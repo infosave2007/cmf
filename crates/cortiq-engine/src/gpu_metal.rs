@@ -3254,6 +3254,87 @@ kernel void kv_append_b(
     vbuf[dst] = v[src];
 }
 
+// Two f32 matvecs over the batch in ONE dispatch (the GDN in_proj_a and
+// in_proj_b share shape and input): rows 0..rows → W1, rows..2·rows → W2.
+kernel void f32_matvec2_b(
+    device const float*  w1   [[buffer(0)]],
+    device const float*  w2   [[buffer(1)]],
+    device const float*  xs   [[buffer(2)]],
+    device float*        y1   [[buffer(3)]],
+    device float*        y2   [[buffer(4)]],
+    constant uint&       cols [[buffer(5)]],
+    constant uint&       rows [[buffer(6)]],
+    constant uint&       nb   [[buffer(7)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tgpos [[threadgroup_position_in_grid]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    uint idx = tgpos * sgs + sg;
+    if (idx >= 2u * rows) return;
+    bool second = idx >= rows;
+    uint row = second ? idx - rows : idx;
+    device const float* wr = (second ? w2 : w1) + (ulong)row * cols;
+    device float* y = second ? y2 : y1;
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f, a4 = 0.0f, a5 = 0.0f, a6 = 0.0f, a7 = 0.0f;
+    for (uint i = lane; i < cols; i += 32u) {
+        float wv = wr[i];
+        a0 += wv * xs[i];
+        if (nb > 1u) a1 += wv * xs[(ulong)1u * cols + i];
+        if (nb > 2u) a2 += wv * xs[(ulong)2u * cols + i];
+        if (nb > 3u) a3 += wv * xs[(ulong)3u * cols + i];
+        if (nb > 4u) a4 += wv * xs[(ulong)4u * cols + i];
+        if (nb > 5u) a5 += wv * xs[(ulong)5u * cols + i];
+        if (nb > 6u) a6 += wv * xs[(ulong)6u * cols + i];
+        if (nb > 7u) a7 += wv * xs[(ulong)7u * cols + i];
+    }
+    a0 = simd_sum(a0); a1 = simd_sum(a1); a2 = simd_sum(a2); a3 = simd_sum(a3);
+    a4 = simd_sum(a4); a5 = simd_sum(a5); a6 = simd_sum(a6); a7 = simd_sum(a7);
+    if (lane == 0u) {
+        y[row] = a0;
+        if (nb > 1u) y[(ulong)1u * rows + row] = a1;
+        if (nb > 2u) y[(ulong)2u * rows + row] = a2;
+        if (nb > 3u) y[(ulong)3u * rows + row] = a3;
+        if (nb > 4u) y[(ulong)4u * rows + row] = a4;
+        if (nb > 5u) y[(ulong)5u * rows + row] = a5;
+        if (nb > 6u) y[(ulong)6u * rows + row] = a6;
+        if (nb > 7u) y[(ulong)7u * rows + row] = a7;
+    }
+}
+
+// SwiGLU activation over b rows WITH the row's power-of-two pre-scale for
+// the half-staged down GEMM in the same pass: act = silu(g)·u, xsc[row]
+// from max|act|. One threadgroup per row.
+kernel void silu_rows(
+    device const float* g   [[buffer(0)]],
+    device const float* u   [[buffer(1)]],
+    device float*       act [[buffer(2)]],
+    device float*       xsc [[buffer(3)]],
+    constant uint&      n   [[buffer(4)]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint row  [[threadgroup_position_in_grid]])
+{
+    threadgroup float part[8];
+    ulong base = (ulong)row * n;
+    float m = 0.0f;
+    for (uint i = tid; i < n; i += 256u) {
+        float gv = g[base + i];
+        float a = (gv / (1.0f + exp(-gv))) * u[base + i];
+        act[base + i] = a;
+        m = max(m, fabs(a));
+    }
+    m = simd_max(m);
+    if (lane == 0) part[sg] = m;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float tot = 0.0f;
+        for (uint k = 0; k < 8u; ++k) tot = max(tot, part[k]);
+        xsc[row] = tot > 16384.0f ? exp2(-ceil(log2(tot / 16384.0f))) : 1.0f;
+    }
+}
+
 // Per-row power-of-two pre-scale for the half-staged GEMM: rows whose
 // max |x| would overflow half get scaled down (the GEMM undoes it).
 kernel void row_pow2_scale(
@@ -5285,6 +5366,8 @@ struct Ctx {
     gdnstb128: ComputePipelineState,
     kvappb: ComputePipelineState,
     rowpow2: ComputePipelineState,
+    f32mv2b: ComputePipelineState,
+    silurows: ComputePipelineState,
     /// Compiled MSL library — shape-specialized pipelines are built
     /// from it lazily.
     lib: metal::Library,
@@ -5492,6 +5575,8 @@ fn init() -> Result<Ctx, String> {
     let gdnstb128 = pso("gdn_state_b128")?;
     let kvappb = pso("kv_append_b")?;
     let rowpow2 = pso("row_pow2_scale")?;
+    let f32mv2b = pso("f32_matvec2_b")?;
+    let silurows = pso("silu_rows")?;
     let queue = device.new_command_queue();
     let flag_buf = device.new_buffer(64, MTLResourceOptions::StorageModeShared);
     unsafe { *(flag_buf.contents() as *mut u32) = 0 };
@@ -5578,6 +5663,8 @@ fn init() -> Result<Ctx, String> {
         gdnstb128,
         kvappb,
         rowpow2,
+        f32mv2b,
+        silurows,
         lib,
         mm_fc: Mutex::new(HashMap::new()),
         kv_mirrors: Mutex::new(HashMap::new()),
@@ -11012,6 +11099,28 @@ impl TokenGraph {
         }
     }
 
+    /// Replace the resident hidden with a projection of a host vector:
+    /// h_b = W · x (the MTP block's `eh_proj · [enorm(e); hnorm(h)]`), so
+    /// the draft step is ONE submit instead of a per-op matvec plus the
+    /// graph. `x` is `t.2` floats; `t.1` must equal hidden.
+    pub fn encode_input_proj(&mut self, t: (usize, usize, usize), x: &[f32]) -> bool {
+        if t.1 != self.dims.hidden || x.len() != t.2 || t.2 % GROUP_SIZE != 0 {
+            return false;
+        }
+        let Some((abs, kind)) = self.proj_abs(t) else {
+            return false;
+        };
+        let x_b = io_buf(self.c, 46_000_000_091 + t.2, t.2 * 4);
+        unsafe {
+            std::ptr::copy_nonoverlapping(x.as_ptr(), x_b.contents() as *mut f32, x.len());
+        }
+        let cmd = self.ensure_cmd();
+        let enc = cmd.new_compute_command_encoder();
+        encode_proj(self.c, enc, &self.fbuf, abs, &kind, &x_b, &self.h_b, t.1, t.2 / GROUP_SIZE);
+        enc.end_encoding();
+        true
+    }
+
     /// Hidden state readback (after `sync`) — debug/oracle use.
     pub fn read_h(&self, out: &mut [f32]) {
         unsafe {
@@ -12329,6 +12438,17 @@ pub fn kv_mirror_drop(kv_id: u64) {
     }
 }
 
+/// Wait for everything queued so far (an empty command buffer behind the
+/// queue's tail) — the oracles use it before reading state the device
+/// writes asynchronously (the verify commit's replay).
+pub fn queue_fence() {
+    if let Some(c) = ctx() {
+        let cmd = c.queue.new_command_buffer();
+        cmd.commit();
+        cmd.wait_until_completed();
+    }
+}
+
 /// Copy `n` consecutive mirror rows starting at `from` (after the final
 /// sync) — the accepted prefix of a speculative round, appended to the
 /// CPU cache by the caller. Outputs are `[n][nkv × hd]`.
@@ -12422,6 +12542,9 @@ pub struct VerifyGraph {
     /// state and shifts the ring in the same pass (no separate commit),
     /// and b may run to 512 (wide GEMMs past 8 rows).
     prefill: bool,
+    /// d_b holds a residual delta not yet added to h_b: the next norm
+    /// folds `h += d` in (one dispatch instead of axpy + norm).
+    pending_delta: bool,
 }
 
 const VBUF_BASE: usize = 60_000_000_000;
@@ -12476,6 +12599,7 @@ impl VerifyGraph {
             gdn: Vec::new(),
             logits_b: None,
             prefill: false,
+            pending_delta: false,
         })
     }
 
@@ -12567,8 +12691,14 @@ impl VerifyGraph {
         lm.2 == self.tg.dims.hidden && self.n8_abs(lm).is_some()
     }
 
-    fn rows_norm(&self, enc: &metal::ComputeCommandEncoderRef, w: &[f32]) {
+    /// n = rmsnorm(h, w) — folding a pending `h += d` in when there is one.
+    fn rows_norm(&mut self, enc: &metal::ComputeCommandEncoderRef, w: &[f32]) {
         let c = self.tg.c;
+        if self.pending_delta {
+            self.pending_delta = false;
+            self.add_norm(enc, w);
+            return;
+        }
         disp(
             enc,
             &c.rmsrows,
@@ -12577,6 +12707,31 @@ impl VerifyGraph {
             &[self.tg.dims.eps],
             ((self.b * 256) as u64, 256),
         );
+    }
+
+    /// h += d_b; n = rmsnorm(h, w) — one dispatch.
+    fn add_norm(&self, enc: &metal::ComputeCommandEncoderRef, w: &[f32]) {
+        let c = self.tg.c;
+        let pn = const_buf(c, w);
+        enc.set_compute_pipeline_state(&c.addnorm);
+        enc.set_buffer(0, Some(&self.h_b), 0);
+        enc.set_buffer(1, Some(&self.d_b), 0);
+        enc.set_buffer(2, Some(&pn), 0);
+        enc.set_buffer(3, Some(&self.n_b), 0);
+        let (n_u, g_u, hd_u) = (self.tg.dims.hidden as u32, self.tg.dims.gemma as u32, 1u32);
+        enc.set_bytes(4, 4, &n_u as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(5, 4, &g_u as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(6, 4, &self.tg.dims.eps as *const f32 as *const std::ffi::c_void);
+        enc.set_bytes(7, 4, &hd_u as *const u32 as *const std::ffi::c_void);
+        enc.dispatch_thread_groups(MTLSize::new(self.b as u64, 1, 1), MTLSize::new(256, 1, 1));
+    }
+
+    /// Flush a pending delta into h_b (before a readback or the head).
+    fn flush_delta(&mut self, enc: &metal::ComputeCommandEncoderRef) {
+        if self.pending_delta {
+            self.pending_delta = false;
+            disp_axpy(self.tg.c, enc, &self.d_b, &self.h_b, 1.0, self.b * self.tg.dims.hidden);
+        }
     }
 
     fn gemm(&self, enc: &metal::ComputeCommandEncoderRef, t: (usize, usize, usize), xs: &Buffer, y: &Buffer, xsc: &Buffer) {
@@ -12594,48 +12749,29 @@ impl VerifyGraph {
 
     /// h += d; n = rmsnorm(h, post_norm); gate/up/silu/down over b rows;
     /// h += down.
-    fn post_ffn(&self, enc: &metal::ComputeCommandEncoderRef, post_norm: &[f32], ffn: &MetalFfn) {
+    fn post_ffn(&mut self, enc: &metal::ComputeCommandEncoderRef, post_norm: &[f32], ffn: &MetalFfn) {
         let c = self.tg.c;
-        let hidden = self.tg.dims.hidden;
         let MetalFfn::Dense { gate, up, down } = ffn else { return };
-        {
-            let pn = const_buf(c, post_norm);
-            enc.set_compute_pipeline_state(&c.addnorm);
-            enc.set_buffer(0, Some(&self.h_b), 0);
-            enc.set_buffer(1, Some(&self.d_b), 0);
-            enc.set_buffer(2, Some(&pn), 0);
-            enc.set_buffer(3, Some(&self.n_b), 0);
-            let (n_u, g_u, hd_u) = (hidden as u32, self.tg.dims.gemma as u32, 1u32);
-            enc.set_bytes(4, 4, &n_u as *const u32 as *const std::ffi::c_void);
-            enc.set_bytes(5, 4, &g_u as *const u32 as *const std::ffi::c_void);
-            enc.set_bytes(6, 4, &self.tg.dims.eps as *const f32 as *const std::ffi::c_void);
-            enc.set_bytes(7, 4, &hd_u as *const u32 as *const std::ffi::c_void);
-            enc.dispatch_thread_groups(MTLSize::new(self.b as u64, 1, 1), MTLSize::new(256, 1, 1));
-        }
+        // h += d (the mixer's output); n = rmsnorm(h, post_norm)
+        self.add_norm(enc, post_norm);
         let inter = gate.1;
         let fg = Self::vbuf(c, 7, 0, self.b * inter * 4);
         let fu = Self::vbuf(c, 8, 0, self.b * inter * 4);
         let fa = Self::vbuf(c, 9, 0, self.b * inter * 4);
         self.gemm(enc, *gate, &self.n_b, &fg, &self.ones);
         self.gemm(enc, *up, &self.n_b, &fu, &self.ones);
+        // silu(g)·u and the row pre-scale in one pass
         disp(
             enc,
-            &c.silu,
-            &[(&fg, 0), (&fu, 0), (&fg, 0), (&fa, 0)],
-            &[(self.b * inter) as u32, 0u32],
-            &[],
-            ((self.b * inter) as u64, 256),
-        );
-        disp(
-            enc,
-            &c.rowpow2,
-            &[(&fa, 0), (&self.xsc, 0)],
+            &c.silurows,
+            &[(&fg, 0), (&fu, 0), (&fa, 0), (&self.xsc, 0)],
             &[inter as u32],
             &[],
             ((self.b * 256) as u64, 256),
         );
         self.gemm(enc, *down, &fa, &self.d_b, &self.xsc);
-        disp_axpy(c, enc, &self.d_b, &self.h_b, 1.0, self.b * hidden);
+        // the residual add rides in the next layer's norm
+        self.pending_delta = true;
     }
 
     /// A run of consecutive GDN layers over the b rows. `states` are the
@@ -12684,19 +12820,20 @@ impl VerifyGraph {
             // 2. mixer projections
             self.gemm(enc, l.qkv, &self.n_b, &qkv_b, &self.ones);
             self.gemm(enc, l.z, &self.n_b, &z_b, &self.ones);
-            for (t, y) in [(&l.a, &a_b), (&l.b, &bb_b)] {
-                let (data, rows, cols) = *t;
-                let wb = const_buf(c, data);
-                // the batched f32 matvec covers 8 rows a dispatch
+            {
+                // a and b projections in one dispatch (8 rows a pass)
+                let (da, rows, cols) = l.a;
+                let (db, _, _) = l.b;
+                let (wa, wb2) = (const_buf(c, da), const_buf(c, db));
                 for c0 in (0..b).step_by(8) {
                     let nb = (b - c0).min(8);
                     disp(
                         enc,
-                        &c.f32mvb,
-                        &[(&wb, 0), (&self.n_b, (c0 * cols * 4) as u64), (y, (c0 * rows * 4) as u64)],
+                        &c.f32mv2b,
+                        &[(&wa, 0), (&wb2, 0), (&self.n_b, (c0 * cols * 4) as u64), (&a_b, (c0 * rows * 4) as u64), (&bb_b, (c0 * rows * 4) as u64)],
                         &[cols as u32, rows as u32, nb as u32],
                         &[],
-                        ((rows as u64).div_ceil(8) * 256, 256),
+                        (((2 * rows) as u64).div_ceil(8) * 256, 256),
                     );
                 }
             }
@@ -12903,9 +13040,10 @@ impl VerifyGraph {
             enc.set_bytes(4 + i as u64, 4, v as *const u32 as *const std::ffi::c_void);
         }
         enc.dispatch_threads(MTLSize::new(kvd as u64, b as u64, 1), MTLSize::new(256, 1, 1));
-        if b > 8 {
+        if b >= 2 {
             // the chunk attend: one simdgroup per (row, head), row e over
-            // positions 0..=stored+e
+            // positions 0..=stored+e (one dispatch; the per-row flash split
+            // below stays for the single row)
             if !verify_skip('a') {
                 enc.set_compute_pipeline_state(&c.cattend);
                 enc.set_buffer(0, Some(&qr_b), 0);
@@ -12925,7 +13063,7 @@ impl VerifyGraph {
         }
         // attend row e over positions 0..=stored+e
         for e in 0..b {
-            if b > 8 || verify_skip('a') { break; }
+            if b >= 2 || verify_skip('a') { break; }
             let n_pos = stored + e + 1;
             let cap_sgs = (c.gqat.max_total_threads_per_threadgroup() as usize / 32).clamp(1, gqa_split_max());
             let sgs = n_pos.div_ceil(32).clamp(1, cap_sgs);
@@ -12966,6 +13104,9 @@ impl VerifyGraph {
         let cmd = self.ensure_cmd();
         let lg_b = Self::vbuf(c, 27, 0, self.b * lm.1 * 4);
         let enc = cmd.new_compute_command_encoder();
+        // the last layer's residual add lands in h_b (the hidden is read
+        // back) — then the final norm
+        self.flush_delta(enc);
         self.rows_norm(enc, norm);
         self.gemm(enc, lm, &self.n_b, &lg_b, &self.ones);
         enc.end_encoding();
@@ -12973,8 +13114,15 @@ impl VerifyGraph {
         true
     }
 
-    /// Submit and wait.
+    /// Submit and wait (a pending residual add is flushed first so h_b is
+    /// the true hidden for readback).
     pub fn sync(&mut self) {
+        if self.pending_delta {
+            let cmd = self.ensure_cmd();
+            let enc = cmd.new_compute_command_encoder();
+            self.flush_delta(enc);
+            enc.end_encoding();
+        }
         if let Some(cmd) = self.cmd.take() {
             METAL_SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             cmd.commit();
@@ -13053,6 +13201,12 @@ impl VerifyGraph {
         enc.end_encoding();
         METAL_SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         cmd.commit();
+        // Every slot zero-copy → nothing to read back on the CPU: leave the
+        // replay in the queue (the next graph run is ordered behind it, the
+        // owner memory is written by the device either way) and return.
+        if self.gdn.iter().all(|s| s.st_len == 0) {
+            return true;
+        }
         wait_fast(&cmd);
         for (slot, out) in self.gdn.iter().zip(states_out.iter_mut()) {
             if slot.st_len == 0 {
