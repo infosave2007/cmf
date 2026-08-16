@@ -3743,8 +3743,14 @@ impl Pipeline {
                 );
             }
             self.graph_want_logits = want_save;
+            // restore IN PLACE: the pending verify graph wraps these very
+            // allocations (zero-copy) — replacing the Vec would strand it
             for (l, st) in self.kv_cache.layers.iter_mut().zip(snap) {
-                l.linear_state = st;
+                if l.linear_state.len() == st.len() {
+                    l.linear_state.copy_from_slice(&st);
+                } else {
+                    l.linear_state = st;
+                }
             }
             for (li, (l, n0)) in self.kv_cache.layers.iter_mut().zip(attn_lens).enumerate() {
                 let extra = l.seq_len.saturating_sub(n0);
@@ -3909,7 +3915,11 @@ impl Pipeline {
                 }
             }
             for (l, st) in self.kv_cache.layers.iter_mut().zip(snap) {
-                l.linear_state = st;
+                if l.linear_state.len() == st.len() {
+                    l.linear_state.copy_from_slice(&st);
+                } else {
+                    l.linear_state = st;
+                }
             }
             Some((plain_states, rows))
         } else {
