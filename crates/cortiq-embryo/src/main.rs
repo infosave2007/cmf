@@ -38,6 +38,36 @@ enum Sub {
         input: PathBuf,
         output: PathBuf,
     },
+    /// Train our byte-level BPE tokenizer (HF tokenizer.json, runtime-compatible).
+    TrainTokenizer {
+        #[arg(long, required = true, num_args = 1..)]
+        inputs: Vec<PathBuf>,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, default_value_t = 32768)]
+        vocab: usize,
+        /// bytes of text to sample for the merge statistics
+        #[arg(long, default_value_t = 400 << 20)]
+        sample_mb_bytes: usize,
+    },
+    /// Encode corpus files (jsonl.gz / txt / parquet with --features data) into a u16 shard.
+    Shard {
+        #[arg(long)]
+        tokenizer: PathBuf,
+        #[arg(long, required = true, num_args = 1..)]
+        inputs: Vec<PathBuf>,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, default_value_t = usize::MAX)]
+        max_tokens: usize,
+    },
+    /// Download corpus files (curl, resumable) into a directory.
+    Fetch {
+        #[arg(long)]
+        dir: PathBuf,
+        #[arg(required = true, num_args = 1..)]
+        urls: Vec<String>,
+    },
     /// Birth: train from scratch (or resume) on a token shard.
     Birth {
         /// token shard (u16 LE)
@@ -95,6 +125,15 @@ fn main() {
             let shard = cortiq_embryo::train::Shard::from_bytes(&text);
             shard.save(&output).expect("write shard");
             println!("{} tokens → {}", shard.tokens.len(), output.display());
+        }
+        Sub::TrainTokenizer { inputs, out, vocab, sample_mb_bytes } => {
+            cortiq_embryo::corpus::train_tokenizer(&inputs, &out, vocab, sample_mb_bytes);
+        }
+        Sub::Shard { tokenizer, inputs, out, max_tokens } => {
+            cortiq_embryo::corpus::shard(&tokenizer, &inputs, &out, max_tokens);
+        }
+        Sub::Fetch { dir, urls } => {
+            cortiq_embryo::corpus::fetch(&urls, &dir);
         }
         Sub::Bench { reps, no_verify } => {
             #[cfg(target_os = "macos")]
