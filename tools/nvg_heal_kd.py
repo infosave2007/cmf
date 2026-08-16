@@ -66,6 +66,7 @@ def main():
     ap.add_argument("--max-steps", type=int, default=0)
     ap.add_argument("--merge-only", action="store_true", help="skip training: merge --out/adapter_best (or adapter_last) into the fold and write --out/merged")
     ap.add_argument("--merge-in-place", action="store_true", help="overwrite the fold's shards with the merged ones (a box without room for a second copy)")
+    ap.add_argument("--only-shards", default="", help="comma-separated shard indices to (re)merge — resume an interrupted in-place merge; shards already carrying the healed metadata are skipped anyway")
     args = ap.parse_args()
     if args.merge_only:
         merge(args, None)
@@ -226,8 +227,18 @@ def merge(args, best_step):
     os.makedirs(out_dir, exist_ok=True)
     wm = {}
     n_merged = 0
-    for f in files:
+    only = {int(x) for x in getattr(args, "only_shards", "").split(",") if x.strip()}
+    from safetensors import safe_open
+    for fi, f in enumerate(files):
         src = os.path.join(args.model, f)
+        if only and fi not in only:
+            log(f"  {f} skipped (--only-shards)")
+            continue
+        with safe_open(src, framework="pt") as sf:
+            meta = sf.metadata() or {}
+        if in_place and meta.get("healed") == "1":
+            log(f"  {f} already healed, skipped")
+            continue
         part = load_file(src)
         new = {}
         for k, v in part.items():
@@ -242,10 +253,10 @@ def merge(args, best_step):
             # overwrite the shard where it really lives (the dir may hold
             # symlinks across filesystems); one shard of slack per filesystem
             real = os.path.realpath(src)
-            save_file(new, real + ".tmp", metadata={"format": "pt"})
+            save_file(new, real + ".tmp", metadata={"format": "pt", "healed": "1"})
             os.replace(real + ".tmp", real)
         else:
-            save_file(new, os.path.join(out_dir, f), metadata={"format": "pt"})
+            save_file(new, os.path.join(out_dir, f), metadata={"format": "pt", "healed": "1"})
         for k in new: wm[k] = f
         del part, new; gc.collect()
         log(f"  {f} written")

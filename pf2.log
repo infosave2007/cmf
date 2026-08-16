@@ -1,0 +1,2 @@
+gpuprof: gdn-run 210.5 | attn 109.8 | прочее 0.0 ms/ток | span 320.3 ms/ток (20 синков)
+gpuprof: gdn-run 217.2 | attn 113.8 | прочее 0.0 ms/ток | span 331.0 ms/ток (40 синков)

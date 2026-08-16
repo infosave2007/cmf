@@ -301,6 +301,52 @@ fn check_mm_b(
 }
 
 #[cfg(target_os = "macos")]
+/// The Metal batched matvec (the speculative verify's kernel) against
+/// the dequant reference on every batch it serves — same 1e-4 band as
+/// the wgpu one; on macOS only.
+#[cfg(target_os = "macos")]
+#[test]
+fn metal_q4tp_matvec_batch_matches_dequant_reference() {
+    unsafe { std::env::set_var("CMF_GPU", "1") };
+    if !cortiq_engine::gpu::enabled_here() {
+        eprintln!("no Metal here — skipping");
+        return;
+    }
+    let mut built = Vec::new();
+    for (rows, cols) in [(256usize, 512usize), (128, 4096), (200, 512)] {
+        let payload = synth(rows, cols);
+        let mut w = vec![0f32; rows * cols];
+        dequant_q4tp(&payload, rows, cols, &mut w);
+        let (model, idx) = tiny_model(&format!("metal-mvb-{rows}-{cols}"), rows, cols, payload);
+        built.push((rows, cols, w, model, idx));
+    }
+    for (rows, cols, w, model, idx) in &built {
+        let (rows, cols, idx) = (*rows, *cols, *idx);
+        for b in [1usize, 2, 3, 5, 8] {
+            let xs: Vec<f32> = (0..b * cols)
+                .map(|i| ((i * 29 + 13) % 103) as f32 / 103.0 - 0.5)
+                .collect();
+            let mut got = vec![0f32; b * rows];
+            assert!(
+                cortiq_engine::gpu_metal::q4tp_matvec_batch(model, idx, &xs, b, rows, cols, &mut got),
+                "Metal refused a batched q4tp matvec ({rows}x{cols}, b={b})"
+            );
+            for t in 0..b {
+                let x = &xs[t * cols..(t + 1) * cols];
+                for r in 0..rows {
+                    let want: f32 = (0..cols).map(|c| w[r * cols + c] * x[c]).sum();
+                    let mag: f32 = (0..cols).map(|c| (w[r * cols + c] * x[c]).abs()).sum();
+                    assert!(
+                        (got[t * rows + r] - want).abs() <= 1e-4 * mag,
+                        "{rows}x{cols} b={b} token {t} row {r}: GPU {} vs dequant {want}",
+                        got[t * rows + r]
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn metal_q4tp_matmat_matches_dequant_reference() {
     let _gpu = gpu_serial();
