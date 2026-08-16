@@ -6535,7 +6535,7 @@ pub fn q4tp_mm_n8_batch(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
-    if cols % 32 != 0 || !(1..=8).contains(&b) || pre.len() < b * cols || out.len() < b * rows {
+    if cols % 64 != 0 || !(1..=8).contains(&b) || pre.len() < b * cols || out.len() < b * rows {
         return false;
     }
     let entry = &model.tensors[idx];

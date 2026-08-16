@@ -3720,6 +3720,12 @@ impl Pipeline {
             for (i, &t) in toks.iter().enumerate() {
                 let hi = self.forward_layers(&self.embed_single(t), next_pos + i, None);
                 let _ = self.graph_logits.take();
+                // CMF_SPEC_PLAIN_HIDDEN=1: the next round drafts from the
+                // plain path's hidden instead of the verify's (an experiment
+                // on the chain's sensitivity to the half-GEMM noise)
+                if std::env::var("CMF_SPEC_PLAIN_HIDDEN").as_deref() == Ok("1") {
+                    hiddens[i * self.hidden_size..(i + 1) * self.hidden_size].copy_from_slice(&hi);
+                }
                 let ref_lg = self.logits_from_hidden(&hi);
                 let row = &logits[i * lm_rows..(i + 1) * lm_rows];
                 let ra = sampler::argmax(&ref_lg);
