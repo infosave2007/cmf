@@ -296,7 +296,7 @@ pub use gpu::*;
 #[cfg(target_os = "macos")]
 mod gpu {
     use super::*;
-    use crate::metal::{Cmd, Ctx, GBuf, HkDims, HkGrads, HkScratch, HkWork, Op, ctx, hk_pow_table};
+    use crate::metal::{Cmd, Ctx, GBuf, GemmBatch, HkDims, HkGrads, HkScratch, HkWork, Op, ctx, hk_pow_table};
     use crate::ops::hk_decay_grid;
 
     /// Per-layer activation buffers kept for the backward (M = B·T rows).
@@ -356,7 +356,9 @@ mod gpu {
         pub dq: GBuf,     // [M, qh·hd]  anchor dQ
         pub dphq: GBuf,   // [M, nh·2nph]
         pub dphk: GBuf,
-        pub dp: GBuf,     // [T,T] one score block
+        pub dp: GBuf,     // [qh, T, T] one sequence's score blocks
+        pub dkh: GBuf,    // [B, qh, T, hd] per-head dK partials
+        pub dvh: GBuf,    // [B, qh, T, hd]
         pub dffn: GBuf,   // [M,I] dh
         pub dgte: GBuf,   // [M,I]
         pub dup: GBuf,    // [M,I]
@@ -492,7 +494,9 @@ mod gpu {
                 dq: z(m * qhd),
                 dphq: z(m * 2 * nhp),
                 dphk: z(m * 2 * nhp),
-                dp: z(t * t),
+                dp: z(cfg.anchor_q_heads * t * t),
+                dkh: z(m * qhd),
+                dvh: z(m * qhd),
                 dffn: z(m * cfg.inter),
                 dgte: z(m * cfg.inter),
                 dup: z(m * cfg.inter),
@@ -625,17 +629,17 @@ mod gpu {
                     cmd.rope(k, 0, m, t, kvh, hd, cfg.rope_base, false);
                     let scale = 1.0 / (hd as f32).sqrt();
                     let group = qh / kvh;
-                    for bi in 0..b {
-                        for i in 0..qh {
-                            let g = i / group;
-                            let p_off = (bi * qh + i) * t * t;
-                            // S = Q_i·K_gᵀ·scale
-                            cmd.gemm(Op::N, Op::T, t, t, hd, scale, q, bi * t * qd + i * hd, qd, k, bi * t * kd + g * hd, kd, 0.0, p, p_off, t);
-                            cmd.causal_softmax(p, p_off, t);
-                            // O_i = P·V_g
-                            cmd.gemm(Op::N, Op::N, t, hd, t, 1.0, p, p_off, t, v, bi * t * kd + g * hd, kd, 0.0, o, bi * t * qd + i * hd, qd);
-                        }
-                    }
+                    // batched over z = (b, kv-group g, head-in-group j), head i = g·group + j
+                    let sq = [t * qd, group * hd, hd]; // q / o column blocks
+                    let sk = [t * kd, hd, 0]; // k / v (shared across the group)
+                    let sp = [qh * t * t, group * t * t, t * t]; // P blocks
+                    let bt = GemmBatch { nb: b, nh: kvh, nc: group, sa: sq, sb: sk, sc: sp };
+                    // S = Q_i·K_gᵀ·scale (all heads, all sequences)
+                    cmd.gemm_ex(Op::N, Op::T, t, t, hd, scale, q, 0, qd, k, 0, kd, 0.0, p, 0, t, &bt, false);
+                    cmd.causal_softmax_blocks(p, 0, t, b * qh);
+                    // O_i = P·V_g
+                    let bt = GemmBatch { nb: b, nh: kvh, nc: group, sa: sp, sb: sk, sc: sq };
+                    cmd.gemm_ex(Op::N, Op::N, t, hd, t, 1.0, p, 0, t, v, 0, kd, 0.0, o, 0, qd, &bt, false);
                     cmd.copy(x_in, 0, x_mid, 0, m * h);
                     cmd.gemm(Op::N, Op::T, m, h, qd, 1.0, o, 0, qd, &self.p, *wo, qd, 1.0, x_mid, 0, h);
                     cmd.rmsnorm_fwd_at(x_mid, &self.p, *ln2, x2, inv2, m, h, cfg.norm_eps);
@@ -706,27 +710,35 @@ mod gpu {
                     assert!(dq.len >= m * qd && s.dk.len >= m * kd && s.dv.len >= m * kd);
                     let scale = 1.0 / (hd as f32).sqrt();
                     let group = qh / kvh;
-                    // dK, dV accumulate over the heads of a group: zero first
-                    cmd.axpby(0.0, &s.dk, 0.0, &s.dk, m * kd);
-                    cmd.axpby(0.0, &s.dv, 0.0, &s.dv, m * kd);
+                    // per sequence b (dP scratch holds one sequence's qh blocks), batched
+                    // over (g, j); per-head dK/dV partials land head-major in s.dkh/s.dvh
+                    // and are group-summed afterwards (no accumulation races).
+                    let sq = [0, group * hd, hd];
+                    let sk = [0, hd, 0];
+                    let sp = [0, group * t * t, t * t];
+                    let sh = [0, group * t * hd, t * hd]; // head-major [qh][T][hd] within one b
                     for bi in 0..b {
-                        for i in 0..qh {
-                            let g = i / group;
-                            let p_off = (bi * qh + i) * t * t;
-                            let do_off = bi * t * qd + i * hd;
-                            let kv_off = bi * t * kd + g * hd;
-                            // dP = dO_i·V_gᵀ
-                            cmd.gemm(Op::N, Op::T, t, t, hd, 1.0, &s.dbig, do_off, qd, v, kv_off, kd, 0.0, &s.dp, 0, t);
-                            // dV_g += P_iᵀ·dO_i
-                            cmd.gemm(Op::T, Op::N, t, hd, t, 1.0, p, p_off, t, &s.dbig, do_off, qd, 1.0, &s.dv, kv_off, kd);
-                            // dS = P⊙(dP − rowsum)
-                            cmd.softmax_bwd(p, p_off, &s.dp, 0, t);
-                            // dQ_i = dS·K_g·scale
-                            cmd.gemm(Op::N, Op::N, t, hd, t, scale, &s.dp, 0, t, k, kv_off, kd, 0.0, dq, do_off, qd);
-                            // dK_g += dSᵀ·Q_i·scale
-                            cmd.gemm(Op::T, Op::N, t, hd, t, scale, &s.dp, 0, t, q, do_off, qd, 1.0, &s.dk, kv_off, kd);
-                        }
+                        let q_off = bi * t * qd;
+                        let kv_off = bi * t * kd;
+                        let p_off = bi * qh * t * t;
+                        let h_off = bi * qh * t * hd;
+                        // dP = dO_i·V_gᵀ
+                        let bt = GemmBatch { nb: 1, nh: kvh, nc: group, sa: sq, sb: sk, sc: sp };
+                        cmd.gemm_ex(Op::N, Op::T, t, t, hd, 1.0, &s.dbig, q_off, qd, v, kv_off, kd, 0.0, &s.dp, 0, t, &bt, false);
+                        // dV_i(partial) = P_iᵀ·dO_i
+                        let bt = GemmBatch { nb: 1, nh: kvh, nc: group, sa: sp, sb: sq, sc: sh };
+                        cmd.gemm_ex(Op::T, Op::N, t, hd, t, 1.0, p, p_off, t, &s.dbig, q_off, qd, 0.0, &s.dvh, h_off, hd, &bt, false);
+                        // dS = P⊙(dP − rowsum)
+                        cmd.softmax_bwd_blocks(p, p_off, &s.dp, 0, t, qh);
+                        // dQ_i = dS·K_g·scale
+                        let bt = GemmBatch { nb: 1, nh: kvh, nc: group, sa: sp, sb: sk, sc: sq };
+                        cmd.gemm_ex(Op::N, Op::N, t, hd, t, scale, &s.dp, 0, t, k, kv_off, kd, 0.0, dq, q_off, qd, &bt, false);
+                        // dK_i(partial) = dSᵀ·Q_i·scale
+                        let bt = GemmBatch { nb: 1, nh: kvh, nc: group, sa: sp, sb: sq, sc: sh };
+                        cmd.gemm_ex(Op::T, Op::N, t, hd, t, scale, &s.dp, 0, t, q, q_off, qd, 0.0, &s.dkh, h_off, hd, &bt, false);
                     }
+                    cmd.group_sum_heads(&s.dkh, &s.dk, b, t, qh, kvh, hd);
+                    cmd.group_sum_heads(&s.dvh, &s.dv, b, t, qh, kvh, hd);
                     cmd.rope(dq, 0, m, t, qh, hd, cfg.rope_base, true);
                     cmd.rope(&s.dk, 0, m, t, kvh, hd, cfg.rope_base, true);
                     // dx1 = dq·Wq + dk·Wk + dv·Wv

@@ -831,13 +831,14 @@ kernel void rope_f32(
 kernel void causal_softmax_rows_f32(
     device float*   S [[buffer(0)]],
     constant uint&  n [[buffer(1)]],
-    uint row  [[threadgroup_position_in_grid]],
+    uint2 tgp [[threadgroup_position_in_grid]],   // x: row, y: [T,T] block
     uint tid  [[thread_index_in_threadgroup]],
     uint sgid [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]])
 {
     threadgroup float red[8];
-    device float* r = S + (ulong)row * n;
+    uint row = tgp.x;
+    device float* r = S + (ulong)tgp.y * n * n + (ulong)row * n;
     uint len = row + 1u;
     float mx = -INFINITY;
     for (uint j = tid; j < len; j += 256u) mx = max(mx, r[j]);
@@ -864,14 +865,15 @@ kernel void softmax_bwd_rows_f32(
     device const float* P  [[buffer(0)]],
     device float*       dP [[buffer(1)]],
     constant uint&      n  [[buffer(2)]],
-    uint row  [[threadgroup_position_in_grid]],
+    uint2 tgp [[threadgroup_position_in_grid]],
     uint tid  [[thread_index_in_threadgroup]],
     uint sgid [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]])
 {
     threadgroup float red[8];
-    device const float* p = P + (ulong)row * n;
-    device float* d = dP + (ulong)row * n;
+    uint row = tgp.x;
+    device const float* p = P + (ulong)tgp.y * n * n + (ulong)row * n;
+    device float* d = dP + (ulong)tgp.y * n * n + (ulong)row * n;
     float dot = 0.0f;
     for (uint j = tid; j < n; j += 256u) dot += p[j] * d[j];
     dot = simd_sum(dot);
@@ -1182,4 +1184,28 @@ kernel void softmax_ce_idx_f32(
         float p = exp(lr[j] - lse);
         lr[j] = (p - ((j == t) ? 1.0f : 0.0f)) * scale;
     }
+}
+
+// GQA group reduction: src is head-major [B][qh][T][hd] (per-q-head partial
+// dK or dV), dst is row-major [B·T, kvh·hd]; dst[b,t][g·hd + d] = Σ_j src[b][g·group + j][t][d].
+struct GroupSumArgs { uint B, T, qh, kvh, hd; };
+kernel void group_sum_heads_f32(
+    device const float*    src [[buffer(0)]],
+    device float*          dst [[buffer(1)]],
+    constant GroupSumArgs& a   [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])   // over B·T·kvh·hd
+{
+    uint kd = a.kvh * a.hd;
+    uint rows = a.B * a.T;
+    if (gid >= rows * kd) return;
+    uint row = gid / kd, r = gid % kd;
+    uint g = r / a.hd, d = r % a.hd;
+    uint b = row / a.T, t = row % a.T;
+    uint group = a.qh / a.kvh;
+    float s = 0.0f;
+    for (uint j = 0; j < group; ++j) {
+        uint i = g * group + j;
+        s += src[(((ulong)b * a.qh + i) * a.T + t) * a.hd + d];
+    }
+    dst[gid] = s;
 }
