@@ -380,15 +380,16 @@ def main():
     json.dump(results, open(os.path.join(args.out, "results.json"), "w"), indent=1)
     log("results:", json.dumps(results, indent=1))
     # ── export the better trained tail at f16 into a copy of the cmf ──
+    pick = "fcd_from_quant" if results["fcd_from_quant:best"]["eval_ppl"] <= results["fcd_from_bf16:best"]["eval_ppl"] else "fcd_from_bf16"
+    sd_pick = sd_q if pick == "fcd_from_quant" else sd_b
+    raw_dir = os.path.join(args.out, "tail_f32"); os.makedirs(raw_dir, exist_ok=True)
+    sets = []
+    for k, v in sd_pick.items():
+        p = os.path.join(raw_dir, k + ".f32")
+        v.contiguous().numpy().astype(np.float32).tofile(p)
+        sets.append(f"--set '{k}={p}'")
+    log(f"tail ({pick}) written as f32 under {raw_dir}")
     if not args.skip_export:
-        pick = "fcd_from_quant" if results["fcd_from_quant:best"]["eval_ppl"] <= results["fcd_from_bf16:best"]["eval_ppl"] else "fcd_from_bf16"
-        sd_pick = sd_q if pick == "fcd_from_quant" else sd_b
-        raw_dir = os.path.join(args.out, "tail_f32"); os.makedirs(raw_dir, exist_ok=True)
-        sets = []
-        for k, v in sd_pick.items():
-            p = os.path.join(raw_dir, k + ".f32")
-            v.contiguous().numpy().astype(np.float32).tofile(p)
-            sets.append(f"--set '{k}={p}'")
         out_cmf = os.path.join(args.out, os.path.basename(args.cmf).replace(".cmf", f".fcd-{pick}.cmf"))
         cmd = f"{args.cortiq} patch-tensor {args.cmf} {' '.join(sets)} --dtype f16 --output {out_cmf}"
         log("export:", pick, "→", out_cmf)
