@@ -258,6 +258,10 @@ pub struct Pipeline {
     pub attn_v_norm: bool,
     /// Final-logit soft-capping C: logits = C·tanh(logits/C) (Gemma-4).
     pub final_softcap: Option<f32>,
+    /// Cortiq Embryo hierarchical head: cluster matrix [C, hidden]. The
+    /// flat logits h·Eᵀ are turned into the two-level log-probabilities
+    /// log softmax_c(h·Cᵀ)[c(v)] + log softmax_{s∈c(v)}(h·E_c(v)ᵀ)[v].
+    pub head_clusters: Option<std::sync::Arc<Vec<f32>>>,
     /// Gemma-2 attention-logit soft-capping (0.0 = off).
     pub attn_softcap: f32,
     /// Compute per-token Born confidence (a full-vocab softmax each
@@ -456,6 +460,47 @@ pub struct MoeFfn {
     /// (the constant gain router.scale·√hidden is folded into the
     /// router weights at convert time).
     pub router_input_norm: bool,
+    /// Cortiq Embryo: resonance routing (P1) — the "logits" are
+    /// bias_e − ‖(x−μ_e) − U_eᵀU_e(x−μ_e)‖², argmax = the expert whose
+    /// descriptor reconstructs the input best. `router` is a placeholder.
+    pub resonance: Option<Resonance>,
+}
+
+/// Per-expert resonance descriptors of one MoE layer (`mlp.desc.*`).
+pub struct Resonance {
+    /// [E, hidden]
+    pub mu: Vec<f32>,
+    /// [E, k, hidden] orthonormal directions (k may be 0)
+    pub u: Vec<f32>,
+    pub k: usize,
+    /// [E] selection bias (loss-free balancing, trained online)
+    pub bias: Vec<f32>,
+}
+
+impl Resonance {
+    /// Routing scores for one input row (higher = better).
+    pub fn scores(&self, x: &[f32], out: &mut [f32]) {
+        let h = x.len();
+        let ne = out.len();
+        for e in 0..ne {
+            let mu = &self.mu[e * h..(e + 1) * h];
+            let mut d2 = 0.0f32;
+            for j in 0..h {
+                let d = x[j] - mu[j];
+                d2 += d * d;
+            }
+            let mut proj = 0.0f32;
+            for i in 0..self.k {
+                let u = &self.u[(e * self.k + i) * h..(e * self.k + i + 1) * h];
+                let mut p = 0.0f32;
+                for j in 0..h {
+                    p += (x[j] - mu[j]) * u[j];
+                }
+                proj += p * p;
+            }
+            out[e] = self.bias.get(e).copied().unwrap_or(0.0) - (d2 - proj);
+        }
+    }
 }
 
 /// Attention operator of a layer. Extension point: new operators are
@@ -1666,6 +1711,7 @@ impl Pipeline {
             inv_freq_global: None,
             attn_v_norm: false,
             final_softcap: None,
+            head_clusters: None,
             attn_softcap: 0.0,
             graph_want_logits: false,
             graph_logits: None,
@@ -8622,7 +8668,42 @@ impl Pipeline {
                 *l = c * (*l / c).tanh();
             }
         }
+        if let Some(cm) = self.head_clusters.as_ref() {
+            self.hierarchical_head_logprobs(hidden, cm, &mut logits);
+        }
         logits
+    }
+
+    /// Two-level head (Cortiq Embryo): in place, logits[v] ← log p(v) =
+    /// (lc[c] − lse(lc)) + (logit[v] − lse over v's cluster block), c = v / S.
+    fn hierarchical_head_logprobs(&self, hidden: &[f32], cm: &[f32], logits: &mut [f32]) {
+        let h = hidden.len();
+        let ncl = cm.len() / h.max(1);
+        if ncl == 0 || logits.len() % ncl != 0 {
+            return;
+        }
+        let cs = logits.len() / ncl;
+        // cluster logits + log-softmax
+        let mut lc = vec![0.0f32; ncl];
+        for c in 0..ncl {
+            let row = &cm[c * h..(c + 1) * h];
+            let mut s = 0.0f32;
+            for j in 0..h {
+                s += row[j] * hidden[j];
+            }
+            lc[c] = s;
+        }
+        let mx = lc.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let lse: f32 = mx + lc.iter().map(|v| (v - mx).exp()).sum::<f32>().ln();
+        for c in 0..ncl {
+            let blk = &mut logits[c * cs..(c + 1) * cs];
+            let bm = blk.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let bl: f32 = bm + blk.iter().map(|v| (v - bm).exp()).sum::<f32>().ln();
+            let add = lc[c] - lse - bl;
+            for v in blk.iter_mut() {
+                *v += add;
+            }
+        }
     }
 
     /// Prefill `ids` and return the next-token logits — what the model
@@ -8881,7 +8962,15 @@ fn moe_ffn_batch(
     accumulate_act(m, xs, b);
     let ne = m.experts.len();
     let mut logits = vec![0.0f32; b * ne];
-    m.router.matmat(xs, b, &mut logits, pool);
+    match &m.resonance {
+        Some(r) => {
+            let hdim = xs.len() / b.max(1);
+            for bi in 0..b {
+                r.scores(&xs[bi * hdim..(bi + 1) * hdim], &mut logits[bi * ne..(bi + 1) * ne]);
+            }
+        }
+        None => m.router.matmat(xs, b, &mut logits, pool),
+    }
 
     // Assignments: expert → [(position, weight)] — same routing as
     // moe_ffn, per position (see `moe_route`).
@@ -9259,6 +9348,7 @@ fn metal_moe_graph_parts(m: &MoeFfn, hidden: usize) -> Option<crate::gpu::GpuMoe
         || m.per_expert_scale.is_some()
         || m.experts.is_empty()
         || m.top_k == 0
+        || m.resonance.is_some()
     {
         return None;
     }
@@ -9604,7 +9694,10 @@ fn moe_ffn(m: &MoeFfn, x: &[f32], pool: Option<&Pool>, allowed: Option<&[bool]>)
     accumulate_act(m, x, 1);
     let ne = m.experts.len();
     let mut logits = vec![0.0f32; ne];
-    m.router.matvec(x, &mut logits, pool);
+    match &m.resonance {
+        Some(r) => r.scores(x, &mut logits),
+        None => m.router.matvec(x, &mut logits, pool),
+    }
     let (idx, p, wsum) = moe_route(&logits, m, allowed);
     {
         let mut st = m.stats.borrow_mut();

@@ -271,6 +271,13 @@ pub struct MoeConfig {
     /// (LFM2-MoE `routed_scaling_factor`). None = 1.0 (no scaling).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routed_scaling_factor: Option<f32>,
+    /// Cortiq Embryo: experts are chosen by RESONANCE with per-expert
+    /// descriptors (`mlp.desc.mu` [E,H], optional `mlp.desc.u` [E,K,H],
+    /// `mlp.desc.bias` [E]) — argmin of the reconstruction error minus the
+    /// bias, weight 1 — instead of a learned gate (P1: router-is-coarse-MoE).
+    /// `mlp.gate.weight` is a schema placeholder and never read.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub router_resonance: bool,
 }
 
 /// Optional YaRN parameters for the model's global RoPE profile.
@@ -436,6 +443,13 @@ pub struct ModelArch {
     /// or not folded yet)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linear_core: Option<LinearCoreConfig>,
+    /// Cortiq Embryo hierarchical head: the vocabulary is C clusters ×
+    /// (vocab/C) tokens (token v → cluster v / (vocab/C)); log p(v) =
+    /// log softmax_c(h·Cᵀ)[c(v)] + log softmax_{s∈c(v)}(h·E_c(v)ᵀ)[v] with the
+    /// cluster matrix `lm_head.clusters.weight` [C, hidden] and the tied
+    /// embedding. None = flat softmax head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_clusters: Option<usize>,
     /// Max position embeddings
     pub max_position_embeddings: usize,
     // Linear attention specific

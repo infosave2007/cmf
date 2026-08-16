@@ -68,6 +68,15 @@ enum Sub {
         #[arg(required = true, num_args = 1..)]
         urls: Vec<String>,
     },
+    /// Export a checkpoint (+ tokenizer.json) into a runtime-loadable .cmf.
+    Export {
+        #[arg(long)]
+        ckpt: PathBuf,
+        #[arg(long)]
+        tokenizer: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Birth: train from scratch (or resume) on a token shard.
     Birth {
         /// token shards (u16 LE), `path[:weight]`, repeatable — mixed by weight
@@ -131,6 +140,13 @@ fn main() {
         }
         Sub::Shard { tokenizer, inputs, out, max_tokens } => {
             cortiq_embryo::corpus::shard(&tokenizer, &inputs, &out, max_tokens);
+        }
+        Sub::Export { ckpt, tokenizer, out } => {
+            let ck = cortiq_embryo::train::load_checkpoint(&ckpt).expect("load checkpoint");
+            let tj = std::fs::read(&tokenizer).expect("read tokenizer.json");
+            cortiq_embryo::export::export(&ck, &tj, &out).expect("export");
+            let (total, active) = ck.cfg.params();
+            println!("exported step {} → {} ({:.1} M params, {:.1} M active)", ck.step, out.display(), total as f64 / 1e6, active as f64 / 1e6);
         }
         Sub::Fetch { dir, urls } => {
             cortiq_embryo::corpus::fetch(&urls, &dir);

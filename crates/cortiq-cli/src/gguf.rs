@@ -800,6 +800,7 @@ fn arch_from_md(md: &BTreeMap<String, Val>, tensors: &[GgufTensor]) -> anyhow::R
             shared_expert_intermediate_size: gu("expert_shared_feed_forward_length"),
             router_sigmoid: false,
             routed_scaling_factor: None,
+            router_resonance: false,
         })
     } else {
         None
@@ -852,6 +853,7 @@ fn arch_from_md(md: &BTreeMap<String, Val>, tensors: &[GgufTensor]) -> anyhow::R
         } else {
             None
         },
+        head_clusters: None,
         max_position_embeddings: gu("context_length").unwrap_or(32_768),
         linear_conv_kernel_dim: gu("ssm.conv_kernel"),
         linear_num_key_heads: gu("ssm.group_count"),

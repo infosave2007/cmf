@@ -1276,3 +1276,26 @@ impl EmbryoGpu {
         }
     }
 }
+
+#[cfg(target_os = "macos")]
+impl EmbryoGpu {
+    /// Forward (no head, no grads): the final-normed hidden xf [M, H] for the
+    /// tokens — the runtime-parity test's reference.
+    pub fn forward_hidden(&self, tokens: &[u32]) -> Vec<f32> {
+        use crate::metal::{Cmd, GBuf};
+        let m = self.b * self.t;
+        assert_eq!(tokens.len(), m);
+        unsafe { std::ptr::copy_nonoverlapping(tokens.as_ptr(), self.tok.buf.contents() as *mut u32, m) };
+        let cfg = &self.cfg;
+        let h = cfg.hidden;
+        let cmd = Cmd::new(self.ctx());
+        cmd.embed_gather_at(&self.p, self.lay.embed, &self.tok, self.x_in(0), m, h);
+        for l in 0..cfg.layers {
+            let out: &GBuf = if l + 1 < cfg.layers { self.x_in(l + 1) } else { &self.x_out };
+            self.layer_fwd(&cmd, l, out, false);
+        }
+        cmd.rmsnorm_fwd_at(&self.x_out, &self.p, self.lay.final_norm, &self.xf, &self.invf, m, h, cfg.norm_eps);
+        cmd.commit();
+        self.xf.to_vec()
+    }
+}

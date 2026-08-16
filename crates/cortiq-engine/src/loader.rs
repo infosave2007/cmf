@@ -250,6 +250,33 @@ pub(crate) fn build_ffn_at(
         None
     };
     let router_input_norm = per_expert_scale.is_some();
+    // Cortiq Embryo resonance descriptors (`mlp.desc.*`): present → the
+    // router is a placeholder and selection is by reconstruction error.
+    let resonance = if model.tensor(&format!("{prefix}mlp.desc.mu")).is_some() {
+        let mu = load_f32(model, &format!("{prefix}mlp.desc.mu"), ov).map_err(CmfError::Parse)?;
+        let ne_d = experts.len();
+        let hidden = arch.hidden_size;
+        if mu.len() != ne_d * hidden {
+            return Err(CmfError::Parse(format!("{prefix}mlp.desc.mu: {} != {ne_d}×{hidden}", mu.len())));
+        }
+        let u_name = format!("{prefix}mlp.desc.u");
+        let (u, k) = if model.tensor(&u_name).is_some() {
+            let u = load_f32(model, &u_name, ov).map_err(CmfError::Parse)?;
+            let k = u.len() / (ne_d * hidden).max(1);
+            (u, k)
+        } else {
+            (Vec::new(), 0)
+        };
+        let b_name = format!("{prefix}mlp.desc.bias");
+        let bias = if model.tensor(&b_name).is_some() {
+            load_f32(model, &b_name, ov).map_err(CmfError::Parse)?
+        } else {
+            vec![0.0; ne_d]
+        };
+        Some(crate::pipeline::Resonance { mu, u, k, bias })
+    } else {
+        None
+    };
     let moe = MoeFfn {
         router,
         experts,
@@ -266,6 +293,7 @@ pub(crate) fn build_ffn_at(
         mask,
         per_expert_scale,
         router_input_norm,
+        resonance,
     };
     // Gemma-4 dual-branch layer: a dense MLP coexists with the routed
     // experts, each branch inside its own norm sandwich.
@@ -1240,6 +1268,18 @@ impl Pipeline {
         }
         pipeline.attn_v_norm = arch.attn_v_norm;
         pipeline.final_softcap = arch.final_logit_softcapping.map(|c| c as f32);
+        // Cortiq Embryo hierarchical head: cluster matrix → two-level log-probs.
+        if let Some(ncl) = arch.head_clusters {
+            let cm = load_f32(model, "lm_head.clusters.weight", ov).map_err(err)?;
+            if cm.len() != ncl * arch.hidden_size {
+                return Err(CmfError::Parse(format!(
+                    "lm_head.clusters.weight: {} != {ncl}×{}",
+                    cm.len(),
+                    arch.hidden_size
+                )));
+            }
+            pipeline.head_clusters = Some(std::sync::Arc::new(cm));
+        }
         pipeline.attn_softcap = arch.attn_logit_softcapping.unwrap_or(0.0) as f32;
         pipeline.vmf_cfg = vmf_cfg;
         pipeline.gdn_cfg = gdn_cfg;

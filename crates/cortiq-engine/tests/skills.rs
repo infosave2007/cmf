@@ -40,6 +40,7 @@ fn arch() -> ModelArch {
         mtp: None,
         moe: None,
         linear_core: None,
+        head_clusters: None,
         max_position_embeddings: 64,
         linear_conv_kernel_dim: None,
         linear_num_key_heads: None,
