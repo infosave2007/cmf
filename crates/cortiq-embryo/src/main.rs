@@ -132,6 +132,9 @@ enum Sub {
         /// φ-layer of the routing descriptor (default: 2/3 depth)
         #[arg(long)]
         phi_layer: Option<usize>,
+        /// positions averaged for the routing φ (prompt-length statistics)
+        #[arg(long, default_value_t = 48)]
+        phi_len: usize,
         #[arg(long, default_value_t = 8)]
         rank: usize,
         #[arg(long, default_value_t = 1)]
@@ -214,7 +217,7 @@ fn main() {
         Sub::SampleText { input, skip, docs, out } => {
             cortiq_embryo::corpus::sample_text(&input, skip, docs, &out);
         }
-        Sub::SkillBake { ckpt, tokenizer, corpus, base, out, id, layers, steps_a, steps_b, lr_a, lr_b, l1, tau, eval_every, batch, seq, phi_layer, rank, seed } => {
+        Sub::SkillBake { ckpt, tokenizer, corpus, base, out, id, layers, steps_a, steps_b, lr_a, lr_b, l1, tau, eval_every, batch, seq, phi_layer, phi_len, rank, seed } => {
             #[cfg(target_os = "macos")]
             {
                 use cortiq_embryo::skill::{BakeArgs, append_to_cmf, bake};
@@ -239,7 +242,7 @@ fn main() {
                 let layers = layers.unwrap_or_else(|| vec![nl.saturating_sub(2), nl.saturating_sub(1)]);
                 let a = BakeArgs {
                     id: id.clone(), layers: layers.clone(), steps_a, steps_b, lr_a, lr_b, l1, tau, eval_every, batch, seq,
-                    phi_layer: phi_layer.unwrap_or(nl * 2 / 3), rank, seed,
+                    phi_layer: phi_layer.unwrap_or(nl * 2 / 3), phi_len, rank, seed,
                 };
                 let (tensors, sel, kept, (l0, la, lb)) = bake(&ck, &shard, &a).expect("bake");
                 let quality = serde_json::json!({
@@ -255,7 +258,7 @@ fn main() {
             }
             #[cfg(not(target_os = "macos"))]
             {
-                let _ = (ckpt, tokenizer, corpus, base, out, id, layers, steps_a, steps_b, lr_a, lr_b, l1, tau, eval_every, batch, seq, phi_layer, rank, seed);
+                let _ = (ckpt, tokenizer, corpus, base, out, id, layers, steps_a, steps_b, lr_a, lr_b, l1, tau, eval_every, batch, seq, phi_layer, phi_len, rank, seed);
                 eprintln!("needs Metal (macOS)");
                 std::process::exit(1);
             }
