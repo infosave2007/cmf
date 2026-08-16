@@ -477,6 +477,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "cortiq-embryo"
+version = "0.5.82"
+dependencies = [
+ "anyhow",
+ "clap",
+ "cortiq-core",
+ "cortiq-engine",
+ "metal",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "cortiq-engine"
 version = "0.5.82"
 dependencies = [
