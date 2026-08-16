@@ -434,7 +434,7 @@ fn force_f16(name: &str) -> bool {
 }
 
 /// Quantization choice for 2-D weight matrices.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum Quant {
     Q8Row,
     Q8_2f,
