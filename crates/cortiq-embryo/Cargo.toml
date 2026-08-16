@@ -25,6 +25,7 @@ clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 fancy-regex = { workspace = true }
+base64 = { workspace = true }
 flate2 = "1"
 # Corpus readers for the birth data (FineWeb parquet, C4 json.gz). Optional:
 # the trainer itself needs neither.
