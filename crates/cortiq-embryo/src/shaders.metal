@@ -1104,3 +1104,82 @@ kernel void hk_dstates_bwd_par_f32(
         dstates[st_base + ((ulong)c * p2 + f) * a.dv + d] = G;
     }
 }
+
+// ---------------------------------------------------------------------
+// Hierarchical head companions (128 clusters × 256, tied to the embedding):
+// rows are grouped by target cluster on the host; these gather/scatter the
+// grouped rows and run the within-cluster CE with an index map.
+// ---------------------------------------------------------------------
+
+// dst[i,:] = idx[i] ≥ 0 ? src[idx[i],:] : 0
+kernel void gather_rows_f32(
+    device const float* src [[buffer(0)]],
+    device const int*   idx [[buffer(1)]],
+    device float*       dst [[buffer(2)]],
+    constant uint&      d   [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= d) return;
+    int i = idx[gid.y];
+    dst[(ulong)gid.y * d + gid.x] = (i >= 0) ? src[(ulong)i * d + gid.x] : 0.0f;
+}
+
+// dst[idx[i],:] += src[i,:]  for idx[i] ≥ 0 (indices unique: no atomics)
+kernel void scatter_add_rows_f32(
+    device float*       dst [[buffer(0)]],
+    device const int*   idx [[buffer(1)]],
+    device const float* src [[buffer(2)]],
+    constant uint&      d   [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= d) return;
+    int i = idx[gid.y];
+    if (i >= 0) dst[(ulong)i * d + gid.x] += src[(ulong)gid.y * d + gid.x];
+}
+
+// Within-cluster softmax-CE over rows of n logits with an index map:
+// row r stands for token idx[r] (< 0: padding → dlogits row = 0, no loss);
+// target = tgt[idx[r]] mod n; loss2[idx[r]] = −log p; logits ← (p−onehot)·scale.
+kernel void softmax_ce_idx_f32(
+    device float*       logits [[buffer(0)]],
+    device const int*   idx    [[buffer(1)]],
+    device const uint*  tgt    [[buffer(2)]],
+    device float*       loss2  [[buffer(3)]],
+    constant uint&      n      [[buffer(4)]],
+    constant float&     scale  [[buffer(5)]],
+    uint row  [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    threadgroup float red[8];
+    device float* lr = logits + (ulong)row * n;
+    int i = idx[row];
+    if (i < 0) {
+        for (uint j = tid; j < n; j += 256u) lr[j] = 0.0f;
+        return;
+    }
+    uint t = tgt[i] % n;
+    float mx = -INFINITY;
+    for (uint j = tid; j < n; j += 256u) mx = max(mx, lr[j]);
+    mx = simd_max(mx);
+    if (lane == 0) red[sgid] = mx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    mx = red[0];
+    for (uint s = 1; s < 8u; ++s) mx = max(mx, red[s]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float sum = 0.0f;
+    for (uint j = tid; j < n; j += 256u) sum += exp(lr[j] - mx);
+    sum = simd_sum(sum);
+    if (lane == 0) red[sgid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tot = 0.0f;
+    for (uint s = 0; s < 8u; ++s) tot += red[s];
+    float lse = mx + log(tot);
+    if (tid == 0) loss2[i] = lse - lr[t];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint j = tid; j < n; j += 256u) {
+        float p = exp(lr[j] - lse);
+        lr[j] = (p - ((j == t) ? 1.0f : 0.0f)) * scale;
+    }
+}

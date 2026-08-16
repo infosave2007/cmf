@@ -60,6 +60,9 @@ pub struct Ctx {
     hk_unscale: ComputePipelineState,
     hk_states_par: ComputePipelineState,
     hk_dstates_par: ComputePipelineState,
+    gather_rows: ComputePipelineState,
+    scatter_add_rows: ComputePipelineState,
+    softmax_ce_idx: ComputePipelineState,
 }
 unsafe impl Send for Ctx {}
 unsafe impl Sync for Ctx {}
@@ -158,6 +161,9 @@ fn init() -> Result<Ctx, String> {
         hk_unscale: pso("hk_unscale_f32")?,
         hk_states_par: pso("hk_states_fwd_par_f32")?,
         hk_dstates_par: pso("hk_dstates_bwd_par_f32")?,
+        gather_rows: pso("gather_rows_f32")?,
+        scatter_add_rows: pso("scatter_add_rows_f32")?,
+        softmax_ce_idx: pso("softmax_ce_idx_f32")?,
         gemm,
         _lib: lib,
         queue,
@@ -1056,6 +1062,46 @@ impl<'a> Cmd<'a> {
         e.set_buffer(3, Some(&g.dstates.buf), 0);
         self.hk_args(4, d);
         e.dispatch_thread_groups(MTLSize::new((d.b * d.nh) as u64, 1, 1), MTLSize::new((d.dv * (2 * d.nph).div_ceil(16)) as u64, 1, 1));
+    }
+
+    /// dst[i,:] = src[idx[i],:] (idx < 0 → zero row), `rows` rows of width d.
+    pub fn gather_rows(&self, src: &GBuf, idx: &GBuf, dst: &GBuf, rows: usize, d: usize) {
+        assert!(idx.len >= rows && dst.len >= rows * d);
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.gather_rows);
+        e.set_buffer(0, Some(&src.buf), 0);
+        e.set_buffer(1, Some(&idx.buf), 0);
+        e.set_buffer(2, Some(&dst.buf), 0);
+        self.set_u32(3, d as u32);
+        let tgx = 64u64.min(d as u64).max(1);
+        e.dispatch_thread_groups(MTLSize::new((d as u64).div_ceil(tgx), rows as u64, 1), MTLSize::new(tgx, 1, 1));
+    }
+
+    /// dst[idx[i],:] += src[i,:] (idx < 0 skipped; unique indices).
+    pub fn scatter_add_rows(&self, dst: &GBuf, idx: &GBuf, src: &GBuf, rows: usize, d: usize) {
+        assert!(idx.len >= rows && src.len >= rows * d);
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.scatter_add_rows);
+        e.set_buffer(0, Some(&dst.buf), 0);
+        e.set_buffer(1, Some(&idx.buf), 0);
+        e.set_buffer(2, Some(&src.buf), 0);
+        self.set_u32(3, d as u32);
+        let tgx = 64u64.min(d as u64).max(1);
+        e.dispatch_thread_groups(MTLSize::new((d as u64).div_ceil(tgx), rows as u64, 1), MTLSize::new(tgx, 1, 1));
+    }
+
+    /// Within-cluster CE with an index map (see the kernel).
+    pub fn softmax_ce_idx(&self, logits: &GBuf, idx: &GBuf, tgt: &GBuf, loss2: &GBuf, rows: usize, n: usize, scale: f32) {
+        assert!(logits.len >= rows * n && idx.len >= rows);
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.softmax_ce_idx);
+        e.set_buffer(0, Some(&logits.buf), 0);
+        e.set_buffer(1, Some(&idx.buf), 0);
+        e.set_buffer(2, Some(&tgt.buf), 0);
+        e.set_buffer(3, Some(&loss2.buf), 0);
+        self.set_u32(4, n as u32);
+        self.set_f32(5, scale);
+        e.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(256, 1, 1));
     }
 
     /// Submit and wait. Returns GPU time in milliseconds (GPUEndTime −
