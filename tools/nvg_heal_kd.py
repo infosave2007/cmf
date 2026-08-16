@@ -64,7 +64,12 @@ def main():
     ap.add_argument("--eval-every", type=int, default=50)
     ap.add_argument("--val-seqs", type=int, default=16)
     ap.add_argument("--max-steps", type=int, default=0)
+    ap.add_argument("--merge-only", action="store_true", help="skip training: merge --out/adapter_best (or adapter_last) into the fold and write --out/merged")
+    ap.add_argument("--merge-in-place", action="store_true", help="overwrite the fold's shards with the merged ones (a box without room for a second copy)")
     args = ap.parse_args()
+    if args.merge_only:
+        merge(args, None)
+        return
     os.makedirs(args.out, exist_ok=True)
     dev = torch.device("cuda")
     from transformers import AutoConfig, AutoTokenizer
@@ -194,44 +199,64 @@ def main():
             model.save_pretrained(os.path.join(args.out, "adapter_last"))
             json.dump(hist, open(os.path.join(args.out, "history.json"), "w"), indent=1)
     log(f"training done; best step {best[1]}")
-    # ── merge the best adapter into the bf16 fold weights on the CPU ──
+    merge(args, best[1])
+
+def merge(args, best_step):
+    """Merge the adapter into the bf16 fold weights on the CPU, one shard at a
+    time and one delta at a time (a dense f32 delta for every projection at
+    once was ~60 GB and the box's cgroup killed the first run there)."""
     from safetensors.torch import load_file, save_file
-    ad_dir = os.path.join(args.out, "adapter_best" if best[1] else "adapter_last")
+    ad_dir = os.path.join(args.out, "adapter_best")
+    if not os.path.exists(os.path.join(ad_dir, "adapter_model.safetensors")):
+        ad_dir = os.path.join(args.out, "adapter_last")
     ad = load_file(os.path.join(ad_dir, "adapter_model.safetensors"))
     scale = args.alpha / args.r
-    # adapter keys look like base_model.model.model.layers.N.mlp.gate_proj.lora_A.weight
-    def key_of(name):  # → the fold checkpoint's key
+    def key_of(name):  # adapter key → the fold checkpoint's key
         base = name.replace("base_model.model.", "").replace(".lora_A.weight", "").replace(".lora_B.weight", "")
         return base.replace("model.", "model.language_model.", 1) + ".weight"
-    deltas = {}
+    pairs = {}
     for k in ad:
         if k.endswith("lora_A.weight"):
-            kb = k.replace("lora_A", "lora_B")
-            A, B = ad[k].float(), ad[kb].float()
-            deltas[key_of(k)] = (B @ A) * scale
-    log(f"merging {len(deltas)} adapters")
+            pairs[key_of(k)] = (k, k.replace("lora_A", "lora_B"))
+    log(f"merging {len(pairs)} adapters from {ad_dir}")
     idx = json.load(open(os.path.join(args.model, "model.safetensors.index.json")))
     files = sorted(set(idx["weight_map"].values()))
-    out_dir = os.path.join(args.out, "merged"); os.makedirs(out_dir, exist_ok=True)
+    in_place = getattr(args, "merge_in_place", False)
+    out_dir = args.model if in_place else os.path.join(args.out, "merged")
+    os.makedirs(out_dir, exist_ok=True)
     wm = {}
     n_merged = 0
     for f in files:
-        part = load_file(os.path.join(args.model, f))
+        src = os.path.join(args.model, f)
+        part = load_file(src)
         new = {}
         for k, v in part.items():
-            if k in deltas:
-                new[k] = (v.float() + deltas[k]).to(torch.bfloat16).contiguous(); n_merged += 1
+            if k in pairs:
+                ka, kb = pairs[k]
+                delta = (ad[kb].float() @ ad[ka].float()) * scale
+                new[k] = (v.float() + delta).to(torch.bfloat16).contiguous(); n_merged += 1
+                del delta
             else:
                 new[k] = v
-        save_file(new, os.path.join(out_dir, f), metadata={"format": "pt"})
+        if in_place:
+            # overwrite the shard where it really lives (the dir may hold
+            # symlinks across filesystems); one shard of slack per filesystem
+            real = os.path.realpath(src)
+            save_file(new, real + ".tmp", metadata={"format": "pt"})
+            os.replace(real + ".tmp", real)
+        else:
+            save_file(new, os.path.join(out_dir, f), metadata={"format": "pt"})
         for k in new: wm[k] = f
         del part, new; gc.collect()
-    json.dump({"metadata": idx.get("metadata", {}), "weight_map": wm}, open(os.path.join(out_dir, "model.safetensors.index.json"), "w"), indent=1)
-    import shutil
-    for fn in os.listdir(args.model):
-        if fn.endswith((".json", ".jinja", ".txt")) and fn != "model.safetensors.index.json":
-            shutil.copy(os.path.join(args.model, fn), os.path.join(out_dir, fn))
-    log(f"merged checkpoint: {out_dir} ({n_merged} tensors merged)")
+        log(f"  {f} written")
+    if not in_place:
+        json.dump({"metadata": idx.get("metadata", {}), "weight_map": wm}, open(os.path.join(out_dir, "model.safetensors.index.json"), "w"), indent=1)
+        import shutil
+        for fn in os.listdir(args.model):
+            if fn.endswith((".json", ".jinja", ".txt")) and fn != "model.safetensors.index.json":
+                shutil.copy(os.path.join(args.model, fn), os.path.join(out_dir, fn))
+    open(os.path.join(out_dir, "HEALED"), "w").write(f"{ad_dir}\n")
+    log(f"merged checkpoint: {out_dir} ({n_merged} tensors merged{', in place' if in_place else ''})")
 
 if __name__ == "__main__":
     main()
