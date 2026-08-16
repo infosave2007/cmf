@@ -11,17 +11,20 @@ use cortiq_embryo::ops::lcg_vec;
 #[test]
 fn every_tensor_matches_finite_differences() {
     let Some(c) = ctx() else { return };
-    for hier in [false, true] {
+    for variant in 0..3 {
     let mut cfg = EmbryoCfg::tiny();
-    if !hier {
-        cfg.head_clusters = 0;
+    match variant {
+        0 => cfg.head_clusters = 0,
+        2 => cfg.experts = 4,
+        _ => {}
     }
-    eprintln!("=== head: {} ===", if hier { "hierarchical" } else { "flat" });
+    eprintln!("=== variant {variant}: head {} experts {} ===", if cfg.head_clusters > 0 { "hierarchical" } else { "flat" }, cfg.experts);
     let (b, t) = (2usize, 64usize);
     let m = b * t;
     let lay = Layout::new(&cfg);
     let p0 = init_params(&cfg, &lay, 7);
     let mut gpu = EmbryoGpu::new(cfg.clone(), b, t, &p0).expect("gpu");
+    gpu.desc_updates.set(false);
     let tokens: Vec<u32> = lcg_vec(11, m).iter().map(|x| ((x * 0.5 + 0.5) * cfg.vocab as f32) as u32 % cfg.vocab as u32).collect();
     let targets: Vec<u32> = lcg_vec(12, m).iter().map(|x| ((x * 0.5 + 0.5) * cfg.vocab as f32) as u32 % cfg.vocab as u32).collect();
     // analytic gradient
@@ -34,6 +37,7 @@ fn every_tensor_matches_finite_differences() {
     gpu.encode_fwd_bwd(&cmd);
     cmd.commit();
     let g = gpu.grads_host();
+    gpu.route_frozen.set(true); // FD inside the analytic pass's routing region
     let l0 = gpu.eval_loss(&tokens, &targets);
     eprintln!("loss {l0:.5} (ln V = {:.5})", (cfg.vocab as f64).ln());
     let mut worst_all = 0.0f64;

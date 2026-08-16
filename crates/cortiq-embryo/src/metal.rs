@@ -64,6 +64,13 @@ pub struct Ctx {
     scatter_add_rows: ComputePipelineState,
     softmax_ce_idx: ComputePipelineState,
     group_sum: ComputePipelineState,
+    route: ComputePipelineState,
+    route_group: ComputePipelineState,
+    moe_gather: ComputePipelineState,
+    moe_scatter_add: ComputePipelineState,
+    moe_stats: ComputePipelineState,
+    moe_update: ComputePipelineState,
+    moe_indirect: ComputePipelineState,
 }
 unsafe impl Send for Ctx {}
 unsafe impl Sync for Ctx {}
@@ -166,6 +173,13 @@ fn init() -> Result<Ctx, String> {
         scatter_add_rows: pso("scatter_add_rows_f32")?,
         softmax_ce_idx: pso("softmax_ce_idx_f32")?,
         group_sum: pso("group_sum_heads_f32")?,
+        route: pso("route_f32")?,
+        route_group: pso("route_group_f32")?,
+        moe_gather: pso("moe_gather_f32")?,
+        moe_scatter_add: pso("moe_scatter_add_f32")?,
+        moe_stats: pso("moe_stats_f32")?,
+        moe_update: pso("moe_update_f32")?,
+        moe_indirect: pso("moe_indirect_args_f32")?,
         gemm,
         _lib: lib,
         queue,
@@ -297,6 +311,37 @@ impl<'a> Cmd<'a> {
         batch: &GemmBatch,
         causal: bool,
     ) {
+        self.gemm_dyn(ta, tb, m, n, k, alpha, a, a_off, lda, b, b_off, ldb, beta, cbuf, c_off, ldc, batch, causal, &GemmDyn::none());
+    }
+
+    /// GEMM with a GPU-decided shape: `dynamic.indirect` = (buffer, byte
+    /// offset) holding the threadgroup grid (rows may be fewer than m/64
+    /// tiles), `dynamic.kcount` = (buffer, element offset) with per-batch
+    /// row counts → K = min(round64(count), k). Used by the routed experts so
+    /// no expert computes its empty capacity rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_dyn(
+        &self,
+        ta: Op,
+        tb: Op,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        a: &GBuf,
+        a_off: usize,
+        lda: usize,
+        b: &GBuf,
+        b_off: usize,
+        ldb: usize,
+        beta: f32,
+        cbuf: &GBuf,
+        c_off: usize,
+        ldc: usize,
+        batch: &GemmBatch,
+        causal: bool,
+        dynamic: &GemmDyn<'_>,
+    ) {
         assert!(m % 64 == 0 && n % 64 == 0 && k % 32 == 0, "gemm tile alignment: m={m} n={n} k={k}");
         assert!(lda % 4 == 0 && ldb % 4 == 0 && ldc % 4 == 0 && a_off % 4 == 0 && b_off % 4 == 0 && c_off % 4 == 0);
         let (arows, acols) = if ta == Op::N { (m, k) } else { (k, m) };
@@ -326,6 +371,7 @@ impl<'a> Cmd<'a> {
             nb_h: u32,
             nb_c: u32,
             mask: u32,
+            kdyn: u32,
         }
         let cv = |s: [usize; 3]| [s[0] as u64, s[1] as u64, s[2] as u64];
         let args = Args {
@@ -343,6 +389,7 @@ impl<'a> Cmd<'a> {
             nb_h: nh as u32,
             nb_c: nc as u32,
             mask: causal as u32,
+            kdyn: dynamic.kcount.is_some() as u32,
         };
         let idx = (ta == Op::T) as usize * 2 + (tb == Op::T) as usize;
         let e = &self.enc;
@@ -351,10 +398,17 @@ impl<'a> Cmd<'a> {
         e.set_buffer(1, Some(&b.buf), (b_off * 4) as u64);
         e.set_buffer(2, Some(&cbuf.buf), (c_off * 4) as u64);
         e.set_bytes(3, std::mem::size_of::<Args>() as u64, &args as *const Args as *const c_void);
-        e.dispatch_thread_groups(
-            MTLSize::new((n / 64) as u64, (m / 64) as u64, (nb * nh * nc) as u64),
-            MTLSize::new(128, 1, 1),
-        );
+        match dynamic.kcount {
+            Some((kb, koff)) => e.set_buffer(4, Some(&kb.buf), (koff * 4) as u64),
+            None => e.set_buffer(4, Some(&a.buf), 0), // never read (kdyn = 0)
+        }
+        match dynamic.indirect {
+            Some((ib, ioff)) => e.dispatch_thread_groups_indirect(&ib.buf, ioff as u64, MTLSize::new(128, 1, 1)),
+            None => e.dispatch_thread_groups(
+                MTLSize::new((n / 64) as u64, (m / 64) as u64, (nb * nh * nc) as u64),
+                MTLSize::new(128, 1, 1),
+            ),
+        }
     }
 
     fn set_u32(&self, idx: u64, v: u32) {
@@ -1148,6 +1202,135 @@ impl<'a> Cmd<'a> {
         self.grid1(b * t * kvh * hd, 256);
     }
 
+    // ---------------- routed experts ----------------
+
+    fn route_args(&self, idx: u64, r: &RouteDims) {
+        #[repr(C)]
+        struct Args {
+            rows: u32,
+            h: u32,
+            e: u32,
+            k: u32,
+            cap: u32,
+        }
+        let a = Args { rows: r.rows as u32, h: r.h as u32, e: r.e as u32, k: r.k as u32, cap: r.cap as u32 };
+        self.enc.set_bytes(idx, std::mem::size_of::<Args>() as u64, &a as *const Args as *const c_void);
+    }
+
+    /// assign[row] = argmin_e resonance − bias; res[row] = winning resonance.
+    #[allow(clippy::too_many_arguments)]
+    pub fn route(&self, r: &RouteDims, x: &GBuf, mu: &GBuf, mu_off: usize, u: &GBuf, u_off: usize, bias: &GBuf, bias_off: usize, assign: &GBuf, res: &GBuf) {
+        assert!(r.e <= 64 && x.len >= r.rows * r.h && assign.len >= r.rows && res.len >= r.rows);
+        assert!(mu.len >= mu_off + r.e * r.h && bias.len >= bias_off + r.e && u.len >= u_off + r.e * r.k * r.h);
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.route);
+        e.set_buffer(0, Some(&x.buf), 0);
+        e.set_buffer(1, Some(&mu.buf), (mu_off * 4) as u64);
+        e.set_buffer(2, Some(&u.buf), (u_off * 4) as u64);
+        e.set_buffer(3, Some(&bias.buf), (bias_off * 4) as u64);
+        e.set_buffer(4, Some(&assign.buf), 0);
+        e.set_buffer(5, Some(&res.buf), 0);
+        self.route_args(6, r);
+        e.dispatch_thread_groups(MTLSize::new(r.rows as u64, 1, 1), MTLSize::new(64, 1, 1));
+    }
+
+    /// slot[row] = rank within its expert; count[e].
+    pub fn route_group(&self, r: &RouteDims, assign: &GBuf, slot: &GBuf, count: &GBuf, count_off: usize) {
+        assert!(slot.len >= r.rows && count.len >= count_off + r.e);
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.route_group);
+        e.set_buffer(0, Some(&assign.buf), 0);
+        e.set_buffer(1, Some(&slot.buf), 0);
+        e.set_buffer(2, Some(&count.buf), (count_off * 4) as u64);
+        self.route_args(3, r);
+        e.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
+    }
+
+    /// hg[e][slot] = x[row] (slot < cap); zero the buffer first.
+    pub fn moe_gather(&self, r: &RouteDims, x: &GBuf, assign: &GBuf, slot: &GBuf, hg: &GBuf) {
+        assert!(hg.len >= r.e * r.cap * r.h && x.len >= r.rows * r.h);
+        self.axpby(0.0, hg, 0.0, hg, r.e * r.cap * r.h);
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.moe_gather);
+        e.set_buffer(0, Some(&x.buf), 0);
+        e.set_buffer(1, Some(&assign.buf), 0);
+        e.set_buffer(2, Some(&slot.buf), 0);
+        e.set_buffer(3, Some(&hg.buf), 0);
+        self.route_args(4, r);
+        let tgx = 64u64.min(r.h as u64).max(1);
+        e.dispatch_thread_groups(MTLSize::new((r.h as u64).div_ceil(tgx), r.rows as u64, 1), MTLSize::new(tgx, 1, 1));
+    }
+
+    /// out[row] += yh[e][slot] (slot < cap).
+    pub fn moe_scatter_add(&self, r: &RouteDims, out: &GBuf, assign: &GBuf, slot: &GBuf, yh: &GBuf) {
+        assert!(yh.len >= r.e * r.cap * r.h && out.len >= r.rows * r.h);
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.moe_scatter_add);
+        e.set_buffer(0, Some(&out.buf), 0);
+        e.set_buffer(1, Some(&assign.buf), 0);
+        e.set_buffer(2, Some(&slot.buf), 0);
+        e.set_buffer(3, Some(&yh.buf), 0);
+        self.route_args(4, r);
+        let tgx = 64u64.min(r.h as u64).max(1);
+        e.dispatch_thread_groups(MTLSize::new((r.h as u64).div_ceil(tgx), r.rows as u64, 1), MTLSize::new(tgx, 1, 1));
+    }
+
+    /// sums[e][j] over the filled slots of expert e.
+    pub fn moe_stats(&self, r: &RouteDims, hg: &GBuf, count: &GBuf, count_off: usize, sums: &GBuf, sums_off: usize) {
+        assert!(sums.len >= sums_off + r.e * r.h);
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.moe_stats);
+        e.set_buffer(0, Some(&hg.buf), 0);
+        e.set_buffer(1, Some(&count.buf), (count_off * 4) as u64);
+        e.set_buffer(2, Some(&sums.buf), (sums_off * 4) as u64);
+        self.route_args(3, r);
+        self.grid1(r.e * r.h, 128);
+    }
+
+    /// μ EMA + balancing bias update from the step's routing statistics.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_update(&self, r: &RouteDims, mu: &GBuf, mu_off: usize, bias: &GBuf, bias_off: usize, sums: &GBuf, sums_off: usize, count: &GBuf, count_off: usize, alpha: f32, eta: f32) {
+        #[repr(C)]
+        struct Args {
+            rows: u32,
+            h: u32,
+            e: u32,
+            alpha: f32,
+            eta: f32,
+        }
+        let a = Args { rows: r.rows as u32, h: r.h as u32, e: r.e as u32, alpha, eta };
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.moe_update);
+        e.set_buffer(0, Some(&mu.buf), (mu_off * 4) as u64);
+        e.set_buffer(1, Some(&bias.buf), (bias_off * 4) as u64);
+        e.set_buffer(2, Some(&sums.buf), (sums_off * 4) as u64);
+        e.set_buffer(3, Some(&count.buf), (count_off * 4) as u64);
+        e.set_bytes(4, std::mem::size_of::<Args>() as u64, &a as *const Args as *const c_void);
+        self.grid1(r.e * r.h, 128);
+    }
+
+    /// Per-expert indirect grids from the routing counts: two sets of
+    /// {n/64, ceil(min(count,cap)/64), 1} (n1 columns, n2 columns) at
+    /// args[off..off + 2·E·3] (u32 elements).
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_indirect_args(&self, count: &GBuf, count_off: usize, args: &GBuf, args_off: usize, e_n: usize, cap: usize, n1: usize, n2: usize) {
+        assert!(args.len >= args_off + 2 * e_n * 3 && count.len >= count_off + e_n);
+        #[repr(C)]
+        struct A {
+            e: u32,
+            cap: u32,
+            n1: u32,
+            n2: u32,
+        }
+        let a = A { e: e_n as u32, cap: cap as u32, n1: n1 as u32, n2: n2 as u32 };
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.moe_indirect);
+        e.set_buffer(0, Some(&count.buf), (count_off * 4) as u64);
+        e.set_buffer(1, Some(&args.buf), (args_off * 4) as u64);
+        e.set_bytes(2, std::mem::size_of::<A>() as u64, &a as *const A as *const c_void);
+        self.grid1(e_n, 64);
+    }
+
     /// Submit and wait. Returns GPU time in milliseconds (GPUEndTime −
     /// GPUStartTime) — the number the TFLOPS bench reports.
     pub fn commit(self) -> f64 {
@@ -1291,5 +1474,31 @@ impl HkScratch<'_> {
     pub fn states(d: &HkDims) -> [usize; 3] {
         let (p2, nch) = (2 * d.nph, d.t / 64);
         [d.nh * (nch + 1) * p2 * d.dv, (nch + 1) * p2 * d.dv, p2 * d.dv]
+    }
+}
+
+/// Routing dimensions of one expert block.
+#[derive(Clone, Copy, Debug)]
+pub struct RouteDims {
+    pub rows: usize,
+    pub h: usize,
+    pub e: usize,
+    /// principal directions per descriptor (0 = distance-to-mean only)
+    pub k: usize,
+    pub cap: usize,
+}
+
+/// GPU-decided GEMM shape (see `Cmd::gemm_dyn`).
+#[derive(Clone, Copy)]
+pub struct GemmDyn<'a> {
+    /// (buffer, BYTE offset) of MTLDispatchThreadgroupsIndirectArguments
+    pub indirect: Option<(&'a GBuf, usize)>,
+    /// (buffer, element offset) of per-batch u32 row counts
+    pub kcount: Option<(&'a GBuf, usize)>,
+}
+
+impl GemmDyn<'_> {
+    pub fn none() -> GemmDyn<'static> {
+        GemmDyn { indirect: None, kcount: None }
     }
 }

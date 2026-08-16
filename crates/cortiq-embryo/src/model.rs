@@ -136,9 +136,12 @@ impl EmbryoCfg {
 
 #[derive(Clone, Debug)]
 pub struct FfnOffs {
-    pub wg: usize, // [I, H]
+    pub wg: usize, // [I, H]  shared expert
     pub wu: usize, // [I, H]
     pub wd: usize, // [H, I]
+    /// routed experts: expert e's gate at `experts + e·3·H·I`, up at +H·I,
+    /// down at +2·H·I (usize::MAX when cfg.experts == 0)
+    pub experts: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -191,10 +194,20 @@ impl Layout {
         let embed = take("embed".into(), cfg.vocab * h);
         let mut layers = Vec::new();
         for l in 0..cfg.layers {
-            let ffn = |take: &mut dyn FnMut(String, usize) -> usize| FfnOffs {
-                wg: take(format!("layers.{l}.ffn.gate"), cfg.inter * h),
-                wu: take(format!("layers.{l}.ffn.up"), cfg.inter * h),
-                wd: take(format!("layers.{l}.ffn.down"), h * cfg.inter),
+            let ffn = |take: &mut dyn FnMut(String, usize) -> usize| {
+                let wg = take(format!("layers.{l}.ffn.gate"), cfg.inter * h);
+                let wu = take(format!("layers.{l}.ffn.up"), cfg.inter * h);
+                let wd = take(format!("layers.{l}.ffn.down"), h * cfg.inter);
+                let mut experts = usize::MAX;
+                for e in 0..cfg.experts {
+                    let g = take(format!("layers.{l}.experts.{e}.gate"), cfg.inter * h);
+                    take(format!("layers.{l}.experts.{e}.up"), cfg.inter * h);
+                    take(format!("layers.{l}.experts.{e}.down"), h * cfg.inter);
+                    if e == 0 {
+                        experts = g;
+                    }
+                }
+                FfnOffs { wg, wu, wd, experts }
             };
             if cfg.is_anchor(l) {
                 let ln1 = take(format!("layers.{l}.ln1"), h);
@@ -269,6 +282,12 @@ pub fn init_params(cfg: &EmbryoCfg, lay: &Layout, seed: u64) -> Vec<f32> {
                 fill(&mut p, ffn.wg, cfg.inter * h, std);
                 fill(&mut p, ffn.wu, cfg.inter * h, std);
                 fill(&mut p, ffn.wd, h * cfg.inter, std * out_scale);
+                for e in 0..cfg.experts {
+                    let base = ffn.experts + e * 3 * h * cfg.inter;
+                    fill(&mut p, base, cfg.inter * h, std);
+                    fill(&mut p, base + cfg.inter * h, cfg.inter * h, std);
+                    fill(&mut p, base + 2 * cfg.inter * h, h * cfg.inter, std * out_scale);
+                }
             }
             LayerOffs::Anchor { ln1, wq, wk, wv, wo, ln2, ffn } => {
                 p[*ln1..*ln1 + h].fill(1.0);
@@ -280,6 +299,12 @@ pub fn init_params(cfg: &EmbryoCfg, lay: &Layout, seed: u64) -> Vec<f32> {
                 fill(&mut p, ffn.wg, cfg.inter * h, std);
                 fill(&mut p, ffn.wu, cfg.inter * h, std);
                 fill(&mut p, ffn.wd, h * cfg.inter, std * out_scale);
+                for e in 0..cfg.experts {
+                    let base = ffn.experts + e * 3 * h * cfg.inter;
+                    fill(&mut p, base, cfg.inter * h, std);
+                    fill(&mut p, base + cfg.inter * h, cfg.inter * h, std);
+                    fill(&mut p, base + 2 * cfg.inter * h, h * cfg.inter, std * out_scale);
+                }
             }
         }
     }
@@ -296,7 +321,14 @@ pub use gpu::*;
 #[cfg(target_os = "macos")]
 mod gpu {
     use super::*;
-    use crate::metal::{Cmd, Ctx, GBuf, GemmBatch, HkDims, HkGrads, HkScratch, HkWork, Op, ctx, hk_pow_table};
+    use crate::metal::{Cmd, Ctx, GBuf, GemmBatch, GemmDyn, HkDims, HkGrads, HkScratch, HkWork, Op, RouteDims, ctx, hk_pow_table};
+
+    /// principal directions per expert descriptor (reserved; filled by the
+    /// periodic PCA of the routed inputs)
+    pub const MOE_K: usize = 16;
+    /// EMA rate of the descriptor means and the balancing-bias step
+    pub const MOE_ALPHA: f32 = 0.05;
+    pub const MOE_ETA: f32 = 0.5;
     use crate::ops::hk_decay_grid;
 
     /// Per-layer activation buffers kept for the backward (M = B·T rows).
@@ -340,6 +372,39 @@ mod gpu {
         },
     }
 
+    /// Routed-expert activations of one layer (kept for the backward).
+    pub struct MoeActs {
+        pub assign: GBuf, // [M] u32 expert of each token
+        pub slot: GBuf,   // [M] u32 rank within its expert (≥ cap: dropped)
+        pub res: GBuf,    // [M] winning resonance
+        pub hg: GBuf,     // [E, cap, H] gathered inputs
+        pub gte: GBuf,    // [E, cap, I]
+        pub up: GBuf,
+        pub hh: GBuf,
+        pub yh: GBuf,     // [E, cap, H] expert outputs
+    }
+
+    /// Resonance descriptors of all layers' experts (not gradient-trained:
+    /// online statistics — μ EMA, balancing bias; U by periodic PCA).
+    pub struct Desc {
+        pub mu: GBuf,    // [L, E, H]
+        pub u: GBuf,     // [L, E, K, H]
+        pub bias: GBuf,  // [L, E]
+        pub count: GBuf, // [L, E] u32 tokens routed last step
+        pub sums: GBuf,  // [L, E, H] Σ inputs last step
+        pub indir: GBuf, // [L, 2, E, 3] u32 indirect dispatch grids
+    }
+
+    /// Initial descriptor means: unit-RMS Gaussian points (the FFN input is
+    /// RMS-normed) — a k-means-style random init the EMA then moves.
+    pub fn desc_init(cfg: &EmbryoCfg, seed: u64) -> Vec<f32> {
+        let n = cfg.layers * cfg.experts * cfg.hidden;
+        if n == 0 {
+            return vec![0.0; 1];
+        }
+        gauss_vec(seed, n)
+    }
+
     /// Scratch for the backward, shared by all layers.
     pub struct Scratch {
         pub dx: GBuf,     // [M,H] the gradient flowing down the residual stream
@@ -363,6 +428,12 @@ mod gpu {
         pub dgte: GBuf,   // [M,I]
         pub dup: GBuf,    // [M,I]
         pub logits: GBuf, // [R, V] head row chunk
+        // routed experts backward scratch (per layer reuse)
+        pub moe_dyh: GBuf,  // [E, cap, H]
+        pub moe_dhg: GBuf,  // [E, cap, H]
+        pub moe_dffn: GBuf, // [E, cap, I]
+        pub moe_dgte: GBuf, // [E, cap, I]
+        pub moe_dup: GBuf,  // [E, cap, I]
         // hybrid_k GEMM-formulation scratch (chunk-major tables + A)
         pub hk_qt: GBuf,
         pub hk_kt: GBuf,
@@ -405,6 +476,15 @@ mod gpu {
         pub lc: GBuf,    // [M, C] cluster logits
         pub loss2: GBuf, // [M]
         pub mpad: usize,
+        /// routed experts: per-layer activations, descriptors, capacity
+        pub moe: Vec<MoeActs>,
+        pub desc: Desc,
+        pub moe_cap: usize,
+        /// online descriptor updates during training forwards (tests turn it off)
+        pub desc_updates: std::cell::Cell<bool>,
+        /// reuse the previous step's expert assignments instead of routing (the
+        /// gradcheck freezes the piecewise-linear region; never set in training)
+        pub route_frozen: std::cell::Cell<bool>,
         pub scratch: Scratch,
         pub step: u32,
         /// rows per head chunk (logits [head_rows, V] materialised at a time)
@@ -470,6 +550,30 @@ mod gpu {
             }
             let head_rows = 1024.min(m);
             assert!(m % head_rows == 0);
+            // routed experts: capacity factor 2 per expert, rows padded to the tile
+            let ne = cfg.experts;
+            let moe_cap = if ne > 0 { (2 * m / ne).div_ceil(64) * 64 } else { 0 };
+            let mut moe = Vec::new();
+            for _ in 0..cfg.layers {
+                moe.push(MoeActs {
+                    assign: GBuf::from_u32(c, &vec![0u32; m.max(1)]),
+                    slot: GBuf::from_u32(c, &vec![0u32; m.max(1)]),
+                    res: z(m),
+                    hg: z(ne * moe_cap * h),
+                    gte: z(ne * moe_cap * cfg.inter),
+                    up: z(ne * moe_cap * cfg.inter),
+                    hh: z(ne * moe_cap * cfg.inter),
+                    yh: z(ne * moe_cap * h),
+                });
+            }
+            let desc = Desc {
+                mu: GBuf::from_slice(c, &desc_init(&cfg, 12345)),
+                u: z(cfg.layers * ne * MOE_K * h),
+                bias: z(cfg.layers * ne),
+                count: GBuf::from_u32(c, &vec![0u32; (cfg.layers * ne).max(1)]),
+                sums: z(cfg.layers * ne * h),
+                indir: GBuf::from_u32(c, &vec![0u32; (cfg.layers * 2 * ne * 3).max(1)]),
+            };
             let ncl = cfg.head_clusters;
             let mpad = m + ncl * 64;
             let cs = if ncl > 0 { cfg.vocab / ncl } else { 0 };
@@ -501,6 +605,11 @@ mod gpu {
                 dgte: z(m * cfg.inter),
                 dup: z(m * cfg.inter),
                 logits: z(head_rows * cfg.vocab),
+                moe_dyh: z(ne * moe_cap * h),
+                moe_dhg: z(ne * moe_cap * h),
+                moe_dffn: z(ne * moe_cap * cfg.inter),
+                moe_dgte: z(ne * moe_cap * cfg.inter),
+                moe_dup: z(ne * moe_cap * cfg.inter),
                 hk_qt: z(m * 2 * nhp),
                 hk_kt: z(m * 2 * nhp),
                 hk_qp: z(m * 2 * nhp),
@@ -537,6 +646,11 @@ mod gpu {
                 lc: z(m * ncl.max(1)),
                 loss2: z(m),
                 mpad,
+                moe,
+                desc,
+                moe_cap,
+                desc_updates: std::cell::Cell::new(true),
+                route_frozen: std::cell::Cell::new(false),
                 scratch,
                 step: 0,
                 head_rows,
@@ -556,7 +670,14 @@ mod gpu {
             ctx().expect("Metal context")
         }
 
-        fn ffn_fwd(&self, cmd: &Cmd, m: usize, ffn: &FfnOffs, x2: &GBuf, gte: &GBuf, up: &GBuf, hh: &GBuf, x_mid: &GBuf, x_out: &GBuf) {
+        fn route_dims(&self) -> RouteDims {
+            RouteDims { rows: self.b * self.t, h: self.cfg.hidden, e: self.cfg.experts, k: MOE_K, cap: self.moe_cap }
+        }
+
+        /// Shared expert + routed experts (top-1 by resonance) forward;
+        /// `l` indexes the layer's MoE activations and descriptors.
+        #[allow(clippy::too_many_arguments)]
+        fn ffn_fwd(&self, cmd: &Cmd, l: usize, m: usize, ffn: &FfnOffs, x2: &GBuf, gte: &GBuf, up: &GBuf, hh: &GBuf, x_mid: &GBuf, x_out: &GBuf, train: bool) {
             let (h, i) = (self.cfg.hidden, self.cfg.inter);
             // gate/up: [M,H]·[I,H]ᵀ
             cmd.gemm(Op::N, Op::T, m, i, h, 1.0, x2, 0, h, &self.p, ffn.wg, h, 0.0, gte, 0, i);
@@ -565,12 +686,52 @@ mod gpu {
             // x_out = x_mid + hh·Wdᵀ  ([M,I]·[H,I]ᵀ)
             cmd.copy(x_mid, 0, x_out, 0, m * h);
             cmd.gemm(Op::N, Op::T, m, h, i, 1.0, hh, 0, i, &self.p, ffn.wd, i, 1.0, x_out, 0, h);
+            let ne = self.cfg.experts;
+            if ne == 0 {
+                return;
+            }
+            // ---- routed experts ----
+            let r = self.route_dims();
+            let mo = &self.moe[l];
+            let d = &self.desc;
+            let (mu_off, u_off, e_off) = (l * ne * h, l * ne * MOE_K * h, l * ne);
+            if !self.route_frozen.get() {
+                cmd.route(&r, x2, &d.mu, mu_off, &d.u, u_off, &d.bias, e_off, &mo.assign, &mo.res);
+                cmd.route_group(&r, &mo.assign, &mo.slot, &d.count, e_off);
+            }
+            cmd.moe_gather(&r, x2, &mo.assign, &mo.slot, &mo.hg);
+            let cap = self.moe_cap;
+            let ew = 3 * h * i; // expert weight stride
+            // per-expert GEMMs over the FILLED rows only: grids come from
+            // count[e] on the GPU (indirect dispatch), no host readback
+            let ind_off = l * 2 * ne * 3;
+            cmd.moe_indirect_args(&d.count, e_off, &d.indir, ind_off, ne, cap, i, h);
+            for e in 0..ne {
+                let ind_i = GemmDyn { indirect: Some((&d.indir, (ind_off + e * 3) * 4)), kcount: None };
+                let (wg, wu) = (ffn.experts + e * ew, ffn.experts + e * ew + h * i);
+                let (hg_o, gi_o) = (e * cap * h, e * cap * i);
+                cmd.gemm_dyn(Op::N, Op::T, cap, i, h, 1.0, &mo.hg, hg_o, h, &self.p, wg, h, 0.0, &mo.gte, gi_o, i, &GemmBatch::none(), false, &ind_i);
+                cmd.gemm_dyn(Op::N, Op::T, cap, i, h, 1.0, &mo.hg, hg_o, h, &self.p, wu, h, 0.0, &mo.up, gi_o, i, &GemmBatch::none(), false, &ind_i);
+            }
+            cmd.swiglu_fwd(&mo.gte, &mo.up, &mo.hh, ne * cap * i);
+            for e in 0..ne {
+                let ind_h = GemmDyn { indirect: Some((&d.indir, (ind_off + (ne + e) * 3) * 4)), kcount: None };
+                let wd = ffn.experts + e * ew + 2 * h * i;
+                let (hg_o, gi_o) = (e * cap * h, e * cap * i);
+                cmd.gemm_dyn(Op::N, Op::T, cap, h, i, 1.0, &mo.hh, gi_o, i, &self.p, wd, i, 0.0, &mo.yh, hg_o, h, &GemmBatch::none(), false, &ind_h);
+            }
+            cmd.moe_scatter_add(&r, x_out, &mo.assign, &mo.slot, &mo.yh);
+            if train && self.desc_updates.get() {
+                // descriptor statistics → μ EMA + balancing bias
+                cmd.moe_stats(&r, &mo.hg, &d.count, e_off, &d.sums, mu_off);
+                cmd.moe_update(&r, &d.mu, mu_off, &d.bias, e_off, &d.sums, mu_off, &d.count, e_off, MOE_ALPHA, MOE_ETA);
+            }
         }
 
         /// FFN backward: dx_out (in s.dx) → accumulates dx_mid into s.dx via
         /// the ln2 backward; weight grads into g.
         #[allow(clippy::too_many_arguments)]
-        fn ffn_bwd(&self, cmd: &Cmd, m: usize, ffn: &FfnOffs, ln2: usize, x_mid: &GBuf, x2: &GBuf, inv2: &GBuf, gte: &GBuf, up: &GBuf, hh: &GBuf) {
+        fn ffn_bwd(&self, cmd: &Cmd, l: usize, m: usize, ffn: &FfnOffs, ln2: usize, x_mid: &GBuf, x2: &GBuf, inv2: &GBuf, gte: &GBuf, up: &GBuf, hh: &GBuf) {
             let s = &self.scratch;
             let (h, i) = (self.cfg.hidden, self.cfg.inter);
             // dhh = dx·Wd  ([M,H]·[H,I])
@@ -584,12 +745,48 @@ mod gpu {
             // dWg += dgteᵀ·x2 ; dWu += dupᵀ·x2
             cmd.gemm(Op::T, Op::N, i, h, m, 1.0, &s.dgte, 0, i, x2, 0, h, 1.0, &self.g, ffn.wg, h);
             cmd.gemm(Op::T, Op::N, i, h, m, 1.0, &s.dup, 0, i, x2, 0, h, 1.0, &self.g, ffn.wu, h);
+            let ne = self.cfg.experts;
+            if ne > 0 {
+                // ---- routed experts: same graph on the gathered slots ----
+                let r = self.route_dims();
+                let mo = &self.moe[l];
+                let cap = self.moe_cap;
+                let ew = 3 * h * i;
+                // dyh[e][slot] = dx_out[row]
+                cmd.moe_gather(&r, &s.dx, &mo.assign, &mo.slot, &s.moe_dyh);
+                let ind_off = l * 2 * ne * 3;
+                let d = &self.desc;
+                for e in 0..ne {
+                    let ind_i = GemmDyn { indirect: Some((&d.indir, (ind_off + e * 3) * 4)), kcount: None };
+                    let kdyn = GemmDyn { indirect: None, kcount: Some((&d.count, l * ne + e)) };
+                    let wd = ffn.experts + e * ew + 2 * h * i;
+                    let (hg_o, gi_o) = (e * cap * h, e * cap * i);
+                    // dhh = dyh·Wd_e ([rows,H]·[H,I]);  dWd_e += dyhᵀ·hh (K = rows)
+                    cmd.gemm_dyn(Op::N, Op::N, cap, i, h, 1.0, &s.moe_dyh, hg_o, h, &self.p, wd, i, 0.0, &s.moe_dffn, gi_o, i, &GemmBatch::none(), false, &ind_i);
+                    cmd.gemm_dyn(Op::T, Op::N, h, i, cap, 1.0, &s.moe_dyh, hg_o, h, &mo.hh, gi_o, i, 1.0, &self.g, wd, i, &GemmBatch::none(), false, &kdyn);
+                }
+                cmd.swiglu_bwd(&mo.gte, &mo.up, &s.moe_dffn, &s.moe_dgte, &s.moe_dup, ne * cap * i);
+                for e in 0..ne {
+                    let ind_h = GemmDyn { indirect: Some((&d.indir, (ind_off + (ne + e) * 3) * 4)), kcount: None };
+                    let kdyn = GemmDyn { indirect: None, kcount: Some((&d.count, l * ne + e)) };
+                    let (wg, wu) = (ffn.experts + e * ew, ffn.experts + e * ew + h * i);
+                    let (hg_o, gi_o) = (e * cap * h, e * cap * i);
+                    // dhg = dgte·Wg_e + dup·Wu_e
+                    cmd.gemm_dyn(Op::N, Op::N, cap, h, i, 1.0, &s.moe_dgte, gi_o, i, &self.p, wg, h, 0.0, &s.moe_dhg, hg_o, h, &GemmBatch::none(), false, &ind_h);
+                    cmd.gemm_dyn(Op::N, Op::N, cap, h, i, 1.0, &s.moe_dup, gi_o, i, &self.p, wu, h, 1.0, &s.moe_dhg, hg_o, h, &GemmBatch::none(), false, &ind_h);
+                    // dWg_e += dgteᵀ·hg ; dWu_e += dupᵀ·hg  (K = rows)
+                    cmd.gemm_dyn(Op::T, Op::N, i, h, cap, 1.0, &s.moe_dgte, gi_o, i, &mo.hg, hg_o, h, 1.0, &self.g, wg, h, &GemmBatch::none(), false, &kdyn);
+                    cmd.gemm_dyn(Op::T, Op::N, i, h, cap, 1.0, &s.moe_dup, gi_o, i, &mo.hg, hg_o, h, 1.0, &self.g, wu, h, &GemmBatch::none(), false, &kdyn);
+                }
+                // dx2 += scatter(dhg)
+                cmd.moe_scatter_add(&r, &s.dx2, &mo.assign, &mo.slot, &s.moe_dhg);
+            }
             // dx_mid = dx_out + rmsnorm_bwd(x_mid; dx2)  (accumulate into s.dx)
             cmd.rmsnorm_bwd_at(x_mid, &self.p, ln2, &s.dx2, inv2, &s.dx, 1.0, &self.g, ln2, m, h);
         }
 
         /// Forward through layer `l` from acts[l].x_in into `x_out`.
-        pub(crate) fn layer_fwd(&self, cmd: &Cmd, l: usize, x_out: &GBuf) {
+        pub(crate) fn layer_fwd(&self, cmd: &Cmd, l: usize, x_out: &GBuf, train: bool) {
             let cfg = &self.cfg;
             let (b, t, h) = (self.b, self.t, cfg.hidden);
             let m = b * t;
@@ -613,7 +810,7 @@ mod gpu {
                     cmd.copy(x_in, 0, x_mid, 0, m * h);
                     cmd.gemm(Op::N, Op::T, m, h, nh * dv, 1.0, o, 0, nh * dv, &self.p, *wo, nh * dv, 1.0, x_mid, 0, h);
                     cmd.rmsnorm_fwd_at(x_mid, &self.p, *ln2, x2, inv2, m, h, cfg.norm_eps);
-                    self.ffn_fwd(cmd, m, ffn, x2, gte, up, hh, x_mid, x_out);
+                    self.ffn_fwd(cmd, l, m, ffn, x2, gte, up, hh, x_mid, x_out, train);
                 }
                 (
                     LayerOffs::Anchor { ln1, wq, wk, wv, wo, ln2, ffn },
@@ -643,7 +840,7 @@ mod gpu {
                     cmd.copy(x_in, 0, x_mid, 0, m * h);
                     cmd.gemm(Op::N, Op::T, m, h, qd, 1.0, o, 0, qd, &self.p, *wo, qd, 1.0, x_mid, 0, h);
                     cmd.rmsnorm_fwd_at(x_mid, &self.p, *ln2, x2, inv2, m, h, cfg.norm_eps);
-                    self.ffn_fwd(cmd, m, ffn, x2, gte, up, hh, x_mid, x_out);
+                    self.ffn_fwd(cmd, l, m, ffn, x2, gte, up, hh, x_mid, x_out, train);
                 }
                 _ => unreachable!("layout/acts kind mismatch"),
             }
@@ -662,7 +859,7 @@ mod gpu {
                     LayerActs::Mixer { x_in, x1, inv1, thq, thk, v, kpre: _, kappa, phq, phk, kv, states, o, x_mid, x2, inv2, gte, up, hh },
                 ) => {
                     let (nh, nph, dv) = (cfg.heads, cfg.nphase, cfg.dv);
-                    self.ffn_bwd(cmd, m, ffn, *ln2, x_mid, x2, inv2, gte, up, hh);
+                    self.ffn_bwd(cmd, l, m, ffn, *ln2, x_mid, x2, inv2, gte, up, hh);
                     // do = dx_mid·Wo  ([M,H]·[H, nh·dv]);  dWo += dx_midᵀ·o
                     cmd.gemm(Op::N, Op::N, m, nh * dv, h, 1.0, &s.dx, 0, h, &self.p, *wo, nh * dv, 0.0, &s.dbig, 0, nh * dv);
                     cmd.gemm(Op::T, Op::N, h, nh * dv, m, 1.0, &s.dx, 0, h, o, 0, nh * dv, 1.0, &self.g, *wo, nh * dv);
@@ -701,7 +898,7 @@ mod gpu {
                 ) => {
                     let (qh, kvh, hd) = (cfg.anchor_q_heads, cfg.anchor_kv_heads, cfg.anchor_hd);
                     let (qd, kd) = (qh * hd, kvh * hd);
-                    self.ffn_bwd(cmd, m, ffn, *ln2, x_mid, x2, inv2, gte, up, hh);
+                    self.ffn_bwd(cmd, l, m, ffn, *ln2, x_mid, x2, inv2, gte, up, hh);
                     // do = dx_mid·Wo ; dWo += dx_midᵀ·o
                     cmd.gemm(Op::N, Op::N, m, qd, h, 1.0, &s.dx, 0, h, &self.p, *wo, qd, 0.0, &s.dbig, 0, qd);
                     cmd.gemm(Op::T, Op::N, h, qd, m, 1.0, &s.dx, 0, h, o, 0, qd, 1.0, &self.g, *wo, qd);
@@ -868,7 +1065,7 @@ mod gpu {
             cmd.embed_gather_at(&self.p, self.lay.embed, &self.tok, self.x_in(0), m, h);
             for l in 0..cfg.layers {
                 let out: &GBuf = if l + 1 < cfg.layers { self.x_in(l + 1) } else { &self.x_out };
-                self.layer_fwd(cmd, l, out);
+                self.layer_fwd(cmd, l, out, true);
             }
             cmd.rmsnorm_fwd_at(&self.x_out, &self.p, self.lay.final_norm, &self.xf, &self.invf, m, h, cfg.norm_eps);
             self.encode_head(cmd, true);
@@ -926,7 +1123,7 @@ mod gpu {
             cmd.embed_gather_at(&self.p, self.lay.embed, &self.tok, self.x_in(0), m, h);
             for l in 0..cfg.layers {
                 let out: &GBuf = if l + 1 < cfg.layers { self.x_in(l + 1) } else { &self.x_out };
-                self.layer_fwd(&cmd, l, out);
+                self.layer_fwd(&cmd, l, out, false);
             }
             cmd.rmsnorm_fwd_at(&self.x_out, &self.p, self.lay.final_norm, &self.xf, &self.invf, m, h, cfg.norm_eps);
             self.encode_head(&cmd, false);
@@ -967,7 +1164,7 @@ impl EmbryoGpu {
         for l in 0..cfg.layers {
             let ms = time(format!("fwd {l}"), &|cmd| {
                 let o: &crate::metal::GBuf = if l + 1 < cfg.layers { self.x_in(l + 1) } else { &self.x_out };
-                self.layer_fwd(cmd, l, o);
+                self.layer_fwd(cmd, l, o, true);
             });
             out.push((format!("layer {l} fwd{}", if cfg.is_anchor(l) { " (anchor)" } else { "" }), ms));
         }
@@ -1033,4 +1230,17 @@ impl EmbryoGpu {
 fn hk_simt() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("EMBRYO_HK_SIMT").is_ok_and(|v| v != "0"))
+}
+
+#[cfg(target_os = "macos")]
+impl EmbryoGpu {
+    /// Routing statistics of the last step: per layer, tokens per expert.
+    pub fn routing_counts(&self) -> Vec<Vec<u32>> {
+        let ne = self.cfg.experts;
+        if ne == 0 {
+            return vec![];
+        }
+        let c = unsafe { std::slice::from_raw_parts(self.desc.count.buf.contents() as *const u32, self.cfg.layers * ne) };
+        (0..self.cfg.layers).map(|l| c[l * ne..(l + 1) * ne].to_vec()).collect()
+    }
 }
