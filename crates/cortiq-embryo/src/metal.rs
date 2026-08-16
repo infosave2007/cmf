@@ -63,6 +63,7 @@ pub struct Ctx {
     gather_rows: ComputePipelineState,
     scatter_add_rows: ComputePipelineState,
     softmax_ce_idx: ComputePipelineState,
+    group_sum: ComputePipelineState,
 }
 unsafe impl Send for Ctx {}
 unsafe impl Sync for Ctx {}
@@ -164,6 +165,7 @@ fn init() -> Result<Ctx, String> {
         gather_rows: pso("gather_rows_f32")?,
         scatter_add_rows: pso("scatter_add_rows_f32")?,
         softmax_ce_idx: pso("softmax_ce_idx_f32")?,
+        group_sum: pso("group_sum_heads_f32")?,
         gemm,
         _lib: lib,
         queue,
@@ -1102,6 +1104,48 @@ impl<'a> Cmd<'a> {
         self.set_u32(4, n as u32);
         self.set_f32(5, scale);
         e.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(256, 1, 1));
+    }
+
+    /// Causal row softmax in place on `blocks` consecutive [t,t] blocks at `off`.
+    pub fn causal_softmax_blocks(&self, s: &GBuf, off: usize, t: usize, blocks: usize) {
+        assert!(s.len >= off + blocks * t * t);
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.causal_softmax);
+        e.set_buffer(0, Some(&s.buf), (off * 4) as u64);
+        self.set_u32(1, t as u32);
+        e.dispatch_thread_groups(MTLSize::new(t as u64, blocks as u64, 1), MTLSize::new(256, 1, 1));
+    }
+
+    /// dS = P ⊙ (dP − rowsum(P⊙dP)) in place on dP, `blocks` consecutive blocks.
+    pub fn softmax_bwd_blocks(&self, p: &GBuf, p_off: usize, dp: &GBuf, dp_off: usize, t: usize, blocks: usize) {
+        assert!(p.len >= p_off + blocks * t * t && dp.len >= dp_off + blocks * t * t);
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.softmax_bwd);
+        e.set_buffer(0, Some(&p.buf), (p_off * 4) as u64);
+        e.set_buffer(1, Some(&dp.buf), (dp_off * 4) as u64);
+        self.set_u32(2, t as u32);
+        e.dispatch_thread_groups(MTLSize::new(t as u64, blocks as u64, 1), MTLSize::new(256, 1, 1));
+    }
+
+    /// dst[b·T+t][g·hd+d] = Σ_j src[b][g·group+j][t][d] (head-major → row-major GQA reduce).
+    #[allow(clippy::too_many_arguments)]
+    pub fn group_sum_heads(&self, src: &GBuf, dst: &GBuf, b: usize, t: usize, qh: usize, kvh: usize, hd: usize) {
+        assert!(src.len >= b * qh * t * hd && dst.len >= b * t * kvh * hd && qh % kvh == 0);
+        #[repr(C)]
+        struct Args {
+            b: u32,
+            t: u32,
+            qh: u32,
+            kvh: u32,
+            hd: u32,
+        }
+        let a = Args { b: b as u32, t: t as u32, qh: qh as u32, kvh: kvh as u32, hd: hd as u32 };
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.group_sum);
+        e.set_buffer(0, Some(&src.buf), 0);
+        e.set_buffer(1, Some(&dst.buf), 0);
+        e.set_bytes(2, std::mem::size_of::<Args>() as u64, &a as *const Args as *const c_void);
+        self.grid1(b * t * kvh * hd, 256);
     }
 
     /// Submit and wait. Returns GPU time in milliseconds (GPUEndTime −
