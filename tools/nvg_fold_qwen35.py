@@ -183,6 +183,7 @@ def main():
     ap.add_argument("--no-ffn", action="store_true")
     ap.add_argument("--dry-layers", type=int, default=0, help="debug: only run N layers of calibration")
     ap.add_argument("--groups", type=int, default=3, help="calibration passes: the layers' Grams are collected in this many groups (RAM: model + one group's Grams; a 27B FFN Gram is 1.2 GB f32 per layer)")
+    ap.add_argument("--shard-dirs", default="", help="comma-separated directories; group g's shards are written to dirs[g % n] and symlinked into --out (a box whose filesystems are each too small for the whole output)")
     args = ap.parse_args()
     torch.set_num_threads(args.threads)
     from transformers import AutoConfig, AutoTokenizer
@@ -264,13 +265,23 @@ def main():
     weight_map = {}
     shard_i = [0]
     total_params = [0]
+    shard_dirs = [d for d in args.shard_dirs.split(",") if d]
+    for d in shard_dirs: os.makedirs(d, exist_ok=True)
+    flush_n = [0]
     def flush_shards(sdict):
         cur = {}; cur_b = 0
+        tgt = shard_dirs[flush_n[0] % len(shard_dirs)] if shard_dirs else args.out
+        flush_n[0] += 1
         def emit():
             nonlocal cur, cur_b
             if not cur: return
             name = f"model-{shard_i[0]:05d}.safetensors"
-            save_file(cur, os.path.join(args.out, name), metadata={"format": "pt"})
+            path = os.path.join(tgt, name)
+            save_file(cur, path, metadata={"format": "pt"})
+            if tgt != args.out:
+                link = os.path.join(args.out, name)
+                if os.path.lexists(link): os.remove(link)
+                os.symlink(path, link)
             for kk in cur: weight_map[kk] = name
             shard_i[0] += 1; cur = {}; cur_b = 0
         for k, v in sdict.items():
