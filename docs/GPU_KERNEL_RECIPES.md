@@ -218,6 +218,47 @@ on this backend.
 Until then, the honest statement about Metal is: its kernels are fine,
 its submission pattern is not.
 
+## Metal, the batched verify (0.5.82): what measured and what did not
+
+The speculative verify wants a GEMM that streams the weights ONCE for
+b ≤ 8 activation rows. Three shapes were built and measured on the M4
+(Qwen3.8-27B gate call, 46 MB):
+
+| kernel | b=1 | b=5 | b=8 | note |
+|---|---|---|---|---|
+| `q4tp_matvec` (one vector) | 0.48 ms (96 GB/s) | — | — | the bandwidth line |
+| `q4tp_matvec_bk` (register-blocked, unpack per element) | 0.57 | 1.85 | 2.9 | ALU-bound: 8 FMAs a weight |
+| `q4tp_mul_mm` (wide simdgroup GEMM, 32-batch tile) | 2.0 | 2.0 | 2.0 | MAC-bound whatever b |
+| **`q4tp_mul_mm_n8`** (64 rows × 8, half unpack, matrix unit) | **0.64** | **0.65** | **0.65** | 68–72 GB/s, flat in b |
+
+n8's memory path alone (MACs removed) is 0.54 — 90 GB/s — and the
+matrix-unit MACs add 0.10 that the two barriers an iteration do not
+overlap. Five variants tried against it, none faster: 4 lanes a row
+(64 B contiguous), NK 32/64/128, 32-/64-/128-row tiles, double-buffered
+tiles (one barrier — slower, 18 KB of threadgroup memory), a
+device-resident half copy of x for the B tiles (slower, 0.76). Take it
+as 0.64 and buy the round elsewhere.
+
+Where the round's time went after that (27B, k=7): verify 242 ms =
+199 GEMMs + 14 GDN recurrence + 8 attend + ~20 small kernels; draft 33
+(seven MTP steps at bandwidth once the head is a 65536-row shortlist);
+commit 18. Fusions that paid: residual add folded into the next norm,
+silu+row-scale one pass, a/b projections one dispatch, one attend
+dispatch for the b rows (the per-row flash split only for a single
+row), the block input folded into the draft submit, zero-copy GDN
+states (the memcpy of 300 MB/token was 10% of the plain token).
+
+Two Metal bugs the same campaign found, both invisible in a
+"coherent-looking" output: an unbound kernel constant (`q4tp_mul_mm`'s
+`wboost`, slot 6 — every batched q4tp prefill was noise) and a head
+index derived from `simdgroups_per_threadgroup` under `dispatch_threads`
+(the partial last threadgroup made the K heads of every model with
+(nh+nkv) % 8 ≠ 0 skip norm+RoPE). Both were caught only by diffing
+against the strict CPU (`CMF_SDOT=0 CMF_GPU=0`) — `CMF_LOGIT_DUMP` and
+`CMF_ATTN_ORACLE=1` exist for exactly that. Rule: a kernel that indexes
+by simdgroup must derive it from `thread_position_in_grid`, or be
+launched with `dispatch_thread_groups`.
+
 ## Cross-format notes
 
 - `q2tp` shares q4tp's params/codes planes byte-for-byte; only the weight

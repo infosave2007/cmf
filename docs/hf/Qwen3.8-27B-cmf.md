@@ -181,13 +181,23 @@ overlapping windows).
 cortiq run qwen38-27b-q4t.cmf --prompt "..."   # no env vars needed
 ```
 
-Measured on an M4 Mac mini, 24 GB unified memory:
+Measured on an M4 Mac mini, 24 GB unified memory (`qwen38-27b-q4tp.cmf`,
+cortiq 0.5.82):
 
 | | tok/s |
 |---|---|
-| decode | **5.8** |
-| prefill @ 2k context | 20.8 |
+| decode, plain | **6.7** (0.5.79–0.5.81: 5.8) |
+| decode, greedy with speculation — code body | **12.2** (avg 3 of 7 drafts accepted) |
+| decode, greedy with speculation — prose | ~7 (the monitor sits at the plain rate) |
+| prefill (447-token prompt, chunks of 256) | **38** (11.6 s to first token; 0.5.81: 42 s) |
 | CPU-only (pre-0.5.79) | 3.7 |
+
+0.5.82 also fixed two silent Metal numerics bugs that this file was
+subject to (every prompt longer than a chunk came back as noise, and
+the device attend ran 15–20% off the CPU on every token) — **update to
+0.5.82 or later on a Mac.** Speculation is on by default for greedy
+decoding (`CMF_GRAPH_SPEC=0` turns it off; `CMF_METAL_VERIFY_CHECK=1`
+diffs every verified row against the plain path).
 
 For long context on a Mac, add the Metal O(1) mode: decode holds
 ~4.7 tok/s **independent of depth** and the attention state stays
@@ -197,7 +207,7 @@ fixed-size instead of growing with the KV cache:
 CMF_O1_METAL=1 cortiq run qwen38-27b-q4t.cmf --o1 all --prompt "..."
 ```
 
-`q4t` is the Mac build; `q8_2f` (27.4 GB) does not fit 24 GB machines.
+`q4tp` is the Mac build (`q4t` also runs); `q8_2f` (27.4 GB) does not fit 24 GB machines.
 
 ## Sampling
 
@@ -374,8 +384,13 @@ CPU-шаг, с записью в лог при RUST_LOG=info). Префилл в
 
 **macOS (Apple Silicon, Metal).** С 0.5.79 модель работает на GPU мака
 из коробки (раньше файл не влезал в лимит одного Metal-буфера и всё
-тихо уходило на CPU). Замер на M4 mini 24 ГБ: декод **5.8 tok/s**,
-префилл на 2k контексте 20.8 tok/s (на CPU было 3.7). Для длинного
+тихо уходило на CPU). С 0.5.82 — нативная Metal-спекуляция и
+префилл-граф, и починены две тихие ошибки численности Metal (промпт
+длиннее чанка возвращался шумом; device-attend отклонялся от CPU на
+15–20% на каждом токене) — **на маке обновляйтесь до 0.5.82**. Замер на
+M4 mini 24 ГБ (q4tp): декод plain **6.7 tok/s** (было 5.8), greedy со
+спекуляцией на коде **12.2 tok/s** (в среднем 3 из 7 черновиков),
+проза ~7; промпт 447 токенов — **11.6 с** до первого токена (было 42). Для длинного
 контекста — Metal-режим O(1): `CMF_O1_METAL=1 cortiq run … --o1 all` —
 декод держит ~4.7 tok/s независимо от глубины, память под внимание
 фиксированная. Для мака берите `q4t`; `q8_2f` (27.4 ГБ) в 24 ГБ не

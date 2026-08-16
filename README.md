@@ -643,6 +643,23 @@ essay the monitor stops speculation and the rate is the plain 46–47.
 ratio, not just tok/s, because a broken draft path degrades silently
 into a lower acceptance rate rather than into wrong output.
 
+**On Apple silicon** (since 0.5.82) the same round runs natively on Metal:
+a b-row whole-model graph verifies the chain in one submit (a
+simdgroup-matrix GEMM that is flat in the batch up to 8 rows, the GDN
+recurrence over the b positions in registers with the accepted prefix
+replayed on commit), the MTP block drafts as one submit with a
+vocabulary shortlist for its head, and the round's warm-ups are one
+batched run. Qwen3.8-27B q4tp on an M4 mini (24 GB): plain **6.7
+tok/s**, a code body **12.2** with speculation, prose at the plain rate
+by the monitor's choice; the prompt goes through the same graph in
+256-token chunks (447 tokens: **11.6 s** to first token, was 42). Two
+oracles guard it — `CMF_METAL_VERIFY_CHECK=1` diffs every verify row
+against the plain path, `=2` the replayed state after commit — and the
+0.5.82 release also fixed two silent Metal bugs found on the way (an
+unbound GEMM constant that made every q4tp batched prefill noise, and a
+head-index slip that skipped the K heads' norm+RoPE on the device
+attend of every Qwen3.5-family model). See the CHANGELOG.
+
 It is worth knowing why the plain number is what it is: that decode is
 **bus-bound**. Two decode processes on one card aggregate 52.8 tok/s
 against a single process's 48.8, and the matvec stripped of all its

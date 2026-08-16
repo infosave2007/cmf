@@ -7,6 +7,99 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.82] - 2026-08-16
+
+The Apple-silicon release. Two silent numerics bugs in the Metal backend
+are fixed — every q4tp batched prefill on a Mac was noise, and the
+device attend of every Qwen3.5-family model ran 15–20% off the CPU on
+every token — and speculative decode is now native Metal: a b-row
+whole-model graph verifies the MTP head's chain in one submit, the same
+graph runs the prompt in 256-token chunks, and the GDN recurrent state
+no longer crosses the CPU/GPU boundary at all. Qwen3.8-27B q4tp on an
+M4 (24 GB): plain **5.7 → 6.7 tok/s**, code **12 tok/s** greedy with
+speculation, a 447-token prompt **42 → 11.6 s** to first token.
+
+### Fixed
+
+- **Metal q4tp GEMM read an unbound `wboost` constant.** The half-range
+  activation boost added to `q4tp_mul_mm` in the animate fix was bound
+  only by `q4tp_matmat`; the chunk graph (`enc_mul_mm`), the fused
+  prefill FFN (`q4tp_ffn`) and the DiT block dispatched the same kernel
+  with slot 6 unbound — an undefined weight scale. Every q4tp batched
+  prefill on Metal produced noise since then: Qwen3.5-0.8B `ppl` read
+  1.3e6 (18.27 now, equal to the CPU); Qwen3.8-27B answered
+  `<parameter=1>` to any prompt longer than a chunk. Bound explicitly
+  everywhere (the host boost where the activations are host-visible,
+  1.0 for device-resident inputs).
+- **Metal `attn_rope_qkn` skipped the K heads' norm and RoPE** on models
+  whose `nh + nkv` is not a multiple of 8. The kernel derived its head
+  from `threadgroup_position × simdgroups_per_threadgroup + simdgroup`
+  under a `dispatch_threads` launch, and the partial last threadgroup
+  reports its own smaller simdgroup count — heads 8,9 of Qwen3.5-0.8B
+  and 24..27 of Qwen3.8-27B (and their MTP blocks) came out as heads
+  0..3, so the raw K went into the cache and the device attend ran
+  15–20% off the CPU's on every token (`CMF_GPU_ATTEND=0` was exact).
+  The head is `thread_position_in_grid / 32` now; the attend oracle
+  (`CMF_ATTN_ORACLE=1`) reads max|Δao| = 0 against the CPU, and the
+  decode hidden equals the strict CPU path to 1e-6.
+
+### Added
+
+- **Native Metal speculative decode** (on by default for greedy q4tp on
+  macOS, the same gate as the wgpu graph): `q4tp_mul_mm_n8`, a 64-row ×
+  ≤8-batch simdgroup-matrix GEMM (magic-mantissa half unpack, permuted
+  K order, per-row power-of-two activation pre-scale) — 0.64 ms per 46 MB
+  gate call, flat in the batch; `VerifyGraph`, a b-row whole-model
+  graph: batched norms and FFN, the GDN recurrence over the b positions
+  in registers WITHOUT writing state (the commit replays the accepted
+  prefix from the same initial state), attention appends b rows to the
+  mirror and attends each row over its own prefix, the head folded in;
+  the MTP block draft as one token-graph submit (`mtp_step_metal`, its
+  input projection folded in), the round's warm-ups as one b-row run
+  of the block, a draft-head vocabulary shortlist (`CMF_DRAFT_VOCAB`,
+  default 65536: 662 → 170 MB a step, the verify keeps the full head so
+  a token past the cut is only a rejected draft), k = 7 on Metal (the
+  8-wide tile is free). Oracles: `CMF_METAL_VERIFY_CHECK=1` (every
+  verify row against the plain path) and `=2` (the replayed states and
+  appended K/V rows against the plain path after commit).
+- **Rows-graph prefill on Metal** for q4tp GDN hybrids: the prompt in
+  chunks of 256 positions (`CMF_METAL_PREFILL_CHUNK`, `=0` off via
+  `CMF_METAL_PREFILL=0`) through the same graph — wide GEMMs, the device
+  recurrence writing its state in the same pass, batched RoPE
+  (`attn_rope_qkn_b`), the chunk attend — and the MTP warm-up rows as
+  one batched run of the block per chunk. Qwen3.8-27B, 447 tokens: 42 s
+  (per-position graph) / 24 s (CPU chunked) → **11.6 s**; 0.8B, 910
+  tokens: 3.3 s → 0.9 s. Numerics equal the CPU-batched path (8e-4 rel
+  against the strict CPU).
+- **Zero-copy GDN states on Metal** (`host_state_buffer`): the CPU
+  owner's Vec is wrapped as a shared buffer (large mallocs are page-
+  aligned on macOS), so the token graph and the verify read and write it
+  in place — 300 MB a token / 400 MB a round of memcpy gone; plain 6.0 →
+  6.7 tok/s on the 27B. `CMF_METAL_STATE_ZEROCOPY=0` restores the copy.
+- Diagnostics: `CMF_LOGIT_DUMP=path` (+`CMF_LOGIT_DUMP_STEP=n`) writes
+  one decode step's hidden and logits as raw f32 for cross-backend
+  diffing (the strict CPU reference is `CMF_SDOT=0 CMF_GPU=0`);
+  `CMF_SPEC_DBG=1` prints drafts against verified ids per round;
+  `CMF_VERIFY_SKIP=sag` attributes the verify's cost; `CMF_MM_AB=1` now
+  reports any GPU/CPU matmat disagreement above 1%; `CMF_PREFILL_GRAPH=0`
+  takes the CPU chunked prefill on Metal.
+
+### Measured (Qwen3.8-27B q4tp, M4 mini 24 GB)
+
+- Plain decode 6.7 tok/s (was 5.7); speculation: code body 12.2 tok/s
+  (avg 3 of 7 drafts accepted, round ≈ 295 ms = draft 33 + verify 242 +
+  commit 18), prose 7 (the monitor mostly sits at plain); TTFT 38 tok/s.
+- The verify's 242 ms is 199 ms of GEMMs at 68 GB/s (the n8 kernel; the
+  one-vector matvec streams at 95) + 14 GDN recurrence + 8 attend + ~20
+  of small kernels; the memory path alone measures 0.54 ms per gate call
+  against the matvec's 0.48 — five layouts tried, none faster.
+- The MTP chain probe on the fox text reads d1..d4 = 91/87/84/81 for both
+  MTP arms now (the pod's "94%" was that degenerate bench prompt at k=4);
+  the 0.8B's head is weak (42% first draft) — acceptance work belongs on
+  the 27B.
+- `iogpu.wired_limit_mb` makes no difference (the weights are not
+  evicted); the M4's 120 GB/s is the only wall for the plain token.
+
 ## [0.5.81] - 2026-08-16
 
 ### Fixed
