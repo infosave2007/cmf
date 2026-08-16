@@ -1348,7 +1348,8 @@ kernel void moe_update_f32(
     device float*       bias  [[buffer(1)]],
     device const float* sums  [[buffer(2)]],
     device const uint*  count [[buffer(3)]],
-    constant MoeUpdArgs& a    [[buffer(4)]],
+    device const float* res   [[buffer(4)]],   // [rows] winning resonances (sets the bias scale)
+    constant MoeUpdArgs& a    [[buffer(5)]],
     uint gid [[thread_position_in_grid]])
 {
     if (gid >= a.E * a.H) return;
@@ -1359,8 +1360,13 @@ kernel void moe_update_f32(
         mu[gid] = (1.0f - a.alpha) * mu[gid] + a.alpha * mean;
     }
     if (j == 0) {
+        // bias step relative to the typical resonance, so balancing acts at
+        // the scale the scores live on
+        float rs = 0.0f;
+        for (uint r = 0; r < a.rows; ++r) rs += res[r];
+        float scale = rs / (float)a.rows;
         float frac = (float)n / (float)a.rows;
-        bias[e] += a.eta * (1.0f / (float)a.E - frac);
+        bias[e] += a.eta * scale * (1.0f / (float)a.E - frac);
     }
 }
 
@@ -1382,4 +1388,18 @@ kernel void moe_indirect_args_f32(
     args[(1u * a.E + e) * 3u + 0u] = a.n2 / 64u;
     args[(1u * a.E + e) * 3u + 1u] = mt;
     args[(1u * a.E + e) * 3u + 2u] = 1u;
+}
+
+// μ_e := x[row_e] — data init of the descriptors (k-means++-style seeding
+// from the batch itself; rows chosen on the host, e ≤ 64).
+kernel void moe_init_mu_f32(
+    device const float* x    [[buffer(0)]],
+    device const uint*  rows [[buffer(1)]],   // [E]
+    device float*       mu   [[buffer(2)]],   // [E, H]
+    constant RouteArgs& a    [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])   // over E·H
+{
+    if (gid >= a.E * a.H) return;
+    uint e = gid / a.H, j = gid % a.H;
+    mu[gid] = x[(ulong)rows[e] * a.H + j];
 }

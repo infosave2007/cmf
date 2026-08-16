@@ -143,6 +143,8 @@ pub fn birth(a: BirthArgs) {
                 m as f64 / (ms * 1e-3),
                 t_start.elapsed().as_secs_f64() / 60.0
             );
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
         }
         if !loss.is_finite() {
             eprintln!("loss is not finite at step {step} — stopping");
@@ -151,6 +153,18 @@ pub fn birth(a: BirthArgs) {
         if (step + 1) % a.eval_every == 0 || step + 1 == a.steps {
             let vl = eval(&gpu, &mut tokens, &mut targets);
             println!("  val loss {vl:.4}  ppl {:.2}", vl.exp());
+            let rc = gpu.routing_counts();
+            if !rc.is_empty() {
+                let cap = gpu.moe_cap;
+                let summary: Vec<String> = rc
+                    .iter()
+                    .map(|c| {
+                        let dropped: u32 = c.iter().map(|&n| n.saturating_sub(cap as u32)).sum();
+                        format!("{:?}{}", c, if dropped > 0 { format!("(-{dropped})") } else { String::new() })
+                    })
+                    .collect();
+                println!("  experts/layer: {}", summary.join(" "));
+            }
         }
         if (step + 1) % a.save_every == 0 || step + 1 == a.steps {
             let p = gpu.params_host();
