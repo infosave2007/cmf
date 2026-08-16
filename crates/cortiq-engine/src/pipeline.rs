@@ -766,6 +766,9 @@ impl Pipeline {
             || std::env::var("CMF_GPU_BLOCK")
                 .map(|v| v == "0")
                 .unwrap_or(false)
+            // CMF_PREFILL_GRAPH=0: the chunked prefill (GEMM projections,
+            // CPU recurrence) instead of the per-position token graph.
+            || std::env::var("CMF_PREFILL_GRAPH").as_deref() == Ok("0")
         {
             return false;
         }
@@ -3799,12 +3802,91 @@ impl Pipeline {
         if spec_dbg {
             eprintln!("spec-dbg round: t_next {t_next} drafts {:?} verified {:?} accepted {a}", drafts, ids);
         }
+        // CMF_METAL_VERIFY_CHECK=2: the commit oracle — plain-forward the
+        // a+1 accepted tokens from a snapshot, then diff the replayed GDN
+        // states and the appended K/V rows against that.
+        #[cfg(target_os = "macos")]
+        let commit_ref: Option<(Vec<Vec<f32>>, Vec<(usize, Vec<f32>, Vec<f32>)>)> = if metal_native
+            && std::env::var("CMF_METAL_VERIFY_CHECK").as_deref() == Ok("2")
+        {
+            let snap: Vec<Vec<f32>> = self.kv_cache.layers.iter().map(|l| l.linear_state.clone()).collect();
+            let attn_lens: Vec<usize> = self.kv_cache.layers.iter().map(|l| l.seq_len).collect();
+            let toks: Vec<u32> = std::iter::once(t_next).chain(drafts.iter().copied()).collect();
+            let want_save = self.graph_want_logits;
+            self.graph_want_logits = false;
+            for (i, &t) in toks.iter().take(a + 1).enumerate() {
+                let _ = self.forward_layers(&self.embed_single(t), next_pos + i, None);
+                let _ = self.graph_logits.take();
+            }
+            self.graph_want_logits = want_save;
+            let plain_states: Vec<Vec<f32>> = self.kv_cache.layers.iter().map(|l| l.linear_state.clone()).collect();
+            let (nkv, hd) = (self.num_kv_heads, self.head_dim);
+            let mut rows = Vec::new();
+            for (li, (l, n0)) in self.kv_cache.layers.iter_mut().zip(attn_lens.iter()).enumerate() {
+                let extra = l.seq_len.saturating_sub(*n0);
+                if extra > 0 {
+                    let mut kk = Vec::new();
+                    let mut vv = Vec::new();
+                    for g in 0..nkv {
+                        kk.extend_from_slice(&l.head_keys(g)[n0 * hd..]);
+                        vv.extend_from_slice(&l.head_values(g)[n0 * hd..]);
+                    }
+                    rows.push((li, kk, vv));
+                    l.truncate_last(extra);
+                    crate::gpu_metal::kv_mirror_set_stored(self.graph_kv_id, li, *n0);
+                }
+            }
+            for (l, st) in self.kv_cache.layers.iter_mut().zip(snap) {
+                l.linear_state = st;
+            }
+            Some((plain_states, rows))
+        } else {
+            None
+        };
         // a fully-accepted round needs no restore: every input was real.
         #[cfg(target_os = "macos")]
         if metal_native {
             // the Metal verify never wrote its states: the commit replays the
             // accepted prefix into the CPU owners and appends the K/V rows
             self.metal_verify_commit(a);
+            if let Some((plain_states, rows)) = commit_ref {
+                let (nkv, hd) = (self.num_kv_heads, self.head_dim);
+                let mut worst_s = 0f32;
+                let mut worst_li = 0usize;
+                for (li, (l, ps)) in self.kv_cache.layers.iter().zip(&plain_states).enumerate() {
+                    if l.linear_state.len() != ps.len() || ps.is_empty() {
+                        continue;
+                    }
+                    let d = l.linear_state.iter().zip(ps).fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+                    let n = ps.iter().fold(0f32, |m, y| m.max(y.abs()));
+                    let rel = d / n.max(1e-6);
+                    if rel > worst_s {
+                        worst_s = rel;
+                        worst_li = li;
+                    }
+                }
+                let mut worst_k = 0f32;
+                for (li, kk, vv) in &rows {
+                    let l = &self.kv_cache.layers[*li];
+                    let n0 = l.seq_len - (kk.len() / (nkv * hd));
+                    let mut ck = Vec::new();
+                    let mut cv = Vec::new();
+                    for g in 0..nkv {
+                        ck.extend_from_slice(&l.head_keys(g)[n0 * hd..]);
+                        cv.extend_from_slice(&l.head_values(g)[n0 * hd..]);
+                    }
+                    if ck.len() == kk.len() {
+                        let dk = ck.iter().zip(kk).fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+                        let dv = cv.iter().zip(vv).fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+                        worst_k = worst_k.max(dk).max(dv);
+                    } else {
+                        eprintln!("commit-check L{li}: kv row count mismatch {} vs {}", ck.len(), kk.len());
+                    }
+                }
+                eprintln!(
+                    "commit-check a={a}: worst GDN state rel-max diff {worst_s:.2e} (L{worst_li}) | worst K/V row abs diff {worst_k:.4}"
+                );
+            }
         } else if a + 1 < b {
             crate::gpu::gdn_spec_restore(self.graph_kv_id, a);
         }
@@ -3824,6 +3906,12 @@ impl Pipeline {
         // The knob stays so the next person can re-price it after the
         // warms are batched instead of assuming either way.
         m.kv.truncate_last(k_spec.saturating_sub(1));
+        #[cfg(target_os = "macos")]
+        if metal_native && self.mtp_graph_mode == Some(true) {
+            // the mirror rows below the cut are the CPU rows: re-point,
+            // no re-upload
+            crate::gpu_metal::kv_mirror_set_stored(self.mtp_kv_id(), Self::MTP_LAYER_BASE, m.kv.seq_len);
+        }
         let warm_off = std::env::var("CMF_SPEC_WARM").is_ok_and(|v| v == "0");
         if !warm_off && a > 0 {
             // Graph arm: all accepted pairs in ONE batched run over the
@@ -3831,12 +3919,21 @@ impl Pipeline {
             let mut warmed = false;
             #[cfg(target_os = "macos")]
             if metal_native && self.mtp_graph_mode == Some(true) {
-                warmed = true;
-                for j in 0..a {
-                    let row = hiddens[j * self.hidden_size..(j + 1) * self.hidden_size].to_vec();
-                    if self.mtp_step_metal(m, &row, ids[j], next_pos + j, false).is_none() {
-                        warmed = false;
-                        break;
+                // all accepted pairs in ONE b-row graph run over the MTP
+                // block (its input projection folded in); one by one on
+                // the token graph if that declines
+                let pairs: Vec<(&[f32], u32)> = (0..a)
+                    .map(|j| (&hiddens[j * self.hidden_size..(j + 1) * self.hidden_size], ids[j]))
+                    .collect();
+                warmed = self.mtp_warm_batch_metal(m, &pairs, next_pos);
+                if !warmed {
+                    warmed = true;
+                    for j in 0..a {
+                        let row = hiddens[j * self.hidden_size..(j + 1) * self.hidden_size].to_vec();
+                        if self.mtp_step_metal(m, &row, ids[j], next_pos + j, false).is_none() {
+                            warmed = false;
+                            break;
+                        }
                     }
                 }
             }
@@ -6490,6 +6587,113 @@ impl Pipeline {
         true
     }
 
+    /// The round's warm-ups as ONE b-row graph run over the MTP block on
+    /// Metal: `pairs` = (trunk hidden, next token) at consecutive positions
+    /// from `first_pos`; the block's input projection is folded in, the
+    /// appended K/V rows are pulled into the CPU MTP cache. False = the
+    /// graph declined (nothing appended).
+    #[cfg(target_os = "macos")]
+    fn mtp_warm_batch_metal(&mut self, m: &mut MtpModule, pairs: &[(&[f32], u32)], first_pos: usize) -> bool {
+        use crate::gpu_metal::{AttnDeviceParams, AttnGpuLayer, GraphDims, MetalFfn, VerifyGraph};
+        let b = pairs.len();
+        if b == 0 || b > 8 || m.kv.mode != crate::kv_cache::KvMode::F32 || m.kv.o1.is_some() {
+            return false;
+        }
+        let AttnKind::Full { wq, wk, wv, wo, q_norm, k_norm, output_gate, softplus_gate: None, bias: None } = &m.layer.attn else {
+            return false;
+        };
+        let FfnKind::Dense(d) = &m.layer.ffn else { return false };
+        let (Some(pq), Some(pk), Some(pv), Some(po)) = (wq.q1_parts(), wk.q1_parts(), wv.q1_parts(), wo.q1_parts()) else {
+            return false;
+        };
+        let (Some(g), Some(u), Some(dn)) = (d.gate_proj.q1_parts(), d.up_proj.q1_parts(), d.down_proj.q1_parts()) else {
+            return false;
+        };
+        let Some(eh) = m.eh_proj.q1_parts() else { return false };
+        let QTensor::Mapped { model, .. } = wq else { return false };
+        let model = model.clone();
+        let hs = self.hidden_size;
+        // [enorm(embed(tok)); hnorm(hidden)] rows
+        let mut cat = vec![0f32; b * 2 * hs];
+        for (j, (h, tok)) in pairs.iter().enumerate() {
+            let e = self.embed_single(*tok);
+            let (ce, ch) = cat[j * 2 * hs..(j + 1) * 2 * hs].split_at_mut(hs);
+            inference::rms_norm_into(&e, &m.enorm, self.rms_eps, self.norm_style, ce);
+            inference::rms_norm_into(h, &m.hnorm, self.rms_eps, self.norm_style, ch);
+        }
+        let dims = GraphDims { hidden: hs, eps: self.rms_eps as f32, gemma: self.norm_style == cortiq_core::NormStyle::Gemma };
+        let Some(mut graph) = VerifyGraph::new_via_proj(&model, dims, eh, &cat, b) else {
+            return false;
+        };
+        let l = AttnGpuLayer {
+            attn_norm: &m.layer.input_norm,
+            post_norm: &m.layer.post_norm,
+            wq: pq,
+            wk: pk,
+            wv: pv,
+            wo: po,
+            ffn: MetalFfn::Dense { gate: g, up: u, down: dn },
+        };
+        let (nh, nkv, hd, rd) = (self.num_heads, self.num_kv_heads, self.head_dim, self.rotary_dim);
+        let inv_freq = self.inv_freq.clone();
+        let cpu_stored;
+        {
+            let cache = &m.kv;
+            let cpu_k: Vec<&[f32]> = (0..nkv).map(|g| cache.head_keys(g)).collect();
+            let cpu_v: Vec<&[f32]> = (0..nkv).map(|g| cache.head_values(g)).collect();
+            cpu_stored = cpu_k[0].len() / hd;
+            if cpu_stored != first_pos {
+                return false;
+            }
+            let p = AttnDeviceParams {
+                kv_id: self.mtp_kv_id(),
+                layer: Self::MTP_LAYER_BASE,
+                nh,
+                nkv,
+                hd,
+                rd,
+                position: first_pos,
+                eps: self.rms_eps as f32,
+                gemma: self.norm_style == cortiq_core::NormStyle::Gemma,
+                output_gate: *output_gate,
+                q_norm: q_norm.as_deref(),
+                k_norm: k_norm.as_deref(),
+                inv_freq: &inv_freq,
+                cpu_k,
+                cpu_v,
+                cpu_stored,
+                o1: None,
+            };
+            if !graph.attn_ok(&l, &p) || !graph.encode_attn_b(&l, &p) {
+                return false;
+            }
+        }
+        graph.sync();
+        let mut kbuf = vec![0f32; b * nkv * hd];
+        let mut vbuf = vec![0f32; b * nkv * hd];
+        if !crate::gpu_metal::kv_mirror_read_rows(self.mtp_kv_id(), Self::MTP_LAYER_BASE, nkv, hd, cpu_stored, b, &mut kbuf, &mut vbuf) {
+            return false;
+        }
+        for r in 0..b {
+            m.kv.append(&kbuf[r * nkv * hd..(r + 1) * nkv * hd], &vbuf[r * nkv * hd..(r + 1) * nkv * hd], &[]);
+        }
+        crate::gpu_metal::kv_mirror_set_stored(self.mtp_kv_id(), Self::MTP_LAYER_BASE, cpu_stored + b);
+        true
+    }
+
+    /// Draft-head shortlist size: `CMF_DRAFT_VOCAB` rows (default 65536,
+    /// capped at the head; 0 = full head).
+    fn draft_vocab_rows(head_rows: usize) -> usize {
+        static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let n = *N.get_or_init(|| {
+            std::env::var("CMF_DRAFT_VOCAB")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(65536)
+        });
+        if n == 0 { head_rows } else { n.min(head_rows) }
+    }
+
     /// One MTP block step on the native Metal token graph: block input on
     /// the host, the attention layer + FFN device-resident over the MTP
     /// mirror, the head folded in when `want_logits`. The appended K/V row
@@ -6583,18 +6787,32 @@ impl Pipeline {
                 return None;
             }
         }
+        // The draft's head over a vocabulary SHORTLIST (the first
+        // CMF_DRAFT_VOCAB rows — BPE ids run roughly by merge rank, so the
+        // low ids carry the mass): the verify keeps the full head, so a true
+        // token past the cut is only a rejected draft, never a wrong token.
+        // 662 MB a step on Qwen3.8 becomes 170 MB at 65536.
+        let draft_rows = if let Some(lm) = lm { Self::draft_vocab_rows(lm.1) } else { 0 };
         if let Some(lm) = lm {
             if !graph.lm_head_ok(lm) {
                 return None;
             }
-            graph.encode_lm_head(&m.final_norm, lm);
+            if draft_rows < lm.1 {
+                if !graph.encode_lm_head_part(&m.final_norm, lm, draft_rows) {
+                    return None;
+                }
+            } else {
+                graph.encode_lm_head(&m.final_norm, lm);
+            }
         }
         graph.sync();
         let mut logits = Vec::new();
         if let Some(lm) = lm {
-            logits = attention::take_buf(lm.1.min(self.vocab_size));
+            let n_read = draft_rows.min(lm.1).min(self.vocab_size);
+            logits = attention::take_buf(n_read);
             graph.read_logits(&mut logits);
-            logits.resize(self.vocab_size, 0.0);
+            // ids past the shortlist: never drafted (−∞ in every chain)
+            logits.resize(self.vocab_size, f32::NEG_INFINITY);
         }
         graph.finish(&mut x);
         let mut krow = attention::take_buf(nkv * hd);

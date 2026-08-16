@@ -3917,6 +3917,89 @@ kernel void q4tp_matvec(
 }
 
 
+// `q4tp_matvec` over the FIRST `rows_do` rows of a `rows`-row tensor: the
+// planes are laid out by the full row count, the dispatch stops early —
+// the draft head's vocabulary shortlist (CMF_DRAFT_VOCAB).
+kernel void q4tp_matvec_part(
+    device const uchar* q    [[buffer(0)]],
+    device const float* x    [[buffer(1)]],
+    device float*       y    [[buffer(2)]],
+    constant uint&      gpr  [[buffer(3)]],
+    constant uint&      rows [[buffer(4)]],
+    constant uint&      rows_do [[buffer(5)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tgpos [[threadgroup_position_in_grid]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    // One rung per lane, four rows per simdgroup, eight simdgroups.
+    threadgroup float lad[8u * 4u * 32u];
+
+    uint r0 = (tgpos * sgs + sg) * 4u;
+    bool active = r0 < rows_do;
+    uint nr = active ? min(rows_do - r0, 4u) : 0u;
+
+    ulong params_off = (ulong)rows * (ulong)gpr * 16ul;
+    ulong codes_off  = params_off + (ulong)rows * 4ul;
+    uint  stride     = (gpr * 5u + 7u) / 8u;
+
+    // Expand each row's ladder ONCE. Evaluating 2^(lo + code*step) inside the
+    // tile loop instead was measured to cost the model ~15% even though the
+    // kernel benchmarked FASTER standalone: free-running dispatches hide the
+    // dependent chain (code byte → exp2 → scale), and the model's dispatches
+    // serialize on each other, which exposes it. The lane index IS the rung,
+    // so one exp2 per lane per row covers all 32.
+    for (uint ri = 0u; ri < nr; ++ri) {
+        device const half* ph = (device const half*)(q + params_off + (ulong)(r0 + ri) * 4ul);
+        lad[(sg * 4u + ri) * 32u + lane] = exp2((float)ph[0] + (float)lane * (float)ph[1]);
+    }
+    // Every thread reaches this, including the inactive tail simdgroups —
+    // a barrier skipped by part of the threadgroup is undefined.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!active) return;
+
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    for (uint g = lane; g < gpr; g += 32u) {
+        uint xb = g * 32u;
+        device const float4* xv = (device const float4*)(x + xb);
+        float4 x0 = xv[0], x1 = xv[1], x2 = xv[2], x3 = xv[3];
+        float4 x4 = xv[4], x5 = xv[5], x6 = xv[6], x7 = xv[7];
+        uint bit = g * 5u;
+        uint cb  = bit >> 3u;
+        uint shf = bit & 7u;
+        for (uint ri = 0u; ri < nr; ++ri) {
+            uint r = r0 + ri;
+            // 16 B tiles are 4-aligned (tensors are 64-aligned in the blob),
+            // so four uint loads — q4t needs nine ushorts for its 18 B stride.
+            device const uint* p32 = (device const uint*)(q + ((ulong)r * gpr + (ulong)g) * 16ul);
+            uint b0 = p32[0], b1 = p32[1], b2 = p32[2], b3 = p32[3];
+            // The 5-bit field spills into the next byte past bit 3; the row's
+            // stride always holds that byte when it does.
+            device const uchar* cp = q + codes_off + (ulong)r * (ulong)stride + cb;
+            uint code = (((uint)cp[0] | ((shf > 3u) ? ((uint)cp[1] << 8) : 0u)) >> shf) & 31u;
+            float scale = lad[(sg * 4u + ri) * 32u + code];
+            float gsum = q4_dot8_fast(b0, x0, x1)
+                       + q4_dot8_fast(b1, x2, x3)
+                       + q4_dot8_fast(b2, x4, x5)
+                       + q4_dot8_fast(b3, x6, x7);
+            float contrib = scale * gsum;
+            if (ri == 0u) acc0 += contrib;
+            else if (ri == 1u) acc1 += contrib;
+            else if (ri == 2u) acc2 += contrib;
+            else acc3 += contrib;
+        }
+    }
+    acc0 = simd_sum(acc0); acc1 = simd_sum(acc1);
+    acc2 = simd_sum(acc2); acc3 = simd_sum(acc3);
+    if (lane == 0u) {
+        y[r0] = acc0;
+        if (nr > 1u) y[r0 + 1u] = acc1;
+        if (nr > 2u) y[r0 + 2u] = acc2;
+        if (nr > 3u) y[r0 + 3u] = acc3;
+    }
+}
+
+
 // ── Batched q4tp matvec: b activation vectors (b ≤ 8) against ONE weight
 // stream — the speculative verify's kernel. Same lanes/rows/ladder as
 // `q4tp_matvec` (four rows a simdgroup, one rung a lane), the nibbles of a
@@ -5029,6 +5112,8 @@ struct Ctx {
     q4tp: ComputePipelineState,
     /// Batched (b ≤ 8) q4tp matvec — the speculative verify's kernel.
     q4tpbk: ComputePipelineState,
+    /// q4tp matvec over a row prefix (draft-head shortlist).
+    q4tppart: ComputePipelineState,
     /// Job-batched q4tp matvec + its two MoE companions: the whole
     /// expert block in four dispatches instead of four per expert.
     q4tpjobs: ComputePipelineState,
@@ -5237,6 +5322,7 @@ fn init() -> Result<Ctx, String> {
     let q4t_dsilu = pso("q4t_matvec_dsilu")?;
     let q4tp = pso("q4tp_matvec")?;
     let q4tpbk = pso("q4tp_matvec_bk")?;
+    let q4tppart = pso("q4tp_matvec_part")?;
     let q4tpjobs = pso("q4tp_matvec_jobs")?;
     let q2tpjobs = pso("q2tp_matvec_jobs")?;
     let moesel = pso("moe_topk_select")?;
@@ -5321,6 +5407,7 @@ fn init() -> Result<Ctx, String> {
         q4t_dsilu,
         q4tp,
         q4tpbk,
+        q4tppart,
         q4tpjobs,
         q2tpjobs,
         moesel,
@@ -10902,6 +10989,47 @@ impl TokenGraph {
         self.logits_b = Some(lg_b);
     }
 
+    /// `encode_lm_head` over the first `rows_do` rows of a q4tp head — the
+    /// draft's vocabulary shortlist. False = not q4tp / out of range.
+    pub fn encode_lm_head_part(&mut self, norm: &[f32], lm: (usize, usize, usize), rows_do: usize) -> bool {
+        if rows_do == 0 || rows_do > lm.1 || lm.2 != self.dims.hidden {
+            return false;
+        }
+        let Some((abs, ProjKind::Q4tp)) = self.proj_abs(lm) else {
+            return false;
+        };
+        WCAT.store(5, std::sync::atomic::Ordering::Relaxed);
+        let cmd = self.ensure_cmd();
+        enc_simple(
+            &cmd,
+            &self.c.rmsn,
+            &[(&self.h_b, 0), (&const_buf(self.c, norm), 0), (&self.n_b, 0)],
+            &[self.dims.hidden as u32, self.dims.gemma as u32],
+            &[self.dims.eps],
+            (256, 256),
+        );
+        let lg_b = io_buf(self.c, 44_000_000_077 + lm.1, lm.1 * 4);
+        let enc = cmd.new_compute_command_encoder();
+        let c = self.c;
+        note_weight_bytes(&ProjKind::Q4tp, rows_do, lm.2 / GROUP_SIZE);
+        enc.set_compute_pipeline_state(&c.q4tppart);
+        self.fbuf.bind(enc, 0, abs);
+        enc.set_buffer(1, Some(&self.n_b), 0);
+        enc.set_buffer(2, Some(&lg_b), 0);
+        let (gpr_u, rows_u, do_u) = ((lm.2 / GROUP_SIZE) as u32, lm.1 as u32, rows_do as u32);
+        enc.set_bytes(3, 4, &gpr_u as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(5, 4, &do_u as *const u32 as *const std::ffi::c_void);
+        let sgs = 8u64;
+        enc.dispatch_thread_groups(
+            MTLSize::new((rows_do as u64).div_ceil(sgs * 4), 1, 1),
+            MTLSize::new(sgs * 32, 1, 1),
+        );
+        enc.end_encoding();
+        self.logits_b = Some(lg_b);
+        true
+    }
+
     /// Copy the finished logits (call after `sync`; out may be shorter
     /// than the head's rows — trailing rows are padding vocab).
     pub fn read_logits(&mut self, out: &mut [f32]) {
@@ -12134,6 +12262,14 @@ pub struct VerifyGraph {
 
 const VBUF_BASE: usize = 60_000_000_000;
 
+/// CMF_VERIFY_SKIP=<letters>: drop parts of the verify graph (s = GDN
+/// recurrence, a = attend loop, g = every GEMM) — a cost-attribution
+/// probe, output is garbage while set.
+fn verify_skip(what: char) -> bool {
+    static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    V.get_or_init(|| std::env::var("CMF_VERIFY_SKIP").unwrap_or_default()).contains(what)
+}
+
 impl VerifyGraph {
     fn vbuf(c: &Ctx, kind: usize, slot: usize, nbytes: usize) -> Buffer {
         // the key carries the size (io_buf caches by key alone)
@@ -12182,6 +12318,36 @@ impl VerifyGraph {
             self.cmd = Some(self.tg.c.queue.new_command_buffer().to_owned());
         }
         self.cmd.as_ref().unwrap().clone()
+    }
+
+    /// The b input rows come out of a projection of `xin` (`[b][t.2]`,
+    /// host f32) — the MTP block's `eh_proj · [enorm(e); hnorm(h)]` for a
+    /// batch of accepted pairs, so a round's warm-ups are ONE graph run.
+    /// The projection must be n8-able (q4tp, cols % 128 == 0, rows ==
+    /// hidden).
+    pub fn new_via_proj(
+        model: &Arc<CmfModel>,
+        dims: GraphDims,
+        t: (usize, usize, usize),
+        xin: &[f32],
+        b: usize,
+    ) -> Option<VerifyGraph> {
+        if t.1 != dims.hidden || xin.len() != b * t.2 {
+            return None;
+        }
+        let zeros = vec![0f32; b * dims.hidden];
+        let mut g = VerifyGraph::new(model, dims, &zeros, b)?;
+        g.n8_abs(t)?;
+        let c = g.tg.c;
+        let x_b = Self::vbuf(c, 28, 0, b * t.2 * 4);
+        unsafe {
+            std::ptr::copy_nonoverlapping(xin.as_ptr(), x_b.contents() as *mut f32, xin.len());
+        }
+        let cmd = g.ensure_cmd();
+        let enc = cmd.new_compute_command_encoder();
+        g.gemm(enc, t, &x_b, &g.h_b, &g.ones);
+        enc.end_encoding();
+        Some(g)
     }
 
     /// A projection the n8 GEMM can take: q4tp with cols % 64 == 0.
@@ -12240,6 +12406,7 @@ impl VerifyGraph {
     }
 
     fn gemm(&self, enc: &metal::ComputeCommandEncoderRef, t: (usize, usize, usize), xs: &Buffer, y: &Buffer, xsc: &Buffer) {
+        if verify_skip('g') { return; }
         let abs = self.n8_abs(t).unwrap();
         note_weight_bytes(&ProjKind::Q4tp, t.1, t.2 / GROUP_SIZE);
         encode_q4tp_mm_n8(self.tg.c, enc, &self.tg.fbuf, abs, xs, y, xsc, t.1, t.2, self.b);
@@ -12372,7 +12539,9 @@ impl VerifyGraph {
                 (((b * cfg.nk) as u64).div_ceil(8) * 256, 256),
             );
             // 5. recurrence over the b positions (outputs only)
+            if !verify_skip('s') {
             Self::state_dispatch(c, enc, &s_b, ring_len, &cq_b, &z_b, &g_b, &bt_b, &iq_b, &ik_b, &gnorm_b, &of_b, cfg, b, 1);
+            }
             // 6. out_proj → d; 7. post-norm + FFN
             self.gemm(enc, l.out, &of_b, &self.d_b, &self.ones);
             self.post_ffn(enc, l.post_norm, &l.ffn);
@@ -12534,6 +12703,7 @@ impl VerifyGraph {
         enc.dispatch_threads(MTLSize::new(kvd as u64, b as u64, 1), MTLSize::new(256, 1, 1));
         // attend row e over positions 0..=stored+e
         for e in 0..b {
+            if verify_skip('a') { break; }
             let n_pos = stored + e + 1;
             let cap_sgs = (c.gqat.max_total_threads_per_threadgroup() as usize / 32).clamp(1, gqa_split_max());
             let sgs = n_pos.div_ceil(32).clamp(1, cap_sgs);
