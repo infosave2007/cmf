@@ -411,3 +411,343 @@ kernel void softmax_ce_f32(
         lr[i] = (p - ((i == t) ? 1.0f : 0.0f)) * scale;
     }
 }
+
+// ---------------------------------------------------------------------
+// hybrid_k mixer — chunked scan (chunk C = 64), the runtime's vmf_phase
+// core + κ write gate (linear_core.rs::phase_step) made trainable.
+//
+//   S_t = γ ⊙ S_{t−1} + κ_t·φk_t ⊗ v_t ,  o_t = φq_tᵀ·S_t ,  φ = [cos θ; sin θ]
+//
+// Layouts (row-major, one row per (b,t)):
+//   phq, phk : [B·T, nh·P2]    kv = κ⊙v, out, dout, dkv : [B·T, nh·dv]
+//   pow      : [nh, C+1, P2]   γ_{h,f}^δ, δ = 0..C
+//   states   : [B, nh, nchunks+1, P2, dv]  S entering chunk c (S_0 = 0)
+//   dstates  : [B, nh, nchunks+1, P2, dv]  ∂L/∂S_c from chunks ≥ c only
+// P2 ≤ 64 (nph ≤ 32), dv ≤ 128 (one thread per value channel).
+// ---------------------------------------------------------------------
+
+#define HK_C   64u
+#define HK_P2  64u
+
+struct HkArgs {
+    uint B, T, nh, nph, dv;   // P2 = 2·nph
+};
+
+// φ tables from θ:  phq[row][h·P2 + i] = cos θ, [.. + nph + i] = sin θ
+kernel void hk_phi_f32(
+    device const float* th  [[buffer(0)]],
+    device float*       ph  [[buffer(1)]],
+    constant HkArgs&    a   [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])   // over B·T·nh·nph
+{
+    uint rows = a.B * a.T;
+    uint per_row = a.nh * a.nph;
+    if (gid >= rows * per_row) return;
+    uint row = gid / per_row, r = gid % per_row;
+    uint h = r / a.nph, i = r % a.nph;
+    uint p2 = 2u * a.nph;
+    float t = th[gid];
+    ph[(ulong)row * a.nh * p2 + h * p2 + i]         = cos(t);
+    ph[(ulong)row * a.nh * p2 + h * p2 + a.nph + i] = sin(t);
+}
+
+// dθ from dφ:  dθ_i = −sin θ_i·dφ[i] + cos θ_i·dφ[nph+i]
+kernel void hk_dtheta_f32(
+    device const float* th  [[buffer(0)]],
+    device const float* dph [[buffer(1)]],
+    device float*       dth [[buffer(2)]],
+    constant HkArgs&    a   [[buffer(3)]],
+    constant float&     beta [[buffer(4)]],   // dth = beta·dth + result
+    uint gid [[thread_position_in_grid]])
+{
+    uint rows = a.B * a.T;
+    uint per_row = a.nh * a.nph;
+    if (gid >= rows * per_row) return;
+    uint row = gid / per_row, r = gid % per_row;
+    uint h = r / a.nph, i = r % a.nph;
+    uint p2 = 2u * a.nph;
+    float t = th[gid];
+    ulong base = (ulong)row * a.nh * p2 + h * p2;
+    float g = -sin(t) * dph[base + i] + cos(t) * dph[base + a.nph + i];
+    dth[gid] = (beta == 0.0f) ? g : (beta * dth[gid] + g);
+}
+
+// kv = κ ⊙ v  (κ per (row, head))
+kernel void hk_kv_f32(
+    device const float* v   [[buffer(0)]],
+    device const float* kap [[buffer(1)]],
+    device float*       kv  [[buffer(2)]],
+    constant HkArgs&    a   [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])   // over B·T·nh·dv
+{
+    uint rows = a.B * a.T;
+    uint per_row = a.nh * a.dv;
+    if (gid >= rows * per_row) return;
+    uint row = gid / per_row, h = (gid % per_row) / a.dv;
+    kv[gid] = v[gid] * kap[row * a.nh + h];
+}
+
+// dv = κ⊙dkv ;  dκ = Σ_d dkv·v   (one thread per (row, head))
+kernel void hk_dkv_split_f32(
+    device const float* v    [[buffer(0)]],
+    device const float* kap  [[buffer(1)]],
+    device const float* dkv  [[buffer(2)]],
+    device float*       dv_o [[buffer(3)]],
+    device float*       dkap [[buffer(4)]],
+    constant HkArgs&    a    [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])   // over B·T·nh
+{
+    if (gid >= a.B * a.T * a.nh) return;
+    uint row = gid / a.nh, h = gid % a.nh;
+    float k = kap[gid];
+    ulong base = (ulong)row * a.nh * a.dv + h * a.dv;
+    float s = 0.0f;
+    for (uint d = 0; d < a.dv; ++d) {
+        float g = dkv[base + d];
+        dv_o[base + d] = k * g;
+        s += g * v[base + d];
+    }
+    dkap[gid] = s;
+}
+
+// Forward states: one threadgroup per (b,h), one thread per value channel
+// d; the literal recurrence over all T positions, S at every chunk
+// boundary written out. Threadgroup = dv threads.
+kernel void hk_states_fwd_f32(
+    device const float* phk    [[buffer(0)]],
+    device const float* kv     [[buffer(1)]],
+    device const float* pow_t  [[buffer(2)]],
+    device float*       states [[buffer(3)]],
+    constant HkArgs&    a      [[buffer(4)]],
+    uint tg  [[threadgroup_position_in_grid]],
+    uint d   [[thread_index_in_threadgroup]])
+{
+    threadgroup float sk[HK_C * HK_P2];   // φk of the current chunk
+    uint b = tg / a.nh, h = tg % a.nh;
+    uint p2 = 2u * a.nph;
+    uint nchunks = a.T / HK_C;
+    // γ_f = pow[h][1][f]
+    device const float* gam = pow_t + ((ulong)h * (HK_C + 1u) + 1u) * p2;
+    float S[HK_P2];
+    for (uint f = 0; f < HK_P2; ++f) S[f] = 0.0f;
+    ulong st_base = ((ulong)b * a.nh + h) * (nchunks + 1u) * p2 * a.dv;
+    for (uint c = 0; c < nchunks; ++c) {
+        // S entering chunk c
+        for (uint f = 0; f < p2; ++f) states[st_base + ((ulong)c * p2 + f) * a.dv + d] = S[f];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = d; i < HK_C * p2; i += a.dv) {
+            uint s = i / p2, f = i % p2;
+            sk[s * HK_P2 + f] = phk[((ulong)(b * a.T + c * HK_C + s) * a.nh + h) * p2 + f];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = 0; s < HK_C; ++s) {
+            float kvv = kv[((ulong)(b * a.T + c * HK_C + s) * a.nh + h) * a.dv + d];
+            for (uint f = 0; f < p2; ++f) {
+                S[f] = gam[f] * S[f] + sk[s * HK_P2 + f] * kvv;
+            }
+        }
+    }
+    for (uint f = 0; f < p2; ++f) states[st_base + ((ulong)nchunks * p2 + f) * a.dv + d] = S[f];
+}
+
+// Forward per chunk: one threadgroup per (b,h,c), nth threads (≥ dv).
+//   A[t,s] = Σ_f φq_t[f]·φk_s[f]·γ_f^{t−s}  (s ≤ t)
+//   o_t[d] = Σ_{s≤t} A[t,s]·kv_s[d] + Σ_f φq_t[f]·γ_f^{t−t0+1}·S_c[f][d]
+kernel void hk_chunk_fwd_f32(
+    device const float* phq    [[buffer(0)]],
+    device const float* phk    [[buffer(1)]],
+    device const float* kv     [[buffer(2)]],
+    device const float* pow_t  [[buffer(3)]],
+    device const float* states [[buffer(4)]],
+    device float*       out    [[buffer(5)]],
+    constant HkArgs&    a      [[buffer(6)]],
+    uint tg  [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint nth [[threads_per_threadgroup]])
+{
+    threadgroup float A[HK_C * HK_C];
+    uint p2 = 2u * a.nph;
+    uint nchunks = a.T / HK_C;
+    uint c = tg % nchunks, bh = tg / nchunks;
+    uint b = bh / a.nh, h = bh % a.nh;
+    uint t0 = c * HK_C;
+    device const float* pw = pow_t + (ulong)h * (HK_C + 1u) * p2;   // pw[δ·p2 + f]
+    // stage 1: A
+    for (uint idx = tid; idx < HK_C * HK_C; idx += nth) {
+        uint t = idx / HK_C, s = idx % HK_C;
+        float acc = 0.0f;
+        if (s <= t) {
+            device const float* q = phq + ((ulong)(b * a.T + t0 + t) * a.nh + h) * p2;
+            device const float* k = phk + ((ulong)(b * a.T + t0 + s) * a.nh + h) * p2;
+            device const float* g = pw + (t - s) * p2;
+            for (uint f = 0; f < p2; ++f) acc += q[f] * k[f] * g[f];
+        }
+        A[idx] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // stage 2: outputs, thread per d
+    if (tid < a.dv) {
+        uint d = tid;
+        float Sc[HK_P2];
+        device const float* st = states + (((ulong)bh * (nchunks + 1u) + c) * p2) * a.dv + d;
+        for (uint f = 0; f < p2; ++f) Sc[f] = st[(ulong)f * a.dv];
+        for (uint t = 0; t < HK_C; ++t) {
+            float o = 0.0f;
+            for (uint s = 0; s <= t; ++s) {
+                o += A[t * HK_C + s] * kv[((ulong)(b * a.T + t0 + s) * a.nh + h) * a.dv + d];
+            }
+            device const float* q = phq + ((ulong)(b * a.T + t0 + t) * a.nh + h) * p2;
+            device const float* g = pw + (t + 1u) * p2;
+            for (uint f = 0; f < p2; ++f) o += q[f] * g[f] * Sc[f];
+            out[((ulong)(b * a.T + t0 + t) * a.nh + h) * a.dv + d] = o;
+        }
+    }
+}
+
+// Backward state gradients (reverse over positions):
+//   G ← γ ⊙ (G + φq_t ⊗ do_t)   for t = T−1 … 0,
+// G at each chunk boundary written to dstates[c] = ∂L/∂S_c restricted
+// to reads by chunks ≥ c (dstates[nchunks] = 0). Threadgroup = dv threads.
+kernel void hk_dstates_bwd_f32(
+    device const float* phq     [[buffer(0)]],
+    device const float* dout    [[buffer(1)]],
+    device const float* pow_t   [[buffer(2)]],
+    device float*       dstates [[buffer(3)]],
+    constant HkArgs&    a       [[buffer(4)]],
+    uint tg  [[threadgroup_position_in_grid]],
+    uint d   [[thread_index_in_threadgroup]])
+{
+    threadgroup float sq[HK_C * HK_P2];
+    uint b = tg / a.nh, h = tg % a.nh;
+    uint p2 = 2u * a.nph;
+    uint nchunks = a.T / HK_C;
+    device const float* gam = pow_t + ((ulong)h * (HK_C + 1u) + 1u) * p2;
+    float G[HK_P2];
+    for (uint f = 0; f < HK_P2; ++f) G[f] = 0.0f;
+    ulong st_base = ((ulong)b * a.nh + h) * (nchunks + 1u) * p2 * a.dv;
+    for (uint f = 0; f < p2; ++f) dstates[st_base + ((ulong)nchunks * p2 + f) * a.dv + d] = 0.0f;
+    for (uint cc = 0; cc < nchunks; ++cc) {
+        uint c = nchunks - 1u - cc;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = d; i < HK_C * p2; i += a.dv) {
+            uint s = i / p2, f = i % p2;
+            sq[s * HK_P2 + f] = phq[((ulong)(b * a.T + c * HK_C + s) * a.nh + h) * p2 + f];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint ss = 0; ss < HK_C; ++ss) {
+            uint s = HK_C - 1u - ss;
+            float dov = dout[((ulong)(b * a.T + c * HK_C + s) * a.nh + h) * a.dv + d];
+            for (uint f = 0; f < p2; ++f) {
+                G[f] = gam[f] * (G[f] + sq[s * HK_P2 + f] * dov);
+            }
+        }
+        for (uint f = 0; f < p2; ++f) dstates[st_base + ((ulong)c * p2 + f) * a.dv + d] = G[f];
+    }
+}
+
+// Backward per chunk. Writes dkv (→ hk_dkv_split), dphq/dphk (→ hk_dtheta).
+//   dkv_s[d]  = Σ_{t≥s} A[t,s]·do_t[d] + Σ_f φk_s[f]·γ_f^{C−1−s}·Gn[f][d]
+//   dA[t,s]   = Σ_d do_t[d]·kv_s[d]
+//   dφq_t[f]  = Σ_{s≤t} dA[t,s]·φk_s[f]·γ_f^{t−s} + γ_f^{t+1}·Σ_d do_t[d]·Sc[f][d]
+//   dφk_s[f]  = Σ_{t≥s} dA[t,s]·φq_t[f]·γ_f^{t−s} + γ_f^{C−1−s}·Σ_d kv_s[d]·Gn[f][d]
+// (t, s relative to the chunk; Sc = states[c], Gn = dstates[c+1])
+kernel void hk_chunk_bwd_f32(
+    device const float* phq     [[buffer(0)]],
+    device const float* phk     [[buffer(1)]],
+    device const float* kv      [[buffer(2)]],
+    device const float* pow_t   [[buffer(3)]],
+    device const float* states  [[buffer(4)]],
+    device const float* dstates [[buffer(5)]],
+    device const float* dout    [[buffer(6)]],
+    device float*       dkv     [[buffer(7)]],
+    device float*       dphq    [[buffer(8)]],
+    device float*       dphk    [[buffer(9)]],
+    constant HkArgs&    a       [[buffer(10)]],
+    uint tg  [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint nth [[threads_per_threadgroup]])
+{
+    threadgroup float A[HK_C * HK_C];    // A, then reused for dA
+    uint p2 = 2u * a.nph;
+    uint nchunks = a.T / HK_C;
+    uint c = tg % nchunks, bh = tg / nchunks;
+    uint b = bh / a.nh, h = bh % a.nh;
+    uint t0 = c * HK_C;
+    device const float* pw = pow_t + (ulong)h * (HK_C + 1u) * p2;
+    #define ROW(t) ((ulong)(b * a.T + t0 + (t)) * a.nh + h)
+    // stage 1: A
+    for (uint idx = tid; idx < HK_C * HK_C; idx += nth) {
+        uint t = idx / HK_C, s = idx % HK_C;
+        float acc = 0.0f;
+        if (s <= t) {
+            device const float* q = phq + ROW(t) * p2;
+            device const float* k = phk + ROW(s) * p2;
+            device const float* g = pw + (t - s) * p2;
+            for (uint f = 0; f < p2; ++f) acc += q[f] * k[f] * g[f];
+        }
+        A[idx] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // stage 2: dkv, thread per d
+    if (tid < a.dv) {
+        uint d = tid;
+        float Gn[HK_P2];
+        device const float* gn = dstates + (((ulong)bh * (nchunks + 1u) + c + 1u) * p2) * a.dv + d;
+        for (uint f = 0; f < p2; ++f) Gn[f] = gn[(ulong)f * a.dv];
+        for (uint s = 0; s < HK_C; ++s) {
+            float acc = 0.0f;
+            for (uint t = s; t < HK_C; ++t) {
+                acc += A[t * HK_C + s] * dout[ROW(t) * a.dv + d];
+            }
+            device const float* k = phk + ROW(s) * p2;
+            device const float* g = pw + (HK_C - 1u - s) * p2;
+            for (uint f = 0; f < p2; ++f) acc += k[f] * g[f] * Gn[f];
+            dkv[ROW(s) * a.dv + d] = acc;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // stage 3: dA (overwrites A)
+    for (uint idx = tid; idx < HK_C * HK_C; idx += nth) {
+        uint t = idx / HK_C, s = idx % HK_C;
+        float acc = 0.0f;
+        if (s <= t) {
+            device const float* dq = dout + ROW(t) * a.dv;
+            device const float* kvs = kv + ROW(s) * a.dv;
+            for (uint d = 0; d < a.dv; ++d) acc += dq[d] * kvs[d];
+        }
+        A[idx] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // stage 4: dφq, dφk — thread per (t, f)
+    for (uint idx = tid; idx < HK_C * p2; idx += nth) {
+        uint t = idx / p2, f = idx % p2;
+        // dφq_t[f]
+        float acc = 0.0f;
+        for (uint s = 0; s <= t; ++s) {
+            acc += A[t * HK_C + s] * phk[ROW(s) * p2 + f] * pw[(t - s) * p2 + f];
+        }
+        {
+            device const float* dq = dout + ROW(t) * a.dv;
+            device const float* sc = states + (((ulong)bh * (nchunks + 1u) + c) * p2 + f) * a.dv;
+            float dot = 0.0f;
+            for (uint d = 0; d < a.dv; ++d) dot += dq[d] * sc[d];
+            acc += pw[(t + 1u) * p2 + f] * dot;
+        }
+        dphq[ROW(t) * p2 + f] = acc;
+        // dφk_s[f] with s = t (same index space)
+        uint s = t;
+        float acck = 0.0f;
+        for (uint tt = s; tt < HK_C; ++tt) {
+            acck += A[tt * HK_C + s] * phq[ROW(tt) * p2 + f] * pw[(tt - s) * p2 + f];
+        }
+        {
+            device const float* kvs = kv + ROW(s) * a.dv;
+            device const float* gn = dstates + (((ulong)bh * (nchunks + 1u) + c + 1u) * p2 + f) * a.dv;
+            float dot = 0.0f;
+            for (uint d = 0; d < a.dv; ++d) dot += kvs[d] * gn[d];
+            acck += pw[(HK_C - 1u - s) * p2 + f] * dot;
+        }
+        dphk[ROW(s) * p2 + f] = acck;
+    }
+    #undef ROW
+}

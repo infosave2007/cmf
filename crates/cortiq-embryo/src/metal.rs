@@ -39,6 +39,14 @@ pub struct Ctx {
     swiglu_bwd: ComputePipelineState,
     embed_gather: ComputePipelineState,
     softmax_ce: ComputePipelineState,
+    hk_phi: ComputePipelineState,
+    hk_dtheta: ComputePipelineState,
+    hk_kv: ComputePipelineState,
+    hk_dkv_split: ComputePipelineState,
+    hk_states_fwd: ComputePipelineState,
+    hk_chunk_fwd: ComputePipelineState,
+    hk_dstates_bwd: ComputePipelineState,
+    hk_chunk_bwd: ComputePipelineState,
 }
 unsafe impl Send for Ctx {}
 unsafe impl Sync for Ctx {}
@@ -116,6 +124,14 @@ fn init() -> Result<Ctx, String> {
         swiglu_bwd: pso("swiglu_bwd_f32")?,
         embed_gather: pso("embed_gather_f32")?,
         softmax_ce: pso("softmax_ce_f32")?,
+        hk_phi: pso("hk_phi_f32")?,
+        hk_dtheta: pso("hk_dtheta_f32")?,
+        hk_kv: pso("hk_kv_f32")?,
+        hk_dkv_split: pso("hk_dkv_split_f32")?,
+        hk_states_fwd: pso("hk_states_fwd_f32")?,
+        hk_chunk_fwd: pso("hk_chunk_fwd_f32")?,
+        hk_dstates_bwd: pso("hk_dstates_bwd_f32")?,
+        hk_chunk_bwd: pso("hk_chunk_bwd_f32")?,
         gemm,
         _lib: lib,
         queue,
@@ -459,6 +475,127 @@ impl<'a> Cmd<'a> {
         e.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(256, 1, 1));
     }
 
+    // ---------------- hybrid_k mixer (chunk C = 64) ----------------
+
+    fn hk_args(&self, idx: u64, d: &HkDims) {
+        #[repr(C)]
+        struct Args {
+            b: u32,
+            t: u32,
+            nh: u32,
+            nph: u32,
+            dv: u32,
+        }
+        let a = Args { b: d.b as u32, t: d.t as u32, nh: d.nh as u32, nph: d.nph as u32, dv: d.dv as u32 };
+        self.enc.set_bytes(idx, std::mem::size_of::<Args>() as u64, &a as *const Args as *const c_void);
+    }
+
+    /// Forward of one hybrid_k mixer layer (after the projections):
+    /// inputs thq/thk [B·T, nh·nph], v [B·T, nh·dv], kappa [B·T, nh]; scratch
+    /// phq/phk [B·T, nh·2nph], kv [B·T, nh·dv], states [B·nh·(T/64+1)·2nph·dv];
+    /// output out [B·T, nh·dv]. `pow` from `hk_pow_table`.
+    pub fn hk_forward(&self, d: &HkDims, w: &HkWork<'_>) {
+        hk_check(d, w);
+        let e = &self.enc;
+        let rows = d.b * d.t;
+        // φ tables
+        for (th, ph) in [(w.thq, w.phq), (w.thk, w.phk)] {
+            e.set_compute_pipeline_state(&self.c.hk_phi);
+            e.set_buffer(0, Some(&th.buf), 0);
+            e.set_buffer(1, Some(&ph.buf), 0);
+            self.hk_args(2, d);
+            self.grid1(rows * d.nh * d.nph, 256);
+        }
+        // kv = κ⊙v
+        e.set_compute_pipeline_state(&self.c.hk_kv);
+        e.set_buffer(0, Some(&w.v.buf), 0);
+        e.set_buffer(1, Some(&w.kappa.buf), 0);
+        e.set_buffer(2, Some(&w.kv.buf), 0);
+        self.hk_args(3, d);
+        self.grid1(rows * d.nh * d.dv, 256);
+        // chunk-boundary states
+        e.set_compute_pipeline_state(&self.c.hk_states_fwd);
+        e.set_buffer(0, Some(&w.phk.buf), 0);
+        e.set_buffer(1, Some(&w.kv.buf), 0);
+        e.set_buffer(2, Some(&w.pow.buf), 0);
+        e.set_buffer(3, Some(&w.states.buf), 0);
+        self.hk_args(4, d);
+        e.dispatch_thread_groups(MTLSize::new((d.b * d.nh) as u64, 1, 1), MTLSize::new(d.dv as u64, 1, 1));
+        // per-chunk outputs
+        let nchunks = d.t / 64;
+        e.set_compute_pipeline_state(&self.c.hk_chunk_fwd);
+        e.set_buffer(0, Some(&w.phq.buf), 0);
+        e.set_buffer(1, Some(&w.phk.buf), 0);
+        e.set_buffer(2, Some(&w.kv.buf), 0);
+        e.set_buffer(3, Some(&w.pow.buf), 0);
+        e.set_buffer(4, Some(&w.states.buf), 0);
+        e.set_buffer(5, Some(&w.out.buf), 0);
+        self.hk_args(6, d);
+        e.dispatch_thread_groups(
+            MTLSize::new((d.b * d.nh * nchunks) as u64, 1, 1),
+            MTLSize::new(d.dv.max(128) as u64, 1, 1),
+        );
+    }
+
+    /// Backward of one hybrid_k mixer layer given dout [B·T, nh·dv].
+    /// Requires the forward's phq/phk/kv/states. Writes dthq/dthk (beta-
+    /// accumulated), dv, dkappa; scratch dstates (same size as states),
+    /// dkv [B·T, nh·dv], dphq/dphk [B·T, nh·2nph].
+    pub fn hk_backward(&self, d: &HkDims, w: &HkWork<'_>, g: &HkGrads<'_>, beta_th: f32) {
+        hk_check(d, w);
+        let e = &self.enc;
+        let rows = d.b * d.t;
+        let nchunks = d.t / 64;
+        assert!(g.dstates.len >= w.states.len && g.dkv.len >= rows * d.nh * d.dv);
+        assert!(g.dphq.len >= rows * d.nh * 2 * d.nph && g.dphk.len >= rows * d.nh * 2 * d.nph);
+        assert!(g.dout.len >= rows * d.nh * d.dv && g.dv.len >= rows * d.nh * d.dv);
+        assert!(g.dthq.len >= rows * d.nh * d.nph && g.dthk.len >= rows * d.nh * d.nph && g.dkappa.len >= rows * d.nh);
+        // reverse state-gradient scan
+        e.set_compute_pipeline_state(&self.c.hk_dstates_bwd);
+        e.set_buffer(0, Some(&w.phq.buf), 0);
+        e.set_buffer(1, Some(&g.dout.buf), 0);
+        e.set_buffer(2, Some(&w.pow.buf), 0);
+        e.set_buffer(3, Some(&g.dstates.buf), 0);
+        self.hk_args(4, d);
+        e.dispatch_thread_groups(MTLSize::new((d.b * d.nh) as u64, 1, 1), MTLSize::new(d.dv as u64, 1, 1));
+        // per-chunk gradients
+        e.set_compute_pipeline_state(&self.c.hk_chunk_bwd);
+        e.set_buffer(0, Some(&w.phq.buf), 0);
+        e.set_buffer(1, Some(&w.phk.buf), 0);
+        e.set_buffer(2, Some(&w.kv.buf), 0);
+        e.set_buffer(3, Some(&w.pow.buf), 0);
+        e.set_buffer(4, Some(&w.states.buf), 0);
+        e.set_buffer(5, Some(&g.dstates.buf), 0);
+        e.set_buffer(6, Some(&g.dout.buf), 0);
+        e.set_buffer(7, Some(&g.dkv.buf), 0);
+        e.set_buffer(8, Some(&g.dphq.buf), 0);
+        e.set_buffer(9, Some(&g.dphk.buf), 0);
+        self.hk_args(10, d);
+        e.dispatch_thread_groups(
+            MTLSize::new((d.b * d.nh * nchunks) as u64, 1, 1),
+            MTLSize::new(d.dv.max(128) as u64, 1, 1),
+        );
+        // dv, dκ from dkv
+        e.set_compute_pipeline_state(&self.c.hk_dkv_split);
+        e.set_buffer(0, Some(&w.v.buf), 0);
+        e.set_buffer(1, Some(&w.kappa.buf), 0);
+        e.set_buffer(2, Some(&g.dkv.buf), 0);
+        e.set_buffer(3, Some(&g.dv.buf), 0);
+        e.set_buffer(4, Some(&g.dkappa.buf), 0);
+        self.hk_args(5, d);
+        self.grid1(rows * d.nh, 128);
+        // dθ from dφ
+        for (th, dph, dth) in [(w.thq, g.dphq, g.dthq), (w.thk, g.dphk, g.dthk)] {
+            e.set_compute_pipeline_state(&self.c.hk_dtheta);
+            e.set_buffer(0, Some(&th.buf), 0);
+            e.set_buffer(1, Some(&dph.buf), 0);
+            e.set_buffer(2, Some(&dth.buf), 0);
+            self.hk_args(3, d);
+            self.set_f32(4, beta_th);
+            self.grid1(rows * d.nh * d.nph, 256);
+        }
+    }
+
     /// Submit and wait. Returns GPU time in milliseconds (GPUEndTime −
     /// GPUStartTime) — the number the TFLOPS bench reports.
     pub fn commit(self) -> f64 {
@@ -481,4 +618,61 @@ fn gpu_ms(cmd: &metal::CommandBufferRef) -> f64 {
         let e: f64 = msg_send![p, GPUEndTime];
         (e - s) * 1000.0
     }
+}
+
+pub use crate::ops::HkDims;
+
+/// Buffers of one hybrid_k layer's forward (inputs + scratch + output).
+pub struct HkWork<'a> {
+    pub thq: &'a GBuf,
+    pub thk: &'a GBuf,
+    pub v: &'a GBuf,
+    pub kappa: &'a GBuf,
+    /// γ^δ table from `hk_pow_table`
+    pub pow: &'a GBuf,
+    pub phq: &'a GBuf,
+    pub phk: &'a GBuf,
+    pub kv: &'a GBuf,
+    pub states: &'a GBuf,
+    pub out: &'a GBuf,
+}
+
+/// Buffers of one hybrid_k layer's backward.
+pub struct HkGrads<'a> {
+    pub dout: &'a GBuf,
+    pub dstates: &'a GBuf,
+    pub dkv: &'a GBuf,
+    pub dphq: &'a GBuf,
+    pub dphk: &'a GBuf,
+    pub dthq: &'a GBuf,
+    pub dthk: &'a GBuf,
+    pub dv: &'a GBuf,
+    pub dkappa: &'a GBuf,
+}
+
+fn hk_check(d: &HkDims, w: &HkWork<'_>) {
+    assert!(d.t % 64 == 0, "hybrid_k: T must be a multiple of the chunk (64), got {}", d.t);
+    assert!(d.nph <= 32 && d.dv <= 128, "hybrid_k kernels: nph ≤ 32, dv ≤ 128");
+    let rows = d.b * d.t;
+    assert!(w.thq.len >= rows * d.nh * d.nph && w.thk.len >= rows * d.nh * d.nph);
+    assert!(w.v.len >= rows * d.nh * d.dv && w.out.len >= rows * d.nh * d.dv && w.kv.len >= rows * d.nh * d.dv);
+    assert!(w.kappa.len >= rows * d.nh);
+    assert!(w.phq.len >= rows * d.nh * 2 * d.nph && w.phk.len >= rows * d.nh * 2 * d.nph);
+    assert!(w.pow.len >= d.nh * 65 * 2 * d.nph);
+    assert!(w.states.len >= d.b * d.nh * (d.t / 64 + 1) * 2 * d.nph * d.dv);
+}
+
+/// γ_{h,f}^δ for δ = 0..=64, laid out [nh][65][p2] — the kernels' `pow`.
+pub fn hk_pow_table(decay: &[f32], nh: usize, nph: usize) -> Vec<f32> {
+    let p2 = 2 * nph;
+    let mut t = vec![0.0f32; nh * 65 * p2];
+    for h in 0..nh {
+        for f in 0..p2 {
+            let g = decay[h * p2 + f] as f64;
+            for delta in 0..=64usize {
+                t[(h * 65 + delta) * p2 + f] = g.powi(delta as i32) as f32;
+            }
+        }
+    }
+    t
 }
