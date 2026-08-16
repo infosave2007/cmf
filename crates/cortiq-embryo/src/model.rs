@@ -327,8 +327,8 @@ mod gpu {
     /// periodic PCA of the routed inputs)
     pub const MOE_K: usize = 16;
     /// EMA rate of the descriptor means and the balancing-bias step
-    pub const MOE_ALPHA: f32 = 0.05;
-    pub const MOE_ETA: f32 = 0.5;
+    pub const MOE_ALPHA: f32 = 0.02;
+    pub const MOE_ETA: f32 = 0.05;
     use crate::ops::hk_decay_grid;
 
     /// Per-layer activation buffers kept for the backward (M = B·T rows).
@@ -485,6 +485,9 @@ mod gpu {
         /// reuse the previous step's expert assignments instead of routing (the
         /// gradcheck freezes the piecewise-linear region; never set in training)
         pub route_frozen: std::cell::Cell<bool>,
+        /// descriptors seeded from data (first training forward)
+        pub desc_seeded: std::cell::Cell<bool>,
+        pub desc_seed_rows: GBuf,
         pub scratch: Scratch,
         pub step: u32,
         /// rows per head chunk (logits [head_rows, V] materialised at a time)
@@ -651,6 +654,8 @@ mod gpu {
                 moe_cap,
                 desc_updates: std::cell::Cell::new(true),
                 route_frozen: std::cell::Cell::new(false),
+                desc_seeded: std::cell::Cell::new(false),
+                desc_seed_rows: GBuf::from_u32(c, &(0..ne.max(1)).map(|e| ((e * 7919 + 13) % (b * t)) as u32).collect::<Vec<u32>>()),
                 scratch,
                 step: 0,
                 head_rows,
@@ -695,6 +700,11 @@ mod gpu {
             let mo = &self.moe[l];
             let d = &self.desc;
             let (mu_off, u_off, e_off) = (l * ne * h, l * ne * MOE_K * h, l * ne);
+            if train && self.desc_updates.get() && !self.desc_seeded.get() {
+                // first training forward: seed the descriptors from this batch's
+                // own rows (spread across the batch), instead of random points
+                cmd.moe_init_mu(&r, x2, &self.desc_seed_rows, &d.mu, mu_off);
+            }
             if !self.route_frozen.get() {
                 cmd.route(&r, x2, &d.mu, mu_off, &d.u, u_off, &d.bias, e_off, &mo.assign, &mo.res);
                 cmd.route_group(&r, &mo.assign, &mo.slot, &d.count, e_off);
@@ -724,7 +734,7 @@ mod gpu {
             if train && self.desc_updates.get() {
                 // descriptor statistics → μ EMA + balancing bias
                 cmd.moe_stats(&r, &mo.hg, &d.count, e_off, &d.sums, mu_off);
-                cmd.moe_update(&r, &d.mu, mu_off, &d.bias, e_off, &d.sums, mu_off, &d.count, e_off, MOE_ALPHA, MOE_ETA);
+                cmd.moe_update(&r, &d.mu, mu_off, &d.bias, e_off, &d.sums, mu_off, &d.count, e_off, &mo.res, MOE_ALPHA, MOE_ETA);
             }
         }
 
@@ -1067,6 +1077,7 @@ mod gpu {
                 let out: &GBuf = if l + 1 < cfg.layers { self.x_in(l + 1) } else { &self.x_out };
                 self.layer_fwd(cmd, l, out, true);
             }
+            self.desc_seeded.set(true);
             cmd.rmsnorm_fwd_at(&self.x_out, &self.p, self.lay.final_norm, &self.xf, &self.invf, m, h, cfg.norm_eps);
             self.encode_head(cmd, true);
             // final norm backward → s.dx
@@ -1252,6 +1263,9 @@ impl EmbryoGpu {
         vec![("desc.mu", self.desc.mu.to_vec()), ("desc.u", self.desc.u.to_vec()), ("desc.bias", self.desc.bias.to_vec())]
     }
     pub fn set_desc(&self, extras: &[(String, Vec<f32>)]) {
+        if !extras.is_empty() {
+            self.desc_seeded.set(true);
+        }
         for (name, x) in extras {
             match name.as_str() {
                 "desc.mu" if x.len() == self.desc.mu.len => self.desc.mu.write_from(x),

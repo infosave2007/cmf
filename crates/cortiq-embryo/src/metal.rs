@@ -71,6 +71,7 @@ pub struct Ctx {
     moe_stats: ComputePipelineState,
     moe_update: ComputePipelineState,
     moe_indirect: ComputePipelineState,
+    moe_init_mu: ComputePipelineState,
 }
 unsafe impl Send for Ctx {}
 unsafe impl Sync for Ctx {}
@@ -180,6 +181,7 @@ fn init() -> Result<Ctx, String> {
         moe_stats: pso("moe_stats_f32")?,
         moe_update: pso("moe_update_f32")?,
         moe_indirect: pso("moe_indirect_args_f32")?,
+        moe_init_mu: pso("moe_init_mu_f32")?,
         gemm,
         _lib: lib,
         queue,
@@ -1289,7 +1291,7 @@ impl<'a> Cmd<'a> {
 
     /// μ EMA + balancing bias update from the step's routing statistics.
     #[allow(clippy::too_many_arguments)]
-    pub fn moe_update(&self, r: &RouteDims, mu: &GBuf, mu_off: usize, bias: &GBuf, bias_off: usize, sums: &GBuf, sums_off: usize, count: &GBuf, count_off: usize, alpha: f32, eta: f32) {
+    pub fn moe_update(&self, r: &RouteDims, mu: &GBuf, mu_off: usize, bias: &GBuf, bias_off: usize, sums: &GBuf, sums_off: usize, count: &GBuf, count_off: usize, res: &GBuf, alpha: f32, eta: f32) {
         #[repr(C)]
         struct Args {
             rows: u32,
@@ -1305,7 +1307,19 @@ impl<'a> Cmd<'a> {
         e.set_buffer(1, Some(&bias.buf), (bias_off * 4) as u64);
         e.set_buffer(2, Some(&sums.buf), (sums_off * 4) as u64);
         e.set_buffer(3, Some(&count.buf), (count_off * 4) as u64);
-        e.set_bytes(4, std::mem::size_of::<Args>() as u64, &a as *const Args as *const c_void);
+        e.set_buffer(4, Some(&res.buf), 0);
+        e.set_bytes(5, std::mem::size_of::<Args>() as u64, &a as *const Args as *const c_void);
+        self.grid1(r.e * r.h, 128);
+    }
+
+    /// μ_e := x[rows[e]] (data init of the descriptors).
+    pub fn moe_init_mu(&self, r: &RouteDims, x: &GBuf, rows: &GBuf, mu: &GBuf, mu_off: usize) {
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.moe_init_mu);
+        e.set_buffer(0, Some(&x.buf), 0);
+        e.set_buffer(1, Some(&rows.buf), 0);
+        e.set_buffer(2, Some(&mu.buf), (mu_off * 4) as u64);
+        self.route_args(3, r);
         self.grid1(r.e * r.h, 128);
     }
 
