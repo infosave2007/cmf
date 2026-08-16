@@ -11,7 +11,12 @@ use cortiq_embryo::ops::lcg_vec;
 #[test]
 fn every_tensor_matches_finite_differences() {
     let Some(c) = ctx() else { return };
-    let cfg = EmbryoCfg::tiny();
+    for hier in [false, true] {
+    let mut cfg = EmbryoCfg::tiny();
+    if !hier {
+        cfg.head_clusters = 0;
+    }
+    eprintln!("=== head: {} ===", if hier { "hierarchical" } else { "flat" });
     let (b, t) = (2usize, 64usize);
     let m = b * t;
     let lay = Layout::new(&cfg);
@@ -24,6 +29,7 @@ fn every_tensor_matches_finite_differences() {
         std::ptr::copy_nonoverlapping(tokens.as_ptr(), gpu.tok.buf.contents() as *mut u32, m);
         std::ptr::copy_nonoverlapping(targets.as_ptr(), gpu.tgt.buf.contents() as *mut u32, m);
     }
+    gpu.prepare_head(&targets);
     let cmd = Cmd::new(c);
     gpu.encode_fwd_bwd(&cmd);
     cmd.commit();
@@ -62,7 +68,9 @@ fn every_tensor_matches_finite_differences() {
             gpu.set_params(&pp);
             let lm = gpu.eval_loss(&tokens, &targets) as f64;
             let fd = (lp - lm) / (2.0 * eps);
-            let denom = gnorm.max(1e-6);
+            // f32 forward noise (~1e-6 on the loss) over the FD step bounds the
+            // resolvable gradient: absolute floor 5e-4 on the denominator.
+            let denom = gnorm.max(5e-4);
             let rel = (fd - analytic).abs() / denom;
             worst_all = worst_all.max(rel);
             eprintln!(
@@ -74,4 +82,5 @@ fn every_tensor_matches_finite_differences() {
     }
     gpu.set_params(&p0);
     eprintln!("worst err/|g| = {worst_all:.2e}");
+    }
 }

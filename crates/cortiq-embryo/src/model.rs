@@ -73,7 +73,7 @@ impl EmbryoCfg {
     /// every dim still a multiple of the GEMM tile).
     pub fn tiny() -> Self {
         EmbryoCfg {
-            vocab: 512,
+            vocab: 4096,
             hidden: 64,
             layers: 2,
             anchor_every: 2,
@@ -89,7 +89,7 @@ impl EmbryoCfg {
             rope_base: 10000.0,
             experts: 0,
             inter: 128,
-            head_clusters: 0,
+            head_clusters: 64,
             mtp_heads: 0,
             seq: 64,
             norm_eps: 1e-6,
@@ -169,6 +169,9 @@ pub struct Layout {
     pub total: usize,
     pub embed: usize, // [V, H]
     pub final_norm: usize,
+    /// [head_clusters, H] cluster embeddings of the hierarchical head
+    /// (usize::MAX when the head is flat)
+    pub head_clusters: usize,
     pub layers: Vec<LayerOffs>,
     /// (name, offset, len) of every tensor — checkpoints and the CMF export
     pub names: Vec<(String, usize, usize)>,
@@ -215,7 +218,9 @@ impl Layout {
             }
         }
         let final_norm = take("final_norm".into(), h);
-        Layout { total: off, embed, final_norm, layers, names }
+        let head_clusters =
+            if cfg.head_clusters > 0 { take("head.clusters".into(), cfg.head_clusters * h) } else { usize::MAX };
+        Layout { total: off, embed, final_norm, head_clusters, layers, names }
     }
 }
 
@@ -279,6 +284,9 @@ pub fn init_params(cfg: &EmbryoCfg, lay: &Layout, seed: u64) -> Vec<f32> {
         }
     }
     p[lay.final_norm..lay.final_norm + h].fill(1.0);
+    if cfg.head_clusters > 0 {
+        fill(&mut p, lay.head_clusters, cfg.head_clusters * h, std);
+    }
     p
 }
 
@@ -384,6 +392,17 @@ mod gpu {
         pub dxf: GBuf,   // [M,H]
         pub tok: GBuf,   // [M] u32 inputs
         pub tgt: GBuf,   // [M] u32 targets
+        // hierarchical head (cfg.head_clusters > 0)
+        pub tgt_cluster: GBuf, // [M] u32 target cluster ids
+        pub head_idx: GBuf,    // [Mpad] i32 grouped row → token index (−1 pad)
+        /// (cluster, row offset, padded rows) of the grouped rows
+        pub head_groups: std::cell::RefCell<Vec<(usize, usize, usize)>>,
+        pub hg: GBuf,    // [Mpad, H] gathered rows
+        pub dhg: GBuf,   // [Mpad, H]
+        pub lw: GBuf,    // [Mpad, S] within-cluster logits
+        pub lc: GBuf,    // [M, C] cluster logits
+        pub loss2: GBuf, // [M]
+        pub mpad: usize,
         pub scratch: Scratch,
         pub step: u32,
         /// rows per head chunk (logits [head_rows, V] materialised at a time)
@@ -449,6 +468,15 @@ mod gpu {
             }
             let head_rows = 1024.min(m);
             assert!(m % head_rows == 0);
+            let ncl = cfg.head_clusters;
+            let mpad = m + ncl * 64;
+            let cs = if ncl > 0 { cfg.vocab / ncl } else { 0 };
+            if ncl > 0 {
+                assert!(
+                    cfg.vocab % ncl == 0 && cs % 64 == 0 && ncl % 64 == 0,
+                    "hierarchical head: vocab = C·S with C, S multiples of 64"
+                );
+            }
             let scratch = Scratch {
                 dx: z(m * h),
                 dx1: z(m * h),
@@ -496,6 +524,15 @@ mod gpu {
                 dxf: z(m * h),
                 tok: GBuf::from_u32(c, &vec![0u32; m]),
                 tgt: GBuf::from_u32(c, &vec![0u32; m]),
+                tgt_cluster: GBuf::from_u32(c, &vec![0u32; m]),
+                head_idx: GBuf::from_u32(c, &vec![u32::MAX; mpad.max(1)]),
+                head_groups: std::cell::RefCell::new(Vec::new()),
+                hg: z(mpad * h),
+                dhg: z(mpad * h),
+                lw: z(mpad * cs.max(1)),
+                lc: z(m * ncl.max(1)),
+                loss2: z(m),
+                mpad,
                 scratch,
                 step: 0,
                 head_rows,
@@ -711,6 +748,102 @@ mod gpu {
             }
         }
 
+
+        /// Host-side prep of the hierarchical head for the batch already in
+        /// `tgt`: target cluster ids and the rows grouped by cluster (each
+        /// group padded to a multiple of 64 with −1). No-op for the flat head.
+        pub fn prepare_head(&self, targets: &[u32]) {
+            let ncl = self.cfg.head_clusters;
+            if ncl == 0 {
+                return;
+            }
+            let m = self.b * self.t;
+            let cs = self.cfg.vocab / ncl;
+            let mut tc = vec![0u32; m];
+            let mut buckets: Vec<Vec<i32>> = vec![Vec::new(); ncl];
+            for (i, &t) in targets.iter().enumerate() {
+                let c = (t as usize / cs).min(ncl - 1);
+                tc[i] = c as u32;
+                buckets[c].push(i as i32);
+            }
+            let mut idx: Vec<i32> = Vec::with_capacity(self.mpad);
+            let mut groups = Vec::new();
+            for (c, bk) in buckets.iter().enumerate() {
+                if bk.is_empty() {
+                    continue;
+                }
+                let off = idx.len();
+                idx.extend_from_slice(bk);
+                let pad = bk.len().div_ceil(64) * 64;
+                idx.resize(off + pad, -1);
+                groups.push((c, off, pad));
+            }
+            assert!(idx.len() <= self.mpad);
+            unsafe {
+                std::ptr::copy_nonoverlapping(tc.as_ptr(), self.tgt_cluster.buf.contents() as *mut u32, m);
+                std::ptr::copy_nonoverlapping(idx.as_ptr(), self.head_idx.buf.contents() as *mut i32, idx.len());
+            }
+            *self.head_groups.borrow_mut() = groups;
+        }
+
+        /// Head: loss (+ dxf and dE/dC when `train`). Flat full-softmax or
+        /// hierarchical (cluster CE + within-target-cluster CE), tied to E.
+        pub(crate) fn encode_head(&self, cmd: &Cmd, train: bool) {
+            let cfg = &self.cfg;
+            let (h, m) = (cfg.hidden, self.b * self.t);
+            let s = &self.scratch;
+            let scale = 1.0 / m as f32;
+            let ncl = cfg.head_clusters;
+            if ncl == 0 {
+                let r = self.head_rows;
+                for c0 in (0..m).step_by(r) {
+                    cmd.gemm(Op::N, Op::T, r, cfg.vocab, h, 1.0, &self.xf, c0 * h, h, &self.p, self.lay.embed, h, 0.0, &s.logits, 0, cfg.vocab);
+                    cmd.softmax_ce_at(&s.logits, 0, &self.tgt, c0, &s.loss, c0, r, cfg.vocab, scale);
+                    if train {
+                        cmd.gemm(Op::N, Op::N, r, h, cfg.vocab, 1.0, &s.logits, 0, cfg.vocab, &self.p, self.lay.embed, h, 0.0, &self.dxf, c0 * h, h);
+                        cmd.gemm(Op::T, Op::N, cfg.vocab, h, r, 1.0, &s.logits, 0, cfg.vocab, &self.xf, c0 * h, h, 1.0, &self.g, self.lay.embed, h);
+                    }
+                }
+                return;
+            }
+            let cs = cfg.vocab / ncl;
+            let hc = self.lay.head_clusters;
+            // level 1: clusters
+            cmd.gemm(Op::N, Op::T, m, ncl, h, 1.0, &self.xf, 0, h, &self.p, hc, h, 0.0, &self.lc, 0, ncl);
+            cmd.softmax_ce_at(&self.lc, 0, &self.tgt_cluster, 0, &s.loss, 0, m, ncl, scale);
+            if train {
+                cmd.gemm(Op::N, Op::N, m, h, ncl, 1.0, &self.lc, 0, ncl, &self.p, hc, h, 0.0, &self.dxf, 0, h);
+                cmd.gemm(Op::T, Op::N, ncl, h, m, 1.0, &self.lc, 0, ncl, &self.xf, 0, h, 1.0, &self.g, hc, h);
+            }
+            // level 2: within the target cluster, rows grouped by cluster
+            let groups = self.head_groups.borrow();
+            let rows_total = groups.last().map(|(_, off, pad)| off + pad).unwrap_or(0);
+            assert!(
+                rows_total >= m,
+                "hierarchical head: prepare_head(targets) must precede the encode (grouped {rows_total} rows for {m} tokens)"
+            );
+            cmd.gather_rows(&self.xf, &self.head_idx, &self.hg, rows_total, h);
+            for &(c, off, pad) in groups.iter() {
+                cmd.gemm(Op::N, Op::T, pad, cs, h, 1.0, &self.hg, off * h, h, &self.p, self.lay.embed + c * cs * h, h, 0.0, &self.lw, off * cs, cs);
+            }
+            cmd.softmax_ce_idx(&self.lw, &self.head_idx, &self.tgt, &self.loss2, rows_total, cs, scale);
+            if train {
+                for &(c, off, pad) in groups.iter() {
+                    cmd.gemm(Op::N, Op::N, pad, h, cs, 1.0, &self.lw, off * cs, cs, &self.p, self.lay.embed + c * cs * h, h, 0.0, &self.dhg, off * h, h);
+                    cmd.gemm(Op::T, Op::N, cs, h, pad, 1.0, &self.lw, off * cs, cs, &self.hg, off * h, h, 1.0, &self.g, self.lay.embed + c * cs * h, h);
+                }
+                cmd.scatter_add_rows(&self.dxf, &self.head_idx, &self.dhg, rows_total, h);
+            }
+        }
+
+        /// Mean loss of the batch just run (both levels of the head).
+        pub fn read_loss(&self) -> f32 {
+            let m = self.b * self.t;
+            let l1: f64 = self.scratch.loss.as_slice()[..m].iter().map(|x| *x as f64).sum();
+            let l2: f64 = if self.cfg.head_clusters > 0 { self.loss2.as_slice()[..m].iter().map(|x| *x as f64).sum() } else { 0.0 };
+            ((l1 + l2) / m as f64) as f32
+        }
+
         /// Encode one full training step's forward + backward (grads into
         /// `g`, zeroed first) + the grad-norm partials. Tokens/targets must
         /// already be in `tok`/`tgt`. Loss per position lands in scratch.loss.
@@ -726,16 +859,7 @@ mod gpu {
                 self.layer_fwd(cmd, l, out);
             }
             cmd.rmsnorm_fwd_at(&self.x_out, &self.p, self.lay.final_norm, &self.xf, &self.invf, m, h, cfg.norm_eps);
-            // head (tied, full softmax) in row chunks: loss + dxf + dE
-            let r = self.head_rows;
-            let scale = 1.0 / m as f32;
-            for c0 in (0..m).step_by(r) {
-                cmd.gemm(Op::N, Op::T, r, cfg.vocab, h, 1.0, &self.xf, c0 * h, h, &self.p, self.lay.embed, h, 0.0, &s.logits, 0, cfg.vocab);
-                cmd.softmax_ce_at(&s.logits, 0, &self.tgt, c0, &s.loss, c0, r, cfg.vocab, scale);
-                // dxf_chunk = dlogits·E ; dE += dlogitsᵀ·xf_chunk
-                cmd.gemm(Op::N, Op::N, r, h, cfg.vocab, 1.0, &s.logits, 0, cfg.vocab, &self.p, self.lay.embed, h, 0.0, &self.dxf, c0 * h, h);
-                cmd.gemm(Op::T, Op::N, cfg.vocab, h, r, 1.0, &s.logits, 0, cfg.vocab, &self.xf, c0 * h, h, 1.0, &self.g, self.lay.embed, h);
-            }
+            self.encode_head(cmd, true);
             // final norm backward → s.dx
             cmd.rmsnorm_bwd_at(&self.x_out, &self.p, self.lay.final_norm, &self.dxf, &self.invf, &s.dx, 0.0, &self.g, self.lay.final_norm, m, h);
             for l in (0..cfg.layers).rev() {
@@ -763,11 +887,12 @@ mod gpu {
                 std::ptr::copy_nonoverlapping(tokens.as_ptr(), self.tok.buf.contents() as *mut u32, m);
                 std::ptr::copy_nonoverlapping(targets.as_ptr(), self.tgt.buf.contents() as *mut u32, m);
             }
+            self.prepare_head(targets);
             let cmd = Cmd::new(c);
             let groups = self.encode_fwd_bwd(&cmd);
             let ms1 = cmd.commit();
             let gnorm = self.scratch.partial.as_slice()[..groups].iter().map(|x| *x as f64).sum::<f64>().sqrt() as f32;
-            let loss = (self.scratch.loss.as_slice()[..m].iter().map(|x| *x as f64).sum::<f64>() / m as f64) as f32;
+            let loss = self.read_loss();
             self.step += 1;
             let cmd = Cmd::new(c);
             self.encode_adamw(&cmd, lr, wd, clip, gnorm, self.step);
@@ -782,9 +907,9 @@ mod gpu {
                 std::ptr::copy_nonoverlapping(tokens.as_ptr(), self.tok.buf.contents() as *mut u32, m);
                 std::ptr::copy_nonoverlapping(targets.as_ptr(), self.tgt.buf.contents() as *mut u32, m);
             }
+            self.prepare_head(targets);
             let cfg = &self.cfg;
             let (h, m) = (cfg.hidden, m);
-            let s = &self.scratch;
             let cmd = Cmd::new(self.ctx());
             cmd.embed_gather_at(&self.p, self.lay.embed, &self.tok, self.x_in(0), m, h);
             for l in 0..cfg.layers {
@@ -792,13 +917,9 @@ mod gpu {
                 self.layer_fwd(&cmd, l, out);
             }
             cmd.rmsnorm_fwd_at(&self.x_out, &self.p, self.lay.final_norm, &self.xf, &self.invf, m, h, cfg.norm_eps);
-            let r = self.head_rows;
-            for c0 in (0..m).step_by(r) {
-                cmd.gemm(Op::N, Op::T, r, cfg.vocab, h, 1.0, &self.xf, c0 * h, h, &self.p, self.lay.embed, h, 0.0, &s.logits, 0, cfg.vocab);
-                cmd.softmax_ce_at(&s.logits, 0, &self.tgt, c0, &s.loss, c0, r, cfg.vocab, 1.0 / m as f32);
-            }
+            self.encode_head(&cmd, false);
             cmd.commit();
-            (self.scratch.loss.as_slice()[..m].iter().map(|x| *x as f64).sum::<f64>() / m as f64) as f32
+            self.read_loss()
         }
 
         pub fn params_host(&self) -> Vec<f32> {
@@ -839,15 +960,7 @@ impl EmbryoGpu {
             out.push((format!("layer {l} fwd{}", if cfg.is_anchor(l) { " (anchor)" } else { "" }), ms));
         }
         out.push(("final norm".into(), time("f".into(), &|cmd| cmd.rmsnorm_fwd_at(&self.x_out, &self.p, self.lay.final_norm, &self.xf, &self.invf, m, h, cfg.norm_eps))));
-        let r = self.head_rows;
-        out.push(("head fwd+bwd".into(), time("h".into(), &|cmd| {
-            for c0 in (0..m).step_by(r) {
-                cmd.gemm(Op::N, Op::T, r, cfg.vocab, h, 1.0, &self.xf, c0 * h, h, &self.p, self.lay.embed, h, 0.0, &s.logits, 0, cfg.vocab);
-                cmd.softmax_ce_at(&s.logits, 0, &self.tgt, c0, &s.loss, c0, r, cfg.vocab, 1.0 / m as f32);
-                cmd.gemm(Op::N, Op::N, r, h, cfg.vocab, 1.0, &s.logits, 0, cfg.vocab, &self.p, self.lay.embed, h, 0.0, &self.dxf, c0 * h, h);
-                cmd.gemm(Op::T, Op::N, cfg.vocab, h, r, 1.0, &s.logits, 0, cfg.vocab, &self.xf, c0 * h, h, 1.0, &self.g, self.lay.embed, h);
-            }
-        })));
+        out.push(("head fwd+bwd".into(), time("h".into(), &|cmd| self.encode_head(cmd, true))));
         out.push(("final norm bwd".into(), time("fb".into(), &|cmd| cmd.rmsnorm_bwd_at(&self.x_out, &self.p, self.lay.final_norm, &self.dxf, &self.invf, &s.dx, 0.0, &self.g, self.lay.final_norm, m, h))));
         for l in (0..cfg.layers).rev() {
             let ms = time(format!("bwd {l}"), &|cmd| self.layer_bwd(cmd, l));
