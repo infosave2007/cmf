@@ -524,7 +524,7 @@ mod gpu {
         }
 
         /// Forward through layer `l` from acts[l].x_in into `x_out`.
-        fn layer_fwd(&self, cmd: &Cmd, l: usize, x_out: &GBuf) {
+        pub(crate) fn layer_fwd(&self, cmd: &Cmd, l: usize, x_out: &GBuf) {
             let cfg = &self.cfg;
             let (b, t, h) = (self.b, self.t, cfg.hidden);
             let m = b * t;
@@ -586,7 +586,7 @@ mod gpu {
 
         /// Backward through layer `l`: s.dx holds dL/dx_out on entry and
         /// dL/dx_in on exit.
-        fn layer_bwd(&self, cmd: &Cmd, l: usize) {
+        pub(crate) fn layer_bwd(&self, cmd: &Cmd, l: usize) {
             let cfg = &self.cfg;
             let (b, t, h) = (self.b, self.t, cfg.hidden);
             let m = b * t;
@@ -681,7 +681,7 @@ mod gpu {
             }
         }
 
-        fn x_in(&self, l: usize) -> &GBuf {
+        pub(crate) fn x_in(&self, l: usize) -> &GBuf {
             match &self.acts[l] {
                 LayerActs::Mixer { x_in, .. } | LayerActs::Anchor { x_in, .. } => x_in,
             }
@@ -786,5 +786,75 @@ mod gpu {
         pub fn set_params(&self, p: &[f32]) {
             self.p.write_from(p);
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl EmbryoGpu {
+    /// Per-phase GPU time of one step (each phase its own command buffer):
+    /// the profile the kernel work is prioritised from.
+    pub fn profile_step(&self) -> Vec<(String, f64)> {
+        use crate::metal::{Cmd, Op};
+        let cfg = &self.cfg;
+        let (h, m) = (cfg.hidden, self.b * self.t);
+        let s = &self.scratch;
+        let c = self.ctx();
+        let mut out = Vec::new();
+        let time = |name: String, f: &dyn Fn(&Cmd)| -> f64 {
+            let cmd = Cmd::new(c);
+            f(&cmd);
+            cmd.commit()
+        };
+        out.push(("zero grads".into(), time("z".into(), &|cmd| cmd.axpby(0.0, &self.g, 0.0, &self.g, self.lay.total))));
+        out.push(("embed".into(), time("e".into(), &|cmd| cmd.embed_gather_at(&self.p, self.lay.embed, &self.tok, self.x_in(0), m, h))));
+        for l in 0..cfg.layers {
+            let ms = time(format!("fwd {l}"), &|cmd| {
+                let o: &crate::metal::GBuf = if l + 1 < cfg.layers { self.x_in(l + 1) } else { &self.x_out };
+                self.layer_fwd(cmd, l, o);
+            });
+            out.push((format!("layer {l} fwd{}", if cfg.is_anchor(l) { " (anchor)" } else { "" }), ms));
+        }
+        out.push(("final norm".into(), time("f".into(), &|cmd| cmd.rmsnorm_fwd_at(&self.x_out, &self.p, self.lay.final_norm, &self.xf, &self.invf, m, h, cfg.norm_eps))));
+        let r = self.head_rows;
+        out.push(("head fwd+bwd".into(), time("h".into(), &|cmd| {
+            for c0 in (0..m).step_by(r) {
+                cmd.gemm(Op::N, Op::T, r, cfg.vocab, h, 1.0, &self.xf, c0 * h, h, &self.p, self.lay.embed, h, 0.0, &s.logits, 0, cfg.vocab);
+                cmd.softmax_ce_at(&s.logits, 0, &self.tgt, c0, &s.loss, c0, r, cfg.vocab, 1.0 / m as f32);
+                cmd.gemm(Op::N, Op::N, r, h, cfg.vocab, 1.0, &s.logits, 0, cfg.vocab, &self.p, self.lay.embed, h, 0.0, &self.dxf, c0 * h, h);
+                cmd.gemm(Op::T, Op::N, cfg.vocab, h, r, 1.0, &s.logits, 0, cfg.vocab, &self.xf, c0 * h, h, 1.0, &self.g, self.lay.embed, h);
+            }
+        })));
+        out.push(("final norm bwd".into(), time("fb".into(), &|cmd| cmd.rmsnorm_bwd_at(&self.x_out, &self.p, self.lay.final_norm, &self.dxf, &self.invf, &s.dx, 0.0, &self.g, self.lay.final_norm, m, h))));
+        for l in (0..cfg.layers).rev() {
+            let ms = time(format!("bwd {l}"), &|cmd| self.layer_bwd(cmd, l));
+            out.push((format!("layer {l} bwd{}", if cfg.is_anchor(l) { " (anchor)" } else { "" }), ms));
+        }
+        out.push(("embed bwd".into(), time("eb".into(), &|cmd| cmd.embed_scatter_add(&self.g, self.lay.embed, &self.tok, &s.dx, m, h))));
+        out.push(("grad norm".into(), time("gn".into(), &|cmd| { cmd.sumsq(&self.g, self.lay.total, &s.partial); })));
+        out.push(("adamw".into(), time("a".into(), &|cmd| self.encode_adamw(cmd, 1e-4, 0.1, 1.0, 1.0, 1))));
+        out
+    }
+
+    /// Per-kernel profile of one hybrid_k mixer layer's forward + backward
+    /// (kernel by kernel, each its own command buffer).
+    pub fn profile_hk_layer(&self, l: usize) -> Vec<(String, f64)> {
+        use crate::metal::{Cmd, HkDims, HkGrads, HkWork};
+        let cfg = &self.cfg;
+        let (b, t) = (self.b, self.t);
+        let s = &self.scratch;
+        let c = self.ctx();
+        let (LayerActs::Mixer { thq, thk, v, kappa, phq, phk, kv, states, o, .. }) = &self.acts[l] else { return vec![] };
+        let (nh, nph, dv) = (cfg.heads, cfg.nphase, cfg.dv);
+        let d = HkDims { b, t, nh, nph, dv };
+        let w = HkWork { thq, thk, v, kappa, pow: &self.pow, phq, phk, kv, states, out: o };
+        let gr = HkGrads { dout: &s.dbig, dstates: &s.dstates, dkv: &s.dkv, dphq: &s.dphq, dphk: &s.dphk, dthq: &s.dk, dthk: &s.dk2, dv: &s.dv, dkappa: &s.dkap };
+        let mut out = Vec::new();
+        let cmd = Cmd::new(c);
+        cmd.hk_forward(&d, &w);
+        out.push(("hk forward (φ, kv, states, chunks)".into(), cmd.commit()));
+        let cmd = Cmd::new(c);
+        cmd.hk_backward(&d, &w, &gr, 0.0);
+        out.push(("hk backward (dstates, chunks, split, dθ)".into(), cmd.commit()));
+        out
     }
 }

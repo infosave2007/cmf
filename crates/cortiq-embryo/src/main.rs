@@ -1,6 +1,7 @@
-//! `cortiq-embryo` — the birth/growth trainer CLI.
+//! `cortiq-embryo` — the birth/growth trainer CLI (native Rust + Metal).
 
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "cortiq-embryo", about = "Cortiq Embryo trainer (native Rust + Metal)")]
@@ -13,15 +14,69 @@ struct Cli {
 enum Sub {
     /// Measure real TFLOPS of the training GEMM at Embryo shapes (docs §4.1).
     Bench {
-        /// dispatches per shape inside one command buffer
         #[arg(long, default_value_t = 10)]
         reps: usize,
-        /// skip the CPU spot-check of results
         #[arg(long)]
         no_verify: bool,
     },
     /// Print the Embryo-0 genome configuration and parameter counts.
     Config,
+    /// Time full training steps of Embryo-0 (fwd + bwd + AdamW) on random tokens.
+    StepBench {
+        #[arg(long, default_value_t = 8)]
+        batch: usize,
+        #[arg(long, default_value_t = 1024)]
+        seq: usize,
+        #[arg(long, default_value_t = 5)]
+        steps: usize,
+        /// use the tiny genome instead of Embryo-0
+        #[arg(long)]
+        tiny: bool,
+    },
+    /// Turn a text file into a byte-level token shard (vocab 256) — smoke corpus.
+    BytesShard {
+        input: PathBuf,
+        output: PathBuf,
+    },
+    /// Birth: train from scratch (or resume) on a token shard.
+    Birth {
+        /// token shard (u16 LE)
+        #[arg(long)]
+        shard: PathBuf,
+        /// held-out shard for validation (defaults to the training shard's tail)
+        #[arg(long)]
+        val: Option<PathBuf>,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long)]
+        resume: Option<PathBuf>,
+        #[arg(long, default_value_t = 8)]
+        batch: usize,
+        #[arg(long, default_value_t = 1024)]
+        seq: usize,
+        #[arg(long, default_value_t = 1000)]
+        steps: usize,
+        #[arg(long, default_value_t = 100)]
+        warmup: usize,
+        #[arg(long, default_value_t = 6e-4)]
+        lr: f32,
+        #[arg(long, default_value_t = 0.1)]
+        wd: f32,
+        #[arg(long, default_value_t = 1.0)]
+        clip: f32,
+        #[arg(long, default_value_t = 100)]
+        eval_every: usize,
+        #[arg(long, default_value_t = 500)]
+        save_every: usize,
+        /// tiny genome (smoke test)
+        #[arg(long)]
+        tiny: bool,
+        /// vocab override (e.g. 256 for byte shards)
+        #[arg(long)]
+        vocab: Option<usize>,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+    },
 }
 
 fn main() {
@@ -32,6 +87,14 @@ fn main() {
             let (total, active) = cfg.params();
             println!("{cfg:#?}");
             println!("params: total {:.2} M, active/token {:.2} M", total as f64 / 1e6, active as f64 / 1e6);
+            let lay = cortiq_embryo::model::Layout::new(&cfg);
+            println!("trainer arena now (shared expert, no routed experts yet): {:.2} M", lay.total as f64 / 1e6);
+        }
+        Sub::BytesShard { input, output } => {
+            let text = std::fs::read(&input).expect("read input");
+            let shard = cortiq_embryo::train::Shard::from_bytes(&text);
+            shard.save(&output).expect("write shard");
+            println!("{} tokens → {}", shard.tokens.len(), output.display());
         }
         Sub::Bench { reps, no_verify } => {
             #[cfg(target_os = "macos")]
@@ -52,6 +115,28 @@ fn main() {
             {
                 let _ = (reps, no_verify);
                 eprintln!("bench needs Metal (macOS)");
+                std::process::exit(1);
+            }
+        }
+        Sub::StepBench { batch, seq, steps, tiny } => {
+            #[cfg(target_os = "macos")]
+            cortiq_embryo::cli::step_bench(batch, seq, steps, tiny);
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = (batch, seq, steps, tiny);
+                eprintln!("needs Metal (macOS)");
+                std::process::exit(1);
+            }
+        }
+        Sub::Birth { shard, val, out, resume, batch, seq, steps, warmup, lr, wd, clip, eval_every, save_every, tiny, vocab, seed } => {
+            #[cfg(target_os = "macos")]
+            cortiq_embryo::cli::birth(cortiq_embryo::cli::BirthArgs {
+                shard, val, out, resume, batch, seq, steps, warmup, lr, wd, clip, eval_every, save_every, tiny, vocab, seed,
+            });
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = (shard, val, out, resume, batch, seq, steps, warmup, lr, wd, clip, eval_every, save_every, tiny, vocab, seed);
+                eprintln!("needs Metal (macOS)");
                 std::process::exit(1);
             }
         }

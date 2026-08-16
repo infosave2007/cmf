@@ -16,5 +16,8 @@
 pub mod metal;
 #[cfg(target_os = "macos")]
 pub mod bench;
+#[cfg(target_os = "macos")]
+pub mod cli;
 pub mod ops;
 pub mod model;
+pub mod train;
