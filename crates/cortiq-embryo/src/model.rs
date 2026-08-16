@@ -1529,9 +1529,10 @@ impl EmbryoGpu {
         (loss, gnorm)
     }
 
-    /// Mean-pooled hidden state entering `phi_layer` for each sequence of the
-    /// batch (the P1 routing descriptor's φ(x)) — [B, H].
-    pub fn probe_phi(&self, tokens: &[u32], phi_layer: usize) -> Vec<Vec<f32>> {
+    /// Mean-pooled hidden state AFTER layer `phi_layer` (the runtime's
+    /// probe_phi semantics: layers 0..=phi_layer) for each sequence of the
+    /// batch — the P1 routing descriptor's φ(x), [B, H].
+    pub fn probe_phi(&self, tokens: &[u32], phi_layer: usize, phi_len: usize) -> Vec<Vec<f32>> {
         use crate::metal::Cmd;
         let m = self.b * self.t;
         assert_eq!(tokens.len(), m);
@@ -1540,23 +1541,25 @@ impl EmbryoGpu {
         let h = cfg.hidden;
         let cmd = Cmd::new(self.ctx());
         cmd.embed_gather_at(&self.p, self.lay.embed, &self.tok, self.x_in(0), m, h);
-        for l in 0..phi_layer.min(cfg.layers) {
+        let last = phi_layer.min(cfg.layers - 1);
+        for l in 0..=last {
             let out: &GBuf = if l + 1 < cfg.layers { self.x_in(l + 1) } else { &self.x_out };
             self.layer_fwd(&cmd, l, out, false);
         }
         cmd.commit();
-        let x: &GBuf = if phi_layer < cfg.layers { self.x_in(phi_layer) } else { &self.x_out };
+        let x: &GBuf = if last + 1 < cfg.layers { self.x_in(last + 1) } else { &self.x_out };
         let xs = x.as_slice();
         (0..self.b)
             .map(|bi| {
+                let n = phi_len.clamp(1, self.t);
                 let mut acc = vec![0.0f32; h];
-                for t in 0..self.t {
+                for t in 0..n {
                     for j in 0..h {
                         acc[j] += xs[(bi * self.t + t) * h + j];
                     }
                 }
                 for v in &mut acc {
-                    *v /= self.t as f32;
+                    *v /= n as f32;
                 }
                 acc
             })

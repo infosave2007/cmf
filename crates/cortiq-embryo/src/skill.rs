@@ -26,6 +26,8 @@ pub struct BakeArgs {
     pub batch: usize,
     pub seq: usize,
     pub phi_layer: usize,
+    /// positions averaged for φ (prompt-length statistics, not whole windows)
+    pub phi_len: usize,
     pub rank: usize,
     pub seed: u64,
 }
@@ -218,9 +220,9 @@ pub fn bake(
     // ---- routing descriptor: φ = mean-pooled hidden entering phi_layer over corpus windows ----
     let mut phis: Vec<Vec<f32>> = Vec::new();
     let mut ps = Sampler::new(a.batch, a.seq, a.seed + 7);
-    for _ in 0..8 {
+    for _ in 0..16 {
         ps.batch(&train, &mut tk, &mut tg);
-        phis.extend(gpu.probe_phi(&tk, a.phi_layer));
+        phis.extend(gpu.probe_phi(&tk, a.phi_layer, a.phi_len));
     }
     let sel = fit_selection(&phis, a.phi_layer, a.rank);
     Ok((out, sel, kept, (base_loss, best_a.0, best_b.0)))

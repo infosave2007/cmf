@@ -55,6 +55,7 @@ fn bake_appends_a_byte_identical_skill_the_runtime_loads() {
         batch: 4,
         seq: 64,
         phi_layer: 1,
+        phi_len: 32,
         rank: 4,
         seed: 3,
     };
