@@ -128,6 +128,7 @@ def main():
     ap.add_argument("--skip-export", action="store_true")
     ap.add_argument("--reuse-hstud", action="store_true", help="load h_stud.pt from --out instead of running the student trunk")
     ap.add_argument("--reuse-teacher", action="store_true", help="load teacher.pt (targets + bf16 tail) from --out")
+    ap.add_argument("--bf16-train", action="store_true", help="bf16 trainable params + bitsandbytes AdamW8bit (a 4-layer tail in fp32/Adam32 does not fit 32 GB)")
     args = ap.parse_args()
     dev = torch.device("cuda")
     os.makedirs(args.out, exist_ok=True)
@@ -336,10 +337,14 @@ def main():
     torch.cuda.empty_cache()
 
     def train(init_sd, tag):
-        mods, norm = build_tail(init_sd, torch.float32)
+        mods, norm = build_tail(init_sd, torch.bfloat16 if args.bf16_train else torch.float32)
         params = [p for m in mods.values() for p in m.parameters()] + list(norm.parameters())
         for p in params: p.requires_grad_(True)
-        opt = torch.optim.AdamW(params, lr=args.lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01)
+        if args.bf16_train:
+            import bitsandbytes as bnb
+            opt = bnb.optim.AdamW8bit(params, lr=args.lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01)
+        else:
+            opt = torch.optim.AdamW(params, lr=args.lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01)
         best = (float("inf"), None)
         g = torch.Generator(device="cpu").manual_seed(0)
         report(f"{tag}:step0", mods, norm)
