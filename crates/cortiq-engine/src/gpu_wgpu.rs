@@ -22261,10 +22261,11 @@ pub fn q4tp_matvec_batch_for_test(
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("q4tp-mv"),
         });
-    // The hook follows the runtime's kernel choice, so the dequant-pinned
-    // test exercises whichever variant real decodes will use.
+    // The f32 kernels of the runtime's arm (bku / bk / the singles): this
+    // helper backs the 1e-4 dequant-reference test; the int8-activation
+    // arm the verify runs by default has its own bounded parity test.
     if c.use_mv4 {
-        if !encode_q4tp_mv4_b(c, &mut enc, &q_buf, &xs_buf, &y_buf, rows, cols, batch) {
+        if !encode_q4tp_mv4_b_with(c, &mut enc, &q_buf, &xs_buf, &y_buf, rows, cols, batch, false) {
             return false;
         }
     } else if batch == 1 {

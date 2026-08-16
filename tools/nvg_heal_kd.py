@@ -67,8 +67,7 @@ def main():
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     dev = torch.device("cuda")
-    from transformers import AutoConfig, AutoTokenizer, BitsAndBytesConfig
-    from transformers.integrations.bitsandbytes import replace_with_bnb_linear
+    from transformers import AutoConfig, AutoTokenizer
     from peft import LoraConfig, get_peft_model
     cfg_all = AutoConfig.from_pretrained(args.model)
     tc = cfg_all.text_config if hasattr(cfg_all, "text_config") else cfg_all
@@ -88,10 +87,24 @@ def main():
     t0 = time.time()
     model = load_fold(args.model, tc)
     log(f"loaded in {time.time()-t0:.0f}s")
-    qcfg = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
-                              bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True,
-                              llm_int8_skip_modules=["lm_head"])
-    model = replace_with_bnb_linear(model, modules_to_not_convert=["lm_head"], quantization_config=qcfg)
+    # nf4 by hand: transformers' `replace_with_bnb_linear` builds the new
+    # modules on the meta device (it expects a loader to fill them); the
+    # weights are already here, so wrap them into Params4bit directly and
+    # let `.to(cuda)` quantize.
+    import bitsandbytes as bnb
+    n_q = 0
+    for name, mod in list(model.named_modules()):
+        for child_name, child in list(mod.named_children()):
+            if isinstance(child, torch.nn.Linear) and child_name != "lm_head":
+                new = bnb.nn.Linear4bit(child.in_features, child.out_features, bias=child.bias is not None,
+                                        compute_dtype=torch.bfloat16, compress_statistics=True, quant_type="nf4")
+                new.weight = bnb.nn.Params4bit(child.weight.data.contiguous(), requires_grad=False,
+                                               compress_statistics=True, quant_type="nf4")
+                if child.bias is not None:
+                    new.bias = torch.nn.Parameter(child.bias.data.clone(), requires_grad=False)
+                setattr(mod, child_name, new)
+                n_q += 1
+    log(f"{n_q} linears wrapped for nf4")
     model.config.use_cache = False
     t0 = time.time()
     model.to(dev)  # quantizes the Linear4bit weights on the way
