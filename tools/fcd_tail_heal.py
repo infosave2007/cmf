@@ -83,12 +83,13 @@ def make_layer(cfg, i, sd_layer, device, dtype, prefix):
         own[k].copy_(src.to(device=device, dtype=own[k].dtype))
     return layer.to(dtype).eval()
 
-def run_layers(cfg, rotary, layers_iter, h_list, device, first_layer, last_layer):
+def run_layers(cfg, rotary, layers_iter, h_list, device, first_layer, last_layer, tag=""):
     """h_list: list of [B,T,H] tensors (bf16, on device); layers_iter yields (i, layer)."""
-    from transformers.masking_utils import create_causal_mask
+    seen = 0
     for i, layer in layers_iter:
         if i < first_layer or i > last_layer:
             continue
+        seen += 1
         for bi, h in enumerate(h_list):
             B, T, _ = h.shape
             pos = torch.arange(T, device=device).view(1, 1, -1).expand(4, B, -1)
@@ -97,8 +98,11 @@ def run_layers(cfg, rotary, layers_iter, h_list, device, first_layer, last_layer
             with torch.no_grad():
                 out = layer(h, position_embeddings=pe, attention_mask=None, position_ids=text_pos)
             h_list[bi] = out if torch.is_tensor(out) else out[0]
+        if i in (0, 1, 2, 3, 15, 31, 47, 61, 62, 63):
+            log(f"  {tag} after layer {i}: mean|h| {h_list[0].float().abs().mean().item():.4f}  rms {h_list[0].float().pow(2).mean().sqrt().item():.3f}")
         del layer
         torch.cuda.empty_cache()
+    log(f"  {tag}: {seen} layers run")
     return h_list
 
 def main():
@@ -122,6 +126,8 @@ def main():
     ap.add_argument("--val-seqs", type=int, default=4)
     ap.add_argument("--tmp", default="/dev/shm/fcdtmp")
     ap.add_argument("--skip-export", action="store_true")
+    ap.add_argument("--reuse-hstud", action="store_true", help="load h_stud.pt from --out instead of running the student trunk")
+    ap.add_argument("--reuse-teacher", action="store_true", help="load teacher.pt (targets + bf16 tail) from --out")
     args = ap.parse_args()
     dev = torch.device("cuda")
     os.makedirs(args.out, exist_ok=True)
@@ -151,18 +157,24 @@ def main():
     emb = cmf_dequant_prefix(args.cortiq, args.cmf, "model.embed_tokens.weight", stud_dir)["model.embed_tokens.weight"]
     def embed(ids_b, table):
         return F.embedding(ids_b, table.to(dev)).to(torch.bfloat16)
-    h_stud = [embed(b, emb) for b in batches]
-    del emb
-    t0 = time.time()
-    def student_layers():
-        for i in range(K):
-            sd_l = cmf_dequant_prefix(args.cortiq, args.cmf, f"model.layers.{i}.", stud_dir)
-            yield i, make_layer(tc, i, sd_l, dev, torch.bfloat16, f"model.layers.{i}.")
-            if i % 8 == 7:
-                log(f"student trunk: layer {i} done ({time.time()-t0:.0f}s)")
-    h_stud = run_layers(tc, rotary, student_layers(), h_stud, dev, 0, K - 1)
-    torch.save([h.cpu() for h in h_stud], os.path.join(args.out, "h_stud.pt"))
-    log(f"student trunk done: {time.time()-t0:.0f}s")
+    hs_path = os.path.join(args.out, "h_stud.pt")
+    if args.reuse_hstud and os.path.exists(hs_path):
+        h_stud = [h.to(dev) for h in torch.load(hs_path)]
+        log(f"student trunk: reused {hs_path}")
+        del emb
+    else:
+        h_stud = [embed(b, emb) for b in batches]
+        del emb
+        t0 = time.time()
+        def student_layers():
+            for i in range(K):
+                sd_l = cmf_dequant_prefix(args.cortiq, args.cmf, f"model.layers.{i}.", stud_dir)
+                yield i, make_layer(tc, i, sd_l, dev, torch.bfloat16, f"model.layers.{i}.")
+                if i % 8 == 7:
+                    log(f"student trunk: layer {i} done ({time.time()-t0:.0f}s)")
+        h_stud = run_layers(tc, rotary, student_layers(), h_stud, dev, 0, K - 1, tag="student")
+        torch.save([h.cpu() for h in h_stud], hs_path)
+        log(f"student trunk done: {time.time()-t0:.0f}s")
     # the student's own tail + norm + lm_head (quantized numerics), for the baseline and the FCD init
     stud_tail = {}
     for i in train_layers:
@@ -173,74 +185,84 @@ def main():
     # ── teacher: bf16 checkpoint, layer-streamed; top-k targets ──
     hf = HFShards(args.teacher, os.path.join(args.tmp, "hf"))
     P = "model.language_model."
-    t_emb = hf.tensor(P + "embed_tokens.weight")
-    h_t = [embed(b, t_emb) for b in batches]
-    del t_emb
-    pending = {}
-    def teacher_layers():
-        need = None
-        for sh_name in hf.shards:
-            sd = hf.load_shard(sh_name)
-            pending.update({k: v for k, v in sd.items() if k.startswith(P + "layers.")})
-            del sd
-            # emit complete layers in order
-            while True:
-                i = teacher_layers.next_i
-                keys = [k for k in pending if k.startswith(f"{P}layers.{i}.")]
-                if not keys:
-                    break
-                # complete? compare with the module's state_dict size
-                from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer
-                with torch.device("meta"):
-                    n_own = len(Qwen3_5DecoderLayer(tc, i).state_dict())
-                if len(keys) < n_own:
-                    break
-                sd_l = {k.replace(P, "model."): pending.pop(k) for k in keys}
-                yield i, make_layer(tc, i, sd_l, dev, torch.bfloat16, f"model.layers.{i}.")
-                teacher_layers.next_i += 1
-    teacher_layers.next_i = 0
-    t0 = time.time()
-    tail_bf16 = {}
-    def teacher_layers_capture():
-        for i, layer in teacher_layers():
-            if i in train_layers:
-                tail_bf16.update({f"model.layers.{i}." + k: v.detach().cpu().clone() for k, v in layer.state_dict().items()})
-            yield i, layer
-    h_t = run_layers(tc, rotary, teacher_layers_capture(), h_t, dev, 0, L - 1)
-    log(f"teacher layers done: {time.time()-t0:.0f}s")
-    t_norm = hf.tensor(P + "norm.weight").to(dev)
-    t_head = hf.tensor("lm_head.weight").to(dev)
-    tail_bf16["model.norm.weight"] = t_norm.cpu().clone()
-    def head_logits(h, normw, head, chunk=1024):
-        # returns generator of (start, logits[chunk, V]) in f32
-        Bt, T, _ = h.shape
-        hh = h.reshape(-1, H)
-        for s in range(0, hh.shape[0], chunk):
-            x = hh[s:s + chunk].float()
-            x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + tc.rms_norm_eps) * normw.float()
-            yield s, x.to(torch.bfloat16) @ head.t()
     tk = args.topk
-    targets = []
-    for bi, h in enumerate(h_t):
-        Bt, T, _ = h.shape
-        ids_flat = batches[bi].reshape(-1)
-        top_v = torch.empty(Bt * T, tk, dtype=torch.float32, device=dev)
-        top_i = torch.empty(Bt * T, tk, dtype=torch.long, device=dev)
-        nll = 0.0; cnt = 0
-        for s, lg in head_logits(h, t_norm, t_head):
-            lg = lg.float()
-            lp = torch.log_softmax(lg, -1)
-            v, ix = lp.topk(tk, dim=-1)
-            top_v[s:s + lg.shape[0]] = v; top_i[s:s + lg.shape[0]] = ix
-            # teacher ppl on this batch (next-token): position p predicts token p+1 within each row
-            n_rows = lg.shape[0]
-            rows = torch.arange(s, s + n_rows, device=dev)
-            valid = (rows % T) < (T - 1)
-            tgt = ids_flat[(rows + 1).clamp(max=ids_flat.numel() - 1)]
-            nll += -(lp[torch.arange(n_rows, device=dev), tgt][valid]).sum().item(); cnt += valid.sum().item()
-        targets.append((top_v.view(Bt, T, tk), top_i.view(Bt, T, tk)))
-        log(f"teacher batch {bi}: ppl {math.exp(nll/max(cnt,1)):.3f} over {cnt} tokens")
-    del h_t, t_head
+    teach_path = os.path.join(args.out, "teacher.pt")
+    if args.reuse_teacher and os.path.exists(teach_path):
+        tp_ = torch.load(teach_path)
+        targets = [(v.to(dev), i.to(dev)) for v, i in tp_["targets"]]
+        tail_bf16 = tp_["tail_bf16"]
+        log(f"teacher: reused {teach_path}")
+    else:
+      t_emb = hf.tensor(P + "embed_tokens.weight")
+      h_t = [embed(b, t_emb) for b in batches]
+      del t_emb
+      pending = {}
+      def teacher_layers():
+          need = None
+          for sh_name in hf.shards:
+              sd = hf.load_shard(sh_name)
+              pending.update({k: v for k, v in sd.items() if k.startswith(P + "layers.")})
+              del sd
+              # emit complete layers in order
+              while True:
+                  i = teacher_layers.next_i
+                  keys = [k for k in pending if k.startswith(f"{P}layers.{i}.")]
+                  if not keys:
+                      break
+                  # complete? compare with the module's state_dict size
+                  from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer
+                  with torch.device("meta"):
+                      n_own = len(Qwen3_5DecoderLayer(tc, i).state_dict())
+                  if len(keys) < n_own:
+                      break
+                  sd_l = {k.replace(P, "model."): pending.pop(k) for k in keys}
+                  yield i, make_layer(tc, i, sd_l, dev, torch.bfloat16, f"model.layers.{i}.")
+                  teacher_layers.next_i += 1
+      teacher_layers.next_i = 0
+      t0 = time.time()
+      tail_bf16 = {}
+      def teacher_layers_capture():
+          for i, layer in teacher_layers():
+              if i in train_layers:
+                  tail_bf16.update({f"model.layers.{i}." + k: v.detach().cpu().clone() for k, v in layer.state_dict().items()})
+              yield i, layer
+      h_t = run_layers(tc, rotary, teacher_layers_capture(), h_t, dev, 0, L - 1, tag="teacher")
+      log(f"teacher layers done: {time.time()-t0:.0f}s")
+      t_norm = hf.tensor(P + "norm.weight").to(dev)
+      t_head = hf.tensor("lm_head.weight").to(dev)
+      tail_bf16["model.norm.weight"] = t_norm.cpu().clone()
+      def head_logits(h, normw, head, chunk=1024):
+          # returns generator of (start, logits[chunk, V]) in f32
+          Bt, T, _ = h.shape
+          hh = h.reshape(-1, H)
+          for s in range(0, hh.shape[0], chunk):
+              x = hh[s:s + chunk].float()
+              # Qwen3.5's RMSNorm is zero-centred: output · (1 + w)
+              x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + tc.rms_norm_eps) * (1.0 + normw.float())
+              yield s, x.to(torch.bfloat16) @ head.t()
+      targets = []
+      for bi, h in enumerate(h_t):
+          Bt, T, _ = h.shape
+          ids_flat = batches[bi].reshape(-1)
+          top_v = torch.empty(Bt * T, tk, dtype=torch.float32, device=dev)
+          top_i = torch.empty(Bt * T, tk, dtype=torch.long, device=dev)
+          nll = 0.0; cnt = 0
+          for s, lg in head_logits(h, t_norm, t_head):
+              lg = lg.float()
+              lp = torch.log_softmax(lg, -1)
+              v, ix = lp.topk(tk, dim=-1)
+              top_v[s:s + lg.shape[0]] = v; top_i[s:s + lg.shape[0]] = ix
+              # teacher ppl on this batch (next-token): position p predicts token p+1 within each row
+              n_rows = lg.shape[0]
+              rows = torch.arange(s, s + n_rows, device=dev)
+              valid = (rows % T) < (T - 1)
+              tgt = ids_flat[(rows + 1).clamp(max=ids_flat.numel() - 1)]
+              nll += -(lp[torch.arange(n_rows, device=dev), tgt][valid]).sum().item(); cnt += valid.sum().item()
+          targets.append((top_v.view(Bt, T, tk), top_i.view(Bt, T, tk)))
+          log(f"teacher batch {bi}: ppl {math.exp(nll/max(cnt,1)):.3f} over {cnt} tokens")
+      del h_t, t_head
+      torch.save({"targets": [(v.cpu(), i.cpu()) for v, i in targets], "tail_bf16": tail_bf16}, teach_path)
+      log(f"teacher: saved {teach_path}")
     torch.cuda.empty_cache()
 
     # ── the trainable tail ──
@@ -279,12 +301,20 @@ def main():
         lp3 = lp.view(b, T, -1)
         ce = -lp3[:, :-1].gather(2, ids_b[:, 1:].unsqueeze(-1)).squeeze(-1)
         return ce.mean(), kl.mean()
+    def loss_rows(mods, norm, bi, rows):
+        """mean (ce, kl) over rows, one row at a time (memory: the 248k logits)."""
+        with torch.no_grad():
+            ces, kls = [], []
+            for r in rows:
+                ce, kl = loss_on(mods, norm, bi, torch.tensor([r], device=dev))
+                ces.append(ce.item()); kls.append(kl.item())
+            return torch.tensor(sum(ces) / len(ces)), torch.tensor(sum(kls) / len(kls))
     def eval_ppl(mods, norm, bi):
         with torch.no_grad():
             tot, cnt = 0.0, 0
             B = h_stud[bi].shape[0]
-            for r in range(0, B, 4):
-                rows = torch.arange(r, min(r + 4, B), device=dev)
+            for r in range(0, B):
+                rows = torch.arange(r, r + 1, device=dev)
                 ce, _ = loss_on(mods, norm, bi, rows)
                 n_t = rows.numel() * (h_stud[bi].shape[1] - 1)
                 tot += ce.item() * n_t; cnt += n_t
@@ -296,8 +326,7 @@ def main():
     def report(tag, mods, norm):
         pe = eval_ppl(mods, norm, 1)
         # val on the calib tail rows
-        with torch.no_grad():
-            ce, kl = loss_on(mods, norm, 0, torch.tensor(val_rows, device=dev))
+        ce, kl = loss_rows(mods, norm, 0, val_rows)
         results[tag] = {"eval_ppl": pe, "val_ce": ce.item(), "val_kl": kl.item()}
         log(f"[{tag}] eval ppl {pe:.4f}  val ce {ce.item():.4f}  val kl {kl.item():.4f}")
     # (a) all quantized (student tail as in the file)
@@ -317,16 +346,19 @@ def main():
         best = (results[f"{tag}:step0"]["val_kl"] * args.kl + results[f"{tag}:step0"]["val_ce"] * (1 - args.kl),
                 {k: v.detach().clone() for k, v in [(f"m{i}.{n}", p) for i, m in mods.items() for n, p in m.state_dict().items()] + [("norm", norm.weight.detach().clone())]})
         for step in range(1, args.steps + 1):
-            rows = torch.tensor([tr_rows[j] for j in torch.randperm(len(tr_rows), generator=g)[: args.bs].tolist()], device=dev)
-            ce, kl = loss_on(mods, norm, 0, rows)
-            loss = (1 - args.kl) * ce + args.kl * kl
+            rows = [tr_rows[j] for j in torch.randperm(len(tr_rows), generator=g)[: args.bs].tolist()]
             opt.zero_grad(set_to_none=True)
-            loss.backward()
+            ce_acc, kl_acc = 0.0, 0.0
+            for r in rows:  # one sequence at a time: the 248k-wide logits are the memory
+                ce, kl = loss_on(mods, norm, 0, torch.tensor([r], device=dev))
+                loss = ((1 - args.kl) * ce + args.kl * kl) / len(rows)
+                loss.backward()
+                ce_acc += ce.item() / len(rows); kl_acc += kl.item() / len(rows)
+            ce = torch.tensor(ce_acc); kl = torch.tensor(kl_acc)
             torch.nn.utils.clip_grad_norm_(params, 1.0)
             opt.step()
             if step % 25 == 0 or step == args.steps:
-                with torch.no_grad():
-                    vce, vkl = loss_on(mods, norm, 0, torch.tensor(val_rows, device=dev))
+                vce, vkl = loss_rows(mods, norm, 0, val_rows)
                 score = (1 - args.kl) * vce.item() + args.kl * vkl.item()
                 log(f"[{tag}] step {step}: train ce {ce.item():.4f} kl {kl.item():.4f} | val ce {vce.item():.4f} kl {vkl.item():.4f} score {score:.4f}")
                 if score < best[0]:

@@ -3941,16 +3941,14 @@ fn cmd_patch_tensor(
             .tensor_index(name)
             .ok_or_else(|| anyhow::anyhow!("no tensor '{name}'"))?;
         let e = &model.tensors[idx];
-        if e.shape.len() != 2 {
-            anyhow::bail!("{name}: 2-D tensors only (shape {:?})", e.shape);
-        }
-        let (rows, cols) = (e.shape[0], e.shape[1]);
+        let n = e.n_elems();
         let raw = std::fs::read(path)?;
-        if raw.len() != rows * cols * 4 {
+        if raw.len() != n * 4 {
             anyhow::bail!(
-                "{path}: {} bytes, want {} (= {rows}×{cols} f32)",
+                "{path}: {} bytes, want {} (= {:?} f32)",
                 raw.len(),
-                rows * cols * 4
+                n * 4,
+                e.shape
             );
         }
         let vals: Vec<f32> = raw
@@ -3961,7 +3959,21 @@ fn cmd_patch_tensor(
             Some(q) => q,
             None => quant_of(e.dtype)?,
         };
-        let (dt, data) = convert::quantize_2d(quant, &vals, rows, cols);
+        // Float targets take any shape (norms, biases, conv taps); the
+        // quantized layouts are 2-D by definition.
+        let (dt, data) = match quant {
+            convert::Quant::F16 => (TensorDtype::F16, convert::encode_f16(&vals)),
+            _ => {
+                if e.shape.len() != 2 {
+                    anyhow::bail!(
+                        "{name}: {quant:?} wants a 2-D tensor (shape {:?}); use --dtype f16",
+                        e.shape
+                    );
+                }
+                convert::quantize_2d(quant, &vals, e.shape[0], e.shape[1])
+            }
+        };
+        let (rows, cols) = (e.shape[0], e.shape.get(1).copied().unwrap_or(1));
         if output.is_none() {
             if e.shard != 0 {
                 anyhow::bail!("{name} lives in a sibling shard; in-place needs shard 0");
