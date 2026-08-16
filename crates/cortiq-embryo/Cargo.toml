@@ -28,7 +28,7 @@ fancy-regex = { workspace = true }
 flate2 = "1"
 # Corpus readers for the birth data (FineWeb parquet, C4 json.gz). Optional:
 # the trainer itself needs neither.
-parquet = { version = "59", default-features = false, features = ["snap", "zstd", "brotli", "flate2", "lz4"], optional = true }
+parquet = { version = "59", default-features = false, features = ["snap", "zstd", "brotli", "flate2-rust_backend", "lz4"], optional = true }
 
 [features]
 default = []

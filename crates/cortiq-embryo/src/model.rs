@@ -1244,3 +1244,21 @@ impl EmbryoGpu {
         (0..self.cfg.layers).map(|l| c[l * ne..(l + 1) * ne].to_vec()).collect()
     }
 }
+
+#[cfg(target_os = "macos")]
+impl EmbryoGpu {
+    /// The expert descriptors (routing state that is part of the model).
+    pub fn desc_host(&self) -> Vec<(&'static str, Vec<f32>)> {
+        vec![("desc.mu", self.desc.mu.to_vec()), ("desc.u", self.desc.u.to_vec()), ("desc.bias", self.desc.bias.to_vec())]
+    }
+    pub fn set_desc(&self, extras: &[(String, Vec<f32>)]) {
+        for (name, x) in extras {
+            match name.as_str() {
+                "desc.mu" if x.len() == self.desc.mu.len => self.desc.mu.write_from(x),
+                "desc.u" if x.len() == self.desc.u.len => self.desc.u.write_from(x),
+                "desc.bias" if x.len() == self.desc.bias.len => self.desc.bias.write_from(x),
+                _ => {}
+            }
+        }
+    }
+}
