@@ -2418,7 +2418,13 @@ impl Pipeline {
                         // (round 1 untimed — it pays the batch scratch and
                         // the draft mirror), and the trial advances.
                         spec_mon.round(t_round.elapsed().as_secs_f64() * 1e3, extra.len() + 1);
-                        spec_trial = Self::spec_trial_round(spec_trial, &mut spec_mon, generated);
+                        // the round's tokens land in `generated` below; the
+                        // plain phase must start counting AFTER them
+                        spec_trial = Self::spec_trial_round(
+                            spec_trial,
+                            &mut spec_mon,
+                            generated + extra.len() + 1,
+                        );
                         let mut stopped = false;
                         for &id in &extra {
                             if self.confidence_on {
@@ -2440,7 +2446,7 @@ impl Pipeline {
                     // like a head that keeps missing (it was spinning
                     // forever on a file whose batch graph declines).
                     spec_mon.round(t_round.elapsed().as_secs_f64() * 1e3, 1);
-                    spec_trial = Self::spec_trial_round(spec_trial, &mut spec_mon, generated);
+                    spec_trial = Self::spec_trial_round(spec_trial, &mut spec_mon, generated + 1);
                     hidden = self.forward_layers(&self.embed_single(t_next), next_pos, task_mask);
                     next_pos += 1;
                     continue 'decode;
