@@ -14645,6 +14645,16 @@ fn encode_q4tp_mv4_b_i8(
     pass.dispatch_workgroups(mv_grid((rows as u32).div_ceil(16)), 1, 1);
 }
 
+/// Whether the wgpu device runs on Metal. The batched verify graph is
+/// verified on Vulkan (bit-exact against the plain token, the aquarium
+/// identical); on wgpu-over-Metal it produced 0 accepted drafts and
+/// garbage text on Qwen3.5-0.8B (measured 16.08) while the plain graph
+/// was fine — so speculation does not default on there until that is
+/// found. `CMF_GRAPH_SPEC=1` still forces it (for the investigation).
+pub(crate) fn wgpu_backend_is_metal() -> bool {
+    ctx().is_some_and(|c| c.adapter_info.backend == wgpu::Backend::Metal)
+}
+
 /// `CMF_MV16W=0`: the wide-row q4tp decode matvec takes the 8-row pair
 /// kernel (`q4tp_matvec4`) instead of the 16-row quad (`q4tp_matvec16w`).
 fn mv16w_on() -> bool {

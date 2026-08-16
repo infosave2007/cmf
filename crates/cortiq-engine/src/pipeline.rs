@@ -1845,11 +1845,27 @@ impl Pipeline {
         let penalized = self.sampler_config.repetition_penalty != 1.0
             || self.sampler_config.presence_penalty != 0.0
             || !self.sampler_config.suppress_tokens.is_empty();
+        // …and not on wgpu-over-Metal: the batched verify graph there
+        // returned 0 accepted drafts and garbage text on a GDN hybrid
+        // (16.08, Qwen3.5-0.8B) while Vulkan is bit-exact; the Mac's
+        // default backend is native Metal without a batch graph anyway.
+        #[cfg(feature = "gpu")]
+        let metal_wgpu = graph_on && crate::gpu_wgpu::wgpu_backend_is_metal();
+        #[cfg(not(feature = "gpu"))]
+        let metal_wgpu = false;
         let spec_env = std::env::var("CMF_GRAPH_SPEC").ok();
         let spec_wanted = match spec_env.as_deref() {
             Some("0") => false,
-            Some(_) => true,
-            None => spec_default_ok && !penalized,
+            Some(_) => {
+                if metal_wgpu {
+                    tracing::warn!(
+                        "CMF_GRAPH_SPEC forced on wgpu/Metal: the batched verify graph is not \
+                         verified on this backend (garbage measured on Qwen3.5-0.8B)"
+                    );
+                }
+                true
+            }
+            None => spec_default_ok && !penalized && !metal_wgpu,
         };
         let graph_spec = self.speculative
             && graph_on
