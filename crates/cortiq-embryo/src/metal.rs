@@ -56,6 +56,10 @@ pub struct Ctx {
     copy: ComputePipelineState,
     kappa_fwd: ComputePipelineState,
     kappa_bwd: ComputePipelineState,
+    hk_scale: ComputePipelineState,
+    hk_unscale: ComputePipelineState,
+    hk_states_par: ComputePipelineState,
+    hk_dstates_par: ComputePipelineState,
 }
 unsafe impl Send for Ctx {}
 unsafe impl Sync for Ctx {}
@@ -150,6 +154,10 @@ fn init() -> Result<Ctx, String> {
         copy: pso("copy_f32")?,
         kappa_fwd: pso("kappa_fwd_f32")?,
         kappa_bwd: pso("kappa_bwd_f32")?,
+        hk_scale: pso("hk_scale_f32")?,
+        hk_unscale: pso("hk_unscale_f32")?,
+        hk_states_par: pso("hk_states_fwd_par_f32")?,
+        hk_dstates_par: pso("hk_dstates_bwd_par_f32")?,
         gemm,
         _lib: lib,
         queue,
@@ -252,16 +260,53 @@ impl<'a> Cmd<'a> {
         c_off: usize,
         ldc: usize,
     ) {
+        self.gemm_ex(
+            ta, tb, m, n, k, alpha, a, a_off, lda, b, b_off, ldb, beta, cbuf, c_off, ldc, &GemmBatch::none(), false,
+        );
+    }
+
+    /// Batched GEMM: one tile grid per (b, h, c) triple, operands offset by
+    /// `batch` strides; `causal` zeroes C[i,j] for j > i in the epilogue.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_ex(
+        &self,
+        ta: Op,
+        tb: Op,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        a: &GBuf,
+        a_off: usize,
+        lda: usize,
+        b: &GBuf,
+        b_off: usize,
+        ldb: usize,
+        beta: f32,
+        cbuf: &GBuf,
+        c_off: usize,
+        ldc: usize,
+        batch: &GemmBatch,
+        causal: bool,
+    ) {
         assert!(m % 64 == 0 && n % 64 == 0 && k % 32 == 0, "gemm tile alignment: m={m} n={n} k={k}");
         assert!(lda % 4 == 0 && ldb % 4 == 0 && ldc % 4 == 0 && a_off % 4 == 0 && b_off % 4 == 0 && c_off % 4 == 0);
         let (arows, acols) = if ta == Op::N { (m, k) } else { (k, m) };
         let (brows, bcols) = if tb == Op::N { (k, n) } else { (n, k) };
         assert!(lda >= acols && ldb >= bcols && ldc >= n);
-        assert!(a_off + (arows - 1) * lda + acols <= a.len, "gemm: A out of range");
-        assert!(b_off + (brows - 1) * ldb + bcols <= b.len, "gemm: B out of range");
-        assert!(c_off + (m - 1) * ldc + n <= cbuf.len, "gemm: C out of range");
+        let (nb, nh, nc) = (batch.nb.max(1), batch.nh.max(1), batch.nc.max(1));
+        let last = |s: [usize; 3]| (nb - 1) * s[0] + (nh - 1) * s[1] + (nc - 1) * s[2];
+        assert!(a_off + last(batch.sa) + (arows - 1) * lda + acols <= a.len, "gemm: A out of range");
+        assert!(b_off + last(batch.sb) + (brows - 1) * ldb + bcols <= b.len, "gemm: B out of range");
+        assert!(c_off + last(batch.sc) + (m - 1) * ldc + n <= cbuf.len, "gemm: C out of range");
+        for s in [batch.sa, batch.sb, batch.sc] {
+            assert!(s.iter().all(|x| x % 4 == 0), "gemm: batch strides must be multiples of 4 floats");
+        }
         #[repr(C)]
         struct Args {
+            sa: [u64; 3],
+            sb: [u64; 3],
+            sc: [u64; 3],
             m: u32,
             n: u32,
             k: u32,
@@ -270,8 +315,15 @@ impl<'a> Cmd<'a> {
             ldc: u32,
             alpha: f32,
             beta: f32,
+            nb_h: u32,
+            nb_c: u32,
+            mask: u32,
         }
+        let cv = |s: [usize; 3]| [s[0] as u64, s[1] as u64, s[2] as u64];
         let args = Args {
+            sa: cv(batch.sa),
+            sb: cv(batch.sb),
+            sc: cv(batch.sc),
             m: m as u32,
             n: n as u32,
             k: k as u32,
@@ -280,6 +332,9 @@ impl<'a> Cmd<'a> {
             ldc: ldc as u32,
             alpha,
             beta,
+            nb_h: nh as u32,
+            nb_c: nc as u32,
+            mask: causal as u32,
         };
         let idx = (ta == Op::T) as usize * 2 + (tb == Op::T) as usize;
         let e = &self.enc;
@@ -289,7 +344,7 @@ impl<'a> Cmd<'a> {
         e.set_buffer(2, Some(&cbuf.buf), (c_off * 4) as u64);
         e.set_bytes(3, std::mem::size_of::<Args>() as u64, &args as *const Args as *const c_void);
         e.dispatch_thread_groups(
-            MTLSize::new((n / 64) as u64, (m / 64) as u64, 1),
+            MTLSize::new((n / 64) as u64, (m / 64) as u64, (nb * nh * nc) as u64),
             MTLSize::new(128, 1, 1),
         );
     }
@@ -538,7 +593,7 @@ impl<'a> Cmd<'a> {
         e.set_buffer(2, Some(&w.pow.buf), 0);
         e.set_buffer(3, Some(&w.states.buf), 0);
         self.hk_args(4, d);
-        e.dispatch_thread_groups(MTLSize::new((d.b * d.nh) as u64, 1, 1), MTLSize::new(d.dv as u64, 1, 1));
+        e.dispatch_thread_groups(MTLSize::new((d.b * d.nh) as u64, 1, 1), MTLSize::new((d.dv * (2 * d.nph).div_ceil(16)) as u64, 1, 1));
         // per-chunk outputs
         let nchunks = d.t / 64;
         e.set_compute_pipeline_state(&self.c.hk_chunk_fwd);
@@ -575,7 +630,7 @@ impl<'a> Cmd<'a> {
         e.set_buffer(2, Some(&w.pow.buf), 0);
         e.set_buffer(3, Some(&g.dstates.buf), 0);
         self.hk_args(4, d);
-        e.dispatch_thread_groups(MTLSize::new((d.b * d.nh) as u64, 1, 1), MTLSize::new(d.dv as u64, 1, 1));
+        e.dispatch_thread_groups(MTLSize::new((d.b * d.nh) as u64, 1, 1), MTLSize::new((d.dv * (2 * d.nph).div_ceil(16)) as u64, 1, 1));
         // per-chunk gradients
         e.set_compute_pipeline_state(&self.c.hk_chunk_bwd);
         e.set_buffer(0, Some(&w.phq.buf), 0);
@@ -820,6 +875,189 @@ impl<'a> Cmd<'a> {
         self.grid1(rows * ld, 256);
     }
 
+    // ---------- hybrid_k, GEMM formulation (the fast path) ----------
+
+    fn hk_scale(&self, d: &HkDims, w: &HkWork<'_>, sc: &HkScratch<'_>) {
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.hk_scale);
+        e.set_buffer(0, Some(&w.phq.buf), 0);
+        e.set_buffer(1, Some(&w.phk.buf), 0);
+        e.set_buffer(2, Some(&w.pow.buf), 0);
+        e.set_buffer(3, Some(&sc.qt.buf), 0);
+        e.set_buffer(4, Some(&sc.kt.buf), 0);
+        e.set_buffer(5, Some(&sc.qp.buf), 0);
+        e.set_buffer(6, Some(&sc.kh.buf), 0);
+        self.hk_args(7, d);
+        self.grid1(d.b * d.t * d.nh * 2 * d.nph, 256);
+    }
+
+    /// A = causal(Q̃·K̃ᵀ) for every chunk (into sc.a).
+    fn hk_intra_a(&self, d: &HkDims, sc: &HkScratch<'_>) {
+        let (p2, nch) = (2 * d.nph, d.t / 64);
+        let cm = HkScratch::chunk_major(d);
+        let sa = [d.nh * nch * 4096, nch * 4096, 4096];
+        let bt = GemmBatch { nb: d.b, nh: d.nh, nc: nch, sa: cm, sb: cm, sc: sa };
+        self.gemm_ex(Op::N, Op::T, 64, 64, p2, 1.0, sc.qt, 0, p2, sc.kt, 0, p2, 0.0, sc.a, 0, 64, &bt, true);
+    }
+
+    /// Forward, GEMM formulation. Same contract as `hk_forward` (φ, kv,
+    /// chunk states via the scan kernel), the per-chunk output as three
+    /// batched GEMMs. Needs `sc` scratch (see `HkScratch`).
+    pub fn hk_forward_gemm(&self, d: &HkDims, w: &HkWork<'_>, sc: &HkScratch<'_>) {
+        hk_check(d, w);
+        sc.check(d);
+        let e = &self.enc;
+        let rows = d.b * d.t;
+        let (p2, dv, nch) = (2 * d.nph, d.dv, d.t / 64);
+        for (th, ph) in [(w.thq, w.phq), (w.thk, w.phk)] {
+            e.set_compute_pipeline_state(&self.c.hk_phi);
+            e.set_buffer(0, Some(&th.buf), 0);
+            e.set_buffer(1, Some(&ph.buf), 0);
+            self.hk_args(2, d);
+            self.grid1(rows * d.nh * d.nph, 256);
+        }
+        e.set_compute_pipeline_state(&self.c.hk_kv);
+        e.set_buffer(0, Some(&w.v.buf), 0);
+        e.set_buffer(1, Some(&w.kappa.buf), 0);
+        e.set_buffer(2, Some(&w.kv.buf), 0);
+        self.hk_args(3, d);
+        self.grid1(rows * d.nh * d.dv, 256);
+        self.hk_states_only(d, w);
+        self.hk_scale(d, w, sc);
+        self.hk_intra_a(d, sc);
+        // out = A·KV + Q⁺·S_c
+        let rm = HkScratch::row_major(d, dv);
+        let st = HkScratch::states(d);
+        let sa = [d.nh * nch * 4096, nch * 4096, 4096];
+        let cm = HkScratch::chunk_major(d);
+        let bt1 = GemmBatch { nb: d.b, nh: d.nh, nc: nch, sa, sb: rm, sc: rm };
+        self.gemm_ex(Op::N, Op::N, 64, dv, 64, 1.0, sc.a, 0, 64, w.kv, 0, d.nh * dv, 0.0, w.out, 0, d.nh * dv, &bt1, false);
+        let bt2 = GemmBatch { nb: d.b, nh: d.nh, nc: nch, sa: cm, sb: st, sc: rm };
+        self.gemm_ex(Op::N, Op::N, 64, dv, p2, 1.0, sc.qp, 0, p2, w.states, 0, dv, 1.0, w.out, 0, d.nh * dv, &bt2, false);
+    }
+
+    /// Backward, GEMM formulation. Same contract as `hk_backward`.
+    pub fn hk_backward_gemm(&self, d: &HkDims, w: &HkWork<'_>, g: &HkGrads<'_>, sc: &HkScratch<'_>, beta_th: f32) {
+        hk_check(d, w);
+        sc.check(d);
+        let e = &self.enc;
+        let rows = d.b * d.t;
+        let (p2, dv, nch) = (2 * d.nph, d.dv, d.t / 64);
+        assert!(g.dstates.len >= w.states.len && g.dkv.len >= rows * d.nh * dv);
+        assert!(g.dphq.len >= rows * d.nh * p2 && g.dphk.len >= rows * d.nh * p2);
+        assert!(g.dout.len >= rows * d.nh * dv && g.dv.len >= rows * d.nh * dv);
+        assert!(g.dthq.len >= rows * d.nh * d.nph && g.dthk.len >= rows * d.nh * d.nph && g.dkappa.len >= rows * d.nh);
+        // reverse state-gradient scan (exact scan kernel)
+        self.hk_dstates_only(d, w, g);
+        // scaled tables + A (recomputed: cheaper than keeping them per layer)
+        self.hk_scale(d, w, sc);
+        self.hk_intra_a(d, sc);
+        let rm = HkScratch::row_major(d, dv);
+        let st = HkScratch::states(d);
+        let cm = HkScratch::chunk_major(d);
+        let sa = [d.nh * nch * 4096, nch * 4096, 4096];
+        let nb = d.b;
+        // dKV = Aᵀ·dO + K̂·G_{c+1}
+        let bt = GemmBatch { nb, nh: d.nh, nc: nch, sa, sb: rm, sc: rm };
+        self.gemm_ex(Op::T, Op::N, 64, dv, 64, 1.0, sc.a, 0, 64, g.dout, 0, d.nh * dv, 0.0, g.dkv, 0, d.nh * dv, &bt, false);
+        let bt = GemmBatch { nb, nh: d.nh, nc: nch, sa: cm, sb: st, sc: rm };
+        self.gemm_ex(Op::N, Op::N, 64, dv, p2, 1.0, sc.kh, 0, p2, g.dstates, p2 * dv, dv, 1.0, g.dkv, 0, d.nh * dv, &bt, false);
+        // dA = causal(dO·KVᵀ)  (overwrites A)
+        let bt = GemmBatch { nb, nh: d.nh, nc: nch, sa: rm, sb: rm, sc: sa };
+        self.gemm_ex(Op::N, Op::T, 64, 64, dv, 1.0, g.dout, 0, d.nh * dv, w.kv, 0, d.nh * dv, 0.0, sc.a, 0, 64, &bt, true);
+        // dK̃ = dAᵀ·Q̃ ; dQ̃ = dA·K̃
+        let bt = GemmBatch { nb, nh: d.nh, nc: nch, sa, sb: cm, sc: cm };
+        self.gemm_ex(Op::T, Op::N, 64, p2, 64, 1.0, sc.a, 0, 64, sc.qt, 0, p2, 0.0, sc.dkt, 0, p2, &bt, false);
+        self.gemm_ex(Op::N, Op::N, 64, p2, 64, 1.0, sc.a, 0, 64, sc.kt, 0, p2, 0.0, sc.dqt, 0, p2, &bt, false);
+        // inter terms: dqi = dO·S_cᵀ ; dki = KV·G_{c+1}ᵀ
+        let bt = GemmBatch { nb, nh: d.nh, nc: nch, sa: rm, sb: st, sc: cm };
+        self.gemm_ex(Op::N, Op::T, 64, p2, dv, 1.0, g.dout, 0, d.nh * dv, w.states, 0, dv, 0.0, sc.dqi, 0, p2, &bt, false);
+        self.gemm_ex(Op::N, Op::T, 64, p2, dv, 1.0, w.kv, 0, d.nh * dv, g.dstates, p2 * dv, dv, 0.0, sc.dki, 0, p2, &bt, false);
+        // back to dφq/dφk (row-major)
+        e.set_compute_pipeline_state(&self.c.hk_unscale);
+        e.set_buffer(0, Some(&sc.dqt.buf), 0);
+        e.set_buffer(1, Some(&sc.dkt.buf), 0);
+        e.set_buffer(2, Some(&sc.dqi.buf), 0);
+        e.set_buffer(3, Some(&sc.dki.buf), 0);
+        e.set_buffer(4, Some(&w.pow.buf), 0);
+        e.set_buffer(5, Some(&g.dphq.buf), 0);
+        e.set_buffer(6, Some(&g.dphk.buf), 0);
+        self.hk_args(7, d);
+        self.grid1(rows * d.nh * p2, 256);
+        // dv, dκ from dkv
+        e.set_compute_pipeline_state(&self.c.hk_dkv_split);
+        e.set_buffer(0, Some(&w.v.buf), 0);
+        e.set_buffer(1, Some(&w.kappa.buf), 0);
+        e.set_buffer(2, Some(&g.dkv.buf), 0);
+        e.set_buffer(3, Some(&g.dv.buf), 0);
+        e.set_buffer(4, Some(&g.dkappa.buf), 0);
+        self.hk_args(5, d);
+        self.grid1(rows * d.nh, 128);
+        // dθ from dφ
+        for (th, dph, dth) in [(w.thq, g.dphq, g.dthq), (w.thk, g.dphk, g.dthk)] {
+            e.set_compute_pipeline_state(&self.c.hk_dtheta);
+            e.set_buffer(0, Some(&th.buf), 0);
+            e.set_buffer(1, Some(&dph.buf), 0);
+            e.set_buffer(2, Some(&dth.buf), 0);
+            self.hk_args(3, d);
+            self.set_f32(4, beta_th);
+            self.grid1(rows * d.nh * d.nph, 256);
+        }
+    }
+
+    /// Cell-parallel forward chunk-state scan.
+    pub fn hk_states_par(&self, d: &HkDims, w: &HkWork<'_>) {
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.hk_states_par);
+        e.set_buffer(0, Some(&w.phk.buf), 0);
+        e.set_buffer(1, Some(&w.kv.buf), 0);
+        e.set_buffer(2, Some(&w.pow.buf), 0);
+        e.set_buffer(3, Some(&w.states.buf), 0);
+        self.hk_args(4, d);
+        let p2 = 2 * d.nph;
+        e.dispatch_thread_groups(
+            MTLSize::new((d.b * d.nh) as u64, p2.div_ceil(8) as u64, d.dv.div_ceil(32) as u64),
+            MTLSize::new(32, 8, 1),
+        );
+    }
+    /// Cell-parallel reverse state-gradient scan.
+    pub fn hk_dstates_par(&self, d: &HkDims, w: &HkWork<'_>, g: &HkGrads<'_>) {
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.hk_dstates_par);
+        e.set_buffer(0, Some(&w.phq.buf), 0);
+        e.set_buffer(1, Some(&g.dout.buf), 0);
+        e.set_buffer(2, Some(&w.pow.buf), 0);
+        e.set_buffer(3, Some(&g.dstates.buf), 0);
+        self.hk_args(4, d);
+        let p2 = 2 * d.nph;
+        e.dispatch_thread_groups(
+            MTLSize::new((d.b * d.nh) as u64, p2.div_ceil(8) as u64, d.dv.div_ceil(32) as u64),
+            MTLSize::new(32, 8, 1),
+        );
+    }
+    /// (profiling) only the forward chunk-state scan
+    pub fn hk_states_only(&self, d: &HkDims, w: &HkWork<'_>) {
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.hk_states_fwd);
+        e.set_buffer(0, Some(&w.phk.buf), 0);
+        e.set_buffer(1, Some(&w.kv.buf), 0);
+        e.set_buffer(2, Some(&w.pow.buf), 0);
+        e.set_buffer(3, Some(&w.states.buf), 0);
+        self.hk_args(4, d);
+        e.dispatch_thread_groups(MTLSize::new((d.b * d.nh) as u64, 1, 1), MTLSize::new((d.dv * (2 * d.nph).div_ceil(16)) as u64, 1, 1));
+    }
+    /// (profiling) only the reverse state-gradient scan
+    pub fn hk_dstates_only(&self, d: &HkDims, w: &HkWork<'_>, g: &HkGrads<'_>) {
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.hk_dstates_bwd);
+        e.set_buffer(0, Some(&w.phq.buf), 0);
+        e.set_buffer(1, Some(&g.dout.buf), 0);
+        e.set_buffer(2, Some(&w.pow.buf), 0);
+        e.set_buffer(3, Some(&g.dstates.buf), 0);
+        self.hk_args(4, d);
+        e.dispatch_thread_groups(MTLSize::new((d.b * d.nh) as u64, 1, 1), MTLSize::new((d.dv * (2 * d.nph).div_ceil(16)) as u64, 1, 1));
+    }
+
     /// Submit and wait. Returns GPU time in milliseconds (GPUEndTime −
     /// GPUStartTime) — the number the TFLOPS bench reports.
     pub fn commit(self) -> f64 {
@@ -899,4 +1137,69 @@ pub fn hk_pow_table(decay: &[f32], nh: usize, nph: usize) -> Vec<f32> {
         }
     }
     t
+}
+
+/// Batch decomposition of a GEMM grid's z axis: z = (b·nh + h)·nc + c,
+/// operand offsets = b·s[0] + h·s[1] + c·s[2] (elements).
+#[derive(Clone, Copy, Debug)]
+pub struct GemmBatch {
+    pub nb: usize,
+    pub nh: usize,
+    pub nc: usize,
+    pub sa: [usize; 3],
+    pub sb: [usize; 3],
+    pub sc: [usize; 3],
+}
+
+impl GemmBatch {
+    pub fn none() -> GemmBatch {
+        GemmBatch { nb: 1, nh: 1, nc: 1, sa: [0; 3], sb: [0; 3], sc: [0; 3] }
+    }
+}
+
+/// Scratch of the GEMM-formulated hybrid_k (shared by all layers; the
+/// backward recomputes the tables from phq/phk).
+pub struct HkScratch<'a> {
+    /// chunk-major [B, nh, T/64, 64, 2nph]
+    pub qt: &'a GBuf,
+    pub kt: &'a GBuf,
+    pub qp: &'a GBuf,
+    pub kh: &'a GBuf,
+    pub dqt: &'a GBuf,
+    pub dkt: &'a GBuf,
+    pub dqi: &'a GBuf,
+    pub dki: &'a GBuf,
+    /// [B, nh, T/64, 64, 64] — A, then dA
+    pub a: &'a GBuf,
+}
+
+impl HkScratch<'_> {
+    pub fn chunk_len(d: &HkDims) -> usize {
+        d.b * d.t * d.nh * 2 * d.nph
+    }
+    pub fn a_len(d: &HkDims) -> usize {
+        d.b * d.nh * (d.t / 64) * 4096
+    }
+    fn check(&self, d: &HkDims) {
+        assert!((2 * d.nph) % 64 == 0 && d.dv % 64 == 0, "hybrid_k GEMM path: 2·nph and dv must be multiples of 64 (got {} and {})", 2 * d.nph, d.dv);
+        let n = Self::chunk_len(d);
+        for b in [self.qt, self.kt, self.qp, self.kh, self.dqt, self.dkt, self.dqi, self.dki] {
+            assert!(b.len >= n, "hk scratch: chunk-major buffer too small");
+        }
+        assert!(self.a.len >= Self::a_len(d), "hk scratch: A too small");
+    }
+    /// batch strides of a chunk-major [B, nh, nch, 64, p2] buffer
+    pub fn chunk_major(d: &HkDims) -> [usize; 3] {
+        let (p2, nch) = (2 * d.nph, d.t / 64);
+        [d.nh * nch * 64 * p2, nch * 64 * p2, 64 * p2]
+    }
+    /// batch strides of a row-major [B·T, nh·x] activation, chunk = 64 rows
+    pub fn row_major(d: &HkDims, x: usize) -> [usize; 3] {
+        [d.t * d.nh * x, x, 64 * d.nh * x]
+    }
+    /// batch strides of the states buffer [B, nh, nch+1, p2, dv] (S_c)
+    pub fn states(d: &HkDims) -> [usize; 3] {
+        let (p2, nch) = (2 * d.nph, d.t / 64);
+        [d.nh * (nch + 1) * p2 * d.dv, (nch + 1) * p2 * d.dv, p2 * d.dv]
+    }
 }

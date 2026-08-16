@@ -79,7 +79,7 @@ impl EmbryoCfg {
             anchor_every: 2,
             heads: 2,
             nphase: 32,
-            dv: 32,
+            dv: 64,
             horizon_min: 4.0,
             horizon_max: 128.0,
             kappa_bias: 2.0,
@@ -288,7 +288,7 @@ pub use gpu::*;
 #[cfg(target_os = "macos")]
 mod gpu {
     use super::*;
-    use crate::metal::{Cmd, Ctx, GBuf, HkDims, HkGrads, HkWork, Op, ctx, hk_pow_table};
+    use crate::metal::{Cmd, Ctx, GBuf, HkDims, HkGrads, HkScratch, HkWork, Op, ctx, hk_pow_table};
     use crate::ops::hk_decay_grid;
 
     /// Per-layer activation buffers kept for the backward (M = B·T rows).
@@ -353,6 +353,16 @@ mod gpu {
         pub dgte: GBuf,   // [M,I]
         pub dup: GBuf,    // [M,I]
         pub logits: GBuf, // [R, V] head row chunk
+        // hybrid_k GEMM-formulation scratch (chunk-major tables + A)
+        pub hk_qt: GBuf,
+        pub hk_kt: GBuf,
+        pub hk_qp: GBuf,
+        pub hk_kh: GBuf,
+        pub hk_dqt: GBuf,
+        pub hk_dkt: GBuf,
+        pub hk_dqi: GBuf,
+        pub hk_dki: GBuf,
+        pub hk_a: GBuf,
         pub loss: GBuf,   // [M]
         pub partial: GBuf,
     }
@@ -459,6 +469,15 @@ mod gpu {
                 dgte: z(m * cfg.inter),
                 dup: z(m * cfg.inter),
                 logits: z(head_rows * cfg.vocab),
+                hk_qt: z(m * 2 * nhp),
+                hk_kt: z(m * 2 * nhp),
+                hk_qp: z(m * 2 * nhp),
+                hk_kh: z(m * 2 * nhp),
+                hk_dqt: z(m * 2 * nhp),
+                hk_dkt: z(m * 2 * nhp),
+                hk_dqi: z(m * 2 * nhp),
+                hk_dki: z(m * 2 * nhp),
+                hk_a: z(b * cfg.heads * (t / 64) * 4096),
                 loss: z(m),
                 partial: z(4096),
             };
@@ -485,6 +504,11 @@ mod gpu {
                 b,
                 t,
             })
+        }
+
+        pub fn hk_scratch(&self) -> HkScratch<'_> {
+            let s = &self.scratch;
+            HkScratch { qt: &s.hk_qt, kt: &s.hk_kt, qp: &s.hk_qp, kh: &s.hk_kh, dqt: &s.hk_dqt, dkt: &s.hk_dkt, dqi: &s.hk_dqi, dki: &s.hk_dki, a: &s.hk_a }
         }
 
         pub fn ctx(&self) -> &'static Ctx {
@@ -543,7 +567,7 @@ mod gpu {
                     cmd.kappa_fwd(kpre, kappa, m, nh, kld, cfg.kappa_bias);
                     let d = HkDims { b, t, nh, nph, dv };
                     let w = HkWork { thq, thk, v, kappa, pow: &self.pow, phq, phk, kv, states, out: o };
-                    cmd.hk_forward(&d, &w);
+                    if hk_simt() { cmd.hk_forward(&d, &w) } else { cmd.hk_forward_gemm(&d, &w, &self.hk_scratch()) }
                     // x_mid = x_in + o·Woᵀ   ([M, nh·dv]·[H, nh·dv]ᵀ)
                     cmd.copy(x_in, 0, x_mid, 0, m * h);
                     cmd.gemm(Op::N, Op::T, m, h, nh * dv, 1.0, o, 0, nh * dv, &self.p, *wo, nh * dv, 1.0, x_mid, 0, h);
@@ -614,7 +638,7 @@ mod gpu {
                         dv: &s.dv,
                         dkappa: &s.dkap,
                     };
-                    cmd.hk_backward(&d, &w, &gr, 0.0);
+                    if hk_simt() { cmd.hk_backward(&d, &w, &gr, 0.0) } else { cmd.hk_backward_gemm(&d, &w, &gr, &self.hk_scratch(), 0.0) }
                     let kld = cfg.kappa_ld();
                     cmd.kappa_bwd(kappa, &s.dkap, &s.dkpre, m, nh, kld);
                     // dx1 = dthq·Wq + dthk·Wk + dv·Wv + dkpre·Wκ
@@ -843,7 +867,7 @@ impl EmbryoGpu {
         let (b, t) = (self.b, self.t);
         let s = &self.scratch;
         let c = self.ctx();
-        let (LayerActs::Mixer { thq, thk, v, kappa, phq, phk, kv, states, o, .. }) = &self.acts[l] else { return vec![] };
+        let LayerActs::Mixer { thq, thk, v, kappa, phq, phk, kv, states, o, .. } = &self.acts[l] else { return vec![] };
         let (nh, nph, dv) = (cfg.heads, cfg.nphase, cfg.dv);
         let d = HkDims { b, t, nh, nph, dv };
         let w = HkWork { thq, thk, v, kappa, pow: &self.pow, phq, phk, kv, states, out: o };
@@ -851,10 +875,37 @@ impl EmbryoGpu {
         let mut out = Vec::new();
         let cmd = Cmd::new(c);
         cmd.hk_forward(&d, &w);
-        out.push(("hk forward (φ, kv, states, chunks)".into(), cmd.commit()));
+        out.push(("hk forward SIMT (φ, kv, states, chunks)".into(), cmd.commit()));
         let cmd = Cmd::new(c);
         cmd.hk_backward(&d, &w, &gr, 0.0);
-        out.push(("hk backward (dstates, chunks, split, dθ)".into(), cmd.commit()));
+        out.push(("hk backward SIMT (dstates, chunks, split, dθ)".into(), cmd.commit()));
+        let sc = self.hk_scratch();
+        let cmd = Cmd::new(c);
+        cmd.hk_forward_gemm(&d, &w, &sc);
+        out.push(("hk forward GEMM".into(), cmd.commit()));
+        let cmd = Cmd::new(c);
+        cmd.hk_backward_gemm(&d, &w, &gr, &sc, 0.0);
+        out.push(("hk backward GEMM".into(), cmd.commit()));
+        let cmd = Cmd::new(c);
+        cmd.hk_states_only(&d, &w);
+        out.push(("  states scan SIMT (fwd)".into(), cmd.commit()));
+        let cmd = Cmd::new(c);
+        cmd.hk_dstates_only(&d, &w, &gr);
+        out.push(("  dstates scan SIMT (bwd)".into(), cmd.commit()));
+        let cmd = Cmd::new(c);
+        cmd.hk_states_par(&d, &w);
+        out.push(("  states scan cell-parallel (fwd)".into(), cmd.commit()));
+        let cmd = Cmd::new(c);
+        cmd.hk_dstates_par(&d, &w, &gr);
+        out.push(("  dstates scan cell-parallel (bwd)".into(), cmd.commit()));
         out
     }
+}
+
+/// `EMBRYO_HK_SIMT=1` selects the reference SIMT chunk kernels instead of
+/// the batched-GEMM formulation (A/B and debugging).
+#[cfg(target_os = "macos")]
+fn hk_simt() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("EMBRYO_HK_SIMT").is_ok_and(|v| v != "0"))
 }
