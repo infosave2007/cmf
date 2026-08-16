@@ -751,3 +751,164 @@ kernel void hk_chunk_bwd_f32(
     }
     #undef ROW
 }
+
+// ---------------------------------------------------------------------
+// Anchor attention companions (the softmax layer: GQA, RoPE, causal).
+// The matmuls are the generic GEMM with column-block offsets; only the
+// row-wise softmax and RoPE are custom.
+// ---------------------------------------------------------------------
+
+// RoPE (neox halves: pair (i, i+hd/2)) in place on x [rows, nheads·hd];
+// position = row % T. sign=+1 forward, −1 = inverse rotation (backward).
+struct RopeArgs { uint T, nheads, hd; float base; float sign; };
+kernel void rope_f32(
+    device float*      x [[buffer(0)]],
+    constant RopeArgs& a [[buffer(1)]],
+    uint gid [[thread_position_in_grid]])   // over rows·nheads·(hd/2)
+{
+    uint half_hd = a.hd / 2u;
+    uint per_row = a.nheads * half_hd;
+    uint row = gid / per_row, r = gid % per_row;
+    uint h = r / half_hd, i = r % half_hd;
+    uint pos = row % a.T;
+    float inv_freq = pow(a.base, -(float)(2u * i) / (float)a.hd);
+    float ang = (float)pos * inv_freq;
+    float c = cos(ang), s = sin(ang) * a.sign;
+    device float* p = x + (ulong)row * a.nheads * a.hd + h * a.hd;
+    float x0 = p[i], x1 = p[i + half_hd];
+    p[i] = x0 * c - x1 * s;
+    p[i + half_hd] = x0 * s + x1 * c;
+}
+
+// Causal softmax over the rows of an [T,T] score block, in place:
+// P[t,j] = softmax_j(S[t,j]) for j ≤ t, 0 beyond. One threadgroup per
+// row (256 threads). `n` = T (row length); grid over T rows.
+kernel void causal_softmax_rows_f32(
+    device float*   S [[buffer(0)]],
+    constant uint&  n [[buffer(1)]],
+    uint row  [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    threadgroup float red[8];
+    device float* r = S + (ulong)row * n;
+    uint len = row + 1u;
+    float mx = -INFINITY;
+    for (uint j = tid; j < len; j += 256u) mx = max(mx, r[j]);
+    mx = simd_max(mx);
+    if (lane == 0) red[sgid] = mx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    mx = red[0];
+    for (uint s = 1; s < 8u; ++s) mx = max(mx, red[s]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float sum = 0.0f;
+    for (uint j = tid; j < len; j += 256u) { float e = exp(r[j] - mx); r[j] = e; sum += e; }
+    sum = simd_sum(sum);
+    if (lane == 0) red[sgid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tot = 0.0f;
+    for (uint s = 0; s < 8u; ++s) tot += red[s];
+    float inv = 1.0f / tot;
+    for (uint j = tid; j < len; j += 256u) r[j] *= inv;
+    for (uint j = len + tid; j < n; j += 256u) r[j] = 0.0f;
+}
+
+// Softmax backward on rows: dS = P ⊙ (dP − Σ_j P·dP), in place on dP.
+kernel void softmax_bwd_rows_f32(
+    device const float* P  [[buffer(0)]],
+    device float*       dP [[buffer(1)]],
+    constant uint&      n  [[buffer(2)]],
+    uint row  [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    threadgroup float red[8];
+    device const float* p = P + (ulong)row * n;
+    device float* d = dP + (ulong)row * n;
+    float dot = 0.0f;
+    for (uint j = tid; j < n; j += 256u) dot += p[j] * d[j];
+    dot = simd_sum(dot);
+    if (lane == 0) red[sgid] = dot;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tot = 0.0f;
+    for (uint s = 0; s < 8u; ++s) tot += red[s];
+    for (uint j = tid; j < n; j += 256u) d[j] = p[j] * (d[j] - tot);
+}
+
+// σ(x + bias) forward (y) and backward (dx = dy·y·(1−y)) — the κ gate.
+kernel void sigmoid_fwd_f32(
+    device const float* x    [[buffer(0)]],
+    device float*       y    [[buffer(1)]],
+    constant float&     bias [[buffer(2)]],
+    constant uint&      n    [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    y[gid] = 1.0f / (1.0f + exp(-(x[gid] + bias)));
+}
+kernel void sigmoid_bwd_f32(
+    device const float* y  [[buffer(0)]],
+    device const float* dy [[buffer(1)]],
+    device float*       dx [[buffer(2)]],
+    constant uint&      n  [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    float s = y[gid];
+    dx[gid] = dy[gid] * s * (1.0f - s);
+}
+
+// dE[tok[row], :] += dx[row, :]  (atomic float adds; tied head)
+kernel void embed_scatter_add_f32(
+    device atomic_float* dE  [[buffer(0)]],
+    device const uint*   tok [[buffer(1)]],
+    device const float*  dx  [[buffer(2)]],
+    constant uint&       d   [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]])   // x: column, y: row
+{
+    if (gid.x >= d) return;
+    atomic_fetch_add_explicit(&dE[(ulong)tok[gid.y] * d + gid.x], dx[(ulong)gid.y * d + gid.x], memory_order_relaxed);
+}
+
+// Copy `n` floats: dst = src (buffer-to-buffer with offsets on the host side).
+kernel void copy_f32(
+    device const float* src [[buffer(0)]],
+    device float*       dst [[buffer(1)]],
+    constant uint&      n   [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < n) dst[gid] = src[gid];
+}
+
+// κ gate with a padded pre-activation (the projection GEMM writes 64
+// columns; only nh are real): kap[row·nh + h] = σ(pre[row·ld + h] + bias)
+struct KapArgs { uint rows, nh, ld; float bias; };
+kernel void kappa_fwd_f32(
+    device const float* pre [[buffer(0)]],
+    device float*       kap [[buffer(1)]],
+    constant KapArgs&   a   [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])   // over rows·nh
+{
+    if (gid >= a.rows * a.nh) return;
+    uint row = gid / a.nh, h = gid % a.nh;
+    kap[gid] = 1.0f / (1.0f + exp(-(pre[(ulong)row * a.ld + h] + a.bias)));
+}
+// dpre[row·ld + j] = j < nh ? dkap[row·nh + j]·k(1−k) : 0
+kernel void kappa_bwd_f32(
+    device const float* kap  [[buffer(0)]],
+    device const float* dkap [[buffer(1)]],
+    device float*       dpre [[buffer(2)]],
+    constant KapArgs&   a    [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])   // over rows·ld
+{
+    if (gid >= a.rows * a.ld) return;
+    uint row = gid / a.ld, j = gid % a.ld;
+    float g = 0.0f;
+    if (j < a.nh) {
+        float k = kap[(ulong)row * a.nh + j];
+        g = dkap[(ulong)row * a.nh + j] * k * (1.0f - k);
+    }
+    dpre[gid] = g;
+}
