@@ -220,3 +220,56 @@ fn rmsnorm_swiglu_ce_adamw_match_cpu() {
     cmd.commit();
     assert_eq!(go.to_vec(), want, "embed gather");
 }
+
+#[test]
+fn hybrid_k_chunk_scan_matches_cpu_oracle() {
+    use cortiq_embryo::metal::{HkGrads, HkWork, hk_pow_table};
+    use cortiq_embryo::ops::{HkDims, hk_decay_grid, hk_ref_bwd, hk_ref_fwd};
+    let Some(c) = ctx() else { return };
+    // 3 chunks, 2 sequences, 2 heads, nph 5 (p2 = 10), dv 32: exercises the
+    // inter-chunk state path (states + dstates) and non-full register arrays.
+    for &(nph, dv) in &[(5usize, 32usize), (32, 128)] {
+        let d = HkDims { b: 2, t: 192, nh: 2, nph, dv };
+        let rows = d.b * d.t;
+        let thq: Vec<f32> = lcg_vec(1, rows * d.nh * nph).iter().map(|x| x * 3.0).collect();
+        let thk: Vec<f32> = lcg_vec(2, rows * d.nh * nph).iter().map(|x| x * 3.0).collect();
+        let v = lcg_vec(3, rows * d.nh * dv);
+        let kappa: Vec<f32> = lcg_vec(4, rows * d.nh).iter().map(|x| 0.5 + 0.4 * x).collect();
+        let dout = lcg_vec(5, rows * d.nh * dv);
+        let decay = hk_decay_grid(d.nh, nph, 8.0, 2.0 * d.t as f64);
+        let to64 = |v: &[f32]| v.iter().map(|x| *x as f64).collect::<Vec<f64>>();
+        let o_ref = hk_ref_fwd(&d, &to64(&thq), &to64(&thk), &to64(&v), &to64(&kappa), &to64(&decay));
+        let (dthq_ref, dthk_ref, dv_ref, dkap_ref) =
+            hk_ref_bwd(&d, &to64(&thq), &to64(&thk), &to64(&v), &to64(&kappa), &to64(&decay), &to64(&dout));
+
+        let p2 = 2 * nph;
+        let g = |n: usize| GBuf::zeros(c, n);
+        let (gthq, gthk, gv, gkap) = (GBuf::from_slice(c, &thq), GBuf::from_slice(c, &thk), GBuf::from_slice(c, &v), GBuf::from_slice(c, &kappa));
+        let gpow = GBuf::from_slice(c, &hk_pow_table(&decay, d.nh, nph));
+        let (gphq, gphk, gkv, gout) = (g(rows * d.nh * p2), g(rows * d.nh * p2), g(rows * d.nh * dv), g(rows * d.nh * dv));
+        let nst = d.b * d.nh * (d.t / 64 + 1) * p2 * dv;
+        let gstates = g(nst);
+        let w = HkWork { thq: &gthq, thk: &gthk, v: &gv, kappa: &gkap, pow: &gpow, phq: &gphq, phk: &gphk, kv: &gkv, states: &gstates, out: &gout };
+        let gdout = GBuf::from_slice(c, &dout);
+        let (gdst, gdkv, gdphq, gdphk) = (g(nst), g(rows * d.nh * dv), g(rows * d.nh * p2), g(rows * d.nh * p2));
+        let (gdthq, gdthk, gdv, gdkap) = (g(rows * d.nh * nph), g(rows * d.nh * nph), g(rows * d.nh * dv), g(rows * d.nh));
+        let gr = HkGrads { dout: &gdout, dstates: &gdst, dkv: &gdkv, dphq: &gdphq, dphk: &gdphk, dthq: &gdthq, dthk: &gdthk, dv: &gdv, dkappa: &gdkap };
+        let cmd = Cmd::new(c);
+        cmd.hk_forward(&d, &w);
+        cmd.hk_backward(&d, &w, &gr, 0.0);
+        let ms = cmd.commit();
+        let rel = |got: &[f32], want: &[f64]| -> f64 {
+            let scale = want.iter().fold(0.0f64, |m, x| m.max(x.abs())).max(1e-12);
+            got.iter().zip(want).map(|(a, b)| (*a as f64 - b).abs()).fold(0.0, f64::max) / scale
+        };
+        let e_o = rel(&gout.to_vec(), &o_ref);
+        let e_q = rel(&gdthq.to_vec(), &dthq_ref);
+        let e_k = rel(&gdthk.to_vec(), &dthk_ref);
+        let e_v = rel(&gdv.to_vec(), &dv_ref);
+        let e_kap = rel(&gdkap.to_vec(), &dkap_ref);
+        eprintln!("hk nph={nph} dv={dv}: {ms:.2} ms; rel err out {e_o:.2e} dthq {e_q:.2e} dthk {e_k:.2e} dv {e_v:.2e} dkappa {e_kap:.2e}");
+        for (name, e) in [("out", e_o), ("dthq", e_q), ("dthk", e_k), ("dv", e_v), ("dkappa", e_kap)] {
+            assert!(e < 5e-4, "hybrid_k {name}: rel err {e:e} (nph={nph} dv={dv})");
+        }
+    }
+}
