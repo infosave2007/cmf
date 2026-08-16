@@ -18,7 +18,7 @@ pub fn for_each_doc(path: &Path, mut f: impl FnMut(&str)) -> anyhow::Result<usiz
             let reader = SerializedFileReader::new(file)?;
             let schema = reader.metadata().file_metadata().schema_descr();
             let col = (0..schema.num_columns())
-                .find(|&i| schema.column(i).name() == "text" || schema.column(i).name() == "content")
+                .find(|&i| ["text", "content", "code"].contains(&schema.column(i).name()))
                 .ok_or_else(|| anyhow::anyhow!("{name}: no text/content column"))?;
             let proj = parquet::schema::types::Type::group_type_builder("schema")
                 .with_fields(vec![std::sync::Arc::new(schema.column(col).self_type().clone())])

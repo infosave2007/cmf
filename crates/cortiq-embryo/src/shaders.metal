@@ -42,6 +42,7 @@ struct GemmArgs {
     float alpha, beta;
     uint nb_h, nb_c;   // z = (b·nb_h + h)·nb_c + c
     uint mask;         // 1: causal — C[i,j] = 0 for j > i (global indices)
+    uint kdyn;         // 1: K = min(round64(kcount[z]), K) — dynamic reduction length
 };
 
 #define BM 64u
@@ -54,12 +55,15 @@ kernel void gemm_f32(
     device const float* B [[buffer(1)]],
     device float*       C [[buffer(2)]],
     constant GemmArgs&  g [[buffer(3)]],
+    device const uint*  kcount [[buffer(4)]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint  tid  [[thread_index_in_threadgroup]],
     uint  sgid [[simdgroup_index_in_threadgroup]])
 {
+    uint Kdim = g.K;
     {
         uint z = tgid.z;
+        if (g.kdyn == 1u) { Kdim = min(((kcount[z] + 63u) / 64u) * 64u, g.K); }
         uint cb = z % g.nb_c;
         uint rem = z / g.nb_c;
         uint hb = rem % g.nb_h;
@@ -89,7 +93,7 @@ kernel void gemm_f32(
         }
     }
 
-    for (uint k0 = 0; k0 < g.K; k0 += BK) {
+    for (uint k0 = 0; k0 < Kdim; k0 += BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         // ---- A tile: BM×BK = 2048 floats, 512 float4, 4 per thread ----
         if (!TA) {
@@ -1208,4 +1212,174 @@ kernel void group_sum_heads_f32(
         s += src[(((ulong)b * a.qh + i) * a.T + t) * a.hd + d];
     }
     dst[gid] = s;
+}
+
+// ---------------------------------------------------------------------
+// Routed experts (top-1 by RESONANCE, no gate — P1): expert e has a
+// descriptor μ_e (+ later a k-dim principal subspace U_e); resonance =
+// reconstruction error ‖(x−μ_e) − U_eᵀU_e(x−μ_e)‖²; route to argmin of
+// (resonance − bias_e), bias_e = loss-free load balancing.
+// Tokens are placed in per-expert slots deterministically (rank among the
+// tokens of that expert); slots ≥ cap are dropped (shared expert only).
+// ---------------------------------------------------------------------
+
+struct RouteArgs { uint rows, H, E, k, cap; };
+
+// assign[row] = argmin_e (‖x−μ_e‖² − ‖U_e(x−μ_e)‖² − bias_e); one threadgroup
+// (E ≤ 64 threads... use 64 threads: thread e computes expert e's score)
+kernel void route_f32(
+    device const float* x      [[buffer(0)]],   // [rows, H]
+    device const float* mu     [[buffer(1)]],   // [E, H]
+    device const float* U      [[buffer(2)]],   // [E, k, H] (rows orthonormal; k may be 0)
+    device const float* bias   [[buffer(3)]],   // [E]
+    device uint*        assign [[buffer(4)]],   // [rows]
+    device float*       res    [[buffer(5)]],   // [rows] resonance of the chosen expert
+    constant RouteArgs& a      [[buffer(6)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint e   [[thread_index_in_threadgroup]])
+{
+    threadgroup float sc[64];
+    threadgroup float rs[64];
+    float score = INFINITY;
+    float r = 0.0f;
+    if (e < a.E) {
+        device const float* xr = x + (ulong)row * a.H;
+        device const float* m = mu + (ulong)e * a.H;
+        float d2 = 0.0f;
+        for (uint j = 0; j < a.H; ++j) { float d = xr[j] - m[j]; d2 += d * d; }
+        float proj = 0.0f;
+        for (uint i = 0; i < a.k; ++i) {
+            device const float* u = U + ((ulong)e * a.k + i) * a.H;
+            float p = 0.0f;
+            for (uint j = 0; j < a.H; ++j) p += (xr[j] - m[j]) * u[j];
+            proj += p * p;
+        }
+        r = d2 - proj;
+        score = r - bias[e];
+    }
+    sc[e] = score;
+    rs[e] = r;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (e == 0) {
+        uint best = 0;
+        float bs = sc[0];
+        for (uint i = 1; i < a.E; ++i) { if (sc[i] < bs) { bs = sc[i]; best = i; } }
+        assign[row] = best;
+        res[row] = rs[best];
+    }
+}
+
+// Deterministic slot assignment: slot[row] = rank of row among rows with
+// the same expert (serial pass, one thread); count[e] = tokens per expert.
+kernel void route_group_f32(
+    device const uint* assign [[buffer(0)]],
+    device uint*       slot   [[buffer(1)]],
+    device uint*       count  [[buffer(2)]],   // [E]
+    constant RouteArgs& a     [[buffer(3)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid != 0) return;
+    uint c[64];
+    for (uint e = 0; e < a.E; ++e) c[e] = 0;
+    for (uint r = 0; r < a.rows; ++r) {
+        uint e = assign[r];
+        slot[r] = c[e];
+        c[e] += 1u;
+    }
+    for (uint e = 0; e < a.E; ++e) count[e] = c[e];
+}
+
+// hg[e][slot][:] = x[row][:] for slot < cap (buffer pre-zeroed)
+kernel void moe_gather_f32(
+    device const float* x      [[buffer(0)]],
+    device const uint*  assign [[buffer(1)]],
+    device const uint*  slot   [[buffer(2)]],
+    device float*       hg     [[buffer(3)]],   // [E, cap, H]
+    constant RouteArgs& a      [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]])   // x: column, y: row
+{
+    if (gid.x >= a.H) return;
+    uint s = slot[gid.y];
+    if (s >= a.cap) return;
+    uint e = assign[gid.y];
+    hg[((ulong)e * a.cap + s) * a.H + gid.x] = x[(ulong)gid.y * a.H + gid.x];
+}
+
+// out[row][:] += yh[e][slot][:] for slot < cap
+kernel void moe_scatter_add_f32(
+    device float*       out    [[buffer(0)]],
+    device const uint*  assign [[buffer(1)]],
+    device const uint*  slot   [[buffer(2)]],
+    device const float* yh     [[buffer(3)]],
+    constant RouteArgs& a      [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= a.H) return;
+    uint s = slot[gid.y];
+    if (s >= a.cap) return;
+    uint e = assign[gid.y];
+    out[(ulong)gid.y * a.H + gid.x] += yh[((ulong)e * a.cap + s) * a.H + gid.x];
+}
+
+// Descriptor statistics: sums[e][j] = Σ_{slots of e} hg[e][slot][j] (over
+// the filled slots — zero rows contribute nothing); one thread per (e, j).
+kernel void moe_stats_f32(
+    device const float* hg    [[buffer(0)]],
+    device const uint*  count [[buffer(1)]],
+    device float*       sums  [[buffer(2)]],   // [E, H]
+    constant RouteArgs& a     [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])   // over E·H
+{
+    if (gid >= a.E * a.H) return;
+    uint e = gid / a.H, j = gid % a.H;
+    uint n = min(count[e], a.cap);
+    float s = 0.0f;
+    for (uint r = 0; r < n; ++r) s += hg[((ulong)e * a.cap + r) * a.H + j];
+    sums[gid] = s;
+}
+
+// Descriptor update after a step: μ_e ← (1−α)·μ_e + α·sums_e/count_e for
+// experts that received tokens; bias_e += η·(1/E − count_e/rows) (loss-free
+// balancing toward equal load). One thread per (e, j); thread j == 0 also
+// moves the bias.
+struct MoeUpdArgs { uint rows, H, E; float alpha, eta; };
+kernel void moe_update_f32(
+    device float*       mu    [[buffer(0)]],
+    device float*       bias  [[buffer(1)]],
+    device const float* sums  [[buffer(2)]],
+    device const uint*  count [[buffer(3)]],
+    constant MoeUpdArgs& a    [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= a.E * a.H) return;
+    uint e = gid / a.H, j = gid % a.H;
+    uint n = count[e];
+    if (n > 0) {
+        float mean = sums[gid] / (float)n;
+        mu[gid] = (1.0f - a.alpha) * mu[gid] + a.alpha * mean;
+    }
+    if (j == 0) {
+        float frac = (float)n / (float)a.rows;
+        bias[e] += a.eta * (1.0f / (float)a.E - frac);
+    }
+}
+
+// Indirect dispatch arguments for the per-expert GEMMs: args[e] =
+// {ntiles_n, ceil(min(count_e, cap)/64), 1} for two column counts (n1, n2).
+struct IndArgs { uint E, cap, n1, n2; };
+kernel void moe_indirect_args_f32(
+    device const uint* count [[buffer(0)]],
+    device uint*       args  [[buffer(1)]],   // [2, E, 3]
+    constant IndArgs&  a     [[buffer(2)]],
+    uint e [[thread_position_in_grid]])
+{
+    if (e >= a.E) return;
+    uint m = min(count[e], a.cap);
+    uint mt = (m + 63u) / 64u;
+    args[(0u * a.E + e) * 3u + 0u] = a.n1 / 64u;
+    args[(0u * a.E + e) * 3u + 1u] = mt;
+    args[(0u * a.E + e) * 3u + 2u] = 1u;
+    args[(1u * a.E + e) * 3u + 0u] = a.n2 / 64u;
+    args[(1u * a.E + e) * 3u + 1u] = mt;
+    args[(1u * a.E + e) * 3u + 2u] = 1u;
 }

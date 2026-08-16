@@ -30,6 +30,11 @@ pub fn step_bench(batch: usize, seq: usize, steps: usize, tiny: bool) {
             "step {s}: loss {loss:.4} |g| {gnorm:.3} gpu {gpu_ms:.0} ms wall {wall:.0} ms → {:.0} tok/s",
             m as f64 / (wall * 1e-3)
         );
+        if s + 1 == steps {
+            for (l, cnt) in gpu.routing_counts().iter().enumerate() {
+                println!("  layer {l} experts: {cnt:?} (of {m}, cap {})", gpu.moe_cap);
+            }
+        }
     }
     if std::env::var("EMBRYO_PROFILE").is_ok() {
         println!("--- per-phase GPU ms ---");
