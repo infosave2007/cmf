@@ -70,9 +70,9 @@ enum Sub {
     },
     /// Birth: train from scratch (or resume) on a token shard.
     Birth {
-        /// token shard (u16 LE)
-        #[arg(long)]
-        shard: PathBuf,
+        /// token shards (u16 LE), `path[:weight]`, repeatable — mixed by weight
+        #[arg(long, required = true, num_args = 1..)]
+        shard: Vec<String>,
         /// held-out shard for validation (defaults to the training shard's tail)
         #[arg(long)]
         val: Option<PathBuf>,

@@ -90,11 +90,22 @@ pub fn lr_at(step: usize, total: usize, warmup: usize, peak: f32, floor: f32) ->
     floor + 0.5 * (peak - floor) * (1.0 + (std::f32::consts::PI * p).cos())
 }
 
-/// Checkpoint: config JSON + raw f32 params (+ optional m/v) — the plain
-/// trainer format; `.cmf` export is the runtime's container.
-pub fn save_checkpoint(path: &Path, cfg: &crate::model::EmbryoCfg, step: u32, params: &[f32], m: Option<&[f32]>, v: Option<&[f32]>) -> anyhow::Result<()> {
-    let mut f = std::fs::File::create(path)?;
-    let hdr = serde_json::json!({ "cfg": cfg, "step": step, "n": params.len(), "opt": m.is_some() });
+/// Checkpoint: config JSON + raw f32 params (+ optional m/v) + named extra
+/// blobs (the expert descriptors) — the plain trainer format; `.cmf` export
+/// is the runtime's container.
+pub fn save_checkpoint(
+    path: &Path,
+    cfg: &crate::model::EmbryoCfg,
+    step: u32,
+    params: &[f32],
+    m: Option<&[f32]>,
+    v: Option<&[f32]>,
+    extras: &[(&str, &[f32])],
+) -> anyhow::Result<()> {
+    let tmp = path.with_extension("tmp");
+    let mut f = std::fs::File::create(&tmp)?;
+    let ex: Vec<serde_json::Value> = extras.iter().map(|(n, x)| serde_json::json!([n, x.len()])).collect();
+    let hdr = serde_json::json!({ "cfg": cfg, "step": step, "n": params.len(), "opt": m.is_some(), "extras": ex });
     let hs = serde_json::to_vec(&hdr)?;
     f.write_all(&(hs.len() as u64).to_le_bytes())?;
     f.write_all(&hs)?;
@@ -108,6 +119,11 @@ pub fn save_checkpoint(path: &Path, cfg: &crate::model::EmbryoCfg, step: u32, pa
         w(&mut f, m)?;
         w(&mut f, v)?;
     }
+    for (_, x) in extras {
+        w(&mut f, x)?;
+    }
+    drop(f);
+    std::fs::rename(&tmp, path)?;
     Ok(())
 }
 
@@ -117,6 +133,7 @@ pub struct Checkpoint {
     pub params: Vec<f32>,
     pub m: Option<Vec<f32>>,
     pub v: Option<Vec<f32>>,
+    pub extras: Vec<(String, Vec<f32>)>,
 }
 
 pub fn load_checkpoint(path: &Path) -> anyhow::Result<Checkpoint> {
@@ -138,5 +155,78 @@ pub fn load_checkpoint(path: &Path) -> anyhow::Result<Checkpoint> {
     };
     let params = rd(&mut f, n)?;
     let (m, v) = if opt { (Some(rd(&mut f, n)?), Some(rd(&mut f, n)?)) } else { (None, None) };
-    Ok(Checkpoint { cfg, step, params, m, v })
+    let mut extras = Vec::new();
+    if let Some(list) = hdr["extras"].as_array() {
+        for e in list {
+            let name = e[0].as_str().unwrap_or("").to_string();
+            let len = e[1].as_u64().unwrap_or(0) as usize;
+            extras.push((name, rd(&mut f, len)?));
+        }
+    }
+    Ok(Checkpoint { cfg, step, params, m, v, extras })
+}
+
+/// Several shards mixed by weight (each sequence of a batch is drawn from
+/// one shard, chosen by weight) — the birth's corpus mix (en / ru / code / math).
+pub struct Mix {
+    pub shards: Vec<Shard>,
+    pub weights: Vec<f64>,
+}
+
+impl Mix {
+    /// Parse `path[:weight]` specs and load; splits the last `holdout`
+    /// fraction of every shard into a validation shard.
+    pub fn load(specs: &[String], holdout: f64, seq: usize) -> anyhow::Result<(Mix, Shard)> {
+        let mut shards = Vec::new();
+        let mut weights = Vec::new();
+        let mut val = Vec::new();
+        for s in specs {
+            let (path, w) = match s.rsplit_once(':') {
+                Some((p, w)) if w.parse::<f64>().is_ok() && !p.is_empty() => (p.to_string(), w.parse::<f64>().unwrap()),
+                _ => (s.clone(), 1.0),
+            };
+            let mut sh = Shard::load(Path::new(&path))?;
+            let n = sh.tokens.len();
+            let cut = n - ((n as f64 * holdout) as usize).max(seq + 2).min(n / 2);
+            val.extend_from_slice(&sh.tokens[cut..]);
+            sh.tokens.truncate(cut);
+            eprintln!("shard {path}: {:.1} M train tokens, weight {w}", sh.tokens.len() as f64 / 1e6);
+            shards.push(sh);
+            weights.push(w);
+        }
+        let tot: f64 = weights.iter().sum();
+        for w in &mut weights {
+            *w /= tot;
+        }
+        Ok((Mix { shards, weights }, Shard { tokens: val }))
+    }
+    pub fn total_tokens(&self) -> usize {
+        self.shards.iter().map(|s| s.tokens.len()).sum()
+    }
+}
+
+impl Sampler {
+    /// B windows, each from a shard chosen by weight.
+    pub fn batch_mix(&mut self, mix: &Mix, tokens: &mut Vec<u32>, targets: &mut Vec<u32>) {
+        tokens.clear();
+        targets.clear();
+        for _ in 0..self.b {
+            let u = (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64;
+            let mut acc = 0.0;
+            let mut si = mix.shards.len() - 1;
+            for (i, w) in mix.weights.iter().enumerate() {
+                acc += w;
+                if u < acc {
+                    si = i;
+                    break;
+                }
+            }
+            let sh = &mix.shards[si];
+            let n = sh.tokens.len();
+            let start = (self.next_u64() % (n - self.t - 1) as u64) as usize;
+            let w = &sh.tokens[start..start + self.t + 1];
+            tokens.extend(w[..self.t].iter().map(|x| *x as u32));
+            targets.extend(w[1..].iter().map(|x| *x as u32));
+        }
+    }
 }

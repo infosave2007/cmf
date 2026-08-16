@@ -8,21 +8,23 @@ pub fn train_tokenizer(inputs: &[PathBuf], out: &std::path::Path, vocab: usize, 
     use crate::tokenizer::{SPLIT, count_words, train};
     let re = fancy_regex::Regex::new(SPLIT).unwrap();
     let mut counts = std::collections::HashMap::new();
-    let mut seen = 0usize;
+    // the byte budget is split equally across the inputs (a mixed corpus
+    // should shape the vocabulary in proportion, not in file order)
+    let per_input = sample_bytes / inputs.len().max(1);
+    let mut seen_total = 0usize;
     let t0 = Instant::now();
-    'outer: for p in inputs {
+    for p in inputs {
+        let mut seen = 0usize;
         let n = crate::data::for_each_doc(p, |text| {
-            if seen >= sample_bytes {
+            if seen >= per_input {
                 return;
             }
             seen += text.len();
             count_words(text, &re, &mut counts);
         })
         .expect("read corpus");
-        eprintln!("{}: {n} docs, {:.1} MB so far, {} word types [{:.0} s]", p.display(), seen as f64 / 1e6, counts.len(), t0.elapsed().as_secs_f64());
-        if seen >= sample_bytes {
-            break 'outer;
-        }
+        seen_total += seen;
+        eprintln!("{}: {n} docs read, {:.1} MB sampled ({:.1} MB total), {} word types [{:.0} s]", p.display(), seen as f64 / 1e6, seen_total as f64 / 1e6, counts.len(), t0.elapsed().as_secs_f64());
     }
     let bpe = train(&counts, vocab, true);
     bpe.save(out).expect("write tokenizer.json");
