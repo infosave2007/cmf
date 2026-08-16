@@ -3932,6 +3932,7 @@ impl Pipeline {
             // accepted prefix into the CPU owners and appends the K/V rows
             self.metal_verify_commit(a);
             if let Some((plain_states, rows)) = commit_ref {
+                crate::gpu_metal::queue_fence();
                 let (nkv, hd) = (self.num_kv_heads, self.head_dim);
                 let mut worst_s = 0f32;
                 let mut worst_li = 0usize;
@@ -6883,13 +6884,29 @@ impl Pipeline {
         let QTensor::Mapped { model, .. } = wq else { return None };
         let model = model.clone();
         let lm = if want_logits { Some(self.weights.lm_head.q1_parts()?) } else { None };
-        let mut x = self.mtp_block_input(m, hidden, next_token);
         let dims = GraphDims {
             hidden: self.hidden_size,
             eps: self.rms_eps as f32,
             gemma: self.norm_style == cortiq_core::NormStyle::Gemma,
         };
+        // The block input `eh_proj · [enorm(e); hnorm(h)]` rides in the
+        // graph (one submit a step); the host per-op matvec if it cannot.
+        let hs = self.hidden_size;
+        let mut x = vec![0f32; hs];
         let mut graph = TokenGraph::new(&model, dims, &x)?;
+        let mut folded = false;
+        if let Some(eh) = m.eh_proj.q1_parts() {
+            let e = self.embed_single(next_token);
+            let mut cat = vec![0.0f32; 2 * hs];
+            let (cat_e, cat_h) = cat.split_at_mut(hs);
+            inference::rms_norm_into(&e, &m.enorm, self.rms_eps, self.norm_style, cat_e);
+            inference::rms_norm_into(hidden, &m.hnorm, self.rms_eps, self.norm_style, cat_h);
+            folded = graph.encode_input_proj(eh, &cat);
+        }
+        if !folded {
+            x = self.mtp_block_input(m, hidden, next_token);
+            graph = TokenGraph::new(&model, dims, &x)?;
+        }
         let l = AttnGpuLayer {
             attn_norm: &m.layer.input_norm,
             post_norm: &m.layer.post_norm,
