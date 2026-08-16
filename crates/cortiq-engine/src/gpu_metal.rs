@@ -3159,6 +3159,10 @@ inline void gdn_state_b_impl(
     float sc[DK];
     #pragma clang loop unroll(full)
     for (uint di = 0u; di < DK; ++di) sc[di] = s[di * dv + dj];
+    // this position's normed k and q staged in threadgroup memory once
+    // (every thread reads all DK of them: broadcast from TG memory instead
+    // of DK device loads a thread a position)
+    threadgroup float* kq = part + 32;
     for (uint e = 0u; e < nb; ++e) {
         device const float* cqe = cq + (ulong)e * c_dim;
         float gh = g[e * nv + h];
@@ -3166,20 +3170,22 @@ inline void gdn_state_b_impl(
         float iq = invq[e * nk + ko];
         float ik = invk[e * nk + ko];
         float vt = cqe[2u * kd + h * dv + dj];
-        device const float* ke = cqe + kd + ko * DK;
-        device const float* qe = cqe + ko * DK;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint di = dj; di < DK; di += dv) {
+            kq[di] = cqe[kd + ko * DK + di] * ik;
+            kq[DK + di] = cqe[ko * DK + di] * iq;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         float kv = 0.0f;
         #pragma clang loop unroll(full)
-        for (uint di = 0u; di < DK; ++di) kv += ke[di] * ik * sc[di];
+        for (uint di = 0u; di < DK; ++di) kv += kq[di] * sc[di];
         float delta = (vt - gh * kv) * bh;
         float o = 0.0f;
         #pragma clang loop unroll(full)
         for (uint di = 0u; di < DK; ++di) {
-            float kf = ke[di] * ik;
-            float qf = qe[di] * iq;
-            float cell = gh * sc[di] + kf * delta;
+            float cell = gh * sc[di] + kq[di] * delta;
             sc[di] = cell;
-            o += qf * cell;
+            o += kq[DK + di] * cell;
         }
         if (mode & 1u) {
             float ss = simd_sum(o * o);
@@ -3187,7 +3193,6 @@ inline void gdn_state_b_impl(
             threadgroup_barrier(mem_flags::mem_threadgroup);
             float tot = 0.0f;
             for (uint k2 = 0; k2 < (dv + 31u) / 32u; ++k2) tot += part[k2];
-            threadgroup_barrier(mem_flags::mem_threadgroup);
             float inv = rsqrt(tot / (float)dv + eps);
             float zz = z[(ulong)e * vd + h * dv + dj];
             of[(ulong)e * vd + h * dv + dj] = o * inv * gnorm[dj] * (zz / (1.0f + exp(-zz)));
@@ -3221,7 +3226,7 @@ kernel void NAME( \
     uint lane [[thread_index_in_simdgroup]], \
     uint sg   [[simdgroup_index_in_threadgroup]]) \
 { \
-    threadgroup float part[32]; \
+    threadgroup float part[32 + 2 * DK]; \
     gdn_state_b_impl<DK>(S, cq, z, g, beta, invq, invk, gnorm, of, nv, nk, dv, c_dim, nb, mode, eps, part, h, dj, lane, sg); \
 }
 GDN_STATE_B_KERNEL(gdn_state_b64, 64u)
@@ -5292,6 +5297,9 @@ struct Ctx {
     /// buffer does not own its mmap bytes, and pointer-only cache keys can be
     /// reused after a model is dropped (cross-model data corruption).
     file_bufs: Mutex<HashMap<usize, (Arc<WeightArena>, Arc<CmfModel>)>>,
+    /// Zero-copy wraps of host state vectors (GDN [ring | S]) keyed by
+    /// (address, byte length) — see `host_state_buffer`.
+    st_wraps: Mutex<HashMap<(usize, usize), Buffer>>,
     o1m: Mutex<HashMap<(u64, usize), O1MetalDev>>,
     /// row_scale buffer per tensor (key — (stable model identity, idx)).
     rs_bufs: Mutex<HashMap<(usize, usize), Buffer>>,
@@ -5574,6 +5582,7 @@ fn init() -> Result<Ctx, String> {
         mm_fc: Mutex::new(HashMap::new()),
         kv_mirrors: Mutex::new(HashMap::new()),
         file_bufs: Mutex::new(HashMap::new()),
+        st_wraps: Mutex::new(HashMap::new()),
         o1m: Mutex::new(HashMap::new()),
         rs_bufs: Mutex::new(HashMap::new()),
         cf_bufs: Mutex::new(HashMap::new()),
@@ -5738,6 +5747,46 @@ fn wait_fast(cmd: &metal::CommandBufferRef) {
 fn page_size() -> usize {
     // Apple Silicon: 16 KiB; taken from sysconf without a libc dependency.
     unsafe { getpagesize() as usize }
+}
+
+/// Wrap a HOST vector as a shared Metal buffer without copying: the GDN
+/// recurrent state ([ring | S], 3 MB a layer on the 27B) used to be
+/// memcpy'd into a device slot before every graph run and back after
+/// (300 MB a token, 400 MB a speculative round). On unified memory the
+/// device can read and write the CPU owner's memory directly. Needs a
+/// page-aligned pointer — macOS hands large mallocs whole pages, so a
+/// state Vec qualifies; the length is rounded up to the page (the
+/// allocation is page-granular, and nothing past `len` is ever touched).
+/// None → the caller falls back to the copy. Cached by (address, len):
+/// a reallocated owner is a new key.
+fn host_state_buffer(c: &Ctx, ptr: *const f32, len_floats: usize) -> Option<Buffer> {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *OFF.get_or_init(|| std::env::var("CMF_METAL_STATE_ZEROCOPY").as_deref() == Ok("0")) {
+        return None;
+    }
+    let page = page_size();
+    let addr = ptr as usize;
+    if addr % page != 0 || len_floats == 0 {
+        return None;
+    }
+    let bytes = len_floats * 4;
+    let wlen = bytes.div_ceil(page) * page;
+    let mut cache = c.st_wraps.lock().unwrap();
+    if let Some(b) = cache.get(&(addr, bytes)) {
+        return Some(b.clone());
+    }
+    let b = c._device.new_buffer_with_bytes_no_copy(
+        ptr as *const std::ffi::c_void,
+        wlen as u64,
+        MTLResourceOptions::StorageModeShared,
+        None,
+    );
+    // an address reused for a different length is a different owner:
+    // drop other entries at this address so the cache cannot pin a stale
+    // wrap of freed memory forever
+    cache.retain(|(a, _), _| *a != addr);
+    cache.insert((addr, bytes), b.clone());
+    Some(b)
 }
 
 unsafe extern "C" {
@@ -10938,6 +10987,10 @@ impl TokenGraph {
     pub fn read_states(&mut self, outs: &mut [&mut [f32]]) {
         debug_assert_eq!(outs.len(), self.dirty.len());
         for ((buf, len), out) in self.dirty.drain(..).zip(outs.iter_mut()) {
+            // len 0 = a zero-copy wrap: the device already wrote the owner
+            if len == 0 {
+                continue;
+            }
             debug_assert_eq!(len, out.len());
             unsafe {
                 std::ptr::copy_nonoverlapping(buf.contents() as *const f32, out.as_mut_ptr(), len);
@@ -11987,24 +12040,29 @@ impl TokenGraph {
         let iq_b = io_buf(c, 29_000_000_131 + cfg.nk, cfg.nk * 4);
         let ik_b = io_buf(c, 30_000_000_133 + cfg.nk, cfg.nk * 4);
         let of_b = io_buf(c, 31_000_000_161 + vd, vd * 4);
-        let st_bs: Vec<Buffer> = (0..layers.len())
-            .map(|i| {
-                io_buf(
+        // Zero-copy wraps of the CPU states where the allocation allows;
+        // the copy-in/copy-out slot path otherwise (`read_states` knows
+        // which is which by the flag).
+        let mut st_bs: Vec<Buffer> = Vec::with_capacity(layers.len());
+        let mut wrapped: Vec<bool> = Vec::with_capacity(layers.len());
+        for (i, st) in states.iter().enumerate() {
+            if let Some(b) = host_state_buffer(c, st.as_ptr(), st.len()) {
+                st_bs.push(b);
+                wrapped.push(true);
+            } else {
+                let sb = io_buf(
                     c,
                     36_000_000_223 + (self.st_next + i) * 613 + ring_len + s_len,
                     (ring_len + s_len) * 4,
-                )
-            })
-            .collect();
-        self.st_next += layers.len();
-
-        // Upload states (UMA memcpy into shared buffers) — safe: these
-        // slots were read back before the previous sync window closed.
-        unsafe {
-            for (st, sb) in states.iter().zip(&st_bs) {
-                std::ptr::copy_nonoverlapping(st.as_ptr(), sb.contents() as *mut f32, st.len());
+                );
+                unsafe {
+                    std::ptr::copy_nonoverlapping(st.as_ptr(), sb.contents() as *mut f32, st.len());
+                }
+                st_bs.push(sb);
+                wrapped.push(false);
             }
         }
+        self.st_next += layers.len();
 
         let cmd = self.ensure_cmd();
         let fbuf = self.fbuf.clone();
@@ -12172,8 +12230,8 @@ impl TokenGraph {
             }
         }
 
-        for (sb, st) in st_bs.iter().zip(states) {
-            self.dirty.push((sb.clone(), st.len()));
+        for ((sb, st), w) in st_bs.iter().zip(states).zip(wrapped) {
+            self.dirty.push((sb.clone(), if w { 0 } else { st.len() }));
         }
         true
     }
@@ -12325,6 +12383,7 @@ pub fn kv_mirror_set_stored(kv_id: u64, layer: usize, stored: usize) {
 /// commit replays from once the accepted count is known.
 struct VerifyGdnSlot {
     st: Buffer,
+    /// 0 = zero-copy wrap of the CPU owner (nothing to copy back)
     st_len: usize,
     qkv: Buffer,
     cq: Buffer,
@@ -12599,7 +12658,10 @@ impl VerifyGraph {
         let cmd = self.ensure_cmd();
         for (l, st) in layers.iter().zip(states) {
             let slot = self.gdn.len();
-            let s_b = Self::vbuf(c, 10, slot, (ring_len + s_len) * 4);
+            let (s_b, st_len) = match host_state_buffer(c, st.as_ptr(), st.len()) {
+                Some(b) => (b, 0usize),
+                None => (Self::vbuf(c, 10, slot, (ring_len + s_len) * 4), st.len()),
+            };
             let qkv_b = Self::vbuf(c, 11, slot, b * cfg.c_dim * 4);
             let cq_b = Self::vbuf(c, 12, slot, b * cfg.c_dim * 4);
             let z_b = Self::vbuf(c, 13, slot, b * vd * 4);
@@ -12610,8 +12672,10 @@ impl VerifyGraph {
             let a_b = Self::vbuf(c, 18, 0, b * cfg.nv * 4);
             let bb_b = Self::vbuf(c, 19, 0, b * cfg.nv * 4);
             let of_b = Self::vbuf(c, 20, 0, b * vd * 4);
-            unsafe {
-                std::ptr::copy_nonoverlapping(st.as_ptr(), s_b.contents() as *mut f32, st.len());
+            if st_len > 0 {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(st.as_ptr(), s_b.contents() as *mut f32, st.len());
+                }
             }
             let gnorm_b = const_buf(c, l.gnorm);
             let enc = cmd.new_compute_command_encoder();
@@ -12686,7 +12750,7 @@ impl VerifyGraph {
             enc.end_encoding();
             self.gdn.push(VerifyGdnSlot {
                 st: s_b,
-                st_len: st.len(),
+                st_len,
                 qkv: qkv_b,
                 cq: cq_b,
                 z: z_b,
@@ -12944,6 +13008,9 @@ impl VerifyGraph {
             return false;
         }
         for (slot, out) in self.gdn.iter().zip(states_out.iter_mut()) {
+            if slot.st_len == 0 {
+                continue; // zero-copy: the owner already holds it
+            }
             unsafe {
                 std::ptr::copy_nonoverlapping(slot.st.contents() as *const f32, out.as_mut_ptr(), slot.st_len.min(out.len()));
             }
@@ -12960,6 +13027,14 @@ impl VerifyGraph {
             return false;
         }
         let c = self.tg.c;
+        // a zero-copy slot replays straight into the owner it wrapped at
+        // encode time — the owner must still be that allocation
+        for (slot, out) in self.gdn.iter().zip(states_out.iter()) {
+            if slot.st_len == 0 && slot.st.contents() as *const f32 != out.as_ptr() {
+                tracing::error!("metal verify commit: a GDN state owner moved between verify and commit — declining");
+                return false;
+            }
+        }
         let cmd = c.queue.new_command_buffer().to_owned();
         let enc = cmd.new_compute_command_encoder();
         for slot in &self.gdn {
@@ -12980,7 +13055,9 @@ impl VerifyGraph {
         cmd.commit();
         wait_fast(&cmd);
         for (slot, out) in self.gdn.iter().zip(states_out.iter_mut()) {
-            debug_assert_eq!(slot.st_len, out.len());
+            if slot.st_len == 0 {
+                continue; // zero-copy: the replay wrote the owner directly
+            }
             unsafe {
                 std::ptr::copy_nonoverlapping(slot.st.contents() as *const f32, out.as_mut_ptr(), slot.st_len.min(out.len()));
             }
