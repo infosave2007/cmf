@@ -4521,7 +4521,7 @@ fn q4tp_matvec4_bku(@builtin(workgroup_id) wid: vec3<u32>,
 }
 
 
-// ── INT8-ACTIVATION batched matvec (`CMF_VERIFY_I8=1`): the speculative
+// ── INT8-ACTIVATION batched matvec (default; `CMF_VERIFY_I8=0` for f32): the speculative
 // verify's b ≤ 8 rows over q4tp weights with the activations quantized to
 // int8 per 32-group and the inner product on `dot4I8Packed` (dp4a: four
 // MACs an instruction). The f32 batched kernel above unpacks a weight
@@ -4538,8 +4538,8 @@ fn q4tp_matvec4_bku(@builtin(workgroup_id) wid: vec3<u32>,
 // (per-32 symmetric, |err| ≤ s/2 with s = max|x|/127 — the Q8_1
 // activation grid every q4 matvec in llama.cpp runs on). The verify's
 // argmax is the batched kernel's own; a near-tie can therefore resolve
-// differently from the plain path. Opt-in for that reason; the parity
-// test bounds the drift.
+// differently from the plain path. `CMF_VERIFY_I8=0` for the f32 verify;
+// the parity test bounds the drift.
 //
 // x8 layout (per element e, group g): two vec4<u32> at (e·gpr + g)·2:
 //   [w0.even, w0.odd, w1.even, w1.odd], [w2.even, w2.odd, w3.even, w3.odd]
@@ -12537,7 +12537,7 @@ struct Ctx {
     gdn_conv_k: wgpu::ComputePipeline,
     q4tp_mv_k: wgpu::ComputePipeline,
     q4tp_mv16w: wgpu::ComputePipeline,
-    /// INT8-activation batched matvec (`CMF_VERIFY_I8=1`), one pipeline per
+    /// INT8-activation batched matvec (default; `CMF_VERIFY_I8=0`), one pipeline per
     /// batch 2..=8 (index = batch), and its quantizer.
     q4tp_mv4_bk8: Vec<wgpu::ComputePipeline>,
     x_quant_i8: wgpu::ComputePipeline,
@@ -14555,12 +14555,17 @@ fn wgsl_main_source() -> String {
         )
 }
 
-/// `CMF_VERIFY_I8=1`: the batched (verify / small-batch prefill) q4tp
-/// matvec on int8 activations and dp4a (`q4tp_matvec4_bk8`). Not
-/// bit-exact against the one-vector kernel — see the kernel's note.
+/// The batched (verify / small-batch prefill) q4tp matvec on int8
+/// activations and dp4a (`q4tp_matvec4_bk8`). ON by default: measured
+/// on the RTX 5090 with Qwen3.8-27B q4tp it decodes 76 against the f32
+/// verify's 66 tok/s (core) and 56.5 against 51.8 on a code prompt, with
+/// the same acceptance; the activations carry a per-32 int8 rounding
+/// (the Q8_1 grid), so a near-tie can resolve differently from the plain
+/// path — `CMF_VERIFY_I8=0` restores the f32 verify and the bit-exact
+/// stream.
 pub(crate) fn verify_i8_on() -> bool {
     static N: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *N.get_or_init(|| std::env::var("CMF_VERIFY_I8").as_deref() == Ok("1"))
+    *N.get_or_init(|| std::env::var("CMF_VERIFY_I8").as_deref() != Ok("0"))
 }
 
 /// Quantize `batch` activation vectors (cols wide, f32) to the packed
@@ -19631,6 +19636,22 @@ pub fn forward_batch_graph(
                   rows_a: usize,
                   rows_b: usize,
                   cols: usize| {
+        // The int8 arm first: two dp4a dispatches (each quantizes the
+        // shared x once, cheaply) beat the fused f32 pair on the verify's
+        // shapes — the pair kernel is the f32 batched matvec's arithmetic
+        // twice over. `ematb` routes to it when the switch is on.
+        if a.kind == 6
+            && b.kind == 6
+            && c.use_mv4
+            && verify_i8_on()
+            && (2..=8).contains(&k)
+            && cols / 32 > 64
+            && cols % 32 == 0
+        {
+            encode_q4tp_mv4_b_i8(c, enc, &a.buf, xs, ya, rows_a, cols, k);
+            encode_q4tp_mv4_b_i8(c, enc, &b.buf, xs, yb, rows_b, cols, k);
+            return;
+        }
         if a.kind == 6
             && b.kind == 6
             && c.use_mv4
@@ -26967,6 +26988,23 @@ fn encode_q4tp_mv4_b(
     cols: usize,
     batch: usize,
 ) -> bool {
+    encode_q4tp_mv4_b_with(c, enc, weight, xs, y, rows, cols, batch, verify_i8_on())
+}
+
+/// `encode_q4tp_mv4_b` with the int8-activation arm chosen explicitly
+/// (the parity tests pin the f32 kernels; production reads the switch).
+#[allow(clippy::too_many_arguments)]
+fn encode_q4tp_mv4_b_with(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    weight: &wgpu::Buffer,
+    xs: &wgpu::Buffer,
+    y: &wgpu::Buffer,
+    rows: usize,
+    cols: usize,
+    batch: usize,
+    i8: bool,
+) -> bool {
     let gpr = cols / 32;
     // A small batch over WIDE rows goes to the register-blocked kernel:
     // it reads the weight once for the whole batch, where the arms below
@@ -26976,7 +27014,7 @@ fn encode_q4tp_mv4_b(
     // Arm 2 chunks the batch internally, so it covers up to 8; arm 1
     // has four accumulator components and stops at 4.
     let bk_max = if c.use_mv_bk >= 2 { 8 } else { 4 };
-    if verify_i8_on() && (2..=8).contains(&batch) && gpr > 64 && cols % 32 == 0 {
+    if i8 && (2..=8).contains(&batch) && gpr > 64 && cols % 32 == 0 {
         encode_q4tp_mv4_b_i8(c, enc, weight, xs, y, rows, cols, batch);
         return true;
     }
@@ -29802,8 +29840,8 @@ fn main() {
         let mut enc = c
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        assert!(encode_q4tp_mv4_b(
-            c, &mut enc, &wbuf, &xall, &yb, rows, cols, batch
+        assert!(encode_q4tp_mv4_b_with(
+            c, &mut enc, &wbuf, &xall, &yb, rows, cols, batch, false
         ));
         for e in 0..batch {
             let xe = mk(bytemuck::cast_slice(&xs[e * cols..(e + 1) * cols]));
@@ -29929,11 +29967,11 @@ fn main() {
         let mut enc = c
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        assert!(encode_q4tp_mv4_b(
-            c, &mut enc, &wab, &xb, &ya1, rows_a, cols, batch
+        assert!(encode_q4tp_mv4_b_with(
+            c, &mut enc, &wab, &xb, &ya1, rows_a, cols, batch, false
         ));
-        assert!(encode_q4tp_mv4_b(
-            c, &mut enc, &wbb, &xb, &yb1, rows_b, cols, batch
+        assert!(encode_q4tp_mv4_b_with(
+            c, &mut enc, &wbb, &xb, &yb1, rows_b, cols, batch, false
         ));
         assert!(encode_q4tp_mv4_b_x2(
             c, &mut enc, &wab, &wbb, &xb, &ya2, &yb2, rows_a, rows_b, cols, batch

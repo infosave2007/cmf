@@ -7,17 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.80] - 2026-08-16
+
 The Qwen3.8-27B q4tp release, converted straight from the bf16
 checkpoint (streamed shard by shard from the hub — never re-coded
 from q4t: a second quantization is a quality cut). 14.27 GB against
 q4t's 15.43, wikitext-2 perplexity 8.793 against 8.857 on the same
 windows. Published to `infosave/Qwen3.8-27B-cmf` with its own
-aquarium example.
+aquarium example. And the decode it gets: speculation off the MTP head
+is on by default for greedy — **76 tok/s against a plain 48.7** on the
+RTX 5090 (`bench --core`; a code prompt 56.5 against 45.7, prose at
+the plain rate by the monitor's choice) — with the draft on the token
+graph, an int8-activation batched verify, a sparse sampler chain and a
+speculation monitor in place of the one-shot trial. Beside it, the
+tools that made the week's measurements: `dequant`/`patch-tensor`, the
+FCD tail heal (q4tp 8.79 → 8.49), the NVG fold to a 19.8B and its
+KD-LoRA heal, and two field-report fixes for the MiniMax video path.
 
 ### Added
 
-- **The int8-activation batched verify** (`CMF_VERIFY_I8=1`,
-  `q4tp_matvec4_bk8`): the speculative verify's rows on int8
+- **The int8-activation batched verify** (default; `CMF_VERIFY_I8=0`
+  restores the f32 one; `q4tp_matvec4_bk8`): the speculative verify's rows on int8
   activations (per-32 symmetric, the Q8_1 grid) and `dot4I8Packed` —
   a weight word's eight nibbles become two packed int8x4 shared across
   the batch, each element costs two dp4a per word against 32 FMAs and
@@ -27,8 +37,12 @@ aquarium example.
   **speculative int8 76.3 tok/s (k=5)**; a code prompt at 2.3k
   context 45.7 → 51.7 (f32) → **56.4** (int8); acceptance unchanged.
   Not the plain path's bits (a near-tie can resolve differently — the
-  essay diverged, the aquarium did not), hence opt-in; the parity test
-  bounds the drift at 4.7e-3 rel rms.
+  essay diverged, the aquarium did not); `CMF_VERIFY_I8=0` gives the
+  bit-exact f32 verify back; the parity test bounds the drift at 4.7e-3
+  rel rms. Speculation itself is on by default for greedy decoding of
+  q4tp files (the monitor below stops it where it does not pay);
+  speculative SAMPLING stays opt-in (`CMF_GRAPH_SPEC_SAMPLE=1`: 60%
+  acceptance at the instruct row, break-even).
 - **The speculation monitor** replaces the one-shot trial: an
   exponential average of tokens-per-round and round time against the
   measured plain token decides on EVERY round (stop after four losing
@@ -59,6 +73,21 @@ aquarium example.
   8.79), decode 58.7 tok/s (+20%); the essay is coherent with dated
   facts, the aquarium prompt gets a plan and an early stop — a heal
   (KD from the 27B) is what makes this a model, not the fold alone.
+- **Video: the contention kill is disarmed during the prompt encode**
+  (`gpu::mm_kill_arm`). The encoder is a one-shot pass over 12 GB; on a
+  24 GB Mac with the 25.7 GB fl2va file it streams from disk and its
+  GEMMs run over budget for reasons that are not contention — users had
+  to gut `mm_kill` in the source to keep the denoise loop on the GPU
+  (HF discussion #4). It arms when the denoise starts.
+- **macOS: the pool's workers ask for the performance cores**
+  (`QOS_CLASS_USER_INITIATED`). A keyframe's video-VAE encode ran ~140 s
+  on an M4 with the E-cores at 100% and the P-cores asleep (`asitop`,
+  same report); threads without a QoS class are the scheduler's to
+  place.
+- The MiniMax card's field notes carry the 24 GB frame budgets from that
+  sweep (25.7 GB file: 512×256 to ~70–90 frames, 768×448 caps at 40–50;
+  the 14.5 GB v2 file: 448×768 × 50 frames at 136 s/step, 90 frames is
+  the paging edge) and the v2 face-consistency confirmation.
 - **The sparse sampler chain** for configs with a top-k (Qwen's own
   rows: 0.7/0.8/20 and 1.0/0.95/20): the dense chain built six or
   seven passes over 248k floats per token — copy, exp, select,
@@ -188,6 +217,18 @@ aquarium example.
   the timed prefill, the pair micro-bench) by the steady token count —
   21.9 GB/token on a 15.4 GB file, a 1.5× "amplification" that was the
   arithmetic. It is the steady-window delta now.
+
+## [0.5.79] - 2026-08-15
+
+The Mac 27B release. A windowed weight arena — a model beyond Metal's
+`maxBufferLength` runs on the GPU at all — with the windows overlapping
+by one tensor rather than half (27B decode 2.2 → 5.7 tok/s), the device
+attend by default for GDN hybrids up to head dim 256, and the O(1)
+Nyström attention ported to Metal (`CMF_O1_METAL=1`). Qwen3.8-27B q4t
+on an M4 24 GB: 5.8 tok/s decode, 20.8 tok/s prefill at 2k, o1 decode
+4.7 tok/s at 2k and flat beyond. The diagnostics that closed the "2×
+amplification" question (weight bytes per token across backends; the
+factor was a looped architecture, not the kernels) rode along.
 
 ## [0.5.78] - 2026-08-15
 

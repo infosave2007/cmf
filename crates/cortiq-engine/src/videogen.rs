@@ -401,6 +401,12 @@ fn generate_inner(
     ids.truncate(p.max_tokens);
     tags.truncate(ids.len());
     lap(&mut marks, "prepare");
+    // The prompt encoder is a one-shot pass over 12 GB of weights; on a
+    // machine the file does not fit it streams from disk and its GEMMs
+    // run over any contention budget for reasons that are not contention.
+    // The kill stays disarmed until the encode is done (users on 24 GB
+    // Macs had to patch it out to keep the denoise loop on the GPU).
+    crate::gpu::mm_kill_arm(false);
     progress("encode", 0, 1);
     let states = {
         let enc = Qwen3Encoder::from_cmf(&model)?;
@@ -423,6 +429,7 @@ fn generate_inner(
     }
     progress("encode", 1, 1);
     lap(&mut marks, "text encode");
+    crate::gpu::mm_kill_arm(true);
     // `CMF_TE_ONLY=1`: stop after the dump — an activation-harvest run
     // (the ClipProj refit) wants hundreds of encodes and zero renders.
     if std::env::var("CMF_TE_ONLY").as_deref() == Ok("1") {

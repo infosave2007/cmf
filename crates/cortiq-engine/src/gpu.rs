@@ -1447,6 +1447,22 @@ pub(crate) fn mm_kill() {
 /// CPU fallback took >60. Contention is persistent; a page-in is not.
 static MM_STRIKES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 const MM_STRIKES_TO_KILL: u32 = 3;
+/// Whether the kill is armed at all. A one-shot phase whose slowness is
+/// expected and not contention — the video prompt encoder streaming
+/// 12 GB off the SSD on a 24 GB Mac (HF discussion #4: users had to
+/// gut `mm_kill` to keep the denoise loop on the GPU) — disarms it and
+/// re-arms it when the phase is over; strikes taken meanwhile are
+/// forgotten.
+static MM_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Disarm / re-arm the contention kill around a phase whose GEMMs are
+/// slow for reasons that are not another process (see `MM_ARMED`).
+pub fn mm_kill_arm(on: bool) {
+    MM_ARMED.store(on, Ordering::Relaxed);
+    if on {
+        MM_STRIKES.store(0, Ordering::Relaxed);
+    }
+}
 
 /// The contention verdict for one wide op: `el` against its
 /// work-proportional `budget`. `exempt` marks ops whose time is not
@@ -1464,7 +1480,7 @@ pub(crate) fn mm_budget_check(
         MM_STRIKES.store(0, Ordering::Relaxed);
         return;
     }
-    if exempt {
+    if exempt || !MM_ARMED.load(Ordering::Relaxed) {
         return;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

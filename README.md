@@ -604,34 +604,44 @@ cortiq fcd model.cmf --corpus corpus.txt --gen-check --gen-gate --out model.fcd.
 
 ### Speculative decode off the model's own MTP head
 
-A model that ships an MTP head can draft with it and verify the whole
-chain in one batched submit. Opt-in. Greedy — with or without
-repetition/presence penalties — verifies by argmax equality and is
-bit-identical to the plain path. Speculative *sampling* (temperature >
-0) exists behind a second switch: the draft is a draw from the MTP
-head's own post-chain distribution q, accepted with min(1, p/q) against
-the verified position's p, a rejected draft replaced by a draw from
-max(0, p − q); the emitted stream is distributed exactly as the plain
-sampler's (a 400k-trial test holds the empirical law within L1 0.01 of
-the target). It is off by default because on the 5090 pod at the
-Qwen instruct row it decoded 19–22 tok/s against a plain 40 — nine
-post-chain distributions a round and a lower acceptance than greedy's
-against a verify that costs ~2.7 single tokens; it wants a cheaper
-verify before it pays.
+A model that ships an MTP head drafts with it and verifies the whole
+chain in one batched submit. **On by default for greedy decoding of
+q4tp files** (since 0.5.80): the draft block runs on the token graph,
+the verify's rows go through an int8-activation batched matvec
+(`dot4I8Packed`), and a monitor keeps averaging tokens-per-round
+against the plain token — it stops speculation after four losing rounds
+(free prose often does not pay) and retries 128 tokens later, so a
+prompt that gains keeps the gain and one that does not sits at the
+plain rate. Greedy — with or without repetition/presence penalties —
+verifies by argmax equality; with `CMF_VERIFY_I8=0` the f32 verify makes
+the stream bit-identical to the plain path (the int8 default can
+resolve a near-tie differently — a different but equally greedy
+continuation). `CMF_GRAPH_SPEC=0` turns speculation off; `=1` forces it
+on for other layouts (q4t/q8_2f verify through tile GEMMs and measured
+a loss). Speculative *sampling* (temperature > 0) exists behind a
+second switch: the draft is a draw from the MTP head's own post-chain
+distribution q, accepted with min(1, p/q) against the verified position's
+p, a rejected draft replaced by a draw from max(0, p − q); the emitted
+stream is distributed exactly as the plain sampler's (a 400k-trial test
+holds the empirical law within L1 0.01 of the target). It stays opt-in:
+at the Qwen instruct row (0.7 / 0.8 / 20 / presence 1.5) acceptance is
+60% and the round breaks even with the plain token.
 
 ```sh
-CMF_GRAPH_SPEC=1 cortiq bench model.cmf --tokens 160 --core --json
-CMF_GRAPH_SPEC=1 CMF_GRAPH_SPEC_K=4 cortiq run model.cmf --prompt "..." --greedy
-# CMF_GRAPH_SPEC_K=3 (default) — drafts per round; CMF_GRAPH_SPEC_SAMPLE=1 extends it to sampling
+cortiq bench model.cmf --tokens 200 --core --json          # speculation on by default (q4tp)
+CMF_GRAPH_SPEC=0 cortiq bench model.cmf --tokens 200 --core --json   # plain, for the A/B
+CMF_VERIFY_I8=0 cortiq run model.cmf --prompt "..." --greedy         # f32 verify: bit-exact with plain
+# CMF_GRAPH_SPEC_K=5 (default with the int8 verify, 4 with f32) — drafts per round
+# CMF_GRAPH_SPEC_SAMPLE=1 extends speculation to sampling (opt-in, see above)
 ```
 
-On Qwen3.6-27B q4tp / RTX 5090, medians of three: **51.1 tok/s against a
-plain 49.4**, 89–91% of drafts accepted, and the greedy continuation is
-byte-identical to the plain path. On Qwen3.8-27B q4tp, same card class:
-k=3 51.2 / k=4 51.8 against a plain 47.1. `bench --json` reports
-`mtp_drafted` and `mtp_accepted` — watch the ratio, not just tok/s,
-because a broken draft path degrades silently into a lower acceptance
-rate rather than into wrong output.
+On Qwen3.8-27B q4tp / RTX 5090, `bench --core`: **76 tok/s against a
+plain 48.5** (int8 verify, k=5; the f32 verify 66), 90% of drafts
+accepted; on a 2.3k-token code prompt in `run` 56.5 against 45.7, on an
+essay the monitor stops speculation and the rate is the plain 46–47.
+`bench --json` reports `mtp_drafted` and `mtp_accepted` — watch the
+ratio, not just tok/s, because a broken draft path degrades silently
+into a lower acceptance rate rather than into wrong output.
 
 It is worth knowing why the plain number is what it is: that decode is
 **bus-bound**. Two decode processes on one card aggregate 52.8 tok/s

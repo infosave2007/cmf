@@ -20,8 +20,13 @@ def load_fold(model_dir, tc, dtype=torch.bfloat16):
     """The fold checkpoint (model.language_model.* keys) into a text-only model on CPU."""
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
     from safetensors.torch import load_file
+    # bf16 from the first byte: an f32 skeleton of a 19.8B model is 79 GB
+    # and the bf16 conversion on top of it is what the box's 124 GB cgroup
+    # killed, silently, on the first run.
+    torch.set_default_dtype(dtype)
     with torch.device("meta"):
         model = Qwen3_5ForCausalLM(tc)
+    torch.set_default_dtype(torch.float32)
     model = model.to_empty(device="cpu")
     for m in model.modules():
         if hasattr(m, "inv_freq") and hasattr(m, "rope_init_fn"):
