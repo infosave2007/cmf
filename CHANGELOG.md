@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.81] - 2026-08-16
+
 ### Fixed
 - Speculation does not default on over **wgpu/Metal**: the batched
   verify graph there returned 0 accepted drafts and garbage text on
