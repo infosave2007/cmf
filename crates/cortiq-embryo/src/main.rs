@@ -77,6 +77,17 @@ enum Sub {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Dump held-out documents of a corpus file as text (for `cortiq ppl`).
+    SampleText {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        skip: usize,
+        #[arg(long, default_value_t = 100)]
+        docs: usize,
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Birth: train from scratch (or resume) on a token shard.
     Birth {
         /// token shards (u16 LE), `path[:weight]`, repeatable — mixed by weight
@@ -107,6 +118,9 @@ enum Sub {
         eval_every: usize,
         #[arg(long, default_value_t = 500)]
         save_every: usize,
+        /// refresh the expert descriptor subspaces (PCA of routed inputs) every N steps (0 = off)
+        #[arg(long, default_value_t = 200)]
+        pca_every: usize,
         /// tiny genome (smoke test)
         #[arg(long)]
         tiny: bool,
@@ -148,6 +162,9 @@ fn main() {
             let (total, active) = ck.cfg.params();
             println!("exported step {} → {} ({:.1} M params, {:.1} M active)", ck.step, out.display(), total as f64 / 1e6, active as f64 / 1e6);
         }
+        Sub::SampleText { input, skip, docs, out } => {
+            cortiq_embryo::corpus::sample_text(&input, skip, docs, &out);
+        }
         Sub::Fetch { dir, urls } => {
             cortiq_embryo::corpus::fetch(&urls, &dir);
         }
@@ -183,14 +200,14 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Sub::Birth { shard, val, out, resume, batch, seq, steps, warmup, lr, wd, clip, eval_every, save_every, tiny, vocab, seed } => {
+        Sub::Birth { shard, val, out, resume, batch, seq, steps, warmup, lr, wd, clip, eval_every, save_every, pca_every, tiny, vocab, seed } => {
             #[cfg(target_os = "macos")]
             cortiq_embryo::cli::birth(cortiq_embryo::cli::BirthArgs {
-                shard, val, out, resume, batch, seq, steps, warmup, lr, wd, clip, eval_every, save_every, tiny, vocab, seed,
+                shard, val, out, resume, batch, seq, steps, warmup, lr, wd, clip, eval_every, save_every, pca_every, tiny, vocab, seed,
             });
             #[cfg(not(target_os = "macos"))]
             {
-                let _ = (shard, val, out, resume, batch, seq, steps, warmup, lr, wd, clip, eval_every, save_every, tiny, vocab, seed);
+                let _ = (shard, val, out, resume, batch, seq, steps, warmup, lr, wd, clip, eval_every, save_every, pca_every, tiny, vocab, seed);
                 eprintln!("needs Metal (macOS)");
                 std::process::exit(1);
             }

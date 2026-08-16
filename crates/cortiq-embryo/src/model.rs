@@ -675,7 +675,7 @@ mod gpu {
             ctx().expect("Metal context")
         }
 
-        fn route_dims(&self) -> RouteDims {
+        pub(crate) fn route_dims(&self) -> RouteDims {
             RouteDims { rows: self.b * self.t, h: self.cfg.hidden, e: self.cfg.experts, k: MOE_K, cap: self.moe_cap }
         }
 
@@ -1298,4 +1298,99 @@ impl EmbryoGpu {
         cmd.commit();
         self.xf.to_vec()
     }
+}
+
+#[cfg(target_os = "macos")]
+impl EmbryoGpu {
+    /// Descriptor subspaces (P1): per (layer, expert) covariance of the
+    /// centred routed inputs of the LAST forward (GEMM on the GPU, K = the
+    /// expert's row count), EMA'd on the host, top-K eigenvectors by block
+    /// power iteration → `desc.u` (orthonormal rows). Call every N steps.
+    pub fn update_subspaces(&mut self, cov_ema: &mut Vec<f32>, ema: f32) {
+        use crate::metal::{Cmd, GemmBatch, GemmDyn, Op};
+        let cfg = &self.cfg;
+        let (ne, h, l_n) = (cfg.experts, cfg.hidden, cfg.layers);
+        if ne == 0 {
+            return;
+        }
+        let k = MOE_K;
+        let cap = self.moe_cap;
+        let r = self.route_dims();
+        let c = self.ctx();
+        // one covariance buffer for all (layer, expert): [L·E, H, H]
+        let cov = crate::metal::GBuf::zeros(c, l_n * ne * h * h);
+        let cmd = Cmd::new(c);
+        for l in 0..l_n {
+            let mo = &self.moe[l];
+            let d = &self.desc;
+            let (mu_off, e_off) = (l * ne * h, l * ne);
+            cmd.moe_center(&r, &mo.hg, &d.mu, mu_off, &d.count, e_off, &self.scratch.moe_dyh);
+            for e in 0..ne {
+                let kdyn = GemmDyn { indirect: None, kcount: Some((&d.count, e_off + e)) };
+                let hg_o = e * cap * h;
+                // cov_e = hgcᵀ·hgc  ([H, rows]·[rows, H])
+                cmd.gemm_dyn(Op::T, Op::N, h, h, cap, 1.0, &self.scratch.moe_dyh, hg_o, h, &self.scratch.moe_dyh, hg_o, h, 0.0, &cov, (l * ne + e) * h * h, h, &GemmBatch::none(), false, &kdyn);
+            }
+        }
+        cmd.commit();
+        let cov_h = cov.to_vec();
+        let counts: Vec<u32> = unsafe { std::slice::from_raw_parts(self.desc.count.buf.contents() as *const u32, l_n * ne).to_vec() };
+        if cov_ema.len() != cov_h.len() {
+            *cov_ema = vec![0.0; cov_h.len()];
+        }
+        let mut u_all = vec![0.0f32; l_n * ne * k * h];
+        for le in 0..l_n * ne {
+            let n = counts[le].min(cap as u32) as f32;
+            let blk = &cov_h[le * h * h..(le + 1) * h * h];
+            let ema_blk = &mut cov_ema[le * h * h..(le + 1) * h * h];
+            if n >= 2.0 {
+                for i in 0..h * h {
+                    ema_blk[i] = ema * ema_blk[i] + (1.0 - ema) * blk[i] / n;
+                }
+            }
+            let u = top_eigenvectors(ema_blk, h, k, 24, le as u64);
+            u_all[le * k * h..(le + 1) * k * h].copy_from_slice(&u);
+        }
+        self.desc.u.write_from(&u_all);
+    }
+}
+
+/// Top-k eigenvectors of a symmetric [n×n] matrix by block power iteration
+/// with Gram–Schmidt re-orthonormalisation; rows of the result are the
+/// orthonormal directions (largest eigenvalues first, approximately).
+pub fn top_eigenvectors(a: &[f32], n: usize, k: usize, iters: usize, seed: u64) -> Vec<f32> {
+    let mut q: Vec<f32> = gauss_vec(seed.wrapping_add(777), k * n);
+    let mut tmp = vec![0.0f32; k * n];
+    let orth = |q: &mut [f32]| {
+        for i in 0..k {
+            for j in 0..i {
+                let dot: f32 = (0..n).map(|t| q[i * n + t] * q[j * n + t]).sum();
+                for t in 0..n {
+                    q[i * n + t] -= dot * q[j * n + t];
+                }
+            }
+            let nrm: f32 = (0..n).map(|t| q[i * n + t] * q[i * n + t]).sum::<f32>().sqrt();
+            if nrm > 1e-12 {
+                for t in 0..n {
+                    q[i * n + t] /= nrm;
+                }
+            }
+        }
+    };
+    orth(&mut q);
+    for _ in 0..iters {
+        // tmp = Q·A (A symmetric)
+        for i in 0..k {
+            for c in 0..n {
+                let mut s = 0.0f32;
+                for t in 0..n {
+                    s += q[i * n + t] * a[t * n + c];
+                }
+                tmp[i * n + c] = s;
+            }
+        }
+        q.copy_from_slice(&tmp);
+        orth(&mut q);
+    }
+    q
 }

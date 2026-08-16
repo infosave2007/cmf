@@ -121,3 +121,22 @@ pub fn fetch(urls: &[String], dir: &std::path::Path) {
         }
     }
 }
+
+/// Dump `docs` documents of a corpus file after skipping `skip` (held-out
+/// text for `cortiq ppl` gates), each followed by a blank line.
+pub fn sample_text(input: &std::path::Path, skip: usize, docs: usize, out: &std::path::Path) {
+    use std::io::Write;
+    let mut f = std::fs::File::create(out).expect("create");
+    let mut i = 0usize;
+    let mut written = 0usize;
+    crate::data::for_each_doc(input, |text| {
+        if i >= skip && written < docs {
+            let _ = f.write_all(text.as_bytes());
+            let _ = f.write_all(b"\n\n");
+            written += 1;
+        }
+        i += 1;
+    })
+    .expect("read");
+    println!("{written} docs (skipped {skip} of {i}) → {}", out.display());
+}

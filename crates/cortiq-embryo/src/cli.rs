@@ -68,6 +68,7 @@ pub struct BirthArgs {
     pub clip: f32,
     pub eval_every: usize,
     pub save_every: usize,
+    pub pca_every: usize,
     pub tiny: bool,
     pub vocab: Option<usize>,
     pub seed: u64,
@@ -130,6 +131,7 @@ pub fn birth(a: BirthArgs) {
     };
     let t_start = Instant::now();
     let mut ema = 0.0f32;
+    let mut cov_ema: Vec<f32> = Vec::new();
     for step in step0 as usize..a.steps {
         sampler.batch_mix(&train, &mut tokens, &mut targets);
         let lr = lr_at(step, a.steps, a.warmup, a.lr, a.lr * 0.1);
@@ -137,6 +139,9 @@ pub fn birth(a: BirthArgs) {
         let (loss, gnorm, _gpu_ms) = gpu.train_step(&tokens, &targets, lr, a.wd, a.clip);
         let ms = t.elapsed().as_secs_f64() * 1e3;
         ema = if step == step0 as usize { loss } else { 0.98 * ema + 0.02 * loss };
+        if a.pca_every > 0 && (step + 1) % a.pca_every == 0 {
+            gpu.update_subspaces(&mut cov_ema, 0.9);
+        }
         if step % 10 == 0 || step + 1 == a.steps {
             println!(
                 "step {step:>6} loss {loss:.4} (ema {ema:.4}) |g| {gnorm:.3} lr {lr:.2e} {ms:.0} ms {:.0} tok/s  [{:.1} min]",

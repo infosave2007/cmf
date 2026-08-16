@@ -72,6 +72,7 @@ pub struct Ctx {
     moe_update: ComputePipelineState,
     moe_indirect: ComputePipelineState,
     moe_init_mu: ComputePipelineState,
+    moe_center: ComputePipelineState,
 }
 unsafe impl Send for Ctx {}
 unsafe impl Sync for Ctx {}
@@ -182,6 +183,7 @@ fn init() -> Result<Ctx, String> {
         moe_update: pso("moe_update_f32")?,
         moe_indirect: pso("moe_indirect_args_f32")?,
         moe_init_mu: pso("moe_init_mu_f32")?,
+        moe_center: pso("moe_center_f32")?,
         gemm,
         _lib: lib,
         queue,
@@ -1343,6 +1345,19 @@ impl<'a> Cmd<'a> {
         e.set_buffer(1, Some(&args.buf), (args_off * 4) as u64);
         e.set_bytes(2, std::mem::size_of::<A>() as u64, &a as *const A as *const c_void);
         self.grid1(e_n, 64);
+    }
+
+    /// hgc = hg − μ over the filled slots (zeros beyond).
+    pub fn moe_center(&self, r: &RouteDims, hg: &GBuf, mu: &GBuf, mu_off: usize, count: &GBuf, count_off: usize, hgc: &GBuf) {
+        assert!(hgc.len >= r.e * r.cap * r.h && hg.len >= r.e * r.cap * r.h);
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.moe_center);
+        e.set_buffer(0, Some(&hg.buf), 0);
+        e.set_buffer(1, Some(&mu.buf), (mu_off * 4) as u64);
+        e.set_buffer(2, Some(&count.buf), (count_off * 4) as u64);
+        e.set_buffer(3, Some(&hgc.buf), 0);
+        self.route_args(4, r);
+        self.grid1(r.e * r.cap * r.h, 256);
     }
 
     /// Submit and wait. Returns GPU time in milliseconds (GPUEndTime −
