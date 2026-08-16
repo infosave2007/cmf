@@ -15,6 +15,10 @@ usage: nvg_fold_qwen35.py --model Qwen/Qwen3.8-27B --out /dev/shm/qwen38-fold \
          --calib calib.txt --calib-tokens 30000 --ffn 12288 --attn-heads 16 --gdn-v-heads 32
 """
 import argparse, json, os, sys, time, math, gc, re
+# This is a CPU job: keep transformers on its own torch GDN implementation.
+# With flash-linear-attention importable it picks fla's kernels, whose CPU
+# fallback measured 213 s a sequence against 60 for the torch path.
+sys.modules["fla"] = None
 import numpy as np
 import torch
 
