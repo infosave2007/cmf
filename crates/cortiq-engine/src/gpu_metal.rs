@@ -1950,6 +1950,103 @@ kernel void attn_rope_qkn(
     }
 }
 
+// attn_rope_qkn over nb positions: row e of every [nb][·] buffer is
+// position pos0+e (the batched verify / prefill graph). 2-D grid: x =
+// (nh+nkv)·32 threads, y = nb.
+kernel void attn_rope_qkn_b(
+    device const float* qraw [[buffer(0)]],
+    device float*       k    [[buffer(1)]],
+    device float*       qout [[buffer(2)]],
+    device float*       gout [[buffer(3)]],
+    device const float* qnw  [[buffer(4)]],
+    device const float* knw  [[buffer(5)]],
+    device const float* invf [[buffer(6)]],
+    constant uint&  nh    [[buffer(7)]],
+    constant uint&  nkv   [[buffer(8)]],
+    constant uint&  hd    [[buffer(9)]],
+    constant uint&  rd    [[buffer(10)]],
+    constant uint&  pos   [[buffer(11)]],
+    constant uint&  flags [[buffer(12)]], // 1=gate 2=qnorm 4=knorm 8=gemma
+    constant float& eps   [[buffer(13)]],
+    constant uint&  nb    [[buffer(14)]],
+    uint2 gid2 [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    uint gid = gid2.x;
+    uint e = gid2.y;
+    if (e >= nb) return;
+    uint pos_e = pos + e;
+    bool gate0 = (flags & 1u) != 0u;
+    qraw += (ulong)e * nh * hd * (gate0 ? 2u : 1u);
+    k    += (ulong)e * nkv * hd;
+    qout += (ulong)e * nh * hd;
+    gout += (ulong)e * nh * hd;
+    // Head = simdgroup index IN THE GRID. This kernel is launched with
+    // dispatch_threads over (nh+nkv)·32 threads, and the last threadgroup
+    // is partial whenever that is not a multiple of 256 — there
+    // `simdgroups_per_threadgroup` reports the PARTIAL group's count, so
+    // `tg·sgs + sg` re-derived heads 0..k for it instead of the tail
+    // heads: the K heads of every model with (nh+nkv) % 8 != 0
+    // (Qwen3.5-0.8B: 8+2, Qwen3.8-27B: 24+4) were never normed nor
+    // rotated, the raw K went into the cache, and the device attend ran
+    // 15-20% off the CPU's on every token.
+    uint head = gid >> 5u;
+    if (head >= nh + nkv) return;
+    bool isq = head < nh;
+    bool gate = (flags & 1u) != 0u;
+    device const float* src = isq
+        ? qraw + (ulong)head * (gate ? 2u : 1u) * hd
+        : k + (ulong)(head - nh) * hd;
+    uint nt = (hd + 31u) / 32u;
+    float xv[8];
+    float ss = 0.0f;
+    for (uint t = 0; t < nt; ++t) {
+        uint d = t * 32u + lane;
+        xv[t] = d < hd ? src[d] : 0.0f;
+        ss += xv[t] * xv[t];
+    }
+    ss = simd_sum(ss);
+    bool normed = isq ? (flags & 2u) != 0u : (flags & 4u) != 0u;
+    if (normed) {
+        float inv = 1.0f / sqrt(ss / (float)hd + eps);
+        device const float* w = isq ? qnw : knw;
+        bool gemma = (flags & 8u) != 0u;
+        for (uint t = 0; t < nt; ++t) {
+            uint d = t * 32u + lane;
+            if (d < hd) {
+                float wd = w[d];
+                xv[t] = xv[t] * inv * (gemma ? (1.0f + wd) : wd);
+            }
+        }
+    }
+    // Partial RoPE: pair (i, i + rd/2); with (rd/2) % 32 == 0 both
+    // halves live in the same lane, slots t and t + (rd/2)/32.
+    uint hlf = rd / 2u;
+    uint toff = hlf / 32u;
+    for (uint t = 0; t < toff; ++t) {
+        uint i = t * 32u + lane;
+        if (i < hlf) {
+            float angle = (float)pos_e * invf[i];
+            float c = cos(angle), s = sin(angle);
+            float x0 = xv[t], x1 = xv[t + toff];
+            xv[t] = x0 * c - x1 * s;
+            xv[t + toff] = x0 * s + x1 * c;
+        }
+    }
+    device float* dst = isq ? qout + (ulong)head * hd : k + (ulong)(head - nh) * hd;
+    for (uint t = 0; t < nt; ++t) {
+        uint d = t * 32u + lane;
+        if (d < hd) dst[d] = xv[t];
+    }
+    if (isq && gate) {
+        device const float* gsrc = qraw + (ulong)head * 2u * hd + hd;
+        for (uint t = 0; t < nt; ++t) {
+            uint d = t * 32u + lane;
+            if (d < hd) gout[(ulong)head * hd + d] = gsrc[d];
+        }
+    }
+}
+
 // Append this position's K/V rows into the device cache mirror
 // ([nkv, cap, hd] each) at index `stored`.
 kernel void kv_append(
@@ -5153,6 +5250,8 @@ struct Ctx {
     axpy: ComputePipelineState,
     zero: ComputePipelineState,
     rqkn: ComputePipelineState,
+    /// attn_rope_qkn over a batch of positions.
+    rqknb: ComputePipelineState,
     kvapp: ComputePipelineState,
     gqat: ComputePipelineState,
     o1far: ComputePipelineState,
@@ -5357,6 +5456,7 @@ fn init() -> Result<Ctx, String> {
     let axpy = pso("axpy")?;
     let zero = pso("fill_zero")?;
     let rqkn = pso("attn_rope_qkn")?;
+    let rqknb = pso("attn_rope_qkn_b")?;
     let kvapp = pso("kv_append")?;
     let gqat = pso("gqa_attend")?;
     let o1far = pso("o1_far")?;
@@ -5442,6 +5542,7 @@ fn init() -> Result<Ctx, String> {
         axpy,
         zero,
         rqkn,
+        rqknb,
         kvapp,
         gqat,
         o1far,
@@ -12258,6 +12359,10 @@ pub struct VerifyGraph {
     imp_scratch: Buffer,
     gdn: Vec<VerifyGdnSlot>,
     logits_b: Option<(Buffer, usize)>,
+    /// Prefill mode: every row is real — the GDN recurrence writes its
+    /// state and shifts the ring in the same pass (no separate commit),
+    /// and b may run to 512 (wide GEMMs past 8 rows).
+    prefill: bool,
 }
 
 const VBUF_BASE: usize = 60_000_000_000;
@@ -12273,11 +12378,11 @@ fn verify_skip(what: char) -> bool {
 impl VerifyGraph {
     fn vbuf(c: &Ctx, kind: usize, slot: usize, nbytes: usize) -> Buffer {
         // the key carries the size (io_buf caches by key alone)
-        io_buf(c, VBUF_BASE + kind * 1_000_000_000 + slot * 1_000_000 + nbytes / 16, nbytes)
+        io_buf(c, VBUF_BASE + kind * 1_000_000_000_000 + slot * 1_000_000_000 + nbytes / 16, nbytes)
     }
 
     pub fn new(model: &Arc<CmfModel>, dims: GraphDims, h: &[f32], b: usize) -> Option<VerifyGraph> {
-        if !(1..=8).contains(&b) || h.len() != b * dims.hidden || dims.hidden % 64 != 0 {
+        if !(1..=512).contains(&b) || h.len() != b * dims.hidden || dims.hidden % 128 != 0 {
             return None;
         }
         let tg = TokenGraph::new(model, dims, &h[..dims.hidden])?;
@@ -12289,11 +12394,12 @@ impl VerifyGraph {
         unsafe {
             std::ptr::copy_nonoverlapping(h.as_ptr(), h_b.contents() as *mut f32, b * dims.hidden);
         }
-        let ones = Self::vbuf(c, 4, 0, 32);
-        let xsc = Self::vbuf(c, 5, 0, 32);
+        // per-row scales: b entries (the pow2 pre-scale writes one a row)
+        let ones = Self::vbuf(c, 4, 0, b.max(8) * 4);
+        let xsc = Self::vbuf(c, 5, 0, b.max(8) * 4);
         unsafe {
             let p = ones.contents() as *mut f32;
-            for i in 0..8 {
+            for i in 0..b.max(8) {
                 *p.add(i) = 1.0;
             }
         }
@@ -12310,7 +12416,16 @@ impl VerifyGraph {
             imp_scratch,
             gdn: Vec::new(),
             logits_b: None,
+            prefill: false,
         })
+    }
+
+    /// The prefill flavour: b prompt rows (≤ 512), states written in
+    /// place, K/V rows appended for good — see `finish_states`.
+    pub fn new_prefill(model: &Arc<CmfModel>, dims: GraphDims, h: &[f32], b: usize) -> Option<VerifyGraph> {
+        let mut g = Self::new(model, dims, h, b)?;
+        g.prefill = true;
+        Some(g)
     }
 
     fn ensure_cmd(&mut self) -> metal::CommandBuffer {
@@ -12409,7 +12524,13 @@ impl VerifyGraph {
         if verify_skip('g') { return; }
         let abs = self.n8_abs(t).unwrap();
         note_weight_bytes(&ProjKind::Q4tp, t.1, t.2 / GROUP_SIZE);
-        encode_q4tp_mm_n8(self.tg.c, enc, &self.tg.fbuf, abs, xs, y, xsc, t.1, t.2, self.b);
+        if self.b <= 8 {
+            encode_q4tp_mm_n8(self.tg.c, enc, &self.tg.fbuf, abs, xs, y, xsc, t.1, t.2, self.b);
+        } else {
+            // the wide simdgroup GEMM (compute-bound, ~1.5 TMAC/s on the
+            // M4); its activations ride at scale 1 — no per-row pre-scale
+            enc_mul_mm(self.tg.c, enc, &self.tg.fbuf, abs, &self.ones, MmKind::Q4tp, xs, y, self.b, t.1, t.2);
+        }
     }
 
     /// h += d; n = rmsnorm(h, post_norm); gate/up/silu/down over b rows;
@@ -12501,14 +12622,19 @@ impl VerifyGraph {
             self.gemm(enc, l.z, &self.n_b, &z_b, &self.ones);
             for (t, y) in [(&l.a, &a_b), (&l.b, &bb_b)] {
                 let (data, rows, cols) = *t;
-                disp(
-                    enc,
-                    &c.f32mvb,
-                    &[(&const_buf(c, data), 0), (&self.n_b, 0), (y, 0)],
-                    &[cols as u32, rows as u32, b as u32],
-                    &[],
-                    ((rows as u64).div_ceil(8) * 256, 256),
-                );
+                let wb = const_buf(c, data);
+                // the batched f32 matvec covers 8 rows a dispatch
+                for c0 in (0..b).step_by(8) {
+                    let nb = (b - c0).min(8);
+                    disp(
+                        enc,
+                        &c.f32mvb,
+                        &[(&wb, 0), (&self.n_b, (c0 * cols * 4) as u64), (y, (c0 * rows * 4) as u64)],
+                        &[cols as u32, rows as u32, nb as u32],
+                        &[],
+                        ((rows as u64).div_ceil(8) * 256, 256),
+                    );
+                }
             }
             // 3. conv over the virtual sequence
             enc.set_compute_pipeline_state(&c.gdnconvb);
@@ -12538,9 +12664,21 @@ impl VerifyGraph {
                 &[],
                 (((b * cfg.nk) as u64).div_ceil(8) * 256, 256),
             );
-            // 5. recurrence over the b positions (outputs only)
+            // 5. recurrence over the b positions (outputs; prefill also
+            //    writes the state back and shifts the ring right here)
             if !verify_skip('s') {
-            Self::state_dispatch(c, enc, &s_b, ring_len, &cq_b, &z_b, &g_b, &bt_b, &iq_b, &ik_b, &gnorm_b, &of_b, cfg, b, 1);
+                let mode = if self.prefill { 3 } else { 1 };
+                Self::state_dispatch(c, enc, &s_b, ring_len, &cq_b, &z_b, &g_b, &bt_b, &iq_b, &ik_b, &gnorm_b, &of_b, cfg, b, mode);
+                if self.prefill {
+                    disp(
+                        enc,
+                        &c.gdnringcb,
+                        &[(&s_b, 0), (&qkv_b, 0)],
+                        &[cfg.c_dim as u32, cfg.kk as u32, b as u32],
+                        &[],
+                        (cfg.c_dim as u64, 256),
+                    );
+                }
             }
             // 6. out_proj → d; 7. post-norm + FFN
             self.gemm(enc, l.out, &of_b, &self.d_b, &self.ones);
@@ -12672,22 +12810,22 @@ impl VerifyGraph {
         let qn_b = p.q_norm.map(|w| const_buf(c, w)).unwrap_or_else(|| qr_b.clone());
         let kn_b = p.k_norm.map(|w| const_buf(c, w)).unwrap_or_else(|| qr_b.clone());
         let invf_b = const_buf(c, p.inv_freq);
-        for e in 0..b {
-            disp(
-                enc,
-                &c.rqkn,
-                &[
-                    (&q_b, (e * l.wq.1 * 4) as u64),
-                    (&k_b, (e * kvd * 4) as u64),
-                    (&qr_b, (e * nhd * 4) as u64),
-                    (&g_b, (e * nhd * 4) as u64),
-                    (&qn_b, 0),
-                    (&kn_b, 0),
-                    (&invf_b, 0),
-                ],
-                &[p.nh as u32, p.nkv as u32, p.hd as u32, p.rd as u32, (p.position + e) as u32, flags],
-                &[p.eps],
-                (((p.nh + p.nkv) * 32) as u64, 256),
+        {
+            // one 2-D dispatch: x = the (nh+nkv) head simdgroups, y = rows
+            enc.set_compute_pipeline_state(&c.rqknb);
+            for (i, bb) in [&q_b, &k_b, &qr_b, &g_b, &qn_b, &kn_b, &invf_b].iter().enumerate() {
+                enc.set_buffer(i as u64, Some(bb), 0);
+            }
+            let w = [p.nh as u32, p.nkv as u32, p.hd as u32, p.rd as u32, p.position as u32, flags];
+            for (i, v) in w.iter().enumerate() {
+                enc.set_bytes(7 + i as u64, 4, v as *const u32 as *const std::ffi::c_void);
+            }
+            enc.set_bytes(13, 4, &p.eps as *const f32 as *const std::ffi::c_void);
+            let nb_u = b as u32;
+            enc.set_bytes(14, 4, &nb_u as *const u32 as *const std::ffi::c_void);
+            enc.dispatch_threads(
+                MTLSize::new(((p.nh + p.nkv) * 32) as u64, b as u64, 1),
+                MTLSize::new(256, 1, 1),
             );
         }
         // append the b rows
@@ -12701,9 +12839,29 @@ impl VerifyGraph {
             enc.set_bytes(4 + i as u64, 4, v as *const u32 as *const std::ffi::c_void);
         }
         enc.dispatch_threads(MTLSize::new(kvd as u64, b as u64, 1), MTLSize::new(256, 1, 1));
+        if b > 8 {
+            // the chunk attend: one simdgroup per (row, head), row e over
+            // positions 0..=stored+e
+            if !verify_skip('a') {
+                enc.set_compute_pipeline_state(&c.cattend);
+                enc.set_buffer(0, Some(&qr_b), 0);
+                enc.set_buffer(1, Some(&k_mb), 0);
+                enc.set_buffer(2, Some(&v_mb), 0);
+                enc.set_buffer(3, Some(&ao_b), 0);
+                enc.set_buffer(4, Some(&self.imp_scratch), 0);
+                let w = [p.nh as u32, (p.nh / p.nkv) as u32, p.hd as u32, cap as u32, stored as u32, b as u32];
+                for (i, v) in w.iter().enumerate() {
+                    enc.set_bytes(5 + i as u64, 4, v as *const u32 as *const std::ffi::c_void);
+                }
+                enc.dispatch_thread_groups(
+                    MTLSize::new((p.nh as u64).div_ceil(8), b as u64, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+            }
+        }
         // attend row e over positions 0..=stored+e
         for e in 0..b {
-            if verify_skip('a') { break; }
+            if b > 8 || verify_skip('a') { break; }
             let n_pos = stored + e + 1;
             let cap_sgs = (c.gqat.max_total_threads_per_threadgroup() as usize / 32).clamp(1, gqa_split_max());
             let sgs = n_pos.div_ceil(32).clamp(1, cap_sgs);
@@ -12777,6 +12935,20 @@ impl VerifyGraph {
         unsafe {
             std::ptr::copy_nonoverlapping(self.h_b.contents() as *const f32, h.as_mut_ptr(), n);
         }
+    }
+
+    /// Prefill mode: copy the (already written) states back to the CPU
+    /// owners after `sync` (order = the `encode_gdn_run_b` calls).
+    pub fn finish_states(&mut self, states_out: &mut [&mut [f32]]) -> bool {
+        if !self.prefill || states_out.len() != self.gdn.len() {
+            return false;
+        }
+        for (slot, out) in self.gdn.iter().zip(states_out.iter_mut()) {
+            unsafe {
+                std::ptr::copy_nonoverlapping(slot.st.contents() as *const f32, out.as_mut_ptr(), slot.st_len.min(out.len()));
+            }
+        }
+        true
     }
 
     /// Commit the accepted prefix: replay the first `n_pos` positions of

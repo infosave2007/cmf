@@ -546,6 +546,22 @@ pub struct MtpModule {
 /// CPU states receive the replay), and the attention layers with the CPU
 /// row count they were encoded against (the accepted rows are pulled from
 /// the mirror from there).
+/// One item of the Metal rows-graph plan.
+#[cfg(target_os = "macos")]
+enum MetalRowsItem<'a> {
+    Gdn {
+        run: Vec<crate::gpu_metal::GdnGpuLayer<'a>>,
+        first: usize,
+    },
+    Attn {
+        l: crate::gpu_metal::AttnGpuLayer<'a>,
+        li: usize,
+        q_norm: Option<&'a [f32]>,
+        k_norm: Option<&'a [f32]>,
+        output_gate: bool,
+    },
+}
+
 #[cfg(target_os = "macos")]
 struct MetalVerifyPending {
     graph: crate::gpu_metal::VerifyGraph,
@@ -2074,6 +2090,62 @@ impl Pipeline {
         // same graph as decode. Pure-attention models keep the batched
         // path — there the chunk-GEMM amortization wins.
         let graph_prefill = self.graph_prefill_preferred();
+        // Native Metal, q4tp GDN hybrids: the prompt through the b-row
+        // rows graph — projections as GEMMs over up to 512 positions, the
+        // GDN recurrence in registers on the device, K/V rows appended by
+        // the chunk — instead of one token-graph submit per position (the
+        // 27B: 8 tok/s → GEMM-bound). The MTP warm-up rows come out of one
+        // batched run of the block per chunk. Any refusal leaves the rest
+        // of the prompt to the sequential paths below.
+        #[cfg(target_os = "macos")]
+        if task_mask.is_none()
+            && !dyn_prefill
+            && crate::gpu::q1_force()
+            && crate::gpu::enabled_here()
+            && self.gdn_cfg.is_some()
+            && self.g3n.is_none()
+            && input_ids.len() > 8
+            && std::env::var("CMF_MTP_CHAIN_PROBE").is_err()
+            && std::env::var("CMF_METAL_PREFILL").as_deref() != Ok("0")
+        {
+            let chunk: usize = std::env::var("CMF_METAL_PREFILL_CHUNK")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&v| (16..=512).contains(&v))
+                .unwrap_or(256);
+            let hs = self.hidden_size;
+            let _tp = std::time::Instant::now();
+            while pos < input_ids.len() && !self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                let end = (pos + chunk).min(input_ids.len());
+                let Some(hb) = self.prefill_batch_metal(&input_ids[pos..end], pos) else {
+                    break;
+                };
+                if let Some(m) = &mut mtp {
+                    let n_pairs = if end < input_ids.len() { end - pos } else { end - pos - 1 };
+                    if n_pairs > 0 {
+                        let pairs: Vec<(&[f32], u32)> = (0..n_pairs)
+                            .map(|j| (&hb[j * hs..(j + 1) * hs], input_ids[pos + j + 1]))
+                            .collect();
+                        if !self.mtp_warm_batch_metal(m, &pairs, pos) {
+                            for (j, (h, t)) in pairs.iter().enumerate() {
+                                let h = h.to_vec();
+                                let _ = self.mtp_step(m, &h, *t, pos + j);
+                            }
+                        }
+                    }
+                }
+                hidden.copy_from_slice(&hb[(end - pos - 1) * hs..]);
+                pos = end;
+            }
+            if std::env::var("CMF_PREFILL_PROF").is_ok() {
+                eprintln!(
+                    "metal-prefill: {} of {} tokens in {:.1} ms",
+                    pos,
+                    input_ids.len(),
+                    _tp.elapsed().as_secs_f64() * 1e3
+                );
+            }
+        }
         if task_mask.is_none()
             && !dyn_prefill
             && !graph_prefill
@@ -6249,27 +6321,17 @@ impl Pipeline {
     /// graph in ONE submit (projections/FFN as GEMMs). `hiddens` is [k·hidden]
     /// in/out (embeddings in, layer output out); KV mirror / GDN state advance.
     /// false ⇒ unsupported → caller keeps the per-position graph.
-    /// Native-Metal twin of `try_batch_graph_wgpu`: the b rows through the
-    /// whole model on the `VerifyGraph` (one submit), the head folded in
-    /// when `spec` asks; `hiddens` come back as the last layer's output
-    /// rows, `spec.2` as `[b][lm_rows]` logits. The graph is parked in
-    /// `metal_verify` for `metal_verify_commit`. All-or-nothing: any layer
-    /// outside the graph's contract declines the whole batch (the caller
-    /// runs plain), nothing is half-encoded.
+    /// The b-row Metal graph plan for the whole model: every layer as a
+    /// GDN run or a full-attention item, all-or-nothing (a layer outside the
+    /// graph's contract → None, the caller runs plain). Shared by the
+    /// speculative verify and the batched prefill.
     #[cfg(target_os = "macos")]
-    fn try_batch_graph_metal(
-        &mut self,
-        hiddens: &mut [f32],
-        positions: &[usize],
-        b: usize,
-        spec: Option<((usize, usize, usize), &[f32], &mut Vec<f32>)>,
-    ) -> bool {
-        use crate::gpu_metal::{
-            AttnDeviceParams, AttnGpuLayer, GdnGpuCfg, GdnGpuLayer, GraphDims, MetalFfn, VerifyGraph,
-        };
-        let _t0 = std::time::Instant::now();
+    #[allow(clippy::type_complexity)]
+    fn metal_rows_plan(&self) -> Option<(Vec<MetalRowsItem<'_>>, std::sync::Arc<cortiq_core::CmfModel>, Option<crate::gpu_metal::GdnGpuCfg>)> {
+        use crate::gpu_metal::{AttnGpuLayer, GdnGpuCfg, GdnGpuLayer, MetalFfn};
         if !crate::gpu::q1_force()
             || !crate::gpu::enabled_here()
+            || std::env::var("CMF_GPU_BLOCK").map(|v| v == "0").unwrap_or(false)
             || self.attn_softcap > 0.0
             || self.o1_active()
             || self.swa.is_some()
@@ -6278,11 +6340,8 @@ impl Pipeline {
             || self.attn_v_norm
             || self.loop_final_norm
             || (self.attn_scale - 1.0 / (self.head_dim as f32).sqrt()).abs() > 1e-9
-            || positions.len() != b
-            || positions.windows(2).any(|w| w[1] != w[0] + 1)
-            || hiddens.len() != b * self.hidden_size
         {
-            return false;
+            return None;
         }
         let attend_contract = self.head_dim % 4 == 0
             && self.head_dim <= 256
@@ -6292,35 +6351,25 @@ impl Pipeline {
             && self.num_kv_heads > 0
             && self.num_heads % self.num_kv_heads == 0;
         if !attend_contract {
-            return false;
+            return None;
         }
-        enum Item<'a> {
-            Gdn { run: Vec<GdnGpuLayer<'a>>, first: usize },
-            Attn {
-                l: AttnGpuLayer<'a>,
-                li: usize,
-                q_norm: Option<&'a [f32]>,
-                k_norm: Option<&'a [f32]>,
-                output_gate: bool,
-            },
-        }
-        let mut plan: Vec<Item> = Vec::new();
+        let mut plan: Vec<MetalRowsItem> = Vec::new();
         let mut model_ref: Option<std::sync::Arc<cortiq_core::CmfModel>> = None;
         for li in 0..self.num_layers {
             let lw = &self.weights.layers[self.phys_layer(li)];
             if lw.attn_out_norm.is_some() || lw.ffn_out_norm.is_some() || lw.layer_scale.is_some() {
-                return false;
+                return None;
             }
             let ffn = match &lw.ffn {
                 FfnKind::Dense(d) if d.act == Act::Silu => {
                     let (Some(g), Some(u), Some(dn)) =
                         (d.gate_proj.q1_parts(), d.up_proj.q1_parts(), d.down_proj.q1_parts())
                     else {
-                        return false;
+                        return None;
                     };
                     MetalFfn::Dense { gate: g, up: u, down: dn }
                 }
-                _ => return false,
+                _ => return None,
             };
             match &lw.attn {
                 AttnKind::LinearGdn(w) if self.gdn_cfg.is_some() => {
@@ -6331,7 +6380,7 @@ impl Pipeline {
                         w.in_proj_b.f32_parts(),
                         w.out_proj.q1_parts(),
                     ) else {
-                        return false;
+                        return None;
                     };
                     if let QTensor::Mapped { model, .. } = &w.in_proj_qkv {
                         model_ref.get_or_insert_with(|| model.clone());
@@ -6351,8 +6400,8 @@ impl Pipeline {
                         gnorm: &w.norm,
                     };
                     match plan.last_mut() {
-                        Some(Item::Gdn { run, .. }) => run.push(gl),
-                        _ => plan.push(Item::Gdn { run: vec![gl], first: li }),
+                        Some(MetalRowsItem::Gdn { run, .. }) => run.push(gl),
+                        _ => plan.push(MetalRowsItem::Gdn { run: vec![gl], first: li }),
                     }
                 }
                 AttnKind::Full {
@@ -6369,16 +6418,16 @@ impl Pipeline {
                     let (Some(pq), Some(pk), Some(pv), Some(po)) =
                         (wq.q1_parts(), wk.q1_parts(), wv.q1_parts(), wo.q1_parts())
                     else {
-                        return false;
+                        return None;
                     };
                     if let QTensor::Mapped { model, .. } = wq {
                         model_ref.get_or_insert_with(|| model.clone());
                     }
                     let cache = &self.kv_cache.layers[li];
                     if cache.mode != crate::kv_cache::KvMode::F32 || cache.o1.is_some() {
-                        return false;
+                        return None;
                     }
-                    plan.push(Item::Attn {
+                    plan.push(MetalRowsItem::Attn {
                         l: AttnGpuLayer {
                             attn_norm: &lw.input_norm,
                             post_norm: &lw.post_norm,
@@ -6394,15 +6443,10 @@ impl Pipeline {
                         output_gate: *output_gate,
                     });
                 }
-                _ => return false,
+                _ => return None,
             }
         }
-        let Some(model) = model_ref else { return false };
-        let dims = GraphDims {
-            hidden: self.hidden_size,
-            eps: self.rms_eps as f32,
-            gemma: self.norm_style == cortiq_core::NormStyle::Gemma,
-        };
+        let model = model_ref?;
         let gcfg = self.gdn_cfg.map(|cfg| GdnGpuCfg {
             nv: cfg.num_v_heads,
             nk: cfg.num_k_heads,
@@ -6415,89 +6459,114 @@ impl Pipeline {
             eps: cfg.rms_eps as f32,
             gemma: self.norm_style == cortiq_core::NormStyle::Gemma,
         });
+        Some((plan, model, gcfg))
+    }
+
+    /// `AttnDeviceParams` for a plan item over the CPU cache as it stands.
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::too_many_arguments)]
+    fn metal_attn_params<'a>(
+        li: usize,
+        cache: &'a crate::kv_cache::LayerKvCache,
+        q_norm: Option<&'a [f32]>,
+        k_norm: Option<&'a [f32]>,
+        output_gate: bool,
+        inv_freq: &'a [f32],
+        geom: (usize, usize, usize, usize),
+        pos0: usize,
+        kv_id: u64,
+        eps: f32,
+        gemma: bool,
+    ) -> (crate::gpu_metal::AttnDeviceParams<'a>, usize) {
+        let (nh, nkv, hd, rd) = geom;
+        let cpu_k: Vec<&[f32]> = (0..nkv).map(|g| cache.head_keys(g)).collect();
+        let cpu_v: Vec<&[f32]> = (0..nkv).map(|g| cache.head_values(g)).collect();
+        let cpu_stored = cpu_k[0].len() / hd;
+        (
+            crate::gpu_metal::AttnDeviceParams {
+                kv_id,
+                layer: li,
+                nh,
+                nkv,
+                hd,
+                rd,
+                position: pos0,
+                eps,
+                gemma,
+                output_gate,
+                q_norm,
+                k_norm,
+                inv_freq,
+                cpu_k,
+                cpu_v,
+                cpu_stored,
+                o1: None,
+            },
+            cpu_stored,
+        )
+    }
+
+    /// Run the rows plan over `hiddens` (b rows at `pos0..`): validate,
+    /// encode every item, optionally the head, sync. Returns the graph
+    /// (for the commit / state finish) plus the GDN layer indices and the
+    /// attention layers with the row count they were encoded against.
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::type_complexity)]
+    fn metal_rows_run(
+        &mut self,
+        hiddens: &mut [f32],
+        pos0: usize,
+        b: usize,
+        prefill: bool,
+        spec: Option<((usize, usize, usize), &[f32], &mut Vec<f32>)>,
+    ) -> Option<MetalVerifyPending> {
+        use crate::gpu_metal::{GraphDims, VerifyGraph};
         let want = self.gdn_cfg.map(|c| c.state_len()).unwrap_or(0);
         for l in &mut self.kv_cache.layers {
             if l.linear_state.len() != want && want > 0 {
                 l.linear_state = vec![0f32; want];
             }
         }
-        let Some(mut graph) = VerifyGraph::new(&model, dims, hiddens, b) else {
-            return false;
+        let (plan, model, gcfg) = self.metal_rows_plan()?;
+        let dims = GraphDims {
+            hidden: self.hidden_size,
+            eps: self.rms_eps as f32,
+            gemma: self.norm_style == cortiq_core::NormStyle::Gemma,
         };
-        let (nh, nkv, hd, rd) = (self.num_heads, self.num_kv_heads, self.head_dim, self.rotary_dim);
+        let mut graph = if prefill {
+            VerifyGraph::new_prefill(&model, dims, hiddens, b)?
+        } else {
+            VerifyGraph::new(&model, dims, hiddens, b)?
+        };
+        let geom = (self.num_heads, self.num_kv_heads, self.head_dim, self.rotary_dim);
         let gemma = self.norm_style == cortiq_core::NormStyle::Gemma;
         let eps = self.rms_eps as f32;
         let kv_id = self.graph_kv_id;
         let inv_freq = self.inv_freq.clone();
-        let pos0 = positions[0];
-        fn mk_params<'a>(
-            li: usize,
-            cache: &'a crate::kv_cache::LayerKvCache,
-            q_norm: Option<&'a [f32]>,
-            k_norm: Option<&'a [f32]>,
-            output_gate: bool,
-            inv_freq: &'a [f32],
-            geom: (usize, usize, usize, usize),
-            pos0: usize,
-            kv_id: u64,
-            eps: f32,
-            gemma: bool,
-        ) -> (AttnDeviceParams<'a>, usize) {
-            let (nh, nkv, hd, rd) = geom;
-            let cpu_k: Vec<&[f32]> = (0..nkv).map(|g| cache.head_keys(g)).collect();
-            let cpu_v: Vec<&[f32]> = (0..nkv).map(|g| cache.head_values(g)).collect();
-            let cpu_stored = cpu_k[0].len() / hd;
-            (
-                AttnDeviceParams {
-                    kv_id,
-                    layer: li,
-                    nh,
-                    nkv,
-                    hd,
-                    rd,
-                    position: pos0,
-                    eps,
-                    gemma,
-                    output_gate,
-                    q_norm,
-                    k_norm,
-                    inv_freq,
-                    cpu_k,
-                    cpu_v,
-                    cpu_stored,
-                    o1: None,
-                },
-                cpu_stored,
-            )
-        }
-        let geom = (nh, nkv, hd, rd);
-        // Validate everything before encoding anything.
         for item in &plan {
             let ok = match item {
-                Item::Gdn { run, .. } => gcfg
+                MetalRowsItem::Gdn { run, .. } => gcfg
                     .as_ref()
                     .map(|gc| run.iter().all(|l| graph.gdn_ok(l, gc)))
                     .unwrap_or(false),
-                Item::Attn { l, li, q_norm, k_norm, output_gate } => {
-                    let (p, _) = mk_params(*li, &self.kv_cache.layers[*li], *q_norm, *k_norm, *output_gate, &inv_freq, geom, pos0, kv_id, eps, gemma);
+                MetalRowsItem::Attn { l, li, q_norm, k_norm, output_gate } => {
+                    let (p, _) = Self::metal_attn_params(*li, &self.kv_cache.layers[*li], *q_norm, *k_norm, *output_gate, &inv_freq, geom, pos0, kv_id, eps, gemma);
                     graph.attn_ok(l, &p)
                 }
             };
             if !ok {
-                {
-                    use std::sync::atomic::{AtomicBool, Ordering};
-                    static SAID: AtomicBool = AtomicBool::new(false);
-                    if !SAID.swap(true, Ordering::Relaxed) {
-                        tracing::warn!("metal verify graph: a layer failed preflight — speculation declines");
-                    }
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static SAID: AtomicBool = AtomicBool::new(false);
+                if !SAID.swap(true, Ordering::Relaxed) {
+                    tracing::warn!("metal rows graph: a layer failed preflight — declining");
                 }
-                return false;
+                return None;
             }
         }
         let lm = match &spec {
             Some((lm, _, _)) => {
                 if !graph.lm_head_ok(*lm) {
-                    return false;
+                    return None;
                 }
                 Some(*lm)
             }
@@ -6507,20 +6576,20 @@ impl Pipeline {
         let mut attn_layers = Vec::new();
         for item in &plan {
             match item {
-                Item::Gdn { run, first } => {
+                MetalRowsItem::Gdn { run, first } => {
                     let ro: Vec<&[f32]> = self.kv_cache.layers[*first..*first + run.len()]
                         .iter()
                         .map(|l| l.linear_state.as_slice())
                         .collect();
                     if !graph.encode_gdn_run_b(run, &ro, gcfg.as_ref().unwrap()) {
-                        return false;
+                        return None;
                     }
                     gdn_layers.extend(*first..*first + run.len());
                 }
-                Item::Attn { l, li, q_norm, k_norm, output_gate } => {
-                    let (p, cpu_stored) = mk_params(*li, &self.kv_cache.layers[*li], *q_norm, *k_norm, *output_gate, &inv_freq, geom, pos0, kv_id, eps, gemma);
+                MetalRowsItem::Attn { l, li, q_norm, k_norm, output_gate } => {
+                    let (p, cpu_stored) = Self::metal_attn_params(*li, &self.kv_cache.layers[*li], *q_norm, *k_norm, *output_gate, &inv_freq, geom, pos0, kv_id, eps, gemma);
                     if !graph.encode_attn_b(l, &p) {
-                        return false;
+                        return None;
                     }
                     attn_layers.push((*li, cpu_stored));
                 }
@@ -6528,26 +6597,89 @@ impl Pipeline {
         }
         if let (Some(lm), Some((_, final_norm, _))) = (lm, spec.as_ref()) {
             if !graph.encode_lm_head_b(final_norm, lm) {
-                return false;
+                return None;
             }
         }
-        let _t_enc = _t0.elapsed();
         graph.sync();
-        let _t_sync = _t0.elapsed();
         if let Some((lm, _, logits)) = spec {
             logits.resize(b * lm.1, 0.0);
             graph.read_logits(logits);
         }
         graph.read_hidden(hiddens);
-        if std::env::var("CMF_GRAPH_SPEC_TIME").is_ok() {
-            eprintln!(
-                "metal-verify: encode {:.1} ms | gpu+wait {:.1} ms | b={b}",
-                _t_enc.as_secs_f64() * 1e3,
-                (_t_sync - _t_enc).as_secs_f64() * 1e3
-            );
+        Some(MetalVerifyPending { graph, gdn_layers, attn_layers })
+    }
+
+    /// Native-Metal twin of `try_batch_graph_wgpu`: the b rows through the
+    /// whole model on the `VerifyGraph` (one submit), the head folded in
+    /// when `spec` asks; `hiddens` come back as the last layer's output
+    /// rows, `spec.2` as `[b][lm_rows]` logits. The graph is parked in
+    /// `metal_verify` for `metal_verify_commit`.
+    #[cfg(target_os = "macos")]
+    fn try_batch_graph_metal(
+        &mut self,
+        hiddens: &mut [f32],
+        positions: &[usize],
+        b: usize,
+        spec: Option<((usize, usize, usize), &[f32], &mut Vec<f32>)>,
+    ) -> bool {
+        let _t0 = std::time::Instant::now();
+        if positions.len() != b
+            || positions.windows(2).any(|w| w[1] != w[0] + 1)
+            || hiddens.len() != b * self.hidden_size
+        {
+            return false;
         }
-        self.metal_verify = Some(MetalVerifyPending { graph, gdn_layers, attn_layers });
+        let Some(pending) = self.metal_rows_run(hiddens, positions[0], b, false, spec) else {
+            return false;
+        };
+        if std::env::var("CMF_GRAPH_SPEC_TIME").is_ok() {
+            eprintln!("metal-verify: {:.1} ms | b={b}", _t0.elapsed().as_secs_f64() * 1e3);
+        }
+        self.metal_verify = Some(pending);
         true
+    }
+
+    /// Batched prefill on the Metal rows graph: `ids` (≤ 512) at
+    /// `start_pos..`, states written in place, K/V rows appended to the
+    /// CPU caches; returns every position's output hidden (`[b][hidden]`).
+    /// None = the graph declined before touching anything.
+    #[cfg(target_os = "macos")]
+    fn prefill_batch_metal(&mut self, ids: &[u32], start_pos: usize) -> Option<Vec<f32>> {
+        let b = ids.len();
+        if b == 0 || b > 512 {
+            return None;
+        }
+        let hs = self.hidden_size;
+        let mut hiddens = vec![0f32; b * hs];
+        for (j, &id) in ids.iter().enumerate() {
+            let e = self.embed_single(id);
+            hiddens[j * hs..(j + 1) * hs].copy_from_slice(&e);
+        }
+        let mut pending = self.metal_rows_run(&mut hiddens, start_pos, b, true, None)?;
+        // states are final: copy them to the owners
+        let idxs = pending.gdn_layers.clone();
+        let mut outs: Vec<&mut [f32]> = self
+            .kv_cache
+            .layers
+            .iter_mut()
+            .enumerate()
+            .filter(|(i, _)| idxs.binary_search(i).is_ok())
+            .map(|(_, l)| l.linear_state.as_mut_slice())
+            .collect();
+        pending.graph.finish_states(&mut outs);
+        let (nkv, hd) = (self.num_kv_heads, self.head_dim);
+        let mut kbuf = vec![0f32; b * nkv * hd];
+        let mut vbuf = vec![0f32; b * nkv * hd];
+        for (li, cpu_stored) in &pending.attn_layers {
+            if crate::gpu_metal::kv_mirror_read_rows(self.graph_kv_id, *li, nkv, hd, *cpu_stored, b, &mut kbuf, &mut vbuf) {
+                let cache = &mut self.kv_cache.layers[*li];
+                for r in 0..b {
+                    cache.append(&kbuf[r * nkv * hd..(r + 1) * nkv * hd], &vbuf[r * nkv * hd..(r + 1) * nkv * hd], &[]);
+                }
+                crate::gpu_metal::kv_mirror_set_stored(self.graph_kv_id, *li, cpu_stored + b);
+            }
+        }
+        Some(hiddens)
     }
 
     /// Commit a Metal verify round: replay the GDN recurrences over the
@@ -6596,7 +6728,7 @@ impl Pipeline {
     fn mtp_warm_batch_metal(&mut self, m: &mut MtpModule, pairs: &[(&[f32], u32)], first_pos: usize) -> bool {
         use crate::gpu_metal::{AttnDeviceParams, AttnGpuLayer, GraphDims, MetalFfn, VerifyGraph};
         let b = pairs.len();
-        if b == 0 || b > 8 || m.kv.mode != crate::kv_cache::KvMode::F32 || m.kv.o1.is_some() {
+        if b == 0 || b > 512 || m.kv.mode != crate::kv_cache::KvMode::F32 || m.kv.o1.is_some() {
             return false;
         }
         let AttnKind::Full { wq, wk, wv, wo, q_norm, k_norm, output_gate, softplus_gate: None, bias: None } = &m.layer.attn else {

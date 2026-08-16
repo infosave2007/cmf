@@ -20,8 +20,9 @@ fn metal_q4tp_matmat_cost_by_batch() {
         let (rows, cols) = (e.shape[0], e.shape[1]);
         let mb = e.nbytes as f64 / 1e6;
         for (which, label) in [(0u32, "mv1"), (1, "bk"), (2, "gemm"), (3, "n8")] {
-            for &b in &[1usize, 2, 5, 8] {
+            for &b in &[1usize, 2, 5, 8, 128, 256, 512] {
                 if which == 0 && b != 1 { continue; }
+                if which != 2 && b > 8 { continue; }
                 if let Some(ms) = cortiq_engine::gpu_metal::q4tp_kernel_bench(&model, idx, b, rows, cols, which, 20) {
                     println!("KERNEL {label:4} {name} b={b}: {ms:6.3} ms/dispatch  ({:.0} GB/s of weight)", mb / ms);
                 }
