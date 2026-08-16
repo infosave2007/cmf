@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Speculation does not default on over **wgpu/Metal**: the batched
+  verify graph there returned 0 accepted drafts and garbage text on
+  Qwen3.5-0.8B (the plain graph is fine, Vulkan is bit-exact). The Mac's
+  default backend is native Metal, which has no batch graph, so this
+  only touched `CMF_GPU=wgpu` on macOS; `CMF_GRAPH_SPEC=1` still forces
+  it, with a warning, for the investigation.
+
 ## [0.5.80] - 2026-08-16
 
 The Qwen3.8-27B q4tp release, converted straight from the bf16
