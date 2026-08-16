@@ -1403,3 +1403,20 @@ kernel void moe_init_mu_f32(
     uint e = gid / a.H, j = gid % a.H;
     mu[gid] = x[(ulong)rows[e] * a.H + j];
 }
+
+// hgc[e][slot] = hg[e][slot] − μ_e for slot < count_e (0 beyond) — centred
+// rows for the descriptor covariance.
+kernel void moe_center_f32(
+    device const float* hg    [[buffer(0)]],
+    device const float* mu    [[buffer(1)]],   // [E, H]
+    device const uint*  count [[buffer(2)]],   // [E]
+    device float*       hgc   [[buffer(3)]],
+    constant RouteArgs& a     [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])   // over E·cap·H
+{
+    if (gid >= a.E * a.cap * a.H) return;
+    uint j = gid % a.H;
+    uint es = gid / a.H;
+    uint e = es / a.cap, s = es % a.cap;
+    hgc[gid] = (s < min(count[e], a.cap)) ? hg[gid] - mu[e * a.H + j] : 0.0f;
+}

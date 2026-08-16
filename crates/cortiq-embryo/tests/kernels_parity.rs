@@ -368,3 +368,29 @@ fn hybrid_k_gemm_formulation_matches_oracle_and_simt() {
         }
     }
 }
+
+#[test]
+fn top_eigenvectors_recover_a_planted_subspace() {
+    use cortiq_embryo::model::top_eigenvectors;
+    // A = Σ_i λ_i v_i v_iᵀ with 3 strong planted directions in R^32
+    let n = 32;
+    let dirs = [3usize, 11, 27];
+    let mut a = vec![0.0f32; n * n];
+    for (i, &d) in dirs.iter().enumerate() {
+        let lam = 10.0 - i as f32;
+        a[d * n + d] += lam;
+    }
+    // small noise on the rest of the diagonal
+    for i in 0..n {
+        if !dirs.contains(&i) {
+            a[i * n + i] += 0.01 * (i as f32);
+        }
+    }
+    let u = top_eigenvectors(&a, n, 3, 30, 1);
+    // each recovered row must lie in the planted span (projection energy > 0.999)
+    for r in 0..3 {
+        let row = &u[r * n..(r + 1) * n];
+        let energy: f32 = dirs.iter().map(|&d| row[d] * row[d]).sum();
+        assert!(energy > 0.999, "row {r}: energy in the planted span {energy}");
+    }
+}
