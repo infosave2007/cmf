@@ -16,6 +16,49 @@ aquarium example.
 
 ### Added
 
+- **The int8-activation batched verify** (`CMF_VERIFY_I8=1`,
+  `q4tp_matvec4_bk8`): the speculative verify's rows on int8
+  activations (per-32 symmetric, the Q8_1 grid) and `dot4I8Packed` —
+  a weight word's eight nibbles become two packed int8x4 shared across
+  the batch, each element costs two dp4a per word against 32 FMAs and
+  a share of 32 unpacks before; one pipeline per batch size (constant
+  `NB8`) so the element loop unrolls. Measured on the RTX 5090,
+  Qwen3.8-27B q4tp, `bench --core`: plain 48.5, speculative f32 66.4,
+  **speculative int8 76.3 tok/s (k=5)**; a code prompt at 2.3k
+  context 45.7 → 51.7 (f32) → **56.4** (int8); acceptance unchanged.
+  Not the plain path's bits (a near-tie can resolve differently — the
+  essay diverged, the aquarium did not), hence opt-in; the parity test
+  bounds the drift at 4.7e-3 rel rms.
+- **The speculation monitor** replaces the one-shot trial: an
+  exponential average of tokens-per-round and round time against the
+  measured plain token decides on EVERY round (stop after four losing
+  rounds, retry 128 tokens later). The trial mis-called prose (the
+  formulaic first rounds accept well, the body does not: an essay
+  measured 39 against a plain 44.8 while "speculating"); with the
+  monitor prose sits at the plain rate (46.5 vs 45.3–47.7) and code
+  keeps its gain.
+- **FCD tail heal** of a quantized file (`tools/fcd_tail_heal.py`):
+  layers 0..61 as the file has them (dequantized), the last two layers
+  + final norm trained against the bf16 teacher (0.3·CE + 0.7·KL on
+  the teacher's top-64), 200 AdamW steps at 2e-5 on 32k calibration
+  tokens, best checkpoint by held-out score, exported through
+  `patch-tensor`. Measured, wikitext-2 12×512 (`cortiq ppl`): **q4tp
+  8.793 → 8.467** (tail at f16, +1.1 GB), **q2tp 14.333 → 12.580**;
+  the teacher itself scores 9.14 against the q4tp student's 9.51 in
+  the same torch harness, so the heal closes most of the 4-bit gap on
+  this eval — with the caveat that wikitext-train was in the
+  calibration mix (the held-out code/chat rows improved too: CE 2.208
+  → 2.174, KL to teacher 0.099 → 0.094). A tail at f16 has no token-
+  graph arm and decodes at 6.8 tok/s; the q8_2f tail is the shippable
+  form (below).
+- **NVG holographic fold** of Qwen3.8-27B to the per-layer Qwen3.5-9B
+  configuration (FFN 12288, 16 attention heads, 32 GDN value heads;
+  `tools/nvg_fold_qwen35.py`, math in docs/NVG_FOLD_ATTN_GDN.ru.md):
+  19.84B parameters, q4tp 10.37 GB, closed form from activation Grams
+  on 32k tokens, no training. Measured: ppl 11.97 (×1.36 the 27B's
+  8.79), decode 58.7 tok/s (+20%); the essay is coherent with dated
+  facts, the aquarium prompt gets a plan and an early stop — a heal
+  (KD from the 27B) is what makes this a model, not the fold alone.
 - **The sparse sampler chain** for configs with a top-k (Qwen's own
   rows: 0.7/0.8/20 and 1.0/0.95/20): the dense chain built six or
   seven passes over 248k floats per token — copy, exp, select,
