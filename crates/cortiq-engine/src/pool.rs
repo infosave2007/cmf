@@ -473,6 +473,16 @@ fn pin_thread_to_big_cores() {
 fn worker_loop(inner: &Inner, idx: usize) {
     #[cfg(target_os = "android")]
     pin_thread_to_big_cores();
+    // Apple silicon: ask for the performance cores. Threads spawned
+    // without a QoS class land on the efficiency cores when the
+    // scheduler feels like it — a user's video-VAE encode on an M4 sat
+    // on the E-cores at 100% with the P-cores asleep for 140 s (HF
+    // discussion #4). USER_INITIATED is the class an interactive tool's
+    // work belongs to; the ~4 P-cores then take the pool's grains.
+    #[cfg(target_os = "macos")]
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0);
+    }
 
     // The pool is created at epoch 0; baseline MUST be 0, not a fresh
     // epoch read — if the caller publishes a job before the OS actually

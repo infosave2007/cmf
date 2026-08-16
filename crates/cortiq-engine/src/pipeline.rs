@@ -3293,8 +3293,8 @@ impl Pipeline {
         // 4 since the draft moved onto the graph (Qwen3.8-27B / 5090:
         // k=3 51.2, k=4 51.8 with the per-op draft; the graph draft
         // halves the draft cost, so the extra draft is cheaper still).
-        // 5 with the int8 verify (measured 76.5 against k=4's 72-74 and
-        // k=6's 74 on the 5090), 4 with the f32 one.
+        // 5 with the int8 verify (the default: measured 76.5 against
+        // k=4's 72-74 and k=6's 74 on the 5090), 4 with the f32 one.
         #[cfg(feature = "gpu")]
         let k_default = if crate::gpu_wgpu::verify_i8_on() { 5 } else { 4 };
         #[cfg(not(feature = "gpu"))]

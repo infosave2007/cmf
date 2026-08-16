@@ -212,7 +212,7 @@ encoder pages, and on this workload paging costs more than any kernel.
 ### Field notes: 24 GB Macs and 20 GB cards
 
 Two users measured what this card could not, and the engine changed on
-both reports (HF discussions #1 and #2). The numbers, as they sent them:
+their reports (HF discussions #1, #2 and #4). The numbers, as they sent them:
 
 | machine | file | render | result |
 |---|---|---|---|
@@ -222,6 +222,9 @@ both reports (HF discussions #1 and #2). The numbers, as they sent them:
 | Mac mini M4 24 GB | `mmh3-turbo-clipproj4b-fl2va-q4tp` (14.5 GB) | 22 frames from a keyframe | **92 s**, no swap |
 | Mac mini M4 24 GB | `mmh3-turbo-fl2va-q4tp` (25.7 GB), 0.5.79 | 10 / 40 frames | **48 s / 140 s per denoise step** on the GPU, 20 GB resident, 0.3 GB swap |
 | Mac mini M4 24 GB | same, 150 frames | | 8 GB of swap and a sawtooth — the activation cache no longer fits |
+| Mac mini M4 24 GB | `mmh3-turbo-clipproj4b-fl2va-v2-q4tp` (14.5 GB) | 448×768, 50 frames | **136 s per denoise step**, faces hold through the clip; 90 frames at that size is the paging threshold |
+| Mac mini M4 24 GB | `mmh3-turbo-fl2va-q4tp` (25.7 GB) | 512×256 | safe to ~70–90 frames; **768×448 caps at 40–50** (90 frames: 22.2 GB RAM + 1.1 GB swap, the GPU stalls) |
+| Mac mini M4 24 GB | any file, `--first-frame` | | the video-VAE **encoder** of the keyframe ran ~100–140 s on the CPU (`encode 0/1 (140.8s)`); text-to-video skips it (0.1 s) |
 
 What follows from them, if you are on such a machine:
 
@@ -241,10 +244,30 @@ What follows from them, if you are on such a machine:
   that were not resident, and `CMF_MM_KILL=0` turns it off. If a run still
   says `device contended, CPU for the rest of the process` on a machine
   nobody else is using, that variable is the answer.
-- **The draft → final workflow.** Block the shot on `clipproj4b-fl2va`
-  (90 s on the Mac), then pay the full encoder once for the final take.
-  The v2 clipproj projection keeps faces through a clip; identity of
-  specific real people is still the full encoder's territory.
+- **The kill is disarmed during the prompt encode (0.5.80).** The
+  encoder is a one-shot pass over 12 GB of weights; on a machine the file
+  does not fit it streams from disk, and its GEMMs run over any budget
+  for reasons that are not contention — the report that had to gut
+  `mm_kill` in the source was on exactly that. The kill now arms only
+  when the denoise loop starts, and three strikes are still needed.
+- **The keyframe encode is CPU work today.** With `--first-frame` the
+  video-VAE encoder runs the reference picture on the host (~100–140 s
+  on an M4 for a 448×768 frame; 0.1 s without a keyframe). 0.5.80 puts
+  the pool's workers on the performance cores (they were landing on the
+  E-cores with the P-cores asleep — that report's `asitop`), which
+  shortens it; a device path for the encoder's 3-D convolutions is the
+  real fix and is on the list.
+- **Frame budgets on 24 GB, from that user's sweep:** with the 25.7 GB
+  file 512×256 is safe to ~70–90 frames and 768×448 caps at 40–50; with
+  the 14.5 GB v2 file 448×768 at 50 frames is the sweet spot (136 s per
+  step) and 90 frames is where paging starts. Past those the machine
+  swaps and the GPU stalls to nothing — better to chain clips than to
+  push the frame count.
+- **The draft → final workflow.** Block the shot on `clipproj4b-fl2va-v2`
+  (90 s on the Mac; v2 holds faces through a clip — "25 GB-level face
+  consistency at 14 GB speed", that user's words), then pay the full
+  encoder once for the final take. Identity of *specific* real people is
+  still the full encoder's territory.
 - **`--height 256` instead of 288** halves the video-VAE decode on every
   machine (three 256-pixel tiles instead of six).
 - **Voices are prompt space.** There is no reference-audio input — H3

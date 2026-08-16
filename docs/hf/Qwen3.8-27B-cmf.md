@@ -29,15 +29,19 @@ Intel and Apple silicon run the same file.
 
 | file | bits | size | decode, RTX 5090 | wikitext-2 ppl |
 |---|---|---|---|---|
-| `qwen38-27b-q4tp.cmf` | 4-bit tiled, ladder scales | **14.3 GB** | 48.6 tok/s plain · **60 tok/s** greedy with speculative decode | **8.79** |
+| `qwen38-27b-q4tp.cmf` | 4-bit tiled, ladder scales | **14.3 GB** | 48.7 tok/s plain · **76 tok/s** greedy with speculative decode (66 with the bit-exact f32 verify) | **8.79** |
 | `qwen38-27b-q4t.cmf` | 4-bit tiled | 15.4 GB | 49.4 tok/s plain | 8.86 |
-| `qwen38-27b-q8_2f.cmf` | 8-bit | 27.4 GB | 28.9 tok/s | — |
+| `qwen38-27b-q8_2f.cmf` | 8-bit | 27.4 GB | 33.0 tok/s | — |
 
-Steady-state decode over Vulkan, single stream, `cortiq bench` on one
-harness (medians of three; the q8_2f row is from an earlier session);
-perplexity on the same twelve 512-token windows of wikitext-2. The
+Steady-state decode over Vulkan, single stream, `cortiq bench --core`
+on one harness (0.5.80, medians of runs), speculative rows on the
+bench's own text; on a real prompt the gain depends on how well the
+draft head agrees with the trunk — a 2.3k-token code prompt decodes at
+56.5 tok/s against 45.7 plain, an essay sits at the plain rate because
+the engine's monitor stops speculation where it does not pay.
+Perplexity on the same twelve 512-token windows of wikitext-2. The
 family is memory-bandwidth-bound, so the 4-bit files are not just
-smaller — they decode ~1.6× faster than 8-bit.
+smaller — they decode ~1.5× faster than 8-bit.
 
 **q4tp** keeps q4t's nibbles and stores each 32-weight tile's scale as
 a rung on a per-row ladder: 7.5% fewer bytes at the same quality (its
@@ -50,14 +54,19 @@ size pick.
 
 **Speculative decode is on by default for greedy** (`--greedy`, or a
 server request with `temperature: 0`) on Vulkan graphs since 0.5.80:
-the model's own MTP head drafts four tokens, one batched submit
-verifies them, and the verify lands on the plain token's bits — the
-greedy continuation is identical to the plain one, only faster. It
-turns itself off for the rest of a generation if the head stops
-agreeing with the trunk. `CMF_GRAPH_SPEC=0` disables it. Sampling
-(temperature > 0) stays on the plain path — the speculative
-*sampling* arm exists (`CMF_GRAPH_SPEC_SAMPLE=1`, exact by
-construction) but measured slower on this card.
+the model's own MTP head drafts five tokens, one batched submit
+verifies them on an int8-activation matvec, and a monitor keeps
+averaging tokens-per-round against the plain token — it stops
+speculation after four losing rounds (free prose often does not pay)
+and retries later, so a prompt that gains keeps the gain and one that
+does not sits at the plain rate. `CMF_VERIFY_I8=0` switches the verify
+to f32 (66 tok/s on the bench) and makes the greedy continuation
+byte-identical to the plain path; the int8 default can resolve a
+near-tie differently — a different but equally greedy continuation.
+`CMF_GRAPH_SPEC=0` disables speculation. Sampling (temperature > 0)
+stays on the plain path — the speculative *sampling* arm exists
+(`CMF_GRAPH_SPEC_SAMPLE=1`, exact by construction) but at the instruct
+row 60% of drafts are accepted and the round breaks even.
 
 ## Server and API
 
@@ -289,15 +298,18 @@ cortiq run qwen38-27b-q4t.cmf --prompt "Объясни квиксорт в тр�
 
 | файл | биты | размер | декод, RTX 5090 | ppl wikitext-2 |
 |---|---|---|---|---|
-| `qwen38-27b-q4tp.cmf` | 4, лестница масштабов | **14.3 ГБ** | 48.6 tok/s · **60 tok/s** greedy со спекуляцией | **8.79** |
+| `qwen38-27b-q4tp.cmf` | 4, лестница масштабов | **14.3 ГБ** | 48.7 tok/s · **76 tok/s** greedy со спекуляцией (66 с побитово точной f32-проверкой) | **8.79** |
 | `qwen38-27b-q4t.cmf` | 4 | 15.4 ГБ | 49.4 tok/s | 8.86 |
-| `qwen38-27b-q8_2f.cmf` | 8 | 27.4 ГБ | 28.9 tok/s | — |
+| `qwen38-27b-q8_2f.cmf` | 8 | 27.4 ГБ | 33.0 tok/s | — |
 
-Все числа — один стенд и один бенч (`cortiq bench`, медианы трёх; строка
-q8_2f — из более ранней сессии); ppl на одних и тех же 12 окнах по 512
-токенов. Семейство упирается в пропускную способность памяти, поэтому
-4-битные файлы не только меньше — они и декодируют в ~1.6× быстрее
-8-битного.
+Все числа — один стенд и один бенч (`cortiq bench --core`, 0.5.80,
+медианы); спекулятивные — на тексте самого бенча, на реальном промпте
+выигрыш зависит от согласия черновой головы с моделью: код на 2.3k
+контекста — 56.5 против 45.7 tok/s, эссе идёт на скорости plain (монитор
+сам останавливает спекуляцию там, где она не окупается). ppl на одних и
+тех же 12 окнах по 512 токенов. Семейство упирается в пропускную
+способность памяти, поэтому 4-битные файлы не только меньше — они и
+декодируют в ~1.5× быстрее 8-битного.
 
 **q4tp** хранит те же ниблы, что q4t, а масштаб каждой плитки из 32 весов —
 как ступень на построчной лестнице: на 7.5% меньше байт при том же качестве
@@ -305,11 +317,18 @@ q8_2f — из более ранней сессии); ppl на одних и т�
 квантованы прямо из bf16-чекпойнта (потоково с HF), не один из другого.
 **Спекулятивный декод включён по умолчанию для greedy** (`--greedy` или
 `temperature: 0` в запросе к серверу) на Vulkan с 0.5.80: собственная
-MTP-голова модели предлагает четыре токена, один батч-сабмит их проверяет,
-и проверка ложится на те же биты, что обычный токен, — greedy-продолжение
-идентично обычному, только быстрее; при плохом согласии головы с моделью
-спекуляция сама выключается до конца генерации. `CMF_GRAPH_SPEC=0`
-отключает. Сэмплинг (temperature > 0) идёт обычным путём.
+MTP-голова модели предлагает пять токенов, один батч-сабмит проверяет
+их матвеком на int8-активациях, а монитор всё время сравнивает токены за
+раунд с обычным токеном — после четырёх проигрышных раундов спекуляция
+останавливается (проза часто не окупается) и позже пробуется снова, так
+что промпт, который выигрывает, выигрыш сохраняет, а который нет — идёт
+на скорости plain. `CMF_VERIFY_I8=0` переводит проверку на f32 (66 tok/s
+на бенче) и делает greedy-продолжение побитово идентичным обычному; int8
+по умолчанию может иначе разрешить близкий тай-брейк — другое, но столь
+же greedy продолжение. `CMF_GRAPH_SPEC=0` отключает спекуляцию. Сэмплинг
+(temperature > 0) идёт обычным путём (спекулятивный сэмплинг есть за
+`CMF_GRAPH_SPEC_SAMPLE=1`, но на instruct-ряду принимается 60% черновиков
+и раунд выходит в ноль).
 
 **Сервер с OpenAI-совместимым API:** `cortiq serve qwen38-27b-q4t.cmf
 --port 8080` — работают `/v1/chat/completions`, `/v1/completions`,
@@ -376,21 +395,26 @@ cortiq run qwen38-27b-q4t.cmf --prompt "用三句话解释快速排序。"
 
 | 文件 | 位宽 | 大小 | 解码速度（RTX 5090） | wikitext-2 困惑度 |
 |---|---|---|---|---|
-| `qwen38-27b-q4tp.cmf` | 4 位，阶梯缩放 | **14.3 GB** | 48.6 tok/s · 贪心+推测解码 **60 tok/s** | **8.79** |
+| `qwen38-27b-q4tp.cmf` | 4 位，阶梯缩放 | **14.3 GB** | 48.7 tok/s · 贪心+推测解码 **76 tok/s**（逐位精确的 f32 验证：66） | **8.79** |
 | `qwen38-27b-q4t.cmf` | 4 位 | 15.4 GB | 49.4 tok/s | 8.86 |
-| `qwen38-27b-q8_2f.cmf` | 8 位 | 27.4 GB | 28.9 tok/s | — |
+| `qwen38-27b-q8_2f.cmf` | 8 位 | 27.4 GB | 33.0 tok/s | — |
 
-所有数字来自同一台机器、同一基准（`cortiq bench`，三次取中位数；q8_2f
-一行来自更早的会话）；困惑度在相同的 12 个 512 token 窗口上测得。该模型
-受内存带宽限制，因此 4 位文件不仅更小，解码也比 8 位快约 1.6 倍。
+所有数字来自同一台机器、同一基准（`cortiq bench --core`，0.5.80，取中位数）；
+推测解码一行在基准自身文本上测得，真实提示词上的收益取决于草稿头与主干的
+一致程度：2.3k 上下文的代码提示 56.5 对 45.7 tok/s，散文则保持普通速度
+（引擎的监视器会在不划算处停止推测）。困惑度在相同的 12 个 512 token 窗口
+上测得。该模型受内存带宽限制，因此 4 位文件不仅更小，解码也比 8 位快约 1.5 倍。
 **q4tp** 保留 q4t 的 4 位权重，把每个 32 权重 tile 的缩放系数存为按行
 阶梯上的一级：字节少 7.5%，质量不变（困惑度甚至略低），是 16 GB 显卡的
 选择。两个 4 位文件都直接由 bf16 检查点量化而来（从 HF 逐分片流式转换），
 而非互相转换。**贪心解码默认开启推测解码**（`--greedy` 或服务器请求
-`temperature: 0`，0.5.80 起，Vulkan）：模型自带的 MTP 头一次起草四个
-token，一次批量提交完成验证，验证结果与普通 token 逐位一致 —— 贪心
-输出与普通路径完全相同，只是更快；若草稿头与主干不再一致，本次生成的
-其余部分会自动关闭推测。`CMF_GRAPH_SPEC=0` 关闭。采样（temperature > 0）
+`temperature: 0`，0.5.80 起，Vulkan）：模型自带的 MTP 头一次起草五个
+token，一次批量提交在 int8 激活的矩阵向量核上完成验证，监视器持续把每轮
+产出的 token 数与普通 token 比较 —— 连续四轮不划算即停止推测（散文常常
+不划算），稍后再试，因此有收益的提示保住收益，没有的按普通速度走。
+`CMF_VERIFY_I8=0` 切回 f32 验证（基准 66 tok/s），贪心输出与普通路径
+逐位一致；默认的 int8 可能把接近平局的 token 解成另一个同样贪心的续写。
+`CMF_GRAPH_SPEC=0` 关闭推测。采样（temperature > 0）
 走普通路径。
 
 **OpenAI 兼容 API 服务器：** `cortiq serve qwen38-27b-q4t.cmf --port
