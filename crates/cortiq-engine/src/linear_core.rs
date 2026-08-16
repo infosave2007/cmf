@@ -552,6 +552,13 @@ pub fn gdn_forward_batch(
     }
     let mut out = vec![0.0f32; b * cfg.hidden_size];
     w.out_proj.matmat(&of, b, &mut out, pool);
+    if std::env::var("CMF_GDN_TRACE").is_ok() {
+        let n = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        eprintln!(
+            "gdn-batch b={b}: |x0|={:.5} |qkv0|={:.5} |z0|={:.5} |a0|={:.5} |b0|={:.5} |of0|={:.5} |out0|={:.5} |state|={:.5}",
+            n(&xs[..cfg.hidden_size]), n(&qkv[..c_dim]), n(&z[..vd]), n(&a[..nv]), n(&bb[..nv]), n(&of[..vd]), n(&out[..cfg.hidden_size]), n(state)
+        );
+    }
     out
 }
 

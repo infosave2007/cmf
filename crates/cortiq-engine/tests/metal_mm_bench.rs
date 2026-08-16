@@ -19,7 +19,7 @@ fn metal_q4tp_matmat_cost_by_batch() {
         let e = &model.tensors[idx];
         let (rows, cols) = (e.shape[0], e.shape[1]);
         let mb = e.nbytes as f64 / 1e6;
-        for (which, label) in [(0u32, "mv1"), (1, "bk"), (2, "gemm")] {
+        for (which, label) in [(0u32, "mv1"), (1, "bk"), (2, "gemm"), (3, "n8")] {
             for &b in &[1usize, 2, 5, 8] {
                 if which == 0 && b != 1 { continue; }
                 if let Some(ms) = cortiq_engine::gpu_metal::q4tp_kernel_bench(&model, idx, b, rows, cols, which, 20) {
@@ -32,6 +32,30 @@ fn metal_q4tp_matmat_cost_by_batch() {
         let idx = model.tensor_index(name).expect("tensor");
         let e = &model.tensors[idx];
         let (rows, cols) = (e.shape[0], e.shape[1]);
+        for &b in &[1usize, 5, 8] {
+            let xs: Vec<f32> = (0..b * cols).map(|i| ((i % 97) as f32 - 48.0) / 48.0).collect();
+            let mut o1 = vec![0f32; b * rows];
+            let mut o2 = vec![0f32; b * rows];
+            assert!(cortiq_engine::gpu_metal::q4tp_matvec_batch(&model, idx, &xs, b, rows, cols, &mut o1));
+            assert!(cortiq_engine::gpu_metal::q4tp_mm_n8_batch(&model, idx, &xs, b, rows, cols, &mut o2));
+            let mut md = 0f32; let mut rms1 = 0f64; let mut rmsd = 0f64;
+            for (a, c) in o1.iter().zip(&o2) { md = md.max((a - c).abs()); rms1 += (*a as f64).powi(2); rmsd += ((a - c) as f64).powi(2); }
+            println!("PARITY n8 vs bk {name} b={b}: max|d|={md:.3e} rel-rms={:.3e}", (rmsd / rms1.max(1e-30)).sqrt());
+        }
+        for &b in &[32usize, 64, 512, 700] {
+            let xs: Vec<f32> = (0..b * cols).map(|i| ((i % 97) as f32 - 48.0) / 48.0).collect();
+            let mut o1 = vec![0f32; b * rows];
+            let mut o2 = vec![0f32; b * rows];
+            // reference: bk in slices of 8
+            for c0 in (0..b).step_by(8) {
+                let bb = (b - c0).min(8);
+                assert!(cortiq_engine::gpu_metal::q4tp_matvec_batch(&model, idx, &xs[c0 * cols..], bb, rows, cols, &mut o1[c0 * rows..]));
+            }
+            assert!(cortiq_engine::gpu_metal::q4tp_matmat(&model, idx, &xs, b, rows, cols, &mut o2));
+            let mut md = 0f32; let mut rms1 = 0f64; let mut rmsd = 0f64;
+            for (a, c) in o1.iter().zip(&o2) { md = md.max((a - c).abs()); rms1 += (*a as f64).powi(2); rmsd += ((a - c) as f64).powi(2); }
+            println!("PARITY gemm vs bk {name} b={b}: max|d|={md:.3e} rel-rms={:.3e}", (rmsd / rms1.max(1e-30)).sqrt());
+        }
         // the batched matvec (weights once): b ≤ 8
         for &b in &[1usize, 2, 5, 8] {
             let xs: Vec<f32> = (0..b * cols).map(|i| ((i % 97) as f32 - 48.0) / 48.0).collect();
