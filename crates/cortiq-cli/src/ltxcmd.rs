@@ -686,6 +686,7 @@ pub struct VideoArgs<'a> {
     pub out: Option<&'a str>,
     pub out_dir: Option<&'a str>,
     pub out_latent: Option<&'a str>,
+    pub out_audio: Option<&'a str>,
 }
 
 /// Prompt in, video out — the whole pipeline in one process and one file.
@@ -750,7 +751,7 @@ pub fn cmd_ltx_video(a: VideoArgs<'_>) -> anyhow::Result<()> {
     );
     println!("stage 1 denoised in {:.1}s", t1.elapsed().as_secs_f64());
 
-    let (geo, vol) = if a.two_stage {
+    let (geo, vol, audio) = if a.two_stage {
         use cortiq_engine::ltxpipe::patchify_video;
         use cortiq_engine::ltxups::LatentUpscaler;
         let ups = LatentUpscaler::from_cmf(&model).map_err(|e| anyhow!(e))?;
@@ -784,14 +785,31 @@ pub fn cmd_ltx_video(a: VideoArgs<'_>) -> anyhow::Result<()> {
         );
         println!("stage 2 denoised in {:.1}s", t2.elapsed().as_secs_f64());
         let v = unpatchify_video(&lat2.video, &geo2);
-        (geo2, v)
+        (geo2, v, lat2.audio)
     } else {
         let v = unpatchify_video(&lat.video, &geo);
-        (geo, v)
+        (geo, v, lat.audio)
     };
     drop(dit);
     if let Some(p) = a.out_latent {
         write_latent(p, &vol, &geo)?;
+    }
+    // The soundtrack came out of the same 48 blocks as the picture; the
+    // audio VAE and its vocoder turn it into a waveform.
+    if let Some(p) = a.out_audio {
+        use cortiq_engine::ltxaudio::{AudioStack, Grid, write_wav};
+        use cortiq_engine::ltxpipe::unpatchify_audio;
+        let t = std::time::Instant::now();
+        let stack = AudioStack::from_cmf(&model).map_err(|e| anyhow!(e))?;
+        let al = unpatchify_audio(&audio, geo.af);
+        let wave = stack.decode(&Grid { c: 8, h: geo.af, w: 16, data: al }, pool.as_deref());
+        write_wav(Path::new(p), &wave, stack.out_rate)?;
+        println!(
+            "{:.1}s of {} Hz stereo → {p} ({:.1}s)",
+            wave.t as f64 / stack.out_rate as f64,
+            stack.out_rate,
+            t.elapsed().as_secs_f64()
+        );
     }
     let dec = ConvVaeDecoder::from_cmf(&model, pool.as_deref()).map_err(|e| anyhow!(e))?;
     let latent = Vol { c: 128, f: geo.lf, h: geo.lh, w: geo.lw, data: vol };

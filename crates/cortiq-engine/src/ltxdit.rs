@@ -301,37 +301,45 @@ impl Attn {
             }
         });
 
+        // Per head, both halves of attention are GEMMs: scores are
+        // q·kᵀ and the value product is p·v. Gathering each head into a
+        // contiguous `[tokens, dh]` block costs one copy and buys the
+        // engine's blocked/BLAS/GPU kernels instead of a scalar loop —
+        // this is most of a step's arithmetic.
         let mut out = vec![0f32; n * inner];
         let scale = 1.0 / (self.dh as f32).sqrt();
-        let dst = Shared(out.as_mut_ptr());
-        rows(pool, n, &|s, e| {
-            let mut sc = vec![0f32; m];
-            for i in s..e {
-                let orow = unsafe { dst.at(i * inner, inner) };
-                for h in 0..self.heads {
-                    let qh = &q[i * inner + h * self.dh..][..self.dh];
-                    for (j, s) in sc.iter_mut().enumerate() {
-                        let kh = &k[j * inner + h * self.dh..][..self.dh];
-                        let mut acc = 0f32;
-                        for d in 0..self.dh {
-                            acc += qh[d] * kh[d];
-                        }
-                        *s = acc * scale + mask.map_or(0.0, |mk| mk[j]);
-                    }
-                    softmax(&mut sc);
-                    let oh = &mut orow[h * self.dh..(h + 1) * self.dh];
-                    for (j, &p) in sc.iter().enumerate() {
-                        if p == 0.0 {
-                            continue;
-                        }
-                        let vh = &v[j * inner + h * self.dh..][..self.dh];
-                        for d in 0..self.dh {
-                            oh[d] += p * vh[d];
-                        }
-                    }
-                }
+        let dh = self.dh;
+        let mut qh = vec![0f32; n * dh];
+        let mut kh = vec![0f32; m * dh];
+        let mut vh = vec![0f32; m * dh];
+        let mut sc = vec![0f32; n * m];
+        let mut oh = vec![0f32; n * dh];
+        for h in 0..self.heads {
+            for i in 0..n {
+                qh[i * dh..(i + 1) * dh].copy_from_slice(&q[i * inner + h * dh..][..dh]);
             }
-        });
+            for j in 0..m {
+                kh[j * dh..(j + 1) * dh].copy_from_slice(&k[j * inner + h * dh..][..dh]);
+                vh[j * dh..(j + 1) * dh].copy_from_slice(&v[j * inner + h * dh..][..dh]);
+            }
+            crate::fcd_ops::gemm_nt(&qh, &kh, &mut sc, n, dh, m, pool);
+            let sp = Shared(sc.as_mut_ptr());
+            rows(pool, n, &|s, e| {
+                let r = unsafe { sp.at(s * m, (e - s) * m) };
+                for row in r.chunks_exact_mut(m) {
+                    for (x, j) in row.iter_mut().zip(0..m) {
+                        *x = *x * scale + mask.map_or(0.0, |mk| mk[j]);
+                    }
+                    softmax(row);
+                }
+            });
+            oh.iter_mut().for_each(|x| *x = 0.0);
+            crate::fcd_ops::gemm_dx(&sc, &vh, &mut oh, n, dh, m, pool);
+            for i in 0..n {
+                out[i * inner + h * dh..i * inner + (h + 1) * dh]
+                    .copy_from_slice(&oh[i * dh..(i + 1) * dh]);
+            }
+        }
 
         if let Some(g) = &self.gate {
             let logits = g.apply(x, n, pool);
