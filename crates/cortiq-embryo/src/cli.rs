@@ -71,6 +71,7 @@ pub struct BirthArgs {
     pub pca_every: usize,
     pub tiny: bool,
     pub vocab: Option<usize>,
+    pub anchor_every: Option<usize>,
     pub seed: u64,
 }
 
@@ -97,6 +98,9 @@ pub fn birth(a: BirthArgs) {
             if let Some(v) = a.vocab {
                 assert!(v % 64 == 0, "vocab must be a multiple of 64");
                 cfg.vocab = v;
+            }
+            if let Some(ae) = a.anchor_every {
+                cfg.anchor_every = ae.max(1);
             }
             let lay = Layout::new(&cfg);
             (cfg.clone(), init_params(&cfg, &lay, a.seed), 0, None, None, Vec::new())

@@ -179,6 +179,9 @@ enum Sub {
         /// vocab override (e.g. 256 for byte shards)
         #[arg(long)]
         vocab: Option<usize>,
+        /// every N-th layer is a softmax anchor (1 = the all-softmax twin)
+        #[arg(long)]
+        anchor_every: Option<usize>,
         #[arg(long, default_value_t = 1)]
         seed: u64,
     },
@@ -298,14 +301,14 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Sub::Birth { shard, val, out, resume, batch, seq, steps, warmup, lr, wd, clip, eval_every, save_every, pca_every, tiny, vocab, seed } => {
+        Sub::Birth { shard, val, out, resume, batch, seq, steps, warmup, lr, wd, clip, eval_every, save_every, pca_every, tiny, vocab, anchor_every, seed } => {
             #[cfg(target_os = "macos")]
             cortiq_embryo::cli::birth(cortiq_embryo::cli::BirthArgs {
-                shard, val, out, resume, batch, seq, steps, warmup, lr, wd, clip, eval_every, save_every, pca_every, tiny, vocab, seed,
+                shard, val, out, resume, batch, seq, steps, warmup, lr, wd, clip, eval_every, save_every, pca_every, tiny, vocab, anchor_every, seed,
             });
             #[cfg(not(target_os = "macos"))]
             {
-                let _ = (shard, val, out, resume, batch, seq, steps, warmup, lr, wd, clip, eval_every, save_every, pca_every, tiny, vocab, seed);
+                let _ = (shard, val, out, resume, batch, seq, steps, warmup, lr, wd, clip, eval_every, save_every, pca_every, tiny, vocab, anchor_every, seed);
                 eprintln!("needs Metal (macOS)");
                 std::process::exit(1);
             }
