@@ -252,15 +252,14 @@ machine, no Python, no GPU. `--quant` picks the codec for the big planes
 
 ## Status
 
-* ✅ **Text → video runs end to end on the Rust engine**: the Gemma-4 prompt
-  encoder, the aggregate projections, the connectors, the 48-block audio-video
-  transformer, the sampler, the latent upscaler and the video VAE.
-* ⏳ **Sound is generated but not yet decoded.** The transformer denoises the
-  audio latent in the same blocks as the picture, and it is in the output
-  latent — the audio VAE and its vocoder are the next port, so the clips here
-  are silent.
-* ⏳ **Image and video conditioning, LoRAs, the IC-LoRA upscaler and the
-  duration head** are in the file but not yet wired into the CLI.
+* ✅ **Text → video *and sound* runs end to end on the Rust engine**: the
+  Gemma-4 prompt encoder, the aggregate projections, the connectors, the
+  48-block audio-video transformer, the sampler, the latent upscaler, the
+  video VAE, the audio VAE with its BigVGAN vocoder and bandwidth extension,
+  and the duration head.
+* ⏳ **Image and video conditioning, LoRAs and the IC-LoRA upscaler** are next.
+  The weights for conditioning are in this file (the video VAE's encoder half);
+  the LoRAs and the IC-LoRA upscaler are separate releases.
 
 Everything above is honest about what it is: a 4-bit repack. The reference at
 bf16 is the quality ceiling, and the codec's cost was measured stage by stage

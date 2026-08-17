@@ -609,7 +609,17 @@ impl Vocoder {
                 }
             }
         }
+        let dbg = std::env::var("CMF_LTX_VOC_DBG").is_ok();
+        let rms = |name: &str, s: &Sig| {
+            let n = s.data.len().max(1) as f64;
+            let r = (s.data.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>() / n).sqrt();
+            println!("  voc {name:<10} [{}, {}] rms {r:.6}", s.c, s.t);
+        };
         let mut h = self.conv_pre.forward(&x, pool);
+        if dbg {
+            rms("in", &x);
+            rms("conv_pre", &h);
+        }
         for (i, up) in self.ups.iter().enumerate() {
             h = up.forward(&h);
             let mut acc: Option<Sig> = None;
@@ -628,6 +638,9 @@ impl Vocoder {
             h = acc.unwrap();
             let inv = 1.0 / self.per_level as f32;
             h.data.iter_mut().for_each(|v| *v *= inv);
+            if dbg {
+                rms(&format!("level{i}"), &h);
+            }
         }
         let h = self.act_post.forward(&h);
         let mut out = self.conv_post.forward(&h, pool);
@@ -816,7 +829,16 @@ impl AudioStack {
     /// `[8, T, 16]` latent → stereo waveform at `out_rate`.
     pub fn decode(&self, latent: &Grid, pool: Option<&Pool>) -> Sig {
         let mel = self.decoder.decode(latent, pool);
-        let low = self.vocoder.forward(&mel, pool);
+        self.decode_from_mel(&mel, pool)
+    }
+
+    /// The vocoder half on its own, from a `[2, frames, mel]` log-mel.
+    pub fn decode_from_mel(&self, mel: &Grid, pool: Option<&Pool>) -> Sig {
+        let low = self.vocoder.forward(mel, pool);
+        // the 16 kHz stage on its own, for bisecting the two generators
+        if let Ok(p) = std::env::var("CMF_LTX_LOW_WAV") {
+            let _ = write_wav(std::path::Path::new(&p), &low, self.in_rate);
+        }
         let out_len = low.t * self.out_rate / self.in_rate;
         // pad to a whole number of hops so the mel frame count is exact
         let rem = low.t % self.hop;
