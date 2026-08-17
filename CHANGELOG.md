@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.83] - 2026-08-18
+
+The LTX-2.5 release: text to video, end to end, on the Rust engine.
+
+### Added
+
+* **`cortiq ltx-video`** — prompt in, frames out, one process and one 22 GB
+  CMF file. It runs the Gemma-4 12 B prompt encoder, the aggregate
+  projections and the connectors; the 48-block audio-video diffusion
+  transformer; the distilled sampler; and the 3-D convolutional video VAE.
+  `--two-stage` adds the learned latent upscaler and the three-step
+  refinement the distilled model was trained for.
+* **`crates/cortiq-engine/src/ltxdit.rs`** — the `AVTransformer3DModel`
+  forward. Per block: video and audio self-attention under split 3-D/1-D
+  RoPE evaluated at patch midpoints, prompt cross-attention with its own
+  adaLN pair on the query and on the prompt's keys and values, both
+  directions of audio↔video cross-attention taken off the pre-fusion state,
+  and a gelu-approximate feed-forward — every one of them modulated by adaLN
+  values computed once per *distinct* timestep rather than once per token.
+* **`ltxte.rs`** — Gemma-4 12 B over a 1024-token window: forty
+  sliding-window layers at head 256 and eight full-attention layers at head
+  512 whose value projection is the key projection, unscaled attention,
+  per-layer scalars. Then the per-token per-layer RMS over all forty-nine
+  hidden states, the two aggregate projections, and the eight-block
+  connectors with their 128 learnable registers.
+* **`ltxups.rs`** — the ×2 spatial latent upscaler (1024-channel 3-D
+  convolutions, GroupNorm, pixel shuffle), run in the VAE's own units.
+* **`ltxpipe.rs`** — latent geometry, the distilled sigma schedules and the
+  ancestral / deterministic Euler steps.
+* **`ltx-encode`, `ltx-render`, `ltx-decode`, `ltx-dit`** — the stages
+  separately, each with a `--gate` that walks every captured activation
+  against a dump of the reference implementation and reports the first place
+  it diverges.
+
+### Changed
+
+* `ltx-pack` keeps two more things exact, both found by that gate rather than
+  by taste: the **adaLN-single stacks** (their output is the scale and shift
+  applied to every token in every block — quantized, they put 3.6·10⁻² of
+  relative error into the first normalization of block 0; exact, 5.9·10⁻³)
+  and the **token embedding table** at 8 bits (it *is* the residual stream at
+  layer zero — q4tp put 11 % into every hidden state). One gigabyte on a
+  22 GB file.
+* Large projections are chunked before the GPU dispatch: the prompt encoder's
+  aggregate reads 188160 numbers per token, which is past what a single
+  binding may address.
+* The video VAE picks whichever packed config actually describes a VAE, so a
+  container packed from the transformer first no longer fails on
+  `vae.decoder_blocks`.
+
+
 ## [0.5.82] - 2026-08-16
 
 The Apple-silicon release. Two silent numerics bugs in the Metal backend

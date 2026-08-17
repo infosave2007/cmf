@@ -1117,6 +1117,36 @@ enum Commands {
         #[arg(long)]
         out: Option<String>,
     },
+    /// Prompt in, video out: the whole LTX-2.5 pipeline on our engine.
+    LtxVideo {
+        #[arg(long)]
+        model: String,
+        #[arg(long)]
+        prompt: String,
+        #[arg(long, default_value_t = 256)]
+        height: usize,
+        #[arg(long, default_value_t = 384)]
+        width: usize,
+        #[arg(long, default_value_t = 49)]
+        frames: usize,
+        #[arg(long, default_value_t = 24.0)]
+        fps: f64,
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        /// Sample the way the distilled model was trained: half resolution,
+        /// latent upscale, then a three-step refinement at full resolution
+        #[arg(long)]
+        two_stage: bool,
+        /// Write the frames as one YUV4MPEG2 stream (feed it to ffmpeg)
+        #[arg(long)]
+        out: Option<String>,
+        /// Write frames as PPM stills into this directory
+        #[arg(long)]
+        out_dir: Option<String>,
+        /// Write the denoised latent as safetensors
+        #[arg(long)]
+        out_latent: Option<String>,
+    },
     /// Pack LTX-2.5 — the 22B audio-video DiT, the Gemma-4 12B prompt
     /// encoder, both VAEs, the latent upscalers and the duration head —
     /// into ONE q4tp .cmf. Multi-pass: `--in` carries an earlier pass
@@ -1994,6 +2024,31 @@ async fn main() -> anyhow::Result<()> {
                 out: out.as_deref(),
             })
         }
+        Commands::LtxVideo {
+            model,
+            prompt,
+            height,
+            width,
+            frames,
+            fps,
+            seed,
+            two_stage,
+            out,
+            out_dir,
+            out_latent,
+        } => ltxcmd::cmd_ltx_video(ltxcmd::VideoArgs {
+            model: &model,
+            two_stage,
+            prompt: &prompt,
+            height,
+            width,
+            frames,
+            fps,
+            seed,
+            out: out.as_deref(),
+            out_dir: out_dir.as_deref(),
+            out_latent: out_latent.as_deref(),
+        }),
         Commands::LtxPack {
             out,
             carry,

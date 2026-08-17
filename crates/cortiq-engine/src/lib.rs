@@ -21,6 +21,7 @@ pub mod loader;
 pub mod ltxdit;
 pub mod ltxpipe;
 pub mod ltxte;
+pub mod ltxups;
 pub mod ltxvae;
 pub mod mm_ab;
 pub mod mmh3;

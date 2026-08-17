@@ -314,3 +314,22 @@ pub fn unpatchify_audio(tokens: &[f32], frames: usize) -> Vec<f32> {
     }
     out
 }
+
+/// A `[128, F, H, W]` volume back to patchified tokens `[T, 128]` — the
+/// inverse of [`unpatchify_video`], for feeding a stage its starting latent.
+pub fn patchify_video(vol: &[f32], geo: &Geometry) -> Vec<f32> {
+    let (lf, lh, lw) = (geo.lf, geo.lh, geo.lw);
+    let c = 128usize;
+    let mut out = vec![0f32; c * lf * lh * lw];
+    for f in 0..lf {
+        for h in 0..lh {
+            for w in 0..lw {
+                let t = (f * lh + h) * lw + w;
+                for ch in 0..c {
+                    out[t * c + ch] = vol[((ch * lf + f) * lh + h) * lw + w];
+                }
+            }
+        }
+    }
+    out
+}

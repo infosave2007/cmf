@@ -10448,6 +10448,7 @@ mod tests {
             mask: None,
             per_expert_scale: None,
             router_input_norm: false,
+            resonance: None,
         };
         let actual = moe_ffn_cpu(&moe, &x, &[0], &[0.0], 1.0, None);
         for (actual, expected) in actual.iter().zip(expected) {

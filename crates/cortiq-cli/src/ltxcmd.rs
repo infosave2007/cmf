@@ -671,3 +671,179 @@ pub fn cmd_ltx_encode(a: EncodeArgs<'_>) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+// -------------------------------------------------------------- ltx-video
+
+pub struct VideoArgs<'a> {
+    pub model: &'a str,
+    pub two_stage: bool,
+    pub prompt: &'a str,
+    pub height: usize,
+    pub width: usize,
+    pub frames: usize,
+    pub fps: f64,
+    pub seed: u64,
+    pub out: Option<&'a str>,
+    pub out_dir: Option<&'a str>,
+    pub out_latent: Option<&'a str>,
+}
+
+/// Prompt in, video out — the whole pipeline in one process and one file.
+pub fn cmd_ltx_video(a: VideoArgs<'_>) -> anyhow::Result<()> {
+    use cortiq_engine::ltxpipe::{Geometry, Rng, Stage, run_stage, unpatchify_video};
+    use cortiq_engine::ltxte::LtxTextEncoder;
+    use cortiq_engine::tokenizer::Tokenizer;
+
+    anyhow::ensure!(
+        a.height % 32 == 0 && a.width % 32 == 0,
+        "height and width must be multiples of 32 (the video VAE's spatial stride)"
+    );
+    anyhow::ensure!(
+        a.frames % 8 == 1,
+        "frames must be 8k+1 (the VAE's temporal stride, plus the standalone first frame)"
+    );
+
+    let model = Arc::new(CmfModel::open_sharded(a.model)?);
+    let pool = Pool::from_env();
+    let whole = std::time::Instant::now();
+
+    let vocab = model.vocab.as_ref().context("container carries no tokenizer")?;
+    let tok = Tokenizer::from_bytes(vocab).map_err(|e| anyhow!("tokenizer: {e}"))?;
+    let te = LtxTextEncoder::from_cmf(&model).map_err(|e| anyhow!(e))?;
+    let (ids, mask) = te.pad_ids(&tok.encode(a.prompt.trim()));
+    let valid = mask.iter().filter(|&&m| m != 0.0).count();
+    let t0 = std::time::Instant::now();
+    let (vctx, actx, ctx_len) = te.encode_ids(&ids, &mask, pool.as_deref());
+    println!(
+        "prompt: {valid} tokens → {ctx_len}-token context in {:.1}s",
+        t0.elapsed().as_secs_f64()
+    );
+    drop(te);
+
+    let dit = LtxDit::from_cmf(&model).map_err(|e| anyhow!(e))?;
+    // Two-stage is how the distilled model was trained to be sampled: eight
+    // ancestral steps at half resolution, a learned latent upscale, then
+    // three deterministic steps that refine the detail the upscale invented.
+    let (h1, w1) = if a.two_stage { (a.height / 2, a.width / 2) } else { (a.height, a.width) };
+    let geo = Geometry::new(a.frames, h1, w1, a.fps);
+    println!(
+        "stage 1 latent {}x{}x{} ({} video tokens), audio {} tokens",
+        geo.lf,
+        geo.lh,
+        geo.lw,
+        geo.video_tokens(),
+        geo.af
+    );
+    let mut rng = Rng::new(a.seed);
+    let t1 = std::time::Instant::now();
+    let lat = run_stage(
+        &dit,
+        &geo,
+        &Stage::stage1(),
+        &vctx,
+        &actx,
+        ctx_len,
+        None,
+        &mut rng,
+        pool.as_deref(),
+        &mut |i, n, secs| println!("  step {i}/{n}  {secs:.1}s"),
+    );
+    println!("stage 1 denoised in {:.1}s", t1.elapsed().as_secs_f64());
+
+    let (geo, vol) = if a.two_stage {
+        use cortiq_engine::ltxpipe::patchify_video;
+        use cortiq_engine::ltxups::LatentUpscaler;
+        let ups = LatentUpscaler::from_cmf(&model).map_err(|e| anyhow!(e))?;
+        let small = Vol { c: 128, f: geo.lf, h: geo.lh, w: geo.lw, data: unpatchify_video(&lat.video, &geo) };
+        let t = std::time::Instant::now();
+        let big = ups.upscale(&small, pool.as_deref());
+        println!(
+            "upscaled to {}x{} in {:.1}s",
+            big.w,
+            big.h,
+            t.elapsed().as_secs_f64()
+        );
+        let geo2 = Geometry::new(a.frames, a.height, a.width, a.fps);
+        anyhow::ensure!(big.h == geo2.lh && big.w == geo2.lw, "upscaler shape mismatch");
+        let init = cortiq_engine::ltxpipe::Latents {
+            video: patchify_video(&big.data, &geo2),
+            audio: lat.audio.clone(),
+        };
+        let t2 = std::time::Instant::now();
+        let lat2 = run_stage(
+            &dit,
+            &geo2,
+            &Stage::stage2(),
+            &vctx,
+            &actx,
+            ctx_len,
+            Some(init),
+            &mut rng,
+            pool.as_deref(),
+            &mut |i, n, secs| println!("  step {i}/{n}  {secs:.1}s"),
+        );
+        println!("stage 2 denoised in {:.1}s", t2.elapsed().as_secs_f64());
+        let v = unpatchify_video(&lat2.video, &geo2);
+        (geo2, v)
+    } else {
+        let v = unpatchify_video(&lat.video, &geo);
+        (geo, v)
+    };
+    drop(dit);
+    if let Some(p) = a.out_latent {
+        write_latent(p, &vol, &geo)?;
+    }
+    let dec = ConvVaeDecoder::from_cmf(&model, pool.as_deref()).map_err(|e| anyhow!(e))?;
+    let latent = Vol { c: 128, f: geo.lf, h: geo.lh, w: geo.lw, data: vol };
+    let t2 = std::time::Instant::now();
+    let out = dec.decode(&latent, pool.as_deref());
+    println!(
+        "decoded {} frames of {}x{} in {:.1}s",
+        out.f,
+        out.w,
+        out.h,
+        t2.elapsed().as_secs_f64()
+    );
+    if let Some(p) = a.out {
+        write_y4m(Path::new(p), &out, a.fps)?;
+        println!("{p}  (ffmpeg -i {p} -pix_fmt yuv420p out.mp4)");
+    }
+    if let Some(d) = a.out_dir {
+        write_frames(d, &out)?;
+    }
+    println!("total {:.1}s", whole.elapsed().as_secs_f64());
+    Ok(())
+}
+
+fn write_latent(p: &str, vol: &[f32], geo: &cortiq_engine::ltxpipe::Geometry) -> anyhow::Result<()> {
+    let mut bytes = Vec::with_capacity(vol.len() * 4);
+    for v in vol {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    let hdr = serde_json::json!({
+        "latent": {"dtype":"F32","shape":[1, 128, geo.lf, geo.lh, geo.lw],"data_offsets":[0, bytes.len()]}
+    });
+    let hs = serde_json::to_vec(&hdr)?;
+    let mut f = std::fs::File::create(p)?;
+    f.write_all(&(hs.len() as u64).to_le_bytes())?;
+    f.write_all(&hs)?;
+    f.write_all(&bytes)?;
+    println!("latent → {p}");
+    Ok(())
+}
+
+fn write_frames(d: &str, out: &Vol) -> anyhow::Result<()> {
+    std::fs::create_dir_all(d)?;
+    for f in 0..out.f {
+        let frame: Vec<f32> = (0..3 * out.h * out.w)
+            .map(|i| {
+                let c = i / (out.h * out.w);
+                let r = i % (out.h * out.w);
+                out.data[((c * out.f + f) * out.h) * out.w + r]
+            })
+            .collect();
+        write_ppm(&Path::new(d).join(format!("frame_{f:04}.ppm")), &frame, out.h, out.w)?;
+    }
+    println!("{} frames → {d}/frame_*.ppm", out.f);
+    Ok(())
+}
