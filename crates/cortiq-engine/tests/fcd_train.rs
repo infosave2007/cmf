@@ -282,6 +282,7 @@ fn write_tiny_model_variant(
         skills: Vec::new(),
         shard: None,
         calibration: None,
+        routing: None,
     };
     let path = dir.join(format!("{name}.cmf"));
     CmfModel::write(&path, &header, &specs, None, None).expect("write tiny model");

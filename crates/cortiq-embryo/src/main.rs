@@ -185,6 +185,36 @@ enum Sub {
         #[arg(long, default_value_t = 30)]
         poll_secs: u64,
     },
+    /// Growth as records: add one expert per layer (copy of the hottest + shifted descriptor), train only the new experts on a corpus, gate on held-out, save the grown genome (+ optional .cmf export).
+    Grow {
+        #[arg(long)]
+        ckpt: PathBuf,
+        #[arg(long)]
+        tokenizer: PathBuf,
+        #[arg(long, required = true, num_args = 1..)]
+        corpus: Vec<PathBuf>,
+        #[arg(long)]
+        out_ckpt: PathBuf,
+        #[arg(long)]
+        export: Option<PathBuf>,
+        #[arg(long, default_value_t = 300)]
+        steps: usize,
+        #[arg(long, default_value_t = 3e-4)]
+        lr: f32,
+        #[arg(long, default_value_t = 4)]
+        batch: usize,
+        #[arg(long, default_value_t = 512)]
+        seq: usize,
+        /// required held-out improvement (fraction of loss) to keep the growth
+        #[arg(long, default_value_t = 0.005)]
+        gate: f32,
+        #[arg(long, default_value_t = 1e-3)]
+        noise: f32,
+        #[arg(long, default_value_t = 0.1)]
+        shift: f32,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+    },
     /// Birth: train from scratch (or resume) on a token shard.
     Birth {
         /// token shards (u16 LE), `path[:weight]`, repeatable — mixed by weight
@@ -303,6 +333,11 @@ fn main() {
                 let unchanged = append_to_cmf(&base, &tmp, &id, &layers, &tensors, sel, quality).expect("append");
                 std::fs::rename(&tmp, &out_path).expect("rename");
                 println!("skill '{id}' appended → {} ({} tensors over layers {:?}; {unchanged} base tensors byte-identical; held-out ppl {:.1} → {:.1})", out_path.display(), tensors.len(), layers, l0.exp(), lb.exp());
+                match cortiq_embryo::skill::calibrate_file(&out_path, 0.05) {
+                    Ok(Some(c)) => println!("router calibrated over {} held-out φ: temperature {:.3e}, novelty θ {:.3} (fpr {:.2})", c.samples, c.temperature, c.novelty_theta, c.target_fpr),
+                    Ok(None) => println!("router calibration: no held-out φ in the file"),
+                    Err(e) => eprintln!("router calibration failed: {e}"),
+                }
             }
             #[cfg(not(target_os = "macos"))]
             {
@@ -324,6 +359,51 @@ fn main() {
             #[cfg(not(target_os = "macos"))]
             {
                 let _ = (ckpt, tokenizer, cmf, ood_dir, idle_min, min_tokens, gate, requant_gate, held_out, cortiq_bin, layers, steps_a, steps_b, batch, seq, once, force, poll_secs);
+                eprintln!("needs Metal (macOS)");
+                std::process::exit(1);
+            }
+        }
+        Sub::Grow { ckpt, tokenizer, corpus, out_ckpt, export, steps, lr, batch, seq, gate, noise, shift, seed } => {
+            #[cfg(target_os = "macos")]
+            {
+                use cortiq_embryo::growth::{GrowArgs, grow_experts, train_new_experts};
+                let ck = cortiq_embryo::train::load_checkpoint(&ckpt).expect("load checkpoint");
+                let bpe = cortiq_embryo::tokenizer::Bpe::load(&tokenizer).expect("tokenizer");
+                let eot = bpe.special_id(cortiq_embryo::tokenizer::EOT).unwrap_or(0) as u16;
+                let mut toks: Vec<u16> = Vec::new();
+                let mut cache = std::collections::HashMap::new();
+                for p in &corpus {
+                    cortiq_embryo::data::for_each_doc(p, |text| {
+                        let mut ids = Vec::new();
+                        bpe.encode(text, &mut cache, &mut ids);
+                        toks.extend(ids.iter().map(|&i| i as u16));
+                        toks.push(eot);
+                    })
+                    .expect("read corpus");
+                }
+                let shard = cortiq_embryo::train::Shard { tokens: toks };
+                let (grown, sources) = grow_experts(&ck, noise, shift, seed);
+                println!("grown: experts {} → {} in {} layers; sources per layer {:?}", ck.cfg.experts, grown.cfg.experts, grown.cfg.layers, sources);
+                let a = GrowArgs { steps, lr, batch, seq, eval_every: 30, seed };
+                let (trained, l0, l1) = train_new_experts(&grown, &shard, &a, &|| false).expect("train");
+                let imp = (l0 - l1) / l0.max(1e-6);
+                println!("held-out: before {l0:.4} (ppl {:.1}) → after {l1:.4} (ppl {:.1}), improvement {imp:.4} vs gate {gate}", l0.exp(), l1.exp());
+                if imp < gate {
+                    println!("growth REJECTED (gate) — nothing written");
+                    std::process::exit(2);
+                }
+                let d: Vec<(&str, &[f32])> = trained.extras.iter().map(|(n, x)| (n.as_str(), x.as_slice())).collect();
+                cortiq_embryo::train::save_checkpoint(&out_ckpt, &trained.cfg, trained.step, &trained.params, None, None, &d).expect("save");
+                println!("grown genome saved → {}", out_ckpt.display());
+                if let Some(e) = export {
+                    let tj = std::fs::read(&tokenizer).expect("read tokenizer.json");
+                    cortiq_embryo::export::export(&trained, &tj, &e).expect("export");
+                    println!("exported → {}", e.display());
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = (ckpt, tokenizer, corpus, out_ckpt, export, steps, lr, batch, seq, gate, noise, shift, seed);
                 eprintln!("needs Metal (macOS)");
                 std::process::exit(1);
             }

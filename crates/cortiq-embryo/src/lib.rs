@@ -29,3 +29,5 @@ pub mod export;
 pub mod skill;
 #[cfg(target_os = "macos")]
 pub mod sleep;
+#[cfg(target_os = "macos")]
+pub mod growth;

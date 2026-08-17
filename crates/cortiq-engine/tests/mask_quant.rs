@@ -147,6 +147,7 @@ fn sparse_ffn_quant_agrees_with_dequant() {
         skills: Vec::new(),
         shard: None,
         calibration: None,
+        routing: None,
     };
     let tensors = vec![
         spec_q8("g", inter, hidden, &gate),

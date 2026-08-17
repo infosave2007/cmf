@@ -112,6 +112,26 @@ pub struct CmfHeader {
     /// calibrate` measures the reliability/ECE.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calibration: Option<Calibration>,
+    /// Skill-router calibration (spec §9 routing; the cortiq-router recipe):
+    /// temperature of the softmax over −error and the novelty threshold θ,
+    /// fitted on the skills' held-out φ samples carried in their descriptors.
+    /// Additive; absent = raw recon-argmin with a fixed E threshold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<RoutingCalibration>,
+}
+
+/// Router calibration (see `SelectionDescriptor`): the recipe of the
+/// cortiq-router service — confidence = softmax(−err/T), novelty = 0.5·σ(z_top)
+/// + 0.25·1/(1+8·margin) + 0.25·(1−confidence), novel iff novelty > θ,
+/// θ = the (1−fpr) quantile of in-scope held-out novelty scores.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingCalibration {
+    pub temperature: f32,
+    pub novelty_theta: f32,
+    /// held-out samples the calibration used
+    pub samples: usize,
+    /// target in-scope false-positive rate of the novelty flag
+    pub target_fpr: f32,
 }
 
 /// Confidence-calibration record (spec §6.2). `temperature` scales the
@@ -146,6 +166,19 @@ pub struct SelectionDescriptor {
     /// Orthonormal basis rows, f16 LE base64, len = rank·hidden.
     pub basis: String,
     pub rank: usize,
+    /// Training reconstruction-error statistics (mean, std) — the z-score
+    /// "energy" of the novelty ensemble. Additive (cortiq-router recipe).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub err_mean: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub err_std: Option<f32>,
+    /// Held-out in-scope φ samples, f16 LE base64, len = holdout_n·hidden —
+    /// what the file-level temperature/θ calibration is fitted on, so a
+    /// container recalibrates itself after every appended skill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holdout: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holdout_n: Option<usize>,
 }
 
 /// One skill of the swarm (spec §9; Patent 15 per-skill record).

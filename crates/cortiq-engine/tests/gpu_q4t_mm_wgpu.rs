@@ -54,6 +54,7 @@ fn wgpu_q4t_matmat_matches_dequant_reference() {
         skills: Vec::new(),
         shard: None,
         calibration: None,
+        routing: None,
     };
     let spec = TensorSpec {
         name: "w".into(),

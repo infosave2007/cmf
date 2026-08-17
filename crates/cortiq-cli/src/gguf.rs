@@ -1247,6 +1247,7 @@ pub fn run_import_gguf(
         skills: Vec::new(),
         shard: None,
         calibration: None,
+        routing: None,
     };
     CmfModel::write(output, &header, &tensors, None, vocab.as_deref())
         .map_err(|e| anyhow::anyhow!("write {output}: {e}"))?;

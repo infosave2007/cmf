@@ -162,7 +162,15 @@ pub(crate) fn build_ffn_at(
         })
     };
     let router_name = format!("{prefix}mlp.gate.weight");
-    if model.tensor(&router_name).is_none() {
+    // Cortiq Embryo: resonance-routed experts carry NO gate tensor — the
+    // MoE is keyed on the first expert + the arch flag (a grown genome
+    // appends `mlp.experts.{E}.*` records without rewriting anything).
+    let resonance_moe = model.tensor(&router_name).is_none()
+        && arch.moe.as_ref().is_some_and(|m| m.router_resonance)
+        && model
+            .tensor(&format!("{prefix}mlp.experts.0.gate_proj.weight"))
+            .is_some();
+    if model.tensor(&router_name).is_none() && !resonance_moe {
         return Ok(FfnKind::Dense(load_dense(&format!("{prefix}mlp."))?));
     }
     let cfg = arch.moe.as_ref().ok_or_else(|| {
@@ -231,7 +239,12 @@ pub(crate) fn build_ffn_at(
         .filter(|&t| t > 0.0 && t < 1.0)
         .inspect(|t| tracing::info!("MoE adaptive routing: tau {t}"));
     let mask = moe_task_mask(&prefix, experts.len());
-    let router = load_matrix(model, &router_name, force_f32, ov)?;
+    let router = if resonance_moe {
+        // never read (selection is by descriptors); zero placeholder in RAM
+        QTensor::from_f32(vec![0.0; experts.len() * arch.hidden_size], experts.len(), arch.hidden_size)
+    } else {
+        load_matrix(model, &router_name, force_f32, ov)?
+    };
     if router.rows() != experts.len() {
         return Err(CmfError::Parse(format!(
             "{router_name}: {} rows != {} experts",
@@ -250,9 +263,45 @@ pub(crate) fn build_ffn_at(
         None
     };
     let router_input_norm = per_expert_scale.is_some();
-    // Cortiq Embryo resonance descriptors (`mlp.desc.*`): present → the
-    // router is a placeholder and selection is by reconstruction error.
-    let resonance = if model.tensor(&format!("{prefix}mlp.desc.mu")).is_some() {
+    // Cortiq Embryo resonance descriptors: per-expert records
+    // `mlp.experts.{e}.desc.{mu,u,bias}` (append-only growth) or the legacy
+    // per-layer `mlp.desc.{mu,u,bias}` [E, ...]. Present → the router is a
+    // placeholder and selection is by reconstruction error.
+    let per_expert = model.tensor(&format!("{prefix}mlp.experts.0.desc.mu")).is_some();
+    let resonance = if per_expert {
+        let ne_d = experts.len();
+        let hidden = arch.hidden_size;
+        let mut mu = Vec::with_capacity(ne_d * hidden);
+        let mut u = Vec::new();
+        let mut bias = Vec::with_capacity(ne_d);
+        let mut k = 0usize;
+        for e in 0..ne_d {
+            let m = load_f32(model, &format!("{prefix}mlp.experts.{e}.desc.mu"), ov).map_err(CmfError::Parse)?;
+            if m.len() != hidden {
+                return Err(CmfError::Parse(format!("{prefix}mlp.experts.{e}.desc.mu: {} != {hidden}", m.len())));
+            }
+            mu.extend_from_slice(&m);
+            let un = format!("{prefix}mlp.experts.{e}.desc.u");
+            if model.tensor(&un).is_some() {
+                let ue = load_f32(model, &un, ov).map_err(CmfError::Parse)?;
+                let ke = ue.len() / hidden.max(1);
+                if e == 0 {
+                    k = ke;
+                }
+                if ke != k {
+                    return Err(CmfError::Parse(format!("{un}: rank {ke} != {k}")));
+                }
+                u.extend_from_slice(&ue);
+            }
+            let bn = format!("{prefix}mlp.experts.{e}.desc.bias");
+            bias.push(if model.tensor(&bn).is_some() {
+                load_f32(model, &bn, ov).map_err(CmfError::Parse)?.first().copied().unwrap_or(0.0)
+            } else {
+                0.0
+            });
+        }
+        Some(crate::pipeline::Resonance { mu, u, k, bias })
+    } else if model.tensor(&format!("{prefix}mlp.desc.mu")).is_some() {
         let mu = load_f32(model, &format!("{prefix}mlp.desc.mu"), ov).map_err(CmfError::Parse)?;
         let ne_d = experts.len();
         let hidden = arch.hidden_size;

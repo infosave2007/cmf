@@ -195,6 +195,12 @@ pub fn run(a: SleepArgs) -> anyhow::Result<()> {
                 // atomic commit; a running `serve` keeps its old mapping until it reloads
                 std::fs::rename(&next, &a.cmf)?;
                 journal(&a.ood_dir, "skill_committed", serde_json::json!({"skill": id, "unchanged_tensors": unchanged, "quality": quality, "seconds": t0.elapsed().as_secs_f64(), "note": "restart/reload serve to activate"}));
+                // the router recalibrates itself over every skill's held-out φ
+                match crate::skill::calibrate_file(&a.cmf, 0.05) {
+                    Ok(Some(c)) => journal(&a.ood_dir, "router_calibrated", serde_json::json!({"temperature": c.temperature, "novelty_theta": c.novelty_theta, "samples": c.samples})),
+                    Ok(None) => journal(&a.ood_dir, "router_calibration_skipped", serde_json::json!({"reason": "no held-out φ"})),
+                    Err(e) => journal(&a.ood_dir, "router_calibration_error", serde_json::json!({"error": e.to_string()})),
+                }
             }
         }
         // archive the consumed buffer (append-only history)

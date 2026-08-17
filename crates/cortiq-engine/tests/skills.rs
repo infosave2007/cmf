@@ -195,6 +195,7 @@ fn write_swarm(path: &std::path::Path, with_skill: bool) -> u64 {
         skills,
         shard: None,
         calibration: None,
+        routing: None,
     };
     CmfModel::write(path, &header, &tensors, None, None).unwrap();
     std::fs::metadata(path).unwrap().len()
@@ -286,6 +287,10 @@ fn routing_picks_the_matching_skill() {
         mean: b64f16(mean),
         basis: b64f16(&basis),
         rank: 1,
+        err_mean: None,
+        err_std: None,
+        holdout: None,
+        holdout_n: None,
     };
     let mk = |id: &str, mean: &[f32]| SkillRecord {
         id: id.into(),

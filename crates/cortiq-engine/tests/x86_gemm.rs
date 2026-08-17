@@ -96,6 +96,7 @@ fn blocked_vs_per_row() {
         skills: Vec::new(),
         shard: None,
         calibration: None,
+        routing: None,
     };
     let spec = TensorSpec {
         name: "w".into(),
@@ -239,6 +240,7 @@ fn q1_blocked_vs_per_row() {
         skills: Vec::new(),
         shard: None,
         calibration: None,
+        routing: None,
     };
     let spec = TensorSpec {
         name: "w".into(),
@@ -381,6 +383,7 @@ fn q4b_blocked_vs_per_row() {
         skills: Vec::new(),
         shard: None,
         calibration: None,
+        routing: None,
     };
     let spec = TensorSpec {
         name: "w".into(),
@@ -531,6 +534,7 @@ fn q4t_blocked_vs_per_row() {
         skills: Vec::new(),
         shard: None,
         calibration: None,
+        routing: None,
     };
     let spec = TensorSpec {
         name: "w".into(),
@@ -673,6 +677,7 @@ fn q4t_silu_mul_fused_matches_composed() {
         skills: Vec::new(),
         shard: None,
         calibration: None,
+        routing: None,
     };
     let specs = [
         TensorSpec {

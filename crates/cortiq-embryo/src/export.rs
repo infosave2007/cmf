@@ -127,18 +127,19 @@ pub fn export(ck: &Checkpoint, tokenizer_json: &[u8], out: &Path) -> anyhow::Res
                 t.push(spec(&format!("{pf}mlp.experts.{e}.up_proj.weight"), &[i, h], sl(base + i * h, i * h)));
                 t.push(spec(&format!("{pf}mlp.experts.{e}.down_proj.weight"), &[h, i], sl(base + 2 * i * h, h * i)));
             }
-            // the loader keys MoE on `mlp.gate.weight`; the resonance router
-            // never reads it — a zero placeholder keeps the schema
-            t.push(spec(&format!("{pf}mlp.gate.weight"), &[ne, h], &vec![0.0f32; ne * h]));
+            // per-expert descriptor records (append-only growth: a new
+            // expert = new tensors, nothing rewritten); no gate placeholder —
+            // the loader keys the resonance MoE on experts.0 + the arch flag
             let k = crate::model::MOE_K;
             let mu_l = mu.map(|m| &m[l * ne * h..(l + 1) * ne * h]).ok_or_else(|| anyhow::anyhow!("checkpoint has no expert descriptors (desc.mu)"))?;
-            t.push(spec(&format!("{pf}mlp.desc.mu"), &[ne, h], mu_l));
-            if let Some(u) = u {
-                t.push(spec(&format!("{pf}mlp.desc.u"), &[ne, k, h], &u[l * ne * k * h..(l + 1) * ne * k * h]));
-            }
-            let b_l = bias.map(|b| &b[l * ne..(l + 1) * ne]).unwrap_or(&[]);
-            if !b_l.is_empty() {
-                t.push(spec(&format!("{pf}mlp.desc.bias"), &[ne], b_l));
+            for e in 0..ne {
+                t.push(spec(&format!("{pf}mlp.experts.{e}.desc.mu"), &[h], &mu_l[e * h..(e + 1) * h]));
+                if let Some(u) = u {
+                    let base = (l * ne + e) * k * h;
+                    t.push(spec(&format!("{pf}mlp.experts.{e}.desc.u"), &[k, h], &u[base..base + k * h]));
+                }
+                let b = bias.map(|b| b[l * ne + e]).unwrap_or(0.0);
+                t.push(spec(&format!("{pf}mlp.experts.{e}.desc.bias"), &[1], &[b]));
             }
         }
     }
@@ -165,6 +166,7 @@ pub fn export(ck: &Checkpoint, tokenizer_json: &[u8], out: &Path) -> anyhow::Res
         skills: Vec::new(),
         shard: None,
         calibration: None,
+        routing: None,
     };
     CmfModel::write(out, &header, &t, None, Some(tokenizer_json))?;
     Ok(())

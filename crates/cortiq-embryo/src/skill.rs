@@ -70,33 +70,86 @@ fn f16_base64(x: &[f32]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
-/// Fit the P1 selection descriptor from φ samples: mean + rank principal
-/// directions (orthonormal rows).
-pub fn fit_selection(phis: &[Vec<f32>], phi_layer: usize, rank: usize) -> SelectionDescriptor {
+/// Fit the P1 selection descriptor from φ samples (cortiq-router recipe):
+/// mean + rank principal directions (orthonormal rows) on the TRAIN part,
+/// training reconstruction-error statistics (err_mean/err_std) for the
+/// novelty z-score, and the HELD-OUT φ samples carried in the record so the
+/// container can recalibrate temperature/θ over all its skills later.
+pub fn fit_selection(phis_raw: &[Vec<f32>], phi_layer: usize, rank: usize) -> SelectionDescriptor {
+    // unit-norm φ (the cortiq-router recipe scores unit embeddings: errors
+    // and margins live on an O(1) scale its constants were tuned for)
+    let phis: Vec<Vec<f32>> = phis_raw
+        .iter()
+        .map(|p| {
+            let n = p.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+            p.iter().map(|x| x / n).collect()
+        })
+        .collect();
     let n = phis.len();
     let h = phis[0].len();
+    // 80/20 split, held-out never enters the mean/basis
+    let n_hold = (n / 5).clamp(1, n.saturating_sub(2).max(1));
+    let (train, hold) = phis.split_at(n - n_hold);
+    let nt = train.len();
     let mut mean = vec![0f32; h];
-    for p in phis {
+    for p in train {
         for (m, v) in mean.iter_mut().zip(p) {
-            *m += v / n as f32;
+            *m += v / nt as f32;
         }
     }
-    let rank = rank.min(n.saturating_sub(1)).max(1).min(16);
-    // covariance and top eigenvectors
+    let rank = rank.min(nt.saturating_sub(1)).max(1).min(16);
     let mut cov = vec![0f32; h * h];
-    for p in phis {
+    for p in train {
         let c: Vec<f32> = p.iter().zip(&mean).map(|(v, m)| v - m).collect();
         for i in 0..h {
             if c[i] == 0.0 {
                 continue;
             }
             for j in 0..h {
-                cov[i * h + j] += c[i] * c[j] / n as f32;
+                cov[i * h + j] += c[i] * c[j] / nt as f32;
             }
         }
     }
-    let basis = crate::model::top_eigenvectors(&cov, h, rank, 40, 99);
-    SelectionDescriptor { metric: "mse".into(), phi_layer, mean: f16_base64(&mean), basis: f16_base64(&basis), rank }
+    let basis = crate::model::top_eigenvectors(&cov, h, rank, 120, 99);
+    // training error distribution
+    let errs: Vec<f32> = train.iter().map(|p| cortiq_engine::router::recon_error(p, &mean, &basis, rank)).collect();
+    let em = errs.iter().sum::<f32>() / nt as f32;
+    let es = (errs.iter().map(|e| (e - em).powi(2)).sum::<f32>() / nt as f32).sqrt().max(1e-4);
+    let mut hold_flat = Vec::with_capacity(hold.len() * h);
+    for p in hold {
+        hold_flat.extend_from_slice(p);
+    }
+    SelectionDescriptor {
+        metric: "mse_unit".into(),
+        phi_layer,
+        mean: f16_base64(&mean),
+        basis: f16_base64(&basis),
+        rank,
+        err_mean: Some(em),
+        err_std: Some(es),
+        holdout: Some(f16_base64(&hold_flat)),
+        holdout_n: Some(hold.len()),
+    }
+}
+
+/// Recalibrate a container's skill router (temperature + θ) from the
+/// held-out φ every skill carries; rewrites the header only (tensor bytes
+/// copied verbatim). Returns the calibration written.
+pub fn calibrate_file(path: &Path, target_fpr: f32) -> anyhow::Result<Option<cortiq_core::format::RoutingCalibration>> {
+    let model = CmfModel::open(path)?;
+    let Some(cal) = cortiq_engine::router::calibrate(&model, target_fpr) else { return Ok(None) };
+    let mut header = model.header.clone();
+    header.routing = Some(cal.clone());
+    let specs: Vec<TensorSpec> = model
+        .tensors
+        .iter()
+        .map(|t| TensorSpec { name: t.name.clone(), dtype: t.dtype, shape: t.shape.clone(), data: model.tensor_bytes(&t.name).map(|b| b.to_vec()).unwrap_or_default() })
+        .collect();
+    let tmp = path.with_extension("cmf.cal");
+    CmfModel::write(&tmp, &header, &specs, if model.masks.masks.is_empty() { None } else { Some(&model.masks) }, model.vocab.as_deref())?;
+    drop(model);
+    std::fs::rename(&tmp, path)?;
+    Ok(Some(cal))
 }
 
 /// Bake: returns (replacement tensors [(runtime tensor name, shape, data)],
@@ -227,7 +280,7 @@ pub fn bake(
     // ---- routing descriptor: φ = mean-pooled hidden entering phi_layer over corpus windows ----
     let mut phis: Vec<Vec<f32>> = Vec::new();
     let mut ps = Sampler::new(a.batch, a.seq, a.seed + 7);
-    for _ in 0..16 {
+    for _ in 0..24 {
         ps.batch(&train, &mut tk, &mut tg);
         phis.extend(gpu.probe_phi(&tk, a.phi_layer, a.phi_len));
     }

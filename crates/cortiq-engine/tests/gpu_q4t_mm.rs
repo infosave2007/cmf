@@ -65,6 +65,7 @@ fn gpu_q4t_matmat_matches_dequant_reference() {
         skills: Vec::new(),
         shard: None,
         calibration: None,
+        routing: None,
     };
     let spec = TensorSpec {
         name: "w".into(),
@@ -196,6 +197,7 @@ fn gpu_q4t_ffn_matches_dequant_reference() {
         skills: Vec::new(),
         shard: None,
         calibration: None,
+        routing: None,
     };
     let spec = |name: &str, rows: usize, cols: usize, data: &[u8]| TensorSpec {
         name: name.into(),

@@ -1342,7 +1342,7 @@ kernel void moe_stats_f32(
 // experts that received tokens; bias_e += η·(1/E − count_e/rows) (loss-free
 // balancing toward equal load). One thread per (e, j); thread j == 0 also
 // moves the bias.
-struct MoeUpdArgs { uint rows, H, E; float alpha, eta; };
+struct MoeUpdArgs { uint rows, H, E; float alpha, eta; uint frozen_below; };
 kernel void moe_update_f32(
     device float*       mu    [[buffer(0)]],
     device float*       bias  [[buffer(1)]],
@@ -1354,6 +1354,7 @@ kernel void moe_update_f32(
 {
     if (gid >= a.E * a.H) return;
     uint e = gid / a.H, j = gid % a.H;
+    if (e < a.frozen_below) return;   // old records: descriptors never move
     uint n = count[e];
     if (n > 0) {
         float mean = sums[gid] / (float)n;

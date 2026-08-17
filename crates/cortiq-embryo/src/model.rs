@@ -490,6 +490,9 @@ mod gpu {
         pub skill: Option<SkillState>,
         /// descriptors seeded from data (first training forward)
         pub desc_seeded: std::cell::Cell<bool>,
+        /// experts below this index keep their descriptors frozen (grown genome:
+        /// old records never move; only the new expert's μ/bias adapt)
+        pub desc_frozen_below: std::cell::Cell<usize>,
         pub desc_seed_rows: GBuf,
         pub scratch: Scratch,
         pub step: u32,
@@ -660,6 +663,7 @@ mod gpu {
                 route_frozen: std::cell::Cell::new(false),
                 skill: None,
                 desc_seeded: std::cell::Cell::new(false),
+                desc_frozen_below: std::cell::Cell::new(0),
                 desc_seed_rows: GBuf::from_u32(c, &(0..ne.max(1)).map(|e| ((e * 7919 + 13) % (b * t)) as u32).collect::<Vec<u32>>()),
                 scratch,
                 step: 0,
@@ -744,7 +748,7 @@ mod gpu {
             if train && self.desc_updates.get() {
                 // descriptor statistics → μ EMA + balancing bias
                 cmd.moe_stats(&r, &mo.hg, &d.count, e_off, &d.sums, mu_off);
-                cmd.moe_update(&r, &d.mu, mu_off, &d.bias, e_off, &d.sums, mu_off, &d.count, e_off, &mo.res, MOE_ALPHA, MOE_ETA);
+                cmd.moe_update(&r, &d.mu, mu_off, &d.bias, e_off, &d.sums, mu_off, &d.count, e_off, &mo.res, MOE_ALPHA, MOE_ETA, self.desc_frozen_below.get());
             }
         }
 
@@ -1564,5 +1568,44 @@ impl EmbryoGpu {
                 acc
             })
             .collect()
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl EmbryoGpu {
+    /// One step training ONLY the given arena ranges (everything else
+    /// frozen; grad clip over the ranges) — growth of new experts, FCD of a
+    /// subset, any append-only record. Returns (loss, grad norm).
+    pub fn train_step_ranges(&mut self, tokens: &[u32], targets: &[u32], lr: f32, wd: f32, clip: f32, ranges: &[(usize, usize)]) -> (f32, f32) {
+        use crate::metal::Cmd;
+        let m = self.b * self.t;
+        assert!(tokens.len() == m && targets.len() == m);
+        let c = self.ctx();
+        unsafe {
+            std::ptr::copy_nonoverlapping(tokens.as_ptr(), self.tok.buf.contents() as *mut u32, m);
+            std::ptr::copy_nonoverlapping(targets.as_ptr(), self.tgt.buf.contents() as *mut u32, m);
+        }
+        self.prepare_head(targets);
+        let cmd = Cmd::new(c);
+        self.encode_fwd_bwd(&cmd);
+        let mut groups = Vec::new();
+        let mut poff = 0usize;
+        for &(off, n) in ranges {
+            let g = cmd.sumsq_at(&self.g, off, n, &self.scratch.partial, poff);
+            groups.push((poff, g));
+            poff += g;
+        }
+        cmd.commit();
+        let part = self.scratch.partial.as_slice();
+        let gnorm = groups.iter().map(|&(o, g)| part[o..o + g].iter().map(|x| *x as f64).sum::<f64>()).sum::<f64>().sqrt() as f32;
+        let loss = self.read_loss();
+        let gscale = if gnorm > clip { clip / gnorm } else { 1.0 };
+        self.step += 1;
+        let cmd = Cmd::new(c);
+        for &(off, n) in ranges {
+            cmd.adamw_at(&self.p, &self.g, &self.m, &self.v, off, n, lr, 0.9, 0.95, 1e-8, wd, self.step, gscale);
+        }
+        cmd.commit();
+        (loss, gnorm)
     }
 }

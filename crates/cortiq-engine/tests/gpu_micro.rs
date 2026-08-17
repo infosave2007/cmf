@@ -90,6 +90,7 @@ fn q1_gpu_micro() {
         skills: Vec::new(),
         shard: None,
         calibration: None,
+        routing: None,
     };
     let spec = TensorSpec {
         name: "w".into(),
@@ -302,6 +303,7 @@ fn q8_gpu_micro() {
         skills: Vec::new(),
         shard: None,
         calibration: None,
+        routing: None,
     };
     let spec = TensorSpec {
         name: "w".into(),
@@ -441,6 +443,7 @@ fn q8_mul_mm_micro() {
         skills: Vec::new(),
         shard: None,
         calibration: None,
+        routing: None,
     };
     let spec = TensorSpec {
         name: "w".into(),
@@ -639,6 +642,7 @@ fn q1_chain_and_batch_parity() {
         skills: Vec::new(),
         shard: None,
         calibration: None,
+        routing: None,
     };
     let specs = vec![
         TensorSpec {
