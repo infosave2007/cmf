@@ -789,19 +789,22 @@ impl AudioStack {
         let hop = bwe.get("hop_length").and_then(|v| v.as_u64()).unwrap_or(80) as usize;
         Ok(AudioStack {
             decoder: AudioVaeDecoder::from_cmf(model)?,
+            // The first generator clamps its output; the bandwidth extender
+            // does not, because its output is a residual that is added to a
+            // resampled copy of the first one and clamped after the sum.
             vocoder: Vocoder::from_cmf(
                 model,
                 "avae.vocoder.vocoder",
                 &rates(&voc, vec![5, 2, 2, 2, 2, 2]),
                 &dils,
-                false,
+                voc.get("apply_final_activation").and_then(|v| v.as_bool()).unwrap_or(true),
             )?,
             bwe: Vocoder::from_cmf(
                 model,
                 "avae.vocoder.bwe_generator",
                 &rates(&bwe, vec![6, 5, 2, 2, 2]),
                 &dils,
-                false,
+                bwe.get("apply_final_activation").and_then(|v| v.as_bool()).unwrap_or(true),
             )?,
             mel: MelStft::load(model, "avae.vocoder.mel_stft", hop)?,
             hop,

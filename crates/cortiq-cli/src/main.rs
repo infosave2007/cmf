@@ -1150,6 +1150,22 @@ enum Commands {
         #[arg(long)]
         out_audio: Option<String>,
     },
+    /// Decode a saved audio latent through the audio VAE and vocoder.
+    LtxAudio {
+        #[arg(long)]
+        model: String,
+        /// safetensors carrying `audio_latent` (written by `ltx-video --out-latent`)
+        #[arg(long)]
+        latent: String,
+        #[arg(long, default_value = "out.wav")]
+        out: String,
+        /// Print the statistics of every stage
+        #[arg(long)]
+        stats: bool,
+        /// safetensors of reference `mel` / `waveform` to compare against
+        #[arg(long)]
+        oracle: Option<String>,
+    },
     /// Pack LTX-2.5 — the 22B audio-video DiT, the Gemma-4 12B prompt
     /// encoder, both VAEs, the latent upscalers and the duration head —
     /// into ONE q4tp .cmf. Multi-pass: `--in` carries an earlier pass
@@ -2054,6 +2070,15 @@ async fn main() -> anyhow::Result<()> {
             out_latent: out_latent.as_deref(),
             out_audio: out_audio.as_deref(),
         }),
+        Commands::LtxAudio { model, latent, out, stats, oracle } => {
+            ltxcmd::cmd_ltx_audio(ltxcmd::AudioArgs {
+                model: &model,
+                latent: &latent,
+                out: &out,
+                stats,
+                oracle: oracle.as_deref(),
+            })
+        }
         Commands::LtxPack {
             out,
             carry,
