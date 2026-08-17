@@ -18,6 +18,7 @@ pub mod inference;
 pub mod kv_cache;
 pub mod linear_core;
 pub mod loader;
+pub mod ltxvae;
 pub mod mm_ab;
 pub mod mmh3;
 pub mod music3;
