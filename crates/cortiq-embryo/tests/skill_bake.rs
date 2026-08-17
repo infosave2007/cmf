@@ -59,7 +59,7 @@ fn bake_appends_a_byte_identical_skill_the_runtime_loads() {
         rank: 4,
         seed: 3,
     };
-    let (tensors, sel, kept, (l0, la, lb)) = bake(&ck, &corpus, &a).expect("bake");
+    let (tensors, sel, kept, (l0, la, lb)) = bake(&ck, &corpus, &a, &|| false).expect("bake");
     eprintln!("held-out: base {l0:.4} → mask {la:.4} → mask+fcd {lb:.4}; kept {kept:?}");
     assert_eq!(tensors.len(), 6);
     assert!(lb <= l0 + 1e-3, "the skill must not be worse than the base on its own held-out ({lb} vs {l0})");

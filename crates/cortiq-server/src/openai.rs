@@ -181,12 +181,21 @@ async fn run_generation(
     on_token: Option<cortiq_engine::TokenCallback>,
 ) -> Result<(GenerateResult, f64), Response> {
     let started = std::time::Instant::now();
+    // The organism's day side: idle marker + OOD buffer (CMF_OOD_DIR).
+    crate::ood::touch_last_request();
+    let ood_on = crate::ood::ood_dir().is_some();
+    let ood_state = state.clone();
 
     // Check a pipeline slot out for this generation: up to
     // `slots` requests decode concurrently, the rest queue here.
     let mut slot = state.slots.acquire().await;
     let remote = state.remote.clone();
     let outcome = tokio::task::spawn_blocking(move || {
+        if ood_on {
+            let text = ood_state.tokenizer.decode(&prompt_ids);
+            let p = &mut *slot.pipe;
+            crate::ood::record_if_ood(ood_state.runtime.model(), p, &prompt_ids, &text);
+        }
         // Replica mode: the compute happens HERE, on a blocking-pool
         // thread that never saw the pin `acquire` set on the async
         // thread. Pin it again or every replica quietly shares card 0
