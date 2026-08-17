@@ -199,6 +199,15 @@ fn is_exact_plane(name: &str) -> bool {
         || name.ends_with("keyframes_abs_pos_embedding")
         || name.contains("per_channel_statistics")
         || name.ends_with("layer_scalar")
+        // The adaLN-single stacks. Their output is not a residual: it is the
+        // scale and shift every block applies to every token, so a codec
+        // error here is not averaged away by anything downstream — it is
+        // multiplied into the whole stream. Measured against the reference,
+        // quantizing these three projections put 3.6e-2 of relative error
+        // into the very first normalization of block 0, while the attention
+        // and feed-forward planes around them cost 3e-3. They are 420 M of
+        // 21 B weights: 0.6 GB to keep exact, and worth every byte.
+        || name.contains("adaln_single")
 }
 
 struct Policy {
@@ -261,6 +270,14 @@ fn pack_component(
             } else {
                 Level::F16
             }
+        } else if short.ends_with("embed_tokens.weight") {
+            // The token table is the one plane whose error nothing dilutes:
+            // it *is* the residual stream at layer zero, and it carries
+            // straight through forty-eight residual additions. Measured
+            // against the reference on a real prompt, q4tp put 11% into the
+            // first hidden state and every one after it; q8 puts 0.5% there
+            // for half a gigabyte more on a 22 GB file.
+            Level::Q8
         } else if conv {
             pol.conv_level
         } else if e.shape.len() == 2 && numel >= pol.min_q4tp {
