@@ -792,7 +792,7 @@ pub fn cmd_ltx_video(a: VideoArgs<'_>) -> anyhow::Result<()> {
     };
     drop(dit);
     if let Some(p) = a.out_latent {
-        write_latent(p, &vol, &geo)?;
+        write_latent(p, &vol, &geo, &audio)?;
     }
     // The soundtrack came out of the same 48 blocks as the picture; the
     // audio VAE and its vocoder turn it into a waveform.
@@ -833,13 +833,23 @@ pub fn cmd_ltx_video(a: VideoArgs<'_>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn write_latent(p: &str, vol: &[f32], geo: &cortiq_engine::ltxpipe::Geometry) -> anyhow::Result<()> {
-    let mut bytes = Vec::with_capacity(vol.len() * 4);
+fn write_latent(
+    p: &str,
+    vol: &[f32],
+    geo: &cortiq_engine::ltxpipe::Geometry,
+    audio: &[f32],
+) -> anyhow::Result<()> {
+    let mut bytes = Vec::with_capacity(vol.len() * 4 + audio.len() * 4);
     for v in vol {
         bytes.extend_from_slice(&v.to_le_bytes());
     }
+    let split = bytes.len();
+    for v in audio {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
     let hdr = serde_json::json!({
-        "latent": {"dtype":"F32","shape":[1, 128, geo.lf, geo.lh, geo.lw],"data_offsets":[0, bytes.len()]}
+        "latent": {"dtype":"F32","shape":[1, 128, geo.lf, geo.lh, geo.lw],"data_offsets":[0, split]},
+        "audio_latent": {"dtype":"F32","shape":[1, geo.af, 128],"data_offsets":[split, bytes.len()]}
     });
     let hs = serde_json::to_vec(&hdr)?;
     let mut f = std::fs::File::create(p)?;
@@ -863,5 +873,125 @@ fn write_frames(d: &str, out: &Vol) -> anyhow::Result<()> {
         write_ppm(&Path::new(d).join(format!("frame_{f:04}.ppm")), &frame, out.h, out.w)?;
     }
     println!("{} frames → {d}/frame_*.ppm", out.f);
+    Ok(())
+}
+
+// -------------------------------------------------------------- ltx-audio
+
+pub struct AudioArgs<'a> {
+    pub model: &'a str,
+    pub latent: &'a str,
+    pub out: &'a str,
+    pub stats: bool,
+    pub oracle: Option<&'a str>,
+}
+
+/// Decode a saved audio latent on its own — the fast loop for the audio
+/// tail, which is seconds of work behind minutes of denoising.
+pub fn cmd_ltx_audio(a: AudioArgs<'_>) -> anyhow::Result<()> {
+    use cortiq_engine::ltxaudio::{AudioStack, Grid, write_wav};
+    use cortiq_engine::ltxpipe::unpatchify_audio;
+    let model = Arc::new(CmfModel::open_sharded(a.model)?);
+    let pool = Pool::from_env();
+    let st = St::open(Path::new(a.latent))?;
+    // an oracle file carries the reference's own latent, so the comparison
+    // is of this stack against that stack on identical input
+    let (shape, vals) = st.get("audio_latent")?;
+    let frames = if shape.len() == 4 { shape[2] } else { shape[shape.len() - 2] };
+    let vals = if shape.len() == 4 {
+        // the reference dumps [B, 8, T, 16]; ours is the patchified [B, T, 128]
+        let (c, t, m) = (shape[1], shape[2], shape[3]);
+        let mut p = vec![0f32; t * c * m];
+        for ch in 0..c {
+            for ti in 0..t {
+                for mi in 0..m {
+                    p[ti * c * m + ch * m + mi] = vals[(ch * t + ti) * m + mi];
+                }
+            }
+        }
+        p
+    } else {
+        vals
+    };
+    let stack = AudioStack::from_cmf(&model).map_err(|e| anyhow!(e))?;
+    let grid = Grid { c: 8, h: frames, w: 16, data: unpatchify_audio(&vals, frames) };
+    let describe = |name: &str, v: &[f32]| {
+        let n = v.len().max(1) as f64;
+        let mean = v.iter().map(|&x| x as f64).sum::<f64>() / n;
+        let rms = (v.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>() / n).sqrt();
+        let (lo, hi) = v.iter().fold((f32::MAX, f32::MIN), |(l, h), &x| (l.min(x), h.max(x)));
+        println!("{name:<12} n {:<9} mean {:+.4} rms {:.4} range [{:+.3}, {:+.3}]", v.len(), mean, rms, lo, hi);
+    };
+    if a.stats {
+        describe("latent", &grid.data);
+        let mel = stack.decoder.decode(&grid, pool.as_deref());
+        describe("log-mel", &mel.data);
+        // per-frame energy, to see whether anything happens over time
+        let step = (mel.h / 12).max(1);
+        let e: Vec<String> = (0..mel.h)
+            .step_by(step)
+            .map(|f| {
+                let mut s = 0f64;
+                for c in 0..mel.c {
+                    for m in 0..mel.w {
+                        s += mel.data[(c * mel.h + f) * mel.w + m] as f64;
+                    }
+                }
+                format!("{:.1}", s / (mel.c * mel.w) as f64)
+            })
+            .collect();
+        println!("mel over time: {}", e.join(" "));
+    }
+    if let Some(p) = a.oracle {
+        let o = St::open(Path::new(p))?;
+        let mel = stack.decoder.decode(&grid, pool.as_deref());
+        let cmp = |name: &str, ours: &[f32], r: &[f32]| {
+            let n = ours.len().min(r.len());
+            let (mut worst, mut s, mut rs) = (0f64, 0f64, 0f64);
+            for (x, y) in ours[..n].iter().zip(&r[..n]) {
+                let d = (*x as f64 - *y as f64).abs();
+                worst = worst.max(d);
+                s += d * d;
+                rs += (*y as f64) * (*y as f64);
+            }
+            println!(
+                "{name:<10} ours {} ref {}  worst {:.2e} rel {:.2e}",
+                ours.len(),
+                r.len(),
+                worst,
+                (s / rs.max(1e-30)).sqrt()
+            );
+        };
+        if let Ok((_, r)) = o.get("mel") {
+            cmp("mel", &mel.data, &r);
+        }
+        if let Ok((_, r)) = o.get("waveform") {
+            let w = stack.decode(&grid, pool.as_deref());
+            cmp("waveform", &w.data, &r);
+        }
+    }
+    let t = std::time::Instant::now();
+    let wave = stack.decode(&grid, pool.as_deref());
+    if a.stats {
+        describe("waveform", &wave.data);
+        let blk = (wave.t / 12).max(1);
+        let env: Vec<String> = (0..wave.t)
+            .step_by(blk)
+            .map(|i| {
+                let hi = (i + blk).min(wave.t);
+                let s: f64 = wave.data[i..hi].iter().map(|&x| (x as f64) * (x as f64)).sum();
+                format!("{:.3}", (s / (hi - i) as f64).sqrt())
+            })
+            .collect();
+        println!("envelope: {}", env.join(" "));
+    }
+    write_wav(Path::new(a.out), &wave, stack.out_rate)?;
+    println!(
+        "{:.2}s of {} Hz stereo → {} ({:.1}s)",
+        wave.t as f64 / stack.out_rate as f64,
+        stack.out_rate,
+        a.out,
+        t.elapsed().as_secs_f64()
+    );
     Ok(())
 }

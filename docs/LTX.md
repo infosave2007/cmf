@@ -46,10 +46,16 @@ cortiq ltx-video \
   --prompt "A corgi in a chef hat flips a pancake in a sunlit kitchen. \
 Warm morning light, static camera." \
   --height 256 --width 384 --frames 49 --fps 24 --seed 42 \
-  --out corgi.y4m
+  --out corgi.y4m --out-audio corgi.wav
 
-ffmpeg -i corgi.y4m -pix_fmt yuv420p corgi.mp4
+# picture and soundtrack into one file
+ffmpeg -i corgi.y4m -i corgi.wav -pix_fmt yuv420p -c:v libx264 -crf 18 \
+  -c:a aac -shortest corgi.mp4
 ```
+
+The transformer denoises picture and sound in the same 48 blocks, so the
+soundtrack costs nothing extra to generate — only the eight seconds the audio
+VAE and its vocoder take to turn the latent into 48 kHz stereo.
 
 The renderer writes [YUV4MPEG2](https://wiki.multimedia.cx/index.php/YUV4MPEG2),
 a raw stream every tool understands, so `cortiq` needs no video encoder of
@@ -123,6 +129,18 @@ cortiq ltx-decode --model ltx25-q4tp.cmf \
 
 The 3-D convolutional decoder on its own: causal-free convolutions, PixelNorm,
 depth-to-space upsamples and the `per_channel_statistics` un-normalization.
+
+### Decode a soundtrack
+
+```bash
+cortiq ltx-audio --model ltx25-q4tp.cmf \
+  --latent latent.safetensors --out out.wav --stats
+```
+
+`ltx-video --out-latent` writes the audio latent alongside the video one, so
+the audio tail — seconds of work behind minutes of denoising — can be
+re-run on its own. `--stats` prints what every stage produced: the latent, the
+log-mel, and the waveform's envelope over time.
 
 ## Pack the container yourself
 
