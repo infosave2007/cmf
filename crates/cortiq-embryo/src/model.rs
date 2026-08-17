@@ -471,6 +471,8 @@ mod gpu {
         pub head_idx: GBuf,    // [Mpad] i32 grouped row → token index (−1 pad)
         /// (cluster, row offset, padded rows) of the grouped rows
         pub head_groups: std::cell::RefCell<Vec<(usize, usize, usize)>>,
+        /// positions with a target (u32::MAX = ignored) in the last prepared batch
+        pub head_valid: std::cell::Cell<usize>,
         pub hg: GBuf,    // [Mpad, H] gathered rows
         pub dhg: GBuf,   // [Mpad, H]
         pub lw: GBuf,    // [Mpad, S] within-cluster logits
@@ -650,6 +652,7 @@ mod gpu {
                 tgt_cluster: GBuf::from_u32(c, &vec![0u32; m]),
                 head_idx: GBuf::from_u32(c, &vec![u32::MAX; mpad.max(1)]),
                 head_groups: std::cell::RefCell::new(Vec::new()),
+                head_valid: std::cell::Cell::new(0),
                 hg: z(mpad * h),
                 dhg: z(mpad * h),
                 lw: z(mpad * cs.max(1)),
@@ -1002,6 +1005,10 @@ mod gpu {
             let mut tc = vec![0u32; m];
             let mut buckets: Vec<Vec<i32>> = vec![Vec::new(); ncl];
             for (i, &t) in targets.iter().enumerate() {
+                if t == u32::MAX {
+                    tc[i] = u32::MAX; // ignored position (no target)
+                    continue;
+                }
                 let c = (t as usize / cs).min(ncl - 1);
                 tc[i] = c as u32;
                 buckets[c].push(i as i32);
@@ -1024,11 +1031,11 @@ mod gpu {
                 std::ptr::copy_nonoverlapping(idx.as_ptr(), self.head_idx.buf.contents() as *mut i32, idx.len());
             }
             *self.head_groups.borrow_mut() = groups;
+            self.head_valid.set(targets.iter().filter(|&&t| t != u32::MAX).count());
         }
 
-        /// Head: loss (+ dxf and dE/dC when `train`). Flat full-softmax or
-        /// hierarchical (cluster CE + within-target-cluster CE), tied to E.
-        pub(crate) fn encode_head(&self, cmd: &Cmd, train: bool) {
+        /// Head on the given hidden/targets (the MTP heads reuse the tied head).
+        pub(crate) fn encode_head_on(&self, cmd: &Cmd, train: bool, x: &GBuf, dx: &GBuf, tgt: &GBuf) {
             let cfg = &self.cfg;
             let (h, m) = (cfg.hidden, self.b * self.t);
             let s = &self.scratch;
@@ -1037,11 +1044,11 @@ mod gpu {
             if ncl == 0 {
                 let r = self.head_rows;
                 for c0 in (0..m).step_by(r) {
-                    cmd.gemm(Op::N, Op::T, r, cfg.vocab, h, 1.0, &self.xf, c0 * h, h, &self.p, self.lay.embed, h, 0.0, &s.logits, 0, cfg.vocab);
-                    cmd.softmax_ce_at(&s.logits, 0, &self.tgt, c0, &s.loss, c0, r, cfg.vocab, scale);
+                    cmd.gemm(Op::N, Op::T, r, cfg.vocab, h, 1.0, x, c0 * h, h, &self.p, self.lay.embed, h, 0.0, &s.logits, 0, cfg.vocab);
+                    cmd.softmax_ce_at(&s.logits, 0, tgt, c0, &s.loss, c0, r, cfg.vocab, scale);
                     if train {
-                        cmd.gemm(Op::N, Op::N, r, h, cfg.vocab, 1.0, &s.logits, 0, cfg.vocab, &self.p, self.lay.embed, h, 0.0, &self.dxf, c0 * h, h);
-                        cmd.gemm(Op::T, Op::N, cfg.vocab, h, r, 1.0, &s.logits, 0, cfg.vocab, &self.xf, c0 * h, h, 1.0, &self.g, self.lay.embed, h);
+                        cmd.gemm(Op::N, Op::N, r, h, cfg.vocab, 1.0, &s.logits, 0, cfg.vocab, &self.p, self.lay.embed, h, 0.0, dx, c0 * h, h);
+                        cmd.gemm(Op::T, Op::N, cfg.vocab, h, r, 1.0, &s.logits, 0, cfg.vocab, x, c0 * h, h, 1.0, &self.g, self.lay.embed, h);
                     }
                 }
                 return;
@@ -1049,31 +1056,38 @@ mod gpu {
             let cs = cfg.vocab / ncl;
             let hc = self.lay.head_clusters;
             // level 1: clusters
-            cmd.gemm(Op::N, Op::T, m, ncl, h, 1.0, &self.xf, 0, h, &self.p, hc, h, 0.0, &self.lc, 0, ncl);
+            cmd.gemm(Op::N, Op::T, m, ncl, h, 1.0, x, 0, h, &self.p, hc, h, 0.0, &self.lc, 0, ncl);
             cmd.softmax_ce_at(&self.lc, 0, &self.tgt_cluster, 0, &s.loss, 0, m, ncl, scale);
             if train {
-                cmd.gemm(Op::N, Op::N, m, h, ncl, 1.0, &self.lc, 0, ncl, &self.p, hc, h, 0.0, &self.dxf, 0, h);
-                cmd.gemm(Op::T, Op::N, ncl, h, m, 1.0, &self.lc, 0, ncl, &self.xf, 0, h, 1.0, &self.g, hc, h);
+                cmd.gemm(Op::N, Op::N, m, h, ncl, 1.0, &self.lc, 0, ncl, &self.p, hc, h, 0.0, dx, 0, h);
+                cmd.gemm(Op::T, Op::N, ncl, h, m, 1.0, &self.lc, 0, ncl, x, 0, h, 1.0, &self.g, hc, h);
             }
             // level 2: within the target cluster, rows grouped by cluster
             let groups = self.head_groups.borrow();
             let rows_total = groups.last().map(|(_, off, pad)| off + pad).unwrap_or(0);
+            let n_valid = self.head_valid.get();
             assert!(
-                rows_total >= m,
+                rows_total >= n_valid,
                 "hierarchical head: prepare_head(targets) must precede the encode (grouped {rows_total} rows for {m} tokens)"
             );
-            cmd.gather_rows(&self.xf, &self.head_idx, &self.hg, rows_total, h);
+            cmd.gather_rows(x, &self.head_idx, &self.hg, rows_total, h);
             for &(c, off, pad) in groups.iter() {
                 cmd.gemm(Op::N, Op::T, pad, cs, h, 1.0, &self.hg, off * h, h, &self.p, self.lay.embed + c * cs * h, h, 0.0, &self.lw, off * cs, cs);
             }
-            cmd.softmax_ce_idx(&self.lw, &self.head_idx, &self.tgt, &self.loss2, rows_total, cs, scale);
+            cmd.softmax_ce_idx(&self.lw, &self.head_idx, tgt, &self.loss2, rows_total, cs, scale);
             if train {
                 for &(c, off, pad) in groups.iter() {
                     cmd.gemm(Op::N, Op::N, pad, h, cs, 1.0, &self.lw, off * cs, cs, &self.p, self.lay.embed + c * cs * h, h, 0.0, &self.dhg, off * h, h);
                     cmd.gemm(Op::T, Op::N, cs, h, pad, 1.0, &self.lw, off * cs, cs, &self.hg, off * h, h, 1.0, &self.g, self.lay.embed + c * cs * h, h);
                 }
-                cmd.scatter_add_rows(&self.dxf, &self.head_idx, &self.dhg, rows_total, h);
+                cmd.scatter_add_rows(dx, &self.head_idx, &self.dhg, rows_total, h);
             }
+        }
+
+
+        /// Head: loss (+ dxf and dE/dC when `train`) on xf/tgt.
+        pub(crate) fn encode_head(&self, cmd: &Cmd, train: bool) {
+            self.encode_head_on(cmd, train, &self.xf, &self.dxf, &self.tgt);
         }
 
         /// Mean loss of the batch just run (both levels of the head).
