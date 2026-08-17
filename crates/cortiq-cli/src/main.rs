@@ -12,6 +12,7 @@ mod npy;
 mod requant;
 mod sign;
 mod skill;
+mod ltxcmd;
 mod ltxpack;
 mod videopack;
 
@@ -1033,6 +1034,27 @@ enum Commands {
         #[arg(long, default_value = "music.wav")]
         out: String,
     },
+    /// Decode LTX-2.5 latents through the packed video VAE (`vvae.*`).
+    LtxDecode {
+        /// The .cmf packed by `ltx-pack`
+        #[arg(long)]
+        model: String,
+        /// safetensors with a `latent` tensor [1,128,F,H,W] or [128,F,H,W]
+        #[arg(long)]
+        latent: String,
+        /// Write frames as PPM stills into this directory
+        #[arg(long)]
+        out_dir: Option<String>,
+        /// Write the decoded frames as a safetensors tensor
+        #[arg(long)]
+        out_tensors: Option<String>,
+        /// Compare against a `frames` tensor in --latent and report the difference
+        #[arg(long)]
+        gate: bool,
+        /// Write every intermediate stage to a safetensors (port debugging)
+        #[arg(long)]
+        dump_stages: Option<String>,
+    },
     /// Pack LTX-2.5 — the 22B audio-video DiT, the Gemma-4 12B prompt
     /// encoder, both VAEs, the latent upscalers and the duration head —
     /// into ONE q4tp .cmf. Multi-pass: `--in` carries an earlier pass
@@ -1851,6 +1873,21 @@ async fn main() -> anyhow::Result<()> {
             seed,
             out,
         } => music::cmd_music(&model, &prompt, &lyrics, seconds, steps, seed, &out),
+        Commands::LtxDecode {
+            model,
+            latent,
+            out_dir,
+            out_tensors,
+            gate,
+            dump_stages,
+        } => ltxcmd::cmd_ltx_decode(ltxcmd::DecodeArgs {
+            model: &model,
+            latent: &latent,
+            out_dir: out_dir.as_deref(),
+            out_tensors: out_tensors.as_deref(),
+            gate,
+            dump_stages: dump_stages.as_deref(),
+        }),
         Commands::LtxPack {
             out,
             carry,
