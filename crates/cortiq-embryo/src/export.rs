@@ -86,7 +86,7 @@ pub fn export(ck: &Checkpoint, tokenizer_json: &[u8], out: &Path) -> anyhow::Res
     for (l, lo) in lay.layers.iter().enumerate() {
         let pf = format!("model.layers.{l}.");
         let ffn = match lo {
-            LayerOffs::Mixer { ln1, wq, wk, wv, wkap, wo, ln2, ffn } => {
+            LayerOffs::Mixer { ln1, wq, wk, wv, wkap, wo, alog, ln2, ffn } => {
                 t.push(spec(&format!("{pf}input_layernorm.weight"), &[h], sl(*ln1, h)));
                 t.push(spec(&format!("{pf}post_attention_layernorm.weight"), &[h], sl(*ln2, h)));
                 let (nh, nph, dv) = (cfg.heads, cfg.nphase, cfg.dv);

@@ -42,6 +42,10 @@ pub struct EmbryoCfg {
     pub mtp_heads: usize,
     pub seq: usize,
     pub norm_eps: f32,
+    /// decays γ = exp(−exp(A_log)) are trained (A_log per head·feature in the
+    /// arena, initialised from the horizon grid) instead of fixed
+    #[serde(default)]
+    pub learn_decay: bool,
 }
 
 impl EmbryoCfg {
@@ -67,6 +71,7 @@ impl EmbryoCfg {
             mtp_heads: 2,
             seq: 1024,
             norm_eps: 1e-6,
+            learn_decay: false,
         }
     }
     /// A tiny genome for smoke tests and gradchecks (same shape family,
@@ -93,6 +98,7 @@ impl EmbryoCfg {
             mtp_heads: 0,
             seq: 64,
             norm_eps: 1e-6,
+            learn_decay: false,
         }
     }
     pub fn is_anchor(&self, layer: usize) -> bool {
@@ -153,6 +159,8 @@ pub enum LayerOffs {
         wv: usize,   // [nh·dv, H]
         wkap: usize, // [kappa_ld, H] (rows ≥ nh are zero, never trained)
         wo: usize,   // [H, nh·dv]
+        /// [nh·2nph] A_log (usize::MAX when the decay grid is fixed)
+        alog: usize,
         ln2: usize,
         ffn: FfnOffs,
     },
@@ -225,9 +233,10 @@ impl Layout {
                 let wv = take(format!("layers.{l}.hk.v"), cfg.heads * cfg.dv * h);
                 let wkap = take(format!("layers.{l}.hk.kappa"), cfg.kappa_ld() * h);
                 let wo = take(format!("layers.{l}.hk.o"), h * cfg.heads * cfg.dv);
+                let alog = if cfg.learn_decay { take(format!("layers.{l}.hk.alog"), cfg.heads * 2 * cfg.nphase) } else { usize::MAX };
                 let ln2 = take(format!("layers.{l}.ln2"), h);
                 let f = ffn(&mut take);
-                layers.push(LayerOffs::Mixer { ln1, wq, wk, wv, wkap, wo, ln2, ffn: f });
+                layers.push(LayerOffs::Mixer { ln1, wq, wk, wv, wkap, wo, alog, ln2, ffn: f });
             }
         }
         let final_norm = take("final_norm".into(), h);
@@ -268,7 +277,7 @@ pub fn init_params(cfg: &EmbryoCfg, lay: &Layout, seed: u64) -> Vec<f32> {
     for (l, lo) in lay.layers.iter().enumerate() {
         let _ = l;
         match lo {
-            LayerOffs::Mixer { ln1, wq, wk, wv, wkap, wo, ln2, ffn } => {
+            LayerOffs::Mixer { ln1, wq, wk, wv, wkap, wo, alog, ln2, ffn } => {
                 p[*ln1..*ln1 + h].fill(1.0);
                 p[*ln2..*ln2 + h].fill(1.0);
                 // phase projections: θ = W·x̂ with x̂ RMS-normed → θ std ≈ s·√H;
@@ -279,6 +288,14 @@ pub fn init_params(cfg: &EmbryoCfg, lay: &Layout, seed: u64) -> Vec<f32> {
                 fill(&mut p, *wv, cfg.heads * cfg.dv * h, std);
                 fill(&mut p, *wkap, cfg.heads * h, std); // pad rows stay 0
                 fill(&mut p, *wo, h * cfg.heads * cfg.dv, std * out_scale);
+                if *alog != usize::MAX {
+                    // A_log = ln(−ln γ) of the horizon grid: the learned decays start
+                    // exactly where the fixed ones were
+                    let g = crate::ops::hk_decay_grid(cfg.heads, cfg.nphase, cfg.horizon_min, cfg.horizon_max);
+                    for (i, gv) in g.iter().enumerate() {
+                        p[*alog + i] = (-(*gv as f64).ln()).ln() as f32;
+                    }
+                }
                 fill(&mut p, ffn.wg, cfg.inter * h, std);
                 fill(&mut p, ffn.wu, cfg.inter * h, std);
                 fill(&mut p, ffn.wd, h * cfg.inter, std * out_scale);
@@ -678,6 +695,13 @@ mod gpu {
             })
         }
 
+        /// Offset of layer `l`'s γ^δ table in `self.pow` (learnable decay: one
+        /// table per layer, rebuilt from A_log each forward; fixed grid: one
+        /// shared table at 0).
+        pub fn pow_off(&self, l: usize) -> usize {
+            if self.cfg.learn_decay { l * self.cfg.heads * 65 * 2 * self.cfg.nphase } else { 0 }
+        }
+
         pub fn hk_scratch(&self) -> HkScratch<'_> {
             let s = &self.scratch;
             HkScratch { qt: &s.hk_qt, kt: &s.hk_kt, qp: &s.hk_qp, kh: &s.hk_kh, dqt: &s.hk_dqt, dkt: &s.hk_dkt, dqi: &s.hk_dqi, dki: &s.hk_dki, a: &s.hk_a }
@@ -826,7 +850,7 @@ mod gpu {
             let m = b * t;
             match (&self.lay.layers[l], &self.acts[l]) {
                 (
-                    LayerOffs::Mixer { ln1, wq, wk, wv, wkap, wo, ln2, ffn },
+                    LayerOffs::Mixer { ln1, wq, wk, wv, wkap, wo, alog, ln2, ffn },
                     LayerActs::Mixer { x_in, x1, inv1, thq, thk, v, kpre, kappa, phq, phk, kv, states, o, x_mid, x2, inv2, gte, up, hh },
                 ) => {
                     let (nh, nph, dv) = (cfg.heads, cfg.nphase, cfg.dv);
@@ -838,7 +862,7 @@ mod gpu {
                     cmd.gemm(Op::N, Op::T, m, kld, h, 1.0, x1, 0, h, &self.p, *wkap, h, 0.0, kpre, 0, kld);
                     cmd.kappa_fwd(kpre, kappa, m, nh, kld, cfg.kappa_bias);
                     let d = HkDims { b, t, nh, nph, dv };
-                    let w = HkWork { thq, thk, v, kappa, pow: &self.pow, phq, phk, kv, states, out: o };
+                    let w = HkWork { thq, thk, v, kappa, pow: &self.pow, pow_off: self.pow_off(l), phq, phk, kv, states, out: o };
                     if hk_simt() { cmd.hk_forward(&d, &w) } else { cmd.hk_forward_gemm(&d, &w, &self.hk_scratch()) }
                     // x_mid = x_in + o·Woᵀ   ([M, nh·dv]·[H, nh·dv]ᵀ)
                     cmd.copy(x_in, 0, x_mid, 0, m * h);
@@ -889,7 +913,7 @@ mod gpu {
             let s = &self.scratch;
             match (&self.lay.layers[l], &self.acts[l]) {
                 (
-                    LayerOffs::Mixer { ln1, wq, wk, wv, wkap, wo, ln2, ffn },
+                    LayerOffs::Mixer { ln1, wq, wk, wv, wkap, wo, alog, ln2, ffn },
                     LayerActs::Mixer { x_in, x1, inv1, thq, thk, v, kpre: _, kappa, phq, phk, kv, states, o, x_mid, x2, inv2, gte, up, hh },
                 ) => {
                     let (nh, nph, dv) = (cfg.heads, cfg.nphase, cfg.dv);
@@ -898,7 +922,7 @@ mod gpu {
                     cmd.gemm(Op::N, Op::N, m, nh * dv, h, 1.0, &s.dx, 0, h, &self.p, *wo, nh * dv, 0.0, &s.dbig, 0, nh * dv);
                     cmd.gemm(Op::T, Op::N, h, nh * dv, m, 1.0, &s.dx, 0, h, o, 0, nh * dv, 1.0, &self.g, *wo, nh * dv);
                     let d = HkDims { b, t, nh, nph, dv };
-                    let w = HkWork { thq, thk, v, kappa, pow: &self.pow, phq, phk, kv, states, out: o };
+                    let w = HkWork { thq, thk, v, kappa, pow: &self.pow, pow_off: self.pow_off(l), phq, phk, kv, states, out: o };
                     let gr = HkGrads {
                         dout: &s.dbig,
                         dstates: &s.dstates,
@@ -1238,7 +1262,7 @@ impl EmbryoGpu {
         let LayerActs::Mixer { thq, thk, v, kappa, phq, phk, kv, states, o, .. } = &self.acts[l] else { return vec![] };
         let (nh, nph, dv) = (cfg.heads, cfg.nphase, cfg.dv);
         let d = HkDims { b, t, nh, nph, dv };
-        let w = HkWork { thq, thk, v, kappa, pow: &self.pow, phq, phk, kv, states, out: o };
+        let w = HkWork { thq, thk, v, kappa, pow: &self.pow, pow_off: self.pow_off(l), phq, phk, kv, states, out: o };
         let gr = HkGrads { dout: &s.dbig, dstates: &s.dstates, dkv: &s.dkv, dphq: &s.dphq, dphk: &s.dphk, dthq: &s.dk, dthk: &s.dk2, dv: &s.dv, dkappa: &s.dkap };
         let mut out = Vec::new();
         let cmd = Cmd::new(c);

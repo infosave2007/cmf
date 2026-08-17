@@ -1485,3 +1485,119 @@ kernel void mask_bwd_dh_f32(
     float w = a.hard ? ((s > a.tau) ? 1.0f : 0.0f) : s;
     dhhm[gid] *= w;
 }
+
+// ---------------------------------------------------------------------
+// Learnable decay: γ_{h,f} = exp(−exp(A_log)). pow table from A_log and the
+// gradient of the loss w.r.t. γ from the chunk-GEMM by-products.
+// ---------------------------------------------------------------------
+
+// pow[h][δ][f] = γ^δ, δ = 0..C, γ = exp(−exp(alog[h·P2+f]))
+kernel void hk_pow_from_alog_f32(
+    device const float* alog [[buffer(0)]],
+    device float*       pow_t [[buffer(1)]],
+    constant HkArgs&    a    [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])   // over nh·P2
+{
+    uint p2 = 2u * a.nph;
+    if (gid >= a.nh * p2) return;
+    uint h = gid / p2, f = gid % p2;
+    float g = exp(-exp(alog[gid]));
+    float acc = 1.0f;
+    for (uint d = 0; d <= HK_C; ++d) {
+        pow_t[((ulong)h * (HK_C + 1u) + d) * p2 + f] = acc;
+        acc *= g;
+    }
+}
+
+// K̃′[s][f] = φk_s[f]·(−s)·γ^{−s−1}  (chunk-major, like hk_scale's outputs)
+kernel void hk_scale_ktp_f32(
+    device const float* phk   [[buffer(0)]],
+    device const float* pow_t [[buffer(1)]],
+    device float*       ktp   [[buffer(2)]],
+    constant HkArgs&    a     [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])   // over B·T·nh·P2
+{
+    uint p2 = 2u * a.nph;
+    uint rows = a.B * a.T;
+    if (gid >= rows * a.nh * p2) return;
+    uint row = gid / (a.nh * p2), r = gid % (a.nh * p2);
+    uint h = r / p2, f = r % p2;
+    uint b = row / a.T, tt = row % a.T;
+    uint c = tt / HK_C, s = tt % HK_C;
+    uint nch = a.T / HK_C;
+    ulong dst = (((ulong)(b * a.nh + h) * nch + c) * HK_C + s) * p2 + f;
+    device const float* pw = pow_t + (ulong)h * (HK_C + 1u) * p2;
+    float g = pw[1u * p2 + f];                    // γ
+    float inv_s1 = 1.0f / (pw[s * p2 + f] * g);   // γ^{−s−1}
+    ktp[dst] = phk[gid] * (-(float)s) * inv_s1;
+}
+
+// dA_log[h·P2+f] += (dγ_f)·γ·ln γ, with
+//   dγ_f = Σ_{b,c,t} [ φq_t·t·γ^{t−1}·dqt + Q̃·dqtp + (t+1)/γ·Q⁺·dqi + (C−1−t)/γ·K̂·dki ](t,f)
+//        + Σ_{b,c,d} C·γ^{C−1}·dstates[c+1][f][d]·states[c][f][d]
+// One threadgroup (256 threads) per (h, f).
+kernel void hk_dgamma_f32(
+    device const float* phq     [[buffer(0)]],
+    device const float* pow_t   [[buffer(1)]],
+    device const float* qt      [[buffer(2)]],
+    device const float* qp      [[buffer(3)]],
+    device const float* kh      [[buffer(4)]],
+    device const float* dqt     [[buffer(5)]],
+    device const float* dqtp    [[buffer(6)]],
+    device const float* dqi     [[buffer(7)]],
+    device const float* dki     [[buffer(8)]],
+    device const float* states  [[buffer(9)]],
+    device const float* dstates [[buffer(10)]],
+    device float*       dalog   [[buffer(11)]],
+    constant HkArgs&    a       [[buffer(12)]],
+    uint tg   [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    threadgroup float red[8];
+    uint p2 = 2u * a.nph;
+    uint h = tg / p2, f = tg % p2;
+    uint nch = a.T / HK_C;
+    device const float* pw = pow_t + (ulong)h * (HK_C + 1u) * p2;
+    float g = pw[1u * p2 + f];
+    float inv_g = 1.0f / g;
+    float acc = 0.0f;
+    // chunk-major (b, c, t) items
+    uint n_items = a.B * nch * HK_C;
+    for (uint it = tid; it < n_items; it += 256u) {
+        uint t = it % HK_C;
+        uint bc = it / HK_C;               // b·nch + c
+        uint b = bc / nch, c = bc % nch;
+        ulong cm = (((ulong)(b * a.nh + h) * nch + c) * HK_C + t) * p2 + f;
+        ulong rm = ((ulong)(b * a.T + c * HK_C + t) * a.nh + h) * p2 + f;   // row-major phq
+        float qprime = (t > 0) ? phq[rm] * (float)t * pw[(t - 1u) * p2 + f] : 0.0f;
+        acc += qprime * dqt[cm];
+        acc += qt[cm] * dqtp[cm];
+        acc += ((float)(t + 1u)) * inv_g * qp[cm] * dqi[cm];
+        acc += ((float)(HK_C - 1u - t)) * inv_g * kh[cm] * dki[cm];
+    }
+    // state path: C·γ^{C−1}·Σ_{b,c,d} G_{c+1}·S_c
+    float cg = (float)HK_C * pw[(HK_C - 1u) * p2 + f];
+    uint n_state = a.B * nch * a.dv;
+    float sacc = 0.0f;
+    for (uint it = tid; it < n_state; it += 256u) {
+        uint d = it % a.dv;
+        uint bc = it / a.dv;
+        uint b = bc / nch, c = bc % nch;
+        ulong base = (((ulong)b * a.nh + h) * (nch + 1u)) * p2 * a.dv;
+        float sc = states[base + ((ulong)c * p2 + f) * a.dv + d];
+        float gn = dstates[base + ((ulong)(c + 1u) * p2 + f) * a.dv + d];
+        sacc += gn * sc;
+    }
+    acc += cg * sacc;
+    acc = simd_sum(acc);
+    if (lane == 0) red[sgid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float tot = 0.0f;
+        for (uint s = 0; s < 8u; ++s) tot += red[s];
+        // dA = dγ · dγ/dA,  γ = exp(−e^A) → dγ/dA = γ·ln γ
+        dalog[h * p2 + f] += tot * g * log(g);
+    }
+}

@@ -227,3 +227,40 @@ pub fn hk_ref_bwd(
     }
     (dthq, dthk, dvv, dkap)
 }
+
+/// Reference gradient w.r.t. the per-(head, feature) decays γ (closed form,
+/// f64): dγ_f = Σ_{t>s} dA[t,s]·φq_t[f]·φk_s[f]·(t−s)·γ_f^{t−s−1}.
+/// Returns [nh·p2].
+pub fn hk_ref_dgamma(d: &HkDims, thq: &[f64], thk: &[f64], v: &[f64], kappa: &[f64], decay: &[f64], dout: &[f64]) -> Vec<f64> {
+    let (p2, nph, dv, nh, t_len) = (d.p2(), d.nph, d.dv, d.nh, d.t);
+    let mut dg = vec![0.0f64; nh * p2];
+    for b in 0..d.b {
+        for h in 0..nh {
+            let idx_th = |t: usize| (b * t_len + t) * nh * nph + h * nph;
+            let idx_v = |t: usize| (b * t_len + t) * nh * dv + h * dv;
+            let idx_k = |t: usize| (b * t_len + t) * nh + h;
+            let mut fq = vec![0.0f64; t_len * p2];
+            let mut fk = vec![0.0f64; t_len * p2];
+            for t in 0..t_len {
+                for f in 0..p2 {
+                    fq[t * p2 + f] = phi(&thq[idx_th(t)..idx_th(t) + nph], nph, f);
+                    fk[t * p2 + f] = phi(&thk[idx_th(t)..idx_th(t) + nph], nph, f);
+                }
+            }
+            for t in 0..t_len {
+                for s in 0..t {
+                    let mut da = 0.0;
+                    for dd in 0..dv {
+                        da += dout[idx_v(t) + dd] * kappa[idx_k(s)] * v[idx_v(s) + dd];
+                    }
+                    let delta = (t - s) as f64;
+                    for f in 0..p2 {
+                        let g = decay[h * p2 + f];
+                        dg[h * p2 + f] += da * fq[t * p2 + f] * fk[s * p2 + f] * delta * g.powi((t - s - 1) as i32);
+                    }
+                }
+            }
+        }
+    }
+    dg
+}
