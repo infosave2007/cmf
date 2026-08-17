@@ -378,49 +378,59 @@ impl LtxTextEncoder {
                 rms_nw(&mut v[i * ki + hh * hd..i * ki + (hh + 1) * hd]);
             }
         }
-        // causal, with the sliding window and the prompt's left padding
+        // The mask is the same for every head: causal, bounded by the
+        // sliding window, and closed over the prompt's left padding. Build
+        // it once, then run both halves of attention as GEMMs per head.
         let window = if l.sliding { 1024usize } else { usize::MAX };
+        let mut bias = vec![0f32; t * t];
+        for i in 0..t {
+            for j in 0..t {
+                let blocked =
+                    j > i || (window != usize::MAX && i - j >= window) || mask[j] == 0.0;
+                bias[i * t + j] = if blocked { f32::NEG_INFINITY } else { 0.0 };
+            }
+        }
+        // A left-pad row attends to nothing at all. The reference's masked
+        // softmax leaves it a uniform average; we leave it zero. Either is
+        // dead weight — the feature extractor masks these rows and the
+        // connector overwrites them with registers — but a row of all
+        // -inf would come back NaN, so mark it and zero it after.
+        let dead: Vec<bool> = (0..t).map(|i| mask[i] == 0.0).collect();
         let mut out = vec![0f32; t * qi];
-        let dst = crate::ltxdit::Shared(out.as_mut_ptr());
-        rows(pool, t, &|s, e| {
-            let mut sc = vec![0f32; t];
-            for i in s..e {
-                let orow = unsafe { dst.at(i * qi, qi) };
-                for hh in 0..l.q_heads {
-                    let kv = hh * l.kv_heads / l.q_heads;
-                    let qh = &q[i * qi + hh * hd..][..hd];
-                    for (j, sj) in sc.iter_mut().enumerate() {
-                        if j > i || (window != usize::MAX && i - j >= window) || mask[j] == 0.0 {
-                            *sj = f32::NEG_INFINITY;
-                            continue;
-                        }
-                        let kh = &k[j * ki + kv * hd..][..hd];
-                        *sj = qh.iter().zip(kh).map(|(&a, &b)| a * b).sum::<f32>();
-                    }
-                    // a fully masked row (a left-pad position) attends nowhere
-                    if sc.iter().all(|v| *v == f32::NEG_INFINITY) {
-                        for d in orow[hh * hd..(hh + 1) * hd].iter_mut() {
-                            *d = 0.0;
-                        }
+        let mut qh = vec![0f32; t * hd];
+        let mut kh = vec![0f32; t * hd];
+        let mut vh = vec![0f32; t * hd];
+        let mut sc = vec![0f32; t * t];
+        let mut oh = vec![0f32; t * hd];
+        for hh in 0..l.q_heads {
+            let kv = hh * l.kv_heads / l.q_heads;
+            for i in 0..t {
+                qh[i * hd..(i + 1) * hd].copy_from_slice(&q[i * qi + hh * hd..][..hd]);
+                kh[i * hd..(i + 1) * hd].copy_from_slice(&k[i * ki + kv * hd..][..hd]);
+                vh[i * hd..(i + 1) * hd].copy_from_slice(&v[i * ki + kv * hd..][..hd]);
+            }
+            crate::fcd_ops::gemm_nt(&qh, &kh, &mut sc, t, hd, t, pool);
+            let sp = crate::ltxdit::Shared(sc.as_mut_ptr());
+            rows(pool, t, &|s, e| {
+                let r = unsafe { sp.at(s * t, (e - s) * t) };
+                for (row, i) in r.chunks_exact_mut(t).zip(s..e) {
+                    if dead[i] {
+                        row.iter_mut().for_each(|x| *x = 0.0);
                         continue;
                     }
-                    crate::ltxdit::softmax(&mut sc);
-                    let oh = &mut orow[hh * hd..(hh + 1) * hd];
-                    for d in oh.iter_mut() {
-                        *d = 0.0;
+                    for (x, b) in row.iter_mut().zip(&bias[i * t..(i + 1) * t]) {
+                        *x += *b;
                     }
-                    for (j, &p) in sc.iter().enumerate() {
-                        if p == 0.0 {
-                            continue;
-                        }
-                        let vh = &v[j * ki + kv * hd..][..hd];
-                        for d in 0..hd {
-                            oh[d] += p * vh[d];
-                        }
-                    }
+                    crate::ltxdit::softmax(row);
                 }
+            });
+            oh.iter_mut().for_each(|x| *x = 0.0);
+            crate::fcd_ops::gemm_dx(&sc, &vh, &mut oh, t, hd, t, pool);
+            for i in 0..t {
+                out[i * qi + hh * hd..i * qi + (hh + 1) * hd]
+                    .copy_from_slice(&oh[i * hd..(i + 1) * hd]);
             }
-        });
+        }
         l.o.apply(&out, t, pool)
     }
 

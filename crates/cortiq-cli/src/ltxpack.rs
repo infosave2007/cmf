@@ -414,7 +414,17 @@ pub fn cmd_ltx_pack(args: LtxPackArgs<'_>) -> anyhow::Result<()> {
             specs.push(config_spec("vvae", &meta["config"]));
         }
     }
-    run(&mut specs, args.audio_vae, 3, "avae", &mut vocab, &mut prov, &pol, t0)?;
+    if let Some(meta) = run(&mut specs, args.audio_vae, 3, "avae", &mut vocab, &mut prov, &pol, t0)? {
+        // the audio VAE carries the vocoder's own geometry — upsample rates,
+        // kernel sizes, sampling rates — which the runtime cannot infer
+        if let Some(cfg) = meta.get("config").and_then(|c| c.as_str()) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(cfg) {
+                specs.push(config_spec("avae", &v));
+            }
+        } else if meta.get("config").is_some() {
+            specs.push(config_spec("avae", &meta["config"]));
+        }
+    }
     run(&mut specs, args.spatial_upscaler, 4, "ups", &mut vocab, &mut prov, &pol, t0)?;
     run(&mut specs, args.temporal_upscaler, 5, "upt", &mut vocab, &mut prov, &pol, t0)?;
     if let Some(p) = args.duration_head {

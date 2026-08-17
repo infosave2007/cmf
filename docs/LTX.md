@@ -59,6 +59,30 @@ its own. To get frames instead, pass `--out-dir frames/` and it writes
 Resolution must be a multiple of 32 (the video VAE's spatial stride) and the
 frame count `8k + 1` (its temporal stride, plus the standalone first frame).
 
+### Higher resolution
+
+```bash
+cortiq ltx-video --model ltx25-q4tp.cmf --two-stage \
+  --height 512 --width 768 --frames 49 --seed 42 \
+  --prompt "…" --out hq.y4m
+```
+
+`--two-stage` samples the way the distilled model was trained: eight
+ancestral Euler steps at half the requested resolution, the learned ×2
+latent upscaler, then three deterministic steps that refine what the upscale
+invented. It costs roughly four times a single-stage render.
+
+### Measured
+
+RTX 5090, container in `/dev/shm`, 49 frames at 24 fps:
+
+| stage | 384×256 | 768×512 (`--two-stage`) |
+|---|---|---|
+| prompt encode (Gemma-4 12 B + connectors) | 28 s | 28 s |
+| denoise | 8 × 30 s | 8 × 30 s + 3 × 120 s |
+| latent upscale | — | 25 s |
+| video VAE | 50 s | 200 s |
+
 ## The stages, one at a time
 
 Each stage is also a command of its own, which is how the port was gated

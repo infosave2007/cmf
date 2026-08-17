@@ -1146,6 +1146,9 @@ enum Commands {
         /// Write the denoised latent as safetensors
         #[arg(long)]
         out_latent: Option<String>,
+        /// Decode the soundtrack and write it as a 48 kHz stereo WAV
+        #[arg(long)]
+        out_audio: Option<String>,
     },
     /// Pack LTX-2.5 — the 22B audio-video DiT, the Gemma-4 12B prompt
     /// encoder, both VAEs, the latent upscalers and the duration head —
@@ -2036,6 +2039,7 @@ async fn main() -> anyhow::Result<()> {
             out,
             out_dir,
             out_latent,
+            out_audio,
         } => ltxcmd::cmd_ltx_video(ltxcmd::VideoArgs {
             model: &model,
             two_stage,
@@ -2048,6 +2052,7 @@ async fn main() -> anyhow::Result<()> {
             out: out.as_deref(),
             out_dir: out_dir.as_deref(),
             out_latent: out_latent.as_deref(),
+            out_audio: out_audio.as_deref(),
         }),
         Commands::LtxPack {
             out,
