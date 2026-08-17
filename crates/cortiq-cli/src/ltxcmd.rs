@@ -9,6 +9,7 @@
 
 use anyhow::{Context, anyhow};
 use cortiq_core::CmfModel;
+use cortiq_engine::ltxdit::{LtxDit, StreamInput};
 use cortiq_engine::ltxvae::{ConvVaeDecoder, Vol};
 use cortiq_engine::pool::Pool;
 use memmap2::Mmap;
@@ -231,6 +232,442 @@ pub fn cmd_ltx_decode(a: DecodeArgs<'_>) -> anyhow::Result<()> {
         f.write_all(&hs)?;
         f.write_all(&bytes)?;
         println!("frames tensor → {p}");
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------- ltx-dit
+
+pub struct DitArgs<'a> {
+    pub model: &'a str,
+    pub oracle: &'a str,
+    pub gate: bool,
+    pub dump: Option<&'a str>,
+}
+
+/// One `[1, T, D]` (or `[1, T, 1]`) oracle tensor as a flat f32 row-major
+/// buffer plus its token count.
+fn oracle_2d(st: &St, name: &str) -> anyhow::Result<(Vec<f32>, usize, usize)> {
+    let (s, v) = st.get(name)?;
+    let dims: Vec<usize> = s.iter().copied().filter(|&d| d > 0).collect();
+    anyhow::ensure!(dims.len() >= 2, "{name}: rank {dims:?}");
+    let d = *dims.last().unwrap();
+    let t = dims[dims.len() - 2];
+    Ok((v, t, d))
+}
+
+/// The `[1, axes, T, 2]` position grid as per-token patch midpoints —
+/// `use_middle_indices_grid`, the reference's default.
+fn oracle_positions(st: &St, name: &str) -> anyhow::Result<Vec<Vec<f64>>> {
+    let (s, v) = st.get(name)?;
+    let d: Vec<usize> = s.iter().copied().filter(|&x| x > 0).collect();
+    anyhow::ensure!(d.len() == 4 && d[3] == 2, "{name}: expected [1, axes, T, 2], got {s:?}");
+    let (axes, t) = (d[1], d[2]);
+    Ok((0..t)
+        .map(|i| {
+            (0..axes)
+                .map(|a| {
+                    let o = (a * t + i) * 2;
+                    (v[o] as f64 + v[o + 1] as f64) / 2.0
+                })
+                .collect()
+        })
+        .collect())
+}
+
+pub fn cmd_ltx_dit(a: DitArgs<'_>) -> anyhow::Result<()> {
+    let model = Arc::new(CmfModel::open_sharded(a.model)?);
+    let pool = Pool::from_env();
+    let t0 = std::time::Instant::now();
+    let dit = LtxDit::from_cmf(&model).map_err(|e| anyhow!(e))?;
+    eprintln!("dit loaded in {:.1}s ({} blocks)", t0.elapsed().as_secs_f64(), dit.blocks());
+    let st = St::open(Path::new(a.oracle))?;
+
+    let stream = |tag: &str| -> anyhow::Result<StreamInput> {
+        let (latent, tokens, _) = oracle_2d(&st, &format!("{tag}.latent"))?;
+        let (timesteps, _, _) = oracle_2d(&st, &format!("{tag}.timesteps"))?;
+        let (context, ctx_len, _) = oracle_2d(&st, &format!("{tag}.context"))?;
+        let positions = oracle_positions(&st, &format!("{tag}.positions"))?;
+        let sigma = st.get(&format!("{tag}.sigma"))?.1[0];
+        let keyframes = st
+            .get(&format!("{tag}.keyframes_mask"))
+            .map(|(_, v)| v)
+            .unwrap_or_default();
+        let context_mask = st
+            .get(&format!("{tag}.args.context_mask"))
+            .map(|(s, v)| v[v.len() - s[s.len() - 1]..].to_vec())
+            .unwrap_or_default();
+        Ok(StreamInput {
+            latent,
+            tokens,
+            timesteps,
+            positions,
+            context,
+            ctx_len,
+            context_mask,
+            keyframes,
+            sigma,
+        })
+    };
+    let video = stream("v")?;
+    let audio = stream("a")?;
+    eprintln!(
+        "video {} tokens, audio {} tokens, prompt {} tokens, sigma v={} a={}",
+        video.tokens, audio.tokens, video.ctx_len, video.sigma, audio.sigma
+    );
+
+    let mut ours: std::collections::HashMap<String, Vec<f32>> = std::collections::HashMap::new();
+    let mut want: Vec<String> = ["v.args.x", "a.args.x", "v.out", "a.out"]
+        .iter()
+        .map(|s| s.to_string())
+        .chain([0usize, 1, dit.blocks() - 1].iter().flat_map(|&i| {
+            [format!("v.block{i}"), format!("a.block{i}")]
+        }))
+        .collect();
+    // the block-0 dissection, when the oracle carries it
+    for m in ["v", "a"] {
+        for st in ["sa", "ca", "ff", if m == "v" { "a2v" } else { "v2a" }] {
+            for part in ["in", "ctx", "out"] {
+                want.push(format!("{m}.b0.{st}.{part}"));
+            }
+        }
+    }
+    let t1 = std::time::Instant::now();
+    dit.forward_traced(&video, &audio, pool.as_deref(), &mut |n, v| {
+        if want.iter().any(|w| w == n) || a.dump.is_some() {
+            ours.insert(n.to_string(), v.to_vec());
+        }
+    });
+    println!("forward in {:.1}s", t1.elapsed().as_secs_f64());
+
+    if a.gate {
+        let mut first_bad: Option<String> = None;
+        for name in &want {
+            let Some(o) = ours.get(name) else { continue };
+            let Ok((_, r)) = st.get(name) else { continue };
+            let ok = r.len() == o.len();
+            let (mut worst, mut sum, mut rsum) = (0f64, 0f64, 0f64);
+            if ok {
+                for (x, y) in o.iter().zip(&r) {
+                    let d = (*x as f64 - *y as f64).abs();
+                    worst = worst.max(d);
+                    sum += d * d;
+                    rsum += (*y as f64) * (*y as f64);
+                }
+            }
+            let rel = (sum / rsum.max(1e-30)).sqrt();
+            println!(
+                "{name:<14} {} n {} vs {}  worst {:.2e} rel {:.2e}",
+                if ok { "ok  " } else { "SHAPE" },
+                o.len(),
+                r.len(),
+                worst,
+                rel
+            );
+            if first_bad.is_none() && (!ok || rel > 5e-3) {
+                first_bad = Some(name.clone());
+            }
+        }
+        match first_bad {
+            Some(b) => println!("first stage that diverges: {b}"),
+            None => println!("all stages match"),
+        }
+    }
+
+    if let Some(p) = a.dump {
+        let mut hdr = serde_json::Map::new();
+        let mut off = 0usize;
+        let mut names: Vec<&String> = ours.keys().collect();
+        names.sort();
+        for n in &names {
+            let len = ours[*n].len() * 4;
+            hdr.insert(
+                (*n).clone(),
+                serde_json::json!({"dtype":"F32","shape":[ours[*n].len()],"data_offsets":[off, off+len]}),
+            );
+            off += len;
+        }
+        let hs = serde_json::to_vec(&serde_json::Value::Object(hdr))?;
+        let mut f = std::fs::File::create(p)?;
+        f.write_all(&(hs.len() as u64).to_le_bytes())?;
+        f.write_all(&hs)?;
+        for n in &names {
+            let mut bytes = Vec::with_capacity(ours[*n].len() * 4);
+            for v in &ours[*n] {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            f.write_all(&bytes)?;
+        }
+        println!("{} tensors → {p}", names.len());
+    }
+    Ok(())
+}
+
+// ------------------------------------------------------------- ltx-render
+
+pub struct RenderArgs<'a> {
+    pub model: &'a str,
+    pub context: &'a str,
+    pub height: usize,
+    pub width: usize,
+    pub frames: usize,
+    pub fps: f64,
+    pub seed: u64,
+    pub out_dir: Option<&'a str>,
+    pub out_y4m: Option<&'a str>,
+    pub out_latent: Option<&'a str>,
+    pub skip_decode: bool,
+}
+
+/// Frames as one YUV4MPEG2 stream — raw, seekable and exactly what `ffmpeg
+/// -i out.y4m out.mp4` wants, so the renderer needs no video encoder.
+fn write_y4m(path: &Path, frames: &Vol, fps: f64) -> anyhow::Result<()> {
+    let (h, w) = (frames.h, frames.w);
+    let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+    let num = (fps * 1000.0).round() as u64;
+    write!(f, "YUV4MPEG2 W{w} H{h} F{num}:1000 Ip A1:1 C420jpeg\n")?;
+    let px = |c: usize, t: usize, y: usize, x: usize| -> f32 {
+        let v = frames.data[((c * frames.f + t) * h + y) * w + x];
+        ((v.clamp(-1.0, 1.0) + 1.0) * 0.5 * 255.0).clamp(0.0, 255.0)
+    };
+    for t in 0..frames.f {
+        write!(f, "FRAME\n")?;
+        let mut yp = vec![0u8; h * w];
+        let (mut up, mut vp) = (vec![0u8; h * w / 4], vec![0u8; h * w / 4]);
+        for y in 0..h {
+            for x in 0..w {
+                let (r, g, b) = (px(0, t, y, x), px(1, t, y, x), px(2, t, y, x));
+                yp[y * w + x] = (0.299 * r + 0.587 * g + 0.114 * b).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+        for y in (0..h).step_by(2) {
+            for x in (0..w).step_by(2) {
+                let (mut r, mut g, mut b) = (0f32, 0f32, 0f32);
+                for dy in 0..2 {
+                    for dx in 0..2 {
+                        let (yy, xx) = ((y + dy).min(h - 1), (x + dx).min(w - 1));
+                        r += px(0, t, yy, xx);
+                        g += px(1, t, yy, xx);
+                        b += px(2, t, yy, xx);
+                    }
+                }
+                let (r, g, b) = (r / 4.0, g / 4.0, b / 4.0);
+                let i = (y / 2) * (w / 2) + x / 2;
+                up[i] = (-0.168736 * r - 0.331264 * g + 0.5 * b + 128.0).round().clamp(0.0, 255.0) as u8;
+                vp[i] = (0.5 * r - 0.418688 * g - 0.081312 * b + 128.0).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+        f.write_all(&yp)?;
+        f.write_all(&up)?;
+        f.write_all(&vp)?;
+    }
+    Ok(())
+}
+
+pub fn cmd_ltx_render(a: RenderArgs<'_>) -> anyhow::Result<()> {
+    use cortiq_engine::ltxpipe::{Geometry, Rng, Stage, run_stage, unpatchify_video};
+    let model = Arc::new(CmfModel::open_sharded(a.model)?);
+    let pool = Pool::from_env();
+    let t0 = std::time::Instant::now();
+    let dit = LtxDit::from_cmf(&model).map_err(|e| anyhow!(e))?;
+    eprintln!("dit loaded in {:.1}s ({} blocks)", t0.elapsed().as_secs_f64(), dit.blocks());
+
+    let st = St::open(Path::new(a.context))?;
+    let (vshape, vctx) = st
+        .get("enc.video")
+        .or_else(|_| st.get("v.context"))
+        .context("context file needs enc.video (or v.context)")?;
+    let (_, actx) = st.get("enc.audio").or_else(|_| st.get("a.context"))?;
+    let ctx_len = vshape[vshape.len() - 2];
+    eprintln!("prompt context: {ctx_len} tokens");
+
+    let geo = Geometry::new(a.frames, a.height, a.width, a.fps);
+    eprintln!(
+        "latent {}x{}x{} ({} video tokens), audio {} tokens",
+        geo.lf,
+        geo.lh,
+        geo.lw,
+        geo.video_tokens(),
+        geo.af
+    );
+    let mut rng = Rng::new(a.seed);
+    let stage = Stage::stage1();
+    let total = std::time::Instant::now();
+    let lat = run_stage(
+        &dit,
+        &geo,
+        &stage,
+        &vctx,
+        &actx,
+        ctx_len,
+        None,
+        &mut rng,
+        pool.as_deref(),
+        &mut |i, n, secs| println!("step {i}/{n}  {secs:.1}s"),
+    );
+    println!("denoised in {:.1}s", total.elapsed().as_secs_f64());
+
+    let vol = unpatchify_video(&lat.video, &geo);
+    if let Some(p) = a.out_latent {
+        let mut bytes = Vec::with_capacity(vol.len() * 4);
+        for v in &vol {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let hdr = serde_json::json!({
+            "latent": {"dtype":"F32","shape":[1, 128, geo.lf, geo.lh, geo.lw],"data_offsets":[0, bytes.len()]}
+        });
+        let hs = serde_json::to_vec(&hdr)?;
+        let mut f = std::fs::File::create(p)?;
+        f.write_all(&(hs.len() as u64).to_le_bytes())?;
+        f.write_all(&hs)?;
+        f.write_all(&bytes)?;
+        println!("latent → {p}");
+    }
+    if a.skip_decode {
+        return Ok(());
+    }
+
+    let dec = ConvVaeDecoder::from_cmf(&model, pool.as_deref()).map_err(|e| anyhow!(e))?;
+    let latent = Vol { c: 128, f: geo.lf, h: geo.lh, w: geo.lw, data: vol };
+    let t1 = std::time::Instant::now();
+    let out = dec.decode(&latent, pool.as_deref());
+    println!(
+        "decoded [{}, {}, {}, {}] in {:.1}s",
+        out.c,
+        out.f,
+        out.h,
+        out.w,
+        t1.elapsed().as_secs_f64()
+    );
+    if let Some(p) = a.out_y4m {
+        write_y4m(Path::new(p), &out, a.fps)?;
+        println!("{} frames → {p}  (ffmpeg -i {p} -pix_fmt yuv420p out.mp4)", out.f);
+    }
+    if let Some(d) = a.out_dir {
+        std::fs::create_dir_all(d)?;
+        for f in 0..out.f {
+            let frame: Vec<f32> = (0..3 * out.h * out.w)
+                .map(|i| {
+                    let c = i / (out.h * out.w);
+                    let r = i % (out.h * out.w);
+                    out.data[((c * out.f + f) * out.h) * out.w + r]
+                })
+                .collect();
+            write_ppm(&Path::new(d).join(format!("frame_{f:04}.ppm")), &frame, out.h, out.w)?;
+        }
+        println!("{} frames → {d}/frame_*.ppm", out.f);
+    }
+    Ok(())
+}
+
+// ------------------------------------------------------------- ltx-encode
+
+pub struct EncodeArgs<'a> {
+    pub model: &'a str,
+    pub prompt: &'a str,
+    pub oracle: Option<&'a str>,
+    pub out: Option<&'a str>,
+}
+
+pub fn cmd_ltx_encode(a: EncodeArgs<'_>) -> anyhow::Result<()> {
+    use cortiq_engine::ltxte::LtxTextEncoder;
+    use cortiq_engine::tokenizer::Tokenizer;
+    let model = Arc::new(CmfModel::open_sharded(a.model)?);
+    let pool = Pool::from_env();
+    let vocab = model.vocab.as_ref().context("container carries no tokenizer")?;
+    let tok = Tokenizer::from_bytes(vocab).map_err(|e| anyhow!("tokenizer: {e}"))?;
+    let t0 = std::time::Instant::now();
+    let te = LtxTextEncoder::from_cmf(&model).map_err(|e| anyhow!(e))?;
+    eprintln!("prompt encoder loaded in {:.1}s", t0.elapsed().as_secs_f64());
+
+    let ids = tok.encode(a.prompt.trim());
+    let (ids, mask) = te.pad_ids(&ids);
+    let valid = mask.iter().filter(|&&m| m != 0.0).count();
+    eprintln!("{valid} prompt tokens (of {} window)", ids.len());
+    eprintln!("ids {:?}", &ids[ids.len() - valid..]);
+
+    let t1 = std::time::Instant::now();
+    let hs = te.hidden_states(&ids, &mask, pool.as_deref());
+    eprintln!("gemma forward in {:.1}s ({} hidden states)", t1.elapsed().as_secs_f64(), hs.len());
+
+    if let Some(p) = a.oracle {
+        let st = St::open(Path::new(p))?;
+        // Only the valid rows are compared: the prompt is left-padded, and a
+        // pad position attends to nothing at all. The reference's masked
+        // softmax leaves those rows a uniform average of the values while
+        // ours leaves them zero — both are dead weight, masked out by the
+        // feature extractor and overwritten by the connector's registers,
+        // and comparing them would drown the signal.
+        let cmp = |name: &str, ours: &[f32]| {
+            let Ok((_, r)) = st.get(name) else { return };
+            if r.len() != ours.len() {
+                println!("{name:<18} SHAPE ours {} ref {}", ours.len(), r.len());
+                return;
+            }
+            let skip = ours.len() - ours.len() / ids.len() * valid;
+            let (mut worst, mut s, mut rs) = (0f64, 0f64, 0f64);
+            for (x, y) in ours.iter().skip(skip).zip(r.iter().skip(skip)) {
+                let d = (*x as f64 - *y as f64).abs();
+                worst = worst.max(d);
+                s += d * d;
+                rs += (*y as f64) * (*y as f64);
+            }
+            println!(
+                "{name:<18} worst {:.2e} rel {:.2e}  ({} valid rows)",
+                worst,
+                (s / rs.max(1e-30)).sqrt(),
+                valid
+            );
+        };
+        for (i, h) in hs.iter().enumerate() {
+            if i == 0 || i == 1 || i == 5 || i == 6 || i == 24 || i == hs.len() - 1 {
+                cmp(&format!("gemma.h{i}"), h);
+            }
+        }
+    }
+
+    let t2 = std::time::Instant::now();
+    let (v, au, n) = te.encode_ids(&ids, &mask, pool.as_deref());
+    eprintln!("projections + connectors in {:.1}s", t2.elapsed().as_secs_f64());
+    if let Some(p) = a.oracle {
+        let st = St::open(Path::new(p))?;
+        for (name, ours) in [("enc.video", &v), ("enc.audio", &au)] {
+            let Ok((_, r)) = st.get(name) else { continue };
+            let (mut worst, mut s, mut rs) = (0f64, 0f64, 0f64);
+            for (x, y) in ours.iter().zip(&r) {
+                let d = (*x as f64 - *y as f64).abs();
+                worst = worst.max(d);
+                s += d * d;
+                rs += (*y as f64) * (*y as f64);
+            }
+            println!(
+                "{name:<18} worst {:.2e} rel {:.2e}",
+                worst,
+                (s / rs.max(1e-30)).sqrt()
+            );
+        }
+    }
+    if let Some(p) = a.out {
+        let mut hdr = serde_json::Map::new();
+        let mut off = 0usize;
+        let mut blob: Vec<u8> = Vec::new();
+        for (name, data, dim) in [("enc.video", &v, 4096usize), ("enc.audio", &au, 2048)] {
+            let len = data.len() * 4;
+            hdr.insert(
+                name.to_string(),
+                serde_json::json!({"dtype":"F32","shape":[1, n, dim],"data_offsets":[off, off+len]}),
+            );
+            off += len;
+            for x in data.iter() {
+                blob.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        let hs = serde_json::to_vec(&serde_json::Value::Object(hdr))?;
+        let mut f = std::fs::File::create(p)?;
+        f.write_all(&(hs.len() as u64).to_le_bytes())?;
+        f.write_all(&hs)?;
+        f.write_all(&blob)?;
+        println!("context → {p}");
     }
     Ok(())
 }

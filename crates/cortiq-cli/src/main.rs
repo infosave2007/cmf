@@ -1055,6 +1055,68 @@ enum Commands {
         #[arg(long)]
         dump_stages: Option<String>,
     },
+    /// Run the LTX-2.5 AV DiT (`dit.*`) for one denoising step, from
+    /// inputs captured off the reference — the port's numeric gate.
+    LtxDit {
+        /// The .cmf packed by `ltx-pack`
+        #[arg(long)]
+        model: String,
+        /// safetensors of reference DiT inputs/outputs (see docs/LTX.md)
+        #[arg(long)]
+        oracle: String,
+        /// Compare every captured stage against the oracle
+        #[arg(long)]
+        gate: bool,
+        /// Write our stages to a safetensors
+        #[arg(long)]
+        dump: Option<String>,
+    },
+    /// Render an LTX-2.5 video on our engine: denoise with the AV DiT and
+    /// decode through the video VAE, all from one .cmf.
+    LtxRender {
+        /// The .cmf packed by `ltx-pack`
+        #[arg(long)]
+        model: String,
+        /// safetensors with `enc.video` / `enc.audio` prompt embeddings
+        #[arg(long)]
+        context: String,
+        #[arg(long, default_value_t = 256)]
+        height: usize,
+        #[arg(long, default_value_t = 384)]
+        width: usize,
+        #[arg(long, default_value_t = 49)]
+        frames: usize,
+        #[arg(long, default_value_t = 24.0)]
+        fps: f64,
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        /// Write frames as PPM stills into this directory
+        #[arg(long)]
+        out_dir: Option<String>,
+        /// Write the frames as one YUV4MPEG2 stream (feed it to ffmpeg)
+        #[arg(long)]
+        out_y4m: Option<String>,
+        /// Write the denoised latent as safetensors
+        #[arg(long)]
+        out_latent: Option<String>,
+        /// Stop after denoising, before the VAE
+        #[arg(long)]
+        skip_decode: bool,
+    },
+    /// Encode a prompt with the packed Gemma-4 encoder, the aggregate
+    /// projections and the connectors — the context the DiT reads.
+    LtxEncode {
+        #[arg(long)]
+        model: String,
+        #[arg(long)]
+        prompt: String,
+        /// safetensors of reference encoder activations, to compare against
+        #[arg(long)]
+        oracle: Option<String>,
+        /// Write `enc.video` / `enc.audio` for `ltx-render --context`
+        #[arg(long)]
+        out: Option<String>,
+    },
     /// Pack LTX-2.5 — the 22B audio-video DiT, the Gemma-4 12B prompt
     /// encoder, both VAEs, the latent upscalers and the duration head —
     /// into ONE q4tp .cmf. Multi-pass: `--in` carries an earlier pass
@@ -1888,6 +1950,50 @@ async fn main() -> anyhow::Result<()> {
             gate,
             dump_stages: dump_stages.as_deref(),
         }),
+        Commands::LtxDit {
+            model,
+            oracle,
+            gate,
+            dump,
+        } => ltxcmd::cmd_ltx_dit(ltxcmd::DitArgs {
+            model: &model,
+            oracle: &oracle,
+            gate,
+            dump: dump.as_deref(),
+        }),
+        Commands::LtxRender {
+            model,
+            context,
+            height,
+            width,
+            frames,
+            fps,
+            seed,
+            out_dir,
+            out_y4m,
+            out_latent,
+            skip_decode,
+        } => ltxcmd::cmd_ltx_render(ltxcmd::RenderArgs {
+            model: &model,
+            context: &context,
+            height,
+            width,
+            frames,
+            fps,
+            seed,
+            out_dir: out_dir.as_deref(),
+            out_y4m: out_y4m.as_deref(),
+            out_latent: out_latent.as_deref(),
+            skip_decode,
+        }),
+        Commands::LtxEncode { model, prompt, oracle, out } => {
+            ltxcmd::cmd_ltx_encode(ltxcmd::EncodeArgs {
+                model: &model,
+                prompt: &prompt,
+                oracle: oracle.as_deref(),
+                out: out.as_deref(),
+            })
+        }
         Commands::LtxPack {
             out,
             carry,
