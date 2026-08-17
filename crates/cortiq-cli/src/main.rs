@@ -2795,15 +2795,31 @@ fn cmd_route(model_path: &str, prompt: &str) -> anyhow::Result<()> {
     let model = Arc::new(CmfModel::open_sharded(model_path)?);
     let mut pipeline = Pipeline::from_model(&model, SamplerConfig::default())?;
     let ids = pipeline.tokenizer.encode(prompt);
-    let routes = cortiq_engine::router::route(&model, &mut pipeline, &ids);
-    if routes.is_empty() {
+    let tau = std::env::var("CMF_OOD_TAU").ok().and_then(|v| v.parse().ok()).unwrap_or(0.30);
+    let r = cortiq_engine::router::route_full(&model, &mut pipeline, &ids, tau);
+    if r.scores.is_empty() {
         println!("no routable skills in this container");
         return Ok(());
     }
-    for r in &routes {
-        println!("  {:<20} E = {:.4}", r.id, r.error);
+    for s in &r.scores {
+        if r.calibrated {
+            println!("  {:<20} E = {:.4}  err = {:.3e}  p = {:.3}", s.id, s.error, s.raw_error, s.probability);
+        } else {
+            println!("  {:<20} E = {:.4}", s.id, s.error);
+        }
     }
-    println!("winner: {}", routes[0].id);
+    if r.calibrated {
+        println!(
+            "winner: {}  confidence {:.3}  margin {:.3}  novelty {:.3} → {}",
+            r.scores[0].id,
+            r.confidence,
+            r.margin,
+            r.novelty,
+            if r.is_novel { "OOD (novel)" } else { "in-scope" }
+        );
+    } else {
+        println!("winner: {}  ({}; uncalibrated file: E_min vs τ={tau})", r.scores[0].id, if r.is_novel { "OOD" } else { "in-scope" });
+    }
     Ok(())
 }
 

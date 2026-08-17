@@ -172,6 +172,10 @@ fn fit_selection(
         mean: b64_f16(&mean),
         basis: b64_f16(&basis),
         rank,
+        err_mean: None,
+        err_std: None,
+        holdout: None,
+        holdout_n: None,
     }
 }
 

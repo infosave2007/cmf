@@ -73,6 +73,7 @@ fn tiny_header() -> CmfHeader {
         skills: Vec::new(),
         shard: None,
         calibration: None,
+        routing: None,
         arch: tiny_arch(),
         quant_type: QuantType::F32,
         provenance: None,

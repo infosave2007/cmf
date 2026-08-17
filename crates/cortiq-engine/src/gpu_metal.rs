@@ -13612,6 +13612,7 @@ mod tests {
             skills: Vec::new(),
             shard: None,
             calibration: None,
+            routing: None,
         };
         let spec = TensorSpec {
             name: "lm_head.weight".into(),
@@ -13739,6 +13740,7 @@ mod tests {
             skills: Vec::new(),
             shard: None,
             calibration: None,
+            routing: None,
         };
         let spec = TensorSpec {
             name: "w".into(),
@@ -13895,6 +13897,7 @@ mod tests {
             skills: Vec::new(),
             shard: None,
             calibration: None,
+            routing: None,
         };
         let spec = TensorSpec {
             name: "lm_head.weight".into(),

@@ -35,12 +35,11 @@ fn unix_now() -> u64 {
 /// Returns (best skill, its E) when routable.
 pub fn record_if_ood(model: &CmfModel, pipe: &mut Pipeline, prompt_ids: &[u32], prompt_text: &str) -> Option<(String, f32)> {
     let dir = ood_dir()?;
-    let routes = cortiq_engine::router::route(model, pipe, prompt_ids);
-    let best = routes.first().map(|r| (r.id.clone(), r.error));
-    let ood = match &best {
-        Some((_, e)) => *e > tau(),
-        None => true,
-    };
+    // calibrated files decide by the novelty ensemble (cortiq-router recipe);
+    // uncalibrated ones by E_min > τ
+    let r = cortiq_engine::router::route_full(model, pipe, prompt_ids, tau());
+    let best = r.scores.first().map(|s| (s.id.clone(), s.error));
+    let ood = r.is_novel;
     if ood {
         let _ = std::fs::create_dir_all(&dir);
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("buffer.jsonl")) {
@@ -48,6 +47,9 @@ pub fn record_if_ood(model: &CmfModel, pipe: &mut Pipeline, prompt_ids: &[u32], 
                 "ts": unix_now(),
                 "e_min": best.as_ref().map(|(_, e)| *e),
                 "nearest": best.as_ref().map(|(id, _)| id.clone()),
+                "novelty": if r.novelty.is_finite() { Some(r.novelty) } else { None },
+                "confidence": r.confidence,
+                "calibrated": r.calibrated,
                 "tokens": prompt_ids.len(),
                 "text": prompt_text,
             });

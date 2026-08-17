@@ -1968,6 +1968,7 @@ pub fn cmd_animate_pack(args: PackArgs<'_>) -> anyhow::Result<()> {
         skills: Vec::new(),
         shard: None,
         calibration: None,
+        routing: None,
     };
     CmfModel::write_ref(args.out, &header, &refs, None, vocab.as_deref())
         .map_err(|e| anyhow!("write {}: {e}", args.out))?;

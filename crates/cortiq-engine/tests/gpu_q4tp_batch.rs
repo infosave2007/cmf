@@ -160,6 +160,7 @@ fn one_shape(rows: usize, cols: usize, two_bit: bool) {
         skills: Vec::new(),
         shard: None,
         calibration: None,
+        routing: None,
     };
     CmfModel::write(
         &path,

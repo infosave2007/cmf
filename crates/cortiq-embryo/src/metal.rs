@@ -1364,7 +1364,7 @@ impl<'a> Cmd<'a> {
 
     /// μ EMA + balancing bias update from the step's routing statistics.
     #[allow(clippy::too_many_arguments)]
-    pub fn moe_update(&self, r: &RouteDims, mu: &GBuf, mu_off: usize, bias: &GBuf, bias_off: usize, sums: &GBuf, sums_off: usize, count: &GBuf, count_off: usize, res: &GBuf, alpha: f32, eta: f32) {
+    pub fn moe_update(&self, r: &RouteDims, mu: &GBuf, mu_off: usize, bias: &GBuf, bias_off: usize, sums: &GBuf, sums_off: usize, count: &GBuf, count_off: usize, res: &GBuf, alpha: f32, eta: f32, frozen_below: usize) {
         #[repr(C)]
         struct Args {
             rows: u32,
@@ -1372,8 +1372,9 @@ impl<'a> Cmd<'a> {
             e: u32,
             alpha: f32,
             eta: f32,
+            frozen_below: u32,
         }
-        let a = Args { rows: r.rows as u32, h: r.h as u32, e: r.e as u32, alpha, eta };
+        let a = Args { rows: r.rows as u32, h: r.h as u32, e: r.e as u32, alpha, eta, frozen_below: frozen_below as u32 };
         let e = &self.enc;
         e.set_compute_pipeline_state(&self.c.moe_update);
         e.set_buffer(0, Some(&mu.buf), (mu_off * 4) as u64);

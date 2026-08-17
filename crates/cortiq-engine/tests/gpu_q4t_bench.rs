@@ -58,6 +58,7 @@ fn bench_q4t_matmat_ffn_shape() {
         skills: Vec::new(),
         shard: None,
         calibration: None,
+        routing: None,
     };
     let spec = TensorSpec {
         name: "w".into(),

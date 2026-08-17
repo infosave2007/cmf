@@ -3944,6 +3944,7 @@ pub fn run_convert(
         skills: Vec::new(),
         shard: None,
         calibration: None,
+        routing: None,
     };
 
     // Lay the blob out in EXECUTION order — embed, then each layer's tensors
