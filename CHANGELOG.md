@@ -41,8 +41,22 @@ The LTX-2.5 release: text to video, end to end, on the Rust engine.
   against a dump of the reference implementation and reports the first place
   it diverges.
 
+* **The audio path** (`ltxaudio.rs`): the spectrogram VAE — 2-D convolutions
+  over (time, mel bin) with PixelNorm and height-causal padding so a frame
+  never sees the future — and BigVGAN v2 with bandwidth extension: six
+  transposed convolutions each followed by three multi-receptive-field blocks
+  whose outputs are averaged, every activation a SnakeBeta sandwiched between
+  a ×2 sinc upsample and a ×2 sinc downsample, then a second generator
+  predicting a 48 kHz residual from the mel of the first one's output.
+  `ltx-video --out-audio out.wav` writes 48 kHz stereo; `ltx-audio` decodes a
+  saved audio latent on its own, with per-stage statistics and a gate.
+* **The duration head** (`ltxdur.rs`): how long a shot the prompt implies,
+  read off the connector outputs before a single denoising step runs.
+
 ### Changed
 
+* Attention is a pair of GEMMs per head instead of a scalar loop, in both the
+  transformer and the prompt encoder — a third off every denoising step.
 * `ltx-pack` keeps two more things exact, both found by that gate rather than
   by taste: the **adaLN-single stacks** (their output is the scale and shift
   applied to every token in every block — quantized, they put 3.6·10⁻² of
