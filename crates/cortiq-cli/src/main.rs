@@ -12,6 +12,7 @@ mod npy;
 mod requant;
 mod sign;
 mod skill;
+mod ltxpack;
 mod videopack;
 
 use clap::{Parser, Subcommand};
@@ -1032,6 +1033,50 @@ enum Commands {
         #[arg(long, default_value = "music.wav")]
         out: String,
     },
+    /// Pack LTX-2.5 — the 22B audio-video DiT, the Gemma-4 12B prompt
+    /// encoder, both VAEs, the latent upscalers and the duration head —
+    /// into ONE q4tp .cmf. Multi-pass: `--in` carries an earlier pass
+    /// through byte for byte, so a stand with less disk than the sum of
+    /// the sources packs one component at a time.
+    LtxPack {
+        /// Output .cmf path
+        #[arg(long)]
+        out: String,
+        /// A .cmf from an earlier pass; its tensors are copied through
+        #[arg(long = "in")]
+        carry: Option<String>,
+        /// The 22B transformer (ltx-2.5-22b-{dev,distilled}-transformer-bf16.safetensors)
+        #[arg(long)]
+        dit: Option<String>,
+        /// Gemma-4 12B prompt encoder (gemma4-12b-with-proj-ltx-2.5-bf16.safetensors)
+        #[arg(long)]
+        te: Option<String>,
+        /// Video VAE (ltx-2.5-video-vae-conv-bf16.safetensors)
+        #[arg(long)]
+        video_vae: Option<String>,
+        /// Audio VAE (ltx-2.5-audio-vae-bf16.safetensors)
+        #[arg(long)]
+        audio_vae: Option<String>,
+        /// Latent spatial upscaler x2
+        #[arg(long)]
+        spatial_upscaler: Option<String>,
+        /// Latent temporal upscaler x2
+        #[arg(long)]
+        temporal_upscaler: Option<String>,
+        /// Duration head
+        #[arg(long)]
+        duration_head: Option<String>,
+        /// Codec for the big 2-D planes [default: q4tp]
+        #[arg(long, default_value = "q4tp")]
+        quant: String,
+        /// Codec for convolutions (VAEs, upscalers): f16 keeps the
+        /// decoder exact, q4tp folds kernels to [out, in·k·k·k]
+        #[arg(long, default_value = "f16")]
+        vae_quant: String,
+        /// 2-D planes smaller than this many weights stay f16
+        #[arg(long, default_value_t = 1 << 20)]
+        min_q4tp: usize,
+    },
     AnimatePack {
         /// Output .cmf path
         #[arg(long)]
@@ -1806,6 +1851,33 @@ async fn main() -> anyhow::Result<()> {
             seed,
             out,
         } => music::cmd_music(&model, &prompt, &lyrics, seconds, steps, seed, &out),
+        Commands::LtxPack {
+            out,
+            carry,
+            dit,
+            te,
+            video_vae,
+            audio_vae,
+            spatial_upscaler,
+            temporal_upscaler,
+            duration_head,
+            quant,
+            vae_quant,
+            min_q4tp,
+        } => ltxpack::cmd_ltx_pack(ltxpack::LtxPackArgs {
+            out: &out,
+            carry: carry.as_deref(),
+            dit: dit.as_deref(),
+            te: te.as_deref(),
+            video_vae: video_vae.as_deref(),
+            audio_vae: audio_vae.as_deref(),
+            spatial_upscaler: spatial_upscaler.as_deref(),
+            temporal_upscaler: temporal_upscaler.as_deref(),
+            duration_head: duration_head.as_deref(),
+            quant: &quant,
+            vae_quant: &vae_quant,
+            min_q4tp,
+        }),
         Commands::AnimatePack {
             out,
             carry,
