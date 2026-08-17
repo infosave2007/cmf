@@ -414,6 +414,12 @@ kernel void softmax_ce_f32(
 {
     threadgroup float red[8];
     device float* lr = logits + (ulong)row * n;
+    uint t0 = target[row];
+    if (t0 == 0xFFFFFFFFu) {   // ignore: no loss, no gradient
+        for (uint i = tid; i < n; i += 256u) lr[i] = 0.0f;
+        if (tid == 0) loss[row] = 0.0f;
+        return;
+    }
     float mx = -INFINITY;
     for (uint i = tid; i < n; i += 256u) { mx = max(mx, lr[i]); }
     mx = simd_max(mx);
@@ -1163,6 +1169,11 @@ kernel void softmax_ce_idx_f32(
     int i = idx[row];
     if (i < 0) {
         for (uint j = tid; j < n; j += 256u) lr[j] = 0.0f;
+        return;
+    }
+    if (tgt[i] == 0xFFFFFFFFu) {
+        for (uint j = tid; j < n; j += 256u) lr[j] = 0.0f;
+        if (tid == 0) loss2[i] = 0.0f;
         return;
     }
     uint t = tgt[i] % n;

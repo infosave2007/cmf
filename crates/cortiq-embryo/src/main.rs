@@ -218,6 +218,31 @@ enum Sub {
         #[arg(long, default_value_t = 1)]
         seed: u64,
     },
+    /// Train K MTP heads (t+2, t+3, …) on the frozen trunk and append them to a .cmf.
+    MtpTrain {
+        #[arg(long)]
+        ckpt: PathBuf,
+        #[arg(long)]
+        tokenizer: PathBuf,
+        #[arg(long, required = true, num_args = 1..)]
+        corpus: Vec<PathBuf>,
+        #[arg(long)]
+        base: PathBuf,
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[arg(long, default_value_t = 2)]
+        heads: usize,
+        #[arg(long, default_value_t = 400)]
+        steps: usize,
+        #[arg(long, default_value_t = 1e-3)]
+        lr: f32,
+        #[arg(long, default_value_t = 4)]
+        batch: usize,
+        #[arg(long, default_value_t = 512)]
+        seq: usize,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+    },
     /// Birth: train from scratch (or resume) on a token shard.
     Birth {
         /// token shards (u16 LE), `path[:weight]`, repeatable — mixed by weight
@@ -407,6 +432,39 @@ fn main() {
             #[cfg(not(target_os = "macos"))]
             {
                 let _ = (ckpt, tokenizer, corpus, out_ckpt, export, steps, lr, batch, seq, gate, noise, shift, seed);
+                eprintln!("needs Metal (macOS)");
+                std::process::exit(1);
+            }
+        }
+        Sub::MtpTrain { ckpt, tokenizer, corpus, base, out, heads, steps, lr, batch, seq, seed } => {
+            #[cfg(target_os = "macos")]
+            {
+                let ck = cortiq_embryo::train::load_checkpoint(&ckpt).expect("load checkpoint");
+                let bpe = cortiq_embryo::tokenizer::Bpe::load(&tokenizer).expect("tokenizer");
+                let eot = bpe.special_id(cortiq_embryo::tokenizer::EOT).unwrap_or(0) as u16;
+                let mut toks: Vec<u16> = Vec::new();
+                let mut cache = std::collections::HashMap::new();
+                for p in &corpus {
+                    cortiq_embryo::data::for_each_doc(p, |text| {
+                        let mut ids = Vec::new();
+                        bpe.encode(text, &mut cache, &mut ids);
+                        toks.extend(ids.iter().map(|&i| i as u16));
+                        toks.push(eot);
+                    })
+                    .expect("read corpus");
+                }
+                let shard = cortiq_embryo::train::Shard { tokens: toks };
+                let (_gpu, st, held) = cortiq_embryo::mtp::train_mtp(&ck, &shard, heads, steps, lr, batch, seq, seed).expect("mtp");
+                println!("mtp heads trained: held-out losses {:?} (ppl {:?})", held, held.iter().map(|l| format!("{:.1}", l.exp())).collect::<Vec<_>>());
+                let out_path = out.unwrap_or_else(|| base.clone());
+                let tmp = out_path.with_extension("cmf.tmp");
+                let kept = cortiq_embryo::mtp::append_to_cmf(&base, &tmp, &st).expect("append");
+                std::fs::rename(&tmp, &out_path).expect("rename");
+                println!("{} MTP tensors appended → {} ({kept} base tensors byte-identical)", 2 * heads, out_path.display());
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = (ckpt, tokenizer, corpus, base, out, heads, steps, lr, batch, seq, seed);
                 eprintln!("needs Metal (macOS)");
                 std::process::exit(1);
             }
