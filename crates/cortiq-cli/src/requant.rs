@@ -32,6 +32,11 @@ use crate::convert::{Quant, encode_q2tp, encode_q4tp, parse_quant, q2tp_expert_g
 enum Mode {
     /// Whole-file scale re-expression, lossless in the 4-bit grid.
     FullQ4tp,
+    /// REAL quantization of a float container (f32/f16/bf16 2-D weight
+    /// tensors → q4tp; the value grid changes). Embeddings, the head, the
+    /// tiny routing/gate tensors and 1-D tensors stay as they are — the
+    /// Embryo trainer's f32 export is the source this exists for.
+    QuantizeQ4tp,
     /// Draft-only expert inputs to the 2-bit grid.
     DraftQ2tp,
     /// The draft's whole expert bodies — inputs AND the down plane. Still
@@ -49,6 +54,18 @@ fn target_dtype(mode: &Mode, name: &str, src: TensorDtype, shape: &[usize]) -> O
         // q4tp reads the same 4-bit grid as q4_tiled/q4_block, so recoding
         // either is lossless in the grid and only re-expresses the scale.
         Mode::FullQ4tp if two_d && matches!(src, TensorDtype::Q4Tiled | TensorDtype::Q4Block) => {
+            Some(TensorDtype::Q4TiledP)
+        }
+        Mode::QuantizeQ4tp
+            if two_d
+                && shape[0] >= 64
+                && matches!(src, TensorDtype::F32 | TensorDtype::F16 | TensorDtype::Bf16)
+                && !name.contains("embed_tokens")
+                && !name.contains("lm_head")
+                && !name.contains(".desc.")
+                && !name.contains("mlp.gate.weight")
+                && !name.contains("k_gate") =>
+        {
             Some(TensorDtype::Q4TiledP)
         }
         // The draft's SwiGLU inputs, and only the draft's: `.mtp.` scopes
@@ -85,7 +102,9 @@ pub fn cmd_requant(
     quant: &str,
     in_place: bool,
 ) -> anyhow::Result<()> {
-    let mode = if quant == "q2tp-draft" {
+    let mode = if quant == "q4tp-quantize" {
+        Mode::QuantizeQ4tp
+    } else if quant == "q2tp-draft" {
         Mode::DraftQ2tp
     } else if quant == "q2tp-draft-full" {
         Mode::DraftQ2tpFull

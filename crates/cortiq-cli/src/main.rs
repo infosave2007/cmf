@@ -369,7 +369,7 @@ enum Commands {
         /// Output .cmf path (omit with --in-place)
         #[arg(long)]
         output: Option<String>,
-        /// Target layout: q4tp, or q2tp-draft (MTP draft expert inputs)
+        /// Target layout: q4tp (re-express q4 scales), q4tp-quantize (REAL quantization of a float container: 2-D weights → q4tp), or q2tp-draft (MTP draft expert inputs)
         #[arg(long, default_value = "q4tp")]
         quant: String,
         /// Rewrite tensors inside the source file itself — for disks that
