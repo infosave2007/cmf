@@ -4714,6 +4714,11 @@ impl Pipeline {
                                 *v = c * (*v / c).tanh();
                             }
                         }
+                        // Cortiq Embryo hierarchical head: same correction
+                        // the decode path applies (lm_head_forward).
+                        if let Some(cm) = self.head_clusters.clone() {
+                            self.hierarchical_head_logprobs(&normed[k * hs..(k + 1) * hs], &cm, lg);
+                        }
                         let lg = &logits[k * rows..k * rows + self.vocab_size.min(rows)];
                         let target = ids[pos + k0 + k + 1] as usize;
                         let max = lg.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
