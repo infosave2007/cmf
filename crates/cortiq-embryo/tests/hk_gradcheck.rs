@@ -45,3 +45,36 @@ fn hk_closed_form_backward_matches_finite_differences() {
     check("dv", &v, &dv, &|x| loss(&thq, &thk, x, &kappa));
     check("dkappa", &kappa, &dkap, &|x| loss(&thq, &thk, &v, x));
 }
+
+#[test]
+fn hk_decay_gradient_matches_finite_differences() {
+    use cortiq_embryo::ops::hk_ref_dgamma;
+    let d = HkDims { b: 2, t: 9, nh: 2, nph: 3, dv: 4 };
+    let n_th = d.b * d.t * d.nh * d.nph;
+    let n_v = d.b * d.t * d.nh * d.dv;
+    let n_k = d.b * d.t * d.nh;
+    let thq: Vec<f64> = to64(&lcg_vec(1, n_th)).iter().map(|x| x * 3.0).collect();
+    let thk: Vec<f64> = to64(&lcg_vec(2, n_th)).iter().map(|x| x * 3.0).collect();
+    let v = to64(&lcg_vec(3, n_v));
+    let kappa: Vec<f64> = to64(&lcg_vec(4, n_k)).iter().map(|x| 0.5 + 0.4 * x).collect();
+    let decay = to64(&hk_decay_grid(d.nh, d.nph, 2.0, 16.0));
+    let dout = to64(&lcg_vec(5, n_v));
+    let loss = |dec: &[f64]| -> f64 {
+        let o = hk_ref_fwd(&d, &thq, &thk, &v, &kappa, dec);
+        o.iter().zip(&dout).map(|(a, b)| a * b).sum()
+    };
+    let dg = hk_ref_dgamma(&d, &thq, &thk, &v, &kappa, &decay, &dout);
+    let eps = 1e-6;
+    let mut worst = 0.0f64;
+    for i in 0..decay.len() {
+        let mut dp = decay.clone();
+        dp[i] += eps;
+        let mut dm = decay.clone();
+        dm[i] -= eps;
+        let fd = (loss(&dp) - loss(&dm)) / (2.0 * eps);
+        let err = (fd - dg[i]).abs() / (1.0 + fd.abs());
+        worst = worst.max(err);
+    }
+    eprintln!("dgamma: worst rel err {worst:e}");
+    assert!(worst < 1e-6);
+}

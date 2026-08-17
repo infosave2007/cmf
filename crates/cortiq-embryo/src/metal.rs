@@ -76,6 +76,9 @@ pub struct Ctx {
     mask_fwd: ComputePipelineState,
     mask_bwd_dm: ComputePipelineState,
     mask_bwd_dh: ComputePipelineState,
+    hk_pow_from_alog: ComputePipelineState,
+    hk_scale_ktp: ComputePipelineState,
+    hk_dgamma: ComputePipelineState,
 }
 unsafe impl Send for Ctx {}
 unsafe impl Sync for Ctx {}
@@ -190,6 +193,9 @@ fn init() -> Result<Ctx, String> {
         mask_fwd: pso("mask_fwd_f32")?,
         mask_bwd_dm: pso("mask_bwd_dm_f32")?,
         mask_bwd_dh: pso("mask_bwd_dh_f32")?,
+        hk_pow_from_alog: pso("hk_pow_from_alog_f32")?,
+        hk_scale_ktp: pso("hk_scale_ktp_f32")?,
+        hk_dgamma: pso("hk_dgamma_f32")?,
         gemm,
         _lib: lib,
         queue,
@@ -727,7 +733,7 @@ impl<'a> Cmd<'a> {
         e.set_compute_pipeline_state(&self.c.hk_states_fwd);
         e.set_buffer(0, Some(&w.phk.buf), 0);
         e.set_buffer(1, Some(&w.kv.buf), 0);
-        e.set_buffer(2, Some(&w.pow.buf), 0);
+        e.set_buffer(2, Some(&w.pow.buf), (w.pow_off * 4) as u64);
         e.set_buffer(3, Some(&w.states.buf), 0);
         self.hk_args(4, d);
         e.dispatch_thread_groups(MTLSize::new((d.b * d.nh) as u64, 1, 1), MTLSize::new((d.dv * (2 * d.nph).div_ceil(16)) as u64, 1, 1));
@@ -737,7 +743,7 @@ impl<'a> Cmd<'a> {
         e.set_buffer(0, Some(&w.phq.buf), 0);
         e.set_buffer(1, Some(&w.phk.buf), 0);
         e.set_buffer(2, Some(&w.kv.buf), 0);
-        e.set_buffer(3, Some(&w.pow.buf), 0);
+        e.set_buffer(3, Some(&w.pow.buf), (w.pow_off * 4) as u64);
         e.set_buffer(4, Some(&w.states.buf), 0);
         e.set_buffer(5, Some(&w.out.buf), 0);
         self.hk_args(6, d);
@@ -764,7 +770,7 @@ impl<'a> Cmd<'a> {
         e.set_compute_pipeline_state(&self.c.hk_dstates_bwd);
         e.set_buffer(0, Some(&w.phq.buf), 0);
         e.set_buffer(1, Some(&g.dout.buf), 0);
-        e.set_buffer(2, Some(&w.pow.buf), 0);
+        e.set_buffer(2, Some(&w.pow.buf), (w.pow_off * 4) as u64);
         e.set_buffer(3, Some(&g.dstates.buf), 0);
         self.hk_args(4, d);
         e.dispatch_thread_groups(MTLSize::new((d.b * d.nh) as u64, 1, 1), MTLSize::new((d.dv * (2 * d.nph).div_ceil(16)) as u64, 1, 1));
@@ -773,7 +779,7 @@ impl<'a> Cmd<'a> {
         e.set_buffer(0, Some(&w.phq.buf), 0);
         e.set_buffer(1, Some(&w.phk.buf), 0);
         e.set_buffer(2, Some(&w.kv.buf), 0);
-        e.set_buffer(3, Some(&w.pow.buf), 0);
+        e.set_buffer(3, Some(&w.pow.buf), (w.pow_off * 4) as u64);
         e.set_buffer(4, Some(&w.states.buf), 0);
         e.set_buffer(5, Some(&g.dstates.buf), 0);
         e.set_buffer(6, Some(&g.dout.buf), 0);
@@ -1019,7 +1025,7 @@ impl<'a> Cmd<'a> {
         e.set_compute_pipeline_state(&self.c.hk_scale);
         e.set_buffer(0, Some(&w.phq.buf), 0);
         e.set_buffer(1, Some(&w.phk.buf), 0);
-        e.set_buffer(2, Some(&w.pow.buf), 0);
+        e.set_buffer(2, Some(&w.pow.buf), (w.pow_off * 4) as u64);
         e.set_buffer(3, Some(&sc.qt.buf), 0);
         e.set_buffer(4, Some(&sc.kt.buf), 0);
         e.set_buffer(5, Some(&sc.qp.buf), 0);
@@ -1116,7 +1122,7 @@ impl<'a> Cmd<'a> {
         e.set_buffer(1, Some(&sc.dkt.buf), 0);
         e.set_buffer(2, Some(&sc.dqi.buf), 0);
         e.set_buffer(3, Some(&sc.dki.buf), 0);
-        e.set_buffer(4, Some(&w.pow.buf), 0);
+        e.set_buffer(4, Some(&w.pow.buf), (w.pow_off * 4) as u64);
         e.set_buffer(5, Some(&g.dphq.buf), 0);
         e.set_buffer(6, Some(&g.dphk.buf), 0);
         self.hk_args(7, d);
@@ -1148,7 +1154,7 @@ impl<'a> Cmd<'a> {
         e.set_compute_pipeline_state(&self.c.hk_states_par);
         e.set_buffer(0, Some(&w.phk.buf), 0);
         e.set_buffer(1, Some(&w.kv.buf), 0);
-        e.set_buffer(2, Some(&w.pow.buf), 0);
+        e.set_buffer(2, Some(&w.pow.buf), (w.pow_off * 4) as u64);
         e.set_buffer(3, Some(&w.states.buf), 0);
         self.hk_args(4, d);
         let p2 = 2 * d.nph;
@@ -1163,7 +1169,7 @@ impl<'a> Cmd<'a> {
         e.set_compute_pipeline_state(&self.c.hk_dstates_par);
         e.set_buffer(0, Some(&w.phq.buf), 0);
         e.set_buffer(1, Some(&g.dout.buf), 0);
-        e.set_buffer(2, Some(&w.pow.buf), 0);
+        e.set_buffer(2, Some(&w.pow.buf), (w.pow_off * 4) as u64);
         e.set_buffer(3, Some(&g.dstates.buf), 0);
         self.hk_args(4, d);
         let p2 = 2 * d.nph;
@@ -1178,7 +1184,7 @@ impl<'a> Cmd<'a> {
         e.set_compute_pipeline_state(&self.c.hk_states_fwd);
         e.set_buffer(0, Some(&w.phk.buf), 0);
         e.set_buffer(1, Some(&w.kv.buf), 0);
-        e.set_buffer(2, Some(&w.pow.buf), 0);
+        e.set_buffer(2, Some(&w.pow.buf), (w.pow_off * 4) as u64);
         e.set_buffer(3, Some(&w.states.buf), 0);
         self.hk_args(4, d);
         e.dispatch_thread_groups(MTLSize::new((d.b * d.nh) as u64, 1, 1), MTLSize::new((d.dv * (2 * d.nph).div_ceil(16)) as u64, 1, 1));
@@ -1189,7 +1195,7 @@ impl<'a> Cmd<'a> {
         e.set_compute_pipeline_state(&self.c.hk_dstates_bwd);
         e.set_buffer(0, Some(&w.phq.buf), 0);
         e.set_buffer(1, Some(&g.dout.buf), 0);
-        e.set_buffer(2, Some(&w.pow.buf), 0);
+        e.set_buffer(2, Some(&w.pow.buf), (w.pow_off * 4) as u64);
         e.set_buffer(3, Some(&g.dstates.buf), 0);
         self.hk_args(4, d);
         e.dispatch_thread_groups(MTLSize::new((d.b * d.nh) as u64, 1, 1), MTLSize::new((d.dv * (2 * d.nph).div_ceil(16)) as u64, 1, 1));
@@ -1474,6 +1480,59 @@ impl<'a> Cmd<'a> {
         self.grid1(rows * n, 256);
     }
 
+    /// pow[h][δ][f] = γ^δ from A_log (γ = exp(−exp(A_log))), written at pow_off.
+    pub fn hk_pow_from_alog(&self, d: &HkDims, alog: &GBuf, alog_off: usize, pow: &GBuf, pow_off: usize) {
+        let p2 = 2 * d.nph;
+        assert!(alog.len >= alog_off + d.nh * p2 && pow.len >= pow_off + d.nh * 65 * p2);
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.hk_pow_from_alog);
+        e.set_buffer(0, Some(&alog.buf), (alog_off * 4) as u64);
+        e.set_buffer(1, Some(&pow.buf), (pow_off * 4) as u64);
+        self.hk_args(2, d);
+        self.grid1(d.nh * p2, 128);
+    }
+
+    /// dA_log += ∂L/∂A_log of one hybrid_k layer. Call right AFTER
+    /// `hk_backward_gemm` (sc.a holds dA, sc.dqt/dqi/dki are fresh, the
+    /// scaled tables are in sc). `ktp`/`dqtp` are two more chunk-major
+    /// scratch buffers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hk_dgamma(&self, d: &HkDims, w: &HkWork<'_>, g: &HkGrads<'_>, sc: &HkScratch<'_>, ktp: &GBuf, dqtp: &GBuf, dalog: &GBuf, dalog_off: usize) {
+        let rows = d.b * d.t;
+        let (p2, nch) = (2 * d.nph, d.t / 64);
+        let cl = HkScratch::chunk_len(d);
+        assert!(ktp.len >= cl && dqtp.len >= cl && dalog.len >= dalog_off + d.nh * p2);
+        let e = &self.enc;
+        // K̃′ table
+        e.set_compute_pipeline_state(&self.c.hk_scale_ktp);
+        e.set_buffer(0, Some(&w.phk.buf), 0);
+        e.set_buffer(1, Some(&w.pow.buf), (w.pow_off * 4) as u64);
+        e.set_buffer(2, Some(&ktp.buf), 0);
+        self.hk_args(3, d);
+        self.grid1(rows * d.nh * p2, 256);
+        // dqtp = dA·K̃′
+        let cm = HkScratch::chunk_major(d);
+        let sa = [d.nh * nch * 4096, nch * 4096, 4096];
+        let bt = GemmBatch { nb: d.b, nh: d.nh, nc: nch, sa, sb: cm, sc: cm };
+        self.gemm_ex(Op::N, Op::N, 64, p2, 64, 1.0, sc.a, 0, 64, ktp, 0, p2, 0.0, dqtp, 0, p2, &bt, false);
+        // reduction → dA_log
+        e.set_compute_pipeline_state(&self.c.hk_dgamma);
+        e.set_buffer(0, Some(&w.phq.buf), 0);
+        e.set_buffer(1, Some(&w.pow.buf), (w.pow_off * 4) as u64);
+        e.set_buffer(2, Some(&sc.qt.buf), 0);
+        e.set_buffer(3, Some(&sc.qp.buf), 0);
+        e.set_buffer(4, Some(&sc.kh.buf), 0);
+        e.set_buffer(5, Some(&sc.dqt.buf), 0);
+        e.set_buffer(6, Some(&dqtp.buf), 0);
+        e.set_buffer(7, Some(&sc.dqi.buf), 0);
+        e.set_buffer(8, Some(&sc.dki.buf), 0);
+        e.set_buffer(9, Some(&w.states.buf), 0);
+        e.set_buffer(10, Some(&g.dstates.buf), 0);
+        e.set_buffer(11, Some(&dalog.buf), (dalog_off * 4) as u64);
+        self.hk_args(12, d);
+        e.dispatch_thread_groups(MTLSize::new((d.nh * p2) as u64, 1, 1), MTLSize::new(256, 1, 1));
+    }
+
     /// Submit and wait. Returns GPU time in milliseconds (GPUEndTime −
     /// GPUStartTime) — the number the TFLOPS bench reports.
     pub fn commit(self) -> f64 {
@@ -1506,8 +1565,9 @@ pub struct HkWork<'a> {
     pub thk: &'a GBuf,
     pub v: &'a GBuf,
     pub kappa: &'a GBuf,
-    /// γ^δ table from `hk_pow_table`
+    /// γ^δ table from `hk_pow_table` (or `hk_pow_from_alog`), at `pow_off`
     pub pow: &'a GBuf,
+    pub pow_off: usize,
     pub phq: &'a GBuf,
     pub phk: &'a GBuf,
     pub kv: &'a GBuf,
@@ -1536,7 +1596,7 @@ fn hk_check(d: &HkDims, w: &HkWork<'_>) {
     assert!(w.v.len >= rows * d.nh * d.dv && w.out.len >= rows * d.nh * d.dv && w.kv.len >= rows * d.nh * d.dv);
     assert!(w.kappa.len >= rows * d.nh);
     assert!(w.phq.len >= rows * d.nh * 2 * d.nph && w.phk.len >= rows * d.nh * 2 * d.nph);
-    assert!(w.pow.len >= d.nh * 65 * 2 * d.nph);
+    assert!(w.pow.len >= w.pow_off + d.nh * 65 * 2 * d.nph);
     assert!(w.states.len >= d.b * d.nh * (d.t / 64 + 1) * 2 * d.nph * d.dv);
 }
 

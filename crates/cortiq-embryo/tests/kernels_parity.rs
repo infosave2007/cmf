@@ -249,7 +249,7 @@ fn hybrid_k_chunk_scan_matches_cpu_oracle() {
         let (gphq, gphk, gkv, gout) = (g(rows * d.nh * p2), g(rows * d.nh * p2), g(rows * d.nh * dv), g(rows * d.nh * dv));
         let nst = d.b * d.nh * (d.t / 64 + 1) * p2 * dv;
         let gstates = g(nst);
-        let w = HkWork { thq: &gthq, thk: &gthk, v: &gv, kappa: &gkap, pow: &gpow, phq: &gphq, phk: &gphk, kv: &gkv, states: &gstates, out: &gout };
+        let w = HkWork { thq: &gthq, thk: &gthk, v: &gv, kappa: &gkap, pow: &gpow, pow_off: 0, phq: &gphq, phk: &gphk, kv: &gkv, states: &gstates, out: &gout };
         let gdout = GBuf::from_slice(c, &dout);
         let (gdst, gdkv, gdphq, gdphk) = (g(nst), g(rows * d.nh * dv), g(rows * d.nh * p2), g(rows * d.nh * p2));
         let (gdthq, gdthk, gdv, gdkap) = (g(rows * d.nh * nph), g(rows * d.nh * nph), g(rows * d.nh * dv), g(rows * d.nh));
@@ -340,7 +340,7 @@ fn hybrid_k_gemm_formulation_matches_oracle_and_simt() {
         let (gphq, gphk, gkv, gout) = (g(rows * nh * p2), g(rows * nh * p2), g(rows * nh * dv), g(rows * nh * dv));
         let nst = b * nh * (t / 64 + 1) * p2 * dv;
         let gstates = g(nst);
-        let w = HkWork { thq: &gthq, thk: &gthk, v: &gv, kappa: &gkap, pow: &gpow, phq: &gphq, phk: &gphk, kv: &gkv, states: &gstates, out: &gout };
+        let w = HkWork { thq: &gthq, thk: &gthk, v: &gv, kappa: &gkap, pow: &gpow, pow_off: 0, phq: &gphq, phk: &gphk, kv: &gkv, states: &gstates, out: &gout };
         let gdout = GBuf::from_slice(c, &dout);
         let (gdst, gdkv, gdphq, gdphk) = (g(nst), g(rows * nh * dv), g(rows * nh * p2), g(rows * nh * p2));
         let (gdthq, gdthk, gdv, gdkap) = (g(rows * nh * nph), g(rows * nh * nph), g(rows * nh * dv), g(rows * nh));

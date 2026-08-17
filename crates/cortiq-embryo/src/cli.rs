@@ -72,6 +72,7 @@ pub struct BirthArgs {
     pub tiny: bool,
     pub vocab: Option<usize>,
     pub anchor_every: Option<usize>,
+    pub cfg_json: Option<String>,
     pub seed: u64,
 }
 
@@ -101,6 +102,17 @@ pub fn birth(a: BirthArgs) {
             }
             if let Some(ae) = a.anchor_every {
                 cfg.anchor_every = ae.max(1);
+            }
+            if let Some(js) = &a.cfg_json {
+                let mut base = serde_json::to_value(&cfg).expect("cfg to json");
+                let over: serde_json::Value = serde_json::from_str(js).expect("--cfg-json must be a JSON object");
+                if let (Some(b), Some(o)) = (base.as_object_mut(), over.as_object()) {
+                    for (k, v) in o {
+                        b.insert(k.clone(), v.clone());
+                    }
+                }
+                cfg = serde_json::from_value(base).expect("cfg overrides");
+                println!("cfg overrides applied: {js}");
             }
             let lay = Layout::new(&cfg);
             (cfg.clone(), init_params(&cfg, &lay, a.seed), 0, None, None, Vec::new())
