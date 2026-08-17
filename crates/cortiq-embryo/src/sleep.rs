@@ -40,6 +40,8 @@ pub struct SleepArgs {
     /// ignore idle / min-tokens conditions (demo)
     pub force: bool,
     pub poll_secs: u64,
+    /// try growth (new experts) after this many consecutive rejected nights (0 = off)
+    pub grow_after: usize,
 }
 
 fn now() -> u64 {
@@ -217,11 +219,126 @@ pub fn run(a: SleepArgs) -> anyhow::Result<()> {
                 }
             }
         }
+        // ---- growth trigger (§4.3 "маска исчерпана"): K nights in a row
+        // whose skill failed the gate while the buffer kept coming → the
+        // masks stopped helping → try new experts on the archived buffers,
+        // gated on held-out; the grown genome replaces the checkpoint and
+        // the served file (skills re-appended: their base bytes are intact).
+        if a.grow_after > 0 {
+            let rejected = consecutive_rejections(&a.ood_dir);
+            if rejected >= a.grow_after {
+                journal(&a.ood_dir, "growth_start", serde_json::json!({"rejected_in_a_row": rejected}));
+                match try_growth(&a, &ck, &bpe, eot, &should_stop) {
+                    Ok(Some((l0, l1))) => {
+                        journal(&a.ood_dir, "growth_committed", serde_json::json!({"held_out_before": l0, "held_out_after": l1}));
+                        // the daemon's genome changed: reload it
+                        return run(a);
+                    }
+                    Ok(None) => journal(&a.ood_dir, "growth_rejected", serde_json::json!({})),
+                    Err(e) if e.to_string().contains("preempted") => journal(&a.ood_dir, "growth_preempted", serde_json::json!({})),
+                    Err(e) => journal(&a.ood_dir, "growth_error", serde_json::json!({"error": e.to_string()})),
+                }
+            }
+        }
         journal(&a.ood_dir, "night_end", serde_json::json!({"skill": id, "seconds": t0.elapsed().as_secs_f64()}));
         if a.once {
             return Ok(());
         }
     }
+}
+
+/// Consecutive `skill_rejected` nights at the tail of the journal (a
+/// commit or a growth event resets the count).
+fn consecutive_rejections(dir: &Path) -> usize {
+    let Ok(s) = std::fs::read_to_string(dir.join("journal.jsonl")) else { return 0 };
+    let mut n = 0usize;
+    for line in s.lines().rev() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        match v["event"].as_str() {
+            Some("skill_rejected") => n += 1,
+            Some("skill_committed") | Some("growth_committed") | Some("growth_rejected") => break,
+            _ => {}
+        }
+    }
+    n
+}
+
+/// Growth attempt: corpus = every archived buffer; E → E+1 experts; train
+/// the new ones; gate; on success write `<ckpt>` (backup kept as
+/// `<ckpt>.gen<N>`), export the grown genome and re-append the served
+/// file's skills onto it. Returns Some((before, after)) when committed.
+fn try_growth(a: &SleepArgs, ck: &Checkpoint, bpe: &Bpe, eot: u16, should_stop: &dyn Fn() -> bool) -> anyhow::Result<Option<(f32, f32)>> {
+    use crate::growth::{GrowArgs, grow_experts, train_new_experts};
+    let arch = a.ood_dir.join("archive");
+    let mut texts = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&arch) {
+        for e in rd.flatten() {
+            if let Ok(s) = std::fs::read_to_string(e.path()) {
+                for line in s.lines() {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                        if let Some(t) = v["text"].as_str() {
+                            texts.push(t.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    anyhow::ensure!(!texts.is_empty(), "no archived buffers to grow on");
+    let mut tokens: Vec<u16> = Vec::new();
+    let mut cache = std::collections::HashMap::new();
+    for t in &texts {
+        let mut ids = Vec::new();
+        bpe.encode(t, &mut cache, &mut ids);
+        tokens.extend(ids.iter().map(|&i| i as u16));
+        tokens.push(eot);
+    }
+    while tokens.len() < 40 * (a.seq + 2) {
+        let c = tokens.clone();
+        tokens.extend(c);
+    }
+    let corpus = Shard { tokens };
+    let (grown, sources) = grow_experts(ck, 1e-3, 0.1, now());
+    let ga = GrowArgs { steps: a.steps_a + a.steps_b, lr: 3e-4, batch: a.batch, seq: a.seq, eval_every: 30, seed: now() };
+    let (trained, l0, l1) = train_new_experts(&grown, &corpus, &ga, should_stop)?;
+    let imp = (l0 - l1) / l0.max(1e-6);
+    journal(&a.ood_dir, "growth_trained", serde_json::json!({"experts": grown.cfg.experts, "sources": sources, "held_out_before": l0, "held_out_after": l1, "improvement": imp}));
+    if imp < a.gate {
+        return Ok(None);
+    }
+    // commit: checkpoint (old kept as a generation backup) + served file
+    let generation = std::fs::read_dir(a.ckpt.parent().unwrap_or(Path::new(".")))?.flatten().filter(|e| e.file_name().to_string_lossy().contains(".gen")).count();
+    let backup = a.ckpt.with_extension(format!("ckpt.gen{generation}"));
+    std::fs::copy(&a.ckpt, &backup)?;
+    let d: Vec<(&str, &[f32])> = trained.extras.iter().map(|(n, x)| (n.as_str(), x.as_slice())).collect();
+    crate::train::save_checkpoint(&a.ckpt, &trained.cfg, trained.step, &trained.params, None, None, &d)?;
+    let tj = std::fs::read(&a.tokenizer)?;
+    let next = a.cmf.with_extension("cmf.grown");
+    crate::export::export(&trained, &tj, &next)?;
+    // re-append the served file's skills (their base tensors are unchanged)
+    let old = cortiq_core::format::CmfModel::open(&a.cmf)?;
+    let mut cur = next.clone();
+    for sk in &old.header.skills {
+        let tensors: Vec<(String, Vec<usize>, Vec<f32>)> = old
+            .tensors
+            .iter()
+            .filter(|t| t.name.starts_with(&format!("skill.{}.", sk.id)))
+            .map(|t| {
+                let bytes = old.tensor_bytes(&t.name).unwrap_or(&[]);
+                let data: Vec<f32> = bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                (t.name.clone(), t.shape.clone(), data)
+            })
+            .collect();
+        let Some(sel) = sk.selection.clone() else { continue };
+        let tmp = a.cmf.with_extension("cmf.grown2");
+        append_to_cmf(&cur, &tmp, &sk.id, &sk.layers, &tensors, sel, sk.quality.clone().unwrap_or(serde_json::json!({})))?;
+        std::fs::rename(&tmp, &next)?;
+        cur = next.clone();
+    }
+    drop(old);
+    std::fs::rename(&next, &a.cmf)?;
+    let _ = crate::skill::calibrate_file(&a.cmf, 0.05);
+    Ok(Some((l0, l1)))
 }
 
 /// q4tp requant of `cmf` next to it (`<stem>-q4tp.cmf`), kept only if

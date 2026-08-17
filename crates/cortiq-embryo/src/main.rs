@@ -184,6 +184,9 @@ enum Sub {
         force: bool,
         #[arg(long, default_value_t = 30)]
         poll_secs: u64,
+        /// try growth (new experts per layer) after N consecutive rejected nights (0 = off)
+        #[arg(long, default_value_t = 3)]
+        grow_after: usize,
     },
     /// Growth as records: add one expert per layer (copy of the hottest + shifted descriptor), train only the new experts on a corpus, gate on held-out, save the grown genome (+ optional .cmf export).
     Grow {
@@ -346,19 +349,19 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Sub::Sleep { ckpt, tokenizer, cmf, ood_dir, idle_min, min_tokens, gate, requant_gate, held_out, cortiq_bin, layers, steps_a, steps_b, batch, seq, once, force, poll_secs } => {
+        Sub::Sleep { ckpt, tokenizer, cmf, ood_dir, idle_min, min_tokens, gate, requant_gate, held_out, cortiq_bin, layers, steps_a, steps_b, batch, seq, once, force, poll_secs, grow_after } => {
             #[cfg(target_os = "macos")]
             {
                 let nl = cortiq_embryo::train::load_checkpoint(&ckpt).map(|c| c.cfg.layers).unwrap_or(8);
                 let layers = layers.unwrap_or_else(|| (nl.saturating_sub(3)..nl).collect());
                 cortiq_embryo::sleep::run(cortiq_embryo::sleep::SleepArgs {
-                    ckpt, tokenizer, cmf, ood_dir, idle_min, min_tokens, gate, requant_gate, held_out, cortiq_bin, layers, steps_a, steps_b, batch, seq, once, force, poll_secs,
+                    ckpt, tokenizer, cmf, ood_dir, idle_min, min_tokens, gate, requant_gate, held_out, cortiq_bin, layers, steps_a, steps_b, batch, seq, once, force, poll_secs, grow_after,
                 })
                 .expect("sleep");
             }
             #[cfg(not(target_os = "macos"))]
             {
-                let _ = (ckpt, tokenizer, cmf, ood_dir, idle_min, min_tokens, gate, requant_gate, held_out, cortiq_bin, layers, steps_a, steps_b, batch, seq, once, force, poll_secs);
+                let _ = (ckpt, tokenizer, cmf, ood_dir, idle_min, min_tokens, gate, requant_gate, held_out, cortiq_bin, layers, steps_a, steps_b, batch, seq, once, force, poll_secs, grow_after);
                 eprintln!("needs Metal (macOS)");
                 std::process::exit(1);
             }
