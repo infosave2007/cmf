@@ -968,6 +968,22 @@ pub fn cmd_ltx_audio(a: AudioArgs<'_>) -> anyhow::Result<()> {
         if let Ok((_, r)) = o.get("waveform") {
             let w = stack.decode(&grid, pool.as_deref());
             cmp("waveform", &w.data, &r);
+            // The vocoder is a GAN: it invents phase, and phase is where a
+            // small change in its input goes. Run it on the *reference's*
+            // own mel to separate our vocoder from our spectrogram.
+            if let Ok((ms, mv)) = o.get("mel") {
+                let d: Vec<usize> = ms.iter().copied().filter(|&x| x > 0).collect();
+                if d.len() >= 3 {
+                    let mel = cortiq_engine::ltxaudio::Grid {
+                        c: d[d.len() - 3],
+                        h: d[d.len() - 2],
+                        w: d[d.len() - 1],
+                        data: mv,
+                    };
+                    let w2 = stack.decode_from_mel(&mel, pool.as_deref());
+                    cmp("waveform*", &w2.data, &r);
+                }
+            }
         }
     }
     let t = std::time::Instant::now();
