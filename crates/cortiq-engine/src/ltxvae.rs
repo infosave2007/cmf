@@ -263,12 +263,15 @@ impl ConvVaeDecoder {
     /// `ltx.config_json`'s `vae.decoder_blocks`, walked in reverse.
     pub fn from_cmf(model: &Arc<CmfModel>, pool: Option<&Pool>) -> Result<ConvVaeDecoder, String> {
         // the pipeline config (from the DiT pass) or the VAE file's own
-        let cfg_bytes = ["ltx.config_json", "vvae.config_json"]
+        // Take whichever config actually describes the VAE: a container
+        // packed from the transformer first carries `ltx.config_json`, whose
+        // `transformer` section says nothing about decoder blocks.
+        let cfg: serde_json::Value = ["vvae.config_json", "ltx.config_json"]
             .iter()
-            .find_map(|n| model.tensor(n).map(|e| model.entry_bytes(e)))
-            .ok_or("neither ltx.config_json nor vvae.config_json is in this container")?;
-        let cfg: serde_json::Value =
-            serde_json::from_slice(cfg_bytes).map_err(|e| format!("config_json: {e}"))?;
+            .filter_map(|n| model.tensor(n).map(|e| model.entry_bytes(e)))
+            .filter_map(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
+            .find(|c| c.get("vae").and_then(|v| v.get("decoder_blocks")).is_some())
+            .ok_or("no config in this container carries vae.decoder_blocks")?;
         let vae = &cfg["vae"];
         let patch = vae["patch_size"].as_u64().unwrap_or(4) as usize;
         let blocks_cfg = vae["decoder_blocks"]
