@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod dashboard;
+pub mod ood;
 pub mod openai;
 pub mod streaming;
 

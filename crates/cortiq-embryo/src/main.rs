@@ -140,6 +140,51 @@ enum Sub {
         #[arg(long, default_value_t = 1)]
         seed: u64,
     },
+    /// Sleep daemon: bake skills from the OOD buffer during idle time, gate, commit/rollback, journal.
+    Sleep {
+        #[arg(long)]
+        ckpt: PathBuf,
+        #[arg(long)]
+        tokenizer: PathBuf,
+        /// the served .cmf (skills are appended atomically)
+        #[arg(long)]
+        cmf: PathBuf,
+        /// CMF_OOD_DIR of the server (buffer.jsonl, last_request, journal.jsonl)
+        #[arg(long)]
+        ood_dir: PathBuf,
+        #[arg(long, default_value_t = 5.0)]
+        idle_min: f64,
+        #[arg(long, default_value_t = 4000)]
+        min_tokens: usize,
+        /// required held-out improvement (fraction of loss) to keep a skill
+        #[arg(long, default_value_t = 0.02)]
+        gate: f32,
+        /// requant to q4tp when ppl grows by at most this fraction (0 = off)
+        #[arg(long, default_value_t = 0.0)]
+        requant_gate: f32,
+        #[arg(long)]
+        held_out: Option<PathBuf>,
+        #[arg(long, default_value = "cortiq")]
+        cortiq_bin: String,
+        #[arg(long, num_args = 1.., value_delimiter = ',')]
+        layers: Option<Vec<usize>>,
+        #[arg(long, default_value_t = 240)]
+        steps_a: usize,
+        #[arg(long, default_value_t = 120)]
+        steps_b: usize,
+        #[arg(long, default_value_t = 4)]
+        batch: usize,
+        #[arg(long, default_value_t = 512)]
+        seq: usize,
+        /// one cycle then exit
+        #[arg(long)]
+        once: bool,
+        /// ignore idle/min-tokens (demo)
+        #[arg(long)]
+        force: bool,
+        #[arg(long, default_value_t = 30)]
+        poll_secs: u64,
+    },
     /// Birth: train from scratch (or resume) on a token shard.
     Birth {
         /// token shards (u16 LE), `path[:weight]`, repeatable — mixed by weight
@@ -247,7 +292,7 @@ fn main() {
                     id: id.clone(), layers: layers.clone(), steps_a, steps_b, lr_a, lr_b, l1, tau, eval_every, batch, seq,
                     phi_layer: phi_layer.unwrap_or(nl * 2 / 3), phi_len, rank, seed,
                 };
-                let (tensors, sel, kept, (l0, la, lb)) = bake(&ck, &shard, &a).expect("bake");
+                let (tensors, sel, kept, (l0, la, lb)) = bake(&ck, &shard, &a, &|| false).expect("bake");
                 let quality = serde_json::json!({
                     "held_out_loss": {"base": l0, "mask": la, "mask+fcd": lb},
                     "held_out_ppl": {"base": l0.exp(), "mask": la.exp(), "mask+fcd": lb.exp()},
@@ -262,6 +307,23 @@ fn main() {
             #[cfg(not(target_os = "macos"))]
             {
                 let _ = (ckpt, tokenizer, corpus, base, out, id, layers, steps_a, steps_b, lr_a, lr_b, l1, tau, eval_every, batch, seq, phi_layer, phi_len, rank, seed);
+                eprintln!("needs Metal (macOS)");
+                std::process::exit(1);
+            }
+        }
+        Sub::Sleep { ckpt, tokenizer, cmf, ood_dir, idle_min, min_tokens, gate, requant_gate, held_out, cortiq_bin, layers, steps_a, steps_b, batch, seq, once, force, poll_secs } => {
+            #[cfg(target_os = "macos")]
+            {
+                let nl = cortiq_embryo::train::load_checkpoint(&ckpt).map(|c| c.cfg.layers).unwrap_or(8);
+                let layers = layers.unwrap_or_else(|| (nl.saturating_sub(3)..nl).collect());
+                cortiq_embryo::sleep::run(cortiq_embryo::sleep::SleepArgs {
+                    ckpt, tokenizer, cmf, ood_dir, idle_min, min_tokens, gate, requant_gate, held_out, cortiq_bin, layers, steps_a, steps_b, batch, seq, once, force, poll_secs,
+                })
+                .expect("sleep");
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = (ckpt, tokenizer, cmf, ood_dir, idle_min, min_tokens, gate, requant_gate, held_out, cortiq_bin, layers, steps_a, steps_b, batch, seq, once, force, poll_secs);
                 eprintln!("needs Metal (macOS)");
                 std::process::exit(1);
             }

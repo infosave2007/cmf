@@ -27,3 +27,5 @@ pub mod corpus;
 pub mod export;
 #[cfg(target_os = "macos")]
 pub mod skill;
+#[cfg(target_os = "macos")]
+pub mod sleep;

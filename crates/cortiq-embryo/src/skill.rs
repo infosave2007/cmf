@@ -107,6 +107,7 @@ pub fn bake(
     ck: &Checkpoint,
     corpus: &Shard,
     a: &BakeArgs,
+    should_stop: &dyn Fn() -> bool,
 ) -> anyhow::Result<(Vec<(String, Vec<usize>, Vec<f32>)>, SelectionDescriptor, Vec<f32>, (f32, f32, f32))> {
     let cfg = ck.cfg.clone();
     let lay = Layout::new(&cfg);
@@ -143,6 +144,9 @@ pub fn bake(
     // ---- phase A: masks to the denoising bottom ----
     let mut best_a = (f32::MAX, gpu.skill.as_ref().unwrap().logits.to_vec());
     for step in 0..a.steps_a {
+        if should_stop() {
+            anyhow::bail!("preempted");
+        }
         let l1 = a.l1 * (step as f32 / a.steps_a.max(1) as f32); // progressive L1
         gpu.skill.as_ref().unwrap().l1.set(l1);
         sampler.batch(&train, &mut tk, &mut tg);
@@ -186,6 +190,9 @@ pub fn bake(
     };
     let mut best_b = (best_a.0, snapshot(&gpu));
     for step in 0..a.steps_b {
+        if should_stop() {
+            anyhow::bail!("preempted");
+        }
         sampler.batch(&train, &mut tk, &mut tg);
         let lr = a.lr_b * 0.5 * (1.0 + (std::f32::consts::PI * step as f32 / a.steps_b.max(1) as f32).cos());
         let (loss, gn) = gpu.train_step_skill(&tk, &tg, lr, 0.0, 1.0, true);
