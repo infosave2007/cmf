@@ -398,10 +398,19 @@ impl Drop for GpuTrust {
     }
 }
 
-fn probe_on() -> bool {
-    if TRUST_GPU.load(Ordering::Relaxed) {
+fn probe_on_for(c: OpClass) -> bool {
+    // The trust is only for the *wide* class. A sustained diffusion step is
+    // where the probe reads a warm device as cold; the narrow batches inside
+    // the same loop — an audio stream of fifty-one tokens against the same
+    // weights — are small enough that submit latency can genuinely beat the
+    // arithmetic, and there the probe is right and should keep deciding.
+    if TRUST_GPU.load(Ordering::Relaxed) && matches!(c, OpClass::MatmatWide | OpClass::Ffn) {
         return false;
     }
+    probe_on()
+}
+
+fn probe_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         std::env::var("CMF_GPU_PROBE")
@@ -487,7 +496,7 @@ pub fn probe_arm(c: OpClass) -> ProbeArm {
     // read it AFTER the op, so a stale note from a previous call on
     // this thread must not leak in.
     PROBE_COLD.with(|f| f.set(false));
-    if !probe_on() {
+    if !probe_on_for(c) {
         return ProbeArm::Gpu;
     }
     probe_cache_load();
@@ -567,7 +576,7 @@ pub fn probe_record(c: OpClass, gpu: bool, dur: std::time::Duration) {
 /// Is the class still collecting samples? (Call sites use this to route
 /// cold-weight calls away from the GPU arm during probing.)
 pub fn probe_deciding(c: OpClass) -> bool {
-    probe_on() && PROBES[c as usize].state.load(Ordering::Relaxed) == 0
+    probe_on_for(c) && PROBES[c as usize].state.load(Ordering::Relaxed) == 0
 }
 
 /// Probing helper: true — tensor `idx`'s quant weights are ALREADY

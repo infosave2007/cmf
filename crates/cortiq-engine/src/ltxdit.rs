@@ -79,23 +79,55 @@ fn silu(v: f32) -> f32 {
 }
 
 /// `gelu(x, approximate="tanh")`, the feed-forward's projection activation.
+///
+/// In f32 and, where it matters, across the pool. A step puts half a billion
+/// values through this — 672 tokens × 16384 wide × 48 blocks — so computing
+/// it in f64 on one thread was worth several seconds of every step on its
+/// own. The f32 form agrees with the f64 one to ~1e-7 relative, which is far
+/// inside what the 4-bit weights around it carry.
+#[inline]
 pub(crate) fn gelu_tanh(v: f32) -> f32 {
-    let x = v as f64;
-    let inner = (2.0f64 / std::f64::consts::PI).sqrt() * (x + 0.044715 * x * x * x);
-    (0.5 * x * (1.0 + inner.tanh())) as f32
+    const K: f32 = 0.797_884_56; // sqrt(2/pi)
+    0.5 * v * (1.0 + (K * (v + 0.044715 * v * v * v)).tanh())
 }
 
+/// The same activation over a whole buffer, split across the pool.
+pub(crate) fn gelu_tanh_rows(x: &mut [f32], pool: Option<&Pool>) {
+    let dst = Shared(x.as_mut_ptr());
+    let n = x.len();
+    let grain = 4096usize;
+    let chunks = n.div_ceil(grain);
+    rows(pool, chunks, &|s, e| {
+        let (lo, hi) = (s * grain, (e * grain).min(n));
+        let r = unsafe { dst.at(lo, hi - lo) };
+        for v in r.iter_mut() {
+            *v = gelu_tanh(*v);
+        }
+    });
+}
+
+/// One attention row, normalized. A step softmaxes on the order of a
+/// billion scores — forty-eight blocks × thirty-two heads × every query
+/// against every key — so the scalar `exp()` here was not a detail: it was
+/// the arithmetic. The NEON path evaluates four at a time.
 pub(crate) fn softmax(row: &mut [f32]) {
-    let mx = row.iter().cloned().fold(f32::MIN, f32::max);
-    let mut den = 0f32;
-    for r in row.iter_mut() {
-        *r = (*r - mx).exp();
-        den += *r;
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::attention::softmax_row(row);
     }
-    if den > 0.0 {
-        let inv = 1.0 / den;
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let mx = row.iter().cloned().fold(f32::MIN, f32::max);
+        let mut den = 0f32;
         for r in row.iter_mut() {
-            *r *= inv;
+            *r = (*r - mx).exp();
+            den += *r;
+        }
+        if den > 0.0 {
+            let inv = 1.0 / den;
+            for r in row.iter_mut() {
+                *r *= inv;
+            }
         }
     }
 }
@@ -130,10 +162,39 @@ impl Lin {
         Ok(Lin { w, b })
     }
 
+    /// The container-mapped q4tp weight behind this projection, when there
+    /// is one: (model, tensor index, rows, cols).
+    #[cfg(target_os = "macos")]
+    fn mapped(&self) -> Option<(&Arc<CmfModel>, usize, usize, usize)> {
+        let (model, idx) = self.w.q4tp_mapped()?;
+        Some((model, idx, self.w.rows(), self.w.cols()))
+    }
+
+    /// The bias half of `apply`, for callers that got the product elsewhere.
+    pub(crate) fn add_bias(&self, out: &mut [f32], n: usize, pool: Option<&Pool>) {
+        let Some(b) = &self.b else { return };
+        let m = self.w.rows();
+        let dst = Shared(out.as_mut_ptr());
+        rows(pool, n, &|s, e| {
+            let r = unsafe { dst.at(s * m, (e - s) * m) };
+            for row in r.chunks_exact_mut(m) {
+                for (v, &bb) in row.iter_mut().zip(b) {
+                    *v += bb;
+                }
+            }
+        });
+    }
+
     pub(crate) fn apply(&self, x: &[f32], n: usize, pool: Option<&Pool>) -> Vec<f32> {
         let m = self.w.rows();
         let cols = self.w.cols();
+        let t_alloc = std::time::Instant::now();
         let mut out = vec![0f32; n * m];
+        attn_prof::ALLOC.fetch_add(
+            t_alloc.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let t_mm = std::time::Instant::now();
         // A GPU binding is capped near 2 GiB, and the prompt encoder's
         // aggregate projection reads 188160 numbers per token — 1024 of them
         // at once is past the cap. Chunk the batch so no single dispatch
@@ -151,6 +212,10 @@ impl Lin {
             );
             done += take;
         }
+        attn_prof::MATMAT.fetch_add(
+            t_mm.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         if let Some(b) = &self.b {
             let dst = Shared(out.as_mut_ptr());
             rows(pool, n, &|s, e| {
@@ -229,6 +294,37 @@ impl Rope {
     }
 }
 
+
+/// Sub-phase microseconds inside attention, summed across every call in a
+/// step. `CMF_LTX_PROF=1` prints them: the phase timers above say *which*
+/// attention is slow, these say *what part of it* is.
+pub(crate) mod attn_prof {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    pub static PROJ: AtomicU64 = AtomicU64::new(0);
+    pub static NORM: AtomicU64 = AtomicU64::new(0);
+    pub static GATHER: AtomicU64 = AtomicU64::new(0);
+    pub static SCORE: AtomicU64 = AtomicU64::new(0);
+    pub static SOFT: AtomicU64 = AtomicU64::new(0);
+    pub static VALUE: AtomicU64 = AtomicU64::new(0);
+    pub static OUT: AtomicU64 = AtomicU64::new(0);
+    pub static ALLOC: AtomicU64 = AtomicU64::new(0);
+    pub static MATMAT: AtomicU64 = AtomicU64::new(0);
+
+    pub fn add(c: &AtomicU64, t: std::time::Instant) -> std::time::Instant {
+        c.fetch_add(t.elapsed().as_micros() as u64, Relaxed);
+        std::time::Instant::now()
+    }
+
+    pub fn report() -> String {
+        let s = |c: &AtomicU64| c.swap(0, Relaxed) as f64 / 1e6;
+        format!(
+            "proj {:.2}s  qk-norm+rope {:.2}s  gather {:.2}s  scores {:.2}s  softmax {:.2}s  values {:.2}s  out {:.2}s  [linear: alloc {:.2}s  matmat {:.2}s]",
+            s(&PROJ), s(&NORM), s(&GATHER), s(&SCORE), s(&SOFT), s(&VALUE), s(&OUT),
+            s(&ALLOC), s(&MATMAT)
+        )
+    }
+}
+
 // ------------------------------------------------------------- attention
 
 pub(crate) struct Attn {
@@ -261,6 +357,102 @@ impl Attn {
         })
     }
 
+    /// The three projections in one submission, when the platform has a
+    /// batched entry and all three read the same activation. Returns `None`
+    /// when they do not — cross-attention's query comes from the tokens and
+    /// its keys from the prompt — and the caller falls back to three calls.
+    #[cfg(target_os = "macos")]
+    fn fused_qkv(
+        &self,
+        x: &[f32],
+        n: usize,
+        ctx: &[f32],
+        m: usize,
+        pool: Option<&Pool>,
+    ) -> Option<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+        if !std::ptr::eq(x.as_ptr(), ctx.as_ptr()) || n != m {
+            return None;
+        }
+        if !crate::gpu::enabled_here() || crate::gpu::mm_killed() {
+            return None;
+        }
+        let (qw, kw, vw) = (self.q.mapped()?, self.k.mapped()?, self.v.mapped()?);
+        if !Arc::ptr_eq(qw.0, kw.0) || !Arc::ptr_eq(qw.0, vw.0) {
+            return None;
+        }
+        let jobs = [
+            crate::gpu_metal::MmJob { idx: qw.1, rows: qw.2, cols: qw.3 },
+            crate::gpu_metal::MmJob { idx: kw.1, rows: kw.2, cols: kw.3 },
+            crate::gpu_metal::MmJob { idx: vw.1, rows: vw.2, cols: vw.3 },
+        ];
+        if n * jobs[0].rows * jobs[0].cols < 128_000_000 || n < 32 {
+            return None;
+        }
+        let mut oq = vec![0f32; n * jobs[0].rows];
+        let mut ok = vec![0f32; n * jobs[1].rows];
+        let mut ov = vec![0f32; n * jobs[2].rows];
+        let done = {
+            let mut outs: [&mut [f32]; 3] = [&mut oq, &mut ok, &mut ov];
+            crate::gpu_metal::q4tp_matmat_many(qw.0, &jobs, x, n, &mut outs)
+        };
+        if !done {
+            return None;
+        }
+        self.q.add_bias(&mut oq, n, pool);
+        self.k.add_bias(&mut ok, n, pool);
+        self.v.add_bias(&mut ov, n, pool);
+        Some((oq, ok, ov))
+    }
+
+    /// The key and value projections in one submission — they always read
+    /// the same buffer, whatever the query does.
+    #[cfg(target_os = "macos")]
+    fn fused_kv(&self, ctx: &[f32], m: usize) -> Option<(Vec<f32>, Vec<f32>)> {
+        if !crate::gpu::enabled_here() || crate::gpu::mm_killed() {
+            return None;
+        }
+        let (kw, vw) = (self.k.mapped()?, self.v.mapped()?);
+        if !Arc::ptr_eq(kw.0, vw.0) {
+            return None;
+        }
+        let jobs = [
+            crate::gpu_metal::MmJob { idx: kw.1, rows: kw.2, cols: kw.3 },
+            crate::gpu_metal::MmJob { idx: vw.1, rows: vw.2, cols: vw.3 },
+        ];
+        if m < 32 || m * jobs[0].rows * jobs[0].cols < 128_000_000 {
+            return None;
+        }
+        let mut ok = vec![0f32; m * jobs[0].rows];
+        let mut ov = vec![0f32; m * jobs[1].rows];
+        let done = {
+            let mut outs: [&mut [f32]; 2] = [&mut ok, &mut ov];
+            crate::gpu_metal::q4tp_matmat_many(kw.0, &jobs, ctx, m, &mut outs)
+        };
+        if !done {
+            return None;
+        }
+        self.k.add_bias(&mut ok, m, None);
+        self.v.add_bias(&mut ov, m, None);
+        Some((ok, ov))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn fused_kv(&self, _ctx: &[f32], _m: usize) -> Option<(Vec<f32>, Vec<f32>)> {
+        None
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn fused_qkv(
+        &self,
+        _x: &[f32],
+        _n: usize,
+        _ctx: &[f32],
+        _m: usize,
+        _pool: Option<&Pool>,
+    ) -> Option<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+        None
+    }
+
     /// `x` is `[n, query_dim]`, `ctx` is `[m, context_dim]` (self-attention
     /// passes the same buffer twice). `mask` is an additive per-key bias.
     #[allow(clippy::too_many_arguments)]
@@ -276,9 +468,30 @@ impl Attn {
         pool: Option<&Pool>,
     ) -> Vec<f32> {
         let inner = self.heads * self.dh;
-        let mut q = self.q.apply(x, n, pool);
-        let mut k = self.k.apply(ctx, m, pool);
-        let v = self.v.apply(ctx, m, pool);
+        let prof = std::env::var("CMF_LTX_PROF").is_ok();
+        let mut t = std::time::Instant::now();
+        // q, k and v do not depend on each other. When they also read the
+        // same buffer — self-attention, and the A↔V pair on the context
+        // side — they go to the device as one command buffer instead of
+        // three, which is three times less of the ~1.3 ms a completion
+        // costs whatever it contains.
+        let (mut q, mut k, v) = match self.fused_qkv(x, n, ctx, m, pool) {
+            Some(t) => t,
+            // Cross-attention's query reads the tokens and its keys read the
+            // prompt, so those two cannot share a submission — but the keys
+            // and the values still can.
+            None => match self.fused_kv(ctx, m) {
+                Some((k, v)) => (self.q.apply(x, n, pool), k, v),
+                None => (
+                    self.q.apply(x, n, pool),
+                    self.k.apply(ctx, m, pool),
+                    self.v.apply(ctx, m, pool),
+                ),
+            },
+        };
+        if prof {
+            t = attn_prof::add(&attn_prof::PROJ, t);
+        }
 
         let qn = Shared(q.as_mut_ptr());
         rows(pool, n, &|s, e| {
@@ -306,6 +519,9 @@ impl Attn {
         // contiguous `[tokens, dh]` block costs one copy and buys the
         // engine's blocked/BLAS/GPU kernels instead of a scalar loop —
         // this is most of a step's arithmetic.
+        if prof {
+            t = attn_prof::add(&attn_prof::NORM, t);
+        }
         let mut out = vec![0f32; n * inner];
         let scale = 1.0 / (self.dh as f32).sqrt();
         let dh = self.dh;
@@ -322,7 +538,13 @@ impl Attn {
                 kh[j * dh..(j + 1) * dh].copy_from_slice(&k[j * inner + h * dh..][..dh]);
                 vh[j * dh..(j + 1) * dh].copy_from_slice(&v[j * inner + h * dh..][..dh]);
             }
+            if prof {
+                t = attn_prof::add(&attn_prof::GATHER, t);
+            }
             crate::fcd_ops::gemm_nt(&qh, &kh, &mut sc, n, dh, m, pool);
+            if prof {
+                t = attn_prof::add(&attn_prof::SCORE, t);
+            }
             let sp = Shared(sc.as_mut_ptr());
             rows(pool, n, &|s, e| {
                 let r = unsafe { sp.at(s * m, (e - s) * m) };
@@ -333,11 +555,20 @@ impl Attn {
                     softmax(row);
                 }
             });
+            if prof {
+                t = attn_prof::add(&attn_prof::SOFT, t);
+            }
             oh.iter_mut().for_each(|x| *x = 0.0);
             crate::fcd_ops::gemm_dx(&sc, &vh, &mut oh, n, dh, m, pool);
+            if prof {
+                t = attn_prof::add(&attn_prof::VALUE, t);
+            }
             for i in 0..n {
                 out[i * inner + h * dh..i * inner + (h + 1) * dh]
                     .copy_from_slice(&oh[i * dh..(i + 1) * dh]);
+            }
+            if prof {
+                t = attn_prof::add(&attn_prof::GATHER, t);
             }
         }
 
@@ -357,7 +588,11 @@ impl Attn {
                 }
             });
         }
-        self.o.apply(&out, n, pool)
+        let r = self.o.apply(&out, n, pool);
+        if prof {
+            attn_prof::add(&attn_prof::OUT, t);
+        }
+        r
     }
 }
 
@@ -627,6 +862,23 @@ impl Prof {
         if !self.on {
             return;
         }
+        // The q4tp GEMM's own split, when Metal is keeping it: a copy-bound
+        // step wants fused blocks, a kernel-bound one wants a better kernel.
+        #[cfg(target_os = "macos")]
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let n = crate::gpu_metal::MM_N.swap(0, Relaxed);
+            if n > 0 {
+                let us = |a: &std::sync::atomic::AtomicU64| a.swap(0, Relaxed) as f64 / 1e6;
+                println!(
+                    "  q4tp on device: {n} calls, upload {:.2}s  kernel {:.2}s  download {:.2}s",
+                    us(&crate::gpu_metal::MM_UP),
+                    us(&crate::gpu_metal::MM_GPU),
+                    us(&crate::gpu_metal::MM_DN),
+                );
+            }
+        }
+        println!("  attention: {}", attn_prof::report());
         let names = ["adaln", "self-attn", "cross-attn", "a<->v", "ffn", "modulate"];
         let total: f64 = self.t.iter().sum();
         let parts: Vec<String> = names
@@ -671,9 +923,7 @@ impl Stream {
 
     fn ff(&self, x: &[f32], n: usize, pool: Option<&Pool>) -> Vec<f32> {
         let mut h = self.ff_in.apply(x, n, pool);
-        for v in h.iter_mut() {
-            *v = gelu_tanh(*v);
-        }
+        gelu_tanh_rows(&mut h, pool);
         self.ff_out.apply(&h, n, pool)
     }
 }
@@ -930,7 +1180,7 @@ impl LtxDit {
             post_sa_rows(&mut vx, &vsa, &mut vnormed, n, dim, &v_msa, &vt.idx, pool);
             let mut vq = vec![0f32; n * dim];
             affine_rows(&vnormed, &mut vq, n, dim, &v_ca, &vt.idx, pool);
-            let vctx = modulate_kv(&video.context, video.ctx_len, dim, &blk.video.prompt_sst, vpt.row(0));
+            let vctx = modulate_kv(&video.context, video.ctx_len, dim, &blk.video.prompt_sst, vpt.row(0), pool);
             let vca = blk.video.attn2.forward(&vq, n, &vctx, video.ctx_len, None, None, vmask, pool);
             if bi == 0 {
                 trace("v.b0.ca.in", &vq);
@@ -957,7 +1207,7 @@ impl LtxDit {
             post_sa_rows(&mut ax, &asa, &mut anormed, m, a_dim, &a_msa, &at.idx, pool);
             let mut aq = vec![0f32; m * a_dim];
             affine_rows(&anormed, &mut aq, m, a_dim, &a_ca, &at.idx, pool);
-            let actx = modulate_kv(&audio.context, audio.ctx_len, a_dim, &blk.audio.prompt_sst, apt.row(0));
+            let actx = modulate_kv(&audio.context, audio.ctx_len, a_dim, &blk.audio.prompt_sst, apt.row(0), pool);
             let aca = blk.audio.attn2.forward(&aq, m, &actx, audio.ctx_len, None, None, amask, pool);
             if bi == 0 {
                 trace("a.b0.ca.in", &aq);
@@ -1035,15 +1285,29 @@ impl LtxDit {
 
 /// `prompt_scale_shift_table` plus the prompt adaLN row, modulating the
 /// cross-attention K/V — the same modulation for every context token.
-fn modulate_kv(ctx: &[f32], len: usize, dim: usize, table: &[f32], extra: &[f32]) -> Vec<f32> {
+fn modulate_kv(
+    ctx: &[f32],
+    len: usize,
+    dim: usize,
+    table: &[f32],
+    extra: &[f32],
+    pool: Option<&Pool>,
+) -> Vec<f32> {
     let mut out = vec![0f32; len * dim];
     let shift: Vec<f32> = (0..dim).map(|d| table[d] + extra[d]).collect();
     let scale: Vec<f32> = (0..dim).map(|d| table[dim + d] + extra[dim + d]).collect();
-    for i in 0..len {
-        for d in 0..dim {
-            out[i * dim + d] = ctx[i * dim + d] * (1.0 + scale[d]) + shift[d];
+    // A thousand prompt tokens by four thousand channels, rebuilt in every
+    // one of forty-eight blocks: three hundred million writes a step, which
+    // is not something to do on one thread.
+    let dst = Shared(out.as_mut_ptr());
+    rows(pool, len, &|s, e| {
+        let r = unsafe { dst.at(s * dim, (e - s) * dim) };
+        for (row, i) in r.chunks_exact_mut(dim).zip(s..e) {
+            for d in 0..dim {
+                row[d] = ctx[i * dim + d] * (1.0 + scale[d]) + shift[d];
+            }
         }
-    }
+    });
     out
 }
 

@@ -343,8 +343,9 @@ impl LtxTextEncoder {
             }
             let mut g = layer.gate.apply(&h2, t, pool);
             let u = layer.up.apply(&h2, t, pool);
+            crate::ltxdit::gelu_tanh_rows(&mut g, pool);
             for (a, &b) in g.iter_mut().zip(&u) {
-                *a = gelu_tanh(*a) * b;
+                *a *= b;
             }
             let ff = layer.down.apply(&g, t, pool);
             for i in 0..t {
@@ -552,9 +553,7 @@ impl Connector {
                 rms_plain(&h[i * d..(i + 1) * d], &mut n2[i * d..(i + 1) * d]);
             }
             let mut g = ff_in.apply(&n2, t, pool);
-            for v in g.iter_mut() {
-                *v = gelu_tanh(*v);
-            }
+            crate::ltxdit::gelu_tanh_rows(&mut g, pool);
             let f = ff_out.apply(&g, t, pool);
             for (v, &y) in h.iter_mut().zip(&f) {
                 *v += y;

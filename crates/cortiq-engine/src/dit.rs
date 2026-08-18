@@ -55,6 +55,16 @@ impl Proj {
         })
     }
 
+    /// The container-mapped q4tp weight behind this projection, when the
+    /// codec put one there — a batched device path needs the tensor index,
+    /// not the bytes.
+    pub(crate) fn q4tp_mapped(&self) -> Option<(&Arc<CmfModel>, usize)> {
+        match self {
+            Proj::Q(q) => q.q4tp_mapped(),
+            Proj::F32 { .. } => None,
+        }
+    }
+
     pub(crate) fn rows(&self) -> usize {
         match self {
             Proj::F32 { rows, .. } => *rows,
