@@ -1121,6 +1121,12 @@ impl LtxDit {
         let at = TsTable::build(&self.a_adaln, &audio.timesteps, self.t_scale, pool);
         let vpt = TsTable::build(&self.prompt_adaln, &[video.sigma], self.t_scale, pool);
         let apt = TsTable::build(&self.a_prompt_adaln, &[audio.sigma], self.t_scale, pool);
+        if std::env::var("CMF_LTX_PROMPTADALN").is_ok() {
+            let r = vpt.row(0);
+            let mx = r.iter().fold(0f32, |m, &v| m.max(v.abs()));
+            let sum: f32 = r.iter().sum();
+            eprintln!("prompt-adaln sigma={:.6} max|row|={mx:.6e} sum={sum:.6e}", video.sigma);
+        }
         let vxs = TsTable::build(&self.av_v_ss, &video.timesteps, self.t_scale, pool);
         let axs = TsTable::build(&self.av_a_ss, &audio.timesteps, self.t_scale, pool);
         // The fusion gate reads the *other* stream's sigma — the noise level

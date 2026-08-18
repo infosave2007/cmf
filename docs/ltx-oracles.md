@@ -141,3 +141,23 @@ After the packing fixes, on a real prompt and a real latent:
 The residue is the 4-bit codec, and it is what a 4-bit repack costs. The
 reference at bf16 is the ceiling; these numbers say how far below it this
 file sits, measured rather than assumed.
+
+## Is the prompt modulation live?
+
+Cross-attention K/V is 32% of a denoising step at 384 video tokens: the context
+is a fixed 1024 tokens, so its two projections are 2.7x the video stream's own
+work, and they are rebuilt in all 48 blocks of every step. Hoisting them out of
+the step loop would be the single largest win available — and it is only legal
+if `modulate_kv`'s modulation does not depend on the timestep.
+
+`CMF_LTX_PROMPTADALN=1` prints the prompt adaLN row per step, which settles it
+without reasoning about the checkpoint:
+
+```
+prompt-adaln sigma=1.000000 max|row|=1.414567e0 sum=3.430337e2
+prompt-adaln sigma=0.993750 max|row|=1.546673e0 sum=3.693303e2
+```
+
+It moves. The modulated context is a different matrix at every sigma, so the
+K/V cannot be cached across steps and the projections stay in the loop. Worth
+re-running on any new checkpoint before assuming the same.
