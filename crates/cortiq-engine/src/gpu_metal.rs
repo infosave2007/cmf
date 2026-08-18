@@ -8419,11 +8419,65 @@ pub static MM_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 /// The threshold leaves one octave below `half`'s 65504 so a tile sum
 /// has room; the scale is a power of two, so the shift costs no mantissa
 /// and 1.0 — the overwhelmingly common answer — is a no-op on both sides.
+/// The absolute maximum of a buffer, ignoring anything not finite.
+///
+/// Eight independent accumulators so the compiler can keep this in NEON
+/// lanes, and a comparison instead of `is_finite()` so it has no branch to
+/// spoil them. It is called once per GEMM over the whole activation buffer —
+/// 2.7 billion floats a denoising step — and the scalar fold it replaces was
+/// seconds of every one of them.
+fn absmax_finite(pre: &[f32]) -> f32 {
+    // Big buffers get the pool. The caller's own pool is parked at this
+    // point — it is the thread that called us — so this borrows the same
+    // cores rather than competing for them.
+    const PAR: usize = 1 << 20;
+    if pre.len() >= PAR {
+        if let Some(p) = scan_pool() {
+            let grain = 1 << 18;
+            let chunks = pre.len().div_ceil(grain);
+            let parts = std::sync::Mutex::new(0f32);
+            p.run_rows(chunks, &|s, e| {
+                let (lo, hi) = (s * grain, (e * grain).min(pre.len()));
+                let m = absmax_serial(&pre[lo..hi]);
+                let mut g = parts.lock().unwrap();
+                *g = g.max(m);
+            });
+            return parts.into_inner().unwrap();
+        }
+    }
+    absmax_serial(pre)
+}
+
+/// The pool used only for the activation scan (see `absmax_finite`).
+fn scan_pool() -> Option<&'static crate::pool::Pool> {
+    static P: OnceLock<Option<std::sync::Arc<crate::pool::Pool>>> = OnceLock::new();
+    P.get_or_init(crate::pool::Pool::from_env).as_deref()
+}
+
+fn absmax_serial(pre: &[f32]) -> f32 {
+    let mut acc = [0f32; 8];
+    let mut it = pre.chunks_exact(8);
+    for c in &mut it {
+        for (a, &v) in acc.iter_mut().zip(c) {
+            let x = v.abs();
+            // `x < INFINITY` is false for both inf and NaN, which is exactly
+            // the set the original guard skipped
+            *a = a.max(if x < f32::INFINITY { x } else { 0.0 });
+        }
+    }
+    let mut m = acc.iter().fold(0f32, |a, &b| a.max(b));
+    for &v in it.remainder() {
+        let x = v.abs();
+        if x < f32::INFINITY {
+            m = m.max(x);
+        }
+    }
+    m
+}
+
 fn activation_boost(pre: &[f32], xs_buf: &Buffer) -> f32 {
     const SAFE: f32 = 32768.0;
-    let amax = pre
-        .iter()
-        .fold(0f32, |m, &v| if v.is_finite() { m.max(v.abs()) } else { m });
+    let amax = absmax_finite(pre);
     if !(amax > SAFE) {
         return 1.0;
     }
@@ -8437,6 +8491,129 @@ fn activation_boost(pre: &[f32], xs_buf: &Buffer) -> f32 {
     }
     tracing::debug!("metal q4tp: activations absmax {amax:.3e}, scaled by 2^-{shift}");
     up
+}
+
+/// One GEMM in a batch: which weight, and where its output goes.
+pub struct MmJob {
+    pub idx: usize,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+/// Several q4tp GEMMs that share one activation buffer, encoded into ONE
+/// command buffer and waited on once.
+///
+/// A command-buffer completion costs ~1.3 ms whatever it contains, and a
+/// denoising step submits over a thousand of them. The three projections of
+/// an attention read the same input and do not depend on each other, so they
+/// have no business being three round trips.
+pub fn q4tp_matmat_many(
+    model: &Arc<CmfModel>,
+    jobs: &[MmJob],
+    xs: &[f32],
+    b: usize,
+    outs: &mut [&mut [f32]],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if jobs.is_empty() || jobs.len() != outs.len() {
+        return false;
+    }
+    let Some((fbuf, safe_len)) = file_buffer(c, model) else {
+        return false;
+    };
+    let mut abs_offsets = Vec::with_capacity(jobs.len());
+    for j in jobs {
+        if j.cols % 32 != 0 {
+            return false;
+        }
+        let entry = &model.tensors[j.idx];
+        let Some(abs) = model.entry_abs_offset(entry) else {
+            return false;
+        };
+        let Some(need) =
+            cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[j.rows, j.cols])
+        else {
+            return false;
+        };
+        if abs + need > safe_len {
+            return false;
+        }
+        abs_offsets.push(abs);
+    }
+    let get_io = |key: usize, nbytes: usize| -> Buffer {
+        let mut cache = c.io_bufs.lock().unwrap();
+        cache
+            .entry(key)
+            .or_insert_with(|| {
+                crate::gpu::probe_note_cold();
+                c._device
+                    .new_buffer(nbytes as u64, MTLResourceOptions::StorageModeShared)
+            })
+            .clone()
+    };
+    let t_up = std::time::Instant::now();
+    let xs_buf = get_io(21_000_000_659 + xs.len(), xs.len() * 4);
+    unsafe {
+        std::ptr::copy_nonoverlapping(xs.as_ptr(), xs_buf.contents() as *mut f32, xs.len());
+    }
+    let wboost = activation_boost(xs, &xs_buf);
+    let up_us = t_up.elapsed().as_micros() as u64;
+
+    // Each output needs its own buffer even when two jobs are the same
+    // shape, so the slot index is part of the key.
+    let ys: Vec<Buffer> = jobs
+        .iter()
+        .enumerate()
+        .map(|(slot, j)| {
+            get_io(
+                23_000_000_000 + slot * 1_000_000_007 + b * j.rows,
+                b * j.rows * 4,
+            )
+        })
+        .collect();
+
+    let cmd = c.queue.new_command_buffer();
+    for (j, (abs, y)) in jobs.iter().zip(abs_offsets.iter().zip(ys.iter())) {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&c.q4tpmm);
+        fbuf.bind(enc, 0, *abs);
+        enc.set_buffer(1, Some(&xs_buf), 0);
+        enc.set_buffer(2, Some(y), 0);
+        let (cols_u, rows_u, nb_u) = (j.cols as u32, j.rows as u32, b as u32);
+        enc.set_bytes(3, 4, &cols_u as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(5, 4, &nb_u as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(6, 4, &wboost as *const f32 as *const std::ffi::c_void);
+        enc.dispatch_thread_groups(
+            MTLSize::new((b as u64).div_ceil(32), (j.rows as u64).div_ceil(64), 1),
+            MTLSize::new(128, 1, 1),
+        );
+        enc.end_encoding();
+    }
+    let t_gpu = std::time::Instant::now();
+    let refs: Vec<&Buffer> = ys.iter().collect();
+    submit_and_wait(c, cmd, &refs);
+    let gpu_us = t_gpu.elapsed().as_micros() as u64;
+    let t_dn = std::time::Instant::now();
+    for (j, (y, out)) in jobs.iter().zip(ys.iter().zip(outs.iter_mut())) {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                y.contents() as *const f32,
+                out.as_mut_ptr(),
+                b * j.rows,
+            );
+        }
+    }
+    if std::env::var("CMF_METAL_MMPROF").is_ok() {
+        MM_UP.fetch_add(up_us, std::sync::atomic::Ordering::Relaxed);
+        MM_GPU.fetch_add(gpu_us, std::sync::atomic::Ordering::Relaxed);
+        MM_DN.fetch_add(
+            t_dn.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        MM_N.fetch_add(jobs.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    true
 }
 
 pub fn q4tp_matmat(
