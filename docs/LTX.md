@@ -160,6 +160,45 @@ Image conditioning goes through the video VAE's **encoder**, audio
 conditioning through the audio VAE's, and both are in the same container as
 everything else.
 
+### LoRA adapters, and multi-subject references
+
+```sh
+cortiq ltx-video --model $M --lora adapter.safetensors --lora-strength 0.8 \
+  --prompt "…" --out clip.y4m
+```
+
+The container's weights are q4tp, so an adapter cannot be folded into them
+without dequantizing the whole DiT. The branch is evaluated beside them
+instead — `y = x·Wᵀ + s·(x·Aᵀ)·Bᵀ`, on every path including the fused
+Metal q/k/v submission. At rank 128 against a 4096×4096 projection that is
+about 6% more arithmetic; the file itself is the only extra memory.
+
+Adapters that carry a `reference_slot_embedding` also take reference stills:
+
+```sh
+cortiq ltx-video --model $M --lora msr.safetensors \
+  --ref a.ppm --ref b.ppm --ref c.ppm --ref-frames 25 \
+  --prompt "Image 1: … Image 2: … Image 3: …" --out clip.y4m
+```
+
+Each still is held for `--ref-frames` pixel frames (25 or 33, whichever the
+adapter was trained on), encoded by the same video VAE the render uses, given
+its slot's learned per-channel bias, and placed at a negative frame offset —
+slot 1 furthest back, the last reference nearest the clip. Those tokens ride
+in the same sequence as the clip, frozen, and are cropped off the result. The
+stills must already be the render's width and height; this build does not
+guess an aspect fit.
+
+References cost sequence length: three of them at 384×256 add 1152 tokens to
+a 384-token clip, so the step is four times the work. Name them in the prompt
+the way the adapter expects (`Image 1`, `Image 2`, …).
+
+Both halves are refused rather than approximated when a file does not match:
+an adapter with a lone `lora_A`, a slot embedding whose width is not the
+latent's channel count, or metadata asking for a token order this build does
+not implement, all stop with a sentence instead of rendering something that
+looks plausible.
+
 ### The prompt is encoded once
 
 The 12 B prompt encoder depends on nothing but the token ids and the

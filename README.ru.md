@@ -234,7 +234,7 @@ cortiq route model.cmf --prompt "..."           # или пусть выбере
 синхронным.
 
 - **`cortiq animate`** — MiniMax-H3 + Turbo LoRA. 512×288, 39 кадров, четыре шага, из одного файла на 23.9 ГБ (при 124.4 ГБ эталонного дерева). Одна RTX 5090: **60.2 с**.
-- **`cortiq ltx-video`** — LTX-2.5, DiT на 21B с совместным аудиопотоком. Восемь шагов или `--two-stage` для детализации. [docs/LTX.md](docs/LTX.md)
+- **`cortiq ltx-video`** — LTX-2.5, DiT на 21B с совместным аудиопотоком. Восемь шагов или `--two-stage` для детализации. `--lora` подключает адаптер на лету, `--ref` обусловливает до пяти эталонных кадров. [docs/LTX.md](docs/LTX.md)
 - **`cortiq imagine`** — Lumina-Image 2.0, дерево diffusers на 19 ГБ в **3.2 ГБ** `.cmf`. M4: 256×256 за 30 шагов примерно за 37 с.
 
 <img src="docs/media/fox-512.png" width="340" alt="рыжая лиса в снежном лесу">

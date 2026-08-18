@@ -149,17 +149,43 @@ fn layer_norm(x: &[f32], dst: &mut [f32]) {
 pub(crate) struct Lin {
     w: Proj,
     b: Option<Vec<f32>>,
+    /// A runtime low-rank branch, when an adapter is loaded. The container's
+    /// q4tp weights cannot absorb one, so it is evaluated beside them.
+    lora: Option<crate::ltxlora::LoraBranch>,
 }
 
 impl Lin {
     pub(crate) fn load(model: &Arc<CmfModel>, name: &str, bias: bool) -> Result<Lin, String> {
+        Lin::load_lora(model, name, bias, None)
+    }
+
+    /// The same, consulting an adapter for a low-rank branch on this
+    /// projection. A bank that carries nothing for `name` leaves the
+    /// projection exactly as `load` would.
+    pub(crate) fn load_lora(
+        model: &Arc<CmfModel>,
+        name: &str,
+        bias: bool,
+        bank: Option<&crate::ltxlora::LoraBank>,
+    ) -> Result<Lin, String> {
         let w = Proj::from_model(model, &format!("{name}.weight"))?;
         let b = if bias {
             Some(cmf_f32(model, &format!("{name}.bias"))?)
         } else {
             None
         };
-        Ok(Lin { w, b })
+        let lora = bank.and_then(|k| k.branch(name));
+        Ok(Lin { w, b, lora })
+    }
+
+    /// The adapter half of `apply`, for the fused paths that got the base
+    /// product elsewhere. Runs before the bias, which is where the reference
+    /// implementations put it — the branch sees the same activations the
+    /// base projection did.
+    pub(crate) fn add_lora(&self, out: &mut [f32], x: &[f32], n: usize, pool: Option<&Pool>) {
+        if let Some(l) = &self.lora {
+            l.add(x, n, out, pool);
+        }
     }
 
     /// The container-mapped q4tp weight behind this projection, when there
@@ -216,6 +242,9 @@ impl Lin {
             t_mm.elapsed().as_micros() as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
+        if let Some(l) = &self.lora {
+            l.add(x, n, &mut out, pool);
+        }
         if let Some(b) = &self.b {
             let dst = Shared(out.as_mut_ptr());
             rows(pool, n, &|s, e| {
@@ -341,11 +370,21 @@ pub(crate) struct Attn {
 
 impl Attn {
     pub(crate) fn load(model: &Arc<CmfModel>, p: &str, heads: usize, dh: usize) -> Result<Attn, String> {
+        Attn::load_lora(model, p, heads, dh, None)
+    }
+
+    pub(crate) fn load_lora(
+        model: &Arc<CmfModel>,
+        p: &str,
+        heads: usize,
+        dh: usize,
+        bank: Option<&crate::ltxlora::LoraBank>,
+    ) -> Result<Attn, String> {
         Ok(Attn {
-            q: Lin::load(model, &format!("{p}.to_q"), true)?,
-            k: Lin::load(model, &format!("{p}.to_k"), true)?,
-            v: Lin::load(model, &format!("{p}.to_v"), true)?,
-            o: Lin::load(model, &format!("{p}.to_out.0"), true)?,
+            q: Lin::load_lora(model, &format!("{p}.to_q"), true, bank)?,
+            k: Lin::load_lora(model, &format!("{p}.to_k"), true, bank)?,
+            v: Lin::load_lora(model, &format!("{p}.to_v"), true, bank)?,
+            o: Lin::load_lora(model, &format!("{p}.to_out.0"), true, bank)?,
             q_norm: cmf_f32(model, &format!("{p}.q_norm.weight"))?,
             k_norm: cmf_f32(model, &format!("{p}.k_norm.weight"))?,
             gate: match model.tensor(&format!("{p}.to_gate_logits.weight")) {
@@ -398,6 +437,9 @@ impl Attn {
         if !done {
             return None;
         }
+        self.q.add_lora(&mut oq, x, n, pool);
+        self.k.add_lora(&mut ok, x, n, pool);
+        self.v.add_lora(&mut ov, x, n, pool);
         self.q.add_bias(&mut oq, n, pool);
         self.k.add_bias(&mut ok, n, pool);
         self.v.add_bias(&mut ov, n, pool);
@@ -431,6 +473,8 @@ impl Attn {
         if !done {
             return None;
         }
+        self.k.add_lora(&mut ok, ctx, m, None);
+        self.v.add_lora(&mut ov, ctx, m, None);
         self.k.add_bias(&mut ok, m, None);
         self.v.add_bias(&mut ov, m, None);
         Some((ok, ov))
@@ -909,13 +953,14 @@ impl Stream {
         heads: usize,
         dh: usize,
         ff_bias: bool,
+        bank: Option<&crate::ltxlora::LoraBank>,
     ) -> Result<Stream, String> {
         let a = |n: &str| format!("{p}.{prefix}{n}");
         Ok(Stream {
-            attn1: Attn::load(model, &a("attn1"), heads, dh)?,
-            attn2: Attn::load(model, &a("attn2"), heads, dh)?,
-            ff_in: Lin::load(model, &a("ff.net.0.proj"), ff_bias)?,
-            ff_out: Lin::load(model, &a("ff.net.2"), ff_bias)?,
+            attn1: Attn::load_lora(model, &a("attn1"), heads, dh, bank)?,
+            attn2: Attn::load_lora(model, &a("attn2"), heads, dh, bank)?,
+            ff_in: Lin::load_lora(model, &a("ff.net.0.proj"), ff_bias, bank)?,
+            ff_out: Lin::load_lora(model, &a("ff.net.2"), ff_bias, bank)?,
             sst: cmf_f32(model, &a("scale_shift_table"))?,
             prompt_sst: cmf_f32(model, &a("prompt_scale_shift_table"))?,
         })
@@ -993,6 +1038,16 @@ pub struct LtxDit {
 
 impl LtxDit {
     pub fn from_cmf(model: &Arc<CmfModel>) -> Result<LtxDit, String> {
+        LtxDit::from_cmf_lora(model, None)
+    }
+
+    /// The same, with a runtime adapter bound to whichever projections it
+    /// names. Reported once at load so a file that matched nothing says so
+    /// instead of rendering as if it had.
+    pub fn from_cmf_lora(
+        model: &Arc<CmfModel>,
+        bank: Option<&crate::ltxlora::LoraBank>,
+    ) -> Result<LtxDit, String> {
         let cfg_bytes = ["ltx.config_json", "dit.config_json"]
             .iter()
             .find_map(|n| model.tensor(n).map(|e| model.entry_bytes(e)))
@@ -1024,8 +1079,8 @@ impl LtxDit {
         for i in 0..n_layers {
             let p = format!("dit.transformer_blocks.{i}");
             blocks.push(Block {
-                video: Stream::load(model, &p, "", heads, dh, ff_bias)?,
-                audio: Stream::load(model, &p, "audio_", a_heads, a_dh, a_ff_bias)?,
+                video: Stream::load(model, &p, "", heads, dh, ff_bias, bank)?,
+                audio: Stream::load(model, &p, "audio_", a_heads, a_dh, a_ff_bias, bank)?,
                 a2v: Attn::load(model, &format!("{p}.audio_to_video_attn"), a_heads, a_dh)?,
                 v2a: Attn::load(model, &format!("{p}.video_to_audio_attn"), a_heads, a_dh)?,
                 sst_a2v_video: cmf_f32(model, &format!("{p}.scale_shift_table_a2v_ca_video"))?,

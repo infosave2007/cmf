@@ -214,7 +214,7 @@ matvec 的算术全部剥掉，同一个 token 的耗时相差不到 4%。所以
 所以出来就是同步的。
 
 - **`cortiq animate`** —— MiniMax-H3 + Turbo LoRA。512×288，39 帧，四步，出自一个 23.9 GB 的文件（参考实现的目录树有 124.4 GB）。一张 RTX 5090：**60.2 秒**。
-- **`cortiq ltx-video`** —— LTX-2.5，21B 的 DiT，带一路联合音频流。八步，或者用 `--two-stage` 换细节。[docs/LTX.md](docs/LTX.md)
+- **`cortiq ltx-video`** —— LTX-2.5，21B 的 DiT，带一路联合音频流。八步，或者用 `--two-stage` 换细节。`--lora` 在运行时挂载适配器，`--ref` 最多可用五张参考图做条件。[docs/LTX.md](docs/LTX.md)
 - **`cortiq imagine`** —— Lumina-Image 2.0，19 GB 的 diffusers 目录树装进 **3.2 GB** 的 `.cmf`。M4：256×256、30 步约 37 秒。
 
 <img src="docs/media/fox-512.png" width="340" alt="雪林中的红狐">

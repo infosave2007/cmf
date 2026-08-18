@@ -170,7 +170,38 @@ then three deterministic steps that refine what the upscale invented.
 distilled — 8 is it exactly, other counts land on sigmas the model never saw
 and usually soften the frame. Detail comes from resolution and `--two-stage`.
 
-### Measured
+#
+### LoRA adapters, and multi-subject references
+
+```sh
+cortiq ltx-video --model $M --lora adapter.safetensors --lora-strength 0.8 \
+  --prompt "…" --out clip.y4m
+```
+
+q4tp weights cannot absorb a low-rank update without dequantizing the whole
+DiT, so the branch runs beside them — `y = x·Wᵀ + s·(x·Aᵀ)·Bᵀ`, on every path
+including the fused Metal q/k/v submission. Rank 128 against a 4096×4096
+projection is about 6% more arithmetic and no memory beyond the file.
+
+An adapter that also carries a `reference_slot_embedding` takes reference
+stills, which is how the multi-subject adapters work:
+
+```sh
+cortiq ltx-video --model $M --lora msr.safetensors \
+  --ref a.ppm --ref b.ppm --ref c.ppm \
+  --prompt "Image 1: … Image 2: … Image 3: …" --out clip.y4m
+```
+
+Each still is held for 25 or 33 pixel frames (`--ref-frames`, whichever the
+adapter was trained on), encoded by the same video VAE the render uses, given
+its slot's learned per-channel bias on the latent, and placed at a negative
+frame offset — slot 1 furthest back. Those tokens ride in the same sequence,
+frozen, and are cropped off the result.
+
+They cost sequence length: three references at 384×256 add 1152 tokens beside
+384 of clip. The stills must already be the render's size.
+
+## Measured
 
 49 frames at 24 fps, container on local storage:
 

@@ -22,6 +22,7 @@ pub mod ltxaudio;
 pub mod ltxdit;
 pub mod ltxenc;
 pub mod ltxdur;
+pub mod ltxlora;
 pub mod ltxpipe;
 pub mod ltxte;
 pub mod ltxups;
