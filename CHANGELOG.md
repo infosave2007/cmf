@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.87] - 2026-08-18
+
+Metal, a quarter faster again — by profiling instead of guessing.
+
+`CMF_LTX_PROF=1` now reports the q4tp GEMM's own split (upload, kernel,
+download) and attention's internals. Three things fell out of it:
+
+* **The feed-forward's gelu ran in f64 on one thread** — half a billion
+  values a step, 672 tokens × 16384 wide × 48 blocks, while nine cores
+  waited. In f32 across the pool: that phase 11.6 s → 6.1 s.
+* **Every activation buffer was scanned scalar-with-a-branch** to find
+  whether anything exceeds half's range: 2.7 billion floats a step, one
+  thread. Eight accumulators and a comparison instead of `is_finite()` lets
+  it vectorize, and past a megabyte it goes to the pool — which is idle at
+  that moment, because it is the thread that called in. The value is
+  identical, exactly.
+* **Independent projections now share a command buffer.** A completion costs
+  ~1.3 ms whatever it holds and a step submitted 1344 of them; self-attention's
+  q, k and v read the same buffer, and every attention's k and v do.
+
+M4 with 24 GB, 384×256, 49 frames, back to back on the same machine:
+**22-23 s → 16.2 s a denoising step**, and the optimized run holds 16.1-16.3 s
+where the old one drifted upward under load.
+
+Quality is the same picture: the same prompt and seed before and after match
+at 42.6 dB with the same composition, lighting and detail — the last-bit
+difference between an f32 and an f64 gelu, amplified by eight sampling steps.
+
+The scalar paths are unchanged, so this is a Metal and CPU-arithmetic
+improvement that costs nothing anywhere else.
+
+
 ## [0.5.86] - 2026-08-18
 
 The conditioned modes, actually run.
