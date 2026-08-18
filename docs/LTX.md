@@ -78,6 +78,16 @@ ancestral Euler steps at half the requested resolution, the learned ×2
 latent upscaler, then three deterministic steps that refine what the upscale
 invented. It costs roughly four times a single-stage render.
 
+`--steps N` (and `--steps2 N` for the refinement pass) resamples that
+schedule. The shipped ladder is nine sigmas —
+`1.0 0.99375 0.9875 0.98125 0.975 0.909375 0.725 0.421875 0.0` — four
+near-zero moves at the top and three large jumps, and the model was distilled
+to take exactly those. `--steps 8` is therefore the default bit for bit, and
+any other count puts the model on sigmas it never saw; expect a softer frame,
+not a sharper one. Detail comes from resolution (the VAE's spatial stride is
+32, so 512x288 is a 16x9 grid to put a subject in), from `--two-stage`, and
+from naming what should be in the picture.
+
 ### Measured
 
 RTX 5090, container in `/dev/shm`, 49 frames at 24 fps:
