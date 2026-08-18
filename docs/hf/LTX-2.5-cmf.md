@@ -175,22 +175,33 @@ frame count `8k + 1` (its temporal stride plus the standalone first frame).
 
 | stage | RTX 5090, 384×256 | RTX 5090, 768×512 `--two-stage` | **M4 MacBook, 24 GB**, 384×256 |
 |---|---|---|---|
-| prompt encode (Gemma-4 12 B + connectors) | 26 s | 26 s | 33 s |
-| denoise | 8 × 19 s | 8 × 19 s + 3 × 70 s | 8 × 20 s |
+| prompt encode (Gemma-4 12 B + connectors) | 26 s | 26 s | 32 s |
+| denoise | 8 × 19 s | 8 × 19 s + 3 × 70 s | 8 × 16 s |
 | latent upscale | — | 12 s | — |
-| audio VAE + vocoder | 8 s | 8 s | 9 s |
-| video VAE | 50 s | 200 s | 26 s |
-| **total** | **3 min** | **10 min** | **4 min** |
+| audio VAE + vocoder | 8 s | 8 s | 16 s |
+| video VAE | 50 s | 200 s | 27 s |
+| **total** | **3 min** | **10 min** | **3.5 min** |
 
-The Mac number is the interesting one. A 22 GB container does not fit in a
-single Metal buffer, so it is mapped as two overlapping windows — and the
-driver accounts its working set by buffer length, not by unique pages. With
-both windows on its books it evicts and re-wires between commits, and a
-190 ms matmul takes 2.7 s. So the windows are built on first use, the prompt
-encoder parks the device for its phase (its weights live in the window the
-denoising loop never touches), and the denoising loop takes the per-op probe
-out of the picture — forty-eight identical blocks with the device warm
-throughout is the opposite of what a probe that alternates arms can measure.
+The Mac number is the interesting one, and it took two rounds to get there.
+
+First, keeping the device at all. A 22 GB container does not fit in a single
+Metal buffer, so it is mapped as two overlapping windows — and the driver
+accounts its working set by buffer length, not by unique pages. With both
+windows on its books it evicts and re-wires between commits, and a 190 ms
+matmul takes 2.7 s. So the windows are built on first use, the prompt encoder
+parks the device for its phase (its weights live in the window the denoising
+loop never touches), and the denoising loop takes the per-op probe out of the
+picture — forty-eight identical blocks with the device warm throughout is the
+opposite of what a probe that alternates arms can measure.
+
+Then, three things found by profiling rather than guessing, worth another
+quarter of every step: the feed-forward's gelu ran in f64 on one thread (half
+a billion values a step), the Metal path scanned every activation buffer
+scalar-with-a-branch to check it fits in half (2.7 billion floats a step, one
+thread), and independent projections each paid their own ~1.3 ms
+command-buffer completion. Same arithmetic — a render at the same seed before
+and after matches at 42.6 dB, which is the last-bit difference between f32 and
+f64 amplified by eight sampling steps, not a change in what the model draws.
 
 A 21 B video model, its 12 B prompt encoder and both VAEs, rendering a clip
 with sound on a laptop with 24 GB of unified memory — because nothing is ever

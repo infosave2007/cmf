@@ -82,12 +82,13 @@ invented. It costs roughly four times a single-stage render.
 
 RTX 5090, container in `/dev/shm`, 49 frames at 24 fps:
 
-| stage | 384×256 | 768×512 (`--two-stage`) |
+| stage | RTX 5090, 384×256 | M4 MacBook, 24 GB, 384×256 |
 |---|---|---|
-| prompt encode (Gemma-4 12 B + connectors) | 28 s | 28 s |
-| denoise | 8 × 30 s | 8 × 30 s + 3 × 120 s |
-| latent upscale | — | 25 s |
-| video VAE | 50 s | 200 s |
+| prompt encode (Gemma-4 12 B + connectors) | 26 s | 32 s |
+| denoise | 8 × 19 s | 8 × 16 s |
+| audio VAE + vocoder | 8 s | 16 s |
+| video VAE | 50 s | 27 s |
+| **total** | **3 min** | **4 min** |
 
 ## Every mode the model has
 
