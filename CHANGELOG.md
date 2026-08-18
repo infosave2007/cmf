@@ -20,7 +20,17 @@ community adapters ship with them.
   including the fused Metal q/k/v submission. Both halves go through the same
   blocked `gemm_nt` the rest of the engine uses, which is not a detail: the
   first version wrote them as scalar loops and cost 182.7 s a step against
-  68.1 through Accelerate's AMX, on the same render.
+  68.1 through Accelerate's AMX, on the same render. They are also pinned to
+  the host: the generic `GemmNt` probe sends them to the device, where they
+  queue behind the q4tp projection they are standing beside — 39.7 s a step
+  through the probe against 22.2 pinned, at 384 tokens on an M4.
+
+  What an adapter costs is placement, not arithmetic. The branch's own GEMMs
+  are 1.1 s of a step measured directly (250–1300 GFLOP/s on those shapes),
+  about 4% of the base model's flops; the step still goes 8.6 s → ~22 s,
+  because host-side f32 work standing beside a device-side 4-bit GEMM does not
+  overlap it. A fused device-side branch is the way to close that, and is not
+  in this release.
 - **`--ref <still.ppm>` (1 to 5) and `--ref-frames`.** Adapters carrying a
   `reference_slot_embedding` condition on reference images. Each still is held
   for 25 or 33 pixel frames, encoded by the same video VAE the render uses,
@@ -29,7 +39,10 @@ community adapters ship with them.
   clip. The tokens ride in the same sequence, frozen, and are cropped off the
   result. Verified against LiconStudio's MSR V1: 480 branches at rank 128 bind
   to the container's projections, and three references at 384×256 add 1152
-  tokens beside 384 of clip at frames −3, −2, −1.
+  tokens beside 384 of clip at frames −3, −2, −1. The render carries the
+  references' subjects: the man's jacket and haircut, the woman's coat, and
+  the club interior all arrive from their own slots. Eight steps at that size
+  with three references: 509.5 s denoise, 576.2 s end to end.
 - `Conditioning::with_references` and `Geometry::guide_positions` — the
   sequence-extension and the negative-time RoPE coordinates, separately
   testable from the CLI.
