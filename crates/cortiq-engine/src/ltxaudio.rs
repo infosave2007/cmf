@@ -894,3 +894,308 @@ pub fn write_wav(path: &std::path::Path, sig: &Sig, rate: usize) -> std::io::Res
     }
     Ok(())
 }
+
+// ------------------------------------------------------------ the encoder
+
+/// A slaney mel filterbank — the one `torchaudio.transforms.MelSpectrogram`
+/// builds with `mel_scale="slaney", norm="slaney"`. Not in the checkpoint,
+/// so it is rebuilt from the same formula the reference's preprocessing used.
+fn mel_filterbank(sr: f64, n_fft: usize, n_mels: usize, fmin: f64, fmax: f64) -> Vec<f32> {
+    let n_freqs = n_fft / 2 + 1;
+    let hz_to_mel = |f: f64| 3.0 * f / 200.0;
+    let mel_to_hz = |m: f64| m * 200.0 / 3.0;
+    // slaney is linear below 1 kHz and logarithmic above it
+    let (f_min_log, min_log_mel) = (1000.0f64, 15.0f64);
+    let logstep = (6.4f64).ln() / 27.0;
+    let hz_to_mel_s = |f: f64| {
+        if f >= f_min_log {
+            min_log_mel + (f / f_min_log).ln() / logstep
+        } else {
+            hz_to_mel(f)
+        }
+    };
+    let mel_to_hz_s = |m: f64| {
+        if m >= min_log_mel {
+            f_min_log * ((m - min_log_mel) * logstep).exp()
+        } else {
+            mel_to_hz(m)
+        }
+    };
+    let (m0, m1) = (hz_to_mel_s(fmin), hz_to_mel_s(fmax));
+    let pts: Vec<f64> = (0..n_mels + 2)
+        .map(|i| mel_to_hz_s(m0 + (m1 - m0) * i as f64 / (n_mels + 1) as f64))
+        .collect();
+    let freqs: Vec<f64> = (0..n_freqs).map(|i| sr * i as f64 / n_fft as f64).collect();
+    let mut fb = vec![0f32; n_mels * n_freqs];
+    for m in 0..n_mels {
+        let (lo, ctr, hi) = (pts[m], pts[m + 1], pts[m + 2]);
+        // slaney normalization: unit area per filter
+        let enorm = 2.0 / (hi - lo);
+        for (k, &f) in freqs.iter().enumerate() {
+            let v = if f >= lo && f <= ctr {
+                (f - lo) / (ctr - lo).max(1e-12)
+            } else if f > ctr && f <= hi {
+                (hi - f) / (hi - ctr).max(1e-12)
+            } else {
+                0.0
+            };
+            fb[m * n_freqs + k] = (v * enorm) as f32;
+        }
+    }
+    fb
+}
+
+/// Waveform → log-mel in the layout the audio VAE encodes: `[C, frames, mel]`.
+/// Centered STFT with a Hann window and reflect padding, magnitude (not
+/// power), then the mel projection and a log with the reference's floor.
+pub fn waveform_to_mel(x: &Sig, sr: usize, n_fft: usize, hop: usize, n_mels: usize) -> Grid {
+    let n_freqs = n_fft / 2 + 1;
+    let fb = mel_filterbank(sr as f64, n_fft, n_mels, 0.0, sr as f64 / 2.0);
+    let win: Vec<f32> = (0..n_fft)
+        .map(|i| {
+            let a = std::f64::consts::PI * 2.0 * i as f64 / n_fft as f64;
+            (0.5 - 0.5 * a.cos()) as f32
+        })
+        .collect();
+    let pad = n_fft / 2;
+    let frames = x.t / hop + 1;
+    let mut out = Grid::zeros(x.c, frames, n_mels);
+    let mut re = vec![0f32; n_freqs];
+    let mut im = vec![0f32; n_freqs];
+    for c in 0..x.c {
+        for f in 0..frames {
+            let start = f as isize * hop as isize - pad as isize;
+            re.iter_mut().for_each(|v| *v = 0.0);
+            im.iter_mut().for_each(|v| *v = 0.0);
+            for j in 0..n_fft {
+                // reflect padding at both ends
+                let mut s = start + j as isize;
+                if s < 0 {
+                    s = -s;
+                }
+                if s >= x.t as isize {
+                    s = 2 * (x.t as isize - 1) - s;
+                }
+                let v = if s >= 0 && s < x.t as isize { x.data[c * x.t + s as usize] } else { 0.0 };
+                let v = v * win[j];
+                if v == 0.0 {
+                    continue;
+                }
+                for (k, (rr, ii)) in re.iter_mut().zip(im.iter_mut()).enumerate() {
+                    let a = -2.0 * std::f64::consts::PI * (k * j) as f64 / n_fft as f64;
+                    *rr += v * a.cos() as f32;
+                    *ii += v * a.sin() as f32;
+                }
+            }
+            for m in 0..n_mels {
+                let mut acc = 0f32;
+                for k in 0..n_freqs {
+                    acc += fb[m * n_freqs + k] * (re[k] * re[k] + im[k] * im[k]).sqrt();
+                }
+                out.data[(c * frames + f) * n_mels + m] = acc.max(1e-5).ln();
+            }
+        }
+    }
+    out
+}
+
+struct Downsample2 {
+    conv: Conv2d,
+}
+
+impl Downsample2 {
+    /// Stride-2 convolution with the encoder's asymmetric padding: two rows
+    /// of history on the causal (time) axis, one column on the right.
+    fn forward(&self, x: &Grid, pool: Option<&Pool>) -> Grid {
+        let (h, w) = (x.h + 2, x.w + 1);
+        let mut p = Grid::zeros(x.c, h, w);
+        for c in 0..x.c {
+            for y in 0..x.h {
+                for z in 0..x.w {
+                    p.data[(c * h + y + 2) * w + z] = x.data[(c * x.h + y) * x.w + z];
+                }
+            }
+        }
+        self.conv.forward_strided(&p, 2, pool)
+    }
+}
+
+impl Conv2d {
+    /// The same convolution with an explicit stride and *no* padding of its
+    /// own — the caller has already padded.
+    fn forward_strided(&self, x: &Grid, stride: usize, pool: Option<&Pool>) -> Grid {
+        let (oh, ow) = ((x.h - self.kh) / stride + 1, (x.w - self.kw) / stride + 1);
+        let npos = oh * ow;
+        let k = self.c_in * self.kh * self.kw;
+        let mut patches = vec![0f32; npos * k];
+        for i in 0..npos {
+            let (pw, ph) = (i % ow, i / ow);
+            for ci in 0..self.c_in {
+                for a in 0..self.kh {
+                    for b in 0..self.kw {
+                        patches[i * k + (ci * self.kh + a) * self.kw + b] =
+                            x.data[(ci * x.h + ph * stride + a) * x.w + pw * stride + b];
+                    }
+                }
+            }
+        }
+        let mut ys = vec![0f32; npos * self.c_out];
+        crate::fcd_ops::gemm_nt(&patches, &self.w, &mut ys, npos, k, self.c_out, pool);
+        let mut out = Grid::zeros(self.c_out, oh, ow);
+        for i in 0..npos {
+            for co in 0..self.c_out {
+                out.data[co * npos + i] = ys[i * self.c_out + co] + self.b[co];
+            }
+        }
+        out
+    }
+}
+
+/// The audio VAE's encoder half: log-mel in, latent out.
+pub struct AudioVaeEncoder {
+    conv_in: Conv2d,
+    levels: Vec<(Vec<ResnetBlock>, Option<Downsample2>)>,
+    mid: Vec<ResnetBlock>,
+    conv_out: Conv2d,
+    mean: Vec<f32>,
+    std: Vec<f32>,
+    z: usize,
+}
+
+impl AudioVaeEncoder {
+    pub fn from_cmf(model: &Arc<CmfModel>) -> Result<AudioVaeEncoder, String> {
+        let mut levels = Vec::new();
+        let mut lv = 0usize;
+        while model
+            .tensor(&format!("avae.encoder.down.{lv}.block.0.conv1.conv.weight"))
+            .is_some()
+        {
+            let mut blocks = Vec::new();
+            let mut bi = 0usize;
+            while model
+                .tensor(&format!("avae.encoder.down.{lv}.block.{bi}.conv1.conv.weight"))
+                .is_some()
+            {
+                blocks.push(ResnetBlock::load(model, &format!("avae.encoder.down.{lv}.block.{bi}"))?);
+                bi += 1;
+            }
+            let down = match model.tensor(&format!("avae.encoder.down.{lv}.downsample.conv.weight")) {
+                // the downsample holds a plain Conv2d, not the causal wrapper
+                // the residual blocks use, so it is one `.conv` shallower
+                Some(_) => Some(Downsample2 {
+                    conv: Conv2d::load(model, &format!("avae.encoder.down.{lv}.downsample.conv"))?,
+                }),
+                None => None,
+            };
+            levels.push((blocks, down));
+            lv += 1;
+        }
+        let out = Conv2d::load(model, "avae.encoder.conv_out.conv")?;
+        let z = out.c_out / 2;
+        Ok(AudioVaeEncoder {
+            conv_in: Conv2d::load(model, "avae.encoder.conv_in.conv")?,
+            levels,
+            mid: vec![
+                ResnetBlock::load(model, "avae.encoder.mid.block_1")?,
+                ResnetBlock::load(model, "avae.encoder.mid.block_2")?,
+            ],
+            conv_out: out,
+            mean: tensor_f32(model, "avae.per_channel_statistics.mean-of-means")?.0,
+            std: tensor_f32(model, "avae.per_channel_statistics.std-of-means")?.0,
+            z,
+        })
+    }
+
+    /// `[2, frames, 64]` log-mel → `[8, frames/4, 16]` latent.
+    pub fn encode(&self, mel: &Grid, pool: Option<&Pool>) -> Grid {
+        let mut h = self.conv_in.forward(mel, pool);
+        for (blocks, down) in &self.levels {
+            for b in blocks {
+                h = b.forward(&h, pool);
+            }
+            if let Some(d) = down {
+                h = d.forward(&h, pool);
+            }
+        }
+        for b in &self.mid {
+            h = b.forward(&h, pool);
+        }
+        pixel_norm(&mut h);
+        h.data.iter_mut().for_each(|v| *v = silu(*v));
+        let out = self.conv_out.forward(&h, pool);
+        // means only, then the per-channel statistics of the *patchified*
+        // layout (channel-major over mel bins)
+        let npos = out.n();
+        let mut lat = Grid::zeros(self.z, out.h, out.w);
+        for c in 0..self.z {
+            for hi in 0..out.h {
+                for wi in 0..out.w {
+                    let idx = c * out.w + wi;
+                    let v = out.data[(c * out.h + hi) * out.w + wi];
+                    lat.data[(c * out.h + hi) * out.w + wi] = (v - self.mean[idx]) / self.std[idx];
+                }
+            }
+        }
+        lat
+    }
+}
+
+/// A 16-bit PCM WAV back into a signal in `[-1, 1]`.
+pub fn read_wav(path: &std::path::Path) -> Result<(Sig, usize), String> {
+    let raw = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if raw.len() < 44 || &raw[..4] != b"RIFF" || &raw[8..12] != b"WAVE" {
+        return Err(format!("{}: not a RIFF/WAVE file", path.display()));
+    }
+    let mut i = 12usize;
+    let (mut ch, mut rate, mut bits) = (2usize, 48000usize, 16usize);
+    let mut data: Option<(usize, usize)> = None;
+    while i + 8 <= raw.len() {
+        let id = &raw[i..i + 4];
+        let len = u32::from_le_bytes(raw[i + 4..i + 8].try_into().unwrap()) as usize;
+        let body = i + 8;
+        if id == b"fmt " && body + 16 <= raw.len() {
+            ch = u16::from_le_bytes(raw[body + 2..body + 4].try_into().unwrap()) as usize;
+            rate = u32::from_le_bytes(raw[body + 4..body + 8].try_into().unwrap()) as usize;
+            bits = u16::from_le_bytes(raw[body + 14..body + 16].try_into().unwrap()) as usize;
+        } else if id == b"data" {
+            data = Some((body, len.min(raw.len() - body)));
+            break;
+        }
+        i = body + len + (len & 1);
+    }
+    let (off, len) = data.ok_or_else(|| format!("{}: no data chunk", path.display()))?;
+    if bits != 16 {
+        return Err(format!("{}: only 16-bit PCM is read", path.display()));
+    }
+    let n = len / 2 / ch.max(1);
+    let mut sig = Sig::zeros(ch, n);
+    for i in 0..n {
+        for c in 0..ch {
+            let o = off + (i * ch + c) * 2;
+            let v = i16::from_le_bytes([raw[o], raw[o + 1]]) as f32 / 32768.0;
+            sig.data[c * n + i] = v;
+        }
+    }
+    Ok((sig, rate))
+}
+
+/// Resample by linear interpolation — good enough for conditioning input,
+/// which the mel transform is about to smear across 64 bands anyway.
+pub fn resample(x: &Sig, from: usize, to: usize) -> Sig {
+    if from == to {
+        return x.clone();
+    }
+    let n = (x.t as f64 * to as f64 / from as f64).round() as usize;
+    let mut out = Sig::zeros(x.c, n);
+    for c in 0..x.c {
+        for i in 0..n {
+            let p = i as f64 * from as f64 / to as f64;
+            let j = p.floor() as usize;
+            let f = (p - j as f64) as f32;
+            let a = x.data[c * x.t + j.min(x.t - 1)];
+            let b = x.data[c * x.t + (j + 1).min(x.t - 1)];
+            out.data[c * n + i] = a + (b - a) * f;
+        }
+    }
+    out
+}

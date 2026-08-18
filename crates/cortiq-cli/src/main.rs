@@ -1158,6 +1158,9 @@ enum Commands {
         /// Hold the given picture fixed and write only its soundtrack
         #[arg(long)]
         video_to_audio: bool,
+        /// Start from a soundtrack (16-bit WAV): audio-to-video
+        #[arg(long)]
+        audio_in: Option<String>,
     },
     /// Decode a saved audio latent through the audio VAE and vocoder.
     LtxAudio {
@@ -2068,6 +2071,7 @@ async fn main() -> anyhow::Result<()> {
             image,
             video,
             video_to_audio,
+            audio_in,
         } => ltxcmd::cmd_ltx_video(ltxcmd::VideoArgs {
             model: &model,
             two_stage,
@@ -2084,6 +2088,7 @@ async fn main() -> anyhow::Result<()> {
             image: image.as_deref(),
             video: video.as_deref(),
             video_to_audio,
+            audio_in: audio_in.as_deref(),
         }),
         Commands::LtxAudio { model, latent, out, stats, oracle } => {
             ltxcmd::cmd_ltx_audio(ltxcmd::AudioArgs {
