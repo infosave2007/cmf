@@ -1174,6 +1174,18 @@ enum Commands {
         /// Refinement steps in the second stage (default 3)
         #[arg(long)]
         steps2: Option<usize>,
+        /// A LoRA adapter (.safetensors) applied at runtime
+        #[arg(long)]
+        lora: Option<String>,
+        /// How hard to apply the adapter
+        #[arg(long, default_value_t = 1.0)]
+        lora_strength: f32,
+        /// Reference still (binary PPM) for a multi-subject adapter; repeat up to 5
+        #[arg(long = "ref")]
+        refs: Vec<String>,
+        /// Pixel frames each reference is held for: 25 or 33
+        #[arg(long, default_value_t = 25)]
+        ref_frames: usize,
     },
     /// Decode a saved audio latent through the audio VAE and vocoder.
     LtxAudio {
@@ -2089,6 +2101,10 @@ async fn main() -> anyhow::Result<()> {
             no_context_cache,
             steps,
             steps2,
+            lora,
+            lora_strength,
+            refs,
+            ref_frames,
         } => ltxcmd::cmd_ltx_video(ltxcmd::VideoArgs {
             model: &model,
             two_stage,
@@ -2110,6 +2126,10 @@ async fn main() -> anyhow::Result<()> {
             no_context_cache,
             steps,
             steps2,
+            lora: lora.as_deref(),
+            lora_strength,
+            refs,
+            ref_frames,
         }),
         Commands::LtxAudio { model, latent, out, stats, oracle } => {
             ltxcmd::cmd_ltx_audio(ltxcmd::AudioArgs {

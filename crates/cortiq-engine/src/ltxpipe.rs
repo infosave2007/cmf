@@ -132,6 +132,31 @@ impl Geometry {
 
     /// Non-zero on the first latent frame, whose latent encodes a single
     /// standalone pixel frame.
+    /// Patch midpoints for a *guide* block of `gf` latent frames placed at
+    /// `frame_offset` pixel frames — negative for a reference slot, which is
+    /// what puts it before the clip on the time axis. The causal correction
+    /// of the first frame is the same one `video_positions` applies; the
+    /// offset is added after it, in pixel frames, exactly as the reference
+    /// implementation shifts a keyframe's coordinates.
+    pub fn guide_positions(&self, gf: usize, frame_offset: i64) -> Vec<Vec<f64>> {
+        let causal = |v: f64| (v + 1.0 - SCALE_TIME as f64).max(0.0);
+        let off = frame_offset as f64;
+        let mut out = Vec::with_capacity(gf * self.tokens_per_frame());
+        for f in 0..gf {
+            let t0 = (causal((f * SCALE_TIME) as f64) + off) / self.fps;
+            let t1 = (causal(((f + 1) * SCALE_TIME) as f64) + off) / self.fps;
+            let t = (t0 + t1) / 2.0;
+            for h in 0..self.lh {
+                let y = ((h * SCALE_SPACE) as f64 + ((h + 1) * SCALE_SPACE) as f64) / 2.0;
+                for w in 0..self.lw {
+                    let x = ((w * SCALE_SPACE) as f64 + ((w + 1) * SCALE_SPACE) as f64) / 2.0;
+                    out.push(vec![t, y, x]);
+                }
+            }
+        }
+        out
+    }
+
     pub fn keyframes_mask(&self) -> Vec<f32> {
         let mut m = vec![0f32; self.video_tokens()];
         for v in m.iter_mut().take(self.tokens_per_frame()) {
@@ -268,6 +293,19 @@ pub struct Conditioning {
     pub video_clean: Vec<f32>,
     pub audio_mask: Vec<f32>,
     pub audio_clean: Vec<f32>,
+    /// Extra clean video tokens carried alongside the clip — reference
+    /// images, at their own positions on the time axis. They are denoised
+    /// with the sequence and dropped from the result.
+    pub refs: Option<RefTokens>,
+}
+
+/// Reference tokens: already patchified `[count, 128]`, with one position
+/// triple each.
+#[derive(Clone, Default)]
+pub struct RefTokens {
+    pub latent: Vec<f32>,
+    pub positions: Vec<Vec<f64>>,
+    pub count: usize,
 }
 
 impl Conditioning {
@@ -292,6 +330,14 @@ impl Conditioning {
             video_clean: clean.to_vec(),
             ..Default::default()
         }
+    }
+
+    /// Carry reference images beside the clip. They are frozen (a guide is
+    /// given, not generated) and cropped off the result, so the render comes
+    /// back the size the caller asked for.
+    pub fn with_references(mut self, refs: RefTokens) -> Conditioning {
+        self.refs = Some(refs);
+        self
     }
 
     /// Freeze the whole soundtrack — the sound is given, the picture is what
@@ -390,9 +436,47 @@ pub fn run_stage_cond(
     blend(&mut v, &vclean, &vmask, vch);
     blend(&mut a, &aclean, &amask, ach);
 
-    let vpos = geo.video_positions();
+    let mut vpos = geo.video_positions();
     let apos = geo.audio_positions();
-    let kf = geo.keyframes_mask();
+    let mut kf = geo.keyframes_mask();
+
+    // Reference tokens ride in the same sequence: clean, frozen, at their own
+    // coordinates. The transformer's attention is permutation-invariant apart
+    // from RoPE, so appending them is the same operation the reference
+    // implementation calls prepending — the position is what carries the
+    // meaning, not the index. `vt` grows here and the result is cropped back
+    // to `clip_tokens` at the end.
+    let clip_tokens = vt;
+    let mut vt = vt;
+    let mut vmask = vmask;
+    let mut vclean = vclean;
+    let mut v = v;
+    if let Some(r) = cond.and_then(|c| c.refs.as_ref()) {
+        if r.count > 0 && r.latent.len() == r.count * vch && r.positions.len() == r.count {
+            v.extend_from_slice(&r.latent);
+            vclean.extend_from_slice(&r.latent);
+            vmask.extend(std::iter::repeat_n(0f32, r.count));
+            kf.extend(std::iter::repeat_n(0f32, r.count));
+            vpos.extend(r.positions.iter().cloned());
+            vt += r.count;
+            tracing::info!(
+                "reference conditioning: {} tokens beside {clip_tokens} of clip",
+                r.count
+            );
+        } else if r.count > 0 {
+            tracing::warn!(
+                "reference conditioning ignored: {} tokens, {} latents, {} positions",
+                r.count,
+                r.latent.len(),
+                r.positions.len()
+            );
+        }
+    }
+    // The frozen-stream rule is decided on the clip, not on the guides: a
+    // render that carries references is still generating its picture, and
+    // reading the whole extended mask would call it clean and close the
+    // fusion gate on it.
+    let v_frozen_src: Vec<f32> = vmask[..clip_tokens].to_vec();
     let steps = stage.sigmas.len() - 1;
     let eta = if stage.ancestral { 1.0 } else { 0.0 };
 
@@ -401,7 +485,7 @@ pub fn run_stage_cond(
     // gate reads the other side's sigma and closes on noise, so leaving the
     // schedule's sigma there makes the transformer discount a picture it was
     // handed intact. The reference sets it to zero for a frozen modality.
-    let v_frozen = vmask.iter().all(|&m| m == 0.0);
+    let v_frozen = v_frozen_src.iter().all(|&m| m == 0.0);
     let a_frozen = amask.iter().all(|&m| m == 0.0);
 
     for i in 0..steps {
@@ -463,6 +547,7 @@ pub fn run_stage_cond(
         blend(&mut a, &aclean, &amask, ach);
         progress(i + 1, steps, t0.elapsed().as_secs_f64());
     }
+    v.truncate(clip_tokens * vch);
     Latents { video: v, audio: a }
 }
 

@@ -705,6 +705,14 @@ pub struct VideoArgs<'a> {
     pub steps: Option<usize>,
     /// Refinement steps in the second stage (`--two-stage`), default 3
     pub steps2: Option<usize>,
+    /// A LoRA adapter (`.safetensors`) evaluated beside the q4tp weights
+    pub lora: Option<&'a str>,
+    /// How hard to apply it
+    pub lora_strength: f32,
+    /// Reference stills (PPM) for a multi-subject adapter, 1 to 5
+    pub refs: Vec<String>,
+    /// Pixel frames each reference is held for — 25 or 33
+    pub ref_frames: usize,
 }
 
 /// Prompt in, video out — the whole pipeline in one process and one file.
@@ -772,7 +780,32 @@ pub fn cmd_ltx_video(a: VideoArgs<'_>) -> anyhow::Result<()> {
     // Clean file-backed pages refault from disk if anything wants them.
     release_pages(&model, "te.");
 
-    let dit = LtxDit::from_cmf(&model).map_err(|e| anyhow!(e))?;
+    // The adapter is read before the transformer so its branches are bound at
+    // load: a projection either carries one or it does not, and nothing in the
+    // step loop has to ask.
+    let bank = match a.lora {
+        None => None,
+        Some(p) => {
+            let t = std::time::Instant::now();
+            let b = cortiq_engine::ltxlora::LoraBank::load(Path::new(p), a.lora_strength)
+                .map_err(|e| anyhow!(e))?;
+            anyhow::ensure!(!b.is_empty(), "{p} carries no lora_A/lora_B pairs");
+            println!(
+                "lora: {} branches at rank {}, strength {} ({:.1}s){}",
+                b.len(),
+                b.rank(),
+                a.lora_strength,
+                t.elapsed().as_secs_f64(),
+                if b.slot.is_some() { ", with reference slots" } else { "" }
+            );
+            Some(b)
+        }
+    };
+    anyhow::ensure!(
+        a.refs.is_empty() || bank.is_some(),
+        "--ref needs the adapter that was trained with it: pass --lora too"
+    );
+    let dit = LtxDit::from_cmf_lora(&model, bank.as_ref()).map_err(|e| anyhow!(e))?;
     // Two-stage is how the distilled model was trained to be sampled: eight
     // ancestral steps at half resolution, a learned latent upscale, then
     // three deterministic steps that refine the detail the upscale invented.
@@ -800,6 +833,14 @@ pub fn cmd_ltx_video(a: VideoArgs<'_>) -> anyhow::Result<()> {
         a.video_strength,
         pool.as_deref(),
     )?;
+    // Reference stills join the sequence as frozen tokens at negative time.
+    let cond = if a.refs.is_empty() {
+        cond
+    } else {
+        let bank = bank.as_ref().expect("checked above");
+        let refs = build_references(&model, &geo, &a.refs, bank, a.ref_frames, pool.as_deref())?;
+        Some(cond.unwrap_or_default().with_references(refs))
+    };
     // A clip that covers the whole render is *re-noised*, not frozen: freezing
     // it would hand back exactly what was given. The schedule starts at the
     // strength asked for, which is also what the latent is mixed to.
@@ -1226,6 +1267,106 @@ fn build_conditioning(
         (None, None) => None,
     };
     Ok((cond, init))
+}
+
+
+/// Reference images as clean tokens at negative time, the way the
+/// multi-subject adapters were trained: each still is held for
+/// `ref_frames` pixel frames, encoded by the same video VAE the render
+/// uses, given its slot's learned channel bias, and placed one pixel frame
+/// further back than the slot after it.
+fn build_references(
+    model: &Arc<CmfModel>,
+    geo: &cortiq_engine::ltxpipe::Geometry,
+    refs: &[String],
+    bank: &cortiq_engine::ltxlora::LoraBank,
+    ref_frames: usize,
+    pool: Option<&cortiq_engine::pool::Pool>,
+) -> anyhow::Result<cortiq_engine::ltxpipe::RefTokens> {
+    use cortiq_engine::ltxenc::VideoEncoder;
+    use cortiq_engine::ltxpipe::{RefTokens, patchify_video};
+    anyhow::ensure!(
+        (1..=5).contains(&refs.len()),
+        "the multi-subject adapters take 1 to 5 references, got {}",
+        refs.len()
+    );
+    anyhow::ensure!(
+        ref_frames == 25 || ref_frames == 33,
+        "--ref-frames must be 25 or 33 (what the adapter was trained on), got {ref_frames}"
+    );
+    bank.check_reference_convention().map_err(|e| anyhow!(e))?;
+    let slot = bank
+        .slot
+        .as_ref()
+        .ok_or_else(|| anyhow!("this adapter carries no reference_slot_embedding — it is a plain LoRA, so --ref does not apply"))?;
+    let enc = VideoEncoder::from_cmf(model).map_err(|e| anyhow!(e))?;
+    let n = refs.len();
+    let mut out = RefTokens::default();
+    for (i, path) in refs.iter().enumerate() {
+        let t = std::time::Instant::now();
+        let (rgb, h, w) = read_ppm_f32(path)?;
+        anyhow::ensure!(
+            h == geo.height && w == geo.width,
+            "reference {} is {w}x{h} but the render is {}x{} — resize it first; \
+             this build does not guess an aspect-fit",
+            i + 1,
+            geo.width,
+            geo.height
+        );
+        // The still is held, not animated: the adapter encodes a static clip
+        // so the guide occupies a whole latent block rather than one frame.
+        let mut held = Vec::with_capacity(rgb.len() * ref_frames);
+        for _ in 0..ref_frames {
+            held.extend_from_slice(&rgb);
+        }
+        let vol = Vol { c: 3, f: ref_frames, h, w, data: held };
+        let lat = enc.encode(&vol, pool);
+        anyhow::ensure!(
+            lat.h == geo.lh && lat.w == geo.lw,
+            "reference {} encoded to a {}x{} latent grid, the render wants {}x{}",
+            i + 1,
+            lat.w,
+            lat.h,
+            geo.lw,
+            geo.lh
+        );
+        // The slot's learned bias goes on the LATENT channels, broadcast over
+        // every frame and position of this reference.
+        let emb = slot.embed(i + 1);
+        anyhow::ensure!(
+            emb.len() == lat.c,
+            "slot embedding is {} wide, the latent has {} channels",
+            emb.len(),
+            lat.c
+        );
+        let mut data = lat.data.clone();
+        let plane = lat.f * lat.h * lat.w;
+        for (c, e) in emb.iter().enumerate() {
+            for v in data[c * plane..(c + 1) * plane].iter_mut() {
+                *v += e;
+            }
+        }
+        let tokens = patchify_video(&data, &cortiq_engine::ltxpipe::Geometry {
+            lf: lat.f,
+            lh: lat.h,
+            lw: lat.w,
+            ..*geo
+        });
+        let count = lat.f * lat.h * lat.w;
+        // Slot 1 sits furthest back; the last reference is nearest the clip.
+        let offset = -((n - i) as i64);
+        out.positions.extend(geo.guide_positions(lat.f, offset));
+        out.latent.extend_from_slice(&tokens);
+        out.count += count;
+        println!(
+            "reference {}/{}: {path} → {} latent frames at frame {offset} ({count} tokens) in {:.1}s",
+            i + 1,
+            n,
+            lat.f,
+            t.elapsed().as_secs_f64()
+        );
+    }
+    Ok(out)
 }
 
 /// One PPM as a single-frame volume in `[-1, 1]`.

@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.90] - 2026-08-18
+
+LoRA adapters for LTX-2.5, and the multi-subject reference conditioning the
+community adapters ship with them.
+
+### Added
+- **`--lora <file.safetensors>` / `--lora-strength` on `ltx-video`.** The
+  container's weights are q4tp, so an adapter cannot be folded into them
+  without dequantizing the whole DiT and requantizing it — the branch is
+  evaluated beside them instead, `y = x·Wᵀ + s·(x·Aᵀ)·Bᵀ`, on every path
+  including the fused Metal q/k/v submission. Both halves go through the same
+  blocked `gemm_nt` the rest of the engine uses, which is not a detail: the
+  first version wrote them as scalar loops and cost 182.7 s a step against
+  68.1 through Accelerate's AMX, on the same render.
+- **`--ref <still.ppm>` (1 to 5) and `--ref-frames`.** Adapters carrying a
+  `reference_slot_embedding` condition on reference images. Each still is held
+  for 25 or 33 pixel frames, encoded by the same video VAE the render uses,
+  given its slot's learned per-channel bias on the latent, and placed at a
+  negative frame offset — slot 1 furthest back, the last reference nearest the
+  clip. The tokens ride in the same sequence, frozen, and are cropped off the
+  result. Verified against LiconStudio's MSR V1: 480 branches at rank 128 bind
+  to the container's projections, and three references at 384×256 add 1152
+  tokens beside 384 of clip at frames −3, −2, −1.
+- `Conditioning::with_references` and `Geometry::guide_positions` — the
+  sequence-extension and the negative-time RoPE coordinates, separately
+  testable from the CLI.
+
+### Notes
+- A file that does not match is refused rather than approximated: a lone
+  `lora_A`, a slot embedding whose width is not the latent's channel count, or
+  metadata asking for a token order this build does not implement, all stop
+  with a sentence. Reference stills must already be the render's size — this
+  build does not guess an aspect fit.
+
 ## [0.5.89] - 2026-08-18
 
 A finished stage gives its memory back.

@@ -224,7 +224,7 @@ The audio is not dubbed on afterwards: it is denoised in the same packed
 sequence as the video, on its own flow schedule, so it arrives in sync.
 
 - **`cortiq animate`** — MiniMax-H3 + Turbo LoRA. 512×288, 39 frames, four steps, out of one 23.9 GB file (124.4 GB of reference tree). One RTX 5090: **60.2 s**.
-- **`cortiq ltx-video`** — LTX-2.5, a 21B DiT with a joint audio stream. Eight steps, or `--two-stage` for detail. [docs/LTX.md](docs/LTX.md)
+- **`cortiq ltx-video`** — LTX-2.5, a 21B DiT with a joint audio stream. Eight steps, or `--two-stage` for detail. `--lora` applies an adapter at runtime, `--ref` conditions on up to five reference stills. [docs/LTX.md](docs/LTX.md)
 - **`cortiq imagine`** — Lumina-Image 2.0, a 19 GB diffusers tree in a **3.2 GB** `.cmf`. M4: 256×256/30 steps in ~37 s.
 
 <img src="docs/media/fox-512.png" width="340" alt="a red fox in a snowy forest">
