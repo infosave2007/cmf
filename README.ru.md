@@ -149,6 +149,21 @@ curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '
 это сервер для локального использования, а не многопользовательский шлюз. Не
 выставляйте его в сеть, которой не доверяете.
 
+## На телефоне
+
+Тот же формат на Android и iOS: **[Cortiq: Local AI Models](https://play.google.com/store/apps/details?id=ai.cortiq.cmf_mobile)**
+несёт этот же рантайм нативной библиотекой — общайтесь с `.cmf` прямо на
+устройстве, конвертируйте репозиторий с Hugging Face в CMF на самом телефоне и
+отдавайте загруженную модель в локальную сеть по тому же OpenAI-совместимому API.
+
+- Что умеет — **[huggingface.co/spaces/infosave/cortiq-mobile](https://huggingface.co/spaces/infosave/cortiq-mobile)**
+- Исходники — [github.com/infosave2007/cmfmobile](https://github.com/infosave2007/cmfmobile) (Apache-2.0)
+
+В паре с `cortiq worker` на настольной машине телефон тянет модель больше
+собственной памяти: измерено — MoE на 34.7B и 16.3 tok/s на аппарате, где
+свободно 2 ГБ.
+
+
 ## Почему CMF
 
 ### Внимание, которое перестаёт расти вместе с контекстом

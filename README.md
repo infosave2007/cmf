@@ -147,6 +147,21 @@ Scope it honestly before you deploy: **requests are serialized** (one at a time
 per model) and **there is no authentication** — this is a local-first server, not
 a multi-tenant gateway. Don't expose it to a network you don't trust.
 
+## On a phone
+
+The same format on Android and iOS: **[Cortiq: Local AI Models](https://play.google.com/store/apps/details?id=ai.cortiq.cmf_mobile)**
+carries this runtime as a native library — chat against a `.cmf` on the device,
+convert a Hugging Face repo to CMF on the handset itself, and serve what is
+loaded to your LAN over the same OpenAI-compatible API.
+
+- What it does — **[huggingface.co/spaces/infosave/cortiq-mobile](https://huggingface.co/spaces/infosave/cortiq-mobile)**
+- Source — [github.com/infosave2007/cmfmobile](https://github.com/infosave2007/cmfmobile) (Apache-2.0)
+
+Pair it with `cortiq worker` on a desktop and the phone runs a model larger
+than its own memory: measured, a 34.7B MoE at 16.3 tok/s on a handset with
+2 GB free.
+
+
 ## Why CMF
 
 ### Attention that stops growing with the context

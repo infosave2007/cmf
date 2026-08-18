@@ -131,6 +131,20 @@ curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '
 一个），而且**没有任何鉴权**——这是一个本地优先的服务器，不是多租户网关。不要把
 它暴露到你不信任的网络上。
 
+## 在手机上
+
+同一种格式也跑在 Android 和 iOS 上：**[Cortiq: Local AI Models](https://play.google.com/store/apps/details?id=ai.cortiq.cmf_mobile)**
+把这套运行时作为原生库带上手机——在设备上直接与 `.cmf` 对话，在手机本地把
+Hugging Face 仓库转换成 CMF，并通过同一套 OpenAI 兼容 API 把已加载的模型提供
+给局域网。
+
+- 功能介绍 — **[huggingface.co/spaces/infosave/cortiq-mobile](https://huggingface.co/spaces/infosave/cortiq-mobile)**
+- 源码 — [github.com/infosave2007/cmfmobile](https://github.com/infosave2007/cmfmobile)（Apache-2.0）
+
+再配合桌面端的 `cortiq worker`，手机就能跑比自身内存更大的模型：实测 34.7B 的
+MoE，在仅剩 2 GB 可用内存的手机上跑到 16.3 tok/s。
+
+
 ## 为什么选 CMF
 
 ### 不再随上下文增长的注意力
