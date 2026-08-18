@@ -2231,7 +2231,7 @@ fn dsv4_layer_loop(
                 .into_iter()
                 .map(|gi| pk.to_slot[gi])
                 .collect();
-            if v.iter().any(|&x| x == usize::MAX) {
+            if v.contains(&usize::MAX) {
                 None
             } else {
                 Some(v)
@@ -2686,7 +2686,7 @@ fn dsv4_chain_run(
                 .into_iter()
                 .map(|gi| pk.to_slot[gi])
                 .collect();
-            if v.iter().any(|&x| x == usize::MAX) {
+            if v.contains(&usize::MAX) {
                 None
             } else {
                 Some(v)
@@ -2913,7 +2913,7 @@ fn dsv4_chain_run(
                         .into_iter()
                         .map(|gi| packs[i].to_slot[gi])
                         .collect();
-                    if v.iter().any(|&x| x == usize::MAX) {
+                    if v.contains(&usize::MAX) {
                         None
                     } else {
                         Some(v)
@@ -3150,7 +3150,7 @@ fn dsv4_two_frame_loop(
         {
             return false;
         }
-        let idx32: Vec<u32> = prep
+        let _idx32: Vec<u32> = prep
             .idxs
             .iter()
             .map(|&p| {
@@ -3616,7 +3616,7 @@ fn moe_frame(
         Some(f) if subset => Some(f.to_vec()),
         Some(f) => {
             let v: Vec<usize> = f.iter().map(|&g| pk.to_slot[g]).collect();
-            if v.iter().any(|&s| s == usize::MAX) {
+            if v.contains(&usize::MAX) {
                 no!("слой {li}: хеш-слой называет эксперта вне упаковки");
             }
             Some(v)
@@ -6332,7 +6332,7 @@ mod tests {
             silu(-50.0) * limit,
             silu(limit) * -limit,
             silu(1.0) * 1.0,
-            silu(-1.0) * -1.0,
+            -silu(-1.0),
         ];
         for (i, w) in want.iter().enumerate() {
             assert!(
@@ -6576,13 +6576,13 @@ mod tests {
         let want_post = [1.9600224, 1.9534285, 1.9201256, 1.8160983];
         let want_comb = [
             0.5996052,
-            0.28253591,
+            0.282_535_9,
             0.09218107,
             0.025676856,
             0.17564717,
             0.22228767,
-            0.27174541,
-            0.33031881,
+            0.271_745_4,
+            0.330_318_8,
             0.029528176,
             0.12206022,
             0.32619134,
@@ -6634,7 +6634,7 @@ mod tests {
         }
         // pre is a gate in (eps, 1+eps); post carries the factor 2
         assert!(pre.iter().all(|&v| v > 0.0 && v < 1.001));
-        assert!(post.iter().all(|&v| v >= 0.0 && v <= 2.0));
+        assert!(post.iter().all(|&v| (0.0..=2.0).contains(&v)));
     }
 
     /// Folding four copies and expanding them back must preserve a constant
@@ -6643,8 +6643,7 @@ mod tests {
     #[test]
     fn expand_of_identical_copies_is_a_fixed_point() {
         let (hc, dim) = (4usize, 3usize);
-        let residual: Vec<f32> = std::iter::repeat([1.5f32, -2.0, 0.25])
-            .take(hc)
+        let residual: Vec<f32> = std::iter::repeat_n([1.5f32, -2.0, 0.25], hc)
             .flatten()
             .collect();
         let comb = {
@@ -7866,7 +7865,7 @@ pub fn dspark_draft(
     let Some(stage0) = mtp.first() else {
         return Vec::new();
     };
-    let (Some(mp), Some(mn)) = (stage0.main_proj.as_ref(), stage0.main_norm.as_ref()) else {
+    let (Some(_mp), Some(_mn)) = (stage0.main_proj.as_ref(), stage0.main_norm.as_ref()) else {
         return Vec::new();
     };
     dspark_ring_append(g, mtp, cfg, ds, pos, pool);

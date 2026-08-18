@@ -68,7 +68,7 @@ fn trial(m: usize, w: usize, sink: usize, amp: f32, depth: usize, seed: u64) -> 
     let mut s = seed;
     let rd = (d as f32).sqrt();
 
-    let mut unit = |s: &mut u64| -> Vec<f32> {
+    let unit = |s: &mut u64| -> Vec<f32> {
         let v: Vec<f32> = (0..d).map(|_| unif(s)).collect();
         let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
         v.iter().map(|x| x / n).collect()
@@ -148,7 +148,7 @@ fn background_error(m: usize, w: usize, sink: usize, depth: usize, seed: u64) ->
     let mut s = seed;
     let rd = (d as f32).sqrt();
 
-    let mut unit = |s: &mut u64| -> Vec<f32> {
+    let unit = |s: &mut u64| -> Vec<f32> {
         let v: Vec<f32> = (0..d).map(|_| unif(s)).collect();
         let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
         v.iter().map(|x| x / n).collect()

@@ -485,6 +485,116 @@ impl TsTable {
     }
 }
 
+
+/// `rms_norm(x) · (1 + scale) + shift` over every token, in parallel.
+/// `mods[r]` is the `(shift, scale, gate)` triple of the r-th distinct
+/// timestep and `idx[t]` says which one token `t` uses.
+fn ada_zero_rows(
+    x: &[f32],
+    out: &mut [f32],
+    n: usize,
+    dim: usize,
+    mods: &[[Vec<f32>; 3]],
+    idx: &[usize],
+    pool: Option<&Pool>,
+) {
+    let dst = Shared(out.as_mut_ptr());
+    rows(pool, n, &|s, e| {
+        let r = unsafe { dst.at(s * dim, (e - s) * dim) };
+        for (row, i) in r.chunks_exact_mut(dim).zip(s..e) {
+            let md = &mods[idx[i]];
+            rms_plain(&x[i * dim..(i + 1) * dim], row);
+            for d in 0..dim {
+                row[d] = row[d] * (1.0 + md[1][d]) + md[0][d];
+            }
+        }
+    });
+}
+
+/// `x += y · gate`, the residual every sub-layer writes back through.
+fn add_gated(
+    x: &mut [f32],
+    y: &[f32],
+    n: usize,
+    dim: usize,
+    mods: &[[Vec<f32>; 3]],
+    idx: &[usize],
+    pool: Option<&Pool>,
+) {
+    let dst = Shared(x.as_mut_ptr());
+    rows(pool, n, &|s, e| {
+        let r = unsafe { dst.at(s * dim, (e - s) * dim) };
+        for (row, i) in r.chunks_exact_mut(dim).zip(s..e) {
+            let g = &mods[idx[i]][2];
+            for d in 0..dim {
+                row[d] += y[i * dim + d] * g[d];
+            }
+        }
+    });
+}
+
+/// The post-SA pair: fold the gated update into the residual and hand the
+/// re-normalized result to cross-attention, in one pass over the tokens.
+fn post_sa_rows(
+    x: &mut [f32],
+    y: &[f32],
+    normed: &mut [f32],
+    n: usize,
+    dim: usize,
+    mods: &[[Vec<f32>; 3]],
+    idx: &[usize],
+    pool: Option<&Pool>,
+) {
+    let a = Shared(x.as_mut_ptr());
+    let b = Shared(normed.as_mut_ptr());
+    rows(pool, n, &|s, e| {
+        let xr = unsafe { a.at(s * dim, (e - s) * dim) };
+        let nr = unsafe { b.at(s * dim, (e - s) * dim) };
+        for ((row, nrow), i) in xr.chunks_exact_mut(dim).zip(nr.chunks_exact_mut(dim)).zip(s..e) {
+            let g = &mods[idx[i]][2];
+            for d in 0..dim {
+                row[d] += y[i * dim + d] * g[d];
+            }
+            rms_plain(row, nrow);
+        }
+    });
+}
+
+/// `x += y · g` with one shared per-channel gate (the A↔V fusion).
+fn add_scaled(x: &mut [f32], y: &[f32], n: usize, dim: usize, g: &[f32], pool: Option<&Pool>) {
+    let dst = Shared(x.as_mut_ptr());
+    rows(pool, n, &|s, e| {
+        let r = unsafe { dst.at(s * dim, (e - s) * dim) };
+        for (row, i) in r.chunks_exact_mut(dim).zip(s..e) {
+            for d in 0..dim {
+                row[d] += y[i * dim + d] * g[d];
+            }
+        }
+    });
+}
+
+/// The cross-attention query: an affine on an already-normalized row.
+fn affine_rows(
+    x: &[f32],
+    out: &mut [f32],
+    n: usize,
+    dim: usize,
+    mods: &[[Vec<f32>; 3]],
+    idx: &[usize],
+    pool: Option<&Pool>,
+) {
+    let dst = Shared(out.as_mut_ptr());
+    rows(pool, n, &|s, e| {
+        let r = unsafe { dst.at(s * dim, (e - s) * dim) };
+        for (row, i) in r.chunks_exact_mut(dim).zip(s..e) {
+            let md = &mods[idx[i]];
+            for d in 0..dim {
+                row[d] = x[i * dim + d] * (1.0 + md[1][d]) + md[0][d];
+            }
+        }
+    });
+}
+
 // ----------------------------------------------------------------- block
 
 struct Stream {
@@ -753,14 +863,7 @@ impl LtxDit {
 
             // ---- video: self-attention, then prompt cross-attention ----
             let mut vnorm = vec![0f32; n * dim];
-            for i in 0..n {
-                let md = &v_msa[vt.idx[i]];
-                let dst = &mut vnorm[i * dim..(i + 1) * dim];
-                rms_plain(&vx[i * dim..(i + 1) * dim], dst);
-                for d in 0..dim {
-                    dst[d] = dst[d] * (1.0 + md[1][d]) + md[0][d];
-                }
-            }
+            ada_zero_rows(&vx, &mut vnorm, n, dim, &v_msa, &vt.idx, pool);
             if bi == 0 {
                 trace("v.b0.sa.in", &vnorm);
             }
@@ -772,20 +875,9 @@ impl LtxDit {
                 trace("v.b0.sa.out", &vsa);
             }
             let mut vnormed = vec![0f32; n * dim];
-            for i in 0..n {
-                let md = &v_msa[vt.idx[i]];
-                for d in 0..dim {
-                    vx[i * dim + d] += vsa[i * dim + d] * md[2][d];
-                }
-                rms_plain(&vx[i * dim..(i + 1) * dim], &mut vnormed[i * dim..(i + 1) * dim]);
-            }
+            post_sa_rows(&mut vx, &vsa, &mut vnormed, n, dim, &v_msa, &vt.idx, pool);
             let mut vq = vec![0f32; n * dim];
-            for i in 0..n {
-                let md = &v_ca[vt.idx[i]];
-                for d in 0..dim {
-                    vq[i * dim + d] = vnormed[i * dim + d] * (1.0 + md[1][d]) + md[0][d];
-                }
-            }
+            affine_rows(&vnormed, &mut vq, n, dim, &v_ca, &vt.idx, pool);
             let vctx = modulate_kv(&video.context, video.ctx_len, dim, &blk.video.prompt_sst, vpt.row(0));
             let vca = blk.video.attn2.forward(&vq, n, &vctx, video.ctx_len, None, None, vmask, pool);
             if bi == 0 {
@@ -793,23 +885,11 @@ impl LtxDit {
                 trace("v.b0.ca.ctx", &vctx);
                 trace("v.b0.ca.out", &vca);
             }
-            for i in 0..n {
-                let md = &v_ca[vt.idx[i]];
-                for d in 0..dim {
-                    vx[i * dim + d] += vca[i * dim + d] * md[2][d];
-                }
-            }
+            add_gated(&mut vx, &vca, n, dim, &v_ca, &vt.idx, pool);
 
             // ---- audio: the same two steps ----
             let mut anorm = vec![0f32; m * a_dim];
-            for i in 0..m {
-                let md = &a_msa[at.idx[i]];
-                let dst = &mut anorm[i * a_dim..(i + 1) * a_dim];
-                rms_plain(&ax[i * a_dim..(i + 1) * a_dim], dst);
-                for d in 0..a_dim {
-                    dst[d] = dst[d] * (1.0 + md[1][d]) + md[0][d];
-                }
-            }
+            ada_zero_rows(&ax, &mut anorm, m, a_dim, &a_msa, &at.idx, pool);
             if bi == 0 {
                 trace("a.b0.sa.in", &anorm);
             }
@@ -821,23 +901,9 @@ impl LtxDit {
                 trace("a.b0.sa.out", &asa);
             }
             let mut anormed = vec![0f32; m * a_dim];
-            for i in 0..m {
-                let md = &a_msa[at.idx[i]];
-                for d in 0..a_dim {
-                    ax[i * a_dim + d] += asa[i * a_dim + d] * md[2][d];
-                }
-                rms_plain(
-                    &ax[i * a_dim..(i + 1) * a_dim],
-                    &mut anormed[i * a_dim..(i + 1) * a_dim],
-                );
-            }
+            post_sa_rows(&mut ax, &asa, &mut anormed, m, a_dim, &a_msa, &at.idx, pool);
             let mut aq = vec![0f32; m * a_dim];
-            for i in 0..m {
-                let md = &a_ca[at.idx[i]];
-                for d in 0..a_dim {
-                    aq[i * a_dim + d] = anormed[i * a_dim + d] * (1.0 + md[1][d]) + md[0][d];
-                }
-            }
+            affine_rows(&anormed, &mut aq, m, a_dim, &a_ca, &at.idx, pool);
             let actx = modulate_kv(&audio.context, audio.ctx_len, a_dim, &blk.audio.prompt_sst, apt.row(0));
             let aca = blk.audio.attn2.forward(&aq, m, &actx, audio.ctx_len, None, None, amask, pool);
             if bi == 0 {
@@ -845,20 +911,15 @@ impl LtxDit {
                 trace("a.b0.ca.ctx", &actx);
                 trace("a.b0.ca.out", &aca);
             }
-            for i in 0..m {
-                let md = &a_ca[at.idx[i]];
-                for d in 0..a_dim {
-                    ax[i * a_dim + d] += aca[i * a_dim + d] * md[2][d];
-                }
-            }
+            add_gated(&mut ax, &aca, m, a_dim, &a_ca, &at.idx, pool);
 
             // ---- audio ↔ video, both directions off the pre-fusion state ----
             let vx_pre = vx.clone();
             let ax_pre = ax.clone();
             let a2v_vp = vxs.pairs(&blk.sst_a2v_video, dim, 0);
             let a2v_ap = axs.pairs(&blk.sst_a2v_audio, a_dim, 0);
-            let a2v_v = ada_pair(&vx_pre, n, dim, &a2v_vp, &vxs.idx);
-            let a2v_a = ada_pair(&ax_pre, m, a_dim, &a2v_ap, &axs.idx);
+            let a2v_v = ada_pair(&vx_pre, n, dim, &a2v_vp, &vxs.idx, pool);
+            let a2v_a = ada_pair(&ax_pre, m, a_dim, &a2v_ap, &axs.idx, pool);
             let a2v = blk
                 .a2v
                 .forward(&a2v_v, n, &a2v_a, m, Some(&v_xpe), Some(&a_xpe), None, pool);
@@ -868,15 +929,11 @@ impl LtxDit {
                 trace("v.b0.a2v.out", &a2v);
             }
             let gate_a2v = gate_row(&blk.sst_a2v_video, dim, vgt.row(0));
-            for i in 0..n {
-                for d in 0..dim {
-                    vx[i * dim + d] += a2v[i * dim + d] * gate_a2v[d];
-                }
-            }
+            add_scaled(&mut vx, &a2v, n, dim, &gate_a2v, pool);
             let v2a_ap = axs.pairs(&blk.sst_a2v_audio, a_dim, 2);
             let v2a_vp = vxs.pairs(&blk.sst_a2v_video, dim, 2);
-            let v2a_a = ada_pair(&ax_pre, m, a_dim, &v2a_ap, &axs.idx);
-            let v2a_v = ada_pair(&vx_pre, n, dim, &v2a_vp, &vxs.idx);
+            let v2a_a = ada_pair(&ax_pre, m, a_dim, &v2a_ap, &axs.idx, pool);
+            let v2a_v = ada_pair(&vx_pre, n, dim, &v2a_vp, &vxs.idx, pool);
             let v2a = blk
                 .v2a
                 .forward(&v2a_a, m, &v2a_v, n, Some(&a_xpe), Some(&v_xpe), None, pool);
@@ -886,53 +943,25 @@ impl LtxDit {
                 trace("a.b0.v2a.out", &v2a);
             }
             let gate_v2a = gate_row(&blk.sst_a2v_audio, a_dim, agt.row(0));
-            for i in 0..m {
-                for d in 0..a_dim {
-                    ax[i * a_dim + d] += v2a[i * a_dim + d] * gate_v2a[d];
-                }
-            }
+            add_scaled(&mut ax, &v2a, m, a_dim, &gate_v2a, pool);
 
             // ---- feed-forward ----
             let mut vsc = vec![0f32; n * dim];
-            for i in 0..n {
-                let md = &v_mlp[vt.idx[i]];
-                let dst = &mut vsc[i * dim..(i + 1) * dim];
-                rms_plain(&vx[i * dim..(i + 1) * dim], dst);
-                for d in 0..dim {
-                    dst[d] = dst[d] * (1.0 + md[1][d]) + md[0][d];
-                }
-            }
+            ada_zero_rows(&vx, &mut vsc, n, dim, &v_mlp, &vt.idx, pool);
             let vff = blk.video.ff(&vsc, n, pool);
             if bi == 0 {
                 trace("v.b0.ff.in", &vsc);
                 trace("v.b0.ff.out", &vff);
             }
-            for i in 0..n {
-                let md = &v_mlp[vt.idx[i]];
-                for d in 0..dim {
-                    vx[i * dim + d] += vff[i * dim + d] * md[2][d];
-                }
-            }
+            add_gated(&mut vx, &vff, n, dim, &v_mlp, &vt.idx, pool);
             let mut asc = vec![0f32; m * a_dim];
-            for i in 0..m {
-                let md = &a_mlp[at.idx[i]];
-                let dst = &mut asc[i * a_dim..(i + 1) * a_dim];
-                rms_plain(&ax[i * a_dim..(i + 1) * a_dim], dst);
-                for d in 0..a_dim {
-                    dst[d] = dst[d] * (1.0 + md[1][d]) + md[0][d];
-                }
-            }
+            ada_zero_rows(&ax, &mut asc, m, a_dim, &a_mlp, &at.idx, pool);
             let aff = blk.audio.ff(&asc, m, pool);
             if bi == 0 {
                 trace("a.b0.ff.in", &asc);
                 trace("a.b0.ff.out", &aff);
             }
-            for i in 0..m {
-                let md = &a_mlp[at.idx[i]];
-                for d in 0..a_dim {
-                    ax[i * a_dim + d] += aff[i * a_dim + d] * md[2][d];
-                }
-            }
+            add_gated(&mut ax, &aff, m, a_dim, &a_mlp, &at.idx, pool);
             trace(&format!("v.block{bi}"), &vx);
             trace(&format!("a.block{bi}"), &ax);
         }
@@ -960,17 +989,28 @@ fn modulate_kv(ctx: &[f32], len: usize, dim: usize, table: &[f32], extra: &[f32]
     out
 }
 
+
 /// `ada_zero` with an A↔V `(scale, shift)` pair per distinct timestep.
-fn ada_pair(x: &[f32], n: usize, dim: usize, pairs: &[[Vec<f32>; 2]], idx: &[usize]) -> Vec<f32> {
+fn ada_pair(
+    x: &[f32],
+    n: usize,
+    dim: usize,
+    pairs: &[[Vec<f32>; 2]],
+    idx: &[usize],
+    pool: Option<&Pool>,
+) -> Vec<f32> {
     let mut out = vec![0f32; n * dim];
-    for i in 0..n {
-        let p = &pairs[idx[i]];
-        let dst = &mut out[i * dim..(i + 1) * dim];
-        rms_plain(&x[i * dim..(i + 1) * dim], dst);
-        for d in 0..dim {
-            dst[d] = dst[d] * (1.0 + p[0][d]) + p[1][d];
+    let dst = Shared(out.as_mut_ptr());
+    rows(pool, n, &|s, e| {
+        let r = unsafe { dst.at(s * dim, (e - s) * dim) };
+        for (row, i) in r.chunks_exact_mut(dim).zip(s..e) {
+            let p = &pairs[idx[i]];
+            rms_plain(&x[i * dim..(i + 1) * dim], row);
+            for d in 0..dim {
+                row[d] = row[d] * (1.0 + p[0][d]) + p[1][d];
+            }
         }
-    }
+    });
     out
 }
 
@@ -992,13 +1032,17 @@ fn head(
     pool: Option<&Pool>,
 ) -> Vec<f32> {
     let mut y = vec![0f32; n * dim];
-    let mut ln = vec![0f32; dim];
-    for i in 0..n {
-        let e = ts.emb_row(ts.idx[i.min(ts.idx.len() - 1)]);
-        layer_norm(&x[i * dim..(i + 1) * dim], &mut ln);
-        for d in 0..dim {
-            y[i * dim + d] = ln[d] * (1.0 + sst[dim + d] + e[d]) + sst[d] + e[d];
+    let dst = Shared(y.as_mut_ptr());
+    rows(pool, n, &|s, e| {
+        let r = unsafe { dst.at(s * dim, (e - s) * dim) };
+        let mut ln = vec![0f32; dim];
+        for (row, i) in r.chunks_exact_mut(dim).zip(s..e) {
+            let emb = ts.emb_row(ts.idx[i.min(ts.idx.len() - 1)]);
+            layer_norm(&x[i * dim..(i + 1) * dim], &mut ln);
+            for d in 0..dim {
+                row[d] = ln[d] * (1.0 + sst[dim + d] + emb[d]) + sst[d] + emb[d];
+            }
         }
-    }
+    });
     proj.apply(&y, n, pool)
 }

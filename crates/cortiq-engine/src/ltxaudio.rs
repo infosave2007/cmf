@@ -435,7 +435,7 @@ impl Aliasing {
         let stride = self.ratio;
         let pad = k / stride - 1;
         let pad_left = pad * stride + (k - stride) / 2;
-        let pad_right = pad * stride + (k - stride + 1) / 2;
+        let pad_right = pad * stride + (k - stride).div_ceil(2);
         // replicate-pad, transposed convolution, then the same trim the
         // reference takes
         let tp = x.t + 2 * pad;

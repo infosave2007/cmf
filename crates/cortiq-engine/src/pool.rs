@@ -260,9 +260,9 @@ impl Pool {
 
     /// The thread count `from_env` would use RIGHT NOW: forced (C ABI)
     /// > CMF_THREADS > big-core topology > available_parallelism−1.
-    /// ≤1 means the model runs serial (no pool). Introspection
-    /// (`execution_mode`, status endpoints) must report THIS, not
-    /// available_parallelism.
+    /// > ≤1 means the model runs serial (no pool). Introspection
+    /// > (`execution_mode`, status endpoints) must report THIS, not
+    /// > available_parallelism.
     pub fn effective_threads() -> usize {
         let forced = FORCED_THREADS.load(std::sync::atomic::Ordering::Relaxed);
         if forced > 0 {

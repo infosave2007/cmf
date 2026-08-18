@@ -14829,8 +14829,8 @@ fn moe_expert_bufs(
         let mut offs = Vec::with_capacity(experts.len());
         for t in experts {
             let e = model.tensors.get(role(t))?;
-            if *e.shape.first()? as usize != rows
-                || *e.shape.get(1)? as usize != cols
+            if *e.shape.first()? != rows
+                || *e.shape.get(1)? != cols
                 || e.nbytes as usize != plen
             {
                 return None;
@@ -15764,8 +15764,8 @@ pub(crate) fn adapter_up() -> bool {
 
 fn q1_weight(c: &Ctx, model: &Arc<CmfModel>, idx: usize) -> Option<(wgpu::Buffer, usize, usize)> {
     let entry = model.tensors.get(idx)?;
-    let rows = *entry.shape.first()? as usize;
-    let cols = *entry.shape.get(1)? as usize;
+    let rows = *entry.shape.first()?;
+    let cols = *entry.shape.get(1)?;
     if cols % 32 != 0 {
         return None;
     }
@@ -15784,8 +15784,8 @@ fn q1_weight(c: &Ctx, model: &Arc<CmfModel>, idx: usize) -> Option<(wgpu::Buffer
 /// and the kernels index them from the same base.
 fn tile_weight(c: &Ctx, model: &Arc<CmfModel>, idx: usize) -> Option<(wgpu::Buffer, usize, usize)> {
     let entry = model.tensors.get(idx)?;
-    let rows = *entry.shape.first()? as usize;
-    let cols = *entry.shape.get(1)? as usize;
+    let rows = *entry.shape.first()?;
+    let cols = *entry.shape.get(1)?;
     if cols % 32 != 0 {
         return None;
     }
@@ -16077,7 +16077,7 @@ pub fn forward_token_graph(
     // `layers.len()` on a full run; smaller when the expert budget ended
     // the device prefix early — then `h` holds the boundary hidden, no
     // logits were produced, and the caller owns the remaining layers.
-    mut layers_run: Option<&mut usize>,
+    layers_run: Option<&mut usize>,
     // Absolute index of layers[0] in the model: KV/GDN mirror keys use
     // `layer_base + li` so a span run (network split) and a full run
     // address the SAME per-layer mirrors.
@@ -16233,7 +16233,7 @@ pub fn forward_token_graph(
                 // overlay, q8_2f's two scale planes) — fetch whole,
                 // device-local.
                 let entry = model.tensors.get(gw.idx)?;
-                if *entry.shape.first()? as usize != rows || *entry.shape.get(1)? as usize != cols {
+                if *entry.shape.first()? != rows || *entry.shape.get(1)? != cols {
                     // A silent refusal here is what made this model look
                     // like the graph "does not work on mobile" for a day:
                     // say which gate closed.
@@ -16375,7 +16375,7 @@ pub fn forward_token_graph(
                     .tensors
                     .get(gate.idx)
                     .and_then(|e| e.shape.first().copied())
-                    .map(|r| r as usize)
+                    .map(|r| r)
                     .filter(|w| *w > 0 && *w <= inter)
                     .unwrap_or(inter);
                 let (Some(gate), Some(up), Some(down)) = (
@@ -16483,7 +16483,7 @@ pub fn forward_token_graph(
             );
         }
     }
-    if let Some(n) = layers_run.as_deref_mut() {
+    if let Some(n) = layers_run {
         *n = lws.len();
     }
     let layers = &layers[..lws.len()];
@@ -17240,7 +17240,7 @@ pub fn forward_token_graph(
         };
     // Two projections of the same input under ONE dispatch. `false` = a
     // kind the paired kernel does not cover, caller keeps `group_mats`.
-    let pair_mats = |enc: &mut wgpu::CommandEncoder,
+    let _pair_mats = |enc: &mut wgpu::CommandEncoder,
                      a: (&GMat, &wgpu::Buffer, usize, usize),
                      b: (&GMat, &wgpu::Buffer, usize, usize),
                      xs: &wgpu::Buffer|
@@ -18412,7 +18412,7 @@ pub fn forward_token_graph(
                             *n_exp as u32,
                             *top_k as u32,
                             *norm_topk as u32,
-                            (hidden as u32) << 8 | u32::from(sg_fold) * 4,
+                            ((hidden as u32) << 8) | (u32::from(sg_fold) * 4),
                         ],
                     );
                     // Per-expert stride in u16 units: q4t is 9 per group flat,
@@ -19299,7 +19299,7 @@ pub fn forward_batch_graph(
                     .tensors
                     .get(lg.idx)
                     .and_then(|e| e.shape.first().copied())
-                    .map(|r| r as usize)
+                    .map(|r| r)
                     .filter(|w| *w > 0 && *w <= inter)
                     .unwrap_or(inter);
                 let (Some(gate), Some(up), Some(down)) = (
@@ -19452,27 +19452,27 @@ pub fn forward_batch_graph(
     let ubuf = rwc(k * inter);
     let abuf = rwc(k * inter);
     // per-position scratch
-    let n1_s = rwc(hidden);
-    let qraw_s = rwc(qdim);
-    let kb_s = rwc(nkv * hd);
-    let vb_s = rwc(nkv * hd);
+    let _n1_s = rwc(hidden);
+    let _qraw_s = rwc(qdim);
+    let _kb_s = rwc(nkv * hd);
+    let _vb_s = rwc(nkv * hd);
     let qout_s = rwc(nh * hd);
     let gout_s = rwc(nh * hd);
     let attn_s = rwc(nh * hd);
     // Split-K attend partials for the per-row attention above 256 positions.
     let pacc_s = rwc(nh * cap.div_ceil(ATTEND_GCK) * hd);
     let pml_s = rwc(nh * cap.div_ceil(ATTEND_GCK) * 2);
-    let qkv_s = rwc(gcdim);
+    let _qkv_s = rwc(gcdim);
     // k rows for the k-looped conv/step twins — row i at i*cdim.
     let cq_s = rwc(k * gcdim);
-    let z_s = rwc(gnv * gdv);
-    let a_s = rwc(gnv);
-    let b_s = rwc(gnv);
+    let _z_s = rwc(gnv * gdv);
+    let _a_s = rwc(gnv);
+    let _b_s = rwc(gnv);
     // Whole-batch a/b planes: one token-axis matvec per layer fills them,
     // and gdn_step reads its token's row via GdnP.tok.
     let a_bb = rwc(k * gnv);
     let b_bb = rwc(k * gnv);
-    let gdo_s = rwc(gnv * gdv);
+    let _gdo_s = rwc(gnv * gdv);
     let invf_b = stor(bytemuck::cast_slice(invf));
     let dummy_hd = stor(bytemuck::cast_slice(&vec![0f32; hd]));
     // KV mirror + GDN state (fresh; batch appends positions pos0..pos0+k).
@@ -20103,8 +20103,8 @@ pub fn forward_batch_graph(
                 let gnorm = stor(bytemuck::cast_slice(norm));
                 bts!(enc, 6);
                 ematb2(&mut enc, qkv, z, &n1, &qkv_b, &z_b, *cdim, nv * dv, hidden);
-                let gc_p = unif(&[*cdim as u32, *kk as u32, 0, 0]);
-                let gd_p = unif(&[
+                let _gc_p = unif(&[*cdim as u32, *kk as u32, 0, 0]);
+                let _gd_p = unif(&[
                     *nv as u32,
                     *dk as u32,
                     *dv as u32,
@@ -20307,7 +20307,7 @@ pub fn forward_batch_graph(
                         *n_exp as u32,
                         *top_k as u32,
                         *norm_topk as u32,
-                        (hidden as u32) << 8 | u32::from(sg_fold) * 4,
+                        ((hidden as u32) << 8) | (u32::from(sg_fold) * 4),
                     ],
                 );
                 // Gate/up stride follows the GU dtype: the mixed profile
@@ -21808,7 +21808,7 @@ fn tp_matmat_impl(
 ) -> Option<wgpu::Buffer> {
     let c = ctx()?;
     let _gate = c.mm_gate.lock().unwrap();
-    let gpr = cols / 32;
+    let _gpr = cols / 32;
     if cols % 32 != 0 || rows == 0 || b == 0 {
         return None;
     }
@@ -21851,10 +21851,7 @@ fn tp_matmat_impl(
     {
         return None;
     }
-    let q_buf = match weight_buffer(c, (model.uid() as usize, idx), &bytes[abs..abs + plen]) {
-        Some(bf) => bf,
-        None => return None,
-    };
+    let q_buf = weight_buffer(c, (model.uid() as usize, idx), &bytes[abs..abs + plen])?;
     let mut sc = c.scratch.lock().unwrap();
     // A resident A operand: the kernel before us left it on the card, so
     // there is nothing to upload and — the point of the exercise —
@@ -23267,7 +23264,7 @@ fn dit_attention_inner(
         // submits and waits between them, so each wall is separable.
         // A measurement mode, not a path: the syncs cost real time.
         let prof = std::env::var("CMF_DIT_ATTN_PROF").is_ok();
-        let mut split_now = |enc: &mut wgpu::CommandEncoder, slot: usize| {
+        let split_now = |enc: &mut wgpu::CommandEncoder, slot: usize| {
             if !prof {
                 return;
             }
@@ -25663,7 +25660,6 @@ fn begin_pass(enc: &mut wgpu::CommandEncoder) -> PassHandle {
     begin_pass_with(enc, None, timestamp_writes)
 }
 
-#[inline]
 // ── Pass merging. A compute-pass boundary costs ~9 µs on this Vulkan
 // stack (measured: 700 one-dispatch passes 9.7 ms against 3.4 ms for
 // the same 700 dispatches in ONE pass), and a token issued 147 of them,
@@ -25801,7 +25797,7 @@ fn begin_pass_with<'a>(
     label: Option<&'a str>,
     timestamp_writes: Option<wgpu::ComputePassTimestampWrites<'a>>,
 ) -> PassHandle {
-    let key = (&*enc).enc_addr();
+    let key = (*enc).enc_addr();
     let merge = timestamp_writes.is_none() && MERGE_KEYS.with(|m| m.borrow().contains(&key));
     if merge {
         // Hand back the open pass if it is this encoder's; otherwise
@@ -26548,7 +26544,7 @@ fn encode_q4_tile_mm_full(
 
 /// The GEMM pipeline to use for this weight layout: the tensor-core one
 /// when the device brought it up, the scalar one otherwise.
-fn mm_pipeline<'a>(c: &'a Ctx, q4tp: bool, two_bit: bool) -> &'a wgpu::ComputePipeline {
+fn mm_pipeline(c: &Ctx, q4tp: bool, two_bit: bool) -> &wgpu::ComputePipeline {
     if two_bit {
         // No cooperative variant: the tensor-core kernel is written
         // against the 4-bit plane, and a shader compiled against a
@@ -32044,7 +32040,7 @@ fn encode_moe_chain_p(
     // Four rows to a workgroup where the layout allows it: the columns give
     // gpr = 128, so a row cannot use more than 64 lanes, and the only width
     // left is overlap between rows. CMF_DSV4_MOE4=0 reverts.
-    let (p_gu, p_dn, l_gu, l_dn) = if g.gu_q2 {
+    let (p_gu, p_dn, _l_gu, _l_dn) = if g.gu_q2 {
         (
             if moe4() {
                 &c.moe_gu_q2tp_m
@@ -32589,7 +32585,7 @@ fn dsv4_layer_frame_enc(
     let state = frame_buf_t(c, 40, tok, hc * dim * 4, true);
 
     // ── constants (model-owned, address keying is sound) ──
-    let qnw = const_buf(c, bytemuck::cast_slice(&w.attn.q_norm[..a.q_lora]));
+    let _qnw = const_buf(c, bytemuck::cast_slice(&w.attn.q_norm[..a.q_lora]));
     let sink = const_buf(c, bytemuck::cast_slice(&w.attn.sink[..a.nh]));
     let freq = const_buf(c, bytemuck::cast_slice(&inv_freq[..a.rd / 2]));
     let ffn_fn = const_buf(c, bytemuck::cast_slice(w.hc_ffn_fn));
@@ -32950,7 +32946,7 @@ fn dsv4_layer_frame_enc(
 /// region walks off the end as the sequence lengthens.
 pub fn dsv4_cache_ensure(kv_id: u64, li: usize, cap: usize) -> bool {
     let Some(c) = ctx() else { return false };
-    if (cap * 4) as u64 > c.device.limits().max_storage_buffer_binding_size as u64 {
+    if (cap * 4) as u64 > c.device.limits().max_storage_buffer_binding_size {
         return false;
     }
     let mut map = c.dsv4_kv.lock().unwrap();
@@ -34715,7 +34711,7 @@ pub fn dsv4_spec_shadow(
         // Staged batches freeze the window until commit, so there is
         // nothing to photograph there any more; only the compressor
         // streams still mutate mid-pass.
-        let dk = 0usize.min(filled.min((filled + batch).saturating_sub(window)));
+        let dk = 0usize;
         let head = if dk > 0 {
             let cache = {
                 let map = c.dsv4_kv.lock().unwrap();
@@ -35362,7 +35358,7 @@ fn dsv4_layer_frame_bt_enc(
                 if n == 0 {
                     return;
                 }
-                let tag = (231 + kind) as u8;
+                let tag = 231 + kind;
                 // The uniform carries (t0, n); the fold position slides with
                 // pos0, so the SAME t0 recurs with a DIFFERENT n — n must be
                 // in the key or a stale shorter uniform silently drops the
@@ -35450,7 +35446,7 @@ fn dsv4_layer_frame_bt_enc(
                     let fr_f = const_buf(c, bytemuck::cast_slice(&inv_freq[..cg.rope_dim / 2]));
                     let bind = cached_bind(
                         c,
-                        ((253 + *kind) as u8, kv_id, li * FRAME_TOK_STRIDE + t),
+                        ((253 + *kind), kv_id, li * FRAME_TOK_STRIDE + t),
                         || {
                             c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                                 label: None,
@@ -40338,7 +40334,7 @@ pub fn dsv4_compressor_frame(
     enc: &mut wgpu::CommandEncoder,
 ) -> Option<usize> {
     let c = ctx()?;
-    let ew = if g.overlap { g.width / 2 } else { g.width };
+    let _ew = if g.overlap { g.width / 2 } else { g.width };
     if g.width == 0 || g.ratio == 0 || g.hidden % 32 != 0 {
         return None;
     }
@@ -40437,7 +40433,7 @@ fn comp_state_step(
     // One pass for the whole compressor step: the copies are dispatches now
     // (`blit`), which is what let them stop cutting the layer into pieces.
     let ape_all = const_buf(c, bytemuck::cast_slice(w.ape));
-    let ape_slot = frame_buf(c, 74 + kind, g.width * 4, true);
+    let _ape_slot = frame_buf(c, 74 + kind, g.width * 4, true);
     let folded = frame_buf(c, 76 + kind, ew * 4, false);
     let normed = frame_buf(c, 78 + kind, ew * 4, false);
     let nw = const_buf(c, bytemuck::cast_slice(&w.norm[..ew]));
@@ -40476,7 +40472,7 @@ fn comp_state_step(
                 &mut pass,
                 c,
                 &ape_all,
-                &csc,
+                csc,
                 1.0,
                 g.width,
                 false,
@@ -40487,7 +40483,7 @@ fn comp_state_step(
         encode_blit_p(
             &mut pass,
             c,
-            &ckv,
+            ckv,
             pend_kv,
             g.width,
             0,
@@ -40497,7 +40493,7 @@ fn comp_state_step(
         encode_blit_p(
             &mut pass,
             c,
-            &csc,
+            csc,
             pend_sc,
             g.width,
             0,
@@ -40618,7 +40614,7 @@ pub fn dsv4_window_append(
     let wb = weight_buffer(c, (model.uid() as usize, wkv), &bytes[abs..abs + plen])?;
 
     let raw = frame_buf(c, 104, hd * 4, false);
-    let kv = frame_buf(c, 105, hd * 4, false);
+    let _kv = frame_buf(c, 105, hd * 4, false);
     window_place(
         c,
         enc,
@@ -41300,7 +41296,7 @@ pub fn dsv4_cache_write(kv_id: u64, li: usize, off: usize, data: &[f32], cap: us
     }
     // Storage buffers have a size ceiling of their own, well under VRAM, and
     // silently refusing at it reads as "no device" from the caller's side.
-    if (cap * 4) as u64 > c.device.limits().max_storage_buffer_binding_size as u64 {
+    if (cap * 4) as u64 > c.device.limits().max_storage_buffer_binding_size {
         tracing::warn!(
             "кеш dsv4: {} МБ превышает предел одного буфера {} МБ — слой остаётся на CPU",
             cap * 4 / (1 << 20),
@@ -42296,7 +42292,7 @@ pub fn dsv4_moe_frame(
     let hc_out = hc_next.map(|(h, next_norm)| {
         let mix_hc = (2 + h.hc) * h.hc;
         let state = frame_buf(c, 40, h.hc * g.hidden * 4, true);
-        let state2 = frame_buf(c, 46, h.hc * g.hidden * 4, true);
+        let _state2 = frame_buf(c, 46, h.hc * g.hidden * 4, true);
         let hpost = frame_buf(c, 43, h.hc * 4, true);
         let hcomb = frame_buf(c, 44, h.hc * h.hc * 4, true);
         let mixes = frame_buf(c, 41, mix_hc * 4, true);

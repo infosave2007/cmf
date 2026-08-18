@@ -1478,7 +1478,7 @@ impl Pipeline {
                 n_routed_experts: moe.num_experts,
                 top_k: moe.top_k,
                 moe_inter: moe.moe_intermediate_size,
-                route_scale: moe.routed_scaling_factor.unwrap_or(1.0) as f32,
+                route_scale: moe.routed_scaling_factor.unwrap_or(1.0),
                 // config.json's `swiglu_limit`, which the header has no
                 // field for. The release ships 10.0; a checkpoint that
                 // retunes it would need this read from the config, so it

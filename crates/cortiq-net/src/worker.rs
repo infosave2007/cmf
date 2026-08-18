@@ -186,7 +186,7 @@ fn serve_one(
     let mut floats: Vec<f32> = Vec::new();
     let mut out: Vec<u8> = Vec::with_capacity(64 * 1024);
 
-    let mut refuse =
+    let refuse =
         |stream: &mut TcpStream, out: &mut Vec<u8>, msg: String| -> Result<(), String> {
             let _ = send_control(stream, out, &Frame::Ack { err: msg.clone() });
             Err(msg)

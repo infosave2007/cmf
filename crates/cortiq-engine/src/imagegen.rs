@@ -254,7 +254,7 @@ pub fn generate(
         // that is where a third of a 512×512 image was hiding.
         let t_stage = std::time::Instant::now();
         let mut marks: Vec<(&str, f32)> = Vec::new();
-        let mut lap = |marks: &mut Vec<(&'static str, f32)>, name: &'static str| {
+        let lap = |marks: &mut Vec<(&'static str, f32)>, name: &'static str| {
             let prev: f32 = marks.iter().map(|(_, v)| v).sum();
             marks.push((name, t_stage.elapsed().as_secs_f32() - prev));
         };

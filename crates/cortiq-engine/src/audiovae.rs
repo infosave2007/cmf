@@ -739,7 +739,7 @@ impl Activation1d {
         // 15-sample margins the reference trims off each end.
         let pad = FILTER_LEN / 2 - 1;
         let pad_l = pad * 2 + (FILTER_LEN - 2) / 2;
-        let pad_r = pad * 2 + (FILTER_LEN - 2 + 1) / 2;
+        let pad_r = pad * 2 + (FILTER_LEN - 2).div_ceil(2);
         let pn = n + 2 * pad;
         let full = (pn - 1) * 2 + FILTER_LEN;
         let mut up = vec![0f32; ch * full];

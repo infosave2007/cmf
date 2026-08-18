@@ -231,7 +231,7 @@ fn wgpu_q4tp_matvec_batch_matches_dequant_reference() {
             let mut got = vec![0f32; b * rows];
             assert!(
                 cortiq_engine::gpu_wgpu::q4tp_matvec_batch_for_test(
-                    &model, idx, &xs, b, rows, cols, &mut got
+                    model, idx, &xs, b, rows, cols, &mut got
                 ),
                 "GPU refused a well-formed batched q4tp matvec ({rows}x{cols}, b={b})"
             );

@@ -3811,7 +3811,7 @@ async fn cmd_run(
         let first_tok: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>> =
             Default::default();
         let ft = first_tok.clone();
-        let mut mark_first = move || {
+        let mark_first = move || {
             let mut g = ft.lock().unwrap();
             if g.is_none() {
                 *g = Some(std::time::Instant::now());
@@ -4161,10 +4161,10 @@ fn wgpu_uploads() -> (f64, f64) {
     #[cfg(feature = "gpu")]
     {
         use std::sync::atomic::Ordering;
-        return (
+        (
             cortiq_engine::gpu_wgpu::UPLOAD_NS.load(Ordering::Relaxed) as f64 / 1e6,
             cortiq_engine::gpu_wgpu::UPLOAD_BYTES.load(Ordering::Relaxed) as f64 / 1e6,
-        );
+        )
     }
     #[cfg(not(feature = "gpu"))]
     {

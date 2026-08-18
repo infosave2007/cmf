@@ -30,7 +30,7 @@ fn main() {
             continue;
         }
         let tp = e.dtype == TensorDtype::Q4TiledP;
-        let (rows, cols) = (e.shape[0] as usize, e.shape[1] as usize);
+        let (rows, cols) = (e.shape[0], e.shape[1]);
         if rows < 64 || cols % 32 != 0 || rows * cols > 40_000_000 {
             continue;
         }
@@ -101,9 +101,9 @@ fn main() {
         .filter(|(_, e)| {
             matches!(e.dtype, TensorDtype::Q4TiledP | TensorDtype::Q4Tiled)
                 && e.shape.len() == 2
-                && e.shape[1] as usize % 32 == 0
+                && e.shape[1] % 32 == 0
         })
-        .map(|(i, e)| (i, e.shape[0] as usize, e.shape[1] as usize))
+        .map(|(i, e)| (i, e.shape[0], e.shape[1]))
         .collect();
     let bytes: usize = all
         .iter()

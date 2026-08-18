@@ -220,7 +220,7 @@ fn split_tiles(input_len: usize, ratio: usize) -> (Vec<usize>, Vec<usize>, Vec<u
         return (vec![0], vec![input_len], Vec::new());
     }
     let mut n = input_len.div_ceil(TILE);
-    let (mut overlaps, mut remaining);
+    let (mut overlaps, remaining);
     loop {
         overlaps = vec![TILE_OVERLAP_MIN; n - 1];
         let total: usize = overlaps.iter().sum();
@@ -1277,37 +1277,6 @@ fn append_frames(out: &mut Vec<f32>, part: &[f32], n: usize, h: usize, w: usize)
     *out = grown;
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tile_schedule_matches_the_reference() {
-        // 288 tall: two 256 tiles, the overlap grown to swallow the slack.
-        let (s, l, o) = split_tiles(288, 16);
-        assert_eq!(s, vec![0, 32]);
-        assert_eq!(l, vec![256, 256]);
-        assert_eq!(o, vec![224]);
-        // 512 wide does not fit in two tiles at the minimum overlap.
-        let (s, l, o) = split_tiles(512, 16);
-        assert_eq!(s, vec![0, 128, 256]);
-        assert_eq!(l, vec![256; 3]);
-        assert_eq!(o, vec![128, 128]);
-        // Anything at or under one tile is one tile.
-        assert_eq!(split_tiles(256, 16).0, vec![0]);
-        assert_eq!(split_tiles(128, 16).1, vec![128]);
-    }
-
-    #[test]
-    fn temporal_constants_come_out_as_the_reference_computes_them() {
-        let ratio_t = 4usize;
-        let chunk = CLIP_LENGTH.div_ceil(ratio_t);
-        assert_eq!(chunk, 5);
-        assert_eq!((chunk - TOKEN_DROP % chunk) % chunk, 2);
-        assert_eq!((ratio_t - CLIP_LENGTH % ratio_t) % ratio_t, 3);
-    }
-}
-
 // ── the encoder, for keyframes only ─────────────────────────────────
 //
 // `fl2va` conditions on a first and/or last frame, and a frame is ONE
@@ -1767,4 +1736,35 @@ fn crop_plane(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tile_schedule_matches_the_reference() {
+        // 288 tall: two 256 tiles, the overlap grown to swallow the slack.
+        let (s, l, o) = split_tiles(288, 16);
+        assert_eq!(s, vec![0, 32]);
+        assert_eq!(l, vec![256, 256]);
+        assert_eq!(o, vec![224]);
+        // 512 wide does not fit in two tiles at the minimum overlap.
+        let (s, l, o) = split_tiles(512, 16);
+        assert_eq!(s, vec![0, 128, 256]);
+        assert_eq!(l, vec![256; 3]);
+        assert_eq!(o, vec![128, 128]);
+        // Anything at or under one tile is one tile.
+        assert_eq!(split_tiles(256, 16).0, vec![0]);
+        assert_eq!(split_tiles(128, 16).1, vec![128]);
+    }
+
+    #[test]
+    fn temporal_constants_come_out_as_the_reference_computes_them() {
+        let ratio_t = 4usize;
+        let chunk = CLIP_LENGTH.div_ceil(ratio_t);
+        assert_eq!(chunk, 5);
+        assert_eq!((chunk - TOKEN_DROP % chunk) % chunk, 2);
+        assert_eq!((ratio_t - CLIP_LENGTH % ratio_t) % ratio_t, 3);
+    }
 }

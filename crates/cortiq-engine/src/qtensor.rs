@@ -10047,7 +10047,7 @@ mod tests {
         // (same contract the fused q8 FFN arm rides on).
         let cols = 96;
         let row: Vec<u8> = (0..cols)
-            .map(|i| ((i as i32 * 37 % 251) - 125) as i8 as u8)
+            .map(|i| ((i * 37 % 251) - 125) as i8 as u8)
             .collect();
         let x: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.13).sin()).collect();
         let act = split_act(&x);
@@ -11178,7 +11178,7 @@ mod tests {
             );
         }
         // matmat (b=2, f32 decode path) must agree too.
-        let x2: Vec<f32> = x.iter().chain(x.iter().map(|v| v)).copied().collect();
+        let x2: Vec<f32> = x.iter().chain(x.iter()).copied().collect();
         let mut gm = vec![0f32; 2 * rows];
         q1t_matmat(&bytes, &x2, 2, rows, cols, &mut gm, None);
         for r in 0..rows {

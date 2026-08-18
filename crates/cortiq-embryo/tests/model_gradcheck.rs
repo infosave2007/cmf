@@ -23,7 +23,7 @@ fn every_tensor_matches_finite_differences() {
     let m = b * t;
     let lay = Layout::new(&cfg);
     let p0 = init_params(&cfg, &lay, 7);
-    let mut gpu = EmbryoGpu::new(cfg.clone(), b, t, &p0).expect("gpu");
+    let gpu = EmbryoGpu::new(cfg.clone(), b, t, &p0).expect("gpu");
     gpu.desc_updates.set(false);
     let tokens: Vec<u32> = lcg_vec(11, m).iter().map(|x| ((x * 0.5 + 0.5) * cfg.vocab as f32) as u32 % cfg.vocab as u32).collect();
     let targets: Vec<u32> = lcg_vec(12, m).iter().map(|x| ((x * 0.5 + 0.5) * cfg.vocab as f32) as u32 % cfg.vocab as u32).collect();

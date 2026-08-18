@@ -763,7 +763,7 @@ mod tests {
         let legacy_scale = f16_to_f32(f32_to_f16(
             w.iter().map(|x| x.abs()).sum::<f32>() / GROUP_SIZE as f32,
         ))
-        .max(6.103_515_625e-5);
+        .max(6.103_515_6e-5);
         let err = |s: f32, c: &[u8]| -> f64 {
             (0..GROUP_SIZE)
                 .map(|i| {

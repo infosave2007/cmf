@@ -5097,7 +5097,7 @@ impl Pipeline {
                     h[bi * hs..(bi + 1) * hs].copy_from_slice(&e);
                 }
                 if let Ok(tp) = std::env::var("CMF_TRACE_POS") {
-                    if let Some(t) = tp.parse::<usize>().ok() {
+                    if let Ok(t) = tp.parse::<usize>() {
                         if t >= start_pos && t < start_pos + ids.len() {
                             let bi = t - start_pos;
                             let row = &h[bi * hs..(bi + 1) * hs];
@@ -5437,7 +5437,7 @@ impl Pipeline {
                 }
             }
             if let Ok(tp) = std::env::var("CMF_TRACE_POS") {
-                if let Some(t) = tp.parse::<usize>().ok() {
+                if let Ok(t) = tp.parse::<usize>() {
                     if t >= start_pos && t < start_pos + b {
                         let bi = t - start_pos;
                         let row = &h[bi * hs..(bi + 1) * hs];
@@ -6085,7 +6085,7 @@ impl Pipeline {
             // Any o1 layer not sealed (or degenerate exact-only) keeps the
             // whole token on the CPU: half-graph forwards would desync.
             let want: usize = (from..upto_excl)
-                .filter(|li| !matches!(self.kv_cache.layers[self.phys_layer(*li)].o1, None))
+                .filter(|li| self.kv_cache.layers[self.phys_layer(*li)].o1.is_some())
                 .count();
             let have = o1_views.iter().filter(|v| v.is_some()).count();
             if want == 0 || have != want {
@@ -6361,7 +6361,7 @@ impl Pipeline {
                             data: &[],
                         },
                         self.weights.embed_tokens.rows(),
-                        self.embed_multiplier as f32,
+                        self.embed_multiplier,
                     )
                 })
         } else {

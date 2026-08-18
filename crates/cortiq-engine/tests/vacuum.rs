@@ -72,8 +72,7 @@ fn equal_keys_case(m: usize, w: usize, sink: usize, rect: O1Rect) -> (f32, f32) 
     let mut s = 0xC0FFEE_u64;
 
     let k0: Vec<f32> = (0..d).map(|_| unif(&mut s)).collect();
-    let ks: Vec<f32> = std::iter::repeat(k0.iter().copied())
-        .take(t)
+    let ks: Vec<f32> = std::iter::repeat_n(k0.iter().copied(), t)
         .flatten()
         .collect();
     let vs: Vec<f32> = (0..t * dv).map(|_| unif(&mut s)).collect();
@@ -154,7 +153,7 @@ pub fn needle_case(m: usize, w: usize, sink: usize, amp: f32, depth: usize, seed
     // a background logit q·k/√d = û·k has unit spread across j. The
     // needle key gets `amp` added along the decode query's direction,
     // which puts its logit exactly `amp` standard deviations up.
-    let mut unit = |s: &mut u64| -> Vec<f32> {
+    let unit = |s: &mut u64| -> Vec<f32> {
         let v: Vec<f32> = (0..d).map(|_| unif(s)).collect();
         let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
         v.iter().map(|x| x / n).collect()

@@ -179,7 +179,7 @@ impl BitWriter {
     fn flush(&mut self) {
         if self.n > 0 {
             let pad = 8 - self.n;
-            self.put(((1u16 << pad) - 1) as u16, pad as u8);
+            self.put((1u16 << pad) - 1, pad as u8);
         }
     }
 }

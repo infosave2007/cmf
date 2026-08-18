@@ -280,7 +280,7 @@ mod tests {
         assert!((out[0] - 1.0 / rms).abs() < 1e-4);
 
         // w = 2 doubles the output — x̂·w, not x̂·(1+w).
-        let out2 = rms_norm(&input, &vec![2.0; 4], 1e-6, NormStyle::Qwen);
+        let out2 = rms_norm(&input, &[2.0; 4], 1e-6, NormStyle::Qwen);
         assert!((out2[0] - 2.0 / rms).abs() < 1e-4);
     }
 

@@ -878,8 +878,8 @@ fn arch_from_md(md: &BTreeMap<String, Val>, tensors: &[GgufTensor]) -> anyhow::R
             .is_some()
             .then(|| gf("final_logit_softcapping"))
             .flatten()
-            .map(|v| v as f64),
-        attn_logit_softcapping: gf("attn_logit_softcapping").map(|v| v as f64),
+            .map(|v| v),
+        attn_logit_softcapping: gf("attn_logit_softcapping").map(|v| v),
         mla: None,
         activation_situ_beta: None,
         activation_situ_linear_beta: None,

@@ -91,8 +91,7 @@ fn spec1d(name: &str, n: usize, v: f32) -> TensorSpec {
         name: name.into(),
         dtype: cortiq_core::TensorDtype::F32,
         shape: vec![n],
-        data: std::iter::repeat(v)
-            .take(n)
+        data: std::iter::repeat_n(v, n)
             .flat_map(|v| v.to_le_bytes())
             .collect(),
     }

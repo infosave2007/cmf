@@ -492,7 +492,7 @@ pub fn recv_msg(
         Err(e) => return Err(format!("wire read: {e}")),
     }
     let len = u32::from_le_bytes(len_bytes);
-    if len < 1 || len > MAX_FRAME {
+    if !(1..=MAX_FRAME).contains(&len) {
         return Err(format!("wire read: frame {len} B outside 1..{MAX_FRAME}"));
     }
     raw.clear();

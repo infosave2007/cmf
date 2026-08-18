@@ -21,7 +21,6 @@
 use anyhow::{Context, bail};
 use cortiq_core::format::{CmfModel, TensorSpec};
 use cortiq_core::quant::dequant_tensor;
-use cortiq_core::types::TensorDtype;
 use cortiq_engine::qtensor::sgemm_public;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -139,7 +138,7 @@ pub fn cmd_awnp(
         let hidden = *model.tensors[idxs[0]]
             .shape
             .get(1)
-            .context("2-D expert weight")? as usize;
+            .context("2-D expert weight")?;
         let x = read_acts(&path, hidden)?;
         let n_rows = x.len() / hidden;
         if n_rows < 2 * hidden {
@@ -182,7 +181,7 @@ pub fn cmd_awnp(
         let mut buf = Vec::new();
         for &ti in idxs {
             let e = &model.tensors[ti];
-            let (rows, cols) = (e.shape[0] as usize, e.shape[1] as usize);
+            let (rows, cols) = (e.shape[0], e.shape[1]);
             buf.clear();
             buf.resize(rows * cols, 0.0);
             dequant_tensor(e, model.entry_bytes(e), &mut buf).map_err(anyhow::Error::msg)?;
@@ -231,7 +230,7 @@ pub fn cmd_awnp(
         // W' = W·Q, scattered back to full width.
         for &ti in idxs {
             let e = &model.tensors[ti];
-            let (rows, cols) = (e.shape[0] as usize, e.shape[1] as usize);
+            let (rows, cols) = (e.shape[0], e.shape[1]);
             buf.clear();
             buf.resize(rows * cols, 0.0);
             dequant_tensor(e, model.entry_bytes(e), &mut buf).map_err(anyhow::Error::msg)?;
