@@ -1149,6 +1149,15 @@ enum Commands {
         /// Decode the soundtrack and write it as a 48 kHz stereo WAV
         #[arg(long)]
         out_audio: Option<String>,
+        /// Start from a still (binary PPM): image-to-video
+        #[arg(long)]
+        image: Option<String>,
+        /// Start from a clip (a directory of frame_*.ppm): video-to-video
+        #[arg(long)]
+        video: Option<String>,
+        /// Hold the given picture fixed and write only its soundtrack
+        #[arg(long)]
+        video_to_audio: bool,
     },
     /// Decode a saved audio latent through the audio VAE and vocoder.
     LtxAudio {
@@ -2056,6 +2065,9 @@ async fn main() -> anyhow::Result<()> {
             out_dir,
             out_latent,
             out_audio,
+            image,
+            video,
+            video_to_audio,
         } => ltxcmd::cmd_ltx_video(ltxcmd::VideoArgs {
             model: &model,
             two_stage,
@@ -2069,6 +2081,9 @@ async fn main() -> anyhow::Result<()> {
             out_dir: out_dir.as_deref(),
             out_latent: out_latent.as_deref(),
             out_audio: out_audio.as_deref(),
+            image: image.as_deref(),
+            video: video.as_deref(),
+            video_to_audio,
         }),
         Commands::LtxAudio { model, latent, out, stats, oracle } => {
             ltxcmd::cmd_ltx_audio(ltxcmd::AudioArgs {

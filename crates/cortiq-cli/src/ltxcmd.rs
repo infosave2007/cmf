@@ -687,6 +687,12 @@ pub struct VideoArgs<'a> {
     pub out_dir: Option<&'a str>,
     pub out_latent: Option<&'a str>,
     pub out_audio: Option<&'a str>,
+    /// A still to start from (PPM), encoded into the first latent frame
+    pub image: Option<&'a str>,
+    /// A directory of PPM frames to condition on
+    pub video: Option<&'a str>,
+    /// Hold the whole picture fixed and write only the soundtrack
+    pub video_to_audio: bool,
 }
 
 /// Prompt in, video out — the whole pipeline in one process and one file.
@@ -736,8 +742,12 @@ pub fn cmd_ltx_video(a: VideoArgs<'_>) -> anyhow::Result<()> {
         geo.af
     );
     let mut rng = Rng::new(a.seed);
+    // Conditioning: whatever picture the caller supplied is encoded into the
+    // model's own latent space and frozen there, and everything else is
+    // generated around it.
+    let cond = build_conditioning(&model, &geo, a.image, a.video, a.video_to_audio, pool.as_deref())?;
     let t1 = std::time::Instant::now();
-    let lat = run_stage(
+    let lat = cortiq_engine::ltxpipe::run_stage_cond(
         &dit,
         &geo,
         &Stage::stage1(),
@@ -745,6 +755,7 @@ pub fn cmd_ltx_video(a: VideoArgs<'_>) -> anyhow::Result<()> {
         &actx,
         ctx_len,
         None,
+        cond.as_ref(),
         &mut rng,
         pool.as_deref(),
         &mut |i, n, secs| println!("  step {i}/{n}  {secs:.1}s"),
@@ -1010,4 +1021,133 @@ pub fn cmd_ltx_audio(a: AudioArgs<'_>) -> anyhow::Result<()> {
         t.elapsed().as_secs_f64()
     );
     Ok(())
+}
+
+/// Encode the caller's picture into the latent space and mark which tokens
+/// the sampler must leave alone.
+fn build_conditioning(
+    model: &Arc<CmfModel>,
+    geo: &cortiq_engine::ltxpipe::Geometry,
+    image: Option<&str>,
+    video: Option<&str>,
+    video_to_audio: bool,
+    pool: Option<&cortiq_engine::pool::Pool>,
+) -> anyhow::Result<Option<cortiq_engine::ltxpipe::Conditioning>> {
+    use cortiq_engine::ltxenc::VideoEncoder;
+    use cortiq_engine::ltxpipe::{Conditioning, patchify_video};
+    if image.is_none() && video.is_none() {
+        return Ok(None);
+    }
+    let enc = VideoEncoder::from_cmf(model).map_err(|e| anyhow!(e))?;
+    let t = std::time::Instant::now();
+    let frames = match (image, video) {
+        (Some(p), _) => read_frames_one(p)?,
+        (_, Some(d)) => read_frames_dir(d)?,
+        _ => unreachable!(),
+    };
+    anyhow::ensure!(
+        frames.h == geo.height && frames.w == geo.width,
+        "conditioning is {}x{} but the render is {}x{}",
+        frames.w,
+        frames.h,
+        geo.width,
+        geo.height
+    );
+    let lat = enc.encode(&frames, pool);
+    println!(
+        "conditioned on {} frame(s) → latent [{}, {}, {}, {}] in {:.1}s",
+        frames.f,
+        lat.c,
+        lat.f,
+        lat.h,
+        lat.w,
+        t.elapsed().as_secs_f64()
+    );
+    let clean = patchify_video(&lat.data, &cortiq_engine::ltxpipe::Geometry {
+        lf: lat.f,
+        lh: lat.h,
+        lw: lat.w,
+        ..*geo
+    });
+    // pad or crop the encoded prefix into the target token grid
+    let mut full = vec![0f32; geo.video_tokens() * 128];
+    let take = clean.len().min(full.len());
+    full[..take].copy_from_slice(&clean[..take]);
+    Ok(Some(if video_to_audio {
+        Conditioning::video_all(geo, &full)
+    } else {
+        Conditioning::video_prefix(geo, &full, lat.f)
+    }))
+}
+
+/// One PPM as a single-frame volume in `[-1, 1]`.
+fn read_frames_one(path: &str) -> anyhow::Result<Vol> {
+    let (rgb, h, w) = read_ppm_f32(path)?;
+    Ok(Vol { c: 3, f: 1, h, w, data: rgb })
+}
+
+/// A directory of `frame_*.ppm` as one volume.
+fn read_frames_dir(dir: &str) -> anyhow::Result<Vol> {
+    let mut paths: Vec<_> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("ppm"))
+        .collect();
+    paths.sort();
+    anyhow::ensure!(!paths.is_empty(), "{dir}: no .ppm frames");
+    let mut data: Vec<f32> = Vec::new();
+    let (mut h, mut w) = (0usize, 0usize);
+    let mut per: Vec<Vec<f32>> = Vec::new();
+    for p in &paths {
+        let (rgb, ph, pw) = read_ppm_f32(p.to_str().unwrap())?;
+        if h == 0 {
+            (h, w) = (ph, pw);
+        }
+        anyhow::ensure!(ph == h && pw == w, "frames differ in size");
+        per.push(rgb);
+    }
+    let f = per.len();
+    // planes are channel-major: [C, F, H, W]
+    for c in 0..3 {
+        for frame in &per {
+            data.extend_from_slice(&frame[c * h * w..(c + 1) * h * w]);
+        }
+    }
+    Ok(Vol { c: 3, f, h, w, data })
+}
+
+/// A binary PPM (P6) into planar RGB in `[-1, 1]`.
+fn read_ppm_f32(path: &str) -> anyhow::Result<(Vec<f32>, usize, usize)> {
+    let raw = std::fs::read(path).with_context(|| path.to_string())?;
+    anyhow::ensure!(raw.starts_with(b"P6"), "{path}: not a binary PPM");
+    let mut fields: Vec<usize> = Vec::new();
+    let mut i = 2usize;
+    while fields.len() < 3 && i < raw.len() {
+        while i < raw.len() && (raw[i] as char).is_whitespace() {
+            i += 1;
+        }
+        if raw[i] == b'#' {
+            while i < raw.len() && raw[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        let start = i;
+        while i < raw.len() && (raw[i] as char).is_ascii_digit() {
+            i += 1;
+        }
+        fields.push(std::str::from_utf8(&raw[start..i])?.parse()?);
+    }
+    i += 1; // the single whitespace after maxval
+    let (w, h) = (fields[0], fields[1]);
+    let px = &raw[i..];
+    anyhow::ensure!(px.len() >= w * h * 3, "{path}: short pixel data");
+    let mut out = vec![0f32; 3 * h * w];
+    for y in 0..h {
+        for x in 0..w {
+            for c in 0..3 {
+                out[(c * h + y) * w + x] = px[(y * w + x) * 3 + c] as f32 / 127.5 - 1.0;
+            }
+        }
+    }
+    Ok((out, h, w))
 }
