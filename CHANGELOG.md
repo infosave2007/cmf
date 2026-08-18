@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.84] - 2026-08-18
+
+Every conditioning mode LTX-2.5 has, and the numbers to justify two of them.
+
+### Added
+
+* **The video VAE encoder** (`ltxenc.rs`) — the decoder run backwards:
+  `patchify(4)`, a causal 3-D convolution, then the checkpoint's own
+  `encoder_blocks` ladder of `res_x` stacks and `SpaceToDepthDownsample`
+  (a stride-1 convolution folded into the channel axis, plus a skip that
+  folds the input the same way and averages each group down to width).
+* **The audio VAE encoder and a log-mel front end** (`ltxaudio.rs`) — a
+  slaney filterbank and a centered Hann STFT, rebuilt because the reference's
+  preprocessing computes them rather than storing them.
+* **Conditioning in the sampler**: `mask[t] = 0` freezes token `t` at its
+  clean value — before the noise, in the velocity, and after every step — and
+  hands the transformer a timestep of zero for it. That single mechanism is
+  every mode: `--image` (image-to-video), `--video` (video-to-video),
+  `--video-to-audio`, `--audio-in` (audio-to-video, audio-to-audio) and the
+  image+audio pairs.
+* A phase profiler behind `CMF_LTX_PROF=1`: where a denoising step actually
+  goes, because guessing at that is how ports stay slow. On an RTX 5090 at
+  672 video tokens it is feed-forward 45-50 %, prompt cross-attention 25-28 %,
+  self-attention 15 %, audio↔video fusion 10 %, and the adaLN and modulation
+  arithmetic together under 1 %.
+
+### Changed
+
+* The per-token work inside a block (ada-zero, the post-SA fold, the gated
+  residuals, the output head) runs on the pool instead of one thread.
+  Together with attention as GEMMs, a step at 384×256 went from 30 s to 19 s
+  on an RTX 5090 and the three-step 768×512 refinement from 580 s to 211 s.
+* Metal windows over the file mapping are built on first use, and a phase can
+  park the device process-wide (`gpu::pause_gpu`). On a 24 GB Mac the prompt
+  encoder uses it: its weights are in a part of the container the denoising
+  loop never touches, and putting both on the driver's books made it evict
+  between commits while the hot loop paid for it.
+
+### Fixed
+
+* `patchify` is `b c (f p) (h q) (w r) -> b (c p r q) f h w` — the *width*
+  offset varies slower than the height one. Getting it backwards does not
+  fail; it encodes a picture as a grid of shuffled tiles.
+
+
 ## [0.5.83] - 2026-08-18
 
 The LTX-2.5 release: text to video, end to end, on the Rust engine.
