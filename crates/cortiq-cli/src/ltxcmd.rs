@@ -896,6 +896,12 @@ pub fn cmd_ltx_video(a: VideoArgs<'_>) -> anyhow::Result<()> {
         write_frames(d, &out)?;
     }
     println!("total {:.1}s", whole.elapsed().as_secs_f64());
+    // `CMF_MM_AB=1` ran both arms of every eligible q4tp GEMM back to back
+    // on the same data; the table is the only device-vs-host comparison a
+    // laptop that drifts between runs can be trusted to give.
+    if cortiq_engine::mm_ab::on() {
+        eprintln!("{}", cortiq_engine::mm_ab::report());
+    }
     Ok(())
 }
 
