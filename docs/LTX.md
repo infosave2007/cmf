@@ -89,6 +89,47 @@ RTX 5090, container in `/dev/shm`, 49 frames at 24 fps:
 | latent upscale | — | 25 s |
 | video VAE | 50 s | 200 s |
 
+## Every mode the model has
+
+LTX-2.5 is one network with two streams; a *mode* is which parts you hold
+fixed. Conditioning is encoded into the model's own latent space and frozen
+there — the sampler is handed a timestep of zero for those tokens and leaves
+them alone — so all of this is the same command with different inputs.
+
+| mode | how |
+|---|---|
+| text → video + sound | `ltx-video --prompt "…" --out-audio track.wav` |
+| text → video | the same, without `--out-audio` |
+| text → sound | the same, keeping only the wav |
+| image + text → video (+ sound) | `--image still.ppm` |
+| video → video | `--video frames/` |
+| video → sound | `--video frames/ --video-to-audio --out-audio track.wav` |
+| sound → video | `--audio-in track.wav` |
+| sound → sound | `--audio-in track.wav --out-audio out.wav` |
+| image + sound → video | `--image still.ppm --audio-in track.wav` |
+
+```bash
+# a still into a shot, with its soundtrack
+ffmpeg -i photo.jpg -vf scale=384:256 -pix_fmt rgb24 still.ppm
+cortiq ltx-video --model ltx25-q4tp.cmf --image still.ppm \
+  --prompt "the camera pushes in slowly as the light shifts" \
+  --height 256 --width 384 --frames 49 --out-dir out/ --out-audio out.wav
+
+# a clip's own soundtrack, written for the picture that is already there
+cortiq ltx-video --model ltx25-q4tp.cmf --video frames/ --video-to-audio \
+  --prompt "footsteps on gravel, distant traffic" \
+  --height 256 --width 384 --frames 49 --out-audio track.wav
+```
+
+The conditioning still must match the render's resolution, and a PPM is what
+the CLI reads — `ffmpeg -i anything.jpg -pix_fmt rgb24 still.ppm` is the
+whole conversion. Frames for `--video` are `frame_0000.ppm …`, exactly what
+`--out-dir` writes.
+
+Image conditioning goes through the video VAE's **encoder**, audio
+conditioning through the audio VAE's, and both are in the same container as
+everything else.
+
 ## The stages, one at a time
 
 Each stage is also a command of its own, which is how the port was gated

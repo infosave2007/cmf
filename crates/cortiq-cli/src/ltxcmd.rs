@@ -693,6 +693,8 @@ pub struct VideoArgs<'a> {
     pub video: Option<&'a str>,
     /// Hold the whole picture fixed and write only the soundtrack
     pub video_to_audio: bool,
+    /// A soundtrack to start from (16-bit WAV): audio-to-video
+    pub audio_in: Option<&'a str>,
 }
 
 /// Prompt in, video out — the whole pipeline in one process and one file.
@@ -745,7 +747,15 @@ pub fn cmd_ltx_video(a: VideoArgs<'_>) -> anyhow::Result<()> {
     // Conditioning: whatever picture the caller supplied is encoded into the
     // model's own latent space and frozen there, and everything else is
     // generated around it.
-    let cond = build_conditioning(&model, &geo, a.image, a.video, a.video_to_audio, pool.as_deref())?;
+    let cond = build_conditioning(
+        &model,
+        &geo,
+        a.image,
+        a.video,
+        a.audio_in,
+        a.video_to_audio,
+        pool.as_deref(),
+    )?;
     let t1 = std::time::Instant::now();
     let lat = cortiq_engine::ltxpipe::run_stage_cond(
         &dit,
@@ -1025,18 +1035,53 @@ pub fn cmd_ltx_audio(a: AudioArgs<'_>) -> anyhow::Result<()> {
 
 /// Encode the caller's picture into the latent space and mark which tokens
 /// the sampler must leave alone.
+#[allow(clippy::too_many_arguments)]
 fn build_conditioning(
     model: &Arc<CmfModel>,
     geo: &cortiq_engine::ltxpipe::Geometry,
     image: Option<&str>,
     video: Option<&str>,
+    audio_in: Option<&str>,
     video_to_audio: bool,
     pool: Option<&cortiq_engine::pool::Pool>,
 ) -> anyhow::Result<Option<cortiq_engine::ltxpipe::Conditioning>> {
     use cortiq_engine::ltxenc::VideoEncoder;
     use cortiq_engine::ltxpipe::{Conditioning, patchify_video};
+    // A soundtrack to build a picture around: the wav is resampled to the
+    // VAE's 16 kHz, turned into the same log-mel its encoder was trained on,
+    // and frozen in the latent the transformer denoises.
+    let audio_cond = match audio_in {
+        None => None,
+        Some(p) => {
+            use cortiq_engine::ltxaudio::{AudioVaeEncoder, read_wav, resample, waveform_to_mel};
+            let t = std::time::Instant::now();
+            let (wave, rate) = read_wav(Path::new(p)).map_err(|e| anyhow!(e))?;
+            let wave = resample(&wave, rate, 16000);
+            let mel = waveform_to_mel(&wave, 16000, 1024, 160, 64);
+            let enc = AudioVaeEncoder::from_cmf(model).map_err(|e| anyhow!(e))?;
+            let lat = enc.encode(&mel, pool);
+            // patchified layout, cropped or zero-padded to the render's length
+            let mut clean = vec![0f32; geo.af * 128];
+            for t in 0..geo.af.min(lat.h) {
+                for c in 0..lat.c {
+                    for m in 0..lat.w {
+                        clean[t * 128 + c * lat.w + m] = lat.data[(c * lat.h + t) * lat.w + m];
+                    }
+                }
+            }
+            println!(
+                "conditioned on {:.2}s of audio → latent [{}, {}, {}] in {:.1}s",
+                wave.t as f64 / 16000.0,
+                lat.c,
+                lat.h,
+                lat.w,
+                t.elapsed().as_secs_f64()
+            );
+            Some(clean)
+        }
+    };
     if image.is_none() && video.is_none() {
-        return Ok(None);
+        return Ok(audio_cond.map(|a| Conditioning::default().with_audio_all(geo, &a)));
     }
     let enc = VideoEncoder::from_cmf(model).map_err(|e| anyhow!(e))?;
     let t = std::time::Instant::now();
@@ -1073,10 +1118,14 @@ fn build_conditioning(
     let mut full = vec![0f32; geo.video_tokens() * 128];
     let take = clean.len().min(full.len());
     full[..take].copy_from_slice(&clean[..take]);
-    Ok(Some(if video_to_audio {
+    let cond = if video_to_audio {
         Conditioning::video_all(geo, &full)
     } else {
         Conditioning::video_prefix(geo, &full, lat.f)
+    };
+    Ok(Some(match audio_cond {
+        Some(a) => cond.with_audio_all(geo, &a),
+        None => cond,
     }))
 }
 

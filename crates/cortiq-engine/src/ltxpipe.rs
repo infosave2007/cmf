@@ -228,6 +228,14 @@ impl Conditioning {
             ..Default::default()
         }
     }
+
+    /// Freeze the whole soundtrack — the sound is given, the picture is what
+    /// is being generated.
+    pub fn with_audio_all(mut self, geo: &Geometry, clean: &[f32]) -> Conditioning {
+        self.audio_mask = vec![0f32; geo.af];
+        self.audio_clean = clean.to_vec();
+        self
+    }
 }
 
 /// Progress callback: `(step, total, seconds for that step)`.
