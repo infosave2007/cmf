@@ -18,6 +18,61 @@ a storage format that also ships a reference CPU runtime. The table
 compares them on the axes people actually ask about, but read the prose
 for the shape each one is really meant for.
 
+## Score out of 100
+
+Eight criteria, each scored 0–100 per format, then weighted. The weights are
+our choice and they are printed so you can change them: the ranking is a
+function of what *you* need, not a property of the formats.
+
+| criterion | weight | CMF | GGUF | safetensors | ONNX | PyTorch | GGML | TensorRT |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Self-contained file (weights + tokenizer + chat template) | 15 | **100** | **100** | 40 | 50 | 30 | 60 | 70 |
+| Integrity & load safety | 10 | **100** | 20 | 60 | 30 | 0 | 20 | 40 |
+| Quantization in the format | 15 | 95 | 95 | 0 | 50 | 30 | 80 | 85 |
+| Runs without an ML framework | 10 | **100** | **100** | 20 | 60 | 0 | **100** | 30 |
+| Hardware reach of the reference runtime | 10 | 80 | **100** | 50 | 85 | 80 | 60 | 30 |
+| Zero-copy mmap load | 10 | **100** | **100** | **100** | 50 | 40 | 90 | 30 |
+| Many specialists from one base | 10 | **100** | 50 | 40 | 10 | 50 | 20 | 40 |
+| Ecosystem, tooling, model availability | 20 | 15 | **100** | **100** | 85 | 95 | 25 | 60 |
+| **Weighted total** | **100** | **80** | **86** | 53 | 56 | 45 | 55 | 52 |
+| *the same without the ecosystem row* | | **97** | 83 | 41 | 48 | 33 | 63 | 50 |
+
+**GGUF wins on the total, and it should.** Twenty of the hundred points are
+ecosystem, and there CMF scores 15 against GGUF's 100: one author, a first
+public release in July 2026, a few dozen published models against thousands.
+That is the honest state of it.
+
+**On the properties of the container itself, CMF leads 97 to 83.** Drop the
+ecosystem row and what remains is per-tensor integrity hashing that no other
+single-file format has, skills that live inside the file under the same hash
+chain, and a quantization ladder that reaches ternary and variable-bit.
+
+Both numbers are true. Pick the one that matches your problem: if you need a
+model to run tonight on hardware someone else has already tested, that is
+GGUF. If you need one auditable file that carries N specialists and proves its
+own integrity, that is what CMF is for.
+
+### How the scores were assigned
+
+- **Self-contained** — 100 requires weights, tokenizer and chat template in
+  one file with no sidecars. ONNX and PyTorch routinely spill weights to
+  external data; safetensors carries tensors only.
+- **Integrity & load safety** — CMF's 100 is the mandatory per-tensor and
+  per-section `hash64` plus `cortiq verify`. safetensors gets 60 for being
+  parse-safe (no pickle execution) without content hashing. PyTorch gets 0:
+  `.pt` is pickle, and loading one can execute arbitrary code.
+- **Quantization** — CMF and GGUF are level at 95: different ladders, both
+  broad and both mixable per tensor. Neither is 100 because both keep adding.
+- **Hardware reach** — GGUF's 100 is CUDA, ROCm, Metal, Vulkan, SYCL and CPU.
+  CMF's 80 is CPU everywhere plus native Metal and wgpu (Vulkan / DX12); there
+  is no CUDA-specific path.
+- **Many specialists** — CMF's 100 is skills stored inside the file, addressed
+  from the same directory, costing zero RAM when unused. GGUF's 50 is external
+  LoRA applied at load. PyTorch's 50 is the PEFT ecosystem, which is large but
+  is not a property of the container.
+- **Ecosystem** — model availability, third-party tools, how likely it is that
+  your problem is already solved by someone else.
+
 ## Feature table
 
 Legend: **Yes** = supported by the format itself; **Partial** = possible

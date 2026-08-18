@@ -2,134 +2,222 @@ English: [README.md](README.md) · Русский: [README.ru.md](README.ru.md)
 
 # CMF — Cortiq Model Format
 
-**一种单文件 LLM 格式——它的注意力内存不再随上下文增长。**
+**一个文件，装着权重、分词器和聊天模板，能自检完整性，且不需要任何 ML 框架就能运行。**
 
 [![CI](https://github.com/infosave2007/cmf/actions/workflows/ci.yml/badge.svg)](https://github.com/infosave2007/cmf/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/cortiq-core.svg)](https://crates.io/crates/cortiq-core)
 [![downloads](https://img.shields.io/crates/d/cortiq-cli.svg)](https://crates.io/crates/cortiq-cli)
 [![docs.rs](https://img.shields.io/docsrs/cortiq-core)](https://docs.rs/cortiq-core)
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/infosave2007/cmf/blob/master/LICENSE)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-一个 `.cmf` 文件把权重、分词器和聊天模板装在一起，能自校验完整性，并直接从磁盘
-内存映射。运行时是一个小巧的 Rust 核心，底下没有任何 ML 框架——不用 torch、不用
-BLAS、不用 ONNX、不用装 CUDA、不用 C++ 工具链——在所有平台上跑 CPU，并开箱即用地
-能通过 wgpu（Vulkan / DX12 / Metal）跑 GPU。转换一个模型只需一条命令，无需 Python。
-
-它的不同之处在于：**只用一个开关，你就能把模型的注意力转换成常量内存的流式
-算子**——无需重训练，权重逐字节不变——于是长对话不再比短对话更费内存。
-
-## 它还能生成画面
-
-同一个容器，同一个二进制文件，推理时同样不需要 Python。
-
-| `cortiq animate` — 视频**连同它的声音** | `--first-frame` — 从一张图继续 |
-|---|---|
-| ![戴厨师帽的柯基在颠煎饼](docs/media/corgi.gif) | ![同一段片子，从一帧静图续出来](docs/media/keyframe.gif) |
-
-512×288，39 帧，**四步采样**，全部出自一个 23.9 GB 的文件。声音不是事后配上去
-的：它和视频在同一条打包序列里去噪，走自己的流匹配时间表，所以出来就是同步的。
-带声音的成片、以及生成第二段所用的那一帧，都放在
-[模型仓库](https://huggingface.co/infosave/MiniMax-H3-Turbo-cmf/tree/main/samples)里；
-[下面的章节](#文本生成视频连同声音minimax-h3--turbo-lora)讲了 124.4 GB 的参考
-实现是怎么变成一个文件的。
-
-| `cortiq imagine` — Lumina-Image 2.0，19 GB 的 diffusers 目录装进 3.2 GB 的 `.cmf` |
-|---|
-| <img src="docs/media/fox-512.png" width="380" alt="雪林中的红狐"> |
-
-不装任何东西就能试：[转换一个模型](https://huggingface.co/spaces/infosave/cmf-converter)、
-[生成一张图](https://huggingface.co/spaces/infosave/cmf-imagine)、
-[看看成片](https://huggingface.co/spaces/infosave/cmf-animate)。
-
-> **关于 Hub 下载计数。** `.cmf` 文件尚未进入 Hugging Face 的下载统计
-> 注册表，因此 CMF 模型仓库即使有真实流量，计数也显示为 `0`。上游修复
-> 等待合并：[huggingface.js#2354](https://github.com/huggingface/huggingface.js/pull/2354)。
+不需要 torch、BLAS、ONNX，不需要装 CUDA，也不需要 C++ 工具链。一个小巧的 Rust
+内核：CPU 到处能跑，GPU 走原生 Metal 和 wgpu（Vulkan / DX12）。权重内存映射、
+就地读取。一个开关就能把模型的注意力换成常量内存算子——不重训，也不改动任何一个
+权重。
 
 ## 上手试试
 
 ```sh
-# prebuilt binary: github.com/infosave2007/cmf/releases/latest
-# or, with a Rust toolchain:
-cargo install cortiq-cli
+cargo install cortiq-cli          # 或者从发布页拿一个预编译二进制
 
 cortiq convert --model Qwen/Qwen3-0.6B --quant q8 --output qwen.cmf
-cortiq run qwen.cmf --prompt "What is the capital of France?" --greedy --no-think
+cortiq run qwen.cmf --prompt "法国的首都是哪里？" --greedy --no-think
 ```
 
 ```console
-Loading model: qwen.cmf
 Ready: qwen3 | Task: general | Sparsity: 0%
-
-Prompt: What is the capital of France?
-
-The capital of France is **Paris**.
+法国的首都是 **巴黎**。
 [10 tokens, 40.1 tok/s, finish: stop]
 ```
 
-**Android**：`aarch64-linux-android` 发布二进制可直接在设备上运行——
-[Termux](https://termux.dev) 或 `adb shell` 中下载后 `chmod +x cortiq`，
-同样的 `convert` / `run` / `serve` 命令即可使用（CPU 路径；wgpu Vulkan
-随附，运行时探针保留胜出的一侧）。0.3.9 带来移动端包：分块 SDOT prefill
-GEMM（便携路径 ×2.1）、Apple 芯片之外的批量因果注意力（池并行 NEON
-micro-GEMM——移动栈上 pp1024 +77%、pp2048 +82%），以及 big.LITTLE 感知的
-线程默认值（能效核不进池）。
+已经有 GGUF？`cortiq import-gguf <文件或仓库> --output model.cmf`。
 
-`convert` 会从 Hugging Face 拉取 checkpoint（分片并行下载）、做量化，并写出一个
-自包含的文件——纯 Rust 实现，不用 torch，不用 numpy。已经有 GGUF 了？
-`cortiq import-gguf <file-or-repo-id> --output model.cmf` 同样能原生读取。
+什么都不用装就能试：[转换模型](https://huggingface.co/spaces/infosave/cmf-converter) ·
+[生成图片](https://huggingface.co/spaces/infosave/cmf-imagine) ·
+[看看视频](https://huggingface.co/spaces/infosave/cmf-animate)
 
-`run` 会套用文件里存着的聊天模板，所以这是一次真正的对话轮次，模型会自行停止。
-Qwen3 是推理模型——去掉 `--no-think`，它会先展示 `<think>` 推理过程。`--raw` 则
-完全跳过模板（续写模式）。`Task` 和 `Sparsity` 反映的是技能覆盖层；没有选中技能
-时它们显示 `general` / `0%`——[技能](#多个专家共用一个骨干)详见下文。
+## 与其他格式的百分制对比
 
-**它能跑你的模型吗？** 目前可原生转换：qwen2 · qwen3 · qwen3.5（包括融合的
-qwen3_next / AgentWorld 布局）· llama · mistral · qwen-moe · gemma / gemma-3
-（GeGLU、sandwich 归一化、512 滑动窗口 + 双 RoPE）· gemma-4 dense 12B/31B
-（双几何注意力：滑动 GQA + 全局 MQA（V=K）、比例 RoPE、逐层标量、最终 logit
-软上限）· phi-3 / phi-4（拆分融合的 qkv/gate_up，longrope 按原生窗口提供）·
-gemma-2（注意力与最终 logit soft-capping、交替滑动/全局层）·
-DeepSeek-R1 蒸馏版（qwen2/llama 布局）——涵盖 dense、MoE 和 GatedDeltaNet。
-还有 DeepSeek-V2 MLA（V2-Lite：潜在注意力展开为 MHA，交错 rope 在
-转换时还原；端到端验证——Paris，ppl 8.8）· gemma-4 MoE 26B-A4B
-（dense+专家双分支 FFN 读取原始 residual，专家尺度在转换时折叠；
-验证门为评分器/解码器一致性——评分器 40/40 复现模型自身的 greedy
-token）· Kimi Linear 48B-A3B（KDA：逐通道衰减的 delta 规则、每投影
-短卷积、sigmoid 门控输出归一化；全注意力层为 NoPE-MLA；tiktoken
-排名表在转换时生成标准 tokenizer.json——端到端验证，98 GB 流式转换
-为 27.7 GB q4t，在 MacBook 上完成）· MiniCPM3（compressed-q MLA
-（q_a→rms→q_b）端到端验证；scale_emb / scale_depth / dim_model_base
-折叠进权重与文件头，longrope 的逐维 short 因子在加载时除入
-inv_freq）。MXFP4 打包的检查点（Kimi-K3 专家）在转换时原生解码。Gemma-3n E4B（E 系列：AltUp 四份隐藏状态副本的
-predict/correct、LAuReL 低秩残差、逐层嵌入、后 15 层 KV 共享、
-gaussian-top-k 激活稀疏——在 E4B-it 上端到端验证）。尚不支持：
-Kimi-K3 独有机制（残差流、latent MoE、MLA 输出门——在 modeling
-代码公开前明确拒绝）。其它模型请试 `import-gguf`——如果它拒绝了，那就是一个
-值得提 issue 的 bug。
+八项标准，各自加权，每个格式按 0–100 打分。完整矩阵和每一格的理由见
+[docs/COMPARISON.zh.md](docs/COMPARISON.zh.md)。
 
-## 接入你现有的工具链
+| | CMF | GGUF | safetensors | ONNX | PyTorch | GGML | TensorRT |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **加权总分 /100** | **80** | **86** | 53 | 56 | 45 | 55 | 52 |
+| *去掉「生态」这一项* | **97** | 83 | 41 | 48 | 33 | 63 | 50 |
 
-`cortiq serve` 说的是 OpenAI API，因此现有的客户端和 SDK 无需改动即可工作——把
-它们指过来就行：
+总分是 GGUF 赢，这很应该：一百分里有二十分是生态，而那一项 CMF 只有 15 分，
+GGUF 是 100 分。一个作者，2026 年 7 月才首次公开发布。
+
+论容器本身的性质，CMF 领先，97 比 83：每个张量都带完整性哈希——别的单文件格式
+都没有；专家模型住在文件内部、共用同一条哈希链；量化阶梯一路做到三值。
+
+两个数字都是真的。如果你要的是今晚就能在别人验证过的硬件上跑起来的模型，那是
+GGUF。如果你要的是一个可审计、装着 N 个专家、并且能自证完整性的文件，那才是这
+个东西。
+
+## 文件里有什么
+
+固定的 128 字节信封，其后各段只能通过它寻址，绝不靠假定的顺序：
+
+| 段 | 内容 |
+|---|---|
+| header JSON | 架构、默认量化、chat bundle、技能注册表、来源信息 |
+| 张量目录 | 56 字节记录：名称、dtype、形状、偏移、字节数、`hash64` |
+| 权重块 | 按页对齐，映射后就地读取 |
+| 技能 | 任务掩码与每个技能的替换张量 |
+| 分词器 | 原封不动的 Hugging Face 文件 |
 
 ```sh
-cortiq serve qwen.cmf --port 8080        # + a web dashboard on /
+cortiq verify model.cmf     # 信封、各段、每一个张量哈希
+cortiq info   model.cmf     # 架构、张量、量化、技能
+cortiq sign   model.cmf     # 基于 SHA-256 的分离式 Ed25519 签名
 ```
+
+一个 `.cmf` 要么有效，要么 `open()` 大声失败——截断和位腐都能被抓住。此外还
+承载：MTP 头、MoE 层、全局与滑窗混合注意力、双 RoPE/YaRN、只追加的技能增长，
+以及切分成 N 个各自独立有效的文件。
+
+**你不会被锁死。** `python/cmf_reader.py` 是一个完整的读取器，约 300 行，只用
+标准库加 numpy，照着规范写成，与 Rust 运行时不共享任何代码：
+
+```python
+from cmf_reader import CmfReader
+r = CmfReader("model.cmf")
+w = r.tensor("model.layers.0.mlp.gate_proj.weight")   # np.ndarray，已反量化
+assert r.verify() == []                               # 所有张量哈希都对得上
+```
+
+规范正文：[docs/CMF_V2_SPEC.zh.md](docs/CMF_V2_SPEC.zh.md)。
+
+## 量化
+
+逐张量、可混用——同一个文件里注意力保持 q8，FFN 压到 q4 完全可以。
+
+| 量化 | 比特/参数 | 说明 |
+|---|---|---|
+| `f16` | 16 | 不量化 |
+| `q8` | 8 | 按行的缩放 |
+| `q8_2f` | 8 | 按行**并且**按列的缩放——同样大小，质量更好 |
+| `q4` · `q4t` | 4.5 | 分块 / 交错瓦片 |
+| `q4tp` | **4.17** | 带预测缩放的 `q4t`——小 7%，误差 +0.1% |
+| `q2tp` | ~2 | MoE 的 2/4 混合档 |
+| `vbit` | ~4.25 | 可变 3–8 比特 |
+| `q1t` | 2.25–3.5 | 免训练三值 + 稀疏离群覆盖层（[文档](docs/Q1T_PTQ.md)） |
+| `q1` | 1.5 | 面向**以二值训练**出来的检查点（Bonsai / BitNet） |
+
+一句话讲 `q4tp`：一个 `q4t` 瓦片为 32 个权重花掉 16 比特存 f16 缩放，占文件的
+11%。把这个缩放改成按行几何阶梯上的 5 比特档位，代价是在行内中位离散度上
+**多 0.1% 的相对误差**。已有文件可以就地转换，不需要原始检查点：
 
 ```sh
-curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
-  "model": "cmf",
-  "messages": [{"role": "user", "content": "Explain mmap in one sentence."}]
-}'
+cortiq requant model.cmf --output model-q4tp.cmf --quant q4tp
+# KAT-Coder-V2.5：12.65 → 11.80 GB（19254 个张量），2 分钟
 ```
 
-`/v1/models`、`/v1/completions` 和 `/healthz` 也都在，流式输出（`"stream": true`）
-可用。`model` 字段是 schema 要求的必填项，但不会拿去匹配任何东西——你的客户端发
-什么就发什么。
+## O(1) 注意力
 
-部署前请如实划定它的适用范围：**请求是串行处理的**（每个模型同一时刻只处理
-一个），而且**没有任何鉴权**——这是一个本地优先的服务器，不是多租户网关。不要把
-它暴露到你不信任的网络上。
+`--o1` 把某一层的 softmax 注意力换成固定大小的状态：几个精确的锚点键、一段精确
+的近期窗口，再加上对更久远内容的地标草图，全部落在同一个共享分母下。**权重不
+变**——这个开关只在文件头里记一条提示。
+
+Qwen3.5-4B（转换了 8 个 softmax 层），Apple M4：
+
+| 上下文 | `--o1 off` | `--o1 all` | 解码 |
+|---:|---:|---:|---:|
+| 543 | 141.0 MB | **124.1 MB** | 15.7 → 16.5 tok/s |
+| 1055 | 174.5 MB | **124.1 MB** | 15.5 → 16.5 tok/s |
+| 4127 | 380.3 MB | **124.1 MB** —— 少 3.1 倍 | 8.2 → 10.7 tok/s |
+
+任何长度都是这个常数。它替掉的 KV 每个 token 大约长 64 KiB，所以两条曲线在约
+290 个 token 处相交：低于此处 `--o1` 反而多花几 MB，高于此处就只有节省。
+
+**代价是什么。** 在留出的 wikitext 上，困惑度在 Qwen3.5-4B 上升到 **1.13 倍**，
+在 Qwen3-0.6B（28 层全转）上升到 **1.30 倍**。模型里 softmax 注意力占比越高，
+代价越大。这是一个「内存换质量」的旋钮，不是白捡的便宜——在你自己的模型上测：
+
+```sh
+cortiq ppl model.cmf --file wiki.txt --o1 all   # 会把精确注意力的基线并排打出来
+cortiq run model.cmf --o1 all|deep12|off        # 或者加载时再决定
+```
+
+`cortiq fcd` 能用一次有界的原生训练把代价找回来一部分——不用 Python，也不用
+ML 框架。
+
+## 对比 llama.cpp
+
+Qwen2.5-0.5B-Instruct，Apple M4，两边都用精确注意力，从全新进程交错运行，各自
+取自己最好的线程数。`cortiq bench --core` 与 `llama-bench` 的口径一致。
+
+| | `llama.cpp` (q8_0) | CMF (q8) | Δ |
+|---|---|---|---|
+| tg128，CPU，他们最好的 `-t 6` | 165.5 tok/s | 151–158 | −5% |
+| tg128，CPU，他们的默认 `-t 4` | 129.4 tok/s | 151–158 | **+18%** |
+| tg128，他们的 Metal `-ngl 99` | 150.9 tok/s | 151–158（CPU） | **CMF 的 CPU ≥ 他们的 GPU** |
+| pp512，CPU | 1168 tok/s | 1017–1051 | −12% |
+| pp512，GPU | 3333–3396 | 2742–3215 | 最好对最好 −5% |
+| 相对自身 f16 的 PPL | 几乎无损 | +0.38% | 相当 |
+| 文件大小 | 644 MB | **479 MB** | **−26%** |
+
+复现：`cortiq bench --json --core`。
+
+## 一个主干，很多专家
+
+要交付 N 个微调模型，通常意味着 N 份完整副本。CMF 只保留一个主干加上每个专家一
+个很小的技能：技能只存它替换掉的那些张量，运行时用它们代替主干的张量，而没被
+用到的技能占用**零内存**。磁盘上是 `|主干| + Σ|技能|`，而不是 `N × |模型|`。
+
+在自己的任务上，技能相对它所依附的主干把困惑度降低 **24.9%**（留出数据，
+[规范 §9](docs/CMF_V2_SPEC.zh.md)）。
+
+```sh
+cortiq skill add ...                            # 从捐赠检查点烘焙
+cortiq run model.cmf --prompt "SELECT ..." --skill sql
+cortiq route model.cmf --prompt "..."           # 或者让它自己选，用 `explain` 看理由
+```
+
+把三个来自公开微调的真实技能烘进一个 0.5B 文件里，连同各种失败模式：
+[docs/SKILLS.zh.md](docs/SKILLS.zh.md)。
+
+**MoE 专家。** 专家的使用与任务强相关——代码和散文路由到几乎不相交的集合
+（top-64 的 Jaccard 只有 0.25）。`cortiq moe-defrag` 会把某个任务从不使用的专家
+物理丢掉：一个 34.7B 的代码模型从 **19.6 GB 降到 12.7 GB（−35%）**，代码困惑度
+只涨 2.8%；在一台 24 GB 的 MacBook 上，完整模型会换页，而这个专家版装得下，解码
+**快 1.8 倍**。`cortiq moe-mask` 则把同样的限制烘成可切换的任务掩码——一个文件，
+`run --task coder`，与物理裁剪逐 token 一致。
+[docs/KAT_CODER.md](docs/KAT_CODER.md)
+
+## 投机解码
+
+带 MTP 头的模型用它来打草稿，然后一次批量提交验证整条链。**对 q4tp 文件的贪心
+解码默认开启。** 一个监视器会把「每轮 token 数」和普通 token 做对比，连输四轮
+就停掉投机、过一阵再试——所以能占到便宜的提示词保住便宜，占不到的就按普通速度走。
+
+- Qwen3.8-27B q4tp，RTX 5090：**76 tok/s，普通路径 48.5**，草稿接受率 90%
+- 同一个模型在 M4 mini（24 GB）：普通 6.7，一段代码 **12.2**；447 token 的提示词 **11.6 秒**出首 token
+- `CMF_VERIFY_I8=0` 让输出与普通路径逐位一致，`CMF_GRAPH_SPEC=0` 关闭投机
+
+这个解码是**卡在总线上**的：同一张卡上两个进程合计 52.8 tok/s，单进程 48.8；把
+matvec 的算术全部剥掉，同一个 token 的耗时相差不到 4%。所以能动的杠杆是少读字
+节，或者把这次读摊到更多 token 上，而不是写更快的 kernel。
+[docs/GPU_KERNEL_RECIPES.md](docs/GPU_KERNEL_RECIPES.md)
+
+## 它还能生成画面
+
+同一个容器，同一个二进制，推理时没有 Python。
+
+| `cortiq animate` —— 视频**连同它的声音** | `--first-frame` —— 从一张图继续 |
+|---|---|
+| ![戴厨师帽的柯基在颠煎饼](docs/media/corgi.gif) | ![同一段视频，从一张静帧续出来](docs/media/keyframe.gif) |
+
+声音不是事后配上去的：它和视频在同一个打包序列里去噪，走自己的流匹配时间表，
+所以出来就是同步的。
+
+- **`cortiq animate`** —— MiniMax-H3 + Turbo LoRA。512×288，39 帧，四步，出自一个 23.9 GB 的文件（参考实现的目录树有 124.4 GB）。一张 RTX 5090：**60.2 秒**。
+- **`cortiq ltx-video`** —— LTX-2.5，21B 的 DiT，带一路联合音频流。八步，或者用 `--two-stage` 换细节。[docs/LTX.md](docs/LTX.md)
+- **`cortiq imagine`** —— Lumina-Image 2.0，19 GB 的 diffusers 目录树装进 **3.2 GB** 的 `.cmf`。M4：256×256、30 步约 37 秒。
+
+<img src="docs/media/fox-512.png" width="340" alt="雪林中的红狐">
 
 ## 在手机上
 
@@ -138,468 +226,43 @@ curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '
 Hugging Face 仓库转换成 CMF，并通过同一套 OpenAI 兼容 API 把已加载的模型提供
 给局域网。
 
-- 功能介绍 — **[huggingface.co/spaces/infosave/cortiq-mobile](https://huggingface.co/spaces/infosave/cortiq-mobile)**
-- 源码 — [github.com/infosave2007/cmfmobile](https://github.com/infosave2007/cmfmobile)（Apache-2.0）
+- 功能介绍 —— **[huggingface.co/spaces/infosave/cortiq-mobile](https://huggingface.co/spaces/infosave/cortiq-mobile)**
+- 源码 —— [github.com/infosave2007/cmfmobile](https://github.com/infosave2007/cmfmobile)（Apache-2.0）
 
-再配合桌面端的 `cortiq worker`，手机就能跑比自身内存更大的模型：实测 34.7B 的
-MoE，在仅剩 2 GB 可用内存的手机上跑到 16.3 tok/s。
+再配合桌面端的 `cortiq worker`，手机就能跑比自身内存更大的模型：34.7B 的 MoE，
+在仅剩 2 GB 可用内存的手机上跑到 **16.3 tok/s**。
 
+## 服务
 
-## 为什么选 CMF
-
-### 不再随上下文增长的注意力
-
-通常，你每往对话里加一个词元，就会往 KV 缓存里永久地添一笔。`--o1` 把某一层的
-softmax 注意力换成一个流式算子，它转而维护一份**固定大小的状态**：若干精确的锚点
-键、一个精确的近期窗口，以及一份覆盖更早内容的地标草图，全部共用同一个 softmax
-分母。转换是瞬时的，而且**权重完全不变**——这个开关只是在 header 里记下一个提示。
-
-实测于 **Qwen3.5-4B**（24 个 GatedDeltaNet 层 + 8 个 softmax 层；`--o1 all` 转换
-其中那 8 个；16 个 query head / 4 个 KV head，head_dim 256；q8_2f）。Apple M4，
-每次运行之间让机器充分降温：
-
-| 上下文 | 注意力内存，`--o1 off` | `--o1 all` | 解码，`off` → `all` |
-|---:|---:|---:|---:|
-| 543 | 141.0 MB | **124.1 MB** | 15.7 → 16.5 tok/s |
-| 1055 | 174.5 MB | **124.1 MB** | 15.5 → 16.5 tok/s |
-| 4127 | 380.3 MB | **124.1 MB** — 少 3.1× | 8.2 → 10.7 tok/s |
-
-**任何上下文长度下都是 124.1 MB**——这正是全部意义所在。它可以拆成两块：循环层的
-一个常量基底，加上顶替 softmax 层 KV 缓存的固定 **18.8 MB**。不这么做的话，那份
-KV 会以约 64 KiB/token 的速度增长，因此两条曲线大约在 **290 词元** 处相交：在此
-之下，`--o1` 要让你多花几 MB；在此之上，它就只有节省——4k 时少 3.1×，按外推 32k
-时约少 17×（状态是常量，所以这个比值会一直往上走；我们实测到 4k——在你自己的机器
-上跑 `cortiq bench model.cmf --ctx 32768`）。
-
-**它的代价。** 草图是一种近似，代价要用质量来付：Qwen3.5-4B 上困惑度上升
-**1.13×**，Qwen3-0.6B（28/28 层全部转换）上升 **1.30×**——这是在留出的 wikitext
-上、经由真实的流式内核、在最苛刻的区段测得的（地标由一段 256 词元的 prefill 封
-定，只对漂移行计分）。模型里 softmax 注意力占得越多，`--o1` 的代价就越大：混合
-架构有循环层来承载长程状态，而纯注意力模型只能让草图独自扛下全部工作。请把
-`--o1` 当作一个内存/质量的旋钮，而不是白捡的便宜。这个代价不会随上下文增长——
-状态也不会。这些都别只听我们说；请测你自己的模型：
+`cortiq serve` 说的是 OpenAI API，现有客户端不用改就能用。
 
 ```sh
-cortiq ppl model.cmf --file wiki.txt --o1 all
+cortiq serve model.cmf --port 8080     # 另外在 / 上有一个网页面板
 ```
 
-它会经由真实的流式内核给转换后的模型打分，并在旁边打印出在完全相同的词元上用
-精确注意力得到的基线，因此这个比值是一次同口径的实测，而不是一句宣称。
-
-如果这个代价对你的场景来说太高，`cortiq fcd` 能用一趟有界的原生训练把其中一部分
-找回来——见 [O(1) 深入解析](#o1-深入解析)。我们还没有为它公布干净的前后对比数字。
-
-把评价轴说清楚：`llama.cpp` 是我们对标的基准。一次同条件对比（2026-07-17：
-Qwen2.5-0.5B-Instruct，Apple M4，双方均为精确注意力，原生 arm64 `llama.cpp`
-master 对 CMF 0.3.9，交替运行、各自独立进程，双方都取各自实测最优线程数——
-它们是 `-t 6`，我们是默认值；CMF 用 `cortiq bench --core` 计时，对应
-`llama-bench` 的核心口径：不含采样器的全词表拷贝，也不含每词元置信度计算）：
-
-| Apple M4 | `llama.cpp` (q8_0) | CMF (q8) | Δ |
-|---|---|---|---|
-| tg128，CPU，它们的最优 `-t 6` | 165.5 ± 0.3 tok/s | 151–158 tok/s | **−5%** |
-| tg128，CPU，它们的默认 `-t 4` | 129.4 ± 0.2 tok/s | 151–158 tok/s | **+18%** |
-| tg128，它们的 GPU（Metal `-ngl 99`） | 150.9 ± 0.4 tok/s | 151–158 tok/s（CPU） | **CMF CPU ≥ 它们的 Metal** |
-| pp512，仅 CPU | 1168 ± 5 tok/s | 1017–1051 tok/s | **−12%** |
-| pp512，GPU prefill 计算图（`CMF_GPU=1`） | 3333–3396 tok/s（Metal） | 2742–3215 tok/s | **它们 CPU 的 2.3–2.8×；最好对最好 −5%，稳态 −18%（同分钟交替）** |
-| pp1024（`CMF_GPU=1`） | — | 2432 tok/s | 曲线不再塌陷（0.3.3 是 390） |
-| pp2048 / pp4096（`CMF_GPU=1`） | — | 2109 / 1651 tok/s | GEMM 注意力随深度扩展 |
-| 量化质量（PPL 对各自 f16，12×512 窗口） | 近乎无损 | +0.38% | 已对齐 |
-| 文件大小 | 644 MB | 479 MB | **−26%** |
-
-两个版本之前这张表还是 tg128 −38%、pp512 −67%。差距是这样合上的：prefill 经
-Accelerate GEMM 跑在 Apple 的 AMX 单元上，并对整个块做 GEMM 加因果掩码
-softmax 的注意力；decode 把采样器的全词表拷贝和每词元置信度计算移出计时循环
-（`--core`；默认的 `bench` 仍然测完整的生产循环）。0.3.6–0.3.7 加入了
-**GPU prefill 计算图**：在 `CMF_GPU=1` 下，整段连续层在每个块内以单次
-Metal 提交执行——ggml 布局的 simdgroup GEMM 直接读 q8 权重、RoPE 与 K/V
-写入缓存镜像融合、双 GEMM 因果注意力（scores → 掩码 softmax → P·V，与
-CPU AMX 路径同构）、FFN 激活融合进 down-GEMM 的操作数加载。每块只等待
-一次，CPU 缓存仍是权威记录。困惑度在 half-GEMM 容差级（+0.16%）。随附
-逐阶段 GPU 剖析器（`CMF_CHUNK_PROF=1`）——正是它发现注意力阶段吃掉块的
-47%，而独立内核基准一直把时间错记在 GEMM 上。Vulkan/DX12（wgpu）路径
-带有同样的分块 GEMM，由运行时探针按机器决定启用。0.3.8 还对 x86
-prefill GEMM（q8 / q4 / q4_tiled / vbit）做了分块：权重瓦片与半字节解包
-在寄存器中跨四路激活流复用——EPYC AVX2 上 +37%（q8）到 ×4.4（q4_block），
-精确一致，`CMF_X86_BLOCKED=0` 可回退。**0.4.0** 将整 token 解码图（Metal）
-从 `q1` 扩展到免训练三值 `q1t` **以及** `q4_block` 投影——于是 14.8B 的
-q1t GDN 混合模型在图上解码快 2.7×，并在 CPU 上胜过同一模型的 `q4`；普通 q4
-模型现在也走这张图（M4 上 3.0 → 5.6 tok/s，此前 q4 没有 GPU 内核）。wgpu
-后端新增了 WGSL 的 `q1t`/`q4_block` matvec 以及 `q1t` prefill GEMM，因此这些
-量化在 NVIDIA / AMD / Intel 上也获得 GPU 加速（已对 CPU 参考实现做校验）。
-
-直线加速赛之外：文件在对齐质量下小 26%，注意力内存可以是 O(1)（`--o1` 在精确
-注意力从 15.7 掉到 8.2 tok/s 的上下文长度下稳在约 16.5），1-bit 训练的模型跑在
-`llama.cpp` 没有对应物的 GPU 计算图上（见「1-bit 模型」），而且整个引擎是可移植
-的 Rust，无需 C++ 工具链。用 `cortiq bench --json` 复现（加 `--core` 即为
-llama-bench 口径）。
-
-### 一个文件，别无附属
-
-分词器（HF byte-level BPE）和聊天模板（Jinja）都随模型一起装在**文件内部**——
-GGUF 也是这么做的，而且这么做是对的：定义聊天行为的是文件本身，而不是你的运行时
-二进制，也就没有附属文件会丢失、会悄悄失去同步。`.cmf` 在此之上加的是完整性：
-固定的 128-byte 信封加上每张量一个 64-bit 哈希，意味着一个 `.cmf` 要么有效，要么
-`open()` 就大声报错。它能检测截断和位腐；它不是签名。
-
-```sh
-cortiq verify model.cmf     # envelope, sections, every tensor hash
-cortiq info   model.cmf     # arch, tensors, quantization, skills
-```
-
-权重经内存映射后就地读取，因此启动是瞬时的，未使用的权重从不进入内存。量化是
-按张量来的，且可以混用——`q8`（1 byte/param）· `q8_2f`（int8，同时带每行和每列
-两个缩放因子——相同字节数下质量更好）· `q4`（0.5）· `q4t`（同样的 4 位网格，
-交错平铺）· `q4tp`（**带预测 scale 的 q4t**——0.52 B/param，见下）· `q1t`
-（**免训练三值**，`{−s,0,+s}` + 稀疏离群值叠加层，约 2.25–3.5 bit/param——低于
-`q4`，用 `quantize-gptq` 生成，在 Metal 与 wgpu 上均有 GPU 加速）· `q1`（1 位）
-· `f16` ·
-`vbit`（可变 3–8 bit，均值约 4.25 ≈ 0.53）——所以你可以在同一个文件里把注意力
-保持在 q8，而把 FFN 压到 q4/q1t。参见 [q1t PTQ](docs/Q1T_PTQ.md)。
-
-#### `q4tp`——任何 q4t 文件小 7%，只花约 0.1% 的误差预算
-
-一个 `q4t` 平铺块要为 32 个权重花 16 位存独立的 f16 scale：占其 4.5 bit/weight
-中的 0.5，即**文件的 11%**。`q4tp` 保持 nibble 逐字节不变，把这个 scale 变成
-按行几何阶梯上的 5 位档位，于是是 4.17 bit/weight。
-
-代价几乎为零。用**同一份** fp32 权重分别量化，`q4tp` 相对源权重的误差是
-9.71%，而 `q4t` 是 9.71%——在 KAT-Coder-V2.5 上实测的行内 scale 跨度中位数处
-相对增加 **0.1%**，在其 90 分位处 0.3%。scale 粗一点几乎无所谓：nibble 会据此
-重新取整，误差始终由 4 位网格主导。Nanbeige-3B 的 top-5 下一 token 顺序不变，
-logit 相差在 0.7% 以内。
-
-已发布的 `.cmf` 可就地转换，无需原始 checkpoint——当模型背后是几十 GB 时这很
-关键：
-
-```sh
-cortiq requant model.cmf --output model-q4tp.cmf --quant q4tp
-# KAT-Coder-V2.5：12.65 → 11.80 GB（19254 个张量），2 分钟
-# Nanbeige-3B：    2.36 →  2.19 GB，峰值 RSS 2.42 → 2.19 GB
-```
-
-`cortiq convert --quant q4tp` 可直接从 HF checkpoint 生成。内核覆盖所有路径——
-CPU（标量、sdot/AVX2/VNNI int8、1×4 分块、Accelerate）、Metal 与 wgpu，解码与
-批量 prefill 皆可。速度持平或更好：16 B 的 nibble 步长是 4 对齐的，因此 matvec
-读四个 `uint`，而 `q4t` 需要九个非对齐 `ushort`；b=64 的批量 GEMM 在 Metal 上是
-9.51 对 10.13 ms，在 wgpu 上是 9.83 对 10.76。
-
-### 多个专家，共用一个骨干
-
-交付 *N* 个微调版本，通常意味着磁盘和内存里各有 *N* 份完整副本。CMF 只保留**一个
-骨干，外加每个专家一个小技能**：技能只存储它实际替换掉的那些张量，推理时运行时会
-*取代*骨干的对应张量去读它们——从不需要单独组装出一个模型。存储开销是
-`|backbone| + Σ|skills|`，而不是 `N × |model|`，而你没用到的技能**不占任何内存**。
-
-技能不只是交付起来更便宜——在它自己的任务上，它还胜过它所依附的骨干：在留出数据
-上，叠加一个技能能把任务困惑度降低 **24.9%**（见[规范 §9](docs/CMF_V2_SPEC.md)）。
-骨干越弱的地方，技能的收益越大；在骨干本来就擅长的领域，预期收益要小一些。
-
-```sh
-cortiq run model.cmf --prompt "SELECT ..." --skill sql
-```
-
-不想手动挑？`cortiq route` 会根据提示词选出技能，`cortiq explain` 会告诉你它为什么
-这么选。
-
-**三条命令即可上手**：[技能指南](docs/SKILLS.zh.md) 用 `cortiq skill add`
-把 Hugging Face 上三个公开微调烘焙成一个 0.5B 文件里的三个真实技能——
-text-to-SQL 助手、俄语助手（俄语散文 PPL 实测 −7.1%）和逐步验证器——
-然后把新鲜提示词 6/6 路由到正确的技能、软混合它们、并在流中切换。
-同一指南还覆盖完整的 DTG-MA 烘焙：训练的任务掩码 + FCD + 物理 defrag
-把 1.6 GB 的检查点变成 **705 MB 的领域专家，在其领域上好 14.7% 且更快**
-——用本运行时在留出文本上端到端实测。命令、测量与踩坑一应俱全。
-
-托管 *N* 个任务专家：
-
-| | N 个完整微调 | 基座 + N 个外部 LoRA | **CMF** |
-|---|---|---|---|
-| 磁盘占用 | N × 完整模型 | 基座 + N 个适配器（附属文件） | 一个骨干 + N 个小技能，**一个文件** |
-| 分词器 + 聊天模板 | 每份副本各带 / 附属文件 | 基座是 GGUF 则内嵌，否则为附属文件 | **内嵌** |
-| 逐张量完整性哈希 | — | — | **有** |
-| 未使用的技能占用的内存 | 已加载 | 配合支持适配器分页的服务端（S-LoRA / vLLM）为 0；否则已加载 | **0**，用到时才分页调入，且不需要任何服务框架 |
-| 技能随模型文件一同交付 | — | 否（适配器是独立文件） | **是，且在同一条哈希链之下** |
-
-完整的逐格式对比——GGUF、safetensors、ONNX、PyTorch、GGML、TensorRT，并把各自的
-取舍讲清楚——见 [docs/COMPARISON.md](docs/COMPARISON.md)。
-
-## 安装
-
-```sh
-cargo install cortiq-cli                 # the `cortiq` command-line tool
-cargo add cortiq-core                    # or use the format from your own Rust code
-```
-
-预编译二进制在[最新发布](https://github.com/infosave2007/cmf/releases/latest)页面
-——Linux x86-64、macOS（Apple Silicon 和 Intel）、Windows（x86-64 和 ARM64）；每个
-压缩包都附带 `.sha256`。自 0.3.1 起内置 wgpu GPU 后端——设置 `CMF_GPU=1`
-即可启用（见 [GPU](#gpu)）。
+`/v1/chat/completions`、`/v1/completions`、`/v1/models`、`/healthz`，支持流式。
+如实划定范围：**请求是串行处理的**，而且**没有鉴权**——这是本地优先的服务器，
+不是多租户网关。
 
 ## 命令
 
 | 命令 | 作用 |
 |---|---|
-| `cortiq convert --model <hf-repo\|dir>` | Hugging Face checkpoint → `.cmf`（纯 Rust） |
-| `cortiq import-gguf <file\|hf-repo>` | GGUF → `.cmf`，覆盖所有常见 ggml 量化类型 |
-| `cortiq run model.cmf` | 对话；或用 `--prompt` 跑单次 |
-| `cortiq serve model.cmf` | 兼容 OpenAI 的 HTTP 服务器 + 仪表盘 |
-| `cortiq info` · `masks` · `verify` | 检视架构、张量、技能；校验完整性 |
-| `cortiq bench --ctx 4096` | 给定上下文下的 tok/s 与内存 |
-| `cortiq ppl --file f.txt` | teacher-forced 困惑度——质量门禁 |
-| `cortiq fcd` | `--o1` 模型的修复训练器（以 KL 锚定，按生成结果把关） |
-| `cortiq diff a.cmf b.cmf` | 两个模型版本之间改了什么 |
-| `cortiq route` · `explain` | 路由器选了哪个技能，以及为什么 |
-| `cortiq skill add` · `list` | 从供体检查点烘焙技能（[指南](docs/SKILLS.zh.md)）；列出文件的技能 |
-| `cortiq moe-defrag` | 丢弃任务从不路由到的 MoE 专家——得到更小更快的专才模型 |
-| `cortiq moe-mask` | 可切换的孪生：把专家限制烘焙为任务掩码——一个文件、多个专才（`run --task`） |
-| `cortiq sign` · `verify` | 对文件 SHA-256 的分离式 Ed25519 签名；verify 同时校验完整性与真实性 |
-| `cortiq compact` | append-only 技能增长后的紧致容器重写 |
-| `cortiq imagine model.cmf --prompt "…"` | 文本 → 图片（Lumina-Image 2.0），纯 Rust，CPU 或 Metal |
-| `cortiq imagine-pack <diffusers-dir>` | 把文本编码器 + DiT + VAE + 分词器打包成一个量化 `.cmf` |
-| `cortiq animate model.cmf --prompt "…"` | 文本 → 视频**连同同步的立体声**（MiniMax-H3 + Turbo LoRA）；`--first-frame`/`--last-frame` 可从一张图继续 |
-| `cortiq animate-pack` | 把音视频 DiT、它的 Qwen3-VL 编码器、两个 VAE 解码器和视觉塔打包成一个 `.cmf` |
+| `convert --model <hf 仓库\|目录>` | HF 检查点 → `.cmf`（原生 Rust） |
+| `import-gguf <文件\|hf 仓库>` | GGUF → `.cmf`，覆盖常见的 ggml 量化 |
+| `run` · `serve` | 对话 / 单次提问；OpenAI 兼容服务器 |
+| `info` · `verify` · `masks` · `diff` | 查看、校验完整性、比较版本 |
+| `bench` · `ppl` | tok/s 与内存；teacher-forced 困惑度 |
+| `requant` · `compact` | 就地更换量化；压紧容器 |
+| `skill add` · `list` · `route` · `explain` | 烘焙、列出并路由专家 |
+| `moe-defrag` · `moe-mask` | 物理丢弃不用的专家，或把它做成可切换的 |
+| `fcd` | 面向 `--o1` 模型的恢复训练器 |
+| `sign` | 分离式 Ed25519 签名 |
+| `imagine` · `animate` · `ltx-video` | 图片、带声音的视频、LTX-2.5 |
+| `imagine-pack` · `animate-pack` · `ltx-pack` | 把参考目录树打包成一个 `.cmf` |
+| `worker` · `peers` | 把层提供给另一台机器；在局域网里找到它 |
 
-`cortiq <command> --help` 里有每个参数的说明。
-
-### 转换
-
-```sh
-cortiq convert --model Qwen/Qwen2.5-0.5B-Instruct --quant q8    --output model.cmf
-cortiq convert --model ./my-hf-checkpoint         --quant q8_2f --output model.cmf
-cortiq import-gguf Qwen/Qwen2.5-0.5B-Instruct-GGUF --output model.cmf --quant q8
-```
-
-GGUF 导入覆盖 `Q4_0/1`、`Q5_0/1`、`Q8_0`、`Q2_K`…`Q6_K`、`IQ4_NL/XS` 和 `BF16`——
-包括 Qwen3.6-MoE / KAT-Coder 一类（`qwen35moe`：GatedDeltaNet 混合 +
-路由专家），llama.cpp 的所有存储约定在导入时都会被还原。一个 34.7B-A3B
-代码模型在 32 核 CPU 上解码 16.6 tok/s，而 llama.cpp 在同一文件上是
-4.7；在 RTX 5090 上达到 **32.8 tok/s**——路由器、top-k 专家选择和所有
-被选中的专家都在单次 submit 的 GPU 计算图内执行（0.5.25）。
-`CMF_MOE_TAU=0.9`（按置信度自适应的专家路由）在 CPU 路径上再加约 12%，
-困惑度不逊于模型自带的固定 top-k。而且专家使用高度依赖任务（代码与散文
-路由到几乎不相交的专家集合——top-64 Jaccard 仅 0.25），`cortiq
-moe-defrag`（0.5.27）会物理丢弃任务从不使用的专家：按代码校准保留 95%
-路由质量后，同一代码模型缩至 **19.6 → 12.7 GB（−35%）**，代码困惑度仅
-+2.8%——在 24 GB 的 MacBook 上，完整模型需要换页，而专才模型完全装进
-内存，解码快 **1.8 倍**（prefill 3.3 倍）。想要一个文件装多个可切换
-专才？`cortiq moe-mask`（0.5.28）把同样的限制烘焙为命名任务掩码——
-完整专家集保留，`run --task coder` 在推理时收窄路由，与物理切除逐
-词元一致。从下载、转换、在 Vulkan 与 Metal 上运行到裁出专才模型的
-分步指南见 [docs/KAT_CODER.md](docs/KAT_CODER.md)。
-
-### 1 位模型（Bonsai / BitNet 一类）
-
-以二值权重**训练**出的检查点可无损转换为 `q1`（1.5 位/权重——每组权重本来
-就只有 ±s 两个取值，编码只是把它们找回来）。27B 变成一个 4.8 GB 的文件，
-在 24 GB 内存的 MacBook 上就能跑——而在 Apple silicon 上，`CMF_GPU=1` 把
-整个词元作为一张 Metal 计算图执行（权重从 mmap 零拷贝，注意力在设备上计算，
-每词元只同步一次）：Bonsai-27B 在 M4 上以 **11–12 tok/s** 解码，首词元约
-3.2 秒（0.3.3 是 5）；Bonsai-1.7B 约 80–87 tok/s。纯 CPU（手机走的
-路径）在同一台机器上为 5–6.6 tok/s（0.3.10 时代的内核受 load 端口限制在
-2.5–3.2；TBL 解包使其翻倍）：Snapdragon 778G 级中端手机估计 2–3 tok/s，
-DRAM 上限约 5。
-
-需要 **cortiq ≥ 0.3.2**——用 `cortiq --version` 检查；旧版本会报
-`unknown quant 'q1'`。更新：`cargo install cortiq-cli --force`（不带
-`--force` 的 `cargo install` 不会更新）或下载
-[最新发布](https://github.com/infosave2007/cmf/releases/latest)。
-
-```sh
-cortiq convert --model prism-ml/Bonsai-27B-unpacked --quant q1 --output bonsai27b-q1.cmf
-CMF_GPU=1 CMF_THREADS=10 cortiq run bonsai27b-q1.cmf -p "What is 84 * 3 / 2?"
-```
-
-注意：`--quant q1` 是显式选项，仅适用于按 1 位训练的模型——对普通检查点做
-PTQ 会毁掉质量。请从 `*-unpacked`（safetensors）仓库转换而不是 GGUF 仓库：
-混合架构（qwen3_5：GatedDeltaNet 线性层 + 每第 4 层全注意力）在原生转换器
-中直接支持；1 位解码计算量大，请把所有核心都给它（10 核机器用
-`CMF_THREADS=10`）。
-
-原生转换器写出的是**骨干**。上文说的那些按技能替换张量和任务掩码，目前仍由
-`converter/` 里的 Python 工具链产出；需要激活 Hessian 的 GPTQ 校准 v-bit 变体也是。
-仅按权重的 v-bit 路径已经是原生的。
-
-### 免训练三值（`q1t`）
-
-`q1` 需要一个以二值*训练*出来的检查点，而 **`q1t` 是后训练路径**：它把一个普通
-的 f16/bf16 检查点压到三值 `{−s,0,+s}`，再加一个逐行的稀疏**离群值叠加层**
-（`(u16 col, f16 val)` 对），按你保留多少离群值落在约 2.25–3.5 bit/param。方法是
-GPTQ 风格的：双字段重要度掩码（`|W|·RMS(x)`）挑出哪些权重必须保持全精度，一个
-稳定输出的逐行重缩放修正残差，而 embed / `lm_head` / `down_proj` 默认保留得更重。
-不需要训练，也不需要激活 Hessian——对几百个 token 做一遍校准就够了。
-
-```sh
-CMF_GPTQ_TERNARY=1 CMF_GPTQ_SKIP=embed_tokens,lm_head,down_proj \
-cortiq quantize-gptq model-q8.cmf --calib corpus.txt --output model-q1t.cmf \
-    --keep 0.03 --tokens 1024
-CMF_GPU=1 cortiq run model-q1t.cmf -p "What is 84 * 3 / 2?"
-```
-
-它带有与内建量化相同的 GPU 加速：Metal 上的整 token 解码图，以及 wgpu 上的 WGSL
-matvec + prefill GEMM（Vulkan / DX12 → NVIDIA / AMD / Intel）。一个 14.8B 的 GDN
-混合模型在 `q1t` 下于 Metal 图上解码比逐算子快 2.7×，并在 CPU 上胜过同一模型的
-`q4`。完整方法、旋钮（`CMF_GPTQ_*`）和质量数字见 [docs/Q1T_PTQ.md](docs/Q1T_PTQ.md)。
-
-### 文本生成图片（Lumina-Image 2.0）
-
-同一个格式、同一个引擎也能跑扩散管线：Gemma-2-2B 编码提示词，Next-DiT
-去噪器跑 flow-matching 循环，FLUX VAE 解码潜变量——全部是原生 Rust，推理
-时没有 Python。`imagine-pack` 把 19 GB 的
-[Lumina-Image 2.0](https://huggingface.co/Alpha-VLLM/Lumina-Image-2.0)
-diffusers 目录折叠成一个 **3.2 GB** 的 `.cmf`（投影用 q4t，VAE 用 f16，
-分词器内嵌），`imagine` 直接在 mmap 上运行它：
-
-```sh
-cortiq imagine-pack ./Lumina-Image-2.0 --quant q4t --out lumina-q4t.cmf
-CMF_GPU=1 cortiq imagine lumina-q4t.cmf \
-    --prompt "a red fox in a snowy forest, photo" \
-    --height 512 --width 512 --out fox.ppm
-```
-
-在 macOS 上，每个带调制的 DiT 块作为单个 Metal command buffer 执行——量化
-GEMM 在 K 循环内解码自己的 tile，注意力 softmax 和 SwiGLU FFN 都留在设备
-上，跨越 CPU 边界的只有 hidden state——VAE 解码器同样跑在 GPU 上（conv2d
-作为 implicit GEMM，整个 resnet 块共用一个 command buffer）。M4 渲染
-256×256 / 30 步约 **37 秒**，512×512 约 2.5 分钟；纯 CPU 大约慢一倍，
-1024×1024 在块图上也变得实用。
-
-在其它平台上，`CMF_GPU=1` 通过 wgpu 运行量化 GEMM 和融合 FFN
-（Vulkan / DX12 → NVIDIA / AMD / Intel，手机上是 Adreno / Mali）：
-RTX 4090 渲染 512×512 的时间**不到**同主机 32 个 CPU 核心所需时间的**一半**。
-GPU 路径与 CPU 的对比探测方式和 LLM 推理完全相同——探测输掉的设备会留在
-CPU 路径上，开启 GPU 永远不会让你更慢——GPU 渲染在视觉上完全一致。面向
-应用，C ABI 导出 `cortiq_imagine`（文本 → RGB8，带每步进度回调）；
-`--cfg 1` 关闭 guidance、工作量减半——是手机上的正确默认值。
-
-### 文本生成视频，连同声音（MiniMax-H3 + Turbo LoRA）
-
-同一个容器里还装着一个音视频联合模型。一个提示词、一个 transformer，出来
-的是一段片子**和与之同步的立体声**：两者在同一条打包序列里、按两套不同的
-流匹配时间表、用四步一起去噪。
-
-```sh
-CMF_MMH3_GPU=1 cortiq animate mmh3-turbo-fl2va-q4tp.cmf \
-    --prompt "A corgi in a chef hat flipping a pancake, sizzling sounds and a cheerful bark." \
-    --width 512 --height 288 --frames 39 --out corgi.avi
-# 改成从一张图继续：
-CMF_MMH3_GPU=1 cortiq animate mmh3-turbo-fl2va-q4tp.cmf \
-    --prompt "…" --first-frame frame.ppm --out clip.avi
-```
-
-四个文件外加一份 ComfyUI 代码——一共 124.4 GB——变成**一个 23.9 GB 的
-`.cmf`**：330 亿参数的 DiT、它的 Qwen3-VL-32B 提示词编码器、ViT3D 视频
-解码器、BigVGAN 声码器、Qwen3-VL 的视觉塔，以及关键帧所需的 VAE 编码器。
-四步 Turbo LoRA 已经合并进去，所以这个文件**就是** turbo 模型。输出是
-AVI 里的 MJPEG+PCM 加一个 `.wav`——JPEG 编码器和 RIFF 封装器都在这个二进制
-文件里，因为一条以调用 ffmpeg 结尾的流水线是没法交付的。
-
-这里的体积缩减大部分并不来自量化。**发布版模型的四成是每个块里的一个
-矩阵**——`adaln_proj.linear`，130 亿参数，而它这个映射的唯一输入是时间步。
-它的输出沿着时间表画出一条曲线，所以 `animate-pack` 把它压到一组秩为 24
-的基上，并且 LoRA 已经折进去了：每块 4.6 MB 而不是 520 MB，误差 rms
-8.7e-5，而信号本身的 rms 是 0.464。
-
-每个栈都在带着发布版真实张量名和真实时间表的玩具检查点上，与 ComfyUI 自己
-的模块逐一比对（`tools/mmh3_toy_gate.sh`）：DiT 速度场 8.8e-5，提示词编码器
-1.1e-6，视频解码器 4.2e-7（含它那 256 像素的分块），声码器 1.7e-9，视觉塔
-6.2e-6。512×288、39 帧，在 48 个 CPU 核上需要 346.5 秒，在一块 RTX PRO 6000
-上需要 **172.0 秒**——这个模型的设备分支需要显式打开，所以上面写了
-`CMF_MMH3_GPU=1`。权重和模型卡：
-[infosave/MiniMax-H3-Turbo-cmf](https://huggingface.co/infosave/MiniMax-H3-Turbo-cmf)。
-
-## O(1) 深入解析
-
-可以在转换时把提示记进文件，也可以在加载时再决定——运行时会自动读取 header 里的
-提示：
-
-```sh
-# at convert time: all softmax layers, the deepest N, or an explicit list
-cortiq convert --model Qwen/Qwen3-0.6B --quant q8 --o1 all    --output model.cmf
-cortiq convert --model Qwen/Qwen3-0.6B --quant q8 --o1 deep12 --output model.cmf
-
-# or override at load time, without reconverting
-cortiq run   model.cmf --o1 all      # force-convert every softmax layer
-cortiq run   model.cmf --o1 off      # back to exact attention
-cortiq bench model.cmf --ctx 4096    # memory + tok/s, with and without
-CMF_O1=deep6 cortiq serve model.cmf  # env override, same syntax
-
-# tuning (validated defaults: 32 landmarks, window 128, 4 anchor keys)
-cortiq run model.cmf --o1 all --o1-m 32 --o1-window 128 --o1-sink 4
-```
-
-在混合模型上（例如 qwen3.5：GatedDeltaNet 层中夹着 softmax 孤岛），`--o1 all` 只
-转换那些 softmax 层，这就让整个模型的注意力状态在上下文长度上成为常量。
-
-**修复。** `cortiq fcd` 是一趟有界的原生训练——不用 Python，不用 ML 框架——它只
-调整被转换层的 norm/FFN 张量，对齐目标是同一个模型跑精确注意力时的输出（以 KL
-锚定），并且只有在长上下文生成没有陷入循环时才保留 checkpoint：
-
-```sh
-cortiq fcd model.cmf --corpus corpus.txt --gen-check --gen-gate --out model.fcd.cmf
-# knobs: --steps 300 --eval-every 25 --kl 0.7 --lr 5e-5 --o1 all|deepN|i,j,k
-#        --val-corpus val.txt --gate-threshold 0.35 --gate-slack 0.10
-```
-
-## 格式
-
-一个 `.cmf` 是一个固定的 128-byte 信封，后面跟着若干区段；读取方**只**通过这个
-信封来定位它们，绝不靠假设顺序：
-
-- **header JSON**——架构、量化默认值、聊天捆绑包、技能注册表、来源信息
-- **张量目录**——56-byte 的二进制记录（name、dtype、shape、offset、nbytes、hash64），不碰 JSON 也能读
-- **权重 blob**——页对齐，映射后就地读取
-- **技能**——位打包的任务掩码和按技能的替换张量
-- **分词器**——原封不动的 Hugging Face 文件
-- **稀疏索引**——预先算好
-
-此外还支持：多词元预测（MTP）头、MoE FFN 层、仅追加式的技能增长与压实，以及把一个
-模型分片到 `N` 个各自独立有效的文件中。
-
-**你不会被锁死。** `python/cmf_reader.py` 是一个完整的读取器，约 300 行，只用
-stdlib + numpy，与 Rust 运行时不共享任何代码——它是刻意照着规范写出来的，为的是
-证明这个格式活得比这份实现更久：
-
-```python
-from cmf_reader import CmfReader
-r = CmfReader("model.cmf")
-w = r.tensor("model.layers.0.mlp.gate_proj.weight")   # np.ndarray, dequantized
-assert r.verify() == []                               # every tensor hash checks
-```
-
-就算这个项目明天消失，仅凭规范你的权重依然读得出来。完整的规范性说明见
-[docs/CMF_V2_SPEC.md](docs/CMF_V2_SPEC.md)。
-
-## 现状
-
-CMF 目前是 **0.2.x**，还很年轻——2026 年 7 月首次公开发布，作者只有一个人。在 1.0
-之前，crate 的 API 仍可能变动。已经定下来的是**格式**：它是 v2，读取方只通过信封
-来定位，未知的 header 字段会被忽略（增量式演进），破坏性变更要付出一个 feature bit
-或一次 `version` 递增的代价——绝不会悄悄改变含义。今天写出的 `.cmf` 以后依然读得
-出来；`cortiq verify` 就是这份契约。每一处改动都记在 [CHANGELOG.md](CHANGELOG.md)。
-
-Bug 和功能请求：[提一个 issue](https://github.com/infosave2007/cmf/issues)。
-安全问题：**不要**公开提 issue——见 [SECURITY.md](SECURITY.md)。
-转换不了的模型是一份 bug 报告，不是用户的错。
-
-## 从源码构建
-
-```sh
-cargo build --release --workspace   # CLI 的 wgpu 后端（Vulkan / DX12 / Metal）默认开启
-cargo build --release -p cortiq-cli --no-default-features   # 纯 CPU 构建
-```
-
-```
-crates/
-  cortiq-core     format reader: envelope, directory, quant, masks, mmap
-  cortiq-engine   portable CPU/GPU inference runtime, tokenizer, chat, skills
-  cortiq-server   OpenAI-compatible HTTP serving
-  cortiq-cli      the `cortiq` command-line tool
-converter/        Python: DTG-MA skills/masks + the GPTQ-calibrated v-bit path
-python/           reference reader — stdlib plus numpy, nothing else
-docs/             format specification and comparison
-```
-
-欢迎贡献——见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+`cortiq <命令> --help` 会说明每一个开关。
 
 ## GPU
 
@@ -607,71 +270,89 @@ docs/             format specification and comparison
 CMF_GPU=1 cortiq run model.cmf
 ```
 
-后端自动选择：wgpu 在 Linux/Windows 上用 Vulkan，Windows 无 Vulkan 时用 DX12，
-macOS 上用 Metal——无需任何配置（`WGPU_BACKEND=vulkan|dx12|metal|gl` 可覆盖）。
-权重按预算驻留 VRAM（`CMF_GPU_VRAM_MB`，独立显卡默认 8192）；各层按首次访问
-顺序驻留，因此预算的行为等价于 llama.cpp 的 `-ngl`，但无需参数：前 N 层在
-GPU，其余在 CPU。
+后端自动选择——Linux/Windows 上是 Vulkan，DX12 作后备，macOS 上是 Metal。
+**打开 GPU 绝不会让你变慢**：对每一类算子，引擎在启动时把两条路都测一遍，留下
+更快的那条（`CMF_GPU_PROBE=0` 表示无条件信任设备）。
 
-在 macOS 上，`q1`、`q1t` 和 `q4_block` 模型把整个词元作为一张 Metal 计算图执行
-（0.4.0 把它从 `q1` 扩展开，所以普通 q4 模型也能用）：隐藏状态在所有层
-间常驻设备，注意力**在 GPU 上**计算（rope、qk 归一化、KV 追加、分组在线
-softmax attend），command buffer 一编码完就提交——每词元只等待一次。KV 缓存
-的所有者仍是 CPU，驱逐、投机回滚和序列化的行为与 CPU 路径完全一致。计算图与
-CPU 路径在分布上等价（首词元概率相差约 0.3% 以内，PPL 一致），但不保证每个
-提示词都逐位相同——浮点归约顺序不同，任何 GPU offload 都是如此。
-`CMF_GPU_ATTEND=0` 把注意力留在 CPU，`CMF_GPU_BLOCK=0` 关闭计算图。
-0.5.35 起 `q4_tiled` 也进入该列表——解码计算图和批量预填充都支持。
+无论 Metal 还是独立显卡，整个 token 都作为一张图执行、只回读一次：隐藏状态在所
+有层之间都留在设备上，注意力也在设备上算，路由式 MoE 的路由器、top-k 选择和被
+选中的每一个专家都在同一次提交里跑完。实测：
 
-0.5.35 起，Metal 解码注意力改为 flash-decoding 形态：同一 threadgroup 的
-各 simdgroup 分摊一个头的位置，再通过 threadgroup 内存合并部分结果
-（`CMF_GQA_SPLIT`，默认 8），因此深上下文下吞吐不再崩塌；整个注意力层在
-**一个** compute encoder 内完成。Looped Transformer 的提示词摄入改走批量
-chunk-GEMM，而不是逐位置计算图。在**无风扇的 MacBook Air（M4，10 核 GPU，
-24 GB）** 上，循环式 Nanbeige4.2-3B——22 个物理层跑两遍，即每词元 44 次层
-计算、3.9 GB 权重读取——短上下文解码 **22.4 tok/s**，ctx 512 为 17.6，
-ctx 1024 为 14.2，提示词摄入 **181 tok/s**（512 词元提示 2.7 秒出首字）。
-这已是该机 120 GB/s 内存带宽理论上限的约 72%；0.5.35 之前同一文件在
-ctx 512 只有 9 tok/s，摄入提示需要 40 秒。
+| | |
+|---|---|
+| Bonsai-27B q1，RTX 4090 | **40 tok/s**（是其 CPU 路径的 7.7 倍），4K 上下文仍有 38 |
+| KAT-Coder 34.7B-A3B，RTX 5090 | **32.8 tok/s**，其 32 核宿主 CPU 是 14.4 |
+| Nanbeige4.2-3B，无风扇 MacBook Air M4 | **22.4 tok/s**，提示词吞吐 181 tok/s |
 
-在独立显卡上（通过 wgpu 的 Vulkan/DX12），0.5.18 默认运行同样的整词元
-计算图：所有层——包括混合模型的 GDN 递归和 Looped Transformer 的循环
-边界——在一次 submit 中执行，每词元只回读一次；注意力采用 split-K
-flash-decoding，深上下文下吞吐不塌。RTX 4090 实测：Bonsai-27B q1 解码
-**40 tok/s**（CPU 路径的 7.7 倍，4K 上下文仍有 38），Bonsai-1.7B q1
-154 tok/s（到 ctx 2048 仍有 95+），Nanbeige4.2-3B 31 tok/s。自 0.5.25
-起，路由 MoE 也在同一计算图内：路由器 matvec、设备端 top-k 选择和每个
-被选中的专家（含共享专家）都在同一次 submit 中执行——KAT-Coder
-34.7B-A3B 在 RTX 5090 上解码 **32.8 tok/s**，同机 32 核 CPU 为 14.4
-（[分步指南](docs/KAT_CODER.md)）。输出与 CPU
-路径分布等价，与 Metal 计算图相同。`CMF_GPU_WGPU_GRAPH=0` 回退到逐操作
-offload。
+输出与 CPU 路径在分布上等价，但不是逐位相同——浮点归约的顺序不一样，任何 GPU
+卸载都是如此。
 
-除此之外，开启 GPU 不会让你变慢：逐操作 offload 要付固定的 submit+poll
-延迟，而它在不同驱动栈之间相差一个数量级，所以引擎启动时*实测*——对每类操作
-（FFN 链、大 matvec、prefill GEMM、QKV 批量）最初几次调用在 GPU 与 CPU 之间
-交替计时，之后走更快的那条路。`RUST_LOG=cortiq_engine=info` 显示判定；
-`CMF_GPU_PROBE=0` 无条件信任 GPU。
+**多张 GPU** —— 两个开关对应两个不同的问题。`serve --gpus N` 在每张卡上放一份
+完整副本（2×RTX 5090，34.7B 的 MoE：单请求 115.3 tok/s，两个请求合计
+**218.5**）。`run --gpus N` 把层栈切开分到多张卡上，是给比单卡更大的模型用的
+——它买到的是空间而不是速度，对本来就装得下的模型还要倒贴几个百分点。`--peer`
+把同样的切分放到网络上。[docs/MULTI_GPU.md](docs/MULTI_GPU.md)
+
+## 你的模型能跑吗？
+
+原生转换支持：qwen2 · qwen3 · qwen3.5（含融合后的 qwen3_next）· llama ·
+mistral · qwen-moe · gemma / gemma-2 / gemma-3 · gemma-4 稠密 12B/31B 与 MoE
+26B-A4B · gemma-3n E4B · phi-3 / phi-4 · DeepSeek-R1 蒸馏版 · DeepSeek-V2 MLA ·
+Kimi Linear 48B-A3B · MiniCPM3 · MXFP4 打包的检查点。暂时不支持：Kimi-K3 独有的
+那部分，要等它的建模代码公开。
+
+其他的——试试 `import-gguf`。如果它拒绝了，那是一个值得提的 bug。
+
+## 安装与构建
+
+```sh
+cargo install cortiq-cli                 # 命令行工具
+cargo add cortiq-core                    # 或者在你自己的 Rust 代码里用这个格式
+
+cargo build --release --workspace                            # 默认带 wgpu 后端
+cargo build --release -p cortiq-cli --no-default-features    # 纯 CPU
+```
+
+预编译二进制覆盖 Linux x86-64、macOS（Apple Silicon 与 Intel）、Windows
+（x86-64 与 ARM64）以及 `aarch64-linux-android`，每个都附 `.sha256`：
+[最新发布](https://github.com/infosave2007/cmf/releases/latest)。
+
+```
+crates/cortiq-core     格式读取：信封、目录、量化、掩码、mmap
+crates/cortiq-engine   可移植的 CPU/GPU 运行时、分词器、对话、技能
+crates/cortiq-server   OpenAI 兼容的 HTTP 服务
+crates/cortiq-cli      `cortiq` 命令
+python/                参考读取器——只用标准库和 numpy
+docs/                  规范、对比、模型实操
+```
+
+## 状态
+
+**格式是已经定下来的那部分。** 它是 v2：读取器只通过信封寻址，文件头里不认识的
+字段一律忽略，破坏性变更要付出一个特性位或者一次版本号提升的代价——绝不会悄悄
+改变含义。今天写出的 `.cmf` 以后仍然读得出来，而 `cortiq verify` 就是这份契约。
+
+各 crate 的 API 在 1.0 之前还可能变动。首次公开发布是 2026 年 7 月，作者一人。
+所有变更都在 [CHANGELOG.md](CHANGELOG.md)。
+
+Bug 与需求：[提 issue](https://github.com/infosave2007/cmf/issues)。
+安全问题：**请不要**公开提 issue，见 [SECURITY.md](SECURITY.md)。
+转换不了的模型是 bug 报告，不是用户的错。
+
+> **关于 Hub 的下载计数。** `.cmf` 文件还没被纳入 Hub 的下载统计注册表，所以
+> CMF 仓库即使有真实流量也显示 `0`。上游修复待合并：
+> [huggingface.js#2354](https://github.com/huggingface/huggingface.js/pull/2354)。
 
 ## 许可
 
-**Apache-2.0**（[LICENSE](LICENSE)）——随你使用、修改，也可用于商业发布。
+**Apache-2.0**（[LICENSE](LICENSE)）——随便用、随便改、也可以商业分发。
 
-本软件实现了作者四项美国在审专利申请所主张的方法，清单见 [PATENTS.md](PATENTS.md)。
-Apache-2.0 第 3 条向你授予一份永久、全球范围、免版税的专利许可，覆盖本代码按其
-分发形式必然涉及的那些权利要求：**运行、fork 和发布本软件都在覆盖范围内**，而
-这份授予只有在你就专利起诉本项目时才会失效。
+本软件实践了作者四项在审美国专利申请中主张的方法（[PATENTS.md](PATENTS.md)）。
+Apache-2.0 第 3 条授予你一份永久、全球、免版税的许可，覆盖本软件在分发形态下
+必然触及的那些权利要求：**运行、fork 和分发本软件都在覆盖范围内**，该授权只在
+你就专利起诉本项目时失效。这份授权的范围是本作品本身；如果你要用别的语言独立
+实现这个容器，请发邮件到 urevich55@gmail.com——可以提供给实现者的授权。
 
-这份授予的范围限于本“作品”（Work），Apache-2.0 §3 向来如此——它本身并不延伸到对
-该容器的独立重新实现。如果你想用另一种语言实现 CMF，或把它嵌进你自己的运行时，
-请发邮件到 urevich55@gmail.com：面向实现者的授权是可以提供的，而这个格式本就希望
-被广泛实现。
-
-## 它从何而来
-
-这些设计思路来自作者另一项独立的物理理论工作——零矢量引力（NVG）框架下的真空质量
-分数（VMF）：共享骨干加扰动的模型，以及双字段量化。格式里没有任何东西依赖于那套
-理论是否正确；它立足于规范和上面那些数字。完整的映射，并在*已测量*与仍属隐喻者
-之间划下硬界线：[CMF 背后的 VMF/NVG 原理](VMF_principles_in_CMF.zh.md)
+设计的来处，并且在「已测量的」和「仅是比喻的」之间划了硬线：
+[CMF 背后的 VMF/NVG 原则](VMF_principles_in_CMF.zh.md)
 （[English](VMF_principles_in_CMF.md) · [Русский](VMF_principles_in_CMF.ru.md)）。
-物理本身则在[它自己的仓库](https://github.com/infosave2007/vmf)里。
