@@ -380,7 +380,7 @@ fn gemm_nt_cpu(
         // blocking expressed as `for l in 0..8 { t += x[l] * w[l] }` lost
         // the vectorisation that `dot_f32` already had and ran the whole
         // render from 90 s to 168.
-        let o = 0usize;
+        let mut o = 0usize;
         #[cfg(target_arch = "x86_64")]
         if gemm_avx512() {
             while o + 4 <= m {

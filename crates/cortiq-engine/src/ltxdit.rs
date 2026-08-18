@@ -595,6 +595,49 @@ fn affine_rows(
     });
 }
 
+
+/// Where a denoising step actually goes. `CMF_LTX_PROF=1` prints the split
+/// once per forward: guessing at this is how ports stay slow.
+#[derive(Default)]
+struct Prof {
+    on: bool,
+    t: [f64; 6],
+}
+
+const P_ADALN: usize = 0;
+const P_SELF: usize = 1;
+const P_CROSS: usize = 2;
+const P_FUSE: usize = 3;
+const P_FF: usize = 4;
+const P_MOD: usize = 5;
+
+impl Prof {
+    fn new() -> Prof {
+        Prof { on: std::env::var("CMF_LTX_PROF").is_ok(), t: [0.0; 6] }
+    }
+    #[inline]
+    fn tick(&mut self, slot: usize, at: std::time::Instant) -> std::time::Instant {
+        if self.on {
+            self.t[slot] += at.elapsed().as_secs_f64();
+            return std::time::Instant::now();
+        }
+        at
+    }
+    fn report(&self) {
+        if !self.on {
+            return;
+        }
+        let names = ["adaln", "self-attn", "cross-attn", "a<->v", "ffn", "modulate"];
+        let total: f64 = self.t.iter().sum();
+        let parts: Vec<String> = names
+            .iter()
+            .zip(&self.t)
+            .map(|(n, v)| format!("{n} {v:.1}s ({:.0}%)", 100.0 * v / total.max(1e-9)))
+            .collect();
+        println!("  profile: {}", parts.join("  "));
+    }
+}
+
 // ----------------------------------------------------------------- block
 
 struct Stream {
@@ -853,7 +896,9 @@ impl LtxDit {
         let vmask = (!video.context_mask.is_empty()).then_some(&video.context_mask[..]);
         let amask = (!audio.context_mask.is_empty()).then_some(&audio.context_mask[..]);
 
+        let mut prof = Prof::new();
         for (bi, blk) in self.blocks.iter().enumerate() {
+            let mut pt = std::time::Instant::now();
             let v_msa = vt.triples(&blk.video.sst, dim, 0);
             let v_ca = vt.triples(&blk.video.sst, dim, 6);
             let v_mlp = vt.triples(&blk.video.sst, dim, 3);
@@ -862,8 +907,10 @@ impl LtxDit {
             let a_mlp = at.triples(&blk.audio.sst, a_dim, 3);
 
             // ---- video: self-attention, then prompt cross-attention ----
+            pt = prof.tick(P_ADALN, pt);
             let mut vnorm = vec![0f32; n * dim];
             ada_zero_rows(&vx, &mut vnorm, n, dim, &v_msa, &vt.idx, pool);
+            pt = prof.tick(P_MOD, pt);
             if bi == 0 {
                 trace("v.b0.sa.in", &vnorm);
             }
@@ -874,6 +921,7 @@ impl LtxDit {
             if bi == 0 {
                 trace("v.b0.sa.out", &vsa);
             }
+            pt = prof.tick(P_SELF, pt);
             let mut vnormed = vec![0f32; n * dim];
             post_sa_rows(&mut vx, &vsa, &mut vnormed, n, dim, &v_msa, &vt.idx, pool);
             let mut vq = vec![0f32; n * dim];
@@ -886,6 +934,7 @@ impl LtxDit {
                 trace("v.b0.ca.out", &vca);
             }
             add_gated(&mut vx, &vca, n, dim, &v_ca, &vt.idx, pool);
+            pt = prof.tick(P_CROSS, pt);
 
             // ---- audio: the same two steps ----
             let mut anorm = vec![0f32; m * a_dim];
@@ -912,6 +961,7 @@ impl LtxDit {
                 trace("a.b0.ca.out", &aca);
             }
             add_gated(&mut ax, &aca, m, a_dim, &a_ca, &at.idx, pool);
+            pt = prof.tick(P_CROSS, pt);
 
             // ---- audio ↔ video, both directions off the pre-fusion state ----
             let vx_pre = vx.clone();
@@ -944,6 +994,7 @@ impl LtxDit {
             }
             let gate_v2a = gate_row(&blk.sst_a2v_audio, a_dim, agt.row(0));
             add_scaled(&mut ax, &v2a, m, a_dim, &gate_v2a, pool);
+            pt = prof.tick(P_FUSE, pt);
 
             // ---- feed-forward ----
             let mut vsc = vec![0f32; n * dim];
@@ -962,9 +1013,12 @@ impl LtxDit {
                 trace("a.b0.ff.out", &aff);
             }
             add_gated(&mut ax, &aff, m, a_dim, &a_mlp, &at.idx, pool);
+            pt = prof.tick(P_FF, pt);
             trace(&format!("v.block{bi}"), &vx);
             trace(&format!("a.block{bi}"), &ax);
         }
+
+        prof.report();
 
         // --- output head: LayerNorm (no affine), adaLN, projection --------
         let vout = head(&vx, n, dim, &self.sst_out, &vt, &self.proj_out, pool);
