@@ -166,35 +166,9 @@ cortiq ltx-video --model $M --two-stage \
 ancestral Euler steps at half resolution, the learned latent upscaler ×2,
 then three deterministic steps that refine what the upscale invented.
 
-### More steps is not the detail dial
-
-The schedule this release ships with is not a discretization that more steps
-approximate better. It is nine sigmas —
-
-```
-1.0  0.99375  0.9875  0.98125  0.975  0.909375  0.725  0.421875  0.0
-```
-
-— four near-zero moves at the top and then three large jumps, and the model was
-*distilled* to take exactly those jumps. `--steps N` resamples that ladder, so
-N = 8 is the shipped schedule bit for bit and anything else puts the model on
-sigmas it never saw in distillation. The usual result is a softer frame, not a
-sharper one. The flag exists so that can be measured rather than argued about.
-
-What does add detail:
-
-- **Resolution.** The VAE's spatial stride is 32, so a 512×288 render gives the
-  transformer a 16×9 grid to put a bird in. Doubling the side quadruples the
-  cells the subject occupies — and the token count with it.
-- **`--two-stage`**, which is the same eleven on-schedule steps arranged the way
-  the distillation intended: the expensive full-resolution pass runs three
-  times, not eight, and the upscaler supplies the structure it refines.
-- **The prompt.** These models render what is named. "Individual scarlet
-  feathers, the bare white cheek patch, the eye catching the light" is a
-  different frame from "a parrot".
-
-Resolution must be a multiple of 32 (the video VAE's spatial stride) and the
-frame count `8k + 1` (its temporal stride plus the standalone first frame).
+`--steps N` / `--steps2 N` resample that schedule. The shipped ladder is
+distilled — 8 is it exactly, other counts land on sigmas the model never saw
+and usually soften the frame. Detail comes from resolution and `--two-stage`.
 
 ### Measured
 
