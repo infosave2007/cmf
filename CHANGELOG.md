@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.89] - 2026-08-18
+
+A finished stage gives its memory back.
+
+### Changed
+- **LTX-2.5 render: the page cache of a stage that has run is released.** The
+  container is 20.5 GiB and a Mac with 24 GB of unified memory cannot hold it
+  and the render at once, so the machine answers with the compressor and the
+  denoise loop slows down as it goes. The prompt encoder is 6.8 GiB that runs
+  once; the DiT is 10.8 GiB that is finished before either VAE opens. Both are
+  now madvised away at the moment they stop being read — clean file-backed
+  pages, so anything that wants them again just refaults. Measured on an M4
+  (24 GB), 384x256x25 with sound: the eight denoising steps used to climb
+  12.4 -> 13.1 s with a 26 s spike and now hold 8.5-8.7 s flat, and the stage
+  goes from 117.5 s to 72.8 s. Nothing about the arithmetic changes.
+- `ltx-video` prints the `CMF_MM_AB=1` table when that diagnostic is on. Both
+  arms of every eligible q4tp GEMM run back to back on the same data inside one
+  call, which is the only device-vs-host comparison a laptop that drifts
+  between runs can be trusted to give. On the M4 the Metal kernel is 2.01x the
+  host over a whole render (4096x16384 2.17x, 16384x4096 2.21x, 4096x4096
+  1.81x) and the two arms disagree by at most 9e-4 relative.
+
 ## [0.5.88] - 2026-08-18
 
 The prompt is encoded once.
