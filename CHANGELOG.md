@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.86] - 2026-08-18
+
+The conditioned modes, actually run.
+
+### Fixed
+
+* **A frozen stream is clean, and has to say so.** The audio↔video fusion gate
+  reads the *other* stream's sigma and closes on noise, so a picture handed to
+  the model intact was being discounted because it still carried the
+  schedule's sigma. The reference forces zero for a frozen modality; so do we
+  now. Measured on `--video-to-audio`: the soundtrack came out three times
+  louder, and it follows the prompt — "a dog panting softly, a quiet kitchen"
+  gives an even 0.007 RMS, "loud sizzling and clattering pans, a dog barking
+  sharply twice" gives 0.035 with transients at 0.046, 0.056 and 0.040.
+
+### Added
+
+* **`--video-strength`**, and with it a real video-to-video. A clip that
+  covers the whole render is now *re-noised* to the requested level and
+  denoised from there — freezing it, which is what the previous code did,
+  handed back exactly what was given. A clip shorter than the render is still
+  frozen and continued, which is the other useful thing.
+* The schedule for a strength starts at exactly that level. Filtering the
+  distilled ladder alone silently started lower: at 0.72 the nearest rung
+  below is 0.42, a different edit than the one asked for.
+
+
 ## [0.5.85] - 2026-08-18
 
 Metal on a 24 GB Mac: the device is used, and it stays used.
