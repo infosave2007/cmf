@@ -171,7 +171,10 @@ The container's weights are q4tp, so an adapter cannot be folded into them
 without dequantizing the whole DiT. The branch is evaluated beside them
 instead — `y = x·Wᵀ + s·(x·Aᵀ)·Bᵀ`, on every path including the fused
 Metal q/k/v submission. At rank 128 against a 4096×4096 projection that is
-about 6% more arithmetic; the file itself is the only extra memory.
+about 6% more arithmetic — but on an M4 a 384-token step goes 8.6 s to
+about 22 s, because that arithmetic is host-side f32 standing beside a
+device-side 4-bit GEMM and does not overlap it. The flops are cheap; the
+placement is what you pay. The file itself is the only extra memory.
 
 Adapters that carry a `reference_slot_embedding` also take reference stills:
 

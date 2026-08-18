@@ -181,7 +181,10 @@ cortiq ltx-video --model $M --lora adapter.safetensors --lora-strength 0.8 \
 q4tp weights cannot absorb a low-rank update without dequantizing the whole
 DiT, so the branch runs beside them — `y = x·Wᵀ + s·(x·Aᵀ)·Bᵀ`, on every path
 including the fused Metal q/k/v submission. Rank 128 against a 4096×4096
-projection is about 6% more arithmetic and no memory beyond the file.
+projection is about 6% more arithmetic and no memory beyond the file — but
+measured on an M4 a 384-token step goes 8.6 s to about 22 s, because that
+arithmetic is host-side f32 beside a device-side 4-bit GEMM and does not
+overlap it. The flops are cheap; the placement is what costs.
 
 An adapter that also carries a `reference_slot_embedding` takes reference
 stills, which is how the multi-subject adapters work:
