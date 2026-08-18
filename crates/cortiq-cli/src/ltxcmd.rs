@@ -758,6 +758,13 @@ pub fn cmd_ltx_video(a: VideoArgs<'_>) -> anyhow::Result<()> {
         }
     };
     drop(te);
+    // The 12 B prompt encoder ran its once-per-render pass. Dropping its
+    // Rust side frees nothing that matters — the weights are page cache
+    // over the mmap, and on a 24 GB Mac the container is 20.5 GiB, so
+    // 6.8 GiB of dead encoder competes with the DiT's 10.8 GiB for the
+    // rest of the render and the machine answers with the compressor.
+    // Clean file-backed pages refault from disk if anything wants them.
+    release_pages(&model, "te.");
 
     let dit = LtxDit::from_cmf(&model).map_err(|e| anyhow!(e))?;
     // Two-stage is how the distilled model was trained to be sampled: eight
@@ -857,6 +864,10 @@ pub fn cmd_ltx_video(a: VideoArgs<'_>) -> anyhow::Result<()> {
         (geo, v, lat.audio)
     };
     drop(dit);
+    // Same again in the other direction: every denoising stage is done, so
+    // the DiT's 10.8 GiB stops earning its RAM and the two VAEs and the
+    // vocoder get the machine to themselves.
+    release_pages(&model, "dit.");
     if let Some(p) = a.out_latent {
         write_latent(p, &vol, &geo, &audio)?;
     }
@@ -1280,6 +1291,16 @@ fn read_ppm_f32(path: &str) -> anyhow::Result<(Vec<f32>, usize, usize)> {
 /// Where a prompt's encoded context lives: keyed by the token ids and by
 /// which container produced it, since a different pack is a different
 /// encoder.
+/// Best-effort page-cache release for a finished stage's weights. Names are
+/// prefixed by component in the LTX container (`te.`, `dit.`, `vvae.`,
+/// `avae.`), and a stage that has run is never read again in one render.
+fn release_pages(model: &std::sync::Arc<cortiq_core::CmfModel>, prefix: &str) {
+    let dropped = model.advise_done(|n| n.starts_with(prefix));
+    if dropped > 0 {
+        tracing::info!("{prefix}* pages released: {} MB", dropped / (1024 * 1024));
+    }
+}
+
 fn context_cache_path(model: &str, ids: &[u32]) -> Option<std::path::PathBuf> {
     use std::hash::{Hash, Hasher};
     let meta = std::fs::metadata(model).ok()?;

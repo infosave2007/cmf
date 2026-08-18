@@ -176,13 +176,13 @@ frame count `8k + 1` (its temporal stride plus the standalone first frame).
 | stage | RTX 5090, 384×256 | RTX 5090, 768×512 `--two-stage` | **M4 MacBook, 24 GB**, 384×256 |
 |---|---|---|---|
 | prompt encode (Gemma-4 12 B + connectors) | 26 s | 26 s | 32 s, then cached |
-| denoise | 8 × 19 s | 8 × 19 s + 3 × 70 s | 8 × 16 s |
+| denoise | 8 × 19 s | 8 × 19 s + 3 × 70 s | 8 × 13 s |
 | latent upscale | — | 12 s | — |
-| audio VAE + vocoder | 8 s | 8 s | 16 s |
-| video VAE | 50 s | 200 s | 27 s |
-| **total** | **3 min** | **10 min** | **3.5 min** |
+| audio VAE + vocoder | 8 s | 8 s | 8.6 s |
+| video VAE | 50 s | 200 s | 24 s |
+| **total** | **3 min** | **10 min** | **2.3 min** |
 
-The Mac number is the interesting one, and it took two rounds to get there.
+The Mac number is the interesting one, and it took three rounds to get there.
 
 First, keeping the device at all. A 22 GB container does not fit in a single
 Metal buffer, so it is mapped as two overlapping windows — and the driver
@@ -202,6 +202,25 @@ thread), and independent projections each paid their own ~1.3 ms
 command-buffer completion. Same arithmetic — a render at the same seed before
 and after matches at 42.6 dB, which is the last-bit difference between f32 and
 f64 amplified by eight sampling steps, not a change in what the model draws.
+
+Third, giving the memory back. The container is 20.5 GiB and the machine has
+24 GB, so holding all of it resident leaves nothing for the render and macOS
+answers with the compressor: at 384×256×25 the steps used to climb through a
+run, 12.4 s to 13.1 s with a 26 s spike, and none of that was arithmetic. But
+the pipeline
+touches one component at a time and never comes back — the prompt encoder is
+6.8 GiB read once, the DiT is 10.8 GiB finished before either VAE opens. Both
+are handed back to the system the moment they stop being read, and because
+they are clean file-backed pages, anything that wants them again just refaults.
+At that size the steps now hold 8.5–8.7 s flat and the stage goes 117.5 s →
+72.8 s; the 49-frame row above is the same change measured at the size the
+table quotes.
+
+On device-vs-host: `CMF_MM_AB=1` runs both arms of every eligible q4tp GEMM
+back to back on the same data inside one call, which is the only comparison a
+laptop that drifts between runs can be trusted to give. Over a whole render the
+Metal kernel is **2.01× the host** — 2.17× on 4096×16384, 2.21× on 16384×4096,
+1.81× on 4096×4096 — and the two arms disagree by at most 9e-4 relative.
 
 A 21 B video model, its 12 B prompt encoder and both VAEs, rendering a clip
 with sound on a laptop with 24 GB of unified memory — because nothing is ever
