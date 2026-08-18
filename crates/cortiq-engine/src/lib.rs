@@ -20,6 +20,7 @@ pub mod linear_core;
 pub mod loader;
 pub mod ltxaudio;
 pub mod ltxdit;
+pub mod ltxenc;
 pub mod ltxdur;
 pub mod ltxpipe;
 pub mod ltxte;

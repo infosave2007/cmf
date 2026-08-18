@@ -192,6 +192,44 @@ pub struct Latents {
     pub audio: Vec<f32>,
 }
 
+/// What is held fixed while the rest is denoised. `mask[t] = 0` freezes
+/// token `t` at `clean[t]` and hands the transformer a timestep of zero for
+/// it — which is how one encoded image becomes the first frame of a
+/// generated shot, and how a whole encoded clip becomes the picture a
+/// soundtrack is written for.
+#[derive(Clone, Default)]
+pub struct Conditioning {
+    pub video_mask: Vec<f32>,
+    pub video_clean: Vec<f32>,
+    pub audio_mask: Vec<f32>,
+    pub audio_clean: Vec<f32>,
+}
+
+impl Conditioning {
+    /// Freeze the first `frames` latent frames at `clean` (patchified).
+    pub fn video_prefix(geo: &Geometry, clean: &[f32], frames: usize) -> Conditioning {
+        let per = geo.tokens_per_frame();
+        let mut mask = vec![1f32; geo.video_tokens()];
+        let mut full = vec![0f32; geo.video_tokens() * 128];
+        let n = (frames * per).min(geo.video_tokens());
+        for (t, m) in mask.iter_mut().enumerate().take(n) {
+            *m = 0.0;
+            full[t * 128..(t + 1) * 128].copy_from_slice(&clean[t * 128..(t + 1) * 128]);
+        }
+        Conditioning { video_mask: mask, video_clean: full, ..Default::default() }
+    }
+
+    /// Freeze the whole video stream — the picture is given, the sound is
+    /// what is being generated.
+    pub fn video_all(geo: &Geometry, clean: &[f32]) -> Conditioning {
+        Conditioning {
+            video_mask: vec![0f32; geo.video_tokens()],
+            video_clean: clean.to_vec(),
+            ..Default::default()
+        }
+    }
+}
+
 /// Progress callback: `(step, total, seconds for that step)`.
 pub type Progress<'a> = &'a mut dyn FnMut(usize, usize, f64);
 
@@ -204,6 +242,23 @@ pub fn run_stage(
     audio_ctx: &[f32],
     ctx_len: usize,
     init: Option<Latents>,
+    rng: &mut Rng,
+    pool: Option<&Pool>,
+    progress: Progress<'_>,
+) -> Latents {
+    run_stage_cond(dit, geo, stage, video_ctx, audio_ctx, ctx_len, init, None, rng, pool, progress)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_stage_cond(
+    dit: &LtxDit,
+    geo: &Geometry,
+    stage: &Stage,
+    video_ctx: &[f32],
+    audio_ctx: &[f32],
+    ctx_len: usize,
+    init: Option<Latents>,
+    cond: Option<&Conditioning>,
     rng: &mut Rng,
     pool: Option<&Pool>,
     progress: Progress<'_>,
@@ -230,6 +285,38 @@ pub fn run_stage(
         }
     }
 
+    // conditioning: a frozen token starts clean, stays clean, and is handed
+    // a timestep of zero so the modulation treats it as already denoised
+    let vmask: Vec<f32> = cond
+        .map(|c| c.video_mask.clone())
+        .filter(|m| m.len() == vt)
+        .unwrap_or_else(|| vec![1f32; vt]);
+    let amask: Vec<f32> = cond
+        .map(|c| c.audio_mask.clone())
+        .filter(|m| m.len() == at)
+        .unwrap_or_else(|| vec![1f32; at]);
+    let vclean: Vec<f32> = cond
+        .map(|c| c.video_clean.clone())
+        .filter(|c| c.len() == v.len())
+        .unwrap_or_else(|| vec![0f32; v.len()]);
+    let aclean: Vec<f32> = cond
+        .map(|c| c.audio_clean.clone())
+        .filter(|c| c.len() == a.len())
+        .unwrap_or_else(|| vec![0f32; a.len()]);
+    let blend = |x: &mut [f32], clean: &[f32], mask: &[f32], ch: usize| {
+        for (t, &m) in mask.iter().enumerate() {
+            if m >= 1.0 {
+                continue;
+            }
+            for d in 0..ch {
+                let i = t * ch + d;
+                x[i] = clean[i] + (x[i] - clean[i]) * m;
+            }
+        }
+    };
+    blend(&mut v, &vclean, &vmask, vch);
+    blend(&mut a, &aclean, &amask, ach);
+
     let vpos = geo.video_positions();
     let apos = geo.audio_positions();
     let kf = geo.keyframes_mask();
@@ -243,7 +330,7 @@ pub fn run_stage(
         let vin = StreamInput {
             latent: v.clone(),
             tokens: vt,
-            timesteps: vec![sigma; vt],
+            timesteps: vmask.iter().map(|m| sigma * m).collect(),
             positions: vpos.clone(),
             context: video_ctx.to_vec(),
             ctx_len,
@@ -254,7 +341,7 @@ pub fn run_stage(
         let ain = StreamInput {
             latent: a.clone(),
             tokens: at,
-            timesteps: vec![sigma; at],
+            timesteps: amask.iter().map(|m| sigma * m).collect(),
             positions: apos.clone(),
             context: audio_ctx.to_vec(),
             ctx_len,
@@ -264,8 +351,22 @@ pub fn run_stage(
         };
         let (vv, av) = dit.forward(&vin, &ain, pool);
         // velocity → denoised, at the token's own timestep
-        let vd: Vec<f32> = v.iter().zip(&vv).map(|(&x, &g)| x - g * sigma).collect();
-        let ad: Vec<f32> = a.iter().zip(&av).map(|(&x, &g)| x - g * sigma).collect();
+        // velocity → denoised at each token's own timestep, then the frozen
+        // tokens are put back exactly as they were
+        let mut vd: Vec<f32> = v
+            .iter()
+            .zip(&vv)
+            .enumerate()
+            .map(|(i, (&x, &g))| x - g * sigma * vmask[i / vch])
+            .collect();
+        let mut ad: Vec<f32> = a
+            .iter()
+            .zip(&av)
+            .enumerate()
+            .map(|(i, (&x, &g))| x - g * sigma * amask[i / ach])
+            .collect();
+        blend(&mut vd, &vclean, &vmask, vch);
+        blend(&mut ad, &aclean, &amask, ach);
         let (vn, an) = if eta > 0.0 && sigma_next > 0.0 {
             let mut vn = vec![0f32; v.len()];
             let mut an = vec![0f32; a.len()];
@@ -277,6 +378,8 @@ pub fn run_stage(
         };
         euler_step(&mut v, &vd, sigma, sigma_next, eta, vn.as_deref());
         euler_step(&mut a, &ad, sigma, sigma_next, eta, an.as_deref());
+        blend(&mut v, &vclean, &vmask, vch);
+        blend(&mut a, &aclean, &amask, ach);
         progress(i + 1, steps, t0.elapsed().as_secs_f64());
     }
     Latents { video: v, audio: a }
