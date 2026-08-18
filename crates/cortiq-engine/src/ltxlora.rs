@@ -56,10 +56,19 @@ impl LoraBranch {
         if n == 0 {
             return;
         }
+        // Held on the host on purpose. These are small f32 GEMMs standing
+        // beside a q4tp GEMM that already owns the device, and the generic
+        // `GemmNt` probe will happily send them there — where they queue
+        // behind the base projection and pay a submit and a readback each.
+        // Measured on an M4, 384 tokens: 39.7 s a step through the probe
+        // against 12.4 pinned to the host, for GEMMs whose own arithmetic is
+        // 1.1 s of that. Accelerate runs these shapes at 250-1300 GFLOP/s.
         let mut h = vec![0f32; n * self.rank];
-        crate::fcd_ops::gemm_nt(x, &self.a, &mut h, n, self.inn, self.rank, pool);
         let mut d = vec![0f32; n * self.out];
-        crate::fcd_ops::gemm_nt(&h, &self.b, &mut d, n, self.rank, self.out, pool);
+        crate::gpu::cpu_scope(|| {
+            crate::fcd_ops::gemm_nt(x, &self.a, &mut h, n, self.inn, self.rank, pool);
+            crate::fcd_ops::gemm_nt(&h, &self.b, &mut d, n, self.rank, self.out, pool);
+        });
         let scale = self.scale;
         let sink = Shared(dst.as_mut_ptr());
         rows(pool, n, &|s, e| {
