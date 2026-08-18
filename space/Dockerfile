@@ -1,23 +1,35 @@
-# The Space builds the renderer from source and then never touches Python
-# for anything numerical: `app.py` only collects a prompt and shells out.
-FROM rust:1.85-slim AS build
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    pkg-config libssl-dev git ca-certificates && rm -rf /var/lib/apt/lists/*
-WORKDIR /src
-RUN git clone --depth 1 https://github.com/infosave2007/cmf . \
- && cargo build --release -p cortiq-cli \
- && strip target/release/cortiq
-
+# No Rust toolchain in the image: the renderer is the released Linux binary
+# from the same tag as the model card documents. `app.py` never touches a
+# tensor — it collects a prompt and shells out.
 FROM python:3.11-slim
+
+ARG CORTIQ_VERSION=v0.5.85
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg ca-certificates libvulkan1 && rm -rf /var/lib/apt/lists/*
-COPY --from=build /src/target/release/cortiq /usr/local/bin/cortiq
+      ffmpeg ca-certificates curl libvulkan1 \
+ && rm -rf /var/lib/apt/lists/* \
+ && curl -fsSL -o /tmp/cortiq.tar.gz \
+      "https://github.com/infosave2007/cmf/releases/download/${CORTIQ_VERSION}/cortiq-x86_64-unknown-linux-gnu.tar.gz" \
+ && tar -xzf /tmp/cortiq.tar.gz -C /usr/local/bin \
+ && rm /tmp/cortiq.tar.gz \
+ && chmod +x /usr/local/bin/cortiq \
+ && cortiq --version
+
 RUN useradd -m -u 1000 user
 USER user
-ENV HOME=/home/user PATH=/home/user/.local/bin:$PATH \
-    HF_HOME=/home/user/.cache/huggingface GRADIO_SERVER_NAME=0.0.0.0
+ENV HOME=/home/user \
+    PATH=/home/user/.local/bin:$PATH \
+    HF_HOME=/home/user/.cache/huggingface \
+    GRADIO_SERVER_NAME=0.0.0.0
 WORKDIR /home/user/app
-RUN pip install --no-cache-dir --user gradio==5.9.1 huggingface_hub>=0.26
+
+# The version specifiers are quoted: an unquoted `>=` is a shell redirect,
+# which silently installs nothing and leaves gradio's CLI importing a
+# `requests` that is not there.
+RUN pip install --no-cache-dir --user \
+      "gradio>=5.44,<6" \
+      "huggingface_hub>=0.26" \
+      "requests>=2.31"
+
 COPY --chown=user . .
 EXPOSE 7860
 CMD ["python", "app.py"]
