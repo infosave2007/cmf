@@ -108,12 +108,17 @@ them alone — so all of this is the same command with different inputs.
 | sound → sound | `--audio-in track.wav --out-audio out.wav` |
 | image + sound → video | `--image still.ppm --audio-in track.wav` |
 
-Each of these has been run end to end and the output looked at, not just
-compiled. Two caveats worth stating rather than hiding: `--audio-in` freezes
-the whole soundtrack, so sound → sound returns what you gave it (a partial
-freeze — condition on the first seconds and continue — is what the machinery
-supports but the CLI does not expose yet); and `--video-to-audio` produces a
-markedly quieter track than a joint text render does.
+Each of these has been run end to end and the output looked at (or listened
+to), not just compiled. `--video-to-audio` follows the prompt the way it
+should: the same frozen clip with "a dog panting softly, a quiet kitchen"
+gives an even track at 0.007 RMS, and with "loud sizzling and clattering
+pans, a dog barking sharply twice" gives 0.035 with transients at 0.046,
+0.056 and 0.040 — two barks and the pans.
+
+One real limitation rather than a caveat: `--audio-in` freezes the *whole*
+soundtrack, so sound → sound returns what you gave it. A partial freeze —
+condition on the first seconds and continue — is what the machinery already
+supports; the CLI does not expose it yet.
 
 ```bash
 # a still into a shot, with its soundtrack
