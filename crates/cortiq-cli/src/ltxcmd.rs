@@ -697,6 +697,8 @@ pub struct VideoArgs<'a> {
     pub audio_in: Option<&'a str>,
     /// How far to re-noise a `--video` clip before denoising it again
     pub video_strength: f32,
+    /// Encode the prompt every time instead of reusing a cached context
+    pub no_context_cache: bool,
 }
 
 /// Prompt in, video out — the whole pipeline in one process and one file.
@@ -723,12 +725,38 @@ pub fn cmd_ltx_video(a: VideoArgs<'_>) -> anyhow::Result<()> {
     let te = LtxTextEncoder::from_cmf(&model).map_err(|e| anyhow!(e))?;
     let (ids, mask) = te.pad_ids(&tok.encode(a.prompt.trim()));
     let valid = mask.iter().filter(|&&m| m != 0.0).count();
+    // The prompt encoder is a 12 B forward that depends on nothing but the
+    // token ids and the container — half a minute that a second render of
+    // the same prompt has no reason to pay again.
+    let cache = (!a.no_context_cache)
+        .then(|| context_cache_path(a.model, &ids))
+        .flatten();
     let t0 = std::time::Instant::now();
-    let (vctx, actx, ctx_len) = te.encode_ids(&ids, &mask, pool.as_deref());
-    println!(
-        "prompt: {valid} tokens → {ctx_len}-token context in {:.1}s",
-        t0.elapsed().as_secs_f64()
-    );
+    let cached = cache.as_ref().and_then(|p| read_context(p).ok());
+    let (vctx, actx, ctx_len) = match cached {
+        Some(c) => {
+            println!(
+                "prompt: {valid} tokens → {}-token context from cache in {:.2}s",
+                c.2,
+                t0.elapsed().as_secs_f64()
+            );
+            c
+        }
+        None => {
+            let c = te.encode_ids(&ids, &mask, pool.as_deref());
+            println!(
+                "prompt: {valid} tokens → {}-token context in {:.1}s",
+                c.2,
+                t0.elapsed().as_secs_f64()
+            );
+            if let Some(p) = &cache {
+                if let Err(e) = write_context(p, &c.0, &c.1, c.2) {
+                    eprintln!("context cache: {e}");
+                }
+            }
+            c
+        }
+    };
     drop(te);
 
     let dit = LtxDit::from_cmf(&model).map_err(|e| anyhow!(e))?;
@@ -1241,4 +1269,62 @@ fn read_ppm_f32(path: &str) -> anyhow::Result<(Vec<f32>, usize, usize)> {
         }
     }
     Ok((out, h, w))
+}
+
+/// Where a prompt's encoded context lives: keyed by the token ids and by
+/// which container produced it, since a different pack is a different
+/// encoder.
+fn context_cache_path(model: &str, ids: &[u32]) -> Option<std::path::PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let meta = std::fs::metadata(model).ok()?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    ids.hash(&mut h);
+    meta.len().hash(&mut h);
+    if let Ok(t) = meta.modified() {
+        if let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) {
+            d.as_secs().hash(&mut h);
+        }
+    }
+    model.hash(&mut h);
+    let key = h.finish();
+    let dir = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))?
+        .join("cortiq")
+        .join("ltx-context");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join(format!("{key:016x}.safetensors")))
+}
+
+fn read_context(p: &std::path::Path) -> anyhow::Result<(Vec<f32>, Vec<f32>, usize)> {
+    let st = St::open(p)?;
+    let (vs, v) = st.get("enc.video")?;
+    let (_, a) = st.get("enc.audio")?;
+    let n = vs[vs.len() - 2];
+    Ok((v, a, n))
+}
+
+fn write_context(p: &std::path::Path, v: &[f32], a: &[f32], n: usize) -> anyhow::Result<()> {
+    let mut blob: Vec<u8> = Vec::with_capacity((v.len() + a.len()) * 4);
+    for x in v {
+        blob.extend_from_slice(&x.to_le_bytes());
+    }
+    let split = blob.len();
+    for x in a {
+        blob.extend_from_slice(&x.to_le_bytes());
+    }
+    let hdr = serde_json::json!({
+        "enc.video": {"dtype":"F32","shape":[1, n, v.len() / n.max(1)],"data_offsets":[0, split]},
+        "enc.audio": {"dtype":"F32","shape":[1, n, a.len() / n.max(1)],"data_offsets":[split, blob.len()]},
+    });
+    let hs = serde_json::to_vec(&hdr)?;
+    let tmp = p.with_extension("tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&(hs.len() as u64).to_le_bytes())?;
+        f.write_all(&hs)?;
+        f.write_all(&blob)?;
+    }
+    std::fs::rename(&tmp, p)?;
+    Ok(())
 }

@@ -156,6 +156,21 @@ Image conditioning goes through the video VAE's **encoder**, audio
 conditioning through the audio VAE's, and both are in the same container as
 everything else.
 
+### The prompt is encoded once
+
+The 12 B prompt encoder depends on nothing but the token ids and the
+container, so its output is cached under `~/.cache/cortiq/ltx-context/` and a
+second render of the same prompt reads it back instead of recomputing:
+
+```
+prompt: 24 tokens → 1024-token context in 29.1s      # first
+prompt: 24 tokens → 1024-token context from cache in 0.03s
+```
+
+Twenty-five megabytes a prompt. `--no-context-cache` turns it off; the key
+covers the ids and the container's path, size and mtime, so a different pack
+never reuses another's context.
+
 ## The stages, one at a time
 
 Each stage is also a command of its own, which is how the port was gated
