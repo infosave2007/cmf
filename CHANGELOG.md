@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.88] - 2026-08-18
+
+The prompt is encoded once.
+
+`ltx-video` caches the prompt encoder's output under
+`~/.cache/cortiq/ltx-context/`, keyed by the token ids and by the container's
+path, size and mtime. A 12 B forward that depends on nothing else has no
+reason to run twice for the same prompt:
+
+```
+prompt: 24 tokens → 1024-token context in 29.1s          # first render
+prompt: 24 tokens → 1024-token context from cache in 0.03s
+```
+
+Twenty-five megabytes a prompt, and `--no-context-cache` turns it off. On an
+M4 a small clip went 76 s → 41 s; on a 384×256 49-frame render it is half a
+minute off a three-and-a-half-minute total.
+
+
 ## [0.5.87] - 2026-08-18
 
 Metal, a quarter faster again — by profiling instead of guessing.
