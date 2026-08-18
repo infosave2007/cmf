@@ -376,7 +376,32 @@ static PROBES: [Probe; 7] = [
     Probe::new(),
 ];
 
+/// A caller that knows its loop is long, uniform and warm can say so: the
+/// probe times ops in isolation and alternates arms to do it, which reads a
+/// sustained diffusion step as slower on the device than it is. Measured on
+/// an M4 at 672 video tokens: the probe picked the CPU at 1.25 ms against
+/// 0.88 ms per op, and the loop it picked for ran 23.9 s a step against the
+/// device's 19.7 s.
+static TRUST_GPU: AtomicBool = AtomicBool::new(false);
+
+/// Take the probe out of the loop until the guard drops.
+pub fn trust_gpu() -> GpuTrust {
+    let was = TRUST_GPU.swap(true, Ordering::Relaxed);
+    GpuTrust(was)
+}
+
+pub struct GpuTrust(bool);
+
+impl Drop for GpuTrust {
+    fn drop(&mut self) {
+        TRUST_GPU.store(self.0, Ordering::Relaxed);
+    }
+}
+
 fn probe_on() -> bool {
+    if TRUST_GPU.load(Ordering::Relaxed) {
+        return false;
+    }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         std::env::var("CMF_GPU_PROBE")

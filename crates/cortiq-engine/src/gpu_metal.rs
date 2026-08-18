@@ -6080,6 +6080,13 @@ impl WeightArena {
     }
 }
 
+/// The largest single buffer the device will make (0 without Metal). A
+/// mapping past this needs more than one window, and a phase that spans two
+/// of them puts both on the driver's accounting at once.
+pub fn max_buffer_bytes() -> u64 {
+    ctx().map(|c| c._device.max_buffer_length() as u64).unwrap_or(0)
+}
+
 /// What the device is willing to keep wired, in bytes (0 without Metal).
 /// A model larger than this cannot have all its windows on the books at
 /// once without the driver evicting between commits, so a caller that knows
