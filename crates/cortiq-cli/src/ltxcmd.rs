@@ -699,6 +699,12 @@ pub struct VideoArgs<'a> {
     pub video_strength: f32,
     /// Encode the prompt every time instead of reusing a cached context
     pub no_context_cache: bool,
+    /// Denoising steps. The default 8 is the distilled ladder itself; other
+    /// counts resample it and put the model on sigmas it was not distilled
+    /// for, which usually softens the frame rather than sharpening it.
+    pub steps: Option<usize>,
+    /// Refinement steps in the second stage (`--two-stage`), default 3
+    pub steps2: Option<usize>,
 }
 
 /// Prompt in, video out — the whole pipeline in one process and one file.
@@ -799,7 +805,10 @@ pub fn cmd_ltx_video(a: VideoArgs<'_>) -> anyhow::Result<()> {
     // strength asked for, which is also what the latent is mixed to.
     let stage1 = match init {
         Some(_) => Stage::from_strength(a.video_strength),
-        None => Stage::stage1(),
+        None => match a.steps {
+            Some(n) => Stage::stage1_steps(n),
+            None => Stage::stage1(),
+        },
     };
     if init.is_some() {
         println!(
@@ -847,7 +856,10 @@ pub fn cmd_ltx_video(a: VideoArgs<'_>) -> anyhow::Result<()> {
         let lat2 = run_stage(
             &dit,
             &geo2,
-            &Stage::stage2(),
+            &match a.steps2 {
+                Some(n) => Stage::stage2_steps(n),
+                None => Stage::stage2(),
+            },
             &vctx,
             &actx,
             ctx_len,

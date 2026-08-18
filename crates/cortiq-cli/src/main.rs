@@ -1168,6 +1168,15 @@ enum Commands {
         /// Encode the prompt every time instead of reusing a cached context
         #[arg(long)]
         no_context_cache: bool,
+        /// Denoising steps (default 8 — the distilled ladder itself). Other
+        /// counts resample that ladder, which puts the model on sigmas it was
+        /// not distilled for and usually softens the frame rather than
+        /// sharpening it; resolution and `--two-stage` are the detail dials.
+        #[arg(long)]
+        steps: Option<usize>,
+        /// Refinement steps in the second stage (default 3)
+        #[arg(long)]
+        steps2: Option<usize>,
     },
     /// Decode a saved audio latent through the audio VAE and vocoder.
     LtxAudio {
@@ -2081,6 +2090,8 @@ async fn main() -> anyhow::Result<()> {
             audio_in,
             video_strength,
             no_context_cache,
+            steps,
+            steps2,
         } => ltxcmd::cmd_ltx_video(ltxcmd::VideoArgs {
             model: &model,
             two_stage,
@@ -2100,6 +2111,8 @@ async fn main() -> anyhow::Result<()> {
             audio_in: audio_in.as_deref(),
             video_strength,
             no_context_cache,
+            steps,
+            steps2,
         }),
         Commands::LtxAudio { model, latent, out, stats, oracle } => {
             ltxcmd::cmd_ltx_audio(ltxcmd::AudioArgs {

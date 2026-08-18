@@ -155,6 +155,53 @@ impl Stage {
         Stage { sigmas: STAGE2_SIGMAS.to_vec(), ancestral: false }
     }
 
+    /// The same ladder resampled to `steps` rungs. The distilled schedule is
+    /// not a discretization of a continuous curve that more steps approximate
+    /// better — it is four near-zero moves at the top and three large jumps,
+    /// which is what the model was distilled to take. Asking for more steps
+    /// puts it on sigmas it never saw, and the usual result is a softer frame,
+    /// not a sharper one. The dial exists so that can be measured rather than
+    /// argued about; `steps == 8` returns the distilled ladder unchanged, bit
+    /// for bit.
+    pub fn stage1_steps(steps: usize) -> Stage {
+        let base = &STAGE1_SIGMAS;
+        let n = steps.max(1);
+        if n + 1 == base.len() {
+            return Stage::stage1();
+        }
+        let last = base.len() - 1;
+        let sigmas: Vec<f32> = (0..=n)
+            .map(|i| {
+                let t = i as f64 * last as f64 / n as f64;
+                let lo = (t.floor() as usize).min(last);
+                let hi = (lo + 1).min(last);
+                let f = (t - lo as f64) as f32;
+                base[lo] + (base[hi] - base[lo]) * f
+            })
+            .collect();
+        Stage { sigmas, ancestral: true }
+    }
+
+    /// `stage2` resampled the same way, for the refinement pass.
+    pub fn stage2_steps(steps: usize) -> Stage {
+        let base = &STAGE2_SIGMAS;
+        let n = steps.max(1);
+        if n + 1 == base.len() {
+            return Stage::stage2();
+        }
+        let last = base.len() - 1;
+        let sigmas: Vec<f32> = (0..=n)
+            .map(|i| {
+                let t = i as f64 * last as f64 / n as f64;
+                let lo = (t.floor() as usize).min(last);
+                let hi = (lo + 1).min(last);
+                let f = (t - lo as f64) as f32;
+                base[lo] + (base[hi] - base[lo]) * f
+            })
+            .collect();
+        Stage { sigmas, ancestral: false }
+    }
+
     /// The tail of the schedule that starts at or below `strength` — the
     /// video-to-video dial. The clip is re-noised to that level and denoised
     /// from there, so 1.0 keeps only the composition and 0.2 barely touches
