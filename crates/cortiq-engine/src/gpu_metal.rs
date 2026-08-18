@@ -6043,18 +6043,30 @@ fn model_key(model: &Arc<CmfModel>) -> usize {
 /// starts right below a tensor still reaches `stride` bytes past it, so
 /// any tensor up to `stride` long lands whole in `bufs[abs / stride]`.
 /// The windows alias the same pages — views, not copies.
+/// The windows are created **on first use**, not up front. The driver
+/// accounts its working set by buffer length, so materializing every window
+/// of a 21 GB file puts 22 GB on the books of a device whose recommended
+/// working set is 17.8 GB — and it answers by evicting and re-wiring on
+/// every commit, which turned a 190 ms matmul into 2.7 s. A pipeline that
+/// touches one component at a time (a diffusion transformer denoising, its
+/// text encoder already done) only ever asks for the window that component
+/// lives in, and the rest are never built.
 pub(crate) struct WeightArena {
-    bufs: Vec<Buffer>,
+    bufs: Vec<OnceLock<Buffer>>,
+    make: Box<dyn Fn(usize) -> Buffer + Send + Sync>,
     stride: usize,
 }
 
 impl WeightArena {
+    fn window(&self, i: usize) -> &Buffer {
+        self.bufs[i].get_or_init(|| (self.make)(i))
+    }
     fn locate(&self, abs: usize) -> (&Buffer, usize) {
         if self.bufs.len() == 1 {
-            return (&self.bufs[0], abs);
+            return (self.window(0), abs);
         }
         let i = (abs / self.stride).min(self.bufs.len() - 1);
-        (&self.bufs[i], abs - i * self.stride)
+        (self.window(i), abs - i * self.stride)
     }
     /// Paths that index the arena from the GPU by absolute bases (the
     /// MoE jobs kernels) have no per-tensor bind to rebase — they must
@@ -6066,6 +6078,15 @@ impl WeightArena {
         let (b, rel) = self.locate(abs);
         enc.set_buffer(index, Some(b), rel as u64);
     }
+}
+
+/// What the device is willing to keep wired, in bytes (0 without Metal).
+/// A model larger than this cannot have all its windows on the books at
+/// once without the driver evicting between commits, so a caller that knows
+/// it is about to touch a *different* part of the file than the hot loop
+/// does can use this to decide to stay on the CPU for that part.
+pub fn working_set_bytes() -> u64 {
+    ctx().map(|c| c._device.recommended_max_working_set_size()).unwrap_or(0)
 }
 
 fn file_buffer(c: &Ctx, model: &Arc<CmfModel>) -> Option<(Arc<WeightArena>, usize)> {
@@ -6083,17 +6104,19 @@ fn file_buffer(c: &Ctx, model: &Arc<CmfModel>) -> Option<(Arc<WeightArena>, usiz
     }
     crate::gpu::probe_note_cold();
     let max_len = c._device.max_buffer_length() as usize / page * page;
-    let mk = |off: usize, wlen: usize| -> Buffer {
-        c._device.new_buffer_with_bytes_no_copy(
-            unsafe { bytes.as_ptr().add(off) } as *const std::ffi::c_void,
-            wlen as u64,
-            MTLResourceOptions::StorageModeShared,
-            None,
-        )
-    };
+    let base_ptr = bytes.as_ptr() as usize;
+    let dev = c._device.clone();
     let arena = if len <= max_len {
         WeightArena {
-            bufs: vec![mk(0, len)],
+            bufs: vec![OnceLock::new()],
+            make: Box::new(move |_| unsafe {
+                dev.new_buffer_with_bytes_no_copy(
+                    base_ptr as *const std::ffi::c_void,
+                    len as u64,
+                    MTLResourceOptions::StorageModeShared,
+                    None,
+                )
+            }),
             stride: len.max(1),
         }
     } else {
@@ -6118,20 +6141,29 @@ fn file_buffer(c: &Ctx, model: &Arc<CmfModel>) -> Option<(Arc<WeightArena>, usiz
         } else {
             (max_len / 2) / page * page
         };
-        let mut bufs = Vec::new();
-        let mut off = 0usize;
-        while off < len {
-            bufs.push(mk(off, (len - off).min(max_len)));
-            off += stride;
-        }
+        let count = len.div_ceil(stride);
         tracing::info!(
-            "model mmap {} MB over Metal maxBufferLength {} MB — {} overlapping windows, stride {} MB",
+            "model mmap {} MB over Metal maxBufferLength {} MB — {} overlapping windows, stride {} MB, built on first use",
             len / (1024 * 1024),
             max_len / (1024 * 1024),
-            bufs.len(),
+            count,
             stride / (1024 * 1024)
         );
-        WeightArena { bufs, stride }
+        WeightArena {
+            bufs: (0..count).map(|_| OnceLock::new()).collect(),
+            make: Box::new(move |i| {
+                let off = i * stride;
+                unsafe {
+                    dev.new_buffer_with_bytes_no_copy(
+                        (base_ptr + off) as *const std::ffi::c_void,
+                        (len - off).min(max_len) as u64,
+                        MTLResourceOptions::StorageModeShared,
+                        None,
+                    )
+                }
+            }),
+            stride,
+        }
     };
     let arena = Arc::new(arena);
     cache.insert(key, (arena.clone(), Arc::clone(model)));
@@ -6704,7 +6736,7 @@ pub fn q4tp_mm_n8_batch(
         (b * cols * 4) as u64,
         MTLResourceOptions::StorageModeShared,
     );
-    let ones = vec![1.0f32; 8];
+    let ones = [1.0f32; 8];
     let sc_buf = c._device.new_buffer_with_data(
         ones.as_ptr() as *const std::ffi::c_void,
         32,
@@ -6759,7 +6791,7 @@ pub fn q4tp_kernel_bench(
                 0 => encode_q4tp_matvec(c, enc, &fbuf, abs, &xs_buf, &y_buf, rows, cols / 32),
                 1 => encode_q4tp_matvec_bk(c, enc, &fbuf, abs, &xs_buf, &y_buf, rows, cols / 32, b),
                 3 => {
-                    let ones = vec![1.0f32; 8];
+                    let ones = [1.0f32; 8];
                     let sc = c._device.new_buffer_with_data(ones.as_ptr() as *const std::ffi::c_void, 32, MTLResourceOptions::StorageModeShared);
                     encode_q4tp_mm_n8(c, enc, &fbuf, abs, &xs_buf, &y_buf, &sc, rows, cols, b)
                 }
@@ -9937,7 +9969,7 @@ fn moe_block_jobs_q4tp(
                     q2: bool| {
         let tg_per = (rows as u64).div_ceil(sgs * 4);
         enc.set_compute_pipeline_state(if q2 { &c.q2tpjobs } else { &c.q4tpjobs });
-        enc.set_buffer(0, Some(&fbuf.bufs[0]), 0);
+        enc.set_buffer(0, Some(fbuf.window(0)), 0);
         enc.set_buffer(1, Some(x), 0);
         enc.set_buffer(2, Some(y), 0);
         let gpr_u = (cols / GROUP_SIZE) as u32;
@@ -12219,7 +12251,7 @@ impl TokenGraph {
                         q2: bool| {
             let tg_per = (rows as u64).div_ceil(sgs * 4);
             enc.set_compute_pipeline_state(if q2 { &c.q2tpjobs } else { &c.q4tpjobs });
-            enc.set_buffer(0, Some(&self.fbuf.bufs[0]), 0);
+            enc.set_buffer(0, Some(self.fbuf.window(0)), 0);
             enc.set_buffer(1, Some(x), 0);
             enc.set_buffer(2, Some(y), 0);
             let gpr_u = (cols / GROUP_SIZE) as u32;

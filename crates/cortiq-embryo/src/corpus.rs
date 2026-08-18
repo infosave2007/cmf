@@ -44,7 +44,7 @@ pub fn shard(tok: &std::path::Path, inputs: &[PathBuf], out: &std::path::Path, m
     'outer: for p in inputs {
         let mut batch: Vec<String> = Vec::new();
         let mut batch_bytes = 0usize;
-        let mut flush = |batch: &mut Vec<String>, all: &mut Vec<u16>| {
+        let flush = |batch: &mut Vec<String>, all: &mut Vec<u16>| {
             if batch.is_empty() {
                 return;
             }

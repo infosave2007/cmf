@@ -1163,7 +1163,7 @@ impl FcdModel {
                         let half = self.rotary_dim / 2;
                         let mut tab = Vec::with_capacity(t * half * 2);
                         for pos in 0..t {
-                            for (_i, &freq) in self.inv_freq.iter().enumerate() {
+                            for &freq in self.inv_freq.iter() {
                                 let a = pos as f64 * freq;
                                 tab.push(a.cos() as f32);
                                 tab.push(a.sin() as f32);

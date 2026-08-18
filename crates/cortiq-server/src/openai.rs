@@ -464,7 +464,7 @@ async fn chat_completions(
                 );
             }
         }
-        eprintln!("[serve] msgs[0]={:?}", msgs.get(0));
+        eprintln!("[serve] msgs[0]={:?}", msgs.first());
         state
             .tokenizer
             .apply_chat_template_json(&msgs, req.effective_tools(), req.thinking())
@@ -742,7 +742,7 @@ async fn chat_completions(
                     } else {
                         Some(plain.into())
                     },
-                    tool_calls: made_calls.then(|| serde_json::Value::Array(calls)),
+                    tool_calls: made_calls.then_some(serde_json::Value::Array(calls)),
                     tool_call_id: None,
                     name: None,
                 },

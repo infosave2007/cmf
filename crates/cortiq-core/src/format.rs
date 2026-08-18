@@ -121,9 +121,10 @@ pub struct CmfHeader {
 }
 
 /// Router calibration (see `SelectionDescriptor`): the recipe of the
-/// cortiq-router service — confidence = softmax(−err/T), novelty = 0.5·σ(z_top)
-/// + 0.25·1/(1+8·margin) + 0.25·(1−confidence), novel iff novelty > θ,
-/// θ = the (1−fpr) quantile of in-scope held-out novelty scores.
+/// cortiq-router service. Confidence is `softmax(−err/T)`; novelty is
+/// `0.5·σ(z_top) + 0.25·1/(1+8·margin) + 0.25·(1−confidence)`; an input is
+/// novel iff its novelty exceeds θ, the `1−fpr` quantile of the in-scope
+/// held-out novelty scores.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingCalibration {
     pub temperature: f32,
@@ -1206,7 +1207,7 @@ impl CmfModel {
                 off: data_cursor,
                 nbytes: t.data.len() as u64,
                 shard: 0,
-                hash: hash64(&t.data),
+                hash: hash64(t.data),
             });
             data_cursor += t.data.len() as u64;
         }
@@ -1305,7 +1306,7 @@ impl CmfModel {
         for (spec, entry) in tensors.iter().zip(&entries) {
             let target = data_off + entry.off;
             f.write_all(&zeros((target - pos) as usize))?;
-            f.write_all(&spec.data)?;
+            f.write_all(spec.data)?;
             pos = target + spec.data.len() as u64;
         }
         debug_assert_eq!(pos, data_off + data_len);

@@ -68,7 +68,7 @@ fn growth_appends_experts_without_touching_old_records() {
     let m1 = cortiq_core::format::CmfModel::open(&p1).unwrap();
     let mut same = 0;
     for t in &m0.tensors {
-        let t1 = m1.tensor(&t.name).expect("old tensor kept");
+        let _t1 = m1.tensor(&t.name).expect("old tensor kept");
         assert_eq!(m0.tensor_bytes(&t.name).unwrap(), m1.tensor_bytes(&t.name).unwrap(), "{}: bytes changed", t.name);
         same += 1;
     }

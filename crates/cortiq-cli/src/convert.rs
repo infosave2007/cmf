@@ -787,7 +787,7 @@ pub(crate) fn encode_q2tp(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8
                         };
                         let mut ge = f32::INFINITY;
                         for cand in
-                            nom.saturating_sub(2).max(1)..=(nom + 2).min(Q2TP_LMAX as usize + 1)
+                            nom.saturating_sub(2).max(1)..=(nom + 2).min(Q2TP_LMAX + 1)
                         {
                             let sc = t[cand];
                             if sc <= 0.0 {
@@ -835,7 +835,7 @@ pub(crate) fn encode_q2tp(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8
                 } else {
                     let mut best = (f32::INFINITY, nominal);
                     for cand in
-                        nominal.saturating_sub(2).max(1)..=(nominal + 1).min(Q2TP_LMAX as usize + 1)
+                        nominal.saturating_sub(2).max(1)..=(nominal + 1).min(Q2TP_LMAX + 1)
                     {
                         let s = tab[cand];
                         if s <= 0.0 {
@@ -950,7 +950,7 @@ pub(crate) fn encode_q4tp(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8
                     nominal
                 } else {
                     let mut best = (f32::INFINITY, nominal);
-                    for cand in nominal.saturating_sub(2)..=(nominal + 1).min(Q4TP_LMAX as usize) {
+                    for cand in nominal.saturating_sub(2)..=(nominal + 1).min(Q4TP_LMAX) {
                         let sc = tab[cand];
                         if sc <= 0.0 {
                             continue;
@@ -4427,7 +4427,7 @@ pub(crate) mod tests {
         let (rows, cols) = (4usize, 128usize);
         let mut v = synth_rows(rows, cols, 1.27);
         for c in 0..GROUP_SIZE {
-            v[1 * cols + c] = 0.0;
+            v[cols + c] = 0.0;
         }
         let mut out = vec![0f32; rows * cols];
         dequant_q4tp(&encode_q4tp(&v, rows, cols), rows, cols, &mut out);

@@ -1529,7 +1529,7 @@ mod tests {
     #[test]
     fn phase_mass_zero_is_noop_and_positive_shifts() {
         let (w, cfg0) = tiny();
-        let mut cfg_m = cfg0.clone();
+        let mut cfg_m = cfg0;
         cfg_m.phase_mass = 1.0;
         let x: Vec<f32> = (0..8).map(|i| (i as f32 * 0.4).sin()).collect();
 

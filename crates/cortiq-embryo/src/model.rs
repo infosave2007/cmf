@@ -332,6 +332,15 @@ pub fn init_params(cfg: &EmbryoCfg, lay: &Layout, seed: u64) -> Vec<f32> {
     p
 }
 
+/// principal directions per expert descriptor (reserved; filled by the
+/// periodic PCA of the routed inputs). Shape constants, not device ones:
+/// the exporter and the growth records read them on every platform, so they
+/// live outside the Metal-only module that consumes them.
+pub const MOE_K: usize = 16;
+/// EMA rate of the descriptor means and the balancing-bias step
+pub const MOE_ALPHA: f32 = 0.02;
+pub const MOE_ETA: f32 = 0.05;
+
 #[cfg(target_os = "macos")]
 pub use gpu::*;
 
@@ -339,13 +348,6 @@ pub use gpu::*;
 mod gpu {
     use super::*;
     use crate::metal::{Cmd, Ctx, GBuf, GemmBatch, GemmDyn, HkDims, HkGrads, HkScratch, HkWork, Op, RouteDims, ctx, hk_pow_table};
-
-    /// principal directions per expert descriptor (reserved; filled by the
-    /// periodic PCA of the routed inputs)
-    pub const MOE_K: usize = 16;
-    /// EMA rate of the descriptor means and the balancing-bias step
-    pub const MOE_ALPHA: f32 = 0.02;
-    pub const MOE_ETA: f32 = 0.05;
     use crate::ops::hk_decay_grid;
 
     /// Per-layer activation buffers kept for the backward (M = B·T rows).
@@ -850,7 +852,7 @@ mod gpu {
             let m = b * t;
             match (&self.lay.layers[l], &self.acts[l]) {
                 (
-                    LayerOffs::Mixer { ln1, wq, wk, wv, wkap, wo, alog, ln2, ffn },
+                    LayerOffs::Mixer { ln1, wq, wk, wv, wkap, wo, alog: _, ln2, ffn },
                     LayerActs::Mixer { x_in, x1, inv1, thq, thk, v, kpre, kappa, phq, phk, kv, states, o, x_mid, x2, inv2, gte, up, hh },
                 ) => {
                     let (nh, nph, dv) = (cfg.heads, cfg.nphase, cfg.dv);
@@ -913,7 +915,7 @@ mod gpu {
             let s = &self.scratch;
             match (&self.lay.layers[l], &self.acts[l]) {
                 (
-                    LayerOffs::Mixer { ln1, wq, wk, wv, wkap, wo, alog, ln2, ffn },
+                    LayerOffs::Mixer { ln1, wq, wk, wv, wkap, wo, alog: _, ln2, ffn },
                     LayerActs::Mixer { x_in, x1, inv1, thq, thk, v, kpre: _, kappa, phq, phk, kv, states, o, x_mid, x2, inv2, gte, up, hh },
                 ) => {
                     let (nh, nph, dv) = (cfg.heads, cfg.nphase, cfg.dv);
@@ -1218,13 +1220,13 @@ impl EmbryoGpu {
     /// Per-phase GPU time of one step (each phase its own command buffer):
     /// the profile the kernel work is prioritised from.
     pub fn profile_step(&self) -> Vec<(String, f64)> {
-        use crate::metal::{Cmd, Op};
+        use crate::metal::Cmd;
         let cfg = &self.cfg;
         let (h, m) = (cfg.hidden, self.b * self.t);
         let s = &self.scratch;
         let c = self.ctx();
         let mut out = Vec::new();
-        let time = |name: String, f: &dyn Fn(&Cmd)| -> f64 {
+        let time = |_name: String, f: &dyn Fn(&Cmd)| -> f64 {
             let cmd = Cmd::new(c);
             f(&cmd);
             cmd.commit()

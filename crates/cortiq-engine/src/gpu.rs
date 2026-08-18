@@ -799,8 +799,29 @@ pub fn backend_available() -> bool {
     }
 }
 
+/// A process-wide, phase-scoped GPU gate. `cpu_scope` is thread-local and
+/// the pool's workers do not inherit it, so a caller that wants a whole
+/// *phase* off the device — a prompt encoder whose weights live in a part of
+/// the file the hot loop never touches, on a machine that cannot keep both
+/// wired — has to say so globally.
+static GPU_PAUSED: AtomicBool = AtomicBool::new(false);
+
+/// Park the device for every thread until the returned guard drops.
+pub fn pause_gpu() -> GpuPause {
+    GPU_PAUSED.store(true, Ordering::Relaxed);
+    GpuPause(())
+}
+
+pub struct GpuPause(());
+
+impl Drop for GpuPause {
+    fn drop(&mut self) {
+        GPU_PAUSED.store(false, Ordering::Relaxed);
+    }
+}
+
 pub fn enabled() -> bool {
-    backend() != Backend::None
+    !GPU_PAUSED.load(Ordering::Relaxed) && backend() != Backend::None
 }
 
 /// Default-on condition for the wgpu whole-token graph: the wgpu
@@ -900,7 +921,7 @@ pub fn vram_budget() -> u64 {
 pub fn upload_bytes() -> u64 {
     #[cfg(feature = "gpu")]
     {
-        return crate::gpu_wgpu::UPLOAD_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+        crate::gpu_wgpu::UPLOAD_BYTES.load(std::sync::atomic::Ordering::Relaxed)
     }
     #[cfg(not(feature = "gpu"))]
     0
@@ -1894,17 +1915,17 @@ pub fn dit_qkv_attention(
 /// attention, output projection. Only `proj` comes home.
 #[allow(clippy::too_many_arguments)]
 pub fn dit_qkv_attn_out(
-    model: &Arc<CmfModel>,
-    qkv_idx: usize,
-    out_idx: usize,
-    xn: &[f32],
-    n: usize,
-    hidden: usize,
-    nh: usize,
-    hd: usize,
-    scale: f32,
-    nr: (&[f32], &[f32], &[f32], f32),
-    proj: &mut [f32],
+    _model: &Arc<CmfModel>,
+    _qkv_idx: usize,
+    _out_idx: usize,
+    _xn: &[f32],
+    _n: usize,
+    _hidden: usize,
+    _nh: usize,
+    _hd: usize,
+    _scale: f32,
+    _nr: (&[f32], &[f32], &[f32], f32),
+    _proj: &mut [f32],
 ) -> bool {
     match backend() {
         #[cfg(all(feature = "gpu", not(target_os = "macos")))]
@@ -1919,19 +1940,19 @@ pub fn dit_qkv_attn_out(
 /// The VAE decoder's attention half on the card. Only `proj` returns.
 #[allow(clippy::too_many_arguments)]
 pub fn vae_qkv_attn_out(
-    model: &Arc<CmfModel>,
-    qkv_idx: usize,
-    out_idx: usize,
-    xn: &[f32],
-    n: usize,
-    dim: usize,
-    nh: usize,
-    hd: usize,
-    scale: f32,
-    angles: &[f32],
-    eps: f32,
-    qkv_bias: &[f32],
-    proj: &mut [f32],
+    _model: &Arc<CmfModel>,
+    _qkv_idx: usize,
+    _out_idx: usize,
+    _xn: &[f32],
+    _n: usize,
+    _dim: usize,
+    _nh: usize,
+    _hd: usize,
+    _scale: f32,
+    _angles: &[f32],
+    _eps: f32,
+    _qkv_bias: &[f32],
+    _proj: &mut [f32],
 ) -> bool {
     match backend() {
         #[cfg(all(feature = "gpu", not(target_os = "macos")))]
@@ -1959,15 +1980,15 @@ pub fn vae_attention_packed(
 
 #[allow(clippy::too_many_arguments)]
 pub fn vae_attention_packed_layout(
-    qkv: &[f32],
-    nh: usize,
-    n: usize,
-    hd: usize,
-    scale: f32,
-    angles: &[f32],
-    eps: f32,
-    out: &mut [f32],
-    layout: u32,
+    _qkv: &[f32],
+    _nh: usize,
+    _n: usize,
+    _hd: usize,
+    _scale: f32,
+    _angles: &[f32],
+    _eps: f32,
+    _out: &mut [f32],
+    _layout: u32,
 ) -> bool {
     match backend() {
         #[cfg(all(feature = "gpu", not(target_os = "macos")))]
@@ -1981,13 +2002,13 @@ pub fn vae_attention_packed_layout(
 
 #[allow(clippy::too_many_arguments)]
 pub fn dit_split_only(
-    qkv: &[f32],
-    nh: usize,
-    n: usize,
-    hd: usize,
-    layout: u32,
-    norm: Option<(&[f32], f32)>,
-    out_q: &mut [f32],
+    _qkv: &[f32],
+    _nh: usize,
+    _n: usize,
+    _hd: usize,
+    _layout: u32,
+    _norm: Option<(&[f32], f32)>,
+    _out_q: &mut [f32],
 ) -> bool {
     match backend() {
         #[cfg(all(feature = "gpu", not(target_os = "macos")))]
@@ -2001,7 +2022,7 @@ pub fn dit_split_only(
 /// cores where the card has them. Refuses under `CMF_BAKE_GPU=0` or
 /// strict f32, and for jobs below n·k·m = 4M, where the round trip
 /// costs more than the arithmetic saves.
-pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: usize) -> bool {
+pub fn gemm_nt_f32(_x: &[f32], _w: &[f32], _y: &mut [f32], _n: usize, _k: usize, _m: usize) -> bool {
     match backend() {
         #[cfg(all(feature = "gpu", not(target_os = "macos")))]
         Backend::Wgpu => crate::gpu_wgpu::gemm_nt_f32(x, w, y, n, k, m),
@@ -2014,15 +2035,15 @@ pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: u
 /// between them with no host round trip. `false` = refused, host runs.
 #[allow(clippy::too_many_arguments)]
 pub fn music3_ffn(
-    model: &std::sync::Arc<CmfModel>,
-    idx_in: usize,
-    idx_out: usize,
-    h: &[f32],
-    bias_in: &[f32],
-    n: usize,
-    hs: usize,
-    inter: usize,
-    out: &mut [f32],
+    _model: &std::sync::Arc<CmfModel>,
+    _idx_in: usize,
+    _idx_out: usize,
+    _h: &[f32],
+    _bias_in: &[f32],
+    _n: usize,
+    _hs: usize,
+    _inter: usize,
+    _out: &mut [f32],
 ) -> bool {
     match backend() {
         #[cfg(all(feature = "gpu", not(target_os = "macos")))]
@@ -2063,15 +2084,15 @@ pub fn conv1d_gemm(
 /// The convolution as a GEMM on the matrix units. `false` = refused.
 #[allow(clippy::too_many_arguments)]
 pub fn vae_conv2d_coop(
-    w: &[f32],
-    bias: Option<&[f32]>,
-    x: &[f32],
-    ic: usize,
-    oc: usize,
-    h: usize,
-    wi: usize,
-    k: usize,
-    out: &mut [f32],
+    _w: &[f32],
+    _bias: Option<&[f32]>,
+    _x: &[f32],
+    _ic: usize,
+    _oc: usize,
+    _h: usize,
+    _wi: usize,
+    _k: usize,
+    _out: &mut [f32],
 ) -> bool {
     match backend() {
         #[cfg(all(feature = "gpu", not(target_os = "macos")))]

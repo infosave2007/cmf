@@ -12,7 +12,7 @@ fn real_checkpoint_runtime_parity() {
     let cfg = ck.cfg.clone();
     let lay = Layout::new(&cfg);
     let t = 256usize;
-    let mut gpu = EmbryoGpu::new(cfg.clone(), 1, t, &ck.params).unwrap();
+    let gpu = EmbryoGpu::new(cfg.clone(), 1, t, &ck.params).unwrap();
     gpu.set_desc(&ck.extras);
     gpu.desc_updates.set(false);
     // tokens: a slice of held-out english

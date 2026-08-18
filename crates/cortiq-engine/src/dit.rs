@@ -1097,7 +1097,7 @@ impl NextDit {
         // per-position loop was the depth wall: at 512px (1064
         // tokens) attention alone cost hundreds of serial GFLOP.
         let scale = 1.0 / (hd as f32).sqrt();
-        let hpk = nh / nkv;
+        let _hpk = nh / nkv;
         let mut attn = vec![0f32; n * nh * hd];
         if segs.len() > 1 {
             // Each sequence attends within itself. The slices are row
@@ -1391,7 +1391,7 @@ impl NextDit {
         let n_img = hp * wp;
         let head = prof::span(prof::HEADTAIL);
         let temb = self.time_embed(t);
-        let mut cap_e = cap_e_in.to_vec();
+        let cap_e = cap_e_in.to_vec();
 
         // patchify (dy, dx, ch inner order) + x_embedder
         let pv = p * p * c;

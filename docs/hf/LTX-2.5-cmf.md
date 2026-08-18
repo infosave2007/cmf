@@ -29,6 +29,11 @@ tags:
   <img src="assets/glass.gif" width="49%" alt="Molten glass blown into a bulb over an orange furnace">
 </p>
 
+> **The clips above are silent GIFs. The videos are not.** The same 48 blocks
+> denoise the soundtrack alongside the picture — hear it in
+> [`examples/`](./tree/main/examples): six mp4s with audio, their raw 48 kHz
+> stereo wavs, and the exact command that made each one.
+
 **Every frame above was produced by `cortiq`** — a single Rust binary with no
 PyTorch, no diffusers, no CUDA toolkit and no Python anywhere in the process —
 reading one memory-mapped [CMF](https://github.com/infosave2007/cmf) file.
@@ -114,7 +119,25 @@ ffmpeg -i corgi.mp4 -vf "fps=12,scale=384:-1:flags=lanczos,split[s0][s1];\
 [YUV4MPEG2](https://wiki.multimedia.cx/index.php/YUV4MPEG2) stream instead,
 which every tool reads — so the renderer needs no video encoder of its own.
 
+### Sound
+
+```bash
+cortiq ltx-video --model $M --prompt "…" \
+  --height 256 --width 384 --frames 49 --seed 3 \
+  --out-dir frames/ --out-audio track.wav
+
+ffmpeg -framerate 24 -i frames/frame_%04d.ppm -i track.wav \
+  -pix_fmt yuv420p -c:v libx264 -crf 18 -c:a aac -b:a 192k -shortest out.mp4
+```
+
+The transformer has been denoising the soundtrack in the same blocks as the
+picture the whole time; `--out-audio` decodes it — the spectrogram VAE, then
+BigVGAN v2, then a bandwidth extender that lifts 16 kHz to 48 kHz stereo.
+Eight seconds of work behind minutes of denoising.
+
 ### Higher resolution
+
+<p align="center"><img src="assets/hq-still.png" width="70%" alt="768x512, two-stage"></p>
 
 ```bash
 cortiq ltx-video --model $M --two-stage \
@@ -131,18 +154,20 @@ frame count `8k + 1` (its temporal stride plus the standalone first frame).
 
 ### Measured
 
-RTX 5090, `/dev/shm`, 49 frames at 24 fps:
+49 frames at 24 fps, container on local storage:
 
-| stage | 384×256 | 768×512 (`--two-stage`) |
-|---|---|---|
-| prompt encode (Gemma-4 12 B + connectors) | 28 s | 28 s |
-| denoise | 8 × 30 s | 8 × 30 s + 3 × 120 s |
-| latent upscale | — | 25 s |
-| video VAE | 50 s | 200 s |
+| stage | RTX 5090, 384×256 | RTX 5090, 768×512 `--two-stage` | **M4 MacBook, 24 GB**, 384×256 |
+|---|---|---|---|
+| prompt encode (Gemma-4 12 B + connectors) | 26 s | 26 s | 34 s |
+| denoise | 8 × 19 s | 8 × 19 s + 3 × 193 s | 8 × 23 s |
+| latent upscale | — | 12 s | — |
+| audio VAE + vocoder | 8 s | 8 s | 9 s |
+| video VAE | 50 s | 580 s | 26 s |
+| **total** | **3 min** | **17 min** | **4 min** |
 
-Nothing here is tuned yet — the transformer runs one 48-block forward per
-step against `mmap`ped 4-bit weights, and the VAE is a straight
-im2col + GEMM.
+A 21 B video model, its 12 B prompt encoder and both VAEs, rendering a clip
+with sound on a laptop with 24 GB of unified memory — because nothing is ever
+loaded, only mapped, and the pipeline touches one component at a time.
 
 ## The stages, separately
 

@@ -121,6 +121,7 @@ struct GemmaLayer {
 /// The full prompt encoder.
 pub struct LtxTextEncoder {
     embed: QTensor,
+    mapped_bytes: u64,
     layers: Vec<GemmaLayer>,
     norm: Vec<f32>,
     video_agg: Lin,
@@ -243,6 +244,7 @@ impl LtxTextEncoder {
 
         Ok(LtxTextEncoder {
             embed: QTensor::from_model(model, "te.model.embed_tokens.weight")?,
+            mapped_bytes: model.primary_bytes().len() as u64,
             layers,
             norm: vecf(model, "te.model.norm.weight")?,
             video_agg: Lin::load(model, "te.text_embedding_projection.video_aggregate_embed", true)?,
@@ -277,6 +279,28 @@ impl LtxTextEncoder {
     /// Every one of the 49 hidden states, in HF's order: the scaled
     /// embedding first, then each layer's output.
     pub fn hidden_states(&self, ids: &[u32], mask: &[f32], pool: Option<&Pool>) -> Vec<Vec<f32>> {
+        // On a device that cannot keep the whole container wired, the
+        // encoder is the wrong thing to give the GPU: it lives in a
+        // different part of the file than the transformer, so putting both
+        // on the books makes the driver evict between commits and the
+        // *denoising loop* pays for it, step after step. The encoder runs
+        // once per render — let it have the CPU.
+        let _pause = self.crowds_the_device().then(crate::gpu::pause_gpu);
+        self.hidden_states_inner(ids, mask, pool)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn crowds_the_device(&self) -> bool {
+        let budget = crate::gpu_metal::working_set_bytes();
+        budget > 0 && self.mapped_bytes > budget
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn crowds_the_device(&self) -> bool {
+        false
+    }
+
+    fn hidden_states_inner(&self, ids: &[u32], mask: &[f32], pool: Option<&Pool>) -> Vec<Vec<f32>> {
         let t = ids.len();
         let d = self.hidden;
         let mut x = vec![0f32; t * d];

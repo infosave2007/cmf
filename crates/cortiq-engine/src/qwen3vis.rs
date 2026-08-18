@@ -555,7 +555,7 @@ mod tests {
         // Both agree to ~1e-3 in the middle and diverge in the tails;
         // the point is that the code picks deliberately.
         assert!((gelu_exact(0.0)).abs() < 1e-12);
-        assert!((gelu_exact(1.0) - 0.841_344_75).abs() < 2e-7);
+        assert!((gelu_exact(1.0) - 0.841_344_8).abs() < 2e-7);
         assert!((gelu_tanh(1.0) - 0.841_192).abs() < 1e-5);
         assert!((gelu_exact(1.0) - gelu_tanh(1.0)).abs() > 1e-5);
         assert!((gelu_exact(-3.0) - -0.004_049_5).abs() < 2e-6);

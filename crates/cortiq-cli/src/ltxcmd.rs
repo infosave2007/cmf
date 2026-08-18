@@ -425,13 +425,13 @@ fn write_y4m(path: &Path, frames: &Vol, fps: f64) -> anyhow::Result<()> {
     let (h, w) = (frames.h, frames.w);
     let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
     let num = (fps * 1000.0).round() as u64;
-    write!(f, "YUV4MPEG2 W{w} H{h} F{num}:1000 Ip A1:1 C420jpeg\n")?;
+    writeln!(f, "YUV4MPEG2 W{w} H{h} F{num}:1000 Ip A1:1 C420jpeg")?;
     let px = |c: usize, t: usize, y: usize, x: usize| -> f32 {
         let v = frames.data[((c * frames.f + t) * h + y) * w + x];
         ((v.clamp(-1.0, 1.0) + 1.0) * 0.5 * 255.0).clamp(0.0, 255.0)
     };
     for t in 0..frames.f {
-        write!(f, "FRAME\n")?;
+        writeln!(f, "FRAME")?;
         let mut yp = vec![0u8; h * w];
         let (mut up, mut vp) = (vec![0u8; h * w / 4], vec![0u8; h * w / 4]);
         for y in 0..h {

@@ -887,31 +887,6 @@ pub fn run_skill_list(model_path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn layers_specs() {
-        assert_eq!(parse_layers("all", 4).unwrap(), vec![0, 1, 2, 3]);
-        assert_eq!(parse_layers("1-2", 4).unwrap(), vec![1, 2]);
-        assert_eq!(parse_layers("0,3", 4).unwrap(), vec![0, 3]);
-        assert!(parse_layers("2-9", 4).is_err());
-        assert!(parse_layers("9", 4).is_err());
-        assert!(parse_layers("", 4).is_err());
-    }
-
-    #[test]
-    fn families_parse() {
-        assert!(Families::parse("ffn").is_ok());
-        assert!(Families::parse("attn").is_ok());
-        assert!(Families::parse("all").is_ok());
-        assert!(Families::parse("norms").is_err());
-        assert_eq!(Families::Ffn.suffixes().len(), 3);
-        assert_eq!(Families::All.suffixes().len(), 7);
-    }
-}
-
 /// Split text files into fixed token chunks (the recipe's calibration
 /// format: 256-token windows, first `held` are the held-out gate).
 fn corpus_chunks(
@@ -1229,4 +1204,29 @@ pub fn run_skill_bake(
     std::fs::rename(&tmp, output)?;
     println!("✓ wrote {output}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layers_specs() {
+        assert_eq!(parse_layers("all", 4).unwrap(), vec![0, 1, 2, 3]);
+        assert_eq!(parse_layers("1-2", 4).unwrap(), vec![1, 2]);
+        assert_eq!(parse_layers("0,3", 4).unwrap(), vec![0, 3]);
+        assert!(parse_layers("2-9", 4).is_err());
+        assert!(parse_layers("9", 4).is_err());
+        assert!(parse_layers("", 4).is_err());
+    }
+
+    #[test]
+    fn families_parse() {
+        assert!(Families::parse("ffn").is_ok());
+        assert!(Families::parse("attn").is_ok());
+        assert!(Families::parse("all").is_ok());
+        assert!(Families::parse("norms").is_err());
+        assert_eq!(Families::Ffn.suffixes().len(), 3);
+        assert_eq!(Families::All.suffixes().len(), 7);
+    }
 }

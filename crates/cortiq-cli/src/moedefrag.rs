@@ -49,7 +49,7 @@ pub fn cmd_compact(model_path: &str, output: &str) -> anyhow::Result<()> {
         .map(|entry| TensorSpecRef {
             name: entry.name.clone(),
             dtype: entry.dtype,
-            shape: entry.shape.iter().map(|&d| d as usize).collect(),
+            shape: entry.shape.to_vec(),
             data: model.entry_bytes(entry),
         })
         .collect();
@@ -163,7 +163,7 @@ pub fn cmd_moe_mask(
         .map(|entry| TensorSpecRef {
             name: entry.name.clone(),
             dtype: entry.dtype,
-            shape: entry.shape.iter().map(|&d| d as usize).collect(),
+            shape: entry.shape.to_vec(),
             data: model.entry_bytes(entry),
         })
         .collect();
@@ -262,7 +262,7 @@ pub fn cmd_moe_defrag(
         // [ne] (Kimi/DeepSeek-V3/LFM2) slice by the same kept set —
         // a renumbered expert must keep ITS bias or selection breaks.
         let (li, hidden) = if let Some(li) = router_layer(&entry.name) {
-            (li, Some(entry.shape[1] as usize))
+            (li, Some(entry.shape[1]))
         } else if let Some(li) = expert_bias_layer(&entry.name) {
             (li, None)
         } else {
@@ -274,7 +274,7 @@ pub fn cmd_moe_defrag(
             TensorDtype::F16 => 2,
             other => bail!("{}: dtype {other:?} — expected F32/F16", entry.name),
         };
-        let ne = entry.shape[0] as usize;
+        let ne = entry.shape[0];
         let src = model.entry_bytes(entry);
         let row = hidden.unwrap_or(1) * elem;
         let mut kept: Vec<usize> = map.keys().copied().collect();
@@ -316,7 +316,7 @@ pub fn cmd_moe_defrag(
                         specs.push(TensorSpecRef {
                             name: format!("model.layers.{li}.mlp.experts.{new}.{rest}"),
                             dtype: entry.dtype,
-                            shape: entry.shape.iter().map(|&d| d as usize).collect(),
+                            shape: entry.shape.to_vec(),
                             data: model.entry_bytes(entry),
                         });
                     }
@@ -328,7 +328,7 @@ pub fn cmd_moe_defrag(
         specs.push(TensorSpecRef {
             name: entry.name.clone(),
             dtype: entry.dtype,
-            shape: entry.shape.iter().map(|&d| d as usize).collect(),
+            shape: entry.shape.to_vec(),
             data: model.entry_bytes(entry),
         });
     }

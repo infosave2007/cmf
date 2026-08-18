@@ -974,7 +974,7 @@ impl LayerKvCache {
             );
         }
         let mut out = Vec::with_capacity(self.memory_bytes() / if f16 { 2 } else { 1 } + 64);
-        let mut u = |v: u32, o: &mut Vec<u8>| o.extend_from_slice(&v.to_le_bytes());
+        let u = |v: u32, o: &mut Vec<u8>| o.extend_from_slice(&v.to_le_bytes());
         u(u8::from(f16) as u32, &mut out);
         u(self.seq_len as u32, &mut out);
         u(self.num_kv_heads as u32, &mut out);
@@ -1018,7 +1018,7 @@ impl LayerKvCache {
     /// model both sides hold — it is checked, not assumed.
     pub fn import_wire(&mut self, buf: &[u8]) -> Result<(), String> {
         let mut o = 0usize;
-        let mut u32_at = |o: &mut usize| -> Result<u32, String> {
+        let u32_at = |o: &mut usize| -> Result<u32, String> {
             if *o + 4 > buf.len() {
                 return Err("kv import: truncated header".into());
             }
