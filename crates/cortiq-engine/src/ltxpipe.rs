@@ -154,6 +154,24 @@ impl Stage {
     pub fn stage2() -> Stage {
         Stage { sigmas: STAGE2_SIGMAS.to_vec(), ancestral: false }
     }
+
+    /// The tail of the schedule that starts at or below `strength` — the
+    /// video-to-video dial. The clip is re-noised to that level and denoised
+    /// from there, so 1.0 keeps only the composition and 0.2 barely touches
+    /// it. The first sigma of the returned schedule *is* the noise scale the
+    /// starting latent is mixed to, which is the same pairing the reference
+    /// uses between its second stage and the latent it upsampled.
+    pub fn from_strength(strength: f32) -> Stage {
+        let s0 = strength.clamp(0.02, 1.0);
+        // Start *at* the level asked for, then follow the distilled ladder
+        // down. Filtering the ladder alone would silently start lower than
+        // requested — at 0.72 the nearest rung below is 0.42, which is a
+        // different edit than the one the caller asked for.
+        let mut sigmas = vec![s0];
+        sigmas.extend(STAGE1_SIGMAS.iter().copied().filter(|&s| s < s0 && s > 0.0));
+        sigmas.push(0.0);
+        Stage { sigmas, ancestral: true }
+    }
 }
 
 /// One ancestral Euler step in the rectified-flow parameterization
@@ -331,6 +349,14 @@ pub fn run_stage_cond(
     let steps = stage.sigmas.len() - 1;
     let eta = if stage.ancestral { 1.0 } else { 0.0 };
 
+    // A stream that is frozen everywhere is *clean*, and both its own
+    // prompt-adaLN and the other stream's fusion gate must be told so: the
+    // gate reads the other side's sigma and closes on noise, so leaving the
+    // schedule's sigma there makes the transformer discount a picture it was
+    // handed intact. The reference sets it to zero for a frozen modality.
+    let v_frozen = vmask.iter().all(|&m| m == 0.0);
+    let a_frozen = amask.iter().all(|&m| m == 0.0);
+
     for i in 0..steps {
         let t0 = std::time::Instant::now();
         let sigma = stage.sigmas[i];
@@ -344,7 +370,7 @@ pub fn run_stage_cond(
             ctx_len,
             context_mask: Vec::new(),
             keyframes: kf.clone(),
-            sigma,
+            sigma: if v_frozen { 0.0 } else { sigma },
         };
         let ain = StreamInput {
             latent: a.clone(),
@@ -355,7 +381,7 @@ pub fn run_stage_cond(
             ctx_len,
             context_mask: Vec::new(),
             keyframes: Vec::new(),
-            sigma,
+            sigma: if a_frozen { 0.0 } else { sigma },
         };
         let (vv, av) = dit.forward(&vin, &ain, pool);
         // velocity → denoised, at the token's own timestep

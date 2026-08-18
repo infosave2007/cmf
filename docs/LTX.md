@@ -108,6 +108,13 @@ them alone — so all of this is the same command with different inputs.
 | sound → sound | `--audio-in track.wav --out-audio out.wav` |
 | image + sound → video | `--image still.ppm --audio-in track.wav` |
 
+Each of these has been run end to end and the output looked at, not just
+compiled. Two caveats worth stating rather than hiding: `--audio-in` freezes
+the whole soundtrack, so sound → sound returns what you gave it (a partial
+freeze — condition on the first seconds and continue — is what the machinery
+supports but the CLI does not expose yet); and `--video-to-audio` produces a
+markedly quieter track than a joint text render does.
+
 ```bash
 # a still into a shot, with its soundtrack
 ffmpeg -i photo.jpg -vf scale=384:256 -pix_fmt rgb24 still.ppm
@@ -120,6 +127,19 @@ cortiq ltx-video --model ltx25-q4tp.cmf --video frames/ --video-to-audio \
   --prompt "footsteps on gravel, distant traffic" \
   --height 256 --width 384 --frames 49 --out-audio track.wav
 ```
+
+`--video-strength` is the video-to-video dial and it only applies when the
+clip covers the whole render: 1.0 keeps little more than the composition,
+0.2 barely touches it. The schedule starts at exactly that noise level, so a
+lower strength is also a shorter render. A clip *shorter* than the render is
+not re-noised at all — it is frozen and the rest is generated after it, which
+is continuation rather than transformation.
+
+A stream that is frozen everywhere is handed a sigma of zero, not the
+schedule's. The other stream's fusion gate reads that sigma and closes on
+noise, so leaving the schedule's value there makes the transformer discount a
+picture it was given intact — measured on `--video-to-audio`, the soundtrack
+came out three times quieter.
 
 The conditioning still must match the render's resolution, and a PPM is what
 the CLI reads — `ffmpeg -i anything.jpg -pix_fmt rgb24 still.ppm` is the
