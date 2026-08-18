@@ -36,11 +36,14 @@ EXAMPLES = [
 _model_path: str | None = None
 
 
-def model() -> str:
-    """Fetch the container once, then reuse it. 22 GB, so this is slow the
-    first time a cold Space is asked for anything."""
+def model(progress=None) -> str:
+    """Fetch the container once, then reuse it. It is 22 GB, so on a cold
+    Space the first request pays for the download before it renders
+    anything — and the file stays only as long as the container does."""
     global _model_path
     if _model_path is None:
+        if progress is not None:
+            progress(0.02, desc="fetching the 22 GB container (first run only)")
         _model_path = hf_hub_download(repo_id=REPO, filename=FILE)
     return _model_path
 
@@ -60,8 +63,9 @@ def render(prompt: str, height: int, width: int, frames: int, seed: int, progres
     if frames % 8 != 1:
         raise gr.Error("Frame count must be 8k+1 (9, 17, 25, 33, 41, 49 …).")
 
-    progress(0.02, desc="fetching the container (22 GB, first run only)")
-    path = model()
+    if not shutil.which("cortiq"):
+        raise gr.Error("the renderer is missing from this image")
+    path = model(progress)
     work = Path(tempfile.mkdtemp())
     frames_dir = work / "frames"
     cmd = [
@@ -98,13 +102,16 @@ def render(prompt: str, height: int, width: int, frames: int, seed: int, progres
 
 GPU = has_gpu()
 NOTE = (
-    "A GPU is attached — expect roughly half a minute per denoising step at "
-    "384×256."
+    "A GPU is attached — expect roughly twenty seconds per denoising step at "
+    "384×256, and about three minutes for a whole clip."
     if GPU else
-    "**This Space is running on CPU.** The transformer is 21 B parameters, so "
-    "a 384×256 clip takes tens of minutes. The sizes below are capped to "
-    "something that finishes; for real work run the same binary on your own "
-    "machine — the command is identical."
+    "**This Space is on CPU, and it is honest about what that means.** The "
+    "transformer is 21 B parameters and the container is 22 GB, which the "
+    "first request downloads before it renders anything. Even the smallest "
+    "size below is minutes of work per step here. The sizes are capped to "
+    "something that can finish; for real work run the same binary on your own "
+    "machine — the command is identical, and a 24 GB MacBook does a 49-frame "
+    "384×256 clip with sound in about four minutes."
 )
 
 with gr.Blocks(title="LTX-2.5 on cortiq", theme=gr.themes.Soft()) as demo:
@@ -145,6 +152,24 @@ with gr.Blocks(title="LTX-2.5 on cortiq", theme=gr.themes.Soft()) as demo:
                 video = gr.Video(label="Result", autoplay=True, loop=True)
                 logs = gr.Textbox(label="Renderer output", lines=12)
         go.click(render, [prompt, height, width, frames, seed], [video, logs])
+    with gr.Tab("Every mode"):
+        gr.Markdown(
+            "LTX-2.5 is one network with two streams, and a *mode* is which parts "
+            "you hold fixed. Conditioning is encoded into the model's own latent "
+            "space and frozen there, so all of this is one command with different "
+            "inputs.\n\n"
+            "| mode | how |\n|---|---|\n"
+            "| text → video + sound | `--prompt \"…\" --out-audio track.wav` |\n"
+            "| image + text → video | `--image still.ppm` |\n"
+            "| video → video | `--video frames/` |\n"
+            "| video → sound | `--video frames/ --video-to-audio` |\n"
+            "| sound → video | `--audio-in track.wav` |\n"
+            "| sound → sound | `--audio-in track.wav --out-audio out.wav` |\n"
+            "| image + sound → video | `--image still.ppm --audio-in track.wav` |\n\n"
+            "Add `--two-stage` for 768×512: eight ancestral steps at half "
+            "resolution, the learned ×2 latent upscaler, then three deterministic "
+            "steps at full resolution."
+        )
     with gr.Tab("Run it yourself"):
         gr.Markdown(
             "```bash\n"
@@ -161,4 +186,4 @@ with gr.Blocks(title="LTX-2.5 on cortiq", theme=gr.themes.Soft()) as demo:
             "filesystem turns every weight into a network round trip."
         )
 
-demo.queue(max_size=8).launch()
+demo.queue(max_size=8).launch(server_name="0.0.0.0", server_port=7860)
