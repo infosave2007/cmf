@@ -1168,10 +1168,7 @@ enum Commands {
         /// Encode the prompt every time instead of reusing a cached context
         #[arg(long)]
         no_context_cache: bool,
-        /// Denoising steps (default 8 — the distilled ladder itself). Other
-        /// counts resample that ladder, which puts the model on sigmas it was
-        /// not distilled for and usually softens the frame rather than
-        /// sharpening it; resolution and `--two-stage` are the detail dials.
+        /// Denoising steps (default 8 — the distilled ladder itself)
         #[arg(long)]
         steps: Option<usize>,
         /// Refinement steps in the second stage (default 3)
