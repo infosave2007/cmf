@@ -175,7 +175,7 @@ frame count `8k + 1` (its temporal stride plus the standalone first frame).
 
 | stage | RTX 5090, 384×256 | RTX 5090, 768×512 `--two-stage` | **M4 MacBook, 24 GB**, 384×256 |
 |---|---|---|---|
-| prompt encode (Gemma-4 12 B + connectors) | 26 s | 26 s | 32 s |
+| prompt encode (Gemma-4 12 B + connectors) | 26 s | 26 s | 32 s, then cached |
 | denoise | 8 × 19 s | 8 × 19 s + 3 × 70 s | 8 × 16 s |
 | latent upscale | — | 12 s | — |
 | audio VAE + vocoder | 8 s | 8 s | 16 s |
@@ -205,7 +205,9 @@ f64 amplified by eight sampling steps, not a change in what the model draws.
 
 A 21 B video model, its 12 B prompt encoder and both VAEs, rendering a clip
 with sound on a laptop with 24 GB of unified memory — because nothing is ever
-loaded, only mapped, and the pipeline touches one component at a time.
+loaded, only mapped, and the pipeline touches one component at a time. The
+encoded prompt is cached, so a second take on the same text starts at the
+first denoising step.
 
 ## The stages, separately
 
