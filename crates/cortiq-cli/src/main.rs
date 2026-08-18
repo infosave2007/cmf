@@ -1161,6 +1161,10 @@ enum Commands {
         /// Start from a soundtrack (16-bit WAV): audio-to-video
         #[arg(long)]
         audio_in: Option<String>,
+        /// How far to re-noise a `--video` clip that covers the whole render:
+        /// 1.0 keeps only its composition, 0.2 barely touches it
+        #[arg(long, default_value_t = 0.6)]
+        video_strength: f32,
     },
     /// Decode a saved audio latent through the audio VAE and vocoder.
     LtxAudio {
@@ -2072,6 +2076,7 @@ async fn main() -> anyhow::Result<()> {
             video,
             video_to_audio,
             audio_in,
+            video_strength,
         } => ltxcmd::cmd_ltx_video(ltxcmd::VideoArgs {
             model: &model,
             two_stage,
@@ -2089,6 +2094,7 @@ async fn main() -> anyhow::Result<()> {
             video: video.as_deref(),
             video_to_audio,
             audio_in: audio_in.as_deref(),
+            video_strength,
         }),
         Commands::LtxAudio { model, latent, out, stats, oracle } => {
             ltxcmd::cmd_ltx_audio(ltxcmd::AudioArgs {

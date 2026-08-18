@@ -695,6 +695,8 @@ pub struct VideoArgs<'a> {
     pub video_to_audio: bool,
     /// A soundtrack to start from (16-bit WAV): audio-to-video
     pub audio_in: Option<&'a str>,
+    /// How far to re-noise a `--video` clip before denoising it again
+    pub video_strength: f32,
 }
 
 /// Prompt in, video out — the whole pipeline in one process and one file.
@@ -747,24 +749,39 @@ pub fn cmd_ltx_video(a: VideoArgs<'_>) -> anyhow::Result<()> {
     // Conditioning: whatever picture the caller supplied is encoded into the
     // model's own latent space and frozen there, and everything else is
     // generated around it.
-    let cond = build_conditioning(
+    let (cond, init) = build_conditioning(
         &model,
         &geo,
         a.image,
         a.video,
         a.audio_in,
         a.video_to_audio,
+        a.video_strength,
         pool.as_deref(),
     )?;
+    // A clip that covers the whole render is *re-noised*, not frozen: freezing
+    // it would hand back exactly what was given. The schedule starts at the
+    // strength asked for, which is also what the latent is mixed to.
+    let stage1 = match init {
+        Some(_) => Stage::from_strength(a.video_strength),
+        None => Stage::stage1(),
+    };
+    if init.is_some() {
+        println!(
+            "video-to-video at strength {:.2} — {} steps",
+            a.video_strength,
+            stage1.sigmas.len() - 1
+        );
+    }
     let t1 = std::time::Instant::now();
     let lat = cortiq_engine::ltxpipe::run_stage_cond(
         &dit,
         &geo,
-        &Stage::stage1(),
+        &stage1,
         &vctx,
         &actx,
         ctx_len,
-        None,
+        init,
         cond.as_ref(),
         &mut rng,
         pool.as_deref(),
@@ -1036,6 +1053,11 @@ pub fn cmd_ltx_audio(a: AudioArgs<'_>) -> anyhow::Result<()> {
 /// Encode the caller's picture into the latent space and mark which tokens
 /// the sampler must leave alone.
 #[allow(clippy::too_many_arguments)]
+type Conditioned = (
+    Option<cortiq_engine::ltxpipe::Conditioning>,
+    Option<cortiq_engine::ltxpipe::Latents>,
+);
+
 fn build_conditioning(
     model: &Arc<CmfModel>,
     geo: &cortiq_engine::ltxpipe::Geometry,
@@ -1043,8 +1065,9 @@ fn build_conditioning(
     video: Option<&str>,
     audio_in: Option<&str>,
     video_to_audio: bool,
+    _video_strength: f32,
     pool: Option<&cortiq_engine::pool::Pool>,
-) -> anyhow::Result<Option<cortiq_engine::ltxpipe::Conditioning>> {
+) -> anyhow::Result<Conditioned> {
     use cortiq_engine::ltxenc::VideoEncoder;
     use cortiq_engine::ltxpipe::{Conditioning, patchify_video};
     // A soundtrack to build a picture around: the wav is resampled to the
@@ -1081,7 +1104,7 @@ fn build_conditioning(
         }
     };
     if image.is_none() && video.is_none() {
-        return Ok(audio_cond.map(|a| Conditioning::default().with_audio_all(geo, &a)));
+        return Ok((audio_cond.map(|a| Conditioning::default().with_audio_all(geo, &a)), None));
     }
     let enc = VideoEncoder::from_cmf(model).map_err(|e| anyhow!(e))?;
     let t = std::time::Instant::now();
@@ -1118,15 +1141,34 @@ fn build_conditioning(
     let mut full = vec![0f32; geo.video_tokens() * 128];
     let take = clean.len().min(full.len());
     full[..take].copy_from_slice(&clean[..take]);
-    let cond = if video_to_audio {
-        Conditioning::video_all(geo, &full)
+    // Three different things, and the difference matters:
+    //  * `--video-to-audio` freezes the picture entirely — the soundtrack is
+    //    what is being written;
+    //  * a clip that covers the whole render is *re-noised* and denoised
+    //    again, because freezing it would return it unchanged;
+    //  * a clip (or a still) shorter than the render freezes what it covers
+    //    and generates the rest — a continuation.
+    let covers_all = lat.f >= geo.lf && video.is_some();
+    let (cond, init) = if video_to_audio {
+        (Some(Conditioning::video_all(geo, &full)), None)
+    } else if covers_all {
+        (
+            None,
+            Some(cortiq_engine::ltxpipe::Latents {
+                video: full.clone(),
+                audio: vec![0f32; geo.af * 128],
+            }),
+        )
     } else {
-        Conditioning::video_prefix(geo, &full, lat.f)
+        (Some(Conditioning::video_prefix(geo, &full, lat.f)), None)
     };
-    Ok(Some(match audio_cond {
-        Some(a) => cond.with_audio_all(geo, &a),
-        None => cond,
-    }))
+    let cond = match (cond, audio_cond) {
+        (Some(c), Some(a)) => Some(c.with_audio_all(geo, &a)),
+        (Some(c), None) => Some(c),
+        (None, Some(a)) => Some(Conditioning::default().with_audio_all(geo, &a)),
+        (None, None) => None,
+    };
+    Ok((cond, init))
 }
 
 /// One PPM as a single-frame volume in `[-1, 1]`.
