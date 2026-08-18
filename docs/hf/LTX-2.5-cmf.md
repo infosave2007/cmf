@@ -187,6 +187,37 @@ cortiq ltx-render --model $M --context context.safetensors \
 cortiq ltx-decode --model $M --latent latent.safetensors --out-dir frames/
 ```
 
+## Every mode the model has
+
+LTX-2.5 is one network with two streams, and a *mode* is simply which parts
+you hold fixed. Conditioning is encoded into the model's own latent space and
+frozen there — the sampler gets a timestep of zero for those tokens and
+leaves them alone — so all of this is one command with different inputs.
+
+| mode | how |
+|---|---|
+| text → video + sound | `--prompt "…" --out-audio track.wav` |
+| text → video | the same, without `--out-audio` |
+| text → sound | the same, keeping only the wav |
+| image + text → video (+ sound) | `--image still.ppm` |
+| video → video | `--video frames/` |
+| video → sound | `--video frames/ --video-to-audio` |
+| sound → video | `--audio-in track.wav` |
+| sound → sound | `--audio-in track.wav --out-audio out.wav` |
+| image + sound → video | `--image still.ppm --audio-in track.wav` |
+
+```bash
+# a still into a shot, with its soundtrack
+ffmpeg -i photo.jpg -vf scale=384:256 -pix_fmt rgb24 still.ppm
+cortiq ltx-video --model $M --image still.ppm \
+  --prompt "the camera pushes in slowly as the light shifts" \
+  --height 256 --width 384 --frames 49 --out-dir out/ --out-audio out.wav
+```
+
+Image conditioning runs through the video VAE's **encoder**, audio
+conditioning through the audio VAE's and a log-mel front end — both in this
+same file, along with everything else.
+
 ## What is inside
 
 | component | weights | in the file | codec |
@@ -282,9 +313,11 @@ machine, no Python, no GPU. `--quant` picks the codec for the big planes
   48-block audio-video transformer, the sampler, the latent upscaler, the
   video VAE, the audio VAE with its BigVGAN vocoder and bandwidth extension,
   and the duration head.
-* ⏳ **Image and video conditioning, LoRAs and the IC-LoRA upscaler** are next.
-  The weights for conditioning are in this file (the video VAE's encoder half);
-  the LoRAs and the IC-LoRA upscaler are separate releases.
+* ✅ **Every conditioning mode**: image-to-video, video-to-video,
+  video-to-audio, audio-to-video, audio-to-audio and the image+audio pairs —
+  all from this one file, because both VAE encoders are in it.
+* ⏳ **LoRAs and the IC-LoRA upscaler** are separate releases and not packed
+  here yet.
 
 Everything above is honest about what it is: a 4-bit repack. The reference at
 bf16 is the quality ceiling, and the codec's cost was measured stage by stage
