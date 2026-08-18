@@ -10,6 +10,7 @@ hf upload infosave/DeepSeek-V4-Flash-0731-cmf \
     docs/hf/DeepSeek-V4-Flash-0731-cmf.md README.md
 hf upload infosave/MiniMax-H3-Turbo-cmf \
     docs/hf/MiniMax-H3-Turbo-cmf.md README.md
+hf upload infosave/cmf docs/hf/cmf.md README.md
 ```
 
 A card claims measured numbers. When a release changes them — as 0.5.44 did,
