@@ -12,6 +12,15 @@ tags:
 - cortiq
 - video
 - text-to-video
+- image-to-video
+- image-text-to-video
+- video-to-video
+- video-to-audio
+- audio-to-video
+- text-to-audio
+- audio-to-audio
+- any-to-any
+- text-to-audio-video
 - ltx-video
 - ltx-2.5
 - rust
@@ -37,6 +46,14 @@ tags:
 **Every frame above was produced by `cortiq`** — a single Rust binary with no
 PyTorch, no diffusers, no CUDA toolkit and no Python anywhere in the process —
 reading one memory-mapped [CMF](https://github.com/infosave2007/cmf) file.
+
+**All nine modes run from this one file**: text → video, text → sound,
+text → video + sound, image + text → video, video → video, video → sound,
+sound → video, sound → sound, and image + sound → video. Both VAE encoders
+are packed alongside the decoders, so conditioning needs nothing else — see
+[the table below](#every-mode-the-model-has). The `pipeline_tag` says
+`text-to-video` because that is the one tag Hugging Face lets a model carry
+and it is where people look for this; the rest are in `tags`.
 
 [LTX-2.5](https://huggingface.co/Lightricks/LTX-2.5) renders video **and its
 soundtrack** from one prompt: a 21 B audio-video diffusion transformer that
