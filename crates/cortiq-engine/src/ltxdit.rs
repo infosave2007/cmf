@@ -182,6 +182,10 @@ impl Lin {
     /// product elsewhere. Runs before the bias, which is where the reference
     /// implementations put it — the branch sees the same activations the
     /// base projection did.
+    pub(crate) fn has_lora(&self) -> bool {
+        self.lora.is_some()
+    }
+
     pub(crate) fn add_lora(&self, out: &mut [f32], x: &[f32], n: usize, pool: Option<&Pool>) {
         if let Some(l) = &self.lora {
             l.add(x, n, out, pool);
@@ -221,6 +225,30 @@ impl Lin {
             std::sync::atomic::Ordering::Relaxed,
         );
         let t_mm = std::time::Instant::now();
+        // With an adapter on this projection, the base GEMM and the branch go
+        // to the device in ONE submission: the branch reads the activation the
+        // base GEMM already uploaded and accumulates into the output it just
+        // wrote, so the adapter costs no transfer. Falls through to the split
+        // path when the device declines the shape.
+        #[cfg(target_os = "macos")]
+        if let (Some(l), Some((model, idx, r, cl))) = (&self.lora, self.mapped()) {
+            if n >= 32
+                && n * r * cl >= 128_000_000
+                && cl % 32 == 0
+                && !crate::gpu::mm_killed()
+                && crate::gpu::enabled_here()
+                && crate::gpu_metal::q4tp_matmat_lora(
+                    model, idx, x, n, r, cl, &mut out, &l.side(),
+                )
+            {
+                attn_prof::MATMAT.fetch_add(
+                    t_mm.elapsed().as_micros() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                self.add_bias(&mut out, n, pool);
+                return out;
+            }
+        }
         // A GPU binding is capped near 2 GiB, and the prompt encoder's
         // aggregate projection reads 188160 numbers per token — 1024 of them
         // at once is past the cap. Chunk the batch so no single dispatch
@@ -415,6 +443,13 @@ impl Attn {
         if !crate::gpu::enabled_here() || crate::gpu::mm_killed() {
             return None;
         }
+        // The batched entry carries one weight per job and no branch. When an
+        // adapter is loaded, decline: `apply` then takes the per-projection
+        // path that fuses the base GEMM and the branch into one submission,
+        // which is the cheaper of the two.
+        if self.q.has_lora() || self.k.has_lora() || self.v.has_lora() {
+            return None;
+        }
         let (qw, kw, vw) = (self.q.mapped()?, self.k.mapped()?, self.v.mapped()?);
         if !Arc::ptr_eq(qw.0, kw.0) || !Arc::ptr_eq(qw.0, vw.0) {
             return None;
@@ -451,6 +486,9 @@ impl Attn {
     #[cfg(target_os = "macos")]
     fn fused_kv(&self, ctx: &[f32], m: usize) -> Option<(Vec<f32>, Vec<f32>)> {
         if !crate::gpu::enabled_here() || crate::gpu::mm_killed() {
+            return None;
+        }
+        if self.k.has_lora() || self.v.has_lora() {
             return None;
         }
         let (kw, vw) = (self.k.mapped()?, self.v.mapped()?);

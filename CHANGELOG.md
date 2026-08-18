@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.91] - 2026-08-18
+
+An LTX adapter stops costing 2.6× a step.
+
+### Changed
+- **The LoRA branch is fused into the base GEMM's submission on Metal**
+  (`q4tp_matmat_lora`). It reads the activation buffer that GEMM already
+  uploaded, runs its two products as `mul_mm_f32nt` encoders in the same
+  command buffer, and accumulates into the output buffer through `axpy`
+  before the single download — so an adapter now costs **no transfer at all**.
+  The adapter's own matrices upload once per render and are keyed by a stable
+  branch id.
+
+  Measured on an M4, 384 tokens, same render throughout: **182.7 s** a step
+  with the branch as scalar loops, **39.7** through `gemm_nt` under the
+  device probe, **22.2** pinned to the host, **10.1** fused — against **8.6**
+  with no adapter at all. An adapter is now **1.17×** a step, not 2.6×.
+
+  Correctness is gated by `examples/lora_fused_parity.rs`: fused against a
+  host reference on a real container tensor, worst relative 5.96e-4, where
+  the base GEMM alone already differs from the host by 6.40e-4. The branch
+  adds nothing beyond the codec's own half-precision staging.
+
+  One trap the oracle exists for: `activation_boost` divides the activation
+  buffer by a power of two when a row would overflow half and folds the
+  factor into the *weight* side. The branch's weights get no such fold, so it
+  has to put the factor back — and `wboost` is 1.0 unless something
+  overflows, so the wrong direction would have been invisible until the one
+  prompt that does.
+- The batched q/k/v entry declines when an adapter is loaded: one submission
+  carrying three weights cannot carry three branches, and fusing each
+  projection with its own branch is the cheaper of the two.
+
 ## [0.5.90] - 2026-08-18
 
 LoRA adapters for LTX-2.5, and the multi-subject reference conditioning the

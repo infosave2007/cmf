@@ -35,11 +35,28 @@ pub struct LoraBranch {
     inn: usize,
     out: usize,
     scale: f32,
+    /// Stable for this branch's lifetime — keys its device-resident copy so
+    /// the adapter uploads once per render rather than once per step.
+    id: usize,
 }
+
+static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
 
 impl LoraBranch {
     pub fn rank(&self) -> usize {
         self.rank
+    }
+
+    /// The pieces the fused device path needs.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn side(&self) -> crate::gpu_metal::LoraSide<'_> {
+        crate::gpu_metal::LoraSide {
+            a: &self.a,
+            b: &self.b,
+            rank: self.rank,
+            scale: self.scale,
+            id: self.id,
+        }
     }
 
     /// `dst += scale · (x·Aᵀ)·Bᵀ`, over `n` rows of `x`.
@@ -343,6 +360,7 @@ impl LoraBank {
             inn: *inn,
             out: *out,
             scale: self.scale,
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         })
     }
 
@@ -379,7 +397,7 @@ mod tests {
         let a: Vec<f32> = (0..rank * inn).map(|i| (i as f32 * 0.37).sin()).collect();
         let b: Vec<f32> = (0..out * rank).map(|i| (i as f32 * 0.11).cos()).collect();
         let x: Vec<f32> = (0..n * inn).map(|i| (i as f32 * 0.7).sin()).collect();
-        let br = LoraBranch { a: a.clone(), b: b.clone(), rank, inn, out, scale: 0.5 };
+        let br = LoraBranch { a: a.clone(), b: b.clone(), rank, inn, out, scale: 0.5, id: 0 };
         let mut got = vec![1.5f32; n * out];
         br.add(&x, n, &mut got, None);
         for t in 0..n {
@@ -409,6 +427,7 @@ mod tests {
             inn: 2,
             out: 3,
             scale: 1.0,
+            id: 0,
         };
         let mut out = vec![7.0f32; 3];
         br.add(&[1.0, 2.0], 1, &mut out, None);
