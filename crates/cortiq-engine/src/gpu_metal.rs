@@ -8616,6 +8616,225 @@ pub fn q4tp_matmat_many(
     true
 }
 
+/// A low-rank branch to evaluate in the same submission as the base GEMM.
+///
+/// `a` is `[rank, cols]`, `b` is `[rows, rank]` — the layout `lora_A` and
+/// `lora_B` already have. `id` is stable for the life of the branch and keys
+/// its device-resident copy, which is uploaded once and never again.
+pub struct LoraSide<'a> {
+    pub a: &'a [f32],
+    pub b: &'a [f32],
+    pub rank: usize,
+    pub scale: f32,
+    pub id: usize,
+}
+
+/// `y = X·dequant(W)ᵀ + scale·(X·Aᵀ)·Bᵀ`, in ONE command buffer.
+///
+/// The point is not the branch's arithmetic — it is 4% of the base GEMM's —
+/// but that it reads the activation the base GEMM already uploaded and
+/// accumulates into the output the base GEMM already wrote, so an adapter
+/// costs no transfer at all. Run as two host GEMMs beside this call it cost
+/// 2.6x the step on an M4; the flops were never the problem, the placement
+/// was.
+#[allow(clippy::too_many_arguments)]
+pub fn q4tp_matmat_lora(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    pre: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+    lora: &LoraSide,
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if cols % 32 != 0 || lora.rank % 32 != 0 {
+        return false;
+    }
+    if lora.a.len() != lora.rank * cols || lora.b.len() != rows * lora.rank {
+        return false;
+    }
+    let entry = &model.tensors[idx];
+    let Some(abs) = model.entry_abs_offset(entry) else {
+        return false;
+    };
+    let Some((fbuf, safe_len)) = file_buffer(c, model) else {
+        return false;
+    };
+    let Some(need) =
+        cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[rows, cols])
+    else {
+        return false;
+    };
+    if abs + need > safe_len {
+        return false;
+    }
+    let get_io = |key: usize, nbytes: usize| -> Buffer {
+        let mut cache = c.io_bufs.lock().unwrap();
+        cache
+            .entry(key)
+            .or_insert_with(|| {
+                crate::gpu::probe_note_cold();
+                c._device
+                    .new_buffer(nbytes as u64, MTLResourceOptions::StorageModeShared)
+            })
+            .clone()
+    };
+    // The adapter's own matrices, uploaded once per branch and kept.
+    let mut fresh = false;
+    let a_buf = {
+        let mut cache = c.io_bufs.lock().unwrap();
+        let key = 24_000_000_000usize + lora.id * 2;
+        cache
+            .entry(key)
+            .or_insert_with(|| {
+                fresh = true;
+                c._device.new_buffer(
+                    (lora.a.len() * 4) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                )
+            })
+            .clone()
+    };
+    if fresh {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                lora.a.as_ptr(),
+                a_buf.contents() as *mut f32,
+                lora.a.len(),
+            );
+        }
+    }
+    let mut fresh_b = false;
+    let b_buf = {
+        let mut cache = c.io_bufs.lock().unwrap();
+        let key = 24_000_000_001usize + lora.id * 2;
+        cache
+            .entry(key)
+            .or_insert_with(|| {
+                fresh_b = true;
+                c._device.new_buffer(
+                    (lora.b.len() * 4) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                )
+            })
+            .clone()
+    };
+    if fresh_b {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                lora.b.as_ptr(),
+                b_buf.contents() as *mut f32,
+                lora.b.len(),
+            );
+        }
+    }
+
+    let tprof = std::env::var("CMF_METAL_MMPROF").is_ok();
+    let t_up = std::time::Instant::now();
+    let xs_buf = get_io(21_000_000_659 + pre.len(), pre.len() * 4);
+    unsafe {
+        std::ptr::copy_nonoverlapping(pre.as_ptr(), xs_buf.contents() as *mut f32, pre.len());
+    }
+    let up_us = t_up.elapsed().as_micros() as u64;
+    let wboost = activation_boost(pre, &xs_buf);
+    let y_buf = get_io(22_000_000_663 + b * rows, b * rows * 4);
+    let h_buf = get_io(25_000_000_000 + b * lora.rank, b * lora.rank * 4);
+    let d_buf = get_io(26_000_000_000 + b * rows, b * rows * 4);
+
+    let cmd = c.queue.new_command_buffer();
+    {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&c.q4tpmm);
+        fbuf.bind(enc, 0, abs);
+        enc.set_buffer(1, Some(&xs_buf), 0);
+        enc.set_buffer(2, Some(&y_buf), 0);
+        let (cols_u, rows_u, nb_u) = (cols as u32, rows as u32, b as u32);
+        enc.set_bytes(3, 4, &cols_u as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(5, 4, &nb_u as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(6, 4, &wboost as *const f32 as *const std::ffi::c_void);
+        enc.dispatch_thread_groups(
+            MTLSize::new((b as u64).div_ceil(32), (rows as u64).div_ceil(64), 1),
+            MTLSize::new(128, 1, 1),
+        );
+        enc.end_encoding();
+    }
+    // h = X·Aᵀ — over the activation the base GEMM just read. When a row
+    // would overflow half, `activation_boost` divided the BUFFER by `wboost`
+    // and folded the factor into the weight side; the branch's weights get no
+    // such fold, so it has to put the factor back here. `wboost` is 1.0
+    // whenever nothing overflowed, which is why getting this backwards would
+    // have been invisible until the one prompt that does.
+    enc_f32nt(c, cmd, &a_buf, &xs_buf, &h_buf, b, lora.rank, cols, wboost);
+    // d = scale·h·Bᵀ, then y += d.
+    enc_f32nt(c, cmd, &b_buf, &h_buf, &d_buf, b, rows, lora.rank, lora.scale);
+    {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&c.axpy);
+        enc.set_buffer(0, Some(&d_buf), 0);
+        enc.set_buffer(1, Some(&y_buf), 0);
+        let one = 1.0f32;
+        let n_u = (b * rows) as u32;
+        enc.set_bytes(2, 4, &one as *const f32 as *const std::ffi::c_void);
+        enc.set_bytes(3, 4, &n_u as *const u32 as *const std::ffi::c_void);
+        enc.dispatch_thread_groups(
+            MTLSize::new((b * rows).div_ceil(256) as u64, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+        enc.end_encoding();
+    }
+    let t_gpu = std::time::Instant::now();
+    submit_and_wait(c, cmd, &[&y_buf]);
+    let gpu_us = t_gpu.elapsed().as_micros() as u64;
+    let t_dn = std::time::Instant::now();
+    unsafe {
+        std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, out.as_mut_ptr(), b * rows);
+    }
+    if tprof {
+        MM_UP.fetch_add(up_us, std::sync::atomic::Ordering::Relaxed);
+        MM_GPU.fetch_add(gpu_us, std::sync::atomic::Ordering::Relaxed);
+        MM_DN.fetch_add(
+            t_dn.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        MM_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    true
+}
+
+/// One `C[nb × rows] = scale · X[nb × cols] · W[rows × cols]ᵀ` encoder.
+#[allow(clippy::too_many_arguments)]
+fn enc_f32nt(
+    c: &Ctx,
+    cmd: &metal::CommandBufferRef,
+    w: &Buffer,
+    x: &Buffer,
+    y: &Buffer,
+    nb: usize,
+    rows: usize,
+    cols: usize,
+    scale: f32,
+) {
+    let enc = cmd.new_compute_command_encoder();
+    let pso = mm_pipeline(c, rows, cols, 2);
+    enc.set_compute_pipeline_state(&pso);
+    enc.set_buffer(0, Some(w), 0);
+    enc.set_buffer(1, Some(x), 0);
+    enc.set_buffer(2, Some(y), 0);
+    let (cols_u, rows_u, nb_u) = (cols as u32, rows as u32, nb as u32);
+    enc.set_bytes(3, 4, &cols_u as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(5, 4, &nb_u as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(6, 4, &scale as *const f32 as *const std::ffi::c_void);
+    enc.dispatch_thread_groups(
+        MTLSize::new((nb as u64).div_ceil(32), (rows as u64).div_ceil(64), 1),
+        MTLSize::new(128, 1, 1),
+    );
+    enc.end_encoding();
+}
+
 pub fn q4tp_matmat(
     model: &Arc<CmfModel>,
     idx: usize,
