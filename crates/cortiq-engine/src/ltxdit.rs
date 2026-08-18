@@ -843,6 +843,10 @@ impl LtxDit {
         pool: Option<&Pool>,
         trace: &mut dyn FnMut(&str, &[f32]),
     ) -> (Vec<f32>, Vec<f32>) {
+        // A denoising step is the opposite of what the per-op probe is built
+        // for: forty-eight identical blocks, the same shapes every time, the
+        // device warm throughout. Take the probe out of it.
+        let _trust = crate::gpu::trust_gpu();
         let dim = self.heads * self.dh;
         let a_dim = self.a_heads * self.a_dh;
         let (n, m) = (video.tokens, audio.tokens);

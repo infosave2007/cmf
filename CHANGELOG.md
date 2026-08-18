@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.85] - 2026-08-18
+
+Metal on a 24 GB Mac: the device is used, and it stays used.
+
+A 22 GB container does not fit in one Metal buffer, so it is mapped as two
+overlapping windows — and the driver accounts its working set by buffer
+length. Materializing both put more on its books than it will keep wired, so
+it evicted and re-wired between commits and a 190 ms matmul took 2.7 s. Three
+strikes and the kill switch put the whole process on the CPU. Three changes:
+
+* **windows are built on first use**, so a phase that lives in one of them
+  never causes the other to exist;
+* **a phase can park the device process-wide** (`gpu::pause_gpu`) — the LTX
+  prompt encoder does, because its weights are in the window the denoising
+  loop never touches, and `cpu_scope` is thread-local so the pool's workers
+  ignore it;
+* **a phase can take the probe out of the loop** (`gpu::trust_gpu`). The
+  per-op probe times ops in isolation and alternates arms to do it, which
+  reads a sustained diffusion step as slower on the device than it is:
+  it measured 1.25 ms against the CPU's 0.88 ms and picked the CPU, whose
+  loop then ran 23.9 s a step against the device's 19.7 s.
+
+Measured on an M4 with 24 GB, 384×256, 49 frames, no environment variables:
+
+| | before | after |
+|---|---|---|
+| prompt encode | 45 s | 33 s |
+| denoising step | 23.2 s | 19.9 s |
+| GPU stalls | 3, then the CPU for the rest of the process | none |
+
+
 ## [0.5.84] - 2026-08-18
 
 Every conditioning mode LTX-2.5 has, and the numbers to justify two of them.

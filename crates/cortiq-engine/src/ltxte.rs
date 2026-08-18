@@ -291,8 +291,15 @@ impl LtxTextEncoder {
 
     #[cfg(target_os = "macos")]
     fn crowds_the_device(&self) -> bool {
-        let budget = crate::gpu_metal::working_set_bytes();
-        budget > 0 && self.mapped_bytes > budget
+        // Two tests, and the buffer one is what actually bites: a container
+        // larger than the biggest buffer the device will make needs more
+        // than one window, and the encoder's weights and the transformer's
+        // are in different windows. Whichever limit the mapping is past,
+        // the prompt phase is better off on the CPU.
+        let one_window = crate::gpu_metal::max_buffer_bytes();
+        let wired = crate::gpu_metal::working_set_bytes();
+        (one_window > 0 && self.mapped_bytes > one_window)
+            || (wired > 0 && self.mapped_bytes > wired)
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -465,7 +472,12 @@ impl LtxTextEncoder {
         mask: &[f32],
         pool: Option<&Pool>,
     ) -> (Vec<f32>, Vec<f32>, usize) {
-        let hs = self.hidden_states(ids, mask, pool);
+        // The pause covers the *whole* prompt phase — the layers, the
+        // aggregate projections and the connectors. Leaving the connectors
+        // outside it was enough to put the far half of the container back on
+        // the driver's books and cost seconds a call.
+        let _pause = self.crowds_the_device().then(crate::gpu::pause_gpu);
+        let hs = self.hidden_states_inner(ids, mask, pool);
         let (t, d, l) = (ids.len(), self.hidden, hs.len());
         // per-token, per-layer RMS over the hidden dimension, concatenated
         // layer-last: [T, d·L]
