@@ -9113,6 +9113,19 @@ pub fn q4tp_ffn(
     // host — buffer setup and an activation scan — with the card idle. The
     // same question deserves an answer here rather than an assumption, so
     // CMF_FFN_COUNT=1 splits a call at the submit.
+    //
+    // ANSWERED, and the answer is the opposite. On an M4 with MiniMax-H3 at
+    // 384x256, nine frames, four steps (`CMF_METAL_MMPROF=1`, which measures
+    // the same split across every four-bit GEMM):
+    //
+    //   q4tp mm x1091: upload 0.7 s | submit+wait 51.1 s | readback 1.3 s
+    //
+    // Two seconds of host work out of 53. Unified memory means the copies
+    // are nothing, and the kernels already use simdgroup_matrix. That render
+    // is ~210 TFLOP of arithmetic sustained at ~4.1 TFLOPS, which is about
+    // what the machine has. So the host-side win on wgpu does not port here,
+    // and on a Mac the lever is fewer tokens — the latent upscaler, chunked
+    // rendering — not a faster GEMM.
     let t_host = t_stage.elapsed();
     submit_and_wait(c, cmd, &[&y_buf]);
     if std::env::var("CMF_FFN_COUNT").is_ok() {
