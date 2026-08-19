@@ -24667,23 +24667,20 @@ pub fn q4tp_ffn_packed(
     };
     // Putting fc2 on the matrix units costs a second plane unpack plus a
     // max-reduction over the activation panel, and whether that pays depends
-    // on how wide the panel is. Measured on MiniMax-H3, 22 frames, four
-    // steps, two runs each way:
-    //
-    //   512×288 (b ≈ 1.1k rows): 137.4 s without, 139.8 s with — neutral.
-    //   768×448 (b = 2449 rows):  75.3 s of denoise without, 70.9 s with.
-    //
-    // So it is on for a wide panel and off for a narrow one, with
-    // CMF_FFN_FC2_COOP forcing either arm for the A/B. The row counts are
-    // from the render itself (`CMF_GPU_DEBUG=1` prints them) rather than
-    // from arithmetic on the frame size, which is how the threshold first
-    // landed at four times the panel it was meant to catch.
+    // The reduction that feeds the f16 arm its activation scale comes in two
+    // shapes on this backend — a single-workgroup `act_absmax` and a
+    // two-stage `act_amax_part`/`act_amax_fold`. The gate below asked for the
+    // first one by name, so on a card that has only the second the fc2 plane
+    // never ran however the switch was set. That is why it kept measuring
+    // neutral: the arm under test was not the arm being taken.
+    let have_reduction =
+        c.act_absmax.is_some() || (c.act_amax_part.is_some() && c.act_amax_fold.is_some());
     match (
-        c.act_absmax.as_ref().filter(|_| want_fc2_coop),
+        (have_reduction && want_fc2_coop).then_some(()),
         &dq2,
         c.q4tp_mm_coop_f16.as_ref(),
     ) {
-        (Some(amax), Some((plane2, bind_dq2)), Some(pipe)) => {
+        (Some(()), Some((plane2, bind_dq2)), Some(pipe)) => {
             {
                 let mut pass = begin_pass(&mut enc);
                 pass.set_pipeline(c.q4tp_dq_f16.as_ref().unwrap());
@@ -24743,6 +24740,11 @@ pub fn q4tp_ffn_packed(
                     pass.dispatch_workgroups(1, 1, 1);
                 }
                 _ => {
+                    // The one-workgroup form, for a card without the split
+                    // reduction. `have_reduction` guarantees one of the two.
+                    let Some(amax) = c.act_absmax.as_ref() else {
+                        return false;
+                    };
                     let bg_amax = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: None,
                         layout: &amax.get_bind_group_layout(0),
