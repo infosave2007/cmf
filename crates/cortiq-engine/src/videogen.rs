@@ -53,6 +53,12 @@ pub struct AnimParams {
     /// A LoRA adapter (.safetensors) applied at runtime, and how hard.
     pub lora: Option<String>,
     pub lora_strength: f32,
+    /// The published latent upscaler (.safetensors) and the factor to
+    /// apply: the denoised latent is resized by the learned net and the
+    /// VAE decodes at the larger size, so the 5 B-parameter decode →
+    /// pixel resize → encode round trip never happens.
+    pub upscale: Option<String>,
+    pub upscale_by: f32,
 }
 
 /// The vision-block token ids the H3 presentation flanks a picture with.
@@ -117,6 +123,8 @@ impl Default for AnimParams {
             mid_frames: Vec::new(),
             lora: None,
             lora_strength: 1.0,
+            upscale: None,
+            upscale_by: 2.0,
         }
     }
 }
@@ -468,7 +476,7 @@ fn generate_inner(
     }
 
     // ── denoise ──
-    let (video, audio) = {
+    let (mut video, audio) = {
         // The adapter is read here, after the encoder's pages are gone:
         // a rank-32 file for this DiT is 130 MB of f32 once expanded and
         // there is no reason for it to share a peak with 12 GB of text
@@ -587,6 +595,44 @@ fn generate_inner(
     };
 
     lap(&mut marks, "denoise");
+
+    // ── the learned latent resize, when one was handed in ──
+    let (mut out_h, mut out_w) = (p.height, p.width);
+    let (mut lat_h, mut lat_w) = (lat_h, lat_w);
+    if let Some(path) = p.upscale.as_deref() {
+        progress("upscale", 0, 1);
+        let t = std::time::Instant::now();
+        let ups = crate::mmh3ups::LatentUpscaler::load(std::path::Path::new(path))?;
+        let z = crate::mmh3ups::Vol {
+            c: video.len() / (latent_t * lat_h * lat_w),
+            t: latent_t,
+            h: lat_h,
+            w: lat_w,
+            data: video,
+        };
+        // Snap to the VAE's own 16-pixel grid: the net takes any target,
+        // the decoder does not.
+        let f = p.upscale_by.max(1.0);
+        let nh = ((lat_h as f32 * f).round() as usize).max(lat_h);
+        let nw = ((lat_w as f32 * f).round() as usize).max(lat_w);
+        let big = ups.upscale(&z, nh, nw, None);
+        tracing::info!(
+            "latent upscale {}x{} -> {}x{} in {:.1}s",
+            lat_h,
+            lat_w,
+            nh,
+            nw,
+            t.elapsed().as_secs_f64()
+        );
+        out_h = out_h * nh / lat_h;
+        out_w = out_w * nw / lat_w;
+        lat_h = nh;
+        lat_w = nw;
+        video = big.data;
+        progress("upscale", 1, 1);
+        lap(&mut marks, "upscale");
+    }
+
     // ── decode ──
     progress("video vae", 0, 1);
     let (rgb, out_frames) = {
@@ -632,10 +678,10 @@ fn generate_inner(
     // frame, so trim rather than pad.
     let keep = out_frames.min(frames_total);
     Ok(Anim {
-        rgb: trim_frames(&rgb, out_frames, keep, p.height, p.width),
+        rgb: trim_frames(&rgb, out_frames, keep, out_h, out_w),
         frames: keep,
-        height: p.height,
-        width: p.width,
+        height: out_h,
+        width: out_w,
         audio: wave,
         samples,
         sample_rate: sr,
