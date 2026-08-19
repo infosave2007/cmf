@@ -22477,7 +22477,14 @@ fn tp_matmat_impl(
             );
         }
     }
-    let ascale: f32 = if coop_arm && src.is_none() {
+    // The scan happens only if the card is not going to do it (see dev_scale
+    // below): scanning and then ignoring the result is what this path did for
+    // an afternoon.
+    let can_reduce_here =
+        (c.act_amax_part.is_some() && c.act_amax_fold.is_some()) || c.act_absmax.is_some();
+    let host_scan =
+        std::env::var("CMF_FFN_HOST_SCAN").as_deref() == Ok("1") || !can_reduce_here;
+    let ascale: f32 = if coop_arm && src.is_none() && host_scan {
         let mx = xs[..b * cols]
             .iter()
             .fold(0f32, |m, v| if v.is_finite() { m.max(v.abs()) } else { m });
@@ -22539,7 +22546,15 @@ fn tp_matmat_impl(
     // it takes a one-element dummy here because this path computes the
     // scale on the host and passes it in `pad`.
     let f16_arm = dq_plane.is_some() && c.q4tp_mm_coop_f16.is_some();
-    let dev_scale = f16_arm && src.is_some();
+    // A host operand's scale is taken on the card too, not only a resident
+    // one: the scan is 13.2 M floats at DiT shapes and it runs on one core
+    // before anything is submitted. The same change in the packed FFN moved
+    // its host time per call from 116.4 ms to 77.0 ms and a 768×448 denoise
+    // from 69.6 s to 62.4 s, byte-identical. `CMF_FFN_HOST_SCAN=1` keeps the
+    // host scan on both paths.
+    let dev_scale = f16_arm
+        && (src.is_some()
+            || (can_dev_scale && !host_scan));
     if dev_scale {
         params[3] = 0xFFFF_FFFFu32;
     }
