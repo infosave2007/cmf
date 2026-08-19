@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Notes
+- **The Metal path is kernel-bound where the wgpu path was host-bound.**
+  Measured on an M4 with MiniMax-H3 at 384×288, nine frames, four steps:
+  `q4tp mm x1091: upload 0.7 s · submit+wait 51.1 s · readback 1.3 s` — two
+  seconds of host work out of 53, against three quarters of a call on wgpu.
+  Unified memory makes the copies free and the kernels already use
+  `simdgroup_matrix`; that render is ~210 TFLOP sustained at ~4.1 TFLOPS,
+  about what an M4 has. So 0.5.96's win does not port to Macs, and the lever
+  there is fewer tokens (`--upscale`, `--stream-chunk`), not a faster GEMM.
+
 ## [0.5.96] - 2026-08-19
 
 Three quarters of a four-bit FFN call was host time, and most of that was one
