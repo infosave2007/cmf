@@ -55,15 +55,14 @@ branches that do not matter.
   adapter rather than like the base: 13.34 dB PSNR against the base render
   where the full adapter is 13.76, and 16.75 dB against the full adapter.
 
-  What it costs: **33.7 s a step with the adapter against 29.8 s without**,
-  taking the base run measured immediately after it — 1.13×. Against the base
-  run measured fifteen minutes *earlier* the same adapter looks like 1.37×,
-  and that difference is the machine, not the code: the identical base render
-  drifted from 24.6 to 29.8 s a step between the two, and the video VAE, which
-  no adapter touches, moved 48.6 → 94.2 → 56.2 s across three runs. On a
-  24 GB Mac under memory pressure that is the measurement floor; read the cost
-  as "roughly one tenth of a step, not a doubling", and treat a sharper number
-  as owed.
+  What it costs, measured back to back with the machine's memory freed:
+  **denoise 133.6 s with the adapter against 126.1 s without — 1.06×.** The
+  video VAE, which no adapter touches, moved 53.4 → 56.9 s between those two
+  runs, so the adapter sits at or below this machine's own noise. Earlier in
+  the same session, with 6 GB of swap in use, the same pair read 1.13× and
+  1.37×, because the base render alone drifted from 22.2 to 32.5 s a step.
+  On a memory-bound Mac an adapter is effectively free; where the DiT is fully
+  resident the fusion it stands down should show, and that number is owed.
 
   The branch's own GEMMs are not the cost — on Metal they ride inside the base
   GEMM's submission (`q4tp_matmat_lora`) and pay no transfer. What an adapter
