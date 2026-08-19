@@ -267,6 +267,14 @@ pub struct LoraBank {
     scale: f32,
 }
 
+/// Read a `.safetensors` into `{name: (shape, f32 data)}`. Shared with the
+/// latent upscaler next door, which loads its weights the same way.
+pub(crate) fn read_safetensors(
+    path: &Path,
+) -> Result<HashMap<String, (Vec<usize>, Vec<f32>)>, String> {
+    st_read(path).map(|(t, _)| t)
+}
+
 fn st_read(path: &Path) -> Result<(HashMap<String, (Vec<usize>, Vec<f32>)>, HashMap<String, String>), String> {
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     if bytes.len() < 8 {
