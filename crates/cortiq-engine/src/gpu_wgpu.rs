@@ -21581,8 +21581,14 @@ fn dispatch_matmat_keep(
             "mm-xs",
         ),
     };
-    c.queue
-        .write_buffer(&xs_buf, 0, bytemuck::cast_slice(&pre[..b * cols]));
+    // Only a host operand is uploaded. Writing here unconditionally would
+    // overwrite the resident panel the previous kernel just produced — and
+    // with `pre` empty, as the device-side callers pass it, index past the
+    // end of an empty slice.
+    if src.is_none() {
+        c.queue
+            .write_buffer(&xs_buf, 0, bytemuck::cast_slice(&pre[..b * cols]));
+    }
     let y_size = (b * rows * 4) as u64;
     let y_buf = Scratch::ensure(
         &c.device,
