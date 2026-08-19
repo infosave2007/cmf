@@ -24644,11 +24644,21 @@ pub fn q4tp_ffn_packed(
         usage: wgpu::BufferUsages::STORAGE,
         mapped_at_creation: false,
     });
-    let want_fc2_coop = match std::env::var("CMF_FFN_FC2_COOP").as_deref() {
-        Ok("1") => true,
-        Ok("0") => false,
-        _ => b >= 2048,
-    };
+    // MEASURED NEUTRAL AT BOTH SIZES, so opt-in: putting fc2 on the matrix
+    // units costs a second plane unpack plus a max-reduction over the
+    // activation panel. On MiniMax-H3, 22 frames, four steps:
+    //
+    //   512×288 (b ≈ 1.1k rows): 137.4 s without, 139.8 s with.
+    //   768×448 (b = 2449 rows): one alternating pair said 75.3 s of denoise
+    //     without against 70.9 s with — and the next pair, back to back,
+    //     said 71.3 s without against 70.9 s with. The first pair was the
+    //     stand drifting (its container pages had gone cold), not the
+    //     kernel. A default set from that would have been noise shipped.
+    //
+    // `CMF_FFN_FC2_COOP=1` takes it; a multi-workgroup reduction is what
+    // would tip it. Row counts are from the render itself — CMF_GPU_DEBUG=1
+    // prints them — not from arithmetic on the frame size.
+    let want_fc2_coop = std::env::var("CMF_FFN_FC2_COOP").as_deref() == Ok("1");
     let dq2 = if want_fc2_coop {
         let mut sc = c.scratch.lock().unwrap();
         dq_f16_plane_slot(c, &mut sc, &w2b, hidden, inter, true)
