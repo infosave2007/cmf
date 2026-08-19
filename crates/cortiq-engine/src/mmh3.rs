@@ -1304,13 +1304,13 @@ impl MiniMaxH3 {
                         "mmh3 fuse-out gate: qkv_q={} out_q={} qkv_map={} out_map={}",
                         matches!(&blk.qkv, Proj::Q(_)),
                         matches!(&blk.out, Proj::Q(_)),
-                        matches!(&blk.qkv, Proj::Q(q) if q.mapped_q4tp().is_some()),
-                        matches!(&blk.out, Proj::Q(o) if o.mapped_q4tp().is_some()),
+                        matches!(&blk.qkv, Proj::Q(q) if q.mapped_device_gemm().is_some()),
+                        matches!(&blk.out, Proj::Q(o) if o.mapped_device_gemm().is_some()),
                     )
                 });
             }
             if let (true, Proj::Q(q), Proj::Q(o)) = (fuse_out, &blk.qkv, &blk.out) {
-                if let (Some((m, i)), Some((_, oi))) = (q.mapped_q4tp(), o.mapped_q4tp()) {
+                if let (Some((m, i)), Some((_, oi))) = (q.mapped_device_gemm(), o.mapped_device_gemm()) {
                     let mut proj = vec![0f32; n * hs];
                     if crate::gpu::dit_qkv_attn_out(
                         m,
@@ -1340,7 +1340,7 @@ impl MiniMaxH3 {
                 }
             }
             if let Proj::Q(q) = &blk.qkv {
-                if let Some((m, i)) = q.mapped_q4tp() {
+                if let Some((m, i)) = q.mapped_device_gemm() {
                     let mut attn = vec![0f32; n * inner];
                     if crate::gpu::dit_qkv_attention(
                         m,
@@ -1463,7 +1463,7 @@ impl MiniMaxH3 {
             && n >= 64
         {
             if let (Proj::Q(q1), Proj::Q(q2)) = (&blk.fc1, &blk.fc2) {
-                if let (Some((m, i1)), Some((_, i2))) = (q1.mapped_q4tp(), q2.mapped_q4tp()) {
+                if let (Some((m, i1)), Some((_, i2))) = (q1.mapped_device_gemm(), q2.mapped_device_gemm()) {
                     let mut fout = vec![0f32; n * hs];
                     if crate::gpu::q4tp_ffn_packed(m, i1, i2, &xn, n, hs, self.ffn, None, &mut fout)
                     {

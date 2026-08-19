@@ -522,6 +522,25 @@ impl QTensor {
         }
     }
 
+    /// (model, tensor idx) for a mapped weight in ANY codec the fused device
+    /// paths can run — four-bit tiled or either int8 layout.
+    ///
+    /// The fused DiT chains asked for `mapped_q4tp` by name, so an eight-bit
+    /// container never reached them and rendered through per-op GEMMs even
+    /// after those kernels learned its codec. The gate is what the codec has
+    /// a device GEMM for, not which codec it is.
+    pub fn mapped_device_gemm(&self) -> Option<(&Arc<CmfModel>, usize)> {
+        match self {
+            Self::Mapped {
+                model,
+                idx,
+                dtype: TensorDtype::Q4TiledP | TensorDtype::Q8Row | TensorDtype::Q8_2f,
+                ..
+            } => Some((model, *idx)),
+            _ => None,
+        }
+    }
+
     /// (model, tensor idx) for a q2tp mapped weight — the 2-bit twin of
     /// `mapped_q4tp`, used by the mixed MoE profile.
     pub fn mapped_q2tp(&self) -> Option<(&Arc<CmfModel>, usize)> {
