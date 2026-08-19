@@ -21727,12 +21727,18 @@ fn dispatch_matmat_keep(
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
-        // The scratch guard goes before any encoding: `encode_act_absmax`
-        // takes that same lock for its partials buffer, and std's Mutex is
-        // not reentrant — holding it here hung the card at 0% util with the
-        // process idling, which is precisely what it looks like from outside.
-        // The buffers are handles; they outlive the guard.
-        drop(sc);
+        // The partials buffer for the device-side max|x| is taken HERE, under
+        // the guard this function already holds — `encode_act_absmax` would
+        // otherwise take that same lock a second time, and std's Mutex is not
+        // reentrant. That deadlock looks from outside like a card at 0% with
+        // the process idling, which is exactly how it presented.
+        let amax_parts = Scratch::ensure(
+            &c.device,
+            &mut sc.amaxp,
+            512 * 4,
+            wgpu::BufferUsages::STORAGE,
+            "q8coop-amax-parts",
+        );
         let bind_mm = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("q8coop-bg"),
             layout: &mm_pipe.get_bind_group_layout(0),
@@ -21757,7 +21763,7 @@ fn dispatch_matmat_keep(
             pass.dispatch_workgroups(wgs.min(MAX_WG), wgs.div_ceil(MAX_WG), 1);
         }
         if dev_scale {
-            encode_act_absmax(c, &mut enc, &xs_buf, b * cols, &asc_buf);
+            encode_act_absmax_with(c, &mut enc, &xs_buf, b * cols, &asc_buf, Some(&amax_parts));
         }
         {
             let mut pass = begin_pass_with(&mut enc, Some("q8coop"), None);
@@ -21771,10 +21777,13 @@ fn dispatch_matmat_keep(
         }
         return match out.as_mut() {
             Some(o) => {
-                readback(c, enc, &y_buf, &stage_buf, y_size, &mut o[..b * rows]).then_some(y_buf)
+                let ok = readback(c, enc, &y_buf, &stage_buf, y_size, &mut o[..b * rows]);
+                drop(sc);
+                ok.then_some(y_buf)
             }
             None => {
                 c.queue.submit(Some(enc.finish()));
+                drop(sc);
                 Some(y_buf)
             }
         };
@@ -22238,6 +22247,21 @@ fn encode_act_absmax(
     n: usize,
     asc: &wgpu::Buffer,
 ) -> bool {
+    encode_act_absmax_with(c, enc, act, n, asc, None)
+}
+
+/// The same, for a caller that already holds the scratch guard: it passes the
+/// partials buffer in rather than making this take the lock a second time.
+/// std's Mutex is not reentrant, and that deadlock looks from outside like a
+/// card sitting at 0% with the process idle.
+fn encode_act_absmax_with(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    act: &wgpu::Buffer,
+    n: usize,
+    asc: &wgpu::Buffer,
+    parts: Option<&wgpu::Buffer>,
+) -> bool {
     let ap = c
         .device
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -22248,15 +22272,18 @@ fn encode_act_absmax(
     match (c.act_amax_part.as_ref(), c.act_amax_fold.as_ref()) {
         (Some(part), Some(fold)) => {
             let nparts = 512usize;
-            let pbuf = {
-                let mut sc = c.scratch.lock().unwrap();
-                Scratch::ensure(
-                    &c.device,
-                    &mut sc.amaxp,
-                    (nparts * 4) as u64,
-                    wgpu::BufferUsages::STORAGE,
-                    "q4tpmm-amax-parts",
-                )
+            let pbuf = match parts {
+                Some(b) => b.clone(),
+                None => {
+                    let mut sc = c.scratch.lock().unwrap();
+                    Scratch::ensure(
+                        &c.device,
+                        &mut sc.amaxp,
+                        (nparts * 4) as u64,
+                        wgpu::BufferUsages::STORAGE,
+                        "q4tpmm-amax-parts",
+                    )
+                }
             };
             let bg1 = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
