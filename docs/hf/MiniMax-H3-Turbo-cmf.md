@@ -624,21 +624,20 @@ axis, which is where an activation-outlier channel shows up from the weight
 side. As a codec it is strictly more faithful than the four-bit ladder.
 
 Until today it was also the slow one. RTX 5090, 512×288, 22 frames, four
-steps, one machine, one sitting:
+steps. The last two rows are three alternating runs each — `q4 q8 q4 q8 q4 q8`,
+both containers warm — because a codec comparison taken any other way measures
+the page cache:
 
 | | denoise | video VAE | wall |
 |---|---|---|---|
 | q8_2f, 0.5.94 | 103.3 s | 62.2 s | 171.5 s |
 | q8_2f, scalar int8 kernel | 56.2 s | 19.5 s | 81 s |
-| **q8_2f, 0.5.95** | **31.7 s** | **9.0 s** | **46 s** |
-| q4tp, same session | 17.7 s | 8.7 s | 31 s |
+| **q8_2f, 0.5.95** | **29.6 s** (27.5 / 29.9 / 31.3) | **8.6 s** | **43 s** |
+| q4tp | 21.5 s (20.8 / 24.3 / 19.4) | 8.8 s | 36 s |
 
-**3.7× on the eight-bit file, and its VAE now matches the four-bit one
-exactly — but four-bit still denoises 1.8× faster**, and 27 GB of weights
-against 15 GB is most of what is left of that. Read the q4tp row carefully if
-you saw an earlier version of this table: it said ~101 s, measured with that
-container on a network filesystem, cold, so its page faults landed inside the
-denoise timer. Both rows above are local disk, warm, alternating runs.
+**Four times faster than the file you may have downloaded, and its VAE now
+matches the four-bit one exactly. Four-bit still denoises 1.38× faster** —
+27 GB of weights against 15 GB is most of what is left of that gap.
 
 Three things were in the way, and none of them was the codec:
 
