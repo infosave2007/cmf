@@ -23011,9 +23011,13 @@ pub fn vae_qkv_attn_out(
     let inner = nh * hd;
     let can_dev_scale =
         (c.act_amax_part.is_some() && c.act_amax_fold.is_some()) || c.act_absmax.is_some();
+    let four_bit = model
+        .tensors
+        .get(qkv_idx)
+        .is_some_and(|e| e.dtype == cortiq_core::TensorDtype::Q4TiledP);
     if !can_dev_scale
-        || c.q4tp_mm_coop_f16.is_none()
-        || c.q4tp_dq_f16.is_none()
+        || (four_bit && c.q4tp_mm_coop_f16.is_none())
+        || (four_bit && c.q4tp_dq_f16.is_none())
         || c.dit_qkv_split.is_none()
         || c.dit_qknorm.is_none()
         || inner != dim
@@ -23025,9 +23029,11 @@ pub fn vae_qkv_attn_out(
     {
         return false;
     }
-    let mut unused = Vec::new();
-    let Some(panel) = tp_matmat_keep(model, qkv_idx, xn, n, 3 * inner, dim, &mut unused, false)
-    else {
+    // Whichever codec the container is packed in. This used to call the
+    // four-bit entry by name while the caller's gate had been widened to any
+    // weight with a device GEMM, so an eight-bit VAE read its int8 payload as
+    // four-bit tiles: a decode that ran fast and returned a flat grey frame.
+    let Some(panel) = fused_panel_keep(model, qkv_idx, xn, n, 3 * inner, dim) else {
         return false;
     };
     let ones = vec![1.0f32; hd];
@@ -23048,18 +23054,7 @@ pub fn vae_qkv_attn_out(
         return false;
     }
     let Some(ab) = ab else { return false };
-    tp_matmat_impl(
-        model,
-        out_idx,
-        &[],
-        n,
-        dim,
-        inner,
-        Some(proj),
-        Some(&ab),
-        false,
-    )
-    .is_some()
+    fused_gemm_from_device(model, out_idx, &ab, n, dim, inner, proj)
 }
 
 /// Bisect handle: the VAE's head-interleaved split plus the weightless
