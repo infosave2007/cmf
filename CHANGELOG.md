@@ -16,6 +16,18 @@ learns to render a clip in chunks.
   first frames and a window of the last, with the already-clean frames entering
   at timestep 0. `--stream-sink` and `--stream-window` set the two spans. Built
   for the RAVEN streaming adapter, which trains exactly this rollout.
+- **An int8 weight reaches the matrix units.** The four-bit path unpacks its
+  weight into an f16 plane and hands that to the cooperative GEMM; int8 ran
+  the scalar kernel on the scalar ALUs, which is most of what separated the
+  two codecs on the clock. `q8_dq_f16` writes the same plane — and folds the
+  two-field codec's column field into it, so the activation is no longer
+  multiplied by that field on the host before every projection.
+  `CMF_Q8_COOP=0` keeps the scalar arm.
+- **The fused chains gate on having a device GEMM, not on being four-bit.**
+  `QTensor::mapped_q4tp` was the door to every fused path in the DiT and the
+  3D VAE, so an eight-bit container walked past all of them into per-op GEMMs
+  — including after those kernels learned its codec. `mapped_device_gemm`
+  answers for q4tp, q8_row and q8_2f alike.
 - **`ffn_packed`, `fused_panel_keep`, `fused_gemm_from_device`.** The fused DiT
   submissions used to ask for a four-bit weight by name; a container packed any
   other way fell back to per-op GEMMs with a readback between every one, and a
