@@ -26,6 +26,21 @@ learns to render a clip in chunks.
 - **`CMF_FUSED_ANY=0`** puts a non-four-bit container back on the per-op path,
   so the fusion can be measured against itself on one machine.
 
+### Changed
+- **The streaming sink and window count latent frames, not chunks.** The
+  reference card's `sink 2 / window 2` is the attention-sink trick as everyone
+  else writes it — two frames pinned at the start, a couple trailing the
+  current chunk — and reading them as chunks made every chunk attend to four
+  chunks of context, more rows than the bidirectional path it replaces.
+  `CMF_STREAM_UNIT=chunks` keeps the old reading.
+- **The two-field int8 encoder uses the whole machine.** `encode_q8_2f` walked
+  the tensor twice on one core while `encode_q4tp` beside it split rows across
+  the box — an order of magnitude on the codec a 20 B DiT gets packed in, and
+  packing a container was the wait. The column field is a reduction across
+  rows, so it is blocked at a fixed 256 rows and summed in index order: the
+  bytes must not depend on the core count, and the byte-identity test now
+  covers this codec too.
+
 ### Fixed
 - The parity harness did not know the two context segment kinds the streaming
   layout added, which stopped the whole workspace compiling under

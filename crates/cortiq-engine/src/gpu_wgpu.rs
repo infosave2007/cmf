@@ -12466,6 +12466,8 @@ struct Ctx {
     act_amax_part: Option<wgpu::ComputePipeline>,
     act_amax_fold: Option<wgpu::ComputePipeline>,
     q4tp_dq_f16: Option<wgpu::ComputePipeline>,
+    /// The int8 twin of `q4tp_dq_f16` — same plane, same GEMM after it.
+    q8_dq_f16: Option<wgpu::ComputePipeline>,
     q4tp_mm_coop_f16: Option<wgpu::ComputePipeline>,
     /// The bake's f32-operand forward GEMM on the matrix units; None off
     /// tensor-core devices, and `gemm_nt_f32` falls back to the scalar arm.
@@ -13550,6 +13552,10 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let q4tp_dq_f16 = (want_f16 && q4tp_mm_coop.is_some())
         .then(|| mk_coop(COOP_DQ_SRC, "q4tp-dq", "q4tp_dq_f16"))
         .flatten();
+    let q8_dq_f16 = q4tp_dq_f16
+        .is_some()
+        .then(|| mk_coop(COOP_DQ8_SRC, "q8-dq", "q8_dq_f16"))
+        .flatten();
     let q4tp_mm_coop_f16 = (q4tp_dq_f16.is_some())
         .then(|| mk_coop(COOP_MM_F16_SRC, "q4tp-mm-f16", "q4tp_mm_coop_f16"))
         .flatten();
@@ -13972,6 +13978,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         act_amax_part,
         act_amax_fold,
         q4tp_dq_f16,
+        q8_dq_f16,
         q4tp_mm_coop_f16,
         gemm_nt_coop,
         gemm_nn_coop,
@@ -21617,6 +21624,105 @@ fn dispatch_matmat_keep(
         wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         "mm-stage",
     );
+    // The matrix units, for an int8 weight. The four-bit path unpacks its
+    // weight into an f16 plane and hands that to the cooperative GEMM; int8
+    // had no such arm and ran the scalar `mul_mm` instead, which is most of
+    // what separated the two codecs on the clock. The plane is the same, the
+    // GEMM after it is the same — only the unpacker differs, and int8's is
+    // one multiply. Worth its pass only when the batch amortizes it, hence
+    // the same b >= 64 gate the four-bit arm uses.
+    let coop = if b >= 64 && cols % 2 == 0 && !std::env::var("CMF_Q8_COOP")
+        .is_ok_and(|v| v == "0")
+    {
+        c.q4tp_mm_coop_f16
+            .as_ref()
+            .and_then(|_| dq8_f16_plane(c, &mut sc, &q_buf, &rs_buf, rows, cols))
+    } else {
+        None
+    };
+    // A resident operand never passed through the host, so max|x| has to be
+    // taken on the card; without that reduction the f16 operands overflow.
+    let can_dev_scale =
+        (c.act_amax_part.is_some() && c.act_amax_fold.is_some()) || c.act_absmax.is_some();
+    let coop = if src.is_some() && !can_dev_scale { None } else { coop };
+    if let (Some((plane, bind_dq)), Some(mm_pipe)) = (&coop, c.q4tp_mm_coop_f16.as_ref()) {
+        let dev_scale = src.is_some();
+        let ascale: f32 = if dev_scale {
+            0.0
+        } else {
+            let mx = pre[..b * cols]
+                .iter()
+                .fold(0f32, |m, v| if v.is_finite() { m.max(v.abs()) } else { m });
+            if mx > 1000.0 { 1000.0 / mx } else { 1.0 }
+        };
+        let cp = [
+            (cols / 4) as u32,
+            rows as u32,
+            b as u32,
+            if dev_scale { 0xFFFF_FFFFu32 } else { ascale.to_bits() },
+        ];
+        let cp_buf = c
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("q8coop-params"),
+                contents: bytemuck::cast_slice(&cp),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let asc_buf = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("q8coop-ascale"),
+            size: 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let bind_mm = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("q8coop-bg"),
+            layout: &mm_pipe.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, plane),
+                bind_buf(1, &xs_buf),
+                bind_buf(2, &y_buf),
+                bind_buf(3, &cp_buf),
+                bind_buf(4, &asc_buf),
+            ],
+        });
+        let mut enc = c
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("q8coop"),
+            });
+        {
+            let mut pass = begin_pass(&mut enc);
+            pass.set_pipeline(c.q8_dq_f16.as_ref().unwrap());
+            pass.set_bind_group(0, bind_dq, &[]);
+            let wgs = ((rows * cols / 2) as u32).div_ceil(256);
+            pass.dispatch_workgroups(wgs.min(MAX_WG), wgs.div_ceil(MAX_WG), 1);
+        }
+        if dev_scale {
+            encode_act_absmax(c, &mut enc, &xs_buf, b * cols, &asc_buf);
+        }
+        {
+            let mut pass = begin_pass_with(&mut enc, Some("q8coop"), None);
+            pass.set_pipeline(mm_pipe);
+            pass.set_bind_group(0, &bind_mm, &[]);
+            pass.dispatch_workgroups(
+                (rows as u32).div_ceil(64).min(MAX_WG),
+                (b as u32).div_ceil(64),
+                1,
+            );
+        }
+        return match out.as_mut() {
+            Some(o) => {
+                let ok = readback(c, enc, &y_buf, &stage_buf, y_size, &mut o[..b * rows]);
+                drop(sc);
+                ok.then_some(y_buf)
+            }
+            None => {
+                c.queue.submit(Some(enc.finish()));
+                drop(sc);
+                Some(y_buf)
+            }
+        };
+    }
     let use_mm = b >= 32;
     let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("mm-bg"),
@@ -21982,6 +22088,48 @@ fn dq_f16_plane_slot(
         label: None,
         layout: &pipe.get_bind_group_layout(0),
         entries: &[bind_buf(0, q_buf), bind_buf(1, &plane), bind_buf(2, &u)],
+    });
+    Some((plane, bind))
+}
+
+/// The int8 payload unpacked into the packed-f16 plane the coop GEMM reads.
+/// Same slot and same shape as the four-bit `dq_f16_plane`; only the unpacker
+/// differs, because there is nothing to unpack — one multiply per weight.
+fn dq8_f16_plane(
+    c: &Ctx,
+    sc: &mut Scratch,
+    q_buf: &wgpu::Buffer,
+    rs_buf: &wgpu::Buffer,
+    rows: usize,
+    cols: usize,
+) -> Option<(wgpu::Buffer, wgpu::BindGroup)> {
+    if cols % 2 != 0 {
+        return None;
+    }
+    let pipe = c.q8_dq_f16.as_ref()?;
+    let plane = Scratch::ensure(
+        &c.device,
+        &mut sc.dqw,
+        (rows * cols * 2) as u64,
+        wgpu::BufferUsages::STORAGE,
+        "q8-dq-plane",
+    );
+    let u = c
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&[cols as u32, rows as u32, 0u32, 0u32]),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &pipe.get_bind_group_layout(0),
+        entries: &[
+            bind_buf(0, q_buf),
+            bind_buf(1, &plane),
+            bind_buf(2, &u),
+            bind_buf(3, rs_buf),
+        ],
     });
     Some((plane, bind))
 }
@@ -25035,6 +25183,39 @@ fn q4tp_dq_f16(@builtin(global_invocation_id) gid: vec3<u32>) {
     let w0 = (f32(b0 & 0xFu) - 8.0) * scale;
     let w1 = (f32(b0 >> 4u) - 8.0) * scale;
     dst[idx] = pack2x16float(vec2<f32>(w0, w1));
+}
+"#;
+
+/// int8 → the same packed-f16 plane the coop GEMM eats. The two-field codec's
+/// column field is already in the activation by the time a GEMM runs, so what
+/// is left on the weight side is one scale per row — `w = q·row[o]`.
+const COOP_DQ8_SRC: &str = r#"
+enable f16;
+
+struct DqP { cols: u32, rows: u32, pad0: u32, pad1: u32 };
+@group(0) @binding(0) var<storage, read> qsrc: array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<u32>;
+@group(0) @binding(2) var<uniform> dp: DqP;
+@group(0) @binding(3) var<storage, read> rsc: array<f32>;
+
+fn s8(off: u32) -> f32 {
+    let b = (qsrc[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu;
+    if (b > 127u) { return f32(b) - 256.0; }
+    return f32(b);
+}
+
+// One thread per PAIR of weights, as the four-bit twin does — the plane is
+// packed u32s of two f16 and the GEMM reads it that way.
+@compute @workgroup_size(256)
+fn q8_dq_f16(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let pairs_per_row = dp.cols / 2u;
+    let idx = gid.y * (65535u * 256u) + gid.x;
+    if (idx >= dp.rows * pairs_per_row) { return; }
+    let row = idx / pairs_per_row;
+    let pair = idx % pairs_per_row;
+    let base = row * dp.cols + pair * 2u;
+    let sc = rsc[row];
+    dst[idx] = pack2x16float(vec2<f32>(s8(base) * sc, s8(base + 1u) * sc));
 }
 "#;
 
