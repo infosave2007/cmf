@@ -24647,7 +24647,7 @@ pub fn q4tp_ffn_packed(
     let want_fc2_coop = match std::env::var("CMF_FFN_FC2_COOP").as_deref() {
         Ok("1") => true,
         Ok("0") => false,
-        _ => b >= 6144,
+        _ => b >= 2048,
     };
     let dq2 = if want_fc2_coop {
         let mut sc = c.scratch.lock().unwrap();
@@ -24660,11 +24660,14 @@ pub fn q4tp_ffn_packed(
     // on how wide the panel is. Measured on MiniMax-H3, 22 frames, four
     // steps, two runs each way:
     //
-    //   512×288 (b ≈ 3.5k rows): 137.4 s without, 139.8 s with — neutral.
-    //   768×448 (b ≈ 8k rows):   75.3 s of denoise without, 70.9 s with.
+    //   512×288 (b ≈ 1.1k rows): 137.4 s without, 139.8 s with — neutral.
+    //   768×448 (b = 2449 rows):  75.3 s of denoise without, 70.9 s with.
     //
     // So it is on for a wide panel and off for a narrow one, with
-    // CMF_FFN_FC2_COOP forcing either arm for the A/B.
+    // CMF_FFN_FC2_COOP forcing either arm for the A/B. The row counts are
+    // from the render itself (`CMF_GPU_DEBUG=1` prints them) rather than
+    // from arithmetic on the frame size, which is how the threshold first
+    // landed at four times the panel it was meant to catch.
     match (
         c.act_absmax.as_ref().filter(|_| want_fc2_coop),
         &dq2,
