@@ -24563,15 +24563,21 @@ pub fn q4tp_ffn_packed(
         wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         "pffn-stage",
     );
-    // Keep the unpacked plane when the tensor is small enough to be worth
-    // keeping: the 3D VAE calls this with the same 33 M-weight tensor over
-    // and over, and the four-bit unpack — a 5-bit rung ladder per group —
-    // was paid every time. Measured at 768×448: the VAE's FFN phase is
-    // 24.1 s here against 5.4 s for the same FFN in an eight-bit container,
-    // whose unpack is one multiply per weight. A DiT weight is far past the
-    // cap and keeps the per-call scratch plane.
+    // MEASURED AND REJECTED, so opt-in (`CMF_PLANE_CACHE_MB=<n>`): keeping the
+    // unpacked plane across calls looked like the obvious fix for the 3D VAE,
+    // which calls this with the same 33 M-weight tensor over and over while
+    // the four-bit unpack — a 5-bit rung ladder per group — is paid every
+    // time. At 768×448 its FFN phase is 24-26 s against 5.4 s for the same
+    // FFN in an eight-bit container.
+    //
+    // Eight runs say the cache is not it. Denoise, alternating arms:
+    // off 72.9 / 71.1 / 69.5 / 76.6, on 60.6 / 71.1 / 73.6 / 76.2. One fast
+    // run out of four, and the spread WITHIN an arm is 10% — larger than
+    // anything being claimed. The VAE's FFN phase also costs the same 24 s
+    // at 512×288 as at 768×448, which says its cost does not scale with the
+    // work: what is left to chase is per-call host overhead, not the unpack.
     let key1 = (model.uid() as usize, w1);
-    let dq1 = plane_cached(c, key1, &w1b, 2 * inter, hidden, 2048)
+    let dq1 = plane_cached(c, key1, &w1b, 2 * inter, hidden, 0)
         .map(|(p, b)| (p, b))
         .or_else(|| dq_f16_plane(c, &mut sc, &w1b, 2 * inter, hidden).map(|(p, b)| (p, Some(b))));
     drop(sc);
