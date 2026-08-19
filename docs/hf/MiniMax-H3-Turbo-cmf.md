@@ -614,6 +614,45 @@ Two more, on the runtime side: the latent upscaler published for H3
 (a 345 M-parameter 3-D conv net) is not ported, and there is no fused
 device kernel for adapter branches on this model — see below.
 
+## The latent upscaler
+
+Render small, resize the **latent**, decode once:
+
+```bash
+cortiq animate mmh3-turbo-clipproj4b-fl2va-v2-q4tp.cmf \
+  --prompt "…" --width 512 --height 288 --frames 39 \
+  --upscale minimax_h3_latent_upscaler_3d_fp16.safetensors --upscale-by 2.0 \
+  --out big.avi
+```
+
+The net is [LBH-123-AI's](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler)
+— 345 M parameters, twelve residual blocks and six temporal convolutions on
+each side of a trilinear resize, with a scalar scale embedding modulating
+every block. It is ported into the engine and gated against the node's own
+torch module on the same weights: **worst 6.68e-6, relative rms 3.92e-7**.
+
+Why it matters on a 24 GB machine: the alternative is decoding through a
+5 B-parameter VAE, resizing pixels and encoding again — the expensive path —
+or interpolating the latent, which is the cheap path that ghosts. This is
+neither. You keep the frame budget of the small render and get the detail of
+the large one, and the file is loaded beside the container like an adapter,
+so it stays under its own licence.
+
+## Reference clips
+
+```bash
+cortiq animate model.cmf --prompt "…" --video ref_frames/ --video-stride 8
+```
+
+Every eighth `.ppm` of the directory becomes a condition pinned to its own
+moment of the render, and the source clip is mapped onto the render's length
+by position — a 100-frame reference conditions a 39-frame clip at the same
+*moments*, not the same indices. This is the `fl2va` keyframe path with more
+than two frames. It is **not** a port of the release's own `v2v` node, which
+conditions differently; what it gives you is composition and motion carried
+across a chain of shots, which is what the keyframe hack in discussion #6 was
+reaching for.
+
 ## Adapters at runtime
 
 Community LoRAs for H3 run against this container as they ship:
