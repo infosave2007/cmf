@@ -81,13 +81,14 @@ What it costs is **placement**:
    `dit_qkv_attn_out` keeps qkv, the attention and the output projection on
    the card with nothing in between, and a branch on `qkv_proj` or
    `out_proj` needs exactly those panels, so the block falls back to the
-   chain. Measured on an M4 at 512×288, 22 frames: **33.7 s a step with the
-   adapter against 29.8 s without**, comparing the two runs that sat next to
-   each other — 1.13×, for arithmetic worth half a per cent. Compared against
-   a base run fifteen minutes earlier the same adapter reads as 1.37×, because
-   that base render itself drifted from 24.6 to 29.8 s a step on a 24 GB
-   machine under memory pressure. Bracket it as 1.1–1.4× until a stand with
-   headroom says otherwise.
+   chain. Measured on an M4 at 512×288, 22 frames, back to back with memory
+   freed: **denoise 133.6 s with the adapter against 126.1 s without — 1.06×**,
+   and the video VAE (no adapter anywhere near it) moved 53.4 → 56.9 s between
+   the same two runs, so the cost is at or below the machine's own noise.
+   Under memory pressure earlier in the session the same pair read 1.13× and
+   1.37×, because the base render itself drifted from 22.2 to 32.5 s a step —
+   a reminder that on a machine where weights stream, an adapter's extra work
+   hides inside the streaming.
 
 ## The router
 

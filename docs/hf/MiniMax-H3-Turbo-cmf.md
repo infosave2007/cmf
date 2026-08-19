@@ -644,17 +644,17 @@ the spatial-physics and streaming ones — therefore land partially, and say so.
 Bake them in instead with `animate-pack --lora … --time-embedder …`, which is
 exactly how the Turbo LoRA got into these files.
 
-**What it costs.** Measured on a Mac mini M4 (24 GB), 512×288, 22 frames, four
-steps, with `fal/MiniMax-H3-Realism-People-LoRA` (rank 32, 104 branches, all
-of which bind): **33.7 s a step with the adapter against 29.8 s without**, the
-two runs taken back to back. The branch itself is half a per cent of the
-projection's arithmetic and rides inside the base GEMM's Metal submission; what
-it costs is the *attention* fusion standing down, because a branch on
-`qkv_proj` or `out_proj` needs the panels that fusion keeps on the card. Two
-honest notes: `--lora-strength 0` reproduces the base render byte for byte, and
-the same base render drifted from 24.6 to 29.8 s a step over fifteen minutes on
-that machine, so read the adapter as costing roughly a tenth of a step, not a
-doubling.
+**What it costs.** On an M4 (24 GB), 512×288, 22 frames, four steps, with
+`fal/MiniMax-H3-Realism-People-LoRA` (rank 32, 104 branches, all of which
+bind), the two runs taken back to back with memory free: **denoise 133.6 s
+with the adapter against 126.1 s without — 1.06×.** The video VAE, which no
+adapter touches, moved 53.4 → 56.9 s between those same runs, so on this
+machine the adapter costs at or below the noise. The branch itself is half a
+per cent of the projection's arithmetic and rides inside the base GEMM's Metal
+submission; what it can cost is the *attention* fusion standing down, because
+a branch on `qkv_proj` or `out_proj` needs the panels that fusion keeps on the
+card — visible where the DiT is fully resident, hidden where weights stream.
+`--lora-strength 0` reproduces the base render byte for byte.
 
 **Which parts of an adapter matter.** `CMF_LORA_PROBE=1` prints every branch by
 its measured contribution `‖s·ΔY‖/‖Y‖`, and `CMF_LORA_ROUTE=<r>` switches off
