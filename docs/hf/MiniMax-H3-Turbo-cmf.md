@@ -56,7 +56,7 @@ One transformer denoises picture and sound together in one packed sequence.
 | `mmh3-turbo-q4tp.cmf` | 23.47 GB | 24 GB+ | no | same, without the vision tower |
 | **`mmh3-turbo-clipproj4b-q4tp.cmf`** | **13.16 GB** | **16–20 GB** | no | **the small one**, peaks at 15.1 GB |
 | **`mmh3-turbo-clipproj4b-fl2va-q4tp.cmf`** | **14.48 GB** | **16–24 GB** | **yes** | the small one WITH start/end frames — the 4B vision tower and the VAE encoder join the compact build |
-| **`mmh3-turbo-clipproj4b-fl2va-v2-q8_2f.cmf`** | **26.90 GB** | **32 GB+** | **yes** | **eight bits**: the two-field int8, `w = q·row[o]·col[i]`. The step up from four bits for a machine with the memory |
+| **`mmh3-turbo-clipproj4b-fl2va-v2-q8_2f.cmf`** | **26.90 GB** | **32 GB+** | **yes** | **eight bits**: the two-field int8, `w = q·row[o]·col[i]`. More weight fidelity — but see the caveat below, it renders on the **host** today |
 | `mmh3-turbo-fl2va-q2tp.cmf` | 18.74 GB | — | yes | don't render with this |
 
 Text-to-video everywhere; the `fl2va` files also take a first and/or last frame
@@ -614,6 +614,25 @@ missing possibility. **None of them needs training.**
 Two more, on the runtime side: the latent upscaler published for H3
 (a 345 M-parameter 3-D conv net) is not ported, and there is no fused
 device kernel for adapter branches on this model — see below.
+
+## The eight-bit build, and what it costs today
+
+`mmh3-turbo-clipproj4b-fl2va-v2-q8_2f.cmf` (26.90 GB, 26.21 B parameters,
+`cortiq verify` clean) packs the DiT as **`q8_2f`** — the two-field int8,
+`w = q·row[o]·col[i]`: eight bits with a second scale field along the *input*
+axis, which is where an activation-outlier channel shows up from the weight
+side. As a codec it is strictly more faithful than the four-bit ladder.
+
+**The caveat, measured rather than guessed: it renders on the host.** The
+device paths in this engine are q4tp-shaped — the fused qkv/attention/output
+kernel and the packed FFN both read the four-bit tiled layout — and there is
+no `q8_2f` *matmat* on either backend yet, only a matvec. On an RTX 5090 the
+q8_2f build leaves the card idle and burns 16 cores instead. Until that kernel
+lands, take this file if you are comparing codecs or rendering overnight, and
+take the q4tp file if you want the card.
+
+That is the honest state of it, and the missing piece is one kernel, not a
+redesign.
 
 ## The latent upscaler
 

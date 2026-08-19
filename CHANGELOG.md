@@ -30,6 +30,11 @@ The latent upscaler, an eight-bit build, and reference clips.
   eight bits with a second scale field along the *input* axis, which is
   where an activation-outlier channel shows up from the weight side. The
   step up from q4tp for a machine with the memory, asked for in discussion #5.
+  Packed and published as `mmh3-turbo-clipproj4b-fl2va-v2-q8_2f.cmf`, 26.90 GB,
+  26.21 B parameters, `cortiq verify` clean. **It renders on the host**: every
+  device path here is q4tp-shaped and there is no `q8_2f` matmat on either
+  backend yet, only a matvec — on a 5090 the card sits idle. Said on the card
+  rather than discovered by a user.
 - **`animate --video <dir> --video-stride n`** — every n-th frame of a
   reference clip becomes a condition pinned to its own moment of the render.
   This is the `fl2va` keyframe path with more than two frames; the source
