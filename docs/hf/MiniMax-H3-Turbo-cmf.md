@@ -631,6 +631,16 @@ each side of a trilinear resize, with a scalar scale embedding modulating
 every block. It is ported into the engine and gated against the node's own
 torch module on the same weights: **worst 6.68e-6, relative rms 3.92e-7**.
 
+| ![lanczos](https://huggingface.co/infosave/MiniMax-H3-Turbo-cmf/resolve/main/images/upscaler_lanczos_1024.png) | ![the net](https://huggingface.co/infosave/MiniMax-H3-Turbo-cmf/resolve/main/images/upscaler_net_1024.png) |
+|---|---|
+| the 512×288 render, resampled to 1024×576 | the same latent through the net, decoded at 1024×576 |
+
+Same seed, same prompt, same denoise. On the left a resampler has nothing to
+add and softens hair, coat seams and the wet road; on the right the detail is
+generated. **Measured on an M4 (24 GB), 22 frames: denoise 76.9 s, upscale
+13.8 s, VAE 98.2 s — 193 s for a 1024×576 clip** whose denoise only ever paid
+for 512×288. The upscale itself is the cheapest stage in that list.
+
 Why it matters on a 24 GB machine: the alternative is decoding through a
 5 B-parameter VAE, resizing pixels and encoding again — the expensive path —
 or interpolating the latent, which is the cheap path that ghosts. This is
