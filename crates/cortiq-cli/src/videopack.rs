@@ -290,20 +290,48 @@ fn silu(v: f32) -> f32 {
 /// there, both because it is 5.5 MB against a 64 MB ranged read and
 /// because it is the LoRA author's own tabulation. Otherwise rebuild it
 /// from the full checkpoint's four `time_embedder.*` tensors.
-fn time_curve(te: &StFile) -> anyhow::Result<(Vec<f32>, usize)> {
+fn time_curve(te: &StFile, lora: Option<&StFile>, scale: f32) -> anyhow::Result<(Vec<f32>, usize)> {
     if let Some(shape) = te.shape("silu_t_emb_grid") {
         let (grid, t_dim) = (shape[0], shape[1]);
         if grid != CURVE_GRID {
             return Err(anyhow!("silu_t_emb_grid grid {grid} != {CURVE_GRID}"));
         }
+        // The bundled grid is already tabulated, so an adapter that trains
+        // the time embedder cannot be folded into it. Refuse rather than
+        // drop the branch: a streaming adapter without its time embedding
+        // is a different model that looks like the right one.
+        if let Some(l) = lora {
+            if lora_key(l, "time_embedder.proj_in", "lora_A").is_some()
+                || lora_key(l, "time_embedder.proj_out", "lora_A").is_some()
+            {
+                return Err(anyhow!(
+                    "this adapter trains time_embedder, which cannot be folded into the \
+                     bundled silu_t_emb_grid — pass --time-embedder with the full \
+                     checkpoint's time_embedder.* tensors (tools/mmh3_fetch.py time-embedder)"
+                ));
+            }
+        }
         return Ok((te.get("silu_t_emb_grid")?, t_dim));
     }
-    let w_in = te.get("time_embedder.proj_in.weight")?; // [hidden, 256]
+    let mut w_in = te.get("time_embedder.proj_in.weight")?; // [hidden, 256]
     let b_in = te.get("time_embedder.proj_in.bias")?;
-    let w_out = te.get("time_embedder.proj_out.weight")?; // [t_dim, hidden]
+    let mut w_out = te.get("time_embedder.proj_out.weight")?; // [t_dim, hidden]
     let b_out = te.get("time_embedder.proj_out.bias")?;
     let hidden = b_in.len();
     let t_dim = b_out.len();
+    // A streaming adapter trains the time embedding itself. It has to be
+    // folded HERE, before the curve is tabulated: the packed container has
+    // no time embedder to apply it to later — only the curve it produces.
+    if let Some(l) = lora {
+        for (key, w, rows, cols) in [
+            ("time_embedder.proj_in", &mut w_in, hidden, FREQ_DIM),
+            ("time_embedder.proj_out", &mut w_out, t_dim, hidden),
+        ] {
+            if fold_lora(w, l, key, rows, cols, scale)? {
+                eprintln!("time curve: folded the adapter's {key}");
+            }
+        }
+    }
     let half = FREQ_DIM / 2;
     let mut out = vec![0f32; CURVE_GRID * t_dim];
     for i in 0..CURVE_GRID {
@@ -359,8 +387,12 @@ fn merge_adaln(
             "{key}: rank {k} but adaln_t_table is {base_cols} wide"
         ));
     }
-    let a = lora.and_then(|l| l.get(&format!("{key}.lora_A.weight")).ok());
-    let b = lora.and_then(|l| l.get(&format!("{key}.lora_B.weight")).ok());
+    let a = lora
+        .and_then(|l| lora_key(l, key, "lora_A").map(|n| (l, n)))
+        .and_then(|(l, n)| l.get(&n).ok());
+    let b = lora
+        .and_then(|l| lora_key(l, key, "lora_B").map(|n| (l, n)))
+        .and_then(|(l, n)| l.get(&n).ok());
     let (a, b) = match (a, b) {
         (Some(a), Some(b)) => (a, b),
         _ => {
@@ -409,6 +441,47 @@ fn merge_adaln(
 const BLOCK_PROJ: [&str; 4] = ["attn.qkv_proj", "attn.out_proj", "mlp.fc1", "mlp.fc2"];
 const BLOCK_NORM: [&str; 4] = ["norm1", "norm2", "attn.q_norm", "attn.k_norm"];
 
+/// The adapter's own name for a projection. Three conventions ship in the
+/// wild — ComfyUI single-file writes `diffusion_model.`, PEFT writes
+/// `base_model.model.` and keeps the module path (`dit.` and all) behind it,
+/// and the Turbo LoRA writes the bare path. The packer used to try the bare
+/// one only, so a PEFT adapter folded *nothing* and said so nowhere.
+fn lora_key(l: &StFile, key: &str, side: &str) -> Option<String> {
+    for pre in [
+        "",
+        "diffusion_model.",
+        "base_model.model.dit.",
+        "base_model.model.",
+        "dit.",
+    ] {
+        let n = format!("{pre}{key}.{side}.weight");
+        if l.has(&n) {
+            return Some(n);
+        }
+    }
+    None
+}
+
+/// `w += scale · B·A` for whichever spelling the adapter uses. Returns
+/// whether a branch was found, so the caller can report what folded.
+fn fold_lora(
+    w: &mut [f32],
+    l: &StFile,
+    key: &str,
+    rows: usize,
+    cols: usize,
+    scale: f32,
+) -> anyhow::Result<bool> {
+    let (Some(an), Some(bn)) = (
+        lora_key(l, key, "lora_A").or_else(|| lora_key(l, key, "lora_down")),
+        lora_key(l, key, "lora_B").or_else(|| lora_key(l, key, "lora_up")),
+    ) else {
+        return Ok(false);
+    };
+    lora_merge(w, &l.get(&bn)?, &l.get(&an)?, rows, cols, scale);
+    Ok(true)
+}
+
 /// Merge the LoRA into one projection and push it at `level`.
 fn push_proj(
     specs: &mut Vec<TensorSpec>,
@@ -426,20 +499,7 @@ fn push_proj(
         .to_vec();
     let mut w = src.get(&name)?;
     if let Some(l) = lora {
-        let (an, bn) = (
-            format!("{key}.lora_A.weight"),
-            format!("{key}.lora_B.weight"),
-        );
-        if l.has(&an) && l.has(&bn) {
-            lora_merge(
-                &mut w,
-                &l.get(&bn)?,
-                &l.get(&an)?,
-                shape[0],
-                shape[1],
-                scale,
-            );
-        }
+        fold_lora(&mut w, l, key, shape[0], shape[1], scale)?;
     }
     specs.push(spec(out_name.to_string(), &w, shape, level));
     Ok(())
@@ -512,7 +572,7 @@ fn pack_dit(
         return Err(anyhow!("adaln_t_table grid {grid} != {CURVE_GRID}"));
     }
     let (curve, t_dim) = match temb_path {
-        Some(p) => time_curve(&StFile::open(p)?)?,
+        Some(p) => time_curve(&StFile::open(p)?, lora.as_ref(), scale)?,
         None if lora.is_some() => {
             return Err(anyhow!(
                 "--lora on a pruned base needs --time-embedder (the LoRA's adaLN update \
@@ -623,18 +683,8 @@ fn pack_dit(
             Level::F32,
         ),
         (
-            "final_layer.video_out.weight",
-            "dit.final_layer.video_out.weight",
-            Level::F32,
-        ),
-        (
             "final_layer.video_out.bias",
             "dit.final_layer.video_out.bias",
-            Level::F32,
-        ),
-        (
-            "final_layer.audio_out.weight",
-            "dit.final_layer.audio_out.weight",
             Level::F32,
         ),
         (
@@ -643,18 +693,8 @@ fn pack_dit(
             Level::F32,
         ),
         (
-            "video_patch_proj.weight",
-            "dit.video_patch_proj.weight",
-            Level::F32,
-        ),
-        (
             "video_patch_proj.bias",
             "dit.video_patch_proj.bias",
-            Level::F32,
-        ),
-        (
-            "audio_patch_proj.weight",
-            "dit.audio_patch_proj.weight",
             Level::F32,
         ),
         (
@@ -681,6 +721,24 @@ fn pack_dit(
         level,
         scale,
     )?;
+    // The streaming adapters (RAVEN) train these too, and they used to be
+    // pushed exact — an adapter's branch on them was silently dropped.
+    for key in [
+        "final_layer.video_out",
+        "final_layer.audio_out",
+        "video_patch_proj",
+        "audio_patch_proj",
+    ] {
+        push_proj(
+            specs,
+            &dit,
+            lora.as_ref(),
+            key,
+            &format!("dit.{key}.weight"),
+            Level::F32,
+            scale,
+        )?;
+    }
 
     Ok(serde_json::json!({
         "hidden_size": hidden,
