@@ -45,6 +45,11 @@ pub struct AnimParams {
     /// frame, and/or its last.
     pub first_frame: Option<(Vec<f32>, usize, usize)>,
     pub last_frame: Option<(Vec<f32>, usize, usize)>,
+    /// Extra reference frames with the pixel index each one stands for:
+    /// video-to-video as this architecture actually takes it — every
+    /// frame is a condition row pinned to its own time coordinate, the
+    /// same machinery `--first-frame`/`--last-frame` use for two.
+    pub mid_frames: Vec<((Vec<f32>, usize, usize), usize)>,
     /// A LoRA adapter (.safetensors) applied at runtime, and how hard.
     pub lora: Option<String>,
     pub lora_strength: f32,
@@ -109,6 +114,7 @@ impl Default for AnimParams {
             max_tokens: 512,
             first_frame: None,
             last_frame: None,
+            mid_frames: Vec::new(),
             lora: None,
             lora_strength: 1.0,
         }
@@ -316,12 +322,18 @@ fn generate_inner(
     // fl2va: every keyframe is presented as "<Picture i>: " and a
     // vision block BEFORE the prompt, and separately conditions the DiT
     // as a latent. Both halves come from the same picture.
-    let keyframes: Vec<(&(Vec<f32>, usize, usize), usize)> = p
+    let mut keyframes: Vec<(&(Vec<f32>, usize, usize), usize)> = p
         .first_frame
         .iter()
         .map(|f| (f, 0usize))
+        .chain(p.mid_frames.iter().map(|(f, i)| (f, (*i).min(frames_total - 1))))
         .chain(p.last_frame.iter().map(|f| (f, frames_total - 1)))
         .collect();
+    // Condition rows are placed by time coordinate, so they have to arrive
+    // in time order and only once per frame — two references pinned to the
+    // same pixel index would be two rows claiming one moment.
+    keyframes.sort_by_key(|(_, i)| *i);
+    keyframes.dedup_by_key(|(_, i)| *i);
     let mut ids: Vec<u32> = Vec::new();
     let mut spans: Vec<ImageSpan> = Vec::new();
     let mut embeds: Vec<Vec<f32>> = Vec::new();
