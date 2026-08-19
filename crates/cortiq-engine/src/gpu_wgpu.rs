@@ -24644,19 +24644,27 @@ pub fn q4tp_ffn_packed(
         usage: wgpu::BufferUsages::STORAGE,
         mapped_at_creation: false,
     });
-    let dq2 = if std::env::var("CMF_FFN_FC2_COOP").as_deref() == Ok("1") {
+    let want_fc2_coop = match std::env::var("CMF_FFN_FC2_COOP").as_deref() {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => b >= 6144,
+    };
+    let dq2 = if want_fc2_coop {
         let mut sc = c.scratch.lock().unwrap();
         dq_f16_plane_slot(c, &mut sc, &w2b, hidden, inter, true)
     } else {
         None
     };
-    // MEASURED NEUTRAL, so opt-in: putting fc2 on the matrix units costs
-    // a second plane unpack plus a max-reduction that one workgroup
-    // walks over the whole activation panel (330 MB at render size).
-    // Full render 139.8 s with it against 137.4 s without — the scalar
-    // arm wins on simplicity at the same speed. `CMF_FFN_FC2_COOP=1`
-    // takes it; a multi-workgroup reduction is what would tip it.
-    let want_fc2_coop = std::env::var("CMF_FFN_FC2_COOP").as_deref() == Ok("1");
+    // Putting fc2 on the matrix units costs a second plane unpack plus a
+    // max-reduction over the activation panel, and whether that pays depends
+    // on how wide the panel is. Measured on MiniMax-H3, 22 frames, four
+    // steps, two runs each way:
+    //
+    //   512×288 (b ≈ 3.5k rows): 137.4 s without, 139.8 s with — neutral.
+    //   768×448 (b ≈ 8k rows):   75.3 s of denoise without, 70.9 s with.
+    //
+    // So it is on for a wide panel and off for a narrow one, with
+    // CMF_FFN_FC2_COOP forcing either arm for the A/B.
     match (
         c.act_absmax.as_ref().filter(|_| want_fc2_coop),
         &dq2,
