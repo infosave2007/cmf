@@ -9030,6 +9030,7 @@ pub fn q4tp_ffn(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let t_stage = std::time::Instant::now();
     if hidden % 32 != 0 || inter % 32 != 0 {
         return false;
     }
@@ -9108,7 +9109,31 @@ pub fn q4tp_ffn(
         enc.end_encoding();
     }
     mm(a2, &g_buf, &y_buf, hidden, inter, 1.0);
+    // The wgpu path's four-bit FFN spends three quarters of a call on the
+    // host — buffer setup and an activation scan — with the card idle. The
+    // same question deserves an answer here rather than an assumption, so
+    // CMF_FFN_COUNT=1 splits a call at the submit.
+    let t_host = t_stage.elapsed();
     submit_and_wait(c, cmd, &[&y_buf]);
+    if std::env::var("CMF_FFN_COUNT").is_ok() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static HOST: AtomicU64 = AtomicU64::new(0);
+        static WAIT: AtomicU64 = AtomicU64::new(0);
+        static N: AtomicU64 = AtomicU64::new(0);
+        let total = t_stage.elapsed();
+        let h = HOST.fetch_add(t_host.as_micros() as u64, Ordering::Relaxed)
+            + t_host.as_micros() as u64;
+        let w = WAIT.fetch_add((total - t_host).as_micros() as u64, Ordering::Relaxed)
+            + (total - t_host).as_micros() as u64;
+        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % 100 == 0 {
+            eprintln!(
+                "metal q4tp_ffn: {n} calls, host {:.1} ms each, card {:.1} ms each ({hidden}x{inter}, b={b})",
+                h as f64 / 1e3 / n as f64,
+                w as f64 / 1e3 / n as f64
+            );
+        }
+    }
     unsafe {
         std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, out.as_mut_ptr(), b * hidden);
     }
