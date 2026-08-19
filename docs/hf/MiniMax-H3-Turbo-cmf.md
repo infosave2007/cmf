@@ -726,25 +726,31 @@ and measured **109.6 s of denoise against 58.8 s** on one machine back to
 back, because a chunk then attends to four chunks' worth of rows.)
 
 **The chunk length is the knob that matters.** RTX 5090, 384×256, 41 frames
-in (56 out), four steps:
+in (56 out), four steps, `sink 2 / window 2` throughout:
 
 | | wall | denoise | picture |
 |---|---|---|---|
 | no streaming | 53 s | 36.8 s | coherent |
-| `--stream-chunk 13` | 73 s | — | coherent, motion holds |
+| `--stream-chunk 13` | 63 s | 47.0 s | coherent, motion holds |
 | `--stream-chunk 9` | 69 s | 62.9 s | coherent |
-| `--stream-chunk 5` | 119 s | — | **drifts**: the scene changes at chunk boundaries |
+| `--stream-chunk 5` | 75 s | 58.8 s | **drifts**: the scene changes at chunk boundaries |
+| `--stream-chunk 5`, `sink 8 / window 8` | 122 s | 106.3 s | drifts *identically* |
 
-At five latent frames the context is not the problem — with three chunks and
-`sink 2 / window 2` every earlier chunk is visible — the chunk itself is too
-short for what the adapter learned. Nine to thirteen is the range that holds.
+The last row is the one worth reading twice: quadrupling the context costs
+2.3× the denoise and changes nothing about the drift. Five latent frames is
+simply shorter than what the adapter learned; nine to thirteen is the range
+that holds.
 
-Streaming costs about **1.7× the denoise** of the ordinary path at this clip
-length, because a chunk's context rows are recomputed at every one of its
-steps. A KV cache over those rows is what removes that, and it is an
-optimization of this path rather than a prerequisite for it: not packing the
-rows a chunk may not see produces the same attention pattern the reference
-gets from its cache.
+Streaming costs about **1.3× the denoise** of the bidirectional path at this
+clip length (47.0 s against 36.8 s), because a chunk's context rows are
+recomputed at every one of its four steps. A KV cache over those rows is what
+removes that, and it is an optimization of this path rather than a
+prerequisite for it: not packing the rows a chunk may not see produces the
+same attention pattern the reference gets from its cache.
+
+A chunk that would leave a tail shorter than half a chunk swallows it — two
+latent frames with four frames of context was the one shape that reliably
+wandered into a different street half a second before the clip ended.
 
 ## Adapters at runtime
 

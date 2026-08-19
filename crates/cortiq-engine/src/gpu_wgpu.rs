@@ -21142,6 +21142,59 @@ fn dispatch_q1(
 /// GEMM of the prefill batch: `pre` are prescaled inputs row-major [b, cols],
 /// out — row-major [b, rows]. Weights are resident in VRAM. false = CPU path.
 #[allow(clippy::too_many_arguments)]
+/// The two-field int8 GEMM with the column field handed to the device.
+///
+/// `q8_matmat` takes an activation the caller has already multiplied by that
+/// field — a full copy of the panel, per call, on the host. When the weight
+/// goes to the matrix units the field is folded into the plane instead, and
+/// nothing touches the activation at all.
+#[allow(clippy::too_many_arguments)]
+pub fn q8_matmat_2f(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    row_scale: &[f32],
+    col_field: &[f32],
+    xs: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if cols % 4 != 0 || rows == 0 || b == 0 || col_field.len() < cols {
+        return false;
+    }
+    let entry = &model.tensors[idx];
+    if entry.shape.first().copied().unwrap_or(0) < rows {
+        return false;
+    }
+    let Some(abs) = model.entry_abs_offset(entry) else {
+        return false;
+    };
+    let bytes = model.primary_bytes();
+    if abs + rows * cols > bytes.len()
+        || row_scale.len() < rows
+        || xs.len() < b * cols
+        || out.len() < b * rows
+    {
+        return false;
+    }
+    dispatch_matmat_keep(
+        c,
+        Some((model.uid() as usize, idx)),
+        &bytes[abs..abs + rows * cols],
+        row_scale,
+        Some(&col_field[..cols]),
+        xs,
+        b,
+        rows,
+        cols,
+        Some(out),
+        None,
+    )
+    .is_some()
+}
+
 pub fn q8_matmat(
     model: &Arc<CmfModel>,
     idx: usize,

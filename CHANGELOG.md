@@ -54,6 +54,9 @@ learns to render a clip in chunks.
   covers this codec too.
 
 ### Fixed
+- **A tail shorter than half a chunk joins the chunk before it.** 41 frames in
+  chunks of 13 left a final chunk of two latent frames, and two frames with
+  four frames of context reliably wandered off into a different street.
 - The parity harness did not know the two context segment kinds the streaming
   layout added, which stopped the whole workspace compiling under
   `--all-targets`.

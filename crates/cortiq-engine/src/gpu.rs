@@ -1050,6 +1050,31 @@ pub fn q8_matvec_range(
 /// GEMM of a prefill batch: `pre` — prescaled inputs row-major [b, cols],
 /// out — row-major [b, rows].
 #[allow(clippy::too_many_arguments, unused_variables)]
+/// The two-field int8 GEMM with the column field left for the device.
+/// wgpu only — Metal's int8 kernel takes a pre-scaled activation, so the
+/// caller keeps that path when this returns `false`.
+#[allow(clippy::too_many_arguments)]
+pub fn q8_matmat_2f(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    row_scale: &[f32],
+    col_field: &[f32],
+    xs: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    #[allow(unreachable_patterns)]
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::q8_matmat_2f(
+            model, idx, row_scale, col_field, xs, b, rows, cols, out,
+        ),
+        _ => false,
+    }
+}
+
 pub fn q8_matmat(
     model: &Arc<CmfModel>,
     idx: usize,

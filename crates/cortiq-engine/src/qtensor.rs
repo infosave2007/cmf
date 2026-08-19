@@ -1807,6 +1807,15 @@ impl QTensor {
             // activation, which leaves a plain per-row int8 GEMM — the
             // same kernel `q8_row` uses, on both backends.
             TensorDtype::Q8Row | TensorDtype::Q8_2f => {
+                // The field belongs to the weight; only a backend that cannot
+                // apply it there makes a scaled copy of the activation.
+                if *dtype == TensorDtype::Q8_2f
+                    && crate::gpu::q8_matmat_2f(
+                        model, *idx, row_scale, col_field, xs, b, rows, cols, out,
+                    )
+                {
+                    return true;
+                }
                 let flat: Vec<f32> = (0..b)
                     .flat_map(|bi| {
                         prescale(&xs[bi * cols..(bi + 1) * cols], col_field, *dtype).into_owned()
