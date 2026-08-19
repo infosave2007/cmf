@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+The eight-bit build stops paying a readback per projection, and the DiT
+learns to render a clip in chunks.
+
+### Added
+- **The chunk-causal path (`--stream-chunk`).** The DiT renders a clip in
+  chunks instead of one packed sequence: each chunk attends to a sink of the
+  first frames and a window of the last, with the already-clean frames entering
+  at timestep 0. `--stream-sink` and `--stream-window` set the two spans. Built
+  for the RAVEN streaming adapter, which trains exactly this rollout.
+- **`ffn_packed`, `fused_panel_keep`, `fused_gemm_from_device`.** The fused DiT
+  submissions used to ask for a four-bit weight by name; a container packed any
+  other way fell back to per-op GEMMs with a readback between every one, and a
+  readback drains the queue. The qkv panel, the output projection and the FFN
+  pair now pick a kernel by the weight's dtype. For the two-field int8 codec
+  the column field folds into the host activation on the way in, and meets a
+  device-side panel through a `colscale` kernel on the way out.
+- **`CMF_FUSED_ANY=0`** puts a non-four-bit container back on the per-op path,
+  so the fusion can be measured against itself on one machine.
+
+### Fixed
+- The parity harness did not know the two context segment kinds the streaming
+  layout added, which stopped the whole workspace compiling under
+  `--all-targets`.
+
+
 ## [0.5.94] - 2026-08-19
 
 The eight-bit build runs on the card: two gates, not a missing kernel.
