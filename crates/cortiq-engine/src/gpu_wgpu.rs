@@ -22377,6 +22377,13 @@ fn tp_matmat_impl(
         return None;
     }
     let entry = &model.tensors[idx];
+    // This kernel reads the four-bit tiled layout and nothing else. Handed a
+    // tensor in another codec it would read int8 as tiles and return plausible
+    // garbage — which is how an eight-bit VAE decoded to a flat grey frame for
+    // an hour this afternoon. Refusing sends the caller to a path that can.
+    if entry.dtype != cortiq_core::TensorDtype::Q4TiledP {
+        return None;
+    }
     if entry.shape.first().copied().unwrap_or(0) < rows {
         return None;
     }
