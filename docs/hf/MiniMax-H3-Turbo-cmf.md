@@ -639,6 +639,22 @@ the page cache:
 matches the four-bit one exactly. Four-bit still denoises 1.38× faster** —
 27 GB of weights against 15 GB is most of what is left of that gap.
 
+**And the order reverses with the frame.** The same sandwich at 768×448,
+where the panels are three times the rows:
+
+| | denoise | video VAE | wall |
+|---|---|---|---|
+| **q8_2f** | **51.6 / 52.2 s** | **11.7 / 11.8 s** | **69 / 70 s** |
+| q4tp | 77.8 / 78.4 s | 37.9 / 38.5 s | 130 / 131 s |
+
+Two runs each, alternating, and the repeats agree to a second. At this size
+the eight-bit build is **1.9× faster overall** and its VAE decodes in a third
+of the time. The reason is structural rather than about the codecs: int8 now
+unpacks each weight into an f16 plane *once* per call and both halves of the
+FFN go to the matrix units, while the four-bit path still unpacks inside its
+FFN kernel, per tile of activations — which costs more the wider the panel.
+That is the next piece of work, and it belongs to `q4tp`.
+
 Three things were in the way, and none of them was the codec:
 
 1. **The fused chains asked for a four-bit weight by name.**
