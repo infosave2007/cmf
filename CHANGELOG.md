@@ -7,8 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-The eight-bit build stops paying a readback per projection, and the DiT
+The eight-bit build becomes the fastest file in the repository, and the DiT
 learns to render a clip in chunks.
+
+Measured on an RTX 5090, MiniMax-H3 at 512×288, 22 frames, four steps, one
+machine in one sitting: **171.5 s → 46 s** for the q8_2f container (denoise
+103.3 → 31.7 s, video VAE 62.2 → 9.0 s), against ~101 s for the four-bit file
+of the same weights. Both arms of every switch below render the same picture.
 
 ### Added
 - **The chunk-causal path (`--stream-chunk`).** The DiT renders a clip in
@@ -54,6 +59,17 @@ learns to render a clip in chunks.
   covers this codec too.
 
 ### Fixed
+- **The 3D VAE's fused attention read whichever codec it was handed.** Widening
+  the gate in front of it left it calling the four-bit entry points by name, so
+  an eight-bit VAE read int8 as four-bit tiles: a decode that ran three times
+  too fast and returned a flat grey frame. The four-bit GEMM now refuses a
+  tensor that is not four-bit instead of returning plausible garbage.
+- **A resident operand is no longer overwritten by the host buffer.** The
+  device-side callers pass an empty slice, so the unconditional upload also
+  indexed past the end of nothing.
+- **The int8 matrix-unit arm holds the scratch guard end to end.** Taking that
+  lock twice — std's Mutex is not reentrant — hung the card at 0% with the
+  process idling.
 - **A tail shorter than half a chunk joins the chunk before it.** 41 frames in
   chunks of 13 left a final chunk of two latent frames, and two frames with
   four frames of context reliably wandered off into a different street.
