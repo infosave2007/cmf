@@ -56,7 +56,7 @@ One transformer denoises picture and sound together in one packed sequence.
 | `mmh3-turbo-q4tp.cmf` | 23.47 GB | 24 GB+ | no | same, without the vision tower |
 | **`mmh3-turbo-clipproj4b-q4tp.cmf`** | **13.16 GB** | **16–20 GB** | no | **the small one**, peaks at 15.1 GB |
 | **`mmh3-turbo-clipproj4b-fl2va-q4tp.cmf`** | **14.48 GB** | **16–24 GB** | **yes** | the small one WITH start/end frames — the 4B vision tower and the VAE encoder join the compact build |
-| **`mmh3-turbo-clipproj4b-fl2va-v2-q8_2f.cmf`** | **26.90 GB** | **32 GB+** | **yes** | **eight bits**: the two-field int8, `w = q·row[o]·col[i]`. More weight fidelity — but see the caveat below, it renders on the **host** today |
+| **`mmh3-turbo-clipproj4b-fl2va-v2-q8_2f.cmf`** | **26.90 GB** | **32 GB+** | **yes** | **eight bits**: the two-field int8, `w = q·row[o]·col[i]`. More weight fidelity, and it runs on the card as of 0.5.94 — still without the fused kernels q4tp has |
 | `mmh3-turbo-fl2va-q2tp.cmf` | 18.74 GB | — | yes | don't render with this |
 
 Text-to-video everywhere; the `fl2va` files also take a first and/or last frame
@@ -623,26 +623,33 @@ device kernel for adapter branches on this model — see below.
 axis, which is where an activation-outlier channel shows up from the weight
 side. As a codec it is strictly more faithful than the four-bit ladder.
 
-**The caveat, measured rather than guessed: it renders on the host.** The
-engine says so itself at startup —
+**It renders on the card — after two gates were fixed, and the story is
+worth reading if you pack your own containers.**
 
-```
-mmh3 GPU parity probe: no q4tp qkv tensor — host path
-```
+The first run of this file left the RTX 5090 idle at 2 MiB and took
+**357.3 s**. Neither cause was a missing kernel:
 
-— because every device path here reads the four-bit tiled layout: the fused
-qkv/attention/output kernel, the packed FFN, all of it. `q8_2f` has a matvec
-on both backends and no *matmat*, which is what a video DiT needs. Measured on
-an RTX 5090, 512×288, 22 frames, four steps: **357.3 s** (denoise 198.8,
-video VAE 151.6) with the card idle and sixteen cores busy, against **60.2 s**
-for the q4tp file at 39 frames on the same class of card.
+1. **The startup probe matched on `Q4TiledP` by name and dtype.** Finding no
+   four-bit qkv weight it declared the host path for the whole render — for a
+   codec that has a device GEMM of its own. The two-field int8 folds its
+   column field into the activation and what is left is the per-row int8
+   kernel both backends already ship. The probe now asks the tensor which
+   entry point its codec has (`QTensor::device_matmat`).
+2. **The weight-residency budget was the whole heap minus a gigabyte.** That
+   survived only because every container published before this one had
+   weights far under it; 24 GB of eight-bit weights took the card and the
+   first scratch allocation died with `wgpu error: Out of Memory`. A quarter
+   of the heap is held back now — 32 GB card → 24 GB of weights.
 
-Until that kernel lands: take this file to compare codecs or to render
-overnight on a big-memory machine, and take the q4tp file when you want the
-GPU.
+With both: **171.5 s** on the same card and clip (103.3 s denoise,
+62.2 s video VAE), against 357.3 s on the host, and the probe agrees with
+the CPU arm to 5.77e-3.
 
-That is the honest state of it, and the missing piece is one kernel, not a
-redesign.
+It is still slower than the four-bit file's 60.2 s, and that part *is* about
+kernels: `q4tp` has the fused qkv → attention → output submission and the
+packed FFN, `q8_2f` goes through the generic per-op GEMM. Fusing those for the
+two-field codec is the next piece of work, and it is worth roughly what the
+fusion is worth on q4tp.
 
 ## The latent upscaler
 
