@@ -1810,6 +1810,7 @@ impl QTensor {
                 // The field belongs to the weight; only a backend that cannot
                 // apply it there makes a scaled copy of the activation.
                 if *dtype == TensorDtype::Q8_2f
+                    && std::env::var("CMF_Q8_2F_DEV").as_deref() != Ok("0")
                     && crate::gpu::q8_matmat_2f(
                         model, *idx, row_scale, col_field, xs, b, rows, cols, out,
                     )
