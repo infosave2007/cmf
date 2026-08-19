@@ -141,6 +141,12 @@ pub enum Kind {
     RefAudio,
     Audio,
     Video,
+    /// Streaming context: video rows of an already-generated chunk, fed
+    /// back as the student's own x0 at timestep 0. Not denoised, not
+    /// decoded — they exist so the current chunk can attend to them.
+    CtxVideo,
+    /// The same for audio.
+    CtxAudio,
 }
 
 /// One contiguous run of rows sharing a modality tag and a timestep.
@@ -470,6 +476,131 @@ impl Layout {
                 text_tags.to_vec()
             },
         }
+    }
+
+    /// The chunk-causal layout: one chunk being denoised, and the chunks
+    /// it is allowed to see.
+    ///
+    /// RAVEN generates a clip chunk by chunk, each one extrapolated from
+    /// what came before instead of denoised as one bidirectional clip.
+    /// Its attention pattern is `sink` chunks from the start plus a
+    /// sliding `window` of recent ones — the reference implements that
+    /// with a KV cache; the same *pattern* falls out of simply not
+    /// packing the rows a chunk may not see, which is what this builds.
+    /// The cache is then an optimization of this, not a prerequisite.
+    ///
+    /// Positions stay ABSOLUTE. A chunk five steps in must carry the RoPE
+    /// coordinates it would have had in the whole clip, or the model is
+    /// told it is generating the opening again.
+    ///
+    /// Rows come out as `[text | audio: ctx then current | video: ctx then
+    /// current]`: the audio and video blocks stay contiguous because the
+    /// patchifier hands them over that way, and audio is channel-major, so
+    /// its context is two runs — one per channel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn streaming(
+        text_len: usize,
+        text_tags: &[u8],
+        lat_h: usize,
+        lat_w: usize,
+        ctx_video: &[usize],
+        cur_video: &[usize],
+        ctx_audio: &[usize],
+        cur_audio: &[usize],
+    ) -> Self {
+        let area = ((lat_h * lat_w) as f64).sqrt();
+        let h_axis = axis_from_sqrt_area(lat_h, 2, area);
+        let w_axis = axis_from_sqrt_area(lat_w, 2, area);
+        let frame_rows = h_axis.len() * w_axis.len();
+        let (w_low, w_high) = (w_axis[0], w_axis[w_axis.len() - 1]);
+
+        let mut pos: Vec<[f64; 3]> = Vec::new();
+        let mut segments = Vec::new();
+        segments.push(Segment { start: 0, stop: text_len, kind: Kind::Text });
+        for i in 0..text_len {
+            pos.push([i as f64, 0.0, 0.0]);
+        }
+        let cursor = text_len as f64;
+
+        // The absolute t coordinate of latent frame k: the same running
+        // sum the bidirectional layout walks, evaluated at k.
+        let t_at = |k: usize| -> f64 {
+            cursor + (0..k).map(|j| FRAME_RESCALE * FRAME_PER_TOKEN[j % 5]).sum::<f64>()
+        };
+
+        // Audio, channel-major: for each channel, the context frames then
+        // the current ones, so each channel's half is [ctx | cur].
+        // Channel-major INSIDE each role, not across them: the packer
+        // hands over [ch0 | ch1] for a set of frames, so context and
+        // current each have to be one run of rows — the output side
+        // looks the current one up by kind and slices it whole.
+        for (idxs, kind) in [(ctx_audio, Kind::CtxAudio), (cur_audio, Kind::Audio)] {
+            if idxs.is_empty() {
+                continue;
+            }
+            let start = pos.len();
+            for ch in 0..2 {
+                let w = if ch == 0 { w_low } else { w_high };
+                for &i in idxs {
+                    pos.push([cursor + i as f64, 0.0, w]);
+                }
+            }
+            segments.push(Segment { start, stop: pos.len(), kind });
+        }
+
+        for (idxs, kind) in [(ctx_video, Kind::CtxVideo), (cur_video, Kind::Video)] {
+            if idxs.is_empty() {
+                continue;
+            }
+            let start = pos.len();
+            for &k in idxs {
+                let t = t_at(k);
+                for &h in &h_axis {
+                    for &w in &w_axis {
+                        pos.push([t, h, w]);
+                    }
+                }
+            }
+            segments.push(Segment { start, stop: pos.len(), kind });
+        }
+
+        Self {
+            seq_len: pos.len(),
+            segments,
+            pos,
+            text_len,
+            audio_t: ctx_audio.len() + cur_audio.len(),
+            latent_t: ctx_video.len() + cur_video.len(),
+            lat_h,
+            lat_w,
+            frame_rows,
+            text_tags: if text_tags.is_empty() {
+                vec![TAG_TEXT as u8; text_len]
+            } else {
+                text_tags.to_vec()
+            },
+        }
+    }
+
+    /// The contiguous span the video rows occupy — context and current
+    /// together, because the patchifier produces them as one block.
+    pub fn video_block(&self) -> (usize, usize) {
+        self.span(&[Kind::CtxVideo, Kind::Video])
+    }
+
+    /// The same for audio.
+    pub fn audio_block(&self) -> (usize, usize) {
+        self.span(&[Kind::CtxAudio, Kind::Audio])
+    }
+
+    fn span(&self, kinds: &[Kind]) -> (usize, usize) {
+        let mut lo = usize::MAX;
+        let mut hi = 0usize;
+        for s in self.segments.iter().filter(|s| kinds.contains(&s.kind)) {
+            lo = lo.min(s.start);
+            hi = hi.max(s.stop);
+        }
+        if lo == usize::MAX { (0, 0) } else { (lo, hi) }
     }
 
     /// How many keyframe condition rows the layout carries.
@@ -1492,7 +1623,18 @@ impl MiniMaxH3 {
         // noise and then tells the block the row sits at `aug`. Turning
         // the blend off means aug = 1, and the timestep moves with it.
         let t_cond = t_v.max(self.cond_aug);
+        // Streaming context is the student's OWN x0, handed back at
+        // timestep 0 — the reference passes literal zeros for the clean
+        // role, and a chunk conditioned on anything else is conditioned
+        // on a frame the previous chunk never produced.
+        let has_ctx = layout
+            .segments
+            .iter()
+            .any(|s| matches!(s.kind, Kind::CtxVideo | Kind::CtxAudio));
         let mut ts = vec![t_v, t_a];
+        if has_ctx {
+            ts.push(0.0);
+        }
         if has_cond {
             ts.push(t_cond);
         }
@@ -1504,6 +1646,7 @@ impl MiniMaxH3 {
         let row_of = |t: f64| ts.iter().position(|&x| x == t).unwrap();
         let (row_v, row_a) = (row_of(t_v), row_of(t_a));
         let row_c = if has_cond { row_of(t_cond) } else { 0 };
+        let row_ctx = if has_ctx { row_of(0.0) } else { 0 };
         let row_ca = if has_ref_audio { row_of(t_cond_a) } else { 0 };
 
         // Per-token modulation row: t_row · MODALITIES + tag. The text
@@ -1539,6 +1682,16 @@ impl MiniMaxH3 {
                 Kind::Audio => {
                     for v in rows[s.start..s.stop].iter_mut() {
                         *v = (row_a * MODALITIES + TAG_AUDIO) as u32;
+                    }
+                }
+                Kind::CtxVideo => {
+                    for v in rows[s.start..s.stop].iter_mut() {
+                        *v = (row_ctx * MODALITIES + TAG_VIDEO) as u32;
+                    }
+                }
+                Kind::CtxAudio => {
+                    for v in rows[s.start..s.stop].iter_mut() {
+                        *v = (row_ctx * MODALITIES + TAG_AUDIO) as u32;
                     }
                 }
             }
@@ -1597,24 +1750,29 @@ impl MiniMaxH3 {
             }
             ci += 1;
         }
+        // The embed writes the whole block — context and current — while
+        // the OUTPUT is only the current chunk's rows, which is why these
+        // are two different spans in streaming and the same one otherwise.
+        let (vblk_start, vblk_stop) = layout.video_block();
+        let (ablk_start, ablk_stop) = layout.audio_block();
         let vseg = layout.segment(Kind::Video);
         let aseg = layout.segment(Kind::Audio);
         let tseg = layout.segment(Kind::Text);
         h[tseg.start * hs..tseg.stop * hs].copy_from_slice(&text[..(tseg.stop - tseg.start) * hs]);
         self.video_patch
-            .matmat(&v_rows, v_n, &mut h[vseg.start * hs..vseg.stop * hs], pool);
+            .matmat(&v_rows, v_n, &mut h[vblk_start * hs..vblk_stop * hs], pool);
         self.audio_patch.matmat(
             &a_rows,
-            aseg.stop - aseg.start,
-            &mut h[aseg.start * hs..aseg.stop * hs],
+            ablk_stop - ablk_start,
+            &mut h[ablk_start * hs..ablk_stop * hs],
             pool,
         );
-        for row in h[vseg.start * hs..vseg.stop * hs].chunks_exact_mut(hs) {
+        for row in h[vblk_start * hs..vblk_stop * hs].chunks_exact_mut(hs) {
             for (v, &b) in row.iter_mut().zip(&self.video_patch_b) {
                 *v += b;
             }
         }
-        for row in h[aseg.start * hs..aseg.stop * hs].chunks_exact_mut(hs) {
+        for row in h[ablk_start * hs..ablk_stop * hs].chunks_exact_mut(hs) {
             for (v, &b) in row.iter_mut().zip(&self.audio_patch_b) {
                 *v += b;
             }
@@ -1735,14 +1893,21 @@ impl MiniMaxH3 {
         // The reference predicts toward the data and the sampler steps
         // σ down, hence the sign; the audio velocity is returned on its
         // OWN clock rather than pre-scaled by d(σ_a)/d(σ_v).
+        // The output covers the rows the sampler owns — which in the
+        // chunk-causal layout is the CURRENT chunk, not every visible
+        // frame. Sizing this by `layout.latent_t` (context included) fed
+        // one chunk's rows into a buffer shaped for five and walked off
+        // the end on the first chunk that had any context.
+        let out_t = (vseg.stop - vseg.start) / layout.frame_rows;
+        let out_at = (aseg.stop - aseg.start) / 2;
         let video = unpatchify_video(
             &video_out,
             self.latents_dim,
-            layout.latent_t,
+            out_t,
             layout.lat_h,
             layout.lat_w,
         );
-        let audio = unpack_audio(&audio_out, self.audio_dim, layout.audio_t);
+        let audio = unpack_audio(&audio_out, self.audio_dim, out_at);
         (
             video.iter().map(|&v| -v).collect(),
             audio.iter().map(|&v| -v).collect(),
@@ -1864,6 +2029,56 @@ fn softmax_inplace(row: &mut [f32]) {
 
 #[cfg(test)]
 mod tests {
+    /// A streaming layout whose "current chunk" is the whole clip and
+    /// which sees no context must be the bidirectional layout, row for
+    /// row. Absolute positions are the whole point of the chunked path:
+    /// if this drifts, every chunk after the first is told it is
+    /// generating the opening again.
+    #[test]
+    fn streaming_layout_degenerates_to_the_bidirectional_one() {
+        let (lat_h, lat_w, latent_t, audio_t, text_len) = (16, 24, 7, 12, 5);
+        let base = Layout::t2va(text_len, latent_t, lat_h, lat_w, audio_t);
+        let cur_v: Vec<usize> = (0..latent_t).collect();
+        let cur_a: Vec<usize> = (0..audio_t).collect();
+        let stream = Layout::streaming(text_len, &[], lat_h, lat_w, &[], &cur_v, &[], &cur_a);
+        assert_eq!(stream.seq_len, base.seq_len, "row count");
+        assert_eq!(stream.latent_t, base.latent_t);
+        assert_eq!(stream.audio_t, base.audio_t);
+        for (i, (a, b)) in stream.pos.iter().zip(&base.pos).enumerate() {
+            for axis in 0..3 {
+                assert!(
+                    (a[axis] - b[axis]).abs() < 1e-9,
+                    "row {i} axis {axis}: {a:?} vs {b:?}"
+                );
+            }
+        }
+        let seg = |l: &Layout, k: Kind| {
+            l.segments
+                .iter()
+                .find(|s| s.kind == k)
+                .map(|s| (s.start, s.stop))
+        };
+        assert_eq!(seg(&stream, Kind::Video), seg(&base, Kind::Video));
+        assert_eq!(seg(&stream, Kind::Audio), seg(&base, Kind::Audio));
+    }
+
+    /// A later chunk keeps the coordinates it would have had in the whole
+    /// clip — that is what makes the chunks line up into one video.
+    #[test]
+    fn streaming_positions_are_absolute() {
+        let (lat_h, lat_w) = (16, 24);
+        let whole = Layout::streaming(3, &[], lat_h, lat_w, &[], &(0..9).collect::<Vec<_>>(), &[], &[]);
+        let tail = Layout::streaming(3, &[], lat_h, lat_w, &[], &(6..9).collect::<Vec<_>>(), &[], &[]);
+        let rows = whole.frame_rows;
+        let (ws, _) = whole.video_block();
+        let (ts_, _) = tail.video_block();
+        for k in 0..3 {
+            let a = whole.pos[ws + (6 + k) * rows];
+            let b = tail.pos[ts_ + k * rows];
+            assert!((a[0] - b[0]).abs() < 1e-9, "frame {k}: {a:?} vs {b:?}");
+        }
+    }
+
     use super::*;
 
     #[test]

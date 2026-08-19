@@ -1384,6 +1384,17 @@ enum Commands {
         /// is one reference every third of a second)
         #[arg(long, default_value_t = 8)]
         video_stride: usize,
+        /// Chunk-causal (streaming) generation: latent frames per chunk.
+        /// Each chunk is denoised seeing only the text, `--stream-sink`
+        /// chunks from the start and a sliding `--stream-window` of recent
+        /// ones — the protocol a streaming adapter (RAVEN) is trained for,
+        /// and what stops the activation cache growing with clip length
+        #[arg(long, default_value_t = 0)]
+        stream_chunk: usize,
+        #[arg(long, default_value_t = 2)]
+        stream_sink: usize,
+        #[arg(long, default_value_t = 2)]
+        stream_window: usize,
         /// The published latent upscaler (`minimax_h3_latent_upscaler_3d_*.safetensors`):
         /// the denoised latent is resized by the learned net and the VAE
         /// decodes at the larger size — no decode → resize → encode round
@@ -2293,6 +2304,9 @@ async fn main() -> anyhow::Result<()> {
             last_frame,
             video,
             video_stride,
+            stream_chunk,
+            stream_sink,
+            stream_window,
             upscale,
             upscale_by,
             lora,
@@ -2314,6 +2328,9 @@ async fn main() -> anyhow::Result<()> {
                     None => Vec::new(),
                     Some(dir) => read_frame_dir(dir, video_stride.max(1), frames)?,
                 },
+                stream_chunk,
+                stream_sink,
+                stream_window,
                 upscale,
                 upscale_by,
                 lora,
