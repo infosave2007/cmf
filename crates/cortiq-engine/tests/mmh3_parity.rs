@@ -225,6 +225,8 @@ fn reference_blocks_lay_out_like_the_reference() {
             cortiq_engine::mmh3::Kind::RefAudio => "ref_audio",
             cortiq_engine::mmh3::Kind::Audio => "audio",
             cortiq_engine::mmh3::Kind::Video => "video",
+            cortiq_engine::mmh3::Kind::CtxVideo => "ctx_video",
+            cortiq_engine::mmh3::Kind::CtxAudio => "ctx_audio",
         })
         .collect();
     assert_eq!(got_kinds, want_kinds, "segment kinds");
