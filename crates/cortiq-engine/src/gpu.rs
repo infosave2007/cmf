@@ -1630,7 +1630,7 @@ pub fn q4tp_ffn_packed(
     match backend() {
         #[cfg(feature = "gpu")]
         Backend::Wgpu => {
-            crate::gpu_wgpu::q4tp_ffn_packed(model, w1, w2, xs, b, hidden, inter, bias, out)
+            crate::gpu_wgpu::ffn_packed(model, w1, w2, xs, b, hidden, inter, bias, out)
         }
         #[allow(unreachable_patterns)]
         _ => false,

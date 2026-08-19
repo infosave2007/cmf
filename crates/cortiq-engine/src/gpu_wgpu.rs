@@ -21229,7 +21229,7 @@ pub(crate) fn fused_panel_keep(
             let mut unused = Vec::new();
             tp_matmat_keep(model, idx, xs, b, rows, cols, &mut unused, false)
         }
-        D::Q8Row | D::Q8_2f => {
+        D::Q8Row | D::Q8_2f if fused_any() => {
             let (rs, cf) = q8_fields(model, idx, rows, cols)?;
             let pre: Vec<f32> = if entry.dtype == D::Q8_2f {
                 xs[..b * cols]
@@ -21313,7 +21313,7 @@ pub(crate) fn fused_gemm_from_device(
         D::Q4TiledP => {
             tp_matmat_impl(model, idx, &[], b, rows, cols, Some(out), Some(src), false).is_some()
         }
-        dt @ (D::Q8Row | D::Q8_2f) => {
+        dt @ (D::Q8Row | D::Q8_2f) if fused_any() => {
             let Some(c) = ctx() else { return false };
             let Some((rs, cf)) = q8_fields(model, idx, rows, cols) else {
                 return false;
@@ -24036,6 +24036,121 @@ pub fn q4t_ffn(
 /// the result. `false` = shapes or dtypes outside the contract, and the
 /// host loop runs as before.
 #[allow(clippy::too_many_arguments)]
+/// The SwiGLU fold over a packed `[gate|up]` panel that is already on the
+/// card, into a fresh compact `[b][inter]` panel. The four-bit FFN does this
+/// inside its own encoder; the int8 pair needs it as a step of its own.
+fn silu_packed_keep(
+    c: &Ctx,
+    gu: &wgpu::Buffer,
+    b: usize,
+    inter: usize,
+    bias: Option<&[f32]>,
+) -> Option<wgpu::Buffer> {
+    let n = b.checked_mul(inter)?;
+    if n == 0 {
+        return None;
+    }
+    let act = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("pffn8-act"),
+        size: (n * 4) as u64,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let bias = bias.filter(|v| v.len() >= 2 * inter);
+    let ps = uniform_u32x4(c, [n as u32, inter as u32, u32::from(bias.is_some()), 0]);
+    let bbuf = c
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("pffn8-bias"),
+            contents: bytemuck::cast_slice(bias.unwrap_or(&[0.0f32])),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("pffn8-silu"),
+        layout: &c.ffn_silu_packed.get_bind_group_layout(0),
+        entries: &[
+            bind_buf(0, gu),
+            bind_buf(1, &act),
+            bind_buf(2, &ps),
+            bind_buf(3, &bbuf),
+        ],
+    });
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("pffn8-silu"),
+        });
+    {
+        let mut pass = begin_pass(&mut enc);
+        pass.set_pipeline(&c.ffn_silu_packed);
+        pass.set_bind_group(0, &bind, &[]);
+        let wgs = (n as u32).div_ceil(256);
+        pass.dispatch_workgroups(wgs.min(MAX_WG), wgs.div_ceil(MAX_WG), 1);
+    }
+    c.queue.submit(Some(enc.finish()));
+    Some(act)
+}
+
+/// The FFN pair for an int8 container: fc1 from the host activation, the
+/// SwiGLU fold, and fc2 — with the panel between them left on the card.
+///
+/// The four-bit twin below is a single kernel because a four-bit weight has to
+/// be unpacked before the matrix units can touch it, and that unpack is worth
+/// hiding inside the GEMM. An int8 weight needs no unpack, so the same work is
+/// just two GEMMs; what mattered was never reading the intermediate home.
+pub fn q8_ffn_packed(
+    model: &Arc<CmfModel>,
+    w1: usize,
+    w2: usize,
+    xs: &[f32],
+    b: usize,
+    hidden: usize,
+    inter: usize,
+    bias: Option<&[f32]>,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if b == 0 || xs.len() < b * hidden || out.len() < b * hidden {
+        return false;
+    }
+    let Some(gu) = fused_panel_keep(model, w1, xs, b, 2 * inter, hidden) else {
+        return false;
+    };
+    let Some(act) = silu_packed_keep(c, &gu, b, inter, bias) else {
+        return false;
+    };
+    fused_gemm_from_device(model, w2, &act, b, hidden, inter, out)
+}
+
+/// The FFN pair for whichever codec the container is packed in.
+#[allow(clippy::too_many_arguments)]
+pub fn ffn_packed(
+    model: &Arc<CmfModel>,
+    w1: usize,
+    w2: usize,
+    xs: &[f32],
+    b: usize,
+    hidden: usize,
+    inter: usize,
+    bias: Option<&[f32]>,
+    out: &mut [f32],
+) -> bool {
+    use cortiq_core::TensorDtype as D;
+    match model.tensors.get(w1).map(|e| e.dtype) {
+        Some(D::Q4TiledP) => q4tp_ffn_packed(model, w1, w2, xs, b, hidden, inter, bias, out),
+        Some(D::Q8Row | D::Q8_2f) if fused_any() => {
+            q8_ffn_packed(model, w1, w2, xs, b, hidden, inter, bias, out)
+        }
+        _ => false,
+    }
+}
+
+/// `CMF_FUSED_ANY=0` puts a non-four-bit container back on the per-op path —
+/// the A/B switch for what the codec-agnostic fusion is worth.
+pub(crate) fn fused_any() -> bool {
+    std::env::var("CMF_FUSED_ANY").as_deref() != Ok("0")
+}
+
 pub fn q4tp_ffn_packed(
     model: &Arc<CmfModel>,
     w1: usize,
