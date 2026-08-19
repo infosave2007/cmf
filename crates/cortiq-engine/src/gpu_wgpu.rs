@@ -21238,15 +21238,8 @@ pub(crate) fn fused_panel_keep(
         }
         D::Q8Row | D::Q8_2f if fused_any() => {
             let (rs, cf) = q8_fields(model, idx, rows, cols)?;
-            let pre: Vec<f32> = if entry.dtype == D::Q8_2f {
-                xs[..b * cols]
-                    .chunks_exact(cols)
-                    .flat_map(|r| r.iter().zip(&cf).map(|(a, c)| a * c))
-                    .collect()
-            } else {
-                xs[..b * cols].to_vec()
-            };
-            q8_matmat_keep(model, idx, &rs, &pre, b, rows, cols)
+            let col = (entry.dtype == D::Q8_2f).then_some(&cf[..]);
+            q8_matmat_keep(model, idx, &rs, col, xs, b, rows, cols)
         }
         _ => None,
     }
@@ -21325,18 +21318,7 @@ pub(crate) fn fused_gemm_from_device(
             let Some((rs, cf)) = q8_fields(model, idx, rows, cols) else {
                 return false;
             };
-            let scaled;
-            let operand = if dt == D::Q8_2f {
-                match colscale_keep(c, src, &cf, b * cols) {
-                    Some(bf) => {
-                        scaled = bf;
-                        &scaled
-                    }
-                    None => return false,
-                }
-            } else {
-                src
-            };
+            let col = (dt == D::Q8_2f).then_some(&cf[..]);
             let entry = &model.tensors[idx];
             let Some(abs) = model.entry_abs_offset(entry) else {
                 return false;
@@ -21350,12 +21332,13 @@ pub(crate) fn fused_gemm_from_device(
                 Some((model.uid() as usize, idx)),
                 &bytes[abs..abs + rows * cols],
                 &rs,
+                col,
                 &[],
                 b,
                 rows,
                 cols,
                 Some(out),
-                Some(operand),
+                Some(src),
             )
             .is_some()
         }
@@ -21371,6 +21354,7 @@ pub fn q8_matmat_keep(
     model: &Arc<CmfModel>,
     idx: usize,
     row_scale: &[f32],
+    col_scale: Option<&[f32]>,
     pre: &[f32],
     b: usize,
     rows: usize,
@@ -21395,6 +21379,7 @@ pub fn q8_matmat_keep(
         Some((model.uid() as usize, idx)),
         full_quant,
         row_scale,
+        col_scale,
         pre,
         b,
         rows,
@@ -21506,7 +21491,7 @@ fn dispatch_matmat(
     out: &mut [f32],
 ) -> bool {
     dispatch_matmat_keep(
-        c, weight_key, full_quant, row_scale, pre, b, rows, cols, Some(out), None,
+        c, weight_key, full_quant, row_scale, None, pre, b, rows, cols, Some(out), None,
     )
     .is_some()
 }
@@ -21524,6 +21509,11 @@ fn dispatch_matmat_keep(
     weight_key: Option<(usize, usize)>,
     full_quant: &[u8],
     row_scale: &[f32],
+    // The two-field codec's column field, when the weight has one. On the
+    // matrix-unit arm it is folded into the weight plane, which is where it
+    // belongs: the activation is then untouched, and a 40 MB host multiply
+    // per projection — 400 of them in a render — disappears.
+    col_scale: Option<&[f32]>,
     pre: &[f32],
     b: usize,
     rows: usize,
@@ -21636,7 +21626,7 @@ fn dispatch_matmat_keep(
     {
         c.q4tp_mm_coop_f16
             .as_ref()
-            .and_then(|_| dq8_f16_plane(c, &mut sc, &q_buf, &rs_buf, rows, cols))
+            .and_then(|_| dq8_f16_plane(c, &mut sc, &q_buf, &rs_buf, col_scale, rows, cols))
     } else {
         None
     };
@@ -21723,6 +21713,29 @@ fn dispatch_matmat_keep(
             }
         };
     }
+    // The scalar arm has no plane to fold into, so the field meets the
+    // activation the old way — on the host for an operand that came from
+    // there, through the colscale kernel for one already on the card.
+    let scaled_xs;
+    let xs_buf = match col_scale {
+        Some(cf) if src.is_none() => {
+            let pres: Vec<f32> = pre[..b * cols]
+                .chunks_exact(cols)
+                .flat_map(|r| r.iter().zip(cf).map(|(a, c)| a * c))
+                .collect();
+            c.queue
+                .write_buffer(&xs_buf, 0, bytemuck::cast_slice(&pres));
+            xs_buf
+        }
+        Some(cf) => match colscale_keep(c, &xs_buf, cf, b * cols) {
+            Some(bf) => {
+                scaled_xs = bf;
+                scaled_xs
+            }
+            None => return None,
+        },
+        None => xs_buf,
+    };
     let use_mm = b >= 32;
     let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("mm-bg"),
@@ -22100,6 +22113,7 @@ fn dq8_f16_plane(
     sc: &mut Scratch,
     q_buf: &wgpu::Buffer,
     rs_buf: &wgpu::Buffer,
+    col: Option<&[f32]>,
     rows: usize,
     cols: usize,
 ) -> Option<(wgpu::Buffer, wgpu::BindGroup)> {
@@ -22118,8 +22132,20 @@ fn dq8_f16_plane(
         .device
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
-            contents: bytemuck::cast_slice(&[cols as u32, rows as u32, 0u32, 0u32]),
+            contents: bytemuck::cast_slice(&[
+                cols as u32,
+                rows as u32,
+                u32::from(col.is_some()),
+                0u32,
+            ]),
             usage: wgpu::BufferUsages::UNIFORM,
+        });
+    let cbuf = c
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("q8-col"),
+            contents: bytemuck::cast_slice(col.unwrap_or(&[1.0f32])),
+            usage: wgpu::BufferUsages::STORAGE,
         });
     let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
@@ -22129,6 +22155,7 @@ fn dq8_f16_plane(
             bind_buf(1, &plane),
             bind_buf(2, &u),
             bind_buf(3, rs_buf),
+            bind_buf(4, &cbuf),
         ],
     });
     Some((plane, bind))
@@ -25197,6 +25224,9 @@ struct DqP { cols: u32, rows: u32, pad0: u32, pad1: u32 };
 @group(0) @binding(1) var<storage, read_write> dst: array<u32>;
 @group(0) @binding(2) var<uniform> dp: DqP;
 @group(0) @binding(3) var<storage, read> rsc: array<f32>;
+// The two-field codec's column field, or a one-element dummy when the
+// weight has none (dp.pad0 says which).
+@group(0) @binding(4) var<storage, read> csc: array<f32>;
 
 fn s8(off: u32) -> f32 {
     let b = (qsrc[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu;
@@ -25215,7 +25245,13 @@ fn q8_dq_f16(@builtin(global_invocation_id) gid: vec3<u32>) {
     let pair = idx % pairs_per_row;
     let base = row * dp.cols + pair * 2u;
     let sc = rsc[row];
-    dst[idx] = pack2x16float(vec2<f32>(s8(base) * sc, s8(base + 1u) * sc));
+    var c0 = 1.0;
+    var c1 = 1.0;
+    if (dp.pad0 != 0u) {
+        c0 = csc[pair * 2u];
+        c1 = csc[pair * 2u + 1u];
+    }
+    dst[idx] = pack2x16float(vec2<f32>(s8(base) * sc * c0, s8(base + 1u) * sc * c1));
 }
 "#;
 
