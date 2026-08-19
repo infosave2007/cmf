@@ -13,10 +13,11 @@ The eight-bit build becomes the fastest file in the repository, and the DiT
 learns to render a clip in chunks.
 
 Measured on an RTX 5090, MiniMax-H3 at 512×288, 22 frames, four steps, one
-machine in one sitting: **171.5 s → 46 s** for the q8_2f container (denoise
-103.3 → 31.7 s, video VAE 62.2 → 9.0 s). Its VAE now matches the four-bit
-file's exactly (9.0 s against 8.7 s) and its denoise is still 1.8× behind
-(31.7 s against 17.7 s) — 27 GB of weights against 15 GB is most of the rest.
+machine in one sitting: **171.5 s → 43 s** for the q8_2f container. Against
+the four-bit file of the same weights, three alternating runs each, both
+warm — denoise 29.6 s against 21.5 s, video VAE 8.6 s against 8.8 s. So the
+eight-bit build is four times faster than it was, its VAE now matches, and its
+denoise is 1.38× behind; 27 GB of weights against 15 GB is most of the rest.
 Both arms of every switch below render the same picture.
 
 ### Added
