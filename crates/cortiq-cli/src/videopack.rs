@@ -1503,11 +1503,23 @@ fn pack_audio_vae(
     let a = StFile::open(path)?;
     let mut n = 0usize;
     for name in a.order.clone() {
+        // The decoder is what renders. The encoder half rides along
+        // because the DiT can take a reference soundtrack — the packed
+        // layout already carries a reference-audio segment with its own
+        // condition timestep — and without these tensors there is
+        // nothing in the file to turn a .wav into latents. The runtime
+        // path for it is not written yet; the weights are here so that
+        // when it is, nobody re-downloads the container.
         if !(name.starts_with("decoder.")
             || name.starts_with("dec_in_proj.")
-            || name.starts_with("latents_"))
+            || name.starts_with("latents_")
+            || name.starts_with("encoder.")
+            || name.starts_with("enc_")
+            || name.starts_with("pre_block")
+            || name.starts_with("mean")
+            || name.starts_with("logs"))
         {
-            continue; // encoder half, pre_block, mean/logs heads: unused
+            continue;
         }
         let shape = a.shape(&name).unwrap().to_vec();
         let vals = a.get(&name)?;
