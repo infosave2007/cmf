@@ -22090,6 +22090,7 @@ fn plane_cached(
     q_buf: &wgpu::Buffer,
     rows: usize,
     cols: usize,
+    default_cap_mb: u64,
 ) -> Option<(wgpu::Buffer, Option<wgpu::BindGroup>)> {
     if cols % 2 != 0 {
         return None;
@@ -22099,7 +22100,7 @@ fn plane_cached(
     let cap = std::env::var("CMF_PLANE_CACHE_MB")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(8192)
+        .unwrap_or(default_cap_mb)
         * 1024
         * 1024;
     let mut m = c.planes.lock().unwrap();
@@ -24554,7 +24555,17 @@ pub fn q4tp_ffn_packed(
         wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         "pffn-stage",
     );
-    let dq1 = dq_f16_plane(c, &mut sc, &w1b, 2 * inter, hidden);
+    // Keep the unpacked plane when the tensor is small enough to be worth
+    // keeping: the 3D VAE calls this with the same 33 M-weight tensor over
+    // and over, and the four-bit unpack — a 5-bit rung ladder per group —
+    // was paid every time. Measured at 768×448: the VAE's FFN phase is
+    // 24.1 s here against 5.4 s for the same FFN in an eight-bit container,
+    // whose unpack is one multiply per weight. A DiT weight is far past the
+    // cap and keeps the per-call scratch plane.
+    let key1 = (model.uid() as usize, w1);
+    let dq1 = plane_cached(c, key1, &w1b, 2 * inter, hidden, 1024)
+        .map(|(p, b)| (p, b))
+        .or_else(|| dq_f16_plane(c, &mut sc, &w1b, 2 * inter, hidden).map(|(p, b)| (p, Some(b))));
     drop(sc);
     c.queue
         .write_buffer(&xs_buf, 0, bytemuck::cast_slice(&xs[..b * hidden]));
@@ -24593,10 +24604,10 @@ pub fn q4tp_ffn_packed(
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("pffn"),
         });
-    // fc1 over the dequantized plane when the tensor cores are up; the
-    // second GEMM keeps the in-kernel path (its plane would need its own
-    // scratch, and it is the smaller of the two).
-    if let (Some((_, bind_dq)), Some(pipe_dq)) = (&dq1, c.q4tp_dq_f16.as_ref()) {
+    // fc1 over the dequantized plane when the tensor cores are up. A plane
+    // that came from the cache is already unpacked — encoding the pass again
+    // would redo the very work the cache exists to skip.
+    if let (Some((_, Some(bind_dq))), Some(pipe_dq)) = (&dq1, c.q4tp_dq_f16.as_ref()) {
         let mut pass = begin_pass(&mut enc);
         pass.set_pipeline(pipe_dq);
         pass.set_bind_group(0, bind_dq, &[]);
@@ -31250,7 +31261,8 @@ fn main() {
         });
         encode_q4_tile_mm(c, &mut enc, &c.q4tp_mm, &wbuf, &xbuf, &y_ref, rows, cols, n);
         // plane + device scale + f16 GEMM
-        let (plane, fresh) = plane_cached(c, (usize::MAX - 7, 0), &wbuf, rows, cols).unwrap();
+        let (plane, fresh) =
+            plane_cached(c, (usize::MAX - 7, 0), &wbuf, rows, cols, 8192).unwrap();
         if let Some(bind_dq) = fresh {
             let mut pass = begin_pass(&mut enc);
             pass.set_pipeline(c.q4tp_dq_f16.as_ref().unwrap());
@@ -39474,7 +39486,7 @@ pub fn dit_block_seg(
         if coop16 && cols % 2 == 0 {
             // Cached per weight: the unpack pass is encoded on the FIRST
             // step only, and the remaining twenty-nine read the plane.
-            let dq = plane_cached(c, (uid, idx), w, rows, cols);
+            let dq = plane_cached(c, (uid, idx), w, rows, cols, 8192);
             if let (Some((plane, fresh)), Some(pdq), Some(pipe)) =
                 (&dq, c.q4tp_dq_f16.as_ref(), c.q4tp_mm_coop_f16.as_ref())
             {
