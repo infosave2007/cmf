@@ -626,19 +626,46 @@ fn generate_inner(
                 out
             };
             for (ci_, cur) in chunks.iter().enumerate() {
-                let mut vis: Vec<usize> = (0..p.stream_sink.min(ci_)).collect();
-                for j in ci_.saturating_sub(p.stream_window)..ci_ {
-                    if !vis.contains(&j) {
-                        vis.push(j);
+                // The sink and the window are counted in LATENT FRAMES, the
+                // unit the reference's KV cache holds: two frames pinned at
+                // the start and two trailing the current chunk, not two whole
+                // chunks of each. Counting them in chunks made a chunk attend
+                // to four chunks' worth of rows — which is both slower than
+                // the bidirectional path it replaces and not the pattern the
+                // adapter trained. `CMF_STREAM_UNIT=chunks` keeps the old
+                // reading for comparison.
+                let by_chunk = std::env::var("CMF_STREAM_UNIT").as_deref() == Ok("chunks");
+                let ctx_v: Vec<usize> = if by_chunk {
+                    let mut vis: Vec<usize> = (0..p.stream_sink.min(ci_)).collect();
+                    for j in ci_.saturating_sub(p.stream_window)..ci_ {
+                        if !vis.contains(&j) {
+                            vis.push(j);
+                        }
+                    }
+                    vis.sort_unstable();
+                    vis.iter().flat_map(|&j| chunks[j].clone()).collect()
+                } else {
+                    let done = cur.start; // every frame finished so far
+                    let mut f: Vec<usize> = (0..p.stream_sink.min(done)).collect();
+                    for k in done.saturating_sub(p.stream_window)..done {
+                        if !f.contains(&k) {
+                            f.push(k);
+                        }
+                    }
+                    f.sort_unstable();
+                    f
+                };
+                let cur_v: Vec<usize> = cur.clone().collect();
+                // Audio rows follow the video frames they belong to.
+                let mut ctx_a: Vec<usize> = Vec::new();
+                for &k in &ctx_v {
+                    for i in a_bound(k)..a_bound(k + 1) {
+                        if !ctx_a.contains(&i) {
+                            ctx_a.push(i);
+                        }
                     }
                 }
-                vis.sort_unstable();
-                let ctx_v: Vec<usize> = vis.iter().flat_map(|&j| chunks[j].clone()).collect();
-                let cur_v: Vec<usize> = cur.clone().collect();
-                let ctx_a: Vec<usize> = vis
-                    .iter()
-                    .flat_map(|&j| a_bound(chunks[j].start)..a_bound(chunks[j].end))
-                    .collect();
+                ctx_a.sort_unstable();
                 let cur_a: Vec<usize> = (a_bound(cur.start)..a_bound(cur.end)).collect();
                 let clay = Layout::streaming(
                     ids.len(),
