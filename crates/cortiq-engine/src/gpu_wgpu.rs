@@ -963,6 +963,23 @@ fn axpy(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (ap.asg != 0u) { ay[i] = v; } else { ay[i] = ay[i] + v; }
 }
 
+// The two-field codec's column scale, applied to a panel that is already on
+// the card: `y[r][i] = x[r][i] · col[i]`. The host folds this field into the
+// activation for free when it has the activation; when the panel is the
+// previous kernel's output, this is what keeps the fusion intact instead of
+// dragging it home to multiply.
+struct ColP { n: u32, cols: u32, _a: u32, _b: u32 };
+@group(0) @binding(0) var<storage, read>       csx : array<f32>;
+@group(0) @binding(1) var<storage, read>       csc : array<f32>;
+@group(0) @binding(2) var<storage, read_write> csy : array<f32>;
+@group(0) @binding(3) var<uniform>             csp : ColP;
+@compute @workgroup_size(256)
+fn colscale(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= csp.n) { return; }
+    csy[i] = csx[i] * csc[i % csp.cols];
+}
+
 // The same matvec with 256 threads and four rows to a workgroup.
 //
 // `f32_matvec` gives a row 64 threads and a workgroup, which for the
@@ -12326,6 +12343,7 @@ struct Ctx {
     q1_mm: wgpu::ComputePipeline,
     silu: wgpu::ComputePipeline,
     axpy: wgpu::ComputePipeline,
+    colscale: wgpu::ComputePipeline,
     gate_mul: wgpu::ComputePipeline,
     zero: wgpu::ComputePipeline,
     q1: wgpu::ComputePipeline,
@@ -12580,6 +12598,7 @@ struct Ctx {
     layout_q1mm: wgpu::BindGroupLayout,
     layout_silu: wgpu::BindGroupLayout,
     layout_axpy: wgpu::BindGroupLayout,
+    layout_colscale: wgpu::BindGroupLayout,
     layout_gate_mul: wgpu::BindGroupLayout,
     layout_zero: wgpu::BindGroupLayout,
     layout_q1: wgpu::BindGroupLayout,
@@ -13354,6 +13373,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let q1_mm = pipe("q1_mul_mm");
     let silu = pipe("silu_mul_pre");
     let axpy = pipe("axpy");
+    let colscale = pipe("colscale");
     let gate_mul = pipe("gate_mul");
     let zero = pipe("fill_zero");
     let q1_constants = [
@@ -13829,6 +13849,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let layout_q1mm = q1_mm.get_bind_group_layout(0);
     let layout_silu = silu.get_bind_group_layout(0);
     let layout_axpy = axpy.get_bind_group_layout(0);
+    let layout_colscale = colscale.get_bind_group_layout(0);
     let layout_gate_mul = gate_mul.get_bind_group_layout(0);
     let layout_zero = zero.get_bind_group_layout(0);
 
@@ -13864,6 +13885,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         q1_mm,
         silu,
         axpy,
+        colscale,
         gate_mul,
         zero,
         q1,
@@ -14050,6 +14072,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         layout_q1mm,
         layout_silu,
         layout_axpy,
+        layout_colscale,
         layout_gate_mul,
         layout_zero,
         layout_q1,
@@ -21155,6 +21178,225 @@ pub fn q8_matmat(
     )
 }
 
+/// The per-row scales and the column field of a `q8_row`/`q8_2f` weight,
+/// read straight out of the mapped file: `[int8 body][f16 row scales][f16
+/// column field]`.
+fn q8_fields(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    rows: usize,
+    cols: usize,
+) -> Option<(Vec<f32>, Vec<f32>)> {
+    use cortiq_core::TensorDtype as D;
+    let entry = &model.tensors[idx];
+    let abs = model.entry_abs_offset(entry)?;
+    let bytes = model.primary_bytes();
+    let n = rows * cols;
+    let need = n + rows * 2 + if entry.dtype == D::Q8_2f { cols * 2 } else { 0 };
+    if abs + need > bytes.len() {
+        return None;
+    }
+    let b = &bytes[abs..abs + need];
+    let f16 = |o: usize| cortiq_core::quant::f16_to_f32(u16::from_le_bytes([b[o], b[o + 1]]));
+    let rs: Vec<f32> = (0..rows).map(|o| f16(n + o * 2)).collect();
+    let cf: Vec<f32> = if entry.dtype == D::Q8_2f {
+        (0..cols).map(|i| f16(n + rows * 2 + i * 2)).collect()
+    } else {
+        vec![1.0; cols]
+    };
+    Some((rs, cf))
+}
+
+/// The panel a projection produces, left on the card, for WHICHEVER codec the
+/// weight is in. The fused DiT paths were written against `q4tp` and asked for
+/// it by name; a container packed any other way then fell back to per-op GEMMs
+/// with a readback between every one.
+///
+/// `xs` is the host activation. For the two-field codec the column field is
+/// folded into it here — that is what leaves a plain per-row int8 product.
+pub(crate) fn fused_panel_keep(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+) -> Option<wgpu::Buffer> {
+    use cortiq_core::TensorDtype as D;
+    let entry = &model.tensors[idx];
+    match entry.dtype {
+        D::Q4TiledP => {
+            let mut unused = Vec::new();
+            tp_matmat_keep(model, idx, xs, b, rows, cols, &mut unused, false)
+        }
+        D::Q8Row | D::Q8_2f => {
+            let (rs, cf) = q8_fields(model, idx, rows, cols)?;
+            let pre: Vec<f32> = if entry.dtype == D::Q8_2f {
+                xs[..b * cols]
+                    .chunks_exact(cols)
+                    .flat_map(|r| r.iter().zip(&cf).map(|(a, c)| a * c))
+                    .collect()
+            } else {
+                xs[..b * cols].to_vec()
+            };
+            q8_matmat_keep(model, idx, &rs, &pre, b, rows, cols)
+        }
+        _ => None,
+    }
+}
+
+/// `y = x · col` on a panel already on the card, into a fresh buffer. The
+/// two-field codec's column field has to meet the activation somewhere; when
+/// the activation is the previous kernel's output, it meets it here instead
+/// of on a round trip home.
+fn colscale_keep(c: &Ctx, src: &wgpu::Buffer, col: &[f32], n_total: usize) -> Option<wgpu::Buffer> {
+    let cols = col.len();
+    if cols == 0 || n_total == 0 || n_total % cols != 0 {
+        return None;
+    }
+    let col_buf = c
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("cs-col"),
+            contents: bytemuck::cast_slice(col),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+    let y = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("cs-y"),
+        size: (n_total * 4) as u64,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let pbuf = c
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("cs-p"),
+            contents: bytemuck::cast_slice(&[n_total as u32, cols as u32, 0u32, 0u32]),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("cs"),
+        layout: &c.layout_colscale,
+        entries: &[
+            bind_buf(0, src),
+            bind_buf(1, &col_buf),
+            bind_buf(2, &y),
+            bind_buf(3, &pbuf),
+        ],
+    });
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("cs") });
+    {
+        let mut pass = begin_pass_with(&mut enc, Some("cs"), None);
+        pass.set_pipeline(&c.colscale);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups((n_total as u32).div_ceil(256).min(MAX_WG), 1, 1);
+    }
+    c.queue.submit(Some(enc.finish()));
+    Some(y)
+}
+
+/// A projection whose input is ALREADY on the card, for whichever codec —
+/// the second half of every fused pair (attention → out, SwiGLU → fc2).
+pub(crate) fn fused_gemm_from_device(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    src: &wgpu::Buffer,
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    use cortiq_core::TensorDtype as D;
+    match model.tensors[idx].dtype {
+        D::Q4TiledP => {
+            tp_matmat_impl(model, idx, &[], b, rows, cols, Some(out), Some(src), false).is_some()
+        }
+        dt @ (D::Q8Row | D::Q8_2f) => {
+            let Some(c) = ctx() else { return false };
+            let Some((rs, cf)) = q8_fields(model, idx, rows, cols) else {
+                return false;
+            };
+            let scaled;
+            let operand = if dt == D::Q8_2f {
+                match colscale_keep(c, src, &cf, b * cols) {
+                    Some(bf) => {
+                        scaled = bf;
+                        &scaled
+                    }
+                    None => return false,
+                }
+            } else {
+                src
+            };
+            let entry = &model.tensors[idx];
+            let Some(abs) = model.entry_abs_offset(entry) else {
+                return false;
+            };
+            let bytes = model.primary_bytes();
+            if abs + rows * cols > bytes.len() {
+                return false;
+            }
+            dispatch_matmat_keep(
+                c,
+                Some((model.uid() as usize, idx)),
+                &bytes[abs..abs + rows * cols],
+                &rs,
+                &[],
+                b,
+                rows,
+                cols,
+                Some(out),
+                Some(operand),
+            )
+            .is_some()
+        }
+        _ => false,
+    }
+}
+
+/// The int8 GEMM with its result left on the card — the entry the fused DiT
+/// paths use for a `q8_row`/`q8_2f` weight. `pre` is the activation already
+/// carrying the column field, which is what turns the two-field codec into a
+/// plain per-row int8 product.
+pub fn q8_matmat_keep(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    row_scale: &[f32],
+    pre: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+) -> Option<wgpu::Buffer> {
+    let c = ctx()?;
+    if cols % 4 != 0 || rows == 0 || b == 0 {
+        return None;
+    }
+    let entry = &model.tensors[idx];
+    if entry.shape.first().copied().unwrap_or(0) < rows {
+        return None;
+    }
+    let abs = model.entry_abs_offset(entry)?;
+    let bytes = model.primary_bytes();
+    if abs + rows * cols > bytes.len() || row_scale.len() < rows || pre.len() < b * cols {
+        return None;
+    }
+    let full_quant = &bytes[abs..abs + rows * cols];
+    dispatch_matmat_keep(
+        c,
+        Some((model.uid() as usize, idx)),
+        full_quant,
+        row_scale,
+        pre,
+        b,
+        rows,
+        cols,
+        None,
+        None,
+    )
+}
+
 /// Batched q1 GEMM (prefill): resident 1-bit weight, batch of raw-f32 inputs,
 /// one 2D dispatch of q1_mul_mm, one readback. cols must be a 64-multiple (the
 /// q1 format packs whole tile-pairs). Weights resident + cached; x through the
@@ -21256,17 +21498,43 @@ fn dispatch_matmat(
     cols: usize,
     out: &mut [f32],
 ) -> bool {
+    dispatch_matmat_keep(
+        c, weight_key, full_quant, row_scale, pre, b, rows, cols, Some(out), None,
+    )
+    .is_some()
+}
+
+/// The same int8 GEMM, with the result LEFT on the card when `out` is None.
+///
+/// This is what lets the two-field codec ride the fused DiT paths: they hand
+/// one kernel's output straight to the next without a readback, and a
+/// readback drains the queue. `q4tp` had such a variant from the start
+/// (`tp_matmat_keep`) and `q8_2f` did not, which is the whole reason the
+/// eight-bit build went through per-op GEMMs while the four-bit one fused.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_matmat_keep(
+    c: &Ctx,
+    weight_key: Option<(usize, usize)>,
+    full_quant: &[u8],
+    row_scale: &[f32],
+    pre: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    mut out: Option<&mut [f32]>,
+    src: Option<&wgpu::Buffer>,
+) -> Option<wgpu::Buffer> {
     if full_quant.len() < rows * cols
         || row_scale.len() < rows
-        || pre.len() < b * cols
-        || out.len() < b * rows
+        || (src.is_none() && pre.len() < b * cols)
+        || out.as_ref().is_some_and(|o| o.len() < b * rows)
     {
-        return false;
+        return None;
     }
     let q_buf = match weight_key {
         Some(k) => match weight_buffer(c, k, full_quant) {
             Some(b) => b,
-            None => return false, // over VRAM budget — honest CPU path
+            None => return None, // over VRAM budget — honest CPU path
         },
         None => c
             .device
@@ -21303,13 +21571,19 @@ fn dispatch_matmat(
     };
     // Pooled scratch for the whole op (encode → submit → poll).
     let mut sc = c.scratch.lock().unwrap();
-    let xs_buf = Scratch::ensure(
-        &c.device,
-        &mut sc.xs,
-        (b * cols * 4) as u64,
-        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        "mm-xs",
-    );
+    let xs_buf = match src {
+        // The operand is already on the card: the kernel before us left it
+        // there, and taking delivery just to hand it back is the round trip
+        // this whole path exists to remove.
+        Some(bf) => bf.clone(),
+        None => Scratch::ensure(
+            &c.device,
+            &mut sc.xs,
+            (b * cols * 4) as u64,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            "mm-xs",
+        ),
+    };
     c.queue
         .write_buffer(&xs_buf, 0, bytemuck::cast_slice(&pre[..b * cols]));
     let y_size = (b * rows * 4) as u64;
@@ -21376,9 +21650,19 @@ fn dispatch_matmat(
             pass.dispatch_workgroups((rows as u32).min(MAX_WG), b as u32, 1);
         }
     }
-    let ok = readback(c, enc, &y_buf, &stage_buf, y_size, &mut out[..b * rows]);
-    drop(sc);
-    ok
+    match out.as_mut() {
+        Some(o) => {
+            let ok = readback(c, enc, &y_buf, &stage_buf, y_size, &mut o[..b * rows]);
+            drop(sc);
+            ok.then_some(y_buf)
+        }
+        None => {
+            // Nothing to bring home: submit and hand the buffer on.
+            c.queue.submit(Some(enc.finish()));
+            drop(sc);
+            Some(y_buf)
+        }
+    }
 }
 
 /// q1t batched GEMM (prefill) on wgpu — register-blocked base GEMM then the
@@ -22326,9 +22610,7 @@ pub fn dit_qkv_attention(
     out: &mut [f32],
 ) -> bool {
     let inner = nh * hd;
-    let mut unused = Vec::new();
-    let Some(panel) = tp_matmat_keep(model, qkv_idx, xn, n, 3 * inner, hidden, &mut unused, false)
-    else {
+    let Some(panel) = fused_panel_keep(model, qkv_idx, xn, n, 3 * inner, hidden) else {
         return false;
     };
     dit_attention_packed_src(
@@ -22372,11 +22654,15 @@ pub fn dit_qkv_attn_out(
     let inner = nh * hd;
     let can_dev_scale =
         (c.act_amax_part.is_some() && c.act_amax_fold.is_some()) || c.act_absmax.is_some();
+    // The f16 dequant and the coop GEMM are the FOUR-BIT path's tools; an
+    // int8 weight needs neither, and demanding them here is what kept a
+    // q8_2f container out of the fused path entirely.
+    let four_bit = model.tensors[qkv_idx].dtype == cortiq_core::TensorDtype::Q4TiledP;
     let refuse = if !can_dev_scale {
         "no device absmax"
-    } else if c.q4tp_mm_coop_f16.is_none() {
+    } else if four_bit && c.q4tp_mm_coop_f16.is_none() {
         "no coop f16 gemm"
-    } else if c.q4tp_dq_f16.is_none() {
+    } else if four_bit && c.q4tp_dq_f16.is_none() {
         "no f16 dequant"
     } else if c.dit_qkv_split.is_none() {
         "no qkv split"
@@ -22396,9 +22682,7 @@ pub fn dit_qkv_attn_out(
         }
         return false;
     }
-    let mut unused = Vec::new();
-    let Some(panel) = tp_matmat_keep(model, qkv_idx, xn, n, 3 * inner, hidden, &mut unused, false)
-    else {
+    let Some(panel) = fused_panel_keep(model, qkv_idx, xn, n, 3 * inner, hidden) else {
         if std::env::var("CMF_GPU_DEBUG").is_ok() {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| eprintln!("dit_qkv_attn_out refused: qkv gemm"));
@@ -22426,18 +22710,7 @@ pub fn dit_qkv_attn_out(
         return false;
     }
     let Some(ab) = ab else { return false };
-    let ok = tp_matmat_impl(
-        model,
-        out_idx,
-        &[],
-        n,
-        hidden,
-        inner,
-        Some(proj),
-        Some(&ab),
-        false,
-    )
-    .is_some();
+    let ok = fused_gemm_from_device(model, out_idx, &ab, n, hidden, inner, proj);
     if !ok && std::env::var("CMF_GPU_DEBUG").is_ok() {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| eprintln!("dit_qkv_attn_out refused: out gemm {hidden}x{inner} b={n}"));
