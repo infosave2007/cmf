@@ -615,7 +615,7 @@ Two more, on the runtime side: the latent upscaler published for H3
 (a 345 M-parameter 3-D conv net) is not ported, and there is no fused
 device kernel for adapter branches on this model — see below.
 
-## The eight-bit build — now the fastest file here
+## The eight-bit build, and what it costs now
 
 `mmh3-turbo-clipproj4b-fl2va-v2-q8_2f.cmf` (26.90 GB, 26.21 B parameters,
 `cortiq verify` clean) packs the DiT as **`q8_2f`** — the two-field int8,
@@ -631,7 +631,14 @@ steps, one machine, one sitting:
 | q8_2f, 0.5.94 | 103.3 s | 62.2 s | 171.5 s |
 | q8_2f, scalar int8 kernel | 56.2 s | 19.5 s | 81 s |
 | **q8_2f, 0.5.95** | **31.7 s** | **9.0 s** | **46 s** |
-| q4tp, same session | 59.0 s | 37.2 s | ~101 s |
+| q4tp, same session | 17.7 s | 8.7 s | 31 s |
+
+**3.7× on the eight-bit file, and its VAE now matches the four-bit one
+exactly — but four-bit still denoises 1.8× faster**, and 27 GB of weights
+against 15 GB is most of what is left of that. Read the q4tp row carefully if
+you saw an earlier version of this table: it said ~101 s, measured with that
+container on a network filesystem, cold, so its page faults landed inside the
+denoise timer. Both rows above are local disk, warm, alternating runs.
 
 Three things were in the way, and none of them was the codec:
 
