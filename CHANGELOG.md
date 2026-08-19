@@ -12,8 +12,10 @@ learns to render a clip in chunks.
 
 Measured on an RTX 5090, MiniMax-H3 at 512×288, 22 frames, four steps, one
 machine in one sitting: **171.5 s → 46 s** for the q8_2f container (denoise
-103.3 → 31.7 s, video VAE 62.2 → 9.0 s), against ~101 s for the four-bit file
-of the same weights. Both arms of every switch below render the same picture.
+103.3 → 31.7 s, video VAE 62.2 → 9.0 s). Its VAE now matches the four-bit
+file's exactly (9.0 s against 8.7 s) and its denoise is still 1.8× behind
+(31.7 s against 17.7 s) — 27 GB of weights against 15 GB is most of the rest.
+Both arms of every switch below render the same picture.
 
 ### Added
 - **The chunk-causal path (`--stream-chunk`).** The DiT renders a clip in
