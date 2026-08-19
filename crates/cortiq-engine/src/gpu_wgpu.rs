@@ -24455,6 +24455,7 @@ pub fn ffn_packed(
         }
         return true;
     }
+    let t_ffn = std::time::Instant::now();
     let took = match model.tensors.get(w1).map(|e| e.dtype) {
         Some(D::Q4TiledP) => q4tp_ffn_packed(model, w1, w2, xs, b, hidden, inter, bias, out),
         Some(D::Q8Row | D::Q8_2f) if fused_any() => {
@@ -24462,6 +24463,25 @@ pub fn ffn_packed(
         }
         _ => false,
     };
+    // Calls and microseconds per shape. The 3D VAE's FFN phase costs the same
+    // 24 s at 512x288 as at 768x448, which means the cost does not scale with
+    // the work — so the question is how many times this is called and what
+    // each call costs, not what the kernel does inside.
+    if std::env::var("CMF_FFN_COUNT").is_ok() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CALLS: AtomicU64 = AtomicU64::new(0);
+        static MICROS: AtomicU64 = AtomicU64::new(0);
+        let n = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        let us = MICROS.fetch_add(t_ffn.elapsed().as_micros() as u64, Ordering::Relaxed)
+            + t_ffn.elapsed().as_micros() as u64;
+        if n % 200 == 0 {
+            eprintln!(
+                "ffn_packed: {n} calls, {:.1} s total, {:.2} ms each (last {hidden}x{inter}, b={b})",
+                us as f64 / 1e6,
+                us as f64 / 1e3 / n as f64
+            );
+        }
+    }
     // A fused FFN that quietly refuses sends the caller to a path that costs
     // several times as much, and the only trace is a slower render. Say it
     // once per shape, so a profile can be read against what actually ran.
