@@ -241,12 +241,14 @@ fn mmh3_gpu_parity_probe(path: &Path) -> Result<bool, String> {
     let model = Arc::new(
         cortiq_core::CmfModel::open(path).map_err(|e| format!("{}: {e}", path.display()))?,
     );
+    // Any codec, not just q4tp: the probe's job is to check THIS file's
+    // device arm against the host, and a container packed as q8_2f has one
+    // too. Matching on dtype sent every non-q4tp build to the CPU for the
+    // whole render — measured at 357 s against 60 on the same card.
     let Some(idx) = model.tensors.iter().position(|t| {
-        t.name.starts_with("dit.")
-            && t.name.ends_with("attn.qkv_proj.weight")
-            && t.dtype == cortiq_core::TensorDtype::Q4TiledP
+        t.name.starts_with("dit.") && t.name.ends_with("attn.qkv_proj.weight")
     }) else {
-        tracing::info!("mmh3 GPU parity probe: no q4tp qkv tensor — host path");
+        tracing::info!("mmh3 GPU parity probe: no qkv weight — host path");
         return Ok(false);
     };
     let entry = &model.tensors[idx];
@@ -266,10 +268,14 @@ fn mmh3_gpu_parity_probe(path: &Path) -> Result<bool, String> {
             crate::gpu::backend_available(),
         );
     }
-    if !crate::gpu::q4tp_matmat(&model, idx, &xs, b, rows, cols, &mut gpu) {
-        tracing::info!("mmh3 GPU parity probe: q4tp_matmat refused ({rows}x{cols}) — host path");
+    let qt = crate::qtensor::QTensor::from_model(&model, &entry.name.clone())?;
+    if !qt.device_matmat(&xs, b, &mut gpu) {
+        tracing::info!(
+            "mmh3 GPU parity probe: {:?} device GEMM refused ({rows}x{cols}) — host path",
+            entry.dtype
+        );
         if std::env::var("CMF_GPU_DEBUG").is_ok() {
-            eprintln!("mmh3 probe: q4tp_matmat refused {rows}x{cols}");
+            eprintln!("mmh3 probe: device GEMM refused {rows}x{cols} for {:?}", entry.dtype);
         }
         return Ok(false);
     }
