@@ -17,6 +17,9 @@ everywhere and on GPU through wgpu — Vulkan, DX12, Metal — out of the box.
 This repository is the format's front page. It holds the specification and
 the index of published models; it carries no weights of its own.
 
+- **Which file to take** — [`FORMATS.md`](FORMATS.md), the quantization ladder
+  in plain terms: what `q4tp`, `q2tp`, `q1t` and the rest cost you, and how a
+  video container decides precision per tensor family
 - **Specification** — [`SPEC.md`](SPEC.md), the normative document
 - **Source** — [github.com/infosave2007/cmf](https://github.com/infosave2007/cmf) (Apache-2.0)
 - **Runtime** — [`cortiq-cli` on crates.io](https://crates.io/crates/cortiq-cli), and prebuilt binaries for six targets on the [releases page](https://github.com/infosave2007/cmf/releases/latest)

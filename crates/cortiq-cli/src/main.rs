@@ -1373,6 +1373,13 @@ enum Commands {
         /// the first one is stretched, as the reference does
         #[arg(long)]
         last_frame: Option<String>,
+        /// A LoRA adapter (.safetensors) applied at runtime — the
+        /// community adapters for MiniMax-H3 as they ship
+        #[arg(long)]
+        lora: Option<String>,
+        /// How hard to apply the adapter
+        #[arg(long, default_value_t = 1.0)]
+        lora_strength: f32,
         /// Output .avi (a .wav is written alongside)
         #[arg(long, default_value = "out.avi")]
         out: String,
@@ -2228,6 +2235,8 @@ async fn main() -> anyhow::Result<()> {
             quality,
             first_frame,
             last_frame,
+            lora,
+            lora_strength,
             out,
         } => cmd_animate(
             &model,
@@ -2241,6 +2250,8 @@ async fn main() -> anyhow::Result<()> {
                 stock_sampler,
                 first_frame: first_frame.as_deref().map(read_ppm).transpose()?,
                 last_frame: last_frame.as_deref().map(read_ppm).transpose()?,
+                lora,
+                lora_strength,
                 ..Default::default()
             },
             quality,

@@ -270,10 +270,15 @@ What follows from them, if you are on such a machine:
   still the full encoder's territory.
 - **`--height 256` instead of 288** halves the video-VAE decode on every
   machine (three 256-pixel tiles instead of six).
-- **Voices are prompt space.** There is no reference-audio input — H3
-  conditions on text and keyframes only — but speaker identity, timbre,
-  pace and emotion respond to stage directions in the prompt, and a fixed
-  seed keeps the same actor across takes.
+- **Voices are prompt space *here*, not in the release.** Speaker identity,
+  timbre, pace and emotion respond to stage directions in the prompt, and a
+  fixed seed keeps the same actor across takes — which is how to work with
+  this file today. But the earlier claim on this card that "H3 has no
+  reference-audio input" was **wrong**, and a user was right to push back
+  (discussion #3): the release is tagged `audio-to-audio-video` and
+  `video-to-audio-video`, and the DiT takes both as conditioning rows. What
+  is missing is on our side and it is not training — see
+  [What this port does not do yet](#what-this-port-does-not-do-yet).
 
 ## Making it smaller
 
@@ -591,6 +596,85 @@ twenty steps and wrong at four, because over the last interval Δσ_a and Δσ_v
 differ by a factor of three and no per-step slope correction survives a step
 that large. `--stock-sampler` reproduces the broken behaviour if you want to
 hear it.
+
+## What this port does not do yet
+
+The release is tagged for six conditioning paths. This container packs one of
+them — `fl2va`, text and/or keyframes → video + audio. What the others need is
+listed here so nobody has to guess whether it is a missing feature or a
+missing possibility. **None of them needs training.**
+
+| the release's path | what it takes | what is missing here |
+|---|---|---|
+| `audio-to-audio-video` | a reference soundtrack | the audio VAE's **encoder half**. The container carries the decoder only — `pack_audio_vae` skips the encoder, `pre_block` and the mean/logs heads as unused. The DiT side already exists: the packed layout has a reference-audio segment kind and its own condition timestep |
+| `video-to-audio-video` | a reference clip | the sampler plumbing. The video VAE **encoder is already packed** in the `fl2va` files — it is what encodes `--first-frame` — so this is a layout and CLI change, not a weight change |
+| `ref2va` (subject / character references) | 1–N reference images | a **different DiT checkpoint** (`minimax_h3_ref2va_*`) with its own turbo LoRA. It would be a second container, not a flag on this one |
+
+Two more, on the runtime side: the latent upscaler published for H3
+(a 345 M-parameter 3-D conv net) is not ported, and there is no fused
+device kernel for adapter branches on this model — see below.
+
+## Adapters at runtime
+
+Community LoRAs for H3 run against this container as they ship:
+
+```bash
+cortiq animate mmh3-turbo-clipproj4b-fl2va-v2-q4tp.cmf \
+  --prompt "r34l1sm a woman in a red raincoat on a neon street, close-up" \
+  --lora h3-realism-people.safetensors --lora-strength 0.8 \
+  --out take.avi
+```
+
+`--lora` reads a `.safetensors` in any of the three conventions in the wild
+(`diffusion_model.…`, `base_model.model.dit.…`, or the bare module path), at
+F32/F16/BF16, with either `lora_A`/`lora_B` or `lora_down`/`lora_up` naming.
+It binds `attn.qkv_proj`, `attn.out_proj`, `mlp.fc1`, `mlp.fc2` on all fifty
+blocks and on the two token-refiner blocks, and it prints what it bound:
+
+```
+lora: rank 32, 104/104 branches bound
+```
+
+Branches it cannot bind are named rather than dropped in silence. The one real
+gap is `adaln_proj.linear`: this container carries the modulation as a rank-24
+curve over the timestep (that collapse is 40% of the released model's weights
+and most of why the file is 14 GB), and folding an adaLN update into it needs
+the time embedding, which only the packer has. Adapters that touch adaLN —
+the spatial-physics and streaming ones — therefore land partially, and say so.
+Bake them in instead with `animate-pack --lora … --time-embedder …`, which is
+exactly how the Turbo LoRA got into these files.
+
+**What it costs.** Measured on a Mac mini M4 (24 GB), 512×288, 22 frames, four
+steps, with `fal/MiniMax-H3-Realism-People-LoRA` (rank 32, 104 branches, all
+of which bind): **33.7 s a step with the adapter against 29.8 s without**, the
+two runs taken back to back. The branch itself is half a per cent of the
+projection's arithmetic and rides inside the base GEMM's Metal submission; what
+it costs is the *attention* fusion standing down, because a branch on
+`qkv_proj` or `out_proj` needs the panels that fusion keeps on the card. Two
+honest notes: `--lora-strength 0` reproduces the base render byte for byte, and
+the same base render drifted from 24.6 to 29.8 s a step over fifteen minutes on
+that machine, so read the adapter as costing roughly a tenth of a step, not a
+doubling.
+
+**Which parts of an adapter matter.** `CMF_LORA_PROBE=1` prints every branch by
+its measured contribution `‖s·ΔY‖/‖Y‖`, and `CMF_LORA_ROUTE=<r>` switches off
+the ones below `r`. For the Realism adapter the loudest branch is 150× the
+quietest, blocks 0–2 contribute nothing it would miss, and 41 of its 104
+branches carry the look:
+
+```
+lora branches by contribution ‖sΔY‖/‖Y‖ (41 of 104 live):
+    0.1633  on   blocks.13.attn.qkv_proj
+    0.0946  on   blocks.9.attn.qkv_proj
+    …
+    0.0011  off  blocks.1.attn.qkv_proj
+```
+
+Rendered on those 41, the clip still looks like the adapter and not like the
+base (13.34 dB PSNR against the base, where the full adapter is 13.76, and
+16.75 dB against the full adapter). It did not make the step shorter on Metal
+— the reason, and where routing does pay, is in
+[docs/LORA.md](https://github.com/infosave2007/cmf/blob/master/docs/LORA.md).
 
 ## Provenance
 

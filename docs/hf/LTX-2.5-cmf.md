@@ -187,6 +187,13 @@ activation already uploaded and accumulating into the output already
 written, so it costs no transfer: a 384-token step goes 8.6 s to 10.1 s on
 an M4.
 
+Three naming conventions are read as they ship — `diffusion_model.…`
+(ComfyUI single-file), `base_model.model.…` (PEFT) and the bare module path —
+in F32, F16 or BF16, with `lora_A`/`lora_B` or `lora_down`/`lora_up` spelling.
+`CMF_LORA_PROBE=1` prints each branch's measured contribution and
+`CMF_LORA_ROUTE=<r>` switches off the ones below `r`; both are described in
+[docs/LORA.md](https://github.com/infosave2007/cmf/blob/master/docs/LORA.md).
+
 An adapter that also carries a `reference_slot_embedding` takes reference
 stills, which is how the multi-subject adapters work:
 
