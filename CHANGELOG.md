@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.96] - 2026-08-19
+
+Three quarters of a four-bit FFN call was host time, and most of that was one
+scan the card could do itself.
+
 ### Changed
 - **The four-bit FFN takes its activation scale from the card.** Three quarters
   of one call was host time — 126.2 ms against 41.4 ms of card at 768×448 —
@@ -25,6 +30,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - `CMF_FFN_COUNT=1` reports the packed FFN's calls and its split between host
   preparation and waiting for the card — the measurement that found the above.
+- `CMF_PROJ_DEV_SCAN=1` applies the same device-side scale to the qkv and
+  output projections. Opt-in, and honestly so: the machine it would have been
+  measured on went away before a single frame came out of that path.
+
+### Notes on what did NOT work, so it is not rediscovered
+- **Caching the unpacked f16 plane across calls** (`CMF_PLANE_CACHE_MB`):
+  eight alternating runs, denoise off 72.9 / 71.1 / 69.5 / 76.6 against on
+  60.6 / 71.1 / 73.6 / 76.2. One fast run, and the spread inside a single arm
+  is 10%.
+- **Lowering the four-bit plane gate** (`CMF_Q4TP_PLANE_MIN=8`): worse at both
+  sizes, 36 s against 31 s.
+- The 3D VAE's four-bit FFN phase costs the same ~24 s at 512×288 and at
+  768×448 while an eight-bit container spends 5.4 s there. Its card half is
+  12.6 ms per call against the eight-bit path's 14 ms *for the whole call* —
+  so what is left is host preparation, not arithmetic.
 
 ## [0.5.95] - 2026-08-19
 
