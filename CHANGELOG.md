@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.94] - 2026-08-19
+
+The eight-bit build runs on the card: two gates, not a missing kernel.
+
+### Fixed
+- **The MiniMax-H3 startup probe matched on `Q4TiledP`.** It looked for a
+  four-bit qkv weight by name *and* dtype and, finding none, declared the host
+  path for the whole render — for a codec that has a device GEMM of its own.
+  `QTensor::device_matmat` is now the one place that knows which entry point
+  each codec has, and the probe asks it. The two-field int8 folds its column
+  field into the activation, which leaves the per-row int8 kernel both
+  backends already ship.
+- **The wgpu weight-residency budget was the whole heap minus a gigabyte.**
+  Every container published before this one had weights far under it; 24 GB of
+  eight-bit weights took the card and the first scratch allocation died with
+  `wgpu error: Out of Memory`. A quarter of the heap is held back now (1–8 GB):
+  a 32 GB card budgets 24 GB of weights, a 24 GB card 18, a 16 GB card 12.
+
+  Measured on an RTX 5090, `mmh3-turbo-clipproj4b-fl2va-v2-q8_2f.cmf`,
+  512×288, 22 frames, four steps: **357.3 s → 171.5 s**, GPU 0% → 58%,
+  2 MiB → 29.7 GB resident. The probe agrees with the CPU arm to 5.77e-3.
+
+  Still 2.8× the four-bit file's 60.2 s, and that part is kernels: `q4tp` has
+  the fused qkv → attention → output submission and the packed FFN, `q8_2f`
+  goes through the generic per-op GEMM.
+
 ## [0.5.93] - 2026-08-19
 
 The latent upscaler, an eight-bit build, and reference clips.
