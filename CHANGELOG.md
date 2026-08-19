@@ -18,6 +18,9 @@ the four-bit file of the same weights, three alternating runs each, both
 warm — denoise 29.6 s against 21.5 s, video VAE 8.6 s against 8.8 s. So the
 eight-bit build is four times faster than it was, its VAE now matches, and its
 denoise is 1.38× behind; 27 GB of weights against 15 GB is most of the rest.
+At 768×448 the order reverses — q8_2f renders in 69 s against 131 s, its VAE
+in 11.7 s against 38.5 s — because the four-bit path still unpacks inside its
+FFN kernel, per tile of activations, and that costs more the wider the panel.
 Both arms of every switch below render the same picture.
 
 ### Added
