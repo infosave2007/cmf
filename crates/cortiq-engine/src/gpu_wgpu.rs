@@ -24526,6 +24526,7 @@ pub fn q4tp_ffn_packed(
 ) -> bool {
     let Some(c) = ctx() else { return false };
     let _gate = c.mm_gate.lock().unwrap();
+    let t_stage = std::time::Instant::now();
     if hidden % 32 != 0 || inter % 32 != 0 || b == 0 {
         return false;
     }
@@ -24840,7 +24841,33 @@ pub fn q4tp_ffn_packed(
             c, &mut enc, &c.q4tp_mm, &w2b, &act_buf, &y_buf, hidden, inter, b,
         ),
     }
-    readback(c, enc, &y_buf, &stage_buf, y_size, &mut out[..b * hidden])
+    // Where one call spends itself, under CMF_FFN_COUNT: everything before
+    // the readback is host work — buffer creation, bind groups, the host scan
+    // for max|x| — and the readback is the wait for the card. A four-bit VAE
+    // call costs 116 ms against an eight-bit one's 14 ms at the same shape,
+    // and this split says which half to go after.
+    let t_host = t_stage.elapsed();
+    let ok = readback(c, enc, &y_buf, &stage_buf, y_size, &mut out[..b * hidden]);
+    if std::env::var("CMF_FFN_COUNT").is_ok() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static HOST: AtomicU64 = AtomicU64::new(0);
+        static WAIT: AtomicU64 = AtomicU64::new(0);
+        static N: AtomicU64 = AtomicU64::new(0);
+        let total = t_stage.elapsed();
+        let h = HOST.fetch_add(t_host.as_micros() as u64, Ordering::Relaxed)
+            + t_host.as_micros() as u64;
+        let w = WAIT.fetch_add((total - t_host).as_micros() as u64, Ordering::Relaxed)
+            + (total - t_host).as_micros() as u64;
+        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % 200 == 0 {
+            eprintln!(
+                "q4tp_ffn split: {n} calls, host {:.1} ms each, card {:.1} ms each ({hidden}x{inter}, b={b})",
+                h as f64 / 1e3 / n as f64,
+                w as f64 / 1e3 / n as f64
+            );
+        }
+    }
+    ok
 }
 
 pub fn q4tp_ffn(
