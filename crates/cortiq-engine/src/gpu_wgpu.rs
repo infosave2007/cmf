@@ -24446,13 +24446,30 @@ pub fn ffn_packed(
         }
         return true;
     }
-    match model.tensors.get(w1).map(|e| e.dtype) {
+    let took = match model.tensors.get(w1).map(|e| e.dtype) {
         Some(D::Q4TiledP) => q4tp_ffn_packed(model, w1, w2, xs, b, hidden, inter, bias, out),
         Some(D::Q8Row | D::Q8_2f) if fused_any() => {
             q8_ffn_packed(model, w1, w2, xs, b, hidden, inter, bias, out)
         }
         _ => false,
+    };
+    // A fused FFN that quietly refuses sends the caller to a path that costs
+    // several times as much, and the only trace is a slower render. Say it
+    // once per shape, so a profile can be read against what actually ran.
+    if std::env::var("CMF_GPU_DEBUG").is_ok() {
+        use std::collections::HashSet;
+        use std::sync::Mutex;
+        static SEEN: Mutex<Option<HashSet<(usize, usize, bool)>>> = Mutex::new(None);
+        let mut g = SEEN.lock().unwrap();
+        if g.get_or_insert_with(HashSet::new).insert((hidden, inter, took)) {
+            eprintln!(
+                "ffn_packed: {} for {hidden}x{inter} (b={b}, dtype={:?})",
+                if took { "fused" } else { "REFUSED" },
+                model.tensors.get(w1).map(|e| e.dtype)
+            );
+        }
     }
+    took
 }
 
 /// What one FFN pass may allocate. A storage binding stops at 2 GiB minus four
