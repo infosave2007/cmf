@@ -1766,6 +1766,39 @@ impl QTensor {
 }
 
 impl QTensor {
+    /// The device GEMM this tensor would take, run once on the caller's
+    /// data — the startup parity probe's arm, and the one place that knows
+    /// which entry point each codec has.
+    ///
+    /// It exists because the probe used to look for a `q4tp` weight by
+    /// name AND dtype, and a container packed any other way was declared
+    /// "host path" for the whole render even though its codec had a device
+    /// GEMM of its own. A gate that only recognizes one codec is a gate
+    /// that silently downgrades every other one.
+    pub fn device_matmat(&self, xs: &[f32], b: usize, out: &mut [f32]) -> bool {
+        let (rows, cols) = (self.rows(), self.cols());
+        let Self::Mapped { model, idx, dtype, row_scale, col_field, .. } = self else {
+            return false;
+        };
+        match *dtype {
+            TensorDtype::Q4TiledP => {
+                crate::gpu::q4tp_matmat(model, *idx, xs, b, rows, cols, out)
+            }
+            // The two-field codec folds its column field into the
+            // activation, which leaves a plain per-row int8 GEMM — the
+            // same kernel `q8_row` uses, on both backends.
+            TensorDtype::Q8Row | TensorDtype::Q8_2f => {
+                let flat: Vec<f32> = (0..b)
+                    .flat_map(|bi| {
+                        prescale(&xs[bi * cols..(bi + 1) * cols], col_field, *dtype).into_owned()
+                    })
+                    .collect();
+                crate::gpu::q8_matmat(model, *idx, row_scale, &flat, b, rows, cols, out)
+            }
+            _ => false,
+        }
+    }
+
     /// Multi-matrix job (roadmap §3 P0): N tensors sharing one input
     /// run under a SINGLE pool dispatch — QKV or gate+up cost one
     /// barrier instead of N. Per-row math is the exact same kernel as
