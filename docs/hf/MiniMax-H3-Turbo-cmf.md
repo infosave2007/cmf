@@ -56,6 +56,7 @@ One transformer denoises picture and sound together in one packed sequence.
 | `mmh3-turbo-q4tp.cmf` | 23.47 GB | 24 GB+ | no | same, without the vision tower |
 | **`mmh3-turbo-clipproj4b-q4tp.cmf`** | **13.16 GB** | **16–20 GB** | no | **the small one**, peaks at 15.1 GB |
 | **`mmh3-turbo-clipproj4b-fl2va-q4tp.cmf`** | **14.48 GB** | **16–24 GB** | **yes** | the small one WITH start/end frames — the 4B vision tower and the VAE encoder join the compact build |
+| **`mmh3-turbo-clipproj4b-fl2va-v2-q8_2f.cmf`** | **26.90 GB** | **32 GB+** | **yes** | **eight bits**: the two-field int8, `w = q·row[o]·col[i]`. The step up from four bits for a machine with the memory |
 | `mmh3-turbo-fl2va-q2tp.cmf` | 18.74 GB | — | yes | don't render with this |
 
 Text-to-video everywhere; the `fl2va` files also take a first and/or last frame
