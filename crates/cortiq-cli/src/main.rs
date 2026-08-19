@@ -1384,6 +1384,16 @@ enum Commands {
         /// is one reference every third of a second)
         #[arg(long, default_value_t = 8)]
         video_stride: usize,
+        /// The published latent upscaler (`minimax_h3_latent_upscaler_3d_*.safetensors`):
+        /// the denoised latent is resized by the learned net and the VAE
+        /// decodes at the larger size — no decode → resize → encode round
+        /// trip through the 5 B-parameter VAE, and none of the ghosting a
+        /// plain interpolation puts there
+        #[arg(long)]
+        upscale: Option<String>,
+        /// How far the latent upscaler takes it
+        #[arg(long, default_value_t = 2.0)]
+        upscale_by: f32,
         /// A LoRA adapter (.safetensors) applied at runtime — the
         /// community adapters for MiniMax-H3 as they ship
         #[arg(long)]
@@ -2283,6 +2293,8 @@ async fn main() -> anyhow::Result<()> {
             last_frame,
             video,
             video_stride,
+            upscale,
+            upscale_by,
             lora,
             lora_strength,
             out,
@@ -2302,6 +2314,8 @@ async fn main() -> anyhow::Result<()> {
                     None => Vec::new(),
                     Some(dir) => read_frame_dir(dir, video_stride.max(1), frames)?,
                 },
+                upscale,
+                upscale_by,
                 lora,
                 lora_strength,
                 ..Default::default()
