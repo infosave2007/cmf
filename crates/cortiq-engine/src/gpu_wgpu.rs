@@ -22482,8 +22482,9 @@ fn tp_matmat_impl(
     // an afternoon.
     let can_reduce_here =
         (c.act_amax_part.is_some() && c.act_amax_fold.is_some()) || c.act_absmax.is_some();
-    let host_scan =
-        std::env::var("CMF_FFN_HOST_SCAN").as_deref() == Ok("1") || !can_reduce_here;
+    let host_scan = std::env::var("CMF_FFN_HOST_SCAN").as_deref() == Ok("1")
+        || !can_reduce_here
+        || std::env::var("CMF_PROJ_DEV_SCAN").as_deref() != Ok("1");
     let ascale: f32 = if coop_arm && src.is_none() && host_scan {
         let mx = xs[..b * cols]
             .iter()
@@ -22546,15 +22547,22 @@ fn tp_matmat_impl(
     // it takes a one-element dummy here because this path computes the
     // scale on the host and passes it in `pad`.
     let f16_arm = dq_plane.is_some() && c.q4tp_mm_coop_f16.is_some();
-    // A host operand's scale is taken on the card too, not only a resident
-    // one: the scan is 13.2 M floats at DiT shapes and it runs on one core
+    // A host operand's scale could be taken on the card too, not only a
+    // resident one: the scan is 13.2 M floats at DiT shapes, on one core,
     // before anything is submitted. The same change in the packed FFN moved
     // its host time per call from 116.4 ms to 77.0 ms and a 768×448 denoise
-    // from 69.6 s to 62.4 s, byte-identical. `CMF_FFN_HOST_SCAN=1` keeps the
-    // host scan on both paths.
+    // from 69.6 s to 62.4 s with byte-identical output.
+    //
+    // Here it is OPT-IN (`CMF_PROJ_DEV_SCAN=1`) for one reason only: the
+    // machine it would have been measured on went away before a single frame
+    // came out of this path. Shipping it on by default would be shipping an
+    // untested render, and the FFN half of the same idea is what this release
+    // actually stands on.
     let dev_scale = f16_arm
         && (src.is_some()
-            || (can_dev_scale && !host_scan));
+            || (can_dev_scale
+                && !host_scan
+                && std::env::var("CMF_PROJ_DEV_SCAN").as_deref() == Ok("1")));
     if dev_scale {
         params[3] = 0xFFFF_FFFFu32;
     }
