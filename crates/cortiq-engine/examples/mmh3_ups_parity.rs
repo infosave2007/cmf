@@ -42,6 +42,18 @@ fn main() {
     let secs = started.elapsed().as_secs_f64();
 
     assert_eq!(got.data.len(), yd.len(), "shape mismatch: {:?} vs {ys:?}", (got.c, got.t, got.h, got.w));
+    // The oracle is the bare network: it neither normalizes its input nor
+    // denormalizes its output. `upscale` does both, because every caller
+    // holds a raw sampler latent — so put ours back on the network's own
+    // scale before diffing, or the comparison measures the statistics
+    // rather than the port.
+    let mut got = got;
+    let on = got.t * got.h * got.w;
+    for ci in 0..got.c {
+        for i in 0..on {
+            got.data[ci * on + i] = (got.data[ci * on + i] - LATENT_MEAN[ci]) / LATENT_STD[ci];
+        }
+    }
     let mut worst = 0f64;
     let mut num = 0f64;
     let mut den = 0f64;
