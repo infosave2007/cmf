@@ -624,12 +624,22 @@ axis, which is where an activation-outlier channel shows up from the weight
 side. As a codec it is strictly more faithful than the four-bit ladder.
 
 **The caveat, measured rather than guessed: it renders on the host.** The
-device paths in this engine are q4tp-shaped — the fused qkv/attention/output
-kernel and the packed FFN both read the four-bit tiled layout — and there is
-no `q8_2f` *matmat* on either backend yet, only a matvec. On an RTX 5090 the
-q8_2f build leaves the card idle and burns 16 cores instead. Until that kernel
-lands, take this file if you are comparing codecs or rendering overnight, and
-take the q4tp file if you want the card.
+engine says so itself at startup —
+
+```
+mmh3 GPU parity probe: no q4tp qkv tensor — host path
+```
+
+— because every device path here reads the four-bit tiled layout: the fused
+qkv/attention/output kernel, the packed FFN, all of it. `q8_2f` has a matvec
+on both backends and no *matmat*, which is what a video DiT needs. Measured on
+an RTX 5090, 512×288, 22 frames, four steps: **357.3 s** (denoise 198.8,
+video VAE 151.6) with the card idle and sixteen cores busy, against **60.2 s**
+for the q4tp file at 39 frames on the same class of card.
+
+Until that kernel lands: take this file to compare codecs or to render
+overnight on a big-memory machine, and take the q4tp file when you want the
+GPU.
 
 That is the honest state of it, and the missing piece is one kernel, not a
 redesign.
