@@ -22107,8 +22107,16 @@ fn plane_cached(
     if let Some((p, _)) = m.get(&key) {
         return Some((p.clone(), None));
     }
+    // Half the cap is reserved for small planes. The DiT runs before the 3D
+    // VAE and its weights are twice the size, so first-come-first-served gave
+    // the whole cache to the DiT and the VAE — where the same tensor is
+    // unpacked dozens of times per render rather than four — kept missing.
+    // Measured at 768x448: caching the DiT's alone took the denoise from
+    // 72.9 s to 60.6 s while the VAE's FFN phase stayed at 24 s.
+    const BIG: u64 = 96 * 1024 * 1024;
     let used: u64 = m.values().map(|(_, b)| *b).sum();
-    if used + bytes > cap {
+    let used_big: u64 = m.values().map(|(_, b)| *b).filter(|b| *b > BIG).sum();
+    if used + bytes > cap || (bytes > BIG && used_big + bytes > cap / 2) {
         return None;
     }
     let plane = c.device.create_buffer(&wgpu::BufferDescriptor {
@@ -24563,7 +24571,7 @@ pub fn q4tp_ffn_packed(
     // whose unpack is one multiply per weight. A DiT weight is far past the
     // cap and keeps the per-call scratch plane.
     let key1 = (model.uid() as usize, w1);
-    let dq1 = plane_cached(c, key1, &w1b, 2 * inter, hidden, 1024)
+    let dq1 = plane_cached(c, key1, &w1b, 2 * inter, hidden, 2048)
         .map(|(p, b)| (p, b))
         .or_else(|| dq_f16_plane(c, &mut sc, &w1b, 2 * inter, hidden).map(|(p, b)| (p, Some(b))));
     drop(sc);
