@@ -594,10 +594,23 @@ fn generate_inner(
             let vc = dit.latents_dim;
             let ac = dit.audio_dim;
             let vframe = lat_h * lat_w; // per channel, per latent frame
-            let chunks: Vec<std::ops::Range<usize>> = (0..latent_t)
+            let mut chunks: Vec<std::ops::Range<usize>> = (0..latent_t)
                 .step_by(p.stream_chunk)
                 .map(|s| s..(s + p.stream_chunk).min(latent_t))
                 .collect();
+            // A tail shorter than half a chunk joins the one before it. A
+            // two-frame chunk with four frames of context is the one shape
+            // that reliably wandered off — a different street in the last
+            // half second — and it is an artefact of the arithmetic, not
+            // something anyone asked for.
+            if chunks.len() > 1 {
+                let tail = chunks[chunks.len() - 1].clone();
+                if tail.len() < p.stream_chunk.div_ceil(2) {
+                    chunks.pop();
+                    let last = chunks.len() - 1;
+                    chunks[last].end = tail.end;
+                }
+            }
             // The audio grid runs at its own rate; split it in the same
             // proportion so a chunk's sound is the sound of its frames.
             let a_bound = |k: usize| (k * audio_t).div_ceil(latent_t.max(1));
