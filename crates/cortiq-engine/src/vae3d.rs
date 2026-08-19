@@ -735,7 +735,7 @@ impl VideoVae {
                 && n >= 256
             {
                 if let (Proj::Q(q), Proj::Q(o)) = (&blk.qkv, &blk.out) {
-                    if let (Some((m, i)), Some((_, oi))) = (q.mapped_q4tp(), o.mapped_q4tp()) {
+                    if let (Some((m, i)), Some((_, oi))) = (q.mapped_device_gemm(), o.mapped_device_gemm()) {
                         fused = crate::gpu::vae_qkv_attn_out(
                             m,
                             i,
@@ -815,7 +815,7 @@ impl VideoVae {
                 && n >= 64
             {
                 if let (Proj::Q(q1), Proj::Q(q2)) = (&blk.w1, &blk.w2) {
-                    if let (Some((m, i1)), Some((_, i2))) = (q1.mapped_q4tp(), q2.mapped_q4tp()) {
+                    if let (Some((m, i1)), Some((_, i2))) = (q1.mapped_device_gemm(), q2.mapped_device_gemm()) {
                         let mut fout = vec![0f32; n * dim];
                         if crate::gpu::q4tp_ffn_packed(
                             m,
