@@ -21695,6 +21695,10 @@ fn dispatch_matmat_keep(
         (c.act_amax_part.is_some() && c.act_amax_fold.is_some()) || c.act_absmax.is_some();
     let coop = if src.is_some() && !can_dev_scale { None } else { coop };
     if let (Some((plane, bind_dq)), Some(mm_pipe)) = (&coop, c.q4tp_mm_coop_f16.as_ref()) {
+        if std::env::var("CMF_GPU_DEBUG").is_ok() {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| eprintln!("int8 GEMM: matrix units (plane {rows}x{cols})"));
+        }
         let dev_scale = src.is_some();
         let ascale: f32 = if dev_scale {
             0.0
