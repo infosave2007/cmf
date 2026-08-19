@@ -24370,6 +24370,32 @@ pub fn ffn_packed(
     out: &mut [f32],
 ) -> bool {
     use cortiq_core::TensorDtype as D;
+    // The [gate|up] panel is b·2·inter floats and a storage binding stops at
+    // 2 GiB. A 321-frame clip rendered bidirectionally asks for exactly that
+    // and the render died at a validation error rather than at anything
+    // physical, so the rows are split into passes that fit. The FFN is
+    // row-wise; splitting it changes nothing but the buffer sizes.
+    let per = (MAX_BINDING_BYTES / (2 * inter * 4)).max(1);
+    if b > per {
+        for r0 in (0..b).step_by(per) {
+            let r1 = (r0 + per).min(b);
+            let ok = ffn_packed(
+                model,
+                w1,
+                w2,
+                &xs[r0 * hidden..r1 * hidden],
+                r1 - r0,
+                hidden,
+                inter,
+                bias,
+                &mut out[r0 * hidden..r1 * hidden],
+            );
+            if !ok {
+                return false;
+            }
+        }
+        return true;
+    }
     match model.tensors.get(w1).map(|e| e.dtype) {
         Some(D::Q4TiledP) => q4tp_ffn_packed(model, w1, w2, xs, b, hidden, inter, bias, out),
         Some(D::Q8Row | D::Q8_2f) if fused_any() => {
@@ -24378,6 +24404,10 @@ pub fn ffn_packed(
         _ => false,
     }
 }
+
+/// What a single storage binding may cover. wgpu reports 2 GiB minus four
+/// bytes on this class of card; the panels are sized to stay under it.
+const MAX_BINDING_BYTES: usize = 2 * 1024 * 1024 * 1024 - 4;
 
 /// `CMF_FUSED_ANY=0` puts a non-four-bit container back on the per-op path —
 /// the A/B switch for what the codec-agnostic fusion is worth.
