@@ -748,6 +748,23 @@ removes that, and it is an optimization of this path rather than a
 prerequisite for it: not packing the rows a chunk may not see produces the
 same attention pattern the reference gets from its cache.
 
+**Where streaming stops being a trade and starts being the only way.** Longer
+clips, same card and settings:
+
+| clip | bidirectional | streaming, chunk 13 |
+|---|---|---|
+| 41 frames | 53 s | 63 s |
+| 161 frames | 148 s (97.8 s denoise) | 190 s (142.8 s denoise) |
+| 321 frames | **does not render** | 354 s (258.8 s denoise) |
+
+The 321-frame bidirectional render does not fail for want of memory — it asks
+for a `[gate|up]` FFN panel of exactly 2 GiB and hits the storage-binding
+limit (`2147483648 exceeds 2147483644`). 0.5.95 splits that panel into passes
+that fit, so it renders; but the chunked path never builds a panel that size
+in the first place, and its cost grows with the clip instead of with the
+square of it. Identity holds across the chunks: the same woman in the same
+red raincoat at frame 4 and at frame 150.
+
 A chunk that would leave a tail shorter than half a chunk swallows it — two
 latent frames with four frames of context was the one shape that reliably
 wandered into a different street half a second before the clip ended.
