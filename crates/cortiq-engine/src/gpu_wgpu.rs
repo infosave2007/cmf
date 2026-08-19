@@ -24601,6 +24601,15 @@ pub fn q4tp_ffn_packed(
     let dq1 = plane_cached(c, key1, &w1b, 2 * inter, hidden, 0)
         .map(|(p, b)| (p, b))
         .or_else(|| dq_f16_plane(c, &mut sc, &w1b, 2 * inter, hidden).map(|(p, b)| (p, Some(b))));
+    // Taken under the guard this function still holds, for the device-side
+    // max|x| below — `encode_act_absmax` would take the same lock again.
+    let amax_parts = Scratch::ensure(
+        &c.device,
+        &mut sc.amaxp,
+        512 * 4,
+        wgpu::BufferUsages::STORAGE,
+        "pffn-amax-parts",
+    );
     drop(sc);
     c.queue
         .write_buffer(&xs_buf, 0, bytemuck::cast_slice(&xs[..b * hidden]));
@@ -24656,13 +24665,30 @@ pub fn q4tp_ffn_packed(
     // f16 operands cap at 65504 and a DiT's modulated activations pass
     // it. The scale is computed from the input we just uploaded; the
     // kernel divides it back out at the store.
-    let ascale = {
+    let f16_arm = dq1.is_some() && c.q4tp_mm_coop_f16.is_some();
+    // The activation scale can be taken on the card, where the resident-operand
+    // path already computes it, instead of scanning the panel on the host —
+    // 13.2 M floats per call at DiT shapes. Three quarters of a four-bit FFN
+    // call is host time (126.2 ms against 41.4 ms of card at 768×448), and
+    // this scan is the biggest single piece of it that the GPU can take back.
+    // `CMF_FFN_HOST_SCAN=1` keeps the host scan for the A/B.
+    let dev_scan = f16_arm
+        && std::env::var("CMF_FFN_HOST_SCAN").as_deref() != Ok("1")
+        && (c.act_absmax.is_some() || (c.act_amax_part.is_some() && c.act_amax_fold.is_some()));
+    let ascale = if dev_scan {
+        0.0
+    } else {
         let mx = xs[..b * hidden]
             .iter()
             .fold(0f32, |m, v| if v.is_finite() { m.max(v.abs()) } else { m });
         if mx > 1000.0 { 1000.0 / mx } else { 1.0 }
     };
-    let f16_arm = dq1.is_some() && c.q4tp_mm_coop_f16.is_some();
+    let asc_dev = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("pffn-ascale-1"),
+        size: 4,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
     let host_scale = c
         .device
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -24670,6 +24696,9 @@ pub fn q4tp_ffn_packed(
             contents: bytemuck::cast_slice(&[ascale]),
             usage: wgpu::BufferUsages::STORAGE,
         });
+    if dev_scan {
+        encode_act_absmax_with(c, &mut enc, &xs_buf, b * hidden, &asc_dev, Some(&amax_parts));
+    }
     encode_q4_tile_mm_full(
         c,
         &mut enc,
@@ -24681,7 +24710,11 @@ pub fn q4tp_ffn_packed(
         hidden,
         b,
         ascale,
-        f16_arm.then_some(&host_scale),
+        if dev_scan {
+            Some(&asc_dev)
+        } else {
+            f16_arm.then_some(&host_scale)
+        },
     );
     {
         let mut pass = begin_pass(&mut enc);
