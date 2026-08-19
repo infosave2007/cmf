@@ -1373,6 +1373,17 @@ enum Commands {
         /// the first one is stretched, as the reference does
         #[arg(long)]
         last_frame: Option<String>,
+        /// A directory of reference frames (`frame_0000.ppm` …): every
+        /// `--video-stride`-th one becomes a condition pinned to its own
+        /// moment in the clip. This is the release's `v2v` as this
+        /// container can do it — the `fl2va` keyframe path with more than
+        /// two frames, not a port of the reference's video node
+        #[arg(long)]
+        video: Option<String>,
+        /// Take every n-th frame of `--video` (default 8: at 24 fps that
+        /// is one reference every third of a second)
+        #[arg(long, default_value_t = 8)]
+        video_stride: usize,
         /// A LoRA adapter (.safetensors) applied at runtime — the
         /// community adapters for MiniMax-H3 as they ship
         #[arg(long)]
@@ -1384,6 +1395,41 @@ enum Commands {
         #[arg(long, default_value = "out.avi")]
         out: String,
     },
+}
+
+/// Every `stride`-th `*.ppm` of a directory, each with the pixel index it
+/// stands for in a render of `frames` frames. The source clip is mapped onto
+/// the render's length by position, so a 100-frame reference conditions a
+/// 39-frame render at the same *moments*, not the same indices.
+fn read_frame_dir(
+    dir: &str,
+    stride: usize,
+    frames: usize,
+) -> anyhow::Result<Vec<((Vec<f32>, usize, usize), usize)>> {
+    let mut names: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .map_err(|e| anyhow::anyhow!("{dir}: {e}"))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("ppm")))
+        .collect();
+    names.sort();
+    if names.is_empty() {
+        return Err(anyhow::anyhow!("{dir}: no .ppm frames"));
+    }
+    let n = names.len();
+    let mut out = Vec::new();
+    for (i, path) in names.iter().enumerate().step_by(stride) {
+        let idx = if n == 1 {
+            0
+        } else {
+            i * (frames.saturating_sub(1)) / (n - 1)
+        };
+        out.push((read_ppm(&path.to_string_lossy())?, idx));
+    }
+    println!(
+        "reference clip: {} of {n} frames, every {stride}th, mapped onto {frames}",
+        out.len()
+    );
+    Ok(out)
 }
 
 /// A binary P6 PPM → RGB in [0, 1] as `[3, h, w]`.
@@ -2235,6 +2281,8 @@ async fn main() -> anyhow::Result<()> {
             quality,
             first_frame,
             last_frame,
+            video,
+            video_stride,
             lora,
             lora_strength,
             out,
@@ -2250,6 +2298,10 @@ async fn main() -> anyhow::Result<()> {
                 stock_sampler,
                 first_frame: first_frame.as_deref().map(read_ppm).transpose()?,
                 last_frame: last_frame.as_deref().map(read_ppm).transpose()?,
+                mid_frames: match video.as_deref() {
+                    None => Vec::new(),
+                    Some(dir) => read_frame_dir(dir, video_stride.max(1), frames)?,
+                },
                 lora,
                 lora_strength,
                 ..Default::default()

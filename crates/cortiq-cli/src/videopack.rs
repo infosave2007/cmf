@@ -42,7 +42,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::convert::{encode_f16, encode_q2tp, encode_q4tp, encode_q8_row};
+use crate::convert::{encode_f16, encode_q2tp, encode_q4tp, encode_q8_2f, encode_q8_row};
 use cortiq_engine::pool::Pool;
 
 /// Timestep-embedding grid of the pruned checkpoints. The runtime reads
@@ -167,6 +167,12 @@ enum Level {
     /// attention are where that trade stops paying.
     Q2tp,
     Q8,
+    /// The two-field q8: `w = q·row[o]·col[i]`, eight bits with a second
+    /// field along the INPUT axis. Same size as `q8_row` and strictly
+    /// better on weights whose columns differ in scale — which is what an
+    /// activation-outlier channel looks like from the weight side. The
+    /// step up from `q4tp` for a machine with the memory to hold it.
+    Q82f,
     F16,
     F32,
 }
@@ -204,7 +210,12 @@ fn spec(name: String, vals: &[f32], shape: Vec<usize>, level: Level) -> TensorSp
         Level::Q4tp if two_d && shape[1] % 32 == 0 => {
             (TensorDtype::Q4TiledP, encode_q4tp(vals, shape[0], shape[1]))
         }
-        Level::Q4tp | Level::Q8 if two_d => {
+        // Two fields need both axes, and the column field is only
+        // meaningful when there is more than one row to share it.
+        Level::Q82f if two_d && shape[0] > 1 => {
+            (TensorDtype::Q8_2f, encode_q8_2f(vals, shape[0], shape[1]))
+        }
+        Level::Q4tp | Level::Q8 | Level::Q82f if two_d => {
             (TensorDtype::Q8Row, encode_q8_row(vals, shape[0], shape[1]))
         }
         Level::F32 => (TensorDtype::F32, f32_bytes(vals)),
@@ -1715,13 +1726,14 @@ pub fn cmd_animate_pack(args: PackArgs<'_>) -> anyhow::Result<()> {
         "q4tp" | "q4" => Level::Q4tp,
         "q2tp" | "q2" => Level::Q2tp,
         "q8" => Level::Q8,
+        "q8_2f" | "q82f" => Level::Q82f,
         "f16" => Level::F16,
         // Exact, for the parity gate: any quantization noise floor sits
         // above the arithmetic difference the gate is looking for.
         "f32" => Level::F32,
         other => {
             return Err(anyhow!(
-                "--quant {other}: expected q4tp, q2tp, q8, f16 or f32"
+                "--quant {other}: expected q4tp, q2tp, q8_2f, q8, f16 or f32"
             ));
         }
     };
@@ -1948,7 +1960,7 @@ pub fn cmd_animate_pack(args: PackArgs<'_>) -> anyhow::Result<()> {
         version: cortiq_core::CMF_VERSION,
         arch,
         quant_type: match level {
-            Level::Q8 => QuantType::Q8Row,
+            Level::Q8 | Level::Q82f => QuantType::Q8Row,
             Level::Q2tp => QuantType::Q4Block,
             _ => QuantType::Q4Block,
         },

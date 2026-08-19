@@ -1164,7 +1164,7 @@ fn encode_q1s(vals: &[f32], out_dim: usize, in_dim: usize, keep_frac: f32) -> Ve
     out
 }
 
-fn encode_q8_2f(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8> {
+pub(crate) fn encode_q8_2f(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8> {
     // Column field: RMS over rows, f16-rounded (the decoder multiplies by these).
     let mut col = vec![0f32; in_dim];
     for (i, c) in col.iter_mut().enumerate() {
