@@ -24841,11 +24841,19 @@ pub fn q4tp_ffn_packed(
             c, &mut enc, &c.q4tp_mm, &w2b, &act_buf, &y_buf, hidden, inter, b,
         ),
     }
-    // Where one call spends itself, under CMF_FFN_COUNT: everything before
-    // the readback is host work — buffer creation, bind groups, the host scan
-    // for max|x| — and the readback is the wait for the card. A four-bit VAE
-    // call costs 116 ms against an eight-bit one's 14 ms at the same shape,
-    // and this split says which half to go after.
+    // Where one call spends itself, under CMF_FFN_COUNT: everything before the
+    // readback is host work — buffer creation, bind groups, the host scan for
+    // max|x| — and the readback is the wait for the card.
+    //
+    // MEASURED, RTX 5090, 768×448: the DiT shape (5376×14336, b=2447) costs
+    // 126.2 ms of host against 41.4 ms of card, and the 3D VAE's
+    // (2048×8192, b=1797) 100.2 ms of host against 12.6 ms of card. The
+    // eight-bit container's whole call at that same VAE shape is 14 ms — so
+    // the four-bit GPU half is already as fast as the int8 path, and the gap
+    // everyone has been chasing is host-side preparation, three quarters of
+    // it. That is the thread to pull: fewer buffers and bind groups per call,
+    // and the max|x| scan moved to the card where the resident-operand path
+    // already computes it.
     let t_host = t_stage.elapsed();
     let ok = readback(c, enc, &y_buf, &stage_buf, y_size, &mut out[..b * hidden]);
     if std::env::var("CMF_FFN_COUNT").is_ok() {
