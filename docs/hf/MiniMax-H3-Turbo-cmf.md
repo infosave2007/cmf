@@ -700,6 +700,48 @@ conditions differently; what it gives you is composition and motion carried
 across a chain of shots, which is what the keyframe hack in discussion #6 was
 reaching for.
 
+## Streaming: a clip rendered in chunks
+
+`mmh3-raven-streaming-q4tp.cmf` — **14.88 GB**, 2698 tensors, the
+[RAVEN streaming adapter](https://huggingface.co/mvp-lab/MiniMax-H3-RAVEN-Streaming-LoRA)
+folded into the weights at pack time. It renders a clip the way that adapter
+was trained: chunk by chunk, each one extrapolated from the frames already
+finished, instead of denoising the whole sequence at once.
+
+```bash
+cortiq animate mmh3-raven-streaming-q4tp.cmf \
+  --prompt "a woman in a red raincoat walks down a neon-lit street at night" \
+  --width 384 --height 256 --frames 161 --steps 4 \
+  --stream-chunk 13 --stream-sink 2 --stream-window 2 --out take.avi
+```
+
+`--stream-chunk` is the chunk length in *latent* frames (one latent frame is
+four video frames). Each chunk attends to a sink of the first `--stream-sink`
+chunks and a sliding window of the last `--stream-window` — the pattern the
+adapter trains — and the already-finished frames enter the sequence at
+timestep 0, as clean context rather than as noise being removed.
+
+**The chunk length is the knob that matters.** RTX 5090, 384×256, 41 frames
+in (56 out), four steps:
+
+| | wall | denoise | picture |
+|---|---|---|---|
+| no streaming | 53 s | 36.8 s | coherent |
+| `--stream-chunk 13` | 73 s | — | coherent, motion holds |
+| `--stream-chunk 9` | 69 s | 62.9 s | coherent |
+| `--stream-chunk 5` | 119 s | — | **drifts**: the scene changes at chunk boundaries |
+
+At five latent frames the context is not the problem — with three chunks and
+`sink 2 / window 2` every earlier chunk is visible — the chunk itself is too
+short for what the adapter learned. Nine to thirteen is the range that holds.
+
+Streaming costs about **1.7× the denoise** of the ordinary path at this clip
+length, because a chunk's context rows are recomputed at every one of its
+steps. A KV cache over those rows is what removes that, and it is an
+optimization of this path rather than a prerequisite for it: not packing the
+rows a chunk may not see produces the same attention pattern the reference
+gets from its cache.
+
 ## Adapters at runtime
 
 Community LoRAs for H3 run against this container as they ship:

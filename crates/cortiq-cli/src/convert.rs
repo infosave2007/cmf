@@ -1166,30 +1166,67 @@ fn encode_q1s(vals: &[f32], out_dim: usize, in_dim: usize, keep_frac: f32) -> Ve
 
 pub(crate) fn encode_q8_2f(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8> {
     // Column field: RMS over rows, f16-rounded (the decoder multiplies by these).
+    // Both halves run across the encode threads: this is the codec a 20 B DiT
+    // gets packed in, and serially it was the slowest encoder in the crate by
+    // an order of magnitude while q4tp next to it used the whole machine.
+    // The column reduction is blocked at a FIXED width, not at one block per
+    // thread: f64 addition does not associate, so a thread-shaped grouping
+    // would make the bytes depend on the core count. Blocks are summed in
+    // index order, which is the same arithmetic on one thread and on thirty.
+    const CBLK: usize = 256;
+    let nblk = out_dim.div_ceil(CBLK);
+    let threads = encode_threads().min(nblk.max(1)).max(1);
     let mut col = vec![0f32; in_dim];
-    for (i, c) in col.iter_mut().enumerate() {
-        let mut acc = 0f64;
-        for o in 0..out_dim {
-            let v = vals[o * in_dim + i] as f64;
-            acc += v * v;
+    {
+        let mut blocks: Vec<Vec<f64>> = vec![Vec::new(); nblk];
+        let per = nblk.div_ceil(threads);
+        std::thread::scope(|sc| {
+            for (ti, chunk) in blocks.chunks_mut(per).enumerate() {
+                sc.spawn(move || {
+                    for (bi, slot) in chunk.iter_mut().enumerate() {
+                        let b = ti * per + bi;
+                        let (r0, r1) = (b * CBLK, ((b + 1) * CBLK).min(out_dim));
+                        let mut acc = vec![0f64; in_dim];
+                        for o in r0..r1 {
+                            for (i, a) in acc.iter_mut().enumerate() {
+                                let v = vals[o * in_dim + i] as f64;
+                                *a += v * v;
+                            }
+                        }
+                        *slot = acc;
+                    }
+                });
+            }
+        });
+        for (i, c) in col.iter_mut().enumerate() {
+            let mut acc = 0f64;
+            for b in &blocks {
+                acc += b[i];
+            }
+            let rms = (acc / out_dim as f64).sqrt().max(1e-12) as f32;
+            *c = f16_to_f32(f32_to_f16(rms)).max(F16_TINY);
         }
-        let rms = (acc / out_dim as f64).sqrt().max(1e-12) as f32;
-        *c = f16_to_f32(f32_to_f16(rms)).max(F16_TINY);
     }
-    let mut q = Vec::with_capacity(out_dim * in_dim);
-    let mut scales = Vec::with_capacity(out_dim * 2);
-    for o in 0..out_dim {
-        let mut absmax = 0f32;
-        for i in 0..in_dim {
-            absmax = absmax.max((vals[o * in_dim + i] / col[i]).abs());
-        }
-        let scale = f16_scale(absmax.max(1e-12) / 127.0);
-        for i in 0..in_dim {
-            let wn = vals[o * in_dim + i] / col[i];
-            q.push((wn / scale).round_ties_even().clamp(-127.0, 127.0) as i8 as u8);
-        }
-        scales.extend_from_slice(&f32_to_f16(scale).to_le_bytes());
-    }
+    let mut q = vec![0u8; out_dim * in_dim];
+    let mut scales = vec![0u8; out_dim * 2];
+    let mut unused = vec![0u8; out_dim];
+    encode_rows_parallel(
+        out_dim,
+        [in_dim, 2, 1],
+        [&mut q, &mut scales, &mut unused],
+        &|o: usize, qrow: &mut [u8], srow: &mut [u8], _: &mut [u8]| {
+            let src = &vals[o * in_dim..(o + 1) * in_dim];
+            let mut absmax = 0f32;
+            for (v, c) in src.iter().zip(&col) {
+                absmax = absmax.max((v / c).abs());
+            }
+            let scale = f16_scale(absmax.max(1e-12) / 127.0);
+            for ((d, v), c) in qrow.iter_mut().zip(src).zip(&col) {
+                *d = ((v / c) / scale).round_ties_even().clamp(-127.0, 127.0) as i8 as u8;
+            }
+            srow.copy_from_slice(&f32_to_f16(scale).to_le_bytes());
+        },
+    );
     let mut out = q;
     out.extend_from_slice(&scales);
     for &c in &col {
@@ -4192,6 +4229,7 @@ pub(crate) mod tests {
         for (name, enc) in [
             ("q2tp", encode_q2tp as fn(&[f32], usize, usize) -> Vec<u8>),
             ("q4tp", encode_q4tp as fn(&[f32], usize, usize) -> Vec<u8>),
+            ("q8_2f", encode_q8_2f as fn(&[f32], usize, usize) -> Vec<u8>),
         ] {
             let serial = enc(&vals, rows, cols);
             unsafe { std::env::set_var("CMF_ENCODE_THREADS", "8") };
