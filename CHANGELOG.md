@@ -64,6 +64,12 @@ Both arms of every switch below render the same picture.
   covers this codec too.
 
 ### Fixed
+- **The FFN splits its rows to fit a storage binding.** A 321-frame clip
+  rendered bidirectionally asks for a `[gate|up]` panel of exactly 2 GiB and
+  died at a validation error; it renders in 404 s now. The passes are sized
+  against the scratch allocator, which rounds capacity to the next power of
+  two — so a panel of 2 GiB minus a row still got a 2 GiB buffer, and the
+  first split did not help at all.
 - **The 3D VAE's fused attention read whichever codec it was handed.** Widening
   the gate in front of it left it calling the four-bit entry points by name, so
   an eight-bit VAE read int8 as four-bit tiles: a decode that ran three times
