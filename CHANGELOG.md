@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.5.95] - 2026-08-19
 
-The eight-bit build becomes the fastest file in the repository, and the DiT
+The eight-bit build stops costing four times what it should, and the DiT
 learns to render a clip in chunks.
 
 Measured on an RTX 5090, MiniMax-H3 at 512×288, 22 frames, four steps, one
