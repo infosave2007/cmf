@@ -13286,7 +13286,19 @@ fn init(dev: usize) -> Result<Ctx, String> {
             match vulkan_vram_total(&adapter) {
                 Some(total) => {
                     let gib = 1024 * 1024 * 1024u64;
-                    total - (total / 72).clamp(gib, 2 * gib).min(total / 2)
+                    // Weights are not the only thing on the card. The pooled
+                    // scratch, the activation panels, the readback staging and
+                    // the VAE's own buffers all live beside them, and a video
+                    // render's working set is gigabytes — so the budget cannot
+                    // be "the heap minus the driver's bookkeeping".
+                    //
+                    // It used to be exactly that, and it survived only because
+                    // every published container's weights were far under it.
+                    // A 26 GB q8_2f build on a 32 GB card took the whole heap
+                    // and then died in the first scratch allocation with
+                    // `wgpu error: Out of Memory` — the residency cache does
+                    // its own eviction, but nothing was left for the caller.
+                    total - (total / 4).clamp(gib, 8 * gib).min(total / 2)
                 }
                 None => 8 * 1024 * 1024 * 1024,
             }
