@@ -24420,7 +24420,12 @@ pub fn ffn_packed(
     // and the render died at a validation error rather than at anything
     // physical, so the rows are split into passes that fit. The FFN is
     // row-wise; splitting it changes nothing but the buffer sizes.
-    let per = (MAX_BINDING_BYTES / (2 * inter * 4)).max(1);
+    //
+    // The budget is a gigabyte, not the limit itself: the scratch allocator
+    // rounds capacity up to the next power of two, so a panel of 2 GiB minus
+    // a row still gets a 2 GiB buffer — and the bind group binds the whole
+    // buffer. Anything above 2^30 rounds into the wall.
+    let per = (PANEL_BUDGET_BYTES / (2 * inter * 4)).max(1);
     if b > per {
         for r0 in (0..b).step_by(per) {
             let r1 = (r0 + per).min(b);
@@ -24450,9 +24455,11 @@ pub fn ffn_packed(
     }
 }
 
-/// What a single storage binding may cover. wgpu reports 2 GiB minus four
-/// bytes on this class of card; the panels are sized to stay under it.
-const MAX_BINDING_BYTES: usize = 2 * 1024 * 1024 * 1024 - 4;
+/// What one FFN pass may allocate. A storage binding stops at 2 GiB minus four
+/// bytes on this class of card, and the scratch allocator rounds capacity up
+/// to the next power of two — so the largest panel that does not round into
+/// that wall is a gigabyte.
+const PANEL_BUDGET_BYTES: usize = 1024 * 1024 * 1024;
 
 /// `CMF_FUSED_ANY=0` puts a non-four-bit container back on the per-op path —
 /// the A/B switch for what the codec-agnostic fusion is worth.
