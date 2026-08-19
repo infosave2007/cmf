@@ -29,6 +29,7 @@ pub mod ltxups;
 pub mod ltxvae;
 pub mod mm_ab;
 pub mod mmh3;
+pub mod mmh3ups;
 pub mod music3;
 pub mod nystrom;
 pub mod pin;
