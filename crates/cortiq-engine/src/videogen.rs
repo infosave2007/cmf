@@ -59,6 +59,15 @@ pub struct AnimParams {
     /// pixel resize → encode round trip never happens.
     pub upscale: Option<String>,
     pub upscale_by: f32,
+    /// Chunk-causal (streaming) generation: latent frames per chunk, and
+    /// how many chunks a chunk may see — `sink` from the start of the
+    /// clip and a sliding `window` of recent ones. 0 chunks = the
+    /// bidirectional path. This is what a streaming adapter is trained
+    /// for, and it is what stops the activation cache growing with the
+    /// clip's length.
+    pub stream_chunk: usize,
+    pub stream_sink: usize,
+    pub stream_window: usize,
 }
 
 /// The vision-block token ids the H3 presentation flanks a picture with.
@@ -125,6 +134,9 @@ impl Default for AnimParams {
             lora_strength: 1.0,
             upscale: None,
             upscale_by: 2.0,
+            stream_chunk: 0,
+            stream_sink: 2,
+            stream_window: 2,
         }
     }
 }
@@ -549,6 +561,7 @@ fn generate_inner(
         let mut v = gauss(dit.latents_dim * latent_t * lat_h * lat_w, p.seed);
         let mut a = gauss(dit.audio_dim * 2 * audio_t, p.seed ^ 0x9E37_79B9_7F4A_7C15);
         let sg = sigmas(p.steps, dit.shift_video);
+        let mut return_streaming: Option<(Vec<f32>, Vec<f32>)> = None;
         // `CMF_ANIM_PROF=1`: the per-step rms of both streams and of
         // their velocities. A run that is not denoising shows it here
         // long before anything is written out.
@@ -566,7 +579,148 @@ fn generate_inner(
                     .collect::<Vec<_>>()
             );
         }
+        // ── chunk-causal rollout ──
+        //
+        // Each chunk is denoised while seeing only the text, `sink` chunks
+        // from the start and a sliding `window` of recent ones, and it is
+        // conditioned on their finished frames at timestep 0 — the
+        // protocol a streaming adapter is trained for. The reference keeps
+        // that context in a KV cache; not packing the rows a chunk may not
+        // see produces the same attention pattern, and the cache is then
+        // an optimization of this rather than a prerequisite.
+        if p.stream_chunk > 0 && cond.is_empty() {
+            let hw = lat_h * lat_w / 4 * 4; // frame element count is c·h·w below
+            let _ = hw;
+            let vc = dit.latents_dim;
+            let ac = dit.audio_dim;
+            let vframe = lat_h * lat_w; // per channel, per latent frame
+            let chunks: Vec<std::ops::Range<usize>> = (0..latent_t)
+                .step_by(p.stream_chunk)
+                .map(|s| s..(s + p.stream_chunk).min(latent_t))
+                .collect();
+            // The audio grid runs at its own rate; split it in the same
+            // proportion so a chunk's sound is the sound of its frames.
+            let a_bound = |k: usize| (k * audio_t).div_ceil(latent_t.max(1));
+            let mut v_out = vec![0f32; v.len()];
+            let mut a_out = vec![0f32; a.len()];
+            let gather_v = |src: &[f32], idx: &[usize]| -> Vec<f32> {
+                let mut out = vec![0f32; vc * idx.len() * vframe];
+                for ci in 0..vc {
+                    for (n, &k) in idx.iter().enumerate() {
+                        let s = (ci * latent_t + k) * vframe;
+                        let d = (ci * idx.len() + n) * vframe;
+                        out[d..d + vframe].copy_from_slice(&src[s..s + vframe]);
+                    }
+                }
+                out
+            };
+            let gather_a = |src: &[f32], idx: &[usize]| -> Vec<f32> {
+                let mut out = vec![0f32; ac * 2 * idx.len()];
+                for ci in 0..ac {
+                    for ch in 0..2 {
+                        for (n, &i) in idx.iter().enumerate() {
+                            out[(ci * 2 + ch) * idx.len() + n] = src[(ci * 2 + ch) * audio_t + i];
+                        }
+                    }
+                }
+                out
+            };
+            for (ci_, cur) in chunks.iter().enumerate() {
+                let mut vis: Vec<usize> = (0..p.stream_sink.min(ci_)).collect();
+                for j in ci_.saturating_sub(p.stream_window)..ci_ {
+                    if !vis.contains(&j) {
+                        vis.push(j);
+                    }
+                }
+                vis.sort_unstable();
+                let ctx_v: Vec<usize> = vis.iter().flat_map(|&j| chunks[j].clone()).collect();
+                let cur_v: Vec<usize> = cur.clone().collect();
+                let ctx_a: Vec<usize> = vis
+                    .iter()
+                    .flat_map(|&j| a_bound(chunks[j].start)..a_bound(chunks[j].end))
+                    .collect();
+                let cur_a: Vec<usize> = (a_bound(cur.start)..a_bound(cur.end)).collect();
+                let clay = Layout::streaming(
+                    ids.len(),
+                    &tags,
+                    lat_h,
+                    lat_w,
+                    &ctx_v,
+                    &cur_v,
+                    &ctx_a,
+                    &cur_a,
+                );
+                let ctx_vx = gather_v(&v_out, &ctx_v);
+                let ctx_ax = gather_a(&a_out, &ctx_a);
+                let mut xv = gather_v(&v, &cur_v);
+                let mut xa = gather_a(&a, &cur_a);
+                for i in 0..p.steps {
+                    let (sv, sv_n) = (sg[i], sg[i + 1]);
+                    // [context frames | current frames], the order the
+                    // layout lays its rows out in.
+                    let mut vin = vec![0f32; vc * (ctx_v.len() + cur_v.len()) * vframe];
+                    let mut ain = vec![0f32; ac * 2 * (ctx_a.len() + cur_a.len())];
+                    let (nc, nk) = (ctx_v.len(), cur_v.len());
+                    for c in 0..vc {
+                        let d = c * (nc + nk) * vframe;
+                        vin[d..d + nc * vframe]
+                            .copy_from_slice(&ctx_vx[c * nc * vframe..(c + 1) * nc * vframe]);
+                        vin[d + nc * vframe..d + (nc + nk) * vframe]
+                            .copy_from_slice(&xv[c * nk * vframe..(c + 1) * nk * vframe]);
+                    }
+                    let (mc, mk) = (ctx_a.len(), cur_a.len());
+                    for c in 0..ac {
+                        for ch in 0..2 {
+                            let d = (c * 2 + ch) * (mc + mk);
+                            ain[d..d + mc]
+                                .copy_from_slice(&ctx_ax[(c * 2 + ch) * mc..(c * 2 + ch + 1) * mc]);
+                            ain[d + mc..d + mc + mk]
+                                .copy_from_slice(&xa[(c * 2 + ch) * mk..(c * 2 + ch + 1) * mk]);
+                        }
+                    }
+                    let (dv, da) = dit.forward(&clay, &text, &vin, &ain, sv, &[]);
+                    let step_v = (sv_n - sv) as f32;
+                    for (x, &d) in xv.iter_mut().zip(&dv) {
+                        *x += step_v * d;
+                    }
+                    let step_a = if p.stock_sampler {
+                        step_v
+                    } else {
+                        (time_shift_sigma(sv_n, dit.shift_video, dit.shift_audio)
+                            - time_shift_sigma(sv.max(1e-6), dit.shift_video, dit.shift_audio))
+                            as f32
+                    };
+                    for (x, &d) in xa.iter_mut().zip(&da) {
+                        *x += step_a * d;
+                    }
+                }
+                for c in 0..vc {
+                    for (n, &k) in cur_v.iter().enumerate() {
+                        let d = (c * latent_t + k) * vframe;
+                        let s = (c * cur_v.len() + n) * vframe;
+                        v_out[d..d + vframe].copy_from_slice(&xv[s..s + vframe]);
+                    }
+                }
+                for c in 0..ac {
+                    for ch in 0..2 {
+                        for (n, &i) in cur_a.iter().enumerate() {
+                            a_out[(c * 2 + ch) * audio_t + i] =
+                                xa[(c * 2 + ch) * cur_a.len() + n];
+                        }
+                    }
+                }
+                progress("stream", ci_ + 1, chunks.len());
+            }
+            if let Some(rep) = dit.lora_report() {
+                eprint!("{rep}");
+            }
+            return_streaming = Some((v_out, a_out));
+        }
+
         for i in 0..p.steps {
+            if return_streaming.is_some() {
+                break;
+            }
             let (sv, sv_n) = (sg[i], sg[i + 1]);
             let (dv, da) = dit.forward(&layout, &text, &v, &a, sv, &cond);
             let step_v = (sv_n - sv) as f32;
@@ -597,7 +751,10 @@ fn generate_inner(
         if let Some(rep) = dit.lora_report() {
             eprint!("{rep}");
         }
-        (v, a)
+        match return_streaming {
+            Some(pair) => pair,
+            None => (v, a),
+        }
     };
 
     lap(&mut marks, "denoise");
