@@ -35,6 +35,7 @@
 //! module; `tools/mmh3_toy_gate.sh` diffs this port against it.
 
 use crate::dit::Proj;
+use crate::ltxlora::{LoraBank, LoraBranch};
 
 /// Per-phase microseconds of the DiT block, under `CMF_MMH3_PROF=1`:
 /// 0 norm+modulate · 1 qkv GEMM · 2 qk-norm+RoPE · 3 attention ·
@@ -559,6 +560,75 @@ struct Block {
     fc1: Proj, // [2·ffn, hidden]
     fc2: Proj, // [hidden, ffn]
     adaln: Option<Adaln>,
+    /// Runtime low-rank branches, one per projection an adapter names.
+    /// A branch is why the fused device paths below stand down: they
+    /// keep qkv, the attention output and the FFN's middle on the card,
+    /// and the branch has to read exactly those.
+    lora: BlockLora,
+}
+
+/// The four projections an adapter can reach in a packed block. `adaln`
+/// is deliberately absent: this container carries the modulation as a
+/// rank-24 curve, and folding an adaLN update into it needs the time
+/// embedding the packer had (`animate-pack --lora --time-embedder`).
+#[derive(Default)]
+struct BlockLora {
+    qkv: Option<LoraBranch>,
+    out: Option<LoraBranch>,
+    fc1: Option<LoraBranch>,
+    fc2: Option<LoraBranch>,
+}
+
+/// A projection and its branch, in one device submission where the platform
+/// has that kernel and the shapes fit — the branch reads the activation the
+/// base GEMM already uploaded and accumulates into the output it just wrote,
+/// so it costs no transfer of its own. Falls back to `matmat` + `add`, which
+/// is correct everywhere and pays a round trip for the branch.
+///
+/// The router and the probe both need the branch and the base separated to
+/// measure one against the other, which the fused kernel does not do — so
+/// when either is asked for, a branch takes the split path until it HAS been
+/// measured, and the fused one from the next step onward. Without that the
+/// probe reports 0.0000 for every branch and reads as "this adapter does
+/// nothing", which is what it did in the first run of it.
+fn proj_with_lora(
+    p: &Proj,
+    br: &Option<LoraBranch>,
+    x: &[f32],
+    n: usize,
+    out: &mut [f32],
+    pool: Option<&Pool>,
+) {
+    #[cfg(target_os = "macos")]
+    if let Some(l) = br.as_ref().filter(|l| l.live()) {
+        if let Some((model, idx)) = p.q4tp_mapped() {
+            let (rows, cols) = (p.rows(), p.cols());
+            if n >= 32
+                && cols % 32 == 0
+                && crate::gpu::enabled_here()
+                && !crate::gpu::mm_killed()
+                && (!crate::ltxlora::wants_measurement() || l.resonance() != 0.0)
+                && crate::gpu_metal::q4tp_matmat_lora(model, idx, x, n, rows, cols, out, &l.side())
+            {
+                return;
+            }
+        }
+    }
+    p.matmat(x, n, out, pool);
+    if let Some(l) = br {
+        l.add(x, n, out, pool);
+    }
+}
+
+impl BlockLora {
+    /// Live, not merely present: a branch the router has switched off
+    /// gives the fused device path back for the rest of the render.
+    fn live(br: &Option<LoraBranch>) -> bool {
+        br.as_ref().is_some_and(|l| l.live())
+    }
+    fn ffn_any(&self) -> bool {
+        Self::live(&self.fc1) || Self::live(&self.fc2)
+    }
 }
 
 pub(crate) const CURVE_GRID: usize = 1025;
@@ -600,6 +670,8 @@ pub struct MiniMaxH3 {
     /// The same, for a reference soundtrack. The reference's default is
     /// 1.0 — an audio condition is not noised at all.
     pub cond_aug_audio: f64,
+    /// Adapter keys that found a projection, for the caller's report.
+    lora_bound: std::collections::BTreeSet<String>,
 }
 
 fn rms_norm_into(x: &[f32], w: &[f32], eps: f64, dst: &mut [f32]) {
@@ -616,6 +688,19 @@ fn silu(v: f32) -> f32 {
 
 impl MiniMaxH3 {
     pub fn from_cmf(model: &Arc<CmfModel>) -> Result<Self, String> {
+        Self::from_cmf_lora(model, None)
+    }
+
+    /// The same, with an adapter consulted for every projection.
+    ///
+    /// The base weights are q4tp and stay untouched: a rank-32 update
+    /// cannot be folded into a four-bit ladder without dequantizing the
+    /// whole DiT, so the branch rides beside the base GEMM the way
+    /// [`crate::ltxlora`] does it for LTX.
+    pub fn from_cmf_lora(
+        model: &Arc<CmfModel>,
+        bank: Option<&LoraBank>,
+    ) -> Result<Self, String> {
         let cfg: serde_json::Value = serde_json::from_slice(
             model
                 .tensor_bytes("dit.config_json")
@@ -628,21 +713,51 @@ impl MiniMaxH3 {
         let n_refiner = u("token_refiner_num_layers");
         let f32v = |n: &str| crate::dit::cmf_f32(model, n);
 
+        // Which of the adapter's names actually found a projection here.
+        let bound: std::cell::RefCell<std::collections::BTreeSet<String>> = Default::default();
         let load_block = |prefix: &str, with_adaln: bool| -> Result<Block, String> {
+            let qkv = Proj::from_model(model, &format!("dit.{prefix}.attn.qkv_proj.weight"))?;
+            let out = Proj::from_model(model, &format!("dit.{prefix}.attn.out_proj.weight"))?;
+            let fc1 = Proj::from_model(model, &format!("dit.{prefix}.mlp.fc1.weight"))?;
+            let fc2 = Proj::from_model(model, &format!("dit.{prefix}.mlp.fc2.weight"))?;
+            // A branch is bound against the SHAPE of the projection it will
+            // ride: `add` writes n·out floats through a raw pointer, so an
+            // adapter for another model has to be refused by name, not
+            // discovered as a corrupted panel.
+            let lora = match bank {
+                None => BlockLora::default(),
+                Some(k) => {
+                    let mut take = |suffix: &str, p: &Proj| -> Result<Option<LoraBranch>, String> {
+                        let key = format!("{prefix}.{suffix}");
+                        let br = k.branch_for(&format!("dit.{key}"), p.rows(), p.cols())?;
+                        if br.is_some() {
+                            bound.borrow_mut().insert(key);
+                        }
+                        Ok(br)
+                    };
+                    BlockLora {
+                        qkv: take("attn.qkv_proj", &qkv)?,
+                        out: take("attn.out_proj", &out)?,
+                        fc1: take("mlp.fc1", &fc1)?,
+                        fc2: take("mlp.fc2", &fc2)?,
+                    }
+                }
+            };
             Ok(Block {
                 norm1: f32v(&format!("dit.{prefix}.norm1.weight"))?,
                 norm2: f32v(&format!("dit.{prefix}.norm2.weight"))?,
-                qkv: Proj::from_model(model, &format!("dit.{prefix}.attn.qkv_proj.weight"))?,
-                out: Proj::from_model(model, &format!("dit.{prefix}.attn.out_proj.weight"))?,
+                qkv,
+                out,
                 q_norm: f32v(&format!("dit.{prefix}.attn.q_norm.weight"))?,
                 k_norm: f32v(&format!("dit.{prefix}.attn.k_norm.weight"))?,
-                fc1: Proj::from_model(model, &format!("dit.{prefix}.mlp.fc1.weight"))?,
-                fc2: Proj::from_model(model, &format!("dit.{prefix}.mlp.fc2.weight"))?,
+                fc1,
+                fc2,
                 adaln: if with_adaln {
                     Some(Adaln::load(model, &format!("dit.{prefix}.adaln"))?)
                 } else {
                     None
                 },
+                lora,
             })
         };
         let blocks = (0..n_blocks)
@@ -684,7 +799,63 @@ impl MiniMaxH3 {
             final_eps: f("final_norm_eps", 1e-5),
             cond_aug: VISUAL_COND_TIMESTEP,
             cond_aug_audio: AUDIO_COND_TIMESTEP,
+            lora_bound: bound.into_inner(),
         })
+    }
+
+    /// How many of the adapter's branches found a projection.
+    pub fn lora_bound(&self) -> usize {
+        self.lora_bound.len()
+    }
+
+    /// Whether this adapter key landed on a projection of ours.
+    pub fn lora_binds(&self, key: &str) -> bool {
+        self.lora_bound.contains(key)
+    }
+
+    /// Under `CMF_LORA_PROBE=1`: every branch by measured contribution,
+    /// loudest first, and which ones the router switched off. This is the
+    /// map that says where an adapter actually lives — for the Realism
+    /// adapter it is not uniform across the fifty blocks.
+    pub fn lora_report(&self) -> Option<String> {
+        if !crate::ltxlora::probe_report_on() {
+            return None;
+        }
+        let mut rows: Vec<(f32, bool, String)> = Vec::new();
+        let mut walk = |blocks: &[Block], pre: &str| {
+            for (i, b) in blocks.iter().enumerate() {
+                for (name, br) in [
+                    ("attn.qkv_proj", &b.lora.qkv),
+                    ("attn.out_proj", &b.lora.out),
+                    ("mlp.fc1", &b.lora.fc1),
+                    ("mlp.fc2", &b.lora.fc2),
+                ] {
+                    if let Some(l) = br {
+                        rows.push((l.resonance(), l.live(), format!("{pre}{i}.{name}")));
+                    }
+                }
+            }
+        };
+        walk(&self.blocks, "blocks.");
+        walk(&self.refiner, "token_refiner.blocks.");
+        if rows.is_empty() {
+            return None;
+        }
+        rows.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let live = rows.iter().filter(|r| r.1).count();
+        let mut s = format!(
+            "lora branches by contribution ‖sΔY‖/‖Y‖ ({} of {} live):\n",
+            live,
+            rows.len()
+        );
+        for (r, on, name) in &rows {
+            s.push_str(&format!(
+                "  {:>8.4}  {}  {name}\n",
+                r,
+                if *on { "on " } else { "off" }
+            ));
+        }
+        Some(s)
     }
 
     /// Qwen3-VL states `[n, text_dim]` → refined text embeds
@@ -981,12 +1152,20 @@ impl MiniMaxH3 {
             && crate::gpu::enabled_here()
             && crate::gpu::dit_attention_packed_available()
             && n >= 256;
-        if qk_gpu && std::env::var("CMF_MMH3_FUSEQKV").as_deref() != Ok("0") {
+        // An adapter on qkv needs the panel the fused paths never let
+        // out of the card; one on `out` needs the attention output. Each
+        // stands down only for the projection it owns — a qkv-only
+        // adapter still gets device attention through the chain below.
+        if qk_gpu
+            && !BlockLora::live(&blk.lora.qkv)
+            && std::env::var("CMF_MMH3_FUSEQKV").as_deref() != Ok("0")
+        {
             // Best case first: qkv, attention and the output projection
             // with nothing crossing the bus between them. It refuses at
             // the door when anything is missing, so falling through to
             // the chain below never repeats work.
-            let fuse_out = std::env::var("CMF_MMH3_FUSEOUT").as_deref() != Ok("0");
+            let fuse_out = !BlockLora::live(&blk.lora.out)
+                && std::env::var("CMF_MMH3_FUSEOUT").as_deref() != Ok("0");
             if std::env::var("CMF_GPU_DEBUG").is_ok() {
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| {
@@ -1057,7 +1236,7 @@ impl MiniMaxH3 {
                         Self::prof(1, t_qkv);
                         let t_out = std::time::Instant::now();
                         let mut proj = vec![0f32; n * hs];
-                        blk.out.matmat(&attn, n, &mut proj, pool);
+                        proj_with_lora(&blk.out, &blk.lora.out, &attn, n, &mut proj, pool);
                         Self::prof(4, t_out);
                         let t_res = std::time::Instant::now();
                         self.residual(x, hs, &proj, mods, rows, 2);
@@ -1069,7 +1248,7 @@ impl MiniMaxH3 {
             }
         }
         let mut qkv = vec![0f32; n * 3 * inner];
-        blk.qkv.matmat(&xn, n, &mut qkv, pool);
+        proj_with_lora(&blk.qkv, &blk.lora.qkv, &xn, n, &mut qkv, pool);
         Self::prof(1, t);
         // q and k are the first two thirds of every row; normalize and
         // rotate them where they lie, leaving v alone.
@@ -1115,7 +1294,7 @@ impl MiniMaxH3 {
         Self::prof(3, t);
         let t = std::time::Instant::now();
         let mut proj = vec![0f32; n * hs];
-        blk.out.matmat(&attn, n, &mut proj, pool);
+        proj_with_lora(&blk.out, &blk.lora.out, &attn, n, &mut proj, pool);
         Self::prof(4, t);
         // Own slot: the residual is host-side elementwise work with
         // modulation, and billing it to the projection hid which of the
@@ -1148,6 +1327,7 @@ impl MiniMaxH3 {
         // hundreds of megabytes each way, per block, per step.
         // CMF_MMH3_FFN=cpu forces the host chain below.
         if std::env::var("CMF_MMH3_FFN").as_deref() != Ok("cpu")
+            && !blk.lora.ffn_any()
             && crate::gpu::enabled_here()
             && n >= 64
         {
@@ -1164,7 +1344,7 @@ impl MiniMaxH3 {
             }
         }
         let mut gu = vec![0f32; n * 2 * self.ffn];
-        blk.fc1.matmat(&xn, n, &mut gu, pool);
+        proj_with_lora(&blk.fc1, &blk.lora.fc1, &xn, n, &mut gu, pool);
         Self::prof(5, t);
         let t = std::time::Instant::now();
         // SwiGLU: fc1's output is [gate | up] per row.
@@ -1186,7 +1366,7 @@ impl MiniMaxH3 {
         });
         Self::prof(6, t);
         let t = std::time::Instant::now();
-        blk.fc2.matmat(&act, n, &mut proj, pool);
+        proj_with_lora(&blk.fc2, &blk.lora.fc2, &act, n, &mut proj, pool);
         Self::prof(7, t);
         self.residual(x, hs, &proj, mods, rows, 5);
     }

@@ -7,6 +7,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.92] - 2026-08-19
+
+Community adapters run against MiniMax-H3, and a router that turns off the
+branches that do not matter.
+
+### Added
+- **`cortiq animate --lora <file.safetensors> --lora-strength <s>`** — runtime
+  LoRA for MiniMax-H3, the way `ltx-video` already had it. The container's
+  weights are q4tp and a rank-32 update cannot be folded into a four-bit
+  ladder, so the branch `s·(x·Aᵀ)·Bᵀ` is evaluated beside the base projection
+  (`crates/cortiq-engine/src/mmh3.rs`, `BlockLora`). It binds
+  `attn.qkv_proj`, `attn.out_proj`, `mlp.fc1` and `mlp.fc2` on all fifty
+  blocks and both token-refiner blocks, and prints what bound:
+  `lora: rank 32, 104/104 branches bound`.
+
+  Branches that find no projection are **named**, not dropped in silence —
+  `adaln_proj.linear` is the real gap, because this container carries the
+  modulation as a rank-24 curve and folding an adaLN update into it needs the
+  time embedding only the packer has (`animate-pack --lora --time-embedder`
+  does that, and is how the Turbo LoRA got in).
+- **`CMF_LORA_ROUTE=<r>` — the branch router.** Each branch's contribution
+  `‖s·ΔY‖/‖Y‖` is measured against the base panel on the first step it runs;
+  every branch below `r` is switched off for the rest of the render, and the
+  projection it sat on gets its fused device path back. That last part is the
+  point: an adapter's cost is not its arithmetic (0.5% of the projection) but
+  the fusion it stands down — a branch has to read the panel the fused kernels
+  keep on the card.
+- **`CMF_LORA_PROBE=1`** prints every branch by measured contribution,
+  loudest first, with the router's verdict beside it.
+
+  Measured on an M4 (24 GB), 512×288, 22 frames, 4 steps, against
+  `fal/MiniMax-H3-Realism-People-LoRA` — 104 branches at rank 32, all of
+  which bind:
+
+  ```
+  lora branches by contribution ‖sΔY‖/‖Y‖ (41 of 104 live):
+      0.1633  on   blocks.13.attn.qkv_proj
+      0.0946  on   blocks.9.attn.qkv_proj
+      …
+      0.0011  off  blocks.1.attn.qkv_proj
+  ```
+
+  The loudest branch is 150× the quietest; blocks 0–2 contribute nothing this
+  adapter would miss, and what matters sits in the middle of the stack. At
+  `r = 0.02`, 41 of 104 branches survive, and the render still looks like the
+  adapter rather than like the base: 13.34 dB PSNR against the base render
+  where the full adapter is 13.76, and 16.75 dB against the full adapter.
+
+  What it costs: **33.7 s a step with the adapter against 29.8 s without**,
+  taking the base run measured immediately after it — 1.13×. Against the base
+  run measured fifteen minutes *earlier* the same adapter looks like 1.37×,
+  and that difference is the machine, not the code: the identical base render
+  drifted from 24.6 to 29.8 s a step between the two, and the video VAE, which
+  no adapter touches, moved 48.6 → 94.2 → 56.2 s across three runs. On a
+  24 GB Mac under memory pressure that is the measurement floor; read the cost
+  as "roughly one tenth of a step, not a doubling", and treat a sharper number
+  as owed.
+
+  The branch's own GEMMs are not the cost — on Metal they ride inside the base
+  GEMM's submission (`q4tp_matmat_lora`) and pay no transfer. What an adapter
+  costs is the *attention* fusion standing down: `dit_qkv_attn_out` keeps qkv,
+  the attention and the output projection on the card with nothing in between,
+  and a branch on either projection needs exactly those panels.
+
+  `--lora-strength 0` reproduces the base render **byte for byte** — the gate
+  that says the adapter path perturbs nothing it should not.
+- [`docs/LORA.md`](docs/LORA.md) — adapters on both video models: which names
+  bind, what an adapter costs and why, the router, reference conditioning.
+
+### Changed
+- The adapter loader accepts the three naming conventions in the wild rather
+  than one: `diffusion_model.…` (ComfyUI single-file), `base_model.model.…`
+  (PEFT) and the bare module path, and normalizes the container's own `dit.`
+  prefix on both sides. A PEFT-trained adapter used to bind nothing at all.
+
+### Fixed
+- The MiniMax-H3 card claimed "there is no reference-audio input — H3
+  conditions on text and keyframes only". That was wrong: the release is
+  tagged `audio-to-audio-video` and `video-to-audio-video`, and the packed
+  layout here already carries a reference-audio segment kind with its own
+  condition timestep. What is missing is the audio VAE's **encoder half**,
+  which `pack_audio_vae` skips as unused. The card now says so, and lists
+  what each unported conditioning path actually needs.
+
 ## [0.5.91] - 2026-08-18
 
 An LTX adapter stops costing 2.6× a step.

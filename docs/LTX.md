@@ -176,6 +176,10 @@ own submission — it reads the activation already uploaded and accumulates
 into the output already written — so it costs no transfer: a 384-token step
 goes 8.6 s to 10.1 s on an M4. The file itself is the only extra memory.
 
+Three naming conventions are read as they ship — `diffusion_model.…`
+(ComfyUI single-file), `base_model.model.…` (PEFT) and the bare module path.
+`CMF_LORA_PROBE=1` and `CMF_LORA_ROUTE=<r>` are in [LORA.md](LORA.md).
+
 Adapters that carry a `reference_slot_embedding` also take reference stills:
 
 ```sh

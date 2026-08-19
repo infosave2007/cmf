@@ -174,7 +174,13 @@ impl Lin {
         } else {
             None
         };
-        let lora = bank.and_then(|k| k.branch(name));
+        // Shape-checked: a branch that does not match this projection is an
+        // adapter for another model, and the branch writes through a raw
+        // pointer sized by ITS out dimension.
+        let lora = match bank {
+            Some(k) => k.branch_for(name, w.rows(), w.cols())?,
+            None => None,
+        };
         Ok(Lin { w, b, lora })
     }
 
@@ -183,7 +189,7 @@ impl Lin {
     /// implementations put it — the branch sees the same activations the
     /// base projection did.
     pub(crate) fn has_lora(&self) -> bool {
-        self.lora.is_some()
+        self.lora.as_ref().is_some_and(|l| l.live())
     }
 
     pub(crate) fn add_lora(&self, out: &mut [f32], x: &[f32], n: usize, pool: Option<&Pool>) {
@@ -232,7 +238,12 @@ impl Lin {
         // path when the device declines the shape.
         #[cfg(target_os = "macos")]
         if let (Some(l), Some((model, idx, r, cl))) = (&self.lora, self.mapped()) {
-            if n >= 32
+            // The router measures a branch by comparing it against the base
+            // panel, and this path never separates the two. With routing on,
+            // take the split path so the measurement can happen at all.
+            if l.live()
+                && crate::ltxlora::route_threshold().is_none()
+                && n >= 32
                 && n * r * cl >= 128_000_000
                 && cl % 32 == 0
                 && !crate::gpu::mm_killed()

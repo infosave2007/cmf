@@ -45,6 +45,9 @@ pub struct AnimParams {
     /// frame, and/or its last.
     pub first_frame: Option<(Vec<f32>, usize, usize)>,
     pub last_frame: Option<(Vec<f32>, usize, usize)>,
+    /// A LoRA adapter (.safetensors) applied at runtime, and how hard.
+    pub lora: Option<String>,
+    pub lora_strength: f32,
 }
 
 /// The vision-block token ids the H3 presentation flanks a picture with.
@@ -106,6 +109,8 @@ impl Default for AnimParams {
             max_tokens: 512,
             first_frame: None,
             last_frame: None,
+            lora: None,
+            lora_strength: 1.0,
         }
     }
 }
@@ -452,7 +457,59 @@ fn generate_inner(
 
     // ── denoise ──
     let (video, audio) = {
-        let dit = MiniMaxH3::from_cmf(&model)?;
+        // The adapter is read here, after the encoder's pages are gone:
+        // a rank-32 file for this DiT is 130 MB of f32 once expanded and
+        // there is no reason for it to share a peak with 12 GB of text
+        // tower on a 24 GB machine.
+        let bank = match p.lora.as_deref() {
+            None => None,
+            Some(path) => {
+                let k = crate::ltxlora::LoraBank::load(std::path::Path::new(path), p.lora_strength)?;
+                Some(k)
+            }
+        };
+        let dit = MiniMaxH3::from_cmf_lora(&model, bank.as_ref())?;
+        if let Some(k) = &bank {
+            let bound = dit.lora_bound();
+            // Say what did NOT land. An adaLN branch on a curve-form
+            // pack is the one real gap, and a user who sees "applied"
+            // while half the adapter sat out has been lied to.
+            let mut skipped: std::collections::BTreeMap<String, usize> = Default::default();
+            for name in k.keys() {
+                if !dit.lora_binds(name) {
+                    let fam = name
+                        .rsplit_once('.')
+                        .map(|(_, t)| {
+                            let head = name.split('.').next().unwrap_or("");
+                            format!("{head}…{t}")
+                        })
+                        .unwrap_or_else(|| name.to_string());
+                    *skipped.entry(fam).or_default() += 1;
+                }
+            }
+            let tail = if skipped.is_empty() {
+                String::new()
+            } else {
+                let parts: Vec<String> =
+                    skipped.iter().map(|(k, v)| format!("{k} ×{v}")).collect();
+                format!("; not applied: {}", parts.join(", "))
+            };
+            tracing::info!(
+                "lora: rank {}, {} branches, {} bound at strength {}{}",
+                k.rank(),
+                k.len(),
+                bound,
+                p.lora_strength,
+                tail
+            );
+            println!(
+                "lora: rank {}, {}/{} branches bound{}",
+                k.rank(),
+                bound,
+                k.len(),
+                tail
+            );
+        }
         let kf: Vec<(usize, usize)> = keyframes
             .iter()
             .map(|&(_, idx)| (idx, frames_total))
@@ -510,6 +567,9 @@ fn generate_inner(
                 );
             }
             progress("denoise", i + 1, p.steps);
+        }
+        if let Some(rep) = dit.lora_report() {
+            eprint!("{rep}");
         }
         (v, a)
     };
