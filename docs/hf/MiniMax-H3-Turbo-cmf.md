@@ -615,7 +615,7 @@ Two more, on the runtime side: the latent upscaler published for H3
 (a 345 M-parameter 3-D conv net) is not ported, and there is no fused
 device kernel for adapter branches on this model — see below.
 
-## The eight-bit build, and what it costs today
+## The eight-bit build — now the fastest file here
 
 `mmh3-turbo-clipproj4b-fl2va-v2-q8_2f.cmf` (26.90 GB, 26.21 B parameters,
 `cortiq verify` clean) packs the DiT as **`q8_2f`** — the two-field int8,
@@ -623,33 +623,45 @@ device kernel for adapter branches on this model — see below.
 axis, which is where an activation-outlier channel shows up from the weight
 side. As a codec it is strictly more faithful than the four-bit ladder.
 
-**It renders on the card — after two gates were fixed, and the story is
-worth reading if you pack your own containers.**
+Until today it was also the slow one. RTX 5090, 512×288, 22 frames, four
+steps, one machine, one sitting:
 
-The first run of this file left the RTX 5090 idle at 2 MiB and took
-**357.3 s**. Neither cause was a missing kernel:
+| | denoise | video VAE | wall |
+|---|---|---|---|
+| q8_2f, 0.5.94 | 103.3 s | 62.2 s | 171.5 s |
+| q8_2f, scalar int8 kernel | 56.2 s | 19.5 s | 81 s |
+| **q8_2f, 0.5.95** | **31.7 s** | **9.0 s** | **46 s** |
+| q4tp, same session | 59.0 s | 37.2 s | ~101 s |
 
-1. **The startup probe matched on `Q4TiledP` by name and dtype.** Finding no
-   four-bit qkv weight it declared the host path for the whole render — for a
-   codec that has a device GEMM of its own. The two-field int8 folds its
-   column field into the activation and what is left is the per-row int8
-   kernel both backends already ship. The probe now asks the tensor which
-   entry point its codec has (`QTensor::device_matmat`).
-2. **The weight-residency budget was the whole heap minus a gigabyte.** That
-   survived only because every container published before this one had
-   weights far under it; 24 GB of eight-bit weights took the card and the
-   first scratch allocation died with `wgpu error: Out of Memory`. A quarter
-   of the heap is held back now — 32 GB card → 24 GB of weights.
+Three things were in the way, and none of them was the codec:
 
-With both: **171.5 s** on the same card and clip (103.3 s denoise,
-62.2 s video VAE), against 357.3 s on the host, and the probe agrees with
-the CPU arm to 5.77e-3.
+1. **The fused chains asked for a four-bit weight by name.**
+   `QTensor::mapped_q4tp` was the door to every fused submission in the DiT
+   and the 3D VAE, so an eight-bit container walked past all of them into
+   per-op GEMMs with a readback between each. `mapped_device_gemm` asks
+   instead whether the codec *has* a device GEMM.
+2. **int8 never reached the matrix units.** The four-bit path unpacks its
+   weight into an f16 plane once and hands that to the cooperative GEMM;
+   int8 ran the scalar kernel on the scalar ALUs. `q8_dq_f16` writes the same
+   plane — and folds the column field into it, so the activation is no longer
+   multiplied by that field on the host before every projection (a 40 MB pass,
+   four hundred times a render).
+3. **The panels stayed on the card.** qkv → attention → output projection and
+   the FFN pair are one submission for this codec now, as they always were for
+   four-bit.
 
-It is still slower than the four-bit file's 60.2 s, and that part *is* about
-kernels: `q4tp` has the fused qkv → attention → output submission and the
-packed FFN, `q8_2f` goes through the generic per-op GEMM. Fusing those for the
-two-field codec is the next piece of work, and it is worth roughly what the
-fusion is worth on q4tp.
+`CMF_Q8_COOP=0` puts the scalar kernel back, `CMF_FUSED_ANY=0` the per-op
+path — both arms above are from those switches, and both render the same
+picture. The startup probe agrees with the CPU arm to 5.78e-3.
+
+**The bug this shook out, since it is the more useful half of the story:**
+widening that gate sent int8 weights to `vae_qkv_attn_out`, which still called
+the four-bit entry points by name. It read the int8 payload as four-bit tiles,
+finished three times faster than it should have, and produced a **flat grey
+frame** — with every switch that could have explained it turned off. The
+four-bit GEMM now refuses a tensor that is not four-bit rather than returning
+plausible garbage, which is what turns that class of mistake into a fallback
+instead of a mystery.
 
 ## The latent upscaler
 
