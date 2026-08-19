@@ -22494,7 +22494,16 @@ fn tp_matmat_impl(
     // pass touches rows×cols regardless of b, so a narrow GEMM pays for
     // a dequantizer it barely uses (measured: nanbeige prefill chunks
     // lost 7× to it before this gate).
-    let dq = if coop_arm && c.q4tp_mm_coop_f16.is_some() && b >= 64 {
+    // The batch at which unpacking the whole plane pays for itself. 64 was
+    // measured on a language model's prefill; the video VAE calls this with
+    // far narrower panels, and its four-bit decode costs four times what the
+    // same decode costs an eight-bit container that always takes the plane.
+    // CMF_Q4TP_PLANE_MIN moves the line so the answer can be measured.
+    let plane_min: usize = std::env::var("CMF_Q4TP_PLANE_MIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64);
+    let dq = if coop_arm && c.q4tp_mm_coop_f16.is_some() && b >= plane_min {
         dq_f16_plane(c, &mut sc, &q_buf, rows, cols)
     } else {
         None
