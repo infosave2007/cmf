@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **The four-bit FFN takes its activation scale from the card.** Three quarters
+  of one call was host time — 126.2 ms against 41.4 ms of card at 768×448 —
+  and the largest piece the GPU could take back was the scan for max|x| over
+  the activation panel: 13.2 M floats per call at DiT shapes, on one core,
+  before anything is submitted. The resident-operand path already computed
+  that scale on the device and the kernel already read it from a buffer.
+  Measured two runs each way: host time per call 116.4 / 118.6 ms → 77.0 ms,
+  denoise 68.1 / 71.1 s → 62.0 / 62.8 s, output byte-identical.
+  `CMF_FFN_HOST_SCAN=1` keeps the old arm.
+- **The four-bit fc2 plane arm was gated on a reduction the card may not
+  have**, so `CMF_FFN_FC2_COOP=1` turned on an arm that then refused itself.
+  It now accepts either form of the reduction; worth about 10 ms of a 116 ms
+  call. It stays opt-in.
+
+### Added
+- `CMF_FFN_COUNT=1` reports the packed FFN's calls and its split between host
+  preparation and waiting for the card — the measurement that found the above.
+
 ## [0.5.95] - 2026-08-19
 
 The eight-bit build stops costing four times what it should, and the DiT

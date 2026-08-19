@@ -24666,12 +24666,16 @@ pub fn q4tp_ffn_packed(
     // it. The scale is computed from the input we just uploaded; the
     // kernel divides it back out at the store.
     let f16_arm = dq1.is_some() && c.q4tp_mm_coop_f16.is_some();
-    // The activation scale can be taken on the card, where the resident-operand
+    // The activation scale is taken on the card, where the resident-operand
     // path already computes it, instead of scanning the panel on the host —
-    // 13.2 M floats per call at DiT shapes. Three quarters of a four-bit FFN
-    // call is host time (126.2 ms against 41.4 ms of card at 768×448), and
-    // this scan is the biggest single piece of it that the GPU can take back.
-    // `CMF_FFN_HOST_SCAN=1` keeps the host scan for the A/B.
+    // 13.2 M floats per call at DiT shapes, on one core, before anything is
+    // submitted. Three quarters of a four-bit FFN call was host time.
+    //
+    // MEASURED, RTX 5090, 768×448, two runs each way: host time per call
+    // 116.4 / 118.6 ms with the host scan against 77.0 ms with this, and the
+    // render's denoise 68.1 / 71.1 s against 62.0 / 62.8 s. Ten percent, with
+    // the output byte-identical across all four. `CMF_FFN_HOST_SCAN=1` keeps
+    // the old arm.
     let dev_scan = f16_arm
         && std::env::var("CMF_FFN_HOST_SCAN").as_deref() != Ok("1")
         && (c.act_absmax.is_some() || (c.act_amax_part.is_some() && c.act_amax_fold.is_some()));
