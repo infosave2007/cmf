@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.93] - 2026-08-19
+
+The latent upscaler, an eight-bit build, and reference clips.
+
+### Added
+- **The MiniMax-H3 latent upscaler is ported** (`crates/cortiq-engine/src/mmh3ups.rs`),
+  and `cortiq animate --upscale <file.safetensors> --upscale-by 2.0` runs it:
+  render small, resize the *latent* with the learned net, decode at the
+  larger size. The 5 B-parameter VAE never does a decode → pixel resize →
+  encode round trip, and none of the ghosting a bilinear latent resize
+  leaves is there.
+
+  345 M parameters: twelve residual blocks and six temporal convolutions on
+  each side of a trilinear resize, with a scalar scale embedding modulating
+  every block. **Parity against the node's own torch module: worst 6.68e-6,
+  relative rms 3.92e-7** (`examples/mmh3_ups_parity.rs`, oracle written by
+  `tools/mmh3_ups_oracle.py`). Loaded from the published `.safetensors`
+  beside the container, the way an adapter is — it is a third-party model
+  with its own licence.
+- **`animate-pack --quant q8_2f`** — the two-field int8, `w = q·row[o]·col[i]`:
+  eight bits with a second scale field along the *input* axis, which is
+  where an activation-outlier channel shows up from the weight side. The
+  step up from q4tp for a machine with the memory, asked for in discussion #5.
+- **`animate --video <dir> --video-stride n`** — every n-th frame of a
+  reference clip becomes a condition pinned to its own moment of the render.
+  This is the `fl2va` keyframe path with more than two frames; the source
+  clip is mapped onto the render's length by position. Not a port of the
+  release's own v2v node, and the card says so.
+- The audio VAE's **encoder half is packed** from now on. The DiT already
+  takes a reference soundtrack — the layout carries the segment kind and its
+  condition timestep — and the container had nothing to turn a `.wav` into
+  latents. The runtime path is still to write; the weights are in place so
+  nobody re-downloads a 14 GB file for them.
+
+### Verified
+- The spatial-physics adapter's behaviour was a prediction from its header
+  and is now measured: `lora: rank 16, 208/258 branches bound; not applied:
+  blocks…linear ×50`, and the render completes — rank 16 is not a multiple
+  of 32, so it takes the split path rather than the fused kernel.
+
 ## [0.5.92] - 2026-08-19
 
 Community adapters run against MiniMax-H3, and a router that turns off the
