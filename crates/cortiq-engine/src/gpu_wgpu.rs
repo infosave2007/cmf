@@ -21727,6 +21727,12 @@ fn dispatch_matmat_keep(
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
+        // The scratch guard goes before any encoding: `encode_act_absmax`
+        // takes that same lock for its partials buffer, and std's Mutex is
+        // not reentrant — holding it here hung the card at 0% util with the
+        // process idling, which is precisely what it looks like from outside.
+        // The buffers are handles; they outlive the guard.
+        drop(sc);
         let bind_mm = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("q8coop-bg"),
             layout: &mm_pipe.get_bind_group_layout(0),
@@ -21765,13 +21771,10 @@ fn dispatch_matmat_keep(
         }
         return match out.as_mut() {
             Some(o) => {
-                let ok = readback(c, enc, &y_buf, &stage_buf, y_size, &mut o[..b * rows]);
-                drop(sc);
-                ok.then_some(y_buf)
+                readback(c, enc, &y_buf, &stage_buf, y_size, &mut o[..b * rows]).then_some(y_buf)
             }
             None => {
                 c.queue.submit(Some(enc.finish()));
-                drop(sc);
                 Some(y_buf)
             }
         };
