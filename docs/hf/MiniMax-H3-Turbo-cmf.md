@@ -716,10 +716,14 @@ cortiq animate mmh3-raven-streaming-q4tp.cmf \
 ```
 
 `--stream-chunk` is the chunk length in *latent* frames (one latent frame is
-four video frames). Each chunk attends to a sink of the first `--stream-sink`
-chunks and a sliding window of the last `--stream-window` — the pattern the
-adapter trains — and the already-finished frames enter the sequence at
-timestep 0, as clean context rather than as noise being removed.
+four video frames). `--stream-sink` and `--stream-window` are counted in
+latent frames too — a couple pinned at the start, a couple trailing the
+current chunk, the attention-sink pattern the adapter trains — and the
+already-finished frames enter the sequence at timestep 0, as clean context
+rather than as noise being removed. (`CMF_STREAM_UNIT=chunks` counts them in
+whole chunks instead — the reading this port shipped first. Same pictures,
+and measured **109.6 s of denoise against 58.8 s** on one machine back to
+back, because a chunk then attends to four chunks' worth of rows.)
 
 **The chunk length is the knob that matters.** RTX 5090, 384×256, 41 frames
 in (56 out), four steps:
