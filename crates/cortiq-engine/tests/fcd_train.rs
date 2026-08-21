@@ -361,7 +361,7 @@ fn block_gradcheck_full_graph_exact_mode() {
     let path = write_tiny_model(&dir);
     let model = std::sync::Arc::new(CmfModel::open(&path).unwrap());
     let o1 = O1Cfg::from_spec("all", Some(4), Some(64), Some(0), None).unwrap(); // w ≥ t → exact
-    let fm = FcdModel::from_cmf(&model, &o1).unwrap();
+    let fm = FcdModel::from_cmf(&model, &o1, false).unwrap();
     let mut ts = TrainState::new(&fm);
     let seqs = rand_ids(SEQ + 1, 7);
     let worst = block_fd(&fm, &mut ts, &seqs[..SEQ], &seqs[1..], SEQ, 3e-2, &|_| true);
@@ -381,7 +381,7 @@ fn block_gradcheck_skeleton_active_last_layer_tight() {
     std::fs::create_dir_all(&dir).unwrap();
     let path = write_tiny_model(&dir);
     let model = std::sync::Arc::new(CmfModel::open(&path).unwrap());
-    let fm = FcdModel::from_cmf(&model, &tiny_o1()).unwrap(); // w=4 → skeleton on
+    let fm = FcdModel::from_cmf(&model, &tiny_o1(), false).unwrap(); // w=4 → skeleton on
     let mut ts = TrainState::new(&fm);
     let seqs = rand_ids(SEQ + 1, 7);
     // Trainable slots: layer-major, 5 per layer; the last layer's
@@ -420,6 +420,7 @@ fn training_smoke_loss_decreases_and_output_loads() {
         bs: 2,
         seq: SEQ,
         seed: 0,
+        polish_only: false,
     };
     let out = dir.join("tiny_fcd.fcd.cmf");
     let report = run_polish(&model, &tiny_o1(), &hp, &tr, &va, &out, None).expect("polish");
@@ -497,7 +498,7 @@ fn block_gradcheck_hybrid_gdn_above_trainable() {
         sink: 0,
         rect: cortiq_engine::nystrom::O1_DEFAULT_RECT,
     };
-    let fm = FcdModel::from_cmf(&model, &o1).unwrap();
+    let fm = FcdModel::from_cmf(&model, &o1, false).unwrap();
     let mut ts = TrainState::new(&fm);
     assert_eq!(ts.layers, vec![0], "only the Full layer is convertible");
     let seqs = rand_ids(SEQ + 1, 17);
@@ -516,7 +517,7 @@ fn block_gradcheck_output_gate() {
     let path = write_tiny_model_variant(&dir, "tiny_gate", true, false);
     let model = std::sync::Arc::new(CmfModel::open(&path).unwrap());
     let o1 = O1Cfg::from_spec("all", Some(4), Some(64), Some(0), None).unwrap();
-    let fm = FcdModel::from_cmf(&model, &o1).unwrap();
+    let fm = FcdModel::from_cmf(&model, &o1, false).unwrap();
     let mut ts = TrainState::new(&fm);
     let seqs = rand_ids(SEQ + 1, 19);
     let worst = block_fd(&fm, &mut ts, &seqs[..SEQ], &seqs[1..], SEQ, 3e-2, &|_| true);

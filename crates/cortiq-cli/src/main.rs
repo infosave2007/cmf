@@ -7,6 +7,7 @@ mod gguf;
 mod gptq;
 mod imagepack;
 mod moedefrag;
+mod tube;
 mod music;
 mod npy;
 mod requant;
@@ -382,6 +383,30 @@ enum Commands {
     /// Bake a task's expert restriction as a switchable task mask
     /// (spec §5 expert fields): the full expert set stays, `run --task`
     /// narrows routing at inference — one file, many specialists.
+    /// Defragment a dense FFN into task tubes: reorder the intermediate
+    /// axis so each task's neurons form ONE contiguous run, cut the run
+    /// into segments (core + tubes) and ship a task mask per tube set.
+    /// A masked FFN only saves bytes once it is contiguous.
+    TubeBake {
+        /// Source .cmf (dense FFN)
+        model: String,
+        /// Plan JSON: {tasks, layers:[{order,widths}], active}
+        #[arg(long)]
+        plan: String,
+        /// Output .cmf
+        #[arg(long)]
+        output: String,
+    },
+    /// Store every dense layer's `down_proj` a second time, transposed,
+    /// so per-token neuron selection reads a neuron's down weights as a
+    /// contiguous row instead of a strided column (`CMF_FFN_GATE_TOPK`).
+    FfnTranspose {
+        /// Source .cmf
+        model: String,
+        /// Output .cmf
+        #[arg(long)]
+        output: String,
+    },
     MoeMask {
         /// Source .cmf model
         model: String,
@@ -964,6 +989,20 @@ enum Commands {
         /// Gate: max loop-score increase over the zero-shot baseline
         #[arg(long, default_value_t = 0.10)]
         gate_slack: f64,
+        /// Polish WITHOUT converting attention: `--o1` then only names
+        /// which layers are TRAINABLE (their FFN and the two layer
+        /// norms) and both teacher and student keep exact attention.
+        /// This is the correction pass a compressed model wants — the
+        /// damage is in the FFN, not in the attention kernel — and with
+        /// `--kl 0` it is plain cross-entropy on the corpus.
+        #[arg(long, default_value_t = false)]
+        polish_only: bool,
+        /// Distil from a SEPARATE, uncompressed .cmf instead of the
+        /// model's own frozen state. For a compressed model that is the
+        /// difference between anchoring on what it should do and
+        /// anchoring on the damage; use it with `--kl` above 0.
+        #[arg(long)]
+        teacher: Option<String>,
     },
     /// Generate an image from text (Lumina-Image 2.0). Takes a packed
     /// `.cmf` from `imagine-pack` — one mmap for text encoder, DiT and
@@ -1820,6 +1859,12 @@ async fn main() -> anyhow::Result<()> {
             quant,
             in_place,
         } => requant::cmd_requant(&model, output.as_deref(), &quant, in_place),
+        Commands::TubeBake {
+            model,
+            plan,
+            output,
+        } => tube::cmd_tube_bake(&model, &plan, &output),
+        Commands::FfnTranspose { model, output } => tube::cmd_ffn_transpose(&model, &output),
         Commands::MoeMask {
             model,
             stats,
@@ -2527,6 +2572,8 @@ async fn main() -> anyhow::Result<()> {
             gen_gate,
             gate_threshold,
             gate_slack,
+            polish_only,
+            teacher,
         } => cmd_fcd(
             &model,
             &corpus,
@@ -2546,6 +2593,8 @@ async fn main() -> anyhow::Result<()> {
             gen_gate,
             gate_threshold,
             gate_slack,
+            polish_only,
+            teacher.as_deref(),
         ),
     }
 }
@@ -2870,8 +2919,10 @@ fn cmd_fcd(
     gen_gate: bool,
     gate_threshold: f64,
     gate_slack: f64,
+    polish_only: bool,
+    teacher: Option<&str>,
 ) -> anyhow::Result<()> {
-    use cortiq_engine::fcd::{FcdHyper, GenGateCfg, run_polish};
+    use cortiq_engine::fcd::{FcdHyper, GenGateCfg, run_polish_distilled};
     use cortiq_engine::nystrom::O1Cfg;
 
     let model = Arc::new(CmfModel::open_sharded(model_path)?);
@@ -2932,7 +2983,7 @@ fn cmd_fcd(
     };
     println!("corpus: train {} tokens, val {} tokens", tr.len(), va.len());
 
-    if gen_check {
+    if gen_check && !polish_only {
         println!("── gen-check BEFORE polish (zero-shot O(1)) ──");
         fcd_gen_check(&model, &cfg, &va, "before")?;
     }
@@ -2945,6 +2996,7 @@ fn cmd_fcd(
         bs,
         seq,
         seed: 0,
+        polish_only,
     };
     let out_path = out
         .map(std::path::PathBuf::from)
@@ -2958,7 +3010,20 @@ fn cmd_fcd(
             g.baseline_slack = gate_slack;
             g
         });
-    let report = run_polish(&model, &cfg, &hp, &tr, &va, &out_path, gate_cfg.as_ref())
+    let tmodel = match teacher {
+        Some(p) => Some(std::sync::Arc::new(cortiq_core::CmfModel::open_sharded(p)?)),
+        None => None,
+    };
+    let report = run_polish_distilled(
+        &model,
+        tmodel.as_ref(),
+        &cfg,
+        &hp,
+        &tr,
+        &va,
+        &out_path,
+        gate_cfg.as_ref(),
+    )
         .map_err(|e| anyhow::anyhow!("fcd polish: {e}"))?;
 
     println!("── FCD polish report ──");

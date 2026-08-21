@@ -50,6 +50,14 @@ pub struct FcdHyper {
     pub bs: usize,
     pub seq: usize,
     pub seed: u64,
+    /// Polish WITHOUT converting attention: the `--o1` spec then only
+    /// names which layers are trainable, and both teacher and student
+    /// keep exact attention. This is the shape the notebook's FCD
+    /// correction has — restore accuracy a compression already cost by
+    /// training the last layers on real text — and it is what a
+    /// narrowed FFN needs, where the damage is in the FFN, not in the
+    /// attention kernel.
+    pub polish_only: bool,
 }
 
 impl Default for FcdHyper {
@@ -62,6 +70,7 @@ impl Default for FcdHyper {
             bs: 2,
             seq: 512,
             seed: 0,
+            polish_only: false,
         }
     }
 }
@@ -343,6 +352,9 @@ pub struct FcdModel {
     pub(crate) loops: usize,
     pub(crate) loop_norm: bool,
     pub(crate) pool: Option<Arc<Pool>>,
+    /// Train the flagged layers WITHOUT switching their attention to the
+    /// Nyström kernel — see `FcdHyper::polish_only`.
+    pub polish_only: bool,
 }
 
 fn deq(model: &CmfModel, name: &str) -> Result<Vec<f32>, String> {
@@ -355,6 +367,74 @@ fn deq(model: &CmfModel, name: &str) -> Result<Vec<f32>, String> {
 }
 
 /// Physical RAM total, for the hard replica ceiling.
+/// The container's own memory ceiling, when it has one.
+///
+/// `/proc/meminfo` reports the HOST inside a container. On a rented box
+/// that is the difference between the 944 GB `free` prints and the
+/// 117 GB the cgroup will actually hand out, and believing the larger
+/// number is an OOM kill one allocation later — which is exactly how a
+/// 27B bake died: it read 944 GB, concluded the f32 replica fit with
+/// room to spare, and never streamed a single layer.
+#[cfg(target_os = "linux")]
+fn cgroup_limit_bytes() -> Option<u64> {
+    let read = |p: &str| -> Option<u64> {
+        std::fs::read_to_string(p).ok()?.trim().parse::<u64>().ok()
+    };
+    // v2 first, then v1. An unlimited v2 cgroup holds the word "max",
+    // which fails to parse; an unlimited v1 holds a huge sentinel.
+    read("/sys/fs/cgroup/memory.max")
+        .or_else(|| read("/sys/fs/cgroup/memory/memory.limit_in_bytes"))
+        .filter(|&v| v < u64::MAX / 2)
+}
+
+/// Which flagged layers survive.
+///
+/// For an O(1) conversion only full-attention layers are eligible — a
+/// GDN layer keeps its own operator. Under `polish_only` the flag means
+/// "train this layer's FFN and norms", which any layer supports, so the
+/// filter must not run: on a hybrid it silently shrank `--o1 deep8` to
+/// the two or three full-attention layers that happened to fall in the
+/// window, and 48 of Qwen3.8-27B's 64 layers are GDN.
+pub(crate) fn apply_layer_eligibility(flags: &mut [bool], is_full: &[bool], polish_only: bool) {
+    if polish_only {
+        return;
+    }
+    for (li, f) in flags.iter_mut().enumerate() {
+        if *f && !is_full.get(li).copied().unwrap_or(false) {
+            *f = false;
+        }
+    }
+}
+
+/// The lower of what the host reports and what the container will hand
+/// out. Pure so the decision can be tested without a cgroup to hand.
+pub(crate) fn effective_total(host: u64, cgroup_limit: Option<u64>) -> u64 {
+    match cgroup_limit {
+        Some(l) => host.min(l),
+        None => host,
+    }
+}
+
+/// Headroom: inside a cgroup it is the limit minus what the cgroup
+/// already holds, never whatever the host happens to have free.
+pub(crate) fn effective_available(host: u64, limit: Option<u64>, used: Option<u64>) -> u64 {
+    match (limit, used) {
+        (Some(l), Some(u)) => host.min(l.saturating_sub(u)),
+        (Some(l), None) => host.min(l),
+        _ => host,
+    }
+}
+
+/// Bytes this cgroup is already holding, for the same reason.
+#[cfg(target_os = "linux")]
+fn cgroup_used_bytes() -> Option<u64> {
+    let read = |p: &str| -> Option<u64> {
+        std::fs::read_to_string(p).ok()?.trim().parse::<u64>().ok()
+    };
+    read("/sys/fs/cgroup/memory.current")
+        .or_else(|| read("/sys/fs/cgroup/memory/memory.usage_in_bytes"))
+}
+
 fn physical_total_bytes() -> Option<u64> {
     #[cfg(target_os = "macos")]
     {
@@ -374,7 +454,7 @@ fn physical_total_bytes() -> Option<u64> {
             .nth(1)?
             .parse()
             .ok()?;
-        return Some(kb * 1024);
+        return Some(effective_total(kb * 1024, cgroup_limit_bytes()));
     }
     #[allow(unreachable_code)]
     None
@@ -421,7 +501,13 @@ fn available_ram_bytes() -> Option<u64> {
             .nth(1)?
             .parse()
             .ok()?;
-        return Some(kb * 1024);
+        // Inside a cgroup, headroom is the limit minus what it already
+        // holds, not whatever the host happens to have free.
+        return Some(effective_available(
+            kb * 1024,
+            cgroup_limit_bytes(),
+            cgroup_used_bytes(),
+        ));
     }
     #[allow(unreachable_code)]
     None
@@ -512,7 +598,11 @@ impl FcdModel {
 impl FcdModel {
     /// Dequantize a model into the f32 training replica. Refuses what
     /// the backward cannot honestly differentiate yet (loud, not silent).
-    pub fn from_cmf(model: &std::sync::Arc<CmfModel>, o1: &O1Cfg) -> Result<Self, String> {
+    pub fn from_cmf(
+        model: &std::sync::Arc<CmfModel>,
+        o1: &O1Cfg,
+        polish_only: bool,
+    ) -> Result<Self, String> {
         let arch = model.arch().clone();
         if arch.hidden_act != "silu" {
             return Err(format!(
@@ -644,11 +734,19 @@ impl FcdModel {
         let mut flags = o1.layer_flags(arch.num_layers);
         flags.resize(arch.num_layers, false);
         // Only full-attention layers are o1-convertible (same rule as
-        // Pipeline::set_o1) — a GDN layer keeps its own operator.
-        for (li, f) in flags.iter_mut().enumerate() {
-            if *f && !matches!(layers[li].attn, FcdAttn::Full { .. }) {
-                *f = false;
-            }
+        // Pipeline::set_o1) — a GDN layer keeps its own operator. Under
+        // `polish_only` the flag means "train this layer's FFN and
+        // norms", which a GDN layer supports like any other: its own
+        // operator stays frozen and the backward already carries the
+        // through-gradient. Excluding them there would silently shrink
+        // `--o1 deep8` on a hybrid to the two or three full-attention
+        // layers that happen to fall in the window.
+        {
+            let is_full: Vec<bool> = layers
+                .iter()
+                .map(|l| matches!(l.attn, FcdAttn::Full { .. }))
+                .collect();
+            apply_layer_eligibility(&mut flags, &is_full, polish_only);
         }
         // Streaming window: how many layers' big matrices stay resident.
         // Sized from available memory; CMF_BAKE_MATS_LAYERS overrides.
@@ -724,6 +822,7 @@ impl FcdModel {
             loops,
             loop_norm,
             pool: Pool::from_env(),
+            polish_only: false,
         })
     }
 
@@ -995,6 +1094,8 @@ impl FcdModel {
         want_acts: bool,
         ffn_scale: Option<&[f32]>,
     ) -> (Vec<f32>, Option<LayerActs>) {
+        // Polish-only: the flags select what to TRAIN, not what to convert.
+        let nystrom = nystrom && !self.polish_only;
         let hsz = self.hidden;
         let n = b * t;
         let l = &self.layers[li];
@@ -1536,6 +1637,7 @@ impl FcdModel {
         dh2: &[f32],
         mut grads: Option<&mut [Vec<f32>]>,
     ) -> Vec<f32> {
+        let nystrom = nystrom && !self.polish_only;
         let hsz = self.hidden;
         let n = b * t;
         let l = &self.layers[li];
@@ -2319,8 +2421,19 @@ impl FcdModel {
 /// AMONG GATE-PASSERS; if none passes, the zero-shot state is restored
 /// (identity polish) — the stage never makes generation worse than
 /// conversion alone.
-pub fn run_polish(
+/// Polish `model`, optionally distilling from a SEPARATE `teacher` file.
+///
+/// Without a teacher the KL anchor is the model's own frozen state,
+/// which is right for an O(1) conversion (the weights are the same, only
+/// the attention kernel moved) and useless for a compression: the anchor
+/// is then the damage itself, and `--kl 0` is the only sane setting.
+/// Pointing `teacher` at the UNCOMPRESSED file makes the anchor what the
+/// model is supposed to do, everywhere — not just on the training text.
+/// The two files share embeddings and head (a narrowing rewrites FFN
+/// tensors only), so one loss head serves both exactly.
+pub fn run_polish_distilled(
     model: &Arc<CmfModel>,
+    teacher: Option<&Arc<CmfModel>>,
     o1: &O1Cfg,
     hp: &FcdHyper,
     tr: &[u32],
@@ -2335,7 +2448,31 @@ pub fn run_polish(
             hp.seq + 2
         ));
     }
-    let fm = FcdModel::from_cmf(model, o1)?;
+    let mut fm = FcdModel::from_cmf(model, o1, hp.polish_only)?;
+    fm.polish_only = hp.polish_only;
+    let fm = fm;
+    let tfm: Option<FcdModel> = match teacher {
+        Some(t) => {
+            let off = O1Cfg {
+                layers: O1Layers::List(Vec::new()),
+                m: o1.m,
+                w: o1.w,
+                sink: o1.sink,
+                rect: o1.rect,
+            };
+            let mut t = FcdModel::from_cmf(t, &off, true)?;
+            t.polish_only = true;
+            if t.hidden != fm.hidden || t.nl != fm.nl {
+                return Err(format!(
+                    "teacher geometry differs: hidden {}/{} layers {}/{}",
+                    t.hidden, fm.hidden, t.nl, fm.nl
+                ));
+            }
+            tracing::info!("fcd: distilling from a separate teacher file");
+            Some(t)
+        }
+        None => None,
+    };
     let converted = fm.converted();
     if converted.is_empty() {
         return Err("no converted layers under this --o1 spec (nothing to polish)".into());
@@ -2353,7 +2490,10 @@ pub fn run_polish(
     );
 
     let mut ts = TrainState::new(&fm);
-    let teacher_ppl = fm.val_ppl(va, None, false, hp.bs, 2, hp.seq);
+    let teacher_ppl = match &tfm {
+        Some(t) => t.val_ppl(va, None, false, hp.bs, 2, hp.seq),
+        None => fm.val_ppl(va, None, false, hp.bs, 2, hp.seq),
+    };
     let ppl_start = fm.val_ppl(va, Some(&ts), true, hp.bs, 2, hp.seq);
     tracing::info!(
         "fcd: quick-val teacher ppl {teacher_ppl:.2} | zero-shot o1 student ppl {ppl_start:.2}"
@@ -2374,7 +2514,9 @@ pub fn run_polish(
             };
             let mut pipe = Pipeline::from_model(model, greedy)
                 .map_err(|e| format!("gen-gate pipeline: {e}"))?;
-            pipe.set_o1(Some(o1.clone()));
+            if !hp.polish_only {
+                pipe.set_o1(Some(o1.clone()));
+            }
             apply_trainables(&mut pipe, &fm, &ts);
             let base = gate_gen_scores(&mut pipe, g)?;
             tracing::info!("fcd gen-gate baseline loop-scores: {base:?}");
@@ -2406,7 +2548,10 @@ pub fn run_polish(
             tgt.extend_from_slice(&tr[off + 1..off + hp.seq + 1]);
         }
 
-        let ht = fm.forward_hidden(&ids, hp.bs, hp.seq, None, false, None);
+        let ht = match &tfm {
+            Some(t) => t.forward_hidden(&ids, hp.bs, hp.seq, None, false, None),
+            None => fm.forward_hidden(&ids, hp.bs, hp.seq, None, false, None),
+        };
         let mut keep: Vec<Vec<f32>> = Vec::with_capacity(fm.nl);
         let hs = fm.forward_hidden(&ids, hp.bs, hp.seq, Some(&ts), true, Some(&mut keep));
         let (ce, kl, dhs) = fm.loss_and_dhidden(&hs, &ht, &tgt, hp.kl_w);
@@ -2508,6 +2653,8 @@ fn apply_trainables(pipe: &mut Pipeline, fm: &FcdModel, ts: &TrainState) {
             up_proj: QTensor::from_f32(ts.data[b + 3].clone(), inter, hidden),
             down_proj: QTensor::from_f32(ts.data[b + 4].clone(), hidden, inter),
             act: crate::pipeline::Act::Silu,
+            down_t: None,
+            segs: Vec::new(),
         });
     }
 }
@@ -2619,6 +2766,74 @@ fn save_polished(
 mod tests {
     use super::*;
 
+    /// The bug this pins: on a hybrid, `--o1 deep8` under `--polish-only`
+    /// used to select two layers instead of eight, because the eligibility
+    /// filter for the O(1) CONVERSION also ran for a plain polish.
+    #[test]
+    fn polish_only_keeps_recurrent_layers_trainable() {
+        // A Qwen3.5-shaped stretch: mostly GDN, a full-attention layer
+        // every fourth. Ask for the deepest eight.
+        let is_full: Vec<bool> = (0..8).map(|i| i % 4 == 3).collect();
+
+        let mut converting = vec![true; 8];
+        apply_layer_eligibility(&mut converting, &is_full, false);
+        assert_eq!(
+            converting.iter().filter(|&&b| b).count(),
+            2,
+            "an O(1) conversion may only take the full-attention layers"
+        );
+
+        let mut polishing = vec![true; 8];
+        apply_layer_eligibility(&mut polishing, &is_full, true);
+        assert_eq!(
+            polishing.iter().filter(|&&b| b).count(),
+            8,
+            "a polish trains FFN and norms, which every layer has"
+        );
+
+        // An unflagged layer is never raised by either path.
+        let mut none = vec![false; 8];
+        apply_layer_eligibility(&mut none, &is_full, true);
+        assert!(none.iter().all(|&b| !b));
+    }
+
+    /// `/proc/meminfo` reports the HOST inside a container. Believing it
+    /// is what killed a 27B bake: 944 GB read, 117 GB actually available,
+    /// the f32 replica declared to fit, SIGKILL a minute later.
+    #[test]
+    fn the_container_ceiling_wins_over_the_host_figure() {
+        let host = 944 * 1_000_000_000u64;
+        let cgroup = 117 * 1_000_000_000u64;
+        assert_eq!(effective_total(host, Some(cgroup)), cgroup);
+        // No cgroup (bare metal): the host figure is the truth.
+        assert_eq!(effective_total(host, None), host);
+        // A cgroup wider than the machine cannot conjure memory.
+        assert_eq!(effective_total(host, Some(host * 2)), host);
+    }
+
+    /// Headroom inside a cgroup is limit-minus-held, not host-free: the
+    /// host can have hundreds of gigabytes free that this process will
+    /// never be allowed to touch.
+    #[test]
+    fn container_headroom_is_the_limit_minus_what_it_holds() {
+        let host_free = 800 * 1_000_000_000u64;
+        let limit = 117 * 1_000_000_000u64;
+        let used = 79 * 1_000_000_000u64;
+        assert_eq!(
+            effective_available(host_free, Some(limit), Some(used)),
+            38 * 1_000_000_000u64
+        );
+        // Over the limit already — report nothing left, never underflow.
+        assert_eq!(
+            effective_available(host_free, Some(limit), Some(limit + 1)),
+            0
+        );
+        // Limit known, usage not: fall back to the limit itself.
+        assert_eq!(effective_available(host_free, Some(limit), None), limit);
+        // Neither known: the host figure stands.
+        assert_eq!(effective_available(host_free, None, None), host_free);
+    }
+
     /// Claim-13 selection: lowest ppl AMONG PASSING, not global lowest.
     #[test]
     fn gate_selects_lowest_ppl_among_passing() {
@@ -2665,4 +2880,19 @@ mod tests {
             "equal ppl → earliest checkpoint"
         );
     }
+}
+
+
+/// Backwards-compatible entry point: polish with the model as its own
+/// KL anchor.
+pub fn run_polish(
+    model: &Arc<CmfModel>,
+    o1: &O1Cfg,
+    hp: &FcdHyper,
+    tr: &[u32],
+    va: &[u32],
+    out: &std::path::Path,
+    gate: Option<&GenGateCfg>,
+) -> Result<FcdReport, String> {
+    run_polish_distilled(model, None, o1, hp, tr, va, out, gate)
 }

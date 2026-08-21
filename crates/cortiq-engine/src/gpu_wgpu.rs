@@ -12821,6 +12821,10 @@ struct Scratch {
     /// card — more than the tensor-core kernel they served — so these are
     /// grow-only like everything else here.
     bx: Option<(wgpu::Buffer, u64)>,
+    /// Left operand of a TRANSIENT gemm: an accumulation whose operand
+    /// changes every call has no business in the resident weight ledger
+    /// (and its fingerprint is a full pass over 178 MB per call).
+    bwt: Option<(wgpu::Buffer, u64)>,
     by: Option<(wgpu::Buffer, u64)>,
     vcx: Option<(wgpu::Buffer, u64)>,
     vcc: Option<(wgpu::Buffer, u64)>,
@@ -32061,14 +32065,15 @@ fn main() {
 /// one, skip loudly when it did not.
 ///
 /// A bare `return` here is why a column of `ok` could mean "every GPU
-/// test skipped". Cargo's summary cannot say "passed without running
-/// anything", so the skip has to be announced by the test itself — and a
-/// skip that happens after someone explicitly named this backend is not a
-/// skip, it is a failure to honour the request.
+/// test skipped" — cargo's summary has no way to say "passed without
+/// running anything", so the skip has to be made visible by the test
+/// itself, and a skip that happens after someone explicitly set
+/// `CMF_GPU` is not a skip, it is a failure to honour the request.
 pub fn skip_or_fail(what: &str) {
     // Only the value that NAMES this backend can make a skip a failure.
     // `CMF_GPU=1` selects Metal on macOS, where wgpu being absent is
-    // correct rather than a broken request.
+    // correct, not a broken request — a wider test here would turn every
+    // Mac run red for the right reason on the wrong platform.
     let asked = std::env::var("CMF_GPU").map(|v| v == "wgpu").unwrap_or(false);
     assert!(
         !asked,
@@ -32077,6 +32082,7 @@ pub fn skip_or_fail(what: &str) {
     );
     eprintln!("SKIPPED ({what}): no wgpu device — set CMF_GPU=wgpu to run it");
 }
+
 
 pub fn selected_and_up() -> Option<bool> {
     // "Asked" means an EXPLICIT request. The wgpu path also self-selects
@@ -37650,6 +37656,17 @@ fn f32_strict() -> bool {
 /// update (Adam masters: same ptr, new fp on a resident entry) refreshes
 /// the resident buffer rather than demoting it. Transients never repeat
 /// a fingerprint, so they never occupy a byte past their own call.
+/// Do all of these fit as single storage buffers?
+///
+/// wgpu caps one buffer — 4 292 870 144 bytes on an A100 — and
+/// `create_buffer` treats a request over it as a FATAL validation error,
+/// not a recoverable one. A 248 320-vocab head in f32 is 5 085 593 600
+/// bytes, so baking a 27B panicked in the middle of phase A instead of
+/// declining to the host arm that was sitting right there.
+pub(crate) fn buffers_fit(max_buffer_size: u64, sizes: &[u64]) -> bool {
+    sizes.iter().all(|&s| s <= max_buffer_size)
+}
+
 fn bake_weight(c: &Ctx, w: &[f32], label: &'static str) -> wgpu::Buffer {
     let key = (w.as_ptr() as usize, w.len());
     let fp = fp_bytes(bytemuck::cast_slice(w));
@@ -38051,6 +38068,29 @@ pub fn conv1d_gemm(
     true
 }
 
+/// `gemm_nt_f32` for operands that change every call: `w` goes to a
+/// reused scratch buffer instead of the resident ledger, and its bytes
+/// are never fingerprinted. This is the shape the refit accumulation
+/// needs — `C[n, m] = X[n, k]·Wᵀ[k, m]` where both operands are fresh
+/// activations, not weights.
+pub fn gemm_nt_f32_transient(
+    x: &[f32],
+    w: &[f32],
+    y: &mut [f32],
+    n: usize,
+    k: usize,
+    m: usize,
+) -> bool {
+    TRANSIENT_W.with(|t| t.set(true));
+    let r = gemm_nt_f32(x, w, y, n, k, m);
+    TRANSIENT_W.with(|t| t.set(false));
+    r
+}
+
+thread_local! {
+    static TRANSIENT_W: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: usize) -> bool {
     if std::env::var("CMF_BAKE_GPU").as_deref() == Ok("0") || f32_strict() {
         return false;
@@ -38082,8 +38122,34 @@ pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: u
     if x.len() < n * k || w.len() < m * k || y.len() < n * m {
         return false;
     }
+    // Decline rather than die: see `buffers_fit`.
+    if !buffers_fit(
+        c.device.limits().max_buffer_size,
+        &[
+            (w.len() * 4) as u64,
+            (n * k * 4) as u64,
+            (n * m * 4) as u64,
+        ],
+    ) {
+        return false;
+    }
     let _bake = BAKE_LOCK.lock().unwrap();
-    let wbuf = bake_weight(c, w, "bake-w");
+    let transient = TRANSIENT_W.with(|t| t.get());
+    let wbuf = if transient {
+        let mut sc = c.scratch.lock().unwrap();
+        let b = Scratch::ensure(
+            &c.device,
+            &mut sc.bwt,
+            (w.len() * 4) as u64,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            "gemm-wt",
+        );
+        drop(sc);
+        c.queue.write_buffer(&b, 0, bytemuck::cast_slice(w));
+        b
+    } else {
+        bake_weight(c, w, "bake-w")
+    };
     let mut sc = c.scratch.lock().unwrap();
     let xbuf = Scratch::ensure(
         &c.device,
@@ -38628,6 +38694,13 @@ pub fn attn_chain_f32(
         || cfg.wo.len() < hsz * qdim
         || attn_out.len() < n * hsz
     {
+        return None;
+    }
+    // Same ceiling as the GEMM path — decline, do not die.
+    if !buffers_fit(
+        c.device.limits().max_buffer_size,
+        &[(cfg.wqkv.len() * 4) as u64, (cfg.wo.len() * 4) as u64],
+    ) {
         return None;
     }
     let _bake = BAKE_LOCK.lock().unwrap();
@@ -43719,4 +43792,34 @@ pub fn adapter_probe() -> bool {
         apply_limit_buckets: false,
     }))
     .is_ok()
+}
+
+#[cfg(test)]
+mod buffer_ceiling_tests {
+    use super::buffers_fit;
+
+    /// The exact numbers that killed a 27B bake mid-phase-A: an A100
+    /// caps one storage buffer at 4 292 870 144 bytes and the f32
+    /// embedding of a 248 320-token vocabulary at hidden 5120 is
+    /// 5 085 593 600. `create_buffer` calls that fatal, so the check has
+    /// to happen before the call.
+    #[test]
+    fn a_large_vocab_head_is_declined_not_fatal() {
+        const A100_MAX: u64 = 4_292_870_144;
+        let embed_f32 = 248_320u64 * 5120 * 4;
+        assert_eq!(embed_f32, 5_085_593_600);
+        assert!(!buffers_fit(A100_MAX, &[embed_f32]));
+        // The other operands of the same call are fine on their own —
+        // one oversized buffer is enough to decline the whole call.
+        assert!(!buffers_fit(A100_MAX, &[1024, embed_f32, 4096]));
+        assert!(buffers_fit(A100_MAX, &[1024, 4096]));
+    }
+
+    /// Exactly at the limit is allowed; one byte over is not.
+    #[test]
+    fn the_ceiling_is_inclusive() {
+        assert!(buffers_fit(100, &[100]));
+        assert!(!buffers_fit(100, &[101]));
+        assert!(buffers_fit(100, &[]));
+    }
 }
