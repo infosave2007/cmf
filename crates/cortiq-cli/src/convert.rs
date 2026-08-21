@@ -4953,6 +4953,78 @@ pub(crate) mod tests {
         assert_eq!(outb[1].1, [2.0, 3.0, 6.0, 7.0]);
     }
 
+    /// LFM2.5 states its mixer per layer in `layer_types`, spelling the
+    /// recurrent one `conv`. The header has to carry that verbatim: a
+    /// layer read as full attention would allocate a KV cache for a
+    /// mixer that has none, and the short-conv ring would never advance.
+    #[test]
+    fn lfm25_layer_types_and_conv_cache_reach_the_header() {
+        let cfg: serde_json::Value = serde_json::from_str(
+            r#"{
+            "model_type": "lfm2", "architectures": ["Lfm2ForCausalLM"],
+            "hidden_size": 1024, "num_hidden_layers": 6,
+            "num_attention_heads": 16, "num_key_value_heads": 8,
+            "intermediate_size": 2560, "vocab_size": 65536,
+            "norm_eps": 1e-5, "conv_L_cache": 3, "conv_bias": false,
+            "layer_types": ["conv","conv","full_attention","conv","full_attention","conv"],
+            "tie_word_embeddings": true
+        }"#,
+        )
+        .unwrap();
+        let arch = build_arch(&cfg).unwrap();
+        assert_eq!(arch.num_layers, 6);
+        for (i, t) in arch.layer_types.iter().enumerate() {
+            let want_full = i == 2 || i == 4;
+            assert_eq!(
+                matches!(t, cortiq_core::LayerType::FullAttention),
+                want_full,
+                "layer {i} attention kind"
+            );
+            assert_eq!(
+                matches!(t, cortiq_core::LayerType::ShortConv),
+                !want_full,
+                "layer {i} mixer kind"
+            );
+        }
+        // The ring is `conv_L_cache` deep; without it the conv reads
+        // whatever the state buffer happened to hold.
+        assert_eq!(arch.linear_conv_kernel_dim, Some(3));
+        assert!(arch.moe.is_none(), "the dense build has no experts");
+    }
+
+    /// The 8B-A1B build is the same mixer schedule with a routed FFN.
+    /// LFM2 routes with a sigmoid gate rather than a softmax over all
+    /// experts, and reading that wrong changes which experts fire.
+    #[test]
+    fn lfm25_moe_routes_with_a_sigmoid_gate() {
+        let cfg: serde_json::Value = serde_json::from_str(
+            r#"{
+            "model_type": "lfm2_moe", "architectures": ["Lfm2MoeForCausalLM"],
+            "hidden_size": 2048, "num_hidden_layers": 4,
+            "num_attention_heads": 32, "num_key_value_heads": 8,
+            "intermediate_size": 7168, "vocab_size": 128000,
+            "norm_eps": 1e-5, "conv_L_cache": 3,
+            "layer_types": ["conv","conv","full_attention","conv"],
+            "num_experts": 32, "num_experts_per_tok": 4,
+            "moe_intermediate_size": 1792, "norm_topk_prob": true,
+            "routed_scaling_factor": 1.0,
+            "tie_word_embeddings": true
+        }"#,
+        )
+        .unwrap();
+        let arch = build_arch(&cfg).unwrap();
+        let moe = arch.moe.as_ref().expect("num_experts → MoE");
+        assert_eq!(moe.num_experts, 32);
+        assert_eq!(moe.top_k, 4);
+        assert_eq!(moe.moe_intermediate_size, 1792);
+        assert!(moe.router_sigmoid, "lfm2 routes with a sigmoid gate");
+        assert!(moe.norm_topk_prob);
+        // A scale of exactly 1.0 is the no-op default and must not ride
+        // in the header as if it were a correction.
+        assert!(moe.routed_scaling_factor.is_none());
+        assert_eq!(arch.linear_conv_kernel_dim, Some(3));
+    }
+
     #[test]
     fn lfm2_names_map_to_canonical_layout() {
         // Conv (dense) layer 0.

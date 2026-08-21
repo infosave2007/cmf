@@ -183,6 +183,56 @@ fn find_prepend_scheme(pt: &serde_json::Value) -> Option<String> {
     None
 }
 
+/// Neutralise `{% generation %}` / `{% endgeneration %}`.
+///
+/// Transformers uses that pair to mark which span of the render is the
+/// assistant's own tokens, so a trainer can build a loss mask. For
+/// INFERENCE it is transparent — the body renders either way — but
+/// minijinja does not know the statement and fails the whole template,
+/// after which the caller quietly serves a ChatML approximation and the
+/// model answers a differently-shaped prompt than the one it was tuned
+/// on. LiquidAI's LFM2.5 templates use it.
+///
+/// Deleting the tag is not enough: `{%- generation -%}` also carries
+/// whitespace control, and dropping it would leave the newline and the
+/// indentation around it in the output. Each tag becomes an assignment
+/// that does nothing, carrying the SAME dashes, so minijinja trims
+/// exactly what the original would have.
+pub(crate) fn strip_generation_tags(tpl: &str) -> std::borrow::Cow<'_, str> {
+    if !tpl.contains("generation") {
+        return std::borrow::Cow::Borrowed(tpl);
+    }
+    let mut out = String::with_capacity(tpl.len());
+    let mut rest = tpl;
+    let mut touched = false;
+    while let Some(open) = rest.find("{%") {
+        let Some(close_rel) = rest[open..].find("%}") else {
+            break;
+        };
+        let close = open + close_rel + 2;
+        let tag = &rest[open..close];
+        let inner = tag[2..tag.len() - 2].trim();
+        let lead = inner.starts_with('-');
+        let trail = inner.ends_with('-');
+        let name = inner.trim_matches('-').trim();
+        out.push_str(&rest[..open]);
+        if name == "generation" || name == "endgeneration" {
+            out.push_str(if lead { "{%-" } else { "{%" });
+            out.push_str(" set _generation_span = true ");
+            out.push_str(if trail { "-%}" } else { "%}" });
+            touched = true;
+        } else {
+            out.push_str(tag);
+        }
+        rest = &rest[close..];
+    }
+    if !touched {
+        return std::borrow::Cow::Borrowed(tpl);
+    }
+    out.push_str(rest);
+    std::borrow::Cow::Owned(out)
+}
+
 impl Tokenizer {
     /// Load tokenizer from HuggingFace tokenizer.json file.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, TokenizerError> {
@@ -861,7 +911,8 @@ impl Tokenizer {
             }
             String::new()
         });
-        env.add_template("chat", tpl)?;
+        let tpl_src = strip_generation_tags(tpl);
+        env.add_template("chat", &tpl_src)?;
         let msgs: Vec<minijinja::Value> = messages
             .iter()
             .map(minijinja::Value::from_serialize)
@@ -956,7 +1007,8 @@ impl Tokenizer {
         env.set_lstrip_blocks(true);
         // HF templates use python string methods (.startswith, .strip…).
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-        env.add_template("chat", tpl)?;
+        let tpl_src = strip_generation_tags(tpl);
+        env.add_template("chat", &tpl_src)?;
         let msgs: Vec<minijinja::Value> = messages
             .iter()
             .map(|(role, content)| {
@@ -1217,5 +1269,47 @@ mod tests {
         // the id list may be empty, but ASCII around it must survive.
         let ids = tok.encode("hello");
         assert!(!ids.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod generation_tag_tests {
+    use super::strip_generation_tags;
+
+    /// LFM2.5's template wraps the assistant branch in `{%- generation -%}`.
+    /// minijinja does not know the statement, the whole template failed,
+    /// and the caller served a ChatML approximation instead — the model
+    /// then answers a differently-shaped prompt than it was tuned on.
+    #[test]
+    fn a_generation_block_becomes_a_no_op_keeping_its_whitespace_control() {
+        let tpl = "a{%- generation -%}b{%- endgeneration -%}c";
+        let out = strip_generation_tags(tpl);
+        assert!(!out.contains("{%- generation"));
+        assert!(!out.contains("endgeneration"));
+        // Both dashes survive on both tags: the trimming must not change.
+        assert_eq!(out.matches("{%-").count(), 2);
+        assert_eq!(out.matches("-%}").count(), 2);
+        assert!(out.starts_with('a') && out.ends_with('c'));
+    }
+
+    /// Whitespace control is per-side, and a tag without dashes must not
+    /// grow any.
+    #[test]
+    fn each_side_keeps_its_own_dash() {
+        let out = strip_generation_tags("{% generation %}x{%- endgeneration %}");
+        assert!(out.starts_with("{% set"), "no dash added on the left");
+        assert!(out.contains("{%- set"), "the right tag keeps its dash");
+        assert!(!out.contains("-%}"), "no trailing dash invented");
+    }
+
+    /// Templates that never use it are returned untouched, and other
+    /// statements are never rewritten.
+    #[test]
+    fn everything_else_is_left_alone() {
+        let plain = "{%- if x -%}{{ y }}{%- endif -%}";
+        assert_eq!(strip_generation_tags(plain), plain);
+        // The word appearing in TEXT is not a statement.
+        let prose = "{{ 'the generation of tokens' }}";
+        assert_eq!(strip_generation_tags(prose), prose);
     }
 }
