@@ -1733,6 +1733,35 @@ fn gdn_conv(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 }
 
+// LFM2 gated short-conv decode step (the mixer 22 of an LFM2.5-2.6B's 30
+// layers are). Reuses gdn_conv's binding set so the module stays valid by
+// construction: gc_qkv = bcx [B | C | x] (3h), gc_taps = [h·k] channel-major
+// taps, gc_ring = the ring in the HOST layout ([channel][k-1], slot 0
+// newest — the seed comes from kv_cache.linear_state without repacking),
+// gc_cq = y out (h), gc_p: cdim = h, kk = k, xoff unused. One thread per
+// channel; y = C · (tap[k-1]·B·x + Σ tap[k-2-s]·ring[s]), then the shift.
+@compute @workgroup_size(256)
+fn sconv_step(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let ch = gid.x;
+    let h = gc_p.cdim;
+    if (ch >= h) { return; }
+    let k = gc_p.kk;
+    let ring = k - 1u;
+    let bx = gc_qkv[ch] * gc_qkv[2u * h + ch];
+    let tb = ch * k;
+    var acc = gc_taps[tb + k - 1u] * bx;
+    for (var s = 0u; s < ring; s = s + 1u) {
+        acc = acc + gc_taps[tb + k - 2u - s] * gc_ring[ch * ring + s];
+    }
+    gc_cq[ch] = gc_qkv[h + ch] * acc;
+    var j = ring;
+    while (j > 1u) {
+        j = j - 1u;
+        gc_ring[ch * ring + j] = gc_ring[ch * ring + j - 1u];
+    }
+    if (ring > 0u) { gc_ring[ch * ring] = bx; }
+}
+
 // ── GDN (gated DeltaNet / linear attention) decode step ──────────────────
 // One workgroup per v-head. From the conv output cq it l2-norms q/k, forms the
 // decay g and gate β, runs the delta-rule state recurrence S ← g·S + kf⊗β(v −
@@ -12530,6 +12559,7 @@ struct Ctx {
     big_attend: bool,
     gdn_step: wgpu::ComputePipeline,
     gdn_conv: wgpu::ComputePipeline,
+    sconv_step: wgpu::ComputePipeline,
     f32_matvec: wgpu::ComputePipeline,
     f32_matvec_b: wgpu::ComputePipeline,
     layout_f32b: wgpu::BindGroupLayout,
@@ -12617,6 +12647,7 @@ struct Ctx {
     layout_attend_merge: wgpu::BindGroupLayout,
     layout_gdn: wgpu::BindGroupLayout,
     layout_gdn_conv: wgpu::BindGroupLayout,
+    layout_sconv: wgpu::BindGroupLayout,
     layout_f32: wgpu::BindGroupLayout,
     layout_silu_down: wgpu::BindGroupLayout,
     layout_moe_sel: wgpu::BindGroupLayout,
@@ -12893,6 +12924,9 @@ struct GraphScratch {
     abuf: Option<(wgpu::Buffer, u64)>,
     // GDN intermediates
     qkv_b: Option<(wgpu::Buffer, u64)>,
+    // Short-conv intermediates: the fused (B,C,x) projection and the gated y
+    sc_bcx: Option<(wgpu::Buffer, u64)>,
+    sc_y: Option<(wgpu::Buffer, u64)>,
     cq_b: Option<(wgpu::Buffer, u64)>,
     z_b: Option<(wgpu::Buffer, u64)>,
     a_b: Option<(wgpu::Buffer, u64)>,
@@ -13701,6 +13735,8 @@ fn init(dev: usize) -> Result<Ctx, String> {
     };
     let gdn_step = pipe("gdn_step");
     let gdn_conv = pipe("gdn_conv");
+    let sconv_step = pipe("sconv_step");
+    let layout_sconv = sconv_step.get_bind_group_layout(0);
     let f32_matvec = pipe("f32_matvec");
     let f32_matvec_b = pipe("f32_matvec_b");
     let layout_f32b = f32_matvec_b.get_bind_group_layout(0);
@@ -14037,6 +14073,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         big_attend,
         gdn_step,
         gdn_conv,
+        sconv_step,
         f32_matvec,
         f32_matvec_b,
         layout_f32b,
@@ -14108,6 +14145,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         layout_attend_merge,
         layout_gdn,
         layout_gdn_conv,
+        layout_sconv,
         layout_f32,
         layout_silu_down,
         layout_moe_sel,
@@ -16175,6 +16213,11 @@ pub fn forward_token_graph(
             wv: GMat,
             wo: GMat,
         },
+        Conv {
+            inp: GMat,
+            out: GMat,
+            kernel: usize,
+        },
         Gdn {
             qkv: GMat,
             z: GMat,
@@ -16418,6 +16461,22 @@ pub fn forward_token_graph(
                     dv: *dv,
                     kk: *kk,
                     cdim,
+                }
+            }
+            crate::gpu::GraphAttn::ShortConv {
+                inp, out, kernel, ..
+            } => {
+                let (Some(inp), Some(out)) = (
+                    resolve(inp, 3 * hidden, hidden),
+                    resolve(out, hidden, hidden),
+                ) else {
+                    graph_decline("short-conv resolve (dtype outside graph contract)");
+                    return false;
+                };
+                LAttn::Conv {
+                    inp,
+                    out,
+                    kernel: *kernel,
                 }
             }
         };
@@ -16714,6 +16773,15 @@ pub fn forward_token_graph(
         st,
         "g-gdo",
     );
+    let sc_bcx = GraphScratch::ensure(
+        &c.device,
+        &mut gs.sc_bcx,
+        (3 * hidden * 4) as u64,
+        st,
+        "g-scbcx",
+    );
+    let sc_y =
+        GraphScratch::ensure(&c.device, &mut gs.sc_y, (hidden * 4) as u64, st, "g-scy");
     // Sync each Full layer's device K/V mirror from the CPU cache (once);
     // GDN layers carry a persistent (ring, S) recurrent state instead.
     let mut kvbufs: Vec<Option<(wgpu::Buffer, wgpu::Buffer)>> = Vec::with_capacity(layers.len());
@@ -16810,6 +16878,38 @@ pub fn forward_token_graph(
                             );
                         }
                         (ring, sbuf)
+                    });
+                    gdnbufs.push(Some((e.0.clone(), e.1.clone())));
+                    kvbufs.push(None);
+                }
+                crate::gpu::GraphAttn::ShortConv {
+                    kernel, cpu_state, ..
+                } => {
+                    // The conv ring rides the same state map as GDN; the
+                    // second buffer of the pair is a 4-byte placeholder.
+                    let ring_sz = ((kernel.saturating_sub(1)) * hidden * 4) as u64;
+                    let e = gsm.entry((kv_id, layer_base + li)).or_insert_with(|| {
+                        let mk = |sz: u64| {
+                            let bf = c.device.create_buffer(&wgpu::BufferDescriptor {
+                                label: Some("sconv-ring"),
+                                size: sz.max(4),
+                                usage: wgpu::BufferUsages::STORAGE
+                                    | wgpu::BufferUsages::COPY_DST
+                                    | wgpu::BufferUsages::COPY_SRC,
+                                mapped_at_creation: false,
+                            });
+                            c.queue.write_buffer(&bf, 0, &vec![0u8; sz.max(4) as usize]);
+                            bf
+                        };
+                        let ring = mk(ring_sz);
+                        // Prefill always runs on the host for this mixer
+                        // (the batch graph declines it), so the CPU ring is
+                        // the truth at the first decode token. Layout is
+                        // the host's: [channel][kernel-1], slot 0 newest.
+                        if cpu_state.len() * 4 == ring_sz as usize && !cpu_state.is_empty() {
+                            c.queue.write_buffer(&ring, 0, bytemuck::cast_slice(*cpu_state));
+                        }
+                        (ring, mk(4))
                     });
                     gdnbufs.push(Some((e.0.clone(), e.1.clone())));
                     kvbufs.push(None);
@@ -18122,6 +18222,29 @@ pub fn forward_token_graph(
                         emat(&mut enc, out, &gdo_b, &ob, hidden, nv * dv);
                     }
                 }
+                (
+                    LAttn::Conv { inp, out, kernel },
+                    crate::gpu::GraphAttn::ShortConv { taps, .. },
+                ) => {
+                    let (ring, _) = gdnbufs[li].as_ref().unwrap();
+                    let taps_b = stor(bytemuck::cast_slice(*taps));
+                    // GcP reused verbatim: cdim = hidden, kk = kernel.
+                    let sc_u = uniform_u32x4(c, [hidden as u32, *kernel as u32, 0, 0]);
+                    emat(&mut enc, inp, &n1, &sc_bcx, 3 * hidden, hidden);
+                    let bg_sc = bgc(
+                        33,
+                        li,
+                        &c.layout_sconv,
+                        &[&sc_bcx, &taps_b, ring, &sc_y, &sc_u],
+                    );
+                    {
+                        let mut pass = begin_pass(&mut enc);
+                        pass.set_pipeline(&c.sconv_step);
+                        pass.set_bind_group(0, &bg_sc, &[]);
+                        pass.dispatch_workgroups((hidden as u32).div_ceil(256), 1, 1);
+                    }
+                    emat(&mut enc, out, &sc_y, &ob, hidden, hidden);
+                }
                 _ => return false,
             }
             ts!(enc, 1, lkind);
@@ -19340,6 +19463,11 @@ pub fn forward_batch_graph(
                     cdim,
                 }
             }
+            crate::gpu::GraphAttn::ShortConv { .. } => {
+                // The batch (prefill) graph has no conv-ring kernel that
+                // walks positions in order yet; prefill stays per-op.
+                return false;
+            }
         };
         let bffn = match &l.ffn {
             crate::gpu::GraphFfn::Dense {
@@ -19579,6 +19707,13 @@ pub fn forward_batch_graph(
                     });
                     gdnbufs.push(Some((e.0.clone(), e.1.clone())));
                     kvbufs.push(None);
+                }
+                crate::gpu::GraphAttn::ShortConv { .. } => {
+                    // Unreachable: the batch resolve declined this mixer
+                    // above. Kept explicit so a future prefill kernel has
+                    // to think about the ring, not inherit a None.
+                    kvbufs.push(None);
+                    gdnbufs.push(None);
                 }
             }
         }

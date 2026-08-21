@@ -6381,6 +6381,18 @@ impl Pipeline {
                         cpu_state: &self.kv_cache.layers[self.phys_layer(li)].linear_state,
                     }
                 }
+                AttnKind::ShortConv(w) => {
+                    let cfg = self.short_conv_cfg?;
+                    let (m, _, _, _) = w.in_proj.graph_weight()?;
+                    model = Some(m.clone());
+                    crate::gpu::GraphAttn::ShortConv {
+                        inp: gw(&w.in_proj)?,
+                        out: gw(&w.out_proj)?,
+                        taps: &w.conv,
+                        kernel: cfg.kernel,
+                        cpu_state: &self.kv_cache.layers[self.phys_layer(li)].linear_state,
+                    }
+                }
                 _ => return None,
             };
             layers.push(crate::gpu::GraphLayer {
@@ -9518,6 +9530,10 @@ fn dense_ffn(d: &DenseFfn, x: &[f32], pool: Option<&Pool>) -> Vec<f32> {
                     crate::gpu::probe_record(crate::gpu::OpClass::Ffn, true, t0.elapsed());
                     return out;
                 }
+                // Declined: no timing exists, so say so. Silence here is
+                // what left `ffn` undecided for 9000 calls and cost a
+                // failed device attempt on half of them.
+                crate::gpu::probe_note_decline(crate::gpu::OpClass::Ffn);
             }
             crate::gpu::ProbeArm::CpuTimed => {
                 let t0 = std::time::Instant::now();

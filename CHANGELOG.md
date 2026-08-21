@@ -17,6 +17,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   about what an M4 has. So 0.5.96's win does not port to Macs, and the lever
   there is fewer tokens (`--upscale`, `--stream-chunk`), not a faster GEMM.
 
+## [0.5.98] - 2026-08-21
+
+One graph arm. LFM2.5's mixer — a gated short convolution — had no entry in
+the whole-token wgpu graph, so the graph refused the entire model and every
+token fell to the per-op path: ~100 submits at ~0.4 ms each, 18.5 tok/s on an
+A100 for a 1.4 GB file, 1.6% of the card's bandwidth.
+
+### Added
+- **The whole-token graph runs LFM2's short-conv mixer.** The conv ring lives
+  on the device in the host's own layout (`[channel][kernel−1]`, slot 0
+  newest), seeded from the CPU state at the first decode token — prefill
+  stays per-op, so the CPU ring is the truth there. The step kernel reuses
+  `gdn_conv`'s binding set, and the two projections ride the graph's
+  existing quantized matvec. Measured on an A100 (Vulkan, steady decode):
+  LFM2.5-230M 39.0 → **390.6 tok/s**, LFM2.5-2.6B 18.5 → **141.3 tok/s**.
+  The MoE build (LFM2.5-8B-A1B) still declines the graph — its
+  sigmoid-with-bias router is not graphed yet — and stays on the honest
+  per-op path.
+- **A probe class whose device arm always declines now settles on the host.**
+  A decline carries no timing, so nothing was recorded and the class could
+  never decide — `ffn` was still undecided after 9000 calls on an M4,
+  alternating arms and paying a failed device attempt on half of them
+  (83.55 ms a token against 41.85 with the device off). Sixteen declines
+  close the class.
+- LFM2.5 support end to end: `Lfm2ForCausalLM` / `Lfm2MoeForCausalLM`
+  convert as before, and the chat template's `{% generation %}` /
+  `{% endgeneration %}` markers — a transformers training-mask extension
+  minijinja does not know — are neutralised with their whitespace control
+  preserved, instead of failing the render and silently serving a ChatML
+  approximation of a differently-shaped prompt.
+
 ## [0.5.97] - 2026-08-21
 
 A 27B specialist bake was attempted on rented hardware three times and died

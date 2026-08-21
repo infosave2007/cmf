@@ -333,6 +333,11 @@ pub enum ProbeArm {
 /// Clean samples per arm before a class decides.
 const PROBE_SAMPLES: u32 = 6;
 
+/// Declines before a class gives the work to the host for good. High
+/// enough that a transient refusal — an unsealed state during prefill, a
+/// shape the kernel skips this once — cannot settle the question.
+const PROBE_DECLINE_LIMIT: u32 = 16;
+
 /// Device samples discarded before any count — see `Probe::gpu_burn`.
 const PROBE_WARMUP: u32 = 1;
 
@@ -342,6 +347,16 @@ struct Probe {
     flip: AtomicU32,
     gpu_ns: AtomicU64,
     gpu_n: AtomicU32,
+    /// Times the device arm was chosen and the device DECLINED.
+    ///
+    /// A decline carries no timing, so nothing is recorded — and a class
+    /// whose device path always refuses therefore never reaches a
+    /// verdict, alternates arms forever, and pays a failed device
+    /// attempt on half of every token's calls. Measured on an M4 with
+    /// LFM2.5-2.6B: `ffn` was still undecided after 9000 calls, and a
+    /// token cost 83.55 ms against 41.85 with the device off — twice the
+    /// price for work the host did anyway.
+    declines: AtomicU32,
     /// GPU samples still to discard as warm-up.
     ///
     /// The cold flag catches buffer and weight uploads, but a compute
@@ -374,6 +389,7 @@ impl Probe {
             flip: AtomicU32::new(0),
             gpu_ns: AtomicU64::new(0),
             gpu_n: AtomicU32::new(0),
+            declines: AtomicU32::new(0),
             gpu_burn: AtomicU32::new(PROBE_WARMUP),
             cpu_ns: AtomicU64::new(0),
             cpu_n: AtomicU32::new(0),
@@ -528,6 +544,27 @@ pub fn probe_arm(c: OpClass) -> ProbeArm {
                 ProbeArm::CpuTimed
             }
         }
+    }
+}
+
+/// The device arm was chosen and the device refused the work, so there
+/// is no time to record. Callers that fall through to the host MUST say
+/// so here, or the class can never decide.
+pub fn probe_note_decline(c: OpClass) {
+    let p = &PROBES[c as usize];
+    if p.state.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    let n = p.declines.fetch_add(1, Ordering::Relaxed) + 1;
+    if n >= PROBE_DECLINE_LIMIT
+        && p.state
+            .compare_exchange(0, 2, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        tracing::info!(
+            "gpu probe [{}]: device declined {n} times → cpu",
+            CLASS_NAMES[c as usize]
+        );
     }
 }
 
@@ -1243,6 +1280,26 @@ pub enum GraphAttn<'a> {
         /// device mirror when prefill ran on the host (o1 collection, CPU
         /// fallback): a zero-initialized device state at decode is exactly
         /// the "coherent but contextless" garble.
+        cpu_state: &'a [f32],
+    },
+    /// LFM2 gated short convolution: a fused (B, C, x) projection, a
+    /// depthwise causal conv over a (kernel−1)-deep per-channel ring,
+    /// C-gating, and an output projection. This mixer is what most of an
+    /// LFM2 stack is (22 of the 2.6B's 30 layers), and before it had a
+    /// graph arm the whole model fell to the per-op path — ~100 submits
+    /// a token, 22 tok/s on an A100 for a 1.4 GB file.
+    ShortConv {
+        /// [3·hidden, hidden] fused input projection.
+        inp: GraphW<'a>,
+        /// [hidden, hidden] output projection.
+        out: GraphW<'a>,
+        /// [hidden · kernel] depthwise taps, `[channel][tap]`, tap
+        /// kernel−1 multiplying the current position.
+        taps: &'a [f32],
+        kernel: usize,
+        /// CPU conv ring `[channel][kernel−1]`, slot 0 newest — seeds
+        /// the device mirror when prefill ran on the host, which for
+        /// this mixer is always (the batch graph declines it).
         cpu_state: &'a [f32],
     },
 }
@@ -2838,6 +2895,35 @@ mod probe_warmup_tests {
             7,
             "one sample burned, the rest counted"
         );
+    }
+
+    /// A device path that always refuses records no timing, so without
+    /// counting the refusals the class can never reach a verdict. On an
+    /// M4 with LFM2.5-2.6B `ffn` was still undecided after 9000 calls,
+    /// alternating arms and paying a failed device attempt on half of
+    /// them.
+    #[test]
+    fn a_class_whose_device_always_declines_settles_on_the_host() {
+        // A class no other test in this file touches: `probe_note_decline`
+        // works on the process-wide probes by design, and the tests in
+        // this binary share them.
+        let c = OpClass::MatmatWide;
+        let p = &PROBES[c as usize];
+        p.state.store(0, Ordering::Relaxed);
+        p.declines.store(0, Ordering::Relaxed);
+        for _ in 0..(PROBE_DECLINE_LIMIT - 1) {
+            probe_note_decline(c);
+        }
+        assert_eq!(
+            p.state.load(Ordering::Relaxed),
+            0,
+            "one short of the limit is still a question, not an answer"
+        );
+        probe_note_decline(c);
+        assert_eq!(p.state.load(Ordering::Relaxed), 2, "settled on the host");
+        assert!(matches!(probe_arm(c), ProbeArm::Cpu));
+        p.state.store(0, Ordering::Relaxed);
+        p.declines.store(0, Ordering::Relaxed);
     }
 
     /// A genuinely slower device still loses — the warm-up removes an

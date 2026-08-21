@@ -483,6 +483,8 @@ pub fn gdn_forward(
                     w.in_proj_a.matvec(x, &mut a, pool);
                     w.in_proj_b.matvec(x, &mut b, pool);
                     done = true;
+                } else {
+                    crate::gpu::probe_note_decline(crate::gpu::OpClass::Batch);
                 }
             }
             crate::gpu::ProbeArm::CpuTimed => {

@@ -760,7 +760,14 @@ fn project_matvecs(
                     );
                     if done {
                         crate::gpu::probe_record(crate::gpu::OpClass::Batch, true, t0.elapsed());
+                    } else {
+                        crate::gpu::probe_note_decline(crate::gpu::OpClass::Batch);
                     }
+                } else {
+                    // No batch job could be built for these weights —
+                    // structural, and silence would leave the class
+                    // alternating for the life of the process.
+                    crate::gpu::probe_note_decline(crate::gpu::OpClass::Batch);
                 }
             }
             crate::gpu::ProbeArm::CpuTimed => {
