@@ -8,9 +8,6 @@ members = [
     "crates/cortiq-ffi",
     "crates/cortiq-embryo",
 ]
-# The tensor-core probe builds on its own: it pulls in ash, which the
-# engine does not, and it only runs where a Vulkan 1.3 driver is present.
-exclude = ["tools/vkcoop"]
 resolver = "2"
 
 # Roadmap §5: portable release stays the default; LTO + single codegen
