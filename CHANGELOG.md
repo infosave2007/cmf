@@ -17,6 +17,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   about what an M4 has. So 0.5.96's win does not port to Macs, and the lever
   there is fewer tokens (`--upscale`, `--stream-chunk`), not a faster GEMM.
 
+## [0.5.99] - 2026-08-21
+
+The other half of 0.5.98: LFM2.5's MoE build now rides the whole-token graph
+too. Its router is sigmoid-scored with a per-expert selection bias and no
+shared expert — three things the graph's select kernel did not speak, so the
+whole model declined to the per-op path at 14.6 tok/s on an A100.
+
+### Added
+- **Sigmoid routing with a selection bias in the graph's MoE select.** The
+  ranking key and the mixing weight are kept apart — the bias ranks the
+  top-k choice and never touches the weights (noaux_tc), renormalisation
+  uses the 1e-6 floor, and a model without a shared expert leaves the
+  shared slot unwritten instead of requiring one. The softmax arm is
+  bit-for-bit the old behaviour, and the subgroup fast-select only runs on
+  the plain contract. LFM2.5-8B-A1B on an A100: 14.6 → **123.5 tok/s**,
+  output token-identical to the CPU path over greedy runs.
+
+With 0.5.98's short-conv arm this closes the family: 230M ×10, 2.6B ×7.6,
+8B-A1B ×8.5, all on the same file the CPU path reads.
+
 ## [0.5.98] - 2026-08-21
 
 One graph arm. LFM2.5's mixer — a gated short convolution — had no entry in

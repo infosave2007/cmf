@@ -7168,7 +7168,15 @@ struct MoeSelP { n_exp: u32, top_k: u32, norm: u32, pk: u32 };
 @group(0) @binding(4) var<uniform>             ms_p     : MoeSelP;
 @group(0) @binding(5) var<storage, read>       ms_sgw   : array<u32>;
 @group(0) @binding(6) var<storage, read>       ms_x     : array<f32>;
+// Per-expert SELECTION bias (noaux_tc): ranks the top-k choice, never the
+// mixing weights. A 4-byte dummy rides here when the model has none.
+@group(0) @binding(7) var<storage, read>       ms_bias  : array<f32>;
 var<workgroup> ms_lg:  array<f32, 256>;
+// The per-expert mixing score: softmax prob or sigmoid, depending on
+// `norm` bit 1. Kept apart from ms_lg because with a bias the RANKING
+// key and the WEIGHT differ, and conflating them is exactly the noaux_tc
+// mistake.
+var<workgroup> ms_sc:  array<f32, 256>;
 var<workgroup> ms_red: array<f32, 256>;
 var<workgroup> ms_ri:  array<u32, 256>;
 var<workgroup> ms_pick: u32;
@@ -7233,6 +7241,26 @@ fn moe_select(@builtin(local_invocation_index) lid: u32) {
     }
     let denom = ms_red[0];
     workgroupBarrier();
+    // norm word: bit0 renorm, bit1 sigmoid scores, bit2 selection bias,
+    // bit3 shared expert present. Softmax models pass 0/1, so every bit
+    // pattern the old contract could send decodes to the old behaviour.
+    let mflags = ms_p.norm;
+    let msig = (mflags & 2u) != 0u;
+    var msc = 0.0;
+    if (lid < n) {
+        if (msig) {
+            msc = 1.0 / (1.0 + exp(-v));
+        } else {
+            msc = exp(v - mx) / denom;
+        }
+    }
+    ms_sc[lid] = msc;
+    if (msig) {
+        var mkey = msc;
+        if ((mflags & 4u) != 0u && lid < n) { mkey = mkey + ms_bias[lid]; }
+        ms_lg[lid] = select(-3.0e38, mkey, lid < n);
+    }
+    workgroupBarrier();
     let k = ms_p.top_k;
     var wsum = 0.0;
     for (var slot = 0u; slot < k; slot = slot + 1u) {
@@ -7258,20 +7286,25 @@ fn moe_select(@builtin(local_invocation_index) lid: u32) {
         if (lid == 0u) {
             let bi = ms_ri[0];
             ms_sel[slot] = bi;
-            ms_w[slot] = exp(ms_red[0] - mx) / denom;
+            ms_w[slot] = ms_sc[bi];
             ms_pick = bi;
         }
         workgroupBarrier();
-        wsum = wsum + exp(ms_red[0] - mx) / denom;
+        wsum = wsum + ms_sc[ms_ri[0]];
         if (lid == ms_pick) { ms_lg[lid] = -3.0e38; }
         workgroupBarrier();
     }
     if (lid == 0u) {
-        if (ms_p.norm != 0u) {
-            for (var slot = 0u; slot < k; slot = slot + 1u) { ms_w[slot] = ms_w[slot] / wsum; }
+        if ((mflags & 1u) != 0u) {
+            // LFM2 floors the denominator (HF's + 1e-6); softmax probs
+            // already sum near 1 and keep the bare sum, as before.
+            let dn = select(wsum, wsum + 1e-6, msig);
+            for (var slot = 0u; slot < k; slot = slot + 1u) { ms_w[slot] = ms_w[slot] / dn; }
         }
-        ms_sel[k] = n;
-        ms_w[k] = 1.0 / (1.0 + exp(-ms_sg));
+        if ((mflags & 8u) != 0u) {
+            ms_sel[k] = n;
+            ms_w[k] = 1.0 / (1.0 + exp(-ms_sg));
+        }
     }
 }
 
@@ -16201,6 +16234,7 @@ pub fn forward_token_graph(
     let t_start = std::time::Instant::now();
     // A resolved matvec weight: the device-local buffer, (q8 only) its row
     // scales, and the codec kind (0=q8_row 1=q1 2=q4_block 3=q1t 4=f32 5=q4_tiled).
+    #[derive(Clone)]
     struct GMat {
         buf: wgpu::Buffer,
         rs: Option<wgpu::Buffer>,
@@ -16256,6 +16290,9 @@ pub fn forward_token_graph(
             norm_topk: bool,
             q4tp: bool,
             gu_q2: bool,
+            sigmoid: bool,
+            bias: Option<wgpu::Buffer>,
+            has_shared: bool,
         },
     }
     struct LW {
@@ -16516,22 +16553,35 @@ pub fn forward_token_graph(
                 norm_topk,
                 q4tp,
                 gu_q2,
+                sigmoid,
+                bias,
+                has_shared,
             } => {
                 // Select kernel: logits live in a 256-slot workgroup array;
-                // slot top_k+1 holds the shared expert.
-                if *top_k >= 16 || *n_exp > 256 || experts.len() != n_exp + 1 {
+                // with a shared expert it rides as the last block.
+                let want = n_exp + usize::from(*has_shared);
+                if *top_k >= 16 || *n_exp > 256 || experts.len() != want {
                     graph_decline(&format!(
-                        "moe shape: top_k {top_k} n_exp {n_exp} experts {}",
+                        "moe shape: top_k {top_k} n_exp {n_exp} experts {} (want {want})",
                         experts.len()
                     ));
                     return false;
                 }
-                let (Some(router), Some(sgate)) = (
-                    resolve(router, *n_exp, hidden),
-                    resolve(shared_gate, 1, hidden),
-                ) else {
-                    graph_decline("moe router/shared_gate resolve");
+                let Some(router) = resolve(router, *n_exp, hidden) else {
+                    graph_decline("moe router resolve");
                     return false;
+                };
+                // Without a shared expert there is no gate to resolve; the
+                // kernel never reads it (flags bit 3 off), so the router
+                // stands in to keep the binding set total.
+                let sgate = if *has_shared {
+                    let Some(sg) = resolve(shared_gate, 1, hidden) else {
+                        graph_decline("moe shared_gate resolve");
+                        return false;
+                    };
+                    sg
+                } else {
+                    router.clone()
                 };
                 // Over budget with layers already built: end the prefix
                 // here. Layer zero over budget keeps the historical loud
@@ -16573,6 +16623,16 @@ pub fn forward_token_graph(
                     norm_topk: *norm_topk,
                     q4tp: *q4tp,
                     gu_q2: *gu_q2,
+                    sigmoid: *sigmoid,
+                    bias: bias.map(|b| {
+                        c.device
+                            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                label: Some("moe-sel-bias"),
+                                contents: bytemuck::cast_slice(b),
+                                usage: wgpu::BufferUsages::STORAGE,
+                            })
+                    }),
+                    has_shared: *has_shared,
                 }
             }
         };
@@ -18567,6 +18627,9 @@ pub fn forward_token_graph(
                     norm_topk,
                     q4tp,
                     gu_q2,
+                    sigmoid,
+                    bias,
+                    has_shared,
                 } => {
                     // The WHOLE MoE FFN — router + shared-gate matvecs, top-k
                     // select, fused gate+up+SiLU over the selected experts, and
@@ -18576,7 +18639,7 @@ pub fn forward_token_graph(
                     // uses), and the inter-pass pipeline flush (~78 µs on
                     // NVIDIA Vulkan) is what dominates a 40-layer decode.
                     let (mlogit, mslog, msel, mwt, mact) = moe_bufs.as_ref().unwrap();
-                    let slots = *top_k + 1;
+                    let slots = *top_k + usize::from(*has_shared);
                     // sg_kind = 4 tells the select kernel to compute the shared
                     // gate itself; then the sgate matvec below is not encoded.
                     let sg_fold = sgate.kind == 4;
@@ -18588,7 +18651,14 @@ pub fn forward_token_graph(
                         [
                             *n_exp as u32,
                             *top_k as u32,
-                            *norm_topk as u32,
+                            // One flags word: bit0 renorm, bit1 sigmoid
+                            // scores, bit2 selection bias, bit3 shared
+                            // expert present. Softmax models pass 0/1
+                            // exactly as before.
+                            u32::from(*norm_topk)
+                                | (u32::from(*sigmoid) << 1)
+                                | (u32::from(bias.is_some()) << 2)
+                                | (u32::from(*has_shared) << 3),
                             ((hidden as u32) << 8) | (u32::from(sg_fold) * 4),
                         ],
                     );
@@ -18664,9 +18734,17 @@ pub fn forward_token_graph(
                             &c.layout_moe_dn,
                         )
                     };
+                    let bias_buf = bias.clone().unwrap_or_else(|| {
+                        c.device
+                            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                label: Some("moe-sel-bias0"),
+                                contents: &[0u8; 4],
+                                usage: wgpu::BufferUsages::STORAGE,
+                            })
+                    });
                     let bg_sel = bg(
                         &c.layout_moe_sel,
-                        &[mlogit, mslog, msel, mwt, &sel_u, &sgate.buf, &n1],
+                        &[mlogit, mslog, msel, mwt, &sel_u, &sgate.buf, &n1, &bias_buf],
                     );
                     let bg_sel_sg = c.moe_select_sg.as_ref().map(|p| {
                         let l = p.get_bind_group_layout(0);
@@ -18779,7 +18857,8 @@ pub fn forward_token_graph(
                                 pass.set_bind_group(0, &bgs, &[]);
                                 pass.dispatch_workgroups(ws, 1, 1);
                             }
-                            if let Some(sgp) = &c.moe_select_sg {
+                            let plain = !*sigmoid && bias.is_none() && *has_shared;
+                            if let (Some(sgp), true) = (&c.moe_select_sg, plain) {
                                 // Same binding ORDER as the tree kernel's bg_sel —
                                 // but its OWN layout (auto layouts are exclusive).
                                 pass.set_pipeline(sgp);
@@ -19513,6 +19592,9 @@ pub fn forward_batch_graph(
                 norm_topk,
                 q4tp,
                 gu_q2,
+                sigmoid,
+                bias,
+                has_shared,
             } => {
                 if *top_k >= 16 || *n_exp > 256 || experts.len() != n_exp + 1 {
                     bgraph_refused("site:5979");

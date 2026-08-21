@@ -1346,6 +1346,17 @@ pub enum GraphFfn<'a> {
         /// `down` stays q4tp — the mixed profile a 2-bit-class checkpoint
         /// converts into. Only meaningful with `q4tp: true`.
         gu_q2: bool,
+        /// LFM2-MoE / DeepSeek-V3 `noaux_tc` routing: per-expert sigmoid
+        /// scores instead of a softmax, and `norm_topk` renormalises with
+        /// the 1e-6 floor. The softmax arm is bit-identical to before.
+        sigmoid: bool,
+        /// Per-expert SELECTION bias: added to the score for the top-k
+        /// choice only — the mixing weights stay unbiased (noaux_tc).
+        bias: Option<&'a [f32]>,
+        /// Whether a shared expert rides as the last `experts` entry.
+        /// LFM2-MoE has none; the select kernel then leaves slot `top_k`
+        /// unwritten and the expert loop runs `top_k` slots, not +1.
+        has_shared: bool,
     },
 }
 
