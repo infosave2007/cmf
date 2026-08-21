@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 #[test]
-fn batched_q4tp_matvec_matches_single_bitwise() {
+fn batched_q4tp_matvec_matches_single_bitwise_needs_cmf_gpu() {
     match cortiq_engine::gpu_wgpu::selected_and_up() {
         None => {
             cortiq_engine::gpu_wgpu::skip_or_fail(module_path!());
