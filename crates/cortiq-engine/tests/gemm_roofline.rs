@@ -1,13 +1,22 @@
 //! What the device's f32 coop GEMM actually delivers, in GFLOP/s, on
 //! the shapes a DiT asks for.
 //!
-//! The q4tp arm measures 414 GFLOP/s on a 3090 — about a per cent of
-//! the card — and its kernel is line-for-line the same tiling as
-//! `gemm_nt_coop`, differing only in an activation scale and in reading
-//! the weight as packed f16 pairs. So either that one kernel is wrong
-//! or the whole cooperative-matrix path is slow here, and those two
-//! have completely different fixes. This measures the known-good arm on
-//! the same shape and settles it.
+//! This measures the f32 cooperative arm — the known-good one — so a
+//! number for any other kernel has something to be compared against.
+//!
+//! It used to open by quoting 414 GFLOP/s for the q4tp arm on a 3090 and
+//! asking whether that kernel or the whole cooperative path was at fault.
+//! Do not carry that figure anywhere: it does not reproduce. Measured on
+//! a 3090 with this methodology the q4tp arm runs 2842-2926 GFLOP/s —
+//! seven times the quoted number, and 1.5x FASTER than its f32 sibling
+//! rather than 4.6x behind it, because it reads ~0.52 bytes per weight
+//! against f32's four and these shapes are weight-read bound. The f32
+//! arm here measures 842-2016 GFLOP/s on an A100 (contended) and
+//! 1310-1957 on a 3090.
+//!
+//! The lesson is the reason this paragraph is long: a benchmark figure
+//! with no machine, no shape and no date attached propagates as a fact,
+//! and a work plan got built on this one before it was checked.
 //!
 //! Run: `cargo test --release -p cortiq-engine --test gemm_roofline -- --nocapture`
 

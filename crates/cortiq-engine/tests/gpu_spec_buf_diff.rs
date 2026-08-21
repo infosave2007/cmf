@@ -21,7 +21,7 @@ fn first_divergent_stage() {
     }
     match cortiq_engine::gpu_wgpu::selected_and_up() {
         None => {
-            eprintln!("wgpu не запрошен — пропуск");
+            cortiq_engine::gpu_wgpu::skip_or_fail(module_path!());
             return;
         }
         Some(false) => panic!("wgpu запрошен, но контекст не поднялся"),
