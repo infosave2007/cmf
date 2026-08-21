@@ -1454,6 +1454,12 @@ enum Commands {
         /// Output .avi (a .wav is written alongside)
         #[arg(long, default_value = "out.avi")]
         out: String,
+        /// Also dump every frame as `frame_%04d.ppm` into this directory —
+        /// the interchange format the LTX refine stage reads back
+        /// (`cortiq ltx-video --video <dir> --video-strength …`), and the
+        /// chunk-handoff format for a second machine
+        #[arg(long)]
+        frames_dir: Option<String>,
     },
 }
 
@@ -2357,6 +2363,7 @@ async fn main() -> anyhow::Result<()> {
             lora,
             lora_strength,
             out,
+            frames_dir,
         } => cmd_animate(
             &model,
             &prompt,
@@ -2384,6 +2391,7 @@ async fn main() -> anyhow::Result<()> {
             },
             quality,
             &out,
+            frames_dir.as_deref(),
         ),
         Commands::Explain { model, prompt, top } => cmd_explain(&model, &prompt, top),
         Commands::Calibrate {
@@ -4712,6 +4720,7 @@ fn cmd_animate(
     params: cortiq_engine::videogen::AnimParams,
     quality: u32,
     out: &str,
+    frames_dir: Option<&str>,
 ) -> anyhow::Result<()> {
     // A seeded render must come out the same twice. It did not: while a
     // probe class is undecided the arbitration ALTERNATES arms on real
@@ -4762,6 +4771,23 @@ fn cmd_animate(
             avout::encode_jpeg(&rgb, anim.height, anim.width, quality)
         })
         .collect();
+    if let Some(d) = frames_dir {
+        // The renderer's planes are already the Vol layout ([3, F, H, W]),
+        // so the LTX frame writer serialises them directly — this is the
+        // interchange the refine stage (`ltx-video --video <dir>`) reads.
+        // Anim.rgb is [0, 1]; the LTX frame codec speaks [-1, 1] (its VAE
+        // decoder emits that, and `read_ppm_f32` maps back to it). Passing
+        // [0, 1] through unmapped compresses every frame into the upper
+        // half of the range — a washed-out clip, not an error.
+        let vol = cortiq_engine::ltxvae::Vol {
+            c: 3,
+            f: anim.frames,
+            h: anim.height,
+            w: anim.width,
+            data: anim.rgb.iter().map(|&v| v * 2.0 - 1.0).collect(),
+        };
+        crate::ltxcmd::write_frames(d, &vol)?;
+    }
     let path = std::path::Path::new(out);
     avout::write_avi(
         path,

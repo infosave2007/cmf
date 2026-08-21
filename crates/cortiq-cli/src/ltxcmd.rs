@@ -996,7 +996,7 @@ fn write_latent(
     Ok(())
 }
 
-fn write_frames(d: &str, out: &Vol) -> anyhow::Result<()> {
+pub(crate) fn write_frames(d: &str, out: &Vol) -> anyhow::Result<()> {
     std::fs::create_dir_all(d)?;
     for f in 0..out.f {
         let frame: Vec<f32> = (0..3 * out.h * out.w)
@@ -1507,4 +1507,39 @@ fn write_context(p: &std::path::Path, v: &[f32], a: &[f32], n: usize) -> anyhow:
     }
     std::fs::rename(&tmp, p)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod frame_interchange_tests {
+    use super::*;
+
+    /// The H3 → LTX refine handoff rides on this round trip: `animate
+    /// --frames-dir` writes with `write_frames`, `ltx-video --video`
+    /// reads with `read_frames_dir`. If the layouts drift apart the
+    /// refine stage would still run — on scrambled channels, which a
+    /// render shows as a colour-shifted clip, not as an error.
+    #[test]
+    fn frames_survive_the_dir_round_trip() {
+        let (f, h, w) = (3usize, 8usize, 6usize);
+        // Distinct value per (c, f, h, w) so any axis swap is caught,
+        // in the codec's own [-1, 1] range.
+        let data: Vec<f32> = (0..3 * f * h * w)
+            .map(|i| ((i * 37) % 251) as f32 / 125.0 - 1.0)
+            .collect();
+        let vol = Vol { c: 3, f, h, w, data: data.clone() };
+        let dir = std::env::temp_dir().join(format!("cmf-frames-{}", std::process::id()));
+        let d = dir.to_str().unwrap();
+        write_frames(d, &vol).unwrap();
+        let back = read_frames_dir(d).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!((back.c, back.f, back.h, back.w), (3, f, h, w));
+        // PPM stores u8 over [-1, 1]: the step is 2/255 and rounding
+        // leaves half of it — the honest bound for this codec.
+        let worst = data
+            .iter()
+            .zip(&back.data)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(worst <= 1.0 / 255.0 + 1e-6, "worst {worst}");
+    }
 }

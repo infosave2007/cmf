@@ -233,6 +233,10 @@ pub(crate) fn canon_name(raw: &str) -> Option<String> {
         // Gemma-3n multimodal towers.
         "model.audio_tower.",
         "model.vision_tower.",
+        // Qwen3.5-VL vision tower (Ornith-1.5 among them): 333 tensors
+        // that would ride into the file as dead weight under their raw
+        // names — the text tower converts alone.
+        "model.visual.",
     ] {
         if raw.starts_with(pfx) {
             return None;
@@ -4957,6 +4961,25 @@ pub(crate) mod tests {
     /// recurrent one `conv`. The header has to carry that verbatim: a
     /// layer read as full attention would allocate a KV cache for a
     /// mixer that has none, and the short-conv ring would never advance.
+    /// A VL wrapper's vision tower must not ride into the file: 333
+    /// `model.visual.*` tensors under raw names is ~a gigabyte of dead
+    /// weight the loader never reads (Ornith-1.5 / Qwen3.5-VL layout).
+    #[test]
+    fn a_vision_tower_is_skipped_whole() {
+        for n in [
+            "model.visual.patch_embed.proj.weight",
+            "model.visual.blocks.0.attn.qkv.weight",
+            "model.visual.merger.mlp.0.weight",
+        ] {
+            assert!(canon_name(n).is_none(), "{n} must be skipped");
+        }
+        // The text tower under the same wrapper still converts.
+        assert_eq!(
+            canon_name("model.language_model.layers.0.mlp.gate_proj.weight").as_deref(),
+            Some("model.layers.0.mlp.gate_proj.weight")
+        );
+    }
+
     #[test]
     fn lfm25_layer_types_and_conv_cache_reach_the_header() {
         let cfg: serde_json::Value = serde_json::from_str(
