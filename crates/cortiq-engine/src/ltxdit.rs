@@ -623,13 +623,45 @@ impl Attn {
         let mut vh = vec![0f32; m * dh];
         let mut sc = vec![0f32; n * m];
         let mut oh = vec![0f32; n * dh];
+        // PV and QK cost the same flops, and PV takes twice the clock:
+        // measured on this stand at 512x512x49, per denoise step, scores
+        // 6.03 s against values 12.13 s (three steps, 6.03-6.54 and
+        // 12.13-12.71). The reason is which cooperative kernel each lands
+        // on -- `gemm_nt` picks `gemm_nt_coop`, whose right operand is read
+        // along rows, while `gemm_dx` picks `gemm_nn_coop` and reads v down
+        // columns of its [tokens, dh] block. Both are on the matrix units;
+        // the difference is the access pattern, not the acceleration.
+        //
+        // The image DiT already solved exactly this (`gpu_wgpu.rs:23664`:
+        // "transpose it once per block and PV becomes the NT product QK
+        // already is", 4.76 -> 2.91 s a step, frames within 0.1%). Here the
+        // transpose is free: v is gathered per head anyway, so gathering it
+        // as [dh, tokens] is the same count of writes to different offsets.
+        //
+        // OFF by default until measured on THIS path. The image DiT's
+        // number is its own; quoting it as the expected win here would be
+        // the same mistake as taking a benchmark out of a docstring.
+        // `CMF_LTX_PV_NT=1` turns it on.
+        let pv_nt = std::env::var("CMF_LTX_PV_NT").as_deref() == Ok("1");
         for h in 0..self.heads {
             for i in 0..n {
                 qh[i * dh..(i + 1) * dh].copy_from_slice(&q[i * inner + h * dh..][..dh]);
             }
             for j in 0..m {
                 kh[j * dh..(j + 1) * dh].copy_from_slice(&k[j * inner + h * dh..][..dh]);
-                vh[j * dh..(j + 1) * dh].copy_from_slice(&v[j * inner + h * dh..][..dh]);
+            }
+            if pv_nt {
+                // vh holds vᵀ: [dh, tokens], so PV is an NT product.
+                for j in 0..m {
+                    let src = &v[j * inner + h * dh..][..dh];
+                    for (d, s) in src.iter().enumerate() {
+                        vh[d * m + j] = *s;
+                    }
+                }
+            } else {
+                for j in 0..m {
+                    vh[j * dh..(j + 1) * dh].copy_from_slice(&v[j * inner + h * dh..][..dh]);
+                }
             }
             if prof {
                 t = attn_prof::add(&attn_prof::GATHER, t);
@@ -652,7 +684,13 @@ impl Attn {
                 t = attn_prof::add(&attn_prof::SOFT, t);
             }
             oh.iter_mut().for_each(|x| *x = 0.0);
-            crate::fcd_ops::gemm_dx(&sc, &vh, &mut oh, n, dh, m, pool);
+            if pv_nt {
+                // oh[n, dh] = sc[n, m] · (vᵀ[dh, m])ᵀ  -- gemm_nt's (n, k, m)
+                // is (tokens_out, reduction, width), so k = m and m = dh here.
+                crate::fcd_ops::gemm_nt(&sc, &vh, &mut oh, n, m, dh, pool);
+            } else {
+                crate::fcd_ops::gemm_dx(&sc, &vh, &mut oh, n, dh, m, pool);
+            }
             if prof {
                 t = attn_prof::add(&attn_prof::VALUE, t);
             }
