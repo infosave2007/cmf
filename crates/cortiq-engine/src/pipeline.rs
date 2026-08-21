@@ -6230,19 +6230,26 @@ impl Pipeline {
                     down: gw(&d.down_proj)?,
                 },
                 FfnKind::Moe(m) => {
-                    // v1 scope: softmax router + shared expert + uniform
-                    // q4t expert trios (the MoE-hybrid coder class). The
-                    // biased/sigmoid routers and adaptive τ keep the CPU
-                    // path, where they are implemented.
-                    if m.router_sigmoid
-                        || m.expert_bias.is_some()
-                        || m.route_tau.is_some()
+                    // Adaptive τ and expert masks keep the CPU path, where
+                    // they are implemented; so does a routed scale ≠ 1 (rare,
+                    // and folding it into the select kernel is not written).
+                    // Sigmoid routing with a selection bias (LFM2-MoE /
+                    // DeepSeek noaux_tc) IS graphed — before it was, every
+                    // LFM2-MoE token fell to the per-op path whole.
+                    if m.route_tau.is_some()
                         || m.mask.is_some()
+                        || (m.routed_scaling - 1.0).abs() > 1e-9
                     {
                         return None;
                     }
-                    let (se, sg) = m.shared.as_ref()?;
-                    let sgate = gw(sg.as_ref()?)?;
+                    let shared = m.shared.as_ref();
+                    let has_shared = shared.is_some();
+                    let sgate = match shared {
+                        Some((_, sg)) => gw(sg.as_ref()?)?,
+                        // Unused by the kernel when has_shared is false; the
+                        // router weight stands in so the plumbing stays total.
+                        None => gw(&m.router)?,
+                    };
                     let router = gw(&m.router)?;
                     let inter = m.experts.first()?.gate_proj.rows();
                     let mut experts = Vec::with_capacity(m.experts.len() + 1);
@@ -6252,7 +6259,11 @@ impl Pipeline {
                     // The mixed 2-bit profile: q2tp gate/up over a q4tp
                     // down. Uniform across the layer, like `q4tp` itself.
                     let mut gu_q2: Option<bool> = None;
-                    for e in m.experts.iter().chain(std::iter::once(se)) {
+                    for e in m
+                        .experts
+                        .iter()
+                        .chain(shared.map(|(se, _)| se))
+                    {
                         if !matches!(e.act, Act::Silu)
                             || e.gate_proj.rows() != inter
                             || e.up_proj.rows() != inter
@@ -6324,6 +6335,9 @@ impl Pipeline {
                         norm_topk: m.norm_topk_prob,
                         q4tp: q4tp?,
                         gu_q2: gu_q2.unwrap_or(false),
+                        sigmoid: m.router_sigmoid,
+                        bias: m.expert_bias.as_deref(),
+                        has_shared,
                     }
                 }
             };
@@ -7283,6 +7297,9 @@ impl Pipeline {
                             norm_topk: m.norm_topk_prob,
                             q4tp: q4tp?,
                             gu_q2: gu_q2.unwrap_or(false),
+                            sigmoid: false,
+                            bias: None,
+                            has_shared: true,
                         }
                     }
                     _ => return None,
