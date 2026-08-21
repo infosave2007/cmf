@@ -66,6 +66,25 @@ pub enum MaskPriority {
 }
 
 impl TaskMask {
+    /// True when this mask forbids nothing: every FFN neuron, every head
+    /// and every layer is open and no expert is restricted.
+    ///
+    /// A mask like that is arithmetically the dense model, but it is NOT
+    /// free: every fused kernel and whole-token graph in the runtime is
+    /// gated on `task_mask.is_none()`, so carrying it costs the fast
+    /// paths (measured: 55 → 11 tok/s on a narrowed 27B whose single
+    /// segment is always on). Callers use this to drop it.
+    pub fn fully_open(&self, inter: usize, heads: usize) -> bool {
+        if !self.layer_gates.iter().all(|&a| a) || !self.expert_masks.is_empty() {
+            return false;
+        }
+        let all_set = |bits: &[u8], n: usize| {
+            (0..n).all(|i| bits.get(i / 8).is_some_and(|b| b & (1 << (i % 8)) != 0))
+        };
+        self.ffn_masks.iter().all(|row| all_set(row, inter))
+            && self.head_masks.iter().all(|row| all_set(row, heads))
+    }
+
     /// Count active neurons in a specific layer's FFN.
     pub fn ffn_active_count(&self, layer_idx: usize) -> usize {
         self.ffn_masks

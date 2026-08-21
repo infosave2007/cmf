@@ -1783,7 +1783,12 @@ pub fn build_sparse_index(catalog: &MaskCatalog, arch: &ModelArch) -> Vec<Sparse
                 let n_groups = arch.intermediate_size.div_ceil(32);
                 for g in 0..n_groups {
                     // Group g covers bits [g*32, g*32+32) = bytes [g*4, g*4+4).
-                    let active = bits[g * 4..(g * 4 + 4).min(bits.len())]
+                    // A per-layer FFN width may be SHORTER than the
+                    // arch's (tube files size the arch to the widest
+                    // layer), so the start needs clamping too — not just
+                    // the end, or a narrow layer indexes past its row.
+                    let lo = (g * 4).min(bits.len());
+                    let active = bits[lo..(g * 4 + 4).min(bits.len())]
                         .iter()
                         .any(|&b| b != 0);
                     if active {

@@ -905,6 +905,83 @@ impl QTensor {
         }
     }
 
+    /// Touch the head of row `r` so the DRAM latency of the next
+    /// neuron's weights overlaps the current one's arithmetic.
+    ///
+    /// Scattered rows are what per-token sparsity reads, and a 2 KB
+    /// stride is past what the hardware prefetcher follows: without this
+    /// every row starts with a cold miss that nothing hides. One touch
+    /// per 512 bytes is enough — the rest of the row is a sequential run
+    /// the prefetcher does pick up.
+    #[inline]
+    pub fn prefetch_row(&self, r: usize) {
+        let Self::Mapped { dtype, .. } = self else {
+            return;
+        };
+        if !matches!(dtype, TensorDtype::Q8Row | TensorDtype::Q8_2f) {
+            return;
+        }
+        let cols = self.cols();
+        let q = self.quant_bytes();
+        let (a, b) = (r * cols, (r + 1) * cols);
+        if b > q.len() {
+            return;
+        }
+        let mut j = a;
+        while j < b {
+            unsafe { std::ptr::read_volatile(q.as_ptr().add(j)) };
+            j += 512;
+        }
+    }
+
+    /// `out += w · row(r)` — the transposed twin of `add_col_scaled`.
+    ///
+    /// A neuron's `down` weights are a COLUMN of `[hidden, inter]`, and a
+    /// column is strided: reading one costs a cache line per element, so
+    /// per-neuron dynamic sparsity saves arithmetic and no bytes. Stored
+    /// transposed (`down_proj.t.weight`, `[inter, hidden]`) the same
+    /// weights are a contiguous ROW, and this accumulate reads exactly
+    /// the neurons the token asked for.
+    pub fn add_row_scaled(&self, r: usize, w: f32, out: &mut [f32], scratch: &mut [f32]) {
+        let cols = self.cols();
+        debug_assert_eq!(out.len(), cols);
+        match self {
+            Self::F32 { data, .. } => {
+                let row = &data[r * cols..(r + 1) * cols];
+                for (o, v) in out.iter_mut().zip(row) {
+                    *o += w * v;
+                }
+            }
+            Self::Mapped {
+                dtype,
+                row_scale,
+                col_field,
+                ..
+            } => match dtype {
+                TensorDtype::Q8Row => {
+                    let q = &self.quant_bytes()[r * cols..(r + 1) * cols];
+                    let ws = w * row_scale[r];
+                    let row: &[i8] =
+                        unsafe { std::slice::from_raw_parts(q.as_ptr() as *const i8, q.len()) };
+                    axpy_i8_f32(out, row, ws);
+                }
+                TensorDtype::Q8_2f => {
+                    let q = &self.quant_bytes()[r * cols..(r + 1) * cols];
+                    let ws = w * row_scale[r];
+                    for ((o, b), c) in out.iter_mut().zip(q).zip(col_field) {
+                        *o += ws * c * (*b as i8 as f32);
+                    }
+                }
+                _ => {
+                    self.row_f32(r, scratch);
+                    for (o, v) in out.iter_mut().zip(scratch.iter()) {
+                        *o += w * v;
+                    }
+                }
+            },
+        }
+    }
+
     /// Dot of row `r` with `x` (gate/up active-neuron path). Reads only
     /// row `r` from the mmap — no full dequant. q4/vbit dequant the row
     /// into `scratch` first (rare for active-FFN weights).

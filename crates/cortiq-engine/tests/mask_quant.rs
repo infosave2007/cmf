@@ -166,6 +166,8 @@ fn sparse_ffn_quant_agrees_with_dequant() {
         gate_proj: QTensor::from_model(&model, "g").unwrap(),
         up_proj: QTensor::from_model(&model, "u").unwrap(),
         down_proj: QTensor::from_model(&model, "d").unwrap(),
+        down_t: None,
+        segs: Vec::new(),
     };
     assert!(
         d_mapped.down_proj.sparse_col_ok(),
@@ -186,6 +188,8 @@ fn sparse_ffn_quant_agrees_with_dequant() {
         gate_proj: QTensor::from_f32(deq(&d_mapped.gate_proj), inter, hidden),
         up_proj: QTensor::from_f32(deq(&d_mapped.up_proj), inter, hidden),
         down_proj: QTensor::from_f32(deq(&d_mapped.down_proj), hidden, inter),
+        down_t: None,
+        segs: Vec::new(),
     };
 
     let x = synth(hidden, 9);

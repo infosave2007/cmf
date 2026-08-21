@@ -333,12 +333,28 @@ pub enum ProbeArm {
 /// Clean samples per arm before a class decides.
 const PROBE_SAMPLES: u32 = 6;
 
+/// Device samples discarded before any count — see `Probe::gpu_burn`.
+const PROBE_WARMUP: u32 = 1;
+
 struct Probe {
     /// 0 = probing, 1 = GPU won, 2 = CPU won.
     state: AtomicU8,
     flip: AtomicU32,
     gpu_ns: AtomicU64,
     gpu_n: AtomicU32,
+    /// GPU samples still to discard as warm-up.
+    ///
+    /// The cold flag catches buffer and weight uploads, but a compute
+    /// pipeline is compiled on first use and not every creation site
+    /// raises it — the wgpu path has 21 pipeline creations against 12
+    /// cold notes. One uncaught shader compile is enough to lose a
+    /// class for the whole process: `gemm-nt` on an A100 was recorded at
+    /// 117.01 ms against the host's 3.19 and sent to the CPU, which
+    /// parked a 27B bake on 2.6 cores with the card idle. The decision
+    /// already uses each arm's BEST sample, so discarding the first
+    /// GPU sample costs one extra round trip and removes the whole
+    /// class of first-call artefacts.
+    gpu_burn: AtomicU32,
     cpu_ns: AtomicU64,
     cpu_n: AtomicU32,
     /// Best (minimum) sample per arm. The DECISION compares these:
@@ -358,6 +374,7 @@ impl Probe {
             flip: AtomicU32::new(0),
             gpu_ns: AtomicU64::new(0),
             gpu_n: AtomicU32::new(0),
+            gpu_burn: AtomicU32::new(PROBE_WARMUP),
             cpu_ns: AtomicU64::new(0),
             cpu_n: AtomicU32::new(0),
             gpu_min: AtomicU64::new(u64::MAX),
@@ -517,12 +534,33 @@ pub fn probe_arm(c: OpClass) -> ProbeArm {
 /// Record a timed arm sample; on the `PROBE_SAMPLES`-th clean sample of
 /// BOTH arms the class decides for the rest of the process.
 pub fn probe_record(c: OpClass, gpu: bool, dur: std::time::Duration) {
-    let p = &PROBES[c as usize];
+    probe_record_into(&PROBES[c as usize], CLASS_NAMES[c as usize], Some(c), gpu, dur)
+}
+
+/// The body of `probe_record` over ONE probe, so the decision can be
+/// driven in a test without touching the process-wide array.
+fn probe_record_into(
+    p: &Probe,
+    class_name: &str,
+    cache: Option<OpClass>,
+    gpu: bool,
+    dur: std::time::Duration,
+) {
     if p.state.load(Ordering::Relaxed) != 0 {
         return;
     }
     if gpu && PROBE_COLD.with(|f| f.replace(false)) {
         return; // one-off cost in this call — not a steady-state sample
+    }
+    if gpu {
+        // Load-then-store rather than fetch_sub: a blind decrement at
+        // zero wraps a u32 to its maximum and mutes the arm forever.
+        // A benign race here burns one extra sample, which is free.
+        let left = p.gpu_burn.load(Ordering::Relaxed);
+        if left > 0 {
+            p.gpu_burn.store(left - 1, Ordering::Relaxed);
+            return; // warm-up: the first device sample builds its pipeline
+        }
     }
     let ns = dur.as_nanos().min(u64::MAX as u128) as u64;
     if gpu {
@@ -563,12 +601,14 @@ pub fn probe_record(c: OpClass, gpu: bool, dur: std::time::Duration) {
         {
             tracing::info!(
                 "gpu probe [{}]: gpu {:.2} ms vs cpu {:.2} ms per op → {}",
-                CLASS_NAMES[c as usize],
+                class_name,
                 g / 1e6,
                 cp / 1e6,
                 if winner == 1 { "gpu" } else { "cpu" },
             );
-            probe_cache_store(c, winner);
+            if let Some(c) = cache {
+                probe_cache_store(c, winner);
+            }
         }
     }
 }
@@ -2081,6 +2121,25 @@ pub fn dit_split_only(
 /// cores where the card has them. Refuses under `CMF_BAKE_GPU=0` or
 /// strict f32, and for jobs below n·k·m = 4M, where the round trip
 /// costs more than the arithmetic saves.
+/// `gemm_nt_f32` whose `w` is known to change every call (an
+/// accumulation over fresh activations, not a weight): it skips the
+/// resident ledger and its per-call fingerprint of the whole operand.
+pub fn gemm_nt_f32_transient(
+    x: &[f32],
+    w: &[f32],
+    y: &mut [f32],
+    n: usize,
+    k: usize,
+    m: usize,
+) -> bool {
+    match backend() {
+        #[cfg(all(feature = "gpu", not(target_os = "macos")))]
+        Backend::Wgpu => crate::gpu_wgpu::gemm_nt_f32_transient(x, w, y, n, k, m),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
 pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: usize) -> bool {
     match backend() {
         #[cfg(all(feature = "gpu", not(target_os = "macos")))]
@@ -2733,4 +2792,65 @@ pub fn weight_bytes_by() -> [u64; 6] {
     }
     #[allow(unreachable_code)]
     [0; 6]
+}
+
+#[cfg(test)]
+mod probe_warmup_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn ms(v: f64) -> Duration {
+        Duration::from_nanos((v * 1e6) as u64)
+    }
+
+    /// The bug this pins, measured on an A100: the first device call for
+    /// a class compiles its pipeline, was timed at 117.01 ms against the
+    /// host's 3.19, and sent `gemm-nt` to the CPU for the whole process —
+    /// which ran a 27B bake on 2.6 cores with the card idle.
+    #[test]
+    fn one_cold_first_sample_does_not_lose_the_class() {
+        let p = Probe::new();
+        // First device sample is the pipeline build. Then the truth.
+        probe_record_into(&p, "gemm-nt", None, true, ms(117.01));
+        probe_record_into(&p, "gemm-nt", None, true, ms(1.1));
+        probe_record_into(&p, "gemm-nt", None, true, ms(1.0));
+        probe_record_into(&p, "gemm-nt", None, false, ms(3.19));
+        probe_record_into(&p, "gemm-nt", None, false, ms(3.20));
+        assert_eq!(
+            p.state.load(Ordering::Relaxed),
+            1,
+            "the device is 3x faster once warm and must win"
+        );
+    }
+
+    /// The warm-up must not become a way to never decide, and must not
+    /// underflow: a blind decrement at zero wraps a u32 to its maximum
+    /// and mutes the arm for the life of the process.
+    #[test]
+    fn the_warmup_is_spent_once_and_never_underflows() {
+        let p = Probe::new();
+        for _ in 0..8 {
+            probe_record_into(&p, "matmat", None, true, ms(10.0));
+        }
+        assert_eq!(p.gpu_burn.load(Ordering::Relaxed), 0, "spent, not wrapped");
+        assert_eq!(
+            p.gpu_n.load(Ordering::Relaxed),
+            7,
+            "one sample burned, the rest counted"
+        );
+    }
+
+    /// A genuinely slower device still loses — the warm-up removes an
+    /// artefact, it does not put a thumb on the scale.
+    #[test]
+    fn a_slow_device_still_loses_after_the_warmup() {
+        let p = Probe::new();
+        for _ in 0..4 {
+            probe_record_into(&p, "matvec", None, true, ms(40.0));
+        }
+        for _ in 0..4 {
+            probe_record_into(&p, "matvec", None, false, ms(2.0));
+        }
+        assert_eq!(p.state.load(Ordering::Relaxed), 2, "host wins on merit");
+    }
 }

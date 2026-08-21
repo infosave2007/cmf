@@ -154,11 +154,65 @@ pub(crate) fn build_ffn_at(
                 arch.hidden_size
             )));
         }
+        // The transposed down, when the file carries one: the per-token
+        // sparse path needs a neuron's down weights contiguous.
+        let dt_name = format!("{p}down_proj.t.weight");
+        let down_t = match model.tensor(&dt_name) {
+            Some(_) => Some(load_matrix(model, &dt_name, force_f32, ov)?),
+            None => None,
+        };
+        if let Some(t) = &down_t
+            && (t.rows() != inter || t.cols() != arch.hidden_size)
+        {
+            return Err(CmfError::Parse(format!(
+                "{p}down_proj.t: [{}, {}] != [{inter}, {}]",
+                t.rows(),
+                t.cols(),
+                arch.hidden_size
+            )));
+        }
+        // Task tubes (`…gate_proj.tube1.weight`, …): the neurons only
+        // some tasks compute, each stored as its own triple so every
+        // kernel runs it unchanged and an inactive tube's bytes are
+        // never touched. Numbering is dense from 1; the first gap ends
+        // the tube list.
+        let mut segs = Vec::new();
+        let mut start = inter;
+        for k in 1.. {
+            let gn = format!("{p}gate_proj.tube{k}.weight");
+            if model.tensor(&gn).is_none() {
+                break;
+            }
+            let gate = load_matrix(model, &gn, force_f32, ov)?;
+            let up = load_matrix(model, &format!("{p}up_proj.tube{k}.weight"), force_f32, ov)?;
+            let down = load_matrix(model, &format!("{p}down_proj.tube{k}.weight"), force_f32, ov)?;
+            let width = gate.rows();
+            if up.rows() != width || down.cols() != width || down.rows() != arch.hidden_size {
+                return Err(CmfError::Parse(format!(
+                    "{p}tube{k}: dims disagree (gate.rows={width}, up.rows={}, \
+                     down=[{}, {}], hidden={})",
+                    up.rows(),
+                    down.rows(),
+                    down.cols(),
+                    arch.hidden_size
+                )));
+            }
+            segs.push(crate::pipeline::FfnSeg {
+                gate,
+                up,
+                down,
+                start,
+                width,
+            });
+            start += width;
+        }
         Ok(DenseFfn {
             gate_proj,
             up_proj,
             down_proj,
             act: crate::pipeline::Act::from_arch_full(arch),
+            down_t,
+            segs,
         })
     };
     let router_name = format!("{prefix}mlp.gate.weight");

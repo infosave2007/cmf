@@ -17,6 +17,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   about what an M4 has. So 0.5.96's win does not port to Macs, and the lever
   there is fewer tokens (`--upscale`, `--stream-chunk`), not a faster GEMM.
 
+## [0.5.97] - 2026-08-21
+
+A 27B specialist bake was attempted on rented hardware three times and died
+three different ways, none of them in the arithmetic. What follows is those
+three, plus two trainer modes that came out of trying to heal a compressed
+model without one.
+
+### Fixed
+- **`/proc/meminfo` reports the HOST inside a container**, so the FCD replica
+  read 944 GB on a box whose cgroup would hand out 117, concluded the f32
+  copy fit with room to spare, streamed nothing and was SIGKILLed a minute in.
+  Both memory probes now take the lower of the host figure and the cgroup
+  ceiling (v2 `memory.max`, v1 `memory.limit_in_bytes`), and headroom is the
+  limit minus what the cgroup already holds. Worth knowing alongside it:
+  `/dev/shm` counts against the same limit, so 32 GB of models in tmpfs is
+  32 GB the trainer cannot have.
+- **The device arm was judged on its first call, which compiles its
+  pipeline.** `gemm-nt` on an A100 was timed at 117.01 ms against the host's
+  3.19 and sent to the CPU for the life of the process — a 27B bake then ran
+  on 2.6 cores with the card idle. The cold flag catches buffer and weight
+  uploads but not every pipeline creation (the wgpu path has 21 creation
+  sites against 12 cold notes), so the probe now discards one device sample
+  per class as warm-up. The decision already compared each arm's best sample;
+  this removes the whole class of first-call artefacts rather than one of them.
+- **A buffer over the device's limit was fatal instead of declined.** wgpu
+  caps one storage buffer at 4 292 870 144 bytes on an A100; a 248 320-token
+  vocabulary at hidden 5120 is 5 085 593 600 bytes in f32, and
+  `create_buffer` treats the overrun as a validation error that panics. The
+  GEMM and attention bake paths now check every operand against
+  `max_buffer_size` and return to the host arm, which was sitting right there.
+- **The FFN mass probe accumulated zeros whenever the card was on.** The
+  fused FFN chain keeps `g` on the device, and the host-side accumulator at
+  the bottom of the function only sees what came back — so the probe reported
+  a statistic of zeros rather than failing. It now declines the fused chain
+  while a probe is installed, which is what the refit pass already did.
+- **A fully-open task mask disabled every fast path.** A narrowed file
+  carrying an all-ones mask ran 11.0 tok/s against 55.5 on a 27B. The mask is
+  dropped at generation and scoring entry when it gates nothing.
+- **A per-layer-narrow file could panic in `build_sparse_index`** on the
+  start-index computation; the index is clamped to the bit vector.
+
+### Added
+- **`cortiq fcd --polish-only`** — `--o1` then names which layers are
+  TRAINABLE (their FFN and the two layer norms) instead of which are converted,
+  and both teacher and student keep exact attention. This is the shape a
+  compression correction has: the damage is in the FFN, not in the attention
+  kernel. On a hybrid the eligibility filter used to drop every recurrent
+  layer, which silently turned `--o1 deep8` into two layers where 48 of 64 are
+  GatedDeltaNet; under `--polish-only` every layer is eligible.
+- **`cortiq fcd --teacher <file>`** — distil from a separate, uncompressed
+  `.cmf` instead of the model's own frozen state. Without it the KL anchor of a
+  compressed model is the damage itself, which makes `--kl 0` the only sane
+  setting; with it the anchor is what the model is supposed to do. The two
+  files share embeddings and head, so one loss head serves both exactly.
+- `cortiq tube-bake` and `cortiq ffn-transpose`, with the probes behind them
+  (`CMF_FFN_PROBE_SQ`, `CMF_FFN_PROBE_TOPK`, `CMF_FFN_REFIT`,
+  `CMF_FFN_GATE_TOPK`, `CMF_FFN_ORACLE_TOPK`) — a coherent permutation of the
+  FFN intermediate axis, cut into segments with a task mask per segment. The
+  mechanism is exact (a full-width tube file scores 10.543 against the dense
+  10.554) and the bytes convert to speed (27B at half FFN width: 9.82 GB
+  against 14.27, 68.5 tok/s against 55.5 on a 5090). Read the note below
+  before building anything on it.
+
+### Notes on what did NOT work, so it is not rediscovered
+- **Per-task tubes do not pay on real task types.** Across js/java/go/python/
+  rust/cpp, a task's own mask is WORSE than one global mask at equal width —
+  own/global 1.054 at 75% and 1.113 at 50%. Neighbouring tasks light up the
+  same neurons (keep-sets overlap 50–60%), and at widths that survive without
+  training the union is 95–99% of the layer, so there is nothing to divide.
+  The value is in narrowing plus healing, not in the tubes.
+- **Cross-entropy alone is not healing.** Training a narrowed 2B on its own
+  answers with no separate teacher made it worse in the training domain and
+  out of it: code held-out 4.588 → 4.898 against a dense 3.618, wikitext
+  20.82 → 21.03 at its best step and 26.11 by step 60. Distillation from the
+  dense file moves the other way (6.38 → 6.35 in fifteen steps, teacher 5.05).
+- **Two-bit weights do not hold a dense 27B without training.** The file
+  converts and loads (11.42 GB, 866 tensors, MTP intact) and reasons
+  coherently for a page before collapsing into a repeating fragment. The
+  `q2tp` profile is for models with expert redundancy to spend.
+- **A line-based loop check is blind to a single enormous line.** The
+  degenerate output above scored 100% distinct lines. The check now also reads
+  the share of distinct 5-grams in the tail: healthy text is above 30%, a
+  collapse is near zero.
+
 ## [0.5.96] - 2026-08-19
 
 Three quarters of a four-bit FFN call was host time, and most of that was one

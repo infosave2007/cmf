@@ -374,6 +374,31 @@ pub struct DenseFfn {
     pub down_proj: QTensor,
     /// Gate activation (SiLU default; Gemma: tanh-GELU).
     pub act: Act,
+    /// `down_proj` stored transposed (`[inter, hidden]`), when the file
+    /// carries it. Only the per-token sparse path reads it: a neuron's
+    /// down weights are a contiguous ROW there, so the token's chosen
+    /// neurons are the only bytes touched. `None` = the ordinary layout,
+    /// and the sparse path stays off.
+    pub down_t: Option<QTensor>,
+    /// Task tubes (spec: defragged task-conditional width). The three
+    /// matrices above are the CORE — the neurons every task computes;
+    /// each tube is an independently quantized slice of the SAME layer
+    /// holding the neurons only some tasks need. A tube is a normal
+    /// tensor triple, so every kernel runs it unchanged, and the bytes
+    /// of an inactive tube are never read. Empty = ordinary dense FFN.
+    pub segs: Vec<FfnSeg>,
+}
+
+/// One task tube: a contiguous slice of a layer's FFN neurons, stored
+/// as its own `[w, hidden]` / `[hidden, w]` triple. `start` is the
+/// neuron's index in the layer's FULL space (core first, then tubes in
+/// order) — the bit a task mask sets to switch this tube on.
+pub struct FfnSeg {
+    pub gate: QTensor,
+    pub up: QTensor,
+    pub down: QTensor,
+    pub start: usize,
+    pub width: usize,
 }
 
 /// FFN operator of a layer, decided by tensor presence at load time
@@ -974,7 +999,7 @@ impl Pipeline {
         while scan < limit {
             let lw = &self.weights.layers[self.phys_layer(scan)];
             let ffn = match &lw.ffn {
-                FfnKind::Dense(d) => {
+                FfnKind::Dense(d) if d.segs.is_empty() => {
                     let (Some(g), Some(u), Some(dn)) = (
                         d.gate_proj.q1_parts(),
                         d.up_proj.q1_parts(),
@@ -1873,6 +1898,11 @@ impl Pipeline {
         self.generate_from_ids(&input_ids, max_tokens, task_mask, on_token)
     }
 
+    /// `None` when the mask forbids nothing (see `TaskMask::fully_open`).
+    fn drop_open_mask<'m>(&self, m: Option<&'m TaskMask>) -> Option<&'m TaskMask> {
+        m.filter(|m| !m.fully_open(self.intermediate_size, self.num_heads))
+    }
+
     /// Generate from prepared token ids (e.g. a chat template).
     ///
     /// With an MTP head, greedy generation without a task mask takes the
@@ -1893,6 +1923,11 @@ impl Pipeline {
         if input_ids.is_empty() {
             return Err("empty prompt: nothing to generate from".to_string());
         }
+        // A mask that forbids nothing still costs every fused path and
+        // whole-token graph, all of which are gated on `is_none()`. A
+        // narrowed file whose one segment is always on carries exactly
+        // such a mask — drop it here rather than pay 5x for a no-op.
+        let task_mask = self.drop_open_mask(task_mask);
 
         // Cross-turn KV reuse: a chat app resends the whole history
         // every turn; when the new ids strictly EXTEND what the cache
@@ -3283,6 +3318,9 @@ impl Pipeline {
         let FfnKind::Dense(d) = &lw.ffn else {
             return None;
         };
+        if !d.segs.is_empty() {
+            return None; // tube layers run on the segmented path
+        }
         // The block's input first: it borrows `self` mutably (embed scratch,
         // pool), the plan below borrows the weights immutably.
         let mut x = self.mtp_block_input(m, hidden, next_token);
@@ -3413,6 +3451,9 @@ impl Pipeline {
         let FfnKind::Dense(d) = &lw.ffn else {
             return false;
         };
+        if !d.segs.is_empty() {
+            return false; // tube layers run on the segmented path
+        }
         fn gw(t: &QTensor) -> Option<crate::gpu::GraphW<'_>> {
             let (_, i, kind, rs) = t.graph_weight()?;
             Some(crate::gpu::GraphW {
@@ -4581,6 +4622,28 @@ impl Pipeline {
             .unwrap_or_default()
     }
 
+    /// `probe_ffn_mass` over the BATCHED prefill: same accumulator, one
+    /// sweep instead of one forward per token. What makes the statistic
+    /// affordable on a 27B.
+    pub fn probe_ffn_mass_batch(&mut self, ids: &[u32]) -> Vec<Vec<f64>> {
+        self.kv_cache.clear();
+        self.kv_history.clear();
+        FFN_PROBE.with(|p| {
+            *p.borrow_mut() = Some(vec![vec![0f64; self.intermediate_size]; self.num_layers]);
+        });
+        for chunk in ids.chunks(256) {
+            if chunk.len() < 2 {
+                continue;
+            }
+            let _ = self.nll_ids_masked(chunk, 0, None);
+        }
+        self.kv_cache.clear();
+        self.kv_history.clear();
+        FFN_PROBE
+            .with(|p| p.borrow_mut().take())
+            .unwrap_or_default()
+    }
+
     /// Teacher-forced PPL with a task mask active (sparse execution) —
     /// the quality gate for a DTG-MA-masked skill. Sequential per
     /// position: the batched prefill path is dense-only.
@@ -4639,6 +4702,7 @@ impl Pipeline {
         start: usize,
         task_mask: Option<&TaskMask>,
     ) -> (f64, usize) {
+        let task_mask = self.drop_open_mask(task_mask);
         self.nll_ids_inner(ids, start, task_mask)
     }
 
@@ -5396,6 +5460,9 @@ impl Pipeline {
                 .and_then(|m| m.ffn_masks.get(li))
                 .map(|v| v.as_slice());
             let mut ffn = match &lw.ffn {
+                FfnKind::Dense(d) if !d.segs.is_empty() => {
+                    tube_ffn(d, &post, b, pool.as_deref(), mask_row)
+                }
                 FfnKind::Dense(d) => dense_ffn_batch(d, &post, b, pool.as_deref(), mask_row),
                 FfnKind::Moe(m) => moe_ffn_batch(m, &post, b, hs, pool.as_deref(), None),
                 // Dual-branch layers run per position (the expert branch
@@ -5594,7 +5661,7 @@ impl Pipeline {
                 break;
             };
             let FfnKind::Dense(d) = &lw.ffn else { break };
-            if d.act != Act::Silu {
+            if d.act != Act::Silu || !d.segs.is_empty() {
                 break;
             }
             // q8_row (row_scale populated), or q4_tiled / q4tp (row_scale
@@ -6154,6 +6221,9 @@ impl Pipeline {
             }
             let gffn = match &lw.ffn {
                 FfnKind::DenseMoe(_) => return None, // dual branch: CPU path
+                // A tube layer is several matrices, not one — the
+                // whole-layer graph has no shape for it yet.
+                FfnKind::Dense(d) if !d.segs.is_empty() => return None,
                 FfnKind::Dense(d) => crate::gpu::GraphFfn::Dense {
                     gate: gw(&d.gate_proj)?,
                     up: gw(&d.up_proj)?,
@@ -6458,7 +6528,7 @@ impl Pipeline {
                 return None;
             }
             let ffn = match &lw.ffn {
-                FfnKind::Dense(d) if d.act == Act::Silu => {
+                FfnKind::Dense(d) if d.act == Act::Silu && d.segs.is_empty() => {
                     let (Some(g), Some(u), Some(dn)) =
                         (d.gate_proj.q1_parts(), d.up_proj.q1_parts(), d.down_proj.q1_parts())
                     else {
@@ -6832,6 +6902,9 @@ impl Pipeline {
             return false;
         };
         let FfnKind::Dense(d) = &m.layer.ffn else { return false };
+        if !d.segs.is_empty() {
+            return false;
+        }
         let (Some(pq), Some(pk), Some(pv), Some(po)) = (wq.q1_parts(), wk.q1_parts(), wv.q1_parts(), wo.q1_parts()) else {
             return false;
         };
@@ -6962,7 +7035,7 @@ impl Pipeline {
             return None;
         };
         let FfnKind::Dense(d) = &m.layer.ffn else { return None };
-        if d.act != Act::Silu {
+        if d.act != Act::Silu || !d.segs.is_empty() {
             return None;
         }
         let (pq, pk, pv, po) = (wq.q1_parts()?, wk.q1_parts()?, wv.q1_parts()?, wo.q1_parts()?);
@@ -7118,6 +7191,7 @@ impl Pipeline {
                 // 54 on decode, i.e. reading the prompt was slower than
                 // writing the answer.
                 let gffn = match &lw.ffn {
+                    FfnKind::Dense(d) if !d.segs.is_empty() => return None,
                     FfnKind::Dense(d) => crate::gpu::GraphFfn::Dense {
                         gate: gw(&d.gate_proj)?,
                         up: gw(&d.up_proj)?,
@@ -8424,6 +8498,15 @@ impl Pipeline {
             // stays fused, a --target-sparsity bake flips arms on its
             // own weight.
             let ffn_out = match (ffn_masked, &lw.ffn) {
+                // A defragged tube layer answers its own mask: the core
+                // always runs, each tube runs when its bit is on, and
+                // the tubes that are off are never read from the mmap.
+                (_, FfnKind::Dense(d)) if !d.segs.is_empty() => {
+                    let row = task_mask
+                        .and_then(|tm| tm.ffn_masks.get(li))
+                        .map(|v| v.as_slice());
+                    tube_ffn(d, post_normed, 1, self.pool.as_deref(), row)
+                }
                 (true, FfnKind::Dense(d)) => {
                     let tm = task_mask.unwrap();
                     let alive = tm.ffn_active_count(li);
@@ -8766,7 +8849,9 @@ pub fn create_test_pipeline(
                 up_proj: qt(intermediate_size, hidden_size, li * 10 + 6),
                 down_proj: qt(hidden_size, intermediate_size, li * 10 + 7),
                 act: Act::Silu,
-            }),
+                down_t: None,
+            segs: Vec::new(),
+        }),
             attn: AttnKind::Full {
                 bias: None,
                 wq: qt(num_heads * head_dim, hidden_size, li * 10 + 1),
@@ -8823,7 +8908,28 @@ fn mask_bit(row: &[u8], j: usize) -> bool {
 /// then the mask lands on the ACTIVATIONS, which is arithmetically the
 /// pruned network without touching a quantized weight byte. Whole open
 /// bytes (0xFF = 8 open neurons) skip in one test.
+/// `CMF_FFN_MASK_GAIN` — Patent 12 FIG. 4, variance-preserving
+/// rescaling: truncation removes a share of the layer's output energy,
+/// so the survivors are scaled up to put the variance back where the
+/// downstream norm expects it. A scalar here; per layer it is
+/// `sqrt(total energy / kept energy)`.
+fn mask_gain() -> f32 {
+    static G: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        std::env::var("CMF_FFN_MASK_GAIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1.0)
+    })
+}
+
 fn zero_masked_cols(g: &mut [f32], rows: usize, inter: usize, row: &[u8]) {
+    // With CMF_FFN_MEANFILL a closed neuron contributes its average
+    // instead of nothing — same bytes read, one constant restored.
+    let fill = meanfill().and_then(|(i, v)| {
+        let li = crate::gpu::cur_layer();
+        (*i == inter && li >= 0).then(|| &v[li as usize * inter..(li as usize + 1) * inter])
+    });
     for r in 0..rows {
         let base = r * inter;
         for (bi, &byte) in row.iter().enumerate() {
@@ -8834,11 +8940,255 @@ fn zero_masked_cols(g: &mut [f32], rows: usize, inter: usize, row: &[u8]) {
             for bit in 0..8 {
                 let j = j0 + bit;
                 if j < inter && byte & (1 << bit) == 0 {
-                    g[base + j] = 0.0;
+                    g[base + j] = fill.map_or(0.0, |f| f[j]);
                 }
             }
         }
     }
+    let gain = mask_gain();
+    if gain != 1.0 {
+        for v in g[..rows * inter].iter_mut() {
+            *v *= gain;
+        }
+    }
+}
+
+/// True when neuron `i`'s bit is set (no mask = everything runs).
+#[inline]
+fn tube_bit(row: Option<&[u8]>, i: usize) -> bool {
+    row.is_none_or(|r| mask_bit(r, i))
+}
+
+/// Every bit below `n` set — the common case for a tube file's CORE,
+/// where only the tube bits vary per task.
+fn all_bits_on(row: &[u8], n: usize) -> bool {
+    (0..n).all(|i| mask_bit(row, i))
+}
+
+/// `CMF_TUBE_TOPK` — how many tubes a TOKEN may open (0 = the task mask
+/// decides alone). This is the dense FFN read as a mixture: the tubes
+/// are the experts a k-means over `gate_proj` rows found, and the token
+/// picks among them. `CMF_TUBE_SCORE=gate` scores a tube by its own
+/// gate (realizable: only `up`/`down` of the losers go unread),
+/// `=oracle` scores by the true `silu(gate)·up` mass (the ceiling —
+/// only `down` is saved, and the selection has read what it predicts).
+fn tube_topk() -> usize {
+    static K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *K.get_or_init(|| {
+        std::env::var("CMF_TUBE_TOPK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+fn tube_score_oracle() -> bool {
+    static O: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *O.get_or_init(|| {
+        std::env::var("CMF_TUBE_SCORE").is_ok_and(|v| v == "oracle")
+    })
+}
+
+/// The routed arm of `tube_ffn`: a token opens only its best `k` tubes.
+/// At `b == 1` (decode) the losers are genuinely never read — that is
+/// the speed. At `b > 1` (the scoring sweep) every tube is computed and
+/// the losers' activations are zeroed instead: same arithmetic, so the
+/// perplexity is the routed model's, measured without a per-token
+/// gather in the middle of a GEMM.
+fn tube_ffn_routed(
+    d: &DenseFfn,
+    xs: &[f32],
+    b: usize,
+    pool: Option<&Pool>,
+    mask_row: Option<&[u8]>,
+    k: usize,
+) -> Vec<f32> {
+    let hidden = d.down_proj.rows();
+    let core = d.gate_proj.rows();
+    let core_full = mask_row.is_none_or(|r| all_bits_on(r, core));
+    let mut out = match (b, core_full, mask_row) {
+        (1, true, _) => dense_ffn(d, xs, pool),
+        (1, false, Some(row)) => dense_ffn_masked(d, xs, pool, row),
+        (_, true, _) => dense_ffn_batch(d, xs, b, pool, None),
+        (_, false, row) => dense_ffn_batch(d, xs, b, pool, row),
+    };
+    let cand: Vec<usize> = (0..d.segs.len())
+        .filter(|&i| tube_bit(mask_row, d.segs[i].start))
+        .collect();
+    if cand.is_empty() {
+        return out;
+    }
+    // gate (and, where the score or the batch needs it, up) per tube.
+    // The SCORE is taken at the point the serving path could take it:
+    // off the gate alone, or off the finished activation for the oracle.
+    let oracle = tube_score_oracle();
+    let mut acts: Vec<Vec<f32>> = Vec::with_capacity(cand.len());
+    let mut scores = vec![0f32; b * cand.len()];
+    for (ci, &i) in cand.iter().enumerate() {
+        let seg = &d.segs[i];
+        let w = seg.width;
+        let mut g = vec![0.0f32; b * w];
+        if b == 1 {
+            seg.gate.matvec(xs, &mut g, pool);
+        } else {
+            seg.gate.matmat(xs, b, &mut g, pool);
+        }
+        for v in g.iter_mut() {
+            *v = Act::Silu.combine(*v, 1.0);
+        }
+        if !oracle {
+            for t in 0..b {
+                scores[t * cand.len() + ci] =
+                    g[t * w..(t + 1) * w].iter().map(|v| v * v).sum::<f32>();
+            }
+        }
+        if oracle || b > 1 {
+            let mut u = vec![0.0f32; b * w];
+            if b == 1 {
+                seg.up.matvec(xs, &mut u, pool);
+            } else {
+                seg.up.matmat(xs, b, &mut u, pool);
+            }
+            for (a, &v) in g.iter_mut().zip(u.iter()) {
+                *a *= v;
+            }
+            if oracle {
+                for t in 0..b {
+                    scores[t * cand.len() + ci] =
+                        g[t * w..(t + 1) * w].iter().map(|v| v * v).sum::<f32>();
+                }
+            }
+        }
+        acts.push(g);
+    }
+    // per-token scores and the winners
+    let keep = k.min(cand.len());
+    let mut scratch: Vec<f32> = Vec::new();
+    for t in 0..b {
+        let mut sc: Vec<(f32, usize)> = (0..cand.len())
+            .map(|ci| (scores[t * cand.len() + ci], ci))
+            .collect();
+        sc.sort_unstable_by(|x, y| y.0.total_cmp(&x.0));
+        let mut alive = vec![false; cand.len()];
+        for &(_, ci) in sc.iter().take(keep) {
+            alive[ci] = true;
+        }
+        if b > 1 {
+            for (ci, a) in acts.iter_mut().enumerate() {
+                if !alive[ci] {
+                    let w = d.segs[cand[ci]].width;
+                    a[t * w..(t + 1) * w].fill(0.0);
+                }
+            }
+        } else {
+            // decode: finish only the winners — the losers' up/down
+            // (and, with the gate score, everything but their gate)
+            // are never touched.
+            for (ci, &i) in cand.iter().enumerate() {
+                if !alive[ci] {
+                    continue;
+                }
+                let seg = &d.segs[i];
+                let w = seg.width;
+                let g = &mut acts[ci];
+                if !tube_score_oracle() {
+                    scratch.clear();
+                    scratch.resize(w, 0.0);
+                    seg.up.matvec(xs, &mut scratch, pool);
+                    for (a, &v) in g.iter_mut().zip(scratch.iter()) {
+                        *a *= v;
+                    }
+                }
+                let mut acc = vec![0.0f32; hidden];
+                seg.down.matvec(g, &mut acc, pool);
+                for (o, a) in out.iter_mut().zip(&acc) {
+                    *o += *a;
+                }
+            }
+        }
+    }
+    if b > 1 {
+        for (ci, &i) in cand.iter().enumerate() {
+            let seg = &d.segs[i];
+            let mut acc = vec![0.0f32; b * hidden];
+            seg.down.matmat(&acts[ci], b, &mut acc, pool);
+            for (o, a) in out.iter_mut().zip(&acc) {
+                *o += *a;
+            }
+        }
+    }
+    out
+}
+
+/// FFN of a defragged tube layer: the always-on core plus the tubes the
+/// task mask switches on. Each tube is a normal tensor triple, so the
+/// same kernels run it and an inactive tube's bytes are never read —
+/// that is the whole point of the defrag (a scattered mask cannot skip
+/// bytes; a contiguous one is just a smaller matrix).
+fn tube_ffn(
+    d: &DenseFfn,
+    xs: &[f32],
+    b: usize,
+    pool: Option<&Pool>,
+    mask_row: Option<&[u8]>,
+) -> Vec<f32> {
+    if tube_topk() > 0 {
+        return tube_ffn_routed(d, xs, b, pool, mask_row, tube_topk());
+    }
+    let hidden = d.down_proj.rows();
+    let core = d.gate_proj.rows();
+    let core_full = mask_row.is_none_or(|r| all_bits_on(r, core));
+    let mut out = match (b, core_full, mask_row) {
+        (1, true, _) => dense_ffn(d, xs, pool),
+        (1, false, Some(row)) => dense_ffn_masked(d, xs, pool, row),
+        (_, true, _) => dense_ffn_batch(d, xs, b, pool, None),
+        (_, false, row) => dense_ffn_batch(d, xs, b, pool, row),
+    };
+    TUBE_SCRATCH.with(|sc| {
+    let mut sc = sc.borrow_mut();
+    let [g, u, acc] = &mut *sc;
+    for seg in &d.segs {
+        if !tube_bit(mask_row, seg.start) {
+            continue;
+        }
+        let w = seg.width;
+        g.resize(b * w, 0.0);
+        if b == 1 && d.act == Act::Silu && QTensor::matvec_silu_mul(&seg.gate, &seg.up, xs, g, pool)
+        {
+            // g holds silu(gate)·up.
+        } else {
+            u.resize(b * w, 0.0);
+            if b == 1 {
+                QTensor::matvec_many([&seg.gate, &seg.up], xs, [g, u], pool);
+            } else {
+                seg.gate.matmat(xs, b, g, pool);
+                seg.up.matmat(xs, b, u, pool);
+            }
+            for i in 0..b * w {
+                g[i] = d.act.combine(g[i], u[i]);
+            }
+        }
+        acc.resize(b * hidden, 0.0);
+        acc.fill(0.0);
+        if b == 1 {
+            seg.down.matvec(g, acc, pool);
+        } else {
+            seg.down.matmat(g, b, acc, pool);
+        }
+        for (o, a) in out.iter_mut().zip(acc.iter()) {
+            *o += *a;
+        }
+    }
+    out
+    })
+}
+
+thread_local! {
+    /// gate / up / down-accumulator scratch for the tube loop — a tube
+    /// runs once per layer per token, and a fresh Vec each time is a
+    /// malloc per tube per layer per token.
+    static TUBE_SCRATCH: std::cell::RefCell<[Vec<f32>; 3]> =
+        const { std::cell::RefCell::new([Vec::new(), Vec::new(), Vec::new()]) };
 }
 
 fn dense_ffn_batch(
@@ -8862,6 +9212,16 @@ fn dense_ffn_batch(
         && b >= 32
         && crate::gpu::enabled_here()
         && !crate::gpu::mm_killed()
+        // The refit pass needs this layer's activations on the host; the
+        // fused chain keeps them on the device. Refusing it here costs
+        // one round trip and keeps every GEMM on the card — the
+        // alternative was running the whole calibration on the CPU.
+        && refit_dir().is_none()
+        // Same for the mass/hit probes. The accumulator at the bottom of
+        // this function only sees `g` when `g` came back to the host, so
+        // a fused batch would leave it summing nothing — a probe that
+        // reports zeros rather than failing, which is worse.
+        && !ffn_probe_active()
     {
         if let (Some((model, w1)), Some((_, w3)), Some((_, w2))) = (
             d.gate_proj.mapped_q4t(),
@@ -8892,14 +9252,58 @@ fn dense_ffn_batch(
     d.gate_proj.matmat(xs, b, &mut g, pool);
     let mut u = vec![0.0f32; b * inter];
     d.up_proj.matmat(xs, b, &mut u, pool);
-    for i in 0..b * inter {
-        g[i] = d.act.combine(g[i], u[i]);
+    if gate_topk() > 0 && d.act == Act::Silu {
+        for t in 0..b {
+            let row = &mut g[t * inter..(t + 1) * inter];
+            for v in row.iter_mut() {
+                *v = Act::Silu.combine(*v, 1.0);
+            }
+            keep_top_k(row, gate_topk());
+        }
+        for i in 0..b * inter {
+            g[i] *= u[i];
+        }
+    } else {
+        for i in 0..b * inter {
+            g[i] = d.act.combine(g[i], u[i]);
+        }
     }
     if let Some(row) = mask_row {
         zero_masked_cols(&mut g, b, inter, row);
     }
+    if oracle_topk() > 0 {
+        for t in 0..b {
+            keep_top_k(&mut g[t * inter..(t + 1) * inter], oracle_topk());
+        }
+    }
     let mut out = vec![0.0f32; b * hidden];
     d.down_proj.matmat(&g, b, &mut out, pool);
+    if refit_dir().is_some() {
+        let li = crate::gpu::cur_layer();
+        if li >= 0 {
+            refit_accumulate(li as usize, &g, b, inter, &out, hidden, pool);
+        }
+    }
+    // The DTG-MA probe, on the batched path: one prefill sweep gives the
+    // same per-neuron statistic the per-position probe does, and on a 27B
+    // that is minutes instead of hours.
+    FFN_PROBE.with(|pr| {
+        if let Some(acc) = pr.borrow_mut().as_mut() {
+            let li = crate::gpu::cur_layer();
+            if li < 0 {
+                return;
+            }
+            let Some(row) = acc.get_mut(li as usize) else {
+                return;
+            };
+            let sq = probe_sq();
+            for t in 0..b {
+                for (a, &v) in row.iter_mut().zip(&g[t * inter..(t + 1) * inter]) {
+                    *a += if sq { (v as f64) * (v as f64) } else { (v as f64).abs() };
+                }
+            }
+        }
+    });
     out
 }
 
@@ -9082,6 +9486,13 @@ thread_local! {
 
 /// Dense SwiGLU FFN through QTensor matvecs (any storage).
 fn dense_ffn(d: &DenseFfn, x: &[f32], pool: Option<&Pool>) -> Vec<f32> {
+    // Per-token sparsity, when the file was built for it: gate first,
+    // then only the chosen neurons' up/down rows leave the mmap.
+    if gate_topk() > 0
+        && let Some(out) = dense_ffn_dynamic(d, x, pool, gate_topk())
+    {
+        return out;
+    }
     // Whole-FFN GPU submit (этап 4.2 increment): gate → silu·up → down
     // chained in ONE command buffer with the intermediate activations
     // resident on the device — 3 per-op polls become 1 per layer. The
@@ -9131,7 +9542,20 @@ fn dense_ffn_cpu(d: &DenseFfn, x: &[f32], pool: Option<&Pool>) -> Vec<f32> {
         g.resize(inter, 0.0);
         // Fused gate+up+silu: one dispatch, no separate silu pass.
         // Falls back to matvec_many + silu loop for unsupported dtypes.
-        if d.act == Act::Silu && QTensor::matvec_silu_mul(&d.gate_proj, &d.up_proj, x, g, pool) {
+        if gate_topk() > 0 {
+            // Gate first, select, and only then pay for `up`: the
+            // measurement arm computes both and zeroes the losers, which
+            // is the same arithmetic.
+            u.resize(inter, 0.0);
+            QTensor::matvec_many([&d.gate_proj, &d.up_proj], x, [g, u], pool);
+            for i in 0..inter {
+                g[i] = Act::Silu.combine(g[i], 1.0);
+            }
+            keep_top_k(g, gate_topk());
+            for i in 0..inter {
+                g[i] *= u[i];
+            }
+        } else if d.act == Act::Silu && QTensor::matvec_silu_mul(&d.gate_proj, &d.up_proj, x, g, pool) {
             // g now holds silu(gate)·up directly.
         } else {
             u.resize(inter, 0.0);
@@ -9143,21 +9567,584 @@ fn dense_ffn_cpu(d: &DenseFfn, x: &[f32], pool: Option<&Pool>) -> Vec<f32> {
         }
         // DTG-MA bake probe (Patent 2): accumulate this layer's
         // per-neuron activation mass while a probe pass is active.
+        // `CMF_FFN_PROBE_TOPK=k` switches the statistic from mass to a
+        // HIT COUNT — how many tokens rank the neuron in their own top
+        // k. Mass asks "how loud is this neuron overall", the count
+        // asks "how often does this task actually need it", and the two
+        // rank neurons differently whenever a few tokens are loud.
         FFN_PROBE.with(|pr| {
             if let Some(acc) = pr.borrow_mut().as_mut() {
                 let li = crate::gpu::cur_layer();
                 if li >= 0 {
                     if let Some(row) = acc.get_mut(li as usize) {
-                        for (a, &v) in row.iter_mut().zip(g.iter()) {
-                            *a += (v as f64).abs();
+                        match probe_topk() {
+                            0 if probe_sq() => {
+                                for (a, &v) in row.iter_mut().zip(g.iter()) {
+                                    *a += (v as f64) * (v as f64);
+                                }
+                            }
+                            0 if probe_signed() => {
+                                for (a, &v) in row.iter_mut().zip(g.iter()) {
+                                    *a += v as f64;
+                                }
+                            }
+                            0 => {
+                                for (a, &v) in row.iter_mut().zip(g.iter()) {
+                                    *a += (v as f64).abs();
+                                }
+                            }
+                            k => {
+                                let n = g.len();
+                                let k = k.min(n);
+                                let mut mag: Vec<f32> = g.iter().map(|v| v.abs()).collect();
+                                let (_, kth, _) = mag.select_nth_unstable_by(k - 1, |a, b| {
+                                    b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+                                });
+                                let thr = *kth;
+                                for (a, &v) in row.iter_mut().zip(g.iter()) {
+                                    if v.abs() >= thr {
+                                        *a += 1.0;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
         });
+        if oracle_topk() > 0 {
+            keep_top_k(g, oracle_topk());
+        }
+        {
+            let li = crate::gpu::cur_layer();
+            if li >= 0 {
+                adump_row(li as usize, g);
+            }
+        }
         let mut out = attention::take_buf(d.down_proj.rows());
         d.down_proj.matvec(g, &mut out, pool);
         out
+    })
+}
+
+/// Online accumulators for the AWNP refit of a narrowed FFN.
+///
+/// The refit needs `Gss = A_SᵀA_S` and `YA = YᵀA_S` per layer, where `A_S`
+/// are the calibration activations of the KEPT neurons and `Y` the full
+/// FFN output. Both are small enough to hold; the thing that is not is
+/// the activations they are built from — a 27B layer would dump a
+/// gigabyte per thousand tokens. So they are accumulated as the
+/// calibration runs and written once at the end.
+///
+/// `CMF_FFN_REFIT=<dir>` holds `support.<L>.u32` (a u32 count then the
+/// kept indices) for every layer to accumulate; `CMF_FFN_REFIT_FROM/TO`
+/// bound the layer span so the accumulators fit in RAM.
+pub struct RefitAcc {
+    pub support: Vec<u32>,
+    pub gss: Vec<f32>,
+    pub ya: Vec<f32>,
+    pub hidden: usize,
+    pub tokens: u64,
+    /// Activations staged transposed ([ns, t] and [hidden, t]) until the
+    /// batch is worth a GEMM. The product costs `ns²` to move and add
+    /// REGARDLESS of how many tokens went into it, so folding 16 chunks
+    /// into one call cuts that cost 16× — it was 15 TB of traffic per
+    /// calibration pass at one call per 256 tokens.
+    pub buf_g: Vec<f32>,
+    pub buf_o: Vec<f32>,
+    pub buf_t: usize,
+}
+
+/// The product buffer is SHARED across layers — one 473 MB allocation,
+/// not one per layer (that was 30 GB of nothing on a 64-layer model).
+/// It lives under the same lock as the accumulators.
+type RefitState = (
+    std::collections::HashMap<usize, RefitAcc>,
+    Vec<f32>,
+);
+
+static REFIT: std::sync::OnceLock<Option<(String, std::sync::Mutex<RefitState>)>> =
+    std::sync::OnceLock::new();
+
+/// Is an FFN probe accumulator installed on this thread? The fused GPU
+/// FFN must decline while one is, or the probe silently measures zero.
+fn ffn_probe_active() -> bool {
+    FFN_PROBE.with(|p| p.borrow().is_some())
+}
+
+fn refit_dir() -> Option<&'static (String, std::sync::Mutex<RefitState>)> {
+    REFIT
+        .get_or_init(|| {
+            std::env::var("CMF_FFN_REFIT").ok().map(|d| {
+                (
+                    d,
+                    std::sync::Mutex::new((std::collections::HashMap::new(), Vec::new())),
+                )
+            })
+        })
+        .as_ref()
+}
+
+/// Accumulate one prefill panel into the layer's refit statistics.
+fn refit_accumulate(
+    li: usize,
+    g: &[f32],
+    b: usize,
+    inter: usize,
+    out: &[f32],
+    hidden: usize,
+    pool: Option<&Pool>,
+) {
+    let Some((dir, map)) = refit_dir() else {
+        return;
+    };
+    static SPAN: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    let (from, to) = *SPAN.get_or_init(|| {
+        let g = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        (g("CMF_FFN_REFIT_FROM", 0), g("CMF_FFN_REFIT_TO", usize::MAX))
+    });
+    if li < from || li > to {
+        return;
+    }
+    let mut guard = map.lock().unwrap();
+    let (map, shared) = &mut *guard;
+    let acc = match map.entry(li) {
+        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+        std::collections::hash_map::Entry::Vacant(e) => {
+            let path = format!("{dir}/support.{li}.u32");
+            let Ok(bytes) = std::fs::read(&path) else {
+                eprintln!("refit: no {path} — layer {li} skipped");
+                return;
+            };
+            let n = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+            let support: Vec<u32> = bytes[4..4 + n * 4]
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            eprintln!(
+                "refit: layer {li} support {n} ({:.0} MB of accumulator)",
+                (n * n + hidden * n) as f64 * 4.0 / 1e6
+            );
+            e.insert(RefitAcc {
+                gss: vec![0.0; n * n],
+                ya: vec![0.0; hidden * n],
+                buf_g: Vec::new(),
+                buf_o: Vec::new(),
+                buf_t: 0,
+                support,
+                hidden,
+                tokens: 0,
+            })
+        }
+    };
+    let ns = acc.support.len();
+    // Stage this chunk transposed; the GEMM fires once the batch is full.
+    let cap = refit_batch();
+    if acc.buf_g.is_empty() {
+        acc.buf_g = vec![0.0; ns * cap];
+        acc.buf_o = vec![0.0; hidden * cap];
+    }
+    let take = b.min(cap - acc.buf_t);
+    for t in 0..take {
+        let col = acc.buf_t + t;
+        for (j, &n) in acc.support.iter().enumerate() {
+            acc.buf_g[j * cap + col] = g[t * inter + n as usize];
+        }
+        for h in 0..hidden {
+            acc.buf_o[h * cap + col] = out[t * hidden + h];
+        }
+    }
+    acc.buf_t += take;
+    acc.tokens += take as u64;
+    if acc.buf_t < cap {
+        return;
+    }
+    let bt = acc.buf_t;
+    acc.buf_t = 0;
+    // The GEMM WRITES its C (it zeroes the accumulators it uses), so the
+    // chunk product lands in scratch and is added on — the one thing that
+    // silently turns a Gram over 13 000 tokens into a Gram over 256.
+    // Both products are `C[n, m] += X[n, b] · Yᵀ[b, m]` with X and Y
+    // stored row-major [·, b] — exactly `gemm_nt_f32`'s shape, so the
+    // card does them when it is up (this is the whole calibration's
+    // cost: O(|S|²) per token, 2.9 PFLOP for a 27B pass). The tiled CPU
+    // loop stays as the fallback. Neither accumulates, so the product
+    // lands in scratch and is added on.
+    let RefitAcc {
+        gss, ya, buf_g, buf_o, ..
+    } = acc;
+    let need = (ns * ns).max(hidden * ns);
+    if shared.len() < need {
+        shared.resize(need, 0.0);
+    }
+    let scratch = &mut shared[..];
+    let _ = bt;
+    if crate::gpu::gemm_nt_f32_transient(buf_g, buf_g, &mut scratch[..ns * ns], ns, cap, ns) {
+        add_into(gss, &scratch[..ns * ns], pool);
+        if crate::gpu::gemm_nt_f32_transient(buf_o, buf_g, &mut scratch[..hidden * ns], hidden, cap, ns) {
+            add_into(ya, &scratch[..hidden * ns], pool);
+        } else {
+            accum_outer_t(ya, hidden, ns, cap, buf_o, buf_g, pool);
+        }
+    } else {
+        accum_outer_t(gss, ns, ns, cap, buf_g, buf_g, pool);
+        accum_outer_t(ya, hidden, ns, cap, buf_o, buf_g, pool);
+    }
+    // No zeroing: the batch is always filled exactly (cap is a multiple
+    // of the prefill chunk), and a memset of 178 MB a layer would cost
+    // more than the GEMM.
+}
+
+/// `CMF_FFN_REFIT_BATCH` — tokens staged before each GEMM (default 4096).
+fn refit_batch() -> usize {
+    static B: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *B.get_or_init(|| {
+        std::env::var("CMF_FFN_REFIT_BATCH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4096)
+    })
+}
+
+/// `c[m, n] += Σ_t left[m, t]·right[n, t]` — both operands transposed,
+/// the CPU fallback for the staged batch.
+fn accum_outer_t(
+    c: &mut [f32],
+    m: usize,
+    n: usize,
+    b: usize,
+    left: &[f32],
+    right: &[f32],
+    pool: Option<&Pool>,
+) {
+    let ptr = SendMut(c.as_mut_ptr());
+    let body = |i: usize| {
+        let ptr = &ptr;
+        let row = unsafe { std::slice::from_raw_parts_mut(ptr.0.add(i * n), n) };
+        for t in 0..b {
+            let a = left[i * b + t];
+            if a == 0.0 {
+                continue;
+            }
+            for (j, o) in row.iter_mut().enumerate() {
+                *o += a * right[j * b + t];
+            }
+        }
+    };
+    match pool {
+        Some(p) if m > 1 => p.run_rows(m, &|s, e| {
+            for i in s..e {
+                body(i);
+            }
+        }),
+        _ => {
+            for i in 0..m {
+                body(i);
+            }
+        }
+    }
+}
+
+/// `dst += src`, spread over the pool — at 118 M floats a layer this is
+/// not a loop to leave on one core.
+fn add_into(dst: &mut [f32], src: &[f32], pool: Option<&Pool>) {
+    let n = dst.len().min(src.len());
+    match pool {
+        Some(p) if n >= 1 << 16 => {
+            let ptr = SendMut(dst.as_mut_ptr());
+            let f = |s: usize, e: usize| {
+                let ptr = &ptr;
+                for blk in s..e {
+                    let (a, b) = (blk * 4096, ((blk + 1) * 4096).min(n));
+                    for i in a..b {
+                        unsafe { *ptr.0.add(i) += src[i] };
+                    }
+                }
+            };
+            p.run_rows(n.div_ceil(4096), &f);
+        }
+        _ => {
+            for (d, v) in dst.iter_mut().zip(&src[..n]) {
+                *d += *v;
+            }
+        }
+    }
+}
+
+/// `c[m, n] += Σ_t left[t, m]·right[t, n]`, with `left` stored [m, t] and
+/// `right` [t, n]. Tiled over the rows of `c` so a tile stays in cache
+/// while each token's `right` row streams past it once, and parallel
+/// over tiles.
+fn accum_outer(
+    c: &mut [f32],
+    m: usize,
+    n: usize,
+    b: usize,
+    left: &[f32],
+    right: &[f32],
+    pool: Option<&Pool>,
+) {
+    const TILE: usize = 32;
+    let tiles = m.div_ceil(TILE);
+    let cp = SendMut(c.as_mut_ptr());
+    let body = |ti: usize| {
+        let cp = &cp;
+        let i0 = ti * TILE;
+        let i1 = (i0 + TILE).min(m);
+        for t in 0..b {
+            let r = &right[t * n..t * n + n];
+            for i in i0..i1 {
+                let a = left[i * b + t];
+                if a == 0.0 {
+                    continue;
+                }
+                // SAFETY: tiles partition c's rows; workers never overlap.
+                let row = unsafe { std::slice::from_raw_parts_mut(cp.0.add(i * n), n) };
+                for (o, v) in row.iter_mut().zip(r) {
+                    *o += a * *v;
+                }
+            }
+        }
+    };
+    match pool {
+        Some(p) if tiles > 1 => p.run_rows(tiles, &|s, e| {
+            for ti in s..e {
+                body(ti);
+            }
+        }),
+        _ => {
+            for ti in 0..tiles {
+                body(ti);
+            }
+        }
+    }
+}
+
+/// Write what the calibration accumulated: `gss.<L>.f32` and `ya.<L>.f32`.
+pub fn refit_flush() -> usize {
+    let Some((dir, map)) = refit_dir() else {
+        return 0;
+    };
+    let guard = map.lock().unwrap();
+    let mut n = 0;
+    for (li, acc) in guard.0.iter() {
+        // A silently truncated write here is a Gram that reshapes to
+        // nothing an hour later — say it out loud instead.
+        let w = |name: &str, v: &[f32]| {
+            let path = format!("{dir}/{name}.{li}.f32");
+            let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+            match std::fs::write(&path, &bytes) {
+                Ok(()) => {}
+                Err(e) => eprintln!("refit: FAILED to write {path} ({} MB): {e}", bytes.len() / 1_000_000),
+            }
+        };
+        w("gss", &acc.gss);
+        w("ya", &acc.ya);
+        println!(
+            "refit L{li}: {} support, {} tokens, hidden {}",
+            acc.support.len(),
+            acc.tokens,
+            acc.hidden
+        );
+        n += 1;
+    }
+    n
+}
+
+/// `CMF_FFN_ADUMP=<prefix>` — append every probed token's FFN activation
+/// row to `<prefix>.<layer>.f16`. The co-activation record: which
+/// neurons fire together, which is what a tube has to group if a token
+/// is ever going to open one tube instead of sixteen.
+fn adump_row(li: usize, g: &[f32]) {
+    use std::io::Write as _;
+    static FILES: std::sync::OnceLock<
+        Option<(String, std::sync::Mutex<std::collections::HashMap<usize, std::fs::File>>)>,
+    > = std::sync::OnceLock::new();
+    let Some((prefix, map)) = FILES
+        .get_or_init(|| {
+            std::env::var("CMF_FFN_ADUMP")
+                .ok()
+                .map(|p| (p, std::sync::Mutex::new(std::collections::HashMap::new())))
+        })
+        .as_ref()
+    else {
+        return;
+    };
+    // `CMF_FFN_ADUMP_FROM/_TO` narrow the dump to a layer span, so a big
+    // calibration run fits on disk in a few passes instead of one.
+    static SPAN: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    let (from, to) = *SPAN.get_or_init(|| {
+        let g = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        (g("CMF_FFN_ADUMP_FROM", 0), g("CMF_FFN_ADUMP_TO", usize::MAX))
+    });
+    if li < from || li > to {
+        return;
+    }
+    let mut map = map.lock().unwrap();
+    let f = map.entry(li).or_insert_with(|| {
+        std::fs::File::create(format!("{prefix}.{li}.f16")).expect("adump file")
+    });
+    let mut bytes = Vec::with_capacity(g.len() * 2);
+    for v in g {
+        bytes.extend_from_slice(&cortiq_core::quant::f32_to_f16(*v).to_le_bytes());
+    }
+    let _ = f.write_all(&bytes);
+}
+
+/// `CMF_FFN_ORACLE_TOPK` — keep only the k largest |silu(g)·u| of each
+/// token and zero the rest. Not a serving mode: it is the CEILING of
+/// contextual sparsity — what a per-token router would be chasing —
+/// measured by cheating, since the selection reads the very activations
+/// it would have to predict.
+fn oracle_topk() -> usize {
+    static K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *K.get_or_init(|| {
+        std::env::var("CMF_FFN_ORACLE_TOPK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// `CMF_FFN_GATE_TOPK` — the REALIZABLE cousin of the oracle: rank the
+/// neurons by their gate alone (which the kernel has computed anyway
+/// before it reads `up`), keep the k best, and drop the rest. Every
+/// dropped neuron's `up` row and `down` column stay unread, so this is
+/// the sparsity a serving path can actually take without a router.
+fn gate_topk() -> usize {
+    static K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *K.get_or_init(|| {
+        std::env::var("CMF_FFN_GATE_TOPK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// `CMF_FFN_GATE_BLOCK` — select in blocks of B neurons instead of one
+/// by one. A scattered per-neuron choice cannot be read efficiently (a
+/// row at a time, no prefetch runway); a block of 32 is a contiguous
+/// 32-row slab of `up` and of the transposed `down`, which the ordinary
+/// kernels stream. The question the measurement answers is what the
+/// block costs in quality.
+fn gate_block() -> usize {
+    static B: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *B.get_or_init(|| {
+        std::env::var("CMF_FFN_GATE_BLOCK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1)
+    })
+}
+
+/// Zero all but the `k` largest BLOCKS (by summed square) of a row.
+fn keep_top_blocks(g: &mut [f32], keep_n: usize, block: usize) {
+    let n = g.len();
+    let nb = n.div_ceil(block);
+    let kb = (keep_n.div_ceil(block)).clamp(1, nb);
+    if kb >= nb {
+        return;
+    }
+    let mut score: Vec<f32> = (0..nb)
+        .map(|b| {
+            g[b * block..((b + 1) * block).min(n)]
+                .iter()
+                .map(|v| v * v)
+                .sum::<f32>()
+        })
+        .collect();
+    let mut ord = score.clone();
+    let (_, kth, _) = ord.select_nth_unstable_by(kb - 1, |a, b| {
+        b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let thr = *kth;
+    for b in 0..nb {
+        if score[b] < thr {
+            g[b * block..((b + 1) * block).min(n)].fill(0.0);
+        }
+    }
+    score.clear();
+}
+
+/// Zero all but the `k` largest magnitudes of one token's activation row.
+fn keep_top_k(g: &mut [f32], k: usize) {
+    if gate_block() > 1 {
+        return keep_top_blocks(g, k, gate_block());
+    }
+    let n = g.len();
+    if k == 0 || k >= n {
+        return;
+    }
+    let mut mag: Vec<f32> = g.iter().map(|v| v.abs()).collect();
+    let (_, kth, _) = mag.select_nth_unstable_by(k - 1, |a, b| {
+        b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let thr = *kth;
+    for v in g.iter_mut() {
+        if v.abs() < thr {
+            *v = 0.0;
+        }
+    }
+}
+
+/// `CMF_FFN_PROBE_SQ` — accumulate Σa², so the dump divided by the token
+/// count and square-rooted is the RMS activation trace Patent 12 weights
+/// its matrices by.
+fn probe_sq() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| std::env::var("CMF_FFN_PROBE_SQ").is_ok())
+}
+
+/// `CMF_FFN_PROBE_SIGNED` — accumulate the SIGNED activation sum
+/// instead of its magnitude: what a dropped neuron contributes ON
+/// AVERAGE, which is the bias a narrowed FFN can add back for free.
+fn probe_signed() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| std::env::var("CMF_FFN_PROBE_SIGNED").is_ok())
+}
+
+/// `CMF_FFN_MEANFILL=<file>` — a masked-out neuron contributes its MEAN
+/// activation instead of zero (`u32 layers, u32 inter, f32[…]`, the mass
+/// dump layout, holding per-neuron means). Dropping a neuron outright
+/// also drops its average contribution, which shifts the layer output by
+/// a constant; filling the mean back is one add per layer and costs no
+/// bytes off the bus. This is the measurement arm — in a tube file the
+/// same correction ships as a per-task bias vector.
+fn meanfill() -> Option<&'static (usize, Vec<f32>)> {
+    static M: std::sync::OnceLock<Option<(usize, Vec<f32>)>> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let p = std::env::var("CMF_FFN_MEANFILL").ok()?;
+        let b = std::fs::read(&p).ok()?;
+        let inter = u32::from_le_bytes(b[4..8].try_into().ok()?) as usize;
+        let vals: Vec<f32> = b[8..]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        eprintln!("meanfill: {} value(s), inter {inter}", vals.len());
+        Some((inter, vals))
+    })
+    .as_ref()
+}
+
+/// `CMF_FFN_PROBE_TOPK` — 0 (default) = accumulate mass, k>0 = count
+/// how often a neuron lands in a token's top k.
+fn probe_topk() -> usize {
+    static K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *K.get_or_init(|| {
+        std::env::var("CMF_FFN_PROBE_TOPK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
     })
 }
 
@@ -9166,6 +10153,133 @@ thread_local! {
     /// accumulator, alive only during `Pipeline::probe_ffn_mass`.
     static FFN_PROBE: std::cell::RefCell<Option<Vec<Vec<f64>>>> =
         const { std::cell::RefCell::new(None) };
+}
+
+/// Per-token structured sparsity, paid for in bytes.
+///
+/// The gate is the cheapest third of an FFN and it already says which
+/// neurons matter: `silu(gate)` near zero means the neuron contributes
+/// nothing whatever `up` says. So compute every gate, keep the `k`
+/// loudest, and read ONLY those neurons' `up` rows and `down` rows —
+/// the latter needs `down_proj` stored transposed, otherwise a neuron's
+/// down weights are a strided column and "reading only those" costs a
+/// full cache line each.
+///
+/// Returns `None` when the file has no transposed `down` (the caller
+/// then runs the ordinary dense path).
+fn dense_ffn_dynamic(d: &DenseFfn, x: &[f32], pool: Option<&Pool>, k: usize) -> Option<Vec<f32>> {
+    let dt = d.down_t.as_ref()?;
+    let inter = d.gate_proj.rows();
+    let hidden = dt.cols();
+    if k == 0 || k >= inter || d.act != Act::Silu {
+        return None;
+    }
+    DYN_SCRATCH.with(|sc| {
+        let mut sc = sc.borrow_mut();
+        let DynScratch { g, mag, live, parts } = &mut *sc;
+        g.resize(inter, 0.0);
+        d.gate_proj.matvec(x, g, pool);
+        for v in g.iter_mut() {
+            *v = inference::silu(*v);
+        }
+        // The k-th largest |silu(gate)| is the threshold; ties keep more,
+        // which is the safe side.
+        mag.clear();
+        mag.extend(g.iter().map(|v| v.abs()));
+        let (_, kth, _) = mag.select_nth_unstable_by(k - 1, |a, b| {
+            b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let thr = *kth;
+        live.clear();
+        live.extend((0..inter as u32).filter(|&n| g[n as usize].abs() >= thr));
+        let mut out = vec![0.0f32; hidden];
+        match pool {
+            Some(p) if live.len() >= 64 => {
+                let nw = p.n_workers() + 1;
+                parts.clear();
+                parts.resize(nw * hidden, 0.0);
+                let ptr = SendMut(parts.as_mut_ptr());
+                let n = live.len();
+                let live_ref: &[u32] = live;
+                let g_ref: &[f32] = g;
+                p.run(&|w, workers| {
+                    let chunk = n.div_ceil(workers);
+                    let (s, e) = (w * chunk, ((w + 1) * chunk).min(n));
+                    if s >= e {
+                        return;
+                    }
+                    WORKER_SCRATCH.with(|ws| {
+                        let mut ws = ws.borrow_mut();
+                        let [scratch, acc] = &mut *ws;
+                        scratch.resize(hidden.max(x.len()), 0.0);
+                        acc.clear();
+                        acc.resize(hidden, 0.0);
+                        for (o, &nrm) in live_ref[s..e].iter().enumerate() {
+                            // One neuron of runway: the next row's lines
+                            // start moving while this one is multiplied.
+                            if let Some(&nx) = live_ref[s..e].get(o + 1) {
+                                d.up_proj.prefetch_row(nx as usize);
+                                dt.prefetch_row(nx as usize);
+                            }
+                            let idx = nrm as usize;
+                            let up = d.up_proj.row_dot(idx, x, scratch);
+                            let a = g_ref[idx] * up;
+                            if a != 0.0 {
+                                dt.add_row_scaled(idx, a, acc, scratch);
+                            }
+                        }
+                        for (j, v) in acc.iter().enumerate() {
+                            unsafe { *ptr.at(w * hidden + j) = *v };
+                        }
+                    });
+                });
+                for w in 0..nw {
+                    for (j, o) in out.iter_mut().enumerate() {
+                        *o += parts[w * hidden + j];
+                    }
+                }
+            }
+            _ => {
+                WORKER_SCRATCH.with(|ws| {
+                    let mut ws = ws.borrow_mut();
+                    let [scratch, _acc] = &mut *ws;
+                    scratch.resize(hidden.max(x.len()), 0.0);
+                    for &nrm in live.iter() {
+                        let idx = nrm as usize;
+                        let up = d.up_proj.row_dot(idx, x, scratch);
+                        let a = g[idx] * up;
+                        if a != 0.0 {
+                            dt.add_row_scaled(idx, a, &mut out, scratch);
+                        }
+                    }
+                });
+            }
+        }
+        Some(out)
+    })
+}
+
+/// Caller-side scratch of the dynamic path — one allocation per thread,
+/// not one per layer per token (that alone cost a third of the decode).
+struct DynScratch {
+    g: Vec<f32>,
+    mag: Vec<f32>,
+    live: Vec<u32>,
+    parts: Vec<f32>,
+}
+
+thread_local! {
+    static DYN_SCRATCH: std::cell::RefCell<DynScratch> = const {
+        std::cell::RefCell::new(DynScratch {
+            g: Vec::new(),
+            mag: Vec::new(),
+            live: Vec::new(),
+            parts: Vec::new(),
+        })
+    };
+    /// Pool-worker scratch: the row buffer and this worker's partial sum.
+    static WORKER_SCRATCH: std::cell::RefCell<[Vec<f32>; 2]> =
+        const { std::cell::RefCell::new([Vec::new(), Vec::new()]) };
 }
 
 /// `dense_ffn_cpu` with a per-visit mask landing on the activations —
@@ -10051,6 +11165,7 @@ fn ffn_forward(
     experts_allowed: Option<&[bool]>,
 ) -> Vec<f32> {
     match ffn {
+        FfnKind::Dense(d) if !d.segs.is_empty() => tube_ffn(d, x, 1, pool, None),
         FfnKind::Dense(d) => dense_ffn(d, x, pool),
         FfnKind::Moe(m) => moe_ffn(m, x, pool, experts_allowed),
         // Dual-branch layers need the raw residual — their callers
@@ -10071,6 +11186,14 @@ fn ffn_forward_pair(
     experts_allowed: Option<&[bool]>,
 ) -> (Vec<f32>, Vec<f32>) {
     let d = match ffn {
+        // A tube layer has nothing to fuse across the pair — the tubes
+        // are separate matrices; two singles are the honest path.
+        FfnKind::Dense(d) if !d.segs.is_empty() => {
+            return (
+                tube_ffn(d, x1, 1, pool, None),
+                tube_ffn(d, x2, 1, pool, None),
+            );
+        }
         FfnKind::Dense(d) => d,
         FfnKind::Moe(m) => {
             return (
@@ -10135,6 +11258,126 @@ mod tests {
     /// zeroed (mask × mmap correctness). On F32 tensors this is EXACT —
     /// it validates the row_dot / add_col_scaled / scatter indexing, the
     /// bug-prone part. The q8 branches reuse the golden-tested linear
+    /// The per-token sparse path reads a transposed `down`; it must
+    /// agree with the arm that computes everything and zeroes the
+    /// losers, or the speed measurement is measuring a different model.
+    #[test]
+    fn dynamic_ffn_equals_the_zeroing_arm() {
+        let (hidden, inter) = (8usize, 32usize);
+        let synth = |n: usize, salt: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| (((i * 29 + salt * 13 + 7) % 89) as f32 / 89.0 - 0.5) * 0.6)
+                .collect()
+        };
+        let down = synth(hidden * inter, 3);
+        let mut down_t = vec![0.0f32; inter * hidden];
+        for r in 0..hidden {
+            for c in 0..inter {
+                down_t[c * hidden + r] = down[r * inter + c];
+            }
+        }
+        let d = DenseFfn {
+            gate_proj: QTensor::from_f32(synth(inter * hidden, 1), inter, hidden),
+            up_proj: QTensor::from_f32(synth(inter * hidden, 2), inter, hidden),
+            down_proj: QTensor::from_f32(down.clone(), hidden, inter),
+            act: Act::Silu,
+            down_t: Some(QTensor::from_f32(down_t, inter, hidden)),
+            segs: Vec::new(),
+        };
+        let x = synth(hidden, 11);
+        let k = 12usize;
+        let got = dense_ffn_dynamic(&d, &x, None, k).expect("down_t present");
+        // Reference: full compute, keep the k loudest |silu(gate)|.
+        let mut g = vec![0.0f32; inter];
+        d.gate_proj.matvec(&x, &mut g, None);
+        let mut u = vec![0.0f32; inter];
+        d.up_proj.matvec(&x, &mut u, None);
+        for v in g.iter_mut() {
+            *v = inference::silu(*v);
+        }
+        keep_top_k(&mut g, k);
+        for i in 0..inter {
+            g[i] *= u[i];
+        }
+        let mut want = vec![0.0f32; hidden];
+        d.down_proj.matvec(&g, &mut want, None);
+        for (a, b) in want.iter().zip(&got) {
+            assert!((a - b).abs() < 1e-5, "dynamic {b} vs reference {a}");
+        }
+    }
+
+    /// A tube layer is the same layer, re-cut. With every tube open the
+    /// answer must equal the dense FFN over the concatenated neurons
+    /// (the permutation is an identity on the layer's function); with a
+    /// tube closed it must equal the dense FFN with those neurons
+    /// zeroed — the mask semantics, now paid for in bytes not read.
+    #[test]
+    fn tube_ffn_open_equals_dense_and_closed_equals_masked() {
+        let (hidden, core, tube) = (8usize, 12usize, 8usize);
+        let inter = core + tube;
+        let synth = |n: usize, salt: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| (((i * 41 + salt * 17 + 5) % 97) as f32 / 97.0 - 0.5) * 0.5)
+                .collect()
+        };
+        let (g_all, u_all) = (synth(inter * hidden, 1), synth(inter * hidden, 2));
+        let d_all = synth(hidden * inter, 3);
+        // The dense layer, and the same weights cut into core + tube.
+        let dense = DenseFfn {
+            gate_proj: QTensor::from_f32(g_all.clone(), inter, hidden),
+            up_proj: QTensor::from_f32(u_all.clone(), inter, hidden),
+            down_proj: QTensor::from_f32(d_all.clone(), hidden, inter),
+            act: Act::Silu,
+            down_t: None,
+            segs: Vec::new(),
+        };
+        let rows = |v: &[f32], a: usize, b: usize| -> Vec<f32> {
+            v[a * hidden..b * hidden].to_vec()
+        };
+        let cols = |v: &[f32], a: usize, b: usize| -> Vec<f32> {
+            let mut o = Vec::with_capacity(hidden * (b - a));
+            for r in 0..hidden {
+                o.extend_from_slice(&v[r * inter + a..r * inter + b]);
+            }
+            o
+        };
+        let tubed = DenseFfn {
+            down_t: None,
+            gate_proj: QTensor::from_f32(rows(&g_all, 0, core), core, hidden),
+            up_proj: QTensor::from_f32(rows(&u_all, 0, core), core, hidden),
+            down_proj: QTensor::from_f32(cols(&d_all, 0, core), hidden, core),
+            act: Act::Silu,
+            segs: vec![FfnSeg {
+                gate: QTensor::from_f32(rows(&g_all, core, inter), tube, hidden),
+                up: QTensor::from_f32(rows(&u_all, core, inter), tube, hidden),
+                down: QTensor::from_f32(cols(&d_all, core, inter), hidden, tube),
+                start: core,
+                width: tube,
+            }],
+        };
+        let x = synth(hidden, 7);
+        let want = dense_ffn(&dense, &x, None);
+        let got = tube_ffn(&tubed, &x, 1, None, None);
+        for (a, b) in want.iter().zip(&got) {
+            assert!((a - b).abs() < 1e-5, "open tube: {a} vs {b}");
+        }
+        // Closed tube: bits on for the core, off for the tube.
+        let mut bits = vec![0u8; inter.div_ceil(8)];
+        for n in 0..core {
+            bits[n / 8] |= 1 << (n % 8);
+        }
+        let closed = tube_ffn(&tubed, &x, 1, None, Some(&bits));
+        let masked = dense_ffn_masked(&dense, &x, None, &bits);
+        for (a, b) in masked.iter().zip(&closed) {
+            assert!((a - b).abs() < 1e-5, "closed tube: {a} vs {b}");
+        }
+        // The batched arm must agree with the single-position one.
+        let batch = tube_ffn(&tubed, &x, 1, None, Some(&bits));
+        for (a, b) in closed.iter().zip(&batch) {
+            assert_eq!(a, b, "batch arm disagrees with decode arm");
+        }
+    }
+
     /// scale, structurally identical to the matvec kernels.
     #[test]
     fn sparse_ffn_quant_equals_dense_with_inactive_zeroed() {
@@ -10149,6 +11392,8 @@ mod tests {
             up_proj: QTensor::from_f32(synth(inter * hidden, 2), inter, hidden),
             down_proj: QTensor::from_f32(synth(hidden * inter, 3), hidden, inter),
             act: Act::Silu,
+            down_t: None,
+            segs: Vec::new(),
         };
         let x = synth(hidden, 9);
         // Active = every 3rd neuron.
@@ -10212,7 +11457,9 @@ mod tests {
                     up_proj: qt(inter, h, 316),
                     down_proj: qt(h, inter, 317),
                     act: Act::Silu,
-                }),
+            down_t: None,
+            segs: Vec::new(),
+        }),
                 attn: AttnKind::Full {
                     bias: None,
                     wq: qt(heads * hd, h, 311),
@@ -10423,12 +11670,16 @@ mod tests {
             up_proj: matrix(vec![0.0; 4]),
             down_proj: matrix(vec![0.0; 4]),
             act: Act::Silu,
+            down_t: None,
+            segs: Vec::new(),
         };
         let shared = DenseFfn {
             gate_proj: identity(),
             up_proj: identity(),
             down_proj: identity(),
             act: Act::Silu,
+            down_t: None,
+            segs: Vec::new(),
         };
         let x = [1.0, 2.0];
         let expected = dense_ffn(&shared, &x, None);

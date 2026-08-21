@@ -102,6 +102,11 @@ pub struct BakeArtifacts {
     pub gate_up: Vec<Option<(Vec<f32>, Vec<f32>)>>,
     /// Which layers went through Phase B.
     pub fcd_layers: Vec<usize>,
+    /// The trained mask logits, per virtual layer — a CONTINUOUS
+    /// per-neuron importance the hard keep flags throw away. The tube
+    /// planner ranks and orders neurons by these, not by raw
+    /// activation mass.
+    pub logits: Vec<Vec<f32>>,
 }
 
 const CLIP: f64 = 1.0;
@@ -552,7 +557,7 @@ pub fn replica_score_file_mask(
         sink: 1,
         rect: crate::nystrom::O1_DEFAULT_RECT,
     };
-    let fm = FcdModel::from_cmf(model, &o1_off)?;
+    let fm = FcdModel::from_cmf(model, &o1_off, false)?;
     let nl = fm.layers.len();
     let loops = fm.loops.max(1);
     let vn = nl * loops;
@@ -613,7 +618,7 @@ pub fn skill_bake(
         sink: 1,
         rect: crate::nystrom::O1_DEFAULT_RECT,
     };
-    let fm = FcdModel::from_cmf(model, &o1_off)?;
+    let fm = FcdModel::from_cmf(model, &o1_off, false)?;
     let nl = fm.layers.len();
     let inter = fm.layers.iter().map(|l| l.inter).max().unwrap_or(0);
     if fm.layers.iter().any(|l| l.inter != inter) {
@@ -1011,6 +1016,7 @@ pub fn skill_bake(
         down: down_out,
         gate_up,
         fcd_layers: fcd,
+        logits: logits.clone(),
     };
     Ok((report, arts))
 }
