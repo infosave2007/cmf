@@ -24,7 +24,7 @@ fn rel(a: &[f32], b: &[f32]) -> f32 {
 }
 
 #[test]
-fn device_kv_pool_matches_the_cpu() {
+fn device_kv_pool_matches_the_cpu_needs_cmf_gpu() {
     // Nobody asked for wgpu here — a legitimate skip, and what CI runners
     // look like. Asked-for-and-absent is a different thing and fails below:
     // a reserved word in one shader once took the context down and every GPU
@@ -87,7 +87,7 @@ fn device_kv_pool_matches_the_cpu() {
 }
 
 #[test]
-fn device_index_scores_match_the_cpu() {
+fn device_index_scores_match_the_cpu_needs_cmf_gpu() {
     // Nobody asked for wgpu here — a legitimate skip, and what CI runners
     // look like. Asked-for-and-absent is a different thing and fails below:
     // a reserved word in one shader once took the context down and every GPU
@@ -125,7 +125,7 @@ fn device_index_scores_match_the_cpu() {
 }
 
 #[test]
-fn device_top_k_matches_the_cpu() {
+fn device_top_k_matches_the_cpu_needs_cmf_gpu() {
     // Nobody asked for wgpu here — a legitimate skip, and what CI runners
     // look like. Asked-for-and-absent is a different thing and fails below:
     // a reserved word in one shader once took the context down and every GPU
@@ -172,7 +172,7 @@ fn device_top_k_matches_the_cpu() {
 /// matvec has its own parity test and this one is about the bookkeeping that
 /// used to live on the host between every pair of GPU submissions.
 #[test]
-fn device_compressor_state_matches_the_cpu() {
+fn device_compressor_state_matches_the_cpu_needs_cmf_gpu() {
     match cortiq_engine::gpu_wgpu::selected_and_up() {
         None => {
             cortiq_engine::gpu_wgpu::skip_or_fail(module_path!());
@@ -302,7 +302,7 @@ fn device_compressor_state_matches_the_cpu() {
 /// window is not yet full, which is every sequence's first hundred tokens —
 /// and reading the wrong keys there would still produce fluent text.
 #[test]
-fn device_index_list_matches_the_host_mapping() {
+fn device_index_list_matches_the_host_mapping_needs_cmf_gpu() {
     match cortiq_engine::gpu_wgpu::selected_and_up() {
         None => {
             cortiq_engine::gpu_wgpu::skip_or_fail(module_path!());
@@ -338,7 +338,7 @@ fn device_index_list_matches_the_host_mapping() {
 /// Both regimes are walked, because the slide only exists in the second: a
 /// window still filling, and one at capacity where the oldest key has to go.
 #[test]
-fn device_window_append_matches_the_cpu() {
+fn device_window_append_matches_the_cpu_needs_cmf_gpu() {
     match cortiq_engine::gpu_wgpu::selected_and_up() {
         None => {
             cortiq_engine::gpu_wgpu::skip_or_fail(module_path!());

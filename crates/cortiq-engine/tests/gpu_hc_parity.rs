@@ -10,7 +10,7 @@
 
 #[cfg(feature = "gpu")]
 #[test]
-fn device_hc_join_matches_the_cpu() {
+fn device_hc_join_matches_the_cpu_needs_cmf_gpu() {
     // Nobody asked for wgpu here — a legitimate skip, and what CI runners
     // look like. Asked-for-and-absent is a different thing and fails below:
     // a reserved word in one shader once took the context down and every GPU

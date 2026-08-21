@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 #[test]
-fn first_divergent_stage() {
+fn first_divergent_stage_needs_cmf_gpu() {
     for (k, v) in [
         ("CMF_SDOT", "0"),
         ("CMF_GPU_VRAM_MB", "2000"),

@@ -54,7 +54,6 @@ pub mod videogen;
     feature = "gpu",
     any(target_os = "linux", target_os = "windows", target_os = "android")
 ))]
-pub mod vulkan;
 
 pub use nystrom::NystromState;
 pub use pipeline::{GenerateResult, Pipeline, TokenCallback, TokenTrace};

@@ -34,7 +34,7 @@ bytemuck = { version = "1", optional = true, features = ["derive"] }
 
 [features]
 # `--features gpu` enables the wgpu path; test on a discrete card.
-gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck", "dep:ash"]
+gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 
 # GPU path (D5): Metal on Apple Silicon; unified memory + no-copy buffers.
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -52,4 +52,3 @@ libc = "0.2"
 # Vulkan exists: Apple has none (the Metal backend uses its own matrix
 # units) and the wgpu path remains the universal one everywhere.
 [target.'cfg(any(target_os = "linux", target_os = "windows", target_os = "android"))'.dependencies]
-ash = { version = "0.38", optional = true }

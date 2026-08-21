@@ -25,7 +25,7 @@ fn toy_dir() -> Option<String> {
 }
 
 #[test]
-fn rejected_verify_leaves_the_walk_intact() {
+fn rejected_verify_leaves_the_walk_intact_needs_cmf_gpu() {
     for (k, v) in [
         ("CMF_SDOT", "0"),
         ("CMF_GPU_VRAM_MB", "2000"),

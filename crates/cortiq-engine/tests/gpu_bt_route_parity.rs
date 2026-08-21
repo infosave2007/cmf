@@ -7,7 +7,7 @@
 #![cfg(feature = "gpu")]
 
 #[test]
-fn batched_routing_matches_the_single_router() {
+fn batched_routing_matches_the_single_router_needs_cmf_gpu() {
     match cortiq_engine::gpu_wgpu::selected_and_up() {
         None => {
             cortiq_engine::gpu_wgpu::skip_or_fail(module_path!());

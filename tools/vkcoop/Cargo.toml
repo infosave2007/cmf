@@ -1,7 +1,0 @@
-[package]
-name = "vkprobe"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-ash = "0.38"
