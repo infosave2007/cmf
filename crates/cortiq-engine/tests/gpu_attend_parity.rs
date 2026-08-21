@@ -11,7 +11,7 @@ fn device_sparse_attend_matches_the_cpu() {
     // test reported success by skipping.
     match cortiq_engine::gpu_wgpu::selected_and_up() {
         None => {
-            eprintln!("wgpu не запрошен (CMF_GPU=wgpu) — пропуск");
+            cortiq_engine::gpu_wgpu::skip_or_fail(module_path!());
             return;
         }
         Some(false) => panic!("wgpu запрошен, но контекст не поднялся"),

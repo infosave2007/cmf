@@ -13214,12 +13214,20 @@ fn init(dev: usize) -> Result<Ctx, String> {
     };
     let want_ts = have_basic;
     let want_sg = adapter.features().contains(wgpu::Features::SUBGROUP);
-    // Tensor cores — OPT-IN, and off by default because the only shape
-    // wgpu 30 exposes is 8x8 f32. NVIDIA's units want f16 at 16x16; asked
-    // for 8x8 f32 this driver falls back to something so slow the render
-    // went from 0.68 to 52 seconds a step and the isolated GEMM did not
-    // finish at all. The kernel below is kept, and `CMF_COOP=1` runs it,
-    // for the day the runtime exposes a shape the hardware wants.
+    // History, kept because it explains the shape check below: when the
+    // only configuration wgpu exposed was 8x8 f32, this path was opt-in
+    // and off — asked for 8x8 f32 the NVIDIA driver fell back to
+    // something so slow a render went from 0.68 to 52 seconds a step.
+    // That is no longer the default. It is ON wherever the card reports
+    // 16x16x16 with f16 operands and an f32 accumulator, and `CMF_COOP=0`
+    // is what turns it off. Two things follow that a reader should know:
+    // an f32 GEMM on this path accumulates at tf32-class precision
+    // (measured on an A100 against an f64 reference: 2.8e-4 relative
+    // against 7.7e-7 on the host, both arms of P·V alike, and `CMF_COOP=0`
+    // restores the floor), and the shape check is not optional — wgpu
+    // raises the feature flag on weaker configurations too, and a shader
+    // compiled against a shape the hardware does not have is a silently
+    // wrong image, not an error.
     // Tensor cores, and only where the card reports the shape the kernel
     // is written against — f16 in, f32 accumulator, 16x16x16. The feature
     // flag alone is not enough: wgpu raises it on a weaker configuration
@@ -32049,6 +32057,27 @@ fn main() {
 /// machine that was pointed at it and produced no context is a failure. A
 /// reserved word in one shader once took the whole context down and every
 /// GPU test reported success by skipping.
+/// A GPU test that found no device: FAIL when the environment asked for
+/// one, skip loudly when it did not.
+///
+/// A bare `return` here is why a column of `ok` could mean "every GPU
+/// test skipped". Cargo's summary cannot say "passed without running
+/// anything", so the skip has to be announced by the test itself — and a
+/// skip that happens after someone explicitly named this backend is not a
+/// skip, it is a failure to honour the request.
+pub fn skip_or_fail(what: &str) {
+    // Only the value that NAMES this backend can make a skip a failure.
+    // `CMF_GPU=1` selects Metal on macOS, where wgpu being absent is
+    // correct rather than a broken request.
+    let asked = std::env::var("CMF_GPU").map(|v| v == "wgpu").unwrap_or(false);
+    assert!(
+        !asked,
+        "{what}: CMF_GPU=wgpu was set but no wgpu adapter came up — \
+         refusing to report a skip as a pass"
+    );
+    eprintln!("SKIPPED ({what}): no wgpu device — set CMF_GPU=wgpu to run it");
+}
+
 pub fn selected_and_up() -> Option<bool> {
     // "Asked" means an EXPLICIT request. The wgpu path also self-selects
     // by default on Linux/Windows, but a default selection on a box with
