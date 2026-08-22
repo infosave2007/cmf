@@ -3705,10 +3705,13 @@ fn moe_frame(
         })
     }
     let mut dynv = pk.dynslots.lock().unwrap();
-    if subset && fetch_quota() > 0 && !logits.is_empty() && !dynv.owner.is_empty() {
-        dynv.clock += 1;
-        let clock = dynv.clock;
-        let (mut pidx, mut pwt) = (Vec::new(), Vec::new());
+    // The winners, from the same logits the device will rank — used by the
+    // slot refill below AND by the FreeToken-style overlap: the picks that
+    // will NOT be resident are computed on the CPU while the device frame
+    // runs, instead of serially after its wait.
+    let mut pidx = Vec::new();
+    let mut pwt = Vec::new();
+    if subset && !logits.is_empty() {
         route(
             logits,
             l.gate_bias.as_deref(),
@@ -3719,6 +3722,10 @@ fn moe_frame(
             &mut pidx,
             &mut pwt,
         );
+    }
+    if subset && fetch_quota() > 0 && !pidx.is_empty() && !dynv.owner.is_empty() {
+        dynv.clock += 1;
+        let clock = dynv.clock;
         if clock % 64 == 0 {
             for v in dynv.seen.iter_mut() {
                 *v >>= 1;
@@ -3843,17 +3850,54 @@ fn moe_frame(
     };
     let mut cold = Vec::new();
     let mut cold_x = Vec::new();
-    if !crate::gpu_wgpu::dsv4_moe_frame(
-        &model,
-        &w,
-        g,
-        hidden,
-        &mut cold,
-        &mut cold_x,
-        hc_cur,
-        hc_next,
-        out,
-    ) {
+    // The FreeToken overlap: the predicted winners that will NOT be
+    // resident are computed on the CPU WHILE the device frame runs,
+    // instead of serially after its wait. Unweighted (weight 1) — the
+    // device's own cold weights scale the result at the merge, so a
+    // routing drift between the host's ranking and the card's costs one
+    // wasted thread, never a wrong number. Only the per-layer path has
+    // the input on the host (`hidden` non-empty); the chain keeps its
+    // own economy.
+    let overlap: Vec<usize> = if !hidden.is_empty() {
+        pidx.iter()
+            .copied()
+            .filter(|&pick| dynv.remap.get(pick).copied().unwrap_or(u32::MAX) == u32::MAX)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut early: std::collections::HashMap<usize, Vec<f32>> = std::collections::HashMap::new();
+    let frame_ok = std::thread::scope(|sc| {
+        let handles: Vec<_> = overlap
+            .iter()
+            .filter_map(|&gi| l.experts.get(gi).map(|exp| (gi, exp)))
+            .map(|(gi, exp)| {
+                sc.spawn(move || {
+                    let mut a = vec![0.0f32; cfg.dim];
+                    crate::gpu::cpu_scope(|| run_expert(hidden, exp, cfg, 1.0, None, &mut a));
+                    (gi, a)
+                })
+            })
+            .collect();
+        let ok = crate::gpu_wgpu::dsv4_moe_frame(
+            &model,
+            &w,
+            g,
+            hidden,
+            &mut cold,
+            &mut cold_x,
+            hc_cur,
+            hc_next,
+            out,
+        );
+        for h in handles {
+            if let Ok((gi, a)) = h.join() {
+                early.insert(gi, a);
+            }
+        }
+        ok
+    });
+    if !frame_ok {
         return None;
     }
     // The picks the card had no room for, finished here and added in. Their
@@ -3888,6 +3932,28 @@ fn moe_frame(
     // inside (inner pool None), was the difference between ~7 ms and ~1 ms
     // per cold expert on the 384-core stand. cpu_scope is thread-local, so
     // it sits INSIDE the worker closure.
+    if !early.is_empty() {
+        // The overlap already computed (most of) the cold picks; scale by
+        // the DEVICE's weight and add in cold order — the same order the
+        // serial path used, so parity holds. A cold pick the prediction
+        // missed (ranking drift) is computed inline, cpu_scope'd.
+        for &(gi, wt) in &cold {
+            if let Some(a) = early.get(&gi) {
+                for ((o, sum), v) in out.iter_mut().zip(&mut cold_sum).zip(a.iter()) {
+                    *o += v * wt;
+                    *sum += v * wt;
+                }
+                continue;
+            }
+            let Some(exp) = l.experts.get(gi) else { continue };
+            crate::gpu::cpu_scope(|| run_expert(cold_input, exp, cfg, wt, pool, &mut acc));
+            for ((o, sum), a) in out.iter_mut().zip(&mut cold_sum).zip(&acc) {
+                *o += a;
+                *sum += a;
+            }
+        }
+        return Some((cold_sum, cold.len()));
+    }
     match pool {
         Some(p) if cold.len() > 1 => {
             let results: Vec<std::sync::Mutex<Vec<f32>>> =
