@@ -14539,12 +14539,32 @@ pub fn prefetch_tier(model: &Arc<CmfModel>, keep: &dyn Fn(&str) -> bool) {
         budget as f64 / 1e9
     );
     let model = model.clone();
-    std::thread::spawn(move || {
+    // A 4-token bench exits while this thread is still sweeping tens of
+    // gigabytes; libc exit() racing a thread mid-allocation was a
+    // reproducible SIGSEGV that ate the process's buffered stdout. The
+    // sweep therefore honors a stop flag, and an atexit hook raises it
+    // and joins — at most one 13 MB read of latency at exit.
+    static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static HANDLE: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
+    extern "C" fn prefetch_atexit() {
+        STOP.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(h) = HANDLE.lock().unwrap().take() {
+            let _ = h.join();
+        }
+    }
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| unsafe {
+        libc::atexit(prefetch_atexit);
+    });
+    let handle = std::thread::spawn(move || {
         use std::os::unix::fs::FileExt;
         let Ok(f) = std::fs::File::open(&model.path) else { return };
         let t0 = std::time::Instant::now();
         let mut done = 0u64;
         for (abs, n, idx) in plan {
+            if STOP.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
             let Some(t) = host_tier() else { return };
             if t.bytes.load(std::sync::atomic::Ordering::Relaxed) + n as u64 > t.budget {
                 break; // tier full — the sweep stops, LRU owns the rest
@@ -14567,6 +14587,7 @@ pub fn prefetch_tier(model: &Arc<CmfModel>, keep: &dyn Fn(&str) -> bool) {
             done as f64 / 1e9 / t0.elapsed().as_secs_f64().max(1e-9)
         );
     });
+    *HANDLE.lock().unwrap() = Some(handle);
 }
 
 fn host_tier_get(key: (usize, usize)) -> Option<std::sync::Arc<Vec<u8>>> {
