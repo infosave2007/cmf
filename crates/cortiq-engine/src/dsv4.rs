@@ -3484,6 +3484,20 @@ fn pack_for(l: &Dsv4Layer, cfg: &Dsv4Cfg, li: usize) -> Option<std::sync::Arc<Pa
             .is_some_and(|e| e.w2.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP));
         let room = crate::gpu_wgpu::dsv4_experts_fit(cfg.moe_inter, cfg.dim, gu_q2, dn_q2_fit)
             .saturating_sub(1);
+        // A greedy pack starves the tail: the first layers take the whole
+        // expert budget, later layers get room 0, fall off the device
+        // chain, and the token pays ~100 per-op submissions where a chained
+        // token pays a handful. A per-layer cap spreads the same budget so
+        // every layer gets a PARTIAL pack — the chain accepts partial
+        // layers, and cold picks complete on the host either way.
+        // CMF_DSV4_PACK_LAYER_CAP=N experts per layer; 0/unset keeps greedy.
+        let room = match std::env::var("CMF_DSV4_PACK_LAYER_CAP")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            Some(cap) if cap > 0 => room.min(cap),
+            _ => room,
+        };
         // When the budget packs a SUBSET, which subset matters: a partial
         // layer completes its cold picks from the host, so every resident
         // expert that the routing actually reaches is host work saved.
@@ -3695,19 +3709,56 @@ fn moe_frame(
     } else {
         hidden
     };
-    for &(gi, wt) in &cold {
-        let Some(exp) = l.experts.get(gi) else {
-            continue;
-        };
-        // Cold means out-of-core by contract. The tensors remain mmap-backed:
-        // missing pages are faulted from the CMF file and the OS may evict
-        // them again under RAM pressure. Do not let the generic matvec probe
-        // turn this into an unbounded second GPU cache behind the packer's
-        // back.
-        crate::gpu::cpu_scope(|| run_expert(cold_input, exp, cfg, wt, pool, &mut acc));
-        for ((o, sum), a) in out.iter_mut().zip(&mut cold_sum).zip(&acc) {
-            *o += a;
-            *sum += a;
+    // Cold means out-of-core by contract. The tensors remain mmap-backed:
+    // missing pages are faulted from the CMF file and the OS may evict
+    // them again under RAM pressure. Do not let the generic matvec probe
+    // turn this into an unbounded second GPU cache behind the packer's
+    // back.
+    //
+    // The unit of parallelism is the EXPERT, not the row: a 2048-row
+    // matvec split across 380 workers is five rows per worker — all
+    // dispatch, no arithmetic. One worker per cold expert, whole matvecs
+    // inside (inner pool None), was the difference between ~7 ms and ~1 ms
+    // per cold expert on the 384-core stand. cpu_scope is thread-local, so
+    // it sits INSIDE the worker closure.
+    match pool {
+        Some(p) if cold.len() > 1 => {
+            let results: Vec<std::sync::Mutex<Vec<f32>>> =
+                cold.iter().map(|_| std::sync::Mutex::new(Vec::new())).collect();
+            let (cold_ref, results_ref) = (&cold, &results);
+            p.run_rows(cold.len(), &move |cs, ce| {
+                for i in cs..ce {
+                    let (gi, wt) = cold_ref[i];
+                    let Some(exp) = l.experts.get(gi) else { continue };
+                    let mut a = vec![0.0f32; cfg.dim];
+                    crate::gpu::cpu_scope(|| run_expert(cold_input, exp, cfg, wt, None, &mut a));
+                    *results_ref[i].lock().unwrap() = a;
+                }
+            });
+            // Serial reduce in cold order — the accumulation order the
+            // scalar path had, so parity holds bit for bit.
+            for r in &results {
+                let a = r.lock().unwrap();
+                if a.is_empty() {
+                    continue;
+                }
+                for ((o, sum), v) in out.iter_mut().zip(&mut cold_sum).zip(a.iter()) {
+                    *o += v;
+                    *sum += v;
+                }
+            }
+        }
+        _ => {
+            for &(gi, wt) in &cold {
+                let Some(exp) = l.experts.get(gi) else {
+                    continue;
+                };
+                crate::gpu::cpu_scope(|| run_expert(cold_input, exp, cfg, wt, pool, &mut acc));
+                for ((o, sum), a) in out.iter_mut().zip(&mut cold_sum).zip(&acc) {
+                    *o += a;
+                    *sum += a;
+                }
+            }
         }
     }
     Some((cold_sum, cold.len()))
@@ -3999,27 +4050,61 @@ pub fn moe_step(
         }
     }
     out.fill(0.0);
-    let mut acc = vec![0.0f32; cfg.dim];
-    for (e, &ei) in idx.iter().enumerate() {
-        let Some(exp) = l.experts.get(ei) else {
-            continue;
-        };
-        run_expert(
-            hidden,
-            exp,
-            cfg,
-            w.get(e).copied().unwrap_or(0.0),
-            pool,
-            &mut acc,
-        );
-        for (o, a) in out.iter_mut().zip(&acc) {
-            *o += a;
+    // Layers the packer had no room for land here whole. Same shape as the
+    // frame's cold completion: one worker per expert (the shared one rides
+    // as an extra job), whole matvecs inside, cpu_scope INSIDE the worker —
+    // on the main thread it would gate nothing, and the generic matvec
+    // would upload every expert to the card tensor by tensor, which is
+    // exactly the per-token PCIe churn this path exists to avoid.
+    let jobs: Vec<(Option<usize>, f32)> = idx
+        .iter()
+        .enumerate()
+        .map(|(e, &ei)| (Some(ei), w.get(e).copied().unwrap_or(0.0)))
+        .chain(std::iter::once((None, 1.0)))
+        .collect();
+    match pool {
+        Some(p) if jobs.len() > 1 => {
+            let results: Vec<std::sync::Mutex<Vec<f32>>> =
+                jobs.iter().map(|_| std::sync::Mutex::new(Vec::new())).collect();
+            let (jobs_ref, results_ref) = (&jobs, &results);
+            p.run_rows(jobs.len(), &move |cs, ce| {
+                for i in cs..ce {
+                    let (ei, wt) = jobs_ref[i];
+                    let exp = match ei {
+                        Some(ei) => match l.experts.get(ei) {
+                            Some(x) => x,
+                            None => continue,
+                        },
+                        None => &l.shared,
+                    };
+                    let mut a = vec![0.0f32; cfg.dim];
+                    crate::gpu::cpu_scope(|| run_expert(hidden, exp, cfg, wt, None, &mut a));
+                    *results_ref[i].lock().unwrap() = a;
+                }
+            });
+            for r in &results {
+                let a = r.lock().unwrap();
+                for (o, v) in out.iter_mut().zip(a.iter()) {
+                    *o += v;
+                }
+            }
         }
-    }
-    // The shared expert always runs, at weight 1.
-    run_expert(hidden, &l.shared, cfg, 1.0, pool, &mut acc);
-    for (o, a) in out.iter_mut().zip(&acc) {
-        *o += a;
+        _ => {
+            let mut acc = vec![0.0f32; cfg.dim];
+            for &(ei, wt) in &jobs {
+                let exp = match ei {
+                    Some(ei) => match l.experts.get(ei) {
+                        Some(x) => x,
+                        None => continue,
+                    },
+                    None => &l.shared,
+                };
+                crate::gpu::cpu_scope(|| run_expert(hidden, exp, cfg, wt, pool, &mut acc));
+                for (o, a) in out.iter_mut().zip(&acc) {
+                    *o += a;
+                }
+            }
+        }
     }
 }
 
@@ -4101,6 +4186,9 @@ fn moe_step_block(
     // Preserve the scalar path's accumulation order by keeping every routed
     // slot separate; grouping below changes only when a weight is read.
     let mut routed = vec![0.0f32; b * cfg.top_k * dim];
+    // Group the token slots by expert first — the list is also the unit of
+    // parallelism below.
+    let mut active: Vec<(usize, Vec<(usize, usize, f32)>)> = Vec::new();
     for ei in 0..l.experts.len() {
         let mut jobs = Vec::new();
         for bi in 0..b {
@@ -4110,9 +4198,13 @@ fn moe_step_block(
                 }
             }
         }
-        if jobs.is_empty() {
-            continue;
+        if !jobs.is_empty() {
+            active.push((ei, jobs));
         }
+    }
+    // One expert's forward, single-threaded, returning the scaled down
+    // projections in job order.
+    let expert_fwd = |ei: usize, jobs: &[(usize, usize, f32)], inner: Option<&crate::pool::Pool>| -> Vec<f32> {
         let e = &l.experts[ei];
         let n = jobs.len();
         let mut xj = vec![0.0f32; n * dim];
@@ -4121,8 +4213,8 @@ fn moe_step_block(
         }
         let mut gate = vec![0.0f32; n * inter];
         let mut up = vec![0.0f32; n * inter];
-        e.w1.matmat(&xj, n, &mut gate, pool);
-        e.w3.matmat(&xj, n, &mut up, pool);
+        e.w1.matmat(&xj, n, &mut gate, inner);
+        e.w3.matmat(&xj, n, &mut up, inner);
         for (j, &(_, _, wt)) in jobs.iter().enumerate() {
             let (gj, uj) = (
                 &mut gate[j * inter..(j + 1) * inter],
@@ -4141,10 +4233,48 @@ fn moe_step_block(
             }
         }
         let mut down = vec![0.0f32; n * dim];
-        e.w2.matmat(&gate, n, &mut down, pool);
-        for (j, &(bi, slot, _)) in jobs.iter().enumerate() {
-            routed[(bi * cfg.top_k + slot) * dim..(bi * cfg.top_k + slot + 1) * dim]
-                .copy_from_slice(&down[j * dim..(j + 1) * dim]);
+        e.w2.matmat(&gate, n, &mut down, inner);
+        down
+    };
+    // ~370 non-resident experts a token used to run this loop ONE AFTER
+    // ANOTHER: a 2048-row matvec cannot occupy a big pool, and the loop
+    // serialised the only real parallelism there is — across experts.
+    // Measured on a 384-core host with DeepSeek-V4-Flash: ~3.3 s/token
+    // flat across every fetch-side improvement, because the wall was
+    // here. Parallel across experts, each single-threaded and pinned to
+    // the CPU on ITS OWN worker (cpu_scope is thread-local, so it must
+    // be entered inside the closure, not around the pool call — the
+    // documented trap).
+    match pool {
+        Some(p) if active.len() > 1 => {
+            let results: Vec<std::sync::Mutex<Vec<f32>>> =
+                active.iter().map(|_| std::sync::Mutex::new(Vec::new())).collect();
+            let active_ref = &active;
+            let results_ref = &results;
+            let fwd = &expert_fwd;
+            p.run_rows(active_ref.len(), &move |s, e| {
+                for i in s..e {
+                    let (ei, jobs) = &active_ref[i];
+                    let d = crate::gpu::cpu_scope(|| fwd(*ei, jobs, None));
+                    *results_ref[i].lock().unwrap() = d;
+                }
+            });
+            for (i, (_, jobs)) in active.iter().enumerate() {
+                let down = results[i].lock().unwrap();
+                for (j, &(bi, slot, _)) in jobs.iter().enumerate() {
+                    routed[(bi * cfg.top_k + slot) * dim..(bi * cfg.top_k + slot + 1) * dim]
+                        .copy_from_slice(&down[j * dim..(j + 1) * dim]);
+                }
+            }
+        }
+        _ => {
+            for (ei, jobs) in &active {
+                let down = expert_fwd(*ei, jobs, pool);
+                for (j, &(bi, slot, _)) in jobs.iter().enumerate() {
+                    routed[(bi * cfg.top_k + slot) * dim..(bi * cfg.top_k + slot + 1) * dim]
+                        .copy_from_slice(&down[j * dim..(j + 1) * dim]);
+                }
+            }
         }
     }
 
@@ -5765,6 +5895,37 @@ pub fn load(
             &format!("model.layers.{li}"),
             Scheme::Main,
         )?);
+    }
+    // The projection this loader exists to serve: with a RAM tier configured,
+    // pin the MASKED expert set with one sequential sweep of the file at
+    // streaming rate, before decode discovers it miss by miss in random
+    // order. Experts outside a layer's mask are skipped; a layer without a
+    // mask keeps all of its experts (the budget caps the sweep).
+    #[cfg(feature = "gpu")]
+    {
+        let masks: Vec<Option<Vec<bool>>> = layers.iter().map(|l| l.mask.clone()).collect();
+        crate::gpu_wgpu::prefetch_tier(model, &|name: &str| {
+            let Some(i) = name.find(".experts.") else {
+                return false;
+            };
+            let rest = &name[i + 9..];
+            let e: usize = match rest[..rest.find('.').unwrap_or(rest.len())].parse() {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            let li: usize = {
+                let Some(j) = name.find("layers.") else { return false };
+                let r = &name[j + 7..];
+                match r[..r.find('.').unwrap_or(r.len())].parse() {
+                    Ok(v) => v,
+                    Err(_) => return false,
+                }
+            };
+            match masks.get(li).and_then(|m| m.as_ref()) {
+                Some(m) => m.get(e).copied().unwrap_or(false),
+                None => true,
+            }
+        });
     }
     Ok((globals, layers))
 }

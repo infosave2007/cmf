@@ -14461,6 +14461,69 @@ fn host_tier() -> Option<&'static HostTier> {
     .as_ref()
 }
 
+/// The projection this system was designed around, made real: pin the
+/// working set into the RAM tier with ONE SEQUENTIAL sweep of the file,
+/// BEFORE decoding — instead of discovering it miss by miss in random
+/// order at seek speed. With a task mask the working set is the masked
+/// experts (52 GB of DeepSeek-V4-Flash at cover 0.95); without one it is
+/// as much of the expert population as the tier holds, hottest file
+/// order. Storage misses during decode then start at zero rather than
+/// converging toward it.
+///
+/// Runs on a background thread; decode proceeds meanwhile and simply
+/// starts hitting the tier as the sweep passes it.
+pub fn prefetch_tier(model: &Arc<CmfModel>, keep: &dyn Fn(&str) -> bool) {
+    let Some(t) = host_tier() else { return };
+    // (offset, len, idx) of every kept tensor, in FILE ORDER — the whole
+    // point is one sequential pass.
+    let mut plan: Vec<(usize, usize, usize)> = Vec::new();
+    for (idx, e) in model.tensors.iter().enumerate() {
+        if !keep(&e.name) {
+            continue;
+        }
+        let Some(abs) = model.entry_abs_offset(e) else { continue };
+        plan.push((abs, e.nbytes as usize, idx));
+    }
+    plan.sort_unstable_by_key(|p| p.0);
+    let total: u64 = plan.iter().map(|p| p.1 as u64).sum();
+    let budget = t.budget;
+    tracing::info!(
+        "tier prefetch: {} tensors, {:.1} GB planned into a {:.1} GB tier",
+        plan.len(),
+        total as f64 / 1e9,
+        budget as f64 / 1e9
+    );
+    let model = model.clone();
+    std::thread::spawn(move || {
+        use std::os::unix::fs::FileExt;
+        let Ok(f) = std::fs::File::open(&model.path) else { return };
+        let t0 = std::time::Instant::now();
+        let mut done = 0u64;
+        for (abs, n, idx) in plan {
+            let Some(t) = host_tier() else { return };
+            if t.bytes.load(std::sync::atomic::Ordering::Relaxed) + n as u64 > t.budget {
+                break; // tier full — the sweep stops, LRU owns the rest
+            }
+            let key = (model.uid() as usize, idx);
+            if host_tier_get(key).is_some() {
+                continue;
+            }
+            let mut v = vec![0u8; n];
+            if f.read_exact_at(&mut v, abs as u64).is_err() {
+                return;
+            }
+            host_tier_put(key, std::sync::Arc::new(v));
+            done += n as u64;
+        }
+        tracing::info!(
+            "tier prefetch: {:.1} GB resident in {:.0}s ({:.2} GB/s)",
+            done as f64 / 1e9,
+            t0.elapsed().as_secs_f64(),
+            done as f64 / 1e9 / t0.elapsed().as_secs_f64().max(1e-9)
+        );
+    });
+}
+
 fn host_tier_get(key: (usize, usize)) -> Option<std::sync::Arc<Vec<u8>>> {
     let t = host_tier()?;
     let mut m = t.map.lock().unwrap();
@@ -14592,6 +14655,7 @@ fn weight_buffer_l(
     if len > c.vram_budget {
         return None; // one tensor larger than the whole budget
     }
+    res_who_key(key);
     RES_MISSES.fetch_add(1, Ordering::Relaxed);
     RES_MISS_BYTES.fetch_add(len, Ordering::Relaxed);
     // The RAM tier serves the bytes on a miss when it has them — one
@@ -16162,6 +16226,34 @@ fn q1_weight(c: &Ctx, model: &Arc<CmfModel>, idx: usize) -> Option<(wgpu::Buffer
 /// A q4_tiled / q4tp weight as one device buffer — the whole tensor, since
 /// both layouts keep their scales inside (q4t) or in trailing planes (q4tp)
 /// and the kernels index them from the same base.
+/// `CMF_RES_WHO=1`: every 256th arena miss prints the tensor NAME — the
+/// counters say how much is fetched, this says by whom.
+/// The idx half of the arena key names the tensor via the model directory
+/// at exit; here it is enough to know WHICH indices carry the traffic.
+fn res_who_key(key: (usize, usize)) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static N: AtomicU64 = AtomicU64::new(0);
+    if !*ON.get_or_init(|| std::env::var("CMF_RES_WHO").is_ok()) {
+        return;
+    }
+    if N.fetch_add(1, Ordering::Relaxed) % 256 == 0 {
+        tracing::info!("res miss idx {}", key.1);
+    }
+}
+
+fn res_who(name: &str) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static N: AtomicU64 = AtomicU64::new(0);
+    if !*ON.get_or_init(|| std::env::var("CMF_RES_WHO").is_ok()) {
+        return;
+    }
+    if N.fetch_add(1, Ordering::Relaxed) % 256 == 0 {
+        tracing::info!("res miss: {name}");
+    }
+}
+
 fn tile_weight(c: &Ctx, model: &Arc<CmfModel>, idx: usize) -> Option<(wgpu::Buffer, usize, usize)> {
     let entry = model.tensors.get(idx)?;
     let rows = *entry.shape.first()?;
@@ -16174,6 +16266,9 @@ fn tile_weight(c: &Ctx, model: &Arc<CmfModel>, idx: usize) -> Option<(wgpu::Buff
     let plen = entry.nbytes as usize;
     if abs + plen > bytes.len() {
         return None;
+    }
+    if !weight_resident(c, (model.uid() as usize, idx)) {
+        res_who(&model.tensors[idx].name);
     }
     let buf = weight_buffer_l(c, (model.uid() as usize, idx), &bytes[abs..abs + plen], layer_of_name(&model.tensors[idx].name))?;
     Some((buf, rows, cols))
@@ -27611,6 +27706,7 @@ fn tensor_weight(
     let key = (model.uid() as usize, idx);
     let lay = layer_of_name(&model.tensors[idx].name);
     if !weight_resident(c, key) {
+        res_who(&model.tensors[idx].name);
         if let Some(v) = host_tier_get(key) {
             return weight_buffer_l(c, key, &v, lay);
         }
