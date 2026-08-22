@@ -40821,22 +40821,28 @@ pub fn dsv4_slot_fill(
         if slot.checked_mul(plen).is_none() || (slot * plen + plen) as u64 > buf.size() {
             return false;
         }
-        let tier = host_tier_get((model.uid() as usize, idx));
+        let key = (model.uid() as usize, idx);
+        let tier = host_tier_get(key);
         let src: &[u8] = if let Some(v) = tier.as_deref() {
             if v.len() != plen {
                 return false;
             }
             v
         } else if let Some(v) = pread_range(model, abs, plen) {
-            return {
-                c.queue.write_buffer(buf, (slot * plen) as u64, &v);
-                true
-            };
+            // Fill-through: a fetched expert earned its trip by being
+            // re-picked (the min-seen gate), so its NEXT eviction-refetch
+            // is likelier than not — serve it from RAM then, not disk.
+            c.queue.write_buffer(buf, (slot * plen) as u64, &v);
+            host_tier_put(key, std::sync::Arc::new(v));
+            return true;
         } else {
             let Some(sl) = bytes.get(abs..abs + plen) else { return false };
             sl
         };
         c.queue.write_buffer(buf, (slot * plen) as u64, src);
+        if tier.is_none() {
+            host_tier_put(key, std::sync::Arc::new(src.to_vec()));
+        }
         true
     };
     let ok = put(&g, t.0, gu_len) && put(&u, t.1, gu_len) && put(&d, t.2, d_len);
