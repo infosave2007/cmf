@@ -5191,11 +5191,21 @@ pub fn dsv4_verify_chunk(
         .iter()
         .enumerate()
         .any(|(i, &on)| on && !st.partial_set.get(gpu_end + i).copied().unwrap_or(false));
+    // `CMF_DSV4_HOST_VERIFY=1` lets the verify run with NO device prefix:
+    // every layer walks in the host tail, batched — which is where a
+    // many-core host amortises the weight read and the unpack across the
+    // draft (the whole point of a batched verify). Off, a partial layer 0
+    // (dynamic-slot packs) silently priced the entire speculation at zero:
+    // 625 drafted, 0 verified, all cost and no candidate.
+    fn host_verify_on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("CMF_DSV4_HOST_VERIFY").is_ok_and(|v| v != "0"))
+    }
     if b < 2
         || !chain_enabled()
         || !st.dev_owned
         || st.dev_set.len() != layers.len()
-        || gpu_end == 0
+        || (gpu_end == 0 && !host_verify_on())
         || full_beyond
     {
         return None;
