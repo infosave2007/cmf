@@ -1893,7 +1893,10 @@ fn dsv4_layer_loop(
                 dn_q2,
             );
             on_dev[li] = attn_ok && experts_ok && pk.globals.len() == cfg.n_routed_experts;
-            partial_dev[li] = attn_ok && experts_ok && pk.globals.len() < cfg.n_routed_experts;
+            partial_dev[li] = attn_ok
+                && experts_ok
+                && pk.globals.len() < cfg.n_routed_experts
+                && !pk.is_mutated();
         }
     }
     let active_dev: Vec<bool> = on_dev
@@ -2681,6 +2684,15 @@ fn dsv4_chain_run(
         let Some(pk) = pack_for(&layers[li], cfg, li) else {
             return false;
         };
+        // The chain hands the device `remap: None`, which asserts two
+        // things a partial or mutated pack breaks SILENTLY: every winner
+        // is resident (a cold pick has nowhere to complete mid-chain),
+        // and slot k still holds globals[k] (a refilled bank does not).
+        // The verify batch reached here with cap-limited partial packs
+        // and accepted 0 of 625 drafts — wrong experts, plausible sums.
+        if pk.globals.len() < cfg.n_routed_experts || pk.is_mutated() {
+            return false;
+        }
         let forced: Option<Vec<usize>> = layers[li].tid2eid.as_ref().and_then(|tbl| {
             let v: Vec<usize> = hash_route(tbl, cfg.vocab, cfg.top_k, token_id)
                 .into_iter()
@@ -3302,6 +3314,29 @@ fn gpu_layer_enabled() -> bool {
 /// directory indices in packing order with the shared expert last. Built once
 /// — the mask does not change during a run — and keyed by layer.
 #[cfg(feature = "gpu")]
+struct PackDyn {
+    remap: Vec<u32>,
+    owner: Vec<u32>,
+    last: Vec<u64>,
+    clock: u64,
+    /// Set on the first slot refill. The chain and the batch verify hand
+    /// the device `remap: None` and trust the banks to still hold the
+    /// BUILD-TIME packing — a mutated pack must never be claimed by them.
+    mutated: bool,
+}
+
+#[cfg(feature = "gpu")]
+impl Pack {
+    /// True once any slot was refilled away from the build-time packing.
+    fn is_mutated(&self) -> bool {
+        self.dynslots.lock().unwrap().mutated
+    }
+}
+
+/// The packed expert set of one layer: which globals made it in, and their
+/// directory indices in packing order with the shared expert last. Keyed by
+/// layer; the STATIC fields are built once, the dynamic slot state evolves.
+#[cfg(feature = "gpu")]
 struct Pack {
     /// The router as dense f32, expanded once. It is 4 MB a layer against a
     /// 112 GB model, it lives as long as the process — so the address-keyed
@@ -3314,6 +3349,15 @@ struct Pack {
     /// packed order, globals only (shared is not in here).
     globals: Vec<usize>,
     tensors: Vec<(usize, usize, usize)>,
+    /// FreeToken-style dynamic slots: the packed subset FOLLOWS the router
+    /// instead of staying whatever load-time frequency guessed. `remap` here
+    /// is the LIVE table (the immutable `remap` above is the initial state
+    /// and stays only as the build artifact); `owner[slot]` is the global
+    /// expert id occupying the slot; `last[slot]`/`clock` drive LRU. The
+    /// device bank buffers accept `write_buffer` at slot offsets, and the
+    /// frame re-uploads the remap every call — so a refill is two queue
+    /// writes and no cache invalidation anywhere.
+    dynslots: std::sync::Mutex<PackDyn>,
     /// The noaux_tc bias in PACKED order, kept here because it is the same
     /// every token and the pack lives as long as the process: a stable
     /// address means a stable device buffer, and a stable device buffer is
@@ -3473,6 +3517,13 @@ fn pack_for(l: &Dsv4Layer, cfg: &Dsv4Cfg, li: usize) -> Option<std::sync::Arc<Pa
                     .map(|b| globals.iter().map(|&g| b[g]).collect()),
                 router,
                 to_slot,
+                dynslots: std::sync::Mutex::new(PackDyn {
+                    remap: remap.clone(),
+                    owner: globals.iter().map(|&g| g as u32).collect(),
+                    last: vec![0; globals.len()],
+                    clock: 0,
+                    mutated: false,
+                }),
                 remap,
                 globals,
                 tensors,
@@ -3574,6 +3625,13 @@ fn pack_for(l: &Dsv4Layer, cfg: &Dsv4Cfg, li: usize) -> Option<std::sync::Arc<Pa
                 .map(|b| globals.iter().map(|&g| b[g]).collect()),
             router,
             to_slot,
+            dynslots: std::sync::Mutex::new(PackDyn {
+                remap: remap.clone(),
+                owner: globals.iter().map(|&g| g as u32).collect(),
+                last: vec![0; globals.len()],
+                clock: 0,
+                mutated: false,
+            }),
             remap,
             globals,
             tensors,
@@ -3623,6 +3681,89 @@ fn moe_frame(
         no!("слой {li}: эксперты не отображены из файла");
     };
     let subset = pk.globals.len() < cfg.n_routed_experts;
+    // Dynamic slots (the FreeToken move): predict this token's winners on
+    // the host and pull the missing ones into LRU slots BEFORE the frame
+    // runs — up to CMF_DSV4_FETCH_MAX experts a layer a token. The device
+    // still routes for real, so a wrong prediction costs one unused fill
+    // and never a wrong number: an unmapped winner comes back as a cold
+    // pick and the CPU completes it, exactly as before.
+    fn fetch_quota() -> usize {
+        static Q: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *Q.get_or_init(|| {
+            std::env::var("CMF_DSV4_FETCH_MAX")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0)
+        })
+    }
+    let mut dynv = pk.dynslots.lock().unwrap();
+    if subset && fetch_quota() > 0 && !logits.is_empty() && !dynv.owner.is_empty() {
+        dynv.clock += 1;
+        let clock = dynv.clock;
+        let (mut pidx, mut pwt) = (Vec::new(), Vec::new());
+        route(
+            logits,
+            l.gate_bias.as_deref(),
+            cfg.top_k,
+            cfg.route_scale,
+            forced,
+            l.mask.as_deref(),
+            &mut pidx,
+            &mut pwt,
+        );
+        for &pick in &pidx {
+            let sl = dynv.remap[pick];
+            if sl != u32::MAX {
+                dynv.last[sl as usize] = clock;
+            }
+        }
+        let mut fetched = 0usize;
+        for &pick in &pidx {
+            if fetched >= fetch_quota() {
+                break;
+            }
+            if dynv.remap[pick] != u32::MAX {
+                continue;
+            }
+            // Victim: the LRU slot among those this token does not need.
+            let victim = (0..dynv.owner.len())
+                .filter(|&sl| dynv.last[sl] != clock)
+                .min_by_key(|&sl| dynv.last[sl]);
+            let Some(victim) = victim else { break };
+            let Some(exp) = l.experts.get(pick) else { continue };
+            let t3 = (|| {
+                Some((
+                    exp.w1.model_idx()?,
+                    exp.w3.model_idx()?,
+                    exp.w2.model_idx()?,
+                ))
+            })();
+            let Some(t3) = t3 else { continue };
+            let gu_q2 =
+                exp.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP);
+            let pack_first = pk.tensors.first().map(|t| t.0).unwrap_or(usize::MAX);
+            if !crate::gpu_wgpu::dsv4_slot_fill(
+                &model,
+                pack_first,
+                victim,
+                t3,
+                cfg.moe_inter,
+                cfg.dim,
+                gu_q2,
+            ) {
+                break;
+            }
+            let old = dynv.owner[victim] as usize;
+            if old < dynv.remap.len() {
+                dynv.remap[old] = u32::MAX;
+            }
+            dynv.remap[pick] = victim as u32;
+            dynv.owner[victim] = pick as u32;
+            dynv.last[victim] = clock;
+            dynv.mutated = true;
+            fetched += 1;
+        }
+    }
     // With a complete pack the forced row is translated to packed numbering.
     // With a subset it stays global: the router's remap either finds its slot
     // or returns the forced expert as a cold pick, exactly like a scored one.
@@ -3661,7 +3802,7 @@ fn moe_frame(
         logits: &lg,
         bias: bias.as_deref(),
         forced: fpack.as_deref(),
-        remap: if subset { Some(&pk.remap) } else { None },
+        remap: if subset { Some(&dynv.remap) } else { None },
     };
     let g = crate::gpu_wgpu::Dsv4MoeGeom {
         hidden: cfg.dim,
