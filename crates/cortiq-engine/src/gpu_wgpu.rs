@@ -34496,6 +34496,15 @@ fn dsv4_layer_frame_enc(
         }
 
         // ── expand, then prepare the NEXT layer ──
+        // A subset pack may return cold winners whose exact correction
+        // (`state[j] += post[j] * cold`) needs THIS layer's post — and the
+        // next-layer fold below rewrites the canonical slot. A blit the
+        // width of the hyper-connection count preserves it; the correction
+        // variant (`dsv4_state_add_cold_preserved`) reads the spare.
+        if w.moe.remap.is_some() {
+            let spare = frame_buf(c, 48, hc * 4, false);
+            encode_blit_p(&mut pass, c, &hpost, &spare, hc, 0, 0, None);
+        }
         let fused_next = hc_fuse() && w.hc_next_fn.is_some();
         if !fused_next {
             encode_hc_expand_k_p(
@@ -41108,7 +41117,17 @@ pub fn dsv4_state_read(state: &mut [f32]) -> bool {
 /// the block output, so the exact correction is another expansion with an
 /// identity `comb`: `state[j] += post[j] * cold`. Doing it here keeps the
 /// policy independent of a layer number or a particular VRAM size.
+/// `dsv4_state_add_cold`, but the post comes from the spare slot the layer
+/// frame preserved before its next-layer fold rewrote the canonical one.
+pub fn dsv4_state_add_cold_preserved(cold: &[f32], hc: usize, state_out: &mut [f32]) -> bool {
+    dsv4_state_add_cold_inner(cold, hc, state_out, 48)
+}
+
 pub fn dsv4_state_add_cold(cold: &[f32], hc: usize, state_out: &mut [f32]) -> bool {
+    dsv4_state_add_cold_inner(cold, hc, state_out, 43)
+}
+
+fn dsv4_state_add_cold_inner(cold: &[f32], hc: usize, state_out: &mut [f32], post_tag: u8) -> bool {
     let Some(c) = ctx() else { return false };
     if hc == 0 || cold.is_empty() || state_out.len() != hc * cold.len() {
         return false;
@@ -41118,7 +41137,7 @@ pub fn dsv4_state_add_cold(cold: &[f32], hc: usize, state_out: &mut [f32]) -> bo
     let corrected = frame_buf(c, 46, state_out.len() * 4, true);
     // `post` was produced by the FFN half's opening fold and is still live in
     // the canonical slot after the MoE frame returns its cold winners.
-    let post = frame_buf(c, 43, hc * 4, true);
+    let post = frame_buf(c, post_tag, hc * 4, post_tag == 43);
     let cold_buf = frame_up(c, 121, bytemuck::cast_slice(cold));
     let mut identity = vec![0.0f32; hc * hc];
     for j in 0..hc {
