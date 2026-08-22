@@ -14395,6 +14395,50 @@ fn q8mv_tiled() -> bool {
     *V.get_or_init(|| std::env::var("CMF_Q8MV").is_ok_and(|v| v == "tiled"))
 }
 
+/// Residency counters for the expert-arena regime (a MoE that outsizes
+/// VRAM routes thousands of small tensors through here per second). Read
+/// them with `residency_stats`; `CMF_MOE_RES=1` logs a line every 512
+/// misses.
+pub static RES_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static RES_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static RES_MISS_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static RES_EVICTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// (hits, misses, miss_bytes, evictions) since process start.
+pub fn residency_stats() -> (u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        RES_HITS.load(Relaxed),
+        RES_MISSES.load(Relaxed),
+        RES_MISS_BYTES.load(Relaxed),
+        RES_EVICTS.load(Relaxed),
+    )
+}
+
+/// On a network filesystem an mmap MISS is the death of this path: every
+/// 4-128 KB page faults through FUSE one round trip at a time, which is
+/// the measured "1% CPU, looks hung" failure on MooseFS volumes. With
+/// `CMF_WEIGHT_PREAD=1` a residency miss reads its byte range with ONE
+/// explicit pread instead — sequential, at the volume's streaming rate.
+/// Hits never touch bytes at all, so this only prices the misses.
+fn pread_range(model: &Arc<CmfModel>, abs: usize, len: usize) -> Option<Vec<u8>> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("CMF_WEIGHT_PREAD").as_deref() == Ok("1")) {
+        return None;
+    }
+    use std::os::unix::fs::FileExt;
+    let f = std::fs::File::open(&model.path).ok()?;
+    let mut v = vec![0u8; len];
+    f.read_exact_at(&mut v, abs as u64).ok()?;
+    Some(v)
+}
+
+/// Is this tensor already resident? A cheap peek so callers can decide
+/// how to source the bytes for a MISS without paying for the hit path.
+fn weight_resident(c: &Ctx, key: (usize, usize)) -> bool {
+    c.weight_bufs.lock().unwrap().contains_key(&key)
+}
+
 fn weight_buffer(c: &Ctx, key: (usize, usize), full_quant: &[u8]) -> Option<wgpu::Buffer> {
     use std::sync::atomic::Ordering;
     let now = c.res_clock.fetch_add(1, Ordering::Relaxed);
@@ -14402,29 +14446,62 @@ fn weight_buffer(c: &Ctx, key: (usize, usize), full_quant: &[u8]) -> Option<wgpu
     if let Some(e) = map.get_mut(&key) {
         e.uses = res_score(e, now) + 1.0;
         e.last = now;
+        RES_HITS.fetch_add(1, Ordering::Relaxed);
         return Some(e.buf.clone());
     }
     let len = full_quant.len() as u64;
     if len > c.vram_budget {
         return None; // one tensor larger than the whole budget
     }
+    RES_MISSES.fetch_add(1, Ordering::Relaxed);
+    RES_MISS_BYTES.fetch_add(len, Ordering::Relaxed);
+    if std::env::var("CMF_MOE_RES").is_ok() {
+        let m = RES_MISSES.load(Ordering::Relaxed);
+        if m % 512 == 0 {
+            let (h, mm, mb, ev) = residency_stats();
+            tracing::info!(
+                "residency: {h} hits / {mm} misses ({:.1}% hit), {:.2} GB fetched, {ev} evictions",
+                h as f64 / (h + mm).max(1) as f64 * 100.0,
+                mb as f64 / 1e9
+            );
+        }
+    }
     // Make room by evicting the least valuable, skipping anything touched
     // recently. Failing to free enough is not an error: the tensor stays on
     // the CPU, which is the pressure valve that keeps a too-small budget
     // from thrashing the bus.
+    //
+    // Eviction picks from a SAMPLE, not a full scan. The full
+    // collect-and-sort was sized for a dense model's dozens of tensors; a
+    // MoE arena holds thousands of experts, and a per-miss O(n log n) over
+    // them at ~120 misses/token is a decode-scale cost. Stride-sampling 64
+    // candidates and evicting the worst of them is the Redis discipline:
+    // within a few percent of true-LRU quality at O(1) cost.
     if c.resident.load(Ordering::Relaxed) + len > c.vram_budget {
-        let mut cand: Vec<((usize, usize), f32, u64)> = map
-            .iter()
-            .filter(|(_, e)| !e.pinned && now.saturating_sub(e.last) > RES_HYSTERESIS)
-            .map(|(k, e)| (*k, res_score(e, now), e.bytes))
-            .collect();
-        cand.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         let mut freed = 0u64;
-        for (k, _, bytes) in cand {
-            if c.resident.load(Ordering::Relaxed) - freed + len <= c.vram_budget {
+        let mut rounds = 0;
+        while c.resident.load(Ordering::Relaxed) - freed + len > c.vram_budget && rounds < 64 {
+            rounds += 1;
+            let n = map.len();
+            if n == 0 {
                 break;
             }
+            let stride = (n / 64).max(1);
+            let start = (now as usize).wrapping_mul(0x9E37_79B9) % stride.max(1);
+            let worst = map
+                .iter()
+                .skip(start)
+                .step_by(stride)
+                .filter(|(_, e)| !e.pinned && now.saturating_sub(e.last) > RES_HYSTERESIS)
+                .min_by(|a, b| {
+                    res_score(a.1, now)
+                        .partial_cmp(&res_score(b.1, now))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|(k, e)| (*k, e.bytes));
+            let Some((k, bytes)) = worst else { break };
             map.remove(&k);
+            RES_EVICTS.fetch_add(1, Ordering::Relaxed);
             freed += bytes;
         }
         if freed > 0 {
@@ -27338,11 +27415,13 @@ fn tensor_weight(
     if abs + rows * cols > bytes.len() {
         return None;
     }
-    weight_buffer(
-        c,
-        (model.uid() as usize, idx),
-        &bytes[abs..abs + rows * cols],
-    )
+    let key = (model.uid() as usize, idx);
+    if !weight_resident(c, key) {
+        if let Some(v) = pread_range(model, abs, rows * cols) {
+            return weight_buffer(c, key, &v);
+        }
+    }
+    weight_buffer(c, key, &bytes[abs..abs + rows * cols])
 }
 
 /// `tensor_weight` for tile-packed dtypes whose payload length differs
@@ -27363,7 +27442,13 @@ fn tensor_weight_sized(
     if abs + payload > bytes.len() {
         return None;
     }
-    weight_buffer(c, (model.uid() as usize, idx), &bytes[abs..abs + payload])
+    let key = (model.uid() as usize, idx);
+    if !weight_resident(c, key) {
+        if let Some(v) = pread_range(model, abs, payload) {
+            return weight_buffer(c, key, &v);
+        }
+    }
+    weight_buffer(c, key, &bytes[abs..abs + payload])
 }
 
 /// Encodes q8-matvec (row0=0) into the given encoder, writes to `y`. The bind

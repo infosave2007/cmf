@@ -10840,6 +10840,24 @@ fn moe_route(logits: &[f32], m: &MoeFfn, allowed: Option<&[bool]>) -> (Vec<usize
     (idx, p, wsum)
 }
 
+/// See the call site: one `layer:e1,e2,…` line per routed token.
+fn moe_trace(idx: &[usize]) {
+    use std::io::Write;
+    static F: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
+        std::sync::OnceLock::new();
+    let Some(f) = F.get_or_init(|| {
+        let p = std::env::var("CMF_MOE_TRACE").ok()?;
+        Some(std::sync::Mutex::new(
+            std::fs::OpenOptions::new().create(true).append(true).open(p).ok()?,
+        ))
+    }) else {
+        return;
+    };
+    let li = crate::gpu::cur_layer();
+    let ids: Vec<String> = idx.iter().map(|e| e.to_string()).collect();
+    let _ = writeln!(f.lock().unwrap(), "{li}:{}", ids.join(","));
+}
+
 /// MoE FFN: router → top-k experts (see `moe_route`). Only selected
 /// experts' pages are touched in mmap.
 fn moe_ffn(m: &MoeFfn, x: &[f32], pool: Option<&Pool>, allowed: Option<&[bool]>) -> Vec<f32> {
@@ -10860,6 +10878,12 @@ fn moe_ffn(m: &MoeFfn, x: &[f32], pool: Option<&Pool>, allowed: Option<&[bool]>)
             st[e] += 1;
         }
     }
+    // `CMF_MOE_TRACE=<file>`: append one line per (layer, token) with the
+    // selected expert ids. The cumulative `stats` above answer "which
+    // experts are popular"; a residency design needs the question they
+    // cannot answer — whether CONSECUTIVE tokens reuse experts (the
+    // temporal locality an LRU cache lives on, FreeToken §4).
+    moe_trace(&idx);
     // D5: the whole layer MoE block in one GPU command buffer (experts — the
     // same mmap via a no-copy buffer; intermediate activations on the GPU).
     // Same Ffn probe class as the dense chain: one submit per layer
