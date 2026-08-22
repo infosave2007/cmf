@@ -2091,6 +2091,25 @@ fn dsv4_layer_loop(
             dspark_note(*run.last().unwrap(), state, cfg);
         }
         run.clear();
+        if partial_dev[li] && chain1_on() {
+            if let Some(home) = dsv4_chain1_layer(
+                state,
+                &mut folded,
+                layers,
+                l,
+                cfg,
+                st,
+                token_id,
+                li,
+                freqs_of(l),
+                pool,
+                state_on_host,
+            ) {
+                state_on_host = home;
+                dspark_note(li, state, cfg);
+                continue;
+            }
+        }
         if partial_dev[li] && partial_walk_on() {
             // Attention and the resident expert subset stay on the card. The
             // router still sees every expert and returns only the winners
@@ -2600,6 +2619,284 @@ fn dsv4_partial_layer(
     // as well double-counts the capture and fails `dspark_take`'s
     // completeness check (seen 4 of 3, measured), which reads exactly like
     // the starvation it was meant to fix.
+    Some(true)
+}
+
+/// `CMF_DSV4_CHAIN1=1`: a partial layer runs as ONE submission — attention,
+/// folds and the subset MoE in a single frame, the state staying on the
+/// card when every winner was resident (the common case once the slots
+/// warm). Cold winners pay the walk's exact correction from the preserved
+/// post. Off by default until measured.
+#[cfg(feature = "gpu")]
+fn chain1_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_DSV4_CHAIN1").is_ok_and(|v| v != "0"))
+}
+
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+fn dsv4_chain1_layer(
+    state: &mut [f32],
+    folded: &mut Vec<f32>,
+    layers: &[Dsv4Layer],
+    l: &Dsv4Layer,
+    cfg: &Dsv4Cfg,
+    st: &mut Dsv4State,
+    token_id: u32,
+    li: usize,
+    freqs: &[f32],
+    pool: Option<&crate::pool::Pool>,
+    state_on_host: bool,
+) -> Option<bool> {
+    let dim = cfg.dim;
+    let pk = pack_for(l, cfg, li)?;
+    if pk.globals.len() >= cfg.n_routed_experts {
+        return None;
+    }
+    let model = l.experts.first().and_then(|e| e.w1.model_arc())?;
+    // The same entry self-seed the repaired walk uses: the frame reads the
+    // pooled post/comb/state slots, and this layer's own are the only ones
+    // it may trust.
+    if state_on_host {
+        let (f, post, comb) = hc_fold_norm(
+            state,
+            &l.hc_attn_fn,
+            &l.hc_attn_scale,
+            &l.hc_attn_base,
+            &l.attn_norm,
+            cfg,
+            pool,
+        );
+        *folded = f;
+        if !crate::gpu_wgpu::dsv4_hc_write(&post, &comb)
+            || !crate::gpu_wgpu::dsv4_state_write(state)
+        {
+            return None;
+        }
+    }
+    let mut prep = AttnPrep::default();
+    let mut sink = vec![0.0f32; dim];
+    attention_step(
+        folded,
+        l,
+        cfg,
+        st,
+        li,
+        freqs,
+        pool,
+        Some(&mut prep),
+        &mut sink,
+    );
+    let hd = cfg.head_dim;
+    let n_comp = st.compressed[li].len() / hd;
+    let cap = (cfg.window + n_comp.next_power_of_two().max(64)) * hd;
+    let kv_id = st.kv_id;
+    if !crate::gpu_wgpu::dsv4_cache_write(kv_id, li, 0, &st.window[li], cap)
+        || (n_comp > 0
+            && !crate::gpu_wgpu::dsv4_cache_write(
+                kv_id,
+                li,
+                cfg.window * hd,
+                &st.compressed[li],
+                cap,
+            ))
+    {
+        return None;
+    }
+    let idx32: Vec<u32> = prep
+        .idxs
+        .iter()
+        .map(|&p| {
+            if p < prep.win_len {
+                p as u32
+            } else {
+                (cfg.window + (p - prep.win_len)) as u32
+            }
+        })
+        .collect();
+    let (Some(wq_a), Some(wq_b), Some(wo_a), Some(wo_b)) = (
+        l.wq_a.model_idx(),
+        l.wq_b.model_idx(),
+        l.wo_a.model_idx(),
+        l.wo_b.model_idx(),
+    ) else {
+        return None;
+    };
+    // Under the subset contract the forced list stays GLOBAL: the remap
+    // either finds each hash winner a slot or returns it cold.
+    let forced: Option<Vec<usize>> = l
+        .tid2eid
+        .as_ref()
+        .map(|tbl| hash_route(tbl, cfg.vocab, cfg.top_k, token_id));
+    let dynv = pk.dynslots.lock().unwrap();
+    let nxt = layers.get(li + 1);
+    let w = crate::gpu_wgpu::Dsv4LayerW {
+        attn: crate::gpu_wgpu::Dsv4AttnW {
+            wq_a,
+            wq_b,
+            wo_a,
+            wo_b,
+            q_norm: &l.q_norm,
+            sink: &l.attn_sink,
+        },
+        moe: crate::gpu_wgpu::Dsv4MoeW {
+            router: &[],
+            experts: &pk.tensors,
+            logits: &[],
+            // GLOBAL bias under the subset contract — the ranking spans
+            // every expert, so a packed-order bias would misalign it.
+            bias: l.gate_bias.as_deref(),
+            forced: forced.as_deref(),
+            remap: Some(&dynv.remap),
+        },
+        hc_ffn_fn: &l.hc_ffn_fn,
+        hc_ffn_scale: &l.hc_ffn_scale,
+        hc_ffn_base: &l.hc_ffn_base,
+        hc_next_fn: nxt.map(|n| n.hc_attn_fn.as_slice()),
+        hc_next_scale: nxt.map_or(&l.hc_attn_scale, |n| &n.hc_attn_scale),
+        hc_next_base: nxt.map_or(&l.hc_attn_base, |n| n.hc_attn_base.as_slice()),
+        ffn_norm: &l.ffn_norm,
+        next_norm: nxt.map_or(&l.attn_norm, |n| n.attn_norm.as_slice()),
+        next_q_norm: nxt.map_or(&l.q_norm, |n| n.q_norm.as_slice()),
+        next_wq_a: nxt.and_then(|n| n.wq_a.model_idx()),
+        router: &pk.router,
+    };
+    let geom = crate::gpu_wgpu::Dsv4LayerGeom {
+        attn: crate::gpu_wgpu::Dsv4AttnGeom {
+            dim,
+            nh: cfg.n_heads,
+            hd,
+            rd: cfg.rope_head_dim,
+            q_lora: cfg.q_lora_rank,
+            o_lora: cfg.o_lora_rank,
+            o_groups: cfg.o_groups,
+            eps: cfg.norm_eps,
+            scale: (hd as f32).powf(-0.5),
+        },
+        moe: crate::gpu_wgpu::Dsv4MoeGeom {
+            hidden: dim,
+            inter: cfg.moe_inter,
+            top_k: cfg.top_k,
+            route_scale: cfg.route_scale,
+            swiglu_limit: cfg.swiglu_limit,
+            gu_q2: l
+                .experts
+                .first()
+                .is_some_and(|e| e.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP)),
+        },
+        hc: cfg.hc_mult,
+        hc_eps: cfg.hc_eps,
+        sinkhorn_iters: cfg.hc_sinkhorn_iters,
+    };
+    let mut next = vec![0.0f32; dim];
+    let mut cold: Vec<(usize, f32)> = Vec::new();
+    let mut cold_x: Vec<f32> = Vec::new();
+    if !crate::gpu_wgpu::dsv4_layer_frame(
+        &model,
+        &w,
+        geom,
+        kv_id,
+        li,
+        Some(&prep.qr),
+        &idx32,
+        freqs,
+        st.pos,
+        &mut next,
+        Some(&mut cold),
+        &mut cold_x,
+    ) {
+        return None;
+    }
+    drop(dynv);
+    if cold.is_empty() {
+        // Every winner was resident: the state stays on the card and the
+        // frame's own next-fold is exact. This is the single-submission
+        // path the whole function exists for.
+        *folded = next;
+        return Some(false);
+    }
+    // Cold winners: complete on the frame's own normed input, correct the
+    // device state from the preserved post, and bring it home.
+    if cold_x.len() < dim {
+        return None;
+    }
+    let mut cold_sum = vec![0.0f32; dim];
+    {
+        let results: Vec<std::sync::Mutex<Vec<f32>>> =
+            cold.iter().map(|_| std::sync::Mutex::new(Vec::new())).collect();
+        let (cold_ref, results_ref, x_ref) = (&cold, &results, &cold_x[..dim]);
+        std::thread::scope(|sc| {
+            for i in 0..cold_ref.len() {
+                let (gi, wt) = cold_ref[i];
+                let Some(exp) = l.experts.get(gi) else { continue };
+                let r = &results_ref[i];
+                sc.spawn(move || {
+                    let mut a = vec![0.0f32; cfg.dim];
+                    crate::gpu::cpu_scope(|| run_expert(x_ref, exp, cfg, wt, None, &mut a));
+                    *r.lock().unwrap() = a;
+                });
+            }
+        });
+        for r in &results {
+            let a = r.lock().unwrap();
+            for (o, v) in cold_sum.iter_mut().zip(a.iter()) {
+                *o += v;
+            }
+        }
+    }
+    if !crate::gpu_wgpu::dsv4_state_add_cold_preserved(&cold_sum, cfg.hc_mult, state) {
+        return None;
+    }
+    // Reactive refill: the winners the slots did not hold are the likeliest
+    // winners of the NEXT token — pull them in now, LRU-evicting.
+    {
+        let mut dynv = pk.dynslots.lock().unwrap();
+        dynv.clock += 1;
+        let clock = dynv.clock;
+        for &(gi, _) in &cold {
+            if gi >= dynv.remap.len() || dynv.remap[gi] != u32::MAX {
+                continue;
+            }
+            let victim = (0..dynv.owner.len())
+                .filter(|&sl| dynv.last[sl] != clock)
+                .min_by_key(|&sl| dynv.last[sl]);
+            let Some(victim) = victim else { break };
+            let Some(exp) = l.experts.get(gi) else { continue };
+            let t3 = (|| Some((exp.w1.model_idx()?, exp.w3.model_idx()?, exp.w2.model_idx()?)))();
+            let Some(t3) = t3 else { continue };
+            let gu_q2 =
+                exp.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP);
+            let pack_first = pk.tensors.first().map(|t| t.0).unwrap_or(usize::MAX);
+            if !crate::gpu_wgpu::dsv4_slot_fill(
+                &model, pack_first, victim, t3, cfg.moe_inter, cfg.dim, gu_q2,
+            ) {
+                break;
+            }
+            let old = dynv.owner[victim] as usize;
+            if old < dynv.remap.len() {
+                dynv.remap[old] = u32::MAX;
+            }
+            dynv.remap[gi] = victim as u32;
+            dynv.owner[victim] = gi as u32;
+            dynv.last[victim] = clock;
+            dynv.mutated = true;
+        }
+    }
+    if let Some(n) = nxt {
+        let (f, post, comb) = hc_fold_norm(
+            state,
+            &n.hc_attn_fn,
+            &n.hc_attn_scale,
+            &n.hc_attn_base,
+            &n.attn_norm,
+            cfg,
+            pool,
+        );
+        *folded = f;
+        if !crate::gpu_wgpu::dsv4_hc_write(&post, &comb) {
+            return None;
+        }
+    }
     Some(true)
 }
 
