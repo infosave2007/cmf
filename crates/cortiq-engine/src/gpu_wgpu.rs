@@ -33608,13 +33608,14 @@ fn encode_moe_chain(
     w: &Dsv4LayerW,
     g: Dsv4MoeGeom,
     n_pack: usize,
+    n_route: usize,
     slots: usize,
     bkey: (u64, usize),
 ) {
     let mut pass = begin_pass(enc);
     encode_moe_chain_p(
         &mut pass, c, logits, x, msel, mwt, mcnt, mact, out, gate_all, up_all, down_all, w, g,
-        n_pack, slots, bkey,
+        n_pack, n_route, slots, bkey,
     );
 }
 
@@ -33635,15 +33636,17 @@ fn encode_moe_chain_p(
     w: &Dsv4LayerW,
     g: Dsv4MoeGeom,
     n_pack: usize,
+    n_route: usize,
     slots: usize,
     bkey: (u64, usize),
 ) {
+    let subset = n_route > n_pack && w.moe.remap.is_some();
     // The bias now lives in the PACK, whose address is stable for the life
     // of the process — so the const cache is sound for it, and each layer
     // gets its own device buffer. The per-call pool here was the many-layer
     // clobber: every queue write lands before the run's single submit.
     let bs = match w.moe.bias {
-        Some(b) if b.len() >= n_pack => const_buf(c, bytemuck::cast_slice(&b[..n_pack])),
+        Some(b) if b.len() >= n_route => const_buf(c, bytemuck::cast_slice(&b[..n_route])),
         _ => logits.clone(),
     };
     let mk = frame_buf(c, 17, n_pack * 4, true);
@@ -33657,11 +33660,12 @@ fn encode_moe_chain_p(
         }
         _ => store_slot(c, 18, bkey.0, bkey.1, &vec![0u8; g.top_k * 4]),
     };
-    let rflags = (w.moe.bias.is_some_and(|b| b.len() >= n_pack) as u32)
+    let rflags = (w.moe.bias.is_some_and(|b| b.len() >= n_route) as u32)
         | ((w.moe.forced.is_some_and(|f| f.len() >= g.top_k) as u32) << 2)
         | 8
+        | ((subset as u32) << 4)
         | ((n_pack as u32) << 8);
-    let rp = uniform_mixed(c, [n_pack as u32, g.top_k as u32, rflags], g.route_scale);
+    let rp = uniform_mixed(c, [n_route as u32, g.top_k as u32, rflags], g.route_scale);
     let stride16 = |rows: usize, cols: usize, q2: bool| -> u32 {
         let dt = if q2 {
             cortiq_core::TensorDtype::Q2TiledP
@@ -33718,6 +33722,16 @@ fn encode_moe_chain_p(
             &c.layout_moe_dn_b,
         )
     };
+    // The live remap rides a per-(kv, layer) store slot: stable identity
+    // for the cached bind group, fresh CONTENT every call — a layer stays
+    // subset (or full) for the life of the process, so the identity never
+    // flips under the cache.
+    let rm = if subset {
+        let r = w.moe.remap.unwrap();
+        store_slot(c, 26, bkey.0, bkey.1, bytemuck::cast_slice(&r[..n_route]))
+    } else {
+        frame_buf(c, 26, n_pack.max(1) * 4, true)
+    };
     let bind_r = cached_bind(c, (127, bkey.0, bkey.1), || {
         c.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
@@ -33731,8 +33745,8 @@ fn encode_moe_chain_p(
                 bind_buf(5, mwt),
                 bind_buf(6, mcnt),
                 bind_buf(7, &rp),
-                bind_buf(8, &frame_buf(c, 26, n_pack.max(1) * 4, true)),
-                bind_buf(9, &frame_buf(c, 27, 2 * g.top_k * 4, false)),
+                bind_buf(8, &rm),
+                bind_buf(9, &frame_buf(c, 27, 4 * g.top_k * 4, false)),
             ],
         })
     });
@@ -34248,10 +34262,15 @@ fn dsv4_layer_frame_enc(
     let ffn_bs = const_buf(c, bytemuck::cast_slice(&w.hc_ffn_base[..mix_hc]));
     let ffn_nw = const_buf(c, bytemuck::cast_slice(&w.ffn_norm[..dim]));
     let n_exp = w.moe.experts.len().saturating_sub(1);
-    if w.router.len() < m.hidden * n_exp {
-        no!("роутер короче {} × {}", n_exp, m.hidden);
+    // Routing width. A subset pack (live remap present) ranks over EVERY
+    // expert and the remap turns winners into slots or cold picks — the
+    // same contract the two-frame path runs; a full pack keeps the packed
+    // width and the remap stays a dummy.
+    let n_route = w.moe.remap.map_or(n_exp, |r| r.len().max(n_exp));
+    if w.router.len() < m.hidden * n_route {
+        no!("роутер короче {} × {}", n_route, m.hidden);
     }
-    let router = const_buf(c, bytemuck::cast_slice(&w.router[..m.hidden * n_exp]));
+    let router = const_buf(c, bytemuck::cast_slice(&w.router[..m.hidden * n_route]));
     let next_nw = const_buf(c, bytemuck::cast_slice(&w.next_norm[..dim]));
     let next_qn = const_buf(c, bytemuck::cast_slice(&w.next_q_norm[..a.q_lora]));
 
@@ -34290,7 +34309,7 @@ fn dsv4_layer_frame_enc(
     let hcomb = frame_buf_t(c, 44, tok, hc * hc * 4, true);
     let x2 = frame_buf_t(c, 45, tok, dim * 4, true);
     let state2 = frame_buf(c, 46, hc * dim * 4, false);
-    let logit_b = frame_buf(c, 47, n_pack * 4, false);
+    let logit_b = frame_buf(c, 47, n_route * 4, false);
     let msel = frame_buf(c, 19, slots * 4, false);
     let mwt = frame_buf(c, 20, slots * 4, false);
     let mcnt = frame_buf(c, 21, 4, false);
@@ -34449,7 +34468,7 @@ fn dsv4_layer_frame_enc(
             &router,
             &x2,
             &logit_b,
-            n_pack,
+            n_route,
             m.hidden,
             (123, kv_id, lk),
         );
@@ -34470,6 +34489,7 @@ fn dsv4_layer_frame_enc(
                 w,
                 m,
                 n_pack,
+                n_route,
                 slots,
                 (kv_id, li),
             );
@@ -38181,6 +38201,12 @@ pub fn dsv4_layer_frame(
     inv_freq: &[f32],
     pos: usize,
     folded_next: &mut [f32],
+    // Subset packs (live remap in `w.moe.remap`) return the winners the
+    // slots do not hold; the caller completes them on the host and owes
+    // the state the correction (`dsv4_state_add_cold`). None keeps the
+    // full-pack contract: every winner resident, nothing to return.
+    mut cold_out: Option<&mut Vec<(usize, f32)>>,
+    cold_x_out: &mut Vec<f32>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
     let dim = g.attn.dim;
@@ -38197,14 +38223,64 @@ pub fn dsv4_layer_frame(
     ) else {
         return false;
     };
+    let cold_bytes = (4 * g.moe.top_k * 4) as u64;
+    let total = (dim * 4) as u64
+        + if cold_out.is_some() {
+            cold_bytes + (dim * 4) as u64 // + the normed FFN input for the host completion
+        } else {
+            0
+        };
     let mut sc = c.scratch.lock().unwrap();
     let stage = Scratch::ensure(
         &c.device,
         &mut sc.stage,
-        (dim * 4) as u64,
+        total,
         wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         "dsv4-layer-stage",
     );
+    if let Some(cold_out) = cold_out.as_deref_mut() {
+        // The cold list rides the same staging and the same fence as the
+        // fold — one barrier pays for both, exactly like the two-frame path.
+        enc.copy_buffer_to_buffer(&folded, 0, &stage, 0, (dim * 4) as u64);
+        enc.copy_buffer_to_buffer(
+            &frame_buf(c, 27, 4 * g.moe.top_k * 4, false),
+            0,
+            &stage,
+            (dim * 4) as u64,
+            cold_bytes,
+        );
+        enc.copy_buffer_to_buffer(
+            &frame_buf_t(c, 45, 0, dim * 4, true),
+            0,
+            &stage,
+            (dim * 4) as u64 + cold_bytes,
+            (dim * 4) as u64,
+        );
+        submit(c, finish_enc(enc));
+        let slice = stage.slice(..total);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
+            return false;
+        }
+        let mut ok = false;
+        if let Ok(data) = slice.get_mapped_range() {
+            folded_next[..dim].copy_from_slice(bytemuck::cast_slice(&data[..dim * 4]));
+            let ct = dim * 4 + cold_bytes as usize;
+            let tail: &[u32] = bytemuck::cast_slice(&data[dim * 4..ct]);
+            cold_out.clear();
+            for t in 0..g.moe.top_k {
+                if tail[2 * t] != u32::MAX {
+                    cold_out.push((tail[2 * t] as usize, f32::from_bits(tail[2 * t + 1])));
+                }
+            }
+            cold_x_out.clear();
+            cold_x_out.extend_from_slice(bytemuck::cast_slice(&data[ct..total as usize]));
+            ok = true;
+        }
+        stage.unmap();
+        drop(sc);
+        return ok;
+    }
     let ok = readback(
         c,
         enc,

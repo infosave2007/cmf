@@ -1903,10 +1903,7 @@ fn dsv4_layer_loop(
                 dn_q2,
             );
             on_dev[li] = attn_ok && experts_ok && pk.globals.len() == cfg.n_routed_experts;
-            partial_dev[li] = attn_ok
-                && experts_ok
-                && pk.globals.len() < cfg.n_routed_experts
-                && !pk.is_mutated();
+            partial_dev[li] = attn_ok && experts_ok && pk.globals.len() < cfg.n_routed_experts;
         }
     }
     let active_dev: Vec<bool> = on_dev
@@ -2110,6 +2107,7 @@ fn dsv4_layer_loop(
                 li,
                 freqs_of(l),
                 pool,
+                state_on_host,
             ) else {
                 return false;
             };
@@ -2327,6 +2325,8 @@ fn dsv4_layer_loop(
             freqs_of(l),
             st.pos,
             &mut next,
+            None,
+            &mut Vec::new(),
         ) {
             return false;
         }
@@ -2460,8 +2460,34 @@ fn dsv4_partial_layer(
     li: usize,
     freqs: &[f32],
     pool: Option<&crate::pool::Pool>,
+    state_on_host: bool,
 ) -> Option<bool> {
     let dim = cfg.dim;
+    // The self-poisoning this walk was parked for: its frames read the
+    // pooled post/comb/state slots, and whatever layer ran a frame LAST —
+    // on this token or the previous one — left its own there. The walk
+    // now seeds its OWN slots from the state it holds at entry, and is
+    // immune to the neighbours. The state is home whenever the previous
+    // layer exited through this walk or the host branch; a device exit
+    // (full-layer frame) leaves it on the card, where the slots are
+    // already this token's — nothing to reseed then.
+    if state_on_host {
+        let (f, post, comb) = hc_fold_norm(
+            state,
+            &l.hc_attn_fn,
+            &l.hc_attn_scale,
+            &l.hc_attn_base,
+            &l.attn_norm,
+            cfg,
+            pool,
+        );
+        *folded = f;
+        if !crate::gpu_wgpu::dsv4_hc_write(&post, &comb)
+            || !crate::gpu_wgpu::dsv4_state_write(state)
+        {
+            return None;
+        }
+    }
     let mut prep = AttnPrep::default();
     let mut sink = vec![0.0f32; dim];
     attention_step(
