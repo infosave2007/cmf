@@ -40772,6 +40772,81 @@ pub fn dsv4_draft_fit(inter: usize, hidden: usize, gu_q2: bool, dn_q2: bool) -> 
 /// commits to the device path.
 /// Ask for the attention weights BEFORE the experts, or the experts take the
 /// card and the skeleton — two orders of magnitude smaller — has nowhere left.
+/// Fill counters for the dynamic expert slots (`dsv4_slot_fill`).
+pub static DSV4_FILLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static DSV4_FILL_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Overwrite ONE routed-expert slot of a layer's device bank buffers with
+/// another expert's bytes — the FreeToken move: the packed subset follows
+/// the router instead of staying whatever load-time frequency guessed.
+///
+/// Three `queue.write_buffer`s into slot offsets; the queue orders them
+/// before any later submit, and the frame re-uploads its remap every call,
+/// so the table and the bytes can never be seen out of step. Sources, in
+/// order: the RAM tier (prefetched), pread (CMF_WEIGHT_PREAD), the mmap.
+/// `pack_first` is the pack's first w1 tensor index — the bank cache key.
+pub fn dsv4_slot_fill(
+    model: &Arc<CmfModel>,
+    pack_first: usize,
+    slot: usize,
+    t: (usize, usize, usize),
+    inter: usize,
+    hidden: usize,
+    gu_q2: bool,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    let Some(c) = ctx() else { return false };
+    let key = (model.uid() as usize, pack_first);
+    let Some((g, u, d)) = c.moe_expw.lock().unwrap().get(&key).cloned() else {
+        return false;
+    };
+    let plen4 = |rows: usize, cols: usize| -> Option<usize> {
+        cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[rows, cols])
+    };
+    let gu_len = if gu_q2 {
+        cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q2TiledP, &[inter, hidden])
+    } else {
+        plen4(inter, hidden)
+    };
+    let (Some(gu_len), Some(d_len)) = (gu_len, plen4(hidden, inter)) else {
+        return false;
+    };
+    let bytes = model.primary_bytes();
+    let put = |buf: &wgpu::Buffer, idx: usize, plen: usize| -> bool {
+        let Some(e) = model.tensors.get(idx) else { return false };
+        if e.nbytes as usize != plen {
+            return false;
+        }
+        let Some(abs) = model.entry_abs_offset(e) else { return false };
+        if slot.checked_mul(plen).is_none() || (slot * plen + plen) as u64 > buf.size() {
+            return false;
+        }
+        let tier = host_tier_get((model.uid() as usize, idx));
+        let src: &[u8] = if let Some(v) = tier.as_deref() {
+            if v.len() != plen {
+                return false;
+            }
+            v
+        } else if let Some(v) = pread_range(model, abs, plen) {
+            return {
+                c.queue.write_buffer(buf, (slot * plen) as u64, &v);
+                true
+            };
+        } else {
+            let Some(sl) = bytes.get(abs..abs + plen) else { return false };
+            sl
+        };
+        c.queue.write_buffer(buf, (slot * plen) as u64, src);
+        true
+    };
+    let ok = put(&g, t.0, gu_len) && put(&u, t.1, gu_len) && put(&d, t.2, d_len);
+    if ok {
+        DSV4_FILLS.fetch_add(1, Ordering::Relaxed);
+        DSV4_FILL_BYTES.fetch_add((2 * gu_len + d_len) as u64, Ordering::Relaxed);
+    }
+    ok
+}
+
 pub fn dsv4_experts_ready(
     model: &Arc<CmfModel>,
     experts: &[(usize, usize, usize)],
