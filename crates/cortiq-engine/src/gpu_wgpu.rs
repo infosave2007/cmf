@@ -14484,7 +14484,52 @@ pub fn prefetch_tier(model: &Arc<CmfModel>, keep: &dyn Fn(&str) -> bool) {
         let Some(abs) = model.entry_abs_offset(e) else { continue };
         plan.push((abs, e.nbytes as usize, idx));
     }
-    plan.sort_unstable_by_key(|p| p.0);
+    // Admission order. Default: file order — ONE sequential sweep at
+    // streaming rate. With `CMF_TIER_HOT=<stats.json>` (the moe-mask
+    // statistics file: {"layer": [counts]}), hot experts go FIRST, so a
+    // budget-capped tier keeps the experts the router actually reaches —
+    // admission policy only, routing and quality untouched. The sweep
+    // then seeks, but a tier that holds the right bytes beats one that
+    // streamed the wrong ones (measured: 60.7 slot fills a token sourcing
+    // at disk speed with file-order admission).
+    let hot: Option<std::collections::HashMap<u16, Vec<u64>>> = std::env::var("CMF_TIER_HOT")
+        .ok()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| {
+            let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+            let mut m = std::collections::HashMap::new();
+            for (k, arr) in v.as_object()? {
+                let li: u16 = k.parse().ok()?;
+                let counts: Vec<u64> = arr
+                    .as_array()?
+                    .iter()
+                    .map(|x| x.as_u64().unwrap_or(0))
+                    .collect();
+                m.insert(li, counts);
+            }
+            Some(m)
+        });
+    match &hot {
+        Some(m) => {
+            let score = |idx: usize| -> u64 {
+                let name = &model.tensors[idx].name;
+                let li = layer_of_name(name);
+                let e: usize = name
+                    .find(".experts.")
+                    .and_then(|i| {
+                        let r = &name[i + 9..];
+                        r[..r.find('.').unwrap_or(r.len())].parse().ok()
+                    })
+                    .unwrap_or(usize::MAX);
+                m.get(&li)
+                    .and_then(|c| c.get(e))
+                    .copied()
+                    .unwrap_or(0)
+            };
+            plan.sort_by_key(|p| std::cmp::Reverse(score(p.2)));
+        }
+        None => plan.sort_unstable_by_key(|p| p.0),
+    }
     let total: u64 = plan.iter().map(|p| p.1 as u64).sum();
     let budget = t.budget;
     tracing::info!(

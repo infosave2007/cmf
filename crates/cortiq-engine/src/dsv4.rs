@@ -1135,6 +1135,16 @@ pub(crate) mod prof {
             - MOE_NS.load(Ordering::Relaxed) as f64 / 1e6)
             .max(0.0);
         let hd = HEAD_NS.load(Ordering::Relaxed) as f64 / 1e6;
+        #[cfg(feature = "gpu")]
+        {
+            let f = crate::gpu_wgpu::DSV4_FILLS.load(Ordering::Relaxed);
+            let fb = crate::gpu_wgpu::DSV4_FILL_BYTES.load(Ordering::Relaxed);
+            eprintln!(
+                "[dsv4-профиль] ЗАЛИВКИ СЛОТОВ: {:.1} эксп/токен, {:.0} МБ/токен",
+                f as f64 / toks as f64,
+                fb as f64 / 1e6 / toks as f64
+            );
+        }
         eprintln!(
             "[dsv4-профиль] {calls} вызовов слоя за {toks} токенов | \
              на токен: внимание {:.0} мс, MoE {:.0} мс, гипер-связи+нормы {:.0} мс, \
