@@ -3319,6 +3319,12 @@ struct PackDyn {
     owner: Vec<u32>,
     last: Vec<u64>,
     clock: u64,
+    /// Per-expert recent-use tally (halved every 64 tokens): the q* rule.
+    /// A slot upload only pays for itself when the expert is REUSED —
+    /// FreeToken's split — so a fetch needs `seen >= CMF_DSV4_FETCH_MIN_SEEN`
+    /// prior recent picks; a first-timer stays a cold pick and the CPU
+    /// reads it at the shelf. At min_seen=1 (default) behavior is unchanged.
+    seen: Vec<u16>,
     /// Set on the first slot refill. The chain and the batch verify hand
     /// the device `remap: None` and trust the banks to still hold the
     /// BUILD-TIME packing — a mutated pack must never be claimed by them.
@@ -3523,6 +3529,7 @@ fn pack_for(l: &Dsv4Layer, cfg: &Dsv4Cfg, li: usize) -> Option<std::sync::Arc<Pa
                     last: vec![0; globals.len()],
                     clock: 0,
                     mutated: false,
+                    seen: vec![0; cfg.n_routed_experts],
                 }),
                 remap,
                 globals,
@@ -3631,6 +3638,7 @@ fn pack_for(l: &Dsv4Layer, cfg: &Dsv4Cfg, li: usize) -> Option<std::sync::Arc<Pa
                 last: vec![0; globals.len()],
                 clock: 0,
                 mutated: false,
+                seen: vec![0; cfg.n_routed_experts],
             }),
             remap,
             globals,
@@ -3711,11 +3719,26 @@ fn moe_frame(
             &mut pidx,
             &mut pwt,
         );
+        if clock % 64 == 0 {
+            for v in dynv.seen.iter_mut() {
+                *v >>= 1;
+            }
+        }
         for &pick in &pidx {
+            dynv.seen[pick] = dynv.seen[pick].saturating_add(1);
             let sl = dynv.remap[pick];
             if sl != u32::MAX {
                 dynv.last[sl as usize] = clock;
             }
+        }
+        fn fetch_min_seen() -> u16 {
+            static M: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+            *M.get_or_init(|| {
+                std::env::var("CMF_DSV4_FETCH_MIN_SEEN")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(1)
+            })
         }
         let mut fetched = 0usize;
         for &pick in &pidx {
@@ -3724,6 +3747,9 @@ fn moe_frame(
             }
             if dynv.remap[pick] != u32::MAX {
                 continue;
+            }
+            if dynv.seen[pick] < fetch_min_seen() {
+                continue; // one-shot so far: the CPU reads it at the shelf
             }
             // Victim: the LRU slot among those this token does not need.
             let victim = (0..dynv.owner.len())
