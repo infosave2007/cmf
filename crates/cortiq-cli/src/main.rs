@@ -736,6 +736,13 @@ enum Commands {
     Bench {
         /// Path to .cmf model file
         model: String,
+        /// Measure the machine's two MoE-offload bandwidths instead of the
+        /// model: host-RAM copy (the CPU arm's ceiling) and host-to-VRAM
+        /// upload (the fetch arm's), each over expert-sized blocks. The
+        /// hybrid split is arithmetic over exactly these two numbers, so
+        /// they are measured once per machine, not guessed per run.
+        #[arg(long)]
+        bw: bool,
         /// Task to benchmark
         #[arg(short, long, default_value = "general")]
         task: String,
@@ -2419,7 +2426,11 @@ async fn main() -> anyhow::Result<()> {
             o1_m,
             o1_window,
             o1_sink,
+            bw,
         } => {
+            if bw {
+                return cmd_bench_bw(json);
+            }
             let o1 = O1Flags {
                 spec: o1,
                 m: o1_m,
@@ -5280,6 +5291,38 @@ async fn cmd_masks(model_path: &str) -> anyhow::Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The two bandwidths the MoE hybrid split is arithmetic over, measured
+/// on expert-sized blocks (13 MB class): host-RAM copy — the CPU arm's
+/// ceiling — and host-to-VRAM upload — the fetch arm's. Once per machine.
+fn cmd_bench_bw(json: bool) -> anyhow::Result<()> {
+    const BLOCK: usize = 13 * 1024 * 1024;
+    const ROUNDS: usize = 24;
+    let src = vec![7u8; BLOCK];
+    let mut dst = vec![0u8; BLOCK];
+    // Warm both buffers, then time the copies.
+    dst.copy_from_slice(&src);
+    let t0 = std::time::Instant::now();
+    for _ in 0..ROUNDS {
+        dst.copy_from_slice(&src);
+        std::hint::black_box(&dst);
+    }
+    let host_gbs = (BLOCK * ROUNDS) as f64 / t0.elapsed().as_secs_f64() / 1e9;
+    let pcie_gbs = cortiq_engine::gpu_wgpu::upload_bandwidth_probe(BLOCK, ROUNDS);
+    if json {
+        println!(
+            "{{\"host_copy_gbs\": {host_gbs:.2}, \"upload_gbs\": {:.2}}}",
+            pcie_gbs.unwrap_or(0.0)
+        );
+    } else {
+        println!("копия в RAM: {host_gbs:.1} ГБ/с (потолок CPU-плеча)");
+        match pcie_gbs {
+            Some(v) => println!("заливка в VRAM: {v:.1} ГБ/с (потолок fetch-плеча)"),
+            None => println!("заливка в VRAM: устройства нет"),
+        }
+    }
+    Ok(())
+}
+
 async fn cmd_bench(
     model_path: &str,
     task: &str,

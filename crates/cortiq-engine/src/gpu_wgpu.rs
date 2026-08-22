@@ -40853,6 +40853,31 @@ pub fn dsv4_slot_fill(
     ok
 }
 
+/// Host→VRAM upload bandwidth over `rounds` writes of a `block`-sized
+/// buffer, submits included — the fetch arm's real ceiling for the MoE
+/// hybrid split (`cortiq bench --bw`). None when no device came up.
+pub fn upload_bandwidth_probe(block: usize, rounds: usize) -> Option<f64> {
+    let c = ctx()?;
+    let src = vec![5u8; block];
+    let buf = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("bw-probe"),
+        size: block as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    // One warm round compiles nothing but pages the staging belt in.
+    c.queue.write_buffer(&buf, 0, &src);
+    c.queue.submit(None);
+    let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+    let t0 = std::time::Instant::now();
+    for _ in 0..rounds {
+        c.queue.write_buffer(&buf, 0, &src);
+        c.queue.submit(None);
+    }
+    let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+    Some((block * rounds) as f64 / t0.elapsed().as_secs_f64() / 1e9)
+}
+
 pub fn dsv4_experts_ready(
     model: &Arc<CmfModel>,
     experts: &[(usize, usize, usize)],
