@@ -3798,6 +3798,12 @@ pub fn moe_step(
     if route_stats_on() {
         record_route(li, 0, cfg.n_routed_experts, &idx);
     }
+    // Same trace the generic MoE path writes (`CMF_MOE_TRACE`): one
+    // `layer:e1,e2,…` line per routed token. The first arena run on this
+    // architecture measured a 4.5% hit rate — random level for the arena's
+    // size — and only a per-token trace can say whether that is the
+    // router's true entropy or the cache structure destroying locality.
+    crate::pipeline::moe_trace_at(li as i32, &idx);
     // The whole block on the device, in one submission, or nothing. Routing
     // happens there too — the logits above are what it starts from, so the
     // CPU's own choice is discarded rather than second-guessed.
