@@ -56,11 +56,17 @@ struct Inner {
     /// The published job: closure pointer + total participant count.
     /// Written by the caller BEFORE the epoch bump, read by workers
     /// AFTER they observe the new epoch (acquire/release pairing).
-    /// (task, worker count, publisher's GPU device). The device rides
-    /// along because a dispatch begun on card 1 must not finish on card
-    /// 0: worker threads have their own thread-locals, and the engine
-    /// resolves its wgpu context through one.
-    slot: UnsafeCell<Option<(TaskPtr, usize, usize)>>,
+    /// (task, worker count, publisher's GPU device, worker limit). The
+    /// device rides along because a dispatch begun on card 1 must not
+    /// finish on card 0: worker threads have their own thread-locals,
+    /// and the engine resolves its wgpu context through one. The limit
+    /// is how many workers PARTICIPATE: a job with eight grains has no
+    /// use for three hundred workers — the unpark syscalls and the
+    /// remaining-drain would BE the job (measured: 361 pool dispatches
+    /// per DeepSeek-V4 token, and CMF_THREADS=64 vs 380 was 1.3 vs 2.4
+    /// tok/s with no other change). Workers at or past the limit skip
+    /// the job entirely and never touch `remaining`.
+    slot: UnsafeCell<Option<(TaskPtr, usize, usize, usize)>>,
     shutdown: AtomicBool,
     /// Spin iterations before a worker parks (0 = park immediately).
     spin_budget: usize,
@@ -319,14 +325,53 @@ impl Pool {
     /// computed exactly as in the serial path → bit-identical output.
     pub fn run_rows(&self, rows: usize, f: &(dyn Fn(usize, usize) + Sync)) {
         let grain = grain_for(rows, self.threads.len() + 1);
+        let chunks = rows.div_ceil(grain.max(1));
         let next = AtomicUsize::new(0);
-        self.run(&|_w, _n| loop {
+        self.run_limited(chunks, &|_w, _n| loop {
             let start = next.fetch_add(grain, Ordering::Relaxed);
             if start >= rows {
                 break;
             }
             f(start, (start + grain).min(rows));
         });
+    }
+
+    /// `run`, waking at most `max_workers` workers. Same grain, same
+    /// row split, bit-identical results — only the number of threads
+    /// woken changes, so an 8-grain job stops paying 380 unparks. Only
+    /// cursor-style closures (which ignore their (idx, n) arguments)
+    /// come through here: the caller identifies itself as `limit`,
+    /// which under a cap is NOT `n_workers()`.
+    fn run_limited(&self, max_workers: usize, f: &(dyn Fn(usize, usize) + Sync)) {
+        let nw = self.threads.len().min(max_workers);
+        if nw == self.threads.len() {
+            return self.run(f);
+        }
+        DISPATCHES.fetch_add(1, Ordering::Relaxed);
+        let ptr: *const (dyn Fn(usize, usize) + Sync) = f;
+        let ptr: *const (dyn Fn(usize, usize) + Sync + 'static) =
+            unsafe { std::mem::transmute(ptr) };
+        let dev = crate::gpu::current_device();
+        // SAFETY: same contract as `run` — no job in flight, and the
+        // wait below outlives every borrow of `f`.
+        unsafe { *self.inner.slot.get() = Some((TaskPtr(ptr), nw + 1, dev, nw)) };
+        self.inner.remaining.store(nw, Ordering::Relaxed);
+        self.inner.epoch.fetch_add(1, Ordering::SeqCst);
+        for (i, t) in self.threads.iter().enumerate().take(nw) {
+            if self.inner.parked[i].load(Ordering::SeqCst) {
+                t.unpark();
+            }
+        }
+        f(nw, nw + 1);
+        let mut spins = 0usize;
+        while self.inner.remaining.load(Ordering::Acquire) != 0 {
+            spins += 1;
+            if spins < 10_000 {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
+        }
     }
 
     /// Multi-matrix job: one dispatch serves SEVERAL row spaces
@@ -342,8 +387,9 @@ impl Pool {
             return;
         }
         let grain = grain_for(total, self.threads.len() + 1);
+        let chunks = total.div_ceil(grain.max(1));
         let next = AtomicUsize::new(0);
-        self.run(&|_w, _n| loop {
+        self.run_limited(chunks, &|_w, _n| loop {
             let s = next.fetch_add(grain, Ordering::Relaxed);
             if s >= total {
                 break;
@@ -379,7 +425,7 @@ impl Pool {
         // SAFETY: no job in flight (previous run() drained `remaining`),
         // so the slot is not being read.
         let dev = crate::gpu::current_device();
-        unsafe { *self.inner.slot.get() = Some((TaskPtr(ptr), n, dev)) };
+        unsafe { *self.inner.slot.get() = Some((TaskPtr(ptr), n, dev, nw)) };
         self.inner.remaining.store(nw, Ordering::Relaxed);
         self.inner.epoch.fetch_add(1, Ordering::SeqCst);
         for (i, t) in self.threads.iter().enumerate() {
@@ -522,7 +568,14 @@ fn worker_loop(inner: &Inner, idx: usize) {
         // SAFETY: the slot was written before the epoch bump we just
         // observed (release/acquire), and stays valid until `remaining`
         // drops to zero — which happens only after `f` returns below.
-        let (task, n, dev) = unsafe { (*inner.slot.get()).expect("job published with epoch") };
+        let (task, n, dev, limit) =
+            unsafe { (*inner.slot.get()).expect("job published with epoch") };
+        if idx >= limit {
+            // Not invited: a bounded dispatch (run_rows with few grains)
+            // counted only `limit` workers into `remaining`. Executing —
+            // or decrementing — here would corrupt the barrier.
+            continue;
+        }
         let f = unsafe { &*task.0 };
         crate::gpu::set_current_device(dev);
         f(idx, n);
