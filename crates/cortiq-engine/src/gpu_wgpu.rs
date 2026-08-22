@@ -14238,6 +14238,13 @@ pub fn is_discrete() -> bool {
 struct Resident {
     buf: wgpu::Buffer,
     bytes: u64,
+    /// Which model layer this tensor belongs to (u16::MAX = not a layer
+    /// tensor). Eviction balances ACROSS layers with this: a global pool
+    /// under a per-token layer-by-layer sweep is the textbook cyclic
+    /// pattern that turns plain LRU into 0% — measured on DeepSeek-V4 as
+    /// a 4.7% arena hit rate while the same trace replayed through a
+    /// PER-LAYER LRU of equal total size hits ~70%.
+    layer: u16,
     /// Never evict. Set for the weights of layers the decode loop has
     /// committed to running on the card: their caches live there, so losing
     /// one mid-sequence is not a slower token but a refused one, and at a
@@ -14403,6 +14410,8 @@ pub static RES_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 pub static RES_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static RES_MISS_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static RES_EVICTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Misses that fetched bytes and then found no room even after eviction.
+pub static RES_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// (hits, misses, miss_bytes, evictions) since process start.
 pub fn residency_stats() -> (u64, u64, u64, u64) {
@@ -14413,6 +14422,93 @@ pub fn residency_stats() -> (u64, u64, u64, u64) {
         RES_MISS_BYTES.load(Relaxed),
         RES_EVICTS.load(Relaxed),
     )
+}
+
+/// The host tier of the expert residency: a pinned-RAM cache of raw
+/// weight bytes between the VRAM arena and storage.
+///
+/// The measurement that makes it load-bearing: on DeepSeek-V4-Flash the
+/// VRAM arena alone hit 4.5% and every miss walked to the network volume
+/// at 0.34 GB/s — 420 GB streamed for 60 tokens. FreeToken survives the
+/// same regime because its misses land in host RAM over PCIe; this tier
+/// is that landing pad. A miss now costs the storage read ONCE while the
+/// bytes stay resident here, and re-uploads to the card run at memcpy
+/// rate. `CMF_RAM_TIER_MB` sizes it (0/unset = off); the ceiling to
+/// respect is the CGROUP's, not the host's — `free` lies in a container.
+struct HostTier {
+    map: std::sync::Mutex<
+        std::collections::HashMap<(usize, usize), (std::sync::Arc<Vec<u8>>, u64)>,
+    >,
+    bytes: std::sync::atomic::AtomicU64,
+    clock: std::sync::atomic::AtomicU64,
+    budget: u64,
+}
+
+pub static TIER_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static TIER_FILLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn host_tier() -> Option<&'static HostTier> {
+    static T: std::sync::OnceLock<Option<HostTier>> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let mb: u64 = std::env::var("CMF_RAM_TIER_MB").ok()?.parse().ok()?;
+        (mb > 0).then(|| HostTier {
+            map: std::sync::Mutex::new(std::collections::HashMap::new()),
+            bytes: std::sync::atomic::AtomicU64::new(0),
+            clock: std::sync::atomic::AtomicU64::new(0),
+            budget: mb * 1024 * 1024,
+        })
+    })
+    .as_ref()
+}
+
+fn host_tier_get(key: (usize, usize)) -> Option<std::sync::Arc<Vec<u8>>> {
+    let t = host_tier()?;
+    let mut m = t.map.lock().unwrap();
+    let now = t.clock.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let e = m.get_mut(&key)?;
+    e.1 = now;
+    TIER_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Some(e.0.clone())
+}
+
+fn host_tier_put(key: (usize, usize), bytes: std::sync::Arc<Vec<u8>>) {
+    let Some(t) = host_tier() else { return };
+    use std::sync::atomic::Ordering;
+    let len = bytes.len() as u64;
+    if len > t.budget {
+        return;
+    }
+    let mut m = t.map.lock().unwrap();
+    if m.contains_key(&key) {
+        return;
+    }
+    // Sampled LRU, same discipline as the VRAM arena: stride-sample,
+    // evict the oldest of the sample, never scan the whole map per miss.
+    let now = t.clock.fetch_add(1, Ordering::Relaxed);
+    let mut rounds = 0;
+    while t.bytes.load(Ordering::Relaxed) + len > t.budget && rounds < 128 {
+        rounds += 1;
+        let n = m.len();
+        if n == 0 {
+            break;
+        }
+        let stride = (n / 64).max(1);
+        let start = (now as usize).wrapping_mul(0x9E37_79B9) % stride;
+        let oldest = m
+            .iter()
+            .skip(start)
+            .step_by(stride)
+            .min_by_key(|(_, e)| e.1)
+            .map(|(k, e)| (*k, e.0.len() as u64));
+        let Some((k, b)) = oldest else { break };
+        m.remove(&k);
+        t.bytes.fetch_sub(b, Ordering::Relaxed);
+    }
+    if t.bytes.load(Ordering::Relaxed) + len <= t.budget {
+        m.insert(key, (bytes, now));
+        t.bytes.fetch_add(len, Ordering::Relaxed);
+        TIER_FILLS.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// On a network filesystem an mmap MISS is the death of this path: every
@@ -14439,7 +14535,50 @@ fn weight_resident(c: &Ctx, key: (usize, usize)) -> bool {
     c.weight_bufs.lock().unwrap().contains_key(&key)
 }
 
+/// `layers.N.` parsed out of a tensor name; u16::MAX when absent.
+fn layer_of_name(name: &str) -> u16 {
+    let Some(i) = name.find("layers.") else {
+        return u16::MAX;
+    };
+    let rest = &name[i + 7..];
+    let end = rest.find('.').unwrap_or(rest.len());
+    rest[..end].parse().unwrap_or(u16::MAX)
+}
+
+/// (model, tensor) -> layer, filled by the wrappers that still know the
+/// tensor's NAME before it becomes a bare key inside the dispatchers.
+/// The eviction policy needs the layer; threading it through every
+/// dispatcher signature would touch a dozen call chains for one u16.
+fn layer_registry() -> &'static std::sync::Mutex<std::collections::HashMap<(usize, usize), u16>> {
+    static R: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(usize, usize), u16>>,
+    > = std::sync::OnceLock::new();
+    R.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn note_layer(key: (usize, usize), name: &str) {
+    let l = layer_of_name(name);
+    if l != u16::MAX {
+        layer_registry().lock().unwrap().entry(key).or_insert(l);
+    }
+}
+
 fn weight_buffer(c: &Ctx, key: (usize, usize), full_quant: &[u8]) -> Option<wgpu::Buffer> {
+    let lay = layer_registry()
+        .lock()
+        .unwrap()
+        .get(&key)
+        .copied()
+        .unwrap_or(u16::MAX);
+    weight_buffer_l(c, key, full_quant, lay)
+}
+
+fn weight_buffer_l(
+    c: &Ctx,
+    key: (usize, usize),
+    full_quant: &[u8],
+    incoming_layer: u16,
+) -> Option<wgpu::Buffer> {
     use std::sync::atomic::Ordering;
     let now = c.res_clock.fetch_add(1, Ordering::Relaxed);
     let mut map = c.weight_bufs.lock().unwrap();
@@ -14455,14 +14594,31 @@ fn weight_buffer(c: &Ctx, key: (usize, usize), full_quant: &[u8]) -> Option<wgpu
     }
     RES_MISSES.fetch_add(1, Ordering::Relaxed);
     RES_MISS_BYTES.fetch_add(len, Ordering::Relaxed);
+    // The RAM tier serves the bytes on a miss when it has them — one
+    // memcpy instead of re-faulting mmap pages (or re-reading a disk
+    // range). Filled below on BOTH outcomes, insert and refusal: a
+    // refused tensor is the one most likely to be missed again next
+    // token, and refetching it from storage every time was measured as
+    // 65% of all fetch traffic on DeepSeek-V4.
+    let tier_bytes = host_tier_get(key);
+    let full_quant: &[u8] = tier_bytes.as_deref().map_or(full_quant, |v| v);
     if std::env::var("CMF_MOE_RES").is_ok() {
         let m = RES_MISSES.load(Ordering::Relaxed);
         if m % 512 == 0 {
             let (h, mm, mb, ev) = residency_stats();
+            let th = TIER_HITS.load(Ordering::Relaxed);
+            let tf = TIER_FILLS.load(Ordering::Relaxed);
+            // Diagnostics for the layer-balance policy: how many resident
+            // entries actually KNOW their layer, and how much is pinned.
             tracing::info!(
-                "residency: {h} hits / {mm} misses ({:.1}% hit), {:.2} GB fetched, {ev} evictions",
+                "residency: {h} hits / {mm} misses ({:.1}% hit), {:.2} GB fetched, {ev} ev {} ref | tier {th}/{tf} | res {} = {:.1} GB (big {}) reg {}",
                 h as f64 / (h + mm).max(1) as f64 * 100.0,
-                mb as f64 / 1e9
+                mb as f64 / 1e9,
+                RES_REFUSED.load(Ordering::Relaxed),
+                map.len(),
+                map.values().map(|e| e.bytes).sum::<u64>() as f64 / 1e9,
+                map.values().filter(|e| e.bytes > (64 << 20)).count(),
+                layer_registry().lock().unwrap().len()
             );
         }
     }
@@ -14488,17 +14644,25 @@ fn weight_buffer(c: &Ctx, key: (usize, usize), full_quant: &[u8]) -> Option<wgpu
             }
             let stride = (n / 64).max(1);
             let start = (now as usize).wrapping_mul(0x9E37_79B9) % stride.max(1);
-            let worst = map
-                .iter()
-                .skip(start)
-                .step_by(stride)
-                .filter(|(_, e)| !e.pinned && now.saturating_sub(e.last) > RES_HYSTERESIS)
-                .min_by(|a, b| {
-                    res_score(a.1, now)
-                        .partial_cmp(&res_score(b.1, now))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .map(|(k, e)| (*k, e.bytes));
+            // Never evict the incoming tensor's own layer while any OTHER
+            // layer still holds entries: under the per-token sweep every
+            // layer refills in turn, and stealing from your own layer is
+            // exactly the cyclic-LRU collapse. With only own-layer entries
+            // left (a model with one giant layer), fall back to any.
+            let pick = |own: bool| {
+                map.iter()
+                    .skip(start)
+                    .step_by(stride)
+                    .filter(|(_, e)| !e.pinned && now.saturating_sub(e.last) > RES_HYSTERESIS)
+                    .filter(|(_, e)| own || e.layer != incoming_layer || e.layer == u16::MAX)
+                    .min_by(|a, b| {
+                        res_score(a.1, now)
+                            .partial_cmp(&res_score(b.1, now))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|(k, e)| (*k, e.bytes))
+            };
+            let worst = pick(false).or_else(|| pick(true));
             let Some((k, bytes)) = worst else { break };
             map.remove(&k);
             RES_EVICTS.fetch_add(1, Ordering::Relaxed);
@@ -14509,6 +14673,10 @@ fn weight_buffer(c: &Ctx, key: (usize, usize), full_quant: &[u8]) -> Option<wgpu
             crate::gpu::probe_note_cold();
         }
         if c.resident.load(Ordering::Relaxed) + len > c.vram_budget {
+            RES_REFUSED.fetch_add(1, Ordering::Relaxed);
+            if tier_bytes.is_none() {
+                host_tier_put(key, std::sync::Arc::new(full_quant.to_vec()));
+            }
             return None; // still no room — honest CPU
         }
     }
@@ -14581,8 +14749,12 @@ fn weight_buffer(c: &Ctx, key: (usize, usize), full_quant: &[u8]) -> Option<wgpu
             uses: 1.0,
             last: now,
             pinned: false,
+            layer: incoming_layer,
         },
     );
+    if tier_bytes.is_none() {
+        host_tier_put(key, std::sync::Arc::new(full_quant.to_vec()));
+    }
     Some(buf)
 }
 
@@ -15253,7 +15425,7 @@ pub fn q8_resident_or_upload(model: &Arc<CmfModel>, idx: usize, may_upload: bool
         return true;
     }
     if may_upload {
-        let _ = weight_buffer(c, key, &bytes[abs..abs + rows_total * cols]);
+        let _ = weight_buffer_l(c, key, &bytes[abs..abs + rows_total * cols], layer_of_name(&model.tensors[idx].name));
     }
     false
 }
@@ -15490,7 +15662,10 @@ fn q1t_like(
     dispatch_q1t(
         c,
         pipeline,
-        Some((model.uid() as usize, idx)),
+        {
+            note_layer((model.uid() as usize, idx), &model.tensors[idx].name);
+            Some((model.uid() as usize, idx))
+        },
         &bytes[abs..abs + plen],
         xs,
         rows,
@@ -15620,7 +15795,10 @@ pub fn q1_matvec(
     }
     dispatch_q1(
         c,
-        Some((model.uid() as usize, idx)),
+        {
+            note_layer((model.uid() as usize, idx), &model.tensors[idx].name);
+            Some((model.uid() as usize, idx))
+        },
         &bytes[abs..abs + plen],
         xs,
         rows,
@@ -15977,7 +16155,7 @@ fn q1_weight(c: &Ctx, model: &Arc<CmfModel>, idx: usize) -> Option<(wgpu::Buffer
     if abs + plen > bytes.len() {
         return None;
     }
-    let buf = weight_buffer(c, (model.uid() as usize, idx), &bytes[abs..abs + plen])?;
+    let buf = weight_buffer_l(c, (model.uid() as usize, idx), &bytes[abs..abs + plen], layer_of_name(&model.tensors[idx].name))?;
     Some((buf, rows, cols))
 }
 
@@ -15997,7 +16175,7 @@ fn tile_weight(c: &Ctx, model: &Arc<CmfModel>, idx: usize) -> Option<(wgpu::Buff
     if abs + plen > bytes.len() {
         return None;
     }
-    let buf = weight_buffer(c, (model.uid() as usize, idx), &bytes[abs..abs + plen])?;
+    let buf = weight_buffer_l(c, (model.uid() as usize, idx), &bytes[abs..abs + plen], layer_of_name(&model.tensors[idx].name))?;
     Some((buf, rows, cols))
 }
 
@@ -16463,7 +16641,7 @@ pub fn forward_token_graph(
                     return None;
                 }
                 WEIGHT_BYTES.fetch_add(plen as u64, std::sync::atomic::Ordering::Relaxed);
-                let b = weight_buffer(c, (model.uid() as usize, gw.idx), &bytes[abs..abs + plen])?;
+                let b = weight_buffer_l(c, (model.uid() as usize, gw.idx), &bytes[abs..abs + plen], layer_of_name(&model.tensors[gw.idx].name))?;
                 Some(GMat {
                     buf: b,
                     rs: None,
@@ -21487,7 +21665,10 @@ pub fn q8_matmat_2f(
     }
     dispatch_matmat_keep(
         c,
-        Some((model.uid() as usize, idx)),
+        {
+            note_layer((model.uid() as usize, idx), &model.tensors[idx].name);
+            Some((model.uid() as usize, idx))
+        },
         &bytes[abs..abs + rows * cols],
         row_scale,
         Some(&col_field[..cols]),
@@ -21533,7 +21714,10 @@ pub fn q8_matmat(
     let full_quant = &bytes[abs..abs + rows * cols];
     dispatch_matmat(
         c,
-        Some((model.uid() as usize, idx)),
+        {
+            note_layer((model.uid() as usize, idx), &model.tensors[idx].name);
+            Some((model.uid() as usize, idx))
+        },
         full_quant,
         row_scale,
         pre,
@@ -21688,7 +21872,10 @@ pub(crate) fn fused_gemm_from_device(
             }
             dispatch_matmat_keep(
                 c,
-                Some((model.uid() as usize, idx)),
+                {
+            note_layer((model.uid() as usize, idx), &model.tensors[idx].name);
+            Some((model.uid() as usize, idx))
+        },
                 &bytes[abs..abs + rows * cols],
                 &rs,
                 col,
@@ -21735,7 +21922,10 @@ pub fn q8_matmat_keep(
     let full_quant = &bytes[abs..abs + rows * cols];
     dispatch_matmat_keep(
         c,
-        Some((model.uid() as usize, idx)),
+        {
+            note_layer((model.uid() as usize, idx), &model.tensors[idx].name);
+            Some((model.uid() as usize, idx))
+        },
         full_quant,
         row_scale,
         col_scale,
@@ -21777,7 +21967,7 @@ pub fn q1_matmat(
     if abs + plen > bytes.len() {
         return false;
     }
-    let Some(w) = weight_buffer(c, (model.uid() as usize, idx), &bytes[abs..abs + plen]) else {
+    let Some(w) = weight_buffer_l(c, (model.uid() as usize, idx), &bytes[abs..abs + plen], layer_of_name(&model.tensors[idx].name)) else {
         return false; // over VRAM budget → CPU path
     };
     let mut sc = c.scratch.lock().unwrap();
@@ -22737,7 +22927,7 @@ fn tp_matmat_impl(
     {
         return None;
     }
-    let q_buf = weight_buffer(c, (model.uid() as usize, idx), &bytes[abs..abs + plen])?;
+    let q_buf = weight_buffer_l(c, (model.uid() as usize, idx), &bytes[abs..abs + plen], layer_of_name(&model.tensors[idx].name))?;
     let mut sc = c.scratch.lock().unwrap();
     // A resident A operand: the kernel before us left it on the card, so
     // there is nothing to upload and — the point of the exercise —
@@ -23008,7 +23198,7 @@ pub fn q4t_matmat(
     {
         return false;
     }
-    let q_buf = match weight_buffer(c, (model.uid() as usize, idx), &bytes[abs..abs + plen]) {
+    let q_buf = match weight_buffer_l(c, (model.uid() as usize, idx), &bytes[abs..abs + plen], layer_of_name(&model.tensors[idx].name)) {
         Some(bf) => bf,
         None => return false,
     };
@@ -23153,7 +23343,7 @@ pub fn q4tp_matvec_batch_for_test(
     if plen < need || abs + plen > bytes.len() {
         return false;
     }
-    let Some(q_buf) = weight_buffer(c, (model.uid() as usize, idx), &bytes[abs..abs + plen]) else {
+    let Some(q_buf) = weight_buffer_l(c, (model.uid() as usize, idx), &bytes[abs..abs + plen], layer_of_name(&model.tensors[idx].name)) else {
         return false;
     };
     let mut sc = c.scratch.lock().unwrap();
@@ -24537,7 +24727,7 @@ pub fn q4t_qkv(
         if plen < rows * gpr * 18 || abs + plen > bytes.len() {
             return None;
         }
-        weight_buffer(c, (model.uid() as usize, idx), &bytes[abs..abs + plen])
+        weight_buffer_l(c, (model.uid() as usize, idx), &bytes[abs..abs + plen], layer_of_name(&model.tensors[idx].name))
     };
     let (Some(bq), Some(bk), Some(bv)) = (wbuf(wq, rq), wbuf(wk, rk), wbuf(wv, rv)) else {
         return false;
@@ -24876,7 +25066,7 @@ pub fn q4tp_ffn_packed(
         if abs + plen > bytes.len() {
             return None;
         }
-        weight_buffer(c, (model.uid() as usize, idx), &bytes[abs..abs + plen])
+        weight_buffer_l(c, (model.uid() as usize, idx), &bytes[abs..abs + plen], layer_of_name(&model.tensors[idx].name))
     };
     let (Some(w1b), Some(w2b)) = (wbuf(w1, 2 * inter, hidden), wbuf(w2, hidden, inter)) else {
         return false;
@@ -25289,7 +25479,7 @@ fn ffn_q4(
         if plen < want || abs + plen > bytes.len() {
             return None;
         }
-        weight_buffer(c, (model.uid() as usize, idx), &bytes[abs..abs + plen])
+        weight_buffer_l(c, (model.uid() as usize, idx), &bytes[abs..abs + plen], layer_of_name(&model.tensors[idx].name))
     };
     let (Some(q1), Some(q3), Some(q2)) = (
         wbuf(w1, inter, hidden),
@@ -25436,7 +25626,10 @@ pub fn q1t_matmat(
     }
     dispatch_q1t_mm(
         c,
-        Some((model.uid() as usize, idx)),
+        {
+            note_layer((model.uid() as usize, idx), &model.tensors[idx].name);
+            Some((model.uid() as usize, idx))
+        },
         &bytes[abs..abs + plen],
         xs,
         b,
@@ -27416,12 +27609,23 @@ fn tensor_weight(
         return None;
     }
     let key = (model.uid() as usize, idx);
+    let lay = layer_of_name(&model.tensors[idx].name);
     if !weight_resident(c, key) {
+        if let Some(v) = host_tier_get(key) {
+            return weight_buffer_l(c, key, &v, lay);
+        }
         if let Some(v) = pread_range(model, abs, rows * cols) {
-            return weight_buffer(c, key, &v);
+            let v = std::sync::Arc::new(v);
+            host_tier_put(key, v.clone());
+            return weight_buffer_l(c, key, &v, lay);
+        }
+        if host_tier().is_some() {
+            let v = std::sync::Arc::new(bytes[abs..abs + rows * cols].to_vec());
+            host_tier_put(key, v.clone());
+            return weight_buffer_l(c, key, &v, lay);
         }
     }
-    weight_buffer(c, key, &bytes[abs..abs + rows * cols])
+    weight_buffer_l(c, key, &bytes[abs..abs + rows * cols], lay)
 }
 
 /// `tensor_weight` for tile-packed dtypes whose payload length differs
@@ -27443,12 +27647,25 @@ fn tensor_weight_sized(
         return None;
     }
     let key = (model.uid() as usize, idx);
+    let lay = layer_of_name(&model.tensors[idx].name);
     if !weight_resident(c, key) {
+        if let Some(v) = host_tier_get(key) {
+            return weight_buffer_l(c, key, &v, lay);
+        }
         if let Some(v) = pread_range(model, abs, payload) {
-            return weight_buffer(c, key, &v);
+            let v = std::sync::Arc::new(v);
+            host_tier_put(key, v.clone());
+            return weight_buffer_l(c, key, &v, lay);
+        }
+        // mmap source: still worth keeping a tier copy — the next miss
+        // of this tensor must not fault the pages again.
+        if host_tier().is_some() {
+            let v = std::sync::Arc::new(bytes[abs..abs + payload].to_vec());
+            host_tier_put(key, v.clone());
+            return weight_buffer_l(c, key, &v, lay);
         }
     }
-    weight_buffer(c, key, &bytes[abs..abs + payload])
+    weight_buffer_l(c, key, &bytes[abs..abs + payload], lay)
 }
 
 /// Encodes q8-matvec (row0=0) into the given encoder, writes to `y`. The bind
@@ -32504,7 +32721,7 @@ pub fn o_lora_a_for_test(
     if abs + plen > bytes.len() {
         return false;
     }
-    let Some(w) = weight_buffer(c, (model.uid() as usize, idx), &bytes[abs..abs + plen]) else {
+    let Some(w) = weight_buffer_l(c, (model.uid() as usize, idx), &bytes[abs..abs + plen], layer_of_name(&model.tensors[idx].name)) else {
         return false; // over budget → the caller keeps it on the CPU
     };
     let xb = storage_bytes(c, bytemuck::cast_slice(&attn[..groups * cols]));
@@ -33832,7 +34049,7 @@ fn dsv4_layer_frame_enc(
         let (Some(abs), plen) = (model.entry_abs_offset(e), e.nbytes as usize) else {
             no!("{} без смещения", e.name);
         };
-        let Some(b) = weight_buffer(c, (model.uid() as usize, idx), &bytes[abs..abs + plen]) else {
+        let Some(b) = weight_buffer_l(c, (model.uid() as usize, idx), &bytes[abs..abs + plen], layer_of_name(&model.tensors[idx].name)) else {
             no!("{} не влез в VRAM", e.name);
         };
         wb.push(b);
@@ -36412,7 +36629,7 @@ fn dsv4_layer_frame_bt_enc(
         let (Some(abs), plen) = (model.entry_abs_offset(e), e.nbytes as usize) else {
             no!("{} без смещения", e.name);
         };
-        let Some(b) = weight_buffer(c, (model.uid() as usize, idx), &bytes[abs..abs + plen]) else {
+        let Some(b) = weight_buffer_l(c, (model.uid() as usize, idx), &bytes[abs..abs + plen], layer_of_name(&model.tensors[idx].name)) else {
             no!("{} не влез в VRAM", e.name);
         };
         wb.push(b);
@@ -36942,7 +37159,7 @@ fn dsv4_layer_frame_bt_enc(
             let (Some(abs), plen) = (model.entry_abs_offset(e), e.nbytes as usize) else {
                 no!("индексер без смещения");
             };
-            let Some(b) = weight_buffer(c, (model.uid() as usize, idx), &bytes[abs..abs + plen])
+            let Some(b) = weight_buffer_l(c, (model.uid() as usize, idx), &bytes[abs..abs + plen], layer_of_name(&model.tensors[idx].name))
             else {
                 no!("индексер не влез");
             };
@@ -37852,7 +38069,7 @@ pub fn dsv4_weight_ready(model: &Arc<CmfModel>, idx: usize) -> bool {
     if abs + plen > bytes.len() {
         return false;
     }
-    weight_buffer(c, (model.uid() as usize, idx), &bytes[abs..abs + plen]).is_some()
+    weight_buffer_l(c, (model.uid() as usize, idx), &bytes[abs..abs + plen], layer_of_name(&model.tensors[idx].name)).is_some()
 }
 
 /// How many experts of this shape still fit on the card. The caller packs
@@ -42970,7 +43187,7 @@ pub fn dsv4_attn_frame(
         if abs + plen > bytes.len() {
             no!("{} выходит за файл", e.name);
         }
-        let Some(b) = weight_buffer(c, (model.uid() as usize, idx), &bytes[abs..abs + plen]) else {
+        let Some(b) = weight_buffer_l(c, (model.uid() as usize, idx), &bytes[abs..abs + plen], layer_of_name(&model.tensors[idx].name)) else {
             no!("{} не поместился в бюджет VRAM", e.name);
         };
         wb.push(b);

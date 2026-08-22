@@ -10842,6 +10842,12 @@ fn moe_route(logits: &[f32], m: &MoeFfn, allowed: Option<&[bool]>) -> (Vec<usize
 
 /// See the call site: one `layer:e1,e2,…` line per routed token.
 fn moe_trace(idx: &[usize]) {
+    moe_trace_at(crate::gpu::cur_layer() as i32, idx)
+}
+
+/// The same, for callers that know their layer (DSV4 owns its layers and
+/// never sets the pipeline's current-layer marker).
+pub(crate) fn moe_trace_at(li: i32, idx: &[usize]) {
     use std::io::Write;
     static F: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
         std::sync::OnceLock::new();
@@ -10853,7 +10859,6 @@ fn moe_trace(idx: &[usize]) {
     }) else {
         return;
     };
-    let li = crate::gpu::cur_layer();
     let ids: Vec<String> = idx.iter().map(|e| e.to_string()).collect();
     let _ = writeln!(f.lock().unwrap(), "{li}:{}", ids.join(","));
 }
