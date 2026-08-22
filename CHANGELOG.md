@@ -17,6 +17,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   about what an M4 has. So 0.5.96's win does not port to Macs, and the lever
   there is fewer tokens (`--upscale`, `--stream-chunk`), not a faster GEMM.
 
+## [0.5.100] - 2026-08-22
+
+One flag, and the pipeline it completes. NVIDIA's H3 Super Acceleration
+page is a 4-step Turbo draft plus a 3-step LTX refinement — and the
+refinement half has been in this engine all along (`ltx-video --video
+<dir> --video-strength`). What was missing was the handoff.
+
+### Added
+- **`cortiq animate --frames-dir <d>`** dumps every rendered frame as
+  `frame_%04d.ppm` — the interchange `ltx-video --video` reads back, and
+  the chunk-handoff format for a second machine. The recipe, verified on
+  a 5090 (draft 40 s at 512×288×39; refine 499 s at 1024×576):
+
+      cortiq animate h3-turbo.cmf --prompt "…" --frames-dir draft/
+      cortiq ltx-video --model ltx25.cmf --prompt "…" \
+          --video draft/ --video-strength 0.45 --width 1024 --height 576
+
+  Two range bugs were caught by the round-trip test rather than by eyes:
+  `Anim.rgb` is [0, 1] while the LTX frame codec speaks [−1, 1] (an
+  unmapped pass ships a washed-out clip, not an error), and the PPM
+  writer's truncation is now a rounding, at half a quantisation step.
+
+### Notes
+- The two temporal grids differ: H3 renders 17k+5 frames, the LTX VAE
+  takes 8k+1 — trim the draft to 33 or 41 frames for the refine until
+  the handoff resamples. And the refine's own cost is 76% VAE (encode +
+  decode), 20% denoise — which is the measured argument for offloading
+  the VAE to a second machine, not the DiT.
+
 ## [0.5.99] - 2026-08-21
 
 The other half of 0.5.98: LFM2.5's MoE build now rides the whole-token graph
