@@ -33732,6 +33732,21 @@ fn encode_moe_chain_p(
     } else {
         frame_buf(c, 26, n_pack.max(1) * 4, true)
     };
+    // The cold list must survive a MERGED run: a pooled slot is written by
+    // every layer of one submission and read once at the end, so each
+    // (kv, layer) owns its own. The u32::MAX fill is the "no cold" marker
+    // the reader checks per pair.
+    let cold_slot = if subset {
+        store_slot(
+            c,
+            27,
+            bkey.0,
+            bkey.1,
+            bytemuck::cast_slice(&vec![u32::MAX; 4 * g.top_k]),
+        )
+    } else {
+        frame_buf(c, 27, 4 * g.top_k * 4, false)
+    };
     let bind_r = cached_bind(c, (127, bkey.0, bkey.1), || {
         c.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
@@ -33746,7 +33761,7 @@ fn encode_moe_chain_p(
                 bind_buf(6, mcnt),
                 bind_buf(7, &rp),
                 bind_buf(8, &rm),
-                bind_buf(9, &frame_buf(c, 27, 4 * g.top_k * 4, false)),
+                bind_buf(9, &cold_slot),
             ],
         })
     });
@@ -34502,7 +34517,7 @@ fn dsv4_layer_frame_enc(
         // width of the hyper-connection count preserves it; the correction
         // variant (`dsv4_state_add_cold_preserved`) reads the spare.
         if w.moe.remap.is_some() {
-            let spare = frame_buf(c, 48, hc * 4, false);
+            let spare = store_slot(c, 48, kv_id, li, &vec![0u8; hc * 4]);
             encode_blit_p(&mut pass, c, &hpost, &spare, hc, 0, 0, None);
         }
         let fused_next = hc_fuse() && w.hc_next_fn.is_some();
@@ -38251,13 +38266,12 @@ pub fn dsv4_layer_frame(
         // The cold list rides the same staging and the same fence as the
         // fold — one barrier pays for both, exactly like the two-frame path.
         enc.copy_buffer_to_buffer(&folded, 0, &stage, 0, (dim * 4) as u64);
-        enc.copy_buffer_to_buffer(
-            &frame_buf(c, 27, 4 * g.moe.top_k * 4, false),
-            0,
-            &stage,
-            (dim * 4) as u64,
-            cold_bytes,
-        );
+        let cold_src = if w.moe.remap.is_some() {
+            store_slot(c, 27, kv_id, li, &[])
+        } else {
+            frame_buf(c, 27, 4 * g.moe.top_k * 4, false)
+        };
+        enc.copy_buffer_to_buffer(&cold_src, 0, &stage, (dim * 4) as u64, cold_bytes);
         enc.copy_buffer_to_buffer(
             &frame_buf_t(c, 45, 0, dim * 4, true),
             0,
@@ -41119,15 +41133,26 @@ pub fn dsv4_state_read(state: &mut [f32]) -> bool {
 /// policy independent of a layer number or a particular VRAM size.
 /// `dsv4_state_add_cold`, but the post comes from the spare slot the layer
 /// frame preserved before its next-layer fold rewrote the canonical one.
-pub fn dsv4_state_add_cold_preserved(cold: &[f32], hc: usize, state_out: &mut [f32]) -> bool {
-    dsv4_state_add_cold_inner(cold, hc, state_out, 48)
+pub fn dsv4_state_add_cold_preserved(
+    cold: &[f32],
+    hc: usize,
+    state_out: &mut [f32],
+    kv_id: u64,
+    li: usize,
+) -> bool {
+    dsv4_state_add_cold_inner(cold, hc, state_out, Some((kv_id, li)))
 }
 
 pub fn dsv4_state_add_cold(cold: &[f32], hc: usize, state_out: &mut [f32]) -> bool {
-    dsv4_state_add_cold_inner(cold, hc, state_out, 43)
+    dsv4_state_add_cold_inner(cold, hc, state_out, None)
 }
 
-fn dsv4_state_add_cold_inner(cold: &[f32], hc: usize, state_out: &mut [f32], post_tag: u8) -> bool {
+fn dsv4_state_add_cold_inner(
+    cold: &[f32],
+    hc: usize,
+    state_out: &mut [f32],
+    preserved: Option<(u64, usize)>,
+) -> bool {
     let Some(c) = ctx() else { return false };
     if hc == 0 || cold.is_empty() || state_out.len() != hc * cold.len() {
         return false;
@@ -41137,7 +41162,10 @@ fn dsv4_state_add_cold_inner(cold: &[f32], hc: usize, state_out: &mut [f32], pos
     let corrected = frame_buf(c, 46, state_out.len() * 4, true);
     // `post` was produced by the FFN half's opening fold and is still live in
     // the canonical slot after the MoE frame returns its cold winners.
-    let post = frame_buf(c, post_tag, hc * 4, post_tag == 43);
+    let post = match preserved {
+        Some((kv, li)) => store_slot(c, 48, kv, li, &[]),
+        None => frame_buf(c, 43, hc * 4, true),
+    };
     let cold_buf = frame_up(c, 121, bytemuck::cast_slice(cold));
     let mut identity = vec![0.0f32; hc * hc];
     for j in 0..hc {
@@ -43374,7 +43402,12 @@ fn store_slot(c: &Ctx, tag: u8, kv: u64, li: usize, data: &[u8]) -> wgpu::Buffer
                 let b = c.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("dsv4-store-slot"),
                     size,
-                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    // COPY_SRC: the per-layer cold/post slots are read back
+                    // after a run — a slot the host can never read is a slot
+                    // that can only ever feed full-pack chains.
+                    usage: wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::COPY_DST
+                        | wgpu::BufferUsages::COPY_SRC,
                     mapped_at_creation: false,
                 });
                 match other {

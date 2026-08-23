@@ -2870,7 +2870,7 @@ fn dsv4_chain1_layer(
             }
         }
     }
-    if !crate::gpu_wgpu::dsv4_state_add_cold_preserved(&cold_sum, cfg.hc_mult, state) {
+    if !crate::gpu_wgpu::dsv4_state_add_cold_preserved(&cold_sum, cfg.hc_mult, state, kv_id, li) {
         return None;
     }
     // Reactive refill: the winners the slots did not hold are the likeliest
