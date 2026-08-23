@@ -7780,6 +7780,12 @@ pub fn dspark_block() -> usize {
 /// paid for on every verify and delivered on a twelfth of them. Three yields
 /// 2.46 tokens a cycle against five's 2.58, for three fifths of the verify.
 /// `CMF_DSPARK_VERIFY_K=N` sets it.
+#[cfg(feature = "gpu")]
+fn dspark_native_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_DSPARK_NATIVE").is_ok_and(|v| v != "0"))
+}
+
 pub fn dspark_verify_k() -> usize {
     static K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *K.get_or_init(|| {
@@ -8186,7 +8192,7 @@ pub fn dspark_pack_build(mtp: &[Dsv4Mtp], cfg: &Dsv4Cfg) -> Option<DsparkPack> {
                 let native_q2 = mtp[0].layer.experts.first().is_some_and(|e| {
                     e.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP)
                 });
-                let gu_q2 = native_q2 || DSPARK_Q2TP_ENCODE.get().is_some();
+                let gu_q2 = !dspark_native_on() && (native_q2 || DSPARK_Q2TP_ENCODE.get().is_some());
                 let dn_q2 = mtp[0].layer.experts.first().is_some_and(|e| {
                     e.w2.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP)
                 });
@@ -8325,7 +8331,7 @@ pub fn dspark_pack_build(mtp: &[Dsv4Mtp], cfg: &Dsv4Cfg) -> Option<DsparkPack> {
         .experts
         .first()
         .is_some_and(|e| e.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP));
-    let gu_q2 = native_q2 || crate::dsv4::DSPARK_Q2TP_ENCODE.get().is_some();
+    let gu_q2 = !crate::dsv4::dspark_native_on() && (native_q2 || crate::dsv4::DSPARK_Q2TP_ENCODE.get().is_some());
     let dn_native = mtp[0]
         .layer
         .experts
