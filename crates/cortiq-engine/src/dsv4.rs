@@ -1052,6 +1052,11 @@ pub(crate) mod prof {
     pub static HC_NS: AtomicU64 = AtomicU64::new(0);
     /// The head: final norm plus lm_head over 129280 rows.
     pub static HEAD_NS: AtomicU64 = AtomicU64::new(0);
+    /// Host prep of the device layer: attention_step's CPU half (indexer,
+    /// compressor, qr) — suspected owner of the unaccounted milliseconds.
+    pub static PREP_NS: AtomicU64 = AtomicU64::new(0);
+    /// The per-layer KV/window cache uploads before the frame.
+    pub static CACHEW_NS: AtomicU64 = AtomicU64::new(0);
     /// The whole forward, so the buckets can be checked against a total
     /// instead of against a guess. 78 ms of measured work in a 108 ms token
     /// left 30 ms that no counter had ever looked at.
@@ -1075,7 +1080,7 @@ pub(crate) mod prof {
             // described one token instead of the run.
             if TOKENS.fetch_add(1, Ordering::Relaxed) == 1 && !ZEROED.swap(true, Ordering::Relaxed)
             {
-                for a in [&ATTN_NS, &MOE_NS, &HC_NS, &HEAD_NS, &ALL_NS, &CALLS] {
+                for a in [&ATTN_NS, &MOE_NS, &HC_NS, &HEAD_NS, &ALL_NS, &CALLS, &PREP_NS, &CACHEW_NS] {
                     a.store(0, Ordering::Relaxed);
                 }
                 TOKENS.store(1, Ordering::Relaxed);
@@ -1135,6 +1140,13 @@ pub(crate) mod prof {
             - MOE_NS.load(Ordering::Relaxed) as f64 / 1e6)
             .max(0.0);
         let hd = HEAD_NS.load(Ordering::Relaxed) as f64 / 1e6;
+        let prep = PREP_NS.load(Ordering::Relaxed) as f64 / 1e6;
+        let cw = CACHEW_NS.load(Ordering::Relaxed) as f64 / 1e6;
+        eprintln!(
+            "[dsv4-профиль] ХОСТ-ПРЕП слоя: {:.0} мс/токен, KV-заливки: {:.0} мс/токен",
+            prep / toks as f64,
+            cw / toks as f64
+        );
         #[cfg(feature = "gpu")]
         {
             let f = crate::gpu_wgpu::DSV4_FILLS.load(Ordering::Relaxed);
@@ -2203,6 +2215,7 @@ fn dsv4_layer_loop(
             continue;
         }
         let mut prep = AttnPrep::default();
+        let _tp = prof::on().then(std::time::Instant::now);
         attention_step(
             &folded,
             l,
@@ -2214,11 +2227,18 @@ fn dsv4_layer_loop(
             Some(&mut prep),
             &mut sink_out,
         );
+        if let Some(t) = _tp {
+            prof::PREP_NS.fetch_add(
+                t.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         // The caches the frame will read.
         let hd = cfg.head_dim;
         let n_comp = st.compressed[li].len() / hd;
         let cap = (cfg.window + n_comp.next_power_of_two().max(64)) * hd;
         let kv_id = st.kv_id;
+        let _tc = prof::on().then(std::time::Instant::now);
         if !crate::gpu_wgpu::dsv4_cache_write(kv_id, li, 0, &st.window[li], cap)
             || (n_comp > 0
                 && !crate::gpu_wgpu::dsv4_cache_write(
@@ -2230,6 +2250,12 @@ fn dsv4_layer_loop(
                 ))
         {
             return false;
+        }
+        if let Some(t) = _tc {
+            prof::CACHEW_NS.fetch_add(
+                t.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
         let idx32: Vec<u32> = prep
             .idxs

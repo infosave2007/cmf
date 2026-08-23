@@ -26,6 +26,7 @@ default = ["gpu"]
 gpu = ["cortiq-engine/gpu"]
 
 [dependencies]
+libc = "0.2"
 base64 = { workspace = true }
 cortiq-core = { path = "../cortiq-core", version = "0.5.65" }
 cortiq-engine = { path = "../cortiq-engine", version = "0.5.65" }
