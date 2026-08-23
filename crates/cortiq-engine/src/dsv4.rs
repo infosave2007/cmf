@@ -2118,7 +2118,17 @@ fn dsv4_layer_loop(
                 state_on_host,
             ) {
                 state_on_host = home;
-                dspark_note(li, state, cfg);
+                // The draft captures THIS layer's state — which lives on
+                // the card when no cold came home. Noting the stale host
+                // array fed the draft garbage: 1265 drafted, 0 accepted.
+                if dspark_wants(li) {
+                    if !state_on_host && crate::gpu_wgpu::dsv4_state_read(state) {
+                        state_on_host = true;
+                    }
+                    if state_on_host {
+                        dspark_note(li, state, cfg);
+                    }
+                }
                 continue;
             }
         }
@@ -2894,7 +2904,7 @@ fn dsv4_chain1_layer(
                 exp.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP);
             let pack_first = pk.tensors.first().map(|t| t.0).unwrap_or(usize::MAX);
             if !crate::gpu_wgpu::dsv4_slot_fill(
-                &model, pack_first, victim, t3, cfg.moe_inter, cfg.dim, gu_q2,
+                &model, pack_first, victim, gi, t3, cfg.moe_inter, cfg.dim, gu_q2,
             ) {
                 break;
             }
@@ -4138,6 +4148,7 @@ fn moe_frame(
                 &model,
                 pack_first,
                 victim,
+                pick,
                 t3,
                 cfg.moe_inter,
                 cfg.dim,
@@ -6503,6 +6514,32 @@ pub fn load(
     // streaming rate, before decode discovers it miss by miss in random
     // order. Experts outside a layer's mask are skipped; a layer without a
     // mask keeps all of its experts (the budget caps the sweep).
+    #[cfg(feature = "gpu")]
+    if crate::gpu_wgpu::host_banks_on() {
+        // Host banks: one background sweep, layer by layer, oldest first.
+        let sets: Vec<(usize, Vec<(usize, usize, usize)>, bool)> = layers
+            .iter()
+            .filter_map(|l| {
+                let idx3 = |e: &Dsv4Expert| {
+                    Some((e.w1.model_idx()?, e.w3.model_idx()?, e.w2.model_idx()?))
+                };
+                let mut v: Vec<_> = l.experts.iter().filter_map(idx3).collect();
+                let first = v.first()?.0;
+                v.push(idx3(&l.shared)?);
+                let gu_q2 = l.experts.first()?.w1.model_dtype()
+                    == Some(cortiq_core::TensorDtype::Q2TiledP);
+                Some((first, v, gu_q2))
+            })
+            .collect();
+        let m2 = model.clone();
+        let (inter, dim) = (cfg.moe_inter, cfg.dim);
+        std::thread::spawn(move || {
+            for (first, v, gu_q2) in sets {
+                crate::gpu_wgpu::dsv4_host_bank_build(&m2, first, &v, inter, dim, gu_q2);
+            }
+            tracing::info!("host banks: built");
+        });
+    }
     #[cfg(feature = "gpu")]
     {
         let masks: Vec<Option<Vec<bool>>> = layers.iter().map(|l| l.mask.clone()).collect();
