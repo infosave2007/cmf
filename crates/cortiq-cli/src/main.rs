@@ -2429,7 +2429,7 @@ async fn main() -> anyhow::Result<()> {
             bw,
         } => {
             if bw {
-                return cmd_bench_bw(json);
+                return cmd_bench_bw(json, &model);
             }
             let o1 = O1Flags {
                 spec: o1,
@@ -5294,9 +5294,42 @@ async fn cmd_masks(model_path: &str) -> anyhow::Result<()> {
 /// The two bandwidths the MoE hybrid split is arithmetic over, measured
 /// on expert-sized blocks (13 MB class): host-RAM copy — the CPU arm's
 /// ceiling — and host-to-VRAM upload — the fetch arm's. Once per machine.
-fn cmd_bench_bw(json: bool) -> anyhow::Result<()> {
+fn cmd_bench_bw(json: bool, model: &str) -> anyhow::Result<()> {
     const BLOCK: usize = 13 * 1024 * 1024;
     const ROUNDS: usize = 24;
+    // Storage read over the MODEL file itself, cache dropped per range —
+    // a Gen5 NVMe reads at RAM-class rates and the offload defaults must
+    // know that (a slow-disk assumption turns eviction and tiering into
+    // anti-optimisations on fast machines, measured both ways).
+    let storage_gbs = (|| -> Option<f64> {
+        #[allow(unused_imports)]
+        use std::os::unix::io::AsRawFd;
+        let f = std::fs::File::open(model).ok()?;
+        let len = f.metadata().ok()?.len();
+        if len < (BLOCK * 4) as u64 {
+            return None;
+        }
+        let mut buf = vec![0u8; BLOCK];
+        let mut total = 0usize;
+        let t0 = std::time::Instant::now();
+        for i in 0..8u64 {
+            let off = (len / 9) * (i + 1) / BLOCK as u64 * BLOCK as u64;
+            #[cfg(target_os = "linux")]
+            unsafe {
+                libc::posix_fadvise(
+                    f.as_raw_fd(),
+                    off as i64,
+                    BLOCK as i64,
+                    libc::POSIX_FADV_DONTNEED,
+                );
+            }
+            use std::os::unix::fs::FileExt;
+            f.read_exact_at(&mut buf, off).ok()?;
+            std::hint::black_box(&buf);
+            total += BLOCK;
+        }
+        Some(total as f64 / t0.elapsed().as_secs_f64() / 1e9)
+    })();
     let src = vec![7u8; BLOCK];
     let mut dst = vec![0u8; BLOCK];
     // Warm both buffers, then time the copies.
@@ -5310,14 +5343,19 @@ fn cmd_bench_bw(json: bool) -> anyhow::Result<()> {
     let pcie_gbs = cortiq_engine::gpu_wgpu::upload_bandwidth_probe(BLOCK, ROUNDS);
     if json {
         println!(
-            "{{\"host_copy_gbs\": {host_gbs:.2}, \"upload_gbs\": {:.2}}}",
-            pcie_gbs.unwrap_or(0.0)
+            "{{\"host_copy_gbs\": {host_gbs:.2}, \"upload_gbs\": {:.2}, \"storage_gbs\": {:.2}}}",
+            pcie_gbs.unwrap_or(0.0),
+            storage_gbs.unwrap_or(0.0)
         );
     } else {
         println!("копия в RAM: {host_gbs:.1} ГБ/с (потолок CPU-плеча)");
         match pcie_gbs {
             Some(v) => println!("заливка в VRAM: {v:.1} ГБ/с (потолок fetch-плеча)"),
             None => println!("заливка в VRAM: устройства нет"),
+        }
+        match storage_gbs {
+            Some(v) => println!("чтение хранилища: {v:.1} ГБ/с (источник холодных байтов)"),
+            None => println!("чтение хранилища: файл мал для замера"),
         }
     }
     Ok(())
