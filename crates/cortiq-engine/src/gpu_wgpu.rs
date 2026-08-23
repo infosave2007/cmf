@@ -40937,6 +40937,110 @@ pub fn dsv4_draft_fit(inter: usize, hidden: usize, gu_q2: bool, dn_q2: bool) -> 
 /// commits to the device path.
 /// Ask for the attention weights BEFORE the experts, or the experts take the
 /// card and the skeleton — two orders of magnitude smaller — has nowhere left.
+/// Contiguous host banks of expert payloads — the fill source FreeToken
+/// calls `bank_sources`: one allocation per (layer, projection) holding
+/// EVERY expert's bytes row-contiguous, so a slot fill is one memcpy from
+/// a known offset instead of a page-cache walk that may reach disk.
+/// Built once by a background sweep (sequential file order, page cache
+/// dropped behind it — banks REPLACE the cache for these ranges, they do
+/// not double it). `CMF_DSV4_HOST_BANKS=1` builds them; the fill path
+/// falls back transparently while a bank is not ready yet.
+struct HostBanks {
+    g: Vec<u8>,
+    u: Vec<u8>,
+    d: Vec<u8>,
+    gu_len: usize,
+    d_len: usize,
+}
+
+fn host_banks() -> &'static Mutex<HashMap<(usize, usize), std::sync::Arc<HostBanks>>> {
+    static M: std::sync::OnceLock<Mutex<HashMap<(usize, usize), std::sync::Arc<HostBanks>>>> =
+        std::sync::OnceLock::new();
+    M.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn host_banks_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_DSV4_HOST_BANKS").is_ok_and(|v| v != "0"))
+}
+
+/// Build one layer's banks from its expert tensor triples (w1, w3, w2 —
+/// the same list a pack carries, shared expert last, which is skipped:
+/// it is VRAM-resident for the life of the process). Reads by pread and
+/// drops the cache behind itself.
+pub fn dsv4_host_bank_build(
+    model: &Arc<CmfModel>,
+    pack_first: usize,
+    experts: &[(usize, usize, usize)],
+    inter: usize,
+    hidden: usize,
+    gu_q2: bool,
+) {
+    if !host_banks_on() {
+        return;
+    }
+    let key = (model.uid() as usize, pack_first);
+    if host_banks().lock().unwrap().contains_key(&key) {
+        return;
+    }
+    let dt = |q2: bool| {
+        if q2 {
+            cortiq_core::TensorDtype::Q2TiledP
+        } else {
+            cortiq_core::TensorDtype::Q4TiledP
+        }
+    };
+    let Some(gu_len) = cortiq_core::quant::expected_nbytes(dt(gu_q2), &[inter, hidden]) else {
+        return;
+    };
+    let Some(d_len) = cortiq_core::quant::expected_nbytes(dt(false), &[hidden, inter]) else {
+        return;
+    };
+    let n = experts.len().saturating_sub(1); // routed only
+    let mut banks = HostBanks {
+        g: vec![0u8; n * gu_len],
+        u: vec![0u8; n * gu_len],
+        d: vec![0u8; n * d_len],
+        gu_len,
+        d_len,
+    };
+    use std::os::unix::fs::FileExt;
+    let Ok(f) = std::fs::File::open(&model.path) else { return };
+    let mut pull = |idx: usize, dst: &mut [u8]| -> bool {
+        let Some(e) = model.tensors.get(idx) else { return false };
+        if e.nbytes as usize != dst.len() {
+            return false;
+        }
+        let Some(abs) = model.entry_abs_offset(e) else { return false };
+        if f.read_exact_at(dst, abs as u64).is_err() {
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        unsafe {
+            use std::os::unix::io::AsRawFd;
+            libc::posix_fadvise(
+                f.as_raw_fd(),
+                abs as i64,
+                dst.len() as i64,
+                libc::POSIX_FADV_DONTNEED,
+            );
+        }
+        true
+    };
+    for (gi, &(t1, t3, t2)) in experts[..n].iter().enumerate() {
+        if !pull(t1, &mut banks.g[gi * gu_len..(gi + 1) * gu_len])
+            || !pull(t3, &mut banks.u[gi * gu_len..(gi + 1) * gu_len])
+            || !pull(t2, &mut banks.d[gi * d_len..(gi + 1) * d_len])
+        {
+            return; // partial banks are worse than none
+        }
+    }
+    host_banks()
+        .lock()
+        .unwrap()
+        .insert(key, std::sync::Arc::new(banks));
+}
+
 /// Fill counters for the dynamic expert slots (`dsv4_slot_fill`).
 pub static DSV4_FILLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static DSV4_FILL_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -40954,11 +41058,42 @@ pub fn dsv4_slot_fill(
     model: &Arc<CmfModel>,
     pack_first: usize,
     slot: usize,
+    gi: usize,
     t: (usize, usize, usize),
     inter: usize,
     hidden: usize,
     gu_q2: bool,
 ) -> bool {
+    // The bank fast path: three memcpys from contiguous rows — no page
+    // cache, no disk, no tier lookups. Falls through when the layer's
+    // banks are not built (yet).
+    if host_banks_on() {
+        let bkey = (model.uid() as usize, pack_first);
+        let banks = host_banks().lock().unwrap().get(&bkey).cloned();
+        if let Some(bk) = banks {
+            let (gl, dl) = (bk.gu_len, bk.d_len);
+            if (gi + 1) * gl <= bk.g.len() && (gi + 1) * dl <= bk.d.len() {
+                let key = (model.uid() as usize, pack_first);
+                let Some((g, u, d)) = ctx()
+                    .and_then(|c| c.moe_expw.lock().unwrap().get(&key).cloned())
+                else {
+                    return false;
+                };
+                let c = ctx().unwrap();
+                if (slot + 1) * gl as usize > g.size() as usize / 1 {}
+                c.queue
+                    .write_buffer(&g, (slot * gl) as u64, &bk.g[gi * gl..(gi + 1) * gl]);
+                c.queue
+                    .write_buffer(&u, (slot * gl) as u64, &bk.u[gi * gl..(gi + 1) * gl]);
+                c.queue
+                    .write_buffer(&d, (slot * dl) as u64, &bk.d[gi * dl..(gi + 1) * dl]);
+                use std::sync::atomic::Ordering;
+                DSV4_FILLS.fetch_add(1, Ordering::Relaxed);
+                DSV4_FILL_BYTES.fetch_add((2 * gl + dl) as u64, Ordering::Relaxed);
+                return true;
+            }
+        }
+    }
     use std::sync::atomic::Ordering;
     let Some(c) = ctx() else { return false };
     let key = (model.uid() as usize, pack_first);
