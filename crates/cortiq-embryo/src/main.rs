@@ -285,6 +285,9 @@ enum Sub {
         /// every N-th layer is a softmax anchor (1 = the all-softmax twin)
         #[arg(long)]
         anchor_every: Option<usize>,
+        /// short-conv taps before the mixer projections (0 = off)
+        #[arg(long)]
+        conv_k: Option<usize>,
         /// JSON overrides merged into the genome config (ablations), e.g. '{"hidden":256,"layers":6}'
         #[arg(long)]
         cfg_json: Option<String>,
@@ -507,14 +510,14 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Sub::Birth { shard, val, out, resume, batch, seq, steps, warmup, lr, wd, clip, eval_every, save_every, pca_every, tiny, vocab, anchor_every, cfg_json, seed } => {
+        Sub::Birth { shard, val, out, resume, batch, seq, steps, warmup, lr, wd, clip, eval_every, save_every, pca_every, tiny, vocab, anchor_every, conv_k, cfg_json, seed } => {
             #[cfg(target_os = "macos")]
             cortiq_embryo::cli::birth(cortiq_embryo::cli::BirthArgs {
-                shard, val, out, resume, batch, seq, steps, warmup, lr, wd, clip, eval_every, save_every, pca_every, tiny, vocab, anchor_every, cfg_json, seed,
+                shard, val, out, resume, batch, seq, steps, warmup, lr, wd, clip, eval_every, save_every, pca_every, tiny, vocab, anchor_every, conv_k, cfg_json, seed,
             });
             #[cfg(not(target_os = "macos"))]
             {
-                let _ = (shard, val, out, resume, batch, seq, steps, warmup, lr, wd, clip, eval_every, save_every, pca_every, tiny, vocab, anchor_every, cfg_json, seed);
+                let _ = (shard, val, out, resume, batch, seq, steps, warmup, lr, wd, clip, eval_every, save_every, pca_every, tiny, vocab, anchor_every, conv_k, cfg_json, seed);
                 eprintln!("needs Metal (macOS)");
                 std::process::exit(1);
             }

@@ -86,7 +86,7 @@ pub fn export(ck: &Checkpoint, tokenizer_json: &[u8], out: &Path) -> anyhow::Res
     for (l, lo) in lay.layers.iter().enumerate() {
         let pf = format!("model.layers.{l}.");
         let ffn = match lo {
-            LayerOffs::Mixer { ln1, wq, wk, wv, wkap, wo, alog: _, ln2, ffn } => {
+            LayerOffs::Mixer { ln1, wq, wk, wv, wkap, wo, alog: _, conv, ln2, ffn } => {
                 t.push(spec(&format!("{pf}input_layernorm.weight"), &[h], sl(*ln1, h)));
                 t.push(spec(&format!("{pf}post_attention_layernorm.weight"), &[h], sl(*ln2, h)));
                 let (nh, nph, dv) = (cfg.heads, cfg.nphase, cfg.dv);
@@ -98,6 +98,14 @@ pub fn export(ck: &Checkpoint, tokenizer_json: &[u8], out: &Path) -> anyhow::Res
                 // κ gate: the trainer's padded [kappa_ld, H] → real rows; fixed bias
                 t.push(spec(&format!("{pf}vmf_attn.k_gate.weight"), &[nh, h], sl(*wkap, nh * h)));
                 t.push(spec(&format!("{pf}vmf_attn.k_gate.bias"), &[nh], &vec![cfg.kappa_bias; nh]));
+                if *conv != usize::MAX {
+                    // the Qwen/LFM conv1d convention: [channels, 1, k]
+                    t.push(spec(
+                        &format!("{pf}vmf_attn.conv1d.weight"),
+                        &[h, 1, cfg.conv_k],
+                        sl(*conv, h * cfg.conv_k),
+                    ));
+                }
                 ffn
             }
             LayerOffs::Anchor { ln1, wq, wk, wv, wo, ln2, ffn } => {

@@ -1601,3 +1601,72 @@ kernel void hk_dgamma_f32(
         dalog[h * p2 + f] += tot * g * log(g);
     }
 }
+
+// Causal depthwise conv1d over [b, t, h], k taps, zero left pad, per-channel
+// weights w[c*k + j] (tap j reaches x[t - (k-1-j)]). Identity init = last
+// tap 1: the layer starts as a pass-through and LEARNS to mix neighbours.
+kernel void conv1d_fwd_f32(
+    device const float* x  [[buffer(0)]],
+    device const float* w  [[buffer(1)]],
+    device float*       y  [[buffer(2)]],
+    constant uint4&     p  [[buffer(3)]], // b, t, h, k
+    uint gid [[thread_position_in_grid]])
+{
+    uint bth = p.x * p.y * p.z;
+    if (gid >= bth) return;
+    uint c  = gid % p.z;
+    uint ti = (gid / p.z) % p.y;
+    uint bi = gid / (p.z * p.y);
+    float acc = 0.0f;
+    for (uint j = 0; j < p.w; ++j) {
+        int src = int(ti) - int(p.w - 1 - j);
+        if (src >= 0) acc += w[c * p.w + j] * x[((ulong)bi * p.y + (ulong)src) * p.z + c];
+    }
+    y[gid] = acc;
+}
+
+// dx[t] = sum_j w[c,j] * dy[t + (k-1-j)] — the future taps that read x[t],
+// clipped at the sequence end (each sequence pads independently).
+kernel void conv1d_bwd_dx_f32(
+    device const float* dy [[buffer(0)]],
+    device const float* w  [[buffer(1)]],
+    device float*       dx [[buffer(2)]],
+    constant uint4&     p  [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint bth = p.x * p.y * p.z;
+    if (gid >= bth) return;
+    uint c  = gid % p.z;
+    uint ti = (gid / p.z) % p.y;
+    uint bi = gid / (p.z * p.y);
+    float acc = 0.0f;
+    for (uint j = 0; j < p.w; ++j) {
+        uint dst = ti + (p.w - 1 - j);
+        if (dst < p.y) acc += w[c * p.w + j] * dy[((ulong)bi * p.y + dst) * p.z + c];
+    }
+    dx[gid] = acc;
+}
+
+// dW[c,j] += sum_{b,t} dy[b,t,c] * x[b, t-(k-1-j), c] — one thread per
+// (c, j), the rmsnorm_dw idiom: serial over rows, += into the grad slot.
+kernel void conv1d_dw_f32(
+    device const float* x  [[buffer(0)]],
+    device const float* dy [[buffer(1)]],
+    device float*       dw [[buffer(2)]],
+    constant uint4&     p  [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint hk = p.z * p.w;
+    if (gid >= hk) return;
+    uint c = gid / p.w;
+    uint j = gid % p.w;
+    uint back = p.w - 1 - j;
+    float s = 0.0f;
+    for (uint bi = 0; bi < p.x; ++bi) {
+        for (uint ti = back; ti < p.y; ++ti) {
+            s += dy[((ulong)bi * p.y + ti) * p.z + c]
+               * x[((ulong)bi * p.y + (ti - back)) * p.z + c];
+        }
+    }
+    dw[gid] += s;
+}
