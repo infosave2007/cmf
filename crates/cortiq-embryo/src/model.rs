@@ -46,6 +46,13 @@ pub struct EmbryoCfg {
     /// arena, initialised from the horizon grid) instead of fixed
     #[serde(default)]
     pub learn_decay: bool,
+    /// Causal depthwise conv over the mixer's normed input, k taps (0 = off).
+    /// The per-token-diagnosis fix: the hybrid's gap to the softmax twin is
+    /// FLAT by position and biggest on repeats — short-range mixing, which a
+    /// 4-tap conv supplies for ~h·k parameters and O(1) per token. Identity
+    /// init (last tap 1): the layer starts as a pass-through.
+    #[serde(default)]
+    pub conv_k: usize,
 }
 
 impl EmbryoCfg {
@@ -55,6 +62,7 @@ impl EmbryoCfg {
             hidden: 384,
             layers: 8,
             anchor_every: 8,
+            conv_k: 0,
             heads: 8,
             nphase: 32,
             dv: 128,
@@ -82,6 +90,7 @@ impl EmbryoCfg {
             hidden: 64,
             layers: 2,
             anchor_every: 2,
+            conv_k: 0,
             heads: 2,
             nphase: 32,
             dv: 64,
@@ -117,7 +126,8 @@ impl EmbryoCfg {
         let mixer = 2 * (self.heads * self.nphase * h) // thq, thk
             + self.heads * self.dv * h                  // v_proj
             + h * self.heads * self.dv                  // out_proj
-            + self.heads * h;                           // κ gate
+            + self.heads * h                            // κ gate
+            + h * self.conv_k;                          // short conv (0 = off)
         let anchor = self.anchor_q_heads * self.anchor_hd * h
             + 2 * self.anchor_kv_heads * self.anchor_hd * h
             + h * self.anchor_q_heads * self.anchor_hd;
@@ -161,6 +171,8 @@ pub enum LayerOffs {
         wo: usize,   // [H, nh·dv]
         /// [nh·2nph] A_log (usize::MAX when the decay grid is fixed)
         alog: usize,
+        /// [H·conv_k] short-conv taps (usize::MAX when conv_k = 0)
+        conv: usize,
         ln2: usize,
         ffn: FfnOffs,
     },
@@ -234,9 +246,10 @@ impl Layout {
                 let wkap = take(format!("layers.{l}.hk.kappa"), cfg.kappa_ld() * h);
                 let wo = take(format!("layers.{l}.hk.o"), h * cfg.heads * cfg.dv);
                 let alog = if cfg.learn_decay { take(format!("layers.{l}.hk.alog"), cfg.heads * 2 * cfg.nphase) } else { usize::MAX };
+                let conv = if cfg.conv_k > 0 { take(format!("layers.{l}.hk.conv"), h * cfg.conv_k) } else { usize::MAX };
                 let ln2 = take(format!("layers.{l}.ln2"), h);
                 let f = ffn(&mut take);
-                layers.push(LayerOffs::Mixer { ln1, wq, wk, wv, wkap, wo, alog, ln2, ffn: f });
+                layers.push(LayerOffs::Mixer { ln1, wq, wk, wv, wkap, wo, alog, conv, ln2, ffn: f });
             }
         }
         let final_norm = take("final_norm".into(), h);
@@ -277,7 +290,14 @@ pub fn init_params(cfg: &EmbryoCfg, lay: &Layout, seed: u64) -> Vec<f32> {
     for (l, lo) in lay.layers.iter().enumerate() {
         let _ = l;
         match lo {
-            LayerOffs::Mixer { ln1, wq, wk, wv, wkap, wo, alog, ln2, ffn } => {
+            LayerOffs::Mixer { ln1, wq, wk, wv, wkap, wo, alog, conv, ln2, ffn } => {
+                if *conv != usize::MAX {
+                    // identity: only the current-token tap is 1 — training
+                    // starts from exactly the conv-less model
+                    for c in 0..h {
+                        p[*conv + c * cfg.conv_k + (cfg.conv_k - 1)] = 1.0;
+                    }
+                }
                 p[*ln1..*ln1 + h].fill(1.0);
                 p[*ln2..*ln2 + h].fill(1.0);
                 // phase projections: θ = W·x̂ with x̂ RMS-normed → θ std ≈ s·√H;
@@ -355,6 +375,7 @@ mod gpu {
         Mixer {
             x_in: GBuf,   // [M,H] residual stream entering the layer
             x1: GBuf,     // [M,H] normed
+            x1c: GBuf,
             inv1: GBuf,   // [M]
             thq: GBuf,    // [M, nh·nph]
             thk: GBuf,
@@ -428,6 +449,7 @@ mod gpu {
     pub struct Scratch {
         pub dx: GBuf,     // [M,H] the gradient flowing down the residual stream
         pub dx1: GBuf,    // [M,H]
+        pub dxc: GBuf,    // [M,H] conv-input grad (the short-conv backward)
         pub dx2: GBuf,    // [M,H]
         pub dbig: GBuf,   // [M, max(nh·dv, qh·hd)]  do / dq
         pub dk: GBuf,     // [M, max(nh·nph, kvh·hd)]
@@ -558,6 +580,7 @@ mod gpu {
                     acts.push(LayerActs::Mixer {
                         x_in: z(m * h),
                         x1: z(m * h),
+                        x1c: z(if cfg.conv_k > 0 { m * h } else { 1 }),
                         inv1: z(m),
                         thq: z(m * nhp),
                         thk: z(m * nhp),
@@ -616,6 +639,7 @@ mod gpu {
             let scratch = Scratch {
                 dx: z(m * h),
                 dx1: z(m * h),
+                dxc: z(m * h),
                 dx2: z(m * h),
                 dbig: z(m * nhd.max(qhd)),
                 dk: z(m * nhp.max(kvhd)),
@@ -852,16 +876,22 @@ mod gpu {
             let m = b * t;
             match (&self.lay.layers[l], &self.acts[l]) {
                 (
-                    LayerOffs::Mixer { ln1, wq, wk, wv, wkap, wo, alog: _, ln2, ffn },
-                    LayerActs::Mixer { x_in, x1, inv1, thq, thk, v, kpre, kappa, phq, phk, kv, states, o, x_mid, x2, inv2, gte, up, hh },
+                    LayerOffs::Mixer { ln1, wq, wk, wv, wkap, wo, alog: _, conv, ln2, ffn },
+                    LayerActs::Mixer { x_in, x1, x1c, inv1, thq, thk, v, kpre, kappa, phq, phk, kv, states, o, x_mid, x2, inv2, gte, up, hh },
                 ) => {
                     let (nh, nph, dv) = (cfg.heads, cfg.nphase, cfg.dv);
                     cmd.rmsnorm_fwd_at(x_in, &self.p, *ln1, x1, inv1, m, h, cfg.norm_eps);
-                    cmd.gemm(Op::N, Op::T, m, nh * nph, h, 1.0, x1, 0, h, &self.p, *wq, h, 0.0, thq, 0, nh * nph);
-                    cmd.gemm(Op::N, Op::T, m, nh * nph, h, 1.0, x1, 0, h, &self.p, *wk, h, 0.0, thk, 0, nh * nph);
-                    cmd.gemm(Op::N, Op::T, m, nh * dv, h, 1.0, x1, 0, h, &self.p, *wv, h, 0.0, v, 0, nh * dv);
+                    let xs = if *conv != usize::MAX {
+                        cmd.conv1d_fwd_at(x1, &self.p, *conv, x1c, b, t, h, cfg.conv_k);
+                        x1c
+                    } else {
+                        x1
+                    };
+                    cmd.gemm(Op::N, Op::T, m, nh * nph, h, 1.0, xs, 0, h, &self.p, *wq, h, 0.0, thq, 0, nh * nph);
+                    cmd.gemm(Op::N, Op::T, m, nh * nph, h, 1.0, xs, 0, h, &self.p, *wk, h, 0.0, thk, 0, nh * nph);
+                    cmd.gemm(Op::N, Op::T, m, nh * dv, h, 1.0, xs, 0, h, &self.p, *wv, h, 0.0, v, 0, nh * dv);
                     let kld = cfg.kappa_ld();
-                    cmd.gemm(Op::N, Op::T, m, kld, h, 1.0, x1, 0, h, &self.p, *wkap, h, 0.0, kpre, 0, kld);
+                    cmd.gemm(Op::N, Op::T, m, kld, h, 1.0, xs, 0, h, &self.p, *wkap, h, 0.0, kpre, 0, kld);
                     cmd.kappa_fwd(kpre, kappa, m, nh, kld, cfg.kappa_bias);
                     let d = HkDims { b, t, nh, nph, dv };
                     let w = HkWork { thq, thk, v, kappa, pow: &self.pow, pow_off: self.pow_off(l), phq, phk, kv, states, out: o };
@@ -915,8 +945,8 @@ mod gpu {
             let s = &self.scratch;
             match (&self.lay.layers[l], &self.acts[l]) {
                 (
-                    LayerOffs::Mixer { ln1, wq, wk, wv, wkap, wo, alog: _, ln2, ffn },
-                    LayerActs::Mixer { x_in, x1, inv1, thq, thk, v, kpre: _, kappa, phq, phk, kv, states, o, x_mid, x2, inv2, gte, up, hh },
+                    LayerOffs::Mixer { ln1, wq, wk, wv, wkap, wo, alog: _, conv, ln2, ffn },
+                    LayerActs::Mixer { x_in, x1, x1c, inv1, thq, thk, v, kpre: _, kappa, phq, phk, kv, states, o, x_mid, x2, inv2, gte, up, hh },
                 ) => {
                     let (nh, nph, dv) = (cfg.heads, cfg.nphase, cfg.dv);
                     self.ffn_bwd(cmd, l, m, ffn, *ln2, x_mid, x2, inv2, gte, up, hh);
@@ -939,18 +969,27 @@ mod gpu {
                     if hk_simt() { cmd.hk_backward(&d, &w, &gr, 0.0) } else { cmd.hk_backward_gemm(&d, &w, &gr, &self.hk_scratch(), 0.0) }
                     let kld = cfg.kappa_ld();
                     cmd.kappa_bwd(kappa, &s.dkap, &s.dkpre, m, nh, kld);
-                    // dx1 = dthq·Wq + dthk·Wk + dv·Wv + dkpre·Wκ
+                    // dx1 = dthq·Wq + dthk·Wk + dv·Wv + dkpre·Wκ (wrt the
+                    // PROJECTION input — the conv output when conv is on)
                     cmd.gemm(Op::N, Op::N, m, h, nh * nph, 1.0, &s.dk, 0, nh * nph, &self.p, *wq, h, 0.0, &s.dx1, 0, h);
                     cmd.gemm(Op::N, Op::N, m, h, nh * nph, 1.0, &s.dk2, 0, nh * nph, &self.p, *wk, h, 1.0, &s.dx1, 0, h);
                     cmd.gemm(Op::N, Op::N, m, h, nh * dv, 1.0, &s.dv, 0, nh * dv, &self.p, *wv, h, 1.0, &s.dx1, 0, h);
                     cmd.gemm(Op::N, Op::N, m, h, kld, 1.0, &s.dkpre, 0, kld, &self.p, *wkap, h, 1.0, &s.dx1, 0, h);
-                    // weight grads
-                    cmd.gemm(Op::T, Op::N, nh * nph, h, m, 1.0, &s.dk, 0, nh * nph, x1, 0, h, 1.0, &self.g, *wq, h);
-                    cmd.gemm(Op::T, Op::N, nh * nph, h, m, 1.0, &s.dk2, 0, nh * nph, x1, 0, h, 1.0, &self.g, *wk, h);
-                    cmd.gemm(Op::T, Op::N, nh * dv, h, m, 1.0, &s.dv, 0, nh * dv, x1, 0, h, 1.0, &self.g, *wv, h);
-                    cmd.gemm(Op::T, Op::N, kld, h, m, 1.0, &s.dkpre, 0, kld, x1, 0, h, 1.0, &self.g, *wkap, h);
-                    // dx_in = dx_mid + rmsnorm_bwd(x_in; dx1)
-                    cmd.rmsnorm_bwd_at(x_in, &self.p, *ln1, &s.dx1, inv1, &s.dx, 1.0, &self.g, *ln1, m, h);
+                    // weight grads read what the projections actually saw
+                    let xs = if *conv != usize::MAX { x1c } else { x1 };
+                    cmd.gemm(Op::T, Op::N, nh * nph, h, m, 1.0, &s.dk, 0, nh * nph, xs, 0, h, 1.0, &self.g, *wq, h);
+                    cmd.gemm(Op::T, Op::N, nh * nph, h, m, 1.0, &s.dk2, 0, nh * nph, xs, 0, h, 1.0, &self.g, *wk, h);
+                    cmd.gemm(Op::T, Op::N, nh * dv, h, m, 1.0, &s.dv, 0, nh * dv, xs, 0, h, 1.0, &self.g, *wv, h);
+                    cmd.gemm(Op::T, Op::N, kld, h, m, 1.0, &s.dkpre, 0, kld, xs, 0, h, 1.0, &self.g, *wkap, h);
+                    let dnorm = if *conv != usize::MAX {
+                        // through the conv: dW += correlate(x1, dx1c); dx1 = w ⋆ dx1c
+                        cmd.conv1d_bwd_at(x1, &self.p, *conv, &s.dx1, &s.dxc, &self.g, *conv, b, t, h, cfg.conv_k);
+                        &s.dxc
+                    } else {
+                        &s.dx1
+                    };
+                    // dx_in = dx_mid + rmsnorm_bwd(x_in; dnorm)
+                    cmd.rmsnorm_bwd_at(x_in, &self.p, *ln1, dnorm, inv1, &s.dx, 1.0, &self.g, *ln1, m, h);
                 }
                 (
                     LayerOffs::Anchor { ln1, wq, wk, wv, wo, ln2, ffn },

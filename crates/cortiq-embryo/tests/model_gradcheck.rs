@@ -11,11 +11,12 @@ use cortiq_embryo::ops::lcg_vec;
 #[test]
 fn every_tensor_matches_finite_differences() {
     let Some(c) = ctx() else { return };
-    for variant in 0..3 {
+    for variant in 0..4 {
     let mut cfg = EmbryoCfg::tiny();
     match variant {
         0 => cfg.head_clusters = 0,
         2 => cfg.experts = 4,
+        3 => cfg.conv_k = 4, // the short-conv taps enter every mixer grad path
         _ => {}
     }
     eprintln!("=== variant {variant}: head {} experts {} ===", if cfg.head_clusters > 0 { "hierarchical" } else { "flat" }, cfg.experts);

@@ -72,6 +72,9 @@ pub struct BirthArgs {
     pub tiny: bool,
     pub vocab: Option<usize>,
     pub anchor_every: Option<usize>,
+    /// Short-conv taps before the mixer projections (0 = off; 4 = the
+    /// Qwen/LFM-class local mixing the per-token diagnosis called for)
+    pub conv_k: Option<usize>,
     pub cfg_json: Option<String>,
     pub seed: u64,
 }
@@ -102,6 +105,9 @@ pub fn birth(a: BirthArgs) {
             }
             if let Some(ae) = a.anchor_every {
                 cfg.anchor_every = ae.max(1);
+            }
+            if let Some(ck) = a.conv_k {
+                cfg.conv_k = ck;
             }
             if let Some(js) = &a.cfg_json {
                 let mut base = serde_json::to_value(&cfg).expect("cfg to json");

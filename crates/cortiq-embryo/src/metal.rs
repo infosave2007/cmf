@@ -35,6 +35,9 @@ pub struct Ctx {
     rms_fwd: ComputePipelineState,
     rms_bwd_dx: ComputePipelineState,
     rms_dw: ComputePipelineState,
+    conv_fwd: ComputePipelineState,
+    conv_dx: ComputePipelineState,
+    conv_dw: ComputePipelineState,
     swiglu_fwd: ComputePipelineState,
     swiglu_bwd: ComputePipelineState,
     embed_gather: ComputePipelineState,
@@ -152,6 +155,9 @@ fn init() -> Result<Ctx, String> {
         rms_fwd: pso("rmsnorm_fwd_f32")?,
         rms_bwd_dx: pso("rmsnorm_bwd_dx_f32")?,
         rms_dw: pso("rmsnorm_dw_f32")?,
+        conv_fwd: pso("conv1d_fwd_f32")?,
+        conv_dx: pso("conv1d_bwd_dx_f32")?,
+        conv_dw: pso("conv1d_dw_f32")?,
         swiglu_fwd: pso("swiglu_fwd_f32")?,
         swiglu_bwd: pso("swiglu_bwd_f32")?,
         embed_gather: pso("embed_gather_f32")?,
@@ -425,6 +431,10 @@ impl<'a> Cmd<'a> {
                 MTLSize::new(128, 1, 1),
             ),
         }
+    }
+
+    fn set_u32x4(&self, idx: u64, v: [u32; 4]) {
+        self.enc.set_bytes(idx, 16, v.as_ptr() as *const c_void);
     }
 
     fn set_u32(&self, idx: u64, v: u32) {
@@ -937,6 +947,43 @@ impl<'a> Cmd<'a> {
         self.set_u32(4, d as u32);
         self.set_f32(5, eps);
         e.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(128, 1, 1));
+    }
+
+    /// Causal depthwise conv1d [b, t, h] with k taps, weights at an offset
+    /// inside the parameter arena. Zero left pad per sequence.
+    pub fn conv1d_fwd_at(&self, x: &GBuf, w: &GBuf, w_off: usize, y: &GBuf, b: usize, t: usize, h: usize, k: usize) {
+        assert!(x.len >= b * t * h && y.len >= b * t * h && w.len >= w_off + h * k);
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.conv_fwd);
+        e.set_buffer(0, Some(&x.buf), 0);
+        e.set_buffer(1, Some(&w.buf), (w_off * 4) as u64);
+        e.set_buffer(2, Some(&y.buf), 0);
+        self.set_u32x4(3, [b as u32, t as u32, h as u32, k as u32]);
+        let n = (b * t * h) as u64;
+        e.dispatch_thread_groups(MTLSize::new(n.div_ceil(128), 1, 1), MTLSize::new(128, 1, 1));
+    }
+
+    /// dX and dW of the causal depthwise conv. `dx` may alias nothing; dw
+    /// accumulates (+=) into the grad arena at `dw_off`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv1d_bwd_at(&self, x: &GBuf, w: &GBuf, w_off: usize, dy: &GBuf, dx: &GBuf, dw: &GBuf, dw_off: usize, b: usize, t: usize, h: usize, k: usize) {
+        assert!(x.len >= b * t * h && dy.len >= b * t * h && dx.len >= b * t * h);
+        assert!(w.len >= w_off + h * k && dw.len >= dw_off + h * k);
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.conv_dx);
+        e.set_buffer(0, Some(&dy.buf), 0);
+        e.set_buffer(1, Some(&w.buf), (w_off * 4) as u64);
+        e.set_buffer(2, Some(&dx.buf), 0);
+        self.set_u32x4(3, [b as u32, t as u32, h as u32, k as u32]);
+        let n = (b * t * h) as u64;
+        e.dispatch_thread_groups(MTLSize::new(n.div_ceil(128), 1, 1), MTLSize::new(128, 1, 1));
+        e.set_compute_pipeline_state(&self.c.conv_dw);
+        e.set_buffer(0, Some(&x.buf), 0);
+        e.set_buffer(1, Some(&dy.buf), 0);
+        e.set_buffer(2, Some(&dw.buf), (dw_off * 4) as u64);
+        self.set_u32x4(3, [b as u32, t as u32, h as u32, k as u32]);
+        let hk = (h * k) as u64;
+        e.dispatch_thread_groups(MTLSize::new(hk.div_ceil(128), 1, 1), MTLSize::new(128, 1, 1));
     }
 
     /// RMSNorm backward with w and dw at offsets inside bigger buffers.
