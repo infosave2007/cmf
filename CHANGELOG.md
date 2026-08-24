@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-08-24
+
+### Fixed
+- The release binaries build again on Windows and iOS: the 0.6.0
+  residency/bank code used `std::os::unix` positional reads and the
+  libc crate's `atexit` unconditionally. Reads go through a per-target
+  helper now (pread on unix, `seek_read` on windows), and the prefetch
+  exit hook calls the C runtime's `atexit` symbol directly.
+
 ## [0.6.0] - 2026-08-24
 
 DeepSeek-V4-Flash q4tp on one GPU goes from 0.665 to 21.5 tok/s on an

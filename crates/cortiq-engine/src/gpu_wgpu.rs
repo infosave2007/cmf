@@ -332,6 +332,206 @@ fn moe_select_sg(@builtin(local_invocation_index) lid: u32,
 }
 "#;
 
+/// Q4TP MoE over a genuine model-wide `(layer, expert)` slot pool.
+///
+/// Vulkan limits one storage-buffer binding to 4 GiB even on cards with far
+/// more VRAM. The cache is therefore split into eight equal physical
+/// segments, exposed to WGSL as binding arrays. `msel` remains one flat slot
+/// id; the shader alone resolves `(segment, local slot)`, so experts selected
+/// for one layer may live anywhere in the common pool and still execute in a
+/// single gate/up pass and a single down pass. Parameters live in group 1:
+/// wgpu forbids a uniform binding in a group that contains a binding array.
+const DSV4_GLOBAL_MOE_SEGMENTS: usize = 8;
+const DSV4_GLOBAL_MOE_SRC: &str = r#"
+enable wgpu_binding_array;
+
+struct WordBank { words: array<u32> };
+struct GGuP {
+    gpr: u32, inter: u32, slots: u32, mat16: u32,
+    lim: f32, segment_slots: u32, _p0: u32, _p1: u32,
+};
+@group(0) @binding(0) var<storage, read>       gg_gw  : binding_array<WordBank, 8>;
+@group(0) @binding(1) var<storage, read>       gg_uw  : binding_array<WordBank, 8>;
+@group(0) @binding(2) var<storage, read>       gg_x   : array<f32>;
+@group(0) @binding(3) var<storage, read>       gg_sel : array<u32>;
+@group(0) @binding(4) var<storage, read_write> gg_act : array<f32>;
+@group(1) @binding(0) var<uniform>             gg_p   : GGuP;
+var<workgroup> gg_pg: array<f32, 64>;
+var<workgroup> gg_pu: array<f32, 64>;
+
+fn gg_g32(seg: u32, o: u32) -> u32 { return gg_gw[seg].words[o]; }
+fn gg_u32(seg: u32, o: u32) -> u32 { return gg_uw[seg].words[o]; }
+fn gg_g16(seg: u32, o: u32) -> u32 {
+    return (gg_g32(seg, o >> 1u) >> ((o & 1u) * 16u)) & 0xFFFFu;
+}
+fn gg_u16(seg: u32, o: u32) -> u32 {
+    return (gg_u32(seg, o >> 1u) >> ((o & 1u) * 16u)) & 0xFFFFu;
+}
+fn gg_g8(seg: u32, o: u32) -> u32 {
+    return (gg_g32(seg, o >> 2u) >> ((o & 3u) * 8u)) & 0xFFu;
+}
+fn gg_u8(seg: u32, o: u32) -> u32 {
+    return (gg_u32(seg, o >> 2u) >> ((o & 3u) * 8u)) & 0xFFu;
+}
+fn gg_dot8(w: u32, xi: u32) -> f32 {
+    return (f32(w & 0xFu) - 8.0) * gg_x[xi]
+         + (f32((w >> 4u) & 0xFu) - 8.0) * gg_x[xi + 1u]
+         + (f32((w >> 8u) & 0xFu) - 8.0) * gg_x[xi + 2u]
+         + (f32((w >> 12u) & 0xFu) - 8.0) * gg_x[xi + 3u]
+         + (f32((w >> 16u) & 0xFu) - 8.0) * gg_x[xi + 4u]
+         + (f32((w >> 20u) & 0xFu) - 8.0) * gg_x[xi + 5u]
+         + (f32((w >> 24u) & 0xFu) - 8.0) * gg_x[xi + 6u]
+         + (f32((w >> 28u) & 0xFu) - 8.0) * gg_x[xi + 7u];
+}
+
+@compute @workgroup_size(64)
+fn dsv4_global_gate_up_q4tp(@builtin(workgroup_id) wid: vec3<u32>,
+                            @builtin(local_invocation_index) lid: u32) {
+    let row = wid.x;
+    let slot = wid.y;
+    let flat = gg_sel[slot];
+    let seg = flat / gg_p.segment_slots;
+    let local = flat - seg * gg_p.segment_slots;
+    let gpr = gg_p.gpr;
+    let rows = gg_p.inter;
+    let base16 = local * gg_p.mat16;
+    let nib16 = base16 + row * gpr * 8u;
+    let par16 = base16 + rows * gpr * 8u + row * 2u;
+    let cst = (gpr * 5u + 7u) / 8u;
+    let cod8 = (base16 + rows * gpr * 8u + rows * 2u) * 2u + row * cst;
+    let gl = unpack2x16float(gg_g16(seg, par16) | (gg_g16(seg, par16 + 1u) << 16u));
+    let ul = unpack2x16float(gg_u16(seg, par16) | (gg_u16(seg, par16 + 1u) << 16u));
+    var ag = 0.0;
+    var au = 0.0;
+    for (var g = lid; g < gpr; g = g + 64u) {
+        let bit = g * 5u;
+        let cb = bit >> 3u;
+        let shf = bit & 7u;
+        var cg = gg_g8(seg, cod8 + cb);
+        var cu = gg_u8(seg, cod8 + cb);
+        if (shf > 3u) {
+            cg = cg | (gg_g8(seg, cod8 + cb + 1u) << 8u);
+            cu = cu | (gg_u8(seg, cod8 + cb + 1u) << 8u);
+        }
+        let sg = exp2(gl.x + f32((cg >> shf) & 31u) * gl.y);
+        let su = exp2(ul.x + f32((cu >> shf) & 31u) * ul.y);
+        let t16 = nib16 + g * 8u;
+        let xb = g * 32u;
+        var dg = 0.0;
+        var du = 0.0;
+        for (var k = 0u; k < 4u; k = k + 1u) {
+            let wg = gg_g16(seg, t16 + 2u * k)
+                   | (gg_g16(seg, t16 + 1u + 2u * k) << 16u);
+            let wu = gg_u16(seg, t16 + 2u * k)
+                   | (gg_u16(seg, t16 + 1u + 2u * k) << 16u);
+            dg = dg + gg_dot8(wg, xb + 8u * k);
+            du = du + gg_dot8(wu, xb + 8u * k);
+        }
+        ag = ag + sg * dg;
+        au = au + su * du;
+    }
+    gg_pg[lid] = ag;
+    gg_pu[lid] = au;
+    workgroupBarrier();
+    var stride = 32u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) {
+            gg_pg[lid] = gg_pg[lid] + gg_pg[lid + stride];
+            gg_pu[lid] = gg_pu[lid] + gg_pu[lid + stride];
+        }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    if (lid == 0u) {
+        var gate = gg_pg[0];
+        var up = gg_pu[0];
+        if (gg_p.lim > 0.0) {
+            up = clamp(up, -gg_p.lim, gg_p.lim);
+            gate = min(gate, gg_p.lim);
+        }
+        gg_act[slot * gg_p.inter + row] = (gate / (1.0 + exp(-gate))) * up;
+    }
+}
+
+struct GDnP {
+    gpr: u32, hidden: u32, slots: u32, mat16: u32,
+    segment_slots: u32, _p0: u32, _p1: u32, _p2: u32,
+};
+@group(0) @binding(0) var<storage, read>       gd_w   : binding_array<WordBank, 8>;
+@group(0) @binding(1) var<storage, read>       gd_act : array<f32>;
+@group(0) @binding(2) var<storage, read>       gd_sel : array<u32>;
+@group(0) @binding(3) var<storage, read>       gd_wt  : array<f32>;
+@group(0) @binding(4) var<storage, read_write> gd_y   : array<f32>;
+@group(1) @binding(0) var<uniform>             gd_p   : GDnP;
+var<workgroup> gd_pt: array<f32, 64>;
+
+fn gd_32(seg: u32, o: u32) -> u32 { return gd_w[seg].words[o]; }
+fn gd_16(seg: u32, o: u32) -> u32 {
+    return (gd_32(seg, o >> 1u) >> ((o & 1u) * 16u)) & 0xFFFFu;
+}
+fn gd_8(seg: u32, o: u32) -> u32 {
+    return (gd_32(seg, o >> 2u) >> ((o & 3u) * 8u)) & 0xFFu;
+}
+fn gd_dot8(w: u32, xi: u32) -> f32 {
+    return (f32(w & 0xFu) - 8.0) * gd_act[xi]
+         + (f32((w >> 4u) & 0xFu) - 8.0) * gd_act[xi + 1u]
+         + (f32((w >> 8u) & 0xFu) - 8.0) * gd_act[xi + 2u]
+         + (f32((w >> 12u) & 0xFu) - 8.0) * gd_act[xi + 3u]
+         + (f32((w >> 16u) & 0xFu) - 8.0) * gd_act[xi + 4u]
+         + (f32((w >> 20u) & 0xFu) - 8.0) * gd_act[xi + 5u]
+         + (f32((w >> 24u) & 0xFu) - 8.0) * gd_act[xi + 6u]
+         + (f32((w >> 28u) & 0xFu) - 8.0) * gd_act[xi + 7u];
+}
+
+@compute @workgroup_size(64)
+fn dsv4_global_down_q4tp(@builtin(workgroup_id) wid: vec3<u32>,
+                         @builtin(local_invocation_index) lid: u32) {
+    let row = wid.x;
+    let gpr = gd_p.gpr;
+    let rows = gd_p.hidden;
+    let cst = (gpr * 5u + 7u) / 8u;
+    let total = gd_p.slots * gpr;
+    var acc = 0.0;
+    for (var i = lid; i < total; i = i + 64u) {
+        let slot = i / gpr;
+        let g = i % gpr;
+        let flat = gd_sel[slot];
+        let seg = flat / gd_p.segment_slots;
+        let local = flat - seg * gd_p.segment_slots;
+        let base16 = local * gd_p.mat16;
+        let par16 = base16 + rows * gpr * 8u + row * 2u;
+        let cod8 = (base16 + rows * gpr * 8u + rows * 2u) * 2u + row * cst;
+        let pl = unpack2x16float(gd_16(seg, par16) | (gd_16(seg, par16 + 1u) << 16u));
+        let bit = g * 5u;
+        let cb = bit >> 3u;
+        let shf = bit & 7u;
+        var cv = gd_8(seg, cod8 + cb);
+        if (shf > 3u) { cv = cv | (gd_8(seg, cod8 + cb + 1u) << 8u); }
+        let scale = exp2(pl.x + f32((cv >> shf) & 31u) * pl.y);
+        let t16 = base16 + (row * gpr + g) * 8u;
+        let xb = (slot * gpr + g) * 32u;
+        var d = 0.0;
+        for (var k = 0u; k < 4u; k = k + 1u) {
+            let w = gd_16(seg, t16 + 2u * k)
+                  | (gd_16(seg, t16 + 1u + 2u * k) << 16u);
+            d = d + gd_dot8(w, xb + 8u * k);
+        }
+        acc = acc + gd_wt[slot] * scale * d;
+    }
+    gd_pt[lid] = acc;
+    workgroupBarrier();
+    var stride = 32u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) { gd_pt[lid] = gd_pt[lid] + gd_pt[lid + stride]; }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    if (lid == 0u) { gd_y[row] = gd_pt[0]; }
+}
+"#;
+
 const WGSL: &str = r#"
 struct Params { cols4: u32, rows: u32, row0_words: u32, _pad: u32 };
 @group(0) @binding(0) var<storage, read>       q  : array<u32>;   // 4×i8 packed into u32, row-major
@@ -12772,6 +12972,11 @@ struct Ctx {
     moe_gate_up_q4tp_b: wgpu::ComputePipeline,
     moe_gate_up_q4tp_b_r4: wgpu::ComputePipeline,
     moe_down_q4tp_b: wgpu::ComputePipeline,
+    /// Genuine model-wide Q4TP expert cache. These live in a separate
+    /// binding-array module and are absent on backends without descriptor
+    /// indexing; the old exact per-layer path remains the fallback there.
+    dsv4_global_gu: Option<wgpu::ComputePipeline>,
+    dsv4_global_dn: Option<wgpu::ComputePipeline>,
     moe_down_q4tp_b2: wgpu::ComputePipeline,
     moe_down_q4tp_part: wgpu::ComputePipeline,
     moe_down_q4tp_b4: wgpu::ComputePipeline,
@@ -12914,6 +13119,10 @@ struct Ctx {
     /// shared one as the trailing block, uploaded once, addressed by expert id
     /// inside the kernels. Counted against `resident` like any weight.
     moe_expw: Mutex<HashMap<(usize, usize), (wgpu::Buffer, wgpu::Buffer, wgpu::Buffer)>>,
+    /// One bank cache for every `(layer, expert)` pair of a model. Buffers
+    /// are physically segmented only because a Vulkan storage binding tops
+    /// out at 4 GiB; slot numbering and eviction are common across segments.
+    dsv4_global_moe: Mutex<HashMap<u64, Arc<Dsv4GlobalMoeBufs>>>,
     /// Immutable [rows,cols,…] uniforms cached by content — the ~800 matvec
     /// param buffers per token are token-invariant, so uploading them once
     /// keeps them off the per-token encode critical path.
@@ -12956,6 +13165,17 @@ struct Ctx {
     /// Pooled graph scratch: eliminates per-token buffer allocations in the
     /// whole-token graph path (the dominant decode cost on Vulkan/DX12).
     graph_scratch: Mutex<GraphScratch>,
+}
+
+#[derive(Clone)]
+struct Dsv4GlobalMoeBufs {
+    gate: Vec<wgpu::Buffer>,
+    up: Vec<wgpu::Buffer>,
+    down: Vec<wgpu::Buffer>,
+    capacity: usize,
+    segment_slots: usize,
+    gu_len: usize,
+    d_len: usize,
 }
 
 struct KvMirror {
@@ -13445,6 +13665,14 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let want_f16 = adapter.features().contains(wgpu::Features::SHADER_F16);
     // Keeping compiled pipelines between runs; see `pipeline_cache_path`.
     let want_pcache = adapter.features().contains(wgpu::Features::PIPELINE_CACHE);
+    // The unified DSV4 slot pool needs a dynamically indexed array of
+    // storage buffers: one logical bank, segmented at Vulkan's 4-GiB binding
+    // limit. Request it only where the complete feature set exists; all
+    // other adapters retain the exact per-layer cache.
+    let bind_array_features = wgpu::Features::BUFFER_BINDING_ARRAY
+        | wgpu::Features::STORAGE_RESOURCE_BINDING_ARRAY
+        | wgpu::Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING;
+    let want_bind_arrays = adapter.features().contains(bind_array_features);
     COOP_OK.store(want_coop, std::sync::atomic::Ordering::Relaxed);
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("cortiq-wgpu"),
@@ -13467,6 +13695,10 @@ fn init(dev: usize) -> Result<Ctx, String> {
             wgpu::Features::empty()
         } | if want_pcache {
             wgpu::Features::PIPELINE_CACHE
+        } else {
+            wgpu::Features::empty()
+        } | if want_bind_arrays {
+            bind_array_features
         } else {
             wgpu::Features::empty()
         },
@@ -13955,6 +14187,83 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let moe_gate_up_q4tp_b = pipe("moe_gate_up_q4tp_b");
     let moe_gate_up_q4tp_b_r4 = pipe("moe_gate_up_q4tp_b_r4");
     let moe_down_q4tp_b = pipe("moe_down_q4tp_b");
+    let (dsv4_global_gu, dsv4_global_dn) = if want_bind_arrays {
+        let gm = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("dsv4-global-moe"),
+            source: wgpu::ShaderSource::Wgsl(DSV4_GLOBAL_MOE_SRC.into()),
+        });
+        let storage = |binding: u32, read_only: bool, count: Option<u32>| {
+            wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: count.and_then(std::num::NonZeroU32::new),
+            }
+        };
+        let gu0 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("dsv4-global-gu0"),
+            entries: &[
+                storage(0, true, Some(DSV4_GLOBAL_MOE_SEGMENTS as u32)),
+                storage(1, true, Some(DSV4_GLOBAL_MOE_SEGMENTS as u32)),
+                storage(2, true, None),
+                storage(3, true, None),
+                storage(4, false, None),
+            ],
+        });
+        let dn0 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("dsv4-global-dn0"),
+            entries: &[
+                storage(0, true, Some(DSV4_GLOBAL_MOE_SEGMENTS as u32)),
+                storage(1, true, None),
+                storage(2, true, None),
+                storage(3, true, None),
+                storage(4, false, None),
+            ],
+        });
+        let params = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("dsv4-global-params"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let gu_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("dsv4-global-gu-layout"),
+            bind_group_layouts: &[Some(&gu0), Some(&params)],
+            immediate_size: 0,
+        });
+        let dn_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("dsv4-global-dn-layout"),
+            bind_group_layouts: &[Some(&dn0), Some(&params)],
+            immediate_size: 0,
+        });
+        let gp = |entry: &str, layout: &wgpu::PipelineLayout| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(entry),
+                layout: Some(layout),
+                module: &gm,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                cache: pcache.as_ref(),
+            })
+        };
+        (
+            Some(gp("dsv4_global_gate_up_q4tp", &gu_layout)),
+            Some(gp("dsv4_global_down_q4tp", &dn_layout)),
+        )
+    } else {
+        (None, None)
+    };
     let moe_down_q4tp_b2 = pipe("moe_down_q4tp_b2");
     let moe_down_q4tp_part = pipe("moe_down_q4tp_part");
     let moe_down_q4tp_b4 = pipe("moe_down_q4tp_b4");
@@ -14269,6 +14578,8 @@ fn init(dev: usize) -> Result<Ctx, String> {
         moe_gate_up_q4tp_b,
         moe_gate_up_q4tp_b_r4,
         moe_down_q4tp_b,
+        dsv4_global_gu,
+        dsv4_global_dn,
         moe_down_q4tp_b2,
         moe_down_q4tp_part,
         moe_down_q4tp_b4,
@@ -14342,6 +14653,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         gdn_state: Mutex::new(HashMap::new()),
         gdn_snap: Mutex::new(HashMap::new()),
         moe_expw: Mutex::new(HashMap::new()),
+        dsv4_global_moe: Mutex::new(HashMap::new()),
         graph_scratch: Mutex::new(GraphScratch::default()),
     })
 }
@@ -14674,12 +14986,16 @@ pub fn prefetch_tier(model: &Arc<CmfModel>, keep: &dyn Fn(&str) -> bool) {
             let _ = h.join();
         }
     }
+    unsafe extern "C" {
+        // The C runtime's own atexit: present on every target the release
+        // ships to, without dragging the libc crate into iOS/Windows deps.
+        fn atexit(f: extern "C" fn()) -> i32;
+    }
     static HOOK: std::sync::Once = std::sync::Once::new();
     HOOK.call_once(|| unsafe {
-        libc::atexit(prefetch_atexit);
+        atexit(prefetch_atexit);
     });
     let handle = std::thread::spawn(move || {
-        use std::os::unix::fs::FileExt;
         let Ok(f) = std::fs::File::open(&model.path) else { return };
         let t0 = std::time::Instant::now();
         let mut done = 0u64;
@@ -14696,7 +15012,7 @@ pub fn prefetch_tier(model: &Arc<CmfModel>, keep: &dyn Fn(&str) -> bool) {
                 continue;
             }
             let mut v = vec![0u8; n];
-            if f.read_exact_at(&mut v, abs as u64).is_err() {
+            if read_at(&f, &mut v, abs as u64).is_err() {
                 return;
             }
             host_tier_put(key, std::sync::Arc::new(v));
@@ -14773,10 +15089,9 @@ fn pread_range(model: &Arc<CmfModel>, abs: usize, len: usize) -> Option<Vec<u8>>
     if !*ON.get_or_init(|| std::env::var("CMF_WEIGHT_PREAD").as_deref() == Ok("1")) {
         return None;
     }
-    use std::os::unix::fs::FileExt;
     let f = std::fs::File::open(&model.path).ok()?;
     let mut v = vec![0u8; len];
-    f.read_exact_at(&mut v, abs as u64).ok()?;
+    read_at(&f, &mut v, abs as u64).ok()?;
     Some(v)
 }
 
@@ -38726,6 +39041,178 @@ pub fn dsv4_weight_ready(model: &Arc<CmfModel>, idx: usize) -> bool {
     weight_buffer_l(c, (model.uid() as usize, idx), &bytes[abs..abs + plen], layer_of_name(&model.tensors[idx].name)).is_some()
 }
 
+/// Whether this adapter can execute the segmented global Q4TP MoE cache.
+/// Descriptor-indexing is optional in wgpu, so unsupported platforms keep
+/// using the parity-proven per-layer slot banks.
+pub fn dsv4_global_moe_supported() -> bool {
+    ctx().is_some_and(|c| c.dsv4_global_gu.is_some() && c.dsv4_global_dn.is_some())
+        && std::env::var("CMF_DSV4_GLOBAL_POOL").as_deref() != Ok("0")
+}
+
+/// Allocate the single model-wide Q4TP bank cache. The logical capacity is
+/// rounded down to eight equal segments; at most seven slots are sacrificed,
+/// while every descriptor stays below the backend's storage-range limit.
+/// Returns `(capacity, slots_per_segment)` and is idempotent per model.
+pub fn dsv4_global_moe_create(
+    model: &Arc<CmfModel>,
+    requested: usize,
+    inter: usize,
+    hidden: usize,
+) -> Option<(usize, usize)> {
+    use std::sync::atomic::Ordering;
+    let c = ctx()?;
+    if c.dsv4_global_gu.is_none() || c.dsv4_global_dn.is_none() {
+        return None;
+    }
+    if let Some(b) = c.dsv4_global_moe.lock().unwrap().get(&model.uid()).cloned() {
+        return Some((b.capacity, b.segment_slots));
+    }
+    let gu_len = cortiq_core::quant::expected_nbytes(
+        cortiq_core::TensorDtype::Q4TiledP,
+        &[inter, hidden],
+    )?;
+    let d_len = cortiq_core::quant::expected_nbytes(
+        cortiq_core::TensorDtype::Q4TiledP,
+        &[hidden, inter],
+    )?;
+    let per = 2usize.checked_mul(gu_len)?.checked_add(d_len)?;
+    let range = c
+        .device
+        .limits()
+        .max_storage_buffer_binding_size
+        .min(c.device.limits().max_buffer_size);
+    let max_seg = (range / gu_len.max(d_len) as u64) as usize;
+    // Binding-array descriptors, per-layer activation/cold-readback buffers,
+    // KV growth and queue staging are physical VRAM too but are not counted
+    // as resident weights. The ordinary per-layer cache allocates gradually
+    // and naturally leaves this space; one global allocation would consume
+    // it in a single call. Carve an automatic geometry-independent reserve
+    // here (2 GiB on this class of card, scaling down on small budgets).
+    let gib = 1024 * 1024 * 1024u64;
+    // Keep room for attention/KV buffers, per-layer intermediates and wgpu's
+    // internal allocations.  The pool is long-lived, while those allocations
+    // peak late in the network, so using every apparently free byte here can
+    // fail only after dozens of otherwise-correct MoE layers.
+    let workspace = (c.vram_budget / 10).clamp(2 * gib, 4 * gib);
+    let requested = requested.saturating_sub((workspace / per as u64) as usize);
+    let capacity = requested
+        .min(max_seg.saturating_mul(DSV4_GLOBAL_MOE_SEGMENTS))
+        / DSV4_GLOBAL_MOE_SEGMENTS
+        * DSV4_GLOBAL_MOE_SEGMENTS;
+    if capacity < DSV4_GLOBAL_MOE_SEGMENTS {
+        return None;
+    }
+    let segment_slots = capacity / DSV4_GLOBAL_MOE_SEGMENTS;
+    let total = (capacity as u64).checked_mul(per as u64)?;
+    if c.resident.load(Ordering::Relaxed).saturating_add(total) > c.vram_budget {
+        return None;
+    }
+    let mk = |label: &'static str, plen: usize| -> Vec<wgpu::Buffer> {
+        (0..DSV4_GLOBAL_MOE_SEGMENTS)
+            .map(|_| {
+                c.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(label),
+                    size: (segment_slots * plen) as u64,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            })
+            .collect()
+    };
+    let bufs = Arc::new(Dsv4GlobalMoeBufs {
+        gate: mk("dsv4-global-gate", gu_len),
+        up: mk("dsv4-global-up", gu_len),
+        down: mk("dsv4-global-down", d_len),
+        capacity,
+        segment_slots,
+        gu_len,
+        d_len,
+    });
+    c.resident.fetch_add(total, Ordering::Relaxed);
+    c.dsv4_global_moe
+        .lock()
+        .unwrap()
+        .insert(model.uid(), bufs);
+    tracing::info!(
+        "DSV4 unified global pool: {} slots, {} segments × {}, {} MB",
+        capacity,
+        DSV4_GLOBAL_MOE_SEGMENTS,
+        segment_slots,
+        total / 1024 / 1024
+    );
+    Some((capacity, segment_slots))
+}
+
+pub fn dsv4_global_moe_ready(model: &Arc<CmfModel>) -> bool {
+    ctx().is_some_and(|c| c.dsv4_global_moe.lock().unwrap().contains_key(&model.uid()))
+}
+
+/// Install one `(layer, expert)` triple into a flat global slot. Slot metadata
+/// is committed by the caller only after all three ordered queue writes
+/// succeed, so a remap never exposes partially replaced weights.
+pub fn dsv4_global_slot_fill(
+    model: &Arc<CmfModel>,
+    slot: usize,
+    t: (usize, usize, usize),
+) -> bool {
+    use std::sync::atomic::Ordering;
+    let Some(c) = ctx() else { return false };
+    let Some(b) = c
+        .dsv4_global_moe
+        .lock()
+        .unwrap()
+        .get(&model.uid())
+        .cloned()
+    else {
+        return false;
+    };
+    if slot >= b.capacity {
+        return false;
+    }
+    let seg = slot / b.segment_slots;
+    let local = slot % b.segment_slots;
+    let bytes = model.primary_bytes();
+    let put = |buf: &wgpu::Buffer, idx: usize, plen: usize| -> bool {
+        let Some(e) = model.tensors.get(idx) else { return false };
+        if e.nbytes as usize != plen {
+            return false;
+        }
+        let Some(abs) = model.entry_abs_offset(e) else { return false };
+        let off = local.saturating_mul(plen);
+        if off.saturating_add(plen) as u64 > buf.size() {
+            return false;
+        }
+        let key = (model.uid() as usize, idx);
+        let tier = host_tier_get(key);
+        let src: &[u8] = if let Some(v) = tier.as_deref() {
+            if v.len() != plen {
+                return false;
+            }
+            v
+        } else if let Some(v) = pread_range(model, abs, plen) {
+            c.queue.write_buffer(buf, off as u64, &v);
+            host_tier_put(key, Arc::new(v));
+            return true;
+        } else {
+            let Some(v) = bytes.get(abs..abs + plen) else { return false };
+            v
+        };
+        c.queue.write_buffer(buf, off as u64, src);
+        if tier.is_none() {
+            host_tier_put(key, Arc::new(src.to_vec()));
+        }
+        true
+    };
+    let ok = put(&b.gate[seg], t.0, b.gu_len)
+        && put(&b.up[seg], t.1, b.gu_len)
+        && put(&b.down[seg], t.2, b.d_len);
+    if ok {
+        DSV4_FILLS.fetch_add(1, Ordering::Relaxed);
+        DSV4_FILL_BYTES.fetch_add((2 * b.gu_len + b.d_len) as u64, Ordering::Relaxed);
+    }
+    ok
+}
+
 /// How many experts of this shape still fit on the card. The caller packs
 /// that many and leaves the rest to the host — per EXPERT, so no layer ever
 /// has to leave the device wholesale.
@@ -41334,6 +41821,41 @@ pub fn dsv4_draft_fit(inter: usize, hidden: usize, gu_q2: bool, dn_q2: bool) -> 
 /// commits to the device path.
 /// Ask for the attention weights BEFORE the experts, or the experts take the
 /// card and the skeleton — two orders of magnitude smaller — has nowhere left.
+/// Positional read that builds on every target: pread on unix,
+/// seek_read on windows — the release CI's Windows and iOS lanes are
+/// exactly the builds that do not have `std::os::unix`.
+fn read_at(f: &std::fs::File, buf: &mut [u8], off: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        f.read_exact_at(buf, off)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut done = 0usize;
+        while done < buf.len() {
+            let n = f.seek_read(&mut buf[done..], off + done as u64)?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "seek_read hit EOF",
+                ));
+            }
+            done += n;
+        }
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (f, buf, off);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no positional read on this target",
+        ))
+    }
+}
+
 /// Contiguous host banks of expert payloads — the fill source FreeToken
 /// calls `bank_sources`: one allocation per (layer, projection) holding
 /// EVERY expert's bytes row-contiguous, so a slot fill is one memcpy from
@@ -41401,7 +41923,6 @@ pub fn dsv4_host_bank_build(
         gu_len,
         d_len,
     };
-    use std::os::unix::fs::FileExt;
     let Ok(f) = std::fs::File::open(&model.path) else { return };
     let mut pull = |idx: usize, dst: &mut [u8]| -> bool {
         let Some(e) = model.tensors.get(idx) else { return false };
@@ -41409,7 +41930,7 @@ pub fn dsv4_host_bank_build(
             return false;
         }
         let Some(abs) = model.entry_abs_offset(e) else { return false };
-        if f.read_exact_at(dst, abs as u64).is_err() {
+        if read_at(&f, dst, abs as u64).is_err() {
             return false;
         }
         #[cfg(target_os = "linux")]
@@ -44462,6 +44983,17 @@ pub struct Dsv4MoeW<'a> {
     /// fit. When present the router ranges over ALL experts and hands the
     /// cold picks back instead of avoiding them.
     pub remap: Option<&'a [u32]>,
+    /// Model-wide segmented slot banks. When present `experts` is not a
+    /// physical pack: every remap value is a flat slot in this pool and the
+    /// shared expert has its own pinned flat slot.
+    pub global: Option<Dsv4GlobalMoe>,
+}
+
+#[derive(Clone, Copy)]
+pub struct Dsv4GlobalMoe {
+    pub pool_uid: u64,
+    pub shared_slot: u32,
+    pub segment_slots: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -44513,7 +45045,19 @@ pub fn dsv4_moe_frame(
     let Some(c) = ctx() else {
         no!("нет контекста wgpu")
     };
-    let n_pack = w.experts.len().saturating_sub(1); // routed; shared is last
+    let global_bufs = w.global.and_then(|gl| {
+        c.dsv4_global_moe
+            .lock()
+            .unwrap()
+            .get(&gl.pool_uid)
+            .cloned()
+    });
+    if w.global.is_some() && global_bufs.is_none() {
+        no!("глобальный пул модели не найден")
+    }
+    let n_pack = global_bufs
+        .as_ref()
+        .map_or_else(|| w.experts.len().saturating_sub(1), |b| b.capacity);
     let slots = g.top_k + 1;
     let n_all = if w.logits.is_empty() {
         w.router.len() / g.hidden.max(1)
@@ -44530,7 +45074,8 @@ pub fn dsv4_moe_frame(
     let n_route = if subset { n_all } else { n_pack };
     if n_pack == 0
         || (!w.logits.is_empty() && w.logits.len() < n_route)
-        || n_pack > 1024
+        || (global_bufs.is_none() && n_pack > 1024)
+        || (global_bufs.is_some() && g.gu_q2)
         || g.top_k == 0
         || g.top_k > 63
         || (!x.is_empty() && x.len() < g.hidden)
@@ -44547,10 +45092,15 @@ pub fn dsv4_moe_frame(
         );
     }
     let t_bufs = std::time::Instant::now();
-    let Some((gate_all, up_all, down_all)) =
-        moe_expert_bufs(c, model, w.experts, g.inter, g.hidden, true, g.gu_q2, false)
-    else {
-        no!("эксперты не поместились в бюджет VRAM");
+    let local_bufs = if global_bufs.is_none() {
+        let Some(v) =
+            moe_expert_bufs(c, model, w.experts, g.inter, g.hidden, true, g.gu_q2, false)
+        else {
+            no!("эксперты не поместились в бюджет VRAM");
+        };
+        Some(v)
+    } else {
+        None
     };
     MOE_BUFS_NS.fetch_add(
         t_bufs.elapsed().as_nanos() as u64,
@@ -44620,7 +45170,7 @@ pub fn dsv4_moe_frame(
         | ((w.forced.is_some_and(|f| f.len() >= g.top_k) as u32) << 2)
         | 8 // always pin the shared slot: these kernels take a fixed count
         | ((subset as u32) << 4)
-        | ((n_pack as u32) << 8); // where the shared expert actually sits
+        | (w.global.map_or(n_pack as u32, |gl| gl.shared_slot) << 8);
     if std::env::var("CMF_DSV4_MOE_CHECK").is_ok() {
         eprintln!(
             "[маршрут] n_all={n_all} n_pack={n_pack} subset={subset} flags={rflags} \
@@ -44649,22 +45199,34 @@ pub fn dsv4_moe_frame(
             slots as u32,
             stride16(g.inter, g.hidden, g.gu_q2),
             g.swiglu_limit.to_bits(),
-            0,
+            w.global.map_or(0, |gl| gl.segment_slots),
             0,
             0,
         ],
     );
-    let dn_u = uniform_u32x4(
-        c,
-        [
+    let dn_u4 = uniform_u32x4(c, [
             (g.inter / 32) as u32,
             g.hidden as u32,
             slots as u32,
             stride16(g.hidden, g.inter, false),
-        ],
-    );
-    let gu_r4 = g.inter % 4 == 0 && bt_gu_r4_on();
-    let (p_gu, p_dn) = if g.gu_q2 {
+        ]);
+    let dn_u8 = w.global.map(|gl| uniform_u32x8(c, [
+        (g.inter / 32) as u32,
+        g.hidden as u32,
+        slots as u32,
+        stride16(g.hidden, g.inter, false),
+        gl.segment_slots,
+        0,
+        0,
+        0,
+    ]));
+    let gu_r4 = global_bufs.is_none() && g.inter % 4 == 0 && bt_gu_r4_on();
+    let (p_gu, p_dn) = if global_bufs.is_some() {
+        (
+            c.dsv4_global_gu.as_ref().unwrap(),
+            c.dsv4_global_dn.as_ref().unwrap(),
+        )
+    } else if g.gu_q2 {
         (
             if gu_r4 {
                 &c.bt_moe_gate_up_q2tp_r4
@@ -44751,45 +45313,114 @@ pub fn dsv4_moe_frame(
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(1, 1, 1);
 
-        let bg_gu = cached_bind(c, (41, 0, lkey), || {
-            c.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
+        if let Some(gb) = global_bufs.as_ref() {
+            let gate_bindings: Vec<_> = gb
+                .gate
+                .iter()
+                .map(wgpu::Buffer::as_entire_buffer_binding)
+                .collect();
+            let up_bindings: Vec<_> = gb
+                .up
+                .iter()
+                .map(wgpu::Buffer::as_entire_buffer_binding)
+                .collect();
+            let down_bindings: Vec<_> = gb
+                .down
+                .iter()
+                .map(wgpu::Buffer::as_entire_buffer_binding)
+                .collect();
+            let bg_gu = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("dsv4-global-gu"),
                 layout: &l_gu,
                 entries: &[
-                    bind_buf(0, &gate_all),
-                    bind_buf(1, &up_all),
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::BufferArray(&gate_bindings),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::BufferArray(&up_bindings),
+                    },
                     bind_buf(2, &xb),
                     bind_buf(3, &msel),
                     bind_buf(4, &mact),
-                    bind_buf(5, &gu_u),
                 ],
-            })
-        });
-        pass.set_pipeline(p_gu);
-        pass.set_bind_group(0, &bg_gu, &[]);
-        pass.dispatch_workgroups(
-            (g.inter as u32).div_ceil(if gu_r4 { 4 } else { 1 }),
-            slots as u32,
-            1,
-        );
+            });
+            let bg_gu_p = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("dsv4-global-gu-p"),
+                layout: &p_gu.get_bind_group_layout(1),
+                entries: &[bind_buf(0, &gu_u)],
+            });
+            pass.set_pipeline(p_gu);
+            pass.set_bind_group(0, &bg_gu, &[]);
+            pass.set_bind_group(1, &bg_gu_p, &[]);
+            pass.dispatch_workgroups(g.inter as u32, slots as u32, 1);
 
-        let bg_dn = cached_bind(c, (42, 0, lkey), || {
-            c.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
+            let bg_dn = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("dsv4-global-dn"),
                 layout: &l_dn,
                 entries: &[
-                    bind_buf(0, &down_all),
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::BufferArray(&down_bindings),
+                    },
                     bind_buf(1, &mact),
                     bind_buf(2, &msel),
                     bind_buf(3, &mwt),
                     bind_buf(4, &ob),
-                    bind_buf(5, &dn_u),
                 ],
-            })
-        });
-        pass.set_pipeline(p_dn);
-        pass.set_bind_group(0, &bg_dn, &[]);
-        pass.dispatch_workgroups(g.hidden as u32, 1, 1);
+            });
+            let bg_dn_p = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("dsv4-global-dn-p"),
+                layout: &p_dn.get_bind_group_layout(1),
+                entries: &[bind_buf(0, dn_u8.as_ref().unwrap())],
+            });
+            pass.set_pipeline(p_dn);
+            pass.set_bind_group(0, &bg_dn, &[]);
+            pass.set_bind_group(1, &bg_dn_p, &[]);
+            pass.dispatch_workgroups(g.hidden as u32, 1, 1);
+        } else {
+            let (gate_all, up_all, down_all) = local_bufs.as_ref().unwrap();
+            let bg_gu = cached_bind(c, (41, 0, lkey), || {
+                c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &l_gu,
+                    entries: &[
+                        bind_buf(0, gate_all),
+                        bind_buf(1, up_all),
+                        bind_buf(2, &xb),
+                        bind_buf(3, &msel),
+                        bind_buf(4, &mact),
+                        bind_buf(5, &gu_u),
+                    ],
+                })
+            });
+            pass.set_pipeline(p_gu);
+            pass.set_bind_group(0, &bg_gu, &[]);
+            pass.dispatch_workgroups(
+                (g.inter as u32).div_ceil(if gu_r4 { 4 } else { 1 }),
+                slots as u32,
+                1,
+            );
+
+            let bg_dn = cached_bind(c, (42, 0, lkey), || {
+                c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &l_dn,
+                    entries: &[
+                        bind_buf(0, down_all),
+                        bind_buf(1, &mact),
+                        bind_buf(2, &msel),
+                        bind_buf(3, &mwt),
+                        bind_buf(4, &ob),
+                        bind_buf(5, &dn_u4),
+                    ],
+                })
+            });
+            pass.set_pipeline(p_dn);
+            pass.set_bind_group(0, &bg_dn, &[]);
+            pass.dispatch_workgroups(g.hidden as u32, 1, 1);
+        }
     }
     // ── the state handover, on the card ──
     if let Some(h) = hc_cur {

@@ -5323,8 +5323,18 @@ fn cmd_bench_bw(json: bool, model: &str) -> anyhow::Result<()> {
                     libc::POSIX_FADV_DONTNEED,
                 );
             }
-            use std::os::unix::fs::FileExt;
-            f.read_exact_at(&mut buf, off).ok()?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::FileExt;
+                f.read_exact_at(&mut buf, off).ok()?;
+            }
+            #[cfg(not(unix))]
+            {
+                use std::io::{Read, Seek, SeekFrom};
+                let mut fh = f.try_clone().ok()?;
+                fh.seek(SeekFrom::Start(off)).ok()?;
+                fh.read_exact(&mut buf).ok()?;
+            }
             std::hint::black_box(&buf);
             total += BLOCK;
         }
