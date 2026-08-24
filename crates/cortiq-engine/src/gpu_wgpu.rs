@@ -389,7 +389,9 @@ fn dsv4_global_gate_up_q4tp(@builtin(workgroup_id) wid: vec3<u32>,
                             @builtin(local_invocation_index) lid: u32) {
     let row = wid.x;
     let slot = wid.y;
-    let flat = gg_sel[slot];
+    let batch = wid.z;
+    let bslot = batch * gg_p.slots + slot;
+    let flat = gg_sel[bslot];
     let seg = flat / gg_p.segment_slots;
     let local = flat - seg * gg_p.segment_slots;
     let gpr = gg_p.gpr;
@@ -416,7 +418,7 @@ fn dsv4_global_gate_up_q4tp(@builtin(workgroup_id) wid: vec3<u32>,
         let sg = exp2(gl.x + f32((cg >> shf) & 31u) * gl.y);
         let su = exp2(ul.x + f32((cu >> shf) & 31u) * ul.y);
         let t16 = nib16 + g * 8u;
-        let xb = g * 32u;
+        let xb = batch * gpr * 32u + g * 32u;
         var dg = 0.0;
         var du = 0.0;
         for (var k = 0u; k < 4u; k = k + 1u) {
@@ -450,7 +452,7 @@ fn dsv4_global_gate_up_q4tp(@builtin(workgroup_id) wid: vec3<u32>,
             up = clamp(up, -gg_p.lim, gg_p.lim);
             gate = min(gate, gg_p.lim);
         }
-        gg_act[slot * gg_p.inter + row] = (gate / (1.0 + exp(-gate))) * up;
+        gg_act[(bslot * gg_p.inter) + row] = (gate / (1.0 + exp(-gate))) * up;
     }
 }
 
@@ -488,6 +490,7 @@ fn gd_dot8(w: u32, xi: u32) -> f32 {
 fn dsv4_global_down_q4tp(@builtin(workgroup_id) wid: vec3<u32>,
                          @builtin(local_invocation_index) lid: u32) {
     let row = wid.x;
+    let batch = wid.y;
     let gpr = gd_p.gpr;
     let rows = gd_p.hidden;
     let cst = (gpr * 5u + 7u) / 8u;
@@ -496,7 +499,8 @@ fn dsv4_global_down_q4tp(@builtin(workgroup_id) wid: vec3<u32>,
     for (var i = lid; i < total; i = i + 64u) {
         let slot = i / gpr;
         let g = i % gpr;
-        let flat = gd_sel[slot];
+        let bslot = batch * gd_p.slots + slot;
+        let flat = gd_sel[bslot];
         let seg = flat / gd_p.segment_slots;
         let local = flat - seg * gd_p.segment_slots;
         let base16 = local * gd_p.mat16;
@@ -510,14 +514,14 @@ fn dsv4_global_down_q4tp(@builtin(workgroup_id) wid: vec3<u32>,
         if (shf > 3u) { cv = cv | (gd_8(seg, cod8 + cb + 1u) << 8u); }
         let scale = exp2(pl.x + f32((cv >> shf) & 31u) * pl.y);
         let t16 = base16 + (row * gpr + g) * 8u;
-        let xb = (slot * gpr + g) * 32u;
+        let xb = (bslot * gpr + g) * 32u;
         var d = 0.0;
         for (var k = 0u; k < 4u; k = k + 1u) {
             let w = gd_16(seg, t16 + 2u * k)
                   | (gd_16(seg, t16 + 1u + 2u * k) << 16u);
             d = d + gd_dot8(w, xb + 8u * k);
         }
-        acc = acc + gd_wt[slot] * scale * d;
+        acc = acc + gd_wt[bslot] * scale * d;
     }
     gd_pt[lid] = acc;
     workgroupBarrier();
@@ -528,7 +532,7 @@ fn dsv4_global_down_q4tp(@builtin(workgroup_id) wid: vec3<u32>,
         workgroupBarrier();
         stride = stride >> 1u;
     }
-    if (lid == 0u) { gd_y[row] = gd_pt[0]; }
+    if (lid == 0u) { gd_y[batch * gd_p.hidden + row] = gd_pt[0]; }
 }
 "#;
 
@@ -36090,6 +36094,8 @@ pub struct DsparkStageW<'a> {
     /// Global id → pack slot, u32, 0xFFFFFFFF where cold (never chosen —
     /// the mask forbids it).
     pub map_u32: &'a [u32],
+    /// Protected draft residents inside the trunk's unified physical pool.
+    pub global: Option<Dsv4GlobalMoe>,
 }
 
 #[derive(Clone, Copy)]
@@ -36357,12 +36363,27 @@ pub fn dspark_graph(
         ) else {
             return false;
         };
-        let Some((gate_all, up_all, down_all)) = (if g.gu_q2 {
-            moe_expert_bufs_requant_gu(model, s.experts, g.inter, dim)
-        } else {
-            moe_expert_bufs(c, model, s.experts, g.inter, dim, true, false, false)
-        }) else {
+        let global_bufs = s.global.and_then(|gl| {
+            c.dsv4_global_moe
+                .lock()
+                .unwrap()
+                .get(&gl.pool_uid)
+                .cloned()
+        });
+        if s.global.is_some() && global_bufs.is_none() {
             return false;
+        }
+        let local_bufs = if global_bufs.is_none() {
+            let Some(v) = (if g.gu_q2 {
+                moe_expert_bufs_requant_gu(model, s.experts, g.inter, dim)
+            } else {
+                moe_expert_bufs(c, model, s.experts, g.inter, dim, true, false, false)
+            }) else {
+                return false;
+            };
+            Some(v)
+        } else {
+            None
         };
         let cache = {
             let map = c.dsv4_kv.lock().unwrap();
@@ -36391,7 +36412,11 @@ pub fn dspark_graph(
         let router = const_buf(c, bytemuck::cast_slice(s.router));
         let mask_b = const_buf(c, bytemuck::cast_slice(s.mask_u32));
         let map_b = const_buf(c, bytemuck::cast_slice(s.map_u32));
-        let n_res = s.experts.len() - 1;
+        let n_res = if global_bufs.is_some() {
+            s.mask_u32.iter().filter(|&&v| v != 0).count()
+        } else {
+            s.experts.len() - 1
+        };
 
         let mixfold = |pass: &mut wgpu::ComputePass<'_>,
                        t1: u8,
@@ -36665,7 +36690,7 @@ pub fn dspark_graph(
                 | 2  // mask: only resident experts are selectable
                 | 8
                 | 16 // subset: winners arrive as pack slots via the map
-                | ((n_res as u32) << 8);
+                | (s.global.map_or(n_res as u32, |gl| gl.shared_slot) << 8);
             let forced_dummy = frame_buf_t(c, BT_FORCED, dk(si), block * g.top_k * 4, true);
             let bind = cached_bind(c, bk(249), || {
                 let rp = uniform_mixed(
@@ -36709,7 +36734,7 @@ pub fn dspark_graph(
                     slots as u32,
                     stride16(g.inter, dim, g.gu_q2),
                     g.swiglu_limit.to_bits(),
-                    0,
+                    s.global.map_or(0, |gl| gl.segment_slots),
                     0,
                     0,
                 ],
@@ -36723,69 +36748,153 @@ pub fn dspark_graph(
                     stride16(dim, g.inter, g.dn_q2),
                 ],
             );
-            let gu_r4 = g.inter % 4 == 0 && bt_gu_r4_on();
-            let p_gu = if g.gu_q2 {
-                if gu_r4 {
-                    &c.bt_moe_gate_up_q2tp_r4
-                } else {
-                    &c.bt_moe_gate_up_q2tp
-                }
-            } else if gu_r4 {
-                &c.moe_gate_up_q4tp_b_r4
-            } else {
-                &c.moe_gate_up_q4tp_b
-            };
-            let bind = cached_bind(c, bk(250), || {
-                c.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: None,
+            if let Some(gb) = global_bufs.as_ref() {
+                let p_gu = c.dsv4_global_gu.as_ref().unwrap();
+                let p_dn = c.dsv4_global_dn.as_ref().unwrap();
+                let dn_g = uniform_u32x8(
+                    c,
+                    [
+                        (g.inter / 32) as u32,
+                        dim as u32,
+                        slots as u32,
+                        stride16(dim, g.inter, false),
+                        s.global.unwrap().segment_slots,
+                        0,
+                        0,
+                        0,
+                    ],
+                );
+                let gate_bindings: Vec<_> = gb
+                    .gate
+                    .iter()
+                    .map(wgpu::Buffer::as_entire_buffer_binding)
+                    .collect();
+                let up_bindings: Vec<_> = gb
+                    .up
+                    .iter()
+                    .map(wgpu::Buffer::as_entire_buffer_binding)
+                    .collect();
+                let down_bindings: Vec<_> = gb
+                    .down
+                    .iter()
+                    .map(wgpu::Buffer::as_entire_buffer_binding)
+                    .collect();
+                let bg_gu = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("dspark-global-gu"),
                     layout: &p_gu.get_bind_group_layout(0),
                     entries: &[
-                        bind_buf(0, &gate_all),
-                        bind_buf(1, &up_all),
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::BufferArray(&gate_bindings),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::BufferArray(&up_bindings),
+                        },
                         bind_buf(2, &x2_bt),
                         bind_buf(3, &msel_bt),
                         bind_buf(4, &mact_bt),
-                        bind_buf(5, &gu_u),
                     ],
-                })
-            });
-            pass.set_pipeline(p_gu);
-            pass.set_bind_group(0, &bind, &[]);
-            let gx = if gu_r4 {
-                (g.inter as u32).div_ceil(4)
-            } else {
-                g.inter as u32
-            };
-            pass.dispatch_workgroups(gx, slots as u32, block as u32);
-            let p_dn = if g.dn_q2 {
-                &c.moe_down_q2tp_b
-            } else {
-                &c.moe_down_q4tp_b
-            };
-            let bind = cached_bind(c, bk(251), || {
-                // The 2-bit kernel reads x through the vec4 view and never
-                // touches the scalar activation binding; the layouts differ.
-                let mut entries = vec![
-                    bind_buf(0, &down_all),
-                    bind_buf(2, &msel_bt),
-                    bind_buf(3, &mwt_bt),
-                    bind_buf(4, &mo_bt),
-                    bind_buf(5, &dn_u),
-                ];
-                if g.dn_q2 {
-                    entries.push(bind_buf(7, &mact_bt));
-                } else {
-                    entries.insert(1, bind_buf(1, &mact_bt));
-                }
-                c.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: None,
+                });
+                let bg_gu_p = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("dspark-global-gu-p"),
+                    layout: &p_gu.get_bind_group_layout(1),
+                    entries: &[bind_buf(0, &gu_u)],
+                });
+                pass.set_pipeline(p_gu);
+                pass.set_bind_group(0, &bg_gu, &[]);
+                pass.set_bind_group(1, &bg_gu_p, &[]);
+                pass.dispatch_workgroups(g.inter as u32, slots as u32, block as u32);
+
+                let bg_dn = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("dspark-global-dn"),
                     layout: &p_dn.get_bind_group_layout(0),
-                    entries: &entries,
-                })
-            });
-            pass.set_pipeline(p_dn);
-            pass.set_bind_group(0, &bind, &[]);
-            pass.dispatch_workgroups(dim as u32, block as u32, 1);
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::BufferArray(&down_bindings),
+                        },
+                        bind_buf(1, &mact_bt),
+                        bind_buf(2, &msel_bt),
+                        bind_buf(3, &mwt_bt),
+                        bind_buf(4, &mo_bt),
+                    ],
+                });
+                let bg_dn_p = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("dspark-global-dn-p"),
+                    layout: &p_dn.get_bind_group_layout(1),
+                    entries: &[bind_buf(0, &dn_g)],
+                });
+                pass.set_pipeline(p_dn);
+                pass.set_bind_group(0, &bg_dn, &[]);
+                pass.set_bind_group(1, &bg_dn_p, &[]);
+                pass.dispatch_workgroups(dim as u32, block as u32, 1);
+            } else {
+                let (gate_all, up_all, down_all) = local_bufs.as_ref().unwrap();
+                let gu_r4 = g.inter % 4 == 0 && bt_gu_r4_on();
+                let p_gu = if g.gu_q2 {
+                    if gu_r4 {
+                        &c.bt_moe_gate_up_q2tp_r4
+                    } else {
+                        &c.bt_moe_gate_up_q2tp
+                    }
+                } else if gu_r4 {
+                    &c.moe_gate_up_q4tp_b_r4
+                } else {
+                    &c.moe_gate_up_q4tp_b
+                };
+                let bind = cached_bind(c, bk(250), || {
+                    c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &p_gu.get_bind_group_layout(0),
+                        entries: &[
+                            bind_buf(0, gate_all),
+                            bind_buf(1, up_all),
+                            bind_buf(2, &x2_bt),
+                            bind_buf(3, &msel_bt),
+                            bind_buf(4, &mact_bt),
+                            bind_buf(5, &gu_u),
+                        ],
+                    })
+                });
+                pass.set_pipeline(p_gu);
+                pass.set_bind_group(0, &bind, &[]);
+                let gx = if gu_r4 {
+                    (g.inter as u32).div_ceil(4)
+                } else {
+                    g.inter as u32
+                };
+                pass.dispatch_workgroups(gx, slots as u32, block as u32);
+                let p_dn = if g.dn_q2 {
+                    &c.moe_down_q2tp_b
+                } else {
+                    &c.moe_down_q4tp_b
+                };
+                let bind = cached_bind(c, bk(251), || {
+                    // The 2-bit kernel reads x through the vec4 view and never
+                    // touches the scalar activation binding; the layouts differ.
+                    let mut entries = vec![
+                        bind_buf(0, down_all),
+                        bind_buf(2, &msel_bt),
+                        bind_buf(3, &mwt_bt),
+                        bind_buf(4, &mo_bt),
+                        bind_buf(5, &dn_u),
+                    ];
+                    if g.dn_q2 {
+                        entries.push(bind_buf(7, &mact_bt));
+                    } else {
+                        entries.insert(1, bind_buf(1, &mact_bt));
+                    }
+                    c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &p_dn.get_bind_group_layout(0),
+                        entries: &entries,
+                    })
+                });
+                pass.set_pipeline(p_dn);
+                pass.set_bind_group(0, &bind, &[]);
+                pass.dispatch_workgroups(dim as u32, block as u32, 1);
+            }
             expand(&mut pass, 252, &mo_bt, &state2_bt, &state_bt);
         }
     }
