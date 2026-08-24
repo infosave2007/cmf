@@ -302,6 +302,9 @@ enum Sub {
         /// distillation weight w in L = CE + w·MSE(xf, xf_teacher)
         #[arg(long, default_value_t = 1.0)]
         distill_w: f32,
+        /// hold the donated tensors still for the first N steps
+        #[arg(long, default_value_t = 0)]
+        freeze_donor: usize,
         #[arg(long, default_value_t = 1)]
         seed: u64,
     },
@@ -521,14 +524,14 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Sub::Birth { shard, val, out, resume, batch, seq, steps, warmup, lr, wd, clip, eval_every, save_every, pca_every, tiny, vocab, anchor_every, conv_k, cfg_json, init_from, distill_from, distill_w, seed } => {
+        Sub::Birth { shard, val, out, resume, batch, seq, steps, warmup, lr, wd, clip, eval_every, save_every, pca_every, tiny, vocab, anchor_every, conv_k, cfg_json, init_from, distill_from, distill_w, freeze_donor, seed } => {
             #[cfg(target_os = "macos")]
             cortiq_embryo::cli::birth(cortiq_embryo::cli::BirthArgs {
-                shard, val, out, resume, batch, seq, steps, warmup, lr, wd, clip, eval_every, save_every, pca_every, tiny, vocab, anchor_every, conv_k, cfg_json, init_from, distill_from, distill_w, seed,
+                shard, val, out, resume, batch, seq, steps, warmup, lr, wd, clip, eval_every, save_every, pca_every, tiny, vocab, anchor_every, conv_k, cfg_json, init_from, distill_from, distill_w, freeze_donor, seed,
             });
             #[cfg(not(target_os = "macos"))]
             {
-                let _ = (shard, val, out, resume, batch, seq, steps, warmup, lr, wd, clip, eval_every, save_every, pca_every, tiny, vocab, anchor_every, conv_k, cfg_json, init_from, distill_from, distill_w, seed);
+                let _ = (shard, val, out, resume, batch, seq, steps, warmup, lr, wd, clip, eval_every, save_every, pca_every, tiny, vocab, anchor_every, conv_k, cfg_json, init_from, distill_from, distill_w, freeze_donor, seed);
                 eprintln!("needs Metal (macOS)");
                 std::process::exit(1);
             }

@@ -82,6 +82,9 @@ pub struct BirthArgs {
     /// Feature-distillation teacher (MSE on the final-normed hidden).
     pub distill_from: Option<PathBuf>,
     pub distill_w: f32,
+    /// Hold the donated tensors still for the first N steps (progressive
+    /// replacement: the fresh mixers learn to fit the frozen network first).
+    pub freeze_donor: usize,
     pub seed: u64,
 }
 
@@ -135,6 +138,7 @@ pub fn birth(a: BirthArgs) {
     }
     let lay = Layout::new(&cfg);
     let mut params = params;
+    let mut donated: Vec<(usize, usize)> = Vec::new();
     if let Some(ip) = &a.init_from {
         let don = load_checkpoint(ip).expect("load --init-from donor");
         let dlay = Layout::new(&don.cfg);
@@ -145,6 +149,7 @@ pub fn birth(a: BirthArgs) {
             match dmap.get(n.as_str()) {
                 Some((doff, dlen)) if dlen == l => {
                     params[*o..*o + *l].copy_from_slice(&don.params[*doff..*doff + *l]);
+                    donated.push((*o, *l));
                     hit += 1;
                 }
                 _ => miss += 1,
@@ -179,6 +184,10 @@ pub fn birth(a: BirthArgs) {
     }
     gpu.set_desc(&extras);
     gpu.step = step0;
+    if a.freeze_donor > 0 && !donated.is_empty() {
+        gpu.freeze = donated.clone();
+        println!("freeze-donor: {} tensors held for the first {} steps", donated.len(), a.freeze_donor);
+    }
     let mut sampler = Sampler::new(a.batch, a.seq, a.seed.wrapping_add(step0 as u64));
     let (mut tokens, mut targets) = (Vec::new(), Vec::new());
     let m = a.batch * a.seq;
@@ -196,15 +205,22 @@ pub fn birth(a: BirthArgs) {
     let mut cov_ema: Vec<f32> = Vec::new();
     for step in step0 as usize..a.steps {
         sampler.batch_mix(&train, &mut tokens, &mut targets);
+        if step == a.freeze_donor && !gpu.freeze.is_empty() {
+            gpu.freeze.clear();
+            println!("freeze-donor: thawed at step {step}");
+        }
         let lr = lr_at(step, a.steps, a.warmup, a.lr, a.lr * 0.1);
+        // AdamW's decoupled decay shrinks even zero-grad params — no weight
+        // decay while the donor is held, or 1000 frozen steps cost it ~6%.
+        let wd = if gpu.freeze.is_empty() { a.wd } else { 0.0 };
         let t = Instant::now();
         let (loss, dloss, gnorm, _gpu_ms) = match &teacher {
             Some(tch) => {
                 let xft = tch.forward_hidden(&tokens);
-                gpu.train_step_distill(&tokens, &targets, lr, a.wd, a.clip, &xft, a.distill_w)
+                gpu.train_step_distill(&tokens, &targets, lr, wd, a.clip, &xft, a.distill_w)
             }
             None => {
-                let (l, g, ms) = gpu.train_step(&tokens, &targets, lr, a.wd, a.clip);
+                let (l, g, ms) = gpu.train_step(&tokens, &targets, lr, wd, a.clip);
                 (l, 0.0, g, ms)
             }
         };
