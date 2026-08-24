@@ -505,6 +505,7 @@ mod gpu {
         pub xf: GBuf,    // [M,H] final-normed
         pub invf: GBuf,
         pub dxf: GBuf,   // [M,H]
+        pub xft: GBuf,   // [M,H] teacher's final-normed hidden (distillation)
         pub tok: GBuf,   // [M] u32 inputs
         pub tgt: GBuf,   // [M] u32 targets
         // hierarchical head (cfg.head_clusters > 0)
@@ -690,6 +691,7 @@ mod gpu {
                 xf: z(m * h),
                 invf: z(m),
                 dxf: z(m * h),
+                xft: z(m * h),
                 tok: GBuf::from_u32(c, &vec![0u32; m]),
                 tgt: GBuf::from_u32(c, &vec![0u32; m]),
                 tgt_cluster: GBuf::from_u32(c, &vec![0u32; m]),
@@ -1167,6 +1169,14 @@ mod gpu {
         /// `g`, zeroed first) + the grad-norm partials. Tokens/targets must
         /// already be in `tok`/`tgt`. Loss per position lands in scratch.loss.
         pub fn encode_fwd_bwd(&self, cmd: &Cmd) -> usize {
+            self.encode_fwd_bwd_d(cmd, None)
+        }
+
+        /// As `encode_fwd_bwd`, plus feature distillation: with
+        /// `distill = Some(w)` the teacher's final-normed hidden must sit
+        /// in `scratch.xft`, and the head's dxf gains the MSE term
+        /// (2w/M)·(xf − xft) — two axpby dispatches, no new kernels.
+        pub fn encode_fwd_bwd_d(&self, cmd: &Cmd, distill: Option<f32>) -> usize {
             let cfg = &self.cfg;
             let (h, m) = (cfg.hidden, self.b * self.t);
             let s = &self.scratch;
@@ -1180,6 +1190,11 @@ mod gpu {
             self.desc_seeded.set(true);
             cmd.rmsnorm_fwd_at(&self.x_out, &self.p, self.lay.final_norm, &self.xf, &self.invf, m, h, cfg.norm_eps);
             self.encode_head(cmd, true);
+            if let Some(w) = distill {
+                let c = 2.0 * w / (m * h) as f32;
+                cmd.axpby(c, &self.xf, 1.0, &self.dxf, m * h);
+                cmd.axpby(-c, &self.xft, 1.0, &self.dxf, m * h);
+            }
             // final norm backward → s.dx
             cmd.rmsnorm_bwd_at(&self.x_out, &self.p, self.lay.final_norm, &self.dxf, &self.invf, &s.dx, 0.0, &self.g, self.lay.final_norm, m, h);
             for l in (0..cfg.layers).rev() {
@@ -1218,6 +1233,47 @@ mod gpu {
             self.encode_adamw(&cmd, lr, wd, clip, gnorm, self.step);
             let ms2 = cmd.commit();
             (loss, gnorm, ms1 + ms2)
+        }
+
+        /// `train_step` with feature distillation from a teacher hidden:
+        /// `xft` is the teacher's final-normed [M,H] for the same tokens.
+        /// Returns (CE loss, distill MSE·w, grad norm, gpu ms).
+        pub fn train_step_distill(
+            &mut self,
+            tokens: &[u32],
+            targets: &[u32],
+            lr: f32,
+            wd: f32,
+            clip: f32,
+            xft: &[f32],
+            w: f32,
+        ) -> (f32, f32, f32, f64) {
+            let m = self.b * self.t;
+            let h = self.cfg.hidden;
+            assert!(tokens.len() == m && targets.len() == m && xft.len() == m * h);
+            let c = self.ctx();
+            unsafe {
+                std::ptr::copy_nonoverlapping(tokens.as_ptr(), self.tok.buf.contents() as *mut u32, m);
+                std::ptr::copy_nonoverlapping(targets.as_ptr(), self.tgt.buf.contents() as *mut u32, m);
+                std::ptr::copy_nonoverlapping(xft.as_ptr(), self.xft.buf.contents() as *mut f32, m * h);
+            }
+            self.prepare_head(targets);
+            let cmd = Cmd::new(c);
+            let groups = self.encode_fwd_bwd_d(&cmd, Some(w));
+            let ms1 = cmd.commit();
+            let gnorm = self.scratch.partial.as_slice()[..groups].iter().map(|x| *x as f64).sum::<f64>().sqrt() as f32;
+            let loss = self.read_loss();
+            let dl = {
+                let a = self.xf.as_slice();
+                let b = self.xft.as_slice();
+                let ss: f64 = a[..m * h].iter().zip(&b[..m * h]).map(|(x, y)| ((x - y) as f64).powi(2)).sum();
+                (w as f64 * ss / (m * h) as f64) as f32
+            };
+            self.step += 1;
+            let cmd = Cmd::new(c);
+            self.encode_adamw(&cmd, lr, wd, clip, gnorm, self.step);
+            let ms2 = cmd.commit();
+            (loss, dl, gnorm, ms1 + ms2)
         }
 
         /// Forward only (no grads): mean loss on a batch already in tok/tgt.
