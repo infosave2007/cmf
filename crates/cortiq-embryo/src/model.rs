@@ -506,6 +506,9 @@ mod gpu {
         pub invf: GBuf,
         pub dxf: GBuf,   // [M,H]
         pub xft: GBuf,   // [M,H] teacher's final-normed hidden (distillation)
+        /// (offset, len) grad ranges zeroed after the backward — donor
+        /// tensors held still while the fresh mixers learn to fit them.
+        pub freeze: Vec<(usize, usize)>,
         pub tok: GBuf,   // [M] u32 inputs
         pub tgt: GBuf,   // [M] u32 targets
         // hierarchical head (cfg.head_clusters > 0)
@@ -692,6 +695,7 @@ mod gpu {
                 invf: z(m),
                 dxf: z(m * h),
                 xft: z(m * h),
+                freeze: Vec::new(),
                 tok: GBuf::from_u32(c, &vec![0u32; m]),
                 tgt: GBuf::from_u32(c, &vec![0u32; m]),
                 tgt_cluster: GBuf::from_u32(c, &vec![0u32; m]),
@@ -1226,7 +1230,16 @@ mod gpu {
             let cmd = Cmd::new(c);
             let groups = self.encode_fwd_bwd(&cmd);
             let ms1 = cmd.commit();
-            let gnorm = self.scratch.partial.as_slice()[..groups].iter().map(|x| *x as f64).sum::<f64>().sqrt() as f32;
+            let mut gnorm = self.scratch.partial.as_slice()[..groups].iter().map(|x| *x as f64).sum::<f64>().sqrt() as f32;
+            if !self.freeze.is_empty() {
+                let g = unsafe {
+                    std::slice::from_raw_parts_mut(self.g.buf.contents() as *mut f32, self.lay.total)
+                };
+                for &(o, l) in &self.freeze {
+                    g[o..o + l].fill(0.0);
+                }
+                gnorm = g.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>().sqrt() as f32;
+            }
             let loss = self.read_loss();
             self.step += 1;
             let cmd = Cmd::new(c);
@@ -1261,7 +1274,18 @@ mod gpu {
             let cmd = Cmd::new(c);
             let groups = self.encode_fwd_bwd_d(&cmd, Some(w));
             let ms1 = cmd.commit();
-            let gnorm = self.scratch.partial.as_slice()[..groups].iter().map(|x| *x as f64).sum::<f64>().sqrt() as f32;
+            let mut gnorm = self.scratch.partial.as_slice()[..groups].iter().map(|x| *x as f64).sum::<f64>().sqrt() as f32;
+            if !self.freeze.is_empty() {
+                // Unified memory: zero the frozen grads on the host, then
+                // recompute the norm so the clip sees only the live params.
+                let g = unsafe {
+                    std::slice::from_raw_parts_mut(self.g.buf.contents() as *mut f32, self.lay.total)
+                };
+                for &(o, l) in &self.freeze {
+                    g[o..o + l].fill(0.0);
+                }
+                gnorm = g.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>().sqrt() as f32;
+            }
             let loss = self.read_loss();
             let dl = {
                 let a = self.xf.as_slice();
