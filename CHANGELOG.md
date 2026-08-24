@@ -7,6 +7,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-24
+
+DeepSeek-V4-Flash q4tp on one GPU goes from 0.665 to 21.5 tok/s on an
+A40 46 GiB — measured `bench --core` steady, exact output budget, no
+environment knobs. The release is the acceleration campaign of 22-24.08
+landing as DEFAULTS: the engine reads the machine and configures itself.
+
+### Added
+- **Dynamic LRU expert slots**: the packed subset follows the router
+  instead of a load-time frequency guess. A miss is fetched into an LRU
+  slot within a per-machine quota; the device still routes for real and
+  returns unmapped winners as cold picks for the CPU — a wrong
+  prediction costs one unused fill, never a wrong number.
+- **Chain-of-one**: a partial layer runs as ONE submission — attention,
+  folds and the subset MoE in a single frame, per-(kv, layer) cold/post
+  slots, exact cold correction from the preserved post. Default-on under
+  a device.
+- **Zero-knob DSV4 defaults**: adaptive VRAM margin (1-2 GiB physical
+  reserve instead of a flat 8 GiB), expert slots split across the
+  remaining layers so the stack's head cannot evict its tail, the
+  host-to-VRAM bandwidth measured and driving the refill quota, the
+  batched verify-chain sized by VRAM, and the MTP draft in the FILE'S
+  OWN quant (q4 for q4tp) gated by a geometric VRAM check — the
+  at-upload q4-to-q2 requant that fed the draft a coarser model than its
+  verifier is no longer the default path.
+- **Task-mask sidecar**: `<model>.moe-mass.json` loads automatically
+  (weighted routing-mass format, 92.5% default cover — the measured
+  balance); `CMF_MOE_MASK` stays as the diagnostic override. With the
+  sidecar all 43 layers ride the GPU chain.
+- **`cortiq bench --bw`**: the three bandwidths the offload split is
+  arithmetic over — host-RAM copy, host-to-VRAM upload (submits
+  included), and storage read with the cache dropped — measured once
+  per machine, in the spirit of calibrate-not-guess.
+- **Embryo: a short causal conv before the mixer projections**
+  (`--conv-k`): the twin-pair diagnosis said the hybrid's gap to full
+  softmax is short-range mixing, and a free 4-tap conv equals a paid
+  softmax anchor (-7% ppl at zero step time); gradchecked whole-graph.
+
+### Changed
+- **The pool wakes only as many workers as the job has grains** — a
+  361-dispatch DSV4 token stops paying 380 unparks per dispatch; big
+  matvecs still take every worker.
+- The four-row gate/up path shares one activation load and now serves
+  q2tp in chain-of-one and batch verify as well.
+- `bench --core` warms real decode (including the lazy DSpark pack)
+  before its window.
+
+### Fixed
+- The chain and batch verify silently miscomputed with partial or
+  refilled packs (`remap: None` asserted a build-time packing that no
+  longer held): 0 of 625 drafts accepted, wrong experts under plausible
+  sums. Both now refuse what they cannot represent, and the chain
+  encode ranks over every expert through the live remap when the pack
+  is a subset.
+- A speculative block could run past `max_tokens` (66 tokens for a
+  64-token request); the last verify is clamped to the remaining budget
+  before it runs, so KV/state never advance past what the user sees.
+- The partial walk's self-poisoning (its frames trusted pooled slots a
+  neighbour rewrote) — the walk seeds its own slots at entry.
+- The tier prefetch thread raced libc exit and ate the process's
+  buffered stdout on short runs; it stops and joins via atexit now.
+- The greedy expert pack starved the trunk (22.4 of 24.4 GB budget on a
+  32 GiB card): every attention tensor re-uploaded per token. The pack
+  spreads across layers and the draft reserve is carved before packing.
+
+### Measured (bench --core steady, one process)
+- A40 46 GiB q4tp: 0.665 (old default) -> 1.5-1.8 (exact dynamic LRU)
+  -> 11.0 (mask 97.5%, no MTP) -> 21.5 (bare command + sidecar, 48/80
+  drafts accepted, exact token budget).
+- RTX 5090 32 GiB q4tp: 1.14 -> 3.0-3.5 (slots, fetch-all).
+- RTX PRO 6000 96 GiB q4tp: 1.5 -> 3.49 (chain-of-one + reuse-gated
+  fills). The q2tp 40.2 on the same card remains the speculative
+  reference: its expert mass fits the budget whole.
+
+
 ### Notes
 - **The Metal path is kernel-bound where the wgpu path was host-bound.**
   Measured on an M4 with MiniMax-H3 at 384×288, nine frames, four steps:

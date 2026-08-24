@@ -3243,7 +3243,7 @@ fn ppl_windows(
     Ok(())
 }
 
-/// B-field of claim 12: expert-selection frequencies of this run →
+/// B-field of claim 12: expert-routing mass of this run →
 /// JSON {layer: [counts]} (CMF_MOE_STATS=file). Works for both
 /// teacher-forcing (ppl) and on-policy generation (run) —
 /// VMF fireball principle: the observable = integral over the trajectory.
@@ -5623,9 +5623,13 @@ async fn cmd_bench(
         return Ok(());
     }
 
-    // Warmup: touch every weight page once so the numbers below are
-    // steady-state (a cold 14 GB mmap otherwise bills its first pass
-    // to whichever phase runs first).
+    // Warmup: compile and exercise the actual decode path before measuring.
+    // `forward_ids` alone is not enough for checkpoints with a speculative
+    // draft: DSpark's resident pack is intentionally built on first use, so
+    // a forward-only warmup used to charge ~1.5 s of one-time upload to the
+    // first inter-token "steady" window. A short untimed generation also
+    // warms the ordinary sampler/head path and is the local equivalent of
+    // the remote benchmark's existing 32-token warmup.
     let prompt = match ctx {
         // Long-context mode: repeat until the token budget is covered
         // (~9 tokens per sentence), then truncate exactly below.
@@ -5642,8 +5646,12 @@ async fn cmd_bench(
             );
         }
     }
+    let warm_ids = &prompt_ids[..2.min(prompt_ids.len())];
     let _ = pipeline
-        .forward_ids(&prompt_ids[..2.min(prompt_ids.len())], mask.as_ref())
+        .forward_ids(warm_ids, mask.as_ref())
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let _ = pipeline
+        .generate_from_ids(warm_ids, 8, mask.as_ref(), None)
         .map_err(|e| anyhow::anyhow!(e))?;
 
     // Prefill benchmark.

@@ -2120,6 +2120,14 @@ impl Pipeline {
         let mut finish_reason = "max_tokens".to_string();
         let mut drafted = 0usize;
         let mut accepted = 0usize;
+        // DeepSeek-V4's draft quality is strongly content-dependent.  Two
+        // consecutive paid rounds with no extra token put it on a bounded
+        // cooldown; predictable text keeps batching, ordinary prose falls
+        // back to the exact walk instead of paying a slow draft forever.
+        // Local to one generation so one difficult request cannot poison the
+        // next one, and deliberately automatic — this is not a user knob.
+        let mut dsv4_spec_bad = 0usize;
+        let mut dsv4_spec_retry_at = 0usize;
         let mut confidence: Vec<f32> = Vec::new();
         let trace_on = self.trace;
         let calib_temp = self.calib_temp;
@@ -2865,15 +2873,36 @@ impl Pipeline {
                         && self.sampler_config.repetition_penalty == 1.0
                         && generated + 1 < max_tokens
                         && all_ids.len() >= 2
+                        && generated >= dsv4_spec_retry_at
                     {
                         let tip_token = all_ids[all_ids.len() - 2];
-                        if let Some((extra, n_pos)) = self.dsv4_spec_step(
+                        let drafted0 = drafted;
+                        let round = self.dsv4_spec_step(
                             tip_token,
                             t_next,
                             next_pos,
+                            max_tokens.saturating_sub(generated),
                             &mut drafted,
                             &mut accepted,
-                        ) {
+                        );
+                        if drafted > drafted0 {
+                            let useful = round
+                                .as_ref()
+                                .is_some_and(|(extra, _)| !extra.is_empty());
+                            if useful {
+                                dsv4_spec_bad = 0;
+                            } else {
+                                dsv4_spec_bad += 1;
+                                if dsv4_spec_bad >= 2 {
+                                    dsv4_spec_bad = 0;
+                                    dsv4_spec_retry_at = generated.saturating_add(32);
+                                    tracing::info!(
+                                        "dsv4: draft не окупился дважды — точный walk на 32 токена"
+                                    );
+                                }
+                            }
+                        }
+                        if let Some((extra, n_pos)) = round {
                             next_pos = n_pos;
                             let mut stopped = false;
                             for &id in &extra {
@@ -7426,9 +7455,25 @@ impl Pipeline {
     fn dsv4_spec_on() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| {
+            // Test-only runtime gate: model loading still performs the same
+            // reservation and trunk packing, which gives rollback parity a
+            // topology-identical non-speculative control arm.
+            if let Ok(v) = std::env::var("CMF_DSV4_SPEC_RUN") {
+                return v != "0";
+            }
+            // An explicit value is a diagnostic force/escape hatch.  With no
+            // knob, speculation is eligible only when model loading reserved
+            // its bounded pack.  On small q4tp cards the geometric reserve
+            // gate deliberately leaves this at zero: trying to build DSpark
+            // after the exact trunk filled VRAM is both slower and a device
+            // OOM (measured on A40).
             std::env::var("CMF_DSV4_SPEC")
                 .map(|v| v != "0")
-                .unwrap_or(true)
+                .unwrap_or_else(|_| {
+                    crate::gpu_wgpu::DRAFT_RESERVE
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        > 0
+                })
         })
     }
 
@@ -7444,6 +7489,7 @@ impl Pipeline {
         tip_token: u32,
         t_next: u32,
         next_pos: usize,
+        max_extra: usize,
         drafted: &mut usize,
         accepted_ctr: &mut usize,
     ) -> Option<(Vec<u32>, usize)> {
@@ -7532,7 +7578,15 @@ impl Pipeline {
             }
             return None;
         }
-        let mut k_verify = crate::dsv4::dspark_verify_k().min(props.len());
+        // `fed[0]` is `t_next`, which the outer loop has already committed;
+        // only `fed[1..]` become additional output tokens. Cap the verify
+        // transaction itself to the caller's remaining output budget instead
+        // of merely truncating the returned vector: otherwise the KV/state
+        // would advance past `max_tokens` and a 64-token request could return
+        // 66 tokens (and poison a reused session with two invisible steps).
+        let mut k_verify = crate::dsv4::dspark_verify_k()
+            .min(props.len())
+            .min(max_extra.saturating_add(1));
         // Adaptive depth: positions the draft itself doubts are paid for on
         // every verify and delivered almost never (natural-text survival
         // [.67 .50 .29 .08 .04]). `CMF_DSPARK_CONF_MIN=p` trims the fed
@@ -7581,6 +7635,7 @@ impl Pipeline {
             eprintln!("spec_step: verify отказал");
         }
         let txn = txn?;
+        let spec_gpu_end = txn.gpu_end;
         let b = fed.len();
         let mut accepted = 1usize;
         while accepted < b && fed[accepted] == argmax[accepted - 1] {
@@ -7623,19 +7678,14 @@ impl Pipeline {
         // becomes the new tip's draft input; every one owes the ring an
         // entry for its position.
         let (hc, dim) = (cfg.hc_mult, cfg.dim);
-        // A PARTIAL capture layer never rides the chain, so the batch has
-        // no photograph of it — its tip capture comes from the walk's own
-        // note like any host layer's. Filtering on the device set alone
-        // handed the draft a never-written photo slot for exactly the
-        // most important input (the last layer feeds main_proj), and the
-        // split configurations drafted at 27% no matter the residency.
+        // Complete-chain layers are photographed by the fused submission;
+        // partial device layers overwrite that slot after exact host cold-
+        // expert correction.  Thus every target in the contiguous device
+        // prefix has a valid per-token capture.
         let dev_caps: Vec<usize> = targets
             .iter()
             .copied()
-            .filter(|&t| {
-                st.dev_set.get(t).copied().unwrap_or(false)
-                    && !st.partial_set.get(t).copied().unwrap_or(false)
-            })
+            .filter(|&t| t < spec_gpu_end)
             .collect();
         let mut caps_all = vec![0.0f32; dev_caps.len() * b * hc * dim];
         if !crate::gpu_wgpu::dsv4_spec_cap_read_all(b, dev_caps.len(), hc * dim, &mut caps_all) {

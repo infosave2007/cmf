@@ -292,7 +292,7 @@ pub(crate) fn build_ffn_at(
         .and_then(|v| v.parse::<f32>().ok())
         .filter(|&t| t > 0.0 && t < 1.0)
         .inspect(|t| tracing::info!("MoE adaptive routing: tau {t}"));
-    let mask = moe_task_mask(&prefix, experts.len());
+    let mask = moe_task_mask(model, &prefix, experts.len());
     let router = if resonance_moe {
         // never read (selection is by descriptors); zero placeholder in RAM
         QTensor::from_f32(vec![0.0; experts.len() * arch.hidden_size], experts.len(), arch.hidden_size)
@@ -418,31 +418,54 @@ pub(crate) fn build_ffn_at(
     Ok(FfnKind::Moe(moe))
 }
 
-/// Task mask over routed experts (opt-in, experimental): DTG-MA applied
-/// to MoE. `CMF_MOE_MASK=<stats.json>` points at a claim-12 B-field dump
-/// (`CMF_MOE_STATS` output — per-layer expert-selection counts from a
-/// task-representative run); `CMF_MOE_MASK_COVER` (default 0.9) keeps,
-/// per layer, the smallest top set of experts reaching that fraction of
-/// the recorded routing mass. Selection then happens over the allowed
-/// set only (softmax renormalizes). Gate any real use on a ppl A/B.
-pub(crate) fn moe_task_mask(prefix: &str, ne: usize) -> Option<Vec<bool>> {
+/// Task mask over routed experts: DTG-MA applied to MoE.
+///
+/// A model may ship a calibrated `<model>.moe-mass.json` sidecar, which is
+/// loaded automatically. `CMF_MOE_MASK=<stats.json>` remains the diagnostic
+/// override and also accepts legacy selection-count files. The weighted
+/// format defaults to 92.5% routing-mass coverage (the measured q4tp A40
+/// balance); legacy count files keep their historical 90% default. In both
+/// cases `CMF_MOE_MASK_COVER` can override the choice for an A/B. Selection
+/// happens over the allowed set only and softmax renormalizes, so every
+/// sidecar must still pass a held-out perplexity gate for its intended task.
+pub(crate) fn moe_task_mask(
+    model: &std::sync::Arc<CmfModel>,
+    prefix: &str,
+    ne: usize,
+) -> Option<Vec<bool>> {
     use std::sync::OnceLock;
     static CFG: OnceLock<Option<(std::collections::HashMap<usize, Vec<u64>>, f64)>> =
         OnceLock::new();
     let cfg = CFG.get_or_init(|| {
-        let path = std::env::var("CMF_MOE_MASK").ok()?;
+        let (path, sidecar) = if let Ok(path) = std::env::var("CMF_MOE_MASK") {
+            (std::path::PathBuf::from(path), false)
+        } else {
+            let mut name = model.path.as_os_str().to_os_string();
+            name.push(".moe-mass.json");
+            let path = std::path::PathBuf::from(name);
+            path.is_file().then_some((path, true))?
+        };
+        let shown = path.display();
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| tracing::warn!("CMF_MOE_MASK: cannot read {shown}: {e}"))
+            .ok()?;
+        let map: std::collections::HashMap<String, Vec<u64>> = serde_json::from_str(&text)
+            .map_err(|e| tracing::warn!("CMF_MOE_MASK: bad JSON in {shown}: {e}"))
+            .ok()?;
+        // Weighted dumps store normalized route mass in fixed-point units
+        // and therefore have per-layer totals many orders above the old
+        // top-k vote counts. The filename is an explicit stronger signal;
+        // the magnitude check keeps manually named weighted dumps automatic.
+        let weighted = sidecar
+            || map
+                .values()
+                .any(|row| row.iter().copied().sum::<u64>() >= 1_000_000);
         let cover = std::env::var("CMF_MOE_MASK_COVER")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|&c| c > 0.0 && c <= 1.0)
-            .unwrap_or(0.9);
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| tracing::warn!("CMF_MOE_MASK: cannot read {path}: {e}"))
-            .ok()?;
-        let map: std::collections::HashMap<String, Vec<u64>> = serde_json::from_str(&text)
-            .map_err(|e| tracing::warn!("CMF_MOE_MASK: bad JSON in {path}: {e}"))
-            .ok()?;
-        tracing::info!("MoE task mask: {path}, cover {cover}");
+            .unwrap_or(if weighted { 0.925 } else { 0.9 });
+        tracing::info!("MoE task mask: {shown}, cover {cover}");
         Some((
             map.into_iter()
                 .filter_map(|(k, v)| Some((k.parse::<usize>().ok()?, v)))
