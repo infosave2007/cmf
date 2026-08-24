@@ -76,6 +76,12 @@ pub struct BirthArgs {
     /// Qwen/LFM-class local mixing the per-token diagnosis called for)
     pub conv_k: Option<usize>,
     pub cfg_json: Option<String>,
+    /// Warm-start donor: copy name+size-matching tensors (twin: everything
+    /// but the mixers).
+    pub init_from: Option<PathBuf>,
+    /// Feature-distillation teacher (MSE on the final-normed hidden).
+    pub distill_from: Option<PathBuf>,
+    pub distill_w: f32,
     pub seed: u64,
 }
 
@@ -91,7 +97,7 @@ pub fn birth(a: BirthArgs) {
         };
         (mix, val)
     };
-    let (mut cfg, params, step0, m0, v0, extras) = match &a.resume {
+    let (mut cfg, params, step0, m0, v0, mut extras) = match &a.resume {
         Some(p) => {
             let ck = load_checkpoint(p).expect("load checkpoint");
             println!("resumed {} at step {}", p.display(), ck.step);
@@ -128,6 +134,40 @@ pub fn birth(a: BirthArgs) {
         cfg.vocab = v;
     }
     let lay = Layout::new(&cfg);
+    let mut params = params;
+    if let Some(ip) = &a.init_from {
+        let don = load_checkpoint(ip).expect("load --init-from donor");
+        let dlay = Layout::new(&don.cfg);
+        let dmap: std::collections::HashMap<&str, (usize, usize)> =
+            dlay.names.iter().map(|(n, o, l)| (n.as_str(), (*o, *l))).collect();
+        let (mut hit, mut miss) = (0usize, 0usize);
+        for (n, o, l) in &lay.names {
+            match dmap.get(n.as_str()) {
+                Some((doff, dlen)) if dlen == l => {
+                    params[*o..*o + *l].copy_from_slice(&don.params[*doff..*doff + *l]);
+                    hit += 1;
+                }
+                _ => miss += 1,
+            }
+        }
+        println!("init-from {}: {hit} tensors copied, {miss} left at init (the fresh mixers)", ip.display());
+        // The donor's expert descriptors travel with its expert weights —
+        // fresh descriptors against copied experts skew the routing.
+        if extras.is_empty() {
+            extras = don.extras;
+        }
+    }
+    let params = params;
+    // Feature-distillation teacher: its own arena, forward-only use.
+    let teacher = a.distill_from.as_ref().map(|tp| {
+        let ck = load_checkpoint(tp).expect("load --distill-from teacher");
+        assert_eq!(ck.cfg.hidden, cfg.hidden, "teacher hidden must match");
+        assert_eq!(ck.cfg.vocab, cfg.vocab, "teacher vocab must match");
+        let mut t = EmbryoGpu::new(ck.cfg.clone(), a.batch, a.seq, &ck.params).expect("Metal (teacher)");
+        t.set_desc(&ck.extras);
+        println!("distill-from {} (step {}), w = {}", tp.display(), ck.step, a.distill_w);
+        t
+    });
     println!(
         "genome: {} layers, hidden {}, vocab {}, arena {:.2} M; train {} tok, val {} tok; B={} T={} steps={}",
         cfg.layers, cfg.hidden, cfg.vocab, lay.total as f64 / 1e6, train.total_tokens(), val.tokens.len(), a.batch, a.seq, a.steps
@@ -158,15 +198,25 @@ pub fn birth(a: BirthArgs) {
         sampler.batch_mix(&train, &mut tokens, &mut targets);
         let lr = lr_at(step, a.steps, a.warmup, a.lr, a.lr * 0.1);
         let t = Instant::now();
-        let (loss, gnorm, _gpu_ms) = gpu.train_step(&tokens, &targets, lr, a.wd, a.clip);
+        let (loss, dloss, gnorm, _gpu_ms) = match &teacher {
+            Some(tch) => {
+                let xft = tch.forward_hidden(&tokens);
+                gpu.train_step_distill(&tokens, &targets, lr, a.wd, a.clip, &xft, a.distill_w)
+            }
+            None => {
+                let (l, g, ms) = gpu.train_step(&tokens, &targets, lr, a.wd, a.clip);
+                (l, 0.0, g, ms)
+            }
+        };
         let ms = t.elapsed().as_secs_f64() * 1e3;
         ema = if step == step0 as usize { loss } else { 0.98 * ema + 0.02 * loss };
         if a.pca_every > 0 && (step + 1) % a.pca_every == 0 {
             gpu.update_subspaces(&mut cov_ema, 0.9);
         }
         if step % 10 == 0 || step + 1 == a.steps {
+            let dtag = if teacher.is_some() { format!(" dist {dloss:.4}") } else { String::new() };
             println!(
-                "step {step:>6} loss {loss:.4} (ema {ema:.4}) |g| {gnorm:.3} lr {lr:.2e} {ms:.0} ms {:.0} tok/s  [{:.1} min]",
+                "step {step:>6} loss {loss:.4} (ema {ema:.4}){dtag} |g| {gnorm:.3} lr {lr:.2e} {ms:.0} ms {:.0} tok/s  [{:.1} min]",
                 m as f64 / (ms * 1e-3),
                 t_start.elapsed().as_secs_f64() / 60.0
             );

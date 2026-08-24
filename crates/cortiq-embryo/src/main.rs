@@ -291,6 +291,17 @@ enum Sub {
         /// JSON overrides merged into the genome config (ablations), e.g. '{"hidden":256,"layers":6}'
         #[arg(long)]
         cfg_json: Option<String>,
+        /// warm-start: copy every name+size-matching tensor from this
+        /// checkpoint (twin donor: embed/head/norms/FFN land, mixers stay fresh)
+        #[arg(long)]
+        init_from: Option<PathBuf>,
+        /// feature distillation: teacher checkpoint whose final hidden the
+        /// student's xf is pulled toward (MSE), on top of the CE loss
+        #[arg(long)]
+        distill_from: Option<PathBuf>,
+        /// distillation weight w in L = CE + w·MSE(xf, xf_teacher)
+        #[arg(long, default_value_t = 1.0)]
+        distill_w: f32,
         #[arg(long, default_value_t = 1)]
         seed: u64,
     },
@@ -510,14 +521,14 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Sub::Birth { shard, val, out, resume, batch, seq, steps, warmup, lr, wd, clip, eval_every, save_every, pca_every, tiny, vocab, anchor_every, conv_k, cfg_json, seed } => {
+        Sub::Birth { shard, val, out, resume, batch, seq, steps, warmup, lr, wd, clip, eval_every, save_every, pca_every, tiny, vocab, anchor_every, conv_k, cfg_json, init_from, distill_from, distill_w, seed } => {
             #[cfg(target_os = "macos")]
             cortiq_embryo::cli::birth(cortiq_embryo::cli::BirthArgs {
-                shard, val, out, resume, batch, seq, steps, warmup, lr, wd, clip, eval_every, save_every, pca_every, tiny, vocab, anchor_every, conv_k, cfg_json, seed,
+                shard, val, out, resume, batch, seq, steps, warmup, lr, wd, clip, eval_every, save_every, pca_every, tiny, vocab, anchor_every, conv_k, cfg_json, init_from, distill_from, distill_w, seed,
             });
             #[cfg(not(target_os = "macos"))]
             {
-                let _ = (shard, val, out, resume, batch, seq, steps, warmup, lr, wd, clip, eval_every, save_every, pca_every, tiny, vocab, anchor_every, conv_k, cfg_json, seed);
+                let _ = (shard, val, out, resume, batch, seq, steps, warmup, lr, wd, clip, eval_every, save_every, pca_every, tiny, vocab, anchor_every, conv_k, cfg_json, init_from, distill_from, distill_w, seed);
                 eprintln!("needs Metal (macOS)");
                 std::process::exit(1);
             }
