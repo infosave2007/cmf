@@ -5302,7 +5302,7 @@ fn cmd_bench_bw(json: bool, model: &str) -> anyhow::Result<()> {
     // know that (a slow-disk assumption turns eviction and tiering into
     // anti-optimisations on fast machines, measured both ways).
     let storage_gbs = (|| -> Option<f64> {
-        #[allow(unused_imports)]
+        #[cfg(target_os = "linux")]
         use std::os::unix::io::AsRawFd;
         let f = std::fs::File::open(model).ok()?;
         let len = f.metadata().ok()?.len();

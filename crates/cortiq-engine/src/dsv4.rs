@@ -2846,7 +2846,12 @@ fn dsv4_chain1_layer(
         .tid2eid
         .as_ref()
         .map(|tbl| hash_route(tbl, cfg.vocab, cfg.top_k, token_id));
+    let global_remap = pk
+        .global
+        .as_ref()
+        .map(|gl| gl.pool.remap(gl.layer, cfg.n_routed_experts));
     let dynv = pk.dynslots.lock().unwrap();
+    let live_remap = global_remap.as_deref().unwrap_or(dynv.remap.as_slice());
     let nxt = layers.get(li + 1);
     let w = crate::gpu_wgpu::Dsv4LayerW {
         attn: crate::gpu_wgpu::Dsv4AttnW {
@@ -2866,8 +2871,12 @@ fn dsv4_chain1_layer(
             bias: pk.bias.as_deref(),
             mask: pk.mask.as_deref(),
             forced: forced.as_deref(),
-            remap: Some(&dynv.remap),
-            global: None,
+            remap: Some(live_remap),
+            global: pk.global.as_ref().map(|gl| crate::gpu_wgpu::Dsv4GlobalMoe {
+                pool_uid: gl.pool.uid,
+                shared_slot: gl.shared_slot,
+                segment_slots: gl.pool.segment_slots as u32,
+            }),
         },
         hc_ffn_fn: &l.hc_ffn_fn,
         hc_ffn_scale: &l.hc_ffn_scale,
@@ -2912,6 +2921,7 @@ fn dsv4_chain1_layer(
     let mut cold: Vec<(usize, f32)> = Vec::new();
     let mut routed: Vec<(usize, f32)> = Vec::new();
     let mut cold_x: Vec<f32> = Vec::new();
+    let need_routes = route_stats_on() || pk.global.is_some();
     if !crate::gpu_wgpu::dsv4_layer_frame(
         &model,
         &w,
@@ -2924,7 +2934,7 @@ fn dsv4_chain1_layer(
         st.pos,
         &mut next,
         Some(&mut cold),
-        route_stats_on().then_some(&mut routed),
+        need_routes.then_some(&mut routed),
         &mut cold_x,
     ) {
         return None;
@@ -2933,6 +2943,21 @@ fn dsv4_chain1_layer(
         record_route(li, layers.len(), cfg.n_routed_experts, &routed);
     }
     drop(dynv);
+    // The cold/readback slot already carries the device's real winners.
+    // Feed all of them back to the allocator: this both installs misses and
+    // refreshes hit ages, without a host-side router prediction or another
+    // fence. A prediction disagreement therefore remains impossible here.
+    if let Some(gl) = pk.global.as_ref() {
+        let picks: Vec<usize> = routed.iter().map(|&(gi, _)| gi).collect();
+        gl.pool.ensure_picks(
+            &model,
+            gl.layer,
+            &picks,
+            &l.experts,
+            cfg.top_k,
+            1,
+        );
+    }
     if cold.is_empty() {
         // Every winner was resident: the state stays on the card and the
         // frame's own next-fold is exact. This is the single-submission
@@ -2974,7 +2999,7 @@ fn dsv4_chain1_layer(
     }
     // Reactive refill: the winners the slots did not hold are the likeliest
     // winners of the NEXT token — pull them in now, LRU-evicting.
-    {
+    if pk.global.is_none() {
         let mut dynv = pk.dynslots.lock().unwrap();
         dynv.clock += 1;
         let clock = dynv.clock;
@@ -4991,26 +5016,32 @@ pub fn moe_step(
             if std::env::var("CMF_DSV4_MOE_CHECK").is_ok() {
                 let mut want = vec![0.0f32; out.len()];
                 let mut acc = vec![0.0f32; cfg.dim];
-                for (e, &ei) in idx.iter().enumerate() {
-                    let Some(exp) = l.experts.get(ei) else {
-                        continue;
-                    };
-                    run_expert(
-                        hidden,
-                        exp,
-                        cfg,
-                        w.get(e).copied().unwrap_or(0.0),
-                        pool,
-                        &mut acc,
-                    );
+                // This is a CPU oracle. Without cpu_scope the generic
+                // quantized matvec probe uploaded a second copy of every
+                // selected expert, so the diagnostic itself exhausted VRAM
+                // after otherwise-correct global-pool layers.
+                crate::gpu::cpu_scope(|| {
+                    for (e, &ei) in idx.iter().enumerate() {
+                        let Some(exp) = l.experts.get(ei) else {
+                            continue;
+                        };
+                        run_expert(
+                            hidden,
+                            exp,
+                            cfg,
+                            w.get(e).copied().unwrap_or(0.0),
+                            pool,
+                            &mut acc,
+                        );
+                        for (o, a) in want.iter_mut().zip(&acc) {
+                            *o += a;
+                        }
+                    }
+                    run_expert(hidden, &l.shared, cfg, 1.0, pool, &mut acc);
                     for (o, a) in want.iter_mut().zip(&acc) {
                         *o += a;
                     }
-                }
-                run_expert(hidden, &l.shared, cfg, 1.0, pool, &mut acc);
-                for (o, a) in want.iter_mut().zip(&acc) {
-                    *o += a;
-                }
+                });
                 let num: f32 = want
                     .iter()
                     .zip(out.iter())
