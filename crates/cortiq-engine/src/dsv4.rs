@@ -4008,6 +4008,30 @@ impl GlobalPool {
         drop(st);
         self.remap(layer, experts.len())
     }
+
+    /// Reserve a small immutable slice of the unified arena for the draft.
+    /// The draft graph cannot pause between its dependent stages to repair a
+    /// slot that the exact trunk evicted, so its bounded resident subset is
+    /// pinned.  These are still the SAME physical banks: no second expert
+    /// allocation and no duplicate upload cache are created.
+    fn pin_picks(
+        &self,
+        model: &std::sync::Arc<cortiq_core::CmfModel>,
+        layer: usize,
+        picks: &[usize],
+        experts: &[Dsv4Expert],
+    ) -> Vec<u32> {
+        let remap = self.ensure_picks(model, layer, picks, experts, picks.len(), 1);
+        let mut st = self.state.lock().unwrap();
+        for &expert in picks {
+            if let Some(&slot) = st.slot_for.get(&(layer, expert)) {
+                if let Some(owner) = st.owner[slot as usize].as_mut() {
+                    owner.pinned = true;
+                }
+            }
+        }
+        remap
+    }
 }
 
 #[cfg(feature = "gpu")]
@@ -6023,8 +6047,15 @@ fn forward_chunk_batched(
             ""
         };
         if !why.is_empty() {
-            static SAID: std::sync::Once = std::sync::Once::new();
-            SAID.call_once(|| tracing::warn!("dsv4: пакет отказал — {why}"));
+            // This is an expected preflight refusal: the first prompt chunk
+            // establishes device ownership and a one-token tail is too small
+            // to batch.  The caller immediately takes the exact walk, so a
+            // warning here looked like a generation failure when nothing had
+            // failed. Keep the reason available only to the diagnostic gate.
+            tracing::debug!("dsv4: пакет preflight — {why}");
+            if std::env::var("CMF_DSV4_FRAME_DEBUG").is_ok() {
+                eprintln!("dsv4: пакет preflight — {why}");
+            }
             return false;
         }
         let (hc, dim) = (cfg.hc_mult, cfg.dim);
@@ -9291,6 +9322,10 @@ pub struct DsparkStagePack {
     /// (gate, up, down) directory indices, pack order, shared LAST.
     pub tensors: Vec<(usize, usize, usize)>,
     pub n_resident: usize,
+    /// A protected subset inside the trunk's model-wide physical banks.
+    /// None keeps the legacy independent local pack for adapters without
+    /// descriptor-indexed storage arrays and for q2tp.
+    global: Option<GlobalPack>,
 }
 
 /// The q2tp encoder, registered by the binary that has one (the CLI's
@@ -9365,6 +9400,22 @@ pub fn dspark_reserve_note(mtp: &[Dsv4Mtp], cfg: &Dsv4Cfg, layers: &[Dsv4Layer])
         .experts
         .first()
         .is_some_and(|e| e.w2.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP));
+    // A native-q4 draft can share the descriptor-indexed trunk arena and
+    // therefore needs no second expert reservation.  Do not arm automatic
+    // speculation here yet: a frequency pack says which experts are common,
+    // not that the draft's proposals pay for a five-token exact verify.  The
+    // explicit diagnostic gate can exercise the shared path without OOM;
+    // zero-knob production remains the measured faster exact walk until an
+    // acceptance profile has passed its own quality/speed gate.
+    if !gu_q2
+        && !dn_q2
+        && std::env::var("CMF_MOE_MASK").is_err()
+        && crate::gpu_wgpu::dsv4_global_moe_supported()
+    {
+        crate::gpu_wgpu::DRAFT_PACK_RESERVE.store(0, std::sync::atomic::Ordering::Relaxed);
+        crate::gpu_wgpu::DRAFT_RESERVE.store(0, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
     let gu = cortiq_core::quant::expected_nbytes(dt(gu_q2), &[cfg.moe_inter, cfg.dim]).unwrap_or(0);
     let dn = cortiq_core::quant::expected_nbytes(dt(dn_q2), &[cfg.dim, cfg.moe_inter]).unwrap_or(0);
     let per = (2 * gu + dn) as u64;
@@ -9443,25 +9494,46 @@ pub fn dspark_pack_build(mtp: &[Dsv4Mtp], cfg: &Dsv4Cfg) -> Option<DsparkPack> {
     if mtp.is_empty() {
         return None;
     }
+    let model = mtp[0]
+        .layer
+        .experts
+        .first()
+        .and_then(|e| e.w1.model_arc())?;
+    let native_q2 = mtp[0]
+        .layer
+        .experts
+        .first()
+        .is_some_and(|e| e.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP));
+    let dn_native = mtp[0]
+        .layer
+        .experts
+        .first()
+        .is_some_and(|e| e.w2.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP));
+    let global_share = !native_q2
+        && !dn_native
+        && std::env::var("CMF_MOE_MASK").is_err()
+        && crate::gpu_wgpu::dsv4_global_moe_supported()
+        && crate::gpu_wgpu::dsv4_global_moe_ready(&model);
     let n_res: usize =
         std::env::var("CMF_DSPARK_RESIDENT")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or_else(|| {
+                if global_share {
+                    // The measured acceptance plateau starts here. These
+                    // rows occupy existing arena slots rather than asking
+                    // the weight allocator for another multi-GiB pack.
+                    return 40;
+                }
                 // No knob: take what the card actually has left, whatever the
                 // card is. The stages split the fit evenly after their shared
                 // experts. Forty is the measured acceptance plateau: larger
                 // packs still make the router and upload more rows without a
                 // useful increase in accepted tokens (64 was slower on A40).
-                let native_q2 = mtp[0].layer.experts.first().is_some_and(|e| {
-                    e.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP)
-                });
                 let gu_q2 =
                     native_q2 || (!dspark_native_on() && DSPARK_Q2TP_ENCODE.get().is_some());
-                let dn_q2 = mtp[0].layer.experts.first().is_some_and(|e| {
-                    e.w2.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP)
-                });
-                let room = crate::gpu_wgpu::dsv4_draft_fit(cfg.moe_inter, cfg.dim, gu_q2, dn_q2);
+                let room =
+                    crate::gpu_wgpu::dsv4_draft_fit(cfg.moe_inter, cfg.dim, gu_q2, dn_native);
                 (room.saturating_sub(mtp.len() + 1) / mtp.len().max(1)).clamp(8, 40)
             });
     // Frequency tallies: lines of `stage<TAB>expert<TAB>count`. Named by
@@ -9519,28 +9591,44 @@ pub fn dspark_pack_build(mtp: &[Dsv4Mtp], cfg: &Dsv4Cfg) -> Option<DsparkPack> {
             o
         };
         order.truncate(n_res.min(n));
-        let mut mask = vec![false; n];
-        let mut to_slot = vec![usize::MAX; n];
-        let mut tensors = Vec::with_capacity(order.len() + 1);
-        for (slot, &e) in order.iter().enumerate() {
-            let ex = &l.experts[e];
-            let (Some(w1), Some(w3), Some(w2)) =
-                (ex.w1.model_idx(), ex.w3.model_idx(), ex.w2.model_idx())
-            else {
+        let (global, mask, to_slot, tensors) = if global_share {
+            let pk = pack_for(l, cfg, model.header.arch.num_layers + si)?;
+            let gl = pk.global.clone()?;
+            let remap = gl.pool.pin_picks(&model, gl.layer, &order, &l.experts);
+            let mut mask = vec![false; n];
+            let mut to_slot = vec![usize::MAX; n];
+            for e in 0..n {
+                if remap.get(e).copied().unwrap_or(u32::MAX) != u32::MAX {
+                    mask[e] = true;
+                    to_slot[e] = remap[e] as usize;
+                }
+            }
+            (Some(gl), mask, to_slot, Vec::new())
+        } else {
+            let mut mask = vec![false; n];
+            let mut to_slot = vec![usize::MAX; n];
+            let mut tensors = Vec::with_capacity(order.len() + 1);
+            for (slot, &e) in order.iter().enumerate() {
+                let ex = &l.experts[e];
+                let (Some(w1), Some(w3), Some(w2)) =
+                    (ex.w1.model_idx(), ex.w3.model_idx(), ex.w2.model_idx())
+                else {
+                    return None;
+                };
+                mask[e] = true;
+                to_slot[e] = slot;
+                tensors.push((w1, w3, w2));
+            }
+            let (Some(s1), Some(s3), Some(s2)) = (
+                l.shared.w1.model_idx(),
+                l.shared.w3.model_idx(),
+                l.shared.w2.model_idx(),
+            ) else {
                 return None;
             };
-            mask[e] = true;
-            to_slot[e] = slot;
-            tensors.push((w1, w3, w2));
-        }
-        let (Some(s1), Some(s3), Some(s2)) = (
-            l.shared.w1.model_idx(),
-            l.shared.w3.model_idx(),
-            l.shared.w2.model_idx(),
-        ) else {
-            return None;
+            tensors.push((s1, s3, s2));
+            (None, mask, to_slot, tensors)
         };
-        tensors.push((s1, s3, s2));
         // The router and bias, dequantized once.
         let mut router = vec![0.0f32; n * cfg.dim];
         for (r, row) in (0..n).zip(router.chunks_mut(cfg.dim)) {
@@ -9560,16 +9648,12 @@ pub fn dspark_pack_build(mtp: &[Dsv4Mtp], cfg: &Dsv4Cfg) -> Option<DsparkPack> {
             map_u32,
             tensors,
             n_resident: order.len(),
+            global,
         });
     }
     // ── upload: the small skeleton FIRST, the expert stacks after — the
     //    documented admission order (experts fill the card and the skeleton
     //    then misses). ──
-    let model = mtp[0]
-        .layer
-        .experts
-        .first()
-        .and_then(|e| e.w1.model_arc())?;
     let mut skeleton = Vec::new();
     for m in mtp {
         let l = &m.layer;
@@ -9591,21 +9675,13 @@ pub fn dspark_pack_build(mtp: &[Dsv4Mtp], cfg: &Dsv4Cfg) -> Option<DsparkPack> {
     // trunk's 2-bit experts. The at-upload requant is only the fallback for
     // files published before the converter's q2tp profile covered the MTP
     // stack (and only when the binary registered an encoder).
-    let native_q2 = mtp[0]
-        .layer
-        .experts
-        .first()
-        .is_some_and(|e| e.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP));
     let gu_q2 = native_q2
         || (!crate::dsv4::dspark_native_on()
             && crate::dsv4::DSPARK_Q2TP_ENCODE.get().is_some());
-    let dn_native = mtp[0]
-        .layer
-        .experts
-        .first()
-        .is_some_and(|e| e.w2.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP));
     for (si, sp) in stages.iter().enumerate() {
-        let ok = if native_q2 {
+        let ok = if sp.global.is_some() {
+            true
+        } else if native_q2 {
             crate::gpu_wgpu::dsv4_experts_ready(
                 &model,
                 &sp.tensors,
@@ -9637,7 +9713,12 @@ pub fn dspark_pack_build(mtp: &[Dsv4Mtp], cfg: &Dsv4Cfg) -> Option<DsparkPack> {
     }
     let _ = crate::gpu_wgpu::pin_weights(&model, &skeleton);
     eprintln!(
-        "DSpark: пак драфта на карте — {} стадии по {} экспертов + shared",
+        "DSpark: {} — {} стадии по {} экспертов + shared",
+        if global_share {
+            "защищённая доля единого пула"
+        } else {
+            "отдельный пак драфта на карте"
+        },
         stages.len(),
         stages
             .iter()
@@ -9647,7 +9728,7 @@ pub fn dspark_pack_build(mtp: &[Dsv4Mtp], cfg: &Dsv4Cfg) -> Option<DsparkPack> {
     );
     Some(DsparkPack {
         stages,
-        gu_q2,
+        gu_q2: if global_share { false } else { gu_q2 },
         dn_q2: dn_native,
         routers,
         biases,
@@ -9757,6 +9838,11 @@ pub fn dspark_draft_gpu(
             experts: &sp.tensors,
             mask_u32: &sp.mask_u32,
             map_u32: &sp.map_u32,
+            global: sp.global.as_ref().map(|gl| crate::gpu_wgpu::Dsv4GlobalMoe {
+                pool_uid: gl.pool.uid,
+                shared_slot: gl.shared_slot,
+                segment_slots: gl.pool.segment_slots as u32,
+            }),
         });
     }
     let geom = crate::gpu_wgpu::DsparkGeom {

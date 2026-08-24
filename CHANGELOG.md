@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- The DeepSeek-V4 q4tp MTP draft can use a protected `3 × 40 + shared`
+  subset of the unified global expert arena. Its five-position graph now
+  addresses the same descriptor-indexed banks on a batch axis; the old
+  independent draft pack reproduced an A40 OOM after the trunk was loaded.
+
+### Changed
+- Shared-pool speculation is not armed merely because a draft frequency
+  tally exists. The exact zero-knob path measured 2.06–2.45 tok/s; two cold
+  general-mode draft misses reduced the short run to 0.5 tok/s. Explicit
+  `CMF_DSV4_SPEC=1` keeps the diagnostic path available until a held-out
+  acceptance/tok/s profile proves that it pays.
+
+### Fixed
+- Expected DSV4 batch-preflight refusals (the first chunk has not transferred
+  state ownership yet; a one-token tail cannot batch) are debug diagnostics,
+  not warnings. Both cases immediately take the exact fallback and no longer
+  look like generation errors in a normal run.
+
 ## [0.6.2] - 2026-08-24
 
 The first tag whose release binaries actually build: 0.6.0 and 0.6.1
