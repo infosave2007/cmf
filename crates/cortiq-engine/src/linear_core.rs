@@ -38,6 +38,12 @@ pub struct VmfPhaseWeights {
     pub out_proj: QTensor,
     /// Per-component decay exp(−exp(A_log)), len nh·2·nphase (precomputed).
     pub decay: Vec<f64>,
+    /// Short causal depthwise conv before the projections (embryo genomes
+    /// born with `--conv-k`): flat `[hidden·k]` taps, identity-initialised
+    /// at training start. The projections were TRAINED on the conv output —
+    /// running without it scrambles the layer (measured: train-val ppl 60
+    /// exported to runtime ppl 93 539). None = pre-conv genomes, untouched.
+    pub conv: Option<Vec<f32>>,
     /// Selective-write input gate κ (hybrid_k core, stage 71): weight
     /// [nh, hidden] + bias [nh]; κ_h = σ(W_k·x + b)_h multiplies the
     /// state WRITE (S = decay·S + κ·φk⊗v). None = classic phase core,
@@ -134,6 +140,51 @@ fn kappa_of(x: &[f32], w: &VmfPhaseWeights, nh: usize, pool: Option<&Pool>) -> O
     Some(k)
 }
 
+/// Causal depthwise conv over the mixer input, with the last k−1 inputs
+/// ringed at the TAIL of the layer state (oldest first). Returns the
+/// convolved input; a layer without conv taps passes through untouched.
+fn conv_in(
+    x: &[f32],
+    w: &VmfPhaseWeights,
+    cfg: &VmfPhaseCfg,
+    state: &mut Vec<f32>,
+) -> Option<Vec<f32>> {
+    let taps = w.conv.as_ref()?;
+    let h = cfg.hidden_size;
+    let k = taps.len() / h.max(1);
+    if k < 2 || taps.len() != h * k {
+        return None;
+    }
+    let ring = (k - 1) * h;
+    let base = cfg.state_len();
+    if state.len() != base + ring {
+        // The phase part resets alongside — a fresh sequence either way.
+        let mut ns = vec![0f32; base + ring];
+        let n = state.len().min(base);
+        ns[..n].copy_from_slice(&state[..n]);
+        *state = ns;
+    }
+    let mut y = vec![0.0f32; h];
+    for c in 0..h {
+        // taps j = 0..k−2 read the ring (oldest first), tap k−1 reads x.
+        let mut acc = taps[c * k + k - 1] * x[c];
+        for j in 0..k - 1 {
+            acc += taps[c * k + j] * state[base + j * h + c];
+        }
+        y[c] = acc;
+    }
+    conv_ring_push(x, h, base, state);
+    Some(y)
+}
+
+/// Rotate the conv ring at `base`: drop the oldest input, append `x`.
+fn conv_ring_push(x: &[f32], h: usize, base: usize, state: &mut [f32]) {
+    let ring = state.len() - base;
+    state.copy_within(base + h.., base);
+    let at = base + ring - h;
+    state[at..at + h].copy_from_slice(&x[..h]);
+}
+
 /// Forward one position through a vmf_phase layer, advancing `state`.
 pub fn vmf_phase_forward(
     x: &[f32],
@@ -142,9 +193,11 @@ pub fn vmf_phase_forward(
     state: &mut Vec<f32>,
     pool: Option<&Pool>,
 ) -> Vec<f32> {
-    if state.len() != cfg.state_len() {
+    if w.conv.is_none() && state.len() != cfg.state_len() {
         *state = vec![0f32; cfg.state_len()];
     }
+    let xc = conv_in(x, w, cfg, state);
+    let x = xc.as_deref().unwrap_or(x);
     let (nh, nph, dv) = (cfg.num_heads, cfg.nphase, cfg.value_head_dim);
 
     let mut thq = vec![0.0f32; nh * nph];
@@ -177,9 +230,20 @@ pub fn vmf_phase_pair(
     scratch: &mut Vec<f32>,
     pool: Option<&Pool>,
 ) -> (Vec<f32>, Vec<f32>) {
-    if state.len() != cfg.state_len() {
+    if w.conv.is_none() && state.len() != cfg.state_len() {
         *state = vec![0f32; cfg.state_len()];
     }
+    // Lane 1 commits its ring advance into the real state; lane 2 works on
+    // the tentative copy exactly like the phase state itself.
+    let xc1 = conv_in(x1, w, cfg, state);
+    let x1 = xc1.as_deref().unwrap_or(x1);
+    let (xc2, x2raw) = if w.conv.is_some() {
+        let mut tmp = state.clone();
+        (conv_in(x2, w, cfg, &mut tmp), Some(x2))
+    } else {
+        (None, None)
+    };
+    let x2 = xc2.as_deref().unwrap_or(x2);
     let (nh, nph, dv) = (cfg.num_heads, cfg.nphase, cfg.value_head_dim);
 
     let mut thq1 = vec![0.0f32; nh * nph];
@@ -221,6 +285,11 @@ pub fn vmf_phase_pair(
         scratch,
         &mut o2,
     );
+    // The scratch copy above re-took state's ring (advanced only through
+    // x1); commit x2's advance so an accepted draft leaves a correct ring.
+    if let Some(xr) = x2raw {
+        conv_ring_push(xr, cfg.hidden_size, cfg.state_len(), scratch);
+    }
 
     let mut out1 = vec![0.0f32; cfg.hidden_size];
     let mut out2 = vec![0.0f32; cfg.hidden_size];
@@ -1508,6 +1577,7 @@ mod tests {
             decay: (0..cfg.num_heads * 2 * cfg.nphase)
                 .map(|i| 0.9 + 0.005 * (i % 10) as f64)
                 .collect(),
+            conv: None,
             k_gate: None,
         };
         (w, cfg)

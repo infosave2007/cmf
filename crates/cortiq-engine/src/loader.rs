@@ -1004,8 +1004,19 @@ impl Pipeline {
             } else {
                 None
             };
+            // Optional short causal conv (embryo genomes born with
+            // --conv-k): `[hidden, 1, k]` taps, flattened.
+            let conv = if model
+                .tensor(&format!("{prefix}vmf_attn.conv1d.weight"))
+                .is_some()
+            {
+                Some(load_f32(model, &format!("{prefix}vmf_attn.conv1d.weight"), ov).map_err(err)?)
+            } else {
+                None
+            };
             Ok(AttnKind::Linear(VmfPhaseWeights {
                 thq: t("thq.weight")?,
+                conv,
                 thk: t("thk.weight")?,
                 v_proj: t("v_proj.weight")?,
                 out_proj: t("out_proj.weight")?,
