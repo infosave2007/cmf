@@ -11,3 +11,4 @@ __pycache__/
 venv*/
 docs/PERFORMANCE_ROADMAP.ru.md
 .claude/
+tmp/

@@ -8082,6 +8082,120 @@ fn moe_gate_up_q4tp_b(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+// Four output rows share one activation load. Q4TP gate/up is unusually
+// activation-traffic heavy: every row used to reread the same 4096-float
+// vector for both matrices. The per-row accumulation and reduction order
+// stay identical to `moe_gate_up_q4tp_b`; only the loads are hoisted.
+var<workgroup> gb4_pg: array<f32, 64>;
+var<workgroup> gb4_pu: array<f32, 64>;
+
+fn gb_dot8v(w: u32, a: vec4<f32>, b: vec4<f32>) -> f32 {
+    return (f32(w & 0xFu) - 8.0) * a.x
+         + (f32((w >> 4u) & 0xFu) - 8.0) * a.y
+         + (f32((w >> 8u) & 0xFu) - 8.0) * a.z
+         + (f32((w >> 12u) & 0xFu) - 8.0) * a.w
+         + (f32((w >> 16u) & 0xFu) - 8.0) * b.x
+         + (f32((w >> 20u) & 0xFu) - 8.0) * b.y
+         + (f32((w >> 24u) & 0xFu) - 8.0) * b.z
+         + (f32((w >> 28u) & 0xFu) - 8.0) * b.w;
+}
+
+@compute @workgroup_size(64)
+fn moe_gate_up_q4tp_b_r4(@builtin(workgroup_id) wid: vec3<u32>,
+                         @builtin(local_invocation_index) lid: u32) {
+    let row0 = wid.x * 4u;
+    let slot = wid.y;
+    let t = wid.z;
+    let gpr = gb_p.gpr;
+    let rows = gb_p.inter;
+    let hidden = gpr * 32u;
+    let xoff = t * hidden;
+    let base16 = gb_sel[t * gb_p.slots + slot] * gb_p.mat16;
+    let cst = (gpr * 5u + 7u) / 8u;
+    let cod0 = (base16 + rows * gpr * 8u + rows * 2u) * 2u;
+    var ag0 = 0.0; var au0 = 0.0;
+    var ag1 = 0.0; var au1 = 0.0;
+    var ag2 = 0.0; var au2 = 0.0;
+    var ag3 = 0.0; var au3 = 0.0;
+    for (var g = lid; g < gpr; g = g + 64u) {
+        let xb = xoff + g * 32u;
+        let x0a = vec4<f32>(gb_x[xb],      gb_x[xb + 1u],  gb_x[xb + 2u],  gb_x[xb + 3u]);
+        let x0b = vec4<f32>(gb_x[xb + 4u], gb_x[xb + 5u],  gb_x[xb + 6u],  gb_x[xb + 7u]);
+        let x1a = vec4<f32>(gb_x[xb + 8u], gb_x[xb + 9u],  gb_x[xb + 10u], gb_x[xb + 11u]);
+        let x1b = vec4<f32>(gb_x[xb + 12u],gb_x[xb + 13u], gb_x[xb + 14u], gb_x[xb + 15u]);
+        let x2a = vec4<f32>(gb_x[xb + 16u],gb_x[xb + 17u], gb_x[xb + 18u], gb_x[xb + 19u]);
+        let x2b = vec4<f32>(gb_x[xb + 20u],gb_x[xb + 21u], gb_x[xb + 22u], gb_x[xb + 23u]);
+        let x3a = vec4<f32>(gb_x[xb + 24u],gb_x[xb + 25u], gb_x[xb + 26u], gb_x[xb + 27u]);
+        let x3b = vec4<f32>(gb_x[xb + 28u],gb_x[xb + 29u], gb_x[xb + 30u], gb_x[xb + 31u]);
+        let bit = g * 5u;
+        let cb = bit >> 3u;
+        let shf = bit & 7u;
+        for (var r = 0u; r < 4u; r = r + 1u) {
+            let row = row0 + r;
+            if (row >= rows) { break; }
+            let par16 = base16 + rows * gpr * 8u + row * 2u;
+            // All Q4TP row/group offsets are even u16 indices. Read each
+            // packed word once; the scalar helper otherwise issues two
+            // storage lookups for its low and high halves.
+            let gl = unpack2x16float(gb_gw[par16 >> 1u]);
+            let ul = unpack2x16float(gb_uw[par16 >> 1u]);
+            let cod8 = cod0 + row * cst;
+            var cg = gb_gu8(cod8 + cb);
+            var cu = gb_uu8(cod8 + cb);
+            if (shf > 3u) {
+                cg = cg | (gb_gu8(cod8 + cb + 1u) << 8u);
+                cu = cu | (gb_uu8(cod8 + cb + 1u) << 8u);
+            }
+            let sg = exp2(gl.x + f32((cg >> shf) & 31u) * gl.y);
+            let su = exp2(ul.x + f32((cu >> shf) & 31u) * ul.y);
+            let t16 = base16 + row * gpr * 8u + g * 8u;
+            let w32 = t16 >> 1u;
+            let wg0 = gb_gw[w32];      let wu0 = gb_uw[w32];
+            let wg1 = gb_gw[w32 + 1u]; let wu1 = gb_uw[w32 + 1u];
+            let wg2 = gb_gw[w32 + 2u]; let wu2 = gb_uw[w32 + 2u];
+            let wg3 = gb_gw[w32 + 3u]; let wu3 = gb_uw[w32 + 3u];
+            let dg = gb_dot8v(wg0, x0a, x0b) + gb_dot8v(wg1, x1a, x1b)
+                   + gb_dot8v(wg2, x2a, x2b) + gb_dot8v(wg3, x3a, x3b);
+            let du = gb_dot8v(wu0, x0a, x0b) + gb_dot8v(wu1, x1a, x1b)
+                   + gb_dot8v(wu2, x2a, x2b) + gb_dot8v(wu3, x3a, x3b);
+            if (r == 0u) { ag0 = ag0 + sg * dg; au0 = au0 + su * du; }
+            if (r == 1u) { ag1 = ag1 + sg * dg; au1 = au1 + su * du; }
+            if (r == 2u) { ag2 = ag2 + sg * dg; au2 = au2 + su * du; }
+            if (r == 3u) { ag3 = ag3 + sg * dg; au3 = au3 + su * du; }
+        }
+    }
+    for (var r = 0u; r < 4u; r = r + 1u) {
+        var ag = ag0; var au = au0;
+        if (r == 1u) { ag = ag1; au = au1; }
+        if (r == 2u) { ag = ag2; au = au2; }
+        if (r == 3u) { ag = ag3; au = au3; }
+        gb4_pg[lid] = ag;
+        gb4_pu[lid] = au;
+        workgroupBarrier();
+        var stride = 32u;
+        loop {
+            if (stride == 0u) { break; }
+            if (lid < stride) {
+                gb4_pg[lid] = gb4_pg[lid] + gb4_pg[lid + stride];
+                gb4_pu[lid] = gb4_pu[lid] + gb4_pu[lid + stride];
+            }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        if (lid == 0u && row0 + r < rows) {
+            var gg = gb4_pg[0];
+            var uu = gb4_pu[0];
+            if (gb_p.lim > 0.0) {
+                uu = clamp(uu, -gb_p.lim, gb_p.lim);
+                gg = min(gg, gb_p.lim);
+            }
+            gb_act[(t * gb_p.slots + slot) * gb_p.inter + row0 + r] =
+                (gg / (1.0 + exp(-gg))) * uu;
+        }
+        workgroupBarrier();
+    }
+}
+
 // Weighted down-projection with a token axis; writes STRAIGHT into the
 // batch FFN output at the token's row — no staging row, no copy back.
 struct MoeDnBP { gpr: u32, hidden: u32, slots: u32, mat16: u32 };
@@ -9755,8 +9869,8 @@ fn moe_route(@builtin(local_invocation_index) lid: u32) {
         rt_w[lid] = 0.0;
         rt_cold[2u * lid] = 0xFFFFFFFFu;
         rt_cold[2u * lid + 1u] = 0u;
-        // Diagnostic mirror, second half: every winner regardless of where it
-        // lives. Nothing reads it but a human, so it cannot change an answer.
+        // Route-statistics mirror, second half: every global winner and its
+        // normalized PRE-bias route weight, regardless of where it lives.
         rt_cold[2u * k + 2u * lid] = 0xFFFFFFFFu;
         rt_cold[2u * k + 2u * lid + 1u] = 0u;
     }
@@ -9794,6 +9908,8 @@ fn moe_route(@builtin(local_invocation_index) lid: u32) {
             let e = rt_forced[lid];
             var w = 0.0;
             if (e < n) { w = rt_sc[e]; }
+            rt_cold[2u * k + 2u * lid] = e;
+            rt_cold[2u * k + 2u * lid + 1u] = bitcast<u32>(w);
             if (subset && e < n) {
                 let slot = rt_map[e];
                 if (slot == 0xFFFFFFFFu) {
@@ -9827,7 +9943,7 @@ fn moe_route(@builtin(local_invocation_index) lid: u32) {
                 if (rank < k) {
                     rt_used[rank] = 1u;
                     rt_cold[2u * k + 2u * rank] = m;
-                    rt_cold[2u * k + 2u * rank + 1u] = bitcast<u32>(rt_sh[m]);
+                    rt_cold[2u * k + 2u * rank + 1u] = bitcast<u32>(rt_sc[m]);
                     // What the kernel believes it was handed, in the slots the
                     // winners do not use.
                     if (subset) {
@@ -9887,6 +10003,8 @@ fn moe_route(@builtin(local_invocation_index) lid: u32) {
                     rt_cold[2u * j + 1u] =
                         bitcast<u32>(bitcast<f32>(rt_cold[2u * j + 1u]) * inv);
                 }
+                rt_cold[2u * k + 2u * j + 1u] =
+                    bitcast<u32>(bitcast<f32>(rt_cold[2u * k + 2u * j + 1u]) * inv);
             }
         }
         // The shared expert is not part of that normalisation — it rides at
@@ -10723,6 +10841,8 @@ fn bt_moe_route(@builtin(workgroup_id) wid: vec3<u32>,
             let e = bt_forced[t * k + lid];
             var w = 0.0;
             if (e < n) { w = btr_sc[e]; }
+            bt_cold[cb + 2u * k + 2u * lid] = e;
+            bt_cold[cb + 2u * k + 2u * lid + 1u] = bitcast<u32>(w);
             if (subset && e < n) {
                 let slot = bt_map[e];
                 if (slot == 0xFFFFFFFFu) {
@@ -10756,7 +10876,7 @@ fn bt_moe_route(@builtin(workgroup_id) wid: vec3<u32>,
                 if (rank < k) {
                     btr_used[rank] = 1u;
                     bt_cold[cb + 2u * k + 2u * rank] = m;
-                    bt_cold[cb + 2u * k + 2u * rank + 1u] = bitcast<u32>(btr_sh[m]);
+                    bt_cold[cb + 2u * k + 2u * rank + 1u] = bitcast<u32>(btr_sc[m]);
                     if (subset) {
                         let slot = bt_map[m];
                         if (slot == 0xFFFFFFFFu) {
@@ -10800,6 +10920,8 @@ fn bt_moe_route(@builtin(workgroup_id) wid: vec3<u32>,
                     bt_cold[cb + 2u * j + 1u] =
                         bitcast<u32>(bitcast<f32>(bt_cold[cb + 2u * j + 1u]) * inv);
                 }
+                bt_cold[cb + 2u * k + 2u * j + 1u] =
+                    bitcast<u32>(bitcast<f32>(bt_cold[cb + 2u * k + 2u * j + 1u]) * inv);
             }
         }
     }
@@ -12648,6 +12770,7 @@ struct Ctx {
     gdn_step_norm_k: wgpu::ComputePipeline,
     gdn_step_k: wgpu::ComputePipeline,
     moe_gate_up_q4tp_b: wgpu::ComputePipeline,
+    moe_gate_up_q4tp_b_r4: wgpu::ComputePipeline,
     moe_down_q4tp_b: wgpu::ComputePipeline,
     moe_down_q4tp_b2: wgpu::ComputePipeline,
     moe_down_q4tp_part: wgpu::ComputePipeline,
@@ -13386,19 +13509,16 @@ fn init(dev: usize) -> Result<Ctx, String> {
             match vulkan_vram_total(&adapter) {
                 Some(total) => {
                     let gib = 1024 * 1024 * 1024u64;
-                    // Weights are not the only thing on the card. The pooled
-                    // scratch, the activation panels, the readback staging and
-                    // the VAE's own buffers all live beside them, and a video
-                    // render's working set is gigabytes — so the budget cannot
-                    // be "the heap minus the driver's bookkeeping".
-                    //
-                    // It used to be exactly that, and it survived only because
-                    // every published container's weights were far under it.
-                    // A 26 GB q8_2f build on a 32 GB card took the whole heap
-                    // and then died in the first scratch allocation with
-                    // `wgpu error: Out of Memory` — the residency cache does
-                    // its own eviction, but nothing was left for the caller.
-                    total - (total / 4).clamp(gib, 8 * gib).min(total / 2)
+                    // Weights are not the only thing on the card, but the old
+                    // 25%-with-an-8-GiB-cap rule stranded almost a fifth of an
+                    // A40 before the model geometry was even known. The DSV4
+                    // packer already reserves its draft and workspace, while
+                    // the residency cache evicts for other workloads. Keep a
+                    // small physical margin here: one GiB on 32-GiB cards,
+                    // scaling to two GiB on large discrete cards. An operator
+                    // with an unusually large render/KV workspace can still
+                    // lower the weight ceiling through CMF_GPU_VRAM_MB.
+                    total - (total / 32).clamp(gib, 2 * gib).min(total / 2)
                 }
                 None => 8 * 1024 * 1024 * 1024,
             }
@@ -13833,6 +13953,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let gdn_step_norm_k = pipe("gdn_step_norm_k");
     let gdn_step_k = pipe("gdn_step_k");
     let moe_gate_up_q4tp_b = pipe("moe_gate_up_q4tp_b");
+    let moe_gate_up_q4tp_b_r4 = pipe("moe_gate_up_q4tp_b_r4");
     let moe_down_q4tp_b = pipe("moe_down_q4tp_b");
     let moe_down_q4tp_b2 = pipe("moe_down_q4tp_b2");
     let moe_down_q4tp_part = pipe("moe_down_q4tp_part");
@@ -14146,6 +14267,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         gdn_step_norm_k,
         gdn_step_k,
         moe_gate_up_q4tp_b,
+        moe_gate_up_q4tp_b_r4,
         moe_down_q4tp_b,
         moe_down_q4tp_b2,
         moe_down_q4tp_part,
@@ -33640,7 +33762,9 @@ fn encode_moe_chain_p(
     slots: usize,
     bkey: (u64, usize),
 ) {
-    let subset = n_route > n_pack && w.moe.remap.is_some();
+    // `remap` also matters for a full hot-first permutation: every expert is
+    // resident, but global router id N need not live in slot N.
+    let subset = w.moe.remap.is_some();
     // The bias now lives in the PACK, whose address is stable for the life
     // of the process — so the const cache is sound for it, and each layer
     // gets its own device buffer. The per-call pool here was the many-layer
@@ -33649,7 +33773,10 @@ fn encode_moe_chain_p(
         Some(b) if b.len() >= n_route => const_buf(c, bytemuck::cast_slice(&b[..n_route])),
         _ => logits.clone(),
     };
-    let mk = frame_buf(c, 17, n_pack * 4, true);
+    let mk = match w.moe.mask {
+        Some(m) if m.len() >= n_route => const_buf(c, bytemuck::cast_slice(&m[..n_route])),
+        _ => frame_buf(c, 17, n_route.max(1) * 4, true),
+    };
     // Per-layer, not pooled: a run holding two hash layers wrote both lists
     // into one buffer before the single submit, and both routed with the
     // second one's experts.
@@ -33661,6 +33788,7 @@ fn encode_moe_chain_p(
         _ => store_slot(c, 18, bkey.0, bkey.1, &vec![0u8; g.top_k * 4]),
     };
     let rflags = (w.moe.bias.is_some_and(|b| b.len() >= n_route) as u32)
+        | ((w.moe.mask.is_some_and(|m| m.len() >= n_route) as u32) << 1)
         | ((w.moe.forced.is_some_and(|f| f.len() >= g.top_k) as u32) << 2)
         | 8
         | ((subset as u32) << 4)
@@ -33699,9 +33827,15 @@ fn encode_moe_chain_p(
     // Four rows to a workgroup where the layout allows it: the columns give
     // gpr = 128, so a row cannot use more than 64 lanes, and the only width
     // left is overlap between rows. CMF_DSV4_MOE4=0 reverts.
+    let gu_r4 = g.inter % 4 == 0 && bt_gu_r4_on();
     let (p_gu, p_dn, _l_gu, _l_dn) = if g.gu_q2 {
         (
-            if moe4() {
+            if gu_r4 {
+                // The token-axis kernel is also the one-token kernel at z=0:
+                // four q2tp rows share each activation load instead of four
+                // 64-lane subgroups rereading it independently.
+                &c.bt_moe_gate_up_q2tp_r4
+            } else if moe4() {
                 &c.moe_gu_q2tp_m
             } else {
                 &c.moe_gate_up_q2tp
@@ -33716,7 +33850,11 @@ fn encode_moe_chain_p(
         )
     } else {
         (
-            &c.moe_gate_up_q4tp_b,
+            if gu_r4 {
+                &c.moe_gate_up_q4tp_b_r4
+            } else {
+                &c.moe_gate_up_q4tp_b
+            },
             &c.moe_down_q4tp_b,
             &c.layout_moe_gu_b,
             &c.layout_moe_dn_b,
@@ -33810,7 +33948,11 @@ fn encode_moe_chain_p(
     if !dsv4_skip("gu") {
         pass.set_pipeline(p_gu);
         pass.set_bind_group(0, &bg_gu, &[]);
-        let gu_per_wg = if g.gu_q2 && moe4() { 4u32 } else { 1u32 };
+        let gu_per_wg = if gu_r4 || (g.gu_q2 && moe4()) {
+            4u32
+        } else {
+            1u32
+        };
         pass.dispatch_workgroups((g.inter as u32).div_ceil(gu_per_wg), slots as u32, 1);
     }
     if !dsv4_skip("dn") {
@@ -35105,7 +35247,7 @@ fn dsv4_chain_batch_bt(
         TS_PAIRS.lock().unwrap().clear();
     }
     let t_enc = std::time::Instant::now();
-    // `CMF_DSV4_CHAIN_SPLIT=N` (default 4): submit the chain in N pieces so
+    // `CMF_DSV4_CHAIN_SPLIT=N`: submit the chain in N pieces so
     // the card starts the first layers while the host still encodes the
     // rest. Same queue, same order — the split changes when work is handed
     // over, never what it computes. N=1 restores the single submission.
@@ -35116,7 +35258,15 @@ fn dsv4_chain_batch_bt(
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .filter(|&n| n >= 1)
-                .unwrap_or(4)
+                // Ampere/Ada-sized budgets benefit from shorter recordings;
+                // the 96 GB class pays more for the extra submissions. The
+                // configured budget is also the right signal for an emulated
+                // smaller card and avoids a device-name table.
+                .unwrap_or(if c.vram_budget <= 64 * 1024 * 1024 * 1024 {
+                    8
+                } else {
+                    4
+                })
         })
     };
     let chunk = layers.len().div_ceil(split_n).max(1);
@@ -35201,7 +35351,10 @@ fn dsv4_chain_batch_bt(
         // target layers, every token, for the host to read after acceptance.
         if let Some(slot) = caps.iter().position(|&t| t == first_li + i) {
             let hcd = g0.hc * dim;
-            let cap = frame_buf_t(c, BT_CAP, 0, caps.len() * batch * hcd * 4, false);
+            // Partial layers may replace this photograph after exact host
+            // cold-expert correction, so the shared capture buffer must also
+            // accept queue writes.
+            let cap = frame_buf_t(c, BT_CAP, 0, caps.len() * batch * hcd * 4, true);
             let mut pass = begin_pass(&mut enc);
             encode_blit_p(
                 &mut pass,
@@ -35364,6 +35517,18 @@ fn bt_dn_mode() -> u8 {
         Ok("b2") => 1,
         Ok("split") => 2,
         _ => 3,
+    })
+}
+
+/// Four Q4TP/Q2TP gate+up rows share one activation span. Enabled by
+/// default; `CMF_DSV4_GU_R4=0` keeps the one-row kernel for parity and
+/// performance A/B on new adapters.
+fn bt_gu_r4_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("CMF_DSV4_GU_R4")
+            .map(|v| v != "0")
+            .unwrap_or(true)
     })
 }
 
@@ -36113,12 +36278,15 @@ pub fn dspark_graph(
                     stride16(dim, g.inter, g.dn_q2),
                 ],
             );
+            let gu_r4 = g.inter % 4 == 0 && bt_gu_r4_on();
             let p_gu = if g.gu_q2 {
-                if g.inter % 4 == 0 {
+                if gu_r4 {
                     &c.bt_moe_gate_up_q2tp_r4
                 } else {
                     &c.bt_moe_gate_up_q2tp
                 }
+            } else if gu_r4 {
+                &c.moe_gate_up_q4tp_b_r4
             } else {
                 &c.moe_gate_up_q4tp_b
             };
@@ -36138,7 +36306,7 @@ pub fn dspark_graph(
             });
             pass.set_pipeline(p_gu);
             pass.set_bind_group(0, &bind, &[]);
-            let gx = if g.gu_q2 && g.inter % 4 == 0 {
+            let gx = if gu_r4 {
                 (g.inter as u32).div_ceil(4)
             } else {
                 g.inter as u32
@@ -36286,7 +36454,7 @@ pub fn dsv4_spec_cap_read_all(batch: usize, n_caps: usize, hc_dim: usize, out: &
         return true;
     }
     let Some(c) = ctx() else { return false };
-    let cap = frame_buf_t(c, BT_CAP, 0, n_caps * batch * hc_dim * 4, false);
+    let cap = frame_buf_t(c, BT_CAP, 0, n_caps * batch * hc_dim * 4, true);
     let bytes = (n_caps * batch * hc_dim * 4) as u64;
     let mut sc = c.scratch.lock().unwrap();
     let stage = Scratch::ensure(
@@ -36324,7 +36492,7 @@ pub fn dsv4_spec_cap_read(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
-    let cap = frame_buf_t(c, BT_CAP, 0, n_caps * batch * hc_dim * 4, false);
+    let cap = frame_buf_t(c, BT_CAP, 0, n_caps * batch * hc_dim * 4, true);
     let bytes = (hc_dim * 4) as u64;
     let mut sc = c.scratch.lock().unwrap();
     let stage = Scratch::ensure(
@@ -36867,16 +37035,16 @@ fn dsv4_layer_frame_bt_enc(
     let ffn_sc = const_buf(c, bytemuck::cast_slice(w.hc_ffn_scale));
     let ffn_bs = const_buf(c, bytemuck::cast_slice(&w.hc_ffn_base[..mix_hc]));
     let ffn_nw = const_buf(c, bytemuck::cast_slice(&w.ffn_norm[..dim]));
-    let n_exp = w.moe.experts.len().saturating_sub(1);
-    if w.router.len() < m.hidden * n_exp {
-        no!("роутер короче {} × {}", n_exp, m.hidden);
+    let n_pack = w.moe.experts.len().saturating_sub(1);
+    let n_route = w.moe.remap.map_or(n_pack, |r| r.len().max(n_pack));
+    if w.router.len() < m.hidden * n_route {
+        no!("роутер короче {} × {}", n_route, m.hidden);
     }
-    let router = const_buf(c, bytemuck::cast_slice(&w.router[..m.hidden * n_exp]));
+    let router = const_buf(c, bytemuck::cast_slice(&w.router[..m.hidden * n_route]));
     let next_nw = const_buf(c, bytemuck::cast_slice(&w.next_norm[..dim]));
     let next_qn = const_buf(c, bytemuck::cast_slice(&w.next_q_norm[..a.q_lora]));
 
     // ── strided working buffers ──
-    let n_pack = n_exp;
     let slots = m.top_k + 1;
     let fb = |tag: u8, len: usize, upload: bool| frame_buf_t(c, tag, 0, batch * len * 4, upload);
     let state_bt = fb(BT_STATE, hc * dim, true);
@@ -36891,7 +37059,7 @@ fn dsv4_layer_frame_bt_enc(
     let hpost_bt = fb(BT_HPOST, hc, true);
     let hcomb_bt = fb(BT_HCOMB, hc * hc, true);
     let state2_bt = fb(BT_STATE2, hc * dim, false);
-    let logit_bt = fb(BT_LOGIT, n_pack, false);
+    let logit_bt = fb(BT_LOGIT, n_route, false);
     let msel_bt = fb(BT_MSEL, slots, false);
     let mwt_bt = fb(BT_MWT, slots, false);
     let mcnt_bt = fb(BT_MCNT, 1, false);
@@ -37813,13 +37981,13 @@ fn dsv4_layer_frame_bt_enc(
             pass = begin_pass(enc);
         }
         {
-            let pipe = if n_pack < 64 {
+            let pipe = if n_route < 64 {
                 &c.bt_f32_matvec_x
             } else {
                 &c.bt_f32_matvec_w
             };
             let bind = cached_bind(c, bk(217), || {
-                let p = uniform_u32x4(c, [m.hidden as u32, n_pack as u32, 0, 0]);
+                let p = uniform_u32x4(c, [m.hidden as u32, n_route as u32, 0, 0]);
                 c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: None,
                     layout: &pipe.get_bind_group_layout(0),
@@ -37833,23 +38001,36 @@ fn dsv4_layer_frame_bt_enc(
             });
             pass.set_pipeline(pipe);
             pass.set_bind_group(0, &bind, &[]);
-            pass.dispatch_workgroups(n_pack as u32, batch as u32, 1);
+            pass.dispatch_workgroups(n_route as u32, batch as u32, 1);
         }
         // ...route, gate/up, down...
         let bs = match w.moe.bias {
-            Some(b) if b.len() >= n_pack => const_buf(c, bytemuck::cast_slice(&b[..n_pack])),
+            Some(b) if b.len() >= n_route => const_buf(c, bytemuck::cast_slice(&b[..n_route])),
             _ => logit_bt.clone(),
         };
-        let rflags = (w.moe.bias.is_some_and(|b| b.len() >= n_pack) as u32)
+        let subset = w.moe.remap.is_some();
+        let rflags = (w.moe.bias.is_some_and(|b| b.len() >= n_route) as u32)
+            | ((w.moe.mask.is_some_and(|m| m.len() >= n_route) as u32) << 1)
             | ((has_forced as u32) << 2)
             | 8
+            | ((subset as u32) << 4)
             | ((n_pack as u32) << 8);
-        let mk = frame_buf(c, 17, n_pack * 4, true);
-        let rmap = frame_buf(c, 26, n_pack.max(1) * 4, true);
+        let mk = match w.moe.mask {
+            Some(mask) if mask.len() >= n_route => {
+                const_buf(c, bytemuck::cast_slice(&mask[..n_route]))
+            }
+            _ => frame_buf(c, 17, n_route.max(1) * 4, true),
+        };
+        let rmap = match w.moe.remap {
+            Some(remap) if remap.len() >= n_route => {
+                const_buf(c, bytemuck::cast_slice(&remap[..n_route]))
+            }
+            _ => frame_buf(c, 26, n_route.max(1) * 4, true),
+        };
         let cold = fb(203, 4 * m.top_k, false);
         {
             let bind = cached_bind(c, bk(218), || {
-                let rp = uniform_mixed(c, [n_pack as u32, m.top_k as u32, rflags], m.route_scale);
+                let rp = uniform_mixed(c, [n_route as u32, m.top_k as u32, rflags], m.route_scale);
                 c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: None,
                     layout: &c.bt_moe_route.get_bind_group_layout(0),
@@ -37903,12 +38084,15 @@ fn dsv4_layer_frame_bt_enc(
                 stride16(m.hidden, m.inter, false),
             ],
         );
+        let gu_r4 = m.inter % 4 == 0 && bt_gu_r4_on();
         let p_gu = if m.gu_q2 {
-            if m.inter % 4 == 0 {
+            if gu_r4 {
                 &c.bt_moe_gate_up_q2tp_r4
             } else {
                 &c.bt_moe_gate_up_q2tp
             }
+        } else if gu_r4 {
+            &c.moe_gate_up_q4tp_b_r4
         } else {
             &c.moe_gate_up_q4tp_b
         };
@@ -37934,7 +38118,7 @@ fn dsv4_layer_frame_bt_enc(
         if !dsv4_skip("gu") && !dsv4_skip("moe") {
             pass.set_pipeline(p_gu);
             pass.set_bind_group(0, &bind, &[]);
-            let gx = if m.gu_q2 && m.inter % 4 == 0 {
+            let gx = if gu_r4 {
                 (m.inter as u32).div_ceil(4)
             } else {
                 m.inter as u32
@@ -38211,6 +38395,190 @@ pub static CHAIN_LAYERS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 /// layer kind is still breaking the chain into pieces.
 pub static CHAIN_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Exact hand-off from one token-axis partial layer.  Resident experts have
+/// already been expanded into `states`; `cold` names only the routed winners
+/// absent from the pack, and `cold_x` is the corresponding normalized FFN
+/// input.  The host computes those few experts, adds `posts[j] * cold`, then
+/// seeds the next layer.  No routing restriction is involved.
+pub struct Dsv4PartialBatchOut {
+    pub states: Vec<f32>,
+    pub cold_x: Vec<f32>,
+    pub posts: Vec<f32>,
+    pub cold: Vec<Vec<(usize, f32)>>,
+    /// Exact global top-k selected by the device, per token.  The caller uses
+    /// the guaranteed-accepted first row to keep the live LRU pack in step
+    /// with ordinary sequential decode.
+    pub routed: Vec<Vec<usize>>,
+}
+
+/// Run one partial layer over the token axis and return everything needed to
+/// make its cold correction before the next dependent layer.  This is the
+/// missing middle ground between a complete fused chain and the old all-host
+/// tail: attention and resident experts stay batched on the device, while
+/// exact cold experts are completed from the checkpoint on the host.
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_layer_batch_partial(
+    model: &Arc<CmfModel>,
+    w: &Dsv4LayerW,
+    g: Dsv4LayerGeom,
+    kv_id: u64,
+    li: usize,
+    batch: usize,
+    preps: &[Dsv4Prep],
+    forced_rows: Option<&[Option<Vec<usize>>]>,
+    inv_freq: &[f32],
+    pos0: usize,
+) -> Option<Dsv4PartialBatchOut> {
+    let c = ctx()?;
+    if batch == 0 || batch > FRAME_TOK_STRIDE || w.moe.remap.is_none() || w.hc_next_fn.is_some() {
+        return None;
+    }
+    let (hc, dim, top_k) = (g.hc, g.attn.dim, g.moe.top_k);
+    if let Some((_, _, _, ixg)) = preps.first()?.ix.as_ref() {
+        let need = preps
+            .iter()
+            .map(|p| p.n_ix)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(2);
+        dsv4_index_cache(kv_id, li, ixg.idim * need)?;
+    }
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("dsv4-partial-batch"),
+        });
+
+    // Replay after a rejected speculative suffix needs the exact input of
+    // every layer.  It is live in BT_X2 before this frame overwrites that
+    // buffer with the FFN-normalized input used by the cold experts.
+    let (retain_n, _) = SPEC_RETAIN.with(|v| v.borrow().clone());
+    if retain_n > li {
+        let x2_bt = frame_buf_t(c, BT_X2, 0, batch * dim * 4, true);
+        let retain = frame_buf_t(c, BT_RETAIN, 0, retain_n * batch * dim * 4, false);
+        let mut pass = begin_pass(&mut enc);
+        encode_blit_p(
+            &mut pass,
+            c,
+            &x2_bt,
+            &retain,
+            batch * dim,
+            0,
+            li * batch * dim,
+            None,
+        );
+    }
+
+    let (_, state_bt) = dsv4_layer_frame_bt_enc(
+        model,
+        w,
+        g,
+        kv_id,
+        li,
+        batch,
+        preps,
+        forced_rows,
+        inv_freq,
+        pos0,
+        &mut enc,
+    )?;
+    let x2_bt = frame_buf_t(c, BT_X2, 0, batch * dim * 4, true);
+    let post_bt = frame_buf_t(c, BT_HPOST, 0, batch * hc * 4, true);
+    let cold_bt = frame_buf_t(c, 203, 0, batch * 4 * top_k * 4, false);
+
+    let state_bytes = batch * hc * dim * 4;
+    let x_bytes = batch * dim * 4;
+    let post_bytes = batch * hc * 4;
+    let cold_bytes = batch * 4 * top_k * 4;
+    let total = state_bytes + x_bytes + post_bytes + cold_bytes;
+    let mut sc = c.scratch.lock().unwrap();
+    let stage = Scratch::ensure(
+        &c.device,
+        &mut sc.stage,
+        total as u64,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "dsv4-partial-batch-stage",
+    );
+    flush_pass(&enc);
+    let mut off = 0u64;
+    for (src, n) in [
+        (&state_bt, state_bytes),
+        (&x2_bt, x_bytes),
+        (&post_bt, post_bytes),
+        (&cold_bt, cold_bytes),
+    ] {
+        enc.copy_buffer_to_buffer(src, 0, &stage, off, n as u64);
+        off += n as u64;
+    }
+    submit(c, finish_enc(enc));
+    let slice = stage.slice(..total as u64);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    c.device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
+    let data = slice.get_mapped_range().ok()?;
+    let mut at = 0usize;
+    let mut take_f32 = |n: usize| {
+        let end = at + n * 4;
+        let out: Vec<f32> = bytemuck::cast_slice(&data[at..end]).to_vec();
+        at = end;
+        out
+    };
+    let states = take_f32(batch * hc * dim);
+    let cold_x = take_f32(batch * dim);
+    let posts = take_f32(batch * hc);
+    let cold_words: &[u32] = bytemuck::cast_slice(&data[at..at + cold_bytes]);
+    let mut cold = vec![Vec::new(); batch];
+    let mut routed = vec![Vec::new(); batch];
+    for t in 0..batch {
+        let row = &cold_words[t * 4 * top_k..(t + 1) * 4 * top_k];
+        for slot in 0..top_k {
+            let ei = row[2 * slot];
+            if ei != u32::MAX {
+                cold[t].push((ei as usize, f32::from_bits(row[2 * slot + 1])));
+            }
+            let global = row[2 * top_k + 2 * slot];
+            if global != u32::MAX {
+                routed[t].push(global as usize);
+            }
+        }
+    }
+    drop(data);
+    stage.unmap();
+    drop(sc);
+    Some(Dsv4PartialBatchOut {
+        states,
+        cold_x,
+        posts,
+        cold,
+        routed,
+    })
+}
+
+/// Replace one armed capture photograph with an exact host-corrected batch.
+/// Queue writes are ordered after the partial layer's readback fence and
+/// before the eventual capture read, so no extra submission is needed.
+pub fn dsv4_spec_cap_write_host(
+    li: usize,
+    batch: usize,
+    hc_dim: usize,
+    states: &[f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let (_, caps) = SPEC_RETAIN.with(|v| v.borrow().clone());
+    let Some(slot) = caps.iter().position(|&x| x == li) else {
+        return true;
+    };
+    if states.len() < batch * hc_dim {
+        return false;
+    }
+    let cap = frame_buf_t(c, BT_CAP, 0, caps.len() * batch * hc_dim * 4, true);
+    c.queue.write_buffer(
+        &cap,
+        ((slot * batch * hc_dim) * 4) as u64,
+        bytemuck::cast_slice(&states[..batch * hc_dim]),
+    );
+    true
+}
+
 /// One layer, submitted on its own and read back — the shape the two-frame
 /// path and the current layer loop use.
 #[allow(clippy::too_many_arguments)]
@@ -38230,6 +38598,13 @@ pub fn dsv4_layer_frame(
     // the state the correction (`dsv4_state_add_cold`). None keeps the
     // full-pack contract: every winner resident, nothing to return.
     mut cold_out: Option<&mut Vec<(usize, f32)>>,
+    // The route shader already mirrors every GLOBAL winner and its normalized
+    // weight into the second half of its cold buffer. Stats consume that
+    // mirror from the same readback/fence; there is no diagnostic submission
+    // on the hot path. Keeping the weight matters: mask `cover` is output
+    // mass, not a vote count where the weakest and strongest top-k routes are
+    // treated as equal.
+    mut route_out: Option<&mut Vec<(usize, f32)>>,
     cold_x_out: &mut Vec<f32>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
@@ -38248,12 +38623,13 @@ pub fn dsv4_layer_frame(
         return false;
     };
     let cold_bytes = (4 * g.moe.top_k * 4) as u64;
-    let total = (dim * 4) as u64
-        + if cold_out.is_some() {
-            cold_bytes + (dim * 4) as u64 // + the normed FFN input for the host completion
-        } else {
-            0
-        };
+    let read_route = cold_out.is_some() || route_out.is_some();
+    let x_bytes = if cold_out.is_some() {
+        (dim * 4) as u64
+    } else {
+        0
+    };
+    let total = (dim * 4) as u64 + if read_route { cold_bytes + x_bytes } else { 0 };
     let mut sc = c.scratch.lock().unwrap();
     let stage = Scratch::ensure(
         &c.device,
@@ -38262,7 +38638,7 @@ pub fn dsv4_layer_frame(
         wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         "dsv4-layer-stage",
     );
-    if let Some(cold_out) = cold_out.as_deref_mut() {
+    if read_route {
         // The cold list rides the same staging and the same fence as the
         // fold — one barrier pays for both, exactly like the two-frame path.
         enc.copy_buffer_to_buffer(&folded, 0, &stage, 0, (dim * 4) as u64);
@@ -38272,13 +38648,15 @@ pub fn dsv4_layer_frame(
             frame_buf(c, 27, 4 * g.moe.top_k * 4, false)
         };
         enc.copy_buffer_to_buffer(&cold_src, 0, &stage, (dim * 4) as u64, cold_bytes);
-        enc.copy_buffer_to_buffer(
-            &frame_buf_t(c, 45, 0, dim * 4, true),
-            0,
-            &stage,
-            (dim * 4) as u64 + cold_bytes,
-            (dim * 4) as u64,
-        );
+        if x_bytes > 0 {
+            enc.copy_buffer_to_buffer(
+                &frame_buf_t(c, 45, 0, dim * 4, true),
+                0,
+                &stage,
+                (dim * 4) as u64 + cold_bytes,
+                x_bytes,
+            );
+        }
         submit(c, finish_enc(enc));
         let slice = stage.slice(..total);
         slice.map_async(wgpu::MapMode::Read, |_| {});
@@ -38290,14 +38668,29 @@ pub fn dsv4_layer_frame(
             folded_next[..dim].copy_from_slice(bytemuck::cast_slice(&data[..dim * 4]));
             let ct = dim * 4 + cold_bytes as usize;
             let tail: &[u32] = bytemuck::cast_slice(&data[dim * 4..ct]);
-            cold_out.clear();
-            for t in 0..g.moe.top_k {
-                if tail[2 * t] != u32::MAX {
-                    cold_out.push((tail[2 * t] as usize, f32::from_bits(tail[2 * t + 1])));
+            if let Some(cold_out) = cold_out.as_deref_mut() {
+                cold_out.clear();
+                for t in 0..g.moe.top_k {
+                    if tail[2 * t] != u32::MAX {
+                        cold_out
+                            .push((tail[2 * t] as usize, f32::from_bits(tail[2 * t + 1])));
+                    }
+                }
+                cold_x_out.clear();
+                cold_x_out.extend_from_slice(bytemuck::cast_slice(&data[ct..total as usize]));
+            }
+            if let Some(route_out) = route_out.as_deref_mut() {
+                route_out.clear();
+                for t in 0..g.moe.top_k {
+                    let e = tail[2 * g.moe.top_k + 2 * t];
+                    if e != u32::MAX {
+                        route_out.push((
+                            e as usize,
+                            f32::from_bits(tail[2 * g.moe.top_k + 2 * t + 1]),
+                        ));
+                    }
                 }
             }
-            cold_x_out.clear();
-            cold_x_out.extend_from_slice(bytemuck::cast_slice(&data[ct..total as usize]));
             ok = true;
         }
         stage.unmap();
@@ -38389,6 +38782,10 @@ pub fn dsv4_experts_fit(inter: usize, hidden: usize, gu_q2: bool, dn_q2: bool) -
 /// file carries an MTP stack and speculation is not disabled. Zero means no
 /// draft is coming and the trunk may pack into the whole budget.
 pub static DRAFT_RESERVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Expert-bank part of `DRAFT_RESERVE`.  The draft builder may reclaim this
+/// part when asking how many experts fit; graph workspace must stay reserved.
+pub static DRAFT_PACK_RESERVE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// f32 GEMM for the skill-bake trainer: y[n,m] = x[n,k] · w[m,k]ᵀ on the
 /// card, riding the existing batched f32 matvec kernel. The weight side
@@ -40929,7 +41326,7 @@ pub fn dsv4_draft_fit(inter: usize, hidden: usize, gu_q2: bool, dn_q2: bool) -> 
     if per == 0 {
         return base;
     }
-    base + (DRAFT_RESERVE.load(std::sync::atomic::Ordering::Relaxed) / per) as usize
+    base + (DRAFT_PACK_RESERVE.load(std::sync::atomic::Ordering::Relaxed) / per) as usize
 }
 
 /// Can this layer's experts live on the card? Uploads them if they can, so a
@@ -41176,6 +41573,25 @@ pub fn upload_bandwidth_probe(block: usize, rounds: usize) -> Option<f64> {
     }
     let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
     Some((block * rounds) as f64 / t0.elapsed().as_secs_f64() / 1e9)
+}
+
+/// Automatic FreeToken-style refill policy for a partial DeepSeek-V4 pack.
+/// Four small transfers distinguish a local high-bandwidth link from a
+/// throttled/cloud staging path without adding a visible model-load tax.
+/// Fast links refill on the first recurrence; slow links demand a second
+/// observation so one-shot experts remain exact CPU cold picks.
+pub fn dsv4_fetch_defaults() -> (usize, u16) {
+    static POLICY: std::sync::OnceLock<(usize, u16)> = std::sync::OnceLock::new();
+    *POLICY.get_or_init(|| {
+        let gbs = upload_bandwidth_probe(8 * 1024 * 1024, 4).unwrap_or(0.0);
+        let min_seen = if gbs >= 10.0 { 1 } else { 2 };
+        tracing::info!(
+            "dsv4 refill auto: upload {:.2} GB/s, quota 1, min_seen {}",
+            gbs,
+            min_seen
+        );
+        (1, min_seen)
+    })
 }
 
 pub fn dsv4_experts_ready(
@@ -44020,11 +44436,11 @@ pub static ATT_WAIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 /// One DeepSeek-V4 MoE block on the device: route, run the chosen experts and
 /// the shared one, sum. One submission.
 ///
-/// The experts arrive PACKED — a subset chosen by the host (the hot set a
-/// mask keeps), shared expert last — and the router's logits arrive already
-/// renumbered into that packing. That removes the whole global-to-slot remap
-/// the obvious design needs, and it makes the mask implicit: an expert not in
-/// the packing has no logit and cannot be chosen.
+/// The experts arrive PACKED — a subset chosen by the host, shared expert
+/// last — while routing remains in global numbering. The explicit task mask
+/// closes experts before top-k; the remap then distinguishes an allowed cold
+/// expert from an allowed resident slot. Keeping those fields separate lets a
+/// mask-complete pack chain without changing the route by accident.
 #[derive(Clone)]
 pub struct Dsv4MoeW<'a> {
     /// The gate as dense f32 `[n_exp, hidden]`. Used when `logits` is empty,
@@ -44037,6 +44453,9 @@ pub struct Dsv4MoeW<'a> {
     pub logits: &'a [f32],
     /// noaux_tc selection bias, same numbering. Absent on the hash layers.
     pub bias: Option<&'a [f32]>,
+    /// Global 0/1 task mask. A closed expert is excluded before top-k; it is
+    /// not the same thing as an allowed expert whose VRAM slot is cold.
+    pub mask: Option<&'a [u32]>,
     /// Hash-layer row, already in packed numbering.
     pub forced: Option<&'a [usize]>,
     /// global expert id -> packed slot, `u32::MAX` where the expert did not
@@ -44174,7 +44593,10 @@ pub fn dsv4_moe_frame(
         _ => frame_buf(c, 26, n_all.max(1) * 4, true),
     };
     let coldb = frame_buf(c, 27, 4 * g.top_k * 4, false);
-    let mk = frame_buf(c, 17, n_pack * 4, true);
+    let mk = match w.mask {
+        Some(m) if m.len() >= n_route => const_buf(c, bytemuck::cast_slice(&m[..n_route])),
+        _ => frame_buf(c, 17, n_route.max(1) * 4, true),
+    };
     let fc = match w.forced {
         Some(f) if f.len() >= g.top_k => {
             let v: Vec<u32> = f[..g.top_k].iter().map(|&i| i as u32).collect();
@@ -44194,6 +44616,7 @@ pub fn dsv4_moe_frame(
     let ob = frame_buf(c, 24, g.hidden * 4, false);
 
     let rflags = (w.bias.is_some_and(|b| b.len() >= n_route) as u32)
+        | ((w.mask.is_some_and(|m| m.len() >= n_route) as u32) << 1)
         | ((w.forced.is_some_and(|f| f.len() >= g.top_k) as u32) << 2)
         | 8 // always pin the shared slot: these kernels take a fixed count
         | ((subset as u32) << 4)
@@ -44240,21 +44663,28 @@ pub fn dsv4_moe_frame(
             stride16(g.hidden, g.inter, false),
         ],
     );
-    let (p_gu, p_dn, l_gu, l_dn) = if g.gu_q2 {
+    let gu_r4 = g.inter % 4 == 0 && bt_gu_r4_on();
+    let (p_gu, p_dn) = if g.gu_q2 {
         (
-            &c.moe_gate_up_q2tp,
+            if gu_r4 {
+                &c.bt_moe_gate_up_q2tp_r4
+            } else {
+                &c.moe_gate_up_q2tp
+            },
             &c.moe_down_q4tp,
-            &c.layout_moe_gu_q2tp,
-            &c.layout_moe_dn_q4tp,
         )
     } else {
         (
-            &c.moe_gate_up_q4tp_b,
+            if gu_r4 {
+                &c.moe_gate_up_q4tp_b_r4
+            } else {
+                &c.moe_gate_up_q4tp_b
+            },
             &c.moe_down_q4tp_b,
-            &c.layout_moe_gu_b,
-            &c.layout_moe_dn_b,
         )
     };
+    let l_gu = p_gu.get_bind_group_layout(0);
+    let l_dn = p_dn.get_bind_group_layout(0);
 
     MOE_UP_NS.fetch_add(
         t_up.elapsed().as_nanos() as u64,
@@ -44324,7 +44754,7 @@ pub fn dsv4_moe_frame(
         let bg_gu = cached_bind(c, (41, 0, lkey), || {
             c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
-                layout: l_gu,
+                layout: &l_gu,
                 entries: &[
                     bind_buf(0, &gate_all),
                     bind_buf(1, &up_all),
@@ -44337,12 +44767,16 @@ pub fn dsv4_moe_frame(
         });
         pass.set_pipeline(p_gu);
         pass.set_bind_group(0, &bg_gu, &[]);
-        pass.dispatch_workgroups(g.inter as u32, slots as u32, 1);
+        pass.dispatch_workgroups(
+            (g.inter as u32).div_ceil(if gu_r4 { 4 } else { 1 }),
+            slots as u32,
+            1,
+        );
 
         let bg_dn = cached_bind(c, (42, 0, lkey), || {
             c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
-                layout: l_dn,
+                layout: &l_dn,
                 entries: &[
                     bind_buf(0, &down_all),
                     bind_buf(1, &mact),

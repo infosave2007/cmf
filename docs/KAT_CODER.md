@@ -104,21 +104,30 @@ import went wrong — re-run step 2 and check its log.
 
 Headless server images (RunPod/vast-style PyTorch containers) are
 compute-only and miss the GL vendor libraries the NVIDIA Vulkan driver
-links against. Fix once:
+links against. Install the complete set unconditionally; a conditional
+`dpkg -l | grep ...` check can incorrectly skip this step:
 
 ```sh
-apt-get update && apt-get install -y vulkan-tools libglvnd0 libegl1 libgl1 libglx0
-vulkaninfo --summary | grep deviceName   # must print your GPU, not an error
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y libglvnd0 libgl1 libegl1 libvulkan1 vulkan-tools
+export XDG_RUNTIME_DIR=/tmp
+XDG_RUNTIME_DIR=/tmp vulkaninfo --summary | grep deviceName
 ```
+
+The check must print your GPU. Keep `XDG_RUNTIME_DIR=/tmp` in every `run`,
+`bench`, and `serve` invocation, not only in the check. A tested pod runbook,
+including driver-version and H100/A100 failure modes, is in
+[VULKAN_POD.ru.md](VULKAN_POD.ru.md).
 
 Run — size the weight budget to your card (a 32 GB card shown; the default
 is a conservative 8 GB):
 
 ```sh
-CMF_GPU=1 CMF_GPU_VRAM_MB=26000 cortiq run kat-q4t.cmf \
+CMF_GPU=1 CMF_GPU_VRAM_MB=26000 XDG_RUNTIME_DIR=/tmp cortiq run kat-q4t.cmf \
     --prompt "Write a Python function that checks if a number is prime." --max-tokens 200
 
-CMF_GPU=1 CMF_GPU_VRAM_MB=26000 cortiq bench kat-q4t.cmf
+CMF_GPU=1 CMF_GPU_VRAM_MB=26000 XDG_RUNTIME_DIR=/tmp cortiq bench kat-q4t.cmf
 ```
 
 What happens: the whole 40-layer stack decodes as **one GPU submit per
@@ -200,8 +209,10 @@ submit+readback).
 
 | symptom | cause / fix |
 |---|---|
-| `vulkaninfo`: `ERROR_INCOMPATIBLE_DRIVER` | missing GL vendor libs — the `apt-get install` line in §4a |
+| `vulkaninfo`: `ERROR_INCOMPATIBLE_DRIVER`, `0 adapters`, or `Found no drivers` | install the complete GLVND/Vulkan package set in §4a; do not start by changing `/dev/dri` permissions |
+| Vulkan still fails after installing GLVND | NVIDIA userspace and kernel driver minor versions must match; H100/A100 pods may lack runtime `graphics` capability and cannot be repaired from inside the container — see [the pod runbook](VULKAN_POD.ru.md) |
 | GPU run ≈ CPU speed on Vulkan | budget too small for the experts — raise `CMF_GPU_VRAM_MB`; check `RUST_LOG=cortiq_engine=info` |
+| first measured run is 5–10× slower | shader compilation warm-up; measure the second run or use `bench`; `cortiq-pipelines-*.bin` persists beside the model |
 | very slow first token | one-time expert upload from a cold disk; page cache makes the next start ~20 s |
 | `unknown quant 'q4t'` | cortiq older than 0.5.24 — update |
 | incoherent output | broken import — redo step 2 with cortiq ≥ 0.5.24 (earlier versions predate the qwen35moe importer) |
