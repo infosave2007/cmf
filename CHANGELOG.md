@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-08-24
+
+The first tag whose release binaries actually build: 0.6.0 and 0.6.1
+tag builds died on unix-only code in the CLI. Note on lineage: the
+global-arena code below physically entered the 0.6.1 crate build (it was
+swept into that commit alongside the portability fix); 0.6.2 is the
+release that completes and documents it.
+
+### Added
+- **Unified global Q4TP expert pool for DeepSeek V4 on Vulkan.** One physical
+  segmented arena is shared by every layer, with a live
+  `(layer, expert) -> slot` table. Layers borrow unused capacity from one
+  another; pinned shared experts and a protected per-layer floor prevent the
+  cyclic-scan collapse of a plain global LRU. The eight descriptor-indexed
+  segments keep every storage binding below Vulkan's 4 GiB range.
+
+### Changed
+- Nearby `<model>.moe-mass.json` files are no longer loaded automatically.
+  A hard routing mask is a diagnostic experiment only and now requires an
+  explicit `CMF_MOE_MASK`. Production acceleration preserves the complete
+  router and services a non-resident winner through an exact refill/cold
+  completion.
+
+### Fixed
+- The global arena leaves an automatic 2–4 GiB workspace for late
+  attention/KV peaks instead of sizing itself from apparently free startup
+  VRAM.
+- `CMF_DSV4_MOE_CHECK=1` now keeps its reference recomputation inside
+  `cpu_scope`. The purported CPU oracle previously let generic matvec upload a
+  second expert cache to the GPU and caused an OOM after otherwise-correct
+  global-pool layers.
+- The runtime now applies the embryo short conv (`vmf_attn.conv1d.weight`,
+  genomes born with `--conv-k`): a causal depthwise conv before the mixer
+  projections, its k−1-input ring kept at the tail of the layer state so
+  decode stays O(1), with the speculative pair lane advancing a tentative
+  ring exactly like the phase state. The projections are trained on the
+  conv output — ignoring the tensor scrambled the layer (heldout PPL
+  93 539 → 48.9 after the fix; the conv-free path is untouched).
+- Release binaries build on Windows again: one last un-gated
+  `std::os::unix::io::AsRawFd` import in `bench --bw` (the 0.6.1 sweep
+  missed it because only the engine, not the CLI, was cross-checked).
+
 ## [0.6.1] - 2026-08-24
 
 ### Fixed
@@ -18,10 +60,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.6.0] - 2026-08-24
 
-DeepSeek-V4-Flash q4tp on one GPU goes from 0.665 to 21.5 tok/s on an
-A40 46 GiB — measured `bench --core` steady, exact output budget, no
-environment knobs. The release is the acceleration campaign of 22-24.08
-landing as DEFAULTS: the engine reads the machine and configures itself.
+DeepSeek-V4-Flash q4tp on one GPU measured up to 21.5 tok/s on an A40
+46 GiB with a task routing mask. That historical number is not an exact
+general-model result: later long autoregressive validation rejected the mask,
+and the Unreleased section removes its implicit activation. The remaining
+machine-dependent acceleration defaults require no environment knobs.
 
 ### Added
 - **Dynamic LRU expert slots**: the packed subset follows the router
@@ -41,10 +84,10 @@ landing as DEFAULTS: the engine reads the machine and configures itself.
   OWN quant (q4 for q4tp) gated by a geometric VRAM check — the
   at-upload q4-to-q2 requant that fed the draft a coarser model than its
   verifier is no longer the default path.
-- **Task-mask sidecar**: `<model>.moe-mass.json` loads automatically
-  (weighted routing-mass format, 92.5% default cover — the measured
-  balance); `CMF_MOE_MASK` stays as the diagnostic override. With the
-  sidecar all 43 layers ride the GPU chain.
+- **Task-mask sidecar experiment** (superseded above): this release could
+  load `<model>.moe-mass.json` automatically. Short-window PPL was not a
+  sufficient safety gate; this behaviour is retained here only as release
+  history and is disabled in the next build.
 - **`cortiq bench --bw`**: the three bandwidths the offload split is
   arithmetic over — host-RAM copy, host-to-VRAM upload (submits
   included), and storage read with the cache dropped — measured once
@@ -82,9 +125,9 @@ landing as DEFAULTS: the engine reads the machine and configures itself.
   spreads across layers and the draft reserve is carved before packing.
 
 ### Measured (bench --core steady, one process)
-- A40 46 GiB q4tp: 0.665 (old default) -> 1.5-1.8 (exact dynamic LRU)
-  -> 11.0 (mask 97.5%, no MTP) -> 21.5 (bare command + sidecar, 48/80
-  drafts accepted, exact token budget).
+- A40 46 GiB q4tp: 0.665 (old default) -> 1.5-1.8 (exact dynamic LRU).
+  The historical 11.0–21.5 masked measurements changed routing semantics and
+  are not accepted as production exact-mode results.
 - RTX 5090 32 GiB q4tp: 1.14 -> 3.0-3.5 (slots, fetch-all).
 - RTX PRO 6000 96 GiB q4tp: 1.5 -> 3.49 (chain-of-one + reuse-gated
   fills). The q2tp 40.2 on the same card remains the speculative

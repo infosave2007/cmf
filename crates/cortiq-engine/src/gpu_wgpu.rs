@@ -13167,7 +13167,6 @@ struct Ctx {
     graph_scratch: Mutex<GraphScratch>,
 }
 
-#[derive(Clone)]
 struct Dsv4GlobalMoeBufs {
     gate: Vec<wgpu::Buffer>,
     up: Vec<wgpu::Buffer>,
@@ -34107,7 +34106,7 @@ fn encode_moe_chain_p(
         | ((w.moe.forced.is_some_and(|f| f.len() >= g.top_k) as u32) << 2)
         | 8
         | ((subset as u32) << 4)
-        | ((n_pack as u32) << 8);
+        | (w.moe.global.map_or(n_pack as u32, |gl| gl.shared_slot) << 8);
     let rp = uniform_mixed(c, [n_route as u32, g.top_k as u32, rflags], g.route_scale);
     let stride16 = |rows: usize, cols: usize, q2: bool| -> u32 {
         let dt = if q2 {
@@ -34218,6 +34217,123 @@ fn encode_moe_chain_p(
             ],
         })
     });
+    // The layer-frame/chain-of-one twin of `dsv4_moe_frame`'s global arm.
+    // Routing, descriptor-indexed gate/up and descriptor-indexed down stay
+    // inside THIS compute pass, so the common pool does not give back the
+    // two barriers per layer that chain-of-one removed.
+    if let Some(gl) = w.moe.global {
+        let Some(gb) = c
+            .dsv4_global_moe
+            .lock()
+            .unwrap()
+            .get(&gl.pool_uid)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(p_gu) = c.dsv4_global_gu.as_ref() else { return };
+        let Some(p_dn) = c.dsv4_global_dn.as_ref() else { return };
+        let gu_gp = uniform_u32x8(
+            c,
+            [
+                (g.hidden / 32) as u32,
+                g.inter as u32,
+                slots as u32,
+                stride16(g.inter, g.hidden, false),
+                g.swiglu_limit.to_bits(),
+                gl.segment_slots,
+                0,
+                0,
+            ],
+        );
+        let dn_gp = uniform_u32x8(
+            c,
+            [
+                (g.inter / 32) as u32,
+                g.hidden as u32,
+                slots as u32,
+                stride16(g.hidden, g.inter, false),
+                gl.segment_slots,
+                0,
+                0,
+                0,
+            ],
+        );
+        let gate_bindings: Vec<_> = gb
+            .gate
+            .iter()
+            .map(wgpu::Buffer::as_entire_buffer_binding)
+            .collect();
+        let up_bindings: Vec<_> = gb
+            .up
+            .iter()
+            .map(wgpu::Buffer::as_entire_buffer_binding)
+            .collect();
+        let down_bindings: Vec<_> = gb
+            .down
+            .iter()
+            .map(wgpu::Buffer::as_entire_buffer_binding)
+            .collect();
+        let bg_gu = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("dsv4-global-chain-gu"),
+            layout: &p_gu.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::BufferArray(&gate_bindings),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::BufferArray(&up_bindings),
+                },
+                bind_buf(2, x),
+                bind_buf(3, msel),
+                bind_buf(4, mact),
+            ],
+        });
+        let bg_gu_p = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("dsv4-global-chain-gu-p"),
+            layout: &p_gu.get_bind_group_layout(1),
+            entries: &[bind_buf(0, &gu_gp)],
+        });
+        let bg_dn = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("dsv4-global-chain-dn"),
+            layout: &p_dn.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::BufferArray(&down_bindings),
+                },
+                bind_buf(1, mact),
+                bind_buf(2, msel),
+                bind_buf(3, mwt),
+                bind_buf(4, out),
+            ],
+        });
+        let bg_dn_p = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("dsv4-global-chain-dn-p"),
+            layout: &p_dn.get_bind_group_layout(1),
+            entries: &[bind_buf(0, &dn_gp)],
+        });
+        if !dsv4_skip("route") {
+            pass.set_pipeline(&c.moe_route);
+            pass.set_bind_group(0, &bind_r, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        if !dsv4_skip("gu") {
+            pass.set_pipeline(p_gu);
+            pass.set_bind_group(0, &bg_gu, &[]);
+            pass.set_bind_group(1, &bg_gu_p, &[]);
+            pass.dispatch_workgroups(g.inter as u32, slots as u32, 1);
+        }
+        if !dsv4_skip("dn") {
+            pass.set_pipeline(p_dn);
+            pass.set_bind_group(0, &bg_dn, &[]);
+            pass.set_bind_group(1, &bg_dn_p, &[]);
+            pass.dispatch_workgroups(g.hidden as u32, 1, 1);
+        }
+        return;
+    }
     // The layout comes from the PIPELINE, not the cached one: wgpu treats an
     // auto-derived layout as exclusive to the pipeline that produced it, so a
     // group built against a twin's layout is rejected at dispatch — with a
@@ -34702,18 +34818,30 @@ fn dsv4_layer_frame_enc(
         };
         wb.push(b);
     }
-    let Some((gate_all, up_all, down_all)) = moe_expert_bufs(
-        c,
-        model,
-        w.moe.experts,
-        m.inter,
-        m.hidden,
-        true,
-        m.gu_q2,
-        false,
-    ) else {
-        no!("эксперты не влезли в VRAM");
+    let local_moe = if w.moe.global.is_none() {
+        let Some(v) = moe_expert_bufs(
+            c,
+            model,
+            w.moe.experts,
+            m.inter,
+            m.hidden,
+            true,
+            m.gu_q2,
+            false,
+        ) else {
+            no!("эксперты не влезли в VRAM");
+        };
+        Some(v)
+    } else {
+        None
     };
+    // The global branch in `encode_moe_chain_p` ignores these arguments;
+    // a real four-byte buffer keeps the common call shape without allocating
+    // a second expert bank.
+    let moe_dummy = frame_buf(c, 90, 4, true);
+    let (gate_all, up_all, down_all) = local_moe.unwrap_or_else(|| {
+        (moe_dummy.clone(), moe_dummy.clone(), moe_dummy.clone())
+    });
     let cache = {
         let map = c.dsv4_kv.lock().unwrap();
         match map.get(&(kv_id, li)) {
@@ -34765,7 +34893,9 @@ fn dsv4_layer_frame_enc(
     };
 
     // ── working buffers ──
-    let n_pack = n_exp;
+    let n_pack = w.moe.global.map_or(n_exp, |_| {
+        w.moe.remap.map_or(0, <[u32]>::len)
+    });
     let slots = m.top_k + 1;
     let q = frame_buf(c, 5, a.nh * a.hd * 4, false);
     let attn = frame_buf(c, 6, a.nh * a.hd * 4, false);
@@ -39194,8 +39324,8 @@ pub fn dsv4_global_slot_fill(
             host_tier_put(key, Arc::new(v));
             return true;
         } else {
-            let Some(v) = bytes.get(abs..abs + plen) else { return false };
-            v
+            let Some(src) = bytes.get(abs..abs + plen) else { return false };
+            src
         };
         c.queue.write_buffer(buf, off as u64, src);
         if tier.is_none() {
