@@ -420,16 +420,16 @@ pub(crate) fn build_ffn_at(
 
 /// Task mask over routed experts: DTG-MA applied to MoE.
 ///
-/// A model may ship a calibrated `<model>.moe-mass.json` sidecar, which is
-/// loaded automatically. `CMF_MOE_MASK=<stats.json>` remains the diagnostic
-/// override and also accepts legacy selection-count files. The weighted
-/// format defaults to 92.5% routing-mass coverage (the measured q4tp A40
-/// balance); legacy count files keep their historical 90% default. In both
-/// cases `CMF_MOE_MASK_COVER` can override the choice for an A/B. Selection
-/// happens over the allowed set only and softmax renormalizes, so every
-/// sidecar must still pass a held-out perplexity gate for its intended task.
+/// This is deliberately diagnostic-only. A route-mass sidecar can look good
+/// on a short perplexity window and still collapse during a long
+/// autoregressive generation: excluding a low-mass expert changes the model,
+/// and the changed prefix changes every later route. Consequently a nearby
+/// `<model>.moe-mass.json` is NEVER adopted implicitly. `CMF_MOE_MASK=...`
+/// remains an explicit experiment and accepts both weighted and legacy count
+/// files; production acceleration must preserve the full router and treat a
+/// non-resident winner as an exact cold completion.
 pub(crate) fn moe_task_mask(
-    model: &std::sync::Arc<CmfModel>,
+    _model: &std::sync::Arc<CmfModel>,
     prefix: &str,
     ne: usize,
 ) -> Option<Vec<bool>> {
@@ -437,14 +437,7 @@ pub(crate) fn moe_task_mask(
     static CFG: OnceLock<Option<(std::collections::HashMap<usize, Vec<u64>>, f64)>> =
         OnceLock::new();
     let cfg = CFG.get_or_init(|| {
-        let (path, sidecar) = if let Ok(path) = std::env::var("CMF_MOE_MASK") {
-            (std::path::PathBuf::from(path), false)
-        } else {
-            let mut name = model.path.as_os_str().to_os_string();
-            name.push(".moe-mass.json");
-            let path = std::path::PathBuf::from(name);
-            path.is_file().then_some((path, true))?
-        };
+        let path = std::path::PathBuf::from(std::env::var("CMF_MOE_MASK").ok()?);
         let shown = path.display();
         let text = std::fs::read_to_string(&path)
             .map_err(|e| tracing::warn!("CMF_MOE_MASK: cannot read {shown}: {e}"))
@@ -454,12 +447,11 @@ pub(crate) fn moe_task_mask(
             .ok()?;
         // Weighted dumps store normalized route mass in fixed-point units
         // and therefore have per-layer totals many orders above the old
-        // top-k vote counts. The filename is an explicit stronger signal;
-        // the magnitude check keeps manually named weighted dumps automatic.
-        let weighted = sidecar
-            || map
-                .values()
-                .any(|row| row.iter().copied().sum::<u64>() >= 1_000_000);
+        // top-k vote counts. The magnitude distinguishes the two explicit
+        // diagnostic formats without relying on a special filename.
+        let weighted = map
+            .values()
+            .any(|row| row.iter().copied().sum::<u64>() >= 1_000_000);
         let cover = std::env::var("CMF_MOE_MASK_COVER")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())

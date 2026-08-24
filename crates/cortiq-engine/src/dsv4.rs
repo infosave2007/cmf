@@ -1856,6 +1856,11 @@ fn dsv4_layer_loop(
     }
     let mut on_dev = vec![false; layers.len()];
     let mut partial_dev = vec![false; layers.len()];
+    let mut attn_ready = vec![false; layers.len()];
+    // Two phases are essential for the unified pool: first pin every small
+    // attention/compressor skeleton, then give all remaining weight budget
+    // to the one expert arena. Allocating the arena after layer zero alone
+    // would honestly fit it, but starve layer one's attention weights.
     for (li, l) in layers.iter().enumerate() {
         if l.wq_a.model_idx().is_none()
             || l.wq_b.model_idx().is_none()
@@ -1867,10 +1872,6 @@ fn dsv4_layer_loop(
         let Some(model) = l.experts.first().and_then(|e| e.w1.model_arc()) else {
             return false;
         };
-        let gu_q2 = l
-            .experts
-            .first()
-            .is_some_and(|e| e.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP));
         // A layer whose experts do not fit is not a reason to abandon the
         // token: 100 GB of experts against a 98 GB card means SOME layer will
         // always miss. Those run on the host, with the state fetched and put
@@ -1904,30 +1905,42 @@ fn dsv4_layer_loop(
                 want.push(ix.compressor.wgate.model_idx());
             }
         }
-        let attn_ok = want
+        attn_ready[li] = want
             .into_iter()
             .flatten()
             .all(|i| crate::gpu_wgpu::dsv4_weight_ready(&model, i));
-        // Size the expert pack only AFTER this layer's attention skeleton is
-        // resident. Otherwise the pack consumes the apparent free budget,
-        // the much smaller skeleton arrives next, and the supposedly fitting
-        // pack misses by exactly those bytes.
+    }
+    for (li, l) in layers.iter().enumerate() {
+        let Some(model) = l.experts.first().and_then(|e| e.w1.model_arc()) else {
+            return false;
+        };
+        let gu_q2 = l
+            .experts
+            .first()
+            .is_some_and(|e| e.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP));
+        // Size expert storage only after EVERY layer's skeleton is resident.
+        // The old per-layer packs could interleave these allocations; one
+        // global allocation cannot, so the ordering is now explicit.
         let pk = pack_for(l, cfg, li);
         if let Some(pk) = pk {
             let dn_q2 = l
                 .experts
                 .first()
                 .is_some_and(|e| e.w2.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP));
-            let experts_ok = crate::gpu_wgpu::dsv4_experts_ready(
-                &model,
-                &pk.tensors,
-                cfg.moe_inter,
-                dim,
-                gu_q2,
-                dn_q2,
-            );
-            on_dev[li] = attn_ok && experts_ok && pk.route_complete();
-            partial_dev[li] = attn_ok && experts_ok && !pk.route_complete();
+            let experts_ok = if pk.global.is_some() {
+                crate::gpu_wgpu::dsv4_global_moe_ready(&model)
+            } else {
+                crate::gpu_wgpu::dsv4_experts_ready(
+                    &model,
+                    &pk.tensors,
+                    cfg.moe_inter,
+                    dim,
+                    gu_q2,
+                    dn_q2,
+                )
+            };
+            on_dev[li] = attn_ready[li] && experts_ok && pk.route_complete();
+            partial_dev[li] = attn_ready[li] && experts_ok && !pk.route_complete();
         }
     }
     let active_dev: Vec<bool> = on_dev
@@ -2370,6 +2383,7 @@ fn dsv4_layer_loop(
                 mask: pk.mask.as_deref(),
                 forced: forced.as_deref(),
                 remap: pk.needs_remap().then_some(pk.remap.as_slice()),
+                global: None,
             },
             hc_ffn_fn: &l.hc_ffn_fn,
             hc_ffn_scale: &l.hc_ffn_scale,
@@ -2853,6 +2867,7 @@ fn dsv4_chain1_layer(
             mask: pk.mask.as_deref(),
             forced: forced.as_deref(),
             remap: Some(&dynv.remap),
+            global: None,
         },
         hc_ffn_fn: &l.hc_ffn_fn,
         hc_ffn_scale: &l.hc_ffn_scale,
@@ -3310,6 +3325,7 @@ fn dsv4_chain_run(
                 mask: packs[i].mask.as_deref(),
                 forced: forceds[i].as_deref(),
                 remap: packs[i].needs_remap().then_some(packs[i].remap.as_slice()),
+                global: None,
             },
             hc_ffn_fn: &l.hc_ffn_fn,
             hc_ffn_scale: &l.hc_ffn_scale,
@@ -3784,11 +3800,204 @@ struct PackDyn {
     mutated: bool,
 }
 
+/// One logical cache line in the model-wide expert pool. `layer` is the
+/// first expert tensor's directory index rather than the ordinal: trunk and
+/// MTP stages both use small ordinal numbers, while this identity is unique
+/// for the lifetime of the mapped model.
+#[cfg(feature = "gpu")]
+#[derive(Clone, Copy)]
+struct GlobalOwner {
+    layer: usize,
+    expert: usize,
+    pinned: bool,
+}
+
+#[cfg(feature = "gpu")]
+struct GlobalPoolDyn {
+    slot_for: std::collections::HashMap<(usize, usize), u32>,
+    owner: Vec<Option<GlobalOwner>>,
+    last: Vec<u64>,
+    seen: std::collections::HashMap<(usize, usize), u16>,
+    occupancy: std::collections::HashMap<usize, usize>,
+    clock: u64,
+}
+
+/// FreeToken's unified `(layer, expert) -> slot` table, with one deliberate
+/// addition learned from this engine's routing traces: each trunk layer gets
+/// a small protected floor. A plain global LRU under a deterministic
+/// layer-by-layer sweep measured 4.7% hits, while equal per-layer LRUs hit
+/// about 70%. The floor prevents cyclic scan eviction; every slot above it is
+/// still borrowed and evicted globally, so skewed layers use otherwise idle
+/// capacity.
+#[cfg(feature = "gpu")]
+struct GlobalPool {
+    uid: u64,
+    capacity: usize,
+    segment_slots: usize,
+    floor: usize,
+    state: std::sync::Mutex<GlobalPoolDyn>,
+}
+
+#[cfg(feature = "gpu")]
+impl GlobalPool {
+    fn remap(&self, layer: usize, n: usize) -> Vec<u32> {
+        let st = self.state.lock().unwrap();
+        debug_assert_eq!(self.capacity, st.owner.len());
+        (0..n)
+            .map(|e| st.slot_for.get(&(layer, e)).copied().unwrap_or(u32::MAX))
+            .collect()
+    }
+
+    fn seed_layer(
+        &self,
+        model: &std::sync::Arc<cortiq_core::CmfModel>,
+        layer: usize,
+        shared: (usize, usize, usize),
+        _routed: &[(usize, (usize, usize, usize))],
+    ) -> Option<u32> {
+        let mut st = self.state.lock().unwrap();
+        let shared_key = (layer, usize::MAX);
+        let shared_slot = if let Some(&slot) = st.slot_for.get(&shared_key) {
+            slot
+        } else {
+            let slot = st.owner.iter().position(Option::is_none)?;
+            if !crate::gpu_wgpu::dsv4_global_slot_fill(model, slot, shared) {
+                return None;
+            }
+            st.owner[slot] = Some(GlobalOwner {
+                layer,
+                expert: usize::MAX,
+                pinned: true,
+            });
+            st.slot_for.insert(shared_key, slot as u32);
+            *st.occupancy.entry(layer).or_insert(0) += 1;
+            slot as u32
+        };
+        // Do not fill the remaining 40+ GiB by expert id. Route locality is
+        // checkpoint- and prompt-dependent; the old eager seed spent a
+        // minute uploading rows that the first token immediately replaced.
+        // Empty slots are populated by the real top-k before its dispatch.
+        Some(shared_slot)
+    }
+
+    fn ensure_picks(
+        &self,
+        model: &std::sync::Arc<cortiq_core::CmfModel>,
+        layer: usize,
+        picks: &[usize],
+        experts: &[Dsv4Expert],
+        quota: usize,
+        min_seen: u16,
+    ) -> Vec<u32> {
+        let mut st = self.state.lock().unwrap();
+        st.clock = st.clock.saturating_add(1);
+        let clock = st.clock;
+        if clock % 64 == 0 {
+            for v in st.seen.values_mut() {
+                *v >>= 1;
+            }
+        }
+        for &expert in picks {
+            let key = (layer, expert);
+            let seen = st.seen.entry(key).or_insert(0);
+            *seen = seen.saturating_add(1);
+            if let Some(&slot) = st.slot_for.get(&key) {
+                st.last[slot as usize] = clock;
+            }
+        }
+        let mut fetched = 0usize;
+        for &expert in picks {
+            if fetched >= quota {
+                break;
+            }
+            let key = (layer, expert);
+            if st.slot_for.contains_key(&key)
+                || st.seen.get(&key).copied().unwrap_or(0) < min_seen
+            {
+                continue;
+            }
+            let Some(exp) = experts.get(expert) else { continue };
+            let Some(tensors) = (|| {
+                Some((
+                    exp.w1.model_idx()?,
+                    exp.w3.model_idx()?,
+                    exp.w2.model_idx()?,
+                ))
+            })() else {
+                continue;
+            };
+            let empty = st.owner.iter().position(Option::is_none);
+            // First evict from a layer that currently borrows above its
+            // floor. Do not evict any expert required by this very dispatch.
+            let over_floor = |o: GlobalOwner, occ: &std::collections::HashMap<usize, usize>| {
+                occ.get(&o.layer).copied().unwrap_or(0) > self.floor
+            };
+            let eligible = |o: GlobalOwner| {
+                !o.pinned && !(o.layer == layer && picks.contains(&o.expert))
+            };
+            let victim = empty.or_else(|| {
+                st.owner
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(slot, &o)| o.filter(|&x| eligible(x) && over_floor(x, &st.occupancy)).map(|_| slot))
+                    .min_by_key(|&slot| st.last[slot])
+            }).or_else(|| {
+                // If every layer sits exactly at its floor, replace within
+                // the requesting layer. This is per-layer LRU behaviour and
+                // cannot trigger the cyclic global scan collapse.
+                st.owner
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(slot, &o)| o.filter(|&x| eligible(x) && x.layer == layer).map(|_| slot))
+                    .min_by_key(|&slot| st.last[slot])
+            }).or_else(|| {
+                // A new/MTP layer has no protected share yet. Let it borrow
+                // the globally oldest unpinned line; trunk floors are a
+                // locality guarantee, not a permanent admission ban.
+                st.owner
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(slot, &o)| o.filter(|&x| eligible(x)).map(|_| slot))
+                    .min_by_key(|&slot| st.last[slot])
+            });
+            let Some(victim) = victim else { break };
+            if !crate::gpu_wgpu::dsv4_global_slot_fill(model, victim, tensors) {
+                break;
+            }
+            if let Some(old) = st.owner[victim] {
+                st.slot_for.remove(&(old.layer, old.expert));
+                if let Some(n) = st.occupancy.get_mut(&old.layer) {
+                    *n = n.saturating_sub(1);
+                }
+            }
+            st.owner[victim] = Some(GlobalOwner {
+                layer,
+                expert,
+                pinned: false,
+            });
+            st.slot_for.insert(key, victim as u32);
+            *st.occupancy.entry(layer).or_insert(0) += 1;
+            st.last[victim] = clock;
+            fetched += 1;
+        }
+        drop(st);
+        self.remap(layer, experts.len())
+    }
+}
+
+#[cfg(feature = "gpu")]
+#[derive(Clone)]
+struct GlobalPack {
+    pool: std::sync::Arc<GlobalPool>,
+    layer: usize,
+    shared_slot: u32,
+}
+
 #[cfg(feature = "gpu")]
 impl Pack {
     /// True once any slot was refilled away from the build-time packing.
     fn is_mutated(&self) -> bool {
-        self.dynslots.lock().unwrap().mutated
+        self.global.is_some() || self.dynslots.lock().unwrap().mutated
     }
 
     /// Complete means complete for the route the model will actually take.
@@ -3797,6 +4006,9 @@ impl Pack {
     /// experts. Hash layers deliberately carry no mask because their forced
     /// rows remain the exact checkpoint contract.
     fn route_complete(&self) -> bool {
+        if self.global.is_some() {
+            return false;
+        }
         let need = self
             .mask
             .as_deref()
@@ -3808,7 +4020,8 @@ impl Pack {
     /// pack whose hot-first order is not identity. Without it a full but
     /// reordered pack silently runs the right router index on the wrong bank.
     fn needs_remap(&self) -> bool {
-        self.mask.is_some()
+        self.global.is_some()
+            || self.mask.is_some()
             || self
                 .remap
                 .iter()
@@ -3855,6 +4068,10 @@ struct Pack {
     /// layer routed with the LAST layer's bias. On the release every scored
     /// layer carries one, which is the 50.280.
     bias: Option<Vec<f32>>,
+    /// Present only on the descriptor-indexed Q4TP path. `remap` above is
+    /// merely the build-time snapshot there; every frame takes a fresh map
+    /// from this common allocator after its refills/evictions.
+    global: Option<GlobalPack>,
 }
 
 #[cfg(feature = "gpu")]
@@ -3902,6 +4119,51 @@ fn pack_freq_order(li: usize, n: usize) -> Option<Vec<usize>> {
         )
     });
     Some(idx)
+}
+
+#[cfg(feature = "gpu")]
+fn global_pool_for(
+    model: &std::sync::Arc<cortiq_core::CmfModel>,
+    cfg: &Dsv4Cfg,
+    gu_q2: bool,
+    dn_q2: bool,
+) -> Option<std::sync::Arc<GlobalPool>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    if gu_q2
+        || dn_q2
+        || !crate::gpu_wgpu::dsv4_global_moe_supported()
+        || std::env::var("CMF_MOE_MASK").is_ok()
+    {
+        return None;
+    }
+    static POOLS: OnceLock<Mutex<HashMap<u64, Arc<GlobalPool>>>> = OnceLock::new();
+    let pools = POOLS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(p) = pools.lock().unwrap().get(&model.uid()).cloned() {
+        return Some(p);
+    }
+    let requested = crate::gpu_wgpu::dsv4_experts_fit(cfg.moe_inter, cfg.dim, false, false);
+    let (capacity, segment_slots) =
+        crate::gpu_wgpu::dsv4_global_moe_create(model, requested, cfg.moe_inter, cfg.dim)?;
+    let layers = model.header.arch.num_layers.max(1);
+    let p = Arc::new(GlobalPool {
+        uid: model.uid(),
+        capacity,
+        segment_slots,
+        // At least shared + one routed line remain protected per layer when
+        // geometry permits it. Larger cards naturally raise the floor.
+        floor: (capacity / layers).max(2),
+        state: Mutex::new(GlobalPoolDyn {
+            slot_for: HashMap::new(),
+            owner: vec![None; capacity],
+            last: vec![0; capacity],
+            seen: HashMap::new(),
+            occupancy: HashMap::new(),
+            clock: 0,
+        }),
+    });
+    pools.lock().unwrap().insert(model.uid(), p.clone());
+    Some(p)
 }
 
 #[cfg(feature = "gpu")]
@@ -3969,6 +4231,68 @@ fn pack_for(l: &Dsv4Layer, cfg: &Dsv4Cfg, li: usize) -> Option<std::sync::Arc<Pa
             .experts
             .first()
             .is_some_and(|e| e.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP));
+        let dn_q2 = l
+            .experts
+            .first()
+            .is_some_and(|e| e.w2.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP));
+        // Exact default on Q4TP: one physical/logical cache for every
+        // `(layer, expert)` pair. Explicit mask experiments keep the old
+        // local path so this branch never combines two independent changes
+        // to model semantics.
+        if route_mask.is_none() {
+            if let Some(model) = l.experts.first().and_then(|e| e.w1.model_arc()) {
+                if let Some(gp) = global_pool_for(&model, cfg, gu_q2, dn_q2) {
+                    let layer_key = first_expert;
+                    let order = pack_freq_order(li, l.experts.len())
+                        .unwrap_or_else(|| (0..l.experts.len()).collect());
+                    let routed: Vec<_> = order
+                        .into_iter()
+                        .filter_map(|gi| Some((gi, idx3(&l.experts[gi])?)))
+                        .collect();
+                    let shared = idx3(&l.shared)?;
+                    let shared_slot = gp.seed_layer(&model, layer_key, shared, &routed)?;
+                    let remap = gp.remap(layer_key, cfg.n_routed_experts);
+                    let to_slot: Vec<usize> = remap
+                        .iter()
+                        .map(|&s| if s == u32::MAX { usize::MAX } else { s as usize })
+                        .collect();
+                    let globals: Vec<usize> = remap
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(e, &s)| (s != u32::MAX).then_some(e))
+                        .collect();
+                    let (rows, cols) = (l.gate.rows(), l.gate.cols());
+                    let mut router = vec![0.0f32; rows * cols];
+                    for r in 0..rows {
+                        l.gate.row_f32(r, &mut router[r * cols..(r + 1) * cols]);
+                    }
+                    return Some(Arc::new(Pack {
+                        bias: l.gate_bias.clone(),
+                        mask: None,
+                        router,
+                        to_slot,
+                        remap: remap.clone(),
+                        globals,
+                        // Physical tensors live in the global GPU bank map,
+                        // not in a second layer-local concatenation.
+                        tensors: Vec::new(),
+                        dynslots: std::sync::Mutex::new(PackDyn {
+                            remap,
+                            owner: Vec::new(),
+                            last: Vec::new(),
+                            clock: 0,
+                            mutated: true,
+                            seen: vec![0; cfg.n_routed_experts],
+                        }),
+                        global: Some(GlobalPack {
+                            pool: gp,
+                            layer: layer_key,
+                            shared_slot,
+                        }),
+                    }));
+                }
+            }
+        }
         // Pack what fits and leave the rest to the host. The router still
         // ranges over every expert; a missing winner is returned as a cold
         // pick and completed on the CPU. This is deliberately budget-driven,
@@ -4030,6 +4354,7 @@ fn pack_for(l: &Dsv4Layer, cfg: &Dsv4Cfg, li: usize) -> Option<std::sync::Arc<Pa
                 remap,
                 globals,
                 tensors,
+                global: None,
             }));
         }
         let dn_q2_fit = l
@@ -4158,6 +4483,7 @@ fn pack_for(l: &Dsv4Layer, cfg: &Dsv4Cfg, li: usize) -> Option<std::sync::Arc<Pa
             remap,
             globals,
             tensors,
+            global: None,
         }))
     };
     let v = build();
@@ -4220,6 +4546,15 @@ fn moe_frame(
                 .unwrap_or_else(|| crate::gpu_wgpu::dsv4_fetch_defaults().0)
         })
     }
+    fn fetch_min_seen() -> u16 {
+        static M: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+        *M.get_or_init(|| {
+            std::env::var("CMF_DSV4_FETCH_MIN_SEEN")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| crate::gpu_wgpu::dsv4_fetch_defaults().1)
+        })
+    }
     let mut dynv = pk.dynslots.lock().unwrap();
     // The winners, from the same logits the device will rank — used by the
     // slot refill below AND by the FreeToken-style overlap: the picks that
@@ -4252,6 +4587,21 @@ fn moe_frame(
             &mut pwt,
         );
     }
+    let global_remap = pk.global.as_ref().map(|gl| {
+        gl.pool.ensure_picks(
+            &model,
+            gl.layer,
+            &pidx,
+            &l.experts,
+            // A global demand cache has empty lines during warmup and each
+            // CPU cold completion costs far more than one expert upload.
+            // Materialise every predicted winner immediately, FreeToken
+            // style; device routing still returns any prediction drift as an
+            // exact cold pick.
+            cfg.top_k,
+            1,
+        )
+    });
     if subset && fetch_quota() > 0 && !pidx.is_empty() && !dynv.owner.is_empty() {
         dynv.clock += 1;
         let clock = dynv.clock;
@@ -4266,15 +4616,6 @@ fn moe_frame(
             if sl != u32::MAX {
                 dynv.last[sl as usize] = clock;
             }
-        }
-        fn fetch_min_seen() -> u16 {
-            static M: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
-            *M.get_or_init(|| {
-                std::env::var("CMF_DSV4_FETCH_MIN_SEEN")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or_else(|| crate::gpu_wgpu::dsv4_fetch_defaults().1)
-            })
         }
         let mut fetched = 0usize;
         for &pick in &pidx {
@@ -4352,6 +4693,7 @@ fn moe_frame(
     } else {
         pk.globals.iter().map(|&g| logits[g]).collect()
     };
+    let live_remap = global_remap.as_deref().unwrap_or(dynv.remap.as_slice());
     let w = crate::gpu_wgpu::Dsv4MoeW {
         router: &pk.router,
         experts: &pk.tensors,
@@ -4359,7 +4701,12 @@ fn moe_frame(
         bias: pk.bias.as_deref(),
         mask: pk.mask.as_deref(),
         forced: fpack.as_deref(),
-        remap: needs_remap.then_some(dynv.remap.as_slice()),
+        remap: needs_remap.then_some(live_remap),
+        global: pk.global.as_ref().map(|gl| crate::gpu_wgpu::Dsv4GlobalMoe {
+            pool_uid: gl.pool.uid,
+            shared_slot: gl.shared_slot,
+            segment_slots: gl.pool.segment_slots as u32,
+        }),
     };
     let g = crate::gpu_wgpu::Dsv4MoeGeom {
         hidden: cfg.dim,
@@ -4385,7 +4732,7 @@ fn moe_frame(
     let overlap: Vec<usize> = if !hidden.is_empty() {
         pidx.iter()
             .copied()
-            .filter(|&pick| dynv.remap.get(pick).copied().unwrap_or(u32::MAX) == u32::MAX)
+            .filter(|&pick| live_remap.get(pick).copied().unwrap_or(u32::MAX) == u32::MAX)
             .collect()
     } else {
         Vec::new()
@@ -6276,6 +6623,7 @@ fn partial_layer_batch(
             mask: pk.mask.as_deref(),
             forced: None,
             remap: Some(&dynv.remap),
+            global: None,
         },
         hc_ffn_fn: &l.hc_ffn_fn,
         hc_ffn_scale: &l.hc_ffn_scale,
