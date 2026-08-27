@@ -127,6 +127,70 @@ kernel void q8f_matvec(
     if (lane == 0) y[row] = total * rs[row];
 }
 
+// Four output rows per simdgroup. q8_2f's column field makes the activation
+// stream twice as wide as plain q8; the one-row kernel re-read x and col for
+// every output row. Keeping four independent row accumulators reuses that
+// stream four times while weight reads remain coalesced. The register shape is
+// the q4tp matvec's proven four-row operating point.
+kernel void q8f_matvec_r4(
+    device const char4*  q     [[buffer(0)]],
+    device const float4* xs    [[buffer(1)]],
+    device const float*  rs    [[buffer(2)]],
+    device float*        y     [[buffer(3)]],
+    device const float4* col   [[buffer(4)]],
+    constant uint&       cols4 [[buffer(5)]],
+    constant uint&       rows  [[buffer(6)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tgpos [[threadgroup_position_in_grid]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    uint r0 = (tgpos * sgs + sg) * 4u;
+    if (r0 >= rows) return;
+    uint nr = min(rows - r0, 4u);
+    float4 a0 = float4(0.0f), a1 = float4(0.0f);
+    float4 a2 = float4(0.0f), a3 = float4(0.0f);
+    uint i = lane;
+    for (; i + 96u < cols4; i += 128u) {
+        float4 x0 = xs[i] * col[i];
+        float4 x1 = xs[i + 32u] * col[i + 32u];
+        float4 x2 = xs[i + 64u] * col[i + 64u];
+        float4 x3 = xs[i + 96u] * col[i + 96u];
+        for (uint ri = 0u; ri < nr; ++ri) {
+            ulong base = (ulong)(r0 + ri) * cols4;
+            float4 aa;
+            aa.x = dot(float4(q[base + i]), x0);
+            aa.y = dot(float4(q[base + i + 32u]), x1);
+            aa.z = dot(float4(q[base + i + 64u]), x2);
+            aa.w = dot(float4(q[base + i + 96u]), x3);
+            if (ri == 0u) a0 += aa;
+            else if (ri == 1u) a1 += aa;
+            else if (ri == 2u) a2 += aa;
+            else a3 += aa;
+        }
+    }
+    for (; i < cols4; i += 32u) {
+        float4 xv = xs[i] * col[i];
+        for (uint ri = 0u; ri < nr; ++ri) {
+            float v = dot(float4(q[(ulong)(r0 + ri) * cols4 + i]), xv);
+            if (ri == 0u) a0.x += v;
+            else if (ri == 1u) a1.x += v;
+            else if (ri == 2u) a2.x += v;
+            else a3.x += v;
+        }
+    }
+    float t0 = simd_sum(a0.x + a0.y + a0.z + a0.w);
+    float t1 = simd_sum(a1.x + a1.y + a1.z + a1.w);
+    float t2 = simd_sum(a2.x + a2.y + a2.z + a2.w);
+    float t3 = simd_sum(a3.x + a3.y + a3.z + a3.w);
+    if (lane == 0u) {
+        y[r0] = t0 * rs[r0];
+        if (nr > 1u) y[r0 + 1u] = t1 * rs[r0 + 1u];
+        if (nr > 2u) y[r0 + 2u] = t2 * rs[r0 + 2u];
+        if (nr > 3u) y[r0 + 3u] = t3 * rs[r0 + 3u];
+    }
+}
+
 // act[i] = silu(g[i])·u[i]·col[i] — down_proj input with the col field already
 // applied (q8_2f prescale on the GPU, without returning to the CPU).
 // GEMM prefill batch: y[bi, o] = rs[o]·Σ q[o,i]·xs[bi,i].
@@ -2090,6 +2154,7 @@ kernel void gqa_attend(
     constant uint& hd  [[buffer(7)]],
     constant uint& cap [[buffer(8)]],
     constant uint& n   [[buffer(9)]],
+    constant float& scale [[buffer(10)]],
     threadgroup float* sh [[threadgroup(0)]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
@@ -2101,7 +2166,6 @@ kernel void gqa_attend(
     uint kh = h / hpk;
     device const float* kh0 = kbuf + (ulong)kh * cap * hd;
     device const float* vh0 = vbuf + (ulong)kh * cap * hd;
-    float scale = 1.0f / sqrt((float)hd);
     uint nt = (hd + 31u) / 32u;
     float qv[8];
     for (uint t = 0; t < nt; ++t) {
@@ -2236,6 +2300,7 @@ kernel void gqa_attend_blk(
     constant uint& s0   [[buffer(8)]],
     constant uint& nb   [[buffer(9)]],
     constant uint& nblk [[buffer(10)]],
+    constant float& scale [[buffer(11)]],
     uint3 tg [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]])
@@ -2259,7 +2324,6 @@ kernel void gqa_attend_blk(
     device const float* kh0 = kbuf + (ulong)kh * cap * hd;
     device const float* vh0 = vbuf + (ulong)kh * cap * hd;
     device const float* qh = q + ((ulong)e * nh + h) * hd;
-    float scale = 1.0f / sqrt((float)hd);
     float qv[8];
     for (uint t = 0; t < nt; ++t) {
         uint d = t * 32u + lane;
@@ -2617,6 +2681,7 @@ kernel void chunk_attend(
     constant uint& cap [[buffer(8)]],
     constant uint& s0  [[buffer(9)]],
     constant uint& nb  [[buffer(10)]],
+    constant float& scale [[buffer(11)]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint2 tg [[threadgroup_position_in_grid]],
@@ -2630,7 +2695,6 @@ kernel void chunk_attend(
     device const float* kh0 = kbuf + (ulong)kh * cap * hd;
     device const float* vh0 = vbuf + (ulong)kh * cap * hd;
     device const float* qh = q + ((ulong)bi * nh + h) * hd;
-    float scale = 1.0f / sqrt((float)hd);
     uint nt = (hd + 31u) / 32u;
     float qv[8];
     for (uint t = 0; t < nt; ++t) {
@@ -5419,6 +5483,7 @@ struct Ctx {
     queue: CommandQueue,
     q8: ComputePipelineState,
     q8f: ComputePipelineState,
+    q8f_r4: ComputePipelineState,
     q8mm: ComputePipelineState,
     q8mmm: ComputePipelineState,
     q1: ComputePipelineState,
@@ -5627,6 +5692,7 @@ fn init() -> Result<Ctx, String> {
     };
     let q8 = pso("q8_matvec")?;
     let q8f = pso("q8f_matvec")?;
+    let q8f_r4 = pso("q8f_matvec_r4")?;
     let q8mm = pso("q8_matmat")?;
     // Functions referencing function constants must be fetched through
     // the constantValues API even for the generic (all-optional-unset)
@@ -5729,6 +5795,7 @@ fn init() -> Result<Ctx, String> {
         queue,
         q8,
         q8f,
+        q8f_r4,
         q8mm,
         q8mmm,
         q1,
@@ -6941,7 +7008,19 @@ fn encode_q8_matvec(
     rows: usize,
     gpr: usize,
 ) {
-    enc.set_compute_pipeline_state(if col_buf.is_some() { &c.q8f } else { &c.q8 });
+    static R4: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // Four-row reuse is an opt-in probe: on the fanless M4 it reduced x/col
+    // traffic but the register-pressure/occupancy trade was neutral to slower
+    // across alternating runs. Keep the one-row kernel as the measured default.
+    let r4 =
+        col_buf.is_some() && *R4.get_or_init(|| std::env::var("CMF_Q8_R4").as_deref() == Ok("1"));
+    enc.set_compute_pipeline_state(if r4 {
+        &c.q8f_r4
+    } else if col_buf.is_some() {
+        &c.q8f
+    } else {
+        &c.q8
+    });
     fbuf.bind(enc, 0, abs);
     enc.set_buffer(1, Some(in_buf), 0);
     enc.set_buffer(2, Some(rs_buf), 0);
@@ -6961,7 +7040,7 @@ fn encode_q8_matvec(
         &rows_u as *const u32 as *const std::ffi::c_void,
     );
     let sgs = 8u64;
-    let n_tg = (rows as u64).div_ceil(sgs);
+    let n_tg = (rows as u64).div_ceil(sgs * if r4 { 4 } else { 1 });
     enc.dispatch_thread_groups(MTLSize::new(n_tg, 1, 1), MTLSize::new(sgs * 32, 1, 1));
 }
 
@@ -11806,6 +11885,7 @@ impl TokenGraph {
             hd: p.hd,
             rd: p.rd,
             position: p.position,
+            scale: p.scale,
             eps: p.eps,
             gemma: p.gemma,
             output_gate: p.output_gate,
@@ -12410,6 +12490,7 @@ impl TokenGraph {
                 && n_pos > thr
                 && encode_gqa_attend_blk(
                     self.c, enc, &qr_b, &k_mb, &v_mb, &ao_b, p.nh, p.nkv, p.hd, cap, stored, 1,
+                    p.scale,
                 );
             let cap_sgs = (self.c.gqat.max_total_threads_per_threadgroup() as usize / 32)
                 .clamp(1, gqa_split_max());
@@ -12427,7 +12508,7 @@ impl TokenGraph {
                         cap as u32,
                         n_pos as u32,
                     ],
-                    &[],
+                    &[p.scale],
                     ((p.nh * tg_threads) as u64, tg_threads as u64),
                     ((sgs * p.hd + 2 * sgs) * 4) as u64,
                 );
@@ -13047,6 +13128,7 @@ pub struct AttnDeviceParams<'a> {
     pub hd: usize,
     pub rd: usize,
     pub position: usize,
+    pub scale: f32,
     pub eps: f32,
     pub gemma: bool,
     pub output_gate: bool,
@@ -13874,7 +13956,7 @@ impl VerifyGraph {
             && stored + b > thr
             && !verify_skip('a')
             && encode_gqa_attend_blk(
-                c, enc, &qr_b, &k_mb, &v_mb, &ao_b, p.nh, p.nkv, p.hd, cap, stored, b,
+                c, enc, &qr_b, &k_mb, &v_mb, &ao_b, p.nh, p.nkv, p.hd, cap, stored, b, p.scale,
             );
         if b >= 2 && !blk {
             // the chunk attend: one simdgroup per (row, head), row e over
@@ -13898,6 +13980,7 @@ impl VerifyGraph {
                 for (i, v) in w.iter().enumerate() {
                     enc.set_bytes(5 + i as u64, 4, v as *const u32 as *const std::ffi::c_void);
                 }
+                enc.set_bytes(11, 4, &p.scale as *const f32 as *const std::ffi::c_void);
                 enc.dispatch_thread_groups(
                     MTLSize::new((p.nh as u64).div_ceil(8), b as u64, 1),
                     MTLSize::new(256, 1, 1),
@@ -13931,7 +14014,7 @@ impl VerifyGraph {
                     cap as u32,
                     n_pos as u32,
                 ],
-                &[],
+                &[p.scale],
                 ((p.nh * tg_threads) as u64, tg_threads as u64),
                 ((sgs * p.hd + 2 * sgs) * 4) as u64,
             );
@@ -14158,6 +14241,7 @@ fn encode_gqa_attend_blk(
     cap: usize,
     stored: usize,
     nb: usize,
+    scale: f32,
 ) -> bool {
     let hpk = nh / nkv;
     if hpk == 0 || hpk > 8 || hd > 1024 || nb == 0 {
@@ -14187,6 +14271,7 @@ fn encode_gqa_attend_blk(
     for (i, v) in w.iter().enumerate() {
         enc.set_bytes(4 + i as u64, 4, v as *const u32 as *const std::ffi::c_void);
     }
+    enc.set_bytes(11, 4, &scale as *const f32 as *const std::ffi::c_void);
     enc.dispatch_thread_groups(
         MTLSize::new(nkv as u64, nblk as u64, nb as u64),
         MTLSize::new((hpk * 32) as u64, 1, 1),

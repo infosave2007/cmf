@@ -453,14 +453,25 @@ fn force_f16(name: &str) -> bool {
 /// percent, whereas a uniform four-bit GDN stack loses coherence after a few
 /// dozen layers.
 fn quant_for_tensor(arch: &ModelArch, name: &str, base: Quant) -> Quant {
-    if !matches!(base, Quant::Q4TiledP | Quant::Q2TiledP) || arch.qwen4_exp.is_none() {
+    if !matches!(base, Quant::Q4TiledP | Quant::Q2TiledP) {
+        return base;
+    }
+    let vocabulary_edges = name == "model.embed_tokens.weight" || name == "lm_head.weight";
+    // Granite 4.2's 100k-token input/output tables are a quality-sensitive
+    // boundary around an otherwise ordinary dense stack.  Keeping just those
+    // two matrices in q8_2f costs little beside the 8B/30B bodies (and remains
+    // worthwhile on 3B), while avoiding a second four-bit error at both the
+    // first and final projection.  The full q8_2f profile is unchanged.
+    if arch.arch_name.eq_ignore_ascii_case("granite") && vocabulary_edges {
+        return Quant::Q8_2f;
+    }
+    if arch.qwen4_exp.is_none() {
         return base;
     }
     let recurrent_skeleton = name.contains(".linear_attn.")
         || name.contains(".self_attn.")
         || (name.contains(".ple.")
             && (name.ends_with("key_proj.weight") || name.ends_with("value_proj.weight")));
-    let vocabulary_edges = name == "model.embed_tokens.weight" || name == "lm_head.weight";
     if recurrent_skeleton || vocabulary_edges {
         Quant::Q8_2f
     } else {
@@ -2045,6 +2056,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
     // Zero-centered RMSNorm x̂·(1+w): Gemma family and Qwen3.5 / Qwen3-Next.
     let mt = model_type.to_lowercase();
     let is_laguna = mt == "laguna";
+    let is_granite = mt == "granite";
     if is_laguna {
         anyhow::ensure!(
             !tc.get("swa_attention_sink_enabled")
@@ -2064,6 +2076,16 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
             "laguna: moe_apply_router_weight_on_input=true is not supported"
+        );
+    }
+    if is_granite {
+        let residual_multiplier = tc
+            .get("residual_multiplier")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0);
+        anyhow::ensure!(
+            (residual_multiplier - 1.0).abs() <= f64::EPSILON,
+            "granite: residual_multiplier={residual_multiplier} is not supported yet"
         );
     }
     let norm_style = if (mt.contains("gemma") && !mt.contains("gemma4") && !mt.contains("gemma3n"))
@@ -2204,7 +2226,11 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         other => anyhow::bail!("unsupported hidden_act '{other}'"),
     };
     let is_minicpm3 = model_type == "minicpm3";
-    let embed_multiplier = if is_gemma {
+    let embed_multiplier = if is_granite {
+        tc.get("embedding_multiplier")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0) as f32
+    } else if is_gemma {
         (hidden as f32).sqrt()
     } else if is_minicpm3 {
         // MiniCPM: embeddings enter the stack ×scale_emb.
@@ -2214,7 +2240,18 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
     };
     // MiniCPM: logits = lm_head(h) · dim_model_base/hidden; the head is
     // tied to the embedding, so the divisor rides in the header.
-    let logit_multiplier = if is_minicpm3 {
+    let logit_multiplier = if is_granite {
+        let divisor = tc
+            .get("logits_scaling")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0);
+        anyhow::ensure!(
+            divisor.is_finite() && divisor > 0.0,
+            "granite: logits_scaling must be finite and positive"
+        );
+        let multiplier = (1.0 / divisor) as f32;
+        ((multiplier - 1.0).abs() > f32::EPSILON).then_some(multiplier)
+    } else if is_minicpm3 {
         cfg_usize(tc, "dim_model_base").map(|d| d as f32 / hidden as f32)
     } else {
         None
@@ -2406,6 +2443,14 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         query_pre_attn_scalar: tc
             .get("query_pre_attn_scalar")
             .and_then(|v| v.as_f64())
+            // Granite specifies the DIRECT multiplier on QK^T.  CMF stores
+            // the equivalent denominator s where the runtime uses 1/sqrt(s).
+            .or_else(|| {
+                tc.get("attention_multiplier")
+                    .and_then(|v| v.as_f64())
+                    .filter(|&v| v.is_finite() && v > 0.0)
+                    .map(|v| 1.0 / (v * v))
+            })
             // Gemma-4 and Gemma-3n attend with scale 1.0 (q-norm carries it).
             .or(if is_gemma4 || is_gemma3n {
                 Some(1.0)
@@ -4610,6 +4655,69 @@ pub(crate) mod tests {
             rel_rms(live, got) < 0.15,
             "dead tile stretched the row's ladder"
         );
+    }
+
+    #[test]
+    fn granite_42_maps_scaling_and_protects_vocabulary_edges() {
+        let config = serde_json::json!({
+            "architectures": ["GraniteForCausalLM"],
+            "model_type": "granite",
+            "hidden_size": 4096,
+            "intermediate_size": 32768,
+            "num_hidden_layers": 64,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "vocab_size": 100352,
+            "max_position_embeddings": 131072,
+            "rms_norm_eps": 0.00001,
+            "rope_theta": 50000000.0,
+            "attention_multiplier": 0.0078125,
+            "embedding_multiplier": 1.0,
+            "residual_multiplier": 1.0,
+            "logits_scaling": 1.0,
+            "hidden_act": "silu",
+            "tie_word_embeddings": false
+        });
+        let arch = build_arch(&config).unwrap();
+        assert_eq!(arch.arch_name, "granite");
+        assert_eq!((arch.hidden_size, arch.head_dim), (4096, 128));
+        assert_eq!(arch.rope_theta, 50_000_000.0);
+        assert_eq!(arch.norm_style, NormStyle::Qwen);
+        assert_eq!(arch.embed_multiplier, 1.0);
+        assert_eq!(arch.logit_multiplier, None);
+        assert_eq!(arch.query_pre_attn_scalar, Some(16_384.0));
+        assert_eq!(
+            quant_for_tensor(&arch, "model.embed_tokens.weight", Quant::Q4TiledP),
+            Quant::Q8_2f
+        );
+        assert_eq!(
+            quant_for_tensor(&arch, "lm_head.weight", Quant::Q4TiledP),
+            Quant::Q8_2f
+        );
+        assert_eq!(
+            quant_for_tensor(
+                &arch,
+                "model.layers.0.self_attn.q_proj.weight",
+                Quant::Q4TiledP,
+            ),
+            Quant::Q4TiledP
+        );
+    }
+
+    #[test]
+    fn granite_refuses_an_unimplemented_residual_multiplier() {
+        let config = serde_json::json!({
+            "model_type": "granite",
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "vocab_size": 32,
+            "residual_multiplier": 0.22
+        });
+        let err = build_arch(&config).unwrap_err().to_string();
+        assert!(err.contains("residual_multiplier=0.22"), "{err}");
     }
 
     #[test]

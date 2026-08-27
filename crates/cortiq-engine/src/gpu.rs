@@ -31,16 +31,27 @@ thread_local! {
     static PROBE_COLD: Cell<bool> = const { Cell::new(false) };
 }
 
+/// RAII form of `cpu_scope`, used when a device-prefix graph hands a whole
+/// remainder of the forward pass to the host. Without a guard around that
+/// tail, its ordinary per-op hooks re-entered the GPU and streamed the rest of
+/// an over-size model through the residency arena, defeating the prefix's VRAM
+/// bound at the driver-allocation level.
+pub struct CpuScopeGuard(bool);
+
+impl Drop for CpuScopeGuard {
+    fn drop(&mut self) {
+        CPU_ONLY.with(|c| c.set(self.0));
+    }
+}
+
+pub fn enter_cpu_scope() -> CpuScopeGuard {
+    let previous = CPU_ONLY.with(|c| c.replace(true));
+    CpuScopeGuard(previous)
+}
+
 /// Run `f` with the GPU gates off on this thread (pure-CPU arm).
 pub fn cpu_scope<R>(f: impl FnOnce() -> R) -> R {
-    struct Restore(bool);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            CPU_ONLY.with(|c| c.set(self.0));
-        }
-    }
-    let previous = CPU_ONLY.with(|c| c.replace(true));
-    let _restore = Restore(previous);
+    let _restore = enter_cpu_scope();
     f()
 }
 
@@ -226,6 +237,22 @@ pub fn set_layer(l: i64) {
 /// The layer `set_layer` last marked on this thread (−1 outside layers).
 pub fn cur_layer() -> i64 {
     CUR_LAYER.with(|c| c.get())
+}
+
+/// Capacity-derived layer prefix for per-op walks. The explicit
+/// `CMF_GPU_LAYERS` override is handled by the backend and takes precedence.
+pub fn automatic_layer_prefix(
+    model: &Arc<CmfModel>,
+    num_layers: usize,
+    physical_layers: usize,
+) -> Option<usize> {
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => {
+            crate::gpu_wgpu::automatic_layer_prefix(model, num_layers, physical_layers)
+        }
+        _ => None,
+    }
 }
 
 /// Parse `CMF_GPU_LAYERS` («0-19», «0,2,4», «0-9,30-39») once.
@@ -1384,6 +1411,7 @@ pub fn forward_token_graph(
     nh: usize,
     nkv: usize,
     hd: usize,
+    attn_scale: f32,
     rd: usize,
     hidden: usize,
     inter: usize,
@@ -1421,6 +1449,7 @@ pub fn forward_token_graph(
             nh,
             nkv,
             hd,
+            attn_scale,
             rd,
             hidden,
             inter,
@@ -1442,6 +1471,7 @@ pub fn forward_token_graph(
         #[allow(unused_variables)]
         _ => {
             let _ = (
+                attn_scale,
                 lm_head,
                 final_norm,
                 logits,
@@ -1485,6 +1515,7 @@ pub fn forward_batch_graph(
     cap: usize,
     gemma: bool,
     eps: f32,
+    attn_scale: f32,
     k: usize,
     spec: Option<SpecTail<'_>>,
 ) -> bool {
@@ -1492,7 +1523,7 @@ pub fn forward_batch_graph(
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::forward_batch_graph(
             model, kv_id, layers, invf, h, nh, nkv, hd, rd, hidden, inter, positions, cap, gemma,
-            eps, k, spec,
+            eps, attn_scale, k, spec,
         ),
         #[allow(unreachable_patterns)]
         _ => {

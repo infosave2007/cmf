@@ -2796,7 +2796,7 @@ fn kv_append(@builtin(global_invocation_id) gid: vec3<u32>) {
 // cached positions with the per-position q·k dot reduced in workgroup memory
 // (portable — no subgroup ops). WGSL twin of Metal gqa_attend (output only;
 // Born-importance is handled on the CPU side when eviction is active).
-struct AtP { nh: u32, hpk: u32, hd: u32, cap: u32, n: u32, _a: u32, _b: u32, _c: u32 };
+struct AtP { nh: u32, hpk: u32, hd: u32, cap: u32, n: u32, scale: f32, _b: u32, _c: u32 };
 @group(0) @binding(0) var<storage, read>       at_q : array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read>       at_k : array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read>       at_v : array<vec4<f32>>;
@@ -2836,7 +2836,7 @@ fn gqa_attend_dec(@builtin(workgroup_id) wid: vec3<u32>,
     let n = at_p.n;
     let kbase = (h / at_p.hpk) * at_p.cap * hd4;
     let qbase = h * hd4;
-    let scale = 1.0 / sqrt(f32(hd));
+    let scale = at_p.scale;
     var m = -1.0e30;
     var l = 0.0;
     var acc = 0.0;                      // this lane's output dim (lid < hd)
@@ -2910,7 +2910,7 @@ fn gqa_attend(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_i
     let n = at_p.n;
     let kbase = (h / at_p.hpk) * at_p.cap * hd4;
     let qbase = h * hd4;
-    let scale = 1.0 / sqrt(f32(hd));
+    let scale = at_p.scale;
     let base = lane * 257u;
     for (var d = 0u; d < hd; d = d + 1u) { at_acc[base + d] = 0.0; }
     var m = -1e30;
@@ -2992,7 +2992,7 @@ fn gqa_attend_w16(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocati
     let n = at_p.n;
     let kbase = (h / at_p.hpk) * at_p.cap * hd4;
     let qbase = h * hd4;
-    let scale = 1.0 / sqrt(f32(hd));
+    let scale = at_p.scale;
     let base = lane * 257u;
     for (var d = 0u; d < hd; d = d + 1u) { at_acc16[base + d] = 0.0; }
     var m = -1e30;
@@ -3065,7 +3065,7 @@ fn gqa_attend_s(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation
     let n = at_p.n;
     let kbase = (h / at_p.hpk) * at_p.cap * hd4;
     let qbase = h * hd4;
-    let scale = 1.0 / sqrt(f32(hd));
+    let scale = at_p.scale;
     let base = lane * 129u;
     for (var d = 0u; d < hd; d = d + 1u) { at_acc_s[base + d] = 0.0; }
     var m = -1e30;
@@ -12522,7 +12522,7 @@ fn bake_attn_gate(@builtin(global_invocation_id) gid: vec3<u32>) {
 // `gqa_attend_merge` (grid nh) rescales the chunk frames into the global max
 // and normalizes. Same math as `gqa_attend` up to one extra merge rounding.
 const ATTEND_SPLIT_SRC: &str = r#"
-struct ApP { nh: u32, hpk: u32, hd: u32, cap: u32, n: u32, ck: u32, nc: u32, _p: u32 };
+struct ApP { nh: u32, hpk: u32, hd: u32, cap: u32, n: u32, ck: u32, nc: u32, scale: f32 };
 @group(0) @binding(0) var<storage, read>       ap_q  : array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read>       ap_k  : array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read>       ap_v  : array<vec4<f32>>;
@@ -12545,7 +12545,7 @@ fn gqa_attend_part(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocat
     let pend = min(ap_p.n, p0 + ap_p.ck);
     let kbase = (h / ap_p.hpk) * ap_p.cap * hd4;
     let qbase = h * hd4;
-    let scale = 1.0 / sqrt(f32(hd));
+    let scale = ap_p.scale;
     let base = lane * 257u;
     for (var d = 0u; d < hd; d = d + 1u) { app_acc[base + d] = 0.0; }
     var m = -1e30;
@@ -12618,7 +12618,7 @@ fn gqa_attend_part_s(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invoc
     let pend = min(ap_p.n, p0 + ap_p.ck);
     let kbase = (h / ap_p.hpk) * ap_p.cap * hd4;
     let qbase = h * hd4;
-    let scale = 1.0 / sqrt(f32(hd));
+    let scale = ap_p.scale;
     let base = lane * 129u;
     for (var d = 0u; d < hd; d = d + 1u) { app_acc_s[base + d] = 0.0; }
     var m = -1e30;
@@ -12729,7 +12729,7 @@ fn gqa_attend_gpart(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invoca
     let pend = min(ap_p.n, p0 + AG_CK);
     let cn = select(0u, pend - p0, pend > p0);
     let kbase = g * ap_p.cap * hd4;
-    let scale = 1.0 / sqrt(f32(hd));
+    let scale = ap_p.scale;
     // Stage this group's queries (zeros for the unused head slots so the
     // unrolled dots below need no guards).
     for (var i = lid; i < 512u; i = i + 256u) {
@@ -13336,6 +13336,78 @@ struct KvMirror {
     k: wgpu::Buffer,
     v: wgpu::Buffer,
     synced: usize,
+    cap: usize,
+}
+
+/// Device KV mirrors grow with the conversation instead of reserving the
+/// model's advertised maximum context at first token. Granite 4.2 advertises
+/// 131k: eagerly allocating `[64 layers, K+V, 8 heads, 131k, 128]` asks for
+/// about 64 GiB of KV before one token is decoded. Power-of-two growth keeps
+/// short prompts small and makes the occasional resize logarithmic.
+fn kv_capacity(limit: usize, need: usize) -> usize {
+    let floor = std::env::var("CMF_GPU_KV_MIN")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(512)
+        .max(1);
+    need.max(1)
+        .checked_next_power_of_two()
+        .unwrap_or(limit)
+        .max(floor.min(limit))
+        .min(limit)
+}
+
+/// Return a mirror with at least `want_cap` positions. Growth copies the
+/// already-device-resident history head by head into the new stride, so batch
+/// prefill and speculative verification do not need a CPU round trip.
+fn kv_mirror_ensure<'a>(
+    c: &Ctx,
+    mirrors: &'a mut HashMap<(u64, usize), KvMirror>,
+    key: (u64, usize),
+    nkv: usize,
+    hd: usize,
+    want_cap: usize,
+) -> &'a mut KvMirror {
+    let grow = mirrors.get(&key).is_none_or(|m| m.cap < want_cap);
+    if grow {
+        let old = mirrors.remove(&key);
+        let sz = (nkv * want_cap * hd * 4) as u64;
+        let mk = || {
+            c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("kv-mirror"),
+                size: sz.max(4),
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            })
+        };
+        let fresh = KvMirror {
+            k: mk(),
+            v: mk(),
+            synced: old.as_ref().map_or(0, |m| m.synced.min(want_cap)),
+            cap: want_cap,
+        };
+        if let Some(old) = old.filter(|m| m.synced > 0) {
+            let copy_pos = old.synced.min(want_cap);
+            let nbytes = (copy_pos * hd * 4) as u64;
+            let mut enc = c
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("kv-grow"),
+                });
+            for h in 0..nkv {
+                let src = (h * old.cap * hd * 4) as u64;
+                let dst = (h * want_cap * hd * 4) as u64;
+                enc.copy_buffer_to_buffer(&old.k, src, &fresh.k, dst, nbytes);
+                enc.copy_buffer_to_buffer(&old.v, src, &fresh.v, dst, nbytes);
+            }
+            submit(c, finish_enc(enc));
+            let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+        }
+        mirrors.insert(key, fresh);
+    }
+    mirrors.get_mut(&key).unwrap()
 }
 
 #[derive(Default)]
@@ -13601,6 +13673,77 @@ fn ctx_for(dev: usize) -> Option<&'static Ctx> {
 /// and a layer split.
 pub fn device_vram_budget() -> u64 {
     ctx().map(|c| c.vram_budget).unwrap_or(0)
+}
+
+/// Physical live-set ceiling used while an over-size graph is assembled.
+/// On the measured Vulkan path Q8_2F needs about 1.6× its packed payload in
+/// driver allocations (19 Granite-30B layers: 15,384 MiB; 30 layers:
+/// 23,832 MiB). The adjusted ceiling still keeps a full graph whenever its
+/// packed payload fits below it (3B/8B on the A40, for example); only a Q8_2F
+/// stack whose physical expansion would cross the card becomes a prefix.
+fn graph_live_weight_budget(c: &Ctx, model: &Arc<CmfModel>) -> u64 {
+    let (mut total, mut q8) = (0u64, 0u64);
+    for e in &model.tensors {
+        total = total.saturating_add(e.nbytes);
+        if e.dtype == cortiq_core::TensorDtype::Q8_2f {
+            q8 = q8.saturating_add(e.nbytes);
+        }
+    }
+    if q8 > total / 2 {
+        // 5/8 matched the packed-to-physical slope but left less than one
+        // GiB for the fixed context/pipeline allocations on an A40. 9/16
+        // keeps ~3 GiB of measured headroom while retaining the largest safe
+        // prefix (and is still substantially better than a blanket 50%).
+        c.vram_budget.saturating_mul(9) / 16
+    } else {
+        c.vram_budget
+    }
+}
+
+/// Automatic prefix for ordinary per-op layer walks (most importantly the
+/// batched prefill). A graph that does not fit already chooses a device
+/// prefix, but the fallback prefill used to stream every later CPU-tail layer
+/// through the GPU arena. Vulkan allocators retain freed blocks, so a 14 GiB
+/// logical arena reached a 25.4 GiB physical peak on Granite 30B Q8_2F.
+///
+/// Non-layer tensors are reserved first because lm_head/embed operations live
+/// outside `set_layer`. `None` means the complete stack fits; `Some(0)` is a
+/// valid all-CPU layer stack with the head still independently GPU-eligible.
+pub fn automatic_layer_prefix(
+    model: &Arc<CmfModel>,
+    num_layers: usize,
+    physical_layers: usize,
+) -> Option<usize> {
+    if std::env::var_os("CMF_GPU_LAYERS").is_some() {
+        return None; // an explicit split always wins
+    }
+    let c = ctx()?;
+    if c.vram_budget == u64::MAX || num_layers == 0 || physical_layers == 0 {
+        return None;
+    }
+    let live_budget = graph_live_weight_budget(c, model);
+    let mut layer_bytes = vec![0u64; physical_layers];
+    let mut outside = 0u64;
+    for e in &model.tensors {
+        let li = layer_of_name(&e.name);
+        if li != u16::MAX && (li as usize) < physical_layers {
+            layer_bytes[li as usize] = layer_bytes[li as usize].saturating_add(e.nbytes);
+        } else {
+            outside = outside.saturating_add(e.nbytes);
+        }
+    }
+    let usable = live_budget.saturating_sub(outside.min(live_budget));
+    let mut used = 0u64;
+    let mut prefix = 0usize;
+    for li in 0..num_layers {
+        let need = layer_bytes[li % physical_layers];
+        if used.saturating_add(need) > usable {
+            break;
+        }
+        used += need;
+        prefix += 1;
+    }
+    (prefix < num_layers).then_some(prefix)
 }
 
 /// How many adapters this build can see (0 when the backend is off).
@@ -13888,23 +14031,21 @@ fn init(dev: usize) -> Result<Ctx, String> {
         .map(|mb| mb * 1024 * 1024)
         .unwrap_or(if discrete {
             // No knob: ask the driver. The Vulkan device-local heap is what
-            // the card actually has; a margin of total/64 (1–2 GB) is left
-            // to the driver's own bookkeeping. Backends that cannot answer
+            // the card actually has; leave room for KV, graph scratch,
+            // pipelines and the upload allocator. Backends that cannot answer
             // (DX12/GL) keep the conservative default — CMF_GPU_VRAM_MB
             // overrides either way.
             match vulkan_vram_total(&adapter) {
                 Some(total) => {
                     let gib = 1024 * 1024 * 1024u64;
-                    // Weights are not the only thing on the card, but the old
-                    // 25%-with-an-8-GiB-cap rule stranded almost a fifth of an
-                    // A40 before the model geometry was even known. The DSV4
-                    // packer already reserves its draft and workspace, while
-                    // the residency cache evicts for other workloads. Keep a
-                    // small physical margin here: one GiB on 32-GiB cards,
-                    // scaling to two GiB on large discrete cards. An operator
-                    // with an unusually large render/KV workspace can still
-                    // lower the weight ceiling through CMF_GPU_VRAM_MB.
-                    total - (total / 32).clamp(gib, 2 * gib).min(total / 2)
+                    // The former 1/32 margin let a 29 GB q8_2f dense graph fill
+                    // an A40 to within 1.4 GiB, then OOM while constructing KV
+                    // and graph scratch. Measured 30B Q4TP needs more than a
+                    // 2 GiB floor on a 16 GiB card, so scale from 2.5 GiB at
+                    // 16 GiB through 3 GiB at 24 GiB to the existing 4 GiB
+                    // ceiling on large cards.
+                    let reserve = (total / 8).clamp(5 * gib / 2, 4 * gib).min(total / 2);
+                    total - reserve
                 }
                 None => 8 * 1024 * 1024 * 1024,
             }
@@ -15302,14 +15443,26 @@ fn weight_buffer_l(
 ) -> Option<wgpu::Buffer> {
     use std::sync::atomic::Ordering;
     let now = c.res_clock.fetch_add(1, Ordering::Relaxed);
-    let mut map = c.weight_bufs.lock().unwrap();
-    if let Some(e) = map.get_mut(&key) {
-        e.uses = res_score(e, now) + 1.0;
-        e.last = now;
-        RES_HITS.fetch_add(1, Ordering::Relaxed);
-        return Some(e.buf.clone());
-    }
     let len = full_quant.len() as u64;
+    let mut map = c.weight_bufs.lock().unwrap();
+    if let Some(e) = map.get(&key) {
+        if e.bytes >= len {
+            let e = map.get_mut(&key).unwrap();
+            e.uses = res_score(e, now) + 1.0;
+            e.last = now;
+            RES_HITS.fetch_add(1, Ordering::Relaxed);
+            return Some(e.buf.clone());
+        }
+        // The same tensor key can first be touched by a body-only q8 GEMM
+        // and later by q8_2f's packed graph kernel, which also reads the row
+        // and column scale planes. A resident hit is valid only when it is
+        // at least as large as the requested payload; upgrade shorter cache
+        // entries instead of returning a buffer whose tail does not exist.
+        let old = e.bytes;
+        map.remove(&key);
+        c.resident.fetch_sub(old, Ordering::Relaxed);
+        crate::gpu::probe_note_cold();
+    }
     if len > c.vram_budget {
         return None; // one tensor larger than the whole budget
     }
@@ -15322,7 +15475,9 @@ fn weight_buffer_l(
     // refused tensor is the one most likely to be missed again next
     // token, and refetching it from storage every time was measured as
     // 65% of all fetch traffic on DeepSeek-V4.
-    let tier_bytes = host_tier_get(key);
+    // A body-only cache fill may also have populated the host tier. It is
+    // useful for this request only if it contains the complete payload.
+    let tier_bytes = host_tier_get(key).filter(|v| v.len() >= full_quant.len());
     let full_quant: &[u8] = tier_bytes.as_deref().map_or(full_quant, |v| v);
     if std::env::var("CMF_MOE_RES").is_ok() {
         let m = RES_MISSES.load(Ordering::Relaxed);
@@ -15420,39 +15575,50 @@ fn weight_buffer_l(
     });
     let t_up = std::time::Instant::now();
     if upload_staged() {
-        // A staging buffer we map ourselves, then one copy. `queue.write_buffer`
-        // goes through wgpu's belt, which for a 92 GB expert stack measured
-        // ~48 MB/s on Vulkan — half an hour before the first token. This path
-        // memcpys straight into a mapped host-visible buffer and issues the
-        // device copy itself.
-        let n = len.next_multiple_of(4);
-        let stg = c.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("weight-staging"),
-            size: n,
-            usage: wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: true,
-        });
-        {
-            let Ok(mut view) = stg.slice(..).get_mapped_range_mut() else {
-                return None;
-            };
-            // Write-only by construction: mapped upload memory may be
-            // uncached, so wgpu hands out a slice you may write but not read.
-            view.slice(..full_quant.len()).copy_from_slice(full_quant);
-            if full_quant.len() < n as usize {
-                view.slice(full_quant.len()..).fill(0);
+        // Map and copy bounded chunks. `queue.write_buffer` goes through
+        // wgpu's belt, which for a 92 GB expert stack measured ~48 MB/s; one
+        // staging buffer per WHOLE tensor was fast but left a size-fragmented
+        // second model in the Vulkan allocator. A fixed chunk class keeps the
+        // speed and bounds the transient peak.
+        let chunk = upload_chunk_bytes().next_multiple_of(4);
+        for (ci, src) in full_quant.chunks(chunk).enumerate() {
+            let n = src.len().next_multiple_of(4) as u64;
+            let stg = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("weight-staging"),
+                // Every allocation has the SAME size, including the last
+                // short chunk of a tensor. Giving Vulkan one differently
+                // sized tail per projection made its allocator retain a
+                // fragmented second heap: a 14 GiB Granite Q8_2F prefix
+                // peaked at 23.8 GiB despite all final weights fitting the
+                // arena. Only `n` bytes are copied below, so the unused tail
+                // never needs to fit in the destination buffer.
+                size: chunk as u64,
+                usage: wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: true,
+            });
+            {
+                let Ok(mut view) = stg.slice(..).get_mapped_range_mut() else {
+                    return None;
+                };
+                // Write-only by construction: mapped upload memory may be
+                // uncached, so wgpu hands out a slice you may write but not read.
+                view.slice(..src.len()).copy_from_slice(src);
+                if src.len() < n as usize {
+                    view.slice(src.len()..).fill(0);
+                }
             }
+            stg.unmap();
+            let mut enc = c
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("wup") });
+            flush_pass(&enc);
+            enc.copy_buffer_to_buffer(&stg, 0, &buf, (ci * chunk) as u64, n);
+            submit(c, finish_enc(enc));
+            // The staging buffer must outlive the copy; polling before it is
+            // dropped also lets the allocator reuse this same chunk class.
+            let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+            drop(stg);
         }
-        stg.unmap();
-        let mut enc = c
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("wup") });
-        flush_pass(&enc);
-        enc.copy_buffer_to_buffer(&stg, 0, &buf, 0, n);
-        submit(c, finish_enc(enc));
-        // The staging buffer must outlive the copy; polling here also keeps
-        // the peak at one tensor rather than the whole stack.
-        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
     } else if full_quant.len() % 4 == 0 {
         c.queue.write_buffer(&buf, 0, full_quant);
     } else {
@@ -16135,18 +16301,35 @@ pub fn q8_resident_or_upload(model: &Arc<CmfModel>, idx: usize, may_upload: bool
         return false;
     };
     let bytes = model.primary_bytes();
-    if abs + rows_total * cols > bytes.len() {
+    // q8_2f's graph kernel reads the row and column scale planes from the
+    // same device buffer.  The per-op q8 kernel only needs the int8 body,
+    // but caching that shorter slice under the shared (model,tensor) key
+    // poisoned a later whole-token graph lookup: it found the resident body,
+    // read both scale planes out of bounds, and returned all-zero logits for
+    // large vocabulary heads.  Keep the complete packed payload resident so
+    // both consumers can safely share the cache entry.
+    let payload_len = if entry.dtype == cortiq_core::TensorDtype::Q8_2f {
+        entry.nbytes as usize
+    } else {
+        rows_total * cols
+    };
+    if abs + payload_len > bytes.len() {
         return false;
     }
     let key = (model.uid() as usize, idx);
-    if c.weight_bufs.lock().unwrap().contains_key(&key) {
+    if c.weight_bufs
+        .lock()
+        .unwrap()
+        .get(&key)
+        .is_some_and(|e| e.bytes >= payload_len as u64)
+    {
         return true;
     }
     if may_upload {
         let _ = weight_buffer_l(
             c,
             key,
-            &bytes[abs..abs + rows_total * cols],
+            &bytes[abs..abs + payload_len],
             layer_of_name(&model.tensors[idx].name),
         );
     }
@@ -16179,10 +16362,15 @@ pub fn q8_matvec_range(
         return false; // neighboring shard — different mapping; CPU
     };
     let bytes = model.primary_bytes();
-    if abs + rows_total * cols > bytes.len() {
+    let payload_len = if entry.dtype == cortiq_core::TensorDtype::Q8_2f {
+        entry.nbytes as usize
+    } else {
+        rows_total * cols
+    };
+    if abs + payload_len > bytes.len() {
         return false;
     }
-    let full_quant = &bytes[abs..abs + rows_total * cols];
+    let full_quant = &bytes[abs..abs + payload_len];
     let key = (model.uid() as usize, idx);
     dispatch_matvec(
         c,
@@ -16980,6 +17168,7 @@ pub fn attn_dropin_gpu(
     if pos >= cap || hd % 4 != 0 || hd > c.hd_cap {
         return false; // vec4 K/V reads; hd_cap = workgroup-storage limit
     }
+    let cap = kv_capacity(cap, pos + 1);
     let (wq, rq, cq) = q1_weight(c, model, wq_idx).unwrap_or((
         c.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
@@ -17007,24 +17196,7 @@ pub fn attn_dropin_gpu(
     }
     // Device K/V mirror (persist across tokens).
     let mut kvm = c.attn_kv.lock().unwrap();
-    let entry = kvm.entry((kv_id, layer)).or_insert_with(|| {
-        let sz = (nkv * cap * hd * 4) as u64;
-        let mk = || {
-            c.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("kv-mirror"),
-                size: sz,
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            })
-        };
-        KvMirror {
-            k: mk(),
-            v: mk(),
-            synced: 0,
-        }
-    });
+    let entry = kv_mirror_ensure(c, &mut kvm, (kv_id, layer), nkv, hd, cap);
     // Sync prefill history 0..pos from the CPU cache (once).
     if entry.synced < pos {
         for h in 0..nkv {
@@ -17144,7 +17316,7 @@ pub fn attn_dropin_gpu(
         hd as u32,
         cap as u32,
         (pos + 1) as u32,
-        0,
+        (1.0 / (hd as f32).sqrt()).to_bits(),
         0,
         0,
     ]);
@@ -17179,6 +17351,105 @@ pub fn attn_dropin_gpu(
     ok
 }
 
+/// Device bytes held alive by one layer of a whole-token graph.
+///
+/// This is deliberately independent of the residency counter. While a graph
+/// is being assembled every `GMat` keeps its `wgpu::Buffer` alive; removing an
+/// entry from the LRU therefore does not release the allocation until the
+/// graph finishes. A dense checkpoint larger than the arena used to appear to
+/// obey `CMF_GPU_VRAM_MB` while physically retaining the complete model and
+/// OOMing the driver. The graph builders use this real live-set size to choose
+/// a device prefix (decode) or decline the all-layers batch graph (prefill).
+fn graph_layer_payload_bytes(
+    model: &Arc<CmfModel>,
+    layer: &crate::gpu::GraphLayer<'_>,
+) -> Option<u64> {
+    let mut tensor_seen = std::collections::HashSet::<usize>::new();
+    let mut f32_seen = std::collections::HashSet::<usize>::new();
+    let mut total = 0u64;
+    let mut add = |w: &crate::gpu::GraphW<'_>| -> Option<()> {
+        let bytes = if w.kind == 4 {
+            if !f32_seen.insert(w.data.as_ptr() as usize) {
+                return Some(());
+            }
+            w.data.len().checked_mul(4)? as u64
+        } else {
+            if !tensor_seen.insert(w.idx) {
+                return Some(());
+            }
+            let e = model.tensors.get(w.idx)?;
+            // q8_row keeps its decoded f32 row-scale side buffer beside the
+            // byte body. Counting it in addition to `nbytes` is slightly
+            // conservative (the file has f16 scales), which is the safe side
+            // of a hard VRAM boundary.
+            (e.nbytes as u64).checked_add(if w.kind == 0 {
+                (w.row_scale.len() as u64).checked_mul(4)?
+            } else {
+                0
+            })?
+        };
+        total = total.checked_add(bytes)?;
+        Some(())
+    };
+    match &layer.attn {
+        crate::gpu::GraphAttn::Full { wq, wk, wv, wo, .. } => {
+            add(wq)?;
+            add(wk)?;
+            add(wv)?;
+            add(wo)?;
+        }
+        crate::gpu::GraphAttn::Gdn {
+            qkv, z, a, b, out, ..
+        } => {
+            add(qkv)?;
+            add(z)?;
+            add(a)?;
+            add(b)?;
+            add(out)?;
+        }
+        crate::gpu::GraphAttn::ShortConv { inp, out, .. } => {
+            add(inp)?;
+            add(out)?;
+        }
+    }
+    match &layer.ffn {
+        crate::gpu::GraphFfn::Dense { gate, up, down } => {
+            add(gate)?;
+            add(up)?;
+            add(down)?;
+        }
+        crate::gpu::GraphFfn::Moe {
+            router,
+            shared_gate,
+            experts,
+            has_shared,
+            ..
+        } => {
+            add(router)?;
+            if *has_shared {
+                add(shared_gate)?;
+            }
+            for &(g, u, d) in experts {
+                for idx in [g, u, d] {
+                    if tensor_seen.insert(idx) {
+                        total = total.checked_add(model.tensors.get(idx)?.nbytes as u64)?;
+                    }
+                }
+            }
+        }
+    }
+    Some(total)
+}
+
+fn graph_stack_payload_bytes(
+    model: &Arc<CmfModel>,
+    layers: &[crate::gpu::GraphLayer<'_>],
+) -> Option<u64> {
+    layers.iter().try_fold(0u64, |n, l| {
+        n.checked_add(graph_layer_payload_bytes(model, l)?)
+    })
+}
+
 /// WHOLE-TOKEN decode graph: the entire layer stack (rmsnorm → attention →
 /// residual → rmsnorm → SiLU-FFN → residual, every layer) encoded into ONE
 /// command buffer with the hidden RESIDENT on the GPU — only the final hidden
@@ -17196,6 +17467,7 @@ pub fn forward_token_graph(
     nh: usize,
     nkv: usize,
     hd: usize,
+    attn_scale: f32,
     rd: usize,
     hidden: usize,
     inter: usize,
@@ -17236,6 +17508,7 @@ pub fn forward_token_graph(
         graph_refused("no ctx");
         return false;
     };
+    let graph_live_budget = graph_live_weight_budget(c, model);
     if position >= cap || hd % 4 != 0 || hd > c.hd_cap {
         {
             use std::sync::atomic::{AtomicBool, Ordering};
@@ -17250,6 +17523,7 @@ pub fn forward_token_graph(
         }
         return false; // vec4 K/V reads; hd_cap = workgroup-storage limit
     }
+    let cap = kv_capacity(cap, position.saturating_add(steps.max(1)));
     let t_start = std::time::Instant::now();
     // A resolved matvec weight: the device-local buffer, (q8 only) its row
     // scales, and the codec kind (0=q8_row 1=q1 2=q4_block 3=q1t 4=f32 5=q4_tiled).
@@ -17457,12 +17731,27 @@ pub fn forward_token_graph(
     };
     let mut lws = Vec::with_capacity(layers.len());
     let mut gdn_dims: Option<(usize, usize, usize, usize, usize, usize)> = None; // nv,nk,dk,dv,kk,cdim
-    // Budget-driven device prefix: the first MoE layer whose experts no
-    // longer fit ends the prefix instead of sinking the whole graph — the
-    // caller finishes the remaining layers on the host from the boundary
-    // hidden. One sync per token at the boundary, not per layer.
+    // Budget-driven device prefix: the first layer whose live graph buffers
+    // no longer fit ends the prefix instead of retaining an over-budget dense
+    // stack behind evicted LRU handles. The caller finishes the remaining
+    // layers on the host from the boundary hidden: one sync per token at the
+    // boundary, not per layer.
     let mut prefix = false;
+    let mut graph_bytes = 0u64;
     for l in layers {
+        let Some(layer_bytes) = graph_layer_payload_bytes(model, l) else {
+            graph_decline("cannot size layer payload");
+            return false;
+        };
+        if graph_bytes.saturating_add(layer_bytes) > graph_live_budget {
+            if lws.is_empty() {
+                graph_decline("one layer exceeds the weight budget");
+                return false;
+            }
+            prefix = true;
+            break;
+        }
+        graph_bytes += layer_bytes;
         let attn = match &l.attn {
             crate::gpu::GraphAttn::Full {
                 wq,
@@ -17607,13 +17896,9 @@ pub fn forward_token_graph(
                 } else {
                     router.clone()
                 };
-                // Over budget with layers already built: end the prefix
-                // here. Layer zero over budget keeps the historical loud
-                // whole-graph refusal inside moe_expert_bufs. A layer whose
-                // buffers are ALREADY on the card is never the one to stop
-                // at — its bytes are inside `resident`, so re-running the
-                // check against them would shrink the prefix to one layer
-                // on the second token (measured: 25 tok/s where 60 belongs).
+                // The layer-level live-set check above owns the prefix
+                // boundary. Keep this arena check for other resident data
+                // that may already occupy the explicit weight budget.
                 let cached = experts.first().is_some_and(|e| {
                     c.moe_expw
                         .lock()
@@ -17662,6 +17947,42 @@ pub fn forward_token_graph(
         };
         lws.push(LW { attn, ffn });
     }
+    // The tail weight is resolved only after the layer command stream has
+    // been encoded. Reserve it now: otherwise a stack that fits by itself
+    // can evict one of its already-referenced buffers to admit lm_head and
+    // exceed the physical limit despite a correct LRU counter.
+    if !prefix {
+        let mut tail_bytes = 0u64;
+        if let Some((w, _)) = lm_head {
+            tail_bytes = tail_bytes.saturating_add(
+                model
+                    .tensors
+                    .get(w.idx)
+                    .map(|e| e.nbytes as u64)
+                    .unwrap_or(u64::MAX),
+            );
+        }
+        if steps > 1 {
+            if let Some((w, _, _)) = embed {
+                if lm_head.is_none_or(|(lm, _)| lm.idx != w.idx) {
+                    tail_bytes = tail_bytes.saturating_add(
+                        model
+                            .tensors
+                            .get(w.idx)
+                            .map(|e| e.nbytes as u64)
+                            .unwrap_or(u64::MAX),
+                    );
+                }
+            }
+        }
+        if graph_bytes.saturating_add(tail_bytes) > graph_live_budget {
+            if lws.pop().is_none() {
+                graph_decline("layers plus tail exceed the weight budget");
+                return false;
+            }
+            prefix = true;
+        }
+    }
     if prefix {
         // The multi-step tail (on-device argmax + re-embed) needs the head,
         // which a prefix does not reach — those callers fall back whole.
@@ -17673,7 +17994,7 @@ pub fn forward_token_graph(
         static SAID: AtomicBool = AtomicBool::new(false);
         if !SAID.swap(true, Ordering::Relaxed) {
             tracing::info!(
-                "wgpu token graph: device prefix {} of {} layers (expert budget), \
+                "wgpu token graph: device prefix {} of {} layers (VRAM budget), \
                  the tail runs on the host from the boundary hidden",
                 lws.len(),
                 layers.len()
@@ -17883,24 +18204,7 @@ pub fn forward_token_graph(
                         gdnbufs.push(None);
                         continue;
                     }
-                    let e = kvm.entry((kv_id, layer_base + li)).or_insert_with(|| {
-                        let sz = (nkv * cap * hd * 4) as u64;
-                        let mk = || {
-                            c.device.create_buffer(&wgpu::BufferDescriptor {
-                                label: Some("kv"),
-                                size: sz,
-                                usage: wgpu::BufferUsages::STORAGE
-                                    | wgpu::BufferUsages::COPY_DST
-                                    | wgpu::BufferUsages::COPY_SRC,
-                                mapped_at_creation: false,
-                            })
-                        };
-                        KvMirror {
-                            k: mk(),
-                            v: mk(),
-                            synced: 0,
-                        }
-                    });
+                    let e = kv_mirror_ensure(c, &mut kvm, (kv_id, layer_base + li), nkv, hd, cap);
                     if e.synced < position {
                         for hh in 0..nkv {
                             let take = position.min(cpu_k[hh].len() / hd);
@@ -18103,7 +18407,7 @@ pub fn forward_token_graph(
                 hd as u32,
                 cap as u32,
                 (p + 1) as u32,
-                0,
+                attn_scale.to_bits(),
                 0,
                 0,
             ]),
@@ -18996,7 +19300,7 @@ pub fn forward_token_graph(
                                     n_ctx as u32,
                                     ck as u32,
                                     nc as u32,
-                                    0,
+                                    attn_scale.to_bits(),
                                 ]);
                                 let (pp, pl) = if gqa {
                                     (
@@ -20330,6 +20634,7 @@ pub fn forward_batch_graph(
     cap: usize,
     gemma: bool,
     eps: f32,
+    attn_scale: f32,
     k: usize,
     // Speculative verify: fold final-norm + lm_head over every position and
     // read the k logit rows back beside the hiddens, snapshotting the GDN
@@ -20342,6 +20647,7 @@ pub fn forward_batch_graph(
         bgraph_refused("no ctx");
         return false;
     };
+    let graph_live_budget = graph_live_weight_budget(c, model);
     if k == 0 || positions.len() != k {
         bgraph_refused("k/positions mismatch");
         return false;
@@ -20351,6 +20657,29 @@ pub fn forward_batch_graph(
         bgraph_refused("pos+k past cap, or head_dim not %4 / over hd_cap");
         return false; // vec4 K/V reads; hd_cap = workgroup-storage limit
     }
+    // Unlike the decode graph this function has no host-tail handoff: every
+    // layer must coexist in one command buffer. Refuse before the first
+    // upload when that live set cannot fit. Relying on the LRU here is
+    // incorrect because the `GMat`s below retain evicted buffers until the
+    // batch command finishes, producing a full-model transient allocation.
+    let Some(mut live_bytes) = graph_stack_payload_bytes(model, layers) else {
+        bgraph_refused("cannot size layer payload");
+        return false;
+    };
+    if let Some(sp) = spec.as_ref() {
+        live_bytes = live_bytes.saturating_add(
+            model
+                .tensors
+                .get(sp.lm.idx)
+                .map(|e| e.nbytes as u64)
+                .unwrap_or(u64::MAX),
+        );
+    }
+    if live_bytes > graph_live_budget {
+        bgraph_refused("all-layer live set exceeds the weight budget");
+        return false;
+    }
+    let cap = kv_capacity(cap, pos0 + k);
     struct GMat {
         buf: wgpu::Buffer,
         rs: Option<wgpu::Buffer>,
@@ -20772,24 +21101,7 @@ pub fn forward_batch_graph(
         for (li, l) in layers.iter().enumerate() {
             match &l.attn {
                 crate::gpu::GraphAttn::Full { .. } => {
-                    let e = kvm.entry((kv_id, li)).or_insert_with(|| {
-                        let sz = (nkv * cap * hd * 4) as u64;
-                        let mk = || {
-                            c.device.create_buffer(&wgpu::BufferDescriptor {
-                                label: Some("kv"),
-                                size: sz,
-                                usage: wgpu::BufferUsages::STORAGE
-                                    | wgpu::BufferUsages::COPY_DST
-                                    | wgpu::BufferUsages::COPY_SRC,
-                                mapped_at_creation: false,
-                            })
-                        };
-                        KvMirror {
-                            k: mk(),
-                            v: mk(),
-                            synced: 0,
-                        }
-                    });
+                    let e = kv_mirror_ensure(c, &mut kvm, (kv_id, li), nkv, hd, cap);
                     kvbufs.push(Some((e.k.clone(), e.v.clone())));
                     gdnbufs.push(None);
                 }
@@ -21220,7 +21532,7 @@ pub fn forward_batch_graph(
                             hd as u32,
                             cap as u32,
                             (p + 1) as u32,
-                            0,
+                            attn_scale.to_bits(),
                             0,
                             0,
                         ]);
@@ -21270,7 +21582,7 @@ pub fn forward_batch_graph(
                                 n_ctx as u32,
                                 ATTEND_GCK as u32,
                                 nc as u32,
-                                0,
+                                attn_scale.to_bits(),
                             ]);
                             let bg_part = bg(
                                 c.layout_attend_gpart.as_ref().unwrap(),
@@ -22265,7 +22577,7 @@ pub fn attn_block_gpu(
         hd as u32,
         cap as u32,
         (stored + 1) as u32,
-        0,
+        (1.0 / (hd as f32).sqrt()).to_bits(),
         0,
         0,
     ]);
@@ -22425,7 +22737,12 @@ pub fn q8_matmat_2f(
         return false;
     };
     let bytes = model.primary_bytes();
-    if abs + rows * cols > bytes.len()
+    let payload_len = if entry.dtype == cortiq_core::TensorDtype::Q8_2f {
+        entry.nbytes as usize
+    } else {
+        rows * cols
+    };
+    if abs + payload_len > bytes.len()
         || row_scale.len() < rows
         || xs.len() < b * cols
         || out.len() < b * rows
@@ -22438,7 +22755,7 @@ pub fn q8_matmat_2f(
             note_layer((model.uid() as usize, idx), &model.tensors[idx].name);
             Some((model.uid() as usize, idx))
         },
-        &bytes[abs..abs + rows * cols],
+        &bytes[abs..abs + payload_len],
         row_scale,
         Some(&col_field[..cols]),
         xs,
@@ -22473,14 +22790,19 @@ pub fn q8_matmat(
         return false;
     };
     let bytes = model.primary_bytes();
-    if abs + rows * cols > bytes.len()
+    let payload_len = if entry.dtype == cortiq_core::TensorDtype::Q8_2f {
+        entry.nbytes as usize
+    } else {
+        rows * cols
+    };
+    if abs + payload_len > bytes.len()
         || row_scale.len() < rows
         || pre.len() < b * cols
         || out.len() < b * rows
     {
         return false;
     }
-    let full_quant = &bytes[abs..abs + rows * cols];
+    let full_quant = &bytes[abs..abs + payload_len];
     dispatch_matmat(
         c,
         {
@@ -22636,7 +22958,12 @@ pub(crate) fn fused_gemm_from_device(
                 return false;
             };
             let bytes = model.primary_bytes();
-            if abs + rows * cols > bytes.len() {
+            let payload_len = if dt == D::Q8_2f {
+                entry.nbytes as usize
+            } else {
+                rows * cols
+            };
+            if abs + payload_len > bytes.len() {
                 return false;
             }
             dispatch_matmat_keep(
@@ -22645,7 +22972,7 @@ pub(crate) fn fused_gemm_from_device(
                     note_layer((model.uid() as usize, idx), &model.tensors[idx].name);
                     Some((model.uid() as usize, idx))
                 },
-                &bytes[abs..abs + rows * cols],
+                &bytes[abs..abs + payload_len],
                 &rs,
                 col,
                 &[],
@@ -22685,10 +23012,15 @@ pub fn q8_matmat_keep(
     }
     let abs = model.entry_abs_offset(entry)?;
     let bytes = model.primary_bytes();
-    if abs + rows * cols > bytes.len() || row_scale.len() < rows || pre.len() < b * cols {
+    let payload_len = if entry.dtype == cortiq_core::TensorDtype::Q8_2f {
+        entry.nbytes as usize
+    } else {
+        rows * cols
+    };
+    if abs + payload_len > bytes.len() || row_scale.len() < rows || pre.len() < b * cols {
         return None;
     }
-    let full_quant = &bytes[abs..abs + rows * cols];
+    let full_quant = &bytes[abs..abs + payload_len];
     dispatch_matmat_keep(
         c,
         {
@@ -26690,6 +27022,25 @@ fn upload_staged() -> bool {
     })
 }
 
+/// Bound transient upload residency. Creating one mapped staging buffer as
+/// large as every dense tensor made Vulkan's allocator retain a second,
+/// size-fragmented copy of most of a model: the 15.6 GB Granite 30B Q4TP graph
+/// occupied 33.5 GB, and its 29.3 GB Q8_2F twin OOMed a 46 GB A40 before the
+/// fallback could run. Fixed-size chunks let the allocator reuse one small
+/// class while the final device-local buffers remain budget-accounted.
+fn upload_chunk_bytes() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("CMF_GPU_UPLOAD_CHUNK_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(64)
+            .max(1)
+            * 1024
+            * 1024
+    })
+}
+
 #[inline]
 fn note_submit(c: &Ctx) {
     SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -30071,6 +30422,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn kv_capacity_grows_without_reserving_the_advertised_context() {
+        assert_eq!(kv_capacity(131_072, 1), 512);
+        assert_eq!(kv_capacity(131_072, 512), 512);
+        assert_eq!(kv_capacity(131_072, 513), 1024);
+        assert_eq!(kv_capacity(131_072, 65_537), 131_072);
+        assert_eq!(kv_capacity(1000, 999), 1000);
+    }
+
+    #[test]
     fn wgpu_q8_matvec_matches_cpu_reference() {
         // Force the wgpu path on (Metal-via-wgpu locally; Vulkan on the server).
         unsafe { std::env::set_var("CMF_GPU", "wgpu") };
@@ -30249,6 +30609,117 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         assert!(max_d < 2e-2, "wgpu q8_2f odd rows ≠ CPU: max|Δ| = {max_d}");
+    }
+
+    /// Real-model regression for vocabulary heads wider than Vulkan's 65,535
+    /// workgroup limit.  Set CMF_Q8_2F_MODEL to a CMF whose lm_head is q8_2f.
+    /// The small synthetic parity case above cannot catch dispatch/scale-plane
+    /// mistakes that only appear at a 100k-row vocabulary.
+    #[test]
+    #[ignore]
+    fn wgpu_q8_2f_large_vocab_head_matches_cpu_reference() {
+        let Ok(path) = std::env::var("CMF_Q8_2F_MODEL") else {
+            eprintln!("CMF_Q8_2F_MODEL is not set — skipping");
+            return;
+        };
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping q8_2f model parity test");
+            return;
+        };
+        let model = Arc::new(CmfModel::open(path).expect("open CMF_Q8_2F_MODEL"));
+        let (idx, entry) = model
+            .tensors
+            .iter()
+            .enumerate()
+            .find(|(_, e)| e.name == "lm_head.weight")
+            .expect("lm_head.weight");
+        assert_eq!(entry.dtype, cortiq_core::TensorDtype::Q8_2f);
+        let (rows, cols) = (entry.shape[0], entry.shape[1]);
+        let abs = model.entry_abs_offset(entry).expect("primary tensor");
+        let payload = &model.primary_bytes()[abs..abs + entry.nbytes as usize];
+        let xs: Vec<f32> = (0..cols)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.002)
+            .collect();
+
+        // Reproduce the production order: a batched/per-op q8 GEMM first
+        // primes residency with only the int8 body, then the whole-token
+        // q8_2f graph asks for the same tensor including both scale planes.
+        let key = (model.uid() as usize, idx);
+        let body = &payload[..rows * cols];
+        let body_buf = weight_buffer_l(c, key, body, layer_of_name(&entry.name))
+            .expect("resident body-only q8 head");
+        assert_eq!(body_buf.size(), body.len().next_multiple_of(4) as u64);
+        assert!(!q8_resident_or_upload(&model, idx, true));
+        let weights = c
+            .weight_bufs
+            .lock()
+            .unwrap()
+            .get(&key)
+            .expect("resident q8_2f head")
+            .buf
+            .clone();
+        assert_eq!(weights.size(), entry.nbytes);
+        let xb = storage_bytes(c, bytemuck::cast_slice(&xs));
+        let yb = rw_f32(c, rows, true);
+        let params = uniform_u32x4(c, [(cols / 4) as u32, rows as u32, cols as u32, 0]);
+        let layout = c.q8_2f_mv.get_bind_group_layout(0);
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("q8-2f-model-head-bg"),
+            layout: &layout,
+            entries: &[
+                bind_buf(0, &weights),
+                bind_buf(1, &xb),
+                bind_buf(2, &yb),
+                bind_buf(3, &params),
+            ],
+        });
+        let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("q8-2f-model-head-stage"),
+            size: (rows * 4) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut enc = c
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = begin_pass(&mut enc);
+            pass.set_pipeline(&c.q8_2f_mv);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
+        }
+        flush_pass(&enc);
+        enc.copy_buffer_to_buffer(&yb, 0, &stage, 0, (rows * 4) as u64);
+        submit(c, finish_enc(enc));
+        stage.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        c.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        let got: Vec<f32> = bytemuck::cast_slice(&stage.get_mapped_range(..).unwrap()).to_vec();
+
+        let qn = rows * cols;
+        let rs = &payload[qn..qn + rows * 2];
+        let cs = &payload[qn + rows * 2..qn + rows * 2 + cols * 2];
+        let f16_at = |p: &[u8], i: usize| {
+            cortiq_core::quant::f16_to_f32(u16::from_le_bytes([p[i * 2], p[i * 2 + 1]]))
+        };
+        let mut max_d = 0.0f32;
+        let mut max_want = 0.0f32;
+        for r in (0..rows).step_by((rows / 31).max(1)).take(32) {
+            let mut acc = 0.0f32;
+            for i in 0..cols {
+                acc += payload[r * cols + i] as i8 as f32 * xs[i] * f16_at(cs, i);
+            }
+            let want = acc * f16_at(rs, r);
+            max_want = max_want.max(want.abs());
+            max_d = max_d.max((got[r] - want).abs());
+        }
+        eprintln!(
+            "q8_2f real head idx={idx} {rows}x{cols}: max|want|={max_want:.6} max|Δ|={max_d:.6} gpu_nonzero={}",
+            got.iter().filter(|v| **v != 0.0).count()
+        );
+        assert!(max_want > 0.0 && max_d < 2e-2, "large q8_2f head mismatch");
     }
 
     /// Quantifies the whole-token-graph ceiling on THIS device: K chained
