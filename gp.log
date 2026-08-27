@@ -1,9 +1,0 @@
-[2m2026-08-16T06:13:32.381549Z[0m [32m INFO[0m [2mcortiq_core::format[0m[2m:[0m Opened CMF v2: qwen3_5 | 866 tensors | 0 masks | vocab embedded | 14271.2 MB
-[2m2026-08-16T06:13:32.519141Z[0m [32m INFO[0m [2mcortiq_engine::tokenizer[0m[2m:[0m Tokenizer loaded: 248077 vocab, 247587 merges, 33 added, eos=Some(248044)
-[2m2026-08-16T06:13:32.519223Z[0m [32m INFO[0m [2mcortiq_engine::loader[0m[2m:[0m chat bundle: template 8952 chars, 2 stop ids
-[2m2026-08-16T06:13:32.580007Z[0m [32m INFO[0m [2mcortiq_engine::loader[0m[2m:[0m Pipeline loaded: qwen3_5 | 64L (48 linear) | 27.32B params | storage: quantized mmap | MTP: yes
-[2m2026-08-16T06:13:32.580193Z[0m [32m INFO[0m [2mcortiq_engine::pipeline[0m[2m:[0m worker pool: 9 threads
-[2m2026-08-16T06:13:32.605143Z[0m [32m INFO[0m [2mcortiq_engine::gpu_metal[0m[2m:[0m Metal GPU path: on (Apple M4)
-[2m2026-08-16T06:14:11.433122Z[0m [32m INFO[0m [2mcortiq_engine::gpu[0m[2m:[0m gpu q4tp matmat took 328.650709ms (budget 42.928862ms) — strike 1 of 3
-gpuprof: gdn-run 119.3 | attn 38.6 | прочее 0.0 ms/ток | span 167.7 ms/ток (20 синков)
-gpuprof: gdn-run 118.8 | attn 41.3 | прочее 0.0 ms/ток | span 164.9 ms/ток (40 синков)

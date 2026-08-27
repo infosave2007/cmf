@@ -1,6 +1,0 @@
-[2m2026-08-16T06:21:50.348136Z[0m [32m INFO[0m [2mcortiq_core::format[0m[2m:[0m Opened CMF v2: qwen3_5 | 866 tensors | 0 masks | vocab embedded | 14271.2 MB
-[2m2026-08-16T06:21:50.472068Z[0m [32m INFO[0m [2mcortiq_engine::tokenizer[0m[2m:[0m Tokenizer loaded: 248077 vocab, 247587 merges, 33 added, eos=Some(248044)
-[2m2026-08-16T06:21:50.472134Z[0m [32m INFO[0m [2mcortiq_engine::loader[0m[2m:[0m chat bundle: template 8952 chars, 2 stop ids
-[2m2026-08-16T06:21:50.591290Z[0m [32m INFO[0m [2mcortiq_engine::loader[0m[2m:[0m Pipeline loaded: qwen3_5 | 64L (48 linear) | 27.32B params | storage: quantized mmap | MTP: yes
-[2m2026-08-16T06:21:50.591410Z[0m [32m INFO[0m [2mcortiq_engine::pipeline[0m[2m:[0m worker pool: 9 threads
-[2m2026-08-16T06:21:50.622993Z[0m [32m INFO[0m [2mcortiq_engine::gpu_metal[0m[2m:[0m Metal GPU path: on (Apple M4)
