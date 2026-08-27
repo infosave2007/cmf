@@ -122,8 +122,9 @@ jobs:
           $bin = "target/${{ matrix.target }}/release/cortiq.exe"
           $zip = "cortiq-${{ matrix.target }}.zip"
           Compress-Archive -Path $bin -DestinationPath $zip -Force
-          (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower() + "  " + $zip |
-            Out-File -Encoding ascii "$zip.sha256"
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          # Write an explicit LF so the checksum is portable to shasum/sha256sum.
+          [System.IO.File]::WriteAllText("$zip.sha256", "$hash  $zip`n", [System.Text.Encoding]::ASCII)
       - name: Attach to release (unix)
         if: runner.os != 'Windows'
         uses: softprops/action-gh-release@v2
