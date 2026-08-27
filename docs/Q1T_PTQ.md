@@ -2,7 +2,7 @@
 
 An experimental, **training-free** compression path that quantizes an
 ordinary checkpoint to **~2.25–3.5 bits/weight** — below `q4` (4.5 bpw) —
-while staying coherent. Built on the *holographic transfer* idea (the CMF
+while staying coherent. Built on an *error-feedback transfer* step (the CMF
 patents): preserve the layer **output** `W·x`, not the weights.
 
 The ternary base is packed **base-3, 5 values per byte** (`3^5 = 243 ≤ 256`),
@@ -38,7 +38,7 @@ For each linear layer, given calibration statistics of its input:
    and `down_proj` (the gated-intermediate output) stay at the input dtype
    — cheaper *and* higher quality than flooding them with outliers.
 
-What was tried and **rejected** (measured): the GPTQ/holographic fold
+What was tried and **rejected** (measured): the GPTQ/error-feedback fold
 `Σ_PS·Σ_SS⁻¹` *backfires* at extreme low bit (a single-pass, rank-deficient
 Hessian injects more error than it removes); a column mask; a finer 4-level
 base (ternary is near-optimal for a single scale that includes zero).

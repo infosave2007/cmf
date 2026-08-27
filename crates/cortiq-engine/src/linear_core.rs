@@ -10,8 +10,8 @@
 //!   the numpy/torch oracle (vmfcore/gdn_layer.py).
 //!
 //! * `vmf_phase` — the canonical core: token carries a phase θ; kernel
-//!   φ(θ) = [cos θ; sin θ] gives a linear factorization; the condensate
-//!   is a recurrent state S[head][p2, dv] with decay exp(−exp(A_log)).
+//!   φ(θ) = [cos θ; sin θ] gives a linear factorization; the recurrent
+//!   state S[head][p2, dv] uses decay exp(−exp(A_log)).
 //!   Noise-robust and simpler than vendor recurrences. Exotic operators
 //!   are folded onto it at CONVERT time (`--linear-core vmf_phase`) and
 //!   quality is restored by the offline heal — the research track and
@@ -59,8 +59,8 @@ pub struct VmfPhaseCfg {
     pub nphase: usize,
     pub value_head_dim: usize,
     pub hidden_size: usize,
-    /// θ-mass (η′ correction): a restoring potential pulling the phase
-    /// toward 0 — θ_eff = θ/(1+mass) — which WIDENS the phase kernel.
+    /// Phase-mass correction: scales the phase toward zero —
+    /// θ_eff = θ/(1+mass) — which widens the phase kernel.
     /// Measured (experiments/vmf_native_core*.py) to restore noise
     /// robustness when the phase projection is FIXED (exactly CMF's
     /// fold-before-heal regime: thq/thk are init, not trained) — recall
@@ -90,7 +90,7 @@ fn phase_step(
     out: &mut [f32],
 ) {
     let (nh, nph, dv) = (cfg.num_heads, cfg.nphase, cfg.value_head_dim);
-    // θ-mass (η′): θ_eff = θ/(1+mass). mass=0 → factor 1 → no-op.
+    // Phase-mass correction: θ_eff = θ/(1+mass). mass=0 → factor 1 → no-op.
     let mscale = 1.0f64 / (1.0 + cfg.phase_mass as f64);
     let p2 = 2 * nph;
     for h in 0..nh {
@@ -100,10 +100,10 @@ fn phase_step(
         let vt = &v[h * dv..(h + 1) * dv];
         let ot = &mut out[h * dv..(h + 1) * dv];
         let dec = &decay[h * p2..(h + 1) * p2];
-        // Selective write (hybrid_k): κ scales what enters the condensate.
+        // Selective write (hybrid_k): κ scales what enters the recurrent state.
         let kh = kap.map_or(1.0f64, |k| k[h] as f64);
         for f in 0..p2 {
-            // φ(θ) = [cos·nph, sin·nph], θ scaled by the mass factor.
+            // φ(θ) = [cos·nph, sin·nph], θ scaled by the correction factor.
             let (fk, fq) = if f < nph {
                 (
                     (thk_h[f] as f64 * mscale).cos(),
@@ -342,7 +342,7 @@ impl GdnCfg {
     }
 
     /// Packed state: [conv ring (kk−1)·c_dim | S nv·dk·dv], one Vec<f64>
-    /// so the speculative scratch-swap moves ring and condensate together.
+    /// so the speculative scratch-swap moves ring and recurrent state together.
     pub fn state_len(&self) -> usize {
         (self.conv_kernel - 1) * self.conv_dim()
             + self.num_v_heads * self.key_head_dim * self.value_head_dim
@@ -372,7 +372,7 @@ unsafe impl Sync for SendMutF32 {}
 /// position. Advances the packed state (conv ring + S) and writes the
 /// gated per-head output into `of` [nv·dv].
 ///
-/// The condensate math runs in f32 (the vendor operator's own dtype —
+/// The recurrent-state math runs in f32 (the vendor operator's own dtype —
 /// `mamba_ssm_dtype: float32` in the source configs; the old f64 was
 /// over-precision at 4× the traffic and no SIMD). The two S passes are
 /// element-wise in `dj` with no cross-lane reduction, so LLVM
@@ -815,7 +815,7 @@ pub fn gdn_pair(
 
 /// Weights of one LFM2 short-convolution mixer
 /// (`model.layers.{i}.short_conv.*`, renamed from the vendor `conv.*` at
-/// convert time). No recurrent condensate — the only state is the causal
+/// convert time). No recurrent mixer state — the only state is the causal
 /// conv ring (the last `kernel−1` gated inputs per channel).
 pub struct ShortConvWeights {
     /// [3·hidden, hidden] — fused (B, C, x) projection.
@@ -1604,12 +1604,12 @@ mod tests {
         let mut state = Vec::new();
         let o1 = vmf_phase_forward(&x, &w, &cfg, &mut state, None);
         let o2 = vmf_phase_forward(&x, &w, &cfg, &mut state, None);
-        // Same input, evolved condensate → different output.
+        // Same input, evolved state → different output.
         assert!(o1.iter().zip(&o2).any(|(a, b)| (a - b).abs() > 1e-6));
         assert_eq!(state.len(), cfg.state_len());
     }
 
-    /// θ-mass (η′): mass=0 is bit-identical to the massless kernel; mass>0
+    /// Phase-mass correction: mass=0 is bit-identical to the unscaled kernel; mass>0
     /// changes the output (phase narrowed → kernel widened). Guards the
     /// no-op default and that the knob is actually wired.
     #[test]
@@ -1638,7 +1638,7 @@ mod tests {
     /// κ write gate (hybrid_k): saturated-open gate (bias ≫ 0 → κ→1)
     /// matches the gateless kernel within fp tolerance; a closed gate
     /// (bias ≪ 0 → κ→0) writes nothing — the state stays zero and the
-    /// output collapses to the empty-condensate readout.
+    /// output collapses to the empty-state readout.
     #[test]
     fn kappa_gate_open_matches_none_and_closed_writes_nothing() {
         let (mut w, cfg) = tiny();
@@ -1684,7 +1684,7 @@ mod tests {
         );
         assert!(
             oc.iter().all(|&v| v.abs() < 1e-6),
-            "closed κ: empty-condensate readout"
+            "closed κ: empty-state readout"
         );
     }
 

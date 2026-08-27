@@ -102,7 +102,7 @@ pub fn dequant_q8_row(bytes: &[u8], out_dim: usize, in_dim: usize, dst: &mut [f3
     }
 }
 
-/// Dequantize a full `q8_2f` tensor (two-field 𝒲×θ, dtype 9):
+/// Dequantize a full `q8_2f` tensor (two-scale row/column, dtype 9):
 /// `[int8: out·in][f16 row_scale: out][f16 col: in]`,
 /// `w[o,i] = q[o,i] · row_scale[o] · col[i]`. The column field absorbs
 /// outlier input channels — validated in vmfcore (+37% at equal size

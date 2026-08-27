@@ -190,7 +190,7 @@ rewritten INTO). Nanbeige-3B q4t on an M4: 22.0 tok/s decode, 152 tok/s
 prefill.
 
 One candidate looked strong and did not survive measurement: the attend
-kernel re-walks every K row a SECOND time to bank Born-importance, whose
+kernel re-walks every K row a SECOND time to bank attention-importance, whose
 only consumer is eviction — which cannot fire until the cache is full.
 Gating that pass on a half-full window measured 22.03 vs 21.95 at short
 context (noise) and 7.80 vs 8.01 at ctx 3000 — i.e. no gain, possibly a

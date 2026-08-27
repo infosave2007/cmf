@@ -6,7 +6,7 @@
 //! nothing at all: masked heads cost neither FLOPs nor memory.
 
 /// KV storage mode. `CMF_KV=q8` enables the q8_2f cache: an int8 row per
-/// (position, head) + an f32 scale per row + a per-channel field 𝒲×θ,
+/// (position, head) + an f32 scale per row + a per-channel scale field,
 /// frozen after WARMUP positions with retroactive requantization
 /// (D4: "KV-quant 2f"). Memory ×~3.7 smaller than f32.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,17 +91,17 @@ pub struct LayerKvCache {
     ks: Vec<Vec<f32>>,
     vq: Vec<Vec<i8>>,
     vs: Vec<Vec<f32>>,
-    /// Per-channel fields 𝒲×θ per head [head_dim]; empty until frozen.
+    /// Per-channel scale fields per head [head_dim]; empty until frozen.
     kcol: Vec<Vec<f32>>,
     vcol: Vec<Vec<f32>>,
-    /// Accumulated attention mass per stored position (Born rule:
-    /// importance of a position = how much probability mass reads it).
+    /// Accumulated attention mass per stored position: importance of a
+    /// position is how much probability mass reads it.
     imp: Vec<f32>,
     /// Positions appended so far (grows once per token, dead heads included).
     pub seq_len: usize,
     pub num_kv_heads: usize,
     pub head_dim: usize,
-    /// Linear-core condensate S (vmf_phase), f64; empty on full layers.
+    /// Linear-core recurrent state S (vmf_phase), f64; empty on full layers.
     pub linear_state: Vec<f32>,
     /// Tentative lane-2 state during speculative verify.
     pub linear_scratch: Vec<f32>,
@@ -512,8 +512,8 @@ impl LayerKvCache {
     /// head's output is bit-for-bit the same.
     ///
     /// `q_group`: `[n_heads_in_group × head_dim]` (global head order);
-    /// `out`: same shape; `imp_acc[0..stored]` accumulates the probs of
-    /// every head (Born importance), matching the caller's former loop.
+    /// `out`: same shape; `imp_acc[0..stored]` accumulates the probabilities
+    /// of every head (attention importance), matching the caller's former loop.
     /// `scale` is the score scale (1/√hd unless the arch overrides);
     /// `first` is the earliest visible position — sliding-window layers
     /// pass `stored − window` so older rows get zero probability.
@@ -671,7 +671,7 @@ impl LayerKvCache {
                 }
             }
 
-            // ── Born-importance accumulation (Σ probs over heads), same
+            // ── Attention-importance accumulation (Σ probs over heads), same
             // head order as the caller's former per-head loop.
             let n = imp_acc.len().min(stored);
             for h in 0..nheads {
@@ -687,7 +687,7 @@ impl LayerKvCache {
     /// cache already holds every chunk row (`s0` old + `b` new). Per
     /// Q-head the scores GEMM `Q·Kᵀ` rides the AMX, the causal softmax
     /// zeroes the not-yet-visible tail so the `P·V` GEMM needs no
-    /// mask, and Born importance takes the masked column sums. Same
+    /// mask, and attention importance takes the masked column sums. Same
     /// math as the per-position attend; summation order differs
     /// (tolerance-class, like the projection GEMMs).
     #[cfg(target_arch = "aarch64")]
@@ -806,7 +806,7 @@ impl LayerKvCache {
                         let allowed = s0 + (r % b) + 1;
                         // Sliding-window layers see only the last W of
                         // the causal range; the zeroed head contributes
-                        // nothing to P·V or Born importance.
+                        // nothing to P·V or attention importance.
                         let lo = window.map(|w| allowed.saturating_sub(w)).unwrap_or(0);
                         // SAFETY: workers cover disjoint row ranges.
                         let row = unsafe { std::slice::from_raw_parts_mut(sp.at(r * n), n) };
@@ -819,7 +819,7 @@ impl LayerKvCache {
                     Some(p) if m >= 64 => p.run_rows(m, &run),
                     _ => run(0, m),
                 }
-                // Born importance: masked column sums (probs of the
+                // Attention importance: masked column sums (probs of the
                 // zeroed tail contribute nothing, same as the CPU
                 // per-position accumulate).
                 let ni = self.imp.len().min(n);
@@ -980,7 +980,7 @@ impl LayerKvCache {
         u(self.num_kv_heads as u32, &mut out);
         u(self.head_dim as u32, &mut out);
         u(self.linear_state.len() as u32, &mut out);
-        // Born-rule importance is ordinary state: every attention call
+        // Attention importance is ordinary state: every attention call
         // accumulates it and eviction reads it. Leaving it behind would
         // hand the far side a cache that forgets the RIGHT positions
         // later — a divergence that shows up only under pressure.
@@ -996,7 +996,7 @@ impl LayerKvCache {
                 }
             }
         };
-        // The recurrent condensate stays f32 whatever the wire dtype: it
+        // The recurrent state stays f32 whatever the wire dtype: it
         // is one small vector per layer and it is the ONLY state a linear
         // layer has — rounding it rounds the whole history.
         for &x in &self.linear_state {
@@ -1143,7 +1143,7 @@ impl LayerKvCache {
         self.seq_len = keep_last;
     }
 
-    /// Born eviction: keep `sink` earliest positions (attention sinks),
+    /// Mass-based eviction: keep `sink` earliest positions (attention sinks),
     /// the `recent` latest, and fill the rest of the `keep_last` budget
     /// with the positions carrying the highest accumulated attention
     /// mass (vmfcore: PPL 8.342 vs 8.687 for recency-only, full 8.295).
@@ -1221,7 +1221,7 @@ impl LayerKvCache {
 pub enum EvictionPolicy {
     /// Sliding window: keep only the most recent positions.
     Recent,
-    /// Born rule: sinks + recents + top accumulated attention mass.
+    /// Mass-based eviction: sinks + recents + top accumulated attention mass.
     Born { sink: usize },
 }
 
@@ -1414,7 +1414,7 @@ mod tests {
 
     /// q8_2f-attend ≈ f32-attend: 100 positions (crosses the field freeze
     /// at the 64th), pseudo-random vectors, relative tolerance of the
-    /// int8 grid. Plus rollback and Born eviction on the q8 storage.
+    /// int8 grid. Plus rollback and mass-based eviction on the q8 storage.
     #[test]
     fn q8_attend_matches_f32_within_grid() {
         let (heads, hd) = (2, 32);
@@ -1516,12 +1516,12 @@ mod tests {
                         *dst += p;
                     }
                 }
-                assert_eq!(imp, imp_ref, "mode {mode:?} g{g}: Born mass must match");
+                assert_eq!(imp, imp_ref, "mode {mode:?} g{g}: attention mass must match");
             }
         }
     }
 
-    /// Review regression: Born eviction in MIXED modes. q8v used to
+    /// Review regression: mass-based eviction in MIXED modes. q8v used to
     /// panic (gather over an empty v[h]), q8k silently left raw V
     /// uncompressed (stale rows under kept keys + memory leak).
     #[test]
@@ -1569,7 +1569,7 @@ mod tests {
             let v = vec![pos as f32 + 100.0; 2];
             layer.append(&k, &v, &[true]);
         }
-        // Position 3 carries the most attention mass (Born importance).
+        // Position 3 carries the most attention mass.
         let mut imp = vec![0.05f32; 8];
         imp[3] = 5.0;
         layer.accumulate_imp(&imp);
@@ -1581,7 +1581,7 @@ mod tests {
         assert_eq!(
             kept_keys,
             vec![0.0, 3.0, 6.0, 7.0],
-            "kept = sink(0) + Born-top(3) + recent(6,7)"
+            "kept = sink(0) + mass-top(3) + recent(6,7)"
         );
         // imp stays aligned with the gathered positions.
         assert_eq!(layer.head_len(0), 4);

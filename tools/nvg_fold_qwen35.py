@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-NVG holographic fold of a Qwen3.5/3.8 hybrid (GDN + full attention) checkpoint —
+Structured fold of a Qwen3.5/3.8 hybrid (GDN + full attention) checkpoint —
 FFN width, attention q-heads and GDN value heads — in closed form, from
 activation Grams collected on a calibration mix. See docs/NVG_FOLD_ATTN_GDN.ru.md.
 
@@ -89,7 +89,7 @@ def fold_layers(args, model, sd, put, grams, report, layer_ids, layer_types, F, 
             G = grams[f"ffn.{i}"].g
             diag = G.diagonal().double() / max(grams[f"ffn.{i}"].n, 1)
             wnorm = Wd.float().pow(2).sum(0).double()  # ‖W_down[:,j]‖²
-            imp = diag * wnorm  # Born: energy the neuron delivers to the stream
+            imp = diag * wnorm  # activation-weighted energy delivered to the stream
             keep = torch.topk(imp, args.ffn).indices.sort().values.tolist()
             drop = sorted(set(range(F)) - set(keep))
             Pi, resid = solve_pi(G, keep, drop, args.eps)

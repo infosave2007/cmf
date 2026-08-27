@@ -41,7 +41,7 @@ pub enum TensorDtype {
     /// j·8+k of the group; value = scale · (2·bit − 1) ∈ {−s, +s}.
     /// 2-D tensors with cols % 32 == 0 only.
     Q1 = 12,
-    /// 1-bit PTQ with a sparse high-precision outlier overlay (holographic
+    /// 1-bit PTQ with a sparse high-precision outlier overlay (error-feedback
     /// transfer / SpQR-style): a `Q1` base (per 32-group `[f16 scale][4B
     /// bits]`, outliers excluded from the scale) followed by
     /// `[u32 count]` then `count × [u32 flat-index][f16 value]` — the

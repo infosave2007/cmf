@@ -31,11 +31,10 @@ compatible with the validated `.vmfc` v2 format where the domains
 overlap (tensor directory, quant layouts, `hash64`). Never two
 definitions of the same thing.
 
-Physical basis (VMF): the model is a vacuum condensate 𝒲; a skill is its
-regular core above a critical density; a task mask selects an active
-subset without changing weights. The format carries the consequences of
-that physics (two-field 𝒲×θ quantization, Born importance, critical mask
-threshold) — but **only those confirmed by measurement**.
+CMF is an engineering container: a shared backbone can be paired with
+task-specific masks and overlays without copying or changing the backbone.
+The format records measured quality metadata and keeps implementation details
+such as row/column scales explicit, so readers can validate every section.
 
 ---
 
@@ -76,7 +75,7 @@ no "read as best we can").
 |-----|----------------|---------|
 | 0   | `TENSOR_DIR`   | binary tensor directory (always set in v2) |
 | 1   | `BINARY_MASKS` | masks section (§5) present |
-| 2   | `QUANT_2F`     | directory contains `q8_2f`/`vbit` tensors (two-field 𝒲×θ quant) |
+| 2   | `QUANT_2F`     | directory contains `q8_2f`/`vbit` tensors (multi-scale quantization) |
 | 3   | `DELTA_MASKS`  | reserved: XOR mask deltas from a parent |
 | 4   | `HOT_PACKS`    | reserved: materialized dense slices |
 | 5   | `LOOP_MASKS`   | mask rows are per VISIT (physical layers × loops, pass-major) — a Looped Transformer's two passes carry independent masks (§5.1) |
@@ -271,7 +270,7 @@ Numbering shared with `.vmfc` (ids are never reused):
 | 6  | `u8`      | reserved |
 | 7  | `q4_col`  | reserved |
 | 8  | `vbit`    | ✅ read/write (`QUANT_2F` bit), variable 3–8 bit |
-| 9  | `q8_2f`   | ✅ read/write (`QUANT_2F` bit), 𝒲×θ |
+| 9  | `q8_2f`   | ✅ read/write (`QUANT_2F` bit), row/column scales |
 | 10 | `vbit_ro` | ✅ read/write — `vbit` + in-file row-offset table (O(1) row access); converter default for `--quant vbit` |
 | 11 | `q4_tiled`| ✅ read/write — q4 in interleaved `[f16 scale][16B nibbles]` tiles (`--quant q4t`) |
 | 12 | `q1`      | ✅ read/write — 1-bit binary, for 1-bit-TRAINED models only (`--quant q1`) |
@@ -290,10 +289,10 @@ Numbering shared with `.vmfc` (ids are never reused):
   `scale = absmax(group)/7`.
 - **1-D tensors and tensors < 32 elements are always `f16`**
   (normalization precision at maximal matrix compression).
-- **`q8_2f`**: `[int8][f16 row-scale][f16 col-field]`,
-  `w = q·scale[o]·col[i]` — the two-field Madelung split 𝒲×θ, validated
-  in vmfcore (+37% at equal size; recovers ~75% of the q8→f16 gap on
-  outlier input channels).
+- **`q8_2f`**: `[int8][f16 row-scale][f16 col-scale]`,
+  `w = q·scale[o]·col[i]` — independent row and input-channel scales,
+  validated in vmfcore (+37% at equal size; recovers ~75% of the q8→f16
+  gap on outlier input channels).
 - **`vbit`** (2-D only, `in % 32 == 0`; P13 FIG.3):
   `[u8 bits: rows][f16 scales: rows·in/32][bit-packed rows, MSB-first,
   each row padded to a byte]`; `w = (u − L)·scale[r,g]`,
@@ -343,7 +342,7 @@ Numbering shared with `.vmfc` (ids are never reused):
   tiles; outliers are EXCLUDED from the group scale) followed by a
   sparse high-precision overlay: `[u32 count]` then
   `count × { [u32 flat-index][f16 value] }` — the salient weights kept
-  at full precision (holographic transfer / SpQR-style) and restored
+  at full precision (error-feedback transfer / SpQR-style) and restored
   verbatim at dequant. Variable length: `expected_nbytes` is
   undefined, the reader trusts the directory's stored span. Lets a
   NORMAL checkpoint survive 1-bit where plain `q1` cannot.
@@ -368,9 +367,8 @@ directory.
 
 ## 5. Masks section
 
-A task mask = bit fields of "what is active" over shared weights
-(weights do not change — the VMF principle: a skill selects a subset of
-the condensate).
+A task mask = bit fields of "what is active" over shared weights. Applying a
+mask selects rows and heads for a task; the shared weights do not change.
 
 ```
 [0 : 4]  n_masks  : u32
@@ -522,9 +520,9 @@ keeps private.
 - **Silent fallbacks** — v1 would interpret any garbage file as "a 27B
   model"; v2 must fail.
 - **JSON for bit data** — v1 masks in JSON bloated 3–4×.
-- **Declaration fields** — `quality_score: 1.0` by default, area-law
-  "capacities", Born multipliers in dynamics: a metaphor does not become
-  a format field until it is measured.
+- **Unmeasured declarations** — quality scores and capacity claims are not
+  emitted by default. A field is included only with a defined metric and
+  recorded measurement.
 
 ## 9. Skills — a swarm in one file (Patent 15, claims 2/12/15)
 

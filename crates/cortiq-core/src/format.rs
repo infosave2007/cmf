@@ -106,7 +106,7 @@ pub struct CmfHeader {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shard: Option<ShardInfo>,
     /// Measured confidence calibration (B1): a temperature fit on held-out
-    /// so the displayed Born-mass confidence is a true property of the
+    /// so the displayed softmax confidence is a true property of the
     /// model (softmax(logits/T)), not a raw estimate. Additive; absent =
     /// use raw (T=1). Written by `set_calibration.py` after `cortiq
     /// calibrate` measures the reliability/ECE.

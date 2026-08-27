@@ -8,9 +8,8 @@
 //! prompts); `eval_dir` holds `<task>.txt` — HELD-OUT text of the same
 //! task. For every width the gate scores each task's held-out text three
 //! ways: dense, with that task's own top-w mask, and with the global
-//! top-w mask (mass summed over all tasks — the task-blind width prune
-//! every NVG-style compressor does). A per-task win over global at equal
-//! width is the whole claim.
+//! top-w mask (mass summed over all tasks — a task-blind width prune).
+//! A per-task win over global at equal width is the whole claim.
 //!
 //! With `cross` as the last argument it also prints the full task×mask
 //! PPL matrix at the first width — the specialization evidence.

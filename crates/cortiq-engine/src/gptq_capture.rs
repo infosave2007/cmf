@@ -1,4 +1,4 @@
-//! Calibration-time Hessian capture for GPTQ / the holographic transfer.
+//! Calibration-time Hessian capture for GPTQ / error-feedback transfer.
 //!
 //! While `begin()` is active, every `QTensor::matmat` (the batched prefill
 //! path) folds its input activations into a per-tensor second-moment

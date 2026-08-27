@@ -49,7 +49,7 @@ DTYPE_ID = {"f32": 0, "f16": 1, "bf16": 2, "q8_row": 3, "q4_block": 4,
 
 QUANT_CHOICES = {
     "VBIT": "vbit",     # variable-bit 3..8 (P13; validated grouped layout)
-    "Q8_2F": "q8_2f",   # two-field 𝒲×θ (validated: recovers ~75% of the q8→f16 gap)
+    "Q8_2F": "q8_2f",   # row/column-scale (validated: recovers ~75% of the q8→f16 gap)
     "Q8_ROW": "q8_row",
     "Q4_BLOCK": "q4_block",
     "F16": "f16",
@@ -127,7 +127,7 @@ _F16_TINY = np.float32(6.104e-5)
 
 
 def encode_q8_2f(t: np.ndarray) -> bytes:
-    """Two-field 𝒲×θ int8 (Madelung split, ≡ vmfcore _enc_q8_2f):
+    """Two-axis int8 encoding (≡ vmfcore _enc_q8_2f):
     column field col[i] = RMS over rows (absorbs outlier input channels),
     then per-row int8 over the normalized residual.
     Layout: [int8: out·in][f16 row_scale: out][f16 col: in].
@@ -197,9 +197,9 @@ VBIT_LEVELS = (3, 4, 5, 6, 8)  # safe-floor 3 (P13 claim 13)
 VBIT_BIAS: dict = {}
 VBIT_MEAN_BITS = [4.25]  # water-filling target; --mean-bits
 # Allocation-curve shape: "log2" (water-filling, clipped at floor) or
-# "cubic" — a causal soft cutoff from the VMF-2026 recomputation (a hard
-# step excluded by theory at ~65σ): b(I) = 3 + 5/(1+(x_c/I)³), x_c by
-# bisection to the tensor's exact budget. VMF-queue experiment #3.
+# "cubic" — a smooth cutoff used in calibration experiments (a hard step
+# was less stable at high outlier scores): b(I) = 3 + 5/(1+(x_c/I)³),
+# with x_c chosen by bisection to the tensor's exact budget.
 VBIT_SHAPE = ["log2"]
 
 
@@ -1908,14 +1908,14 @@ if __name__ == "__main__":
                    help="do not carry model.mtp.* (checkpoints with an MTP "
                         "block the runtime does not execute)")
     p.add_argument("--vbit-shape", choices=["log2", "cubic"], default="log2",
-                   help="vbit allocation-curve shape (cubic — VMF experiment "
-                        "#3: a soft causal cutoff instead of a step)")
+                   help="vbit allocation-curve shape (cubic: a smooth cutoff "
+                        "instead of a hard step)")
     p.add_argument("--mean-bits", type=float, default=4.25,
                    help="target mean bit of vbit water-filling (equal size "
                         "in A/B comparisons)")
     p.add_argument("--route-stats", default=None,
                    help="JSON of expert-selection frequencies (CMF_MOE_STATS) "
-                        "— water-filling B-field, full claim 12: b ∝ log2(A·B)")
+                        "— water-filling expert-frequency weighting: b ∝ log2(A·B)")
     p.add_argument("--vbit-flat", action="store_true",
                    help="A/B arm: per-tensor water-filling WITHOUT the expert "
                         "family budget (claim 12 disabled)")

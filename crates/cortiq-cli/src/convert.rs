@@ -512,7 +512,7 @@ pub(crate) enum Quant {
     /// 1-bit PTQ with an outlier mask (`Q1S` dtype): keeps the heavy tail
     /// (`CMF_Q1S_KEEP` of weights by |value|, default 1%) at full f16 in a
     /// sparse overlay, binarizes the rest with error diffusion. The mask
-    /// lever of the holographic-transfer path — what lets a NORMAL
+    /// lever of the error-feedback path — what lets a NORMAL
     /// checkpoint survive 1-bit.
     Q1s,
     Q1t,
@@ -649,7 +649,7 @@ fn encode_q4_block(vals: &[f32]) -> Vec<u8> {
     packed
 }
 
-/// q8_2f (two-field 𝒲×θ): `[int8: out·in][f16 row_scale: out][f16 col: in]`.
+/// q8_2f (row/column-scale): `[int8: out·in][f16 row_scale: out][f16 col: in]`.
 /// `col[i]` = RMS over rows (absorbs outlier input channels); each row is int8
 /// over the residual normalized by col. Dequant: `w = q·scale[o]·col[i]`.
 /// Recovers most of the q8→f16 quality gap at the same size.
@@ -1143,7 +1143,7 @@ fn q1s_keep_frac() -> f32 {
         .clamp(0.0, 0.25)
 }
 
-/// 1-bit PTQ with an outlier mask (Stage 2a of the holographic-transfer
+/// 1-bit PTQ with an outlier mask (Stage 2a of the error-feedback
 /// path). Keeps the top `keep_frac` of weights by |value| — the heavy tail
 /// a normal checkpoint carries — at full f16 precision in a sparse overlay,
 /// and binarizes the rest with the error-diffusion base, EXCLUDING the
@@ -5507,8 +5507,8 @@ pub(crate) mod tests {
     }
 
     /// Q1S roundtrip: kept outliers come back at f16 precision and the bulk
-    /// decodes to the per-group ±s level. Guards the format the holographic
-    /// fold will populate.
+    /// decodes to the per-group ±s level. Guards the format the fold will
+    /// populate.
     #[test]
     fn q1s_roundtrip_restores_outliers_and_binarizes_the_rest() {
         use cortiq_core::quant::dequant_q1s;
