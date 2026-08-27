@@ -9,8 +9,8 @@
 //!
 //!   CMF_GPU=0 cargo run --release -p cortiq-cli --example tube_alloc -- \
 //!       model.cmf mass.mass text.txt out.json [budget] [tokens] [grid]
-use cortiq_core::mask::{MaskPriority, TaskMask};
 use cortiq_core::CmfModel;
+use cortiq_core::mask::{MaskPriority, TaskMask};
 use cortiq_engine::{Pipeline, SamplerConfig};
 use std::sync::Arc;
 
@@ -89,7 +89,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         s / c.max(1) as f64
     };
     let base = nll(&mut p, None);
-    println!("dense NLL {base:.5} (PPL {:.3}) over {} tokens", base.exp(), ids.len());
+    println!(
+        "dense NLL {base:.5} (PPL {:.3}) over {} tokens",
+        base.exp(),
+        ids.len()
+    );
     // cost[l][g] — the NLL this layer adds at grid width g.
     let mut cost = vec![vec![0f64; grid.len()]; nl];
     for li in 0..nl {
@@ -138,9 +142,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|li| ((inter as f64 * grid[at[li]]).round() as usize / 32 * 32).clamp(32, inter))
         .collect();
     let mean: f64 = widths.iter().sum::<usize>() as f64 / (nl * inter) as f64;
-    println!("allocated widths (mean {:.1}% of {inter}): {widths:?}", mean * 100.0);
+    println!(
+        "allocated widths (mean {:.1}% of {inter}): {widths:?}",
+        mean * 100.0
+    );
     let pred: f64 = (0..nl).map(|li| cost[li][at[li]]).sum();
-    println!("predicted NLL cost if additive: {pred:.4} → PPL {:.3}", (base + pred).exp());
+    println!(
+        "predicted NLL cost if additive: {pred:.4} → PPL {:.3}",
+        (base + pred).exp()
+    );
     std::fs::write(&out_p, serde_json::to_string(&widths)?)?;
     // And the honest joint measurement of exactly that allocation.
     let mut ffn_masks = Vec::with_capacity(nl);
@@ -166,7 +176,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         has_hot_pack: false,
     };
     let j = nll(&mut p, Some(&joint));
-    println!("measured joint: NLL {j:.5} → PPL {:.3} ({:+.1}% vs dense)", j.exp(), (j.exp() / base.exp() - 1.0) * 100.0);
+    println!(
+        "measured joint: NLL {j:.5} → PPL {:.3} ({:+.1}% vs dense)",
+        j.exp(),
+        (j.exp() / base.exp() - 1.0) * 100.0
+    );
     // The uniform allocation of the same budget, for the comparison.
     let uw = ((inter as f64 * mean).round() as usize / 32 * 32).clamp(32, inter);
     let mut ffn_masks = Vec::with_capacity(nl);
@@ -177,8 +191,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         ffn_masks.push(bits);
     }
-    let unif = TaskMask { name: "uniform".into(), ffn_masks, ..joint.clone() };
+    let unif = TaskMask {
+        name: "uniform".into(),
+        ffn_masks,
+        ..joint.clone()
+    };
     let u = nll(&mut p, Some(&unif));
-    println!("uniform {uw}/{inter}: NLL {u:.5} → PPL {:.3} ({:+.1}% vs dense)", u.exp(), (u.exp() / base.exp() - 1.0) * 100.0);
+    println!(
+        "uniform {uw}/{inter}: NLL {u:.5} → PPL {:.3} ({:+.1}% vs dense)",
+        u.exp(),
+        (u.exp() / base.exp() - 1.0) * 100.0
+    );
     Ok(())
 }

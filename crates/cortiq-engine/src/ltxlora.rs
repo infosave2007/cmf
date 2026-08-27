@@ -275,14 +275,24 @@ pub(crate) fn read_safetensors(
     st_read(path).map(|(t, _)| t)
 }
 
-fn st_read(path: &Path) -> Result<(HashMap<String, (Vec<usize>, Vec<f32>)>, HashMap<String, String>), String> {
+fn st_read(
+    path: &Path,
+) -> Result<
+    (
+        HashMap<String, (Vec<usize>, Vec<f32>)>,
+        HashMap<String, String>,
+    ),
+    String,
+> {
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     if bytes.len() < 8 {
         return Err("lora: truncated safetensors header".into());
     }
     let hlen = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
     let header: serde_json::Value = serde_json::from_slice(
-        bytes.get(8..8 + hlen).ok_or("lora: header past end of file")?,
+        bytes
+            .get(8..8 + hlen)
+            .ok_or("lora: header past end of file")?,
     )
     .map_err(|e| format!("lora header: {e}"))?;
     let base = 8 + hlen;
@@ -310,7 +320,9 @@ fn st_read(path: &Path) -> Result<(HashMap<String, (Vec<usize>, Vec<f32>)>, Hash
         let offs = m["data_offsets"].as_array().ok_or("lora: offsets")?;
         let s = offs[0].as_u64().unwrap_or(0) as usize + base;
         let e = offs[1].as_u64().unwrap_or(0) as usize + base;
-        let raw = bytes.get(s..e).ok_or("lora: tensor span past end of file")?;
+        let raw = bytes
+            .get(s..e)
+            .ok_or("lora: tensor span past end of file")?;
         let mut data = Vec::with_capacity(shape.iter().product::<usize>().max(1));
         match dtype {
             "F32" => {
@@ -455,7 +467,12 @@ impl LoraBank {
             }
             None => strength,
         };
-        Ok(LoraBank { pairs, slot, meta, scale })
+        Ok(LoraBank {
+            pairs,
+            slot,
+            meta,
+            scale,
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -685,7 +702,10 @@ mod tests {
         };
         let mut out = vec![1.0f32; 2];
         quiet.add(&[1.0, 1.0], 1, &mut out, None);
-        assert!(!quiet.live(), "a 1e-6 branch on a unit base must be routed off");
+        assert!(
+            !quiet.live(),
+            "a 1e-6 branch on a unit base must be routed off"
+        );
         let loud = LoraBranch {
             a: vec![1.0; 2],
             b: vec![1.0; 2],
@@ -736,8 +756,14 @@ mod tests {
         let path = dir.join("tiny.safetensors");
         // rank 2, in 3, out 4 — one pair, plus a slot embedding
         let names = [
-            ("diffusion_model.transformer_blocks.0.attn1.to_q.lora_A.weight", vec![2usize, 3]),
-            ("diffusion_model.transformer_blocks.0.attn1.to_q.lora_B.weight", vec![4, 2]),
+            (
+                "diffusion_model.transformer_blocks.0.attn1.to_q.lora_A.weight",
+                vec![2usize, 3],
+            ),
+            (
+                "diffusion_model.transformer_blocks.0.attn1.to_q.lora_B.weight",
+                vec![4, 2],
+            ),
         ];
         let mut header = serde_json::Map::new();
         let mut blob: Vec<u8> = Vec::new();

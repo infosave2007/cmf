@@ -42,9 +42,19 @@ impl DurationHead {
             v_emb: vecf(model, &format!("{p}.video_modality_emb"))?,
             a_emb: vecf(model, &format!("{p}.audio_modality_emb"))?,
             query,
-            in_proj_w: vecf(model, &format!("{p}.attention_pooler.cross_attn.in_proj_weight"))?,
-            in_proj_b: vecf(model, &format!("{p}.attention_pooler.cross_attn.in_proj_bias"))?,
-            out_proj: Lin::load(model, &format!("{p}.attention_pooler.cross_attn.out_proj"), true)?,
+            in_proj_w: vecf(
+                model,
+                &format!("{p}.attention_pooler.cross_attn.in_proj_weight"),
+            )?,
+            in_proj_b: vecf(
+                model,
+                &format!("{p}.attention_pooler.cross_attn.in_proj_bias"),
+            )?,
+            out_proj: Lin::load(
+                model,
+                &format!("{p}.attention_pooler.cross_attn.out_proj"),
+                true,
+            )?,
             mlp_hidden: Lin::load(model, &format!("{p}.mlp_hidden"), true)?,
             mlp_out: Lin::load(model, &format!("{p}.mlp_out"), true)?,
             dim,

@@ -343,6 +343,31 @@ pub struct G3nConfig {
     pub activation_sparsity: Vec<f32>,
 }
 
+/// Qwen3.8-Flash-Next (`qwen4_exp`) text-stack geometry. The family uses
+/// four hyper-connection streams, block-sparse QSA, GDN and a deterministic
+/// n-gram/PLE side path. Keeping these values in the CMF header makes the
+/// same q4tp file portable across CPU and every GPU backend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Qwen4ExpConfig {
+    pub hc_count: usize,
+    pub hc_lowrank: usize,
+    pub indexer_n_heads: usize,
+    pub indexer_kv_heads: usize,
+    pub indexer_head_dim: usize,
+    pub indexer_budget: usize,
+    pub indexer_compress_ratio: usize,
+    /// One-indexed layer ids, matching the upstream configuration.
+    pub ple_layer_ids: Vec<usize>,
+    pub ple_embed_dim: usize,
+    pub ple_conv_kernel_size: usize,
+    pub ngram_size: usize,
+    pub heads_per_ngram: usize,
+    pub ngram_vocab_size_base: usize,
+    pub make_ngram_vocab_size_divisible_by: usize,
+    pub split_ngram_parts: usize,
+    pub seed: u64,
+}
+
 /// Model architecture descriptor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelArch {
@@ -439,6 +464,9 @@ pub struct ModelArch {
     /// Mixture-of-Experts FFN (None = all-dense model)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub moe: Option<MoeConfig>,
+    /// Qwen3.8-Flash-Next exact text stack (None for all other families).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qwen4_exp: Option<Qwen4ExpConfig>,
     /// Canonical linear core carried by the file (None = no linear layers
     /// or not folded yet)
     #[serde(default, skip_serializing_if = "Option::is_none")]

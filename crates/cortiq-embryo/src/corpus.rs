@@ -4,7 +4,12 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 /// Train our byte-level BPE on up to `sample_bytes` of text from `inputs`.
-pub fn train_tokenizer(inputs: &[PathBuf], out: &std::path::Path, vocab: usize, sample_bytes: usize) {
+pub fn train_tokenizer(
+    inputs: &[PathBuf],
+    out: &std::path::Path,
+    vocab: usize,
+    sample_bytes: usize,
+) {
     use crate::tokenizer::{SPLIT, count_words, train};
     let re = fancy_regex::Regex::new(SPLIT).unwrap();
     let mut counts = std::collections::HashMap::new();
@@ -24,11 +29,24 @@ pub fn train_tokenizer(inputs: &[PathBuf], out: &std::path::Path, vocab: usize, 
         })
         .expect("read corpus");
         seen_total += seen;
-        eprintln!("{}: {n} docs read, {:.1} MB sampled ({:.1} MB total), {} word types [{:.0} s]", p.display(), seen as f64 / 1e6, seen_total as f64 / 1e6, counts.len(), t0.elapsed().as_secs_f64());
+        eprintln!(
+            "{}: {n} docs read, {:.1} MB sampled ({:.1} MB total), {} word types [{:.0} s]",
+            p.display(),
+            seen as f64 / 1e6,
+            seen_total as f64 / 1e6,
+            counts.len(),
+            t0.elapsed().as_secs_f64()
+        );
     }
     let bpe = train(&counts, vocab, true);
     bpe.save(out).expect("write tokenizer.json");
-    println!("tokenizer: {} tokens, {} merges → {} [{:.0} s]", bpe.vocab_size(), bpe.merges.len(), out.display(), t0.elapsed().as_secs_f64());
+    println!(
+        "tokenizer: {} tokens, {} merges → {} [{:.0} s]",
+        bpe.vocab_size(),
+        bpe.merges.len(),
+        out.display(),
+        t0.elapsed().as_secs_f64()
+    );
 }
 
 /// Encode corpus files into one u16 shard (documents separated by EOT),
@@ -38,7 +56,9 @@ pub fn shard(tok: &std::path::Path, inputs: &[PathBuf], out: &std::path::Path, m
     let bpe = std::sync::Arc::new(Bpe::load(tok).expect("load tokenizer"));
     let eot = bpe.special_id(EOT).expect("EOT id") as u16;
     assert!(bpe.vocab_size() <= 65536);
-    let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let nthreads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
     let mut all: Vec<u16> = Vec::new();
     let t0 = Instant::now();
     'outer: for p in inputs {
@@ -84,26 +104,48 @@ pub fn shard(tok: &std::path::Path, inputs: &[PathBuf], out: &std::path::Path, m
             if batch_bytes >= 64 << 20 {
                 flush(&mut batch, &mut all);
                 batch_bytes = 0;
-                eprintln!("  {:.1} M tokens [{:.0} s]", all.len() as f64 / 1e6, t0.elapsed().as_secs_f64());
+                eprintln!(
+                    "  {:.1} M tokens [{:.0} s]",
+                    all.len() as f64 / 1e6,
+                    t0.elapsed().as_secs_f64()
+                );
             }
         })
         .expect("read corpus");
         flush(&mut batch, &mut all);
-        eprintln!("{}: {:.1} M tokens total [{:.0} s]", p.display(), all.len() as f64 / 1e6, t0.elapsed().as_secs_f64());
+        eprintln!(
+            "{}: {:.1} M tokens total [{:.0} s]",
+            p.display(),
+            all.len() as f64 / 1e6,
+            t0.elapsed().as_secs_f64()
+        );
         if all.len() >= max_tokens {
             break 'outer;
         }
     }
     all.truncate(max_tokens);
-    crate::train::Shard { tokens: all }.save(out).expect("write shard");
-    println!("shard: {} tokens → {}", std::fs::metadata(out).map(|m| m.len() / 2).unwrap_or(0), out.display());
+    crate::train::Shard { tokens: all }
+        .save(out)
+        .expect("write shard");
+    println!(
+        "shard: {} tokens → {}",
+        std::fs::metadata(out).map(|m| m.len() / 2).unwrap_or(0),
+        out.display()
+    );
 }
 
 /// Download URLs into `dir` with curl (resumable). Skips existing files.
 pub fn fetch(urls: &[String], dir: &std::path::Path) {
     std::fs::create_dir_all(dir).expect("mkdir");
     for u in urls {
-        let name = u.rsplit('/').next().unwrap_or("file").split('?').next().unwrap().to_string();
+        let name = u
+            .rsplit('/')
+            .next()
+            .unwrap_or("file")
+            .split('?')
+            .next()
+            .unwrap()
+            .to_string();
         let dst = dir.join(&name);
         if dst.exists() && !dst.with_extension("part").exists() {
             println!("have {}", dst.display());

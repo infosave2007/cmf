@@ -9,7 +9,9 @@ use cortiq_embryo::train::Shard;
 
 #[test]
 fn mtp_head_gradients_match_finite_differences() {
-    let Some(_) = cortiq_embryo::metal::ctx() else { return };
+    let Some(_) = cortiq_embryo::metal::ctx() else {
+        return;
+    };
     let mut cfg = EmbryoCfg::tiny();
     cfg.experts = 2;
     let lay = Layout::new(&cfg);
@@ -30,7 +32,10 @@ fn mtp_head_gradients_match_finite_differences() {
     let trunk = gpu.params_host();
     gpu.desc_updates.set(false);
     let mut st = MtpState::new(&gpu, 1, 7);
-    let toks: Vec<u32> = corpus.tokens[1000..1000 + m].iter().map(|&x| x as u32).collect();
+    let toks: Vec<u32> = corpus.tokens[1000..1000 + m]
+        .iter()
+        .map(|&x| x as u32)
+        .collect();
     let valid = (t - 2) * b; // head 1 (t+2): positions with a target
     // analytic gradient (lr 0 → params untouched, grads left in gp/gw)
     let l = mtp_step(&mut gpu, &mut st, &toks, 0.0, true)[0] * valid as f32 / m as f32;
@@ -40,13 +45,21 @@ fn mtp_head_gradients_match_finite_differences() {
     let w0 = st.w.to_vec();
     let h = cfg.hidden;
     for (name, is_p, base, g) in [("proj", true, &p0, &gp), ("norm", false, &w0, &gw)] {
-        let gn = g.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>().sqrt();
+        let gn = g
+            .iter()
+            .map(|x| (*x as f64) * (*x as f64))
+            .sum::<f64>()
+            .sqrt();
         for dir in 0..2 {
             let delta: Vec<f64> = if dir == 0 {
                 g.iter().map(|x| *x as f64 / gn.max(1e-30)).collect()
             } else {
                 let r = gauss_vec(11 + dir, g.len());
-                let rn = r.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>().sqrt();
+                let rn = r
+                    .iter()
+                    .map(|x| (*x as f64) * (*x as f64))
+                    .sum::<f64>()
+                    .sqrt();
                 r.iter().map(|x| *x as f64 / rn).collect()
             };
             let an: f64 = g.iter().zip(&delta).map(|(a, d)| *a as f64 * d).sum();
@@ -55,17 +68,33 @@ fn mtp_head_gradients_match_finite_differences() {
             for i in 0..pp.len() {
                 pp[i] = (base[i] as f64 + eps * delta[i]) as f32;
             }
-            if is_p { st.p.write_from(&pp) } else { st.w.write_from(&pp) }
-            let lp = mtp_step(&mut gpu, &mut st, &toks, 0.0, false)[0] as f64 * valid as f64 / m as f64;
+            if is_p {
+                st.p.write_from(&pp)
+            } else {
+                st.w.write_from(&pp)
+            }
+            let lp =
+                mtp_step(&mut gpu, &mut st, &toks, 0.0, false)[0] as f64 * valid as f64 / m as f64;
             for i in 0..pp.len() {
                 pp[i] = (base[i] as f64 - eps * delta[i]) as f32;
             }
-            if is_p { st.p.write_from(&pp) } else { st.w.write_from(&pp) }
-            let lm = mtp_step(&mut gpu, &mut st, &toks, 0.0, false)[0] as f64 * valid as f64 / m as f64;
-            if is_p { st.p.write_from(base) } else { st.w.write_from(base) }
+            if is_p {
+                st.p.write_from(&pp)
+            } else {
+                st.w.write_from(&pp)
+            }
+            let lm =
+                mtp_step(&mut gpu, &mut st, &toks, 0.0, false)[0] as f64 * valid as f64 / m as f64;
+            if is_p {
+                st.p.write_from(base)
+            } else {
+                st.w.write_from(base)
+            }
             let fd = (lp - lm) / (2.0 * eps);
             let err = (fd - an).abs() / gn.max(5e-4);
-            eprintln!("mtp {name} dir {dir}: |g| {gn:.3e} fd {fd:+.4e} an {an:+.4e} err/|g| {err:.2e} (loss {l:.4}, h {h})");
+            eprintln!(
+                "mtp {name} dir {dir}: |g| {gn:.3e} fd {fd:+.4e} an {an:+.4e} err/|g| {err:.2e} (loss {l:.4}, h {h})"
+            );
             assert!(err < 3e-2, "mtp {name}: fd {fd} vs analytic {an}");
         }
     }

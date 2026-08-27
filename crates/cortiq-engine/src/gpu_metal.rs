@@ -6084,7 +6084,9 @@ impl WeightArena {
 /// mapping past this needs more than one window, and a phase that spans two
 /// of them puts both on the driver's accounting at once.
 pub fn max_buffer_bytes() -> u64 {
-    ctx().map(|c| c._device.max_buffer_length() as u64).unwrap_or(0)
+    ctx()
+        .map(|c| c._device.max_buffer_length() as u64)
+        .unwrap_or(0)
 }
 
 /// What the device is willing to keep wired, in bytes (0 without Metal).
@@ -6093,7 +6095,9 @@ pub fn max_buffer_bytes() -> u64 {
 /// it is about to touch a *different* part of the file than the hot loop
 /// does can use this to decide to stay on the CPU for that part.
 pub fn working_set_bytes() -> u64 {
-    ctx().map(|c| c._device.recommended_max_working_set_size()).unwrap_or(0)
+    ctx()
+        .map(|c| c._device.recommended_max_working_set_size())
+        .unwrap_or(0)
 }
 
 fn file_buffer(c: &Ctx, model: &Arc<CmfModel>) -> Option<(Arc<WeightArena>, usize)> {
@@ -6691,10 +6695,9 @@ pub fn q4tp_matvec_batch(
         (b * cols * 4) as u64,
         MTLResourceOptions::StorageModeShared,
     );
-    let y_buf = c._device.new_buffer(
-        (b * rows * 4) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
+    let y_buf = c
+        ._device
+        .new_buffer((b * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
     let cmd = c.queue.new_command_buffer();
     {
         let enc = cmd.new_compute_command_encoder();
@@ -6749,10 +6752,9 @@ pub fn q4tp_mm_n8_batch(
         32,
         MTLResourceOptions::StorageModeShared,
     );
-    let y_buf = c._device.new_buffer(
-        (b * rows * 4) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
+    let y_buf = c
+        ._device
+        .new_buffer((b * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
     let cmd = c.queue.new_command_buffer();
     {
         let enc = cmd.new_compute_command_encoder();
@@ -6783,13 +6785,17 @@ pub fn q4tp_kernel_bench(
     let entry = &model.tensors[idx];
     let abs = model.entry_abs_offset(entry)?;
     let (fbuf, _safe) = file_buffer(c, model)?;
-    let xs: Vec<f32> = (0..b * cols).map(|i| ((i % 97) as f32 - 48.0) / 48.0).collect();
+    let xs: Vec<f32> = (0..b * cols)
+        .map(|i| ((i % 97) as f32 - 48.0) / 48.0)
+        .collect();
     let xs_buf = c._device.new_buffer_with_data(
         xs.as_ptr() as *const std::ffi::c_void,
         (b * cols * 4) as u64,
         MTLResourceOptions::StorageModeShared,
     );
-    let y_buf = c._device.new_buffer((b * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+    let y_buf = c
+        ._device
+        .new_buffer((b * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
     let cmd = c.queue.new_command_buffer();
     {
         let enc = cmd.new_compute_command_encoder();
@@ -6799,12 +6805,30 @@ pub fn q4tp_kernel_bench(
                 1 => encode_q4tp_matvec_bk(c, enc, &fbuf, abs, &xs_buf, &y_buf, rows, cols / 32, b),
                 3 => {
                     let ones = [1.0f32; 8];
-                    let sc = c._device.new_buffer_with_data(ones.as_ptr() as *const std::ffi::c_void, 32, MTLResourceOptions::StorageModeShared);
+                    let sc = c._device.new_buffer_with_data(
+                        ones.as_ptr() as *const std::ffi::c_void,
+                        32,
+                        MTLResourceOptions::StorageModeShared,
+                    );
                     encode_q4tp_mm_n8(c, enc, &fbuf, abs, &xs_buf, &y_buf, &sc, rows, cols, b)
                 }
                 _ => {
-                    let rs = c._device.new_buffer(16, MTLResourceOptions::StorageModeShared);
-                    enc_mul_mm(c, enc, &fbuf, abs, &rs, MmKind::Q4tp, &xs_buf, &y_buf, b, rows, cols)
+                    let rs = c
+                        ._device
+                        .new_buffer(16, MTLResourceOptions::StorageModeShared);
+                    enc_mul_mm(
+                        c,
+                        enc,
+                        &fbuf,
+                        abs,
+                        &rs,
+                        MmKind::Q4tp,
+                        &xs_buf,
+                        &y_buf,
+                        b,
+                        rows,
+                        cols,
+                    )
                 }
             }
         }
@@ -8530,9 +8554,10 @@ pub fn q4tp_matmat_many(
         let Some(abs) = model.entry_abs_offset(entry) else {
             return false;
         };
-        let Some(need) =
-            cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[j.rows, j.cols])
-        else {
+        let Some(need) = cortiq_core::quant::expected_nbytes(
+            cortiq_core::TensorDtype::Q4TiledP,
+            &[j.rows, j.cols],
+        ) else {
             return false;
         };
         if abs + need > safe_len {
@@ -8597,11 +8622,7 @@ pub fn q4tp_matmat_many(
     let t_dn = std::time::Instant::now();
     for (j, (y, out)) in jobs.iter().zip(ys.iter().zip(outs.iter_mut())) {
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                y.contents() as *const f32,
-                out.as_mut_ptr(),
-                b * j.rows,
-            );
+            std::ptr::copy_nonoverlapping(y.contents() as *const f32, out.as_mut_ptr(), b * j.rows);
         }
     }
     if std::env::var("CMF_METAL_MMPROF").is_ok() {
@@ -8769,7 +8790,9 @@ pub fn q4tp_matmat_lora(
     // have been invisible until the one prompt that does.
     enc_f32nt(c, cmd, &a_buf, &xs_buf, &h_buf, b, lora.rank, cols, wboost);
     // d = scale·h·Bᵀ, then y += d.
-    enc_f32nt(c, cmd, &b_buf, &h_buf, &d_buf, b, rows, lora.rank, lora.scale);
+    enc_f32nt(
+        c, cmd, &b_buf, &h_buf, &d_buf, b, rows, lora.rank, lora.scale,
+    );
     {
         let enc = cmd.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&c.axpy);
@@ -11735,7 +11758,17 @@ impl TokenGraph {
         }
         let cmd = self.ensure_cmd();
         let enc = cmd.new_compute_command_encoder();
-        encode_proj(self.c, enc, &self.fbuf, abs, &kind, &x_b, &self.h_b, t.1, t.2 / GROUP_SIZE);
+        encode_proj(
+            self.c,
+            enc,
+            &self.fbuf,
+            abs,
+            &kind,
+            &x_b,
+            &self.h_b,
+            t.1,
+            t.2 / GROUP_SIZE,
+        );
         enc.end_encoding();
         true
     }
@@ -11743,7 +11776,11 @@ impl TokenGraph {
     /// Hidden state readback (after `sync`) — debug/oracle use.
     pub fn read_h(&self, out: &mut [f32]) {
         unsafe {
-            std::ptr::copy_nonoverlapping(self.h_b.contents() as *const f32, out.as_mut_ptr(), out.len().min(self.dims.hidden));
+            std::ptr::copy_nonoverlapping(
+                self.h_b.contents() as *const f32,
+                out.as_mut_ptr(),
+                out.len().min(self.dims.hidden),
+            );
         }
     }
 
@@ -11802,7 +11839,11 @@ impl TokenGraph {
         kv_mirror_drop(p2.kv_id);
         // restore the shared hidden buffer
         unsafe {
-            std::ptr::copy_nonoverlapping(h_now.as_ptr(), self.h_b.contents() as *mut f32, self.dims.hidden);
+            std::ptr::copy_nonoverlapping(
+                h_now.as_ptr(),
+                self.h_b.contents() as *mut f32,
+                self.dims.hidden,
+            );
         }
         Some((qr, krow, vrow, ao))
     }
@@ -11873,7 +11914,12 @@ impl TokenGraph {
 
     /// `encode_lm_head` over the first `rows_do` rows of a q4tp head — the
     /// draft's vocabulary shortlist. False = not q4tp / out of range.
-    pub fn encode_lm_head_part(&mut self, norm: &[f32], lm: (usize, usize, usize), rows_do: usize) -> bool {
+    pub fn encode_lm_head_part(
+        &mut self,
+        norm: &[f32],
+        lm: (usize, usize, usize),
+        rows_do: usize,
+    ) -> bool {
         if rows_do == 0 || rows_do > lm.1 || lm.2 != self.dims.hidden {
             return false;
         }
@@ -11885,7 +11931,11 @@ impl TokenGraph {
         enc_simple(
             &cmd,
             &self.c.rmsn,
-            &[(&self.h_b, 0), (&const_buf(self.c, norm), 0), (&self.n_b, 0)],
+            &[
+                (&self.h_b, 0),
+                (&const_buf(self.c, norm), 0),
+                (&self.n_b, 0),
+            ],
             &[self.dims.hidden as u32, self.dims.gemma as u32],
             &[self.dims.eps],
             (256, 256),
@@ -12123,7 +12173,10 @@ impl TokenGraph {
                     // Resync from the owner of record (eviction, rollback,
                     // a CPU-path append, or a fresh mirror).
                     if std::env::var("CMF_MIRROR_DBG").is_ok() {
-                        eprintln!("kv-mirror resync L{} : mirror {} vs cpu {} rows", p.layer, entry.stored as i64, p.cpu_stored);
+                        eprintln!(
+                            "kv-mirror resync L{} : mirror {} vs cpu {} rows",
+                            p.layer, entry.stored as i64, p.cpu_stored
+                        );
                     }
                     for h in 0..p.nkv {
                         if p.cpu_k[h].len() != p.cpu_stored * p.hd
@@ -12355,27 +12408,29 @@ impl TokenGraph {
             let thr = gqa_blk_threshold();
             let blk = thr > 0
                 && n_pos > thr
-                && encode_gqa_attend_blk(self.c, enc, &qr_b, &k_mb, &v_mb, &ao_b, p.nh, p.nkv, p.hd, cap, stored, 1);
+                && encode_gqa_attend_blk(
+                    self.c, enc, &qr_b, &k_mb, &v_mb, &ao_b, p.nh, p.nkv, p.hd, cap, stored, 1,
+                );
             let cap_sgs = (self.c.gqat.max_total_threads_per_threadgroup() as usize / 32)
                 .clamp(1, gqa_split_max());
             let sgs = n_pos.div_ceil(32).clamp(1, cap_sgs);
             let tg_threads = 32 * sgs;
             if !blk {
-            disp_tg(
-                enc,
-                &self.c.gqat,
-                &[(&qr_b, 0), (&k_mb, 0), (&v_mb, 0), (&ao_b, 0), (&imp_mb, 0)],
-                &[
-                    p.nh as u32,
-                    (p.nh / p.nkv) as u32,
-                    p.hd as u32,
-                    cap as u32,
-                    n_pos as u32,
-                ],
-                &[],
-                ((p.nh * tg_threads) as u64, tg_threads as u64),
-                ((sgs * p.hd + 2 * sgs) * 4) as u64,
-            );
+                disp_tg(
+                    enc,
+                    &self.c.gqat,
+                    &[(&qr_b, 0), (&k_mb, 0), (&v_mb, 0), (&ao_b, 0), (&imp_mb, 0)],
+                    &[
+                        p.nh as u32,
+                        (p.nh / p.nkv) as u32,
+                        p.hd as u32,
+                        cap as u32,
+                        n_pos as u32,
+                    ],
+                    &[],
+                    ((p.nh * tg_threads) as u64, tg_threads as u64),
+                    ((sgs * p.hd + 2 * sgs) * 4) as u64,
+                );
             }
         }
         // 6. output gate
@@ -13184,13 +13239,18 @@ const VBUF_BASE: usize = 60_000_000_000;
 /// probe, output is garbage while set.
 fn verify_skip(what: char) -> bool {
     static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    V.get_or_init(|| std::env::var("CMF_VERIFY_SKIP").unwrap_or_default()).contains(what)
+    V.get_or_init(|| std::env::var("CMF_VERIFY_SKIP").unwrap_or_default())
+        .contains(what)
 }
 
 impl VerifyGraph {
     fn vbuf(c: &Ctx, kind: usize, slot: usize, nbytes: usize) -> Buffer {
         // the key carries the size (io_buf caches by key alone)
-        io_buf(c, VBUF_BASE + kind * 1_000_000_000_000 + slot * 1_000_000_000 + nbytes / 16, nbytes)
+        io_buf(
+            c,
+            VBUF_BASE + kind * 1_000_000_000_000 + slot * 1_000_000_000 + nbytes / 16,
+            nbytes,
+        )
     }
 
     pub fn new(model: &Arc<CmfModel>, dims: GraphDims, h: &[f32], b: usize) -> Option<VerifyGraph> {
@@ -13235,7 +13295,12 @@ impl VerifyGraph {
 
     /// The prefill flavour: b prompt rows (≤ 512), states written in
     /// place, K/V rows appended for good — see `finish_states`.
-    pub fn new_prefill(model: &Arc<CmfModel>, dims: GraphDims, h: &[f32], b: usize) -> Option<VerifyGraph> {
+    pub fn new_prefill(
+        model: &Arc<CmfModel>,
+        dims: GraphDims,
+        h: &[f32],
+        b: usize,
+    ) -> Option<VerifyGraph> {
         let mut g = Self::new(model, dims, h, b)?;
         g.prefill = true;
         Some(g)
@@ -13305,7 +13370,9 @@ impl VerifyGraph {
             && (cfg.dk == 64 || cfg.dk == 128)
             && cfg.kk <= 8
             && cfg.nv % cfg.nk == 0
-            && [l.qkv, l.z, l.out].iter().all(|t| self.n8_abs(*t).is_some())
+            && [l.qkv, l.z, l.out]
+                .iter()
+                .all(|t| self.n8_abs(*t).is_some())
             && self.ffn_n8_ok(&l.ffn)
     }
 
@@ -13313,7 +13380,9 @@ impl VerifyGraph {
     pub fn attn_ok(&self, l: &AttnGpuLayer, p: &AttnDeviceParams) -> bool {
         self.tg.attn_device_ok(l, p)
             && p.o1.is_none()
-            && [l.wq, l.wk, l.wv, l.wo].iter().all(|t| self.n8_abs(*t).is_some())
+            && [l.wq, l.wk, l.wv, l.wo]
+                .iter()
+                .all(|t| self.n8_abs(*t).is_some())
             && self.ffn_n8_ok(&l.ffn)
     }
 
@@ -13351,7 +13420,11 @@ impl VerifyGraph {
         let (n_u, g_u, hd_u) = (self.tg.dims.hidden as u32, self.tg.dims.gemma as u32, 1u32);
         enc.set_bytes(4, 4, &n_u as *const u32 as *const std::ffi::c_void);
         enc.set_bytes(5, 4, &g_u as *const u32 as *const std::ffi::c_void);
-        enc.set_bytes(6, 4, &self.tg.dims.eps as *const f32 as *const std::ffi::c_void);
+        enc.set_bytes(
+            6,
+            4,
+            &self.tg.dims.eps as *const f32 as *const std::ffi::c_void,
+        );
         enc.set_bytes(7, 4, &hd_u as *const u32 as *const std::ffi::c_void);
         enc.dispatch_thread_groups(MTLSize::new(self.b as u64, 1, 1), MTLSize::new(256, 1, 1));
     }
@@ -13360,28 +13433,74 @@ impl VerifyGraph {
     fn flush_delta(&mut self, enc: &metal::ComputeCommandEncoderRef) {
         if self.pending_delta {
             self.pending_delta = false;
-            disp_axpy(self.tg.c, enc, &self.d_b, &self.h_b, 1.0, self.b * self.tg.dims.hidden);
+            disp_axpy(
+                self.tg.c,
+                enc,
+                &self.d_b,
+                &self.h_b,
+                1.0,
+                self.b * self.tg.dims.hidden,
+            );
         }
     }
 
-    fn gemm(&self, enc: &metal::ComputeCommandEncoderRef, t: (usize, usize, usize), xs: &Buffer, y: &Buffer, xsc: &Buffer) {
-        if verify_skip('g') { return; }
+    fn gemm(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        t: (usize, usize, usize),
+        xs: &Buffer,
+        y: &Buffer,
+        xsc: &Buffer,
+    ) {
+        if verify_skip('g') {
+            return;
+        }
         let abs = self.n8_abs(t).unwrap();
         note_weight_bytes(&ProjKind::Q4tp, t.1, t.2 / GROUP_SIZE);
         if self.b <= 8 {
-            encode_q4tp_mm_n8(self.tg.c, enc, &self.tg.fbuf, abs, xs, y, xsc, t.1, t.2, self.b);
+            encode_q4tp_mm_n8(
+                self.tg.c,
+                enc,
+                &self.tg.fbuf,
+                abs,
+                xs,
+                y,
+                xsc,
+                t.1,
+                t.2,
+                self.b,
+            );
         } else {
             // the wide simdgroup GEMM (compute-bound, ~1.5 TMAC/s on the
             // M4); its activations ride at scale 1 — no per-row pre-scale
-            enc_mul_mm(self.tg.c, enc, &self.tg.fbuf, abs, &self.ones, MmKind::Q4tp, xs, y, self.b, t.1, t.2);
+            enc_mul_mm(
+                self.tg.c,
+                enc,
+                &self.tg.fbuf,
+                abs,
+                &self.ones,
+                MmKind::Q4tp,
+                xs,
+                y,
+                self.b,
+                t.1,
+                t.2,
+            );
         }
     }
 
     /// h += d; n = rmsnorm(h, post_norm); gate/up/silu/down over b rows;
     /// h += down.
-    fn post_ffn(&mut self, enc: &metal::ComputeCommandEncoderRef, post_norm: &[f32], ffn: &MetalFfn) {
+    fn post_ffn(
+        &mut self,
+        enc: &metal::ComputeCommandEncoderRef,
+        post_norm: &[f32],
+        ffn: &MetalFfn,
+    ) {
         let c = self.tg.c;
-        let MetalFfn::Dense { gate, up, down } = ffn else { return };
+        let MetalFfn::Dense { gate, up, down } = ffn else {
+            return;
+        };
         // h += d (the mixer's output); n = rmsnorm(h, post_norm)
         self.add_norm(enc, post_norm);
         let inter = gate.1;
@@ -13406,7 +13525,12 @@ impl VerifyGraph {
 
     /// A run of consecutive GDN layers over the b rows. `states` are the
     /// CPU owners' `[ring | S]` (read here, never written — see `commit`).
-    pub fn encode_gdn_run_b(&mut self, layers: &[GdnGpuLayer], states: &[&[f32]], cfg: &GdnGpuCfg) -> bool {
+    pub fn encode_gdn_run_b(
+        &mut self,
+        layers: &[GdnGpuLayer],
+        states: &[&[f32]],
+        cfg: &GdnGpuCfg,
+    ) -> bool {
         WCAT.store(4, std::sync::atomic::Ordering::Relaxed);
         if layers.is_empty() || layers.len() != states.len() {
             return false;
@@ -13440,7 +13564,11 @@ impl VerifyGraph {
             let of_b = Self::vbuf(c, 20, 0, b * vd * 4);
             if st_len > 0 {
                 unsafe {
-                    std::ptr::copy_nonoverlapping(st.as_ptr(), s_b.contents() as *mut f32, st.len());
+                    std::ptr::copy_nonoverlapping(
+                        st.as_ptr(),
+                        s_b.contents() as *mut f32,
+                        st.len(),
+                    );
                 }
             }
             let gnorm_b = const_buf(c, l.gnorm);
@@ -13460,7 +13588,13 @@ impl VerifyGraph {
                     disp(
                         enc,
                         &c.f32mv2b,
-                        &[(&wa, 0), (&wb2, 0), (&self.n_b, (c0 * cols * 4) as u64), (&a_b, (c0 * rows * 4) as u64), (&bb_b, (c0 * rows * 4) as u64)],
+                        &[
+                            (&wa, 0),
+                            (&wb2, 0),
+                            (&self.n_b, (c0 * cols * 4) as u64),
+                            (&a_b, (c0 * rows * 4) as u64),
+                            (&bb_b, (c0 * rows * 4) as u64),
+                        ],
                         &[cols as u32, rows as u32, nb as u32],
                         &[],
                         (((2 * rows) as u64).div_ceil(8) * 256, 256),
@@ -13477,12 +13611,22 @@ impl VerifyGraph {
             enc.set_bytes(4, 4, &cd_u as *const u32 as *const std::ffi::c_void);
             enc.set_bytes(5, 4, &kk_u as *const u32 as *const std::ffi::c_void);
             enc.set_bytes(6, 4, &nb_u as *const u32 as *const std::ffi::c_void);
-            enc.dispatch_threads(MTLSize::new(cfg.c_dim as u64, b as u64, 1), MTLSize::new(256, 1, 1));
+            enc.dispatch_threads(
+                MTLSize::new(cfg.c_dim as u64, b as u64, 1),
+                MTLSize::new(256, 1, 1),
+            );
             // 4. gates + qk norms
             disp(
                 enc,
                 &c.gdngatesb,
-                &[(&a_b, 0), (&bb_b, 0), (&const_buf(c, l.a_log), 0), (&const_buf(c, l.dt_bias), 0), (&g_b, 0), (&bt_b, 0)],
+                &[
+                    (&a_b, 0),
+                    (&bb_b, 0),
+                    (&const_buf(c, l.a_log), 0),
+                    (&const_buf(c, l.dt_bias), 0),
+                    (&g_b, 0),
+                    (&bt_b, 0),
+                ],
                 &[cfg.nv as u32, (b * cfg.nv) as u32],
                 &[],
                 ((b * cfg.nv) as u64, 64),
@@ -13499,7 +13643,10 @@ impl VerifyGraph {
             //    writes the state back and shifts the ring right here)
             if !verify_skip('s') {
                 let mode = if self.prefill { 3 } else { 1 };
-                Self::state_dispatch(c, enc, &s_b, ring_len, &cq_b, &z_b, &g_b, &bt_b, &iq_b, &ik_b, &gnorm_b, &of_b, cfg, b, mode);
+                Self::state_dispatch(
+                    c, enc, &s_b, ring_len, &cq_b, &z_b, &g_b, &bt_b, &iq_b, &ik_b, &gnorm_b,
+                    &of_b, cfg, b, mode,
+                );
                 if self.prefill {
                     disp(
                         enc,
@@ -13550,7 +13697,11 @@ impl VerifyGraph {
         n_pos: usize,
         mode: u32,
     ) {
-        let pso = if cfg.dk == 64 { &c.gdnstb64 } else { &c.gdnstb128 };
+        let pso = if cfg.dk == 64 {
+            &c.gdnstb64
+        } else {
+            &c.gdnstb128
+        };
         enc.set_compute_pipeline_state(pso);
         enc.set_buffer(0, Some(s_b), (ring_len * 4) as u64);
         enc.set_buffer(1, Some(cq), 0);
@@ -13561,12 +13712,22 @@ impl VerifyGraph {
         enc.set_buffer(6, Some(ik), 0);
         enc.set_buffer(7, Some(gnorm), 0);
         enc.set_buffer(8, Some(of), 0);
-        let w = [cfg.nv as u32, cfg.nk as u32, cfg.dv as u32, cfg.c_dim as u32, n_pos as u32, mode];
+        let w = [
+            cfg.nv as u32,
+            cfg.nk as u32,
+            cfg.dv as u32,
+            cfg.c_dim as u32,
+            n_pos as u32,
+            mode,
+        ];
         for (i, v) in w.iter().enumerate() {
             enc.set_bytes(9 + i as u64, 4, v as *const u32 as *const std::ffi::c_void);
         }
         enc.set_bytes(15, 4, &cfg.eps as *const f32 as *const std::ffi::c_void);
-        enc.dispatch_thread_groups(MTLSize::new(cfg.nv as u64, 1, 1), MTLSize::new(cfg.dv as u64, 1, 1));
+        enc.dispatch_thread_groups(
+            MTLSize::new(cfg.nv as u64, 1, 1),
+            MTLSize::new(cfg.dv as u64, 1, 1),
+        );
     }
 
     /// One full-attention layer over the b rows: rows land in the mirror
@@ -13584,18 +13745,28 @@ impl VerifyGraph {
             let mut reg = c.kv_mirrors.lock().unwrap();
             let need = p.cpu_stored + b;
             let entry = reg.entry((p.kv_id, p.layer)).or_insert_with(|| KvMirror {
-                k: c._device.new_buffer(0, MTLResourceOptions::StorageModeShared),
-                v: c._device.new_buffer(0, MTLResourceOptions::StorageModeShared),
-                imp: c._device.new_buffer(0, MTLResourceOptions::StorageModeShared),
+                k: c._device
+                    .new_buffer(0, MTLResourceOptions::StorageModeShared),
+                v: c._device
+                    .new_buffer(0, MTLResourceOptions::StorageModeShared),
+                imp: c
+                    ._device
+                    .new_buffer(0, MTLResourceOptions::StorageModeShared),
                 cap: 0,
                 stored: usize::MAX,
             });
             if entry.cap < need {
                 let cap = need.next_power_of_two().max(1024);
                 let bytes = (p.nkv * cap * p.hd * 4) as u64;
-                entry.k = c._device.new_buffer(bytes, MTLResourceOptions::StorageModeShared);
-                entry.v = c._device.new_buffer(bytes, MTLResourceOptions::StorageModeShared);
-                entry.imp = c._device.new_buffer((cap * 4) as u64, MTLResourceOptions::StorageModeShared);
+                entry.k = c
+                    ._device
+                    .new_buffer(bytes, MTLResourceOptions::StorageModeShared);
+                entry.v = c
+                    ._device
+                    .new_buffer(bytes, MTLResourceOptions::StorageModeShared);
+                entry.imp = c
+                    ._device
+                    .new_buffer((cap * 4) as u64, MTLResourceOptions::StorageModeShared);
                 unsafe {
                     std::ptr::write_bytes(entry.imp.contents() as *mut u8, 0, cap * 4);
                 }
@@ -13604,7 +13775,9 @@ impl VerifyGraph {
             }
             if entry.stored != p.cpu_stored {
                 for h in 0..p.nkv {
-                    if p.cpu_k[h].len() != p.cpu_stored * p.hd || p.cpu_v[h].len() != p.cpu_stored * p.hd {
+                    if p.cpu_k[h].len() != p.cpu_stored * p.hd
+                        || p.cpu_v[h].len() != p.cpu_stored * p.hd
+                    {
                         return false;
                     }
                     unsafe {
@@ -13638,16 +13811,32 @@ impl VerifyGraph {
             | ((p.q_norm.is_some() as u32) << 1)
             | ((p.k_norm.is_some() as u32) << 2)
             | ((p.gemma as u32) << 3);
-        let qn_b = p.q_norm.map(|w| const_buf(c, w)).unwrap_or_else(|| qr_b.clone());
-        let kn_b = p.k_norm.map(|w| const_buf(c, w)).unwrap_or_else(|| qr_b.clone());
+        let qn_b = p
+            .q_norm
+            .map(|w| const_buf(c, w))
+            .unwrap_or_else(|| qr_b.clone());
+        let kn_b = p
+            .k_norm
+            .map(|w| const_buf(c, w))
+            .unwrap_or_else(|| qr_b.clone());
         let invf_b = const_buf(c, p.inv_freq);
         {
             // one 2-D dispatch: x = the (nh+nkv) head simdgroups, y = rows
             enc.set_compute_pipeline_state(&c.rqknb);
-            for (i, bb) in [&q_b, &k_b, &qr_b, &g_b, &qn_b, &kn_b, &invf_b].iter().enumerate() {
+            for (i, bb) in [&q_b, &k_b, &qr_b, &g_b, &qn_b, &kn_b, &invf_b]
+                .iter()
+                .enumerate()
+            {
                 enc.set_buffer(i as u64, Some(bb), 0);
             }
-            let w = [p.nh as u32, p.nkv as u32, p.hd as u32, p.rd as u32, p.position as u32, flags];
+            let w = [
+                p.nh as u32,
+                p.nkv as u32,
+                p.hd as u32,
+                p.rd as u32,
+                p.position as u32,
+                flags,
+            ];
             for (i, v) in w.iter().enumerate() {
                 enc.set_bytes(7 + i as u64, 4, v as *const u32 as *const std::ffi::c_void);
             }
@@ -13665,17 +13854,28 @@ impl VerifyGraph {
         enc.set_buffer(1, Some(&v_b), 0);
         enc.set_buffer(2, Some(&k_mb), 0);
         enc.set_buffer(3, Some(&v_mb), 0);
-        let w = [p.nkv as u32, p.hd as u32, cap as u32, stored as u32, b as u32];
+        let w = [
+            p.nkv as u32,
+            p.hd as u32,
+            cap as u32,
+            stored as u32,
+            b as u32,
+        ];
         for (i, v) in w.iter().enumerate() {
             enc.set_bytes(4 + i as u64, 4, v as *const u32 as *const std::ffi::c_void);
         }
-        enc.dispatch_threads(MTLSize::new(kvd as u64, b as u64, 1), MTLSize::new(256, 1, 1));
+        enc.dispatch_threads(
+            MTLSize::new(kvd as u64, b as u64, 1),
+            MTLSize::new(256, 1, 1),
+        );
         let thr = gqa_blk_threshold();
         let blk = b >= 2
             && thr > 0
             && stored + b > thr
             && !verify_skip('a')
-            && encode_gqa_attend_blk(c, enc, &qr_b, &k_mb, &v_mb, &ao_b, p.nh, p.nkv, p.hd, cap, stored, b);
+            && encode_gqa_attend_blk(
+                c, enc, &qr_b, &k_mb, &v_mb, &ao_b, p.nh, p.nkv, p.hd, cap, stored, b,
+            );
         if b >= 2 && !blk {
             // the chunk attend: one simdgroup per (row, head), row e over
             // positions 0..=stored+e (one dispatch; the per-row flash split
@@ -13687,7 +13887,14 @@ impl VerifyGraph {
                 enc.set_buffer(2, Some(&v_mb), 0);
                 enc.set_buffer(3, Some(&ao_b), 0);
                 enc.set_buffer(4, Some(&self.imp_scratch), 0);
-                let w = [p.nh as u32, (p.nh / p.nkv) as u32, p.hd as u32, cap as u32, stored as u32, b as u32];
+                let w = [
+                    p.nh as u32,
+                    (p.nh / p.nkv) as u32,
+                    p.hd as u32,
+                    cap as u32,
+                    stored as u32,
+                    b as u32,
+                ];
                 for (i, v) in w.iter().enumerate() {
                     enc.set_bytes(5 + i as u64, 4, v as *const u32 as *const std::ffi::c_void);
                 }
@@ -13699,9 +13906,12 @@ impl VerifyGraph {
         }
         // attend row e over positions 0..=stored+e
         for e in 0..b {
-            if b >= 2 || verify_skip('a') { break; }
+            if b >= 2 || verify_skip('a') {
+                break;
+            }
             let n_pos = stored + e + 1;
-            let cap_sgs = (c.gqat.max_total_threads_per_threadgroup() as usize / 32).clamp(1, gqa_split_max());
+            let cap_sgs = (c.gqat.max_total_threads_per_threadgroup() as usize / 32)
+                .clamp(1, gqa_split_max());
             let sgs = n_pos.div_ceil(32).clamp(1, cap_sgs);
             let tg_threads = 32 * sgs;
             disp_tg(
@@ -13714,14 +13924,27 @@ impl VerifyGraph {
                     (&ao_b, (e * nhd * 4) as u64),
                     (&self.imp_scratch, 0),
                 ],
-                &[p.nh as u32, (p.nh / p.nkv) as u32, p.hd as u32, cap as u32, n_pos as u32],
+                &[
+                    p.nh as u32,
+                    (p.nh / p.nkv) as u32,
+                    p.hd as u32,
+                    cap as u32,
+                    n_pos as u32,
+                ],
                 &[],
                 ((p.nh * tg_threads) as u64, tg_threads as u64),
                 ((sgs * p.hd + 2 * sgs) * 4) as u64,
             );
         }
         if p.output_gate {
-            disp(enc, &c.sgate, &[(&ao_b, 0), (&g_b, 0)], &[(b * nhd) as u32], &[], ((b * nhd) as u64, 256));
+            disp(
+                enc,
+                &c.sgate,
+                &[(&ao_b, 0), (&g_b, 0)],
+                &[(b * nhd) as u32],
+                &[],
+                ((b * nhd) as u64, 256),
+            );
         }
         self.gemm(enc, l.wo, &ao_b, &self.d_b, &self.ones);
         self.post_ffn(enc, l.post_norm, &l.ffn);
@@ -13796,7 +14019,11 @@ impl VerifyGraph {
                 continue; // zero-copy: the owner already holds it
             }
             unsafe {
-                std::ptr::copy_nonoverlapping(slot.st.contents() as *const f32, out.as_mut_ptr(), slot.st_len.min(out.len()));
+                std::ptr::copy_nonoverlapping(
+                    slot.st.contents() as *const f32,
+                    out.as_mut_ptr(),
+                    slot.st_len.min(out.len()),
+                );
             }
         }
         true
@@ -13815,7 +14042,9 @@ impl VerifyGraph {
         // encode time — the owner must still be that allocation
         for (slot, out) in self.gdn.iter().zip(states_out.iter()) {
             if slot.st_len == 0 && slot.st.contents() as *const f32 != out.as_ptr() {
-                tracing::error!("metal verify commit: a GDN state owner moved between verify and commit — declining");
+                tracing::error!(
+                    "metal verify commit: a GDN state owner moved between verify and commit — declining"
+                );
                 return false;
             }
         }
@@ -13824,7 +14053,23 @@ impl VerifyGraph {
         for slot in &self.gdn {
             let cfg = &slot.cfg;
             let ring_len = (cfg.kk - 1) * cfg.c_dim;
-            Self::state_dispatch(c, enc, &slot.st, ring_len, &slot.cq, &slot.z, &slot.g, &slot.beta, &slot.iq, &slot.ik, &slot.gnorm, &slot.cq, cfg, n_pos, 2);
+            Self::state_dispatch(
+                c,
+                enc,
+                &slot.st,
+                ring_len,
+                &slot.cq,
+                &slot.z,
+                &slot.g,
+                &slot.beta,
+                &slot.iq,
+                &slot.ik,
+                &slot.gnorm,
+                &slot.cq,
+                cfg,
+                n_pos,
+                2,
+            );
             disp(
                 enc,
                 &c.gdnringcb,
@@ -13849,7 +14094,11 @@ impl VerifyGraph {
                 continue; // zero-copy: the replay wrote the owner directly
             }
             unsafe {
-                std::ptr::copy_nonoverlapping(slot.st.contents() as *const f32, out.as_mut_ptr(), slot.st_len.min(out.len()));
+                std::ptr::copy_nonoverlapping(
+                    slot.st.contents() as *const f32,
+                    out.as_mut_ptr(),
+                    slot.st_len.min(out.len()),
+                );
             }
         }
         true
@@ -13916,13 +14165,25 @@ fn encode_gqa_attend_blk(
     }
     let n_max = stored + nb;
     let nblk = n_max.div_ceil(128);
-    let part = io_buf(c, 48_000_000_131 + nb * nh * nblk * (hd + 2), nb * nh * nblk * (hd + 2) * 4);
+    let part = io_buf(
+        c,
+        48_000_000_131 + nb * nh * nblk * (hd + 2),
+        nb * nh * nblk * (hd + 2) * 4,
+    );
     enc.set_compute_pipeline_state(&c.gqablk);
     enc.set_buffer(0, Some(q), 0);
     enc.set_buffer(1, Some(k_mb), 0);
     enc.set_buffer(2, Some(v_mb), 0);
     enc.set_buffer(3, Some(&part), 0);
-    let w = [nh as u32, hpk as u32, hd as u32, cap as u32, stored as u32, nb as u32, nblk as u32];
+    let w = [
+        nh as u32,
+        hpk as u32,
+        hd as u32,
+        cap as u32,
+        stored as u32,
+        nb as u32,
+        nblk as u32,
+    ];
     for (i, v) in w.iter().enumerate() {
         enc.set_bytes(4 + i as u64, 4, v as *const u32 as *const std::ffi::c_void);
     }
@@ -13937,7 +14198,10 @@ fn encode_gqa_attend_blk(
     for (i, v) in w2.iter().enumerate() {
         enc.set_bytes(2 + i as u64, 4, v as *const u32 as *const std::ffi::c_void);
     }
-    enc.dispatch_thread_groups(MTLSize::new(nh as u64, nb as u64, 1), MTLSize::new(hd as u64, 1, 1));
+    enc.dispatch_thread_groups(
+        MTLSize::new(nh as u64, nb as u64, 1),
+        MTLSize::new(hd as u64, 1, 1),
+    );
     true
 }
 
@@ -14044,6 +14308,7 @@ mod tests {
             local_partial_rotary_factor: None,
             mtp: None,
             moe: None,
+            qwen4_exp: None,
             linear_core: None,
             head_clusters: None,
             max_position_embeddings: 8,
@@ -14172,6 +14437,7 @@ mod tests {
             local_partial_rotary_factor: None,
             mtp: None,
             moe: None,
+            qwen4_exp: None,
             linear_core: None,
             head_clusters: None,
             max_position_embeddings: 8,
@@ -14329,6 +14595,7 @@ mod tests {
             local_partial_rotary_factor: None,
             mtp: None,
             moe: None,
+            qwen4_exp: None,
             linear_core: None,
             head_clusters: None,
             max_position_embeddings: 8,

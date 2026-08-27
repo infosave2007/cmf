@@ -26,6 +26,7 @@ fn gdn_matches_numpy_oracle() {
         conv_kernel: g("conv_kernel"),
         hidden_size: g("hidden_size"),
         rms_eps: c["rms_eps"].as_f64().unwrap(),
+        output_gate_sigmoid: false,
     };
     let (c_dim, vd, h) = (
         cfg.conv_dim(),

@@ -37,16 +37,30 @@ fn task_files(seeds: &str) -> Vec<(String, Vec<String>)> {
         }
         let mut lines: Vec<String> = Vec::new();
         if path.is_dir() {
-            let mut inner: Vec<_> = std::fs::read_dir(&path).into_iter().flatten().flatten().collect();
+            let mut inner: Vec<_> = std::fs::read_dir(&path)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .collect();
             inner.sort_by_key(|e| e.file_name());
             for f in inner {
                 if let Ok(t) = std::fs::read_to_string(f.path()) {
-                    lines.extend(t.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from));
+                    lines.extend(
+                        t.lines()
+                            .map(str::trim)
+                            .filter(|l| !l.is_empty())
+                            .map(String::from),
+                    );
                 }
             }
         } else if path.extension().and_then(|s| s.to_str()) == Some("txt") {
             if let Ok(t) = std::fs::read_to_string(&path) {
-                lines.extend(t.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from));
+                lines.extend(
+                    t.lines()
+                        .map(str::trim)
+                        .filter(|l| !l.is_empty())
+                        .map(String::from),
+                );
             }
         }
         if !lines.is_empty() {
@@ -112,9 +126,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        let mut f = std::io::BufWriter::new(std::fs::File::create(format!(
-            "{out_dir}/{task}.mass"
-        ))?);
+        let mut f =
+            std::io::BufWriter::new(std::fs::File::create(format!("{out_dir}/{task}.mass"))?);
         f.write_all(&(nl as u32).to_le_bytes())?;
         f.write_all(&(inter as u32).to_le_bytes())?;
         for row in &mass {

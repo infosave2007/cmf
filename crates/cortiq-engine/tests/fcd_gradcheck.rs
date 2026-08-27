@@ -622,6 +622,7 @@ fn gdn_seq_fwd_matches_runtime_operator() {
         conv_kernel: f.kk,
         hidden_size: hidden,
         rms_eps: 1e-6,
+        output_gate_sigmoid: false,
     };
     let mut state = Vec::new();
     let mut runtime_out = Vec::new();

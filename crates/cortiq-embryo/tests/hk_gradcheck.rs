@@ -8,14 +8,23 @@ fn to64(v: &[f32]) -> Vec<f64> {
 
 #[test]
 fn hk_closed_form_backward_matches_finite_differences() {
-    let d = HkDims { b: 2, t: 9, nh: 2, nph: 3, dv: 4 };
+    let d = HkDims {
+        b: 2,
+        t: 9,
+        nh: 2,
+        nph: 3,
+        dv: 4,
+    };
     let n_th = d.b * d.t * d.nh * d.nph;
     let n_v = d.b * d.t * d.nh * d.dv;
     let n_k = d.b * d.t * d.nh;
     let thq: Vec<f64> = to64(&lcg_vec(1, n_th)).iter().map(|x| x * 3.0).collect();
     let thk: Vec<f64> = to64(&lcg_vec(2, n_th)).iter().map(|x| x * 3.0).collect();
     let v = to64(&lcg_vec(3, n_v));
-    let kappa: Vec<f64> = to64(&lcg_vec(4, n_k)).iter().map(|x| 0.5 + 0.4 * x).collect();
+    let kappa: Vec<f64> = to64(&lcg_vec(4, n_k))
+        .iter()
+        .map(|x| 0.5 + 0.4 * x)
+        .collect();
     let decay = to64(&hk_decay_grid(d.nh, d.nph, 2.0, 16.0));
     let dout = to64(&lcg_vec(5, n_v));
 
@@ -49,14 +58,23 @@ fn hk_closed_form_backward_matches_finite_differences() {
 #[test]
 fn hk_decay_gradient_matches_finite_differences() {
     use cortiq_embryo::ops::hk_ref_dgamma;
-    let d = HkDims { b: 2, t: 9, nh: 2, nph: 3, dv: 4 };
+    let d = HkDims {
+        b: 2,
+        t: 9,
+        nh: 2,
+        nph: 3,
+        dv: 4,
+    };
     let n_th = d.b * d.t * d.nh * d.nph;
     let n_v = d.b * d.t * d.nh * d.dv;
     let n_k = d.b * d.t * d.nh;
     let thq: Vec<f64> = to64(&lcg_vec(1, n_th)).iter().map(|x| x * 3.0).collect();
     let thk: Vec<f64> = to64(&lcg_vec(2, n_th)).iter().map(|x| x * 3.0).collect();
     let v = to64(&lcg_vec(3, n_v));
-    let kappa: Vec<f64> = to64(&lcg_vec(4, n_k)).iter().map(|x| 0.5 + 0.4 * x).collect();
+    let kappa: Vec<f64> = to64(&lcg_vec(4, n_k))
+        .iter()
+        .map(|x| 0.5 + 0.4 * x)
+        .collect();
     let decay = to64(&hk_decay_grid(d.nh, d.nph, 2.0, 16.0));
     let dout = to64(&lcg_vec(5, n_v));
     let loss = |dec: &[f64]| -> f64 {

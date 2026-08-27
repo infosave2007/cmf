@@ -53,7 +53,13 @@ pub struct Vol {
 
 impl Vol {
     pub fn zeros(c: usize, f: usize, h: usize, w: usize) -> Vol {
-        Vol { c, f, h, w, data: vec![0.0; c * f * h * w] }
+        Vol {
+            c,
+            f,
+            h,
+            w,
+            data: vec![0.0; c * f * h * w],
+        }
     }
     #[inline]
     pub fn at(&self, c: usize, f: usize, h: usize, w: usize) -> f32 {
@@ -131,7 +137,15 @@ impl Conv3d {
                 }
             }
             // y[n, Cout] = patches[n, k] · wᵀ
-            crate::fcd_ops::gemm_nt(&patches[..n * k], &self.w, &mut ybuf[..n * self.c_out], n, k, self.c_out, pool);
+            crate::fcd_ops::gemm_nt(
+                &patches[..n * k],
+                &self.w,
+                &mut ybuf[..n * self.c_out],
+                n,
+                k,
+                self.c_out,
+                pool,
+            );
             for i in 0..n {
                 let p = p0 + i;
                 for co in 0..self.c_out {
@@ -292,8 +306,16 @@ impl ConvVaeDecoder {
                     let mut res = Vec::new();
                     for j in 0..n {
                         res.push(ResBlock {
-                            conv1: Conv3d::load(model, &format!("{prefix}.res_blocks.{j}.conv1"), pool)?,
-                            conv2: Conv3d::load(model, &format!("{prefix}.res_blocks.{j}.conv2"), pool)?,
+                            conv1: Conv3d::load(
+                                model,
+                                &format!("{prefix}.res_blocks.{j}.conv1"),
+                                pool,
+                            )?,
+                            conv2: Conv3d::load(
+                                model,
+                                &format!("{prefix}.res_blocks.{j}.conv2"),
+                                pool,
+                            )?,
                         });
                     }
                     blocks.push(Block::Res(res));
@@ -369,7 +391,6 @@ impl ConvVaeDecoder {
         trace("frames", &out);
         out
     }
-
 }
 
 /// `[C·q·r, F, H, W]` → `[C, F, H·q, W·r]` (channels laid out `(c r q)`).
@@ -388,7 +409,8 @@ pub fn unpatchify(x: &Vol, patch: usize) -> Vol {
                     for hh in 0..x.h {
                         for ww in 0..x.w {
                             let v = x.at(src_c, f, hh, ww);
-                            out.data[((cc * x.f + f) * h2 + hh * patch + q) * w2 + ww * patch + r] = v;
+                            out.data
+                                [((cc * x.f + f) * h2 + hh * patch + q) * w2 + ww * patch + r] = v;
                         }
                     }
                 }

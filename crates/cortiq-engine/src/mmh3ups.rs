@@ -91,9 +91,7 @@ pub const LATENT_STD: [f32; 24] = [
 ];
 
 /// Read a `.safetensors` of f32 tensors — the parity oracle's own format.
-pub fn read_oracle(
-    path: &Path,
-) -> Result<HashMap<String, (Vec<usize>, Vec<f32>)>, String> {
+pub fn read_oracle(path: &Path) -> Result<HashMap<String, (Vec<usize>, Vec<f32>)>, String> {
     crate::ltxlora::read_safetensors(path)
 }
 
@@ -109,7 +107,13 @@ pub struct Vol {
 
 impl Vol {
     fn zeros(c: usize, t: usize, h: usize, w: usize) -> Vol {
-        Vol { c, t, h, w, data: vec![0f32; c * t * h * w] }
+        Vol {
+            c,
+            t,
+            h,
+            w,
+            data: vec![0f32; c * t * h * w],
+        }
     }
     #[inline]
     fn at(&self, c: usize, t: usize, h: usize, w: usize) -> f32 {
@@ -176,7 +180,8 @@ impl Conv3 {
             for p in 0..n {
                 let (hi, wi) = (p / w, p % w);
                 for co in 0..self.c_out {
-                    out.data[((co * t + ti) * h + hi) * w + wi] = acc[p * self.c_out + co] + self.b[co];
+                    out.data[((co * t + ti) * h + hi) * w + wi] =
+                        acc[p * self.c_out + co] + self.b[co];
                 }
             }
         }
@@ -356,9 +361,17 @@ fn conv(st: &St, prefix: &str) -> Result<Conv3, String> {
     let (shape, w) = take(st, &format!("{prefix}.weight"))?;
     let (_, b) = take(st, &format!("{prefix}.bias"))?;
     if shape.len() != 5 || shape[2] != shape[3] || shape[3] != shape[4] {
-        return Err(format!("{prefix}: expected a cubic 3-D kernel, got {shape:?}"));
+        return Err(format!(
+            "{prefix}: expected a cubic 3-D kernel, got {shape:?}"
+        ));
     }
-    Ok(Conv3 { w, b, c_out: shape[0], c_in: shape[1], k: shape[2] })
+    Ok(Conv3 {
+        w,
+        b,
+        c_out: shape[0],
+        c_in: shape[1],
+        k: shape[2],
+    })
 }
 
 fn gnorm(st: &St, prefix: &str) -> Result<GroupNorm, String> {
@@ -429,7 +442,11 @@ impl LatentUpscaler {
     /// `embed(scale − 1)`: Linear, SiLU, Linear.
     fn embedding(&self, scale: f32) -> Vec<f32> {
         let ((w0, b0), (w2, b2)) = &self.embed;
-        let mut h: Vec<f32> = b0.iter().zip(w0).map(|(b, w)| b + w * (scale - 1.0)).collect();
+        let mut h: Vec<f32> = b0
+            .iter()
+            .zip(w0)
+            .map(|(b, w)| b + w * (scale - 1.0))
+            .collect();
         silu_in_place(&mut h);
         let e = b2.len();
         let mut out = vec![0f32; e];
@@ -481,7 +498,11 @@ impl LatentUpscaler {
     /// the network was trained on the normalized latent and every caller
     /// holds the raw one.
     pub fn upscale(&self, z: &Vol, h_out: usize, w_out: usize, pool: Option<&Pool>) -> Vol {
-        assert_eq!(z.c, LATENT_MEAN.len(), "upscaler expects a 24-channel latent");
+        assert_eq!(
+            z.c,
+            LATENT_MEAN.len(),
+            "upscaler expects a 24-channel latent"
+        );
         let n = z.t * z.h * z.w;
         let mut x = z.clone();
         for c in 0..z.c {
@@ -529,7 +550,13 @@ mod tests {
     /// a whole clip.
     #[test]
     fn resize_matches_torch_convention() {
-        let x = Vol { c: 1, t: 1, h: 1, w: 2, data: vec![0.0, 1.0] };
+        let x = Vol {
+            c: 1,
+            t: 1,
+            h: 1,
+            w: 2,
+            data: vec![0.0, 1.0],
+        };
         let up = LatentUpscaler::resize(&x, 1, 1, 4);
         // torch: F.interpolate([0,1], size=4, mode='linear', align_corners=False)
         // → [0, 0.25, 0.75, 1]
@@ -542,7 +569,13 @@ mod tests {
     /// A resize to the same size is the identity, not a blur.
     #[test]
     fn resize_identity() {
-        let x = Vol { c: 1, t: 2, h: 2, w: 2, data: (0..8).map(|i| i as f32).collect() };
+        let x = Vol {
+            c: 1,
+            t: 2,
+            h: 2,
+            w: 2,
+            data: (0..8).map(|i| i as f32).collect(),
+        };
         let up = LatentUpscaler::resize(&x, 2, 2, 2);
         assert_eq!(up.data, x.data);
     }

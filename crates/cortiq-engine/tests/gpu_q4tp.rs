@@ -328,7 +328,9 @@ fn metal_q4tp_matvec_batch_matches_dequant_reference() {
                 .collect();
             let mut got = vec![0f32; b * rows];
             assert!(
-                cortiq_engine::gpu_metal::q4tp_matvec_batch(model, idx, &xs, b, rows, cols, &mut got),
+                cortiq_engine::gpu_metal::q4tp_matvec_batch(
+                    model, idx, &xs, b, rows, cols, &mut got
+                ),
                 "Metal refused a batched q4tp matvec ({rows}x{cols}, b={b})"
             );
             for t in 0..b {
@@ -376,7 +378,9 @@ fn metal_q4tp_mm_n8_matches_dequant_reference() {
                 .collect();
             let mut got = vec![0f32; b * rows];
             assert!(
-                cortiq_engine::gpu_metal::q4tp_mm_n8_batch(model, idx, &xs, b, rows, cols, &mut got),
+                cortiq_engine::gpu_metal::q4tp_mm_n8_batch(
+                    model, idx, &xs, b, rows, cols, &mut got
+                ),
                 "Metal refused the n8 GEMM ({rows}x{cols}, b={b})"
             );
             for t in 0..b {

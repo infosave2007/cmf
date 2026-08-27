@@ -5,8 +5,8 @@
 //!
 //!   CMF_GPU=0 cargo run --release -p cortiq-cli --example tube_sens -- \
 //!       model.cmf mass.mass text.txt [width] [tokens]
-use cortiq_core::mask::{MaskPriority, TaskMask};
 use cortiq_core::CmfModel;
+use cortiq_core::mask::{MaskPriority, TaskMask};
 use cortiq_engine::{Pipeline, SamplerConfig};
 use std::sync::Arc;
 
@@ -53,7 +53,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         hb[h / 8] |= 1 << (h % 8);
     }
     let dense = score(&mut p, None);
-    println!("dense PPL {dense:.4} | pruning one layer at a time to {:.0}%", width * 100.0);
+    println!(
+        "dense PPL {dense:.4} | pruning one layer at a time to {:.0}%",
+        width * 100.0
+    );
     for g0 in (0..nl).step_by(group) {
         let g1 = (g0 + group).min(nl);
         let mut ffn_masks = Vec::with_capacity(nl);

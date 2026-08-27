@@ -377,9 +377,8 @@ fn deq(model: &CmfModel, name: &str) -> Result<Vec<f32>, String> {
 /// room to spare, and never streamed a single layer.
 #[cfg(target_os = "linux")]
 fn cgroup_limit_bytes() -> Option<u64> {
-    let read = |p: &str| -> Option<u64> {
-        std::fs::read_to_string(p).ok()?.trim().parse::<u64>().ok()
-    };
+    let read =
+        |p: &str| -> Option<u64> { std::fs::read_to_string(p).ok()?.trim().parse::<u64>().ok() };
     // v2 first, then v1. An unlimited v2 cgroup holds the word "max",
     // which fails to parse; an unlimited v1 holds a huge sentinel.
     read("/sys/fs/cgroup/memory.max")
@@ -428,9 +427,8 @@ pub(crate) fn effective_available(host: u64, limit: Option<u64>, used: Option<u6
 /// Bytes this cgroup is already holding, for the same reason.
 #[cfg(target_os = "linux")]
 fn cgroup_used_bytes() -> Option<u64> {
-    let read = |p: &str| -> Option<u64> {
-        std::fs::read_to_string(p).ok()?.trim().parse::<u64>().ok()
-    };
+    let read =
+        |p: &str| -> Option<u64> { std::fs::read_to_string(p).ok()?.trim().parse::<u64>().ok() };
     read("/sys/fs/cgroup/memory.current")
         .or_else(|| read("/sys/fs/cgroup/memory/memory.usage_in_bytes"))
 }
@@ -2881,7 +2879,6 @@ mod tests {
         );
     }
 }
-
 
 /// Backwards-compatible entry point: polish with the model as its own
 /// KL anchor.

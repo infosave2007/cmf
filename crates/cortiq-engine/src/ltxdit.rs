@@ -136,7 +136,11 @@ pub(crate) fn softmax(row: &mut [f32]) {
 fn layer_norm(x: &[f32], dst: &mut [f32]) {
     let n = x.len() as f64;
     let mean = x.iter().map(|&v| v as f64).sum::<f64>() / n;
-    let var = x.iter().map(|&v| (v as f64 - mean) * (v as f64 - mean)).sum::<f64>() / n;
+    let var = x
+        .iter()
+        .map(|&v| (v as f64 - mean) * (v as f64 - mean))
+        .sum::<f64>()
+        / n;
     let inv = 1.0 / (var + EPS).sqrt();
     for (d, &v) in dst.iter_mut().zip(x) {
         *d = ((v as f64 - mean) * inv) as f32;
@@ -248,9 +252,7 @@ impl Lin {
                 && cl % 32 == 0
                 && !crate::gpu::mm_killed()
                 && crate::gpu::enabled_here()
-                && crate::gpu_metal::q4tp_matmat_lora(
-                    model, idx, x, n, r, cl, &mut out, &l.side(),
-                )
+                && crate::gpu_metal::q4tp_matmat_lora(model, idx, x, n, r, cl, &mut out, &l.side())
             {
                 attn_prof::MATMAT.fetch_add(
                     t_mm.elapsed().as_micros() as u64,
@@ -313,13 +315,23 @@ impl Rope {
     /// `positions[t][d]` are patch midpoints and `max_pos[d]` the axis
     /// extent they are divided by. `dim` is the *inner* dimension
     /// (heads·dh) the frequency ladder is sized from.
-    pub fn build(positions: &[Vec<f64>], max_pos: &[f64], dim: usize, heads: usize, theta: f64) -> Rope {
+    pub fn build(
+        positions: &[Vec<f64>],
+        max_pos: &[f64],
+        dim: usize,
+        heads: usize,
+        theta: f64,
+    ) -> Rope {
         let ndim = max_pos.len();
         let count = dim / (2 * ndim);
         // indices = theta^linspace(0, 1, count) · π/2, in f64
         let idx: Vec<f64> = (0..count)
             .map(|j| {
-                let e = if count > 1 { j as f64 / (count - 1) as f64 } else { 0.0 };
+                let e = if count > 1 {
+                    j as f64 / (count - 1) as f64
+                } else {
+                    0.0
+                };
                 theta.powf(e) * std::f64::consts::PI / 2.0
             })
             .collect();
@@ -342,7 +354,12 @@ impl Rope {
                 }
             }
         }
-        Rope { cos, sin, heads, half: half / heads }
+        Rope {
+            cos,
+            sin,
+            heads,
+            half: half / heads,
+        }
     }
 
     /// In-place split rotation of one token's `[heads·dh]` projection.
@@ -351,7 +368,10 @@ impl Rope {
         let stride = self.heads * self.half;
         for h in 0..self.heads {
             let off = t * stride + h * self.half;
-            let (c, s) = (&self.cos[off..off + self.half], &self.sin[off..off + self.half]);
+            let (c, s) = (
+                &self.cos[off..off + self.half],
+                &self.sin[off..off + self.half],
+            );
             let v = &mut row[h * dh..(h + 1) * dh];
             for i in 0..self.half {
                 let (a, b) = (v[i], v[i + self.half]);
@@ -361,7 +381,6 @@ impl Rope {
         }
     }
 }
-
 
 /// Sub-phase microseconds inside attention, summed across every call in a
 /// step. `CMF_LTX_PROF=1` prints them: the phase timers above say *which*
@@ -387,8 +406,15 @@ pub(crate) mod attn_prof {
         let s = |c: &AtomicU64| c.swap(0, Relaxed) as f64 / 1e6;
         format!(
             "proj {:.2}s  qk-norm+rope {:.2}s  gather {:.2}s  scores {:.2}s  softmax {:.2}s  values {:.2}s  out {:.2}s  [linear: alloc {:.2}s  matmat {:.2}s]",
-            s(&PROJ), s(&NORM), s(&GATHER), s(&SCORE), s(&SOFT), s(&VALUE), s(&OUT),
-            s(&ALLOC), s(&MATMAT)
+            s(&PROJ),
+            s(&NORM),
+            s(&GATHER),
+            s(&SCORE),
+            s(&SOFT),
+            s(&VALUE),
+            s(&OUT),
+            s(&ALLOC),
+            s(&MATMAT)
         )
     }
 }
@@ -408,7 +434,12 @@ pub(crate) struct Attn {
 }
 
 impl Attn {
-    pub(crate) fn load(model: &Arc<CmfModel>, p: &str, heads: usize, dh: usize) -> Result<Attn, String> {
+    pub(crate) fn load(
+        model: &Arc<CmfModel>,
+        p: &str,
+        heads: usize,
+        dh: usize,
+    ) -> Result<Attn, String> {
         Attn::load_lora(model, p, heads, dh, None)
     }
 
@@ -466,9 +497,21 @@ impl Attn {
             return None;
         }
         let jobs = [
-            crate::gpu_metal::MmJob { idx: qw.1, rows: qw.2, cols: qw.3 },
-            crate::gpu_metal::MmJob { idx: kw.1, rows: kw.2, cols: kw.3 },
-            crate::gpu_metal::MmJob { idx: vw.1, rows: vw.2, cols: vw.3 },
+            crate::gpu_metal::MmJob {
+                idx: qw.1,
+                rows: qw.2,
+                cols: qw.3,
+            },
+            crate::gpu_metal::MmJob {
+                idx: kw.1,
+                rows: kw.2,
+                cols: kw.3,
+            },
+            crate::gpu_metal::MmJob {
+                idx: vw.1,
+                rows: vw.2,
+                cols: vw.3,
+            },
         ];
         if n * jobs[0].rows * jobs[0].cols < 128_000_000 || n < 32 {
             return None;
@@ -507,8 +550,16 @@ impl Attn {
             return None;
         }
         let jobs = [
-            crate::gpu_metal::MmJob { idx: kw.1, rows: kw.2, cols: kw.3 },
-            crate::gpu_metal::MmJob { idx: vw.1, rows: vw.2, cols: vw.3 },
+            crate::gpu_metal::MmJob {
+                idx: kw.1,
+                rows: kw.2,
+                cols: kw.3,
+            },
+            crate::gpu_metal::MmJob {
+                idx: vw.1,
+                rows: vw.2,
+                cols: vw.3,
+            },
         ];
         if m < 32 || m * jobs[0].rows * jobs[0].cols < 128_000_000 {
             return None;
@@ -806,7 +857,13 @@ impl TsTable {
         let scaled: Vec<f32> = vals.iter().map(|&v| (v as f64 * scale) as f32).collect();
         let (v, e) = a.forward(&scaled, pool);
         let width = v.len() / scaled.len().max(1);
-        TsTable { vals: v, emb: e, idx, width, edim: a.dim }
+        TsTable {
+            vals: v,
+            emb: e,
+            idx,
+            width,
+            edim: a.dim,
+        }
     }
 
     fn distinct(&self) -> usize {
@@ -850,7 +907,6 @@ impl TsTable {
             .collect()
     }
 }
-
 
 /// `rms_norm(x) · (1 + scale) + shift` over every token, in parallel.
 /// `mods[r]` is the `(shift, scale, gate)` triple of the r-th distinct
@@ -916,7 +972,11 @@ fn post_sa_rows(
     rows(pool, n, &|s, e| {
         let xr = unsafe { a.at(s * dim, (e - s) * dim) };
         let nr = unsafe { b.at(s * dim, (e - s) * dim) };
-        for ((row, nrow), i) in xr.chunks_exact_mut(dim).zip(nr.chunks_exact_mut(dim)).zip(s..e) {
+        for ((row, nrow), i) in xr
+            .chunks_exact_mut(dim)
+            .zip(nr.chunks_exact_mut(dim))
+            .zip(s..e)
+        {
             let g = &mods[idx[i]][2];
             for d in 0..dim {
                 row[d] += y[i * dim + d] * g[d];
@@ -961,7 +1021,6 @@ fn affine_rows(
     });
 }
 
-
 /// Where a denoising step actually goes. `CMF_LTX_PROF=1` prints the split
 /// once per forward: guessing at this is how ports stay slow.
 #[derive(Default)]
@@ -979,7 +1038,10 @@ const P_MOD: usize = 5;
 
 impl Prof {
     fn new() -> Prof {
-        Prof { on: std::env::var("CMF_LTX_PROF").is_ok(), t: [0.0; 6] }
+        Prof {
+            on: std::env::var("CMF_LTX_PROF").is_ok(),
+            t: [0.0; 6],
+        }
     }
     #[inline]
     fn tick(&mut self, slot: usize, at: std::time::Instant) -> std::time::Instant {
@@ -1010,7 +1072,14 @@ impl Prof {
             }
         }
         println!("  attention: {}", attn_prof::report());
-        let names = ["adaln", "self-attn", "cross-attn", "a<->v", "ffn", "modulate"];
+        let names = [
+            "adaln",
+            "self-attn",
+            "cross-attn",
+            "a<->v",
+            "ffn",
+            "modulate",
+        ];
         let total: f64 = self.t.iter().sum();
         let parts: Vec<String> = names
             .iter()
@@ -1149,7 +1218,10 @@ impl LtxDit {
         let a_dh = g("audio_attention_head_dim", 64.0) as usize;
         let n_layers = g("num_layers", 48.0) as usize;
         let ff_bias = t.get("ff_bias").and_then(|v| v.as_bool()).unwrap_or(true);
-        let a_ff_bias = t.get("audio_ff_bias").and_then(|v| v.as_bool()).unwrap_or(true);
+        let a_ff_bias = t
+            .get("audio_ff_bias")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
         let arr = |k: &str, d: Vec<f64>| -> Vec<f64> {
             t.get(k)
                 .and_then(|v| v.as_array())
@@ -1267,7 +1339,10 @@ impl LtxDit {
             let r = vpt.row(0);
             let mx = r.iter().fold(0f32, |m, &v| m.max(v.abs()));
             let sum: f32 = r.iter().sum();
-            eprintln!("prompt-adaln sigma={:.6} max|row|={mx:.6e} sum={sum:.6e}", video.sigma);
+            eprintln!(
+                "prompt-adaln sigma={:.6} max|row|={mx:.6e} sum={sum:.6e}",
+                video.sigma
+            );
         }
         let vxs = TsTable::build(&self.av_v_ss, &video.timesteps, self.t_scale, pool);
         let axs = TsTable::build(&self.av_a_ss, &audio.timesteps, self.t_scale, pool);
@@ -1278,7 +1353,13 @@ impl LtxDit {
 
         // --- RoPE ---------------------------------------------------------
         let v_pe = Rope::build(&video.positions, &self.max_pos, dim, self.heads, self.theta);
-        let a_pe = Rope::build(&audio.positions, &self.a_max_pos, a_dim, self.a_heads, self.theta);
+        let a_pe = Rope::build(
+            &audio.positions,
+            &self.a_max_pos,
+            a_dim,
+            self.a_heads,
+            self.theta,
+        );
         let time_only = |p: &[Vec<f64>]| p.iter().map(|r| vec![r[0]]).collect::<Vec<_>>();
         let v_xpe = Rope::build(
             &time_only(&video.positions),
@@ -1316,10 +1397,10 @@ impl LtxDit {
             if bi == 0 {
                 trace("v.b0.sa.in", &vnorm);
             }
-            let vsa = blk
-                .video
-                .attn1
-                .forward(&vnorm, n, &vnorm, n, Some(&v_pe), Some(&v_pe), None, pool);
+            let vsa =
+                blk.video
+                    .attn1
+                    .forward(&vnorm, n, &vnorm, n, Some(&v_pe), Some(&v_pe), None, pool);
             if bi == 0 {
                 trace("v.b0.sa.out", &vsa);
             }
@@ -1328,8 +1409,18 @@ impl LtxDit {
             post_sa_rows(&mut vx, &vsa, &mut vnormed, n, dim, &v_msa, &vt.idx, pool);
             let mut vq = vec![0f32; n * dim];
             affine_rows(&vnormed, &mut vq, n, dim, &v_ca, &vt.idx, pool);
-            let vctx = modulate_kv(&video.context, video.ctx_len, dim, &blk.video.prompt_sst, vpt.row(0), pool);
-            let vca = blk.video.attn2.forward(&vq, n, &vctx, video.ctx_len, None, None, vmask, pool);
+            let vctx = modulate_kv(
+                &video.context,
+                video.ctx_len,
+                dim,
+                &blk.video.prompt_sst,
+                vpt.row(0),
+                pool,
+            );
+            let vca =
+                blk.video
+                    .attn2
+                    .forward(&vq, n, &vctx, video.ctx_len, None, None, vmask, pool);
             if bi == 0 {
                 trace("v.b0.ca.in", &vq);
                 trace("v.b0.ca.ctx", &vctx);
@@ -1344,10 +1435,10 @@ impl LtxDit {
             if bi == 0 {
                 trace("a.b0.sa.in", &anorm);
             }
-            let asa = blk
-                .audio
-                .attn1
-                .forward(&anorm, m, &anorm, m, Some(&a_pe), Some(&a_pe), None, pool);
+            let asa =
+                blk.audio
+                    .attn1
+                    .forward(&anorm, m, &anorm, m, Some(&a_pe), Some(&a_pe), None, pool);
             if bi == 0 {
                 trace("a.b0.sa.out", &asa);
             }
@@ -1355,8 +1446,18 @@ impl LtxDit {
             post_sa_rows(&mut ax, &asa, &mut anormed, m, a_dim, &a_msa, &at.idx, pool);
             let mut aq = vec![0f32; m * a_dim];
             affine_rows(&anormed, &mut aq, m, a_dim, &a_ca, &at.idx, pool);
-            let actx = modulate_kv(&audio.context, audio.ctx_len, a_dim, &blk.audio.prompt_sst, apt.row(0), pool);
-            let aca = blk.audio.attn2.forward(&aq, m, &actx, audio.ctx_len, None, None, amask, pool);
+            let actx = modulate_kv(
+                &audio.context,
+                audio.ctx_len,
+                a_dim,
+                &blk.audio.prompt_sst,
+                apt.row(0),
+                pool,
+            );
+            let aca =
+                blk.audio
+                    .attn2
+                    .forward(&aq, m, &actx, audio.ctx_len, None, None, amask, pool);
             if bi == 0 {
                 trace("a.b0.ca.in", &aq);
                 trace("a.b0.ca.ctx", &actx);
@@ -1458,7 +1559,6 @@ fn modulate_kv(
     });
     out
 }
-
 
 /// `ada_zero` with an A↔V `(scale, shift)` pair per distinct timestep.
 fn ada_pair(

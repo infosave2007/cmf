@@ -26,8 +26,9 @@ const AUDIO_RATE: f64 = 16000.0;
 const AUDIO_DOWNSAMPLE: f64 = 4.0;
 
 /// The distilled schedules the release ships with.
-pub const STAGE1_SIGMAS: [f32; 9] =
-    [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0];
+pub const STAGE1_SIGMAS: [f32; 9] = [
+    1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0,
+];
 pub const STAGE2_SIGMAS: [f32; 4] = [0.909375, 0.725, 0.421875, 0.0];
 
 /// Counter-based RNG with a Box-Muller normal — reproducible from a seed,
@@ -127,7 +128,9 @@ impl Geometry {
             let mel = (i as f64 * AUDIO_DOWNSAMPLE + 1.0 - AUDIO_DOWNSAMPLE).max(0.0);
             mel * AUDIO_HOP / AUDIO_RATE
         };
-        (0..self.af).map(|i| vec![(sec(i) + sec(i + 1)) / 2.0]).collect()
+        (0..self.af)
+            .map(|i| vec![(sec(i) + sec(i + 1)) / 2.0])
+            .collect()
     }
 
     /// Non-zero on the first latent frame, whose latent encodes a single
@@ -174,10 +177,16 @@ pub struct Stage {
 
 impl Stage {
     pub fn stage1() -> Stage {
-        Stage { sigmas: STAGE1_SIGMAS.to_vec(), ancestral: true }
+        Stage {
+            sigmas: STAGE1_SIGMAS.to_vec(),
+            ancestral: true,
+        }
     }
     pub fn stage2() -> Stage {
-        Stage { sigmas: STAGE2_SIGMAS.to_vec(), ancestral: false }
+        Stage {
+            sigmas: STAGE2_SIGMAS.to_vec(),
+            ancestral: false,
+        }
     }
 
     /// The same ladder resampled to `steps` rungs. The distilled schedule is
@@ -204,7 +213,10 @@ impl Stage {
                 base[lo] + (base[hi] - base[lo]) * f
             })
             .collect();
-        Stage { sigmas, ancestral: true }
+        Stage {
+            sigmas,
+            ancestral: true,
+        }
     }
 
     /// `stage2` resampled the same way, for the refinement pass.
@@ -224,7 +236,10 @@ impl Stage {
                 base[lo] + (base[hi] - base[lo]) * f
             })
             .collect();
-        Stage { sigmas, ancestral: false }
+        Stage {
+            sigmas,
+            ancestral: false,
+        }
     }
 
     /// The tail of the schedule that starts at or below `strength` — the
@@ -242,7 +257,10 @@ impl Stage {
         let mut sigmas = vec![s0];
         sigmas.extend(STAGE1_SIGMAS.iter().copied().filter(|&s| s < s0 && s > 0.0));
         sigmas.push(0.0);
-        Stage { sigmas, ancestral: true }
+        Stage {
+            sigmas,
+            ancestral: true,
+        }
     }
 }
 
@@ -250,7 +268,14 @@ impl Stage {
 /// (`alpha = 1 - sigma`): advance to `sigma_down`, then renoise back up to
 /// `sigma_next` with the variance-preserving rescale. `eta = 0` reduces it to
 /// a plain Euler step and ignores `noise`.
-fn euler_step(x: &mut [f32], denoised: &[f32], sigma: f32, sigma_next: f32, eta: f32, noise: Option<&[f32]>) {
+fn euler_step(
+    x: &mut [f32],
+    denoised: &[f32],
+    sigma: f32,
+    sigma_next: f32,
+    eta: f32,
+    noise: Option<&[f32]>,
+) {
     if sigma_next == 0.0 {
         x.copy_from_slice(denoised);
         return;
@@ -319,7 +344,11 @@ impl Conditioning {
             *m = 0.0;
             full[t * 128..(t + 1) * 128].copy_from_slice(&clean[t * 128..(t + 1) * 128]);
         }
-        Conditioning { video_mask: mask, video_clean: full, ..Default::default() }
+        Conditioning {
+            video_mask: mask,
+            video_clean: full,
+            ..Default::default()
+        }
     }
 
     /// Freeze the whole video stream — the picture is given, the sound is
@@ -365,7 +394,9 @@ pub fn run_stage(
     pool: Option<&Pool>,
     progress: Progress<'_>,
 ) -> Latents {
-    run_stage_cond(dit, geo, stage, video_ctx, audio_ctx, ctx_len, init, None, rng, pool, progress)
+    run_stage_cond(
+        dit, geo, stage, video_ctx, audio_ctx, ctx_len, init, None, rng, pool, progress,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

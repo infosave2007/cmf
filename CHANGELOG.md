@@ -7,11 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-08-27
+
 ### Added
 - The DeepSeek-V4 q4tp MTP draft can use a protected `3 × 40 + shared`
   subset of the unified global expert arena. Its five-position graph now
   addresses the same descriptor-indexed banks on a batch axis; the old
   independent draft pack reproduced an A40 OOM after the trunk was loaded.
+- A dedicated `qwen4_exp` runtime implements Qwen3.8-Flash-Next's four-stream
+  Gated Residual, GDN/QSA split, PLE n-gram path and 512-expert MoE. Both the
+  mixed q4tp/q8_2f quality profile and the smaller q2tp/q4tp/q8_2f profile run
+  from the same mmap-backed artifact on CPU and supported GPUs.
 
 ### Changed
 - Shared-pool speculation is not armed merely because a draft frequency
@@ -19,6 +25,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   general-mode draft misses reduced the short run to 0.5 tok/s. Explicit
   `CMF_DSV4_SPEC=1` keeps the diagnostic path available until a held-out
   acceptance/tok/s profile proves that it pays.
+- Qwen q2tp automatically selects the exact dynamic Vulkan MoE path on
+  supported GPUs with at least a 14 GB budget, while q4tp retains the faster
+  measured CPU/GPU auto plan. At a 16 GB budget on RTX 5090, q2tp reaches
+  7.13–7.34 tok/s steady; at 32 GB, two warmed runs reach 6.58–6.62 tok/s.
+- The Qwen expert arena requests 75% of the advertised budget before the
+  allocator's driver/workspace reserve. Cache metadata is now a dense
+  layer/expert table with an O(1) free list and lazy admission counters.
 
 ### Fixed
 - Expected DSV4 batch-preflight refusals (the first chunk has not transferred

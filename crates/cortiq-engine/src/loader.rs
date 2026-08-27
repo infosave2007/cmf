@@ -185,7 +185,12 @@ pub(crate) fn build_ffn_at(
             }
             let gate = load_matrix(model, &gn, force_f32, ov)?;
             let up = load_matrix(model, &format!("{p}up_proj.tube{k}.weight"), force_f32, ov)?;
-            let down = load_matrix(model, &format!("{p}down_proj.tube{k}.weight"), force_f32, ov)?;
+            let down = load_matrix(
+                model,
+                &format!("{p}down_proj.tube{k}.weight"),
+                force_f32,
+                ov,
+            )?;
             let width = gate.rows();
             if up.rows() != width || down.cols() != width || down.rows() != arch.hidden_size {
                 return Err(CmfError::Parse(format!(
@@ -295,7 +300,11 @@ pub(crate) fn build_ffn_at(
     let mask = moe_task_mask(model, &prefix, experts.len());
     let router = if resonance_moe {
         // never read (selection is by descriptors); zero placeholder in RAM
-        QTensor::from_f32(vec![0.0; experts.len() * arch.hidden_size], experts.len(), arch.hidden_size)
+        QTensor::from_f32(
+            vec![0.0; experts.len() * arch.hidden_size],
+            experts.len(),
+            arch.hidden_size,
+        )
     } else {
         load_matrix(model, &router_name, force_f32, ov)?
     };
@@ -321,7 +330,9 @@ pub(crate) fn build_ffn_at(
     // `mlp.experts.{e}.desc.{mu,u,bias}` (append-only growth) or the legacy
     // per-layer `mlp.desc.{mu,u,bias}` [E, ...]. Present → the router is a
     // placeholder and selection is by reconstruction error.
-    let per_expert = model.tensor(&format!("{prefix}mlp.experts.0.desc.mu")).is_some();
+    let per_expert = model
+        .tensor(&format!("{prefix}mlp.experts.0.desc.mu"))
+        .is_some();
     let resonance = if per_expert {
         let ne_d = experts.len();
         let hidden = arch.hidden_size;
@@ -330,9 +341,13 @@ pub(crate) fn build_ffn_at(
         let mut bias = Vec::with_capacity(ne_d);
         let mut k = 0usize;
         for e in 0..ne_d {
-            let m = load_f32(model, &format!("{prefix}mlp.experts.{e}.desc.mu"), ov).map_err(CmfError::Parse)?;
+            let m = load_f32(model, &format!("{prefix}mlp.experts.{e}.desc.mu"), ov)
+                .map_err(CmfError::Parse)?;
             if m.len() != hidden {
-                return Err(CmfError::Parse(format!("{prefix}mlp.experts.{e}.desc.mu: {} != {hidden}", m.len())));
+                return Err(CmfError::Parse(format!(
+                    "{prefix}mlp.experts.{e}.desc.mu: {} != {hidden}",
+                    m.len()
+                )));
             }
             mu.extend_from_slice(&m);
             let un = format!("{prefix}mlp.experts.{e}.desc.u");
@@ -349,7 +364,11 @@ pub(crate) fn build_ffn_at(
             }
             let bn = format!("{prefix}mlp.experts.{e}.desc.bias");
             bias.push(if model.tensor(&bn).is_some() {
-                load_f32(model, &bn, ov).map_err(CmfError::Parse)?.first().copied().unwrap_or(0.0)
+                load_f32(model, &bn, ov)
+                    .map_err(CmfError::Parse)?
+                    .first()
+                    .copied()
+                    .unwrap_or(0.0)
             } else {
                 0.0
             });
@@ -360,7 +379,10 @@ pub(crate) fn build_ffn_at(
         let ne_d = experts.len();
         let hidden = arch.hidden_size;
         if mu.len() != ne_d * hidden {
-            return Err(CmfError::Parse(format!("{prefix}mlp.desc.mu: {} != {ne_d}×{hidden}", mu.len())));
+            return Err(CmfError::Parse(format!(
+                "{prefix}mlp.desc.mu: {} != {ne_d}×{hidden}",
+                mu.len()
+            )));
         }
         let u_name = format!("{prefix}mlp.desc.u");
         let (u, k) = if model.tensor(&u_name).is_some() {
@@ -506,7 +528,7 @@ pub(crate) fn moe_task_mask(
     Some(mask)
 }
 
-fn load_matrix(
+pub(crate) fn load_matrix(
     model: &Arc<CmfModel>,
     name: &str,
     force_f32: bool,
@@ -727,7 +749,13 @@ impl Pipeline {
 
         // ── Top-level weights (never masked → always quantized) ──
         let embed_tokens = load_matrix(model, "model.embed_tokens.weight", false, ov)?;
-        let final_norm = load_f32(model, "model.norm.weight", ov).map_err(err)?;
+        let final_norm = if arch.qwen4_exp.is_some() {
+            // qwen4_exp folds its four streams through a learned global
+            // hyper mixer and has no conventional final RMSNorm.
+            vec![0.0; arch.hidden_size]
+        } else {
+            load_f32(model, "model.norm.weight", ov).map_err(err)?
+        };
         let lm_head = if model.tensor("lm_head.weight").is_some() {
             load_matrix(model, "lm_head.weight", false, ov)?
         } else if arch.tie_word_embeddings {
@@ -781,6 +809,7 @@ impl Pipeline {
                         conv_kernel: need(arch.linear_conv_kernel_dim, "linear_conv_kernel_dim")?,
                         hidden_size: arch.hidden_size,
                         rms_eps: arch.rms_norm_eps,
+                        output_gate_sigmoid: false,
                     });
                 }
                 other => {
@@ -1094,7 +1123,7 @@ impl Pipeline {
         // has none of the canonical projections — no q/k/v/o_proj, no
         // per-layer gate_proj — so the generic loop would demand
         // `self_attn.q_proj.weight` and fail before its own loader ever ran.
-        let owns_its_layers = is_g3n || arch.arch_name == "deepseek_v4";
+        let owns_its_layers = is_g3n || arch.arch_name == "deepseek_v4" || arch.qwen4_exp.is_some();
         for li in 0..(if owns_its_layers { 0 } else { arch.num_layers }) {
             let prefix = format!("model.layers.{li}.");
             let attn = match arch.layer_types.get(li) {
@@ -1413,6 +1442,10 @@ impl Pipeline {
         pipeline.vmf_cfg = vmf_cfg;
         pipeline.gdn_cfg = gdn_cfg;
         pipeline.kda_cfg = kda_cfg;
+        if arch.qwen4_exp.is_some() {
+            let (globals, layers, cfg, state) = crate::qwen4_exp::load(model, &arch)?;
+            pipeline.qwen4_exp = Some(Box::new((globals, layers, cfg, state)));
+        }
         if let Some(gc) = arch.g3n.as_ref() {
             use crate::g3n::{G3nAltUp, G3nGlobals, G3nLaurel, G3nLayer};
             anyhow_like(gc.altup_num_inputs == crate::g3n::ALTUP_N).map_err(|_| {

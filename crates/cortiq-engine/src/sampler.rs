@@ -534,7 +534,10 @@ fn par_topk(
         for i in s..e {
             let c = (i as u32, src[i]);
             if best.len() < k {
-                let pos = best.iter().position(|&b| better(c, b)).unwrap_or(best.len());
+                let pos = best
+                    .iter()
+                    .position(|&b| better(c, b))
+                    .unwrap_or(best.len());
                 best.insert(pos, c);
             } else if better(c, best[k - 1]) {
                 let pos = best.iter().position(|&b| better(c, b)).unwrap_or(k - 1);
@@ -1417,7 +1420,10 @@ mod tests {
                         let b = draw_sparse(&sp, &mut r2);
                         agree += (a == b) as usize;
                     }
-                    assert!(agree >= trials - 2, "seed {seed} cfg {cfg:?}: agree {agree}/{trials}");
+                    assert!(
+                        agree >= trials - 2,
+                        "seed {seed} cfg {cfg:?}: agree {agree}/{trials}"
+                    );
                     // and the public entry uses it
                     let mut r1 = SplitMix64::new(9);
                     let mut r2 = SplitMix64::new(9);

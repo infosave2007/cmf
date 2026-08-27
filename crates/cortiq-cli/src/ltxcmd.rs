@@ -31,7 +31,11 @@ impl St {
         let map = unsafe { Mmap::map(&f) }?;
         let hlen = u64::from_le_bytes(map[..8].try_into().unwrap()) as usize;
         let dir: serde_json::Value = serde_json::from_slice(&map[8..8 + hlen])?;
-        Ok(St { map, dir, base: 8 + hlen })
+        Ok(St {
+            map,
+            dir,
+            base: 8 + hlen,
+        })
     }
     fn get(&self, name: &str) -> anyhow::Result<(Vec<usize>, Vec<f32>)> {
         let e = self
@@ -44,14 +48,19 @@ impl St {
             .iter()
             .map(|v| v.as_u64().unwrap_or(0) as usize)
             .collect();
-        let off = e["data_offsets"].as_array().ok_or_else(|| anyhow!("{name}: offsets"))?;
+        let off = e["data_offsets"]
+            .as_array()
+            .ok_or_else(|| anyhow!("{name}: offsets"))?;
         let (s, t) = (
             off[0].as_u64().unwrap_or(0) as usize + self.base,
             off[1].as_u64().unwrap_or(0) as usize + self.base,
         );
         let raw = &self.map[s..t];
         let vals = match e["dtype"].as_str().unwrap_or("F32") {
-            "F32" => raw.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect(),
+            "F32" => raw
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .collect(),
             "F16" => raw
                 .chunks_exact(2)
                 .map(|c| cortiq_core::quant::f16_to_f32(u16::from_le_bytes(c.try_into().unwrap())))
@@ -100,9 +109,22 @@ pub fn cmd_ltx_decode(a: DecodeArgs<'_>) -> anyhow::Result<()> {
     eprintln!("vae decoder loaded in {:.1}s", t0.elapsed().as_secs_f64());
     let st = St::open(Path::new(a.latent))?;
     let (shape, vals) = st.get("latent")?;
-    let s: Vec<usize> = if shape.len() == 5 { shape[1..].to_vec() } else { shape.clone() };
-    anyhow::ensure!(s.len() == 4, "latent must be [C,F,H,W] or [1,C,F,H,W], got {shape:?}");
-    let lat = Vol { c: s[0], f: s[1], h: s[2], w: s[3], data: vals };
+    let s: Vec<usize> = if shape.len() == 5 {
+        shape[1..].to_vec()
+    } else {
+        shape.clone()
+    };
+    anyhow::ensure!(
+        s.len() == 4,
+        "latent must be [C,F,H,W] or [1,C,F,H,W], got {shape:?}"
+    );
+    let lat = Vol {
+        c: s[0],
+        f: s[1],
+        h: s[2],
+        w: s[3],
+        data: vals,
+    };
     eprintln!("latent [{}, {}, {}, {}]", lat.c, lat.f, lat.h, lat.w);
     let t1 = std::time::Instant::now();
     let out = dec.decode(&lat, pool.as_deref());
@@ -136,7 +158,11 @@ pub fn cmd_ltx_decode(a: DecodeArgs<'_>) -> anyhow::Result<()> {
         let mut first_bad: Option<String> = None;
         for (name, (rs, rv)) in &stages {
             let Some(o) = ours.get(name) else { continue };
-            let r: Vec<usize> = if rs.len() == 5 { rs[1..].to_vec() } else { rs.clone() };
+            let r: Vec<usize> = if rs.len() == 5 {
+                rs[1..].to_vec()
+            } else {
+                rs.clone()
+            };
             let shape_ok = r == vec![o.c, o.f, o.h, o.w];
             let (mut worst, mut sum, mut rsum) = (0f64, 0f64, 0f64);
             if shape_ok {
@@ -214,7 +240,12 @@ pub fn cmd_ltx_decode(a: DecodeArgs<'_>) -> anyhow::Result<()> {
                     out.data[((c * out.f + f) * out.h) * out.w + r]
                 })
                 .collect();
-            write_ppm(&Path::new(d).join(format!("frame_{f:04}.ppm")), &frame, out.h, out.w)?;
+            write_ppm(
+                &Path::new(d).join(format!("frame_{f:04}.ppm")),
+                &frame,
+                out.h,
+                out.w,
+            )?;
         }
         println!("{} frames → {d}/frame_*.ppm", out.f);
     }
@@ -261,7 +292,10 @@ fn oracle_2d(st: &St, name: &str) -> anyhow::Result<(Vec<f32>, usize, usize)> {
 fn oracle_positions(st: &St, name: &str) -> anyhow::Result<Vec<Vec<f64>>> {
     let (s, v) = st.get(name)?;
     let d: Vec<usize> = s.iter().copied().filter(|&x| x > 0).collect();
-    anyhow::ensure!(d.len() == 4 && d[3] == 2, "{name}: expected [1, axes, T, 2], got {s:?}");
+    anyhow::ensure!(
+        d.len() == 4 && d[3] == 2,
+        "{name}: expected [1, axes, T, 2], got {s:?}"
+    );
     let (axes, t) = (d[1], d[2]);
     Ok((0..t)
         .map(|i| {
@@ -280,7 +314,11 @@ pub fn cmd_ltx_dit(a: DitArgs<'_>) -> anyhow::Result<()> {
     let pool = Pool::from_env();
     let t0 = std::time::Instant::now();
     let dit = LtxDit::from_cmf(&model).map_err(|e| anyhow!(e))?;
-    eprintln!("dit loaded in {:.1}s ({} blocks)", t0.elapsed().as_secs_f64(), dit.blocks());
+    eprintln!(
+        "dit loaded in {:.1}s ({} blocks)",
+        t0.elapsed().as_secs_f64(),
+        dit.blocks()
+    );
     let st = St::open(Path::new(a.oracle))?;
 
     let stream = |tag: &str| -> anyhow::Result<StreamInput> {
@@ -320,9 +358,11 @@ pub fn cmd_ltx_dit(a: DitArgs<'_>) -> anyhow::Result<()> {
     let mut want: Vec<String> = ["v.args.x", "a.args.x", "v.out", "a.out"]
         .iter()
         .map(|s| s.to_string())
-        .chain([0usize, 1, dit.blocks() - 1].iter().flat_map(|&i| {
-            [format!("v.block{i}"), format!("a.block{i}")]
-        }))
+        .chain(
+            [0usize, 1, dit.blocks() - 1]
+                .iter()
+                .flat_map(|&i| [format!("v.block{i}"), format!("a.block{i}")]),
+        )
         .collect();
     // the block-0 dissection, when the oracle carries it
     for m in ["v", "a"] {
@@ -437,7 +477,9 @@ fn write_y4m(path: &Path, frames: &Vol, fps: f64) -> anyhow::Result<()> {
         for y in 0..h {
             for x in 0..w {
                 let (r, g, b) = (px(0, t, y, x), px(1, t, y, x), px(2, t, y, x));
-                yp[y * w + x] = (0.299 * r + 0.587 * g + 0.114 * b).round().clamp(0.0, 255.0) as u8;
+                yp[y * w + x] = (0.299 * r + 0.587 * g + 0.114 * b)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
             }
         }
         for y in (0..h).step_by(2) {
@@ -453,8 +495,12 @@ fn write_y4m(path: &Path, frames: &Vol, fps: f64) -> anyhow::Result<()> {
                 }
                 let (r, g, b) = (r / 4.0, g / 4.0, b / 4.0);
                 let i = (y / 2) * (w / 2) + x / 2;
-                up[i] = (-0.168736 * r - 0.331264 * g + 0.5 * b + 128.0).round().clamp(0.0, 255.0) as u8;
-                vp[i] = (0.5 * r - 0.418688 * g - 0.081312 * b + 128.0).round().clamp(0.0, 255.0) as u8;
+                up[i] = (-0.168736 * r - 0.331264 * g + 0.5 * b + 128.0)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+                vp[i] = (0.5 * r - 0.418688 * g - 0.081312 * b + 128.0)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
             }
         }
         f.write_all(&yp)?;
@@ -470,7 +516,11 @@ pub fn cmd_ltx_render(a: RenderArgs<'_>) -> anyhow::Result<()> {
     let pool = Pool::from_env();
     let t0 = std::time::Instant::now();
     let dit = LtxDit::from_cmf(&model).map_err(|e| anyhow!(e))?;
-    eprintln!("dit loaded in {:.1}s ({} blocks)", t0.elapsed().as_secs_f64(), dit.blocks());
+    eprintln!(
+        "dit loaded in {:.1}s ({} blocks)",
+        t0.elapsed().as_secs_f64(),
+        dit.blocks()
+    );
 
     let st = St::open(Path::new(a.context))?;
     let (vshape, vctx) = st
@@ -528,7 +578,13 @@ pub fn cmd_ltx_render(a: RenderArgs<'_>) -> anyhow::Result<()> {
     }
 
     let dec = ConvVaeDecoder::from_cmf(&model, pool.as_deref()).map_err(|e| anyhow!(e))?;
-    let latent = Vol { c: 128, f: geo.lf, h: geo.lh, w: geo.lw, data: vol };
+    let latent = Vol {
+        c: 128,
+        f: geo.lf,
+        h: geo.lh,
+        w: geo.lw,
+        data: vol,
+    };
     let t1 = std::time::Instant::now();
     let out = dec.decode(&latent, pool.as_deref());
     println!(
@@ -541,7 +597,10 @@ pub fn cmd_ltx_render(a: RenderArgs<'_>) -> anyhow::Result<()> {
     );
     if let Some(p) = a.out_y4m {
         write_y4m(Path::new(p), &out, a.fps)?;
-        println!("{} frames → {p}  (ffmpeg -i {p} -pix_fmt yuv420p out.mp4)", out.f);
+        println!(
+            "{} frames → {p}  (ffmpeg -i {p} -pix_fmt yuv420p out.mp4)",
+            out.f
+        );
     }
     if let Some(d) = a.out_dir {
         std::fs::create_dir_all(d)?;
@@ -553,7 +612,12 @@ pub fn cmd_ltx_render(a: RenderArgs<'_>) -> anyhow::Result<()> {
                     out.data[((c * out.f + f) * out.h) * out.w + r]
                 })
                 .collect();
-            write_ppm(&Path::new(d).join(format!("frame_{f:04}.ppm")), &frame, out.h, out.w)?;
+            write_ppm(
+                &Path::new(d).join(format!("frame_{f:04}.ppm")),
+                &frame,
+                out.h,
+                out.w,
+            )?;
         }
         println!("{} frames → {d}/frame_*.ppm", out.f);
     }
@@ -574,11 +638,17 @@ pub fn cmd_ltx_encode(a: EncodeArgs<'_>) -> anyhow::Result<()> {
     use cortiq_engine::tokenizer::Tokenizer;
     let model = Arc::new(CmfModel::open_sharded(a.model)?);
     let pool = Pool::from_env();
-    let vocab = model.vocab.as_ref().context("container carries no tokenizer")?;
+    let vocab = model
+        .vocab
+        .as_ref()
+        .context("container carries no tokenizer")?;
     let tok = Tokenizer::from_bytes(vocab).map_err(|e| anyhow!("tokenizer: {e}"))?;
     let t0 = std::time::Instant::now();
     let te = LtxTextEncoder::from_cmf(&model).map_err(|e| anyhow!(e))?;
-    eprintln!("prompt encoder loaded in {:.1}s", t0.elapsed().as_secs_f64());
+    eprintln!(
+        "prompt encoder loaded in {:.1}s",
+        t0.elapsed().as_secs_f64()
+    );
 
     let ids = tok.encode(a.prompt.trim());
     let (ids, mask) = te.pad_ids(&ids);
@@ -588,7 +658,11 @@ pub fn cmd_ltx_encode(a: EncodeArgs<'_>) -> anyhow::Result<()> {
 
     let t1 = std::time::Instant::now();
     let hs = te.hidden_states(&ids, &mask, pool.as_deref());
-    eprintln!("gemma forward in {:.1}s ({} hidden states)", t1.elapsed().as_secs_f64(), hs.len());
+    eprintln!(
+        "gemma forward in {:.1}s ({} hidden states)",
+        t1.elapsed().as_secs_f64(),
+        hs.len()
+    );
 
     if let Some(p) = a.oracle {
         let st = St::open(Path::new(p))?;
@@ -628,7 +702,10 @@ pub fn cmd_ltx_encode(a: EncodeArgs<'_>) -> anyhow::Result<()> {
 
     let t2 = std::time::Instant::now();
     let (v, au, n) = te.encode_ids(&ids, &mask, pool.as_deref());
-    eprintln!("projections + connectors in {:.1}s", t2.elapsed().as_secs_f64());
+    eprintln!(
+        "projections + connectors in {:.1}s",
+        t2.elapsed().as_secs_f64()
+    );
     if let Some(p) = a.oracle {
         let st = St::open(Path::new(p))?;
         for (name, ours) in [("enc.video", &v), ("enc.audio", &au)] {
@@ -734,7 +811,10 @@ pub fn cmd_ltx_video(a: VideoArgs<'_>) -> anyhow::Result<()> {
     let pool = Pool::from_env();
     let whole = std::time::Instant::now();
 
-    let vocab = model.vocab.as_ref().context("container carries no tokenizer")?;
+    let vocab = model
+        .vocab
+        .as_ref()
+        .context("container carries no tokenizer")?;
     let tok = Tokenizer::from_bytes(vocab).map_err(|e| anyhow!("tokenizer: {e}"))?;
     let te = LtxTextEncoder::from_cmf(&model).map_err(|e| anyhow!(e))?;
     let (ids, mask) = te.pad_ids(&tok.encode(a.prompt.trim()));
@@ -796,7 +876,11 @@ pub fn cmd_ltx_video(a: VideoArgs<'_>) -> anyhow::Result<()> {
                 b.rank(),
                 a.lora_strength,
                 t.elapsed().as_secs_f64(),
-                if b.slot.is_some() { ", with reference slots" } else { "" }
+                if b.slot.is_some() {
+                    ", with reference slots"
+                } else {
+                    ""
+                }
             );
             Some(b)
         }
@@ -809,7 +893,11 @@ pub fn cmd_ltx_video(a: VideoArgs<'_>) -> anyhow::Result<()> {
     // Two-stage is how the distilled model was trained to be sampled: eight
     // ancestral steps at half resolution, a learned latent upscale, then
     // three deterministic steps that refine the detail the upscale invented.
-    let (h1, w1) = if a.two_stage { (a.height / 2, a.width / 2) } else { (a.height, a.width) };
+    let (h1, w1) = if a.two_stage {
+        (a.height / 2, a.width / 2)
+    } else {
+        (a.height, a.width)
+    };
     let geo = Geometry::new(a.frames, h1, w1, a.fps);
     println!(
         "stage 1 latent {}x{}x{} ({} video tokens), audio {} tokens",
@@ -878,7 +966,13 @@ pub fn cmd_ltx_video(a: VideoArgs<'_>) -> anyhow::Result<()> {
         use cortiq_engine::ltxpipe::patchify_video;
         use cortiq_engine::ltxups::LatentUpscaler;
         let ups = LatentUpscaler::from_cmf(&model).map_err(|e| anyhow!(e))?;
-        let small = Vol { c: 128, f: geo.lf, h: geo.lh, w: geo.lw, data: unpatchify_video(&lat.video, &geo) };
+        let small = Vol {
+            c: 128,
+            f: geo.lf,
+            h: geo.lh,
+            w: geo.lw,
+            data: unpatchify_video(&lat.video, &geo),
+        };
         let t = std::time::Instant::now();
         let big = ups.upscale(&small, pool.as_deref());
         println!(
@@ -888,7 +982,10 @@ pub fn cmd_ltx_video(a: VideoArgs<'_>) -> anyhow::Result<()> {
             t.elapsed().as_secs_f64()
         );
         let geo2 = Geometry::new(a.frames, a.height, a.width, a.fps);
-        anyhow::ensure!(big.h == geo2.lh && big.w == geo2.lw, "upscaler shape mismatch");
+        anyhow::ensure!(
+            big.h == geo2.lh && big.w == geo2.lw,
+            "upscaler shape mismatch"
+        );
         let init = cortiq_engine::ltxpipe::Latents {
             video: patchify_video(&big.data, &geo2),
             audio: lat.audio.clone(),
@@ -932,7 +1029,15 @@ pub fn cmd_ltx_video(a: VideoArgs<'_>) -> anyhow::Result<()> {
         let t = std::time::Instant::now();
         let stack = AudioStack::from_cmf(&model).map_err(|e| anyhow!(e))?;
         let al = unpatchify_audio(&audio, geo.af);
-        let wave = stack.decode(&Grid { c: 8, h: geo.af, w: 16, data: al }, pool.as_deref());
+        let wave = stack.decode(
+            &Grid {
+                c: 8,
+                h: geo.af,
+                w: 16,
+                data: al,
+            },
+            pool.as_deref(),
+        );
         write_wav(Path::new(p), &wave, stack.out_rate)?;
         println!(
             "{:.1}s of {} Hz stereo → {p} ({:.1}s)",
@@ -942,7 +1047,13 @@ pub fn cmd_ltx_video(a: VideoArgs<'_>) -> anyhow::Result<()> {
         );
     }
     let dec = ConvVaeDecoder::from_cmf(&model, pool.as_deref()).map_err(|e| anyhow!(e))?;
-    let latent = Vol { c: 128, f: geo.lf, h: geo.lh, w: geo.lw, data: vol };
+    let latent = Vol {
+        c: 128,
+        f: geo.lf,
+        h: geo.lh,
+        w: geo.lw,
+        data: vol,
+    };
     let t2 = std::time::Instant::now();
     let out = dec.decode(&latent, pool.as_deref());
     println!(
@@ -1006,7 +1117,12 @@ pub(crate) fn write_frames(d: &str, out: &Vol) -> anyhow::Result<()> {
                 out.data[((c * out.f + f) * out.h) * out.w + r]
             })
             .collect();
-        write_ppm(&Path::new(d).join(format!("frame_{f:04}.ppm")), &frame, out.h, out.w)?;
+        write_ppm(
+            &Path::new(d).join(format!("frame_{f:04}.ppm")),
+            &frame,
+            out.h,
+            out.w,
+        )?;
     }
     println!("{} frames → {d}/frame_*.ppm", out.f);
     Ok(())
@@ -1033,7 +1149,11 @@ pub fn cmd_ltx_audio(a: AudioArgs<'_>) -> anyhow::Result<()> {
     // an oracle file carries the reference's own latent, so the comparison
     // is of this stack against that stack on identical input
     let (shape, vals) = st.get("audio_latent")?;
-    let frames = if shape.len() == 4 { shape[2] } else { shape[shape.len() - 2] };
+    let frames = if shape.len() == 4 {
+        shape[2]
+    } else {
+        shape[shape.len() - 2]
+    };
     let vals = if shape.len() == 4 {
         // the reference dumps [B, 8, T, 16]; ours is the patchified [B, T, 128]
         let (c, t, m) = (shape[1], shape[2], shape[3]);
@@ -1050,13 +1170,27 @@ pub fn cmd_ltx_audio(a: AudioArgs<'_>) -> anyhow::Result<()> {
         vals
     };
     let stack = AudioStack::from_cmf(&model).map_err(|e| anyhow!(e))?;
-    let grid = Grid { c: 8, h: frames, w: 16, data: unpatchify_audio(&vals, frames) };
+    let grid = Grid {
+        c: 8,
+        h: frames,
+        w: 16,
+        data: unpatchify_audio(&vals, frames),
+    };
     let describe = |name: &str, v: &[f32]| {
         let n = v.len().max(1) as f64;
         let mean = v.iter().map(|&x| x as f64).sum::<f64>() / n;
         let rms = (v.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>() / n).sqrt();
-        let (lo, hi) = v.iter().fold((f32::MAX, f32::MIN), |(l, h), &x| (l.min(x), h.max(x)));
-        println!("{name:<12} n {:<9} mean {:+.4} rms {:.4} range [{:+.3}, {:+.3}]", v.len(), mean, rms, lo, hi);
+        let (lo, hi) = v
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(l, h), &x| (l.min(x), h.max(x)));
+        println!(
+            "{name:<12} n {:<9} mean {:+.4} rms {:.4} range [{:+.3}, {:+.3}]",
+            v.len(),
+            mean,
+            rms,
+            lo,
+            hi
+        );
     };
     if a.stats {
         describe("latent", &grid.data);
@@ -1131,7 +1265,10 @@ pub fn cmd_ltx_audio(a: AudioArgs<'_>) -> anyhow::Result<()> {
             .step_by(blk)
             .map(|i| {
                 let hi = (i + blk).min(wave.t);
-                let s: f64 = wave.data[i..hi].iter().map(|&x| (x as f64) * (x as f64)).sum();
+                let s: f64 = wave.data[i..hi]
+                    .iter()
+                    .map(|&x| (x as f64) * (x as f64))
+                    .sum();
                 format!("{:.3}", (s / (hi - i) as f64).sqrt())
             })
             .collect();
@@ -1202,7 +1339,10 @@ fn build_conditioning(
         }
     };
     if image.is_none() && video.is_none() {
-        return Ok((audio_cond.map(|a| Conditioning::default().with_audio_all(geo, &a)), None));
+        return Ok((
+            audio_cond.map(|a| Conditioning::default().with_audio_all(geo, &a)),
+            None,
+        ));
     }
     let enc = VideoEncoder::from_cmf(model).map_err(|e| anyhow!(e))?;
     let t = std::time::Instant::now();
@@ -1229,12 +1369,15 @@ fn build_conditioning(
         lat.w,
         t.elapsed().as_secs_f64()
     );
-    let clean = patchify_video(&lat.data, &cortiq_engine::ltxpipe::Geometry {
-        lf: lat.f,
-        lh: lat.h,
-        lw: lat.w,
-        ..*geo
-    });
+    let clean = patchify_video(
+        &lat.data,
+        &cortiq_engine::ltxpipe::Geometry {
+            lf: lat.f,
+            lh: lat.h,
+            lw: lat.w,
+            ..*geo
+        },
+    );
     // pad or crop the encoded prefix into the target token grid
     let mut full = vec![0f32; geo.video_tokens() * 128];
     let take = clean.len().min(full.len());
@@ -1268,7 +1411,6 @@ fn build_conditioning(
     };
     Ok((cond, init))
 }
-
 
 /// Reference images as clean tokens at negative time, the way the
 /// multi-subject adapters were trained: each still is held for
@@ -1319,7 +1461,13 @@ fn build_references(
         for _ in 0..ref_frames {
             held.extend_from_slice(&rgb);
         }
-        let vol = Vol { c: 3, f: ref_frames, h, w, data: held };
+        let vol = Vol {
+            c: 3,
+            f: ref_frames,
+            h,
+            w,
+            data: held,
+        };
         let lat = enc.encode(&vol, pool);
         anyhow::ensure!(
             lat.h == geo.lh && lat.w == geo.lw,
@@ -1346,12 +1494,15 @@ fn build_references(
                 *v += e;
             }
         }
-        let tokens = patchify_video(&data, &cortiq_engine::ltxpipe::Geometry {
-            lf: lat.f,
-            lh: lat.h,
-            lw: lat.w,
-            ..*geo
-        });
+        let tokens = patchify_video(
+            &data,
+            &cortiq_engine::ltxpipe::Geometry {
+                lf: lat.f,
+                lh: lat.h,
+                lw: lat.w,
+                ..*geo
+            },
+        );
         let count = lat.f * lat.h * lat.w;
         // Slot 1 sits furthest back; the last reference is nearest the clip.
         let offset = -((n - i) as i64);
@@ -1372,7 +1523,13 @@ fn build_references(
 /// One PPM as a single-frame volume in `[-1, 1]`.
 fn read_frames_one(path: &str) -> anyhow::Result<Vol> {
     let (rgb, h, w) = read_ppm_f32(path)?;
-    Ok(Vol { c: 3, f: 1, h, w, data: rgb })
+    Ok(Vol {
+        c: 3,
+        f: 1,
+        h,
+        w,
+        data: rgb,
+    })
 }
 
 /// A directory of `frame_*.ppm` as one volume.
@@ -1401,7 +1558,13 @@ fn read_frames_dir(dir: &str) -> anyhow::Result<Vol> {
             data.extend_from_slice(&frame[c * h * w..(c + 1) * h * w]);
         }
     }
-    Ok(Vol { c: 3, f, h, w, data })
+    Ok(Vol {
+        c: 3,
+        f,
+        h,
+        w,
+        data,
+    })
 }
 
 /// A binary PPM (P6) into planar RGB in `[-1, 1]`.
@@ -1526,7 +1689,13 @@ mod frame_interchange_tests {
         let data: Vec<f32> = (0..3 * f * h * w)
             .map(|i| ((i * 37) % 251) as f32 / 125.0 - 1.0)
             .collect();
-        let vol = Vol { c: 3, f, h, w, data: data.clone() };
+        let vol = Vol {
+            c: 3,
+            f,
+            h,
+            w,
+            data: data.clone(),
+        };
         let dir = std::env::temp_dir().join(format!("cmf-frames-{}", std::process::id()));
         let d = dir.to_str().unwrap();
         write_frames(d, &vol).unwrap();

@@ -257,9 +257,11 @@ fn mmh3_gpu_parity_probe(path: &Path) -> Result<bool, String> {
     // device arm against the host, and a container packed as q8_2f has one
     // too. Matching on dtype sent every non-q4tp build to the CPU for the
     // whole render — measured at 357 s against 60 on the same card.
-    let Some(idx) = model.tensors.iter().position(|t| {
-        t.name.starts_with("dit.") && t.name.ends_with("attn.qkv_proj.weight")
-    }) else {
+    let Some(idx) = model
+        .tensors
+        .iter()
+        .position(|t| t.name.starts_with("dit.") && t.name.ends_with("attn.qkv_proj.weight"))
+    else {
         tracing::info!("mmh3 GPU parity probe: no qkv weight — host path");
         return Ok(false);
     };
@@ -287,7 +289,10 @@ fn mmh3_gpu_parity_probe(path: &Path) -> Result<bool, String> {
             entry.dtype
         );
         if std::env::var("CMF_GPU_DEBUG").is_ok() {
-            eprintln!("mmh3 probe: device GEMM refused {rows}x{cols} for {:?}", entry.dtype);
+            eprintln!(
+                "mmh3 probe: device GEMM refused {rows}x{cols} for {:?}",
+                entry.dtype
+            );
         }
         return Ok(false);
     }
@@ -352,7 +357,11 @@ fn generate_inner(
         .first_frame
         .iter()
         .map(|f| (f, 0usize))
-        .chain(p.mid_frames.iter().map(|(f, i)| (f, (*i).min(frames_total - 1))))
+        .chain(
+            p.mid_frames
+                .iter()
+                .map(|(f, i)| (f, (*i).min(frames_total - 1))),
+        )
         .chain(p.last_frame.iter().map(|f| (f, frames_total - 1)))
         .collect();
     // Condition rows are placed by time coordinate, so they have to arrive
@@ -502,7 +511,8 @@ fn generate_inner(
         let bank = match p.lora.as_deref() {
             None => None,
             Some(path) => {
-                let k = crate::ltxlora::LoraBank::load(std::path::Path::new(path), p.lora_strength)?;
+                let k =
+                    crate::ltxlora::LoraBank::load(std::path::Path::new(path), p.lora_strength)?;
                 Some(k)
             }
         };
@@ -528,8 +538,7 @@ fn generate_inner(
             let tail = if skipped.is_empty() {
                 String::new()
             } else {
-                let parts: Vec<String> =
-                    skipped.iter().map(|(k, v)| format!("{k} ×{v}")).collect();
+                let parts: Vec<String> = skipped.iter().map(|(k, v)| format!("{k} ×{v}")).collect();
                 format!("; not applied: {}", parts.join(", "))
             };
             tracing::info!(
@@ -744,8 +753,7 @@ fn generate_inner(
                 for c in 0..ac {
                     for ch in 0..2 {
                         for (n, &i) in cur_a.iter().enumerate() {
-                            a_out[(c * 2 + ch) * audio_t + i] =
-                                xa[(c * 2 + ch) * cur_a.len() + n];
+                            a_out[(c * 2 + ch) * audio_t + i] = xa[(c * 2 + ch) * cur_a.len() + n];
                         }
                     }
                 }

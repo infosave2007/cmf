@@ -51,6 +51,17 @@ pub struct BakeHyper {
     /// Force one FFN width across all layers (the max aligned count) —
     /// the whole-token GPU graphs require a uniform intermediate size.
     pub uniform_inter: bool,
+    /// When non-empty, LM loss is accumulated only where the next token
+    /// is one of these ids. The whole chunk is still forwarded as context.
+    /// This is useful for supervised corpora with a long input and a
+    /// one-token answer, where ordinary all-token LM loss would drown the
+    /// task signal in prompt reconstruction.
+    pub focus_tokens: Vec<u32>,
+    /// Optional token(s) that must immediately follow a focused target.
+    /// Supervised ChatML uses the one-token label followed by `<|im_end|>`;
+    /// this prevents label names mentioned inside the user instruction from
+    /// being mistaken for answer positions.
+    pub focus_follow_tokens: Vec<u32>,
 }
 
 impl Default for BakeHyper {
@@ -70,6 +81,8 @@ impl Default for BakeHyper {
             l1_mult: 1.0,
             align: 32,
             uniform_inter: false,
+            focus_tokens: Vec::new(),
+            focus_follow_tokens: Vec::new(),
         }
     }
 }
@@ -193,6 +206,21 @@ fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
+fn is_scored_target(
+    ids: &[u32],
+    target_index: usize,
+    sequence_end: usize,
+    focus: &[u32],
+    follow: &[u32],
+) -> bool {
+    if focus.is_empty() {
+        return true;
+    }
+    focus.contains(&ids[target_index])
+        && (follow.is_empty()
+            || (target_index + 1 < sequence_end && follow.contains(&ids[target_index + 1])))
+}
+
 /// One forward + CE(+optionally backward through the FFN chain).
 /// Returns (nll_sum, tokens). `dmask`/`dffn` accumulate when given.
 struct Pass<'a> {
@@ -203,6 +231,10 @@ struct Pass<'a> {
     hard: bool,
     /// Phase-B replacement FFN weights per layer (trained copies).
     ffn: &'a [Option<(Vec<f32>, Vec<f32>, Vec<f32>)>],
+    /// Empty means ordinary all-token LM loss.
+    focus_tokens: &'a [u32],
+    /// Empty means no right-context constraint on focused targets.
+    focus_follow_tokens: &'a [u32],
 }
 
 impl Pass<'_> {
@@ -343,7 +375,25 @@ impl Pass<'_> {
         // Positions are walked PER SEQUENCE: the last position of chunk
         // i must not be scored against the first token of chunk i+1.
         const POS_CHUNK: usize = 64;
-        let scored = b * (t - 1);
+        let scored = (0..b)
+            .map(|bi| {
+                let base = bi * t;
+                (base + 1..base + t)
+                    .filter(|&target_index| {
+                        is_scored_target(
+                            ids,
+                            target_index,
+                            base + t,
+                            self.focus_tokens,
+                            self.focus_follow_tokens,
+                        )
+                    })
+                    .count()
+            })
+            .sum::<usize>();
+        if scored == 0 {
+            return (0.0, 0);
+        }
         for bi in 0..b {
             let base = bi * t;
             let mut p0 = 0usize;
@@ -360,21 +410,68 @@ impl Pass<'_> {
                     pool,
                 );
                 for r in 0..pc {
-                    let target = ids[base + p0 + r + 1] as usize;
+                    let target_index = base + p0 + r + 1;
+                    let target_id = ids[target_index];
                     let row = &mut logits[r * vocab..(r + 1) * vocab];
-                    let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
-                    let mut sum = 0f64;
-                    for v in row.iter() {
-                        sum += ((*v as f64) - mx).exp();
-                    }
-                    nll += mx + sum.ln() - row[target] as f64;
-                    if grad.is_some() {
-                        // dCE/dlogit = softmax − onehot, scaled by 1/scored.
-                        let inv_n = 1.0 / scored as f64;
-                        for v in row.iter_mut() {
-                            *v = ((((*v as f64) - mx).exp() / sum) * inv_n) as f32;
+                    if !is_scored_target(
+                        ids,
+                        target_index,
+                        base + t,
+                        self.focus_tokens,
+                        self.focus_follow_tokens,
+                    ) {
+                        if grad.is_some() {
+                            row.fill(0.0);
                         }
-                        row[target] -= inv_n as f32;
+                        continue;
+                    }
+                    let target = target_id as usize;
+                    if self.focus_tokens.is_empty() {
+                        let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
+                        let mut sum = 0f64;
+                        for v in row.iter() {
+                            sum += ((*v as f64) - mx).exp();
+                        }
+                        nll += mx + sum.ln() - row[target] as f64;
+                        if grad.is_some() {
+                            // dCE/dlogit = softmax − onehot, scaled by 1/scored.
+                            let inv_n = 1.0 / scored as f64;
+                            for v in row.iter_mut() {
+                                *v = ((((*v as f64) - mx).exp() / sum) * inv_n) as f32;
+                            }
+                            row[target] -= inv_n as f32;
+                        }
+                    } else {
+                        // A supervised classifier needs competition BETWEEN
+                        // its labels. Full-vocabulary CE merely teaches both
+                        // UP and DOWN to outrank unrelated words and can lower
+                        // PPL while greedy decoding stays one constant class.
+                        // Restrict the normalizer and gradient to the declared
+                        // one-token labels: this is exact binary/multiclass CE.
+                        let mx = self
+                            .focus_tokens
+                            .iter()
+                            .map(|&id| row[id as usize])
+                            .fold(f32::NEG_INFINITY, f32::max)
+                            as f64;
+                        let probs: Vec<(usize, f64)> = self
+                            .focus_tokens
+                            .iter()
+                            .map(|&id| {
+                                let index = id as usize;
+                                (index, ((row[index] as f64) - mx).exp())
+                            })
+                            .collect();
+                        let sum: f64 = probs.iter().map(|(_, value)| value).sum();
+                        nll += mx + sum.ln() - row[target] as f64;
+                        if grad.is_some() {
+                            let inv_n = 1.0 / scored as f64;
+                            row.fill(0.0);
+                            for (index, value) in probs {
+                                row[index] = (value / sum * inv_n) as f32;
+                            }
+                            row[target] -= inv_n as f32;
+                        }
                     }
                 }
                 if grad.is_some() {
@@ -596,6 +693,8 @@ pub fn replica_score_file_mask(
             logits,
             hard: true,
             ffn: &ffn,
+            focus_tokens: &[],
+            focus_follow_tokens: &[],
         };
         held_ppl(&pass, chunks)
     };
@@ -678,6 +777,8 @@ pub fn skill_bake(
         logits: &open,
         hard: true,
         ffn: &ffn,
+        focus_tokens: &hy.focus_tokens,
+        focus_follow_tokens: &hy.focus_follow_tokens,
     };
     let backbone = held_ppl(&base_pass, &held);
     log(&format!("baseline (full): {backbone:.3}"));
@@ -715,6 +816,8 @@ pub fn skill_bake(
             logits: &logits,
             hard: false,
             ffn: &ffn,
+            focus_tokens: &hy.focus_tokens,
+            focus_follow_tokens: &hy.focus_follow_tokens,
         };
         let _ = pass.chunk(chunk, Some((&mut dmask, &mut dffn)));
         // Fold σ'(m) into the mask grads + add the L1 term.
@@ -750,6 +853,8 @@ pub fn skill_bake(
                 logits: &logits,
                 hard: true,
                 ffn: &ffn,
+                focus_tokens: &hy.focus_tokens,
+                focus_follow_tokens: &hy.focus_follow_tokens,
             };
             crate::gpu::bake_precision_strict(false);
             let hp = held_ppl(&pass, &held);
@@ -854,6 +959,8 @@ pub fn skill_bake(
         logits: &logits,
         hard: true,
         ffn: &ffn,
+        focus_tokens: &hy.focus_tokens,
+        focus_follow_tokens: &hy.focus_follow_tokens,
     };
     let masked = held_ppl(&pass, &held);
     log(&format!(
@@ -881,7 +988,11 @@ pub fn skill_bake(
         })
         .collect();
     let mut adam_b = Adam::new(&sizes, hy.lr_b);
-    let mut best_b: (f64, Option<Vec<Option<(Vec<f32>, Vec<f32>, Vec<f32>)>>>) = (masked, None);
+    // The mask-only model is a real checkpoint too. If every FCD eval is
+    // worse, restore `None` overlays rather than accidentally writing the
+    // final (rejected) training step while reporting the mask-only PPL.
+    let mut best_b: (f64, Option<Vec<Option<(Vec<f32>, Vec<f32>, Vec<f32>)>>>) =
+        (masked, Some(vec![None; nl]));
     for step in 0..hy.steps_b {
         let chunk = &calib[step % calib.len()];
         let mut dmask: Vec<Vec<f64>> = vec![vec![0.0; inter]; vn];
@@ -898,6 +1009,8 @@ pub fn skill_bake(
             logits: &logits,
             hard: true,
             ffn: &ffn,
+            focus_tokens: &hy.focus_tokens,
+            focus_follow_tokens: &hy.focus_follow_tokens,
         };
         let _ = pass.chunk(chunk, Some((&mut dmask, &mut dffn)));
         // Cosine LR.
@@ -930,6 +1043,8 @@ pub fn skill_bake(
                 logits: &logits,
                 hard: true,
                 ffn: &ffn,
+                focus_tokens: &hy.focus_tokens,
+                focus_follow_tokens: &hy.focus_follow_tokens,
             };
             let cur = held_ppl(&pass, &held);
             if cur < best_b.0 {
@@ -942,9 +1057,7 @@ pub fn skill_bake(
             ));
         }
     }
-    if let Some(b) = best_b.1.take() {
-        ffn = b;
-    }
+    ffn = best_b.1.take().expect("phase-B always has a checkpoint");
     let overlaid = best_b.0;
 
     // ── Export artifacts ──
@@ -1070,6 +1183,21 @@ mod tests {
             .iter()
             .map(|m| m.iter().filter(|&&a| a).count())
             .collect()
+    }
+
+    #[test]
+    fn terminal_focus_ignores_label_names_inside_the_prompt() {
+        // DOWN and UP occur in the instruction, but only the final UP is an
+        // assistant answer because it is immediately followed by im_end.
+        let down = 10;
+        let up = 11;
+        let im_end = 99;
+        let ids = [1, down, 2, up, 3, up, im_end, 4];
+        let focus = [down, up];
+        let follow = [im_end];
+        assert!(!is_scored_target(&ids, 1, ids.len(), &focus, &follow));
+        assert!(!is_scored_target(&ids, 3, ids.len(), &focus, &follow));
+        assert!(is_scored_target(&ids, 5, ids.len(), &focus, &follow));
     }
 
     /// align=32 rounds each layer UP by resurrecting the largest

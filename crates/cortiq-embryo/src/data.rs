@@ -21,7 +21,9 @@ pub fn for_each_doc(path: &Path, mut f: impl FnMut(&str)) -> anyhow::Result<usiz
                 .find(|&i| ["text", "content", "code"].contains(&schema.column(i).name()))
                 .ok_or_else(|| anyhow::anyhow!("{name}: no text/content column"))?;
             let proj = parquet::schema::types::Type::group_type_builder("schema")
-                .with_fields(vec![std::sync::Arc::new(schema.column(col).self_type().clone())])
+                .with_fields(vec![std::sync::Arc::new(
+                    schema.column(col).self_type().clone(),
+                )])
                 .build()?;
             for row in reader.get_row_iter(Some(proj))? {
                 let row = row?;
@@ -38,7 +40,11 @@ pub fn for_each_doc(path: &Path, mut f: impl FnMut(&str)) -> anyhow::Result<usiz
         anyhow::bail!("{name}: parquet needs `--features data`");
     }
     let file = std::fs::File::open(path)?;
-    let reader: Box<dyn Read> = if name.ends_with(".gz") { Box::new(flate2::read::GzDecoder::new(file)) } else { Box::new(file) };
+    let reader: Box<dyn Read> = if name.ends_with(".gz") {
+        Box::new(flate2::read::GzDecoder::new(file))
+    } else {
+        Box::new(file)
+    };
     if name.contains(".json") {
         let br = BufReader::with_capacity(1 << 20, reader);
         for line in br.lines() {
@@ -50,7 +56,11 @@ pub fn for_each_doc(path: &Path, mut f: impl FnMut(&str)) -> anyhow::Result<usiz
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            if let Some(t) = v.get("text").and_then(|t| t.as_str()).or_else(|| v.get("content").and_then(|t| t.as_str())) {
+            if let Some(t) = v
+                .get("text")
+                .and_then(|t| t.as_str())
+                .or_else(|| v.get("content").and_then(|t| t.as_str()))
+            {
                 f(t);
                 n += 1;
             }

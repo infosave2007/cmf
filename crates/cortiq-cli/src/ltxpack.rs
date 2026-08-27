@@ -388,7 +388,9 @@ pub fn cmd_ltx_pack(args: LtxPackArgs<'_>) -> anyhow::Result<()> {
         Ok(Some(meta))
     }
 
-    if let Some(meta) = run(&mut specs, args.dit, 0, "dit", &mut vocab, &mut prov, &pol, t0)? {
+    if let Some(meta) = run(
+        &mut specs, args.dit, 0, "dit", &mut vocab, &mut prov, &pol, t0,
+    )? {
         // The single-file release carries the whole pipeline config in the
         // safetensors metadata; it is the spec the runtime is written
         // against, so it rides in the container verbatim.
@@ -402,8 +404,19 @@ pub fn cmd_ltx_pack(args: LtxPackArgs<'_>) -> anyhow::Result<()> {
             prov.insert("model_version".into(), serde_json::json!(v));
         }
     }
-    run(&mut specs, args.te, 1, "te", &mut vocab, &mut prov, &pol, t0)?;
-    if let Some(meta) = run(&mut specs, args.video_vae, 2, "vvae", &mut vocab, &mut prov, &pol, t0)? {
+    run(
+        &mut specs, args.te, 1, "te", &mut vocab, &mut prov, &pol, t0,
+    )?;
+    if let Some(meta) = run(
+        &mut specs,
+        args.video_vae,
+        2,
+        "vvae",
+        &mut vocab,
+        &mut prov,
+        &pol,
+        t0,
+    )? {
         // the VAE file carries its own `config.vae` block; a VAE-only pass
         // must still leave the runtime a config to build the decoder from
         if let Some(cfg) = meta.get("config").and_then(|c| c.as_str()) {
@@ -414,7 +427,16 @@ pub fn cmd_ltx_pack(args: LtxPackArgs<'_>) -> anyhow::Result<()> {
             specs.push(config_spec("vvae", &meta["config"]));
         }
     }
-    if let Some(meta) = run(&mut specs, args.audio_vae, 3, "avae", &mut vocab, &mut prov, &pol, t0)? {
+    if let Some(meta) = run(
+        &mut specs,
+        args.audio_vae,
+        3,
+        "avae",
+        &mut vocab,
+        &mut prov,
+        &pol,
+        t0,
+    )? {
         // the audio VAE carries the vocoder's own geometry — upsample rates,
         // kernel sizes, sampling rates — which the runtime cannot infer
         if let Some(cfg) = meta.get("config").and_then(|c| c.as_str()) {
@@ -425,8 +447,26 @@ pub fn cmd_ltx_pack(args: LtxPackArgs<'_>) -> anyhow::Result<()> {
             specs.push(config_spec("avae", &meta["config"]));
         }
     }
-    run(&mut specs, args.spatial_upscaler, 4, "ups", &mut vocab, &mut prov, &pol, t0)?;
-    run(&mut specs, args.temporal_upscaler, 5, "upt", &mut vocab, &mut prov, &pol, t0)?;
+    run(
+        &mut specs,
+        args.spatial_upscaler,
+        4,
+        "ups",
+        &mut vocab,
+        &mut prov,
+        &pol,
+        t0,
+    )?;
+    run(
+        &mut specs,
+        args.temporal_upscaler,
+        5,
+        "upt",
+        &mut vocab,
+        &mut prov,
+        &pol,
+        t0,
+    )?;
     if let Some(p) = args.duration_head {
         let (n, w, b, _) = pack_component(
             &mut specs,
@@ -441,7 +481,10 @@ pub fn cmd_ltx_pack(args: LtxPackArgs<'_>) -> anyhow::Result<()> {
             &mut vocab,
         )?;
         eprintln!("dhead: {n} tensors, {w} weights → {b} bytes");
-        prov.insert("dhead".into(), serde_json::json!({"source": p, "tensors": n}));
+        prov.insert(
+            "dhead".into(),
+            serde_json::json!({"source": p, "tensors": n}),
+        );
     }
 
     // ── carry the previous pass through, byte for byte ──

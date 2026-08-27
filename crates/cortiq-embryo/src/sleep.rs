@@ -45,33 +45,51 @@ pub struct SleepArgs {
 }
 
 fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn journal(dir: &Path, event: &str, details: serde_json::Value) {
     let _ = std::fs::create_dir_all(dir);
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("journal.jsonl")) {
-        let _ = writeln!(f, "{}", serde_json::json!({"ts": now(), "event": event, "details": details}));
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("journal.jsonl"))
+    {
+        let _ = writeln!(
+            f,
+            "{}",
+            serde_json::json!({"ts": now(), "event": event, "details": details})
+        );
     }
     eprintln!("[sleep] {event}: {details}");
 }
 
 /// mtime of the idle marker (None when absent; None < Some).
 fn marker_mtime(dir: &Path) -> Option<SystemTime> {
-    std::fs::metadata(dir.join("last_request")).and_then(|m| m.modified()).ok()
+    std::fs::metadata(dir.join("last_request"))
+        .and_then(|m| m.modified())
+        .ok()
 }
 
 /// Seconds since the last request (∞ when the marker is absent).
 fn idle_secs(dir: &Path) -> f64 {
     match std::fs::metadata(dir.join("last_request")).and_then(|m| m.modified()) {
-        Ok(t) => SystemTime::now().duration_since(t).map(|d| d.as_secs_f64()).unwrap_or(0.0),
+        Ok(t) => SystemTime::now()
+            .duration_since(t)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0),
         Err(_) => f64::INFINITY,
     }
 }
 
 /// Buffer contents: (texts, total tokens).
 fn read_buffer(dir: &Path) -> (Vec<String>, usize) {
-    let Ok(s) = std::fs::read_to_string(dir.join("buffer.jsonl")) else { return (Vec::new(), 0) };
+    let Ok(s) = std::fs::read_to_string(dir.join("buffer.jsonl")) else {
+        return (Vec::new(), 0);
+    };
     let mut texts = Vec::new();
     let mut toks = 0usize;
     for line in s.lines() {
@@ -95,21 +113,33 @@ pub fn run(a: SleepArgs) -> anyhow::Result<()> {
     let ck: Checkpoint = load_checkpoint(&a.ckpt)?;
     let bpe = Bpe::load(&a.tokenizer)?;
     let eot = bpe.special_id(EOT).unwrap_or(0) as u16;
-    journal(&a.ood_dir, "daemon_start", serde_json::json!({"cmf": a.cmf, "idle_min": a.idle_min, "min_tokens": a.min_tokens, "gate": a.gate}));
+    journal(
+        &a.ood_dir,
+        "daemon_start",
+        serde_json::json!({"cmf": a.cmf, "idle_min": a.idle_min, "min_tokens": a.min_tokens, "gate": a.gate}),
+    );
     loop {
         let idle = idle_secs(&a.ood_dir);
         let (texts, toks) = read_buffer(&a.ood_dir);
         let ready = a.force || (idle >= a.idle_min * 60.0 && toks >= a.min_tokens);
         if !ready {
             if a.once {
-                journal(&a.ood_dir, "nothing_to_do", serde_json::json!({"idle_s": idle, "buffer_tokens": toks}));
+                journal(
+                    &a.ood_dir,
+                    "nothing_to_do",
+                    serde_json::json!({"idle_s": idle, "buffer_tokens": toks}),
+                );
                 return Ok(());
             }
             std::thread::sleep(Duration::from_secs(a.poll_secs));
             continue;
         }
         if texts.is_empty() {
-            journal(&a.ood_dir, "nothing_to_do", serde_json::json!({"reason": "empty buffer"}));
+            journal(
+                &a.ood_dir,
+                "nothing_to_do",
+                serde_json::json!({"reason": "empty buffer"}),
+            );
             if a.once {
                 return Ok(());
             }
@@ -119,7 +149,11 @@ pub fn run(a: SleepArgs) -> anyhow::Result<()> {
         // ---- the night begins ----
         let t0 = Instant::now();
         let id = format!("night-{}", now());
-        journal(&a.ood_dir, "night_start", serde_json::json!({"skill": id, "buffer_tokens": toks, "docs": texts.len(), "idle_s": idle}));
+        journal(
+            &a.ood_dir,
+            "night_start",
+            serde_json::json!({"skill": id, "buffer_tokens": toks, "docs": texts.len(), "idle_s": idle}),
+        );
         // corpus from the buffer
         let mut tokens: Vec<u16> = Vec::new();
         let mut cache = std::collections::HashMap::new();
@@ -161,7 +195,11 @@ pub fn run(a: SleepArgs) -> anyhow::Result<()> {
         let (tensors, sel, kept, (l0, la, lb)) = match baked {
             Ok(v) => v,
             Err(e) if e.to_string().contains("preempted") => {
-                journal(&a.ood_dir, "preempted", serde_json::json!({"skill": id, "after_s": t0.elapsed().as_secs_f64()}));
+                journal(
+                    &a.ood_dir,
+                    "preempted",
+                    serde_json::json!({"skill": id, "after_s": t0.elapsed().as_secs_f64()}),
+                );
                 if a.once {
                     return Ok(());
                 }
@@ -177,11 +215,23 @@ pub fn run(a: SleepArgs) -> anyhow::Result<()> {
             "kept_fraction": kept, "improvement": improvement,
         });
         if improvement < a.gate {
-            journal(&a.ood_dir, "skill_rejected", serde_json::json!({"skill": id, "quality": quality, "gate": a.gate}));
+            journal(
+                &a.ood_dir,
+                "skill_rejected",
+                serde_json::json!({"skill": id, "quality": quality, "gate": a.gate}),
+            );
         } else {
             let next = a.cmf.with_extension("cmf.next");
             let before = tensor_hashes(&a.cmf)?;
-            let unchanged = append_to_cmf(&a.cmf, &next, &id, &a.layers, &tensors, sel, quality.clone())?;
+            let unchanged = append_to_cmf(
+                &a.cmf,
+                &next,
+                &id,
+                &a.layers,
+                &tensors,
+                sel,
+                quality.clone(),
+            )?;
             // byte-identity proof: every pre-existing tensor keeps its hash
             let after = tensor_hashes(&next)?;
             let mut broken = Vec::new();
@@ -192,30 +242,65 @@ pub fn run(a: SleepArgs) -> anyhow::Result<()> {
             }
             if !broken.is_empty() {
                 let _ = std::fs::remove_file(&next);
-                journal(&a.ood_dir, "rollback", serde_json::json!({"skill": id, "reason": "base tensors changed", "tensors": broken}));
+                journal(
+                    &a.ood_dir,
+                    "rollback",
+                    serde_json::json!({"skill": id, "reason": "base tensors changed", "tensors": broken}),
+                );
             } else {
                 // atomic commit; a running `serve` keeps its old mapping until it reloads
                 std::fs::rename(&next, &a.cmf)?;
-                journal(&a.ood_dir, "skill_committed", serde_json::json!({"skill": id, "unchanged_tensors": unchanged, "quality": quality, "seconds": t0.elapsed().as_secs_f64(), "note": "restart/reload serve to activate"}));
+                journal(
+                    &a.ood_dir,
+                    "skill_committed",
+                    serde_json::json!({"skill": id, "unchanged_tensors": unchanged, "quality": quality, "seconds": t0.elapsed().as_secs_f64(), "note": "restart/reload serve to activate"}),
+                );
                 // the router recalibrates itself over every skill's held-out φ
                 match crate::skill::calibrate_file(&a.cmf, 0.05) {
-                    Ok(Some(c)) => journal(&a.ood_dir, "router_calibrated", serde_json::json!({"temperature": c.temperature, "novelty_theta": c.novelty_theta, "samples": c.samples})),
-                    Ok(None) => journal(&a.ood_dir, "router_calibration_skipped", serde_json::json!({"reason": "no held-out φ"})),
-                    Err(e) => journal(&a.ood_dir, "router_calibration_error", serde_json::json!({"error": e.to_string()})),
+                    Ok(Some(c)) => journal(
+                        &a.ood_dir,
+                        "router_calibrated",
+                        serde_json::json!({"temperature": c.temperature, "novelty_theta": c.novelty_theta, "samples": c.samples}),
+                    ),
+                    Ok(None) => journal(
+                        &a.ood_dir,
+                        "router_calibration_skipped",
+                        serde_json::json!({"reason": "no held-out φ"}),
+                    ),
+                    Err(e) => journal(
+                        &a.ood_dir,
+                        "router_calibration_error",
+                        serde_json::json!({"error": e.to_string()}),
+                    ),
                 }
             }
         }
         // archive the consumed buffer (append-only history)
         let arch = a.ood_dir.join("archive");
         let _ = std::fs::create_dir_all(&arch);
-        let _ = std::fs::rename(a.ood_dir.join("buffer.jsonl"), arch.join(format!("buffer-{}.jsonl", now())));
+        let _ = std::fs::rename(
+            a.ood_dir.join("buffer.jsonl"),
+            arch.join(format!("buffer-{}.jsonl", now())),
+        );
         // ---- optional requant under a ppl gate ----
         if a.requant_gate > 0.0 {
             if let Some(held) = &a.held_out {
                 match requant_gate(&a.cortiq_bin, &a.cmf, held, a.requant_gate) {
-                    Ok(Some((p0, p1, out))) => journal(&a.ood_dir, "requant_committed", serde_json::json!({"ppl_f32": p0, "ppl_q4tp": p1, "out": out})),
-                    Ok(None) => journal(&a.ood_dir, "requant_rejected", serde_json::json!({"gate": a.requant_gate})),
-                    Err(e) => journal(&a.ood_dir, "requant_error", serde_json::json!({"error": e.to_string()})),
+                    Ok(Some((p0, p1, out))) => journal(
+                        &a.ood_dir,
+                        "requant_committed",
+                        serde_json::json!({"ppl_f32": p0, "ppl_q4tp": p1, "out": out}),
+                    ),
+                    Ok(None) => journal(
+                        &a.ood_dir,
+                        "requant_rejected",
+                        serde_json::json!({"gate": a.requant_gate}),
+                    ),
+                    Err(e) => journal(
+                        &a.ood_dir,
+                        "requant_error",
+                        serde_json::json!({"error": e.to_string()}),
+                    ),
                 }
             }
         }
@@ -227,20 +312,38 @@ pub fn run(a: SleepArgs) -> anyhow::Result<()> {
         if a.grow_after > 0 {
             let rejected = consecutive_rejections(&a.ood_dir);
             if rejected >= a.grow_after {
-                journal(&a.ood_dir, "growth_start", serde_json::json!({"rejected_in_a_row": rejected}));
+                journal(
+                    &a.ood_dir,
+                    "growth_start",
+                    serde_json::json!({"rejected_in_a_row": rejected}),
+                );
                 match try_growth(&a, &ck, &bpe, eot, &should_stop) {
                     Ok(Some((l0, l1))) => {
-                        journal(&a.ood_dir, "growth_committed", serde_json::json!({"held_out_before": l0, "held_out_after": l1}));
+                        journal(
+                            &a.ood_dir,
+                            "growth_committed",
+                            serde_json::json!({"held_out_before": l0, "held_out_after": l1}),
+                        );
                         // the daemon's genome changed: reload it
                         return run(a);
                     }
                     Ok(None) => journal(&a.ood_dir, "growth_rejected", serde_json::json!({})),
-                    Err(e) if e.to_string().contains("preempted") => journal(&a.ood_dir, "growth_preempted", serde_json::json!({})),
-                    Err(e) => journal(&a.ood_dir, "growth_error", serde_json::json!({"error": e.to_string()})),
+                    Err(e) if e.to_string().contains("preempted") => {
+                        journal(&a.ood_dir, "growth_preempted", serde_json::json!({}))
+                    }
+                    Err(e) => journal(
+                        &a.ood_dir,
+                        "growth_error",
+                        serde_json::json!({"error": e.to_string()}),
+                    ),
                 }
             }
         }
-        journal(&a.ood_dir, "night_end", serde_json::json!({"skill": id, "seconds": t0.elapsed().as_secs_f64()}));
+        journal(
+            &a.ood_dir,
+            "night_end",
+            serde_json::json!({"skill": id, "seconds": t0.elapsed().as_secs_f64()}),
+        );
         if a.once {
             return Ok(());
         }
@@ -250,10 +353,14 @@ pub fn run(a: SleepArgs) -> anyhow::Result<()> {
 /// Consecutive `skill_rejected` nights at the tail of the journal (a
 /// commit or a growth event resets the count).
 fn consecutive_rejections(dir: &Path) -> usize {
-    let Ok(s) = std::fs::read_to_string(dir.join("journal.jsonl")) else { return 0 };
+    let Ok(s) = std::fs::read_to_string(dir.join("journal.jsonl")) else {
+        return 0;
+    };
     let mut n = 0usize;
     for line in s.lines().rev() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
         match v["event"].as_str() {
             Some("skill_rejected") => n += 1,
             Some("skill_committed") | Some("growth_committed") | Some("growth_rejected") => break,
@@ -267,7 +374,13 @@ fn consecutive_rejections(dir: &Path) -> usize {
 /// the new ones; gate; on success write `<ckpt>` (backup kept as
 /// `<ckpt>.gen<N>`), export the grown genome and re-append the served
 /// file's skills onto it. Returns Some((before, after)) when committed.
-fn try_growth(a: &SleepArgs, ck: &Checkpoint, bpe: &Bpe, eot: u16, should_stop: &dyn Fn() -> bool) -> anyhow::Result<Option<(f32, f32)>> {
+fn try_growth(
+    a: &SleepArgs,
+    ck: &Checkpoint,
+    bpe: &Bpe,
+    eot: u16,
+    should_stop: &dyn Fn() -> bool,
+) -> anyhow::Result<Option<(f32, f32)>> {
     use crate::growth::{GrowArgs, grow_experts, train_new_experts};
     let arch = a.ood_dir.join("archive");
     let mut texts = Vec::new();
@@ -299,19 +412,45 @@ fn try_growth(a: &SleepArgs, ck: &Checkpoint, bpe: &Bpe, eot: u16, should_stop: 
     }
     let corpus = Shard { tokens };
     let (grown, sources) = grow_experts(ck, 1e-3, 0.1, now());
-    let ga = GrowArgs { steps: a.steps_a + a.steps_b, lr: 3e-4, batch: a.batch, seq: a.seq, eval_every: 30, seed: now() };
+    let ga = GrowArgs {
+        steps: a.steps_a + a.steps_b,
+        lr: 3e-4,
+        batch: a.batch,
+        seq: a.seq,
+        eval_every: 30,
+        seed: now(),
+    };
     let (trained, l0, l1) = train_new_experts(&grown, &corpus, &ga, should_stop)?;
     let imp = (l0 - l1) / l0.max(1e-6);
-    journal(&a.ood_dir, "growth_trained", serde_json::json!({"experts": grown.cfg.experts, "sources": sources, "held_out_before": l0, "held_out_after": l1, "improvement": imp}));
+    journal(
+        &a.ood_dir,
+        "growth_trained",
+        serde_json::json!({"experts": grown.cfg.experts, "sources": sources, "held_out_before": l0, "held_out_after": l1, "improvement": imp}),
+    );
     if imp < a.gate {
         return Ok(None);
     }
     // commit: checkpoint (old kept as a generation backup) + served file
-    let generation = std::fs::read_dir(a.ckpt.parent().unwrap_or(Path::new(".")))?.flatten().filter(|e| e.file_name().to_string_lossy().contains(".gen")).count();
+    let generation = std::fs::read_dir(a.ckpt.parent().unwrap_or(Path::new(".")))?
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().contains(".gen"))
+        .count();
     let backup = a.ckpt.with_extension(format!("ckpt.gen{generation}"));
     std::fs::copy(&a.ckpt, &backup)?;
-    let d: Vec<(&str, &[f32])> = trained.extras.iter().map(|(n, x)| (n.as_str(), x.as_slice())).collect();
-    crate::train::save_checkpoint(&a.ckpt, &trained.cfg, trained.step, &trained.params, None, None, &d)?;
+    let d: Vec<(&str, &[f32])> = trained
+        .extras
+        .iter()
+        .map(|(n, x)| (n.as_str(), x.as_slice()))
+        .collect();
+    crate::train::save_checkpoint(
+        &a.ckpt,
+        &trained.cfg,
+        trained.step,
+        &trained.params,
+        None,
+        None,
+        &d,
+    )?;
     let tj = std::fs::read(&a.tokenizer)?;
     let next = a.cmf.with_extension("cmf.grown");
     crate::export::export(&trained, &tj, &next)?;
@@ -325,13 +464,26 @@ fn try_growth(a: &SleepArgs, ck: &Checkpoint, bpe: &Bpe, eot: u16, should_stop: 
             .filter(|t| t.name.starts_with(&format!("skill.{}.", sk.id)))
             .map(|t| {
                 let bytes = old.tensor_bytes(&t.name).unwrap_or(&[]);
-                let data: Vec<f32> = bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                let data: Vec<f32> = bytes
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
                 (t.name.clone(), t.shape.clone(), data)
             })
             .collect();
-        let Some(sel) = sk.selection.clone() else { continue };
+        let Some(sel) = sk.selection.clone() else {
+            continue;
+        };
         let tmp = a.cmf.with_extension("cmf.grown2");
-        append_to_cmf(&cur, &tmp, &sk.id, &sk.layers, &tensors, sel, sk.quality.clone().unwrap_or(serde_json::json!({})))?;
+        append_to_cmf(
+            &cur,
+            &tmp,
+            &sk.id,
+            &sk.layers,
+            &tensors,
+            sel,
+            sk.quality.clone().unwrap_or(serde_json::json!({})),
+        )?;
         std::fs::rename(&tmp, &next)?;
         cur = next.clone();
     }
@@ -343,16 +495,44 @@ fn try_growth(a: &SleepArgs, ck: &Checkpoint, bpe: &Bpe, eot: u16, should_stop: 
 
 /// q4tp requant of `cmf` next to it (`<stem>-q4tp.cmf`), kept only if
 /// ppl(q4tp)/ppl(f32) − 1 ≤ gate on the held-out text. Uses our CLI.
-fn requant_gate(bin: &str, cmf: &Path, held: &Path, gate: f32) -> anyhow::Result<Option<(f64, f64, String)>> {
-    let out = cmf.with_file_name(format!("{}-q4tp.cmf", cmf.file_stem().and_then(|s| s.to_str()).unwrap_or("model")));
+fn requant_gate(
+    bin: &str,
+    cmf: &Path,
+    held: &Path,
+    gate: f32,
+) -> anyhow::Result<Option<(f64, f64, String)>> {
+    let out = cmf.with_file_name(format!(
+        "{}-q4tp.cmf",
+        cmf.file_stem().and_then(|s| s.to_str()).unwrap_or("model")
+    ));
     let tmp = out.with_extension("cmf.tmp");
-    let st = std::process::Command::new(bin).args(["requant", "--quant", "q4tp-quantize", "--output"]).arg(&tmp).arg(cmf).output()?;
-    anyhow::ensure!(st.status.success(), "requant failed: {}", String::from_utf8_lossy(&st.stderr));
+    let st = std::process::Command::new(bin)
+        .args(["requant", "--quant", "q4tp-quantize", "--output"])
+        .arg(&tmp)
+        .arg(cmf)
+        .output()?;
+    anyhow::ensure!(
+        st.status.success(),
+        "requant failed: {}",
+        String::from_utf8_lossy(&st.stderr)
+    );
     let ppl = |m: &Path| -> anyhow::Result<f64> {
-        let o = std::process::Command::new(bin).env("CMF_GPU", "0").args(["ppl", "--windows", "8", "--window-len", "512", "--file"]).arg(held).arg(m).output()?;
+        let o = std::process::Command::new(bin)
+            .env("CMF_GPU", "0")
+            .args(["ppl", "--windows", "8", "--window-len", "512", "--file"])
+            .arg(held)
+            .arg(m)
+            .output()?;
         let s = String::from_utf8_lossy(&o.stdout);
-        let line = s.lines().find(|l| l.starts_with("PPL =")).ok_or_else(|| anyhow::anyhow!("no PPL line: {s}"))?;
-        Ok(line.split_whitespace().nth(2).and_then(|v| v.parse().ok()).unwrap_or(f64::NAN))
+        let line = s
+            .lines()
+            .find(|l| l.starts_with("PPL ="))
+            .ok_or_else(|| anyhow::anyhow!("no PPL line: {s}"))?;
+        Ok(line
+            .split_whitespace()
+            .nth(2)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(f64::NAN))
     };
     let p0 = ppl(cmf)?;
     let p1 = ppl(&tmp)?;

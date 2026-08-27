@@ -1080,7 +1080,9 @@ pub(crate) mod prof {
             // described one token instead of the run.
             if TOKENS.fetch_add(1, Ordering::Relaxed) == 1 && !ZEROED.swap(true, Ordering::Relaxed)
             {
-                for a in [&ATTN_NS, &MOE_NS, &HC_NS, &HEAD_NS, &ALL_NS, &CALLS, &PREP_NS, &CACHEW_NS] {
+                for a in [
+                    &ATTN_NS, &MOE_NS, &HC_NS, &HEAD_NS, &ALL_NS, &CALLS, &PREP_NS, &CACHEW_NS,
+                ] {
                     a.store(0, Ordering::Relaxed);
                 }
                 TOKENS.store(1, Ordering::Relaxed);
@@ -1749,12 +1751,7 @@ fn route_stats_on() -> bool {
     *ON.get_or_init(|| std::env::var("CMF_MOE_STATS").is_ok())
 }
 
-fn record_route(
-    li: usize,
-    n_layers_hint: usize,
-    n_experts: usize,
-    routed: &[(usize, f32)],
-) {
+fn record_route(li: usize, n_layers_hint: usize, n_experts: usize, routed: &[(usize, f32)]) {
     ROUTE_COUNTS.with(|c| {
         let mut c = c.borrow_mut();
         if c.len() <= li.max(n_layers_hint) {
@@ -2384,6 +2381,10 @@ fn dsv4_layer_loop(
                 forced: forced.as_deref(),
                 remap: pk.needs_remap().then_some(pk.remap.as_slice()),
                 global: None,
+                has_shared: true,
+                shared_weight: 1.0,
+                preweighted: false,
+                qwen_softmax: false,
             },
             hc_ffn_fn: &l.hc_ffn_fn,
             hc_ffn_scale: &l.hc_ffn_scale,
@@ -2877,6 +2878,10 @@ fn dsv4_chain1_layer(
                 shared_slot: gl.shared_slot,
                 segment_slots: gl.pool.segment_slots as u32,
             }),
+            has_shared: true,
+            shared_weight: 1.0,
+            preweighted: false,
+            qwen_softmax: false,
         },
         hc_ffn_fn: &l.hc_ffn_fn,
         hc_ffn_scale: &l.hc_ffn_scale,
@@ -2949,14 +2954,8 @@ fn dsv4_chain1_layer(
     // fence. A prediction disagreement therefore remains impossible here.
     if let Some(gl) = pk.global.as_ref() {
         let picks: Vec<usize> = routed.iter().map(|&(gi, _)| gi).collect();
-        gl.pool.ensure_picks(
-            &model,
-            gl.layer,
-            &picks,
-            &l.experts,
-            cfg.top_k,
-            1,
-        );
+        gl.pool
+            .ensure_picks(&model, gl.layer, &picks, &l.experts, cfg.top_k, 1);
     }
     if cold.is_empty() {
         // Every winner was resident: the state stays on the card and the
@@ -2972,13 +2971,17 @@ fn dsv4_chain1_layer(
     }
     let mut cold_sum = vec![0.0f32; dim];
     {
-        let results: Vec<std::sync::Mutex<Vec<f32>>> =
-            cold.iter().map(|_| std::sync::Mutex::new(Vec::new())).collect();
+        let results: Vec<std::sync::Mutex<Vec<f32>>> = cold
+            .iter()
+            .map(|_| std::sync::Mutex::new(Vec::new()))
+            .collect();
         let (cold_ref, results_ref, x_ref) = (&cold, &results, &cold_x[..dim]);
         std::thread::scope(|sc| {
             for i in 0..cold_ref.len() {
                 let (gi, wt) = cold_ref[i];
-                let Some(exp) = l.experts.get(gi) else { continue };
+                let Some(exp) = l.experts.get(gi) else {
+                    continue;
+                };
                 let r = &results_ref[i];
                 sc.spawn(move || {
                     let mut a = vec![0.0f32; cfg.dim];
@@ -3011,14 +3014,28 @@ fn dsv4_chain1_layer(
                 .filter(|&sl| dynv.last[sl] != clock)
                 .min_by_key(|&sl| dynv.last[sl]);
             let Some(victim) = victim else { break };
-            let Some(exp) = l.experts.get(gi) else { continue };
-            let t3 = (|| Some((exp.w1.model_idx()?, exp.w3.model_idx()?, exp.w2.model_idx()?)))();
+            let Some(exp) = l.experts.get(gi) else {
+                continue;
+            };
+            let t3 = (|| {
+                Some((
+                    exp.w1.model_idx()?,
+                    exp.w3.model_idx()?,
+                    exp.w2.model_idx()?,
+                ))
+            })();
             let Some(t3) = t3 else { continue };
-            let gu_q2 =
-                exp.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP);
+            let gu_q2 = exp.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP);
             let pack_first = pk.tensors.first().map(|t| t.0).unwrap_or(usize::MAX);
             if !crate::gpu_wgpu::dsv4_slot_fill(
-                &model, pack_first, victim, gi, t3, cfg.moe_inter, cfg.dim, gu_q2,
+                &model,
+                pack_first,
+                victim,
+                gi,
+                t3,
+                cfg.moe_inter,
+                cfg.dim,
+                gu_q2,
             ) {
                 break;
             }
@@ -3351,6 +3368,10 @@ fn dsv4_chain_run(
                 forced: forceds[i].as_deref(),
                 remap: packs[i].needs_remap().then_some(packs[i].remap.as_slice()),
                 global: None,
+                has_shared: true,
+                shared_weight: 1.0,
+                preweighted: false,
+                qwen_softmax: false,
             },
             hc_ffn_fn: &l.hc_ffn_fn,
             hc_ffn_scale: &l.hc_ffn_scale,
@@ -3936,12 +3957,13 @@ impl GlobalPool {
                 break;
             }
             let key = (layer, expert);
-            if st.slot_for.contains_key(&key)
-                || st.seen.get(&key).copied().unwrap_or(0) < min_seen
+            if st.slot_for.contains_key(&key) || st.seen.get(&key).copied().unwrap_or(0) < min_seen
             {
                 continue;
             }
-            let Some(exp) = experts.get(expert) else { continue };
+            let Some(exp) = experts.get(expert) else {
+                continue;
+            };
             let Some(tensors) = (|| {
                 Some((
                     exp.w1.model_idx()?,
@@ -3957,34 +3979,41 @@ impl GlobalPool {
             let over_floor = |o: GlobalOwner, occ: &std::collections::HashMap<usize, usize>| {
                 occ.get(&o.layer).copied().unwrap_or(0) > self.floor
             };
-            let eligible = |o: GlobalOwner| {
-                !o.pinned && !(o.layer == layer && picks.contains(&o.expert))
-            };
-            let victim = empty.or_else(|| {
-                st.owner
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(slot, &o)| o.filter(|&x| eligible(x) && over_floor(x, &st.occupancy)).map(|_| slot))
-                    .min_by_key(|&slot| st.last[slot])
-            }).or_else(|| {
-                // If every layer sits exactly at its floor, replace within
-                // the requesting layer. This is per-layer LRU behaviour and
-                // cannot trigger the cyclic global scan collapse.
-                st.owner
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(slot, &o)| o.filter(|&x| eligible(x) && x.layer == layer).map(|_| slot))
-                    .min_by_key(|&slot| st.last[slot])
-            }).or_else(|| {
-                // A new/MTP layer has no protected share yet. Let it borrow
-                // the globally oldest unpinned line; trunk floors are a
-                // locality guarantee, not a permanent admission ban.
-                st.owner
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(slot, &o)| o.filter(|&x| eligible(x)).map(|_| slot))
-                    .min_by_key(|&slot| st.last[slot])
-            });
+            let eligible =
+                |o: GlobalOwner| !o.pinned && !(o.layer == layer && picks.contains(&o.expert));
+            let victim = empty
+                .or_else(|| {
+                    st.owner
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(slot, &o)| {
+                            o.filter(|&x| eligible(x) && over_floor(x, &st.occupancy))
+                                .map(|_| slot)
+                        })
+                        .min_by_key(|&slot| st.last[slot])
+                })
+                .or_else(|| {
+                    // If every layer sits exactly at its floor, replace within
+                    // the requesting layer. This is per-layer LRU behaviour and
+                    // cannot trigger the cyclic global scan collapse.
+                    st.owner
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(slot, &o)| {
+                            o.filter(|&x| eligible(x) && x.layer == layer).map(|_| slot)
+                        })
+                        .min_by_key(|&slot| st.last[slot])
+                })
+                .or_else(|| {
+                    // A new/MTP layer has no protected share yet. Let it borrow
+                    // the globally oldest unpinned line; trunk floors are a
+                    // locality guarantee, not a permanent admission ban.
+                    st.owner
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(slot, &o)| o.filter(|&x| eligible(x)).map(|_| slot))
+                        .min_by_key(|&slot| st.last[slot])
+                });
             let Some(victim) = victim else { break };
             if !crate::gpu_wgpu::dsv4_global_slot_fill(model, victim, tensors) {
                 break;
@@ -4179,8 +4208,7 @@ fn global_pool_for(
 ) -> Option<std::sync::Arc<GlobalPool>> {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, OnceLock};
-    if gu_q2
-        || dn_q2
+    if dn_q2
         || !crate::gpu_wgpu::dsv4_global_moe_supported()
         || std::env::var("CMF_MOE_MASK").is_ok()
     {
@@ -4191,9 +4219,9 @@ fn global_pool_for(
     if let Some(p) = pools.lock().unwrap().get(&model.uid()).cloned() {
         return Some(p);
     }
-    let requested = crate::gpu_wgpu::dsv4_experts_fit(cfg.moe_inter, cfg.dim, false, false);
+    let requested = crate::gpu_wgpu::dsv4_experts_fit(cfg.moe_inter, cfg.dim, gu_q2, false);
     let (capacity, segment_slots) =
-        crate::gpu_wgpu::dsv4_global_moe_create(model, requested, cfg.moe_inter, cfg.dim)?;
+        crate::gpu_wgpu::dsv4_global_moe_create(model, requested, cfg.moe_inter, cfg.dim, gu_q2)?;
     let layers = model.header.arch.num_layers.max(1);
     let p = Arc::new(GlobalPool {
         uid: model.uid(),
@@ -4303,7 +4331,13 @@ fn pack_for(l: &Dsv4Layer, cfg: &Dsv4Cfg, li: usize) -> Option<std::sync::Arc<Pa
                     let remap = gp.remap(layer_key, cfg.n_routed_experts);
                     let to_slot: Vec<usize> = remap
                         .iter()
-                        .map(|&s| if s == u32::MAX { usize::MAX } else { s as usize })
+                        .map(|&s| {
+                            if s == u32::MAX {
+                                usize::MAX
+                            } else {
+                                s as usize
+                            }
+                        })
                         .collect();
                     let globals: Vec<usize> = remap
                         .iter()
@@ -4638,17 +4672,13 @@ fn moe_frame(
     }
     let global_remap = pk.global.as_ref().map(|gl| {
         gl.pool.ensure_picks(
-            &model,
-            gl.layer,
-            &pidx,
-            &l.experts,
+            &model, gl.layer, &pidx, &l.experts,
             // A global demand cache has empty lines during warmup and each
             // CPU cold completion costs far more than one expert upload.
             // Materialise every predicted winner immediately, FreeToken
             // style; device routing still returns any prediction drift as an
             // exact cold pick.
-            cfg.top_k,
-            1,
+            cfg.top_k, 1,
         )
     });
     if subset && fetch_quota() > 0 && !pidx.is_empty() && !dynv.owner.is_empty() {
@@ -4682,7 +4712,9 @@ fn moe_frame(
                 .filter(|&sl| dynv.last[sl] != clock)
                 .min_by_key(|&sl| dynv.last[sl]);
             let Some(victim) = victim else { break };
-            let Some(exp) = l.experts.get(pick) else { continue };
+            let Some(exp) = l.experts.get(pick) else {
+                continue;
+            };
             let t3 = (|| {
                 Some((
                     exp.w1.model_idx()?,
@@ -4691,8 +4723,7 @@ fn moe_frame(
                 ))
             })();
             let Some(t3) = t3 else { continue };
-            let gu_q2 =
-                exp.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP);
+            let gu_q2 = exp.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP);
             let pack_first = pk.tensors.first().map(|t| t.0).unwrap_or(usize::MAX);
             if !crate::gpu_wgpu::dsv4_slot_fill(
                 &model,
@@ -4756,6 +4787,10 @@ fn moe_frame(
             shared_slot: gl.shared_slot,
             segment_slots: gl.pool.segment_slots as u32,
         }),
+        has_shared: true,
+        shared_weight: 1.0,
+        preweighted: false,
+        qwen_softmax: false,
     };
     let g = crate::gpu_wgpu::Dsv4MoeGeom {
         hidden: cfg.dim,
@@ -4865,7 +4900,9 @@ fn moe_frame(
                 }
                 continue;
             }
-            let Some(exp) = l.experts.get(gi) else { continue };
+            let Some(exp) = l.experts.get(gi) else {
+                continue;
+            };
             crate::gpu::cpu_scope(|| run_expert(cold_input, exp, cfg, wt, pool, &mut acc));
             for ((o, sum), a) in out.iter_mut().zip(&mut cold_sum).zip(&acc) {
                 *o += a;
@@ -4876,13 +4913,17 @@ fn moe_frame(
     }
     match pool {
         Some(p) if cold.len() > 1 => {
-            let results: Vec<std::sync::Mutex<Vec<f32>>> =
-                cold.iter().map(|_| std::sync::Mutex::new(Vec::new())).collect();
+            let results: Vec<std::sync::Mutex<Vec<f32>>> = cold
+                .iter()
+                .map(|_| std::sync::Mutex::new(Vec::new()))
+                .collect();
             let (cold_ref, results_ref) = (&cold, &results);
             p.run_rows(cold.len(), &move |cs, ce| {
                 for i in cs..ce {
                     let (gi, wt) = cold_ref[i];
-                    let Some(exp) = l.experts.get(gi) else { continue };
+                    let Some(exp) = l.experts.get(gi) else {
+                        continue;
+                    };
                     let mut a = vec![0.0f32; cfg.dim];
                     crate::gpu::cpu_scope(|| run_expert(cold_input, exp, cfg, wt, None, &mut a));
                     *results_ref[i].lock().unwrap() = a;
@@ -5224,8 +5265,10 @@ pub fn moe_step(
         .collect();
     match pool {
         Some(p) if jobs.len() > 1 => {
-            let results: Vec<std::sync::Mutex<Vec<f32>>> =
-                jobs.iter().map(|_| std::sync::Mutex::new(Vec::new())).collect();
+            let results: Vec<std::sync::Mutex<Vec<f32>>> = jobs
+                .iter()
+                .map(|_| std::sync::Mutex::new(Vec::new()))
+                .collect();
             let (jobs_ref, results_ref) = (&jobs, &results);
             p.run_rows(jobs.len(), &move |cs, ce| {
                 for i in cs..ce {
@@ -5364,38 +5407,39 @@ fn moe_step_block(
     }
     // One expert's forward, single-threaded, returning the scaled down
     // projections in job order.
-    let expert_fwd = |ei: usize, jobs: &[(usize, usize, f32)], inner: Option<&crate::pool::Pool>| -> Vec<f32> {
-        let e = &l.experts[ei];
-        let n = jobs.len();
-        let mut xj = vec![0.0f32; n * dim];
-        for (j, &(bi, _, _)) in jobs.iter().enumerate() {
-            xj[j * dim..(j + 1) * dim].copy_from_slice(&xs[bi * dim..(bi + 1) * dim]);
-        }
-        let mut gate = vec![0.0f32; n * inter];
-        let mut up = vec![0.0f32; n * inter];
-        e.w1.matmat(&xj, n, &mut gate, inner);
-        e.w3.matmat(&xj, n, &mut up, inner);
-        for (j, &(_, _, wt)) in jobs.iter().enumerate() {
-            let (gj, uj) = (
-                &mut gate[j * inter..(j + 1) * inter],
-                &mut up[j * inter..(j + 1) * inter],
-            );
-            if cfg.swiglu_limit > 0.0 {
-                for u in uj.iter_mut() {
-                    *u = u.clamp(-cfg.swiglu_limit, cfg.swiglu_limit);
+    let expert_fwd =
+        |ei: usize, jobs: &[(usize, usize, f32)], inner: Option<&crate::pool::Pool>| -> Vec<f32> {
+            let e = &l.experts[ei];
+            let n = jobs.len();
+            let mut xj = vec![0.0f32; n * dim];
+            for (j, &(bi, _, _)) in jobs.iter().enumerate() {
+                xj[j * dim..(j + 1) * dim].copy_from_slice(&xs[bi * dim..(bi + 1) * dim]);
+            }
+            let mut gate = vec![0.0f32; n * inter];
+            let mut up = vec![0.0f32; n * inter];
+            e.w1.matmat(&xj, n, &mut gate, inner);
+            e.w3.matmat(&xj, n, &mut up, inner);
+            for (j, &(_, _, wt)) in jobs.iter().enumerate() {
+                let (gj, uj) = (
+                    &mut gate[j * inter..(j + 1) * inter],
+                    &mut up[j * inter..(j + 1) * inter],
+                );
+                if cfg.swiglu_limit > 0.0 {
+                    for u in uj.iter_mut() {
+                        *u = u.clamp(-cfg.swiglu_limit, cfg.swiglu_limit);
+                    }
+                    for g in gj.iter_mut() {
+                        *g = g.min(cfg.swiglu_limit);
+                    }
                 }
-                for g in gj.iter_mut() {
-                    *g = g.min(cfg.swiglu_limit);
+                for (g, &u) in gj.iter_mut().zip(uj.iter()) {
+                    *g = (*g / (1.0 + (-*g).exp())) * u * wt;
                 }
             }
-            for (g, &u) in gj.iter_mut().zip(uj.iter()) {
-                *g = (*g / (1.0 + (-*g).exp())) * u * wt;
-            }
-        }
-        let mut down = vec![0.0f32; n * dim];
-        e.w2.matmat(&gate, n, &mut down, inner);
-        down
-    };
+            let mut down = vec![0.0f32; n * dim];
+            e.w2.matmat(&gate, n, &mut down, inner);
+            down
+        };
     // ~370 non-resident experts a token used to run this loop ONE AFTER
     // ANOTHER: a 2048-row matvec cannot occupy a big pool, and the loop
     // serialised the only real parallelism there is — across experts.
@@ -5407,8 +5451,10 @@ fn moe_step_block(
     // documented trap).
     match pool {
         Some(p) if active.len() > 1 => {
-            let results: Vec<std::sync::Mutex<Vec<f32>>> =
-                active.iter().map(|_| std::sync::Mutex::new(Vec::new())).collect();
+            let results: Vec<std::sync::Mutex<Vec<f32>>> = active
+                .iter()
+                .map(|_| std::sync::Mutex::new(Vec::new()))
+                .collect();
             let active_ref = &active;
             let results_ref = &results;
             let fwd = &expert_fwd;
@@ -5518,26 +5564,23 @@ fn cold_step_block(
                     .map(move |(slot, &(ei, wt))| (bi, slot, ei, wt))
             })
             .collect();
-        let results: Vec<std::sync::Mutex<Vec<f32>>> =
-            jobs.iter().map(|_| std::sync::Mutex::new(Vec::new())).collect();
+        let results: Vec<std::sync::Mutex<Vec<f32>>> = jobs
+            .iter()
+            .map(|_| std::sync::Mutex::new(Vec::new()))
+            .collect();
         match pool {
             Some(p) if jobs.len() > 1 => {
                 let (jobs_ref, results_ref) = (&jobs, &results);
                 p.run_rows(jobs.len(), &move |s, e| {
                     for i in s..e {
                         let (_, _, ei, wt) = jobs_ref[i];
-                        let Some(exp) = l.experts.get(ei) else { continue };
+                        let Some(exp) = l.experts.get(ei) else {
+                            continue;
+                        };
                         let bi = jobs_ref[i].0;
                         let mut a = vec![0.0f32; dim];
                         crate::gpu::cpu_scope(|| {
-                            run_expert(
-                                &xs[bi * dim..(bi + 1) * dim],
-                                exp,
-                                cfg,
-                                wt,
-                                None,
-                                &mut a,
-                            )
+                            run_expert(&xs[bi * dim..(bi + 1) * dim], exp, cfg, wt, None, &mut a)
                         });
                         *results_ref[i].lock().unwrap() = a;
                     }
@@ -5545,17 +5588,12 @@ fn cold_step_block(
             }
             _ => {
                 for (i, &(bi, _, ei, wt)) in jobs.iter().enumerate() {
-                    let Some(exp) = l.experts.get(ei) else { continue };
+                    let Some(exp) = l.experts.get(ei) else {
+                        continue;
+                    };
                     let mut a = vec![0.0f32; dim];
                     crate::gpu::cpu_scope(|| {
-                        run_expert(
-                            &xs[bi * dim..(bi + 1) * dim],
-                            exp,
-                            cfg,
-                            wt,
-                            pool,
-                            &mut a,
-                        )
+                        run_expert(&xs[bi * dim..(bi + 1) * dim], exp, cfg, wt, pool, &mut a)
                     });
                     *results[i].lock().unwrap() = a;
                 }
@@ -5585,46 +5623,46 @@ fn cold_step_block(
             active.push((ei, jobs));
         }
     }
-    let expert_fwd = |ei: usize,
-                      jobs: &[(usize, usize, f32)],
-                      inner: Option<&crate::pool::Pool>|
-     -> Vec<f32> {
-        let e = &l.experts[ei];
-        let n = jobs.len();
-        let mut xj = vec![0.0f32; n * dim];
-        for (j, &(bi, _, _)) in jobs.iter().enumerate() {
-            xj[j * dim..(j + 1) * dim].copy_from_slice(&xs[bi * dim..(bi + 1) * dim]);
-        }
-        let mut gate = vec![0.0f32; n * inter];
-        let mut up = vec![0.0f32; n * inter];
-        e.w1.matmat(&xj, n, &mut gate, inner);
-        e.w3.matmat(&xj, n, &mut up, inner);
-        for (j, &(_, _, wt)) in jobs.iter().enumerate() {
-            let (gj, uj) = (
-                &mut gate[j * inter..(j + 1) * inter],
-                &mut up[j * inter..(j + 1) * inter],
-            );
-            if cfg.swiglu_limit > 0.0 {
-                for u in uj.iter_mut() {
-                    *u = u.clamp(-cfg.swiglu_limit, cfg.swiglu_limit);
+    let expert_fwd =
+        |ei: usize, jobs: &[(usize, usize, f32)], inner: Option<&crate::pool::Pool>| -> Vec<f32> {
+            let e = &l.experts[ei];
+            let n = jobs.len();
+            let mut xj = vec![0.0f32; n * dim];
+            for (j, &(bi, _, _)) in jobs.iter().enumerate() {
+                xj[j * dim..(j + 1) * dim].copy_from_slice(&xs[bi * dim..(bi + 1) * dim]);
+            }
+            let mut gate = vec![0.0f32; n * inter];
+            let mut up = vec![0.0f32; n * inter];
+            e.w1.matmat(&xj, n, &mut gate, inner);
+            e.w3.matmat(&xj, n, &mut up, inner);
+            for (j, &(_, _, wt)) in jobs.iter().enumerate() {
+                let (gj, uj) = (
+                    &mut gate[j * inter..(j + 1) * inter],
+                    &mut up[j * inter..(j + 1) * inter],
+                );
+                if cfg.swiglu_limit > 0.0 {
+                    for u in uj.iter_mut() {
+                        *u = u.clamp(-cfg.swiglu_limit, cfg.swiglu_limit);
+                    }
+                    for g in gj.iter_mut() {
+                        *g = g.min(cfg.swiglu_limit);
+                    }
                 }
-                for g in gj.iter_mut() {
-                    *g = g.min(cfg.swiglu_limit);
+                for (g, &u) in gj.iter_mut().zip(uj.iter()) {
+                    *g = (*g / (1.0 + (-*g).exp())) * u * wt;
                 }
             }
-            for (g, &u) in gj.iter_mut().zip(uj.iter()) {
-                *g = (*g / (1.0 + (-*g).exp())) * u * wt;
-            }
-        }
-        let mut down = vec![0.0f32; n * dim];
-        e.w2.matmat(&gate, n, &mut down, inner);
-        down
-    };
+            let mut down = vec![0.0f32; n * dim];
+            e.w2.matmat(&gate, n, &mut down, inner);
+            down
+        };
     let mut routed = vec![0.0f32; b * slots * dim];
     match pool {
         Some(p) if active.len() > 1 => {
-            let results: Vec<std::sync::Mutex<Vec<f32>>> =
-                active.iter().map(|_| std::sync::Mutex::new(Vec::new())).collect();
+            let results: Vec<std::sync::Mutex<Vec<f32>>> = active
+                .iter()
+                .map(|_| std::sync::Mutex::new(Vec::new()))
+                .collect();
             let active_ref = &active;
             let results_ref = &results;
             let fwd = &expert_fwd;
@@ -6025,8 +6063,7 @@ fn forward_chunk_batched(
             .iter()
             .enumerate()
             .position(|(li, &on)| {
-                !on || pack_for(&layers[li], cfg, li)
-                    .is_none_or(|p| !p.route_complete())
+                !on || pack_for(&layers[li], cfg, li).is_none_or(|p| !p.route_complete())
             })
             .unwrap_or(st.dev_set.len());
         let why = if b < 2 {
@@ -6038,9 +6075,9 @@ fn forward_chunk_batched(
         } else if st.dev_set.len() != layers.len() {
             "набор слоёв ещё не зафиксирован"
         } else if st.dev_set[gpu_end.min(st.dev_set.len())..]
-                .iter()
-                .enumerate()
-                .any(|(i, &on)| on && !st.partial_set.get(gpu_end + i).copied().unwrap_or(false))
+            .iter()
+            .enumerate()
+            .any(|(i, &on)| on && !st.partial_set.get(gpu_end + i).copied().unwrap_or(false))
         {
             "слои на карте не образуют префикс"
         } else {
@@ -6582,18 +6619,22 @@ fn partial_layer_batch(
             ))
         }
     };
-    let ew_c = comp.as_ref().map_or(0, |(_, cg)| {
-        if cg.overlap { cg.width / 2 } else { cg.width }
-    });
-    let ew_i = ix.as_ref().map_or(0, |(_, cg, _, _)| {
-        if cg.overlap { cg.width / 2 } else { cg.width }
-    });
+    let ew_c = comp.as_ref().map_or(
+        0,
+        |(_, cg)| {
+            if cg.overlap { cg.width / 2 } else { cg.width }
+        },
+    );
+    let ew_i = ix.as_ref().map_or(
+        0,
+        |(_, cg, _, _)| {
+            if cg.overlap { cg.width / 2 } else { cg.width }
+        },
+    );
     let comp_extra = comp
         .as_ref()
         .map_or(0, |(_, cg)| b.div_ceil(cg.ratio.max(1)));
-    let need = cfg.window * hd
-        + (st.dev_n_comp[li] + comp_extra + 1) * ew_c.max(1)
-        + (b + 1) * hd;
+    let need = cfg.window * hd + (st.dev_n_comp[li] + comp_extra + 1) * ew_c.max(1) + (b + 1) * hd;
     if !crate::gpu_wgpu::dsv4_cache_ensure(st.kv_id, li, need.next_power_of_two()) {
         return false;
     }
@@ -6686,6 +6727,10 @@ fn partial_layer_batch(
             forced: None,
             remap: Some(&dynv.remap),
             global: None,
+            has_shared: true,
+            shared_weight: 1.0,
+            preweighted: false,
+            qwen_softmax: false,
         },
         hc_ffn_fn: &l.hc_ffn_fn,
         hc_ffn_scale: &l.hc_ffn_scale,
@@ -6818,8 +6863,7 @@ pub fn dsv4_verify_chunk(
         .iter()
         .enumerate()
         .position(|(li, &on)| {
-            !on || pack_for(&layers[li], cfg, li)
-                .is_none_or(|p| !p.route_complete())
+            !on || pack_for(&layers[li], cfg, li).is_none_or(|p| !p.route_complete())
         })
         .unwrap_or(st.dev_set.len());
     fn partial_batch_on() -> bool {
@@ -6944,8 +6988,7 @@ pub fn dsv4_verify_chunk(
     // Diagnostic split: the fused prefix normally has one fence.  Splitting
     // only while fingerprinting tells us which complete layer first departs
     // from scalar decode; it must never become a user-facing tuning flag.
-    let fp_split = verify_fp_on(pos0)
-        && std::env::var("CMF_DSV4_FP_SPLIT").is_ok_and(|v| v != "0");
+    let fp_split = verify_fp_on(pos0) && std::env::var("CMF_DSV4_FP_SPLIT").is_ok_and(|v| v != "0");
     let mut ok = true;
     if fp_split {
         for li in 0..complete_end {
@@ -7088,14 +7131,15 @@ pub fn dsv4_verify_chunk(
     // a force-reject transaction, so it is diagnostic-only until parity is
     // proven; speculative execution must inherit the canonical head exactly.
     let batch_head = std::env::var("CMF_DSV4_SPEC_BATCH_HEAD").is_ok_and(|v| v != "0");
-    let head_gpu = batch_head && g.head.model_idx().is_some_and(|hi| {
-        let model = layers[0].experts.first().and_then(|e| e.w1.model_arc());
-        model.is_some_and(|m| {
-            crate::gpu_wgpu::q4tp_matvec_batch_for_test(
-                &m, hi, &head_in, b, cfg.vocab, dim, logits_out,
-            )
-        })
-    });
+    let head_gpu = batch_head
+        && g.head.model_idx().is_some_and(|hi| {
+            let model = layers[0].experts.first().and_then(|e| e.w1.model_arc());
+            model.is_some_and(|m| {
+                crate::gpu_wgpu::q4tp_matvec_batch_for_test(
+                    &m, hi, &head_in, b, cfg.vocab, dim, logits_out,
+                )
+            })
+        });
     for t in 0..b {
         if !head_gpu {
             let h = &head_in[t * dim..(t + 1) * dim];
@@ -7776,8 +7820,8 @@ pub fn load(
                 let mut v: Vec<_> = l.experts.iter().filter_map(idx3).collect();
                 let first = v.first()?.0;
                 v.push(idx3(&l.shared)?);
-                let gu_q2 = l.experts.first()?.w1.model_dtype()
-                    == Some(cortiq_core::TensorDtype::Q2TiledP);
+                let gu_q2 =
+                    l.experts.first()?.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP);
                 Some((first, v, gu_q2))
             })
             .collect();
@@ -7803,7 +7847,9 @@ pub fn load(
                 Err(_) => return false,
             };
             let li: usize = {
-                let Some(j) = name.find("layers.") else { return false };
+                let Some(j) = name.find("layers.") else {
+                    return false;
+                };
                 let r = &name[j + 7..];
                 match r[..r.find('.').unwrap_or(r.len())].parse() {
                     Ok(v) => v,
@@ -9478,12 +9524,15 @@ pub fn dspark_reserve_note(mtp: &[Dsv4Mtp], cfg: &Dsv4Cfg, layers: &[Dsv4Layer])
         // ceiling and the driver's physical allocation ceiling.  One GiB is
         // still only ~2% of an A40 and is cheaper than an OOM/restart.
         Some(b) if b <= 64 * 1024 * mib => 1024 * mib,
-        _ => ((cfg.dim * cfg.hc_mult * DSPARK_BLOCK_MAX * 4096) as u64)
-            .clamp(512 * mib, 1024 * mib),
+        _ => {
+            ((cfg.dim * cfg.hc_mult * DSPARK_BLOCK_MAX * 4096) as u64).clamp(512 * mib, 1024 * mib)
+        }
     };
     crate::gpu_wgpu::DRAFT_PACK_RESERVE.store(bytes, std::sync::atomic::Ordering::Relaxed);
-    crate::gpu_wgpu::DRAFT_RESERVE
-        .store(bytes.saturating_add(workspace), std::sync::atomic::Ordering::Relaxed);
+    crate::gpu_wgpu::DRAFT_RESERVE.store(
+        bytes.saturating_add(workspace),
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 #[cfg(not(feature = "gpu"))]
@@ -9514,28 +9563,25 @@ pub fn dspark_pack_build(mtp: &[Dsv4Mtp], cfg: &Dsv4Cfg) -> Option<DsparkPack> {
         && std::env::var("CMF_MOE_MASK").is_err()
         && crate::gpu_wgpu::dsv4_global_moe_supported()
         && crate::gpu_wgpu::dsv4_global_moe_ready(&model);
-    let n_res: usize =
-        std::env::var("CMF_DSPARK_RESIDENT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or_else(|| {
-                if global_share {
-                    // The measured acceptance plateau starts here. These
-                    // rows occupy existing arena slots rather than asking
-                    // the weight allocator for another multi-GiB pack.
-                    return 40;
-                }
-                // No knob: take what the card actually has left, whatever the
-                // card is. The stages split the fit evenly after their shared
-                // experts. Forty is the measured acceptance plateau: larger
-                // packs still make the router and upload more rows without a
-                // useful increase in accepted tokens (64 was slower on A40).
-                let gu_q2 =
-                    native_q2 || (!dspark_native_on() && DSPARK_Q2TP_ENCODE.get().is_some());
-                let room =
-                    crate::gpu_wgpu::dsv4_draft_fit(cfg.moe_inter, cfg.dim, gu_q2, dn_native);
-                (room.saturating_sub(mtp.len() + 1) / mtp.len().max(1)).clamp(8, 40)
-            });
+    let n_res: usize = std::env::var("CMF_DSPARK_RESIDENT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| {
+            if global_share {
+                // The measured acceptance plateau starts here. These
+                // rows occupy existing arena slots rather than asking
+                // the weight allocator for another multi-GiB pack.
+                return 40;
+            }
+            // No knob: take what the card actually has left, whatever the
+            // card is. The stages split the fit evenly after their shared
+            // experts. Forty is the measured acceptance plateau: larger
+            // packs still make the router and upload more rows without a
+            // useful increase in accepted tokens (64 was slower on A40).
+            let gu_q2 = native_q2 || (!dspark_native_on() && DSPARK_Q2TP_ENCODE.get().is_some());
+            let room = crate::gpu_wgpu::dsv4_draft_fit(cfg.moe_inter, cfg.dim, gu_q2, dn_native);
+            (room.saturating_sub(mtp.len() + 1) / mtp.len().max(1)).clamp(8, 40)
+        });
     // Frequency tallies: lines of `stage<TAB>expert<TAB>count`. Named by
     // `CMF_DSPARK_PACK`, or found as `<model>.dspark.tsv` beside the model
     // file — ship the tally next to the checkpoint and no knob is needed.
@@ -9676,8 +9722,7 @@ pub fn dspark_pack_build(mtp: &[Dsv4Mtp], cfg: &Dsv4Cfg) -> Option<DsparkPack> {
     // files published before the converter's q2tp profile covered the MTP
     // stack (and only when the binary registered an encoder).
     let gu_q2 = native_q2
-        || (!crate::dsv4::dspark_native_on()
-            && crate::dsv4::DSPARK_Q2TP_ENCODE.get().is_some());
+        || (!crate::dsv4::dspark_native_on() && crate::dsv4::DSPARK_Q2TP_ENCODE.get().is_some());
     for (si, sp) in stages.iter().enumerate() {
         let ok = if sp.global.is_some() {
             true

@@ -14,7 +14,9 @@ use cortiq_core::CmfModel;
 use std::sync::Arc;
 
 fn tensor_f32(model: &Arc<CmfModel>, name: &str) -> Result<(Vec<f32>, Vec<usize>), String> {
-    let e = model.tensor(name).ok_or_else(|| format!("missing tensor {name}"))?;
+    let e = model
+        .tensor(name)
+        .ok_or_else(|| format!("missing tensor {name}"))?;
     let mut out = vec![0.0f32; e.n_elems()];
     cortiq_core::quant::dequant_tensor(e, model.entry_bytes(e), &mut out)?;
     Ok((out, e.shape.clone()))
@@ -45,7 +47,15 @@ impl Conv {
             4 => (1, s[2], s[3]),
             _ => return Err(format!("{name}: rank {}", s.len())),
         };
-        Ok(Conv { w, b, c_out: s[0], c_in: s[1], kf, kh, kw })
+        Ok(Conv {
+            w,
+            b,
+            c_out: s[0],
+            c_in: s[1],
+            kf,
+            kh,
+            kw,
+        })
     }
 
     fn forward(&self, x: &Vol, pool: Option<&Pool>) -> Vol {
@@ -85,7 +95,8 @@ impl Conv {
                                 }
                                 let v = x.data
                                     [((ci * f + sf as usize) * h + sh as usize) * w + sw as usize];
-                                patches[i * k + ((ci * self.kf + a) * self.kh + bb) * self.kw + c] = v;
+                                patches
+                                    [i * k + ((ci * self.kf + a) * self.kh + bb) * self.kw + c] = v;
                             }
                         }
                     }
@@ -122,7 +133,11 @@ fn group_norm(x: &mut Vol, w: &[f32], b: &[f32]) {
         let s = &x.data[lo..hi];
         let n = s.len() as f64;
         let mean = s.iter().map(|&v| v as f64).sum::<f64>() / n;
-        let var = s.iter().map(|&v| (v as f64 - mean) * (v as f64 - mean)).sum::<f64>() / n;
+        let var = s
+            .iter()
+            .map(|&v| (v as f64 - mean) * (v as f64 - mean))
+            .sum::<f64>()
+            / n;
         let inv = 1.0 / (var + 1e-5).sqrt();
         for c in 0..per {
             let ch = g * per + c;

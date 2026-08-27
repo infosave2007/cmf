@@ -128,6 +128,11 @@ impl From<String> for MessageContent {
 #[derive(Deserialize)]
 struct CortiqExtension {
     task: Option<String>,
+    /// Cortiq classifier mode: score these single-token labels at the next
+    /// position and normalize only across them. This is the exact confidence
+    /// used by binary/multiclass skills; no sampled generation is involved.
+    #[serde(default)]
+    class_tokens: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -144,6 +149,23 @@ struct CortiqResponseMeta {
     active_layers: usize,
     execution_mode: String,
     tokens_per_second: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    classification: Option<ClassTokenClassification>,
+}
+
+#[derive(Serialize)]
+struct ClassTokenScore {
+    token: String,
+    token_id: u32,
+    logit: f32,
+    probability: f32,
+}
+
+#[derive(Serialize)]
+struct ClassTokenClassification {
+    label: String,
+    confidence: f32,
+    scores: Vec<ClassTokenScore>,
 }
 
 #[derive(Serialize)]
@@ -251,6 +273,60 @@ async fn run_generation(
             Err(error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "generation failed",
+            ))
+        }
+    }
+}
+
+/// One prefill, then an exact softmax restricted to caller-declared labels.
+/// A market skill can therefore return both UP/DOWN and a reproducible
+/// confidence coefficient without sampling or parsing free-form text.
+async fn run_classification(
+    state: Arc<AppState>,
+    prompt_ids: Vec<u32>,
+    mask: Option<TaskMask>,
+    labels: Vec<(String, u32)>,
+) -> Result<(ClassTokenClassification, f64), Response> {
+    if state.remote.is_some() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "class-token scoring is not available with --peer",
+        ));
+    }
+    let started = std::time::Instant::now();
+    let mut slot = state.slots.acquire().await;
+    let outcome = tokio::task::spawn_blocking(move || {
+        cortiq_engine::gpu::set_current_device(slot.device);
+        let logits = slot.pipe.prefill_next_logits(&prompt_ids, mask.as_ref());
+        let selected: Vec<f32> = labels.iter().map(|(_, id)| logits[*id as usize]).collect();
+        let max = selected.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let denom: f32 = selected.iter().map(|value| (*value - max).exp()).sum();
+        let mut scores: Vec<ClassTokenScore> = labels
+            .into_iter()
+            .zip(selected)
+            .map(|((token, token_id), logit)| ClassTokenScore {
+                token,
+                token_id,
+                logit,
+                probability: (logit - max).exp() / denom,
+            })
+            .collect();
+        scores.sort_by(|left, right| right.probability.total_cmp(&left.probability));
+        ClassTokenClassification {
+            label: scores[0].token.clone(),
+            confidence: scores[0].probability,
+            scores,
+        }
+    })
+    .await;
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    match outcome {
+        Ok(classification) => Ok((classification, elapsed_ms)),
+        Err(join_err) => {
+            tracing::error!("classification task panicked: {join_err}");
+            Err(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "classification failed",
             ))
         }
     }
@@ -473,6 +549,77 @@ async fn chat_completions(
     let request_id = format!("cmf-{}", uuid::Uuid::new_v4());
     let created = chrono::Utc::now().timestamp() as u64;
     let max_tokens = req.max_tokens as usize;
+
+    if let Some(class_tokens) = req
+        .cortiq
+        .as_ref()
+        .and_then(|extension| extension.class_tokens.clone())
+    {
+        if req.stream {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "cortiq.class_tokens does not support stream=true",
+            );
+        }
+        if !(2..=32).contains(&class_tokens.len()) {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "cortiq.class_tokens must contain 2..32 labels",
+            );
+        }
+        let mut labels = Vec::with_capacity(class_tokens.len());
+        for token in class_tokens {
+            let ids = state.tokenizer.encode(&token);
+            if ids.len() != 1 {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("class label {token:?} must encode to exactly one token, got {ids:?}"),
+                );
+            }
+            labels.push((token, ids[0]));
+        }
+        let prompt_tokens = prompt_ids.len() as u32;
+        let (classification, elapsed_ms) =
+            match run_classification(state.clone(), prompt_ids, request_mask, labels).await {
+                Ok(result) => result,
+                Err(response) => return response,
+            };
+        let status = state.runtime.status().await;
+        let task_mask = state.runtime.masks().get(&task_used);
+        return Json(ChatCompletionsResponse {
+            id: request_id,
+            object: "chat.completion".to_string(),
+            created,
+            model: req.model,
+            choices: vec![ChatChoice {
+                index: 0,
+                message: ChatMessage {
+                    role: "assistant".to_string(),
+                    content: Some(classification.label.clone().into()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                },
+                finish_reason: "stop".to_string(),
+            }],
+            usage: Usage {
+                prompt_tokens,
+                completion_tokens: 0,
+                total_tokens: prompt_tokens,
+            },
+            cortiq: Some(CortiqResponseMeta {
+                task_used,
+                sparsity: task_mask.map(|mask| mask.sparsity).unwrap_or(0.0),
+                active_layers: task_mask
+                    .map(|mask| mask.active_layer_count())
+                    .unwrap_or(state.runtime.model().arch().num_layers),
+                execution_mode: format!("{:?}", status.execution_mode),
+                tokens_per_second: prompt_tokens as f64 / (elapsed_ms / 1000.0).max(1e-9),
+                classification: Some(classification),
+            }),
+        })
+        .into_response();
+    }
 
     if req.stream {
         let tool_names: Vec<String> = req
@@ -705,6 +852,7 @@ async fn chat_completions(
                 .unwrap_or(state.runtime.model().arch().num_layers),
             execution_mode: format!("{:?}", status.execution_mode),
             tokens_per_second: result.tokens_generated as f64 / (elapsed_ms / 1000.0).max(1e-9),
+            classification: None,
         });
 
         let content = if req.thinking() == Some(false) {

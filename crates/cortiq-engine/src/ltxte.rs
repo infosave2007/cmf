@@ -157,7 +157,10 @@ impl LtxTextEncoder {
             Some(b) => serde_json::from_slice(b).map_err(|e| format!("gemma config: {e}"))?,
             None => serde_json::Value::Null,
         };
-        let tc = cfg.get("text_config").cloned().unwrap_or(serde_json::Value::Null);
+        let tc = cfg
+            .get("text_config")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         let g = |k: &str, d: f64| tc.get(k).and_then(|v| v.as_f64()).unwrap_or(d);
         let hidden = g("hidden_size", 3840.0) as usize;
         let n_layers = g("num_hidden_layers", 48.0) as usize;
@@ -166,12 +169,20 @@ impl LtxTextEncoder {
         let types: Vec<String> = tc
             .get("layer_types")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().map(|s| s.as_str().unwrap_or("sliding_attention").to_string()).collect())
+            .map(|a| {
+                a.iter()
+                    .map(|s| s.as_str().unwrap_or("sliding_attention").to_string())
+                    .collect()
+            })
             .unwrap_or_else(|| {
                 // the released layout: every sixth layer is a full-attention one
                 (0..n_layers)
                     .map(|i| {
-                        if i % 6 == 5 { "full_attention".into() } else { "sliding_attention".into() }
+                        if i % 6 == 5 {
+                            "full_attention".into()
+                        } else {
+                            "sliding_attention".into()
+                        }
                     })
                     .collect()
             });
@@ -217,38 +228,49 @@ impl LtxTextEncoder {
             });
         }
 
-        let conn = |prefix: &str, dim: usize, heads: usize, dh: usize| -> Result<Connector, String> {
-            let mut blocks = Vec::new();
-            let mut i = 0usize;
-            while model
-                .tensor(&format!("{prefix}.transformer_1d_blocks.{i}.attn1.to_q.weight"))
-                .is_some()
-            {
-                let p = format!("{prefix}.transformer_1d_blocks.{i}");
-                blocks.push((
-                    Attn::load(model, &format!("{p}.attn1"), heads, dh)?,
-                    Lin::load(model, &format!("{p}.ff.net.0.proj"), true)?,
-                    Lin::load(model, &format!("{p}.ff.net.2"), true)?,
-                ));
-                i += 1;
-            }
-            Ok(Connector {
-                blocks,
-                registers: vecf(model, &format!("{prefix}.learnable_registers"))?,
-                dim,
-                heads,
-                dh,
-                max_pos: 4096.0,
-            })
-        };
+        let conn =
+            |prefix: &str, dim: usize, heads: usize, dh: usize| -> Result<Connector, String> {
+                let mut blocks = Vec::new();
+                let mut i = 0usize;
+                while model
+                    .tensor(&format!(
+                        "{prefix}.transformer_1d_blocks.{i}.attn1.to_q.weight"
+                    ))
+                    .is_some()
+                {
+                    let p = format!("{prefix}.transformer_1d_blocks.{i}");
+                    blocks.push((
+                        Attn::load(model, &format!("{p}.attn1"), heads, dh)?,
+                        Lin::load(model, &format!("{p}.ff.net.0.proj"), true)?,
+                        Lin::load(model, &format!("{p}.ff.net.2"), true)?,
+                    ));
+                    i += 1;
+                }
+                Ok(Connector {
+                    blocks,
+                    registers: vecf(model, &format!("{prefix}.learnable_registers"))?,
+                    dim,
+                    heads,
+                    dh,
+                    max_pos: 4096.0,
+                })
+            };
 
         Ok(LtxTextEncoder {
             embed: QTensor::from_model(model, "te.model.embed_tokens.weight")?,
             mapped_bytes: model.primary_bytes().len() as u64,
             layers,
             norm: vecf(model, "te.model.norm.weight")?,
-            video_agg: Lin::load(model, "te.text_embedding_projection.video_aggregate_embed", true)?,
-            audio_agg: Lin::load(model, "te.text_embedding_projection.audio_aggregate_embed", true)?,
+            video_agg: Lin::load(
+                model,
+                "te.text_embedding_projection.video_aggregate_embed",
+                true,
+            )?,
+            audio_agg: Lin::load(
+                model,
+                "te.text_embedding_projection.audio_aggregate_embed",
+                true,
+            )?,
             v_conn: conn("dit.video_embeddings_connector", 4096, 32, 128)?,
             a_conn: conn("dit.audio_embeddings_connector", 2048, 32, 64)?,
             hidden,
@@ -324,10 +346,18 @@ impl LtxTextEncoder {
         let rot_full = full.map(|l| Rot::build(t, l.head_dim, 1_000_000.0, 0.25));
 
         for layer in &self.layers {
-            let rot = if layer.sliding { &rot_slide } else { rot_full.as_ref().unwrap() };
+            let rot = if layer.sliding {
+                &rot_slide
+            } else {
+                rot_full.as_ref().unwrap()
+            };
             let mut h = vec![0f32; t * d];
             for i in 0..t {
-                rms(&x[i * d..(i + 1) * d], &layer.in_norm, &mut h[i * d..(i + 1) * d]);
+                rms(
+                    &x[i * d..(i + 1) * d],
+                    &layer.in_norm,
+                    &mut h[i * d..(i + 1) * d],
+                );
             }
             let attn = self.attention(layer, &h, t, mask, rot, pool);
             for i in 0..t {
@@ -339,7 +369,11 @@ impl LtxTextEncoder {
             }
             let mut h2 = vec![0f32; t * d];
             for i in 0..t {
-                rms(&x[i * d..(i + 1) * d], &layer.pre_ff_norm, &mut h2[i * d..(i + 1) * d]);
+                rms(
+                    &x[i * d..(i + 1) * d],
+                    &layer.pre_ff_norm,
+                    &mut h2[i * d..(i + 1) * d],
+                );
             }
             let mut g = layer.gate.apply(&h2, t, pool);
             let u = layer.up.apply(&h2, t, pool);
@@ -368,7 +402,11 @@ impl LtxTextEncoder {
         if let Some(last) = out.last_mut() {
             let mut n = vec![0f32; t * d];
             for i in 0..t {
-                rms(&last[i * d..(i + 1) * d], &self.norm, &mut n[i * d..(i + 1) * d]);
+                rms(
+                    &last[i * d..(i + 1) * d],
+                    &self.norm,
+                    &mut n[i * d..(i + 1) * d],
+                );
             }
             *last = n;
         }
@@ -417,8 +455,7 @@ impl LtxTextEncoder {
         let mut bias = vec![0f32; t * t];
         for i in 0..t {
             for j in 0..t {
-                let blocked =
-                    j > i || (window != usize::MAX && i - j >= window) || mask[j] == 0.0;
+                let blocked = j > i || (window != usize::MAX && i - j >= window) || mask[j] == 0.0;
                 bias[i * t + j] = if blocked { f32::NEG_INFINITY } else { 0.0 };
             }
         }
@@ -490,7 +527,11 @@ impl LtxTextEncoder {
                 let inv = 1.0 / (var + 1e-6).sqrt();
                 let keep = mask[i] != 0.0;
                 for j in 0..d {
-                    feats[i * d * l + j * l + li] = if keep { (row[j] as f64 * inv) as f32 } else { 0.0 };
+                    feats[i * d * l + j * l + li] = if keep {
+                        (row[j] as f64 * inv) as f32
+                    } else {
+                        0.0
+                    };
                 }
             }
         }
