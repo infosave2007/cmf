@@ -1185,6 +1185,36 @@ mod tests {
         }
     }
 
+    /// Granite 4.2 ships its prompt grammar as a sidecar
+    /// `chat_template.jinja` (not tokenizer_config.chat_template).  Exercise
+    /// the exact upstream file when supplied so macro/namespace support and
+    /// both reasoning prefixes cannot silently fall back to generic ChatML.
+    #[test]
+    fn granite_42_chat_template_when_available() {
+        let Ok(path) = std::env::var("CMF_GRANITE_CHAT_TEMPLATE") else {
+            return;
+        };
+        let mut tok = Tokenizer::byte_level();
+        tok.chat_template = Some(std::fs::read_to_string(path).expect("read Granite template"));
+        let messages = vec![("user".to_string(), "Hello".to_string())];
+
+        let thinking = tok
+            .render_chat_opts(&messages, Some(true))
+            .expect("render Granite thinking prompt");
+        assert_eq!(
+            thinking,
+            "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n"
+        );
+
+        let direct = tok
+            .render_chat_opts(&messages, Some(false))
+            .expect("render Granite direct prompt");
+        assert_eq!(
+            direct,
+            "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think></think>"
+        );
+    }
+
     /// A Sequence of Splits applies ALL of them, in order. Reading only the
     /// first is not a near-miss: DeepSeek-V4 puts a digit rule first and the
     /// word rule third, so one-pattern behaviour hands BPE a whole sentence

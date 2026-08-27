@@ -98,6 +98,7 @@ measured, a 34.7B MoE at 16.3 tok/s with 2 GB free.
 | [LTX-2.5](https://huggingface.co/infosave/LTX-2.5-cmf) | text → video **with sound**, 21B DiT + audio VAE | 20.53 GB |
 | [Qwen3.8-27B](https://huggingface.co/infosave/Qwen3.8-27B-cmf) | dense, q4tp | 14.44 GB |
 | [Qwen3.8-Flash-Next](https://huggingface.co/infosave/Qwen3.8-Flash-Next-cmf) | 176.9B hybrid MoE/PLE, mixed q4tp + q8_2f | 97.12 GB |
+| [Granite 4.2 — 3B/8B/30B](https://huggingface.co/infosave/Granite-4.2-cmf) | dense reasoning family, q4tp + q8_2f | 2.17–29.31 GB |
 
 Every one of them runs from the same binary: `cortiq run` for the text
 models, `cortiq imagine` for Lumina, `cortiq animate` for MiniMax-H3, `cortiq ltx-video` for LTX-2.5.

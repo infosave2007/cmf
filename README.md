@@ -353,9 +353,12 @@ Bugs and features: [open an issue](https://github.com/infosave2007/cmf/issues).
 Security: **do not** open a public issue — see [SECURITY.md](SECURITY.md).
 A model that won't convert is a bug report, not a user error.
 
-> **Hub download counters.** `.cmf` files are not yet in the Hub's
-> download-counting registry, so CMF repos show `0` under real traffic.
-> Upstream fix pending: [huggingface.js#2354](https://github.com/huggingface/huggingface.js/pull/2354).
+> **Hub integration.** The upstream `.cmf` download-counting and Cortiq
+> snippet change was merged on August 26, 2026:
+> [huggingface.js#2354](https://github.com/huggingface/huggingface.js/pull/2354).
+> It is present in the published `@huggingface/tasks` package, but the Hub's
+> production UI and statistics workers have not rolled it out yet: CMF repos
+> still show `0` downloads and no “Use with Cortiq” entry as of August 27.
 
 ## License
 

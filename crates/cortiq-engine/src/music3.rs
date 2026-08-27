@@ -1187,6 +1187,7 @@ impl Music3Ar {
                 self.nh,
                 self.nkv,
                 self.hd,
+                1.0 / (self.hd as f32).sqrt(),
                 self.hd,
                 hs,
                 self.inter,

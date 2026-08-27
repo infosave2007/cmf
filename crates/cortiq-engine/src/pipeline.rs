@@ -789,6 +789,13 @@ impl Pipeline {
     fn can_prefill_batched(&self) -> bool {
         prefill_batched() && !self.weights.layers.is_empty()
     }
+
+    /// The backend's automatic capacity split for a mapped transformer.
+    /// Kept as a method so prefill and decode use the exact same boundary.
+    fn automatic_gpu_prefix(&self) -> Option<usize> {
+        let (model, _, _, _) = self.weights.embed_tokens.graph_weight()?;
+        crate::gpu::automatic_layer_prefix(&model, self.num_layers, self.physical_layers)
+    }
 }
 
 /// Prefill chunk (positions per batched pass). On macOS the AMX GEMM
@@ -931,15 +938,13 @@ impl Pipeline {
             }
             return start;
         }
-        // The graph encodes SiLU FFN, 1/√hd attention scores and
-        // full-context attend with no branch norms — Gemma-style archs
-        // (sliding window, scale override, sandwich norms, GeLU) fall
-        // back to the CPU path.
+        // The graph encodes SiLU FFN and full-context attention with an
+        // explicit model scale. Architectures with sliding windows,
+        // sandwich norms or non-SiLU FFNs still fall back to the CPU path.
         if self.swa.is_some()
             || self.global_attn.is_some()
             || self.attention_heads_per_layer.is_some()
             || self.attn_v_norm
-            || (self.attn_scale - 1.0 / (self.head_dim as f32).sqrt()).abs() > 1e-9
             || self.weights.layers.iter().any(|lw| {
                 lw.attn_out_norm.is_some()
                     || lw.ffn_out_norm.is_some()
@@ -1395,6 +1400,7 @@ impl Pipeline {
                             hd,
                             rd,
                             position,
+                            scale: self.attn_scale,
                             eps: eps as f32,
                             gemma,
                             output_gate: *output_gate,
@@ -1530,6 +1536,7 @@ impl Pipeline {
                             hd,
                             rd,
                             position,
+                            scale: self.attn_scale,
                             eps: eps as f32,
                             gemma,
                             output_gate: *output_gate,
@@ -3475,6 +3482,7 @@ impl Pipeline {
             nh,
             nkv,
             hd,
+            self.attn_scale,
             rd,
             self.hidden_size,
             self.intermediate_size,
@@ -3611,6 +3619,7 @@ impl Pipeline {
             self.kv_cache.max_seq_len,
             gemma,
             self.rms_eps as f32,
+            self.attn_scale,
             pairs.len(),
             None,
         )
@@ -5343,10 +5352,14 @@ impl Pipeline {
         );
         let pool = self.pool.clone();
         let norm_style = self.norm_style;
+        let automatic_gpu_prefix = self.automatic_gpu_prefix();
 
         #[cfg(target_os = "macos")]
         let mut chunk_skip_until = 0usize;
         for li in from..upto_excl {
+            let _capacity_tail = automatic_gpu_prefix
+                .filter(|&prefix| li >= prefix)
+                .map(|_| crate::gpu::enter_cpu_scope());
             crate::gpu::set_layer(li as i64); // layer-split GPU/CPU
             // GPU chunk graph (default-on under CMF_GPU=1): a run of
             // consecutive eligible layers for the whole chunk in ONE
@@ -6650,6 +6663,7 @@ impl Pipeline {
             nh,
             nkv,
             hd,
+            self.attn_scale,
             rd,
             self.hidden_size,
             self.intermediate_size,
@@ -6701,7 +6715,6 @@ impl Pipeline {
             || self.attention_heads_per_layer.is_some()
             || self.attn_v_norm
             || self.loop_final_norm
-            || (self.attn_scale - 1.0 / (self.head_dim as f32).sqrt()).abs() > 1e-9
         {
             return None;
         }
@@ -6846,6 +6859,7 @@ impl Pipeline {
         geom: (usize, usize, usize, usize),
         pos0: usize,
         kv_id: u64,
+        scale: f32,
         eps: f32,
         gemma: bool,
     ) -> (crate::gpu_metal::AttnDeviceParams<'a>, usize) {
@@ -6862,6 +6876,7 @@ impl Pipeline {
                 hd,
                 rd,
                 position: pos0,
+                scale,
                 eps,
                 gemma,
                 output_gate,
@@ -6942,6 +6957,7 @@ impl Pipeline {
                         geom,
                         pos0,
                         kv_id,
+                        self.attn_scale,
                         eps,
                         gemma,
                     );
@@ -6997,6 +7013,7 @@ impl Pipeline {
                         geom,
                         pos0,
                         kv_id,
+                        self.attn_scale,
                         eps,
                         gemma,
                     );
@@ -7274,6 +7291,7 @@ impl Pipeline {
                 hd,
                 rd,
                 position: first_pos,
+                scale: self.attn_scale,
                 eps: self.rms_eps as f32,
                 gemma: self.norm_style == cortiq_core::NormStyle::Gemma,
                 output_gate: *output_gate,
@@ -7452,6 +7470,7 @@ impl Pipeline {
                 hd,
                 rd,
                 position,
+                scale: self.attn_scale,
                 eps: self.rms_eps as f32,
                 gemma: self.norm_style == cortiq_core::NormStyle::Gemma,
                 output_gate: *output_gate,
@@ -7745,6 +7764,7 @@ impl Pipeline {
             self.kv_cache.max_seq_len,
             gemma,
             self.rms_eps as f32,
+            self.attn_scale,
             k,
             spec,
         )
@@ -8575,9 +8595,20 @@ impl Pipeline {
         }
         let t_race_cpu = (race_eligible && !graph_trusted).then(std::time::Instant::now);
 
+        // A partial graph is an explicit GPU-prefix / CPU-tail split. Keep
+        // the tail PURE host-side: letting its QTensor hooks re-enter the
+        // residency arena streams every omitted layer through Vulkan and the
+        // driver's freed-allocation cache can grow to the full model size
+        // (25.4 GiB observed with a 14 GiB budget on Granite 30B Q8_2F).
+        let _host_tail = (tail_start > from).then(crate::gpu::enter_cpu_scope);
+        let automatic_gpu_prefix = self.automatic_gpu_prefix();
+
         #[cfg(target_os = "macos")]
         let mut gpu_skip_until = 0usize;
         for li in tail_start.max(from)..self.num_layers {
+            let _capacity_tail = automatic_gpu_prefix
+                .filter(|&prefix| li >= prefix)
+                .map(|_| crate::gpu::enter_cpu_scope());
             crate::gpu::set_layer(li as i64); // layer-split GPU/CPU (CMF_GPU_LAYERS)
             if let Some(u) = upto {
                 if li > u {
