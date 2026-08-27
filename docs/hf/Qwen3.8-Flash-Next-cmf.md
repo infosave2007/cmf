@@ -37,9 +37,7 @@ token, plus the 51B-parameter PLE n-gram table. The sparse/on-demand layout is
 why a single artifact can remain usable well below its full file size in VRAM.
 
 ```bash
-# The qwen4_exp support is newer than cortiq 0.6.2. Until the next
-# packaged release, build the CMF checkout that contains this support:
-cargo install --path crates/cortiq-cli
+cargo install cortiq-cli --version 0.6.4
 hf download infosave/Qwen3.8-Flash-Next-cmf qwen38-flash-next-q4tp.cmf --local-dir .
 # Or use qwen38-flash-next-q2tp.cmf for the smaller 2/4-bit expert profile.
 cortiq verify qwen38-flash-next-q4tp.cmf

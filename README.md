@@ -109,6 +109,15 @@ same file.
 | `q1t` | 2.25–3.5 | training-free ternary + sparse outlier overlay ([docs](docs/Q1T_PTQ.md)) |
 | `q1` | 1.5 | for checkpoints **trained** binary (Bonsai / BitNet) |
 
+**Granite 4.2 is supported explicitly.** The public
+[3B/8B/30B Q4TP and Q8_2F files](https://huggingface.co/infosave/Granite-4.2-cmf)
+carry IBM's exact attention multiplier and chat template. Q4TP keeps the
+100,352-token embedding and untied `lm_head` in Q8_2F; the full Q8_2F profile
+is the higher-quality control. When a dense model is larger than VRAM, Cortiq
+chooses a fixed GPU-layer prefix and runs the mmap-backed tail on CPU instead
+of repeatedly streaming all weights through the driver. On a 10-core M4 the
+3B files measured 34.8 tok/s (Q4TP) and 11.2 tok/s (Q8_2F) steady decode.
+
 `q4tp` in one line: a `q4t` tile spends 16 bits on an f16 scale for 32 weights —
 11% of the file. Making that scale a 5-bit rung on a per-row geometric ladder
 costs **+0.1% relative error** at the median within-row spread. Existing files

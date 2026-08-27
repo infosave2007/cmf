@@ -3,6 +3,14 @@
 use cortiq_embryo::tokenizer::{Bpe, SPLIT, count_words, train};
 use std::collections::HashMap;
 
+fn utf8_prefix(text: &str, max_bytes: usize) -> &str {
+    let mut end = text.len().min(max_bytes);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 #[test]
 fn runtime_encodes_our_tokenizer_identically() {
     let mut text = String::new();
@@ -37,14 +45,14 @@ fn runtime_encodes_our_tokenizer_identically() {
         "Hello, world! Cortiq Embryo — саморазвивающееся ядро на нашем формате.",
         "fn main() {\n    println!(\"{}\", 42);\n}\n",
         "   Leading spaces, tabs\t and 12345 numbers, e-mail@example.com; 日本語テキスト.",
-        &text[..20_000],
+        utf8_prefix(&text, 20_000),
     ];
     let mut cache = HashMap::new();
     for s in samples {
         let mut a = Vec::new();
         ours.encode(s, &mut cache, &mut a);
         let b = rt.encode(s);
-        assert_eq!(a, b, "encoding differs on {:?}", &s[..s.len().min(60)]);
+        assert_eq!(a, b, "encoding differs on {:?}", utf8_prefix(s, 60));
         assert_eq!(ours.decode(&a), s, "round trip");
     }
     let bytes: usize = samples.iter().map(|s| s.len()).sum();
