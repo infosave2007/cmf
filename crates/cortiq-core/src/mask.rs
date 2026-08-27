@@ -1,8 +1,7 @@
 //! Task mask management — per-task neuron/head/layer masks.
 //!
 //! A mask selects an active subset of the shared weights (weights are
-//! never modified — VMF principle: a skill is a regular core of the
-//! condensate). Bit order is LSB-first: neuron `i` = bit `i % 8` of
+//! never modified). Bit order is LSB-first: neuron `i` = bit `i % 8` of
 //! byte `i / 8`; bit 1 = active. Tail bits beyond the dimension MUST
 //! be zero (otherwise popcount sees phantom neurons/heads).
 

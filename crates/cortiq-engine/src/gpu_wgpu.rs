@@ -6,7 +6,7 @@
 //! the quantized weights are LOADED into VRAM ONCE (residency cache keyed by
 //! tensor index) — that is where the win lives (VRAM bandwidth ×5–10 vs CPU). The math
 //! is identical to CPU/Metal: y[o] = row_scale[o]·Σ q[o,i]·xs[i], where xs is already
-//! prescaled by the θ field (the two-field q8_2f folds into the input prescale).
+//! prescaled by the column scale (the two-scale q8_2f folds into the input prescale).
 //!
 //! Enabling: `CMF_GPU=wgpu` (or `=1` on non-macOS, where wgpu is the only backend).
 //! Any init/limit failure — `false` and an honest CPU path.
@@ -647,7 +647,7 @@ mod global_moe_shader_tests {
 const WGSL: &str = r#"
 struct Params { cols4: u32, rows: u32, row0_words: u32, _pad: u32 };
 @group(0) @binding(0) var<storage, read>       q  : array<u32>;   // 4×i8 packed into u32, row-major
-@group(0) @binding(1) var<storage, read>       xs : array<f32>;   // cols, already prescaled by the θ field
+@group(0) @binding(1) var<storage, read>       xs : array<f32>;   // cols, already prescaled by the column scale
 @group(0) @binding(2) var<storage, read>       rs : array<f32>;   // row scales for the range
 @group(0) @binding(3) var<storage, read_write> y  : array<f32>;   // output: rows
 @group(0) @binding(4) var<uniform>             p  : Params;
@@ -2795,7 +2795,7 @@ fn kv_append(@builtin(global_invocation_id) gid: vec3<u32>) {
 // across lanes (dim d in lane d%32, slot d/32); online softmax over the n
 // cached positions with the per-position q·k dot reduced in workgroup memory
 // (portable — no subgroup ops). WGSL twin of Metal gqa_attend (output only;
-// Born-importance is handled on the CPU side when eviction is active).
+// Attention-importance is handled on the CPU side when eviction is active).
 struct AtP { nh: u32, hpk: u32, hd: u32, cap: u32, n: u32, scale: f32, _b: u32, _c: u32 };
 @group(0) @binding(0) var<storage, read>       at_q : array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read>       at_k : array<vec4<f32>>;

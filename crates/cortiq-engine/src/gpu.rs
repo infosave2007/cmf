@@ -843,7 +843,7 @@ pub fn discrete() -> bool {
 
 /// A single MoE-FFN job (an expert with its own weight), executed in one
 /// submission: (rows, cols, idx, row_scale) for gate/up/down + prescaled
-/// inputs + the down θ-field + the blending weight.
+/// inputs + the down column scale + the blending weight.
 pub struct MoeJob<'a> {
     pub gate: (usize, usize, usize, &'a [f32]),
     pub up: (usize, usize, usize, &'a [f32]),
@@ -1132,7 +1132,7 @@ pub fn wgpu_graph_default() -> bool {
     }
 }
 
-/// q8_row/q8_2f matvec, rows [row0, row0+rows). `xs` — prescaled by the θ-field.
+/// q8_row/q8_2f matvec, rows [row0, row0+rows). `xs` — prescaled by the column scale.
 #[allow(clippy::too_many_arguments, unused_variables)]
 pub fn q8_matvec_range(
     model: &Arc<CmfModel>,

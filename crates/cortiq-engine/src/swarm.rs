@@ -1,18 +1,16 @@
-//! Dynamic per-token skill routing with hysteresis (spec §9 made
-//! runtime; VMF-2026 experiment №2).
+//! Dynamic per-token skill routing with hysteresis (spec §9 runtime
+//! implementation).
 //!
 //! The recon-argmin error E(skill) is computed against the rolling φ
-//! (EMA of the router layer's hidden state — on-policy, fireball-style).
-//! Switching uses TWO thresholds — a first-order-transition analogue of
-//! the VMF condensation potential V(𝒲,T) = D(T²−T₀²)𝒲² − E·T·𝒲³ +
-//! (λ/4)𝒲⁴, whose cubic term opens a barrier between the "off" (φ far
-//! from any skill) and "on" (φ inside a skill's subspace) minima:
-//!   - activate a skill only when its E drops below `e_on` (nucleation);
+//! (EMA of the router layer's hidden state, updated on-policy).
+//! Switching uses TWO thresholds, which create a dead band between the
+//! "off" (φ far from any skill) and "on" (φ inside a skill's subspace) states:
+//!   - activate a skill only when its E drops below `e_on`;
 //!   - abandon the active skill only when its E rises above `e_off`
 //!     (> e_on), or a rival beats it by more than `margin`.
 //!
-//! The barrier `e_off − e_on` is exactly what suppresses thrashing at
-//! domain boundaries (the very effect a single threshold cannot give).
+//! The gap `e_off − e_on` suppresses thrashing at domain boundaries (the
+//! very effect a single threshold cannot give).
 
 use base64::Engine as _;
 use cortiq_core::SelectionDescriptor;

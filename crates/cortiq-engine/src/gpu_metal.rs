@@ -965,7 +965,7 @@ kernel void causal_softmax(
     for (uint i = allowed + lane; i < n; i += 32u) r[i] = 0.0f;
 }
 
-// Born importance: imp[pos] += Σ over rows of P[row, pos] (masked
+// Attention importance: imp[pos] += Σ over rows of P[row, pos] (masked
 // column sums — the zeroed tail contributes nothing). One THREAD per
 // position, rows walked inside: adjacent threads read adjacent
 // positions, so every row pass is coalesced (the lane-per-column form
@@ -2140,7 +2140,7 @@ kernel void kv_append(
 // for Nanbeige 4.2), nowhere near enough to hide the per-position
 // simd_sum latency chain, so decode fell off a cliff with context depth.
 // A second pass banks each position's probability mass into the
-// Born-importance accumulator (the default eviction policy ranks by it).
+// Attention-importance accumulator (the default eviction policy ranks by it).
 // exp/order differ from the CPU attend (tolerance-gated, like every GPU
 // reduction here).
 kernel void gqa_attend(
@@ -2228,7 +2228,7 @@ kernel void gqa_attend(
         }
     }
     m = gm; // the importance pass below wants the head's final max
-    // Born-importance pass: prob_p = exp(s_p − m)/l summed over heads.
+    // Attention-importance pass: prob_p = exp(s_p − m)/l summed over heads.
     // The score is recomputed in the SAME lane-sliced layout as the main
     // loop. The obvious form — one position per lane, each lane walking
     // a whole K row — makes every lane touch a different 512 B row, so
@@ -2286,7 +2286,7 @@ kernel void gqa_attend(
 // Each simdgroup keeps its head's online-softmax partial (m, l, acc[hd])
 // over the block, lane-sliced (dim d in lane d%32 slot d/32); the
 // partials go to `part` ([nb][nh][nblk][hd+2]) and `gqa_combine` folds
-// the blocks. Row e attends positions 0..s0+e (its own prefix). No Born
+// the blocks. Row e attends positions 0..s0+e (its own prefix). No attention
 // importance from this path.
 kernel void gqa_attend_blk(
     device const float* q    [[buffer(0)]],   // [nb][nh][hd] rope'd
@@ -2421,7 +2421,7 @@ kernel void gqa_combine(
 // Chunk (prefill) attend: gqa_attend batched over the chunk's query
 // positions with the causal bound — query bi sees cache rows
 // 0 .. s0+bi. One simdgroup per (query, head), online softmax, the
-// same Born-importance second pass accumulated atomically across every
+// same attention-importance second pass accumulated atomically across every
 // query and head (matching the CPU chunk path's masked column sums).
 // The chunk's own K/V rows must already sit in the mirror.
 //
@@ -2727,7 +2727,7 @@ kernel void chunk_attend(
         uint d = t * 32u + lane;
         if (d < hd) oh[d] = acc[t] * invl;
     }
-    // Born importance, lane-sliced like the main loop (see gqa_attend:
+    // Attention importance, lane-sliced like the main loop (see gqa_attend:
     // the per-lane serial dot reads the mirror uncoalesced and dominated
     // the whole chunk). Four positions per step for reduction ILP.
     uint p = 0;
@@ -5676,7 +5676,7 @@ fn init() -> Result<Ctx, String> {
         ));
     }
     let opts = metal::CompileOptions::new();
-    // atomic_float (Born-importance accumulation in gqa_attend) needs
+    // atomic_float (attention-importance accumulation in gqa_attend) needs
     // MSL 3.0 — macOS 13+, a subset of what the UMA gate already implies.
     opts.set_language_version(metal::MTLLanguageVersion::V3_0);
     let lib = device
@@ -7595,7 +7595,7 @@ pub struct ChunkLayer<'a> {
 
 /// Run a RUN of consecutive prefill layers for the whole chunk in a
 /// single submission: per layer — norm → QKV GEMMs → bias+qk-norm+RoPE
-/// with fused mirror append → causal chunk attend (+Born importance) →
+/// with fused mirror append → causal chunk attend (+attention importance) →
 /// O GEMM → residual → norm → gate/up GEMMs → silu·mul → down GEMM →
 /// residual. The hidden buffer stays device-resident across the whole
 /// run; ONE wait at the end, then every layer's chunk K/V rows and
@@ -8147,7 +8147,7 @@ pub fn chunk_run_gpu(
         cmd = prof.cut(c, cmd, "rope_kv");
         // GEMM attention (profiled: the streaming attend was 47% of the
         // chunk): scores = Qpanel·Kᵀ·scale per KV group, causal softmax
-        // rows, Born column sums, attn = P·V. Groups get their own
+        // rows, attention column sums, attn = P·V. Groups get their own
         // score REGIONS so same-stage dispatches of every group share
         // one encoder and may overlap; the imp and P·V passes both only
         // read the softmaxed scores and merge into one encoder too.
@@ -8204,7 +8204,7 @@ pub fn chunk_run_gpu(
             }
             cmd = prof.cut(c, cmd, "att_sm");
             {
-                // Born sums and P·V both only READ the softmaxed scores
+                // Attention sums and P·V both only READ the softmaxed scores
                 // — one encoder, they may overlap.
                 let enc = cmd.new_compute_command_encoder();
                 for g in 0..nkv {
@@ -11238,7 +11238,7 @@ fn disp_tg(
 }
 
 /// Device mirror of one layer's K/V cache: `[nkv, cap, hd]` each, plus
-/// the per-position Born-importance accumulator for this token. The
+/// the per-position attention-importance accumulator for this token. The
 /// CPU cache stays the owner of record — `stored` tracks how many CPU
 /// rows the mirror reflects, and any mismatch (eviction, rollback, a
 /// non-graph path having appended) triggers a full re-upload.
@@ -12191,7 +12191,7 @@ impl TokenGraph {
     }
 
     /// One attention layer entirely on the device: norm → QKV →
-    /// qk-norm+RoPE → KV append → grouped attend (+Born importance) →
+    /// qk-norm+RoPE → KV append → grouped attend (+attention importance) →
     /// output gate → O → residual → FFN → residual. No sync — the KV
     /// mirror is prepared host-side first (self-healing: any mismatch
     /// with the CPU cache re-uploads it). Returns false without
@@ -12478,7 +12478,7 @@ impl TokenGraph {
                 &[],
                 ((p.nkv * p.hd) as u64, 256),
             );
-            // 5. grouped attend (+ Born importance into the mirror's imp).
+            // 5. grouped attend (+ attention importance into the mirror's imp).
             //    Flash-decoding: one threadgroup per Q-head, its simdgroups
             //    splitting the stored positions. ~32 positions per simdgroup
             //    is the point where the split stops paying for itself.
@@ -13177,7 +13177,7 @@ pub fn kv_mirror_read_last(
     true
 }
 
-/// Add this token's Born-importance mass (mirror accumulator) into
+/// Add this token's attention-importance mass (mirror accumulator) into
 /// `imp_acc` and clear the accumulator. Call after the final sync.
 pub fn kv_mirror_take_imp(kv_id: u64, layer: usize, imp_acc: &mut [f32]) {
     let Some(c) = ctx() else { return };

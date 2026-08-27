@@ -1,4 +1,4 @@
-//! Vacuum tests — inputs whose answer is known in closed form.
+//! Known-answer tests — inputs whose answer is known in closed form.
 //!
 //! Every other test in this directory is DIFFERENTIAL: it compares two
 //! implementations (GPU against CPU, this port against ComfyUI) and
@@ -20,7 +20,7 @@ use cortiq_engine::attention::{rope_inv_freq, rope_rotate};
 use cortiq_engine::nystrom::{NystromState, O1Rect};
 
 /// Deterministic uniform noise in [-1, 1) — no rand dependency, and the
-/// same numbers on every platform, which a vacuum test wants.
+/// same numbers on every platform, which a known-answer test wants.
 fn unif(s: &mut u64) -> f32 {
     *s = s
         .wrapping_mul(6364136223846793005)

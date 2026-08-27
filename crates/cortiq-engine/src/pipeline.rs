@@ -228,7 +228,7 @@ pub struct Pipeline {
     /// Emit a structured per-token trace (B4 telemetry channel). Off by
     /// default — the runtime is silent unless observation is requested.
     trace: bool,
-    /// Confidence-calibration temperature (B1): reported Born mass is
+    /// Confidence-calibration temperature (B1): reported probability is
     /// softmax(logits / calib_temp). 1.0 = raw. Set from header.calibration.
     calib_temp: f32,
     /// Process-unique id keying this pipeline's device KV mirrors.
@@ -274,7 +274,7 @@ pub struct Pipeline {
     pub head_clusters: Option<std::sync::Arc<Vec<f32>>>,
     /// Gemma-2 attention-logit soft-capping (0.0 = off).
     pub attn_softcap: f32,
-    /// Compute per-token Born confidence (a full-vocab softmax each
+    /// Compute per-token confidence (a full-vocab softmax each
     /// token). On by default; `bench --core` turns it off to match
     /// llama-bench's core timing.
     confidence_on: bool,
@@ -714,7 +714,7 @@ pub struct GenerateResult {
     pub mtp_drafted: usize,
     pub mtp_accepted: usize,
     /// Per-generated-token confidence = softmax probability of the token
-    /// that was actually emitted (Born mass on the chosen state). High =
+    /// that was actually emitted (softmax probability on the chosen state). High =
     /// the model was sure; low = it was guessing. Same length as the
     /// generated slice of `token_ids`.
     pub token_confidence: Vec<f32>,
@@ -733,7 +733,7 @@ pub struct TokenTrace {
     pub t: usize,
     /// The emitted token id.
     pub token_id: u32,
-    /// Born mass on the emitted token (softmax prob) — how sure the model was.
+    /// Softmax probability on the emitted token — how sure the model was.
     pub confidence: f32,
     /// Skill in force while this token was generated (None = backbone).
     pub active_skill: Option<String>,
@@ -746,7 +746,7 @@ pub struct TokenTrace {
     pub switched: bool,
 }
 
-/// Calibrated softmax probability of `id` under `logits` (the Born mass on
+/// Calibrated softmax probability of `id` under `logits` (the confidence on
 /// the emitted token) — the confidence signal, cheap from logits already
 /// computed for sampling. `temp` is the calibration temperature (B1):
 /// softmax(logits / temp); 1.0 = raw.
@@ -1644,7 +1644,7 @@ impl Pipeline {
         graph.finish(h);
         // Device-attended layers: replay the CPU bookkeeping — append
         // the mirror's new K/V row (rope'd on the GPU) into the owner
-        // cache, then bank this token's Born-importance mass.
+        // cache, then bank this token's attention-importance mass.
         for li in dev_attn {
             let mut krow = attention::take_buf(nkv * hd);
             let mut vrow = attention::take_buf(nkv * hd);
@@ -1871,7 +1871,7 @@ impl Pipeline {
         self.sampler_config = config;
     }
 
-    /// Toggle the per-token Born-confidence reduction (a full-vocab
+    /// Toggle the per-token confidence reduction (a full-vocab
     /// softmax each token). `bench --core` turns it off so the timed
     /// loop matches llama-bench's core contract; the result's
     /// `confidence` vec is empty while off.
@@ -1885,7 +1885,7 @@ impl Pipeline {
         self.calib_temp = if t > 1e-3 { t } else { 1.0 };
     }
 
-    /// The active calibration temperature (1.0 = raw Born mass).
+    /// The active calibration temperature (1.0 = raw probability).
     pub fn calib_temp(&self) -> f32 {
         self.calib_temp
     }
@@ -5125,7 +5125,7 @@ impl Pipeline {
 
     /// Teacher-forced calibration data (B1): for each position, whether the
     /// argmax equals the actual next token, and the top-1 softmax prob
-    /// (Born mass) under EACH temperature in `temps` — all from ONE forward
+    /// (top-1 probability) under EACH temperature in `temps` — all from ONE forward
     /// pass (argmax/correctness are temperature-invariant; only p_max
     /// reshapes). Feeds `cortiq calibrate` (reliability/ECE + temperature
     /// fit): is the model's confidence a true property, or does it need a
@@ -9061,7 +9061,7 @@ impl Pipeline {
                 );
             }
 
-            // Dynamic routing φ capture (on-policy, fireball-style): the
+            // Dynamic routing φ capture (on-policy): the
             // EMA of the post-residual hidden at the router's phi_layer,
             // updated as the context evolves during decode.
             if self.dyn_phi_layer == Some(li) {
@@ -11556,7 +11556,7 @@ fn moe_ffn_cpu(
 /// cache + grouped attend do the rest. K head layout is [rope | nope]
 /// (rotary_dim = qk_rope rotates the shared rope key and each q head's
 /// prefix); V rows are zero-padded to the K head_dim inside the cache
-/// and the pad is sliced off before O. Born importance is not
+/// and the pad is sliced off before O. Attention importance is not
 /// accumulated for MLA yet (no eviction interplay).
 #[allow(clippy::too_many_arguments)]
 fn mla_attention(

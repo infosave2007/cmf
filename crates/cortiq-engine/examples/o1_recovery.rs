@@ -9,8 +9,8 @@
 //! measures a search: inject a signal of KNOWN strength at a KNOWN
 //! depth, and count how much of it comes back out. The needle is one
 //! (key, value) pair whose logit sits `amp` standard deviations above
-//! the background — the same construction as `tests/vacuum.rs`, run
-//! Monte Carlo over seeds. Because the background values are zero in
+//! the background — the same construction as the known-answer quantizer
+//! tests, run Monte Carlo over seeds. Because the background values are zero in
 //! dimension 0 and the needle's is one, the output's component 0 IS the
 //! needle's contribution: recovery = got[0] / exact[0], a fraction with
 //! no fitting and no threshold.
@@ -32,10 +32,10 @@
 //! −0.18 to −0.38 across injection strengths, clustering near −1/4.
 //!
 //! That exponent is the number an allocation rule needs, and it is not
-//! the one a physical detection experiment would hand over. Equalizing a
+//! the one a separate detection experiment would hand over. Equalizing a
 //! response that grows as r^β needs budget ∝ c^(1/β): at β = 1/2 — the
 //! √t law of an integration-time search — that is the familiar c², but at
-//! β = 1/4 it is c⁴, quadratically more aggressive. Assuming the physics
+//! β = 1/4 it is c⁴, quadratically more aggressive. Assuming a generic
 //! exponent here would under-serve the weak layers by a wide margin.
 //!
 //! Two honest limits on that number. Recovery is NOT monotone in

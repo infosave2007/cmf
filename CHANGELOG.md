@@ -567,7 +567,7 @@ The latent upscaler, an eight-bit build, and reference clips.
   nobody re-downloads a 14 GB file for them.
 
 ### Verified
-- The spatial-physics adapter's behaviour was a prediction from its header
+- The spatial adapter's behaviour was a prediction from its header
   and is now measured: `lora: rank 16, 208/258 branches bound; not applied:
   blocks…linear ×50`, and the render completes — rank 16 is not a multiple
   of 32, so it takes the split path rather than the fused kernel.
@@ -1093,7 +1093,7 @@ the plain rate by the monitor's choice) — with the draft on the token
 graph, an int8-activation batched verify, a sparse sampler chain and a
 speculation monitor in place of the one-shot trial. Beside it, the
 tools that made the week's measurements: `dequant`/`patch-tensor`, the
-FCD tail heal (q4tp 8.79 → 8.49), the NVG fold to a 19.8B and its
+FCD tail heal (q4tp 8.79 → 8.49), the structured fold to a 19.8B and its
 KD-LoRA heal, and two field-report fixes for the MiniMax video path.
 
 ### Added
@@ -1137,7 +1137,7 @@ KD-LoRA heal, and two field-report fixes for the MiniMax video path.
   → 2.174, KL to teacher 0.099 → 0.094). A tail at f16 has no token-
   graph arm and decodes at 6.8 tok/s; the q8_2f tail is the shippable
   form (below).
-- **NVG holographic fold** of Qwen3.8-27B to the per-layer Qwen3.5-9B
+- **Structured fold** of Qwen3.8-27B to the per-layer Qwen3.5-9B
   configuration (FFN 12288, 16 attention heads, 32 GDN value heads;
   `tools/nvg_fold_qwen35.py`, math in docs/NVG_FOLD_ATTN_GDN.ru.md):
   19.84B parameters, q4tp 10.37 GB, closed form from activation Grams
@@ -1197,9 +1197,9 @@ KD-LoRA heal, and two field-report fixes for the MiniMax video path.
   f32/bf16) and `cortiq patch-tensor` (raw f32 → the tensor's own
   quantization in place, or another dtype into a new file with
   everything else copied verbatim) — the bridge that lets offline
-  tools (the FCD tail heal, the NVG fold) work on a quantized file's
+  tools (the FCD tail heal, the structured fold) work on a quantized file's
   exact numerics and write their result back.
-- `tools/nvg_fold_qwen35.py` — the holographic fold of a Qwen3.5/3.8
+- `tools/nvg_fold_qwen35.py` — the structured fold of a Qwen3.5/3.8
   hybrid in closed form (FFN width, attention q-heads, GDN value
   heads) from activation Grams, layer-streamed and grouped for a
   memory-capped box; `tools/fcd_tail_heal.py` — the last layers of a
@@ -1820,7 +1820,7 @@ moment the state landed.
   position (measured), so `--net-dtype f16` decides whether the trade
   pays. It REFUSES rather than travelling half-described — q8 storage, a
   Nyström overlay and frozen columns each hold state this format does
-  not carry. Born-rule importance does travel: every attention call
+  not carry. Attention-importance state travels too: every attention call
   accumulates it and eviction reads it, so leaving it behind would make
   the far side forget the wrong positions later, under pressure, long
   after the transfer looked fine. The oracle is what the layer ANSWERS —
@@ -3902,7 +3902,7 @@ prefill **11.8 → 16.7**. Perplexity is unchanged at every step.
 
 ### Fixed
 - **Decode collapsed with context depth on Metal.** Two causes, both in
-  `gqa_attend`: its Born-importance pass recomputed the QK dot with one
+  `gqa_attend`: its attention-importance pass recomputed the QK dot with one
   position per lane, so each lane walked a whole K row and the reads
   never coalesced; and the kernel ran one simdgroup per Q-head, putting
   only `num_heads` simdgroups on the device — nowhere near enough to
@@ -3944,7 +3944,7 @@ prefill **11.8 → 16.7**. Perplexity is unchanged at every step.
 
 ### Fixed
 - **Decode collapsed with context depth on Metal.** Two causes, both in
-  `gqa_attend`: its Born-importance pass recomputed the QK dot with one
+  `gqa_attend`: its attention-importance pass recomputed the QK dot with one
   position per lane, so each lane walked a whole K row and the reads
   never coalesced; and the kernel ran one simdgroup per Q-head, putting
   only `num_heads` simdgroups on the device — nowhere near enough to
@@ -4662,7 +4662,7 @@ decode 3.9 tok/s, TTFT 6.0 s, PPL identical to the CPU path.
 - **q1t codec** (`TensorDtype::Q1T`) — per 32-group ternary `{−s,0,+s}` packed
   base-3 (5 values/byte → ~2.25 bpw) with a sparse per-row outlier overlay
   `[u32 row_ptr[rows+1]][(u16 col, f16 val)]` (4 B/outlier, no binary search).
-  Built on the holographic-transfer idea: preserve the layer output `W·x`.
+  Built on error-feedback transfer: preserve the layer output `W·x`.
 - **`quantize-gptq` command** — a calibration-driven, training-free path
   (`CMF_GPTQ_TERNARY=1`): two-field outlier mask (`|W|·RMS(x)`), a closed-form
   per-row output-stabilising rescale (*докрутка*), and a keep-precise skip-list
@@ -4751,7 +4751,7 @@ its best CPU config, and prefills within 12% (pp512 377 → ~1030).
   next buffer with the following GDN run (~17 syncs/token instead of
   ~64) — and then all the way: new MSL kernels for per-head qk-norm +
   partial RoPE with gate split, KV append into per-layer shared-memory
-  mirrors, grouped online-softmax attend with Born importance banked via
+  mirrors, grouped online-softmax attend with attention importance banked via
   `atomic_float`, and the sigmoid output gate. One wait per token. The
   CPU cache stays the owner of record — any divergence (eviction,
   rollback, a CPU-path append) re-uploads the mirror, and after each
@@ -4778,7 +4778,7 @@ its best CPU config, and prefills within 12% (pp512 377 → ~1030).
   every position first, then attends per KV group in two fat GEMMs
   (scores `Q·Kᵀ` with the group's Q-heads stacked into one panel, and
   `P·V` after a causal masked softmax that zeroes the invisible tail),
-  with Born importance from the masked column sums. Softmax `exp` is a
+  with attention importance from the masked column sums. Softmax `exp` is a
   NEON Cephes-style polynomial — scalar `expf` over a long prefill's
   ~10⁸ calls would have eaten the GEMM win. The quadratic wall is gone:
   pp1024 390 → 976 tok/s. Chunks under 32 positions and non-F32 KV
@@ -5237,7 +5237,7 @@ matrix is still open; reproduce with `cortiq bench --json`.
   and prints `Memory: KV+state X MB at seq_len N` (O(context) KV for
   full-attention vs O(1) state for the linear core, measured).
 - Hot-path hygiene: `row_dot` (active-neuron path) NEON for q8_row/q8_2f
-  (new `dot_i8_col_f32` folds the θ col-field without a prescaled copy);
+  (new `dot_i8_col_f32` folds the column scale field without a prescaled copy);
   vbit SDOT per-row heap allocation replaced by a per-worker scratch
   (lm_head ≈ 150k rows/token); `prescale` returns borrowed activations
   for non-q8_2f dtypes (was an unconditional copy per matvec). Short-ctx
@@ -5362,7 +5362,7 @@ matrix is still open; reproduce with `cortiq bench --json`.
 
 ### Added
 
-- `cortiq convert --quant q8_2f` — the two-field (𝒲×θ) int8 quantization that
+- `cortiq convert --quant q8_2f` — the row/column-scale int8 quantization that
   recovers most of the int8→fp16 quality gap at the same file size.
 - Converter round-trip tests (q8 / q8_2f / q4 encoders + a tiny end-to-end
   convert) run in CI.
@@ -5429,7 +5429,7 @@ Initial public release.
   table, memory-mappable tensor directory, tokenizer and chat-template records,
   per-task mask records, and per-skill full-shape replacement-tensor delta
   records with a byte-offset delta index.
-- **Quantization codecs** — including the two-field `q8_2f` (scale × phase)
+- **Quantization codecs** — including the two-field `q8_2f` (row/column scales)
   path and v-bit stacking, with golden round-trip and parity tests.
 - **`cortiq-engine`** — a dependency-free runtime that memory-maps a container
   and runs inference on **CPU or GPU**. Overlay execution reads per-skill

@@ -1,4 +1,4 @@
-//! Layer-wise GPTQ — the **holographic transfer** for the `q1s` codec.
+//! Layer-wise GPTQ — an **error-feedback transfer** for the `q1s` codec.
 //!
 //! Given a weight matrix `W [out, in]` and the calibration Hessian
 //! `H = X·Xᵀ [in, in]` of its input activations, quantize the input
@@ -52,7 +52,7 @@ fn read_calib_text(path: &str, budget_chars: usize) -> anyhow::Result<String> {
 }
 
 /// `cortiq quantize-gptq`: calibrate per-layer input Hessians on a corpus,
-/// then GPTQ-quantize every captured linear to `q1s` (holographic fold +
+/// then GPTQ-quantize every captured linear to `q1s` (error-feedback fold +
 /// two-field mask); copy the rest (norms/embeddings/lm_head) verbatim.
 pub fn run_quantize_gptq(
     input: &str,
@@ -366,7 +366,7 @@ fn column_mask(w0: &[f32], in_dim: usize, act_rms: &[f32], n_out: usize) -> Vec<
 }
 
 /// Two-field outlier mask: keep the `n_out` weights of highest
-/// `|W| · RMS(x_col)` (amplitude 𝒲 × activation θ) at full precision.
+/// `|W| · RMS(x_col)` (weight magnitude × activation RMS) at full precision.
 /// `CMF_GPTQ_COLMASK=1` spends the same budget on whole channels instead.
 fn two_field_mask(w0: &[f32], in_dim: usize, act_rms: &[f32], n_out: usize) -> Vec<bool> {
     if std::env::var("CMF_GPTQ_COLMASK")
@@ -397,7 +397,7 @@ fn two_field_mask(w0: &[f32], in_dim: usize, act_rms: &[f32], n_out: usize) -> V
 }
 
 /// Ternary (BitNet b1.58) quantization with the two-field outlier mask —
-/// NO fold (the holographic fold backfires at extreme low-bit with a noisy
+/// NO fold (the error-feedback fold backfires at extreme low-bit with a noisy
 /// single-pass Hessian; ternary's zero level is the real win). Each group's
 /// scale/support are selected between the historical abs-mean rounding and
 /// an activation-weighted least-squares candidate. The lower-error candidate
@@ -611,7 +611,7 @@ pub fn quantize_q1t(
     out
 }
 
-/// Quantize `W [out,in]` to `Q1S` bytes with the GPTQ holographic fold.
+/// Quantize `W [out,in]` to `Q1S` bytes with the GPTQ error-feedback fold.
 /// `h` is the input Hessian `X·Xᵀ [in,in]` (row-major f64), `act_rms[i]` =
 /// `RMS(x_i)` over calibration (the activation field of the two-field
 /// outlier score `|W|·RMS(x)`), `keep_frac` = outlier budget, `lambda` =
@@ -673,7 +673,7 @@ pub fn gptq_quantize_q1s(
             let s = if cnt > 0 { sum / cnt as f32 } else { 0.0 };
             scale[o * groups_per_row + gi] = f16_to_f32(f32_to_f16(s)).max(6.103_515_6e-5);
         }
-        // Column-by-column quant + holographic fold into the remaining ones.
+        // Column-by-column quant + error-feedback fold into the remaining ones.
         for c in c0..c0 + GROUP_SIZE {
             let inv_d = if fold {
                 let dinv = hinv[c * n + c];
@@ -827,12 +827,12 @@ mod tests {
     }
 
     /// The core claim: on a layer with CORRELATED input activations, the
-    /// GPTQ holographic fold cuts the calibration OUTPUT error ‖(W−Ŵ)·X‖
+    /// GPTQ error-feedback fold cuts the calibration OUTPUT error ‖(W−Ŵ)·X‖
     /// far below the naïve per-group sign quantizer — because it preserves
     /// W·x, not the weights. (Weight-space methods cannot; that is the
-    /// whole point of the holographic transfer.)
+    /// whole point of the error-feedback transfer.)
     #[test]
-    fn holographic_fold_beats_naive_on_output_error() {
+    fn error_feedback_fold_beats_naive_on_output_error() {
         let (out_dim, in_dim, t) = (8usize, 64usize, 400usize);
         // Deterministic PRNG (no Math.random in this env / determinism).
         let mut seed = 0x2545F4914F6CDD1Du64;
@@ -916,7 +916,7 @@ mod tests {
         let (e_naive, e_gptq) = (out_err(&naive), out_err(&gptq));
         assert!(
             e_gptq < e_naive * 0.6,
-            "holographic fold must cut output error ≥40%: naive={e_naive:.3} gptq={e_gptq:.3}"
+            "error-feedback fold must cut output error ≥40%: naive={e_naive:.3} gptq={e_gptq:.3}"
         );
     }
 }

@@ -463,7 +463,7 @@ enum Commands {
         #[arg(long)]
         hf_token: Option<String>,
     },
-    /// 1-bit PTQ via the holographic transfer (GPTQ). Calibrates each
+    /// 1-bit PTQ via error-feedback transfer (GPTQ). Calibrates each
     /// linear's input Hessian on a corpus, then quantizes it to `q1s`:
     /// binarize with the rounding error folded into the kept weights
     /// through H⁻¹ (`Σ_PS·Σ_SS⁻¹`) so the layer OUTPUT survives, plus a
@@ -554,7 +554,7 @@ enum Commands {
         #[arg(long)]
         route_dynamic: bool,
         /// After generation, reprint the answer with each token coloured
-        /// by the model's confidence (Born mass): green = sure, red =
+        /// by the model's confidence (softmax probability): green = sure, red =
         /// guessing. The honest house — the model shows where it's unsure.
         #[arg(long)]
         confidence: bool,
@@ -832,7 +832,7 @@ enum Commands {
         #[arg(long)]
         blend: Option<String>,
         /// Dynamic per-window skill routing with hysteresis while scoring
-        /// (VMF experiment: CMF_ROUTE_EON/EOFF/MARGIN/PERIOD).
+        /// (tune with CMF_ROUTE_EON/EOFF/MARGIN/PERIOD).
         #[arg(long)]
         route_dynamic: bool,
         /// Score N evenly spaced windows of --window-len tokens instead of
@@ -900,7 +900,7 @@ enum Commands {
         #[arg(long, default_value = "8")]
         top: usize,
     },
-    /// Measure confidence calibration (B1): is the model's Born-mass
+    /// Measure confidence calibration (B1): is the model's softmax
     /// confidence a true property (80% ⇒ right 80%), or does it need a
     /// measured temperature? Reliability diagram + ECE + fitted T.
     Calibrate {
@@ -3283,7 +3283,7 @@ fn ppl_windows(
 /// B-field of claim 12: expert-routing mass of this run →
 /// JSON {layer: [counts]} (CMF_MOE_STATS=file). Works for both
 /// teacher-forcing (ppl) and on-policy generation (run) —
-/// VMF fireball principle: the observable = integral over the trajectory.
+/// Routing telemetry records the aggregate observable over the trajectory.
 fn dump_moe_stats(pipeline: &Pipeline) -> anyhow::Result<()> {
     if let Ok(path) = std::env::var("CMF_MOE_STATS") {
         let mut parts = Vec::new();
@@ -3415,7 +3415,7 @@ fn cmd_route(model_path: &str, prompt: &str) -> anyhow::Result<()> {
 
 /// Introspection without generation (ROADMAP A4): show recon-argmin skill
 /// selection (with E) and the first-token distribution the routed model
-/// would emit, plus its Born-mass confidence. Everything shown is a
+/// would emit, plus its softmax confidence. Everything shown is a
 /// quantity already computed by the runtime — no synthesis.
 fn cmd_explain(model_path: &str, prompt: &str, top: usize) -> anyhow::Result<()> {
     let model = Arc::new(CmfModel::open_sharded(model_path)?);
@@ -3455,7 +3455,7 @@ fn cmd_explain(model_path: &str, prompt: &str, top: usize) -> anyhow::Result<()>
         Some(routes[0].id.clone())
     };
 
-    // ── First token: distribution and confidence (Born mass) ──
+    // ── First token: distribution and confidence (softmax probability) ──
     // Apply the chosen skill to show EXACTLY the routed answer.
     let mut pipeline = match &winner {
         Some(id) => Pipeline::from_model_with_skill(&model, SamplerConfig::default(), Some(id))?,
@@ -3489,7 +3489,7 @@ fn cmd_explain(model_path: &str, prompt: &str, top: usize) -> anyhow::Result<()>
     }
     let top1 = probs[0].1;
     println!(
-        "Confidence on the 1st token: {} (Born mass top-1)",
+        "Confidence on the 1st token: {} (top-1 probability)",
         conf_colour(&format!("{:.0}%", top1 * 100.0), top1)
     );
     Ok(())
@@ -3561,7 +3561,7 @@ fn ece_bins(conf: &[f32], correct: &[bool]) -> (f32, Vec<(f32, f32, usize)>) {
 }
 
 /// Measure confidence calibration (B1). Teacher-forces held-out text,
-/// scores the model's Born-mass confidence against whether its argmax was
+/// scores the model's softmax confidence against whether its argmax was
 /// the real next token, over a temperature grid — reliability diagram +
 /// ECE + the temperature that best calibrates. Honest: if already
 /// calibrated, says so (no bytes needed).
@@ -3620,7 +3620,7 @@ fn cmd_calibrate(
         "well calibrated"
     };
     println!(
-        "Raw Born mass: \x1b[1m{verdict}\x1b[0m (ECE = {:.3})",
+        "Raw confidence: \x1b[1m{verdict}\x1b[0m (ECE = {:.3})",
         ece_raw
     );
 
@@ -3662,7 +3662,7 @@ fn cmd_calibrate(
     if (bt - 1.0).abs() < 1e-6 || bece + 0.005 > ece_raw {
         println!(
             "\n\x1b[1mVerdict: already calibrated (T≈1).\x1b[0m No separate field needed — \
-                  Born mass is itself the honest confidence."
+                  softmax probability is the reported confidence."
         );
     } else {
         println!(
@@ -3675,13 +3675,13 @@ fn cmd_calibrate(
             "Write into header (additive): \x1b[2mpython converter/set_calibration.py {model_path} --temperature {bt}\x1b[0m"
         );
         println!(
-            "The runtime will apply it to --confidence/--trace/explain (calibrated Born mass)."
+            "The runtime will apply it to --confidence/--trace/explain (calibrated probability)."
         );
     }
     Ok(())
 }
 
-/// Colour a token by the model's confidence (Born mass): a 5-step ramp
+/// Colour a token by the model's confidence (softmax probability): a 5-step ramp
 /// from bright green (sure) to red (guessing). 24-bit ANSI.
 fn conf_colour(text: &str, conf: f32) -> String {
     let (r, g, b) = if conf >= 0.8 {
@@ -3699,7 +3699,7 @@ fn conf_colour(text: &str, conf: f32) -> String {
 }
 
 /// Render the structured per-token telemetry trace (B4). Every column is
-/// a measured quantity: Born-mass confidence, the active skill, the
+/// a measured quantity: softmax confidence, the active skill, the
 /// recon-coherence E (‖r−BBᵀr‖²/‖φ‖², low = coherent with the skill's
 /// subspace), and a ▸ marker where the hysteresis router crossed a domain
 /// boundary. With `json`, each row is also emitted as JSONL on stderr.
@@ -4177,7 +4177,7 @@ async fn cmd_run(
             Ok(r) => {
                 let secs = started.elapsed().as_secs_f64();
                 // Confidence view: reprint token-by-token, coloured by the
-                // model's Born mass on each emitted token.
+                // model's softmax probability on each emitted token.
                 if confidence && !r.token_confidence.is_empty() {
                     println!();
                     let mut lo = 1.0f32;
@@ -5057,7 +5057,7 @@ fn cmd_story(model_path: &str) -> anyhow::Result<()> {
             println!();
         }
         println!(
-            "Skill selection is by signal physics (recon-argmin), not by name; \
+            "Skill selection is by reconstruction signal (recon-argmin), not by name; \
              storage = backbone + Σ deltas, not K copies."
         );
     }
@@ -5086,7 +5086,7 @@ fn cmd_story(model_path: &str) -> anyhow::Result<()> {
         if let (Some(a), Some(b)) = (cal.ece_before, cal.ece_after) {
             print!(", ECE {a:.3}→{b:.3}");
         }
-        println!("): I show Born mass as a measured property, not a raw estimate.");
+        println!("): I show softmax probability as a measured property, not a raw estimate.");
     }
 
     // ── Am I part of a whole ──

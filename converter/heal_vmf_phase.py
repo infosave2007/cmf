@@ -42,16 +42,14 @@ CALIB_TEXT = (
     "curvature tells matter how to move. "
     "def fibonacci(n):\n    a, b = 0, 1\n    for _ in range(n):\n"
     "        a, b = b, a + b\n    return a\n\n"
-    "Вакуумный конденсат описывается комплексным параметром порядка: "
-    "амплитуда задаёт плотность энергии, а голдстоуновская фаза — "
-    "когерентность и порядок. Плавление конденсата в плотной среде "
-    "останавливает коллапс и снимает сингулярность. "
+    "Потоковая обработка сохраняет локальные зависимости и проверяется "
+    "на стабильность при длинных последовательностях. "
     "In machine learning, attention mechanisms allow models to weigh the "
     "relevance of different parts of the input sequence when producing "
     "each element of the output. SELECT name, COUNT(*) FROM users GROUP "
     "BY name ORDER BY 2 DESC LIMIT 10; "
-    "История науки показывает, что красивые теории побеждают тогда, "
-    "когда их предсказания фальсифицируемы и подтверждаются измерением. "
+    "Надёжный эксперимент требует воспроизводимых входов и измеримых "
+    "критериев качества. "
 )
 
 

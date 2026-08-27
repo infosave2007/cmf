@@ -1,4 +1,4 @@
-//! Vacuum tests for the quantizers — payloads whose decoded value is
+//! Known-answer tests for the quantizers — payloads whose decoded value is
 //! known exactly, digit for digit, before anything runs.
 //!
 //! `roundtrip.rs` next door measures dequantization ACCURACY: encode

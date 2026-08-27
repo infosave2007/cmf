@@ -83,7 +83,7 @@ pub fn rope_rotate_scaled(x: &mut [f32], position: usize, inv_freq: &[f32], scal
 /// Single-head attention: softmax(Q·Kᵀ/√d)·V over a contiguous cache.
 /// `k_cache`/`v_cache`: `[seq_len × head_dim]`.
 /// Returns `([head_dim] output, [seq_len] attention probabilities)` —
-/// the probabilities feed Born-importance accumulation for eviction.
+/// the probabilities feed attention-importance accumulation for eviction.
 pub fn attention_head(
     q: &[f32],
     k_cache: &[f32],
@@ -460,8 +460,8 @@ pub fn multi_head_attention(
             *dst += p;
         }
     }
-    // Born rule: a position's importance is the probability mass that
-    // reads it — accumulated for importance-aware eviction.
+    // A position's importance is the probability mass that reads it —
+    // accumulated for importance-aware eviction.
     cache.accumulate_imp(&imp);
 
     // ── Output projection ──

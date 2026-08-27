@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ДЕМО РОЯ: один .cmf-файл — backbone + несколько скиллов + роутинг по
-# физике сигнала (recon-argmin), без каких-либо аргументов «какой скилл
+# сигналу реконструкции (recon-argmin), без каких-либо аргументов «какой скилл
 # брать». То, чего нет ни у GGUF, ни у safetensors (Patent 15).
 #
 # Требует: models/qwen35-swarm.cmf (этап B2) и собранный cortiq.
@@ -10,7 +10,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 SWARM="${SWARM:-models/qwen35-swarm.cmf}"
-RU_TEXT="${1:-../NVG_NEURAL_PRACTICE_RU.md}"
+RU_TEXT="${1:-docs/SKILLS.ru.md}"
 CLI=./target/release/cortiq
 export RUST_LOG=error
 [ -f "$SWARM" ] || { echo "нет $SWARM — соберите рой (make_skill + --skills)"; exit 1; }
@@ -77,12 +77,12 @@ CMF_MAX_SEQ=200 CMF_ROUTE_PERIOD=4 \
     $CLI run "$SWARM" --route-dynamic --greedy --trace \
     -p "fn main() { let mut total: u64 = 0; for i in 0..100 { total += i; } }" 2>/dev/null \
     | sed -n '/трейс/,$p' | head -26 | sed 's/^/  /'
-echo '  (conf = Born-масса уверенности; E = recon-когерентность ‖r−BBᵀr‖²/‖φ‖²;'
+echo '  (conf = вероятность уверенности; E = ошибка реконструкции ‖r−BBᵀr‖²/‖φ‖²;'
 echo '   ▸ = переключение через tensor-source indirection на лету, ноль копий;'
-echo '   два порога e_on<e_off гасят дребезг — VMF переход первого рода)'
+echo '   два порога e_on<e_off гасят дребезг переключений)'
 
 hr "7. ИНТРОСПЕКЦИЯ БЕЗ ГЕНЕРАЦИИ: cortiq explain (какой скилл и почему)"
 $CLI explain "$SWARM" -p "Напиши функцию на Rust" --top 5 2>/dev/null \
     | grep -vE "Loading|Opened|explain:|Промпт" | sed 's/^/  /'
 
-printf '\n\033[1mИтог: один файл, N навыков, селекция по физике сигнала, каждый скилл\nс измеренным контрактом качества, роутинг ЖИВОЙ (пер-токенный) и\nНАБЛЮДАЕМЫЙ (--trace, explain). Хранение = бэкбон + Σ дельт.\033[0m\n'
+printf '\n\033[1mИтог: один файл, N навыков, селекция по сигналу реконструкции, каждый скилл\nс измеренным контрактом качества, роутинг ЖИВОЙ (пер-токенный) и\nНАБЛЮДАЕМЫЙ (--trace, explain). Хранение = бэкбон + Σ дельт.\033[0m\n'

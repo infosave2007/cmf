@@ -792,7 +792,7 @@ impl Pipeline {
                         nphase: need(lc.nphase, "linear_core.nphase")?,
                         value_head_dim: lc.value_head_dim,
                         hidden_size: arch.hidden_size,
-                        // θ-mass (η′): default 0 (massless); CMF_PHASE_MASS
+                        // Phase-mass correction: default 0 (disabled); CMF_PHASE_MASS
                         // widens the phase kernel for folded-unhealed models.
                         phase_mass: std::env::var("CMF_PHASE_MASS")
                             .ok()
@@ -1727,7 +1727,7 @@ impl Pipeline {
             Overlay::None => {}
         }
         // B1: apply the measured confidence-calibration temperature, if the
-        // file carries one (softmax(logits / T) for reported Born mass).
+        // file carries one (softmax(logits / T) for reported confidence).
         if let Some(c) = &model.header.calibration {
             pipeline.set_calib_temp(c.temperature);
         }
