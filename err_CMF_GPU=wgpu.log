@@ -1,9 +1,0 @@
-[2m2026-08-16T05:38:23.572773Z[0m [32m INFO[0m [2mcortiq_core::format[0m[2m:[0m Opened CMF v2: qwen3_5 | 335 tensors | 0 masks | vocab embedded | 425.9 MB
-[2m2026-08-16T05:38:23.700924Z[0m [32m INFO[0m [2mcortiq_engine::tokenizer[0m[2m:[0m Tokenizer loaded: 248070 vocab, 247587 merges, 26 added, eos=Some(248044)
-[2m2026-08-16T05:38:23.700986Z[0m [32m INFO[0m [2mcortiq_engine::loader[0m[2m:[0m chat bundle: template 7755 chars, 0 stop ids
-[2m2026-08-16T05:38:23.701944Z[0m [32m INFO[0m [2mcortiq_engine::loader[0m[2m:[0m Pipeline loaded: qwen3_5 | 24L (18 linear) | 0.77B params | storage: quantized mmap | MTP: yes
-[2m2026-08-16T05:38:23.702048Z[0m [32m INFO[0m [2mcortiq_engine::pipeline[0m[2m:[0m worker pool: 9 threads
-[2m2026-08-16T05:38:23.712633Z[0m [32m INFO[0m [2mcortiq_engine::gpu_wgpu[0m[2m:[0m wgpu GPU path: on (Apple M4 / Metal, uma, weight budget unlimited, q1 8 rows/128 threads)
-[2m2026-08-16T05:38:25.131712Z[0m [32m INFO[0m [2mcortiq_engine::pipeline[0m[2m:[0m wgpu whole-token graph: ACTIVE
-[2m2026-08-16T05:38:26.861397Z[0m [32m INFO[0m [2mcortiq_engine::pipeline[0m[2m:[0m speculation trial: 1.00 tok/round in 84.4 ms vs plain 13.2 ms/tok — plain
-[2m2026-08-16T05:38:28.014901Z[0m [32m INFO[0m [2mcortiq_engine::gpu_metal[0m[2m:[0m Metal GPU path: on (Apple M4)
