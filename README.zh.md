@@ -106,6 +106,14 @@ assert r.verify() == []                               # 所有张量哈希都对
 | `q1t` | 2.25–3.5 | 免训练三值 + 稀疏离群覆盖层（[文档](docs/Q1T_PTQ.md)） |
 | `q1` | 1.5 | 面向**以二值训练**出来的检查点（Bonsai / BitNet） |
 
+**Granite 4.2 已获得显式支持。**公开的
+[3B/8B/30B Q4TP 与 Q8_2F 文件](https://huggingface.co/infosave/Granite-4.2-cmf)
+携带 IBM 的精确 attention multiplier 和官方聊天模板。Q4TP 会把 100,352-token
+embedding 与独立的 `lm_head` 保留为 Q8_2F；完整 Q8_2F 则作为更高质量的对照档。
+当稠密模型大于显存时，Cortiq 会选择固定的 GPU 层前缀，并在 CPU 上运行 mmap
+尾部，而不是让全部权重反复流经驱动。在 10 核 M4 上，3B 文件的稳定解码速度为
+34.8 tok/s（Q4TP）和 11.2 tok/s（Q8_2F）。
+
 一句话讲 `q4tp`：一个 `q4t` 瓦片为 32 个权重花掉 16 比特存 f16 缩放，占文件的
 11%。把这个缩放改成按行几何阶梯上的 5 比特档位，代价是在行内中位离散度上
 **多 0.1% 的相对误差**。已有文件可以就地转换，不需要原始检查点：
@@ -339,9 +347,12 @@ Bug 与需求：[提 issue](https://github.com/infosave2007/cmf/issues)。
 安全问题：**请不要**公开提 issue，见 [SECURITY.md](SECURITY.md)。
 转换不了的模型是 bug 报告，不是用户的错。
 
-> **关于 Hub 的下载计数。** `.cmf` 文件还没被纳入 Hub 的下载统计注册表，所以
-> CMF 仓库即使有真实流量也显示 `0`。上游修复待合并：
+> **Hub 集成。** `.cmf` 下载计数和 Cortiq 代码片段的上游改动已于 2026 年
+> 8 月 26 日合并：
 > [huggingface.js#2354](https://github.com/huggingface/huggingface.js/pull/2354)。
+> 它已经进入发布的 `@huggingface/tasks` 包，但 Hub 的 production UI 与统计
+> worker 尚未部署这项变更：截至 8 月 27 日，CMF 仓库仍显示 `0` 下载，也还没有
+> “Use with Cortiq” 入口。
 
 ## 许可
 

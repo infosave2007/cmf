@@ -44,11 +44,7 @@ CPU, Vulkan (NVIDIA/AMD/Intel), DX12 and Metal; inference needs no Python,
 PyTorch, CUDA toolkit or model-specific GPU build.
 
 ```bash
-# Granite 4.2 support is newer than cortiq 0.6.3. Until the next packaged
-# release, build the checkout containing this support:
-git clone --branch codex/granite-4-2 https://github.com/infosave2007/cmf
-cd cmf
-cargo install --path crates/cortiq-cli --features gpu
+cargo install cortiq-cli --version 0.6.4
 
 hf download infosave/Granite-4.2-cmf granite-4.2-3b-q4tp.cmf --local-dir .
 cortiq verify granite-4.2-3b-q4tp.cmf

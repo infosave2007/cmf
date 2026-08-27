@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.4] - 2026-08-27
+
+### Added
+- Explicit IBM Granite 4.2 support for the 3B, 8B and 30B dense reasoning
+  models, including their direct `attention_multiplier`, embedding/logit
+  multipliers, GQA geometry and exact upstream thinking/non-thinking chat
+  template.
+- Published Q4TP and Q8_2F CMF profiles for every Granite 4.2 size. The Q4TP
+  profile keeps the 100,352-row input embedding and untied `lm_head` in
+  Q8_2F so both vocabulary boundaries retain the higher-quality layout.
+
+### Changed
+- Dense Vulkan execution now derives a fixed GPU layer prefix from the
+  detected memory budget and runs an mmap-backed CPU tail when a model is
+  larger than VRAM. Batched prefill and decode share the same boundary;
+  `CMF_GPU_VRAM_MB` can impose a stricter ceiling.
+- GPU KV mirrors start at 512 positions and grow geometrically rather than
+  reserving a model's advertised maximum context on the first token.
+- Metal and Vulkan graphs carry each model's explicit attention scale through
+  single-token, split-context and batched paths. Granite no longer falls back
+  solely because its scale differs from `1/sqrt(head_dim)`.
+
+### Fixed
+- Q8_2F graph payload accounting includes both fields for prefill and decode,
+  preventing hidden re-uploads and driver-memory amplification on constrained
+  cards. CPU tails are protected from accidentally re-entering the GPU arena.
+- Vulkan graph admission checks the complete live payload before upload and
+  leaves a physical driver/workspace reserve, allowing Granite 30B Q4TP and
+  Q8_2F to complete under tested 16 GiB-equivalent budgets instead of OOM.
+- Standalone wgpu attention parity helpers now populate the explicit scale
+  field introduced for Granite; their previous zero-filled compatibility word
+  made the direct GQA test compute uniform attention.
+- The multilingual tokenizer parity test truncates its corpus only at a UTF-8
+  character boundary instead of panicking when byte 20,000 splits a codepoint.
+
 ## [0.6.3] - 2026-08-27
 
 ### Added

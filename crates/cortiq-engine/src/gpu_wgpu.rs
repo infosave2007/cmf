@@ -16903,7 +16903,14 @@ pub fn gqa_attend_gpu(
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("at-p"),
             contents: bytemuck::cast_slice(&[
-                nh as u32, hpk as u32, hd as u32, cap as u32, n as u32, 0u32, 0u32, 0u32,
+                nh as u32,
+                hpk as u32,
+                hd as u32,
+                cap as u32,
+                n as u32,
+                (1.0 / (hd as f32).sqrt()).to_bits(),
+                0u32,
+                0u32,
             ]),
             usage: wgpu::BufferUsages::UNIFORM,
         });
@@ -16977,7 +16984,14 @@ pub fn gqa_attend_split_gpu(
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("ap-p"),
             contents: bytemuck::cast_slice(&[
-                nh as u32, hpk as u32, hd as u32, cap as u32, n as u32, ck as u32, nc as u32, 0u32,
+                nh as u32,
+                hpk as u32,
+                hd as u32,
+                cap as u32,
+                n as u32,
+                ck as u32,
+                nc as u32,
+                (1.0 / (hd as f32).sqrt()).to_bits(),
             ]),
             usage: wgpu::BufferUsages::UNIFORM,
         });
