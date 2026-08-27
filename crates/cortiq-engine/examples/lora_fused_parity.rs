@@ -66,10 +66,15 @@ fn main() {
 
     // Fused: one submission, base and branch together.
     let mut got = vec![0f32; n * rows];
-    let side = cortiq_engine::gpu_metal::LoraSide { a: &a, b: &b, rank, scale, id: 7_000_001 };
-    let ok = cortiq_engine::gpu_metal::q4tp_matmat_lora(
-        &model, idx, &x, n, rows, cols, &mut got, &side,
-    );
+    let side = cortiq_engine::gpu_metal::LoraSide {
+        a: &a,
+        b: &b,
+        rank,
+        scale,
+        id: 7_000_001,
+    };
+    let ok =
+        cortiq_engine::gpu_metal::q4tp_matmat_lora(&model, idx, &x, n, rows, cols, &mut got, &side);
     assert!(ok, "the device declined the shape");
 
     // Scale the difference by the row's own magnitude: a quiet row and a loud

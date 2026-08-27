@@ -39,6 +39,7 @@ fn arch() -> ModelArch {
         local_partial_rotary_factor: None,
         mtp: None,
         moe: None,
+        qwen4_exp: None,
         linear_core: None,
         head_clusters: None,
         max_position_embeddings: 64,

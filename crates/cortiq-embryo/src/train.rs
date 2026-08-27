@@ -16,13 +16,22 @@ impl Shard {
         let mut f = std::fs::File::open(path)?;
         let mut bytes = Vec::new();
         f.read_to_end(&mut bytes)?;
-        anyhow::ensure!(bytes.len() % 2 == 0, "shard {}: odd byte length", path.display());
-        let tokens = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        anyhow::ensure!(
+            bytes.len() % 2 == 0,
+            "shard {}: odd byte length",
+            path.display()
+        );
+        let tokens = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
         Ok(Shard { tokens })
     }
     /// Bytes as tokens (vocab 256) — the zero-dependency smoke corpus.
     pub fn from_bytes(text: &[u8]) -> Shard {
-        Shard { tokens: text.iter().map(|b| *b as u16).collect() }
+        Shard {
+            tokens: text.iter().map(|b| *b as u16).collect(),
+        }
     }
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         let mut f = std::fs::File::create(path)?;
@@ -44,7 +53,11 @@ pub struct Sampler {
 
 impl Sampler {
     pub fn new(b: usize, t: usize, seed: u64) -> Sampler {
-        Sampler { b, t, state: seed ^ 0x9E37_79B9_7F4A_7C15 }
+        Sampler {
+            b,
+            t,
+            state: seed ^ 0x9E37_79B9_7F4A_7C15,
+        }
     }
     fn next_u64(&mut self) -> u64 {
         self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -67,7 +80,14 @@ impl Sampler {
         }
     }
     /// Fixed evenly spaced windows for a deterministic validation set.
-    pub fn fixed_batch(shard: &Shard, b: usize, t: usize, index: usize, tokens: &mut Vec<u32>, targets: &mut Vec<u32>) {
+    pub fn fixed_batch(
+        shard: &Shard,
+        b: usize,
+        t: usize,
+        index: usize,
+        tokens: &mut Vec<u32>,
+        targets: &mut Vec<u32>,
+    ) {
         let n = shard.tokens.len();
         tokens.clear();
         targets.clear();
@@ -104,7 +124,10 @@ pub fn save_checkpoint(
 ) -> anyhow::Result<()> {
     let tmp = path.with_extension("tmp");
     let mut f = std::fs::File::create(&tmp)?;
-    let ex: Vec<serde_json::Value> = extras.iter().map(|(n, x)| serde_json::json!([n, x.len()])).collect();
+    let ex: Vec<serde_json::Value> = extras
+        .iter()
+        .map(|(n, x)| serde_json::json!([n, x.len()]))
+        .collect();
     let hdr = serde_json::json!({ "cfg": cfg, "step": step, "n": params.len(), "opt": m.is_some(), "extras": ex });
     let hs = serde_json::to_vec(&hdr)?;
     f.write_all(&(hs.len() as u64).to_le_bytes())?;
@@ -151,10 +174,17 @@ pub fn load_checkpoint(path: &Path) -> anyhow::Result<Checkpoint> {
     let rd = |f: &mut std::fs::File, n: usize| -> anyhow::Result<Vec<f32>> {
         let mut bytes = vec![0u8; n * 4];
         f.read_exact(&mut bytes)?;
-        Ok(bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
     };
     let params = rd(&mut f, n)?;
-    let (m, v) = if opt { (Some(rd(&mut f, n)?), Some(rd(&mut f, n)?)) } else { (None, None) };
+    let (m, v) = if opt {
+        (Some(rd(&mut f, n)?), Some(rd(&mut f, n)?))
+    } else {
+        (None, None)
+    };
     let mut extras = Vec::new();
     if let Some(list) = hdr["extras"].as_array() {
         for e in list {
@@ -163,7 +193,14 @@ pub fn load_checkpoint(path: &Path) -> anyhow::Result<Checkpoint> {
             extras.push((name, rd(&mut f, len)?));
         }
     }
-    Ok(Checkpoint { cfg, step, params, m, v, extras })
+    Ok(Checkpoint {
+        cfg,
+        step,
+        params,
+        m,
+        v,
+        extras,
+    })
 }
 
 /// Several shards mixed by weight (each sequence of a batch is drawn from
@@ -182,7 +219,9 @@ impl Mix {
         let mut val = Vec::new();
         for s in specs {
             let (path, w) = match s.rsplit_once(':') {
-                Some((p, w)) if w.parse::<f64>().is_ok() && !p.is_empty() => (p.to_string(), w.parse::<f64>().unwrap()),
+                Some((p, w)) if w.parse::<f64>().is_ok() && !p.is_empty() => {
+                    (p.to_string(), w.parse::<f64>().unwrap())
+                }
                 _ => (s.clone(), 1.0),
             };
             let mut sh = Shard::load(Path::new(&path))?;
@@ -190,7 +229,10 @@ impl Mix {
             let cut = n - ((n as f64 * holdout) as usize).max(seq + 2).min(n / 2);
             val.extend_from_slice(&sh.tokens[cut..]);
             sh.tokens.truncate(cut);
-            eprintln!("shard {path}: {:.1} M train tokens, weight {w}", sh.tokens.len() as f64 / 1e6);
+            eprintln!(
+                "shard {path}: {:.1} M train tokens, weight {w}",
+                sh.tokens.len() as f64 / 1e6
+            );
             shards.push(sh);
             weights.push(w);
         }

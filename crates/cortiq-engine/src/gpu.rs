@@ -571,7 +571,13 @@ pub fn probe_note_decline(c: OpClass) {
 /// Record a timed arm sample; on the `PROBE_SAMPLES`-th clean sample of
 /// BOTH arms the class decides for the rest of the process.
 pub fn probe_record(c: OpClass, gpu: bool, dur: std::time::Duration) {
-    probe_record_into(&PROBES[c as usize], CLASS_NAMES[c as usize], Some(c), gpu, dur)
+    probe_record_into(
+        &PROBES[c as usize],
+        CLASS_NAMES[c as usize],
+        Some(c),
+        gpu,
+        dur,
+    )
 }
 
 /// The body of `probe_record` over ONE probe, so the decision can be
@@ -1145,9 +1151,9 @@ pub fn q8_matmat_2f(
     #[allow(unreachable_patterns)]
     match backend() {
         #[cfg(feature = "gpu")]
-        Backend::Wgpu => crate::gpu_wgpu::q8_matmat_2f(
-            model, idx, row_scale, col_field, xs, b, rows, cols, out,
-        ),
+        Backend::Wgpu => {
+            crate::gpu_wgpu::q8_matmat_2f(model, idx, row_scale, col_field, xs, b, rows, cols, out)
+        }
         _ => false,
     }
 }

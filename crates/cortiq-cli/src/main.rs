@@ -6,15 +6,15 @@ mod convert;
 mod gguf;
 mod gptq;
 mod imagepack;
+mod ltxcmd;
+mod ltxpack;
 mod moedefrag;
-mod tube;
 mod music;
 mod npy;
 mod requant;
 mod sign;
 mod skill;
-mod ltxcmd;
-mod ltxpack;
+mod tube;
 mod videopack;
 
 use clap::{Parser, Subcommand};
@@ -1661,8 +1661,9 @@ enum SkillCmd {
         #[arg(long, default_value = "0.0")]
         min_delta: f32,
         /// Store the skill's tensors in a cheaper encoding than the
-        /// backbone (q8 | q8_2f | q4 | q4t | f16 | vbit): half the
-        /// bytes with q4 on a q8 backbone. Verify with --quality
+        /// backbone (q8 | q8_2f | q4 | q4t | q4tp | q2tp | q1 | q1p |
+        /// q1s | q1t | f16 | vbit): per-tensor dtypes are native to CMF,
+        /// e.g. q4 halves an overlay on a q8 backbone. Verify with --quality
         #[arg(long)]
         skill_quant: Option<String>,
         /// Mean bits for --skill-quant vbit (3.0–8.0; small models
@@ -1698,6 +1699,11 @@ enum SkillCmd {
         /// Task corpus: one or more plain-text files
         #[arg(long, num_args = 1.., required = true)]
         files: Vec<String>,
+        /// Dedicated validation corpus for the held-out quality gate.
+        /// When omitted, the first --held chunks of --files are used
+        /// for backwards compatibility.
+        #[arg(long, num_args = 1..)]
+        held_files: Vec<String>,
         /// Output .cmf (the standalone specialist)
         #[arg(long)]
         output: String,
@@ -1707,6 +1713,15 @@ enum SkillCmd {
         /// Phase B steps (FCD polish)
         #[arg(long, default_value = "120")]
         steps_b: usize,
+        /// Phase A Adam learning rate
+        #[arg(long, default_value = "0.1")]
+        lr_a: f64,
+        /// Phase B FCD Adam learning rate
+        #[arg(long, default_value = "0.00001")]
+        lr_b: f64,
+        /// Evaluate and checkpoint every N steps
+        #[arg(long, default_value = "30")]
+        eval_every: usize,
         /// How many of the last layers Phase B trains
         #[arg(long, default_value = "4")]
         fcd_layers: usize,
@@ -1722,6 +1737,11 @@ enum SkillCmd {
         /// are what cost, chunks only feed them.
         #[arg(long, default_value = "112")]
         calib_chunks: usize,
+        /// Comma-separated single-token labels to score/train on while
+        /// still forwarding the full chunk as context (for example
+        /// DOWN,UP). Empty means ordinary all-token LM loss.
+        #[arg(long)]
+        focus_tokens: Option<String>,
         /// Target sparsity (0.0–1.0): force at least this fraction of
         /// FFN neurons to be pruned. 0 = auto (denoising bottom)
         #[arg(long, default_value = "0.0")]
@@ -2204,14 +2224,17 @@ async fn main() -> anyhow::Result<()> {
             out_latent: out_latent.as_deref(),
             skip_decode,
         }),
-        Commands::LtxEncode { model, prompt, oracle, out } => {
-            ltxcmd::cmd_ltx_encode(ltxcmd::EncodeArgs {
-                model: &model,
-                prompt: &prompt,
-                oracle: oracle.as_deref(),
-                out: out.as_deref(),
-            })
-        }
+        Commands::LtxEncode {
+            model,
+            prompt,
+            oracle,
+            out,
+        } => ltxcmd::cmd_ltx_encode(ltxcmd::EncodeArgs {
+            model: &model,
+            prompt: &prompt,
+            oracle: oracle.as_deref(),
+            out: out.as_deref(),
+        }),
         Commands::LtxVideo {
             model,
             prompt,
@@ -2263,15 +2286,19 @@ async fn main() -> anyhow::Result<()> {
             refs,
             ref_frames,
         }),
-        Commands::LtxAudio { model, latent, out, stats, oracle } => {
-            ltxcmd::cmd_ltx_audio(ltxcmd::AudioArgs {
-                model: &model,
-                latent: &latent,
-                out: &out,
-                stats,
-                oracle: oracle.as_deref(),
-            })
-        }
+        Commands::LtxAudio {
+            model,
+            latent,
+            out,
+            stats,
+            oracle,
+        } => ltxcmd::cmd_ltx_audio(ltxcmd::AudioArgs {
+            model: &model,
+            latent: &latent,
+            out: &out,
+            stats,
+            oracle: oracle.as_deref(),
+        }),
         Commands::LtxPack {
             out,
             carry,
@@ -2511,13 +2538,18 @@ async fn main() -> anyhow::Result<()> {
             SkillCmd::Bake {
                 model,
                 files,
+                held_files,
                 output,
                 steps_a,
                 steps_b,
+                lr_a,
+                lr_b,
+                eval_every,
                 fcd_layers,
                 chunk,
                 held,
                 calib_chunks,
+                focus_tokens,
                 target_sparsity,
                 l1_aggression,
                 ffn_align,
@@ -2525,13 +2557,18 @@ async fn main() -> anyhow::Result<()> {
             } => skill::run_skill_bake(
                 &model,
                 &files,
+                &held_files,
                 &output,
                 steps_a,
                 steps_b,
+                lr_a,
+                lr_b,
+                eval_every,
                 fcd_layers,
                 chunk,
                 held,
                 calib_chunks,
+                focus_tokens.as_deref(),
                 target_sparsity,
                 l1_aggression,
                 ffn_align,
@@ -3043,7 +3080,7 @@ fn cmd_fcd(
         &out_path,
         gate_cfg.as_ref(),
     )
-        .map_err(|e| anyhow::anyhow!("fcd polish: {e}"))?;
+    .map_err(|e| anyhow::anyhow!("fcd polish: {e}"))?;
 
     println!("── FCD polish report ──");
     println!("converted layers : {:?}", report.converted);
@@ -3334,7 +3371,10 @@ fn cmd_route(model_path: &str, prompt: &str) -> anyhow::Result<()> {
     let model = Arc::new(CmfModel::open_sharded(model_path)?);
     let mut pipeline = Pipeline::from_model(&model, SamplerConfig::default())?;
     let ids = pipeline.tokenizer.encode(prompt);
-    let tau = std::env::var("CMF_OOD_TAU").ok().and_then(|v| v.parse().ok()).unwrap_or(0.30);
+    let tau = std::env::var("CMF_OOD_TAU")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.30);
     let r = cortiq_engine::router::route_full(&model, &mut pipeline, &ids, tau);
     if r.scores.is_empty() {
         println!("no routable skills in this container");
@@ -3342,7 +3382,10 @@ fn cmd_route(model_path: &str, prompt: &str) -> anyhow::Result<()> {
     }
     for s in &r.scores {
         if r.calibrated {
-            println!("  {:<20} E = {:.4}  err = {:.3e}  p = {:.3}", s.id, s.error, s.raw_error, s.probability);
+            println!(
+                "  {:<20} E = {:.4}  err = {:.3e}  p = {:.3}",
+                s.id, s.error, s.raw_error, s.probability
+            );
         } else {
             println!("  {:<20} E = {:.4}", s.id, s.error);
         }
@@ -3354,10 +3397,18 @@ fn cmd_route(model_path: &str, prompt: &str) -> anyhow::Result<()> {
             r.confidence,
             r.margin,
             r.novelty,
-            if r.is_novel { "OOD (novel)" } else { "in-scope" }
+            if r.is_novel {
+                "OOD (novel)"
+            } else {
+                "in-scope"
+            }
         );
     } else {
-        println!("winner: {}  ({}; uncalibrated file: E_min vs τ={tau})", r.scores[0].id, if r.is_novel { "OOD" } else { "in-scope" });
+        println!(
+            "winner: {}  ({}; uncalibrated file: E_min vs τ={tau})",
+            r.scores[0].id,
+            if r.is_novel { "OOD" } else { "in-scope" }
+        );
     }
     Ok(())
 }
@@ -4226,9 +4277,23 @@ async fn cmd_run(
         // CMF_PROMPT_DUMP=1: the rendered prompt as the model sees it
         // (template applied, decoded back to text) — for template audits.
         if std::env::var("CMF_PROMPT_DUMP").is_ok() {
-            eprintln!("--- rendered prompt ({} tokens) ---\n{}\n--- end ---", ids.len(), pipeline.tokenizer.decode(&ids));
-            let head: Vec<String> = ids.iter().take(12).map(|&t| format!("{t}:{:?}", pipeline.tokenizer.decode(&[t]))).collect();
-            let tail: Vec<String> = ids.iter().rev().take(12).rev().map(|&t| format!("{t}:{:?}", pipeline.tokenizer.decode(&[t]))).collect();
+            eprintln!(
+                "--- rendered prompt ({} tokens) ---\n{}\n--- end ---",
+                ids.len(),
+                pipeline.tokenizer.decode(&ids)
+            );
+            let head: Vec<String> = ids
+                .iter()
+                .take(12)
+                .map(|&t| format!("{t}:{:?}", pipeline.tokenizer.decode(&[t])))
+                .collect();
+            let tail: Vec<String> = ids
+                .iter()
+                .rev()
+                .take(12)
+                .rev()
+                .map(|&t| format!("{t}:{:?}", pipeline.tokenizer.decode(&[t])))
+                .collect();
             eprintln!("head {}\ntail {}", head.join(" "), tail.join(" "));
         }
         generate_and_print(&mut pipeline, &ids)?;
@@ -4411,7 +4476,13 @@ fn wgpu_uploads() -> (f64, f64) {
     }
 }
 
-fn cmd_dequant(model_path: &str, name: &str, out: &str, dtype: &str, all: bool) -> anyhow::Result<()> {
+fn cmd_dequant(
+    model_path: &str,
+    name: &str,
+    out: &str,
+    dtype: &str,
+    all: bool,
+) -> anyhow::Result<()> {
     let model = CmfModel::open_sharded(model_path)?;
     let names: Vec<String> = if all {
         model
@@ -4549,7 +4620,11 @@ fn cmd_patch_tensor(
                 );
             }
         }
-        eprintln!("{name}: {rows}×{cols} {:?} → {dt:?} ({} bytes)", e.dtype, data.len());
+        eprintln!(
+            "{name}: {rows}×{cols} {:?} → {dt:?} ({} bytes)",
+            e.dtype,
+            data.len()
+        );
         patches.push((idx, dt, data));
     }
     match output {

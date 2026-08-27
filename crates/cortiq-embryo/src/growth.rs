@@ -13,7 +13,12 @@ use std::time::Instant;
 
 /// Host-side surgery: E → E+1 experts in every layer. Returns the grown
 /// checkpoint and, per layer, the source expert copied.
-pub fn grow_experts(ck: &Checkpoint, noise: f32, shift: f32, seed: u64) -> (Checkpoint, Vec<usize>) {
+pub fn grow_experts(
+    ck: &Checkpoint,
+    noise: f32,
+    shift: f32,
+    seed: u64,
+) -> (Checkpoint, Vec<usize>) {
     let cfg0 = ck.cfg.clone();
     let mut cfg = cfg0.clone();
     cfg.experts += 1;
@@ -23,15 +28,23 @@ pub fn grow_experts(ck: &Checkpoint, noise: f32, shift: f32, seed: u64) -> (Chec
     let lay1 = Layout::new(&cfg);
     let mut p = vec![0.0f32; lay1.total];
     // copy every named tensor by name (offsets differ; names are stable)
-    let old_by_name: std::collections::HashMap<&str, (usize, usize)> =
-        lay0.names.iter().map(|(n, o, l)| (n.as_str(), (*o, *l))).collect();
+    let old_by_name: std::collections::HashMap<&str, (usize, usize)> = lay0
+        .names
+        .iter()
+        .map(|(n, o, l)| (n.as_str(), (*o, *l)))
+        .collect();
     for (name, off, len) in &lay1.names {
         if let Some((o0, l0)) = old_by_name.get(name.as_str()) {
             debug_assert_eq!(l0, len);
             p[*off..*off + len].copy_from_slice(&ck.params[*o0..*o0 + l0]);
         }
     }
-    let ex = |name: &str| ck.extras.iter().find(|(n, _)| n == name).map(|(_, x)| x.clone());
+    let ex = |name: &str| {
+        ck.extras
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, x)| x.clone())
+    };
     let mu0 = ex("desc.mu").unwrap_or_else(|| vec![0.0; cfg0.layers * e0 * h]);
     let u0 = ex("desc.u").unwrap_or_else(|| vec![0.0; cfg0.layers * e0 * k * h]);
     let b0 = ex("desc.bias").unwrap_or_else(|| vec![0.0; cfg0.layers * e0]);
@@ -59,10 +72,13 @@ pub fn grow_experts(ck: &Checkpoint, noise: f32, shift: f32, seed: u64) -> (Chec
     for l in 0..cfg.layers {
         // old descriptors copied verbatim
         mu1[l * e1 * h..l * e1 * h + e0 * h].copy_from_slice(&mu0[l * e0 * h..(l + 1) * e0 * h]);
-        u1[l * e1 * k * h..l * e1 * k * h + e0 * k * h].copy_from_slice(&u0[l * e0 * k * h..(l + 1) * e0 * k * h]);
+        u1[l * e1 * k * h..l * e1 * k * h + e0 * k * h]
+            .copy_from_slice(&u0[l * e0 * k * h..(l + 1) * e0 * k * h]);
         b1[l * e1..l * e1 + e0].copy_from_slice(&b0[l * e0..(l + 1) * e0]);
         // hottest expert = most negative balancing bias
-        let src = (0..e0).min_by(|&a, &b| b0[l * e0 + a].partial_cmp(&b0[l * e0 + b]).unwrap()).unwrap_or(0);
+        let src = (0..e0)
+            .min_by(|&a, &b| b0[l * e0 + a].partial_cmp(&b0[l * e0 + b]).unwrap())
+            .unwrap_or(0);
         sources.push(src);
         let ffn = match &lay1.layers[l] {
             LayerOffs::Mixer { ffn, .. } | LayerOffs::Anchor { ffn, .. } => ffn,
@@ -92,8 +108,22 @@ pub fn grow_experts(ck: &Checkpoint, noise: f32, shift: f32, seed: u64) -> (Chec
         u1[ub..ub + k * h].copy_from_slice(&u0[(l * e0 + src) * k * h..(l * e0 + src + 1) * k * h]);
         b1[l * e1 + e0] = b0[l * e0 + src];
     }
-    let extras = vec![("desc.mu".to_string(), mu1), ("desc.u".to_string(), u1), ("desc.bias".to_string(), b1)];
-    (Checkpoint { cfg, step: ck.step, params: p, m: m1, v: v1, extras }, sources)
+    let extras = vec![
+        ("desc.mu".to_string(), mu1),
+        ("desc.u".to_string(), u1),
+        ("desc.bias".to_string(), b1),
+    ];
+    (
+        Checkpoint {
+            cfg,
+            step: ck.step,
+            params: p,
+            m: m1,
+            v: v1,
+            extras,
+        },
+        sources,
+    )
 }
 
 pub struct GrowArgs {
@@ -107,19 +137,29 @@ pub struct GrowArgs {
 
 /// Train only the newest expert of every layer (index E−1) on `corpus`;
 /// returns (trained checkpoint, held-out loss before, after).
-pub fn train_new_experts(ck: &Checkpoint, corpus: &Shard, a: &GrowArgs, should_stop: &dyn Fn() -> bool) -> anyhow::Result<(Checkpoint, f32, f32)> {
+pub fn train_new_experts(
+    ck: &Checkpoint,
+    corpus: &Shard,
+    a: &GrowArgs,
+    should_stop: &dyn Fn() -> bool,
+) -> anyhow::Result<(Checkpoint, f32, f32)> {
     let cfg: EmbryoCfg = ck.cfg.clone();
     let lay = Layout::new(&cfg);
     let (h, i) = (cfg.hidden, cfg.inter);
     let e_new = cfg.experts - 1;
-    let mut gpu = EmbryoGpu::new(cfg.clone(), a.batch, a.seq, &ck.params).ok_or_else(|| anyhow::anyhow!("no Metal"))?;
+    let mut gpu = EmbryoGpu::new(cfg.clone(), a.batch, a.seq, &ck.params)
+        .ok_or_else(|| anyhow::anyhow!("no Metal"))?;
     gpu.set_desc(&ck.extras);
     gpu.desc_frozen_below.set(e_new);
     let n = corpus.tokens.len();
     anyhow::ensure!(n > 20 * (a.seq + 2), "growth corpus too small: {n} tokens");
     let cut = n - n / 10;
-    let train = Shard { tokens: corpus.tokens[..cut].to_vec() };
-    let held = Shard { tokens: corpus.tokens[cut..].to_vec() };
+    let train = Shard {
+        tokens: corpus.tokens[..cut].to_vec(),
+    };
+    let held = Shard {
+        tokens: corpus.tokens[cut..].to_vec(),
+    };
     let m = a.batch * a.seq;
     let nval = (held.tokens.len() / (m + 1)).clamp(1, 4);
     let (mut tk, mut tg) = (Vec::new(), Vec::new());
@@ -152,16 +192,36 @@ pub fn train_new_experts(ck: &Checkpoint, corpus: &Shard, a: &GrowArgs, should_s
             anyhow::bail!("preempted");
         }
         sampler.batch(&train, &mut tk, &mut tg);
-        let lr = a.lr * 0.5 * (1.0 + (std::f32::consts::PI * step as f32 / a.steps.max(1) as f32).cos());
+        let lr =
+            a.lr * 0.5 * (1.0 + (std::f32::consts::PI * step as f32 / a.steps.max(1) as f32).cos());
         let (loss, gn) = gpu.train_step_ranges(&tk, &tg, lr, 0.0, 1.0, &ranges);
         if (step + 1) % a.eval_every == 0 || step + 1 == a.steps {
             let vl = eval(&gpu, &mut tk, &mut tg);
-            eprintln!("  grow step {:>4} loss {loss:.4} |g| {gn:.3} lr {lr:.2e} held-out {vl:.4} (before {l_before:.4}) [{:.0} s]", step + 1, t0.elapsed().as_secs_f64());
+            eprintln!(
+                "  grow step {:>4} loss {loss:.4} |g| {gn:.3} lr {lr:.2e} held-out {vl:.4} (before {l_before:.4}) [{:.0} s]",
+                step + 1,
+                t0.elapsed().as_secs_f64()
+            );
             if vl < best.0 {
                 best = (vl, gpu.params_host(), gpu.desc_host());
             }
         }
     }
-    let extras: Vec<(String, Vec<f32>)> = best.2.into_iter().map(|(n, x)| (n.to_string(), x)).collect();
-    Ok((Checkpoint { cfg, step: ck.step, params: best.1, m: None, v: None, extras }, l_before, best.0))
+    let extras: Vec<(String, Vec<f32>)> = best
+        .2
+        .into_iter()
+        .map(|(n, x)| (n.to_string(), x))
+        .collect();
+    Ok((
+        Checkpoint {
+            cfg,
+            step: ck.step,
+            params: best.1,
+            m: None,
+            v: None,
+            extras,
+        },
+        l_before,
+        best.0,
+    ))
 }

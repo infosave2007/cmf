@@ -109,6 +109,16 @@ pub struct Pipeline {
             crate::dsv4::Dsv4State,
         )>,
     >,
+    /// Qwen3.8-Flash-Next owns four residual streams plus QSA/PLE state;
+    /// the generic single-residual layer loop cannot represent it.
+    pub qwen4_exp: Option<
+        Box<(
+            crate::qwen4_exp::Globals,
+            Vec<crate::qwen4_exp::Layer>,
+            crate::qwen4_exp::Cfg,
+            crate::qwen4_exp::State,
+        )>,
+    >,
     /// DeepSeek-V4's own speculation stack: three draft modules, each a full
     /// layer, plus a confidence head on the last. Empty when the file has
     /// none, which is the only signal the decode path needs.
@@ -1472,7 +1482,8 @@ impl Pipeline {
                     // block bounds, mass concentration). Needs CMF_GPU_ATTEND=0.
                     if let Ok(dir) = std::env::var("CMF_ATTN_DUMP") {
                         if let Some((qr0, k0, v0)) = oracle_in.clone() {
-                            let (cq, _cg, _ck, _cv) = attention::finish_projection_debug(qr0, k0, v0, &cfg, position);
+                            let (cq, _cg, _ck, _cv) =
+                                attention::finish_projection_debug(qr0, k0, v0, &cfg, position);
                             let cache = &self.kv_cache.layers[*li];
                             let n = cache.head_keys(0).len() / hd;
                             let mut bytes: Vec<u8> = Vec::new();
@@ -1492,17 +1503,25 @@ impl Pipeline {
                                     bytes.extend_from_slice(&v.to_le_bytes());
                                 }
                             }
-                            let _ = std::fs::write(format!("{dir}/L{li}_pos{position}.bin"), &bytes);
+                            let _ =
+                                std::fs::write(format!("{dir}/L{li}_pos{position}.bin"), &bytes);
                         }
                     }
-                    if let Some((qr0, k0, v0)) = oracle_in.filter(|_| std::env::var("CMF_ATTN_ORACLE").as_deref() == Ok("1")) {
-                        let (cq, _cg, ck, cv) = attention::finish_projection_debug(qr0, k0, v0, &cfg, position);
+                    if let Some((qr0, k0, v0)) =
+                        oracle_in.filter(|_| std::env::var("CMF_ATTN_ORACLE").as_deref() == Ok("1"))
+                    {
+                        let (cq, _cg, ck, cv) =
+                            attention::finish_projection_debug(qr0, k0, v0, &cfg, position);
                         let mut h_now = vec![0f32; hs];
                         graph.read_h(&mut h_now);
                         let cache = &self.kv_cache.layers[*li];
                         let n_after = cache.head_keys(0).len() / hd;
-                        let cpu_k: Vec<&[f32]> = (0..nkv).map(|g| &cache.head_keys(g)[..(n_after - 1) * hd]).collect();
-                        let cpu_v: Vec<&[f32]> = (0..nkv).map(|g| &cache.head_values(g)[..(n_after - 1) * hd]).collect();
+                        let cpu_k: Vec<&[f32]> = (0..nkv)
+                            .map(|g| &cache.head_keys(g)[..(n_after - 1) * hd])
+                            .collect();
+                        let cpu_v: Vec<&[f32]> = (0..nkv)
+                            .map(|g| &cache.head_values(g)[..(n_after - 1) * hd])
+                            .collect();
                         let p = crate::gpu::AttnDeviceParams {
                             kv_id,
                             layer: *li,
@@ -1523,11 +1542,20 @@ impl Pipeline {
                             o1: None,
                         };
                         if let Some((dq, dk, dv, dao)) = graph.debug_attn_device(l, &p, &h_now) {
-                            let md = |a: &[f32], b: &[f32]| a.iter().zip(b).fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+                            let md = |a: &[f32], b: &[f32]| {
+                                a.iter().zip(b).fold(0f32, |m, (x, y)| m.max((x - y).abs()))
+                            };
                             let nn = |a: &[f32]| a.iter().map(|x| x * x).sum::<f32>().sqrt();
                             eprintln!(
                                 "attn-oracle L{li} pos {position}: |q| {:.2} max|dq| {:.4} | |k| {:.2} max|dk| {:.4} | |v| {:.2} max|dv| {:.4} | |ao| {:.2} max|dao| {:.4}",
-                                nn(&cq), md(&cq, &dq), nn(&ck), md(&ck, &dk), nn(&cv), md(&cv, &dv), nn(&ao), md(&ao, &dao)
+                                nn(&cq),
+                                md(&cq, &dq),
+                                nn(&ck),
+                                md(&ck, &dk),
+                                nn(&cv),
+                                md(&cv, &dv),
+                                nn(&ao),
+                                md(&ao, &dao)
                             );
                         } else {
                             eprintln!("attn-oracle L{li}: device probe declined");
@@ -1680,6 +1708,7 @@ impl Pipeline {
             kda_cfg: None,
             g3n: None,
             dsv4: None,
+            qwen4_exp: None,
             dsv4_mtp: Vec::new(),
             dspark: None,
             dspark_pending: Vec::new(),
@@ -2062,7 +2091,9 @@ impl Pipeline {
         #[cfg(target_os = "macos")]
         let metal_graph = crate::gpu::q1_force()
             && crate::gpu::enabled_here()
-            && std::env::var("CMF_GPU_BLOCK").map(|v| v != "0").unwrap_or(true);
+            && std::env::var("CMF_GPU_BLOCK")
+                .map(|v| v != "0")
+                .unwrap_or(true);
         #[cfg(not(target_os = "macos"))]
         let metal_graph = false;
         let graph_spec = self.speculative
@@ -2168,6 +2199,34 @@ impl Pipeline {
         // Bounded chunks preserve cancellation responsiveness. Only the
         // prompt's final chunk asks for logits; every earlier head projection
         // would produce 129 280 values that no caller reads.
+        while self.qwen4_exp.is_some()
+            && mtp.is_none()
+            && pos < input_ids.len()
+            && !self.cancel.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let token_id = input_ids[pos];
+            let want_logits = pos + 1 == input_ids.len();
+            let mut lg = Vec::new();
+            if let Some(b) = &mut self.qwen4_exp {
+                crate::qwen4_exp::forward_token(
+                    &b.0,
+                    &b.1,
+                    &b.2,
+                    &mut b.3,
+                    token_id,
+                    pos,
+                    &self.inv_freq,
+                    self.pool.as_deref(),
+                    &mut lg,
+                    want_logits,
+                );
+            }
+            if want_logits {
+                self.graph_logits = Some(lg);
+            }
+            pos += 1;
+            hidden.fill(0.0);
+        }
         while self.dsv4.is_some()
             && mtp.is_none()
             && pos < input_ids.len()
@@ -2239,7 +2298,11 @@ impl Pipeline {
                     break;
                 };
                 if let Some(m) = &mut mtp {
-                    let n_pairs = if end < input_ids.len() { end - pos } else { end - pos - 1 };
+                    let n_pairs = if end < input_ids.len() {
+                        end - pos
+                    } else {
+                        end - pos - 1
+                    };
                     if n_pairs > 0 {
                         let pairs: Vec<(&[f32], u32)> = (0..n_pairs)
                             .map(|j| (&hb[j * hs..(j + 1) * hs], input_ids[pos + j + 1]))
@@ -2886,9 +2949,7 @@ impl Pipeline {
                             &mut accepted,
                         );
                         if drafted > drafted0 {
-                            let useful = round
-                                .as_ref()
-                                .is_some_and(|(extra, _)| !extra.is_empty());
+                            let useful = round.as_ref().is_some_and(|(extra, _)| !extra.is_empty());
                             if useful {
                                 dsv4_spec_bad = 0;
                             } else {
@@ -3723,8 +3784,14 @@ impl Pipeline {
             let (mut lg, hj) = self.mtp_step_hl(m, &hx, tok_in, next_pos - 1 + j);
             if let Some((lg_cpu, h_cpu)) = dbg_ref {
                 let n = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
-                let dl = lg.iter().zip(&lg_cpu).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
-                let dh = hj.iter().zip(&h_cpu).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+                let dl = lg
+                    .iter()
+                    .zip(&lg_cpu)
+                    .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+                let dh = hj
+                    .iter()
+                    .zip(&h_cpu)
+                    .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
                 eprintln!(
                     "spec-dbg j={j} pos {} tok_in {tok_in}: per-op draft {} graph draft {} | max|dlogit| {dl:.3} | |h_cpu| {:.2} |h_graph| {:.2} max|dh| {dh:.3} | kv rows {}",
                     next_pos - 1 + j,
@@ -3818,7 +3885,12 @@ impl Pipeline {
         #[cfg(target_os = "macos")]
         let ok = if metal_native {
             let lm = self.weights.lm_head.q1_parts()?;
-            self.try_batch_graph_metal(&mut hiddens, &positions, b, Some((lm, &final_norm, &mut logits)))
+            self.try_batch_graph_metal(
+                &mut hiddens,
+                &positions,
+                b,
+                Some((lm, &final_norm, &mut logits)),
+            )
         } else {
             self.try_batch_graph_wgpu(
                 &mut hiddens,
@@ -3857,9 +3929,16 @@ impl Pipeline {
         // back, and the K/V mirrors re-pointed, before the round goes on.
         #[cfg(target_os = "macos")]
         if metal_native && std::env::var("CMF_METAL_VERIFY_CHECK").as_deref() == Ok("1") {
-            let snap: Vec<Vec<f32>> = self.kv_cache.layers.iter().map(|l| l.linear_state.clone()).collect();
+            let snap: Vec<Vec<f32>> = self
+                .kv_cache
+                .layers
+                .iter()
+                .map(|l| l.linear_state.clone())
+                .collect();
             let attn_lens: Vec<usize> = self.kv_cache.layers.iter().map(|l| l.seq_len).collect();
-            let toks: Vec<u32> = std::iter::once(t_next).chain(drafts.iter().copied()).collect();
+            let toks: Vec<u32> = std::iter::once(t_next)
+                .chain(drafts.iter().copied())
+                .collect();
             let want_save = self.graph_want_logits;
             self.graph_want_logits = false;
             for (i, &t) in toks.iter().enumerate() {
@@ -4029,7 +4108,10 @@ impl Pipeline {
             ids
         };
         if spec_dbg {
-            eprintln!("spec-dbg round: t_next {t_next} drafts {:?} verified {:?} accepted {a}", drafts, ids);
+            eprintln!(
+                "spec-dbg round: t_next {t_next} drafts {:?} verified {:?} accepted {a}",
+                drafts, ids
+            );
         }
         // CMF_METAL_VERIFY_CHECK=2: the commit oracle — plain-forward the
         // a+1 accepted tokens from a snapshot, then diff the replayed GDN
@@ -4038,9 +4120,16 @@ impl Pipeline {
         let commit_ref: Option<(Vec<Vec<f32>>, Vec<(usize, Vec<f32>, Vec<f32>)>)> = if metal_native
             && std::env::var("CMF_METAL_VERIFY_CHECK").as_deref() == Ok("2")
         {
-            let snap: Vec<Vec<f32>> = self.kv_cache.layers.iter().map(|l| l.linear_state.clone()).collect();
+            let snap: Vec<Vec<f32>> = self
+                .kv_cache
+                .layers
+                .iter()
+                .map(|l| l.linear_state.clone())
+                .collect();
             let attn_lens: Vec<usize> = self.kv_cache.layers.iter().map(|l| l.seq_len).collect();
-            let toks: Vec<u32> = std::iter::once(t_next).chain(drafts.iter().copied()).collect();
+            let toks: Vec<u32> = std::iter::once(t_next)
+                .chain(drafts.iter().copied())
+                .collect();
             let want_save = self.graph_want_logits;
             self.graph_want_logits = false;
             for (i, &t) in toks.iter().take(a + 1).enumerate() {
@@ -4048,10 +4137,21 @@ impl Pipeline {
                 let _ = self.graph_logits.take();
             }
             self.graph_want_logits = want_save;
-            let plain_states: Vec<Vec<f32>> = self.kv_cache.layers.iter().map(|l| l.linear_state.clone()).collect();
+            let plain_states: Vec<Vec<f32>> = self
+                .kv_cache
+                .layers
+                .iter()
+                .map(|l| l.linear_state.clone())
+                .collect();
             let (nkv, hd) = (self.num_kv_heads, self.head_dim);
             let mut rows = Vec::new();
-            for (li, (l, n0)) in self.kv_cache.layers.iter_mut().zip(attn_lens.iter()).enumerate() {
+            for (li, (l, n0)) in self
+                .kv_cache
+                .layers
+                .iter_mut()
+                .zip(attn_lens.iter())
+                .enumerate()
+            {
                 let extra = l.seq_len.saturating_sub(*n0);
                 if extra > 0 {
                     let mut kk = Vec::new();
@@ -4091,7 +4191,11 @@ impl Pipeline {
                     if l.linear_state.len() != ps.len() || ps.is_empty() {
                         continue;
                     }
-                    let d = l.linear_state.iter().zip(ps).fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+                    let d = l
+                        .linear_state
+                        .iter()
+                        .zip(ps)
+                        .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
                     let n = ps.iter().fold(0f32, |m, y| m.max(y.abs()));
                     let rel = d / n.max(1e-6);
                     if rel > worst_s {
@@ -4110,11 +4214,21 @@ impl Pipeline {
                         cv.extend_from_slice(&l.head_values(g)[n0 * hd..]);
                     }
                     if ck.len() == kk.len() {
-                        let dk = ck.iter().zip(kk).fold(0f32, |m, (x, y)| m.max((x - y).abs()));
-                        let dv = cv.iter().zip(vv).fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+                        let dk = ck
+                            .iter()
+                            .zip(kk)
+                            .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+                        let dv = cv
+                            .iter()
+                            .zip(vv)
+                            .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
                         worst_k = worst_k.max(dk).max(dv);
                     } else {
-                        eprintln!("commit-check L{li}: kv row count mismatch {} vs {}", ck.len(), kk.len());
+                        eprintln!(
+                            "commit-check L{li}: kv row count mismatch {} vs {}",
+                            ck.len(),
+                            kk.len()
+                        );
                     }
                 }
                 eprintln!(
@@ -4144,7 +4258,11 @@ impl Pipeline {
         if metal_native && self.mtp_graph_mode == Some(true) {
             // the mirror rows below the cut are the CPU rows: re-point,
             // no re-upload
-            crate::gpu_metal::kv_mirror_set_stored(self.mtp_kv_id(), Self::MTP_LAYER_BASE, m.kv.seq_len);
+            crate::gpu_metal::kv_mirror_set_stored(
+                self.mtp_kv_id(),
+                Self::MTP_LAYER_BASE,
+                m.kv.seq_len,
+            );
         }
         let warm_off = std::env::var("CMF_SPEC_WARM").is_ok_and(|v| v == "0");
         if !warm_off && a > 0 {
@@ -4157,14 +4275,23 @@ impl Pipeline {
                 // block (its input projection folded in); one by one on
                 // the token graph if that declines
                 let pairs: Vec<(&[f32], u32)> = (0..a)
-                    .map(|j| (&hiddens[j * self.hidden_size..(j + 1) * self.hidden_size], ids[j]))
+                    .map(|j| {
+                        (
+                            &hiddens[j * self.hidden_size..(j + 1) * self.hidden_size],
+                            ids[j],
+                        )
+                    })
                     .collect();
                 warmed = self.mtp_warm_batch_metal(m, &pairs, next_pos);
                 if !warmed {
                     warmed = true;
                     for j in 0..a {
-                        let row = hiddens[j * self.hidden_size..(j + 1) * self.hidden_size].to_vec();
-                        if self.mtp_step_metal(m, &row, ids[j], next_pos + j, false).is_none() {
+                        let row =
+                            hiddens[j * self.hidden_size..(j + 1) * self.hidden_size].to_vec();
+                        if self
+                            .mtp_step_metal(m, &row, ids[j], next_pos + j, false)
+                            .is_none()
+                        {
                             warmed = false;
                             break;
                         }
@@ -5197,7 +5324,11 @@ impl Pipeline {
                             let n: f32 = row.iter().map(|x| x * x).sum::<f32>().sqrt();
                             eprintln!(
                                 "BATCH pos {t} embed: id {} |h| = {n:.6} h0 {:.6} h1 {:.6} | b={} start={start_pos} ids[..8]={:?}",
-                                ids[bi], row[0], row[1], ids.len(), &ids[..ids.len().min(8)]
+                                ids[bi],
+                                row[0],
+                                row[1],
+                                ids.len(),
+                                &ids[..ids.len().min(8)]
                             );
                         }
                     }
@@ -5607,7 +5738,7 @@ impl Pipeline {
         // DeepSeek-V4's hash layers route by TOKEN ID, so the id has to
         // reach the forward. It rides in slot 0 (the forward re-reads the
         // real embedding itself from the table).
-        if self.dsv4.is_some() {
+        if self.dsv4.is_some() || self.qwen4_exp.is_some() {
             let mut v = vec![0.0f32; self.hidden_size.max(1)];
             v[0] = id as f32;
             return v;
@@ -5904,6 +6035,11 @@ impl Pipeline {
         if self.dsv4.is_some() {
             return Err(
                 "network split: DeepSeek-V4 runs its own fused stack (not splittable yet)".into(),
+            );
+        }
+        if self.qwen4_exp.is_some() {
+            return Err(
+                "network split: Qwen3.8-Flash-Next hyper/QSA stack is not splittable yet".into(),
             );
         }
         if self.g3n.is_some() {
@@ -6288,11 +6424,7 @@ impl Pipeline {
                     // The mixed 2-bit profile: q2tp gate/up over a q4tp
                     // down. Uniform across the layer, like `q4tp` itself.
                     let mut gu_q2: Option<bool> = None;
-                    for e in m
-                        .experts
-                        .iter()
-                        .chain(shared.map(|(se, _)| se))
-                    {
+                    for e in m.experts.iter().chain(shared.map(|(se, _)| se)) {
                         if !matches!(e.act, Act::Silu)
                             || e.gate_proj.rows() != inter
                             || e.up_proj.rows() != inter
@@ -6549,11 +6681,19 @@ impl Pipeline {
     /// speculative verify and the batched prefill.
     #[cfg(target_os = "macos")]
     #[allow(clippy::type_complexity)]
-    fn metal_rows_plan(&self) -> Option<(Vec<MetalRowsItem<'_>>, std::sync::Arc<cortiq_core::CmfModel>, Option<crate::gpu_metal::GdnGpuCfg>)> {
+    fn metal_rows_plan(
+        &self,
+    ) -> Option<(
+        Vec<MetalRowsItem<'_>>,
+        std::sync::Arc<cortiq_core::CmfModel>,
+        Option<crate::gpu_metal::GdnGpuCfg>,
+    )> {
         use crate::gpu_metal::{AttnGpuLayer, GdnGpuCfg, GdnGpuLayer, MetalFfn};
         if !crate::gpu::q1_force()
             || !crate::gpu::enabled_here()
-            || std::env::var("CMF_GPU_BLOCK").map(|v| v == "0").unwrap_or(false)
+            || std::env::var("CMF_GPU_BLOCK")
+                .map(|v| v == "0")
+                .unwrap_or(false)
             || self.attn_softcap > 0.0
             || self.o1_active()
             || self.swa.is_some()
@@ -6584,12 +6724,18 @@ impl Pipeline {
             }
             let ffn = match &lw.ffn {
                 FfnKind::Dense(d) if d.act == Act::Silu && d.segs.is_empty() => {
-                    let (Some(g), Some(u), Some(dn)) =
-                        (d.gate_proj.q1_parts(), d.up_proj.q1_parts(), d.down_proj.q1_parts())
-                    else {
+                    let (Some(g), Some(u), Some(dn)) = (
+                        d.gate_proj.q1_parts(),
+                        d.up_proj.q1_parts(),
+                        d.down_proj.q1_parts(),
+                    ) else {
                         return None;
                     };
-                    MetalFfn::Dense { gate: g, up: u, down: dn }
+                    MetalFfn::Dense {
+                        gate: g,
+                        up: u,
+                        down: dn,
+                    }
                 }
                 _ => return None,
             };
@@ -6623,7 +6769,10 @@ impl Pipeline {
                     };
                     match plan.last_mut() {
                         Some(MetalRowsItem::Gdn { run, .. }) => run.push(gl),
-                        _ => plan.push(MetalRowsItem::Gdn { run: vec![gl], first: li }),
+                        _ => plan.push(MetalRowsItem::Gdn {
+                            run: vec![gl],
+                            first: li,
+                        }),
                     }
                 }
                 AttnKind::Full {
@@ -6760,7 +6909,12 @@ impl Pipeline {
         } else {
             VerifyGraph::new(&model, dims, hiddens, b)?
         };
-        let geom = (self.num_heads, self.num_kv_heads, self.head_dim, self.rotary_dim);
+        let geom = (
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            self.rotary_dim,
+        );
         let gemma = self.norm_style == cortiq_core::NormStyle::Gemma;
         let eps = self.rms_eps as f32;
         let kv_id = self.graph_kv_id;
@@ -6771,8 +6925,26 @@ impl Pipeline {
                     .as_ref()
                     .map(|gc| run.iter().all(|l| graph.gdn_ok(l, gc)))
                     .unwrap_or(false),
-                MetalRowsItem::Attn { l, li, q_norm, k_norm, output_gate } => {
-                    let (p, _) = Self::metal_attn_params(*li, &self.kv_cache.layers[*li], *q_norm, *k_norm, *output_gate, &inv_freq, geom, pos0, kv_id, eps, gemma);
+                MetalRowsItem::Attn {
+                    l,
+                    li,
+                    q_norm,
+                    k_norm,
+                    output_gate,
+                } => {
+                    let (p, _) = Self::metal_attn_params(
+                        *li,
+                        &self.kv_cache.layers[*li],
+                        *q_norm,
+                        *k_norm,
+                        *output_gate,
+                        &inv_freq,
+                        geom,
+                        pos0,
+                        kv_id,
+                        eps,
+                        gemma,
+                    );
                     graph.attn_ok(l, &p)
                 }
             };
@@ -6808,8 +6980,26 @@ impl Pipeline {
                     }
                     gdn_layers.extend(*first..*first + run.len());
                 }
-                MetalRowsItem::Attn { l, li, q_norm, k_norm, output_gate } => {
-                    let (p, cpu_stored) = Self::metal_attn_params(*li, &self.kv_cache.layers[*li], *q_norm, *k_norm, *output_gate, &inv_freq, geom, pos0, kv_id, eps, gemma);
+                MetalRowsItem::Attn {
+                    l,
+                    li,
+                    q_norm,
+                    k_norm,
+                    output_gate,
+                } => {
+                    let (p, cpu_stored) = Self::metal_attn_params(
+                        *li,
+                        &self.kv_cache.layers[*li],
+                        *q_norm,
+                        *k_norm,
+                        *output_gate,
+                        &inv_freq,
+                        geom,
+                        pos0,
+                        kv_id,
+                        eps,
+                        gemma,
+                    );
                     if !graph.encode_attn_b(l, &p) {
                         return None;
                     }
@@ -6828,7 +7018,11 @@ impl Pipeline {
             graph.read_logits(logits);
         }
         graph.read_hidden(hiddens);
-        Some(MetalVerifyPending { graph, gdn_layers, attn_layers })
+        Some(MetalVerifyPending {
+            graph,
+            gdn_layers,
+            attn_layers,
+        })
     }
 
     /// Native-Metal twin of `try_batch_graph_wgpu`: the b rows through the
@@ -6855,7 +7049,10 @@ impl Pipeline {
             return false;
         };
         if std::env::var("CMF_GRAPH_SPEC_TIME").is_ok() {
-            eprintln!("metal-verify: {:.1} ms | b={b}", _t0.elapsed().as_secs_f64() * 1e3);
+            eprintln!(
+                "metal-verify: {:.1} ms | b={b}",
+                _t0.elapsed().as_secs_f64() * 1e3
+            );
         }
         self.metal_verify = Some(pending);
         true
@@ -6893,10 +7090,23 @@ impl Pipeline {
         let mut kbuf = vec![0f32; b * nkv * hd];
         let mut vbuf = vec![0f32; b * nkv * hd];
         for (li, cpu_stored) in &pending.attn_layers {
-            if crate::gpu_metal::kv_mirror_read_rows(self.graph_kv_id, *li, nkv, hd, *cpu_stored, b, &mut kbuf, &mut vbuf) {
+            if crate::gpu_metal::kv_mirror_read_rows(
+                self.graph_kv_id,
+                *li,
+                nkv,
+                hd,
+                *cpu_stored,
+                b,
+                &mut kbuf,
+                &mut vbuf,
+            ) {
                 let cache = &mut self.kv_cache.layers[*li];
                 for r in 0..b {
-                    cache.append(&kbuf[r * nkv * hd..(r + 1) * nkv * hd], &vbuf[r * nkv * hd..(r + 1) * nkv * hd], &[]);
+                    cache.append(
+                        &kbuf[r * nkv * hd..(r + 1) * nkv * hd],
+                        &vbuf[r * nkv * hd..(r + 1) * nkv * hd],
+                        &[],
+                    );
                 }
                 crate::gpu_metal::kv_mirror_set_stored(self.graph_kv_id, *li, cpu_stored + b);
             }
@@ -6930,10 +7140,23 @@ impl Pipeline {
         let mut kbuf = vec![0f32; n * nkv * hd];
         let mut vbuf = vec![0f32; n * nkv * hd];
         for (li, cpu_stored) in &pending.attn_layers {
-            if crate::gpu_metal::kv_mirror_read_rows(self.graph_kv_id, *li, nkv, hd, *cpu_stored, n, &mut kbuf, &mut vbuf) {
+            if crate::gpu_metal::kv_mirror_read_rows(
+                self.graph_kv_id,
+                *li,
+                nkv,
+                hd,
+                *cpu_stored,
+                n,
+                &mut kbuf,
+                &mut vbuf,
+            ) {
                 let cache = &mut self.kv_cache.layers[*li];
                 for r in 0..n {
-                    cache.append(&kbuf[r * nkv * hd..(r + 1) * nkv * hd], &vbuf[r * nkv * hd..(r + 1) * nkv * hd], &[]);
+                    cache.append(
+                        &kbuf[r * nkv * hd..(r + 1) * nkv * hd],
+                        &vbuf[r * nkv * hd..(r + 1) * nkv * hd],
+                        &[],
+                    );
                 }
                 crate::gpu_metal::kv_mirror_set_stored(self.graph_kv_id, *li, cpu_stored + n);
             }
@@ -6947,27 +7170,55 @@ impl Pipeline {
     /// appended K/V rows are pulled into the CPU MTP cache. False = the
     /// graph declined (nothing appended).
     #[cfg(target_os = "macos")]
-    fn mtp_warm_batch_metal(&mut self, m: &mut MtpModule, pairs: &[(&[f32], u32)], first_pos: usize) -> bool {
+    fn mtp_warm_batch_metal(
+        &mut self,
+        m: &mut MtpModule,
+        pairs: &[(&[f32], u32)],
+        first_pos: usize,
+    ) -> bool {
         use crate::gpu_metal::{AttnDeviceParams, AttnGpuLayer, GraphDims, MetalFfn, VerifyGraph};
         let b = pairs.len();
         if b == 0 || b > 512 || m.kv.mode != crate::kv_cache::KvMode::F32 || m.kv.o1.is_some() {
             return false;
         }
-        let AttnKind::Full { wq, wk, wv, wo, q_norm, k_norm, output_gate, softplus_gate: None, bias: None } = &m.layer.attn else {
+        let AttnKind::Full {
+            wq,
+            wk,
+            wv,
+            wo,
+            q_norm,
+            k_norm,
+            output_gate,
+            softplus_gate: None,
+            bias: None,
+        } = &m.layer.attn
+        else {
             return false;
         };
-        let FfnKind::Dense(d) = &m.layer.ffn else { return false };
+        let FfnKind::Dense(d) = &m.layer.ffn else {
+            return false;
+        };
         if !d.segs.is_empty() {
             return false;
         }
-        let (Some(pq), Some(pk), Some(pv), Some(po)) = (wq.q1_parts(), wk.q1_parts(), wv.q1_parts(), wo.q1_parts()) else {
+        let (Some(pq), Some(pk), Some(pv), Some(po)) =
+            (wq.q1_parts(), wk.q1_parts(), wv.q1_parts(), wo.q1_parts())
+        else {
             return false;
         };
-        let (Some(g), Some(u), Some(dn)) = (d.gate_proj.q1_parts(), d.up_proj.q1_parts(), d.down_proj.q1_parts()) else {
+        let (Some(g), Some(u), Some(dn)) = (
+            d.gate_proj.q1_parts(),
+            d.up_proj.q1_parts(),
+            d.down_proj.q1_parts(),
+        ) else {
             return false;
         };
-        let Some(eh) = m.eh_proj.q1_parts() else { return false };
-        let QTensor::Mapped { model, .. } = wq else { return false };
+        let Some(eh) = m.eh_proj.q1_parts() else {
+            return false;
+        };
+        let QTensor::Mapped { model, .. } = wq else {
+            return false;
+        };
         let model = model.clone();
         let hs = self.hidden_size;
         // [enorm(embed(tok)); hnorm(hidden)] rows
@@ -6978,7 +7229,11 @@ impl Pipeline {
             inference::rms_norm_into(&e, &m.enorm, self.rms_eps, self.norm_style, ce);
             inference::rms_norm_into(h, &m.hnorm, self.rms_eps, self.norm_style, ch);
         }
-        let dims = GraphDims { hidden: hs, eps: self.rms_eps as f32, gemma: self.norm_style == cortiq_core::NormStyle::Gemma };
+        let dims = GraphDims {
+            hidden: hs,
+            eps: self.rms_eps as f32,
+            gemma: self.norm_style == cortiq_core::NormStyle::Gemma,
+        };
         let Some(mut graph) = VerifyGraph::new_via_proj(&model, dims, eh, &cat, b) else {
             return false;
         };
@@ -6989,9 +7244,18 @@ impl Pipeline {
             wk: pk,
             wv: pv,
             wo: po,
-            ffn: MetalFfn::Dense { gate: g, up: u, down: dn },
+            ffn: MetalFfn::Dense {
+                gate: g,
+                up: u,
+                down: dn,
+            },
         };
-        let (nh, nkv, hd, rd) = (self.num_heads, self.num_kv_heads, self.head_dim, self.rotary_dim);
+        let (nh, nkv, hd, rd) = (
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            self.rotary_dim,
+        );
         let inv_freq = self.inv_freq.clone();
         let cpu_stored;
         {
@@ -7028,13 +7292,30 @@ impl Pipeline {
         graph.sync();
         let mut kbuf = vec![0f32; b * nkv * hd];
         let mut vbuf = vec![0f32; b * nkv * hd];
-        if !crate::gpu_metal::kv_mirror_read_rows(self.mtp_kv_id(), Self::MTP_LAYER_BASE, nkv, hd, cpu_stored, b, &mut kbuf, &mut vbuf) {
+        if !crate::gpu_metal::kv_mirror_read_rows(
+            self.mtp_kv_id(),
+            Self::MTP_LAYER_BASE,
+            nkv,
+            hd,
+            cpu_stored,
+            b,
+            &mut kbuf,
+            &mut vbuf,
+        ) {
             return false;
         }
         for r in 0..b {
-            m.kv.append(&kbuf[r * nkv * hd..(r + 1) * nkv * hd], &vbuf[r * nkv * hd..(r + 1) * nkv * hd], &[]);
+            m.kv.append(
+                &kbuf[r * nkv * hd..(r + 1) * nkv * hd],
+                &vbuf[r * nkv * hd..(r + 1) * nkv * hd],
+                &[],
+            );
         }
-        crate::gpu_metal::kv_mirror_set_stored(self.mtp_kv_id(), Self::MTP_LAYER_BASE, cpu_stored + b);
+        crate::gpu_metal::kv_mirror_set_stored(
+            self.mtp_kv_id(),
+            Self::MTP_LAYER_BASE,
+            cpu_stored + b,
+        );
         true
     }
 
@@ -7089,15 +7370,32 @@ impl Pipeline {
         else {
             return None;
         };
-        let FfnKind::Dense(d) = &m.layer.ffn else { return None };
+        let FfnKind::Dense(d) = &m.layer.ffn else {
+            return None;
+        };
         if d.act != Act::Silu || !d.segs.is_empty() {
             return None;
         }
-        let (pq, pk, pv, po) = (wq.q1_parts()?, wk.q1_parts()?, wv.q1_parts()?, wo.q1_parts()?);
-        let (g, u, dn) = (d.gate_proj.q1_parts()?, d.up_proj.q1_parts()?, d.down_proj.q1_parts()?);
-        let QTensor::Mapped { model, .. } = wq else { return None };
+        let (pq, pk, pv, po) = (
+            wq.q1_parts()?,
+            wk.q1_parts()?,
+            wv.q1_parts()?,
+            wo.q1_parts()?,
+        );
+        let (g, u, dn) = (
+            d.gate_proj.q1_parts()?,
+            d.up_proj.q1_parts()?,
+            d.down_proj.q1_parts()?,
+        );
+        let QTensor::Mapped { model, .. } = wq else {
+            return None;
+        };
         let model = model.clone();
-        let lm = if want_logits { Some(self.weights.lm_head.q1_parts()?) } else { None };
+        let lm = if want_logits {
+            Some(self.weights.lm_head.q1_parts()?)
+        } else {
+            None
+        };
         let dims = GraphDims {
             hidden: self.hidden_size,
             eps: self.rms_eps as f32,
@@ -7128,9 +7426,18 @@ impl Pipeline {
             wk: pk,
             wv: pv,
             wo: po,
-            ffn: MetalFfn::Dense { gate: g, up: u, down: dn },
+            ffn: MetalFfn::Dense {
+                gate: g,
+                up: u,
+                down: dn,
+            },
         };
-        let (nh, nkv, hd, rd) = (self.num_heads, self.num_kv_heads, self.head_dim, self.rotary_dim);
+        let (nh, nkv, hd, rd) = (
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            self.rotary_dim,
+        );
         let inv_freq = self.inv_freq.clone();
         {
             let cache = &m.kv;
@@ -7165,7 +7472,11 @@ impl Pipeline {
         // low ids carry the mass): the verify keeps the full head, so a true
         // token past the cut is only a rejected draft, never a wrong token.
         // 662 MB a step on Qwen3.8 becomes 170 MB at 65536.
-        let draft_rows = if let Some(lm) = lm { Self::draft_vocab_rows(lm.1) } else { 0 };
+        let draft_rows = if let Some(lm) = lm {
+            Self::draft_vocab_rows(lm.1)
+        } else {
+            0
+        };
         if let Some(lm) = lm {
             if !graph.lm_head_ok(lm) {
                 return None;
@@ -7190,7 +7501,14 @@ impl Pipeline {
         graph.finish(&mut x);
         let mut krow = attention::take_buf(nkv * hd);
         let mut vrow = attention::take_buf(nkv * hd);
-        if crate::gpu_metal::kv_mirror_read_last(self.mtp_kv_id(), Self::MTP_LAYER_BASE, nkv, hd, &mut krow, &mut vrow) {
+        if crate::gpu_metal::kv_mirror_read_last(
+            self.mtp_kv_id(),
+            Self::MTP_LAYER_BASE,
+            nkv,
+            hd,
+            &mut krow,
+            &mut vrow,
+        ) {
             m.kv.append(&krow, &vrow, &[]);
         }
         attention::recycle_buf(&mut krow);
@@ -7470,9 +7788,7 @@ impl Pipeline {
             std::env::var("CMF_DSV4_SPEC")
                 .map(|v| v != "0")
                 .unwrap_or_else(|_| {
-                    crate::gpu_wgpu::DRAFT_RESERVE
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        > 0
+                    crate::gpu_wgpu::DRAFT_RESERVE.load(std::sync::atomic::Ordering::Relaxed) > 0
                 })
         })
     }
@@ -8036,7 +8352,28 @@ impl Pipeline {
         from: usize,
         upto: Option<usize>,
     ) -> Vec<f32> {
-        debug_assert!(from == 0 || (self.dsv4.is_none() && self.g3n.is_none()));
+        debug_assert!(
+            from == 0 || (self.dsv4.is_none() && self.qwen4_exp.is_none() && self.g3n.is_none())
+        );
+        if let Some(b) = &mut self.qwen4_exp {
+            let _ = (task_mask, upto);
+            let token_id = hidden.first().copied().unwrap_or(0.0) as u32;
+            let mut logits = Vec::new();
+            crate::qwen4_exp::forward_token(
+                &b.0,
+                &b.1,
+                &b.2,
+                &mut b.3,
+                token_id,
+                position,
+                &self.inv_freq,
+                self.pool.as_deref(),
+                &mut logits,
+                true,
+            );
+            self.graph_logits = Some(logits);
+            return vec![0.0; self.hidden_size];
+        }
         // DeepSeek-V4 runs its own stack: the state is hc_mult copies, and
         // the forward returns LOGITS, not a hidden — the head is inside it
         // (the final fold sits between the last layer and the norm). The
@@ -8929,8 +9266,8 @@ pub fn create_test_pipeline(
                 down_proj: qt(hidden_size, intermediate_size, li * 10 + 7),
                 act: Act::Silu,
                 down_t: None,
-            segs: Vec::new(),
-        }),
+                segs: Vec::new(),
+            }),
             attn: AttnKind::Full {
                 bias: None,
                 wq: qt(num_heads * head_dim, hidden_size, li * 10 + 1),
@@ -9063,9 +9400,7 @@ fn tube_topk() -> usize {
 
 fn tube_score_oracle() -> bool {
     static O: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *O.get_or_init(|| {
-        std::env::var("CMF_TUBE_SCORE").is_ok_and(|v| v == "oracle")
-    })
+    *O.get_or_init(|| std::env::var("CMF_TUBE_SCORE").is_ok_and(|v| v == "oracle"))
 }
 
 /// The routed arm of `tube_ffn`: a token opens only its best `k` tubes.
@@ -9224,41 +9559,43 @@ fn tube_ffn(
         (_, false, row) => dense_ffn_batch(d, xs, b, pool, row),
     };
     TUBE_SCRATCH.with(|sc| {
-    let mut sc = sc.borrow_mut();
-    let [g, u, acc] = &mut *sc;
-    for seg in &d.segs {
-        if !tube_bit(mask_row, seg.start) {
-            continue;
-        }
-        let w = seg.width;
-        g.resize(b * w, 0.0);
-        if b == 1 && d.act == Act::Silu && QTensor::matvec_silu_mul(&seg.gate, &seg.up, xs, g, pool)
-        {
-            // g holds silu(gate)·up.
-        } else {
-            u.resize(b * w, 0.0);
-            if b == 1 {
-                QTensor::matvec_many([&seg.gate, &seg.up], xs, [g, u], pool);
+        let mut sc = sc.borrow_mut();
+        let [g, u, acc] = &mut *sc;
+        for seg in &d.segs {
+            if !tube_bit(mask_row, seg.start) {
+                continue;
+            }
+            let w = seg.width;
+            g.resize(b * w, 0.0);
+            if b == 1
+                && d.act == Act::Silu
+                && QTensor::matvec_silu_mul(&seg.gate, &seg.up, xs, g, pool)
+            {
+                // g holds silu(gate)·up.
             } else {
-                seg.gate.matmat(xs, b, g, pool);
-                seg.up.matmat(xs, b, u, pool);
+                u.resize(b * w, 0.0);
+                if b == 1 {
+                    QTensor::matvec_many([&seg.gate, &seg.up], xs, [g, u], pool);
+                } else {
+                    seg.gate.matmat(xs, b, g, pool);
+                    seg.up.matmat(xs, b, u, pool);
+                }
+                for i in 0..b * w {
+                    g[i] = d.act.combine(g[i], u[i]);
+                }
             }
-            for i in 0..b * w {
-                g[i] = d.act.combine(g[i], u[i]);
+            acc.resize(b * hidden, 0.0);
+            acc.fill(0.0);
+            if b == 1 {
+                seg.down.matvec(g, acc, pool);
+            } else {
+                seg.down.matmat(g, b, acc, pool);
+            }
+            for (o, a) in out.iter_mut().zip(acc.iter()) {
+                *o += *a;
             }
         }
-        acc.resize(b * hidden, 0.0);
-        acc.fill(0.0);
-        if b == 1 {
-            seg.down.matvec(g, acc, pool);
-        } else {
-            seg.down.matmat(g, b, acc, pool);
-        }
-        for (o, a) in out.iter_mut().zip(acc.iter()) {
-            *o += *a;
-        }
-    }
-    out
+        out
     })
 }
 
@@ -9378,7 +9715,11 @@ fn dense_ffn_batch(
             let sq = probe_sq();
             for t in 0..b {
                 for (a, &v) in row.iter_mut().zip(&g[t * inter..(t + 1) * inter]) {
-                    *a += if sq { (v as f64) * (v as f64) } else { (v as f64).abs() };
+                    *a += if sq {
+                        (v as f64) * (v as f64)
+                    } else {
+                        (v as f64).abs()
+                    };
                 }
             }
         }
@@ -9454,7 +9795,10 @@ fn moe_ffn_batch(
         Some(r) => {
             let hdim = xs.len() / b.max(1);
             for bi in 0..b {
-                r.scores(&xs[bi * hdim..(bi + 1) * hdim], &mut logits[bi * ne..(bi + 1) * ne]);
+                r.scores(
+                    &xs[bi * hdim..(bi + 1) * hdim],
+                    &mut logits[bi * ne..(bi + 1) * ne],
+                );
             }
         }
         None => m.router.matmat(xs, b, &mut logits, pool),
@@ -9638,7 +9982,9 @@ fn dense_ffn_cpu(d: &DenseFfn, x: &[f32], pool: Option<&Pool>) -> Vec<f32> {
             for i in 0..inter {
                 g[i] *= u[i];
             }
-        } else if d.act == Act::Silu && QTensor::matvec_silu_mul(&d.gate_proj, &d.up_proj, x, g, pool) {
+        } else if d.act == Act::Silu
+            && QTensor::matvec_silu_mul(&d.gate_proj, &d.up_proj, x, g, pool)
+        {
             // g now holds silu(gate)·up directly.
         } else {
             u.resize(inter, 0.0);
@@ -9741,10 +10087,7 @@ pub struct RefitAcc {
 /// The product buffer is SHARED across layers — one 473 MB allocation,
 /// not one per layer (that was 30 GB of nothing on a 64-layer model).
 /// It lives under the same lock as the accumulators.
-type RefitState = (
-    std::collections::HashMap<usize, RefitAcc>,
-    Vec<f32>,
-);
+type RefitState = (std::collections::HashMap<usize, RefitAcc>, Vec<f32>);
 
 static REFIT: std::sync::OnceLock<Option<(String, std::sync::Mutex<RefitState>)>> =
     std::sync::OnceLock::new();
@@ -9789,7 +10132,10 @@ fn refit_accumulate(
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(d)
         };
-        (g("CMF_FFN_REFIT_FROM", 0), g("CMF_FFN_REFIT_TO", usize::MAX))
+        (
+            g("CMF_FFN_REFIT_FROM", 0),
+            g("CMF_FFN_REFIT_TO", usize::MAX),
+        )
     });
     if li < from || li > to {
         return;
@@ -9859,7 +10205,11 @@ fn refit_accumulate(
     // loop stays as the fallback. Neither accumulates, so the product
     // lands in scratch and is added on.
     let RefitAcc {
-        gss, ya, buf_g, buf_o, ..
+        gss,
+        ya,
+        buf_g,
+        buf_o,
+        ..
     } = acc;
     let need = (ns * ns).max(hidden * ns);
     if shared.len() < need {
@@ -9869,7 +10219,14 @@ fn refit_accumulate(
     let _ = bt;
     if crate::gpu::gemm_nt_f32_transient(buf_g, buf_g, &mut scratch[..ns * ns], ns, cap, ns) {
         add_into(gss, &scratch[..ns * ns], pool);
-        if crate::gpu::gemm_nt_f32_transient(buf_o, buf_g, &mut scratch[..hidden * ns], hidden, cap, ns) {
+        if crate::gpu::gemm_nt_f32_transient(
+            buf_o,
+            buf_g,
+            &mut scratch[..hidden * ns],
+            hidden,
+            cap,
+            ns,
+        ) {
             add_into(ya, &scratch[..hidden * ns], pool);
         } else {
             accum_outer_t(ya, hidden, ns, cap, buf_o, buf_g, pool);
@@ -10023,7 +10380,10 @@ pub fn refit_flush() -> usize {
             let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
             match std::fs::write(&path, &bytes) {
                 Ok(()) => {}
-                Err(e) => eprintln!("refit: FAILED to write {path} ({} MB): {e}", bytes.len() / 1_000_000),
+                Err(e) => eprintln!(
+                    "refit: FAILED to write {path} ({} MB): {e}",
+                    bytes.len() / 1_000_000
+                ),
             }
         };
         w("gss", &acc.gss);
@@ -10046,7 +10406,10 @@ pub fn refit_flush() -> usize {
 fn adump_row(li: usize, g: &[f32]) {
     use std::io::Write as _;
     static FILES: std::sync::OnceLock<
-        Option<(String, std::sync::Mutex<std::collections::HashMap<usize, std::fs::File>>)>,
+        Option<(
+            String,
+            std::sync::Mutex<std::collections::HashMap<usize, std::fs::File>>,
+        )>,
     > = std::sync::OnceLock::new();
     let Some((prefix, map)) = FILES
         .get_or_init(|| {
@@ -10068,7 +10431,10 @@ fn adump_row(li: usize, g: &[f32]) {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(d)
         };
-        (g("CMF_FFN_ADUMP_FROM", 0), g("CMF_FFN_ADUMP_TO", usize::MAX))
+        (
+            g("CMF_FFN_ADUMP_FROM", 0),
+            g("CMF_FFN_ADUMP_TO", usize::MAX),
+        )
     });
     if li < from || li > to {
         return;
@@ -10259,7 +10625,12 @@ fn dense_ffn_dynamic(d: &DenseFfn, x: &[f32], pool: Option<&Pool>, k: usize) -> 
     }
     DYN_SCRATCH.with(|sc| {
         let mut sc = sc.borrow_mut();
-        let DynScratch { g, mag, live, parts } = &mut *sc;
+        let DynScratch {
+            g,
+            mag,
+            live,
+            parts,
+        } = &mut *sc;
         g.resize(inter, 0.0);
         d.gate_proj.matvec(x, g, pool);
         for v in g.iter_mut() {
@@ -10827,7 +11198,11 @@ impl SendMut {
 /// DeepSeek-V3 `noaux_tc`: per-expert sigmoid scores, an optional
 /// selection bias (top-k CHOICE only; weights stay unbiased), a 1e-6 renorm
 /// floor and a routed scale.
-fn moe_route(logits: &[f32], m: &MoeFfn, allowed: Option<&[bool]>) -> (Vec<usize>, Vec<f32>, f32) {
+pub(crate) fn moe_route(
+    logits: &[f32],
+    m: &MoeFfn,
+    allowed: Option<&[bool]>,
+) -> (Vec<usize>, Vec<f32>, f32) {
     let ne = logits.len();
     let p: Vec<f32> = if m.router_sigmoid {
         logits.iter().map(|&l| 1.0 / (1.0 + (-l).exp())).collect()
@@ -10904,7 +11279,11 @@ pub(crate) fn moe_trace_at(li: i32, idx: &[usize]) {
     let Some(f) = F.get_or_init(|| {
         let p = std::env::var("CMF_MOE_TRACE").ok()?;
         Some(std::sync::Mutex::new(
-            std::fs::OpenOptions::new().create(true).append(true).open(p).ok()?,
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+                .ok()?,
         ))
     }) else {
         return;
@@ -10915,7 +11294,12 @@ pub(crate) fn moe_trace_at(li: i32, idx: &[usize]) {
 
 /// MoE FFN: router → top-k experts (see `moe_route`). Only selected
 /// experts' pages are touched in mmap.
-fn moe_ffn(m: &MoeFfn, x: &[f32], pool: Option<&Pool>, allowed: Option<&[bool]>) -> Vec<f32> {
+pub(crate) fn moe_ffn(
+    m: &MoeFfn,
+    x: &[f32],
+    pool: Option<&Pool>,
+    allowed: Option<&[bool]>,
+) -> Vec<f32> {
     accumulate_act(m, x, 1);
     let ne = m.experts.len();
     let mut logits = vec![0.0f32; ne];
@@ -11060,6 +11444,44 @@ fn moe_ffn_cpu_batched(
         return None;
     }
     Some(out)
+}
+
+/// Exact CPU completion for the routed experts a dynamic device cache did
+/// not contain. The weights are already the router's final normalized mix.
+/// Keeping this independent of `MoeFfn` makes the job `Sync`: its routing
+/// statistics live in a `RefCell`, while the immutable expert tensors can be
+/// evaluated safely in parallel with the GPU's resident subset.
+pub(crate) fn moe_cold_experts_cpu(
+    experts: &[(&DenseFfn, f32)],
+    x: &[f32],
+    pool: Option<&Pool>,
+) -> Vec<f32> {
+    let mut out = attention::take_buf(x.len());
+    if experts.is_empty() {
+        return out;
+    }
+    let pairs: Vec<_> = experts
+        .iter()
+        .map(|(e, _)| (&e.gate_proj, &e.up_proj))
+        .collect();
+    let downs: Vec<_> = experts.iter().map(|(e, _)| &e.down_proj).collect();
+    let weights: Vec<_> = experts.iter().map(|(_, w)| *w).collect();
+    let inter = experts[0].0.gate_proj.rows();
+    let mut activations: Vec<Vec<f32>> = (0..experts.len()).map(|_| vec![0.0; inter]).collect();
+    if QTensor::moe_gate_up_many(&pairs, x, &mut activations, pool)
+        && QTensor::moe_down_many(&downs, &activations, &weights, &mut out, pool)
+    {
+        return out;
+    }
+    out.fill(0.0);
+    for &(expert, weight) in experts {
+        let mut one = dense_ffn(expert, x, pool);
+        for (o, v) in out.iter_mut().zip(&one) {
+            *o += weight * v;
+        }
+        attention::recycle_buf(&mut one);
+    }
+    out
 }
 
 /// The pure-CPU MoE expert loop (also the fallback of every GPU refusal).
@@ -11443,9 +11865,8 @@ mod tests {
             down_t: None,
             segs: Vec::new(),
         };
-        let rows = |v: &[f32], a: usize, b: usize| -> Vec<f32> {
-            v[a * hidden..b * hidden].to_vec()
-        };
+        let rows =
+            |v: &[f32], a: usize, b: usize| -> Vec<f32> { v[a * hidden..b * hidden].to_vec() };
         let cols = |v: &[f32], a: usize, b: usize| -> Vec<f32> {
             let mut o = Vec::with_capacity(hidden * (b - a));
             for r in 0..hidden {
@@ -11569,9 +11990,9 @@ mod tests {
                     up_proj: qt(inter, h, 316),
                     down_proj: qt(h, inter, 317),
                     act: Act::Silu,
-            down_t: None,
-            segs: Vec::new(),
-        }),
+                    down_t: None,
+                    segs: Vec::new(),
+                }),
                 attn: AttnKind::Full {
                     bias: None,
                     wq: qt(heads * hd, h, 311),

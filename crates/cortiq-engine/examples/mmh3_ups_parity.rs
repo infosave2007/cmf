@@ -16,8 +16,12 @@ use std::path::Path;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let weights = args.next().expect("usage: mmh3_ups_parity <weights> <oracle>");
-    let oracle = args.next().expect("usage: mmh3_ups_parity <weights> <oracle>");
+    let weights = args
+        .next()
+        .expect("usage: mmh3_ups_parity <weights> <oracle>");
+    let oracle = args
+        .next()
+        .expect("usage: mmh3_ups_parity <weights> <oracle>");
 
     let ups = LatentUpscaler::load(Path::new(&weights)).expect("load upscaler");
     let st = cortiq_engine::mmh3ups::read_oracle(Path::new(&oracle)).expect("load oracle");
@@ -36,12 +40,23 @@ fn main() {
             raw[ci * n + i] = raw[ci * n + i] * LATENT_STD[ci] + LATENT_MEAN[ci];
         }
     }
-    let z = Vol { c, t, h, w, data: raw };
+    let z = Vol {
+        c,
+        t,
+        h,
+        w,
+        data: raw,
+    };
     let started = std::time::Instant::now();
     let got = ups.upscale(&z, oh, ow, None);
     let secs = started.elapsed().as_secs_f64();
 
-    assert_eq!(got.data.len(), yd.len(), "shape mismatch: {:?} vs {ys:?}", (got.c, got.t, got.h, got.w));
+    assert_eq!(
+        got.data.len(),
+        yd.len(),
+        "shape mismatch: {:?} vs {ys:?}",
+        (got.c, got.t, got.h, got.w)
+    );
     // The oracle is the bare network: it neither normalizes its input nor
     // denormalizes its output. `upscale` does both, because every caller
     // holds a raw sampler latent — so put ours back on the network's own
@@ -70,5 +85,8 @@ fn main() {
     );
     // The reference runs in f32 here, so anything above a loose float
     // tolerance is a port bug, not precision.
-    assert!(rel < 2e-3, "relative rms {rel:.3e} is a port bug, not rounding");
+    assert!(
+        rel < 2e-3,
+        "relative rms {rel:.3e} is a port bug, not rounding"
+    );
 }

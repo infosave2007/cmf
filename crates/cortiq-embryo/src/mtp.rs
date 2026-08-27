@@ -45,7 +45,8 @@ impl MtpState {
         for kk in 0..k {
             for i in 0..h {
                 for j in 0..h {
-                    p[(kk * h + i) * h + j] = if i == j { 1.0 } else { 0.0 } + 0.01 * noise[(kk * h + i) * h + j];
+                    p[(kk * h + i) * h + j] =
+                        if i == j { 1.0 } else { 0.0 } + 0.01 * noise[(kk * h + i) * h + j];
                 }
             }
         }
@@ -89,7 +90,13 @@ pub fn shifted_targets(tokens: &[u32], b: usize, t: usize, k: usize) -> Vec<u32>
 /// One MTP training step on a batch: trunk forward (frozen), then for each
 /// head k: norm → proj → tied head loss on the k-shifted targets → grads of
 /// the head only → AdamW. Returns per-head mean loss (over valid positions).
-pub fn mtp_step(gpu: &mut EmbryoGpu, st: &mut MtpState, tokens: &[u32], lr: f32, train: bool) -> Vec<f32> {
+pub fn mtp_step(
+    gpu: &mut EmbryoGpu,
+    st: &mut MtpState,
+    tokens: &[u32],
+    lr: f32,
+    train: bool,
+) -> Vec<f32> {
     let m = gpu.b * gpu.t;
     let h = st.h;
     let cfg_eps = gpu.cfg.norm_eps;
@@ -99,25 +106,118 @@ pub fn mtp_step(gpu: &mut EmbryoGpu, st: &mut MtpState, tokens: &[u32], lr: f32,
     for kk in 0..st.k {
         let shifted = shifted_targets(tokens, gpu.b, gpu.t, kk + 1);
         let valid = shifted.iter().filter(|&&x| x != u32::MAX).count().max(1);
-        unsafe { std::ptr::copy_nonoverlapping(shifted.as_ptr(), st.tgt.buf.contents() as *mut u32, m) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(shifted.as_ptr(), st.tgt.buf.contents() as *mut u32, m)
+        };
         gpu.prepare_head(&shifted);
         let cmd = Cmd::new(c);
         if train {
             cmd.axpby(0.0, &gpu.g, 0.0, &gpu.g, gpu.lay.total); // head grads land here (ignored)
         }
         cmd.rmsnorm_fwd_at(&gpu.xf, &st.w, kk * h, &st.n, &st.inv, m, h, cfg_eps);
-        cmd.gemm(Op::N, Op::T, m, h, h, 1.0, &st.n, 0, h, &st.p, kk * h * h, h, 0.0, &st.hk, 0, h);
+        cmd.gemm(
+            Op::N,
+            Op::T,
+            m,
+            h,
+            h,
+            1.0,
+            &st.n,
+            0,
+            h,
+            &st.p,
+            kk * h * h,
+            h,
+            0.0,
+            &st.hk,
+            0,
+            h,
+        );
         gpu.encode_head_on(&cmd, train, &st.hk, &st.dhk, &st.tgt);
         if train {
             // dP_k = dhkᵀ·n ; dn = dhk·P_k ; norm backward → dw_k (dx into a sink)
             cmd.axpby(0.0, &st.gp, 0.0, &st.gp, st.gp.len);
             cmd.axpby(0.0, &st.gw, 0.0, &st.gw, st.gw.len);
-            cmd.gemm(Op::T, Op::N, h, h, m, 1.0, &st.dhk, 0, h, &st.n, 0, h, 0.0, &st.gp, kk * h * h, h);
-            cmd.gemm(Op::N, Op::N, m, h, h, 1.0, &st.dhk, 0, h, &st.p, kk * h * h, h, 0.0, &st.dn, 0, h);
-            cmd.rmsnorm_bwd_at(&gpu.xf, &st.w, kk * h, &st.dn, &st.inv, &st.dx, 0.0, &st.gw, kk * h, m, h);
+            cmd.gemm(
+                Op::T,
+                Op::N,
+                h,
+                h,
+                m,
+                1.0,
+                &st.dhk,
+                0,
+                h,
+                &st.n,
+                0,
+                h,
+                0.0,
+                &st.gp,
+                kk * h * h,
+                h,
+            );
+            cmd.gemm(
+                Op::N,
+                Op::N,
+                m,
+                h,
+                h,
+                1.0,
+                &st.dhk,
+                0,
+                h,
+                &st.p,
+                kk * h * h,
+                h,
+                0.0,
+                &st.dn,
+                0,
+                h,
+            );
+            cmd.rmsnorm_bwd_at(
+                &gpu.xf,
+                &st.w,
+                kk * h,
+                &st.dn,
+                &st.inv,
+                &st.dx,
+                0.0,
+                &st.gw,
+                kk * h,
+                m,
+                h,
+            );
             st.step += 1;
-            cmd.adamw_at(&st.p, &st.gp, &st.mp, &st.vp, kk * h * h, h * h, lr, 0.9, 0.95, 1e-8, 0.0, st.step, 1.0);
-            cmd.adamw_at(&st.w, &st.gw, &st.mw, &st.vw, kk * h, h, lr, 0.9, 0.95, 1e-8, 0.0, st.step, 1.0);
+            cmd.adamw_at(
+                &st.p,
+                &st.gp,
+                &st.mp,
+                &st.vp,
+                kk * h * h,
+                h * h,
+                lr,
+                0.9,
+                0.95,
+                1e-8,
+                0.0,
+                st.step,
+                1.0,
+            );
+            cmd.adamw_at(
+                &st.w,
+                &st.gw,
+                &st.mw,
+                &st.vw,
+                kk * h,
+                h,
+                lr,
+                0.9,
+                0.95,
+                1e-8,
+                0.0,
+                st.step,
+                1.0,
+            );
         }
         cmd.commit();
         // read_loss divides by m; rescale to valid positions
@@ -127,24 +227,44 @@ pub fn mtp_step(gpu: &mut EmbryoGpu, st: &mut MtpState, tokens: &[u32], lr: f32,
 }
 
 /// Train K heads on `corpus` for `steps`; returns (state, per-head held-out losses).
-pub fn train_mtp(ck: &Checkpoint, corpus: &Shard, k: usize, steps: usize, lr: f32, batch: usize, seq: usize, seed: u64) -> anyhow::Result<(EmbryoGpu, MtpState, Vec<f32>)> {
-    let mut gpu = EmbryoGpu::new(ck.cfg.clone(), batch, seq, &ck.params).ok_or_else(|| anyhow::anyhow!("no Metal"))?;
+pub fn train_mtp(
+    ck: &Checkpoint,
+    corpus: &Shard,
+    k: usize,
+    steps: usize,
+    lr: f32,
+    batch: usize,
+    seq: usize,
+    seed: u64,
+) -> anyhow::Result<(EmbryoGpu, MtpState, Vec<f32>)> {
+    let mut gpu = EmbryoGpu::new(ck.cfg.clone(), batch, seq, &ck.params)
+        .ok_or_else(|| anyhow::anyhow!("no Metal"))?;
     gpu.set_desc(&ck.extras);
     gpu.desc_updates.set(false);
     let mut st = MtpState::new(&gpu, k, seed);
     let n = corpus.tokens.len();
     let cut = n - n / 10;
-    let train = Shard { tokens: corpus.tokens[..cut].to_vec() };
-    let held = Shard { tokens: corpus.tokens[cut..].to_vec() };
+    let train = Shard {
+        tokens: corpus.tokens[..cut].to_vec(),
+    };
+    let held = Shard {
+        tokens: corpus.tokens[cut..].to_vec(),
+    };
     let mut sampler = Sampler::new(batch, seq, seed);
     let (mut tk, mut tg) = (Vec::new(), Vec::new());
     let t0 = Instant::now();
     for step in 0..steps {
         sampler.batch(&train, &mut tk, &mut tg);
-        let lr_s = lr * 0.5 * (1.0 + (std::f32::consts::PI * step as f32 / steps.max(1) as f32).cos());
+        let lr_s =
+            lr * 0.5 * (1.0 + (std::f32::consts::PI * step as f32 / steps.max(1) as f32).cos());
         let l = mtp_step(&mut gpu, &mut st, &tk, lr_s, true);
         if (step + 1) % 25 == 0 || step + 1 == steps {
-            eprintln!("  mtp step {:>4} losses {:?} [{:.0} s]", step + 1, l.iter().map(|x| format!("{x:.3}")).collect::<Vec<_>>(), t0.elapsed().as_secs_f64());
+            eprintln!(
+                "  mtp step {:>4} losses {:?} [{:.0} s]",
+                step + 1,
+                l.iter().map(|x| format!("{x:.3}")).collect::<Vec<_>>(),
+                t0.elapsed().as_secs_f64()
+            );
         }
     }
     // held-out
@@ -162,7 +282,11 @@ pub fn train_mtp(ck: &Checkpoint, corpus: &Shard, k: usize, steps: usize, lr: f3
 
 /// Append the trained heads to a .cmf as `model.mtp.{k}.{norm,proj}.weight`
 /// (base tensors byte-identical; the runtime ignores unknown tensors).
-pub fn append_to_cmf(base: &std::path::Path, out: &std::path::Path, st: &MtpState) -> anyhow::Result<usize> {
+pub fn append_to_cmf(
+    base: &std::path::Path,
+    out: &std::path::Path,
+    st: &MtpState,
+) -> anyhow::Result<usize> {
     use cortiq_core::format::{CmfModel, TensorSpec};
     use cortiq_core::types::TensorDtype;
     let model = CmfModel::open(base)?;
@@ -172,7 +296,12 @@ pub fn append_to_cmf(base: &std::path::Path, out: &std::path::Path, st: &MtpStat
         if t.name.starts_with("model.mtp.") {
             continue;
         }
-        specs.push(TensorSpec { name: t.name.clone(), dtype: t.dtype, shape: t.shape.clone(), data: model.tensor_bytes(&t.name)?.to_vec() });
+        specs.push(TensorSpec {
+            name: t.name.clone(),
+            dtype: t.dtype,
+            shape: t.shape.clone(),
+            data: model.tensor_bytes(&t.name)?.to_vec(),
+        });
         kept += 1;
     }
     let (w, p, h) = (st.w.to_vec(), st.p.to_vec(), st.h);
@@ -184,14 +313,34 @@ pub fn append_to_cmf(base: &std::path::Path, out: &std::path::Path, st: &MtpStat
         v
     };
     for k in 0..st.k {
-        specs.push(TensorSpec { name: format!("model.mtp.{}.norm.weight", k + 1), dtype: TensorDtype::F32, shape: vec![h], data: f32b(&w[k * h..(k + 1) * h]) });
-        specs.push(TensorSpec { name: format!("model.mtp.{}.proj.weight", k + 1), dtype: TensorDtype::F32, shape: vec![h, h], data: f32b(&p[k * h * h..(k + 1) * h * h]) });
+        specs.push(TensorSpec {
+            name: format!("model.mtp.{}.norm.weight", k + 1),
+            dtype: TensorDtype::F32,
+            shape: vec![h],
+            data: f32b(&w[k * h..(k + 1) * h]),
+        });
+        specs.push(TensorSpec {
+            name: format!("model.mtp.{}.proj.weight", k + 1),
+            dtype: TensorDtype::F32,
+            shape: vec![h, h],
+            data: f32b(&p[k * h * h..(k + 1) * h * h]),
+        });
     }
     let mut header = model.header.clone();
     let mut prov = header.provenance.clone().unwrap_or(serde_json::json!({}));
     prov["mtp_heads"] = serde_json::json!({"k": st.k, "layout": "model.mtp.{k}.{norm,proj}.weight, tied hierarchical head; k = 1..K predicts t+1+k"});
     header.provenance = Some(prov);
     let vocab = model.vocab.clone();
-    CmfModel::write(out, &header, &specs, if model.masks.masks.is_empty() { None } else { Some(&model.masks) }, vocab.as_deref())?;
+    CmfModel::write(
+        out,
+        &header,
+        &specs,
+        if model.masks.masks.is_empty() {
+            None
+        } else {
+            Some(&model.masks)
+        },
+        vocab.as_deref(),
+    )?;
     Ok(kept)
 }

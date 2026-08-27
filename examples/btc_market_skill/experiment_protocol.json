@@ -1,0 +1,44 @@
+{
+  "schema": 1,
+  "frozen_before_validation_generation": true,
+  "data_end_exclusive_utc": "2026-08-26T00:00:00Z",
+  "candidates": [
+    "BTCUSDT",
+    "ETHUSDT"
+  ],
+  "base_model": "Qwen/Qwen3.5-2B",
+  "base_cmf_quant": "q4tp",
+  "window_closed_candles": 48,
+  "horizon_hours": 1,
+  "target": "UP if close[t+1] > close[t], else DOWN",
+  "split": "chronological 70/15/15",
+  "purge_hours": 49,
+  "asset_selection_split": "validation",
+  "validation_generation_samples_per_asset": 180,
+  "final_test_generation_samples": 400,
+  "baked_applied_parity_samples": 30,
+  "sample_selection": "deterministic evenly-spaced timestamps over the chosen split",
+  "primary_selection_metric": "accuracy delta: q4tp_plus_applied_skill - q4tp_base",
+  "tie_breakers": [
+    "macro_f1 delta",
+    "balanced_accuracy delta"
+  ],
+  "final_test_policy": "Open the test split once for the selected asset and fixed skill.",
+  "bake": {
+    "steps_a": 180,
+    "steps_b": 0,
+    "lr_a": 0.1,
+    "lr_b": 0.0001,
+    "eval_every": 30,
+    "fcd_layers_if_enabled": 4,
+    "fcd_selection_note": "A 30-step pilot worsened held PPL from 2.058 to 4.459, so the mask-only checkpoint was frozen before any generation/test evaluation.",
+    "focus_tokens": [
+      "DOWN",
+      "UP"
+    ],
+    "calibration_chunks": 1200,
+    "held_chunks": 24,
+    "chunk_tokens": 256,
+    "ffn_align": 32
+  }
+}

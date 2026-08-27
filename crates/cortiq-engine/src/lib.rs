@@ -20,8 +20,8 @@ pub mod linear_core;
 pub mod loader;
 pub mod ltxaudio;
 pub mod ltxdit;
-pub mod ltxenc;
 pub mod ltxdur;
+pub mod ltxenc;
 pub mod ltxlora;
 pub mod ltxpipe;
 pub mod ltxte;
@@ -38,6 +38,7 @@ pub mod pool;
 pub mod qtensor;
 pub mod qwen3te;
 pub mod qwen3vis;
+pub mod qwen4_exp;
 pub mod router;
 pub mod runtime;
 pub mod sampler;
@@ -54,7 +55,6 @@ pub mod videogen;
     feature = "gpu",
     any(target_os = "linux", target_os = "windows", target_os = "android")
 ))]
-
 pub use nystrom::NystromState;
 pub use pipeline::{GenerateResult, Pipeline, TokenCallback, TokenTrace};
 pub use runtime::CortiqRuntime;

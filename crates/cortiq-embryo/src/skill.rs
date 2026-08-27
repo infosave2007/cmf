@@ -50,7 +50,12 @@ fn f16_bits(x: f32) -> u16 {
             return sign;
         }
         let m = (mant | 0x80_0000) >> (1 - e);
-        let round = (m >> 13) as u16 + if (m & 0x1fff) > 0x1000 || ((m & 0x1fff) == 0x1000 && (m & 0x2000) != 0) { 1 } else { 0 };
+        let round = (m >> 13) as u16
+            + if (m & 0x1fff) > 0x1000 || ((m & 0x1fff) == 0x1000 && (m & 0x2000) != 0) {
+                1
+            } else {
+                0
+            };
         return sign | round;
     }
     let mut half = sign | ((e as u16) << 10) | ((mant >> 13) as u16);
@@ -112,9 +117,14 @@ pub fn fit_selection(phis_raw: &[Vec<f32>], phi_layer: usize, rank: usize) -> Se
     }
     let basis = crate::model::top_eigenvectors(&cov, h, rank, 120, 99);
     // training error distribution
-    let errs: Vec<f32> = train.iter().map(|p| cortiq_engine::router::recon_error(p, &mean, &basis, rank)).collect();
+    let errs: Vec<f32> = train
+        .iter()
+        .map(|p| cortiq_engine::router::recon_error(p, &mean, &basis, rank))
+        .collect();
     let em = errs.iter().sum::<f32>() / nt as f32;
-    let es = (errs.iter().map(|e| (e - em).powi(2)).sum::<f32>() / nt as f32).sqrt().max(1e-4);
+    let es = (errs.iter().map(|e| (e - em).powi(2)).sum::<f32>() / nt as f32)
+        .sqrt()
+        .max(1e-4);
     let mut hold_flat = Vec::with_capacity(hold.len() * h);
     for p in hold {
         hold_flat.extend_from_slice(p);
@@ -135,18 +145,41 @@ pub fn fit_selection(phis_raw: &[Vec<f32>], phi_layer: usize, rank: usize) -> Se
 /// Recalibrate a container's skill router (temperature + θ) from the
 /// held-out φ every skill carries; rewrites the header only (tensor bytes
 /// copied verbatim). Returns the calibration written.
-pub fn calibrate_file(path: &Path, target_fpr: f32) -> anyhow::Result<Option<cortiq_core::format::RoutingCalibration>> {
+pub fn calibrate_file(
+    path: &Path,
+    target_fpr: f32,
+) -> anyhow::Result<Option<cortiq_core::format::RoutingCalibration>> {
     let model = CmfModel::open(path)?;
-    let Some(cal) = cortiq_engine::router::calibrate(&model, target_fpr) else { return Ok(None) };
+    let Some(cal) = cortiq_engine::router::calibrate(&model, target_fpr) else {
+        return Ok(None);
+    };
     let mut header = model.header.clone();
     header.routing = Some(cal.clone());
     let specs: Vec<TensorSpec> = model
         .tensors
         .iter()
-        .map(|t| TensorSpec { name: t.name.clone(), dtype: t.dtype, shape: t.shape.clone(), data: model.tensor_bytes(&t.name).map(|b| b.to_vec()).unwrap_or_default() })
+        .map(|t| TensorSpec {
+            name: t.name.clone(),
+            dtype: t.dtype,
+            shape: t.shape.clone(),
+            data: model
+                .tensor_bytes(&t.name)
+                .map(|b| b.to_vec())
+                .unwrap_or_default(),
+        })
         .collect();
     let tmp = path.with_extension("cmf.cal");
-    CmfModel::write(&tmp, &header, &specs, if model.masks.masks.is_empty() { None } else { Some(&model.masks) }, model.vocab.as_deref())?;
+    CmfModel::write(
+        &tmp,
+        &header,
+        &specs,
+        if model.masks.masks.is_empty() {
+            None
+        } else {
+            Some(&model.masks)
+        },
+        model.vocab.as_deref(),
+    )?;
     drop(model);
     std::fs::rename(&tmp, path)?;
     Ok(Some(cal))
@@ -161,11 +194,17 @@ pub fn bake(
     corpus: &Shard,
     a: &BakeArgs,
     should_stop: &dyn Fn() -> bool,
-) -> anyhow::Result<(Vec<(String, Vec<usize>, Vec<f32>)>, SelectionDescriptor, Vec<f32>, (f32, f32, f32))> {
+) -> anyhow::Result<(
+    Vec<(String, Vec<usize>, Vec<f32>)>,
+    SelectionDescriptor,
+    Vec<f32>,
+    (f32, f32, f32),
+)> {
     let cfg = ck.cfg.clone();
     let lay = Layout::new(&cfg);
     let (h, i) = (cfg.hidden, cfg.inter);
-    let mut gpu = EmbryoGpu::new(cfg.clone(), a.batch, a.seq, &ck.params).ok_or_else(|| anyhow::anyhow!("no Metal"))?;
+    let mut gpu = EmbryoGpu::new(cfg.clone(), a.batch, a.seq, &ck.params)
+        .ok_or_else(|| anyhow::anyhow!("no Metal"))?;
     gpu.set_desc(&ck.extras);
     gpu.desc_updates.set(false); // the genome's routing state is frozen
     let c = gpu.ctx();
@@ -174,8 +213,12 @@ pub fn bake(
     let n = corpus.tokens.len();
     anyhow::ensure!(n > 20 * (a.seq + 2), "skill corpus too small: {n} tokens");
     let cut = n - n / 10;
-    let train = Shard { tokens: corpus.tokens[..cut].to_vec() };
-    let held = Shard { tokens: corpus.tokens[cut..].to_vec() };
+    let train = Shard {
+        tokens: corpus.tokens[..cut].to_vec(),
+    };
+    let held = Shard {
+        tokens: corpus.tokens[cut..].to_vec(),
+    };
     let mut sampler = Sampler::new(a.batch, a.seq, a.seed);
     let (mut tk, mut tg) = (Vec::new(), Vec::new());
     let m = a.batch * a.seq;
@@ -193,7 +236,12 @@ pub fn bake(
     gpu.skill.as_ref().unwrap().hard.set(true);
     let base_loss = eval(&gpu, &mut tk, &mut tg);
     gpu.skill.as_ref().unwrap().hard.set(false);
-    eprintln!("skill '{}': base held-out loss {base_loss:.4} (ppl {:.1}); layers {:?}", a.id, base_loss.exp(), a.layers);
+    eprintln!(
+        "skill '{}': base held-out loss {base_loss:.4} (ppl {:.1}); layers {:?}",
+        a.id,
+        base_loss.exp(),
+        a.layers
+    );
     // ---- phase A: masks to the denoising bottom ----
     let mut best_a = (f32::MAX, gpu.skill.as_ref().unwrap().logits.to_vec());
     for step in 0..a.steps_a {
@@ -210,8 +258,16 @@ pub fn bake(
             let vl = eval(&gpu, &mut tk, &mut tg);
             sk.hard.set(false);
             let masks = sk.hard_masks();
-            let kept: Vec<f32> = masks.iter().map(|mk| mk.iter().filter(|&&b| b).count() as f32 / mk.len() as f32).collect();
-            eprintln!("  A step {:>4} loss {loss:.4} |g| {gn:.3} l1 {l1:.2e} held-out(hard) {vl:.4} kept {:?} [{:.0} s]", step + 1, kept.iter().map(|k| format!("{k:.2}")).collect::<Vec<_>>(), t0.elapsed().as_secs_f64());
+            let kept: Vec<f32> = masks
+                .iter()
+                .map(|mk| mk.iter().filter(|&&b| b).count() as f32 / mk.len() as f32)
+                .collect();
+            eprintln!(
+                "  A step {:>4} loss {loss:.4} |g| {gn:.3} l1 {l1:.2e} held-out(hard) {vl:.4} kept {:?} [{:.0} s]",
+                step + 1,
+                kept.iter().map(|k| format!("{k:.2}")).collect::<Vec<_>>(),
+                t0.elapsed().as_secs_f64()
+            );
             if vl < best_a.0 {
                 best_a = (vl, sk.logits.to_vec());
             }
@@ -224,8 +280,20 @@ pub fn bake(
         sk.hard.set(true);
         sk.l1.set(0.0);
     }
-    let kept: Vec<f32> = gpu.skill.as_ref().unwrap().hard_masks().iter().map(|mk| mk.iter().filter(|&&b| b).count() as f32 / mk.len() as f32).collect();
-    eprintln!("phase A best held-out {:.4} (ppl {:.1}); kept {:?}", best_a.0, best_a.0.exp(), kept);
+    let kept: Vec<f32> = gpu
+        .skill
+        .as_ref()
+        .unwrap()
+        .hard_masks()
+        .iter()
+        .map(|mk| mk.iter().filter(|&&b| b).count() as f32 / mk.len() as f32)
+        .collect();
+    eprintln!(
+        "phase A best held-out {:.4} (ppl {:.1}); kept {:?}",
+        best_a.0,
+        best_a.0.exp(),
+        kept
+    );
     // ---- phase B: FCD polish of the selected FFNs under the hard mask ----
     let ffn_ranges: Vec<(usize, usize)> = a
         .layers
@@ -239,7 +307,10 @@ pub fn bake(
         .collect();
     let snapshot = |gpu: &EmbryoGpu| -> Vec<Vec<f32>> {
         let p = gpu.params_host();
-        ffn_ranges.iter().map(|&(o, n)| p[o..o + n].to_vec()).collect()
+        ffn_ranges
+            .iter()
+            .map(|&(o, n)| p[o..o + n].to_vec())
+            .collect()
     };
     let mut best_b = (best_a.0, snapshot(&gpu));
     for step in 0..a.steps_b {
@@ -247,22 +318,38 @@ pub fn bake(
             anyhow::bail!("preempted");
         }
         sampler.batch(&train, &mut tk, &mut tg);
-        let lr = a.lr_b * 0.5 * (1.0 + (std::f32::consts::PI * step as f32 / a.steps_b.max(1) as f32).cos());
+        let lr = a.lr_b
+            * 0.5
+            * (1.0 + (std::f32::consts::PI * step as f32 / a.steps_b.max(1) as f32).cos());
         let (loss, gn) = gpu.train_step_skill(&tk, &tg, lr, 0.0, 1.0, true);
         if (step + 1) % a.eval_every == 0 || step + 1 == a.steps_b {
             let vl = eval(&gpu, &mut tk, &mut tg);
-            eprintln!("  B step {:>4} loss {loss:.4} |g| {gn:.3} lr {lr:.2e} held-out {vl:.4} [{:.0} s]", step + 1, t0.elapsed().as_secs_f64());
+            eprintln!(
+                "  B step {:>4} loss {loss:.4} |g| {gn:.3} lr {lr:.2e} held-out {vl:.4} [{:.0} s]",
+                step + 1,
+                t0.elapsed().as_secs_f64()
+            );
             if vl < best_b.0 {
                 best_b = (vl, snapshot(&gpu));
             }
         }
     }
-    eprintln!("phase B best held-out {:.4} (ppl {:.1}) vs base {:.4} (ppl {:.1})", best_b.0, best_b.0.exp(), base_loss, base_loss.exp());
+    eprintln!(
+        "phase B best held-out {:.4} (ppl {:.1}) vs base {:.4} (ppl {:.1})",
+        best_b.0,
+        best_b.0.exp(),
+        base_loss,
+        base_loss.exp()
+    );
     // ---- fold the mask into the best tensors, name them for the runtime ----
     let masks = gpu.skill.as_ref().unwrap().hard_masks();
     let mut out = Vec::new();
     for (li, &l) in a.layers.iter().enumerate() {
-        let (mut wg, mut wu, mut wd) = (best_b.1[li * 3].clone(), best_b.1[li * 3 + 1].clone(), best_b.1[li * 3 + 2].clone());
+        let (mut wg, mut wu, mut wd) = (
+            best_b.1[li * 3].clone(),
+            best_b.1[li * 3 + 1].clone(),
+            best_b.1[li * 3 + 2].clone(),
+        );
         for j in 0..i {
             if !masks[li][j] {
                 wg[j * h..(j + 1) * h].fill(0.0);
@@ -272,7 +359,11 @@ pub fn bake(
                 }
             }
         }
-        let pf = if cfg.experts > 0 { format!("skill.{}.model.layers.{l}.mlp.shared_expert.", a.id) } else { format!("skill.{}.model.layers.{l}.mlp.", a.id) };
+        let pf = if cfg.experts > 0 {
+            format!("skill.{}.model.layers.{l}.mlp.shared_expert.", a.id)
+        } else {
+            format!("skill.{}.model.layers.{l}.mlp.", a.id)
+        };
         out.push((format!("{pf}gate_proj.weight"), vec![i, h], wg));
         out.push((format!("{pf}up_proj.weight"), vec![i, h], wu));
         out.push((format!("{pf}down_proj.weight"), vec![h, i], wd));
@@ -307,7 +398,12 @@ pub fn append_to_cmf(
         if t.name.starts_with(&format!("skill.{id}.")) {
             continue;
         }
-        specs.push(TensorSpec { name: t.name.clone(), dtype: t.dtype, shape: t.shape.clone(), data: model.tensor_bytes(&t.name)?.to_vec() });
+        specs.push(TensorSpec {
+            name: t.name.clone(),
+            dtype: t.dtype,
+            shape: t.shape.clone(),
+            data: model.tensor_bytes(&t.name)?.to_vec(),
+        });
         kept += 1;
     }
     for (name, shape, data) in tensors {
@@ -315,7 +411,12 @@ pub fn append_to_cmf(
         for f in data {
             bytes.extend_from_slice(&f.to_le_bytes());
         }
-        specs.push(TensorSpec { name: name.clone(), dtype: TensorDtype::F32, shape: shape.clone(), data: bytes });
+        specs.push(TensorSpec {
+            name: name.clone(),
+            dtype: TensorDtype::F32,
+            shape: shape.clone(),
+            data: bytes,
+        });
     }
     let mut header = model.header.clone();
     header.skills.retain(|s| s.id != id);
@@ -332,6 +433,16 @@ pub fn append_to_cmf(
         provenance: Some(serde_json::json!({"producer": "cortiq-embryo skill-bake", "recipe": "DTG-MA mask (phase A, L1 to the denoising bottom) + FCD polish (phase B), mask folded"})),
     });
     let vocab = model.vocab.clone();
-    CmfModel::write(out, &header, &specs, if model.masks.masks.is_empty() { None } else { Some(&model.masks) }, vocab.as_deref())?;
+    CmfModel::write(
+        out,
+        &header,
+        &specs,
+        if model.masks.masks.is_empty() {
+            None
+        } else {
+            Some(&model.masks)
+        },
+        vocab.as_deref(),
+    )?;
     Ok(kept)
 }

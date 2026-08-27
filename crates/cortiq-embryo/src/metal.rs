@@ -220,7 +220,9 @@ unsafe impl Sync for GBuf {}
 impl GBuf {
     pub fn zeros(c: &Ctx, len: usize) -> GBuf {
         let bytes = (len.max(1) * 4) as u64;
-        let buf = c.device.new_buffer(bytes, MTLResourceOptions::StorageModeShared);
+        let buf = c
+            .device
+            .new_buffer(bytes, MTLResourceOptions::StorageModeShared);
         // new_buffer memory is zero-filled by Metal for shared storage
         // in practice, but the contract does not promise it — do it.
         unsafe { std::ptr::write_bytes(buf.contents() as *mut u8, 0, bytes as usize) };
@@ -305,7 +307,24 @@ impl<'a> Cmd<'a> {
         ldc: usize,
     ) {
         self.gemm_ex(
-            ta, tb, m, n, k, alpha, a, a_off, lda, b, b_off, ldb, beta, cbuf, c_off, ldc, &GemmBatch::none(), false,
+            ta,
+            tb,
+            m,
+            n,
+            k,
+            alpha,
+            a,
+            a_off,
+            lda,
+            b,
+            b_off,
+            ldb,
+            beta,
+            cbuf,
+            c_off,
+            ldc,
+            &GemmBatch::none(),
+            false,
         );
     }
 
@@ -333,7 +352,27 @@ impl<'a> Cmd<'a> {
         batch: &GemmBatch,
         causal: bool,
     ) {
-        self.gemm_dyn(ta, tb, m, n, k, alpha, a, a_off, lda, b, b_off, ldb, beta, cbuf, c_off, ldc, batch, causal, &GemmDyn::none());
+        self.gemm_dyn(
+            ta,
+            tb,
+            m,
+            n,
+            k,
+            alpha,
+            a,
+            a_off,
+            lda,
+            b,
+            b_off,
+            ldb,
+            beta,
+            cbuf,
+            c_off,
+            ldc,
+            batch,
+            causal,
+            &GemmDyn::none(),
+        );
     }
 
     /// GEMM with a GPU-decided shape: `dynamic.indirect` = (buffer, byte
@@ -364,18 +403,40 @@ impl<'a> Cmd<'a> {
         causal: bool,
         dynamic: &GemmDyn<'_>,
     ) {
-        assert!(m % 64 == 0 && n % 64 == 0 && k % 32 == 0, "gemm tile alignment: m={m} n={n} k={k}");
-        assert!(lda % 4 == 0 && ldb % 4 == 0 && ldc % 4 == 0 && a_off % 4 == 0 && b_off % 4 == 0 && c_off % 4 == 0);
+        assert!(
+            m % 64 == 0 && n % 64 == 0 && k % 32 == 0,
+            "gemm tile alignment: m={m} n={n} k={k}"
+        );
+        assert!(
+            lda % 4 == 0
+                && ldb % 4 == 0
+                && ldc % 4 == 0
+                && a_off % 4 == 0
+                && b_off % 4 == 0
+                && c_off % 4 == 0
+        );
         let (arows, acols) = if ta == Op::N { (m, k) } else { (k, m) };
         let (brows, bcols) = if tb == Op::N { (k, n) } else { (n, k) };
         assert!(lda >= acols && ldb >= bcols && ldc >= n);
         let (nb, nh, nc) = (batch.nb.max(1), batch.nh.max(1), batch.nc.max(1));
         let last = |s: [usize; 3]| (nb - 1) * s[0] + (nh - 1) * s[1] + (nc - 1) * s[2];
-        assert!(a_off + last(batch.sa) + (arows - 1) * lda + acols <= a.len, "gemm: A out of range");
-        assert!(b_off + last(batch.sb) + (brows - 1) * ldb + bcols <= b.len, "gemm: B out of range");
-        assert!(c_off + last(batch.sc) + (m - 1) * ldc + n <= cbuf.len, "gemm: C out of range");
+        assert!(
+            a_off + last(batch.sa) + (arows - 1) * lda + acols <= a.len,
+            "gemm: A out of range"
+        );
+        assert!(
+            b_off + last(batch.sb) + (brows - 1) * ldb + bcols <= b.len,
+            "gemm: B out of range"
+        );
+        assert!(
+            c_off + last(batch.sc) + (m - 1) * ldc + n <= cbuf.len,
+            "gemm: C out of range"
+        );
         for s in [batch.sa, batch.sb, batch.sc] {
-            assert!(s.iter().all(|x| x % 4 == 0), "gemm: batch strides must be multiples of 4 floats");
+            assert!(
+                s.iter().all(|x| x % 4 == 0),
+                "gemm: batch strides must be multiples of 4 floats"
+            );
         }
         #[repr(C)]
         struct Args {
@@ -419,13 +480,19 @@ impl<'a> Cmd<'a> {
         e.set_buffer(0, Some(&a.buf), (a_off * 4) as u64);
         e.set_buffer(1, Some(&b.buf), (b_off * 4) as u64);
         e.set_buffer(2, Some(&cbuf.buf), (c_off * 4) as u64);
-        e.set_bytes(3, std::mem::size_of::<Args>() as u64, &args as *const Args as *const c_void);
+        e.set_bytes(
+            3,
+            std::mem::size_of::<Args>() as u64,
+            &args as *const Args as *const c_void,
+        );
         match dynamic.kcount {
             Some((kb, koff)) => e.set_buffer(4, Some(&kb.buf), (koff * 4) as u64),
             None => e.set_buffer(4, Some(&a.buf), 0), // never read (kdyn = 0)
         }
         match dynamic.indirect {
-            Some((ib, ioff)) => e.dispatch_thread_groups_indirect(&ib.buf, ioff as u64, MTLSize::new(128, 1, 1)),
+            Some((ib, ioff)) => {
+                e.dispatch_thread_groups_indirect(&ib.buf, ioff as u64, MTLSize::new(128, 1, 1))
+            }
             None => e.dispatch_thread_groups(
                 MTLSize::new((n / 64) as u64, (m / 64) as u64, (nb * nh * nc) as u64),
                 MTLSize::new(128, 1, 1),
@@ -438,10 +505,12 @@ impl<'a> Cmd<'a> {
     }
 
     fn set_u32(&self, idx: u64, v: u32) {
-        self.enc.set_bytes(idx, 4, &v as *const u32 as *const c_void);
+        self.enc
+            .set_bytes(idx, 4, &v as *const u32 as *const c_void);
     }
     fn set_f32(&self, idx: u64, v: f32) {
-        self.enc.set_bytes(idx, 4, &v as *const f32 as *const c_void);
+        self.enc
+            .set_bytes(idx, 4, &v as *const f32 as *const c_void);
     }
     fn grid1(&self, n: usize, tg: usize) {
         let groups = n.div_ceil(tg).max(1);
@@ -512,7 +581,11 @@ impl<'a> Cmd<'a> {
         e.set_buffer(1, Some(&g.buf), 0);
         e.set_buffer(2, Some(&m.buf), 0);
         e.set_buffer(3, Some(&v.buf), 0);
-        e.set_bytes(4, std::mem::size_of::<Args>() as u64, &args as *const Args as *const c_void);
+        e.set_bytes(
+            4,
+            std::mem::size_of::<Args>() as u64,
+            &args as *const Args as *const c_void,
+        );
         self.grid1(n, 256);
     }
 
@@ -565,12 +638,23 @@ impl<'a> Cmd<'a> {
         e.set_buffer(1, Some(&g.buf), (off * 4) as u64);
         e.set_buffer(2, Some(&m.buf), (off * 4) as u64);
         e.set_buffer(3, Some(&v.buf), (off * 4) as u64);
-        e.set_bytes(4, std::mem::size_of::<Args>() as u64, &args as *const Args as *const c_void);
+        e.set_bytes(
+            4,
+            std::mem::size_of::<Args>() as u64,
+            &args as *const Args as *const c_void,
+        );
         self.grid1(n, 256);
     }
 
     /// Sum of squares of x[off..off+n] into partial[part_off..]; returns groups.
-    pub fn sumsq_at(&self, x: &GBuf, off: usize, n: usize, partial: &GBuf, part_off: usize) -> usize {
+    pub fn sumsq_at(
+        &self,
+        x: &GBuf,
+        off: usize,
+        n: usize,
+        partial: &GBuf,
+        part_off: usize,
+    ) -> usize {
         let groups = n.div_ceil(256).clamp(1, 4096).min(partial.len - part_off);
         let e = &self.enc;
         e.set_compute_pipeline_state(&self.c.sumsq);
@@ -597,7 +681,16 @@ impl<'a> Cmd<'a> {
 
     /// RMSNorm forward over `rows` rows of width d: y, inv.
     #[allow(clippy::too_many_arguments)]
-    pub fn rmsnorm_fwd(&self, x: &GBuf, w: &GBuf, y: &GBuf, inv: &GBuf, rows: usize, d: usize, eps: f32) {
+    pub fn rmsnorm_fwd(
+        &self,
+        x: &GBuf,
+        w: &GBuf,
+        y: &GBuf,
+        inv: &GBuf,
+        rows: usize,
+        d: usize,
+        eps: f32,
+    ) {
         assert!(x.len >= rows * d && y.len >= rows * d && w.len >= d && inv.len >= rows);
         let e = &self.enc;
         e.set_compute_pipeline_state(&self.c.rms_fwd);
@@ -658,7 +751,15 @@ impl<'a> Cmd<'a> {
     }
 
     /// dgate, dup from dh.
-    pub fn swiglu_bwd(&self, gate: &GBuf, up: &GBuf, dh: &GBuf, dgate: &GBuf, dup: &GBuf, n: usize) {
+    pub fn swiglu_bwd(
+        &self,
+        gate: &GBuf,
+        up: &GBuf,
+        dh: &GBuf,
+        dgate: &GBuf,
+        dup: &GBuf,
+        n: usize,
+    ) {
         assert!(gate.len >= n && up.len >= n && dh.len >= n && dgate.len >= n && dup.len >= n);
         let e = &self.enc;
         e.set_compute_pipeline_state(&self.c.swiglu_bwd);
@@ -689,7 +790,15 @@ impl<'a> Cmd<'a> {
 
     /// Fused softmax-CE over `rows` rows of `n` logits: loss[row], and
     /// logits ← (p − onehot)·scale in place.
-    pub fn softmax_ce(&self, logits: &GBuf, target: &GBuf, loss: &GBuf, rows: usize, n: usize, scale: f32) {
+    pub fn softmax_ce(
+        &self,
+        logits: &GBuf,
+        target: &GBuf,
+        loss: &GBuf,
+        rows: usize,
+        n: usize,
+        scale: f32,
+    ) {
         assert!(logits.len >= rows * n && target.len >= rows && loss.len >= rows);
         let e = &self.enc;
         e.set_compute_pipeline_state(&self.c.softmax_ce);
@@ -712,8 +821,18 @@ impl<'a> Cmd<'a> {
             nph: u32,
             dv: u32,
         }
-        let a = Args { b: d.b as u32, t: d.t as u32, nh: d.nh as u32, nph: d.nph as u32, dv: d.dv as u32 };
-        self.enc.set_bytes(idx, std::mem::size_of::<Args>() as u64, &a as *const Args as *const c_void);
+        let a = Args {
+            b: d.b as u32,
+            t: d.t as u32,
+            nh: d.nh as u32,
+            nph: d.nph as u32,
+            dv: d.dv as u32,
+        };
+        self.enc.set_bytes(
+            idx,
+            std::mem::size_of::<Args>() as u64,
+            &a as *const Args as *const c_void,
+        );
     }
 
     /// Forward of one hybrid_k mixer layer (after the projections):
@@ -746,7 +865,10 @@ impl<'a> Cmd<'a> {
         e.set_buffer(2, Some(&w.pow.buf), (w.pow_off * 4) as u64);
         e.set_buffer(3, Some(&w.states.buf), 0);
         self.hk_args(4, d);
-        e.dispatch_thread_groups(MTLSize::new((d.b * d.nh) as u64, 1, 1), MTLSize::new((d.dv * (2 * d.nph).div_ceil(16)) as u64, 1, 1));
+        e.dispatch_thread_groups(
+            MTLSize::new((d.b * d.nh) as u64, 1, 1),
+            MTLSize::new((d.dv * (2 * d.nph).div_ceil(16)) as u64, 1, 1),
+        );
         // per-chunk outputs
         let nchunks = d.t / 64;
         e.set_compute_pipeline_state(&self.c.hk_chunk_fwd);
@@ -775,7 +897,11 @@ impl<'a> Cmd<'a> {
         assert!(g.dstates.len >= w.states.len && g.dkv.len >= rows * d.nh * d.dv);
         assert!(g.dphq.len >= rows * d.nh * 2 * d.nph && g.dphk.len >= rows * d.nh * 2 * d.nph);
         assert!(g.dout.len >= rows * d.nh * d.dv && g.dv.len >= rows * d.nh * d.dv);
-        assert!(g.dthq.len >= rows * d.nh * d.nph && g.dthk.len >= rows * d.nh * d.nph && g.dkappa.len >= rows * d.nh);
+        assert!(
+            g.dthq.len >= rows * d.nh * d.nph
+                && g.dthk.len >= rows * d.nh * d.nph
+                && g.dkappa.len >= rows * d.nh
+        );
         // reverse state-gradient scan
         e.set_compute_pipeline_state(&self.c.hk_dstates_bwd);
         e.set_buffer(0, Some(&w.phq.buf), 0);
@@ -783,7 +909,10 @@ impl<'a> Cmd<'a> {
         e.set_buffer(2, Some(&w.pow.buf), (w.pow_off * 4) as u64);
         e.set_buffer(3, Some(&g.dstates.buf), 0);
         self.hk_args(4, d);
-        e.dispatch_thread_groups(MTLSize::new((d.b * d.nh) as u64, 1, 1), MTLSize::new((d.dv * (2 * d.nph).div_ceil(16)) as u64, 1, 1));
+        e.dispatch_thread_groups(
+            MTLSize::new((d.b * d.nh) as u64, 1, 1),
+            MTLSize::new((d.dv * (2 * d.nph).div_ceil(16)) as u64, 1, 1),
+        );
         // per-chunk gradients
         e.set_compute_pipeline_state(&self.c.hk_chunk_bwd);
         e.set_buffer(0, Some(&w.phq.buf), 0);
@@ -827,7 +956,17 @@ impl<'a> Cmd<'a> {
     /// RoPE in place on x[rows, nheads·hd] (neox halves), position = row % t.
     /// `inverse` applies the transpose rotation (the backward).
     #[allow(clippy::too_many_arguments)]
-    pub fn rope(&self, x: &GBuf, x_off: usize, rows: usize, t: usize, nheads: usize, hd: usize, base: f32, inverse: bool) {
+    pub fn rope(
+        &self,
+        x: &GBuf,
+        x_off: usize,
+        rows: usize,
+        t: usize,
+        nheads: usize,
+        hd: usize,
+        base: f32,
+        inverse: bool,
+    ) {
         assert!(hd % 2 == 0 && x.len >= x_off + rows * nheads * hd);
         #[repr(C)]
         struct Args {
@@ -837,11 +976,21 @@ impl<'a> Cmd<'a> {
             base: f32,
             sign: f32,
         }
-        let a = Args { t: t as u32, nheads: nheads as u32, hd: hd as u32, base, sign: if inverse { -1.0 } else { 1.0 } };
+        let a = Args {
+            t: t as u32,
+            nheads: nheads as u32,
+            hd: hd as u32,
+            base,
+            sign: if inverse { -1.0 } else { 1.0 },
+        };
         let e = &self.enc;
         e.set_compute_pipeline_state(&self.c.rope);
         e.set_buffer(0, Some(&x.buf), (x_off * 4) as u64);
-        e.set_bytes(1, std::mem::size_of::<Args>() as u64, &a as *const Args as *const c_void);
+        e.set_bytes(
+            1,
+            std::mem::size_of::<Args>() as u64,
+            &a as *const Args as *const c_void,
+        );
         self.grid1(rows * nheads * (hd / 2), 256);
     }
 
@@ -891,7 +1040,15 @@ impl<'a> Cmd<'a> {
     }
 
     /// dE[tok[row],:] += dx[row,:] (atomic).
-    pub fn embed_scatter_add(&self, de: &GBuf, de_off: usize, tok: &GBuf, dx: &GBuf, rows: usize, d: usize) {
+    pub fn embed_scatter_add(
+        &self,
+        de: &GBuf,
+        de_off: usize,
+        tok: &GBuf,
+        dx: &GBuf,
+        rows: usize,
+        d: usize,
+    ) {
         assert!(tok.len >= rows && dx.len >= rows * d);
         let e = &self.enc;
         e.set_compute_pipeline_state(&self.c.embed_scatter_add);
@@ -919,7 +1076,15 @@ impl<'a> Cmd<'a> {
 
     /// Embedding gather with a table offset (the tied table lives inside
     /// the parameter arena).
-    pub fn embed_gather_at(&self, e_tab: &GBuf, e_off: usize, tok: &GBuf, out: &GBuf, rows: usize, d: usize) {
+    pub fn embed_gather_at(
+        &self,
+        e_tab: &GBuf,
+        e_off: usize,
+        tok: &GBuf,
+        out: &GBuf,
+        rows: usize,
+        d: usize,
+    ) {
         assert!(tok.len >= rows && out.len >= rows * d);
         let e = &self.enc;
         e.set_compute_pipeline_state(&self.c.embed_gather);
@@ -936,7 +1101,17 @@ impl<'a> Cmd<'a> {
 
     /// RMSNorm forward where w lives at an offset inside a bigger buffer.
     #[allow(clippy::too_many_arguments)]
-    pub fn rmsnorm_fwd_at(&self, x: &GBuf, w: &GBuf, w_off: usize, y: &GBuf, inv: &GBuf, rows: usize, d: usize, eps: f32) {
+    pub fn rmsnorm_fwd_at(
+        &self,
+        x: &GBuf,
+        w: &GBuf,
+        w_off: usize,
+        y: &GBuf,
+        inv: &GBuf,
+        rows: usize,
+        d: usize,
+        eps: f32,
+    ) {
         assert!(x.len >= rows * d && y.len >= rows * d && w.len >= w_off + d && inv.len >= rows);
         let e = &self.enc;
         e.set_compute_pipeline_state(&self.c.rms_fwd);
@@ -951,7 +1126,17 @@ impl<'a> Cmd<'a> {
 
     /// Causal depthwise conv1d [b, t, h] with k taps, weights at an offset
     /// inside the parameter arena. Zero left pad per sequence.
-    pub fn conv1d_fwd_at(&self, x: &GBuf, w: &GBuf, w_off: usize, y: &GBuf, b: usize, t: usize, h: usize, k: usize) {
+    pub fn conv1d_fwd_at(
+        &self,
+        x: &GBuf,
+        w: &GBuf,
+        w_off: usize,
+        y: &GBuf,
+        b: usize,
+        t: usize,
+        h: usize,
+        k: usize,
+    ) {
         assert!(x.len >= b * t * h && y.len >= b * t * h && w.len >= w_off + h * k);
         let e = &self.enc;
         e.set_compute_pipeline_state(&self.c.conv_fwd);
@@ -966,7 +1151,20 @@ impl<'a> Cmd<'a> {
     /// dX and dW of the causal depthwise conv. `dx` may alias nothing; dw
     /// accumulates (+=) into the grad arena at `dw_off`.
     #[allow(clippy::too_many_arguments)]
-    pub fn conv1d_bwd_at(&self, x: &GBuf, w: &GBuf, w_off: usize, dy: &GBuf, dx: &GBuf, dw: &GBuf, dw_off: usize, b: usize, t: usize, h: usize, k: usize) {
+    pub fn conv1d_bwd_at(
+        &self,
+        x: &GBuf,
+        w: &GBuf,
+        w_off: usize,
+        dy: &GBuf,
+        dx: &GBuf,
+        dw: &GBuf,
+        dw_off: usize,
+        b: usize,
+        t: usize,
+        h: usize,
+        k: usize,
+    ) {
         assert!(x.len >= b * t * h && dy.len >= b * t * h && dx.len >= b * t * h);
         assert!(w.len >= w_off + h * k && dw.len >= dw_off + h * k);
         let e = &self.enc;
@@ -983,7 +1181,10 @@ impl<'a> Cmd<'a> {
         e.set_buffer(2, Some(&dw.buf), (dw_off * 4) as u64);
         self.set_u32x4(3, [b as u32, t as u32, h as u32, k as u32]);
         let hk = (h * k) as u64;
-        e.dispatch_thread_groups(MTLSize::new(hk.div_ceil(128), 1, 1), MTLSize::new(128, 1, 1));
+        e.dispatch_thread_groups(
+            MTLSize::new(hk.div_ceil(128), 1, 1),
+            MTLSize::new(128, 1, 1),
+        );
     }
 
     /// RMSNorm backward with w and dw at offsets inside bigger buffers.
@@ -1002,7 +1203,13 @@ impl<'a> Cmd<'a> {
         rows: usize,
         d: usize,
     ) {
-        assert!(x.len >= rows * d && dy.len >= rows * d && dx.len >= rows * d && dw.len >= dw_off + d && w.len >= w_off + d);
+        assert!(
+            x.len >= rows * d
+                && dy.len >= rows * d
+                && dx.len >= rows * d
+                && dw.len >= dw_off + d
+                && w.len >= w_off + d
+        );
         let e = &self.enc;
         e.set_compute_pipeline_state(&self.c.rms_bwd_dx);
         e.set_buffer(0, Some(&x.buf), 0);
@@ -1024,8 +1231,23 @@ impl<'a> Cmd<'a> {
     }
 
     /// Fused softmax-CE where the logits block sits at an offset.
-    pub fn softmax_ce_at(&self, logits: &GBuf, l_off: usize, target: &GBuf, t_off: usize, loss: &GBuf, l2_off: usize, rows: usize, n: usize, scale: f32) {
-        assert!(logits.len >= l_off + rows * n && target.len >= t_off + rows && loss.len >= l2_off + rows);
+    pub fn softmax_ce_at(
+        &self,
+        logits: &GBuf,
+        l_off: usize,
+        target: &GBuf,
+        t_off: usize,
+        loss: &GBuf,
+        l2_off: usize,
+        rows: usize,
+        n: usize,
+        scale: f32,
+    ) {
+        assert!(
+            logits.len >= l_off + rows * n
+                && target.len >= t_off + rows
+                && loss.len >= l2_off + rows
+        );
         let e = &self.enc;
         e.set_compute_pipeline_state(&self.c.softmax_ce);
         e.set_buffer(0, Some(&logits.buf), (l_off * 4) as u64);
@@ -1040,28 +1262,64 @@ impl<'a> Cmd<'a> {
     pub fn kappa_fwd(&self, pre: &GBuf, kap: &GBuf, rows: usize, nh: usize, ld: usize, bias: f32) {
         assert!(pre.len >= rows * ld && kap.len >= rows * nh);
         #[repr(C)]
-        struct Args { rows: u32, nh: u32, ld: u32, bias: f32 }
-        let a = Args { rows: rows as u32, nh: nh as u32, ld: ld as u32, bias };
+        struct Args {
+            rows: u32,
+            nh: u32,
+            ld: u32,
+            bias: f32,
+        }
+        let a = Args {
+            rows: rows as u32,
+            nh: nh as u32,
+            ld: ld as u32,
+            bias,
+        };
         let e = &self.enc;
         e.set_compute_pipeline_state(&self.c.kappa_fwd);
         e.set_buffer(0, Some(&pre.buf), 0);
         e.set_buffer(1, Some(&kap.buf), 0);
-        e.set_bytes(2, std::mem::size_of::<Args>() as u64, &a as *const Args as *const c_void);
+        e.set_bytes(
+            2,
+            std::mem::size_of::<Args>() as u64,
+            &a as *const Args as *const c_void,
+        );
         self.grid1(rows * nh, 256);
     }
 
     /// dpre (padded [rows, ld]) from dκ.
-    pub fn kappa_bwd(&self, kap: &GBuf, dkap: &GBuf, dpre: &GBuf, rows: usize, nh: usize, ld: usize) {
+    pub fn kappa_bwd(
+        &self,
+        kap: &GBuf,
+        dkap: &GBuf,
+        dpre: &GBuf,
+        rows: usize,
+        nh: usize,
+        ld: usize,
+    ) {
         assert!(dpre.len >= rows * ld && kap.len >= rows * nh && dkap.len >= rows * nh);
         #[repr(C)]
-        struct Args { rows: u32, nh: u32, ld: u32, bias: f32 }
-        let a = Args { rows: rows as u32, nh: nh as u32, ld: ld as u32, bias: 0.0 };
+        struct Args {
+            rows: u32,
+            nh: u32,
+            ld: u32,
+            bias: f32,
+        }
+        let a = Args {
+            rows: rows as u32,
+            nh: nh as u32,
+            ld: ld as u32,
+            bias: 0.0,
+        };
         let e = &self.enc;
         e.set_compute_pipeline_state(&self.c.kappa_bwd);
         e.set_buffer(0, Some(&kap.buf), 0);
         e.set_buffer(1, Some(&dkap.buf), 0);
         e.set_buffer(2, Some(&dpre.buf), 0);
-        e.set_bytes(3, std::mem::size_of::<Args>() as u64, &a as *const Args as *const c_void);
+        e.set_bytes(
+            3,
+            std::mem::size_of::<Args>() as u64,
+            &a as *const Args as *const c_void,
+        );
         self.grid1(rows * ld, 256);
     }
 
@@ -1086,8 +1344,34 @@ impl<'a> Cmd<'a> {
         let (p2, nch) = (2 * d.nph, d.t / 64);
         let cm = HkScratch::chunk_major(d);
         let sa = [d.nh * nch * 4096, nch * 4096, 4096];
-        let bt = GemmBatch { nb: d.b, nh: d.nh, nc: nch, sa: cm, sb: cm, sc: sa };
-        self.gemm_ex(Op::N, Op::T, 64, 64, p2, 1.0, sc.qt, 0, p2, sc.kt, 0, p2, 0.0, sc.a, 0, 64, &bt, true);
+        let bt = GemmBatch {
+            nb: d.b,
+            nh: d.nh,
+            nc: nch,
+            sa: cm,
+            sb: cm,
+            sc: sa,
+        };
+        self.gemm_ex(
+            Op::N,
+            Op::T,
+            64,
+            64,
+            p2,
+            1.0,
+            sc.qt,
+            0,
+            p2,
+            sc.kt,
+            0,
+            p2,
+            0.0,
+            sc.a,
+            0,
+            64,
+            &bt,
+            true,
+        );
     }
 
     /// Forward, GEMM formulation. Same contract as `hk_forward` (φ, kv,
@@ -1120,14 +1404,73 @@ impl<'a> Cmd<'a> {
         let st = HkScratch::states(d);
         let sa = [d.nh * nch * 4096, nch * 4096, 4096];
         let cm = HkScratch::chunk_major(d);
-        let bt1 = GemmBatch { nb: d.b, nh: d.nh, nc: nch, sa, sb: rm, sc: rm };
-        self.gemm_ex(Op::N, Op::N, 64, dv, 64, 1.0, sc.a, 0, 64, w.kv, 0, d.nh * dv, 0.0, w.out, 0, d.nh * dv, &bt1, false);
-        let bt2 = GemmBatch { nb: d.b, nh: d.nh, nc: nch, sa: cm, sb: st, sc: rm };
-        self.gemm_ex(Op::N, Op::N, 64, dv, p2, 1.0, sc.qp, 0, p2, w.states, 0, dv, 1.0, w.out, 0, d.nh * dv, &bt2, false);
+        let bt1 = GemmBatch {
+            nb: d.b,
+            nh: d.nh,
+            nc: nch,
+            sa,
+            sb: rm,
+            sc: rm,
+        };
+        self.gemm_ex(
+            Op::N,
+            Op::N,
+            64,
+            dv,
+            64,
+            1.0,
+            sc.a,
+            0,
+            64,
+            w.kv,
+            0,
+            d.nh * dv,
+            0.0,
+            w.out,
+            0,
+            d.nh * dv,
+            &bt1,
+            false,
+        );
+        let bt2 = GemmBatch {
+            nb: d.b,
+            nh: d.nh,
+            nc: nch,
+            sa: cm,
+            sb: st,
+            sc: rm,
+        };
+        self.gemm_ex(
+            Op::N,
+            Op::N,
+            64,
+            dv,
+            p2,
+            1.0,
+            sc.qp,
+            0,
+            p2,
+            w.states,
+            0,
+            dv,
+            1.0,
+            w.out,
+            0,
+            d.nh * dv,
+            &bt2,
+            false,
+        );
     }
 
     /// Backward, GEMM formulation. Same contract as `hk_backward`.
-    pub fn hk_backward_gemm(&self, d: &HkDims, w: &HkWork<'_>, g: &HkGrads<'_>, sc: &HkScratch<'_>, beta_th: f32) {
+    pub fn hk_backward_gemm(
+        &self,
+        d: &HkDims,
+        w: &HkWork<'_>,
+        g: &HkGrads<'_>,
+        sc: &HkScratch<'_>,
+        beta_th: f32,
+    ) {
         hk_check(d, w);
         sc.check(d);
         let e = &self.enc;
@@ -1136,7 +1479,11 @@ impl<'a> Cmd<'a> {
         assert!(g.dstates.len >= w.states.len && g.dkv.len >= rows * d.nh * dv);
         assert!(g.dphq.len >= rows * d.nh * p2 && g.dphk.len >= rows * d.nh * p2);
         assert!(g.dout.len >= rows * d.nh * dv && g.dv.len >= rows * d.nh * dv);
-        assert!(g.dthq.len >= rows * d.nh * d.nph && g.dthk.len >= rows * d.nh * d.nph && g.dkappa.len >= rows * d.nh);
+        assert!(
+            g.dthq.len >= rows * d.nh * d.nph
+                && g.dthk.len >= rows * d.nh * d.nph
+                && g.dkappa.len >= rows * d.nh
+        );
         // reverse state-gradient scan (exact scan kernel)
         self.hk_dstates_only(d, w, g);
         // scaled tables + A (recomputed: cheaper than keeping them per layer)
@@ -1148,21 +1495,189 @@ impl<'a> Cmd<'a> {
         let sa = [d.nh * nch * 4096, nch * 4096, 4096];
         let nb = d.b;
         // dKV = Aᵀ·dO + K̂·G_{c+1}
-        let bt = GemmBatch { nb, nh: d.nh, nc: nch, sa, sb: rm, sc: rm };
-        self.gemm_ex(Op::T, Op::N, 64, dv, 64, 1.0, sc.a, 0, 64, g.dout, 0, d.nh * dv, 0.0, g.dkv, 0, d.nh * dv, &bt, false);
-        let bt = GemmBatch { nb, nh: d.nh, nc: nch, sa: cm, sb: st, sc: rm };
-        self.gemm_ex(Op::N, Op::N, 64, dv, p2, 1.0, sc.kh, 0, p2, g.dstates, p2 * dv, dv, 1.0, g.dkv, 0, d.nh * dv, &bt, false);
+        let bt = GemmBatch {
+            nb,
+            nh: d.nh,
+            nc: nch,
+            sa,
+            sb: rm,
+            sc: rm,
+        };
+        self.gemm_ex(
+            Op::T,
+            Op::N,
+            64,
+            dv,
+            64,
+            1.0,
+            sc.a,
+            0,
+            64,
+            g.dout,
+            0,
+            d.nh * dv,
+            0.0,
+            g.dkv,
+            0,
+            d.nh * dv,
+            &bt,
+            false,
+        );
+        let bt = GemmBatch {
+            nb,
+            nh: d.nh,
+            nc: nch,
+            sa: cm,
+            sb: st,
+            sc: rm,
+        };
+        self.gemm_ex(
+            Op::N,
+            Op::N,
+            64,
+            dv,
+            p2,
+            1.0,
+            sc.kh,
+            0,
+            p2,
+            g.dstates,
+            p2 * dv,
+            dv,
+            1.0,
+            g.dkv,
+            0,
+            d.nh * dv,
+            &bt,
+            false,
+        );
         // dA = causal(dO·KVᵀ)  (overwrites A)
-        let bt = GemmBatch { nb, nh: d.nh, nc: nch, sa: rm, sb: rm, sc: sa };
-        self.gemm_ex(Op::N, Op::T, 64, 64, dv, 1.0, g.dout, 0, d.nh * dv, w.kv, 0, d.nh * dv, 0.0, sc.a, 0, 64, &bt, true);
+        let bt = GemmBatch {
+            nb,
+            nh: d.nh,
+            nc: nch,
+            sa: rm,
+            sb: rm,
+            sc: sa,
+        };
+        self.gemm_ex(
+            Op::N,
+            Op::T,
+            64,
+            64,
+            dv,
+            1.0,
+            g.dout,
+            0,
+            d.nh * dv,
+            w.kv,
+            0,
+            d.nh * dv,
+            0.0,
+            sc.a,
+            0,
+            64,
+            &bt,
+            true,
+        );
         // dK̃ = dAᵀ·Q̃ ; dQ̃ = dA·K̃
-        let bt = GemmBatch { nb, nh: d.nh, nc: nch, sa, sb: cm, sc: cm };
-        self.gemm_ex(Op::T, Op::N, 64, p2, 64, 1.0, sc.a, 0, 64, sc.qt, 0, p2, 0.0, sc.dkt, 0, p2, &bt, false);
-        self.gemm_ex(Op::N, Op::N, 64, p2, 64, 1.0, sc.a, 0, 64, sc.kt, 0, p2, 0.0, sc.dqt, 0, p2, &bt, false);
+        let bt = GemmBatch {
+            nb,
+            nh: d.nh,
+            nc: nch,
+            sa,
+            sb: cm,
+            sc: cm,
+        };
+        self.gemm_ex(
+            Op::T,
+            Op::N,
+            64,
+            p2,
+            64,
+            1.0,
+            sc.a,
+            0,
+            64,
+            sc.qt,
+            0,
+            p2,
+            0.0,
+            sc.dkt,
+            0,
+            p2,
+            &bt,
+            false,
+        );
+        self.gemm_ex(
+            Op::N,
+            Op::N,
+            64,
+            p2,
+            64,
+            1.0,
+            sc.a,
+            0,
+            64,
+            sc.kt,
+            0,
+            p2,
+            0.0,
+            sc.dqt,
+            0,
+            p2,
+            &bt,
+            false,
+        );
         // inter terms: dqi = dO·S_cᵀ ; dki = KV·G_{c+1}ᵀ
-        let bt = GemmBatch { nb, nh: d.nh, nc: nch, sa: rm, sb: st, sc: cm };
-        self.gemm_ex(Op::N, Op::T, 64, p2, dv, 1.0, g.dout, 0, d.nh * dv, w.states, 0, dv, 0.0, sc.dqi, 0, p2, &bt, false);
-        self.gemm_ex(Op::N, Op::T, 64, p2, dv, 1.0, w.kv, 0, d.nh * dv, g.dstates, p2 * dv, dv, 0.0, sc.dki, 0, p2, &bt, false);
+        let bt = GemmBatch {
+            nb,
+            nh: d.nh,
+            nc: nch,
+            sa: rm,
+            sb: st,
+            sc: cm,
+        };
+        self.gemm_ex(
+            Op::N,
+            Op::T,
+            64,
+            p2,
+            dv,
+            1.0,
+            g.dout,
+            0,
+            d.nh * dv,
+            w.states,
+            0,
+            dv,
+            0.0,
+            sc.dqi,
+            0,
+            p2,
+            &bt,
+            false,
+        );
+        self.gemm_ex(
+            Op::N,
+            Op::T,
+            64,
+            p2,
+            dv,
+            1.0,
+            w.kv,
+            0,
+            d.nh * dv,
+            g.dstates,
+            p2 * dv,
+            dv,
+            0.0,
+            sc.dki,
+            0,
+            p2,
+            &bt,
+            false,
+        );
         // back to dφq/dφk (row-major)
         e.set_compute_pipeline_state(&self.c.hk_unscale);
         e.set_buffer(0, Some(&sc.dqt.buf), 0);
@@ -1206,7 +1721,11 @@ impl<'a> Cmd<'a> {
         self.hk_args(4, d);
         let p2 = 2 * d.nph;
         e.dispatch_thread_groups(
-            MTLSize::new((d.b * d.nh) as u64, p2.div_ceil(8) as u64, d.dv.div_ceil(32) as u64),
+            MTLSize::new(
+                (d.b * d.nh) as u64,
+                p2.div_ceil(8) as u64,
+                d.dv.div_ceil(32) as u64,
+            ),
             MTLSize::new(32, 8, 1),
         );
     }
@@ -1221,7 +1740,11 @@ impl<'a> Cmd<'a> {
         self.hk_args(4, d);
         let p2 = 2 * d.nph;
         e.dispatch_thread_groups(
-            MTLSize::new((d.b * d.nh) as u64, p2.div_ceil(8) as u64, d.dv.div_ceil(32) as u64),
+            MTLSize::new(
+                (d.b * d.nh) as u64,
+                p2.div_ceil(8) as u64,
+                d.dv.div_ceil(32) as u64,
+            ),
             MTLSize::new(32, 8, 1),
         );
     }
@@ -1234,7 +1757,10 @@ impl<'a> Cmd<'a> {
         e.set_buffer(2, Some(&w.pow.buf), (w.pow_off * 4) as u64);
         e.set_buffer(3, Some(&w.states.buf), 0);
         self.hk_args(4, d);
-        e.dispatch_thread_groups(MTLSize::new((d.b * d.nh) as u64, 1, 1), MTLSize::new((d.dv * (2 * d.nph).div_ceil(16)) as u64, 1, 1));
+        e.dispatch_thread_groups(
+            MTLSize::new((d.b * d.nh) as u64, 1, 1),
+            MTLSize::new((d.dv * (2 * d.nph).div_ceil(16)) as u64, 1, 1),
+        );
     }
     /// (profiling) only the reverse state-gradient scan
     pub fn hk_dstates_only(&self, d: &HkDims, w: &HkWork<'_>, g: &HkGrads<'_>) {
@@ -1245,7 +1771,10 @@ impl<'a> Cmd<'a> {
         e.set_buffer(2, Some(&w.pow.buf), (w.pow_off * 4) as u64);
         e.set_buffer(3, Some(&g.dstates.buf), 0);
         self.hk_args(4, d);
-        e.dispatch_thread_groups(MTLSize::new((d.b * d.nh) as u64, 1, 1), MTLSize::new((d.dv * (2 * d.nph).div_ceil(16)) as u64, 1, 1));
+        e.dispatch_thread_groups(
+            MTLSize::new((d.b * d.nh) as u64, 1, 1),
+            MTLSize::new((d.dv * (2 * d.nph).div_ceil(16)) as u64, 1, 1),
+        );
     }
 
     /// dst[i,:] = src[idx[i],:] (idx < 0 → zero row), `rows` rows of width d.
@@ -1258,7 +1787,10 @@ impl<'a> Cmd<'a> {
         e.set_buffer(2, Some(&dst.buf), 0);
         self.set_u32(3, d as u32);
         let tgx = 64u64.min(d as u64).max(1);
-        e.dispatch_thread_groups(MTLSize::new((d as u64).div_ceil(tgx), rows as u64, 1), MTLSize::new(tgx, 1, 1));
+        e.dispatch_thread_groups(
+            MTLSize::new((d as u64).div_ceil(tgx), rows as u64, 1),
+            MTLSize::new(tgx, 1, 1),
+        );
     }
 
     /// dst[idx[i],:] += src[i,:] (idx < 0 skipped; unique indices).
@@ -1271,11 +1803,23 @@ impl<'a> Cmd<'a> {
         e.set_buffer(2, Some(&src.buf), 0);
         self.set_u32(3, d as u32);
         let tgx = 64u64.min(d as u64).max(1);
-        e.dispatch_thread_groups(MTLSize::new((d as u64).div_ceil(tgx), rows as u64, 1), MTLSize::new(tgx, 1, 1));
+        e.dispatch_thread_groups(
+            MTLSize::new((d as u64).div_ceil(tgx), rows as u64, 1),
+            MTLSize::new(tgx, 1, 1),
+        );
     }
 
     /// Within-cluster CE with an index map (see the kernel).
-    pub fn softmax_ce_idx(&self, logits: &GBuf, idx: &GBuf, tgt: &GBuf, loss2: &GBuf, rows: usize, n: usize, scale: f32) {
+    pub fn softmax_ce_idx(
+        &self,
+        logits: &GBuf,
+        idx: &GBuf,
+        tgt: &GBuf,
+        loss2: &GBuf,
+        rows: usize,
+        n: usize,
+        scale: f32,
+    ) {
         assert!(logits.len >= rows * n && idx.len >= rows);
         let e = &self.enc;
         e.set_compute_pipeline_state(&self.c.softmax_ce_idx);
@@ -1295,23 +1839,46 @@ impl<'a> Cmd<'a> {
         e.set_compute_pipeline_state(&self.c.causal_softmax);
         e.set_buffer(0, Some(&s.buf), (off * 4) as u64);
         self.set_u32(1, t as u32);
-        e.dispatch_thread_groups(MTLSize::new(t as u64, blocks as u64, 1), MTLSize::new(256, 1, 1));
+        e.dispatch_thread_groups(
+            MTLSize::new(t as u64, blocks as u64, 1),
+            MTLSize::new(256, 1, 1),
+        );
     }
 
     /// dS = P ⊙ (dP − rowsum(P⊙dP)) in place on dP, `blocks` consecutive blocks.
-    pub fn softmax_bwd_blocks(&self, p: &GBuf, p_off: usize, dp: &GBuf, dp_off: usize, t: usize, blocks: usize) {
+    pub fn softmax_bwd_blocks(
+        &self,
+        p: &GBuf,
+        p_off: usize,
+        dp: &GBuf,
+        dp_off: usize,
+        t: usize,
+        blocks: usize,
+    ) {
         assert!(p.len >= p_off + blocks * t * t && dp.len >= dp_off + blocks * t * t);
         let e = &self.enc;
         e.set_compute_pipeline_state(&self.c.softmax_bwd);
         e.set_buffer(0, Some(&p.buf), (p_off * 4) as u64);
         e.set_buffer(1, Some(&dp.buf), (dp_off * 4) as u64);
         self.set_u32(2, t as u32);
-        e.dispatch_thread_groups(MTLSize::new(t as u64, blocks as u64, 1), MTLSize::new(256, 1, 1));
+        e.dispatch_thread_groups(
+            MTLSize::new(t as u64, blocks as u64, 1),
+            MTLSize::new(256, 1, 1),
+        );
     }
 
     /// dst[b·T+t][g·hd+d] = Σ_j src[b][g·group+j][t][d] (head-major → row-major GQA reduce).
     #[allow(clippy::too_many_arguments)]
-    pub fn group_sum_heads(&self, src: &GBuf, dst: &GBuf, b: usize, t: usize, qh: usize, kvh: usize, hd: usize) {
+    pub fn group_sum_heads(
+        &self,
+        src: &GBuf,
+        dst: &GBuf,
+        b: usize,
+        t: usize,
+        qh: usize,
+        kvh: usize,
+        hd: usize,
+    ) {
         assert!(src.len >= b * qh * t * hd && dst.len >= b * t * kvh * hd && qh % kvh == 0);
         #[repr(C)]
         struct Args {
@@ -1321,12 +1888,22 @@ impl<'a> Cmd<'a> {
             kvh: u32,
             hd: u32,
         }
-        let a = Args { b: b as u32, t: t as u32, qh: qh as u32, kvh: kvh as u32, hd: hd as u32 };
+        let a = Args {
+            b: b as u32,
+            t: t as u32,
+            qh: qh as u32,
+            kvh: kvh as u32,
+            hd: hd as u32,
+        };
         let e = &self.enc;
         e.set_compute_pipeline_state(&self.c.group_sum);
         e.set_buffer(0, Some(&src.buf), 0);
         e.set_buffer(1, Some(&dst.buf), 0);
-        e.set_bytes(2, std::mem::size_of::<Args>() as u64, &a as *const Args as *const c_void);
+        e.set_bytes(
+            2,
+            std::mem::size_of::<Args>() as u64,
+            &a as *const Args as *const c_void,
+        );
         self.grid1(b * t * kvh * hd, 256);
     }
 
@@ -1341,15 +1918,41 @@ impl<'a> Cmd<'a> {
             k: u32,
             cap: u32,
         }
-        let a = Args { rows: r.rows as u32, h: r.h as u32, e: r.e as u32, k: r.k as u32, cap: r.cap as u32 };
-        self.enc.set_bytes(idx, std::mem::size_of::<Args>() as u64, &a as *const Args as *const c_void);
+        let a = Args {
+            rows: r.rows as u32,
+            h: r.h as u32,
+            e: r.e as u32,
+            k: r.k as u32,
+            cap: r.cap as u32,
+        };
+        self.enc.set_bytes(
+            idx,
+            std::mem::size_of::<Args>() as u64,
+            &a as *const Args as *const c_void,
+        );
     }
 
     /// assign[row] = argmin_e resonance − bias; res[row] = winning resonance.
     #[allow(clippy::too_many_arguments)]
-    pub fn route(&self, r: &RouteDims, x: &GBuf, mu: &GBuf, mu_off: usize, u: &GBuf, u_off: usize, bias: &GBuf, bias_off: usize, assign: &GBuf, res: &GBuf) {
+    pub fn route(
+        &self,
+        r: &RouteDims,
+        x: &GBuf,
+        mu: &GBuf,
+        mu_off: usize,
+        u: &GBuf,
+        u_off: usize,
+        bias: &GBuf,
+        bias_off: usize,
+        assign: &GBuf,
+        res: &GBuf,
+    ) {
         assert!(r.e <= 64 && x.len >= r.rows * r.h && assign.len >= r.rows && res.len >= r.rows);
-        assert!(mu.len >= mu_off + r.e * r.h && bias.len >= bias_off + r.e && u.len >= u_off + r.e * r.k * r.h);
+        assert!(
+            mu.len >= mu_off + r.e * r.h
+                && bias.len >= bias_off + r.e
+                && u.len >= u_off + r.e * r.k * r.h
+        );
         let e = &self.enc;
         e.set_compute_pipeline_state(&self.c.route);
         e.set_buffer(0, Some(&x.buf), 0);
@@ -1363,7 +1966,14 @@ impl<'a> Cmd<'a> {
     }
 
     /// slot[row] = rank within its expert; count[e].
-    pub fn route_group(&self, r: &RouteDims, assign: &GBuf, slot: &GBuf, count: &GBuf, count_off: usize) {
+    pub fn route_group(
+        &self,
+        r: &RouteDims,
+        assign: &GBuf,
+        slot: &GBuf,
+        count: &GBuf,
+        count_off: usize,
+    ) {
         assert!(slot.len >= r.rows && count.len >= count_off + r.e);
         let e = &self.enc;
         e.set_compute_pipeline_state(&self.c.route_group);
@@ -1386,11 +1996,21 @@ impl<'a> Cmd<'a> {
         e.set_buffer(3, Some(&hg.buf), 0);
         self.route_args(4, r);
         let tgx = 64u64.min(r.h as u64).max(1);
-        e.dispatch_thread_groups(MTLSize::new((r.h as u64).div_ceil(tgx), r.rows as u64, 1), MTLSize::new(tgx, 1, 1));
+        e.dispatch_thread_groups(
+            MTLSize::new((r.h as u64).div_ceil(tgx), r.rows as u64, 1),
+            MTLSize::new(tgx, 1, 1),
+        );
     }
 
     /// out[row] += yh[e][slot] (slot < cap).
-    pub fn moe_scatter_add(&self, r: &RouteDims, out: &GBuf, assign: &GBuf, slot: &GBuf, yh: &GBuf) {
+    pub fn moe_scatter_add(
+        &self,
+        r: &RouteDims,
+        out: &GBuf,
+        assign: &GBuf,
+        slot: &GBuf,
+        yh: &GBuf,
+    ) {
         assert!(yh.len >= r.e * r.cap * r.h && out.len >= r.rows * r.h);
         let e = &self.enc;
         e.set_compute_pipeline_state(&self.c.moe_scatter_add);
@@ -1400,11 +2020,22 @@ impl<'a> Cmd<'a> {
         e.set_buffer(3, Some(&yh.buf), 0);
         self.route_args(4, r);
         let tgx = 64u64.min(r.h as u64).max(1);
-        e.dispatch_thread_groups(MTLSize::new((r.h as u64).div_ceil(tgx), r.rows as u64, 1), MTLSize::new(tgx, 1, 1));
+        e.dispatch_thread_groups(
+            MTLSize::new((r.h as u64).div_ceil(tgx), r.rows as u64, 1),
+            MTLSize::new(tgx, 1, 1),
+        );
     }
 
     /// sums[e][j] over the filled slots of expert e.
-    pub fn moe_stats(&self, r: &RouteDims, hg: &GBuf, count: &GBuf, count_off: usize, sums: &GBuf, sums_off: usize) {
+    pub fn moe_stats(
+        &self,
+        r: &RouteDims,
+        hg: &GBuf,
+        count: &GBuf,
+        count_off: usize,
+        sums: &GBuf,
+        sums_off: usize,
+    ) {
         assert!(sums.len >= sums_off + r.e * r.h);
         let e = &self.enc;
         e.set_compute_pipeline_state(&self.c.moe_stats);
@@ -1417,7 +2048,22 @@ impl<'a> Cmd<'a> {
 
     /// μ EMA + balancing bias update from the step's routing statistics.
     #[allow(clippy::too_many_arguments)]
-    pub fn moe_update(&self, r: &RouteDims, mu: &GBuf, mu_off: usize, bias: &GBuf, bias_off: usize, sums: &GBuf, sums_off: usize, count: &GBuf, count_off: usize, res: &GBuf, alpha: f32, eta: f32, frozen_below: usize) {
+    pub fn moe_update(
+        &self,
+        r: &RouteDims,
+        mu: &GBuf,
+        mu_off: usize,
+        bias: &GBuf,
+        bias_off: usize,
+        sums: &GBuf,
+        sums_off: usize,
+        count: &GBuf,
+        count_off: usize,
+        res: &GBuf,
+        alpha: f32,
+        eta: f32,
+        frozen_below: usize,
+    ) {
         #[repr(C)]
         struct Args {
             rows: u32,
@@ -1427,7 +2073,14 @@ impl<'a> Cmd<'a> {
             eta: f32,
             frozen_below: u32,
         }
-        let a = Args { rows: r.rows as u32, h: r.h as u32, e: r.e as u32, alpha, eta, frozen_below: frozen_below as u32 };
+        let a = Args {
+            rows: r.rows as u32,
+            h: r.h as u32,
+            e: r.e as u32,
+            alpha,
+            eta,
+            frozen_below: frozen_below as u32,
+        };
         let e = &self.enc;
         e.set_compute_pipeline_state(&self.c.moe_update);
         e.set_buffer(0, Some(&mu.buf), (mu_off * 4) as u64);
@@ -1435,7 +2088,11 @@ impl<'a> Cmd<'a> {
         e.set_buffer(2, Some(&sums.buf), (sums_off * 4) as u64);
         e.set_buffer(3, Some(&count.buf), (count_off * 4) as u64);
         e.set_buffer(4, Some(&res.buf), 0);
-        e.set_bytes(5, std::mem::size_of::<Args>() as u64, &a as *const Args as *const c_void);
+        e.set_bytes(
+            5,
+            std::mem::size_of::<Args>() as u64,
+            &a as *const Args as *const c_void,
+        );
         self.grid1(r.e * r.h, 128);
     }
 
@@ -1454,7 +2111,17 @@ impl<'a> Cmd<'a> {
     /// {n/64, ceil(min(count,cap)/64), 1} (n1 columns, n2 columns) at
     /// args[off..off + 2·E·3] (u32 elements).
     #[allow(clippy::too_many_arguments)]
-    pub fn moe_indirect_args(&self, count: &GBuf, count_off: usize, args: &GBuf, args_off: usize, e_n: usize, cap: usize, n1: usize, n2: usize) {
+    pub fn moe_indirect_args(
+        &self,
+        count: &GBuf,
+        count_off: usize,
+        args: &GBuf,
+        args_off: usize,
+        e_n: usize,
+        cap: usize,
+        n1: usize,
+        n2: usize,
+    ) {
         assert!(args.len >= args_off + 2 * e_n * 3 && count.len >= count_off + e_n);
         #[repr(C)]
         struct A {
@@ -1463,17 +2130,35 @@ impl<'a> Cmd<'a> {
             n1: u32,
             n2: u32,
         }
-        let a = A { e: e_n as u32, cap: cap as u32, n1: n1 as u32, n2: n2 as u32 };
+        let a = A {
+            e: e_n as u32,
+            cap: cap as u32,
+            n1: n1 as u32,
+            n2: n2 as u32,
+        };
         let e = &self.enc;
         e.set_compute_pipeline_state(&self.c.moe_indirect);
         e.set_buffer(0, Some(&count.buf), (count_off * 4) as u64);
         e.set_buffer(1, Some(&args.buf), (args_off * 4) as u64);
-        e.set_bytes(2, std::mem::size_of::<A>() as u64, &a as *const A as *const c_void);
+        e.set_bytes(
+            2,
+            std::mem::size_of::<A>() as u64,
+            &a as *const A as *const c_void,
+        );
         self.grid1(e_n, 64);
     }
 
     /// hgc = hg − μ over the filled slots (zeros beyond).
-    pub fn moe_center(&self, r: &RouteDims, hg: &GBuf, mu: &GBuf, mu_off: usize, count: &GBuf, count_off: usize, hgc: &GBuf) {
+    pub fn moe_center(
+        &self,
+        r: &RouteDims,
+        hg: &GBuf,
+        mu: &GBuf,
+        mu_off: usize,
+        count: &GBuf,
+        count_off: usize,
+        hgc: &GBuf,
+    ) {
         assert!(hgc.len >= r.e * r.cap * r.h && hg.len >= r.e * r.cap * r.h);
         let e = &self.enc;
         e.set_compute_pipeline_state(&self.c.moe_center);
@@ -1495,11 +2180,30 @@ impl<'a> Cmd<'a> {
             tau: f32,
             l1: f32,
         }
-        let a = A { rows: rows as u32, n: n as u32, hard: hard as u32, tau, l1 };
-        self.enc.set_bytes(idx, std::mem::size_of::<A>() as u64, &a as *const A as *const c_void);
+        let a = A {
+            rows: rows as u32,
+            n: n as u32,
+            hard: hard as u32,
+            tau,
+            l1,
+        };
+        self.enc.set_bytes(
+            idx,
+            std::mem::size_of::<A>() as u64,
+            &a as *const A as *const c_void,
+        );
     }
     /// hh[rows, n] *= mask(m[m_off..]) (soft σ or hard 1[σ>τ]).
-    pub fn mask_fwd(&self, hh: &GBuf, m: &GBuf, m_off: usize, rows: usize, n: usize, hard: bool, tau: f32) {
+    pub fn mask_fwd(
+        &self,
+        hh: &GBuf,
+        m: &GBuf,
+        m_off: usize,
+        rows: usize,
+        n: usize,
+        hard: bool,
+        tau: f32,
+    ) {
         assert!(hh.len >= rows * n && m.len >= m_off + n);
         let e = &self.enc;
         e.set_compute_pipeline_state(&self.c.mask_fwd);
@@ -1510,8 +2214,25 @@ impl<'a> Cmd<'a> {
     }
     /// dm += column reduction (soft), then dhhm *= mask (in place).
     #[allow(clippy::too_many_arguments)]
-    pub fn mask_bwd(&self, dhhm: &GBuf, hh_pre: &GBuf, m: &GBuf, m_off: usize, dm: &GBuf, rows: usize, n: usize, hard: bool, tau: f32, l1: f32) {
-        assert!(dhhm.len >= rows * n && hh_pre.len >= rows * n && m.len >= m_off + n && dm.len >= m_off + n);
+    pub fn mask_bwd(
+        &self,
+        dhhm: &GBuf,
+        hh_pre: &GBuf,
+        m: &GBuf,
+        m_off: usize,
+        dm: &GBuf,
+        rows: usize,
+        n: usize,
+        hard: bool,
+        tau: f32,
+        l1: f32,
+    ) {
+        assert!(
+            dhhm.len >= rows * n
+                && hh_pre.len >= rows * n
+                && m.len >= m_off + n
+                && dm.len >= m_off + n
+        );
         let e = &self.enc;
         e.set_compute_pipeline_state(&self.c.mask_bwd_dm);
         e.set_buffer(0, Some(&dhhm.buf), 0);
@@ -1528,7 +2249,14 @@ impl<'a> Cmd<'a> {
     }
 
     /// pow[h][δ][f] = γ^δ from A_log (γ = exp(−exp(A_log))), written at pow_off.
-    pub fn hk_pow_from_alog(&self, d: &HkDims, alog: &GBuf, alog_off: usize, pow: &GBuf, pow_off: usize) {
+    pub fn hk_pow_from_alog(
+        &self,
+        d: &HkDims,
+        alog: &GBuf,
+        alog_off: usize,
+        pow: &GBuf,
+        pow_off: usize,
+    ) {
         let p2 = 2 * d.nph;
         assert!(alog.len >= alog_off + d.nh * p2 && pow.len >= pow_off + d.nh * 65 * p2);
         let e = &self.enc;
@@ -1544,7 +2272,17 @@ impl<'a> Cmd<'a> {
     /// scaled tables are in sc). `ktp`/`dqtp` are two more chunk-major
     /// scratch buffers.
     #[allow(clippy::too_many_arguments)]
-    pub fn hk_dgamma(&self, d: &HkDims, w: &HkWork<'_>, g: &HkGrads<'_>, sc: &HkScratch<'_>, ktp: &GBuf, dqtp: &GBuf, dalog: &GBuf, dalog_off: usize) {
+    pub fn hk_dgamma(
+        &self,
+        d: &HkDims,
+        w: &HkWork<'_>,
+        g: &HkGrads<'_>,
+        sc: &HkScratch<'_>,
+        ktp: &GBuf,
+        dqtp: &GBuf,
+        dalog: &GBuf,
+        dalog_off: usize,
+    ) {
         let rows = d.b * d.t;
         let (p2, nch) = (2 * d.nph, d.t / 64);
         let cl = HkScratch::chunk_len(d);
@@ -1560,8 +2298,34 @@ impl<'a> Cmd<'a> {
         // dqtp = dA·K̃′
         let cm = HkScratch::chunk_major(d);
         let sa = [d.nh * nch * 4096, nch * 4096, 4096];
-        let bt = GemmBatch { nb: d.b, nh: d.nh, nc: nch, sa, sb: cm, sc: cm };
-        self.gemm_ex(Op::N, Op::N, 64, p2, 64, 1.0, sc.a, 0, 64, ktp, 0, p2, 0.0, dqtp, 0, p2, &bt, false);
+        let bt = GemmBatch {
+            nb: d.b,
+            nh: d.nh,
+            nc: nch,
+            sa,
+            sb: cm,
+            sc: cm,
+        };
+        self.gemm_ex(
+            Op::N,
+            Op::N,
+            64,
+            p2,
+            64,
+            1.0,
+            sc.a,
+            0,
+            64,
+            ktp,
+            0,
+            p2,
+            0.0,
+            dqtp,
+            0,
+            p2,
+            &bt,
+            false,
+        );
         // reduction → dA_log
         e.set_compute_pipeline_state(&self.c.hk_dgamma);
         e.set_buffer(0, Some(&w.phq.buf), 0);
@@ -1577,7 +2341,10 @@ impl<'a> Cmd<'a> {
         e.set_buffer(10, Some(&g.dstates.buf), 0);
         e.set_buffer(11, Some(&dalog.buf), (dalog_off * 4) as u64);
         self.hk_args(12, d);
-        e.dispatch_thread_groups(MTLSize::new((d.nh * p2) as u64, 1, 1), MTLSize::new(256, 1, 1));
+        e.dispatch_thread_groups(
+            MTLSize::new((d.nh * p2) as u64, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
     }
 
     /// Submit and wait. Returns GPU time in milliseconds (GPUEndTime −
@@ -1636,11 +2403,22 @@ pub struct HkGrads<'a> {
 }
 
 fn hk_check(d: &HkDims, w: &HkWork<'_>) {
-    assert!(d.t % 64 == 0, "hybrid_k: T must be a multiple of the chunk (64), got {}", d.t);
-    assert!(d.nph <= 32 && d.dv <= 128, "hybrid_k kernels: nph ≤ 32, dv ≤ 128");
+    assert!(
+        d.t % 64 == 0,
+        "hybrid_k: T must be a multiple of the chunk (64), got {}",
+        d.t
+    );
+    assert!(
+        d.nph <= 32 && d.dv <= 128,
+        "hybrid_k kernels: nph ≤ 32, dv ≤ 128"
+    );
     let rows = d.b * d.t;
     assert!(w.thq.len >= rows * d.nh * d.nph && w.thk.len >= rows * d.nh * d.nph);
-    assert!(w.v.len >= rows * d.nh * d.dv && w.out.len >= rows * d.nh * d.dv && w.kv.len >= rows * d.nh * d.dv);
+    assert!(
+        w.v.len >= rows * d.nh * d.dv
+            && w.out.len >= rows * d.nh * d.dv
+            && w.kv.len >= rows * d.nh * d.dv
+    );
     assert!(w.kappa.len >= rows * d.nh);
     assert!(w.phq.len >= rows * d.nh * 2 * d.nph && w.phk.len >= rows * d.nh * 2 * d.nph);
     assert!(w.pow.len >= w.pow_off + d.nh * 65 * 2 * d.nph);
@@ -1676,7 +2454,14 @@ pub struct GemmBatch {
 
 impl GemmBatch {
     pub fn none() -> GemmBatch {
-        GemmBatch { nb: 1, nh: 1, nc: 1, sa: [0; 3], sb: [0; 3], sc: [0; 3] }
+        GemmBatch {
+            nb: 1,
+            nh: 1,
+            nc: 1,
+            sa: [0; 3],
+            sb: [0; 3],
+            sc: [0; 3],
+        }
     }
 }
 
@@ -1704,9 +2489,16 @@ impl HkScratch<'_> {
         d.b * d.nh * (d.t / 64) * 4096
     }
     fn check(&self, d: &HkDims) {
-        assert!((2 * d.nph) % 64 == 0 && d.dv % 64 == 0, "hybrid_k GEMM path: 2·nph and dv must be multiples of 64 (got {} and {})", 2 * d.nph, d.dv);
+        assert!(
+            (2 * d.nph) % 64 == 0 && d.dv % 64 == 0,
+            "hybrid_k GEMM path: 2·nph and dv must be multiples of 64 (got {} and {})",
+            2 * d.nph,
+            d.dv
+        );
         let n = Self::chunk_len(d);
-        for b in [self.qt, self.kt, self.qp, self.kh, self.dqt, self.dkt, self.dqi, self.dki] {
+        for b in [
+            self.qt, self.kt, self.qp, self.kh, self.dqt, self.dkt, self.dqi, self.dki,
+        ] {
             assert!(b.len >= n, "hk scratch: chunk-major buffer too small");
         }
         assert!(self.a.len >= Self::a_len(d), "hk scratch: A too small");
@@ -1723,7 +2515,11 @@ impl HkScratch<'_> {
     /// batch strides of the states buffer [B, nh, nch+1, p2, dv] (S_c)
     pub fn states(d: &HkDims) -> [usize; 3] {
         let (p2, nch) = (2 * d.nph, d.t / 64);
-        [d.nh * (nch + 1) * p2 * d.dv, (nch + 1) * p2 * d.dv, p2 * d.dv]
+        [
+            d.nh * (nch + 1) * p2 * d.dv,
+            (nch + 1) * p2 * d.dv,
+            p2 * d.dv,
+        ]
     }
 }
 
@@ -1749,6 +2545,9 @@ pub struct GemmDyn<'a> {
 
 impl GemmDyn<'_> {
     pub fn none() -> GemmDyn<'static> {
-        GemmDyn { indirect: None, kcount: None }
+        GemmDyn {
+            indirect: None,
+            kcount: None,
+        }
     }
 }

@@ -13,23 +13,23 @@
 //! - `export` — the genome as a `.cmf` container the runtime loads
 
 #[cfg(target_os = "macos")]
-pub mod metal;
-#[cfg(target_os = "macos")]
 pub mod bench;
 #[cfg(target_os = "macos")]
 pub mod cli;
-pub mod ops;
-pub mod model;
-pub mod train;
-pub mod tokenizer;
-pub mod data;
 pub mod corpus;
+pub mod data;
 pub mod export;
+#[cfg(target_os = "macos")]
+pub mod growth;
+#[cfg(target_os = "macos")]
+pub mod metal;
+pub mod model;
+#[cfg(target_os = "macos")]
+pub mod mtp;
+pub mod ops;
 #[cfg(target_os = "macos")]
 pub mod skill;
 #[cfg(target_os = "macos")]
 pub mod sleep;
-#[cfg(target_os = "macos")]
-pub mod growth;
-#[cfg(target_os = "macos")]
-pub mod mtp;
+pub mod tokenizer;
+pub mod train;

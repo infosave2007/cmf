@@ -28,7 +28,9 @@ use cortiq_core::CmfModel;
 use std::sync::Arc;
 
 fn tensor_f32(model: &Arc<CmfModel>, name: &str) -> Result<(Vec<f32>, Vec<usize>), String> {
-    let e = model.tensor(name).ok_or_else(|| format!("missing tensor {name}"))?;
+    let e = model
+        .tensor(name)
+        .ok_or_else(|| format!("missing tensor {name}"))?;
     let mut out = vec![0.0f32; e.n_elems()];
     cortiq_core::quant::dequant_tensor(e, model.entry_bytes(e), &mut out)?;
     Ok((out, e.shape.clone()))
@@ -49,7 +51,12 @@ pub struct Grid {
 
 impl Grid {
     fn zeros(c: usize, h: usize, w: usize) -> Grid {
-        Grid { c, h, w, data: vec![0.0; c * h * w] }
+        Grid {
+            c,
+            h,
+            w,
+            data: vec![0.0; c * h * w],
+        }
     }
     fn n(&self) -> usize {
         self.h * self.w
@@ -72,7 +79,14 @@ impl Conv2d {
     fn load(model: &Arc<CmfModel>, name: &str) -> Result<Conv2d, String> {
         let (w, s) = tensor_f32(model, &format!("{name}.weight"))?;
         let (b, _) = tensor_f32(model, &format!("{name}.bias"))?;
-        Ok(Conv2d { w, b, c_out: s[0], c_in: s[1], kh: s[2], kw: s[3] })
+        Ok(Conv2d {
+            w,
+            b,
+            c_out: s[0],
+            c_in: s[1],
+            kh: s[2],
+            kw: s[3],
+        })
     }
 
     fn forward(&self, x: &Grid, pool: Option<&Pool>) -> Grid {
@@ -226,14 +240,23 @@ impl AudioVaeDecoder {
             let mut blocks = Vec::new();
             let mut bi = 0usize;
             while model
-                .tensor(&format!("avae.decoder.up.{lv}.block.{bi}.conv1.conv.weight"))
+                .tensor(&format!(
+                    "avae.decoder.up.{lv}.block.{bi}.conv1.conv.weight"
+                ))
                 .is_some()
             {
-                blocks.push(ResnetBlock::load(model, &format!("avae.decoder.up.{lv}.block.{bi}"))?);
+                blocks.push(ResnetBlock::load(
+                    model,
+                    &format!("avae.decoder.up.{lv}.block.{bi}"),
+                )?);
                 bi += 1;
             }
-            let up = match model.tensor(&format!("avae.decoder.up.{lv}.upsample.conv.conv.weight")) {
-                Some(_) => Some(Conv2d::load(model, &format!("avae.decoder.up.{lv}.upsample.conv.conv"))?),
+            let up = match model.tensor(&format!("avae.decoder.up.{lv}.upsample.conv.conv.weight"))
+            {
+                Some(_) => Some(Conv2d::load(
+                    model,
+                    &format!("avae.decoder.up.{lv}.upsample.conv.conv"),
+                )?),
                 None => None,
             };
             levels.push((blocks, up));
@@ -293,7 +316,8 @@ impl AudioVaeDecoder {
         for c in 0..out.c {
             for y in 0..cropped.h {
                 for z in 0..out.w {
-                    cropped.data[(c * cropped.h + y) * out.w + z] = out.data[(c * out.h + y) * out.w + z];
+                    cropped.data[(c * cropped.h + y) * out.w + z] =
+                        out.data[(c * out.h + y) * out.w + z];
                 }
             }
         }
@@ -313,7 +337,11 @@ pub struct Sig {
 
 impl Sig {
     fn zeros(c: usize, t: usize) -> Sig {
-        Sig { c, t, data: vec![0.0; c * t] }
+        Sig {
+            c,
+            t,
+            data: vec![0.0; c * t],
+        }
     }
 }
 
@@ -332,7 +360,15 @@ impl Conv1d {
         let (w, s) = tensor_f32(model, &format!("{name}.weight"))?;
         let b = tensor_f32(model, &format!("{name}.bias")).ok().map(|x| x.0);
         let k = s[2];
-        Ok(Conv1d { w, b, c_out: s[0], c_in: s[1], k, dilation, pad: (k - 1) * dilation / 2 })
+        Ok(Conv1d {
+            w,
+            b,
+            c_out: s[0],
+            c_in: s[1],
+            k,
+            dilation,
+            pad: (k - 1) * dilation / 2,
+        })
     }
 
     fn forward(&self, x: &Sig, pool: Option<&Pool>) -> Sig {
@@ -354,7 +390,8 @@ impl Conv1d {
         let mut out = Sig::zeros(self.c_out, t);
         for p in 0..t {
             for co in 0..self.c_out {
-                out.data[co * t + p] = ys[p * self.c_out + co] + self.b.as_ref().map_or(0.0, |b| b[co]);
+                out.data[co * t + p] =
+                    ys[p * self.c_out + co] + self.b.as_ref().map_or(0.0, |b| b[co]);
             }
         }
         out
@@ -377,7 +414,15 @@ impl ConvT1d {
         let (w, s) = tensor_f32(model, &format!("{name}.weight"))?;
         let b = tensor_f32(model, &format!("{name}.bias")).ok().map(|x| x.0);
         let k = s[2];
-        Ok(ConvT1d { w, b, c_in: s[0], c_out: s[1], k, stride, pad: (k - stride) / 2 })
+        Ok(ConvT1d {
+            w,
+            b,
+            c_in: s[0],
+            c_out: s[1],
+            k,
+            stride,
+            pad: (k - stride) / 2,
+        })
     }
 
     fn forward(&self, x: &Sig) -> Sig {
@@ -397,7 +442,8 @@ impl ConvT1d {
                     }
                     let oo = o - self.pad;
                     for co in 0..self.c_out {
-                        out.data[co * t_out + oo] += v * self.w[(ci * self.c_out + co) * self.k + a];
+                        out.data[co * t_out + oo] +=
+                            v * self.w[(ci * self.c_out + co) * self.k + a];
                     }
                 }
             }
@@ -457,7 +503,8 @@ impl Aliasing {
         let t2 = hi - lo;
         let mut trimmed = Sig::zeros(x.c, t2);
         for c in 0..x.c {
-            trimmed.data[c * t2..(c + 1) * t2].copy_from_slice(&out.data[c * full + lo..c * full + hi]);
+            trimmed.data[c * t2..(c + 1) * t2]
+                .copy_from_slice(&out.data[c * full + lo..c * full + hi]);
         }
         trimmed
     }
@@ -535,7 +582,12 @@ impl AmpBlock {
             acts1.push(SnakeBeta::load(model, &format!("{p}.acts1.{i}"))?);
             acts2.push(SnakeBeta::load(model, &format!("{p}.acts2.{i}"))?);
         }
-        Ok(AmpBlock { convs1, convs2, acts1, acts2 })
+        Ok(AmpBlock {
+            convs1,
+            convs2,
+            acts1,
+            acts2,
+        })
     }
 
     fn forward(&self, x: &Sig, pool: Option<&Pool>) -> Sig {
@@ -580,8 +632,15 @@ impl Vocoder {
         }
         let mut blocks = Vec::new();
         let mut i = 0usize;
-        while model.tensor(&format!("{p}.resblocks.{i}.convs1.0.weight")).is_some() {
-            blocks.push(AmpBlock::load(model, &format!("{p}.resblocks.{i}"), &dils[i % dils.len()])?);
+        while model
+            .tensor(&format!("{p}.resblocks.{i}.convs1.0.weight"))
+            .is_some()
+        {
+            blocks.push(AmpBlock::load(
+                model,
+                &format!("{p}.resblocks.{i}"),
+                &dils[i % dils.len()],
+            )?);
             i += 1;
         }
         let per_level = blocks.len() / rates.len().max(1);
@@ -646,7 +705,11 @@ impl Vocoder {
         let mut out = self.conv_post.forward(&h, pool);
         if self.apply_final {
             out.data.iter_mut().for_each(|v| {
-                *v = if self.tanh_final { v.tanh() } else { v.clamp(-1.0, 1.0) }
+                *v = if self.tanh_final {
+                    v.tanh()
+                } else {
+                    v.clamp(-1.0, 1.0)
+                }
             });
         }
         out
@@ -795,7 +858,12 @@ impl AudioStack {
         let rates = |v: &serde_json::Value, d: Vec<usize>| -> Vec<usize> {
             v.get("upsample_rates")
                 .and_then(|a| a.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_u64()).map(|x| x as usize).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_u64())
+                        .map(|x| x as usize)
+                        .collect()
+                })
                 .unwrap_or(d)
         };
         let dils = vec![vec![1usize, 3, 5], vec![1, 3, 5], vec![1, 3, 5]];
@@ -810,19 +878,29 @@ impl AudioStack {
                 "avae.vocoder.vocoder",
                 &rates(&voc, vec![5, 2, 2, 2, 2, 2]),
                 &dils,
-                voc.get("apply_final_activation").and_then(|v| v.as_bool()).unwrap_or(true),
+                voc.get("apply_final_activation")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true),
             )?,
             bwe: Vocoder::from_cmf(
                 model,
                 "avae.vocoder.bwe_generator",
                 &rates(&bwe, vec![6, 5, 2, 2, 2]),
                 &dils,
-                bwe.get("apply_final_activation").and_then(|v| v.as_bool()).unwrap_or(true),
+                bwe.get("apply_final_activation")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true),
             )?,
             mel: MelStft::load(model, "avae.vocoder.mel_stft", hop)?,
             hop,
-            in_rate: bwe.get("input_sampling_rate").and_then(|v| v.as_u64()).unwrap_or(16000) as usize,
-            out_rate: bwe.get("output_sampling_rate").and_then(|v| v.as_u64()).unwrap_or(48000) as usize,
+            in_rate: bwe
+                .get("input_sampling_rate")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(16000) as usize,
+            out_rate: bwe
+                .get("output_sampling_rate")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(48000) as usize,
         })
     }
 
@@ -848,7 +926,8 @@ impl AudioStack {
             let t2 = low.t + self.hop - rem;
             let mut p = Sig::zeros(low.c, t2);
             for c in 0..low.c {
-                p.data[c * t2..c * t2 + low.t].copy_from_slice(&low.data[c * low.t..(c + 1) * low.t]);
+                p.data[c * t2..c * t2 + low.t]
+                    .copy_from_slice(&low.data[c * low.t..(c + 1) * low.t]);
             }
             p
         };
@@ -859,8 +938,9 @@ impl AudioStack {
         let mut out = Sig::zeros(skip.c, t);
         for c in 0..skip.c {
             for i in 0..t {
-                out.data[c * t + i] =
-                    (residual.data[c * residual.t + i] + skip.data[c * skip.t + i]).clamp(-1.0, 1.0);
+                out.data[c * t + i] = (residual.data[c * residual.t + i]
+                    + skip.data[c * skip.t + i])
+                    .clamp(-1.0, 1.0);
             }
         }
         out
@@ -976,7 +1056,11 @@ pub fn waveform_to_mel(x: &Sig, sr: usize, n_fft: usize, hop: usize, n_mels: usi
                 if s >= x.t as isize {
                     s = 2 * (x.t as isize - 1) - s;
                 }
-                let v = if s >= 0 && s < x.t as isize { x.data[c * x.t + s as usize] } else { 0.0 };
+                let v = if s >= 0 && s < x.t as isize {
+                    x.data[c * x.t + s as usize]
+                } else {
+                    0.0
+                };
                 let v = v * win[j];
                 if v == 0.0 {
                     continue;
@@ -1073,13 +1157,19 @@ impl AudioVaeEncoder {
             let mut blocks = Vec::new();
             let mut bi = 0usize;
             while model
-                .tensor(&format!("avae.encoder.down.{lv}.block.{bi}.conv1.conv.weight"))
+                .tensor(&format!(
+                    "avae.encoder.down.{lv}.block.{bi}.conv1.conv.weight"
+                ))
                 .is_some()
             {
-                blocks.push(ResnetBlock::load(model, &format!("avae.encoder.down.{lv}.block.{bi}"))?);
+                blocks.push(ResnetBlock::load(
+                    model,
+                    &format!("avae.encoder.down.{lv}.block.{bi}"),
+                )?);
                 bi += 1;
             }
-            let down = match model.tensor(&format!("avae.encoder.down.{lv}.downsample.conv.weight")) {
+            let down = match model.tensor(&format!("avae.encoder.down.{lv}.downsample.conv.weight"))
+            {
                 // the downsample holds a plain Conv2d, not the causal wrapper
                 // the residual blocks use, so it is one `.conv` shallower
                 Some(_) => Some(Downsample2 {

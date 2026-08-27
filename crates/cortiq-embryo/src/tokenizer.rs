@@ -77,7 +77,11 @@ pub fn train(counts: &HashMap<String, u64>, vocab_size: usize, log: bool) -> Bpe
     let n_merges = vocab_size - 256 - SPECIALS.len();
     // symbol table: 0..256 = bytes (as their unicode chars)
     let mut symbols: Vec<String> = (0..256).map(|b| enc[b].to_string()).collect();
-    let mut sym_id: HashMap<String, u32> = symbols.iter().enumerate().map(|(i, s)| (s.clone(), i as u32)).collect();
+    let mut sym_id: HashMap<String, u32> = symbols
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.clone(), i as u32))
+        .collect();
     // words as symbol-id sequences
     let mut words: Vec<Vec<u32>> = Vec::with_capacity(counts.len());
     let mut freqs: Vec<u64> = Vec::with_capacity(counts.len());
@@ -98,8 +102,10 @@ pub fn train(counts: &HashMap<String, u64>, vocab_size: usize, log: bool) -> Bpe
     let mut merges: Vec<(String, String)> = Vec::with_capacity(n_merges);
     // max-heap with lazy invalidation: entries (count, pair); an entry is
     // live iff its count equals the pair's current count.
-    let mut heap: std::collections::BinaryHeap<(i64, std::cmp::Reverse<(u32, u32)>)> =
-        pair_count.iter().map(|(p, c)| (*c, std::cmp::Reverse(*p))).collect();
+    let mut heap: std::collections::BinaryHeap<(i64, std::cmp::Reverse<(u32, u32)>)> = pair_count
+        .iter()
+        .map(|(p, c)| (*c, std::cmp::Reverse(*p)))
+        .collect();
     let t0 = std::time::Instant::now();
     for mi in 0..n_merges {
         let mut top = None;
@@ -117,9 +123,15 @@ pub fn train(counts: &HashMap<String, u64>, vocab_size: usize, log: bool) -> Bpe
         let new_id = symbols.len() as u32;
         symbols.push(new_sym.clone());
         sym_id.insert(new_sym, new_id);
-        merges.push((symbols[best.0 as usize].clone(), symbols[best.1 as usize].clone()));
+        merges.push((
+            symbols[best.0 as usize].clone(),
+            symbols[best.1 as usize].clone(),
+        ));
         // apply to every word containing the pair
-        let affected: Vec<u32> = pair_words.remove(&best).map(|s| s.into_iter().collect()).unwrap_or_default();
+        let affected: Vec<u32> = pair_words
+            .remove(&best)
+            .map(|s| s.into_iter().collect())
+            .unwrap_or_default();
         pair_count.remove(&best);
         let mut touched: HashSet<(u32, u32)> = HashSet::new();
         for wi in affected {
@@ -164,7 +176,11 @@ pub fn train(counts: &HashMap<String, u64>, vocab_size: usize, log: bool) -> Bpe
             }
         }
         if log && (mi % 2000 == 0 || mi + 1 == n_merges) {
-            eprintln!("bpe merge {mi}/{n_merges}: {:?} count {bc}  [{:.0} s]", merges.last().unwrap(), t0.elapsed().as_secs_f64());
+            eprintln!(
+                "bpe merge {mi}/{n_merges}: {:?} count {bc}  [{:.0} s]",
+                merges.last().unwrap(),
+                t0.elapsed().as_secs_f64()
+            );
         }
     }
     // vocab: bytes, merges, then specials at the end
@@ -188,8 +204,20 @@ pub fn train(counts: &HashMap<String, u64>, vocab_size: usize, log: bool) -> Bpe
         id_to_token.push(s.to_string());
         specials.push((s.to_string(), id));
     }
-    let ranks = merges.iter().enumerate().map(|(i, m)| (m.clone(), i as u32)).collect();
-    Bpe { vocab, id_to_token, ranks, merges, specials, re: fancy_regex::Regex::new(SPLIT).unwrap(), byte_enc: enc }
+    let ranks = merges
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (m.clone(), i as u32))
+        .collect();
+    Bpe {
+        vocab,
+        id_to_token,
+        ranks,
+        merges,
+        specials,
+        re: fancy_regex::Regex::new(SPLIT).unwrap(),
+        byte_enc: enc,
+    }
 }
 
 impl Bpe {
@@ -197,7 +225,10 @@ impl Bpe {
         self.id_to_token.len()
     }
     pub fn special_id(&self, name: &str) -> Option<u32> {
-        self.specials.iter().find(|(s, _)| s == name).map(|(_, i)| *i)
+        self.specials
+            .iter()
+            .find(|(s, _)| s == name)
+            .map(|(_, i)| *i)
     }
 
     /// BPE-merge one pre-token (byte-level unicode string) into ids.
@@ -234,7 +265,11 @@ impl Bpe {
     pub fn encode(&self, text: &str, cache: &mut HashMap<String, Vec<u32>>, out: &mut Vec<u32>) {
         for m in self.re.find_iter(text) {
             let Ok(m) = m else { continue };
-            let w: String = m.as_str().bytes().map(|b| self.byte_enc[b as usize]).collect();
+            let w: String = m
+                .as_str()
+                .bytes()
+                .map(|b| self.byte_enc[b as usize])
+                .collect();
             if let Some(ids) = cache.get(&w) {
                 out.extend_from_slice(ids);
                 continue;
@@ -253,7 +288,9 @@ impl Bpe {
         let (_, dec) = bytes_to_unicode();
         let mut bytes = Vec::new();
         for &id in ids {
-            let Some(tok) = self.id_to_token.get(id as usize) else { continue };
+            let Some(tok) = self.id_to_token.get(id as usize) else {
+                continue;
+            };
             if self.specials.iter().any(|(s, _)| s == tok) {
                 bytes.extend_from_slice(tok.as_bytes());
                 continue;
@@ -273,9 +310,15 @@ impl Bpe {
     pub fn to_hf_json(&self) -> String {
         let mut vocab_sorted: Vec<(&String, &u32)> = self.vocab.iter().collect();
         vocab_sorted.sort_by_key(|(_, id)| **id);
-        let vocab: serde_json::Map<String, serde_json::Value> =
-            vocab_sorted.iter().map(|(t, id)| ((*t).clone(), serde_json::json!(**id))).collect();
-        let merges: Vec<String> = self.merges.iter().map(|(a, b)| format!("{a} {b}")).collect();
+        let vocab: serde_json::Map<String, serde_json::Value> = vocab_sorted
+            .iter()
+            .map(|(t, id)| ((*t).clone(), serde_json::json!(**id)))
+            .collect();
+        let merges: Vec<String> = self
+            .merges
+            .iter()
+            .map(|(a, b)| format!("{a} {b}"))
+            .collect();
         let added: Vec<serde_json::Value> = self
             .specials
             .iter()
@@ -312,7 +355,9 @@ impl Bpe {
     pub fn load(path: &Path) -> anyhow::Result<Bpe> {
         let s = std::fs::read_to_string(path)?;
         let j: serde_json::Value = serde_json::from_str(&s)?;
-        let vocab_j = j["model"]["vocab"].as_object().ok_or_else(|| anyhow::anyhow!("no vocab"))?;
+        let vocab_j = j["model"]["vocab"]
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("no vocab"))?;
         let mut vocab = HashMap::new();
         let mut max_id = 0u32;
         for (k, v) in vocab_j {
@@ -332,7 +377,10 @@ impl Bpe {
                     merges.push((a.to_string(), b.to_string()));
                 }
             } else if let Some(arr) = m.as_array() {
-                merges.push((arr[0].as_str().unwrap().to_string(), arr[1].as_str().unwrap().to_string()));
+                merges.push((
+                    arr[0].as_str().unwrap().to_string(),
+                    arr[1].as_str().unwrap().to_string(),
+                ));
             }
         }
         let mut specials = Vec::new();
@@ -346,8 +394,20 @@ impl Bpe {
             id_to_token[id as usize] = content.clone();
             specials.push((content, id));
         }
-        let ranks = merges.iter().enumerate().map(|(i, m)| (m.clone(), i as u32)).collect();
+        let ranks = merges
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (m.clone(), i as u32))
+            .collect();
         let (enc, _) = bytes_to_unicode();
-        Ok(Bpe { vocab, id_to_token, ranks, merges, specials, re: fancy_regex::Regex::new(SPLIT).unwrap(), byte_enc: enc })
+        Ok(Bpe {
+            vocab,
+            id_to_token,
+            ranks,
+            merges,
+            specials,
+            re: fancy_regex::Regex::new(SPLIT).unwrap(),
+            byte_enc: enc,
+        })
     }
 }

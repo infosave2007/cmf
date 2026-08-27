@@ -69,7 +69,7 @@ struct Inner {
     slot: UnsafeCell<Option<(TaskPtr, usize, usize, usize)>>,
     shutdown: AtomicBool,
     /// Spin iterations before a worker parks (0 = park immediately).
-    spin_budget: usize,
+    spin_budget: AtomicUsize,
     /// Per-worker "I am parked" flags — lets the caller skip the unpark
     /// syscall for workers that are still spinning.
     parked: Box<[AtomicBool]>,
@@ -135,7 +135,7 @@ impl Pool {
             remaining: AtomicUsize::new(0),
             slot: UnsafeCell::new(None),
             shutdown: AtomicBool::new(false),
-            spin_budget,
+            spin_budget: AtomicUsize::new(spin_budget),
             parked: (0..n_workers).map(|_| AtomicBool::new(false)).collect(),
         });
         let mut joins = Vec::with_capacity(n_workers);
@@ -311,6 +311,13 @@ impl Pool {
     /// Spawned worker threads (the caller joins each job on top).
     pub fn n_workers(&self) -> usize {
         self.threads.len()
+    }
+
+    /// Retune an already-created pool for an architecture with a measured
+    /// dispatch cadence. The environment remains the operator override; this
+    /// hook only changes the automatic default after model geometry is known.
+    pub(crate) fn set_spin_budget(&self, spins: usize) {
+        self.inner.spin_budget.store(spins, Ordering::Relaxed);
     }
 
     /// Run `f(row_start, row_end)` over `0..rows`, self-balancing.
@@ -548,7 +555,7 @@ fn worker_loop(inner: &Inner, idx: usize) {
             if inner.shutdown.load(Ordering::Relaxed) {
                 return;
             }
-            if spins < inner.spin_budget {
+            if spins < inner.spin_budget.load(Ordering::Relaxed) {
                 spins += 1;
                 std::hint::spin_loop();
             } else {

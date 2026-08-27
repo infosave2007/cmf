@@ -39,7 +39,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut n, mut toks) = (0usize, 0usize);
     for line in text.lines().skip(skip).take(take) {
         // one JSON object per line; the prompt field is all we need
-        let Some(i) = line.find("\"prompt\":") else { continue };
+        let Some(i) = line.find("\"prompt\":") else {
+            continue;
+        };
         let rest = &line[i + 9..];
         let Some(s) = rest.find('"') else { continue };
         let mut prompt = String::new();

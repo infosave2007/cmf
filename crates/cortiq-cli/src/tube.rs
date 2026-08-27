@@ -123,7 +123,10 @@ pub fn cmd_tube_bake(model_path: &str, plan_path: &str, output: &str) -> anyhow:
     for (li, l) in layers.iter().enumerate() {
         let sum: usize = l.widths.iter().sum();
         if sum != l.order.len() {
-            bail!("layer {li}: widths sum {sum} != order len {}", l.order.len());
+            bail!(
+                "layer {li}: widths sum {sum} != order len {}",
+                l.order.len()
+            );
         }
         if l.widths.is_empty() || l.widths[0] == 0 {
             bail!("layer {li}: the core segment must be non-empty");
@@ -318,7 +321,13 @@ pub fn cmd_tube_bake(model_path: &str, plan_path: &str, output: &str) -> anyhow:
         "active": active,
     });
     header.provenance = Some(prov);
-    CmfModel::write(output, &header, &tensors, Some(&catalog), model.vocab.as_deref())?;
+    CmfModel::write(
+        output,
+        &header,
+        &tensors,
+        Some(&catalog),
+        model.vocab.as_deref(),
+    )?;
     let in_sz = std::fs::metadata(model_path)?.len() as f64 / 1e9;
     let out_sz = std::fs::metadata(output)?.len() as f64 / 1e9;
     println!(

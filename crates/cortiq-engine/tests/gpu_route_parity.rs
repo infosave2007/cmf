@@ -150,3 +150,45 @@ fn device_routing_matches_the_cpu_needs_cmf_gpu() {
     assert_eq!(gi[top_k], n);
     println!("формат msel/mwt: {gi:?}");
 }
+
+#[test]
+fn qwen_selected_softmax_route_matches_cpu_needs_cmf_gpu() {
+    match cortiq_engine::gpu_wgpu::selected_and_up() {
+        None => {
+            cortiq_engine::gpu_wgpu::skip_or_fail(module_path!());
+            return;
+        }
+        Some(false) => panic!("wgpu запрошен, но контекст не поднялся"),
+        Some(true) => {}
+    }
+
+    // Deliberately non-monotonic, with a close pair below the cut. This
+    // catches both ranking transformed scores and normalising all experts
+    // instead of only the selected Qwen top-k.
+    let logits = [2.0f32, -1.0, 0.5, 3.0, 0.2, 1.999];
+    let top_k = 2;
+    let mut gi = Vec::new();
+    let mut gw = Vec::new();
+    assert!(cortiq_engine::gpu_wgpu::qwen_moe_route_for_test(
+        &logits, top_k, &mut gi, &mut gw,
+    ));
+
+    let mut order: Vec<usize> = (0..logits.len()).collect();
+    order.sort_by(|&a, &b| logits[b].total_cmp(&logits[a]));
+    order.truncate(top_k);
+    let max = order
+        .iter()
+        .map(|&i| logits[i])
+        .fold(f32::NEG_INFINITY, f32::max);
+    let z: f32 = order.iter().map(|&i| (logits[i] - max).exp()).sum();
+    let expected: Vec<f32> = order.iter().map(|&i| (logits[i] - max).exp() / z).collect();
+
+    assert_eq!(gi, order, "Qwen выбрал другие эксперты");
+    let d = expected
+        .iter()
+        .zip(&gw)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    println!("Qwen selected-softmax: {gi:?}, {gw:?}, max|Δw|={d:.3e}");
+    assert!(d < 1e-6, "Qwen-веса разошлись на {d:.3e}");
+}

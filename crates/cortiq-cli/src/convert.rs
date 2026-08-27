@@ -22,8 +22,8 @@ use cortiq_core::quant::{
     q4tp_code_stride, q4tp_ladder, q4tp_put_code,
 };
 use cortiq_core::types::{
-    LayerType, LinearCoreConfig, ModelArch, MoeConfig, NormStyle, QuantType, TensorDtype,
-    YarnConfig,
+    LayerType, LinearCoreConfig, ModelArch, MoeConfig, NormStyle, QuantType, Qwen4ExpConfig,
+    TensorDtype, YarnConfig,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -435,6 +435,37 @@ fn force_f16(name: &str) -> bool {
         || name.ends_with("mlp.gate.weight")
         || name.ends_with("shared_expert_gate.weight")
         || name.ends_with("self_attn.g_proj.weight")
+        // Qwen3.8 hyper-connection projections sit directly on sigmoid
+        // residual gates.  They are tiny relative to the experts and are
+        // deliberately kept at f16 in a q4tp file.
+        || (name.contains("hyper_connection")
+            && (name.contains("input_mix_weight_") || name.contains("block_inject_weight")))
+}
+
+/// Qwen3.8-Flash-Next is unusually sensitive to error in its small recurrent
+/// skeleton: every token traverses the same GDN/QSA projections 48 times,
+/// while only ten of 512 routed experts are active. Keep the 172B memory wall
+/// (experts + PLE lookup) in q4tp/q2tp, but give the always-active skeleton
+/// q8_2f.
+/// Its input-channel field preserves activation-outlier columns at essentially
+/// the same size as q8-row.  This is the usual "K-medium" mixed-precision idea
+/// expressed in CMF: the file/profile remains q4tp and grows only a few
+/// percent, whereas a uniform four-bit GDN stack loses coherence after a few
+/// dozen layers.
+fn quant_for_tensor(arch: &ModelArch, name: &str, base: Quant) -> Quant {
+    if !matches!(base, Quant::Q4TiledP | Quant::Q2TiledP) || arch.qwen4_exp.is_none() {
+        return base;
+    }
+    let recurrent_skeleton = name.contains(".linear_attn.")
+        || name.contains(".self_attn.")
+        || (name.contains(".ple.")
+            && (name.ends_with("key_proj.weight") || name.ends_with("value_proj.weight")));
+    let vocabulary_edges = name == "model.embed_tokens.weight" || name == "lm_head.weight";
+    if recurrent_skeleton || vocabulary_edges {
+        Quant::Q8_2f
+    } else {
+        base
+    }
 }
 
 /// Quantization choice for 2-D weight matrices.
@@ -545,6 +576,23 @@ pub(crate) fn parse_quant(s: &str) -> anyhow::Result<Quant> {
             "unknown quant '{other}' (use q8, q8_2f, q4, q4t, q4tp, q2tp, f16, vbit, q1, q1p, q1s, or q1t)"
         ),
     })
+}
+
+pub(crate) fn quant_name(quant: Quant) -> &'static str {
+    match quant {
+        Quant::Q8Row => "q8",
+        Quant::Q8_2f => "q8_2f",
+        Quant::Q4Block => "q4",
+        Quant::F16 => "f16",
+        Quant::Vbit => "vbit",
+        Quant::Q4Tiled => "q4t",
+        Quant::Q4TiledP => "q4tp",
+        Quant::Q2TiledP => "q2tp",
+        Quant::Q1 => "q1",
+        Quant::Q1p => "q1p",
+        Quant::Q1s => "q1s",
+        Quant::Q1t => "q1t",
+    }
 }
 
 /// q8_row: `[int8 : out·in][f16 : out]` (validated layout, matches the reader).
@@ -790,9 +838,7 @@ pub(crate) fn encode_q2tp(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8
                             1
                         };
                         let mut ge = f32::INFINITY;
-                        for cand in
-                            nom.saturating_sub(2).max(1)..=(nom + 2).min(Q2TP_LMAX + 1)
-                        {
+                        for cand in nom.saturating_sub(2).max(1)..=(nom + 2).min(Q2TP_LMAX + 1) {
                             let sc = t[cand];
                             if sc <= 0.0 {
                                 continue;
@@ -838,8 +884,7 @@ pub(crate) fn encode_q2tp(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8
                     nominal
                 } else {
                     let mut best = (f32::INFINITY, nominal);
-                    for cand in
-                        nominal.saturating_sub(2).max(1)..=(nominal + 1).min(Q2TP_LMAX + 1)
+                    for cand in nominal.saturating_sub(2).max(1)..=(nominal + 1).min(Q2TP_LMAX + 1)
                     {
                         let s = tab[cand];
                         if s <= 0.0 {
@@ -1946,8 +1991,10 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         .filter(|&n| n > 0)
         .map(|ne| {
             let mt = model_type.to_lowercase();
-            let ntp_default =
-                mt.starts_with("qwen3_5") || mt.contains("qwen3_next") || mt.contains("gemma4");
+            let ntp_default = mt.starts_with("qwen3_5")
+                || mt.contains("qwen3_next")
+                || mt.contains("qwen4_exp")
+                || mt.contains("gemma4");
             // LFM2-MoE routes with a sigmoid gate + selection bias (DeepSeek-V3
             // noaux_tc); Qwen keeps the softmax-over-all default.
             let is_lfm2 = mt.starts_with("lfm2");
@@ -2022,6 +2069,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
     let norm_style = if (mt.contains("gemma") && !mt.contains("gemma4") && !mt.contains("gemma3n"))
         || mt.starts_with("qwen3_5")
         || mt.contains("qwen3_next")
+        || mt.contains("qwen4_exp")
     {
         NormStyle::Gemma
     } else {
@@ -2238,7 +2286,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         }
     }
     Ok(ModelArch {
-        arch_name: model_type,
+        arch_name: model_type.clone(),
         hidden_size: hidden,
         intermediate_size: cfg_usize(tc, "intermediate_size")
             .or_else(|| {
@@ -2294,16 +2342,50 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         // `mtp_num_hidden_layers`; DeepSeek-lineage configs say
         // `num_nextn_predict_layers`. Absent → no speculative head, which is
         // the honest default for every model that has none.
-        mtp: ["mtp_num_hidden_layers", "num_nextn_predict_layers"]
-            .iter()
-            .find_map(|k| cfg_usize(tc, k))
-            .filter(|n| *n > 0)
-            .map(|n| cortiq_core::MtpConfig {
-                num_layers: n,
-                share_lm_head: true,
-                share_embed: true,
-            }),
+        mtp: if mt.contains("qwen4_exp") {
+            // qwen4_exp ships a second hyper-connected hybrid stack.  It is
+            // not wire-compatible with the legacy DeepSeek/Qwen MTP block;
+            // leave it out until that speculative-only head has an exact op.
+            None
+        } else {
+            ["mtp_num_hidden_layers", "num_nextn_predict_layers"]
+                .iter()
+                .find_map(|k| cfg_usize(tc, k))
+                .filter(|n| *n > 0)
+                .map(|n| cortiq_core::MtpConfig {
+                    num_layers: n,
+                    share_lm_head: true,
+                    share_embed: true,
+                })
+        },
         moe,
+        qwen4_exp: (model_type == "qwen4_exp").then(|| Qwen4ExpConfig {
+            hc_count: cfg_usize(tc, "hc_count").unwrap_or(4),
+            hc_lowrank: cfg_usize(tc, "hc_lowrank").unwrap_or(320),
+            indexer_n_heads: cfg_usize(tc, "indexer_n_heads").unwrap_or(4),
+            indexer_kv_heads: cfg_usize(tc, "indexer_kv_heads").unwrap_or(1),
+            indexer_head_dim: cfg_usize(tc, "indexer_head_dim").unwrap_or(128),
+            indexer_budget: cfg_usize(tc, "indexer_budget").unwrap_or(2048),
+            indexer_compress_ratio: cfg_usize(tc, "indexer_compress_ratio").unwrap_or(4),
+            ple_layer_ids: tc
+                .get("ple_layer_ids")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_u64().map(|n| n as usize))
+                        .collect()
+                })
+                .unwrap_or_else(|| vec![2]),
+            ple_embed_dim: cfg_usize(tc, "ple_embed_dim").unwrap_or(hidden),
+            ple_conv_kernel_size: cfg_usize(tc, "ple_conv_kernel_size").unwrap_or(4),
+            ngram_size: cfg_usize(tc, "ngram_size").unwrap_or(3),
+            heads_per_ngram: cfg_usize(tc, "heads_per_ngram").unwrap_or(8),
+            ngram_vocab_size_base: cfg_usize(tc, "ngram_vocab_size_base").unwrap_or(20_000_000),
+            make_ngram_vocab_size_divisible_by: cfg_usize(tc, "make_ngram_vocab_size_divisible_by")
+                .unwrap_or(128),
+            split_ngram_parts: cfg_usize(tc, "split_ngram_parts").unwrap_or(128),
+            seed: cfg_usize(tc, "seed").unwrap_or(1234) as u64,
+        }),
         linear_core,
         head_clusters: None,
         max_position_embeddings: max_pos,
@@ -3030,6 +3112,20 @@ fn build_defrag_plan(
     Ok(DefragPlan { overlay, keep })
 }
 
+/// Conservative record count for the streaming writer's fixed head gap.
+/// A packed `[experts, out, in]` source tensor becomes one CMF directory
+/// record per expert; flat checkpoints merely over-reserve here.
+fn directory_record_estimate(source_tensors: usize, arch: &ModelArch) -> usize {
+    let expanded_expert_records = arch.moe.as_ref().map_or(0usize, |m| {
+        arch.num_layers
+            .saturating_mul(m.num_experts)
+            .saturating_mul(3)
+    });
+    source_tensors
+        .saturating_add(expanded_expert_records)
+        .max(4096)
+}
+
 pub fn run_convert(
     model: &str,
     quant: &str,
@@ -3046,6 +3142,11 @@ pub fn run_convert(
     mut progress: impl FnMut(f32),
 ) -> anyhow::Result<()> {
     let quant = parse_quant(quant)?;
+    // Some codecs intentionally share a physical dtype (q1/q1p both use
+    // Q1).  Preserve the requested encoder so later skill grafts can encode
+    // replacement tensors with the same algorithm instead of guessing from
+    // the directory dtype alone.
+    let requested_quant = quant_name(quant);
     // The q2tp PROFILE: 2-bit tiles go to the MoE gate/up experts only —
     // `down` experts and the whole skeleton stay q4tp (the 2/4 split that
     // mirrors Escha's 2/3-bit choice). `gu_quant` is what gate/up get.
@@ -3114,8 +3215,18 @@ pub fn run_convert(
     // therefore goes straight into the output file and is dropped; the head
     // is patched into a reserved gap once the last tensor lands, so the
     // payloads are never held twice — not in RAM and not on disk.
-    let head_reserve =
-        cortiq_core::format::CmfStreamWriter::head_reserve_for(2 * total.max(4096), 96);
+    // Hub streaming has no resident `files`, so `total` is one here. Packed
+    // MoE tensors can nevertheless expand into E individual gate/up/down
+    // directory records per layer (Qwen3.8 Flash: >73k records). Account for
+    // that expansion up front; discovering an undersized head only in
+    // `finish()` would otherwise waste the entire multi-hour conversion.
+    // Flat-expert checkpoints are deliberately counted twice by this upper
+    // bound — a larger zero-filled gap is cheap and keeps resume portable.
+    let directory_records = directory_record_estimate(total, &arch);
+    let head_reserve = cortiq_core::format::CmfStreamWriter::head_reserve_for(
+        2usize.saturating_mul(directory_records),
+        96,
+    );
     let manifest_path = format!("{output}.manifest");
     let mut done_shards: std::collections::HashSet<String> = std::collections::HashSet::new();
     let resuming = resume
@@ -3186,6 +3297,17 @@ pub fn run_convert(
             let Some(name) = canon_name(&m.name) else {
                 continue;
             };
+            if arch.qwen4_exp.is_some()
+                && (name.starts_with("model.mtp.")
+                    || name.ends_with("ple_embedding.layer_multipliers")
+                    || name.ends_with("ple_embedding.ngram_heads_offsets")
+                    || name.ends_with("ple_embedding.ngram_heads_vocab_sizes"))
+            {
+                // qwen4 MTP is speculative-only and uses a different stack.
+                // PLE's integer hash tables are deterministic from the header
+                // and are recomputed by the runtime, avoiding lossy casts.
+                continue;
+            }
             // Kimi: KDA layers share the `self_attn.` vendor prefix with
             // the MLA full-attention layers — retag them by the layer
             // schedule so the loader dispatches unambiguously.
@@ -3636,7 +3758,8 @@ pub fn run_convert(
                 {
                     let two_d = out_rows * hid >= GROUP_SIZE && !force_f16(&out_name);
                     let (dt, data) = if two_d {
-                        quantize_2d(quant, &out_vals, out_rows, hid)
+                        let q = quant_for_tensor(&arch, &out_name, quant);
+                        quantize_2d(q, &out_vals, out_rows, hid)
                     } else {
                         (TensorDtype::F16, encode_f16(&out_vals))
                     };
@@ -3798,6 +3921,7 @@ pub fn run_convert(
             let expert_gu = q2tp_expert_gate_or_up(&name)
                 || (arch.moe.is_none() && q2tp_dense_gate_or_up(&name));
             let q_here = if expert_gu { gu_quant } else { quant };
+            let q_here = quant_for_tensor(&arch, &name, q_here);
             let (dt, data) = if two_d {
                 quantize_2d(q_here, &vals, m_shape[0], m_shape[1])
             } else {
@@ -3955,6 +4079,7 @@ pub fn run_convert(
             serde_json::json!({
                 "tool": "cortiq convert",
                 "source_model": model,
+                "weight_quant": requested_quant,
                 "defrag": {
                     "source_skill": defrag,
                     "pre_intermediate": orig_inter,
@@ -3964,7 +4089,11 @@ pub fn run_convert(
                 }
             })
         }
-        None => serde_json::json!({ "tool": "cortiq convert", "source_model": model }),
+        None => serde_json::json!({
+            "tool": "cortiq convert",
+            "source_model": model,
+            "weight_quant": requested_quant,
+        }),
     };
     let provenance = match o1_hint {
         Some(h) => {
@@ -4671,6 +4800,99 @@ pub(crate) mod tests {
         let strip: Vec<u32> = ids.iter().copied().filter(|&i| i != 100).collect(); // drop a possible auto-BOS
         assert_eq!(strip, vec![12, 15, 2, 7], "ids: {ids:?}");
         assert_eq!(tok.decode(&strip), "hello world");
+    }
+
+    #[test]
+    fn qwen4_exp_arch_carries_portable_qsa_ple_geometry() {
+        let cfg = serde_json::json!({
+            "model_type": "qwen4_exp",
+            "text_config": {
+                "model_type": "qwen4_exp_text",
+                "hidden_size": 2560,
+                "moe_intermediate_size": 640,
+                "num_hidden_layers": 48,
+                "num_attention_heads": 24,
+                "num_key_value_heads": 2,
+                "head_dim": 256,
+                "vocab_size": 248320,
+                "max_position_embeddings": 262144,
+                "partial_rotary_factor": 0.25,
+                "rope_theta": 10000000,
+                "num_experts": 512,
+                "num_experts_per_tok": 10,
+                "shared_expert_intermediate_size": 640,
+                "linear_num_value_heads": 48,
+                "linear_num_key_heads": 16,
+                "linear_key_head_dim": 128,
+                "linear_value_head_dim": 128,
+                "linear_conv_kernel_dim": 4,
+                "layer_types": ["linear_attention", "full_attention"],
+                "hc_count": 4,
+                "hc_lowrank": 320,
+                "indexer_n_heads": 4,
+                "indexer_kv_heads": 1,
+                "indexer_head_dim": 128,
+                "indexer_budget": 2048,
+                "indexer_compress_ratio": 4,
+                "ple_layer_ids": [2],
+                "ple_embed_dim": 2560,
+                "ple_conv_kernel_size": 4,
+                "ngram_size": 3,
+                "heads_per_ngram": 8,
+                "ngram_vocab_size_base": 20000000,
+                "make_ngram_vocab_size_divisible_by": 128,
+                "split_ngram_parts": 128,
+                "mtp_num_hidden_layers": 1
+            }
+        });
+        let mut cfg = cfg;
+        cfg["text_config"]["num_hidden_layers"] = 2.into();
+        let mut arch = build_arch(&cfg).unwrap();
+        let q = arch.qwen4_exp.as_ref().unwrap();
+        assert_eq!(arch.norm_style, NormStyle::Gemma);
+        assert_eq!(
+            arch.layer_types,
+            [LayerType::LinearAttention, LayerType::FullAttention]
+        );
+        assert_eq!((q.hc_count, q.hc_lowrank), (4, 320));
+        assert_eq!((q.indexer_budget, q.indexer_compress_ratio), (2048, 4));
+        assert_eq!(q.ple_layer_ids, [2]);
+        assert_eq!(q.split_ngram_parts, 128);
+        assert!(arch.moe.as_ref().unwrap().norm_topk_prob);
+        assert!(arch.mtp.is_none(), "qwen4 MTP is a different stack");
+        assert_eq!(
+            quant_for_tensor(
+                &arch,
+                "model.layers.0.linear_attn.in_proj_qkv.weight",
+                Quant::Q4TiledP,
+            ),
+            Quant::Q8_2f
+        );
+        assert_eq!(
+            quant_for_tensor(
+                &arch,
+                "model.layers.0.mlp.experts.0.gate_proj.weight",
+                Quant::Q4TiledP,
+            ),
+            Quant::Q4TiledP
+        );
+        assert_eq!(
+            quant_for_tensor(
+                &arch,
+                "model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight",
+                Quant::Q4TiledP,
+            ),
+            Quant::Q4TiledP
+        );
+        assert!(force_f16(
+            "model.hyper_connection_mixer.input_mix_weight_down.weight"
+        ));
+        arch.num_layers = 48;
+        assert_eq!(
+            directory_record_estimate(1, &arch),
+            73_729,
+            "the fixed streamed head must include packed MoE expansion"
+        );
     }
 
     #[test]

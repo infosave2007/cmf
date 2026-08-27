@@ -22,7 +22,9 @@ use cortiq_core::CmfModel;
 use std::sync::Arc;
 
 fn tensor_f32(model: &Arc<CmfModel>, name: &str) -> Result<(Vec<f32>, Vec<usize>), String> {
-    let e = model.tensor(name).ok_or_else(|| format!("missing tensor {name}"))?;
+    let e = model
+        .tensor(name)
+        .ok_or_else(|| format!("missing tensor {name}"))?;
     let mut out = vec![0.0f32; e.n_elems()];
     cortiq_core::quant::dequant_tensor(e, model.entry_bytes(e), &mut out)?;
     Ok((out, e.shape.clone()))
@@ -65,7 +67,13 @@ impl Conv {
             Some(_) => tensor_f32(model, &format!("{p}.conv.bias"))?.0,
             None => vec![0.0; s[0]],
         };
-        Ok(Conv { w, b, c_out: s[0], c_in: s[1], stride })
+        Ok(Conv {
+            w,
+            b,
+            c_out: s[0],
+            c_in: s[1],
+            stride,
+        })
     }
 
     fn forward(&self, x: &Vol, pool: Option<&Pool>) -> Vol {
@@ -103,7 +111,8 @@ impl Conv {
                                 if s == 0 || s > x.w {
                                     continue;
                                 }
-                                row[(ci * 3 + kf) * 9 + kh * 3 + kw] = x.at(ci, src_f, src_h, s - 1);
+                                row[(ci * 3 + kf) * 9 + kh * 3 + kw] =
+                                    x.at(ci, src_f, src_h, s - 1);
                             }
                         }
                     }
@@ -170,7 +179,11 @@ impl Down {
     ) -> Result<Down, String> {
         let conv = Conv::load(model, &format!("{p}.conv"), (1, 1, 1))?;
         let out_channels = conv.c_in * multiplier;
-        Ok(Down { conv, stride, out_channels })
+        Ok(Down {
+            conv,
+            stride,
+            out_channels,
+        })
     }
 
     fn forward(&self, x: &Vol, pool: Option<&Pool>) -> Vol {
@@ -269,7 +282,9 @@ impl VideoEncoder {
             .ok_or("no config in this container carries vae.encoder_blocks")?;
         let vae = &cfg["vae"];
         let patch = vae["patch_size"].as_u64().unwrap_or(4) as usize;
-        let list = vae["encoder_blocks"].as_array().ok_or("vae.encoder_blocks")?;
+        let list = vae["encoder_blocks"]
+            .as_array()
+            .ok_or("vae.encoder_blocks")?;
         let mut blocks = Vec::new();
         for (i, entry) in list.iter().enumerate() {
             let name = entry[0].as_str().unwrap_or("");
@@ -278,7 +293,10 @@ impl VideoEncoder {
                 "res_x" => {
                     let mut r = Vec::new();
                     let mut j = 0usize;
-                    while model.tensor(&format!("{p}.res_blocks.{j}.conv1.conv.weight")).is_some() {
+                    while model
+                        .tensor(&format!("{p}.res_blocks.{j}.conv1.conv.weight"))
+                        .is_some()
+                    {
                         r.push(Res {
                             c1: Conv::load(model, &format!("{p}.res_blocks.{j}.conv1"), (1, 1, 1))?,
                             c2: Conv::load(model, &format!("{p}.res_blocks.{j}.conv2"), (1, 1, 1))?,

@@ -4,7 +4,10 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "cortiq-embryo", about = "Cortiq Embryo trainer (native Rust + Metal)")]
+#[command(
+    name = "cortiq-embryo",
+    about = "Cortiq Embryo trainer (native Rust + Metal)"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Sub,
@@ -34,10 +37,7 @@ enum Sub {
         tiny: bool,
     },
     /// Turn a text file into a byte-level token shard (vocab 256) — smoke corpus.
-    BytesShard {
-        input: PathBuf,
-        output: PathBuf,
-    },
+    BytesShard { input: PathBuf, output: PathBuf },
     /// Train our byte-level BPE tokenizer (HF tokenizer.json, runtime-compatible).
     TrainTokenizer {
         #[arg(long, required = true, num_args = 1..)]
@@ -317,9 +317,16 @@ fn main() {
             let cfg = cortiq_embryo::model::EmbryoCfg::embryo0();
             let (total, active) = cfg.params();
             println!("{cfg:#?}");
-            println!("params: total {:.2} M, active/token {:.2} M", total as f64 / 1e6, active as f64 / 1e6);
+            println!(
+                "params: total {:.2} M, active/token {:.2} M",
+                total as f64 / 1e6,
+                active as f64 / 1e6
+            );
             let lay = cortiq_embryo::model::Layout::new(&cfg);
-            println!("trainer arena now (shared expert, no routed experts yet): {:.2} M", lay.total as f64 / 1e6);
+            println!(
+                "trainer arena now (shared expert, no routed experts yet): {:.2} M",
+                lay.total as f64 / 1e6
+            );
         }
         Sub::BytesShard { input, output } => {
             let text = std::fs::read(&input).expect("read input");
@@ -327,23 +334,69 @@ fn main() {
             shard.save(&output).expect("write shard");
             println!("{} tokens → {}", shard.tokens.len(), output.display());
         }
-        Sub::TrainTokenizer { inputs, out, vocab, sample_mb_bytes } => {
+        Sub::TrainTokenizer {
+            inputs,
+            out,
+            vocab,
+            sample_mb_bytes,
+        } => {
             cortiq_embryo::corpus::train_tokenizer(&inputs, &out, vocab, sample_mb_bytes);
         }
-        Sub::Shard { tokenizer, inputs, out, max_tokens } => {
+        Sub::Shard {
+            tokenizer,
+            inputs,
+            out,
+            max_tokens,
+        } => {
             cortiq_embryo::corpus::shard(&tokenizer, &inputs, &out, max_tokens);
         }
-        Sub::Export { ckpt, tokenizer, out } => {
+        Sub::Export {
+            ckpt,
+            tokenizer,
+            out,
+        } => {
             let ck = cortiq_embryo::train::load_checkpoint(&ckpt).expect("load checkpoint");
             let tj = std::fs::read(&tokenizer).expect("read tokenizer.json");
             cortiq_embryo::export::export(&ck, &tj, &out).expect("export");
             let (total, active) = ck.cfg.params();
-            println!("exported step {} → {} ({:.1} M params, {:.1} M active)", ck.step, out.display(), total as f64 / 1e6, active as f64 / 1e6);
+            println!(
+                "exported step {} → {} ({:.1} M params, {:.1} M active)",
+                ck.step,
+                out.display(),
+                total as f64 / 1e6,
+                active as f64 / 1e6
+            );
         }
-        Sub::SampleText { input, skip, docs, out } => {
+        Sub::SampleText {
+            input,
+            skip,
+            docs,
+            out,
+        } => {
             cortiq_embryo::corpus::sample_text(&input, skip, docs, &out);
         }
-        Sub::SkillBake { ckpt, tokenizer, corpus, base, out, id, layers, steps_a, steps_b, lr_a, lr_b, l1, tau, eval_every, batch, seq, phi_layer, phi_len, rank, seed } => {
+        Sub::SkillBake {
+            ckpt,
+            tokenizer,
+            corpus,
+            base,
+            out,
+            id,
+            layers,
+            steps_a,
+            steps_b,
+            lr_a,
+            lr_b,
+            l1,
+            tau,
+            eval_every,
+            batch,
+            seq,
+            phi_layer,
+            phi_len,
+            rank,
+            seed,
+        } => {
             #[cfg(target_os = "macos")]
             {
                 use cortiq_embryo::skill::{BakeArgs, append_to_cmf, bake};
@@ -365,12 +418,27 @@ fn main() {
                 println!("skill corpus: {} tokens", toks.len());
                 let shard = cortiq_embryo::train::Shard { tokens: toks };
                 let nl = ck.cfg.layers;
-                let layers = layers.unwrap_or_else(|| vec![nl.saturating_sub(2), nl.saturating_sub(1)]);
+                let layers =
+                    layers.unwrap_or_else(|| vec![nl.saturating_sub(2), nl.saturating_sub(1)]);
                 let a = BakeArgs {
-                    id: id.clone(), layers: layers.clone(), steps_a, steps_b, lr_a, lr_b, l1, tau, eval_every, batch, seq,
-                    phi_layer: phi_layer.unwrap_or(nl * 2 / 3), phi_len, rank, seed,
+                    id: id.clone(),
+                    layers: layers.clone(),
+                    steps_a,
+                    steps_b,
+                    lr_a,
+                    lr_b,
+                    l1,
+                    tau,
+                    eval_every,
+                    batch,
+                    seq,
+                    phi_layer: phi_layer.unwrap_or(nl * 2 / 3),
+                    phi_len,
+                    rank,
+                    seed,
                 };
-                let (tensors, sel, kept, (l0, la, lb)) = bake(&ck, &shard, &a, &|| false).expect("bake");
+                let (tensors, sel, kept, (l0, la, lb)) =
+                    bake(&ck, &shard, &a, &|| false).expect("bake");
                 let quality = serde_json::json!({
                     "held_out_loss": {"base": l0, "mask": la, "mask+fcd": lb},
                     "held_out_ppl": {"base": l0.exp(), "mask": la.exp(), "mask+fcd": lb.exp()},
@@ -378,40 +446,128 @@ fn main() {
                 });
                 let out_path = out.unwrap_or_else(|| base.clone());
                 let tmp = out_path.with_extension("cmf.tmp");
-                let unchanged = append_to_cmf(&base, &tmp, &id, &layers, &tensors, sel, quality).expect("append");
+                let unchanged = append_to_cmf(&base, &tmp, &id, &layers, &tensors, sel, quality)
+                    .expect("append");
                 std::fs::rename(&tmp, &out_path).expect("rename");
-                println!("skill '{id}' appended → {} ({} tensors over layers {:?}; {unchanged} base tensors byte-identical; held-out ppl {:.1} → {:.1})", out_path.display(), tensors.len(), layers, l0.exp(), lb.exp());
+                println!(
+                    "skill '{id}' appended → {} ({} tensors over layers {:?}; {unchanged} base tensors byte-identical; held-out ppl {:.1} → {:.1})",
+                    out_path.display(),
+                    tensors.len(),
+                    layers,
+                    l0.exp(),
+                    lb.exp()
+                );
                 match cortiq_embryo::skill::calibrate_file(&out_path, 0.05) {
-                    Ok(Some(c)) => println!("router calibrated over {} held-out φ: temperature {:.3e}, novelty θ {:.3} (fpr {:.2})", c.samples, c.temperature, c.novelty_theta, c.target_fpr),
+                    Ok(Some(c)) => println!(
+                        "router calibrated over {} held-out φ: temperature {:.3e}, novelty θ {:.3} (fpr {:.2})",
+                        c.samples, c.temperature, c.novelty_theta, c.target_fpr
+                    ),
                     Ok(None) => println!("router calibration: no held-out φ in the file"),
                     Err(e) => eprintln!("router calibration failed: {e}"),
                 }
             }
             #[cfg(not(target_os = "macos"))]
             {
-                let _ = (ckpt, tokenizer, corpus, base, out, id, layers, steps_a, steps_b, lr_a, lr_b, l1, tau, eval_every, batch, seq, phi_layer, phi_len, rank, seed);
+                let _ = (
+                    ckpt, tokenizer, corpus, base, out, id, layers, steps_a, steps_b, lr_a, lr_b,
+                    l1, tau, eval_every, batch, seq, phi_layer, phi_len, rank, seed,
+                );
                 eprintln!("needs Metal (macOS)");
                 std::process::exit(1);
             }
         }
-        Sub::Sleep { ckpt, tokenizer, cmf, ood_dir, idle_min, min_tokens, gate, requant_gate, held_out, cortiq_bin, layers, steps_a, steps_b, batch, seq, once, force, poll_secs, grow_after } => {
+        Sub::Sleep {
+            ckpt,
+            tokenizer,
+            cmf,
+            ood_dir,
+            idle_min,
+            min_tokens,
+            gate,
+            requant_gate,
+            held_out,
+            cortiq_bin,
+            layers,
+            steps_a,
+            steps_b,
+            batch,
+            seq,
+            once,
+            force,
+            poll_secs,
+            grow_after,
+        } => {
             #[cfg(target_os = "macos")]
             {
-                let nl = cortiq_embryo::train::load_checkpoint(&ckpt).map(|c| c.cfg.layers).unwrap_or(8);
+                let nl = cortiq_embryo::train::load_checkpoint(&ckpt)
+                    .map(|c| c.cfg.layers)
+                    .unwrap_or(8);
                 let layers = layers.unwrap_or_else(|| (nl.saturating_sub(3)..nl).collect());
                 cortiq_embryo::sleep::run(cortiq_embryo::sleep::SleepArgs {
-                    ckpt, tokenizer, cmf, ood_dir, idle_min, min_tokens, gate, requant_gate, held_out, cortiq_bin, layers, steps_a, steps_b, batch, seq, once, force, poll_secs, grow_after,
+                    ckpt,
+                    tokenizer,
+                    cmf,
+                    ood_dir,
+                    idle_min,
+                    min_tokens,
+                    gate,
+                    requant_gate,
+                    held_out,
+                    cortiq_bin,
+                    layers,
+                    steps_a,
+                    steps_b,
+                    batch,
+                    seq,
+                    once,
+                    force,
+                    poll_secs,
+                    grow_after,
                 })
                 .expect("sleep");
             }
             #[cfg(not(target_os = "macos"))]
             {
-                let _ = (ckpt, tokenizer, cmf, ood_dir, idle_min, min_tokens, gate, requant_gate, held_out, cortiq_bin, layers, steps_a, steps_b, batch, seq, once, force, poll_secs, grow_after);
+                let _ = (
+                    ckpt,
+                    tokenizer,
+                    cmf,
+                    ood_dir,
+                    idle_min,
+                    min_tokens,
+                    gate,
+                    requant_gate,
+                    held_out,
+                    cortiq_bin,
+                    layers,
+                    steps_a,
+                    steps_b,
+                    batch,
+                    seq,
+                    once,
+                    force,
+                    poll_secs,
+                    grow_after,
+                );
                 eprintln!("needs Metal (macOS)");
                 std::process::exit(1);
             }
         }
-        Sub::Grow { ckpt, tokenizer, corpus, out_ckpt, export, steps, lr, batch, seq, gate, noise, shift, seed } => {
+        Sub::Grow {
+            ckpt,
+            tokenizer,
+            corpus,
+            out_ckpt,
+            export,
+            steps,
+            lr,
+            batch,
+            seq,
+            gate,
+            noise,
+            shift,
+            seed,
+        } => {
             #[cfg(target_os = "macos")]
             {
                 use cortiq_embryo::growth::{GrowArgs, grow_experts, train_new_experts};
@@ -431,17 +587,45 @@ fn main() {
                 }
                 let shard = cortiq_embryo::train::Shard { tokens: toks };
                 let (grown, sources) = grow_experts(&ck, noise, shift, seed);
-                println!("grown: experts {} → {} in {} layers; sources per layer {:?}", ck.cfg.experts, grown.cfg.experts, grown.cfg.layers, sources);
-                let a = GrowArgs { steps, lr, batch, seq, eval_every: 30, seed };
-                let (trained, l0, l1) = train_new_experts(&grown, &shard, &a, &|| false).expect("train");
+                println!(
+                    "grown: experts {} → {} in {} layers; sources per layer {:?}",
+                    ck.cfg.experts, grown.cfg.experts, grown.cfg.layers, sources
+                );
+                let a = GrowArgs {
+                    steps,
+                    lr,
+                    batch,
+                    seq,
+                    eval_every: 30,
+                    seed,
+                };
+                let (trained, l0, l1) =
+                    train_new_experts(&grown, &shard, &a, &|| false).expect("train");
                 let imp = (l0 - l1) / l0.max(1e-6);
-                println!("held-out: before {l0:.4} (ppl {:.1}) → after {l1:.4} (ppl {:.1}), improvement {imp:.4} vs gate {gate}", l0.exp(), l1.exp());
+                println!(
+                    "held-out: before {l0:.4} (ppl {:.1}) → after {l1:.4} (ppl {:.1}), improvement {imp:.4} vs gate {gate}",
+                    l0.exp(),
+                    l1.exp()
+                );
                 if imp < gate {
                     println!("growth REJECTED (gate) — nothing written");
                     std::process::exit(2);
                 }
-                let d: Vec<(&str, &[f32])> = trained.extras.iter().map(|(n, x)| (n.as_str(), x.as_slice())).collect();
-                cortiq_embryo::train::save_checkpoint(&out_ckpt, &trained.cfg, trained.step, &trained.params, None, None, &d).expect("save");
+                let d: Vec<(&str, &[f32])> = trained
+                    .extras
+                    .iter()
+                    .map(|(n, x)| (n.as_str(), x.as_slice()))
+                    .collect();
+                cortiq_embryo::train::save_checkpoint(
+                    &out_ckpt,
+                    &trained.cfg,
+                    trained.step,
+                    &trained.params,
+                    None,
+                    None,
+                    &d,
+                )
+                .expect("save");
                 println!("grown genome saved → {}", out_ckpt.display());
                 if let Some(e) = export {
                     let tj = std::fs::read(&tokenizer).expect("read tokenizer.json");
@@ -451,12 +635,27 @@ fn main() {
             }
             #[cfg(not(target_os = "macos"))]
             {
-                let _ = (ckpt, tokenizer, corpus, out_ckpt, export, steps, lr, batch, seq, gate, noise, shift, seed);
+                let _ = (
+                    ckpt, tokenizer, corpus, out_ckpt, export, steps, lr, batch, seq, gate, noise,
+                    shift, seed,
+                );
                 eprintln!("needs Metal (macOS)");
                 std::process::exit(1);
             }
         }
-        Sub::MtpTrain { ckpt, tokenizer, corpus, base, out, heads, steps, lr, batch, seq, seed } => {
+        Sub::MtpTrain {
+            ckpt,
+            tokenizer,
+            corpus,
+            base,
+            out,
+            heads,
+            steps,
+            lr,
+            batch,
+            seq,
+            seed,
+        } => {
             #[cfg(target_os = "macos")]
             {
                 let ck = cortiq_embryo::train::load_checkpoint(&ckpt).expect("load checkpoint");
@@ -474,17 +673,31 @@ fn main() {
                     .expect("read corpus");
                 }
                 let shard = cortiq_embryo::train::Shard { tokens: toks };
-                let (_gpu, st, held) = cortiq_embryo::mtp::train_mtp(&ck, &shard, heads, steps, lr, batch, seq, seed).expect("mtp");
-                println!("mtp heads trained: held-out losses {:?} (ppl {:?})", held, held.iter().map(|l| format!("{:.1}", l.exp())).collect::<Vec<_>>());
+                let (_gpu, st, held) =
+                    cortiq_embryo::mtp::train_mtp(&ck, &shard, heads, steps, lr, batch, seq, seed)
+                        .expect("mtp");
+                println!(
+                    "mtp heads trained: held-out losses {:?} (ppl {:?})",
+                    held,
+                    held.iter()
+                        .map(|l| format!("{:.1}", l.exp()))
+                        .collect::<Vec<_>>()
+                );
                 let out_path = out.unwrap_or_else(|| base.clone());
                 let tmp = out_path.with_extension("cmf.tmp");
                 let kept = cortiq_embryo::mtp::append_to_cmf(&base, &tmp, &st).expect("append");
                 std::fs::rename(&tmp, &out_path).expect("rename");
-                println!("{} MTP tensors appended → {} ({kept} base tensors byte-identical)", 2 * heads, out_path.display());
+                println!(
+                    "{} MTP tensors appended → {} ({kept} base tensors byte-identical)",
+                    2 * heads,
+                    out_path.display()
+                );
             }
             #[cfg(not(target_os = "macos"))]
             {
-                let _ = (ckpt, tokenizer, corpus, base, out, heads, steps, lr, batch, seq, seed);
+                let _ = (
+                    ckpt, tokenizer, corpus, base, out, heads, steps, lr, batch, seq, seed,
+                );
                 eprintln!("needs Metal (macOS)");
                 std::process::exit(1);
             }
@@ -499,7 +712,10 @@ fn main() {
                     eprintln!("no Metal device");
                     std::process::exit(1);
                 };
-                println!("{:<44} {:>6} {:>6} {:>6} {:>9} {:>8} {:>10}", "shape", "M", "N", "K", "gpu ms", "TFLOPS", "max|err|");
+                println!(
+                    "{:<44} {:>6} {:>6} {:>6} {:>9} {:>8} {:>10}",
+                    "shape", "M", "N", "K", "gpu ms", "TFLOPS", "max|err|"
+                );
                 for r in &rows {
                     println!(
                         "{:<44} {:>6} {:>6} {:>6} {:>9.3} {:>8.2} {:>10.2e}",
@@ -514,7 +730,12 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Sub::StepBench { batch, seq, steps, tiny } => {
+        Sub::StepBench {
+            batch,
+            seq,
+            steps,
+            tiny,
+        } => {
             #[cfg(target_os = "macos")]
             cortiq_embryo::cli::step_bench(batch, seq, steps, tiny);
             #[cfg(not(target_os = "macos"))]
@@ -524,14 +745,87 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Sub::Birth { shard, val, out, resume, batch, seq, steps, warmup, lr, wd, clip, eval_every, save_every, pca_every, tiny, vocab, anchor_every, conv_k, cfg_json, init_from, distill_from, distill_w, freeze_donor, seed } => {
+        Sub::Birth {
+            shard,
+            val,
+            out,
+            resume,
+            batch,
+            seq,
+            steps,
+            warmup,
+            lr,
+            wd,
+            clip,
+            eval_every,
+            save_every,
+            pca_every,
+            tiny,
+            vocab,
+            anchor_every,
+            conv_k,
+            cfg_json,
+            init_from,
+            distill_from,
+            distill_w,
+            freeze_donor,
+            seed,
+        } => {
             #[cfg(target_os = "macos")]
             cortiq_embryo::cli::birth(cortiq_embryo::cli::BirthArgs {
-                shard, val, out, resume, batch, seq, steps, warmup, lr, wd, clip, eval_every, save_every, pca_every, tiny, vocab, anchor_every, conv_k, cfg_json, init_from, distill_from, distill_w, freeze_donor, seed,
+                shard,
+                val,
+                out,
+                resume,
+                batch,
+                seq,
+                steps,
+                warmup,
+                lr,
+                wd,
+                clip,
+                eval_every,
+                save_every,
+                pca_every,
+                tiny,
+                vocab,
+                anchor_every,
+                conv_k,
+                cfg_json,
+                init_from,
+                distill_from,
+                distill_w,
+                freeze_donor,
+                seed,
             });
             #[cfg(not(target_os = "macos"))]
             {
-                let _ = (shard, val, out, resume, batch, seq, steps, warmup, lr, wd, clip, eval_every, save_every, pca_every, tiny, vocab, anchor_every, conv_k, cfg_json, init_from, distill_from, distill_w, freeze_donor, seed);
+                let _ = (
+                    shard,
+                    val,
+                    out,
+                    resume,
+                    batch,
+                    seq,
+                    steps,
+                    warmup,
+                    lr,
+                    wd,
+                    clip,
+                    eval_every,
+                    save_every,
+                    pca_every,
+                    tiny,
+                    vocab,
+                    anchor_every,
+                    conv_k,
+                    cfg_json,
+                    init_from,
+                    distill_from,
+                    distill_w,
+                    freeze_donor,
+                    seed,
+                );
                 eprintln!("needs Metal (macOS)");
                 std::process::exit(1);
             }

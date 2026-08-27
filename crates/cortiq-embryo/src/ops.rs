@@ -29,7 +29,11 @@ pub fn gemm_ref(
                 s += av * bv;
             }
             let idx = i * ldc + j;
-            let prev = if beta != 0.0 { beta as f64 * c[idx] as f64 } else { 0.0 };
+            let prev = if beta != 0.0 {
+                beta as f64 * c[idx] as f64
+            } else {
+                0.0
+            };
             c[idx] = (alpha as f64 * s + prev) as f32;
         }
     }
@@ -91,7 +95,11 @@ pub fn hk_decay_grid(nh: usize, nph: usize, h_min: f64, h_max: f64) -> Vec<f32> 
     let mut d = vec![0.0f32; nh * 2 * nph];
     for h in 0..nh {
         for i in 0..nph {
-            let frac = if nph > 1 { i as f64 / (nph - 1) as f64 } else { 0.0 };
+            let frac = if nph > 1 {
+                i as f64 / (nph - 1) as f64
+            } else {
+                0.0
+            };
             let horizon = h_min * (h_max / h_min).powf(frac);
             let g = (-1.0 / horizon).exp() as f32;
             d[h * 2 * nph + i] = g;
@@ -103,11 +111,22 @@ pub fn hk_decay_grid(nh: usize, nph: usize, h_min: f64, h_max: f64) -> Vec<f32> 
 
 #[inline]
 fn phi(theta: &[f64], nph: usize, f: usize) -> f64 {
-    if f < nph { theta[f].cos() } else { theta[f - nph].sin() }
+    if f < nph {
+        theta[f].cos()
+    } else {
+        theta[f - nph].sin()
+    }
 }
 
 /// Reference forward by the literal recurrence (f64). Returns o.
-pub fn hk_ref_fwd(d: &HkDims, thq: &[f64], thk: &[f64], v: &[f64], kappa: &[f64], decay: &[f64]) -> Vec<f64> {
+pub fn hk_ref_fwd(
+    d: &HkDims,
+    thq: &[f64],
+    thk: &[f64],
+    v: &[f64],
+    kappa: &[f64],
+    decay: &[f64],
+) -> Vec<f64> {
     let (p2, nph, dv, nh, t_len) = (d.p2(), d.nph, d.dv, d.nh, d.t);
     let mut o = vec![0.0f64; d.b * t_len * nh * dv];
     for b in 0..d.b {
@@ -174,7 +193,9 @@ pub fn hk_ref_bwd(
                 for s in 0..=t {
                     let mut acc = 0.0;
                     for f in 0..p2 {
-                        acc += fq[t * p2 + f] * fk[s * p2 + f] * decay[h * p2 + f].powi((t - s) as i32);
+                        acc += fq[t * p2 + f]
+                            * fk[s * p2 + f]
+                            * decay[h * p2 + f].powi((t - s) as i32);
                     }
                     a[t * t_len + s] = acc;
                     let mut dacc = 0.0;
@@ -219,8 +240,10 @@ pub fn hk_ref_bwd(
                 for i in 0..nph {
                     let tq = thq[idx_th(t) + i];
                     let tk = thk[idx_th(t) + i];
-                    dthq[idx_th(t) + i] += -tq.sin() * dfq[t * p2 + i] + tq.cos() * dfq[t * p2 + nph + i];
-                    dthk[idx_th(t) + i] += -tk.sin() * dfk[t * p2 + i] + tk.cos() * dfk[t * p2 + nph + i];
+                    dthq[idx_th(t) + i] +=
+                        -tq.sin() * dfq[t * p2 + i] + tq.cos() * dfq[t * p2 + nph + i];
+                    dthk[idx_th(t) + i] +=
+                        -tk.sin() * dfk[t * p2 + i] + tk.cos() * dfk[t * p2 + nph + i];
                 }
             }
         }
@@ -231,7 +254,15 @@ pub fn hk_ref_bwd(
 /// Reference gradient w.r.t. the per-(head, feature) decays γ (closed form,
 /// f64): dγ_f = Σ_{t>s} dA[t,s]·φq_t[f]·φk_s[f]·(t−s)·γ_f^{t−s−1}.
 /// Returns [nh·p2].
-pub fn hk_ref_dgamma(d: &HkDims, thq: &[f64], thk: &[f64], v: &[f64], kappa: &[f64], decay: &[f64], dout: &[f64]) -> Vec<f64> {
+pub fn hk_ref_dgamma(
+    d: &HkDims,
+    thq: &[f64],
+    thk: &[f64],
+    v: &[f64],
+    kappa: &[f64],
+    decay: &[f64],
+    dout: &[f64],
+) -> Vec<f64> {
     let (p2, nph, dv, nh, t_len) = (d.p2(), d.nph, d.dv, d.nh, d.t);
     let mut dg = vec![0.0f64; nh * p2];
     for b in 0..d.b {
@@ -256,7 +287,11 @@ pub fn hk_ref_dgamma(d: &HkDims, thq: &[f64], thk: &[f64], v: &[f64], kappa: &[f
                     let delta = (t - s) as f64;
                     for f in 0..p2 {
                         let g = decay[h * p2 + f];
-                        dg[h * p2 + f] += da * fq[t * p2 + f] * fk[s * p2 + f] * delta * g.powi((t - s - 1) as i32);
+                        dg[h * p2 + f] += da
+                            * fq[t * p2 + f]
+                            * fk[s * p2 + f]
+                            * delta
+                            * g.powi((t - s - 1) as i32);
                     }
                 }
             }

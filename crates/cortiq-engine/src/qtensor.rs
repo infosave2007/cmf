@@ -1873,13 +1873,19 @@ impl QTensor {
     /// that silently downgrades every other one.
     pub fn device_matmat(&self, xs: &[f32], b: usize, out: &mut [f32]) -> bool {
         let (rows, cols) = (self.rows(), self.cols());
-        let Self::Mapped { model, idx, dtype, row_scale, col_field, .. } = self else {
+        let Self::Mapped {
+            model,
+            idx,
+            dtype,
+            row_scale,
+            col_field,
+            ..
+        } = self
+        else {
             return false;
         };
         match *dtype {
-            TensorDtype::Q4TiledP => {
-                crate::gpu::q4tp_matmat(model, *idx, xs, b, rows, cols, out)
-            }
+            TensorDtype::Q4TiledP => crate::gpu::q4tp_matmat(model, *idx, xs, b, rows, cols, out),
             // The two-field codec folds its column field into the
             // activation, which leaves a plain per-row int8 GEMM — the
             // same kernel `q8_row` uses, on both backends.
@@ -4755,6 +4761,49 @@ fn q2tp_outlier(chunks: &[u8], r: usize, gpr: usize, j: usize, scales: &[f32]) -
     (c as f32 - 1.5, scales[gi])
 }
 
+#[cfg(target_arch = "x86_64")]
+const Q2TP_DECODE_U32: [u32; 256] = {
+    let mut tab = [0u32; 256];
+    let mut b = 0usize;
+    while b < 256 {
+        tab[b] = ((b as u32) & 3)
+            | ((((b as u32) >> 2) & 3) << 8)
+            | ((((b as u32) >> 4) & 3) << 16)
+            | ((((b as u32) >> 6) & 3) << 24);
+        b += 1;
+    }
+    tab
+};
+
+/// Eight packed q2tp bytes against 32 signed activation bytes. `maddubs`
+/// exactly computes unsigned 2-bit code × signed i8; its pair sums cannot
+/// saturate (2 × 3 × 127 < i16::MAX), and the second madd widens to i32.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn q2tp_code_dot_avx2(ch: &[u8], x: &[i8]) -> i32 {
+    use core::arch::x86_64::*;
+    debug_assert!(ch.len() >= Q2TP_CHUNK && x.len() >= GROUP_SIZE);
+    let codes = _mm256_setr_epi32(
+        Q2TP_DECODE_U32[ch[0] as usize] as i32,
+        Q2TP_DECODE_U32[ch[1] as usize] as i32,
+        Q2TP_DECODE_U32[ch[2] as usize] as i32,
+        Q2TP_DECODE_U32[ch[3] as usize] as i32,
+        Q2TP_DECODE_U32[ch[4] as usize] as i32,
+        Q2TP_DECODE_U32[ch[5] as usize] as i32,
+        Q2TP_DECODE_U32[ch[6] as usize] as i32,
+        Q2TP_DECODE_U32[ch[7] as usize] as i32,
+    );
+    let xv = unsafe { _mm256_loadu_si256(x.as_ptr().cast()) };
+    let pair = _mm256_maddubs_epi16(codes, xv);
+    let quad = _mm256_madd_epi16(pair, _mm256_set1_epi16(1));
+    let sum128 = _mm_add_epi32(
+        _mm256_castsi256_si128(quad),
+        _mm256_extracti128_si256(quad, 1),
+    );
+    let sum64 = _mm_hadd_epi32(sum128, sum128);
+    _mm_cvtsi128_si32(_mm_hadd_epi32(sum64, sum64))
+}
+
 /// Integer dot of one q2tp row against pre-quantized activations:
 /// Σ_g s_g · (Σ c·xq − 1.5·Σ xq). The half-integer grid (c − 1.5)
 /// becomes exact integer math through the group sums — the same trick
@@ -4772,8 +4821,10 @@ fn dot_q2tp_row_i8(
 ) -> f32 {
     let mut acc = 0f32;
     let base = r * gpr * Q2TP_CHUNK;
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     let mut codes = [0i8; GROUP_SIZE];
+    #[cfg(target_arch = "x86_64")]
+    let avx2 = std::arch::is_x86_feature_detected!("avx2");
     for gi in 0..gpr {
         let ch = &chunks[base + gi * Q2TP_CHUNK..base + (gi + 1) * Q2TP_CHUNK];
         let xg = &xq[gi * GROUP_SIZE..(gi + 1) * GROUP_SIZE];
@@ -4799,7 +4850,23 @@ fn dot_q2tp_row_i8(
             acc4 = vpadalq_s16(acc4, vmull_s8(c3, x4.3));
             vaddvq_s32(acc4)
         };
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(target_arch = "x86_64")]
+        let dot: i32 = if avx2 {
+            // SAFETY: the runtime feature check gates the target-feature body;
+            // the group slices above are exactly 8 and 32 bytes long.
+            unsafe { q2tp_code_dot_avx2(ch, xg) }
+        } else {
+            ch.iter()
+                .enumerate()
+                .map(|(k, &b)| {
+                    ((b & 3) as i32) * xg[k * 4] as i32
+                        + (((b >> 2) & 3) as i32) * xg[k * 4 + 1] as i32
+                        + (((b >> 4) & 3) as i32) * xg[k * 4 + 2] as i32
+                        + (((b >> 6) & 3) as i32) * xg[k * 4 + 3] as i32
+                })
+                .sum()
+        };
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         let dot: i32 = {
             for (k, &b) in ch.iter().enumerate() {
                 codes[k * 4] = (b & 3) as i8;

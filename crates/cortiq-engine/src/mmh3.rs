@@ -516,7 +516,11 @@ impl Layout {
 
         let mut pos: Vec<[f64; 3]> = Vec::new();
         let mut segments = Vec::new();
-        segments.push(Segment { start: 0, stop: text_len, kind: Kind::Text });
+        segments.push(Segment {
+            start: 0,
+            stop: text_len,
+            kind: Kind::Text,
+        });
         for i in 0..text_len {
             pos.push([i as f64, 0.0, 0.0]);
         }
@@ -525,7 +529,10 @@ impl Layout {
         // The absolute t coordinate of latent frame k: the same running
         // sum the bidirectional layout walks, evaluated at k.
         let t_at = |k: usize| -> f64 {
-            cursor + (0..k).map(|j| FRAME_RESCALE * FRAME_PER_TOKEN[j % 5]).sum::<f64>()
+            cursor
+                + (0..k)
+                    .map(|j| FRAME_RESCALE * FRAME_PER_TOKEN[j % 5])
+                    .sum::<f64>()
         };
 
         // Audio, channel-major: for each channel, the context frames then
@@ -545,7 +552,11 @@ impl Layout {
                     pos.push([cursor + i as f64, 0.0, w]);
                 }
             }
-            segments.push(Segment { start, stop: pos.len(), kind });
+            segments.push(Segment {
+                start,
+                stop: pos.len(),
+                kind,
+            });
         }
 
         for (idxs, kind) in [(ctx_video, Kind::CtxVideo), (cur_video, Kind::Video)] {
@@ -561,7 +572,11 @@ impl Layout {
                     }
                 }
             }
-            segments.push(Segment { start, stop: pos.len(), kind });
+            segments.push(Segment {
+                start,
+                stop: pos.len(),
+                kind,
+            });
         }
 
         Self {
@@ -828,10 +843,7 @@ impl MiniMaxH3 {
     /// cannot be folded into a four-bit ladder without dequantizing the
     /// whole DiT, so the branch rides beside the base GEMM the way
     /// [`crate::ltxlora`] does it for LTX.
-    pub fn from_cmf_lora(
-        model: &Arc<CmfModel>,
-        bank: Option<&LoraBank>,
-    ) -> Result<Self, String> {
+    pub fn from_cmf_lora(model: &Arc<CmfModel>, bank: Option<&LoraBank>) -> Result<Self, String> {
         let cfg: serde_json::Value = serde_json::from_slice(
             model
                 .tensor_bytes("dit.config_json")
@@ -1310,7 +1322,9 @@ impl MiniMaxH3 {
                 });
             }
             if let (true, Proj::Q(q), Proj::Q(o)) = (fuse_out, &blk.qkv, &blk.out) {
-                if let (Some((m, i)), Some((_, oi))) = (q.mapped_device_gemm(), o.mapped_device_gemm()) {
+                if let (Some((m, i)), Some((_, oi))) =
+                    (q.mapped_device_gemm(), o.mapped_device_gemm())
+                {
                     let mut proj = vec![0f32; n * hs];
                     if crate::gpu::dit_qkv_attn_out(
                         m,
@@ -1463,7 +1477,9 @@ impl MiniMaxH3 {
             && n >= 64
         {
             if let (Proj::Q(q1), Proj::Q(q2)) = (&blk.fc1, &blk.fc2) {
-                if let (Some((m, i1)), Some((_, i2))) = (q1.mapped_device_gemm(), q2.mapped_device_gemm()) {
+                if let (Some((m, i1)), Some((_, i2))) =
+                    (q1.mapped_device_gemm(), q2.mapped_device_gemm())
+                {
                     let mut fout = vec![0f32; n * hs];
                     if crate::gpu::q4tp_ffn_packed(m, i1, i2, &xn, n, hs, self.ffn, None, &mut fout)
                     {
@@ -2067,8 +2083,26 @@ mod tests {
     #[test]
     fn streaming_positions_are_absolute() {
         let (lat_h, lat_w) = (16, 24);
-        let whole = Layout::streaming(3, &[], lat_h, lat_w, &[], &(0..9).collect::<Vec<_>>(), &[], &[]);
-        let tail = Layout::streaming(3, &[], lat_h, lat_w, &[], &(6..9).collect::<Vec<_>>(), &[], &[]);
+        let whole = Layout::streaming(
+            3,
+            &[],
+            lat_h,
+            lat_w,
+            &[],
+            &(0..9).collect::<Vec<_>>(),
+            &[],
+            &[],
+        );
+        let tail = Layout::streaming(
+            3,
+            &[],
+            lat_h,
+            lat_w,
+            &[],
+            &(6..9).collect::<Vec<_>>(),
+            &[],
+            &[],
+        );
         let rows = whole.frame_rows;
         let (ws, _) = whole.video_block();
         let (ts_, _) = tail.video_block();

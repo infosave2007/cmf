@@ -14,8 +14,8 @@
 //!
 //! With `cross` as the last argument it also prints the full task×mask
 //! PPL matrix at the first width — the specialization evidence.
-use cortiq_core::mask::{MaskPriority, TaskMask};
 use cortiq_core::CmfModel;
+use cortiq_core::mask::{MaskPriority, TaskMask};
 use cortiq_engine::{Pipeline, SamplerConfig};
 use std::sync::Arc;
 
@@ -40,10 +40,7 @@ fn load_mass(dir: &str) -> Vec<(String, Vec<Vec<f64>>)> {
             }
             rows.push(row);
         }
-        out.push((
-            p.file_stem().unwrap().to_str().unwrap().to_string(),
-            rows,
-        ));
+        out.push((p.file_stem().unwrap().to_str().unwrap().to_string(), rows));
     }
     out
 }
@@ -152,9 +149,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (nll / cnt.max(1) as f64).exp()
     };
 
-    println!("{:16} {:>9} {:>9} {:>9}  {:>7}", "task", "dense", "own", "global", "own/gl");
+    println!(
+        "{:16} {:>9} {:>9} {:>9}  {:>7}",
+        "task", "dense", "own", "global", "own/gl"
+    );
     for &w in &widths {
-        println!("── width {:.0}% ───────────────────────────────────", w * 100.0);
+        println!(
+            "── width {:.0}% ───────────────────────────────────",
+            w * 100.0
+        );
         let gmask = mask_from_mass("global", &global, w, heads);
         let (mut so, mut sg, mut sd) = (0f64, 0f64, 0f64);
         for (task, ids) in &evals {
@@ -163,10 +166,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let dense = score(&mut p, ids, None);
             let po = score(&mut p, ids, Some(&omask));
             let pg = score(&mut p, ids, Some(&gmask));
-            println!(
-                "{task:16} {dense:9.3} {po:9.3} {pg:9.3}  {:6.3}",
-                po / pg
-            );
+            println!("{task:16} {dense:9.3} {po:9.3} {pg:9.3}  {:6.3}", po / pg);
             sd += dense;
             so += po;
             sg += pg;
@@ -184,7 +184,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if cross {
         let w = widths[0];
-        println!("\ncross matrix at width {:.0}% (rows = text, cols = mask):", w * 100.0);
+        println!(
+            "\ncross matrix at width {:.0}% (rows = text, cols = mask):",
+            w * 100.0
+        );
         let masks: Vec<(String, TaskMask)> = mass
             .iter()
             .map(|(t, r)| (t.clone(), mask_from_mass(t, r, w, heads)))

@@ -66,9 +66,19 @@ fn pv_nt_matches_pv_nn_and_the_f64_reference() {
     ];
 
     let gpu = std::env::var("CMF_GPU").is_ok() && cortiq_engine::gpu::enabled_here();
-    eprintln!("device lane: {}", if gpu { "ON (CMF_GPU set, backend up)" } else { "off -- host kernels only" });
+    eprintln!(
+        "device lane: {}",
+        if gpu {
+            "ON (CMF_GPU set, backend up)"
+        } else {
+            "off -- host kernels only"
+        }
+    );
     eprintln!();
-    eprintln!("{:<38} {:>12} {:>12} {:>12}", "case", "NN vs f64", "NT vs f64", "NN vs NT");
+    eprintln!(
+        "{:<38} {:>12} {:>12} {:>12}",
+        "case", "NN vs f64", "NT vs f64", "NN vs NT"
+    );
 
     let mut bad = Vec::new();
     for (n, m, dh, name) in cases {

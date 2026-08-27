@@ -6,7 +6,12 @@ use std::collections::HashMap;
 #[test]
 fn runtime_encodes_our_tokenizer_identically() {
     let mut text = String::new();
-    for f in ["../../README.md", "../../README.ru.md", "../../docs/CMF_V2_SPEC.md", "../../docs/SKILLS.ru.md"] {
+    for f in [
+        "../../README.md",
+        "../../README.ru.md",
+        "../../docs/CMF_V2_SPEC.md",
+        "../../docs/SKILLS.ru.md",
+    ] {
         if let Ok(s) = std::fs::read_to_string(f) {
             text.push_str(&s);
             text.push('\n');
@@ -26,7 +31,8 @@ fn runtime_encodes_our_tokenizer_identically() {
     // reload ours
     let ours = Bpe::load(&path).unwrap();
     // runtime
-    let rt = cortiq_engine::tokenizer::Tokenizer::from_json(&json).expect("runtime loads our tokenizer.json");
+    let rt = cortiq_engine::tokenizer::Tokenizer::from_json(&json)
+        .expect("runtime loads our tokenizer.json");
     let samples = [
         "Hello, world! Cortiq Embryo — саморазвивающееся ядро на нашем формате.",
         "fn main() {\n    println!(\"{}\", 42);\n}\n",
@@ -46,13 +52,18 @@ fn runtime_encodes_our_tokenizer_identically() {
     for s in samples {
         ours.encode(s, &mut cache, &mut all);
     }
-    eprintln!("vocab 2048 on docs: {:.2} bytes/token", bytes as f64 / all.len() as f64);
+    eprintln!(
+        "vocab 2048 on docs: {:.2} bytes/token",
+        bytes as f64 / all.len() as f64
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn heldout_text_encodes_identically_in_the_runtime() {
-    let Ok(tok_path) = std::env::var("EMBRYO_TOK") else { return };
+    let Ok(tok_path) = std::env::var("EMBRYO_TOK") else {
+        return;
+    };
     let text = std::fs::read_to_string("/Users/oleg/embryo-data/heldout-en.txt").unwrap();
     let json = std::fs::read_to_string(&tok_path).unwrap();
     let ours = Bpe::load(std::path::Path::new(&tok_path)).unwrap();
@@ -64,8 +75,15 @@ fn heldout_text_encodes_identically_in_the_runtime() {
     eprintln!("ours {} tokens, runtime {} tokens", a.len(), b.len());
     let first_diff = a.iter().zip(&b).position(|(x, y)| x != y);
     if let Some(i) = first_diff {
-        eprintln!("first diff at {i}: ours {:?} runtime {:?}", &a[i.saturating_sub(3)..(i + 5).min(a.len())], &b[i.saturating_sub(3)..(i + 5).min(b.len())]);
-        eprintln!("ours decode: {:?}", ours.decode(&a[i.saturating_sub(3)..(i + 5).min(a.len())]));
+        eprintln!(
+            "first diff at {i}: ours {:?} runtime {:?}",
+            &a[i.saturating_sub(3)..(i + 5).min(a.len())],
+            &b[i.saturating_sub(3)..(i + 5).min(b.len())]
+        );
+        eprintln!(
+            "ours decode: {:?}",
+            ours.decode(&a[i.saturating_sub(3)..(i + 5).min(a.len())])
+        );
     }
     assert_eq!(a, b);
 }

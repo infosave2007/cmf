@@ -331,6 +331,9 @@ pub struct GdnCfg {
     pub conv_kernel: usize,
     pub hidden_size: usize,
     pub rms_eps: f64,
+    /// Qwen4-exp trains the output gate as sigmoid(z); older GDN families
+    /// use SiLU(z). This is part of the operator, not a sampling option.
+    pub output_gate_sigmoid: bool,
 }
 
 impl GdnCfg {
@@ -486,8 +489,12 @@ fn gdn_step(
             let ss: f64 = o[..dv].iter().map(|&v| (v as f64) * (v as f64)).sum();
             let inv = 1.0 / (ss / dv as f64 + cfg.rms_eps).sqrt();
             for dj in 0..dv {
-                oh[dj] =
-                    ((o[dj] as f64 * inv) * w.norm[dj] as f64 * silu(z[h * dv + dj] as f64)) as f32;
+                let gate = if cfg.output_gate_sigmoid {
+                    sigmoid(z[h * dv + dj] as f64)
+                } else {
+                    silu(z[h * dv + dj] as f64)
+                };
+                oh[dj] = ((o[dj] as f64 * inv) * w.norm[dj] as f64 * gate) as f32;
             }
         }
         crate::attention::recycle_buf(&mut kv);
@@ -627,7 +634,14 @@ pub fn gdn_forward_batch(
         let n = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
         eprintln!(
             "gdn-batch b={b}: |x0|={:.5} |qkv0|={:.5} |z0|={:.5} |a0|={:.5} |b0|={:.5} |of0|={:.5} |out0|={:.5} |state|={:.5}",
-            n(&xs[..cfg.hidden_size]), n(&qkv[..c_dim]), n(&z[..vd]), n(&a[..nv]), n(&bb[..nv]), n(&of[..vd]), n(&out[..cfg.hidden_size]), n(state)
+            n(&xs[..cfg.hidden_size]),
+            n(&qkv[..c_dim]),
+            n(&z[..vd]),
+            n(&a[..nv]),
+            n(&bb[..nv]),
+            n(&of[..vd]),
+            n(&out[..cfg.hidden_size]),
+            n(state)
         );
     }
     out
@@ -1723,6 +1737,7 @@ mod tests {
             conv_kernel: 4,
             hidden_size: 8,
             rms_eps: 1e-6,
+            output_gate_sigmoid: false,
         };
         let c_dim = cfg.conv_dim();
         let vd = cfg.num_v_heads * cfg.value_head_dim;

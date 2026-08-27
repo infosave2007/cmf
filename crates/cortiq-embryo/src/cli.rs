@@ -6,20 +6,35 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 pub fn step_bench(batch: usize, seq: usize, steps: usize, tiny: bool) {
-    let cfg = if tiny { EmbryoCfg::tiny() } else { EmbryoCfg::embryo0() };
+    let cfg = if tiny {
+        EmbryoCfg::tiny()
+    } else {
+        EmbryoCfg::embryo0()
+    };
     let lay = Layout::new(&cfg);
     let (total, active) = cfg.params();
     println!(
         "genome: {} layers, hidden {}, vocab {}; arena {:.2} M params (§3 count {:.1} M / {:.1} M active)",
-        cfg.layers, cfg.hidden, cfg.vocab, lay.total as f64 / 1e6, total as f64 / 1e6, active as f64 / 1e6
+        cfg.layers,
+        cfg.hidden,
+        cfg.vocab,
+        lay.total as f64 / 1e6,
+        total as f64 / 1e6,
+        active as f64 / 1e6
     );
     let t0 = Instant::now();
     let p = init_params(&cfg, &lay, 1);
     let mut gpu = EmbryoGpu::new(cfg.clone(), batch, seq, &p).expect("Metal");
     println!("alloc + init: {:.1} s", t0.elapsed().as_secs_f64());
     let m = batch * seq;
-    let tokens: Vec<u32> = crate::ops::lcg_vec(3, m).iter().map(|x| ((x * 0.5 + 0.5) * cfg.vocab as f32) as u32 % cfg.vocab as u32).collect();
-    let targets: Vec<u32> = crate::ops::lcg_vec(4, m).iter().map(|x| ((x * 0.5 + 0.5) * cfg.vocab as f32) as u32 % cfg.vocab as u32).collect();
+    let tokens: Vec<u32> = crate::ops::lcg_vec(3, m)
+        .iter()
+        .map(|x| ((x * 0.5 + 0.5) * cfg.vocab as f32) as u32 % cfg.vocab as u32)
+        .collect();
+    let targets: Vec<u32> = crate::ops::lcg_vec(4, m)
+        .iter()
+        .map(|x| ((x * 0.5 + 0.5) * cfg.vocab as f32) as u32 % cfg.vocab as u32)
+        .collect();
     let mut best = f64::MAX;
     for s in 0..steps {
         let t = Instant::now();
@@ -107,7 +122,11 @@ pub fn birth(a: BirthArgs) {
             (ck.cfg, ck.params, ck.step, ck.m, ck.v, ck.extras)
         }
         None => {
-            let mut cfg = if a.tiny { EmbryoCfg::tiny() } else { EmbryoCfg::embryo0() };
+            let mut cfg = if a.tiny {
+                EmbryoCfg::tiny()
+            } else {
+                EmbryoCfg::embryo0()
+            };
             if let Some(v) = a.vocab {
                 assert!(v % 64 == 0, "vocab must be a multiple of 64");
                 cfg.vocab = v;
@@ -120,7 +139,8 @@ pub fn birth(a: BirthArgs) {
             }
             if let Some(js) = &a.cfg_json {
                 let mut base = serde_json::to_value(&cfg).expect("cfg to json");
-                let over: serde_json::Value = serde_json::from_str(js).expect("--cfg-json must be a JSON object");
+                let over: serde_json::Value =
+                    serde_json::from_str(js).expect("--cfg-json must be a JSON object");
                 if let (Some(b), Some(o)) = (base.as_object_mut(), over.as_object()) {
                     for (k, v) in o {
                         b.insert(k.clone(), v.clone());
@@ -130,7 +150,14 @@ pub fn birth(a: BirthArgs) {
                 println!("cfg overrides applied: {js}");
             }
             let lay = Layout::new(&cfg);
-            (cfg.clone(), init_params(&cfg, &lay, a.seed), 0, None, None, Vec::new())
+            (
+                cfg.clone(),
+                init_params(&cfg, &lay, a.seed),
+                0,
+                None,
+                None,
+                Vec::new(),
+            )
         }
     };
     if let Some(v) = a.vocab {
@@ -142,8 +169,11 @@ pub fn birth(a: BirthArgs) {
     if let Some(ip) = &a.init_from {
         let don = load_checkpoint(ip).expect("load --init-from donor");
         let dlay = Layout::new(&don.cfg);
-        let dmap: std::collections::HashMap<&str, (usize, usize)> =
-            dlay.names.iter().map(|(n, o, l)| (n.as_str(), (*o, *l))).collect();
+        let dmap: std::collections::HashMap<&str, (usize, usize)> = dlay
+            .names
+            .iter()
+            .map(|(n, o, l)| (n.as_str(), (*o, *l)))
+            .collect();
         let (mut hit, mut miss) = (0usize, 0usize);
         for (n, o, l) in &lay.names {
             match dmap.get(n.as_str()) {
@@ -155,7 +185,10 @@ pub fn birth(a: BirthArgs) {
                 _ => miss += 1,
             }
         }
-        println!("init-from {}: {hit} tensors copied, {miss} left at init (the fresh mixers)", ip.display());
+        println!(
+            "init-from {}: {hit} tensors copied, {miss} left at init (the fresh mixers)",
+            ip.display()
+        );
         // The donor's expert descriptors travel with its expert weights —
         // fresh descriptors against copied experts skew the routing.
         if extras.is_empty() {
@@ -168,14 +201,28 @@ pub fn birth(a: BirthArgs) {
         let ck = load_checkpoint(tp).expect("load --distill-from teacher");
         assert_eq!(ck.cfg.hidden, cfg.hidden, "teacher hidden must match");
         assert_eq!(ck.cfg.vocab, cfg.vocab, "teacher vocab must match");
-        let mut t = EmbryoGpu::new(ck.cfg.clone(), a.batch, a.seq, &ck.params).expect("Metal (teacher)");
+        let mut t =
+            EmbryoGpu::new(ck.cfg.clone(), a.batch, a.seq, &ck.params).expect("Metal (teacher)");
         t.set_desc(&ck.extras);
-        println!("distill-from {} (step {}), w = {}", tp.display(), ck.step, a.distill_w);
+        println!(
+            "distill-from {} (step {}), w = {}",
+            tp.display(),
+            ck.step,
+            a.distill_w
+        );
         t
     });
     println!(
         "genome: {} layers, hidden {}, vocab {}, arena {:.2} M; train {} tok, val {} tok; B={} T={} steps={}",
-        cfg.layers, cfg.hidden, cfg.vocab, lay.total as f64 / 1e6, train.total_tokens(), val.tokens.len(), a.batch, a.seq, a.steps
+        cfg.layers,
+        cfg.hidden,
+        cfg.vocab,
+        lay.total as f64 / 1e6,
+        train.total_tokens(),
+        val.tokens.len(),
+        a.batch,
+        a.seq,
+        a.steps
     );
     let mut gpu = EmbryoGpu::new(cfg.clone(), a.batch, a.seq, &params).expect("Metal");
     if let (Some(m), Some(v)) = (m0, v0) {
@@ -186,7 +233,11 @@ pub fn birth(a: BirthArgs) {
     gpu.step = step0;
     if a.freeze_donor > 0 && !donated.is_empty() {
         gpu.freeze = donated.clone();
-        println!("freeze-donor: {} tensors held for the first {} steps", donated.len(), a.freeze_donor);
+        println!(
+            "freeze-donor: {} tensors held for the first {} steps",
+            donated.len(),
+            a.freeze_donor
+        );
     }
     let mut sampler = Sampler::new(a.batch, a.seq, a.seed.wrapping_add(step0 as u64));
     let (mut tokens, mut targets) = (Vec::new(), Vec::new());
@@ -225,12 +276,20 @@ pub fn birth(a: BirthArgs) {
             }
         };
         let ms = t.elapsed().as_secs_f64() * 1e3;
-        ema = if step == step0 as usize { loss } else { 0.98 * ema + 0.02 * loss };
+        ema = if step == step0 as usize {
+            loss
+        } else {
+            0.98 * ema + 0.02 * loss
+        };
         if a.pca_every > 0 && (step + 1) % a.pca_every == 0 {
             gpu.update_subspaces(&mut cov_ema, 0.9);
         }
         if step % 10 == 0 || step + 1 == a.steps {
-            let dtag = if teacher.is_some() { format!(" dist {dloss:.4}") } else { String::new() };
+            let dtag = if teacher.is_some() {
+                format!(" dist {dloss:.4}")
+            } else {
+                String::new()
+            };
             println!(
                 "step {step:>6} loss {loss:.4} (ema {ema:.4}){dtag} |g| {gnorm:.3} lr {lr:.2e} {ms:.0} ms {:.0} tok/s  [{:.1} min]",
                 m as f64 / (ms * 1e-3),
@@ -253,7 +312,15 @@ pub fn birth(a: BirthArgs) {
                     .iter()
                     .map(|c| {
                         let dropped: u32 = c.iter().map(|&n| n.saturating_sub(cap as u32)).sum();
-                        format!("{:?}{}", c, if dropped > 0 { format!("(-{dropped})") } else { String::new() })
+                        format!(
+                            "{:?}{}",
+                            c,
+                            if dropped > 0 {
+                                format!("(-{dropped})")
+                            } else {
+                                String::new()
+                            }
+                        )
                     })
                     .collect();
                 println!("  experts/layer: {}", summary.join(" "));
@@ -263,9 +330,17 @@ pub fn birth(a: BirthArgs) {
             let p = gpu.params_host();
             let d = gpu.desc_host();
             let ex: Vec<(&str, &[f32])> = d.iter().map(|(n, x)| (*n, x.as_slice())).collect();
-            save_checkpoint(&a.out, &cfg, gpu.step, &p, Some(gpu.m.as_slice()), Some(gpu.v.as_slice()), &ex).expect("save");
+            save_checkpoint(
+                &a.out,
+                &cfg,
+                gpu.step,
+                &p,
+                Some(gpu.m.as_slice()),
+                Some(gpu.v.as_slice()),
+                &ex,
+            )
+            .expect("save");
             println!("  saved {} (step {})", a.out.display(), gpu.step);
         }
     }
 }
-
