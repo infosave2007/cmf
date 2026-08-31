@@ -114,6 +114,9 @@ fails.
 - [Multi-GPU execution](docs/MULTI_GPU.md) and [mobile split](docs/MOBILE_SPLIT.ru.md).
 - [FCD restoration](docs/RUST_FCD.md) and [low-bit PTQ](docs/Q1T_PTQ.md).
 - [Model cards and conversion notes](docs/hf/README.md).
+- [Cortiq Spectra](docs/SPECTRA.ru.md) — deterministic CPU streaming colorization
+  for dual-energy X-ray captures, scanner profiles, refusal masks, and measured
+  limits (Russian).
 
 ## Build from source
 

@@ -102,6 +102,8 @@ CLI 还提供 `info`、`bench`、`ppl`、`serve`、`skill`、`moe-mask`、`moe-d
 - [多 GPU](docs/MULTI_GPU.md) 与[移动端切分](docs/MOBILE_SPLIT.ru.md)。
 - [FCD 恢复](docs/RUST_FCD.md) 与[低比特 PTQ](docs/Q1T_PTQ.md)。
 - [模型卡片和转换说明](docs/hf/README.md)。
+- [Cortiq Spectra](docs/SPECTRA.ru.md) — 双能 X 射线的确定性 CPU 流式着色、
+  扫描仪配置、拒绝掩码与测量限制（俄文）。
 
 ## 从源码构建
 
