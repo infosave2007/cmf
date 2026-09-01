@@ -5,9 +5,7 @@
 //! three-row halo and emits only mature rows. Consequently a caller may use
 //! any chunk size without changing a byte of the result.
 
-use cortiq_core::{
-    CmfHeader, CmfModel, LayerType, ModelArch, NormStyle, QuantType, TensorDtype, TensorSpec,
-};
+use cortiq_core::{CmfHeader, CmfModel, ModelArch, QuantType, TensorDtype, TensorSpec};
 use image::{
     DynamicImage, GenericImageView, ImageBuffer, ImageReader, Luma, Rgb, RgbImage, imageops,
 };
@@ -760,6 +758,70 @@ pub fn rotate_for_display(rgb: RgbImage) -> RgbImage {
     imageops::rotate90(&rgb)
 }
 
+/// Build the architecture descriptor carried by a scanner profile.
+///
+/// `ModelArch` is shared with the model converter and gains optional fields as
+/// new model families are added.  Deserializing the profile's stable schema
+/// lets this crate remain source-compatible with both older committed cores
+/// and a checkout that has newer, uncommitted optional fields.
+fn scanner_profile_arch(width: usize) -> Result<ModelArch, SpectraError> {
+    let mut value: serde_json::Value = serde_json::from_str(
+        r#"{
+            "arch_name": "cortiq-spectra-scanner-profile",
+            "hidden_size": 0,
+            "intermediate_size": 0,
+            "num_layers": 0,
+            "num_attention_heads": 0,
+            "num_kv_heads": 0,
+            "head_dim": 0,
+            "vocab_size": 0,
+            "layer_types": [],
+            "rms_norm_eps": 1e-6,
+            "norm_style": "qwen",
+            "rope_theta": 10000.0,
+            "tie_word_embeddings": false,
+            "partial_rotary_factor": 1.0,
+            "yarn": null,
+            "attention_heads_per_layer": null,
+            "hidden_act": "silu",
+            "embed_multiplier": 1.0,
+            "query_pre_attn_scalar": null,
+            "sliding_window": null,
+            "sliding_window_pattern": null,
+            "rope_local_base_freq": null,
+            "local_partial_rotary_factor": null,
+            "global_head_dim": null,
+            "num_global_kv_heads": null,
+            "global_partial_rotary_factor": null,
+            "final_logit_softcapping": null,
+            "mla": null,
+            "activation_situ_beta": null,
+            "activation_situ_linear_beta": null,
+            "attn_logit_softcapping": null,
+            "attn_v_norm": false,
+            "mtp": null,
+            "moe": null,
+            "qwen4_exp": null,
+            "linear_core": null,
+            "head_clusters": null,
+            "max_position_embeddings": 0,
+            "linear_conv_kernel_dim": null,
+            "linear_num_key_heads": null,
+            "linear_num_value_heads": null,
+            "linear_key_head_dim": null,
+            "linear_value_head_dim": null,
+            "rope_freq_factors": null,
+            "logit_multiplier": null,
+            "g3n": null,
+            "kda_gate_lower_bound": null,
+            "num_loops": 1,
+            "loop_final_norm": false
+        }"#,
+    )?;
+    value["hidden_size"] = serde_json::Value::from(width);
+    Ok(serde_json::from_value(value)?)
+}
+
 /// Store calibration as a normal, verifiable CMF container. The profile is a
 /// four-row F32 tensor and JSON provenance records its schema/parameters.
 pub fn save_profile(path: impl AsRef<Path>, calibration: &Calibration) -> Result<(), SpectraError> {
@@ -794,58 +856,7 @@ pub fn save_profile(path: impl AsRef<Path>, calibration: &Calibration) -> Result
             bytes.extend_from_slice(&(v as f32).to_le_bytes());
         }
     }
-    let arch = ModelArch {
-        arch_name: "cortiq-spectra-scanner-profile".into(),
-        hidden_size: calibration.width,
-        intermediate_size: 0,
-        num_layers: 0,
-        num_attention_heads: 0,
-        num_kv_heads: 0,
-        head_dim: 0,
-        vocab_size: 0,
-        layer_types: Vec::<LayerType>::new(),
-        rms_norm_eps: 1e-6,
-        norm_style: NormStyle::Qwen,
-        rope_theta: 10_000.0,
-        tie_word_embeddings: false,
-        partial_rotary_factor: 1.0,
-        yarn: None,
-        attention_heads_per_layer: None,
-        hidden_act: "silu".into(),
-        embed_multiplier: 1.0,
-        query_pre_attn_scalar: None,
-        sliding_window: None,
-        sliding_window_pattern: None,
-        rope_local_base_freq: None,
-        local_partial_rotary_factor: None,
-        global_head_dim: None,
-        num_global_kv_heads: None,
-        global_partial_rotary_factor: None,
-        final_logit_softcapping: None,
-        mla: None,
-        activation_situ_beta: None,
-        activation_situ_linear_beta: None,
-        attn_logit_softcapping: None,
-        attn_v_norm: false,
-        mtp: None,
-        moe: None,
-        qwen4_exp: None,
-        glm5_next: None,
-        linear_core: None,
-        head_clusters: None,
-        max_position_embeddings: 0,
-        linear_conv_kernel_dim: None,
-        linear_num_key_heads: None,
-        linear_num_value_heads: None,
-        linear_key_head_dim: None,
-        linear_value_head_dim: None,
-        rope_freq_factors: None,
-        logit_multiplier: None,
-        g3n: None,
-        kda_gate_lower_bound: None,
-        num_loops: 1,
-        loop_final_norm: false,
-    };
+    let arch = scanner_profile_arch(calibration.width)?;
     let lut_size = calibration.color_lut.as_ref().map(|lut| lut.size);
     let color_parameters = serde_json::to_value(&calibration.color_parameters)?;
     let header = CmfHeader {
@@ -1168,6 +1179,19 @@ mod tests {
         );
         let model = CmfModel::open(path).unwrap();
         assert!(model.verify().is_empty());
+    }
+
+    #[test]
+    fn scanner_profile_arch_is_portable_across_core_fields() {
+        let arch = scanner_profile_arch(11).unwrap();
+        assert_eq!(arch.arch_name, "cortiq-spectra-scanner-profile");
+        assert_eq!(arch.hidden_size, 11);
+        assert!(arch.layer_types.is_empty());
+
+        // Optional fields added by a newer local core must not leak into the
+        // stable scanner-profile descriptor or become compile-time coupling.
+        let encoded = serde_json::to_value(&arch).unwrap();
+        assert!(encoded.get("glm5_next").is_none());
     }
 
     #[test]
