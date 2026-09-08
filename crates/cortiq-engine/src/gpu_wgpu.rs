@@ -32365,18 +32365,17 @@ mod tests {
                 let mut near_k = Vec::with_capacity(gcnt);
                 let mut near_v = Vec::with_capacity(gcnt);
                 for (g, view) in views.iter().enumerate() {
-                    let post_len = if view.win_len == w { w } else { view.win_len + 1 };
+                    let post_len = if view.win_len == w {
+                        w
+                    } else {
+                        view.win_len + 1
+                    };
                     let post_head = if view.win_len == w {
                         (view.win_head + 1) % w
                     } else {
                         view.win_head
                     };
-                    empty_meta.extend_from_slice(&[
-                        post_len as u32,
-                        post_head as u32,
-                        0,
-                        0,
-                    ]);
+                    empty_meta.extend_from_slice(&[post_len as u32, post_head as u32, 0, 0]);
                     let slot = if view.win_len == w {
                         view.win_head
                     } else {
@@ -32384,10 +32383,8 @@ mod tests {
                     };
                     let mut rk = view.win_k.to_vec();
                     let mut rv = view.win_v.to_vec();
-                    rk[slot * d..(slot + 1) * d]
-                        .copy_from_slice(&k_new[g * d..(g + 1) * d]);
-                    rv[slot * dv..(slot + 1) * dv]
-                        .copy_from_slice(&v_new[g * dv..(g + 1) * dv]);
+                    rk[slot * d..(slot + 1) * d].copy_from_slice(&k_new[g * d..(g + 1) * d]);
+                    rv[slot * dv..(slot + 1) * dv].copy_from_slice(&v_new[g * dv..(g + 1) * dv]);
                     near_k.push((rk, post_len));
                     near_v.push(rv);
                 }
@@ -32441,13 +32438,7 @@ mod tests {
                     pass.dispatch_workgroups((gcnt * hpg) as u32, 1, 1);
                 }
                 flush_pass(&mut empty_enc);
-                empty_enc.copy_buffer_to_buffer(
-                    &ob,
-                    0,
-                    &stage,
-                    0,
-                    (gcnt * hpg * dv * 4) as u64,
-                );
+                empty_enc.copy_buffer_to_buffer(&ob, 0, &stage, 0, (gcnt * hpg * dv * 4) as u64);
                 submit(c, finish_enc(empty_enc));
                 let (tx, rx) = std::sync::mpsc::channel();
                 stage.map_async(wgpu::MapMode::Read, .., move |r| tx.send(r).unwrap());

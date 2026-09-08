@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.6] - 2026-09-08
+
+### Added
+- Qwen3.8-27B Q4TP's opt-in `--o1` path now keeps an exact prefill and
+  lead-in through the skeleton-safe boundary (`window + sink + 8 + 1`), then
+  switches to bounded Nyström state. Sequential, batched, pair and split
+  handoffs are covered, and a failed transition terminates the request until
+  the normal reset boundary.
+
+### Changed
+- The Vulkan/wgpu O(1) landmark inverse readout computes independent output
+  columns in parallel while preserving the existing per-column arithmetic and
+  CPU/GPU parity. The default profile remains `m=32`, `window=128`, `sink=4`;
+  `window=2048` remains experimental.
+- In a matched six-run Qwen3.8-27B Q4TP screen on one RTX PRO 4000 Blackwell
+  Vulkan setup (`ctx=8192`, 128 output tokens), TTFT median moved from
+  73.8218 s to 68.3111 s (−7.46%) and steady decode from 25.7715 to
+  26.1725 tok/s (+1.56%). Each run produced 128 tokens with 127 full-graph
+  and 0 graph-miss tokens, 16 O(1) device layers, and 46,236,672 bytes of
+  O(1) device state; this is a single-model, single-hardware result.
+
+### Known limitations
+- O(1) remains an opt-in approximation with an exact near window; it does not
+  claim universal speed, exact unbounded-context recall, or a quality gain.
+  `convert --o1` changes runtime attention behavior without native training.
+- The corrected activation-tape replay is an opt-in test via
+  `CMF_O1_REPLAY_TAPE`; no activation tape is bundled in the source or
+  packages.
+
 ## [0.6.5] - 2026-09-08
 
 ### Changed
@@ -5481,7 +5510,8 @@ Initial public release.
 - **Licensing** — Apache-2.0 with an explicit patent-grant explanation
   (`LICENSE`, `NOTICE`, `PATENTS.md`).
 
-[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.5.62...HEAD
+[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.6.6...HEAD
+[0.6.6]: https://github.com/infosave2007/cmf/compare/v0.6.5...v0.6.6
 [0.5.62]: https://github.com/infosave2007/cmf/compare/v0.5.61...v0.5.62
 [0.5.61]: https://github.com/infosave2007/cmf/compare/v0.5.60...v0.5.61
 [0.5.60]: https://github.com/infosave2007/cmf/compare/v0.5.59...v0.5.60
