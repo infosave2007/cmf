@@ -109,6 +109,16 @@ const DEN_EPS: f32 = 1e-30;
 /// tiny prefills duplicate segment-mean landmarks (singular Au).
 const EXACT_SLACK: usize = 8;
 
+/// First prompt length that is safe to convert to the streaming skeleton.
+/// Keep this arithmetic checked: the value is also the deferred boundary
+/// stored by the exact KV collector, and a wrapped boundary would turn a
+/// malformed configuration into an immediate or never-ending transition.
+pub(crate) fn o1_deferred_boundary(w: usize, sink: usize) -> Option<usize> {
+    w.checked_add(sink)?
+        .checked_add(EXACT_SLACK)?
+        .checked_add(1)
+}
+
 /// Patent-17 claim 1 probe (`CMF_O1_FARONLY=1`): drop the window from
 /// the READOUT — sinks + far field only — while the ring keeps its
 /// staging role (delayed insertion is untouched). In a GDN hybrid the
@@ -684,7 +694,13 @@ impl NystromGroup {
         self.win_len = 0;
         self.win_head = 0;
         self.sink_len = 0;
-        self.exact_only = t <= self.w + self.sink + EXACT_SLACK;
+        // A runtime seal is only admitted at the first bounded boundary
+        // (w + sink + slack + 1), so a converted prompt never enters the
+        // exact-only state. Direct Nystrom users retain the historical
+        // exact-only behavior for short prefills.
+        self.exact_only = o1_deferred_boundary(self.w, self.sink)
+            .map(|boundary| t < boundary)
+            .unwrap_or(true);
         if self.exact_only {
             // The end of a three-hop silence: exact-only seals are not
             // portable to the graph (o1_views -> None), which read as

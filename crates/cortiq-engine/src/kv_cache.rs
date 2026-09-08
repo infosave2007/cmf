@@ -65,6 +65,10 @@ pub enum O1State {
         w: usize,
         sink: usize,
         rect: crate::nystrom::O1Rect,
+        /// Optional completed-row barrier. `None` means the caller will
+        /// request a full-prompt seal; `Some(B)` keeps a short prompt exact
+        /// until the first skeleton-safe boundary B.
+        seal_at: Option<usize>,
         /// Rotated post-norm queries, `[pos × num_heads × head_dim]`.
         q_buf: Vec<f32>,
     },
@@ -107,6 +111,13 @@ pub struct LayerKvCache {
     pub linear_scratch: Vec<f32>,
     /// O(1) Nyström override (None = plain cache attention).
     pub o1: Option<O1State>,
+    /// A deferred seal failure is terminal for the current request. The
+    /// attention functions return only a hidden vector, so the pipeline
+    /// consumes this side channel at its next forward boundary.
+    o1_error: Option<String>,
+    /// Set when a collecting state actually becomes sealed. Pipeline owns
+    /// the epoch bump and consumes this bit after a complete forward.
+    o1_transitioned: bool,
 }
 
 impl LayerKvCache {
@@ -128,6 +139,8 @@ impl LayerKvCache {
             linear_state: Vec::new(),
             linear_scratch: Vec::new(),
             o1: None,
+            o1_error: None,
+            o1_transitioned: false,
         }
     }
 
@@ -144,13 +157,30 @@ impl LayerKvCache {
 
     /// Arm query collection for a fresh prompt pass (a cleared cache).
     pub fn o1_begin(&mut self, m: usize, w: usize, sink: usize, rect: crate::nystrom::O1Rect) {
+        self.o1_begin_with_boundary(m, w, sink, rect, None);
+    }
+
+    /// Arm query collection with an optional completed-row seal barrier.
+    /// The barrier is deliberately part of the existing collecting state:
+    /// no second history or scheduler is introduced for short prompts.
+    pub(crate) fn o1_begin_with_boundary(
+        &mut self,
+        m: usize,
+        w: usize,
+        sink: usize,
+        rect: crate::nystrom::O1Rect,
+        seal_at: Option<usize>,
+    ) {
         self.o1 = Some(O1State::Collecting {
             m,
             w,
             sink,
             rect,
+            seal_at,
             q_buf: Vec::new(),
         });
+        self.o1_error = None;
+        self.o1_transitioned = false;
     }
 
     /// Record one position's rotated queries (`[num_heads × head_dim]`)
@@ -167,43 +197,158 @@ impl LayerKvCache {
         matches!(self.o1, Some(O1State::Sealed { .. }))
     }
 
-    /// Freeze the prompt into per-KV-group Nyström states and drop this
-    /// layer's full KV. Returns false (layer stays exact, KV kept) when
-    /// the preconditions fail: the seal needs f32 KV rows (`CMF_KV=q8`
-    /// stores int8), every group densely stored, a full q trace, and a
-    /// GQA fan-out that actually divides.
-    pub fn o1_seal(&mut self, num_heads: usize) -> bool {
-        // Idempotent: sealing a sealed (or plain) layer must not
-        // disturb its state — check before take().
-        if !matches!(self.o1, Some(O1State::Collecting { .. })) {
-            return self.o1_sealed();
+    /// Pending completed-row barrier, if any. A plain full-prompt seal has
+    /// no barrier until the caller asks to seal.
+    pub(crate) fn o1_pending_boundary(&self) -> Option<usize> {
+        match &self.o1 {
+            Some(O1State::Collecting { seal_at, .. }) => *seal_at,
+            _ => None,
         }
+    }
+
+    /// Whether a batch of `count` exact rows would cross the deferred
+    /// boundary. This lets batched/pair callers split before row B rather
+    /// than appending exact KV past the point where conversion is required.
+    pub(crate) fn o1_boundary_crossed_by(&self, count: usize) -> bool {
+        let Some(target) = self.o1_pending_boundary() else {
+            return false;
+        };
+        target <= self.seq_len
+            || self
+                .seq_len
+                .checked_add(count)
+                .map_or(true, |next| next >= target)
+    }
+
+    pub(crate) fn take_o1_transition(&mut self) -> bool {
+        std::mem::take(&mut self.o1_transitioned)
+    }
+
+    pub(crate) fn take_o1_error(&mut self) -> Option<String> {
+        self.o1_error.take()
+    }
+
+    /// Abort a malformed deferred transition after attention has already
+    /// produced its current row. Clearing the exact storage and dropping
+    /// the overlay makes the state unrecoverable by continued decode; the
+    /// pipeline then routes through its normal graph/cancel cleanup.
+    pub(crate) fn o1_abort(&mut self, err: String) {
+        self.k.iter_mut().for_each(Vec::clear);
+        self.v.iter_mut().for_each(Vec::clear);
+        self.kq.iter_mut().for_each(Vec::clear);
+        self.ks.iter_mut().for_each(Vec::clear);
+        self.vq.iter_mut().for_each(Vec::clear);
+        self.vs.iter_mut().for_each(Vec::clear);
+        self.kcol.iter_mut().for_each(Vec::clear);
+        self.vcol.iter_mut().for_each(Vec::clear);
+        self.imp.clear();
+        self.o1 = None;
+        self.seq_len = 0;
+        self.o1_transitioned = false;
+        self.o1_error = Some(err);
+    }
+
+    /// Freeze the prompt into per-KV-group Nyström states and drop this
+    /// layer's full KV. Returns false while a short collecting layer is
+    /// below its deferred boundary; malformed prerequisites abort the
+    /// layer instead of silently resuming exact KV growth. The seal needs
+    /// f32 KV rows (`CMF_KV=q8` stores int8), every group densely stored, a
+    /// full q trace, and a GQA fan-out that actually divides.
+    pub fn o1_seal(&mut self, num_heads: usize) -> bool {
+        match self.o1_seal_checked(num_heads) {
+            Ok(sealed) => sealed,
+            Err(err) => {
+                tracing::error!("o1: seal aborted: {err}");
+                self.o1_abort(err);
+                false
+            }
+        }
+    }
+
+    /// Checked seal implementation. Validation happens while the collecting
+    /// state and full KV are still intact; only a valid completed boundary
+    /// is allowed to destructively convert them.
+    pub(crate) fn o1_seal_checked(&mut self, num_heads: usize) -> Result<bool, String> {
+        if let Some(err) = self.o1_error.clone() {
+            return Err(err);
+        }
+        // Idempotent: sealing a sealed (or plain) layer must not disturb its
+        // state, and a plain layer is not an O(1) participant.
+        if !matches!(self.o1, Some(O1State::Collecting { .. })) {
+            return Ok(self.o1_sealed());
+        }
+        let (m, w, sink, requested_boundary, q_len) = match &self.o1 {
+            Some(O1State::Collecting {
+                m,
+                w,
+                sink,
+                rect: _,
+                seal_at,
+                q_buf,
+            }) => (*m, *w, *sink, *seal_at, q_buf.len()),
+            _ => unreachable!("checked above"),
+        };
+        let floor = crate::nystrom::o1_deferred_boundary(w, sink)
+            .ok_or_else(|| "o1 seal: w + sink + slack + 1 overflow".to_string())?;
+        let target = requested_boundary.unwrap_or(floor).max(floor);
+        let t = self.seq_len;
+        if t < target {
+            if let Some(O1State::Collecting { seal_at, .. }) = &mut self.o1 {
+                if *seal_at != Some(target) {
+                    *seal_at = Some(target);
+                    tracing::info!(
+                        "o1 deferred seal: current rows={t}, boundary={target} (floor={floor})"
+                    );
+                }
+            }
+            return Ok(false);
+        }
+
+        let hd = self.head_dim;
+        if t == 0 {
+            return Err("o1 seal: cannot seal an empty layer".into());
+        }
+        if self.mode != KvMode::F32 {
+            return Err("o1 seal: requires dense F32 KV storage".into());
+        }
+        if self.num_kv_heads == 0 || num_heads == 0 || num_heads % self.num_kv_heads != 0 {
+            return Err(format!(
+                "o1 seal: invalid GQA geometry num_heads={num_heads} num_kv_heads={}",
+                self.num_kv_heads
+            ));
+        }
+        let hpk = num_heads / self.num_kv_heads;
+        let expected_k = t
+            .checked_mul(hd)
+            .ok_or_else(|| "o1 seal: KV row length overflow".to_string())?;
+        let expected_q = expected_k
+            .checked_mul(num_heads)
+            .ok_or_else(|| "o1 seal: query trace length overflow".to_string())?;
+        if q_len != expected_q {
+            return Err(format!(
+                "o1 seal: query trace has {q_len} values, expected {expected_q}"
+            ));
+        }
+        if (0..self.num_kv_heads)
+            .any(|g| self.k[g].len() != expected_k || self.v[g].len() != expected_k)
+        {
+            return Err("o1 seal: KV heads are not densely populated".into());
+        }
+        if m < 4 || w == 0 {
+            return Err(format!("o1 seal: invalid geometry m={m} w={w}"));
+        }
+
         let Some(O1State::Collecting {
             m,
             w,
             sink,
             rect,
             q_buf,
+            ..
         }) = self.o1.take()
         else {
-            unreachable!("checked above");
+            unreachable!("collecting state disappeared after validation");
         };
-        let (hd, t) = (self.head_dim, self.seq_len);
-        let nkv = self.num_kv_heads.max(1);
-        let hpk = num_heads / nkv;
-        let ok = t > 0
-            && self.mode == KvMode::F32
-            && q_buf.len() == t * num_heads * hd
-            && hpk * nkv == num_heads
-            && (0..self.num_kv_heads).all(|g| self.head_len(g) == t);
-        if !ok {
-            tracing::warn!(
-                "o1: cannot seal (needs f32 KV mode, dense heads, full query \
-                 trace, num_heads divisible by num_kv_heads) — layer keeps \
-                 exact attention"
-            );
-            return false;
-        }
         let mut groups = Vec::with_capacity(self.num_kv_heads);
         // Query trace is position-major; the state wants each head's
         // queries contiguous, so transpose one group at a time.
@@ -232,7 +377,8 @@ impl LayerKvCache {
         }
         self.imp = Vec::new();
         self.o1 = Some(O1State::Sealed { groups });
-        true
+        self.o1_transitioned = true;
+        Ok(true)
     }
 
     /// One decode step on a sealed layer: per KV group, insert the
@@ -364,6 +510,12 @@ impl LayerKvCache {
     /// `[num_kv_heads × head_dim]`; heads with `alive[h] == false` are
     /// skipped (their slices stay empty).
     pub fn append(&mut self, k_new: &[f32], v_new: &[f32], alive: &[bool]) {
+        // A failed bounded transition is terminal until the sequence is
+        // cleared. Do not let an ignored boolean/result resume plain KV
+        // growth after the O(1) collector has aborted.
+        if self.o1_error.is_some() {
+            return;
+        }
         debug_assert_eq!(k_new.len(), self.num_kv_heads * self.head_dim);
         debug_assert_eq!(v_new.len(), self.num_kv_heads * self.head_dim);
         // Freeze the 2f field AT THE START of append: only rows that
@@ -942,6 +1094,8 @@ impl LayerKvCache {
         // Fresh conversation → the pipeline re-arms collection if the
         // layer is o1-flagged (landmarks are per-prompt, never reused).
         self.o1 = None;
+        self.o1_error = None;
+        self.o1_transitioned = false;
         self.seq_len = 0;
     }
 
@@ -1089,6 +1243,8 @@ impl LayerKvCache {
         self.vcol = vec![Vec::new(); heads];
         self.imp = imp;
         self.o1 = None;
+        self.o1_error = None;
+        self.o1_transitioned = false;
         self.seq_len = seq_len;
         Ok(())
     }
@@ -1516,7 +1672,10 @@ mod tests {
                         *dst += p;
                     }
                 }
-                assert_eq!(imp, imp_ref, "mode {mode:?} g{g}: attention mass must match");
+                assert_eq!(
+                    imp, imp_ref,
+                    "mode {mode:?} g{g}: attention mass must match"
+                );
             }
         }
     }
