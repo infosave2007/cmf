@@ -95,8 +95,9 @@ pub fn run_quantize_gptq(
         .unwrap_or(false);
     let need_full_h = !is_ternary && lambda < 1e5;
     cortiq_engine::gptq_capture::begin(need_full_h);
-    let _ = pipe.ppl_ids(&ids);
+    let score = pipe.ppl_ids(&ids);
     let hess = cortiq_engine::gptq_capture::end();
+    score.map_err(|e| anyhow::anyhow!(e))?;
     eprintln!("captured input Hessians for {} linears", hess.len());
     drop(pipe);
 

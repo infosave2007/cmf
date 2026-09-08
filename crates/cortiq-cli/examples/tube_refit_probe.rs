@@ -34,7 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if done >= ntok || chunk.len() < 8 {
                 break;
             }
-            let _ = p.nll_ids_masked(chunk, 0, None);
+            p.nll_ids_masked(chunk, 0, None)?;
             done += chunk.len();
             // One corpus file means the print below fires once, at the end,
             // and a pass that takes an hour looks identical to a hung one.

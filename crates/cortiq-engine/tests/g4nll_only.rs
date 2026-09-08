@@ -16,7 +16,7 @@ fn g4_nll_only() {
     let mut ids = prompt_ids.clone();
     ids.extend(pl.tokenizer.encode(answer));
     let start = prompt_ids.len();
-    let (nll, cnt) = pl.nll_ids_from(&ids, start);
+    let (nll, cnt) = pl.nll_ids_from(&ids, start).expect("NLL scoring");
     eprintln!(
         "chat-answer ppl = {:.3} over {} tokens (prompt {} ids)",
         (nll / cnt.max(1) as f64).exp(),
