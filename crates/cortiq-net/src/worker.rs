@@ -364,7 +364,9 @@ fn serve_one(
             }
             Msg::Control(Frame::Reset) => {
                 p.reset_session();
-                p.o1_begin();
+                if mask.is_none() {
+                    p.o1_begin();
+                }
                 last_prefill.clear();
                 hist.clear();
                 send_control(&mut stream, &mut out, &Frame::Ack { err: String::new() })?;
@@ -456,7 +458,9 @@ fn serve_one(
                 }
                 // Prompt absorbed on our span — freeze the o1 skeletons
                 // exactly where the local path would (post-prefill).
-                p.o1_seal();
+                if let Err(e) = p.o1_seal_checked() {
+                    return fatal(&mut stream, &mut out, e);
+                }
                 if head {
                     // The first token of the generation is sampled here,
                     // from the last prefill position — the coordinator

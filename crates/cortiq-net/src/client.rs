@@ -402,7 +402,9 @@ pub fn generate_split(
     };
     if reuse_from == 0 {
         p.reset_session();
-        p.o1_begin();
+        if task_mask.is_none() {
+            p.o1_begin();
+        }
         remote.reset()?;
     }
     remote.net_s = 0.0;
@@ -438,7 +440,7 @@ pub fn generate_split(
     }
     // Prompt absorbed on the local span — freeze o1 skeletons exactly
     // where the local path would; the worker seals at Sync.
-    p.o1_seal();
+    p.o1_seal_checked()?;
     // Head mode samples on the worker, so it needs the prompt ids its
     // repetition penalty reads BEFORE the barrier that samples token one.
     let first_token = if remote.head {
