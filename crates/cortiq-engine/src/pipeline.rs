@@ -879,6 +879,70 @@ impl Pipeline {
         crate::gpu::graph_kv_reset(self.mtp_kv_id());
     }
 
+    /// Finish a generation lifecycle after the MTP/router owners were
+    /// detached.  Every terminal path must put those owners back before the
+    /// pooled pipeline can serve another request.  Graph side channels and
+    /// device mirrors are cleared on errors and cancellations; a successful
+    /// generation keeps its decode-ready host cache for KV reuse.
+    fn finish_generation(
+        &mut self,
+        mtp: &mut Option<MtpModule>,
+        router: &mut Option<crate::swarm::DynRouter>,
+        clear_sequence: bool,
+    ) {
+        // A dynamic route may have switched the overlay before the terminal
+        // path. Restore the backbone while the detached router is still
+        // available, because set_active_skill also owns the overlay reset.
+        if router.is_some() {
+            let _ = self.set_active_skill(None);
+        }
+        if clear_sequence {
+            self.clear_sequence_state();
+            if let Some(m) = mtp.as_mut() {
+                // The MTP owner is detached while generation runs, so the
+                // trunk reset above cannot clear its host cache.  Drop its
+                // partial rows before reattaching it to the pooled pipeline;
+                // the next request must start from the same empty anchor on
+                // CPU and on the device mirror.
+                m.kv.clear();
+            }
+            if let Some(m) = self.mtp.as_mut() {
+                // A non-speculative request leaves the configured MTP owner
+                // attached.  Clear that dormant cache too when a shared
+                // generation failure/cancellation resets the sequence.
+                m.kv.clear();
+            }
+        }
+        self.graph_want_logits = false;
+        self.graph_logits = None;
+        self.graph_failed
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.cancel
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.dyn_router = router.take().or(self.dyn_router.take());
+        self.mtp = mtp.take().or(self.mtp.take());
+        self.mtp_graph_mode = None;
+        self.spec_forced = None;
+    }
+
+    /// Consume a graph failure reported by a forward that returns only a
+    /// hidden vector.  `forward_ids` is a public Result API, so it must not
+    /// turn the graph's zero hidden sentinel into a valid lm_head result.
+    fn check_forward_graph(&mut self, phase: &str, pos: usize) -> Result<(), String> {
+        if self
+            .graph_failed
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            self.cancel
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            self.clear_sequence_state();
+            self.graph_logits = None;
+            self.graph_want_logits = false;
+            return Err(format!("GPU graph failed during {phase} at position {pos}"));
+        }
+        Ok(())
+    }
+
     /// Start an NLL/PPL request with all graph side channels in a known
     /// state.  A graph failure also raises the cooperative cancel bit; it is
     /// consumed here and that graph-induced bit is cleared so an independent
@@ -2772,8 +2836,7 @@ impl Pipeline {
                                 // failed MTP warm-up therefore clears both
                                 // mirrors and exits; continuing would pair a
                                 // current trunk state with a stale MTP cache.
-                                self.clear_sequence_state();
-                                self.mtp = mtp.take();
+                                self.finish_generation(&mut mtp, &mut router, true);
                                 return Err(err.to_string());
                             }
                         }
@@ -2785,13 +2848,7 @@ impl Pipeline {
                     // state (ordinary GDN or sealed O(1)). A CPU fallback
                     // would then observe stale accumulators, so clear the
                     // request state and make the failure explicit.
-                    if mtp_batch_prefill {
-                        // MTP is detached for generation; preserve the head
-                        // when returning the terminal error so the pipeline
-                        // remains reusable after its mirrors are cleared.
-                        self.mtp = mtp.take();
-                    }
-                    self.clear_sequence_state();
+                    self.finish_generation(&mut mtp, &mut router, true);
                     return Err(if o1_batch_ready {
                         "sealed O(1) batch graph failed after admission".to_string()
                     } else {
@@ -2854,14 +2911,11 @@ impl Pipeline {
             .graph_failed
             .swap(false, std::sync::atomic::Ordering::Relaxed)
         {
-            self.cancel
-                .store(false, std::sync::atomic::Ordering::Relaxed);
             // MTP is detached for speculative generation.  Restore the
             // module before returning the terminal graph error; otherwise a
             // failed request would silently remove the head from a pooled
             // pipeline and the next request would lose its configured route.
-            self.mtp = mtp.take().or(self.mtp.take());
-            self.clear_sequence_state();
+            self.finish_generation(&mut mtp, &mut router, true);
             return Err("GPU token graph failed during prefill".to_string());
         }
         // Cancelled mid-prefill: the cache holds a partial prompt —
@@ -2873,10 +2927,7 @@ impl Pipeline {
             // A cancelled prefill can already have advanced the device
             // mirror. Drop the whole partial sequence so a pooled pipeline
             // cannot carry that state into its next request.
-            self.clear_sequence_state();
-            if let Some(m) = mtp {
-                self.mtp = Some(m);
-            }
+            self.finish_generation(&mut mtp, &mut router, true);
             return Ok(GenerateResult {
                 text: String::new(),
                 token_ids: Vec::new(),
@@ -2942,14 +2993,11 @@ impl Pipeline {
                 .graph_failed
                 .swap(false, std::sync::atomic::Ordering::Relaxed)
             {
-                self.cancel
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 // Keep the detached MTP module attached after a terminal
                 // graph error so the pipeline can be reused for a fresh
                 // sequence.  `clear_sequence_state` only clears mirrors and
                 // host KV; it cannot recover a module dropped here.
-                self.mtp = mtp.take().or(self.mtp.take());
-                self.clear_sequence_state();
+                self.finish_generation(&mut mtp, &mut router, true);
                 return Err("GPU token graph failed during decode".to_string());
             }
             if self
@@ -2993,6 +3041,7 @@ impl Pipeline {
                     }
                     if let Err(e) = std::fs::write(&path, &bytes) {
                         eprintln!("logit dump: failed to write {path}: {e}");
+                        self.finish_generation(&mut mtp, &mut router, true);
                         return Err(format!("logit dump write failed: {e}"));
                     }
                 }
@@ -3162,10 +3211,7 @@ impl Pipeline {
                         // terminal device failure as a plain decode step;
                         // restore the head, clear both mirrors, and surface
                         // one explicit error to the caller.
-                        self.cancel
-                            .store(false, std::sync::atomic::Ordering::Relaxed);
-                        self.mtp = mtp.take();
-                        self.clear_sequence_state();
+                        self.finish_generation(&mut mtp, &mut router, true);
                         return Err("GPU MTP graph failed during speculative decode".to_string());
                     }
                     // Declined (batch graph refused): plain forward below —
@@ -3377,10 +3423,7 @@ impl Pipeline {
                                     .graph_failed
                                     .swap(false, std::sync::atomic::Ordering::Relaxed)
                                 {
-                                    self.cancel
-                                        .store(false, std::sync::atomic::Ordering::Relaxed);
-                                    self.mtp = mtp.take().or(self.mtp.take());
-                                    self.clear_sequence_state();
+                                    self.finish_generation(&mut mtp, &mut router, true);
                                     return Err(
                                         "GPU token graph failed during greedy burst".to_string()
                                     );
@@ -3427,21 +3470,19 @@ impl Pipeline {
             }
         }
 
-        self.graph_want_logits = false;
-        self.graph_logits = None;
-        // Restore backbone overlay and re-attach the router for reuse.
-        if router.is_some() {
-            let _ = self.set_active_skill(None);
-        }
-        self.dyn_router = router.or(self.dyn_router.take());
-        self.mtp = mtp.or(self.mtp.take());
+        let cancelled = finish_reason == "cancelled";
+        self.finish_generation(&mut mtp, &mut router, cancelled);
 
         let output_ids = &all_ids[input_ids.len()..];
         // Forwarded = prompt + all generated but the LAST sampled token
         // (emitted without being fed back). Exact only without MTP —
         // reuse is gated off when MTP is active.
         let forwarded = input_ids.len() + output_ids.len().saturating_sub(1);
-        self.kv_history = all_ids[..forwarded.min(all_ids.len())].to_vec();
+        if cancelled {
+            self.kv_history.clear();
+        } else {
+            self.kv_history = all_ids[..forwarded.min(all_ids.len())].to_vec();
+        }
         confidence.truncate(output_ids.len()); // guard against any overshoot
         traces.truncate(output_ids.len());
         Ok(GenerateResult {
@@ -3745,7 +3786,7 @@ impl Pipeline {
     /// replaying accepted pairs.  The next graph append then sees the same
     /// contiguous position as the CPU/Metal path without uploading stale
     /// speculative rows.
-    #[cfg(all(feature = "gpu", not(target_os = "macos")))]
+    #[cfg(feature = "gpu")]
     fn rewind_mtp_graph_mirror(&self, stored: usize) -> bool {
         self.mtp_graph_mode != Some(true)
             || crate::gpu::graph_kv_set_stored(self.mtp_kv_id(), Self::MTP_LAYER_BASE, stored)
@@ -3756,7 +3797,7 @@ impl Pipeline {
     /// restore; Full-attention mirrors need the matching logical cursor
     /// rewind so the next graph call does not reject an ahead-of-position KV
     /// cache after a partial acceptance.
-    #[cfg(all(feature = "gpu", not(target_os = "macos")))]
+    #[cfg(feature = "gpu")]
     fn rewind_trunk_graph_mirrors(&self, stored: usize) -> bool {
         let mut ok = true;
         let mut expected = false;
@@ -4506,7 +4547,7 @@ impl Pipeline {
                     final_norm: &final_norm,
                     logits_out: &mut logits,
                 }),
-            ) == crate::gpu::BatchGraphOutcome::Completed
+            )
         };
         #[cfg(not(target_os = "macos"))]
         let verify_outcome = self.try_batch_graph_wgpu(
@@ -4520,15 +4561,6 @@ impl Pipeline {
                 logits_out: &mut logits,
             }),
         );
-        #[cfg(target_os = "macos")]
-        if !verify_outcome {
-            // Metal's verify graph owns a CPU mirror and its established
-            // commit/restore path; a false result means no pending graph was
-            // admitted.  Drop the draft rows and let the exact path continue.
-            m.kv.truncate_last(k_spec);
-            return None;
-        }
-        #[cfg(not(target_os = "macos"))]
         match verify_outcome {
             crate::gpu::BatchGraphOutcome::Completed => {}
             crate::gpu::BatchGraphOutcome::Declined => {
@@ -4536,7 +4568,7 @@ impl Pipeline {
                 // rows are still device-resident, so rewind the separate
                 // mirror before the caller takes the exact one-token path.
                 m.kv.truncate_last(k_spec);
-                if !self.rewind_mtp_graph_mirror(next_pos) {
+                if !metal_native && !self.rewind_mtp_graph_mirror(next_pos) {
                     self.clear_sequence_state();
                     self.graph_failed
                         .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -4872,7 +4904,7 @@ impl Pipeline {
                     "commit-check a={a}: worst GDN state rel-max diff {worst_s:.2e} (L{worst_li}) | worst K/V row abs diff {worst_k:.4}"
                 );
             }
-        } else if a + 1 < b {
+        } else if !metal_native && a + 1 < b {
             let expected_gdn_layers = self.graph_gdn_layer_count();
             if expected_gdn_layers > 0
                 && !crate::gpu::gdn_spec_restore(self.graph_kv_id, a, next_pos, expected_gdn_layers)
@@ -4886,23 +4918,7 @@ impl Pipeline {
                 return None;
             }
         }
-        #[cfg(not(target_os = "macos"))]
-        if a + 1 < b {
-            let expected_gdn_layers = self.graph_gdn_layer_count();
-            if expected_gdn_layers > 0
-                && !crate::gpu::gdn_spec_restore(self.graph_kv_id, a, next_pos, expected_gdn_layers)
-            {
-                self.clear_sequence_state();
-                self.graph_failed
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                self.cancel
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                tracing::error!("GDN speculative restore failed after verify");
-                return None;
-            }
-        }
-        #[cfg(all(feature = "gpu", not(target_os = "macos")))]
-        if !self.rewind_trunk_graph_mirrors(next_pos + a + 1) {
+        if !metal_native && !self.rewind_trunk_graph_mirrors(next_pos + a + 1) {
             // The verify graph committed the full batch, but one of its
             // persistent Full-attention mirrors could not be re-pointed to
             // the accepted prefix.  Treat that as terminal state failure;
@@ -4937,8 +4953,10 @@ impl Pipeline {
                 m.kv.seq_len,
             );
         }
-        #[cfg(not(target_os = "macos"))]
-        if self.mtp_graph_mode == Some(true) && !self.rewind_mtp_graph_mirror(next_pos) {
+        if !metal_native
+            && self.mtp_graph_mode == Some(true)
+            && !self.rewind_mtp_graph_mirror(next_pos)
+        {
             // The graph draft was admitted, so inability to move its cursor
             // back to the real anchor is a state failure, not a capability
             // refusal.  Do not warm or continue with a stale mirror.
@@ -5382,6 +5400,7 @@ impl Pipeline {
             return Err("empty id sequence".to_string());
         }
         self.clear_sequence_state();
+        self.check_forward_graph("forward_ids setup", 0)?;
         self.o1_begin();
         let mut hidden = vec![0.0f32; self.hidden_size];
         let mut pos = 0usize;
@@ -5401,6 +5420,7 @@ impl Pipeline {
             while pos < ids.len() {
                 let end = (pos + chunk).min(ids.len());
                 let hb = self.prefill_batch_masked(&ids[pos..end], pos, task_mask);
+                self.check_forward_graph("forward_ids batched prefill", end - 1)?;
                 hidden.copy_from_slice(&hb[(end - pos - 1) * hs..]);
                 pos = end;
             }
@@ -5422,6 +5442,7 @@ impl Pipeline {
                 let e1 = self.embed_single(ids[pos]);
                 let e2 = self.embed_single(ids[pos + 1]);
                 let (_, h2) = self.forward_pair(&e1, &e2, pos);
+                self.check_forward_graph("forward_ids pair", pos + 1)?;
                 self.commit_linear_scratch();
                 hidden = h2;
                 pos += 2;
@@ -5429,6 +5450,7 @@ impl Pipeline {
         }
         while pos < ids.len() {
             hidden = self.forward_layers(&self.embed_single(ids[pos]), pos, task_mask);
+            self.check_forward_graph("forward_ids", pos)?;
             pos += 1;
         }
         // Harness contract: after forward_ids the cache is decode-ready —
@@ -7930,16 +7952,16 @@ impl Pipeline {
         positions: &[usize],
         b: usize,
         spec: Option<((usize, usize, usize), &[f32], &mut Vec<f32>)>,
-    ) -> bool {
+    ) -> crate::gpu::BatchGraphOutcome {
         let _t0 = std::time::Instant::now();
         if positions.len() != b
             || positions.windows(2).any(|w| w[1] != w[0] + 1)
             || hiddens.len() != b * self.hidden_size
         {
-            return false;
+            return crate::gpu::BatchGraphOutcome::Declined;
         }
         let Some(pending) = self.metal_rows_run(hiddens, positions[0], b, false, spec) else {
-            return false;
+            return crate::gpu::BatchGraphOutcome::Declined;
         };
         if std::env::var("CMF_GRAPH_SPEC_TIME").is_ok() {
             eprintln!(
@@ -7948,7 +7970,7 @@ impl Pipeline {
             );
         }
         self.metal_verify = Some(pending);
-        true
+        crate::gpu::BatchGraphOutcome::Completed
     }
 
     /// Batched prefill on the Metal rows graph: `ids` (≤ 512) at
@@ -12747,6 +12769,10 @@ mod tests {
             "no tokens after cancel: {:?}",
             r.token_ids
         );
+        assert_eq!(p.kv_cache.seq_len(), 0);
+        assert!(p.kv_history.is_empty());
+        assert!(!p.graph_want_logits);
+        assert!(p.graph_logits.is_none());
         // Flag auto-cleared: the next call generates normally.
         let r2 = p.generate_from_ids(&[1, 2, 3], 4, None, None).unwrap();
         assert_ne!(r2.finish_reason, "cancelled");
@@ -13300,5 +13326,41 @@ mod tests {
             .expect("unaffected pipeline remains reusable");
         assert_eq!(actual.1, expected.1);
         assert!((actual.0 - expected.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn forward_ids_failure_channel_is_terminal_and_reusable() {
+        let ids = vec![1u32, 2, 3, 4, 5, 6];
+        let mut p = create_test_pipeline(8, 16, 2, 1, 4, 1, 64);
+        p.graph_logits = Some(vec![123.0]);
+        p.graph_want_logits = true;
+        p.graph_failed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let err = p
+            .forward_ids(&ids, None)
+            .expect_err("a failed forward must not become a valid head result");
+        assert!(err.contains("forward_ids setup"));
+        assert!(p.graph_logits.is_none());
+        assert!(!p.graph_want_logits);
+        assert!(!p.graph_failed.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!p.cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(p.kv_cache.seq_len(), 0);
+
+        let expected = create_test_pipeline(8, 16, 2, 1, 4, 1, 64)
+            .forward_ids(&ids, None)
+            .expect("fresh forward_ids");
+        let actual = p
+            .forward_ids(&ids, None)
+            .expect("pipeline remains reusable after a failed forward");
+        assert_eq!(actual.len(), expected.len());
+        assert!(
+            actual
+                .iter()
+                .zip(expected)
+                .all(|(a, b)| (a - b).abs() < 1e-9)
+        );
+        assert_eq!(p.kv_cache.seq_len(), ids.len());
     }
 }
