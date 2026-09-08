@@ -16,7 +16,7 @@ fn g4_chat_answer_nll() {
     let mut ids = prompt_ids.clone();
     ids.extend(pl.tokenizer.encode(answer));
     let start = prompt_ids.len();
-    let (nll, cnt) = pl.nll_ids_from(&ids, start);
+    let (nll, cnt) = pl.nll_ids_from(&ids, start).expect("NLL scoring");
     eprintln!(
         "chat-answer ppl = {:.3} over {} tokens (prompt {} ids)",
         (nll / cnt.max(1) as f64).exp(),
@@ -34,7 +34,7 @@ fn g4_chat_answer_nll() {
     // token_ids is the GENERATED slice only (prompt excluded).
     let mut ids2 = prompt_ids.clone();
     ids2.extend(out.token_ids.iter().copied());
-    let (nll2, cnt2) = pl.nll_ids_from(&ids2, start);
+    let (nll2, cnt2) = pl.nll_ids_from(&ids2, start).expect("NLL scoring");
     eprintln!(
         "self-greedy ppl = {:.3} over {} tokens",
         (nll2 / cnt2.max(1) as f64).exp(),

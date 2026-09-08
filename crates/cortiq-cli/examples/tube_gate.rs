@@ -135,17 +135,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         evals.push((task.clone(), ids));
     }
 
-    let score = |p: &mut Pipeline, ids: &[u32], mask: Option<&TaskMask>| -> f64 {
+    let score = |p: &mut Pipeline, ids: &[u32], mask: Option<&TaskMask>| -> Result<f64, String> {
         let (mut nll, mut cnt) = (0f64, 0usize);
         for c in ids.chunks(256) {
             if c.len() < 2 {
                 break;
             }
-            let (l, k) = p.nll_ids_masked(c, 0, mask);
+            let (l, k) = p.nll_ids_masked(c, 0, mask)?;
             nll += l;
             cnt += k;
         }
-        (nll / cnt.max(1) as f64).exp()
+        Ok((nll / cnt.max(1) as f64).exp())
     };
 
     println!(
@@ -162,9 +162,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for (task, ids) in &evals {
             let own = mass.iter().find(|(t, _)| t == task).unwrap();
             let omask = mask_from_mass(task, &own.1, w, heads);
-            let dense = score(&mut p, ids, None);
-            let po = score(&mut p, ids, Some(&omask));
-            let pg = score(&mut p, ids, Some(&gmask));
+            let dense = score(&mut p, ids, None)?;
+            let po = score(&mut p, ids, Some(&omask))?;
+            let pg = score(&mut p, ids, Some(&gmask))?;
             println!("{task:16} {dense:9.3} {po:9.3} {pg:9.3}  {:6.3}", po / pg);
             sd += dense;
             so += po;
@@ -199,7 +199,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for (task, ids) in &evals {
             print!("{task:16}");
             for (_, mk) in &masks {
-                print!("{:9.3}", score(&mut p, ids, Some(mk)));
+                print!("{:9.3}", score(&mut p, ids, Some(mk))?);
             }
             println!();
         }

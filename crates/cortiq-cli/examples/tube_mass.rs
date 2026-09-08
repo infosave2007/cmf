@@ -38,7 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
             let probe = if batched {
-                p.probe_ffn_mass_batch(chunk)
+                p.probe_ffn_mass_batch(chunk)?
             } else {
                 p.probe_ffn_mass(chunk)
             };
