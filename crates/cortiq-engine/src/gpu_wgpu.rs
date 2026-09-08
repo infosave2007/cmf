@@ -32456,6 +32456,14 @@ mod tests {
                 let empty_got: Vec<f32> =
                     bytemuck::cast_slice(&stage.get_mapped_range(..).unwrap()).to_vec();
                 stage.unmap();
+                assert!(
+                    near_want.iter().all(|x| x.is_finite()),
+                    "far-empty CPU reference produced non-finite output"
+                );
+                assert!(
+                    empty_got.iter().all(|x| x.is_finite()),
+                    "far-empty GPU output produced non-finite output"
+                );
                 let md_empty = near_want
                     .iter()
                     .zip(&empty_got)
@@ -32467,6 +32475,14 @@ mod tests {
                 );
             }
             c.o1m.lock().unwrap().remove(&(u64::MAX, usize::MAX));
+            assert!(
+                want.iter().all(|x| x.is_finite()),
+                "O1 CPU reference produced non-finite output"
+            );
+            assert!(
+                got.iter().all(|x| x.is_finite()),
+                "O1 GPU output produced non-finite output"
+            );
             let md = want
                 .iter()
                 .zip(&got)
@@ -32480,6 +32496,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CMF_O1_REPLAY_TAPE retained external tape"]
     fn wgpu_o1_replay_real_tape_corrected() {
         // Actual first-Full-layer operator gate.  This is deliberately
         // separate from the old whole-tape/duplicate replay: the tape
