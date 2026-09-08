@@ -224,8 +224,13 @@ impl LayerKvCache {
         std::mem::take(&mut self.o1_transitioned)
     }
 
-    pub(crate) fn take_o1_error(&mut self) -> Option<String> {
-        self.o1_error.take()
+    pub(crate) fn take_o1_error(&self) -> Option<String> {
+        // Error observation is deliberately non-consuming.  The error is the
+        // append guard for this request; removing it would let a caller that
+        // ignored the returned Err resume ordinary KV growth after the
+        // bounded transition dropped its overlay.  `clear()` is the explicit
+        // reset boundary that clears the latch.
+        self.o1_error.clone()
     }
 
     /// Abort a malformed deferred transition after attention has already
@@ -1271,10 +1276,14 @@ impl LayerKvCache {
 
     /// Drop oldest positions, keeping the last `keep_last`.
     fn evict(&mut self, keep_last: usize) {
-        // A sealed o1 layer stores nothing per position — the Nyström
+        // A collecting o1 layer owns a still-needed exact prefix and query
+        // trace.  Evicting it would lower the effective seal boundary while
+        // leaving q_buf untouched, so conversion could never match its KV
+        // rows.  A sealed layer stores nothing per position — the Nyström
         // state IS the eviction policy; resetting seq_len here would lie
-        // about the context depth.
-        if self.o1_sealed() || self.seq_len <= keep_last {
+        // about the context depth.  Both states therefore bypass ordinary
+        // eviction until the transition or explicit reset completes.
+        if self.o1.is_some() || self.seq_len <= keep_last {
             return;
         }
         let drop = self.seq_len - keep_last;
@@ -1304,8 +1313,10 @@ impl LayerKvCache {
     /// with the positions carrying the highest accumulated attention
     /// mass (vmfcore: PPL 8.342 vs 8.687 for recency-only, full 8.295).
     fn evict_born(&mut self, keep_last: usize, sink: usize, recent: usize) {
-        if self.o1_sealed() {
-            return; // see evict(): the o1 state is its own eviction
+        if self.o1.is_some() {
+            // See evict(): collecting must retain the exact prefix as well as
+            // sealed O(1) state must retain its own bounded representation.
+            return;
         }
         let stored = self.imp.len();
         if stored <= keep_last {
@@ -1551,6 +1562,64 @@ mod tests {
         cache.evict(4);
         assert_eq!(cache.seq_len(), 4);
         assert_eq!(cache.layers[0].head_len(0), 4);
+    }
+
+    #[test]
+    fn collecting_o1_eviction_retains_exact_storage_until_boundary() {
+        const B: usize = 19;
+        let q = vec![0.1f32; 8];
+        let k = vec![0.2f32; 4];
+        let v = vec![0.3f32; 4];
+
+        for policy in [EvictionPolicy::Recent, EvictionPolicy::Born { sink: 2 }] {
+            let mut cache = KvCache::new(1, 1, 4, 6);
+            cache.policy = policy;
+            cache.layers[0].mode = KvMode::F32;
+            cache.layers[0].o1_begin_with_boundary(
+                4,
+                8,
+                2,
+                crate::nystrom::O1Rect::Aggregate,
+                Some(B),
+            );
+
+            for pos in 0..B {
+                {
+                    let layer = &mut cache.layers[0];
+                    layer.o1_push_q(&q);
+                    layer.append(&k, &v, &[]);
+                }
+                if pos + 1 < B {
+                    cache.evict(3);
+                }
+            }
+
+            let layer = &cache.layers[0];
+            let rows = B * layer.head_dim;
+            assert_eq!(layer.seq_len, B, "policy {policy:?} retained depth");
+            assert_eq!(layer.k[0].len(), rows, "policy {policy:?} K rows");
+            assert_eq!(layer.v[0].len(), rows, "policy {policy:?} V rows");
+            assert!(
+                layer.k[0].capacity() >= rows,
+                "policy {policy:?} K capacity"
+            );
+            assert!(
+                layer.v[0].capacity() >= rows,
+                "policy {policy:?} V capacity"
+            );
+            let q_capacity = match layer.o1.as_ref() {
+                Some(O1State::Collecting { q_buf, .. }) => q_buf.capacity(),
+                other => panic!("policy {policy:?} changed state early: {other:?}"),
+            };
+            assert!(
+                q_capacity >= B * 8,
+                "policy {policy:?} Q capacity must cover the exact prefix"
+            );
+
+            assert!(cache.layers[0].o1_seal_checked(2).unwrap());
+            assert_eq!(cache.layers[0].k[0].capacity(), 0, "K released after seal");
+            assert_eq!(cache.layers[0].v[0].capacity(), 0, "V released after seal");
+        }
     }
 
     #[test]

@@ -2192,6 +2192,23 @@ impl Pipeline {
         }
     }
 
+    /// Turn a deferred O(1) failure raised by a hidden-only forward into the
+    /// Result error its public batch/span caller must return. The failure
+    /// path already cleared host/device sequence state; consume only the
+    /// side-channel marker here and leave the pipeline reusable.
+    fn check_o1_progress_failure(&mut self, phase: &str) -> Result<(), String> {
+        if self
+            .graph_failed
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            self.cancel
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            self.clear_sequence_state();
+            return Err(format!("{phase}: deferred O(1) transition failed"));
+        }
+        Ok(())
+    }
+
     /// Freeze landmarks + skeleton state after the prompt pass and drop
     /// the o1 layers' full KV; decode then runs `step()` per token.
     /// Pub for the network split (see `o1_begin`).
@@ -5528,6 +5545,15 @@ impl Pipeline {
                 );
             }
         }
+        // Real O(1) prefill pairs may also carry tentative lane-2 recurrent
+        // state. Commit it before publishing the transition epoch so the
+        // next serial/device row cannot observe a new attention epoch with an
+        // old GDN state. Speculative pairs run only when O(1) is inactive and
+        // retain their existing caller-controlled commit/rollback semantics.
+        if self.o1_active() {
+            self.commit_linear_scratch();
+        }
+        self.o1_progress();
         (h1, h2)
     }
 
@@ -6814,6 +6840,11 @@ impl Pipeline {
             }
         }
         crate::gpu::set_layer(-1); // lm_head/final ops outside layer-split
+        // A batched span owns a complete set of positions. Publish any
+        // collecting→sealed transition only after every layer has finished;
+        // callers that cross into serial/device work must see the new epoch
+        // before this function returns.
+        self.o1_progress();
         h
     }
 
@@ -7239,7 +7270,10 @@ impl Pipeline {
         // state lives on the device must walk positions through the
         // graph, not through the batched CPU span.
         if self.can_prefill_batched() && !self.graph_prefill_preferred() {
-            Ok(self.prefill_batch_span(PrefillIn::Ids(ids), start_pos, task_mask, 0, upto + 1))
+            let out =
+                self.prefill_batch_span(PrefillIn::Ids(ids), start_pos, task_mask, 0, upto + 1);
+            self.check_o1_progress_failure("prefill_span_ids")?;
+            Ok(out)
         } else {
             let hs = self.hidden_size;
             let mut out = Vec::with_capacity(ids.len() * hs);
@@ -7282,13 +7316,15 @@ impl Pipeline {
             ));
         }
         if self.can_prefill_batched() && !self.graph_prefill_preferred() {
-            Ok(self.prefill_batch_span(
+            let out = self.prefill_batch_span(
                 PrefillIn::Hidden(hidden),
                 start_pos,
                 task_mask,
                 from,
                 upto + 1,
-            ))
+            );
+            self.check_o1_progress_failure("prefill_span_hidden")?;
+            Ok(out)
         } else {
             let b = hidden.len() / hs;
             let mut out = Vec::with_capacity(hidden.len());
@@ -13446,6 +13482,133 @@ mod tests {
         for (actual, expected) in actual.iter().zip(expected) {
             assert!((actual - expected).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn o1_batch_transition_publishes_one_epoch_before_serial_handoff() {
+        const B: usize = 19;
+        let mut p = create_test_pipeline(8, 16, 2, 1, 4, 2, 260);
+        p.set_o1(Some(crate::nystrom::O1Cfg {
+            layers: crate::nystrom::O1Layers::All,
+            m: 4,
+            w: 8,
+            sink: 2,
+            rect: crate::nystrom::O1Rect::Aggregate,
+        }));
+        p.o1_begin_with_prefix(Some(B));
+        let ids: Vec<u32> = (0..B as u32).collect();
+        let _ = p.prefill_batch_span(PrefillIn::Ids(&ids), 0, None, 0, p.num_layers);
+
+        assert_eq!(p.o1_epoch, 1, "all layers publish one completed transition");
+        assert!(p.kv_cache.layers.iter().all(|l| l.o1_sealed()));
+        let next = p.embed_single(B as u32);
+        let _ = p.forward_layers(&next, B, None);
+        assert_eq!(p.o1_epoch, 1, "sealed handoff must not republish the epoch");
+    }
+
+    #[test]
+    fn o1_pair_transition_commits_scratch_before_epoch_publication() {
+        const B: usize = 19;
+        let mut p = create_test_pipeline(8, 16, 2, 1, 4, 2, 260);
+        // Keep a real recurrent layer ahead of the Full O(1) layer so the
+        // pair test observes the GDN lane-2 scratch swap at the same
+        // boundary, rather than only exercising an artificial scratch vec.
+        let gdn_cfg = crate::linear_core::GdnCfg {
+            num_v_heads: 2,
+            num_k_heads: 1,
+            key_head_dim: 2,
+            value_head_dim: 4,
+            conv_kernel: 3,
+            hidden_size: 8,
+            rms_eps: 1e-6,
+            output_gate_sigmoid: false,
+        };
+        let synth = |n: usize, salt: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| (((i * 13 + salt * 7) % 97) as f32 / 97.0 - 0.5) * 0.4)
+                .collect()
+        };
+        let qt = |rows: usize, cols: usize, salt: usize| {
+            crate::qtensor::QTensor::from_f32(synth(rows * cols, salt), rows, cols)
+        };
+        let c_dim = gdn_cfg.conv_dim();
+        let vd = gdn_cfg.num_v_heads * gdn_cfg.value_head_dim;
+        p.weights.layers[0].attn = AttnKind::LinearGdn(crate::linear_core::GdnWeights {
+            in_proj_qkv: qt(c_dim, 8, 1),
+            in_proj_z: qt(vd, 8, 2),
+            in_proj_a: qt(gdn_cfg.num_v_heads, 8, 3),
+            in_proj_b: qt(gdn_cfg.num_v_heads, 8, 4),
+            conv1d: synth(c_dim * gdn_cfg.conv_kernel, 5),
+            a_log: vec![0.2, 0.5],
+            dt_bias: synth(gdn_cfg.num_v_heads, 6),
+            norm: vec![1.0; gdn_cfg.value_head_dim],
+            out_proj: qt(8, vd, 7),
+        });
+        p.gdn_cfg = Some(gdn_cfg);
+        p.set_o1(Some(crate::nystrom::O1Cfg {
+            layers: crate::nystrom::O1Layers::All,
+            m: 4,
+            w: 8,
+            sink: 2,
+            rect: crate::nystrom::O1Rect::Aggregate,
+        }));
+        p.o1_begin_with_prefix(Some(B));
+        for pos in 0..B - 2 {
+            let emb = p.embed_single(pos as u32);
+            let _ = p.forward_layers(&emb, pos, None);
+        }
+        let lane1_state = p.kv_cache.layers[0].linear_state.clone();
+
+        let e1 = p.embed_single((B - 2) as u32);
+        let e2 = p.embed_single((B - 1) as u32);
+        let _ = p.forward_pair(&e1, &e2, B - 2);
+
+        assert_eq!(p.o1_epoch, 1, "pair crossing B publishes one epoch");
+        assert!(
+            p.kv_cache
+                .layers
+                .iter()
+                .enumerate()
+                .all(|(li, l)| !p.o1_flags[li] || l.o1_sealed())
+        );
+        assert!(!p.kv_cache.layers[0].linear_state.is_empty());
+        assert_ne!(
+            p.kv_cache.layers[0].linear_state, lane1_state,
+            "real pair must commit GDN lane 2 before returning"
+        );
+        assert!(p.kv_cache.layers[0].linear_scratch.is_empty());
+        let next = p.embed_single(B as u32);
+        let _ = p.forward_layers(&next, B, None);
+        assert_eq!(p.o1_epoch, 1, "serial continuation must reuse the epoch");
+    }
+
+    #[test]
+    fn o1_error_observation_stays_terminal_until_reset() {
+        let mut p = create_test_pipeline(8, 16, 2, 1, 4, 1, 64);
+        p.set_o1(Some(crate::nystrom::O1Cfg {
+            layers: crate::nystrom::O1Layers::All,
+            m: 4,
+            w: 8,
+            sink: 2,
+            rect: crate::nystrom::O1Rect::Aggregate,
+        }));
+        p.o1_begin();
+        p.kv_cache.layers[0].o1_abort("synthetic transition failure".into());
+
+        assert!(p.o1_seal_checked().is_err());
+        assert!(
+            p.o1_seal_checked().is_err(),
+            "retry must see the sticky error"
+        );
+        let k = vec![0.2f32; 4];
+        let v = vec![0.3f32; 4];
+        p.kv_cache.layers[0].append(&k, &v, &[]);
+        assert_eq!(p.kv_cache.layers[0].seq_len, 0);
+
+        p.reset_session();
+        p.o1_begin();
+        p.kv_cache.layers[0].append(&k, &v, &[]);
+        assert_eq!(p.kv_cache.layers[0].seq_len, 1);
     }
 
     #[test]
