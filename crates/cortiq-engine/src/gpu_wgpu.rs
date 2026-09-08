@@ -32348,6 +32348,514 @@ mod tests {
     }
 
     #[test]
+    fn wgpu_o1_replay_real_tape_corrected() {
+        // Actual first-Full-layer operator gate.  This is deliberately
+        // separate from the old whole-tape/duplicate replay: the tape
+        // contains positions 0..1523, the state seals 0..255, and rows
+        // 256..1523 are each inserted once as a real post-seal step.
+        let path = std::env::var("CMF_O1_REPLAY_TAPE")
+            .expect("CMF_O1_REPLAY_TAPE is required for corrected replay");
+        unsafe {
+            std::env::set_var("CMF_GPU", "wgpu");
+        }
+        assert_eq!(
+            std::env::var("WGPU_BACKEND").as_deref(),
+            Ok("vulkan"),
+            "corrected replay must run with WGPU_BACKEND=vulkan"
+        );
+        let data = std::fs::read(&path).expect("read retained real activation tape");
+        let mut off = 0usize;
+        fn u32le(data: &[u8], off: &mut usize) -> u32 {
+            let end = *off + 4;
+            assert!(end <= data.len(), "real tape u32 truncated");
+            let x = u32::from_le_bytes(data[*off..end].try_into().unwrap());
+            *off = end;
+            x
+        }
+        assert!(data.len() >= 24, "real tape header truncated");
+        let magic = u32le(&data, &mut off);
+        let version = u32le(&data, &mut off);
+        let layer = u32le(&data, &mut off) as usize;
+        let nh = u32le(&data, &mut off) as usize;
+        let nkv = u32le(&data, &mut off) as usize;
+        let hd = u32le(&data, &mut off) as usize;
+        assert_eq!(magic, 0x434d4652, "real tape magic");
+        assert_eq!(version, 1, "real tape version");
+        assert_eq!(layer, 3, "earliest Full layer");
+        assert_eq!((nh, nkv, hd), (24, 4, 256));
+        assert_eq!(nh % nkv, 0);
+        let hpg = nh / nkv;
+        let mut q = Vec::<f32>::new();
+        let mut k = Vec::<f32>::new();
+        let mut v = Vec::<f32>::new();
+        let mut positions = Vec::<usize>::new();
+        while off < data.len() {
+            assert!(off + 16 <= data.len(), "real tape record header truncated");
+            let pos = u32le(&data, &mut off) as usize;
+            let qn = u32le(&data, &mut off) as usize;
+            let kn = u32le(&data, &mut off) as usize;
+            let vn = u32le(&data, &mut off) as usize;
+            assert_eq!((qn, kn, vn), (nh * hd, nkv * hd, nkv * hd));
+            let read_f32 = |off: &mut usize, n: usize| {
+                let end = *off + n * 4;
+                assert!(end <= data.len(), "real tape payload truncated");
+                let out = data[*off..end]
+                    .chunks_exact(4)
+                    .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
+                    .collect::<Vec<_>>();
+                *off = end;
+                out
+            };
+            q.extend_from_slice(&read_f32(&mut off, qn));
+            k.extend_from_slice(&read_f32(&mut off, kn));
+            v.extend_from_slice(&read_f32(&mut off, vn));
+            positions.push(pos);
+        }
+        let t = positions.len();
+        assert_eq!(t, 1524, "retained replay tape length");
+        assert_eq!(positions, (0..t).collect::<Vec<_>>(), "absolute positions");
+        assert_eq!(off, data.len(), "real tape trailing bytes");
+        assert!(q.iter().chain(&k).chain(&v).all(|x| x.is_finite()));
+
+        const PREFIX: usize = 256;
+        const M: usize = 32;
+        const W: usize = 128;
+        const SINK: usize = 4;
+        const CHECKS: [usize; 4] = [256, 511, 1023, 1523];
+        let scale = 1.0f64 / (hd as f64).sqrt();
+
+        // Use the same f64 landmark and ridge routines as runtime seal, then
+        // keep an independent f64 Aggregate stream for the four checkpoints.
+        fn seg64(xs: &[f32], rows: usize, d: usize, m: usize) -> Vec<f64> {
+            let mut out = vec![0.0; m * d];
+            for i in 0..m {
+                let lo = i * rows / m;
+                let hi = (i + 1) * rows / m;
+                for p in lo..hi {
+                    for c in 0..d {
+                        out[i * d + c] += xs[p * d + c] as f64;
+                    }
+                }
+                let inv = 1.0 / (hi - lo) as f64;
+                for c in 0..d {
+                    out[i * d + c] *= inv;
+                }
+            }
+            out
+        }
+        struct F64Head {
+            q_tilde: Vec<f64>,
+            k_tilde: Vec<f64>,
+            mu: Vec<f64>,
+            t_hat: Vec<f64>,
+            z_hat: Vec<f64>,
+            m_max: Vec<f64>,
+        }
+        let insert_f64 = |h: &mut F64Head, kr: &[f32], vr: &[f32]| {
+            for a in 0..M {
+                let mut l = 0.0;
+                for d0 in 0..hd {
+                    l += h.q_tilde[a * hd + d0] * kr[d0] as f64;
+                }
+                l *= scale;
+                if l > h.m_max[a] {
+                    let r = (h.m_max[a] - l).exp();
+                    h.z_hat[a] *= r;
+                    for x in &mut h.t_hat[a * hd..(a + 1) * hd] {
+                        *x *= r;
+                    }
+                    h.m_max[a] = l;
+                }
+                let e = (l - h.m_max[a]).exp();
+                h.z_hat[a] += e;
+                for d0 in 0..hd {
+                    h.t_hat[a * hd + d0] += e * vr[d0] as f64;
+                }
+            }
+        };
+
+        let mut groups = Vec::with_capacity(nkv);
+        let mut f64_heads = Vec::with_capacity(nkv * hpg);
+        for g in 0..nkv {
+            let mut qh = vec![0.0f32; hpg * PREFIX * hd];
+            let mut kg = vec![0.0f32; PREFIX * hd];
+            let mut vg = vec![0.0f32; PREFIX * hd];
+            for p in 0..PREFIX {
+                kg[p * hd..(p + 1) * hd]
+                    .copy_from_slice(&k[(p * nkv + g) * hd..(p * nkv + g + 1) * hd]);
+                vg[p * hd..(p + 1) * hd]
+                    .copy_from_slice(&v[(p * nkv + g) * hd..(p * nkv + g + 1) * hd]);
+                for hh in 0..hpg {
+                    let head = g * hpg + hh;
+                    qh[(hh * PREFIX + p) * hd..(hh * PREFIX + p + 1) * hd]
+                        .copy_from_slice(&q[(p * nh + head) * hd..(p * nh + head + 1) * hd]);
+                }
+            }
+            let qrefs: Vec<&[f32]> = (0..hpg)
+                .map(|hh| &qh[hh * PREFIX * hd..(hh + 1) * PREFIX * hd])
+                .collect();
+            let mut st = crate::nystrom::NystromState::new_group(M, W, SINK, hpg)
+                .with_rect(crate::nystrom::O1Rect::Aggregate);
+            st.prefill_group(&qrefs, &kg, &vg, PREFIX, hd, hd);
+            let view = st.device_view();
+            assert!(!view.exact_only, "p256 corrected replay must seal");
+            assert_eq!(
+                (view.m_eff, view.w, view.sink_len, view.far_len),
+                (M, W, SINK, 124)
+            );
+
+            let k_tilde = seg64(&kg, PREFIX, hd, M);
+            for hh in 0..hpg {
+                let q_tilde = seg64(&qh[hh * PREFIX * hd..(hh + 1) * PREFIX * hd], PREFIX, hd, M);
+                let mut au = vec![0.0; M * M];
+                for a in 0..M {
+                    for b in 0..M {
+                        let mut dot = 0.0;
+                        for d0 in 0..hd {
+                            dot += q_tilde[a * hd + d0] * k_tilde[b * hd + d0];
+                        }
+                        au[a * M + b] = (dot * scale).exp();
+                    }
+                }
+                let mu = crate::nystrom::ridge_pinv(&au, M);
+                let mut fh = F64Head {
+                    q_tilde,
+                    k_tilde: k_tilde.clone(),
+                    mu,
+                    t_hat: vec![0.0; M * hd],
+                    z_hat: vec![0.0; M],
+                    m_max: vec![f64::NEG_INFINITY; M],
+                };
+                // At seal, prompt rows 4..127 are already in the far field.
+                for p in SINK..PREFIX - W {
+                    insert_f64(
+                        &mut fh,
+                        &k[(p * nkv + g) * hd..(p * nkv + g + 1) * hd],
+                        &v[(p * nkv + g) * hd..(p * nkv + g + 1) * hd],
+                    );
+                }
+                f64_heads.push(fh);
+            }
+            groups.push(st);
+        }
+
+        let c = ctx().expect("actual Vulkan adapter required for corrected replay");
+        let uid = u64::MAX - 17;
+        let views: Vec<_> = groups.iter().map(|st| st.device_view()).collect();
+        o1_ensure(c, uid, layer, &views, 1).expect("upload corrected replay state");
+        let dev_bufs = {
+            let map = c.o1m.lock().unwrap();
+            let dref = map.get(&(uid, layer)).expect("uploaded O1 state");
+            (
+                dref.meta.clone(),
+                dref.ring_k.clone(),
+                dref.ring_v.clone(),
+                dref.sink_k.clone(),
+                dref.sink_v.clone(),
+                dref.k_tilde.clone(),
+                dref.qt.clone(),
+                dref.mu.clone(),
+                dref.mz.clone(),
+                dref.that.clone(),
+                dref.scale,
+            )
+        };
+        let (dmeta, drk, drv, dsk, dsv, dkt, dqt, dmu, dmz, dth, scale_f32) = dev_bufs;
+        use wgpu::util::DeviceExt;
+        let input = |data: &[f32], label: &str| {
+            c.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(label),
+                    contents: bytemuck::cast_slice(data),
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                })
+        };
+        let q_all = input(&q, "o1-corrected-replay-q");
+        let k_all = input(&k, "o1-corrected-replay-k");
+        let v_all = input(&v, "o1-corrected-replay-v");
+        let work = |bytes: u64, label: &str| {
+            c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: bytes,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let q_work = work((nh * hd * 4) as u64, "o1-corrected-replay-q-work");
+        let k_work = work((nkv * hd * 4) as u64, "o1-corrected-replay-k-work");
+        let v_work = work((nkv * hd * 4) as u64, "o1-corrected-replay-v-work");
+        let out_bytes = (nh * hd * 4) as u64;
+        let out = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("o1-corrected-replay-out"),
+            size: out_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let stage_bytes = out_bytes * CHECKS.len() as u64;
+        let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("o1-corrected-replay-stage"),
+            size: stage_bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let uniform = uniform_u32x8(
+            c,
+            [
+                hpg as u32,
+                M as u32,
+                W as u32,
+                SINK as u32,
+                hd as u32,
+                hd as u32,
+                scale_f32.to_bits(),
+                0,
+            ],
+        );
+        let bgf = |layout: &wgpu::BindGroupLayout, bufs: &[&wgpu::Buffer]| {
+            let entries: Vec<_> = bufs
+                .iter()
+                .enumerate()
+                .map(|(i, b)| bind_buf(i as u32, b))
+                .collect();
+            c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("o1-corrected-replay-bind"),
+                layout,
+                entries: &entries,
+            })
+        };
+        let bg_far = bgf(
+            &c.layout_o1_far,
+            &[&dmeta, &drk, &drv, &dqt, &dmz, &dth, &uniform],
+        );
+        let bg_push = bgf(
+            &c.layout_o1_push,
+            &[&dmeta, &k_work, &v_work, &drk, &drv, &uniform],
+        );
+        let bg_att = bgf(
+            &c.layout_o1_attend,
+            &[
+                &dmeta, &q_work, &drk, &drv, &dsk, &dsv, &dkt, &dmu, &dmz, &dth, &out, &uniform,
+            ],
+        );
+        let mut enc = c
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("o1-corrected-replay-encoder"),
+            });
+        let mut cpu_checkpoints = Vec::<Vec<f32>>::new();
+        let mut f64_errors = Vec::<f64>::new();
+        for row in PREFIX..t {
+            let mut cpu_row = vec![0.0f32; nh * hd];
+            for g in 0..nkv {
+                groups[g].step_group(
+                    &q[row * nh * hd + g * hpg * hd..row * nh * hd + (g + 1) * hpg * hd],
+                    &k[(row * nkv + g) * hd..(row * nkv + g + 1) * hd],
+                    &v[(row * nkv + g) * hd..(row * nkv + g + 1) * hd],
+                    &mut cpu_row[g * hpg * hd..(g + 1) * hpg * hd],
+                );
+            }
+            let evicted = row - W;
+            for g in 0..nkv {
+                for hh in 0..hpg {
+                    insert_f64(
+                        &mut f64_heads[g * hpg + hh],
+                        &k[(evicted * nkv + g) * hd..(evicted * nkv + g + 1) * hd],
+                        &v[(evicted * nkv + g) * hd..(evicted * nkv + g + 1) * hd],
+                    );
+                }
+            }
+
+            // The CPU-side f64 checkpoint uses the same Aggregate partition:
+            // sinks 0..3, far 4..row-128, and near row-127..row.
+            if let Some(ci) = CHECKS.iter().position(|&x| x == row) {
+                let mut max_err = 0.0f64;
+                for g in 0..nkv {
+                    for hh in 0..hpg {
+                        let head = g * hpg + hh;
+                        let qrow = &q[(row * nh + head) * hd..(row * nh + head + 1) * hd];
+                        let fh = &f64_heads[head];
+                        let mut near = Vec::<(f64, usize)>::with_capacity(SINK + W);
+                        for p in 0..SINK {
+                            let kr = &k[(p * nkv + g) * hd..(p * nkv + g + 1) * hd];
+                            let mut s = 0.0;
+                            for d0 in 0..hd {
+                                s += qrow[d0] as f64 * kr[d0] as f64;
+                            }
+                            near.push((s * scale, p));
+                        }
+                        for p in row + 1 - W..=row {
+                            let kr = &k[(p * nkv + g) * hd..(p * nkv + g + 1) * hd];
+                            let mut s = 0.0;
+                            for d0 in 0..hd {
+                                s += qrow[d0] as f64 * kr[d0] as f64;
+                            }
+                            near.push((s * scale, p));
+                        }
+                        let c_near = near
+                            .iter()
+                            .map(|&(s, _)| s)
+                            .fold(f64::NEG_INFINITY, f64::max);
+                        let mut landmark = vec![0.0f64; M];
+                        let mut f = f64::NEG_INFINITY;
+                        for a in 0..M {
+                            let mut s = 0.0;
+                            for d0 in 0..hd {
+                                s += qrow[d0] as f64 * fh.k_tilde[a * hd + d0];
+                            }
+                            landmark[a] = s * scale;
+                            f = f.max(landmark[a]);
+                        }
+                        let mut c_all = c_near;
+                        for a in 0..M {
+                            c_all = c_all.max(f + fh.m_max[a]);
+                        }
+                        let mut far_den = 0.0;
+                        let mut out64 = vec![0.0f64; hd];
+                        for b in 0..M {
+                            let mut u = 0.0;
+                            for a in 0..M {
+                                u += (landmark[a] - f).exp() * fh.mu[a * M + b];
+                            }
+                            let gain = u * (f + fh.m_max[b] - c_all).exp();
+                            far_den += gain * fh.z_hat[b];
+                            for d0 in 0..hd {
+                                out64[d0] += gain * fh.t_hat[b * hd + d0];
+                            }
+                        }
+                        let mut den = far_den;
+                        for &(s, p) in &near {
+                            let wt = (s - c_all).exp();
+                            den += wt;
+                            let vr = &v[(p * nkv + g) * hd..(p * nkv + g + 1) * hd];
+                            for d0 in 0..hd {
+                                out64[d0] += wt * vr[d0] as f64;
+                            }
+                        }
+                        assert!(den.is_finite() && den >= 0.0);
+                        for x in &mut out64 {
+                            *x /= den.max(1e-30);
+                        }
+                        let mut logits = vec![0.0f64; row + 1];
+                        for p in 0..=row {
+                            let kr = &k[(p * nkv + g) * hd..(p * nkv + g + 1) * hd];
+                            let mut s = 0.0;
+                            for d0 in 0..hd {
+                                s += qrow[d0] as f64 * kr[d0] as f64;
+                            }
+                            logits[p] = s * scale;
+                        }
+                        let mx = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                        let mut den_exact = 0.0;
+                        for x in &mut logits {
+                            *x = (*x - mx).exp();
+                            den_exact += *x;
+                        }
+                        let mut exact = vec![0.0f64; hd];
+                        for (p, wt) in logits.iter().enumerate() {
+                            let vr = &v[(p * nkv + g) * hd..(p * nkv + g + 1) * hd];
+                            for d0 in 0..hd {
+                                exact[d0] += *wt * vr[d0] as f64;
+                            }
+                        }
+                        let mut local = 0.0f64;
+                        let mut cpu_local = 0.0f32;
+                        for d0 in 0..hd {
+                            exact[d0] /= den_exact;
+                            local = local.max((out64[d0] - exact[d0]).abs());
+                            cpu_local =
+                                cpu_local.max((cpu_row[head * hd + d0] - out64[d0] as f32).abs());
+                        }
+                        assert!(out64.iter().all(|x| x.is_finite()));
+                        assert!(cpu_local.is_finite());
+                        max_err = max_err.max(local);
+                    }
+                }
+                f64_errors.push(max_err);
+                cpu_checkpoints.push(cpu_row);
+                eprintln!("o1-corrected-replay: row={row} f64_dense_max={max_err:.6e}");
+                let src_q = (row * nh * hd * 4) as u64;
+                let src_k = (row * nkv * hd * 4) as u64;
+                let src_v = (row * nkv * hd * 4) as u64;
+                flush_pass(&enc);
+                enc.copy_buffer_to_buffer(&q_all, src_q, &q_work, 0, (nh * hd * 4) as u64);
+                enc.copy_buffer_to_buffer(&k_all, src_k, &k_work, 0, (nkv * hd * 4) as u64);
+                enc.copy_buffer_to_buffer(&v_all, src_v, &v_work, 0, (nkv * hd * 4) as u64);
+                {
+                    let mut pass = begin_pass(&mut enc);
+                    pass.set_pipeline(&c.o1_far);
+                    pass.set_bind_group(0, &bg_far, &[]);
+                    pass.dispatch_workgroups((nkv * hpg * M) as u32, 1, 1);
+                    pass.set_pipeline(&c.o1_push);
+                    pass.set_bind_group(0, &bg_push, &[]);
+                    pass.dispatch_workgroups(nkv as u32, 1, 1);
+                    pass.set_pipeline(&c.o1_attend);
+                    pass.set_bind_group(0, &bg_att, &[]);
+                    pass.dispatch_workgroups((nkv * hpg) as u32, 1, 1);
+                }
+                flush_pass(&enc);
+                enc.copy_buffer_to_buffer(&out, 0, &stage, ci as u64 * out_bytes, out_bytes);
+            } else {
+                let src_q = (row * nh * hd * 4) as u64;
+                let src_k = (row * nkv * hd * 4) as u64;
+                let src_v = (row * nkv * hd * 4) as u64;
+                flush_pass(&enc);
+                enc.copy_buffer_to_buffer(&q_all, src_q, &q_work, 0, (nh * hd * 4) as u64);
+                enc.copy_buffer_to_buffer(&k_all, src_k, &k_work, 0, (nkv * hd * 4) as u64);
+                enc.copy_buffer_to_buffer(&v_all, src_v, &v_work, 0, (nkv * hd * 4) as u64);
+                {
+                    let mut pass = begin_pass(&mut enc);
+                    pass.set_pipeline(&c.o1_far);
+                    pass.set_bind_group(0, &bg_far, &[]);
+                    pass.dispatch_workgroups((nkv * hpg * M) as u32, 1, 1);
+                    pass.set_pipeline(&c.o1_push);
+                    pass.set_bind_group(0, &bg_push, &[]);
+                    pass.dispatch_workgroups(nkv as u32, 1, 1);
+                    pass.set_pipeline(&c.o1_attend);
+                    pass.set_bind_group(0, &bg_att, &[]);
+                    pass.dispatch_workgroups((nkv * hpg) as u32, 1, 1);
+                }
+            }
+        }
+        flush_pass(&enc);
+        submit(c, finish_enc(enc));
+        let (tx, rx) = std::sync::mpsc::channel();
+        stage.map_async(wgpu::MapMode::Read, ..stage_bytes, move |r| {
+            tx.send(r).unwrap()
+        });
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+        rx.recv().unwrap().unwrap();
+        let mapped = stage.get_mapped_range(..stage_bytes).unwrap();
+        let gpu: Vec<f32> = bytemuck::cast_slice(&mapped).to_vec();
+        drop(mapped);
+        stage.unmap();
+        for (ci, &row) in CHECKS.iter().enumerate() {
+            let got = &gpu[ci * nh * hd..(ci + 1) * nh * hd];
+            let want = &cpu_checkpoints[ci];
+            let md = want
+                .iter()
+                .zip(got)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            let expected = [3.61143, 1.16262, 1.10457, 1.03681][ci];
+            eprintln!(
+                "o1-corrected-replay: row={row} cpu_gpu_maxabs={md:.6e} f64_dense_max={:.6e}",
+                f64_errors[ci]
+            );
+            assert!(got.iter().all(|x| x.is_finite()));
+            assert!(
+                md < 1e-3,
+                "corrected Vulkan/CPU mismatch at row {row}: {md}"
+            );
+            assert!(
+                (f64_errors[ci] - expected).abs() < 0.05 * expected,
+                "f64 checkpoint changed at row {row}: {} vs {expected}",
+                f64_errors[ci]
+            );
+        }
+        c.o1m.lock().unwrap().remove(&(uid, layer));
+    }
+
+    #[test]
     fn wgpu_gdn_step_matches_cpu() {
         unsafe { std::env::set_var("CMF_GPU", "wgpu") };
         if ctx().is_none() {
