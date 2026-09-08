@@ -373,3 +373,55 @@ fn nystrom_short_prompt_is_exact_softmax() {
         "exact-only max abs error {max_abs:.3e} >= 1e-5"
     );
 }
+
+/// The extended GPU profile uses a 2048-entry exact ring.  Exercise both
+/// initial fill and a complete wrap on the portable state so a device-side
+/// near-window extension has a chronological reference at every slot.
+#[test]
+fn extended_window_ring_wrap_preserves_rows() {
+    let (d, dv, m, w, sink, hpg, t) =
+        (4usize, 2usize, 4usize, 2048usize, 4usize, 1usize, 2064usize);
+    let row = |pos: usize, width: usize| {
+        let mut out = vec![0.0f32; width];
+        out[0] = pos as f32;
+        for (i, value) in out.iter_mut().enumerate().skip(1) {
+            *value = ((pos * 11 + i * 7) % 101) as f32 / 101.0 - 0.5;
+        }
+        out
+    };
+    let qs: Vec<f32> = (0..t).flat_map(|pos| row(pos + 3, d)).collect();
+    let ks: Vec<f32> = (0..t).flat_map(|pos| row(pos, d)).collect();
+    let vs: Vec<f32> = (0..t).flat_map(|pos| row(pos + 100, dv)).collect();
+    let mut state = NystromState::new_group(m, w, sink, hpg);
+    state.prefill_group(&[&qs], &ks, &vs, t, d, dv);
+
+    // Enough decode rows to wrap the ring once, including a non-zero initial
+    // head from the prompt replay.  The state remains bounded throughout.
+    let steps = w + 5;
+    let mut out = vec![0.0f32; dv];
+    for pos in t..t + steps {
+        let q = row(pos + 3, d);
+        let k = row(pos, d);
+        let v = row(pos + 100, dv);
+        state.step_group(&q, &k, &v, &mut out);
+        assert!(
+            out.iter().all(|x| x.is_finite()),
+            "non-finite output at {pos}"
+        );
+    }
+
+    let view = state.device_view();
+    assert!(!view.exact_only);
+    assert_eq!(view.win_len, w);
+    assert_eq!(view.far_len + view.win_len + view.sink_len, t + steps);
+    let oldest = t + steps - w;
+    for logical in 0..w {
+        let slot = (view.win_head + logical) % w;
+        assert_eq!(
+            view.win_k[slot * d].to_bits(),
+            ((oldest + logical) as f32).to_bits(),
+            "ring slot {slot} does not hold chronological row {}",
+            oldest + logical
+        );
+    }
+}

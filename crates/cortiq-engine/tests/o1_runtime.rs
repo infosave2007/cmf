@@ -5,6 +5,7 @@
 //! prompt pass + seal + step lifecycle, GQA head mapping through the
 //! pipeline, the short-prompt guard, and the memory accounting.
 
+use cortiq_engine::kv_cache::{EvictionPolicy, KvCache, KvMode, LayerKvCache, O1State};
 use cortiq_engine::nystrom::{
     O1_DEFAULT_M, O1_DEFAULT_RECT, O1_DEFAULT_SINK, O1_DEFAULT_W, O1Cfg, O1Layers, O1Rect,
 };
@@ -120,11 +121,21 @@ fn o1_long_generation_crosses_window_and_stays_o1() {
     let _ = p.generate(prompt, 80, None, None).unwrap();
     let after: usize = p.kv_cache.layers.iter().map(|l| l.o1_memory_bytes()).sum();
     assert_eq!(before, after, "sealed state must be constant in context");
+
+    // A long sealed request must not leak its skeleton into a later short
+    // request: reset/reuse starts a fresh collecting state and defers again.
+    let short = p.generate("ab", 8, None, None).unwrap();
+    assert!(short.tokens_generated > 0);
+    assert!(matches!(
+        p.kv_cache.layers[0].o1,
+        Some(O1State::Collecting { .. })
+    ));
+    assert!(p.kv_cache.layers[0].seq_len < 19);
 }
 
-/// Prompt shorter than the window (the §5-guard regime): the kernel
-/// runs exact-only with a growing buffer — the runtime must not assume
-/// skeleton state exists.
+/// Prompt shorter than the window (the §5-guard regime): the runtime keeps
+/// the exact trace only until the first skeleton-safe boundary, then seals.
+/// A short request must remain bounded by that one deferred boundary.
 #[test]
 fn o1_short_prompt_does_not_crash() {
     let mut p = create_test_pipeline(8, 16, 2, 1, 4, 2, 260);
@@ -134,7 +145,274 @@ fn o1_short_prompt_does_not_crash() {
     let r = p.generate("ab", 8, None, None).unwrap();
     assert_eq!(r.prompt_tokens, 2);
     assert!(r.tokens_generated > 0);
-    assert!(p.kv_cache.layers[0].o1_sealed());
+    assert!(!p.kv_cache.layers[0].o1_sealed());
+    assert!(p.kv_cache.layers[0].seq_len < 32 + 128 + 4 + 8 + 1);
+    assert!(matches!(
+        p.kv_cache.layers[0].o1,
+        Some(O1State::Collecting { .. })
+    ));
+}
+
+/// The layer-level barrier keeps the full trace/KV through B-1, converts at
+/// B, and makes repeated sealing idempotent. A malformed trace is rejected
+/// before conversion and cannot resume ordinary KV growth if ignored.
+#[test]
+fn o1_deferred_layer_boundary_and_error_are_terminal() {
+    let mut layer = LayerKvCache::new(1, 4);
+    layer.o1_begin(4, 8, 2, O1_DEFAULT_RECT); // B = 19
+    let q = vec![0.1f32; 8];
+    let k = vec![0.2f32; 4];
+    let v = vec![0.3f32; 4];
+    for _ in 0..18 {
+        layer.o1_push_q(&q);
+        layer.append(&k, &v, &[]);
+    }
+    assert!(!layer.o1_seal(2));
+    assert!(matches!(
+        layer.o1.as_ref(),
+        Some(O1State::Collecting {
+            seal_at: Some(19),
+            ..
+        })
+    ));
+    assert_eq!(layer.head_keys(0).len(), 18 * 4);
+
+    layer.o1_push_q(&q);
+    layer.append(&k, &v, &[]);
+    assert!(layer.o1_seal(2));
+    let bounded = layer.o1_memory_bytes();
+    assert!(layer.o1_sealed());
+    assert!(layer.head_keys(0).is_empty());
+    assert!(layer.o1_seal(2));
+    assert_eq!(layer.o1_memory_bytes(), bounded);
+    for _ in 0..64 {
+        layer.o1_step(&q, &k, &v, 2);
+    }
+    assert_eq!(layer.head_keys(0).len(), 0);
+    assert_eq!(layer.o1_memory_bytes(), bounded);
+
+    let mut bad = LayerKvCache::new(1, 4);
+    bad.o1_begin(4, 8, 2, O1_DEFAULT_RECT);
+    for _ in 0..19 {
+        bad.append(&k, &v, &[]);
+    }
+    assert!(!bad.o1_seal(2));
+    assert!(bad.o1.is_none());
+    assert_eq!(bad.seq_len, 0);
+    bad.append(&k, &v, &[]);
+    assert_eq!(bad.seq_len, 0, "failed seal must not resume KV growth");
+}
+
+/// A collecting layer owns the exact prefix needed for its deferred boundary.
+/// Both cache eviction policies must leave its Q/K/V rows aligned until the
+/// one conversion at B, even when the ordinary cache limit is much smaller.
+#[test]
+fn o1_deferred_prefix_survives_both_eviction_policies() {
+    const B: usize = 19;
+    let q = vec![0.1f32; 8];
+    let k = vec![0.2f32; 4];
+    let v = vec![0.3f32; 4];
+
+    for policy in [EvictionPolicy::Recent, EvictionPolicy::Born { sink: 2 }] {
+        let mut cache = KvCache::new(1, 1, 4, 6);
+        cache.policy = policy;
+        cache.layers[0].mode = KvMode::F32;
+        cache.layers[0].o1_begin(4, 8, 2, O1_DEFAULT_RECT);
+
+        cache.layers[0].o1_push_q(&q);
+        cache.layers[0].append(&k, &v, &[]);
+        assert!(!cache.layers[0].o1_seal(2));
+
+        for _ in 1..B {
+            cache.layers[0].o1_push_q(&q);
+            cache.layers[0].append(&k, &v, &[]);
+            cache.evict(3);
+        }
+        let layer = &cache.layers[0];
+        assert_eq!(layer.seq_len, B, "policy {policy:?} must preserve depth");
+        assert_eq!(layer.head_keys(0).len(), B * 4, "policy {policy:?} K rows");
+        assert_eq!(
+            layer.head_values(0).len(),
+            B * 4,
+            "policy {policy:?} V rows"
+        );
+        assert!(
+            layer.o1_memory_bytes() >= B * 2 * 4 * 4,
+            "policy {policy:?} must retain the full Q trace"
+        );
+
+        assert!(cache.layers[0].o1_seal(2));
+        assert!(cache.layers[0].o1_sealed());
+        assert!(cache.layers[0].head_keys(0).is_empty());
+        assert!(cache.layers[0].head_values(0).is_empty());
+    }
+}
+
+/// A short prompt eventually reaches B = w + sink + slack + 1. The exact
+/// rows are retained through B-1; the completed Bth row seals and all later
+/// steps use the bounded state without restoring ordinary KV.
+#[test]
+fn o1_short_prompt_seals_at_deferred_boundary() {
+    let mut p = create_test_pipeline(8, 16, 2, 1, 4, 2, 260);
+    p.sampler_config.temperature = 0.0;
+    p.sampler_config.repetition_penalty = 1.0;
+    p.set_o1(o1(O1Layers::All, 4, 8, 2)); // B = 19
+    let r = p.generate("ab", 32, None, None).unwrap();
+    assert!(r.tokens_generated > 18, "test needs to cross B");
+    for (li, layer) in p.kv_cache.layers.iter().enumerate() {
+        assert!(layer.o1_sealed(), "layer {li} must seal at deferred B");
+        assert!(layer.k_heads().iter().all(Vec::is_empty));
+    }
+}
+
+/// The completed-row barrier is equivalent to an explicit seal over the
+/// identical exact prefix: rows through B-1 stay exact, row B completes the
+/// conversion, and row B+1 is the first streaming step.
+#[test]
+fn o1_boundary_matches_explicit_seal_prefix() {
+    const B: usize = 19;
+    let ids: Vec<u32> = (0..=B as u32).collect();
+    let mut deferred = create_test_pipeline(8, 16, 2, 1, 4, 2, 260);
+    deferred.set_o1(o1(O1Layers::All, 4, 8, 2));
+    deferred.o1_begin();
+    for (pos, &id) in ids[..B - 1].iter().enumerate() {
+        deferred
+            .forward_span(
+                &deferred.embed_id(id),
+                pos,
+                0,
+                deferred.num_layers - 1,
+                None,
+            )
+            .unwrap();
+    }
+    assert!(!deferred.o1_seal_checked().unwrap());
+    assert!(matches!(
+        deferred.kv_cache.layers[0].o1,
+        Some(O1State::Collecting {
+            seal_at: Some(B),
+            ..
+        })
+    ));
+    let b_minus_one = deferred.kv_cache.layers[0].head_len(0);
+    assert_eq!(b_minus_one, B - 1);
+    deferred
+        .forward_span(
+            &deferred.embed_id(ids[B - 1]),
+            B - 1,
+            0,
+            deferred.num_layers - 1,
+            None,
+        )
+        .unwrap();
+    assert!(deferred.kv_cache.layers[0].o1_sealed());
+    assert_eq!(deferred.kv_cache.layers[0].seq_len, B);
+    assert!(deferred.kv_cache.layers[0].head_keys(0).is_empty());
+    let deferred_first_stream = deferred
+        .forward_span(
+            &deferred.embed_id(ids[B]),
+            B,
+            0,
+            deferred.num_layers - 1,
+            None,
+        )
+        .unwrap();
+
+    let mut explicit = create_test_pipeline(8, 16, 2, 1, 4, 2, 260);
+    explicit.set_o1(o1(O1Layers::All, 4, 8, 2));
+    explicit.o1_begin();
+    for (pos, &id) in ids[..B].iter().enumerate() {
+        explicit
+            .forward_span(
+                &explicit.embed_id(id),
+                pos,
+                0,
+                explicit.num_layers - 1,
+                None,
+            )
+            .unwrap();
+    }
+    assert!(explicit.o1_seal_checked().unwrap());
+    let explicit_first_stream = explicit
+        .forward_span(
+            &explicit.embed_id(ids[B]),
+            B,
+            0,
+            explicit.num_layers - 1,
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        deferred_first_stream, explicit_first_stream,
+        "first compressed row must match explicit seal of the same exact prefix"
+    );
+}
+
+/// The public batched span must publish the transition before a following
+/// serial span consumes the first compressed row. This is the handoff used by
+/// the network split after a prefix batch.
+#[test]
+fn o1_batched_span_handoffs_to_serial_span() {
+    const B: usize = 19;
+    let mut p = create_test_pipeline(8, 16, 2, 1, 4, 2, 260);
+    p.set_o1(o1(O1Layers::All, 4, 8, 2));
+    p.o1_begin_with_prefix(Some(B));
+    let ids: Vec<u32> = (0..B as u32).collect();
+    let last = p.num_layers - 1;
+
+    p.prefill_span_ids(&ids, 0, last, None)
+        .expect("batch prefix should complete and seal");
+    assert!(p.kv_cache.layers.iter().all(|l| l.o1_sealed()));
+
+    let next = p.embed_id(B as u32);
+    let hidden = p
+        .forward_span(&next, B, 0, last, None)
+        .expect("serial row after batch seal");
+    assert_eq!(hidden.len(), p.hidden_size);
+    assert!(p.kv_cache.layers.iter().all(|l| l.head_keys(0).is_empty()));
+}
+
+/// A conversion failure raised inside a batched span is an error at the
+/// public boundary, never successful boundary hiddens. Reset/reuse then
+/// clears the terminal latch and permits a fresh bounded request.
+#[test]
+fn o1_batched_failure_returns_err_and_reset_reuses() {
+    const B: usize = 19;
+    let ids: Vec<u32> = (0..B as u32).collect();
+    let mut p = create_test_pipeline(8, 16, 2, 1, 4, 2, 260);
+    p.set_o1(o1(O1Layers::All, 4, 8, 2));
+    p.o1_begin_with_prefix(Some(B));
+    p.kv_cache.layers[0].mode = KvMode::Q8 { k: true, v: true };
+    let last = p.num_layers - 1;
+
+    let err = p
+        .prefill_span_ids(&ids, 0, last, None)
+        .expect_err("a malformed O(1) batch boundary must fail");
+    assert!(err.contains("deferred O(1)"));
+    assert_eq!(
+        p.kv_cache.seq_len(),
+        0,
+        "failed batch must clear the request"
+    );
+
+    p.kv_cache.layers[0].mode = KvMode::F32;
+    p.reset_session();
+    p.o1_begin_with_prefix(Some(B));
+    p.prefill_span_ids(&ids, 0, last, None)
+        .expect("reset must make the bounded path reusable");
+    assert!(p.kv_cache.layers.iter().all(|l| l.o1_sealed()));
+}
+
+/// The deferred exact lead-in must not change the caller's shifted target
+/// range: a requested prefix of three still scores every target from three
+/// onward, including exact rows before B.
+#[test]
+fn o1_nll_preserves_requested_range_under_deferred_boundary() {
+    let mut p = create_test_pipeline(8, 16, 2, 1, 4, 2, 260);
+    p.set_o1(o1(O1Layers::All, 4, 8, 2)); // B = 19
+    let ids: Vec<u32> = (0..25).collect();
+    let (_, count) = p.nll_ids_o1(&ids, 3).unwrap();
+    assert_eq!(count, ids.len() - 1 - 3);
 }
 
 /// Per-layer override is really per-layer: an un-flagged layer keeps

@@ -14,7 +14,7 @@ language:
 # Qwen3.8-27B → CMF — one file, one Rust binary, no Python
 
 ```bash
-cargo install cortiq-cli          # 0.5.76+
+cargo install cortiq-cli          # 0.6.6+
 hf download infosave/Qwen3.8-27B-cmf qwen38-27b-q4t.cmf --local-dir .
 cortiq run qwen38-27b-q4t.cmf --prompt "Explain quicksort in three sentences."
 ```
@@ -199,9 +199,9 @@ the device attend ran 15–20% off the CPU on every token) — **update to
 decoding (`CMF_GRAPH_SPEC=0` turns it off; `CMF_METAL_VERIFY_CHECK=1`
 diffs every verified row against the plain path).
 
-For long context on a Mac, add the Metal O(1) mode: decode holds
-~4.7 tok/s **independent of depth** and the attention state stays
-fixed-size instead of growing with the KV cache:
+For long context on a Mac, add the Metal O(1) mode: the retained M4 profile
+measured ~4.7 tok/s after transition with fixed attention state instead of a
+growing KV cache; throughput still depends on backend and profile:
 
 ```bash
 CMF_O1_METAL=1 cortiq run qwen38-27b-q4t.cmf --o1 all --prompt "..."
@@ -246,16 +246,23 @@ and open in a browser:
 ## O(1) long-context mode
 
 Nyström O(1) attention replaces KV-cache attention on the flagged
-layers: memory stays **constant** instead of growing with the context
-(the 16 full-attention layers keep a fixed landmark skeleton; the 48
-linear layers were O(1) already), and decode speed stays flat at any
-depth.
+layers after an exact prefill: memory stays **bounded** instead of growing
+with the context (the 16 full-attention layers keep a fixed landmark
+skeleton; the 48 linear layers were O(1) already), and attention work per
+token is bounded after the transition. Observed throughput still depends on
+the backend and profile. By default, generation runs an exact prefill over
+the full prompt and seals once at the end. Set `CMF_O1_PREFILL=256` for the
+explicit bounded profile: on prompts at least 256 tokens long, the runtime
+keeps the first 256 tokens exact (or raises the prefix to the
+skeleton-safe floor `window + sink + 8 + 1`), seals once, and streams the
+remaining prompt through the bounded state. A short prompt remains exact
+through that floor; if generation crosses it, the runtime seals once.
 
 ```bash
 # Vulkan / discrete GPUs (since 0.5.78), ~25 tok/s on an RTX 5090:
 CMF_O1_GPU=1 cortiq run qwen38-27b-q4t.cmf --o1 all --prompt "..." --max-tokens 2000
 
-# Apple Silicon (since 0.5.79), ~4.7 tok/s on an M4 24 GB at any depth:
+# Apple Silicon (since 0.5.79), retained M4 profile ~4.7 tok/s after transition:
 CMF_O1_METAL=1 cortiq run qwen38-27b-q4t.cmf --o1 all --prompt "..."
 ```
 
@@ -271,14 +278,20 @@ CMF_O1_METAL=1 cortiq run qwen38-27b-q4t.cmf --o1 all --prompt "..."
 Practical settings:
 
 - **Defaults are the validated optimum** — start with plain `--o1 all`.
-- The GPU kernels accept `sink + window ≤ 196` and `m ≤ 32`; anything
-  larger falls back to the CPU step for those layers (it says so in
-  the log — run with `RUST_LOG=info` to see refusals).
-- Prompts shorter than `window + sink + 8` skip the skeleton entirely
-  (exact attention — nothing to approximate yet).
-- The **prefill runs on the CPU by design**: it records the query trace
-  that seals the landmark skeleton after the prompt. First token of a
-  long prompt is slower; every token after is where this mode pays.
+- Backend limits are separate. Vulkan/wgpu accepts `sink + window ≤ 2052`
+  and `m ≤ 32`; with the default sink of 4, `window=2048` is the largest
+  extended profile and remains experimental. Native Metal currently keeps
+  its own `sink + window ≤ 196` cap. A request beyond the selected backend's
+  cap is declined for those layers and uses the CPU step; run with
+  `RUST_LOG=info` to see refusals.
+- A prompt shorter than `window + sink + 8 + 1` stays exact while it is below
+  the deferred boundary. If the request ends before that point, no skeleton
+  is built; if generation crosses it, the exact lead-in is sealed once.
+- The default full-prompt prefill records the query trace and seals at the
+  prompt end. `CMF_O1_PREFILL=256` selects the bounded generation profile
+  above, so only the requested exact prefix is retained before the O(1)
+  suffix stream. First-token latency includes whichever exact prefix the
+  selected backend runs.
 - Where it wins: contexts past ~8k, memory-tight machines (24 GB Macs),
   and any workload where decode must not degrade with depth. At short
   contexts plain attention is equal or faster — O(1) already matches it
@@ -286,6 +299,18 @@ Practical settings:
 - Output is not bit-identical to full attention (it is an approximation
   with an exact window); quality holds while the conversation fits the
   window + landmarks regime the defaults were validated on.
+
+The 0.6.6 Vulkan speed result is bounded and hardware-specific. The measured
+profile was `m=32`, `window=128`, `sink=4`, `CMF_O1_PREFILL=256`,
+`CMF_BATCH_K=128`, `CMF_BATCH_COOP=1` (K128/COOP1), and `CMF_MTP=0` (MTP
+off). On one RTX PRO 4000 Blackwell, three alternating baseline/candidate
+pairs at an 8192 token context and 128 output tokens moved median TTFT from
+73.8218 s to 68.3111 s (−7.46%) and steady decode from 25.7715 to 26.1725
+tok/s (+1.56%). Every run produced 128 tokens, with 16 O(1) device layers and
+46,236,672 bytes of O(1) device state. `window=2048` is experimental; the
+default remains `window=128`. These measurements do not establish universal
+speed, exact far-context recall, or a quality improvement. `convert --o1`
+does not train the model; it selects the runtime approximation.
 
 ## Verify
 
@@ -301,7 +326,7 @@ cortiq info qwen38-27b-q4tp.cmf
 Одна модель — один файл `.cmf`, один Rust-бинарник `cortiq`, без Python:
 
 ```bash
-cargo install cortiq-cli          # 0.5.77+
+cargo install cortiq-cli          # 0.6.6+
 hf download infosave/Qwen3.8-27B-cmf qwen38-27b-q4t.cmf --local-dir .
 cortiq run qwen38-27b-q4t.cmf --prompt "Объясни квиксорт в трёх предложениях."
 ```
@@ -370,17 +395,40 @@ top-p 0.80, top-k 20, presence-penalty 1.5. Все шесть ручек дос�
 (q4tp, q4t, q8_2f) сгенерированы одним промтом с одним seed — готовое
 сравнение квантов.
 
-**O(1) длинный контекст — параметры.** `--o1 all|deepN|i,j,k|off` —
+**O(1) длинный контекст — параметры.** Начиная с 0.6.6, `--o1` держит
+точный префилл и короткий lead-in до безопасной границы скелета
+`window + sink + 8 + 1`, а затем один раз переводит слой в ограниченное
+состояние Nyström. Если короткая генерация заканчивается раньше границы,
+остаётся точное внимание; веса при этом не обучаются и не меняются.
+`--o1 all|deepN|i,j,k|off` —
 какие attention-слои перевести на O(1) (обычно `all`); `--o1-m 32` —
 бюджет ландмарок (валидированный максимум GPU-ядер); `--o1-window 128`
 — точное скользящее окно; `--o1-sink 4` — постоянные точные ключи в
-начале. Лимиты ядер: sink+window ≤ 196, m ≤ 32 (сверх — слой уходит на
-CPU-шаг, с записью в лог при RUST_LOG=info). Префилл в этом режиме
-идёт на CPU намеренно — он записывает трассу, запечатывающую скелет.
-Память под внимание константна, скорость декода не падает с глубиной;
+начале. Лимиты зависят от backend: Vulkan/wgpu принимает sink+window ≤ 2052
+и m ≤ 32; при sink=4 это допускает `window=2048`, который остаётся
+экспериментальным. Нативный Metal сохраняет отдельный предел sink+window ≤
+196; более широкая настройка отклоняется этим backend, и слой идёт на
+CPU-шаг (отказ виден при RUST_LOG=info). По умолчанию точный префилл идёт по
+всему промпту и запечатывает скелет в конце. Для ограниченного профиля
+задайте `CMF_O1_PREFILL=256`: точными остаются первые 256 токенов (или
+безопасный минимум `window + sink + 8 + 1`), затем остаток промпта проходит
+через ограниченное состояние; короткий промпт остаётся точным до этой
+границы. После перехода объём работы внимания ограничен, а фактическая
+скорость зависит от backend и профиля;
 выгодно от ~8k контекста и на машинах с 24 ГБ. Вывод не бит-в-бит с
 полным вниманием (это аппроксимация с точным окном). Vulkan:
 `CMF_O1_GPU=1`; Metal: `CMF_O1_METAL=1` (с 0.5.79).
+
+Замер 0.6.6 на одной RTX PRO 4000 Blackwell (Vulkan), три чередующиеся
+пары control/candidate, контекст 8192 и 128 выходных токенов использовал
+профиль `m=32`, `window=128`, `sink=4`, `CMF_O1_PREFILL=256`,
+`CMF_BATCH_K=128`, `CMF_BATCH_COOP=1` (K128/COOP1), `CMF_MTP=0` (MTP off):
+медианный TTFT 73.8218 → 68.3111 с (−7.46%), steady decode 25.7715 →
+26.1725 tok/s (+1.56%). В каждом запуске было 128 токенов, 16 O(1)-слоёв и
+46 236 672 байта состояния на устройстве. Это результат одной модели и
+одного GPU; `window=2048` остаётся экспериментальным, по умолчанию — 128.
+Качество и точное извлечение произвольных дальних фактов этим замером не
+утверждаются.
 
 **macOS (Apple Silicon, Metal).** С 0.5.79 модель работает на GPU мака
 из коробки (раньше файл не влезал в лимит одного Metal-буфера и всё
@@ -392,8 +440,8 @@ M4 mini 24 ГБ (q4tp): декод plain **6.7 tok/s** (было 5.8), greedy с
 спекуляцией на коде **12.2 tok/s** (в среднем 3 из 7 черновиков),
 проза ~7; промпт 447 токенов — **11.6 с** до первого токена (было 42). Для длинного
 контекста — Metal-режим O(1): `CMF_O1_METAL=1 cortiq run … --o1 all` —
-декод держит ~4.7 tok/s независимо от глубины, память под внимание
-фиксированная. Для мака берите `q4t`; `q8_2f` (27.4 ГБ) в 24 ГБ не
+сохранённый профиль даёт ~4.7 tok/s после перехода при фиксированной
+памяти внимания; фактическая скорость зависит от backend и профиля. Для мака берите `q4t`; `q8_2f` (27.4 ГБ) в 24 ГБ не
 помещается.
 
 ---
@@ -403,7 +451,7 @@ M4 mini 24 ГБ (q4tp): декод plain **6.7 tok/s** (было 5.8), greedy с
 一个模型 — 一个 `.cmf` 文件，一个 Rust 可执行文件 `cortiq`，无需 Python：
 
 ```bash
-cargo install cortiq-cli          # 0.5.77+
+cargo install cortiq-cli          # 0.6.6+
 hf download infosave/Qwen3.8-27B-cmf qwen38-27b-q4t.cmf --local-dir .
 cortiq run qwen38-27b-q4t.cmf --prompt "用三句话解释快速排序。"
 ```
@@ -458,20 +506,37 @@ token，一次批量提交在 int8 激活的矩阵向量核上完成验证，监
 中的三个水族馆页面（q4tp、q4t、q8_2f）由同一提示词、同一 seed 生成 —
 可直接对比三种量化。
 
-**O(1) 长上下文 — 参数。** `--o1 all|deepN|i,j,k|off` 选择切换到
+**O(1) 长上下文 — 参数。** 从 0.6.6 起，`--o1` 在安全边界
+`window + sink + 8 + 1` 之前保留精确预填充和短引导段，然后一次切换到
+有界的 Nyström 状态；如果请求在边界前结束，就继续使用精确注意力。
+这只是运行时适配，不训练也不修改权重。`--o1 all|deepN|i,j,k|off` 选择切换到
 O(1) 的注意力层（通常 `all`）；`--o1-m 32` 地标预算（GPU 内核验证过的
 上限）；`--o1-window 128` 精确滑动窗口；`--o1-sink 4` 序列开头的永久
-精确键。内核限制：sink+window ≤ 196、m ≤ 32（超出的层回退到 CPU，
-RUST_LOG=info 可见）。此模式下预填充有意在 CPU 上运行——它记录封存
-地标骨架所需的查询轨迹。注意力内存恒定，解码速度不随深度下降；
+精确键。后端限制分别计算：Vulkan/wgpu 接受 sink+window ≤ 2052、m ≤ 32；
+sink=4 时 `window=2048` 可用但仍是实验选项。原生 Metal 仍有独立的
+sink+window ≤ 196 上限；超出该后端上限的层会回退到 CPU，
+RUST_LOG=info 可见。默认配置对整个提示词做精确预填充并在末尾封存。
+设置 `CMF_O1_PREFILL=256` 可选有界配置：对至少 256 token 的提示词，先
+精确处理 256 token（或提升到安全下限 `window + sink + 8 + 1`），一次封存，
+再用有界状态处理提示词余部；更短提示词在越过该边界前保持精确。切换后
+注意力工作量有界，实际速度取决于后端和配置；
 在 ~8k 以上上下文和 24 GB 内存的机器上收益最大。输出与完整注意力
 并非逐位相同（带精确窗口的近似）。Vulkan 用 `CMF_O1_GPU=1`；
 Metal 用 `CMF_O1_METAL=1`（0.5.79 起）。
+
+0.6.6 在一台 RTX PRO 4000 Blackwell（Vulkan）上的三组交替对照中，
+上下文 8192、输出 128 token，使用 `m=32`、`window=128`、`sink=4`、
+`CMF_O1_PREFILL=256`、`CMF_BATCH_K=128`、`CMF_BATCH_COOP=1`
+（K128/COOP1）和 `CMF_MTP=0`（MTP off）：TTFT 中位数 73.8218 →
+68.3111 秒（−7.46%），稳定解码 25.7715 → 26.1725 token/s（+1.56%）。
+每次生成 128 token，16 个 O(1) 层的设备状态为 46,236,672 字节。这是
+单模型单硬件结果；不代表普遍速度、精确的无限上下文记忆或质量提升，
+`window=2048` 仍是实验选项，默认值是 128。
 
 **macOS（Apple Silicon，Metal）。** 自 **0.5.79** 起，27B 可直接在 Mac
 GPU 上运行（此前文件超出单个 Metal 缓冲区上限，会静默回退到 CPU）。
 M4 mini 24 GB 实测：解码 **5.8 tok/s**，2k 上下文预填充 20.8 tok/s
 （纯 CPU 为 3.7）。长上下文请使用 Metal 版 O(1) 模式：
-`CMF_O1_METAL=1 cortiq run … --o1 all` — 解码稳定在 ~4.7 tok/s，
-与上下文深度无关，注意力状态恒定大小。Mac 请选 `q4t`；`q8_2f`
+`CMF_O1_METAL=1 cortiq run … --o1 all` — 保留的 M4 配置在切换后约
+4.7 tok/s，注意力状态恒定大小；实际速度取决于后端和配置。Mac 请选 `q4t`；`q8_2f`
 （27.4 GB）无法装入 24 GB 内存。

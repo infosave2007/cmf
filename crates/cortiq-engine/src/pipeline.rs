@@ -225,8 +225,8 @@ pub struct Pipeline {
     /// O(1) Nyström attention setting (CLI/env/header-hint resolved by
     /// the caller; None = plain cache attention everywhere).
     o1_cfg: Option<crate::nystrom::O1Cfg>,
-    /// Bumped at every o1 seal — the GPU state mirror re-uploads when it
-    /// sees a new epoch (each generate seals fresh CPU state).
+    /// Bumped once per collecting→sealed transition — the GPU state mirror
+    /// re-uploads when it sees a new epoch (each fresh sealed state).
     o1_epoch: u64,
     /// Per-layer o1 flags derived from `o1_cfg` (Full layers only).
     o1_flags: Vec<bool>,
@@ -1699,11 +1699,15 @@ impl Pipeline {
                         graph.read_h(&mut h_now);
                         let cache = &self.kv_cache.layers[*li];
                         let n_after = cache.head_keys(0).len() / hd;
+                        // A sealed O(1) cache may have no dense current-row
+                        // entry. The oracle is a debug probe, so let it see
+                        // zero stored exact rows instead of underflowing.
+                        let stored = n_after.saturating_sub(1);
                         let cpu_k: Vec<&[f32]> = (0..nkv)
-                            .map(|g| &cache.head_keys(g)[..(n_after - 1) * hd])
+                            .map(|g| &cache.head_keys(g)[..stored * hd])
                             .collect();
                         let cpu_v: Vec<&[f32]> = (0..nkv)
-                            .map(|g| &cache.head_values(g)[..(n_after - 1) * hd])
+                            .map(|g| &cache.head_values(g)[..stored * hd])
                             .collect();
                         let p = crate::gpu::AttnDeviceParams {
                             kv_id,
@@ -1722,7 +1726,7 @@ impl Pipeline {
                             inv_freq: &inv_freq,
                             cpu_k,
                             cpu_v,
-                            cpu_stored: n_after - 1,
+                            cpu_stored: stored,
                             o1: None,
                         };
                         if let Some((dq, dk, dv, dao)) = graph.debug_attn_device(l, &p, &h_now) {
@@ -1968,10 +1972,23 @@ impl Pipeline {
     /// Enable/disable per-layer O(1) Nyström attention. Only Full
     /// layers are eligible (a linear layer keeps its own operator).
     /// Applies to generation (`generate*`/`forward_ids`): the prompt
-    /// pass stays exact, the seal happens once after prefill, decode
-    /// runs on the O(1) state. Teacher-forced scoring (`ppl_ids`)
-    /// intentionally stays exact.
+    /// pass stays exact, then the state seals after prefill or at the
+    /// deferred skeleton-safe boundary for short prompts; decode runs on
+    /// the O(1) state. Teacher-forced scoring (`ppl_ids`) intentionally
+    /// stays exact.
     pub fn set_o1(&mut self, cfg: Option<crate::nystrom::O1Cfg>) {
+        if let Some(c) = &cfg {
+            if crate::nystrom::o1_deferred_boundary(c.w, c.sink).is_none() {
+                tracing::error!(
+                    "o1 disabled: w + sink + slack + 1 overflows usize (w={}, sink={})",
+                    c.w,
+                    c.sink
+                );
+                self.o1_flags.clear();
+                self.o1_cfg = None;
+                return;
+            }
+        }
         self.o1_flags = match &cfg {
             Some(c) => {
                 let mut flags = c.layer_flags(self.num_layers);
@@ -2048,28 +2065,156 @@ impl Pipeline {
     /// network split: each side runs the o1 lifecycle over ITS OWN layers
     /// (begin before prefill, seal at the prefill barrier).
     pub fn o1_begin(&mut self) {
+        self.o1_begin_with_prefix(None);
+    }
+
+    /// Arm collection and optionally request a positive calibration prefix.
+    /// The effective barrier is always at least the skeleton-safe floor, so
+    /// a short requested prefix cannot create an exact-only runtime state.
+    pub fn o1_begin_with_prefix(&mut self, requested_prefix: Option<usize>) {
         if let Some(c) = &self.o1_cfg {
             let (m, w, sink, rect) = (c.m, c.w, c.sink, c.rect);
+            let boundary = requested_prefix.map(|p| {
+                p.max(
+                    crate::nystrom::o1_deferred_boundary(w, sink)
+                        .expect("o1 config boundary validated in set_o1"),
+                )
+            });
             for (li, &f) in self.o1_flags.iter().enumerate() {
                 if f {
-                    self.kv_cache.layers[li].o1_begin(m, w, sink, rect);
+                    self.kv_cache.layers[li].o1_begin_with_boundary(m, w, sink, rect, boundary);
                 }
             }
         }
+    }
+
+    /// Effective deferred boundary for a positive prefix request.
+    fn o1_effective_boundary(&self, requested_prefix: usize) -> Option<usize> {
+        self.o1_cfg.as_ref().and_then(|c| {
+            crate::nystrom::o1_deferred_boundary(c.w, c.sink)
+                .map(|floor| requested_prefix.max(floor))
+        })
+    }
+
+    fn o1_note_transition(&mut self) {
+        // Drain every layer's one-shot bit before publishing one pipeline
+        // epoch. `any()` would short-circuit on the first layer and leak the
+        // remaining bits into later forwards, causing one epoch per layer.
+        let mut transitioned = false;
+        for (li, &flagged) in self.o1_flags.iter().enumerate() {
+            if flagged {
+                transitioned |= self.kv_cache.layers[li].take_o1_transition();
+            }
+        }
+        if transitioned {
+            self.o1_epoch = self.o1_epoch.wrapping_add(1);
+        }
+    }
+
+    fn o1_pending(&self) -> bool {
+        self.o1_flags.iter().enumerate().any(|(li, &f)| {
+            f && self.kv_cache.layers[li].seq_len > 0
+                && self.kv_cache.layers[li].o1_pending_boundary().is_some()
+        })
+    }
+
+    fn o1_fail(&mut self, err: String) {
+        tracing::error!("o1 deferred seal failed; terminating sequence: {err}");
+        self.clear_sequence_state();
+        self.graph_failed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Seal participating layers while retaining the exact state when the
+    /// prompt is below the deferred boundary. A split worker may have
+    /// collecting layers outside its owned span; zero-depth layers remain
+    /// armed and are intentionally skipped until their peer runs them.
+    pub fn o1_seal_checked(&mut self) -> Result<bool, String> {
+        if self.o1_cfg.is_none() {
+            return Ok(false);
+        }
+        let mut participating = false;
+        for li in 0..self.num_layers {
+            if !self.o1_flags.get(li).copied().unwrap_or(false) {
+                continue;
+            }
+            if let Some(err) = self.kv_cache.layers[li].take_o1_error() {
+                return Err(err);
+            }
+            if self.kv_cache.layers[li].seq_len == 0 {
+                continue;
+            }
+            participating = true;
+            let num_heads = self.layer_num_heads(li);
+            self.kv_cache.layers[li].o1_seal_checked(num_heads)?;
+        }
+        self.o1_note_transition();
+        for li in 0..self.num_layers {
+            if self.o1_flags.get(li).copied().unwrap_or(false) {
+                if let Some(err) = self.kv_cache.layers[li].take_o1_error() {
+                    return Err(err);
+                }
+            }
+        }
+        Ok(participating
+            && (0..self.num_layers).all(|li| {
+                !self.o1_flags.get(li).copied().unwrap_or(false)
+                    || self.kv_cache.layers[li].seq_len == 0
+                    || self.kv_cache.layers[li].o1_sealed()
+            }))
+    }
+
+    /// Complete a deferred boundary after a full position/span forward.
+    /// This is the pipeline owner for epoch publication and failure cleanup.
+    fn o1_progress(&mut self) {
+        if !self.o1_active() {
+            return;
+        }
+        for li in 0..self.num_layers {
+            if self.o1_flags.get(li).copied().unwrap_or(false) {
+                if let Some(err) = self.kv_cache.layers[li].take_o1_error() {
+                    self.o1_fail(err);
+                    return;
+                }
+            }
+        }
+        // A qwen_attention row can seal in the middle of a complete layer
+        // walk. Consume its transition even though the pending boundary has
+        // already disappeared from the cache.
+        self.o1_note_transition();
+        if !self.o1_pending() {
+            return;
+        }
+        if let Err(err) = self.o1_seal_checked() {
+            self.o1_fail(err);
+        }
+    }
+
+    /// Turn a deferred O(1) failure raised by a hidden-only forward into the
+    /// Result error its public batch/span caller must return. The failure
+    /// path already cleared host/device sequence state; consume only the
+    /// side-channel marker here and leave the pipeline reusable.
+    fn check_o1_progress_failure(&mut self, phase: &str) -> Result<(), String> {
+        if self
+            .graph_failed
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            self.cancel
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            self.clear_sequence_state();
+            return Err(format!("{phase}: deferred O(1) transition failed"));
+        }
+        Ok(())
     }
 
     /// Freeze landmarks + skeleton state after the prompt pass and drop
     /// the o1 layers' full KV; decode then runs `step()` per token.
     /// Pub for the network split (see `o1_begin`).
     pub fn o1_seal(&mut self) {
-        self.o1_epoch = self.o1_epoch.wrapping_add(1);
-        if self.o1_cfg.is_none() {
-            return;
-        }
-        for li in 0..self.num_layers {
-            if self.o1_flags.get(li).copied().unwrap_or(false) {
-                self.kv_cache.layers[li].o1_seal(self.num_heads);
-            }
+        if let Err(err) = self.o1_seal_checked() {
+            self.o1_fail(err);
         }
     }
 
@@ -2221,7 +2366,20 @@ impl Pipeline {
             );
         }
         crate::gpu::graph_race_begin_generation();
-        self.o1_begin();
+        // Optional bounded calibration prefix. Keep the requested value
+        // even when it is longer than the prompt; the collecting layer will
+        // defer at the effective boundary and remain exact for short input.
+        let o1_prefill = if self.o1_active() && task_mask.is_none() {
+            std::env::var("CMF_O1_PREFILL")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&p| p > 0)
+        } else {
+            None
+        };
+        if task_mask.is_none() {
+            self.o1_begin_with_prefix(o1_prefill);
+        }
 
         // Speculative decode is off under o1: a rejected draft can't be
         // rolled back out of the far accumulators / ring window (the
@@ -2495,16 +2653,11 @@ impl Pipeline {
         // O(1) step used by decode.  It keeps the O(1) layers' Q trace and
         // temporary full KV bounded by the prefix while leaving the default
         // full-prompt quality profile untouched.
-        let o1_prefill = if self.o1_active() && task_mask.is_none() {
-            std::env::var("CMF_O1_PREFILL")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .filter(|&p| p > 0 && p < input_ids.len())
-        } else {
-            None
-        };
+        let o1_prefill_limit = o1_prefill
+            .and_then(|requested| self.o1_effective_boundary(requested))
+            .map(|boundary| boundary.min(input_ids.len()));
         let mut o1_sealed = false;
-        if let Some(limit) = o1_prefill {
+        if let Some(limit) = o1_prefill_limit {
             // Reuse the exact batched prefix machinery when available; it
             // records the same per-position Q trace as the full prefill.
             if self.can_prefill_batched() && limit > 2 {
@@ -2523,10 +2676,19 @@ impl Pipeline {
                 }
             }
             if pos >= limit {
-                self.o1_seal();
-                o1_sealed = true;
+                o1_sealed = match self.o1_seal_checked() {
+                    Ok(sealed) => sealed,
+                    Err(err) => {
+                        self.finish_generation(&mut mtp, &mut router, true);
+                        return Err(err);
+                    }
+                };
                 tracing::info!(
-                    "o1 bounded prompt prefix: sealed after {limit} of {} token(s)",
+                    "o1 bounded prompt prefix: requested={} effective={} processed={} of {} token(s)",
+                    o1_prefill.unwrap_or(0),
+                    self.o1_effective_boundary(o1_prefill.unwrap_or(0))
+                        .unwrap_or(limit),
+                    limit,
                     input_ids.len()
                 );
             }
@@ -2944,7 +3106,13 @@ impl Pipeline {
         // Prompt absorbed → freeze the o1 layers' skeletons; from here
         // every decode step on those layers is O(W + m·dv + m²).
         if !o1_sealed {
-            self.o1_seal();
+            match self.o1_seal_checked() {
+                Ok(_) => {}
+                Err(err) => {
+                    self.finish_generation(&mut mtp, &mut router, true);
+                    return Err(err);
+                }
+            }
         }
 
         // Commit one token: push, check EOS, stream. Returns false = stop.
@@ -5377,6 +5545,15 @@ impl Pipeline {
                 );
             }
         }
+        // Real O(1) prefill pairs may also carry tentative lane-2 recurrent
+        // state. Commit it before publishing the transition epoch so the
+        // next serial/device row cannot observe a new attention epoch with an
+        // old GDN state. Speculative pairs run only when O(1) is inactive and
+        // retain their existing caller-controlled commit/rollback semantics.
+        if self.o1_active() {
+            self.commit_linear_scratch();
+        }
+        self.o1_progress();
         (h1, h2)
     }
 
@@ -5402,7 +5579,9 @@ impl Pipeline {
         }
         self.clear_sequence_state();
         self.check_forward_graph("forward_ids setup", 0)?;
-        self.o1_begin();
+        if task_mask.is_none() {
+            self.o1_begin();
+        }
         let mut hidden = vec![0.0f32; self.hidden_size];
         let mut pos = 0usize;
         // Same routing predicate generation uses. Two reasons it must be
@@ -5457,7 +5636,10 @@ impl Pipeline {
         // Harness contract: after forward_ids the cache is decode-ready —
         // under o1 that means sealed (bench measures the seal as part of
         // prefill, honestly).
-        self.o1_seal();
+        if let Err(err) = self.o1_seal_checked() {
+            self.clear_sequence_state();
+            return Err(err);
+        }
         let normed = inference::rms_norm(
             &hidden,
             &self.weights.final_norm,
@@ -5826,13 +6008,14 @@ impl Pipeline {
     /// failure instead of returning a partial score.
     ///
     /// Runtime discipline, deliberately NOT the matrix probe's: the
-    /// first `prefill` tokens run the exact prompt pass — that pass is
-    /// what freezes the landmarks and M — and every scored position then
-    /// goes through `NystromState::step()`, the same code decode runs.
+    /// requested prefix plus any required deferred lead-in run the exact
+    /// prompt pass — that pass is what freezes the landmarks and M — and
+    /// every post-seal scored position goes through `NystromState::step()`,
+    /// the same code decode runs.
     /// So the landmarks are PREFILL-frozen (what ships), not
-    /// full-sequence oracles (what the published probe measured), and
-    /// every scored row carries a real far field rather than sitting
-    /// inside the exact window.
+    /// full-sequence oracles (what the published probe measured). When the
+    /// requested prefix is shorter than the bounded transition, rows in the
+    /// exact lead-in are still scored so the shifted target range is stable.
     ///
     /// Pair with `nll_ids_from(ids, prefill)` for the exact baseline
     /// over the identical token set — that ratio is the honest one.
@@ -5842,16 +6025,39 @@ impl Pipeline {
         // prior graph failure and clears only the cancel bit that failure
         // raised, leaving a caller-owned cancellation observable.
         self.nll_begin()?;
-        self.o1_begin();
+        let requested_prefix = (prefill > 0).then_some(prefill);
+        self.o1_begin_with_prefix(requested_prefix);
         let n = ids.len().saturating_sub(1);
-        let p = prefill.min(n);
-        // Exact prompt pass over ids[..p]: the seal consumes its q/k/v.
+        let requested_start = prefill.min(n);
+        // The exact prefix must reach the deferred boundary before a
+        // collecting layer can convert. Rows between the requested start and
+        // that boundary remain part of the public NLL range and are scored
+        // from the same hidden pass below.
+        let exact_end = if self.o1_active() {
+            match requested_prefix {
+                Some(requested) => self.o1_effective_boundary(requested),
+                None => self
+                    .o1_cfg
+                    .as_ref()
+                    .and_then(|c| crate::nystrom::o1_deferred_boundary(c.w, c.sink)),
+            }
+            .unwrap_or(requested_start)
+            .min(n)
+        } else {
+            requested_start
+        };
+        let mut nll = 0f64;
+        let mut cnt = 0usize;
+
+        // Exact prompt pass over ids[..exact_end]: the seal consumes its
+        // q/k/v. Rows at or after requested_start are scored here when the
+        // bounded lead-in is longer than the caller's requested prefix.
         let mut pos = 0usize;
         if self.can_prefill_batched() {
             const CHUNK: usize = 128;
-            while pos < p {
-                let end = (pos + CHUNK).min(p);
-                let _ = self.prefill_batch(&ids[pos..end], pos);
+            while pos < exact_end {
+                let end = (pos + CHUNK).min(exact_end);
+                let hiddens = self.prefill_batch(&ids[pos..end], pos);
                 if self
                     .graph_failed
                     .swap(false, std::sync::atomic::Ordering::Relaxed)
@@ -5860,12 +6066,23 @@ impl Pipeline {
                         .store(false, std::sync::atomic::Ordering::Relaxed);
                     self.nll_end();
                     return Err("GPU graph failed during O(1) NLL prefix".into());
+                }
+                for row in 0..end - pos {
+                    let score_pos = pos + row;
+                    if score_pos >= requested_start && score_pos < n {
+                        nll += self.nll_from_hidden(
+                            &hiddens[row * self.hidden_size..(row + 1) * self.hidden_size],
+                            ids[score_pos + 1],
+                            score_pos,
+                        );
+                        cnt += 1;
+                    }
                 }
                 pos = end;
             }
         } else {
-            while pos < p {
-                let _ = self.forward_layers(&self.embed_single(ids[pos]), pos, None);
+            while pos < exact_end {
+                let hidden = self.forward_layers(&self.embed_single(ids[pos]), pos, None);
                 if self
                     .graph_failed
                     .swap(false, std::sync::atomic::Ordering::Relaxed)
@@ -5875,13 +6092,17 @@ impl Pipeline {
                     self.nll_end();
                     return Err("GPU graph failed during O(1) NLL prefix".into());
                 }
+                if pos >= requested_start && pos < n {
+                    nll += self.nll_from_hidden(&hidden, ids[pos + 1], pos);
+                    cnt += 1;
+                }
                 pos += 1;
             }
         }
-        self.o1_seal();
-
-        let mut nll = 0f64;
-        let mut cnt = 0usize;
+        self.o1_seal_checked().map_err(|err| {
+            self.nll_end();
+            err
+        })?;
 
         // Reuse the production whole-token batch graph for the post-seal
         // suffix when the caller explicitly enabled both routes. This is a
@@ -5908,13 +6129,13 @@ impl Pipeline {
                 "nll-batch: phase=post-seal admission={} requested_k={} scored_rows={}",
                 batch_admitted,
                 batch_k,
-                n.saturating_sub(p),
+                n.saturating_sub(exact_end),
             );
         }
         let mut batch_completed = false;
-        if batch_admitted && p < n {
+        if batch_admitted && exact_end < n {
             let hs = self.hidden_size;
-            let mut batch_pos = p;
+            let mut batch_pos = exact_end;
             while batch_pos < n {
                 let end = (batch_pos + batch_k).min(n);
                 let bk = end - batch_pos;
@@ -5968,7 +6189,7 @@ impl Pipeline {
                     }
                 }
             }
-            if batch_completed && cnt == n.saturating_sub(p) {
+            if batch_completed && cnt == n.saturating_sub(requested_start) {
                 self.nll_end();
                 return Ok((nll, cnt));
             }
@@ -5978,7 +6199,7 @@ impl Pipeline {
         // batch admission declines before mutation; callers must label this
         // CMF_BATCH_K=0/per-position path separately from the production
         // whole-token batch route.
-        for pos in p..n {
+        for pos in exact_end..n {
             let hidden = self.forward_layers(&self.embed_single(ids[pos]), pos, None);
             if self
                 .graph_failed
@@ -6619,6 +6840,11 @@ impl Pipeline {
             }
         }
         crate::gpu::set_layer(-1); // lm_head/final ops outside layer-split
+        // A batched span owns a complete set of positions. Publish any
+        // collecting→sealed transition only after every layer has finished;
+        // callers that cross into serial/device work must see the new epoch
+        // before this function returns.
+        self.o1_progress();
         h
     }
 
@@ -6674,6 +6900,9 @@ impl Pipeline {
             || b < 32
             || self.swa.is_some()
             || self.global_attn.is_some()
+            // Collection owns the exact Q trace and boundary conversion;
+            // this chunk graph appends dense KV without feeding that trace.
+            || self.o1_active()
             || self.attn_v_norm
             || (self.attn_scale - 1.0 / (self.head_dim as f32).sqrt()).abs() > 1e-9
         {
@@ -6912,7 +7141,9 @@ impl Pipeline {
         position: usize,
         task_mask: Option<&TaskMask>,
     ) -> Vec<f32> {
-        self.forward_layers_upto(hidden, position, task_mask, None)
+        let out = self.forward_layers_upto(hidden, position, task_mask, None);
+        self.o1_progress();
+        out
     }
 
     // ── Network pipeline-split building blocks (coordinator/worker) ──
@@ -6974,7 +7205,18 @@ impl Pipeline {
                 self.hidden_size
             ));
         }
-        Ok(self.forward_layers_span(hidden, position, task_mask, from, Some(upto)))
+        let out = self.forward_layers_span(hidden, position, task_mask, from, Some(upto));
+        self.o1_progress();
+        if self
+            .graph_failed
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            self.cancel
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            self.clear_sequence_state();
+            return Err("forward_span: deferred O(1) transition failed".into());
+        }
+        Ok(out)
     }
 
     /// Final norm + lm_head over a boundary hidden (the final-logit
@@ -7028,7 +7270,10 @@ impl Pipeline {
         // state lives on the device must walk positions through the
         // graph, not through the batched CPU span.
         if self.can_prefill_batched() && !self.graph_prefill_preferred() {
-            Ok(self.prefill_batch_span(PrefillIn::Ids(ids), start_pos, task_mask, 0, upto + 1))
+            let out =
+                self.prefill_batch_span(PrefillIn::Ids(ids), start_pos, task_mask, 0, upto + 1);
+            self.check_o1_progress_failure("prefill_span_ids")?;
+            Ok(out)
         } else {
             let hs = self.hidden_size;
             let mut out = Vec::with_capacity(ids.len() * hs);
@@ -7071,13 +7316,15 @@ impl Pipeline {
             ));
         }
         if self.can_prefill_batched() && !self.graph_prefill_preferred() {
-            Ok(self.prefill_batch_span(
+            let out = self.prefill_batch_span(
                 PrefillIn::Hidden(hidden),
                 start_pos,
                 task_mask,
                 from,
                 upto + 1,
-            ))
+            );
+            self.check_o1_progress_failure("prefill_span_hidden")?;
+            Ok(out)
         } else {
             let b = hidden.len() / hs;
             let mut out = Vec::with_capacity(hidden.len());
@@ -10183,11 +10430,16 @@ impl Pipeline {
         // every request is a fresh sequence. The shared reset also clears the
         // wgpu token graph's device-side recurrent state.
         crate::gpu::graph_race_begin_generation();
-        self.o1_begin();
+        if task_mask.is_none() {
+            self.o1_begin();
+        }
         let mut hidden = vec![0.0f32; self.hidden_size];
         for (pos, &id) in ids.iter().enumerate() {
             let emb = self.embed_single(id);
             hidden = self.forward_layers(&emb, pos, task_mask);
+        }
+        if let Err(err) = self.o1_seal_checked() {
+            self.o1_fail(err);
         }
         inference::rms_norm_into(
             &hidden,
@@ -13230,6 +13482,133 @@ mod tests {
         for (actual, expected) in actual.iter().zip(expected) {
             assert!((actual - expected).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn o1_batch_transition_publishes_one_epoch_before_serial_handoff() {
+        const B: usize = 19;
+        let mut p = create_test_pipeline(8, 16, 2, 1, 4, 2, 260);
+        p.set_o1(Some(crate::nystrom::O1Cfg {
+            layers: crate::nystrom::O1Layers::All,
+            m: 4,
+            w: 8,
+            sink: 2,
+            rect: crate::nystrom::O1Rect::Aggregate,
+        }));
+        p.o1_begin_with_prefix(Some(B));
+        let ids: Vec<u32> = (0..B as u32).collect();
+        let _ = p.prefill_batch_span(PrefillIn::Ids(&ids), 0, None, 0, p.num_layers);
+
+        assert_eq!(p.o1_epoch, 1, "all layers publish one completed transition");
+        assert!(p.kv_cache.layers.iter().all(|l| l.o1_sealed()));
+        let next = p.embed_single(B as u32);
+        let _ = p.forward_layers(&next, B, None);
+        assert_eq!(p.o1_epoch, 1, "sealed handoff must not republish the epoch");
+    }
+
+    #[test]
+    fn o1_pair_transition_commits_scratch_before_epoch_publication() {
+        const B: usize = 19;
+        let mut p = create_test_pipeline(8, 16, 2, 1, 4, 2, 260);
+        // Keep a real recurrent layer ahead of the Full O(1) layer so the
+        // pair test observes the GDN lane-2 scratch swap at the same
+        // boundary, rather than only exercising an artificial scratch vec.
+        let gdn_cfg = crate::linear_core::GdnCfg {
+            num_v_heads: 2,
+            num_k_heads: 1,
+            key_head_dim: 2,
+            value_head_dim: 4,
+            conv_kernel: 3,
+            hidden_size: 8,
+            rms_eps: 1e-6,
+            output_gate_sigmoid: false,
+        };
+        let synth = |n: usize, salt: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| (((i * 13 + salt * 7) % 97) as f32 / 97.0 - 0.5) * 0.4)
+                .collect()
+        };
+        let qt = |rows: usize, cols: usize, salt: usize| {
+            crate::qtensor::QTensor::from_f32(synth(rows * cols, salt), rows, cols)
+        };
+        let c_dim = gdn_cfg.conv_dim();
+        let vd = gdn_cfg.num_v_heads * gdn_cfg.value_head_dim;
+        p.weights.layers[0].attn = AttnKind::LinearGdn(crate::linear_core::GdnWeights {
+            in_proj_qkv: qt(c_dim, 8, 1),
+            in_proj_z: qt(vd, 8, 2),
+            in_proj_a: qt(gdn_cfg.num_v_heads, 8, 3),
+            in_proj_b: qt(gdn_cfg.num_v_heads, 8, 4),
+            conv1d: synth(c_dim * gdn_cfg.conv_kernel, 5),
+            a_log: vec![0.2, 0.5],
+            dt_bias: synth(gdn_cfg.num_v_heads, 6),
+            norm: vec![1.0; gdn_cfg.value_head_dim],
+            out_proj: qt(8, vd, 7),
+        });
+        p.gdn_cfg = Some(gdn_cfg);
+        p.set_o1(Some(crate::nystrom::O1Cfg {
+            layers: crate::nystrom::O1Layers::All,
+            m: 4,
+            w: 8,
+            sink: 2,
+            rect: crate::nystrom::O1Rect::Aggregate,
+        }));
+        p.o1_begin_with_prefix(Some(B));
+        for pos in 0..B - 2 {
+            let emb = p.embed_single(pos as u32);
+            let _ = p.forward_layers(&emb, pos, None);
+        }
+        let lane1_state = p.kv_cache.layers[0].linear_state.clone();
+
+        let e1 = p.embed_single((B - 2) as u32);
+        let e2 = p.embed_single((B - 1) as u32);
+        let _ = p.forward_pair(&e1, &e2, B - 2);
+
+        assert_eq!(p.o1_epoch, 1, "pair crossing B publishes one epoch");
+        assert!(
+            p.kv_cache
+                .layers
+                .iter()
+                .enumerate()
+                .all(|(li, l)| !p.o1_flags[li] || l.o1_sealed())
+        );
+        assert!(!p.kv_cache.layers[0].linear_state.is_empty());
+        assert_ne!(
+            p.kv_cache.layers[0].linear_state, lane1_state,
+            "real pair must commit GDN lane 2 before returning"
+        );
+        assert!(p.kv_cache.layers[0].linear_scratch.is_empty());
+        let next = p.embed_single(B as u32);
+        let _ = p.forward_layers(&next, B, None);
+        assert_eq!(p.o1_epoch, 1, "serial continuation must reuse the epoch");
+    }
+
+    #[test]
+    fn o1_error_observation_stays_terminal_until_reset() {
+        let mut p = create_test_pipeline(8, 16, 2, 1, 4, 1, 64);
+        p.set_o1(Some(crate::nystrom::O1Cfg {
+            layers: crate::nystrom::O1Layers::All,
+            m: 4,
+            w: 8,
+            sink: 2,
+            rect: crate::nystrom::O1Rect::Aggregate,
+        }));
+        p.o1_begin();
+        p.kv_cache.layers[0].o1_abort("synthetic transition failure".into());
+
+        assert!(p.o1_seal_checked().is_err());
+        assert!(
+            p.o1_seal_checked().is_err(),
+            "retry must see the sticky error"
+        );
+        let k = vec![0.2f32; 4];
+        let v = vec![0.3f32; 4];
+        p.kv_cache.layers[0].append(&k, &v, &[]);
+        assert_eq!(p.kv_cache.layers[0].seq_len, 0);
+
+        p.reset_session();
+        p.o1_begin();
+        p.kv_cache.layers[0].append(&k, &v, &[]);
+        assert_eq!(p.kv_cache.layers[0].seq_len, 1);
     }
 
     #[test]
