@@ -1,4 +1,5 @@
 //! Cortiq CLI — sparse task-routed model inference.
+#![recursion_limit = "256"]
 
 mod avout;
 mod awnp;
@@ -3180,16 +3181,22 @@ fn cmd_ppl(
         let prefill = o1_prefill
             .unwrap_or(ids.len() / 2)
             .min(ids.len().saturating_sub(1));
-        let (n_o1, c) = pipeline.nll_ids_o1(&ids, prefill);
+        let (n_o1, c) = pipeline
+            .nll_ids_o1(&ids, prefill)
+            .map_err(|e| anyhow::anyhow!(e))?;
         pipeline.set_o1(None);
-        let (n_ex, _) = pipeline.nll_ids_from(&ids, prefill);
+        let (n_ex, _) = pipeline
+            .nll_ids_from(&ids, prefill)
+            .map_err(|e| anyhow::anyhow!(e))?;
         report_o1_ppl(n_o1, n_ex, c, prefill, ids.len());
         dump_moe_stats(&pipeline)?;
         return Ok(());
     }
     if route_dynamic {
         let n = pipeline.enable_dynamic_routing();
-        let (ppl, switches) = pipeline.ppl_ids_dynamic(&ids);
+        let (ppl, switches) = pipeline
+            .ppl_ids_dynamic(&ids)
+            .map_err(|e| anyhow::anyhow!(e))?;
         println!(
             "PPL = {ppl:.3} over {} tokens | dynamic routing: {n} skills, {switches} switch(es)",
             ids.len()
@@ -3197,7 +3204,7 @@ fn cmd_ppl(
         dump_moe_stats(&pipeline)?;
         return Ok(());
     }
-    let ppl = pipeline.ppl_ids(&ids);
+    let ppl = pipeline.ppl_ids(&ids).map_err(|e| anyhow::anyhow!(e))?;
     println!("PPL = {ppl:.3} over {} tokens", ids.len());
 
     // B-field of claim 12: router expert-selection frequencies on this
@@ -3240,21 +3247,44 @@ fn ppl_windows(
         None => 0,
     };
     let (mut nll_o1, mut nll_ex, mut cnt) = (0f64, 0f64, 0usize);
-    for &off in offsets {
+    let progress = std::env::var("CMF_PPL_PROGRESS").as_deref() == Ok("1");
+    let started = std::time::Instant::now();
+    for (wi, &off) in offsets.iter().enumerate() {
         let w = &ids[off..off + wlen];
         if let Some(c) = &cfg {
             pipeline.set_o1(Some(c.clone()));
-            let (n, k) = pipeline.nll_ids_o1(w, prefill);
+            let (n, k) = pipeline
+                .nll_ids_o1(w, prefill)
+                .map_err(|e| anyhow::anyhow!(e))?;
             nll_o1 += n;
             pipeline.set_o1(None);
-            let (n, k2) = pipeline.nll_ids_from(w, prefill);
+            let (n, k2) = pipeline
+                .nll_ids_from(w, prefill)
+                .map_err(|e| anyhow::anyhow!(e))?;
             debug_assert_eq!(k, k2, "o1 and exact must score the same tokens");
             nll_ex += n;
             cnt += k;
         } else {
-            let (n, k) = pipeline.nll_ids_from(w, 0);
+            let (n, k) = pipeline
+                .nll_ids_from(w, 0)
+                .map_err(|e| anyhow::anyhow!(e))?;
             nll_ex += n;
             cnt += k;
+        }
+        if progress {
+            eprintln!(
+                "ppl-window: index={} offset={} scored={} elapsed_ms={} exact_nll={:.6}{}",
+                wi + 1,
+                off,
+                cnt,
+                started.elapsed().as_millis(),
+                nll_ex,
+                if cfg.is_some() {
+                    format!(" o1_nll={:.6}", nll_o1)
+                } else {
+                    String::new()
+                }
+            );
         }
     }
     println!(
@@ -4087,6 +4117,7 @@ async fn cmd_run(
         tracing::info!("no chat template in this container — running completion mode");
     }
 
+    let noninteractive_generate = prompt.is_some();
     let mut generate_and_print = |pipeline: &mut Pipeline,
                                   ids: &[u32]|
      -> anyhow::Result<Option<String>> {
@@ -4241,6 +4272,9 @@ async fn cmd_run(
                 // specials stripped) — exactly the assistant turn to carry
                 // into the next render.
                 return Ok(Some(r.text));
+            }
+            Err(e) if noninteractive_generate => {
+                return Err(anyhow::anyhow!("generation failed: {e}"));
             }
             Err(e) => println!("error: {e}"),
         }
@@ -5425,7 +5459,7 @@ fn cmd_bench_bw(json: bool, model: &str) -> anyhow::Result<()> {
         std::hint::black_box(&dst);
     }
     let host_gbs = (BLOCK * ROUNDS) as f64 / t0.elapsed().as_secs_f64() / 1e9;
-    let pcie_gbs = cortiq_engine::gpu_wgpu::upload_bandwidth_probe(BLOCK, ROUNDS);
+    let pcie_gbs = cortiq_engine::gpu::upload_bandwidth_probe(BLOCK, ROUNDS);
     if json {
         println!(
             "{{\"host_copy_gbs\": {host_gbs:.2}, \"upload_gbs\": {:.2}, \"storage_gbs\": {:.2}}}",
@@ -5444,6 +5478,35 @@ fn cmd_bench_bw(json: bool, model: &str) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Select the prompt timing path used by the measured generation.  A
+/// selected generation prefill must not be preceded by an unselected full
+/// `forward_ids` pass: that pass is useful for the ordinary reference row,
+/// but it is a misleading depth measurement for bounded O(1) or batched
+/// graph ingestion.
+fn bench_generation_prefill_path(
+    o1_active: bool,
+    task_mask_present: bool,
+    prompt_len: usize,
+    o1_prefill: Option<usize>,
+    batch_k: Option<usize>,
+    graph_prefill: bool,
+) -> Option<&'static str> {
+    if task_mask_present {
+        return None;
+    }
+    if o1_active && o1_prefill.is_some_and(|p| p > 0 && p < prompt_len) {
+        return Some("generation_ttft_bounded_o1");
+    }
+    if !o1_active && batch_k.is_some_and(|k| k > 0) {
+        return Some(if graph_prefill {
+            "generation_ttft_token_graph_prefill"
+        } else {
+            "generation_ttft_batched_graph"
+        });
+    }
+    None
 }
 
 async fn cmd_bench(
@@ -5546,7 +5609,7 @@ async fn cmd_bench(
             }
         }
     }
-    if pipeline.o1_active() {
+    if pipeline.o1_active() && !json {
         println!("  O(1):    nystrom attention on (KV replaced on flagged layers)");
     }
     let runtime = CortiqRuntime::new(model);
@@ -5739,12 +5802,39 @@ async fn cmd_bench(
         .generate_from_ids(warm_ids, 8, mask.as_ref(), None)
         .map_err(|e| anyhow::anyhow!(e))?;
 
-    // Prefill benchmark.
-    let t0 = std::time::Instant::now();
-    let _ = pipeline
-        .forward_ids(&prompt_ids, mask.as_ref())
-        .map_err(|e| anyhow::anyhow!(e))?;
-    let prefill_s = t0.elapsed().as_secs_f64();
+    // Prefill benchmark.  Bounded O(1) generation deliberately calibrates
+    // only the requested prefix and streams the suffix through its sealed
+    // state; batched graph generation similarly chooses a different ingest
+    // path.  Running forward_ids here would silently do a second full
+    // prefill before the real selected generation, so it would dominate
+    // depth/TTFT and report the wrong path as `prefill_tok_s`.
+    let o1_prefill_requested = std::env::var("CMF_O1_PREFILL")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
+    let batch_k_requested = std::env::var("CMF_BATCH_K")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
+    let prefill_measurement = bench_generation_prefill_path(
+        pipeline.o1_active(),
+        mask.is_some(),
+        prompt_ids.len(),
+        o1_prefill_requested,
+        batch_k_requested,
+        pipeline.generation_graph_prefill(),
+    );
+    let bounded_o1_prefill = prefill_measurement == Some("generation_ttft_bounded_o1");
+    let batched_graph_prefill = prefill_measurement == Some("generation_ttft_batched_graph");
+    let token_graph_prefill = prefill_measurement == Some("generation_ttft_token_graph_prefill");
+    let generation_prefill = prefill_measurement.is_some();
+    let prefill_s = if generation_prefill {
+        None
+    } else {
+        let t0 = std::time::Instant::now();
+        let _ = pipeline
+            .forward_ids(&prompt_ids, mask.as_ref())
+            .map_err(|e| anyhow::anyhow!(e))?;
+        Some(t0.elapsed().as_secs_f64())
+    };
 
     // Pair-fusion micro-bench: the memory-traffic win MTP verify rides
     // on. Skipped under o1 — forward_pair appends into the (sealed,
@@ -5764,6 +5854,10 @@ async fn cmd_bench(
     // allocations/token and pool dispatches/token come from the same
     // inter-token deltas as the steady tok/s (roadmap этап 0).
     type Stamp = (std::time::Instant, u64, usize, GpuCounterSnapshot);
+    let graph_ok0 = cortiq_engine::pipeline::GRAPH_TOK_OK.load(AtomicOrdering::Relaxed);
+    let graph_prefix0 = cortiq_engine::pipeline::GRAPH_TOK_PREFIX.load(AtomicOrdering::Relaxed);
+    let graph_full0 = cortiq_engine::pipeline::GRAPH_TOK_FULL.load(AtomicOrdering::Relaxed);
+    let graph_miss0 = cortiq_engine::pipeline::GRAPH_TOK_MISS.load(AtomicOrdering::Relaxed);
     let stamps: Arc<std::sync::Mutex<Vec<Stamp>>> = Arc::default();
     let st = stamps.clone();
     let cb: cortiq_engine::TokenCallback = Box::new(move |_tok| {
@@ -5780,14 +5874,22 @@ async fn cmd_bench(
         .generate_from_ids(&prompt_ids, tokens as usize, mask.as_ref(), Some(cb))
         .map_err(|e| anyhow::anyhow!(e))?;
     let total_s = t1.elapsed().as_secs_f64();
+    let graph_ok = cortiq_engine::pipeline::GRAPH_TOK_OK
+        .load(AtomicOrdering::Relaxed)
+        .saturating_sub(graph_ok0);
+    let graph_prefix = cortiq_engine::pipeline::GRAPH_TOK_PREFIX
+        .load(AtomicOrdering::Relaxed)
+        .saturating_sub(graph_prefix0);
+    let graph_full = cortiq_engine::pipeline::GRAPH_TOK_FULL
+        .load(AtomicOrdering::Relaxed)
+        .saturating_sub(graph_full0);
+    let graph_miss = cortiq_engine::pipeline::GRAPH_TOK_MISS
+        .load(AtomicOrdering::Relaxed)
+        .saturating_sub(graph_miss0);
+    let gpu_vram_budget = cortiq_engine::gpu::vram_budget();
+    let gpu_resident_weight = cortiq_engine::gpu::resident_bytes();
+    let (o1_device_layers, o1_device_state_bytes) = pipeline.o1_device_stats();
 
-    if !json {
-        println!(
-            "  Prompt:  {} tokens | prefill {:.1} tok/s",
-            prompt_ids.len(),
-            prompt_ids.len() as f64 / prefill_s.max(1e-9)
-        );
-    }
     let stamps = stamps.lock().unwrap();
     // stamp[0] fires right after generation's prefill (the first token
     // is sampled from the prefill hidden, no decode forward yet).
@@ -5853,6 +5955,40 @@ async fn cmd_bench(
         .first()
         .map(|s| s.0.duration_since(t1).as_secs_f64())
         .unwrap_or(0.0);
+    // For the bounded profile, TTFT is the only honest end-to-end prompt
+    // measure because it includes exactly the prefix calibration plus the
+    // O(1) suffix stream that production generation uses.  Keep the field
+    // joinable with ordinary rows and label its provenance explicitly.
+    let prefill_tok_s = prefill_s
+        .map(|s| prompt_ids.len() as f64 / s.max(1e-9))
+        .unwrap_or_else(|| prompt_ids.len() as f64 / ttft_s.max(1e-9));
+    if !json {
+        if bounded_o1_prefill {
+            println!(
+                "  Prompt:  {} tokens | bounded generation prefill {:.1} tok/s (TTFT)",
+                prompt_ids.len(),
+                prefill_tok_s
+            );
+        } else if token_graph_prefill {
+            println!(
+                "  Prompt:  {} tokens | token-graph generation prefill {:.1} tok/s (TTFT)",
+                prompt_ids.len(),
+                prefill_tok_s
+            );
+        } else if batched_graph_prefill {
+            println!(
+                "  Prompt:  {} tokens | batched generation prefill {:.1} tok/s (TTFT)",
+                prompt_ids.len(),
+                prefill_tok_s
+            );
+        } else {
+            println!(
+                "  Prompt:  {} tokens | prefill {:.1} tok/s",
+                prompt_ids.len(),
+                prefill_tok_s
+            );
+        }
+    }
     // KV/state residency at the end of the run: full-attention layers
     // grow O(context); the linear core (vmf_phase/GDN) and the nystrom
     // override hold O(1) state — this line is the long-context memory
@@ -5877,9 +6013,14 @@ async fn cmd_bench(
             "task": task,
             "ctx": ctx,
             "o1": pipeline.o1_active(),
+            "o1_prefill_tokens": std::env::var("CMF_O1_PREFILL")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok()),
             "threads_env": std::env::var("CMF_THREADS").ok(),
             "prompt_tokens": prompt_ids.len(),
-            "prefill_tok_s": prompt_ids.len() as f64 / prefill_s.max(1e-9),
+            "prefill_tok_s": prefill_tok_s,
+            "prefill_forward_s": prefill_s,
+            "prefill_measurement": prefill_measurement.unwrap_or("forward_ids"),
             "tokens_generated": result.tokens_generated,
             "metal_submits_per_token": metal_submits_per_token,
             "wgpu_submits_per_token": wgpu_submits_per_token,
@@ -5888,6 +6029,14 @@ async fn cmd_bench(
             "wgpu_upload_mb": wgpu_uploads().1,
             "wgpu_steady_upload_ms_per_token": wgpu_steady_upload_ms_per_token,
             "wgpu_steady_upload_mb_per_token": wgpu_steady_upload_mb_per_token,
+            "graph_tokens": graph_ok,
+            "graph_full_tokens": graph_full,
+            "graph_prefix_tokens": graph_prefix,
+            "graph_miss_tokens": graph_miss,
+            "gpu_vram_budget_bytes": gpu_vram_budget,
+            "gpu_resident_weight_bytes": gpu_resident_weight,
+            "o1_device_layers": o1_device_layers,
+            "o1_device_state_bytes": o1_device_state_bytes,
             "decode_tok_s_steady": decode_tps,
             "decode_tok_s_incl_prefill": result.tokens_generated as f64 / total_s.max(1e-9),
             "ttft_s": ttft_s,
@@ -5920,6 +6069,16 @@ async fn cmd_bench(
         "  Steady:  {:.1} allocs/token | {:.1} pool dispatches/token",
         allocs_per_token, dispatches_per_token
     );
+    if gpu_vram_budget > 0 {
+        println!(
+            "  GPU:     graph full {} | prefix {} | miss {} | resident {:.1} MB / budget {:.1} MB",
+            graph_full,
+            graph_prefix,
+            graph_miss,
+            gpu_resident_weight as f64 / 1e6,
+            gpu_vram_budget as f64 / 1e6
+        );
+    }
     // `bench` is where the dsv4 breakdown is actually wanted — `run` had it
     // and this did not, so every timing question needed a second command
     // measuring a different workload.
@@ -6021,5 +6180,31 @@ mod tests {
         let r = SessionState::read(p);
         std::fs::remove_file(p).ok();
         assert!(r.is_err(), "bad magic must be rejected");
+    }
+
+    #[test]
+    fn bench_prefill_path_matches_selected_generation() {
+        assert_eq!(
+            bench_generation_prefill_path(false, false, 2048, None, Some(128), false),
+            Some("generation_ttft_batched_graph")
+        );
+        assert_eq!(
+            bench_generation_prefill_path(false, false, 2048, None, Some(128), true),
+            Some("generation_ttft_token_graph_prefill")
+        );
+        assert_eq!(
+            bench_generation_prefill_path(true, false, 2048, Some(256), None, false),
+            Some("generation_ttft_bounded_o1")
+        );
+        // Invalid/full-prefix and task-masked paths retain the ordinary
+        // forward_ids timing, so a caller cannot accidentally skip it.
+        assert_eq!(
+            bench_generation_prefill_path(true, false, 2048, Some(2048), None, false),
+            None
+        );
+        assert_eq!(
+            bench_generation_prefill_path(false, true, 2048, None, Some(128), true),
+            None
+        );
     }
 }

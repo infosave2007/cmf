@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.5] - 2026-09-08
+
+### Changed
+- Qwen Q4TP ordinary decode and the opt-in bounded O(1)/MTP graph paths now
+  keep graph admission, device-state restore and token outcomes explicit, so
+  a failed graph cannot be reported as a successful cancellation or silently
+  continue from stale recurrent state.
+- NLL/PPL scoring now returns runtime failures through the CLI, skill quality
+  gates, GPTQ capture and maintained probe examples. Exact scoring remains the
+  reference path for release measurements. This is a source API change:
+  public `nll_ids_*`, `ppl_ids*`, `nll_ids_o1` and
+  `probe_ffn_mass_batch` return `Result`; external Rust callers must handle
+  those errors.
+- The release workflow accepts a build-only manual dispatch that runs the
+  complete package matrix while skipping GitHub release attachments; tag and
+  attachment defaults remain unchanged.
+- The 0.6.5 baseline adds Spectra's streaming dual-energy X-ray colorizer and
+  portable profile serialization across core versions, and streamlines the
+  project documentation.
+
+### Fixed
+- Qwen graph verification restores speculative KV/GDN state at the accepted
+  cursor and records bounded prefill provenance in benchmark output.
+- Windows release archives now emit portable LF checksum files.
+
+### Known limitations
+- O(1) retrieval and speculative paths remain opt-in experimental diagnostics;
+  exact ordinary scoring is authoritative and no retrieval profile is promoted
+  by this release.
+
 ## [0.6.4] - 2026-08-27
 
 ### Added

@@ -1059,6 +1059,33 @@ pub fn vram_budget() -> u64 {
     }
 }
 
+/// Bytes currently accounted as resident weight buffers on the active wgpu
+/// adapter.  This is the logical device-local weight set; physical driver
+/// allocations are reported separately by the platform tools.
+pub fn resident_bytes() -> u64 {
+    #[cfg(feature = "gpu")]
+    {
+        if backend() == Backend::Wgpu {
+            return crate::gpu_wgpu::resident_bytes();
+        }
+    }
+    0
+}
+
+/// Sealed O(1) device mirror count and logical bytes for one pipeline id.
+/// Zero is returned when wgpu is unavailable or the sequence has not reached
+/// an O(1) seal yet.
+pub fn o1_device_stats(kv_id: u64) -> (usize, u64) {
+    #[cfg(feature = "gpu")]
+    {
+        if backend() == Backend::Wgpu {
+            return crate::gpu_wgpu::o1_device_stats(kv_id);
+        }
+    }
+    let _ = kv_id;
+    (0, 0)
+}
+
 /// Device weight bytes uploaded so far (wgpu; 0 on other backends).
 /// Steady-state windows must show a ZERO delta — growth mid-benchmark
 /// means eviction/re-upload and disqualifies the number.
@@ -1069,6 +1096,18 @@ pub fn upload_bytes() -> u64 {
     }
     #[cfg(not(feature = "gpu"))]
     0
+}
+
+/// Measure a transient host-to-device upload when the wgpu backend is
+/// compiled in. CPU-only builds keep the benchmark command available and
+/// report no device measurement instead of referring to the gated module.
+pub fn upload_bandwidth_probe(block: usize, rounds: usize) -> Option<f64> {
+    #[cfg(feature = "gpu")]
+    {
+        return crate::gpu_wgpu::upload_bandwidth_probe(block, rounds);
+    }
+    let _ = (block, rounds);
+    None
 }
 
 /// Which half of the run is asking.
@@ -1393,8 +1432,20 @@ pub enum GraphFfn<'a> {
     },
 }
 
+/// Outcome of one whole-token graph attempt. A failed attempt after sealed
+/// O(1) state was admitted must not fall through to the stale CPU state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TokenGraphOutcome {
+    /// No command was committed; the caller may use its ordinary path.
+    Declined,
+    /// The graph completed and its hidden/logits output is valid.
+    Completed,
+    /// Sealed O(1) state was admitted and a later graph operation failed.
+    Failed,
+}
+
 /// Whole-token decode graph on wgpu: the entire layer stack in ONE submit,
-/// hidden resident, one readback. Updates `h` in place. false = refusal.
+/// hidden resident, one readback. Updates `h` in place.
 /// `loop_norm_at`: virtual layer indices after which `final_norm` is applied
 /// (Looped Transformer mid-stack norm). Empty for standard models.
 #[allow(clippy::too_many_arguments)]
@@ -1435,7 +1486,7 @@ pub fn forward_token_graph(
     layer_base: usize,
     // Read the final hidden back alongside the fused head's logits.
     hidden_too: bool,
-) -> bool {
+) -> TokenGraphOutcome {
     match backend() {
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::forward_token_graph(
@@ -1480,7 +1531,7 @@ pub fn forward_token_graph(
                 layer_base,
                 hidden_too,
             );
-            false
+            TokenGraphOutcome::Declined
         }
     }
 }
@@ -1488,6 +1539,19 @@ pub fn forward_token_graph(
 /// Speculative-verify tail for the batched graph: fold final-norm + lm_head
 /// over every batch position and read all k logit rows back; the batch also
 /// snapshots the GDN state per position for `gdn_spec_restore`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BatchGraphOutcome {
+    /// The graph declined before mutating persistent device state. Callers may
+    /// safely use the existing per-position path.
+    Declined,
+    /// The complete batch committed and its readback succeeded.
+    Completed,
+    /// A batch that had admitted sealed O(1) state failed after admission.
+    /// Falling back to CPU would mix two state machines, so the caller must
+    /// abort and clear the sequence instead.
+    Failed,
+}
+
 pub struct SpecTail<'a> {
     pub lm: GraphW<'a>,
     pub lm_rows: usize,
@@ -1517,34 +1581,58 @@ pub fn forward_batch_graph(
     eps: f32,
     attn_scale: f32,
     k: usize,
+    // Per-layer sealed O(1) device views. An empty slice means the ordinary
+    // exact-KV path; otherwise it must have one entry per graph layer.
+    o1: &[Option<Vec<crate::nystrom::O1DeviceView<'_>>>],
+    o1_epoch: u64,
     spec: Option<SpecTail<'_>>,
-) -> bool {
+) -> BatchGraphOutcome {
     match backend() {
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::forward_batch_graph(
             model, kv_id, layers, invf, h, nh, nkv, hd, rd, hidden, inter, positions, cap, gemma,
-            eps, attn_scale, k, spec,
+            eps, attn_scale, k, o1, o1_epoch, spec,
         ),
         #[allow(unreachable_patterns)]
         _ => {
-            let _ = spec;
-            false
+            let _ = (o1, o1_epoch, spec);
+            BatchGraphOutcome::Declined
         }
     }
 }
 
 /// After a partial speculative acceptance: restore every GDN layer's device
-/// state to the snapshot after batch position `slot`. wgpu only.
-pub fn gdn_spec_restore(kv_id: u64, slot: usize) -> bool {
+/// state to the snapshot after batch position `slot`. `base_pos` is the
+/// absolute position of the first verify row and `expected_layers` makes the
+/// restore all-or-nothing across the model's recurrent layers. wgpu only.
+pub fn gdn_spec_restore(kv_id: u64, slot: usize, base_pos: usize, expected_layers: usize) -> bool {
     #[cfg(feature = "gpu")]
     if backend() == Backend::Wgpu {
-        return crate::gpu_wgpu::gdn_spec_restore(kv_id, slot);
+        return crate::gpu_wgpu::gdn_spec_restore(kv_id, slot, base_pos, expected_layers);
     }
     #[allow(unreachable_code)]
     {
-        let _ = (kv_id, slot);
+        let _ = (kv_id, slot, base_pos, expected_layers);
         false
     }
+}
+
+/// Re-point one exact-attention device mirror after a speculative round has
+/// discarded unaccepted rows. The rows beyond `stored` remain allocated and
+/// are overwritten by the next append; only the logical cursor moves. This
+/// is the wgpu twin of Metal's existing mirror cursor helper and keeps the
+/// MTP graph's speculative/device cache coherent with its real anchor.
+pub fn graph_kv_set_stored(kv_id: u64, layer: usize, stored: usize) -> bool {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::kv_mirror_set_stored(kv_id, layer, stored);
+    }
+    #[cfg(target_os = "macos")]
+    if backend() == Backend::Metal {
+        crate::gpu_metal::kv_mirror_set_stored(kv_id, layer, stored);
+        return true;
+    }
+    false
 }
 
 /// Drop the wgpu token graph's device K/V mirror for a pipeline.

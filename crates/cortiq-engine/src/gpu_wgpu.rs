@@ -8889,7 +8889,7 @@ fn moe_down_q4tp_b2(@builtin(workgroup_id) wid: vec3<u32>,
 // layer per token: THREE dispatches replacing kv_append+attend, and the
 // work is O(m + w) instead of O(ctx) — the graph's exact attend was
 // 54 -> 37.8 tok/s from 4K to 16K while o1 holds flat by construction.
-struct O1P { hpg: u32, m: u32, w: u32, nsrect: u32, d: u32, dv: u32, scale: f32, _p: u32 };
+struct O1P { hpg: u32, m: u32, w: u32, nsrect: u32, d: u32, dv: u32, scale: f32, goff: u32 };
 
 @group(0) @binding(0) var<storage, read_write> of_meta : array<u32>;
 @group(0) @binding(1) var<storage, read>       of_rk   : array<f32>;
@@ -8982,13 +8982,18 @@ fn o1_push(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_inde
     var t = lid;
     loop {
         if (t >= d) { break; }
-        op_rk[(g * op_p.w + slot) * d + t] = op_k[g * d + t];
+        // `goff` is the batch row's Q element offset.  K/V rows are shorter
+        // by `hpg`, so divide once here instead of carrying a second offset
+        // through the fixed 32-byte uniform.  The token graph keeps goff=0.
+        op_rk[(g * op_p.w + slot) * d + t] =
+            op_k[(op_p.goff / op_p.hpg) + g * d + t];
         t = t + 256u;
     }
     t = lid;
     loop {
         if (t >= op_p.dv) { break; }
-        op_rv[(g * op_p.w + slot) * op_p.dv + t] = op_v[g * op_p.dv + t];
+        op_rv[(g * op_p.w + slot) * op_p.dv + t] =
+            op_v[(op_p.goff / op_p.hpg) + g * op_p.dv + t];
         t = t + 256u;
     }
     workgroupBarrier();
@@ -9015,7 +9020,11 @@ fn o1_push(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_inde
 @group(0) @binding(10) var<storage, read_write> oa_out  : array<f32>;
 @group(0) @binding(11) var<uniform>             oa_p    : O1P;
 var<workgroup> oa_qs:  array<f32, 256>;
-var<workgroup> oa_scr: array<f32, 160>;
+// The admission contract permits sink + sliding window up to 196 rows
+// (w192/sink4 is the selected long-context profile).  Keep the workgroup
+// softmax scratch at that same bound; a 160-entry array made the otherwise
+// valid w192 route index past the shader allocation.
+var<workgroup> oa_scr: array<f32, 196>;
 var<workgroup> oa_f:   array<f32, 32>;
 var<workgroup> oa_u:   array<f32, 32>;
 var<workgroup> oa_red: array<f32, 256>;
@@ -9042,6 +9051,9 @@ fn o1_attend(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_in
     var t = lid;
     loop {
         if (t >= d) { break; }
+        // `oa_q` is the one-row rope scratch (the batch input is consumed by
+        // attn_rope before this kernel), so its base stays zero just like the
+        // token graph. `goff` belongs only to the batch K/V source in push.
         oa_qs[t] = oa_q[gh * d + t];
         t = t + 256u;
     }
@@ -13263,11 +13275,15 @@ struct Ctx {
     /// GDN recurrent state per (kv_id, layer): (conv ring, S), persists across
     /// decode tokens (created zeroed on first touch).
     gdn_state: Mutex<HashMap<(u64, usize), (wgpu::Buffer, wgpu::Buffer)>>,
+    /// Shape and absolute next-position cursor for each resident GDN state.
+    /// The state buffers are recurrent, so a gap or reordered batch cannot be
+    /// repaired by choosing a different RoPE position.
+    gdn_cursor: Mutex<HashMap<(u64, usize), GdnCursor>>,
     /// Speculative verify: per (kv_id, layer) snapshot buffer holding the
     /// GDN (ring, S) after every batch position, so a partial acceptance
     /// restores the recurrent state to the last position that was real.
     /// Value: (buffer, ring bytes, state bytes, slots).
-    gdn_snap: Mutex<HashMap<(u64, usize), (wgpu::Buffer, u64, u64, usize)>>,
+    gdn_snap: Mutex<HashMap<(u64, usize), (wgpu::Buffer, u64, u64, usize, usize)>>,
     /// Per-layer concatenated MoE expert weights (gate_all, up_all, down_all)
     /// keyed by (file base ptr, first gate idx) — every routed expert plus the
     /// shared one as the trailing block, uploaded once, addressed by expert id
@@ -13337,6 +13353,13 @@ struct KvMirror {
     v: wgpu::Buffer,
     synced: usize,
     cap: usize,
+}
+
+#[derive(Clone, Copy)]
+struct GdnCursor {
+    /// (nv, nk, dk, dv, kernel, packed qkv width)
+    dims: (usize, usize, usize, usize, usize, usize),
+    next_pos: usize,
 }
 
 /// Device KV mirrors grow with the conversation instead of reserving the
@@ -13673,6 +13696,15 @@ fn ctx_for(dev: usize) -> Option<&'static Ctx> {
 /// and a layer split.
 pub fn device_vram_budget() -> u64 {
     ctx().map(|c| c.vram_budget).unwrap_or(0)
+}
+
+/// Logical bytes currently held by the weight-residency arena on the active
+/// adapter.  A sequence's KV/O(1) buffers are intentionally excluded; callers
+/// report those through the pipeline and `o1_device_stats`.
+pub fn resident_bytes() -> u64 {
+    ctx()
+        .map(|c| c.resident.load(std::sync::atomic::Ordering::Relaxed))
+        .unwrap_or(0)
 }
 
 /// Physical live-set ceiling used while an over-size graph is assembled.
@@ -14947,6 +14979,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         rs_bufs: Mutex::new(HashMap::new()),
         attn_kv: Mutex::new(HashMap::new()),
         gdn_state: Mutex::new(HashMap::new()),
+        gdn_cursor: Mutex::new(HashMap::new()),
         gdn_snap: Mutex::new(HashMap::new()),
         moe_expw: Mutex::new(HashMap::new()),
         dsv4_global_moe: Mutex::new(HashMap::new()),
@@ -17468,7 +17501,8 @@ fn graph_stack_payload_bytes(
 /// residual → rmsnorm → SiLU-FFN → residual, every layer) encoded into ONE
 /// command buffer with the hidden RESIDENT on the GPU — only the final hidden
 /// reads back (one submit/token instead of ~2 per layer). This is what lifts
-/// the submit-latency wall. Returns false on any refusal (caller keeps CPU).
+/// the submit-latency wall. A failed run after sealed O(1) admission is
+/// distinct from a preflight refusal because the CPU state is stale.
 #[allow(clippy::too_many_arguments)]
 pub fn forward_token_graph(
     model: &Arc<CmfModel>,
@@ -17516,11 +17550,16 @@ pub fn forward_token_graph(
     // MTP draft chain feeds the block's hidden to its next step and wants
     // the head's logits from the same submit).
     hidden_too: bool,
-) -> bool {
+) -> crate::gpu::TokenGraphOutcome {
     let _hp_t0 = std::time::Instant::now(); // CMF_GRAPH_HOSTPROF
+    let mut o1_started = false;
+    // Persistent GDN/short-conv state makes a submitted graph mutation-sensitive
+    // even when O(1) is not enabled.  A failed readback must therefore abort
+    // the sequence instead of declining into a stale CPU fallback.
+    let mut state_started = false;
     let Some(c) = ctx() else {
         graph_refused("no ctx");
-        return false;
+        return token_graph_outcome(o1_started || state_started, false);
     };
     let graph_live_budget = graph_live_weight_budget(c, model);
     if position >= cap || hd % 4 != 0 || hd > c.hd_cap {
@@ -17535,7 +17574,7 @@ pub fn forward_token_graph(
                 );
             }
         }
-        return false; // vec4 K/V reads; hd_cap = workgroup-storage limit
+        return token_graph_outcome(o1_started || state_started, false); // vec4 K/V reads; hd_cap = workgroup-storage limit
     }
     let cap = kv_capacity(cap, position.saturating_add(steps.max(1)));
     let t_start = std::time::Instant::now();
@@ -17755,12 +17794,12 @@ pub fn forward_token_graph(
     for l in layers {
         let Some(layer_bytes) = graph_layer_payload_bytes(model, l) else {
             graph_decline("cannot size layer payload");
-            return false;
+            return token_graph_outcome(o1_started || state_started, false);
         };
         if graph_bytes.saturating_add(layer_bytes) > graph_live_budget {
             if lws.is_empty() {
                 graph_decline("one layer exceeds the weight budget");
-                return false;
+                return token_graph_outcome(o1_started || state_started, false);
             }
             prefix = true;
             break;
@@ -17784,7 +17823,7 @@ pub fn forward_token_graph(
                     resolve(wo, hidden, nh * hd),
                 ) else {
                     graph_decline("attn q/k/v/o resolve");
-                    return false;
+                    return token_graph_outcome(o1_started || state_started, false);
                 };
                 LAttn::Full { wq, wk, wv, wo }
             }
@@ -17802,7 +17841,12 @@ pub fn forward_token_graph(
                 ..
             } => {
                 let cdim = 2 * nk * dk + nv * dv;
-                gdn_dims = Some((*nv, *nk, *dk, *dv, *kk, cdim));
+                let dims = (*nv, *nk, *dk, *dv, *kk, cdim);
+                if gdn_dims.is_some_and(|prev| prev != dims) {
+                    graph_decline("heterogeneous GDN geometry across token-graph layers");
+                    return token_graph_outcome(o1_started || state_started, false);
+                }
+                gdn_dims = Some(dims);
                 let (Some(qkv), Some(z), Some(a), Some(b), Some(out)) = (
                     resolve(qkv, cdim, hidden),
                     resolve(z, nv * dv, hidden),
@@ -17811,7 +17855,7 @@ pub fn forward_token_graph(
                     resolve(out, hidden, nv * dv),
                 ) else {
                     graph_decline("weight resolve (dtype/shape outside graph contract)");
-                    return false;
+                    return token_graph_outcome(o1_started || state_started, false);
                 };
                 LAttn::Gdn {
                     qkv,
@@ -17835,7 +17879,7 @@ pub fn forward_token_graph(
                     resolve(out, hidden, hidden),
                 ) else {
                     graph_decline("short-conv resolve (dtype outside graph contract)");
-                    return false;
+                    return token_graph_outcome(o1_started || state_started, false);
                 };
                 LAttn::Conv {
                     inp,
@@ -17861,7 +17905,7 @@ pub fn forward_token_graph(
                     resolve(down, hidden, ffn_w),
                 ) else {
                     graph_decline("weight resolve (dtype/shape outside graph contract)");
-                    return false;
+                    return token_graph_outcome(o1_started || state_started, false);
                 };
                 LFfn::Dense {
                     gate,
@@ -17892,11 +17936,11 @@ pub fn forward_token_graph(
                         "moe shape: top_k {top_k} n_exp {n_exp} experts {} (want {want})",
                         experts.len()
                     ));
-                    return false;
+                    return token_graph_outcome(o1_started || state_started, false);
                 }
                 let Some(router) = resolve(router, *n_exp, hidden) else {
                     graph_decline("moe router resolve");
-                    return false;
+                    return token_graph_outcome(o1_started || state_started, false);
                 };
                 // Without a shared expert there is no gate to resolve; the
                 // kernel never reads it (flags bit 3 off), so the router
@@ -17904,7 +17948,7 @@ pub fn forward_token_graph(
                 let sgate = if *has_shared {
                     let Some(sg) = resolve(shared_gate, 1, hidden) else {
                         graph_decline("moe shared_gate resolve");
-                        return false;
+                        return token_graph_outcome(o1_started || state_started, false);
                     };
                     sg
                 } else {
@@ -17932,7 +17976,7 @@ pub fn forward_token_graph(
                     moe_expert_bufs(c, model, experts, *mi, hidden, *q4tp, *gu_q2, false)
                 else {
                     graph_decline("moe_expert_bufs (pack/budget/dtype)");
-                    return false;
+                    return token_graph_outcome(o1_started || state_started, false);
                 };
                 LFfn::Moe {
                     router,
@@ -17992,7 +18036,7 @@ pub fn forward_token_graph(
         if graph_bytes.saturating_add(tail_bytes) > graph_live_budget {
             if lws.pop().is_none() {
                 graph_decline("layers plus tail exceed the weight budget");
-                return false;
+                return token_graph_outcome(o1_started || state_started, false);
             }
             prefix = true;
         }
@@ -18002,7 +18046,7 @@ pub fn forward_token_graph(
         // which a prefix does not reach — those callers fall back whole.
         if steps > 1 || ids_out.is_some() {
             graph_refused("device prefix cannot serve the multi-step tail");
-            return false;
+            return token_graph_outcome(o1_started || state_started, false);
         }
         use std::sync::atomic::{AtomicBool, Ordering};
         static SAID: AtomicBool = AtomicBool::new(false);
@@ -18207,6 +18251,7 @@ pub fn forward_token_graph(
     {
         let mut kvm = c.attn_kv.lock().unwrap();
         let mut gsm = c.gdn_state.lock().unwrap();
+        let mut gcm = c.gdn_cursor.lock().unwrap();
         for (li, l) in layers.iter().enumerate() {
             match &l.attn {
                 crate::gpu::GraphAttn::Full { cpu_k, cpu_v, .. } => {
@@ -18219,6 +18264,13 @@ pub fn forward_token_graph(
                         continue;
                     }
                     let e = kv_mirror_ensure(c, &mut kvm, (kv_id, layer_base + li), nkv, hd, cap);
+                    if e.synced > position {
+                        graph_refused("KV mirror is ahead of token-graph position");
+                        // A resident mirror proves that device state already
+                        // belongs to this request.  Falling through to the
+                        // host path would consume a stale CPU KV copy.
+                        return token_graph_outcome(true, false);
+                    }
                     if e.synced < position {
                         for hh in 0..nkv {
                             let take = position.min(cpu_k[hh].len() / hd);
@@ -18241,8 +18293,44 @@ pub fn forward_token_graph(
                     kvbufs.push(Some((e.k.clone(), e.v.clone())));
                     gdnbufs.push(None);
                 }
-                crate::gpu::GraphAttn::Gdn { cpu_state, .. } => {
-                    let e = gsm.entry((kv_id, layer_base + li)).or_insert_with(|| {
+                crate::gpu::GraphAttn::Gdn {
+                    cpu_state,
+                    nv,
+                    nk,
+                    dk,
+                    dv,
+                    kk,
+                    ..
+                } => {
+                    let key = (kv_id, layer_base + li);
+                    let dims = (*nv, *nk, *dk, *dv, *kk, 2 * nk * dk + nv * dv);
+                    match (gsm.get(&key), gcm.get(&key)) {
+                        (Some(_), Some(cur)) if cur.dims == dims && cur.next_pos == position => {}
+                        (Some(_), Some(_)) => {
+                            graph_refused("GDN device state position/geometry mismatch");
+                            return token_graph_outcome(true, false);
+                        }
+                        (Some(_), None) => {
+                            graph_refused("GDN device state cursor missing");
+                            return token_graph_outcome(true, false);
+                        }
+                        (None, Some(_)) => {
+                            graph_refused("GDN cursor exists without device state");
+                            return token_graph_outcome(true, false);
+                        }
+                        (None, None) => {}
+                    }
+                    let ring_words = gcdim * _gkk.max(1).saturating_sub(1);
+                    let state_words = gnv * gdk * gdv;
+                    if !gsm.contains_key(&key)
+                        && !gcm.contains_key(&key)
+                        && position > 0
+                        && cpu_state.len() != ring_words.saturating_add(state_words)
+                    {
+                        graph_refused("GDN CPU seed missing for nonzero token position");
+                        return token_graph_outcome(o1_started || state_started, false);
+                    }
+                    let e = gsm.entry(key).or_insert_with(|| {
                         let ring_sz = ((gcdim * (_gkk.max(1).saturating_sub(1))) * 4) as u64;
                         let s_sz = (gnv * gdk * gdv * 4) as u64;
                         let mk = |sz: u64| {
@@ -18280,16 +18368,46 @@ pub fn forward_token_graph(
                         }
                         (ring, sbuf)
                     });
+                    gcm.entry(key).or_insert(GdnCursor {
+                        dims,
+                        next_pos: position,
+                    });
                     gdnbufs.push(Some((e.0.clone(), e.1.clone())));
                     kvbufs.push(None);
                 }
                 crate::gpu::GraphAttn::ShortConv {
                     kernel, cpu_state, ..
                 } => {
+                    let key = (kv_id, layer_base + li);
+                    let dims = (hidden, 0, 0, 0, *kernel, hidden);
+                    match (gsm.get(&key), gcm.get(&key)) {
+                        (Some(_), Some(cur)) if cur.dims == dims && cur.next_pos == position => {}
+                        (Some(_), Some(_)) => {
+                            graph_refused("short-conv device state position/geometry mismatch");
+                            return token_graph_outcome(true, false);
+                        }
+                        (Some(_), None) => {
+                            graph_refused("short-conv device state cursor missing");
+                            return token_graph_outcome(true, false);
+                        }
+                        (None, Some(_)) => {
+                            graph_refused("short-conv cursor exists without device state");
+                            return token_graph_outcome(true, false);
+                        }
+                        (None, None) => {}
+                    }
                     // The conv ring rides the same state map as GDN; the
                     // second buffer of the pair is a 4-byte placeholder.
                     let ring_sz = ((kernel.saturating_sub(1)) * hidden * 4) as u64;
-                    let e = gsm.entry((kv_id, layer_base + li)).or_insert_with(|| {
+                    if !gsm.contains_key(&key)
+                        && !gcm.contains_key(&key)
+                        && position > 0
+                        && cpu_state.len() * 4 != ring_sz as usize
+                    {
+                        graph_refused("short-conv CPU seed missing for nonzero token position");
+                        return token_graph_outcome(o1_started || state_started, false);
+                    }
+                    let e = gsm.entry(key).or_insert_with(|| {
                         let mk = |sz: u64| {
                             let bf = c.device.create_buffer(&wgpu::BufferDescriptor {
                                 label: Some("sconv-ring"),
@@ -18312,6 +18430,10 @@ pub fn forward_token_graph(
                                 .write_buffer(&ring, 0, bytemuck::cast_slice(*cpu_state));
                         }
                         (ring, mk(4))
+                    });
+                    gcm.entry(key).or_insert(GdnCursor {
+                        dims,
+                        next_pos: position,
                     });
                     gdnbufs.push(Some((e.0.clone(), e.1.clone())));
                     kvbufs.push(None);
@@ -18804,7 +18926,7 @@ pub fn forward_token_graph(
         let ok = |k: u8| k == 4 || k == 6;
         if !ok(a.0.kind) || !ok(b.0.kind) {
             return false;
-        }
+        };
         let p = unif(&[
             a.2 as u32,
             a.3 as u32,
@@ -18869,7 +18991,65 @@ pub fn forward_token_graph(
         let embed_ok = matches!(&emb_pre, Some((m, _, _)) if m.kind == 6);
         if lm_pre.is_none() || !embed_ok {
             graph_refused("multi-step needs the lm_head fold and a q4tp embedding");
-            return false;
+            return token_graph_outcome(o1_started || state_started, false);
+        }
+    }
+    // O(1) admission is completed before the first command is encoded.  A
+    // later readback/submit failure must therefore be reported as Failed,
+    // while a malformed or unsealed view remains an ordinary decline.  The
+    // caller can clear the sequence on Failed instead of walking stale CPU
+    // accumulators beside a partially advanced device state.
+    // A budget prefix may deliberately truncate `layers`; the caller's O(1)
+    // vector is for the full stack, so only a short vector is malformed here.
+    if !o1.is_empty() && o1.len() < layers.len() {
+        graph_refused("o1 layer/view count mismatch");
+        return token_graph_outcome(o1_started || state_started, false);
+    }
+    let has_o1 = o1.iter().take(layers.len()).any(Option::is_some);
+    if has_o1 {
+        for (li, views) in o1.iter().take(layers.len()).enumerate() {
+            match (&layers[li].attn, views) {
+                (crate::gpu::GraphAttn::Full { .. }, Some(v)) => {
+                    if !o1_views_valid(v, nh, nkv, hd) {
+                        graph_refused("o1 view failed token admission");
+                        return token_graph_outcome(o1_started || state_started, false);
+                    }
+                }
+                (crate::gpu::GraphAttn::Full { .. }, None) => {}
+                (crate::gpu::GraphAttn::Gdn { .. }, None) => {}
+                (crate::gpu::GraphAttn::Gdn { .. }, Some(_))
+                | (crate::gpu::GraphAttn::ShortConv { .. }, Some(_)) => {
+                    graph_refused("o1 view attached to non-full attention");
+                    return token_graph_outcome(o1_started || state_started, false);
+                }
+                (crate::gpu::GraphAttn::ShortConv { .. }, None) => {}
+            }
+        }
+        {
+            let om = c.o1m.lock().unwrap();
+            for (li, views) in o1.iter().take(layers.len()).enumerate() {
+                if views.is_some()
+                    && om
+                        .get(&(kv_id, layer_base + li))
+                        .filter(|d| d.epoch == o1_epoch)
+                        .and_then(|d| d.next_pos)
+                        .is_some_and(|next| next != position)
+                {
+                    graph_refused("o1 device state position mismatch");
+                    return token_graph_outcome(true, false);
+                }
+            }
+        }
+        // Set this before the first upload: an upload can allocate earlier
+        // mirrors before a later layer rejects the same epoch.
+        o1_started = true;
+        for (li, views) in o1.iter().take(layers.len()).enumerate() {
+            if let Some(views) = views {
+                if o1_ensure(c, kv_id, layer_base + li, views, o1_epoch).is_none() {
+                    graph_refused("o1 state not portable");
+                    return token_graph_outcome(o1_started || state_started, false);
+                }
+            }
         }
     }
     const AM_PARTS: u32 = 512;
@@ -19066,9 +19246,13 @@ pub fn forward_token_graph(
                         // kernels replace kv_append + attend. State mirrors on
                         // the device once per seal epoch; kv mirrors are not
                         // touched for this layer at all.
-                        if o1_ensure(c, kv_id, li, views, o1_epoch).is_none() {
+                        // A network/in-process span uses an absolute layer
+                        // base. Keep the O(1) mirror key aligned with the
+                        // ordinary KV/GDN mirrors so spans cannot collide
+                        // with layer zero or unwrap a missing state.
+                        if o1_ensure(c, kv_id, layer_base + li, views, o1_epoch).is_none() {
                             graph_refused("o1 state not portable");
-                            return false;
+                            return token_graph_outcome(o1_started || state_started, false);
                         }
                         let (
                             dmeta,
@@ -19232,6 +19416,11 @@ pub fn forward_token_graph(
                                 pass.set_bind_group(0, &bg_rope, &[]);
                                 pass.dispatch_workgroups((nh + nkv) as u32, 1, 1);
                                 tsp!(pass, fine, 21); // rope
+                                // Exact Full attention has now admitted a
+                                // persistent K/V mutation.  If a later
+                                // dispatch or readback fails, the CPU cache
+                                // cannot safely resume this sequence.
+                                state_started = true;
                                 pass.set_pipeline(&c.kv_append);
                                 pass.set_bind_group(0, &bg_kv, &[]);
                                 pass.dispatch_workgroups(((nkv * hd) as u32).div_ceil(256), 1, 1);
@@ -19272,6 +19461,10 @@ pub fn forward_token_graph(
                                 pass.set_pipeline(&c.attn_rope);
                                 pass.set_bind_group(0, &bg_rope, &[]);
                                 pass.dispatch_workgroups((nh + nkv) as u32, 1, 1);
+                                // See the fused short-context arm above:
+                                // kv_append is the Full-attention admission
+                                // boundary for the terminal outcome contract.
+                                state_started = true;
                                 pass.set_pipeline(&c.kv_append);
                                 pass.set_bind_group(0, &bg_kv, &[]);
                                 pass.dispatch_workgroups(((nkv * hd) as u32).div_ceil(256), 1, 1);
@@ -19391,6 +19584,7 @@ pub fn forward_token_graph(
                         ..
                     },
                 ) => {
+                    state_started = true;
                     let (ring, s) = gdnbufs[li].as_ref().unwrap();
                     let taps = stor(bytemuck::cast_slice(conv1d));
                     let alog = stor(bytemuck::cast_slice(a_log));
@@ -19628,6 +19822,7 @@ pub fn forward_token_graph(
                     LAttn::Conv { inp, out, kernel },
                     crate::gpu::GraphAttn::ShortConv { taps, .. },
                 ) => {
+                    state_started = true;
                     let (ring, _) = gdnbufs[li].as_ref().unwrap();
                     let taps_b = stor(bytemuck::cast_slice(*taps));
                     // GcP reused verbatim: cdim = hidden, kk = kernel.
@@ -19647,7 +19842,7 @@ pub fn forward_token_graph(
                     }
                     emat(&mut enc, out, &sc_y, &ob, hidden, hidden);
                 }
-                _ => return false,
+                _ => return token_graph_outcome(o1_started || state_started, false),
             }
             ts!(enc, 1, lkind);
             // token-mix residual + FFN-norm fused: h += ob, n1 = rms(h, post_norm).
@@ -20428,12 +20623,29 @@ pub fn forward_token_graph(
         if ok {
             let mut kvm = c.attn_kv.lock().unwrap();
             for li in 0..layers.len() {
-                if let Some(m) = kvm.get_mut(&(kv_id, li)) {
+                if let Some(m) = kvm.get_mut(&(kv_id, layer_base + li)) {
                     m.synced = position + steps;
                 }
             }
-            let mut gsm = c.gdn_state.lock().unwrap();
-            let _ = &mut gsm; // states advanced on-device; nothing to sync
+            // The recurrent buffers advanced on-device.  Keep host-side
+            // cursors in lockstep so the next graph call cannot silently
+            // reuse a state at a gap or an older absolute position.
+            let next = position + steps;
+            let mut gcm = c.gdn_cursor.lock().unwrap();
+            for li in 0..layers.len() {
+                if let Some(cur) = gcm.get_mut(&(kv_id, layer_base + li)) {
+                    cur.next_pos = next;
+                }
+            }
+            drop(gcm);
+            let mut om = c.o1m.lock().unwrap();
+            for (li, views) in o1.iter().take(layers.len()).enumerate() {
+                if views.is_some() {
+                    if let Some(d) = om.get_mut(&(kv_id, layer_base + li)) {
+                        d.next_pos = Some(next);
+                    }
+                }
+            }
         }
         drop(gs);
         if prof {
@@ -20443,7 +20655,7 @@ pub fn forward_token_graph(
                 t_sub0.elapsed().as_secs_f64() * 1000.0
             );
         }
-        return ok;
+        return token_graph_outcome(o1_started || state_started, ok);
     }
     // h_buf now holds the final hidden. Either ride final-norm + lm_head and
     // read back logits, or (no lm / unresolved weight / device prefix) read
@@ -20608,8 +20820,24 @@ pub fn forward_token_graph(
         // The append at `position` is now durable — advance each mirror.
         let mut kvm = c.attn_kv.lock().unwrap();
         for li in 0..layers.len() {
-            if let Some(m) = kvm.get_mut(&(kv_id, li)) {
+            if let Some(m) = kvm.get_mut(&(kv_id, layer_base + li)) {
                 m.synced = position + 1;
+            }
+        }
+        let next = position + 1;
+        let mut gcm = c.gdn_cursor.lock().unwrap();
+        for li in 0..layers.len() {
+            if let Some(cur) = gcm.get_mut(&(kv_id, layer_base + li)) {
+                cur.next_pos = next;
+            }
+        }
+        drop(gcm);
+        let mut om = c.o1m.lock().unwrap();
+        for (li, views) in o1.iter().take(layers.len()).enumerate() {
+            if views.is_some() {
+                if let Some(d) = om.get_mut(&(kv_id, layer_base + li)) {
+                    d.next_pos = Some(next);
+                }
             }
         }
     }
@@ -20620,17 +20848,20 @@ pub fn forward_token_graph(
             t_sub0.elapsed().as_secs_f64() * 1000.0
         );
     }
-    ok
+    token_graph_outcome(o1_started || state_started, ok)
 }
 
 /// Batched prefill: K prompt positions through the whole layer stack in ONE
 /// submit. Projections & FFN run as resident GEMMs (each weight read once per K
 /// columns instead of once per position); attention and GDN loop the existing
 /// per-position kernels over scratch slices (KV mirror / recurrent S persist).
-/// Cuts graph prefill from N whole-graph submits to N/K. Returns false on any
-/// unsupported case (bias, q4t/q1t projections) → caller keeps the per-position
-/// graph. positions[i] = absolute sequence position of batch row i (contiguous
-/// causal run starting at positions[0]); `h` is [k·hidden] in/out.
+/// Cuts graph prefill from N whole-graph submits to N/K. Returns `Declined`
+/// before device mutation when an unsupported case (bias, q4t/q1t
+/// projections) requires the per-position graph; returns `Failed` after a
+/// submitted batch mutates persistent state, so callers cannot use stale CPU
+/// state. `Completed` provides valid output. `positions[i]` is the absolute
+/// sequence position of batch row i (contiguous causal run starting at
+/// `positions[0]`); `h` is [k·hidden] in/out.
 #[allow(clippy::too_many_arguments)]
 pub fn forward_batch_graph(
     model: &Arc<CmfModel>,
@@ -20654,22 +20885,44 @@ pub fn forward_batch_graph(
     // read the k logit rows back beside the hiddens, snapshotting the GDN
     // state after each position so a partial acceptance can restore it
     // (`gdn_spec_restore`). None = the plain batched prefill.
+    o1: &[Option<Vec<crate::nystrom::O1DeviceView<'_>>>],
+    o1_epoch: u64,
     mut spec: Option<crate::gpu::SpecTail<'_>>,
-) -> bool {
+) -> crate::gpu::BatchGraphOutcome {
     let t_bfn = std::time::Instant::now();
+    // Once sealed O(1) views have been admitted and uploaded, a failed batch
+    // cannot safely fall through to the CPU path: the device state may have
+    // advanced while the CPU copy is intentionally stale. All refusals before
+    // that point remain ordinary declines.
+    let mut o1_started = false;
+    // A submitted ordinary GDN batch mutates persistent device state just
+    // like the O(1) route; failures after that point must be terminal rather
+    // than a stale CPU fallback.
+    let mut state_started = false;
     let Some(c) = ctx() else {
         bgraph_refused("no ctx");
-        return false;
+        return batch_outcome(o1_started || state_started, false);
     };
     let graph_live_budget = graph_live_weight_budget(c, model);
     if k == 0 || positions.len() != k {
         bgraph_refused("k/positions mismatch");
-        return false;
+        return batch_outcome(o1_started || state_started, false);
     }
     let pos0 = positions[0];
-    if pos0 + k > cap || hd % 4 != 0 || hd > c.hd_cap {
+    let Some(pos_end) = pos0.checked_add(k) else {
+        bgraph_refused("position range overflow");
+        return batch_outcome(o1_started || state_started, false);
+    };
+    if positions
+        .windows(2)
+        .any(|pair| pair[0].checked_add(1) != Some(pair[1]))
+    {
+        bgraph_refused("batch positions are not contiguous");
+        return batch_outcome(o1_started || state_started, false);
+    }
+    if pos_end > cap || hd % 4 != 0 || hd > c.hd_cap {
         bgraph_refused("pos+k past cap, or head_dim not %4 / over hd_cap");
-        return false; // vec4 K/V reads; hd_cap = workgroup-storage limit
+        return batch_outcome(o1_started || state_started, false); // vec4 K/V reads; hd_cap = workgroup-storage limit
     }
     // Unlike the decode graph this function has no host-tail handoff: every
     // layer must coexist in one command buffer. Refuse before the first
@@ -20678,7 +20931,7 @@ pub fn forward_batch_graph(
     // batch command finishes, producing a full-model transient allocation.
     let Some(mut live_bytes) = graph_stack_payload_bytes(model, layers) else {
         bgraph_refused("cannot size layer payload");
-        return false;
+        return batch_outcome(o1_started || state_started, false);
     };
     if let Some(sp) = spec.as_ref() {
         live_bytes = live_bytes.saturating_add(
@@ -20691,9 +20944,9 @@ pub fn forward_batch_graph(
     }
     if live_bytes > graph_live_budget {
         bgraph_refused("all-layer live set exceeds the weight budget");
-        return false;
+        return batch_outcome(o1_started || state_started, false);
     }
-    let cap = kv_capacity(cap, pos0 + k);
+    let cap = kv_capacity(cap, pos_end);
     struct GMat {
         buf: wgpu::Buffer,
         rs: Option<wgpu::Buffer>,
@@ -20847,7 +21100,7 @@ pub fn forward_batch_graph(
             } => {
                 if bias.is_some() {
                     bgraph_refused("site:5889");
-                    return false;
+                    return batch_outcome(o1_started || state_started, false);
                 } // batched bias axpy not wired
                 let qrows = nh * hd * (1 + *output_gate as usize);
                 let (Some(wq), Some(wk), Some(wv), Some(wo)) = (
@@ -20857,11 +21110,11 @@ pub fn forward_batch_graph(
                     resolve(wo, hidden, nh * hd),
                 ) else {
                     bgraph_refused("site:5898");
-                    return false;
+                    return batch_outcome(o1_started || state_started, false);
                 };
                 if !(gemmable(&wq) && gemmable(&wk) && gemmable(&wv) && gemmable(&wo)) {
                     bgraph_refused("attention weights not gemmable");
-                    return false;
+                    return batch_outcome(o1_started || state_started, false);
                 }
                 LAttn::Full { wq, wk, wv, wo }
             }
@@ -20879,7 +21132,12 @@ pub fn forward_batch_graph(
                 ..
             } => {
                 let cdim = 2 * nk * dk + nv * dv;
-                gdn_dims = Some((*nv, *nk, *dk, *dv, *kk, cdim));
+                let dims = (*nv, *nk, *dk, *dv, *kk, cdim);
+                if gdn_dims.is_some_and(|prev| prev != dims) {
+                    bgraph_refused("heterogeneous GDN geometry across batch layers");
+                    return batch_outcome(o1_started || state_started, false);
+                }
+                gdn_dims = Some(dims);
                 let (Some(qkv), Some(z), Some(a), Some(b), Some(out)) = (
                     resolve(qkv, cdim, hidden),
                     resolve(z, nv * dv, hidden),
@@ -20888,12 +21146,12 @@ pub fn forward_batch_graph(
                     resolve(out, hidden, nv * dv),
                 ) else {
                     bgraph_refused("site:5928");
-                    return false;
+                    return batch_outcome(o1_started || state_started, false);
                 };
                 if !(gemmable(&qkv) && gemmable(&z) && gemmable(&out) && a.kind == 4 && b.kind == 4)
                 {
                     bgraph_refused("site:5932");
-                    return false;
+                    return batch_outcome(o1_started || state_started, false);
                 }
                 LAttn::Gdn {
                     qkv,
@@ -20912,7 +21170,7 @@ pub fn forward_batch_graph(
             crate::gpu::GraphAttn::ShortConv { .. } => {
                 // The batch (prefill) graph has no conv-ring kernel that
                 // walks positions in order yet; prefill stays per-op.
-                return false;
+                return batch_outcome(o1_started || state_started, false);
             }
         };
         let bffn = match &l.ffn {
@@ -20936,11 +21194,11 @@ pub fn forward_batch_graph(
                     resolve(ld, hidden, ffn_w),
                 ) else {
                     bgraph_refused("site:5960");
-                    return false;
+                    return batch_outcome(o1_started || state_started, false);
                 };
                 if !(gemmable(&gate) && gemmable(&up) && gemmable(&down)) {
                     bgraph_refused("dense FFN not gemmable");
-                    return false;
+                    return batch_outcome(o1_started || state_started, false);
                 }
                 BFfn::Dense {
                     gate,
@@ -20965,20 +21223,20 @@ pub fn forward_batch_graph(
             } => {
                 if *top_k >= 16 || *n_exp > 256 || experts.len() != n_exp + 1 {
                     bgraph_refused("site:5979");
-                    return false;
+                    return batch_outcome(o1_started || state_started, false);
                 }
                 let (Some(router), Some(sgate)) = (
                     resolve(router, *n_exp, hidden),
                     resolve(shared_gate, 1, hidden),
                 ) else {
                     bgraph_refused("site:5985");
-                    return false;
+                    return batch_outcome(o1_started || state_started, false);
                 };
                 let Some((gate_all, up_all, down_all)) =
                     moe_expert_bufs(c, model, experts, *mi, hidden, *q4tp, *gu_q2, false)
                 else {
                     bgraph_refused("site:5990");
-                    return false;
+                    return batch_outcome(o1_started || state_started, false);
                 };
                 BFfn::Moe {
                     router,
@@ -20996,6 +21254,154 @@ pub fn forward_batch_graph(
             }
         };
         lws.push(LW { attn, ffn: bffn });
+    }
+    // Recurrent state and exact-KV mirrors must enter this batch at the same
+    // absolute position. Validate all cursors before allocating the batch
+    // scratch or uploading a sealed O(1) mirror; otherwise a later refusal
+    // could leave one layer advanced while the caller still believes the
+    // batch declined. A missing cursor is only valid when its state is also
+    // absent and the CPU seed can initialize a nonzero position.
+    {
+        let kvm = c.attn_kv.lock().unwrap();
+        let gsm = c.gdn_state.lock().unwrap();
+        let gcm = c.gdn_cursor.lock().unwrap();
+        let om = c.o1m.lock().unwrap();
+        for (li, l) in layers.iter().enumerate() {
+            let key = (kv_id, li);
+            let o1_here = o1.get(li).is_some_and(|v| v.is_some());
+            if o1_here
+                && om
+                    .get(&key)
+                    .filter(|d| d.epoch == o1_epoch)
+                    .and_then(|d| d.next_pos)
+                    .is_some_and(|next| next != pos0)
+            {
+                bgraph_refused("o1 device state position mismatch");
+                // A resident O(1) state is already authoritative on the
+                // device; a host fallback would pair the sealed request with
+                // stale accumulators.
+                return batch_outcome(true, false);
+            }
+            match &l.attn {
+                crate::gpu::GraphAttn::Full { .. } if !o1_here => {
+                    if kvm.get(&key).is_some_and(|m| m.synced > pos0) {
+                        bgraph_refused("KV mirror is ahead of batch position");
+                        return batch_outcome(true, false);
+                    }
+                }
+                crate::gpu::GraphAttn::Full { .. } => {}
+                crate::gpu::GraphAttn::Gdn {
+                    cpu_state,
+                    nv,
+                    nk,
+                    dk,
+                    dv,
+                    kk,
+                    ..
+                } => {
+                    let dims = (*nv, *nk, *dk, *dv, *kk, 2 * nk * dk + nv * dv);
+                    match (gsm.get(&key), gcm.get(&key)) {
+                        (Some(_), Some(cur)) if cur.dims == dims && cur.next_pos == pos0 => {}
+                        (Some(_), Some(_)) => {
+                            bgraph_refused("GDN device state position/geometry mismatch");
+                            return batch_outcome(true, false);
+                        }
+                        (Some(_), None) => {
+                            bgraph_refused("GDN device state cursor missing");
+                            return batch_outcome(true, false);
+                        }
+                        (None, Some(_)) => {
+                            bgraph_refused("GDN cursor exists without device state");
+                            return batch_outcome(true, false);
+                        }
+                        (None, None) => {
+                            let cdim = 2 * nk * dk + nv * dv;
+                            let want = cdim
+                                .saturating_mul(kk.saturating_sub(1))
+                                .saturating_add((*nv).saturating_mul(*dk).saturating_mul(*dv));
+                            if pos0 > 0 && cpu_state.len() != want {
+                                bgraph_refused("GDN CPU seed missing for nonzero batch position");
+                                return batch_outcome(o1_started || state_started, false);
+                            }
+                        }
+                    }
+                }
+                crate::gpu::GraphAttn::ShortConv {
+                    kernel, cpu_state, ..
+                } => {
+                    let dims = (hidden, 0, 0, 0, *kernel, hidden);
+                    match (gsm.get(&key), gcm.get(&key)) {
+                        (Some(_), Some(cur)) if cur.dims == dims && cur.next_pos == pos0 => {}
+                        (Some(_), Some(_)) => {
+                            bgraph_refused("short-conv device state position/geometry mismatch");
+                            return batch_outcome(true, false);
+                        }
+                        (Some(_), None) => {
+                            bgraph_refused("short-conv device state cursor missing");
+                            return batch_outcome(true, false);
+                        }
+                        (None, Some(_)) => {
+                            bgraph_refused("short-conv cursor exists without device state");
+                            return batch_outcome(true, false);
+                        }
+                        (None, None) => {
+                            let want = kernel.saturating_sub(1).saturating_mul(hidden);
+                            if pos0 > 0 && cpu_state.len() != want {
+                                bgraph_refused(
+                                    "short-conv CPU seed missing for nonzero batch position",
+                                );
+                                return batch_outcome(o1_started || state_started, false);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // O(1) admission is all-or-nothing. Validate every sealed view and every
+    // layer pairing before creating the persistent batch scratch or touching a
+    // device mirror. A partial set would otherwise make a later CPU fallback
+    // consume a stale exact-KV copy beside an already-mutated O(1) state.
+    let has_o1 = o1.iter().any(Option::is_some);
+    if !o1.is_empty() && o1.len() != layers.len() {
+        bgraph_refused("o1 layer/view count mismatch");
+        return batch_outcome(o1_started || state_started, false);
+    }
+    if has_o1 {
+        if spec.is_some() {
+            bgraph_refused("o1 batch does not support speculative tail");
+            return batch_outcome(o1_started || state_started, false);
+        }
+        for (li, views) in o1.iter().enumerate() {
+            match (&layers[li].attn, views) {
+                (crate::gpu::GraphAttn::Full { .. }, Some(v)) => {
+                    if !o1_views_valid(v, nh, nkv, hd) {
+                        bgraph_refused("o1 view failed batch admission");
+                        return batch_outcome(o1_started || state_started, false);
+                    }
+                }
+                (crate::gpu::GraphAttn::Full { .. }, None) => {}
+                (crate::gpu::GraphAttn::Gdn { .. }, None) => {}
+                (crate::gpu::GraphAttn::Gdn { .. }, Some(_))
+                | (crate::gpu::GraphAttn::ShortConv { .. }, Some(_)) => {
+                    bgraph_refused("o1 view attached to non-full attention");
+                    return batch_outcome(o1_started || state_started, false);
+                }
+                (crate::gpu::GraphAttn::ShortConv { .. }, None) => {}
+            }
+        }
+        // Upload every layer's sealed state before the first command dispatch.
+        // `o1_started` is set before the first call because a later upload can
+        // still fail after earlier layers have allocated their mirrors.
+        o1_started = true;
+        for (li, views) in o1.iter().enumerate() {
+            if let Some(views) = views {
+                if o1_ensure(c, kv_id, li, views, o1_epoch).is_none() {
+                    graph_refused("o1 state not portable");
+                    return batch_outcome(o1_started || state_started, false);
+                }
+            }
+        }
     }
     // Content-cached, exactly as the token graph's: norm weights are
     // token-invariant, and this minted a fresh device buffer for every one
@@ -21112,15 +21518,63 @@ pub fn forward_batch_graph(
     {
         let mut kvm = c.attn_kv.lock().unwrap();
         let mut gsm = c.gdn_state.lock().unwrap();
+        let mut gcm = c.gdn_cursor.lock().unwrap();
         for (li, l) in layers.iter().enumerate() {
             match &l.attn {
-                crate::gpu::GraphAttn::Full { .. } => {
+                crate::gpu::GraphAttn::Full { cpu_k, cpu_v, .. } => {
+                    if o1.get(li).is_some_and(|v| v.is_some()) {
+                        // Sealed O(1) owns this layer's attention state. Do
+                        // not allocate or advance an exact-KV mirror that a
+                        // later fallback could accidentally read.
+                        kvbufs.push(None);
+                        gdnbufs.push(None);
+                        continue;
+                    }
                     let e = kv_mirror_ensure(c, &mut kvm, (kv_id, li), nkv, hd, cap);
+                    if e.synced > pos0 {
+                        bgraph_refused("KV mirror is ahead of batch position");
+                        return batch_outcome(true, false);
+                    }
+                    if e.synced < pos0 {
+                        if cpu_k.len() < nkv
+                            || cpu_v.len() < nkv
+                            || cpu_k
+                                .iter()
+                                .zip(cpu_v.iter())
+                                .any(|(kh, vh)| kh.len() / hd < pos0 || vh.len() / hd < pos0)
+                        {
+                            bgraph_refused("CPU KV seed missing for nonzero batch position");
+                            return batch_outcome(o1_started || state_started, false);
+                        }
+                        for hh in 0..nkv {
+                            let off = ((hh * cap + e.synced) * hd * 4) as u64;
+                            c.queue.write_buffer(
+                                &e.k,
+                                off,
+                                bytemuck::cast_slice(&cpu_k[hh][e.synced * hd..pos0 * hd]),
+                            );
+                            c.queue.write_buffer(
+                                &e.v,
+                                off,
+                                bytemuck::cast_slice(&cpu_v[hh][e.synced * hd..pos0 * hd]),
+                            );
+                        }
+                        e.synced = pos0;
+                    }
                     kvbufs.push(Some((e.k.clone(), e.v.clone())));
                     gdnbufs.push(None);
                 }
-                crate::gpu::GraphAttn::Gdn { .. } => {
-                    let e = gsm.entry((kv_id, li)).or_insert_with(|| {
+                crate::gpu::GraphAttn::Gdn {
+                    cpu_state,
+                    nv,
+                    nk,
+                    dk,
+                    dv,
+                    kk,
+                    ..
+                } => {
+                    let key = (kv_id, li);
+                    let e = gsm.entry(key).or_insert_with(|| {
                         let ring_sz = (gcdim * (_gkk.max(1).saturating_sub(1)) * 4) as u64;
                         let s_sz = (gnv * gdk * gdv * 4) as u64;
                         let mk = |sz: u64| {
@@ -21135,7 +21589,30 @@ pub fn forward_batch_graph(
                             c.queue.write_buffer(&bf, 0, &vec![0u8; sz.max(4) as usize]);
                             bf
                         };
-                        (mk(ring_sz), mk(s_sz))
+                        let (ring, sbuf) = (mk(ring_sz), mk(s_sz));
+                        // A CPU prefix (including bounded O(1) calibration)
+                        // may have already advanced the recurrent state. Seed
+                        // a newly-created device entry from that exact layout
+                        // instead of silently starting the batch from zero.
+                        let want = (ring_sz + s_sz) as usize / 4;
+                        if cpu_state.len() == want && want > 0 {
+                            let ring_n = ring_sz as usize / 4;
+                            c.queue.write_buffer(
+                                &ring,
+                                0,
+                                bytemuck::cast_slice(&cpu_state[..ring_n]),
+                            );
+                            c.queue.write_buffer(
+                                &sbuf,
+                                0,
+                                bytemuck::cast_slice(&cpu_state[ring_n..]),
+                            );
+                        }
+                        (ring, sbuf)
+                    });
+                    gcm.entry(key).or_insert(GdnCursor {
+                        dims: (*nv, *nk, *dk, *dv, *kk, 2 * nk * dk + nv * dv),
+                        next_pos: pos0,
                     });
                     gdnbufs.push(Some((e.0.clone(), e.1.clone())));
                     kvbufs.push(None);
@@ -21497,7 +21974,7 @@ pub fn forward_batch_graph(
                     ..
                 },
             ) => {
-                let (kbuf, vbuf) = kvbufs[li].as_ref().unwrap();
+                let o1_here = o1.get(li).and_then(|v| v.as_ref());
                 let qnw = stor(bytemuck::cast_slice(q_norm.unwrap_or(&vec![0f32; hd])));
                 let knw = stor(bytemuck::cast_slice(k_norm.unwrap_or(&vec![0f32; hd])));
                 let qrows = nh * hd * (1 + *output_gate as usize);
@@ -21513,7 +21990,143 @@ pub fn forward_batch_graph(
                     nkv * hd,
                     hidden,
                 );
-                {
+                if let Some(views) = o1_here {
+                    // Sealed O(1) attention uses the same rotated Q/K/V
+                    // projections as the exact path, then runs the existing
+                    // far/push/attend kernels for each batch row in causal
+                    // order. `goff` is the row's KV-group offset in kb_b/vb_b.
+                    let (
+                        dmeta,
+                        drk,
+                        drv,
+                        dsk,
+                        dsv,
+                        dkt,
+                        dqt,
+                        dmu,
+                        dmz,
+                        dth,
+                        gg,
+                        hh_,
+                        mm,
+                        ww,
+                        nns,
+                        sc,
+                    ) = {
+                        let map = c.o1m.lock().unwrap();
+                        let Some(d) = map.get(&(kv_id, li)) else {
+                            graph_refused("o1 batch mirror missing after admission");
+                            return batch_outcome(o1_started || state_started, false);
+                        };
+                        (
+                            d.meta.clone(),
+                            d.ring_k.clone(),
+                            d.ring_v.clone(),
+                            d.sink_k.clone(),
+                            d.sink_v.clone(),
+                            d.k_tilde.clone(),
+                            d.qt.clone(),
+                            d.mu.clone(),
+                            d.mz.clone(),
+                            d.that.clone(),
+                            d.g,
+                            d.h,
+                            d.m,
+                            d.w,
+                            d.ns,
+                            d.scale,
+                        )
+                    };
+                    let rect_fm = views
+                        .first()
+                        .and_then(|v| v.heads.first())
+                        .is_some_and(|h| h.rect_fm);
+                    let mut pass = begin_pass(&mut enc);
+                    for i in 0..k {
+                        let p = positions[i];
+                        let rope_u = uniform_u32x8(
+                            c,
+                            [
+                                nh as u32,
+                                nkv as u32,
+                                hd as u32,
+                                rd as u32,
+                                p as u32,
+                                flags(q_norm.is_some(), k_norm.is_some())
+                                    | if *output_gate { 1 } else { 0 },
+                                eps.to_bits(),
+                                i as u32,
+                            ],
+                        );
+                        let o1_u = uniform_u32x8(
+                            c,
+                            [
+                                hh_ as u32,
+                                mm as u32,
+                                ww as u32,
+                                (nns as u32) | (u32::from(rect_fm) << 8),
+                                hd as u32,
+                                hd as u32,
+                                sc.to_bits(),
+                                (i * nh * hd) as u32,
+                            ],
+                        );
+                        let bg_rope = bg(
+                            &c.layout_attn_rope,
+                            &[
+                                &qraw_b, &kb_b, &qout_s, &gout_s, &qnw, &knw, &invf_b, &rope_u,
+                            ],
+                        );
+                        let bg_far = bg(
+                            &c.layout_o1_far,
+                            &[&dmeta, &drk, &drv, &dqt, &dmz, &dth, &o1_u],
+                        );
+                        let bg_push = bg(
+                            &c.layout_o1_push,
+                            &[&dmeta, &kb_b, &vb_b, &drk, &drv, &o1_u],
+                        );
+                        let bg_att = bg(
+                            &c.layout_o1_attend,
+                            &[
+                                &dmeta, &qout_s, &drk, &drv, &dsk, &dsv, &dkt, &dmu, &dmz, &dth,
+                                &attn_s, &o1_u,
+                            ],
+                        );
+                        pass.set_pipeline(&c.attn_rope);
+                        pass.set_bind_group(0, &bg_rope, &[]);
+                        pass.dispatch_workgroups((nh + nkv) as u32, 1, 1);
+                        pass.set_pipeline(&c.o1_far);
+                        pass.set_bind_group(0, &bg_far, &[]);
+                        pass.dispatch_workgroups((gg * hh_ * mm) as u32, 1, 1);
+                        pass.set_pipeline(&c.o1_push);
+                        pass.set_bind_group(0, &bg_push, &[]);
+                        pass.dispatch_workgroups(gg as u32, 1, 1);
+                        pass.set_pipeline(&c.o1_attend);
+                        pass.set_bind_group(0, &bg_att, &[]);
+                        pass.dispatch_workgroups((gg * hh_) as u32, 1, 1);
+                        if *output_gate {
+                            let gm_u = unif(&[(nh * hd) as u32, 0, 0, 0]);
+                            pass.set_pipeline(&c.gate_mul);
+                            pass.set_bind_group(
+                                0,
+                                &bg(&c.layout_gate_mul, &[&gout_s, &attn_s, &gm_u]),
+                                &[],
+                            );
+                            pass.dispatch_workgroups(((nh * hd) as u32).div_ceil(256), 1, 1);
+                        }
+                        encode_blit_p(
+                            &mut pass,
+                            c,
+                            &attn_s,
+                            &attn_bb,
+                            nh * hd,
+                            0,
+                            i * nh * hd,
+                            None,
+                        );
+                    }
+                } else {
+                    let (kbuf, vbuf) = kvbufs[li].as_ref().unwrap();
                     // ONE compute pass for every position: the loop's four
                     // dispatches per token each carried their own pass, and
                     // pass boundaries — not the math — were 4.3 of this
@@ -21563,6 +22176,12 @@ pub fn forward_batch_graph(
                         );
                         pass.dispatch_workgroups((nh + nkv) as u32, 1, 1);
                         pass.set_pipeline(&c.kv_append);
+                        // The first Full-attention K/V append is the
+                        // persistent-state admission boundary.  A failed
+                        // submit/readback after this point must be surfaced
+                        // as Failed so the caller clears state instead of
+                        // falling back to a stale CPU cache.
+                        state_started = true;
                         pass.set_bind_group(
                             0,
                             &bg(&c.layout_kv, &[&kb_b, &vb_b, kbuf, vbuf, &kv_u]),
@@ -21684,6 +22303,7 @@ pub fn forward_batch_graph(
                     ..
                 },
             ) => {
+                state_started = true;
                 let (ring, s) = gdnbufs[li].as_ref().unwrap();
                 // Speculative rounds: a snapshot slot per position, taken
                 // right after this position's state advance. The buffer
@@ -21701,7 +22321,7 @@ pub fn forward_batch_graph(
                                 | wgpu::BufferUsages::COPY_SRC,
                             mapped_at_creation: false,
                         });
-                        (b, ring_sz, s_sz, k)
+                        (b, ring_sz, s_sz, k, pos0)
                     });
                     if e.3 < k {
                         e.0 = c.device.create_buffer(&wgpu::BufferDescriptor {
@@ -21714,6 +22334,10 @@ pub fn forward_batch_graph(
                         });
                         e.3 = k;
                     }
+                    // A snapshot buffer is reused across rounds.  Its slot
+                    // zero belongs to this batch's absolute base position,
+                    // which restore needs to put the recurrent cursor back.
+                    e.4 = pos0;
                     Some((e.0.clone(), ring_sz, s_sz))
                 } else {
                     None
@@ -21864,7 +22488,7 @@ pub fn forward_batch_graph(
                 ematb(&mut enc, out, &gdo_b, &ob, hidden, nv * dv);
                 bts!(enc, 2);
             }
-            _ => return false,
+            _ => return batch_outcome(o1_started || state_started, false),
         }
         go(
             &mut enc,
@@ -22110,7 +22734,7 @@ pub fn forward_batch_graph(
         // logits anyway (the sampler's contract at the loop top).
         let Some(lm) = resolve(&sp.lm, sp.lm_rows, hidden) else {
             bgraph_refused("spec tail: lm head weight did not resolve");
-            return false;
+            return batch_outcome(o1_started || state_started, false);
         };
         let fnw = stor(bytemuck::cast_slice(sp.final_norm));
         let n1b = c.device.create_buffer(&wgpu::BufferDescriptor {
@@ -22209,41 +22833,118 @@ pub fn forward_batch_graph(
                 m.synced = pos0 + k;
             }
         }
+        let next = pos0 + k;
+        let mut gcm = c.gdn_cursor.lock().unwrap();
+        for li in 0..layers.len() {
+            if let Some(cur) = gcm.get_mut(&(kv_id, li)) {
+                cur.next_pos = next;
+            }
+        }
+        drop(gcm);
+        let mut om = c.o1m.lock().unwrap();
+        for (li, views) in o1.iter().enumerate() {
+            if views.is_some() {
+                if let Some(d) = om.get_mut(&(kv_id, li)) {
+                    d.next_pos = Some(next);
+                }
+            }
+        }
     }
-    ok
+    batch_outcome(o1_started || state_started, ok)
 }
 
 /// After a partial speculative acceptance: put every GDN layer's (ring, S)
 /// back to the snapshot taken after batch position `slot` — the last
-/// position whose input token was real.
-pub fn gdn_spec_restore(kv_id: u64, slot: usize) -> bool {
+/// position whose input token was real. `base_pos` and `expected_layers` are
+/// part of the call contract: a stale snapshot from an earlier round, or a
+/// partial snapshot set, must fail closed instead of moving only some
+/// recurrent layers and letting the next graph consume mixed state.
+pub fn gdn_spec_restore(kv_id: u64, slot: usize, base_pos: usize, expected_layers: usize) -> bool {
     let Some(c) = ctx() else { return false };
     let snaps = c.gdn_snap.lock().unwrap();
+    let entries: Vec<(usize, &(wgpu::Buffer, u64, u64, usize, usize))> = snaps
+        .iter()
+        .filter_map(|((id, li), value)| (*id == kv_id).then_some((*li, value)))
+        .collect();
+    if entries.len() != expected_layers || entries.is_empty() {
+        return false;
+    }
+    let Some(next) = slot
+        .checked_add(1)
+        .and_then(|accepted_rows| base_pos.checked_add(accepted_rows))
+    else {
+        return false;
+    };
     let states = c.gdn_state.lock().unwrap();
+    let mut common_dims: Option<(usize, usize, usize, usize, usize, usize)> = None;
+    let mut cursors = c.gdn_cursor.lock().unwrap();
+    // Every layer must describe this same speculative batch anchor and have
+    // a matching device state/cursor.  Derive the byte geometry from that
+    // cursor as well as trusting the snapshot metadata: otherwise a reused
+    // `(kv_id, layer)` entry from another model could copy a valid-looking
+    // prefix with the wrong stride. The batch admission path currently
+    // requires homogeneous GDN geometry, so reject a mixed set here too.
+    for (li, (_, ring_sz, s_sz, slots, snap_base)) in &entries {
+        let Some(cur) = cursors.get(&(kv_id, *li)) else {
+            return false;
+        };
+        if !states.contains_key(&(kv_id, *li))
+            || slot >= *slots
+            || *snap_base != base_pos
+            || cur.next_pos < next
+        {
+            return false;
+        }
+        let (nv, _nk, dk, dv, kk, cdim) = cur.dims;
+        let Some(ring_words) = cdim.checked_mul(kk.saturating_sub(1)) else {
+            return false;
+        };
+        let Some(state_words) = nv.checked_mul(dk).and_then(|v| v.checked_mul(dv)) else {
+            return false;
+        };
+        let want_ring = (ring_words as u64).saturating_mul(4);
+        let want_state = (state_words as u64).saturating_mul(4);
+        if *ring_sz != want_ring || *s_sz != want_state {
+            return false;
+        }
+        if let Some(prev) = common_dims {
+            if prev != cur.dims {
+                return false;
+            }
+        } else {
+            common_dims = Some(cur.dims);
+        }
+    }
     let mut enc = c
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("gdn-restore"),
         });
-    let mut any = false;
-    for ((id, li), (snap, ring_sz, s_sz, slots)) in snaps.iter() {
-        if *id != kv_id || slot >= *slots {
-            continue;
-        }
-        let Some((ring, s)) = states.get(&(*id, *li)) else {
-            continue;
+    for (li, (snap, ring_sz, s_sz, _, _)) in &entries {
+        let Some((ring, s)) = states.get(&(kv_id, *li)) else {
+            return false;
         };
-        let off = slot as u64 * (ring_sz + s_sz);
+        let off = slot as u64 * (*ring_sz + *s_sz);
         if *ring_sz > 0 {
             flush_pass(&enc);
             enc.copy_buffer_to_buffer(snap, off, ring, 0, *ring_sz);
         }
-        flush_pass(&enc);
-        enc.copy_buffer_to_buffer(snap, off + ring_sz, s, 0, *s_sz);
-        any = true;
+        if *s_sz > 0 {
+            flush_pass(&enc);
+            enc.copy_buffer_to_buffer(snap, off + *ring_sz, s, 0, *s_sz);
+        }
     }
     submit(c, finish_enc(enc));
-    any
+    for (li, _) in &entries {
+        let Some(cur) = cursors.get_mut(&(kv_id, *li)) else {
+            // All cursors were validated before submit; this is defensive
+            // against an impossible concurrent deletion and still fails
+            // closed for the caller.
+            return false;
+        };
+        cur.next_pos = next;
+    }
+    true
 }
 
 /// Drop the device K/V mirror for a pipeline (called on cache clear).
@@ -22254,7 +22955,35 @@ pub fn kv_mirror_reset(kv_id: u64) {
             .lock()
             .unwrap()
             .retain(|(id, _), _| *id != kv_id);
+        c.gdn_cursor
+            .lock()
+            .unwrap()
+            .retain(|(id, _), _| *id != kv_id);
+        c.gdn_snap.lock().unwrap().retain(|(id, _), _| *id != kv_id);
+        c.o1m.lock().unwrap().retain(|(id, _), _| *id != kv_id);
+        c.graph_bgs
+            .lock()
+            .unwrap()
+            .retain(|(_, _, id), _| *id != kv_id);
     }
+}
+
+/// Rewind the logical row count of one exact-attention mirror. Speculative
+/// MTP drafts append rows directly on the device while the CPU owner retains
+/// only the real anchor; after verification, accepted warm rows overwrite from
+/// that anchor rather than being rejected as ahead of the next graph position.
+/// The storage itself is retained for the next append.
+pub fn kv_mirror_set_stored(kv_id: u64, layer: usize, stored: usize) -> bool {
+    let Some(c) = ctx() else { return false };
+    let mut mirrors = c.attn_kv.lock().unwrap();
+    let Some(m) = mirrors.get_mut(&(kv_id, layer)) else {
+        return false;
+    };
+    if stored > m.cap {
+        return false;
+    }
+    m.synced = stored;
+    true
 }
 
 /// GDN depthwise conv step (bring-up / parity): updates cq [cdim] and shifts
@@ -28949,9 +29678,93 @@ fn bgraph_refused(why: &'static str) {
     }
 }
 
+fn token_graph_outcome(o1_started: bool, ok: bool) -> crate::gpu::TokenGraphOutcome {
+    if ok {
+        crate::gpu::TokenGraphOutcome::Completed
+    } else if o1_started {
+        crate::gpu::TokenGraphOutcome::Failed
+    } else {
+        crate::gpu::TokenGraphOutcome::Declined
+    }
+}
+
+fn batch_outcome(o1_started: bool, ok: bool) -> crate::gpu::BatchGraphOutcome {
+    if ok {
+        crate::gpu::BatchGraphOutcome::Completed
+    } else if o1_started {
+        crate::gpu::BatchGraphOutcome::Failed
+    } else {
+        crate::gpu::BatchGraphOutcome::Declined
+    }
+}
+
+fn o1_view_valid(v: &crate::nystrom::O1DeviceView<'_>, nh: usize, nkv: usize, hd: usize) -> bool {
+    let hpg = nh.checked_div(nkv).unwrap_or(0);
+    let md = v.m_eff.checked_mul(v.d).unwrap_or(usize::MAX);
+    let mdv = v.m_eff.checked_mul(v.dv).unwrap_or(usize::MAX);
+    let mm = v.m_eff.checked_mul(v.m_eff).unwrap_or(usize::MAX);
+    let wd = v.w.checked_mul(v.d).unwrap_or(usize::MAX);
+    let wdv = v.w.checked_mul(v.dv).unwrap_or(usize::MAX);
+    !v.exact_only
+        && nkv > 0
+        && nh % nkv == 0
+        && v.heads.len() == hpg
+        && (4..=32).contains(&v.m_eff)
+        && v.w > 0
+        && v.sink_len.saturating_add(v.w) <= 196
+        && v.d == hd
+        && v.dv == hd
+        && v.d <= 256
+        && v.dv <= 256
+        && v.win_len <= v.w
+        && v.win_head < v.w
+        && v.win_k.len() >= v.win_len.saturating_mul(v.d)
+        && v.win_k.len() <= wd
+        && v.win_v.len() >= v.win_len.saturating_mul(v.dv)
+        && v.win_v.len() <= wdv
+        && v.sink_k.len() == v.sink_len.saturating_mul(v.d)
+        && v.sink_v.len() == v.sink_len.saturating_mul(v.dv)
+        && v.k_tilde.len() == md
+        && v.heads.iter().all(|h| {
+            h.t_hat.len() == mdv
+                && h.z_hat.len() == v.m_eff
+                && h.m_max.len() == v.m_eff
+                && h.q_tilde.len() == md
+                && h.mu.len() == mm
+        })
+}
+
+fn o1_views_valid(
+    views: &[crate::nystrom::O1DeviceView<'_>],
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+) -> bool {
+    let Some(first) = views.first() else {
+        return false;
+    };
+    o1_view_valid(first, nh, nkv, hd)
+        && views.iter().all(|v| {
+            o1_view_valid(v, nh, nkv, hd)
+                && v.m_eff == first.m_eff
+                && v.w == first.w
+                && v.sink_len == first.sink_len
+                && v.d == first.d
+                && v.dv == first.dv
+                && v.heads.len() == first.heads.len()
+        })
+}
+
 /// Device mirror of one layer's sealed o1 state.
 struct O1Dev {
     epoch: u64,
+    /// Absolute position of the next row that may mutate this state.  None
+    /// means the first post-seal graph call has not advanced it yet.
+    next_pos: Option<usize>,
+    /// Logical device bytes owned by this sealed state.  wgpu does not expose
+    /// a portable buffer-size query, so keep the exact upload footprint next
+    /// to the handles for diagnostics and reset checks.
+    bytes: u64,
     meta: wgpu::Buffer,
     ring_k: wgpu::Buffer,
     ring_v: wgpu::Buffer,
@@ -28968,6 +29781,20 @@ struct O1Dev {
     w: usize,
     ns: usize,
     scale: f32,
+}
+
+/// Return the number of O(1) device mirrors currently owned by `kv_id` and
+/// their logical upload footprint.  The map is keyed by sequence id and layer
+/// so a pooled server can prove that a fresh request did not inherit the prior
+/// request's sealed state.
+pub fn o1_device_stats(kv_id: u64) -> (usize, u64) {
+    let Some(c) = ctx() else { return (0, 0) };
+    let map = c.o1m.lock().unwrap();
+    map.iter()
+        .filter(|((id, _), _)| *id == kv_id)
+        .fold((0usize, 0u64), |(layers, bytes), (_, state)| {
+            (layers + 1, bytes.saturating_add(state.bytes))
+        })
 }
 
 /// Upload (or reuse) a layer's o1 state. One upload per seal epoch: the
@@ -29065,6 +29892,22 @@ fn o1_ensure(
         .write_buffer(&meta_b, 0, bytemuck::cast_slice(&meta));
     let dev = O1Dev {
         epoch,
+        next_pos: None,
+        bytes: [
+            meta.len(),
+            rk.len(),
+            rv.len(),
+            sk.len(),
+            sv.len(),
+            kt.len(),
+            qt.len(),
+            mu.len(),
+            mz.len(),
+            th.len(),
+        ]
+        .into_iter()
+        .map(|n| n.max(1) as u64 * std::mem::size_of::<f32>() as u64)
+        .sum(),
         meta: meta_b,
         ring_k: stor_f(&rk, "o1-rk"),
         ring_v: stor_f(&rv, "o1-rv"),
