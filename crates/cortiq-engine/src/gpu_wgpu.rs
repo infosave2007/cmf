@@ -9020,11 +9020,12 @@ fn o1_push(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_inde
 @group(0) @binding(10) var<storage, read_write> oa_out  : array<f32>;
 @group(0) @binding(11) var<uniform>             oa_p    : O1P;
 var<workgroup> oa_qs:  array<f32, 256>;
-// The admission contract permits sink + sliding window up to 196 rows
-// (w192/sink4 is the selected long-context profile).  Keep the workgroup
-// softmax scratch at that same bound; a 160-entry array made the otherwise
-// valid w192 route index past the shader allocation.
-var<workgroup> oa_scr: array<f32, 196>;
+// The admission contract permits sink + sliding window up to 2052 rows
+// (w2048/sink4 is the first extended profile).  Keep the workgroup softmax
+// scratch at that same bound.  Near scores are distributed across the 256
+// lanes below, so the array is a bounded ring-sized workspace rather than a
+// requirement that one lane own every key.
+var<workgroup> oa_scr: array<f32, 2052>;
 var<workgroup> oa_f:   array<f32, 32>;
 var<workgroup> oa_u:   array<f32, 32>;
 var<workgroup> oa_red: array<f32, 256>;
@@ -9058,21 +9059,28 @@ fn o1_attend(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_in
         t = t + 256u;
     }
     workgroupBarrier();
-    // near scores: thread s owns key s
-    if (lid < n) {
+    // Near scores: each lane walks a bounded grid-stride slice.  The old
+    // one-key-per-lane mapping was correct only while sink+window <= 196;
+    // keeping the same mapping for the extended window left most scores
+    // uninitialised and also collided with the landmark lanes.
+    var s = lid;
+    loop {
+        if (s >= n) { break; }
         var acc = 0.0;
-        if (lid < ns) {
-            let kb = (g * ns + lid) * d;
+        if (s < ns) {
+            let kb = (g * ns + s) * d;
             for (var j = 0u; j < d; j = j + 1u) { acc = acc + oa_qs[j] * oa_sk[kb + j]; }
         } else {
-            let kb = (g * oa_p.w + (lid - ns)) * d;
+            let kb = (g * oa_p.w + (s - ns)) * d;
             for (var j = 0u; j < d; j = j + 1u) { acc = acc + oa_qs[j] * oa_rk[kb + j]; }
         }
-        oa_scr[lid] = acc * oa_p.scale;
+        oa_scr[s] = acc * oa_p.scale;
+        s = s + 256u;
     }
-    // landmark scores: thread 200+a owns landmark a (disjoint from keys)
-    if (lid >= 200u && lid < 200u + m && farl > 0u) {
-        let a = lid - 200u;
+    // Landmark scores use their own small array, so every lane can also
+    // participate in the near grid above without a lane-number reservation.
+    if (lid < m && farl > 0u) {
+        let a = lid;
         var acc = 0.0;
         let ktb = (g * m + a) * d;
         for (var j = 0u; j < d; j = j + 1u) {
@@ -9081,7 +9089,7 @@ fn o1_attend(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_in
         oa_f[a] = acc * oa_p.scale;
     }
     workgroupBarrier();
-    // c = max near score (single thread — n <= 136, trivial)
+    // c = max near score (single thread — n <= 2052, bounded)
     if (lid == 0u) {
         var c = -3.0e38;
         for (var sidx = 0u; sidx < n; sidx = sidx + 1u) { c = max(c, oa_scr[sidx]); }
@@ -29698,6 +29706,11 @@ fn batch_outcome(o1_started: bool, ok: bool) -> crate::gpu::BatchGraphOutcome {
     }
 }
 
+// Keep this in sync with `oa_scr` in the WGSL above.  It is the total number
+// of exact near entries (sinks + ring window), not a silent enlargement of
+// the landmark budget or the portable CPU/Metal state.
+const O1_MAX_NEAR: usize = 2052;
+
 fn o1_view_valid(v: &crate::nystrom::O1DeviceView<'_>, nh: usize, nkv: usize, hd: usize) -> bool {
     let hpg = nh.checked_div(nkv).unwrap_or(0);
     let md = v.m_eff.checked_mul(v.d).unwrap_or(usize::MAX);
@@ -29711,7 +29724,7 @@ fn o1_view_valid(v: &crate::nystrom::O1DeviceView<'_>, nh: usize, nkv: usize, hd
         && v.heads.len() == hpg
         && (4..=32).contains(&v.m_eff)
         && v.w > 0
-        && v.sink_len.saturating_add(v.w) <= 196
+        && v.sink_len.saturating_add(v.w) <= O1_MAX_NEAR
         && v.d == hd
         && v.dv == hd
         && v.d <= 256
@@ -29825,10 +29838,10 @@ fn o1_ensure(
     // against 49.2 tok/s on Qwen3.8 — so every branch says which limit
     // it is and with what numbers. Silent capability gates are how a
     // day was once spent reading one KV ceiling as three model bugs.
-    if ns + w > 196 || m > 32 || g0.d > 256 || g0.dv > 256 {
+    if ns.saturating_add(w) > O1_MAX_NEAR || m > 32 || g0.d > 256 || g0.dv > 256 {
         graph_refused("o1 geometry over kernel limits");
         tracing::warn!(
-            "o1_ensure L{li}: sink+window {}+{} (cap 196), landmarks {m} (cap 32), \
+            "o1_ensure L{li}: sink+window {}+{} (cap {O1_MAX_NEAR}), landmarks {m} (cap 32), \
              d {} dv {} (cap 256)",
             ns,
             w,
@@ -31279,6 +31292,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn o1_admission_accepts_bounded_extended_window() {
+        let (d, dv, m, w, sink, hpg, t) =
+            (8usize, 8usize, 4usize, 2048usize, 4usize, 2usize, 2064usize);
+        let row = |salt: usize, width: usize| {
+            (0..width)
+                .map(|i| ((i * 17 + salt * 13) % 97) as f32 / 97.0 - 0.5)
+                .collect::<Vec<_>>()
+        };
+        let qs: Vec<Vec<f32>> = (0..hpg)
+            .map(|h| (0..t).flat_map(|i| row(i + h, d)).collect())
+            .collect();
+        let ks: Vec<f32> = (0..t).flat_map(|i| row(i + 31, d)).collect();
+        let vs: Vec<f32> = (0..t).flat_map(|i| row(i + 71, dv)).collect();
+        let qrefs: Vec<&[f32]> = qs.iter().map(Vec::as_slice).collect();
+        let mut st = crate::nystrom::NystromState::new_group(m, w, sink, hpg);
+        st.prefill_group(&qrefs, &ks, &vs, t, d, dv);
+        let view = st.device_view();
+        assert!(o1_view_valid(&view, hpg * 2, 2, d));
+
+        // The shader scratch is a total near-entry cap, so one additional
+        // row must remain an explicit decline rather than indexing past it.
+        let mut over = crate::nystrom::NystromState::new_group(m, w + 1, sink, hpg);
+        over.prefill_group(&qrefs, &ks, &vs, t, d, dv);
+        let over_view = over.device_view();
+        assert!(!o1_view_valid(&over_view, hpg * 2, 2, d));
+    }
+
+    #[test]
     fn kv_capacity_grows_without_reserving_the_advertised_context() {
         assert_eq!(kv_capacity(131_072, 1), 512);
         assert_eq!(kv_capacity(131_072, 512), 512);
@@ -32139,6 +32180,12 @@ mod tests {
         for (d, dv, m, w, sink, hpg, t) in [
             (8usize, 8usize, 4usize, 8usize, 2usize, 2usize, 40usize),
             (256, 256, 32, 128, 4, 8, 430),
+            // Exercise the extended near grid with a real >256 score count
+            // while keeping the fixture small enough for a unit test.  The
+            // production-sized d=256 case above still guards the normal
+            // upload/layout geometry; this case specifically catches stale
+            // one-lane indexing and the landmark-lane collision at w2048.
+            (8, 8, 4, 2048, 4, 2, 2064),
         ] {
             let jit = |a: usize, b: usize| ((a * 37 + b * 13 + 3) % 83) as f32 / 83.0 - 0.5;
             let ks: Vec<f32> = (0..t * d).map(|i| jit(i, 1)).collect();
