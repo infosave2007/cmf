@@ -4904,7 +4904,8 @@ impl Pipeline {
                     "commit-check a={a}: worst GDN state rel-max diff {worst_s:.2e} (L{worst_li}) | worst K/V row abs diff {worst_k:.4}"
                 );
             }
-        } else if !metal_native && a + 1 < b {
+        }
+        if !metal_native && a + 1 < b {
             let expected_gdn_layers = self.graph_gdn_layer_count();
             if expected_gdn_layers > 0
                 && !crate::gpu::gdn_spec_restore(self.graph_kv_id, a, next_pos, expected_gdn_layers)
