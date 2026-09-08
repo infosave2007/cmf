@@ -26,7 +26,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   73.8218 s to 68.3111 s (−7.46%) and steady decode from 25.7715 to
   26.1725 tok/s (+1.56%). Each run produced 128 tokens with 127 full-graph
   and 0 graph-miss tokens, 16 O(1) device layers, and 46,236,672 bytes of
-  O(1) device state; this is a single-model, single-hardware result.
+  O(1) device state; the profile was `m=32`, `window=128`, `sink=4`,
+  `CMF_O1_PREFILL=256`, `CMF_BATCH_K=128`, `CMF_BATCH_COOP=1`, and
+  `CMF_MTP=0` (MTP off); this is a single-model, single-hardware result.
+- The public Rust O(1) lifecycle is additive: `Pipeline::o1_begin_with_prefix`
+  accepts an optional calibration prefix, and `Pipeline::o1_seal_checked`
+  returns `Result<bool, String>` for callers that need transition errors.
+  Existing `o1_begin`/`o1_seal` and the existing `Result`-returning forward and
+  scoring signatures remain; those paths now surface deferred transition
+  failures, so callers should propagate their existing `Err` results.
 
 ### Known limitations
 - O(1) remains an opt-in approximation with an exact near window; it does not
