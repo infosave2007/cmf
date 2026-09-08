@@ -107,7 +107,7 @@ jobs:
           tar -C "$bindir" -czf "libcortiq-ffi-${{ matrix.target }}.tar.gz" libcortiq_ffi.so
           shasum -a 256 "libcortiq-ffi-${{ matrix.target }}.tar.gz" > "libcortiq-ffi-${{ matrix.target }}.tar.gz.sha256"
       - name: Attach FFI to release (android)
-        if: matrix.target == 'aarch64-linux-android' && !inputs.build_only
+        if: ${{ matrix.target == 'aarch64-linux-android' && !inputs.build_only }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
@@ -131,7 +131,7 @@ jobs:
           # Write an explicit LF so the checksum is portable to shasum/sha256sum.
           [System.IO.File]::WriteAllText("$zip.sha256", "$hash  $zip`n", [System.Text.Encoding]::ASCII)
       - name: Attach to release (unix)
-        if: runner.os != 'Windows' && !inputs.build_only
+        if: ${{ runner.os != 'Windows' && !inputs.build_only }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
@@ -139,7 +139,7 @@ jobs:
             cortiq-${{ matrix.target }}.tar.gz
             cortiq-${{ matrix.target }}.tar.gz.sha256
       - name: Attach to release (windows)
-        if: runner.os == 'Windows' && !inputs.build_only
+        if: ${{ runner.os == 'Windows' && !inputs.build_only }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
@@ -217,7 +217,7 @@ jobs:
           tar -C "$bindir" -czf "libcortiq-ffi-${{ matrix.target }}.tar.gz" ${{ matrix.lib }}
           shasum -a 256 "libcortiq-ffi-${{ matrix.target }}.tar.gz" > "libcortiq-ffi-${{ matrix.target }}.tar.gz.sha256"
       - name: Attach to release
-        if: !inputs.build_only
+        if: ${{ !inputs.build_only }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}

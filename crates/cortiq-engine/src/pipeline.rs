@@ -283,6 +283,14 @@ pub struct Pipeline {
     /// token). On by default; `bench --core` turns it off to match
     /// llama-bench's core timing.
     confidence_on: bool,
+    /// Test-only one-shot forward failure, scoped to this pipeline so
+    /// parallel scoring tests cannot consume one another's injection.
+    #[cfg(test)]
+    nll_test_fail_at: Option<usize>,
+    /// Test-only route override; avoids mutating the process-wide
+    /// `CMF_PREFILL` environment variable while forcing the serial path.
+    #[cfg(test)]
+    nll_test_force_serial: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -792,7 +800,11 @@ enum PrefillIn<'a> {
 /// architecture is one line, not four.
 impl Pipeline {
     fn can_prefill_batched(&self) -> bool {
-        prefill_batched() && !self.weights.layers.is_empty()
+        #[cfg(test)]
+        let force_serial = self.nll_test_force_serial;
+        #[cfg(not(test))]
+        let force_serial = false;
+        prefill_batched() && !force_serial && !self.weights.layers.is_empty()
     }
 
     /// The backend's automatic capacity split for a mapped transformer.
@@ -847,14 +859,6 @@ fn mtp_prefill_pair_count(start: usize, end: usize, input_len: usize) -> usize {
 
 /// Callback for streaming tokens. Return `false` to cancel.
 pub type TokenCallback = Box<dyn FnMut(&str) -> bool + Send>;
-
-/// A one-shot forward-boundary failure used only by the focused NLL lifecycle
-/// tests.  It lets a test emulate a device failure after an earlier row was
-/// scored without requiring a GPU-backed fixture.
-#[cfg(test)]
-static NLL_TEST_FAIL_AT: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(-1);
-#[cfg(test)]
-static NLL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl Pipeline {
     /// Clear all per-sequence state, including backend device mirrors.
@@ -912,15 +916,8 @@ impl Pipeline {
     /// pipeline reusable when the device path failed.
     fn nll_check_graph(&mut self, phase: &str, pos: usize) -> Result<(), String> {
         #[cfg(test)]
-        if NLL_TEST_FAIL_AT
-            .compare_exchange(
-                pos as isize,
-                -2,
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-            )
-            .is_ok()
-        {
+        if self.nll_test_fail_at == Some(pos) {
+            self.nll_test_fail_at = None;
             self.graph_failed
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             self.cancel
@@ -1897,6 +1894,10 @@ impl Pipeline {
                 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             },
+            #[cfg(test)]
+            nll_test_fail_at: None,
+            #[cfg(test)]
+            nll_test_force_serial: false,
         }
     }
 
@@ -13206,7 +13207,6 @@ mod tests {
 
     #[test]
     fn nll_graph_failure_is_terminal_and_request_is_reusable() {
-        let _guard = NLL_TEST_LOCK.lock().unwrap();
         let ids = vec![1u32, 2, 3, 4, 5, 6];
         let mut p = create_test_pipeline(8, 16, 2, 1, 4, 1, 64);
         p.graph_logits = Some(vec![123.0]);
@@ -13230,14 +13230,12 @@ mod tests {
 
     #[test]
     fn nll_forward_failure_discards_partial_score_and_clears_sidechannels() {
-        let _guard = NLL_TEST_LOCK.lock().unwrap();
         let ids = vec![1u32, 2, 3, 4, 5, 6];
         let mut p = create_test_pipeline(8, 16, 2, 1, 4, 1, 64);
-        NLL_TEST_FAIL_AT.store(1, std::sync::atomic::Ordering::Relaxed);
+        p.nll_test_fail_at = Some(1);
         let err = p
             .nll_ids_from(&ids, 0)
             .expect_err("one-shot forward failure");
-        NLL_TEST_FAIL_AT.store(-1, std::sync::atomic::Ordering::Relaxed);
         assert!(err.contains("forward") || err.contains("score row"));
         assert!(!p.graph_failed.load(std::sync::atomic::Ordering::Relaxed));
         assert!(!p.graph_want_logits);
@@ -13253,14 +13251,11 @@ mod tests {
 
     #[test]
     fn nll_serial_failure_before_first_row_is_reported() {
-        let _guard = NLL_TEST_LOCK.lock().unwrap();
         let ids = vec![1u32, 2, 3, 4];
         let mut p = create_test_pipeline(8, 16, 2, 1, 4, 1, 64);
-        unsafe { std::env::set_var("CMF_PREFILL", "seq") };
-        NLL_TEST_FAIL_AT.store(0, std::sync::atomic::Ordering::Relaxed);
+        p.nll_test_force_serial = true;
+        p.nll_test_fail_at = Some(0);
         let err = p.nll_ids_from(&ids, 0).expect_err("serial forward failure");
-        NLL_TEST_FAIL_AT.store(-1, std::sync::atomic::Ordering::Relaxed);
-        unsafe { std::env::remove_var("CMF_PREFILL") };
         assert!(err.contains("serial forward"));
         assert!(p.kv_history.is_empty());
         assert!(!p.graph_failed.load(std::sync::atomic::Ordering::Relaxed));
@@ -13269,17 +13264,41 @@ mod tests {
 
     #[test]
     fn ffn_probe_failure_discards_recorder_and_state() {
-        let _guard = NLL_TEST_LOCK.lock().unwrap();
         let ids = vec![1u32, 2, 3, 4];
         let mut p = create_test_pipeline(8, 16, 2, 1, 4, 1, 64);
-        NLL_TEST_FAIL_AT.store(0, std::sync::atomic::Ordering::Relaxed);
+        p.nll_test_fail_at = Some(0);
         let err = p
             .probe_ffn_mass_batch(&ids)
             .expect_err("probe forward failure");
-        NLL_TEST_FAIL_AT.store(-1, std::sync::atomic::Ordering::Relaxed);
         assert!(err.contains("NLL"));
         assert!(FFN_PROBE.with(|probe| probe.borrow().is_none()));
         assert!(p.kv_history.is_empty());
         assert!(!p.graph_failed.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn nll_test_controls_are_pipeline_scoped() {
+        let ids = vec![1u32, 2, 3, 4];
+        let mut failing = create_test_pipeline(8, 16, 2, 1, 4, 1, 64);
+        let mut unaffected = create_test_pipeline(8, 16, 2, 1, 4, 1, 64);
+        failing.nll_test_force_serial = true;
+        failing.nll_test_fail_at = Some(0);
+
+        assert!(!failing.can_prefill_batched());
+        assert!(unaffected.can_prefill_batched());
+        let expected = unaffected
+            .nll_ids_from(&ids, 0)
+            .expect("unaffected pipeline remains usable");
+        let err = failing
+            .nll_ids_from(&ids, 0)
+            .expect_err("failure injection belongs to failing pipeline");
+        assert!(err.contains("serial forward"));
+        assert!(failing.nll_test_fail_at.is_none());
+        assert!(unaffected.can_prefill_batched());
+        let actual = unaffected
+            .nll_ids_from(&ids, 0)
+            .expect("unaffected pipeline remains reusable");
+        assert_eq!(actual.1, expected.1);
+        assert!((actual.0 - expected.0).abs() < 1e-9);
     }
 }
