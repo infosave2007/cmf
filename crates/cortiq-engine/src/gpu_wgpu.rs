@@ -32722,6 +32722,13 @@ mod tests {
                                 out64[d0] += gain * fh.t_hat[b * hd + d0];
                             }
                         }
+                        if far_den < 0.0 {
+                            // Aggregate's signed far readout drops an
+                            // unusable negative denominator and numerator
+                            // before adding the exact near field.
+                            far_den = 0.0;
+                            out64.fill(0.0);
+                        }
                         let mut den = far_den;
                         for &(s, p) in &near {
                             let wt = (s - c_all).exp();
