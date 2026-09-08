@@ -32353,6 +32353,119 @@ mod tests {
             let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
             rx.recv().unwrap().unwrap();
             let got: Vec<f32> = bytemuck::cast_slice(&stage.get_mapped_range(..).unwrap()).to_vec();
+            stage.unmap();
+            // Exercise the far-empty branch on the same real GPU dispatch.
+            // The production admission normally supplies farl > 0, but a
+            // retained/handed-off state can reach the attend shader with an
+            // empty far field.  Reuse the post-push ring contents and compare
+            // against exact softmax over sinks + ring; this also covers m <
+            // 32 without manufacturing a second shader or changing state.
+            if m < 32 {
+                let mut empty_meta = Vec::with_capacity(gcnt * 4);
+                let mut near_k = Vec::with_capacity(gcnt);
+                let mut near_v = Vec::with_capacity(gcnt);
+                for (g, view) in views.iter().enumerate() {
+                    let post_len = if view.win_len == w { w } else { view.win_len + 1 };
+                    let post_head = if view.win_len == w {
+                        (view.win_head + 1) % w
+                    } else {
+                        view.win_head
+                    };
+                    empty_meta.extend_from_slice(&[
+                        post_len as u32,
+                        post_head as u32,
+                        0,
+                        0,
+                    ]);
+                    let slot = if view.win_len == w {
+                        view.win_head
+                    } else {
+                        view.win_len
+                    };
+                    let mut rk = view.win_k.to_vec();
+                    let mut rv = view.win_v.to_vec();
+                    rk[slot * d..(slot + 1) * d]
+                        .copy_from_slice(&k_new[g * d..(g + 1) * d]);
+                    rv[slot * dv..(slot + 1) * dv]
+                        .copy_from_slice(&v_new[g * dv..(g + 1) * dv]);
+                    near_k.push((rk, post_len));
+                    near_v.push(rv);
+                }
+                let mut near_want = vec![0.0f32; gcnt * hpg * dv];
+                let scale = views[0].scale;
+                for g in 0..gcnt {
+                    let view = &views[g];
+                    let (rk, post_len) = &near_k[g];
+                    let rv = &near_v[g];
+                    for h in 0..hpg {
+                        let q = &q_new[(g * hpg + h) * d..(g * hpg + h + 1) * d];
+                        let mut scores = Vec::with_capacity(view.sink_len + *post_len);
+                        for s in 0..view.sink_len {
+                            let mut acc = 0.0f32;
+                            for j in 0..d {
+                                acc += q[j] * view.sink_k[s * d + j];
+                            }
+                            scores.push(acc * scale);
+                        }
+                        for s in 0..*post_len {
+                            let mut acc = 0.0f32;
+                            for j in 0..d {
+                                acc += q[j] * rk[s * d + j];
+                            }
+                            scores.push(acc * scale);
+                        }
+                        let c = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                        let weights: Vec<f32> = scores.iter().map(|&x| (x - c).exp()).collect();
+                        let den = weights.iter().sum::<f32>();
+                        for j in 0..dv {
+                            let mut acc = 0.0f32;
+                            for s in 0..view.sink_len {
+                                acc += weights[s] * view.sink_v[s * dv + j];
+                            }
+                            for s in 0..*post_len {
+                                acc += weights[view.sink_len + s] * rv[s * dv + j];
+                            }
+                            near_want[(g * hpg + h) * dv + j] = acc / den;
+                        }
+                    }
+                }
+                c.queue
+                    .write_buffer(&dmeta, 0, bytemuck::cast_slice(&empty_meta));
+                let mut empty_enc = c
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+                {
+                    let mut pass = begin_pass(&mut empty_enc);
+                    pass.set_pipeline(&c.o1_attend);
+                    pass.set_bind_group(0, &bg_att, &[]);
+                    pass.dispatch_workgroups((gcnt * hpg) as u32, 1, 1);
+                }
+                flush_pass(&mut empty_enc);
+                empty_enc.copy_buffer_to_buffer(
+                    &ob,
+                    0,
+                    &stage,
+                    0,
+                    (gcnt * hpg * dv * 4) as u64,
+                );
+                submit(c, finish_enc(empty_enc));
+                let (tx, rx) = std::sync::mpsc::channel();
+                stage.map_async(wgpu::MapMode::Read, .., move |r| tx.send(r).unwrap());
+                let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+                rx.recv().unwrap().unwrap();
+                let empty_got: Vec<f32> =
+                    bytemuck::cast_slice(&stage.get_mapped_range(..).unwrap()).to_vec();
+                stage.unmap();
+                let md_empty = near_want
+                    .iter()
+                    .zip(&empty_got)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    md_empty < 1e-3,
+                    "wgpu o1 far-empty ≠ exact near (d={d} m={m} w={w} hpg={hpg}): max|Δ| = {md_empty}"
+                );
+            }
             c.o1m.lock().unwrap().remove(&(u64::MAX, usize::MAX));
             let md = want
                 .iter()
