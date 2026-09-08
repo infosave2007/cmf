@@ -18,8 +18,8 @@ name = "cortiq-embryo"
 path = "src/main.rs"
 
 [dependencies]
-cortiq-core = { path = "../cortiq-core", version = "0.6.5" }
-cortiq-engine = { path = "../cortiq-engine", version = "0.6.5", default-features = false }
+cortiq-core = { path = "../cortiq-core", version = "0.6.6" }
+cortiq-engine = { path = "../cortiq-engine", version = "0.6.6", default-features = false }
 anyhow = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
