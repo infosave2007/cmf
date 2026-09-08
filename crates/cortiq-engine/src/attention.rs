@@ -625,6 +625,7 @@ fn rmsnorm_head(x: &mut [f32], w: &[f32], eps: f64, style: cortiq_core::NormStyl
 
 /// Dense attention configuration (no head masks — masked execution uses
 /// the historical path).
+#[derive(Clone, Copy)]
 pub struct QwenAttnCfg<'a> {
     pub num_heads: usize,
     pub num_kv_heads: usize,
@@ -979,7 +980,29 @@ pub fn qwen_attention_core(
 ) -> Vec<f32> {
     let (nh, nkv, hd) = (cfg.num_heads, cfg.num_kv_heads, cfg.head_dim);
     let heads_per_kv = nh / nkv;
+    // A direct caller may have appended the completed boundary without
+    // passing through the usual post-row hook. Seal before accepting another
+    // exact row so the first row after B cannot re-open ordinary KV growth.
+    if cache
+        .o1_pending_boundary()
+        .is_some_and(|target| cache.seq_len >= target)
+    {
+        if let Err(err) = cache.o1_seal_checked(nh) {
+            cache.o1_abort(err);
+        }
+    }
     let p = finish_projection(q_raw, k, v, cfg, cfg.position);
+    // The Metal sandwich path already ran Q/K/V projections on the device
+    // and calls this middle function directly. If a sealed O(1) view refused
+    // device admission, keep that path on the streaming state; appending to
+    // the now-dropped exact KV here would silently resurrect unbounded cache.
+    if cache.o1_sealed() {
+        let mut ao = cache.o1_step(&p.q, &p.k, &p.v, nh);
+        if cfg.output_gate {
+            apply_gate(&mut ao, &p.gate);
+        }
+        return ao;
+    }
     // O(1) prefill trace: while a nystrom layer is collecting, the exact
     // prompt pass also records this position's queries for the seal
     // (no-op on plain layers).
@@ -1002,6 +1025,18 @@ pub fn qwen_attention_core(
     if cfg.output_gate {
         apply_gate(&mut ao, &p.gate);
     }
+    // A deferred short-prompt seal is a completed-row barrier. The exact
+    // row above is retained in the trace/KV, then conversion happens before
+    // the next row can append. A malformed transition is terminal: clear
+    // the layer and publish the error for Pipeline's existing failure path.
+    if cache
+        .o1_pending_boundary()
+        .is_some_and(|target| cache.seq_len >= target)
+    {
+        if let Err(err) = cache.o1_seal_checked(nh) {
+            cache.o1_abort(err);
+        }
+    }
     recycle_buf(&mut imp);
     ao
 }
@@ -1017,6 +1052,12 @@ pub fn qwen_attention(
     cache: &mut LayerKvCache,
     cfg: &QwenAttnCfg,
 ) -> Vec<f32> {
+    // Once a deferred barrier seals, every following row must use the
+    // streaming state. This dispatch also covers sequential fallback rows
+    // after a pair/batch was split at the barrier.
+    if cache.o1_sealed() {
+        return qwen_attention_nystrom(hidden, wq, wk, wv, wo, cache, cfg);
+    }
     let (q_raw, k, v) = project_matvecs(hidden, wq, wk, wv, cfg);
     let mut projected = projected_gate(hidden, cfg);
     let mut ao = qwen_attention_core(q_raw, k, v, cache, cfg);
@@ -1054,6 +1095,28 @@ pub fn qwen_attention_batch(
     let heads_per_kv = nh / nkv;
     let qrows = wq.rows();
     debug_assert_eq!(normed_all.len(), b * cfg.hidden_size);
+
+    // A chunk that reaches the deferred barrier is walked row by row so the
+    // completed exact row can seal before the first compressed row. A
+    // sealed state also cannot use this append-and-batched-attend path.
+    if cache.o1_sealed() || cache.o1_boundary_crossed_by(b) {
+        let mut out = take_buf(b * cfg.hidden_size);
+        for bi in 0..b {
+            let mut row_cfg = *cfg;
+            row_cfg.position = cfg.position + bi;
+            let row = qwen_attention(
+                &normed_all[bi * cfg.hidden_size..(bi + 1) * cfg.hidden_size],
+                wq,
+                wk,
+                wv,
+                wo,
+                cache,
+                &row_cfg,
+            );
+            out[bi * cfg.hidden_size..(bi + 1) * cfg.hidden_size].copy_from_slice(&row);
+        }
+        return out;
+    }
 
     // ── chunk-GEMM projections ──
     let mut q_all = take_buf(b * qrows);
@@ -1449,6 +1512,20 @@ pub fn qwen_attention_pair(
 ) -> (Vec<f32>, Vec<f32>) {
     let (nh, nkv, hd) = (cfg.num_heads, cfg.num_kv_heads, cfg.head_dim);
     let heads_per_kv = nh / nkv;
+
+    // Preserve causal ordering across a deferred boundary. The ordinary
+    // pair kernel is exact-only and would append both rows before a seal;
+    // sequential dispatch lets row B convert and row B+1 use Nyström.
+    if cache.o1_sealed() || cache.o1_boundary_crossed_by(2) {
+        let mut cfg1 = *cfg;
+        cfg1.position = cfg.position;
+        let mut cfg2 = *cfg;
+        cfg2.position = cfg.position + 1;
+        return (
+            qwen_attention(h1, wq, wk, wv, wo, cache, &cfg1),
+            qwen_attention(h2, wq, wk, wv, wo, cache, &cfg2),
+        );
+    }
 
     // Fused projections (one weight pass for both positions) — Q, K
     // and V under a single pool dispatch (multi-matrix pair job).
