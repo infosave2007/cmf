@@ -273,7 +273,7 @@ fn ppl_of(
         .map_err(|e| anyhow::anyhow!(e))?;
     let mut ids = p.tokenizer.with_bos(p.tokenizer.encode(text));
     ids.truncate(max_tokens);
-    Ok(p.ppl_ids(&ids))
+    p.ppl_ids(&ids).map_err(|e| anyhow::anyhow!(e))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -689,6 +689,7 @@ pub fn run_skill_add(
             let mut ids = p.tokenizer.with_bos(p.tokenizer.encode(&text));
             ids.truncate(quality_tokens);
             p.ppl_ids_masked(&ids, &mask)
+                .map_err(|e| anyhow::anyhow!(e))?
         } else {
             ppl_of(&probe, Some(id), &text, quality_tokens)?
         };
@@ -1473,7 +1474,9 @@ pub fn run_skill_bake(
         let mut nll = 0f64;
         let mut n = 0usize;
         for c in &held_ids {
-            let (l, k) = p.nll_ids_masked(c, 0, mask);
+            let (l, k) = p
+                .nll_ids_masked(c, 0, mask)
+                .map_err(|e| anyhow::anyhow!(e))?;
             nll += l;
             n += k;
         }

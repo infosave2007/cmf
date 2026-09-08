@@ -12,17 +12,17 @@ use cortiq_core::CmfModel;
 use cortiq_engine::{Pipeline, SamplerConfig};
 use std::sync::Arc;
 
-fn ppl(p: &mut Pipeline, ids: &[u32], mask: Option<&cortiq_core::TaskMask>) -> f64 {
+fn ppl(p: &mut Pipeline, ids: &[u32], mask: Option<&cortiq_core::TaskMask>) -> Result<f64, String> {
     let (mut nll, mut cnt) = (0f64, 0usize);
     for c in ids.chunks(256) {
         if c.len() < 2 {
             break;
         }
-        let (l, k) = p.nll_ids_masked(c, 0, mask);
+        let (l, k) = p.nll_ids_masked(c, 0, mask)?;
         nll += l;
         cnt += k;
     }
-    (nll / cnt.max(1) as f64).exp()
+    Ok((nll / cnt.max(1) as f64).exp())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -67,7 +67,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let dm = Arc::new(CmfModel::open_sharded(dp)?);
         let mut p = Pipeline::from_model(&dm, SamplerConfig::default())?;
         for (_, ids) in &evals {
-            dense.push(ppl(&mut p, ids, None));
+            dense.push(ppl(&mut p, ids, None)?);
         }
     }
 
@@ -78,8 +78,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut sd, mut sa, mut so) = (0f64, 0f64, 0f64);
     for (i, (task, ids)) in evals.iter().enumerate() {
         let m = masks.iter().find(|m| &m.name == task).unwrap();
-        let all = ppl(&mut tp, ids, None);
-        let own = ppl(&mut tp, ids, Some(m));
+        let all = ppl(&mut tp, ids, None)?;
+        let own = ppl(&mut tp, ids, Some(m))?;
         let d = dense.get(i).copied().unwrap_or(f64::NAN);
         let act = 1.0 - m.sparsity as f64;
         println!(
@@ -112,7 +112,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for (task, ids) in &evals {
             print!("{task:18}");
             for m in &masks {
-                print!("{:9.3}", ppl(&mut tp, ids, Some(m)));
+                print!("{:9.3}", ppl(&mut tp, ids, Some(m))?);
             }
             println!();
         }

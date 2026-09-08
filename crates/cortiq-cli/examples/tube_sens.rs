@@ -35,24 +35,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut p = Pipeline::from_model(&m, SamplerConfig::default())?;
     let mut ids = p.tokenizer.encode(&std::fs::read_to_string(&text_p)?);
     ids.truncate(ntok);
-    let score = |p: &mut Pipeline, mask: Option<&TaskMask>| -> f64 {
+    let score = |p: &mut Pipeline, mask: Option<&TaskMask>| -> Result<f64, String> {
         let (mut nll, mut cnt) = (0f64, 0usize);
         for c in ids.chunks(256) {
             if c.len() < 2 {
                 break;
             }
-            let (l, k) = p.nll_ids_masked(c, 0, mask);
+            let (l, k) = p.nll_ids_masked(c, 0, mask)?;
             nll += l;
             cnt += k;
         }
-        (nll / cnt.max(1) as f64).exp()
+        Ok((nll / cnt.max(1) as f64).exp())
     };
     let keep_n = ((inter as f32 * width).ceil() as usize).clamp(1, inter);
     let mut hb = vec![0u8; heads.div_ceil(8)];
     for h in 0..heads {
         hb[h / 8] |= 1 << (h % 8);
     }
-    let dense = score(&mut p, None);
+    let dense = score(&mut p, None)?;
     println!(
         "dense PPL {dense:.4} | pruning one layer at a time to {:.0}%",
         width * 100.0
@@ -91,7 +91,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             priority: MaskPriority::Normal,
             has_hot_pack: false,
         };
-        let s = score(&mut p, Some(&mask));
+        let s = score(&mut p, Some(&mask))?;
         println!(
             "L{g0:02}..{g1:02}  PPL {s:8.4}   Δ {:+7.2}%",
             (s / dense - 1.0) * 100.0

@@ -23,7 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             v.truncate(512);
             v
         });
-        let (nll, n) = p.nll_ids_from(ids, 0);
+        let (nll, n) = p.nll_ids_from(ids, 0)?;
         println!("{path}: PPL = {:.3}", (nll / n.max(1) as f64).exp());
     }
     Ok(())

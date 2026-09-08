@@ -1206,7 +1206,7 @@ impl Music3Ar {
                 0,
                 false,
             );
-            if !ok || out.len() < lm_rows {
+            if ok != crate::gpu::TokenGraphOutcome::Completed || out.len() < lm_rows {
                 return false;
             }
             staged[bi] = (h, out);

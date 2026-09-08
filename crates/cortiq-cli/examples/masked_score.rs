@@ -27,21 +27,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut ids = p.tokenizer.encode(&text);
     ids.truncate(ntok);
     // The bake gate's shape: INDEPENDENT 256-token chunks, kv reset each.
-    let score = |p: &mut Pipeline, mask: Option<&cortiq_core::TaskMask>| -> (f64, f64) {
-        let t0 = std::time::Instant::now();
-        let (mut nll, mut cnt) = (0f64, 0usize);
-        for c in ids.chunks(256) {
-            if c.len() < 2 {
-                break;
+    let score =
+        |p: &mut Pipeline, mask: Option<&cortiq_core::TaskMask>| -> Result<(f64, f64), String> {
+            let t0 = std::time::Instant::now();
+            let (mut nll, mut cnt) = (0f64, 0usize);
+            for c in ids.chunks(256) {
+                if c.len() < 2 {
+                    break;
+                }
+                let (l, k) = p.nll_ids_masked(c, 0, mask)?;
+                nll += l;
+                cnt += k;
             }
-            let (l, k) = p.nll_ids_masked(c, 0, mask);
-            nll += l;
-            cnt += k;
-        }
-        ((nll / cnt.max(1) as f64).exp(), t0.elapsed().as_secs_f64())
-    };
-    let (bare, t_bare) = score(&mut p, None);
-    let (masked, t_mask) = score(&mut p, mask.as_ref());
+            Ok(((nll / cnt.max(1) as f64).exp(), t0.elapsed().as_secs_f64()))
+        };
+    let (bare, t_bare) = score(&mut p, None)?;
+    let (masked, t_mask) = score(&mut p, mask.as_ref())?;
     // The decomposition probe: same chunks through the replica's f32 math.
     if std::env::var("MS_REPLICA").is_ok() {
         let chunks: Vec<Vec<u32>> = ids

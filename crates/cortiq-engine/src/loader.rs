@@ -1805,8 +1805,11 @@ impl Pipeline {
     /// Result is bit-identical to loading the pipeline with that skill.
     pub fn set_active_skill(&mut self, idx: Option<usize>) -> Result<(), CmfError> {
         // Overlay swap changes weights → every cached K/V is stale.
-        self.kv_cache.clear();
-        self.kv_history.clear();
+        // The wgpu graph owns a parallel recurrent/KV mirror keyed by the
+        // pipeline id.  Overlay swaps are sequence boundaries too; the shared
+        // reset clears it before the next token so dynamic routing cannot
+        // read state produced with the prior skill.
+        self.reset_session();
         if self.dyn_active == idx {
             return Ok(());
         }

@@ -76,19 +76,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             has_hot_pack: false,
         }
     };
-    let nll = |p: &mut Pipeline, mask: Option<&TaskMask>| -> f64 {
+    let nll = |p: &mut Pipeline, mask: Option<&TaskMask>| -> Result<f64, String> {
         let (mut s, mut c) = (0f64, 0usize);
         for ch in ids.chunks(256) {
             if ch.len() < 2 {
                 continue;
             }
-            let (l, k) = p.nll_ids_masked(ch, 0, mask);
+            let (l, k) = p.nll_ids_masked(ch, 0, mask)?;
             s += l;
             c += k;
         }
-        s / c.max(1) as f64
+        Ok(s / c.max(1) as f64)
     };
-    let base = nll(&mut p, None);
+    let base = nll(&mut p, None)?;
     println!(
         "dense NLL {base:.5} (PPL {:.3}) over {} tokens",
         base.exp(),
@@ -103,7 +103,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let d = if keep_n >= inter {
                 0.0
             } else {
-                (nll(&mut p, Some(&mk(li, keep_n))) - base).max(0.0)
+                (nll(&mut p, Some(&mk(li, keep_n)))? - base).max(0.0)
             };
             cost[li][gi] = d;
             line += &format!(" {:.4}", d);
@@ -175,7 +175,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         priority: MaskPriority::Normal,
         has_hot_pack: false,
     };
-    let j = nll(&mut p, Some(&joint));
+    let j = nll(&mut p, Some(&joint))?;
     println!(
         "measured joint: NLL {j:.5} → PPL {:.3} ({:+.1}% vs dense)",
         j.exp(),
@@ -196,7 +196,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ffn_masks,
         ..joint.clone()
     };
-    let u = nll(&mut p, Some(&unif));
+    let u = nll(&mut p, Some(&unif))?;
     println!(
         "uniform {uw}/{inter}: NLL {u:.5} → PPL {:.3} ({:+.1}% vs dense)",
         u.exp(),

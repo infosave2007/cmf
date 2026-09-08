@@ -88,6 +88,11 @@ pub struct Pipeline {
     /// every prefill chunk and decode step and finishes with
     /// `finish_reason: "cancelled"`. Auto-cleared when honoured.
     pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// A GPU graph failure is distinct from a user/request cancellation.
+    /// Graph code sets this before raising the cooperative cancel flag so the
+    /// generation API can return an error instead of reporting a successful
+    /// `finish_reason: cancelled` result.
+    graph_failed: std::sync::atomic::AtomicBool,
     /// Token ids currently materialized in the KV cache (the forwarded
     /// prompt + all generated tokens except the last, which is sampled
     /// but not yet forwarded). Lets the next generate call prefill only
@@ -822,10 +827,121 @@ pub fn prefill_chunk() -> usize {
     }
 }
 
+/// Number of prompt rows that have a real teacher-forced next-token pair in a
+/// prefill span.  The final prompt row has no successor token, so it must not
+/// be handed to the MTP warm-up.  Keeping this arithmetic in one helper makes
+/// the full-chunk and tail-chunk boundaries explicit for both the graph and
+/// CPU implementations.
+#[inline]
+fn mtp_prefill_pair_count(start: usize, end: usize, input_len: usize) -> usize {
+    if end <= start || start >= input_len {
+        return 0;
+    }
+    let rows = (end.min(input_len) - start).min(input_len - start);
+    if end < input_len {
+        rows
+    } else {
+        rows.saturating_sub(1)
+    }
+}
+
 /// Callback for streaming tokens. Return `false` to cancel.
 pub type TokenCallback = Box<dyn FnMut(&str) -> bool + Send>;
 
+/// A one-shot forward-boundary failure used only by the focused NLL lifecycle
+/// tests.  It lets a test emulate a device failure after an earlier row was
+/// scored without requiring a GPU-backed fixture.
+#[cfg(test)]
+static NLL_TEST_FAIL_AT: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(-1);
+#[cfg(test)]
+static NLL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 impl Pipeline {
+    /// Clear all per-sequence state, including backend device mirrors.
+    ///
+    /// The host KV/history buffers are only half of the request lifecycle on
+    /// wgpu: GDN/O(1) state and cached graph bind groups are keyed by the
+    /// pipeline id and otherwise survive a pooled request.  Keep every fresh
+    /// sequence entry point on this one reset path so a new request cannot
+    /// inherit the prior request's device state.
+    fn clear_sequence_state(&mut self) {
+        self.kv_cache.clear();
+        self.kv_history.clear();
+        crate::gpu::graph_kv_reset(self.graph_kv_id);
+        // MTP is detached from `self` for the duration of generation, so its
+        // device mirror is not covered by the trunk reset above.  Reset the
+        // derived id as well: a failed/aborted warm-up must never leave a
+        // mirror that a later request can mistake for a current MTP cache.
+        crate::gpu::graph_kv_reset(self.mtp_kv_id());
+    }
+
+    /// Start an NLL/PPL request with all graph side channels in a known
+    /// state.  A graph failure also raises the cooperative cancel bit; it is
+    /// consumed here and that graph-induced bit is cleared so an independent
+    /// request can be reused.  A caller-owned cancellation remains intact.
+    fn nll_begin(&mut self) -> Result<(), String> {
+        if self
+            .graph_failed
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            self.cancel
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            self.clear_sequence_state();
+            self.graph_logits = None;
+            self.graph_want_logits = false;
+            return Err("GPU graph failed before NLL scoring".to_string());
+        }
+        self.clear_sequence_state();
+        self.graph_logits = None;
+        self.graph_want_logits = false;
+        Ok(())
+    }
+
+    /// End an NLL/PPL request, including the side channels that are not part
+    /// of the host KV cache.  This is intentionally explicit instead of
+    /// relying on a tuple/sentinel return: callers must see every failure.
+    fn nll_end(&mut self) {
+        self.clear_sequence_state();
+        self.graph_logits = None;
+        self.graph_want_logits = false;
+        self.graph_failed
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Check the graph failure channel at a scoring boundary and leave the
+    /// pipeline reusable when the device path failed.
+    fn nll_check_graph(&mut self, phase: &str, pos: usize) -> Result<(), String> {
+        #[cfg(test)]
+        if NLL_TEST_FAIL_AT
+            .compare_exchange(
+                pos as isize,
+                -2,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            self.graph_failed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        if self
+            .graph_failed
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            self.cancel
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            self.clear_sequence_state();
+            self.graph_logits = None;
+            self.graph_want_logits = false;
+            return Err(format!(
+                "GPU graph failed during NLL {phase} at position {pos}"
+            ));
+        }
+        Ok(())
+    }
+
     /// Map a virtual layer index to its physical weight index.
     /// Looped Transformer (Nanbeige 4.2): 22 physical layers × 2 loops = 44 virtual;
     /// virtual layer 23 maps back to physical layer 1 (23 % 22 = 1).
@@ -1726,6 +1842,7 @@ impl Pipeline {
             dspark_draft_ns: 0,
             logit_multiplier: None,
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            graph_failed: std::sync::atomic::AtomicBool::new(false),
             kv_history: Vec::new(),
             short_conv_cfg: None,
             mtp: None,
@@ -1824,6 +1941,41 @@ impl Pipeline {
     /// True when at least one layer runs the O(1) kernel.
     pub fn o1_active(&self) -> bool {
         self.o1_cfg.is_some() && self.o1_flags.iter().any(|&f| f)
+    }
+
+    /// Whether generation's prompt ingest is routed through the whole-token
+    /// graph.  The bench uses this to label the measured generation prefill
+    /// honestly; keep the predicate in Pipeline so CLI labels cannot drift
+    /// from the production route.
+    pub fn generation_graph_prefill(&self) -> bool {
+        let graph = self.graph_prefill_preferred();
+        // On wgpu, an active MTP head now consumes the trunk's graph batches
+        // and warms its own block from those returned rows.  The selected
+        // generation measurement is therefore the batched path, even though
+        // the underlying GDN model still satisfies the graph-prefill
+        // predicate.  Keep the CLI label tied to the actual route.  Native
+        // Metal has a separate prefill-batch arm and retains its historical
+        // label here.
+        #[cfg(not(target_os = "macos"))]
+        if graph
+            && self.mtp.is_some()
+            && std::env::var("CMF_BATCH_K")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .is_some_and(|k| k > 0)
+            && std::env::var("CMF_MTP_CHAIN_PROBE").is_err()
+        {
+            return false;
+        }
+        graph
+    }
+
+    /// Device-side O(1) mirrors currently uploaded for this pipeline's
+    /// sequence.  The count/bytes are zero before seal or after a fresh
+    /// reset; callers use this to distinguish logical host state from the
+    /// GPU allocation that actually serves decode.
+    pub fn o1_device_stats(&self) -> (usize, u64) {
+        crate::gpu::o1_device_stats(self.graph_kv_id)
     }
 
     /// Arm query collection on the o1 layers (fresh prompt pass).
@@ -1959,6 +2111,11 @@ impl Pipeline {
         if input_ids.is_empty() {
             return Err("empty prompt: nothing to generate from".to_string());
         }
+        // A prior graph failure is terminal for that sequence but must not
+        // poison the next independent request.  Keep this flag separate from
+        // the externally-owned cooperative cancel bit.
+        self.graph_failed
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         // A mask that forbids nothing still costs every fused path and
         // whole-token graph, all of which are gated on `is_none()`. A
         // narrowed file whose one segment is always on carries exactly
@@ -1990,9 +2147,7 @@ impl Pipeline {
         };
         if reuse_from == 0 {
             // Fresh sequence — the cache holds absolute positions.
-            self.kv_cache.clear();
-            self.kv_history.clear();
-            crate::gpu::graph_kv_reset(self.graph_kv_id);
+            self.clear_sequence_state();
         } else if std::env::var("CMF_PREFILL_PROF").is_ok() {
             eprintln!(
                 "kv-reuse: {} of {} prompt positions already cached",
@@ -2268,6 +2423,49 @@ impl Pipeline {
         // fused-pair path skips the per-layer φ capture). o1 layers
         // collect their query trace in both the single and pair paths.
         let dyn_prefill = router.is_some();
+        // Optional bounded calibration prefix for generation.  The normal
+        // O(1) path seals after the full prompt; this explicit knob instead
+        // runs only the requested prefix through exact attention, seals the
+        // Nyström state, and streams the rest of the prompt through the same
+        // O(1) step used by decode.  It keeps the O(1) layers' Q trace and
+        // temporary full KV bounded by the prefix while leaving the default
+        // full-prompt quality profile untouched.
+        let o1_prefill = if self.o1_active() && task_mask.is_none() {
+            std::env::var("CMF_O1_PREFILL")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&p| p > 0 && p < input_ids.len())
+        } else {
+            None
+        };
+        let mut o1_sealed = false;
+        if let Some(limit) = o1_prefill {
+            // Reuse the exact batched prefix machinery when available; it
+            // records the same per-position Q trace as the full prefill.
+            if self.can_prefill_batched() && limit > 2 {
+                let chunk = prefill_chunk();
+                let hs = self.hidden_size;
+                while pos < limit && !self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    let end = (pos + chunk).min(limit);
+                    let hb = self.prefill_batch(&input_ids[pos..end], pos);
+                    hidden.copy_from_slice(&hb[(end - pos - 1) * hs..]);
+                    pos = end;
+                }
+            } else {
+                while pos < limit && !self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    hidden = self.forward_layers(&self.embed_single(input_ids[pos]), pos, None);
+                    pos += 1;
+                }
+            }
+            if pos >= limit {
+                self.o1_seal();
+                o1_sealed = true;
+                tracing::info!(
+                    "o1 bounded prompt prefix: sealed after {limit} of {} token(s)",
+                    input_ids.len()
+                );
+            }
+        }
         // q1 hybrids on Metal: the per-position GPU token graph beats
         // the CPU chunk-GEMM (whose wall is the sequential scalar GDN
         // recurrence), so prefill goes position-by-position through the
@@ -2339,6 +2537,7 @@ impl Pipeline {
             && !graph_prefill
             && self.can_prefill_batched()
             && self.g3n.is_none()
+            && o1_prefill.is_none()
             && input_ids.len() > 2
         {
             // Production prefill = the same chunked prefill-GEMM that
@@ -2405,6 +2604,7 @@ impl Pipeline {
             && !graph_prefill
             && !pair_off
             && self.pair_supported()
+            && o1_prefill.is_none()
         {
             while pos + 1 < input_ids.len()
                 && !self.cancel.load(std::sync::atomic::Ordering::Relaxed)
@@ -2459,11 +2659,33 @@ impl Pipeline {
         // graph prefill. (Steady-state decode is provably identical either way —
         // token-graph submit and lm_head both unchanged — so this only trades
         // prefill wall.)
-        if batch_k > 0
+        // A bounded O(1) prefix is the one post-seal prompt interval: only
+        // admit its batch when the device O(1) route is explicitly enabled and
+        // every sealed layer exposes a portable view. The same batch size and
+        // refusal behavior remain the ordinary controls/comparator.
+        let o1_batch_ready = o1_sealed
+            && o1_prefill.is_some()
+            && mtp.is_none()
+            && std::env::var("CMF_O1_GPU").as_deref() == Ok("1")
+            && (0..self.num_layers).all(|li| {
+                let cache = &self.kv_cache.layers[self.phys_layer(li)];
+                cache.o1.is_none() || cache.o1_views().is_some()
+            });
+        // The ordinary graph-prefill route can share each completed trunk
+        // chunk with an attached MTP head.  Keep chain probing on its
+        // established per-position path: the probe deliberately needs every
+        // teacher-forced draft row and its rollback table.
+        let mtp_batch_prefill = mtp.is_some()
             && graph_prefill
             && task_mask.is_none()
+            && !dyn_prefill
             && !self.o1_active()
-            && mtp.is_none()
+            && std::env::var("CMF_MTP_CHAIN_PROBE").is_err();
+        if batch_k > 0
+            && (graph_prefill || o1_batch_ready)
+            && task_mask.is_none()
+            && (!self.o1_active() || o1_batch_ready)
+            && (mtp.is_none() || mtp_batch_prefill)
             && !dyn_prefill
             && pos + 1 < input_ids.len()
         {
@@ -2478,11 +2700,19 @@ impl Pipeline {
                 }
                 let positions: Vec<usize> = (pos..end).collect();
                 let t_chunk = std::time::Instant::now();
-                let ok_b = self.try_batch_graph_wgpu(&mut hiddens, &positions, bk, None);
+                let outcome = self.try_batch_graph_wgpu(&mut hiddens, &positions, bk, None);
+                let ok_b = outcome == crate::gpu::BatchGraphOutcome::Completed;
                 if std::env::var("CMF_GRAPH_PROF").is_ok() {
                     let ms = t_chunk.elapsed().as_secs_f64() * 1000.0;
                     eprintln!(
-                        "batch-chunk: k={bk} ok={ok_b} {ms:.1} ms ({:.1} tok/s)",
+                        "batch-chunk: phase=prompt mode={} k={bk} outcome={outcome:?} {ms:.1} ms ({:.1} tok/s)",
+                        if o1_batch_ready {
+                            "o1"
+                        } else if mtp_batch_prefill {
+                            "ordinary_mtp"
+                        } else {
+                            "ordinary"
+                        },
                         bk as f64 / (ms / 1000.0)
                     );
                 }
@@ -2491,15 +2721,81 @@ impl Pipeline {
                     static SAID: AtomicBool = AtomicBool::new(false);
                     if !SAID.swap(true, Ordering::Relaxed) {
                         if ok_b {
-                            tracing::info!("batched prefill: ACTIVE (k={bk})");
+                            tracing::info!(
+                                "batched prefill: ACTIVE mode={} (k={bk})",
+                                if o1_batch_ready {
+                                    "o1"
+                                } else if mtp_batch_prefill {
+                                    "ordinary_mtp"
+                                } else {
+                                    "ordinary"
+                                }
+                            );
                         } else {
-                            tracing::warn!("batched prefill declined — per-position graph");
+                            tracing::warn!("batched prefill {:?} — per-position graph", outcome);
                         }
                     }
                 }
                 if ok_b {
+                    if mtp_batch_prefill {
+                        let n_pairs = mtp_prefill_pair_count(pos, end, input_ids.len());
+                        if n_pairs > 0 {
+                            // `hiddens` is owned by this chunk, so materialize
+                            // row slices before borrowing the detached MTP
+                            // module.  The last prompt row has no successor;
+                            // the helper above is the single source of that
+                            // boundary rule.
+                            let rows: Vec<Vec<f32>> = (0..n_pairs)
+                                .map(|j| hiddens[j * hs..(j + 1) * hs].to_vec())
+                                .collect();
+                            let pairs: Vec<(&[f32], u32)> = rows
+                                .iter()
+                                .enumerate()
+                                .map(|(j, row)| (row.as_slice(), input_ids[pos + j + 1]))
+                                .collect();
+                            if std::env::var("CMF_GRAPH_PROF").is_ok() {
+                                eprintln!(
+                                    "mtp-warm: phase=prompt mode=ordinary_mtp first_pos={} pairs={} last_pos={}",
+                                    pos,
+                                    n_pairs,
+                                    pos + n_pairs - 1,
+                                );
+                            }
+                            let warm_error = if let Some(m) = mtp.as_mut() {
+                                self.mtp_warm_prefill_pairs(m, &pairs, pos).err()
+                            } else {
+                                None
+                            };
+                            if let Some(err) = warm_error {
+                                // The trunk batch was already admitted.  A
+                                // failed MTP warm-up therefore clears both
+                                // mirrors and exits; continuing would pair a
+                                // current trunk state with a stale MTP cache.
+                                self.clear_sequence_state();
+                                self.mtp = mtp.take();
+                                return Err(err.to_string());
+                            }
+                        }
+                    }
                     hidden.copy_from_slice(&hiddens[(bk - 1) * hs..]);
                     pos = end;
+                } else if outcome == crate::gpu::BatchGraphOutcome::Failed {
+                    // A failed batch may have advanced a device recurrent
+                    // state (ordinary GDN or sealed O(1)). A CPU fallback
+                    // would then observe stale accumulators, so clear the
+                    // request state and make the failure explicit.
+                    if mtp_batch_prefill {
+                        // MTP is detached for generation; preserve the head
+                        // when returning the terminal error so the pipeline
+                        // remains reusable after its mirrors are cleared.
+                        self.mtp = mtp.take();
+                    }
+                    self.clear_sequence_state();
+                    return Err(if o1_batch_ready {
+                        "sealed O(1) batch graph failed after admission".to_string()
+                    } else {
+                        "ordinary recurrent batch graph failed after admission".to_string()
+                    });
                 } else {
                     break; // unsupported → per-position graph handles the rest
                 }
@@ -2553,13 +2849,30 @@ impl Pipeline {
                 _tpf.elapsed().as_secs_f64() * 1000.0
             );
         }
+        if self
+            .graph_failed
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            self.cancel
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            // MTP is detached for speculative generation.  Restore the
+            // module before returning the terminal graph error; otherwise a
+            // failed request would silently remove the head from a pooled
+            // pipeline and the next request would lose its configured route.
+            self.mtp = mtp.take().or(self.mtp.take());
+            self.clear_sequence_state();
+            return Err("GPU token graph failed during prefill".to_string());
+        }
         // Cancelled mid-prefill: the cache holds a partial prompt —
         // drop the reuse history and return an empty generation.
         if self
             .cancel
             .swap(false, std::sync::atomic::Ordering::Relaxed)
         {
-            self.kv_history.clear();
+            // A cancelled prefill can already have advanced the device
+            // mirror. Drop the whole partial sequence so a pooled pipeline
+            // cannot carry that state into its next request.
+            self.clear_sequence_state();
             if let Some(m) = mtp {
                 self.mtp = Some(m);
             }
@@ -2578,7 +2891,9 @@ impl Pipeline {
 
         // Prompt absorbed → freeze the o1 layers' skeletons; from here
         // every decode step on those layers is O(W + m·dv + m²).
-        self.o1_seal();
+        if !o1_sealed {
+            self.o1_seal();
+        }
 
         // Commit one token: push, check EOS, stream. Returns false = stop.
         macro_rules! commit {
@@ -2623,6 +2938,20 @@ impl Pipeline {
         let mut next_pos = input_ids.len();
         'decode: while generated < max_tokens {
             if self
+                .graph_failed
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                self.cancel
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                // Keep the detached MTP module attached after a terminal
+                // graph error so the pipeline can be reused for a fresh
+                // sequence.  `clear_sequence_state` only clears mirrors and
+                // host KV; it cannot recover a module dropped here.
+                self.mtp = mtp.take().or(self.mtp.take());
+                self.clear_sequence_state();
+                return Err("GPU token graph failed during decode".to_string());
+            }
+            if self
                 .cancel
                 .swap(false, std::sync::atomic::Ordering::Relaxed)
             {
@@ -2661,7 +2990,10 @@ impl Pipeline {
                     for v in hidden.iter().chain(logits.iter()) {
                         bytes.extend_from_slice(&v.to_le_bytes());
                     }
-                    let _ = std::fs::write(&path, &bytes);
+                    if let Err(e) = std::fs::write(&path, &bytes) {
+                        eprintln!("logit dump: failed to write {path}: {e}");
+                        return Err(format!("logit dump write failed: {e}"));
+                    }
                 }
             }
             let t_next = match forced {
@@ -2819,6 +3151,21 @@ impl Pipeline {
                             break 'decode;
                         }
                         continue 'decode;
+                    }
+                    if self
+                        .graph_failed
+                        .swap(false, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        // `graph_spec_step` may have detached MTP while a
+                        // warm-up was in flight.  Do not reinterpret its
+                        // terminal device failure as a plain decode step;
+                        // restore the head, clear both mirrors, and surface
+                        // one explicit error to the caller.
+                        self.cancel
+                            .store(false, std::sync::atomic::Ordering::Relaxed);
+                        self.mtp = mtp.take();
+                        self.clear_sequence_state();
+                        return Err("GPU MTP graph failed during speculative decode".to_string());
                     }
                     // Declined (batch graph refused): plain forward below —
                     // and a round that produced one token for the trial's
@@ -3025,6 +3372,18 @@ impl Pipeline {
                                 break;
                             }
                             let Some(ids) = self.try_multi_burst(t_fwd, next_pos, k) else {
+                                if self
+                                    .graph_failed
+                                    .swap(false, std::sync::atomic::Ordering::Relaxed)
+                                {
+                                    self.cancel
+                                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                                    self.mtp = mtp.take().or(self.mtp.take());
+                                    self.clear_sequence_state();
+                                    return Err(
+                                        "GPU token graph failed during greedy burst".to_string()
+                                    );
+                                }
                                 break;
                             };
                             next_pos += k;
@@ -3162,22 +3521,59 @@ impl Pipeline {
                 self.mtp_graph_mode = Some(true);
                 return r;
             }
+            if self.mtp_graph_mode == Some(true) {
+                tracing::error!("mtp Metal graph failed after admission");
+                self.clear_sequence_state();
+                self.graph_failed
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                self.cancel
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                return (Vec::new(), Vec::new());
+            }
             self.mtp_graph_mode = Some(false);
         }
         #[cfg(feature = "gpu")]
         if self.mtp_graph_mode != Some(false) {
-            if let Some(r) = self.mtp_step_graph(m, hidden, next_token, position) {
-                self.mtp_graph_mode = Some(true);
-                return r;
+            if !self.mtp_graph_ok(m) {
+                if self.mtp_graph_mode == Some(true) {
+                    // A mirror was already admitted, so a capability change
+                    // cannot safely switch this request to the stale CPU
+                    // cache.  Keep the same terminal contract as a failed
+                    // token graph.
+                    tracing::error!("mtp graph became unavailable after admission");
+                    self.clear_sequence_state();
+                    self.graph_failed
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.cancel
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    return (Vec::new(), Vec::new());
+                }
+                self.mtp_graph_mode = Some(false);
+            } else {
+                if let Some(r) = self.mtp_step_graph(m, hidden, next_token, position) {
+                    self.mtp_graph_mode = Some(true);
+                    return r;
+                }
+                if self.graph_failed.load(std::sync::atomic::Ordering::Relaxed) {
+                    // A token graph can have admitted a persistent MTP/GDN
+                    // mirror before its readback failed.  The CPU MTP cache
+                    // is not a valid continuation in that state; leave the
+                    // flag set so the generation caller returns through its
+                    // terminal error path instead of silently switching
+                    // arithmetic.
+                    return (Vec::new(), Vec::new());
+                }
+                // `mtp_graph_ok` was true, so a None here means a refusal or
+                // failure after graph admission.  Do not fall through to a
+                // CPU cache whose rows may lag the device mirror.
+                tracing::error!("mtp graph failed or declined after admission");
+                self.clear_sequence_state();
+                self.graph_failed
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                self.cancel
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                return (Vec::new(), Vec::new());
             }
-            if self.mtp_graph_mode == Some(true) {
-                // The graph carried this generation's MTP KV and just
-                // declined — the CPU cache is not current. A draft from
-                // stale attention is still only a draft (verify decides),
-                // but say so once.
-                tracing::warn!("mtp graph declined mid-run — draft falls to the per-op path");
-            }
-            self.mtp_graph_mode = Some(false);
         }
         // fc concat order is [enorm(embed); hnorm(hidden)] — EMBEDDING
         // FIRST. Verified by the oracle (converter/mtp_oracle.py):
@@ -3342,6 +3738,53 @@ impl Pipeline {
     /// token graph must key the same slot.
     const MTP_LAYER_BASE: usize = 0;
 
+    /// The wgpu MTP draft writes speculative rows straight into its device
+    /// mirror while the CPU owner retains only the real prompt/decode anchor.
+    /// After verification, move that mirror cursor back to the anchor before
+    /// replaying accepted pairs.  The next graph append then sees the same
+    /// contiguous position as the CPU/Metal path without uploading stale
+    /// speculative rows.
+    #[cfg(all(feature = "gpu", not(target_os = "macos")))]
+    fn rewind_mtp_graph_mirror(&self, stored: usize) -> bool {
+        self.mtp_graph_mode != Some(true)
+            || crate::gpu::graph_kv_set_stored(self.mtp_kv_id(), Self::MTP_LAYER_BASE, stored)
+    }
+
+    /// A speculative verify graph appends the full `k+1` trunk rows before
+    /// the acceptance count is known.  GDN state already has a snapshot
+    /// restore; Full-attention mirrors need the matching logical cursor
+    /// rewind so the next graph call does not reject an ahead-of-position KV
+    /// cache after a partial acceptance.
+    #[cfg(all(feature = "gpu", not(target_os = "macos")))]
+    fn rewind_trunk_graph_mirrors(&self, stored: usize) -> bool {
+        let mut ok = true;
+        let mut expected = false;
+        for li in 0..self.num_layers {
+            if matches!(
+                self.weights.layers[self.phys_layer(li)].attn,
+                AttnKind::Full { .. }
+            ) {
+                expected = true;
+                ok &= crate::gpu::graph_kv_set_stored(self.graph_kv_id, li, stored);
+            }
+        }
+        !expected || ok
+    }
+
+    /// Count the recurrent layers participating in the trunk verify graph.
+    /// Snapshot restore is all-or-nothing across that set; deriving the count
+    /// from the model keeps the restore contract valid for looped models too.
+    fn graph_gdn_layer_count(&self) -> usize {
+        (0..self.num_layers)
+            .filter(|&li| {
+                matches!(
+                    &self.weights.layers[self.phys_layer(li)].attn,
+                    AttnKind::LinearGdn(_)
+                )
+            })
+            .count()
+    }
+
     /// The block's input from (trunk hidden, token): eh_proj · [enorm(e);
     /// hnorm(h)] — the same arithmetic the per-op path starts with.
     fn mtp_block_input(&mut self, m: &MtpModule, hidden: &[f32], next_token: u32) -> Vec<f32> {
@@ -3358,7 +3801,7 @@ impl Pipeline {
     /// Is the MTP block graphable at all (device up, full attention
     /// without softplus, dense FFN)? The plan itself is built per call.
     #[cfg(feature = "gpu")]
-    fn mtp_graph_ok(&self, m: &MtpModule) -> bool {
+    fn mtp_block_graph_ok(&self, m: &MtpModule) -> bool {
         if std::env::var("CMF_MTP_GRAPH").as_deref() == Ok("0") {
             return false;
         }
@@ -3376,6 +3819,31 @@ impl Pipeline {
                 ..
             }
         ) && matches!(&m.layer.ffn, FfnKind::Dense(_))
+    }
+
+    /// Full MTP token-graph eligibility, including the fused lm-head and all
+    /// block projection weights.  Keep this distinct from the block-only
+    /// check: prompt warm-up does not need the head, while a draft step does.
+    #[cfg(feature = "gpu")]
+    fn mtp_graph_ok(&self, m: &MtpModule) -> bool {
+        if !self.mtp_block_graph_ok(m) {
+            return false;
+        }
+        let AttnKind::Full { wq, wk, wv, wo, .. } = &m.layer.attn else {
+            return false;
+        };
+        let FfnKind::Dense(d) = &m.layer.ffn else {
+            return false;
+        };
+        d.segs.is_empty()
+            && wq.graph_weight().is_some()
+            && wk.graph_weight().is_some()
+            && wv.graph_weight().is_some()
+            && wo.graph_weight().is_some()
+            && d.gate_proj.graph_weight().is_some()
+            && d.up_proj.graph_weight().is_some()
+            && d.down_proj.graph_weight().is_some()
+            && self.weights.lm_head.graph_weight().is_some()
     }
 
     /// One MTP block step on the wgpu token graph: block + fused head in
@@ -3501,8 +3969,20 @@ impl Pipeline {
             Self::MTP_LAYER_BASE,
             true,
         );
-        if !ok {
-            return None;
+        match ok {
+            crate::gpu::TokenGraphOutcome::Completed => {}
+            crate::gpu::TokenGraphOutcome::Declined => return None,
+            crate::gpu::TokenGraphOutcome::Failed => {
+                // The backend has already admitted persistent state.  Keep
+                // this distinct from a capability refusal so the caller
+                // cannot switch to the stale CPU MTP cache.
+                self.clear_sequence_state();
+                self.graph_failed
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                self.cancel
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                return None;
+            }
         }
         logits.resize(self.vocab_size, 0.0);
         Some((logits, x))
@@ -3511,18 +3991,22 @@ impl Pipeline {
     /// The warm-ups of one speculative round on the device: every accepted
     /// (hidden, token) pair as ONE batched graph run over the MTP block
     /// (no head) — its kv_append lands the pairs in the block's mirror.
-    /// `pairs` are consecutive positions from `first_pos`. False = the
-    /// batch graph declined; the caller warms one by one on the token
-    /// graph (prefix mode) instead.
+    /// `pairs` are consecutive positions from `first_pos`.  The tri-state
+    /// result is intentional: a refusal before admission may use the
+    /// per-row/CPU route, while a failure after admission must terminate the
+    /// sequence rather than fall through to a stale CPU cache.
     #[cfg(feature = "gpu")]
     fn mtp_warm_graph(
         &mut self,
         m: &mut MtpModule,
         pairs: &[(&[f32], u32)],
         first_pos: usize,
-    ) -> bool {
-        if pairs.is_empty() || !self.mtp_graph_ok(m) {
-            return pairs.is_empty();
+    ) -> crate::gpu::BatchGraphOutcome {
+        if pairs.is_empty() {
+            return crate::gpu::BatchGraphOutcome::Completed;
+        }
+        if !self.mtp_block_graph_ok(m) {
+            return crate::gpu::BatchGraphOutcome::Declined;
         }
         let hs = self.hidden_size;
         // Block inputs for every pair (eh_proj on the per-op path, one
@@ -3544,13 +4028,13 @@ impl Pipeline {
             ..
         } = &lw.attn
         else {
-            return false;
+            return crate::gpu::BatchGraphOutcome::Declined;
         };
         let FfnKind::Dense(d) = &lw.ffn else {
-            return false;
+            return crate::gpu::BatchGraphOutcome::Declined;
         };
         if !d.segs.is_empty() {
-            return false; // tube layers run on the segmented path
+            return crate::gpu::BatchGraphOutcome::Declined; // tube layers run on the segmented path
         }
         fn gw(t: &QTensor) -> Option<crate::gpu::GraphW<'_>> {
             let (_, i, kind, rs) = t.graph_weight()?;
@@ -3562,7 +4046,7 @@ impl Pipeline {
             })
         }
         let Some((model, _, _, _)) = wq.graph_weight() else {
-            return false;
+            return crate::gpu::BatchGraphOutcome::Declined;
         };
         let model = model.clone();
         let (Some(gwq), Some(gwk), Some(gwv), Some(gwo), Some(gg), Some(gu), Some(gd)) = (
@@ -3574,7 +4058,7 @@ impl Pipeline {
             gw(&d.up_proj),
             gw(&d.down_proj),
         ) else {
-            return false;
+            return crate::gpu::BatchGraphOutcome::Declined;
         };
         let layer = crate::gpu::GraphLayer {
             input_norm: &lw.input_norm,
@@ -3621,8 +4105,112 @@ impl Pipeline {
             self.rms_eps as f32,
             self.attn_scale,
             pairs.len(),
+            &[],
+            0,
             None,
         )
+    }
+
+    /// Complete an MTP warm-up after the batched graph has refused.  A
+    /// graphable block is retried one row at a time; once any device row has
+    /// been admitted, a CPU fallback would observe a stale mirror, so every
+    /// token-graph refusal is terminal.  If the block is not graphable and no
+    /// mirror exists yet, warming on the CPU is safe and records the CPU mode
+    /// for the rest of the generation.
+    #[cfg(feature = "gpu")]
+    fn mtp_warm_graph_fallback(
+        &mut self,
+        m: &mut MtpModule,
+        pairs: &[(&[f32], u32)],
+        first_pos: usize,
+    ) -> bool {
+        if pairs.is_empty() {
+            return true;
+        }
+        let graphable = self.mtp_block_graph_ok(m);
+        if !graphable {
+            // A previously admitted mirror cannot be made coherent by
+            // appending to the host cache.  The caller turns this into a
+            // terminal generation error and clears both mirrors.
+            if self.mtp_graph_mode == Some(true) {
+                return false;
+            }
+            self.mtp_graph_mode = Some(false);
+            for (j, (h, t)) in pairs.iter().enumerate() {
+                self.mtp_warm(m, h, *t, first_pos + j);
+            }
+            return true;
+        }
+
+        // The batch refusal is recoverable only through the same device
+        // state.  Keep rows owned until each token graph has completed; a
+        // None is treated as unsafe because the token-graph API deliberately
+        // collapses its backend refusal/failure into that result.
+        for (j, (h, t)) in pairs.iter().enumerate() {
+            if self.mtp_step_graph(m, h, *t, first_pos + j).is_none() {
+                return false;
+            }
+        }
+        self.mtp_graph_mode = Some(true);
+        true
+    }
+
+    /// Warm a contiguous set of MTP pairs using the existing graph seam, with
+    /// an all-or-nothing error contract for callers that already admitted the
+    /// trunk batch.  The non-GPU build keeps the same pair accounting while
+    /// using the established CPU warm path.
+    #[cfg(feature = "gpu")]
+    fn mtp_warm_prefill_pairs(
+        &mut self,
+        m: &mut MtpModule,
+        pairs: &[(&[f32], u32)],
+        first_pos: usize,
+    ) -> Result<(), &'static str> {
+        // Keep unsupported token-graph heads on the established CPU MTP
+        // route before admitting any block mirror.  Once a device mirror is
+        // active, the same condition is terminal because CPU rows cannot
+        // repair its state.
+        if self.mtp_graph_mode == Some(false) || !self.mtp_graph_ok(m) {
+            if self.mtp_graph_mode == Some(true) {
+                return Err("MTP token graph became unavailable after admission");
+            }
+            self.mtp_graph_mode = Some(false);
+            for (j, (h, t)) in pairs.iter().enumerate() {
+                self.mtp_warm(m, h, *t, first_pos + j);
+            }
+            return Ok(());
+        }
+        match self.mtp_warm_graph(m, pairs, first_pos) {
+            crate::gpu::BatchGraphOutcome::Completed => {
+                if !pairs.is_empty() {
+                    self.mtp_graph_mode = Some(true);
+                }
+                Ok(())
+            }
+            crate::gpu::BatchGraphOutcome::Declined => {
+                if self.mtp_warm_graph_fallback(m, pairs, first_pos) {
+                    Ok(())
+                } else {
+                    Err("MTP warm-up fallback failed after device admission")
+                }
+            }
+            crate::gpu::BatchGraphOutcome::Failed => {
+                Err("MTP warm batch graph failed after admission")
+            }
+        }
+    }
+
+    #[cfg(not(feature = "gpu"))]
+    fn mtp_warm_prefill_pairs(
+        &mut self,
+        m: &mut MtpModule,
+        pairs: &[(&[f32], u32)],
+        first_pos: usize,
+    ) -> Result<(), &'static str> {
+        for (j, (h, t)) in pairs.iter().enumerate() {
+            self.mtp_warm(m, h, *t, first_pos + j);
+        }
+        Ok(())
     }
 
     /// The MTP block alone — advance its KV with a (hidden, token) pair the
@@ -3787,10 +4375,16 @@ impl Pipeline {
                 self.mtp_graph_mode = Some(false);
                 let r = self.mtp_step_hl(m, &hx, tok_in, next_pos - 1 + j);
                 self.mtp_graph_mode = saved;
+                if self.graph_failed.load(std::sync::atomic::Ordering::Relaxed) {
+                    return None;
+                }
                 m.kv.truncate_last(1);
                 dbg_ref = Some(r);
             }
             let (mut lg, hj) = self.mtp_step_hl(m, &hx, tok_in, next_pos - 1 + j);
+            if self.graph_failed.load(std::sync::atomic::Ordering::Relaxed) {
+                return None;
+            }
             if let Some((lg_cpu, h_cpu)) = dbg_ref {
                 let n = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
                 let dl = lg
@@ -3892,7 +4486,7 @@ impl Pipeline {
         let mut logits = Vec::new();
         let final_norm = self.weights.final_norm.clone();
         #[cfg(target_os = "macos")]
-        let ok = if metal_native {
+        let verify_outcome = if metal_native {
             let lm = self.weights.lm_head.q1_parts()?;
             self.try_batch_graph_metal(
                 &mut hiddens,
@@ -3911,10 +4505,10 @@ impl Pipeline {
                     final_norm: &final_norm,
                     logits_out: &mut logits,
                 }),
-            )
+            ) == crate::gpu::BatchGraphOutcome::Completed
         };
         #[cfg(not(target_os = "macos"))]
-        let ok = self.try_batch_graph_wgpu(
+        let verify_outcome = self.try_batch_graph_wgpu(
             &mut hiddens,
             &positions,
             b,
@@ -3925,11 +4519,44 @@ impl Pipeline {
                 logits_out: &mut logits,
             }),
         );
-        if !ok {
-            // Roll the draft rows back out of the MTP cache and decline —
-            // the caller runs the plain path, nothing has changed.
+        #[cfg(target_os = "macos")]
+        if !verify_outcome {
+            // Metal's verify graph owns a CPU mirror and its established
+            // commit/restore path; a false result means no pending graph was
+            // admitted.  Drop the draft rows and let the exact path continue.
             m.kv.truncate_last(k_spec);
             return None;
+        }
+        #[cfg(not(target_os = "macos"))]
+        match verify_outcome {
+            crate::gpu::BatchGraphOutcome::Completed => {}
+            crate::gpu::BatchGraphOutcome::Declined => {
+                // The verifier refused before admission.  Its draft MTP
+                // rows are still device-resident, so rewind the separate
+                // mirror before the caller takes the exact one-token path.
+                m.kv.truncate_last(k_spec);
+                if !self.rewind_mtp_graph_mirror(next_pos) {
+                    self.clear_sequence_state();
+                    self.graph_failed
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.cancel
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    tracing::error!("MTP graph mirror rewind failed after verify decline");
+                }
+                return None;
+            }
+            crate::gpu::BatchGraphOutcome::Failed => {
+                // A failed batch may have advanced trunk/GDN state.  Clear
+                // both mirrors and preserve the terminal outcome rather than
+                // falling through to stale CPU state.
+                self.clear_sequence_state();
+                self.graph_failed
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                self.cancel
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                tracing::error!("MTP verify batch graph failed after admission");
+                return None;
+            }
         }
         // `CMF_METAL_VERIFY_CHECK=1`: run the same b tokens through the
         // plain per-token path and compare each row's argmax + logits with
@@ -4245,11 +4872,47 @@ impl Pipeline {
                 );
             }
         } else if a + 1 < b {
-            crate::gpu::gdn_spec_restore(self.graph_kv_id, a);
+            let expected_gdn_layers = self.graph_gdn_layer_count();
+            if expected_gdn_layers > 0
+                && !crate::gpu::gdn_spec_restore(self.graph_kv_id, a, next_pos, expected_gdn_layers)
+            {
+                self.clear_sequence_state();
+                self.graph_failed
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                self.cancel
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                tracing::error!("GDN speculative restore failed after verify");
+                return None;
+            }
         }
         #[cfg(not(target_os = "macos"))]
         if a + 1 < b {
-            crate::gpu::gdn_spec_restore(self.graph_kv_id, a);
+            let expected_gdn_layers = self.graph_gdn_layer_count();
+            if expected_gdn_layers > 0
+                && !crate::gpu::gdn_spec_restore(self.graph_kv_id, a, next_pos, expected_gdn_layers)
+            {
+                self.clear_sequence_state();
+                self.graph_failed
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                self.cancel
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                tracing::error!("GDN speculative restore failed after verify");
+                return None;
+            }
+        }
+        #[cfg(all(feature = "gpu", not(target_os = "macos")))]
+        if !self.rewind_trunk_graph_mirrors(next_pos + a + 1) {
+            // The verify graph committed the full batch, but one of its
+            // persistent Full-attention mirrors could not be re-pointed to
+            // the accepted prefix.  Treat that as terminal state failure;
+            // an exact CPU fallback would otherwise consume stale GDN/KV.
+            self.clear_sequence_state();
+            self.graph_failed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::error!("trunk graph KV rewind failed after speculative verify");
+            return None;
         }
         *accepted += a;
         // MTP cache: keep the first draft row (its inputs were real), drop
@@ -4272,6 +4935,19 @@ impl Pipeline {
                 Self::MTP_LAYER_BASE,
                 m.kv.seq_len,
             );
+        }
+        #[cfg(not(target_os = "macos"))]
+        if self.mtp_graph_mode == Some(true) && !self.rewind_mtp_graph_mirror(next_pos) {
+            // The graph draft was admitted, so inability to move its cursor
+            // back to the real anchor is a state failure, not a capability
+            // refusal.  Do not warm or continue with a stale mirror.
+            self.clear_sequence_state();
+            self.graph_failed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::error!("MTP graph mirror rewind failed after verify commit");
+            return None;
         }
         let warm_off = std::env::var("CMF_SPEC_WARM").is_ok_and(|v| v == "0");
         if !warm_off && a > 0 {
@@ -4307,7 +4983,7 @@ impl Pipeline {
                     }
                 }
             }
-            if !warmed && self.mtp_graph_mode == Some(true) && !metal_native {
+            if !warmed && self.mtp_graph_mode != Some(false) && !metal_native {
                 let rows: Vec<Vec<f32>> = (0..a)
                     .map(|j| hiddens[j * self.hidden_size..(j + 1) * self.hidden_size].to_vec())
                     .collect();
@@ -4316,18 +4992,21 @@ impl Pipeline {
                     .zip(ids.iter())
                     .map(|(r, &t)| (r.as_slice(), t))
                     .collect();
-                warmed = self.mtp_warm_graph(m, &pairs, next_pos);
-                if !warmed {
-                    // Prefix-mode token graph per pair (kv_append inside).
-                    warmed = true;
-                    for j in 0..a {
-                        if self
-                            .mtp_step_graph(m, &rows[j], ids[j], next_pos + j)
-                            .is_none()
-                        {
-                            warmed = false;
-                            break;
-                        }
+                match self.mtp_warm_prefill_pairs(m, &pairs, next_pos) {
+                    Ok(()) => warmed = true,
+                    Err(err) => {
+                        // A warm-up failure after graph admission cannot
+                        // fall back to `mtp_warm`: the detached CPU cache is
+                        // not authoritative for the device mirror.  Mark it
+                        // terminal so the generation caller clears state and
+                        // returns instead of drafting from stale attention.
+                        tracing::error!("{err}");
+                        self.clear_sequence_state();
+                        self.graph_failed
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        self.cancel
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        return None;
                     }
                 }
             }
@@ -4389,6 +5068,14 @@ impl Pipeline {
         if !self.pair_supported() {
             return (0.0, 0.0);
         }
+        // This is a host-side pair micro-benchmark. It truncates the host KV
+        // after every probe, so letting the whole-token graph participate
+        // would leave its device GDN/KV mirror ahead of the next probe and
+        // poison the process-wide graph verdict before the real generation
+        // benchmark starts. Keep the existing per-op/GPU arithmetic while
+        // suppressing only the stateful token graph for this measurement.
+        let graph_env = std::env::var_os("CMF_GPU_WGPU_GRAPH");
+        unsafe { std::env::set_var("CMF_GPU_WGPU_GRAPH", "0") };
         let emb1 = self.embed_single(1);
         let emb2 = self.embed_single(2);
         let pos = self.kv_cache.seq_len();
@@ -4411,6 +5098,10 @@ impl Pipeline {
             }
         }
         let pair_ms = t1.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+        match graph_env {
+            Some(value) => unsafe { std::env::set_var("CMF_GPU_WGPU_GRAPH", value) },
+            None => unsafe { std::env::remove_var("CMF_GPU_WGPU_GRAPH") },
+        }
         (singles_ms, pair_ms)
     }
 
@@ -4689,8 +5380,7 @@ impl Pipeline {
         if ids.is_empty() {
             return Err("empty id sequence".to_string());
         }
-        self.kv_cache.clear();
-        self.kv_history.clear();
+        self.clear_sequence_state();
         self.o1_begin();
         let mut hidden = vec![0.0f32; self.hidden_size];
         let mut pos = 0usize;
@@ -4759,9 +5449,9 @@ impl Pipeline {
     /// Attention is EXACT even on a model whose layers are flagged for
     /// the O(1) kernel — scoring the backbone is the default on purpose
     /// (it is the yardstick). `nll_ids_o1` scores the CONVERTED model.
-    pub fn ppl_ids(&mut self, ids: &[u32]) -> f64 {
-        let (nll, cnt) = self.nll_ids_from(ids, 0);
-        (nll / cnt.max(1) as f64).exp()
+    pub fn ppl_ids(&mut self, ids: &[u32]) -> Result<f64, String> {
+        let (nll, cnt) = self.nll_ids_from(ids, 0)?;
+        Ok((nll / cnt.max(1) as f64).exp())
     }
 
     /// DTG-MA calibration pass (Patent 2): run `ids` through the model
@@ -4769,8 +5459,7 @@ impl Pipeline {
     /// activation mass Σ|silu(gate)·up| — the statistic the task-guided
     /// FFN mask is derived from.
     pub fn probe_ffn_mass(&mut self, ids: &[u32]) -> Vec<Vec<f64>> {
-        self.kv_cache.clear();
-        self.kv_history.clear();
+        self.clear_sequence_state();
         FFN_PROBE.with(|p| {
             *p.borrow_mut() = Some(vec![vec![0f64; self.intermediate_size]; self.num_layers]);
         });
@@ -4780,8 +5469,7 @@ impl Pipeline {
                 let _ = self.forward_layers(&emb, pos, None);
             }
         });
-        self.kv_cache.clear();
-        self.kv_history.clear();
+        self.clear_sequence_state();
         FFN_PROBE
             .with(|p| p.borrow_mut().take())
             .unwrap_or_default()
@@ -4790,57 +5478,78 @@ impl Pipeline {
     /// `probe_ffn_mass` over the BATCHED prefill: same accumulator, one
     /// sweep instead of one forward per token. What makes the statistic
     /// affordable on a 27B.
-    pub fn probe_ffn_mass_batch(&mut self, ids: &[u32]) -> Vec<Vec<f64>> {
-        self.kv_cache.clear();
-        self.kv_history.clear();
+    pub fn probe_ffn_mass_batch(&mut self, ids: &[u32]) -> Result<Vec<Vec<f64>>, String> {
+        if let Err(err) = self.nll_begin() {
+            // A recorder can be left by a caller that was interrupted before
+            // this request entered its scoring block.  Consume it even when
+            // the preflight failure prevents initialization of a new one.
+            let _ = FFN_PROBE.with(|p| p.borrow_mut().take());
+            self.nll_end();
+            return Err(err);
+        }
         FFN_PROBE.with(|p| {
             *p.borrow_mut() = Some(vec![vec![0f64; self.intermediate_size]; self.num_layers]);
         });
-        for chunk in ids.chunks(256) {
-            if chunk.len() < 2 {
-                continue;
+        let result: Result<(), String> = (|| {
+            for chunk in ids.chunks(256) {
+                if chunk.len() < 2 {
+                    continue;
+                }
+                self.nll_ids_masked(chunk, 0, None)?;
             }
-            let _ = self.nll_ids_masked(chunk, 0, None);
-        }
-        self.kv_cache.clear();
-        self.kv_history.clear();
-        FFN_PROBE
+            Ok(())
+        })();
+        self.nll_end();
+        let probe = FFN_PROBE
             .with(|p| p.borrow_mut().take())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        match result {
+            Ok(()) => Ok(probe),
+            Err(err) => {
+                drop(probe);
+                Err(err)
+            }
+        }
     }
 
     /// Teacher-forced PPL with a task mask active (sparse execution) —
     /// the quality gate for a DTG-MA-masked skill. Sequential per
     /// position: the batched prefill path is dense-only.
-    pub fn ppl_ids_masked(&mut self, ids: &[u32], mask: &TaskMask) -> f64 {
-        self.kv_cache.clear();
-        self.kv_history.clear();
-        let mut nll = 0f64;
-        let mut cnt = 0usize;
-        let mut hidden = vec![0f32; self.hidden_size];
-        for (pos, &id) in ids.iter().enumerate() {
-            if pos > 0 {
-                inference::rms_norm_into(
-                    &hidden,
-                    &self.weights.final_norm,
-                    self.rms_eps,
-                    self.norm_style,
-                    &mut self.ws.n1,
-                );
-                let mut logits = self.lm_head_forward(&self.ws.n1);
-                let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let sum: f64 = logits.iter().map(|&v| ((v - max) as f64).exp()).sum();
-                let p = ((logits[id as usize] - max) as f64).exp() / sum.max(1e-300);
-                nll -= p.max(1e-300).ln();
-                cnt += 1;
-                attention::recycle_buf(&mut logits);
+    pub fn ppl_ids_masked(&mut self, ids: &[u32], mask: &TaskMask) -> Result<f64, String> {
+        self.nll_begin()?;
+        let result: Result<f64, String> = (|| {
+            let mut nll = 0f64;
+            let mut cnt = 0usize;
+            let mut hidden = vec![0f32; self.hidden_size];
+            for (pos, &id) in ids.iter().enumerate() {
+                if pos > 0 {
+                    inference::rms_norm_into(
+                        &hidden,
+                        &self.weights.final_norm,
+                        self.rms_eps,
+                        self.norm_style,
+                        &mut self.ws.n1,
+                    );
+                    let mut logits = self.lm_head_forward(&self.ws.n1);
+                    let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let sum: f64 = logits.iter().map(|&v| ((v - max) as f64).exp()).sum();
+                    let p = ((logits[id as usize] - max) as f64).exp() / sum.max(1e-300);
+                    nll -= p.max(1e-300).ln();
+                    cnt += 1;
+                    attention::recycle_buf(&mut logits);
+                }
+                let emb = self.embed_single(id);
+                hidden = self.forward_layers(&emb, pos, Some(mask));
+                self.nll_check_graph("masked serial forward", pos)?;
+                // Consume a possible graph logits side channel before the
+                // next row.  Masked scoring normally disables that route,
+                // but stale channel state must never survive a request.
+                let _ = self.graph_logits.take();
             }
-            let emb = self.embed_single(id);
-            hidden = self.forward_layers(&emb, pos, Some(mask));
-        }
-        self.kv_cache.clear();
-        self.kv_history.clear();
-        (nll / cnt.max(1) as f64).exp()
+            Ok((nll / cnt.max(1) as f64).exp())
+        })();
+        self.nll_end();
+        result
     }
 
     /// Teacher-forced NLL sum + scored-token count over positions
@@ -4866,12 +5575,12 @@ impl Pipeline {
         ids: &[u32],
         start: usize,
         task_mask: Option<&TaskMask>,
-    ) -> (f64, usize) {
+    ) -> Result<(f64, usize), String> {
         let task_mask = self.drop_open_mask(task_mask);
         self.nll_ids_inner(ids, start, task_mask)
     }
 
-    pub fn nll_ids_from(&mut self, ids: &[u32], start: usize) -> (f64, usize) {
+    pub fn nll_ids_from(&mut self, ids: &[u32], start: usize) -> Result<(f64, usize), String> {
         self.nll_ids_inner(ids, start, None)
     }
 
@@ -4880,171 +5589,217 @@ impl Pipeline {
         ids: &[u32],
         start: usize,
         task_mask: Option<&TaskMask>,
-    ) -> (f64, usize) {
-        self.kv_cache.clear();
-        self.kv_history.clear();
-        let mut nll = 0f64;
-        let mut cnt = 0usize;
-        if self.can_prefill_batched() {
-            // prefill-GEMM: layer-major position chunks, lm_head batched
-            // (254MB lm_head read once per chunk, not per position).
-            // The layer chunk is large (grouping positions by MoE experts
-            // wins with size), lm_head in sub-blocks (logit buffer
-            // 32×vocab ≈ 32MB instead of 128×).
-            const CHUNK: usize = 128;
-            const LM_SUB: usize = 32;
-            let n = ids.len().saturating_sub(1);
-            let hs = self.hidden_size;
-            let rows = self.weights.lm_head.rows();
-            let mut pos = 0usize;
-            while pos < n {
-                let end = (pos + CHUNK).min(n);
-                let bsz = end - pos;
-                let hb = self.prefill_batch_masked(&ids[pos..end], pos, task_mask);
-                let mut k0 = 0usize;
-                while k0 < bsz {
-                    let k1 = (k0 + LM_SUB).min(bsz);
-                    let sb = k1 - k0;
-                    // Sub-block entirely below the scored range: the KV
-                    // it just built is all this pass needed from it.
-                    if pos + k1 <= start {
+    ) -> Result<(f64, usize), String> {
+        self.nll_begin()?;
+        let result: Result<(f64, usize), String> = (|| {
+            let mut nll = 0f64;
+            let mut cnt = 0usize;
+            if self.can_prefill_batched() {
+                // prefill-GEMM: layer-major position chunks, lm_head batched
+                // (254MB lm_head read once per chunk, not per position).
+                // The layer chunk is large (grouping positions by MoE experts
+                // wins with size), lm_head in sub-blocks (logit buffer
+                // 32×vocab ≈ 32MB instead of 128×).
+                const CHUNK: usize = 128;
+                const LM_SUB: usize = 32;
+                let n = ids.len().saturating_sub(1);
+                let hs = self.hidden_size;
+                let rows = self.weights.lm_head.rows();
+                let mut pos = 0usize;
+                while pos < n {
+                    let end = (pos + CHUNK).min(n);
+                    let bsz = end - pos;
+                    let hb = self.prefill_batch_masked(&ids[pos..end], pos, task_mask);
+                    self.nll_check_graph("batched prefill", pos)?;
+                    let mut k0 = 0usize;
+                    while k0 < bsz {
+                        let k1 = (k0 + LM_SUB).min(bsz);
+                        let sb = k1 - k0;
+                        // Sub-block entirely below the scored range: the KV
+                        // it just built is all this pass needed from it.
+                        if pos + k1 <= start {
+                            k0 = k1;
+                            continue;
+                        }
+                        let mut normed = vec![0.0f32; sb * hs];
+                        for k in 0..sb {
+                            let r = inference::rms_norm(
+                                &hb[(k0 + k) * hs..(k0 + k + 1) * hs],
+                                &self.weights.final_norm,
+                                self.rms_eps,
+                                self.norm_style,
+                            );
+                            normed[k * hs..(k + 1) * hs].copy_from_slice(&r);
+                        }
+                        let mut logits = vec![0.0f32; sb * rows];
+                        self.weights
+                            .lm_head
+                            .matmat(&normed, sb, &mut logits, self.pool.as_deref());
+                        for k in 0..sb {
+                            if pos + k0 + k < start {
+                                continue;
+                            }
+                            self.nll_check_graph("batched score row", pos + k0 + k)?;
+                            let lg = &mut logits[k * rows..k * rows + self.vocab_size.min(rows)];
+                            if let Some(mu) = self.logit_multiplier {
+                                for v in lg.iter_mut() {
+                                    *v *= mu;
+                                }
+                            }
+                            // Gemma-class final-logit soft-capping: the
+                            // decode paths apply it; scoring must too, or
+                            // the uncapped softmax misprices every token.
+                            if let Some(c) = self.final_softcap {
+                                for v in lg.iter_mut() {
+                                    *v = c * (*v / c).tanh();
+                                }
+                            }
+                            // Cortiq Embryo hierarchical head: same correction
+                            // the decode path applies (lm_head_forward).
+                            if let Some(cm) = self.head_clusters.clone() {
+                                self.hierarchical_head_logprobs(
+                                    &normed[k * hs..(k + 1) * hs],
+                                    &cm,
+                                    lg,
+                                );
+                            }
+                            let lg = &logits[k * rows..k * rows + self.vocab_size.min(rows)];
+                            let target = ids[pos + k0 + k + 1] as usize;
+                            let max = lg.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
+                            let lse: f64 = lg
+                                .iter()
+                                .map(|&v| ((v - max) as f64).exp())
+                                .sum::<f64>()
+                                .ln()
+                                + max as f64;
+                            nll += lse - lg[target] as f64;
+                            cnt += 1;
+                            if std::env::var("CMF_PPL_TRACE").is_ok() {
+                                let top = lg
+                                    .iter()
+                                    .enumerate()
+                                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                                    .map(|(i, _)| i)
+                                    .unwrap_or(0);
+                                eprintln!(
+                                    "BTRACE pos {} target {} nll {:.4} top {} lg_t {:.3} lg_top {:.3}",
+                                    pos + k0 + k,
+                                    target,
+                                    lse - lg[target] as f64,
+                                    top,
+                                    lg[target],
+                                    lg[top]
+                                );
+                            }
+                        }
                         k0 = k1;
-                        continue;
                     }
-                    let mut normed = vec![0.0f32; sb * hs];
-                    for k in 0..sb {
-                        let r = inference::rms_norm(
-                            &hb[(k0 + k) * hs..(k0 + k + 1) * hs],
+                    pos = end;
+                }
+                return Ok((nll, cnt));
+            }
+            for pos in 0..ids.len().saturating_sub(1) {
+                let hidden = self.forward_layers(&self.embed_single(ids[pos]), pos, task_mask);
+                self.nll_check_graph("serial forward", pos)?;
+                // Architectures whose head lives inside their own stack return
+                // the logits out of band and a zero hidden — DeepSeek-V4 folds
+                // its hyper-connection copies between the last layer and the
+                // norm, so it cannot hand back a vector this loop could use.
+                // Scoring the zeros gave a perplexity of exactly the vocabulary
+                // size, which is a uniform distribution reported as a
+                // measurement. `generate` already reads this channel.
+                let out_of_band = self.graph_logits.take();
+                if pos < start {
+                    continue;
+                }
+                let logits = match out_of_band {
+                    Some(lg) => lg,
+                    None => {
+                        let normed = inference::rms_norm(
+                            &hidden,
                             &self.weights.final_norm,
                             self.rms_eps,
                             self.norm_style,
                         );
-                        normed[k * hs..(k + 1) * hs].copy_from_slice(&r);
+                        // lm_head_forward applies the final-logit softcap itself
+                        // — capping again here double-squashed gemma-class
+                        // logits (tanh∘tanh) and reported a flattered ppl.
+                        self.lm_head_forward(&normed)
                     }
-                    let mut logits = vec![0.0f32; sb * rows];
-                    self.weights
-                        .lm_head
-                        .matmat(&normed, sb, &mut logits, self.pool.as_deref());
-                    for k in 0..sb {
-                        if pos + k0 + k < start {
-                            continue;
-                        }
-                        let lg = &mut logits[k * rows..k * rows + self.vocab_size.min(rows)];
-                        if let Some(mu) = self.logit_multiplier {
-                            for v in lg.iter_mut() {
-                                *v *= mu;
-                            }
-                        }
-                        // Gemma-class final-logit soft-capping: the
-                        // decode paths apply it; scoring must too, or
-                        // the uncapped softmax misprices every token.
-                        if let Some(c) = self.final_softcap {
-                            for v in lg.iter_mut() {
-                                *v = c * (*v / c).tanh();
-                            }
-                        }
-                        // Cortiq Embryo hierarchical head: same correction
-                        // the decode path applies (lm_head_forward).
-                        if let Some(cm) = self.head_clusters.clone() {
-                            self.hierarchical_head_logprobs(&normed[k * hs..(k + 1) * hs], &cm, lg);
-                        }
-                        let lg = &logits[k * rows..k * rows + self.vocab_size.min(rows)];
-                        let target = ids[pos + k0 + k + 1] as usize;
-                        let max = lg.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
-                        let lse: f64 = lg
-                            .iter()
-                            .map(|&v| ((v - max) as f64).exp())
-                            .sum::<f64>()
-                            .ln()
-                            + max as f64;
-                        nll += lse - lg[target] as f64;
-                        cnt += 1;
-                        if std::env::var("CMF_PPL_TRACE").is_ok() {
-                            let top = lg
-                                .iter()
-                                .enumerate()
-                                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-                                .map(|(i, _)| i)
-                                .unwrap_or(0);
-                            eprintln!(
-                                "BTRACE pos {} target {} nll {:.4} top {} lg_t {:.3} lg_top {:.3}",
-                                pos + k0 + k,
-                                target,
-                                lse - lg[target] as f64,
-                                top,
-                                lg[target],
-                                lg[top]
-                            );
-                        }
-                    }
-                    k0 = k1;
-                }
-                pos = end;
-            }
-            self.kv_cache.clear();
-            self.kv_history.clear();
-            return (nll, cnt);
-        }
-        for pos in 0..ids.len().saturating_sub(1) {
-            let hidden = self.forward_layers(&self.embed_single(ids[pos]), pos, task_mask);
-            // Architectures whose head lives inside their own stack return
-            // the logits out of band and a zero hidden — DeepSeek-V4 folds
-            // its hyper-connection copies between the last layer and the
-            // norm, so it cannot hand back a vector this loop could use.
-            // Scoring the zeros gave a perplexity of exactly the vocabulary
-            // size, which is a uniform distribution reported as a
-            // measurement. `generate` already reads this channel.
-            let out_of_band = self.graph_logits.take();
-            if pos < start {
-                continue;
-            }
-            let logits = match out_of_band {
-                Some(lg) => lg,
-                None => {
-                    let normed = inference::rms_norm(
-                        &hidden,
-                        &self.weights.final_norm,
-                        self.rms_eps,
-                        self.norm_style,
-                    );
-                    // lm_head_forward applies the final-logit softcap itself
-                    // — capping again here double-squashed gemma-class
-                    // logits (tanh∘tanh) and reported a flattered ppl.
-                    self.lm_head_forward(&normed)
-                }
-            };
-            let target = ids[pos + 1] as usize;
-            let max = logits.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
-            let lse: f64 = logits
-                .iter()
-                .map(|&v| ((v - max) as f64).exp())
-                .sum::<f64>()
-                .ln()
-                + max as f64;
-            let tok_nll = lse - logits[target] as f64;
-            if std::env::var("CMF_PPL_TRACE").is_ok() && pos < 48 {
-                let top = logits
+                };
+                let target = ids[pos + 1] as usize;
+                let max = logits.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
+                let lse: f64 = logits
                     .iter()
-                    .enumerate()
-                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
-                eprintln!(
-                    "pos {pos:3} tgt {target:6} nll {tok_nll:7.3} | top1 {top:6} lg[t]={:.2} lg[top]={:.2}",
-                    logits[target], logits[top]
-                );
+                    .map(|&v| ((v - max) as f64).exp())
+                    .sum::<f64>()
+                    .ln()
+                    + max as f64;
+                let tok_nll = lse - logits[target] as f64;
+                if std::env::var("CMF_PPL_TRACE").is_ok() && pos < 48 {
+                    let top = logits
+                        .iter()
+                        .enumerate()
+                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    eprintln!(
+                        "pos {pos:3} tgt {target:6} nll {tok_nll:7.3} | top1 {top:6} lg[t]={:.2} lg[top]={:.2}",
+                        logits[target], logits[top]
+                    );
+                }
+                nll += tok_nll;
+                cnt += 1;
             }
-            nll += tok_nll;
-            cnt += 1;
+            Ok((nll, cnt))
+        })();
+        self.nll_end();
+        result
+    }
+
+    /// Score one post-layer hidden with the same final norm/head path used by
+    /// decode. Keeping this in one helper is important for the production
+    /// batch scorer: its rows stop before the final norm, just like the
+    /// per-position O(1) path below.
+    fn nll_from_hidden(&mut self, hidden: &[f32], target: u32, pos: usize) -> f64 {
+        let normed = inference::rms_norm(
+            hidden,
+            &self.weights.final_norm,
+            self.rms_eps,
+            self.norm_style,
+        );
+        // lm_head_forward applies the final-logit softcap itself — capping
+        // again here double-squashed gemma-class logits in earlier scorers.
+        let mut logits = self.lm_head_forward(&normed);
+        let target = target as usize;
+        let max = logits.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
+        let lse: f64 = logits
+            .iter()
+            .map(|&v| ((v - max) as f64).exp())
+            .sum::<f64>()
+            .ln()
+            + max as f64;
+        let tok_nll = lse - logits[target] as f64;
+        if std::env::var("CMF_PPL_TRACE").is_ok() && pos < 48 {
+            let top = logits
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            eprintln!(
+                "pos {pos:3} tgt {target:6} nll {tok_nll:7.3} | top1 {top:6} lg[t]={:.2} lg[top]={:.2}",
+                logits[target], logits[top]
+            );
         }
-        self.kv_cache.clear();
-        self.kv_history.clear();
-        (nll, cnt)
+        attention::recycle_buf(&mut logits);
+        tok_nll
     }
 
     /// Teacher-forced NLL of the CONVERTED model: the O(1) Nyström path
-    /// is ACTIVE over the scored positions. Returns (nll sum, scored
-    /// count) over `prefill..len-1`.
+    /// is ACTIVE over the scored positions. Returns `Ok((nll sum, scored
+    /// count))` over `prefill..len-1` and surfaces a post-mutation batch
+    /// failure instead of returning a partial score.
     ///
     /// Runtime discipline, deliberately NOT the matrix probe's: the
     /// first `prefill` tokens run the exact prompt pass — that pass is
@@ -5057,9 +5812,12 @@ impl Pipeline {
     ///
     /// Pair with `nll_ids_from(ids, prefill)` for the exact baseline
     /// over the identical token set — that ratio is the honest one.
-    pub fn nll_ids_o1(&mut self, ids: &[u32], prefill: usize) -> (f64, usize) {
-        self.kv_cache.clear();
-        self.kv_history.clear();
+    pub fn nll_ids_o1(&mut self, ids: &[u32], prefill: usize) -> Result<(f64, usize), String> {
+        // This scorer consumes host hiddens, so never request the optional
+        // token-graph lm_head side channel. `nll_begin` also consumes a
+        // prior graph failure and clears only the cancel bit that failure
+        // raised, leaving a caller-owned cancellation observable.
+        self.nll_begin()?;
         self.o1_begin();
         let n = ids.len().saturating_sub(1);
         let p = prefill.min(n);
@@ -5070,11 +5828,29 @@ impl Pipeline {
             while pos < p {
                 let end = (pos + CHUNK).min(p);
                 let _ = self.prefill_batch(&ids[pos..end], pos);
+                if self
+                    .graph_failed
+                    .swap(false, std::sync::atomic::Ordering::Relaxed)
+                {
+                    self.cancel
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    self.nll_end();
+                    return Err("GPU graph failed during O(1) NLL prefix".into());
+                }
                 pos = end;
             }
         } else {
             while pos < p {
                 let _ = self.forward_layers(&self.embed_single(ids[pos]), pos, None);
+                if self
+                    .graph_failed
+                    .swap(false, std::sync::atomic::Ordering::Relaxed)
+                {
+                    self.cancel
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    self.nll_end();
+                    return Err("GPU graph failed during O(1) NLL prefix".into());
+                }
                 pos += 1;
             }
         }
@@ -5082,45 +5858,120 @@ impl Pipeline {
 
         let mut nll = 0f64;
         let mut cnt = 0usize;
+
+        // Reuse the production whole-token batch graph for the post-seal
+        // suffix when the caller explicitly enabled both routes. This is a
+        // teacher-forced scorer, so every row is ids[pos] and its target is
+        // ids[pos + 1]; no speculative tail or rollback state is involved.
+        // A first Declined is safe to handle with the established serial O(1)
+        // path. Once a chunk completes, however, the device recurrent state
+        // owns the sequence and a later decline must be terminal rather than
+        // falling back to stale CPU state.
+        let batch_k = std::env::var("CMF_BATCH_K")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        let batch_admitted = batch_k > 0
+            && self.can_prefill_batched()
+            && self.o1_active()
+            && std::env::var("CMF_O1_GPU").as_deref() == Ok("1")
+            && (0..self.num_layers).all(|li| {
+                let cache = &self.kv_cache.layers[self.phys_layer(li)];
+                cache.o1.is_none() || cache.o1_views().is_some()
+            });
+        if std::env::var("CMF_GRAPH_PROF").is_ok() {
+            eprintln!(
+                "nll-batch: phase=post-seal admission={} requested_k={} scored_rows={}",
+                batch_admitted,
+                batch_k,
+                n.saturating_sub(p),
+            );
+        }
+        let mut batch_completed = false;
+        if batch_admitted && p < n {
+            let hs = self.hidden_size;
+            let mut batch_pos = p;
+            while batch_pos < n {
+                let end = (batch_pos + batch_k).min(n);
+                let bk = end - batch_pos;
+                let mut hiddens = vec![0.0f32; bk * hs];
+                for (row, &id) in ids[batch_pos..end].iter().enumerate() {
+                    hiddens[row * hs..(row + 1) * hs].copy_from_slice(&self.embed_single(id));
+                }
+                let positions: Vec<usize> = (batch_pos..end).collect();
+                let t_batch = std::time::Instant::now();
+                let outcome = self.try_batch_graph_wgpu(&mut hiddens, &positions, bk, None);
+                if std::env::var("CMF_GRAPH_PROF").is_ok() {
+                    let ms = t_batch.elapsed().as_secs_f64() * 1000.0;
+                    eprintln!(
+                        "nll-batch: phase=post-seal mode=o1 k={bk} pos={}..{} outcome={outcome:?} {ms:.1} ms ({:.1} tok/s)",
+                        batch_pos,
+                        end.saturating_sub(1),
+                        bk as f64 / (ms / 1000.0),
+                    );
+                }
+                if let Err(err) = self.nll_check_graph("batch graph", batch_pos) {
+                    self.nll_end();
+                    return Err(err);
+                }
+                match outcome {
+                    crate::gpu::BatchGraphOutcome::Completed => {
+                        batch_completed = true;
+                        for row in 0..bk {
+                            nll += self.nll_from_hidden(
+                                &hiddens[row * hs..(row + 1) * hs],
+                                ids[batch_pos + row + 1],
+                                batch_pos + row,
+                            );
+                            cnt += 1;
+                        }
+                        batch_pos = end;
+                    }
+                    crate::gpu::BatchGraphOutcome::Declined => {
+                        if batch_completed {
+                            self.nll_end();
+                            return Err(format!(
+                                "O(1) NLL batch declined after completed chunk at position {batch_pos}"
+                            ));
+                        }
+                        break;
+                    }
+                    crate::gpu::BatchGraphOutcome::Failed => {
+                        self.nll_end();
+                        return Err(format!(
+                            "O(1) NLL batch graph failed after admission at position {batch_pos}"
+                        ));
+                    }
+                }
+            }
+            if batch_completed && cnt == n.saturating_sub(p) {
+                self.nll_end();
+                return Ok((nll, cnt));
+            }
+        }
+
+        // Serial O(1) fallback/reference. It is intentionally retained when
+        // batch admission declines before mutation; callers must label this
+        // CMF_BATCH_K=0/per-position path separately from the production
+        // whole-token batch route.
         for pos in p..n {
             let hidden = self.forward_layers(&self.embed_single(ids[pos]), pos, None);
-            let normed = inference::rms_norm(
-                &hidden,
-                &self.weights.final_norm,
-                self.rms_eps,
-                self.norm_style,
-            );
-            // lm_head_forward applies the final-logit softcap itself —
-            // capping again here double-squashed gemma-class logits
-            // (tanh∘tanh) and reported a flattered ppl.
-            let logits = self.lm_head_forward(&normed);
-            let target = ids[pos + 1] as usize;
-            let max = logits.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
-            let lse: f64 = logits
-                .iter()
-                .map(|&v| ((v - max) as f64).exp())
-                .sum::<f64>()
-                .ln()
-                + max as f64;
-            let tok_nll = lse - logits[target] as f64;
-            if std::env::var("CMF_PPL_TRACE").is_ok() && pos < 48 {
-                let top = logits
-                    .iter()
-                    .enumerate()
-                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
-                eprintln!(
-                    "pos {pos:3} tgt {target:6} nll {tok_nll:7.3} | top1 {top:6} lg[t]={:.2} lg[top]={:.2}",
-                    logits[target], logits[top]
-                );
+            if self
+                .graph_failed
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                self.cancel
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                self.nll_end();
+                return Err(format!(
+                    "GPU graph failed during O(1) NLL serial scoring at position {pos}"
+                ));
             }
-            nll += tok_nll;
+            nll += self.nll_from_hidden(&hidden, ids[pos + 1], pos);
             cnt += 1;
         }
-        self.kv_cache.clear();
-        self.kv_history.clear();
-        (nll, cnt)
+        self.nll_end();
+        Ok((nll, cnt))
     }
 
     /// Teacher-forced calibration data (B1): for each position, whether the
@@ -5131,8 +5982,7 @@ impl Pipeline {
     /// fit): is the model's confidence a true property, or does it need a
     /// measured scaling?
     pub fn calib_ids(&mut self, ids: &[u32], temps: &[f32]) -> (Vec<bool>, Vec<Vec<f32>>) {
-        self.kv_cache.clear();
-        self.kv_history.clear();
+        self.clear_sequence_state();
         let n = ids.len().saturating_sub(1);
         let mut correct = Vec::with_capacity(n);
         let mut pmax = Vec::with_capacity(n);
@@ -5168,8 +6018,7 @@ impl Pipeline {
                 .collect();
             pmax.push(row);
         }
-        self.kv_cache.clear();
-        self.kv_history.clear();
+        self.clear_sequence_state();
         (correct, pmax)
     }
 
@@ -5179,73 +6028,86 @@ impl Pipeline {
     /// must be enabled (`enable_dynamic_routing`); else this equals
     /// plain `ppl_ids`. The active skill when scoring token t shapes the
     /// logits for t+1 — on-policy over the held-out text itself.
-    pub fn ppl_ids_dynamic(&mut self, ids: &[u32]) -> (f64, usize) {
-        let mut router = match self.dyn_router.take() {
-            Some(r) => r,
-            None => return (self.ppl_ids(ids), 0),
-        };
+    pub fn ppl_ids_dynamic(&mut self, ids: &[u32]) -> Result<(f64, usize), String> {
+        if self.dyn_router.is_none() {
+            return Ok((self.ppl_ids(ids)?, 0));
+        }
+        self.nll_begin()?;
+        let saved_active = self.dyn_active;
+        let mut router = self
+            .dyn_router
+            .take()
+            .ok_or_else(|| "dynamic router disappeared before PPL scoring".to_string())?;
         router.reset();
         self.dyn_phi_seen = 0;
         let _ = self.set_active_skill(None);
 
-        self.kv_cache.clear();
-
-        self.kv_history.clear();
-        let mut nll = 0f64;
-        let mut cnt = 0usize;
-        for pos in 0..ids.len().saturating_sub(1) {
-            let hidden = self.forward_layers(&self.embed_single(ids[pos]), pos, None);
-            let normed = inference::rms_norm(
-                &hidden,
-                &self.weights.final_norm,
-                self.rms_eps,
-                self.norm_style,
-            );
-            // lm_head_forward applies the final-logit softcap itself —
-            // capping again here double-squashed gemma-class logits
-            // (tanh∘tanh) and reported a flattered ppl.
-            let logits = self.lm_head_forward(&normed);
-            let target = ids[pos + 1] as usize;
-            let max = logits.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
-            let lse: f64 = logits
-                .iter()
-                .map(|&v| ((v - max) as f64).exp())
-                .sum::<f64>()
-                .ln()
-                + max as f64;
-            let tok_nll = lse - logits[target] as f64;
-            if std::env::var("CMF_PPL_TRACE").is_ok() && pos < 48 {
-                let top = logits
+        let result: Result<(f64, usize), String> = (|| {
+            let mut nll = 0f64;
+            let mut cnt = 0usize;
+            for pos in 0..ids.len().saturating_sub(1) {
+                let hidden = self.forward_layers(&self.embed_single(ids[pos]), pos, None);
+                self.nll_check_graph("dynamic serial forward", pos)?;
+                let out_of_band = self.graph_logits.take();
+                let mut logits = match out_of_band {
+                    Some(lg) => lg,
+                    None => {
+                        let normed = inference::rms_norm(
+                            &hidden,
+                            &self.weights.final_norm,
+                            self.rms_eps,
+                            self.norm_style,
+                        );
+                        // lm_head_forward applies the final-logit softcap itself —
+                        // capping again here double-squashed gemma-class logits
+                        // and reported a flattered ppl.
+                        self.lm_head_forward(&normed)
+                    }
+                };
+                let target = ids[pos + 1] as usize;
+                let max = logits.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
+                let lse: f64 = logits
                     .iter()
-                    .enumerate()
-                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
-                eprintln!(
-                    "pos {pos:3} tgt {target:6} nll {tok_nll:7.3} | top1 {top:6} lg[t]={:.2} lg[top]={:.2}",
-                    logits[target], logits[top]
-                );
+                    .map(|&v| ((v - max) as f64).exp())
+                    .sum::<f64>()
+                    .ln()
+                    + max as f64;
+                let tok_nll = lse - logits[target] as f64;
+                if std::env::var("CMF_PPL_TRACE").is_ok() && pos < 48 {
+                    let top = logits
+                        .iter()
+                        .enumerate()
+                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    eprintln!(
+                        "pos {pos:3} tgt {target:6} nll {tok_nll:7.3} | top1 {top:6} lg[t]={:.2} lg[top]={:.2}",
+                        logits[target], logits[top]
+                    );
+                }
+                nll += tok_nll;
+                cnt += 1;
+                attention::recycle_buf(&mut logits);
+                // Route on the evolving phi (drives the NEXT token's skill).
+                let phi = self.dyn_phi_ema.clone();
+                if let Some(new_active) = router.step(&phi, pos) {
+                    let _ = self.set_active_skill(new_active);
+                }
             }
-            nll += tok_nll;
-            cnt += 1;
-            // Route on the evolving φ (drives the NEXT token's skill).
-            let phi = self.dyn_phi_ema.clone();
-            if let Some(new_active) = router.step(&phi, pos) {
-                let _ = self.set_active_skill(new_active);
-            }
-        }
-        let switches = router.switches.len();
-        let _ = self.set_active_skill(None);
+            Ok(((nll / cnt.max(1) as f64).exp(), router.switches.len()))
+        })();
+
+        // Restore the detached router and the active overlay on both success
+        // and failure. The scoring state is cleared independently below.
+        let _ = self.set_active_skill(saved_active);
         self.dyn_router = Some(router);
-        self.kv_cache.clear();
-        self.kv_history.clear();
-        ((nll / cnt.max(1) as f64).exp(), switches)
+        self.nll_end();
+        result
     }
 
     /// Routing probe φ (spec §9): mean-pooled hidden after `layer`.
     pub fn probe_phi(&mut self, ids: &[u32], layer: usize) -> Vec<f32> {
-        self.kv_cache.clear();
-        self.kv_history.clear();
+        self.clear_sequence_state();
         let mut acc = vec![0f32; self.hidden_size];
         for (pos, &id) in ids.iter().enumerate() {
             let h = self.forward_layers_upto(&self.embed_single(id), pos, None, Some(layer));
@@ -5257,8 +6119,7 @@ impl Pipeline {
         for a in acc.iter_mut() {
             *a /= n;
         }
-        self.kv_cache.clear();
-        self.kv_history.clear();
+        self.clear_sequence_state();
         acc
     }
 
@@ -6117,9 +6978,7 @@ impl Pipeline {
 
     /// Fresh sequence: clear KV, reuse history and device mirrors.
     pub fn reset_session(&mut self) {
-        self.kv_cache.clear();
-        self.kv_history.clear();
-        crate::gpu::graph_kv_reset(self.graph_kv_id);
+        self.clear_sequence_state();
     }
 
     /// Batched span prefill from token ids (coordinator side): embed +
@@ -6221,7 +7080,7 @@ impl Pipeline {
         position: usize,
         logits_out: &mut Vec<f32>,
         layers_run: &mut usize,
-    ) -> Option<Vec<f32>> {
+    ) -> Option<Result<Vec<f32>, ()>> {
         self.try_token_graph_wgpu_steps(
             hidden,
             position,
@@ -6245,7 +7104,7 @@ impl Pipeline {
         from: usize,
         upto_excl: usize,
         layers_run: &mut usize,
-    ) -> Option<Vec<f32>> {
+    ) -> Option<Result<Vec<f32>, ()>> {
         self.try_token_graph_wgpu_steps(
             hidden,
             position,
@@ -6278,7 +7137,7 @@ impl Pipeline {
         let emb = self.embed_single(t_next);
         let mut lg = Vec::new();
         let mut ids = Vec::new();
-        self.try_token_graph_wgpu_steps(
+        match self.try_token_graph_wgpu_steps(
             &emb,
             position,
             &mut lg,
@@ -6287,7 +7146,19 @@ impl Pipeline {
             None,
             0,
             self.num_layers,
-        )?;
+        ) {
+            Some(Ok(_)) => {}
+            Some(Err(())) => {
+                // Preserve the backend's post-admission failure through the
+                // Option-based burst API.  The decode caller consumes this
+                // flag and clears the sequence instead of falling through
+                // to a stale CPU recurrent state.
+                self.graph_failed
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                return None;
+            }
+            None => return None,
+        }
         (ids.len() == k).then_some(ids)
     }
 
@@ -6304,7 +7175,7 @@ impl Pipeline {
         layers_run: Option<&mut usize>,
         from: usize,
         upto_excl: usize,
-    ) -> Option<Vec<f32>> {
+    ) -> Option<Result<Vec<f32>, ()>> {
         // O(1) Nyström decode runs off the sealed state, not the KV cache the
         // graph mirrors — never take the graph while o1 is active.
         let o1_gpu = std::env::var("CMF_O1_GPU").as_deref() == Ok("1");
@@ -6652,7 +7523,7 @@ impl Pipeline {
             Vec::new()
         };
         let mut h = hidden.to_vec();
-        crate::gpu::forward_token_graph(
+        let outcome = crate::gpu::forward_token_graph(
             &model,
             self.graph_kv_id,
             &layers,
@@ -6681,8 +7552,12 @@ impl Pipeline {
             layers_run,
             from,
             false,
-        )
-        .then_some(h)
+        );
+        match outcome {
+            crate::gpu::TokenGraphOutcome::Completed => Some(Ok(h)),
+            crate::gpu::TokenGraphOutcome::Failed => Some(Err(())),
+            crate::gpu::TokenGraphOutcome::Declined => None,
+        }
     }
 
     /// Batched prefill: k contiguous prompt positions through the whole wgpu
@@ -7541,13 +8416,10 @@ impl Pipeline {
         positions: &[usize],
         k: usize,
         spec: Option<crate::gpu::SpecTail<'_>>,
-    ) -> bool {
+    ) -> crate::gpu::BatchGraphOutcome {
         let _tb = std::time::Instant::now();
         if self.attn_softcap > 0.0 {
-            return false; // capped scores: no graph kernel — CPU path
-        }
-        if self.o1_active() {
-            return false;
+            return crate::gpu::BatchGraphOutcome::Declined; // capped scores: no graph kernel — CPU path
         }
         let nh = self.num_heads;
         let (nkv, hd, rd) = self.layer_geom(0);
@@ -7743,7 +8615,7 @@ impl Pipeline {
                     tracing::warn!("batch graph: BUILDER refused (layer weights/kinds)");
                 }
             }
-            return false;
+            return crate::gpu::BatchGraphOutcome::Declined;
         };
         if std::env::var("CMF_GRAPH_SPEC_TIME").is_ok() {
             eprintln!("batch-build: {:.1} ms", _tb.elapsed().as_secs_f64() * 1e3);
@@ -7766,6 +8638,10 @@ impl Pipeline {
             self.rms_eps as f32,
             self.attn_scale,
             k,
+            &(0..self.num_layers)
+                .map(|li| self.kv_cache.layers[self.phys_layer(li)].o1_views())
+                .collect::<Vec<_>>(),
+            self.o1_epoch,
             spec,
         )
     }
@@ -8485,14 +9361,31 @@ impl Pipeline {
             let mut lg = Vec::new();
             let mut gl = 0usize;
             let built = self.try_token_graph_wgpu(hidden, position, &mut lg, &mut gl);
+            let declined = built.is_none();
+            let built = match built {
+                Some(Ok(hh)) => Some(hh),
+                Some(Err(())) => {
+                    // O(1) state was admitted before the device failure; the
+                    // CPU mirrors are stale by construction.  Clear the whole
+                    // sequence and stop rather than walking that stale state.
+                    self.clear_sequence_state();
+                    self.graph_failed
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.cancel
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    tracing::error!("token graph failed after admission; sequence state cleared");
+                    return vec![0.0; self.hidden_size];
+                }
+                None => None,
+            };
             // Past the transient guards (o1 still collecting, a softcap)
             // a refusal is about the weights and will never change —
             // remember it instead of walking every layer again next
             // token.
-            if built.is_none() && !self.o1_active() && self.attn_softcap == 0.0 {
+            if declined && !self.o1_active() && self.attn_softcap == 0.0 {
                 crate::gpu::graph_mark_unsupported();
             }
-            graph_note(built.is_some());
+            graph_note(built.is_some(), gl, self.num_layers);
             if let Some(hh) = built {
                 let dur = t_graph.elapsed();
                 if std::env::var("CMF_GRAPH_PROF").is_ok() {
@@ -8560,7 +9453,22 @@ impl Pipeline {
             let mut gl = 0usize;
             let span_res =
                 self.try_token_graph_wgpu_span(hidden, position, &mut lg, from, upto_excl, &mut gl);
-            graph_note(span_res.is_some() && gl == upto_excl - from);
+            let span_res = match span_res {
+                Some(Ok(hh)) => Some(hh),
+                Some(Err(())) => {
+                    self.clear_sequence_state();
+                    self.graph_failed
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.cancel
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    tracing::error!(
+                        "span token graph failed after admission; sequence state cleared"
+                    );
+                    return vec![0.0; self.hidden_size];
+                }
+                None => None,
+            };
+            graph_note(span_res.is_some(), gl, upto_excl - from);
             if std::env::var("CMF_GPU_DEBUG").is_ok() {
                 // How much of the span the graph actually covered. A
                 // prefix of nothing means every layer walks per-op and
@@ -9246,8 +10154,12 @@ impl Pipeline {
     /// for `cortiq explain`). Clears and repopulates the KV cache; leaves
     /// the active overlay untouched.
     pub fn prefill_next_logits(&mut self, ids: &[u32], task_mask: Option<&TaskMask>) -> Vec<f32> {
-        self.kv_cache.clear();
-        self.kv_history.clear();
+        self.clear_sequence_state();
+        // This helper is used by the pooled classification endpoint, where
+        // every request is a fresh sequence. The shared reset also clears the
+        // wgpu token graph's device-side recurrent state.
+        crate::gpu::graph_race_begin_generation();
+        self.o1_begin();
         let mut hidden = vec![0.0f32; self.hidden_size];
         for (pos, &id) in ids.iter().enumerate() {
             let emb = self.embed_single(id);
@@ -11383,11 +12295,17 @@ pub(crate) fn moe_ffn(
 
 /// One-shot report of whether the whole-token wgpu graph actually formed.
 /// A refusal silently reverts to the per-op path, which is how a model can
-/// look "GPU-accelerated" while every layer walks the host.
-fn graph_note(built: bool) {
+/// look "GPU-accelerated" while every layer walks the host.  A device prefix
+/// is tracked separately because it still pays a host boundary for the tail.
+fn graph_note(built: bool, layers_run: usize, total_layers: usize) {
     use std::sync::atomic::{AtomicBool, Ordering};
     if built {
         GRAPH_TOK_OK.fetch_add(1, Ordering::Relaxed);
+        if total_layers > 0 && layers_run < total_layers {
+            GRAPH_TOK_PREFIX.fetch_add(1, Ordering::Relaxed);
+        } else {
+            GRAPH_TOK_FULL.fetch_add(1, Ordering::Relaxed);
+        }
     } else {
         GRAPH_TOK_MISS.fetch_add(1, Ordering::Relaxed);
     }
@@ -11406,6 +12324,12 @@ fn graph_note(built: bool) {
 /// contract makes that an error, not a footnote.
 pub static GRAPH_TOK_OK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static GRAPH_TOK_MISS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Graph calls that returned a hidden after running only a leading device
+/// prefix.  These are valid hybrid executions but must not be reported as a
+/// full GPU graph in benchmark evidence.
+pub static GRAPH_TOK_PREFIX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Graph calls that covered the complete requested layer span.
+pub static GRAPH_TOK_FULL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `CMF_MOE_BATCH=0` restores the per-expert serial loop — the A/B lever
 /// for the batched kernel, and how its bit-identity is checked.
@@ -11799,6 +12723,15 @@ fn ffn_forward_pair(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn mtp_prefill_pair_boundaries_skip_only_final_prompt_row() {
+        assert_eq!(mtp_prefill_pair_count(0, 128, 256), 128);
+        assert_eq!(mtp_prefill_pair_count(128, 256, 256), 127);
+        assert_eq!(mtp_prefill_pair_count(0, 256, 256), 255);
+        assert_eq!(mtp_prefill_pair_count(256, 256, 256), 0);
+        assert_eq!(mtp_prefill_pair_count(300, 320, 256), 0);
+    }
 
     #[test]
     fn cancel_flag_stops_generation() {
@@ -12269,5 +13202,84 @@ mod tests {
         for (actual, expected) in actual.iter().zip(expected) {
             assert!((actual - expected).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn nll_graph_failure_is_terminal_and_request_is_reusable() {
+        let _guard = NLL_TEST_LOCK.lock().unwrap();
+        let ids = vec![1u32, 2, 3, 4, 5, 6];
+        let mut p = create_test_pipeline(8, 16, 2, 1, 4, 1, 64);
+        p.graph_logits = Some(vec![123.0]);
+        p.graph_want_logits = true;
+        p.graph_failed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        let err = p.nll_ids_from(&ids, 0).expect_err("prior graph failure");
+        assert!(err.contains("before NLL"));
+        assert!(p.graph_logits.is_none());
+        assert!(!p.graph_want_logits);
+        assert!(!p.graph_failed.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!p.cancel.load(std::sync::atomic::Ordering::Relaxed));
+
+        let mut fresh = create_test_pipeline(8, 16, 2, 1, 4, 1, 64);
+        let expected = fresh.nll_ids_from(&ids, 0).expect("fresh NLL");
+        let actual = p.nll_ids_from(&ids, 0).expect("reused NLL");
+        assert_eq!(actual.1, expected.1);
+        assert!((actual.0 - expected.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn nll_forward_failure_discards_partial_score_and_clears_sidechannels() {
+        let _guard = NLL_TEST_LOCK.lock().unwrap();
+        let ids = vec![1u32, 2, 3, 4, 5, 6];
+        let mut p = create_test_pipeline(8, 16, 2, 1, 4, 1, 64);
+        NLL_TEST_FAIL_AT.store(1, std::sync::atomic::Ordering::Relaxed);
+        let err = p
+            .nll_ids_from(&ids, 0)
+            .expect_err("one-shot forward failure");
+        NLL_TEST_FAIL_AT.store(-1, std::sync::atomic::Ordering::Relaxed);
+        assert!(err.contains("forward") || err.contains("score row"));
+        assert!(!p.graph_failed.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!p.graph_want_logits);
+        assert!(p.graph_logits.is_none());
+        assert!(p.kv_history.is_empty());
+
+        let mut fresh = create_test_pipeline(8, 16, 2, 1, 4, 1, 64);
+        let expected = fresh.nll_ids_from(&ids, 0).expect("fresh NLL");
+        let actual = p.nll_ids_from(&ids, 0).expect("reused NLL");
+        assert_eq!(actual.1, expected.1);
+        assert!((actual.0 - expected.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn nll_serial_failure_before_first_row_is_reported() {
+        let _guard = NLL_TEST_LOCK.lock().unwrap();
+        let ids = vec![1u32, 2, 3, 4];
+        let mut p = create_test_pipeline(8, 16, 2, 1, 4, 1, 64);
+        unsafe { std::env::set_var("CMF_PREFILL", "seq") };
+        NLL_TEST_FAIL_AT.store(0, std::sync::atomic::Ordering::Relaxed);
+        let err = p.nll_ids_from(&ids, 0).expect_err("serial forward failure");
+        NLL_TEST_FAIL_AT.store(-1, std::sync::atomic::Ordering::Relaxed);
+        unsafe { std::env::remove_var("CMF_PREFILL") };
+        assert!(err.contains("serial forward"));
+        assert!(p.kv_history.is_empty());
+        assert!(!p.graph_failed.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!p.cancel.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn ffn_probe_failure_discards_recorder_and_state() {
+        let _guard = NLL_TEST_LOCK.lock().unwrap();
+        let ids = vec![1u32, 2, 3, 4];
+        let mut p = create_test_pipeline(8, 16, 2, 1, 4, 1, 64);
+        NLL_TEST_FAIL_AT.store(0, std::sync::atomic::Ordering::Relaxed);
+        let err = p
+            .probe_ffn_mass_batch(&ids)
+            .expect_err("probe forward failure");
+        NLL_TEST_FAIL_AT.store(-1, std::sync::atomic::Ordering::Relaxed);
+        assert!(err.contains("NLL"));
+        assert!(FFN_PROBE.with(|probe| probe.borrow().is_none()));
+        assert!(p.kv_history.is_empty());
+        assert!(!p.graph_failed.load(std::sync::atomic::Ordering::Relaxed));
     }
 }
