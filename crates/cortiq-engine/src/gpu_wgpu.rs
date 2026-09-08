@@ -9029,7 +9029,7 @@ var<workgroup> oa_scr: array<f32, 2052>;
 var<workgroup> oa_f:   array<f32, 32>;
 var<workgroup> oa_u:   array<f32, 32>;
 var<workgroup> oa_red: array<f32, 256>;
-var<workgroup> oa_sc:  array<f32, 4>; // [c_all, far_den, den, have_far]
+var<workgroup> oa_sc:  array<f32, 4>; // [c/f staging, far_den, den, have_far]
 
 // One workgroup per (group, head): the whole Nystrom step output.
 // Per-score dots run one THREAD per key/landmark (serial over d) — no
@@ -9089,25 +9089,44 @@ fn o1_attend(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_in
         oa_f[a] = acc * oa_p.scale;
     }
     workgroupBarrier();
-    // c = max near score (single thread — n <= 2052, bounded)
+    // c = max near score (single thread — n <= 2052, bounded).  The
+    // landmark inverse readout below has m independent output columns.  Keep
+    // the score/exp order on lane 0, publish its two scalars, and let one lane
+    // own each column's ascending-a accumulation.  This removes the old
+    // 32-column serial loop without changing any per-column arithmetic.
     if (lid == 0u) {
         var c = -3.0e38;
         for (var sidx = 0u; sidx < n; sidx = sidx + 1u) { c = max(c, oa_scr[sidx]); }
-        var c_all = c;
-        var far_den = 0.0;
-        var have_far = 0.0;
+        oa_sc[0] = c;
+        oa_sc[1] = 0.0;
         if (farl > 0u) {
             var f = -3.0e38;
             for (var a = 0u; a < m; a = a + 1u) { f = max(f, oa_f[a]); }
             for (var a = 0u; a < m; a = a + 1u) { oa_f[a] = exp(oa_f[a] - f); }
-            for (var b = 0u; b < m; b = b + 1u) {
-                var uacc = 0.0;
-                for (var a = 0u; a < m; a = a + 1u) {
-                    uacc = uacc + oa_f[a] * oa_mu[(gh * m + a) * m + b];
-                }
-                if (rect_fm) { uacc = max(uacc, 0.0); }
-                oa_u[b] = uacc;
-            }
+            oa_sc[1] = f;
+        }
+    }
+    workgroupBarrier();
+    // Each output column keeps the exact old ascending-a accumulation order.
+    // The guard is uniform in farl for a given workgroup; the barrier after
+    // it is unconditional so far-empty admissions and m < 32 remain safe.
+    if (lid < m && farl > 0u) {
+        let b = lid;
+        var uacc = 0.0;
+        for (var a = 0u; a < m; a = a + 1u) {
+            uacc = uacc + oa_f[a] * oa_mu[(gh * m + a) * m + b];
+        }
+        if (rect_fm) { uacc = max(uacc, 0.0); }
+        oa_u[b] = uacc;
+    }
+    workgroupBarrier();
+    if (lid == 0u) {
+        let c = oa_sc[0];
+        let f = oa_sc[1];
+        var c_all = c;
+        var far_den = 0.0;
+        var have_far = 0.0;
+        if (farl > 0u) {
             let mzb = gh * 2u * m;
             for (var b = 0u; b < m; b = b + 1u) {
                 c_all = max(c_all, f + oa_mz[mzb + b]);
