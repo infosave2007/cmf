@@ -20,12 +20,18 @@ on:
         required: false
         type: boolean
         default: false
+      verify_qwen_image:
+        description: 'Run the Issue #10 real GGUF conversion validation job only'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
 
 jobs:
   build:
+    if: ${{ !inputs.verify_qwen_image }}
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     # The macos-13 (Intel) runner pool is retired: jobs queue forever with
@@ -153,6 +159,7 @@ jobs:
   # binary; Dart reaches it via DynamicLibrary.process()). The arm64
   # Android .so comes from the main matrix above.
   ffi:
+    if: ${{ !inputs.verify_qwen_image }}
     name: ffi ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
@@ -224,3 +231,191 @@ jobs:
           files: |
             libcortiq-ffi-${{ matrix.target }}.tar.gz
             libcortiq-ffi-${{ matrix.target }}.tar.gz.sha256
+
+  verify-issue10-gguf:
+    name: "Issue #10 Qwen Image GGUF conversion (CPU)"
+    if: ${{ inputs.verify_qwen_image }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout dispatched ref
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Check runner capacity and reclaim only when required
+        shell: bash
+        run: |
+          set -euo pipefail
+          validation_dir="$RUNNER_TEMP/cmf-issue10-validation"
+          model_dir="$RUNNER_TEMP/cmf-issue10-model"
+          mkdir -p "$validation_dir" "$model_dir"
+          before=$(df -P -B1 "$RUNNER_TEMP" | awk 'NR == 2 {print $4}')
+          minimum=45000000000
+          [[ "$before" =~ ^[0-9]+$ ]]
+          cleanup_triggered=false
+          if (( before < minimum )); then
+            if [[ "${RUNNER_ENVIRONMENT:-}" != "github-hosted" ]]; then
+              echo "::error::free bytes ($before) are below $minimum and this is not a GitHub-hosted runner"
+              exit 1
+            fi
+            cleanup_triggered=true
+            echo "free bytes $before < $minimum; reclaiming only known preinstalled CPU-QA toolchains"
+            for candidate in \
+                /usr/local/lib/android/sdk \
+                /usr/share/dotnet \
+                /usr/local/share/dotnet \
+                /opt/hostedtoolcache/dotnet; do
+              if [[ ! -e "$candidate" && ! -L "$candidate" ]]; then
+                echo "skip_absent=$candidate"
+                continue
+              fi
+              if [[ -L "$candidate" ]]; then
+                echo "skip_symlink=$candidate"
+                continue
+              fi
+              bytes=$(sudo du -sx -B1 -- "$candidate" | awk 'NR == 1 {print $1}')
+              echo "remove_path=$candidate bytes=${bytes:-unknown}"
+              sudo rm -rf -- "$candidate"
+            done
+          fi
+          available=$(df -P -B1 "$RUNNER_TEMP" | awk 'NR == 2 {print $4}')
+          [[ "$available" =~ ^[0-9]+$ ]]
+          if (( available < minimum )); then
+            echo "::error::runner has ${available:-unknown} free bytes after cleanup; need at least $minimum"
+            exit 1
+          fi
+          {
+            echo "checked_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "runner=${RUNNER_OS}/${RUNNER_ARCH}"
+            echo "ref=$GITHUB_REF"
+            echo "free_bytes_before=$before"
+            echo "cleanup_triggered=$cleanup_triggered"
+            echo "available_bytes=$available"
+            echo "minimum_bytes=$minimum"
+            uname -a
+            rustc --version
+            cargo --version
+            df -h "$RUNNER_TEMP"
+            free -h
+            nproc
+          } | tee "$validation_dir/runner-capacity.txt"
+          echo "VALIDATION_DIR=$validation_dir" >> "$GITHUB_ENV"
+          echo "MODEL_DIR=$model_dir" >> "$GITHUB_ENV"
+
+      - name: Check conversion QA assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f scripts/download_qwen_image_gguf.py
+          test -f scripts/check_qwen_image_component.py
+          test -f scripts/qwen_image_issue10_source.json
+          test -f scripts/qwen_image_issue10_transformer_config.json
+          python3 -B scripts/check_qwen_image_component.py --help \
+            2>&1 | tee "$VALIDATION_DIR/checker-help.txt"
+          python3 -B scripts/test_qwen_image_checker.py \
+            2>&1 | tee "$VALIDATION_DIR/checker-regression.json"
+
+      - name: Build importer and download pinned GGUF concurrently
+        shell: bash
+        run: |
+          set -euo pipefail
+          (
+            set -euo pipefail
+            cargo build --locked --release --no-default-features --jobs 2 -p cortiq-cli \
+              2>&1 | tee "$VALIDATION_DIR/build.log"
+            bin="$GITHUB_WORKSPACE/target/release/cortiq"
+            test -x "$bin"
+            "$bin" --version | tee "$VALIDATION_DIR/importer-version.txt"
+            sha256sum "$bin" | tee "$VALIDATION_DIR/importer.sha256"
+          ) &
+          build_pid=$!
+
+          (
+            set -euo pipefail
+            python3 -B scripts/download_qwen_image_gguf.py \
+              --output "$MODEL_DIR/Qwen-Image-Edit-2509-Q6_K.gguf" \
+              --receipt "$VALIDATION_DIR/download-receipt.json" \
+              --workers 8 \
+              2>&1 | tee "$VALIDATION_DIR/download.log"
+            cp "$MODEL_DIR/Qwen-Image-Edit-2509-Q6_K.gguf.sha256" "$VALIDATION_DIR/gguf.sha256"
+          ) &
+          download_pid=$!
+
+          build_status=0
+          download_status=0
+          wait "$build_pid" || build_status=$?
+          wait "$download_pid" || download_status=$?
+          if (( build_status != 0 || download_status != 0 )); then
+            echo "::error::concurrent QA preparation failed: build_exit=$build_status download_exit=$download_status"
+            exit 1
+          fi
+
+      - name: Import as Q8 CMF
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="$GITHUB_WORKSPACE/target/release/cortiq"
+          set +e
+          "$bin" import-gguf \
+            "$MODEL_DIR/Qwen-Image-Edit-2509-Q6_K.gguf" \
+            --quant q8 \
+            --output "$MODEL_DIR/Qwen-Image-Edit-2509-Q8.cmf" \
+            2>&1 | tee "$VALIDATION_DIR/import.log"
+          status=${PIPESTATUS[0]}
+          set -e
+          echo "import_exit=$status" | tee "$VALIDATION_DIR/import-exit.txt"
+          if [[ "$status" -ne 0 ]]; then
+            echo "::error::import-gguf failed with exit $status; a missing/unsupported output is fatal"
+            exit "$status"
+          fi
+          test -s "$MODEL_DIR/Qwen-Image-Edit-2509-Q8.cmf"
+          stat -c 'cmf_bytes=%s' "$MODEL_DIR/Qwen-Image-Edit-2509-Q8.cmf" \
+            | tee "$VALIDATION_DIR/cmf-size.txt"
+          sha256sum "$MODEL_DIR/Qwen-Image-Edit-2509-Q8.cmf" \
+            | tee "$VALIDATION_DIR/cmf.sha256"
+
+      - name: Verify and inspect CMF
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s "$MODEL_DIR/Qwen-Image-Edit-2509-Q8.cmf"
+          bin="$GITHUB_WORKSPACE/target/release/cortiq"
+          "$bin" verify "$MODEL_DIR/Qwen-Image-Edit-2509-Q8.cmf" \
+            2>&1 | tee "$VALIDATION_DIR/verify.log"
+          "$bin" info "$MODEL_DIR/Qwen-Image-Edit-2509-Q8.cmf" \
+            2>&1 | tee "$VALIDATION_DIR/info.log"
+
+      - name: Independently audit source and converted CMF
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s "$MODEL_DIR/Qwen-Image-Edit-2509-Q8.cmf"
+          python3 -B scripts/check_qwen_image_component.py \
+            --gguf "$MODEL_DIR/Qwen-Image-Edit-2509-Q6_K.gguf" \
+            --cmf "$MODEL_DIR/Qwen-Image-Edit-2509-Q8.cmf" \
+            --prefix "" \
+            --config-json scripts/qwen_image_issue10_transformer_config.json \
+            --config-name image.config_json \
+            --source-manifest scripts/qwen_image_issue10_source.json \
+            --expected-source-count 1933 \
+            --sample-per-kind 2000 \
+            --max-sample-elements 1024 \
+            --max-relative-rms 0.03 \
+            --report "$VALIDATION_DIR/component-check.json" \
+            2>&1 | tee "$VALIDATION_DIR/component-check.log"
+
+      - name: Upload small receipt and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue10-gguf-validation-${{ github.run_id }}
+          path: ${{ runner.temp }}/cmf-issue10-validation

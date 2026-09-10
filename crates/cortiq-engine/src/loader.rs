@@ -1123,7 +1123,10 @@ impl Pipeline {
         // has none of the canonical projections — no q/k/v/o_proj, no
         // per-layer gate_proj — so the generic loop would demand
         // `self_attn.q_proj.weight` and fail before its own loader ever ran.
-        let owns_its_layers = is_g3n || arch.arch_name == "deepseek_v4" || arch.qwen4_exp.is_some();
+        let owns_its_layers = is_g3n
+            || arch.arch_name == "deepseek_v4"
+            || arch.arch_name == "deepseek_v41"
+            || arch.qwen4_exp.is_some();
         for li in 0..(if owns_its_layers { 0 } else { arch.num_layers }) {
             let prefix = format!("model.layers.{li}.");
             let attn = match arch.layer_types.get(li) {
@@ -1546,6 +1549,226 @@ impl Pipeline {
                 window: arch.sliding_window.unwrap_or(512),
             };
             pipeline.g3n = Some(Box::new((globals, g3n_layers)));
+        }
+        // DeepSeek-V4.1: its own stack, selected by the preserved source
+        // configuration. The generic layer loop cannot represent shared
+        // CED/CSA2 state or native Engram tables, so loading failure is
+        // fatal instead of falling back to an unrelated attention layout.
+        if arch.arch_name == "deepseek_v41" {
+            let source = arch.deepseek_v41.as_ref().ok_or_else(|| {
+                CmfError::Parse("deepseek_v41: missing preserved source config".into())
+            })?;
+            let tc = source.get("text_config").unwrap_or(source);
+            let usize_of = |key: &str, fallback: usize| {
+                tc.get(key)
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .unwrap_or(fallback)
+            };
+            let f32_of = |key: &str, fallback: f32| {
+                tc.get(key)
+                    .and_then(|v| v.as_f64())
+                    .map(|v| v as f32)
+                    .unwrap_or(fallback)
+            };
+            let usize_any = |keys: &[&str], fallback: usize| {
+                keys.iter()
+                    .find_map(|key| tc.get(key).and_then(|v| v.as_u64()))
+                    .map(|v| v as usize)
+                    .unwrap_or(fallback)
+            };
+            let f32_any = |keys: &[&str], fallback: f32| {
+                keys.iter()
+                    .find_map(|key| tc.get(key).and_then(|v| v.as_f64()))
+                    .map(|v| v as f32)
+                    .unwrap_or(fallback)
+            };
+            let bool_of = |key: &str, fallback: bool| {
+                tc.get(key).and_then(|v| v.as_bool()).unwrap_or(fallback)
+            };
+            let array_of = |key: &str| -> Vec<usize> {
+                tc.get(key)
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64().map(|x| x as usize))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let array_alias = |keys: &[&str]| -> Vec<usize> {
+                keys.iter()
+                    .find_map(|key| {
+                        let values = array_of(key);
+                        (!values.is_empty()).then_some(values)
+                    })
+                    .unwrap_or_default()
+            };
+            let dim = usize_any(&["hidden_size", "dim"], arch.hidden_size);
+            let n_layers = usize_any(&["num_hidden_layers", "n_layers"], arch.num_layers);
+            let n_heads = usize_any(
+                &["num_attention_heads", "n_heads"],
+                arch.num_attention_heads,
+            );
+            let head_dim = usize_any(&["head_dim"], arch.head_dim);
+            let rope_head_dim = usize_any(&["rope_head_dim", "qk_rope_head_dim"], 64.min(head_dim));
+            let moe_inter = usize_any(
+                &[
+                    "moe_intermediate_size",
+                    "moe_inter_dim",
+                    "intermediate_size",
+                ],
+                arch.intermediate_size,
+            );
+            let n_experts = usize_any(
+                &["n_routed_experts"],
+                arch.moe.as_ref().map(|m| m.num_experts).unwrap_or(384),
+            );
+            let top_k = usize_any(
+                &["num_experts_per_tok", "n_activated_experts"],
+                arch.moe.as_ref().map(|m| m.top_k).unwrap_or(6),
+            );
+            let mut ratios = array_of("compress_ratios");
+            if ratios.len() >= n_layers {
+                ratios.truncate(n_layers);
+            } else {
+                ratios = (0..n_layers)
+                    .map(|li| {
+                        if (2..20).contains(&li) {
+                            2
+                        } else if (20..40).contains(&li) {
+                            1
+                        } else {
+                            0
+                        }
+                    })
+                    .collect();
+            }
+            let kv_sources = {
+                let a = array_alias(&["kv_source_layers", "kv_source_layer_ids"]);
+                if a.is_empty() { vec![2, 8, 14, 20] } else { a }
+            };
+            let index_sources = {
+                let a = array_alias(&["index_source_layers", "index_source_layer_ids"]);
+                if a.is_empty() {
+                    vec![2, 8, 14, 20, 24, 28, 32, 36]
+                } else {
+                    a
+                }
+            };
+            let engram_layers = array_of("engram_layer_ids");
+            let engram_embeddings = array_of("engram_num_embeddings");
+            let cfg = crate::dsv41::Dsv41Cfg {
+                dim,
+                n_heads,
+                head_dim,
+                rope_head_dim: rope_head_dim.min(head_dim) & !1,
+                q_lora_rank: usize_of("q_lora_rank", 1280),
+                o_lora_rank: usize_of("o_lora_rank", 1024),
+                o_groups: usize_of("o_groups", 8),
+                hc_mult: usize_of("hc_mult", 4),
+                hc_sinkhorn_iters: usize_of("hc_sinkhorn_iters", 20),
+                hc_eps: f32_of("hc_eps", 1e-6),
+                norm_eps: f32_any(&["norm_eps", "rms_norm_eps"], arch.rms_norm_eps as f32),
+                n_routed_experts: n_experts,
+                top_k,
+                moe_inter,
+                gate_temp: f32_of("gate_temp", 1.0),
+                norm_topk_prob: bool_of("norm_topk_prob", true),
+                route_scale: f32_any(
+                    &["routed_scaling_factor", "route_scale"],
+                    arch.moe
+                        .as_ref()
+                        .and_then(|m| m.routed_scaling_factor)
+                        .unwrap_or(1.5),
+                ),
+                swiglu_limit: f32_of("swiglu_limit", 10.0),
+                window: usize_any(
+                    &["window_size", "sliding_window"],
+                    arch.sliding_window.unwrap_or(128),
+                ),
+                rope_theta: f32_any(&["rope_theta"], arch.rope_theta as f32),
+                compress_rope_theta: f32_any(&["compress_rope_theta"], 160_000.0),
+                rope_factor: f32_any(
+                    &["rope_factor"],
+                    tc.get("rope_scaling")
+                        .and_then(|v| v.get("factor"))
+                        .and_then(|v| v.as_f64())
+                        .map(|v| v as f32)
+                        .unwrap_or(16.0),
+                ),
+                original_seq_len: usize_any(
+                    &["original_seq_len", "original_max_position_embeddings"],
+                    tc.get("rope_scaling")
+                        .and_then(|v| v.get("original_max_position_embeddings"))
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as usize)
+                        .unwrap_or(65_536),
+                ),
+                beta_fast: f32_any(
+                    &["beta_fast"],
+                    tc.get("rope_scaling")
+                        .and_then(|v| v.get("beta_fast"))
+                        .and_then(|v| v.as_f64())
+                        .map(|v| v as f32)
+                        .unwrap_or(32.0),
+                ),
+                beta_slow: f32_any(
+                    &["beta_slow"],
+                    tc.get("rope_scaling")
+                        .and_then(|v| v.get("beta_slow"))
+                        .and_then(|v| v.as_f64())
+                        .map(|v| v as f32)
+                        .unwrap_or(1.0),
+                ),
+                index_heads: usize_any(&["index_n_heads", "indexer_n_heads"], 32),
+                index_head_dim: usize_any(&["index_head_dim", "indexer_head_dim"], 128),
+                index_topk: usize_any(&["index_topk", "indexer_topk"], 512),
+                candidate_source: usize_any(
+                    &["candidate_source_layer", "candidate_source_layer_id"],
+                    20,
+                ),
+                candidate_topk_blocks: usize_any(&["candidate_topk_blocks"], 2048),
+                candidate_block_size: usize_any(&["candidate_block_size"], 8),
+                kv_sources,
+                index_sources,
+                compress_ratios: ratios,
+                engram_layers,
+                engram_vocab: usize_any(&["engram_vocab_size"], 16_000_000),
+                engram_embeddings,
+                engram_max_ngram: usize_any(&["engram_max_ngram_size"], 4),
+                engram_heads: usize_any(&["engram_n_heads"], 8),
+                engram_head_dim: usize_any(&["engram_head_dim"], 256),
+                engram_compressed_vocab: usize_any(&["engram_compressed_vocab_size"], 99_092),
+                engram_pad_id: usize_any(&["engram_pad_id", "engram_pad_token_id"], 2),
+                vocab: usize_any(&["vocab_size"], arch.vocab_size),
+            };
+            let token_map = crate::dsv41::token_map_from_model(model, cfg.vocab);
+            let (g, dl, hash) = crate::dsv41::load(model, &cfg, n_layers, token_map)
+                .map_err(|e| CmfError::Parse(format!("deepseek_v41: {e}")))?;
+            let st = crate::dsv41::Dsv41State::new(&cfg, hash);
+            // Vision tensors are optional in text-only exports, but when
+            // present they stay mmap-backed through the dedicated tower.
+            // Do not make a text-only CMF fail merely because its source
+            // config still carries the multimodal section.
+            if let Ok(vision_cfg) = crate::dsv41_vision::VisionConfig::from_source(source) {
+                if vision_cfg.vision_enabled()
+                    && model.tensor("vision.patch_embed.proj.weight").is_some()
+                {
+                    pipeline.dsv41_vision = Some(
+                        crate::dsv41_vision::VisionModel::from_model(model, vision_cfg)
+                            .map_err(|e| CmfError::Parse(format!("deepseek_v41 vision: {e}")))?,
+                    );
+                }
+            }
+            tracing::info!(
+                "deepseek_v41: loaded {} layers, {} KV sources, {} index sources, {} Engram layers; experts remain mmap-backed",
+                dl.len(),
+                cfg.kv_sources.len(),
+                cfg.index_sources.len(),
+                cfg.engram_layers.len()
+            );
+            pipeline.dsv41 = Some(Box::new((g, dl, cfg, st)));
         }
         // DeepSeek-V4: its own stack, selected by the arch name the
         // converter wrote. Loading failure is fatal rather than a silent
