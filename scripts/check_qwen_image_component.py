@@ -611,7 +611,10 @@ def q6k_value(raw: memoryview, index: int) -> float:
     l = within % 32
     ql_off = half * 64
     qh_off = half * 32
-    scale_off = half * 8 + group * 2
+    # GGML's Q6_K reference selects one signed scale for each 16-value
+    # sub-group.  The old checker stopped at the 32-value group and silently
+    # reused the first scale for both 16-value halves.
+    scale_off = half * 8 + group * 2 + l // 16
     ql0 = ql[ql_off + l]
     ql32 = ql[ql_off + l + 32]
     qhb = qh[qh_off + l]
@@ -734,15 +737,40 @@ def cmf_value_at(entry: CmfEntry, raw: memoryview, index: int) -> float:
     raise CheckError("CMF dtype %d is not decoded by this checker" % dtype)
 
 
-def sample_indices(count: int, limit: int) -> list[int]:
+def sample_windows(count: int, limit: int, block_size: int = 256) -> list[tuple[int, int]]:
+    """Return bounded contiguous windows aligned to GGML's 256-value block."""
     if count <= 0:
         return []
     limit = max(1, limit)
     if count <= limit:
-        return list(range(count))
-    if limit == 1:
-        return [0]
-    return [(i * (count - 1)) // (limit - 1) for i in range(limit)]
+        return [(0, count)]
+
+    block = min(block_size, limit)
+    block_count = min(4, max(1, limit // block))
+    last_start = max(0, count - block)
+    if block_count == 1:
+        candidates = [0]
+    elif block_count == 2:
+        candidates = [0, last_start]
+    elif block_count == 3:
+        candidates = [0, count // 2, last_start]
+    else:
+        candidates = [0, count // 3, (2 * count) // 3, last_start]
+
+    starts: list[int] = []
+    for candidate in candidates:
+        # Q6_K tensors have a 256-element block size.  Align every window
+        # start down so no sampled Q6_K value crosses a GGML block boundary.
+        start = min(last_start, (candidate // block_size) * block_size)
+        if start not in starts:
+            starts.append(start)
+    return [(start, min(block, count - start)) for start in starts]
+
+
+def sample_indices(count: int, limit: int) -> list[int]:
+    return [index
+            for start, size in sample_windows(count, limit)
+            for index in range(start, start + size)]
 
 
 def evenly_spaced(items: list[Any], count: int) -> list[Any]:
@@ -1231,7 +1259,10 @@ def run_samples(source: GgufFile, cmf: CmfFile, mapping: dict[str, str],
             entry = by_name.get(target)
             if entry is None:
                 continue
-            indices = sample_indices(tensor.elements, max_sample_elements)
+            windows = sample_windows(tensor.elements, max_sample_elements)
+            indices = [index
+                       for start, size in windows
+                       for index in range(start, start + size)]
             try:
                 source_raw = source.raw(tensor)
                 reference = [source_value_at(tensor, source_raw, index) for index in indices]
@@ -1252,6 +1283,12 @@ def run_samples(source: GgufFile, cmf: CmfFile, mapping: dict[str, str],
                     "count": len(indices),
                     "first": indices[0] if indices else None,
                     "last": indices[-1] if indices else None,
+                    "windows": [
+                        {"start": start, "count": size}
+                        for start, size in windows
+                    ],
+                    "alignment": 256,
+                    "strategy": "contiguous_256_aligned_blocks",
                 },
                 "metrics": metric,
             }
@@ -1309,7 +1346,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sample-per-kind", type=int, default=4,
                         help="number of evenly spaced Q6_K and F32 tensors to sample")
     parser.add_argument("--max-sample-elements", type=int, default=65536,
-                        help="maximum values sampled from each selected tensor")
+                        help="maximum values sampled from each tensor; values are read in up to four contiguous 256-value blocks")
     parser.add_argument("--max-relative-rms", type=float,
                         help="optional explicit per-tensor relative RMS acceptance limit")
     parser.add_argument("--full-payload-hash", action="store_true",

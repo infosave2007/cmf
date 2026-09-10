@@ -249,7 +249,7 @@ jobs:
       - name: Restore Cargo cache
         uses: Swatinem/rust-cache@v2
         with:
-          cache-on-failure: false
+          cache-on-failure: true
 
       - name: Check runner capacity and reclaim only when required
         shell: bash
@@ -321,28 +321,43 @@ jobs:
           test -f scripts/qwen_image_issue10_transformer_config.json
           python3 -B scripts/check_qwen_image_component.py --help \
             2>&1 | tee "$VALIDATION_DIR/checker-help.txt"
+          python3 -B scripts/test_qwen_image_checker.py \
+            2>&1 | tee "$VALIDATION_DIR/checker-regression.json"
 
-      - name: Build importer (CPU-only, two jobs)
+      - name: Build importer and download pinned GGUF concurrently
         shell: bash
         run: |
           set -euo pipefail
-          cargo build --locked --release --no-default-features --jobs 2 -p cortiq-cli \
-            2>&1 | tee "$VALIDATION_DIR/build.log"
-          bin="$GITHUB_WORKSPACE/target/release/cortiq"
-          test -x "$bin"
-          "$bin" --version | tee "$VALIDATION_DIR/importer-version.txt"
-          sha256sum "$bin" | tee "$VALIDATION_DIR/importer.sha256"
+          (
+            set -euo pipefail
+            cargo build --locked --release --no-default-features --jobs 2 -p cortiq-cli \
+              2>&1 | tee "$VALIDATION_DIR/build.log"
+            bin="$GITHUB_WORKSPACE/target/release/cortiq"
+            test -x "$bin"
+            "$bin" --version | tee "$VALIDATION_DIR/importer-version.txt"
+            sha256sum "$bin" | tee "$VALIDATION_DIR/importer.sha256"
+          ) &
+          build_pid=$!
 
-      - name: Download pinned GGUF with eight range workers
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 -B scripts/download_qwen_image_gguf.py \
-            --output "$MODEL_DIR/Qwen-Image-Edit-2509-Q6_K.gguf" \
-            --receipt "$VALIDATION_DIR/download-receipt.json" \
-            --workers 8 \
-            2>&1 | tee "$VALIDATION_DIR/download.log"
-          cp "$MODEL_DIR/Qwen-Image-Edit-2509-Q6_K.gguf.sha256" "$VALIDATION_DIR/gguf.sha256"
+          (
+            set -euo pipefail
+            python3 -B scripts/download_qwen_image_gguf.py \
+              --output "$MODEL_DIR/Qwen-Image-Edit-2509-Q6_K.gguf" \
+              --receipt "$VALIDATION_DIR/download-receipt.json" \
+              --workers 8 \
+              2>&1 | tee "$VALIDATION_DIR/download.log"
+            cp "$MODEL_DIR/Qwen-Image-Edit-2509-Q6_K.gguf.sha256" "$VALIDATION_DIR/gguf.sha256"
+          ) &
+          download_pid=$!
+
+          build_status=0
+          download_status=0
+          wait "$build_pid" || build_status=$?
+          wait "$download_pid" || download_status=$?
+          if (( build_status != 0 || download_status != 0 )); then
+            echo "::error::concurrent QA preparation failed: build_exit=$build_status download_exit=$download_status"
+            exit 1
+          fi
 
       - name: Import as Q8 CMF
         shell: bash
