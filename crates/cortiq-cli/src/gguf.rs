@@ -1187,6 +1187,18 @@ fn qwen_image_config(geometry: &QwenImageGeometry) -> serde_json::Value {
     })
 }
 
+/// Qwen Image's rank-2 matrices use the existing two-field Q8 codec when the
+/// user requests the ordinary Q8 profile.  Per-row Q8 is unusually sensitive
+/// to the low-energy modulation rows in this diffusion transformer; Q8_2f
+/// preserves the requested Q8 size class while retaining input-channel scale
+/// information.  The caller still handles 1-D quantized tensors separately.
+fn qwen_image_effective_quant(quant: Quant) -> Quant {
+    match quant {
+        Quant::Q8Row => Quant::Q8_2f,
+        other => other,
+    }
+}
+
 fn qwen_image_arch(geometry: &QwenImageGeometry) -> ModelArch {
     ModelArch {
         arch_name: "qwen_image".into(),
@@ -1364,6 +1376,7 @@ fn run_import_qwen_image(
     if g.tensors.is_empty() {
         anyhow::bail!("qwen_image GGUF has no tensors");
     }
+    let output_quant = qwen_image_effective_quant(quant);
     let geometry = qwen_image_geometry(&g.tensors)?;
     let config = serde_json::to_vec(&qwen_image_config(&geometry))?;
     // Validate the complete directory before creating the output. A malformed
@@ -1445,7 +1458,7 @@ fn run_import_qwen_image(
                 _ => {
                     let vals = dequant(t.ggml_type, raw, numel)?;
                     if shape.len() == 2 {
-                        convert::quantize_2d(quant, &vals, shape[0], shape[1])
+                        convert::quantize_2d(output_quant, &vals, shape[0], shape[1])
                     } else {
                         (TensorDtype::F16, convert::encode_f16(&vals))
                     }
@@ -1462,7 +1475,7 @@ fn run_import_qwen_image(
             format: "cmf".into(),
             version: CMF_VERSION,
             arch,
-            quant_type: quant_type_for(quant),
+            quant_type: quant_type_for(output_quant),
             provenance: Some(serde_json::json!({
                 "tool": "cortiq import-gguf",
                 "source": source_spec,
@@ -1484,7 +1497,8 @@ fn run_import_qwen_image(
                     .md
                     .get("general.file_type")
                     .and_then(|v| v.as_u64()),
-                "output_quant": convert::quant_name(quant),
+                "requested_quant": convert::quant_name(quant),
+                "output_quant": convert::quant_name(output_quant),
                 "external_components": {
                     "text_encoder": "Qwen2.5-VL family",
                     "tokenizer": "Qwen2 tokenizer/processor",
@@ -2095,6 +2109,9 @@ mod dequant_tests {
         assert_eq!(provenance["runnable_image_pipeline"], false);
         assert_eq!(provenance["tensor_name_policy"], "source_names_unchanged");
         assert_eq!(provenance["source_tensor_count"], 7);
+        assert_eq!(provenance["requested_quant"], "q8");
+        assert_eq!(provenance["output_quant"], "q8_2f");
+        assert_eq!(model.header.quant_type, QuantType::Q8_2f);
 
         let config = model.tensor("image.config_json").unwrap();
         assert_eq!(config.dtype, TensorDtype::U8);
@@ -2135,7 +2152,7 @@ mod dequant_tests {
         let q6 = model
             .tensor("transformer_blocks.0.img_mlp.net.0.proj.weight")
             .unwrap();
-        assert_eq!(q6.dtype, TensorDtype::Q8Row);
+        assert_eq!(q6.dtype, TensorDtype::Q8_2f);
         assert_eq!(q6.shape, vec![1024, 256]);
         let mut decoded = vec![0.0f32; q6.n_elems()];
         cortiq_core::quant::dequant_tensor(q6, model.entry_bytes(q6), &mut decoded).unwrap();
@@ -2147,12 +2164,12 @@ mod dequant_tests {
             .zip(expected)
             .map(|(got, want)| (got - want).abs())
             .fold(0.0f32, f32::max);
-        assert!(max_err < 0.25, "Q6_K→Q8 max error {max_err}");
+        assert!(max_err < 0.25, "Q6_K→Q8_2F max error {max_err}");
 
         let q4 = model
             .tensor("transformer_blocks.0.attn.to_q.weight")
             .unwrap();
-        assert_eq!(q4.dtype, TensorDtype::Q8Row);
+        assert_eq!(q4.dtype, TensorDtype::Q8_2f);
         assert_eq!(q4.shape, vec![256, 256]);
         let mut q4_decoded = vec![0.0f32; q4.n_elems()];
         cortiq_core::quant::dequant_tensor(q4, model.entry_bytes(q4), &mut q4_decoded).unwrap();
