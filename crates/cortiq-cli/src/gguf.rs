@@ -6,9 +6,14 @@
 //! passed directly (the matching `.gguf` is downloaded). IQ4_NL / IQ4_XS (the
 //! non-linear 4-bit codebook, used inside q2_k/q3_k mixes) are handled; the
 //! IQ1/IQ2/IQ3 grid-codebook types are the only ggml types not yet supported.
+//! Qwen Image diffusion-transformer GGUFs use a separate component branch
+//! which preserves source tensor names and stores the official image
+//! transformer config instead of interpreting the file as an LLM.
 
 use crate::convert::{self, Quant};
-use cortiq_core::format::{CMF_VERSION, CmfHeader, CmfModel, TensorSpec, TokenizerBundle};
+use cortiq_core::format::{
+    CMF_VERSION, CmfHeader, CmfModel, CmfStreamWriter, TensorSpec, TokenizerBundle,
+};
 use cortiq_core::quant::f16_to_f32;
 use cortiq_core::types::{LayerType, ModelArch, MoeConfig, NormStyle, QuantType, TensorDtype};
 use std::collections::BTreeMap;
@@ -1030,6 +1035,285 @@ fn pick_gguf<'a>(files: &[&'a String]) -> &'a str {
         .as_str()
 }
 
+fn quant_type_for(quant: Quant) -> QuantType {
+    match quant {
+        Quant::Q8Row => QuantType::Q8Row,
+        Quant::Q8_2f => QuantType::Q8_2f,
+        Quant::Q4Block => QuantType::Q4Block,
+        Quant::F16 => QuantType::F16,
+        Quant::Vbit => QuantType::Vbit,
+        Quant::Q4Tiled | Quant::Q4TiledP | Quant::Q2TiledP => QuantType::Q4Block,
+        Quant::Q1 | Quant::Q1p | Quant::Q1s | Quant::Q1t => QuantType::Vbit,
+    }
+}
+
+fn qwen_image_config() -> serde_json::Value {
+    // This is the transformer component's official diffusers config. The
+    // text encoder, tokenizer, VAE, and scheduler are separate components of
+    // the pipeline and are intentionally described in provenance rather than
+    // pretending that this GGUF contains them.
+    serde_json::json!({
+        "_class_name": "QwenImageTransformer2DModel",
+        "_diffusers_version": "0.36.0.dev0",
+        "attention_head_dim": 128,
+        "axes_dims_rope": [16, 56, 56],
+        "guidance_embeds": false,
+        "in_channels": 64,
+        "joint_attention_dim": 3584,
+        "num_attention_heads": 24,
+        "num_layers": 60,
+        "out_channels": 16,
+        "patch_size": 2
+    })
+}
+
+fn qwen_image_arch() -> ModelArch {
+    ModelArch {
+        arch_name: "qwen_image".into(),
+        hidden_size: 3072,
+        intermediate_size: 12_288,
+        num_layers: 60,
+        num_attention_heads: 24,
+        num_kv_heads: 24,
+        head_dim: 128,
+        vocab_size: 0,
+        layer_types: vec![LayerType::FullAttention; 60],
+        rms_norm_eps: 1e-5,
+        norm_style: NormStyle::Qwen,
+        rope_theta: 10_000.0,
+        tie_word_embeddings: false,
+        partial_rotary_factor: 1.0,
+        yarn: None,
+        attention_heads_per_layer: None,
+        hidden_act: "silu".into(),
+        embed_multiplier: 1.0,
+        query_pre_attn_scalar: None,
+        sliding_window: None,
+        sliding_window_pattern: None,
+        rope_local_base_freq: None,
+        local_partial_rotary_factor: None,
+        global_head_dim: None,
+        num_global_kv_heads: None,
+        global_partial_rotary_factor: None,
+        final_logit_softcapping: None,
+        attn_logit_softcapping: None,
+        mla: None,
+        activation_situ_beta: None,
+        activation_situ_linear_beta: None,
+        attn_v_norm: false,
+        mtp: None,
+        moe: None,
+        qwen4_exp: None,
+        deepseek_v41: None,
+        linear_core: None,
+        head_clusters: None,
+        max_position_embeddings: 0,
+        linear_conv_kernel_dim: None,
+        linear_num_key_heads: None,
+        linear_num_value_heads: None,
+        linear_key_head_dim: None,
+        linear_value_head_dim: None,
+        rope_freq_factors: None,
+        logit_multiplier: None,
+        g3n: None,
+        kda_gate_lower_bound: None,
+        num_loops: 1,
+        loop_final_norm: false,
+    }
+}
+
+fn qwen_image_raw<'a>(g: &'a Gguf, t: &GgufTensor, numel: usize) -> anyhow::Result<&'a [u8]> {
+    let nb = nbytes(t.ggml_type, numel)?;
+    let offset = usize::try_from(t.offset)
+        .map_err(|_| anyhow::anyhow!("gguf tensor '{}': offset overflows usize", t.name))?;
+    let start = g
+        .data_start
+        .checked_add(offset)
+        .ok_or_else(|| anyhow::anyhow!("gguf tensor '{}': data offset overflows", t.name))?;
+    let end = start
+        .checked_add(nb)
+        .ok_or_else(|| anyhow::anyhow!("gguf tensor '{}': data range overflows", t.name))?;
+    if end > g.bytes.len() {
+        anyhow::bail!(
+            "gguf tensor '{}' is truncated: needs bytes [{start}, {end}), file has {}",
+            t.name,
+            g.bytes.len()
+        );
+    }
+    Ok(&g.bytes[start..end])
+}
+
+fn qwen_image_shape(t: &GgufTensor) -> anyhow::Result<(Vec<usize>, usize)> {
+    if t.dims.is_empty() || t.dims.len() > 2 {
+        anyhow::bail!(
+            "qwen_image tensor '{}' has unsupported rank {}; only 1-D and 2-D tensors are supported",
+            t.name,
+            t.dims.len()
+        );
+    }
+    let shape: Vec<usize> = t
+        .dims
+        .iter()
+        .rev()
+        .map(|&d| {
+            if d == 0 {
+                return Err(anyhow::anyhow!(
+                    "qwen_image tensor '{}' has a zero dimension",
+                    t.name
+                ));
+            }
+            usize::try_from(d).map_err(|_| {
+                anyhow::anyhow!(
+                    "qwen_image tensor '{}': dimension {d} overflows usize",
+                    t.name
+                )
+            })
+        })
+        .collect::<anyhow::Result<_>>()?;
+    let numel = shape.iter().try_fold(1usize, |n, &d| {
+        n.checked_mul(d).ok_or_else(|| {
+            anyhow::anyhow!("qwen_image tensor '{}': shape product overflows", t.name)
+        })
+    })?;
+    Ok((shape, numel))
+}
+
+/// Import the Qwen Image diffusion transformer component. GGUF stores matrix
+/// dimensions in ggml order (the fastest dimension first), so CMF receives
+/// the reversed, framework-facing shape while retaining the source name.
+/// Q6_K tensors are decoded and re-encoded one at a time through the existing
+/// native codecs; CmfStreamWriter keeps the 16.8 GB input plus output bounded
+/// without a temporary whole-model copy.
+fn run_import_qwen_image(
+    g: &Gguf,
+    source: &std::path::Path,
+    source_spec: &str,
+    quant: Quant,
+    output: &str,
+    mut progress: impl FnMut(f32),
+) -> anyhow::Result<()> {
+    let config = serde_json::to_vec(&qwen_image_config())?;
+    if g.tensors.is_empty() {
+        anyhow::bail!("qwen_image GGUF has no tensors");
+    }
+    // Validate the complete directory before creating the output. A malformed
+    // or unsupported source therefore cannot leave a partial CMF that looks
+    // resumable or valid to a later caller.
+    let mut seen = BTreeMap::new();
+    for t in &g.tensors {
+        if seen.insert(&t.name, ()).is_some() {
+            anyhow::bail!("qwen_image GGUF contains duplicate tensor '{}'", t.name);
+        }
+        let (_, numel) = qwen_image_shape(t)?;
+        match t.ggml_type {
+            GGML_F32 | GGML_F16 | GGML_BF16 | GGML_Q6_K => {}
+            other => anyhow::bail!(
+                "qwen_image tensor '{}' uses ggml type {other}; this diffusion importer preserves F32/F16/BF16 and re-encodes Q6_K",
+                t.name
+            ),
+        }
+        let _ = qwen_image_raw(g, t, numel)?;
+    }
+    let total = g.tensors.len() + 1;
+    let avg_name = g
+        .tensors
+        .iter()
+        .map(|t| t.name.len())
+        .sum::<usize>()
+        .checked_div(g.tensors.len().max(1))
+        .unwrap_or(64)
+        .max(32);
+    let gap = CmfStreamWriter::head_reserve_for(total, avg_name);
+    let mut writer = CmfStreamWriter::new(output, gap)
+        .map_err(|e| anyhow::anyhow!("create streamed CMF {output}: {e}"))?;
+    writer
+        .push(
+            "image.config_json",
+            TensorDtype::U8,
+            &[config.len()],
+            &config,
+        )
+        .map_err(|e| anyhow::anyhow!("write image config: {e}"))?;
+    progress(1.0 / total as f32);
+
+    for (idx, t) in g.tensors.iter().enumerate() {
+        let (shape, numel) = qwen_image_shape(t)?;
+        let raw = qwen_image_raw(g, t, numel)?;
+        let (dtype, data) = match t.ggml_type {
+            GGML_F32 => (TensorDtype::F32, raw.to_vec()),
+            GGML_F16 => (TensorDtype::F16, raw.to_vec()),
+            GGML_BF16 => (TensorDtype::Bf16, raw.to_vec()),
+            GGML_Q6_K => {
+                let vals = dequant(t.ggml_type, raw, numel)?;
+                if shape.len() == 2 {
+                    convert::quantize_2d(quant, &vals, shape[0], shape[1])
+                } else {
+                    (TensorDtype::F16, convert::encode_f16(&vals))
+                }
+            }
+            other => anyhow::bail!(
+                "qwen_image tensor '{}' uses ggml type {other}; this diffusion importer preserves F32/F16/BF16 and re-encodes Q6_K",
+                t.name
+            ),
+        };
+        writer
+            .push(&t.name, dtype, &shape, &data)
+            .map_err(|e| anyhow::anyhow!("write qwen_image tensor '{}': {e}", t.name))?;
+        progress((idx + 2) as f32 / total as f32);
+    }
+
+    let arch = qwen_image_arch();
+    let header = CmfHeader {
+        format: "cmf".into(),
+        version: CMF_VERSION,
+        arch,
+        quant_type: quant_type_for(quant),
+        provenance: Some(serde_json::json!({
+            "tool": "cortiq import-gguf",
+            "source": source_spec,
+            "source_path": source.display().to_string(),
+            "source_arch": "qwen_image",
+            "model_kind": "image",
+            "component": "transformer",
+            "pipeline": "QwenImageEditPlusPipeline",
+            "artifact_scope": "transformer_only",
+            "runnable_image_pipeline": false,
+            "tensor_name_policy": "source_names_unchanged",
+            "source_tensor_count": g.tensors.len(),
+            "source_quantization_version": g
+                .md
+                .get("general.quantization_version")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(2),
+            "source_file_type": g
+                .md
+                .get("general.file_type")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(18),
+            "output_quant": convert::quant_name(quant),
+            "external_components": {
+                "text_encoder": "Qwen2_5_VLForConditionalGeneration",
+                "tokenizer": "Qwen2Tokenizer/Qwen2VLProcessor",
+                "vae": "AutoencoderKLQwenImage",
+                "scheduler": "FlowMatchEulerDiscreteScheduler"
+            }
+        })),
+        // The transformer GGUF has no tokenizer metadata. An image component
+        // must not acquire a fabricated text tokenizer section.
+        tokenizer_config: None,
+        section_hashes: None,
+        skills: Vec::new(),
+        shard: None,
+        calibration: None,
+        routing: None,
+    };
+    writer
+        .finish(&header, None, None)
+        .map_err(|e| anyhow::anyhow!("finish streamed CMF {output}: {e}"))?;
+    progress(1.0);
+    Ok(())
+}
+
 pub fn run_import_gguf(
     gguf: &str,
     quant: &str,
@@ -1041,6 +1325,16 @@ pub fn run_import_gguf(
     // Source: a local .gguf, an HF repo id (auto-pick a .gguf), or owner/repo/file.gguf.
     let path = resolve_gguf_source(gguf, hf_token)?;
     let g = parse(&path)?;
+
+    // Qwen Image is a diffusion transformer component, not an LLM. It has no
+    // block_count metadata and must bypass the generic tokenizer/LLM mapper.
+    if g.md
+        .get("general.architecture")
+        .and_then(|v| v.as_str())
+        .is_some_and(|arch| arch == "qwen_image")
+    {
+        return run_import_qwen_image(&g, &path, gguf, quant, output, progress);
+    }
 
     let arch = arch_from_md(&g.md, &g.tensors)?;
     let is_llama = arch.arch_name == "llama";
@@ -1229,15 +1523,7 @@ pub fn run_import_gguf(
     }
 
     let (vocab, bundle) = tokenizer(&g.md);
-    let quant_type = match quant {
-        Quant::Q8Row => QuantType::Q8Row,
-        Quant::Q8_2f => QuantType::Q8_2f,
-        Quant::Q4Block => QuantType::Q4Block,
-        Quant::F16 => QuantType::F16,
-        Quant::Vbit => QuantType::Vbit,
-        Quant::Q4Tiled | Quant::Q4TiledP | Quant::Q2TiledP => QuantType::Q4Block,
-        Quant::Q1 | Quant::Q1p | Quant::Q1s | Quant::Q1t => QuantType::Vbit,
-    };
+    let quant_type = quant_type_for(quant);
     let header = CmfHeader {
         format: "cmf".into(),
         version: CMF_VERSION,
@@ -1446,5 +1732,178 @@ mod dequant_tests {
                 e
             );
         }
+    }
+
+    fn put_gstr(out: &mut Vec<u8>, s: &str) {
+        out.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        out.extend_from_slice(s.as_bytes());
+    }
+
+    fn test_qwen_image_gguf() -> (Vec<u8>, Vec<u8>) {
+        // The payloads use the same GGML ids and block layout as the real
+        // Qwen Image file: F32 controls, BF16 root matrices, and Q6_K
+        // projection weights. The Q6 block is deliberately nonzero so the
+        // output check exercises dequantization rather than only shape paths.
+        let f32_bias: Vec<u8> = (0..8usize)
+            .flat_map(|i| (i as f32 * 0.25 - 0.5).to_le_bytes())
+            .collect();
+        let bf16_weight: Vec<u8> = (0..32usize)
+            .flat_map(|i| {
+                let bits = (0x3f80u16).wrapping_add((i as u16) & 7);
+                bits.to_le_bytes()
+            })
+            .collect();
+        let mut q6 = vec![0u8; 32 * 210]; // [32, 256] in CMF after dim reversal
+        for block in q6.chunks_exact_mut(210) {
+            block[0] = 0x0f;
+            block[32] = 0xf0;
+            block[192] = 1; // first sub-scale
+            block[208..210].copy_from_slice(&0x3c00u16.to_le_bytes()); // d = 1
+        }
+        let norm: Vec<u8> = (0..4usize).flat_map(|_| (1.0f32).to_le_bytes()).collect();
+        let defs = vec![
+            ("img_in.bias", vec![8u64], GGML_F32, f32_bias),
+            ("img_in.weight", vec![4, 8], GGML_BF16, bf16_weight),
+            (
+                "transformer_blocks.0.img_mlp.net.0.proj.weight",
+                vec![256, 32],
+                GGML_Q6_K,
+                q6.clone(),
+            ),
+            (
+                "transformer_blocks.0.attn.norm_q.weight",
+                vec![4],
+                GGML_F32,
+                norm,
+            ),
+        ];
+        let mut out = Vec::new();
+        out.extend_from_slice(b"GGUF");
+        out.extend_from_slice(&3u32.to_le_bytes());
+        out.extend_from_slice(&(defs.len() as u64).to_le_bytes());
+        out.extend_from_slice(&3u64.to_le_bytes());
+        put_gstr(&mut out, "general.architecture");
+        out.extend_from_slice(&T_STR.to_le_bytes());
+        put_gstr(&mut out, "qwen_image");
+        put_gstr(&mut out, "general.quantization_version");
+        out.extend_from_slice(&T_U32.to_le_bytes());
+        out.extend_from_slice(&2u32.to_le_bytes());
+        put_gstr(&mut out, "general.file_type");
+        out.extend_from_slice(&T_U32.to_le_bytes());
+        out.extend_from_slice(&18u32.to_le_bytes());
+        let mut rel = 0usize;
+        let mut offsets = Vec::with_capacity(defs.len());
+        for (name, dims, ggml_type, data) in &defs {
+            rel = align_up(rel, 32);
+            offsets.push(rel);
+            put_gstr(&mut out, name);
+            out.extend_from_slice(&(dims.len() as u32).to_le_bytes());
+            for &d in dims {
+                out.extend_from_slice(&d.to_le_bytes());
+            }
+            out.extend_from_slice(&ggml_type.to_le_bytes());
+            out.extend_from_slice(&(rel as u64).to_le_bytes());
+            rel += data.len();
+        }
+        let data_start = align_up(out.len(), 32);
+        out.resize(data_start, 0);
+        for ((_, _, _, data), &offset) in defs.iter().zip(&offsets) {
+            let start = data_start + offset;
+            if out.len() < start {
+                out.resize(start, 0);
+            }
+            out.extend_from_slice(data);
+        }
+        (out, q6)
+    }
+
+    #[test]
+    fn qwen_image_import_preserves_controls_and_requantizes_q6k() {
+        let (gguf_bytes, q6_raw) = test_qwen_image_gguf();
+        let id = format!(
+            "cortiq-qwen-image-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let src = std::env::temp_dir().join(format!("{id}.gguf"));
+        let out = std::env::temp_dir().join(format!("{id}.cmf"));
+        std::fs::write(&src, gguf_bytes).unwrap();
+        run_import_gguf(
+            src.to_str().unwrap(),
+            "q8",
+            out.to_str().unwrap(),
+            None,
+            |_| {},
+        )
+        .unwrap();
+
+        let model = cortiq_core::CmfModel::open(&out).unwrap();
+        let errors = model.verify();
+        assert!(errors.is_empty(), "CMF verification errors: {errors:?}");
+        assert_eq!(model.tensors.len(), 5); // four source tensors + config
+        assert_eq!(model.header.arch.arch_name, "qwen_image");
+        assert_eq!(model.header.arch.hidden_size, 3072);
+        assert_eq!(model.header.arch.num_layers, 60);
+        let provenance = model.header.provenance.as_ref().unwrap();
+        assert_eq!(provenance["model_kind"], "image");
+        assert_eq!(provenance["component"], "transformer");
+        assert_eq!(provenance["artifact_scope"], "transformer_only");
+        assert_eq!(provenance["runnable_image_pipeline"], false);
+        assert_eq!(provenance["tensor_name_policy"], "source_names_unchanged");
+        assert_eq!(provenance["source_tensor_count"], 4);
+
+        let config = model.tensor("image.config_json").unwrap();
+        assert_eq!(config.dtype, TensorDtype::U8);
+        let config_json: serde_json::Value =
+            serde_json::from_slice(model.entry_bytes(config)).unwrap();
+        assert_eq!(config_json["_class_name"], "QwenImageTransformer2DModel");
+        assert_eq!(
+            config_json["axes_dims_rope"],
+            serde_json::json!([16, 56, 56])
+        );
+        assert_eq!(config_json["num_layers"], 60);
+
+        let bias = model.tensor("img_in.bias").unwrap();
+        assert_eq!(bias.dtype, TensorDtype::F32);
+        assert_eq!(bias.shape, vec![8]);
+        let bias_bytes = model.entry_bytes(bias);
+        assert_eq!(bias_bytes.len(), 32);
+        assert_eq!(
+            f32::from_le_bytes(bias_bytes[..4].try_into().unwrap()),
+            -0.5
+        );
+
+        let root_weight = model.tensor("img_in.weight").unwrap();
+        assert_eq!(root_weight.dtype, TensorDtype::Bf16);
+        assert_eq!(root_weight.shape, vec![8, 4]);
+        assert_eq!(root_weight.n_elems(), 32);
+        assert_eq!(
+            u16::from_le_bytes(model.entry_bytes(root_weight)[..2].try_into().unwrap()),
+            0x3f80
+        );
+
+        let q6 = model
+            .tensor("transformer_blocks.0.img_mlp.net.0.proj.weight")
+            .unwrap();
+        assert_eq!(q6.dtype, TensorDtype::Q8Row);
+        assert_eq!(q6.shape, vec![32, 256]);
+        let mut decoded = vec![0.0f32; q6.n_elems()];
+        cortiq_core::quant::dequant_tensor(q6, model.entry_bytes(q6), &mut decoded).unwrap();
+        let expected = dequant_q6_k(&q6_raw, q6.n_elems());
+        assert!(decoded.iter().all(|v| v.is_finite()));
+        assert!(decoded.iter().any(|v| v.abs() > 1.0));
+        let max_err = decoded
+            .iter()
+            .zip(expected)
+            .map(|(got, want)| (got - want).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_err < 0.25, "Q6_K→Q8 max error {max_err}");
+
+        drop(model);
+        let _ = std::fs::remove_file(src);
+        let _ = std::fs::remove_file(out);
     }
 }
