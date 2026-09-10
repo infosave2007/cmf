@@ -1210,7 +1210,7 @@ fn qwen_image_arch(geometry: &QwenImageGeometry) -> ModelArch {
         head_dim: geometry.head_dim,
         vocab_size: 0,
         layer_types: vec![LayerType::FullAttention; geometry.num_layers],
-        rms_norm_eps: 1e-5,
+        rms_norm_eps: 1e-6,
         norm_style: NormStyle::Qwen,
         rope_theta: 10_000.0,
         tie_word_embeddings: false,
@@ -2101,6 +2101,7 @@ mod dequant_tests {
         assert_eq!(model.header.arch.num_layers, 1);
         assert_eq!(model.header.arch.num_attention_heads, 2);
         assert_eq!(model.header.arch.head_dim, 128);
+        assert_eq!(model.header.arch.rms_norm_eps, 1e-6);
         assert_eq!(model.header.arch.hidden_act, "gelu_tanh");
         let provenance = model.header.provenance.as_ref().unwrap();
         assert_eq!(provenance["model_kind"], "image");
