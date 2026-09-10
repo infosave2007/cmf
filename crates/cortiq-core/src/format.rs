@@ -1368,6 +1368,21 @@ fn zeros(n: usize) -> Vec<u8> {
     vec![0u8; n]
 }
 
+/// Persist a directory entry after a file it contains is created or updated.
+/// A converter checkpoint is only safe once the payload, manifest, and their
+/// containing directory are durable. Filesystems without directory fsync keep
+/// the file-level ordering through the no-op fallback.
+fn sync_parent_dir(path: &Path) -> Result<(), CmfError> {
+    #[cfg(unix)]
+    {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        File::open(parent)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 // ─────────────────── one-pass streaming writer (§8.4) ───────────────────
 
 /// Writes a CMF file in a single pass, payloads first.
@@ -1445,6 +1460,20 @@ impl CmfStreamWriter {
         shape: &[usize],
         data: &[u8],
     ) -> Result<(), CmfError> {
+        self.push_bounded(name, dtype, shape, data, data.len().max(1))
+    }
+
+    /// Append one tensor while limiting each write syscall to `chunk_bytes`.
+    /// This keeps very large native auxiliary tensors bounded while preserving
+    /// the same directory entry and hash as [`Self::push`].
+    pub fn push_bounded(
+        &mut self,
+        name: &str,
+        dtype: TensorDtype,
+        shape: &[usize],
+        data: &[u8],
+        chunk_bytes: usize,
+    ) -> Result<(), CmfError> {
         if shape.len() > DIR_MAX_NDIM {
             return Err(CmfError::Parse(format!(
                 "tensor '{}': ndim {} > {}",
@@ -1472,7 +1501,9 @@ impl CmfStreamWriter {
         };
         let off = align_to(self.cursor, align);
         self.file.write_all(&zeros((off - self.cursor) as usize))?;
-        self.file.write_all(data)?;
+        for chunk in data.chunks(chunk_bytes.max(1)) {
+            self.file.write_all(chunk)?;
+        }
         self.entries.push(TensorEntry {
             name: name.to_string(),
             dtype,
@@ -1503,9 +1534,12 @@ impl CmfStreamWriter {
     /// Start recording a sidecar manifest at `path`. One JSON line per
     /// tensor, flushed as it goes, plus a first line pinning the gap size.
     pub fn with_manifest(mut self, path: impl AsRef<Path>) -> Result<Self, CmfError> {
-        let mut f = BufWriter::new(File::create(path)?);
+        let path = path.as_ref().to_path_buf();
+        let mut f = BufWriter::new(File::create(&path)?);
         writeln!(f, "{{\"data_off\":{}}}", self.data_off)?;
         f.flush()?;
+        f.get_ref().sync_data()?;
+        sync_parent_dir(&path)?;
         self.manifest = Some(f);
         Ok(self)
     }
@@ -1513,9 +1547,11 @@ impl CmfStreamWriter {
     /// Keep recording into an existing manifest — for a writer from
     /// [`CmfStreamWriter::resume`], whose earlier lines must survive.
     pub fn appending_manifest(mut self, path: impl AsRef<Path>) -> Result<Self, CmfError> {
-        self.manifest = Some(BufWriter::new(
-            std::fs::OpenOptions::new().append(true).open(path)?,
-        ));
+        let path = path.as_ref().to_path_buf();
+        let file = std::fs::OpenOptions::new().append(true).open(&path)?;
+        file.sync_data()?;
+        sync_parent_dir(&path)?;
+        self.manifest = Some(BufWriter::new(file));
         Ok(self)
     }
 
@@ -1626,6 +1662,7 @@ impl CmfStreamWriter {
         // Without this the manifest runs ahead of a buffered writer, and a
         // kill in between leaves a record of bytes that were never written.
         self.file.flush()?;
+        self.file.get_ref().sync_data()?;
         if let Some(m) = self.manifest.as_mut() {
             writeln!(
                 m,
@@ -1634,7 +1671,9 @@ impl CmfStreamWriter {
                 self.cursor
             )?;
             m.flush()?;
+            m.get_ref().sync_data()?;
         }
+        sync_parent_dir(&self.path)?;
         Ok(())
     }
 
@@ -1756,6 +1795,8 @@ impl CmfStreamWriter {
         f.write_all(&header_json)?;
         f.write_all(&dir_bytes)?;
         f.flush()?;
+        f.sync_all()?;
+        sync_parent_dir(&self.path)?;
 
         tracing::info!(
             "Wrote CMF v2 (streamed): {} ({} tensors, {:.1} MB)",

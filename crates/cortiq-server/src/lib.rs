@@ -123,15 +123,22 @@ pub struct AppState {
 /// capability-gated traffic (tool calling) without manual configuration:
 /// tools are "supported" when the model's chat template has a tools branch.
 async fn healthz(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let tools = st
-        .tokenizer
-        .chat_template
-        .as_deref()
-        .map(|t| t.contains("tool"))
-        .unwrap_or(false);
+    let dsv41 = st.runtime.model().arch().deepseek_v41.is_some();
+    let tools = dsv41
+        || st
+            .tokenizer
+            .chat_template
+            .as_deref()
+            .map(|t| t.contains("tool"))
+            .unwrap_or(false);
     Json(serde_json::json!({
         "status": "ok",
-        "capabilities": { "tools": tools }
+        "capabilities": {
+            "tools": tools,
+            "vision": dsv41,
+            "reasoning_effort": dsv41,
+            "dsml": dsv41
+        }
     }))
 }
 
