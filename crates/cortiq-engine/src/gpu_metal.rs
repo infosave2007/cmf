@@ -15,8 +15,30 @@ use crate::gpu::{BatchJob, MoeJob};
 use cortiq_core::CmfModel;
 use cortiq_core::quant::{GROUP_SIZE, Q1_TILE, Q1T_TILE, Q4_TILE, f16_to_f32};
 use metal::{Buffer, CommandQueue, ComputePipelineState, Device, MTLResourceOptions, MTLSize};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
+
+// Native Metal scratch buffers are process-wide (the command queue and
+// `Ctx::io_bufs` are shared by all pipelines).  A buffer is safe to reuse
+// only after the owning pipeline's command buffer has completed; two server
+// slots may otherwise copy their activations into the same `xs`/`y` buffer
+// concurrently and corrupt one another's logits.  Generation installs its
+// unique graph id here, and every scratch-buffer key carries that namespace.
+thread_local! {
+    static IO_NAMESPACE: Cell<u64> = const { Cell::new(0) };
+}
+
+fn io_key(key: usize) -> (u64, usize) {
+    (IO_NAMESPACE.with(Cell::get), key)
+}
+
+/// Select the scratch-buffer namespace for the current generation thread.
+/// Pipeline graph ids are process-unique, so no allocation or global lock is
+/// needed.  A zero id is retained for direct low-level callers/tests.
+pub(crate) fn set_io_namespace(id: u64) {
+    IO_NAMESPACE.with(|slot| slot.set(id));
+}
 
 const MSL: &str = r#"
 #include <metal_stdlib>
@@ -5596,7 +5618,7 @@ struct Ctx {
     /// q8_2f input-channel field buffer per tensor.
     cf_bufs: Mutex<HashMap<(usize, usize), Buffer>>,
     /// Reusable xs/y buffers by size (no per-token allocations).
-    io_bufs: Mutex<HashMap<usize, Buffer>>,
+    io_bufs: Mutex<HashMap<(u64, usize), Buffer>>,
     /// Pointer-keyed constant/weight buffers, each carrying a content
     /// fingerprint: the address is NOT a stable identity — a reloaded
     /// model's slices and a recreated module's Vecs land on freed
@@ -6357,7 +6379,7 @@ fn q8_matvec_range_field(
     let get_io = |nbytes: usize| -> Buffer {
         let mut cache = c.io_bufs.lock().unwrap();
         cache
-            .entry(nbytes)
+            .entry(io_key(nbytes))
             .or_insert_with(|| {
                 crate::gpu::probe_note_cold();
                 c._device
@@ -6439,7 +6461,7 @@ pub fn q1_matvec(
     let get_io = |key: usize, nbytes: usize| -> Buffer {
         let mut cache = c.io_bufs.lock().unwrap();
         cache
-            .entry(key)
+            .entry(io_key(key))
             .or_insert_with(|| {
                 crate::gpu::probe_note_cold();
                 c._device
@@ -7133,7 +7155,7 @@ fn q1t_matvec_impl(
     let get_io = |key: usize, nbytes: usize| -> Buffer {
         let mut cache = c.io_bufs.lock().unwrap();
         cache
-            .entry(key)
+            .entry(io_key(key))
             .or_insert_with(|| {
                 crate::gpu::probe_note_cold();
                 c._device
@@ -7190,7 +7212,7 @@ pub fn q4t_matvec_for_test(
     let get_io = |key: usize, nbytes: usize| -> Buffer {
         let mut cache = c.io_bufs.lock().unwrap();
         cache
-            .entry(key)
+            .entry(io_key(key))
             .or_insert_with(|| {
                 crate::gpu::probe_note_cold();
                 c._device
@@ -7248,7 +7270,7 @@ pub fn q4tp_matvec_for_test(
     let get_io = |key: usize, nbytes: usize| -> Buffer {
         let mut cache = c.io_bufs.lock().unwrap();
         cache
-            .entry(key)
+            .entry(io_key(key))
             .or_insert_with(|| {
                 crate::gpu::probe_note_cold();
                 c._device
@@ -7300,7 +7322,7 @@ pub fn q4_matvec_bench(
     let get_io = |key: usize, nbytes: usize| -> Buffer {
         let mut cache = c.io_bufs.lock().unwrap();
         cache
-            .entry(key)
+            .entry(io_key(key))
             .or_insert_with(|| {
                 c._device
                     .new_buffer(nbytes as u64, MTLResourceOptions::StorageModeShared)
@@ -7349,7 +7371,7 @@ pub fn q4_matvec_sweep(
     let get_io = |key: usize, nbytes: usize| -> Buffer {
         let mut cache = c.io_bufs.lock().unwrap();
         cache
-            .entry(key)
+            .entry(io_key(key))
             .or_insert_with(|| {
                 c._device
                     .new_buffer(nbytes as u64, MTLResourceOptions::StorageModeShared)
@@ -8445,7 +8467,7 @@ pub fn q8_matmat(
     let get_io = |key: usize, nbytes: usize| -> Buffer {
         let mut cache = c.io_bufs.lock().unwrap();
         cache
-            .entry(key)
+            .entry(io_key(key))
             .or_insert_with(|| {
                 crate::gpu::probe_note_cold();
                 c._device
@@ -8647,7 +8669,7 @@ pub fn q4tp_matmat_many(
     let get_io = |key: usize, nbytes: usize| -> Buffer {
         let mut cache = c.io_bufs.lock().unwrap();
         cache
-            .entry(key)
+            .entry(io_key(key))
             .or_insert_with(|| {
                 crate::gpu::probe_note_cold();
                 c._device
@@ -8773,7 +8795,7 @@ pub fn q4tp_matmat_lora(
     let get_io = |key: usize, nbytes: usize| -> Buffer {
         let mut cache = c.io_bufs.lock().unwrap();
         cache
-            .entry(key)
+            .entry(io_key(key))
             .or_insert_with(|| {
                 crate::gpu::probe_note_cold();
                 c._device
@@ -8787,7 +8809,7 @@ pub fn q4tp_matmat_lora(
         let mut cache = c.io_bufs.lock().unwrap();
         let key = 24_000_000_000usize + lora.id * 2;
         cache
-            .entry(key)
+            .entry(io_key(key))
             .or_insert_with(|| {
                 fresh = true;
                 c._device.new_buffer(
@@ -8811,7 +8833,7 @@ pub fn q4tp_matmat_lora(
         let mut cache = c.io_bufs.lock().unwrap();
         let key = 24_000_000_001usize + lora.id * 2;
         cache
-            .entry(key)
+            .entry(io_key(key))
             .or_insert_with(|| {
                 fresh_b = true;
                 c._device.new_buffer(
@@ -8968,7 +8990,7 @@ pub fn q4tp_matmat(
     let get_io = |key: usize, nbytes: usize| -> Buffer {
         let mut cache = c.io_bufs.lock().unwrap();
         cache
-            .entry(key)
+            .entry(io_key(key))
             .or_insert_with(|| {
                 crate::gpu::probe_note_cold();
                 c._device
@@ -9069,7 +9091,7 @@ pub fn q4t_matmat(
     let get_io = |key: usize, nbytes: usize| -> Buffer {
         let mut cache = c.io_bufs.lock().unwrap();
         cache
-            .entry(key)
+            .entry(io_key(key))
             .or_insert_with(|| {
                 crate::gpu::probe_note_cold();
                 c._device
@@ -9153,7 +9175,7 @@ pub fn q4tp_ffn(
     let get_io = |key: usize, nbytes: usize| -> Buffer {
         let mut cache = c.io_bufs.lock().unwrap();
         cache
-            .entry(key)
+            .entry(io_key(key))
             .or_insert_with(|| {
                 crate::gpu::probe_note_cold();
                 c._device
@@ -9288,7 +9310,7 @@ pub fn q4t_ffn(
     let get_io = |key: usize, nbytes: usize| -> Buffer {
         let mut cache = c.io_bufs.lock().unwrap();
         cache
-            .entry(key)
+            .entry(io_key(key))
             .or_insert_with(|| {
                 crate::gpu::probe_note_cold();
                 c._device
@@ -9353,7 +9375,7 @@ pub fn q4t_ffn(
 fn io_shared(c: &Ctx, key: usize, nbytes: usize) -> Buffer {
     let mut cache = c.io_bufs.lock().unwrap();
     cache
-        .entry(key)
+        .entry(io_key(key))
         .or_insert_with(|| {
             crate::gpu::probe_note_cold();
             c._device
@@ -9863,7 +9885,7 @@ pub fn dit_attention(
     let get_io = |key: usize, nbytes: usize| -> Buffer {
         let mut cache = c.io_bufs.lock().unwrap();
         cache
-            .entry(key)
+            .entry(io_key(key))
             .or_insert_with(|| {
                 crate::gpu::probe_note_cold();
                 c._device
@@ -10036,7 +10058,7 @@ pub fn dit_block(model: &Arc<CmfModel>, a: &crate::gpu::DitBlockArgs, x: &mut [f
     let get_io = |key: usize, nbytes: usize| -> Buffer {
         let mut cache = c.io_bufs.lock().unwrap();
         cache
-            .entry(key)
+            .entry(io_key(key))
             .or_insert_with(|| {
                 crate::gpu::probe_note_cold();
                 c._device
@@ -10356,7 +10378,7 @@ pub fn q1t_matmat(
     let get_io = |key: usize, nbytes: usize| -> Buffer {
         let mut cache = c.io_bufs.lock().unwrap();
         cache
-            .entry(key)
+            .entry(io_key(key))
             .or_insert_with(|| {
                 crate::gpu::probe_note_cold();
                 c._device
@@ -10702,7 +10724,7 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
     let get_io = |key: usize, nbytes: usize| -> Buffer {
         let mut cache = c.io_bufs.lock().unwrap();
         cache
-            .entry(key)
+            .entry(io_key(key))
             .or_insert_with(|| {
                 crate::gpu::probe_note_cold();
                 c._device
@@ -10962,7 +10984,7 @@ pub fn matvec_batch(model: &Arc<CmfModel>, jobs: &[BatchJob], outs: &mut [&mut [
     let get_io = |key: usize, nbytes: usize| -> Buffer {
         let mut cache = c.io_bufs.lock().unwrap();
         cache
-            .entry(key)
+            .entry(io_key(key))
             .or_insert_with(|| {
                 crate::gpu::probe_note_cold();
                 c._device
@@ -11132,7 +11154,7 @@ pub struct AttnGpuLayer<'a> {
 fn io_buf(c: &Ctx, key: usize, nbytes: usize) -> Buffer {
     let mut cache = c.io_bufs.lock().unwrap();
     cache
-        .entry(key)
+        .entry(io_key(key))
         .or_insert_with(|| {
             crate::gpu::probe_note_cold();
             c._device
