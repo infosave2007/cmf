@@ -7,13 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.6.7] - 2026-09-10
+## [0.6.7] - 2026-09-11
 
 ### Added
 - Streaming GGUF-to-CMF import for Qwen Image transformer checkpoints, including
   Qwen-Image-Edit-2509 Q6_K. Tensor names and floating-point bytes are preserved;
   existing GGML decoders convert quantized weights into native CMF formats.
   Transformer geometry is inferred from tensors and stored with the component.
+  Its default Q8 profile uses the existing two-field codec to retain precision
+  in modulation weights with large outliers.
 - DeepSeek-V4.1-Flash Q4TP text and image inference support, including the
   native Engram byte tables, CED/CSA2 cache and index contracts, and the
   portable CPU fallback.
