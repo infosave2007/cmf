@@ -47,6 +47,8 @@ unsafe impl GlobalAlloc for CountingAlloc {
 
 #[global_allocator]
 static GLOBAL_ALLOC: CountingAlloc = CountingAlloc;
+use cortiq_engine::dsv41_encoding::{self, EncodeOptions, ReasoningEffort, ThinkingMode};
+use cortiq_engine::dsv41_vision::{self, PreparedVlInputs, VisionConfig};
 use cortiq_engine::{CortiqRuntime, Pipeline, SamplerConfig};
 use cortiq_server::{AppState, build_router};
 use std::sync::Arc;
@@ -450,7 +452,7 @@ enum Commands {
         #[arg(long, default_value = "cortiq-signing.key")]
         key: String,
     },
-    /// Import a GGUF model to .cmf — native Rust (F32/F16/BF16/Q4_0..Q6_K + K-quants; llama/mistral/qwen2/qwen3/qwen3.5 incl. the qwen35moe GDN+MoE hybrids, gemma-3, phi-3/4, DeepSeek-R1 distills)
+    /// Import a GGUF model to .cmf — native Rust (LLM GGUFs plus the Qwen Image diffusion transformer; F32/F16/BF16/Q4_0..Q6_K + K-quants)
     ImportGguf {
         /// A local .gguf file, an HF repo id (owner/name — best .gguf auto-picked), or owner/name/file.gguf
         gguf: String,
@@ -502,6 +504,13 @@ enum Commands {
         /// Single prompt (non-interactive)
         #[arg(short, long)]
         prompt: Option<String>,
+        /// Image path, data URL, or HTTP(S) URL for a V4.1 multimodal prompt.
+        /// Repeat the flag to place images after the text in prompt order.
+        #[arg(long = "image")]
+        images: Vec<String>,
+        /// V4.1 reasoning budget: 1..=100 or low/high/max.
+        #[arg(long, value_name = "1..100|low|high|max")]
+        reasoning_effort: Option<String>,
         /// Maximum number of tokens to generate
         #[arg(short = 'n', long, default_value = "256")]
         max_tokens: usize,
@@ -1944,6 +1953,8 @@ async fn main() -> anyhow::Result<()> {
             model,
             task,
             prompt,
+            images,
+            reasoning_effort,
             max_tokens,
             skill,
             greedy,
@@ -1986,6 +1997,8 @@ async fn main() -> anyhow::Result<()> {
                 &model,
                 &task,
                 prompt.as_deref(),
+                &images,
+                reasoning_effort.as_deref(),
                 max_tokens,
                 skill.as_deref(),
                 greedy,
@@ -2834,7 +2847,7 @@ async fn cmd_serve(
     }
 
     // Create runtime
-    let runtime = CortiqRuntime::new(model);
+    let runtime = CortiqRuntime::new(model.clone());
     if runtime.masks().get(default_task).is_some() {
         let _ = runtime.switch_task(default_task).await;
     }
@@ -3798,12 +3811,103 @@ fn chat_mode(has_template: bool, raw: bool, resuming: bool) -> bool {
     has_template && !raw && !resuming
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Build the exact V4.1 harmony prompt and image records for the CLI. The
+/// `run --prompt ... --image ...` path uses the same tagged text and image
+/// block normalization as the OpenAI endpoint.
+fn prepare_dsv41_cli_prompt(
+    model: &CmfModel,
+    pipeline: &Pipeline,
+    prompt: &str,
+    image_paths: &[String],
+    no_think: bool,
+    reasoning_effort: Option<&str>,
+) -> anyhow::Result<PreparedVlInputs> {
+    let tagged = dsv41_encoding::parse_tagged_text(prompt).map_err(|e| anyhow::anyhow!(e))?;
+    let content = if image_paths.is_empty() {
+        tagged
+    } else {
+        let mut blocks = match tagged {
+            serde_json::Value::Array(blocks) => blocks,
+            value => vec![serde_json::json!({"type":"text", "text":value})],
+        };
+        blocks.extend(image_paths.iter().map(|path| {
+            serde_json::json!({
+                "type":"image_url",
+                "image_url":{"url":path},
+            })
+        }));
+        serde_json::Value::Array(blocks)
+    };
+    prepare_dsv41_cli_messages(
+        model,
+        pipeline,
+        &[serde_json::json!({"role":"user", "content":content})],
+        no_think,
+        reasoning_effort,
+    )
+}
+
+fn prepare_dsv41_cli_messages(
+    model: &CmfModel,
+    pipeline: &Pipeline,
+    messages: &[serde_json::Value],
+    no_think: bool,
+    reasoning_effort: Option<&str>,
+) -> anyhow::Result<PreparedVlInputs> {
+    let source = model
+        .arch()
+        .deepseek_v41
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("DeepSeek-V4.1 source config is missing"))?;
+    let vision = VisionConfig::from_source(source).map_err(|e| anyhow::anyhow!(e))?;
+    let mode = if no_think || reasoning_effort.is_none() {
+        ThinkingMode::Chat
+    } else {
+        ThinkingMode::Thinking
+    };
+    let effort = reasoning_effort
+        .map(ReasoningEffort::parse)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let messages = messages
+        .iter()
+        .map(|message| {
+            let mut message = message.clone();
+            if let Some(text) = message.get("content").and_then(|value| value.as_str()) {
+                let tagged = dsv41_encoding::parse_tagged_text(text)
+                    .map_err(|error| anyhow::anyhow!(error))?;
+                if tagged.is_array() {
+                    message["content"] = tagged;
+                }
+            }
+            Ok::<_, anyhow::Error>(message)
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let encoded = dsv41_encoding::encode_messages(
+        &messages,
+        &EncodeOptions {
+            thinking_mode: mode,
+            reasoning_effort: effort,
+            ..EncodeOptions::default()
+        },
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    dsv41_vision::prepare_vl_inputs(
+        &encoded.prompt,
+        &encoded.images,
+        &pipeline.tokenizer,
+        &vision,
+    )
+    .map_err(|e| anyhow::anyhow!(e))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn cmd_run(
     model_path: &str,
     task: &str,
     prompt: Option<&str>,
+    images: &[String],
+    reasoning_effort: Option<&str>,
     max_tokens: usize,
     skill: Option<&str>,
     greedy: bool,
@@ -3928,6 +4032,13 @@ async fn cmd_run(
         None => Pipeline::from_model_with_skill(&model, sampler, skill.as_deref())?,
     };
     o1.apply(&mut pipeline);
+    let is_dsv41 = model.arch().arch_name == "deepseek_v41";
+    if !is_dsv41 && (!images.is_empty() || reasoning_effort.is_some()) {
+        anyhow::bail!("--image and --reasoning-effort are supported only for DeepSeek-V4.1");
+    }
+    if !images.is_empty() && prompt.is_none() {
+        anyhow::bail!("--image requires --prompt so image order is unambiguous");
+    }
     // Same rule for the CLI: the vocabulary-wide softmax runs when its
     // output is going to be shown, not on every run.
     pipeline.set_confidence(confidence || trace);
@@ -3990,7 +4101,7 @@ async fn cmd_run(
         }
     }
     let task = task.as_str();
-    let runtime = CortiqRuntime::new(model);
+    let runtime = CortiqRuntime::new(model.clone());
 
     if runtime.masks().get(task).is_some() {
         let _ = runtime.switch_task(task).await;
@@ -4119,7 +4230,8 @@ async fn cmd_run(
 
     let noninteractive_generate = prompt.is_some();
     let mut generate_and_print = |pipeline: &mut Pipeline,
-                                  ids: &[u32]|
+                                  ids: &[u32],
+                                  vl_inputs: Option<&PreparedVlInputs>|
      -> anyhow::Result<Option<String>> {
         use std::io::Write;
         // Stream silently when the confidence view will reprint coloured;
@@ -4152,6 +4264,11 @@ async fn cmd_run(
             })
         };
         let started = std::time::Instant::now();
+        if vl_inputs.is_some() && remote_opt.is_some() {
+            anyhow::bail!(
+                "DeepSeek-V4.1 multimodal generation is not supported with --peer; use a local pipeline"
+            );
+        }
         // Prefill offload: the peer absorbs the prompt, its state
         // comes home, and the wire goes idle for the rest of the
         // conversation. Done once — after it the segment is dropped,
@@ -4202,7 +4319,12 @@ async fn cmd_run(
                         r
                     })
             }
-            None => pipeline.generate_from_ids(ids, max_tokens, mask.as_ref(), Some(cb)),
+            None => match vl_inputs {
+                Some(inputs) => {
+                    pipeline.generate_from_vl(inputs, max_tokens, mask.as_ref(), Some(cb))
+                }
+                None => pipeline.generate_from_ids(ids, max_tokens, mask.as_ref(), Some(cb)),
+            },
         };
         match gen_res {
             Ok(r) => {
@@ -4254,6 +4376,7 @@ async fn cmd_run(
                 }
                 #[cfg(feature = "gpu")]
                 cortiq_engine::dsv4::profile_report();
+                cortiq_engine::dsv41::profile_report();
                 let sw = pipeline.route_switches();
                 if !sw.is_empty() {
                     println!("route: {} skill switch(es):", sw.len());
@@ -4303,11 +4426,27 @@ async fn cmd_run(
             ids
         }
     };
+    let build_dsv41_inputs =
+        |pipeline: &Pipeline, history: &[(String, String)]| -> anyhow::Result<PreparedVlInputs> {
+            let messages = history
+                .iter()
+                .map(|(role, content)| serde_json::json!({"role":role, "content":content}))
+                .collect::<Vec<_>>();
+            prepare_dsv41_cli_messages(&model, pipeline, &messages, no_think, reasoning_effort)
+        };
 
     if let Some(p) = prompt {
         println!("\nPrompt: {p}\n");
         let history = vec![("user".to_string(), p.to_string())];
-        let ids = build_ids(&pipeline, &history, p);
+        let vl_inputs = is_dsv41
+            .then(|| {
+                prepare_dsv41_cli_prompt(&model, &pipeline, p, images, no_think, reasoning_effort)
+            })
+            .transpose()?;
+        let ids = vl_inputs
+            .as_ref()
+            .map(|inputs| inputs.token_ids.clone())
+            .unwrap_or_else(|| build_ids(&pipeline, &history, p));
         // CMF_PROMPT_DUMP=1: the rendered prompt as the model sees it
         // (template applied, decoded back to text) — for template audits.
         if std::env::var("CMF_PROMPT_DUMP").is_ok() {
@@ -4330,7 +4469,7 @@ async fn cmd_run(
                 .collect();
             eprintln!("head {}\ntail {}", head.join(" "), tail.join(" "));
         }
-        generate_and_print(&mut pipeline, &ids)?;
+        generate_and_print(&mut pipeline, &ids, vl_inputs.as_ref())?;
     } else {
         println!("\nType your message (Ctrl+C to exit):\n");
         let stdin = std::io::stdin();
@@ -4349,7 +4488,13 @@ async fn cmd_run(
                 continue;
             }
             history.push(("user".to_string(), text.to_string()));
-            let mut ids = build_ids(&pipeline, &history, text);
+            let mut vl_inputs = is_dsv41
+                .then(|| build_dsv41_inputs(&pipeline, &history))
+                .transpose()?;
+            let mut ids = vl_inputs
+                .as_ref()
+                .map(|inputs| inputs.token_ids.clone())
+                .unwrap_or_else(|| build_ids(&pipeline, &history, text));
             // The cache is cleared per turn and the prefill loop has no
             // length check (eviction only fires while decoding), so a long
             // chat would prefill past the RoPE range. Drop the oldest
@@ -4365,13 +4510,19 @@ async fn cmd_run(
                     history.remove(i);
                 }
                 eprintln!("note: context full — dropped the oldest exchange");
-                ids = build_ids(&pipeline, &history, text);
+                vl_inputs = is_dsv41
+                    .then(|| build_dsv41_inputs(&pipeline, &history))
+                    .transpose()?;
+                ids = vl_inputs
+                    .as_ref()
+                    .map(|inputs| inputs.token_ids.clone())
+                    .unwrap_or_else(|| build_ids(&pipeline, &history, text));
             }
             // The terminal already echoed the user's line after "> ".
             if use_template {
                 println!();
             }
-            match generate_and_print(&mut pipeline, &ids)? {
+            match generate_and_print(&mut pipeline, &ids, vl_inputs.as_ref())? {
                 Some(reply) => history.push(("assistant".to_string(), reply)),
                 // A failed turn leaves no dangling user message.
                 None => {
@@ -6084,6 +6235,7 @@ async fn cmd_bench(
     // measuring a different workload.
     #[cfg(feature = "gpu")]
     cortiq_engine::dsv4::profile_report();
+    cortiq_engine::dsv41::profile_report();
     if pair_ms > 0.0 {
         println!(
             "  Pair:    2 singles {:.2} ms vs fused {:.2} ms (×{:.2} cheaper second lane)",

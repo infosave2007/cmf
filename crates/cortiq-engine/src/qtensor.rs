@@ -11125,6 +11125,85 @@ mod tests {
         assert_eq!(eb, gb, "fused multi-matrix lane 2 must be bit-identical");
     }
 
+    /// The public Q4TP operator must take the real mapped matvec_many arm,
+    /// rather than the F32 fallback above.  Build a tiny valid CMF so both
+    /// handles retain their mmap payloads, then compare the fused dispatch
+    /// with two ordinary mapped matvec calls bit-for-bit.
+    #[test]
+    fn q4tp_matvec_many_equals_separate_matvecs() {
+        use crate::pool::Pool;
+        use cortiq_core::{CMF_VERSION, CmfHeader, CmfModel, QuantType, TensorSpec};
+
+        let (r1, r2, cols) = (300usize, 200usize, 64usize);
+        let arch: cortiq_core::ModelArch = serde_json::from_value(serde_json::json!({
+            "arch_name": "tiny-q4tp",
+            "hidden_size": cols,
+            "intermediate_size": cols * 2,
+            "num_layers": 1,
+            "num_attention_heads": 2,
+            "num_kv_heads": 1,
+            "head_dim": 32,
+            "vocab_size": r1,
+            "layer_types": ["FullAttention"],
+            "rms_norm_eps": 1e-6,
+            "max_position_embeddings": 8,
+            "linear_conv_kernel_dim": 0,
+            "linear_num_key_heads": 0,
+            "linear_num_value_heads": 0
+        }))
+        .unwrap();
+        let header = CmfHeader {
+            format: "cmf".into(),
+            version: CMF_VERSION,
+            arch,
+            quant_type: QuantType::Q4Block,
+            provenance: None,
+            tokenizer_config: None,
+            section_hashes: None,
+            skills: Vec::new(),
+            shard: None,
+            calibration: None,
+            routing: None,
+        };
+        let specs = [
+            TensorSpec {
+                name: "q".into(),
+                dtype: TensorDtype::Q4TiledP,
+                shape: vec![r1, cols],
+                data: synth_q4tp(r1, cols),
+            },
+            TensorSpec {
+                name: "kv".into(),
+                dtype: TensorDtype::Q4TiledP,
+                shape: vec![r2, cols],
+                data: synth_q4tp(r2, cols),
+            },
+        ];
+        let dir = std::env::temp_dir().join(format!("cmf-q4tp-many-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("m.cmf");
+        CmfModel::write(&path, &header, &specs, None, None).unwrap();
+        let model = Arc::new(CmfModel::open(&path).unwrap());
+        let (a, b) = (
+            QTensor::from_model(&model, "q").unwrap(),
+            QTensor::from_model(&model, "kv").unwrap(),
+        );
+        assert_eq!(a.model_dtype(), Some(TensorDtype::Q4TiledP));
+        assert_eq!(b.model_dtype(), Some(TensorDtype::Q4TiledP));
+        let x: Vec<f32> = (0..cols)
+            .map(|i| ((i * 17 + 3) % 97) as f32 / 97.0 - 0.5)
+            .collect();
+        let pool = Pool::new(3);
+        let (mut ea, mut eb) = (vec![0.0f32; r1], vec![0.0f32; r2]);
+        a.matvec(&x, &mut ea, Some(&pool));
+        b.matvec(&x, &mut eb, Some(&pool));
+        let (mut ga, mut gb) = (vec![0.0f32; r1], vec![0.0f32; r2]);
+        QTensor::matvec_many([&a, &b], &x, [&mut ga, &mut gb], Some(&pool));
+        assert_eq!(ea, ga, "Q4TP fused lane 1 must be bit-identical");
+        assert_eq!(eb, gb, "Q4TP fused lane 2 must be bit-identical");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Batched q4/vbit matmat must equal per-position matvec calls
     /// exactly (the fallback it replaced) — same kernels, same order.
     #[test]

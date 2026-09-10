@@ -29,6 +29,8 @@
 
 use std::cell::UnsafeCell;
 use std::sync::Arc;
+#[cfg(any(target_os = "android", target_os = "linux"))]
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Embedder override for the pool size (C ABI `cortiq_set_threads`):
@@ -36,9 +38,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 /// pool construction, so set it before the load.
 pub static FORCED_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Kernel thread ids of the CURRENT pool's workers (Android/Linux) —
-/// what ADPF's PerformanceHintManager needs to attribute work to the
-/// governor. Refilled on every pool construction; empty elsewhere.
+/// Kernel thread ids of the last fully constructed pool's workers
+/// (Android/Linux) — what ADPF's PerformanceHintManager needs to attribute
+/// work to the governor. Published as one complete snapshot after that
+/// pool's per-instance registration barrier; empty elsewhere.
 pub static WORKER_TIDS: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
 
 /// A `*const dyn Fn` that may cross a thread boundary. Safety is
@@ -73,6 +76,13 @@ struct Inner {
     /// Per-worker "I am parked" flags — lets the caller skip the unpark
     /// syscall for workers that are still spinning.
     parked: Box<[AtomicBool]>,
+    /// Per-pool registration state. `WORKER_TIDS` is a process-wide
+    /// snapshot for ADPF and cannot be a construction barrier: another
+    /// pool may clear and republish that snapshot concurrently.
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    registered: AtomicUsize,
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    worker_tids: Mutex<Vec<i32>>,
 }
 
 // SAFETY: `slot` is only written while no job is in flight (run()
@@ -137,34 +147,43 @@ impl Pool {
             shutdown: AtomicBool::new(false),
             spin_budget: AtomicUsize::new(spin_budget),
             parked: (0..n_workers).map(|_| AtomicBool::new(false)).collect(),
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            registered: AtomicUsize::new(0),
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            worker_tids: Mutex::new(Vec::with_capacity(n_workers)),
         });
         let mut joins = Vec::with_capacity(n_workers);
-        if let Ok(mut tids) = WORKER_TIDS.lock() {
-            tids.clear();
-        }
         for w in 0..n_workers {
             let inner = inner.clone();
             let h = std::thread::Builder::new()
                 .name(format!("cmf-pool-{w}"))
                 .spawn(move || {
                     #[cfg(any(target_os = "android", target_os = "linux"))]
-                    if let Ok(mut tids) = WORKER_TIDS.lock() {
-                        tids.push(unsafe { libc::gettid() } as i32);
+                    {
+                        let tid = unsafe { libc::gettid() } as i32;
+                        if let Ok(mut tids) = inner.worker_tids.lock() {
+                            tids.push(tid);
+                        }
+                        inner.registered.fetch_add(1, Ordering::Release);
                     }
                     worker_loop(&inner, w)
                 })
                 .expect("spawn pool worker");
             joins.push(h);
         }
-        // Registration barrier: `spawn` returns before the closure runs,
+        // Per-pool registration barrier: `spawn` returns before the closure runs,
         // and the embedder reads `cortiq_worker_tids` right after load —
         // on a phone only the first worker had registered by then (the
         // '· 1 threads' About line that misled the cmfmobile device
         // investigation twice). Thread start is milliseconds; wait for
-        // every tid before construction returns.
+        // every worker has registered before construction returns.
         #[cfg(any(target_os = "android", target_os = "linux"))]
-        while WORKER_TIDS.lock().map(|t| t.len()).unwrap_or(n_workers) < n_workers {
+        while inner.registered.load(Ordering::Acquire) < n_workers {
             std::thread::yield_now();
+        }
+        #[cfg(any(target_os = "android", target_os = "linux"))]
+        if let (Ok(mut global), Ok(local)) = (WORKER_TIDS.lock(), inner.worker_tids.lock()) {
+            *global = local.clone();
         }
         let threads = joins.iter().map(|h| h.thread().clone()).collect();
         Self {
@@ -728,27 +747,24 @@ mod tests {
     #[test]
     #[cfg(any(target_os = "android", target_os = "linux"))]
     fn worker_tids_registered_before_new_returns() {
-        // WORKER_TIDS is a process-global registry, and the test harness
-        // runs suites in parallel — other tests' pools add their tids to
-        // the same list (19 showed up on a 48-core box where the old
-        // `== 3` held on a laptop by timing luck). Assert on the DELTA:
-        // our pool's three workers must be there the moment new returns.
-        // Counting LENGTHS raced: a parallel suite dropping its pool
-        // shrinks the same registry between the two reads, and the delta
-        // goes negative through no fault of ours (this flake failed two
-        // releases). Compare SETS instead — removals elsewhere cannot
-        // take away tids that were not there before.
+        // WORKER_TIDS is only the last completed pool's process-wide
+        // snapshot; another test can publish a different valid snapshot
+        // immediately after `new` returns. Check this pool's private
+        // registration state instead.
         use std::collections::HashSet;
-        let before: HashSet<_> = super::WORKER_TIDS.lock().unwrap().iter().copied().collect();
-        let _p = super::Pool::new(3);
-        let after: HashSet<_> = super::WORKER_TIDS.lock().unwrap().iter().copied().collect();
-        let fresh = after.difference(&before).count();
+        let p = super::Pool::new(3);
+        let local: Vec<_> = p.inner.worker_tids.lock().unwrap().clone();
+        let registered = p.inner.registered.load(Ordering::Acquire);
+        let unique: HashSet<_> = local.iter().copied().collect();
         assert!(
-            fresh >= 3,
-            "all worker tids must be visible the moment the pool exists \
-             (fresh {fresh}, before {}, after {})",
-            before.len(),
-            after.len()
+            registered == 3
+                && local.len() == 3
+                && unique.len() == 3
+                && local.iter().all(|&tid| tid > 0),
+            "all worker tids must be privately registered before new returns \
+             (registered {registered}, local {}, unique {})",
+            local.len(),
+            unique.len()
         );
     }
 
@@ -761,6 +777,49 @@ mod tests {
         super::FORCED_THREADS.store(1, Ordering::Relaxed);
         assert!(super::Pool::from_env().is_none(), "forced 1 → serial");
         super::FORCED_THREADS.store(0, Ordering::Relaxed);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    fn concurrent_pool_constructors_complete_without_registration_race() {
+        // WORKER_TIDS is a process-wide publication target. Before the
+        // per-pool counter, a larger constructor could have all its workers
+        // append, then a concurrent one could clear that vector; the larger
+        // constructor would wait forever for a length that could never return.
+        // Start unlike-sized constructors together so that regression is
+        // exercised without relying on the test harness' scheduling.
+        use std::sync::{Barrier, mpsc};
+        use std::time::Duration;
+
+        for round in 0..16 {
+            let start = Arc::new(Barrier::new(3));
+            let (done_tx, done_rx) = mpsc::channel();
+            let mut joins = Vec::new();
+            for workers in [8usize, 1usize] {
+                let start = start.clone();
+                let done_tx = done_tx.clone();
+                joins.push(std::thread::spawn(move || {
+                    start.wait();
+                    let pool = Pool::with_spin(workers, 0);
+                    done_tx.send(pool.n_workers()).unwrap();
+                }));
+            }
+            drop(done_tx);
+            start.wait();
+            let mut sizes = Vec::with_capacity(2);
+            for _ in 0..2 {
+                sizes.push(
+                    done_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .unwrap_or_else(|_| panic!("pool constructor stalled in round {round}")),
+                );
+            }
+            sizes.sort_unstable();
+            assert_eq!(sizes, [1, 8]);
+            for join in joins {
+                join.join().unwrap();
+            }
+        }
     }
 
     #[test]

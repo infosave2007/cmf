@@ -126,10 +126,14 @@ pub struct State {
     pub pos: usize,
 }
 
-struct QwenGpuPool {
-    segment_slots: usize,
+pub(crate) struct QwenGpuPool {
+    pub(crate) segment_slots: usize,
     floor: usize,
     n_experts: usize,
+    fetch_quota: usize,
+    fetch_min_seen: u16,
+    fetch_max_env: &'static str,
+    fetch_min_env: &'static str,
     owner: Vec<Option<(usize, usize)>>,
     /// Qwen has one fixed expert count on every layer.  A dense
     /// `[layer][expert]` map avoids hundreds of hash lookups per layer and
@@ -144,6 +148,23 @@ struct QwenGpuPool {
     occupancy: Vec<usize>,
     last: Vec<u64>,
     clock: u64,
+}
+
+/// Parse a bounded pool percentage without allowing a malformed operator
+/// knob to turn into an unbounded allocation.  Kept pure so the Qwen and GLM
+/// policies can be regression-tested without initializing a GPU adapter.
+fn bounded_pool_pct(raw: Option<&str>, default: usize, min: usize, max: usize) -> usize {
+    raw.and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(default)
+        .clamp(min, max)
+}
+
+fn bounded_pool_slots(raw: Option<&str>, safe: usize, cap_override: bool) -> usize {
+    let floor = if cap_override { safe.min(8) } else { 8 };
+    raw.and_then(|v| v.parse::<usize>().ok())
+        .map(|v| if cap_override { v.min(safe) } else { v })
+        .unwrap_or(safe)
+        .max(floor)
 }
 
 impl State {
@@ -169,13 +190,106 @@ impl State {
 
 #[cfg(feature = "gpu")]
 impl QwenGpuPool {
-    fn create(
+    pub(crate) fn create(
         model: &Arc<CmfModel>,
         inter: usize,
         hidden: usize,
         n_layers: usize,
         n_experts: usize,
         gu_q2: bool,
+    ) -> Option<Self> {
+        Self::create_with_policy(
+            model,
+            inter,
+            hidden,
+            n_layers,
+            n_experts,
+            gu_q2,
+            "CMF_QWEN_POOL_PCT",
+            75,
+            25,
+            85,
+            "CMF_QWEN_EXPERT_SLOTS",
+            "CMF_QWEN_FETCH_MAX",
+            "CMF_QWEN_FETCH_MIN_SEEN",
+        )
+    }
+
+    /// DeepSeek V4.1 uses the same segmented, model-wide bank as Qwen's
+    /// dynamic MoE path, but its routed experts are Q4TP in the production
+    /// profile.  Keep the policy knob architecture-specific while sharing
+    /// the allocator and LRU implementation.
+    pub(crate) fn create_for_dsv41(
+        model: &Arc<CmfModel>,
+        inter: usize,
+        hidden: usize,
+        n_layers: usize,
+        n_experts: usize,
+        gu_q2: bool,
+    ) -> Option<Self> {
+        Self::create_with_policy(
+            model,
+            inter,
+            hidden,
+            n_layers,
+            n_experts,
+            gu_q2,
+            "CMF_DSV41_POOL_PCT",
+            75,
+            25,
+            85,
+            "CMF_DSV41_EXPERT_SLOTS",
+            "CMF_DSV41_FETCH_MAX",
+            "CMF_DSV41_FETCH_MIN_SEEN",
+        )
+    }
+
+    /// GLM-5.3-Flash's Q2 expert arena shares the card with a much larger
+    /// static attention/control footprint and with transient cold-expert
+    /// staging allocations.  Keep that model-specific policy here while
+    /// reusing the same LRU/cache machinery as Qwen.  The lower default is
+    /// intentionally applied before the common allocator's workspace carve
+    /// out; it treats the configured budget as a physical envelope rather
+    /// than as a promise that the whole budget may become resident weights.
+    pub(crate) fn create_for_glm(
+        model: &Arc<CmfModel>,
+        inter: usize,
+        hidden: usize,
+        n_layers: usize,
+        n_experts: usize,
+        gu_q2: bool,
+    ) -> Option<Self> {
+        Self::create_with_policy(
+            model,
+            inter,
+            hidden,
+            n_layers,
+            n_experts,
+            gu_q2,
+            "CMF_GLM_POOL_PCT",
+            40,
+            20,
+            40,
+            "CMF_GLM_EXPERT_SLOTS",
+            "CMF_GLM_FETCH_MAX",
+            "CMF_GLM_FETCH_MIN_SEEN",
+        )
+    }
+
+    fn create_with_policy(
+        model: &Arc<CmfModel>,
+        inter: usize,
+        hidden: usize,
+        n_layers: usize,
+        n_experts: usize,
+        gu_q2: bool,
+        pct_env: &str,
+        default_pct: usize,
+        min_pct: usize,
+        max_pct: usize,
+        slots_env: &str,
+        fetch_max_env: &'static str,
+        fetch_min_env: &'static str,
     ) -> Option<Self> {
         if !crate::gpu_wgpu::dsv4_global_moe_supported() {
             return None;
@@ -196,28 +310,83 @@ impl QwenGpuPool {
         let budget = crate::gpu_wgpu::dsv4_vram_budget()? as usize;
         // The Q8_2f attention/GDN skeleton, f32 HyperConnection projections,
         // KV/state and the full-vocabulary head live next to this arena. The
-        // global allocator subtracts another 2-4 GiB workspace below this
-        // request. 75% therefore becomes a ~50% expert arena on 8 GiB, ~62%
-        // on 16 GiB and ~70% on 80 GiB: enough Qwen locality without stealing
-        // the geometry-independent driver/KV/frame reserve. The old 55%
-        // request left only 6.7 GiB of experts under a 16 GiB budget and lost
-        // 12-15% decode to avoidable cold completions.
-        let pool_pct = std::env::var("CMF_QWEN_POOL_PCT")
+        // common allocator subtracts another 2-4 GiB workspace below this
+        // request. Qwen's 75% profile preserves locality. GLM has a separate
+        // physical-card envelope: the measured RTX-3090 budget can use the
+        // full 100% request (the allocator subtracts workspace below), while
+        // the 16-GB compatibility profile stays at the proven 40% cap. The
+        // global allocator still subtracts its workspace reserve and refuses
+        // an unsafe allocation.
+        let max_pct = if pct_env == "CMF_GLM_POOL_PCT" && budget >= 20_000_000_000 {
+            // A 24-GiB card has room for the measured static trunk plus a
+            // larger expert arena.  The allocator below still subtracts its
+            // workspace reserve and rounds the result, while the 16-GiB
+            // compatibility budget remains capped at the conservative 40%.
+            100
+        } else {
+            max_pct
+        };
+        let default_pct = if pct_env == "CMF_GLM_POOL_PCT" && budget >= 20_000_000_000 {
+            100
+        } else {
+            default_pct
+        };
+        let pool_pct = bounded_pool_pct(
+            std::env::var(pct_env).ok().as_deref(),
+            default_pct,
+            min_pct,
+            max_pct,
+        );
+        let safe_requested = budget.saturating_mul(pool_pct) / 100 / per.max(1);
+        // GLM's explicit slot knob is still subject to the same
+        // physical-envelope cap as its percentage policy.  This prevents
+        // `CMF_GPU_VRAM_MB=16000` plus an oversized slot override from
+        // recreating pod-7's physical OOM.  Qwen retains its established
+        // operator-controlled slot override semantics.
+        let bounded_override = pct_env == "CMF_GLM_POOL_PCT" || pct_env == "CMF_DSV41_POOL_PCT";
+        let requested = bounded_pool_slots(
+            std::env::var(slots_env).ok().as_deref(),
+            safe_requested,
+            bounded_override,
+        );
+        let (capacity, segment_slots) = if pct_env == "CMF_DSV41_POOL_PCT" {
+            crate::gpu_wgpu::dsv4_global_moe_create_for_dsv41(
+                model, requested, inter, hidden, gu_q2,
+            )?
+        } else {
+            // Generic Qwen/GLM/DSV4 callers keep the established S8 bank.
+            crate::gpu_wgpu::dsv4_global_moe_create(model, requested, inter, hidden, gu_q2)?
+        };
+        let (auto_quota, auto_min_seen) = crate::gpu_wgpu::dsv4_fetch_defaults();
+        let fetch_quota = std::env::var(fetch_max_env)
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(75)
-            .clamp(25, 85);
-        let requested = budget.saturating_mul(pool_pct) / 100 / per.max(1);
-        let requested = std::env::var("CMF_QWEN_EXPERT_SLOTS")
+            .unwrap_or(auto_quota);
+        // GLM routes through a 45-layer sweep with a larger cold-expert
+        // penalty. Q2's mixed profile waits for three observations so
+        // one-shot routes do not trigger a synchronous upload; Q4 keeps the
+        // first-recurrence policy because its larger rows make CPU misses
+        // more expensive. Qwen retains its established hysteresis.
+        let glm_policy = pct_env == "CMF_GLM_POOL_PCT";
+        let fetch_min_seen = std::env::var(fetch_min_env)
             .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(requested)
-            .max(8);
-        let (capacity, segment_slots) =
-            crate::gpu_wgpu::dsv4_global_moe_create(model, requested, inter, hidden, gu_q2)?;
-        if std::env::var_os("CMF_QWEN_PROF").is_some() {
+            .and_then(|v| v.parse::<u16>().ok())
+            // Repair-8's first-recurrence policy is the measured GLM
+            // baseline. Repair-9's Q2-specific three-observation gate
+            // regressed throughput and is intentionally removed here;
+            // persistent-device scheduling must not be substituted by an
+            // admission heuristic.
+            .unwrap_or(if glm_policy || pct_env == "CMF_DSV41_POOL_PCT" {
+                1
+            } else {
+                auto_min_seen.max(2)
+            });
+        if std::env::var_os("CMF_QWEN_PROF").is_some()
+            || std::env::var_os("CMF_GLM_PROF").is_some()
+            || std::env::var_os("CMF_DSV41_PROF").is_some()
+        {
             eprintln!(
-                "qwen-pool capacity={capacity} segment_slots={segment_slots} requested={requested} gu={}",
+                "dynamic-pool capacity={capacity} segment_slots={segment_slots} requested={requested} pct={pool_pct} env={pct_env} fetch_quota={fetch_quota} min_seen={fetch_min_seen} gu={}",
                 if gu_q2 { "q2tp" } else { "q4tp" }
             );
         }
@@ -225,6 +394,10 @@ impl QwenGpuPool {
             segment_slots,
             floor: (capacity / n_layers.max(1)).max(2),
             n_experts,
+            fetch_quota,
+            fetch_min_seen,
+            fetch_max_env,
+            fetch_min_env,
             owner: vec![None; capacity],
             slot_for: vec![u32::MAX; n_layers.checked_mul(n_experts)?],
             shared_slot: vec![u32::MAX; n_layers],
@@ -237,7 +410,7 @@ impl QwenGpuPool {
         })
     }
 
-    fn ensure(
+    pub(crate) fn ensure(
         &mut self,
         model: &Arc<CmfModel>,
         layer: usize,
@@ -310,18 +483,14 @@ impl QwenGpuPool {
                 self.last[slot as usize] = now;
             }
         }
-        let (auto_quota, auto_min_seen) = crate::gpu_wgpu::dsv4_fetch_defaults();
-        let quota = std::env::var("CMF_QWEN_FETCH_MAX")
+        let quota = std::env::var(self.fetch_max_env)
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(auto_quota);
-        let min_seen = std::env::var("CMF_QWEN_FETCH_MIN_SEEN")
+            .unwrap_or(self.fetch_quota);
+        let min_seen = std::env::var(self.fetch_min_env)
             .ok()
             .and_then(|v| v.parse::<u16>().ok())
-            // With 512 experts/layer, first sightings churn the cache even on
-            // a fast PCIe link. Both 16 and 32 GiB A/B runs were faster at 2;
-            // an explicit operator value still wins for unusual hardware.
-            .unwrap_or(auto_min_seen.max(2));
+            .unwrap_or(self.fetch_min_seen);
         let mut fetched = 0usize;
         for &expert in picks {
             let key = base + expert;
@@ -1215,6 +1384,7 @@ fn dynamic_moe_gpu(
         route_scale: 1.0,
         swiglu_limit: 0.0,
         gu_q2,
+        bf16: false,
     };
     let mut out = vec![0.0f32; x.len()];
     let mut cold = Vec::new();
@@ -1439,6 +1609,22 @@ pub fn forward_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dynamic_pool_percent_is_bounded_per_policy() {
+        // GLM's 40% default leaves a physical-VRAM reserve for static
+        // attention/control tensors and transient cold-expert staging; the
+        // operator may tune it, but never outside the policy envelope.
+        assert_eq!(bounded_pool_pct(None, 40, 20, 60), 40);
+        assert_eq!(bounded_pool_pct(Some("55"), 40, 20, 40), 40);
+        assert_eq!(bounded_pool_pct(Some("999"), 40, 20, 40), 40);
+        assert_eq!(bounded_pool_pct(Some("0"), 40, 20, 40), 20);
+        assert_eq!(bounded_pool_pct(Some("bad"), 40, 20, 40), 40);
+        // Qwen retains its established wider range independently.
+        assert_eq!(bounded_pool_pct(Some("90"), 75, 25, 85), 85);
+        assert_eq!(bounded_pool_slots(Some("9999"), 752, true), 752);
+        assert_eq!(bounded_pool_slots(Some("9999"), 752, false), 9999);
+    }
 
     #[test]
     fn deterministic_hash_tables_match_contract() {

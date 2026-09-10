@@ -40,6 +40,7 @@ fn arch() -> ModelArch {
         mtp: None,
         moe: None,
         qwen4_exp: None,
+        deepseek_v41: None,
         linear_core: None,
         head_clusters: None,
         max_position_embeddings: 64,

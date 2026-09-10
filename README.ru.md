@@ -38,6 +38,14 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+GGUF трансформера Qwen Image, включая `Qwen-Image-Edit-2509-Q6_K.gguf`,
+импортируется той же командой. Тензоры записываются в CMF последовательно:
+веса F32/F16/BF16 сохраняются точно, квантованные матрицы переводятся в формат
+`--quant` (по умолчанию `q8`, с масштабами строк и столбцов для Qwen Image).
+CMF содержит трансформер и его конфигурацию;
+отдельные текстовый энкодер и VAE исходной модели в него не входят.
+Генерация Qwen Image через `cortiq imagine` пока не реализована.
+
 CLI также предоставляет `info`, `bench`, `ppl`, `serve`, `skill`, `moe-mask`,
 `moe-defrag`, `requant`, `compact`, `sign`, `imagine`, `animate` и `ltx-video`.
 Команда `cortiq <команда> --help` показывает флаги и ограничения.

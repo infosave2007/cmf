@@ -13,6 +13,8 @@ use axum::{
 };
 use cortiq_core::TaskMask;
 use cortiq_engine::SamplerConfig;
+use cortiq_engine::dsv41_encoding::{self, EncodeOptions, ReasoningEffort, ThinkingMode};
+use cortiq_engine::dsv41_vision::{self, VisionConfig};
 use cortiq_engine::pipeline::GenerateResult;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -73,6 +75,16 @@ struct ChatMessage {
     tool_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     name: Option<String>,
+    /// Harmony/V4.1 assistant history carries reasoning separately from its
+    /// user-visible summary. Preserve it across the next request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    response_format: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    task: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    wo_eos: Option<bool>,
 }
 
 /// `content` in the shape clients actually send it.
@@ -97,10 +109,14 @@ enum MessageContent {
 /// some future client degrades to "no text" instead of a 422.
 #[derive(Deserialize, Serialize, Clone)]
 struct ContentBlock {
-    #[serde(default, rename = "type")]
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
     kind: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     text: Option<String>,
+    /// Image URL/source and future content block fields survive the initial
+    /// deserialization; the V4.1 encoder consumes these records verbatim.
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl MessageContent {
@@ -116,6 +132,10 @@ impl MessageContent {
                 .collect::<Vec<_>>()
                 .join("\n"),
         }
+    }
+
+    fn to_value(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or_else(|_| serde_json::Value::String(self.text()))
     }
 }
 
@@ -197,6 +217,7 @@ fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
 async fn run_generation(
     state: Arc<AppState>,
     prompt_ids: Vec<u32>,
+    vl_inputs: Option<dsv41_vision::PreparedVlInputs>,
     max_tokens: usize,
     mask: Option<TaskMask>,
     sampler_config: SamplerConfig,
@@ -230,6 +251,12 @@ async fn run_generation(
         p.set_sampler_config(sampler_config);
         match remote {
             Some(rm) => {
+                if vl_inputs.is_some() {
+                    return Err(
+                        "V4.1 multimodal generation is not supported with a network-split pipeline"
+                            .to_string(),
+                    );
+                }
                 // Task masks would apply to this side's layers only —
                 // refuse rather than run half a mask (same rule as
                 // `run --peer`).
@@ -259,7 +286,10 @@ async fn run_generation(
                     },
                 )
             }
-            None => p.generate_from_ids(&prompt_ids, max_tokens, mask.as_ref(), on_token),
+            None => match vl_inputs.as_ref() {
+                Some(inputs) => p.generate_from_vl(inputs, max_tokens, mask.as_ref(), on_token),
+                None => p.generate_from_ids(&prompt_ids, max_tokens, mask.as_ref(), on_token),
+            },
         }
     })
     .await;
@@ -378,6 +408,10 @@ struct ChatCompletionsRequest {
     /// so the model answers directly). Absent = the template's default.
     #[serde(default)]
     enable_thinking: Option<bool>,
+    /// DeepSeek-V4.1 accepts an integer budget 1..=100 or low/high/max.
+    /// Keep JSON at the protocol edge so numeric values remain integers.
+    #[serde(default)]
+    reasoning_effort: Option<serde_json::Value>,
     /// vLLM-style alternative: {"enable_thinking": false} — the explicit
     /// top-level field above wins when both are present.
     #[serde(default)]
@@ -423,6 +457,166 @@ impl ChatCompletionsRequest {
                 .and_then(|v| v.as_bool())
         })
     }
+}
+
+/// Prompt payload produced by the protocol layer. Text-only models use just
+/// `token_ids`; V4.1 image requests additionally carry per-position types and
+/// decoded image patches for the engine's vision-aware prefill.
+#[derive(Debug)]
+pub struct PromptIngress {
+    pub token_ids: Vec<u32>,
+    pub token_types: Vec<i8>,
+    pub images: Vec<dsv41_vision::ImageInput>,
+    pub dsv41: bool,
+}
+
+fn message_to_json(message: &ChatMessage) -> serde_json::Value {
+    let content = message
+        .content
+        .as_ref()
+        .map(MessageContent::to_value)
+        .unwrap_or_else(|| serde_json::Value::String(String::new()));
+    let mut object = serde_json::json!({
+        "role": message.role,
+        "content": content,
+    });
+    if let Some(tool_calls) = &message.tool_calls {
+        let mut tool_calls = tool_calls.clone();
+        // Some chat templates iterate arguments as an object while the
+        // OpenAI wire format sends them as a JSON string. Preserve the
+        // historical normalization for those templates; V4.1 accepts both
+        // forms when rendering DSML.
+        if let Some(calls) = tool_calls.as_array_mut() {
+            for call in calls {
+                if let Some(arguments) = call
+                    .get_mut("function")
+                    .and_then(|function| function.get_mut("arguments"))
+                {
+                    if let Some(string) = arguments.as_str() {
+                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(string) {
+                            if parsed.is_object() {
+                                *arguments = parsed;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        object["tool_calls"] = tool_calls;
+    }
+    if let Some(tool_call_id) = &message.tool_call_id {
+        object["tool_call_id"] = serde_json::Value::String(tool_call_id.clone());
+    }
+    if let Some(name) = &message.name {
+        object["name"] = serde_json::Value::String(name.clone());
+    }
+    if let Some(reasoning) = &message.reasoning_content {
+        object["reasoning_content"] = serde_json::Value::String(reasoning.clone());
+    }
+    if let Some(response_format) = &message.response_format {
+        object["response_format"] = response_format.clone();
+    }
+    if let Some(task) = &message.task {
+        object["task"] = serde_json::Value::String(task.clone());
+    }
+    if let Some(wo_eos) = message.wo_eos {
+        object["wo_eos"] = serde_json::Value::Bool(wo_eos);
+    }
+    object
+}
+
+fn request_messages_json(
+    messages: &[ChatMessage],
+    parse_dsv41_images: bool,
+) -> Result<Vec<serde_json::Value>, String> {
+    messages
+        .iter()
+        .map(|message| {
+            let mut value = message_to_json(message);
+            if !parse_dsv41_images {
+                // Preserve the public template path: structured OpenAI
+                // blocks are flattened to text for non-V4.1 models.
+                value["content"] = serde_json::Value::String(
+                    message
+                        .content
+                        .as_ref()
+                        .map(|content| content.text())
+                        .unwrap_or_default(),
+                );
+            }
+            // Compact `<image>...</image>` notation is converted before the
+            // image walker so it shares the OpenAI content-block path.
+            if parse_dsv41_images {
+                if let Some(text) = value.get("content").and_then(|v| v.as_str()) {
+                    let blocks = dsv41_encoding::parse_tagged_text(text)
+                        .map_err(|error| error.to_string())?;
+                    if blocks.is_array() {
+                        value["content"] = blocks;
+                    }
+                }
+            }
+            Ok(value)
+        })
+        .collect()
+}
+
+/// Encode OpenAI messages with the pinned V4.1 harmony formatter and image
+/// processor. This is public so the CLI/server protocol layers share the same
+/// image-span normalization without duplicating it in the runtime.
+pub fn encode_dsv41_messages(
+    messages: &[serde_json::Value],
+    tools: Option<&[serde_json::Value]>,
+    enable_thinking: Option<bool>,
+    reasoning_effort: Option<&serde_json::Value>,
+    tokenizer: &cortiq_engine::tokenizer::Tokenizer,
+    config: &VisionConfig,
+) -> Result<PromptIngress, String> {
+    let mut messages = messages.to_vec();
+    if let Some(tools) = tools.filter(|items| !items.is_empty()) {
+        let tools_value = serde_json::Value::Array(tools.to_vec());
+        if messages
+            .first()
+            .and_then(|message| message.get("role"))
+            .and_then(|role| role.as_str())
+            == Some("system")
+        {
+            messages[0]["tools"] = tools_value;
+        } else {
+            messages.insert(
+                0,
+                serde_json::json!({"role":"system", "content":"", "tools":tools_value}),
+            );
+        }
+    }
+    let thinking_mode = if enable_thinking == Some(true)
+        || (enable_thinking.is_none() && reasoning_effort.is_some())
+    {
+        ThinkingMode::Thinking
+    } else {
+        ThinkingMode::Chat
+    };
+    let effort = reasoning_effort
+        .map(ReasoningEffort::from_json)
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    let encoded = dsv41_encoding::encode_messages(
+        &messages,
+        &EncodeOptions {
+            thinking_mode,
+            reasoning_effort: effort,
+            ..EncodeOptions::default()
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    let prepared =
+        dsv41_vision::prepare_vl_inputs(&encoded.prompt, &encoded.images, tokenizer, config)
+            .map_err(|error| error.to_string())?;
+    Ok(PromptIngress {
+        token_ids: prepared.token_ids,
+        token_types: prepared.token_types,
+        images: prepared.images,
+        dsv41: true,
+    })
 }
 
 #[derive(Serialize)]
@@ -476,85 +670,132 @@ async fn chat_completions(
     }
 
     // Chat template → prompt ids (uses real special tokens).
-    let prompt_ids = {
-        let mut msgs: Vec<serde_json::Value> = req
-            .messages
-            .iter()
-            .map(|m| {
-                let mut o = serde_json::json!({
-                    "role": m.role,
-                    "content": m.content.as_ref().map(|c| c.text()).unwrap_or_default(),
-                });
-                if let Some(tc) = &m.tool_calls {
-                    // OpenAI sends function.arguments as a STRING of
-                    // JSON; some templates (Nanbeige's XML history
-                    // branch) iterate it as an object. Normalise:
-                    // parseable strings become objects, everything else
-                    // passes through untouched. Qwen-style templates
-                    // tojson the object back to the identical text.
-                    let mut tc = tc.clone();
-                    if let Some(arr) = tc.as_array_mut() {
-                        for call in arr {
-                            if let Some(args) = call
-                                .get_mut("function")
-                                .and_then(|f| f.get_mut("arguments"))
-                            {
-                                if let Some(s) = args.as_str() {
-                                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
-                                        if v.is_object() {
-                                            *args = v;
+    let (prompt_ids, prompt_ingress) = if let Some(source) =
+        state.runtime.model().arch().deepseek_v41.as_ref()
+    {
+        let config = match VisionConfig::from_source(source) {
+            Ok(config) => config,
+            Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
+        };
+        let messages = match request_messages_json(&req.messages, true) {
+            Ok(messages) => messages,
+            Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
+        };
+        let ingress = match encode_dsv41_messages(
+            &messages,
+            req.effective_tools(),
+            req.thinking(),
+            req.reasoning_effort.as_ref(),
+            &state.tokenizer,
+            &config,
+        ) {
+            Ok(ingress) => ingress,
+            Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
+        };
+        (ingress.token_ids.clone(), Some(ingress))
+    } else {
+        let prompt_ids = {
+            let mut msgs: Vec<serde_json::Value> = req
+                .messages
+                .iter()
+                .map(|m| {
+                    let mut o = serde_json::json!({
+                        "role": m.role,
+                        "content": m.content.as_ref().map(|c| c.text()).unwrap_or_default(),
+                    });
+                    if let Some(tc) = &m.tool_calls {
+                        // OpenAI sends function.arguments as a STRING of
+                        // JSON; some templates (Nanbeige's XML history
+                        // branch) iterate it as an object. Normalise:
+                        // parseable strings become objects, everything else
+                        // passes through untouched. Qwen-style templates
+                        // tojson the object back to the identical text.
+                        let mut tc = tc.clone();
+                        if let Some(arr) = tc.as_array_mut() {
+                            for call in arr {
+                                if let Some(args) = call
+                                    .get_mut("function")
+                                    .and_then(|f| f.get_mut("arguments"))
+                                {
+                                    if let Some(s) = args.as_str() {
+                                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(s)
+                                        {
+                                            if v.is_object() {
+                                                *args = v;
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
+                        o["tool_calls"] = tc;
                     }
-                    o["tool_calls"] = tc;
+                    if let Some(id) = &m.tool_call_id {
+                        o["tool_call_id"] = serde_json::json!(id);
+                    }
+                    if let Some(n) = &m.name {
+                        o["name"] = serde_json::json!(n);
+                    }
+                    o
+                })
+                .collect();
+            // Hard thinking suppression: when enable_thinking=false, inject a
+            // system-level directive so even models that ignore the empty
+            //  block still produce direct answers.
+            eprintln!("[serve] thinking={:?}", req.thinking());
+            if req.thinking() == Some(false) {
+                let has_system = msgs.iter().any(|m| m["role"] == "system");
+                let directive = "Answer directly and concisely. Do NOT reason, think step-by-step, or explain your process. Output ONLY the final answer.";
+                if has_system {
+                    // Prepend to existing system message
+                    if let Some(m) = msgs.iter_mut().find(|m| m["role"] == "system") {
+                        let cur = m["content"].as_str().unwrap_or_default();
+                        m["content"] = serde_json::json!(format!("{directive}\n\n{cur}"));
+                    }
+                } else {
+                    msgs.insert(
+                        0,
+                        serde_json::json!({"role": "system", "content": directive}),
+                    );
                 }
-                if let Some(id) = &m.tool_call_id {
-                    o["tool_call_id"] = serde_json::json!(id);
-                }
-                if let Some(n) = &m.name {
-                    o["name"] = serde_json::json!(n);
-                }
-                o
-            })
-            .collect();
-        // Hard thinking suppression: when enable_thinking=false, inject a
-        // system-level directive so even models that ignore the empty
-        //  block still produce direct answers.
-        eprintln!("[serve] thinking={:?}", req.thinking());
-        if req.thinking() == Some(false) {
-            let has_system = msgs.iter().any(|m| m["role"] == "system");
-            let directive = "Answer directly and concisely. Do NOT reason, think step-by-step, or explain your process. Output ONLY the final answer.";
-            if has_system {
-                // Prepend to existing system message
-                if let Some(m) = msgs.iter_mut().find(|m| m["role"] == "system") {
-                    let cur = m["content"].as_str().unwrap_or_default();
-                    m["content"] = serde_json::json!(format!("{directive}\n\n{cur}"));
-                }
-            } else {
-                msgs.insert(
-                    0,
-                    serde_json::json!({"role": "system", "content": directive}),
-                );
             }
-        }
-        eprintln!("[serve] msgs[0]={:?}", msgs.first());
-        state
-            .tokenizer
-            .apply_chat_template_json(&msgs, req.effective_tools(), req.thinking())
+            eprintln!("[serve] msgs[0]={:?}", msgs.first());
+            state
+                .tokenizer
+                .apply_chat_template_json(&msgs, req.effective_tools(), req.thinking())
+        };
+        (prompt_ids, None)
     };
+
+    // Runtime integration consumes this payload for V4.1 image-aware prefill.
+    let vl_inputs = prompt_ingress.map(|ingress| dsv41_vision::PreparedVlInputs {
+        token_ids: ingress.token_ids,
+        token_types: ingress.token_types,
+        images: ingress.images,
+    });
+    let dsv41 = vl_inputs.is_some();
 
     let request_id = format!("cmf-{}", uuid::Uuid::new_v4());
     let created = chrono::Utc::now().timestamp() as u64;
     let max_tokens = req.max_tokens as usize;
+    let dsv41_thinking = dsv41
+        && req.thinking() != Some(false)
+        && (req.thinking() == Some(true) || req.reasoning_effort.is_some());
 
     if let Some(class_tokens) = req
         .cortiq
         .as_ref()
         .and_then(|extension| extension.class_tokens.clone())
     {
+        if vl_inputs
+            .as_ref()
+            .is_some_and(|inputs| !inputs.images.is_empty())
+        {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "cortiq.class_tokens does not support image prompts",
+            );
+        }
         if req.stream {
             return error_response(
                 StatusCode::BAD_REQUEST,
@@ -599,6 +840,10 @@ async fn chat_completions(
                     tool_calls: None,
                     tool_call_id: None,
                     name: None,
+                    reasoning_content: None,
+                    response_format: None,
+                    task: None,
+                    wo_eos: None,
                 },
                 finish_reason: "stop".to_string(),
             }],
@@ -737,6 +982,7 @@ async fn chat_completions(
             let outcome = run_generation(
                 state2.clone(),
                 prompt_ids,
+                vl_inputs,
                 max_tokens,
                 request_mask,
                 sampler_config,
@@ -771,7 +1017,12 @@ async fn chat_completions(
                         .runtime
                         .record_generation(result.tokens_generated, elapsed_ms, elapsed_ms)
                         .await;
-                    let (plain2, mut calls) = extract_tool_calls(&result.text);
+                    let (plain2, mut calls, _) = if dsv41 {
+                        extract_dsv41_result(&result, dsv41_thinking, &state2.tokenizer)
+                    } else {
+                        let (plain, calls) = extract_tool_calls(&result.text);
+                        (plain, calls, None)
+                    };
                     if calls.is_empty() {
                         if let Some(c) = bare_call_fallback(&plain2, &tool_names) {
                             calls = vec![c];
@@ -826,6 +1077,7 @@ async fn chat_completions(
         let (result, elapsed_ms) = match run_generation(
             state.clone(),
             prompt_ids,
+            vl_inputs,
             max_tokens,
             request_mask,
             sampler_config,
@@ -855,13 +1107,16 @@ async fn chat_completions(
             classification: None,
         });
 
-        let content = if req.thinking() == Some(false) {
-            strip_think_block(&result.text)
+        let (mut plain, mut calls, reasoning_content) = if dsv41 {
+            extract_dsv41_result(&result, dsv41_thinking, &state.tokenizer)
+        } else if req.thinking() == Some(false) {
+            let content = strip_think_block(&result.text);
+            let (plain, calls) = extract_tool_calls(&content);
+            (plain, calls, None)
         } else {
-            result.text.clone()
+            let (plain, calls) = extract_tool_calls(&result.text);
+            (plain, calls, None)
         };
-
-        let (mut plain, mut calls) = extract_tool_calls(&content);
         if calls.is_empty() {
             if let Some(names) = req.effective_tools().map(|ts| {
                 ts.iter()
@@ -893,6 +1148,10 @@ async fn chat_completions(
                     tool_calls: made_calls.then_some(serde_json::Value::Array(calls)),
                     tool_call_id: None,
                     name: None,
+                    reasoning_content,
+                    response_format: None,
+                    task: None,
+                    wo_eos: None,
                 },
                 finish_reason: if made_calls {
                     "tool_calls".to_string()
@@ -1025,6 +1284,71 @@ fn extract_tool_calls(text: &str) -> (String, Vec<serde_json::Value>) {
     (plain.trim().to_string(), calls)
 }
 
+/// Parse a DeepSeek-V4.1 harmony completion. The engine normally decodes the
+/// EOS marker, but a tokenizer configured to skip special tokens may omit it;
+/// append one only for this strict parser and preserve raw text when malformed
+/// or truncated.
+fn extract_dsv41_completion(
+    text: &str,
+    thinking: bool,
+) -> (String, Vec<serde_json::Value>, Option<String>) {
+    let mode = if thinking {
+        ThinkingMode::Thinking
+    } else {
+        ThinkingMode::Chat
+    };
+    let mut wire = text.to_string();
+    if !wire.contains(dsv41_encoding::EOS_TOKEN) {
+        wire.push_str(dsv41_encoding::EOS_TOKEN);
+    }
+    let Ok(message) = dsv41_encoding::parse_message_from_completion_text(&wire, mode) else {
+        return (text.to_string(), Vec::new(), None);
+    };
+    let content = message
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let reasoning = message
+        .get("reasoning_content")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let calls = message
+        .get("tool_calls")
+        .and_then(serde_json::Value::as_array)
+        .map(|calls| {
+            calls
+                .iter()
+                .enumerate()
+                .map(|(index, call)| {
+                    let mut call = call.clone();
+                    if call.get("id").is_none() {
+                        call["id"] = serde_json::json!(format!("call_dsv41_{index}"));
+                    }
+                    call
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    (content, calls, reasoning)
+}
+
+fn extract_dsv41_result(
+    result: &GenerateResult,
+    thinking: bool,
+    tokenizer: &cortiq_engine::tokenizer::Tokenizer,
+) -> (String, Vec<serde_json::Value>, Option<String>) {
+    // `GenerateResult::text` uses the normal user-facing decoder, which may
+    // drop special tokens. Reconstruct the harmony wire text from ids so EOS,
+    // thinking markers, and DSML tags reach the strict parser.
+    if !result.token_ids.is_empty() {
+        let wire = tokenizer.decode_for_protocol(&result.token_ids);
+        return extract_dsv41_completion(&wire, thinking);
+    }
+    extract_dsv41_completion(&result.text, thinking)
+}
+
 fn strip_think_block(s: &str) -> String {
     let mut rest = s;
     if let Some(pos) = rest.find("</think>") {
@@ -1078,6 +1402,7 @@ async fn completions(
     let (result, elapsed_ms) = match run_generation(
         state.clone(),
         prompt_ids,
+        None,
         req.max_tokens as usize,
         request_mask,
         sampler_config,

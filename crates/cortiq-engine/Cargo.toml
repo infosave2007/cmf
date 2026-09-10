@@ -13,9 +13,9 @@ categories.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-cortiq-core = { path = "../cortiq-core", version = "0.6.6" }
+cortiq-core = { path = "../cortiq-core", version = "0.6.7" }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["preserve_order"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
@@ -25,6 +25,9 @@ unicode-normalization = { workspace = true }
 minijinja = { workspace = true }
 minijinja-contrib = { workspace = true }
 base64 = { workspace = true }
+# DeepSeek-V4.1 image decode/resize and remote image ingress.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+ureq = { version = "2", features = ["tls"] }
 
 # Cross-platform GPU backend (C1): wgpu -> Vulkan/DX12/Metal (NVIDIA,
 # Radeon, Intel, Apple). Optional: a plain CPU build does not pull it in.

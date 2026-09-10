@@ -107,6 +107,7 @@ fn sparse_ffn_quant_agrees_with_dequant() {
         mtp: None,
         moe: None,
         qwen4_exp: None,
+        deepseek_v41: None,
         linear_core: None,
         head_clusters: None,
         max_position_embeddings: 8,

@@ -467,6 +467,11 @@ pub struct ModelArch {
     /// Qwen3.8-Flash-Next exact text stack (None for all other families).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub qwen4_exp: Option<Qwen4ExpConfig>,
+    /// DeepSeek-V4.1 source configuration, preserved verbatim for the
+    /// multimodal/Engram runtime. The engine reads the nested `text_config`,
+    /// `vision_config`, and `quantization_config` values from this copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deepseek_v41: Option<serde_json::Value>,
     /// Canonical linear core carried by the file (None = no linear layers
     /// or not folded yet)
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -1405,6 +1405,8 @@ fn attn_frame(
         o_groups: cfg.o_groups,
         eps: cfg.norm_eps,
         scale,
+        bf16: false,
+        q_rms: true,
     };
     // The host fold, explicitly. The frame used to read this half's input
     // from the pooled x2 slot — which a device MoE frame of the SAME layer
@@ -1419,6 +1421,7 @@ fn attn_frame(
         g,
         hidden,
         Some(qn),
+        None,
         kv_id,
         li,
         &idx32,
@@ -2409,6 +2412,8 @@ fn dsv4_layer_loop(
                 o_groups: cfg.o_groups,
                 eps: cfg.norm_eps,
                 scale: (hd as f32).powf(-0.5),
+                bf16: false,
+                q_rms: true,
             },
             moe: crate::gpu_wgpu::Dsv4MoeGeom {
                 hidden: dim,
@@ -2419,6 +2424,7 @@ fn dsv4_layer_loop(
                 gu_q2: l.experts.first().is_some_and(|e| {
                     e.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP)
                 }),
+                bf16: false,
             },
             hc: cfg.hc_mult,
             hc_eps: cfg.hc_eps,
@@ -2906,6 +2912,8 @@ fn dsv4_chain1_layer(
             o_groups: cfg.o_groups,
             eps: cfg.norm_eps,
             scale: (hd as f32).powf(-0.5),
+            bf16: false,
+            q_rms: true,
         },
         moe: crate::gpu_wgpu::Dsv4MoeGeom {
             hidden: dim,
@@ -2917,6 +2925,7 @@ fn dsv4_chain1_layer(
                 .experts
                 .first()
                 .is_some_and(|e| e.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP)),
+            bf16: false,
         },
         hc: cfg.hc_mult,
         hc_eps: cfg.hc_eps,
@@ -3396,6 +3405,8 @@ fn dsv4_chain_run(
                 o_groups: cfg.o_groups,
                 eps: cfg.norm_eps,
                 scale: (hd as f32).powf(-0.5),
+                bf16: false,
+                q_rms: true,
             },
             moe: crate::gpu_wgpu::Dsv4MoeGeom {
                 hidden: dim,
@@ -3406,6 +3417,7 @@ fn dsv4_chain_run(
                 gu_q2: l.experts.first().is_some_and(|e| {
                     e.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP)
                 }),
+                bf16: false,
             },
             hc: cfg.hc_mult,
             hc_eps: cfg.hc_eps,
@@ -4802,6 +4814,7 @@ fn moe_frame(
             .experts
             .first()
             .is_some_and(|e| e.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP)),
+        bf16: false,
     };
     let mut cold = Vec::new();
     let mut cold_x = Vec::new();
@@ -6757,6 +6770,8 @@ fn partial_layer_batch(
             o_groups: cfg.o_groups,
             eps: cfg.norm_eps,
             scale: (hd as f32).powf(-0.5),
+            bf16: false,
+            q_rms: true,
         },
         moe: crate::gpu_wgpu::Dsv4MoeGeom {
             hidden: dim,
@@ -6768,6 +6783,7 @@ fn partial_layer_batch(
                 .experts
                 .first()
                 .is_some_and(|e| e.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP)),
+            bf16: false,
         },
         hc,
         hc_eps: cfg.hc_eps,

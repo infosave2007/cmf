@@ -38,6 +38,14 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+Qwen Image transformer GGUFs, including `Qwen-Image-Edit-2509-Q6_K.gguf`,
+use the same command. Import streams all tensors into CMF, retains floating-point
+weights exactly and converts quantized matrices to the requested `--quant`
+(default `q8`, using row and column scales for Qwen Image). The resulting CMF
+contains the transformer and its configuration;
+the source GGUF's separate text encoder and VAE are not bundled, and Qwen Image
+generation is not yet implemented by `cortiq imagine`.
+
 The CLI also exposes `info`, `bench`, `ppl`, `serve`, `skill`, `moe-mask`,
 `moe-defrag`, `requant`, `compact`, `sign`, `imagine`, `animate` and
 `ltx-video`. Run `cortiq <command> --help` for flags and current limitations.

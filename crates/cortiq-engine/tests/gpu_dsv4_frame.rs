@@ -149,6 +149,8 @@ fn the_fused_attention_block_matches_the_cpu() {
         o_groups,
         eps,
         scale,
+        bf16: false,
+        q_rms: true,
     };
     // Stage by stage, then whole. The first stage that moves is the wiring
     // fault; comparing only the output tells you there is one and no more.
@@ -173,7 +175,7 @@ fn the_fused_attention_block_matches_the_cpu() {
         }
         let mut got = vec![0.0f32; nh * hd + dim];
         if !gpu_wgpu::dsv4_attn_frame(
-            &model, &w, g, &hidden, None, 7, 0, &idxs, &inv_freq, pos, None, &mut got,
+            &model, &w, g, &hidden, None, None, 7, 0, &idxs, &inv_freq, pos, None, &mut got,
         ) {
             eprintln!("кадр отклонён устройством — пропуск");
             return;

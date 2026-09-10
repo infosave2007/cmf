@@ -28,7 +28,7 @@ use cortiq_core::types::{
 use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -37,6 +37,265 @@ const GROUP_SIZE: usize = 32;
 /// Smallest normal f16 — floor for degenerate (all-zero) rows so the stored
 /// scale never underflows to a subnormal the reader would read back as 0.
 const F16_TINY: f32 = 6.103_515_6e-5;
+/// Local source-shard consumption is deliberately explicit because it removes
+/// the original safetensors files after their output checkpoint is durable.
+/// The V4.1 pod conversion sets this when the source and output cannot coexist
+/// under the disk budget; ordinary conversions preserve their source files.
+const CONSUME_SOURCE_SHARDS_ENV: &str = "CMF_CONSUME_SOURCE_SHARDS";
+/// Opt-in certificate directory for a local source whose shards are still
+/// being downloaded by another process.  The sibling `source-files.json`
+/// pins every filename, byte length and SHA256 before a marker can authorize
+/// opening that shard.
+const LOCAL_READY_DIR_ENV: &str = "CMF_LOCAL_READY_DIR";
+/// Test/operator override for the ready-marker poll interval.  Production
+/// uses the conservative default so a marker producer is not busy-polled.
+const LOCAL_READY_POLL_MS_ENV: &str = "CMF_LOCAL_READY_POLL_MS";
+const LOCAL_READY_POLL_MS_DEFAULT: u64 = 2_000;
+
+fn consume_source_shards_enabled() -> bool {
+    std::env::var(CONSUME_SOURCE_SHARDS_ENV)
+        .ok()
+        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SourceFileExpectation {
+    size: u64,
+    sha256: String,
+}
+
+fn local_ready_dir_from_env() -> Option<PathBuf> {
+    std::env::var_os(LOCAL_READY_DIR_ENV)
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+}
+
+fn local_ready_poll_ms() -> u64 {
+    std::env::var(LOCAL_READY_POLL_MS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(LOCAL_READY_POLL_MS_DEFAULT)
+}
+
+/// The source manifest lives next to the ready directory (`/root/dsv41` in
+/// the pod layout).  Keeping this derived from the one opt-in environment
+/// variable avoids a second path that could accidentally point at a
+/// different certificate set.
+fn local_ready_manifest_path(ready_dir: &Path) -> PathBuf {
+    ready_dir
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join("source-files.json")
+}
+
+fn ensure_source_filename(name: &str) -> anyhow::Result<()> {
+    let path = Path::new(name);
+    anyhow::ensure!(
+        !name.is_empty()
+            && !name.contains('\\')
+            && path.is_relative()
+            && path.components().count() == 1
+            && matches!(path.components().next(), Some(Component::Normal(_))),
+        "local-ready source filename must be a plain basename, got {name:?}"
+    );
+    Ok(())
+}
+
+fn parse_sha256(value: &str, context: &str) -> anyhow::Result<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    anyhow::ensure!(
+        normalized.len() == 64 && normalized.bytes().all(|b| b.is_ascii_hexdigit()),
+        "{context}: SHA256 must be exactly 64 hexadecimal characters"
+    );
+    Ok(normalized)
+}
+
+/// Read the pinned parent manifest.  The production manifest is a JSON object
+/// keyed by shard basename; each value contains `size` and `sha256`.  The
+/// required set comes from the local model index, so unrelated files in the
+/// manifest do not silently become conversion inputs.
+fn read_source_file_manifest(
+    path: &Path,
+    required_shards: &[String],
+) -> anyhow::Result<HashMap<String, SourceFileExpectation>> {
+    let text = fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("read local-ready source manifest {}: {e}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+        anyhow::anyhow!("parse local-ready source manifest {}: {e}", path.display())
+    })?;
+    let object = value.as_object().ok_or_else(|| {
+        anyhow::anyhow!(
+            "local-ready source manifest {} must be a JSON object keyed by filename",
+            path.display()
+        )
+    })?;
+    let mut expected = HashMap::with_capacity(object.len());
+    for (name, record) in object {
+        ensure_source_filename(name)?;
+        let record = record
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("manifest entry {name:?} is not an object"))?;
+        let size = record
+            .get("size")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("manifest entry {name:?} has no u64 size"))?;
+        let sha256 = record
+            .get("sha256")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("manifest entry {name:?} has no sha256"))
+            .and_then(|v| parse_sha256(v, &format!("manifest entry {name:?}")))?;
+        anyhow::ensure!(
+            expected
+                .insert(name.clone(), SourceFileExpectation { size, sha256 })
+                .is_none(),
+            "duplicate local-ready source manifest entry {name:?}"
+        );
+    }
+    for name in required_shards {
+        ensure_source_filename(name)?;
+        anyhow::ensure!(
+            expected.contains_key(name),
+            "local-ready source manifest {} has no entry for indexed shard {name}",
+            path.display()
+        );
+    }
+    Ok(expected)
+}
+
+fn ready_marker_path(ready_dir: &Path, filename: &str) -> anyhow::Result<PathBuf> {
+    ensure_source_filename(filename)?;
+    Ok(ready_dir.join(format!("{filename}.json")))
+}
+
+fn read_ready_marker(
+    path: &Path,
+    filename: &str,
+    expected: &SourceFileExpectation,
+) -> anyhow::Result<()> {
+    let text = fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("read local-ready marker {}: {e}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| anyhow::anyhow!("parse local-ready marker {}: {e}", path.display()))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("local-ready marker {} is not an object", path.display()))?;
+    let marker_name = object
+        .get("filename")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("local-ready marker {} has no filename", path.display()))?;
+    anyhow::ensure!(
+        marker_name == filename,
+        "local-ready marker {} names {marker_name:?}, expected {filename:?}",
+        path.display()
+    );
+    let marker_size = object
+        .get("size")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("local-ready marker {} has no u64 size", path.display()))?;
+    anyhow::ensure!(
+        marker_size == expected.size,
+        "local-ready marker {} size {} disagrees with pinned size {}",
+        path.display(),
+        marker_size,
+        expected.size
+    );
+    let marker_sha = object
+        .get("sha256")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("local-ready marker {} has no sha256", path.display()))
+        .and_then(|v| parse_sha256(v, &format!("local-ready marker {}", path.display())))?;
+    anyhow::ensure!(
+        marker_sha == expected.sha256,
+        "local-ready marker {} SHA256 disagrees with pinned source manifest",
+        path.display()
+    );
+    Ok(())
+}
+
+/// Hash one ready source shard with a fixed-size buffer.  This is intentionally
+/// done before mmap: a marker is a certificate boundary, while the second
+/// metadata check catches a producer that changed a file after certification.
+fn sha256_file(path: &Path) -> anyhow::Result<(u64, String)> {
+    use sha2::{Digest, Sha256};
+    let mut file = fs::File::open(path)
+        .map_err(|e| anyhow::anyhow!("open local-ready source {}: {e}", path.display()))?;
+    let before = file.metadata()?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 8 * 1024 * 1024];
+    let mut size = 0u64;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        size = size.checked_add(n as u64).ok_or_else(|| {
+            anyhow::anyhow!("local-ready source {} size overflow", path.display())
+        })?;
+    }
+    let after = file.metadata()?;
+    anyhow::ensure!(
+        before.len() == after.len() && before.modified().ok() == after.modified().ok(),
+        "local-ready source {} changed while it was being certified",
+        path.display()
+    );
+    Ok((size, format!("{:x}", hasher.finalize())))
+}
+
+/// Validate a marker and its source bytes.  Callers only pass the returned
+/// path to `open_safetensors` after this function succeeds, so incomplete
+/// `.aria2`/partial files can never enter the mmap path.
+fn validate_local_ready_source(
+    ready_dir: &Path,
+    source_dir: &Path,
+    filename: &str,
+    expected: &SourceFileExpectation,
+) -> anyhow::Result<PathBuf> {
+    let marker = ready_marker_path(ready_dir, filename)?;
+    read_ready_marker(&marker, filename, expected)?;
+    let source = source_dir.join(filename);
+    anyhow::ensure!(
+        !PathBuf::from(format!("{}.aria2", source.display())).exists(),
+        "local-ready source {} still has an aria2 partial marker",
+        source.display()
+    );
+    let metadata = fs::metadata(&source).map_err(|e| {
+        anyhow::anyhow!(
+            "local-ready marker exists for missing source {}: {e}",
+            source.display()
+        )
+    })?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.len() == expected.size,
+        "local-ready source {} has {} bytes, expected {}",
+        source.display(),
+        metadata.len(),
+        expected.size
+    );
+    let (actual_size, actual_sha) = sha256_file(&source)?;
+    anyhow::ensure!(
+        actual_size == expected.size && actual_sha == expected.sha256,
+        "local-ready source {} failed pinned SHA256/size validation",
+        source.display()
+    );
+    Ok(source)
+}
+
+fn wait_for_local_ready_source(
+    ready_dir: &Path,
+    source_dir: &Path,
+    filename: &str,
+    expected: &SourceFileExpectation,
+) -> anyhow::Result<PathBuf> {
+    let marker = ready_marker_path(ready_dir, filename)?;
+    loop {
+        if marker.exists() {
+            return validate_local_ready_source(ready_dir, source_dir, filename, expected);
+        }
+        std::thread::sleep(Duration::from_millis(local_ready_poll_ms()));
+    }
+}
 
 /// Round a scale to f16 precision (the reader stores/uses it as f16), so the
 /// quantized values are computed against the *same* scale the reader dequantizes
@@ -287,6 +546,9 @@ pub(crate) fn canon_name(raw: &str) -> Option<String> {
                     // the loader reads as `mlp.expert_bias`.
                     "ffn.gate.weight" => "mlp.gate.weight".to_string(),
                     "ffn.gate.bias" => "mlp.expert_bias".to_string(),
+                    // V4.1's vision-language router carries a second bias
+                    // plane consumed explicitly by the multimodal runtime.
+                    "ffn.gate.bias_vl" => "mlp.expert_bias_vl".to_string(),
                     // Hash-routed layers carry a token-id → expert table
                     // instead of a learned gate.
                     "ffn.gate.tid2eid" => "mlp.tid2eid".to_string(),
@@ -410,6 +672,20 @@ fn lfm2_canon(name: &str) -> String {
 /// DeepSeek-V4's table holds expert ids per vocabulary id (129 280 rows).
 fn force_f32(name: &str) -> bool {
     name.ends_with(".tid2eid")
+        || name.ends_with(".mlp.expert_bias")
+        || name.ends_with(".mlp.expert_bias_vl")
+        || name.ends_with(".ffn.gate.bias")
+        || name.ends_with(".ffn.gate.bias_vl")
+}
+
+/// DeepSeek-V4.1 vision and aligner matrices are small and sensitive to
+/// quantization. Keep them exact in a q4tp/q2tp profile without affecting
+/// unrelated model families that use generic `vision.` prefixes.
+fn force_dsv41_vision_f16(arch: &ModelArch, name: &str, shape: &[usize]) -> bool {
+    arch.deepseek_v41.is_some()
+        && shape.len() == 2
+        && name.ends_with(".weight")
+        && (name.starts_with("vision.") || name.starts_with("aligner."))
 }
 
 fn force_f16(name: &str) -> bool {
@@ -435,6 +711,8 @@ fn force_f16(name: &str) -> bool {
         || name.ends_with("mlp.gate.weight")
         || name.ends_with("shared_expert_gate.weight")
         || name.ends_with("self_attn.g_proj.weight")
+        || name.ends_with(".engram.q_weight")
+        || name.ends_with(".engram.k_weight")
         // Qwen3.8 hyper-connection projections sit directly on sigmoid
         // residual gates.  They are tiny relative to the experts and are
         // deliberately kept at f16 in a q4tp file.
@@ -1453,6 +1731,32 @@ pub(crate) fn encode_f16(vals: &[f32]) -> Vec<u8> {
 /// then drop it. Called after each source shard, so peak residency is one
 /// shard's tensors rather than the model's — and because the writer streams
 /// into the final file, peak DISK is the finished model rather than twice it.
+const RAW_AUX_COPY_CHUNK: usize = 8 * 1024 * 1024;
+
+/// Copy a native auxiliary tensor without decoding it or putting it through a
+/// quantizer. DeepSeek-V4.1's Engram embedding planes remain U8 records with
+/// their original 2-D shape and are interpreted by the V4.1 runtime.
+fn push_raw_u8_tensor(
+    writer: &mut cortiq_core::format::CmfStreamWriter,
+    name: &str,
+    shape: &[usize],
+    data: &[u8],
+) -> anyhow::Result<()> {
+    let expected = shape.iter().try_fold(1usize, |n, &d| n.checked_mul(d));
+    let expected =
+        expected.ok_or_else(|| anyhow::anyhow!("raw tensor '{name}': shape overflow"))?;
+    anyhow::ensure!(
+        expected == data.len(),
+        "raw tensor '{name}': {} bytes for shape {:?} (expected {})",
+        data.len(),
+        shape,
+        expected
+    );
+    writer
+        .push_bounded(name, TensorDtype::U8, shape, data, RAW_AUX_COPY_CHUNK)
+        .map_err(|e| anyhow::anyhow!("write raw tensor '{name}': {e}"))
+}
+
 fn drain_to_writer(
     tensors: &mut Vec<TensorSpec>,
     writer: &mut cortiq_core::format::CmfStreamWriter,
@@ -1581,9 +1885,67 @@ pub(crate) fn unpack_fp8_blocks(
             // E8M0: 2^(k−127); 255 is NaN per OCP — refuse loudly rather
             // than fold a NaN through the whole row.
             anyhow::ensure!(k != 255, "fp8 blocks: NaN scale at ({r},{c})");
-            out[r * cols + c] = fp8_e4m3_to_f32(packed[r * cols + c]) * (k as f32 - 127.0).exp2();
+            let v = fp8_e4m3_to_f32(packed[r * cols + c]);
+            anyhow::ensure!(v.is_finite(), "fp8 blocks: NaN weight at ({r},{c})");
+            out[r * cols + c] = v * (k as f32 - 127.0).exp2();
         }
     }
+    Ok(out)
+}
+
+/// Fine-grained FP8 with one ordinary f32 inverse scale per source block.
+/// V4.1's `weight_block_size` controls the block geometry; older checkpoints
+/// use 128 while the V4.1 source uses 32.
+fn unpack_fp8_scale_inv(
+    packed: &[u8],
+    scales: &[f32],
+    rows: usize,
+    cols: usize,
+    block: usize,
+) -> anyhow::Result<Vec<f32>> {
+    anyhow::ensure!(block > 0, "fp8 scale_inv: block size 0");
+    anyhow::ensure!(
+        packed.len() == rows * cols,
+        "fp8 scale_inv: weight size mismatch"
+    );
+    let (sr, sc) = (rows.div_ceil(block), cols.div_ceil(block));
+    anyhow::ensure!(
+        scales.len() == sr * sc,
+        "fp8 scale_inv: {} scales, expected {sr}x{sc}",
+        scales.len()
+    );
+    let mut out = vec![0.0f32; rows * cols];
+    let threads = encode_threads().min(rows.max(1)).max(1);
+    let rows_per_thread = rows.div_ceil(threads);
+    std::thread::scope(|scope| -> anyhow::Result<()> {
+        let mut workers = Vec::with_capacity(threads);
+        for (chunk_index, out_chunk) in out.chunks_mut(rows_per_thread * cols).enumerate() {
+            let first_row = chunk_index * rows_per_thread;
+            workers.push(scope.spawn(move || -> anyhow::Result<()> {
+                for (local_row, out_row) in out_chunk.chunks_mut(cols).enumerate() {
+                    let r = first_row + local_row;
+                    let packed_row = &packed[r * cols..(r + 1) * cols];
+                    for (c, (&byte, dst)) in packed_row.iter().zip(out_row).enumerate() {
+                        let v = fp8_e4m3_to_f32(byte);
+                        anyhow::ensure!(v.is_finite(), "fp8 scale_inv: NaN weight at ({r},{c})");
+                        let scale = scales[(r / block) * sc + c / block];
+                        anyhow::ensure!(
+                            scale.is_finite(),
+                            "fp8 scale_inv: non-finite scale at ({r},{c})"
+                        );
+                        *dst = v * scale;
+                    }
+                }
+                Ok(())
+            }));
+        }
+        for worker in workers {
+            worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("fp8 scale_inv worker panicked"))??;
+        }
+        Ok(())
+    })?;
     Ok(out)
 }
 
@@ -1711,7 +2073,7 @@ pub(crate) struct TensorMeta {
 /// A memory-mapped safetensors file — tensor bytes are borrowed from the mmap, so
 /// the raw weights are never fully loaded into RAM (peak stays ~one tensor).
 pub(crate) struct SafeTensors {
-    mmap: memmap2::Mmap,
+    mmap: Option<memmap2::Mmap>,
     data_start: usize,
     pub(crate) tensors: Vec<TensorMeta>,
     /// File name, so a resumed conversion can tell which of these are done.
@@ -1720,8 +2082,47 @@ pub(crate) struct SafeTensors {
 
 impl SafeTensors {
     pub(crate) fn bytes(&self, m: &TensorMeta) -> &[u8] {
-        &self.mmap[self.data_start + m.start..self.data_start + m.end]
+        let mmap = self
+            .mmap
+            .as_ref()
+            .expect("safetensors mmap accessed after source shard release");
+        &mmap[self.data_start + m.start..self.data_start + m.end]
     }
+
+    /// Release the file mapping after this source shard's converted payloads
+    /// and manifest checkpoint are durable. Metadata stays resident so the
+    /// caller can retain the index for companion/name lookups.
+    pub(crate) fn release(&mut self) {
+        self.mmap.take();
+    }
+}
+
+/// Release and unlink one local source shard after its converted payloads and
+/// manifest checkpoint are durable. The metadata remains available for any
+/// companion/name lookups made by the caller before the next shard.
+fn consume_source_shard(files: &mut [SafeTensors], index: usize, dir: &Path) -> anyhow::Result<()> {
+    let source_name = files
+        .get(index)
+        .map(|f| f.name.clone())
+        .ok_or_else(|| anyhow::anyhow!("source shard index {index} out of range"))?;
+    files[index].release();
+    let source_path = dir.join(&source_name);
+    match fs::remove_file(&source_path) {
+        Ok(()) => eprintln!("  consumed source shard {source_name}"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("  source shard {source_name} already absent")
+        }
+        Err(e) => anyhow::bail!(
+            "remove consumed source shard {}: {e}",
+            source_path.display()
+        ),
+    }
+    Ok(())
+}
+
+fn consume_local_ready_source(path: &Path) -> anyhow::Result<()> {
+    fs::remove_file(path)
+        .map_err(|e| anyhow::anyhow!("remove consumed local-ready source {}: {e}", path.display()))
 }
 
 fn open_safetensors(path: &Path) -> anyhow::Result<SafeTensors> {
@@ -1760,7 +2161,7 @@ fn open_safetensors(path: &Path) -> anyhow::Result<SafeTensors> {
         });
     }
     Ok(SafeTensors {
-        mmap,
+        mmap: Some(mmap),
         data_start,
         tensors,
         name: path
@@ -1772,8 +2173,80 @@ fn open_safetensors(path: &Path) -> anyhow::Result<SafeTensors> {
 
 /// Memory-map a model dir's weights (single file or sharded index).
 pub(crate) fn open_model(dir: &Path) -> anyhow::Result<Vec<SafeTensors>> {
+    open_model_filtered(dir, &std::collections::HashSet::new())
+}
+
+/// Return the source shard basename used in manifests and `SafeTensors.name`.
+fn source_shard_name(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string())
+}
+
+/// Count tensors from safetensors headers/index without mapping payloads.
+/// Resume uses this before opening source files so shards deleted after a
+/// durable checkpoint still contribute to progress and head sizing.
+fn source_shard_counts(dir: &Path) -> anyhow::Result<Vec<(String, usize)>> {
     let single = dir.join("model.safetensors");
     if single.exists() {
+        return Ok(vec![(
+            "model.safetensors".to_string(),
+            safetensors_tensor_count(&single)?,
+        )]);
+    }
+    let index = dir.join("model.safetensors.index.json");
+    if index.exists() {
+        let idx: serde_json::Value = serde_json::from_slice(&fs::read(&index)?)?;
+        let map = idx["weight_map"]
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("bad index json"))?;
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for file in map.values().filter_map(|v| v.as_str()) {
+            *counts.entry(source_shard_name(file)).or_default() += 1;
+        }
+        let mut shards: Vec<(String, usize)> = counts.into_iter().collect();
+        shards.sort_by(|a, b| a.0.cmp(&b.0));
+        return Ok(shards);
+    }
+    anyhow::bail!(
+        "no model.safetensors or model.safetensors.index.json in {}",
+        dir.display()
+    )
+}
+
+fn safetensors_tensor_count(path: &Path) -> anyhow::Result<usize> {
+    let mut file =
+        fs::File::open(path).map_err(|e| anyhow::anyhow!("open {}: {e}", path.display()))?;
+    let mut len_bytes = [0u8; 8];
+    file.read_exact(&mut len_bytes)?;
+    let header_len = u64::from_le_bytes(len_bytes) as usize;
+    let mut header_bytes = vec![0u8; header_len];
+    file.read_exact(&mut header_bytes)?;
+    let header: serde_json::Value = serde_json::from_slice(&header_bytes)
+        .map_err(|e| anyhow::anyhow!("{}: bad safetensors header: {e}", path.display()))?;
+    Ok(header
+        .as_object()
+        .map(|o| {
+            o.keys()
+                .filter(|name| name.as_str() != "__metadata__")
+                .count()
+        })
+        .unwrap_or(0))
+}
+
+/// Open only source shards absent from the supplied completed-mark set. A
+/// missing shard is acceptable on resume only when it is proven complete by
+/// the output manifest; an unmarked missing shard remains a hard error.
+pub(crate) fn open_model_filtered(
+    dir: &Path,
+    completed_shards: &std::collections::HashSet<String>,
+) -> anyhow::Result<Vec<SafeTensors>> {
+    let single = dir.join("model.safetensors");
+    if single.exists() {
+        if completed_shards.contains("model.safetensors") {
+            return Ok(Vec::new());
+        }
         return Ok(vec![open_safetensors(&single)?]);
     }
     let index = dir.join("model.safetensors.index.json");
@@ -1790,6 +2263,7 @@ pub(crate) fn open_model(dir: &Path) -> anyhow::Result<Vec<SafeTensors>> {
         files.dedup();
         return files
             .iter()
+            .filter(|f| !completed_shards.contains(&source_shard_name(f)))
             .map(|f| open_safetensors(&dir.join(f)))
             .collect();
     }
@@ -1799,8 +2273,47 @@ pub(crate) fn open_model(dir: &Path) -> anyhow::Result<Vec<SafeTensors>> {
     )
 }
 
+/// Read only completed source-shard marks from a manifest. A malformed line
+/// ends the durable prefix, so later marks are not trusted for filtering.
+fn resume_manifest_marks(path: &Path) -> std::collections::HashSet<String> {
+    let Ok(text) = fs::read_to_string(path) else {
+        return std::collections::HashSet::new();
+    };
+    let mut marks = std::collections::HashSet::new();
+    for line in text.lines().skip(1) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            break;
+        };
+        if let Some(mark) = value["mark"].as_str() {
+            marks.insert(mark.to_string());
+        }
+    }
+    marks
+}
+
 fn cfg_usize(c: &serde_json::Value, key: &str) -> Option<usize> {
     c.get(key).and_then(|v| v.as_u64()).map(|x| x as usize)
+}
+
+/// Source FP8 tile width for DeepSeek-family checkpoints. V4.1 stores its
+/// E4M3 weight and E8M0 scale plane over 32x32 tiles; older V4 files use 128.
+fn source_fp8_block(config: &serde_json::Value) -> usize {
+    if config.get("model_type").and_then(|v| v.as_str()) != Some("deepseek_v41") {
+        return 128;
+    }
+    config
+        .get("quantization_config")
+        .and_then(|q| q.get("weight_block_size"))
+        .and_then(|v| v.as_array())
+        .and_then(|a| {
+            let row = a.first()?.as_u64()? as usize;
+            let col = a.get(1)?.as_u64()? as usize;
+            (row > 0 && row == col).then_some(row)
+        })
+        .unwrap_or(32)
 }
 
 /// Build ModelArch from a HF config.json (dense transformer families).
@@ -1813,6 +2326,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         .unwrap_or("unknown")
         .to_string();
     let is_dsv4 = model_type == "deepseek_v4";
+    let is_dsv41 = model_type == "deepseek_v41";
     // DeepSeek-V4: the name mapping and both source quantizations (FP8
     // E4M3 with 128x128 block scales, MXFP4 experts) are in place, but
     // five of its blocks have no runtime yet — and without them the file
@@ -2365,7 +2879,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         // and its config states that directly rather than as a fraction.
         // Carrying it here is what lets a retuned checkpoint load without
         // the loader guessing.
-        partial_rotary_factor: if is_dsv4 {
+        partial_rotary_factor: if is_dsv4 || is_dsv41 {
             match (cfg_usize(tc, "qk_rope_head_dim"), cfg_usize(tc, "head_dim")) {
                 (Some(rd), Some(hd)) if hd > 0 => rd as f32 / hd as f32,
                 _ => prf,
@@ -2423,6 +2937,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
             split_ngram_parts: cfg_usize(tc, "split_ngram_parts").unwrap_or(128),
             seed: cfg_usize(tc, "seed").unwrap_or(1234) as u64,
         }),
+        deepseek_v41: is_dsv41.then(|| config.clone()),
         linear_core,
         head_clusters: None,
         max_position_embeddings: max_pos,
@@ -3207,9 +3722,14 @@ pub fn run_convert(
     let downloaded;
     let mut stream_shards: Vec<String> = Vec::new();
     let mut stream_repo: Option<String> = None;
+    let local_ready_dir = local_ready_dir_from_env();
     let dir: &Path = if Path::new(model).join("config.json").exists() {
         Path::new(model)
     } else if looks_like_repo(model) {
+        anyhow::ensure!(
+            local_ready_dir.is_none(),
+            "{LOCAL_READY_DIR_ENV} requires a local model directory; unset it for HF hub streaming"
+        );
         eprintln!("downloading {model} from Hugging Face (streamed)…");
         let (d, shards) = hf_download_opts(model, hf_token, false)?;
         stream_shards = shards;
@@ -3226,16 +3746,67 @@ pub fn run_convert(
         &fs::read(dir.join("config.json")).map_err(|e| anyhow::anyhow!("read config.json: {e}"))?,
     )?;
     let mut arch = build_arch(&config)?;
+    let source_fp8_block = source_fp8_block(&config);
+    let consume_source_shards =
+        stream_repo.is_none() && arch.deepseek_v41.is_some() && consume_source_shards_enabled();
+    if consume_source_shards {
+        eprintln!(
+            "  source consumption enabled via {CONSUME_SOURCE_SHARDS_ENV}: each local shard is deleted after its output checkpoint"
+        );
+    }
+
+    let manifest_path = format!("{output}.manifest");
+    let resuming = resume
+        && std::path::Path::new(&manifest_path).exists()
+        && std::path::Path::new(output).exists();
+    let mut done_shards: std::collections::HashSet<String> = if resuming {
+        resume_manifest_marks(std::path::Path::new(&manifest_path))
+    } else {
+        std::collections::HashSet::new()
+    };
+    let source_shards = if stream_repo.is_none() {
+        source_shard_counts(dir)?
+    } else {
+        Vec::new()
+    };
+    if local_ready_dir.is_some() {
+        anyhow::ensure!(
+            stream_repo.is_none(),
+            "{LOCAL_READY_DIR_ENV} cannot be combined with HF hub streaming"
+        );
+        anyhow::ensure!(
+            !source_shards.is_empty(),
+            "{LOCAL_READY_DIR_ENV} requires at least one local source shard"
+        );
+        stream_shards = source_shards.iter().map(|(name, _)| name.clone()).collect();
+    }
+    let local_ready_manifest = if let Some(ready_dir) = local_ready_dir.as_deref() {
+        let required: Vec<String> = source_shards.iter().map(|(name, _)| name.clone()).collect();
+        let manifest_path = local_ready_manifest_path(ready_dir);
+        Some(read_source_file_manifest(&manifest_path, &required)?)
+    } else {
+        None
+    };
+    let completed_source_shards: std::collections::HashSet<String> = if resuming {
+        source_shards
+            .iter()
+            .filter(|(name, _)| done_shards.contains(name))
+            .map(|(name, _)| name.clone())
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
 
     // Memory-map the weights and process one tensor at a time — the raw model is
     // never fully loaded into RAM (peak ≈ the .cmf output + one tensor).
-    let files = if stream_repo.is_some() {
+    let streamed_source = stream_repo.is_some() || local_ready_dir.is_some();
+    let mut files = if streamed_source {
         Vec::new() // shards arrive one at a time below
     } else {
-        open_model(dir)?
+        open_model_filtered(dir, &completed_source_shards)?
     };
-    if stream_repo.is_some() && defrag.is_some() {
-        anyhow::bail!("--defrag needs a local checkpoint dir (streaming hub convert)");
+    if streamed_source && defrag.is_some() {
+        anyhow::bail!("--defrag needs a resident local checkpoint dir (streamed convert)");
     }
 
     // Physical defragmentation plan (spec §11): drop pruned FFN neurons so
@@ -3253,7 +3824,15 @@ pub fn run_convert(
             .unwrap_or(orig_inter);
         arch.intermediate_size = max_kept;
     }
-    let total: usize = files.iter().map(|f| f.tensors.len()).sum::<usize>().max(1);
+    let total: usize = if stream_repo.is_some() {
+        1
+    } else {
+        source_shards
+            .iter()
+            .map(|(_, count)| *count)
+            .sum::<usize>()
+            .max(1)
+    };
     // A 300B-class MoE encodes to ~100 GB, and holding that in
     // `Vec<TensorSpec>` until the writer runs OOMs any machine (measured:
     // +1.8 GB/min, a 176 GB box exhausted mid-model). Each encoded tensor
@@ -3272,11 +3851,6 @@ pub fn run_convert(
         2usize.saturating_mul(directory_records),
         96,
     );
-    let manifest_path = format!("{output}.manifest");
-    let mut done_shards: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let resuming = resume
-        && std::path::Path::new(&manifest_path).exists()
-        && std::path::Path::new(output).exists();
     let mut writer = if resuming {
         let (w, st) = cortiq_core::format::CmfStreamWriter::resume(output, &manifest_path)
             .map_err(|e| anyhow::anyhow!("resume {output}: {e}"))?;
@@ -3294,7 +3868,15 @@ pub fn run_convert(
             .map_err(|e| anyhow::anyhow!("create {output}: {e}"))?
     };
     let mut tensors: Vec<TensorSpec> = Vec::with_capacity(total);
-    let mut done = 0usize;
+    let mut done = if stream_repo.is_none() {
+        source_shards
+            .iter()
+            .filter(|(name, _)| done_shards.contains(name))
+            .map(|(_, count)| *count)
+            .sum()
+    } else {
+        0
+    };
     // Tiny cross-shard tensors (gemma-4 router.scale, ~128 f32 each):
     // stashed as shards stream by, so a projection in shard 2 can fold
     // a scale that lived in the already-deleted shard 1.
@@ -3326,6 +3908,7 @@ pub fn run_convert(
 
     let mut process_file = |file: &SafeTensors,
                             files: &[SafeTensors],
+                            writer: &mut cortiq_core::format::CmfStreamWriter,
                             tensors: &mut Vec<TensorSpec>,
                             done: &mut usize,
                             total: usize,
@@ -3373,6 +3956,85 @@ pub fn run_convert(
                 }
             };
 
+            // DeepSeek-V4.1 Engram tables are native FP8 byte planes. Keep
+            // both planes lossless as explicit U8 auxiliary tensors before
+            // generic scale skipping or FP8 decode can consume them. Their
+            // companion shape and dtype are checked against the source shard
+            // index before bytes reach the output.
+            let raw_engram =
+                m.name.ends_with(".engram.embed.weight") || m.name.ends_with(".engram.embed.scale");
+            if arch.deepseek_v41.is_some() && raw_engram {
+                let is_weight = m.name.ends_with(".engram.embed.weight");
+                anyhow::ensure!(m.shape.len() == 2, "{name}: Engram table must be 2-D");
+                anyhow::ensure!(
+                    m.shape.iter().all(|&d| d > 0),
+                    "{name}: Engram table has an empty dimension"
+                );
+                let expected_dtype = if is_weight { "F8_E4M3" } else { "F8_E8M0" };
+                anyhow::ensure!(
+                    m.dtype == expected_dtype,
+                    "{name}: Engram {} has dtype {}, expected {expected_dtype}",
+                    if is_weight { "weight" } else { "scale" },
+                    m.dtype
+                );
+                if is_weight {
+                    anyhow::ensure!(
+                        m.shape[1] % 32 == 0,
+                        "{name}: Engram weight columns {} are not divisible by 32",
+                        m.shape[1]
+                    );
+                }
+                let stem = if is_weight {
+                    m.name
+                        .strip_suffix(".weight")
+                        .expect("Engram weight suffix checked")
+                } else {
+                    m.name
+                        .strip_suffix(".scale")
+                        .expect("Engram scale suffix checked")
+                };
+                let companion_name = if is_weight {
+                    format!("{stem}.scale")
+                } else {
+                    format!("{stem}.weight")
+                };
+                let companion = files.iter().find_map(|source| {
+                    source
+                        .tensors
+                        .iter()
+                        .find(|t| t.name == companion_name)
+                        .map(|t| (t.dtype.clone(), t.shape.clone()))
+                });
+                let (comp_dtype, comp_shape) = companion.ok_or_else(|| {
+                    anyhow::anyhow!("{name}: missing Engram companion '{companion_name}'")
+                })?;
+                if is_weight {
+                    let expected_scale_cols = m.shape[1].div_ceil(32);
+                    anyhow::ensure!(
+                        comp_dtype == "F8_E8M0"
+                            && comp_shape == vec![m.shape[0], expected_scale_cols],
+                        "{name}: Engram scale companion has dtype {comp_dtype} shape {:?}, expected F8_E8M0 [{}, {}]",
+                        comp_shape,
+                        m.shape[0],
+                        expected_scale_cols
+                    );
+                } else {
+                    let expected_weight_cols = m.shape[1]
+                        .checked_mul(32)
+                        .ok_or_else(|| anyhow::anyhow!("{name}: Engram shape overflow"))?;
+                    anyhow::ensure!(
+                        comp_dtype == "F8_E4M3"
+                            && comp_shape == vec![m.shape[0], expected_weight_cols],
+                        "{name}: Engram weight companion has dtype {comp_dtype} shape {:?}, expected F8_E4M3 [{}, {}]",
+                        comp_shape,
+                        m.shape[0],
+                        expected_weight_cols
+                    );
+                }
+                push_raw_u8_tensor(writer, &name, &m.shape, file.bytes(m))?;
+                continue;
+            }
+
             // Skip MLX scales and biases as they are processed with the weight.
             if m.dtype == "F16" && (name.ends_with(".scales") || name.ends_with(".biases")) {
                 continue;
@@ -3386,6 +4048,35 @@ pub fn run_convert(
             if m.dtype == "F8_E8M0" && name.ends_with(".scale") {
                 continue;
             }
+            // Fine-grained FP8 inverse scale planes ride with `.weight` below.
+            if name.ends_with(".weight_scale_inv") {
+                continue;
+            }
+            let fp8_scale_inv = if m.dtype == "F8_E4M3" && m.shape.len() == 2 {
+                let scale_name = m.name.replace(".weight", ".weight_scale_inv");
+                let mut scale = None;
+                for source in files {
+                    if let Some(sm) = source.tensors.iter().find(|t| t.name == scale_name) {
+                        scale = Some(to_f32(&sm.dtype, source.bytes(sm))?);
+                        break;
+                    }
+                }
+                match scale {
+                    Some(scales) => Some((
+                        m.shape.clone(),
+                        unpack_fp8_scale_inv(
+                            file.bytes(m),
+                            &scales,
+                            m.shape[0],
+                            m.shape[1],
+                            source_fp8_block,
+                        )?,
+                    )),
+                    None => None,
+                }
+            } else {
+                None
+            };
             // Its own two quantizations, decoded to f32 so the rest of the
             // pipeline (defrag, requant to q4tp/q2tp) is layout-agnostic:
             //   * experts  — I8 holding two FP4 (E2M1) values per byte with
@@ -3412,7 +4103,13 @@ pub fn run_convert(
                         } else {
                             Some((
                                 vec![rows, cols],
-                                unpack_fp8_blocks(file.bytes(m), scales, rows, cols, 128)?,
+                                unpack_fp8_blocks(
+                                    file.bytes(m),
+                                    scales,
+                                    rows,
+                                    cols,
+                                    source_fp8_block,
+                                )?,
                             ))
                         }
                     }
@@ -3450,7 +4147,7 @@ pub fn run_convert(
             } else {
                 name
             };
-            let mxfp4 = mxfp4.or(dsv4);
+            let mxfp4 = fp8_scale_inv.or(mxfp4).or(dsv4);
             let (m_shape, m_vals) = if let Some(v) = mxfp4 {
                 v
             } else if m.dtype == "U32" && m.name.ends_with(".weight") {
@@ -3945,7 +4642,10 @@ pub fn run_convert(
                 });
                 continue;
             }
-            let two_d = m_shape.len() == 2 && numel >= GROUP_SIZE && !force_f16(&name);
+            let two_d = m_shape.len() == 2
+                && numel >= GROUP_SIZE
+                && !force_f16(&name)
+                && !force_dsv41_vision_f16(&arch, &name, &m_shape);
             // The q2tp profile covers the gate/up planes of EVERY expert.
             // Checkpoints that pack their experts into one 3-D tensor are
             // handled above; the ones that ship a tensor per expert (DeepSeek
@@ -3982,8 +4682,10 @@ pub fn run_convert(
 
         Ok(())
     };
-    if let Some(repo) = stream_repo.clone() {
-        let base = format!("https://huggingface.co/{repo}/resolve/main");
+    if streamed_source {
+        let base = stream_repo
+            .as_deref()
+            .map(|repo| format!("https://huggingface.co/{repo}/resolve/main"));
         let threads = hf_threads();
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(20))
@@ -4001,20 +4703,44 @@ pub fn run_convert(
                 continue;
             }
             eprintln!("  [stream {}/{}] {sname}", si + 1, ns);
-            fetch(
-                &agent,
-                &format!("{base}/{sname}"),
-                &dir.join(sname),
-                hf_token,
-                true,
-                threads,
-            )?;
-            let f = open_safetensors(&dir.join(sname))?;
+            let source_path = if let Some(base) = base.as_deref() {
+                fetch(
+                    &agent,
+                    &format!("{base}/{sname}"),
+                    &dir.join(sname),
+                    hf_token,
+                    true,
+                    threads,
+                )?;
+                dir.join(sname)
+            } else {
+                let ready_dir = local_ready_dir.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("streamed source has neither an HF repo nor a ready directory")
+                })?;
+                let expected = local_ready_manifest
+                    .as_ref()
+                    .and_then(|m| m.get(sname))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "local-ready source manifest has no expectation for shard {sname}"
+                        )
+                    })?;
+                wait_for_local_ready_source(ready_dir, dir, sname, expected)?
+            };
+            let f = open_safetensors(&source_path)?;
             let one = [f];
             let ft = one[0].tensors.len().max(1);
             let mut fd = 0usize;
             let mut sub = |p: f32| progress((si as f32 + p) / ns as f32);
-            process_file(&one[0], &one, &mut tensors, &mut fd, ft, &mut sub)?;
+            process_file(
+                &one[0],
+                &one,
+                &mut writer,
+                &mut tensors,
+                &mut fd,
+                ft,
+                &mut sub,
+            )?;
             // Spill this shard's payloads before touching the next one:
             // that is what keeps residency at one shard instead of the
             // whole model.
@@ -4024,24 +4750,42 @@ pub fn run_convert(
                 .mark(sname)
                 .map_err(|e| anyhow::anyhow!("manifest: {e}"))?;
             drop(one);
-            let _ = fs::remove_file(dir.join(sname));
+            if stream_repo.is_some() {
+                // Preserve hub-stream cleanup: cache files are disposable.
+                let _ = fs::remove_file(&source_path);
+            } else if consume_source_shards {
+                // The local-ready path is the bounded-disk contract: an
+                // unlink failure must stop conversion instead of retaining a
+                // full shard after its output checkpoint.
+                consume_local_ready_source(&source_path)?;
+            }
         }
     } else {
-        for file in &files {
-            if done_shards.contains(&file.name) {
-                eprintln!("  [{}] уже в файле, пропуск", file.name);
-                done += file.tensors.len();
-                progress(done as f32 / total as f32);
+        for file_index in 0..files.len() {
+            let file_name = files[file_index].name.clone();
+            if done_shards.contains(&file_name) {
+                eprintln!("  [{file_name}] уже в файле, пропуск");
                 continue;
             }
-            process_file(file, &files, &mut tensors, &mut done, total, &mut progress)?;
+            process_file(
+                &files[file_index],
+                &files,
+                &mut writer,
+                &mut tensors,
+                &mut done,
+                total,
+                &mut progress,
+            )?;
             // Marking per source file gives a local conversion the same
             // resumability as a streamed one; the payloads have to reach the
             // output first, so the drain comes before the mark.
             drain_to_writer(&mut tensors, &mut writer)?;
             writer
-                .mark(&file.name)
+                .mark(&file_name)
                 .map_err(|e| anyhow::anyhow!("manifest: {e}"))?;
+            if consume_source_shards {
+                consume_source_shard(&mut files, file_index, dir)?;
+            }
         }
     }
 

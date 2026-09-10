@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.7] - 2026-09-11
+
+### Added
+- Streaming GGUF-to-CMF import for Qwen Image transformer checkpoints, including
+  Qwen-Image-Edit-2509 Q6_K. Tensor names and floating-point bytes are preserved;
+  existing GGML decoders convert quantized weights into native CMF formats.
+  Transformer geometry is inferred from tensors and stored with the component.
+  Its default Q8 profile uses the existing two-field codec to retain precision
+  in modulation weights with large outliers.
+- DeepSeek-V4.1-Flash Q4TP text and image inference support, including the
+  native Engram byte tables, CED/CSA2 cache and index contracts, and the
+  portable CPU fallback.
+- A bounded packed main/index KV representation and the Vulkan attention/output
+  tail for V4.1. The GPU path gathers selected rows only and preserves sink and
+  logical-position semantics.
+
+### Changed
+- The opt-in CMF_DSV41_FUSED_Q=1 path reuses the existing GPU frame for the
+  V4.1 Q projection and forward RoPE. The default query path remains unchanged;
+  set CMF_DSV41_FUSED_Q=0 to keep it disabled.
+- V4.1 retains a capability-gated dynamic MoE GPU path, BF16 boundaries and
+  explicit CPU fallback. CMF_DSV41_PROF=1 enables one compact cumulative
+  stage report for measurements.
+
+### Fixed
+- Concurrent Linux CPU pool construction no longer races on a shared worker
+  registration barrier, which could leave inference or tests waiting forever.
+- V4.1 GPU attention adapter materialization now uses the final normalized
+  query contract and bounded selected-row storage, avoiding whole-history
+  uploads and preserving CPU/GPU output layout.
+
+
 ## [0.6.6] - 2026-09-08
 
 ### Added
@@ -5518,7 +5550,8 @@ Initial public release.
 - **Licensing** — Apache-2.0 with an explicit patent-grant explanation
   (`LICENSE`, `NOTICE`, `PATENTS.md`).
 
-[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.6.6...HEAD
+[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.6.7...HEAD
+[0.6.7]: https://github.com/infosave2007/cmf/compare/v0.6.6...v0.6.7
 [0.6.6]: https://github.com/infosave2007/cmf/compare/v0.6.5...v0.6.6
 [0.5.62]: https://github.com/infosave2007/cmf/compare/v0.5.61...v0.5.62
 [0.5.61]: https://github.com/infosave2007/cmf/compare/v0.5.60...v0.5.61

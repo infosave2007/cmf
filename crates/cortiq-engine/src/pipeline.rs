@@ -114,6 +114,21 @@ pub struct Pipeline {
             crate::dsv4::Dsv4State,
         )>,
     >,
+    /// DeepSeek-V4.1 owns the shared CED/CSA2 attention state, raw Engram
+    /// lookup and four-stream mHC handoff. It cannot use the V4 cache
+    /// layout, so it has a dedicated executor and state tuple.
+    pub dsv41: Option<
+        Box<(
+            crate::dsv41::Dsv41Globals,
+            Vec<crate::dsv41::Dsv41Layer>,
+            crate::dsv41::Dsv41Cfg,
+            crate::dsv41::Dsv41State,
+        )>,
+    >,
+    /// Optional V4.1 vision tower. Text-only files leave this unset.
+    pub dsv41_vision: Option<crate::dsv41_vision::VisionModel>,
+    /// Prepared image rows consumed by the next V4.1 prefill.
+    dsv41_prefill: Option<(Vec<Option<Vec<f32>>>, Vec<bool>)>,
     /// Qwen3.8-Flash-Next owns four residual streams plus QSA/PLE state;
     /// the generic single-residual layer loop cannot represent it.
     pub qwen4_exp: Option<
@@ -871,6 +886,9 @@ impl Pipeline {
     fn clear_sequence_state(&mut self) {
         self.kv_cache.clear();
         self.kv_history.clear();
+        if let Some(b) = &mut self.dsv41 {
+            b.3.clear();
+        }
         crate::gpu::graph_kv_reset(self.graph_kv_id);
         // MTP is detached from `self` for the duration of generation, so its
         // device mirror is not covered by the trunk reset above.  Reset the
@@ -1896,6 +1914,9 @@ impl Pipeline {
             kda_cfg: None,
             g3n: None,
             dsv4: None,
+            dsv41: None,
+            dsv41_vision: None,
+            dsv41_prefill: None,
             qwen4_exp: None,
             dsv4_mtp: Vec::new(),
             dspark: None,
@@ -2296,6 +2317,75 @@ impl Pipeline {
         self.generate_from_ids(&input_ids, max_tokens, task_mask, on_token)
     }
 
+    /// Generate from a V4.1 multimodal prompt prepared by the vision module.
+    /// Vision rows are encoded once and fed through the same bounded token walk as text.
+    pub fn generate_from_vl(
+        &mut self,
+        input: &crate::dsv41_vision::PreparedVlInputs,
+        max_tokens: usize,
+        task_mask: Option<&TaskMask>,
+        on_token: Option<TokenCallback>,
+    ) -> Result<GenerateResult, String> {
+        let Some(dsv41) = &self.dsv41 else {
+            return Err("V4.1 multimodal input requires a DeepSeek-V4.1 pipeline".into());
+        };
+        if input.token_ids.is_empty() {
+            return Err("empty V4.1 multimodal prompt".into());
+        }
+        if input.token_types.len() != input.token_ids.len() {
+            return Err(format!(
+                "V4.1 token type count {} != token count {}",
+                input.token_types.len(),
+                input.token_ids.len()
+            ));
+        }
+        let dim = dsv41.2.dim;
+        let mut embeddings = vec![None; input.token_ids.len()];
+        let mut participates = vec![true; input.token_ids.len()];
+        if !input.images.is_empty() {
+            let vision = self
+                .dsv41_vision
+                .as_ref()
+                .ok_or_else(|| "V4.1 image prompt has no loaded vision tower".to_string())?;
+            for image in &input.images {
+                let end = image.start.saturating_add(image.types.len());
+                if end > input.token_ids.len() {
+                    return Err(format!(
+                        "V4.1 image span {}..{} exceeds prompt length {}",
+                        image.start,
+                        end,
+                        input.token_ids.len()
+                    ));
+                }
+                let mut span = vec![0.0f32; image.types.len() * dim];
+                vision.fill_image_span(image, &mut span, self.pool.as_deref())?;
+                for (offset, &kind) in image.types.iter().enumerate() {
+                    let pos = image.start + offset;
+                    if input.token_types[pos] != kind {
+                        return Err(format!(
+                            "V4.1 image type mismatch at position {pos}: {} != {kind}",
+                            input.token_types[pos]
+                        ));
+                    }
+                    embeddings[pos] = Some(span[offset * dim..(offset + 1) * dim].to_vec());
+                    participates[pos] = false;
+                }
+            }
+        }
+        for (pos, &kind) in input.token_types.iter().enumerate() {
+            if kind == crate::dsv41_vision::TEXT && embeddings[pos].is_some() {
+                return Err(format!("V4.1 text position {pos} has an image embedding"));
+            }
+            if kind != crate::dsv41_vision::TEXT && embeddings[pos].is_none() {
+                return Err(format!("V4.1 image position {pos} has no image embedding"));
+            }
+        }
+        self.dsv41_prefill = Some((embeddings, participates));
+        let result = self.generate_from_ids(&input.token_ids, max_tokens, task_mask, on_token);
+        self.dsv41_prefill = None;
+        result
+    }
+
     /// `None` when the mask forbids nothing (see `TaskMask::fully_open`).
     fn drop_open_mask<'m>(&self, m: Option<&'m TaskMask>) -> Option<&'m TaskMask> {
         m.filter(|m| !m.fully_open(self.intermediate_size, self.num_heads))
@@ -2346,6 +2436,7 @@ impl Pipeline {
                 && task_mask.is_none()
                 && self.mtp.is_none()
                 && self.o1_cfg.is_none()
+                && self.dsv41.is_none()
                 && !h.is_empty()
                 && h.len() < input_ids.len()
                 && input_ids[..h.len()] == h[..]
@@ -2634,6 +2725,49 @@ impl Pipeline {
                     &mut lg,
                     end == input_ids.len(),
                 );
+            }
+            if end == input_ids.len() {
+                self.graph_logits = Some(lg);
+            }
+            pos = end;
+            hidden = vec![0.0; self.hidden_size];
+        }
+        let dsv41_prefill = self.dsv41_prefill.take();
+        while self.dsv41.is_some()
+            && mtp.is_none()
+            && pos < input_ids.len()
+            && !self.cancel.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let end = (pos + prefill_chunk()).min(input_ids.len());
+            let ids: Vec<u32> = input_ids[pos..end].to_vec();
+            let mut lg = Vec::new();
+            if let Some(b) = &mut self.dsv41 {
+                let (g, layers, cfg, st) = (&b.0, &b.1, &b.2, &mut b.3);
+                if let Some((embeddings, participates)) = dsv41_prefill.as_ref() {
+                    crate::dsv41::forward_chunk_masked_with_embeddings(
+                        g,
+                        layers,
+                        cfg,
+                        st,
+                        &ids,
+                        pos,
+                        &embeddings[pos..end],
+                        &participates[pos..end],
+                        self.pool.as_deref(),
+                        &mut lg,
+                    );
+                } else {
+                    crate::dsv41::forward_chunk(
+                        g,
+                        layers,
+                        cfg,
+                        st,
+                        &ids,
+                        pos,
+                        self.pool.as_deref(),
+                        &mut lg,
+                    );
+                }
             }
             if end == input_ids.len() {
                 self.graph_logits = Some(lg);
@@ -3262,7 +3396,7 @@ impl Pipeline {
                 break 'decode;
             }
 
-            if self.kv_cache.needs_eviction() {
+            if self.dsv41.is_none() && self.kv_cache.needs_eviction() {
                 // Say it ONCE, loudly: past this point the model keeps
                 // talking but has lost half its context, and on a GDN
                 // hybrid the graph's device state goes stale on top. The
@@ -5584,6 +5718,25 @@ impl Pipeline {
         }
         let mut hidden = vec![0.0f32; self.hidden_size];
         let mut pos = 0usize;
+        if let Some(b) = &mut self.dsv41 {
+            let pool = self.pool.clone();
+            let mut logits = Vec::new();
+            crate::dsv41::forward_chunk(
+                &b.0,
+                &b.1,
+                &b.2,
+                &mut b.3,
+                ids,
+                0,
+                pool.as_deref(),
+                &mut logits,
+            );
+            if let Err(err) = self.o1_seal_checked() {
+                self.clear_sequence_state();
+                return Err(err);
+            }
+            return Ok(logits);
+        }
         // Same routing predicate generation uses. Two reasons it must be
         // the same one: (1) a GDN hybrid's recurrent state is GPU-
         // resident, and a batched CPU prefill would build it on the host
@@ -5647,6 +5800,48 @@ impl Pipeline {
             self.norm_style,
         );
         Ok(self.lm_head_forward(&normed))
+    }
+
+    /// Run the V4.1 stack one token at a time and retain logits for every
+    /// position. This is a diagnostic surface for comparing a converted
+    /// checkpoint with a tokenwise reference implementation.
+    #[doc(hidden)]
+    pub fn dsv41_serial_logits(&mut self, ids: &[u32]) -> Result<Vec<Vec<f32>>, String> {
+        #[cfg(target_os = "macos")]
+        crate::gpu_metal::set_io_namespace(self.graph_kv_id);
+        if ids.is_empty() {
+            return Err("empty id sequence".to_string());
+        }
+        self.clear_sequence_state();
+        self.dsv41
+            .as_ref()
+            .ok_or_else(|| "dsv41 serial logits require a DeepSeek-V4.1 model".to_string())?;
+        self.o1_begin();
+        let rows = {
+            let pool = self.pool.clone();
+            let b = self
+                .dsv41
+                .as_mut()
+                .expect("dsv41 checked above; state cannot change during forward");
+            let mut rows = Vec::with_capacity(ids.len());
+            for (position, &id) in ids.iter().enumerate() {
+                let mut logits = Vec::new();
+                crate::dsv41::forward_token(
+                    &b.0,
+                    &b.1,
+                    &b.2,
+                    &mut b.3,
+                    id,
+                    position,
+                    pool.as_deref(),
+                    &mut logits,
+                );
+                rows.push(logits);
+            }
+            rows
+        };
+        self.o1_seal();
+        Ok(rows)
     }
 
     /// Teacher-forced perplexity over a token sequence (phase-C gate:
@@ -6862,7 +7057,7 @@ impl Pipeline {
         // DeepSeek-V4's hash layers route by TOKEN ID, so the id has to
         // reach the forward. It rides in slot 0 (the forward re-reads the
         // real embedding itself from the table).
-        if self.dsv4.is_some() || self.qwen4_exp.is_some() {
+        if self.dsv4.is_some() || self.dsv41.is_some() || self.qwen4_exp.is_some() {
             let mut v = vec![0.0f32; self.hidden_size.max(1)];
             v[0] = id as f32;
             return v;
@@ -7164,6 +7359,12 @@ impl Pipeline {
         if self.dsv4.is_some() {
             return Err(
                 "network split: DeepSeek-V4 runs its own fused stack (not splittable yet)".into(),
+            );
+        }
+        if self.dsv41.is_some() {
+            return Err(
+                "network split: DeepSeek-V4.1 owns the shared CED/CSA2 state (not splittable)"
+                    .into(),
             );
         }
         if self.qwen4_exp.is_some() {
@@ -9520,7 +9721,11 @@ impl Pipeline {
         upto: Option<usize>,
     ) -> Vec<f32> {
         debug_assert!(
-            from == 0 || (self.dsv4.is_none() && self.qwen4_exp.is_none() && self.g3n.is_none())
+            from == 0
+                || (self.dsv4.is_none()
+                    && self.dsv41.is_none()
+                    && self.qwen4_exp.is_none()
+                    && self.g3n.is_none())
         );
         if let Some(b) = &mut self.qwen4_exp {
             let _ = (task_mask, upto);
@@ -9566,6 +9771,24 @@ impl Pipeline {
             self.dspark_probe(position, token_id);
             // The caller expects a hidden; the logits went out of band, as
             // with the fused lm_head path.
+            return vec![0.0; self.hidden_size];
+        }
+        // DeepSeek-V4.1 owns its complete stack and emits logits out of band.
+        if let Some(b) = &mut self.dsv41 {
+            let _ = (task_mask, upto);
+            let token_id = hidden.first().copied().unwrap_or(0.0) as u32;
+            let mut logits = Vec::new();
+            crate::dsv41::forward_token(
+                &b.0,
+                &b.1,
+                &b.2,
+                &mut b.3,
+                token_id,
+                position,
+                self.pool.as_deref(),
+                &mut logits,
+            );
+            self.graph_logits = Some(logits);
             return vec![0.0; self.hidden_size];
         }
         // Gemma-3n runs its own stack (4 AltUp replicas don't fit this

@@ -1,0 +1,16 @@
+{
+  "repo": "QuantStack/Qwen-Image-Edit-2509-GGUF",
+  "revision": "84a3006979126011422eeeefe0c9485ddf431ef5",
+  "file": [
+    {
+      "rfilename": "Qwen-Image-Edit-2509-Q6_K.gguf",
+      "blobId": "d78660a1d18abe8abd4d6b64cb2899f6d9b5c992",
+      "size": 16824990240,
+      "lfs": {
+        "sha256": "ec5694f11a2908c10ef5324c50c79b1bb433547a39a211996551417b4b16f0ce",
+        "size": 16824990240,
+        "pointerSize": 136
+      }
+    }
+  ]
+}
