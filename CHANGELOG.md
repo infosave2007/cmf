@@ -10,6 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.6.7] - 2026-09-10
 
 ### Added
+- Streaming GGUF-to-CMF import for Qwen Image transformer checkpoints, including
+  Qwen-Image-Edit-2509 Q6_K. Tensor names and floating-point bytes are preserved;
+  existing GGML decoders convert quantized weights into native CMF formats.
+  Transformer geometry is inferred from tensors and stored with the component.
 - DeepSeek-V4.1-Flash Q4TP text and image inference support, including the
   native Engram byte tables, CED/CSA2 cache and index contracts, and the
   portable CPU fallback.
@@ -26,6 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stage report for measurements.
 
 ### Fixed
+- Concurrent Linux CPU pool construction no longer races on a shared worker
+  registration barrier, which could leave inference or tests waiting forever.
 - V4.1 GPU attention adapter materialization now uses the final normalized
   query contract and bounded selected-row storage, avoiding whole-history
   uploads and preserving CPU/GPU output layout.
