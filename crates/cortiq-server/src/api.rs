@@ -22,7 +22,18 @@ pub fn routes() -> Router<Arc<AppState>> {
 
 async fn get_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let status = state.runtime.status().await;
-    Json(serde_json::to_value(status).unwrap_or_default())
+    let mut value = serde_json::to_value(status).unwrap_or_default();
+    if let Some(source) = state.runtime.model().arch().deepseek_v41.as_ref() {
+        let vision = cortiq_engine::dsv41_vision::VisionConfig::from_source(source).ok();
+        value["capabilities"] = serde_json::json!({
+            "tools": true,
+            "vision": vision.as_ref().is_some_and(|config| config.vision_enabled()),
+            "image_token_id": vision.map(|config| config.image_token_id),
+            "reasoning_effort": true,
+            "dsml": true
+        });
+    }
+    Json(value)
 }
 
 // ─── Masks ───────────────────────────────────────────────

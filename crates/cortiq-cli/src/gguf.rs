@@ -844,6 +844,7 @@ fn arch_from_md(md: &BTreeMap<String, Val>, tensors: &[GgufTensor]) -> anyhow::R
         mtp: None,
         moe,
         qwen4_exp: None,
+        deepseek_v41: None,
         linear_core: if is_q35 {
             Some(cortiq_core::types::LinearCoreConfig {
                 kind: "gated_delta_net".into(),

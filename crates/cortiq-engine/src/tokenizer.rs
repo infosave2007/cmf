@@ -361,6 +361,42 @@ impl Tokenizer {
                 _ => {}
             }
         }
+
+        // DeepSeek-V4.1 keeps harmony/DSML markers in the ordinary vocabulary
+        // on some tokenizer revisions and in `added_tokens` on others. Treat
+        // either spelling as atomic so image placeholders cannot split into
+        // byte-BPE pieces, and make the configured BOS/EOS ids discoverable.
+        const DSV41_SPECIALS: &[&str] = &[
+            "<｜begin▁of▁sentence｜>",
+            "<｜end▁of▁sentence｜>",
+            "<｜User｜>",
+            "<｜Assistant｜>",
+            "<｜System｜>",
+            "<｜latest_reminder｜>",
+            "<｜deepseek_image｜>",
+            "<｜action｜>",
+            "<｜query｜>",
+            "<｜authority｜>",
+            "<｜domain｜>",
+            "<｜title｜>",
+            "<｜read_url｜>",
+            "<think>",
+            "</think>",
+            "｜DSML｜",
+        ];
+        for token in DSV41_SPECIALS {
+            if let Some(&id) = vocab.get(*token) {
+                if !added.iter().any(|(content, _)| content.as_str() == *token) {
+                    added.push(((*token).to_string(), id));
+                }
+                added_ids.insert(id);
+                match *token {
+                    "<｜begin▁of▁sentence｜>" => bos_token_id = Some(id),
+                    "<｜end▁of▁sentence｜>" => eos_token_id = Some(id),
+                    _ => {}
+                }
+            }
+        }
         added.sort_by_key(|(c, _)| std::cmp::Reverse(c.len()));
 
         // Gemma REQUIRES a leading <bos> on every sequence, but newer
@@ -803,6 +839,44 @@ impl Tokenizer {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
+    /// Decode one vocabulary entry for Engram's compressed token map while
+    /// retaining special tokens.
+    pub fn decode_token_for_hash(&self, id: u32) -> String {
+        let idx = id as usize;
+        if idx >= self.id_to_token.len() {
+            return String::new();
+        }
+        if self.special_ids.contains(&id) {
+            return self.id_to_token[idx].clone();
+        }
+        self.decode_token(id)
+    }
+
+    /// Decode generated protocol text while retaining special markers. The
+    /// V4.1 harmony parser needs `<think>`, EOS, and spaced DSML tags.
+    pub fn decode_for_protocol(&self, ids: &[u32]) -> String {
+        let mut out = String::new();
+        for &id in ids {
+            let idx = id as usize;
+            if self.special_ids.contains(&id) {
+                if let Some(token) = self.id_to_token.get(idx) {
+                    out.push_str(token);
+                }
+            } else {
+                out.push_str(&self.decode_token(id));
+            }
+        }
+        out
+    }
+
+    /// Return the backend vocabulary spelling for an Engram map entry.
+    pub fn raw_token_for_hash(&self, id: u32) -> String {
+        self.id_to_token
+            .get(id as usize)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// Render the container's Jinja chat template (HF semantics:
     /// trim_blocks + lstrip_blocks + loop controls) and encode it.
     /// Falls back to hardcoded ChatML when the file carries none.
@@ -1090,6 +1164,19 @@ impl Tokenizer {
     /// Vocabulary size.
     pub fn vocab_size(&self) -> usize {
         self.id_to_token.len()
+    }
+
+    /// Return the ID for an exact token spelling, including added/special
+    /// tokens. Multimodal prompt preparation uses this to validate the image
+    /// placeholder against the model configuration.
+    pub fn token_to_id(&self, token: &str) -> Option<u32> {
+        self.vocab.get(token).copied()
+    }
+
+    /// Alias matching the HuggingFace tokenizer API used by the official
+    /// DeepSeek image processor.
+    pub fn convert_tokens_to_ids(&self, token: &str) -> Option<u32> {
+        self.token_to_id(token)
     }
 
     /// Check if token ID is EOS.
