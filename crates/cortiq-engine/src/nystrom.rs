@@ -1,0 +1,1332 @@
+//! Nyström (landmark) attention kernel — streaming per-GQA-group runtime
+//! for long-context `attn_type: nystrom` layers.
+//!
+//! Attention splits into an EXACT sliding window (last `w` keys) and a
+//! landmark-skeleton far field sharing ONE joint denominator:
+//!
+//! ```text
+//! out(q_t) = (Σ_{j>t-w} e_j·v_j + F·M·T_far) / (Σ_{j>t-w} e_j + F·M·Z_far)
+//! e_j   = exp(q_t·k_j/√d)                      exact near weights
+//! F_i   = exp(q_t·k̃_i/√d)                      scores vs landmark keys
+//! M     = pinv_reg(exp(Q̃·K̃ᵀ/√d))               fixed after prefill
+//! T_far = Σ_{j≤t-w} exp(Q̃·k_j/√d)·v_jᵀ         [m × dv]
+//! Z_far = Σ_{j≤t-w} exp(Q̃·k_j/√d)              [m]
+//! ```
+//!
+//! exp(q·k) is a PSD kernel, so the UNNORMALIZED skeleton (classic
+//! Nyström/CUR) is legal.  Do NOT row-softmax the factors and do NOT
+//! normalize the key scores over landmarks — both "simplifications"
+//! measurably collapse quality (validated in the torch matrix probes).
+//!
+//! Boundary discipline: key j enters T/Z at the exact step it LEAVES
+//! the window (t = j+w) — delayed insertion, no overlap, no hole; the
+//! near mass stays exact rather than Nyström-estimated.
+//!
+//! Sink tokens (spec §5b, StreamingLLM discipline): the first `sink`
+//! keys of the sequence are PERMANENT exact keys — the near mask is
+//! (t-j < w) OR (j < sink) — and must never enter the far accumulators.
+//! Here they never enter the ring window in the first place (they live
+//! in a dedicated buffer), so delayed insertion cannot see them: no
+//! double count, no gap.  Measured: sinks make the full 28/28-layer
+//! O(1) conversion viable — the default mode.
+//!
+//! Quality of THIS kernel, measured through it (`cortiq ppl --o1 all`,
+//! Qwen3-0.6B, all 28 layers, m=32 W=128 sink=4, wikitext-2 val, 12×512
+//! windows, landmarks frozen at a 256-token prefill): ×1.296 vs exact
+//! attention over the same scored tokens (28.04 vs 21.63).
+//!
+//! The older ×1.177 figure is NOT this operator: it comes from the torch
+//! matrix probe, which (a) rectifies every per-(t,j) weight — impossible
+//! to stream, the weights are never materialized — (b) builds landmarks
+//! from the FULL sequence rather than the prefill, and (c) averages in
+//! the first W positions, which are pure-exact and cost nothing.  Quote
+//! ×1.296 for the runtime; ×1.177 is an upper bound the runtime cannot
+//! reach by construction.
+//!
+//! fp32 numerics: raw exp overflows on real logits, so shifts are
+//! absorbed into diagonals.  T̂[i]/Ẑ[i] live at scale e^{-m_i} with a
+//! per-landmark running max m_i (flash-style rescale on growth); each
+//! token's landmark row uses its own shift f; near and far are brought
+//! to one common scale before the single joint division.
+
+/// Which rectifier keeps the skeleton's estimated far mass non-negative.
+///
+/// pinv(exp(Q̃K̃ᵀ/√d)) is violently ill-conditioned, so M is indefinite
+/// and the raw skeleton estimates negative weights for a large minority
+/// of keys (measured on Qwen3-0.6B: 23.5% of far weights negative,
+/// carrying 24.5% of the absolute far mass).  Unrectified, the joint
+/// denominator goes near-zero/negative and the model collapses (×510).
+///
+/// The matrix probe rectifies every estimated weight — `west =
+/// ((Fu@Mu)@E).clamp_min(0)`.  A STREAMING kernel cannot do that: the
+/// per-(t, j) weights are never materialized, they exist only already
+/// contracted against the accumulators.  Two streaming-legal stand-ins:
+///
+/// MEASURED (Qwen3-0.6B, all 28 layers, W=128, sink=4, wikitext-2 val,
+/// 12×512 windows, landmarks frozen at a 256-token prefill — i.e. the
+/// runtime's real discipline, `cortiq ppl --o1`):
+///
+/// ```text
+///        m=8              m=16             m=32
+/// agg    28.51 (×1.318)   28.82 (×1.332)   28.04 (×1.296)  ← default
+/// fm     28.97 (×1.340)   29.69 (×1.373)   30.58 (×1.414)
+/// ```
+///
+/// `Aggregate` wins at every m, so it stays the default.  `Fm` is kept
+/// selectable because its per-key guarantee is the intuitively "correct"
+/// fix and someone will re-derive it: this table is the evidence that it
+/// costs quality HERE, and the reason is that the guarantee is bought by
+/// destroying signal — clamping a landmark's coefficient zeroes its
+/// contribution to EVERY far key, including the majority where the
+/// weighted sum was already positive and accurate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum O1Rect {
+    /// Clamp only the AGGREGATE far denominator: a row whose skeleton
+    /// denominator comes out negative drops its far field entirely.
+    /// Coarse — negative per-key mass survives untouched whenever the
+    /// row sum happens to stay positive — but measured BEST (see above):
+    /// the surviving negatives are apparently error-cancelling, not
+    /// error-causing.
+    Aggregate,
+    /// Clamp FM = F_u·M_u (an m-vector, per query row) at zero.
+    /// ŵ(t,j) = Σ_b FM[b]·E[b,j] and E = exp(·) ≥ 0 ELEMENTWISE, so
+    /// FM ≥ 0 is SUFFICIENT for every far weight to be non-negative —
+    /// a per-key guarantee bought with O(m) work on a vector the row
+    /// already materializes, state untouched.  It is strictly stronger
+    /// than the probe's clamp (a negative landmark is dropped for every
+    /// key, not only where the sum would go negative), so this is a
+    /// DIFFERENT operator, not an emulation of the matrix reference —
+    /// and, measured, a worse one.  Opt in with `--o1-rect fm`.
+    Fm,
+}
+
+/// Ridge factor for the regularized pseudo-inverse of the landmark
+/// kernel: λ = RIDGE_REL · mean(diag(AᵀA)).
+const RIDGE_REL: f64 = 1e-6;
+/// Floor for the joint denominator (mirrors the reference probe).
+const DEN_EPS: f32 = 1e-30;
+/// Prompts of length ≤ w + EXACT_SLACK skip the skeleton entirely:
+/// tiny prefills duplicate segment-mean landmarks (singular Au).
+const EXACT_SLACK: usize = 8;
+
+/// First prompt length that is safe to convert to the streaming skeleton.
+/// Keep this arithmetic checked: the value is also the deferred boundary
+/// stored by the exact KV collector, and a wrapped boundary would turn a
+/// malformed configuration into an immediate or never-ending transition.
+pub(crate) fn o1_deferred_boundary(w: usize, sink: usize) -> Option<usize> {
+    w.checked_add(sink)?
+        .checked_add(EXACT_SLACK)?
+        .checked_add(1)
+}
+
+/// Patent-17 claim 1 probe (`CMF_O1_FARONLY=1`): drop the window from
+/// the READOUT — sinks + far field only — while the ring keeps its
+/// staging role (delayed insertion is untouched). In a GDN hybrid the
+/// near field is carried by the linear-core neighbours; the window is
+/// ~70% of the operator's state and most of its per-token work. Only
+/// engages once the far field holds mass (far_len > 0) — before the
+/// first eviction the window is the only history there is.
+/// Patent-17 claim 9 (`CMF_O1_RESEAL=R`, 0/absent = off): landmarks and
+/// the mixing matrix are FROZEN at prefill, and the deep-layer stream
+/// drifts away from them — measured x3.5-3.9 ppl on the 0.8B hybrid
+/// where the matrix probe reads x1.075. Every R evictions the operator
+/// rebuilds K-landmarks from a ring of recent evicted keys, Q-landmarks
+/// from recent queries, re-inverts M, and re-warms the far accumulators
+/// by re-inserting the ring — sinks and the window stay exact
+/// throughout. Far mass older than the ring is dropped: under drifted
+/// landmarks it was mis-binned anyway, and the ring covers the depth
+/// the ppl gate scores.
+fn reseal_every() -> usize {
+    static R: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *R.get_or_init(|| {
+        std::env::var("CMF_O1_RESEAL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// Sample-ring capacity for reseal (evicted keys/values per group,
+/// recent queries per head).
+const RESEAL_CAP: usize = 256;
+
+fn far_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_O1_FARONLY").as_deref() == Ok("1"))
+}
+
+/// Streaming Nyström attention state for ONE GQA group.
+///
+/// State splits along the GQA grain, because the operator does:
+///
+/// * SHARED per KV group (`NystromGroup`) — the exact window ring, the
+///   sink buffer and the key landmarks K̃.  Under GQA every Q head of a
+///   group reads the SAME k/v rows, so all three are bit-identical
+///   across the group; storing them once per group instead of once per
+///   Q head is the point of this split (identical arithmetic,
+///   ×heads_per_kv less window memory).  K̃ = seg_means(ks, t, d, m_eff)
+///   is a pure function of the group's keys and of `t` (which fixes
+///   m_eff), so it is shareable for the same reason the keys are.
+/// * PRIVATE per Q head (`NystromHead`) — the far accumulators T̂/Ẑ and
+///   their per-landmark running maxima, the QUERY landmarks Q̃, and the
+///   mixing matrix M = pinv(exp(Q̃K̃ᵀ/√d)).  Q̃ is built from that head's
+///   own queries, so M and the far field it drives are per-Q-head and
+///   cannot be shared: the far mass a head accumulates is contracted
+///   against its own query landmarks.
+///
+/// Lifecycle: `new(m, w, sink)` → `prefill(prompt)` once → `step()` per
+/// decode token (single-head façade), or `new_group`/`prefill_group`/
+/// `step_group` for a whole GQA group at once.  All buffers are flat
+/// `Vec<f32>`, row-major; the skeleton path performs no allocations
+/// inside `step()`.
+#[derive(Clone, Debug)]
+pub struct NystromState {
+    group: NystromGroup,
+    heads: Vec<NystromHead>,
+}
+
+/// The part of the state a GQA group shares: everything derived from
+/// the group's KEYS and VALUES alone (see `NystromState`).
+#[derive(Clone, Debug)]
+struct NystromGroup {
+    /// Landmark budget (m) — effective count may be lower (`m_eff`).
+    m: usize,
+    /// Exact-window width in keys.
+    w: usize,
+    /// Permanent exact sink keys at positions 0..sink (spec §5b).
+    sink: usize,
+    d: usize,
+    dv: usize,
+    /// Effective landmark count: clamp(t/8, 4, m) at prefill.  Derived
+    /// from the prompt length, hence equal for every head of the group.
+    m_eff: usize,
+    /// Short-prompt mode: window holds ALL keys, no skeleton.  The
+    /// buffer grows on decode, so this mode may allocate in `step()` —
+    /// acceptable for the ≤ w+8-token degenerate case.
+    exact_only: bool,
+    scale: f32,
+    /// Window keys `[cap][d]` — ring buffer in skeleton mode (cap = w),
+    /// append-only in exact-only mode.
+    win_k: Vec<f32>,
+    /// Window values `[cap][dv]`.
+    win_v: Vec<f32>,
+    win_len: usize,
+    /// Ring slot of the OLDEST window entry (0 while not yet full).
+    win_head: usize,
+    /// Sink keys `[sink_len][d]` — filled once at prefill, immutable.
+    sink_k: Vec<f32>,
+    /// Sink values `[sink_len][dv]`.
+    sink_v: Vec<f32>,
+    /// Number of stored sink tokens (0 in exact-only mode, where every
+    /// key is permanent-exact anyway).
+    sink_len: usize,
+    /// Key landmarks `[m_eff][d]` — segment means of the group's keys.
+    k_tilde: Vec<f32>,
+    /// Reseal sample ring: recent EVICTED keys/values (chronological
+    /// via `samp_head`), empty unless CMF_O1_RESEAL is set.
+    samp_k: Vec<f32>,
+    samp_v: Vec<f32>,
+    samp_len: usize,
+    samp_head: usize,
+    /// Evictions since the last reseal.
+    since_reseal: usize,
+}
+
+/// The part of the state that is private to one Q head: everything that
+/// touches that head's QUERIES (see `NystromState`).
+#[derive(Clone, Debug)]
+struct NystromHead {
+    /// How the indefinite skeleton is rectified (see `O1Rect`).
+    rect: O1Rect,
+    /// Far numerator `[m_eff][dv]`, stored at scale e^{-m_max[i]}.
+    t_hat: Vec<f32>,
+    /// Far denominator `[m_eff]`, same scale.
+    z_hat: Vec<f32>,
+    /// Per-landmark running max of far logits q̃_i·k_j/√d.
+    m_max: Vec<f32>,
+    /// Number of keys absorbed into the far field.
+    far_len: usize,
+    /// Query landmarks `[m_eff][d]` (segment means of the prefill).
+    q_tilde: Vec<f32>,
+    /// Regularized pseudo-inverse of Au = exp(Q̃·K̃ᵀ/√d), `[m_eff][m_eff]`.
+    mu: Vec<f32>,
+    // Scratch preallocated at prefill so skeleton-mode step() is
+    // allocation-free.  Per head rather than per group: the heads of a
+    // group write it independently, and it is ~0.5 KB.
+    scr_s: Vec<f32>,
+    scr_fh: Vec<f32>,
+    scr_u: Vec<f32>,
+    scr_l: Vec<f32>,
+    /// Reseal: ring of this head's recent queries.
+    samp_q: Vec<f32>,
+    samp_q_len: usize,
+    samp_q_head: usize,
+}
+
+/// Everything `step()`/`advance()` mutate, captured before a
+/// speculative burst and restored bit-for-bit on rejection. The whole
+/// point of the O(1) operator is that this is SMALL — the window ring
+/// plus the far accumulators, ~150 KB a head-group — so speculation,
+/// which Patent 16 disclaims as impossible over the irreversible far
+/// insertion, becomes a memcpy. Immutable-after-seal parts (sinks,
+/// landmarks, mu) are not captured.
+pub struct O1Snapshot {
+    win_k: Vec<f32>,
+    win_v: Vec<f32>,
+    win_len: usize,
+    win_head: usize,
+    /// Per head: (t_hat, z_hat, m_max, far_len).
+    heads: Vec<(Vec<f32>, Vec<f32>, Vec<f32>, usize)>,
+}
+
+impl NystromState {
+    pub fn snapshot(&self) -> O1Snapshot {
+        O1Snapshot {
+            win_k: self.group.win_k.clone(),
+            win_v: self.group.win_v.clone(),
+            win_len: self.group.win_len,
+            win_head: self.group.win_head,
+            heads: self
+                .heads
+                .iter()
+                .map(|h| (h.t_hat.clone(), h.z_hat.clone(), h.m_max.clone(), h.far_len))
+                .collect(),
+        }
+    }
+
+    /// Restore a snapshot taken on THIS state (same geometry). The
+    /// exact-only window grows on decode, so the vectors are assigned,
+    /// not copied into.
+    pub fn restore(&mut self, s: &O1Snapshot) {
+        self.group.win_k = s.win_k.clone();
+        self.group.win_v = s.win_v.clone();
+        self.group.win_len = s.win_len;
+        self.group.win_head = s.win_head;
+        debug_assert_eq!(self.heads.len(), s.heads.len());
+        for (h, (t, z, m, fl)) in self.heads.iter_mut().zip(&s.heads) {
+            h.t_hat = t.clone();
+            h.z_hat = z.clone();
+            h.m_max = m.clone();
+            h.far_len = *fl;
+        }
+    }
+}
+
+/// Borrowed view of a sealed group's state for the GPU upload — every
+/// slice the device mirror needs, in the layout the kernels index.
+/// `exact_only` groups (degenerate short prompts) are not portable and
+/// make the caller refuse the GPU path for the layer.
+pub struct O1DeviceView<'a> {
+    pub m_eff: usize,
+    pub w: usize,
+    pub sink_len: usize,
+    pub d: usize,
+    pub dv: usize,
+    pub exact_only: bool,
+    pub scale: f32,
+    pub win_len: usize,
+    pub win_head: usize,
+    pub far_len: usize,
+    pub win_k: &'a [f32],
+    pub win_v: &'a [f32],
+    pub sink_k: &'a [f32],
+    pub sink_v: &'a [f32],
+    pub k_tilde: &'a [f32],
+    pub heads: Vec<O1HeadView<'a>>,
+}
+
+pub struct O1HeadView<'a> {
+    pub rect_fm: bool,
+    pub t_hat: &'a [f32],
+    pub z_hat: &'a [f32],
+    pub m_max: &'a [f32],
+    pub q_tilde: &'a [f32],
+    pub mu: &'a [f32],
+}
+
+impl NystromState {
+    pub fn device_view(&self) -> O1DeviceView<'_> {
+        let g = &self.group;
+        O1DeviceView {
+            m_eff: g.m_eff,
+            w: g.w,
+            sink_len: g.sink_len,
+            d: g.d,
+            dv: g.dv,
+            exact_only: g.exact_only,
+            scale: g.scale,
+            win_len: g.win_len,
+            win_head: g.win_head,
+            far_len: self.heads.first().map_or(0, |h| h.far_len),
+            win_k: &g.win_k,
+            win_v: &g.win_v,
+            sink_k: &g.sink_k,
+            sink_v: &g.sink_v,
+            k_tilde: &g.k_tilde,
+            heads: self
+                .heads
+                .iter()
+                .map(|h| O1HeadView {
+                    rect_fm: h.rect == O1Rect::Fm,
+                    t_hat: &h.t_hat,
+                    z_hat: &h.z_hat,
+                    m_max: &h.m_max,
+                    q_tilde: &h.q_tilde,
+                    mu: &h.mu,
+                })
+                .collect(),
+        }
+    }
+}
+
+impl NystromState {
+    /// Single-head state (`heads_per_kv == 1`, and the shape the kernel
+    /// unit tests use).
+    ///
+    /// `m` — landmark budget (≥ 4; see `O1_DEFAULT_M`),
+    /// `w` — exact window width (validated setting is 128),
+    /// `sink` — permanent exact sink keys (validated default is 4;
+    /// 0 reproduces the sink-free kernel bit-for-bit).
+    /// Rectifier defaults to `O1_DEFAULT_RECT`; override with
+    /// `with_rect` (the golden-parity test pins it explicitly).
+    pub fn new(m: usize, w: usize, sink: usize) -> Self {
+        Self::new_group(m, w, sink, 1)
+    }
+
+    /// State for one GQA group of `q_heads` query heads sharing a KV
+    /// head.  The window/sink/K̃ are stored ONCE for the group; each Q
+    /// head keeps its own far field, Q̃ and M.
+    pub fn new_group(m: usize, w: usize, sink: usize, q_heads: usize) -> Self {
+        assert!(m >= 4, "landmark budget must be at least 4");
+        assert!(w >= 1, "window must hold at least one key");
+        assert!(q_heads >= 1, "a GQA group needs at least one query head");
+        NystromState {
+            group: NystromGroup {
+                m,
+                w,
+                sink,
+                d: 0,
+                dv: 0,
+                m_eff: 0,
+                exact_only: true,
+                scale: 0.0,
+                win_k: Vec::new(),
+                win_v: Vec::new(),
+                win_len: 0,
+                win_head: 0,
+                sink_k: Vec::new(),
+                sink_v: Vec::new(),
+                sink_len: 0,
+                k_tilde: Vec::new(),
+                samp_k: Vec::new(),
+                samp_v: Vec::new(),
+                samp_len: 0,
+                samp_head: 0,
+                since_reseal: 0,
+            },
+            heads: (0..q_heads).map(|_| NystromHead::new()).collect(),
+        }
+    }
+
+    /// Select the skeleton rectifier for every head of the group
+    /// (builder; see `O1Rect`).
+    pub fn with_rect(mut self, rect: O1Rect) -> Self {
+        for h in &mut self.heads {
+            h.rect = rect;
+        }
+        self
+    }
+
+    /// Query heads in this group.
+    pub fn num_q_heads(&self) -> usize {
+        self.heads.len()
+    }
+
+    /// Keys absorbed into head `head`'s far field.  Exposed for the
+    /// delayed-insertion invariant test: eviction is a GROUP event, but
+    /// each head must absorb the evicted key EXACTLY once, so this must
+    /// equal the number of evictions — never a multiple of it.
+    pub fn far_len(&self, head: usize) -> usize {
+        self.heads[head].far_len
+    }
+
+    /// Absorb the whole prompt for a single-head state — see
+    /// `prefill_group`.
+    pub fn prefill(&mut self, qs: &[f32], ks: &[f32], vs: &[f32], t: usize, d: usize, dv: usize) {
+        assert_eq!(self.heads.len(), 1, "use prefill_group for a GQA group");
+        self.prefill_group(&[qs], ks, vs, t, d, dv);
+    }
+
+    /// Absorb the whole prompt for a GQA group: freeze each head's
+    /// landmarks and M, then replay the prompt through the step() state
+    /// semantics (window fill + delayed far insertion).  `qs[h]` is that
+    /// head's `[t][d]` query block; `ks` is `[t][d]` and `vs` is
+    /// `[t][dv]` — the group's shared keys/values, row-major.
+    pub fn prefill_group(
+        &mut self,
+        qs: &[&[f32]],
+        ks: &[f32],
+        vs: &[f32],
+        t: usize,
+        d: usize,
+        dv: usize,
+    ) {
+        assert_eq!(qs.len(), self.heads.len(), "one query block per head");
+        for q in qs {
+            assert_eq!(q.len(), t * d);
+        }
+        assert_eq!(ks.len(), t * d);
+        assert_eq!(vs.len(), t * dv);
+
+        let Some(k_tilde64) = self.group.prefill_shared(ks, vs, t, d, dv) else {
+            // exact-only: no skeleton, no far field — nothing per head
+            // beyond the score scratch.
+            for h in &mut self.heads {
+                h.seal_exact(t);
+            }
+            return;
+        };
+        for (h, q) in self.heads.iter_mut().zip(qs) {
+            h.seal(&self.group, q, t, &k_tilde64);
+        }
+        // Replay the post-sink prompt ONCE for the group: each key
+        // enters the shared window, evicting the (j-w)-th into every
+        // head's far field.
+        for j in self.group.sink..t {
+            Self::advance(
+                &mut self.group,
+                &mut self.heads,
+                &ks[j * d..(j + 1) * d],
+                &vs[j * dv..(j + 1) * dv],
+            );
+        }
+    }
+
+    /// One decode step for a single-head state — see `step_group`.
+    pub fn step(&mut self, q: &[f32], k: &[f32], v: &[f32], out: &mut [f32]) {
+        assert_eq!(self.heads.len(), 1, "use step_group for a GQA group");
+        self.step_group(q, k, v, out);
+    }
+
+    /// One decode step for the whole GQA group.  Inserts the group's
+    /// (k, v) ONCE, evicting the oldest window key into every head's far
+    /// accumulators, then writes each head's attention output.
+    /// `q_all` is `[q_heads][d]`, `out_all` is `[q_heads][dv]`.
+    pub fn step_group(&mut self, q_all: &[f32], k: &[f32], v: &[f32], out_all: &mut [f32]) {
+        let (d, dv) = (self.group.d, self.group.dv);
+        assert!(d > 0, "prefill() must run before step()");
+        let nh = self.heads.len();
+        assert_eq!(q_all.len(), nh * d);
+        assert_eq!(k.len(), d);
+        assert_eq!(v.len(), dv);
+        assert_eq!(out_all.len(), nh * dv);
+        // The current token is part of its own near window (t-j = 0),
+        // so insertion happens BEFORE any output is computed.
+        Self::advance(&mut self.group, &mut self.heads, k, v);
+        let rs = reseal_every();
+        for (h, head) in self.heads.iter_mut().enumerate() {
+            let qh = &q_all[h * d..(h + 1) * d];
+            if rs > 0 && !self.group.exact_only {
+                if head.samp_q.is_empty() {
+                    head.samp_q = vec![0.0; RESEAL_CAP * d];
+                }
+                let sp = head.samp_q_head;
+                head.samp_q[sp * d..(sp + 1) * d].copy_from_slice(qh);
+                head.samp_q_head = (sp + 1) % RESEAL_CAP;
+                head.samp_q_len = (head.samp_q_len + 1).min(RESEAL_CAP);
+            }
+            head.step(&self.group, qh, &mut out_all[h * dv..(h + 1) * dv]);
+        }
+        if rs > 0 && self.group.since_reseal >= rs && self.group.samp_len >= 2 * self.group.m_eff {
+            self.reseal();
+        }
+    }
+
+    /// Rebuild the skeleton against the CURRENT stream (Patent 17):
+    /// K-landmarks from the ring of recently evicted keys, Q-landmarks
+    /// from each head's recent queries, M re-inverted, and the far
+    /// accumulators re-warmed by re-inserting the ring. Sinks and the
+    /// window are untouched — the exact stores anchor the operator
+    /// while the approximation refreshes.
+    fn reseal(&mut self) {
+        let g = &mut self.group;
+        let (d, dv, m_eff) = (g.d, g.dv, g.m_eff);
+        let n = g.samp_len;
+        // Chronological copies (oldest first) out of the rings.
+        let start = if n == RESEAL_CAP { g.samp_head } else { 0 };
+        let mut ks = vec![0.0f32; n * d];
+        let mut vs = vec![0.0f32; n * dv];
+        for i in 0..n {
+            let idx = (start + i) % RESEAL_CAP;
+            ks[i * d..(i + 1) * d].copy_from_slice(&g.samp_k[idx * d..(idx + 1) * d]);
+            vs[i * dv..(i + 1) * dv].copy_from_slice(&g.samp_v[idx * dv..(idx + 1) * dv]);
+        }
+        let k_tilde64 = seg_means(&ks, n, d, m_eff);
+        g.k_tilde = k_tilde64.iter().map(|&x| x as f32).collect();
+        g.since_reseal = 0;
+        for head in &mut self.heads {
+            let qn = head.samp_q_len;
+            if qn < m_eff {
+                continue; // not enough queries yet — keep the old Q̃/M
+            }
+            let qstart = if qn == RESEAL_CAP {
+                head.samp_q_head
+            } else {
+                0
+            };
+            let mut qs = vec![0.0f32; qn * d];
+            for i in 0..qn {
+                let idx = (qstart + i) % RESEAL_CAP;
+                qs[i * d..(i + 1) * d].copy_from_slice(&head.samp_q[idx * d..(idx + 1) * d]);
+            }
+            let q_tilde64 = seg_means(&qs, qn, d, m_eff);
+            head.q_tilde = q_tilde64.iter().map(|&x| x as f32).collect();
+            let mut au = vec![0.0f64; m_eff * m_eff];
+            for i in 0..m_eff {
+                for j in 0..m_eff {
+                    let mut s = 0.0f64;
+                    for c in 0..d {
+                        s += q_tilde64[i * d + c] * k_tilde64[j * d + c];
+                    }
+                    au[i * m_eff + j] = (s * g.scale as f64).exp();
+                }
+            }
+            let mu64 = ridge_pinv(&au, m_eff);
+            head.mu = mu64.iter().map(|&x| x as f32).collect();
+            // Re-warm: the far field is rebuilt from the ring. Mass
+            // older than the ring is dropped — under the drifted
+            // landmarks it was mis-binned anyway.
+            head.t_hat.iter_mut().for_each(|x| *x = 0.0);
+            head.z_hat.iter_mut().for_each(|x| *x = 0.0);
+            head.m_max.iter_mut().for_each(|x| *x = f32::NEG_INFINITY);
+            head.far_len = 0;
+            for i in 0..n {
+                head.far_absorb(
+                    m_eff,
+                    d,
+                    dv,
+                    g.scale,
+                    &ks[i * d..(i + 1) * d],
+                    &vs[i * dv..(i + 1) * dv],
+                );
+            }
+        }
+    }
+
+    /// Heap bytes held by this group's state (shared window + sinks +
+    /// K̃, plus each head's skeleton and scratch) — feeds the honest
+    /// "KV+state" memory line, same discipline as counting
+    /// `linear_state` for the linear core.
+    pub fn memory_bytes(&self) -> usize {
+        self.group.memory_bytes()
+            + self
+                .heads
+                .iter()
+                .map(NystromHead::memory_bytes)
+                .sum::<usize>()
+    }
+
+    /// Push the group's (k, v) into the shared window.  In skeleton mode
+    /// a full ring first evicts its oldest key (delayed insertion — the
+    /// key leaves the exact window at this very step).
+    ///
+    /// The eviction is a GROUP event: the window is shared, so there is
+    /// exactly ONE eviction per position, not one per Q head.  The far
+    /// accumulators are per head, though, so that single evicted key is
+    /// absorbed once into EACH head — one eviction, `q_heads`
+    /// insertions.  Getting this wrong in either direction breaks the
+    /// boundary invariant (a key enters the far field at exactly the
+    /// step it leaves the window: no double count, no hole).
+    fn advance(g: &mut NystromGroup, heads: &mut [NystromHead], k: &[f32], v: &[f32]) {
+        let (d, dv) = (g.d, g.dv);
+        if !g.exact_only && g.win_len == g.w {
+            let slot = g.win_head;
+            // Every head absorbs the outgoing key BEFORE the slot is
+            // overwritten by the incoming one.
+            for h in heads.iter_mut() {
+                h.far_insert(g, slot);
+            }
+            // Reseal sampling: the evicted (k, v) joins the ring the
+            // next reseal rebuilds landmarks and far mass from.
+            if reseal_every() > 0 {
+                if g.samp_k.is_empty() {
+                    g.samp_k = vec![0.0; RESEAL_CAP * d];
+                    g.samp_v = vec![0.0; RESEAL_CAP * dv];
+                }
+                let sp = g.samp_head;
+                g.samp_k[sp * d..(sp + 1) * d].copy_from_slice(&g.win_k[slot * d..(slot + 1) * d]);
+                g.samp_v[sp * dv..(sp + 1) * dv]
+                    .copy_from_slice(&g.win_v[slot * dv..(slot + 1) * dv]);
+                g.samp_head = (sp + 1) % RESEAL_CAP;
+                g.samp_len = (g.samp_len + 1).min(RESEAL_CAP);
+                g.since_reseal += 1;
+            }
+            g.win_k[slot * d..(slot + 1) * d].copy_from_slice(k);
+            g.win_v[slot * dv..(slot + 1) * dv].copy_from_slice(v);
+            g.win_head = (g.win_head + 1) % g.w;
+        } else if g.exact_only {
+            g.win_k.extend_from_slice(k);
+            g.win_v.extend_from_slice(v);
+            g.win_len += 1;
+        } else {
+            g.win_k[g.win_len * d..(g.win_len + 1) * d].copy_from_slice(k);
+            g.win_v[g.win_len * dv..(g.win_len + 1) * dv].copy_from_slice(v);
+            g.win_len += 1;
+        }
+    }
+}
+
+impl NystromGroup {
+    /// Freeze the group-shared geometry from the prompt's keys/values.
+    /// Returns the f64 key landmarks (which the heads need at full
+    /// precision to build Au), or None in exact-only mode.
+    fn prefill_shared(
+        &mut self,
+        ks: &[f32],
+        vs: &[f32],
+        t: usize,
+        d: usize,
+        dv: usize,
+    ) -> Option<Vec<f64>> {
+        self.d = d;
+        self.dv = dv;
+        self.scale = 1.0 / (d as f32).sqrt();
+        self.win_len = 0;
+        self.win_head = 0;
+        self.sink_len = 0;
+        // A runtime seal is only admitted at the first bounded boundary
+        // (w + sink + slack + 1), so a converted prompt never enters the
+        // exact-only state. Direct Nystrom users retain the historical
+        // exact-only behavior for short prefills.
+        self.exact_only = o1_deferred_boundary(self.w, self.sink)
+            .map(|boundary| t < boundary)
+            .unwrap_or(true);
+        if self.exact_only {
+            // The end of a three-hop silence: exact-only seals are not
+            // portable to the graph (o1_views -> None), which read as
+            // "0 of 16 layers sealed" upstairs, which read as a broken
+            // seal, which read as a broken port. Say the arithmetic.
+            tracing::info!(
+                "o1 seal: exact-only (prompt t={t} <= w {} + sink {} + slack {}) — \
+                 not graph-portable; longer prompt or smaller --o1-window lifts it",
+                self.w,
+                self.sink,
+                EXACT_SLACK
+            );
+        }
+
+        if self.exact_only {
+            // Everything fits in the exact window (plus slack for a few
+            // decode steps before Vec growth); no skeleton is built and
+            // no separate sink buffer is needed — every key is already
+            // a permanent exact key in this mode.
+            self.win_k = Vec::with_capacity((t + 64) * d);
+            self.win_v = Vec::with_capacity((t + 64) * dv);
+            self.win_k.extend_from_slice(ks);
+            self.win_v.extend_from_slice(vs);
+            self.win_len = t;
+            return None;
+        }
+
+        // Sink tokens: positions 0..sink become permanent exact keys.
+        // They bypass the ring window entirely, so the delayed-insertion
+        // path can never move them into the far accumulators.
+        self.sink_len = self.sink; // skeleton mode guarantees t > sink
+        self.sink_k = ks[..self.sink * d].to_vec();
+        self.sink_v = vs[..self.sink * dv].to_vec();
+
+        // Landmarks: contiguous segment means of the prompt.  The
+        // integer split (i·t)/m matches the reference probe; the clamp
+        // keeps tiny prompts from producing duplicate landmarks.
+        let m_eff = (t / 8).clamp(4, self.m);
+        // Say so when the budget asked for is not the budget used. A
+        // prefill of 256 caps m_eff at 32, so `--o1-m 64`, `128` and
+        // `256` all run as 32 and report perplexities identical to the
+        // last digit — which reads as a saturating method rather than a
+        // clamp, and cost a sweep before it was noticed. This file's own
+        // discipline is that a file is either valid or open() fails
+        // loudly; a flag that silently does nothing is the same defect
+        // one level up.
+        if m_eff < self.m {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static SAID: AtomicBool = AtomicBool::new(false);
+            if !SAID.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "o1: landmark budget m={} clamped to m_eff={} — the prefill is {t} tokens \
+                     and the skeleton takes t/8. Prefill at least {} tokens to use the budget \
+                     you asked for.",
+                    self.m,
+                    m_eff,
+                    self.m * 8
+                );
+            }
+        }
+        self.m_eff = m_eff;
+        let k_tilde64 = seg_means(ks, t, d, m_eff);
+        self.k_tilde = k_tilde64.iter().map(|&x| x as f32).collect();
+
+        self.win_k = vec![0.0; self.w * d];
+        self.win_v = vec![0.0; self.w * dv];
+        Some(k_tilde64)
+    }
+
+    fn memory_bytes(&self) -> usize {
+        (self.win_k.len()
+            + self.win_v.len()
+            + self.sink_k.len()
+            + self.sink_v.len()
+            + self.k_tilde.len())
+            * std::mem::size_of::<f32>()
+    }
+}
+
+impl NystromHead {
+    fn new() -> Self {
+        NystromHead {
+            rect: O1_DEFAULT_RECT,
+            t_hat: Vec::new(),
+            z_hat: Vec::new(),
+            m_max: Vec::new(),
+            far_len: 0,
+            q_tilde: Vec::new(),
+            mu: Vec::new(),
+            scr_s: Vec::new(),
+            scr_fh: Vec::new(),
+            scr_u: Vec::new(),
+            scr_l: Vec::new(),
+            samp_q: Vec::new(),
+            samp_q_len: 0,
+            samp_q_head: 0,
+        }
+    }
+
+    /// exact-only mode: no skeleton state at all, just room to score the
+    /// growing window.
+    fn seal_exact(&mut self, t: usize) {
+        self.far_len = 0;
+        self.scr_s = Vec::with_capacity(t + 64);
+    }
+
+    /// Freeze this head's query landmarks and mixing matrix against the
+    /// group's (already frozen) key landmarks.
+    fn seal(&mut self, g: &NystromGroup, qs: &[f32], t: usize, k_tilde64: &[f64]) {
+        let (d, dv, m_eff) = (g.d, g.dv, g.m_eff);
+        self.far_len = 0;
+        let q_tilde64 = seg_means(qs, t, d, m_eff);
+        self.q_tilde = q_tilde64.iter().map(|&x| x as f32).collect();
+
+        // Au and its regularized pseudo-inverse in f64 — one-off m×m
+        // work at prefill only; the hot path stays f32.
+        let mut au = vec![0.0f64; m_eff * m_eff];
+        for i in 0..m_eff {
+            for j in 0..m_eff {
+                let mut s = 0.0f64;
+                for c in 0..d {
+                    s += q_tilde64[i * d + c] * k_tilde64[j * d + c];
+                }
+                au[i * m_eff + j] = (s * g.scale as f64).exp();
+            }
+        }
+        let mu64 = ridge_pinv(&au, m_eff);
+        self.mu = mu64.iter().map(|&x| x as f32).collect();
+
+        self.t_hat = vec![0.0; m_eff * dv];
+        self.z_hat = vec![0.0; m_eff];
+        self.m_max = vec![f32::NEG_INFINITY; m_eff];
+        self.scr_s = vec![0.0; g.sink + g.w];
+        self.scr_fh = vec![0.0; m_eff];
+        self.scr_u = vec![0.0; m_eff];
+        self.scr_l = vec![0.0; m_eff];
+    }
+
+    /// This head's output for `q` against the group's current window and
+    /// sinks and its own far field.  The window insertion for this
+    /// position already happened at group level (`NystromState::advance`).
+    fn step(&mut self, g: &NystromGroup, q: &[f32], out: &mut [f32]) {
+        let (d, dv) = (g.d, g.dv);
+        assert_eq!(q.len(), d);
+        assert_eq!(out.len(), dv);
+
+        // Near field: exact logits over sinks + window, one shared
+        // shift.  Sinks are permanent exact keys (near mask §5b:
+        // t-j < w OR j < sink); sink_len = 0 in exact-only mode.
+        let ns = g.sink_len;
+        let skip_win = far_only() && !g.exact_only && self.far_len > 0;
+        let n = if skip_win { ns } else { ns + g.win_len };
+        self.scr_s.resize(n, 0.0);
+        let mut c = f32::NEG_INFINITY;
+        for s in 0..ns {
+            let lg = dot(q, &g.sink_k[s * d..(s + 1) * d]) * g.scale;
+            self.scr_s[s] = lg;
+            c = c.max(lg);
+        }
+        // Window scores are the decode hot loop — NEON dot (same
+        // products, regrouped sums; parity-gated by the golden tests).
+        if !skip_win {
+            for s in 0..g.win_len {
+                let lg = crate::attention::dot_f32(q, &g.win_k[s * d..(s + 1) * d]) * g.scale;
+                self.scr_s[ns + s] = lg;
+                c = c.max(lg);
+            }
+        }
+
+        // Far field: shifted skeleton (spec §3).  All exp arguments are
+        // ≤ 0 relative to the joint shift c_all, so nothing overflows.
+        let mut far_den = 0.0f32;
+        let mut c_all = c;
+        let mut have_far = false;
+        if self.far_len > 0 {
+            // Per-token row shift f over landmark scores.
+            let mut f = f32::NEG_INFINITY;
+            for a in 0..g.m_eff {
+                let s = crate::attention::dot_f32(q, &g.k_tilde[a * d..(a + 1) * d]) * g.scale;
+                self.scr_fh[a] = s;
+                f = f.max(s);
+            }
+            for a in 0..g.m_eff {
+                self.scr_fh[a] = (self.scr_fh[a] - f).exp();
+            }
+            // u = (F·e^{-f}) · M — the landmark mixing row (= FM, up to
+            // the positive factor e^{-f}).
+            for b in 0..g.m_eff {
+                let mut s = 0.0f32;
+                for a in 0..g.m_eff {
+                    s += self.scr_fh[a] * self.mu[a * g.m_eff + b];
+                }
+                // FM rectifier: every far weight is Σ_b FM[b]·E[b,j]
+                // with E ≥ 0 elementwise, so clamping this m-vector is
+                // enough to make all of them non-negative — the per-key
+                // guarantee the streaming form otherwise cannot state.
+                // The row shift e^{-f} and the flash factors below are
+                // strictly positive, so clamping here or after the
+                // rescale is the same predicate.
+                self.scr_u[b] = if self.rect == O1Rect::Fm {
+                    s.max(0.0)
+                } else {
+                    s
+                };
+            }
+            // Joint scale: the far term b carries e^{f + m_max[b]}, the
+            // near term e^{c}; take the max so every factor is ≤ 1.
+            for b in 0..g.m_eff {
+                c_all = c_all.max(f + self.m_max[b]);
+            }
+            for b in 0..g.m_eff {
+                let gain = self.scr_u[b] * (f + self.m_max[b] - c_all).exp();
+                self.scr_u[b] = gain;
+                far_den += gain * self.z_hat[b];
+            }
+            // Aggregate guard — the rectifier of `O1Rect::Aggregate`,
+            // and a second line of defence under `Fm` (where far_den is
+            // a sum of non-negative terms, so this can only fire on
+            // rounding): a negative denominator means the skeleton
+            // estimate is unusable for this row — drop the far field.
+            if far_den >= 0.0 {
+                have_far = true;
+            } else {
+                far_den = 0.0;
+            }
+        }
+
+        for o in out.iter_mut() {
+            *o = 0.0;
+        }
+        if have_far {
+            for b in 0..g.m_eff {
+                crate::attention::axpy_f32(out, &self.t_hat[b * dv..(b + 1) * dv], self.scr_u[b]);
+            }
+        }
+        let mut den = far_den;
+        for s in 0..n {
+            let p = (self.scr_s[s] - c_all).exp();
+            den += p;
+            // scr_s rows 0..ns are sinks, the rest are window entries.
+            let vv = if s < ns {
+                &g.sink_v[s * dv..(s + 1) * dv]
+            } else {
+                &g.win_v[(s - ns) * dv..(s - ns + 1) * dv]
+            };
+            crate::attention::axpy_f32(out, vv, p);
+        }
+        let den = den.max(DEN_EPS);
+        for o in out.iter_mut() {
+            *o /= den;
+        }
+    }
+
+    /// Absorb the group's window slot into THIS head's far accumulators
+    /// with the per-landmark flash shift: T̂[i]/Ẑ[i] live at scale
+    /// e^{-m_max[i]}; when a new logit raises the max, existing mass is
+    /// rescaled by e^{old-new} (exactly 0 on first insertion, since
+    /// m_max = -inf).
+    fn far_insert(&mut self, g: &NystromGroup, slot: usize) {
+        let (d, dv) = (g.d, g.dv);
+        // SAFETY of the two slices: slot < w, buffers are w-sized.
+        let k = &g.win_k[slot * d..(slot + 1) * d];
+        let v = &g.win_v[slot * dv..(slot + 1) * dv];
+        // borrow-friendly copies are avoided: far_absorb takes slices.
+        // (g is &, self is &mut — disjoint.)
+        let (m_eff, scale) = (g.m_eff, g.scale);
+        // Runs once per evicted key per head — NEON dot/axpy like the
+        // decode loop (same products, regrouped sums).
+        self.far_absorb_slices(m_eff, d, dv, scale, k, v);
+    }
+
+    /// The insertion math itself, over caller-provided (k, v) — shared
+    /// by the streaming path (window slot) and the reseal re-warm
+    /// (sample ring).
+    fn far_absorb(&mut self, m_eff: usize, d: usize, dv: usize, scale: f32, k: &[f32], v: &[f32]) {
+        self.far_absorb_slices(m_eff, d, dv, scale, k, v);
+    }
+
+    fn far_absorb_slices(
+        &mut self,
+        m_eff: usize,
+        d: usize,
+        dv: usize,
+        scale: f32,
+        k: &[f32],
+        v: &[f32],
+    ) {
+        if self.scr_l.len() < m_eff {
+            self.scr_l.resize(m_eff, 0.0);
+        }
+        for i in 0..m_eff {
+            self.scr_l[i] = crate::attention::dot_f32(&self.q_tilde[i * d..(i + 1) * d], k) * scale;
+        }
+        for i in 0..m_eff {
+            let l = self.scr_l[i];
+            if l > self.m_max[i] {
+                let r = (self.m_max[i] - l).exp();
+                self.z_hat[i] *= r;
+                for e in self.t_hat[i * dv..(i + 1) * dv].iter_mut() {
+                    *e *= r;
+                }
+                self.m_max[i] = l;
+            }
+            let e = (l - self.m_max[i]).exp();
+            self.z_hat[i] += e;
+            crate::attention::axpy_f32(&mut self.t_hat[i * dv..(i + 1) * dv], v, e);
+        }
+        self.far_len += 1;
+    }
+
+    fn memory_bytes(&self) -> usize {
+        (self.t_hat.len()
+            + self.z_hat.len()
+            + self.m_max.len()
+            + self.q_tilde.len()
+            + self.mu.len()
+            + self.scr_s.len()
+            + self.scr_fh.len()
+            + self.scr_u.len()
+            + self.scr_l.len())
+            * std::mem::size_of::<f32>()
+    }
+}
+
+/// Contiguous segment means (the Nyströmformer landmark recipe), f64
+/// accumulation.  The split (i·t)/m matches the Python reference.
+fn seg_means(xs: &[f32], t: usize, d: usize, m: usize) -> Vec<f64> {
+    let mut out = vec![0.0f64; m * d];
+    for i in 0..m {
+        let lo = i * t / m;
+        let hi = (i + 1) * t / m;
+        for j in lo..hi {
+            for c in 0..d {
+                out[i * d + c] += xs[j * d + c] as f64;
+            }
+        }
+        let inv = 1.0 / (hi - lo) as f64;
+        for c in 0..d {
+            out[i * d + c] *= inv;
+        }
+    }
+    out
+}
+
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    let mut s = 0.0f32;
+    for (x, y) in a.iter().zip(b) {
+        s += x * y;
+    }
+    s
+}
+
+/// Regularized pseudo-inverse M = (AᵀA + λI)⁻¹ Aᵀ of a square matrix,
+/// λ = RIDGE_REL·mean(diag(AᵀA)), solved via Cholesky.  f64 internal —
+/// this runs once per prefill on an m×m matrix (m ≤ 32).  If Cholesky
+/// fails (Au numerically singular despite the m_eff clamp), λ grows
+/// tenfold — the jitter fallback of the reference probe.
+/// pub(crate): the FCD polish trainer builds its (constant-in-backward)
+/// mixing matrix with the SAME solver the runtime seals with.
+pub(crate) fn ridge_pinv(a: &[f64], n: usize) -> Vec<f64> {
+    let mut ata = vec![0.0f64; n * n];
+    for i in 0..n {
+        for j in 0..n {
+            let mut s = 0.0;
+            for k in 0..n {
+                s += a[k * n + i] * a[k * n + j];
+            }
+            ata[i * n + j] = s;
+        }
+    }
+    let mean_diag: f64 = (0..n).map(|i| ata[i * n + i]).sum::<f64>() / n as f64;
+    let mut lambda = RIDGE_REL * mean_diag.max(f64::MIN_POSITIVE);
+    for _ in 0..12 {
+        let mut g = ata.clone();
+        for i in 0..n {
+            g[i * n + i] += lambda;
+        }
+        if let Some(l) = cholesky(&mut g, n) {
+            // Solve G·M = Aᵀ column by column; column j of Aᵀ is row j
+            // of A.
+            let mut m_out = vec![0.0f64; n * n];
+            let mut x = vec![0.0f64; n];
+            for j in 0..n {
+                let rhs = &a[j * n..(j + 1) * n];
+                // Forward: L·y = rhs.
+                for i in 0..n {
+                    let mut s = rhs[i];
+                    for k in 0..i {
+                        s -= l[i * n + k] * x[k];
+                    }
+                    x[i] = s / l[i * n + i];
+                }
+                // Backward: Lᵀ·x = y.
+                for i in (0..n).rev() {
+                    let mut s = x[i];
+                    for k in i + 1..n {
+                        s -= l[k * n + i] * x[k];
+                    }
+                    x[i] = s / l[i * n + i];
+                }
+                for i in 0..n {
+                    m_out[i * n + j] = x[i];
+                }
+            }
+            return m_out;
+        }
+        lambda *= 10.0;
+    }
+    // Unreachable in practice: λ eventually dominates the diagonal.
+    // Degrade to a scaled identity rather than poison the output.
+    let mut fallback = vec![0.0f64; n * n];
+    for i in 0..n {
+        fallback[i * n + i] = 1.0 / mean_diag.max(f64::MIN_POSITIVE);
+    }
+    fallback
+}
+
+// ── Runtime configuration (v1: runtime-level, NOT a format change) ──
+//
+// A layer set + {m, w, sink}, resolved in priority order:
+//   1. CLI flag (`--o1` on run/serve/bench) — explicit user intent;
+//   2. env `CMF_O1` (all | deepN | i,j,k | off) with CMF_O1_M /
+//      CMF_O1_WINDOW / CMF_O1_SINK parameter overrides;
+//   3. converter hint in the header JSON (`provenance.o1_attn`,
+//      written by `cortiq convert --o1`) — additive metadata, the
+//      binary envelope is untouched.
+
+/// Validated defaults (spec: m=32, W=128, sink=4; sink ablation ×2.39).
+pub const O1_DEFAULT_M: usize = 32;
+pub const O1_DEFAULT_W: usize = 128;
+pub const O1_DEFAULT_SINK: usize = 4;
+/// Rectifier default (see `O1Rect`).
+pub const O1_DEFAULT_RECT: O1Rect = O1Rect::Aggregate;
+
+/// Which layers run the O(1) kernel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum O1Layers {
+    All,
+    /// The N deepest layers (deep-N ladder of the price map; the
+    /// early stack is the most sink-dependent, depth converts best).
+    Deep(usize),
+    /// Explicit layer indices.
+    List(Vec<usize>),
+}
+
+/// Per-model O(1)-attention setting.
+#[derive(Clone, Debug)]
+pub struct O1Cfg {
+    pub layers: O1Layers,
+    /// Landmark budget (≥ 4; m=64 measured WORSE — collinear segment
+    /// means poison the pinv, so don't "help" by raising it).
+    pub m: usize,
+    /// Exact-window width — the main quality lever.
+    pub w: usize,
+    /// Permanent exact sink keys (StreamingLLM discipline, spec §5b).
+    pub sink: usize,
+    /// Skeleton rectifier (see `O1Rect`).
+    pub rect: O1Rect,
+}
+
+/// Three-state env reading: unset falls through to the header hint,
+/// `off`/`0` force-disables even a header hint (the escape hatch).
+pub enum O1Env {
+    Unset,
+    Off,
+    On(O1Cfg),
+}
+
+impl O1Cfg {
+    /// Parse a layer spec: `all` | `deepN` | `i,j,k`. None = not a spec
+    /// (also used for `off`/`0`/empty).
+    pub fn parse_layers(spec: &str) -> Option<O1Layers> {
+        let s = spec.trim();
+        match s {
+            "" | "off" | "0" | "none" => None,
+            "all" => Some(O1Layers::All),
+            _ => {
+                if let Some(n) = s.strip_prefix("deep") {
+                    return n
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|&n| n > 0)
+                        .map(O1Layers::Deep);
+                }
+                let idx: Result<Vec<usize>, _> =
+                    s.split(',').map(|p| p.trim().parse::<usize>()).collect();
+                idx.ok().filter(|v| !v.is_empty()).map(O1Layers::List)
+            }
+        }
+    }
+
+    /// Parse a rectifier spec: `agg`/`aggregate` | `fm`. None = not a
+    /// spec.
+    pub fn parse_rect(spec: &str) -> Option<O1Rect> {
+        match spec.trim() {
+            "agg" | "aggregate" => Some(O1Rect::Aggregate),
+            "fm" => Some(O1Rect::Fm),
+            _ => None,
+        }
+    }
+
+    /// Rectifier from an explicit value, else `CMF_O1_RECT`, else the
+    /// default.
+    fn rect_or_env(rect: Option<O1Rect>) -> O1Rect {
+        rect.or_else(|| {
+            std::env::var("CMF_O1_RECT")
+                .ok()
+                .as_deref()
+                .and_then(Self::parse_rect)
+        })
+        .unwrap_or(O1_DEFAULT_RECT)
+    }
+
+    /// Build from an explicit spec (CLI path). None = `off` or malformed.
+    /// Explicit m/w/sink/rect beat env overrides beat validated defaults.
+    pub fn from_spec(
+        spec: &str,
+        m: Option<usize>,
+        w: Option<usize>,
+        sink: Option<usize>,
+        rect: Option<O1Rect>,
+    ) -> Option<O1Cfg> {
+        let layers = Self::parse_layers(spec)?;
+        let env = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
+        Some(O1Cfg {
+            layers,
+            // NystromState asserts m ≥ 4 and w ≥ 1 — clamp rather than
+            // panic deep in the first prefill.
+            m: m.or_else(|| env("CMF_O1_M")).unwrap_or(O1_DEFAULT_M).max(4),
+            w: w.or_else(|| env("CMF_O1_WINDOW"))
+                .unwrap_or(O1_DEFAULT_W)
+                .max(1),
+            sink: sink
+                .or_else(|| env("CMF_O1_SINK"))
+                .unwrap_or(O1_DEFAULT_SINK),
+            rect: Self::rect_or_env(rect),
+        })
+    }
+
+    /// Converter hint from the header JSON: `{"layers": "all"|[i,…],
+    /// "m": …, "w": …, "sink": …}`. Env parameter overrides still apply
+    /// (the operator's knob wins over the file's suggestion).
+    pub fn from_json(v: &serde_json::Value) -> Option<O1Cfg> {
+        let layers = match v.get("layers") {
+            Some(serde_json::Value::String(s)) => Self::parse_layers(s)?,
+            Some(serde_json::Value::Array(a)) => O1Layers::List(
+                a.iter()
+                    .filter_map(|x| x.as_u64().map(|n| n as usize))
+                    .collect(),
+            ),
+            _ => return None,
+        };
+        let f = |k: &str| v.get(k).and_then(|x| x.as_u64()).map(|n| n as usize);
+        let env = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<usize>().ok());
+        Some(O1Cfg {
+            layers,
+            m: env("CMF_O1_M")
+                .or_else(|| f("m"))
+                .unwrap_or(O1_DEFAULT_M)
+                .max(4),
+            w: env("CMF_O1_WINDOW")
+                .or_else(|| f("w"))
+                .unwrap_or(O1_DEFAULT_W)
+                .max(1),
+            sink: env("CMF_O1_SINK")
+                .or_else(|| f("sink"))
+                .unwrap_or(O1_DEFAULT_SINK),
+            // The rectifier is a runtime property of the kernel, not a
+            // property of the weights — a file hint cannot pin it.
+            rect: Self::rect_or_env(None),
+        })
+    }
+
+    /// Per-layer flags over `num_layers` (indices past the end are
+    /// silently dropped; the pipeline additionally filters non-Full
+    /// layers — a linear layer keeps its own operator).
+    pub fn layer_flags(&self, num_layers: usize) -> Vec<bool> {
+        let mut flags = vec![false; num_layers];
+        match &self.layers {
+            O1Layers::All => flags.iter_mut().for_each(|f| *f = true),
+            O1Layers::Deep(n) => {
+                for f in flags.iter_mut().skip(num_layers.saturating_sub(*n)) {
+                    *f = true;
+                }
+            }
+            O1Layers::List(idx) => {
+                for &i in idx {
+                    if i < num_layers {
+                        flags[i] = true;
+                    }
+                }
+            }
+        }
+        flags
+    }
+}
+
+/// Read `CMF_O1` (+ parameter overrides) — the embedding-friendly path
+/// for hosts that don't go through the CLI flags.
+pub fn o1_from_env() -> O1Env {
+    match std::env::var("CMF_O1") {
+        Err(_) => O1Env::Unset,
+        Ok(s) => match O1Cfg::from_spec(&s, None, None, None, None) {
+            Some(cfg) => O1Env::On(cfg),
+            None => O1Env::Off,
+        },
+    }
+}
+
+/// In-place lower Cholesky of an SPD matrix; None if a pivot fails.
+fn cholesky(g: &mut [f64], n: usize) -> Option<&[f64]> {
+    for i in 0..n {
+        for j in 0..=i {
+            let mut s = g[i * n + j];
+            for k in 0..j {
+                s -= g[i * n + k] * g[j * n + k];
+            }
+            if i == j {
+                if s <= 0.0 || !s.is_finite() {
+                    return None;
+                }
+                g[i * n + i] = s.sqrt();
+            } else {
+                g[i * n + j] = s / g[j * n + j];
+            }
+        }
+    }
+    Some(g)
+}

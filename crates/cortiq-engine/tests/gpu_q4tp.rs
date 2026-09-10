@@ -1,0 +1,516 @@
+//! The Metal q4tp kernel against the canonical scalar dequant.
+//!
+//! A wrong GPU kernel is the expensive kind of bug: the model still emits
+//! fluent text, so nothing looks broken until someone measures quality. This
+//! pins each backend's kernel to `dequant_q4tp`, the format's definition.
+//!
+//! The tests select their backend through `CMF_GPU`, which is
+//! process-global — and so are the wgpu context and its scratch slots. Run
+//! in parallel they hand each other the same `q4tpmm-stage` buffer, and a
+//! submit lands while the other thread still has it mapped: CI caught
+//! exactly that ("Buffer with 'q4tpmm-stage' label is still mapped"), and
+//! the poisoned scratch mutex then turned one failure into three. The
+//! engine is single-stream by contract (one caller at a time); the parallel
+//! harness is what breaks it, so every test here takes `gpu_serial()`
+//! first. The guard recovers from poisoning on purpose — a real failure
+//! must be reported once, not smeared over its neighbours.
+//!
+//! A backend that fails to come up says so on stderr rather than passing
+//! quietly — check for "skipped" before trusting a green combined run.
+
+use cortiq_core::format::{CMF_VERSION, CmfHeader, CmfModel, TensorSpec};
+use cortiq_core::quant::{
+    GROUP_SIZE, dequant_q4tp, f32_to_f16, q4tp_code_stride, q4tp_put_code, q4tp_sections,
+};
+use cortiq_core::types::{ModelArch, QuantType, TensorDtype};
+
+/// Serialize every GPU test in this binary: see the module note. Poison is
+/// recovered, so the first failure is the only failure reported.
+fn gpu_serial() -> std::sync::MutexGuard<'static, ()> {
+    static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GPU.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Random nibbles plus a per-row ladder whose span varies row to row, so the
+/// codes cover the full 0..31 range instead of clustering on one rung.
+fn synth(rows: usize, cols: usize) -> Vec<u8> {
+    let gpr = cols / GROUP_SIZE;
+    let stride = q4tp_code_stride(gpr);
+    let (params_off, codes_off, _) = q4tp_sections(rows, cols);
+    let mut b = vec![0u8; codes_off + rows * stride];
+    for r in 0..rows {
+        for g in 0..gpr {
+            let t = (r * gpr + g) * 16;
+            for k in 0..16 {
+                b[t + k] = ((r * 31 + g * 7 + k * 13) % 251) as u8;
+            }
+        }
+        let p = params_off + r * 4;
+        b[p..p + 2].copy_from_slice(&f32_to_f16(-6.0 - 0.03 * (r % 17) as f32).to_le_bytes());
+        b[p + 2..p + 4].copy_from_slice(&f32_to_f16(0.01 + 0.004 * (r % 11) as f32).to_le_bytes());
+        let crow = &mut b[codes_off + r * stride..codes_off + (r + 1) * stride];
+        for g in 0..gpr {
+            q4tp_put_code(crow, g, (r * 5 + g * 3) % 32);
+        }
+    }
+    b
+}
+
+/// `tag` keeps the four backend tests off each other's file: cargo runs them
+/// in parallel threads of ONE process, so a shared path had them reading a
+/// model another test was mid-write on — which reads exactly like a broken
+/// kernel.
+fn tiny_model(
+    tag: &str,
+    rows: usize,
+    cols: usize,
+    payload: Vec<u8>,
+) -> (std::sync::Arc<CmfModel>, usize) {
+    let arch: ModelArch = serde_json::from_value(serde_json::json!({
+        "arch_name": "tiny",
+        "hidden_size": cols,
+        "intermediate_size": rows,
+        "num_layers": 1,
+        "num_attention_heads": 2,
+        "num_kv_heads": 1,
+        "head_dim": 4,
+        "vocab_size": rows,
+        "layer_types": ["FullAttention"],
+        "rms_norm_eps": 1e-6,
+        "max_position_embeddings": 8,
+        "linear_conv_kernel_dim": 0,
+        "linear_num_key_heads": 0,
+        "linear_num_value_heads": 0,
+    }))
+    .unwrap();
+    let header = CmfHeader {
+        format: "cmf".into(),
+        version: CMF_VERSION,
+        arch,
+        quant_type: QuantType::Q4Block,
+        provenance: None,
+        tokenizer_config: None,
+        section_hashes: None,
+        skills: Vec::new(),
+        shard: None,
+        calibration: None,
+        routing: None,
+    };
+    let spec = TensorSpec {
+        name: "w".into(),
+        dtype: TensorDtype::Q4TiledP,
+        shape: vec![rows, cols],
+        data: payload,
+    };
+    // The Metal path maps the file and refuses tensors whose payload would
+    // run past the mapped span, so leave slack behind the weight.
+    let pad = TensorSpec {
+        name: "pad".into(),
+        dtype: TensorDtype::F32,
+        shape: vec![8192, 2],
+        data: vec![0u8; 8192 * 8],
+    };
+    let dir = std::env::temp_dir().join(format!("cmf-q4tp-{}-{tag}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("m.cmf");
+    CmfModel::write(&path, &header, &[spec, pad], None, None).unwrap();
+    let model = std::sync::Arc::new(CmfModel::open(&path).unwrap());
+    let idx = model.tensor_index("w").unwrap();
+    (model, idx)
+}
+
+/// Compare a backend's kernel against the scalar dequant over a whole tensor.
+fn check(
+    tag: &str,
+    run: impl Fn(&std::sync::Arc<CmfModel>, usize, &[f32], usize, usize, &mut [f32]) -> bool,
+) {
+    let (rows, cols) = (512usize, 1024usize);
+    let payload = synth(rows, cols);
+    let mut w = vec![0f32; rows * cols];
+    dequant_q4tp(&payload, rows, cols, &mut w);
+    let (model, idx) = tiny_model(tag, rows, cols, payload);
+
+    let xs: Vec<f32> = (0..cols)
+        .map(|i| ((i * 37 + 11) % 101) as f32 / 101.0 - 0.5)
+        .collect();
+    let mut got = vec![0f32; rows];
+    assert!(
+        run(&model, idx, &xs, rows, cols, &mut got),
+        "GPU refused a well-formed q4tp tensor"
+    );
+
+    for r in 0..rows {
+        let want: f32 = (0..cols).map(|c| w[r * cols + c] * xs[c]).sum();
+        // Tolerance against the summed magnitude, not the result: these dot
+        // products cancel, and GPU/CPU differ only in summation order.
+        let mag: f32 = (0..cols).map(|c| (w[r * cols + c] * xs[c]).abs()).sum();
+        assert!(
+            (got[r] - want).abs() <= 1e-5 * mag,
+            "row {r}: GPU {} vs dequant {want}",
+            got[r]
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn metal_q4tp_matvec_matches_dequant_reference() {
+    let _gpu = gpu_serial();
+    unsafe { std::env::set_var("CMF_GPU", "1") };
+    // NOT a silent skip. A broken MSL kernel makes ctx() fail, Metal falls
+    // back to CPU, and `enabled()` goes false — so an early return here turns
+    // "the shader does not compile" into a green test. That shipped a dead
+    // Metal backend in 0.5.40. On macOS the backend must come up.
+    assert!(
+        cortiq_engine::gpu_metal::enabled(),
+        "Metal did not initialize — check the MSL compile log above"
+    );
+    check("metal-mv", cortiq_engine::gpu_metal::q4tp_matvec_for_test);
+}
+
+/// wgpu covers Vulkan/DX12; `CMF_GPU=wgpu` selects it on macOS too, so this
+/// runs locally instead of only on the machines that have no other backend.
+#[cfg(feature = "gpu")]
+#[test]
+fn wgpu_q4tp_matvec_matches_dequant_reference() {
+    let _gpu = gpu_serial();
+    unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+    if !cortiq_engine::gpu_wgpu::enabled() {
+        eprintln!("skipped: no wgpu adapter");
+        return;
+    }
+    check("wgpu-mv", cortiq_engine::gpu_wgpu::q4tp_matvec_for_test);
+}
+
+/// The batched MATVEC — the mv4/mv16 pair with `_p0 > 1`, which is a
+/// different kernel from the GEMM above. It carries the whole prefill chunk
+/// and every speculative verify, and it shares its inner loop with decode's
+/// matvec: a bug in the batch dimension is one row-block boundary away from
+/// being a bug in decode. Both row blockings are covered — 16 rows when the
+/// shape is narrow, 8 when it is wide — because the batch offset is computed
+/// per block and the two compute it separately.
+#[cfg(feature = "gpu")]
+#[test]
+fn wgpu_q4tp_matvec_batch_matches_dequant_reference() {
+    let _gpu = gpu_serial();
+    unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+    if !cortiq_engine::gpu_wgpu::enabled() {
+        eprintln!("skipped: no wgpu adapter");
+        return;
+    }
+    // cols 512 -> gpr 16, the 16-row kernel; cols 4096 -> gpr 128, the 8-row.
+    //
+    // The models are built up front and HELD. The device-side weight cache is
+    // keyed by the mapping's address, so a model dropped mid-loop frees an
+    // address the next mmap can take — and the second shape then reads the
+    // first one's weights. That is a test bug that reads exactly like a
+    // broken kernel, and it cost a bisect to tell apart.
+    let mut built = Vec::new();
+    // 200 rows divides neither blocking: the batch is the fast axis, so a
+    // ragged tail is a tail of the LAST row block, not a block straddling two
+    // batch elements. That distinction is the whole correctness argument.
+    for (rows, cols) in [(256usize, 512usize), (128, 4096), (200, 512)] {
+        let payload = synth(rows, cols);
+        let mut w = vec![0f32; rows * cols];
+        dequant_q4tp(&payload, rows, cols, &mut w);
+        let (model, idx) = tiny_model(&format!("wgpu-mvb-{rows}-{cols}"), rows, cols, payload);
+        built.push((rows, cols, w, model, idx));
+    }
+    for (rows, cols, w, model, idx) in &built {
+        let (rows, cols, idx) = (*rows, *cols, *idx);
+        // 5 is production: the draft block is five positions wide. 3 is
+        // the short block near EOS, where the verify is truncated.
+        // 6..8 exercise the chunked arm: batches past four re-read the
+        // weight once per chunk of four inside the kernel, and a chunk
+        // boundary landing mid-row-block would read one chunk's weights
+        // against another's activations. 7 is deliberately odd.
+        for b in [1usize, 2, 3, 4, 5, 6, 7, 8] {
+            let xs: Vec<f32> = (0..b * cols)
+                .map(|i| ((i * 29 + 13) % 103) as f32 / 103.0 - 0.5)
+                .collect();
+            let mut got = vec![0f32; b * rows];
+            assert!(
+                cortiq_engine::gpu_wgpu::q4tp_matvec_batch_for_test(
+                    model, idx, &xs, b, rows, cols, &mut got
+                ),
+                "GPU refused a well-formed batched q4tp matvec ({rows}x{cols}, b={b})"
+            );
+            // Every batch element against the SAME weight, which is the claim
+            // the kernel makes: one read, B uses.
+            for t in 0..b {
+                let x = &xs[t * cols..(t + 1) * cols];
+                for r in 0..rows {
+                    let want: f32 = (0..cols).map(|c| w[r * cols + c] * x[c]).sum();
+                    let mag: f32 = (0..cols).map(|c| (w[r * cols + c] * x[c]).abs()).sum();
+                    assert!(
+                        (got[t * rows + r] - want).abs() <= 1e-4 * mag,
+                        "{rows}x{cols} b={b} token {t} row {r}: GPU {} vs dequant {want}",
+                        got[t * rows + r]
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Same idea for the batched GEMM. Prefill runs through this kernel, so a
+/// wrong one corrupts the prompt while decode still looks fine — the failure
+/// mode is a model that answers a question it was never asked.
+fn check_mm(
+    tag: &str,
+    run: impl Fn(&std::sync::Arc<CmfModel>, usize, &[f32], usize, usize, usize, &mut [f32]) -> bool,
+) {
+    check_mm_b(tag, 48, &run);
+    // b=1 is the lm_head route: `gpu::q4tp_matvec` is this kernel with a
+    // batch of one, and a GEMM that only ever ran at b=48 could carry a
+    // tail bug that decode — not prefill — would be the one to hit.
+    check_mm_b(tag, 1, &run);
+}
+
+fn check_mm_b(
+    tag: &str,
+    b: usize,
+    run: &impl Fn(&std::sync::Arc<CmfModel>, usize, &[f32], usize, usize, usize, &mut [f32]) -> bool,
+) {
+    let (rows, cols) = (256usize, 512usize);
+    let payload = synth(rows, cols);
+    let mut w = vec![0f32; rows * cols];
+    dequant_q4tp(&payload, rows, cols, &mut w);
+    let (model, idx) = tiny_model(tag, rows, cols, payload);
+
+    let xs: Vec<f32> = (0..b * cols)
+        .map(|i| ((i * 29 + 13) % 103) as f32 / 103.0 - 0.5)
+        .collect();
+    let mut got = vec![0f32; b * rows];
+    assert!(
+        run(&model, idx, &xs, b, rows, cols, &mut got),
+        "GPU refused a well-formed q4tp GEMM"
+    );
+
+    for t in 0..b {
+        let x = &xs[t * cols..(t + 1) * cols];
+        for r in 0..rows {
+            let want: f32 = (0..cols).map(|c| w[r * cols + c] * x[c]).sum();
+            let mag: f32 = (0..cols).map(|c| (w[r * cols + c] * x[c]).abs()).sum();
+            assert!(
+                (got[t * rows + r] - want).abs() <= 1e-4 * mag,
+                "batch {t} row {r}: GPU {} vs dequant {want}",
+                got[t * rows + r]
+            );
+        }
+    }
+}
+
+/// The Metal batched matvec (the speculative verify's kernel) against
+/// the dequant reference on every batch it serves — same 1e-4 band as
+/// the wgpu one; on macOS only.
+#[cfg(target_os = "macos")]
+#[test]
+fn metal_q4tp_matvec_batch_matches_dequant_reference() {
+    unsafe { std::env::set_var("CMF_GPU", "1") };
+    if !cortiq_engine::gpu::enabled_here() {
+        eprintln!("no Metal here — skipping");
+        return;
+    }
+    let mut built = Vec::new();
+    for (rows, cols) in [(256usize, 512usize), (128, 4096), (200, 512)] {
+        let payload = synth(rows, cols);
+        let mut w = vec![0f32; rows * cols];
+        dequant_q4tp(&payload, rows, cols, &mut w);
+        let (model, idx) = tiny_model(&format!("metal-mvb-{rows}-{cols}"), rows, cols, payload);
+        built.push((rows, cols, w, model, idx));
+    }
+    for (rows, cols, w, model, idx) in &built {
+        let (rows, cols, idx) = (*rows, *cols, *idx);
+        for b in [1usize, 2, 3, 5, 8] {
+            let xs: Vec<f32> = (0..b * cols)
+                .map(|i| ((i * 29 + 13) % 103) as f32 / 103.0 - 0.5)
+                .collect();
+            let mut got = vec![0f32; b * rows];
+            assert!(
+                cortiq_engine::gpu_metal::q4tp_matvec_batch(
+                    model, idx, &xs, b, rows, cols, &mut got
+                ),
+                "Metal refused a batched q4tp matvec ({rows}x{cols}, b={b})"
+            );
+            for t in 0..b {
+                let x = &xs[t * cols..(t + 1) * cols];
+                for r in 0..rows {
+                    let want: f32 = (0..cols).map(|c| w[r * cols + c] * x[c]).sum();
+                    let mag: f32 = (0..cols).map(|c| (w[r * cols + c] * x[c]).abs()).sum();
+                    assert!(
+                        (got[t * rows + r] - want).abs() <= 1e-4 * mag,
+                        "{rows}x{cols} b={b} token {t} row {r}: GPU {} vs dequant {want}",
+                        got[t * rows + r]
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The Metal narrow simdgroup-matrix GEMM (`q4tp_mul_mm_n8`, the verify's
+/// projection kernel: 64 rows × ≤8 batch, half-staged) against the
+/// dequant reference. Half staging bounds it at ~1e-3 relative per
+/// element, so the band is 2e-3 of the row's absolute mass (the f32
+/// kernels hold 1e-4). cols must be a multiple of 128.
+#[cfg(target_os = "macos")]
+#[test]
+fn metal_q4tp_mm_n8_matches_dequant_reference() {
+    unsafe { std::env::set_var("CMF_GPU", "1") };
+    assert!(
+        cortiq_engine::gpu_metal::enabled(),
+        "Metal did not initialize — check the MSL compile log above"
+    );
+    let mut built = Vec::new();
+    for (rows, cols) in [(256usize, 512usize), (100, 4096), (65, 1152)] {
+        let payload = synth(rows, cols);
+        let mut w = vec![0f32; rows * cols];
+        dequant_q4tp(&payload, rows, cols, &mut w);
+        let (model, idx) = tiny_model(&format!("metal-n8-{rows}-{cols}"), rows, cols, payload);
+        built.push((rows, cols, w, model, idx));
+    }
+    for (rows, cols, w, model, idx) in &built {
+        let (rows, cols, idx) = (*rows, *cols, *idx);
+        for b in [1usize, 3, 8] {
+            let xs: Vec<f32> = (0..b * cols)
+                .map(|i| ((i * 29 + 13) % 103) as f32 / 103.0 - 0.5)
+                .collect();
+            let mut got = vec![0f32; b * rows];
+            assert!(
+                cortiq_engine::gpu_metal::q4tp_mm_n8_batch(
+                    model, idx, &xs, b, rows, cols, &mut got
+                ),
+                "Metal refused the n8 GEMM ({rows}x{cols}, b={b})"
+            );
+            for t in 0..b {
+                let x = &xs[t * cols..(t + 1) * cols];
+                for r in 0..rows {
+                    let want: f32 = (0..cols).map(|c| w[r * cols + c] * x[c]).sum();
+                    let mag: f32 = (0..cols).map(|c| (w[r * cols + c] * x[c]).abs()).sum();
+                    assert!(
+                        (got[t * rows + r] - want).abs() <= 2e-3 * mag,
+                        "{rows}x{cols} b={b} token {t} row {r}: n8 {} vs dequant {want}",
+                        got[t * rows + r]
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn metal_q4tp_matmat_matches_dequant_reference() {
+    let _gpu = gpu_serial();
+    unsafe { std::env::set_var("CMF_GPU", "1") };
+    // NOT a silent skip. A broken MSL kernel makes ctx() fail, Metal falls
+    // back to CPU, and `enabled()` goes false — so an early return here turns
+    // "the shader does not compile" into a green test. That shipped a dead
+    // Metal backend in 0.5.40. On macOS the backend must come up.
+    assert!(
+        cortiq_engine::gpu_metal::enabled(),
+        "Metal did not initialize — check the MSL compile log above"
+    );
+    check_mm("metal-mm", cortiq_engine::gpu_metal::q4tp_matmat);
+}
+
+#[cfg(feature = "gpu")]
+#[test]
+fn wgpu_q4tp_matmat_matches_dequant_reference() {
+    let _gpu = gpu_serial();
+    unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+    if !cortiq_engine::gpu_wgpu::enabled() {
+        eprintln!("skipped: no wgpu adapter");
+        return;
+    }
+    check_mm("wgpu-mm", cortiq_engine::gpu_wgpu::q4tp_matmat);
+}
+
+/// What a batch actually COSTS. The parity test says the answer is right;
+/// this says whether it is cheaper, which is the only reason to want it.
+///
+/// The whole speculative design rests on one number: a trunk pass over B
+/// drafted tokens has to cost far less than B passes, or verifying five
+/// proposals costs five tokens and the draft is pure overhead. Ignored by
+/// default because it wants a real GPU and a few seconds:
+///     cargo test --features gpu --test gpu_q4tp -- --ignored --nocapture
+#[cfg(feature = "gpu")]
+#[test]
+#[ignore]
+fn wgpu_q4tp_batch_cost() {
+    let _gpu = gpu_serial();
+    unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+    assert!(cortiq_engine::gpu_wgpu::enabled(), "нет адаптера wgpu");
+    // Two shapes off the release: a layer projection, and the head.
+    // Shape decides everything here. 4096 rows is 256 workgroups, which
+    // already saturates the card at B=1 — extra batch elements there must
+    // cost proportionally, and do. The trunk's real projections are narrow:
+    // wkv is 512 rows (32 workgroups), wq_a 1024, wo_b 4096. A kernel that
+    // leaves the card idle at B=1 is where a batch can be nearly free, and
+    // measuring only the wide shape would have hidden that entirely.
+    // The last two are the Qwen3.6-27B dense FFN exactly (gate/up and
+    // down at hidden 5120, inter 17408). A speculative verify spends half
+    // its device time there, so a batch kernel that is only measured on
+    // 4096-square shapes has not been measured where it is paid for.
+    // CMF_COST_SHAPES="rows:cols,..." overrides the list.
+    let shapes: Vec<(usize, usize)> = match std::env::var("CMF_COST_SHAPES") {
+        Ok(s) => s
+            .split(',')
+            .filter_map(|p| {
+                let (r, c) = p.split_once(':')?;
+                Some((r.trim().parse().ok()?, c.trim().parse().ok()?))
+            })
+            .collect(),
+        Err(_) => vec![
+            (512usize, 4096usize),
+            (1024, 4096),
+            (4096, 4096),
+            (129280, 4096),
+            (17408, 5120),
+            (5120, 17408),
+        ],
+    };
+    for (rows, cols) in shapes {
+        let payload = synth(rows, cols);
+        let (model, idx) = tiny_model(&format!("cost-{rows}x{cols}"), rows, cols, payload);
+        let mut base = 0f64;
+        // 3 is the verify width a k=2 draft produces — the one shape the
+        // decode actually runs, and the powers of two had skipped it.
+        for b in [1usize, 2, 3, 4, 8] {
+            let xs: Vec<f32> = (0..b * cols)
+                .map(|i| (i % 97) as f32 / 97.0 - 0.5)
+                .collect();
+            let mut got = vec![0f32; b * rows];
+            // Warm: the first call uploads the weight and builds the groups.
+            for _ in 0..2 {
+                assert!(cortiq_engine::gpu_wgpu::q4tp_matvec_batch_for_test(
+                    &model, idx, &xs, b, rows, cols, &mut got
+                ));
+            }
+            let reps = 20;
+            let t = std::time::Instant::now();
+            for _ in 0..reps {
+                cortiq_engine::gpu_wgpu::q4tp_matvec_batch_for_test(
+                    &model, idx, &xs, b, rows, cols, &mut got,
+                );
+            }
+            let ms = t.elapsed().as_secs_f64() * 1000.0 / reps as f64;
+            if b == 1 {
+                base = ms;
+            }
+            // GB/s counts the weight ONCE: at 4 bits plus the tiled
+            // params that is what a batch-blocked kernel has to move,
+            // and the number says outright whether the bus or the ALU
+            // is the wall.
+            let wbytes = (rows * cols) as f64 * 0.5;
+            eprintln!(
+                "СТОИМОСТЬ {rows}x{cols} B={b}: {ms:.3} мс, {:.2}x от B=1, \
+                 на токен {:.3} мс, вес-один-раз {:.0} ГБ/с",
+                ms / base,
+                ms / b as f64,
+                wbytes / (ms / 1000.0) / 1e9
+            );
+        }
+    }
+}

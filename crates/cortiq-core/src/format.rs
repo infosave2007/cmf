@@ -1,0 +1,1905 @@
+//! CMF v2 binary container — envelope, tensor directory, mmap access.
+//!
+//! See `docs/CMF_V2_SPEC.md`. Layout summary:
+//!
+//! ```text
+//! [0x00]  magic "CMF\x01" | version u32 = 2 | flags u32 | required_features u32
+//! [0x10]  header_off/len | dir_off/len | data_off/len   (u64 LE each)
+//! [0x40]  masks_off/len  | vocab_off/len | index_off/len
+//! [0x70]  16 reserved bytes (zero)
+//! [0x80]  header JSON → tensor directory → weight blob (4096-aligned,
+//!         tensors 64-aligned) → masks → vocab → sparse index
+//! ```
+//!
+//! The tensor directory is the ONLY source of truth for the weight blob
+//! layout — there is no computable layout, by design (v1 bug class #1).
+//! Every validation failure is a hard error: no silent fallbacks.
+
+use crate::hash::hash64;
+use crate::mask::{MaskCatalog, TaskMask, decode_masks_section, encode_masks_section};
+use crate::quant::expected_nbytes;
+use crate::types::{ModelArch, QuantType, TensorDtype};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{self, BufWriter, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+
+pub const CMF_MAGIC: [u8; 4] = *b"CMF\x01";
+pub const CMF_VERSION: u32 = 2;
+pub const ENVELOPE_LEN: usize = 128;
+/// Weight blob is page-aligned for mmap.
+pub const DATA_ALIGNMENT: u64 = 4096;
+/// Every tensor inside the blob is 64-byte aligned (SIMD / cache line).
+pub const TENSOR_ALIGNMENT: u64 = 64;
+/// Tensors at least this large are additionally page-aligned to
+/// [`LARGE_TENSOR_ALIGN`], so a cold skill / MoE-expert / mask weight sits on
+/// its own page(s): the "unused weights cost 0 RSS" guarantee then holds at
+/// page granularity (a lazily-paged tensor pulls exactly its own bytes, not a
+/// neighbour's), and per-layer `madvise(WILLNEED)` covers clean ranges. Small
+/// tensors (norms, biases, 1-D f16) keep the 64-byte SIMD alignment so the
+/// padding stays negligible.
+pub const LARGE_TENSOR_MIN: u64 = 16 * 1024;
+/// Page alignment applied to large tensors. 4096 is the common page size
+/// (x86, most ARM/Android); it is a multiple of [`TENSOR_ALIGNMENT`], so
+/// existing readers — which only require `off % 64 == 0` — accept these files
+/// unchanged. Purely a writer-side, backward-compatible layout choice.
+pub const LARGE_TENSOR_ALIGN: u64 = 4096;
+/// One directory record is 56 bytes (see `.vmfc` v2).
+pub const DIR_RECORD_LEN: usize = 56;
+pub const DIR_MAX_NDIM: usize = 6;
+
+/// `required_features` bits. A reader MUST refuse a file with any bit
+/// it does not support.
+pub mod features {
+    pub const TENSOR_DIR: u32 = 1 << 0;
+    pub const BINARY_MASKS: u32 = 1 << 1;
+    pub const QUANT_2F: u32 = 1 << 2;
+    pub const DELTA_MASKS: u32 = 1 << 3;
+    pub const HOT_PACKS: u32 = 1 << 4;
+    /// FFN mask rows are stored PER VIRTUAL LAYER (physical × loops) so
+    /// a Looped Transformer can mask a neuron in one pass and keep it in
+    /// the other. A reader without this bit would slice the mask area by
+    /// the physical count and misread every row after the first pass —
+    /// silently — so the bit makes it refuse instead.
+    pub const LOOP_MASKS: u32 = 1 << 5;
+    /// The file is a STANDALONE SKILL — a partial tensor set cut against a
+    /// specific base (`SkillRecord.base_dir_hash`), not a runnable model.
+    /// Readers that predate the bit refuse the file loudly instead of
+    /// running half a network; runtimes that know it refuse to RUN it and
+    /// say `cortiq skill apply` instead.
+    pub const SKILL_FILE: u32 = 1 << 6;
+
+    /// Features this reader implements today.
+    pub const SUPPORTED: u32 = TENSOR_DIR | BINARY_MASKS | QUANT_2F | LOOP_MASKS | SKILL_FILE;
+}
+
+/// JSON header — architecture and provenance (human-readable part;
+/// machine-critical data lives in binary sections).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CmfHeader {
+    #[serde(default = "default_format")]
+    pub format: String,
+    pub version: u32,
+    pub arch: ModelArch,
+    /// Informational default; per-tensor truth is in the directory.
+    pub quant_type: QuantType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<serde_json::Value>,
+    /// Chat/eos bundle (spec §6.1): the file — not the binary — defines
+    /// chat behavior. Additive: absent in older files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokenizer_config: Option<TokenizerBundle>,
+    /// Section-level integrity (spec §8.1): hex hash64 of the raw bytes
+    /// of the optional sections. header/dir hashes live in the envelope
+    /// reserved bytes — JSON cannot protect the JSON that carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section_hashes: Option<SectionHashes>,
+    /// Per-skill records (spec §9): replacement tensors live in the
+    /// directory as `skill.{id}.{name}`; this registry carries the
+    /// selection descriptor and the honest quality contract.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<SkillRecord>,
+    /// Sharding (spec §10): this file is shard `no` of `count`; every
+    /// shard is a standalone valid .cmf carrying a tensor subset.
+    /// Naming convention: `…-{no:05}-of-{count:05}.cmf`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard: Option<ShardInfo>,
+    /// Measured confidence calibration (B1): a temperature fit on held-out
+    /// so the displayed softmax confidence is a true property of the
+    /// model (softmax(logits/T)), not a raw estimate. Additive; absent =
+    /// use raw (T=1). Written by `set_calibration.py` after `cortiq
+    /// calibrate` measures the reliability/ECE.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibration: Option<Calibration>,
+    /// Skill-router calibration (spec §9 routing; the cortiq-router recipe):
+    /// temperature of the softmax over −error and the novelty threshold θ,
+    /// fitted on the skills' held-out φ samples carried in their descriptors.
+    /// Additive; absent = raw recon-argmin with a fixed E threshold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<RoutingCalibration>,
+}
+
+/// Router calibration (see `SelectionDescriptor`): the recipe of the
+/// cortiq-router service. Confidence is `softmax(−err/T)`; novelty is
+/// `0.5·σ(z_top) + 0.25·1/(1+8·margin) + 0.25·(1−confidence)`; an input is
+/// novel iff its novelty exceeds θ, the `1−fpr` quantile of the in-scope
+/// held-out novelty scores.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingCalibration {
+    pub temperature: f32,
+    pub novelty_theta: f32,
+    /// held-out samples the calibration used
+    pub samples: usize,
+    /// target in-scope false-positive rate of the novelty flag
+    pub target_fpr: f32,
+}
+
+/// Confidence-calibration record (spec §6.2). `temperature` scales the
+/// logits before softmax when reporting confidence; `ece_before`/`after`
+/// are the measured Expected Calibration Error (honest provenance).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Calibration {
+    pub temperature: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ece_before: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ece_after: Option<f32>,
+}
+
+/// Shard coordinates (1-based, gguf-split style).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardInfo {
+    pub no: usize,
+    pub count: usize,
+}
+
+/// Recon-argmin routing parameters (spec §9; P1 signal-consistency):
+/// E = ‖(φ−mean) − B·Bᵀ(φ−mean)‖² / ‖φ−mean‖²; pick argmin over skills.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectionDescriptor {
+    /// "mse" (normalized reconstruction error) — the only metric today.
+    pub metric: String,
+    /// Backbone layer whose mean-pooled hidden is φ(x).
+    pub phi_layer: usize,
+    /// Subspace mean, f16 LE base64, len = hidden.
+    pub mean: String,
+    /// Orthonormal basis rows, f16 LE base64, len = rank·hidden.
+    pub basis: String,
+    pub rank: usize,
+    /// Training reconstruction-error statistics (mean, std) — the z-score
+    /// "energy" of the novelty ensemble. Additive (cortiq-router recipe).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub err_mean: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub err_std: Option<f32>,
+    /// Held-out in-scope φ samples, f16 LE base64, len = holdout_n·hidden —
+    /// what the file-level temperature/θ calibration is fitted on, so a
+    /// container recalibrates itself after every appended skill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holdout: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holdout_n: Option<usize>,
+}
+
+/// One skill of the swarm (spec §9; Patent 15 per-skill record).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillRecord {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Layers this skill specializes (a proper subset).
+    #[serde(default)]
+    pub layers: Vec<usize>,
+    /// Selection descriptor for recon-argmin routing (208c, P1):
+    /// per-skill affine subspace over φ(x) = mean-pooled hidden state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<SelectionDescriptor>,
+    /// Optional input-mask task name (208b), applied with the skill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_mask_task: Option<String>,
+    /// Measured quality (claim 16): overlaid vs backbone, held-out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality: Option<serde_json::Value>,
+
+    // ── Standalone-skill-file keys (features::SKILL_FILE) ──
+    /// hex hash64 of the BASE model's tensor directory this skill was cut
+    /// against. `skill apply` refuses a base whose directory hash differs:
+    /// a skill is a delta against exact bytes, not an architecture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_dir_hash: Option<String>,
+    /// The base's architecture name — the cheap human-readable identity
+    /// check next to the exact one above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_arch: Option<String>,
+    /// Mask-catalog task this skill activates once applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    /// Free-form provenance: corpus, steps, recipe, who baked it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<serde_json::Value>,
+}
+
+/// Hex-encoded hash64 per optional section (u64 as JSON number would
+/// lose precision past 2^53).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SectionHashes {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub masks: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vocab: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<String>,
+}
+
+/// Chat template + generation stop tokens carried by the container.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TokenizerBundle {
+    /// Jinja chat template (chat_template.jinja / tokenizer_config.json)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_template: Option<String>,
+    /// All ids that terminate generation (generation_config + im_end)
+    #[serde(default)]
+    pub eos_token_ids: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bos_token_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pad_token_id: Option<u32>,
+}
+
+fn default_format() -> String {
+    "cmf".to_string()
+}
+
+/// One tensor directory entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TensorEntry {
+    pub name: String,
+    pub dtype: TensorDtype,
+    pub shape: Vec<usize>,
+    /// Offset relative to the OWNING shard's `data_off`, multiple of 64.
+    pub off: u64,
+    pub nbytes: u64,
+    /// Runtime-only: which shard's mmap holds the bytes (0 for the
+    /// single-file case; not part of the 56-byte record).
+    pub shard: usize,
+    /// `hash64` of the tensor bytes.
+    pub hash: u64,
+}
+
+impl TensorEntry {
+    pub fn n_elems(&self) -> usize {
+        self.shape.iter().product()
+    }
+}
+
+/// Input for the Rust writer: one tensor with its encoded bytes.
+#[derive(Debug, Clone)]
+pub struct TensorSpec {
+    pub name: String,
+    pub dtype: TensorDtype,
+    pub shape: Vec<usize>,
+    pub data: Vec<u8>,
+}
+
+/// `TensorSpec` with a borrowed payload — see [`CmfModel::write_ref`].
+pub struct TensorSpecRef<'a> {
+    pub name: String,
+    pub dtype: TensorDtype,
+    pub shape: Vec<usize>,
+    pub data: &'a [u8],
+}
+
+/// Sparse index entry — precomputed per-task per-layer active group IDs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SparseIndexEntry {
+    pub task_id: u32,
+    pub layer_idx: usize,
+    /// Active quant-group indices for FFN (sorted, group = 32 neurons).
+    pub active_ffn_groups: Vec<u16>,
+    /// Active head indices for attention (sorted).
+    pub active_heads: Vec<u8>,
+}
+
+/// Section ranges parsed from the fixed envelope.
+#[derive(Debug, Clone, Copy, Default)]
+struct Envelope {
+    required_features: u32,
+    header: (u64, u64),
+    dir: (u64, u64),
+    data: (u64, u64),
+    masks: (u64, u64),
+    vocab: (u64, u64),
+    index: (u64, u64),
+    /// hash64 of the header JSON bytes (reserved [0x70]); 0 = absent.
+    header_hash: u64,
+    /// hash64 of the tensor-directory bytes (reserved [0x78]); 0 = absent.
+    dir_hash: u64,
+}
+
+enum Backing {
+    Mmap(memmap2::Mmap),
+    Owned(Vec<u8>),
+}
+
+impl Backing {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Backing::Mmap(m) => m,
+            Backing::Owned(v) => v,
+        }
+    }
+}
+
+/// A loaded CMF model: metadata owned, weights zero-copy via mmap.
+pub struct CmfModel {
+    pub path: PathBuf,
+    /// Identifies THIS open of the file, monotonically. GPU backends cache
+    /// device weights by (model, tensor); keying that on the mapping's
+    /// address made a reloaded model inherit the previous one's buffers
+    /// whenever the new mmap landed where the old had been — silent wrong
+    /// weights in any process that unloads and reloads, which a server does.
+    uid: u64,
+    pub header: CmfHeader,
+    pub required_features: u32,
+    pub tensors: Vec<TensorEntry>,
+    /// name-hash → tensor index. Keying on the hash (not the name) avoids
+    /// cloning every tensor name into the map at `open()` — that halves the
+    /// open-time allocations and the map's footprint, which matters for large
+    /// MoE / skills files with tens of thousands of tensors. A genuine 64-bit
+    /// hash collision between two *distinct* names — astronomically unlikely —
+    /// lands in `name_overflow`, so lookups stay exact.
+    by_name: HashMap<u64, u32>,
+    name_overflow: Vec<u32>,
+    pub masks: MaskCatalog,
+    pub sparse_index: Vec<SparseIndexEntry>,
+    /// Embedded tokenizer.json bytes, if present.
+    pub vocab: Option<Vec<u8>>,
+    backing: Backing,
+    data_off: u64,
+    envelope: Envelope,
+    /// Shards 2..N (spec §10): (backing, data_off) per extra file;
+    /// `TensorEntry.shard` 0 = this file, i>0 = extra_shards[i-1].
+    extra_shards: Vec<(Backing, u64)>,
+}
+
+impl std::fmt::Debug for CmfModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CmfModel")
+            .field("path", &self.path)
+            .field("arch", &self.header.arch.arch_name)
+            .field("tensors", &self.tensors.len())
+            .field("masks", &self.masks.masks.len())
+            .finish()
+    }
+}
+
+/// Hands out a fresh id per open. Wraps only after 2^64 opens.
+static MODEL_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+impl CmfModel {
+    /// A key that is unique to this open of the file and never recycled.
+    /// Backends that cache anything derived from the weights must key on
+    /// this, not on the mapping's address, which the allocator reuses.
+    pub fn uid(&self) -> u64 {
+        self.uid
+    }
+
+    /// Open and strictly validate a CMF v2 file. Any inconsistency is an
+    /// error — this function never substitutes defaults.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, CmfError> {
+        let path = path.as_ref().to_path_buf();
+        if !path.exists() {
+            return Err(CmfError::FileNotFound(path.display().to_string()));
+        }
+        let file = File::open(&path)?;
+        let file_len = file.metadata()?.len();
+
+        let backing = match unsafe { memmap2::MmapOptions::new().map(&file) } {
+            Ok(m) => {
+                // Decode touches every weight page each token, so tell
+                // the kernel up front: WillNeed front-loads readahead
+                // (first-token page-fault storm becomes streaming I/O —
+                // this is TTFT on phones, where the file is a large
+                // share of RAM). Advisory only: a memory-pressured
+                // kernel is free to ignore it. CMF_MMAP_ADVISE=0 turns
+                // it off; CMF_MLOCK=1 additionally tries to pin the
+                // mapping (needs RLIMIT_MEMLOCK headroom — refusal is
+                // logged, not fatal).
+                #[cfg(unix)]
+                {
+                    // …unless these pages are headed for a device that will
+                    // then drop them. Reading the file ahead only to throw it
+                    // out behind the uploader has the kernel fetching the same
+                    // bytes twice. The two advices contradict each other, so
+                    // the one that asked for eviction wins.
+                    //
+                    // The conditions are the uploader's, approximated from what
+                    // is knowable at open time (the GPU is not up yet): Linux,
+                    // because `evict_ranges` is a no-op elsewhere; a backend
+                    // actually requested, because a CPU run wants the readahead;
+                    // and eviction not turned off. On UMA the mapping IS the
+                    // working copy and nothing is evicted — that is why this
+                    // cannot key on `CMF_GPU` alone.
+                    let evicting = cfg!(target_os = "linux")
+                        && std::env::var("CMF_GPU").is_ok_and(|v| v != "0" && v != "off")
+                        && std::env::var("CMF_UPLOAD_EVICT")
+                            .map(|v| v != "0")
+                            .unwrap_or(true);
+                    // WILLNEED is a whole-file readahead and macOS runs it
+                    // SYNCHRONOUSLY — on a 12.9 GB MoE file it held open()
+                    // for ~6.5 s while polluting RAM with experts that a
+                    // routed decode never touches. Small dense files keep
+                    // the readahead (it pays there); big files rely on
+                    // demand paging. CMF_MMAP_ADVISE=1 forces the old
+                    // blanket advise, =0 disables it entirely.
+                    const ADVISE_CAP: usize = 4 << 30;
+                    let advise = match std::env::var("CMF_MMAP_ADVISE").as_deref() {
+                        Ok("0") => false,
+                        Ok("1") => true,
+                        _ => m.len() <= ADVISE_CAP,
+                    };
+                    if !evicting && advise {
+                        let _ = m.advise(memmap2::Advice::WillNeed);
+                    }
+                    if std::env::var("CMF_MLOCK")
+                        .map(|v| v == "1")
+                        .unwrap_or(false)
+                    {
+                        if let Err(e) = m.lock() {
+                            tracing::warn!(
+                                "CMF_MLOCK=1: mlock refused ({e}) — continuing unpinned"
+                            );
+                        }
+                    }
+                }
+                Backing::Mmap(m)
+            }
+            Err(e) => {
+                tracing::warn!("mmap failed ({e}), reading file into memory");
+                Backing::Owned(std::fs::read(&path)?)
+            }
+        };
+
+        let env = Self::parse_envelope(backing.bytes(), file_len)?;
+
+        let bytes = backing.bytes();
+        let section = |off: u64, len: u64| -> &[u8] { &bytes[off as usize..(off + len) as usize] };
+
+        // Header JSON
+        let header: CmfHeader = serde_json::from_slice(section(env.header.0, env.header.1))
+            .map_err(|e| CmfError::Parse(format!("header JSON: {e}")))?;
+
+        // Tensor directory
+        let tensors = Self::decode_directory(section(env.dir.0, env.dir.1))?;
+        for t in &tensors {
+            if t.off % TENSOR_ALIGNMENT != 0 {
+                return Err(CmfError::Bounds(format!(
+                    "tensor '{}': offset {} not 64-aligned",
+                    t.name, t.off
+                )));
+            }
+            let tensor_end = t.off.checked_add(t.nbytes).ok_or_else(|| {
+                CmfError::Bounds(format!("tensor '{}': offset + length overflows", t.name))
+            })?;
+            if tensor_end > env.data.1 {
+                return Err(CmfError::Bounds(format!(
+                    "tensor '{}': [{}, {}) exceeds data section ({} bytes)",
+                    t.name, t.off, tensor_end, env.data.1
+                )));
+            }
+            t.shape
+                .iter()
+                .try_fold(1usize, |n, &dim| n.checked_mul(dim))
+                .ok_or_else(|| {
+                    CmfError::Bounds(format!(
+                        "tensor '{}': shape product overflows usize",
+                        t.name
+                    ))
+                })?;
+            if let Some(expect) = expected_nbytes(t.dtype, &t.shape) {
+                if expect as u64 != t.nbytes {
+                    return Err(CmfError::Bounds(format!(
+                        "tensor '{}': nbytes {} != expected {} for {:?}{:?}",
+                        t.name, t.nbytes, expect, t.dtype, t.shape
+                    )));
+                }
+            }
+            // Payload-dependent lengths (vbit): exact check against the
+            // width header, bounds-before-slice (roadmap §4.9).
+            if matches!(t.dtype, TensorDtype::Vbit | TensorDtype::VbitRo) {
+                let payload = section(env.data.0 + t.off, t.nbytes);
+                crate::quant::validate_payload(t.dtype, &t.shape, payload)
+                    .map_err(|e| CmfError::Bounds(format!("tensor '{}': {e}", t.name)))?;
+            }
+        }
+        // Duplicate names would silently shadow each other in the
+        // HashMap (directory scan and by_name would disagree) — refuse
+        // the file instead (roadmap §4.9).
+        let mut by_name: HashMap<u64, u32> = HashMap::with_capacity(tensors.len());
+        let mut name_overflow: Vec<u32> = Vec::new();
+        for i in 0..tensors.len() {
+            let h = hash64(tensors[i].name.as_bytes());
+            match by_name.get(&h) {
+                Some(&j) if tensors[j as usize].name == tensors[i].name => {
+                    return Err(CmfError::Parse(format!(
+                        "duplicate tensor name '{}' in directory",
+                        tensors[i].name
+                    )));
+                }
+                Some(_) => name_overflow.push(i as u32), // hash collision of distinct names
+                None => {
+                    by_name.insert(h, i as u32);
+                }
+            }
+        }
+
+        // Masks
+        let masks = if env.masks.1 > 0 {
+            decode_masks_section(section(env.masks.0, env.masks.1), &header.arch)
+                .map_err(CmfError::Parse)?
+        } else {
+            MaskCatalog::empty()
+        };
+
+        // Vocab (tokenizer.json)
+        let vocab = if env.vocab.1 > 0 {
+            Some(section(env.vocab.0, env.vocab.1).to_vec())
+        } else {
+            None
+        };
+
+        // Sparse index
+        let sparse_index = if env.index.1 > 0 {
+            decode_sparse_index(section(env.index.0, env.index.1))?
+        } else {
+            vec![]
+        };
+
+        tracing::info!(
+            "Opened CMF v2: {} | {} tensors | {} masks | vocab {} | {:.1} MB",
+            header.arch.arch_name,
+            tensors.len(),
+            masks.masks.len(),
+            if vocab.is_some() { "embedded" } else { "none" },
+            file_len as f64 / 1e6
+        );
+
+        Ok(Self {
+            uid: MODEL_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            path,
+            header,
+            required_features: env.required_features,
+            tensors,
+            by_name,
+            name_overflow,
+            masks,
+            sparse_index,
+            vocab,
+            backing,
+            data_off: env.data.0,
+            envelope: env,
+            extra_shards: Vec::new(),
+        })
+    }
+
+    /// Open a sharded model (spec §10): pass shard 1; siblings found by
+    /// the `-{no:05}-of-{count:05}.cmf` convention. Directories merge;
+    /// masks/vocab/index/skills come from shard 1.
+    pub fn open_sharded(path: impl AsRef<Path>) -> Result<Self, CmfError> {
+        let path = path.as_ref();
+        let mut first = Self::open(path)?;
+        let Some(info) = first.header.shard.clone() else {
+            return Ok(first); // not sharded — plain open
+        };
+        if info.no != 1 {
+            return Err(CmfError::Parse(format!(
+                "open shard 1, not {} (of {})",
+                info.no, info.count
+            )));
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| CmfError::Parse("bad shard path".into()))?;
+        let tag1 = format!("-{:05}-of-{:05}.cmf", 1, info.count);
+        if !name.ends_with(&tag1) {
+            return Err(CmfError::Parse(format!(
+                "shard file must end with '{tag1}' (got '{name}')"
+            )));
+        }
+        let stem = &name[..name.len() - tag1.len()];
+        for no in 2..=info.count {
+            let sib = path.with_file_name(format!("{stem}-{:05}-of-{:05}.cmf", no, info.count));
+            let sh = Self::open(&sib)?;
+            match &sh.header.shard {
+                Some(si) if si.no == no && si.count == info.count => {}
+                other => {
+                    return Err(CmfError::Parse(format!(
+                        "{}: wrong shard coords {other:?}",
+                        sib.display()
+                    )));
+                }
+            }
+            let shard_idx = first.extra_shards.len() + 1;
+            first.extra_shards.push((sh.backing, sh.envelope.data.0));
+            for mut t in sh.tensors {
+                t.shard = shard_idx;
+                let idx = first.tensors.len() as u32;
+                let h = hash64(t.name.as_bytes());
+                match first.by_name.get(&h) {
+                    Some(&j) if first.tensors[j as usize].name == t.name => {
+                        return Err(CmfError::Parse(format!(
+                            "duplicate tensor name '{}' across shards",
+                            t.name
+                        )));
+                    }
+                    Some(_) => first.name_overflow.push(idx),
+                    None => {
+                        first.by_name.insert(h, idx);
+                    }
+                }
+                first.tensors.push(t);
+            }
+        }
+        tracing::info!(
+            "sharded model: {} files, {} tensors total",
+            info.count,
+            first.tensors.len()
+        );
+        Ok(first)
+    }
+
+    fn parse_envelope(bytes: &[u8], file_len: u64) -> Result<Envelope, CmfError> {
+        if bytes.len() < ENVELOPE_LEN {
+            return Err(CmfError::Bounds(format!(
+                "file too small for CMF envelope: {} bytes",
+                bytes.len()
+            )));
+        }
+        if bytes[0..4] != CMF_MAGIC {
+            return Err(CmfError::InvalidMagic);
+        }
+        let u32le = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap());
+        let u64le = |o: usize| u64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
+
+        let version = u32le(4);
+        if version != CMF_VERSION {
+            return Err(CmfError::UnsupportedVersion(version));
+        }
+        let _flags = u32le(8); // reserved
+        let required_features = u32le(12);
+        let unknown = required_features & !features::SUPPORTED;
+        if unknown != 0 {
+            return Err(CmfError::UnsupportedFeature(unknown));
+        }
+
+        let env = Envelope {
+            required_features,
+            header: (u64le(0x10), u64le(0x18)),
+            dir: (u64le(0x20), u64le(0x28)),
+            data: (u64le(0x30), u64le(0x38)),
+            masks: (u64le(0x40), u64le(0x48)),
+            vocab: (u64le(0x50), u64le(0x58)),
+            index: (u64le(0x60), u64le(0x68)),
+            header_hash: u64le(0x70),
+            dir_hash: u64le(0x78),
+        };
+
+        for (name, (off, len), required) in [
+            ("header", env.header, true),
+            ("dir", env.dir, true),
+            ("data", env.data, false),
+            ("masks", env.masks, false),
+            ("vocab", env.vocab, false),
+            ("index", env.index, false),
+        ] {
+            if required && len == 0 {
+                return Err(CmfError::Bounds(format!("section '{name}' is required")));
+            }
+            if len > 0
+                && off
+                    .checked_add(len)
+                    .map(|end| end > file_len)
+                    .unwrap_or(true)
+            {
+                return Err(CmfError::Bounds(format!(
+                    "section '{name}' [{off}, {}) exceeds file ({file_len} bytes)",
+                    off.saturating_add(len)
+                )));
+            }
+            if len > 0
+                && (usize::try_from(off).is_err()
+                    || usize::try_from(len).is_err()
+                    || usize::try_from(off + len).is_err())
+            {
+                return Err(CmfError::Bounds(format!(
+                    "section '{name}' cannot be addressed on this platform"
+                )));
+            }
+        }
+        if env.data.1 > 0 && env.data.0 % DATA_ALIGNMENT != 0 {
+            return Err(CmfError::Bounds(format!(
+                "data section offset {} not {}-aligned",
+                env.data.0, DATA_ALIGNMENT
+            )));
+        }
+        Ok(env)
+    }
+
+    fn decode_directory(bytes: &[u8]) -> Result<Vec<TensorEntry>, CmfError> {
+        if bytes.len() < 16 {
+            return Err(CmfError::Parse("tensor directory too short".into()));
+        }
+        let count = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
+        let pool_off = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let records_len = count
+            .checked_mul(DIR_RECORD_LEN)
+            .ok_or_else(|| CmfError::Parse("tensor directory record count overflows".into()))?;
+        let records_end = 16usize
+            .checked_add(records_len)
+            .ok_or_else(|| CmfError::Parse("tensor directory size overflows".into()))?;
+        if records_end > bytes.len() || pool_off > bytes.len() || pool_off < records_end {
+            return Err(CmfError::Parse(format!(
+                "tensor directory malformed: count={count}, pool_off={pool_off}, len={}",
+                bytes.len()
+            )));
+        }
+        let pool = &bytes[pool_off..];
+
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let r = &bytes[16 + i * DIR_RECORD_LEN..16 + (i + 1) * DIR_RECORD_LEN];
+            let name_off = u32::from_le_bytes(r[0..4].try_into().unwrap()) as usize;
+            let name_len = u16::from_le_bytes(r[4..6].try_into().unwrap()) as usize;
+            let dtype_id = r[6];
+            let ndim = r[7] as usize;
+            if ndim > DIR_MAX_NDIM {
+                return Err(CmfError::Parse(format!("tensor #{i}: ndim {ndim} > 6")));
+            }
+            let mut shape = Vec::with_capacity(ndim);
+            for d in 0..ndim {
+                shape.push(
+                    u32::from_le_bytes(r[8 + d * 4..12 + d * 4].try_into().unwrap()) as usize,
+                );
+            }
+            let off = u64::from_le_bytes(r[32..40].try_into().unwrap());
+            let nbytes = u64::from_le_bytes(r[40..48].try_into().unwrap());
+            let hash = u64::from_le_bytes(r[48..56].try_into().unwrap());
+
+            let name_end = name_off
+                .checked_add(name_len)
+                .ok_or_else(|| CmfError::Parse(format!("tensor #{i}: name range overflows")))?;
+            if name_end > pool.len() {
+                return Err(CmfError::Parse(format!("tensor #{i}: name out of pool")));
+            }
+            let name = std::str::from_utf8(&pool[name_off..name_end])
+                .map_err(|_| CmfError::Parse(format!("tensor #{i}: name is not UTF-8")))?
+                .to_string();
+            let dtype = TensorDtype::from_id(dtype_id).ok_or(CmfError::UnknownDtype(dtype_id))?;
+
+            out.push(TensorEntry {
+                name,
+                dtype,
+                shape,
+                off,
+                nbytes,
+                shard: 0,
+                hash,
+            });
+        }
+        Ok(out)
+    }
+
+    // ───────────────────────── access ─────────────────────────
+
+    pub fn arch(&self) -> &ModelArch {
+        &self.header.arch
+    }
+
+    pub fn tensor(&self, name: &str) -> Option<&TensorEntry> {
+        self.tensor_index(name).map(|i| &self.tensors[i])
+    }
+
+    /// Directory index of a tensor by name (same resolution as
+    /// [`Self::tensor`] — engines must not re-scan the directory). O(1) via the
+    /// name-hash index; the name is verified against the entry so a hash
+    /// collision can never return the wrong tensor, and the rare distinct-name
+    /// collision falls back to the tiny overflow list.
+    pub fn tensor_index(&self, name: &str) -> Option<usize> {
+        let h = hash64(name.as_bytes());
+        if let Some(&i) = self.by_name.get(&h) {
+            if self.tensors[i as usize].name == name {
+                return Some(i as usize);
+            }
+        }
+        self.name_overflow
+            .iter()
+            .copied()
+            .find(|&i| self.tensors[i as usize].name == name)
+            .map(|i| i as usize)
+    }
+
+    /// Tensor-source indirection (spec §9, Patent 15 fig3/302): the
+    /// skill's replacement is read IN PLACE OF the backbone tensor —
+    /// either/or, never combined. None skill → backbone directly.
+    pub fn resolve_tensor(&self, name: &str, skill: Option<&str>) -> Option<&TensorEntry> {
+        if let Some(sid) = skill {
+            if let Some(t) = self.tensor(&format!("skill.{sid}.{name}")) {
+                return Some(t);
+            }
+        }
+        self.tensor(name)
+    }
+
+    /// The per-skill delta index view (claim 2): directory entries of
+    /// one skill — exactly the byte ranges lazy loading pages in.
+    pub fn skill_tensors(&self, skill_id: &str) -> impl Iterator<Item = &TensorEntry> {
+        let prefix = format!("skill.{skill_id}.");
+        self.tensors
+            .iter()
+            .filter(move |t| t.name.starts_with(&prefix))
+    }
+
+    /// Zero-copy bytes of a tensor from the mmap'd data section.
+    pub fn tensor_bytes(&self, name: &str) -> Result<&[u8], CmfError> {
+        let entry = self
+            .tensor(name)
+            .ok_or_else(|| CmfError::MissingTensor(name.to_string()))?;
+        Ok(self.entry_bytes(entry))
+    }
+
+    /// All bytes of the primary mapping (GPU path: no-copy Metal buffer
+    /// over the same mmap — unified memory, zero copying).
+    /// hash64 of this file's tensor directory — the identity a standalone
+    /// skill binds to (`SkillRecord.base_dir_hash`).
+    pub fn dir_hash(&self) -> u64 {
+        self.envelope.dir_hash
+    }
+
+    pub fn primary_bytes(&self) -> &[u8] {
+        self.backing.bytes()
+    }
+
+    /// Absolute offset of the tensor within the primary mapping
+    /// (None for tensors from sibling shards).
+    /// Best-effort page-cache release for every tensor whose name passes
+    /// `pred` (unix, primary shard only): the merged ranges are madvised
+    /// DONTNEED so a one-shot stage's weights — a prompt encoder that
+    /// runs once per generation — stop competing for RAM with the
+    /// stages after it. A 25.7 GB fl2va file on a 24 GB Mac spent 40
+    /// minutes paging the SSD during denoise for exactly this reason.
+    /// Re-reading a dropped range later just refaults from disk.
+    /// Returns the bytes released.
+    pub fn advise_done(&self, pred: impl Fn(&str) -> bool) -> usize {
+        #[cfg(unix)]
+        {
+            let base = self.primary_bytes().as_ptr() as usize;
+            let map_len = self.primary_bytes().len();
+            let page = 16384usize.max(unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize);
+            let mut ranges: Vec<(usize, usize)> = self
+                .tensors
+                .iter()
+                .filter(|e| e.shard == 0 && pred(&e.name))
+                .filter_map(|e| {
+                    let abs = self.entry_abs_offset(e)?;
+                    Some((abs, abs + e.nbytes as usize))
+                })
+                .collect();
+            ranges.sort_unstable();
+            let mut dropped = 0usize;
+            let mut merged: Vec<(usize, usize)> = Vec::new();
+            for (s, e) in ranges {
+                match merged.last_mut() {
+                    Some(l) if s <= l.1 => l.1 = l.1.max(e),
+                    _ => merged.push((s, e)),
+                }
+            }
+            for (s, e) in merged {
+                // Align INWARD: a page shared with a kept tensor stays.
+                let s = s.div_ceil(page) * page;
+                let e = (e.min(map_len)) / page * page;
+                if e > s {
+                    let r = unsafe {
+                        libc::madvise((base + s) as *mut libc::c_void, e - s, libc::MADV_DONTNEED)
+                    };
+                    if r == 0 {
+                        dropped += e - s;
+                    }
+                }
+            }
+            dropped
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pred;
+            0
+        }
+    }
+
+    pub fn entry_abs_offset(&self, entry: &TensorEntry) -> Option<usize> {
+        (entry.shard == 0).then(|| (self.data_off + entry.off) as usize)
+    }
+
+    pub fn entry_bytes(&self, entry: &TensorEntry) -> &[u8] {
+        let (bytes, data_off) = if entry.shard == 0 {
+            (self.backing.bytes(), self.data_off)
+        } else {
+            let (b, o) = &self.extra_shards[entry.shard - 1];
+            (b.bytes(), *o)
+        };
+        let start = (data_off + entry.off) as usize;
+        &bytes[start..start + entry.nbytes as usize]
+    }
+
+    /// The CPU is done with these byte ranges of the primary mapping
+    /// (absolute offsets, as `entry_abs_offset` hands them out): drop them
+    /// from the resident set and let the page cache release the file pages.
+    /// Both calls are advisory and the mapping stays valid — a range that
+    /// gets touched again re-faults from disk, so a caller can only cost
+    /// time here, never correctness. Ranges are aligned OUTWARD to page
+    /// boundaries; the neighbours those edges claw in re-fault the same way.
+    /// Linux + mmap backing only; everywhere else a no-op.
+    pub fn evict_ranges(&self, ranges: &[(usize, usize)]) {
+        #[cfg(target_os = "linux")]
+        {
+            let Backing::Mmap(m) = &self.backing else {
+                return;
+            };
+            let page = 4096usize;
+            // One fd for the whole batch: fadvise targets the inode's page
+            // cache, any fd on the same file will do.
+            use std::os::unix::io::AsRawFd;
+            let file = File::open(&self.path).ok();
+            for &(off, len) in ranges {
+                if len == 0 || off.saturating_add(len) > m.len() {
+                    continue;
+                }
+                let start = off & !(page - 1);
+                let end = off + len;
+                let alen = end.next_multiple_of(page).min(m.len()) - start;
+                // SAFETY: read-only MAP_SHARED file mapping — DONTNEED here
+                // only drops clean pages; the next access re-faults them.
+                let _ = unsafe {
+                    m.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, start, alen)
+                };
+                if let Some(f) = &file {
+                    // SAFETY: plain fd + numeric range; advisory by contract.
+                    unsafe {
+                        libc::posix_fadvise(
+                            f.as_raw_fd(),
+                            start as libc::off_t,
+                            alen as libc::off_t,
+                            libc::POSIX_FADV_DONTNEED,
+                        );
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = ranges;
+    }
+
+    /// Tensors belonging to layer `i` (prefix `model.layers.{i}.`).
+    pub fn layer_tensors(&self, layer_idx: usize) -> Vec<&TensorEntry> {
+        let prefix = format!("model.layers.{layer_idx}.");
+        self.tensors
+            .iter()
+            .filter(|t| t.name.starts_with(&prefix))
+            .collect()
+    }
+
+    /// Total parameter count estimated from matrix tensors (ndim ≥ 2).
+    pub fn total_param_count(&self) -> u64 {
+        self.tensors
+            .iter()
+            .filter(|t| t.shape.len() >= 2)
+            .map(|t| t.n_elems() as u64)
+            .sum()
+    }
+
+    /// Recode selected tensors IN PLACE: each new payload must fit its old
+    /// slot, the entry keeps its offset and the file keeps its length — the
+    /// bytes between the new end and the old simply go dark (every reader
+    /// walks the directory, nothing addresses the gap). This is what lets a
+    /// published 100+ GB file change a tensor's layout on a disk too small
+    /// to hold two copies of it. Patches are `(directory index, new dtype,
+    /// new payload)`; entry hashes and the directory hash are recomputed so
+    /// `verify` stays clean. Not atomic: a crash between the payload writes
+    /// and the directory write leaves the old dtype over new bytes — verify
+    /// (or re-fetch the source) after an interrupted run.
+    pub fn recode_entries_in_place(
+        path: &str,
+        patches: &[(usize, TensorDtype, Vec<u8>)],
+    ) -> Result<(), CmfError> {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?;
+        let file_len = f.metadata()?.len();
+        let mut head = vec![0u8; ENVELOPE_LEN];
+        f.read_exact(&mut head)?;
+        let env = Self::parse_envelope(&head, file_len)?;
+
+        let mut dir = vec![0u8; env.dir.1 as usize];
+        f.seek(SeekFrom::Start(env.dir.0))?;
+        f.read_exact(&mut dir)?;
+        let count = u64::from_le_bytes(dir[0..8].try_into().unwrap()) as usize;
+
+        for (i, dtype, data) in patches {
+            if *i >= count {
+                return Err(CmfError::Bounds(format!(
+                    "recode: tensor #{i} out of directory ({count} entries)"
+                )));
+            }
+            let rb = 16 + i * DIR_RECORD_LEN;
+            let rec = &mut dir[rb..rb + DIR_RECORD_LEN];
+            let off = u64::from_le_bytes(rec[32..40].try_into().unwrap());
+            let old_n = u64::from_le_bytes(rec[40..48].try_into().unwrap());
+            if data.len() as u64 > old_n {
+                return Err(CmfError::Bounds(format!(
+                    "recode: tensor #{i} payload {} > slot {old_n}",
+                    data.len()
+                )));
+            }
+            f.seek(SeekFrom::Start(env.data.0 + off))?;
+            f.write_all(data)?;
+            rec[6] = dtype.id();
+            rec[40..48].copy_from_slice(&(data.len() as u64).to_le_bytes());
+            rec[48..56].copy_from_slice(&hash64(data).to_le_bytes());
+        }
+
+        f.seek(SeekFrom::Start(env.dir.0))?;
+        f.write_all(&dir)?;
+        f.seek(SeekFrom::Start(0x78))?;
+        f.write_all(&hash64(&dir).to_le_bytes())?;
+        f.sync_all()?;
+        Ok(())
+    }
+
+    /// Recompute all tensor hashes; returns human-readable problems
+    /// (empty = file intact).
+    pub fn verify(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+
+        // Section-level integrity (spec §8.1). Zero/absent = legacy file.
+        let bytes = self.backing.bytes();
+        let env = &self.envelope;
+        let sect = |(off, len): (u64, u64)| &bytes[off as usize..(off + len) as usize];
+        let check = |name: &str, stored: u64, span: (u64, u64)| -> Option<String> {
+            if stored != 0 && span.1 > 0 {
+                let actual = hash64(sect(span));
+                if actual != stored {
+                    return Some(format!(
+                        "section '{name}': hash mismatch (stored {stored:016x}, \
+                         actual {actual:016x})"
+                    ));
+                }
+            }
+            None
+        };
+        problems.extend(check("header", env.header_hash, env.header));
+        problems.extend(check("dir", env.dir_hash, env.dir));
+        if let Some(sh) = &self.header.section_hashes {
+            for (name, hex, span) in [
+                ("masks", &sh.masks, env.masks),
+                ("vocab", &sh.vocab, env.vocab),
+                ("index", &sh.index, env.index),
+            ] {
+                if let Some(hex) = hex {
+                    match u64::from_str_radix(hex, 16) {
+                        Ok(stored) => problems.extend(check(name, stored, span)),
+                        Err(_) => {
+                            problems.push(format!("section '{name}': malformed hash '{hex}'"))
+                        }
+                    }
+                }
+            }
+        }
+
+        for t in &self.tensors {
+            let actual = hash64(self.entry_bytes(t));
+            if actual != t.hash {
+                problems.push(format!(
+                    "tensor '{}': hash mismatch (stored {:016x}, actual {:016x})",
+                    t.name, t.hash, actual
+                ));
+            }
+        }
+        problems
+    }
+
+    /// Approximate active weight bytes under a mask, from real tensor
+    /// sizes in the directory (not from a formula).
+    pub fn compute_active_size(&self, mask: &TaskMask) -> u64 {
+        let arch = &self.header.arch;
+        let mut total = 0u64;
+        for li in 0..arch.num_layers {
+            if !mask.layer_alive(li) {
+                continue;
+            }
+            let ffn_frac = mask.ffn_active_count(li) as f64 / arch.intermediate_size.max(1) as f64;
+            let head_frac =
+                mask.active_head_count(li) as f64 / arch.num_attention_heads.max(1) as f64;
+            for t in self.layer_tensors(li) {
+                let frac = if t.name.contains(".mlp.") {
+                    ffn_frac
+                } else if t.name.contains(".self_attn.") {
+                    head_frac
+                } else {
+                    1.0
+                };
+                total += (t.nbytes as f64 * frac) as u64;
+            }
+        }
+        total
+    }
+
+    // ───────────────────────── writer ─────────────────────────
+
+    /// Write a CMF v2 file. Offsets, alignment, hashes and the sparse
+    /// index are computed here — the caller supplies content only.
+    pub fn write(
+        path: impl AsRef<Path>,
+        header: &CmfHeader,
+        tensors: &[TensorSpec],
+        masks: Option<&MaskCatalog>,
+        vocab: Option<&[u8]>,
+    ) -> Result<(), CmfError> {
+        let refs: Vec<TensorSpecRef> = tensors
+            .iter()
+            .map(|t| TensorSpecRef {
+                name: t.name.clone(),
+                dtype: t.dtype,
+                shape: t.shape.clone(),
+                data: &t.data,
+            })
+            .collect();
+        Self::write_ref(path, header, &refs, masks, vocab)
+    }
+
+    /// `write` with BORROWED tensor payloads — repack tools slice the
+    /// source file's mmap directly, so a 19 GB container rewrites without
+    /// materializing its tensors in RAM (the OS streams pages through).
+    pub fn write_ref(
+        path: impl AsRef<Path>,
+        header: &CmfHeader,
+        tensors: &[TensorSpecRef],
+        masks: Option<&MaskCatalog>,
+        vocab: Option<&[u8]>,
+    ) -> Result<(), CmfError> {
+        let path = path.as_ref();
+
+        // Directory + data layout.
+        let mut entries = Vec::with_capacity(tensors.len());
+        let mut data_cursor = 0u64;
+        for t in tensors {
+            if t.shape.len() > DIR_MAX_NDIM {
+                return Err(CmfError::Parse(format!(
+                    "tensor '{}': ndim {} > 6",
+                    t.name,
+                    t.shape.len()
+                )));
+            }
+            if let Some(expect) = expected_nbytes(t.dtype, &t.shape) {
+                if expect != t.data.len() {
+                    return Err(CmfError::Bounds(format!(
+                        "tensor '{}': data {} bytes != expected {} for {:?}{:?}",
+                        t.name,
+                        t.data.len(),
+                        expect,
+                        t.dtype,
+                        t.shape
+                    )));
+                }
+            }
+            let align = if t.data.len() as u64 >= LARGE_TENSOR_MIN {
+                LARGE_TENSOR_ALIGN
+            } else {
+                TENSOR_ALIGNMENT
+            };
+            data_cursor = align_to(data_cursor, align);
+            entries.push(TensorEntry {
+                name: t.name.clone(),
+                dtype: t.dtype,
+                shape: t.shape.clone(),
+                off: data_cursor,
+                nbytes: t.data.len() as u64,
+                shard: 0,
+                hash: hash64(t.data),
+            });
+            data_cursor += t.data.len() as u64;
+        }
+        let data_len = data_cursor;
+
+        let dir_bytes = Self::encode_directory(&entries);
+
+        let masks_bytes = match masks {
+            Some(catalog) if !catalog.masks.is_empty() => {
+                Some(encode_masks_section(catalog, &header.arch).map_err(CmfError::Parse)?)
+            }
+            _ => None,
+        };
+        let index_bytes = match masks {
+            Some(catalog) if !catalog.masks.is_empty() => {
+                let idx = build_sparse_index(catalog, &header.arch);
+                Some(encode_sparse_index(&idx))
+            }
+            _ => None,
+        };
+
+        // Section hashes go INTO the header (so the envelope's header
+        // hash transitively covers them), then the header is serialized.
+        let hex = |b: Option<&[u8]>| b.map(|b| format!("{:016x}", hash64(b)));
+        let mut header = header.clone();
+        if masks_bytes.is_some() || vocab.is_some() || index_bytes.is_some() {
+            header.section_hashes = Some(SectionHashes {
+                masks: hex(masks_bytes.as_deref()),
+                vocab: hex(vocab),
+                index: hex(index_bytes.as_deref()),
+            });
+        }
+        let header_json =
+            serde_json::to_vec(&header).map_err(|e| CmfError::Parse(format!("header: {e}")))?;
+
+        let mut required_features = features::TENSOR_DIR;
+        if masks_bytes.is_some() {
+            required_features |= features::BINARY_MASKS;
+            if header.arch.num_loops > 1 {
+                required_features |= features::LOOP_MASKS;
+            }
+        }
+        if entries
+            .iter()
+            .any(|t| matches!(t.dtype, TensorDtype::Q8_2f | TensorDtype::Vbit))
+        {
+            required_features |= features::QUANT_2F;
+        }
+        // A skill record bound to a base directory makes this file a
+        // standalone skill, and the bit keeps every reader honest about it.
+        if header.skills.iter().any(|s| s.base_dir_hash.is_some()) {
+            required_features |= features::SKILL_FILE;
+        }
+
+        // Section offsets.
+        let header_off = ENVELOPE_LEN as u64;
+        let dir_off = header_off + header_json.len() as u64;
+        let data_off = align_to(dir_off + dir_bytes.len() as u64, DATA_ALIGNMENT);
+        let masks_off = data_off + data_len;
+        let masks_len = masks_bytes.as_ref().map(|b| b.len() as u64).unwrap_or(0);
+        let vocab_off = masks_off + masks_len;
+        let vocab_len = vocab.map(|b| b.len() as u64).unwrap_or(0);
+        let index_off = vocab_off + vocab_len;
+        let index_len = index_bytes.as_ref().map(|b| b.len() as u64).unwrap_or(0);
+
+        // Envelope.
+        let mut env = Vec::with_capacity(ENVELOPE_LEN);
+        env.extend_from_slice(&CMF_MAGIC);
+        env.extend_from_slice(&CMF_VERSION.to_le_bytes());
+        env.extend_from_slice(&0u32.to_le_bytes()); // flags
+        env.extend_from_slice(&required_features.to_le_bytes());
+        for (off, len) in [
+            (header_off, header_json.len() as u64),
+            (dir_off, dir_bytes.len() as u64),
+            (data_off, data_len),
+            (if masks_len > 0 { masks_off } else { 0 }, masks_len),
+            (if vocab_len > 0 { vocab_off } else { 0 }, vocab_len),
+            (if index_len > 0 { index_off } else { 0 }, index_len),
+        ] {
+            env.extend_from_slice(&off.to_le_bytes());
+            env.extend_from_slice(&len.to_le_bytes());
+        }
+        // Reserved bytes carry header/dir integrity (spec §8.1).
+        env.extend_from_slice(&hash64(&header_json).to_le_bytes());
+        env.extend_from_slice(&hash64(&dir_bytes).to_le_bytes());
+        env.resize(ENVELOPE_LEN, 0);
+
+        // Write out.
+        let mut f = BufWriter::new(File::create(path)?);
+        f.write_all(&env)?;
+        f.write_all(&header_json)?;
+        f.write_all(&dir_bytes)?;
+        let mut pos = dir_off + dir_bytes.len() as u64;
+        f.write_all(&zeros((data_off - pos) as usize))?;
+        pos = data_off;
+        for (spec, entry) in tensors.iter().zip(&entries) {
+            let target = data_off + entry.off;
+            f.write_all(&zeros((target - pos) as usize))?;
+            f.write_all(spec.data)?;
+            pos = target + spec.data.len() as u64;
+        }
+        debug_assert_eq!(pos, data_off + data_len);
+        if let Some(mb) = &masks_bytes {
+            f.write_all(mb)?;
+        }
+        if let Some(vb) = vocab {
+            f.write_all(vb)?;
+        }
+        if let Some(ib) = &index_bytes {
+            f.write_all(ib)?;
+        }
+        f.flush()?;
+
+        tracing::info!(
+            "Wrote CMF v2: {} ({} tensors, {} masks, {:.1} MB)",
+            path.display(),
+            entries.len(),
+            masks.map(|m| m.masks.len()).unwrap_or(0),
+            std::fs::metadata(path)?.len() as f64 / 1e6
+        );
+        Ok(())
+    }
+
+    pub(crate) fn encode_directory(entries: &[TensorEntry]) -> Vec<u8> {
+        let mut pool = Vec::new();
+        let mut name_offs = Vec::with_capacity(entries.len());
+        for e in entries {
+            name_offs.push((pool.len() as u32, e.name.len() as u16));
+            pool.extend_from_slice(e.name.as_bytes());
+        }
+        let pool_off = 16 + entries.len() * DIR_RECORD_LEN;
+
+        let mut out = Vec::with_capacity(pool_off + pool.len());
+        out.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+        out.extend_from_slice(&(pool_off as u64).to_le_bytes());
+        for (e, (noff, nlen)) in entries.iter().zip(&name_offs) {
+            out.extend_from_slice(&noff.to_le_bytes());
+            out.extend_from_slice(&nlen.to_le_bytes());
+            out.push(e.dtype.id());
+            out.push(e.shape.len() as u8);
+            for d in 0..DIR_MAX_NDIM {
+                out.extend_from_slice(&(e.shape.get(d).copied().unwrap_or(0) as u32).to_le_bytes());
+            }
+            out.extend_from_slice(&e.off.to_le_bytes());
+            out.extend_from_slice(&e.nbytes.to_le_bytes());
+            out.extend_from_slice(&e.hash.to_le_bytes());
+        }
+        out.extend_from_slice(&pool);
+        out
+    }
+}
+
+fn align_to(x: u64, a: u64) -> u64 {
+    x.div_ceil(a) * a
+}
+
+fn zeros(n: usize) -> Vec<u8> {
+    vec![0u8; n]
+}
+
+// ─────────────────── one-pass streaming writer (§8.4) ───────────────────
+
+/// Writes a CMF file in a single pass, payloads first.
+///
+/// [`CmfModel::write_ref`] needs every payload addressable at once, so a
+/// converter has to hold the whole encoded model — RAM, or a spill file it
+/// then copies into the output. For a 300B-class MoE that is ~120 GB written
+/// twice. This writer instead reserves a gap at the head of the file, appends
+/// each payload the moment it is encoded, and patches the envelope, header and
+/// directory into that gap at the end. The bytes are written once and peak
+/// disk cost is the finished file.
+///
+/// The gap is the one thing that can go wrong: the directory is not sized
+/// until the last tensor arrives. [`CmfStreamWriter::finish`] therefore
+/// refuses loudly if the head does not fit rather than truncating it, and
+/// [`CmfStreamWriter::head_reserve_for`] gives callers a safe estimate.
+/// What a resumed writer recovers from its manifest: the tensors already on
+/// disk and any milestones the producer noted.
+pub struct ResumeState {
+    pub names: Vec<String>,
+    pub marks: Vec<String>,
+}
+
+pub struct CmfStreamWriter {
+    file: BufWriter<File>,
+    path: PathBuf,
+    /// Absolute offset of the weight blob — also the size of the reserved gap.
+    data_off: u64,
+    /// Write cursor, relative to `data_off`.
+    cursor: u64,
+    entries: Vec<TensorEntry>,
+    /// Append-only sidecar describing every payload already on disk. A Colab
+    /// box can vanish mid-conversion; with this the finished payloads can be
+    /// turned into a valid file instead of re-encoding for hours.
+    manifest: Option<BufWriter<File>>,
+}
+
+impl CmfStreamWriter {
+    /// A gap that comfortably holds the head for `n_tensors` whose names run
+    /// to `avg_name` bytes: the directory's fixed records, the name pool, the
+    /// envelope, and a header JSON with room for arch metadata — then doubled,
+    /// because being wrong here costs a whole re-run.
+    pub fn head_reserve_for(n_tensors: usize, avg_name: usize) -> u64 {
+        let dir = 16 + n_tensors * (DIR_RECORD_LEN + 6 + avg_name);
+        let head = ENVELOPE_LEN + dir + (1 << 20);
+        // Tripled, on top of a megabyte of slack that is already ~20x a
+        // small model's directory. The asymmetry is deliberate: an
+        // over-estimate costs zeros at the head of the file, an
+        // under-estimate costs the entire conversion that produced it.
+        align_to(3 * head as u64, DATA_ALIGNMENT).max(1 << 20)
+    }
+
+    /// `gap` bytes are reserved for envelope + header + directory.
+    pub fn new(path: impl AsRef<Path>, gap: u64) -> Result<Self, CmfError> {
+        let path = path.as_ref().to_path_buf();
+        let data_off = align_to(gap.max(ENVELOPE_LEN as u64 + 1), DATA_ALIGNMENT);
+        let mut file = BufWriter::new(File::create(&path)?);
+        file.write_all(&zeros(data_off as usize))?;
+        Ok(Self {
+            file,
+            path,
+            data_off,
+            cursor: 0,
+            entries: Vec::new(),
+            manifest: None,
+        })
+    }
+
+    /// Append one tensor. The payload is consumed here, so the caller can drop
+    /// it immediately — that is the entire point of this writer.
+    pub fn push(
+        &mut self,
+        name: &str,
+        dtype: TensorDtype,
+        shape: &[usize],
+        data: &[u8],
+    ) -> Result<(), CmfError> {
+        if shape.len() > DIR_MAX_NDIM {
+            return Err(CmfError::Parse(format!(
+                "tensor '{}': ndim {} > {}",
+                name,
+                shape.len(),
+                DIR_MAX_NDIM
+            )));
+        }
+        if let Some(expect) = expected_nbytes(dtype, shape) {
+            if expect != data.len() {
+                return Err(CmfError::Bounds(format!(
+                    "tensor '{}': data {} bytes != expected {} for {:?}{:?}",
+                    name,
+                    data.len(),
+                    expect,
+                    dtype,
+                    shape
+                )));
+            }
+        }
+        let align = if data.len() as u64 >= LARGE_TENSOR_MIN {
+            LARGE_TENSOR_ALIGN
+        } else {
+            TENSOR_ALIGNMENT
+        };
+        let off = align_to(self.cursor, align);
+        self.file.write_all(&zeros((off - self.cursor) as usize))?;
+        self.file.write_all(data)?;
+        self.entries.push(TensorEntry {
+            name: name.to_string(),
+            dtype,
+            shape: shape.to_vec(),
+            off,
+            nbytes: data.len() as u64,
+            shard: 0,
+            hash: hash64(data),
+        });
+        self.cursor = off + data.len() as u64;
+        if let Some(m) = self.manifest.as_mut() {
+            let e = self.entries.last().unwrap();
+            writeln!(
+                m,
+                "{{\"name\":{},\"dtype\":{},\"shape\":{:?},\"off\":{},\"nbytes\":{},\"hash\":{}}}",
+                serde_json::to_string(&e.name).unwrap_or_else(|_| "\"?\"".into()),
+                dtype.id(),
+                e.shape,
+                e.off,
+                e.nbytes,
+                e.hash
+            )?;
+            m.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Start recording a sidecar manifest at `path`. One JSON line per
+    /// tensor, flushed as it goes, plus a first line pinning the gap size.
+    pub fn with_manifest(mut self, path: impl AsRef<Path>) -> Result<Self, CmfError> {
+        let mut f = BufWriter::new(File::create(path)?);
+        writeln!(f, "{{\"data_off\":{}}}", self.data_off)?;
+        f.flush()?;
+        self.manifest = Some(f);
+        Ok(self)
+    }
+
+    /// Keep recording into an existing manifest — for a writer from
+    /// [`CmfStreamWriter::resume`], whose earlier lines must survive.
+    pub fn appending_manifest(mut self, path: impl AsRef<Path>) -> Result<Self, CmfError> {
+        self.manifest = Some(BufWriter::new(
+            std::fs::OpenOptions::new().append(true).open(path)?,
+        ));
+        Ok(self)
+    }
+
+    /// Rebuild a writer over an output file whose payloads are already on
+    /// disk, from the manifest that recorded them. The file is reopened for
+    /// writing without truncation and the cursor is placed after the last
+    /// recorded tensor, so `finish` can complete a conversion that died.
+    pub fn resume(
+        path: impl AsRef<Path>,
+        manifest: impl AsRef<Path>,
+    ) -> Result<(Self, ResumeState), CmfError> {
+        let path = path.as_ref().to_path_buf();
+        let text = std::fs::read_to_string(manifest.as_ref())?;
+        let mut lines = text.lines();
+        let first = lines
+            .next()
+            .ok_or_else(|| CmfError::Parse("manifest is empty".into()))?;
+        let head: serde_json::Value = serde_json::from_str(first)
+            .map_err(|e| CmfError::Parse(format!("manifest head: {e}")))?;
+        let data_off = head["data_off"]
+            .as_u64()
+            .ok_or_else(|| CmfError::Parse("manifest head has no data_off".into()))?;
+
+        let mut entries = Vec::new();
+        let mut names = Vec::new();
+        let mut marks = Vec::new();
+        let (mut safe_upto, mut safe_entries) = (0u64, 0usize);
+        for (i, line) in lines.enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            // A truncated last line is expected if the process was killed
+            // mid-write; it is dropped, not an error.
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                tracing::warn!("manifest line {} is truncated — ignoring it", i + 2);
+                break;
+            };
+            if let Some(mark) = v["mark"].as_str() {
+                marks.push(mark.to_string());
+                // Everything up to here is durable; anything the manifest
+                // records after the LAST mark belongs to a shard that was
+                // interrupted and will be redone, so it must not be kept —
+                // otherwise the redo appends those tensors a second time.
+                safe_upto = v["at"].as_u64().unwrap_or(0);
+                safe_entries = entries.len();
+                continue;
+            }
+            let dtype = TensorDtype::from_id(v["dtype"].as_u64().unwrap_or(0) as u8)
+                .ok_or_else(|| CmfError::Parse(format!("manifest line {}: dtype", i + 2)))?;
+            let name = v["name"].as_str().unwrap_or_default().to_string();
+            names.push(name.clone());
+            entries.push(TensorEntry {
+                name,
+                dtype,
+                shape: v["shape"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_u64())
+                            .map(|x| x as usize)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                off: v["off"].as_u64().unwrap_or(0),
+                nbytes: v["nbytes"].as_u64().unwrap_or(0),
+                shard: 0,
+                hash: v["hash"].as_u64().unwrap_or(0),
+            });
+        }
+        entries.truncate(safe_entries);
+        names.truncate(safe_entries);
+        let cursor = safe_upto;
+        debug_assert_eq!(
+            entries.last().map(|e| e.off + e.nbytes).unwrap_or(0),
+            cursor,
+            "the last mark disagrees with the entries before it"
+        );
+        let on_disk = std::fs::metadata(&path)?.len();
+        if on_disk < data_off + cursor {
+            return Err(CmfError::Bounds(format!(
+                "{} is {on_disk} bytes but its last checkpoint claims {} — \
+                 the file is shorter than its own record",
+                path.display(),
+                data_off + cursor
+            )));
+        }
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path)?;
+        file.seek(SeekFrom::Start(data_off + cursor))?;
+        Ok((
+            Self {
+                file: BufWriter::new(file),
+                path,
+                data_off,
+                cursor,
+                entries,
+                manifest: None,
+            },
+            ResumeState { names, marks },
+        ))
+    }
+
+    /// Note a milestone in the manifest — a source shard fully consumed, say.
+    /// Resume reads these back, which is what lets a restart skip work whose
+    /// payloads are already in the file rather than only skipping tensors it
+    /// happens to recognise by name.
+    pub fn mark(&mut self, note: &str) -> Result<(), CmfError> {
+        // The payloads must be on disk BEFORE the mark claims they are.
+        // Without this the manifest runs ahead of a buffered writer, and a
+        // kill in between leaves a record of bytes that were never written.
+        self.file.flush()?;
+        if let Some(m) = self.manifest.as_mut() {
+            writeln!(
+                m,
+                "{{\"mark\":{},\"at\":{}}}",
+                serde_json::to_string(note).unwrap_or_default(),
+                self.cursor
+            )?;
+            m.flush()?;
+        }
+        Ok(())
+    }
+
+    pub fn tensor_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Bytes of weight blob written so far.
+    pub fn data_len(&self) -> u64 {
+        self.cursor
+    }
+
+    /// Write the trailing sections, then patch the head into the reserved gap.
+    pub fn finish(
+        mut self,
+        header: &CmfHeader,
+        masks: Option<&MaskCatalog>,
+        vocab: Option<&[u8]>,
+    ) -> Result<(), CmfError> {
+        let data_len = self.cursor;
+
+        let masks_bytes = match masks {
+            Some(catalog) if !catalog.masks.is_empty() => {
+                Some(encode_masks_section(catalog, &header.arch).map_err(CmfError::Parse)?)
+            }
+            _ => None,
+        };
+        let index_bytes = match masks {
+            Some(catalog) if !catalog.masks.is_empty() => Some(encode_sparse_index(
+                &build_sparse_index(catalog, &header.arch),
+            )),
+            _ => None,
+        };
+        if let Some(mb) = &masks_bytes {
+            self.file.write_all(mb)?;
+        }
+        if let Some(vb) = vocab {
+            self.file.write_all(vb)?;
+        }
+        if let Some(ib) = &index_bytes {
+            self.file.write_all(ib)?;
+        }
+        self.file.flush()?;
+
+        let dir_bytes = CmfModel::encode_directory(&self.entries);
+
+        let hex = |b: Option<&[u8]>| b.map(|b| format!("{:016x}", hash64(b)));
+        let mut header = header.clone();
+        if masks_bytes.is_some() || vocab.is_some() || index_bytes.is_some() {
+            header.section_hashes = Some(SectionHashes {
+                masks: hex(masks_bytes.as_deref()),
+                vocab: hex(vocab),
+                index: hex(index_bytes.as_deref()),
+            });
+        }
+        let header_json =
+            serde_json::to_vec(&header).map_err(|e| CmfError::Parse(format!("header: {e}")))?;
+
+        let mut required_features = features::TENSOR_DIR;
+        if masks_bytes.is_some() {
+            required_features |= features::BINARY_MASKS;
+            if header.arch.num_loops > 1 {
+                required_features |= features::LOOP_MASKS;
+            }
+        }
+        if self
+            .entries
+            .iter()
+            .any(|t| matches!(t.dtype, TensorDtype::Q8_2f | TensorDtype::Vbit))
+        {
+            required_features |= features::QUANT_2F;
+        }
+
+        let header_off = ENVELOPE_LEN as u64;
+        let dir_off = header_off + header_json.len() as u64;
+        let head_len = dir_off + dir_bytes.len() as u64;
+        if head_len > self.data_off {
+            return Err(CmfError::Parse(format!(
+                "streamed head is {head_len} bytes but only {} were reserved — \
+                 the payloads are already on disk at a fixed offset, so this \
+                 file cannot be salvaged; re-run with a larger reserve",
+                self.data_off
+            )));
+        }
+        let data_off = self.data_off;
+        let masks_off = data_off + data_len;
+        let masks_len = masks_bytes.as_ref().map(|b| b.len() as u64).unwrap_or(0);
+        let vocab_off = masks_off + masks_len;
+        let vocab_len = vocab.map(|b| b.len() as u64).unwrap_or(0);
+        let index_off = vocab_off + vocab_len;
+        let index_len = index_bytes.as_ref().map(|b| b.len() as u64).unwrap_or(0);
+
+        let mut env = Vec::with_capacity(ENVELOPE_LEN);
+        env.extend_from_slice(&CMF_MAGIC);
+        env.extend_from_slice(&CMF_VERSION.to_le_bytes());
+        env.extend_from_slice(&0u32.to_le_bytes());
+        env.extend_from_slice(&required_features.to_le_bytes());
+        for (off, len) in [
+            (header_off, header_json.len() as u64),
+            (dir_off, dir_bytes.len() as u64),
+            (data_off, data_len),
+            (if masks_len > 0 { masks_off } else { 0 }, masks_len),
+            (if vocab_len > 0 { vocab_off } else { 0 }, vocab_len),
+            (if index_len > 0 { index_off } else { 0 }, index_len),
+        ] {
+            env.extend_from_slice(&off.to_le_bytes());
+            env.extend_from_slice(&len.to_le_bytes());
+        }
+        env.extend_from_slice(&hash64(&header_json).to_le_bytes());
+        env.extend_from_slice(&hash64(&dir_bytes).to_le_bytes());
+        env.resize(ENVELOPE_LEN, 0);
+
+        let mut f = self
+            .file
+            .into_inner()
+            .map_err(|e| CmfError::Io(e.into_error()))?;
+        f.seek(SeekFrom::Start(0))?;
+        f.write_all(&env)?;
+        f.write_all(&header_json)?;
+        f.write_all(&dir_bytes)?;
+        f.flush()?;
+
+        tracing::info!(
+            "Wrote CMF v2 (streamed): {} ({} tensors, {:.1} MB)",
+            self.path.display(),
+            self.entries.len(),
+            (data_off + data_len + masks_len + vocab_len + index_len) as f64 / 1e6
+        );
+        Ok(())
+    }
+}
+
+// ───────────────────── sparse index (§7 of the spec) ─────────────────────
+
+/// Build the sparse index from mask bitfields: a 32-neuron FFN group is
+/// active if it contains at least one active bit.
+pub fn build_sparse_index(catalog: &MaskCatalog, arch: &ModelArch) -> Vec<SparseIndexEntry> {
+    let mut out = Vec::new();
+    for m in &catalog.masks {
+        for li in 0..arch.num_layers {
+            if !m.layer_alive(li) {
+                continue;
+            }
+            let mut groups = Vec::new();
+            if let Some(bits) = m.ffn_masks.get(li) {
+                let n_groups = arch.intermediate_size.div_ceil(32);
+                for g in 0..n_groups {
+                    // Group g covers bits [g*32, g*32+32) = bytes [g*4, g*4+4).
+                    // A per-layer FFN width may be SHORTER than the
+                    // arch's (tube files size the arch to the widest
+                    // layer), so the start needs clamping too — not just
+                    // the end, or a narrow layer indexes past its row.
+                    let lo = (g * 4).min(bits.len());
+                    let active = bits[lo..(g * 4 + 4).min(bits.len())]
+                        .iter()
+                        .any(|&b| b != 0);
+                    if active {
+                        groups.push(g as u16);
+                    }
+                }
+            }
+            let mut heads = Vec::new();
+            if let Some(bits) = m.head_masks.get(li) {
+                for h in 0..arch.num_attention_heads {
+                    if bits
+                        .get(h / 8)
+                        .map(|b| b & (1 << (h % 8)) != 0)
+                        .unwrap_or(false)
+                    {
+                        heads.push(h as u8);
+                    }
+                }
+            }
+            out.push(SparseIndexEntry {
+                task_id: m.task_id,
+                layer_idx: li,
+                active_ffn_groups: groups,
+                active_heads: heads,
+            });
+        }
+    }
+    out
+}
+
+/// `[u32 n_entries][u32 reserved]` then per entry:
+/// `[u32 task][u32 layer][u32 n_groups][u32 n_heads][u16×g][u8×h][pad→4]`.
+pub fn encode_sparse_index(entries: &[SparseIndexEntry]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    for e in entries {
+        out.extend_from_slice(&e.task_id.to_le_bytes());
+        out.extend_from_slice(&(e.layer_idx as u32).to_le_bytes());
+        out.extend_from_slice(&(e.active_ffn_groups.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(e.active_heads.len() as u32).to_le_bytes());
+        for g in &e.active_ffn_groups {
+            out.extend_from_slice(&g.to_le_bytes());
+        }
+        out.extend_from_slice(&e.active_heads);
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
+    }
+    out
+}
+
+pub fn decode_sparse_index(bytes: &[u8]) -> Result<Vec<SparseIndexEntry>, CmfError> {
+    let err = |msg: &str| CmfError::Parse(format!("sparse index: {msg}"));
+    if bytes.len() < 8 {
+        return Err(err("too short"));
+    }
+    let n = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    let mut pos = 8usize;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        if pos + 16 > bytes.len() {
+            return Err(err("entry header out of bounds"));
+        }
+        let task_id = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+        let layer_idx = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
+        let n_groups = u32::from_le_bytes(bytes[pos + 8..pos + 12].try_into().unwrap()) as usize;
+        let n_heads = u32::from_le_bytes(bytes[pos + 12..pos + 16].try_into().unwrap()) as usize;
+        pos += 16;
+        if pos + n_groups * 2 + n_heads > bytes.len() {
+            return Err(err("entry data out of bounds"));
+        }
+        let mut groups = Vec::with_capacity(n_groups);
+        for g in 0..n_groups {
+            groups.push(u16::from_le_bytes(
+                bytes[pos + g * 2..pos + g * 2 + 2].try_into().unwrap(),
+            ));
+        }
+        pos += n_groups * 2;
+        let heads = bytes[pos..pos + n_heads].to_vec();
+        pos += n_heads;
+        pos = pos.div_ceil(4) * 4;
+        out.push(SparseIndexEntry {
+            task_id,
+            layer_idx,
+            active_ffn_groups: groups,
+            active_heads: heads,
+        });
+    }
+    Ok(out)
+}
+
+/// Errors from CMF operations. Every failure mode is loud.
+#[derive(Debug, thiserror::Error)]
+pub enum CmfError {
+    #[error("File not found: {0}")]
+    FileNotFound(String),
+    #[error("Invalid CMF magic bytes")]
+    InvalidMagic,
+    #[error("Unsupported CMF version: {0}")]
+    UnsupportedVersion(u32),
+    #[error("File requires unsupported features (bits {0:#x})")]
+    UnsupportedFeature(u32),
+    #[error("Unknown tensor dtype id: {0}")]
+    UnknownDtype(u8),
+    #[error("Tensor not found: {0}")]
+    MissingTensor(String),
+    #[error("Bounds error: {0}")]
+    Bounds(String),
+    #[error("IO error: {0}")]
+    Io(#[from] io::Error),
+    #[error("Parse error: {0}")]
+    Parse(String),
+}

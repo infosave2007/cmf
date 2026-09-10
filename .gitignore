@@ -1,0 +1,16 @@
+/target
+**/*.rs.bk
+Cargo.lock.orig
+.DS_Store
+*.cmf
+models/
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+venv*/
+docs/PERFORMANCE_ROADMAP.ru.md
+.claude/
+tmp/
+/*.log
+/*.out

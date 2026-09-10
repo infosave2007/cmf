@@ -1,0 +1,50 @@
+[package]
+name = "cortiq-cli"
+version.workspace = true
+edition.workspace = true
+description = "Command-line tools for the CMF model format: inspect, convert, run and serve .cmf models."
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "cortiq"
+path = "src/main.rs"
+
+[features]
+# The wgpu backend (Vulkan / DX12 / Metal-via-wgpu) is ON by default so a
+# plain `cargo install cortiq-cli` gets GPU decode out of the box — the
+# release binaries always shipped with it, and a bare install silently
+# missing Vulkan was a footgun. `--no-default-features` builds CPU-only
+# (native Metal on macOS is target-gated in the engine and always in).
+default = ["gpu"]
+gpu = ["cortiq-engine/gpu"]
+
+[dependencies]
+libc = "0.2"
+base64 = { workspace = true }
+cortiq-core = { path = "../cortiq-core", version = "0.6.6" }
+cortiq-engine = { path = "../cortiq-engine", version = "0.6.6" }
+cortiq-net = { path = "../cortiq-net", version = "0.6.6" }
+cortiq-server = { path = "../cortiq-server", version = "0.6.6" }
+clap = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+memmap2 = { workspace = true }
+# Minimal blocking HTTP client (rustls) so `cortiq convert` can pull a model
+# straight from the Hugging Face hub — keeps the whole convert pipeline in one crate.
+ureq = { version = "2", features = ["json", "tls"] }
+# Detached model signing (cortiq sign / verify): Ed25519 over the file's
+# SHA-256 — authenticity on top of the format's integrity hash chain.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+sha2 = "0.10"
+rand_core = { version = "0.6", features = ["getrandom"] }

@@ -1,0 +1,934 @@
+//! Canonical quantization layouts and scalar dequantization.
+//!
+//! Layouts are byte-identical to `.vmfc` ("quants first, then scales"):
+//! - `q8_row`  (2-D `[out, in]`): `[int8: out·in][f16: out]`,
+//!   `w = q[o,i] · scale[o]`, `scale[o] = absmax(row_o) / 127`.
+//! - `q4_block`: groups of 32 over the flattened tensor (zero-padded),
+//!   `[u8: ceil(n/32)·16][f16: ceil(n/32)]`, nibbles low-first,
+//!   `w = (q − 8) · scale`, `scale = absmax(group) / 7`.
+//!
+//! 1-D tensors (norms) are always stored `f16`.
+
+use crate::format::TensorEntry;
+use crate::types::TensorDtype;
+
+pub const GROUP_SIZE: usize = 32;
+
+/// IEEE half → f32.
+#[inline]
+pub fn f16_to_f32(h: u16) -> f32 {
+    let sign = (h >> 15) as u32;
+    let exp = ((h >> 10) & 0x1F) as u32;
+    let mant = (h & 0x3FF) as u32;
+    let bits = if exp == 0 {
+        if mant == 0 {
+            sign << 31
+        } else {
+            // subnormal: normalize. A subnormal half equals mant·2^-24; shifting
+            // its MSB up to bit 10 takes e = 10-b shifts (b = MSB position), so
+            // the true exponent is b-24 and the f32 biased exponent is b+103 =
+            // 113-e. (The old `127-15-e` form was off by one — it halved every
+            // subnormal, which corrupts K-quant super-block scales.)
+            let mut e = 0u32;
+            let mut m = mant;
+            while m & 0x400 == 0 {
+                m <<= 1;
+                e += 1;
+            }
+            m &= 0x3FF;
+            (sign << 31) | ((113 - e) << 23) | (m << 13)
+        }
+    } else if exp == 0x1F {
+        (sign << 31) | (0xFF << 23) | (mant << 13)
+    } else {
+        (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13)
+    };
+    f32::from_bits(bits)
+}
+
+/// f32 → IEEE half (round-to-nearest-even). Used by the Rust writer.
+#[inline]
+pub fn f32_to_f16(x: f32) -> u16 {
+    let bits = x.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let mut exp = ((bits >> 23) & 0xFF) as i32;
+    let mant = bits & 0x7F_FFFF;
+
+    if exp == 0xFF {
+        // Inf / NaN
+        return sign | 0x7C00 | if mant != 0 { 0x200 } else { 0 };
+    }
+    exp -= 127 - 15;
+    if exp >= 0x1F {
+        return sign | 0x7C00; // overflow → Inf
+    }
+    if exp <= 0 {
+        if exp < -10 {
+            return sign; // underflow → 0
+        }
+        // subnormal
+        let m = mant | 0x80_0000;
+        let shift = (14 - exp) as u32;
+        let half = m >> shift;
+        let round = (m >> (shift - 1)) & 1;
+        return sign | ((half + round) as u16);
+    }
+    let half = ((exp as u32) << 10) | (mant >> 13);
+    let round = (mant >> 12) & 1;
+    // round-to-nearest-even: bump if round bit set and (sticky or odd)
+    let sticky = (mant & 0xFFF) != 0;
+    let bump = round & (sticky as u32 | (half & 1));
+    sign | ((half + bump) as u16)
+}
+
+/// bfloat16 → f32.
+#[inline]
+pub fn bf16_to_f32(h: u16) -> f32 {
+    f32::from_bits((h as u32) << 16)
+}
+
+/// Dequantize a full `q8_row` tensor: `[int8: out·in][f16: out]`.
+pub fn dequant_q8_row(bytes: &[u8], out_dim: usize, in_dim: usize, dst: &mut [f32]) {
+    debug_assert_eq!(bytes.len(), out_dim * in_dim + out_dim * 2);
+    debug_assert_eq!(dst.len(), out_dim * in_dim);
+    let (q, scales) = bytes.split_at(out_dim * in_dim);
+    for o in 0..out_dim {
+        let s = f16_to_f32(u16::from_le_bytes([scales[o * 2], scales[o * 2 + 1]]));
+        let row = &q[o * in_dim..(o + 1) * in_dim];
+        let out = &mut dst[o * in_dim..(o + 1) * in_dim];
+        for (d, &b) in out.iter_mut().zip(row) {
+            *d = (b as i8) as f32 * s;
+        }
+    }
+}
+
+/// Dequantize a full `q8_2f` tensor (two-scale row/column, dtype 9):
+/// `[int8: out·in][f16 row_scale: out][f16 col: in]`,
+/// `w[o,i] = q[o,i] · row_scale[o] · col[i]`. The column field absorbs
+/// outlier input channels — validated in vmfcore (+37% at equal size
+/// for the two-field family; q8_2f recovers ~75% of the q8→f16 gap).
+pub fn dequant_q8_2f(bytes: &[u8], out_dim: usize, in_dim: usize, dst: &mut [f32]) {
+    debug_assert_eq!(bytes.len(), out_dim * in_dim + out_dim * 2 + in_dim * 2);
+    debug_assert_eq!(dst.len(), out_dim * in_dim);
+    let (q, rest) = bytes.split_at(out_dim * in_dim);
+    let (scales, cols) = rest.split_at(out_dim * 2);
+    let col: Vec<f32> = (0..in_dim)
+        .map(|i| f16_to_f32(u16::from_le_bytes([cols[i * 2], cols[i * 2 + 1]])))
+        .collect();
+    for o in 0..out_dim {
+        let s = f16_to_f32(u16::from_le_bytes([scales[o * 2], scales[o * 2 + 1]]));
+        let row = &q[o * in_dim..(o + 1) * in_dim];
+        let out = &mut dst[o * in_dim..(o + 1) * in_dim];
+        for i in 0..in_dim {
+            out[i] = (row[i] as i8) as f32 * s * col[i];
+        }
+    }
+}
+
+/// Dequantize a full `q4_block` tensor into `dst` (`dst.len()` = real
+/// element count; the trailing pad group elements are discarded).
+pub fn dequant_q4_block(bytes: &[u8], dst: &mut [f32]) {
+    let n_groups = dst.len().div_ceil(GROUP_SIZE);
+    let packed_len = n_groups * GROUP_SIZE / 2;
+    debug_assert_eq!(bytes.len(), packed_len + n_groups * 2);
+    let (packed, scales) = bytes.split_at(packed_len);
+    for g in 0..n_groups {
+        let s = f16_to_f32(u16::from_le_bytes([scales[g * 2], scales[g * 2 + 1]]));
+        let base = g * GROUP_SIZE;
+        let pk = &packed[g * 16..(g + 1) * 16];
+        for (k, &byte) in pk.iter().enumerate() {
+            let i0 = base + k * 2;
+            let i1 = i0 + 1;
+            if i0 < dst.len() {
+                dst[i0] = ((byte & 0x0F) as f32 - 8.0) * s;
+            }
+            if i1 < dst.len() {
+                dst[i1] = (((byte >> 4) & 0x0F) as f32 - 8.0) * s;
+            }
+        }
+    }
+}
+
+/// Dequantize a full `vbit` tensor (P13 FIG.3, grouped variant):
+/// [u8 bits: rows][f16 scales: rows·cols/32][bit-packed rows MSB-first,
+/// each row padded to a whole byte]. w = (u − L)·scale, L = 2^{b−1}−1.
+pub fn dequant_vbit(bytes: &[u8], rows: usize, cols: usize, dst: &mut [f32]) -> Result<(), String> {
+    if cols % GROUP_SIZE != 0 {
+        return Err(format!("vbit: cols {cols} not a multiple of {GROUP_SIZE}"));
+    }
+    let ng = cols / GROUP_SIZE;
+    let bits = &bytes[..rows];
+    if let Some(&b) = bits.iter().find(|&&b| !(3..=8).contains(&b)) {
+        return Err(format!("vbit: bit-width {b} outside safe range 3..=8"));
+    }
+    let sc_off = rows;
+    let data_off = sc_off + rows * ng * 2;
+    let mut off = data_off;
+    for r in 0..rows {
+        let b = bits[r] as usize;
+        let l = ((1usize << (b - 1)) - 1) as f32;
+        let rowlen = (cols * b).div_ceil(8);
+        let data = &bytes[off..off + rowlen];
+        let (mut acc, mut nbits, mut idx) = (0u64, 0usize, 0usize);
+        for i in 0..cols {
+            while nbits < b {
+                acc = (acc << 8) | data[idx] as u64;
+                idx += 1;
+                nbits += 8;
+            }
+            let u = ((acc >> (nbits - b)) & ((1u64 << b) - 1)) as f32;
+            nbits -= b;
+            let so = (r * ng + i / GROUP_SIZE) * 2;
+            let s = f16_to_f32(u16::from_le_bytes([
+                bytes[sc_off + so],
+                bytes[sc_off + so + 1],
+            ]));
+            dst[r * cols + i] = (u - l) * s;
+        }
+        off += rowlen;
+    }
+    Ok(())
+}
+
+/// Bytes per q4_tiled group tile: 2 (f16 scale) + 16 (nibbles).
+pub const Q4_TILE: usize = 18;
+
+/// Bytes per q1 group tile: 2 (f16 scale) + 4 (32 sign bits).
+pub const Q1_TILE: usize = 6;
+
+/// Dequantize a full `q1` tensor: per 32-group `[f16 scale][4B bits]`,
+/// bit k of byte j (LSB-first) is weight j·8+k of the group;
+/// value = scale · (2·bit − 1) ∈ {−s, +s}. 1-bit-TRAINED models only —
+/// see the dtype doc.
+pub fn dequant_q1(bytes: &[u8], dst: &mut [f32]) {
+    let n_groups = dst.len().div_ceil(GROUP_SIZE);
+    debug_assert_eq!(bytes.len(), n_groups * Q1_TILE);
+    for g in 0..n_groups {
+        let tile = &bytes[g * Q1_TILE..(g + 1) * Q1_TILE];
+        let s = f16_to_f32(u16::from_le_bytes([tile[0], tile[1]]));
+        let base = g * GROUP_SIZE;
+        for (j, &byte) in tile[2..].iter().enumerate() {
+            for k in 0..8 {
+                let i = base + j * 8 + k;
+                if i < dst.len() {
+                    dst[i] = if (byte >> k) & 1 == 1 { s } else { -s };
+                }
+            }
+        }
+    }
+}
+
+/// Dequantize a full `q1s` tensor (1-bit + sparse outlier overlay): the
+/// leading `n_groups·6` bytes are a plain `q1` base, then `[u32 count]`
+/// and `count × [u32 flat-index][f16 value]` restore the salient weights
+/// the two-field mask kept at full precision (they overwrite the ±s base).
+pub fn dequant_q1s(bytes: &[u8], dst: &mut [f32]) {
+    let n_groups = dst.len().div_ceil(GROUP_SIZE);
+    let base_len = n_groups * Q1_TILE;
+    dequant_q1(&bytes[..base_len.min(bytes.len())], dst);
+    let mut off = base_len;
+    if off + 4 > bytes.len() {
+        return;
+    }
+    let count =
+        u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]) as usize;
+    off += 4;
+    for _ in 0..count {
+        if off + 6 > bytes.len() {
+            break;
+        }
+        let idx = u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
+            as usize;
+        let val = f16_to_f32(u16::from_le_bytes([bytes[off + 4], bytes[off + 5]]));
+        if idx < dst.len() {
+            dst[idx] = val;
+        }
+        off += 6;
+    }
+}
+
+/// Ternary tile: 2 (f16 scale) + 7 (32 base-3 codes, 5 ternary values per
+/// byte, `3^5 = 243 ≤ 256`) = 9 bytes ⇒ ~2.25 bpw base (vs the old 2-bit
+/// 10-byte tile). The packed codes carry the same `{0,+s,−s}` values, so
+/// the reconstruction is bit-identical — this is pure size, no quality change.
+pub const Q1T_TILE: usize = 9;
+const Q1T_POW3: [u16; 5] = [1, 3, 9, 27, 81];
+
+/// Base-3 code (0/1/2) of ternary weight `k` from a group's packed 7 bytes.
+#[inline]
+pub fn q1t_code(codes: &[u8], k: usize) -> u8 {
+    ((codes[k / 5] as u16 / Q1T_POW3[k % 5]) % 3) as u8
+}
+
+/// Pack one base-3 code into the group's 7-byte code block (accumulative;
+/// start from a zeroed block, call for k = 0..32 in order).
+#[inline]
+pub fn q1t_pack(codes: &mut [u8; 7], k: usize, code: u8) {
+    codes[k / 5] += code * Q1T_POW3[k % 5] as u8;
+}
+
+/// Dequantize a full `q1t` tensor (ternary + sparse outlier overlay): per
+/// 32-group `[f16 scale][7B base-3 codes]` (0 → 0, 1 → +s, 2 → −s), then
+/// `[u32 count]` and `count × [u32 index][f16 value]`.
+/// `rows`×`cols` shape is needed for the per-row overlay (`[u32 row_ptr[rows+1]]`
+/// then `[(u16 col, f16 val)]` grouped by row — 4 B/outlier, no flat index).
+pub fn dequant_q1t(bytes: &[u8], rows: usize, cols: usize, dst: &mut [f32]) {
+    let n_groups = dst.len().div_ceil(GROUP_SIZE);
+    let base_len = n_groups * Q1T_TILE;
+    for g in 0..n_groups {
+        let off = g * Q1T_TILE;
+        if off + Q1T_TILE > bytes.len() {
+            break;
+        }
+        let s = f16_to_f32(u16::from_le_bytes([bytes[off], bytes[off + 1]]));
+        let codes = &bytes[off + 2..off + Q1T_TILE];
+        let base = g * GROUP_SIZE;
+        for k in 0..GROUP_SIZE {
+            let i = base + k;
+            if i < dst.len() {
+                dst[i] = match q1t_code(codes, k) {
+                    1 => s,
+                    2 => -s,
+                    _ => 0.0,
+                };
+            }
+        }
+    }
+    // Overlay: [u32 row_ptr[rows+1]] then entries grouped by row.
+    let entries = base_len + (rows + 1) * 4;
+    if entries > bytes.len() {
+        return;
+    }
+    let rp = |r: usize| -> usize {
+        let o = base_len + r * 4;
+        u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]) as usize
+    };
+    for r in 0..rows {
+        for p in rp(r)..rp(r + 1) {
+            let e = entries + p * 4;
+            if e + 4 > bytes.len() {
+                return;
+            }
+            let col = u16::from_le_bytes([bytes[e], bytes[e + 1]]) as usize;
+            let val = f16_to_f32(u16::from_le_bytes([bytes[e + 2], bytes[e + 3]]));
+            let i = r * cols + col;
+            if i < dst.len() {
+                dst[i] = val;
+            }
+        }
+    }
+}
+
+/// Dequantize a full `q4_tiled` tensor: per 32-group
+/// `[f16 scale][16B nibbles]`, nibbles low-first inside each byte —
+/// the same values/order as `q4_block`, only the placement of the
+/// scale differs.
+pub fn dequant_q4_tiled(bytes: &[u8], dst: &mut [f32]) {
+    let n_groups = dst.len().div_ceil(GROUP_SIZE);
+    debug_assert_eq!(bytes.len(), n_groups * Q4_TILE);
+    for g in 0..n_groups {
+        let tile = &bytes[g * Q4_TILE..(g + 1) * Q4_TILE];
+        let s = f16_to_f32(u16::from_le_bytes([tile[0], tile[1]]));
+        let base = g * GROUP_SIZE;
+        for (k, &byte) in tile[2..].iter().enumerate() {
+            let i0 = base + k * 2;
+            let i1 = i0 + 1;
+            if i0 < dst.len() {
+                dst[i0] = ((byte & 0x0F) as f32 - 8.0) * s;
+            }
+            if i1 < dst.len() {
+                dst[i1] = (((byte >> 4) & 0x0F) as f32 - 8.0) * s;
+            }
+        }
+    }
+}
+
+/// Nibble bytes per `q4tp` group tile — the scale lives in a side plane,
+/// so the nibble stream is 16-byte strided (better aligned than q4t's 18).
+pub const Q4TP_NIB: usize = 16;
+
+/// Highest `q4tp` scale code: 5 bits, so the ladder has 32 rungs.
+pub const Q4TP_LMAX: usize = 31;
+
+/// Bytes of 5-bit codes per row. Rounded up to whole bytes so every row
+/// decodes independently — worth the ≤7 wasted bits for parallel row work.
+pub const fn q4tp_code_stride(gpr: usize) -> usize {
+    (gpr * 5).div_ceil(8)
+}
+
+/// Byte offsets inside a `q4tp` payload: `(params_off, codes_off, code_stride)`.
+/// Layout is `[nibbles][row params: (f16 lo, f16 step)][codes]`.
+pub fn q4tp_sections(rows: usize, cols: usize) -> (usize, usize, usize) {
+    let gpr = cols / GROUP_SIZE;
+    let nib = rows * gpr * Q4TP_NIB;
+    (nib, nib + rows * 4, q4tp_code_stride(gpr))
+}
+
+/// Read tile `g`'s 5-bit scale code out of one row's code slice.
+#[inline]
+pub fn q4tp_code(codes: &[u8], g: usize) -> usize {
+    let bit = g * 5;
+    let (b, sh) = (bit / 8, bit % 8);
+    let lo = codes[b] as u16;
+    // A 5-bit field starting past bit 3 spills into the next byte; the
+    // stride always has that byte when it does, but stay total anyway.
+    let hi = if sh > 3 {
+        codes.get(b + 1).copied().unwrap_or(0) as u16
+    } else {
+        0
+    };
+    (((lo | (hi << 8)) >> sh) & 0x1F) as usize
+}
+
+/// Write tile `g`'s 5-bit code (encoder side; assumes the slice starts zeroed).
+#[inline]
+pub fn q4tp_put_code(codes: &mut [u8], g: usize, code: usize) {
+    let bit = g * 5;
+    let (b, sh) = (bit / 8, bit % 8);
+    let v = (code & 0x1F) as u16;
+    codes[b] |= (v << sh) as u8;
+    if sh > 3 {
+        codes[b + 1] |= (v >> (8 - sh)) as u8;
+    }
+}
+
+/// Expand row `r`'s 32-rung scale ladder: `s[c] = 2^(lo + c·step)`,
+/// evaluated as one `exp2` plus 31 multiplies so that every consumer —
+/// scalar dequant, SIMD kernel, GPU shader — lands on the SAME f32 bits.
+/// The geometric form is the format's definition, not an optimization.
+#[inline]
+pub fn q4tp_ladder(params: &[u8], r: usize) -> [f32; 32] {
+    let lo = f16_to_f32(u16::from_le_bytes([params[r * 4], params[r * 4 + 1]]));
+    let st = f16_to_f32(u16::from_le_bytes([params[r * 4 + 2], params[r * 4 + 3]]));
+    let ratio = st.exp2();
+    let mut t = [0f32; 32];
+    t[0] = lo.exp2();
+    for c in 1..32 {
+        t[c] = t[c - 1] * ratio;
+    }
+    t
+}
+
+/// Dequantize a full `q4tp` tensor. Nibbles are read exactly as `q4_tiled`
+/// reads them; only where the scale comes from differs.
+pub fn dequant_q4tp(bytes: &[u8], rows: usize, cols: usize, dst: &mut [f32]) {
+    let gpr = cols / GROUP_SIZE;
+    let (params_off, codes_off, stride) = q4tp_sections(rows, cols);
+    let params = &bytes[params_off..params_off + rows * 4];
+    for r in 0..rows {
+        let tab = q4tp_ladder(params, r);
+        let codes = &bytes[codes_off + r * stride..codes_off + (r + 1) * stride];
+        for g in 0..gpr {
+            let s = tab[q4tp_code(codes, g)];
+            let tile = &bytes[(r * gpr + g) * Q4TP_NIB..(r * gpr + g + 1) * Q4TP_NIB];
+            let base = r * cols + g * GROUP_SIZE;
+            for (k, &byte) in tile.iter().enumerate() {
+                dst[base + k * 2] = ((byte & 0x0F) as f32 - 8.0) * s;
+                dst[base + k * 2 + 1] = (((byte >> 4) & 0x0F) as f32 - 8.0) * s;
+            }
+        }
+    }
+}
+
+/// Chunk bytes per `q2tp` group — 32 weights at 2 bits. The scale ladder,
+/// row params and 5-bit rung codes are byte-identical to `q4tp`'s planes;
+/// only the weight plane shrinks from 16 to 8 bytes per group.
+pub const Q2TP_CHUNK: usize = 8;
+
+/// Byte offsets inside a `q2tp` payload: `(params_off, codes_off, code_stride)`.
+/// Layout is `[2-bit chunks][row params: (f16 lo, f16 step)][codes]`.
+pub fn q2tp_sections(rows: usize, cols: usize) -> (usize, usize, usize) {
+    let gpr = cols / GROUP_SIZE;
+    let chunk = rows * gpr * Q2TP_CHUNK;
+    (chunk, chunk + rows * 4, q4tp_code_stride(gpr))
+}
+
+/// Highest `q2tp` scale rung. One fewer than q4tp's: rung 0 is spent on
+/// the exact zero below, so the geometric part is rungs 1..=31.
+pub const Q2TP_LMAX: usize = 30;
+
+/// `q2tp` scale ladder. The 4-level grid ±0.5/±1.5 is the RMS-optimal
+/// symmetric quantizer for Gaussian-ish weights, but it cannot spell
+/// ZERO — so a pruned or masked group would come back as noise. Rung 0
+/// therefore means "this group is exactly zero" and rungs 1..=31 are the
+/// q4tp ladder shifted down one: `s(c) = 2^(lo + (c−1)·step)`.
+pub fn q2tp_ladder(params: &[u8], r: usize) -> [f32; 32] {
+    let base = q4tp_ladder(params, r);
+    let mut t = [0f32; 32];
+    t[1..32].copy_from_slice(&base[..31]);
+    t
+}
+
+/// Dequantize a full `q2tp` tensor. Weights are 2-bit fields, LSB-first
+/// within each byte: code c ∈ 0..4 → (c − 1.5)·s (and s = 0 at rung 0).
+pub fn dequant_q2tp(bytes: &[u8], rows: usize, cols: usize, dst: &mut [f32]) {
+    let gpr = cols / GROUP_SIZE;
+    let (params_off, codes_off, stride) = q2tp_sections(rows, cols);
+    let params = &bytes[params_off..params_off + rows * 4];
+    for r in 0..rows {
+        let tab = q2tp_ladder(params, r);
+        let codes = &bytes[codes_off + r * stride..codes_off + (r + 1) * stride];
+        for g in 0..gpr {
+            let s = tab[q4tp_code(codes, g)];
+            let chunk = &bytes[(r * gpr + g) * Q2TP_CHUNK..(r * gpr + g + 1) * Q2TP_CHUNK];
+            let base = r * cols + g * GROUP_SIZE;
+            for (k, &byte) in chunk.iter().enumerate() {
+                for j in 0..4 {
+                    dst[base + k * 4 + j] = (((byte >> (2 * j)) & 3) as f32 - 1.5) * s;
+                }
+            }
+        }
+    }
+}
+
+/// Byte layout of a `vbit_ro` payload (roadmap §4.2):
+/// `[u8 bits: rows][f16 scales: rows·cols/32][u32 row_offsets: rows+1]
+///  [bit-packed rows]` — offsets are relative to the packed area, so
+/// `offsets[r]..offsets[r+1]` is row r without any prefix scan.
+/// Returns (scales_off, offsets_off, packed_off).
+pub fn vbit_ro_sections(rows: usize, cols: usize) -> (usize, usize, usize) {
+    let ng = cols / GROUP_SIZE;
+    let scales_off = rows;
+    let offsets_off = scales_off + rows * ng * 2;
+    let packed_off = offsets_off + (rows + 1) * 4;
+    (scales_off, offsets_off, packed_off)
+}
+
+/// Read one u32 row offset from a `vbit_ro` offsets table.
+#[inline]
+pub fn vbit_ro_offset(bytes: &[u8], offsets_off: usize, r: usize) -> usize {
+    let o = offsets_off + r * 4;
+    u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]) as usize
+}
+
+/// Dequantize a full `vbit_ro` tensor — same math as `dequant_vbit`,
+/// rows addressed through the stored offset table.
+pub fn dequant_vbit_ro(
+    bytes: &[u8],
+    rows: usize,
+    cols: usize,
+    dst: &mut [f32],
+) -> Result<(), String> {
+    if cols % GROUP_SIZE != 0 {
+        return Err(format!(
+            "vbit_ro: cols {cols} not a multiple of {GROUP_SIZE}"
+        ));
+    }
+    let ng = cols / GROUP_SIZE;
+    let (sc_off, off_off, packed_off) = vbit_ro_sections(rows, cols);
+    let bits = &bytes[..rows];
+    for r in 0..rows {
+        let b = bits[r] as usize;
+        if !matches!(b, 3..=6 | 8) {
+            return Err(format!(
+                "vbit_ro row {r}: bit width {b} outside {{3,4,5,6,8}}"
+            ));
+        }
+        let l = ((1usize << (b - 1)) - 1) as f32;
+        let start = packed_off + vbit_ro_offset(bytes, off_off, r);
+        let end = packed_off + vbit_ro_offset(bytes, off_off, r + 1);
+        let data = &bytes[start..end];
+        let (mut acc, mut nbits, mut idx) = (0u64, 0usize, 0usize);
+        for i in 0..cols {
+            while nbits < b {
+                acc = (acc << 8) | data[idx] as u64;
+                idx += 1;
+                nbits += 8;
+            }
+            let u = ((acc >> (nbits - b)) & ((1u64 << b) - 1)) as f32;
+            nbits -= b;
+            let so = (r * ng + i / GROUP_SIZE) * 2;
+            let sc = f16_to_f32(u16::from_le_bytes([
+                bytes[sc_off + so],
+                bytes[sc_off + so + 1],
+            ]));
+            dst[r * cols + i] = (u - l) * sc;
+        }
+    }
+    Ok(())
+}
+
+/// Expected byte length of a tensor given dtype and element count.
+pub fn expected_nbytes(dtype: TensorDtype, shape: &[usize]) -> Option<usize> {
+    let n = shape
+        .iter()
+        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))?;
+    match dtype {
+        TensorDtype::F32 => n.checked_mul(4),
+        TensorDtype::F16 | TensorDtype::Bf16 => n.checked_mul(2),
+        TensorDtype::Q8Row => {
+            let out = *shape.first()?;
+            n.checked_add(out.checked_mul(2)?)
+        }
+        TensorDtype::Q4Block => {
+            let groups = n.div_ceil(GROUP_SIZE);
+            groups.checked_mul(18)
+        }
+        TensorDtype::Q4Tiled => {
+            // Interleaved tiles: [f16 scale][16B nibbles] per 32-group.
+            n.div_ceil(GROUP_SIZE).checked_mul(18)
+        }
+        TensorDtype::Q1 => {
+            // Interleaved tiles: [f16 scale][4B bits] per 32-group.
+            n.div_ceil(GROUP_SIZE).checked_mul(Q1_TILE)
+        }
+        TensorDtype::Q4TiledP => {
+            // [nibbles][row params][row-aligned 5-bit codes] — needs the
+            // row count, so 2-D only (the encoder emits nothing else).
+            if shape.len() != 2 {
+                return None;
+            }
+            let (rows, cols) = (shape[0], shape[1]);
+            if cols % GROUP_SIZE != 0 {
+                return None;
+            }
+            let gpr = cols / GROUP_SIZE;
+            rows.checked_mul(gpr)?
+                .checked_mul(Q4TP_NIB)?
+                .checked_add(rows.checked_mul(4)?)?
+                .checked_add(rows.checked_mul(q4tp_code_stride(gpr))?)
+        }
+        TensorDtype::Q2TiledP => {
+            if shape.len() != 2 {
+                return None;
+            }
+            let (rows, cols) = (shape[0], shape[1]);
+            if cols % GROUP_SIZE != 0 {
+                return None;
+            }
+            let gpr = cols / GROUP_SIZE;
+            rows.checked_mul(gpr)?
+                .checked_mul(Q2TP_CHUNK)?
+                .checked_add(rows.checked_mul(4)?)?
+                .checked_add(rows.checked_mul(q4tp_code_stride(gpr))?)
+        }
+        TensorDtype::Q8_2f => {
+            let out = *shape.first()?;
+            let inn = n / out.max(1);
+            n.checked_add(out.checked_mul(2)?)?
+                .checked_add(inn.checked_mul(2)?)
+        }
+        _ => None, // variable/reserved dtypes: size not defined by this reader
+    }
+}
+
+fn has_fixed_payload_size(dtype: TensorDtype) -> bool {
+    matches!(
+        dtype,
+        TensorDtype::F32
+            | TensorDtype::F16
+            | TensorDtype::Bf16
+            | TensorDtype::Q8Row
+            | TensorDtype::Q4Block
+            | TensorDtype::Q4Tiled
+            | TensorDtype::Q4TiledP
+            | TensorDtype::Q2TiledP
+            | TensorDtype::Q1
+            | TensorDtype::Q8_2f
+    )
+}
+
+/// Validate a tensor payload against its directory entry (roadmap
+/// §4.9): every length is checked BEFORE any slice is taken, so a
+/// corrupted or truncated file fails loudly at `open()` instead of
+/// panicking in a kernel. For fixed-size dtypes this is the
+/// `expected_nbytes` equality; for vbit — whose payload length depends
+/// on the per-row bit widths stored in the payload itself — the exact
+/// length is computed from the (validated) width header.
+pub fn validate_payload(dtype: TensorDtype, shape: &[usize], bytes: &[u8]) -> Result<(), String> {
+    if dtype == TensorDtype::Q4TiledP {
+        // Say WHY the shape is wrong; the generic length check below cannot,
+        // since expected_nbytes has to fold both causes into None.
+        if shape.len() != 2 {
+            return Err(format!("q4tp tensor must be 2-D, got {shape:?}"));
+        }
+        if shape[1] == 0 || shape[1] % GROUP_SIZE != 0 {
+            return Err(format!(
+                "q4tp cols {} not a positive multiple of {GROUP_SIZE}",
+                shape[1]
+            ));
+        }
+    }
+    if dtype == TensorDtype::Q2TiledP {
+        if shape.len() != 2 {
+            return Err(format!("q2tp tensor must be 2-D, got {shape:?}"));
+        }
+        if shape[1] == 0 || shape[1] % GROUP_SIZE != 0 {
+            return Err(format!(
+                "q2tp cols {} not a positive multiple of {GROUP_SIZE}",
+                shape[1]
+            ));
+        }
+    }
+    if dtype == TensorDtype::VbitRo {
+        if shape.len() != 2 {
+            return Err(format!("vbit_ro tensor must be 2-D, got {shape:?}"));
+        }
+        let (rows, cols) = (shape[0], shape[1]);
+        if cols == 0 || cols % GROUP_SIZE != 0 {
+            return Err(format!(
+                "vbit_ro cols {cols} not a positive multiple of {GROUP_SIZE}"
+            ));
+        }
+        let (_, off_off, packed_off) = vbit_ro_sections(rows, cols);
+        if bytes.len() < packed_off {
+            return Err(format!(
+                "vbit_ro payload {} bytes cannot hold headers ({packed_off})",
+                bytes.len()
+            ));
+        }
+        if vbit_ro_offset(bytes, off_off, 0) != 0 {
+            return Err("vbit_ro offsets[0] must be 0".to_string());
+        }
+        for r in 0..rows {
+            let b = bytes[r];
+            if !matches!(b, 3..=6 | 8) {
+                return Err(format!(
+                    "vbit_ro row {r}: bit width {b} outside {{3,4,5,6,8}}"
+                ));
+            }
+            let want = (cols * b as usize).div_ceil(8);
+            let got = vbit_ro_offset(bytes, off_off, r + 1)
+                .checked_sub(vbit_ro_offset(bytes, off_off, r))
+                .ok_or_else(|| format!("vbit_ro offsets not monotonic at row {r}"))?;
+            if want != got {
+                return Err(format!(
+                    "vbit_ro row {r}: offset span {got} != {want} for width {b}"
+                ));
+            }
+        }
+        let total = packed_off + vbit_ro_offset(bytes, off_off, rows);
+        if total != bytes.len() {
+            return Err(format!(
+                "vbit_ro payload length {} != computed {total}",
+                bytes.len()
+            ));
+        }
+        return Ok(());
+    }
+    if dtype == TensorDtype::Vbit {
+        if shape.len() != 2 {
+            return Err(format!("vbit tensor must be 2-D, got {shape:?}"));
+        }
+        let (rows, cols) = (shape[0], shape[1]);
+        if cols == 0 || cols % GROUP_SIZE != 0 {
+            return Err(format!(
+                "vbit cols {cols} not a positive multiple of {GROUP_SIZE}"
+            ));
+        }
+        // bits header: bounds BEFORE slicing.
+        if bytes.len() < rows {
+            return Err(format!(
+                "vbit payload {} bytes cannot hold the {rows}-byte width header",
+                bytes.len()
+            ));
+        }
+        let ng = cols / GROUP_SIZE;
+        let mut total = rows + rows * ng * 2;
+        for (r, &b) in bytes[..rows].iter().enumerate() {
+            if !matches!(b, 3..=6 | 8) {
+                return Err(format!("vbit row {r}: bit width {b} outside {{3,4,5,6,8}}"));
+            }
+            total += (cols * b as usize).div_ceil(8);
+        }
+        if total != bytes.len() {
+            return Err(format!(
+                "vbit payload length {} != computed {} (rows {rows}, cols {cols})",
+                bytes.len(),
+                total
+            ));
+        }
+        return Ok(());
+    }
+    if has_fixed_payload_size(dtype) && expected_nbytes(dtype, shape).is_none() {
+        return Err(format!(
+            "tensor size overflows usize for {dtype:?}{shape:?}"
+        ));
+    }
+    if let Some(expect) = expected_nbytes(dtype, shape) {
+        if expect != bytes.len() {
+            return Err(format!(
+                "payload length {} != expected {expect} for {dtype:?}{shape:?}",
+                bytes.len()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Dequantize any supported tensor into f32.
+pub fn dequant_tensor(entry: &TensorEntry, bytes: &[u8], dst: &mut [f32]) -> Result<(), String> {
+    let n: usize = entry.shape.iter().product();
+    if dst.len() != n {
+        return Err(format!(
+            "dst len {} != tensor elems {} for '{}'",
+            dst.len(),
+            n,
+            entry.name
+        ));
+    }
+    match entry.dtype {
+        TensorDtype::F32 => {
+            for (i, d) in dst.iter_mut().enumerate() {
+                *d = f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+            }
+        }
+        TensorDtype::F16 => {
+            for (i, d) in dst.iter_mut().enumerate() {
+                *d = f16_to_f32(u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]));
+            }
+        }
+        TensorDtype::Bf16 => {
+            for (i, d) in dst.iter_mut().enumerate() {
+                *d = bf16_to_f32(u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]));
+            }
+        }
+        TensorDtype::Q8Row => {
+            if entry.shape.len() != 2 {
+                return Err(format!("q8_row tensor '{}' must be 2-D", entry.name));
+            }
+            dequant_q8_row(bytes, entry.shape[0], entry.shape[1], dst);
+        }
+        TensorDtype::Q4Block => dequant_q4_block(bytes, dst),
+        TensorDtype::Q4Tiled => dequant_q4_tiled(bytes, dst),
+        TensorDtype::Q4TiledP => {
+            if entry.shape.len() != 2 {
+                return Err(format!("q4tp tensor '{}' must be 2-D", entry.name));
+            }
+            dequant_q4tp(bytes, entry.shape[0], entry.shape[1], dst);
+        }
+        TensorDtype::Q2TiledP => {
+            if entry.shape.len() != 2 {
+                return Err(format!("q2tp tensor '{}' must be 2-D", entry.name));
+            }
+            dequant_q2tp(bytes, entry.shape[0], entry.shape[1], dst);
+        }
+        TensorDtype::Q1 => dequant_q1(bytes, dst),
+        TensorDtype::Q1S => dequant_q1s(bytes, dst),
+        TensorDtype::Q1T => {
+            if entry.shape.len() != 2 {
+                return Err(format!("q1t tensor '{}' must be 2-D", entry.name));
+            }
+            dequant_q1t(bytes, entry.shape[0], entry.shape[1], dst);
+        }
+        TensorDtype::Vbit => {
+            if entry.shape.len() != 2 {
+                return Err(format!("vbit tensor '{}' must be 2-D", entry.name));
+            }
+            dequant_vbit(bytes, entry.shape[0], entry.shape[1], dst)?;
+        }
+        TensorDtype::VbitRo => {
+            if entry.shape.len() != 2 {
+                return Err(format!("vbit_ro tensor '{}' must be 2-D", entry.name));
+            }
+            dequant_vbit_ro(bytes, entry.shape[0], entry.shape[1], dst)?;
+        }
+        TensorDtype::Q8_2f => {
+            if entry.shape.len() != 2 {
+                return Err(format!("q8_2f tensor '{}' must be 2-D", entry.name));
+            }
+            dequant_q8_2f(bytes, entry.shape[0], entry.shape[1], dst);
+        }
+        other => {
+            return Err(format!(
+                "dtype {} of '{}' is reserved — not decodable by this runtime",
+                other.name(),
+                entry.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Approximate stored bytes per weight for a dtype (informational).
+pub fn bytes_per_weight(dtype: TensorDtype) -> f32 {
+    match dtype {
+        TensorDtype::F32 => 4.0,
+        TensorDtype::F16 | TensorDtype::Bf16 => 2.0,
+        TensorDtype::Q8Row | TensorDtype::Q8_2f => 1.0,
+        TensorDtype::Q4Block | TensorDtype::Q4Col | TensorDtype::Mix84 | TensorDtype::Q4Tiled => {
+            0.5625
+        }
+        // 16 B nibbles + 5 bits of scale per 32 weights; the 4 B/row of
+        // ladder params are shape-dependent and not counted here.
+        TensorDtype::Q4TiledP => 0.519_531_25,
+        // 8 B chunks + the same 5-bit rung per 32 weights.
+        TensorDtype::Q2TiledP => 0.269_531_25,
+        TensorDtype::Vbit | TensorDtype::VbitRo => 0.5,
+        TensorDtype::Q1 => 0.1875, // 6 bytes per 32 weights
+        // q1 base + a small sparse f16 overlay (informational; the true
+        // size is the stored span, which grows with the outlier budget).
+        TensorDtype::Q1S => 0.3125,
+        TensorDtype::Q1T => 0.281_25, // 9 bytes per 32 weights (base-3 packed)
+        TensorDtype::U8 => 1.0,
+    }
+}
+
+#[cfg(test)]
+mod f16_tests {
+    use super::{GROUP_SIZE, f16_to_f32, f32_to_f16, validate_payload};
+
+    #[test]
+    fn f16_subnormals_decode_correctly() {
+        // Smallest positive subnormal: 2^-24.
+        assert!((f16_to_f32(0x0001) - 5.9604645e-8).abs() < 1e-12);
+        // Largest subnormal: 1023 * 2^-24.
+        assert!((f16_to_f32(0x03FF) - 6.097_555e-5).abs() < 1e-9);
+        // The value that exposed the halving bug (mant=299, subnormal).
+        assert!((f16_to_f32(0x812b) - -1.7821789e-5).abs() < 1e-9);
+        // Smallest normal (boundary) still correct: 2^-14.
+        assert!((f16_to_f32(0x0400) - 6.1035156e-5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn f16_roundtrip_including_subnormals() {
+        for &v in &[
+            0.0f32, 1.0, -2.5, 6.097e-5, 3.0e-5, 5.96e-8, -1.782e-5, 65504.0,
+        ] {
+            let back = f16_to_f32(f32_to_f16(v));
+            let tol = (v.abs() * 1e-3).max(1e-9);
+            assert!((back - v).abs() <= tol, "roundtrip {v} -> {back}");
+        }
+    }
+    /// §4.9: vbit payload validation — exact length from the width
+    /// header, bounds before any slice, width whitelist.
+    #[test]
+    fn validate_payload_vbit_contract() {
+        use crate::types::TensorDtype as D;
+        let (rows, cols) = (3usize, 64usize);
+        let ng = cols / GROUP_SIZE;
+        let bits = [4u8, 3, 8];
+        let mut good = bits.to_vec();
+        good.extend(std::iter::repeat_n(0u8, rows * ng * 2)); // scales
+        for &b in &bits {
+            good.extend(std::iter::repeat_n(0u8, (cols * b as usize).div_ceil(8)));
+        }
+        assert!(validate_payload(D::Vbit, &[rows, cols], &good).is_ok());
+
+        // Truncated: shorter than the width header itself.
+        assert!(validate_payload(D::Vbit, &[rows, cols], &good[..2]).is_err());
+        // One byte short / one byte long.
+        assert!(validate_payload(D::Vbit, &[rows, cols], &good[..good.len() - 1]).is_err());
+        let mut long = good.clone();
+        long.push(0);
+        assert!(validate_payload(D::Vbit, &[rows, cols], &long).is_err());
+        // Forbidden width (7).
+        let mut bad = good.clone();
+        bad[0] = 7;
+        assert!(validate_payload(D::Vbit, &[rows, cols], &bad).is_err());
+        // Non-2D / non-multiple-of-group cols.
+        assert!(validate_payload(D::Vbit, &[rows * cols], &good).is_err());
+        assert!(validate_payload(D::Vbit, &[rows, 33], &good).is_err());
+
+        // Fixed-size dtype goes through expected_nbytes.
+        let q8 = vec![0u8; 2 * 8 + 2 * 2];
+        assert!(validate_payload(D::Q8Row, &[2, 8], &q8).is_ok());
+        assert!(validate_payload(D::Q8Row, &[2, 8], &q8[..q8.len() - 1]).is_err());
+    }
+
+    /// §4.9: vbit is a first-class supported dtype.
+    #[test]
+    fn vbit_is_supported() {
+        assert!(crate::types::TensorDtype::Vbit.is_supported());
+    }
+}

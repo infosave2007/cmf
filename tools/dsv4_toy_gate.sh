@@ -1,0 +1,132 @@
+#!/bin/bash
+# The dsv4 toy gate. FIRST it proves the device came up: a WGSL parse error
+# takes the whole module with it, wgpu falls back to the CPU with one WARN,
+# and then every arm of the comparison agrees — vacuously.
+# Where the stands live. CMF_TOY_DIR overrides; the default is a scratch
+# path from the session that built them, which is exactly the kind of thing
+# that makes a gate unrunnable for anyone else.
+S=${CMF_TOY_DIR:-/private/tmp/claude-501/-Users-oleg-Documents-cortiq-bot-cmfpublic/674db62a-643b-4641-b330-5feed6d40b67/scratchpad}
+if [ ! -f "$S/plain4.cmf" ]; then
+  echo "GATE ABORT: стендов нет в $S — задайте CMF_TOY_DIR"
+  exit 1
+fi
+E="CMF_GPU=wgpu CMF_SDOT=0 CMF_GPU_VRAM_MB=200 CMF_DSV4_GPU_LAYER=1 CMF_DSV4_GPU_ATTN=1 CMF_DSV4_GPU_MOE2=1 CMF_DSV4_SLOT_CHECK=1"
+
+# "wgpu GPU path: on" is logged BEFORE the pipelines are built, so it appears
+# even when a shader then fails to parse and the whole context falls back to
+# the CPU. The absence of the failure is the real check.
+out=$(env $E RUST_LOG=info ./target/release/cortiq ppl $S/plain4.cmf --file $S/long.txt --tokens 4 2>&1)
+up=$(printf '%s' "$out" | grep -ac "wgpu GPU path: on")
+printf '%s' "$out" | grep -aq "wgpu init failed" && up=0
+if [ "$up" != "1" ]; then
+  echo "GATE ABORT: wgpu не поднялся — сравнение было бы холостым"
+  env $E RUST_LOG=info ./target/release/cortiq ppl $S/plain4.cmf --file $S/long.txt --tokens 4 2>&1 \
+    | grep -aiE "init failed|Shader|error" | head -4
+  exit 1
+fi
+echo "устройство: поднялось"
+
+# The build gate, and it has to be the EXIT CODE. Grepping for "N failed"
+# counts test failures — a compile error produces no such line at all, so
+# that check reported success while CI reported three type errors in code
+# that only the test profile builds.
+# RUN the tests, in BOTH configurations. Compiling them is not running
+# them, and the CPU-only build is where the layer loop went missing: it
+# lived in the else arm of a cfg-gated if, so without the gpu feature no
+# layer ran at all and one test said so — in the one configuration this
+# gate never executed.
+if ! cargo test --workspace >/dev/null 2>&1; then
+  echo "GATE ABORT: тесты БЕЗ gpu"
+  cargo test --workspace 2>&1 | grep -E "^error|FAILED|panicked" -A3 | head -14
+  exit 1
+fi
+if ! cargo test --workspace --features gpu >/dev/null 2>&1; then
+  echo "GATE ABORT: тесты С gpu"
+  cargo test --workspace --features gpu 2>&1 | grep -E "^error|FAILED|panicked" -A3 | head -14
+  exit 1
+fi
+if ! cargo clippy --workspace --all-targets >/dev/null 2>&1; then
+  echo "GATE ABORT: clippy"
+  exit 1
+fi
+echo "сборка тестов и clippy: чисто"
+
+# And that the chain really engages, which needs GPU_LAYER — without it both
+# arms are the same path and agree for the wrong reason.
+subs=$(env $E CMF_DSV4_CHAIN=1 CMF_DSV4_PROFILE=1 ./target/release/cortiq run $S/hx4.cmf \
+       --prompt abc --max-tokens 12 2>&1 | grep -a "ЦЕПОЧКА" | head -1)
+[ -z "$subs" ] && { echo "GATE ABORT: цепочка не включилась"; exit 1; }
+echo "цепочка: $subs"
+
+# The CPU arm. The chain and the layer frame run the SAME kernels, so a
+# kernel that computes the wrong thing makes both of them agree — which is
+# exactly how a rewritten projection passed this gate and then read 133.433
+# where the CPU read 133.396. The host path is the only reference that is
+# not also the thing under test.
+echo "--- против CPU (стенды без индексатора обязаны совпасть) ---"
+for toy in plain4 sc4; do
+  cpu=$(env CMF_SDOT=0 CMF_GPU=off ./target/release/cortiq ppl $S/$toy.cmf --file $S/long.txt --tokens 120 2>/dev/null | grep -o "PPL = [0-9.]*")
+  gpu=$(env $E CMF_DSV4_CHAIN=1 ./target/release/cortiq ppl $S/$toy.cmf --file $S/long.txt --tokens 120 2>/dev/null | grep -o "PPL = [0-9.]*")
+  if [ "$cpu" != "$gpu" ]; then
+    echo "$toy  CPU:$cpu  карта:$gpu  ← РАСХОЖДЕНИЕ С ХОСТОМ"
+    exit 1
+  fi
+  echo "$toy  CPU:$cpu  карта:$gpu"
+done
+
+fail=0
+for toy in hx4 plain4 sc4 q4 big2; do
+  a=$(env $E CMF_DSV4_CHAIN=0 ./target/release/cortiq ppl $S/$toy.cmf --file $S/long.txt --tokens 120 2>/dev/null | grep -o "PPL = [0-9.]*")
+  b=$(env $E CMF_DSV4_CHAIN=1 ./target/release/cortiq ppl $S/$toy.cmf --file $S/long.txt --tokens 120 2>/dev/null | grep -o "PPL = [0-9.]*")
+  # plain/scored/hash stands must be EXACT; the two with indexers carry the
+  # on-device top-k flip contract, so they get 0.05%.
+  mark=""
+  if [ "$a" != "$b" ]; then
+    case $toy in
+      q4|big2)
+        d=$(python3 -c "import sys;x=float('$a'.split()[-1]);y=float('$b'.split()[-1]);print(abs(x-y)/x*100)")
+        ok=$(python3 -c "print(1 if $d < 0.05 else 0)")
+        if [ "$ok" = "1" ]; then mark="  (флип $d%)"; else mark="  ← РАСХОЖДЕНИЕ $d%"; fail=1; fi ;;
+      *)
+        d=$(python3 -c "x=float('$a'.split()[-1]);y=float('$b'.split()[-1]);print(abs(x-y)/x*100)")
+        ok=$(python3 -c "print(1 if $d < 0.001 else 0)")
+        # 0.001%: the split attention and the wide matvec sum in a different
+        # lane order, so 'exact' now means 'below the float noise floor', not
+        # 'the same bits'. Anything real is orders of magnitude above this.
+        if [ "$ok" = "1" ]; then mark="  (шум $d%)"; else mark="  ← РАСХОЖДЕНИЕ $d%"; fail=1; fi ;;
+    esac
+  fi
+  echo "$toy  кадр:$a  цепочка:$b$mark"
+done
+# ── the batched prompt against the walk ────────────────────────────────
+# A batch changes only HOW the prompt reaches the card, never what it
+# computes, so any difference here is a defect. The walk is the reference;
+# widths 2, 3 and 5 are decode-block sizes, and 5 straddles the compressor's
+# ratio-4 boundary, which is where a closed-form counter would go wrong.
+echo "--- пакетный префилл против прохода по токенам ---"
+# The comparison is only worth its name if the batch RAN. `ppl` walks tokens
+# one at a time and never reaches forward_chunk, so this section compared the
+# walk against itself and printed agreement — which is how a vacuous check
+# looks from the outside. It now demands the engine say it batched, and says
+# plainly that it did not when it did not.
+for toy in plain4 sc4 q4; do
+  base=$(env $E CMF_DSV4_CHAIN=1 CMF_DSV4_BATCH=1 ./target/release/cortiq ppl \
+    $S/$toy.cmf --file $S/long.txt --tokens 120 2>/dev/null | grep -o "PPL = [0-9.]*")
+  for b in 2 3 5; do
+    log=$(env $E CMF_DSV4_CHAIN=1 CMF_DSV4_BATCH=$b RUST_LOG=info \
+      ./target/release/cortiq ppl $S/$toy.cmf --file $S/long.txt --tokens 120 2>&1)
+    got=$(echo "$log" | grep -o "PPL = [0-9.]*")
+    if ! echo "$log" | grep -q "префилл пакетами"; then
+      echo "$toy  пакет=$b: НЕ ПРОВЕРЕНО — пакет не включился на этом пути"
+      continue
+    fi
+    if [ "$base" = "$got" ]; then
+      echo "$toy  пакет=$b: $got  (совпало)"
+    else
+      echo "GATE FAIL: $toy пакет=$b: $got против прохода $base"
+      exit 1
+    fi
+  done
+done
+
+exit $fail

@@ -1,0 +1,1817 @@
+//! KV cache — per-layer, head-major storage.
+//!
+//! Layout: one contiguous `Vec<f32>` per KV head (`[pos × head_dim]`),
+//! so per-head attention reads a straight slice — no per-head gather
+//! copies per token. Dead GQA groups (all Q heads masked) store
+//! nothing at all: masked heads cost neither FLOPs nor memory.
+
+/// KV storage mode. `CMF_KV=q8` enables the q8_2f cache: an int8 row per
+/// (position, head) + an f32 scale per row + a per-channel scale field,
+/// frozen after WARMUP positions with retroactive requantization
+/// (D4: "KV-quant 2f"). Memory ×~3.7 smaller than f32.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvMode {
+    F32,
+    /// Quantized components: (K, V) — sensitivity diagnostics.
+    Q8 {
+        k: bool,
+        v: bool,
+    },
+}
+
+impl KvMode {
+    pub fn from_env() -> Self {
+        match std::env::var("CMF_KV").as_deref() {
+            Ok("q8") | Ok("q8_2f") => KvMode::Q8 { k: true, v: true },
+            Ok("q8k") => KvMode::Q8 { k: true, v: false },
+            Ok("q8v") => KvMode::Q8 { k: false, v: true },
+            _ => KvMode::F32,
+        }
+    }
+
+    fn quant_k(self) -> bool {
+        matches!(self, KvMode::Q8 { k: true, .. })
+    }
+
+    fn quant_v(self) -> bool {
+        matches!(self, KvMode::Q8 { v: true, .. })
+    }
+}
+
+/// Positions before freezing the per-channel field (2f): before — col ≡ 1,
+/// after — col = RMS over channels of the stored rows, old rows are requantized.
+const KV_COL_WARMUP: usize = 64;
+
+/// K-rows are quantized in groups of 32 channels (scale per group):
+/// attention logits are sensitive to the dot-product error, per-group scales
+/// localize it along RoPE bands (35B: +4.6% PPL with a per-row scale
+/// → target <1% with a per-group one). V — per-row scale (measured +0.56%).
+const KV_K_GROUP: usize = 32;
+
+/// Per-layer O(1) Nyström attention state (runtime `attn_type`
+/// override — spec §7 presence-driven pattern, no format change).
+///
+/// Collecting: the prompt pass still runs EXACT cache attention (the
+/// prefill outputs feed the residual stream, so they cannot be
+/// deferred) while the per-position rotated queries are buffered;
+/// `o1_seal()` then freezes landmarks + M from the full prompt, replays
+/// it into per-KV-group streaming states, and DROPS the full KV.
+/// Sealed: decode replaces cache attention with
+/// `NystromState::step_group()`.
+#[derive(Debug, Clone)]
+pub enum O1State {
+    Collecting {
+        m: usize,
+        w: usize,
+        sink: usize,
+        rect: crate::nystrom::O1Rect,
+        /// Optional completed-row barrier. `None` means the caller will
+        /// request a full-prompt seal; `Some(B)` keeps a short prompt exact
+        /// until the first skeleton-safe boundary B.
+        seal_at: Option<usize>,
+        /// Rotated post-norm queries, `[pos × num_heads × head_dim]`.
+        q_buf: Vec<f32>,
+    },
+    /// One state per KV GROUP, each holding its group's Q heads. The
+    /// exact window / sinks / K̃ are stored once per group (every Q head
+    /// of the group reads the same k/v rows); only the far field, Q̃ and
+    /// M — the query-dependent pieces — stay per Q head. See
+    /// `NystromState` for which piece is which and why.
+    Sealed {
+        groups: Vec<crate::nystrom::NystromState>,
+    },
+}
+
+/// KV cache for a single layer, head-major.
+#[derive(Debug, Clone)]
+pub struct LayerKvCache {
+    pub mode: KvMode,
+    /// Per-KV-head keys: `k[h]` is `[seq_len × head_dim]` (empty if head is dead).
+    k: Vec<Vec<f32>>,
+    /// Per-KV-head values, same layout.
+    v: Vec<Vec<f32>>,
+    /// q8 storage (mode == Q8_2F): int8 rows + f32 scale per row.
+    kq: Vec<Vec<i8>>,
+    ks: Vec<Vec<f32>>,
+    vq: Vec<Vec<i8>>,
+    vs: Vec<Vec<f32>>,
+    /// Per-channel scale fields per head [head_dim]; empty until frozen.
+    kcol: Vec<Vec<f32>>,
+    vcol: Vec<Vec<f32>>,
+    /// Accumulated attention mass per stored position: importance of a
+    /// position is how much probability mass reads it.
+    imp: Vec<f32>,
+    /// Positions appended so far (grows once per token, dead heads included).
+    pub seq_len: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    /// Linear-core recurrent state S (vmf_phase), f64; empty on full layers.
+    pub linear_state: Vec<f32>,
+    /// Tentative lane-2 state during speculative verify.
+    pub linear_scratch: Vec<f32>,
+    /// O(1) Nyström override (None = plain cache attention).
+    pub o1: Option<O1State>,
+    /// A deferred seal failure is terminal for the current request. The
+    /// attention functions return only a hidden vector, so the pipeline
+    /// consumes this side channel at its next forward boundary.
+    o1_error: Option<String>,
+    /// Set when a collecting state actually becomes sealed. Pipeline owns
+    /// the epoch bump and consumes this bit after a complete forward.
+    o1_transitioned: bool,
+}
+
+impl LayerKvCache {
+    pub fn new(num_kv_heads: usize, head_dim: usize) -> Self {
+        Self {
+            mode: KvMode::from_env(),
+            k: vec![Vec::new(); num_kv_heads],
+            v: vec![Vec::new(); num_kv_heads],
+            kq: vec![Vec::new(); num_kv_heads],
+            ks: vec![Vec::new(); num_kv_heads],
+            vq: vec![Vec::new(); num_kv_heads],
+            vs: vec![Vec::new(); num_kv_heads],
+            kcol: vec![Vec::new(); num_kv_heads],
+            vcol: vec![Vec::new(); num_kv_heads],
+            imp: Vec::new(),
+            seq_len: 0,
+            num_kv_heads,
+            head_dim,
+            linear_state: Vec::new(),
+            linear_scratch: Vec::new(),
+            o1: None,
+            o1_error: None,
+            o1_transitioned: false,
+        }
+    }
+
+    /// Per-KV-head stored keys `[seq_len × head_dim]` (GPU token graph sync).
+    pub fn k_heads(&self) -> &[Vec<f32>] {
+        &self.k
+    }
+    /// Per-KV-head stored values `[seq_len × head_dim]`.
+    pub fn v_heads(&self) -> &[Vec<f32>] {
+        &self.v
+    }
+
+    // ── O(1) Nyström override ──
+
+    /// Arm query collection for a fresh prompt pass (a cleared cache).
+    pub fn o1_begin(&mut self, m: usize, w: usize, sink: usize, rect: crate::nystrom::O1Rect) {
+        self.o1_begin_with_boundary(m, w, sink, rect, None);
+    }
+
+    /// Arm query collection with an optional completed-row seal barrier.
+    /// The barrier is deliberately part of the existing collecting state:
+    /// no second history or scheduler is introduced for short prompts.
+    pub(crate) fn o1_begin_with_boundary(
+        &mut self,
+        m: usize,
+        w: usize,
+        sink: usize,
+        rect: crate::nystrom::O1Rect,
+        seal_at: Option<usize>,
+    ) {
+        self.o1 = Some(O1State::Collecting {
+            m,
+            w,
+            sink,
+            rect,
+            seal_at,
+            q_buf: Vec::new(),
+        });
+        self.o1_error = None;
+        self.o1_transitioned = false;
+    }
+
+    /// Record one position's rotated queries (`[num_heads × head_dim]`)
+    /// during the exact prompt pass. No-op unless collecting — the hook
+    /// sits inside qwen_attention so every prefill flavor (sequential,
+    /// batched) feeds the same trace.
+    pub fn o1_push_q(&mut self, q_all: &[f32]) {
+        if let Some(O1State::Collecting { q_buf, .. }) = &mut self.o1 {
+            q_buf.extend_from_slice(q_all);
+        }
+    }
+
+    pub fn o1_sealed(&self) -> bool {
+        matches!(self.o1, Some(O1State::Sealed { .. }))
+    }
+
+    /// Pending completed-row barrier, if any. A plain full-prompt seal has
+    /// no barrier until the caller asks to seal.
+    pub(crate) fn o1_pending_boundary(&self) -> Option<usize> {
+        match &self.o1 {
+            Some(O1State::Collecting { seal_at, .. }) => *seal_at,
+            _ => None,
+        }
+    }
+
+    /// Whether a batch of `count` exact rows would cross the deferred
+    /// boundary. This lets batched/pair callers split before row B rather
+    /// than appending exact KV past the point where conversion is required.
+    pub(crate) fn o1_boundary_crossed_by(&self, count: usize) -> bool {
+        let Some(target) = self.o1_pending_boundary() else {
+            return false;
+        };
+        target <= self.seq_len
+            || self
+                .seq_len
+                .checked_add(count)
+                .map_or(true, |next| next >= target)
+    }
+
+    pub(crate) fn take_o1_transition(&mut self) -> bool {
+        std::mem::take(&mut self.o1_transitioned)
+    }
+
+    pub(crate) fn take_o1_error(&self) -> Option<String> {
+        // Error observation is deliberately non-consuming.  The error is the
+        // append guard for this request; removing it would let a caller that
+        // ignored the returned Err resume ordinary KV growth after the
+        // bounded transition dropped its overlay.  `clear()` is the explicit
+        // reset boundary that clears the latch.
+        self.o1_error.clone()
+    }
+
+    /// Abort a malformed deferred transition after attention has already
+    /// produced its current row. Clearing the exact storage and dropping
+    /// the overlay makes the state unrecoverable by continued decode; the
+    /// pipeline then routes through its normal graph/cancel cleanup.
+    pub(crate) fn o1_abort(&mut self, err: String) {
+        self.k.iter_mut().for_each(Vec::clear);
+        self.v.iter_mut().for_each(Vec::clear);
+        self.kq.iter_mut().for_each(Vec::clear);
+        self.ks.iter_mut().for_each(Vec::clear);
+        self.vq.iter_mut().for_each(Vec::clear);
+        self.vs.iter_mut().for_each(Vec::clear);
+        self.kcol.iter_mut().for_each(Vec::clear);
+        self.vcol.iter_mut().for_each(Vec::clear);
+        self.imp.clear();
+        self.o1 = None;
+        self.seq_len = 0;
+        self.o1_transitioned = false;
+        self.o1_error = Some(err);
+    }
+
+    /// Freeze the prompt into per-KV-group Nyström states and drop this
+    /// layer's full KV. Returns false while a short collecting layer is
+    /// below its deferred boundary; malformed prerequisites abort the
+    /// layer instead of silently resuming exact KV growth. The seal needs
+    /// f32 KV rows (`CMF_KV=q8` stores int8), every group densely stored, a
+    /// full q trace, and a GQA fan-out that actually divides.
+    pub fn o1_seal(&mut self, num_heads: usize) -> bool {
+        match self.o1_seal_checked(num_heads) {
+            Ok(sealed) => sealed,
+            Err(err) => {
+                tracing::error!("o1: seal aborted: {err}");
+                self.o1_abort(err);
+                false
+            }
+        }
+    }
+
+    /// Checked seal implementation. Validation happens while the collecting
+    /// state and full KV are still intact; only a valid completed boundary
+    /// is allowed to destructively convert them.
+    pub(crate) fn o1_seal_checked(&mut self, num_heads: usize) -> Result<bool, String> {
+        if let Some(err) = self.o1_error.clone() {
+            return Err(err);
+        }
+        // Idempotent: sealing a sealed (or plain) layer must not disturb its
+        // state, and a plain layer is not an O(1) participant.
+        if !matches!(self.o1, Some(O1State::Collecting { .. })) {
+            return Ok(self.o1_sealed());
+        }
+        let (m, w, sink, requested_boundary, q_len) = match &self.o1 {
+            Some(O1State::Collecting {
+                m,
+                w,
+                sink,
+                rect: _,
+                seal_at,
+                q_buf,
+            }) => (*m, *w, *sink, *seal_at, q_buf.len()),
+            _ => unreachable!("checked above"),
+        };
+        let floor = crate::nystrom::o1_deferred_boundary(w, sink)
+            .ok_or_else(|| "o1 seal: w + sink + slack + 1 overflow".to_string())?;
+        let target = requested_boundary.unwrap_or(floor).max(floor);
+        let t = self.seq_len;
+        if t < target {
+            if let Some(O1State::Collecting { seal_at, .. }) = &mut self.o1 {
+                if *seal_at != Some(target) {
+                    *seal_at = Some(target);
+                    tracing::info!(
+                        "o1 deferred seal: current rows={t}, boundary={target} (floor={floor})"
+                    );
+                }
+            }
+            return Ok(false);
+        }
+
+        let hd = self.head_dim;
+        if t == 0 {
+            return Err("o1 seal: cannot seal an empty layer".into());
+        }
+        if self.mode != KvMode::F32 {
+            return Err("o1 seal: requires dense F32 KV storage".into());
+        }
+        if self.num_kv_heads == 0 || num_heads == 0 || num_heads % self.num_kv_heads != 0 {
+            return Err(format!(
+                "o1 seal: invalid GQA geometry num_heads={num_heads} num_kv_heads={}",
+                self.num_kv_heads
+            ));
+        }
+        let hpk = num_heads / self.num_kv_heads;
+        let expected_k = t
+            .checked_mul(hd)
+            .ok_or_else(|| "o1 seal: KV row length overflow".to_string())?;
+        let expected_q = expected_k
+            .checked_mul(num_heads)
+            .ok_or_else(|| "o1 seal: query trace length overflow".to_string())?;
+        if q_len != expected_q {
+            return Err(format!(
+                "o1 seal: query trace has {q_len} values, expected {expected_q}"
+            ));
+        }
+        if (0..self.num_kv_heads)
+            .any(|g| self.k[g].len() != expected_k || self.v[g].len() != expected_k)
+        {
+            return Err("o1 seal: KV heads are not densely populated".into());
+        }
+        if m < 4 || w == 0 {
+            return Err(format!("o1 seal: invalid geometry m={m} w={w}"));
+        }
+
+        let Some(O1State::Collecting {
+            m,
+            w,
+            sink,
+            rect,
+            q_buf,
+            ..
+        }) = self.o1.take()
+        else {
+            unreachable!("collecting state disappeared after validation");
+        };
+        let mut groups = Vec::with_capacity(self.num_kv_heads);
+        // Query trace is position-major; the state wants each head's
+        // queries contiguous, so transpose one group at a time.
+        let mut qh = vec![0.0f32; hpk * t * hd];
+        for g in 0..self.num_kv_heads {
+            for hh in 0..hpk {
+                let h = g * hpk + hh;
+                for p in 0..t {
+                    let src = (p * num_heads + h) * hd;
+                    let dst = (hh * t + p) * hd;
+                    qh[dst..dst + hd].copy_from_slice(&q_buf[src..src + hd]);
+                }
+            }
+            let qs: Vec<&[f32]> = (0..hpk)
+                .map(|hh| &qh[hh * t * hd..(hh + 1) * t * hd])
+                .collect();
+            let mut st = crate::nystrom::NystromState::new_group(m, w, sink, hpk).with_rect(rect);
+            st.prefill_group(&qs, &self.k[g], &self.v[g], t, hd, hd);
+            groups.push(st);
+        }
+        // The states now carry everything decode needs — release the
+        // O(context) storage (this is the memory claim, not a cosmetic).
+        for h in 0..self.num_kv_heads {
+            self.k[h] = Vec::new();
+            self.v[h] = Vec::new();
+        }
+        self.imp = Vec::new();
+        self.o1 = Some(O1State::Sealed { groups });
+        self.o1_transitioned = true;
+        Ok(true)
+    }
+
+    /// One decode step on a sealed layer: per KV group, insert the
+    /// group's fresh (k, v) ONCE and read every Q head's attention
+    /// output. Returns `[num_heads × head_dim]`. Head h belongs to group
+    /// h/hpk, so a group's Q heads are contiguous in `q_all`/`out` —
+    /// same math as the shared KV row the exact path appends once.
+    /// Device views of the sealed o1 groups, or None when o1 is not
+    /// sealed on this layer (or any group is in the degenerate
+    /// exact-only mode the GPU path does not carry).
+    pub fn o1_views(&self) -> Option<Vec<crate::nystrom::O1DeviceView<'_>>> {
+        let Some(O1State::Sealed { groups }) = &self.o1 else {
+            return None;
+        };
+        let views: Vec<_> = groups.iter().map(|g| g.device_view()).collect();
+        if views.iter().any(|v| v.exact_only) {
+            return None;
+        }
+        Some(views)
+    }
+
+    pub fn o1_step(
+        &mut self,
+        q_all: &[f32],
+        k_new: &[f32],
+        v_new: &[f32],
+        num_heads: usize,
+    ) -> Vec<f32> {
+        let hd = self.head_dim;
+        let hpk = num_heads / self.num_kv_heads.max(1);
+        let mut out = vec![0.0f32; num_heads * hd];
+        let Some(O1State::Sealed { groups }) = &mut self.o1 else {
+            debug_assert!(false, "o1_step on an unsealed layer");
+            return out;
+        };
+        for (g, st) in groups.iter_mut().enumerate() {
+            let (lo, hi) = (g * hpk * hd, (g + 1) * hpk * hd);
+            st.step_group(
+                &q_all[lo..hi],
+                &k_new[g * hd..(g + 1) * hd],
+                &v_new[g * hd..(g + 1) * hd],
+                &mut out[lo..hi],
+            );
+        }
+        // Track the true context depth for the honest memory/seq report
+        // (nothing is stored per position — the state is O(1)).
+        self.seq_len += 1;
+        out
+    }
+
+    /// Bytes held by the O(1) override (query trace while collecting,
+    /// per-KV-group states once sealed).
+    pub fn o1_memory_bytes(&self) -> usize {
+        match &self.o1 {
+            Some(O1State::Collecting { q_buf, .. }) => q_buf.len() * std::mem::size_of::<f32>(),
+            Some(O1State::Sealed { groups }) => groups.iter().map(|s| s.memory_bytes()).sum(),
+            None => 0,
+        }
+    }
+
+    /// Quantize one row against the per-channel field (empty col = 1);
+    /// `group` — elements per scale (the whole row or KV_K_GROUP).
+    fn quant_row(row: &[f32], col: &[f32], q: &mut Vec<i8>, sc: &mut Vec<f32>, group: usize) {
+        let mut resid = vec![0.0f32; row.len()];
+        for (d, &x) in row.iter().enumerate() {
+            resid[d] = if col.is_empty() { x } else { x / col[d] };
+        }
+        for g0 in (0..row.len()).step_by(group) {
+            let g1 = (g0 + group).min(row.len());
+            let mut absmax = 0.0f32;
+            for &r in &resid[g0..g1] {
+                absmax = absmax.max(r.abs());
+            }
+            let s = (absmax / 127.0).max(1e-12);
+            sc.push(s);
+            for &r in &resid[g0..g1] {
+                q.push((r / s).round().clamp(-127.0, 127.0) as i8);
+            }
+        }
+    }
+
+    /// Freeze the 2f field: col = RMS of channels over stored rows, old
+    /// rows are requantized against the new field (once per conversation).
+    fn freeze_cols(&mut self) {
+        let hd = self.head_dim;
+        let ngk = hd.div_ceil(KV_K_GROUP);
+        for h in 0..self.num_kv_heads {
+            for (qv, sv, colv, group) in [
+                (
+                    &mut self.kq[h],
+                    &mut self.ks[h],
+                    &mut self.kcol[h],
+                    KV_K_GROUP,
+                ),
+                (&mut self.vq[h], &mut self.vs[h], &mut self.vcol[h], hd),
+            ] {
+                let spp = if group == hd { 1 } else { ngk }; // scales per position
+                let n = sv.len() / spp;
+                if n == 0 {
+                    continue;
+                }
+                // Dequantize to f32, RMS over channels, requantize.
+                let mut rows = vec![0.0f32; n * hd];
+                for p in 0..n {
+                    for d in 0..hd {
+                        rows[p * hd + d] = qv[p * hd + d] as f32 * sv[p * spp + d / group];
+                    }
+                }
+                let mut col = vec![0.0f32; hd];
+                for p in 0..n {
+                    for d in 0..hd {
+                        col[d] += rows[p * hd + d] * rows[p * hd + d];
+                    }
+                }
+                for c in col.iter_mut() {
+                    *c = (*c / n as f32).sqrt().max(1e-6);
+                }
+                qv.clear();
+                sv.clear();
+                for p in 0..n {
+                    Self::quant_row(&rows[p * hd..(p + 1) * hd], &col, qv, sv, group);
+                }
+                *colv = col;
+            }
+        }
+    }
+
+    /// Append K/V for one position. `k_new`/`v_new` are
+    /// `[num_kv_heads × head_dim]`; heads with `alive[h] == false` are
+    /// skipped (their slices stay empty).
+    pub fn append(&mut self, k_new: &[f32], v_new: &[f32], alive: &[bool]) {
+        // A failed bounded transition is terminal until the sequence is
+        // cleared. Do not let an ignored boolean/result resume plain KV
+        // growth after the O(1) collector has aborted.
+        if self.o1_error.is_some() {
+            return;
+        }
+        debug_assert_eq!(k_new.len(), self.num_kv_heads * self.head_dim);
+        debug_assert_eq!(v_new.len(), self.num_kv_heads * self.head_dim);
+        // Freeze the 2f field AT THE START of append: only rows that
+        // survived verify are visible (a rejected lane-2 draft does not
+        // pollute the field — found in review), and the threshold uses >=
+        // rather than strict equality (in small windows eviction may
+        // oscillate across 64).
+        if matches!(self.mode, KvMode::Q8 { .. })
+            && self.seq_len >= KV_COL_WARMUP
+            && self.kcol.iter().all(Vec::is_empty)
+            && self.vcol.iter().all(Vec::is_empty)
+        {
+            self.freeze_cols();
+        }
+        for h in 0..self.num_kv_heads {
+            if !alive.get(h).copied().unwrap_or(true) {
+                continue;
+            }
+            let s = h * self.head_dim;
+            if self.mode.quant_k() {
+                Self::quant_row(
+                    &k_new[s..s + self.head_dim],
+                    &self.kcol[h],
+                    &mut self.kq[h],
+                    &mut self.ks[h],
+                    KV_K_GROUP,
+                );
+            } else {
+                self.k[h].extend_from_slice(&k_new[s..s + self.head_dim]);
+            }
+            if self.mode.quant_v() {
+                Self::quant_row(
+                    &v_new[s..s + self.head_dim],
+                    &self.vcol[h],
+                    &mut self.vq[h],
+                    &mut self.vs[h],
+                    self.head_dim,
+                );
+            } else {
+                self.v[h].extend_from_slice(&v_new[s..s + self.head_dim]);
+            }
+        }
+        self.imp.push(0.0);
+        self.seq_len += 1;
+    }
+
+    /// Per-head attention over its own storage: the f32 branch is
+    /// bit-for-bit equal to attention_head() over slices; the q8 branch
+    /// computes score = s_k·⟨q⊙col_k, k_q⟩ and the weighted sum of V in i8
+    /// with f32 accumulation. Returns (output [head_dim], probs [stored]).
+    pub fn attend(&self, q: &[f32], kv_head: usize) -> (Vec<f32>, Vec<f32>) {
+        let hd = self.head_dim;
+        if self.mode == KvMode::F32 {
+            let stored = self.k[kv_head].len() / hd;
+            return crate::attention::attention_head(
+                q,
+                &self.k[kv_head],
+                &self.v[kv_head],
+                hd,
+                stored,
+            );
+        }
+        let stored = self.head_len(kv_head);
+        let scale = 1.0 / (hd as f32).sqrt();
+        let mut scores = vec![0.0f32; stored];
+        if self.mode.quant_k() {
+            let (kq, ks) = (&self.kq[kv_head], &self.ks[kv_head]);
+            // q ⊙ col_k — once per call.
+            let kcol = &self.kcol[kv_head];
+            let mut qc = vec![0.0f32; hd];
+            for d in 0..hd {
+                qc[d] = if kcol.is_empty() {
+                    q[d]
+                } else {
+                    q[d] * kcol[d]
+                };
+            }
+            let ng = hd.div_ceil(KV_K_GROUP);
+            for p in 0..stored {
+                let row = &kq[p * hd..(p + 1) * hd];
+                // SAFETY: i8 and u8 share layout; dot_i8_f32 reads the
+                // bytes back as i8.
+                let row_u8 =
+                    unsafe { std::slice::from_raw_parts(row.as_ptr() as *const u8, row.len()) };
+                let mut dot = 0.0f32;
+                for g in 0..ng {
+                    let g0 = g * KV_K_GROUP;
+                    let g1 = (g0 + KV_K_GROUP).min(hd);
+                    dot +=
+                        crate::qtensor::dot_i8_f32(&row_u8[g0..g1], &qc[g0..g1]) * ks[p * ng + g];
+                }
+                scores[p] = dot * scale;
+            }
+        } else {
+            let k = &self.k[kv_head];
+            for p in 0..stored {
+                let row = &k[p * hd..(p + 1) * hd];
+                scores[p] = crate::attention::dot_f32(q, row) * scale;
+            }
+        }
+        let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0f32;
+        for s in scores.iter_mut() {
+            *s = (*s - max_score).exp();
+            sum += *s;
+        }
+        if sum > 0.0 {
+            for s in scores.iter_mut() {
+                *s /= sum;
+            }
+        }
+        let mut acc = vec![0.0f32; hd];
+        if self.mode.quant_v() {
+            let (vq, vs) = (&self.vq[kv_head], &self.vs[kv_head]);
+            for p in 0..stored {
+                let w = scores[p] * vs[p];
+                if w.abs() < 1e-12 {
+                    continue;
+                }
+                crate::qtensor::axpy_i8_f32(&mut acc, &vq[p * hd..(p + 1) * hd], w);
+            }
+            let vcol = &self.vcol[kv_head];
+            if !vcol.is_empty() {
+                for d in 0..hd {
+                    acc[d] *= vcol[d];
+                }
+            }
+        } else {
+            let v = &self.v[kv_head];
+            for p in 0..stored {
+                let w = scores[p];
+                if w.abs() < 1e-12 {
+                    continue;
+                }
+                crate::attention::axpy_f32(&mut acc, &v[p * hd..(p + 1) * hd], w);
+            }
+        }
+        (acc, scores)
+    }
+
+    /// Grouped GQA attention: all Q-heads of one KV group in a single
+    /// pass over the stored K rows and a single pass over the V rows
+    /// (per-head `attend` re-read the shared group storage
+    /// heads_per_kv times — roadmap §3 P1). Per-head score order,
+    /// softmax and V accumulation are IDENTICAL to `attend`, so each
+    /// head's output is bit-for-bit the same.
+    ///
+    /// `q_group`: `[n_heads_in_group × head_dim]` (global head order);
+    /// `out`: same shape; `imp_acc[0..stored]` accumulates the probabilities
+    /// of every head (attention importance), matching the caller's former loop.
+    /// `scale` is the score scale (1/√hd unless the arch overrides);
+    /// `first` is the earliest visible position — sliding-window layers
+    /// pass `stored − window` so older rows get zero probability.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attend_group(
+        &self,
+        q_group: &[f32],
+        kv_head: usize,
+        out: &mut [f32],
+        imp_acc: &mut [f32],
+        scale: f32,
+        first: usize,
+        softcap: f32,
+    ) {
+        let hd = self.head_dim;
+        let nheads = q_group.len() / hd;
+        debug_assert_eq!(out.len(), nheads * hd);
+        let stored = if self.mode == KvMode::F32 {
+            self.k[kv_head].len() / hd
+        } else {
+            self.head_len(kv_head)
+        };
+        if stored == 0 {
+            out.fill(0.0);
+            return;
+        }
+        let first = first.min(stored.saturating_sub(1));
+
+        thread_local! {
+            /// scores [nheads × stored] — reused across layers/tokens.
+            static GQA_SCORES: std::cell::RefCell<Vec<f32>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+            /// q ⊙ col_k per head (q8 K mode).
+            static GQA_QC: std::cell::RefCell<Vec<f32>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+
+        GQA_SCORES.with(|sc| {
+            let mut scores = sc.borrow_mut();
+            if first > 0 {
+                // Out-of-window rows stay at −inf → exp gives exactly 0,
+                // so softmax / V / importance need no special-casing.
+                scores.clear();
+                scores.resize(nheads * stored, f32::NEG_INFINITY);
+            } else {
+                scores.resize(nheads * stored, 0.0);
+            }
+
+            // ── score pass: each stored K row is read ONCE for all heads.
+            if self.mode.quant_k() {
+                let (kq, ks) = (&self.kq[kv_head], &self.ks[kv_head]);
+                let kcol = &self.kcol[kv_head];
+                let ng = hd.div_ceil(KV_K_GROUP);
+                GQA_QC.with(|qc| {
+                    let mut qcb = qc.borrow_mut();
+                    qcb.resize(nheads * hd, 0.0);
+                    for h in 0..nheads {
+                        for d in 0..hd {
+                            let qv = q_group[h * hd + d];
+                            qcb[h * hd + d] = if kcol.is_empty() { qv } else { qv * kcol[d] };
+                        }
+                    }
+                    for p in first..stored {
+                        let row = &kq[p * hd..(p + 1) * hd];
+                        // SAFETY: i8 and u8 share layout; dot_i8_f32 reads
+                        // the bytes back as i8.
+                        let row_u8 = unsafe {
+                            std::slice::from_raw_parts(row.as_ptr() as *const u8, row.len())
+                        };
+                        for h in 0..nheads {
+                            let qch = &qcb[h * hd..(h + 1) * hd];
+                            let mut dot = 0.0f32;
+                            for g in 0..ng {
+                                let g0 = g * KV_K_GROUP;
+                                let g1 = (g0 + KV_K_GROUP).min(hd);
+                                dot += crate::qtensor::dot_i8_f32(&row_u8[g0..g1], &qch[g0..g1])
+                                    * ks[p * ng + g];
+                            }
+                            scores[h * stored + p] = dot * scale;
+                        }
+                    }
+                });
+            } else {
+                let k = &self.k[kv_head];
+                for p in first..stored {
+                    let row = &k[p * hd..(p + 1) * hd];
+                    for h in 0..nheads {
+                        scores[h * stored + p] =
+                            crate::attention::dot_f32(&q_group[h * hd..(h + 1) * hd], row) * scale;
+                    }
+                }
+            }
+
+            // Gemma-2 attention-logit soft-capping: tanh-squash the
+            // COMPUTED scores before the softmax. Out-of-window rows sit
+            // at −inf and must stay there (tanh would resurrect them at
+            // −cap), hence the finiteness guard.
+            if softcap > 0.0 {
+                for v in scores.iter_mut() {
+                    if v.is_finite() {
+                        *v = softcap * (*v / softcap).tanh();
+                    }
+                }
+            }
+
+            // ── per-head softmax (identical to attend / attention_head).
+            for h in 0..nheads {
+                let s = &mut scores[h * stored..(h + 1) * stored];
+                let max_score = s.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for v in s.iter_mut() {
+                    *v = (*v - max_score).exp();
+                    sum += *v;
+                }
+                if sum > 0.0 {
+                    for v in s.iter_mut() {
+                        *v /= sum;
+                    }
+                }
+            }
+
+            // ── value pass: each stored V row is read ONCE for all heads.
+            out.fill(0.0);
+            if self.mode.quant_v() {
+                let (vq, vs) = (&self.vq[kv_head], &self.vs[kv_head]);
+                for p in first..stored {
+                    let row = &vq[p * hd..(p + 1) * hd];
+                    for h in 0..nheads {
+                        let w = scores[h * stored + p] * vs[p];
+                        if w.abs() < 1e-12 {
+                            continue;
+                        }
+                        crate::qtensor::axpy_i8_f32(&mut out[h * hd..(h + 1) * hd], row, w);
+                    }
+                }
+                let vcol = &self.vcol[kv_head];
+                if !vcol.is_empty() {
+                    for h in 0..nheads {
+                        for d in 0..hd {
+                            out[h * hd + d] *= vcol[d];
+                        }
+                    }
+                }
+            } else {
+                let v = &self.v[kv_head];
+                for p in first..stored {
+                    let row = &v[p * hd..(p + 1) * hd];
+                    for h in 0..nheads {
+                        let w = scores[h * stored + p];
+                        if w.abs() < 1e-12 {
+                            continue;
+                        }
+                        crate::attention::axpy_f32(&mut out[h * hd..(h + 1) * hd], row, w);
+                    }
+                }
+            }
+
+            // ── Attention-importance accumulation (Σ probs over heads), same
+            // head order as the caller's former per-head loop.
+            let n = imp_acc.len().min(stored);
+            for h in 0..nheads {
+                let s = &scores[h * stored..(h + 1) * stored];
+                for (dst, &p) in imp_acc[..n].iter_mut().zip(s) {
+                    *dst += p;
+                }
+            }
+        });
+    }
+
+    /// Batched causal attend for a prefill chunk (macOS/AArch64): the
+    /// cache already holds every chunk row (`s0` old + `b` new). Per
+    /// Q-head the scores GEMM `Q·Kᵀ` rides the AMX, the causal softmax
+    /// zeroes the not-yet-visible tail so the `P·V` GEMM needs no
+    /// mask, and attention importance takes the masked column sums. Same
+    /// math as the per-position attend; summation order differs
+    /// (tolerance-class, like the projection GEMMs).
+    #[cfg(target_arch = "aarch64")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn attend_chunk(
+        &mut self,
+        q_all: &[f32],
+        b: usize,
+        s0: usize,
+        nh: usize,
+        heads_per_kv: usize,
+        hd: usize,
+        out: &mut [f32],
+        pool: Option<&crate::pool::Pool>,
+        scale: f32,
+        window: Option<usize>,
+    ) {
+        let n = s0 + b;
+        struct SendPtr(*mut f32);
+        unsafe impl Send for SendPtr {}
+        unsafe impl Sync for SendPtr {}
+        impl SendPtr {
+            fn at(&self, i: usize) -> *mut f32 {
+                // Method receiver keeps the closure capturing &SendPtr
+                // (2021 disjoint capture would grab the raw field).
+                unsafe { self.0.add(i) }
+            }
+        }
+        thread_local! {
+            static SCRATCH: std::cell::RefCell<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> =
+                const { std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new())) };
+        }
+        // The portable NEON GEMM pays dearly for the gathered Bᵀ loads
+        // of the scores multiply — pack Kᵀ once per (group, chunk) and
+        // hand it the sequential-B fast path instead. Accelerate keeps
+        // the no-copy transposed call.
+        let neon_gemm = cfg!(not(target_os = "macos"))
+            || std::env::var("CMF_FORCE_NEON_GEMM")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+        SCRATCH.with(|s| {
+            let mut s = s.borrow_mut();
+            let (qpanel, scores, aopanel, ktpack) = &mut *s;
+            // The whole KV-group attends in one GEMM pair: the group's
+            // Q-heads stack head-major into one tall panel [hpk·b, hd]
+            // (row hl·b + bi), so each layer costs 2 sgemm calls per
+            // group instead of 2 per head — fat M keeps the AMX fed.
+            let m = heads_per_kv * b;
+            qpanel.resize(m * hd, 0.0);
+            scores.resize(m * n, 0.0);
+            aopanel.resize(m * hd, 0.0);
+            for g in 0..self.num_kv_heads {
+                let kmat = &self.k[g];
+                let vmat = &self.v[g];
+                debug_assert_eq!(kmat.len(), n * hd);
+                for hl in 0..heads_per_kv {
+                    let hh = g * heads_per_kv + hl;
+                    for bi in 0..b {
+                        qpanel[(hl * b + bi) * hd..(hl * b + bi + 1) * hd]
+                            .copy_from_slice(&q_all[bi * nh * hd + hh * hd..][..hd]);
+                    }
+                }
+                if neon_gemm {
+                    ktpack.resize(hd * n, 0.0);
+                    for p in 0..n {
+                        let row = &kmat[p * hd..(p + 1) * hd];
+                        for (d, &v) in row.iter().enumerate() {
+                            ktpack[d * n + p] = v;
+                        }
+                    }
+                    // Accelerate threads its own GEMM; the NEON kernel
+                    // splits the m rows across the pool instead.
+                    let sp_q = SendPtr(qpanel.as_ptr() as *mut f32);
+                    let sp_s = SendPtr(scores.as_mut_ptr());
+                    let kt = &*ktpack;
+                    let run = |start: usize, end: usize| {
+                        if end > start {
+                            // SAFETY: workers write disjoint score rows.
+                            let a = unsafe {
+                                std::slice::from_raw_parts(sp_q.at(start * hd), (end - start) * hd)
+                            };
+                            let c = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    sp_s.at(start * n),
+                                    (end - start) * n,
+                                )
+                            };
+                            crate::qtensor::neon_gemm_rm(
+                                end - start,
+                                n,
+                                hd,
+                                scale,
+                                a,
+                                hd,
+                                kt,
+                                n,
+                                false,
+                                c,
+                                n,
+                            );
+                        }
+                    };
+                    match pool {
+                        Some(p) if m >= 64 => p.run_rows(m, &run),
+                        _ => run(0, m),
+                    }
+                } else {
+                    crate::qtensor::sgemm_rm(
+                        m, n, hd, scale, qpanel, hd, kmat, hd, true, scores, n,
+                    );
+                }
+                // Causal softmax, row-parallel (rows are disjoint).
+                let sp = SendPtr(scores.as_mut_ptr());
+                let run = |start: usize, end: usize| {
+                    for r in start..end {
+                        let allowed = s0 + (r % b) + 1;
+                        // Sliding-window layers see only the last W of
+                        // the causal range; the zeroed head contributes
+                        // nothing to P·V or attention importance.
+                        let lo = window.map(|w| allowed.saturating_sub(w)).unwrap_or(0);
+                        // SAFETY: workers cover disjoint row ranges.
+                        let row = unsafe { std::slice::from_raw_parts_mut(sp.at(r * n), n) };
+                        crate::attention::softmax_row(&mut row[lo..allowed]);
+                        row[..lo].fill(0.0);
+                        row[allowed..].fill(0.0);
+                    }
+                };
+                match pool {
+                    Some(p) if m >= 64 => p.run_rows(m, &run),
+                    _ => run(0, m),
+                }
+                // Attention importance: masked column sums (probs of the
+                // zeroed tail contribute nothing, same as the CPU
+                // per-position accumulate).
+                let ni = self.imp.len().min(n);
+                for r in 0..m {
+                    let al = (s0 + (r % b) + 1).min(ni);
+                    for (dst, &p) in self.imp[..al].iter_mut().zip(&scores[r * n..r * n + al]) {
+                        *dst += p;
+                    }
+                }
+                if neon_gemm {
+                    let sp_s = SendPtr(scores.as_mut_ptr());
+                    let sp_o = SendPtr(aopanel.as_mut_ptr());
+                    let run = |start: usize, end: usize| {
+                        if end > start {
+                            // SAFETY: workers write disjoint output rows.
+                            let a = unsafe {
+                                std::slice::from_raw_parts(sp_s.at(start * n), (end - start) * n)
+                            };
+                            let c = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    sp_o.at(start * hd),
+                                    (end - start) * hd,
+                                )
+                            };
+                            crate::qtensor::neon_gemm_rm(
+                                end - start,
+                                hd,
+                                n,
+                                1.0,
+                                a,
+                                n,
+                                vmat,
+                                hd,
+                                false,
+                                c,
+                                hd,
+                            );
+                        }
+                    };
+                    match pool {
+                        Some(p) if m >= 64 => p.run_rows(m, &run),
+                        _ => run(0, m),
+                    }
+                } else {
+                    crate::qtensor::sgemm_rm(
+                        m, hd, n, 1.0, scores, n, vmat, hd, false, aopanel, hd,
+                    );
+                }
+                for hl in 0..heads_per_kv {
+                    let hh = g * heads_per_kv + hl;
+                    for bi in 0..b {
+                        out[bi * nh * hd + hh * hd..][..hd]
+                            .copy_from_slice(&aopanel[(hl * b + bi) * hd..(hl * b + bi + 1) * hd]);
+                    }
+                }
+            }
+        });
+    }
+
+    /// Roll back the last `n_drop` positions (speculative-decode reject).
+    pub fn truncate_last(&mut self, n_drop: usize) {
+        let d = n_drop.min(self.seq_len);
+        for h in 0..self.num_kv_heads {
+            let keep = self.k[h].len().saturating_sub(d * self.head_dim);
+            self.k[h].truncate(keep);
+            self.v[h].truncate(keep);
+            let ngk = self.head_dim.div_ceil(KV_K_GROUP);
+            let keep_q = self.kq[h].len().saturating_sub(d * self.head_dim);
+            self.kq[h].truncate(keep_q);
+            let keep_vq = self.vq[h].len().saturating_sub(d * self.head_dim);
+            self.vq[h].truncate(keep_vq);
+            let keep_ks = self.ks[h].len().saturating_sub(d * ngk);
+            self.ks[h].truncate(keep_ks);
+            let keep_vs = self.vs[h].len().saturating_sub(d);
+            self.vs[h].truncate(keep_vs);
+        }
+        self.imp.truncate(self.imp.len().saturating_sub(d));
+        self.seq_len -= d;
+    }
+
+    /// Accumulate attention mass per stored position (summed over heads).
+    pub fn accumulate_imp(&mut self, probs: &[f32]) {
+        for (dst, &p) in self.imp.iter_mut().zip(probs) {
+            *dst += p;
+        }
+    }
+
+    /// Contiguous keys of one head: `[stored_len × head_dim]`.
+    pub fn head_keys(&self, kv_head: usize) -> &[f32] {
+        &self.k[kv_head]
+    }
+
+    pub fn head_values(&self, kv_head: usize) -> &[f32] {
+        &self.v[kv_head]
+    }
+
+    /// Number of positions actually stored for a head (0 for dead heads).
+    pub fn head_len(&self, kv_head: usize) -> usize {
+        let ng = self.head_dim.div_ceil(KV_K_GROUP);
+        (self.k[kv_head].len() / self.head_dim)
+            .max(self.ks[kv_head].len() / ng)
+            .max(self.vs[kv_head].len())
+    }
+
+    /// Clear cache (e.g. on new conversation or task switch).
+    pub fn clear(&mut self) {
+        for h in 0..self.num_kv_heads {
+            self.k[h].clear();
+            self.v[h].clear();
+            self.kq[h].clear();
+            self.ks[h].clear();
+            self.vq[h].clear();
+            self.vs[h].clear();
+            self.kcol[h].clear();
+            self.vcol[h].clear();
+        }
+        self.imp.clear();
+        self.linear_state.clear();
+        self.linear_scratch.clear();
+        // Fresh conversation → the pipeline re-arms collection if the
+        // layer is o1-flagged (landmarks are per-prompt, never reused).
+        self.o1 = None;
+        self.o1_error = None;
+        self.o1_transitioned = false;
+        self.seq_len = 0;
+    }
+
+    /// Memory usage in bytes.
+    /// Serialize this layer's state for the wire: `f16` halves it and is
+    /// the caller's explicit choice, exactly like the hidden-state wire.
+    ///
+    /// REFUSES rather than travelling half-complete. A cache carrying
+    /// frozen columns, accumulated importance, a Nyström overlay or q8
+    /// storage holds state this format does not describe, and shipping
+    /// the rest would land a plausible-looking cache that answers
+    /// differently — the failure mode this whole format exists to avoid.
+    pub fn export_wire(&self, f16: bool) -> Result<Vec<u8>, String> {
+        if !matches!(self.mode, KvMode::F32) {
+            return Err("kv export: only the F32 cache is described by this                         format (CMF_KV=q8 stores int8 rows and per-row scales)"
+                .into());
+        }
+        if self.o1.is_some() {
+            return Err("kv export: an O(1) Nyström overlay is not part of                         this format — the skeletons are irreversible and                         would have to travel with it"
+                .into());
+        }
+        // Frozen columns only exist under q8 storage, which is refused
+        // above. If one shows up under an F32 cache the format is lying
+        // about something and the transfer must not proceed.
+        if self.kcol.iter().any(|c| !c.is_empty()) || self.vcol.iter().any(|c| !c.is_empty()) {
+            return Err(
+                "kv export: frozen columns under an F32 cache — refusing to ship \
+                        a state this format does not describe"
+                    .into(),
+            );
+        }
+        let mut out = Vec::with_capacity(self.memory_bytes() / if f16 { 2 } else { 1 } + 64);
+        let u = |v: u32, o: &mut Vec<u8>| o.extend_from_slice(&v.to_le_bytes());
+        u(u8::from(f16) as u32, &mut out);
+        u(self.seq_len as u32, &mut out);
+        u(self.num_kv_heads as u32, &mut out);
+        u(self.head_dim as u32, &mut out);
+        u(self.linear_state.len() as u32, &mut out);
+        // Attention importance is ordinary state: every attention call
+        // accumulates it and eviction reads it. Leaving it behind would
+        // hand the far side a cache that forgets the RIGHT positions
+        // later — a divergence that shows up only under pressure.
+        u(self.imp.len() as u32, &mut out);
+        let push = |xs: &[f32], o: &mut Vec<u8>| {
+            if f16 {
+                for &x in xs {
+                    o.extend_from_slice(&cortiq_core::quant::f32_to_f16(x).to_le_bytes());
+                }
+            } else {
+                for &x in xs {
+                    o.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+        };
+        // The recurrent state stays f32 whatever the wire dtype: it
+        // is one small vector per layer and it is the ONLY state a linear
+        // layer has — rounding it rounds the whole history.
+        for &x in &self.linear_state {
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        for &x in &self.imp {
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        for h in 0..self.num_kv_heads {
+            u(self.k[h].len() as u32, &mut out);
+            push(&self.k[h], &mut out);
+            u(self.v[h].len() as u32, &mut out);
+            push(&self.v[h], &mut out);
+        }
+        Ok(out)
+    }
+
+    /// Install a peer's state over this layer. The geometry must match the
+    /// model both sides hold — it is checked, not assumed.
+    pub fn import_wire(&mut self, buf: &[u8]) -> Result<(), String> {
+        let mut o = 0usize;
+        let u32_at = |o: &mut usize| -> Result<u32, String> {
+            if *o + 4 > buf.len() {
+                return Err("kv import: truncated header".into());
+            }
+            let v = u32::from_le_bytes(buf[*o..*o + 4].try_into().unwrap());
+            *o += 4;
+            Ok(v)
+        };
+        let f16 = u32_at(&mut o)? != 0;
+        let seq_len = u32_at(&mut o)? as usize;
+        let heads = u32_at(&mut o)? as usize;
+        let hd = u32_at(&mut o)? as usize;
+        let lin = u32_at(&mut o)? as usize;
+        let nimp = u32_at(&mut o)? as usize;
+        if heads != self.num_kv_heads || hd != self.head_dim {
+            return Err(format!(
+                "kv import: peer sent {heads}×{hd} per position, this layer is {}×{}",
+                self.num_kv_heads, self.head_dim
+            ));
+        }
+        let w = if f16 { 2 } else { 4 };
+        let need = |n: usize, o: usize| -> Result<(), String> {
+            if o + n > buf.len() {
+                Err("kv import: truncated payload".into())
+            } else {
+                Ok(())
+            }
+        };
+        need(lin * 4, o)?;
+        self.linear_state = (0..lin)
+            .map(|i| f32::from_le_bytes(buf[o + i * 4..o + i * 4 + 4].try_into().unwrap()))
+            .collect();
+        o += lin * 4;
+        need(nimp * 4, o)?;
+        let imp: Vec<f32> = (0..nimp)
+            .map(|i| f32::from_le_bytes(buf[o + i * 4..o + i * 4 + 4].try_into().unwrap()))
+            .collect();
+        o += nimp * 4;
+        let mut k: Vec<Vec<f32>> = Vec::with_capacity(heads);
+        let mut v: Vec<Vec<f32>> = Vec::with_capacity(heads);
+        for _ in 0..heads {
+            for which in 0..2 {
+                let n = u32_at(&mut o)? as usize;
+                need(n * w, o)?;
+                let xs: Vec<f32> = (0..n)
+                    .map(|i| {
+                        let at = o + i * w;
+                        if f16 {
+                            cortiq_core::quant::f16_to_f32(u16::from_le_bytes(
+                                buf[at..at + 2].try_into().unwrap(),
+                            ))
+                        } else {
+                            f32::from_le_bytes(buf[at..at + 4].try_into().unwrap())
+                        }
+                    })
+                    .collect();
+                o += n * w;
+                if which == 0 { k.push(xs) } else { v.push(xs) }
+            }
+        }
+        self.mode = KvMode::F32;
+        self.k = k;
+        self.v = v;
+        self.kq = vec![Vec::new(); heads];
+        self.ks = vec![Vec::new(); heads];
+        self.vq = vec![Vec::new(); heads];
+        self.vs = vec![Vec::new(); heads];
+        self.kcol = vec![Vec::new(); heads];
+        self.vcol = vec![Vec::new(); heads];
+        self.imp = imp;
+        self.o1 = None;
+        self.o1_error = None;
+        self.o1_transitioned = false;
+        self.seq_len = seq_len;
+        Ok(())
+    }
+
+    pub fn memory_bytes(&self) -> usize {
+        let floats: usize = self.k.iter().map(Vec::len).sum::<usize>()
+            + self.v.iter().map(Vec::len).sum::<usize>()
+            + self.ks.iter().map(Vec::len).sum::<usize>()
+            + self.vs.iter().map(Vec::len).sum::<usize>()
+            + self.kcol.iter().map(Vec::len).sum::<usize>()
+            + self.vcol.iter().map(Vec::len).sum::<usize>();
+        let bytes: usize = self.kq.iter().map(Vec::len).sum::<usize>()
+            + self.vq.iter().map(Vec::len).sum::<usize>();
+        floats * std::mem::size_of::<f32>()
+            + bytes
+            // O(1) recurrent state of linear-core layers (vmf_phase/GDN):
+            // constant in context, but real memory — the honest "KV+state"
+            // line must count it (a pure-linear model reported 0 before).
+            + self.linear_state.len() * std::mem::size_of::<f32>()
+            // O(1) Nyström state (window + sinks + skeleton) — same
+            // discipline: constant in context, but real memory.
+            + self.o1_memory_bytes()
+    }
+
+    /// Drop oldest positions, keeping the last `keep_last`.
+    fn evict(&mut self, keep_last: usize) {
+        // A collecting o1 layer owns a still-needed exact prefix and query
+        // trace.  Evicting it would lower the effective seal boundary while
+        // leaving q_buf untouched, so conversion could never match its KV
+        // rows.  A sealed layer stores nothing per position — the Nyström
+        // state IS the eviction policy; resetting seq_len here would lie
+        // about the context depth.  Both states therefore bypass ordinary
+        // eviction until the transition or explicit reset completes.
+        if self.o1.is_some() || self.seq_len <= keep_last {
+            return;
+        }
+        let drop = self.seq_len - keep_last;
+        for h in 0..self.num_kv_heads {
+            // Dead heads store fewer positions; drop proportionally.
+            let stored = self.head_len(h);
+            let d = drop.min(stored);
+            let hd = self.head_dim;
+            fn drop_front<T>(v: &mut Vec<T>, n: usize) {
+                let n = n.min(v.len());
+                v.drain(..n);
+            }
+            drop_front(&mut self.k[h], d * hd);
+            drop_front(&mut self.v[h], d * hd);
+            drop_front(&mut self.kq[h], d * hd);
+            drop_front(&mut self.vq[h], d * hd);
+            drop_front(&mut self.ks[h], d * hd.div_ceil(KV_K_GROUP));
+            drop_front(&mut self.vs[h], d);
+        }
+        let d = drop.min(self.imp.len());
+        self.imp.drain(..d);
+        self.seq_len = keep_last;
+    }
+
+    /// Mass-based eviction: keep `sink` earliest positions (attention sinks),
+    /// the `recent` latest, and fill the rest of the `keep_last` budget
+    /// with the positions carrying the highest accumulated attention
+    /// mass (vmfcore: PPL 8.342 vs 8.687 for recency-only, full 8.295).
+    fn evict_born(&mut self, keep_last: usize, sink: usize, recent: usize) {
+        if self.o1.is_some() {
+            // See evict(): collecting must retain the exact prefix as well as
+            // sealed O(1) state must retain its own bounded representation.
+            return;
+        }
+        let stored = self.imp.len();
+        if stored <= keep_last {
+            return;
+        }
+        // Budget discipline: sinks first, recents next, both clamped so
+        // the total never exceeds keep_last.
+        let sink_n = sink.min(keep_last);
+        let recent_n = recent.min(keep_last - sink_n);
+        let mut keep = vec![false; stored];
+        for k in keep.iter_mut().take(sink_n) {
+            *k = true;
+        }
+        for k in keep.iter_mut().skip(stored.saturating_sub(recent_n)) {
+            *k = true;
+        }
+        let mut budget = keep_last.saturating_sub(keep.iter().filter(|&&x| x).count());
+        // Highest accumulated mass first among the middle positions.
+        let mut order: Vec<usize> = (0..stored).filter(|&i| !keep[i]).collect();
+        order.sort_by(|&a, &b| {
+            self.imp[b]
+                .partial_cmp(&self.imp[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for i in order {
+            if budget == 0 {
+                break;
+            }
+            keep[i] = true;
+            budget -= 1;
+        }
+
+        let kept: Vec<usize> = (0..stored).filter(|&i| keep[i]).collect();
+        let hd = self.head_dim;
+        fn gather<T: Copy>(src: &[T], kept: &[usize], step: usize) -> Vec<T> {
+            let mut out = Vec::with_capacity(kept.len() * step);
+            for &i in kept {
+                out.extend_from_slice(&src[i * step..(i + 1) * step]);
+            }
+            out
+        }
+        // Each storage is gathered INDEPENDENTLY: in mixed modes
+        // (q8k/q8v) K and V live in different storages — the paired branch
+        // panicked (q8v) or silently left V uncompressed (q8k);
+        // found by adversarial review, closed by regression tests.
+        for h in 0..self.num_kv_heads {
+            if !self.k[h].is_empty() {
+                self.k[h] = gather(&self.k[h], &kept, hd);
+            }
+            if !self.v[h].is_empty() {
+                self.v[h] = gather(&self.v[h], &kept, hd);
+            }
+            if !self.kq[h].is_empty() {
+                self.kq[h] = gather(&self.kq[h], &kept, hd);
+                self.ks[h] = gather(&self.ks[h], &kept, hd.div_ceil(KV_K_GROUP));
+            }
+            if !self.vq[h].is_empty() {
+                self.vq[h] = gather(&self.vq[h], &kept, hd);
+                self.vs[h] = gather(&self.vs[h], &kept, 1);
+            }
+        }
+        self.imp = kept.iter().map(|&i| self.imp[i]).collect();
+        self.seq_len = kept.len();
+    }
+}
+
+/// Eviction policy for a bounded cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvictionPolicy {
+    /// Sliding window: keep only the most recent positions.
+    Recent,
+    /// Mass-based eviction: sinks + recents + top accumulated attention mass.
+    Born { sink: usize },
+}
+
+/// Full KV cache for all layers.
+#[derive(Debug)]
+pub struct KvCache {
+    pub layers: Vec<LayerKvCache>,
+    pub max_seq_len: usize,
+    pub policy: EvictionPolicy,
+}
+
+impl KvCache {
+    pub fn new(
+        num_layers: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> Self {
+        let layers = (0..num_layers)
+            .map(|_| LayerKvCache::new(num_kv_heads, head_dim))
+            .collect();
+        Self {
+            layers,
+            max_seq_len,
+            policy: EvictionPolicy::Born { sink: 4 },
+        }
+    }
+
+    pub fn clear(&mut self) {
+        for layer in &mut self.layers {
+            layer.clear();
+        }
+    }
+
+    pub fn total_memory_bytes(&self) -> usize {
+        self.layers.iter().map(|l| l.memory_bytes()).sum()
+    }
+
+    /// Current sequence length (max across layers — dead layers may lag).
+    pub fn seq_len(&self) -> usize {
+        self.layers.iter().map(|l| l.seq_len).max().unwrap_or(0)
+    }
+
+    pub fn needs_eviction(&self) -> bool {
+        self.seq_len() >= self.max_seq_len
+    }
+
+    /// Evict down to `keep_last` positions according to the policy.
+    pub fn evict(&mut self, keep_last: usize) {
+        match self.policy {
+            EvictionPolicy::Recent => {
+                for layer in &mut self.layers {
+                    layer.evict(keep_last);
+                }
+            }
+            EvictionPolicy::Born { sink } => {
+                let recent = (keep_last / 2).max(1);
+                for layer in &mut self.layers {
+                    layer.evict_born(keep_last, sink, recent);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wire_round_trip_reproduces_attention() {
+        // The state has to arrive as state, not as something that looks
+        // like it: the oracle is what the layer ANSWERS, not what it
+        // stores. Same query, same output, bit for bit.
+        let (heads, hd) = (2usize, 4usize);
+        let mut a = LayerKvCache::new(heads, hd);
+        for p in 0..5 {
+            let k: Vec<f32> = (0..heads * hd)
+                .map(|i| (p * 10 + i) as f32 * 0.031)
+                .collect();
+            let v: Vec<f32> = (0..heads * hd)
+                .map(|i| (p * 7 + i) as f32 * -0.017)
+                .collect();
+            a.append(&k, &v, &[true, true]);
+        }
+        a.linear_state = vec![0.5, -0.25, 1.0];
+        let q: Vec<f32> = (0..hd).map(|i| 0.1 * (i as f32 + 1.0)).collect();
+
+        let bytes = a.export_wire(false).expect("f32 cache exports");
+        let mut b = LayerKvCache::new(heads, hd);
+        b.import_wire(&bytes).expect("import");
+
+        assert_eq!(b.seq_len, a.seq_len);
+        assert_eq!(b.linear_state, a.linear_state);
+        for h in 0..heads {
+            let (oa, sa) = a.attend(&q, h);
+            let (ob, sb) = b.attend(&q, h);
+            assert_eq!(oa, ob, "head {h} attention output diverged");
+            assert_eq!(sa, sb, "head {h} attention scores diverged");
+        }
+    }
+
+    #[test]
+    fn wire_refuses_what_it_cannot_describe() {
+        // A refusal is the feature: a cache whose extra state this format
+        // does not carry must not travel looking complete.
+        let mut c = LayerKvCache::new(1, 4);
+        c.mode = KvMode::Q8 { k: true, v: true };
+        let err = c.export_wire(false).unwrap_err();
+        assert!(err.contains("F32"), "{err}");
+    }
+
+    #[test]
+    fn wire_import_checks_geometry() {
+        let a = LayerKvCache::new(2, 4);
+        let bytes = a.export_wire(false).unwrap();
+        let mut wrong = LayerKvCache::new(2, 8);
+        let err = wrong.import_wire(&bytes).unwrap_err();
+        assert!(err.contains("2×4"), "{err}");
+    }
+
+    #[test]
+    fn append_tracks_seq_len_and_layout() {
+        let mut cache = LayerKvCache::new(4, 8);
+        cache.mode = KvMode::F32;
+        assert_eq!(cache.seq_len, 0);
+
+        let k: Vec<f32> = (0..32).map(|i| i as f32).collect();
+        let v = vec![2.0f32; 32];
+        cache.append(&k, &v, &[true; 4]);
+
+        assert_eq!(cache.seq_len, 1);
+        assert_eq!(cache.head_len(0), 1);
+        // head 1 slice is contiguous and equals its part of k_new
+        assert_eq!(cache.head_keys(1), &k[8..16]);
+        assert_eq!(cache.memory_bytes(), 256);
+    }
+
+    #[test]
+    fn dead_head_stores_nothing() {
+        let mut cache = LayerKvCache::new(2, 4);
+        cache.mode = KvMode::F32;
+        let k = vec![1.0f32; 8];
+        let v = vec![2.0f32; 8];
+        cache.append(&k, &v, &[true, false]);
+        cache.append(&k, &v, &[true, false]);
+
+        assert_eq!(cache.seq_len, 2);
+        assert_eq!(cache.head_len(0), 2);
+        assert_eq!(cache.head_len(1), 0, "dead head must not store KV");
+        assert_eq!(cache.memory_bytes(), 2 * 2 * 4 * 4);
+    }
+
+    #[test]
+    fn eviction_keeps_recent() {
+        let mut cache = KvCache::new(2, 4, 8, 10);
+        cache.policy = EvictionPolicy::Recent;
+        for l in &mut cache.layers {
+            l.mode = KvMode::F32;
+        }
+        let k = vec![1.0f32; 32];
+        let v = vec![2.0f32; 32];
+        for _ in 0..8 {
+            for layer in &mut cache.layers {
+                layer.append(&k, &v, &[true; 4]);
+            }
+        }
+        assert_eq!(cache.seq_len(), 8);
+        assert!(!cache.needs_eviction());
+
+        cache.evict(4);
+        assert_eq!(cache.seq_len(), 4);
+        assert_eq!(cache.layers[0].head_len(0), 4);
+    }
+
+    #[test]
+    fn collecting_o1_eviction_retains_exact_storage_until_boundary() {
+        const B: usize = 19;
+        let q = vec![0.1f32; 8];
+        let k = vec![0.2f32; 4];
+        let v = vec![0.3f32; 4];
+
+        for policy in [EvictionPolicy::Recent, EvictionPolicy::Born { sink: 2 }] {
+            let mut cache = KvCache::new(1, 1, 4, 6);
+            cache.policy = policy;
+            cache.layers[0].mode = KvMode::F32;
+            cache.layers[0].o1_begin_with_boundary(
+                4,
+                8,
+                2,
+                crate::nystrom::O1Rect::Aggregate,
+                Some(B),
+            );
+
+            for pos in 0..B {
+                {
+                    let layer = &mut cache.layers[0];
+                    layer.o1_push_q(&q);
+                    layer.append(&k, &v, &[]);
+                }
+                if pos + 1 < B {
+                    cache.evict(3);
+                }
+            }
+
+            let layer = &cache.layers[0];
+            let rows = B * layer.head_dim;
+            assert_eq!(layer.seq_len, B, "policy {policy:?} retained depth");
+            assert_eq!(layer.k[0].len(), rows, "policy {policy:?} K rows");
+            assert_eq!(layer.v[0].len(), rows, "policy {policy:?} V rows");
+            assert!(
+                layer.k[0].capacity() >= rows,
+                "policy {policy:?} K capacity"
+            );
+            assert!(
+                layer.v[0].capacity() >= rows,
+                "policy {policy:?} V capacity"
+            );
+            let q_capacity = match layer.o1.as_ref() {
+                Some(O1State::Collecting { q_buf, .. }) => q_buf.capacity(),
+                other => panic!("policy {policy:?} changed state early: {other:?}"),
+            };
+            assert!(
+                q_capacity >= B * 8,
+                "policy {policy:?} Q capacity must cover the exact prefix"
+            );
+
+            assert!(cache.layers[0].o1_seal_checked(2).unwrap());
+            assert_eq!(cache.layers[0].k[0].capacity(), 0, "K released after seal");
+            assert_eq!(cache.layers[0].v[0].capacity(), 0, "V released after seal");
+        }
+    }
+
+    #[test]
+    fn truncate_rolls_back_speculative_positions() {
+        let mut cache = LayerKvCache::new(2, 4);
+        cache.mode = KvMode::F32;
+        for pos in 0..5 {
+            let k = vec![pos as f32; 8];
+            let v = vec![pos as f32; 8];
+            cache.append(&k, &v, &[true; 2]);
+        }
+        cache.truncate_last(2);
+        assert_eq!(cache.seq_len, 3);
+        assert_eq!(cache.head_len(0), 3);
+        assert_eq!(cache.head_keys(0)[2 * 4], 2.0, "position 2 survives");
+    }
+
+    /// q8_2f-attend ≈ f32-attend: 100 positions (crosses the field freeze
+    /// at the 64th), pseudo-random vectors, relative tolerance of the
+    /// int8 grid. Plus rollback and mass-based eviction on the q8 storage.
+    #[test]
+    fn q8_attend_matches_f32_within_grid() {
+        let (heads, hd) = (2, 32);
+        let mut f = LayerKvCache::new(heads, hd);
+        f.mode = KvMode::F32;
+        let mut q8 = LayerKvCache::new(heads, hd);
+        q8.mode = KvMode::Q8 { k: true, v: true };
+
+        let synth = |p: usize, salt: usize| -> Vec<f32> {
+            (0..heads * hd)
+                .map(|i| {
+                    let x = ((i * 31 + p * 17 + salt * 7 + 3) % 97) as f32 / 97.0 - 0.5;
+                    // channel structure: even channels ×4 (checks the 2f field)
+                    if i % 2 == 0 { x * 4.0 } else { x * 0.25 }
+                })
+                .collect()
+        };
+        for p in 0..100 {
+            let k = synth(p, 1);
+            let v = synth(p, 2);
+            f.append(&k, &v, &[true; 2]);
+            q8.append(&k, &v, &[true; 2]);
+        }
+        let q: Vec<f32> = (0..hd)
+            .map(|i| ((i * 13 + 5) % 89) as f32 / 89.0 - 0.5)
+            .collect();
+        for g in 0..heads {
+            let (of, pf) = f.attend(&q, g);
+            let (o8, p8) = q8.attend(&q, g);
+            let scale = of.iter().fold(0f32, |m, x| m.max(x.abs())).max(1e-6);
+            for d in 0..hd {
+                assert!(
+                    (of[d] - o8[d]).abs() <= scale * 0.03 + 1e-3,
+                    "g{g} d{d}: f32 {} vs q8 {}",
+                    of[d],
+                    o8[d]
+                );
+            }
+            for p in 0..100 {
+                assert!((pf[p] - p8[p]).abs() < 0.02, "prob p{p}");
+            }
+        }
+        // rollback + eviction live on the q8 storage
+        q8.truncate_last(30);
+        assert_eq!(q8.head_len(0), 70);
+        let imp: Vec<f32> = (0..70).map(|i| i as f32).collect();
+        q8.accumulate_imp(&imp);
+        q8.evict_born(20, 2, 8);
+        assert_eq!(q8.head_len(0), 20);
+        let (o, _) = q8.attend(&q, 0);
+        assert!(o.iter().all(|x| x.is_finite()));
+        // memory: q8 ≈ 1 byte/element + scale per row (vs 4 for f32)
+        assert!(q8.memory_bytes() * 3 < f.memory_bytes());
+    }
+
+    /// Grouped GQA attend must be bit-identical to per-head attend in
+    /// every KV mode (it is the same math with rows streamed once).
+    #[test]
+    fn attend_group_equals_per_head_attend_bitexact() {
+        let (kv_heads, hd, hpk) = (2usize, 32usize, 3usize); // 6 Q-heads
+        for mode in [KvMode::F32, KvMode::Q8 { k: true, v: true }] {
+            let mut c = LayerKvCache::new(kv_heads, hd);
+            c.mode = mode;
+            for p in 0..70 {
+                let k: Vec<f32> = (0..kv_heads * hd)
+                    .map(|i| ((i * 31 + p * 17 + 3) % 97) as f32 / 97.0 - 0.5)
+                    .collect();
+                let v: Vec<f32> = (0..kv_heads * hd)
+                    .map(|i| ((i * 13 + p * 29 + 7) % 89) as f32 / 89.0 - 0.5)
+                    .collect();
+                c.append(&k, &v, &[true; 2]);
+            }
+            let q: Vec<f32> = (0..kv_heads * hpk * hd)
+                .map(|i| ((i * 11 + 5) % 83) as f32 / 83.0 - 0.5)
+                .collect();
+            for g in 0..kv_heads {
+                let span = g * hpk * hd..(g + 1) * hpk * hd;
+                let mut out = vec![0f32; hpk * hd];
+                let mut imp = vec![0f32; 70];
+                c.attend_group(
+                    &q[span.clone()],
+                    g,
+                    &mut out,
+                    &mut imp,
+                    1.0 / (hd as f32).sqrt(),
+                    0,
+                    0.0,
+                );
+                let mut imp_ref = vec![0f32; 70];
+                for h in 0..hpk {
+                    let qh = &q[span.start + h * hd..span.start + (h + 1) * hd];
+                    let (o, probs) = c.attend(qh, g);
+                    assert_eq!(
+                        &out[h * hd..(h + 1) * hd],
+                        &o[..],
+                        "mode {mode:?} g{g} h{h}: grouped attend must be bit-identical"
+                    );
+                    for (dst, &p) in imp_ref.iter_mut().zip(&probs) {
+                        *dst += p;
+                    }
+                }
+                assert_eq!(
+                    imp, imp_ref,
+                    "mode {mode:?} g{g}: attention mass must match"
+                );
+            }
+        }
+    }
+
+    /// Review regression: mass-based eviction in MIXED modes. q8v used to
+    /// panic (gather over an empty v[h]), q8k silently left raw V
+    /// uncompressed (stale rows under kept keys + memory leak).
+    #[test]
+    fn born_eviction_mixed_modes_stay_consistent() {
+        for (mk, mv) in [(false, true), (true, false)] {
+            let mut c = LayerKvCache::new(1, 4);
+            c.mode = KvMode::Q8 { k: mk, v: mv };
+            for p in 0..80 {
+                let k = vec![p as f32 * 0.01; 4];
+                let v = vec![p as f32; 4];
+                c.append(&k, &v, &[true]);
+            }
+            let imp: Vec<f32> = (0..80).map(|i| i as f32).collect();
+            c.accumulate_imp(&imp);
+            let before = c.memory_bytes();
+            c.evict_born(20, 4, 8); // q8v: used to panic here
+            assert_eq!(c.head_len(0), 20, "k={mk} v={mv}");
+            assert!(
+                c.memory_bytes() < before / 2,
+                "memory must shrink (k={mk} v={mv})"
+            );
+            // V rows match the kept set: the heaviest positions
+            // (tail 60..79) must be present in the attend output.
+            let (out, _) = c.attend(&[1.0, 1.0, 1.0, 1.0], 0);
+            assert!(
+                out[0] > 30.0,
+                "V from the kept tail, not the stale head (k={mk} v={mv}, out {})",
+                out[0]
+            );
+        }
+    }
+
+    #[test]
+    fn born_eviction_keeps_high_mass_position() {
+        let mut cache = KvCache::new(1, 1, 2, 16);
+        cache.policy = EvictionPolicy::Born { sink: 1 };
+        for l in &mut cache.layers {
+            l.mode = KvMode::F32;
+        }
+        let layer = &mut cache.layers[0];
+        // 8 positions; keys carry the position index so we can verify
+        // exactly which positions survive the gather.
+        for pos in 0..8 {
+            let k = vec![pos as f32; 2];
+            let v = vec![pos as f32 + 100.0; 2];
+            layer.append(&k, &v, &[true]);
+        }
+        // Position 3 carries the most attention mass.
+        let mut imp = vec![0.05f32; 8];
+        imp[3] = 5.0;
+        layer.accumulate_imp(&imp);
+
+        cache.evict(4); // sink 1 + recent 2 + 1 top-mass slot
+        let layer = &cache.layers[0];
+        assert_eq!(layer.seq_len, 4);
+        let kept_keys: Vec<f32> = (0..4).map(|i| layer.head_keys(0)[i * 2]).collect();
+        assert_eq!(
+            kept_keys,
+            vec![0.0, 3.0, 6.0, 7.0],
+            "kept = sink(0) + mass-top(3) + recent(6,7)"
+        );
+        // imp stays aligned with the gathered positions.
+        assert_eq!(layer.head_len(0), 4);
+    }
+}

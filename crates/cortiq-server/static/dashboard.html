@@ -1,0 +1,675 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cortiq — Model Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg-primary: #0a0e17;
+  --bg-secondary: #111827;
+  --bg-card: #1a2332;
+  --bg-card-hover: #1f2b3d;
+  --border: #2a3548;
+  --text-primary: #e8ecf4;
+  --text-secondary: #8b95a8;
+  --text-muted: #5a6478;
+  --accent: #6c5ce7;
+  --accent-glow: rgba(108, 92, 231, 0.3);
+  --green: #00d2a0;
+  --green-glow: rgba(0, 210, 160, 0.2);
+  --blue: #4facfe;
+  --orange: #f8a534;
+  --red: #ff6b6b;
+  --gpu-color: #6c5ce7;
+  --cpu-color: #4facfe;
+  --radius: 12px;
+  --shadow: 0 4px 24px rgba(0,0,0,0.3);
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: 'Inter', -apple-system, sans-serif;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  min-height: 100vh;
+}
+
+/* Header */
+header {
+  background: linear-gradient(135deg, var(--bg-secondary) 0%, #0d1521 100%);
+  border-bottom: 1px solid var(--border);
+  padding: 16px 32px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.logo {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.logo-icon {
+  width: 36px;
+  height: 36px;
+  background: linear-gradient(135deg, var(--accent), #a78bfa);
+  border-radius: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 18px;
+  color: white;
+}
+.logo h1 {
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: -0.5px;
+}
+.logo span {
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 400;
+}
+.header-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--green);
+  font-size: 13px;
+  font-weight: 500;
+}
+.status-dot {
+  width: 8px;
+  height: 8px;
+  background: var(--green);
+  border-radius: 50%;
+  box-shadow: 0 0 8px var(--green-glow);
+  animation: pulse 2s infinite;
+}
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+/* Layout */
+main {
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 24px;
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 20px;
+}
+
+/* Cards */
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px;
+  transition: all 0.2s ease;
+}
+.card:hover {
+  background: var(--bg-card-hover);
+  border-color: var(--accent);
+  box-shadow: 0 0 20px var(--accent-glow);
+}
+.card-title {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--text-muted);
+  margin-bottom: 12px;
+}
+.card-value {
+  font-size: 32px;
+  font-weight: 700;
+  letter-spacing: -1px;
+}
+.card-sub {
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-top: 4px;
+}
+
+/* Wide cards */
+.card-wide { grid-column: span 2; }
+.card-full { grid-column: span 3; }
+
+/* Metric row */
+.metric-row {
+  display: flex;
+  gap: 24px;
+  margin-top: 16px;
+}
+.metric {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.metric-label {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.metric-value {
+  font-size: 18px;
+  font-weight: 600;
+}
+
+/* Progress bar */
+.progress-bar {
+  width: 100%;
+  height: 6px;
+  background: var(--bg-primary);
+  border-radius: 3px;
+  margin-top: 8px;
+  overflow: hidden;
+}
+.progress-fill {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.5s ease;
+}
+.progress-gpu { background: linear-gradient(90deg, var(--gpu-color), #a78bfa); }
+.progress-cpu { background: linear-gradient(90deg, var(--cpu-color), #00d2ff); }
+.progress-green { background: linear-gradient(90deg, var(--green), #00f5c4); }
+
+/* Layer grid */
+.layer-grid {
+  display: grid;
+  grid-template-columns: repeat(16, 1fr);
+  gap: 4px;
+  margin-top: 12px;
+}
+.layer-cell {
+  aspect-ratio: 1;
+  border-radius: 4px;
+  position: relative;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  min-width: 0;
+}
+.layer-cell:hover {
+  transform: scale(1.3);
+  z-index: 10;
+}
+.layer-cell.gpu { background: var(--gpu-color); }
+.layer-cell.cpu { background: var(--cpu-color); }
+.layer-cell.dead { background: var(--bg-primary); border: 1px solid var(--border); }
+.layer-cell .tooltip {
+  display: none;
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 11px;
+  white-space: nowrap;
+  z-index: 100;
+  box-shadow: var(--shadow);
+}
+.layer-cell:hover .tooltip { display: block; }
+
+/* Task selector */
+.task-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 12px;
+}
+.task-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.task-item:hover {
+  border-color: var(--accent);
+  background: rgba(108, 92, 231, 0.08);
+}
+.task-item.active {
+  border-color: var(--green);
+  background: rgba(0, 210, 160, 0.08);
+}
+.task-name {
+  font-weight: 600;
+  font-size: 14px;
+}
+.task-meta {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.task-badge {
+  font-size: 11px;
+  padding: 3px 10px;
+  border-radius: 20px;
+  font-weight: 600;
+}
+.task-badge.active {
+  background: var(--green);
+  color: var(--bg-primary);
+}
+.task-badge.inactive {
+  background: var(--border);
+  color: var(--text-secondary);
+}
+
+/* Settings panel */
+.settings-group {
+  margin-top: 12px;
+}
+.setting-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+.setting-row:last-child { border-bottom: none; }
+.setting-label {
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+.setting-value {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+select, input[type="number"] {
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+  padding: 6px 12px;
+  border-radius: 6px;
+  font-family: inherit;
+  font-size: 13px;
+}
+select:focus, input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* Log panel */
+.log-output {
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  max-height: 200px;
+  overflow-y: auto;
+  margin-top: 12px;
+}
+.log-line { white-space: pre; }
+.log-line.info { color: var(--blue); }
+.log-line.success { color: var(--green); }
+.log-line.warn { color: var(--orange); }
+.log-line.error { color: var(--red); }
+
+/* Button */
+.btn {
+  padding: 8px 20px;
+  border: none;
+  border-radius: 8px;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.btn-primary {
+  background: linear-gradient(135deg, var(--accent), #a78bfa);
+  color: white;
+}
+.btn-primary:hover {
+  box-shadow: 0 0 20px var(--accent-glow);
+  transform: translateY(-1px);
+}
+
+@media (max-width: 1024px) {
+  main { grid-template-columns: 1fr 1fr; }
+  .card-full { grid-column: span 2; }
+}
+@media (max-width: 640px) {
+  main { grid-template-columns: 1fr; }
+  .card-wide, .card-full { grid-column: span 1; }
+}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <div class="logo-icon">C</div>
+    <div>
+      <h1>Cortiq</h1>
+      <span>Sparse Task-Routed Inference</span>
+    </div>
+  </div>
+  <div class="header-status">
+    <div class="status-dot"></div>
+    <span id="header-status-text">Loading...</span>
+  </div>
+</header>
+
+<main>
+  <!-- Row 1: Key metrics -->
+  <div class="card">
+    <div class="card-title">Tokens/sec</div>
+    <div class="card-value" id="tok-sec" style="color: var(--green)">—</div>
+    <div class="card-sub" id="tok-sec-sub">measuring...</div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Active Task</div>
+    <div class="card-value" id="active-task" style="color: var(--accent)">—</div>
+    <div class="card-sub" id="active-task-sub">sparsity: —</div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Execution Mode</div>
+    <div class="card-value" id="exec-mode" style="font-size: 22px;">—</div>
+    <div class="card-sub" id="exec-mode-sub">detecting...</div>
+  </div>
+
+  <!-- Row 2: Memory + Performance -->
+  <div class="card card-wide">
+    <div class="card-title">Memory Usage</div>
+    <div class="metric-row">
+      <div class="metric" style="flex:1">
+        <span class="metric-label">GPU VRAM</span>
+        <span class="metric-value" id="vram-used" style="color: var(--gpu-color)">— GB</span>
+        <div class="progress-bar">
+          <div class="progress-fill progress-gpu" id="vram-bar" style="width: 0%"></div>
+        </div>
+      </div>
+      <div class="metric" style="flex:1">
+        <span class="metric-label">System RAM</span>
+        <span class="metric-value" id="ram-used" style="color: var(--cpu-color)">— GB</span>
+        <div class="progress-bar">
+          <div class="progress-fill progress-cpu" id="ram-bar" style="width: 0%"></div>
+        </div>
+      </div>
+      <div class="metric" style="flex:1">
+        <span class="metric-label">Active Params</span>
+        <span class="metric-value" id="active-params" style="color: var(--green)">—</span>
+        <div class="progress-bar">
+          <div class="progress-fill progress-green" id="params-bar" style="width: 0%"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Performance</div>
+    <div class="metric-row" style="flex-direction: column; gap: 12px;">
+      <div class="metric">
+        <span class="metric-label">Time to First Token</span>
+        <span class="metric-value" id="ttft">— ms</span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">Last Switch Latency</span>
+        <span class="metric-value" id="switch-lat">— ms</span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">Total Tokens</span>
+        <span class="metric-value" id="total-tokens">0</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Row 3: Layer Map -->
+  <div class="card card-full">
+    <div class="card-title">Layer Map — GPU / CPU Placement</div>
+    <div style="display: flex; gap: 16px; margin-bottom: 8px; font-size: 12px; color: var(--text-muted);">
+      <span>◼ <span style="color:var(--gpu-color)">GPU</span></span>
+      <span>◼ <span style="color:var(--cpu-color)">CPU</span></span>
+      <span>◻ Dead (skipped)</span>
+      <span style="margin-left:auto" id="layer-summary">— layers active</span>
+    </div>
+    <div class="layer-grid" id="layer-grid"></div>
+  </div>
+
+  <!-- Row 4: Tasks + Settings -->
+  <div class="card card-wide">
+    <div class="card-title">Task Masks</div>
+    <div class="task-list" id="task-list">
+      <div style="color: var(--text-muted); font-size: 13px;">Loading masks...</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Settings</div>
+    <div class="settings-group">
+      <div class="setting-row">
+        <span class="setting-label">Routing Mode</span>
+        <select id="setting-routing">
+          <option value="auto">Auto</option>
+          <option value="manual">Manual</option>
+          <option value="hybrid">Hybrid</option>
+        </select>
+      </div>
+      <div class="setting-row">
+        <span class="setting-label">Max Context</span>
+        <select id="setting-context">
+          <option value="4096">4K</option>
+          <option value="8192">8K</option>
+          <option value="16384">16K</option>
+          <option value="32768">32K</option>
+        </select>
+      </div>
+      <div class="setting-row">
+        <span class="setting-label">Temperature</span>
+        <input type="number" id="setting-temp" value="0.7" min="0" max="2" step="0.1" style="width:70px">
+      </div>
+      <div class="setting-row">
+        <span class="setting-label">API Port</span>
+        <span class="setting-value" id="setting-port">8080</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Row 5: Logs -->
+  <div class="card card-full">
+    <div class="card-title">Activity Log</div>
+    <div class="log-output" id="log-output">
+      <div class="log-line info">[init] Cortiq dashboard connected</div>
+    </div>
+  </div>
+</main>
+
+<script>
+const API_BASE = window.location.origin;
+let currentTask = null;
+
+// ─── Polling ─────────────────────────────
+async function fetchStatus() {
+  try {
+    const res = await fetch(`${API_BASE}/v1/cortiq/status`);
+    const s = await res.json();
+    updateDashboard(s);
+  } catch (e) {
+    document.getElementById('header-status-text').textContent = 'Disconnected';
+    document.querySelector('.status-dot').style.background = 'var(--red)';
+  }
+}
+
+async function fetchMasks() {
+  try {
+    const res = await fetch(`${API_BASE}/v1/cortiq/masks`);
+    const data = await res.json();
+    renderMasks(data.masks || []);
+  } catch (e) {
+    // ignore
+  }
+}
+
+function updateDashboard(s) {
+  // Header
+  document.getElementById('header-status-text').textContent = `Running — ${s.model_name}`;
+  document.querySelector('.status-dot').style.background = 'var(--green)';
+
+  // Metrics
+  document.getElementById('tok-sec').textContent = s.performance.avg_tokens_per_sec.toFixed(1);
+  document.getElementById('tok-sec-sub').textContent = `${s.performance.tokens_generated} total`;
+  
+  document.getElementById('active-task').textContent = s.active_task;
+  document.getElementById('active-task-sub').textContent = 
+    `sparsity: ${(s.active_sparsity * 100).toFixed(0)}%`;
+  currentTask = s.active_task;
+
+  const modeStr = typeof s.execution_mode === 'object' 
+    ? Object.keys(s.execution_mode)[0] 
+    : s.execution_mode;
+  document.getElementById('exec-mode').textContent = formatMode(modeStr);
+  document.getElementById('exec-mode-sub').textContent = 
+    `${s.active_layers}/${s.total_layers} layers active`;
+
+  // Memory
+  const vramGB = (s.performance.vram_used_mb / 1024).toFixed(1);
+  const ramGB = (s.performance.ram_used_mb / 1024).toFixed(1);
+  document.getElementById('vram-used').textContent = `${vramGB} GB`;
+  document.getElementById('ram-used').textContent = `${ramGB} GB`;
+  document.getElementById('active-params').textContent = s.active_params;
+  
+  const sparsityPct = ((1 - s.active_sparsity) * 100).toFixed(0);
+  document.getElementById('vram-bar').style.width = `${Math.min(100, vramGB / 24 * 100)}%`;
+  document.getElementById('ram-bar').style.width = `${Math.min(100, ramGB / 64 * 100)}%`;
+  document.getElementById('params-bar').style.width = `${sparsityPct}%`;
+
+  // Performance
+  document.getElementById('ttft').textContent = 
+    `${s.performance.avg_time_to_first_token_ms.toFixed(0)} ms`;
+  document.getElementById('switch-lat').textContent = 
+    `${s.performance.last_switch_latency_ms.toFixed(1)} ms`;
+  document.getElementById('total-tokens').textContent = 
+    s.performance.tokens_generated.toLocaleString();
+
+  // Layer grid
+  renderLayers(s.layer_stats || [], s.active_layers, s.total_layers);
+}
+
+function renderLayers(layers, activeCount, totalCount) {
+  const grid = document.getElementById('layer-grid');
+  document.getElementById('layer-summary').textContent = 
+    `${activeCount}/${totalCount} layers active`;
+  
+  if (layers.length === 0) {
+    // Demo: generate 64 sample layers
+    grid.innerHTML = '';
+    for (let i = 0; i < 64; i++) {
+      const isAlive = Math.random() > 0.2;
+      const isGpu = isAlive && Math.random() > 0.4;
+      const cls = !isAlive ? 'dead' : (isGpu ? 'gpu' : 'cpu');
+      const active = isAlive ? Math.floor(Math.random() * 17408) : 0;
+      grid.innerHTML += `<div class="layer-cell ${cls}">
+        <div class="tooltip">
+          Layer ${i} | ${cls.toUpperCase()}<br>
+          Active: ${active}/17408 (${(active/174.08).toFixed(0)}%)
+        </div>
+      </div>`;
+    }
+    return;
+  }
+
+  grid.innerHTML = '';
+  layers.forEach(l => {
+    const cls = !l.is_alive ? 'dead' : (l.placement === 'gpu' ? 'gpu' : 'cpu');
+    const pct = l.total_neurons > 0 ? (l.active_neurons / l.total_neurons * 100).toFixed(0) : 0;
+    grid.innerHTML += `<div class="layer-cell ${cls}" style="opacity: ${l.is_alive ? 0.3 + l.active_neurons / l.total_neurons * 0.7 : 1}">
+      <div class="tooltip">
+        Layer ${l.layer_idx} | ${cls.toUpperCase()}<br>
+        Neurons: ${l.active_neurons}/${l.total_neurons} (${pct}%)<br>
+        Heads: ${l.active_heads}/${l.total_heads}<br>
+        Avg: ${l.avg_forward_ms.toFixed(2)}ms
+      </div>
+    </div>`;
+  });
+}
+
+function renderMasks(masks) {
+  const list = document.getElementById('task-list');
+  if (masks.length === 0) {
+    list.innerHTML = '<div style="color: var(--text-muted); font-size:13px;">No masks loaded. Load a .cmf model with masks.</div>';
+    return;
+  }
+  list.innerHTML = masks.map(m => `
+    <div class="task-item ${m.name === currentTask ? 'active' : ''}" onclick="switchTask('${m.name}')">
+      <div>
+        <div class="task-name">${m.name}</div>
+        <div class="task-meta">
+          Sparsity: ${(m.sparsity * 100).toFixed(0)}% · 
+          Quality: ${(m.quality_score * 100).toFixed(0)}% · 
+          Layers: ${m.active_layers} · 
+          Avg neurons: ${Math.round(m.active_neurons_avg)}
+          ${m.has_hot_pack ? ' · 🔥 Hot' : ''}
+        </div>
+      </div>
+      <span class="task-badge ${m.name === currentTask ? 'active' : 'inactive'}">
+        ${m.name === currentTask ? 'ACTIVE' : 'SWITCH'}
+      </span>
+    </div>
+  `).join('');
+}
+
+async function switchTask(taskName) {
+  addLog(`Switching to task: ${taskName}`, 'info');
+  try {
+    const res = await fetch(`${API_BASE}/v1/cortiq/switch`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ task: taskName })
+    });
+    const result = await res.json();
+    addLog(`✓ Switched: ${result.previous_task} → ${result.new_task} (${result.switch_latency_ms.toFixed(1)}ms)`, 'success');
+    fetchStatus();
+    fetchMasks();
+  } catch (e) {
+    addLog(`✗ Switch failed: ${e.message}`, 'error');
+  }
+}
+
+function addLog(msg, level = 'info') {
+  const log = document.getElementById('log-output');
+  const time = new Date().toLocaleTimeString();
+  log.innerHTML += `<div class="log-line ${level}">[${time}] ${msg}</div>`;
+  log.scrollTop = log.scrollHeight;
+}
+
+function formatMode(mode) {
+  const map = {
+    'GpuOnly': 'GPU Only',
+    'GpuCpuSplit': 'GPU + CPU',
+    'CpuGpuOffload': 'CPU + GPU',
+    'CpuOnly': 'CPU Only',
+    'AppleUnified': 'Apple Unified',
+  };
+  return map[mode] || mode;
+}
+
+// ─── Init ────────────────────────────────
+fetchStatus();
+fetchMasks();
+setInterval(fetchStatus, 3000);
+setInterval(fetchMasks, 10000);
+addLog('Dashboard initialized, polling /v1/cortiq/status every 3s', 'info');
+</script>
+</body>
+</html>

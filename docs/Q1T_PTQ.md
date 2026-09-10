@@ -1,0 +1,181 @@
+# q1t — training-free ternary post-training quantization
+
+An experimental, **training-free** compression path that quantizes an
+ordinary checkpoint to **~2.25–3.5 bits/weight** — below `q4` (4.5 bpw) —
+while staying coherent. Built on an *error-feedback transfer* step (the CMF
+patents): preserve the layer **output** `W·x`, not the weights.
+
+The ternary base is packed **base-3, 5 values per byte** (`3^5 = 243 ≤ 256`),
+so a 32-weight group is `[f16 scale][7 B codes]` = **2.25 bpw** (vs a naïve
+2-bit 2.5 bpw) — a lossless size win, same reconstructed values.
+
+It is **not** wired into the default `--quant` flags; it is a separate
+calibration-driven command. The engine is untouched apart from the `Q1T`
+codec + its fused kernel.
+
+## The method
+
+For each linear layer, given calibration statistics of its input:
+
+1. **Ternary bulk (`Q1T`, BitNet b1.58).** Each 32-weight group →
+   `{−s, 0, +s}`. The converter compares the historical abs-mean rounding
+   with a sparse-support, activation-weighted least-squares candidate and
+   keeps whichever has lower diagonal-Hessian reconstruction error. This is
+   training-free, adds no bytes to the format, and cannot worsen that local
+   proxy (real held-out PPL still has to be measured after conversion).
+   Capturing the many near-zero weights *exactly* (the zero level) is the
+   decisive win over 1-bit binary — measured ×7 better at matched budget.
+2. **Two-field outlier mask.** Keep the top `--keep` fraction of weights by
+   `|W|·RMS(x)` (amplitude × activation) at f16 in a sparse overlay. This
+   is the SpQR/AWQ salience idea; a *weight* mask beats a *column* mask
+   here (3988 vs 615 on 0.5B at 10%).
+3. **Докрутка — per-row output stabilization.** After quantizing a row,
+   rescale it by the closed-form `α` that minimizes the activation-weighted
+   output error `‖α·Q(x) − W(x)‖²_d` (`d` = per-channel activation power).
+   One scalar per row, folded into the row's scales — **zero extra size**.
+   This is the single biggest lever (0.5B keep-5%: 7344 → 547, ×13).
+4. **Keep the bit-sensitive tensors precise.** `embed_tokens`, `lm_head`
+   and `down_proj` (the gated-intermediate output) stay at the input dtype
+   — cheaper *and* higher quality than flooding them with outliers.
+
+What was tried and **rejected** (measured): the GPTQ/error-feedback fold
+`Σ_PS·Σ_SS⁻¹` *backfires* at extreme low bit (a single-pass, rank-deficient
+Hessian injects more error than it removes); a column mask; a finer 4-level
+base (ternary is near-optimal for a single scale that includes zero).
+
+## Usage
+
+```sh
+# input should be a high-precision CMF (f16 or q8; q4 also works)
+CMF_GPTQ_TERNARY=1 \
+CMF_GPTQ_SKIP=embed_tokens,lm_head,down_proj \
+cortiq quantize-gptq model-q8.cmf \
+    --calib corpus.txt \        # .txt, or a JSON array of [prompt, text] pairs
+    --output model-q1t.cmf \
+    --keep 0.03 \               # outlier budget (2–3% ⇒ below q4 size)
+    --tokens 1024               # calibration tokens (diminishing returns past ~2k)
+```
+
+Env knobs: `CMF_GPTQ_SKIP` (keep-precise substrings), `CMF_GPTQ_DOWN_KEEP`
+(extra down_proj mask if it can't be skipped), `CMF_GPTQ_NOCORRECT=1`
+(disable докрутка), `CMF_GPTQ_MAXCOL` (leave wide tensors at input dtype).
+The Hessian capture is diagonal-only (fits a 12B); the quantizer streams
+one tensor per worker, so RAM stays bounded.
+
+## Measured
+
+Qwen2.5-0.5B (PPL on held-out spec text; q8 = 34):
+
+| build | PPL |
+|---|---|
+| naive 1-bit | 3.4M |
+| ternary + mask, keep 10% | 108 |
+| + skip down_proj, keep 10% | 84 |
+
+qwopus-nvg-12b (Qwen3.5 GDN hybrid, 14.8B; q4 baseline = 42.3 @ 7.8 GB):
+
+| build | size | PPL |
+|---|---|---|
+| ternary + докрутка, keep 10% | 12.7 GB | 83 |
+| ternary, keep 2% (below q4 size) | 6.3 GB | 196 |
+
+Larger models degrade **far less** at low bit (12B ~2× vs 0.5B ~4.5×), and
+the 12B generates correct, coherent code (docstring, type hints) at ternary
+— the recipe is validated end-to-end on a real 15B model. The keep-2% point
+is **19 % smaller than q4**; `skip{embed,lm_head,down_proj}` trades a little
+of that size back for a large quality gain (measured −39 % PPL on 0.5B at
+keep-2%).
+
+**Honest positioning:** q1t does not dominate `q4` at equal size (dense
+4-bit is denser); it opens a **smaller operating point** (~2.5–3.5 bpw) that
+`q4` cannot reach, with graceful degradation — valuable where size is the
+binding constraint (on-device / mobile).
+
+**Decode speed** (three levers, on top of a slow per-row-dequant baseline):
+
+1. **Base matvec** — decode+dot per group straight from mmap (no per-row
+   buffer), a 256-entry byte→signs LUT instead of the base-3 divide/modulo
+   per weight, and each group's signs unpacked into a tiny stack buffer so
+   the 32-wide dot lowers to f32x4 FMAs. **6.9×** over the division decode on
+   an 8192×4096 tensor (single thread, 9.25 → 7.64 ms after the SIMD unpack).
+2. **Overlay** — dominates at high keep; since the encoder writes ternary
+   code 0 at every outlier position, the correction is a plain `value·x`
+   with **no scattered per-outlier scale read** (+45 % at keep-10 %).
+3. **int8 SIMD** — ARM dotprod (`sdot`) and x86 AVX2 (`maddubs`), default;
+   `CMF_SDOT=0` keeps the exact f32 path — for BOTH decode (`matvec`) and
+   prefill (`matmat`): x → i8 once (`split_act`, activation outliers stay
+   f32), signs unpacked base-3 → i8, an int8 dot per 32-group; in matmat each
+   row's signs decode once and dot against the whole batch. ARM: decode
+   **+30 %**, prefill **2.6×** at keep-2 % (TTFT 0.87 → 0.32 s). x86 (i9):
+   prefill **2.1×**, decode +31 %. Cost: PPL +0.2–0.5 % (89.08 vs 88.66 on
+   ARM; 88.42 vs 88.23 on x86) — the standard a8w8 activation-quant tradeoff
+   q8/q1/q4 also take by default. Levers 1–2 stay bit-identical to
+   `dequant_q1t`; only the i8 path perturbs.
+
+End to end, 0.5B q1t went from ~2.5 tok/s decode (the div-decode regression
+the packing introduced) to **~38 tok/s decode / ~58 prefill at keep-10 %, ~60
+decode / ~120 prefill at keep-2 %** — a noisy-machine, fair-load read; the
+isolated kernel gains above are cleaner.
+
+**Overlay encoding.** Per-row, not flat: `[u32 row_ptr[rows+1]]` then
+`[(u16 col, f16 val)]` grouped by row. **4 B/outlier** (was 6) and row `r`'s
+entries are the contiguous slice `[row_ptr[r], row_ptr[r+1])` — a direct
+index, no binary search. Lossless: 0.5B keep-10 % 471 → 422 MB (−10.5 %),
+PPL unchanged. The saving is the overlay fraction (grows with keep); at a
+fixed size budget it buys ~50 % more kept outliers → better quality-at-size.
+`col` is within-row, so a quantized tensor's `cols` must fit `u16` (true for
+attn/FFN; the vocab-sized `embed`/`lm_head` are skipped anyway).
+
+## GPU
+
+q1t runs on the GPU on both engine backends — native **Metal** (Apple Silicon)
+and **wgpu** (Vulkan / DX12 / Metal → NVIDIA / AMD / Intel). Every kernel is
+gated by the runtime probe: the GPU is used only where it beats the CPU, so a
+machine where it loses silently keeps the CPU path.
+
+> **Metal alignment fix (July 2026):** a real 14.8B GDN model exposed that
+> typed `ushort`/`uint` loads from Q1T's 9-byte tiles were unaligned, producing
+> NaN logits after the first generated token. All Q1T base/overlay fields now
+> use explicit little-endian byte loads. Real-tensor Metal/CPU parity reaches
+> `max_rel=3.52e-6`; `CMF_METAL_Q1T=0` remains as an emergency CPU fallback.
+> The shared no-copy Metal cache now also retains its `CmfModel` owner and is
+> keyed by model identity, preventing a released mmap address from being
+> recycled across Q1/Q4/Q8/Q8_2f/Q1T models in a long-lived process.
+
+**Kernels (Metal MSL and WGSL):**
+
+- `q1t_matvec` — decode: per 32-group, decode the f16 scale + base-3 codes to
+  `{−1,0,+1}` and dot with the raw f32 activations (full precision — more
+  accurate than the CPU int8 path). `q1t_overlay` adds the sparse overlay
+  on-device (the base code is 0 at every overlay position, so no double count).
+- `q1t_mul_mm` — prefill: a register-blocked GEMM (Metal simdgroup-matrix;
+  WGSL 64×64 C-tile). It is the q8 GEMM with one change — the weight staging
+  decodes base-3 × per-group scale into the shared tile instead of `i8·scale`.
+  `q1t_overlay_mm` fans each `(col,val)` over the whole batch in a second pass.
+- `q4b_matvec` — a q4_block kernel added along the way so a *precise* weight
+  (e.g. `down_proj`, `lm_head`) can stay 4-bit on the GPU without ternarizing.
+
+**Whole-token graph (Metal).** The dtype dispatch (`proj_abs`/`encode_proj`)
+accepts **Q1, Q1T or Q4-block**, so a q1t model (with a q4-block `down_proj`)
+runs a whole decode token — all projections, GDN mixers, attention and FFN — in
+one pipelined submission, the way q1 does. This is where the real decode win is:
+on a 14.8B GDN-hybrid (Apple M4) decode goes **1.3 → 3.9 tok/s (2.7×)** and
+beats the same model in `q4` on the CPU (2.8–3.3), at 6.27 GB (−25 % vs q4);
+PPL is identical to the CPU path. The generalisation is free for other formats:
+a **pure q4 model now runs the same graph** (via `q4b`) — 12B q4 decode
+3.0 → 5.6 tok/s. Per-op GPU (a single-token matvec) does *not* win on Apple's
+UMA — the dispatch/upload overhead exceeds the tiny compute — which is exactly
+why the whole-token graph matters.
+
+**wgpu (cross-platform).** The token graph is Metal-only; on Vulkan/DX12 the
+path is per-op matvec + the prefill GEMM with the weights **resident in VRAM**,
+where per-op *does* win (a discrete GPU is not bandwidth-starved the way UMA is,
+and there is no per-call upload). All wgpu kernels are validated against the CPU
+dequant reference (`wgpu_q1t/q4b_matvec_matches_cpu`, `wgpu_q1t_matmat_matches_cpu`).
+
+**Prefill.** The GEMM reads each weight once and multiplies it against the whole
+prompt: 12B TTFT **9.4 → 6.0 s** (1.5× at 41 tokens, ~1.9× at ~350 — the win
+grows with prompt length as the 32-wide C-tiles fill).
+
+**Follow-ups:** an int8-SDOT ternary variant of the wgpu matvec; porting the
+whole-token graph to wgpu (large — the graph machinery is Metal-specific).

@@ -1,0 +1,54 @@
+[package]
+name = "cortiq-engine"
+version.workspace = true
+edition.workspace = true
+description = "Portable inference runtime for the CMF model format, with no ML framework underneath: runs on CPU, and on GPU (Vulkan / Metal / DX12) with the `gpu` feature; tokenizer, chat templates and dynamic per-skill weight overlay."
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cortiq-core = { path = "../cortiq-core", version = "0.6.6" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+fancy-regex = { workspace = true }
+unicode-normalization = { workspace = true }
+minijinja = { workspace = true }
+minijinja-contrib = { workspace = true }
+base64 = { workspace = true }
+
+# Cross-platform GPU backend (C1): wgpu -> Vulkan/DX12/Metal (NVIDIA,
+# Radeon, Intel, Apple). Optional: a plain CPU build does not pull it in.
+wgpu = { version = "30", optional = true }
+pollster = { version = "0.4", optional = true }
+bytemuck = { version = "1", optional = true, features = ["derive"] }
+
+[features]
+# `--features gpu` enables the wgpu path; test on a discrete card.
+gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+
+# GPU path (D5): Metal on Apple Silicon; unified memory + no-copy buffers.
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = "0.29"
+# pthread_set_qos_class_self_np: the pool's workers ask for the P-cores.
+libc = "0.2"
+
+# gettid for the worker-tid registry (ADPF) + Android core pinning.
+[target.'cfg(any(target_os = "android", target_os = "linux"))'.dependencies]
+libc = "0.2"
+
+# The native Vulkan fast lane. `ash` is bindings and nothing else — it
+# links no library, it opens `libvulkan.so.1` at run time exactly as wgpu
+# already does, so this adds a code path and not a dependency. Only where
+# Vulkan exists: Apple has none (the Metal backend uses its own matrix
+# units) and the wgpu path remains the universal one everywhere.
+[target.'cfg(any(target_os = "linux", target_os = "windows", target_os = "android"))'.dependencies]

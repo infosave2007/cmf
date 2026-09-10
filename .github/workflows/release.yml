@@ -1,0 +1,226 @@
+name: Release binaries
+
+# On every version tag, build the `cortiq` CLI for the common desktop/server
+# targets and attach the archives to the GitHub Release — so people can use it
+# without a Rust toolchain.
+on:
+  push:
+    tags: ['v*']
+  # Manual re-run: attach binaries to an already-published release (e.g. after
+  # adding a target to the matrix). Dispatch from the branch that carries the
+  # matrix you want — GitHub takes the workflow file from the dispatched ref,
+  # not from the tag.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to attach the archives to'
+        required: true
+      build_only:
+        description: 'Build and package the full matrix without attaching archives to a release'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    # The macos-13 (Intel) runner pool is retired: jobs queue forever with
+    # zero steps and die at the 24h cap (v0.1.8–v0.1.10 all lost the
+    # x86_64-apple-darwin asset this way). Build Intel macOS by
+    # cross-compiling on the arm64 runner instead — the macOS toolchain
+    # is natively multi-arch. The timeout is a tripwire so any future
+    # runner-pool death fails fast instead of hanging a day.
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          # Windows: MSVC toolchain, zip archives (the convention there); the
+          # aarch64 target cross-compiles from the x86_64 runner — the MSVC
+          # linker is multi-arch, same trick as the Intel-macOS row above.
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+          # Android (arm64): runnable in Termux or via adb shell. Built
+          # with the runner's preinstalled NDK; CPU path (+ wgpu Vulkan
+          # from --features gpu — Android Vulkan loads where present,
+          # the runtime probe keeps CPU where it wins). API 24+.
+          - os: ubuntu-latest
+            target: aarch64-linux-android
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Android NDK toolchain env
+        if: matrix.target == 'aarch64-linux-android'
+        # The GitHub ubuntu image ships an NDK; point cargo/cc at its
+        # clang wrapper (API 24) so ring and friends cross-compile.
+        run: |
+          NDK="${ANDROID_NDK_ROOT:-$ANDROID_NDK_HOME}"
+          TOOL="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$TOOL/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
+          echo "CC_aarch64_linux_android=$TOOL/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
+          echo "AR_aarch64_linux_android=$TOOL/llvm-ar" >> "$GITHUB_ENV"
+          # Android 15+ (16 KB kernel pages) rejects 4 KB-aligned .so —
+          # every android artifact links with 16 KB max-page-size.
+          echo "RUSTFLAGS=-C link-arg=-Wl,-z,max-page-size=16384" >> "$GITHUB_ENV"
+      - name: Build
+        # --features gpu: the wgpu (Vulkan/DX12) path ships in every
+        # artifact — field case: a 35B CMF on an RTX 4090 ran CPU-only at
+        # 1.9 tok/s because Linux/Windows builds carried no GPU backend
+        # at all. macOS keeps native Metal as the default; wgpu there
+        # remains opt-in via CMF_GPU=wgpu.
+        run: cargo build --release -p cortiq-cli --features gpu --target ${{ matrix.target }}
+      - name: Build FFI library (android)
+        if: matrix.target == 'aarch64-linux-android'
+        # libcortiq_ffi.so for APK embedding (see crates/cortiq-ffi).
+        # --features gpu: Vulkan via wgpu so Mali/Adreno are reachable
+        # from the app; the probe keeps CPU where the GPU loses.
+        run: cargo build --release -p cortiq-ffi --features gpu --target ${{ matrix.target }}
+      - name: Verify 16 KB page alignment (android)
+        if: matrix.target == 'aarch64-linux-android'
+        run: |
+          NDK="${ANDROID_NDK_ROOT:-$ANDROID_NDK_HOME}"
+          READELF="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          SO="target/${{ matrix.target }}/release/libcortiq_ffi.so"
+          if "$READELF" -l "$SO" | grep -E '^\s*LOAD' | grep -q '0x1000$'; then
+            echo "::error::$SO is 4 KB-aligned — Android 15+ rejects it"; exit 1
+          fi
+      - name: Package FFI (android)
+        if: matrix.target == 'aarch64-linux-android'
+        run: |
+          bindir="target/${{ matrix.target }}/release"
+          tar -C "$bindir" -czf "libcortiq-ffi-${{ matrix.target }}.tar.gz" libcortiq_ffi.so
+          shasum -a 256 "libcortiq-ffi-${{ matrix.target }}.tar.gz" > "libcortiq-ffi-${{ matrix.target }}.tar.gz.sha256"
+      - name: Attach FFI to release (android)
+        if: ${{ matrix.target == 'aarch64-linux-android' && !inputs.build_only }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: |
+            libcortiq-ffi-${{ matrix.target }}.tar.gz
+            libcortiq-ffi-${{ matrix.target }}.tar.gz.sha256
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          bindir="target/${{ matrix.target }}/release"
+          tar -C "$bindir" -czf "cortiq-${{ matrix.target }}.tar.gz" cortiq
+          shasum -a 256 "cortiq-${{ matrix.target }}.tar.gz" > "cortiq-${{ matrix.target }}.tar.gz.sha256"
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $bin = "target/${{ matrix.target }}/release/cortiq.exe"
+          $zip = "cortiq-${{ matrix.target }}.zip"
+          Compress-Archive -Path $bin -DestinationPath $zip -Force
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          # Write an explicit LF so the checksum is portable to shasum/sha256sum.
+          [System.IO.File]::WriteAllText("$zip.sha256", "$hash  $zip`n", [System.Text.Encoding]::ASCII)
+      - name: Attach to release (unix)
+        if: ${{ runner.os != 'Windows' && !inputs.build_only }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: |
+            cortiq-${{ matrix.target }}.tar.gz
+            cortiq-${{ matrix.target }}.tar.gz.sha256
+      - name: Attach to release (windows)
+        if: ${{ runner.os == 'Windows' && !inputs.build_only }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: |
+            cortiq-${{ matrix.target }}.zip
+            cortiq-${{ matrix.target }}.zip.sha256
+
+  # FFI-only targets: no CLI is built for these — they exist so an app
+  # can drop the library straight into its bundle. Android ships .so per
+  # ABI (jniLibs/<abi>/), iOS ships the static .a (link it into the app
+  # binary; Dart reaches it via DynamicLibrary.process()). The arm64
+  # Android .so comes from the main matrix above.
+  ffi:
+    name: ffi ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 32-bit ARM phones. The NDK clang wrapper spells this target
+          # armv7a-…-eabi24 while rustc spells it armv7-…-eabi — the
+          # `clang` field carries the NDK spelling.
+          # No gpu feature on 32-bit ARM: Vulkan-on-armv7 is rare in
+          # the field and wgpu there is untested — CPU-only, honestly.
+          - os: ubuntu-latest
+            target: armv7-linux-androideabi
+            clang: armv7a-linux-androideabi24-clang
+            lib: libcortiq_ffi.so
+          # Android emulators on x86 hosts.
+          - os: ubuntu-latest
+            target: x86_64-linux-android
+            clang: x86_64-linux-android24-clang
+            lib: libcortiq_ffi.so
+            features: gpu
+          # iOS devices: static library, linked into the app binary.
+          # gpu = the wgpu Metal backend; the app adds `-framework Metal`
+          # (cmfmobile TUNING.md) and cortiq_gpu_available() turns true.
+          - os: macos-latest
+            target: aarch64-apple-ios
+            lib: libcortiq_ffi.a
+            features: gpu
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Android NDK toolchain env
+        if: contains(matrix.target, 'android')
+        run: |
+          NDK="${ANDROID_NDK_ROOT:-$ANDROID_NDK_HOME}"
+          TOOL="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          TRIPLE_ENV="$(echo '${{ matrix.target }}' | tr 'a-z-' 'A-Z_')"
+          echo "CARGO_TARGET_${TRIPLE_ENV}_LINKER=$TOOL/${{ matrix.clang }}" >> "$GITHUB_ENV"
+          echo "CC_$(echo '${{ matrix.target }}' | tr '-' '_')=$TOOL/${{ matrix.clang }}" >> "$GITHUB_ENV"
+          echo "AR_$(echo '${{ matrix.target }}' | tr '-' '_')=$TOOL/llvm-ar" >> "$GITHUB_ENV"
+          # Android 15+ (16 KB kernel pages) rejects 4 KB-aligned .so.
+          echo "RUSTFLAGS=-C link-arg=-Wl,-z,max-page-size=16384" >> "$GITHUB_ENV"
+      - name: Build FFI library
+        run: cargo build --release -p cortiq-ffi ${{ matrix.features && format('--features {0}', matrix.features) || '' }} --target ${{ matrix.target }}
+      - name: Verify 16 KB page alignment (android)
+        if: contains(matrix.target, 'android')
+        run: |
+          NDK="${ANDROID_NDK_ROOT:-$ANDROID_NDK_HOME}"
+          READELF="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          SO="target/${{ matrix.target }}/release/${{ matrix.lib }}"
+          if "$READELF" -l "$SO" | grep -E '^\s*LOAD' | grep -q '0x1000$'; then
+            echo "::error::$SO is 4 KB-aligned — Android 15+ rejects it"; exit 1
+          fi
+      - name: Package
+        run: |
+          bindir="target/${{ matrix.target }}/release"
+          tar -C "$bindir" -czf "libcortiq-ffi-${{ matrix.target }}.tar.gz" ${{ matrix.lib }}
+          shasum -a 256 "libcortiq-ffi-${{ matrix.target }}.tar.gz" > "libcortiq-ffi-${{ matrix.target }}.tar.gz.sha256"
+      - name: Attach to release
+        if: ${{ !inputs.build_only }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: |
+            libcortiq-ffi-${{ matrix.target }}.tar.gz
+            libcortiq-ffi-${{ matrix.target }}.tar.gz.sha256

@@ -1,0 +1,42 @@
+[package]
+name = "cortiq-embryo"
+version.workspace = true
+edition.workspace = true
+description = "Cortiq Embryo: a self-developing core born and grown on the CMF format — native Rust training stack (Metal on Apple Silicon), no ML framework underneath."
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "cortiq-embryo"
+path = "src/main.rs"
+
+[dependencies]
+cortiq-core = { path = "../cortiq-core", version = "0.6.6" }
+cortiq-engine = { path = "../cortiq-engine", version = "0.6.6", default-features = false }
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+fancy-regex = { workspace = true }
+base64 = { workspace = true }
+flate2 = "1"
+# Corpus readers for the birth data (FineWeb parquet, C4 json.gz). Optional:
+# the trainer itself needs neither.
+parquet = { version = "59", default-features = false, features = ["snap", "zstd", "brotli", "flate2-rust_backend", "lz4"], optional = true }
+
+[features]
+default = []
+data = ["dep:parquet"]
+
+# The training kernels are Metal (Apple Silicon: unified memory, simdgroup
+# matrices). Everything else in the crate — the model, the CPU reference
+# ops, the gradchecks, the CMF export — builds and tests everywhere.
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = "0.29"

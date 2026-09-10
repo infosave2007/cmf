@@ -1,0 +1,968 @@
+//! End-to-end MiniMax-H3 text→(video + synchronized stereo audio):
+//! Qwen3-VL prompt encode → 4-step dual-schedule flow sampling over the
+//! packed DiT → ViT3D video decode and BigVGAN audio decode.
+//!
+//! Stages load and drop one at a time, as the image pipeline next door
+//! does: peak resident is one component, not their sum.
+//!
+//! ## Two clocks, four steps
+//!
+//! The sampler walks the VIDEO sigma grid — `simple` at shift 12, which
+//! at four steps is 1, 0.973, 0.923, 0.8, 0 — and the audio stream is
+//! integrated on its own remap of that grid (shift 3). Stepping both on
+//! the video grid is what a stock sampler does, and it is fine at
+//! twenty steps and audibly wrong at four: `Δσ_a` and `Δσ_v` differ by
+//! a factor of three over the last interval, and no per-step slope
+//! correction fixes a step that large. Hence `--stock-sampler`, which
+//! reproduces the broken behaviour on purpose, for comparison.
+
+use crate::audiovae::AudioVae;
+use crate::mmh3::{Layout, MiniMaxH3, time_shift_sigma};
+use crate::qwen3te::{ImageSpan, Qwen3Encoder};
+use crate::qwen3vis::{self, VisionTower};
+use crate::sampler::SplitMix64;
+use crate::tokenizer::Tokenizer;
+use crate::vae3d::VideoVae;
+use crate::vae3d::VideoVaeEncoder;
+use std::path::Path;
+use std::sync::Arc;
+
+pub const FPS: usize = 24;
+pub const AUDIO_LATENT_FPS: usize = 40;
+
+pub struct AnimParams {
+    pub width: usize,
+    pub height: usize,
+    /// Frames at 24 fps; snapped up to the model's 17k+5 grid.
+    pub frames: usize,
+    pub steps: usize,
+    pub seed: u64,
+    /// Integrate the audio on the video's grid, as a stock sampler
+    /// would. Wrong at four steps; kept for A/B.
+    pub stock_sampler: bool,
+    pub max_tokens: usize,
+    /// RGB in [0, 1] as `[3, h, w]` with its size — the clip's first
+    /// frame, and/or its last.
+    pub first_frame: Option<(Vec<f32>, usize, usize)>,
+    pub last_frame: Option<(Vec<f32>, usize, usize)>,
+    /// Extra reference frames with the pixel index each one stands for:
+    /// video-to-video as this architecture actually takes it — every
+    /// frame is a condition row pinned to its own time coordinate, the
+    /// same machinery `--first-frame`/`--last-frame` use for two.
+    pub mid_frames: Vec<((Vec<f32>, usize, usize), usize)>,
+    /// A LoRA adapter (.safetensors) applied at runtime, and how hard.
+    pub lora: Option<String>,
+    pub lora_strength: f32,
+    /// The published latent upscaler (.safetensors) and the factor to
+    /// apply: the denoised latent is resized by the learned net and the
+    /// VAE decodes at the larger size, so the 5 B-parameter decode →
+    /// pixel resize → encode round trip never happens.
+    pub upscale: Option<String>,
+    pub upscale_by: f32,
+    /// Chunk-causal (streaming) generation: latent frames per chunk, and
+    /// how many chunks a chunk may see — `sink` from the start of the
+    /// clip and a sliding `window` of recent ones. 0 chunks = the
+    /// bidirectional path. This is what a streaming adapter is trained
+    /// for, and it is what stops the activation cache growing with the
+    /// clip's length.
+    pub stream_chunk: usize,
+    pub stream_sink: usize,
+    pub stream_window: usize,
+}
+
+/// The vision-block token ids the H3 presentation flanks a picture with.
+const VISION_START: u32 = 151_652;
+const VISION_END: u32 = 151_653;
+
+/// Resize `[3, h, w]` RGB to the canvas. The first frame is a geometry
+/// anchor and is stretched; the last one follows and is cover-cropped,
+/// which is what the reference node does with each.
+pub fn fit_to_canvas(
+    rgb: &[f32],
+    h: usize,
+    w: usize,
+    out_h: usize,
+    out_w: usize,
+    crop: bool,
+) -> Vec<f32> {
+    // Cover-crop picks the largest centred rectangle of the source with
+    // the target's aspect; a stretch takes the whole thing.
+    let (sx0, sy0, sw, sh) = if crop {
+        let (tw, th) = (out_w as f64, out_h as f64);
+        let scale = (w as f64 / tw).min(h as f64 / th);
+        let (cw, ch) = ((tw * scale).round() as usize, (th * scale).round() as usize);
+        ((w - cw) / 2, (h - ch) / 2, cw.max(1), ch.max(1))
+    } else {
+        (0, 0, w, h)
+    };
+    let mut out = vec![0f32; 3 * out_h * out_w];
+    for c in 0..3 {
+        for y in 0..out_h {
+            let sy = ((y as f64 + 0.5) * sh as f64 / out_h as f64 - 0.5).max(0.0);
+            let y0 = sy.floor() as usize;
+            let y1 = (y0 + 1).min(sh - 1);
+            let fy = (sy - y0 as f64) as f32;
+            for x in 0..out_w {
+                let sx = ((x as f64 + 0.5) * sw as f64 / out_w as f64 - 0.5).max(0.0);
+                let x0 = sx.floor() as usize;
+                let x1 = (x0 + 1).min(sw - 1);
+                let fx = (sx - x0 as f64) as f32;
+                let p = |yy: usize, xx: usize| rgb[(c * h + sy0 + yy) * w + sx0 + xx];
+                let top = p(y0, x0) * (1.0 - fx) + p(y0, x1) * fx;
+                let bot = p(y1, x0) * (1.0 - fx) + p(y1, x1) * fx;
+                out[(c * out_h + y) * out_w + x] = top * (1.0 - fy) + bot * fy;
+            }
+        }
+    }
+    out
+}
+
+impl Default for AnimParams {
+    fn default() -> Self {
+        Self {
+            width: 512,
+            height: 288,
+            frames: 39,
+            steps: 4,
+            seed: 42,
+            stock_sampler: false,
+            max_tokens: 512,
+            first_frame: None,
+            last_frame: None,
+            mid_frames: Vec::new(),
+            lora: None,
+            lora_strength: 1.0,
+            upscale: None,
+            upscale_by: 2.0,
+            stream_chunk: 0,
+            stream_sink: 2,
+            stream_window: 2,
+        }
+    }
+}
+
+/// The rendered result: RGB in [0, 1] as `[3, frames, h, w]`, and
+/// stereo f32 in [-1, 1] as `[2, samples]`.
+pub struct Anim {
+    pub rgb: Vec<f32>,
+    pub frames: usize,
+    pub height: usize,
+    pub width: usize,
+    pub audio: Vec<f32>,
+    pub samples: usize,
+    pub sample_rate: usize,
+}
+
+/// Frame counts snap UP to 17k+5 — the grid the temporal VAE and the
+/// DiT's frame-span pattern agree on.
+pub fn align_frames(n: usize) -> usize {
+    let mut n = n.max(5);
+    while n % 17 != 5 {
+        n += 1;
+    }
+    n
+}
+
+pub fn video_latent_t(frames: usize) -> usize {
+    if frames <= 5 {
+        2
+    } else {
+        (frames - 5) / 17 * 5 + 2
+    }
+}
+
+/// `(frames, latent_t, audio_t)` for a requested length.
+pub fn temporal_shape(len: usize) -> (usize, usize, usize) {
+    let frames = align_frames(len);
+    let audio_t = ((frames as f64 / FPS as f64) * AUDIO_LATENT_FPS as f64).round() as usize;
+    (frames, video_latent_t(frames), audio_t)
+}
+
+/// The `simple` scheduler over `ModelSamplingDiscreteFlow(shift)`: the
+/// 1000-entry sigma table sampled at even strides, terminal 0 appended.
+pub fn sigmas(steps: usize, shift: f64) -> Vec<f64> {
+    let table = 1000usize;
+    let mut out: Vec<f64> = (0..steps)
+        .map(|x| {
+            let idx = table - 1 - x * table / steps;
+            let t = (idx + 1) as f64 / table as f64;
+            shift * t / (1.0 + (shift - 1.0) * t)
+        })
+        .collect();
+    out.push(0.0);
+    out
+}
+
+/// Shared with the DiT's condition-row noise blend.
+pub fn gauss_pub(n: usize, seed: u64) -> Vec<f32> {
+    gauss(n, seed)
+}
+
+fn gauss(n: usize, seed: u64) -> Vec<f32> {
+    let mut rng = SplitMix64::new(seed);
+    let mut u = || (rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64;
+    let mut out = Vec::with_capacity(n);
+    while out.len() < n {
+        let (a, b) = (u().max(1e-300), u());
+        let r = (-2.0 * a.ln()).sqrt();
+        let ang = 2.0 * std::f64::consts::PI * b;
+        out.push((r * ang.cos()) as f32);
+        if out.len() < n {
+            out.push((r * ang.sin()) as f32);
+        }
+    }
+    out
+}
+
+/// Text→(video, audio) from a packaged `.cmf`.
+pub fn generate(
+    path: &Path,
+    prompt: &str,
+    p: &AnimParams,
+    mut progress: impl FnMut(&str, usize, usize),
+) -> Result<Anim, String> {
+    if p.width % 32 != 0 || p.height % 32 != 0 {
+        return Err("width/height must be multiples of 32".into());
+    }
+    // The wgpu wide-GEMM arm was measured WRONG on one driver stack
+    // (RTX PRO 6000: step-1 velocity rms off, step-2 NaN) and byte-
+    // healthy on another (2×RTX 5090, coop and plain arms within 0.5%
+    // of each other and 3.5% of the host render). Trust is therefore
+    // PER-STACK, decided by a parity probe on this file's own first
+    // qkv weight at DiT-scale activations — not by a hardcoded verdict
+    // either way. CMF_MMH3_GPU=1/0 still forces.
+    let use_gpu = match std::env::var("CMF_MMH3_GPU").ok().as_deref() {
+        Some("1") => true,
+        Some("0") => false,
+        _ => mmh3_gpu_parity_probe(path).unwrap_or(false),
+    };
+    if use_gpu {
+        generate_inner(path, prompt, p, &mut progress)
+    } else {
+        crate::gpu::cpu_scope(|| generate_inner(path, prompt, p, &mut progress))
+    }
+}
+
+/// GPU-vs-host parity on the packed DiT's first attention projection:
+/// the real q4tp bytes, activations spanning the modulation range
+/// (±2000 mixed with ±2), rms gate at 1e-2 — the measured failure was
+/// ~24%, honest drift is ~1e-5, so the gate has a decade of margin on
+/// each side. Any refusal (no adapter, dtype outside the kernel) is a
+/// clean "no": the host path is never wrong, only slower.
+fn mmh3_gpu_parity_probe(path: &Path) -> Result<bool, String> {
+    let model = Arc::new(
+        cortiq_core::CmfModel::open(path).map_err(|e| format!("{}: {e}", path.display()))?,
+    );
+    // Any codec, not just q4tp: the probe's job is to check THIS file's
+    // device arm against the host, and a container packed as q8_2f has one
+    // too. Matching on dtype sent every non-q4tp build to the CPU for the
+    // whole render — measured at 357 s against 60 on the same card.
+    let Some(idx) = model
+        .tensors
+        .iter()
+        .position(|t| t.name.starts_with("dit.") && t.name.ends_with("attn.qkv_proj.weight"))
+    else {
+        tracing::info!("mmh3 GPU parity probe: no qkv weight — host path");
+        return Ok(false);
+    };
+    let entry = &model.tensors[idx];
+    let (rows, cols) = (entry.shape[0], entry.shape[1]);
+    let b = 64usize;
+    let mut xs = vec![0f32; b * cols];
+    for (i, v) in xs.iter_mut().enumerate() {
+        let base = ((i * 37 + 11) % 1009) as f32 / 1009.0 - 0.5;
+        *v = base * if i % 7 == 0 { 2000.0 } else { 2.0 };
+    }
+    let mut gpu = vec![0f32; b * rows];
+    if std::env::var("CMF_GPU_DEBUG").is_ok() {
+        eprintln!(
+            "mmh3 probe env: CMF_GPU={:?} enabled={} avail={}",
+            std::env::var("CMF_GPU").ok(),
+            crate::gpu::enabled(),
+            crate::gpu::backend_available(),
+        );
+    }
+    let qt = crate::qtensor::QTensor::from_model(&model, &entry.name.clone())?;
+    if !qt.device_matmat(&xs, b, &mut gpu) {
+        tracing::info!(
+            "mmh3 GPU parity probe: {:?} device GEMM refused ({rows}x{cols}) — host path",
+            entry.dtype
+        );
+        if std::env::var("CMF_GPU_DEBUG").is_ok() {
+            eprintln!(
+                "mmh3 probe: device GEMM refused {rows}x{cols} for {:?}",
+                entry.dtype
+            );
+        }
+        return Ok(false);
+    }
+    let host = {
+        let name = entry.name.clone();
+        let proj = crate::dit::Proj::from_model(&model, &name)?;
+        let mut out = vec![0f32; b * rows];
+        crate::gpu::cpu_scope(|| proj.matmat(&xs, b, &mut out, None));
+        out
+    };
+    let mut num = 0f64;
+    let mut den = 0f64;
+    for (g, h) in gpu.iter().zip(&host) {
+        num += ((g - h) as f64).powi(2);
+        den += (*h as f64).powi(2);
+    }
+    let rel = (num / den.max(1e-30)).sqrt();
+    let ok = rel < 1e-2;
+    tracing::info!(
+        "mmh3 GPU parity probe: rel rms {rel:.2e} → {}",
+        if ok { "device" } else { "host" }
+    );
+    if std::env::var("CMF_GPU_DEBUG").is_ok() {
+        eprintln!("mmh3 GPU parity probe: rel rms {rel:.2e}");
+    }
+    Ok(ok)
+}
+
+fn generate_inner(
+    path: &Path,
+    prompt: &str,
+    p: &AnimParams,
+    progress: &mut dyn FnMut(&str, usize, usize),
+) -> Result<Anim, String> {
+    let model = Arc::new(
+        cortiq_core::CmfModel::open(path).map_err(|e| format!("{}: {e}", path.display()))?,
+    );
+    let (frames_total, latent_t, audio_t) = temporal_shape(p.frames);
+    let (lat_h, lat_w) = (p.height / 16, p.width / 16);
+
+    // ── prompt ──
+    // The H3 presentation is raw text: no chat template, no BOS, no
+    // special tokens at all.
+    // Stage clock. Half of a render is not the DiT — at 8 steps the
+    // denoiser is 63 s of 116 — and until this line existed there was
+    // no way to see which half anything went to.
+    let t_stage = std::time::Instant::now();
+    let mut marks: Vec<(&str, f32)> = Vec::new();
+    let lap = |marks: &mut Vec<(&'static str, f32)>, name: &'static str| {
+        let prev: f32 = marks.iter().map(|(_, v)| v).sum();
+        marks.push((name, t_stage.elapsed().as_secs_f32() - prev));
+    };
+    let vocab = model
+        .vocab
+        .as_deref()
+        .ok_or("packaged .cmf has no embedded tokenizer")?;
+    let tok = Tokenizer::from_bytes(vocab).map_err(|e| format!("tokenizer: {e}"))?;
+    // fl2va: every keyframe is presented as "<Picture i>: " and a
+    // vision block BEFORE the prompt, and separately conditions the DiT
+    // as a latent. Both halves come from the same picture.
+    let mut keyframes: Vec<(&(Vec<f32>, usize, usize), usize)> = p
+        .first_frame
+        .iter()
+        .map(|f| (f, 0usize))
+        .chain(
+            p.mid_frames
+                .iter()
+                .map(|(f, i)| (f, (*i).min(frames_total - 1))),
+        )
+        .chain(p.last_frame.iter().map(|f| (f, frames_total - 1)))
+        .collect();
+    // Condition rows are placed by time coordinate, so they have to arrive
+    // in time order and only once per frame — two references pinned to the
+    // same pixel index would be two rows claiming one moment.
+    keyframes.sort_by_key(|(_, i)| *i);
+    keyframes.dedup_by_key(|(_, i)| *i);
+    let mut ids: Vec<u32> = Vec::new();
+    let mut spans: Vec<ImageSpan> = Vec::new();
+    let mut embeds: Vec<Vec<f32>> = Vec::new();
+    let mut deepstack: Vec<Vec<f32>> = Vec::new();
+    let mut cond: Vec<Vec<f32>> = Vec::new();
+    let mut tags: Vec<u8> = Vec::new();
+
+    if !keyframes.is_empty() {
+        let tower = VisionTower::from_cmf(&model)?;
+        // An activation harvest (CMF_TE_ONLY) never denoises, and the
+        // VAE latent is the DiT's food alone — the frame's 3-D conv
+        // encode is 99.5 s of a 102.5 s M4 run. Skip it.
+        let te_only = std::env::var("CMF_TE_ONLY").as_deref() == Ok("1");
+        let venc = if te_only {
+            None
+        } else {
+            Some(VideoVaeEncoder::from_cmf(&model)?)
+        };
+        for (i, (frame, _)) in keyframes.iter().enumerate() {
+            let (src, sh, sw) = *frame;
+            // The picture the DiT sees is on the generation canvas; the
+            // one Qwen sees keeps its own resolution policy.
+            let fitted = fit_to_canvas(src, *sh, *sw, p.height, p.width, i > 0);
+            if let Some(venc) = &venc {
+                let (z, _, _) = venc.encode_frame(
+                    &fitted.iter().map(|&v| v * 2.0 - 1.0).collect::<Vec<_>>(),
+                    p.height,
+                    p.width,
+                );
+                cond.push(z);
+            }
+
+            for t in tok.encode(&format!("<Picture {}>: ", i + 1)) {
+                ids.push(t);
+                tags.push(1);
+            }
+            let (patches, gh, gw) = qwen3vis::preprocess(
+                &fitted,
+                p.height,
+                p.width,
+                tower.patch_size,
+                tower.temporal_patch,
+                tower.merge,
+            );
+            let (merged, deep) = tower.forward(&patches, gh, gw);
+            let n_img = merged.len() / tower.out_hidden;
+            // The whole block carries the VIDEO tag, the flanking
+            // markers included.
+            ids.push(VISION_START);
+            tags.push(0);
+            let start = ids.len();
+            for _ in 0..n_img {
+                ids.push(VISION_START); // a placeholder the embed replaces
+                tags.push(0);
+            }
+            ids.push(VISION_END);
+            tags.push(0);
+            spans.push(ImageSpan {
+                start,
+                len: n_img,
+                merged_h: gh / tower.merge,
+                merged_w: gw / tower.merge,
+            });
+            embeds.push(merged);
+            if deepstack.is_empty() {
+                deepstack = deep;
+            } else {
+                for (a, b) in deepstack.iter_mut().zip(deep) {
+                    a.extend_from_slice(&b);
+                }
+            }
+        }
+    }
+    for t in tok.encode(prompt) {
+        ids.push(t);
+        tags.push(1);
+    }
+    if ids.is_empty() {
+        ids.push(151643); // the pad id, as the reference does for ""
+        tags.push(1);
+    }
+    ids.truncate(p.max_tokens);
+    tags.truncate(ids.len());
+    lap(&mut marks, "prepare");
+    // The prompt encoder is a one-shot pass over 12 GB of weights; on a
+    // machine the file does not fit it streams from disk and its GEMMs
+    // run over any contention budget for reasons that are not contention.
+    // The kill stays disarmed until the encode is done (users on 24 GB
+    // Macs had to patch it out to keep the denoise loop on the GPU).
+    crate::gpu::mm_kill_arm(false);
+    progress("encode", 0, 1);
+    let states = {
+        let enc = Qwen3Encoder::from_cmf(&model)?;
+        enc.encode_with_images(&ids, &spans, &embeds, &deepstack)
+    };
+    // `CMF_TE_DUMP=<path>`: the conditioning as `[u64 n][u64 width]`
+    // then f32 rows. A stand-in encoder is only as good as the stream
+    // it hands the DiT, and that is measurable against the teacher's
+    // dump on the same prompt WITHOUT rendering a frame.
+    if let Ok(p) = std::env::var("CMF_TE_DUMP") {
+        let w = states.len() / ids.len().max(1);
+        let mut b = Vec::with_capacity(16 + states.len() * 4);
+        b.extend_from_slice(&(ids.len() as u64).to_le_bytes());
+        b.extend_from_slice(&(w as u64).to_le_bytes());
+        for v in &states {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        std::fs::write(&p, &b).map_err(|e| format!("CMF_TE_DUMP {p}: {e}"))?;
+        eprintln!("te dump: {} tokens x {w} -> {p}", ids.len());
+    }
+    progress("encode", 1, 1);
+    lap(&mut marks, "text encode");
+    crate::gpu::mm_kill_arm(true);
+    // `CMF_TE_ONLY=1`: stop after the dump — an activation-harvest run
+    // (the ClipProj refit) wants hundreds of encodes and zero renders.
+    if std::env::var("CMF_TE_ONLY").as_deref() == Ok("1") {
+        return Err("CMF_TE_ONLY: encode dumped, render skipped".into());
+    }
+    // The prompt encoder and vision tower ran their once-per-generation
+    // pass; release their page cache so the denoise loop's DiT does not
+    // fight 12+ GB of dead weights for RAM. On a 24 GB Mac with the
+    // 25.7 GB full-encoder fl2va file this is the difference between
+    // denoise steps at DiT speed and 320 s/step of SSD thrash.
+    {
+        let dropped = model.advise_done(|n| n.starts_with("model.") || n.starts_with("vis."));
+        if dropped > 0 {
+            tracing::info!(
+                "encoder pages released after prompt encode: {} MB",
+                dropped / (1024 * 1024)
+            );
+        }
+    }
+
+    // ── denoise ──
+    let (mut video, audio) = {
+        // The adapter is read here, after the encoder's pages are gone:
+        // a rank-32 file for this DiT is 130 MB of f32 once expanded and
+        // there is no reason for it to share a peak with 12 GB of text
+        // tower on a 24 GB machine.
+        let bank = match p.lora.as_deref() {
+            None => None,
+            Some(path) => {
+                let k =
+                    crate::ltxlora::LoraBank::load(std::path::Path::new(path), p.lora_strength)?;
+                Some(k)
+            }
+        };
+        let dit = MiniMaxH3::from_cmf_lora(&model, bank.as_ref())?;
+        if let Some(k) = &bank {
+            let bound = dit.lora_bound();
+            // Say what did NOT land. An adaLN branch on a curve-form
+            // pack is the one real gap, and a user who sees "applied"
+            // while half the adapter sat out has been lied to.
+            let mut skipped: std::collections::BTreeMap<String, usize> = Default::default();
+            for name in k.keys() {
+                if !dit.lora_binds(name) {
+                    let fam = name
+                        .rsplit_once('.')
+                        .map(|(_, t)| {
+                            let head = name.split('.').next().unwrap_or("");
+                            format!("{head}…{t}")
+                        })
+                        .unwrap_or_else(|| name.to_string());
+                    *skipped.entry(fam).or_default() += 1;
+                }
+            }
+            let tail = if skipped.is_empty() {
+                String::new()
+            } else {
+                let parts: Vec<String> = skipped.iter().map(|(k, v)| format!("{k} ×{v}")).collect();
+                format!("; not applied: {}", parts.join(", "))
+            };
+            tracing::info!(
+                "lora: rank {}, {} branches, {} bound at strength {}{}",
+                k.rank(),
+                k.len(),
+                bound,
+                p.lora_strength,
+                tail
+            );
+            println!(
+                "lora: rank {}, {}/{} branches bound{}",
+                k.rank(),
+                bound,
+                k.len(),
+                tail
+            );
+        }
+        let kf: Vec<(usize, usize)> = keyframes
+            .iter()
+            .map(|&(_, idx)| (idx, frames_total))
+            .collect();
+        let layout = if kf.is_empty() {
+            Layout::t2va(ids.len(), latent_t, lat_h, lat_w, audio_t)
+        } else {
+            Layout::fl2va(ids.len(), latent_t, lat_h, lat_w, audio_t, &kf, &tags)
+        };
+        let text = dit.refine_text(&states, ids.len());
+        let mut v = gauss(dit.latents_dim * latent_t * lat_h * lat_w, p.seed);
+        let mut a = gauss(dit.audio_dim * 2 * audio_t, p.seed ^ 0x9E37_79B9_7F4A_7C15);
+        let sg = sigmas(p.steps, dit.shift_video);
+        let mut return_streaming: Option<(Vec<f32>, Vec<f32>)> = None;
+        // `CMF_ANIM_PROF=1`: the per-step rms of both streams and of
+        // their velocities. A run that is not denoising shows it here
+        // long before anything is written out.
+        let prof = std::env::var_os("CMF_ANIM_PROF").is_some();
+        let rms = |x: &[f32]| {
+            (x.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / x.len() as f64).sqrt()
+        };
+        if prof {
+            eprintln!(
+                "  text {} tok, refined rms {:.4}, sigmas {:?}",
+                ids.len(),
+                rms(&text),
+                sg.iter()
+                    .map(|v| (v * 1e4).round() / 1e4)
+                    .collect::<Vec<_>>()
+            );
+        }
+        // ── chunk-causal rollout ──
+        //
+        // Each chunk is denoised while seeing only the text, `sink` chunks
+        // from the start and a sliding `window` of recent ones, and it is
+        // conditioned on their finished frames at timestep 0 — the
+        // protocol a streaming adapter is trained for. The reference keeps
+        // that context in a KV cache; not packing the rows a chunk may not
+        // see produces the same attention pattern, and the cache is then
+        // an optimization of this rather than a prerequisite.
+        if p.stream_chunk > 0 && cond.is_empty() {
+            let hw = lat_h * lat_w / 4 * 4; // frame element count is c·h·w below
+            let _ = hw;
+            let vc = dit.latents_dim;
+            let ac = dit.audio_dim;
+            let vframe = lat_h * lat_w; // per channel, per latent frame
+            let mut chunks: Vec<std::ops::Range<usize>> = (0..latent_t)
+                .step_by(p.stream_chunk)
+                .map(|s| s..(s + p.stream_chunk).min(latent_t))
+                .collect();
+            // A tail shorter than half a chunk joins the one before it. A
+            // two-frame chunk with four frames of context is the one shape
+            // that reliably wandered off — a different street in the last
+            // half second — and it is an artefact of the arithmetic, not
+            // something anyone asked for.
+            if chunks.len() > 1 {
+                let tail = chunks[chunks.len() - 1].clone();
+                if tail.len() < p.stream_chunk.div_ceil(2) {
+                    chunks.pop();
+                    let last = chunks.len() - 1;
+                    chunks[last].end = tail.end;
+                }
+            }
+            // The audio grid runs at its own rate; split it in the same
+            // proportion so a chunk's sound is the sound of its frames.
+            let a_bound = |k: usize| (k * audio_t).div_ceil(latent_t.max(1));
+            let mut v_out = vec![0f32; v.len()];
+            let mut a_out = vec![0f32; a.len()];
+            let gather_v = |src: &[f32], idx: &[usize]| -> Vec<f32> {
+                let mut out = vec![0f32; vc * idx.len() * vframe];
+                for ci in 0..vc {
+                    for (n, &k) in idx.iter().enumerate() {
+                        let s = (ci * latent_t + k) * vframe;
+                        let d = (ci * idx.len() + n) * vframe;
+                        out[d..d + vframe].copy_from_slice(&src[s..s + vframe]);
+                    }
+                }
+                out
+            };
+            let gather_a = |src: &[f32], idx: &[usize]| -> Vec<f32> {
+                let mut out = vec![0f32; ac * 2 * idx.len()];
+                for ci in 0..ac {
+                    for ch in 0..2 {
+                        for (n, &i) in idx.iter().enumerate() {
+                            out[(ci * 2 + ch) * idx.len() + n] = src[(ci * 2 + ch) * audio_t + i];
+                        }
+                    }
+                }
+                out
+            };
+            for (ci_, cur) in chunks.iter().enumerate() {
+                // The sink and the window are counted in LATENT FRAMES, the
+                // unit the reference's KV cache holds: two frames pinned at
+                // the start and two trailing the current chunk, not two whole
+                // chunks of each. Counting them in chunks made a chunk attend
+                // to four chunks' worth of rows — which is both slower than
+                // the bidirectional path it replaces and not the pattern the
+                // adapter trained. `CMF_STREAM_UNIT=chunks` keeps the old
+                // reading for comparison.
+                let by_chunk = std::env::var("CMF_STREAM_UNIT").as_deref() == Ok("chunks");
+                let ctx_v: Vec<usize> = if by_chunk {
+                    let mut vis: Vec<usize> = (0..p.stream_sink.min(ci_)).collect();
+                    for j in ci_.saturating_sub(p.stream_window)..ci_ {
+                        if !vis.contains(&j) {
+                            vis.push(j);
+                        }
+                    }
+                    vis.sort_unstable();
+                    vis.iter().flat_map(|&j| chunks[j].clone()).collect()
+                } else {
+                    let done = cur.start; // every frame finished so far
+                    let mut f: Vec<usize> = (0..p.stream_sink.min(done)).collect();
+                    for k in done.saturating_sub(p.stream_window)..done {
+                        if !f.contains(&k) {
+                            f.push(k);
+                        }
+                    }
+                    f.sort_unstable();
+                    f
+                };
+                let cur_v: Vec<usize> = cur.clone().collect();
+                // Audio rows follow the video frames they belong to.
+                let mut ctx_a: Vec<usize> = Vec::new();
+                for &k in &ctx_v {
+                    for i in a_bound(k)..a_bound(k + 1) {
+                        if !ctx_a.contains(&i) {
+                            ctx_a.push(i);
+                        }
+                    }
+                }
+                ctx_a.sort_unstable();
+                let cur_a: Vec<usize> = (a_bound(cur.start)..a_bound(cur.end)).collect();
+                let clay = Layout::streaming(
+                    ids.len(),
+                    &tags,
+                    lat_h,
+                    lat_w,
+                    &ctx_v,
+                    &cur_v,
+                    &ctx_a,
+                    &cur_a,
+                );
+                let ctx_vx = gather_v(&v_out, &ctx_v);
+                let ctx_ax = gather_a(&a_out, &ctx_a);
+                let mut xv = gather_v(&v, &cur_v);
+                let mut xa = gather_a(&a, &cur_a);
+                for i in 0..p.steps {
+                    let (sv, sv_n) = (sg[i], sg[i + 1]);
+                    // [context frames | current frames], the order the
+                    // layout lays its rows out in.
+                    let mut vin = vec![0f32; vc * (ctx_v.len() + cur_v.len()) * vframe];
+                    let mut ain = vec![0f32; ac * 2 * (ctx_a.len() + cur_a.len())];
+                    let (nc, nk) = (ctx_v.len(), cur_v.len());
+                    for c in 0..vc {
+                        let d = c * (nc + nk) * vframe;
+                        vin[d..d + nc * vframe]
+                            .copy_from_slice(&ctx_vx[c * nc * vframe..(c + 1) * nc * vframe]);
+                        vin[d + nc * vframe..d + (nc + nk) * vframe]
+                            .copy_from_slice(&xv[c * nk * vframe..(c + 1) * nk * vframe]);
+                    }
+                    let (mc, mk) = (ctx_a.len(), cur_a.len());
+                    for c in 0..ac {
+                        for ch in 0..2 {
+                            let d = (c * 2 + ch) * (mc + mk);
+                            ain[d..d + mc]
+                                .copy_from_slice(&ctx_ax[(c * 2 + ch) * mc..(c * 2 + ch + 1) * mc]);
+                            ain[d + mc..d + mc + mk]
+                                .copy_from_slice(&xa[(c * 2 + ch) * mk..(c * 2 + ch + 1) * mk]);
+                        }
+                    }
+                    let (dv, da) = dit.forward(&clay, &text, &vin, &ain, sv, &[]);
+                    let step_v = (sv_n - sv) as f32;
+                    for (x, &d) in xv.iter_mut().zip(&dv) {
+                        *x += step_v * d;
+                    }
+                    let step_a = if p.stock_sampler {
+                        step_v
+                    } else {
+                        (time_shift_sigma(sv_n, dit.shift_video, dit.shift_audio)
+                            - time_shift_sigma(sv.max(1e-6), dit.shift_video, dit.shift_audio))
+                            as f32
+                    };
+                    for (x, &d) in xa.iter_mut().zip(&da) {
+                        *x += step_a * d;
+                    }
+                }
+                for c in 0..vc {
+                    for (n, &k) in cur_v.iter().enumerate() {
+                        let d = (c * latent_t + k) * vframe;
+                        let s = (c * cur_v.len() + n) * vframe;
+                        v_out[d..d + vframe].copy_from_slice(&xv[s..s + vframe]);
+                    }
+                }
+                for c in 0..ac {
+                    for ch in 0..2 {
+                        for (n, &i) in cur_a.iter().enumerate() {
+                            a_out[(c * 2 + ch) * audio_t + i] = xa[(c * 2 + ch) * cur_a.len() + n];
+                        }
+                    }
+                }
+                progress("stream", ci_ + 1, chunks.len());
+            }
+            if let Some(rep) = dit.lora_report() {
+                eprint!("{rep}");
+            }
+            return_streaming = Some((v_out, a_out));
+        }
+
+        for i in 0..p.steps {
+            if return_streaming.is_some() {
+                break;
+            }
+            let (sv, sv_n) = (sg[i], sg[i + 1]);
+            let (dv, da) = dit.forward(&layout, &text, &v, &a, sv, &cond);
+            let step_v = (sv_n - sv) as f32;
+            for (x, &d) in v.iter_mut().zip(&dv) {
+                *x += step_v * d;
+            }
+            let step_a = if p.stock_sampler {
+                step_v
+            } else {
+                (time_shift_sigma(sv_n, dit.shift_video, dit.shift_audio)
+                    - time_shift_sigma(sv.max(1e-6), dit.shift_video, dit.shift_audio))
+                    as f32
+            };
+            for (x, &d) in a.iter_mut().zip(&da) {
+                *x += step_a * d;
+            }
+            if prof {
+                eprintln!(
+                    "  step {i}: sv {sv:.4}->{sv_n:.4} v_vel {:.4} a_vel {:.4} | video {:.4} audio {:.4}",
+                    rms(&dv),
+                    rms(&da),
+                    rms(&v),
+                    rms(&a)
+                );
+            }
+            progress("denoise", i + 1, p.steps);
+        }
+        if let Some(rep) = dit.lora_report() {
+            eprint!("{rep}");
+        }
+        match return_streaming {
+            Some(pair) => pair,
+            None => (v, a),
+        }
+    };
+
+    lap(&mut marks, "denoise");
+
+    // ── the learned latent resize, when one was handed in ──
+    let (mut out_h, mut out_w) = (p.height, p.width);
+    let (mut lat_h, mut lat_w) = (lat_h, lat_w);
+    if let Some(path) = p.upscale.as_deref() {
+        progress("upscale", 0, 1);
+        let t = std::time::Instant::now();
+        let ups = crate::mmh3ups::LatentUpscaler::load(std::path::Path::new(path))?;
+        let z = crate::mmh3ups::Vol {
+            c: video.len() / (latent_t * lat_h * lat_w),
+            t: latent_t,
+            h: lat_h,
+            w: lat_w,
+            data: video,
+        };
+        // Snap to the VAE's own 16-pixel grid: the net takes any target,
+        // the decoder does not.
+        let f = p.upscale_by.max(1.0);
+        let nh = ((lat_h as f32 * f).round() as usize).max(lat_h);
+        let nw = ((lat_w as f32 * f).round() as usize).max(lat_w);
+        let big = ups.upscale(&z, nh, nw, None);
+        tracing::info!(
+            "latent upscale {}x{} -> {}x{} in {:.1}s",
+            lat_h,
+            lat_w,
+            nh,
+            nw,
+            t.elapsed().as_secs_f64()
+        );
+        out_h = out_h * nh / lat_h;
+        out_w = out_w * nw / lat_w;
+        lat_h = nh;
+        lat_w = nw;
+        video = big.data;
+        progress("upscale", 1, 1);
+        lap(&mut marks, "upscale");
+    }
+
+    // ── decode ──
+    progress("video vae", 0, 1);
+    let (rgb, out_frames) = {
+        let vae = VideoVae::from_cmf(&model)?;
+        vae.decode(&video, latent_t, lat_h, lat_w)
+    };
+    progress("video vae", 1, 1);
+    lap(&mut marks, "video vae");
+    progress("audio vae", 0, 1);
+    let (wave, samples, sr) = {
+        let vae = AudioVae::from_cmf(&model)?;
+        let c = audio.len() / (2 * audio_t);
+        let (w, n) = vae.decode(&audio, c, audio_t);
+        (w, n, vae.sample_rate)
+    };
+    progress("audio vae", 1, 1);
+    lap(&mut marks, "audio vae");
+    tracing::info!(
+        "stages: {}",
+        marks
+            .iter()
+            .map(|(n, v)| format!("{n} {v:.1}s"))
+            .collect::<Vec<_>>()
+            .join(" · ")
+    );
+    // Where a GEMM's wall time goes on unified memory: copies or kernel.
+    // The answer decides whether fusing blocks or tuning the kernel is
+    // the optimization worth doing.
+    #[cfg(target_os = "macos")]
+    if std::env::var("CMF_METAL_MMPROF").is_ok() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let n = crate::gpu_metal::MM_N.load(Relaxed);
+        eprintln!(
+            "  q4tp mm x{n}: upload {:.1}s · submit+wait {:.1}s · readback {:.1}s",
+            crate::gpu_metal::MM_UP.load(Relaxed) as f64 / 1e6,
+            crate::gpu_metal::MM_GPU.load(Relaxed) as f64 / 1e6,
+            crate::gpu_metal::MM_DN.load(Relaxed) as f64 / 1e6,
+        );
+    }
+
+    // The VAE emits latent_t·4 frames; the request snapped to 17k+5,
+    // which is one fewer than a multiple of four plus the leading key
+    // frame, so trim rather than pad.
+    let keep = out_frames.min(frames_total);
+    Ok(Anim {
+        rgb: trim_frames(&rgb, out_frames, keep, out_h, out_w),
+        frames: keep,
+        height: out_h,
+        width: out_w,
+        audio: wave,
+        samples,
+        sample_rate: sr,
+    })
+}
+
+fn trim_frames(rgb: &[f32], have: usize, keep: usize, h: usize, w: usize) -> Vec<f32> {
+    if keep == have {
+        return rgb.to_vec();
+    }
+    let mut out = vec![0f32; 3 * keep * h * w];
+    for c in 0..3 {
+        let s = c * have * h * w;
+        let d = c * keep * h * w;
+        out[d..d + keep * h * w].copy_from_slice(&rgb[s..s + keep * h * w]);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_four_step_schedule_is_the_references() {
+        let s = sigmas(4, 12.0);
+        let want = [1.0, 0.972_973, 0.923_077, 0.8, 0.0];
+        assert_eq!(s.len(), want.len());
+        for (g, w) in s.iter().zip(&want) {
+            assert!((g - w).abs() < 1e-6, "{s:?}");
+        }
+    }
+
+    #[test]
+    fn a_stretch_keeps_the_corners_and_a_crop_takes_the_middle() {
+        // A 4x2 ramp: value rises left to right, so the corners name
+        // themselves.
+        let (h, w) = (2usize, 4usize);
+        let mut rgb = vec![0f32; 3 * h * w];
+        for c in 0..3 {
+            for y in 0..h {
+                for x in 0..w {
+                    rgb[(c * h + y) * w + x] = x as f32 / (w - 1) as f32;
+                }
+            }
+        }
+        // Stretch to a square: the far edges survive.
+        let s = fit_to_canvas(&rgb, h, w, 4, 4, false);
+        assert!((s[0] - 0.0).abs() < 1e-6, "left edge");
+        assert!((s[3] - 1.0).abs() < 1e-6, "right edge");
+        // Cover-crop to a square takes the centre 2x2, so the extremes
+        // are gone and the span is narrower.
+        let c = fit_to_canvas(&rgb, h, w, 4, 4, true);
+        let (lo, hi) = c[..16]
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
+        assert!(lo > 0.05, "crop kept the left edge: {lo}");
+        assert!(hi < 0.95, "crop kept the right edge: {hi}");
+    }
+
+    #[test]
+    fn frame_counts_snap_to_the_models_grid() {
+        // The grid is 5 + 17k: 5, 22, 39, 56, … 124.
+        assert_eq!(align_frames(1), 5);
+        assert_eq!(align_frames(39), 39);
+        assert_eq!(align_frames(41), 56);
+        assert_eq!(align_frames(124), 124);
+        assert_eq!(video_latent_t(124), 37);
+        assert_eq!(video_latent_t(39), 12);
+        let (f, lt, at) = temporal_shape(124);
+        assert_eq!((f, lt, at), (124, 37, 207));
+    }
+}

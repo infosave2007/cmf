@@ -1,0 +1,22 @@
+[package]
+name = "cortiq-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "C ABI for embedding the CMF runtime in native apps (Android/iOS/desktop)"
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[features]
+# Vulkan/DX12 via wgpu inside the embedded runtime (Mali/Adreno on
+# Android). The runtime probe still decides GPU-vs-CPU per op class.
+gpu = ["cortiq-engine/gpu"]
+
+[dependencies]
+cortiq-core = { path = "../cortiq-core", version = "0.6.6" }
+cortiq-engine = { path = "../cortiq-engine", version = "0.6.6" }
+cortiq-net = { path = "../cortiq-net", version = "0.6.6" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

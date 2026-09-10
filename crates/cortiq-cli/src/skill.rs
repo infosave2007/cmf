@@ -1,0 +1,1634 @@
+//! `cortiq skill` — bake, list and route-fit swarm skills (spec §9).
+//!
+//! A skill is a set of full-shape replacement tensors appended to the
+//! container (`skill.{id}.{tensor}`), plus a registry record with the
+//! recon-argmin selection subspace and the honest quality contract.
+//! `skill add` grafts them from a REAL donor checkpoint of the same
+//! architecture (any HF repo or local dir): the donor's chosen tensors
+//! are quantized with the backbone's own per-tensor encoding and the
+//! file is rewritten append-style — backbone bytes never change,
+//! storage scales as |backbone| + Σ|deltas|.
+
+use crate::convert::{
+    Quant, canon_name, hf_download, looks_like_repo, open_model, parse_quant, quantize_2d, to_f32,
+};
+use anyhow::Context as _;
+use base64::Engine as _;
+use cortiq_core::mask::{MaskCatalog, MaskPriority, TaskMask};
+use cortiq_core::quant::f32_to_f16;
+use cortiq_core::{
+    CmfModel, SelectionDescriptor, SkillRecord, TensorDtype, TensorEntry, TensorSpec,
+};
+use cortiq_engine::{Pipeline, SamplerConfig};
+use std::path::Path;
+use std::sync::Arc;
+
+/// Bitfield bytes for `n` attention heads.
+fn nh_bytes(n: usize) -> usize {
+    n.div_ceil(8)
+}
+
+/// Which tensor families a skill replaces.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Families {
+    Ffn,
+    Attn,
+    All,
+}
+
+impl Families {
+    pub fn parse(s: &str) -> anyhow::Result<Self> {
+        Ok(match s {
+            "ffn" => Self::Ffn,
+            "attn" => Self::Attn,
+            "all" => Self::All,
+            other => anyhow::bail!("unknown --tensors '{other}' (ffn | attn | all)"),
+        })
+    }
+
+    fn suffixes(self) -> &'static [&'static str] {
+        const FFN: &[&str] = &[
+            "mlp.gate_proj.weight",
+            "mlp.up_proj.weight",
+            "mlp.down_proj.weight",
+        ];
+        const ATTN: &[&str] = &[
+            "self_attn.q_proj.weight",
+            "self_attn.k_proj.weight",
+            "self_attn.v_proj.weight",
+            "self_attn.o_proj.weight",
+        ];
+        const ALL: &[&str] = &[
+            "mlp.gate_proj.weight",
+            "mlp.up_proj.weight",
+            "mlp.down_proj.weight",
+            "self_attn.q_proj.weight",
+            "self_attn.k_proj.weight",
+            "self_attn.v_proj.weight",
+            "self_attn.o_proj.weight",
+        ];
+        match self {
+            Self::Ffn => FFN,
+            Self::Attn => ATTN,
+            Self::All => ALL,
+        }
+    }
+}
+
+/// Parse `--layers`: `all`, `A-B`, or `i,j,k`.
+pub fn parse_layers(spec: &str, num_layers: usize) -> anyhow::Result<Vec<usize>> {
+    if spec == "all" {
+        return Ok((0..num_layers).collect());
+    }
+    if let Some((a, b)) = spec.split_once('-') {
+        let (a, b): (usize, usize) = (a.trim().parse()?, b.trim().parse()?);
+        anyhow::ensure!(
+            a <= b && b < num_layers,
+            "--layers {spec}: out of 0..{num_layers}"
+        );
+        return Ok((a..=b).collect());
+    }
+    let mut v = Vec::new();
+    for part in spec.split(',') {
+        let i: usize = part.trim().parse()?;
+        anyhow::ensure!(
+            i < num_layers,
+            "--layers {spec}: layer {i} out of 0..{num_layers}"
+        );
+        v.push(i);
+    }
+    anyhow::ensure!(!v.is_empty(), "--layers {spec}: empty");
+    Ok(v)
+}
+
+fn b64_f16(v: &[f32]) -> String {
+    let mut bytes = Vec::with_capacity(v.len() * 2);
+    for &x in v {
+        bytes.extend_from_slice(&f32_to_f16(x).to_le_bytes());
+    }
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// Fit the recon-argmin selection subspace from example prompts: the
+/// φ(x) mean plus a rank-K PCA basis (power iteration + deflation) of
+/// the centered φ cloud. Rank is clamped to N−1 — with one prompt the
+/// subspace degenerates to pure distance-to-mean, which still routes.
+fn fit_selection(
+    pipeline: &mut Pipeline,
+    prompts: &[String],
+    phi_layer: usize,
+    rank: usize,
+) -> SelectionDescriptor {
+    let hidden = pipeline.hidden_size;
+    let phis: Vec<Vec<f32>> = prompts
+        .iter()
+        .map(|p| {
+            let ids = pipeline.tokenizer.encode(p);
+            pipeline.probe_phi(&ids, phi_layer)
+        })
+        .collect();
+    let n = phis.len();
+    let mut mean = vec![0f32; hidden];
+    for phi in &phis {
+        for (m, v) in mean.iter_mut().zip(phi) {
+            *m += v / n as f32;
+        }
+    }
+    let mut centered: Vec<Vec<f32>> = phis
+        .iter()
+        .map(|phi| phi.iter().zip(&mean).map(|(v, m)| v - m).collect())
+        .collect();
+    let rank = rank.min(n.saturating_sub(1)).min(8);
+    let mut basis: Vec<f32> = Vec::with_capacity(rank * hidden);
+    for _ in 0..rank {
+        // Power iteration on Σ ccᵀ (implicitly, via the N vectors).
+        let mut v = vec![1f32; hidden];
+        for _ in 0..50 {
+            let mut next = vec![0f32; hidden];
+            for c in &centered {
+                let dot: f32 = c.iter().zip(&v).map(|(a, b)| a * b).sum();
+                for (nx, cv) in next.iter_mut().zip(c) {
+                    *nx += dot * cv;
+                }
+            }
+            let norm = next.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+            for x in next.iter_mut() {
+                *x /= norm;
+            }
+            v = next;
+        }
+        // Deflate: remove the found component from every sample.
+        for c in centered.iter_mut() {
+            let dot: f32 = c.iter().zip(&v).map(|(a, b)| a * b).sum();
+            for (cv, bv) in c.iter_mut().zip(&v) {
+                *cv -= dot * bv;
+            }
+        }
+        basis.extend_from_slice(&v);
+    }
+    SelectionDescriptor {
+        metric: "mse".into(),
+        phi_layer,
+        mean: b64_f16(&mean),
+        basis: b64_f16(&basis),
+        rank,
+        err_mean: None,
+        err_std: None,
+        holdout: None,
+        holdout_n: None,
+    }
+}
+
+/// Read routing prompts without forcing one-line market windows.  Plain
+/// text keeps the historical one-prompt-per-line contract; JSONL accepts a
+/// string or an object with a `prompt`/`text` field, so structured examples
+/// can retain their embedded newlines exactly.
+fn load_prompts(path: &str) -> anyhow::Result<Vec<String>> {
+    let text = std::fs::read_to_string(path)?;
+    let jsonl = text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .is_some_and(|line| {
+            let first = line.trim_start().as_bytes().first().copied();
+            matches!(first, Some(b'{') | Some(b'"'))
+        });
+    let prompts = if jsonl {
+        text.lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let value: serde_json::Value = serde_json::from_str(line)
+                    .with_context(|| format!("{path}: invalid JSONL prompt"))?;
+                let prompt = value
+                    .as_str()
+                    .or_else(|| value.get("prompt").and_then(|v| v.as_str()))
+                    .or_else(|| value.get("text").and_then(|v| v.as_str()))
+                    .context(
+                        "JSONL prompt must be a string or contain string field 'prompt'/'text'",
+                    )?;
+                Ok(prompt.to_string())
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?
+    } else {
+        text.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(String::from)
+            .collect()
+    };
+    anyhow::ensure!(!prompts.is_empty(), "--prompts {path}: no prompts");
+    Ok(prompts)
+}
+
+fn dtype_to_quant(d: TensorDtype, weight_quant: Option<&str>) -> Option<Quant> {
+    Some(match d {
+        TensorDtype::Q8Row => Quant::Q8Row,
+        TensorDtype::Q8_2f => Quant::Q8_2f,
+        TensorDtype::Q4Block => Quant::Q4Block,
+        TensorDtype::Q4Tiled => Quant::Q4Tiled,
+        TensorDtype::Q4TiledP => Quant::Q4TiledP,
+        TensorDtype::Q2TiledP => Quant::Q2TiledP,
+        TensorDtype::F16 => Quant::F16,
+        TensorDtype::Vbit | TensorDtype::VbitRo => Quant::Vbit,
+        // q1 and q1p deliberately share the Q1 on-disk dtype.  New
+        // converters record the encoder in provenance; old files keep the
+        // conservative q1 fallback and can still request --skill-quant q1p.
+        TensorDtype::Q1 if weight_quant == Some("q1p") => Quant::Q1p,
+        TensorDtype::Q1 => Quant::Q1,
+        TensorDtype::Q1S => Quant::Q1s,
+        TensorDtype::Q1T => Quant::Q1t,
+        _ => return None,
+    })
+}
+
+/// Store a freshly trained FCD master in the two-field 8-bit codec.  Its row
+/// and column fields retain substantially more of a small coordinated update
+/// than ordinary row-Q8 at essentially the same bytes/weight.  The replica's
+/// f32 held score remains the reference; the rebuilt runtime is gated below.
+fn encode_trained_fcd(vals: &[f32], rows: usize, cols: usize) -> (TensorDtype, Vec<u8>) {
+    quantize_2d(Quant::Q8_2f, vals, rows, cols)
+}
+
+fn is_identity_keep(kept: &[usize], original: usize) -> bool {
+    kept.len() == original && kept.iter().copied().eq(0..original)
+}
+
+fn weight_quant_hint(model: &CmfModel) -> Option<&str> {
+    model
+        .header
+        .provenance
+        .as_ref()?
+        .get("weight_quant")?
+        .as_str()
+}
+
+/// PPL of a text file through an (optionally overlaid) pipeline —
+/// the claim-16 quality gate, same math as `cortiq ppl`.
+fn ppl_of(
+    model: &Arc<CmfModel>,
+    skill: Option<&str>,
+    text: &str,
+    max_tokens: usize,
+) -> anyhow::Result<f64> {
+    let mut p = Pipeline::from_model_with_skill(model, SamplerConfig::default(), skill)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let mut ids = p.tokenizer.with_bos(p.tokenizer.encode(text));
+    ids.truncate(max_tokens);
+    p.ppl_ids(&ids).map_err(|e| anyhow::anyhow!(e))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_skill_add(
+    model_path: &str,
+    from: &str,
+    id: &str,
+    name: Option<&str>,
+    layers_spec: &str,
+    families: Families,
+    prompts_file: Option<&str>,
+    phi_layer: Option<usize>,
+    rank: usize,
+    quality_file: Option<&str>,
+    quality_tokens: usize,
+    min_delta: f32,
+    skill_quant: Option<&str>,
+    mean_bits: Option<f32>,
+    sparse: Option<f32>,
+    output: Option<&str>,
+    hf_token: Option<&str>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        id.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+        "skill id must be [A-Za-z0-9_-]"
+    );
+    if let Some(k) = sparse {
+        anyhow::ensure!(
+            (0.05..=0.95).contains(&k),
+            "--sparse {k}: keep fraction must be within 0.05..=0.95"
+        );
+        anyhow::ensure!(
+            prompts_file.is_some(),
+            "--sparse needs --prompts: the DTG-MA mask is derived from the task's activations"
+        );
+    }
+    if let Some(b) = mean_bits {
+        crate::convert::set_vbit_mean_bits(b);
+    }
+    let model = Arc::new(CmfModel::open(model_path)?);
+    let num_layers = model.arch().num_layers;
+    let layers = parse_layers(layers_spec, num_layers)?;
+
+    // ── donor: local dir or HF repo (cached download) ──
+    let donor_dir = if looks_like_repo(from) && !Path::new(from).exists() {
+        hf_download(from, hf_token)?
+    } else {
+        Path::new(from).to_path_buf()
+    };
+    let shards = open_model(&donor_dir)?;
+    println!("donor: {} ({} shard(s))", donor_dir.display(), shards.len());
+
+    // ── graft: donor tensors for the chosen layers/families, quantized
+    //    with the backbone's own per-tensor encoding ──
+    let mut wanted: Vec<String> = Vec::new();
+    for &li in &layers {
+        for suf in families.suffixes() {
+            wanted.push(format!("model.layers.{li}.{suf}"));
+        }
+    }
+    let mut new_tensors: Vec<TensorSpec> = Vec::new();
+    let mut ffn_vals: Vec<(String, Vec<usize>, Vec<f32>)> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    let mut unchanged = 0usize;
+    let mut unchanged_bytes = 0u64;
+    let mut deltas: Vec<(String, f32)> = Vec::new();
+    for want in &wanted {
+        let Some(entry) = model.tensors.iter().find(|t| &t.name == want) else {
+            skipped.push(format!("{want} (not in backbone)"));
+            continue;
+        };
+        let mut found = false;
+        'shards: for sh in &shards {
+            for m in &sh.tensors {
+                if canon_name(&m.name).as_deref() != Some(want.as_str()) {
+                    continue;
+                }
+                anyhow::ensure!(
+                    m.shape == entry.shape,
+                    "{want}: donor shape {:?} != backbone {:?} — different architecture?",
+                    m.shape,
+                    entry.shape
+                );
+                let vals = to_f32(&m.dtype, sh.bytes(m))?;
+                found = true;
+                if sparse.is_some() && want.contains(".mlp.") {
+                    ffn_vals.push((want.clone(), entry.shape.clone(), vals.clone()));
+                }
+                // Delta gate: neurons the fine-tune never touched are
+                // not worth bytes. Compare the donor against the
+                // backbone through the reference decoder and drop
+                // tensors whose relative change is below --min-delta —
+                // the runtime reads the backbone entry for them, which
+                // is exactly what the donor holds there anyway.
+                if min_delta > 0.0 {
+                    let n: usize = entry.shape.iter().product();
+                    let mut base = vec![0f32; n];
+                    cortiq_core::quant::dequant_tensor(entry, model.tensor_bytes(want)?, &mut base)
+                        .map_err(|e| anyhow::anyhow!("{want}: dequant: {e}"))?;
+                    let mut dd = 0f64;
+                    let mut bb = 0f64;
+                    for (d, b) in vals.iter().zip(&base) {
+                        let diff = (d - b) as f64;
+                        dd += diff * diff;
+                        bb += (*b as f64) * (*b as f64);
+                    }
+                    let rel = (dd / bb.max(1e-30)).sqrt() as f32;
+                    deltas.push((want.clone(), rel));
+                    if rel < min_delta {
+                        unchanged += 1;
+                        unchanged_bytes += entry.nbytes;
+                        break 'shards;
+                    }
+                }
+                let (out_dim, in_dim) = (entry.shape[0], entry.shape[1]);
+                // A skill may live in a cheaper encoding than the
+                // backbone (--skill-quant, spec §3 per-tensor dtypes):
+                // the overlay is small next to the backbone, so its
+                // bytes are often better spent halved.
+                let q = match skill_quant {
+                    Some(sq) => parse_quant(sq)?,
+                    None => match dtype_to_quant(entry.dtype, weight_quant_hint(&model)) {
+                        Some(q) => q,
+                        None => {
+                            anyhow::bail!("{want}: backbone dtype {:?} unsupported", entry.dtype)
+                        }
+                    },
+                };
+                let (dtype, data) = quantize_2d(q, &vals, out_dim, in_dim);
+                new_tensors.push(TensorSpec {
+                    name: format!("skill.{id}.{want}"),
+                    dtype,
+                    shape: entry.shape.clone(),
+                    data,
+                });
+                break 'shards;
+            }
+        }
+        if !found {
+            skipped.push(format!("{want} (not in donor)"));
+        }
+    }
+    anyhow::ensure!(
+        !new_tensors.is_empty(),
+        "no matching donor tensors{} — wrong --from{}?",
+        if unchanged > 0 {
+            " above --min-delta"
+        } else {
+            ""
+        },
+        if unchanged > 0 {
+            " or threshold too high"
+        } else {
+            ""
+        }
+    );
+    if !skipped.is_empty() {
+        for s in &skipped {
+            println!("  skipped: {s}");
+        }
+    }
+    if min_delta > 0.0 && !deltas.is_empty() {
+        let mut sorted: Vec<f32> = deltas.iter().map(|(_, d)| *d).collect();
+        sorted.sort_by(f32::total_cmp);
+        println!(
+            "delta gate ≥ {min_delta}: kept {} / dropped {} unchanged tensor(s) (−{:.1} MB); \
+             rel-delta min {:.4} / median {:.4} / max {:.4}",
+            new_tensors.len(),
+            unchanged,
+            unchanged_bytes as f64 / 1e6,
+            sorted.first().unwrap(),
+            sorted[sorted.len() / 2],
+            sorted.last().unwrap()
+        );
+    }
+    // The registry's layer list reflects what is actually stored.
+    let layers: Vec<usize> = layers
+        .into_iter()
+        .filter(|li| {
+            new_tensors.iter().any(|t| {
+                t.name
+                    .strip_prefix(&format!("skill.{id}.model.layers.{li}."))
+                    .is_some()
+            })
+        })
+        .collect();
+    let delta_bytes: usize = new_tensors.iter().map(|t| t.data.len()).sum();
+    println!(
+        "skill '{id}': {} tensors over {} layer(s), +{:.1} MB",
+        new_tensors.len(),
+        layers.len(),
+        delta_bytes as f64 / 1e6
+    );
+
+    // ── selection subspace from example prompts (recon-argmin routing) ──
+    let selection = match prompts_file {
+        Some(pf) => {
+            let prompts = load_prompts(pf)?;
+            let phi_layer = phi_layer.unwrap_or(num_layers * 2 / 3);
+            let mut p = Pipeline::from_model(&model, SamplerConfig::default())
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let sel = fit_selection(&mut p, &prompts, phi_layer, rank);
+            println!(
+                "selection: φ-layer {phi_layer}, rank {} from {} prompt(s)",
+                sel.rank,
+                prompts.len()
+            );
+            Some(sel)
+        }
+        None => {
+            println!(
+                "selection: none (no --prompts) — `route`/`--route-dynamic` will skip this skill"
+            );
+            None
+        }
+    };
+
+    // ── rebuild the container: old tensors byte-for-byte + the skill ──
+    let mut tensors: Vec<TensorSpec> = Vec::with_capacity(model.tensors.len() + new_tensors.len());
+    for t in &model.tensors {
+        if t.name.starts_with(&format!("skill.{id}.")) {
+            continue; // re-baking the same id replaces its tensors
+        }
+        tensors.push(TensorSpec {
+            name: t.name.clone(),
+            dtype: t.dtype,
+            shape: t.shape.clone(),
+            data: model.tensor_bytes(&t.name)?.to_vec(),
+        });
+    }
+    tensors.extend(new_tensors);
+
+    let mut header = model.header.clone();
+    header.skills.retain(|s| s.id != id);
+    header.skills.push(SkillRecord {
+        id: id.to_string(),
+        name: name.map(String::from),
+        layers: layers.clone(),
+        selection,
+        input_mask_task: None,
+        quality: None, // measured below, on the REBUILT file
+        base_dir_hash: None,
+        base_arch: None,
+        task: None,
+        provenance: None,
+    });
+
+    let out_path = output.unwrap_or(model_path).to_string();
+    let tmp = format!("{out_path}.tmp");
+    let mut catalog = model.masks.clone();
+    CmfModel::write(
+        &tmp,
+        &header,
+        &tensors,
+        if catalog.masks.is_empty() {
+            None
+        } else {
+            Some(&catalog)
+        },
+        model.vocab.as_deref(),
+    )?;
+
+    // ── DTG-MA sparse bake (Patent 2): derive the task-guided FFN mask
+    //    from the skill's own prompts run through the OVERLAID model,
+    //    zero the dead neurons in the stored skill tensors and let vbit
+    //    water-filling sink them to its bit floor. With the mask active
+    //    the zeroed neurons are never read — mathematically identical
+    //    to the donor (a dead neuron contributes act·0). ──
+    if let Some(keep) = sparse {
+        let prompts = load_prompts(prompts_file.unwrap())?;
+        let probe_model = Arc::new(CmfModel::open(&tmp)?);
+        let mut p =
+            Pipeline::from_model_with_skill(&probe_model, SamplerConfig::default(), Some(id))
+                .map_err(|e| anyhow::anyhow!(e))?;
+        let mut mass = vec![vec![0f64; model.arch().intermediate_size]; num_layers];
+        for prompt in &prompts {
+            let ids = p.tokenizer.encode(prompt);
+            for (li, row) in p.probe_ffn_mass(&ids).into_iter().enumerate() {
+                for (a, v) in mass[li].iter_mut().zip(row) {
+                    *a += v;
+                }
+            }
+        }
+        drop(p);
+        drop(probe_model);
+        let inter = model.arch().intermediate_size;
+        let keep_n = ((inter as f32 * keep).ceil() as usize).clamp(1, inter);
+        let mut ffn_bits: Vec<Vec<u8>> = Vec::with_capacity(num_layers);
+        let mut keep_sets: Vec<Vec<bool>> = Vec::with_capacity(num_layers);
+        for row in &mass {
+            let mut order: Vec<usize> = (0..inter).collect();
+            order.sort_by(|&a, &b| row[b].total_cmp(&row[a]));
+            let mut alive = vec![false; inter];
+            for &n in order.iter().take(keep_n) {
+                alive[n] = true;
+            }
+            let mut bits = vec![0u8; inter.div_ceil(8)];
+            for (n, &a) in alive.iter().enumerate() {
+                if a {
+                    bits[n / 8] |= 1 << (n % 8);
+                }
+            }
+            keep_sets.push(alive);
+            ffn_bits.push(bits);
+        }
+        // Re-encode the skill's FFN tensors with dead neurons zeroed:
+        // gate/up rows and down columns. vbit gives zero rows its bit
+        // floor, so the dead neurons cost ~3 bits instead of 8.
+        let vq = match skill_quant {
+            Some(sq) => parse_quant(sq)?,
+            None => Quant::Vbit,
+        };
+        if skill_quant.is_none() && mean_bits.is_none() {
+            // Live rows deserve full precision; the mean budget is what
+            // water-filling needs so they float to ~8 bits while the
+            // zeroed rows sink to the floor.
+            crate::convert::set_vbit_mean_bits((3.0 + 5.0 * keep).clamp(3.0, 8.0));
+        }
+        let mut saved = 0usize;
+        for (name, shape, vals) in &ffn_vals {
+            let li: usize = name
+                .strip_prefix("model.layers.")
+                .and_then(|r| r.split('.').next())
+                .and_then(|n| n.parse().ok())
+                .context("ffn tensor without layer index")?;
+            let alive = &keep_sets[li];
+            let (rows, cols) = (shape[0], shape[1]);
+            let mut z = vals.clone();
+            if name.ends_with("down_proj.weight") {
+                // [hidden, inter]: the neuron axis is the columns.
+                for r in 0..rows {
+                    for (c, a) in alive.iter().enumerate() {
+                        if !a {
+                            z[r * cols + c] = 0.0;
+                        }
+                    }
+                }
+            } else {
+                // gate/up [inter, hidden]: the neuron axis is the rows.
+                for (r, a) in alive.iter().enumerate() {
+                    if !a {
+                        z[r * cols..(r + 1) * cols].fill(0.0);
+                    }
+                }
+            }
+            let (dtype, data) = quantize_2d(vq, &z, rows, cols);
+            let skill_name = format!("skill.{id}.{name}");
+            if let Some(t) = tensors.iter_mut().find(|t| t.name == skill_name) {
+                saved += t.data.len().saturating_sub(data.len());
+                t.dtype = dtype;
+                t.shape = shape.clone();
+                t.data = data;
+            }
+        }
+        let sparsity = 1.0 - keep_n as f32 / inter as f32;
+        println!(
+            "sparse bake: keep {keep_n}/{inter} neurons/layer (sparsity {:.0}%), −{:.1} MB",
+            sparsity * 100.0,
+            saved as f64 / 1e6
+        );
+        // The mask is an ordinary task in the catalog, linked to the
+        // skill via input_mask_task — `run --skill` activates it.
+        catalog.masks.retain(|m| m.name != id);
+        let task_id = catalog
+            .masks
+            .iter()
+            .map(|m| m.task_id + 1)
+            .max()
+            .unwrap_or(1);
+        catalog.masks.push(TaskMask {
+            task_id,
+            name: id.to_string(),
+            description: Some(format!("DTG-MA mask of skill '{id}' (keep {keep:.2})")),
+            sparsity,
+            quality: None,
+            ffn_masks: ffn_bits,
+            head_masks: vec![vec![0xffu8; nh_bytes(model.arch().num_attention_heads)]; num_layers],
+            layer_gates: vec![true; num_layers],
+            expert_masks: Vec::new(),
+            parent: None,
+            priority: MaskPriority::Normal,
+            has_hot_pack: false,
+        });
+        if let Some(rec) = header.skills.iter_mut().find(|s| s.id == id) {
+            rec.input_mask_task = Some(id.to_string());
+        }
+        CmfModel::write(
+            &tmp,
+            &header,
+            &tensors,
+            Some(&catalog),
+            model.vocab.as_deref(),
+        )?;
+    }
+
+    // ── claim-16 quality gate: overlaid vs backbone on held-out text,
+    //    measured through the rebuilt file and recorded in the registry.
+    //    A sparse skill is measured WITH its mask active — that is how
+    //    it runs. ──
+    if let Some(qf) = quality_file {
+        let text = std::fs::read_to_string(qf)?;
+        let probe = Arc::new(CmfModel::open(&tmp)?);
+        let backbone = ppl_of(&probe, None, &text, quality_tokens)?;
+        let overlaid = if sparse.is_some() {
+            let mask = probe
+                .masks
+                .get(id)
+                .context("sparse bake lost its mask")?
+                .clone();
+            let mut p = Pipeline::from_model_with_skill(&probe, SamplerConfig::default(), Some(id))
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let mut ids = p.tokenizer.with_bos(p.tokenizer.encode(&text));
+            ids.truncate(quality_tokens);
+            p.ppl_ids_masked(&ids, &mask)
+                .map_err(|e| anyhow::anyhow!(e))?
+        } else {
+            ppl_of(&probe, Some(id), &text, quality_tokens)?
+        };
+        println!(
+            "quality ({qf}): backbone PPL {backbone:.3} → skill PPL {overlaid:.3} ({:+.1}%)",
+            (overlaid / backbone - 1.0) * 100.0
+        );
+        drop(probe);
+        let mut header2 = header.clone();
+        if let Some(rec) = header2.skills.iter_mut().find(|s| s.id == id) {
+            rec.quality = Some(serde_json::json!({
+                "metric": "ppl",
+                "backbone": (backbone * 1000.0).round() / 1000.0,
+                "overlaid": (overlaid * 1000.0).round() / 1000.0,
+                "file": Path::new(qf).file_name().map(|f| f.to_string_lossy().into_owned()),
+                "tokens": quality_tokens,
+                "masked": sparse.is_some(),
+            }));
+        }
+        CmfModel::write(
+            &tmp,
+            &header2,
+            &tensors,
+            if catalog.masks.is_empty() {
+                None
+            } else {
+                Some(&catalog)
+            },
+            model.vocab.as_deref(),
+        )?;
+    }
+
+    // Verify before replacing anything.
+    let check = CmfModel::open(&tmp)?;
+    anyhow::ensure!(
+        check.skill_tensors(id).count() > 0,
+        "rebuilt file lost the skill tensors — refusing"
+    );
+    drop(check);
+    drop(model);
+    std::fs::rename(&tmp, &out_path)?;
+    println!("✓ wrote {out_path}");
+    Ok(())
+}
+
+/// Cut a baked specialist against its base into a standalone skill file:
+/// the tensors whose directory hashes differ, the mask catalog, and the
+/// identity keys (`base_dir_hash`, `base_arch`, `task`) that let `apply`
+/// refuse the wrong base. Payloads are borrowed straight from the
+/// specialist's mmap — a 2.4 GB specialist exports without materializing.
+pub fn run_skill_export(
+    specialist_path: &str,
+    base_path: &str,
+    id: &str,
+    name: Option<&str>,
+    output: &str,
+) -> anyhow::Result<()> {
+    use cortiq_core::TensorSpecRef;
+    let spec = CmfModel::open(specialist_path)?;
+    let base = CmfModel::open(base_path)?;
+    if spec.header.arch.arch_name != base.header.arch.arch_name
+        || spec.header.arch.num_layers != base.header.arch.num_layers
+        || spec.header.arch.hidden_size != base.header.arch.hidden_size
+    {
+        anyhow::bail!(
+            "specialist and base disagree on architecture ({} vs {}) — nothing to cut",
+            spec.header.arch.arch_name,
+            base.header.arch.arch_name
+        );
+    }
+    let base_by_name: std::collections::HashMap<&str, u64> = base
+        .tensors
+        .iter()
+        .map(|t| (t.name.as_str(), t.hash))
+        .collect();
+    let mut refs: Vec<TensorSpecRef> = Vec::new();
+    let mut layers: Vec<usize> = Vec::new();
+    let sbytes = spec.primary_bytes();
+    // `skill add` stores a donor as `skill.<id>.<base tensor name>` in an
+    // otherwise complete CMF. Exporting that record must strip the namespace,
+    // not compare the whole augmented model against the base. This is the
+    // bridge from a BF16/FCD donor to a genuinely standalone q8_2f overlay.
+    let embedded_prefix = format!("skill.{id}.");
+    let embedded = spec
+        .header
+        .skills
+        .iter()
+        .find(|record| record.id == id)
+        .filter(|_| {
+            spec.tensors
+                .iter()
+                .any(|entry| entry.name.starts_with(&embedded_prefix))
+        });
+    if embedded.is_some() {
+        for e in spec
+            .tensors
+            .iter()
+            .filter(|entry| entry.name.starts_with(&embedded_prefix))
+        {
+            let name = e.name[embedded_prefix.len()..].to_string();
+            anyhow::ensure!(
+                base_by_name.contains_key(name.as_str()),
+                "embedded skill tensor {name} is absent from the base"
+            );
+            let abs = spec
+                .entry_abs_offset(e)
+                .ok_or_else(|| anyhow::anyhow!("tensor {} out of bounds", e.name))?;
+            refs.push(TensorSpecRef {
+                name: name.clone(),
+                dtype: e.dtype,
+                shape: e.shape.clone(),
+                data: &sbytes[abs..abs + e.nbytes as usize],
+            });
+            if let Some(li) = name
+                .strip_prefix("model.layers.")
+                .and_then(|r| r.split('.').next())
+                .and_then(|s| s.parse::<usize>().ok())
+            {
+                if !layers.contains(&li) {
+                    layers.push(li);
+                }
+            }
+        }
+    } else {
+        for e in &spec.tensors {
+            if base_by_name.get(e.name.as_str()) == Some(&e.hash) {
+                continue; // byte-identical to the base — the base carries it
+            }
+            let abs = spec
+                .entry_abs_offset(e)
+                .ok_or_else(|| anyhow::anyhow!("tensor {} out of bounds", e.name))?;
+            refs.push(TensorSpecRef {
+                name: e.name.clone(),
+                dtype: e.dtype,
+                shape: e.shape.clone(),
+                data: &sbytes[abs..abs + e.nbytes as usize],
+            });
+            if let Some(li) = e
+                .name
+                .strip_prefix("model.layers.")
+                .and_then(|r| r.split('.').next())
+                .and_then(|s| s.parse::<usize>().ok())
+            {
+                if !layers.contains(&li) {
+                    layers.push(li);
+                }
+            }
+        }
+    }
+    if refs.is_empty() {
+        anyhow::bail!("specialist and base are byte-identical — no skill to export");
+    }
+    layers.sort_unstable();
+    let mut header = if embedded.is_some() {
+        base.header.clone()
+    } else {
+        spec.header.clone()
+    };
+    let embedded_record = embedded.cloned();
+    header.skills = vec![SkillRecord {
+        id: id.to_string(),
+        name: name.map(str::to_string).or_else(|| {
+            embedded_record
+                .as_ref()
+                .and_then(|record| record.name.clone())
+        }),
+        layers: layers.clone(),
+        selection: None,
+        input_mask_task: embedded_record
+            .as_ref()
+            .and_then(|record| record.input_mask_task.clone()),
+        quality: embedded_record
+            .as_ref()
+            .and_then(|record| record.quality.clone()),
+        base_dir_hash: Some(format!("{:016x}", base.dir_hash())),
+        base_arch: Some(base.header.arch.arch_name.clone()),
+        task: embedded_record
+            .as_ref()
+            .and_then(|record| record.task.clone())
+            .or_else(|| {
+                (!spec.masks.default_task.is_empty()).then(|| spec.masks.default_task.clone())
+            }),
+        provenance: Some(serde_json::json!({
+            "cut_from": std::path::Path::new(specialist_path)
+                .file_name().map(|s| s.to_string_lossy().into_owned()),
+            "tensors": refs.len(),
+            "embedded": embedded_record.is_some(),
+        })),
+    }];
+    let catalog = (!spec.masks.masks.is_empty()).then(|| spec.masks.clone());
+    CmfModel::write_ref(output, &header, &refs, catalog.as_ref(), None)?;
+    let sz = std::fs::metadata(output)?.len();
+    println!(
+        "✓ skill '{id}': {} tensor(s) across layers {:?}, {} masks | {:.1} MB (specialist was {:.1} MB)",
+        refs.len(),
+        layers,
+        spec.masks.masks.len(),
+        sz as f64 / 1e6,
+        std::fs::metadata(specialist_path)?.len() as f64 / 1e6,
+    );
+    Ok(())
+}
+
+/// Attach a standalone skill to its base: verify the identity keys, lay
+/// the skill's tensors over the base's, carry the skill's masks, write
+/// the specialist. Both payload sets are borrowed mmaps.
+pub fn run_skill_apply(
+    base_path: &str,
+    skill_path: &str,
+    output: &str,
+    force: bool,
+) -> anyhow::Result<()> {
+    use cortiq_core::TensorSpecRef;
+    let base = CmfModel::open(base_path)?;
+    let skill = CmfModel::open(skill_path)?;
+    let rec = skill
+        .header
+        .skills
+        .iter()
+        .find(|s| s.base_dir_hash.is_some())
+        .ok_or_else(|| {
+            anyhow::anyhow!("{skill_path} carries no standalone-skill record — not a skill file")
+        })?;
+    let want = rec.base_dir_hash.as_deref().unwrap_or_default();
+    let have = format!("{:016x}", base.dir_hash());
+    if want != have {
+        if force {
+            eprintln!(
+                "warning: base directory hash {have} does not match the skill's key {want} — \
+                 --force accepted, the result is unsupported territory"
+            );
+        } else {
+            anyhow::bail!(
+                "this skill was cut against a different base (key {want}, this base {have}).\n\
+                 The right base is '{}' with exactly those bytes; --force overrides.",
+                rec.base_arch.as_deref().unwrap_or("?"),
+            );
+        }
+    }
+    let over: std::collections::HashMap<&str, &TensorEntry> =
+        skill.tensors.iter().map(|t| (t.name.as_str(), t)).collect();
+    let bbytes = base.primary_bytes();
+    let sbytes = skill.primary_bytes();
+    let mut refs: Vec<TensorSpecRef> = Vec::with_capacity(base.tensors.len());
+    let mut replaced = 0usize;
+    for e in &base.tensors {
+        let (src, m, bytes) = match over.get(e.name.as_str()) {
+            Some(s) => (*s, &skill, sbytes),
+            None => (e, &base, bbytes),
+        };
+        let abs = m
+            .entry_abs_offset(src)
+            .ok_or_else(|| anyhow::anyhow!("tensor {} out of bounds", src.name))?;
+        if over.contains_key(e.name.as_str()) {
+            replaced += 1;
+        }
+        refs.push(TensorSpecRef {
+            name: src.name.clone(),
+            dtype: src.dtype,
+            shape: src.shape.clone(),
+            data: &bytes[abs..abs + src.nbytes as usize],
+        });
+    }
+    // A baked skill may carry a physically defragmented FFN: its tensor
+    // shapes (and therefore arch.intermediate_size) need not match the
+    // original backbone.  The standalone skill was cut from that exact
+    // specialist, so its header is the authoritative overlay header; the
+    // base still supplies byte-identical shared tensors and the tokenizer.
+    let mut header = skill.header.clone();
+    // The record rides along minus the binding keys: the output is a
+    // complete model again, not a partial file.
+    let mut carried = rec.clone();
+    carried.base_dir_hash = None;
+    header.skills = vec![carried];
+    let catalog = (!skill.masks.masks.is_empty()).then(|| skill.masks.clone());
+    CmfModel::write_ref(
+        output,
+        &header,
+        &refs,
+        catalog.as_ref(),
+        base.vocab.as_deref(),
+    )?;
+    println!(
+        "✓ applied skill '{}': {replaced} tensor(s) replaced, {} masks carried → {output}",
+        rec.id,
+        skill.masks.masks.len()
+    );
+    Ok(())
+}
+
+pub fn run_skill_list(model_path: &str) -> anyhow::Result<()> {
+    let model = CmfModel::open(model_path)?;
+    if model.header.skills.is_empty() {
+        println!("no skills — a flat backbone");
+        return Ok(());
+    }
+    println!("{} skill(s):", model.header.skills.len());
+    for s in &model.header.skills {
+        // An embedded skill stores names below `skill.<id>.*`.  A
+        // standalone skill cut by `skill export`, however, intentionally
+        // keeps the original model tensor names so `skill apply` can overlay
+        // them directly.  Its base binding is the unambiguous discriminator.
+        let standalone = s.base_dir_hash.is_some();
+        let (tensor_count, bytes): (usize, u64) = if standalone {
+            (
+                model.tensors.len(),
+                model.tensors.iter().map(|t| t.nbytes).sum(),
+            )
+        } else {
+            (
+                model.skill_tensors(&s.id).count(),
+                model
+                    .tensors
+                    .iter()
+                    .filter(|t| t.name.starts_with(&format!("skill.{}.", s.id)))
+                    .map(|t| t.nbytes)
+                    .sum(),
+            )
+        };
+        let routable = if s.selection.is_some() {
+            "routable"
+        } else if standalone {
+            "standalone overlay"
+        } else {
+            "no selection"
+        };
+        println!(
+            "  {:<10} {:<24} {} tensor(s), {:.1} MB, layers {:?}, {}",
+            s.id,
+            s.name.as_deref().unwrap_or("—"),
+            tensor_count,
+            bytes as f64 / 1e6,
+            s.layers,
+            routable
+        );
+        if let Some(q) = &s.quality {
+            println!("      quality: {q}");
+        }
+    }
+    Ok(())
+}
+
+/// Split text files into fixed token chunks (the recipe's calibration
+/// format: 256-token windows, first `held` are the held-out gate).
+fn corpus_chunks(
+    tok: &cortiq_engine::tokenizer::Tokenizer,
+    files: &[String],
+    chunk: usize,
+    need: usize,
+) -> anyhow::Result<Vec<Vec<u32>>> {
+    let mut out = Vec::new();
+    for f in files {
+        let ids = tok.encode(&std::fs::read_to_string(f)?);
+        let mut i = 0usize;
+        while i + chunk < ids.len() {
+            out.push(ids[i..i + chunk].to_vec());
+            i += chunk;
+        }
+        if out.len() >= need {
+            break;
+        }
+    }
+    out.truncate(need);
+    Ok(out)
+}
+
+fn scored_corpus_chunks(
+    tok: &cortiq_engine::tokenizer::Tokenizer,
+    files: &[String],
+    chunk: usize,
+    need: usize,
+    focus_ids: &[u32],
+    focus_follow_ids: &[u32],
+    focus_desc: &str,
+) -> anyhow::Result<Vec<Vec<u32>>> {
+    let raw_need = if focus_ids.is_empty() {
+        need
+    } else {
+        need.saturating_mul(16)
+    };
+    let mut chunks = corpus_chunks(tok, files, chunk, raw_need)?;
+    if !focus_ids.is_empty() {
+        chunks.retain(|ids| {
+            (1..ids.len()).any(|index| {
+                focus_ids.contains(&ids[index])
+                    && (focus_follow_ids.is_empty()
+                        || (index + 1 < ids.len() && focus_follow_ids.contains(&ids[index + 1])))
+            })
+        });
+    }
+    anyhow::ensure!(
+        chunks.len() >= need,
+        "corpus has only {} scored chunks{}; need {need}",
+        chunks.len(),
+        if focus_ids.is_empty() {
+            String::new()
+        } else {
+            format!(" containing [{focus_desc}]")
+        }
+    );
+    chunks.truncate(need);
+    Ok(chunks)
+}
+
+/// `cortiq skill bake` — the native DTG-MA recipe (Patent 2), no
+/// Python: train the L1 mask to its denoising bottom, FCD-polish the
+/// last layers, and write a standalone defragged specialist whose
+/// pruned neurons are neither stored nor computed (claims 9/10).
+#[allow(clippy::too_many_arguments)]
+pub fn run_skill_bake(
+    model_path: &str,
+    files: &[String],
+    held_files: &[String],
+    output: &str,
+    steps_a: usize,
+    steps_b: usize,
+    lr_a: f64,
+    lr_b: f64,
+    eval_every: usize,
+    fcd_layers: usize,
+    chunk: usize,
+    held: usize,
+    calib_chunks: usize,
+    focus_tokens: Option<&str>,
+    target_sparsity: f64,
+    l1_aggression: f64,
+    ffn_align: usize,
+    uniform_inter: bool,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(chunk >= 2, "--chunk must be at least 2");
+    anyhow::ensure!(held > 0, "--held must be positive");
+    anyhow::ensure!(calib_chunks >= 12, "--calib-chunks must be at least 12");
+    anyhow::ensure!(eval_every > 0, "--eval-every must be positive");
+    let model = Arc::new(CmfModel::open(model_path)?);
+    let vocab_bytes = model
+        .vocab
+        .clone()
+        .context("model has no embedded tokenizer")?;
+    let tok = cortiq_engine::tokenizer::Tokenizer::from_bytes(&vocab_bytes)
+        .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+    let focus_ids: Vec<u32> = focus_tokens
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|label| {
+            let ids = tok.encode(label);
+            anyhow::ensure!(
+                ids.len() == 1,
+                "--focus-tokens entry {label:?} encodes to {} tokens; each entry must be exactly one token",
+                ids.len()
+            );
+            Ok(ids[0])
+        })
+        .collect::<anyhow::Result<_>>()?;
+    let focus_follow_ids = if focus_ids.is_empty() {
+        Vec::new()
+    } else {
+        let ids = tok.encode("<|im_end|>");
+        anyhow::ensure!(
+            ids.len() == 1,
+            "tokenizer encodes <|im_end|> to {} tokens; terminal answer focus requires one",
+            ids.len()
+        );
+        ids
+    };
+    let focus_desc = focus_tokens.unwrap_or("");
+    let (chunks, held_n) = if held_files.is_empty() {
+        let need = calib_chunks + held;
+        let chunks = scored_corpus_chunks(
+            &tok,
+            files,
+            chunk,
+            need,
+            &focus_ids,
+            &focus_follow_ids,
+            focus_desc,
+        )?;
+        (chunks, held)
+    } else {
+        let held_chunks = scored_corpus_chunks(
+            &tok,
+            held_files,
+            chunk,
+            held,
+            &focus_ids,
+            &focus_follow_ids,
+            focus_desc,
+        )?;
+        let calib = scored_corpus_chunks(
+            &tok,
+            files,
+            chunk,
+            calib_chunks,
+            &focus_ids,
+            &focus_follow_ids,
+            focus_desc,
+        )?;
+        let mut joined = held_chunks;
+        joined.extend(calib);
+        (joined, held)
+    };
+    println!(
+        "bake: {} calib + {held_n} held chunks of {chunk} tokens{} | FCD last {fcd_layers} layer(s){}",
+        chunks.len().saturating_sub(held_n),
+        if held_files.is_empty() {
+            ""
+        } else {
+            " (dedicated validation files)"
+        },
+        focus_tokens
+            .map(|v| format!(" | focused targets [{v}]"))
+            .unwrap_or_default()
+    );
+    let hyper = cortiq_engine::skillbake::BakeHyper {
+        steps_a,
+        steps_b,
+        lr_a,
+        lr_b,
+        eval_every,
+        fcd_layers,
+        target_sparsity,
+        l1_mult: l1_aggression,
+        align: ffn_align,
+        uniform_inter,
+        focus_tokens: focus_ids,
+        focus_follow_tokens: focus_follow_ids,
+        ..Default::default()
+    };
+    let (report, arts) =
+        cortiq_engine::skillbake::skill_bake(&model, &chunks, held_n, &hyper, |line| {
+            println!("{line}");
+        })
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let verdict = if report.overlaid <= report.backbone {
+        "SPECIALIST ≤ baseline ✓"
+    } else {
+        "did not beat baseline"
+    };
+    println!(
+        "=== bake: baseline {:.3} | mask {:.3} | mask+FCD {:.3} | pruned {:.2}% | {:.1}s → {verdict}",
+        report.backbone,
+        report.masked,
+        report.overlaid,
+        report.pruned_ratio * 100.0,
+        report.sec
+    );
+
+    // ── write the standalone defragged specialist ──
+    let hidden = model.arch().hidden_size;
+    let nl = model.arch().num_layers;
+    let orig_inter = model.arch().intermediate_size;
+    let mut tensors: Vec<TensorSpec> = Vec::new();
+    for t in &model.tensors {
+        // FFN tensors are rebuilt below; everything else copies raw.
+        // Rebuild only the backbone FFNs. Qwen3.5 can also carry an MTP
+        // block under `model.mtp.layers.*`; it is outside the trained mask
+        // geometry and must be copied byte-for-byte.
+        if t.name.starts_with("model.layers.")
+            && (t.name.contains(".mlp.gate_proj.")
+                || t.name.contains(".mlp.up_proj.")
+                || t.name.contains(".mlp.down_proj."))
+        {
+            continue;
+        }
+        if t.name.starts_with("skill.") {
+            continue; // a defragged specialist is a standalone file
+        }
+        tensors.push(TensorSpec {
+            name: t.name.clone(),
+            dtype: t.dtype,
+            shape: t.shape.clone(),
+            data: model.tensor_bytes(&t.name)?.to_vec(),
+        });
+    }
+    let deq = |name: &str| -> anyhow::Result<Vec<f32>> {
+        let e = model
+            .tensors
+            .iter()
+            .find(|t| t.name == name)
+            .context("missing tensor")?;
+        let mut out = vec![0f32; e.shape.iter().product()];
+        cortiq_core::quant::dequant_tensor(e, model.tensor_bytes(name)?, &mut out)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        Ok(out)
+    };
+    // A Looped Transformer's weights serve every pass, so a neuron may
+    // be dead in one visit and load-bearing in the other. Physical row
+    // removal is only legal for the union — and remapping per-visit
+    // bitfields onto compacted indices buys bytes at the cost of a
+    // second index space. So for looped models the file keeps its full
+    // FFN shape and the sparsity ships as a per-visit task mask the
+    // runtime applies each pass (format feature LOOP_MASKS).
+    let loops = model.arch().num_loops.max(1);
+    let mut max_kept = 0usize;
+    for li in 0..nl {
+        let alive = &arts.keep[li];
+        let kept: Vec<usize> = if loops > 1 {
+            (0..orig_inter).collect()
+        } else {
+            alive
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| **a)
+                .map(|(i, _)| i)
+                .collect()
+        };
+        anyhow::ensure!(!kept.is_empty(), "layer {li}: 0 live neurons");
+        max_kept = max_kept.max(kept.len());
+        let trained = arts.gate_up[li].is_some();
+        let shape_unchanged = is_identity_keep(&kept, orig_inter);
+        // Do not turn a frozen layer into a false skill delta.  Even a
+        // nominally idempotent q8_2f -> f32 -> q8_2f round-trip can choose
+        // slightly different row/column fields, changing all three hashes.
+        // When no neuron was physically removed, the exact source payload is
+        // already the correct frozen tensor and must be copied byte-for-byte.
+        if !trained && shape_unchanged {
+            for suffix in ["gate_proj", "up_proj", "down_proj"] {
+                let name = format!("model.layers.{li}.mlp.{suffix}.weight");
+                let entry = model
+                    .tensors
+                    .iter()
+                    .find(|tensor| tensor.name == name)
+                    .with_context(|| format!("missing tensor {name}"))?;
+                tensors.push(TensorSpec {
+                    name,
+                    dtype: entry.dtype,
+                    shape: entry.shape.clone(),
+                    data: model.tensor_bytes(&entry.name)?.to_vec(),
+                });
+            }
+            continue;
+        }
+        let (gate_f, up_f) = match &arts.gate_up[li] {
+            Some((g, u)) => (g.clone(), u.clone()),
+            None => (
+                deq(&format!("model.layers.{li}.mlp.gate_proj.weight"))?,
+                deq(&format!("model.layers.{li}.mlp.up_proj.weight"))?,
+            ),
+        };
+        // gather live rows (gate/up) and live columns (down).
+        let mut gate_k = Vec::with_capacity(kept.len() * hidden);
+        let mut up_k = Vec::with_capacity(kept.len() * hidden);
+        for &r in &kept {
+            gate_k.extend_from_slice(&gate_f[r * hidden..(r + 1) * hidden]);
+            up_k.extend_from_slice(&up_f[r * hidden..(r + 1) * hidden]);
+        }
+        let down_f = &arts.down[li];
+        let mut down_k = Vec::with_capacity(hidden * kept.len());
+        for r in 0..hidden {
+            for &c in &kept {
+                down_k.push(down_f[r * orig_inter + c]);
+            }
+        }
+        let base_dtype = model
+            .tensors
+            .iter()
+            .find(|t| t.name == format!("model.layers.{li}.mlp.gate_proj.weight"))
+            .map(|t| t.dtype)
+            .context("gate tensor missing")?;
+        let q_rowsafe = dtype_to_quant(base_dtype, weight_quant_hint(&model))
+            .context("unsupported ffn dtype")?;
+        // down's IN dim shrinks: grouped codecs need in % 32 == 0.
+        let q_down = if kept.len() % 32 == 0 {
+            q_rowsafe
+        } else {
+            Quant::Q8_2f
+        };
+        // A freshly TRAINED master carries millions of coordinated, very
+        // small FCD corrections. Requantizing to q4 erased a measured 7.9%
+        // held-PPL gain, while ordinary q8-row erased a smaller update
+        // completely. q8_2f is the compact trained-master codec: its separate
+        // row and column fields recover most of the q8->f16 quality gap at
+        // essentially the same bytes/weight. Frozen layers retain their own
+        // source codec; the real-runtime gate below verifies the written file.
+        for (suffix, vals, rows, cols, frozen_q) in [
+            ("gate_proj", &gate_k, kept.len(), hidden, q_rowsafe),
+            ("up_proj", &up_k, kept.len(), hidden, q_rowsafe),
+            ("down_proj", &down_k, hidden, kept.len(), q_down),
+        ] {
+            let (dtype, data) = if trained {
+                encode_trained_fcd(vals, rows, cols)
+            } else {
+                quantize_2d(frozen_q, vals, rows, cols)
+            };
+            tensors.push(TensorSpec {
+                name: format!("model.layers.{li}.mlp.{suffix}.weight"),
+                dtype,
+                shape: vec![rows, cols],
+                data,
+            });
+        }
+    }
+    let mut header = model.header.clone();
+    header.skills.clear();
+    header.arch.intermediate_size = max_kept;
+    let mut prov = header
+        .provenance
+        .take()
+        .unwrap_or_else(|| serde_json::json!({}));
+    prov["defrag"] = serde_json::json!({
+        "recipe": "skill-bake L1+FCD (native)",
+        "pre_intermediate": orig_inter,
+        "post_intermediate_max": max_kept,
+        "kept_per_layer": report.kept_per_layer,
+        "pruned_ratio": (report.pruned_ratio * 10000.0).round() / 10000.0,
+        "quality": {"metric": "ppl", "backbone": (report.backbone * 1000.0).round() / 1000.0,
+                     "masked": (report.masked * 1000.0).round() / 1000.0,
+                     "overlaid": (report.overlaid * 1000.0).round() / 1000.0,
+                     "held_out_chunks": held_n,
+                     "held_out_source": if held_files.is_empty() { "training-prefix" } else { "dedicated-files" },
+                     "focus_tokens": focus_tokens,
+                     "trained_fcd_dtype": "q8_2f"},
+    });
+    header.provenance = Some(prov);
+    // The per-visit mask, when there is one to ship.
+    let ffn_b = orig_inter.div_ceil(8);
+    let visit_mask: Option<TaskMask> = (loops > 1).then(|| {
+        let ffn_masks: Vec<Vec<u8>> = arts
+            .keep_visits
+            .iter()
+            .map(|alive| {
+                let mut row = vec![0u8; ffn_b];
+                for (j, &a) in alive.iter().enumerate() {
+                    if a {
+                        row[j / 8] |= 1 << (j % 8);
+                    }
+                }
+                row
+            })
+            .collect();
+        TaskMask {
+            task_id: 1,
+            name: "specialist".into(),
+            description: Some("DTG-MA per-visit mask (loop-aware bake)".into()),
+            sparsity: report.pruned_ratio as f32,
+            quality: None,
+            ffn_masks,
+            // ALL-ONES, not empty: the codec writes a zero row for a
+            // missing entry, and a zero head row means "no active
+            // heads" — the loader then forces f32 storage for the head
+            // path and attention itself is masked away. An FFN-only
+            // mask must say so explicitly.
+            head_masks: {
+                let hb = model.arch().num_attention_heads.div_ceil(8);
+                let mut row = vec![0xFFu8; hb];
+                let tail = model.arch().num_attention_heads % 8;
+                if tail != 0 {
+                    row[hb - 1] = (1u8 << tail) - 1;
+                }
+                vec![row; nl]
+            },
+            // Per VISIT like the ffn rows: the runtime gates layers
+            // by the virtual index, and a short list read as a dead
+            // second pass.
+            layer_gates: vec![true; nl * loops],
+            expert_masks: Vec::new(),
+            parent: None,
+            has_hot_pack: false,
+            priority: MaskPriority::Primary,
+        }
+    });
+    let catalog = visit_mask.as_ref().map(|m| MaskCatalog {
+        masks: vec![m.clone()],
+        default_task: "specialist".into(),
+    });
+    let tmp = format!("{output}.tmp");
+    CmfModel::write(
+        &tmp,
+        &header,
+        &tensors,
+        catalog.as_ref(),
+        model.vocab.as_deref(),
+    )?;
+
+    // ── end-to-end gate: held-out PPL through the REAL runtime ──
+    let held_ids: Vec<&Vec<u32>> = chunks[..held.min(chunks.len())].iter().collect();
+    let runtime_ppl = |path: &str, mask: Option<&TaskMask>| -> anyhow::Result<f64> {
+        let m = Arc::new(CmfModel::open(path)?);
+        let mut p =
+            Pipeline::from_model(&m, SamplerConfig::default()).map_err(|e| anyhow::anyhow!(e))?;
+        let mut nll = 0f64;
+        let mut n = 0usize;
+        for c in &held_ids {
+            let (l, k) = p
+                .nll_ids_masked(c, 0, mask)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            nll += l;
+            n += k;
+        }
+        Ok((nll / n.max(1) as f64).exp())
+    };
+    // The bake's device residency (f32 weights, planes) and the runtime's
+    // do not fit one card together — hand the VRAM back first.
+    cortiq_engine::gpu::bake_release();
+    let rt_base = runtime_ppl(model_path, None)?;
+    // Masked scoring rides the batched sweep since the masked-inference
+    // fast path (activation zeroing inside the fused arms) — the
+    // specialist is scored the way it is meant to be served: mask active,
+    // quantized storage untouched, batched speed.
+    let rt_spec = runtime_ppl(&tmp, visit_mask.as_ref())?;
+    println!(
+        "runtime gate (held-out, real engine): backbone {rt_base:.3} → specialist {rt_spec:.3} ({:+.1}%)",
+        (rt_spec / rt_base - 1.0) * 100.0
+    );
+    drop(model);
+    std::fs::rename(&tmp, output)?;
+    println!("✓ wrote {output}");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layers_specs() {
+        assert_eq!(parse_layers("all", 4).unwrap(), vec![0, 1, 2, 3]);
+        assert_eq!(parse_layers("1-2", 4).unwrap(), vec![1, 2]);
+        assert_eq!(parse_layers("0,3", 4).unwrap(), vec![0, 3]);
+        assert!(parse_layers("2-9", 4).is_err());
+        assert!(parse_layers("9", 4).is_err());
+        assert!(parse_layers("", 4).is_err());
+    }
+
+    #[test]
+    fn families_parse() {
+        assert!(Families::parse("ffn").is_ok());
+        assert!(Families::parse("attn").is_ok());
+        assert!(Families::parse("all").is_ok());
+        assert!(Families::parse("norms").is_err());
+        assert_eq!(Families::Ffn.suffixes().len(), 3);
+        assert_eq!(Families::All.suffixes().len(), 7);
+    }
+
+    #[test]
+    fn routing_prompts_accept_multiline_jsonl() {
+        let path = std::env::temp_dir().join(format!(
+            "cortiq-skill-prompts-{}-{}.jsonl",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(
+            &path,
+            "{\"prompt\":\"line 1\\nline 2\"}\n\"plain json string\"\n",
+        )
+        .unwrap();
+        let prompts = load_prompts(path.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_file(path);
+        assert_eq!(prompts, vec!["line 1\nline 2", "plain json string"]);
+    }
+
+    #[test]
+    fn q4tp_backbone_codec_is_preserved_by_skills() {
+        assert!(matches!(
+            dtype_to_quant(TensorDtype::Q4TiledP, None),
+            Some(Quant::Q4TiledP)
+        ));
+    }
+
+    #[test]
+    fn trained_fcd_uses_two_field_q8_not_row_q8() {
+        let (rows, cols) = (8usize, 64usize);
+        let vals: Vec<f32> = (0..rows * cols)
+            .map(|i| (i as f32 * 0.031).sin() * 0.05)
+            .collect();
+        let (dtype, bytes) = encode_trained_fcd(&vals, rows, cols);
+        assert_eq!(dtype, TensorDtype::Q8_2f);
+        assert_eq!(bytes.len(), rows * cols + rows * 2 + cols * 2);
+    }
+
+    #[test]
+    fn only_an_exact_identity_keep_can_copy_frozen_ffn_bytes() {
+        assert!(is_identity_keep(&[0, 1, 2, 3], 4));
+        assert!(!is_identity_keep(&[0, 1, 3], 4));
+        assert!(!is_identity_keep(&[0, 2, 1, 3], 4));
+    }
+
+    #[test]
+    fn every_skill_compatible_codec_round_trips_to_an_encoder() {
+        let cases = [
+            (TensorDtype::Q8Row, None, Quant::Q8Row),
+            (TensorDtype::Q8_2f, None, Quant::Q8_2f),
+            (TensorDtype::Q4Block, None, Quant::Q4Block),
+            (TensorDtype::Q4Tiled, None, Quant::Q4Tiled),
+            (TensorDtype::Q4TiledP, None, Quant::Q4TiledP),
+            (TensorDtype::Q2TiledP, None, Quant::Q2TiledP),
+            (TensorDtype::VbitRo, None, Quant::Vbit),
+            (TensorDtype::Q1, None, Quant::Q1),
+            (TensorDtype::Q1, Some("q1p"), Quant::Q1p),
+            (TensorDtype::Q1S, None, Quant::Q1s),
+            (TensorDtype::Q1T, None, Quant::Q1t),
+            (TensorDtype::F16, None, Quant::F16),
+        ];
+        for (dtype, hint, expected) in cases {
+            assert_eq!(dtype_to_quant(dtype, hint), Some(expected), "{dtype:?}");
+        }
+    }
+
+    #[test]
+    fn every_skill_codec_encodes_and_dequantizes_finite_weights() {
+        use cortiq_core::quant::dequant_tensor;
+
+        let (rows, cols) = (4usize, 64usize);
+        let vals: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i as f32 * 0.173).sin() + (i as f32 * 0.037).cos()) * 0.2)
+            .collect();
+        let cases = [
+            (Quant::Q8Row, TensorDtype::Q8Row),
+            (Quant::Q8_2f, TensorDtype::Q8_2f),
+            (Quant::Q4Block, TensorDtype::Q4Block),
+            (Quant::Q4Tiled, TensorDtype::Q4Tiled),
+            (Quant::Q4TiledP, TensorDtype::Q4TiledP),
+            (Quant::Q2TiledP, TensorDtype::Q2TiledP),
+            (Quant::Vbit, TensorDtype::VbitRo),
+            (Quant::Q1, TensorDtype::Q1),
+            (Quant::Q1p, TensorDtype::Q1),
+            (Quant::Q1s, TensorDtype::Q1S),
+            (Quant::Q1t, TensorDtype::Q1T),
+            (Quant::F16, TensorDtype::F16),
+        ];
+
+        for (quant, expected_dtype) in cases {
+            let (dtype, data) = quantize_2d(quant, &vals, rows, cols);
+            assert_eq!(dtype, expected_dtype, "{quant:?}");
+            assert!(!data.is_empty(), "{quant:?}");
+            let entry = TensorEntry {
+                name: format!("codec.{quant:?}"),
+                dtype,
+                shape: vec![rows, cols],
+                off: 0,
+                nbytes: data.len() as u64,
+                shard: 0,
+                hash: 0,
+            };
+            let mut restored = vec![0.0f32; vals.len()];
+            dequant_tensor(&entry, &data, &mut restored).unwrap();
+            assert!(restored.iter().all(|v| v.is_finite()), "{quant:?}");
+            assert!(restored.iter().any(|v| *v != 0.0), "{quant:?}");
+        }
+    }
+}

@@ -1,0 +1,7 @@
+# Pin the toolchain channel so contributors and CI build the same way.
+# `channel = "stable"` floats to the latest stable release (>= the crate's
+# rust-version / MSRV of 1.85, required for edition 2024).
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

@@ -1,0 +1,2001 @@
+//! Attention forward pass — GQA with RoPE, head masking, head-major KV.
+//!
+//! Two entry points:
+//! - `multi_head_attention` — the historical f32-slice path with per-head
+//!   masking (task masks); untouched, exercised by masked models.
+//! - `qwen_attention` / `qwen_attention_pair` — the dense QTensor path:
+//!   quantized-from-mmap weights, optional Qwen3.5 extras (per-head
+//!   qk-norm, output gate, partial rotary). With extras off and f32
+//!   weights the math is identical to the historical path.
+
+use crate::kv_cache::LayerKvCache;
+use crate::pool::Pool;
+use crate::qtensor::QTensor;
+
+/// Scale-less RMS normalization of one V head (Gemma-4):
+/// x ← x / sqrt(mean(x²) + eps). No weight, no +1 — pure normalization.
+fn vnorm_head(x: &mut [f32], eps: f64) {
+    let ms = x.iter().map(|&a| (a as f64) * (a as f64)).sum::<f64>() / x.len().max(1) as f64;
+    let inv = 1.0 / (ms + eps).sqrt() as f32;
+    for a in x.iter_mut() {
+        *a *= inv;
+    }
+}
+
+/// Precompute RoPE inverse frequencies for a head dimension — powf is
+/// paid once per model, not per (head × position × dim) in the hot loop.
+pub fn rope_inv_freq(head_dim: usize, base: f32) -> Vec<f32> {
+    (0..head_dim / 2)
+        .map(|i| 1.0 / base.powf(2.0 * i as f32 / head_dim as f32))
+        .collect()
+}
+
+/// Hugging Face-compatible YaRN inverse frequencies. `head_dim` is the
+/// rotary dimension (after partial_rotary_factor), not the full head width.
+pub fn yarn_inv_freq(
+    head_dim: usize,
+    base: f32,
+    factor: f32,
+    original_max_position_embeddings: usize,
+    beta_fast: f32,
+    beta_slow: f32,
+) -> Vec<f32> {
+    let correction_dim = |rotations: f32| {
+        (head_dim as f32
+            * (original_max_position_embeddings as f32 / (rotations * 2.0 * std::f32::consts::PI))
+                .ln())
+            / (2.0 * base.ln())
+    };
+    let low = correction_dim(beta_fast).floor().max(0.0) as usize;
+    let high = correction_dim(beta_slow)
+        .ceil()
+        .clamp(0.0, (head_dim / 2).saturating_sub(1) as f32) as usize;
+    let denom = (high.saturating_sub(low)).max(1) as f32;
+    (0..head_dim / 2)
+        .map(|i| {
+            let extrap = 1.0 / base.powf(2.0 * i as f32 / head_dim as f32);
+            let interp = extrap / factor;
+            let ramp = ((i.saturating_sub(low)) as f32 / denom).clamp(0.0, 1.0);
+            let extrapolation = 1.0 - ramp;
+            interp * (1.0 - extrapolation) + extrap * extrapolation
+        })
+        .collect()
+}
+
+/// Rotate one vector in place (RoPE, half-split pairing as in Llama/Qwen).
+pub fn rope_rotate(x: &mut [f32], position: usize, inv_freq: &[f32]) {
+    rope_rotate_scaled(x, position, inv_freq, 1.0);
+}
+
+/// RoPE with an optional post-processing scale on both cos and sin (YaRN).
+pub fn rope_rotate_scaled(x: &mut [f32], position: usize, inv_freq: &[f32], scale: f32) {
+    let half = inv_freq.len();
+    for (i, &freq) in inv_freq.iter().enumerate() {
+        let angle = position as f32 * freq;
+        let (sin, cos) = angle.sin_cos();
+        let x0 = x[i];
+        let x1 = x[i + half];
+        x[i] = (x0 * cos - x1 * sin) * scale;
+        x[i + half] = (x0 * sin + x1 * cos) * scale;
+    }
+}
+
+/// Single-head attention: softmax(Q·Kᵀ/√d)·V over a contiguous cache.
+/// `k_cache`/`v_cache`: `[seq_len × head_dim]`.
+/// Returns `([head_dim] output, [seq_len] attention probabilities)` —
+/// the probabilities feed attention-importance accumulation for eviction.
+pub fn attention_head(
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    head_dim: usize,
+    seq_len: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    // These two loops are the decode-attention hot path: cost grows
+    // linearly with the stored context, so they are NEON-vectorized
+    // (regrouped summation only — same products).
+    let mut scores = vec![0.0f32; seq_len];
+    for s in 0..seq_len {
+        let k = &k_cache[s * head_dim..(s + 1) * head_dim];
+        scores[s] = dot_f32(q, k) * scale;
+    }
+
+    // Numerically stable softmax.
+    let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0f32;
+    for s in scores.iter_mut() {
+        *s = (*s - max_score).exp();
+        sum += *s;
+    }
+    if sum > 0.0 {
+        for s in scores.iter_mut() {
+            *s /= sum;
+        }
+    }
+
+    let mut output = vec![0.0f32; head_dim];
+    for s in 0..seq_len {
+        let w = scores[s];
+        if w.abs() < 1e-12 {
+            continue;
+        }
+        let v = &v_cache[s * head_dim..(s + 1) * head_dim];
+        axpy_f32(&mut output, v, w);
+    }
+    (output, scores)
+}
+
+/// f32 dot with 4 independent accumulators — NEON on aarch64, scalar
+/// elsewhere. Same products as the sequential loop, regrouped sums.
+#[inline]
+pub(crate) fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        return dot_f32_neon(a, b);
+    }
+    #[cfg(target_arch = "x86_64")]
+    if crate::qtensor::avx2_enabled() {
+        return unsafe { dot_f32_avx2(a, b) };
+    }
+    #[allow(unreachable_code)]
+    {
+        a.iter().zip(b).map(|(x, y)| x * y).sum()
+    }
+}
+
+/// f32 dot via AVX2/FMA (x86 mirror of `dot_f32_neon`; regrouped sums).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
+    // SAFETY: callers pass equal-length slices.
+    unsafe {
+        use core::arch::x86_64::*;
+        let n = a.len().min(b.len());
+        let (ap, bp) = (a.as_ptr(), b.as_ptr());
+        let (mut s0, mut s1) = (_mm256_setzero_ps(), _mm256_setzero_ps());
+        let mut j = 0usize;
+        while j + 16 <= n {
+            s0 = _mm256_fmadd_ps(_mm256_loadu_ps(ap.add(j)), _mm256_loadu_ps(bp.add(j)), s0);
+            s1 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(ap.add(j + 8)),
+                _mm256_loadu_ps(bp.add(j + 8)),
+                s1,
+            );
+            j += 16;
+        }
+        let acc = _mm256_add_ps(s0, s1);
+        let hi = _mm256_extractf128_ps::<1>(acc);
+        let q = _mm_add_ps(_mm256_castps256_ps128(acc), hi);
+        let d = _mm_add_ps(q, _mm_movehl_ps(q, q));
+        let s = _mm_add_ss(d, _mm_shuffle_ps::<1>(d, d));
+        let mut sum = _mm_cvtss_f32(s);
+        while j < n {
+            sum += *ap.add(j) * *bp.add(j);
+            j += 1;
+        }
+        sum
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn dot_f32_neon(a: &[f32], b: &[f32]) -> f32 {
+    // SAFETY: callers pass equal-length slices (head_dim rows).
+    unsafe {
+        use core::arch::aarch64::*;
+        let n = a.len().min(b.len());
+        let (ap, bp) = (a.as_ptr(), b.as_ptr());
+        let (mut a0, mut a1, mut a2, mut a3) = (
+            vdupq_n_f32(0.0),
+            vdupq_n_f32(0.0),
+            vdupq_n_f32(0.0),
+            vdupq_n_f32(0.0),
+        );
+        let mut j = 0usize;
+        while j + 16 <= n {
+            a0 = vfmaq_f32(a0, vld1q_f32(ap.add(j)), vld1q_f32(bp.add(j)));
+            a1 = vfmaq_f32(a1, vld1q_f32(ap.add(j + 4)), vld1q_f32(bp.add(j + 4)));
+            a2 = vfmaq_f32(a2, vld1q_f32(ap.add(j + 8)), vld1q_f32(bp.add(j + 8)));
+            a3 = vfmaq_f32(a3, vld1q_f32(ap.add(j + 12)), vld1q_f32(bp.add(j + 12)));
+            j += 16;
+        }
+        let mut sum = vaddvq_f32(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)));
+        while j < n {
+            sum += *ap.add(j) * *bp.add(j);
+            j += 1;
+        }
+        sum
+    }
+}
+
+/// exp(x) for one NEON vector — Cephes-style degree-6 polynomial,
+/// |rel err| < 2e-7 on the softmax range. The batched-attend softmax
+/// calls exp hundreds of millions of times per long prefill; libm's
+/// scalar expf there would eat the whole GEMM win.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn vexpq_f32(x: core::arch::aarch64::float32x4_t) -> core::arch::aarch64::float32x4_t {
+    // SAFETY: pure register math.
+    unsafe {
+        use core::arch::aarch64::*;
+        let x = vmaxq_f32(x, vdupq_n_f32(-87.0));
+        let x = vminq_f32(x, vdupq_n_f32(88.0));
+        let n = vrndnq_f32(vmulq_f32(x, vdupq_n_f32(std::f32::consts::LOG2_E)));
+        // r = x − n·ln2, split hi/lo for accuracy (Cephes).
+        let r = vfmsq_f32(x, n, vdupq_n_f32(0.693_359_4));
+        let r = vfmsq_f32(r, n, vdupq_n_f32(-2.121_944_4e-4));
+        let mut p = vdupq_n_f32(1.987_569_1e-4);
+        p = vfmaq_f32(vdupq_n_f32(1.398_2e-3), p, r);
+        p = vfmaq_f32(vdupq_n_f32(8.333_452e-3), p, r);
+        p = vfmaq_f32(vdupq_n_f32(4.166_579_6e-2), p, r);
+        p = vfmaq_f32(vdupq_n_f32(1.666_666_5e-1), p, r);
+        p = vfmaq_f32(vdupq_n_f32(5.000_000_3e-1), p, r);
+        let r2 = vmulq_f32(r, r);
+        let e = vaddq_f32(vaddq_f32(vdupq_n_f32(1.0), r), vmulq_f32(p, r2));
+        let pow2 = vreinterpretq_f32_s32(vshlq_n_s32::<23>(vaddq_s32(
+            vcvtq_s32_f32(n),
+            vdupq_n_s32(127),
+        )));
+        vmulq_f32(e, pow2)
+    }
+}
+
+/// Numerically stable in-place softmax of one score row — vectorized
+/// max / exp / sum on aarch64 (scalar exp only on the tail).
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn softmax_row(row: &mut [f32]) {
+    // SAFETY: slice reads/writes within bounds.
+    unsafe {
+        use core::arch::aarch64::*;
+        let nn = row.len();
+        let p = row.as_mut_ptr();
+        let mut j = 0usize;
+        let mut mv = vdupq_n_f32(f32::NEG_INFINITY);
+        while j + 4 <= nn {
+            mv = vmaxq_f32(mv, vld1q_f32(p.add(j)));
+            j += 4;
+        }
+        let mut maxs = vmaxvq_f32(mv);
+        while j < nn {
+            maxs = maxs.max(*p.add(j));
+            j += 1;
+        }
+        if maxs == f32::NEG_INFINITY {
+            return;
+        }
+        let mvv = vdupq_n_f32(maxs);
+        let mut sumv = vdupq_n_f32(0.0);
+        j = 0;
+        while j + 4 <= nn {
+            let e = vexpq_f32(vsubq_f32(vld1q_f32(p.add(j)), mvv));
+            vst1q_f32(p.add(j), e);
+            sumv = vaddq_f32(sumv, e);
+            j += 4;
+        }
+        let mut sum = vaddvq_f32(sumv);
+        while j < nn {
+            let e = (*p.add(j) - maxs).exp();
+            *p.add(j) = e;
+            sum += e;
+            j += 1;
+        }
+        if sum > 0.0 {
+            let inv = vdupq_n_f32(1.0 / sum);
+            j = 0;
+            while j + 4 <= nn {
+                vst1q_f32(p.add(j), vmulq_f32(vld1q_f32(p.add(j)), inv));
+                j += 4;
+            }
+            while j < nn {
+                *p.add(j) *= 1.0 / sum;
+                j += 1;
+            }
+        }
+    }
+}
+
+/// `acc += w · row` (f32 axpy) — NEON on aarch64, scalar elsewhere.
+#[inline]
+pub(crate) fn axpy_f32(acc: &mut [f32], row: &[f32], w: f32) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        return axpy_f32_neon(acc, row, w);
+    }
+    #[cfg(target_arch = "x86_64")]
+    if crate::qtensor::avx2_enabled() {
+        return unsafe { axpy_f32_avx2(acc, row, w) };
+    }
+    #[allow(unreachable_code)]
+    {
+        for (a, &r) in acc.iter_mut().zip(row) {
+            *a += w * r;
+        }
+    }
+}
+
+/// f32 axpy via AVX2/FMA (x86 mirror of `axpy_f32_neon`).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn axpy_f32_avx2(acc: &mut [f32], row: &[f32], w: f32) {
+    // SAFETY: callers pass equal-length slices (head_dim rows).
+    unsafe {
+        use core::arch::x86_64::*;
+        let n = acc.len().min(row.len());
+        let ap = acc.as_mut_ptr();
+        let rp = row.as_ptr();
+        let wv = _mm256_set1_ps(w);
+        let mut j = 0usize;
+        while j + 8 <= n {
+            let v = _mm256_fmadd_ps(wv, _mm256_loadu_ps(rp.add(j)), _mm256_loadu_ps(ap.add(j)));
+            _mm256_storeu_ps(ap.add(j), v);
+            j += 8;
+        }
+        while j < n {
+            *ap.add(j) += w * *rp.add(j);
+            j += 1;
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn axpy_f32_neon(acc: &mut [f32], row: &[f32], w: f32) {
+    // SAFETY: callers pass equal-length slices (head_dim rows).
+    unsafe {
+        use core::arch::aarch64::*;
+        let n = acc.len().min(row.len());
+        let ap = acc.as_mut_ptr();
+        let rp = row.as_ptr();
+        let wv = vdupq_n_f32(w);
+        let mut j = 0usize;
+        while j + 4 <= n {
+            let v = vfmaq_f32(vld1q_f32(ap.add(j)), wv, vld1q_f32(rp.add(j)));
+            vst1q_f32(ap.add(j), v);
+            j += 4;
+        }
+        while j < n {
+            *ap.add(j) += w * *rp.add(j);
+            j += 1;
+        }
+    }
+}
+
+/// Multi-head GQA attention for one position.
+///
+/// - `active_heads[h]` — Q-head mask; a KV group whose Q heads are ALL
+///   dead is neither projected nor cached (GQA-skip: no FLOPs, no memory).
+/// - KV cache is head-major: per-head reads are contiguous slices,
+///   no per-head gather copies.
+///
+/// Weights: `wq [num_heads·head_dim, hidden]`, `wk/wv [num_kv·head_dim, hidden]`,
+/// `wo [hidden, num_heads·head_dim]`. Returns `[hidden_size]`.
+#[allow(clippy::too_many_arguments)]
+pub fn multi_head_attention(
+    hidden: &[f32],
+    wq: &[f32],
+    wk: &[f32],
+    wv: &[f32],
+    wo: &[f32],
+    cache: &mut LayerKvCache,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    hidden_size: usize,
+    position: usize,
+    active_heads: &[bool],
+    inv_freq: &[f32],
+) -> Vec<f32> {
+    let heads_per_kv = num_heads / num_kv_heads;
+    let head_alive = |h: usize| -> bool { active_heads.get(h).copied().unwrap_or(true) };
+    // A KV group lives while at least one of its Q heads lives.
+    let group_alive: Vec<bool> = (0..num_kv_heads)
+        .map(|g| (0..heads_per_kv).any(|i| head_alive(g * heads_per_kv + i)))
+        .collect();
+
+    // ── Q projection (live heads only) ──
+    let mut q_all = vec![0.0f32; num_heads * head_dim];
+    for h in 0..num_heads {
+        if !head_alive(h) {
+            continue;
+        }
+        for d in 0..head_dim {
+            let row = (h * head_dim + d) * hidden_size;
+            let mut sum = 0.0f32;
+            for j in 0..hidden_size {
+                sum += wq[row + j] * hidden[j];
+            }
+            q_all[h * head_dim + d] = sum;
+        }
+        rope_rotate(
+            &mut q_all[h * head_dim..(h + 1) * head_dim],
+            position,
+            inv_freq,
+        );
+    }
+
+    // ── K/V projection (live groups only) ──
+    let mut k_new = vec![0.0f32; num_kv_heads * head_dim];
+    let mut v_new = vec![0.0f32; num_kv_heads * head_dim];
+    for g in 0..num_kv_heads {
+        if !group_alive[g] {
+            continue;
+        }
+        for d in 0..head_dim {
+            let row = (g * head_dim + d) * hidden_size;
+            let (mut ks, mut vs) = (0.0f32, 0.0f32);
+            for j in 0..hidden_size {
+                ks += wk[row + j] * hidden[j];
+                vs += wv[row + j] * hidden[j];
+            }
+            k_new[g * head_dim + d] = ks;
+            v_new[g * head_dim + d] = vs;
+        }
+        rope_rotate(
+            &mut k_new[g * head_dim..(g + 1) * head_dim],
+            position,
+            inv_freq,
+        );
+    }
+
+    cache.append(&k_new, &v_new, &group_alive);
+
+    // ── Per-head attention over contiguous head-major slices ──
+    let mut attn_out = vec![0.0f32; num_heads * head_dim];
+    let mut imp = vec![0.0f32; cache.seq_len];
+    for h in 0..num_heads {
+        if !head_alive(h) {
+            continue; // dead head contributes zeros
+        }
+        let g = h / heads_per_kv;
+        let stored = cache.head_len(g);
+        if stored == 0 {
+            continue;
+        }
+        let _ = stored;
+        let (out, probs) = cache.attend(&q_all[h * head_dim..(h + 1) * head_dim], g);
+        attn_out[h * head_dim..(h + 1) * head_dim].copy_from_slice(&out);
+        for (dst, &p) in imp.iter_mut().zip(&probs) {
+            *dst += p;
+        }
+    }
+    // A position's importance is the probability mass that reads it —
+    // accumulated for importance-aware eviction.
+    cache.accumulate_imp(&imp);
+
+    // ── Output projection ──
+    let mut output = vec![0.0f32; hidden_size];
+    for i in 0..hidden_size {
+        let mut sum = 0.0f32;
+        let row = i * num_heads * head_dim;
+        for j in 0..(num_heads * head_dim) {
+            sum += wo[row + j] * attn_out[j];
+        }
+        output[i] = sum;
+    }
+    output
+}
+
+/// Fused two-position GQA attention: Q/K/V/O weight rows are streamed
+/// from memory once for both positions; the attention itself runs
+/// sequentially (position p first — its K/V must be in the cache before
+/// position p+1 attends). Dense-only (no head mask): the speculative
+/// path uses it for draft verification. Bit-identical to two calls of
+/// `multi_head_attention`.
+#[allow(clippy::too_many_arguments)]
+pub fn multi_head_attention_pair(
+    hidden1: &[f32],
+    hidden2: &[f32],
+    wq: &[f32],
+    wk: &[f32],
+    wv: &[f32],
+    wo: &[f32],
+    cache: &mut LayerKvCache,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    hidden_size: usize,
+    position: usize,
+    inv_freq: &[f32],
+) -> (Vec<f32>, Vec<f32>) {
+    let heads_per_kv = num_heads / num_kv_heads;
+
+    // ── Fused projections: each weight row read once, two dots ──
+    let qk_dim = num_heads * head_dim;
+    let kv_dim = num_kv_heads * head_dim;
+    let mut q1 = vec![0.0f32; qk_dim];
+    let mut q2 = vec![0.0f32; qk_dim];
+    let mut k1 = vec![0.0f32; kv_dim];
+    let mut k2 = vec![0.0f32; kv_dim];
+    let mut v1 = vec![0.0f32; kv_dim];
+    let mut v2 = vec![0.0f32; kv_dim];
+    let proj2 = |w: &[f32], o1: &mut [f32], o2: &mut [f32]| {
+        for (o, (d1, d2)) in o1.iter_mut().zip(o2.iter_mut()).enumerate() {
+            let row = &w[o * hidden_size..(o + 1) * hidden_size];
+            let (mut s1, mut s2) = (0.0f32, 0.0f32);
+            for j in 0..hidden_size {
+                s1 += row[j] * hidden1[j];
+                s2 += row[j] * hidden2[j];
+            }
+            *d1 = s1;
+            *d2 = s2;
+        }
+    };
+    proj2(wq, &mut q1, &mut q2);
+    proj2(wk, &mut k1, &mut k2);
+    proj2(wv, &mut v1, &mut v2);
+
+    for h in 0..num_heads {
+        rope_rotate(
+            &mut q1[h * head_dim..(h + 1) * head_dim],
+            position,
+            inv_freq,
+        );
+        rope_rotate(
+            &mut q2[h * head_dim..(h + 1) * head_dim],
+            position + 1,
+            inv_freq,
+        );
+    }
+    for g in 0..num_kv_heads {
+        rope_rotate(
+            &mut k1[g * head_dim..(g + 1) * head_dim],
+            position,
+            inv_freq,
+        );
+        rope_rotate(
+            &mut k2[g * head_dim..(g + 1) * head_dim],
+            position + 1,
+            inv_freq,
+        );
+    }
+
+    // ── Sequential attention: p, then p+1 (causal dependency) ──
+    let alive = vec![true; num_kv_heads];
+    let attend = |q_all: &[f32], cache: &LayerKvCache| -> Vec<f32> {
+        let mut attn_out = vec![0.0f32; qk_dim];
+        let mut imp = vec![0.0f32; cache.seq_len];
+        for h in 0..num_heads {
+            let g = h / heads_per_kv;
+            let stored = cache.head_len(g);
+            if stored == 0 {
+                continue;
+            }
+            let _ = stored;
+            let (out, probs) = cache.attend(&q_all[h * head_dim..(h + 1) * head_dim], g);
+            attn_out[h * head_dim..(h + 1) * head_dim].copy_from_slice(&out);
+            for (dst, &p) in imp.iter_mut().zip(&probs) {
+                *dst += p;
+            }
+        }
+        attn_out.extend_from_slice(&imp); // carry imp back to the caller
+        attn_out
+    };
+
+    cache.append(&k1, &v1, &alive);
+    let mut a1 = attend(&q1, cache);
+    let imp1 = a1.split_off(qk_dim);
+    cache.accumulate_imp(&imp1);
+
+    cache.append(&k2, &v2, &alive);
+    let mut a2 = attend(&q2, cache);
+    let imp2 = a2.split_off(qk_dim);
+    cache.accumulate_imp(&imp2);
+
+    // ── Fused output projection ──
+    let mut out1 = vec![0.0f32; hidden_size];
+    let mut out2 = vec![0.0f32; hidden_size];
+    for i in 0..hidden_size {
+        let row = &wo[i * qk_dim..(i + 1) * qk_dim];
+        let (mut s1, mut s2) = (0.0f32, 0.0f32);
+        for j in 0..qk_dim {
+            s1 += row[j] * a1[j];
+            s2 += row[j] * a2[j];
+        }
+        out1[i] = s1;
+        out2[i] = s2;
+    }
+    (out1, out2)
+}
+
+/// Per-head RMS norm with weight (qk-norm). Follows the model's norm
+/// style: Qwen3.5/Qwen3-Next are zero-centered `x̂·(1+w)` (gemma-style),
+/// classic Qwen/Llama are `x̂·w` — same authority as the layer norms.
+#[inline]
+fn rmsnorm_head(x: &mut [f32], w: &[f32], eps: f64, style: cortiq_core::NormStyle) {
+    let mut ss = 0f64;
+    for &v in x.iter() {
+        ss += (v as f64) * (v as f64);
+    }
+    let inv = (1.0 / (ss / x.len() as f64 + eps).sqrt()) as f32;
+    match style {
+        cortiq_core::NormStyle::Qwen => {
+            for (v, &wi) in x.iter_mut().zip(w) {
+                *v = *v * inv * wi;
+            }
+        }
+        cortiq_core::NormStyle::Gemma => {
+            for (v, &wi) in x.iter_mut().zip(w) {
+                *v = *v * inv * (1.0 + wi);
+            }
+        }
+    }
+}
+
+/// Dense attention configuration (no head masks — masked execution uses
+/// the historical path).
+#[derive(Clone, Copy)]
+pub struct QwenAttnCfg<'a> {
+    pub num_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub hidden_size: usize,
+    pub position: usize,
+    /// len = rotary_dim / 2
+    pub inv_freq: &'a [f32],
+    /// ≤ head_dim; RoPE rotates only the first `rotary_dim` dims.
+    pub rotary_dim: usize,
+    pub q_norm: Option<&'a [f32]>,
+    pub k_norm: Option<&'a [f32]>,
+    /// Qwen3.5: wq rows = 2·nh·hd, per-head [q(hd); gate(hd)];
+    /// attention output is multiplied by sigmoid(gate) before o_proj.
+    pub output_gate: bool,
+    /// Laguna: separate projection followed by softplus. Bool = per-head
+    /// projection (broadcast across head_dim), false = per-element.
+    pub softplus_gate: Option<(&'a QTensor, bool)>,
+    /// Multiplier applied to both RoPE cos and sin (YaRN attention factor).
+    pub rope_scale: f32,
+    pub rms_eps: f64,
+    /// Attention score scale (1/√head_dim unless the arch overrides).
+    pub scale: f32,
+    /// Gemma-2 attention-logit soft-capping: scores pass tanh(s/c)·c
+    /// before the softmax. 0.0 = off.
+    pub softcap: f32,
+    /// Sliding-window width: attend only the last N positions (Gemma-3
+    /// local layers). None = full context.
+    pub window: Option<usize>,
+    /// Scale-less RMS normalization of each V head before it enters
+    /// the cache (Gemma-4).
+    pub v_norm: bool,
+    /// Norm-weight semantics for qk-norm (same as the layer norms).
+    pub norm_style: cortiq_core::NormStyle,
+    /// Qwen2-family q/k/v projection biases (added after the matvecs).
+    pub bias: Option<(&'a [f32], &'a [f32], &'a [f32])>,
+    pub pool: Option<&'a Pool>,
+}
+
+thread_local! {
+    /// Recycled projection/attention buffers: the dense attention path
+    /// consumed ~7 fresh Vecs per layer per token (roadmap §3 P0).
+    static PROJ_FREE: std::cell::RefCell<Vec<Vec<f32>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Take a zeroed buffer of length `n` from the freelist (or allocate).
+pub(crate) fn take_buf(n: usize) -> Vec<f32> {
+    let mut b = PROJ_FREE.with(|f| f.borrow_mut().pop()).unwrap_or_default();
+    b.clear();
+    b.resize(n, 0.0);
+    b
+}
+
+/// Return a buffer to the freelist (leaves an empty Vec behind).
+pub(crate) fn recycle_buf(b: &mut Vec<f32>) {
+    let b = std::mem::take(b);
+    if b.capacity() > 0 {
+        PROJ_FREE.with(|f| {
+            let mut f = f.borrow_mut();
+            if f.len() < 16 {
+                f.push(b);
+            }
+        });
+    }
+}
+
+struct Projected {
+    q: Vec<f32>,
+    gate: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+}
+
+impl Drop for Projected {
+    fn drop(&mut self) {
+        recycle_buf(&mut self.q);
+        recycle_buf(&mut self.gate);
+        recycle_buf(&mut self.k);
+        recycle_buf(&mut self.v);
+    }
+}
+
+/// Project + split gate + qk-norm + partial RoPE for one position.
+fn project_position(
+    hidden: &[f32],
+    wq: &QTensor,
+    wk: &QTensor,
+    wv: &QTensor,
+    cfg: &QwenAttnCfg,
+    position: usize,
+) -> Projected {
+    let (q_raw, k, v) = project_matvecs(hidden, wq, wk, wv, cfg);
+    finish_projection(q_raw, k, v, cfg, position)
+}
+
+/// The Q/K/V matvecs of one position (GPU batch or fused CPU dispatch).
+fn project_matvecs(
+    hidden: &[f32],
+    wq: &QTensor,
+    wk: &QTensor,
+    wv: &QTensor,
+    cfg: &QwenAttnCfg,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let (_, nkv, hd) = (cfg.num_heads, cfg.num_kv_heads, cfg.head_dim);
+    let mut q_raw = take_buf(wq.rows());
+    let mut k = take_buf(nkv * hd);
+    let mut v = take_buf(nkv * hd);
+    // QKV in ONE device submission (этап 4): three matvecs, one poll —
+    // gated by the same discrete-card threshold as every GPU op. Any
+    // refusal (budget/dtype/shard) falls through to the CPU path.
+    // Runtime probe (Batch class): the batch either amortizes its
+    // submit+poll on this driver stack or the fused CPU dispatch wins.
+    let mut done = false;
+    if crate::gpu::enabled_here() && (wq.rows() >= crate::gpu::min_rows() || wq.is_q1()) {
+        let arm = if wq.is_q1() && crate::gpu::q1_force() {
+            crate::gpu::ProbeArm::Gpu
+        } else {
+            crate::gpu::probe_arm(crate::gpu::OpClass::Batch)
+        };
+        match arm {
+            crate::gpu::ProbeArm::Gpu => {
+                if let (Some((m, jq)), Some((_, jk)), Some((_, jv))) = (
+                    crate::qtensor::gpu_batch_job(wq, hidden),
+                    crate::qtensor::gpu_batch_job(wk, hidden),
+                    crate::qtensor::gpu_batch_job(wv, hidden),
+                ) {
+                    let t0 = std::time::Instant::now();
+                    done = crate::gpu::matvec_batch(
+                        &m,
+                        &[jq, jk, jv],
+                        &mut [q_raw.as_mut_slice(), k.as_mut_slice(), v.as_mut_slice()],
+                    );
+                    if done {
+                        crate::gpu::probe_record(crate::gpu::OpClass::Batch, true, t0.elapsed());
+                    } else {
+                        crate::gpu::probe_note_decline(crate::gpu::OpClass::Batch);
+                    }
+                } else {
+                    // No batch job could be built for these weights —
+                    // structural, and silence would leave the class
+                    // alternating for the life of the process.
+                    crate::gpu::probe_note_decline(crate::gpu::OpClass::Batch);
+                }
+            }
+            crate::gpu::ProbeArm::CpuTimed => {
+                let t0 = std::time::Instant::now();
+                crate::gpu::cpu_scope(|| {
+                    QTensor::matvec_many(
+                        [wq, wk, wv],
+                        hidden,
+                        [q_raw.as_mut_slice(), k.as_mut_slice(), v.as_mut_slice()],
+                        cfg.pool,
+                    )
+                });
+                crate::gpu::probe_record(crate::gpu::OpClass::Batch, false, t0.elapsed());
+                done = true;
+            }
+            crate::gpu::ProbeArm::Cpu => {
+                crate::gpu::cpu_scope(|| {
+                    QTensor::matvec_many(
+                        [wq, wk, wv],
+                        hidden,
+                        [q_raw.as_mut_slice(), k.as_mut_slice(), v.as_mut_slice()],
+                        cfg.pool,
+                    )
+                });
+                done = true;
+            }
+        }
+    }
+    if !done {
+        // Multi-matrix job: Q, K and V projections under one pool dispatch.
+        QTensor::matvec_many(
+            [wq, wk, wv],
+            hidden,
+            [q_raw.as_mut_slice(), k.as_mut_slice(), v.as_mut_slice()],
+            cfg.pool,
+        );
+    }
+    (q_raw, k, v)
+}
+
+/// Everything between the QKV matvecs and the attend: bias, gate
+/// split, qk-norm, partial RoPE (the shared tail of `project_position`).
+pub(crate) fn finish_projection_debug(
+    q_raw: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    cfg: &QwenAttnCfg,
+    position: usize,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+    let p = finish_projection(q_raw, k, v, cfg, position);
+    (p.q.clone(), p.gate.clone(), p.k.clone(), p.v.clone())
+}
+
+fn finish_projection(
+    mut q_raw: Vec<f32>,
+    mut k: Vec<f32>,
+    mut v: Vec<f32>,
+    cfg: &QwenAttnCfg,
+    position: usize,
+) -> Projected {
+    let (nh, nkv, hd) = (cfg.num_heads, cfg.num_kv_heads, cfg.head_dim);
+    if let Some((bq, bk, bv)) = cfg.bias {
+        for (x, b) in q_raw.iter_mut().zip(bq) {
+            *x += b;
+        }
+        for (x, b) in k.iter_mut().zip(bk) {
+            *x += b;
+        }
+        for (x, b) in v.iter_mut().zip(bv) {
+            *x += b;
+        }
+    }
+
+    // Gate split: per-head [q(hd); gate(hd)] (vmfcore/HF convention).
+    let (mut q, gate) = if cfg.output_gate {
+        let mut qn = take_buf(nh * hd);
+        let mut g = take_buf(nh * hd);
+        for h in 0..nh {
+            let src = h * hd * 2;
+            let dst = h * hd;
+            qn[dst..dst + hd].copy_from_slice(&q_raw[src..src + hd]);
+            g[dst..dst + hd].copy_from_slice(&q_raw[src + hd..src + 2 * hd]);
+        }
+        recycle_buf(&mut q_raw);
+        (qn, g)
+    } else {
+        (q_raw, Vec::new())
+    };
+
+    // qk-norm before RoPE.
+    if let Some(qw) = cfg.q_norm {
+        for h in 0..nh {
+            rmsnorm_head(&mut q[h * hd..h * hd + hd], qw, cfg.rms_eps, cfg.norm_style);
+        }
+    }
+    if let Some(kw) = cfg.k_norm {
+        for g in 0..nkv {
+            rmsnorm_head(&mut k[g * hd..g * hd + hd], kw, cfg.rms_eps, cfg.norm_style);
+        }
+    }
+    if cfg.v_norm {
+        for g in 0..nkv {
+            vnorm_head(&mut v[g * hd..g * hd + hd], cfg.rms_eps);
+        }
+    }
+
+    // Partial RoPE: rotate only the first rotary_dim dims of each head.
+    let rd = cfg.rotary_dim.min(hd);
+    for h in 0..nh {
+        rope_rotate_scaled(
+            &mut q[h * hd..h * hd + rd],
+            position,
+            cfg.inv_freq,
+            cfg.rope_scale,
+        );
+    }
+    for g in 0..nkv {
+        rope_rotate_scaled(
+            &mut k[g * hd..g * hd + rd],
+            position,
+            cfg.inv_freq,
+            cfg.rope_scale,
+        );
+    }
+    Projected { q, gate, k, v }
+}
+
+pub(crate) fn attend_all_heads(
+    q: &[f32],
+    cache: &LayerKvCache,
+    nh: usize,
+    heads_per_kv: usize,
+    hd: usize,
+    scale: f32,
+    window: Option<usize>,
+    softcap: f32,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut attn_out = take_buf(nh * hd);
+    let mut imp = take_buf(cache.seq_len);
+    // Grouped GQA kernel: the group's shared K/V storage is streamed
+    // once for all its Q-heads (per-head attend re-read it
+    // heads_per_kv times). Bit-identical per head — see attend_group.
+    let nkv = nh / heads_per_kv;
+    for g in 0..nkv {
+        let stored = cache.head_len(g);
+        if stored == 0 {
+            continue;
+        }
+        let first = window.map(|w| stored.saturating_sub(w)).unwrap_or(0);
+        let span = g * heads_per_kv * hd..(g + 1) * heads_per_kv * hd;
+        cache.attend_group(
+            &q[span.clone()],
+            g,
+            &mut attn_out[span],
+            &mut imp,
+            scale,
+            first,
+            softcap,
+        );
+    }
+    (attn_out, imp)
+}
+
+#[inline]
+fn apply_gate(ao: &mut [f32], gate: &[f32]) {
+    for (a, &g) in ao.iter_mut().zip(gate) {
+        *a *= 1.0 / (1.0 + (-g).exp());
+    }
+}
+
+#[inline]
+fn softplus(x: f32) -> f32 {
+    x.max(0.0) + (-x.abs()).exp().ln_1p()
+}
+
+fn apply_projected_gate(ao: &mut [f32], raw: &[f32], per_head: bool, head_dim: usize) {
+    if per_head {
+        for (h, &g) in raw.iter().enumerate() {
+            let gain = softplus(g);
+            for a in &mut ao[h * head_dim..(h + 1) * head_dim] {
+                *a *= gain;
+            }
+        }
+    } else {
+        for (a, &g) in ao.iter_mut().zip(raw) {
+            *a *= softplus(g);
+        }
+    }
+}
+
+fn projected_gate(hidden: &[f32], cfg: &QwenAttnCfg) -> Option<Vec<f32>> {
+    cfg.softplus_gate.map(|(proj, _)| {
+        let mut gate = take_buf(proj.rows());
+        proj.matvec(hidden, &mut gate, cfg.pool);
+        gate
+    })
+}
+
+/// The CPU middle of an attention layer whose QKV matvecs already ran
+/// (e.g. on the GPU token graph) and whose O projection runs after:
+/// bias, gate split, qk-norm, RoPE, KV append, grouped attend, output
+/// gate. Bit-identical to `qwen_attention` between its two matvecs.
+pub fn qwen_attention_core(
+    q_raw: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    cache: &mut LayerKvCache,
+    cfg: &QwenAttnCfg,
+) -> Vec<f32> {
+    let (nh, nkv, hd) = (cfg.num_heads, cfg.num_kv_heads, cfg.head_dim);
+    let heads_per_kv = nh / nkv;
+    // A direct caller may have appended the completed boundary without
+    // passing through the usual post-row hook. Seal before accepting another
+    // exact row so the first row after B cannot re-open ordinary KV growth.
+    if cache
+        .o1_pending_boundary()
+        .is_some_and(|target| cache.seq_len >= target)
+    {
+        if let Err(err) = cache.o1_seal_checked(nh) {
+            cache.o1_abort(err);
+        }
+    }
+    let p = finish_projection(q_raw, k, v, cfg, cfg.position);
+    // The Metal sandwich path already ran Q/K/V projections on the device
+    // and calls this middle function directly. If a sealed O(1) view refused
+    // device admission, keep that path on the streaming state; appending to
+    // the now-dropped exact KV here would silently resurrect unbounded cache.
+    if cache.o1_sealed() {
+        let mut ao = cache.o1_step(&p.q, &p.k, &p.v, nh);
+        if cfg.output_gate {
+            apply_gate(&mut ao, &p.gate);
+        }
+        return ao;
+    }
+    // O(1) prefill trace: while a nystrom layer is collecting, the exact
+    // prompt pass also records this position's queries for the seal
+    // (no-op on plain layers).
+    cache.o1_push_q(&p.q);
+    // Empty alive slice = every head alive (append's get().unwrap_or(true))
+    // — the vec![true; nkv] here was one allocation per layer per token.
+    cache.append(&p.k, &p.v, &[]);
+
+    let (mut ao, mut imp) = attend_all_heads(
+        &p.q,
+        cache,
+        nh,
+        heads_per_kv,
+        hd,
+        cfg.scale,
+        cfg.window,
+        cfg.softcap,
+    );
+    cache.accumulate_imp(&imp);
+    if cfg.output_gate {
+        apply_gate(&mut ao, &p.gate);
+    }
+    // A deferred short-prompt seal is a completed-row barrier. The exact
+    // row above is retained in the trace/KV, then conversion happens before
+    // the next row can append. A malformed transition is terminal: clear
+    // the layer and publish the error for Pipeline's existing failure path.
+    if cache
+        .o1_pending_boundary()
+        .is_some_and(|target| cache.seq_len >= target)
+    {
+        if let Err(err) = cache.o1_seal_checked(nh) {
+            cache.o1_abort(err);
+        }
+    }
+    recycle_buf(&mut imp);
+    ao
+}
+
+/// Dense GQA attention for one position (QTensor weights, Qwen3.5 extras).
+#[allow(clippy::too_many_arguments)]
+pub fn qwen_attention(
+    hidden: &[f32],
+    wq: &QTensor,
+    wk: &QTensor,
+    wv: &QTensor,
+    wo: &QTensor,
+    cache: &mut LayerKvCache,
+    cfg: &QwenAttnCfg,
+) -> Vec<f32> {
+    // Once a deferred barrier seals, every following row must use the
+    // streaming state. This dispatch also covers sequential fallback rows
+    // after a pair/batch was split at the barrier.
+    if cache.o1_sealed() {
+        return qwen_attention_nystrom(hidden, wq, wk, wv, wo, cache, cfg);
+    }
+    let (q_raw, k, v) = project_matvecs(hidden, wq, wk, wv, cfg);
+    let mut projected = projected_gate(hidden, cfg);
+    let mut ao = qwen_attention_core(q_raw, k, v, cache, cfg);
+    if let (Some(raw), Some((_, per_head))) = (projected.as_deref(), cfg.softplus_gate) {
+        apply_projected_gate(&mut ao, raw, per_head, cfg.head_dim);
+    }
+    let mut out = take_buf(cfg.hidden_size);
+    wo.matvec(&ao, &mut out, cfg.pool);
+    recycle_buf(&mut ao);
+    if let Some(mut gate) = projected.take() {
+        recycle_buf(&mut gate);
+    }
+    out
+}
+
+/// Batched-chunk exact attention (roadmap §3 P0 «prefill»): Q/K/V and O
+/// projections run as chunk-GEMMs — each weight row streams from memory
+/// ONCE per chunk instead of once per position — while the attention
+/// core stays per-position (causal append order). Per-position math is
+/// identical to `qwen_attention` (matmat ≡ per-position matvec by the
+/// existing parity tests), so the results match the sequential prefill.
+/// `cfg.position` is the chunk's FIRST absolute position.
+#[allow(clippy::too_many_arguments)]
+pub fn qwen_attention_batch(
+    normed_all: &[f32],
+    b: usize,
+    wq: &QTensor,
+    wk: &QTensor,
+    wv: &QTensor,
+    wo: &QTensor,
+    cache: &mut LayerKvCache,
+    cfg: &QwenAttnCfg,
+) -> Vec<f32> {
+    let (nh, nkv, hd) = (cfg.num_heads, cfg.num_kv_heads, cfg.head_dim);
+    let heads_per_kv = nh / nkv;
+    let qrows = wq.rows();
+    debug_assert_eq!(normed_all.len(), b * cfg.hidden_size);
+
+    // A chunk that reaches the deferred barrier is walked row by row so the
+    // completed exact row can seal before the first compressed row. A
+    // sealed state also cannot use this append-and-batched-attend path.
+    if cache.o1_sealed() || cache.o1_boundary_crossed_by(b) {
+        let mut out = take_buf(b * cfg.hidden_size);
+        for bi in 0..b {
+            let mut row_cfg = *cfg;
+            row_cfg.position = cfg.position + bi;
+            let row = qwen_attention(
+                &normed_all[bi * cfg.hidden_size..(bi + 1) * cfg.hidden_size],
+                wq,
+                wk,
+                wv,
+                wo,
+                cache,
+                &row_cfg,
+            );
+            out[bi * cfg.hidden_size..(bi + 1) * cfg.hidden_size].copy_from_slice(&row);
+        }
+        return out;
+    }
+
+    // ── chunk-GEMM projections ──
+    let mut q_all = take_buf(b * qrows);
+    let mut k_all = take_buf(b * nkv * hd);
+    let mut v_all = take_buf(b * nkv * hd);
+    // One fused submission when the device is in play: three `matmat`
+    // calls upload the SAME normed chunk three times and pay three round
+    // trips per layer. Falls through to the per-projection path on any
+    // refusal (non-q4t weights, no device, contention kill).
+    let fused = crate::gpu::enabled_here()
+        && !crate::gpu::mm_killed()
+        && b >= 32
+        && match (wq.mapped_q4t(), wk.mapped_q4t(), wv.mapped_q4t()) {
+            (Some((model, iq)), Some((_, ik)), Some((_, iv))) => {
+                let (rk, rv) = (wk.rows(), wv.rows());
+                let mut cat = take_buf(b * (qrows + rk + rv));
+                let ok = crate::gpu::q4t_qkv(
+                    model,
+                    iq,
+                    ik,
+                    iv,
+                    normed_all,
+                    b,
+                    cfg.hidden_size,
+                    qrows,
+                    rk,
+                    rv,
+                    &mut cat,
+                );
+                if ok {
+                    q_all.copy_from_slice(&cat[..b * qrows]);
+                    k_all.copy_from_slice(&cat[b * qrows..b * (qrows + rk)]);
+                    v_all.copy_from_slice(&cat[b * (qrows + rk)..b * (qrows + rk + rv)]);
+                }
+                recycle_buf(&mut cat);
+                ok
+            }
+            _ => false,
+        };
+    if !fused {
+        wq.matmat(normed_all, b, &mut q_all, cfg.pool);
+        wk.matmat(normed_all, b, &mut k_all, cfg.pool);
+        wv.matmat(normed_all, b, &mut v_all, cfg.pool);
+    }
+    let mut projected_all = cfg.softplus_gate.map(|(proj, _)| {
+        let mut values = take_buf(b * proj.rows());
+        proj.matmat(normed_all, b, &mut values, cfg.pool);
+        values
+    });
+
+    // ── per-position: bias, gate split, qk-norm, partial RoPE, append;
+    //    the attend either runs per position (exact historical order)
+    //    or batched over the whole chunk after the appends ──
+    // Batched causal attend: Accelerate on macOS, the portable NEON
+    // micro-GEMM elsewhere on aarch64 (mobile prefill was per-position
+    // — the quadratic wall).
+    let attend_ok = b >= 32
+        && cache.mode == crate::kv_cache::KvMode::F32
+        && cfg.softcap == 0.0 // capped scores: per-position attend (correctness first)
+        && cfg.window.is_none();
+    // The device can batch it on any architecture. That matters because
+    // the CPU twin needs Accelerate or the NEON micro-GEMM, so x86 had
+    // no batched attend at all and prefill fell back to a per-position
+    // scalar loop — 30% of a 512-token prefill and 46% of a 1024-token
+    // one on a 256-core EPYC.
+    // Every shape condition `chunk_attend` checks is mirrored here: on a
+    // machine with no CPU twin (x86) a refusal after this point would
+    // leave the output zeroed, so refusal must be impossible short of a
+    // lost device.
+    let gpu_attend = attend_ok
+        && crate::gpu::enabled_here()
+        && !crate::gpu::mm_killed()
+        && !cfg.output_gate
+        && cfg.softplus_gate.is_none()
+        && nh > 0
+        && nkv > 0
+        && hd > 0
+        && nh % nkv == 0
+        && cache.o1.is_none();
+    #[cfg(target_arch = "aarch64")]
+    let cpu_attend = attend_ok
+        && (crate::qtensor::accel_gemm_enabled()
+            || std::env::var("CMF_FORCE_NEON_GEMM")
+                .map(|v| v == "1")
+                .unwrap_or(false));
+    #[cfg(not(target_arch = "aarch64"))]
+    let cpu_attend = false;
+    let batched_attend = cpu_attend || gpu_attend;
+    let s0 = cache.seq_len;
+    let mut ao_all = take_buf(b * nh * hd);
+    let mut q_rope_all = if batched_attend {
+        take_buf(b * nh * hd)
+    } else {
+        Vec::new()
+    };
+    let mut gates_all = if batched_attend && cfg.output_gate {
+        take_buf(b * nh * hd)
+    } else {
+        Vec::new()
+    };
+    let rd = cfg.rotary_dim.min(hd);
+    for bi in 0..b {
+        let pos = cfg.position + bi;
+        let q_raw = &mut q_all[bi * qrows..(bi + 1) * qrows];
+        let k = &mut k_all[bi * nkv * hd..(bi + 1) * nkv * hd];
+        let v = &mut v_all[bi * nkv * hd..(bi + 1) * nkv * hd];
+        if let Some((bq, bk, bv)) = cfg.bias {
+            for (x, bb) in q_raw.iter_mut().zip(bq) {
+                *x += bb;
+            }
+            for (x, bb) in k.iter_mut().zip(bk) {
+                *x += bb;
+            }
+            for (x, bb) in v.iter_mut().zip(bv) {
+                *x += bb;
+            }
+        }
+        // Gate split: per-head [q(hd); gate(hd)] (see project_position).
+        let (mut q, mut gate) = if cfg.output_gate {
+            let mut qn = take_buf(nh * hd);
+            let mut g = take_buf(nh * hd);
+            for hh in 0..nh {
+                let src = hh * hd * 2;
+                let dst = hh * hd;
+                qn[dst..dst + hd].copy_from_slice(&q_raw[src..src + hd]);
+                g[dst..dst + hd].copy_from_slice(&q_raw[src + hd..src + 2 * hd]);
+            }
+            (qn, g)
+        } else {
+            (take_buf(nh * hd), Vec::new())
+        };
+        if !cfg.output_gate {
+            q.copy_from_slice(&q_raw[..nh * hd]);
+        }
+        if let Some(qw) = cfg.q_norm {
+            for hh in 0..nh {
+                rmsnorm_head(
+                    &mut q[hh * hd..hh * hd + hd],
+                    qw,
+                    cfg.rms_eps,
+                    cfg.norm_style,
+                );
+            }
+        }
+        if let Some(kw) = cfg.k_norm {
+            for g in 0..nkv {
+                rmsnorm_head(&mut k[g * hd..g * hd + hd], kw, cfg.rms_eps, cfg.norm_style);
+            }
+        }
+        if cfg.v_norm {
+            for g in 0..nkv {
+                vnorm_head(&mut v[g * hd..g * hd + hd], cfg.rms_eps);
+            }
+        }
+        for hh in 0..nh {
+            rope_rotate_scaled(
+                &mut q[hh * hd..hh * hd + rd],
+                pos,
+                cfg.inv_freq,
+                cfg.rope_scale,
+            );
+        }
+        for g in 0..nkv {
+            rope_rotate_scaled(
+                &mut k[g * hd..g * hd + rd],
+                pos,
+                cfg.inv_freq,
+                cfg.rope_scale,
+            );
+        }
+
+        cache.o1_push_q(&q);
+        cache.append(k, v, &[]);
+        if batched_attend {
+            q_rope_all[bi * nh * hd..(bi + 1) * nh * hd].copy_from_slice(&q);
+            if cfg.output_gate {
+                gates_all[bi * nh * hd..(bi + 1) * nh * hd].copy_from_slice(&gate);
+            }
+        } else {
+            let (mut ao, mut imp) = attend_all_heads(
+                &q,
+                cache,
+                nh,
+                heads_per_kv,
+                hd,
+                cfg.scale,
+                cfg.window,
+                cfg.softcap,
+            );
+            cache.accumulate_imp(&imp);
+            if cfg.output_gate {
+                apply_gate(&mut ao, &gate);
+            }
+            if let (Some(all), Some((proj, per_head))) =
+                (projected_all.as_deref(), cfg.softplus_gate)
+            {
+                let raw = &all[bi * proj.rows()..(bi + 1) * proj.rows()];
+                apply_projected_gate(&mut ao, raw, per_head, hd);
+            }
+            ao_all[bi * nh * hd..(bi + 1) * nh * hd].copy_from_slice(&ao);
+            recycle_buf(&mut ao);
+            recycle_buf(&mut imp);
+        }
+        recycle_buf(&mut q);
+        recycle_buf(&mut gate);
+    }
+    if batched_attend {
+        // Head-major pack for the device kernel: [b][nh·hd] -> [nh][b][hd].
+        let mut done = false;
+        if gpu_attend {
+            let mut qhm = take_buf(nh * b * hd);
+            for bi in 0..b {
+                for h in 0..nh {
+                    let src = &q_rope_all[bi * nh * hd + h * hd..bi * nh * hd + (h + 1) * hd];
+                    qhm[h * b * hd + bi * hd..h * b * hd + (bi + 1) * hd].copy_from_slice(src);
+                }
+            }
+            let ks: Vec<&[f32]> = (0..nkv).map(|g| cache.head_keys(g)).collect();
+            let vs: Vec<&[f32]> = (0..nkv).map(|g| cache.head_values(g)).collect();
+            done = crate::gpu::chunk_attend(
+                &qhm,
+                &ks,
+                &vs,
+                b,
+                s0,
+                nh,
+                nkv,
+                hd,
+                cfg.scale,
+                &mut ao_all,
+            );
+            recycle_buf(&mut qhm);
+        }
+        #[cfg(target_arch = "aarch64")]
+        if !done {
+            cache.attend_chunk(
+                &q_rope_all,
+                b,
+                s0,
+                nh,
+                heads_per_kv,
+                hd,
+                &mut ao_all,
+                cfg.pool,
+                cfg.scale,
+                cfg.window,
+            );
+            done = true;
+        }
+        if !done {
+            // Portable fallback. It exists so a device refusal can never
+            // leave `ao_all` untouched: this path is chosen BEFORE the
+            // per-position attend is skipped, and on x86 there is no
+            // other batched attend to fall back to.
+            let n = s0 + b;
+            struct OutPtr(*mut f32);
+            // SAFETY: workers own disjoint query ranges, so the writes
+            // through this pointer never overlap.
+            unsafe impl Send for OutPtr {}
+            unsafe impl Sync for OutPtr {}
+            impl OutPtr {
+                fn at(&self, i: usize) -> *mut f32 {
+                    unsafe { self.0.add(i) }
+                }
+            }
+            let out_ptr = OutPtr(ao_all.as_mut_ptr());
+            let (qr, sc) = (&q_rope_all, cfg.scale);
+            let run = |start: usize, end: usize| {
+                for bi in start..end {
+                    let lim = s0 + bi + 1;
+                    for h in 0..nh {
+                        let kv = h / heads_per_kv;
+                        let (ks, vs) = (cache.head_keys(kv), cache.head_values(kv));
+                        if ks.len() < n * hd || vs.len() < n * hd {
+                            continue;
+                        }
+                        let q = &qr[bi * nh * hd + h * hd..bi * nh * hd + (h + 1) * hd];
+                        let mut probs = vec![0f32; lim];
+                        let mut mx = f32::NEG_INFINITY;
+                        for (j, p) in probs.iter_mut().enumerate() {
+                            let krow = &ks[j * hd..(j + 1) * hd];
+                            let d: f32 = q.iter().zip(krow).map(|(&a, &b)| a * b).sum();
+                            *p = d * sc;
+                            mx = mx.max(*p);
+                        }
+                        let mut sum = 0f32;
+                        for p in probs.iter_mut() {
+                            *p = (*p - mx).exp();
+                            sum += *p;
+                        }
+                        let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+                        let base = bi * nh * hd + h * hd;
+                        for d in 0..hd {
+                            let mut acc = 0f32;
+                            for (j, &p) in probs.iter().enumerate() {
+                                acc += p * vs[j * hd + d];
+                            }
+                            // SAFETY: workers own disjoint query ranges.
+                            unsafe { *out_ptr.at(base + d) = acc * inv };
+                        }
+                    }
+                }
+            };
+            match cfg.pool {
+                Some(p) => p.run_rows(b, &run),
+                None => run(0, b),
+            }
+        }
+        if cfg.output_gate {
+            apply_gate(&mut ao_all, &gates_all);
+        }
+        if let (Some(all), Some((proj, per_head))) = (projected_all.as_deref(), cfg.softplus_gate) {
+            for bi in 0..b {
+                apply_projected_gate(
+                    &mut ao_all[bi * nh * hd..(bi + 1) * nh * hd],
+                    &all[bi * proj.rows()..(bi + 1) * proj.rows()],
+                    per_head,
+                    hd,
+                );
+            }
+        }
+    }
+    recycle_buf(&mut q_rope_all);
+    recycle_buf(&mut gates_all);
+
+    // ── chunk-GEMM output projection ──
+    let mut out = vec![0.0f32; b * cfg.hidden_size];
+    wo.matmat(&ao_all, b, &mut out, cfg.pool);
+    recycle_buf(&mut q_all);
+    recycle_buf(&mut k_all);
+    recycle_buf(&mut v_all);
+    recycle_buf(&mut ao_all);
+    if let Some(mut values) = projected_all.take() {
+        recycle_buf(&mut values);
+    }
+    out
+}
+
+/// Dense GQA attention for one DECODE position on a SEALED O(1) layer:
+/// projection / qk-norm / partial RoPE / output gate are identical to
+/// `qwen_attention`, but the KV cache is replaced by per-KV-group
+/// streaming Nyström states (exact window + permanent sinks + landmark
+/// skeleton, shared across the group's Q heads). Head masks don't
+/// apply — the o1 path is dense, like the masked-on-quantized fallback.
+#[allow(clippy::too_many_arguments)]
+pub fn qwen_attention_nystrom(
+    hidden: &[f32],
+    wq: &QTensor,
+    wk: &QTensor,
+    wv: &QTensor,
+    wo: &QTensor,
+    cache: &mut LayerKvCache,
+    cfg: &QwenAttnCfg,
+) -> Vec<f32> {
+    let p = project_position(hidden, wq, wk, wv, cfg, cfg.position);
+    let mut projected = projected_gate(hidden, cfg);
+    let mut ao = cache.o1_step(&p.q, &p.k, &p.v, cfg.num_heads);
+    if std::env::var("CMF_O1_TRACE").is_ok() {
+        eprintln!(
+            "o1-trace cpu attn[..8] = {:?} (q[..4]={:?} k[..4]={:?})",
+            &ao[..8],
+            &p.q[..4],
+            &p.k[..4]
+        );
+    }
+    if cfg.output_gate {
+        apply_gate(&mut ao, &p.gate);
+    }
+    if let (Some(raw), Some((_, per_head))) = (projected.as_deref(), cfg.softplus_gate) {
+        apply_projected_gate(&mut ao, raw, per_head, cfg.head_dim);
+    }
+    let mut out = vec![0.0f32; cfg.hidden_size];
+    wo.matvec(&ao, &mut out, cfg.pool);
+    if let Some(mut gate) = projected.take() {
+        recycle_buf(&mut gate);
+    }
+    out
+}
+
+/// Fused two-position dense attention (speculative verify): projections
+/// stream the weights once via `matvec2`; attention runs sequentially
+/// (causal dependency through the cache).
+#[allow(clippy::too_many_arguments)]
+pub fn qwen_attention_pair(
+    h1: &[f32],
+    h2: &[f32],
+    wq: &QTensor,
+    wk: &QTensor,
+    wv: &QTensor,
+    wo: &QTensor,
+    cache: &mut LayerKvCache,
+    cfg: &QwenAttnCfg,
+) -> (Vec<f32>, Vec<f32>) {
+    let (nh, nkv, hd) = (cfg.num_heads, cfg.num_kv_heads, cfg.head_dim);
+    let heads_per_kv = nh / nkv;
+
+    // Preserve causal ordering across a deferred boundary. The ordinary
+    // pair kernel is exact-only and would append both rows before a seal;
+    // sequential dispatch lets row B convert and row B+1 use Nyström.
+    if cache.o1_sealed() || cache.o1_boundary_crossed_by(2) {
+        let mut cfg1 = *cfg;
+        cfg1.position = cfg.position;
+        let mut cfg2 = *cfg;
+        cfg2.position = cfg.position + 1;
+        return (
+            qwen_attention(h1, wq, wk, wv, wo, cache, &cfg1),
+            qwen_attention(h2, wq, wk, wv, wo, cache, &cfg2),
+        );
+    }
+
+    // Fused projections (one weight pass for both positions) — Q, K
+    // and V under a single pool dispatch (multi-matrix pair job).
+    let mut q1r = take_buf(wq.rows());
+    let mut q2r = take_buf(wq.rows());
+    let mut k1 = take_buf(nkv * hd);
+    let mut k2 = take_buf(nkv * hd);
+    let mut v1 = take_buf(nkv * hd);
+    let mut v2 = take_buf(nkv * hd);
+    QTensor::matvec2_many(
+        [wq, wk, wv],
+        h1,
+        h2,
+        [q1r.as_mut_slice(), k1.as_mut_slice(), v1.as_mut_slice()],
+        [q2r.as_mut_slice(), k2.as_mut_slice(), v2.as_mut_slice()],
+        cfg.pool,
+    );
+    if let Some((bq, bk, bv)) = cfg.bias {
+        for lane in [(&mut q1r, &mut k1, &mut v1), (&mut q2r, &mut k2, &mut v2)] {
+            for (x, b) in lane.0.iter_mut().zip(bq) {
+                *x += b;
+            }
+            for (x, b) in lane.1.iter_mut().zip(bk) {
+                *x += b;
+            }
+            for (x, b) in lane.2.iter_mut().zip(bv) {
+                *x += b;
+            }
+        }
+    }
+
+    let finish = |mut q_raw: Vec<f32>, k: &mut [f32], pos: usize| -> (Vec<f32>, Vec<f32>) {
+        // split + norms + rope, reusing the single-position logic shape
+        let (mut q, mut gate) = if cfg.output_gate {
+            let mut qn = take_buf(nh * hd);
+            let mut g = take_buf(nh * hd);
+            for h in 0..nh {
+                let src = h * hd * 2;
+                let dst = h * hd;
+                qn[dst..dst + hd].copy_from_slice(&q_raw[src..src + hd]);
+                g[dst..dst + hd].copy_from_slice(&q_raw[src + hd..src + 2 * hd]);
+            }
+            recycle_buf(&mut q_raw);
+            (qn, g)
+        } else {
+            (q_raw, Vec::new())
+        };
+        if let Some(qw) = cfg.q_norm {
+            for h in 0..nh {
+                rmsnorm_head(&mut q[h * hd..h * hd + hd], qw, cfg.rms_eps, cfg.norm_style);
+            }
+        }
+        if let Some(kw) = cfg.k_norm {
+            for g in 0..nkv {
+                rmsnorm_head(&mut k[g * hd..g * hd + hd], kw, cfg.rms_eps, cfg.norm_style);
+            }
+        }
+        let rd = cfg.rotary_dim.min(hd);
+        for h in 0..nh {
+            rope_rotate_scaled(
+                &mut q[h * hd..h * hd + rd],
+                pos,
+                cfg.inv_freq,
+                cfg.rope_scale,
+            );
+        }
+        for g in 0..nkv {
+            rope_rotate_scaled(
+                &mut k[g * hd..g * hd + rd],
+                pos,
+                cfg.inv_freq,
+                cfg.rope_scale,
+            );
+        }
+        let _ = &mut gate;
+        (q, gate)
+    };
+
+    let (mut qa, mut gate1) = finish(q1r, &mut k1, cfg.position);
+    let (mut qb, mut gate2) = finish(q2r, &mut k2, cfg.position + 1);
+    // V-norm (gemma-4): the closure covers q/k; V is normalized here or
+    // the pair prefill caches raw V while singles cache normalized.
+    if cfg.v_norm {
+        for g in 0..nkv {
+            vnorm_head(&mut v1[g * hd..g * hd + hd], cfg.rms_eps);
+            vnorm_head(&mut v2[g * hd..g * hd + hd], cfg.rms_eps);
+        }
+    }
+
+    // O(1) prefill trace (see qwen_attention): lane order = position
+    // order, so the collected buffer stays position-major.
+    cache.o1_push_q(&qa);
+    cache.o1_push_q(&qb);
+    // Empty alive slice = every head alive (see qwen_attention).
+    cache.append(&k1, &v1, &[]);
+    let (mut a1, mut imp1) = attend_all_heads(
+        &qa,
+        cache,
+        nh,
+        heads_per_kv,
+        hd,
+        cfg.scale,
+        cfg.window,
+        cfg.softcap,
+    );
+    cache.accumulate_imp(&imp1);
+
+    cache.append(&k2, &v2, &[]);
+    let (mut a2, mut imp2) = attend_all_heads(
+        &qb,
+        cache,
+        nh,
+        heads_per_kv,
+        hd,
+        cfg.scale,
+        cfg.window,
+        cfg.softcap,
+    );
+    cache.accumulate_imp(&imp2);
+
+    if cfg.output_gate {
+        apply_gate(&mut a1, &gate1);
+        apply_gate(&mut a2, &gate2);
+    }
+    if let Some((proj, per_head)) = cfg.softplus_gate {
+        let mut g1 = take_buf(proj.rows());
+        let mut g2 = take_buf(proj.rows());
+        proj.matvec2(h1, h2, &mut g1, &mut g2, cfg.pool);
+        apply_projected_gate(&mut a1, &g1, per_head, hd);
+        apply_projected_gate(&mut a2, &g2, per_head, hd);
+        recycle_buf(&mut g1);
+        recycle_buf(&mut g2);
+    }
+
+    let mut o1 = take_buf(cfg.hidden_size);
+    let mut o2 = take_buf(cfg.hidden_size);
+    wo.matvec2(&a1, &a2, &mut o1, &mut o2, cfg.pool);
+    for b in [
+        &mut qa, &mut qb, &mut gate1, &mut gate2, &mut k1, &mut k2, &mut v1, &mut v2, &mut a1,
+        &mut a2, &mut imp1, &mut imp2,
+    ] {
+        recycle_buf(b);
+    }
+    (o1, o2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kv_cache::LayerKvCache;
+
+    fn synth(rows: usize, cols: usize, salt: usize) -> QTensor {
+        QTensor::from_f32(
+            (0..rows * cols)
+                .map(|i| (((i * 13 + salt * 7) % 97) as f32 / 97.0 - 0.5) * 0.4)
+                .collect(),
+            rows,
+            cols,
+        )
+    }
+
+    /// Every projection path must apply identical semantics: the pair
+    /// path (prefill / speculative verify) once missed the q/k/v bias
+    /// while singles had it — healthy PPL, garbage generation.
+    #[test]
+    fn pair_with_bias_matches_two_singles() {
+        let (nh, nkv, hd, hs) = (2usize, 1usize, 4usize, 8usize);
+        let wq = synth(nh * hd, hs, 1);
+        let wk = synth(nkv * hd, hs, 2);
+        let wv = synth(nkv * hd, hs, 3);
+        let wo = synth(hs, nh * hd, 4);
+        let bq: Vec<f32> = (0..nh * hd).map(|i| 0.1 + 0.01 * i as f32).collect();
+        let bk: Vec<f32> = (0..nkv * hd).map(|i| -0.2 + 0.02 * i as f32).collect();
+        let bv: Vec<f32> = (0..nkv * hd).map(|i| 0.05 * i as f32).collect();
+        let inv = rope_inv_freq(hd, 10_000.0);
+        let cfg = |position| QwenAttnCfg {
+            num_heads: nh,
+            num_kv_heads: nkv,
+            head_dim: hd,
+            hidden_size: hs,
+            position,
+            inv_freq: &inv,
+            rotary_dim: hd,
+            scale: 1.0 / (hd as f32).sqrt(),
+            softcap: 0.0,
+            window: None,
+            v_norm: false,
+            q_norm: None,
+            k_norm: None,
+            output_gate: false,
+            softplus_gate: None,
+            rope_scale: 1.0,
+            bias: Some((&bq, &bk, &bv)),
+            rms_eps: 1e-6,
+            norm_style: cortiq_core::NormStyle::Qwen,
+            pool: None,
+        };
+        let h1: Vec<f32> = (0..hs).map(|i| (i as f32 * 0.3).sin()).collect();
+        let h2: Vec<f32> = (0..hs).map(|i| (i as f32 * 0.7).cos()).collect();
+
+        let mut c_ref = LayerKvCache::new(nkv, hd);
+        let r1 = qwen_attention(&h1, &wq, &wk, &wv, &wo, &mut c_ref, &cfg(0));
+        let r2 = qwen_attention(&h2, &wq, &wk, &wv, &wo, &mut c_ref, &cfg(1));
+
+        let mut c = LayerKvCache::new(nkv, hd);
+        let (p1, p2) = qwen_attention_pair(&h1, &h2, &wq, &wk, &wv, &wo, &mut c, &cfg(0));
+        for (a, b) in r1.iter().zip(&p1) {
+            assert!((a - b).abs() < 1e-5, "lane1 {a} vs {b}");
+        }
+        for (a, b) in r2.iter().zip(&p2) {
+            assert!((a - b).abs() < 1e-5, "lane2 {a} vs {b}");
+        }
+    }
+
+    /// gemma-4 V-norm: the pair path once normalized q/k but cached RAW
+    /// V — healthy singles, diverging pair prefill.
+    #[test]
+    fn pair_with_v_norm_matches_two_singles() {
+        let (nh, nkv, hd, hs) = (2usize, 1usize, 4usize, 8usize);
+        let wq = synth(nh * hd, hs, 5);
+        let wk = synth(nkv * hd, hs, 6);
+        let wv = synth(nkv * hd, hs, 7);
+        let wo = synth(hs, nh * hd, 8);
+        let inv = rope_inv_freq(hd, 10_000.0);
+        let cfg = |position| QwenAttnCfg {
+            num_heads: nh,
+            num_kv_heads: nkv,
+            head_dim: hd,
+            hidden_size: hs,
+            position,
+            inv_freq: &inv,
+            rotary_dim: hd,
+            scale: 1.0 / (hd as f32).sqrt(),
+            softcap: 0.0,
+            window: None,
+            v_norm: true,
+            q_norm: None,
+            k_norm: None,
+            output_gate: false,
+            softplus_gate: None,
+            rope_scale: 1.0,
+            bias: None,
+            rms_eps: 1e-6,
+            norm_style: cortiq_core::NormStyle::Qwen,
+            pool: None,
+        };
+        let h1: Vec<f32> = (0..hs).map(|i| (i as f32 * 0.4).sin()).collect();
+        let h2: Vec<f32> = (0..hs).map(|i| (i as f32 * 0.9).cos()).collect();
+
+        let mut c_ref = LayerKvCache::new(nkv, hd);
+        let r1 = qwen_attention(&h1, &wq, &wk, &wv, &wo, &mut c_ref, &cfg(0));
+        let r2 = qwen_attention(&h2, &wq, &wk, &wv, &wo, &mut c_ref, &cfg(1));
+
+        let mut c = LayerKvCache::new(nkv, hd);
+        let (p1, p2) = qwen_attention_pair(&h1, &h2, &wq, &wk, &wv, &wo, &mut c, &cfg(0));
+        for (a, b) in r1.iter().zip(&p1) {
+            assert!((a - b).abs() < 1e-5, "lane1 {a} vs {b}");
+        }
+        for (a, b) in r2.iter().zip(&p2) {
+            assert!((a - b).abs() < 1e-5, "lane2 {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn laguna_per_head_softplus_gate_matches_reference() {
+        let (nh, nkv, hd, hs) = (2usize, 1usize, 2usize, 4usize);
+        let zeros = |rows, cols| QTensor::from_f32(vec![0.0; rows * cols], rows, cols);
+        let wq = zeros(nh * hd, hs);
+        let wk = zeros(nkv * hd, hs);
+        let wv = QTensor::from_f32(vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0], nkv * hd, hs);
+        let wo = QTensor::from_f32(
+            vec![
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+            ],
+            hs,
+            nh * hd,
+        );
+        let gate = QTensor::from_f32(vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0], nh, hs);
+        let inv = rope_inv_freq(hd, 10_000.0);
+        let cfg = QwenAttnCfg {
+            num_heads: nh,
+            num_kv_heads: nkv,
+            head_dim: hd,
+            hidden_size: hs,
+            position: 0,
+            inv_freq: &inv,
+            rotary_dim: hd,
+            q_norm: None,
+            k_norm: None,
+            output_gate: false,
+            softplus_gate: Some((&gate, true)),
+            rope_scale: 1.0,
+            rms_eps: 1e-6,
+            scale: 1.0 / (hd as f32).sqrt(),
+            softcap: 0.0,
+            window: None,
+            v_norm: false,
+            norm_style: cortiq_core::NormStyle::Qwen,
+            bias: None,
+            pool: None,
+        };
+        let hidden = vec![0.0, 1.0, 2.0, 3.0];
+        let mut cache = LayerKvCache::new(nkv, hd);
+        let out = qwen_attention(&hidden, &wq, &wk, &wv, &wo, &mut cache, &cfg);
+        let expected = [0.0, softplus(0.0), 0.0, softplus(1.0)];
+        for (actual, expected) in out.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-6, "{actual} != {expected}");
+        }
+    }
+
+    #[test]
+    fn yarn_frequency_endpoints_match_interpolation_contract() {
+        let freq = yarn_inv_freq(64, 500_000.0, 128.0, 8192, 32.0, 1.0);
+        let base = rope_inv_freq(64, 500_000.0);
+        assert_eq!(freq.len(), 32);
+        assert!((freq[0] - base[0]).abs() < 1e-7);
+        assert!((freq[31] - base[31] / 128.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rope_preserves_norm() {
+        let mut q = vec![1.0, 0.0, 0.5, 0.5];
+        let before: f32 = q.iter().map(|x| x * x).sum::<f32>().sqrt();
+        rope_rotate(&mut q, 7, &rope_inv_freq(4, 10000.0));
+        let after: f32 = q.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((before - after).abs() < 1e-5);
+    }
+
+    #[test]
+    fn rope_identity_at_position_zero() {
+        let mut q = vec![0.3, -0.7, 1.1, 0.2];
+        let orig = q.clone();
+        rope_rotate(&mut q, 0, &rope_inv_freq(4, 10000.0));
+        for (a, b) in q.iter().zip(&orig) {
+            assert!((a - b).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn attention_head_uniform() {
+        let head_dim = 4;
+        let seq_len = 3;
+        let q = vec![1.0; head_dim];
+        let k = vec![1.0; seq_len * head_dim];
+        let v = vec![
+            1.0, 0.0, 0.0, 0.0, //
+            0.0, 1.0, 0.0, 0.0, //
+            0.0, 0.0, 1.0, 0.0,
+        ];
+        let (out, probs) = attention_head(&q, &k, &v, head_dim, seq_len);
+        for d in 0..3 {
+            assert!((out[d] - 1.0 / 3.0).abs() < 0.1);
+        }
+        let mass: f32 = probs.iter().sum();
+        assert!((mass - 1.0).abs() < 1e-5, "probs must sum to 1");
+    }
+
+    #[test]
+    fn dead_group_skips_projection_and_cache() {
+        let (heads, kv, hd, hidden) = (4usize, 2usize, 4usize, 8usize);
+        let mut cache = LayerKvCache::new(kv, hd);
+        let h_in = vec![0.5f32; hidden];
+        let wq = vec![0.1f32; heads * hd * hidden];
+        let wk = vec![0.1f32; kv * hd * hidden];
+        let wv = vec![0.1f32; kv * hd * hidden];
+        let wo = vec![0.1f32; hidden * heads * hd];
+
+        // Kill group 1 (Q heads 2 and 3).
+        let active = vec![true, true, false, false];
+        let inv_freq = rope_inv_freq(hd, 1e4);
+        let out = multi_head_attention(
+            &h_in, &wq, &wk, &wv, &wo, &mut cache, heads, kv, hd, hidden, 0, &active, &inv_freq,
+        );
+        assert_eq!(cache.head_len(0), 1, "live group cached");
+        assert_eq!(cache.head_len(1), 0, "dead group must not be cached");
+        assert!(
+            out.iter().any(|&x| x.abs() > 1e-9),
+            "live heads still produce output"
+        );
+    }
+
+    #[test]
+    fn attention_pair_equals_two_sequential_calls() {
+        let (heads, kv, hd, hidden) = (4usize, 2usize, 4usize, 8usize);
+        let mk = |salt: usize, n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i * 7 + salt * 13) % 89) as f32 / 89.0 - 0.5)
+                .collect()
+        };
+        let h1 = mk(1, hidden);
+        let h2 = mk(2, hidden);
+        let wq = mk(3, heads * hd * hidden);
+        let wk = mk(4, kv * hd * hidden);
+        let wv = mk(5, kv * hd * hidden);
+        let wo = mk(6, hidden * heads * hd);
+        let inv_freq = rope_inv_freq(hd, 1e4);
+
+        // Reference: two sequential single-position calls.
+        let mut c_ref = LayerKvCache::new(kv, hd);
+        let r1 = multi_head_attention(
+            &h1, &wq, &wk, &wv, &wo, &mut c_ref, heads, kv, hd, hidden, 5, &[true; 4], &inv_freq,
+        );
+        let r2 = multi_head_attention(
+            &h2, &wq, &wk, &wv, &wo, &mut c_ref, heads, kv, hd, hidden, 6, &[true; 4], &inv_freq,
+        );
+
+        // Fused pair.
+        let mut c_pair = LayerKvCache::new(kv, hd);
+        let (p1, p2) = multi_head_attention_pair(
+            &h1,
+            &h2,
+            &wq,
+            &wk,
+            &wv,
+            &wo,
+            &mut c_pair,
+            heads,
+            kv,
+            hd,
+            hidden,
+            5,
+            &inv_freq,
+        );
+
+        assert_eq!(r1, p1, "pair lane 1 must be bit-identical");
+        assert_eq!(r2, p2, "pair lane 2 must be bit-identical");
+        assert_eq!(c_ref.seq_len, c_pair.seq_len);
+        assert_eq!(c_ref.head_keys(0), c_pair.head_keys(0));
+    }
+
+    #[test]
+    fn masked_equals_dense_when_all_heads_alive() {
+        let (heads, kv, hd, hidden) = (2usize, 1usize, 4usize, 8usize);
+        let h_in: Vec<f32> = (0..hidden).map(|i| (i as f32 * 0.3).sin()).collect();
+        let wq: Vec<f32> = (0..heads * hd * hidden)
+            .map(|i| (i as f32 * 0.01).cos() * 0.1)
+            .collect();
+        let wk: Vec<f32> = (0..kv * hd * hidden)
+            .map(|i| (i as f32 * 0.02).sin() * 0.1)
+            .collect();
+        let wv: Vec<f32> = (0..kv * hd * hidden)
+            .map(|i| (i as f32 * 0.03).cos() * 0.1)
+            .collect();
+        let wo: Vec<f32> = (0..hidden * heads * hd)
+            .map(|i| (i as f32 * 0.04).sin() * 0.1)
+            .collect();
+
+        let mut c1 = LayerKvCache::new(kv, hd);
+        let mut c2 = LayerKvCache::new(kv, hd);
+        let inv_freq = rope_inv_freq(hd, 1e4);
+        let dense = multi_head_attention(
+            &h_in,
+            &wq,
+            &wk,
+            &wv,
+            &wo,
+            &mut c1,
+            heads,
+            kv,
+            hd,
+            hidden,
+            0,
+            &[true, true],
+            &inv_freq,
+        );
+        let masked = multi_head_attention(
+            &h_in, &wq, &wk, &wv, &wo, &mut c2, heads, kv, hd, hidden, 0, &[true; 2], &inv_freq,
+        );
+        for (a, b) in dense.iter().zip(&masked) {
+            assert_eq!(a, b, "full mask must be bit-identical to dense");
+        }
+    }
+}
