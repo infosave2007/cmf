@@ -95,6 +95,7 @@ receipt = dict(command=cmd, version=version, binary_sha256=binary_sha, exit_code
                elapsed_s=elapsed, backend=a.backend, gpu_probe='0', stages=stages,
                engine_env={k: env[k] for k in (
                    'CMF_THREADS', 'CMF_QWEN_IMAGE_PROFILE', 'CMF_QWEN_IMAGE_FUSED_QKV',
+                   'CMF_QWEN_IMAGE_RESIDENT',
                    'CMF_QWEN_IMAGE_FUSED_MLP', 'CMF_QWEN_IMAGE_FUSED_MLP_COOP', 'CMF_QWEN_VAE_GPU', 'CMF_GPU_UPLOAD',
                    'CMF_GPU_UPLOAD_CHUNK_MB', 'CMF_PLANE_CACHE_MB', 'CMF_COOP',
                    'CMF_GPU_VRAM_MB', 'CMF_RAM_TIER_MB', 'WGPU_BACKEND') if k in env},

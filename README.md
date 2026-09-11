@@ -41,7 +41,7 @@ cortiq verify model.cmf
 ## Native Qwen Image Edit
 
 Version 0.6.8 adds the native Qwen-Image-Edit-2509 path. The ready default is
-one self-contained CMF, while the three standalone components remain available
+one self-contained CMF, while the standalone component files remain available
 when users want to stage them independently. Build the bundle from a directory
 that contains `transformer.cmf`, `text_encoder.cmf`, `vae.cmf`, and
 `scheduler_config.json`:
@@ -49,13 +49,10 @@ that contains `transformer.cmf`, `text_encoder.cmf`, `vae.cmf`, and
 ```sh
 cortiq imagine-pack --bundle qwen-image \
   --out qwen-image/qwen-image-edit-2509-q4tp.cmf
-cortiq verify qwen-image/qwen-image-edit-2509-q4tp.cmf
 ```
 
 The bundle embeds the transformer, Qwen2.5-VL text/vision encoder,
-tokenizer/processor/configuration, VAE, scheduler, and its bundle manifest.
-The merge streams the retained component payloads byte-for-byte and does not
-requantize or hold all three source mappings live. Run it directly with no
+tokenizer/processor/configuration, VAE, and scheduler. Run it directly with no
 companion files:
 
 ```sh
@@ -70,9 +67,15 @@ The command requires at least one reference image; repeat `--image` for
 additional references. PNG, JPEG, and PPM output are supported. `CMF_GPU=0`
 forces the portable CPU path. The documented profile keeps
 `--reference-size 1024`: this is the square root of the VAE reference area and
-is independent of the requested output dimensions. See [the Qwen Image
-guide](docs/QWEN_IMAGE.md) for pinned acquisition, standalone staging, and
-bundle packing commands.
+is independent of the requested output dimensions. On a capable Vulkan device,
+`cortiq imagine` automatically selects the resident Qwen transformer forward:
+hidden state stays on the device across transformer blocks and is read back once
+at the end of each forward. CPU and Metal fallback paths remain available, and
+the memory-budgeted admission chooses a compatible path when needed. A current
+RTX 3090 component-folder profile measured 109.487 s for two steps, 9.8 s per
+steady forward, and 18,603 MiB peak device memory; these are workload-specific
+figures. See [the Qwen Image guide](docs/QWEN_IMAGE.md) for pinned acquisition,
+standalone staging, and bundle packing commands.
 
 The standalone layout remains available for explicit component selection:
 
@@ -87,13 +90,7 @@ cortiq imagine qwen-image/transformer.cmf \
   --reference-size 1024 --out watercolor.png
 ```
 
-Qwen Image transformer GGUFs, including `Qwen-Image-Edit-2509-Q6_K.gguf`,
-use the same command. Import streams all tensors into the standalone
-transformer CMF, retains floating-point weights exactly and converts quantized
-matrices to the requested `--quant` (default `q8`, using row and column scales
-for Qwen Image). Pack the official text/vision encoder and VAE with
-`imagine-pack --component`, then use `imagine-pack --bundle` to make the
-self-contained release file described above.
+For pinned sources and component packing, see [the Qwen Image guide](docs/QWEN_IMAGE.md).
 
 The CLI also exposes `info`, `bench`, `ppl`, `serve`, `skill`, `moe-mask`,
 `moe-defrag`, `requant`, `compact`, `sign`, `imagine`, `animate` and
