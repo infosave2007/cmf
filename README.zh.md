@@ -39,18 +39,16 @@ cortiq verify model.cmf
 
 0.6.8 提供 Qwen-Image-Edit-2509 的原生 Rust 流程。默认发布形态是一个
 自包含的 `qwen-image-edit-2509-q4tp.cmf`；独立的 transformer、Qwen2.5-VL
-文本/视觉编码器和 VAE 文件仍可单独暂存或显式选择。将四个已验证输入合并为
-一个文件：
+文本/视觉编码器、VAE 和 scheduler 文件仍可单独暂存或显式选择。使用下面的
+命令合并为一个文件：
 
 ```sh
 cortiq imagine-pack --bundle qwen-image \
   --out qwen-image/qwen-image-edit-2509-q4tp.cmf
-cortiq verify qwen-image/qwen-image-edit-2509-q4tp.cmf
 ```
 
-Bundle 内含 transformer、文本/视觉编码器、tokenizer、processor、配置、VAE、
-调度器和 bundle 清单。合并过程逐个流式复制已有张量字节，不会重新量化；运行
-bundle 不需要旁边再放其它 CMF：
+Bundle 内含 transformer、文本/视觉编码器、tokenizer、processor、配置、VAE 和
+调度器；运行 bundle 不需要旁边再放其它 CMF：
 
 ```sh
 cortiq imagine qwen-image/qwen-image-edit-2509-q4tp.cmf \
@@ -75,6 +73,11 @@ cortiq imagine qwen-image/transformer.cmf \
 ```
 
 `--reference-size 1024` 是 VAE 参考区域 1024² 的平方根，与输出尺寸无关。
+在满足设备和内存预算的 Vulkan 设备上，`cortiq imagine` 会自动选择 Qwen
+transformer 的 resident forward；各 transformer block 之间保留设备端 hidden
+state，每次 forward 末尾只回读一次。CPU 和 Metal fallback 仍可用，预算不满足
+时会选择兼容路径。RTX 3090 的组件目录 profile 记录了两步 109.487 s、稳定
+forward 9.8 s 和 18,603 MiB 峰值设备内存；这些是具体硬件与工作负载的测量值。
 固定获取、打包和配置细节请参阅 [Qwen Image 指南](docs/QWEN_IMAGE.md)。
 
 CLI 还提供 `info`、`bench`、`ppl`、`serve`、`skill`、`moe-mask`、`moe-defrag`、

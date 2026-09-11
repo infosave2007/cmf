@@ -22,6 +22,13 @@ const ROPE_THETA: f64 = 10_000.0;
 const NORM_EPS: f64 = 1e-6;
 const GELU_C: f32 = 0.797_884_6;
 const GELU_K: f32 = 0.044_715;
+// `gpu::vram_budget` is already the effective post-reserve budget used by
+// the residency arena.  The resident Qwen chain's measured 18.6 GiB live set
+// needs a little headroom for VAE/context allocations, so automatic mode is
+// limited to a budget of at least 20 GiB on a discrete adapter.  Unknown or
+// smaller budgets stay on the portable path; an explicit `=1` remains the
+// operator override for a known deployment.
+const QWEN_RESIDENT_MIN_VRAM: u64 = 20 * 1024 * 1024 * 1024;
 
 const PROFILE_INPUT: usize = 0;
 const PROFILE_TIME: usize = 1;
@@ -105,6 +112,15 @@ fn qwen_profile_enabled() -> bool {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("on"))
             .unwrap_or(false)
     })
+}
+
+fn qwen_resident_enabled() -> bool {
+    match std::env::var("CMF_QWEN_IMAGE_RESIDENT").ok().as_deref() {
+        Some("0") => false,
+        Some("1") => true,
+        Some(_) => false,
+        None => crate::gpu::discrete() && crate::gpu::vram_budget() >= QWEN_RESIDENT_MIN_VRAM,
+    }
 }
 
 /// The native dense Qwen Image transformer.
@@ -415,23 +431,74 @@ impl QwenImageTransformer {
         let (img_cos, img_sin, txt_cos, txt_sin) =
             rope_angles(image_shapes, text_len, &self.axes_dim)?;
         profile.finish(PROFILE_QK_NORM_ROPE, profile_span);
-        for block in &self.blocks {
-            block.forward(
-                &mut img,
-                &mut txt,
+        let mut chained = false;
+        if qwen_resident_enabled() && self.blocks.iter().all(Block::chain_capable) {
+            // Timestep projections depend on temb but not on the evolving
+            // hidden state. Prepare their small per-layer vectors once; the
+            // chain then keeps the large image/text panels on the card.
+            let mod_span = profile.begin();
+            let mut mod_cond = temb.clone();
+            silu_inplace(&mut mod_cond);
+            let mut image_mods = Vec::with_capacity(self.blocks.len());
+            let mut text_mods = Vec::with_capacity(self.blocks.len());
+            for block in &self.blocks {
+                let mut image_mod = vec![0.0f32; 6 * self.hidden];
+                let mut text_mod = vec![0.0f32; 6 * self.hidden];
+                block.img_mod.forward_one(&mod_cond, &mut image_mod, pool)?;
+                block.txt_mod.forward_one(&mod_cond, &mut text_mod, pool)?;
+                add_bias(&mut image_mod, 1, &block.img_mod_bias)?;
+                add_bias(&mut text_mod, 1, &block.txt_mod_bias)?;
+                image_mods.push(image_mod);
+                text_mods.push(text_mod);
+            }
+            profile.finish(PROFILE_MODULATION, mod_span);
+            let specs = self
+                .blocks
+                .iter()
+                .zip(image_mods.iter().zip(text_mods.iter()))
+                .map(|(block, (image_mod, text_mod))| {
+                    block.chain_spec(image_mod, text_mod, self.hidden)
+                })
+                .collect::<Vec<_>>();
+            let chain_span = profile.begin();
+            let mut chain_args = crate::gpu::QwenImageChainArgs {
+                image: &mut img,
+                text: &mut txt,
                 image_tokens,
-                text_len,
-                &temb,
-                &img_cos,
-                &img_sin,
-                &txt_cos,
-                &txt_sin,
-                self.hidden,
-                self.heads,
-                self.head_dim,
-                pool,
-                &mut profile,
-            )?;
+                text_tokens: text_len,
+                heads: self.heads,
+                head_dim: self.head_dim,
+                image_cos: &img_cos,
+                image_sin: &img_sin,
+                text_cos: &txt_cos,
+                text_sin: &txt_sin,
+                blocks: &specs,
+            };
+            if crate::gpu::qwen_image_chain(&self.model, &mut chain_args) {
+                profile.blocks += specs.len();
+                profile.finish(PROFILE_ATTENTION, chain_span);
+                chained = true;
+            }
+        }
+        if !chained {
+            for block in &self.blocks {
+                block.forward(
+                    &mut img,
+                    &mut txt,
+                    image_tokens,
+                    text_len,
+                    &temb,
+                    &img_cos,
+                    &img_sin,
+                    &txt_cos,
+                    &txt_sin,
+                    self.hidden,
+                    self.heads,
+                    self.head_dim,
+                    pool,
+                    &mut profile,
+                )?;
+            }
         }
 
         // AdaLayerNormContinuous: SiLU(temb) -> [scale, shift] projection,
@@ -491,6 +558,69 @@ impl QwenImageTransformer {
 }
 
 impl Block {
+    fn chain_capable(&self) -> bool {
+        self.attn_to_q.mapped_q4tp().is_some()
+            && self.attn_to_k.mapped_q4tp().is_some()
+            && self.attn_to_v.mapped_q4tp().is_some()
+            && self.attn_add_q.mapped_q4tp().is_some()
+            && self.attn_add_k.mapped_q4tp().is_some()
+            && self.attn_add_v.mapped_q4tp().is_some()
+            && self.attn_to_out.mapped_q4tp().is_some()
+            && self.attn_to_add_out.mapped_q4tp().is_some()
+            && self.img_mlp_in.mapped_q4tp().is_some()
+            && self.img_mlp_out.mapped_q4tp().is_some()
+            && self.txt_mlp_in.mapped_q4tp().is_some()
+            && self.txt_mlp_out.mapped_q4tp().is_some()
+    }
+
+    fn chain_spec<'a>(
+        &'a self,
+        image_mod: &'a [f32],
+        text_mod: &'a [f32],
+        hidden: usize,
+    ) -> crate::gpu::QwenImageChainBlock<'a> {
+        let index = |linear: &Linear| {
+            linear
+                .mapped_q4tp()
+                .map(|(_, idx)| idx)
+                .unwrap_or(usize::MAX)
+        };
+        crate::gpu::QwenImageChainBlock {
+            image_mod,
+            text_mod,
+            image_q: index(&self.attn_to_q),
+            image_k: index(&self.attn_to_k),
+            image_v: index(&self.attn_to_v),
+            text_q: index(&self.attn_add_q),
+            text_k: index(&self.attn_add_k),
+            text_v: index(&self.attn_add_v),
+            image_out: index(&self.attn_to_out),
+            text_out: index(&self.attn_to_add_out),
+            image_q_norm: &self.norm_q,
+            image_k_norm: &self.norm_k,
+            text_q_norm: &self.norm_added_q,
+            text_k_norm: &self.norm_added_k,
+            image_q_bias: &self.attn_to_q_bias,
+            image_k_bias: &self.attn_to_k_bias,
+            image_v_bias: &self.attn_to_v_bias,
+            text_q_bias: &self.attn_add_q_bias,
+            text_k_bias: &self.attn_add_k_bias,
+            text_v_bias: &self.attn_add_v_bias,
+            image_out_bias: &self.attn_to_out_bias,
+            text_out_bias: &self.attn_to_add_out_bias,
+            image_attn_gate: &image_mod[2 * hidden..3 * hidden],
+            text_attn_gate: &text_mod[2 * hidden..3 * hidden],
+            image_mlp_in: index(&self.img_mlp_in),
+            image_mlp_out: index(&self.img_mlp_out),
+            text_mlp_in: index(&self.txt_mlp_in),
+            text_mlp_out: index(&self.txt_mlp_out),
+            image_mlp_in_bias: &self.img_mlp_in_bias,
+            image_mlp_out_bias: &self.img_mlp_out_bias,
+            text_mlp_in_bias: &self.txt_mlp_in_bias,
+            text_mlp_out_bias: &self.txt_mlp_out_bias,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
@@ -547,120 +677,162 @@ impl Block {
         }
         profile.finish(PROFILE_MODULATION, profile_span);
 
-        // Six affine projections feed the joint attention. The two streams
-        // have distinct Q/K/V matrices, exactly as the official processor.
-        let profile_span = profile.begin();
-        let mut img_q = vec![0.0f32; image_tokens * hidden];
-        let mut img_k = vec![0.0f32; image_tokens * hidden];
-        let mut img_v = vec![0.0f32; image_tokens * hidden];
-        let mut txt_q = vec![0.0f32; text_len * hidden];
-        let mut txt_k = vec![0.0f32; text_len * hidden];
-        let mut txt_v = vec![0.0f32; text_len * hidden];
-        forward_qkv(
-            &self.attn_to_q,
-            &self.attn_to_k,
-            &self.attn_to_v,
+        // The discrete WGPU arm can keep both streams resident for the
+        // complete Qwen block.  The first norm/mod panels above remain the
+        // native caller's boundary; after that this path performs QKV,
+        // joint attention, both output projections, gated residuals and the
+        // two exact tanh-GELU MLPs in one submission.  A refusal leaves the
+        // established attention-plus-MLP fallback below untouched.
+        let chain_span = profile.begin();
+        if fused_qwen_block(
+            self,
+            img,
+            txt,
             &img_n,
-            image_tokens,
-            &mut img_q,
-            &mut img_k,
-            &mut img_v,
-            pool,
-        )?;
-        forward_qkv(
-            &self.attn_add_q,
-            &self.attn_add_k,
-            &self.attn_add_v,
             &txt_n,
-            text_len,
-            &mut txt_q,
-            &mut txt_k,
-            &mut txt_v,
-            pool,
-        )?;
-        add_bias(&mut img_q, image_tokens, &self.attn_to_q_bias)?;
-        add_bias(&mut img_k, image_tokens, &self.attn_to_k_bias)?;
-        add_bias(&mut img_v, image_tokens, &self.attn_to_v_bias)?;
-        add_bias(&mut txt_q, text_len, &self.attn_add_q_bias)?;
-        add_bias(&mut txt_k, text_len, &self.attn_add_k_bias)?;
-        add_bias(&mut txt_v, text_len, &self.attn_add_v_bias)?;
-        profile.finish(PROFILE_QKV, profile_span);
-
-        let profile_span = profile.begin();
-        normalize_rope(&mut img_q, heads, head_dim, &self.norm_q, img_cos, img_sin);
-        normalize_rope(&mut img_k, heads, head_dim, &self.norm_k, img_cos, img_sin);
-        normalize_rope(
-            &mut txt_q,
-            heads,
-            head_dim,
-            &self.norm_added_q,
-            txt_cos,
-            txt_sin,
-        );
-        normalize_rope(
-            &mut txt_k,
-            heads,
-            head_dim,
-            &self.norm_added_k,
-            txt_cos,
-            txt_sin,
-        );
-        profile.finish(PROFILE_QK_NORM_ROPE, profile_span);
-
-        let profile_span = profile.begin();
-        let (img_attn, txt_attn) = joint_attention(
-            &txt_q,
-            &txt_k,
-            &txt_v,
-            &img_q,
-            &img_k,
-            &img_v,
-            text_len,
             image_tokens,
-            hidden,
+            text_len,
             heads,
             head_dim,
-            pool,
-        );
-        profile.finish(PROFILE_ATTENTION, profile_span);
+            hidden,
+            img_cos,
+            img_sin,
+            txt_cos,
+            txt_sin,
+            &img_mod,
+            &txt_mod,
+        ) {
+            // The aggregate is recorded under attention because the public
+            // profile has no separate resident-chain bucket; the fallback
+            // stages remain zero for this block rather than double-counting
+            // one wall-clock span in several categories.
+            profile.finish(PROFILE_ATTENTION, chain_span);
+            return Ok(());
+        }
 
-        let profile_span = profile.begin();
         let mut img_proj = vec![0.0f32; img.len()];
         let mut txt_proj = vec![0.0f32; txt.len()];
-        self.attn_to_out
-            .forward(&img_attn, image_tokens, &mut img_proj, pool)?;
-        self.attn_to_add_out
-            .forward(&txt_attn, text_len, &mut txt_proj, pool)?;
-        add_bias(&mut img_proj, image_tokens, &self.attn_to_out_bias)?;
-        add_bias(&mut txt_proj, text_len, &self.attn_to_add_out_bias)?;
+        let resident_span = profile.begin();
+        let resident = fused_qwen_attention(
+            self,
+            &img_n,
+            &txt_n,
+            image_tokens,
+            text_len,
+            heads,
+            head_dim,
+            img_cos,
+            img_sin,
+            txt_cos,
+            txt_sin,
+            hidden,
+            &mut img_proj,
+            &mut txt_proj,
+        );
+        if resident {
+            // The resident helper accounts for all QKV, qk-norm/RoPE,
+            // attention, and output-projection work as one device span.  It
+            // also applies both output biases before the single readback.
+            profile.finish(PROFILE_QKV, None);
+            profile.finish(PROFILE_QK_NORM_ROPE, None);
+            profile.finish(PROFILE_ATTENTION, resident_span);
+            profile.finish(PROFILE_ATTN_OUTPUT, None);
+        } else {
+            // Six affine projections feed the joint attention. The two
+            // streams have distinct Q/K/V matrices, exactly as the official
+            // processor.
+            let profile_span = profile.begin();
+            let mut img_q = vec![0.0f32; image_tokens * hidden];
+            let mut img_k = vec![0.0f32; image_tokens * hidden];
+            let mut img_v = vec![0.0f32; image_tokens * hidden];
+            let mut txt_q = vec![0.0f32; text_len * hidden];
+            let mut txt_k = vec![0.0f32; text_len * hidden];
+            let mut txt_v = vec![0.0f32; text_len * hidden];
+            forward_qkv(
+                &self.attn_to_q,
+                &self.attn_to_k,
+                &self.attn_to_v,
+                &img_n,
+                image_tokens,
+                &mut img_q,
+                &mut img_k,
+                &mut img_v,
+                pool,
+            )?;
+            forward_qkv(
+                &self.attn_add_q,
+                &self.attn_add_k,
+                &self.attn_add_v,
+                &txt_n,
+                text_len,
+                &mut txt_q,
+                &mut txt_k,
+                &mut txt_v,
+                pool,
+            )?;
+            add_bias(&mut img_q, image_tokens, &self.attn_to_q_bias)?;
+            add_bias(&mut img_k, image_tokens, &self.attn_to_k_bias)?;
+            add_bias(&mut img_v, image_tokens, &self.attn_to_v_bias)?;
+            add_bias(&mut txt_q, text_len, &self.attn_add_q_bias)?;
+            add_bias(&mut txt_k, text_len, &self.attn_add_k_bias)?;
+            add_bias(&mut txt_v, text_len, &self.attn_add_v_bias)?;
+            profile.finish(PROFILE_QKV, profile_span);
+
+            let profile_span = profile.begin();
+            normalize_rope(&mut img_q, heads, head_dim, &self.norm_q, img_cos, img_sin);
+            normalize_rope(&mut img_k, heads, head_dim, &self.norm_k, img_cos, img_sin);
+            normalize_rope(
+                &mut txt_q,
+                heads,
+                head_dim,
+                &self.norm_added_q,
+                txt_cos,
+                txt_sin,
+            );
+            normalize_rope(
+                &mut txt_k,
+                heads,
+                head_dim,
+                &self.norm_added_k,
+                txt_cos,
+                txt_sin,
+            );
+            profile.finish(PROFILE_QK_NORM_ROPE, profile_span);
+
+            let profile_span = profile.begin();
+            let (img_attn, txt_attn) = joint_attention(
+                &txt_q,
+                &txt_k,
+                &txt_v,
+                &img_q,
+                &img_k,
+                &img_v,
+                text_len,
+                image_tokens,
+                hidden,
+                heads,
+                head_dim,
+                pool,
+            );
+            profile.finish(PROFILE_ATTENTION, profile_span);
+
+            let profile_span = profile.begin();
+            self.attn_to_out
+                .forward(&img_attn, image_tokens, &mut img_proj, pool)?;
+            self.attn_to_add_out
+                .forward(&txt_attn, text_len, &mut txt_proj, pool)?;
+            add_bias(&mut img_proj, image_tokens, &self.attn_to_out_bias)?;
+            add_bias(&mut txt_proj, text_len, &self.attn_to_add_out_bias)?;
+            profile.finish(PROFILE_ATTN_OUTPUT, profile_span);
+        }
         gated_residual(img, &img_proj, &img_mod[2 * hidden..3 * hidden]);
         gated_residual(txt, &txt_proj, &txt_mod[2 * hidden..3 * hidden]);
-        profile.finish(PROFILE_ATTN_OUTPUT, profile_span);
 
         // Second normalized/modulated input and independent GELU-tanh MLPs.
-        let profile_span = profile.begin();
-        for r in 0..image_tokens {
-            layer_norm_into(
-                &img[r * hidden..(r + 1) * hidden],
-                NORM_EPS,
-                &mut img_n[r * hidden..(r + 1) * hidden],
-            );
-            modulate_row(
-                &mut img_n[r * hidden..(r + 1) * hidden],
-                &img_mod[3 * hidden..6 * hidden],
-            );
-        }
-        for r in 0..text_len {
-            layer_norm_into(
-                &txt[r * hidden..(r + 1) * hidden],
-                NORM_EPS,
-                &mut txt_n[r * hidden..(r + 1) * hidden],
-            );
-            modulate_row(
-                &mut txt_n[r * hidden..(r + 1) * hidden],
-                &txt_mod[3 * hidden..6 * hidden],
-            );
-        }
+        // The resident arm keeps this complete sub-block on the device.  It
+        // is attempted independently for the two streams so a mixed codec
+        // model still gets the exact host fallback for whichever stream
+        // cannot satisfy the Q4TP contract.
         let inter = self.img_mlp_in.rows();
         if self.img_mlp_out.cols() != inter || self.txt_mlp_in.rows() != inter {
             return Err(format!(
@@ -671,73 +843,135 @@ impl Block {
                 self.txt_mlp_out.cols()
             ));
         }
-        let mut img_ff = vec![0.0f32; img.len()];
-        let mut txt_ff = vec![0.0f32; txt.len()];
-        // On a wide Q4TP batch the WGPU arm keeps the intermediate panel on
-        // the device and applies both biases plus exact tanh-GELU there.  A
-        // refusal (unsupported codec/limits/backend/probe) falls through to
-        // the original bounded projection + pooled pointwise sequence.
-        let img_fused = fused_qwen_gelu_ffn(
+        let profile_span = profile.begin();
+        let img_resident = fused_qwen_mlp_block(
             &self.img_mlp_in,
             &self.img_mlp_out,
-            &img_n,
+            img,
             image_tokens,
             hidden,
             inter,
             &self.img_mlp_in_bias,
             &self.img_mlp_out_bias,
-            &mut img_ff,
+            &img_mod[3 * hidden..5 * hidden],
+            &img_mod[5 * hidden..6 * hidden],
         );
-        let txt_fused = fused_qwen_gelu_ffn(
+        let txt_resident = fused_qwen_mlp_block(
             &self.txt_mlp_in,
             &self.txt_mlp_out,
-            &txt_n,
+            txt,
             text_len,
             hidden,
             inter,
             &self.txt_mlp_in_bias,
             &self.txt_mlp_out_bias,
-            &mut txt_ff,
+            &txt_mod[3 * hidden..5 * hidden],
+            &txt_mod[5 * hidden..6 * hidden],
         );
-        if !img_fused {
-            let mut img_mlp = vec![0.0f32; image_tokens * inter];
-            self.img_mlp_in
-                .forward(&img_n, image_tokens, &mut img_mlp, pool)?;
-            // Bias and tanh-GELU are one row-parallel pass.  The helper
-            // preserves the original add-then-GELU order.
-            gelu_tanh_bias_inplace(&mut img_mlp, image_tokens, &self.img_mlp_in_bias, pool)?;
-            self.img_mlp_out
-                .forward(&img_mlp, image_tokens, &mut img_ff, pool)?;
+        if img_resident && txt_resident {
+            profile.finish(PROFILE_MLP, profile_span);
+            return Ok(());
         }
-        if !txt_fused {
-            let mut txt_mlp = vec![0.0f32; text_len * inter];
-            self.txt_mlp_in
-                .forward(&txt_n, text_len, &mut txt_mlp, pool)?;
-            gelu_tanh_bias_inplace(&mut txt_mlp, text_len, &self.txt_mlp_in_bias, pool)?;
-            self.txt_mlp_out
-                .forward(&txt_mlp, text_len, &mut txt_ff, pool)?;
+        // Refused streams use the original f64 LayerNorm and bounded host
+        // projection sequence. A resident stream has already updated its
+        // state and is left untouched below.
+        if !img_resident {
+            for r in 0..image_tokens {
+                layer_norm_into(
+                    &img[r * hidden..(r + 1) * hidden],
+                    NORM_EPS,
+                    &mut img_n[r * hidden..(r + 1) * hidden],
+                );
+                modulate_row(
+                    &mut img_n[r * hidden..(r + 1) * hidden],
+                    &img_mod[3 * hidden..6 * hidden],
+                );
+            }
         }
-        if img_fused {
-            gated_residual(img, &img_ff, &img_mod[5 * hidden..6 * hidden]);
-        } else {
-            gated_residual_bias(
-                img,
-                &img_ff,
+        if !txt_resident {
+            for r in 0..text_len {
+                layer_norm_into(
+                    &txt[r * hidden..(r + 1) * hidden],
+                    NORM_EPS,
+                    &mut txt_n[r * hidden..(r + 1) * hidden],
+                );
+                modulate_row(
+                    &mut txt_n[r * hidden..(r + 1) * hidden],
+                    &txt_mod[3 * hidden..6 * hidden],
+                );
+            }
+        }
+        if !img_resident {
+            let mut img_ff = vec![0.0f32; img.len()];
+            // On a wide Q4TP batch this legacy resident FFN can still keep
+            // its intermediate panel on the device. If it refuses, the
+            // original bounded projection + pooled pointwise sequence is
+            // exact and remains the final fallback.
+            let img_fused = fused_qwen_gelu_ffn(
+                &self.img_mlp_in,
+                &self.img_mlp_out,
+                &img_n,
+                image_tokens,
+                hidden,
+                inter,
+                &self.img_mlp_in_bias,
                 &self.img_mlp_out_bias,
-                &img_mod[5 * hidden..6 * hidden],
-                pool,
-            )?;
+                &mut img_ff,
+            );
+            if !img_fused {
+                let mut img_mlp = vec![0.0f32; image_tokens * inter];
+                self.img_mlp_in
+                    .forward(&img_n, image_tokens, &mut img_mlp, pool)?;
+                // Bias and tanh-GELU are one row-parallel pass.  The helper
+                // preserves the original add-then-GELU order.
+                gelu_tanh_bias_inplace(&mut img_mlp, image_tokens, &self.img_mlp_in_bias, pool)?;
+                self.img_mlp_out
+                    .forward(&img_mlp, image_tokens, &mut img_ff, pool)?;
+            }
+            if img_fused {
+                gated_residual(img, &img_ff, &img_mod[5 * hidden..6 * hidden]);
+            } else {
+                gated_residual_bias(
+                    img,
+                    &img_ff,
+                    &self.img_mlp_out_bias,
+                    &img_mod[5 * hidden..6 * hidden],
+                    pool,
+                )?;
+            }
         }
-        if txt_fused {
-            gated_residual(txt, &txt_ff, &txt_mod[5 * hidden..6 * hidden]);
-        } else {
-            gated_residual_bias(
-                txt,
-                &txt_ff,
+        if !txt_resident {
+            let mut txt_ff = vec![0.0f32; txt.len()];
+            let txt_fused = fused_qwen_gelu_ffn(
+                &self.txt_mlp_in,
+                &self.txt_mlp_out,
+                &txt_n,
+                text_len,
+                hidden,
+                inter,
+                &self.txt_mlp_in_bias,
                 &self.txt_mlp_out_bias,
-                &txt_mod[5 * hidden..6 * hidden],
-                pool,
-            )?;
+                &mut txt_ff,
+            );
+            if !txt_fused {
+                let mut txt_mlp = vec![0.0f32; text_len * inter];
+                self.txt_mlp_in
+                    .forward(&txt_n, text_len, &mut txt_mlp, pool)?;
+                gelu_tanh_bias_inplace(&mut txt_mlp, text_len, &self.txt_mlp_in_bias, pool)?;
+                self.txt_mlp_out
+                    .forward(&txt_mlp, text_len, &mut txt_ff, pool)?;
+            }
+            if txt_fused {
+                gated_residual(txt, &txt_ff, &txt_mod[5 * hidden..6 * hidden]);
+            } else {
+                gated_residual_bias(
+                    txt,
+                    &txt_ff,
+                    &self.txt_mlp_out_bias,
+                    &txt_mod[5 * hidden..6 * hidden],
+                    pool,
+                )?;
+            }
         }
         profile.finish(PROFILE_MLP, profile_span);
         Ok(())
@@ -769,6 +1003,270 @@ fn fused_qwen_gelu_ffn(
         return false;
     }
     crate::gpu::q4tp_gelu_ffn(im, ii, oi, x, batch, hidden, inter, bias_in, bias_out, out)
+}
+
+/// Attempt the complete Qwen second sub-block for one stream.  The device
+/// arm owns the affine-free LayerNorm, shift/scale, two Q4TP projections,
+/// exact tanh-GELU, projection bias, and gated residual; it returns one
+/// final host panel.  A refusal leaves `data` untouched so the caller can
+/// use the original portable path for this stream alone.
+#[allow(clippy::too_many_arguments)]
+fn fused_qwen_mlp_block(
+    input: &Linear,
+    output: &Linear,
+    data: &mut [f32],
+    batch: usize,
+    hidden: usize,
+    inter: usize,
+    bias_in: &[f32],
+    bias_out: &[f32],
+    modulation: &[f32],
+    gate: &[f32],
+) -> bool {
+    if !qwen_resident_enabled() || std::env::var("CMF_QWEN_IMAGE_FUSED_MLP").as_deref() == Ok("0") {
+        return false;
+    }
+    let (Some((im, ii)), Some((om, oi))) = (input.mapped_q4tp(), output.mapped_q4tp()) else {
+        return false;
+    };
+    if im.uid() != om.uid() {
+        return false;
+    }
+    crate::gpu::qwen_image_mlp_inplace(
+        im, ii, oi, data, batch, hidden, inter, bias_in, bias_out, modulation, gate,
+    )
+}
+
+/// Attempt the full Qwen block as one device-resident graph.  The raw
+/// streams are mutable because the backend writes the final block states
+/// back into those same panels; the normalized first panels are separate
+/// host buffers prepared by `Block::forward`.
+#[allow(clippy::too_many_arguments)]
+fn fused_qwen_block(
+    block: &Block,
+    image: &mut [f32],
+    text: &mut [f32],
+    image_norm: &[f32],
+    text_norm: &[f32],
+    image_tokens: usize,
+    text_tokens: usize,
+    heads: usize,
+    head_dim: usize,
+    hidden: usize,
+    image_cos: &[f32],
+    image_sin: &[f32],
+    text_cos: &[f32],
+    text_sin: &[f32],
+    image_mod: &[f32],
+    text_mod: &[f32],
+) -> bool {
+    if !qwen_resident_enabled()
+        || std::env::var("CMF_QWEN_IMAGE_FUSED_MLP").as_deref() == Ok("0")
+        || image_mod.len() != hidden.saturating_mul(6)
+        || text_mod.len() != hidden.saturating_mul(6)
+    {
+        return false;
+    }
+    let mappings = [
+        block.attn_to_q.mapped_q4tp(),
+        block.attn_to_k.mapped_q4tp(),
+        block.attn_to_v.mapped_q4tp(),
+        block.attn_add_q.mapped_q4tp(),
+        block.attn_add_k.mapped_q4tp(),
+        block.attn_add_v.mapped_q4tp(),
+        block.attn_to_out.mapped_q4tp(),
+        block.attn_to_add_out.mapped_q4tp(),
+        block.img_mlp_in.mapped_q4tp(),
+        block.img_mlp_out.mapped_q4tp(),
+        block.txt_mlp_in.mapped_q4tp(),
+        block.txt_mlp_out.mapped_q4tp(),
+    ];
+    let [
+        Some((model, image_q)),
+        Some((image_model_k, image_k)),
+        Some((image_model_v, image_v)),
+        Some((text_model_q, text_q)),
+        Some((text_model_k, text_k)),
+        Some((text_model_v, text_v)),
+        Some((image_out_model, image_out)),
+        Some((text_out_model, text_out)),
+        Some((image_mlp_in_model, image_mlp_in)),
+        Some((image_mlp_out_model, image_mlp_out)),
+        Some((text_mlp_in_model, text_mlp_in)),
+        Some((text_mlp_out_model, text_mlp_out)),
+    ] = mappings
+    else {
+        return false;
+    };
+    let uid = model.uid();
+    if [
+        image_model_k,
+        image_model_v,
+        text_model_q,
+        text_model_k,
+        text_model_v,
+        image_out_model,
+        text_out_model,
+        image_mlp_in_model,
+        image_mlp_out_model,
+        text_mlp_in_model,
+        text_mlp_out_model,
+    ]
+    .iter()
+    .any(|m| m.uid() != uid)
+    {
+        return false;
+    }
+    let mut args = crate::gpu::QwenImageBlockArgs {
+        image,
+        text,
+        image_norm,
+        text_norm,
+        image_tokens,
+        text_tokens,
+        heads,
+        head_dim,
+        image_cos,
+        image_sin,
+        text_cos,
+        text_sin,
+        image_q,
+        image_k,
+        image_v,
+        text_q,
+        text_k,
+        text_v,
+        image_out,
+        text_out,
+        image_q_norm: &block.norm_q,
+        image_k_norm: &block.norm_k,
+        text_q_norm: &block.norm_added_q,
+        text_k_norm: &block.norm_added_k,
+        image_q_bias: &block.attn_to_q_bias,
+        image_k_bias: &block.attn_to_k_bias,
+        image_v_bias: &block.attn_to_v_bias,
+        text_q_bias: &block.attn_add_q_bias,
+        text_k_bias: &block.attn_add_k_bias,
+        text_v_bias: &block.attn_add_v_bias,
+        image_out_bias: &block.attn_to_out_bias,
+        text_out_bias: &block.attn_to_add_out_bias,
+        image_attn_gate: &image_mod[2 * hidden..3 * hidden],
+        text_attn_gate: &text_mod[2 * hidden..3 * hidden],
+        image_mlp_in,
+        image_mlp_out,
+        text_mlp_in,
+        text_mlp_out,
+        image_mlp_in_bias: &block.img_mlp_in_bias,
+        image_mlp_out_bias: &block.img_mlp_out_bias,
+        text_mlp_in_bias: &block.txt_mlp_in_bias,
+        text_mlp_out_bias: &block.txt_mlp_out_bias,
+        image_mlp_mod: &image_mod[3 * hidden..5 * hidden],
+        text_mlp_mod: &text_mod[3 * hidden..5 * hidden],
+        image_mlp_gate: &image_mod[5 * hidden..6 * hidden],
+        text_mlp_gate: &text_mod[5 * hidden..6 * hidden],
+    };
+    crate::gpu::qwen_image_block(model, &mut args)
+}
+
+/// Attempt the Qwen-specific resident attention half.  The generic DiT
+/// block has a single stream and one QKV/output projection; Qwen has two
+/// streams with distinct projections and distinct qk norms, so it needs the
+/// dedicated contract exposed by `gpu::qwen_image_attention`.
+#[allow(clippy::too_many_arguments)]
+fn fused_qwen_attention(
+    block: &Block,
+    img_n: &[f32],
+    txt_n: &[f32],
+    image_tokens: usize,
+    text_len: usize,
+    heads: usize,
+    head_dim: usize,
+    img_cos: &[f32],
+    img_sin: &[f32],
+    txt_cos: &[f32],
+    txt_sin: &[f32],
+    hidden: usize,
+    img_proj: &mut [f32],
+    txt_proj: &mut [f32],
+) -> bool {
+    // Automatic mode is capability-gated in `qwen_resident_enabled`; `=0`
+    // remains a diagnostic switch that leaves the portable caller intact.
+    if !qwen_resident_enabled() {
+        return false;
+    }
+    let mappings = [
+        block.attn_to_q.mapped_q4tp(),
+        block.attn_to_k.mapped_q4tp(),
+        block.attn_to_v.mapped_q4tp(),
+        block.attn_add_q.mapped_q4tp(),
+        block.attn_add_k.mapped_q4tp(),
+        block.attn_add_v.mapped_q4tp(),
+        block.attn_to_out.mapped_q4tp(),
+        block.attn_to_add_out.mapped_q4tp(),
+    ];
+    let [
+        Some((model, image_q)),
+        Some((image_model_k, image_k)),
+        Some((image_model_v, image_v)),
+        Some((text_model_q, text_q)),
+        Some((text_model_k, text_k)),
+        Some((text_model_v, text_v)),
+        Some((image_out_model, image_out)),
+        Some((text_out_model, text_out)),
+    ] = mappings
+    else {
+        return false;
+    };
+    let uid = model.uid();
+    if [
+        image_model_k,
+        image_model_v,
+        text_model_q,
+        text_model_k,
+        text_model_v,
+        image_out_model,
+        text_out_model,
+    ]
+    .iter()
+    .any(|m| m.uid() != uid)
+    {
+        return false;
+    }
+    let mut args = crate::gpu::QwenImageAttentionArgs {
+        image: img_n,
+        text: txt_n,
+        image_tokens,
+        text_tokens: text_len,
+        heads,
+        head_dim,
+        image_q,
+        image_k,
+        image_v,
+        text_q,
+        text_k,
+        text_v,
+        image_out,
+        text_out,
+        image_q_norm: &block.norm_q,
+        image_k_norm: &block.norm_k,
+        text_q_norm: &block.norm_added_q,
+        text_k_norm: &block.norm_added_k,
+        image_cos: img_cos,
+        image_sin: img_sin,
+        text_cos: txt_cos,
+        text_sin: txt_sin,
+        image_q_bias: &block.attn_to_q_bias,
+        image_k_bias: &block.attn_to_k_bias,
+        image_v_bias: &block.attn_to_v_bias,
+        text_q_bias: &block.attn_add_q_bias,
+        text_k_bias: &block.attn_add_k_bias,
+        text_v_bias: &block.attn_add_v_bias,
+        image_out_bias: &block.attn_to_out_bias,
+        text_out_bias: &block.attn_to_add_out_bias,
+        image_proj: img_proj,
+        text_proj: txt_proj,
+    };
+    crate::gpu::qwen_image_attention(model, &mut args)
 }
 
 fn load_block(
@@ -1068,10 +1566,7 @@ fn gelu_tanh_bias_inplace(
         // The pool hands out rows, so every worker gets a whole number of
         // bias vectors and the source slice remains immutable to its peers.
         let rows = unsafe {
-            std::slice::from_raw_parts_mut(
-                panel.as_ptr().add(start * width),
-                (end - start) * width,
-            )
+            std::slice::from_raw_parts_mut(panel.as_ptr().add(start * width), (end - start) * width)
         };
         for row in rows.chunks_exact_mut(width) {
             for (value, &b) in row.iter_mut().zip(bias) {
@@ -1307,8 +1802,8 @@ fn softmax_inplace(row: &mut [f32]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        checked_shape_tokens, gated_residual_bias, gelu_tanh_bias_inplace, rope_angles, Pool,
-        GELU_C, GELU_K,
+        GELU_C, GELU_K, Pool, checked_shape_tokens, gated_residual_bias, gelu_tanh_bias_inplace,
+        rope_angles,
     };
 
     #[test]
