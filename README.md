@@ -59,7 +59,7 @@ companion files:
 cortiq imagine qwen-image/qwen-image-edit-2509-q4tp.cmf \
   --image docs/media/fox-512.png \
   --prompt "Add a vivid blue knitted scarf while preserving the fox, pose, and snowy background." \
-  --height 512 --width 512 --steps 30 --cfg 4 --seed 7 \
+  --height 1024 --width 1024 --steps 40 --cfg 4 --seed 7 \
   --reference-size 1024 --out fox-scarf.png
 ```
 
@@ -71,11 +71,9 @@ is independent of the requested output dimensions. On a capable Vulkan device,
 `cortiq imagine` automatically selects the resident Qwen transformer forward:
 hidden state stays on the device across transformer blocks and is read back once
 at the end of each forward. CPU and Metal fallback paths remain available, and
-the memory-budgeted admission chooses a compatible path when needed. A current
-RTX 3090 component-folder profile measured 109.487 s for two steps, 9.8 s per
-steady forward, and 18,603 MiB peak device memory; these are workload-specific
-figures. See [the Qwen Image guide](docs/QWEN_IMAGE.md) for pinned acquisition,
-standalone staging, and bundle packing commands.
+the memory-budgeted admission chooses a compatible path when needed. See [the
+Qwen Image guide](docs/QWEN_IMAGE.md) for pinned acquisition, standalone staging,
+and bundle packing commands.
 
 The standalone layout remains available for explicit component selection:
 
@@ -86,7 +84,7 @@ cortiq imagine qwen-image/transformer.cmf \
   --scheduler qwen-image/scheduler_config.json \
   --image docs/media/fox-512.png \
   --prompt "Turn the scene into a watercolor illustration." \
-  --height 512 --width 512 --steps 30 --cfg 4 --seed 7 \
+  --height 1024 --width 1024 --steps 40 --cfg 4 --seed 7 \
   --reference-size 1024 --out watercolor.png
 ```
 

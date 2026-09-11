@@ -1032,13 +1032,13 @@ enum Commands {
         /// Text prompt
         #[arg(long)]
         prompt: String,
-        #[arg(long, default_value_t = 512)]
-        height: usize,
-        #[arg(long, default_value_t = 512)]
-        width: usize,
+        #[arg(long)]
+        height: Option<usize>,
+        #[arg(long)]
+        width: Option<usize>,
         /// Denoising steps
-        #[arg(long, default_value_t = 30)]
-        steps: usize,
+        #[arg(long)]
+        steps: Option<usize>,
         /// Guidance scale (≤1 disables CFG and halves the work)
         #[arg(long, default_value_t = 4.0)]
         cfg: f32,
@@ -5047,9 +5047,9 @@ fn qwen_component_paths(
 fn cmd_imagine(
     model_dir: &str,
     prompt: &str,
-    height: usize,
-    width: usize,
-    steps: usize,
+    height: Option<usize>,
+    width: Option<usize>,
+    steps: Option<usize>,
     cfg: f32,
     seed: u64,
     out: &str,
@@ -5078,10 +5078,11 @@ fn cmd_imagine(
                 "Qwen Image: reference area {reference_size}² differs from the official 1024² profile"
             );
         }
+        let defaults = cortiq_engine::qwen_imagegen::QwenImageParams::default();
         let params = cortiq_engine::qwen_imagegen::QwenImageParams {
-            height,
-            width,
-            steps,
+            height: height.unwrap_or(defaults.height),
+            width: width.unwrap_or(defaults.width),
+            steps: steps.unwrap_or(defaults.steps),
             true_cfg_scale: cfg,
             seed,
             reference_size,
@@ -5107,9 +5108,10 @@ fn cmd_imagine(
             .save(std::path::Path::new(out))
             .map_err(anyhow::Error::msg)?;
         println!(
-            "{out}: {}x{}, {steps} steps in {:.1}s",
+            "{out}: {}x{}, {} steps in {:.1}s",
             image.width,
             image.height,
+            params.steps,
             t0.elapsed().as_secs_f64()
         );
         return Ok(());
@@ -5117,6 +5119,9 @@ fn cmd_imagine(
     if negative_prompt.is_some() || scheduler.is_some() || reference_size != 1024 {
         anyhow::bail!("negative-prompt, scheduler, and reference-size are Qwen Image options");
     }
+    let height = height.unwrap_or(512);
+    let width = width.unwrap_or(512);
+    let steps = steps.unwrap_or(30);
     let params = cortiq_engine::imagegen::GenParams {
         height,
         width,
