@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.8] - 2026-09-11
+
+### Added
+- Native Qwen-Image-Edit-2509 image editing from three independent CMF
+  components: the Qwen Image transformer, Qwen2.5-VL text/vision encoder, and
+  Qwen Image VAE. The `cortiq imagine` command accepts one or more reference
+  images and writes PNG, JPEG, or PPM output.
+- `cortiq imagine-pack --component qwen-text-encoder|qwen-vae` for packing the
+  official Diffusers companion components while retaining their source tensor
+  names and embedded processor/tokenizer metadata.
+- A focused [Qwen Image guide](docs/QWEN_IMAGE.md) with pinned source
+  revisions, reproducible acquisition, component verification, and the
+  canonical 1024² reference-area profile.
+
+### Changed
+- Qwen Image transformer GGUF import remains a transformer-only conversion;
+  the native edit path now loads its text encoder and VAE from sibling CMFs.
+  The existing `import-gguf` quantization choices and source floating-point
+  byte preservation remain unchanged.
+
 ## [0.6.7] - 2026-09-11
 
 ### Added
@@ -5551,6 +5571,7 @@ Initial public release.
   (`LICENSE`, `NOTICE`, `PATENTS.md`).
 
 [Unreleased]: https://github.com/infosave2007/cmf/compare/v0.6.7...HEAD
+[0.6.8]: https://github.com/infosave2007/cmf/compare/v0.6.7...v0.6.8
 [0.6.7]: https://github.com/infosave2007/cmf/compare/v0.6.6...v0.6.7
 [0.6.6]: https://github.com/infosave2007/cmf/compare/v0.6.5...v0.6.6
 [0.5.62]: https://github.com/infosave2007/cmf/compare/v0.5.61...v0.5.62

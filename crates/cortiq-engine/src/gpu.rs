@@ -3076,3 +3076,32 @@ mod probe_warmup_tests {
         assert_eq!(p.state.load(Ordering::Relaxed), 2, "host wins on merit");
     }
 }
+
+/// Scratch/weight lifetime for a synchronous image-pipeline stage. Declare
+/// this before the stage model so the model drops before cache collection.
+pub(crate) struct ImageStageGuard {
+    #[cfg(target_os = "macos")]
+    metal: Option<crate::gpu_metal::ImageStageGuard>,
+}
+
+pub(crate) fn image_stage_scope() -> ImageStageGuard {
+    ImageStageGuard {
+        #[cfg(target_os = "macos")]
+        metal: if matches!(backend(), Backend::Metal) {
+            Some(crate::gpu_metal::image_stage_scope())
+        } else {
+            None
+        },
+    }
+}
+
+impl ImageStageGuard {
+    pub(crate) fn track_model(&mut self, uid: u64) {
+        #[cfg(target_os = "macos")]
+        if let Some(metal) = &mut self.metal {
+            metal.track_model(uid);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = uid;
+    }
+}
