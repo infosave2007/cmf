@@ -1916,6 +1916,33 @@ pub fn q4tp_ffn(
     }
 }
 
+/// Qwen Image's exact two-projection tanh-GELU FFN.  The WGPU arm keeps the
+/// intermediate on the device; other backends decline so the caller retains
+/// its bounded CPU path.  `bias_in` is applied before GELU and `bias_out`
+/// after the second projection, matching the official transformer.
+#[allow(clippy::too_many_arguments, unused_variables)]
+pub fn q4tp_gelu_ffn(
+    model: &Arc<CmfModel>,
+    w_in: usize,
+    w_out: usize,
+    xs: &[f32],
+    b: usize,
+    hidden: usize,
+    inter: usize,
+    bias_in: &[f32],
+    bias_out: &[f32],
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::q4tp_gelu_ffn(
+            model, w_in, w_out, xs, b, hidden, inter, bias_in, bias_out, out,
+        ),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
 pub fn q4t_ffn(
     model: &Arc<CmfModel>,
     w1: usize,
@@ -3082,6 +3109,8 @@ mod probe_warmup_tests {
 pub(crate) struct ImageStageGuard {
     #[cfg(target_os = "macos")]
     metal: Option<crate::gpu_metal::ImageStageGuard>,
+    #[cfg(feature = "gpu")]
+    wgpu: crate::gpu_wgpu::ImageStageGuard,
 }
 
 pub(crate) fn image_stage_scope() -> ImageStageGuard {
@@ -3092,6 +3121,8 @@ pub(crate) fn image_stage_scope() -> ImageStageGuard {
         } else {
             None
         },
+        #[cfg(feature = "gpu")]
+        wgpu: crate::gpu_wgpu::image_stage_scope(),
     }
 }
 
@@ -3101,6 +3132,8 @@ impl ImageStageGuard {
         if let Some(metal) = &mut self.metal {
             metal.track_model(uid);
         }
+        #[cfg(feature = "gpu")]
+        self.wgpu.track_model(uid);
         #[cfg(not(target_os = "macos"))]
         let _ = uid;
     }

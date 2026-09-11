@@ -3,7 +3,7 @@
 //! copy or expanded whole-model weight array is needed.
 use crate::{convert, gguf, http_range};
 use anyhow::{anyhow, ensure, Context};
-use cortiq_core::format::{CmfHeader, CmfStreamWriter};
+use cortiq_core::format::{CmfHeader, CmfModel, CmfStreamWriter};
 use cortiq_core::types::{ModelArch, TensorDtype};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
@@ -425,6 +425,299 @@ pub(crate) fn pack(root: &str, component: &str, quant: &str, output: &str) -> an
     Ok(())
 }
 
+/// The three files in a ready Qwen Image bundle share one CMF directory.  The
+/// payload names remain the names consumed by the native loaders; only the
+/// colliding component config is given an explicit alias.
+#[derive(Clone, Copy, Debug)]
+enum BundlePart {
+    Transformer,
+    TextEncoder,
+    Vae,
+}
+
+impl BundlePart {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Transformer => "transformer",
+            Self::TextEncoder => "text_encoder",
+            Self::Vae => "vae",
+        }
+    }
+}
+
+fn bundle_entry_name(part: BundlePart, name: &str) -> String {
+    match (part, name) {
+        (BundlePart::TextEncoder, "image.config_json") => "image.text_encoder.config_json".into(),
+        (BundlePart::Vae, "image.config_json") => "image.vae.config_json".into(),
+        _ => name.to_string(),
+    }
+}
+
+fn u8_json<'a>(model: &'a CmfModel, name: &str, label: &str) -> anyhow::Result<&'a [u8]> {
+    let entry = model
+        .tensor(name)
+        .ok_or_else(|| anyhow!("{label}: missing {name}"))?;
+    ensure!(
+        entry.dtype == TensorDtype::U8 && entry.shape.len() == 1,
+        "{label}: {name} must be a one-dimensional U8 blob"
+    );
+    ensure!(
+        entry.shape[0] == entry.n_elems(),
+        "{label}: {name} has an invalid byte length"
+    );
+    Ok(model.entry_bytes(entry))
+}
+
+/// Validate a source component and return the names needed for a bounded
+/// preflight.  The component is unmapped before the next one is opened, so a
+/// bundle operation never needs all three large source mappings live together.
+fn inspect_bundle_part(path: &Path, part: BundlePart) -> anyhow::Result<(CmfHeader, Vec<String>)> {
+    let model = CmfModel::open_sharded(path)
+        .map_err(|e| anyhow!("{} component {}: {e}", part.label(), path.display()))?;
+    let config = u8_json(&model, "image.config_json", part.label())?;
+    let config_json: serde_json::Value = serde_json::from_slice(config)
+        .with_context(|| format!("{}: invalid image.config_json", part.label()))?;
+    match part {
+        BundlePart::Transformer => {
+            ensure!(
+                model.header.arch.arch_name == "qwen_image",
+                "transformer component has architecture '{}', expected qwen_image",
+                model.header.arch.arch_name
+            );
+            for key in [
+                "patch_size",
+                "in_channels",
+                "out_channels",
+                "num_attention_heads",
+                "attention_head_dim",
+                "num_layers",
+            ] {
+                ensure!(
+                    config_json
+                        .get(key)
+                        .and_then(serde_json::Value::as_u64)
+                        .is_some(),
+                    "transformer image.config_json missing numeric {key}"
+                );
+            }
+        }
+        BundlePart::TextEncoder => {
+            ensure!(
+                config_json["model_type"] == "qwen2_5_vl",
+                "text encoder image.config_json is not qwen2_5_vl"
+            );
+            u8_json(&model, "image.tokenizer_json", "text_encoder")?;
+            u8_json(&model, "image.processor_config_json", "text_encoder")?;
+        }
+        BundlePart::Vae => {
+            ensure!(
+                config_json["_class_name"] == "AutoencoderKLQwenImage",
+                "VAE image.config_json is not AutoencoderKLQwenImage"
+            );
+            ensure!(
+                config_json
+                    .get("z_dim")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some(),
+                "VAE image.config_json missing numeric z_dim"
+            );
+        }
+    }
+    let names = model
+        .tensors
+        .iter()
+        .map(|entry| bundle_entry_name(part, &entry.name))
+        .collect();
+    Ok((model.header.clone(), names))
+}
+
+fn copy_bundle_part(
+    writer: &mut CmfStreamWriter,
+    path: &Path,
+    part: BundlePart,
+) -> anyhow::Result<usize> {
+    let model = CmfModel::open_sharded(path)
+        .map_err(|e| anyhow!("{} component {}: {e}", part.label(), path.display()))?;
+    let mut copied = 0usize;
+    for entry in &model.tensors {
+        let name = bundle_entry_name(part, &entry.name);
+        writer.push_bounded(
+            &name,
+            entry.dtype,
+            &entry.shape,
+            model.entry_bytes(entry),
+            16 * 1024 * 1024,
+        )?;
+        copied += 1;
+        if copied % 100 == 0 || copied == model.tensors.len() {
+            eprintln!("{}: {copied}/{} tensors", part.label(), model.tensors.len());
+        }
+    }
+    Ok(copied)
+}
+
+fn read_bundle_scheduler(path: &Path) -> anyhow::Result<Vec<u8>> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("read scheduler config {}", path.display()))?;
+    ensure!(
+        bytes.len() <= SMALL_SOURCE_LIMIT,
+        "scheduler config exceeds 32 MiB"
+    );
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("invalid scheduler config {}", path.display()))?;
+    ensure!(value.is_object(), "scheduler config must be a JSON object");
+    Ok(bytes)
+}
+
+/// Merge the retained standalone Qwen components into one mmap-served CMF.
+/// This copies encoded payloads byte-for-byte; it does not requantize or hold
+/// the three source mappings at the same time.
+pub(crate) fn bundle(root: &str, output: &str) -> anyhow::Result<()> {
+    let root_path = Path::new(root);
+    ensure!(
+        root_path.is_dir(),
+        "Qwen bundle root must be a component directory"
+    );
+    let transformer_path = root_path.join("transformer.cmf");
+    let text_encoder_path = root_path.join("text_encoder.cmf");
+    let vae_path = root_path.join("vae.cmf");
+    let scheduler_path = root_path.join("scheduler_config.json");
+    for path in [
+        &transformer_path,
+        &text_encoder_path,
+        &vae_path,
+        &scheduler_path,
+    ] {
+        ensure!(
+            path.is_file(),
+            "missing Qwen bundle input {}",
+            path.display()
+        );
+    }
+    let output_path = PathBuf::from(output);
+    let output_abs = std::fs::canonicalize(&output_path).ok();
+    for path in [
+        &transformer_path,
+        &text_encoder_path,
+        &vae_path,
+        &scheduler_path,
+    ] {
+        if output_abs.as_ref() == std::fs::canonicalize(path).ok().as_ref() {
+            return Err(anyhow!(
+                "bundle output must differ from input {}",
+                path.display()
+            ));
+        }
+    }
+
+    let (transformer_header, transformer_names) =
+        inspect_bundle_part(&transformer_path, BundlePart::Transformer)?;
+    let (_, text_encoder_names) = inspect_bundle_part(&text_encoder_path, BundlePart::TextEncoder)?;
+    let (_, vae_names) = inspect_bundle_part(&vae_path, BundlePart::Vae)?;
+    let scheduler = read_bundle_scheduler(&scheduler_path)?;
+
+    let manifest = serde_json::to_vec(&serde_json::json!({
+        "version": 1,
+        "pipeline": "qwen-image-edit-2509",
+        "components": {
+            "transformer": "transformer.cmf",
+            "text_encoder": "text_encoder.cmf",
+            "vae": "vae.cmf"
+        },
+        "embedded_assets": [
+            "image.text_encoder.config_json",
+            "image.vae.config_json",
+            "image.tokenizer_json",
+            "image.processor_config_json",
+            "image.scheduler_config_json"
+        ],
+        "tensor_payloads": "standalone bytes copied without requantization"
+    }))?;
+
+    let mut names = BTreeSet::new();
+    for name in transformer_names
+        .into_iter()
+        .chain(text_encoder_names)
+        .chain(vae_names)
+    {
+        ensure!(
+            name != "image.bundle_config_json" && name != "image.scheduler_config_json",
+            "reserved bundle asset name already present: {name}"
+        );
+        ensure!(
+            names.insert(name.clone()),
+            "duplicate bundle tensor name {name}"
+        );
+    }
+    let count = names
+        .len()
+        .checked_add(2)
+        .ok_or_else(|| anyhow!("bundle tensor count overflows"))?;
+    let temp = gguf::qwen_image_temp_path(&output_path)?;
+    let result = (|| -> anyhow::Result<()> {
+        let mut writer =
+            CmfStreamWriter::new(&temp, CmfStreamWriter::head_reserve_for(count, 128))?;
+        let copied_transformer =
+            copy_bundle_part(&mut writer, &transformer_path, BundlePart::Transformer)?;
+        let copied_text_encoder =
+            copy_bundle_part(&mut writer, &text_encoder_path, BundlePart::TextEncoder)?;
+        let copied_vae = copy_bundle_part(&mut writer, &vae_path, BundlePart::Vae)?;
+        ensure!(
+            copied_transformer
+                .checked_add(copied_text_encoder)
+                .and_then(|n| n.checked_add(copied_vae))
+                .and_then(|n| n.checked_add(2))
+                == Some(count),
+            "bundle source changed during preflight"
+        );
+        writer.push_bounded(
+            "image.scheduler_config_json",
+            TensorDtype::U8,
+            &[scheduler.len()],
+            &scheduler,
+            16 * 1024 * 1024,
+        )?;
+        writer.push_bounded(
+            "image.bundle_config_json",
+            TensorDtype::U8,
+            &[manifest.len()],
+            &manifest,
+            16 * 1024 * 1024,
+        )?;
+        let mut header = transformer_header.clone();
+        header.arch.arch_name = "qwen_image_bundle".into();
+        header.provenance = Some(serde_json::json!({
+            "tool": "cortiq imagine-pack",
+            "pipeline": "qwen-image-edit-2509",
+            "bundle": true,
+            "components": ["transformer.cmf", "text_encoder.cmf", "vae.cmf"],
+            "tensor_payloads": "standalone bytes copied without requantization"
+        }));
+        header.tokenizer_config = None;
+        header.section_hashes = None;
+        header.skills.clear();
+        header.shard = None;
+        header.calibration = None;
+        header.routing = None;
+        writer.finish(&header, None, None)?;
+        Ok(())
+    })();
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&temp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&temp, &output_path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(e.into());
+    }
+    gguf::qwen_image_sync_parent(&output_path)?;
+    println!(
+        "{output}: {count} tensors, {:.3} GiB",
+        std::fs::metadata(&output_path)?.len() as f64 / 1073741824.0
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -646,6 +939,244 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn bundle_header(arch_name: &str) -> CmfHeader {
+        let arch: ModelArch = serde_json::from_value(serde_json::json!({
+            "arch_name": arch_name,
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "num_layers": 1,
+            "num_attention_heads": 1,
+            "num_kv_heads": 1,
+            "head_dim": 32,
+            "vocab_size": 4,
+            "layer_types": [],
+            "rms_norm_eps": 1e-6,
+            "max_position_embeddings": 128,
+            "linear_conv_kernel_dim": 0,
+            "linear_num_key_heads": 0,
+            "linear_num_value_heads": 0
+        }))
+        .unwrap();
+        CmfHeader {
+            format: "cmf".into(),
+            version: cortiq_core::CMF_VERSION,
+            arch,
+            quant_type: gguf::quant_type_for(convert::Quant::F16),
+            provenance: None,
+            tokenizer_config: None,
+            section_hashes: None,
+            skills: vec![],
+            shard: None,
+            calibration: None,
+            routing: None,
+        }
+    }
+
+    fn write_tiny_component(
+        path: &Path,
+        arch_name: &str,
+        config: &[u8],
+        extras: &[(&str, &[u8])],
+        tensors: &[(&str, &[usize], &[u8])],
+    ) {
+        let mut specs = Vec::with_capacity(1 + extras.len() + tensors.len());
+        specs.push(cortiq_core::format::TensorSpec {
+            name: "image.config_json".into(),
+            dtype: TensorDtype::U8,
+            shape: vec![config.len()],
+            data: config.to_vec(),
+        });
+        specs.extend(
+            extras
+                .iter()
+                .map(|(name, data)| cortiq_core::format::TensorSpec {
+                    name: (*name).into(),
+                    dtype: TensorDtype::U8,
+                    shape: vec![data.len()],
+                    data: (*data).to_vec(),
+                }),
+        );
+        specs.extend(
+            tensors
+                .iter()
+                .map(|(name, shape, data)| cortiq_core::format::TensorSpec {
+                    name: (*name).into(),
+                    dtype: TensorDtype::F32,
+                    shape: shape.to_vec(),
+                    data: (*data).to_vec(),
+                }),
+        );
+        cortiq_core::CmfModel::write(path, &bundle_header(arch_name), &specs, None, None).unwrap();
+    }
+
+    fn f32_bytes(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn qwen_bundle_copies_components_and_embeds_assets() {
+        let root = unique_path("bundle");
+        std::fs::create_dir_all(&root).unwrap();
+        let transformer_config = br#"{"patch_size":2,"in_channels":64,"out_channels":64,"num_attention_heads":1,"attention_head_dim":32,"num_layers":1,"joint_attention_dim":32}"#;
+        let transformer_weight = [1.0f32, -2.0, 3.0, -4.0];
+        let transformer_bytes = f32_bytes(&transformer_weight);
+        write_tiny_component(
+            &root.join("transformer.cmf"),
+            "qwen_image",
+            transformer_config,
+            &[],
+            &[("img_in.weight", &[2, 2], &transformer_bytes)],
+        );
+        let text_config = br#"{"model_type":"qwen2_5_vl","hidden_size":32,"vocab_size":4}"#;
+        let tokenizer = br#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]}}"#;
+        let processor =
+            br#"{"image_processor_type":"Qwen2VLImageProcessor","min_pixels":1,"max_pixels":4}"#;
+        let tokenizer_config = br#"{"tokenizer_class":"Qwen2VLProcessor"}"#;
+        let text_weight = [5.0f32, 6.0, 7.0, 8.0];
+        let text_bytes = f32_bytes(&text_weight);
+        write_tiny_component(
+            &root.join("text_encoder.cmf"),
+            "qwen_image_text_encoder",
+            text_config,
+            &[
+                ("image.tokenizer_json", tokenizer),
+                ("image.processor_config_json", processor),
+                ("image.tokenizer_config_json", tokenizer_config),
+            ],
+            &[("model.embed_tokens.weight", &[2, 2], &text_bytes)],
+        );
+        let vae_config = br#"{"_class_name":"AutoencoderKLQwenImage","base_dim":8,"z_dim":16}"#;
+        let vae_weight = [9.0f32, 10.0, 11.0, 12.0];
+        let vae_bytes = f32_bytes(&vae_weight);
+        write_tiny_component(
+            &root.join("vae.cmf"),
+            "qwen_image_vae",
+            vae_config,
+            &[],
+            &[("encoder.conv_in.weight", &[2, 2], &vae_bytes)],
+        );
+        let scheduler =
+            br#"{"base_image_seq_len":256,"max_image_seq_len":8192,"num_train_timesteps":1000}"#;
+        std::fs::write(root.join("scheduler_config.json"), scheduler).unwrap();
+        let output = unique_path("bundle-output.cmf");
+
+        bundle(root.to_str().unwrap(), output.to_str().unwrap()).unwrap();
+        let model = cortiq_core::CmfModel::open(&output).unwrap();
+        assert!(model.verify().is_empty());
+        assert_eq!(model.header.arch.arch_name, "qwen_image_bundle");
+        for name in [
+            "image.config_json",
+            "image.text_encoder.config_json",
+            "image.vae.config_json",
+            "image.tokenizer_json",
+            "image.processor_config_json",
+            "image.tokenizer_config_json",
+            "image.scheduler_config_json",
+            "image.bundle_config_json",
+            "img_in.weight",
+            "model.embed_tokens.weight",
+            "encoder.conv_in.weight",
+        ] {
+            assert!(model.tensor(name).is_some(), "missing {name}");
+        }
+        assert_eq!(
+            model.tensor_bytes("image.config_json").unwrap(),
+            transformer_config
+        );
+        assert_eq!(
+            model
+                .tensor_bytes("image.text_encoder.config_json")
+                .unwrap(),
+            text_config
+        );
+        assert_eq!(
+            model.tensor_bytes("image.vae.config_json").unwrap(),
+            vae_config
+        );
+        assert_eq!(
+            model.tensor_bytes("image.scheduler_config_json").unwrap(),
+            scheduler
+        );
+        assert_eq!(
+            model.tensor_bytes("img_in.weight").unwrap(),
+            transformer_bytes
+        );
+        assert_eq!(
+            model.tensor_bytes("model.embed_tokens.weight").unwrap(),
+            text_bytes
+        );
+        assert_eq!(
+            model.tensor_bytes("encoder.conv_in.weight").unwrap(),
+            vae_bytes
+        );
+        let manifest: serde_json::Value =
+            serde_json::from_slice(model.tensor_bytes("image.bundle_config_json").unwrap())
+                .unwrap();
+        assert_eq!(manifest["pipeline"], "qwen-image-edit-2509");
+        drop(model);
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_file(output);
+    }
+
+    #[test]
+    fn qwen_bundle_rejects_missing_or_malformed_scheduler() {
+        let root = unique_path("bundle-invalid");
+        std::fs::create_dir_all(&root).unwrap();
+        let transformer_config = br#"{"patch_size":2,"in_channels":64,"out_channels":64,"num_attention_heads":1,"attention_head_dim":32,"num_layers":1}"#;
+        let text_config = br#"{"model_type":"qwen2_5_vl","hidden_size":32,"vocab_size":4}"#;
+        let vae_config = br#"{"_class_name":"AutoencoderKLQwenImage","z_dim":16}"#;
+        let bytes = [0u8; 16];
+        let tok = br#"{}"#;
+        let proc = br#"{}"#;
+        write_tiny_component(
+            &root.join("transformer.cmf"),
+            "qwen_image",
+            transformer_config,
+            &[],
+            &[("img_in.weight", &[2, 2], &bytes)],
+        );
+        write_tiny_component(
+            &root.join("text_encoder.cmf"),
+            "qwen_image_text_encoder",
+            text_config,
+            &[
+                ("image.tokenizer_json", tok),
+                ("image.processor_config_json", proc),
+            ],
+            &[("model.embed_tokens.weight", &[2, 2], &bytes)],
+        );
+        write_tiny_component(
+            &root.join("vae.cmf"),
+            "qwen_image_vae",
+            vae_config,
+            &[],
+            &[("encoder.conv_in.weight", &[2, 2], &bytes)],
+        );
+        let output = unique_path("bundle-invalid-output.cmf");
+        assert!(bundle(root.to_str().unwrap(), output.to_str().unwrap()).is_err());
+        std::fs::write(root.join("scheduler_config.json"), b"[]").unwrap();
+        assert!(bundle(root.to_str().unwrap(), output.to_str().unwrap()).is_err());
+        assert!(!output.exists());
+        std::fs::write(root.join("scheduler_config.json"), b"{}").unwrap();
+        let scheduler_before = std::fs::read(root.join("scheduler_config.json")).unwrap();
+        assert!(
+            bundle(
+                root.to_str().unwrap(),
+                root.join("scheduler_config.json").to_str().unwrap()
+            )
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read(root.join("scheduler_config.json")).unwrap(),
+            scheduler_before
+        );
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_file(output);
     }
 
     #[test]

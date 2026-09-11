@@ -258,9 +258,14 @@ struct VaeScale {
 
 fn vae_scale(path: &Path) -> Result<VaeScale, String> {
     let model = CmfModel::open(path).map_err(|e| e.to_string())?;
+    let config_name = if model.tensor("image.vae.config_json").is_some() {
+        "image.vae.config_json"
+    } else {
+        "image.config_json"
+    };
     let config: VaeScale = serde_json::from_slice(
         model
-            .tensor_bytes("image.config_json")
+            .tensor_bytes(config_name)
             .map_err(|e| format!("VAE CMF image.config_json: {e}"))?,
     )
     .map_err(|e| format!("VAE configuration: {e}"))?;
@@ -278,6 +283,22 @@ fn vae_scale(path: &Path) -> Result<VaeScale, String> {
         );
     }
     Ok(config)
+}
+
+fn embedded_scheduler(path: &Path) -> Result<Option<FlowMatchConfig>, String> {
+    let model = CmfModel::open(path).map_err(|e| e.to_string())?;
+    let Some(entry) = model.tensor("image.scheduler_config_json") else {
+        return Ok(None);
+    };
+    if entry.dtype != cortiq_core::TensorDtype::U8
+        || entry.shape.len() != 1
+        || entry.shape[0] != entry.n_elems()
+    {
+        return Err("embedded Qwen scheduler must be a one-dimensional U8 blob".into());
+    }
+    serde_json::from_slice(model.entry_bytes(entry))
+        .map(Some)
+        .map_err(|e| format!("embedded scheduler configuration: {e}"))
 }
 
 fn normalize_latents(data: &mut [f32], config: &VaeScale, decode: bool) -> Result<(), String> {
@@ -397,7 +418,7 @@ pub fn edit(
     let scheduler = match &paths.scheduler {
         Some(path) => serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?)
             .map_err(|e| format!("scheduler configuration: {e}"))?,
-        None => FlowMatchConfig::default(),
+        None => embedded_scheduler(&paths.transformer)?.unwrap_or_default(),
     };
     let (lh, lw) = (height / 8, width / 8);
     let sigmas = flow_match_sigmas(params.steps, lh * lw / 4, &scheduler)?;

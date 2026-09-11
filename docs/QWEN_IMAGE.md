@@ -2,41 +2,60 @@
 
 This guide covers the native Rust path for
 [Qwen-Image-Edit-2509](https://huggingface.co/Qwen/Qwen-Image-Edit-2509).
-It is an image editing pipeline: provide one or more reference images with
-`--image` and a text instruction. The runtime uses three separate CMF files so
-the text/vision encoder, denoiser, and VAE can be staged independently.
+Provide one or more reference images with `--image` and a text instruction.
+The ready release is a self-contained CMF; the original three-file layout
+remains available when users need to stage components independently.
 
-## Components
+## Ready layouts
 
-Keep this layout for the defaults used by `cortiq imagine`:
+The default release file is `qwen-image-edit-2509-q4tp.cmf`. It contains the
+Qwen Image transformer, Qwen2.5-VL text/vision encoder, tokenizer, processor,
+component configurations, VAE, scheduler configuration, and bundle manifest.
+It is memory-mapped directly and needs no sibling CMF files at inference time.
+
+The accepted bundle has 2,864 tensors, is 15,374,173,939 bytes, and has SHA-256
+`6e0795e3f63a5e38083ca8b03c2abaee16621763b1cbf01456081bbbfe931c24`.
+The merge preserved all 2,862 component tensor shapes, dtypes, and payload
+bytes. Two configuration entries have distinct names in the bundle; the only
+extra payloads are the embedded scheduler and manifest.
+
+For component staging, retain this directory:
 
 ```text
 qwen-image/
   transformer.cmf
   text_encoder.cmf
   vae.cmf
-  scheduler_config.json       # optional; the built-in FlowMatch defaults apply otherwise
+  scheduler_config.json
 ```
 
-The transformer is the diffusion model imported from the pinned Q6_K GGUF.
-`text_encoder.cmf` contains Qwen2.5-VL text and vision weights plus the
-tokenizer and image processor metadata. `vae.cmf` contains the Qwen Image VAE.
-The files are independent: `cortiq verify` can check each one on its own.
+The verified standalone files are:
 
-The source components and revisions used for the reproducible conversion are:
+| file | profile | size | SHA-256 |
+|---|---|---:|---|
+| `transformer.cmf` | Q4TP Qwen Image transformer | 10,719,610,880 bytes | `7c477f464e6eda50d6c73eb9c8c4cd275c8852ba9eaf1c47252a97b612350aaa` |
+| `text_encoder.cmf` | Q4TP + Q8_2f Qwen2.5-VL encoder | 4,403,056,640 bytes | `15745717be7fee53499a425a240cc25b8b122848a1c1e1c4a3fc50ea06b64532` |
+| `vae.cmf` | source-float Qwen Image VAE | 257,213,312 bytes | `af10c1a55bf8e47b8eaea79dfdfb0cd6dadb9ac2a65cbdf1c383a5b1b8b5ee87` |
+| `scheduler_config.json` | FlowMatch Euler metadata | 485 bytes | `7ee767e37bae4af31d4eb935e125bb20a2237eeecafd22af6610093865c6f587` |
 
-| component | source | revision | source size |
-|---|---|---|---:|
-| transformer | `QuantStack/Qwen-Image-Edit-2509-GGUF/Qwen-Image-Edit-2509-Q6_K.gguf` | `84a3006979126011422eeeefe0c9485ddf431ef5` | 16,824,990,240 bytes |
-| text encoder | `Qwen/Qwen-Image-Edit-2509/text_encoder/model-00001-of-00004.safetensors` | `983d8d220ec4cf16278ef80bf3f30fe0378c8263` | 4,968,243,304 bytes |
-| text encoder | `Qwen/Qwen-Image-Edit-2509/text_encoder/model-00002-of-00004.safetensors` | same | 4,991,495,816 bytes |
-| text encoder | `Qwen/Qwen-Image-Edit-2509/text_encoder/model-00003-of-00004.safetensors` | same | 4,932,751,040 bytes |
-| text encoder | `Qwen/Qwen-Image-Edit-2509/text_encoder/model-00004-of-00004.safetensors` | same | 1,691,924,384 bytes |
-| VAE | `Qwen/Qwen-Image-Edit-2509/vae/diffusion_pytorch_model.safetensors` | same | 253,806,966 bytes |
+A bundle defaults the transformer, encoder, and VAE paths to itself. The
+`--text-encoder`, `--vae`, and `--scheduler` options remain available for
+an explicit component or scheduler override. The standalone payloads and the
+bundle therefore use the same tensor bytes and loader configuration.
 
-The source GGUF SHA-256 is
+## Acquire the pinned source
+
+Use the following immutable revisions:
+
+| source | revision | source bytes |
+|---|---|---:|
+| `QuantStack/Qwen-Image-Edit-2509-GGUF/Qwen-Image-Edit-2509-Q6_K.gguf` | `84a3006979126011422eeeefe0c9485ddf431ef5` | 16,824,990,240 |
+| `Qwen/Qwen-Image-Edit-2509` text encoder shards | `983d8d220ec4cf16278ef80bf3f30fe0378c8263` | 16,584,414,544 |
+| `Qwen/Qwen-Image-Edit-2509` VAE safetensors | same | 253,806,966 |
+
+The pinned GGUF SHA-256 is
 `ec5694f11a2908c10ef5324c50c79b1bb433547a39a211996551417b4b16f0ce`.
-The companion weight SHA-256 values are:
+The companion receipt records these source hashes:
 
 ```text
 text_encoder/model-00001-of-00004.safetensors  d725335e4ea2399be706469e4b8807716a8fa64bd03468252e9f7acf2415fee4
@@ -46,25 +65,12 @@ text_encoder/model-00004-of-00004.safetensors  5dd068336d14d45ffb43cef374d286cc6
 vae/diffusion_pytorch_model.safetensors        0c8bc8b758c649abef9ea407b95408389a3b2f610d0d10fcb054fe171d0a8344
 ```
 
-Verify these values before packing when the source is transferred outside
-the Hub client.
-
-## Acquire and pack
-
-The following uses the `hf` command-line client and an explicit revision. It
-downloads only the transformer source and the companion files required by the
+For a complete local source tree, download only the pinned files needed by the
 native path:
-
-This complete-tree recipe materializes about 33.7 GB of source weights before
-packing. Use it on a disk with that headroom plus the CMF outputs. On a small
-development disk, pack the transformer first and remove its verified source,
-then use the pinned remote companion commands below; never delete a source
-shard before its output is durable and verified.
 
 ```sh
 set -eu
 mkdir -p qwen-image/source
-
 GGUF_REV=84a3006979126011422eeeefe0c9485ddf431ef5
 QWEN_REV=983d8d220ec4cf16278ef80bf3f30fe0378c8263
 
@@ -88,9 +94,7 @@ hf download Qwen/Qwen-Image-Edit-2509 \
   --revision "$QWEN_REV" --local-dir qwen-image/source
 ```
 
-Check the large source files before creating output files. For the companion
-weights, compare against the SHA-256 values in the acquisition receipt for
-the selected revision:
+Hash the transferred source before packing:
 
 ```sh
 shasum -a 256 qwen-image/source/Qwen-Image-Edit-2509-Q6_K.gguf
@@ -98,11 +102,14 @@ shasum -a 256 qwen-image/source/text_encoder/model-*.safetensors
 shasum -a 256 qwen-image/source/vae/diffusion_pytorch_model.safetensors
 ```
 
-Build a matching `cortiq` binary from this repository, then pack the three
-components. The transformer uses the existing Q4TP codec. The text encoder
-uses Q4TP for its rank-2 projection/embedding weights while retaining the
-other source tensors and metadata. The VAE command uses `f16`; its source
-floating tensors are retained by the component packer.
+The complete source tree is about 33.7 GB before CMF outputs. On a smaller
+disk, import and verify the GGUF first, remove that source only after its CMF
+and receipt are durable, then stream-pack the pinned companion files. Never
+mix source revisions.
+
+## Pack standalone components and merge the bundle
+
+Build the matching CLI, then create the standalone components:
 
 ```sh
 cargo build --release -p cortiq-cli
@@ -120,18 +127,44 @@ cargo build --release -p cortiq-cli
   --out qwen-image/vae.cmf qwen-image/source
 
 cp qwen-image/source/scheduler/scheduler_config.json qwen-image/
+```
 
+For the text encoder, `--quant q4tp` applies to every rank-2 `.weight`
+tensor, including embeddings and the retained `lm_head`. Aligned matrices use
+Q4TP; shapes that cannot satisfy its tile group use Q8_2f. The verified profile
+contains 328 Q4TP and 32 Q8_2f projection payloads. Norms, biases, patch
+convolutions, and other non-rank-2 tensors keep their source F32/F16/BF16
+storage. The VAE `--quant f16` path keeps its source floating-point tensors.
+
+Verify the standalone files and merge them with the native streaming command:
+
+```sh
 ./target/release/cortiq verify qwen-image/transformer.cmf
 ./target/release/cortiq verify qwen-image/text_encoder.cmf
 ./target/release/cortiq verify qwen-image/vae.cmf
+
+./target/release/cortiq imagine-pack \
+  --bundle qwen-image \
+  --out qwen-image/qwen-image-edit-2509-q4tp.cmf
+
+./target/release/cortiq verify qwen-image/qwen-image-edit-2509-q4tp.cmf
 ```
 
-`imagine-pack` can also stream a component directly from the pinned Hub
-resolve base, using `HF_TOKEN` when the source requires authentication:
+`imagine-pack --bundle ROOT --out FILE.cmf` validates all three CMFs and the
+scheduler JSON, then opens one component at a time and streams each encoded
+payload through the existing CMF writer. It aliases the colliding component
+configs as `image.text_encoder.config_json` and
+`image.vae.config_json`, embeds `image.scheduler_config_json` and
+`image.bundle_config_json`, and preserves tokenizer/processor assets. It
+does not requantize or materialize all component weights.
+
+The component packer can also read directly from the pinned Hub resolve base.
+This uses bounded HTTP ranges and keeps any required Hub credential local:
 
 ```sh
 QWEN_REV=983d8d220ec4cf16278ef80bf3f30fe0378c8263
 QWEN_BASE="https://huggingface.co/Qwen/Qwen-Image-Edit-2509/resolve/$QWEN_REV"
+
 ./target/release/cortiq imagine-pack \
   --component qwen-text-encoder --quant q4tp \
   --out qwen-image/text_encoder.cmf "$QWEN_BASE"
@@ -140,20 +173,20 @@ QWEN_BASE="https://huggingface.co/Qwen/Qwen-Image-Edit-2509/resolve/$QWEN_REV"
   --out qwen-image/vae.cmf "$QWEN_BASE"
 ```
 
-The remote form still needs the `processor/` and component files at that
-revision; the local form makes the complete source tree and its hashes easier
-to audit. It reads the companion source by bounded HTTP ranges, so it avoids
-materializing the roughly 16.6 GB text-encoder tree locally. For a bounded
-disk, the safe sequence is: import and verify the 16.8 GB GGUF, retain the
-verified transformer CMF, remove that GGUF, then stream-pack the text encoder
-and VAE from the same pinned resolve base. Do not mix files from different
-revisions in one model directory.
+## Run an edit
 
-## Edit an image
+The one-file command is the default and needs only the bundle plus a reference
+image:
 
-Pass the model directory and at least one reference image. The CLI defaults
-to 512×512 output, 30 denoising steps, CFG 4, and seed 42. The example fixes
-all generation settings so it can be reproduced:
+```sh
+./target/release/cortiq imagine qwen-image/qwen-image-edit-2509-q4tp.cmf \
+  --image docs/media/fox-512.png \
+  --prompt "Add a vivid blue knitted scarf while preserving the fox, pose, and snowy background." \
+  --height 512 --width 512 --steps 30 --cfg 4 --seed 7 \
+  --reference-size 1024 --out fox-scarf.png
+```
+
+The standalone layout supports directory discovery:
 
 ```sh
 ./target/release/cortiq imagine qwen-image \
@@ -163,83 +196,71 @@ all generation settings so it can be reproduced:
   --reference-size 1024 --out fox-scarf.png
 ```
 
-Repeat `--image` to supply multiple references in prompt order. If the
-components are stored elsewhere, pass a transformer file as the model path
-and override the companions explicitly:
+When components live elsewhere, pass the explicit overrides:
 
 ```sh
 ./target/release/cortiq imagine qwen-image/transformer.cmf \
   --text-encoder /models/qwen/text_encoder.cmf \
   --vae /models/qwen/vae.cmf \
+  --scheduler /models/qwen/scheduler_config.json \
   --image docs/media/fox-512.png \
   --prompt "Turn the scene into a watercolor illustration." \
   --height 512 --width 512 --steps 30 --cfg 4 --seed 7 \
   --reference-size 1024 --out watercolor.png
 ```
 
-The official profile uses `--reference-size 1024`. This value is the square
-root of the VAE reference image area; it is independent of the output
-height/width. The Qwen2.5-VL image-conditioning stage has its own 384²-area
-resize before smart patch resizing, so changing the VAE reference area does
-not change that encoder rule. Keep output dimensions on multiples of 16.
+Repeat `--image` in reference order for multiple images. The required edit
+prompt is passed through the official Qwen2.5-VL processor/template. The
+default negative prompt is one space, which keeps true CFG enabled; use
+`--negative-prompt` for an explicit negative prompt. CFG at or below 1 omits
+the unconditional branch and is a different guidance profile.
 
-The default negative prompt is a single space, which keeps true classifier
-free guidance enabled. Set `--negative-prompt` to provide a deliberate
-negative prompt. A CFG value at or below 1 disables the unconditional branch
-and reduces work, but it is a different guidance profile.
+The canonical `--reference-size 1024` value is the square root of the VAE
+reference area (1024²), independent of output height and width. Qwen2.5-VL
+conditioning first applies the official 384²-area image resize and then its
+smart patch resize, so changing the VAE reference area does not alter that
+encoder preprocessing rule. Keep output dimensions on multiples of 16. PNG,
+JPEG, and PPM output are supported.
 
-The optional scheduler file is auto-discovered as
-`qwen-image/scheduler_config.json`. Use `--scheduler PATH` when it lives
-elsewhere. The file must describe the Qwen Image exponential FlowMatch Euler
-contract from the pinned source.
+## Backends, lifetimes, and measured operator paths
 
-## Backends and resource use
-
-The same command selects the available native backend. Use `CMF_GPU=0` for a
-portable CPU run. On a headless Vulkan host, set the loader environment before
-running:
+Use `CMF_GPU=0` for the portable CPU path. On a headless Vulkan host, set
+the loader explicitly:
 
 ```sh
-CMF_GPU=0 ./target/release/cortiq imagine qwen-image \
+CMF_GPU=0 ./target/release/cortiq imagine qwen-image/qwen-image-edit-2509-q4tp.cmf \
   --image docs/media/fox-512.png --prompt "Add a blue scarf." \
   --height 512 --width 512 --steps 30 --cfg 4 --seed 7 \
   --reference-size 1024 --out fox-scarf-cpu.png
 
 XDG_RUNTIME_DIR=/tmp WGPU_BACKEND=vulkan CMF_GPU=1 \
-  ./target/release/cortiq imagine qwen-image \
+  ./target/release/cortiq imagine qwen-image/qwen-image-edit-2509-q4tp.cmf \
   --image docs/media/fox-512.png --prompt "Add a blue scarf." \
   --height 512 --width 512 --steps 30 --cfg 4 --seed 7 \
   --reference-size 1024 --out fox-scarf-vulkan.png
 ```
 
-The pipeline reports text encoder, reference VAE, denoiser, and decode VAE
-stages on stderr. It releases each large component stage before opening the
-next one and keeps only conditioning data and latents between stages. A
-missing companion, malformed metadata, or invalid tensor shape fails before
-image generation starts.
+The pipeline opens the encoder, reference VAE, transformer, and decode VAE in
+stages. It retains conditioning and latents across stage boundaries and
+releases each large component before opening the next one. A missing companion,
+malformed metadata, or invalid tensor shape fails before generation.
 
-This guide documents the canonical 1024² reference profile. The CLI accepts
-other `--reference-size` values for controlled experiments, but this source
-tree does not advertise a lower-quality/speed profile without a measured
-quality and memory result for that exact setting.
+Accepted component measurements on the RTX 3090 Vulkan gate are useful for
+operator attribution, not whole-pipeline promises: the optimized single-frame
+VAE encoded a 1024² reference in 23.098 s versus 128.411 s in the frozen
+baseline (5.56x), and decoded a 512² result in 8.582 s versus 54.775 s
+(6.38x). The Q4TP GELU FFN fixture at 5,120 × 3,072 × 12,288 measured
+205.570 ms with cooperative f16 versus 2,105.088 ms scalar, with relative RMS
+error 1.94e-7. The fused QKV path remains opt-in; its measured operator result
+was 514.364 ms versus 522.502 ms scalar with relative RMS 3.90e-4.
 
-## What is verified here
-
-The component format preserves the official tensor names and embeds the
-configuration required by the native loader. The encoder path follows the
-Qwen2.5-VL processor/template, two-stage image preprocessing, vision windows,
-MRoPE, and the 64-token prefix drop. The transformer follows the Qwen Image
-double-stream denoiser and FlowMatch schedule; the VAE uses the official
-Qwen Image scaling metadata. Focused seeded oracles cover these contracts.
-
-Full-device image quality and timing are workload-specific. Record the exact
-binary, component SHA-256 values, backend, output dimensions, steps, CFG,
-seed, reference size, elapsed stages, and output SHA when publishing a
-comparison. The repository guide intentionally makes no universal quality or
-performance claim.
+These are component/operator gates on the stated hardware and shapes. Record
+the exact binary, CMF hashes, backend, output dimensions, steps, CFG, seed,
+reference size, stage timings, and output SHA for any end-to-end comparison.
+This guide makes no universal image-quality or whole-pipeline timing claim.
 
 ## Source references
 
-- [Qwen-Image-Edit-2509](https://huggingface.co/Qwen/Qwen-Image-Edit-2509/tree/983d8d220ec4cf16278ef80bf3f30fe0378c8263)
-- [Qwen Image Edit GGUF](https://huggingface.co/QuantStack/Qwen-Image-Edit-2509-GGUF/tree/84a3006979126011422eeeefe0c9485ddf431ef5)
+- [Qwen-Image-Edit-2509 pinned source](https://huggingface.co/Qwen/Qwen-Image-Edit-2509/tree/983d8d220ec4cf16278ef80bf3f30fe0378c8263)
+- [Qwen Image Edit GGUF pinned source](https://huggingface.co/QuantStack/Qwen-Image-Edit-2509-GGUF/tree/84a3006979126011422eeeefe0c9485ddf431ef5)
 - [CMF v2 specification](CMF_V2_SPEC.md)

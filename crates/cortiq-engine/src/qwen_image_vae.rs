@@ -13,14 +13,118 @@
 
 use cortiq_core::{CmfModel, TensorDtype};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+use crate::pool::Pool;
 
 /// Scratch budget for one lowered convolution.  The activation itself is
 /// owned by the caller; this cap covers the patch and GEMM output buffers.
 const MAX_WORK_BYTES: usize = 64 * 1024 * 1024;
 const EPS_NORMALIZE: f32 = 1.0e-12;
+const GPU_CONV_WORK: usize = 1 << 26;
 
 type VaeResult<T> = Result<T, String>;
+
+/// The Qwen VAE used to pass `None` to every CPU GEMM, leaving the large
+/// single-frame convolutions serial on Linux.  Keep one bounded pool for the
+/// component, just as the other native image paths do.  `Pool::effective_threads`
+/// caps the automatic default and still honours the operator's `CMF_THREADS`.
+fn vae_pool() -> Option<&'static Pool> {
+    static POOL: OnceLock<Option<Arc<Pool>>> = OnceLock::new();
+    POOL.get_or_init(Pool::from_env).as_deref()
+}
+
+fn rows_par(n: usize, f: &(dyn Fn(usize, usize) + Sync)) {
+    if n == 0 {
+        return;
+    }
+    match vae_pool() {
+        Some(pool) => pool.run_rows(n, f),
+        None => f(0, n),
+    }
+}
+
+struct SendPtr(*mut f32);
+
+unsafe impl Send for SendPtr {}
+unsafe impl Sync for SendPtr {}
+
+impl SendPtr {
+    /// SAFETY: callers partition writes into disjoint ranges.
+    unsafe fn write(&self, index: usize, value: f32) {
+        unsafe {
+            *self.0.add(index) = value;
+        }
+    }
+}
+
+/// Existing VAE device kernels are complete same-padding 2-D convolutions.
+/// An operator can force the exact CPU arm for numerical diagnosis without
+/// changing the default native GPU selection.
+fn vae_gpu_enabled() -> bool {
+    std::env::var("CMF_QWEN_VAE_GPU").as_deref() != Ok("0") && crate::gpu::enabled_here()
+}
+
+fn try_gpu_conv2d(
+    weight: &[f32],
+    bias: &[f32],
+    x: &[f32],
+    ci: usize,
+    co: usize,
+    h: usize,
+    w: usize,
+    k: usize,
+) -> Option<Vec<f32>> {
+    let work = h
+        .saturating_mul(w)
+        .saturating_mul(ci)
+        .saturating_mul(co)
+        .saturating_mul(k)
+        .saturating_mul(k);
+    if work < GPU_CONV_WORK || !vae_gpu_enabled() {
+        return None;
+    }
+    let mut out = vec![0.0f32; co.saturating_mul(h).saturating_mul(w)];
+    if crate::gpu::vae_conv2d(weight, bias, x, ci, co, h, w, k, &mut out) {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+fn try_gpu_upsample_conv2d(
+    weight: &[f32],
+    bias: &[f32],
+    x: &[f32],
+    ci: usize,
+    co: usize,
+    h: usize,
+    w: usize,
+    k: usize,
+) -> Option<Vec<f32>> {
+    let work = h
+        .saturating_mul(w)
+        .saturating_mul(4)
+        .saturating_mul(ci)
+        .saturating_mul(co)
+        .saturating_mul(k)
+        .saturating_mul(k);
+    if work < GPU_CONV_WORK || !vae_gpu_enabled() {
+        return None;
+    }
+    let mut out = vec![
+        0.0f32;
+        co.saturating_mul(h)
+            .saturating_mul(2)
+            .saturating_mul(w)
+            .saturating_mul(2)
+    ];
+    if crate::gpu::vae_upsample_conv(weight, bias, x, ci, co, h, w, k, &mut out) {
+        Some(out)
+    } else {
+        None
+    }
+}
 
 /// A lazily decoded tensor.  CMF F16/BF16 and quantized payloads remain in
 /// the mmap; `values` widens one tensor only for the duration of its op.
@@ -120,6 +224,26 @@ impl Volume {
             h,
             w,
             data: data.to_vec(),
+        })
+    }
+
+    fn from_frame_owned(data: Vec<f32>, c: usize, h: usize, w: usize) -> VaeResult<Self> {
+        let n = c
+            .checked_mul(h)
+            .and_then(|n| n.checked_mul(w))
+            .ok_or_else(|| "qwen image VAE: activation shape overflow".to_string())?;
+        if data.len() != n {
+            return Err(format!(
+                "qwen image VAE: expected owned frame with {n} values, got {}",
+                data.len()
+            ));
+        }
+        Ok(Self {
+            c,
+            t: 1,
+            h,
+            w,
+            data,
         })
     }
 
@@ -260,6 +384,35 @@ impl Conv3dRef {
         Ok((padded - kernel) / stride + 1)
     }
 
+    /// For the public image API the temporal input is exactly one frame.  A
+    /// causal layer with `T == 1` has one and only one non-zero temporal
+    /// slice: `kt == left_t`.  Extract that slice into the equivalent 2-D
+    /// kernel so the existing direct device convolution and the bounded CPU
+    /// lowering do not spend work on two guaranteed-zero planes.
+    fn single_frame_weight(&self, weight: &[f32]) -> Option<Vec<f32>> {
+        if self.st != 1
+            || self.sh != 1
+            || self.sw != 1
+            || self.left_t >= self.kt
+            || self.kh != self.kw
+            || self.pad_h.saturating_mul(2).saturating_add(1) != self.kh
+            || self.pad_w.saturating_mul(2).saturating_add(1) != self.kw
+        {
+            return None;
+        }
+        let spatial = self.kh * self.kw;
+        let in_plane = self.kt * spatial;
+        let mut out = vec![0.0f32; self.co * self.ci * spatial];
+        for co in 0..self.co {
+            for ci in 0..self.ci {
+                let src = (co * self.ci + ci) * in_plane + self.left_t * spatial;
+                let dst = (co * self.ci + ci) * spatial;
+                out[dst..dst + spatial].copy_from_slice(&weight[src..src + spatial]);
+            }
+        }
+        Some(out)
+    }
+
     fn forward(&self, x: &Volume) -> VaeResult<Volume> {
         if x.c != self.ci {
             return Err(format!(
@@ -277,6 +430,36 @@ impl Conv3dRef {
         let patch_k = self.ci * self.kt * self.kh * self.kw;
         let weight = self.weight.values()?;
         let bias = self.bias.values()?;
+
+        if x.t == 1 && ot == 1 {
+            if let Some(weight_2d) = self.single_frame_weight(&weight) {
+                let k = self.kh;
+                if let Some(out) =
+                    try_gpu_conv2d(&weight_2d, &bias, &x.data, self.ci, self.co, x.h, x.w, k)
+                {
+                    return Volume::from_frame_owned(out, self.co, oh, ow);
+                }
+                let (out, oh, ow) = conv2d_cpu(
+                    &x.data,
+                    self.ci,
+                    self.co,
+                    x.h,
+                    x.w,
+                    self.kh,
+                    self.kw,
+                    self.sh,
+                    self.sw,
+                    self.pad_h,
+                    self.pad_h,
+                    self.pad_w,
+                    self.pad_w,
+                    &weight_2d,
+                    &bias,
+                    vae_pool(),
+                )?;
+                return Volume::from_frame_owned(out, self.co, oh, ow);
+            }
+        }
         let mut out = Volume::zeros(self.co, ot, oh, ow)?;
         let bytes_per_position = 4usize
             .checked_mul(patch_k.saturating_add(self.co).max(1))
@@ -332,7 +515,7 @@ impl Conv3dRef {
                 n,
                 patch_k,
                 self.co,
-                None,
+                vae_pool(),
             );
             for row in 0..n {
                 let p = p0 + row;
@@ -348,6 +531,109 @@ impl Conv3dRef {
         }
         Ok(out)
     }
+}
+
+/// Portable 2-D lowering shared by the spatial projections and the exact
+/// single-frame reduction of a causal 3-D convolution.  The patch tile is
+/// bounded, and the GEMM rows are handed to the component pool on CPU.
+fn conv2d_cpu(
+    x: &[f32],
+    ci: usize,
+    co: usize,
+    h: usize,
+    w: usize,
+    kh: usize,
+    kw: usize,
+    sh: usize,
+    sw: usize,
+    pad_top: usize,
+    pad_bottom: usize,
+    pad_left: usize,
+    pad_right: usize,
+    weight: &[f32],
+    bias: &[f32],
+    pool: Option<&Pool>,
+) -> VaeResult<(Vec<f32>, usize, usize)> {
+    let input_len = ci
+        .checked_mul(h)
+        .and_then(|n| n.checked_mul(w))
+        .ok_or_else(|| "qwen image VAE: Conv2d input shape overflow".to_string())?;
+    if x.len() != input_len {
+        return Err(format!(
+            "qwen image VAE: Conv2d input length {} != {input_len}",
+            x.len()
+        ));
+    }
+    let weight_len = co
+        .checked_mul(ci)
+        .and_then(|n| n.checked_mul(kh))
+        .and_then(|n| n.checked_mul(kw))
+        .ok_or_else(|| "qwen image VAE: Conv2d weight shape overflow".to_string())?;
+    if weight.len() != weight_len || bias.len() != co {
+        return Err("qwen image VAE: Conv2d weight or bias length mismatch".into());
+    }
+    let oh = Conv3dRef::output_dim(h, pad_top, pad_bottom, kh, sh)?;
+    let ow = Conv3dRef::output_dim(w, pad_left, pad_right, kw, sw)?;
+    let patch_k = ci
+        .checked_mul(kh)
+        .and_then(|n| n.checked_mul(kw))
+        .ok_or_else(|| "qwen image VAE: Conv2d patch shape overflow".to_string())?;
+    let npos = oh
+        .checked_mul(ow)
+        .ok_or_else(|| "qwen image VAE: Conv2d position shape overflow".to_string())?;
+    let bytes_per_position = 4usize
+        .checked_mul(patch_k.saturating_add(co).max(1))
+        .unwrap_or(MAX_WORK_BYTES + 1);
+    let tile = (MAX_WORK_BYTES / bytes_per_position)
+        .max(1)
+        .min(npos.max(1));
+    let mut patches = vec![0.0f32; tile * patch_k];
+    let mut ybuf = vec![0.0f32; tile * co];
+    let mut out = vec![0.0f32; co * npos];
+    let mut p0 = 0usize;
+    while p0 < npos {
+        let n = tile.min(npos - p0);
+        patches[..n * patch_k].fill(0.0);
+        for row in 0..n {
+            let p = p0 + row;
+            let xw = p % ow;
+            let xh = p / ow;
+            let patch = &mut patches[row * patch_k..(row + 1) * patch_k];
+            let mut i = 0usize;
+            for ci_idx in 0..ci {
+                let img = &x[ci_idx * h * w..(ci_idx + 1) * h * w];
+                for kh_idx in 0..kh {
+                    let sy = xh as isize * sh as isize + kh_idx as isize - pad_top as isize;
+                    for kw_idx in 0..kw {
+                        let sx = xw as isize * sw as isize + kw_idx as isize - pad_left as isize;
+                        patch[i] = if sy >= 0 && sy < h as isize && sx >= 0 && sx < w as isize {
+                            img[sy as usize * w + sx as usize]
+                        } else {
+                            0.0
+                        };
+                        i += 1;
+                    }
+                }
+            }
+        }
+        crate::fcd_ops::gemm_nt(
+            &patches[..n * patch_k],
+            weight,
+            &mut ybuf[..n * co],
+            n,
+            patch_k,
+            co,
+            pool,
+        );
+        for row in 0..n {
+            let p = p0 + row;
+            for co_idx in 0..co {
+                out[co_idx * npos + p] = ybuf[row * co + co_idx] + bias[co_idx];
+            }
+        }
+        p0 += n;
+    }
+    Ok((out, oh, ow))
 }
 
 /// A spatial convolution used by the resampling blocks and mid attention.
@@ -392,75 +678,49 @@ impl Conv2dRef {
         })
     }
 
-    fn forward_frame(&self, x: &[f32], h: usize, w: usize) -> VaeResult<(Vec<f32>, usize, usize)> {
-        if x.len() != self.ci * h * w {
-            return Err(format!(
-                "qwen image VAE: Conv2d input length {} != {}",
-                x.len(),
-                self.ci * h * w
-            ));
-        }
+    fn forward_frame(
+        &self,
+        x: &[f32],
+        h: usize,
+        w: usize,
+        pool: Option<&Pool>,
+    ) -> VaeResult<(Vec<f32>, usize, usize)> {
         let oh = Conv3dRef::output_dim(h, self.pad_top, self.pad_bottom, self.kh, self.sh)?;
         let ow = Conv3dRef::output_dim(w, self.pad_left, self.pad_right, self.kw, self.sw)?;
-        let patch_k = self.ci * self.kh * self.kw;
-        let npos = oh * ow;
         let weight = self.weight.values()?;
         let bias = self.bias.values()?;
-        let bytes_per_position = 4usize
-            .checked_mul(patch_k.saturating_add(self.co).max(1))
-            .unwrap_or(MAX_WORK_BYTES + 1);
-        let tile = (MAX_WORK_BYTES / bytes_per_position)
-            .max(1)
-            .min(npos.max(1));
-        let mut patches = vec![0.0f32; tile * patch_k];
-        let mut ybuf = vec![0.0f32; tile * self.co];
-        let mut out = vec![0.0f32; self.co * npos];
-        let mut p0 = 0usize;
-        while p0 < npos {
-            let n = tile.min(npos - p0);
-            patches[..n * patch_k].fill(0.0);
-            for row in 0..n {
-                let p = p0 + row;
-                let xw = p % ow;
-                let xh = p / ow;
-                let patch = &mut patches[row * patch_k..(row + 1) * patch_k];
-                let mut i = 0usize;
-                for ci in 0..self.ci {
-                    let img = &x[ci * h * w..(ci + 1) * h * w];
-                    for kh in 0..self.kh {
-                        let sy =
-                            xh as isize * self.sh as isize + kh as isize - self.pad_top as isize;
-                        for kw in 0..self.kw {
-                            let sx = xw as isize * self.sw as isize + kw as isize
-                                - self.pad_left as isize;
-                            patch[i] = if sy >= 0 && sy < h as isize && sx >= 0 && sx < w as isize {
-                                img[sy as usize * w + sx as usize]
-                            } else {
-                                0.0
-                            };
-                            i += 1;
-                        }
-                    }
-                }
+        let same_padding = self.sh == 1
+            && self.sw == 1
+            && self.kh == self.kw
+            && self.pad_top == self.pad_bottom
+            && self.pad_left == self.pad_right
+            && self.pad_top.saturating_mul(2).saturating_add(1) == self.kh
+            && self.pad_left.saturating_mul(2).saturating_add(1) == self.kw
+            && oh == h
+            && ow == w;
+        if same_padding {
+            if let Some(out) = try_gpu_conv2d(&weight, &bias, x, self.ci, self.co, h, w, self.kh) {
+                return Ok((out, oh, ow));
             }
-            crate::fcd_ops::gemm_nt(
-                &patches[..n * patch_k],
-                &weight,
-                &mut ybuf[..n * self.co],
-                n,
-                patch_k,
-                self.co,
-                None,
-            );
-            for row in 0..n {
-                let p = p0 + row;
-                for co in 0..self.co {
-                    out[co * npos + p] = ybuf[row * self.co + co] + bias[co];
-                }
-            }
-            p0 += n;
         }
-        Ok((out, oh, ow))
+        conv2d_cpu(
+            x,
+            self.ci,
+            self.co,
+            h,
+            w,
+            self.kh,
+            self.kw,
+            self.sh,
+            self.sw,
+            self.pad_top,
+            self.pad_bottom,
+            self.pad_left,
+            self.pad_right,
+            &weight,
+            &bias,
+            pool,
+        )
     }
 
     fn forward(&self, x: &Volume) -> VaeResult<Volume> {
@@ -470,12 +730,16 @@ impl Conv2dRef {
                 x.c, self.ci
             ));
         }
+        if x.t == 1 {
+            let (out, h, w) = self.forward_frame(&x.data, x.h, x.w, vae_pool())?;
+            return Volume::from_frame_owned(out, self.co, h, w);
+        }
         let mut frames = Vec::with_capacity(x.t);
         let mut oh = 0;
         let mut ow = 0;
         for t in 0..x.t {
             let frame = x.frame(t)?;
-            let (out, h, w) = self.forward_frame(&frame, x.h, x.w)?;
+            let (out, h, w) = self.forward_frame(&frame, x.h, x.w, vae_pool())?;
             oh = h;
             ow = w;
             frames.push(out);
@@ -512,29 +776,44 @@ impl RmsRef {
         let gamma = self.gamma.values()?;
         let mut out = x.clone();
         let scale = (self.channels as f32).sqrt();
-        for t in 0..x.t {
-            for y in 0..x.h {
-                for xx in 0..x.w {
-                    let mut norm2 = 0.0f32;
-                    for c in 0..x.c {
-                        let v = x.get(c, t, y, xx);
-                        norm2 += v * v;
-                    }
-                    let inv = 1.0 / norm2.sqrt().max(EPS_NORMALIZE);
-                    for c in 0..x.c {
-                        out.set(c, t, y, xx, x.get(c, t, y, xx) * inv * scale * gamma[c]);
-                    }
+        let hw = x.h * x.w;
+        let positions = x.t * hw;
+        let dst = SendPtr(out.data.as_mut_ptr());
+        rows_par(positions, &|start, end| {
+            for position in start..end {
+                let t = position / hw;
+                let plane = position % hw;
+                let y = plane / x.w;
+                let xx = plane % x.w;
+                let mut norm2 = 0.0f32;
+                for c in 0..x.c {
+                    let v = x.get(c, t, y, xx);
+                    norm2 += v * v;
+                }
+                let inv = 1.0 / norm2.sqrt().max(EPS_NORMALIZE);
+                for c in 0..x.c {
+                    let index = x.offset(c, t, y, xx);
+                    // SAFETY: each position owns all channel indices for one
+                    // output location, and `rows_par` partitions positions.
+                    unsafe { dst.write(index, x.get(c, t, y, xx) * inv * scale * gamma[c]) };
                 }
             }
-        }
+        });
         Ok(out)
     }
 }
 
 fn silu_inplace(data: &mut [f32]) {
-    for v in data {
-        *v /= 1.0 + (-*v).exp();
-    }
+    let dst = SendPtr(data.as_mut_ptr());
+    rows_par(data.len(), &|start, end| {
+        for index in start..end {
+            // SAFETY: `rows_par` gives each worker a disjoint index range.
+            unsafe {
+                let v = *dst.0.add(index);
+                dst.write(index, v / (1.0 + (-v).exp()));
+            }
+        }
+    });
 }
 
 struct ResidualRef {
@@ -817,7 +1096,66 @@ impl ResampleRef {
             return Err("qwen image VAE: resampling currently accepts one frame".into());
         }
         let y = match self.mode {
-            ResampleMode::Up2d | ResampleMode::Up3d => self.spatial.forward(&upsample2x(x)?)?,
+            ResampleMode::Up2d | ResampleMode::Up3d => {
+                let same_padding = self.spatial.sh == 1
+                    && self.spatial.sw == 1
+                    && self.spatial.kh == self.spatial.kw
+                    && self.spatial.pad_top == self.spatial.pad_bottom
+                    && self.spatial.pad_left == self.spatial.pad_right
+                    && self.spatial.pad_top.saturating_mul(2).saturating_add(1) == self.spatial.kh
+                    && self.spatial.pad_left.saturating_mul(2).saturating_add(1) == self.spatial.kw;
+                let up = upsample2x(x)?;
+                if same_padding {
+                    let work =
+                        x.h.saturating_mul(x.w)
+                            .saturating_mul(4)
+                            .saturating_mul(self.spatial.ci)
+                            .saturating_mul(self.spatial.co)
+                            .saturating_mul(self.spatial.kh)
+                            .saturating_mul(self.spatial.kw);
+                    if work >= GPU_CONV_WORK && vae_gpu_enabled() {
+                        let weight = self.spatial.weight.values()?;
+                        let bias = self.spatial.bias.values()?;
+                        if let Some(out) = try_gpu_upsample_conv2d(
+                            &weight,
+                            &bias,
+                            &x.data,
+                            self.spatial.ci,
+                            self.spatial.co,
+                            x.h,
+                            x.w,
+                            self.spatial.kh,
+                        ) {
+                            return Volume::from_frame_owned(
+                                out,
+                                self.spatial.co,
+                                x.h * 2,
+                                x.w * 2,
+                            );
+                        }
+                        let (out, h, w) = conv2d_cpu(
+                            &up.data,
+                            self.spatial.ci,
+                            self.spatial.co,
+                            up.h,
+                            up.w,
+                            self.spatial.kh,
+                            self.spatial.kw,
+                            self.spatial.sh,
+                            self.spatial.sw,
+                            self.spatial.pad_top,
+                            self.spatial.pad_bottom,
+                            self.spatial.pad_left,
+                            self.spatial.pad_right,
+                            &weight,
+                            &bias,
+                            vae_pool(),
+                        )?;
+                        return Volume::from_frame_owned(out, self.spatial.co, h, w);
+                    }
+                }
+                self.spatial.forward(&up)?
+            }
             ResampleMode::Down2d | ResampleMode::Down3d => self.spatial.forward(x)?,
         };
         // Diffusers' first-frame calls have a None cache entry.  For
@@ -955,10 +1293,11 @@ impl QwenImageVae {
     pub fn open(path: &Path) -> VaeResult<Self> {
         let model = Arc::new(CmfModel::open(path).map_err(|e| format!("qwen image VAE CMF: {e}"))?);
         let config_entry = model
-            .tensor("image.config_json")
-            .ok_or_else(|| "qwen image VAE: missing image.config_json".to_string())?;
+            .tensor("image.vae.config_json")
+            .or_else(|| model.tensor("image.config_json"))
+            .ok_or_else(|| "qwen image VAE: missing image.vae.config_json".to_string())?;
         if config_entry.dtype != TensorDtype::U8 {
-            return Err("qwen image VAE: image.config_json must be U8".into());
+            return Err("qwen image VAE: component config must be U8".into());
         }
         let cfg: serde_json::Value = serde_json::from_slice(model.entry_bytes(config_entry))
             .map_err(|e| format!("qwen image VAE image.config_json: {e}"))?;

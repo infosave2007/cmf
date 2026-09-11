@@ -137,6 +137,26 @@ impl Linear {
         }
     }
 
+    /// Return the mmap identity for a q4tp projection.  The fused QKV path
+    /// needs the directory index for all three weights; keeping this query on
+    /// the bounded `Linear` wrapper avoids materializing a `QTensor` or its
+    /// compressed payload just to discover the device handle.
+    pub(crate) fn mapped_q4tp(&self) -> Option<(&Arc<CmfModel>, usize)> {
+        match &self.repr {
+            LinearRepr::Quant(Proj::Q(q)) => q.mapped_q4tp(),
+            LinearRepr::Mapped { .. } | LinearRepr::Quant(Proj::F32 { .. }) => None,
+        }
+    }
+
+    /// Return the mmap identity for a q4tiled projection.  This is the
+    /// companion codec supported by the existing fused QKV device entry.
+    pub(crate) fn mapped_q4t(&self) -> Option<(&Arc<CmfModel>, usize)> {
+        match &self.repr {
+            LinearRepr::Quant(Proj::Q(q)) => q.mapped_q4t(),
+            LinearRepr::Mapped { .. } | LinearRepr::Quant(Proj::F32 { .. }) => None,
+        }
+    }
+
     /// Compute `out[b, rows] = x[b, cols] · Wᵀ`.
     ///
     /// The output and activation buffers are caller-owned.  Mapped dense
@@ -238,6 +258,128 @@ impl Linear {
     ) -> Result<(), String> {
         self.forward(x, 1, out, pool)
     }
+}
+
+/// Compute three projections of one activation panel.
+///
+/// Qwen keeps image and text Q/K/V weights separate, but each triplet reads
+/// the same normalized stream.  The existing device QKV entries can therefore
+/// remove two uploads and two waits from a large Q4TP/Q4T batch.  Every shape
+/// and dtype outside that exact mapped contract falls through to the original
+/// three `Linear::forward` calls, preserving the CPU arithmetic and all small
+/// batch behavior.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn forward_qkv(
+    q: &Linear,
+    k: &Linear,
+    v: &Linear,
+    x: &[f32],
+    batch: usize,
+    q_out: &mut [f32],
+    k_out: &mut [f32],
+    v_out: &mut [f32],
+    pool: Option<&Pool>,
+) -> Result<(), String> {
+    let cols = q.cols();
+    let qrows = q.rows();
+    let krows = k.rows();
+    let vrows = v.rows();
+    if k.cols() != cols || v.cols() != cols {
+        return Err(format!(
+            "Qwen Image QKV input widths disagree: q={cols} k={} v={}",
+            k.cols(),
+            v.cols()
+        ));
+    }
+    let x_len = batch
+        .checked_mul(cols)
+        .ok_or_else(|| "Qwen Image QKV input size overflows".to_string())?;
+    let q_len = batch
+        .checked_mul(qrows)
+        .ok_or_else(|| "Qwen Image QKV query size overflows".to_string())?;
+    let k_len = batch
+        .checked_mul(krows)
+        .ok_or_else(|| "Qwen Image QKV key size overflows".to_string())?;
+    let v_len = batch
+        .checked_mul(vrows)
+        .ok_or_else(|| "Qwen Image QKV value size overflows".to_string())?;
+    if x.len() != x_len || q_out.len() != q_len || k_out.len() != k_len || v_out.len() != v_len {
+        return Err(format!(
+            "Qwen Image QKV buffers have x={} (expected {x_len}), q={} (expected {q_len}), k={} (expected {k_len}), v={} (expected {v_len})",
+            x.len(),
+            q_out.len(),
+            k_out.len(),
+            v_out.len()
+        ));
+    }
+
+    // The shared fused entry is for the wide prefill regime in which the
+    // ordinary QTensor path also considers a device GEMM.  Keeping the same
+    // work floor prevents a tiny prompt or focused fixture from paying a
+    // device round trip that the host path intentionally avoids.
+    let wide = batch >= 32
+        && batch
+            .checked_mul(qrows)
+            .and_then(|n| n.checked_mul(cols))
+            .is_some_and(|work| work >= 128_000_000)
+        && crate::gpu::enabled_here()
+        && crate::gpu::mm_killed() == false
+        // QKV remains opt-in until the real 5120-token WGPU fixture has
+        // proved this exact compressed-payload dispatch against fallback.
+        && std::env::var("CMF_QWEN_IMAGE_FUSED_QKV").as_deref() == Ok("1");
+
+    if wide {
+        if let (Some((qm, qi)), Some((km, ki)), Some((vm, vi))) =
+            (q.mapped_q4tp(), k.mapped_q4tp(), v.mapped_q4tp())
+        {
+            if qm.uid() == km.uid() && qm.uid() == vm.uid() && krows == vrows {
+                if crate::gpu::dit_qkv(
+                    qm, qi, ki, vi, x, batch, cols, qrows, krows, q_out, k_out, v_out,
+                ) {
+                    return Ok(());
+                }
+            }
+        }
+
+        if let (Some((qm, qi)), Some((km, ki)), Some((vm, vi))) =
+            (q.mapped_q4t(), k.mapped_q4t(), v.mapped_q4t())
+        {
+            if qm.uid() == km.uid() && qm.uid() == vm.uid() {
+                let packed_len = batch
+                    .checked_mul(
+                        qrows
+                            .checked_add(krows)
+                            .and_then(|n| n.checked_add(vrows))
+                            .ok_or_else(|| "Qwen Image fused QKV size overflows".to_string())?,
+                    )
+                    .ok_or_else(|| "Qwen Image fused QKV size overflows".to_string())?;
+                let mut packed = vec![0.0f32; packed_len];
+                if crate::gpu::q4t_qkv(
+                    qm,
+                    qi,
+                    ki,
+                    vi,
+                    x,
+                    batch,
+                    cols,
+                    qrows,
+                    krows,
+                    vrows,
+                    &mut packed,
+                ) {
+                    q_out.copy_from_slice(&packed[..q_len]);
+                    k_out.copy_from_slice(&packed[q_len..q_len + k_len]);
+                    v_out.copy_from_slice(&packed[q_len + k_len..]);
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    q.forward(x, batch, q_out, pool)?;
+    k.forward(x, batch, k_out, pool)?;
+    v.forward(x, batch, v_out, pool)?;
+    Ok(())
 }
 
 fn decode_dense_row(bytes: &[u8], dtype: TensorDtype, row: usize, cols: usize, dst: &mut [f32]) {

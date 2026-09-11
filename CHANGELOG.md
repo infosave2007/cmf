@@ -10,22 +10,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.6.8] - 2026-09-11
 
 ### Added
-- Native Qwen-Image-Edit-2509 image editing from three independent CMF
-  components: the Qwen Image transformer, Qwen2.5-VL text/vision encoder, and
-  Qwen Image VAE. The `cortiq imagine` command accepts one or more reference
-  images and writes PNG, JPEG, or PPM output.
+- Native Qwen-Image-Edit-2509 image editing with a ready self-contained
+  `qwen-image-edit-2509-q4tp.cmf` bundle. The bundle embeds the Qwen Image
+  transformer, Qwen2.5-VL text/vision encoder, tokenizer/processor/config,
+  VAE, scheduler, and bundle manifest; `cortiq imagine` accepts one or more
+  reference images and writes PNG, JPEG, or PPM output.
+- `cortiq imagine-pack --bundle ROOT --out FILE.cmf` for a native streaming
+  merge of the retained `transformer.cmf`, `text_encoder.cmf`, `vae.cmf`, and
+  `scheduler_config.json`. Component payloads are copied without
+  requantization, while standalone component files remain supported.
 - `cortiq imagine-pack --component qwen-text-encoder|qwen-vae` for packing the
   official Diffusers companion components while retaining their source tensor
   names and embedded processor/tokenizer metadata.
 - A focused [Qwen Image guide](docs/QWEN_IMAGE.md) with pinned source
-  revisions, reproducible acquisition, component verification, and the
-  canonical 1024² reference-area profile.
+  revisions, reproducible acquisition, one-file and standalone run commands,
+  component verification, and the canonical 1024² reference-area profile.
 
 ### Changed
-- Qwen Image transformer GGUF import remains a transformer-only conversion;
-  the native edit path now loads its text encoder and VAE from sibling CMFs.
-  The existing `import-gguf` quantization choices and source floating-point
-  byte preservation remain unchanged.
+- Qwen Image transformer GGUF import remains the standalone transformer
+  conversion. After packing the companion components, `imagine-pack --bundle`
+  creates the one-file edit artifact; a bundle defaults all component loaders
+  to itself and explicit `--text-encoder`, `--vae`, and `--scheduler` options
+  remain available.
+- The Qwen2.5-VL companion profile applies Q4TP to aligned rank-2 weights and
+  Q8_2f to shapes that cannot satisfy the Q4TP tile group; source F32/F16/BF16
+  control tensors are retained. The existing `import-gguf` choices and source
+  floating-point byte preservation remain unchanged.
+- Native single-frame Qwen VAE execution reuses the existing Vulkan
+  convolution/upsample paths with exact T=1 lowering. The accepted component
+  gate measured 23.098 s versus 128.411 s for 1024² encode and 8.582 s versus
+  54.775 s for 512² decode; these are component measurements, not an
+  end-to-end image-quality or timing guarantee.
+- The Qwen Q4TP GELU FFN has a capability-gated cooperative-f16 path. The
+  accepted RTX 3090 operator gate measured 205.570 ms versus 2,105.088 ms at
+  5,120 × 3,072 × 12,288 with relative RMS error 1.94e-7; fused QKV remains
+  opt-in.
 
 ## [0.6.7] - 2026-09-11
 

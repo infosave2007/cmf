@@ -42,9 +42,52 @@ GGUF трансформера Qwen Image, включая `Qwen-Image-Edit-2509-Q
 импортируется той же командой. Тензоры записываются в CMF последовательно:
 веса F32/F16/BF16 сохраняются точно, квантованные матрицы переводятся в формат
 `--quant` (по умолчанию `q8`, с масштабами строк и столбцов для Qwen Image).
-CMF содержит трансформер и его конфигурацию;
-отдельные текстовый энкодер и VAE исходной модели в него не входят.
-Генерация Qwen Image через `cortiq imagine` пока не реализована.
+Импорт создаёт самостоятельный CMF трансформера и его конфигурацию. Для
+нативного редактирования Qwen Image используйте готовый однофайловый bundle
+или сохраните три компонента отдельно.
+
+## Нативное редактирование Qwen Image
+
+Сначала соберите bundle из проверенных `transformer.cmf`, `text_encoder.cmf`,
+`vae.cmf` и `scheduler_config.json`:
+
+```sh
+cortiq imagine-pack --bundle qwen-image \
+  --out qwen-image/qwen-image-edit-2509-q4tp.cmf
+cortiq verify qwen-image/qwen-image-edit-2509-q4tp.cmf
+```
+
+Bundle встраивает трансформер, текстовый и зрительный энкодер Qwen2.5-VL,
+токенизатор, процессор, конфигурации, VAE и планировщик. Потоки тензоров
+переносятся побайтно, без повторного квантования. Запуску нужен только bundle
+и входное изображение:
+
+```sh
+cortiq imagine qwen-image/qwen-image-edit-2509-q4tp.cmf \
+  --image docs/media/fox-512.png \
+  --prompt "Добавьте яркий синий вязаный шарф, сохранив лису, позу и снежный фон." \
+  --height 512 --width 512 --steps 30 --cfg 4 --seed 7 \
+  --reference-size 1024 --out fox-scarf.png
+```
+
+Для гибкой раскладки оставьте компоненты в одном каталоге или укажите их
+явно:
+
+```sh
+cortiq imagine qwen-image/transformer.cmf \
+  --text-encoder qwen-image/text_encoder.cmf \
+  --vae qwen-image/vae.cmf \
+  --scheduler qwen-image/scheduler_config.json \
+  --image docs/media/fox-512.png \
+  --prompt "Превратите сцену в акварельную иллюстрацию." \
+  --height 512 --width 512 --steps 30 --cfg 4 --seed 7 \
+  --reference-size 1024 --out watercolor.png
+```
+
+Нужна хотя бы одна ссылка `--image`; для нескольких изображений повторите
+флаг. Профиль `--reference-size 1024` задаёт корень из площади входного VAE
+1024² и не меняет размер результата. За правилами получения и упаковки с
+фиксированными ревизиями обращайтесь к [руководству Qwen Image](docs/QWEN_IMAGE.md).
 
 CLI также предоставляет `info`, `bench`, `ppl`, `serve`, `skill`, `moe-mask`,
 `moe-defrag`, `requant`, `compact`, `sign`, `imagine`, `animate` и `ltx-video`.
@@ -117,6 +160,8 @@ Kimi Linear, MiniCPM и несколько MoE/video-семейств. Огра�
 - [GPU-рецепты](docs/GPU_KERNEL_RECIPES.md) — измерения бэкендов.
 - [Несколько GPU](docs/MULTI_GPU.md) и [разделение на мобильном](docs/MOBILE_SPLIT.ru.md).
 - [FCD-восстановление](docs/RUST_FCD.md) и [низкоразрядный PTQ](docs/Q1T_PTQ.md).
+- [Qwen Image Edit](docs/QWEN_IMAGE.md) — однофайловое редактирование и
+  отдельная раскладка компонентов.
 - [Карточки моделей и конвертация](docs/hf/README.md).
 - [Cortiq Spectra](docs/SPECTRA.ru.md) — детерминированная потоковая CPU-раскраска
   двухэнергетического рентгена, профили сканера, маска отказов и измеренные

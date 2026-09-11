@@ -1544,6 +1544,29 @@ fn ffn_silu_mul(@builtin(global_invocation_id) gid: vec3<u32>) {
     fsg[i] = (g / (1.0 + exp(-g))) * fsu[i];
 }
 
+// Qwen Image's MLP middle is tanh-GELU, not the SwiGLU used by the
+// neighbouring DiT paths.  Keep the exact add-then-GELU order from the
+// reference, but leave the panel on the device between the two Q4TP GEMMs.
+// `gelu` is 1 for the input projection bias and 0 for the output projection
+// bias; using one entry point keeps the pipeline/cache surface small.
+struct QwenGeluP { n: u32, width: u32, gelu: u32, _p: u32 };
+@group(0) @binding(0) var<storage, read_write> qg_values: array<f32>;
+@group(0) @binding(1) var<storage, read>       qg_bias: array<f32>;
+@group(0) @binding(2) var<uniform>             qg_p: QwenGeluP;
+
+@compute @workgroup_size(256)
+fn qwen_gelu_bias(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.y * (65535u * 256u) + gid.x;
+    if (i >= qg_p.n) { return; }
+    let j = i - (i / qg_p.width) * qg_p.width;
+    var x = qg_values[i] + qg_bias[j];
+    if (qg_p.gelu != 0u) {
+        let x3 = x * x * x;
+        x = 0.5 * x * (1.0 + tanh(0.7978846 * (x + 0.044715 * x3)));
+    }
+    qg_values[i] = x;
+}
+
 // The same, for a fc1 that emits gate and up PACKED IN ONE ROW
 // ([gate|up] per token, as MiniMax-H3's DiT stores it) instead of two
 // separate panels. `n` counts activations (b·inter), `fsp2.inter` is the
@@ -13178,6 +13201,8 @@ struct Ctx {
     dit_softmax: wgpu::ComputePipeline,
     dit_unstack: wgpu::ComputePipeline,
     ffn_silu: wgpu::ComputePipeline,
+    /// Qwen Image's exact tanh-GELU+bias epilogue for a resident FFN.
+    qwen_gelu_bias: wgpu::ComputePipeline,
     q1t_ovmm: wgpu::ComputePipeline,
     rmsnorm: wgpu::ComputePipeline,
     add_rmsnorm: wgpu::ComputePipeline,
@@ -13397,8 +13422,10 @@ struct Ctx {
     dsv4_binds: Mutex<(u64, HashMap<(u8, u64, usize), wgpu::BindGroup>)>,
     /// Access clock for the aging above — one tick per weight lookup.
     res_clock: std::sync::atomic::AtomicU64,
-    /// row_scale buffer per (idx, row0) — small, cached.
-    rs_bufs: Mutex<HashMap<(usize, usize), wgpu::Buffer>>,
+    /// row_scale buffer per (model uid, (tensor idx, row0)) — small, cached.
+    /// The model component is explicit so image-stage cleanup can remove one
+    /// model without touching another model's scales.
+    rs_bufs: Mutex<HashMap<(usize, (usize, usize)), wgpu::Buffer>>,
     /// Device K/V cache mirror per (kv_id, layer) for the token graph:
     /// [nkv, cap, hd] each, persists across decode tokens. `synced` counts
     /// the positions already resident (prefill sync + graph appends).
@@ -13821,6 +13848,18 @@ fn ctx_for(dev: usize) -> Option<&'static Ctx> {
     };
     g.insert(dev, built);
     built
+}
+
+/// Look up an already-created context without initializing a device.  Stage
+/// cleanup must be inert for CPU-only callers and for an explicitly selected
+/// non-wgpu backend.
+fn existing_ctx() -> Option<&'static Ctx> {
+    let map = CTXS.get()?;
+    map.lock()
+        .unwrap()
+        .get(&crate::gpu::current_device())
+        .copied()
+        .flatten()
 }
 
 /// Weight budget of the current device, in bytes (0 when there is no
@@ -14563,6 +14602,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let dit_softmax = pipe("dit_softmax");
     let dit_unstack = pipe("dit_unstack");
     let ffn_silu = pipe("ffn_silu_mul");
+    let qwen_gelu_bias = pipe("qwen_gelu_bias");
     let q1t_ovmm = pipe("q1t_overlay_mm");
     let rmsnorm = pipe("rmsnorm");
     let add_rmsnorm = pipe("add_rmsnorm");
@@ -15044,6 +15084,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         dit_softmax,
         dit_unstack,
         ffn_silu,
+        qwen_gelu_bias,
         q1t_ovmm,
         rmsnorm,
         add_rmsnorm,
@@ -15614,6 +15655,213 @@ fn host_tier_put(key: (usize, usize), bytes: std::sync::Arc<Vec<u8>>) {
     }
 }
 
+/// Remove one model's entries from a UID-prefixed cache and return the exact
+/// bytes owned by the removed values.  The caller holds any surrounding cache
+/// lock; keeping the predicate here makes every scoped cleanup use the same
+/// owner test and prevents an unrelated model from being dropped by a broad
+/// cache clear.
+fn release_uid_entries<K, V, F>(
+    map: &mut std::collections::HashMap<(usize, K), V>,
+    uid: usize,
+    mut bytes: F,
+) -> u64
+where
+    K: std::cmp::Eq + std::hash::Hash,
+    F: FnMut(&V) -> u64,
+{
+    let mut released = 0u64;
+    map.retain(|(owner, _), value| {
+        if *owner == uid {
+            released = released.saturating_add(bytes(value));
+            false
+        } else {
+            true
+        }
+    });
+    released
+}
+
+#[inline]
+fn resident_sub(c: &Ctx, bytes: u64) {
+    if bytes == 0 {
+        return;
+    }
+    c.resident
+        .fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Relaxed,
+            |current| Some(current.saturating_sub(bytes)),
+        )
+        .ok();
+}
+
+/// A synchronous image stage owns the model UID it registered.  The context
+/// is process-lived, but the model-specific device buffers are disposable.
+/// Wait for every submitted command before dropping handles; shared scratch,
+/// content caches, and other model UIDs deliberately remain untouched.
+pub(crate) struct ImageStageGuard {
+    active: bool,
+    model_uid: Option<u64>,
+}
+
+pub(crate) fn image_stage_scope() -> ImageStageGuard {
+    ImageStageGuard {
+        // `selected` only reads configuration.  In particular, this guard
+        // must not initialize a GPU for a CPU-only stage or release a stale
+        // wgpu cache when the caller explicitly selected Metal/CPU.
+        active: selected(),
+        model_uid: None,
+    }
+}
+
+impl ImageStageGuard {
+    pub(crate) fn track_model(&mut self, uid: u64) {
+        if self.active {
+            self.model_uid = Some(uid);
+        }
+    }
+}
+
+impl Drop for ImageStageGuard {
+    fn drop(&mut self) {
+        if self.active {
+            if let Some(uid) = self.model_uid {
+                release_idle_model_buffers(uid);
+            }
+        }
+    }
+}
+
+/// Drop only model-owned wgpu cache entries after all submitted work drains.
+/// This is intentionally narrower than a device/cache reset: shared scratch,
+/// content-keyed buffers, KV state, and every other model UID survive.
+pub(crate) fn release_idle_model_buffers(uid: u64) {
+    let Some(c) = existing_ctx() else { return };
+    let owner = uid as usize;
+    // The image pipeline's GPU calls are synchronous, but a few reusable
+    // paths leave a submission pending while returning a device buffer.  A
+    // completed poll is the lifetime barrier before cache-owned handles go.
+    let _gate = c.mm_gate.lock().unwrap();
+    if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
+        tracing::warn!("wgpu image-stage cache release skipped after device poll failure");
+        return;
+    }
+
+    let weight_bytes = {
+        let mut map = c.weight_bufs.lock().unwrap();
+        let bytes = release_uid_entries(&mut map, owner, |entry| entry.bytes);
+        resident_sub(c, bytes);
+        bytes
+    };
+    let moe_bytes = {
+        let mut map = c.moe_expw.lock().unwrap();
+        let bytes = release_uid_entries(&mut map, owner, |(gate, up, down)| {
+            gate.size()
+                .saturating_add(up.size())
+                .saturating_add(down.size())
+        });
+        resident_sub(c, bytes);
+        bytes
+    };
+    let global_moe_bytes = {
+        let mut map = c.dsv4_global_moe.lock().unwrap();
+        let mut bytes = 0u64;
+        map.retain(|owner, bufs| {
+            if *owner != uid {
+                return true;
+            }
+            for buffer in bufs.gate.iter().chain(&bufs.up).chain(&bufs.down) {
+                bytes = bytes.saturating_add(buffer.size());
+            }
+            false
+        });
+        resident_sub(c, bytes);
+        bytes
+    };
+    let plane_count = {
+        let mut map = c.planes.lock().unwrap();
+        let before = map.len();
+        let _ = release_uid_entries(&mut map, owner, |(_, bytes)| *bytes);
+        before - map.len()
+    };
+    let row_scale_count = {
+        let mut map = c.rs_bufs.lock().unwrap();
+        let before = map.len();
+        let _ = release_uid_entries(&mut map, owner, |_| 0);
+        before - map.len()
+    };
+    {
+        let mut registry = layer_registry().lock().unwrap();
+        let _ = release_uid_entries(&mut registry, owner, |_| 0);
+    }
+    let host_bytes = if let Some(tier) = host_tier() {
+        let mut map = tier.map.lock().unwrap();
+        let bytes = release_uid_entries(&mut map, owner, |(data, _)| data.len() as u64);
+        if bytes != 0 {
+            tier.bytes
+                .fetch_sub(bytes, std::sync::atomic::Ordering::AcqRel);
+        }
+        bytes
+    } else {
+        0
+    };
+    let host_bank_bytes = {
+        let mut map = host_banks().lock().unwrap();
+        let mut bytes = 0u64;
+        map.retain(|(bank_owner, _), banks| {
+            if *bank_owner != owner {
+                return true;
+            }
+            bytes = bytes.saturating_add(
+                (banks.g.len() as u64)
+                    .saturating_add(banks.u.len() as u64)
+                    .saturating_add(banks.d.len() as u64),
+            );
+            false
+        });
+        bytes
+    };
+    if weight_bytes != 0
+        || moe_bytes != 0
+        || global_moe_bytes != 0
+        || plane_count != 0
+        || row_scale_count != 0
+        || host_bytes != 0
+        || host_bank_bytes != 0
+    {
+        tracing::debug!(
+            uid,
+            weight_bytes,
+            moe_bytes,
+            global_moe_bytes,
+            plane_count,
+            row_scale_count,
+            host_bytes,
+            host_bank_bytes,
+            "released wgpu image-stage model caches"
+        );
+    }
+}
+
+#[cfg(test)]
+mod image_stage_cache_tests {
+    use super::release_uid_entries;
+    use std::collections::HashMap;
+
+    #[test]
+    fn uid_release_sums_only_owned_entries() {
+        let mut cache = HashMap::from([
+            ((11usize, 0usize), 17u64),
+            ((11usize, 1usize), 23u64),
+            ((12usize, 0usize), 41u64),
+        ]);
+        let released = release_uid_entries(&mut cache, 11, |bytes| *bytes);
+        assert_eq!(released, 40);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.get(&(12, 0)), Some(&41));
+    }
+}
+
 /// On a network filesystem an mmap MISS is the death of this path: every
 /// 4-128 KB page faults through FUSE one round trip at a time, which is
 /// the measured "1% CPU, looks hung" failure on MooseFS volumes. With
@@ -15798,11 +16046,11 @@ fn weight_buffer_l(
         }
     }
     crate::gpu::probe_note_cold(); // first touch = upload, not a steady sample
-    // DEVICE-LOCAL residency: create_buffer_init maps at creation → the buffer
-    // lands in a HOST_VISIBLE heap and every matvec streams its weights over
-    // PCIe (~25 GB/s) every token. A plain create_buffer + staged write_buffer
-    // lets the allocator pick DEVICE_LOCAL VRAM (~1 TB/s on a 4090). This is
-    // THE discrete-GPU decode fix; on UMA it's a wash.
+                                   // DEVICE-LOCAL residency: create_buffer_init maps at creation → the buffer
+                                   // lands in a HOST_VISIBLE heap and every matvec streams its weights over
+                                   // PCIe (~25 GB/s) every token. A plain create_buffer + staged write_buffer
+                                   // lets the allocator pick DEVICE_LOCAL VRAM (~1 TB/s on a 4090). This is
+                                   // THE discrete-GPU decode fix; on UMA it's a wash.
     let buf = c.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("q1-weights"),
         // Rounded up: write_buffer refuses a size that is not a multiple of
@@ -16668,7 +16916,7 @@ fn dispatch_matvec(
             .rs_bufs
             .lock()
             .unwrap()
-            .entry((base ^ idx.wrapping_mul(1_000_003), row0))
+            .entry((base, (idx, row0)))
             .or_insert_with(|| {
                 crate::gpu::probe_note_cold();
                 make_rs()
@@ -17862,8 +18110,8 @@ pub fn forward_token_graph(
                     return None;
                 }
                 let b = tensor_weight(c, model, gw.idx, rows, cols)?; // device-local
-                // Row scales are token-invariant — cache by (ptr,rows),
-                // fingerprint-checked (the ptr is not a stable identity).
+                                                                      // Row scales are token-invariant — cache by (ptr,rows),
+                                                                      // fingerprint-checked (the ptr is not a stable identity).
                 let key = (gw.row_scale.as_ptr() as usize, rows);
                 let fp = fp_bytes(bytemuck::cast_slice(&gw.row_scale[..rows]));
                 let mut cb = c.const_bufs.lock().unwrap();
@@ -17991,11 +18239,11 @@ pub fn forward_token_graph(
     };
     let mut lws = Vec::with_capacity(layers.len());
     let mut gdn_dims: Option<(usize, usize, usize, usize, usize, usize)> = None; // nv,nk,dk,dv,kk,cdim
-    // Budget-driven device prefix: the first layer whose live graph buffers
-    // no longer fit ends the prefix instead of retaining an over-budget dense
-    // stack behind evicted LRU handles. The caller finishes the remaining
-    // layers on the host from the boundary hidden: one sync per token at the
-    // boundary, not per layer.
+                                                                                 // Budget-driven device prefix: the first layer whose live graph buffers
+                                                                                 // no longer fit ends the prefix instead of retaining an over-budget dense
+                                                                                 // stack behind evicted LRU handles. The caller finishes the remaining
+                                                                                 // layers on the host from the boundary hidden: one sync per token at the
+                                                                                 // boundary, not per layer.
     let mut prefix = false;
     let mut graph_bytes = 0u64;
     for l in layers {
@@ -19623,10 +19871,10 @@ pub fn forward_token_graph(
                                 pass.set_bind_group(0, &bg_rope, &[]);
                                 pass.dispatch_workgroups((nh + nkv) as u32, 1, 1);
                                 tsp!(pass, fine, 21); // rope
-                                // Exact Full attention has now admitted a
-                                // persistent K/V mutation.  If a later
-                                // dispatch or readback fails, the CPU cache
-                                // cannot safely resume this sequence.
+                                                      // Exact Full attention has now admitted a
+                                                      // persistent K/V mutation.  If a later
+                                                      // dispatch or readback fails, the CPU cache
+                                                      // cannot safely resume this sequence.
                                 state_started = true;
                                 pass.set_pipeline(&c.kv_append);
                                 pass.set_bind_group(0, &bg_kv, &[]);
@@ -19754,7 +20002,7 @@ pub fn forward_token_graph(
                                 );
                             }
                         } // fused-vs-split attend arms
-                        // attn_out *= sigmoid(gate) before the O projection.
+                          // attn_out *= sigmoid(gate) before the O projection.
                     }
                     if *output_gate && !attn_done {
                         let gm_u = uniform_u32x4(c, [(nh * hd) as u32, 0, 0, 0]);
@@ -20314,12 +20562,12 @@ pub fn forward_token_graph(
                             pass.set_bind_group(0, &bg_silu, &[]);
                             pass.dispatch_workgroups_flat((inter as u32).div_ceil(256));
                             tsp!(pass, fine, 43); // SiLU × up
-                            // `down` rides here too when its dtype can be
-                            // prepped: dispatches inside one pass serialize
-                            // with memory visibility — the same guarantee the
-                            // MoE arm leans on — so it reads the `abuf` silu
-                            // just wrote. This saves one pass per layer without
-                            // pretending that pass count predicts kernel time.
+                                                  // `down` rides here too when its dtype can be
+                                                  // prepped: dispatches inside one pass serialize
+                                                  // with memory visibility — the same guarantee the
+                                                  // MoE arm leans on — so it reads the `abuf` silu
+                                                  // just wrote. This saves one pass per layer without
+                                                  // pretending that pass count predicts kernel time.
                             if let Some((pdp, bg_d, wd)) = &pd {
                                 pass.set_pipeline(pdp);
                                 pass.set_bind_group(0, bg_d, &[]);
@@ -24162,7 +24410,7 @@ fn dispatch_matmat_keep(
             .rs_bufs
             .lock()
             .unwrap()
-            .entry((base ^ idx.wrapping_mul(1_000_003), usize::MAX))
+            .entry((base, (idx, usize::MAX)))
             .or_insert_with(|| {
                 crate::gpu::probe_note_cold();
                 c.device
@@ -24268,10 +24516,15 @@ fn dispatch_matmat_keep(
         let ascale: f32 = if dev_scale {
             0.0
         } else {
-            let mx = pre[..b * cols]
-                .iter()
-                .fold(0f32, |m, v| if v.is_finite() { m.max(v.abs()) } else { m });
-            if mx > 1000.0 { 1000.0 / mx } else { 1.0 }
+            let mx =
+                pre[..b * cols]
+                    .iter()
+                    .fold(0f32, |m, v| if v.is_finite() { m.max(v.abs()) } else { m });
+            if mx > 1000.0 {
+                1000.0 / mx
+            } else {
+                1.0
+            }
         };
         let cp = [
             (cols / 4) as u32,
@@ -25063,7 +25316,11 @@ fn tp_matmat_impl(
         let mx = xs[..b * cols]
             .iter()
             .fold(0f32, |m, v| if v.is_finite() { m.max(v.abs()) } else { m });
-        if mx > 1000.0 { 1000.0 / mx } else { 1.0 }
+        if mx > 1000.0 {
+            1000.0 / mx
+        } else {
+            1.0
+        }
     } else {
         0.0
     };
@@ -27306,7 +27563,11 @@ pub fn q4tp_ffn_packed(
         let mx = xs[..b * hidden]
             .iter()
             .fold(0f32, |m, v| if v.is_finite() { m.max(v.abs()) } else { m });
-        if mx > 1000.0 { 1000.0 / mx } else { 1.0 }
+        if mx > 1000.0 {
+            1000.0 / mx
+        } else {
+            1.0
+        }
     };
     let asc_dev = c.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("pffn-ascale-1"),
@@ -31309,7 +31570,7 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
         let mut rs_map = c.rs_bufs.lock().unwrap();
         let mut cached = |tag: usize, idx: usize, data: &[f32]| -> wgpu::Buffer {
             rs_map
-                .entry((idx.wrapping_mul(1_000_003) ^ tag, usize::MAX - 1))
+                .entry((model.uid() as usize, (idx, tag)))
                 .or_insert_with(|| {
                     crate::gpu::probe_note_cold();
                     storage_bytes(c, bytemuck::cast_slice(data))
@@ -31536,7 +31797,7 @@ mod tests {
             return;
         };
         let (rows, cols) = (256usize, 64usize); // cols % 4 == 0
-        // Synthetic int8 weights + row scales + pre-scaled activations.
+                                                // Synthetic int8 weights + row scales + pre-scaled activations.
         let mut q = vec![0i8; rows * cols];
         for (i, v) in q.iter_mut().enumerate() {
             *v = (((i * 37 + 11) % 255) as i32 - 127) as i8;
@@ -34944,7 +35205,11 @@ fn main() {
         let xs: Vec<f32> = (0..n * cols)
             .map(|i| {
                 let b = ((i % 97) as f32 - 48.0) / 48.0;
-                if i % 11 == 0 { b * 3000.0 } else { b }
+                if i % 11 == 0 {
+                    b * 3000.0
+                } else {
+                    b
+                }
             })
             .collect();
         let mk = |bytes: &[u8]| {
@@ -35088,7 +35353,11 @@ fn main() {
         let xs: Vec<f32> = (0..n * cols)
             .map(|i| {
                 let b = ((i % 97) as f32 - 48.0) / 48.0;
-                if i % 11 == 0 { b * 3000.0 } else { b }
+                if i % 11 == 0 {
+                    b * 3000.0
+                } else {
+                    b
+                }
             })
             .collect();
         let mk = |bytes: &[u8]| {
@@ -35273,7 +35542,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping q1t parity test");
             return;
         };
-        use cortiq_core::quant::{GROUP_SIZE, f32_to_f16, q1t_pack};
+        use cortiq_core::quant::{f32_to_f16, q1t_pack, GROUP_SIZE};
         let (rows, cols) = (33usize, 256usize);
         let gpr = cols / GROUP_SIZE;
         let outliers: [(usize, f32); 3] = [(5, 3.0), (300, -2.0), (600, 1.5)]; // sorted
@@ -35337,7 +35606,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping q4b parity test");
             return;
         };
-        use cortiq_core::quant::{GROUP_SIZE, f32_to_f16};
+        use cortiq_core::quant::{f32_to_f16, GROUP_SIZE};
         let (rows, cols) = (33usize, 256usize);
         let n_groups = rows * (cols / GROUP_SIZE);
         let mut payload = vec![0u8; n_groups * 16]; // packed nibbles
@@ -35380,7 +35649,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping q1t GEMM parity test");
             return;
         };
-        use cortiq_core::quant::{GROUP_SIZE, f32_to_f16, q1t_pack};
+        use cortiq_core::quant::{f32_to_f16, q1t_pack, GROUP_SIZE};
         let (b, rows, cols) = (40usize, 64usize, 256usize);
         let gpr = cols / GROUP_SIZE;
         let outliers: [(usize, f32); 4] = [(5, 3.0), (300, -2.0), (600, 1.5), (2000, -1.0)];
@@ -35534,7 +35803,7 @@ fn main() {
         let (rows, cols, b) = (100usize, 128usize, 70usize); // cols % 64 == 0
         let np = cols / 64;
         let jit = |a: usize| ((a * 2654435761usize) >> 13) as u32; // cheap hash → bits
-        // Build the q1 weight blob + a decoded f32 reference weight in lock-step.
+                                                                   // Build the q1 weight blob + a decoded f32 reference weight in lock-step.
         let mut q1w = vec![0u32; rows * np * 3];
         let mut wref = vec![0f32; rows * cols];
         for o in 0..rows {
@@ -37193,7 +37462,11 @@ fn dsv4_frame_salt() -> usize {
 #[inline]
 fn dsv4_salted_li(li: usize) -> usize {
     let salt = dsv4_frame_salt();
-    if salt == 0 { li } else { li + salt * 1_000_000 }
+    if salt == 0 {
+        li
+    } else {
+        li + salt * 1_000_000
+    }
 }
 
 fn dsv4_layer_frame_enc(
@@ -40122,7 +40395,11 @@ fn dsv4_layer_frame_bt_enc(
         let ew_c = p0.comp.as_ref().map_or(
             0,
             |(_, cg)| {
-                if cg.overlap { cg.width / 2 } else { cg.width }
+                if cg.overlap {
+                    cg.width / 2
+                } else {
+                    cg.width
+                }
             },
         );
         let comp_top = p0.window * a.hd + (p0.n_comp + batch.div_ceil(4).max(1) + 2) * ew_c.max(1);
@@ -42103,7 +42380,11 @@ pub fn dsv4_experts_fit(inter: usize, hidden: usize, gu_q2: bool, dn_q2: bool) -
             // is coming.
             let base = (c.vram_budget / 384).clamp(256 * mib, 512 * mib);
             let draft = DRAFT_RESERVE.load(Ordering::Relaxed);
-            if draft > 0 { 2 * base + draft } else { base }
+            if draft > 0 {
+                2 * base + draft
+            } else {
+                base
+            }
         });
     let usable = c.vram_budget.saturating_sub(reserve);
     ((usable.saturating_sub(used)) / per) as usize
@@ -43886,10 +44167,25 @@ pub fn q4tp_qkv(
     if q_out.len() < b * qrows || k_out.len() < b * kvrows || v_out.len() < b * kvrows {
         return false;
     }
+    let q4tp_weight = |idx: usize, rows: usize| -> Option<wgpu::Buffer> {
+        let entry = model.tensors.get(idx)?;
+        if entry.dtype != cortiq_core::TensorDtype::Q4TiledP
+            || entry.shape.len() != 2
+            || entry.shape[0] != rows
+            || entry.shape[1] != hidden
+        {
+            return None;
+        }
+        let payload = cortiq_core::quant::expected_nbytes(
+            cortiq_core::TensorDtype::Q4TiledP,
+            &[rows, hidden],
+        )?;
+        tensor_weight_sized(c, model, idx, rows, payload)
+    };
     let (Some(q1), Some(q2), Some(q3)) = (
-        tensor_weight(c, model, wq, qrows, hidden),
-        tensor_weight(c, model, wk, kvrows, hidden),
-        tensor_weight(c, model, wv, kvrows, hidden),
+        q4tp_weight(wq, qrows),
+        q4tp_weight(wk, kvrows),
+        q4tp_weight(wv, kvrows),
     ) else {
         return false;
     };
@@ -43973,6 +44269,325 @@ pub fn q4tp_qkv(
     read(&stage_q, qs, &mut q_out[..b * qrows])
         && read(&stage_k, ks, &mut k_out[..b * kvrows])
         && read(&stage_v, ks, &mut v_out[..b * kvrows])
+}
+
+/// Return whether a scratch/storage binding remains valid after the
+/// grow-only allocator rounds it to a power of two.  The real Qwen Image
+/// prefill intermediate is roughly 240 MiB at 5120×12288, below the RTX
+/// 3090's limit, but the refusal is required before `create_buffer` for
+/// smaller/older adapters whose storage binding wall is lower.
+fn qwen_storage_binding_fit(c: &Ctx, bytes: usize, label: &str) -> bool {
+    let Some(need): Option<u64> = bytes.max(4096).try_into().ok() else {
+        return false;
+    };
+    let rounded = need.checked_next_power_of_two().unwrap_or(u64::MAX);
+    let limits = c.device.limits();
+    let max = limits
+        .max_storage_buffer_binding_size
+        .min(limits.max_buffer_size);
+    if rounded <= max {
+        return true;
+    }
+    if std::env::var("CMF_GPU_DEBUG").is_ok() {
+        eprintln!(
+            "qwen q4tp GELU FFN refused: {label} binding {bytes} B rounds to {rounded} B, limit {max} B"
+        );
+    }
+    false
+}
+
+/// Fetch one exact Q4TP projection without the generic dense-byte-size
+/// assumption.  Q4TP's compressed payload is shorter than rows×cols; using
+/// that raw element count here would bind following tensors as weight bytes.
+fn qwen_q4tp_weight(
+    c: &Ctx,
+    model: &Arc<CmfModel>,
+    idx: usize,
+    rows: usize,
+    cols: usize,
+) -> Option<wgpu::Buffer> {
+    let entry = model.tensors.get(idx)?;
+    if entry.dtype != cortiq_core::TensorDtype::Q4TiledP
+        || entry.shape.len() != 2
+        || entry.shape[0] != rows
+        || entry.shape[1] != cols
+    {
+        return None;
+    }
+    let payload =
+        cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[rows, cols])?;
+    if !qwen_storage_binding_fit(c, payload, "Q4TP weight") {
+        return None;
+    }
+    tensor_weight_sized(c, model, idx, rows, payload)
+}
+
+/// Cache a small f32 vector in the existing constant arena.  Biases are
+/// stable across diffusion steps, and using the same fingerprinted cache as
+/// norms prevents one component's recycled mmap address from serving stale
+/// values in a later component.
+fn qwen_f32_const(c: &Ctx, data: &[f32], label: &'static str) -> wgpu::Buffer {
+    let key = (data.as_ptr() as usize, data.len());
+    let fp = fp_bytes(bytemuck::cast_slice(data));
+    let mut cb = c.const_bufs.lock().unwrap();
+    if let Some((b, f)) = cb.get_mut(&key) {
+        if *f != fp {
+            c.queue.write_buffer(b, 0, bytemuck::cast_slice(data));
+            *f = fp;
+        }
+        return b.clone();
+    }
+    let b = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: (data.len().max(1) * 4) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    c.queue.write_buffer(&b, 0, bytemuck::cast_slice(data));
+    cb.insert(key, (b.clone(), fp));
+    b
+}
+
+/// Encode the Qwen bias/GELU epilogue in the same command buffer as its
+/// surrounding GEMMs.  `gelu=true` applies the input bias followed by the
+/// exact tanh approximation; `false` only adds the output projection bias.
+fn encode_qwen_gelu_bias(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    values: &wgpu::Buffer,
+    bias: &wgpu::Buffer,
+    n: usize,
+    width: usize,
+    gelu: bool,
+) {
+    let p = uniform_u32x4(c, [n as u32, width as u32, u32::from(gelu), 0]);
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("qwen-gelu-bias-bg"),
+        layout: &c.qwen_gelu_bias.get_bind_group_layout(0),
+        entries: &[bind_buf(0, values), bind_buf(1, bias), bind_buf(2, &p)],
+    });
+    let mut pass = begin_pass_with(enc, Some("qwen-gelu-bias"), None);
+    pass.set_pipeline(&c.qwen_gelu_bias);
+    pass.set_bind_group(0, &bind, &[]);
+    let wgs = (n as u32).div_ceil(256);
+    pass.dispatch_workgroups(wgs.min(MAX_WG), wgs.div_ceil(MAX_WG), 1);
+}
+
+/// Qwen Image's two-projection tanh-GELU FFN on WGPU.  The input projection,
+/// exact bias+GELU, output projection and output bias share one command
+/// buffer; only the source and final output cross the host/device boundary.
+/// The cooperative f16 GEMM is reused when available, with a device max
+/// reduction for the resident second operand.  The scalar Q4TP GEMM remains
+/// the exact fallback when cooperative matrices, reductions, or binding
+/// limits are unavailable.
+#[allow(clippy::too_many_arguments)]
+pub fn q4tp_gelu_ffn(
+    model: &Arc<CmfModel>,
+    w_in: usize,
+    w_out: usize,
+    xs: &[f32],
+    b: usize,
+    hidden: usize,
+    inter: usize,
+    bias_in: &[f32],
+    bias_out: &[f32],
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let _gate = c.mm_gate.lock().unwrap();
+    if b < 32
+        || hidden == 0
+        || inter == 0
+        || hidden % 32 != 0
+        || inter % 32 != 0
+        || bias_in.len() != inter
+        || bias_out.len() != hidden
+    {
+        return false;
+    }
+    let Some(x_len) = b.checked_mul(hidden) else {
+        return false;
+    };
+    let Some(mid_len) = b.checked_mul(inter) else {
+        return false;
+    };
+    if xs.len() < x_len
+        || out.len() < x_len
+        || x_len > u32::MAX as usize
+        || mid_len > u32::MAX as usize
+    {
+        return false;
+    }
+    let Some(x_bytes) = x_len.checked_mul(4) else {
+        return false;
+    };
+    let Some(mid_bytes) = mid_len.checked_mul(4) else {
+        return false;
+    };
+    // Scratch::ensure rounds every slot to a power of two.  Check all three
+    // live panels before touching the weight cache or creating any buffers.
+    if !qwen_storage_binding_fit(c, x_bytes, "input")
+        || !qwen_storage_binding_fit(c, mid_bytes, "intermediate")
+        || !qwen_storage_binding_fit(c, x_bytes, "output")
+    {
+        return false;
+    }
+    let Some(w_in_buf) = qwen_q4tp_weight(c, model, w_in, inter, hidden) else {
+        return false;
+    };
+    let Some(w_out_buf) = qwen_q4tp_weight(c, model, w_out, hidden, inter) else {
+        return false;
+    };
+    let bias_in_buf = qwen_f32_const(c, bias_in, "qwen-mlp-bias-in");
+    let bias_out_buf = qwen_f32_const(c, bias_out, "qwen-mlp-bias-out");
+
+    let st = wgpu::BufferUsages::STORAGE;
+    let (x_buf, mid_buf, y_buf, stage, planes, amax_parts) = {
+        let mut sc = c.scratch.lock().unwrap();
+        let x_buf = Scratch::ensure(
+            &c.device,
+            &mut sc.xs,
+            x_bytes as u64,
+            st | wgpu::BufferUsages::COPY_DST,
+            "qwen-mlp-x",
+        );
+        let mid_buf = Scratch::ensure(&c.device, &mut sc.g, mid_bytes as u64, st, "qwen-mlp-mid");
+        let y_buf = Scratch::ensure(
+            &c.device,
+            &mut sc.y,
+            x_bytes as u64,
+            st | wgpu::BufferUsages::COPY_SRC,
+            "qwen-mlp-y",
+        );
+        let stage = Scratch::ensure(
+            &c.device,
+            &mut sc.stage,
+            x_bytes as u64,
+            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            "qwen-mlp-stage",
+        );
+        let coop = c.q4tp_dq_f16.is_some()
+            && c.q4tp_mm_coop_f16.is_some()
+            && (c.act_absmax.is_some() || (c.act_amax_part.is_some() && c.act_amax_fold.is_some()))
+            && std::env::var("CMF_QWEN_IMAGE_FUSED_MLP_COOP").as_deref() != Ok("0");
+        let planes = if coop {
+            let p1 = dq_f16_plane_slot(c, &mut sc, &w_in_buf, inter, hidden, false);
+            let p2 = dq_f16_plane_slot(c, &mut sc, &w_out_buf, hidden, inter, true);
+            match (p1, p2) {
+                (Some(p1), Some(p2)) => Some((p1, p2)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        // `encode_act_absmax_with` can reuse these partials without trying to
+        // lock `scratch` recursively while this scope owns it.
+        let amax_parts =
+            if planes.is_some() && c.act_amax_part.is_some() && c.act_amax_fold.is_some() {
+                Some(Scratch::ensure(
+                    &c.device,
+                    &mut sc.amaxp,
+                    (512 * 4) as u64,
+                    st,
+                    "qwen-mlp-amax-parts",
+                ))
+            } else {
+                None
+            };
+        c.queue
+            .write_buffer(&x_buf, 0, bytemuck::cast_slice(&xs[..x_len]));
+        (x_buf, mid_buf, y_buf, stage, planes, amax_parts)
+    };
+
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("qwen-gelu-ffn"),
+        });
+    let use_coop = planes.is_some();
+    if let Some(((plane1, bind_dq1), (plane2, bind_dq2))) = planes.as_ref() {
+        let dq = c.q4tp_dq_f16.as_ref().unwrap();
+        for (plane_bind, rows, cols) in [(bind_dq1, inter, hidden), (bind_dq2, hidden, inter)] {
+            let mut pass = begin_pass_with(&mut enc, Some("qwen-q4tp-dequant"), None);
+            pass.set_pipeline(dq);
+            pass.set_bind_group(0, plane_bind, &[]);
+            let Some(pairs) = rows.checked_mul(cols).and_then(|n| n.checked_div(2)) else {
+                return false;
+            };
+            let Ok(pairs_u32) = u32::try_from(pairs) else {
+                return false;
+            };
+            let wgs = pairs_u32.div_ceil(256);
+            pass.dispatch_workgroups(wgs.min(MAX_WG), wgs.div_ceil(MAX_WG), 1);
+        }
+        let mx = xs[..x_len].iter().fold(
+            0.0f32,
+            |m, &v| if v.is_finite() { m.max(v.abs()) } else { m },
+        );
+        let ascale = if mx > 1000.0 { 1000.0 / mx } else { 1.0 };
+        encode_q4_tile_mm_full(
+            c,
+            &mut enc,
+            c.q4tp_mm_coop_f16.as_ref().unwrap(),
+            plane1,
+            &x_buf,
+            &mid_buf,
+            inter,
+            hidden,
+            b,
+            ascale,
+            None,
+        );
+        encode_qwen_gelu_bias(c, &mut enc, &mid_buf, &bias_in_buf, mid_len, inter, true);
+        let asc = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("qwen-mlp-ascale"),
+            size: 4,
+            usage: st,
+            mapped_at_creation: false,
+        });
+        if !encode_act_absmax_with(c, &mut enc, &mid_buf, mid_len, &asc, amax_parts.as_ref()) {
+            return false;
+        }
+        encode_q4_tile_mm_full(
+            c,
+            &mut enc,
+            c.q4tp_mm_coop_f16.as_ref().unwrap(),
+            plane2,
+            &mid_buf,
+            &y_buf,
+            hidden,
+            inter,
+            b,
+            0.0,
+            Some(&asc),
+        );
+    } else {
+        encode_q4_tile_mm(
+            c, &mut enc, &c.q4tp_mm, &w_in_buf, &x_buf, &mid_buf, inter, hidden, b,
+        );
+        encode_qwen_gelu_bias(c, &mut enc, &mid_buf, &bias_in_buf, mid_len, inter, true);
+        encode_q4_tile_mm(
+            c, &mut enc, &c.q4tp_mm, &w_out_buf, &mid_buf, &y_buf, hidden, inter, b,
+        );
+    }
+    encode_qwen_gelu_bias(c, &mut enc, &y_buf, &bias_out_buf, x_len, hidden, false);
+    let ok = readback(c, enc, &y_buf, &stage, x_bytes as u64, &mut out[..x_len]);
+    if ok && std::env::var("CMF_GPU_DEBUG").is_ok() {
+        static SEEN: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashSet<(usize, usize, bool)>>,
+        > = std::sync::OnceLock::new();
+        let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+        if seen.lock().unwrap().insert((hidden, inter, use_coop)) {
+            let limits = c.device.limits();
+            eprintln!(
+                "qwen q4tp GELU FFN: fused {} b={b} hidden={hidden} inter={inter} mid_bytes={mid_bytes} storage_limit={} max_buffer={}",
+                if use_coop { "coop_f16" } else { "scalar" },
+                limits.max_storage_buffer_binding_size,
+                limits.max_buffer_size,
+            );
+        }
+    }
+    ok
 }
 
 /// One whole modulated DiT block on the card — the norms, the three
