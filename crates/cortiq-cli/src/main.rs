@@ -6,12 +6,14 @@ mod awnp;
 mod convert;
 mod gguf;
 mod gptq;
+mod http_range;
 mod imagepack;
 mod ltxcmd;
 mod ltxpack;
 mod moedefrag;
 mod music;
 mod npy;
+mod qwen_imagepack;
 mod requant;
 mod sign;
 mod skill;
@@ -1021,11 +1023,9 @@ enum Commands {
         #[arg(long)]
         teacher: Option<String>,
     },
-    /// Generate an image from text (Lumina-Image 2.0). Takes a packed
-    /// `.cmf` from `imagine-pack` — one mmap for text encoder, DiT and
-    /// VAE — or a raw diffusers directory (tokenizer/ text_encoder/
-    /// transformer/ vae/) for the exact f32 path. `CMF_GPU=1` runs the
-    /// DiT on the device (Metal); output is P6 PPM
+    /// Generate with Lumina or edit reference images with Qwen Image CMFs.
+    /// Qwen takes a transformer.cmf plus text_encoder.cmf and vae.cmf beside it;
+    /// pass --image once per reference. Metal/Vulkan/DX12 are selected when available.
     Imagine {
         /// Model root directory
         model_dir: String,
@@ -1044,18 +1044,38 @@ enum Commands {
         cfg: f32,
         #[arg(long, default_value_t = 42)]
         seed: u64,
-        /// Output image path (.ppm, P6)
+        /// Reference image for Qwen Image Edit; repeat for multiple images
+        #[arg(long = "image")]
+        images: Vec<String>,
+        /// Qwen2.5-VL CMF (default: text_encoder.cmf beside the transformer)
+        #[arg(long)]
+        text_encoder: Option<String>,
+        /// Qwen Image VAE CMF (default: vae.cmf beside the transformer)
+        #[arg(long)]
+        vae: Option<String>,
+        /// Qwen Image negative prompt (default: a space, enabling true CFG)
+        #[arg(long)]
+        negative_prompt: Option<String>,
+        /// Optional Qwen Image FlowMatch Euler scheduler JSON
+        #[arg(long)]
+        scheduler: Option<String>,
+        /// Qwen Image reference area as side squared; 1024 is the official profile
+        #[arg(long, default_value_t = 1024)]
+        reference_size: usize,
+        /// Output image path (Qwen: PNG/JPEG/PPM; Lumina: P6 PPM)
         #[arg(long, default_value = "out.ppm")]
         out: String,
     },
-    /// Pack a Lumina-Image 2.0 diffusers directory into ONE quantized
-    /// .cmf (te.* + dit.* + vae.* + tokenizer) that `imagine` runs
-    /// straight off the mmap
+    /// Pack a Diffusers source into CMF. The default packs Lumina into one file;
+    /// --component packs a standalone Qwen text encoder or VAE. Qwen also accepts
+    /// a pinned Hugging Face resolve URL and streams source weights in parallel.
     ImaginePack {
-        /// Diffusers root (tokenizer/ text_encoder/ transformer/ vae/)
+        /// Optional standalone Qwen component: qwen-text-encoder or qwen-vae
+        #[arg(long)]
+        component: Option<String>,
+        /// Diffusers root directory, or a pinned HF resolve base URL for Qwen
         root: String,
-        /// Projection codec: q4t | q8 (modulation/embeddings stay q8,
-        /// VAE f16, norms f32)
+        /// Projection codec (Qwen: q4tp/q4t/q8_2f/f16; Lumina: q4t/q8)
         #[arg(long, default_value = "q4t")]
         quant: String,
         /// Output .cmf path
@@ -2173,10 +2193,40 @@ async fn main() -> anyhow::Result<()> {
             steps,
             cfg,
             seed,
+            images,
+            text_encoder,
+            vae,
+            negative_prompt,
+            scheduler,
+            reference_size,
             out,
-        } => cmd_imagine(&model_dir, &prompt, height, width, steps, cfg, seed, &out),
-        Commands::ImaginePack { root, quant, out } => {
-            imagepack::cmd_imagine_pack(&root, &quant, &out)
+        } => cmd_imagine(
+            &model_dir,
+            &prompt,
+            height,
+            width,
+            steps,
+            cfg,
+            seed,
+            &out,
+            &images,
+            text_encoder.as_deref(),
+            vae.as_deref(),
+            negative_prompt.as_deref(),
+            scheduler.as_deref(),
+            reference_size,
+        ),
+        Commands::ImaginePack {
+            root,
+            quant,
+            out,
+            component,
+        } => {
+            if let Some(component) = component {
+                qwen_imagepack::pack(&root, &component, &quant, &out)
+            } else {
+                imagepack::cmd_imagine_pack(&root, &quant, &out)
+            }
         }
         Commands::Music {
             model,
@@ -4937,9 +4987,7 @@ async fn cmd_info(model_path: &str, tensors: Option<&str>) -> anyhow::Result<()>
     Ok(())
 }
 
-/// The file's verifiable autobiography — narrated from its own header
-/// (spec §2/§9) and directory. Everything here is IN the file; nothing
-/// is inferred. "Opening someone else's .cmf, I am no longer blind."
+/// Dispatch native image generation/editing from its CMF architecture.
 #[allow(clippy::too_many_arguments)]
 fn cmd_imagine(
     model_dir: &str,
@@ -4950,7 +4998,86 @@ fn cmd_imagine(
     cfg: f32,
     seed: u64,
     out: &str,
+    images: &[String],
+    text_encoder: Option<&str>,
+    vae: Option<&str>,
+    negative_prompt: Option<&str>,
+    scheduler: Option<&str>,
+    reference_size: usize,
 ) -> anyhow::Result<()> {
+    let root = std::path::Path::new(model_dir);
+    let qwen_image = if root.is_file() {
+        CmfModel::open(root)?.header.arch.arch_name == "qwen_image"
+    } else {
+        root.join("transformer.cmf").is_file()
+    };
+    if qwen_image || !images.is_empty() || text_encoder.is_some() || vae.is_some() {
+        let parent = if root.is_dir() {
+            root
+        } else {
+            root.parent().unwrap_or_else(|| std::path::Path::new("."))
+        };
+        let paths = cortiq_engine::qwen_imagegen::QwenImagePaths {
+            transformer: if root.is_dir() {
+                root.join("transformer.cmf")
+            } else {
+                root.to_path_buf()
+            },
+            text_encoder: text_encoder
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| parent.join("text_encoder.cmf")),
+            vae: vae
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| parent.join("vae.cmf")),
+            scheduler: scheduler.map(std::path::PathBuf::from).or_else(|| {
+                let path = parent.join("scheduler_config.json");
+                path.is_file().then_some(path)
+            }),
+        };
+        if reference_size != 1024 {
+            eprintln!(
+                "Qwen Image: reference area {reference_size}² differs from the official 1024² profile"
+            );
+        }
+        let params = cortiq_engine::qwen_imagegen::QwenImageParams {
+            height,
+            width,
+            steps,
+            true_cfg_scale: cfg,
+            seed,
+            reference_size,
+            negative_prompt: Some(negative_prompt.unwrap_or(" ").to_string()),
+            ..Default::default()
+        };
+        let refs = images
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect::<Vec<_>>();
+        let t0 = std::time::Instant::now();
+        let image = cortiq_engine::qwen_imagegen::edit_files(
+            &paths,
+            prompt,
+            &refs,
+            &params,
+            |stage, i, n| {
+                eprintln!("{stage}: {i}/{n} ({:.1}s)", t0.elapsed().as_secs_f64());
+            },
+        )
+        .map_err(anyhow::Error::msg)?;
+        image
+            .save(std::path::Path::new(out))
+            .map_err(anyhow::Error::msg)?;
+        println!(
+            "{out}: {}x{}, {steps} steps in {:.1}s",
+            image.width,
+            image.height,
+            t0.elapsed().as_secs_f64()
+        );
+        return Ok(());
+    }
+    if negative_prompt.is_some() || scheduler.is_some() || reference_size != 1024 {
+        anyhow::bail!("negative-prompt, scheduler, and reference-size are Qwen Image options");
+    }
     let params = cortiq_engine::imagegen::GenParams {
         height,
         width,
