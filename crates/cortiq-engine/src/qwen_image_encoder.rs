@@ -753,20 +753,54 @@ impl QwenImageEncoder {
     }
 
     fn apply_text_rope(&self, q: &mut [f32], k: &mut [f32], positions: &[[i64; 3]]) {
-        let half = self.head_dim / 2;
+        Self::apply_mrope_rotary(
+            q,
+            k,
+            positions,
+            self.hidden,
+            self.heads,
+            self.kv_heads,
+            self.head_dim,
+            self.rope_theta,
+            self.mrope_section,
+        );
+    }
+    /// Apply Qwen2.5-VL's three-axis rotary embedding to Q/K in place.
+    ///
+    /// The configured mRoPE section lengths describe one half of the rotary
+    /// vector.  Transformers duplicates that list before selecting axes, so the
+    /// canonical `[16, 24, 24]` config produces six sections
+    /// `[16, 24, 24, 16, 24, 24]`.  Keeping the axis selection here (rather than
+    /// assigning one axis to each whole half) is required for anisotropic image
+    /// positions and preserves an orthogonal rotation for every pair.
+    fn apply_mrope_rotary(
+        q: &mut [f32],
+        k: &mut [f32],
+        positions: &[[i64; 3]],
+        hidden: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        rope_theta: f64,
+        mrope_section: [usize; 3],
+    ) {
+        let half = head_dim / 2;
+        debug_assert_eq!(hidden, heads * head_dim);
+        debug_assert_eq!(q.len(), positions.len() * hidden);
+        debug_assert_eq!(k.len(), positions.len() * kv_heads * head_dim);
         for (token, p) in positions.iter().enumerate() {
-            let mut cos = vec![0f32; self.head_dim];
-            let mut sin = vec![0f32; self.head_dim];
+            let mut cos = vec![0f32; head_dim];
+            let mut sin = vec![0f32; head_dim];
             // Transformers builds `freqs = position @ inv_freq`, duplicates
             // it (`cat(freqs, freqs)`), then replaces each mRoPE section with
             // the corresponding temporal/height/width section.  Preserve
             // that split before rotate-half; a direct `[T,H,W]` assignment
             // to the first/second head halves is a different rotation.
-            let mut axis_emb = vec![vec![0f32; self.head_dim]; 3];
-            let mut axis_sin = vec![vec![0f32; self.head_dim]; 3];
+            let mut axis_emb = vec![vec![0f32; head_dim]; 3];
+            let mut axis_sin = vec![vec![0f32; head_dim]; 3];
             for axis in 0..3 {
                 for j in 0..half {
-                    let freq = 1.0 / self.rope_theta.powf(2.0 * j as f64 / self.head_dim as f64);
+                    let freq = 1.0 / rope_theta.powf(2.0 * j as f64 / head_dim as f64);
                     let (s, c) = (p[axis] as f64 * freq).sin_cos();
                     axis_emb[axis][j] = c as f32;
                     axis_sin[axis][j] = s as f32;
@@ -775,33 +809,34 @@ impl QwenImageEncoder {
                 }
             }
             let section_widths = [
-                self.mrope_section[0] * 2,
-                self.mrope_section[1] * 2,
-                self.mrope_section[2] * 2,
+                mrope_section[0],
+                mrope_section[1],
+                mrope_section[2],
+                mrope_section[0],
+                mrope_section[1],
+                mrope_section[2],
             ];
             let mut offset = 0usize;
-            for (axis, &width) in section_widths.iter().enumerate() {
-                // `cos.split([section*2])` is applied before the axis
-                // replacement.  Therefore height starts at source offset
-                // 32 and width at 80 in the canonical 128-wide head.
-                cos[offset..offset + width]
-                    .copy_from_slice(&axis_emb[axis][offset..offset + width]);
-                sin[offset..offset + width]
-                    .copy_from_slice(&axis_sin[axis][offset..offset + width]);
+            for (section, &width) in section_widths.iter().enumerate() {
+                let axis = section % 3;
+                let end = offset + width;
+                cos[offset..end].copy_from_slice(&axis_emb[axis][offset..end]);
+                sin[offset..end].copy_from_slice(&axis_sin[axis][offset..end]);
                 offset += width;
             }
-            for head in 0..self.heads {
-                let qv = &mut q[token * self.hidden + head * self.head_dim
-                    ..token * self.hidden + (head + 1) * self.head_dim];
+            debug_assert_eq!(offset, head_dim);
+            for head in 0..heads {
+                let qv = &mut q
+                    [token * hidden + head * head_dim..token * hidden + (head + 1) * head_dim];
                 for d in 0..half {
                     let (a, b) = (qv[d], qv[d + half]);
                     qv[d] = a * cos[d] - b * sin[d];
                     qv[d + half] = a * sin[d + half] + b * cos[d + half];
                 }
             }
-            for head in 0..self.kv_heads {
-                let kv_offset = token * self.kv_heads * self.head_dim + head * self.head_dim;
-                let kv = &mut k[kv_offset..kv_offset + self.head_dim];
+            for head in 0..kv_heads {
+                let kv_offset = token * kv_heads * head_dim + head * head_dim;
+                let kv = &mut k[kv_offset..kv_offset + head_dim];
                 for d in 0..half {
                     let (a, b) = (kv[d], kv[d + half]);
                     kv[d] = a * cos[d] - b * sin[d];
@@ -1001,7 +1036,9 @@ struct Grid {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_mrope, DROP_PREFIX, PROMPT_TEMPLATE_HEAD, PROMPT_TEMPLATE_TAIL};
+    use super::{
+        parse_mrope, QwenImageEncoder, DROP_PREFIX, PROMPT_TEMPLATE_HEAD, PROMPT_TEMPLATE_TAIL,
+    };
     use serde_json::json;
 
     #[test]
@@ -1016,5 +1053,54 @@ mod tests {
         let cfg = json!({"rope_scaling":{"mrope_section":[1,1,2]}});
         assert_eq!(parse_mrope(&cfg, 8).unwrap(), [1, 1, 2]);
         assert!(parse_mrope(&json!({}), 8).is_err());
+    }
+
+    #[test]
+    fn canonical_mrope_repeats_sections_for_anisotropic_positions() {
+        let hidden = 128;
+        let heads = 1;
+        let kv_heads = 1;
+        let head_dim = 128;
+        let rope_theta = 1_000_000.0;
+        let sections = [16, 24, 24];
+        let positions = [[3_i64, 5_i64, 7_i64]];
+        let mut q: Vec<f32> = (0..hidden).map(|i| (i as f32 - 63.5) * 0.03125).collect();
+        let mut k: Vec<f32> = (0..hidden)
+            .map(|i| (63.5 - i as f32) * 0.017578125)
+            .collect();
+        let q_before = q.clone();
+        let k_before = k.clone();
+
+        QwenImageEncoder::apply_mrope_rotary(
+            &mut q, &mut k, &positions, hidden, heads, kv_heads, head_dim, rope_theta, sections,
+        );
+
+        // In the official implementation, the repeated list assigns axes to
+        // [0..16), [16..40), and [40..64) in both rotary halves.  Check one
+        // pair from each interval with distinct T/H/W positions so a numeric
+        // [32,48,48] split cannot satisfy this regression.
+        for &(d, axis) in &[(0usize, 0usize), (16, 1), (40, 2)] {
+            let j = d as f64;
+            let freq = 1.0 / rope_theta.powf(2.0 * j / head_dim as f64);
+            let angle = positions[0][axis] as f64 * freq;
+            let (sin, cos) = angle.sin_cos();
+            let (a, b) = (q_before[d], q_before[d + head_dim / 2]);
+            let expected_a = a as f64 * cos - b as f64 * sin;
+            let expected_b = a as f64 * sin + b as f64 * cos;
+            assert!((q[d] as f64 - expected_a).abs() < 2e-6);
+            assert!((q[d + head_dim / 2] as f64 - expected_b).abs() < 2e-6);
+        }
+
+        let norm_sq = |x: &[f32]| x.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>();
+        let q_norm_error = (norm_sq(&q) - norm_sq(&q_before)).abs() / norm_sq(&q_before);
+        let k_norm_error = (norm_sq(&k) - norm_sq(&k_before)).abs() / norm_sq(&k_before);
+        assert!(
+            q_norm_error < 2e-6,
+            "Q rotation changed norm by {q_norm_error:e}"
+        );
+        assert!(
+            k_norm_error < 2e-6,
+            "K rotation changed norm by {k_norm_error:e}"
+        );
     }
 }
