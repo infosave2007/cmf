@@ -38,13 +38,57 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
-Qwen Image transformer GGUFs, including `Qwen-Image-Edit-2509-Q6_K.gguf`,
-use the same command. Import streams all tensors into CMF, retains floating-point
-weights exactly and converts quantized matrices to the requested `--quant`
-(default `q8`, using row and column scales for Qwen Image). The resulting CMF
-contains the transformer and its configuration;
-the source GGUF's separate text encoder and VAE are not bundled, and Qwen Image
-generation is not yet implemented by `cortiq imagine`.
+## Native Qwen Image Edit
+
+Version 0.6.8 adds the native Qwen-Image-Edit-2509 path. The ready default is
+one self-contained CMF, while the standalone component files remain available
+when users want to stage them independently. Build the bundle from a directory
+that contains `transformer.cmf`, `text_encoder.cmf`, `vae.cmf`, and
+`scheduler_config.json`:
+
+```sh
+cortiq imagine-pack --bundle qwen-image \
+  --out qwen-image/qwen-image-edit-2509-q4tp.cmf
+```
+
+The bundle embeds the transformer, Qwen2.5-VL text/vision encoder,
+tokenizer/processor/configuration, VAE, and scheduler. Run it directly with no
+companion files:
+
+```sh
+cortiq imagine qwen-image/qwen-image-edit-2509-q4tp.cmf \
+  --image docs/media/fox-512.png \
+  --prompt "Add a vivid blue knitted scarf while preserving the fox, pose, and snowy background." \
+  --height 1024 --width 1024 --steps 40 --cfg 4 --seed 7 \
+  --reference-size 1024 --out fox-scarf.png
+```
+
+The command requires at least one reference image; repeat `--image` for
+additional references. PNG, JPEG, and PPM output are supported. `CMF_GPU=0`
+forces the portable CPU path. The documented profile keeps
+`--reference-size 1024`: this is the square root of the VAE reference area and
+is independent of the requested output dimensions. On a capable Vulkan device,
+`cortiq imagine` automatically selects the resident Qwen transformer forward:
+hidden state stays on the device across transformer blocks and is read back once
+at the end of each forward. CPU and Metal fallback paths remain available, and
+the memory-budgeted admission chooses a compatible path when needed. See [the
+Qwen Image guide](docs/QWEN_IMAGE.md) for pinned acquisition, standalone staging,
+and bundle packing commands.
+
+The standalone layout remains available for explicit component selection:
+
+```sh
+cortiq imagine qwen-image/transformer.cmf \
+  --text-encoder qwen-image/text_encoder.cmf \
+  --vae qwen-image/vae.cmf \
+  --scheduler qwen-image/scheduler_config.json \
+  --image docs/media/fox-512.png \
+  --prompt "Turn the scene into a watercolor illustration." \
+  --height 1024 --width 1024 --steps 40 --cfg 4 --seed 7 \
+  --reference-size 1024 --out watercolor.png
+```
+
+For pinned sources and component packing, see [the Qwen Image guide](docs/QWEN_IMAGE.md).
 
 The CLI also exposes `info`, `bench`, `ppl`, `serve`, `skill`, `moe-mask`,
 `moe-defrag`, `requant`, `compact`, `sign`, `imagine`, `animate` and
@@ -121,6 +165,8 @@ fails.
 - [GPU kernel recipes](docs/GPU_KERNEL_RECIPES.md) — backend measurements.
 - [Multi-GPU execution](docs/MULTI_GPU.md) and [mobile split](docs/MOBILE_SPLIT.ru.md).
 - [FCD restoration](docs/RUST_FCD.md) and [low-bit PTQ](docs/Q1T_PTQ.md).
+- [Qwen Image Edit](docs/QWEN_IMAGE.md) — one-file native image editing and
+  standalone component staging.
 - [Model cards and conversion notes](docs/hf/README.md).
 - [Cortiq Spectra](docs/SPECTRA.ru.md) — deterministic CPU streaming colorization
   for dual-energy X-ray captures, scanner profiles, refusal masks, and measured

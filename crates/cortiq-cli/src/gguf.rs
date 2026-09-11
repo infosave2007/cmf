@@ -11,13 +11,16 @@
 //! transformer config instead of interpreting the file as an LLM.
 
 use crate::convert::{self, Quant};
+use crate::http_range::read_http_range;
 use cortiq_core::format::{
-    CMF_VERSION, CmfHeader, CmfModel, CmfStreamWriter, TensorSpec, TokenizerBundle,
+    CmfHeader, CmfModel, CmfStreamWriter, TensorSpec, TokenizerBundle, CMF_VERSION,
 };
 use cortiq_core::quant::f16_to_f32;
 use cortiq_core::types::{LayerType, ModelArch, MoeConfig, NormStyle, QuantType, TensorDtype};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs;
+use std::ops::Deref;
 
 // GGUF metadata value types.
 const T_U8: u32 = 0;
@@ -101,7 +104,7 @@ struct Cursor<'a> {
 }
 impl<'a> Cursor<'a> {
     fn take(&mut self, n: usize) -> anyhow::Result<&'a [u8]> {
-        if self.p + n > self.b.len() {
+        if n > self.b.len().saturating_sub(self.p) {
             anyhow::bail!("gguf: truncated");
         }
         let s = &self.b[self.p..self.p + n];
@@ -139,7 +142,10 @@ impl<'a> Cursor<'a> {
             return self.scalar(t);
         }
         let et = self.u32()?;
-        let n = self.u64()? as usize;
+        let n = usize::try_from(self.u64()?)?;
+        if n > self.b.len().saturating_sub(self.p) {
+            anyhow::bail!("gguf: truncated array");
+        }
         if et == T_STR {
             let mut v = Vec::with_capacity(n);
             for _ in 0..n {
@@ -172,13 +178,29 @@ struct GgufTensor {
     offset: u64, // relative to data section
 }
 
+enum GgufBytes {
+    Mapped(memmap2::Mmap),
+    Header(Vec<u8>),
+}
+
+impl Deref for GgufBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Mapped(m) => m,
+            Self::Header(b) => b,
+        }
+    }
+}
+
 struct Gguf {
     md: BTreeMap<String, Val>,
     tensors: Vec<GgufTensor>,
     /// The whole file, memory-mapped — a 20 GB+ MoE GGUF must not be
     /// slurped into RAM on a 24 GB machine.
-    bytes: memmap2::Mmap,
+    bytes: GgufBytes,
     data_start: usize,
+    source_len: usize,
 }
 
 fn align_up(x: usize, a: usize) -> usize {
@@ -189,13 +211,23 @@ fn parse(path: &std::path::Path) -> anyhow::Result<Gguf> {
     let file = fs::File::open(path)?;
     // SAFETY: read-only map of a file we just opened.
     let bytes = unsafe { memmap2::Mmap::map(&file)? };
+    let source_len = bytes.len();
+    parse_bytes(GgufBytes::Mapped(bytes), source_len)
+}
+
+fn parse_bytes(bytes: GgufBytes, source_len: usize) -> anyhow::Result<Gguf> {
     let mut c = Cursor { b: &bytes, p: 0 };
     if c.take(4)? != b"GGUF" {
         anyhow::bail!("not a GGUF file");
     }
-    let _ver = c.u32()?;
-    let n_tensors = c.u64()? as usize;
-    let n_kv = c.u64()? as usize;
+    let ver = c.u32()?;
+    anyhow::ensure!(matches!(ver, 2 | 3), "gguf: unsupported version {ver}");
+    let n_tensors = usize::try_from(c.u64()?)?;
+    let n_kv = usize::try_from(c.u64()?)?;
+    anyhow::ensure!(
+        n_tensors <= bytes.len() / 24 && n_kv <= bytes.len() / 12,
+        "gguf: truncated directory"
+    );
     let mut md = BTreeMap::new();
     for _ in 0..n_kv {
         let key = c.gstr()?;
@@ -206,6 +238,7 @@ fn parse(path: &std::path::Path) -> anyhow::Result<Gguf> {
     for _ in 0..n_tensors {
         let name = c.gstr()?;
         let nd = c.u32()? as usize;
+        anyhow::ensure!(nd <= 8, "gguf: invalid tensor rank {nd}");
         let mut dims = Vec::with_capacity(nd);
         for _ in 0..nd {
             dims.push(c.u64()?);
@@ -223,12 +256,17 @@ fn parse(path: &std::path::Path) -> anyhow::Result<Gguf> {
         .get("general.alignment")
         .and_then(|v| v.as_u64())
         .unwrap_or(32) as usize;
-    let data_start = align_up(c.p, align.max(1));
+    anyhow::ensure!(
+        align.is_power_of_two() && align <= 65536,
+        "gguf: invalid alignment {align}"
+    );
+    let data_start = align_up(c.p, align);
     Ok(Gguf {
         md,
         tensors,
         bytes,
         data_start,
+        source_len,
     })
 }
 
@@ -1035,7 +1073,7 @@ fn pick_gguf<'a>(files: &[&'a String]) -> &'a str {
         .as_str()
 }
 
-fn quant_type_for(quant: Quant) -> QuantType {
+pub(crate) fn quant_type_for(quant: Quant) -> QuantType {
     match quant {
         Quant::Q8Row => QuantType::Q8Row,
         Quant::Q8_2f => QuantType::Q8_2f,
@@ -1255,7 +1293,11 @@ fn qwen_image_arch(geometry: &QwenImageGeometry) -> ModelArch {
     }
 }
 
-fn qwen_image_raw<'a>(g: &'a Gguf, t: &GgufTensor, numel: usize) -> anyhow::Result<&'a [u8]> {
+fn qwen_image_range(
+    g: &Gguf,
+    t: &GgufTensor,
+    numel: usize,
+) -> anyhow::Result<std::ops::Range<usize>> {
     let nb = nbytes(t.ggml_type, numel)?;
     let offset = usize::try_from(t.offset)
         .map_err(|_| anyhow::anyhow!("gguf tensor '{}': offset overflows usize", t.name))?;
@@ -1266,17 +1308,24 @@ fn qwen_image_raw<'a>(g: &'a Gguf, t: &GgufTensor, numel: usize) -> anyhow::Resu
     let end = start
         .checked_add(nb)
         .ok_or_else(|| anyhow::anyhow!("gguf tensor '{}': data range overflows", t.name))?;
-    if end > g.bytes.len() {
+    if end > g.source_len {
         anyhow::bail!(
             "gguf tensor '{}' is truncated: needs bytes [{start}, {end}), file has {}",
             t.name,
-            g.bytes.len()
+            g.source_len
         );
     }
-    Ok(&g.bytes[start..end])
+    Ok(start..end)
 }
 
-fn qwen_image_temp_path(output: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+fn qwen_image_raw<'a>(g: &'a Gguf, t: &GgufTensor, numel: usize) -> anyhow::Result<&'a [u8]> {
+    let range = qwen_image_range(g, t, numel)?;
+    g.bytes
+        .get(range)
+        .ok_or_else(|| anyhow::anyhow!("gguf: tensor data not mapped"))
+}
+
+pub(crate) fn qwen_image_temp_path(output: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
     let parent = output
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -1310,7 +1359,7 @@ fn qwen_image_temp_path(output: &std::path::Path) -> anyhow::Result<std::path::P
     )
 }
 
-fn qwen_image_sync_parent(path: &std::path::Path) -> anyhow::Result<()> {
+pub(crate) fn qwen_image_sync_parent(path: &std::path::Path) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         let parent = path
@@ -1371,7 +1420,27 @@ fn run_import_qwen_image(
     source_spec: &str,
     quant: Quant,
     output: &str,
+    progress: impl FnMut(f32),
+) -> anyhow::Result<()> {
+    run_import_qwen_image_with_reader(
+        g,
+        source,
+        source_spec,
+        quant,
+        output,
+        progress,
+        |_, t, numel| Ok(Cow::Borrowed(qwen_image_raw(g, t, numel)?)),
+    )
+}
+
+fn run_import_qwen_image_with_reader<'a>(
+    g: &Gguf,
+    source: &std::path::Path,
+    source_spec: &str,
+    quant: Quant,
+    output: &str,
     mut progress: impl FnMut(f32),
+    mut read: impl FnMut(usize, &GgufTensor, usize) -> anyhow::Result<Cow<'a, [u8]>>,
 ) -> anyhow::Result<()> {
     if g.tensors.is_empty() {
         anyhow::bail!("qwen_image GGUF has no tensors");
@@ -1416,7 +1485,7 @@ fn run_import_qwen_image(
                 t.ggml_type
             );
         }
-        let _ = qwen_image_raw(g, t, numel)?;
+        let _ = qwen_image_range(g, t, numel)?;
     }
     let total = g.tensors.len() + 1;
     let avg_name = g
@@ -1445,7 +1514,7 @@ fn run_import_qwen_image(
 
         for (idx, t) in g.tensors.iter().enumerate() {
             let (shape, numel) = qwen_image_shape(t)?;
-            let raw = qwen_image_raw(g, t, numel)?;
+            let raw = read(idx, t, numel)?;
             let (dtype, data) = match t.ggml_type {
                 // Controls and root matrices in the real Qwen Image GGUF use
                 // these native dtypes; retain their bytes exactly.
@@ -1456,7 +1525,7 @@ fn run_import_qwen_image(
                 // ordinary CMF requantization path, including Q4/Q5/Q6/Q8 K
                 // blocks and IQ4 codebooks.
                 _ => {
-                    let vals = dequant(t.ggml_type, raw, numel)?;
+                    let vals = dequant(t.ggml_type, &raw, numel)?;
                     if shape.len() == 2 {
                         convert::quantize_2d(output_quant, &vals, shape[0], shape[1])
                     } else {
@@ -1535,6 +1604,62 @@ fn run_import_qwen_image(
     Ok(())
 }
 
+fn run_import_qwen_image_url(
+    url: &str,
+    quant: Quant,
+    output: &str,
+    token: Option<&str>,
+    progress: impl FnMut(f32),
+) -> anyhow::Result<()> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(30))
+        .timeout_read(std::time::Duration::from_secs(120))
+        .build();
+    let mut header_size = 1024 * 1024;
+    let g = loop {
+        let (header, total) = read_http_range(&agent, url, token, 0, header_size, None)?;
+        match parse_bytes(GgufBytes::Header(header), total) {
+            Ok(g) => break g,
+            Err(e)
+                if e.to_string().contains("truncated")
+                    && header_size < 16 * 1024 * 1024
+                    && header_size < total =>
+            {
+                header_size *= 2;
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    anyhow::ensure!(
+        g.md.get("general.architecture").and_then(Val::as_str) == Some("qwen_image"),
+        "streaming URL import currently requires a Qwen Image GGUF; download other architectures before import"
+    );
+    let ranges: Vec<_> = g
+        .tensors
+        .iter()
+        .map(|t| {
+            let (_, n) = qwen_image_shape(t)?;
+            qwen_image_range(&g, t, n)
+        })
+        .collect::<anyhow::Result<_>>()?;
+    eprintln!(
+        "Streaming {} tensors from {} bytes; up to 8 concurrent range requests",
+        g.tensors.len(),
+        g.source_len
+    );
+    crate::http_range::with_http_ranges(&agent, url, token, g.source_len, ranges, |read| {
+        run_import_qwen_image_with_reader(
+            &g,
+            std::path::Path::new(url),
+            url,
+            quant,
+            output,
+            progress,
+            |_, _, _| read().map(Cow::Owned),
+        )
+    })
+}
+
 pub fn run_import_gguf(
     gguf: &str,
     quant: &str,
@@ -1543,6 +1668,9 @@ pub fn run_import_gguf(
     mut progress: impl FnMut(f32),
 ) -> anyhow::Result<()> {
     let quant = convert::parse_quant(quant)?;
+    if gguf.starts_with("https://") || gguf.starts_with("http://") {
+        return run_import_qwen_image_url(gguf, quant, output, hf_token, progress);
+    }
     // Source: a local .gguf, an HF repo id (auto-pick a .gguf), or owner/repo/file.gguf.
     let path = resolve_gguf_source(gguf, hf_token)?;
     let g = parse(&path)?;
@@ -1828,6 +1956,10 @@ fn unpermute(vals: &[f32], out_dim: usize, in_dim: usize, n_heads: usize) -> Vec
 #[cfg(test)]
 mod dequant_tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
+    use std::thread::JoinHandle;
 
     /// tiled block v·nk+g → grouped g·r+v, and the column variant.
     #[test]
@@ -2218,16 +2350,14 @@ mod dequant_tests {
         truncated.truncate(truncated.len().saturating_sub(1));
         std::fs::write(&bad_source, truncated).unwrap();
         std::fs::write(&bad_output, b"previous-valid-artifact").unwrap();
-        assert!(
-            run_import_gguf(
-                bad_source.to_str().unwrap(),
-                "q8",
-                bad_output.to_str().unwrap(),
-                None,
-                |_| {},
-            )
-            .is_err()
-        );
+        assert!(run_import_gguf(
+            bad_source.to_str().unwrap(),
+            "q8",
+            bad_output.to_str().unwrap(),
+            None,
+            |_| {},
+        )
+        .is_err());
         assert_eq!(
             std::fs::read(&bad_output).unwrap(),
             b"previous-valid-artifact"
@@ -2236,5 +2366,190 @@ mod dequant_tests {
         let _ = std::fs::remove_file(source);
         let _ = std::fs::remove_file(bad_source);
         let _ = std::fs::remove_file(bad_output);
+    }
+
+    #[derive(Clone, Copy)]
+    enum HttpReply {
+        Normal,
+        Status200,
+        BadContentRange,
+        TruncatedData,
+    }
+
+    fn serve_gguf(
+        source: Arc<Vec<u8>>,
+        reply: HttpReply,
+        expected_requests: usize,
+    ) -> (String, JoinHandle<anyhow::Result<()>>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let url = format!(
+            "http://127.0.0.1:{}/qwen.gguf",
+            listener.local_addr().unwrap().port()
+        );
+        let handle = std::thread::spawn(move || {
+            for request_no in 0..expected_requests {
+                let (mut stream, _) = listener.accept()?;
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = stream
+                        .read(&mut buf)
+                        .map_err(|e| anyhow::anyhow!("request {request_no} read: {e}"))?;
+                    anyhow::ensure!(n > 0, "truncated test HTTP request");
+                    request.extend_from_slice(&buf[..n]);
+                    anyhow::ensure!(request.len() <= 64 * 1024, "test HTTP request too large");
+                }
+                let request = String::from_utf8_lossy(&request);
+                let range = request.lines().find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    (key.eq_ignore_ascii_case("range")).then_some(value.trim().to_owned())
+                });
+                let (start, mut end) = range
+                    .as_deref()
+                    .and_then(|s| s.strip_prefix("bytes="))
+                    .and_then(|s| s.split_once('-'))
+                    .map(|(start, end)| {
+                        (
+                            start.parse::<usize>().unwrap(),
+                            end.parse::<usize>().unwrap(),
+                        )
+                    })
+                    .unwrap();
+                end = end.min(source.len() - 1);
+                anyhow::ensure!(start <= end && end < source.len(), "invalid test range");
+                if matches!(reply, HttpReply::Status200) && request_no == 0 {
+                    let body = &source[start..=end];
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .map_err(|e| anyhow::anyhow!("request {request_no} header: {e}"))?;
+                    write_test_body(&mut stream, body, request_no)?;
+                    continue;
+                }
+                let mut body = source[start..=end].to_vec();
+                if matches!(reply, HttpReply::TruncatedData) && request_no > 0 {
+                    body.pop();
+                }
+                let content_range =
+                    if matches!(reply, HttpReply::BadContentRange) && request_no == 0 {
+                        format!("bytes 1-{end}/{}", source.len())
+                    } else {
+                        format!("bytes {start}-{end}/{}", source.len())
+                    };
+                write!(
+                    stream,
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: {content_range}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .map_err(|e| anyhow::anyhow!("request {request_no} header: {e}"))?;
+                write_test_body(&mut stream, &body, request_no)?;
+            }
+            Ok(())
+        });
+        (url, handle)
+    }
+
+    fn write_test_body(
+        stream: &mut TcpStream,
+        body: &[u8],
+        request_no: usize,
+    ) -> anyhow::Result<()> {
+        match stream.write_all(body) {
+            Ok(()) => Ok(()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                ) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(anyhow::anyhow!("request {request_no} body: {error}")),
+        }
+    }
+
+    fn assert_qwen_payloads_equal(local: &cortiq_core::CmfModel, remote: &cortiq_core::CmfModel) {
+        assert_eq!(
+            serde_json::to_value(&local.header.arch).unwrap(),
+            serde_json::to_value(&remote.header.arch).unwrap()
+        );
+        assert_eq!(local.header.quant_type, remote.header.quant_type);
+        assert_eq!(local.tensors.len(), remote.tensors.len());
+        for (left, right) in local.tensors.iter().zip(&remote.tensors) {
+            assert_eq!(
+                (&left.name, left.dtype, &left.shape),
+                (&right.name, right.dtype, &right.shape)
+            );
+            assert_eq!(
+                local.entry_bytes(left),
+                remote.entry_bytes(right),
+                "{}",
+                left.name
+            );
+        }
+        assert_eq!(
+            local.tensor_bytes("image.config_json").unwrap(),
+            remote.tensor_bytes("image.config_json").unwrap()
+        );
+    }
+
+    #[test]
+    fn qwen_image_url_import_matches_local_and_keeps_output_on_range_failures() {
+        let (gguf_bytes, _, _, _) = test_qwen_image_gguf();
+        let id = format!(
+            "cortiq-qwen-image-url-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let source = std::env::temp_dir().join(format!("{id}.gguf"));
+        let local_out = std::env::temp_dir().join(format!("{id}.local.cmf"));
+        let remote_out = std::env::temp_dir().join(format!("{id}.remote.cmf"));
+        std::fs::write(&source, &gguf_bytes).unwrap();
+        run_import_gguf(
+            source.to_str().unwrap(),
+            "q8",
+            local_out.to_str().unwrap(),
+            None,
+            |_| {},
+        )
+        .unwrap();
+        let (url, server) = serve_gguf(Arc::new(gguf_bytes.clone()), HttpReply::Normal, 8);
+        run_import_gguf(&url, "q8", remote_out.to_str().unwrap(), None, |_| {}).unwrap();
+        server.join().unwrap().unwrap();
+        let local = cortiq_core::CmfModel::open(&local_out).unwrap();
+        let remote = cortiq_core::CmfModel::open(&remote_out).unwrap();
+        assert_qwen_payloads_equal(&local, &remote);
+        drop((local, remote));
+
+        let preserved = b"previous-valid-output";
+        for (suffix, reply) in [
+            ("status", HttpReply::Status200),
+            ("content-range", HttpReply::BadContentRange),
+            ("truncated", HttpReply::TruncatedData),
+        ] {
+            let output = std::env::temp_dir().join(format!("{id}.{suffix}.cmf"));
+            std::fs::write(&output, preserved).unwrap();
+            let requests = if matches!(reply, HttpReply::TruncatedData) {
+                8
+            } else {
+                1
+            };
+            let (url, server) = serve_gguf(Arc::new(gguf_bytes.clone()), reply, requests);
+            assert!(run_import_gguf(&url, "q8", output.to_str().unwrap(), None, |_| {}).is_err());
+            server.join().unwrap().unwrap();
+            assert_eq!(std::fs::read(&output).unwrap(), preserved);
+            let _ = std::fs::remove_file(output);
+        }
+
+        let _ = std::fs::remove_file(source);
+        let _ = std::fs::remove_file(local_out);
+        let _ = std::fs::remove_file(remote_out);
     }
 }
