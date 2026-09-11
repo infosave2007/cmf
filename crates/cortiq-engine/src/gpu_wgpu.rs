@@ -1603,6 +1603,9 @@ fn qwen_layernorm_mod(
         stride = stride / 2u;
     }
     let mean = qnm_part[0] / f32(qnm_p.width);
+    // Every invocation must finish reading the reduced mean before any lane
+    // reuses qnm_part for the variance reduction below.
+    workgroupBarrier();
     var var_sum = 0.0;
     i = lid;
     loop {
@@ -29726,7 +29729,14 @@ fn dit_gemm_coop(@builtin(workgroup_id) wid: vec3<u32>,
             var v = vec4<f32>(0.0);
             if (m0 + m < dcp.nb && col0 < cols) {
                 let base = dcp.a_off + (m0 + m) * cols + col0;
-                v = vec4<f32>(dcx[base], dcx[base + 1u], dcx[base + 2u], dcx[base + 3u]);
+                if (col0 + 3u < cols) {
+                    v = vec4<f32>(dcx[base], dcx[base + 1u], dcx[base + 2u], dcx[base + 3u]);
+                } else {
+                    v.x = dcx[base];
+                    if (col0 + 1u < cols) { v.y = dcx[base + 1u]; }
+                    if (col0 + 2u < cols) { v.z = dcx[base + 2u]; }
+                    if (col0 + 3u < cols) { v.w = dcx[base + 3u]; }
+                }
             }
             dm_a[dst] = f16(v.x); dm_a[dst + 1u] = f16(v.y);
             dm_a[dst + 2u] = f16(v.z); dm_a[dst + 3u] = f16(v.w);
@@ -29739,7 +29749,14 @@ fn dit_gemm_coop(@builtin(workgroup_id) wid: vec3<u32>,
             var wv = vec4<f32>(0.0);
             if (n0 + nn < dcp.rows && col0 < cols) {
                 let base = dcp.b_off + (n0 + nn) * cols + col0;
-                wv = vec4<f32>(dcw[base], dcw[base + 1u], dcw[base + 2u], dcw[base + 3u]);
+                if (col0 + 3u < cols) {
+                    wv = vec4<f32>(dcw[base], dcw[base + 1u], dcw[base + 2u], dcw[base + 3u]);
+                } else {
+                    wv.x = dcw[base];
+                    if (col0 + 1u < cols) { wv.y = dcw[base + 1u]; }
+                    if (col0 + 2u < cols) { wv.z = dcw[base + 2u]; }
+                    if (col0 + 3u < cols) { wv.w = dcw[base + 3u]; }
+                }
             }
             dm_b[bd] = f16(wv.x); dm_b[bd + 1u] = f16(wv.y);
             dm_b[bd + 2u] = f16(wv.z); dm_b[bd + 3u] = f16(wv.w);
@@ -32407,6 +32424,208 @@ mod tests {
         ));
         assert_eq!(got_a, [1.0, 2.0, 3.0, 4.0]);
         assert_eq!(got_b, [5.0, 6.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn qwen_layernorm_mod_matches_cpu_across_warps() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping qwen layernorm parity test");
+            return;
+        };
+        let _gate = c.mm_gate.lock().unwrap();
+        let eps = 1.0e-6f32;
+        let batch = 4usize;
+        for width in [64usize, 257, 3072] {
+            let row_means = [3.25f32, -7.5, 19.0, -31.0];
+            let x: Vec<f32> = (0..batch * width)
+                .map(|j| {
+                    let row = j / width;
+                    let col = j % width;
+                    let centered = ((col * 37 + row * 19 + width) % 101) as f32 / 50.0 - 1.0;
+                    row_means[row] + centered + (col % 7) as f32 * 0.013
+                })
+                .collect();
+            let shift: Vec<f32> = (0..width)
+                .map(|i| ((i * 17 + width) % 101) as f32 * 0.002 - 0.1)
+                .collect();
+            let scale: Vec<f32> = (0..width)
+                .map(|i| ((i * 19 + 7) % 89) as f32 * 0.003 - 0.132)
+                .collect();
+            let mut modulation = shift.clone();
+            modulation.extend_from_slice(&scale);
+
+            let mut want = vec![0.0f32; x.len()];
+            for row in 0..batch {
+                let xr = &x[row * width..(row + 1) * width];
+                let mean = xr.iter().map(|&v| v as f64).sum::<f64>() / width as f64;
+                let var = xr
+                    .iter()
+                    .map(|&v| {
+                        let d = v as f64 - mean;
+                        d * d
+                    })
+                    .sum::<f64>()
+                    / width as f64;
+                let inv = 1.0 / (var + eps as f64).sqrt();
+                for i in 0..width {
+                    want[row * width + i] =
+                        (((xr[i] as f64 - mean) * inv) as f32) * (1.0 + scale[i]) + shift[i];
+                }
+            }
+
+            let src = storage_bytes(c, bytemuck::cast_slice(&x));
+            let dst = rw_f32(c, x.len(), true);
+            assert!(qwen_layernorm_mod_keep(
+                c,
+                &src,
+                &modulation,
+                &dst,
+                batch,
+                width,
+                eps,
+            ));
+            let mut got = vec![0.0f32; x.len()];
+            let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("qwen-layernorm-test-stage"),
+                size: (x.len() * 4) as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let enc = c
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("qwen-layernorm-test-readback"),
+                });
+            assert!(readback(
+                c,
+                enc,
+                &dst,
+                &stage,
+                (x.len() * 4) as u64,
+                &mut got
+            ));
+            assert!(
+                got.iter().all(|value| value.is_finite()),
+                "qwen layernorm width={width} produced non-finite output"
+            );
+            let max_d = want
+                .iter()
+                .zip(&got)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_d < 2.0e-3,
+                "qwen layernorm width={width} ≠ CPU: max|Δ| = {max_d}"
+            );
+        }
+    }
+
+    #[test]
+    fn dit_coop_matmul_preserves_odd_reduction_tail() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping DiT cooperative odd-tail test");
+            return;
+        };
+        let _gate = c.mm_gate.lock().unwrap();
+        let Some(pipe) = c.dit_gemm_coop.as_ref() else {
+            eprintln!("cooperative matrix pipeline unavailable — skipping odd-tail test");
+            return;
+        };
+
+        // Both the reduction and the two tiled output dimensions are odd;
+        // nonzero input offsets also exercise the per-head packed layout.
+        for (case, &(k, m, n)) in [(65usize, 65usize, 67usize), (129, 129, 131)]
+            .iter()
+            .enumerate()
+        {
+            let a_off = 5 + case * 3;
+            let b_off = 7 + case * 5;
+            let mut a = vec![0.0f32; a_off + m * k + 1];
+            let mut b = vec![0.0f32; b_off + n * k + 1];
+            for row in 0..m {
+                for col in 0..k {
+                    a[a_off + row * k + col] =
+                        (((row * 13 + col * 7 + case * 5) % 17) as f32 - 8.0) * 0.125;
+                }
+            }
+            for row in 0..n {
+                for col in 0..k {
+                    b[b_off + row * k + col] =
+                        (((row * 11 + col * 3 + case * 9) % 19) as f32 - 9.0) * 0.125;
+                }
+            }
+            let mut want = vec![0.0f32; m * n];
+            for row in 0..m {
+                for col in 0..n {
+                    let mut sum = 0.0f32;
+                    for i in 0..k {
+                        sum += a[a_off + row * k + i] * b[b_off + col * k + i];
+                    }
+                    want[row * n + col] = sum;
+                }
+            }
+
+            let wb = storage_bytes(c, bytemuck::cast_slice(&b));
+            let xb = storage_bytes(c, bytemuck::cast_slice(&a));
+            let yb = rw_f32(c, m * n, true);
+            let p = uniform_u32x8(
+                c,
+                [
+                    k.div_ceil(4) as u32,
+                    n as u32,
+                    m as u32,
+                    1.0f32.to_bits(),
+                    a_off as u32,
+                    b_off as u32,
+                    0,
+                    k as u32,
+                ],
+            );
+            let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("dit-coop-odd-tail-test-bg"),
+                layout: &pipe.get_bind_group_layout(0),
+                entries: &[
+                    bind_buf(0, &wb),
+                    bind_buf(1, &xb),
+                    bind_buf(2, &yb),
+                    bind_buf(3, &p),
+                ],
+            });
+            let mut enc = c
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("dit-coop-odd-tail-test"),
+                });
+            {
+                let mut pass = begin_pass(&mut enc);
+                pass.set_pipeline(pipe);
+                pass.set_bind_group(0, &bind, &[]);
+                pass.dispatch_workgroups((n as u32).div_ceil(64), (m as u32).div_ceil(64), 1);
+            }
+            let mut got = vec![0.0f32; m * n];
+            let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("dit-coop-odd-tail-test-stage"),
+                size: (got.len() * 4) as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            assert!(readback(c, enc, &yb, &stage, (got.len() * 4) as u64, &mut got));
+            assert!(
+                got.iter().all(|value| value.is_finite()),
+                "DiT cooperative odd-tail K={k}, M={m}, N={n} produced non-finite output"
+            );
+            let max_d = want
+                .iter()
+                .zip(&got)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_d < 1.0e-5,
+                "DiT cooperative odd-tail K={k}, M={m}, N={n} ≠ CPU: max|Δ| = {max_d}"
+            );
+        }
     }
 
     #[test]
@@ -45511,7 +45730,6 @@ fn qwen_attention_encode(
         && c.dit_gemm_coop.is_some()
         && std::env::var("CMF_DIT_ATTN_COOP").as_deref() != Ok("0")
         && std::env::var("CMF_DIT_PV_COOP").as_deref() != Ok("0")
-        && total % 4 == 0
         && head_dim % 4 == 0
     {
         Some(pooled(total_bytes, st, "qwen-chain-vt"))
@@ -45542,14 +45760,6 @@ fn qwen_attention_encode(
         pass.dispatch_workgroups_flat(((heads * total * head_dim) as u32).div_ceil(256));
     }
 
-    let coop_qk = c
-        .dit_gemm_coop
-        .as_ref()
-        .filter(|_| {
-            std::env::var("CMF_DIT_ATTN_COOP").as_deref() != Ok("0")
-                && total % 4 == 0
-                && head_dim % 4 == 0
-        });
     let bind = |pipe: &wgpu::ComputePipeline,
                 a: &wgpu::Buffer,
                 ao: u64,
@@ -45576,32 +45786,7 @@ fn qwen_attention_encode(
 
     for h in 0..heads {
         let hoff = h as u64 * head;
-        let p_qk_coop = coop_qk.map(|pipe| {
-            let p = uniform_u32x8(
-                c,
-                [
-                    (head_dim / 4) as u32,
-                    total as u32,
-                    total as u32,
-                    (1.0 / (head_dim as f32).sqrt()).to_bits(),
-                    0,
-                    0,
-                    0,
-                    head_dim as u32,
-                ],
-            );
-            c.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("qwen-chain-qk-coop-bg"),
-                layout: &pipe.get_bind_group_layout(0),
-                entries: &[
-                    bind_buf_off(0, k, hoff, head),
-                    bind_buf_off(1, q, hoff, head),
-                    bind_buf(2, &score),
-                    bind_buf(3, &p),
-                ],
-            })
-        });
-        let p_pv_coop = match (coop_qk, vt.as_ref()) {
+        let p_pv_coop = match (c.dit_gemm_coop.as_ref(), vt.as_ref()) {
             (Some(pipe), Some(vt)) => {
                 let p = uniform_u32x8(
                     c,
@@ -45661,14 +45846,12 @@ fn qwen_attention_encode(
             &p_pv,
         );
         {
+            // Cooperative QK converts activations to f16; keep this measured
+            // accuracy-sensitive product on the scalar F32 path. PV can use
+            // cooperative math independently after its odd-tail fix.
             let mut pass = begin_pass_with(enc, Some("qwen-chain-qk"), None);
-            if let (Some(pipe), Some(bg)) = (coop_qk, p_qk_coop.as_ref()) {
-                pass.set_pipeline(pipe);
-                pass.set_bind_group(0, bg, &[]);
-            } else {
-                pass.set_pipeline(&c.dit_qk);
-                pass.set_bind_group(0, &bg_qk, &[]);
-            }
+            pass.set_pipeline(&c.dit_qk);
+            pass.set_bind_group(0, &bg_qk, &[]);
             pass.dispatch_workgroups((total as u32).div_ceil(64), (total as u32).div_ceil(64), 1);
         }
         {
@@ -45679,7 +45862,7 @@ fn qwen_attention_encode(
         }
         {
             let mut pass = begin_pass_with(enc, Some("qwen-chain-pv"), None);
-            if let (Some(pipe), Some(bg)) = (coop_qk, p_pv_coop.as_ref()) {
+            if let (Some(pipe), Some(bg)) = (c.dit_gemm_coop.as_ref(), p_pv_coop.as_ref()) {
                 pass.set_pipeline(pipe);
                 pass.set_bind_group(0, bg, &[]);
             } else {

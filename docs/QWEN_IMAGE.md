@@ -17,7 +17,7 @@ files are required:
 cortiq imagine qwen-image-edit-2509-q4tp.cmf \
   --image docs/media/fox-512.png \
   --prompt "Add a vivid blue knitted scarf while preserving the fox, pose, and snowy background." \
-  --height 512 --width 512 --steps 30 --cfg 4 --seed 7 \
+  --height 1024 --width 1024 --steps 40 --cfg 4 --seed 7 \
   --reference-size 1024 --out fox-scarf.png
 ```
 
@@ -48,7 +48,7 @@ cortiq imagine qwen-image/transformer.cmf \
   --scheduler qwen-image/scheduler_config.json \
   --image docs/media/fox-512.png \
   --prompt "Turn the scene into a watercolor illustration." \
-  --height 512 --width 512 --steps 30 --cfg 4 --seed 7 \
+  --height 1024 --width 1024 --steps 40 --cfg 4 --seed 7 \
   --reference-size 1024 --out watercolor.png
 ```
 
@@ -64,7 +64,7 @@ Keep output dimensions on multiples of 16. CFG at or below 1 omits the
 unconditional branch and changes the guidance profile. PNG, JPEG, and PPM output
 are supported.
 
-## Backends and measured profile
+## Backends
 
 Set `CMF_GPU=0` for the portable CPU path. For a headless Vulkan run, prefix the
 command with `XDG_RUNTIME_DIR=/tmp WGPU_BACKEND=vulkan CMF_GPU=1`. On a capable
@@ -74,9 +74,7 @@ and each forward performs one final hidden-state readback. CPU and Metal paths
 remain available as fallbacks. The encoder, reference VAE, transformer, and
 decode VAE are loaded in stages so large mappings can be released between stages.
 
-A current RTX 3090 component-folder profile recorded 109.487 s for a two-step
-edit, 9.8 s steady forward, and 18,603 MiB peak device memory. These are
-hardware- and workload-specific profile figures.
+Image-quality validation remains incomplete; visible artifacts may occur.
 
 ## Source references
 

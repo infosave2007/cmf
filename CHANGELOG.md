@@ -33,8 +33,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Native Qwen Image automatically selects the capability-gated resident Vulkan
   forward when its memory contract fits. Hidden state stays on the device across
   transformer blocks, with one final readback per forward; CPU and Metal fallback
-  paths remain available. An RTX 3090 component-folder profile measured
-  109.487 s for two steps, 9.8 s steady forward, and 18,603 MiB peak device memory.
+  paths remain available.
+- Qwen Image defaults to 1024×1024 output and 40 steps; Lumina defaults remain unchanged.
+
+### Known limitations
+- Qwen Image editing is available, but image-quality validation remains incomplete.
 
 ## [0.6.7] - 2026-09-11
 

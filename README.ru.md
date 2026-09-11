@@ -61,7 +61,7 @@ Bundle встраивает трансформер, текстовый и зри
 cortiq imagine qwen-image/qwen-image-edit-2509-q4tp.cmf \
   --image docs/media/fox-512.png \
   --prompt "Добавьте яркий синий вязаный шарф, сохранив лису, позу и снежный фон." \
-  --height 512 --width 512 --steps 30 --cfg 4 --seed 7 \
+  --height 1024 --width 1024 --steps 40 --cfg 4 --seed 7 \
   --reference-size 1024 --out fox-scarf.png
 ```
 
@@ -75,7 +75,7 @@ cortiq imagine qwen-image/transformer.cmf \
   --scheduler qwen-image/scheduler_config.json \
   --image docs/media/fox-512.png \
   --prompt "Превратите сцену в акварельную иллюстрацию." \
-  --height 512 --width 512 --steps 30 --cfg 4 --seed 7 \
+  --height 1024 --width 1024 --steps 40 --cfg 4 --seed 7 \
   --reference-size 1024 --out watercolor.png
 ```
 
@@ -86,9 +86,7 @@ cortiq imagine qwen-image/transformer.cmf \
 резидентный проход трансформера Qwen: скрытое состояние остаётся на устройстве
 между блоками, а в конце каждого прохода выполняется одно чтение обратно.
 Пути CPU и Metal остаются доступными, а проверка бюджета памяти выбирает
-совместимый путь. Профиль каталога компонентов на RTX 3090 дал 109.487 с для
-двух шагов, 9.8 с на установившийся проход и пик 18 603 МиБ памяти устройства;
-это цифры конкретной задачи и стенда. Правила получения и упаковки с
+совместимый путь. Правила получения и упаковки с
 фиксированными ревизиями приведены в [руководстве Qwen Image](docs/QWEN_IMAGE.md).
 
 CLI также предоставляет `info`, `bench`, `ppl`, `serve`, `skill`, `moe-mask`,

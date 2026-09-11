@@ -33,8 +33,8 @@ pub struct QwenImageParams {
 impl Default for QwenImageParams {
     fn default() -> Self {
         Self {
-            height: 512,
-            width: 512,
+            height: 1024,
+            width: 1024,
             steps: 40,
             true_cfg_scale: 4.0,
             negative_prompt: Some(" ".into()),
