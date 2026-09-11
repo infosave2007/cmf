@@ -32359,6 +32359,57 @@ mod tests {
     }
 
     #[test]
+    fn qwen_f32_const_keeps_recorded_bias_snapshot() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping qwen constant lifetime test");
+            return;
+        };
+        let _gate = c.mm_gate.lock().unwrap();
+        let mut bias = vec![1.0f32, 2.0, 3.0, 4.0];
+        let zeros = [0.0f32; 4];
+        let make_values = |label: &'static str| {
+            let b = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: (zeros.len() * 4) as u64,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            c.queue.write_buffer(&b, 0, bytemuck::cast_slice(&zeros));
+            b
+        };
+        let out_a = make_values("qwen-const-test-a");
+        let out_b = make_values("qwen-const-test-b");
+        let mut enc = c
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("qwen-const-test"),
+            });
+
+        let old_bias = qwen_f32_const(c, &bias, "qwen-const-test-bias");
+        encode_qwen_gelu_bias(c, &mut enc, &out_a, &old_bias, 4, 4, false);
+
+        // Keep the Vec allocation and pointer unchanged so this exercises
+        // the fingerprint-change branch rather than a new cache key.
+        bias.copy_from_slice(&[5.0, 6.0, 7.0, 8.0]);
+        let new_bias = qwen_f32_const(c, &bias, "qwen-const-test-bias");
+        encode_qwen_gelu_bias(c, &mut enc, &out_b, &new_bias, 4, 4, false);
+
+        let mut got_a = [0.0f32; 4];
+        let mut got_b = [0.0f32; 4];
+        assert!(readback2(
+            c,
+            enc,
+            (&out_a, &mut got_a),
+            (&out_b, &mut got_b),
+        ));
+        assert_eq!(got_a, [1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(got_b, [5.0, 6.0, 7.0, 8.0]);
+    }
+
+    #[test]
     fn wgpu_q8_matvec_matches_cpu_reference() {
         // Force the wgpu path on (Metal-via-wgpu locally; Vulkan on the server).
         unsafe { std::env::set_var("CMF_GPU", "wgpu") };
@@ -44900,12 +44951,15 @@ fn qwen_f32_const(c: &Ctx, data: &[f32], label: &'static str) -> wgpu::Buffer {
     let key = (data.as_ptr() as usize, data.len());
     let fp = fp_bytes(bytemuck::cast_slice(data));
     let mut cb = c.const_bufs.lock().unwrap();
-    if let Some((b, f)) = cb.get_mut(&key) {
-        if *f != fp {
-            c.queue.write_buffer(b, 0, bytemuck::cast_slice(data));
-            *f = fp;
+    if let Some((b, f)) = cb.get(&key) {
+        if *f == fp {
+            return b.clone();
         }
-        return b.clone();
+        // A command encoder may still hold a bind group referring to the
+        // old buffer. Updating that buffer here races commands recorded
+        // before this call, so the unchanged-fingerprint fast path above is
+        // the only case that reuses the cached handle. Fall through to
+        // allocate a replacement and replace the cache entry.
     }
     let b = c.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
