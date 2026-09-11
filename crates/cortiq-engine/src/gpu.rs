@@ -1916,6 +1916,33 @@ pub fn q4tp_ffn(
     }
 }
 
+/// Qwen Image's exact two-projection tanh-GELU FFN.  The WGPU arm keeps the
+/// intermediate on the device; other backends decline so the caller retains
+/// its bounded CPU path.  `bias_in` is applied before GELU and `bias_out`
+/// after the second projection, matching the official transformer.
+#[allow(clippy::too_many_arguments, unused_variables)]
+pub fn q4tp_gelu_ffn(
+    model: &Arc<CmfModel>,
+    w_in: usize,
+    w_out: usize,
+    xs: &[f32],
+    b: usize,
+    hidden: usize,
+    inter: usize,
+    bias_in: &[f32],
+    bias_out: &[f32],
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::q4tp_gelu_ffn(
+            model, w_in, w_out, xs, b, hidden, inter, bias_in, bias_out, out,
+        ),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
 pub fn q4t_ffn(
     model: &Arc<CmfModel>,
     w1: usize,
@@ -2031,6 +2058,239 @@ pub fn dit_qkv(
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::q4tp_qkv(
             model, wq, wk, wv, xs, b, hidden, qrows, kvrows, q_out, k_out, v_out,
+        ),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
+/// The Qwen Image double-stream attention half.  The WGPU implementation
+/// keeps the six Q/K/V projections, the stream join, qk-norm/RoPE, joint
+/// attention, and both output projections on the device; the caller only
+/// supplies the two normalized streams and receives the two projected
+/// streams.  A backend or codec that cannot satisfy the full contract
+/// returns `false` before changing either output, so the native host path
+/// remains the portable fallback.
+pub struct QwenImageAttentionArgs<'a> {
+    pub image: &'a [f32],
+    pub text: &'a [f32],
+    pub image_tokens: usize,
+    pub text_tokens: usize,
+    pub heads: usize,
+    pub head_dim: usize,
+    pub image_q: usize,
+    pub image_k: usize,
+    pub image_v: usize,
+    pub text_q: usize,
+    pub text_k: usize,
+    pub text_v: usize,
+    pub image_out: usize,
+    pub text_out: usize,
+    pub image_q_norm: &'a [f32],
+    pub image_k_norm: &'a [f32],
+    pub text_q_norm: &'a [f32],
+    pub text_k_norm: &'a [f32],
+    pub image_cos: &'a [f32],
+    pub image_sin: &'a [f32],
+    pub text_cos: &'a [f32],
+    pub text_sin: &'a [f32],
+    pub image_q_bias: &'a [f32],
+    pub image_k_bias: &'a [f32],
+    pub image_v_bias: &'a [f32],
+    pub text_q_bias: &'a [f32],
+    pub text_k_bias: &'a [f32],
+    pub text_v_bias: &'a [f32],
+    pub image_out_bias: &'a [f32],
+    pub text_out_bias: &'a [f32],
+    pub image_proj: &'a mut [f32],
+    pub text_proj: &'a mut [f32],
+}
+
+/// The per-layer controls and Q4TP directory indices used by the native
+/// Qwen block.  Keeping this descriptor separate from the stream buffers
+/// lets a whole transformer forward reuse one explicit device state without
+/// a global scratch slot or a hidden context label.
+#[allow(clippy::too_many_fields)]
+pub struct QwenImageChainBlock<'a> {
+    pub image_mod: &'a [f32],
+    pub text_mod: &'a [f32],
+    pub image_q: usize,
+    pub image_k: usize,
+    pub image_v: usize,
+    pub text_q: usize,
+    pub text_k: usize,
+    pub text_v: usize,
+    pub image_out: usize,
+    pub text_out: usize,
+    pub image_q_norm: &'a [f32],
+    pub image_k_norm: &'a [f32],
+    pub text_q_norm: &'a [f32],
+    pub text_k_norm: &'a [f32],
+    pub image_q_bias: &'a [f32],
+    pub image_k_bias: &'a [f32],
+    pub image_v_bias: &'a [f32],
+    pub text_q_bias: &'a [f32],
+    pub text_k_bias: &'a [f32],
+    pub text_v_bias: &'a [f32],
+    pub image_out_bias: &'a [f32],
+    pub text_out_bias: &'a [f32],
+    pub image_attn_gate: &'a [f32],
+    pub text_attn_gate: &'a [f32],
+    pub image_mlp_in: usize,
+    pub image_mlp_out: usize,
+    pub text_mlp_in: usize,
+    pub text_mlp_out: usize,
+    pub image_mlp_in_bias: &'a [f32],
+    pub image_mlp_out_bias: &'a [f32],
+    pub text_mlp_in_bias: &'a [f32],
+    pub text_mlp_out_bias: &'a [f32],
+}
+
+/// Complete Qwen Image transformer block contract. The first norm/mod
+/// panels are supplied by the native caller; the WGPU arm keeps both streams
+/// resident through QKV, QK/RoPE, joint attention, output projections, both
+/// gated residuals, and the exact tanh-GELU MLPs. A backend that cannot
+/// satisfy the whole graph returns `false` without changing either output.
+#[allow(clippy::too_many_fields)]
+pub struct QwenImageBlockArgs<'a> {
+    /// Raw stream state is read for the first gated residual and overwritten
+    /// with the block's final state after the one readback.
+    pub image: &'a mut [f32],
+    pub text: &'a mut [f32],
+    pub image_norm: &'a [f32],
+    pub text_norm: &'a [f32],
+    pub image_tokens: usize,
+    pub text_tokens: usize,
+    pub heads: usize,
+    pub head_dim: usize,
+    pub image_cos: &'a [f32],
+    pub image_sin: &'a [f32],
+    pub text_cos: &'a [f32],
+    pub text_sin: &'a [f32],
+    pub image_q: usize,
+    pub image_k: usize,
+    pub image_v: usize,
+    pub text_q: usize,
+    pub text_k: usize,
+    pub text_v: usize,
+    pub image_out: usize,
+    pub text_out: usize,
+    pub image_q_norm: &'a [f32],
+    pub image_k_norm: &'a [f32],
+    pub text_q_norm: &'a [f32],
+    pub text_k_norm: &'a [f32],
+    pub image_q_bias: &'a [f32],
+    pub image_k_bias: &'a [f32],
+    pub image_v_bias: &'a [f32],
+    pub text_q_bias: &'a [f32],
+    pub text_k_bias: &'a [f32],
+    pub text_v_bias: &'a [f32],
+    pub image_out_bias: &'a [f32],
+    pub text_out_bias: &'a [f32],
+    pub image_attn_gate: &'a [f32],
+    pub text_attn_gate: &'a [f32],
+    pub image_mlp_in: usize,
+    pub image_mlp_out: usize,
+    pub text_mlp_in: usize,
+    pub text_mlp_out: usize,
+    pub image_mlp_in_bias: &'a [f32],
+    pub image_mlp_out_bias: &'a [f32],
+    pub text_mlp_in_bias: &'a [f32],
+    pub text_mlp_out_bias: &'a [f32],
+    pub image_mlp_mod: &'a [f32],
+    pub text_mlp_mod: &'a [f32],
+    pub image_mlp_gate: &'a [f32],
+    pub text_mlp_gate: &'a [f32],
+}
+
+/// Explicit whole-forward Qwen state contract.  The WGPU backend uploads the
+/// two initial streams once, encodes a bounded number of complete blocks per
+/// submission, and reads the final state once.  `blocks` is immutable for the
+/// call, while the two stream slices receive only the final readback.
+pub struct QwenImageChainArgs<'a> {
+    pub image: &'a mut [f32],
+    pub text: &'a mut [f32],
+    pub image_tokens: usize,
+    pub text_tokens: usize,
+    pub heads: usize,
+    pub head_dim: usize,
+    pub image_cos: &'a [f32],
+    pub image_sin: &'a [f32],
+    pub text_cos: &'a [f32],
+    pub text_sin: &'a [f32],
+    pub blocks: &'a [QwenImageChainBlock<'a>],
+}
+
+#[allow(unused_variables)]
+pub fn qwen_image_attention(
+    model: &Arc<CmfModel>,
+    args: &mut QwenImageAttentionArgs<'_>,
+) -> bool {
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::qwen_image_attention(model, args),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
+#[allow(unused_variables)]
+pub fn qwen_image_block(model: &Arc<CmfModel>, args: &mut QwenImageBlockArgs<'_>) -> bool {
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::qwen_image_block(model, args),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
+/// Keep all Qwen transformer blocks on the selected WGPU device, with only
+/// bounded chunk submissions and one final readback.  Other backends decline
+/// so the native caller can use its exact portable block loop.
+#[allow(unused_variables)]
+pub fn qwen_image_chain(model: &Arc<CmfModel>, args: &mut QwenImageChainArgs<'_>) -> bool {
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::qwen_image_chain(model, args),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
+/// The Qwen Image second sub-block on WGPU: affine-free LayerNorm,
+/// shift/scale modulation, Q4TP input projection, exact tanh-GELU, output
+/// projection, bias and gated residual.  `data` is updated in place after a
+/// single final readback.  Backends/codecs that cannot keep this chain on the
+/// device return `false` before changing `data`, leaving the caller's
+/// portable per-op path intact.
+#[allow(unused_variables, clippy::too_many_arguments)]
+pub fn qwen_image_mlp_inplace(
+    model: &Arc<CmfModel>,
+    w_in: usize,
+    w_out: usize,
+    data: &mut [f32],
+    batch: usize,
+    hidden: usize,
+    inter: usize,
+    bias_in: &[f32],
+    bias_out: &[f32],
+    modulation: &[f32],
+    gate: &[f32],
+) -> bool {
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::qwen_image_mlp_inplace(
+            model,
+            w_in,
+            w_out,
+            data,
+            batch,
+            hidden,
+            inter,
+            bias_in,
+            bias_out,
+            modulation,
+            gate,
         ),
         #[allow(unreachable_patterns)]
         _ => false,
@@ -3074,5 +3334,40 @@ mod probe_warmup_tests {
             probe_record_into(&p, "matvec", None, false, ms(2.0));
         }
         assert_eq!(p.state.load(Ordering::Relaxed), 2, "host wins on merit");
+    }
+}
+
+/// Scratch/weight lifetime for a synchronous image-pipeline stage. Declare
+/// this before the stage model so the model drops before cache collection.
+pub(crate) struct ImageStageGuard {
+    #[cfg(target_os = "macos")]
+    metal: Option<crate::gpu_metal::ImageStageGuard>,
+    #[cfg(feature = "gpu")]
+    wgpu: crate::gpu_wgpu::ImageStageGuard,
+}
+
+pub(crate) fn image_stage_scope() -> ImageStageGuard {
+    ImageStageGuard {
+        #[cfg(target_os = "macos")]
+        metal: if matches!(backend(), Backend::Metal) {
+            Some(crate::gpu_metal::image_stage_scope())
+        } else {
+            None
+        },
+        #[cfg(feature = "gpu")]
+        wgpu: crate::gpu_wgpu::image_stage_scope(),
+    }
+}
+
+impl ImageStageGuard {
+    pub(crate) fn track_model(&mut self, uid: u64) {
+        #[cfg(target_os = "macos")]
+        if let Some(metal) = &mut self.metal {
+            metal.track_model(uid);
+        }
+        #[cfg(feature = "gpu")]
+        self.wgpu.track_model(uid);
+        #[cfg(not(target_os = "macos"))]
+        let _ = uid;
     }
 }

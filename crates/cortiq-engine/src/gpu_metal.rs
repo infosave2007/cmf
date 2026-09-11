@@ -6198,6 +6198,9 @@ fn file_buffer(c: &Ctx, model: &Arc<CmfModel>) -> Option<(Arc<WeightArena>, usiz
         return None; // mmap is always aligned, but we check honestly
     }
     let len = bytes.len() / page * page; // down to the page
+    if len == 0 {
+        return None; // Metal rejects zero-length no-copy buffers.
+    }
     let mut cache = c.file_bufs.lock().unwrap();
     if let Some((a, _owner)) = cache.get(&key) {
         return Some((a.clone(), len));
@@ -14918,5 +14921,138 @@ mod tests {
             assert_eq!(got_dn[top_k], stbl[2], "shared down slot");
             assert!((got_w[top_k] - want_shared).abs() < 1e-5, "shared weight");
         }
+    }
+}
+
+/// A synchronous image stage has its own scratch namespace. Once the stage
+/// completes, release its scratch and an idle model's no-copy weight buffers.
+/// Other live models and other generation namespaces remain valid.
+pub(crate) struct ImageStageGuard {
+    namespace: u64,
+    previous: u64,
+    model_uid: Option<usize>,
+    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+pub(crate) fn image_stage_scope() -> ImageStageGuard {
+    static NEXT_IMAGE_NAMESPACE: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(1u64 << 63);
+    let namespace = NEXT_IMAGE_NAMESPACE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let previous = IO_NAMESPACE.with(|slot| slot.replace(namespace));
+    ImageStageGuard {
+        namespace,
+        previous,
+        model_uid: None,
+        _not_send: std::marker::PhantomData,
+    }
+}
+
+impl ImageStageGuard {
+    pub(crate) fn track_model(&mut self, uid: u64) {
+        self.model_uid = Some(uid as usize);
+    }
+}
+
+impl Drop for ImageStageGuard {
+    fn drop(&mut self) {
+        // Do not initialize Metal merely to clean up a CPU-only stage.
+        if let Some(Ok(c)) = CTX.get() {
+            c.io_bufs
+                .lock()
+                .unwrap()
+                .retain(|(namespace, _), _| *namespace != self.namespace);
+            if let Some(uid) = self.model_uid {
+                let removed = {
+                    let mut cache = c.file_bufs.lock().unwrap();
+                    let idle = cache.get(&uid).is_some_and(|(arena, model)| {
+                        Arc::strong_count(arena) == 1 && Arc::strong_count(model) == 1
+                    });
+                    if idle { cache.remove(&uid) } else { None }
+                };
+                if removed.is_some() {
+                    c.rs_bufs
+                        .lock()
+                        .unwrap()
+                        .retain(|(model, _), _| *model != uid);
+                    c.cf_bufs
+                        .lock()
+                        .unwrap()
+                        .retain(|(model, _), _| *model != uid);
+                }
+                // Destroy no-copy buffers before their last mmap owner.
+                if let Some((arena, model)) = removed {
+                    drop(arena);
+                    drop(model);
+                }
+            }
+        }
+        IO_NAMESPACE.with(|slot| slot.set(self.previous));
+    }
+}
+
+#[cfg(test)]
+mod image_stage_tests {
+    use super::*;
+    #[test]
+    #[ignore = "requires a real Metal device; run explicitly with CMF_GPU=metal"]
+    fn image_stage_releases_only_idle_model_and_own_scratch() {
+        use cortiq_core::format::{CmfHeader, TensorSpec};
+        let c = ctx().expect("Metal device required for cache lifetime proof");
+        let header: CmfHeader = serde_json::from_value(serde_json::json!({
+            "version": cortiq_core::CMF_VERSION,
+            "arch": {"arch_name":"cache-lifetime-fixture", "hidden_size":32,
+                "intermediate_size":32,"num_layers":0,"num_attention_heads":1,
+                "num_kv_heads":1,"head_dim":32,"vocab_size":0,"layer_types":[],
+                "rms_norm_eps":1e-6,"max_position_embeddings":0},
+            "quant_type":"F32"
+        }))
+        .unwrap();
+        let path =
+            std::env::temp_dir().join(format!("qwen-image-metal-cache-{}.cmf", std::process::id()));
+        CmfModel::write(
+            &path,
+            &header,
+            &[TensorSpec {
+                name: "weight".into(),
+                dtype: cortiq_core::TensorDtype::F32,
+                shape: vec![128, 128],
+                data: vec![0; 65536],
+            }],
+            None,
+            None,
+        )
+        .unwrap();
+        let model = Arc::new(CmfModel::open(&path).unwrap());
+        let uid = model_key(&model);
+        let (arena, _) = file_buffer(c, &model).unwrap();
+        let _ = arena.window(0);
+        drop(arena);
+        let previous = IO_NAMESPACE.with(Cell::get);
+        let mut stage = image_stage_scope();
+        stage.track_model(model.uid());
+        let scratch = c
+            ._device
+            .new_buffer(4096, MTLResourceOptions::StorageModeShared);
+        c.io_bufs
+            .lock()
+            .unwrap()
+            .insert((stage.namespace, 7), scratch);
+        let own_namespace = stage.namespace;
+        drop(stage);
+        assert_eq!(IO_NAMESPACE.with(Cell::get), previous);
+        assert!(!c.io_bufs.lock().unwrap().contains_key(&(own_namespace, 7)));
+        assert!(
+            c.file_bufs.lock().unwrap().contains_key(&uid),
+            "live model must retain its cache"
+        );
+        let mut stage = image_stage_scope();
+        stage.track_model(model.uid());
+        drop(model);
+        drop(stage);
+        assert!(
+            !c.file_bufs.lock().unwrap().contains_key(&uid),
+            "idle no-copy model must be released"
+        );
+        std::fs::remove_file(path).unwrap();
     }
 }

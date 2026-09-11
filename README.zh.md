@@ -35,6 +35,49 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+## 原生 Qwen Image 编辑
+
+0.6.8 提供 Qwen-Image-Edit-2509 的原生 Rust 流程。默认发布形态是一个
+自包含的 `qwen-image-edit-2509-q4tp.cmf`；独立的 transformer、Qwen2.5-VL
+文本/视觉编码器、VAE 和 scheduler 文件仍可单独暂存或显式选择。使用下面的
+命令合并为一个文件：
+
+```sh
+cortiq imagine-pack --bundle qwen-image \
+  --out qwen-image/qwen-image-edit-2509-q4tp.cmf
+```
+
+Bundle 内含 transformer、文本/视觉编码器、tokenizer、processor、配置、VAE 和
+调度器；运行 bundle 不需要旁边再放其它 CMF：
+
+```sh
+cortiq imagine qwen-image/qwen-image-edit-2509-q4tp.cmf \
+  --image docs/media/fox-512.png \
+  --prompt "为狐狸围上一条鲜艳的蓝色针织围巾，同时保留狐狸姿态、雪景和日落背景。" \
+  --height 1024 --width 1024 --steps 40 --cfg 4 --seed 7 \
+  --reference-size 1024 --out fox-scarf.png
+```
+
+需要至少一个参考图像；使用多个参考图像时重复 `--image`。如需独立组件，可用
+以下显式覆盖：
+
+```sh
+cortiq imagine qwen-image/transformer.cmf \
+  --text-encoder qwen-image/text_encoder.cmf \
+  --vae qwen-image/vae.cmf \
+  --scheduler qwen-image/scheduler_config.json \
+  --image docs/media/fox-512.png \
+  --prompt "将场景变成水彩插画。" \
+  --height 1024 --width 1024 --steps 40 --cfg 4 --seed 7 \
+  --reference-size 1024 --out watercolor.png
+```
+
+`--reference-size 1024` 是 VAE 参考区域 1024² 的平方根，与输出尺寸无关。
+在满足设备和内存预算的 Vulkan 设备上，`cortiq imagine` 会自动选择 Qwen
+transformer 的 resident forward；各 transformer block 之间保留设备端 hidden
+state，每次 forward 末尾只回读一次。CPU 和 Metal fallback 仍可用，预算不满足
+时会选择兼容路径。固定获取、打包和配置细节请参阅 [Qwen Image 指南](docs/QWEN_IMAGE.md)。
+
 CLI 还提供 `info`、`bench`、`ppl`、`serve`、`skill`、`moe-mask`、`moe-defrag`、
 `requant`、`compact`、`sign`、`imagine`、`animate` 和 `ltx-video`。使用
 `cortiq <command> --help` 查看参数与限制。
@@ -101,6 +144,7 @@ CLI 还提供 `info`、`bench`、`ppl`、`serve`、`skill`、`moe-mask`、`moe-d
 - [GPU 内核配方](docs/GPU_KERNEL_RECIPES.md) — 后端测量。
 - [多 GPU](docs/MULTI_GPU.md) 与[移动端切分](docs/MOBILE_SPLIT.ru.md)。
 - [FCD 恢复](docs/RUST_FCD.md) 与[低比特 PTQ](docs/Q1T_PTQ.md)。
+- [Qwen Image 编辑](docs/QWEN_IMAGE.md) — 单文件运行和独立组件暂存。
 - [模型卡片和转换说明](docs/hf/README.md)。
 - [Cortiq Spectra](docs/SPECTRA.ru.md) — 双能 X 射线的确定性 CPU 流式着色、
   扫描仪配置、拒绝掩码与测量限制（俄文）。

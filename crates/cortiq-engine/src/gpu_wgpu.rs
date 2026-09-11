@@ -1544,6 +1544,111 @@ fn ffn_silu_mul(@builtin(global_invocation_id) gid: vec3<u32>) {
     fsg[i] = (g / (1.0 + exp(-g))) * fsu[i];
 }
 
+// Qwen Image's MLP middle is tanh-GELU, not the SwiGLU used by the
+// neighbouring DiT paths.  Keep the exact add-then-GELU order from the
+// reference, but leave the panel on the device between the two Q4TP GEMMs.
+// `gelu` is 1 for the input projection bias and 0 for the output projection
+// bias; using one entry point keeps the pipeline/cache surface small.
+struct QwenGeluP { n: u32, width: u32, gelu: u32, _p: u32 };
+@group(0) @binding(0) var<storage, read_write> qg_values: array<f32>;
+@group(0) @binding(1) var<storage, read>       qg_bias: array<f32>;
+@group(0) @binding(2) var<uniform>             qg_p: QwenGeluP;
+
+@compute @workgroup_size(256)
+fn qwen_gelu_bias(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.y * (65535u * 256u) + gid.x;
+    if (i >= qg_p.n) { return; }
+    let j = i - (i / qg_p.width) * qg_p.width;
+    var x = qg_values[i] + qg_bias[j];
+    if (qg_p.gelu != 0u) {
+        let x3 = x * x * x;
+        x = 0.5 * x * (1.0 + tanh(0.7978846 * (x + 0.044715 * x3)));
+    }
+    qg_values[i] = x;
+}
+
+// Qwen Image's affine-free LayerNorm followed by its per-stream
+// shift/scale modulation.  The two reductions intentionally stay in one
+// workgroup per token so the large hidden panel never crosses the host.
+// `qnm_mod` is `[shift, scale]`, both width elements.
+struct QwenNormModP { n: u32, width: u32, eps: f32, _p: u32 };
+@group(0) @binding(0) var<storage, read>       qnm_x   : array<f32>;
+@group(0) @binding(1) var<storage, read>       qnm_mod : array<f32>;
+@group(0) @binding(2) var<storage, read_write> qnm_y   : array<f32>;
+@group(0) @binding(3) var<uniform>             qnm_p   : QwenNormModP;
+var<workgroup> qnm_part: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn qwen_layernorm_mod(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_index) lid: u32,
+) {
+    let row = wid.x;
+    if (row >= qnm_p.n) { return; }
+    let base = row * qnm_p.width;
+    var sum = 0.0;
+    var i = lid;
+    loop {
+        if (i >= qnm_p.width) { break; }
+        sum = sum + qnm_x[base + i];
+        i = i + 256u;
+    }
+    qnm_part[lid] = sum;
+    workgroupBarrier();
+    var stride = 128u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) { qnm_part[lid] = qnm_part[lid] + qnm_part[lid + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    let mean = qnm_part[0] / f32(qnm_p.width);
+    // Every invocation must finish reading the reduced mean before any lane
+    // reuses qnm_part for the variance reduction below.
+    workgroupBarrier();
+    var var_sum = 0.0;
+    i = lid;
+    loop {
+        if (i >= qnm_p.width) { break; }
+        let d = qnm_x[base + i] - mean;
+        var_sum = var_sum + d * d;
+        i = i + 256u;
+    }
+    qnm_part[lid] = var_sum;
+    workgroupBarrier();
+    stride = 128u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) { qnm_part[lid] = qnm_part[lid] + qnm_part[lid + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    let inv = inverseSqrt(qnm_part[0] / f32(qnm_p.width) + qnm_p.eps);
+    i = lid;
+    loop {
+        if (i >= qnm_p.width) { break; }
+        let normed = (qnm_x[base + i] - mean) * inv;
+        qnm_y[base + i] = normed * (1.0 + qnm_mod[qnm_p.width + i]) + qnm_mod[i];
+        i = i + 256u;
+    }
+}
+
+// Qwen's gated residual has no extra RMS normalization: the projection
+// bias is added first, then the learned per-channel gate scales it.
+struct QwenResidualP { n: u32, width: u32, _a: u32, _b: u32 };
+@group(0) @binding(0) var<storage, read>       qgr_base : array<f32>;
+@group(0) @binding(1) var<storage, read_write> qgr_delta: array<f32>;
+@group(0) @binding(2) var<storage, read>       qgr_gate : array<f32>;
+@group(0) @binding(3) var<uniform>             qgr_p    : QwenResidualP;
+
+@compute @workgroup_size(256)
+fn qwen_gated_residual(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.y * (65535u * 256u) + gid.x;
+    if (i >= qgr_p.n * qgr_p.width) { return; }
+    let j = i - (i / qgr_p.width) * qgr_p.width;
+    qgr_delta[i] = qgr_base[i] + qgr_gate[j] * qgr_delta[i];
+}
+
 // The same, for a fc1 that emits gate and up PACKED IN ONE ROW
 // ([gate|up] per token, as MiniMax-H3's DiT stores it) instead of two
 // separate panels. `n` counts activations (b·inter), `fsp2.inter` is the
@@ -12392,6 +12497,158 @@ fn bf16_round(v: f32) -> f32 {
 fn bf16_round_buffer(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x < bf16_p.n) { bf16_x[gid.x] = bf16_round(bf16_x[gid.x]); }
 }
+
+// Qwen Image's two streams have different Q/K/V projections, qk-norm
+// weights, and RoPE tables.  This exact join keeps those differences in one
+// position-wise pass: the six resident token-major projection panels become
+// joint head-major Q/K/V planes in `[text, image]` order.  The attention
+// kernels can then consume the planes without the host concat/repack seam.
+struct QwenRopeP {
+    image_n: u32, text_n: u32, heads: u32, hd: u32,
+    hidden: u32, total: u32, pairs: u32, _p: u32,
+};
+@group(0) @binding(0) var<storage, read>       qwi_q : array<f32>;
+@group(0) @binding(1) var<storage, read>       qwi_k : array<f32>;
+@group(0) @binding(2) var<storage, read>       qwi_v : array<f32>;
+@group(0) @binding(3) var<storage, read>       qwt_q : array<f32>;
+@group(0) @binding(4) var<storage, read>       qwt_k : array<f32>;
+@group(0) @binding(5) var<storage, read>       qwt_v : array<f32>;
+@group(0) @binding(6) var<storage, read>       qwi_bias : array<f32>;
+@group(0) @binding(7) var<storage, read>       qwt_bias : array<f32>;
+@group(0) @binding(8) var<storage, read>       qwi_qn : array<f32>;
+@group(0) @binding(9) var<storage, read>       qwi_kn : array<f32>;
+@group(0) @binding(10) var<storage, read>      qwt_qn : array<f32>;
+@group(0) @binding(11) var<storage, read>      qwt_kn : array<f32>;
+@group(0) @binding(12) var<storage, read>      qwi_cos : array<f32>;
+@group(0) @binding(13) var<storage, read>      qwi_sin : array<f32>;
+@group(0) @binding(14) var<storage, read>      qwt_cos : array<f32>;
+@group(0) @binding(15) var<storage, read>      qwt_sin : array<f32>;
+@group(0) @binding(16) var<storage, read_write> qwo_q : array<f32>;
+@group(0) @binding(17) var<storage, read_write> qwo_k : array<f32>;
+@group(0) @binding(18) var<storage, read_write> qwo_v : array<f32>;
+@group(0) @binding(19) var<uniform>             qwr_p : QwenRopeP;
+var<workgroup> qwr_q: array<f32, 256>;
+var<workgroup> qwr_k: array<f32, 256>;
+var<workgroup> qwr_v: array<f32, 256>;
+var<workgroup> qwr_qr: array<f32, 256>;
+var<workgroup> qwr_kr: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn qwen_rope_pack(@builtin(workgroup_id) wid: vec3<u32>,
+                  @builtin(local_invocation_index) lid: u32) {
+    let job = wid.y * 65535u + wid.x;
+    let jobs = qwr_p.total * qwr_p.heads;
+    if (job >= jobs || qwr_p.hd > 256u || qwr_p.hd == 0u) { return; }
+    let p = job / qwr_p.heads;
+    let h = job - p * qwr_p.heads;
+    let text = p < qwr_p.text_n;
+    var tok = p;
+    if (!text) { tok = p - qwr_p.text_n; }
+    let row = tok * qwr_p.hidden + h * qwr_p.hd;
+    let base = h * qwr_p.total * qwr_p.hd + p * qwr_p.hd;
+    var angle_tok = tok;
+    if (text) {
+        angle_tok = p;
+    }
+    var i = lid;
+    loop {
+        if (i >= qwr_p.hd) { break; }
+        var qv = 0.0;
+        var kv = 0.0;
+        var vv = 0.0;
+        var qbias = 0.0;
+        var kbias = 0.0;
+        var vbias = 0.0;
+        if (text) {
+            qv = qwt_q[row + i];
+            kv = qwt_k[row + i];
+            vv = qwt_v[row + i];
+            qbias = qwt_bias[h * qwr_p.hd + i];
+            kbias = qwt_bias[qwr_p.hidden + h * qwr_p.hd + i];
+            vbias = qwt_bias[2u * qwr_p.hidden + h * qwr_p.hd + i];
+        } else {
+            qv = qwi_q[row + i];
+            kv = qwi_k[row + i];
+            vv = qwi_v[row + i];
+            qbias = qwi_bias[h * qwr_p.hd + i];
+            kbias = qwi_bias[qwr_p.hidden + h * qwr_p.hd + i];
+            vbias = qwi_bias[2u * qwr_p.hidden + h * qwr_p.hd + i];
+        }
+        qwr_q[i] = qv + qbias;
+        qwr_k[i] = kv + kbias;
+        qwr_qr[i] = qwr_q[i] * qwr_q[i];
+        qwr_kr[i] = qwr_k[i] * qwr_k[i];
+        qwr_v[i] = vv + vbias;
+        i = i + 256u;
+    }
+    if (lid >= qwr_p.hd) {
+        qwr_qr[lid] = 0.0;
+        qwr_kr[lid] = 0.0;
+    }
+    workgroupBarrier();
+    var stride = 128u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) {
+            qwr_qr[lid] = qwr_qr[lid] + qwr_qr[lid + stride];
+            qwr_kr[lid] = qwr_kr[lid] + qwr_kr[lid + stride];
+        }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    let qi = inverseSqrt(qwr_qr[0] / f32(qwr_p.hd) + 0.000001);
+    let ki = inverseSqrt(qwr_kr[0] / f32(qwr_p.hd) + 0.000001);
+    i = lid;
+    loop {
+        if (i >= qwr_p.hd) { break; }
+        var qnw = 0.0;
+        var knw = 0.0;
+        if (text) {
+            qnw = qwt_qn[i];
+            knw = qwt_kn[i];
+        } else {
+            qnw = qwi_qn[i];
+            knw = qwi_kn[i];
+        }
+        qwr_q[i] = qwr_q[i] * qi * qnw;
+        qwr_k[i] = qwr_k[i] * ki * knw;
+        i = i + 256u;
+    }
+    // The rotation below reads both members of each pair.  Norm writes are
+    // distributed across lanes, so synchronize before a lane reads its
+    // neighbour's normalized value.
+    workgroupBarrier();
+    i = lid;
+    loop {
+        if (i >= qwr_p.hd) { break; }
+        let pair = i / 2u;
+        var qv = qwr_q[i];
+        var kv = qwr_k[i];
+        var cs = 1.0;
+        var sn = 0.0;
+        if (text) {
+            cs = qwt_cos[angle_tok * qwr_p.pairs + pair];
+            sn = qwt_sin[angle_tok * qwr_p.pairs + pair];
+        } else {
+            cs = qwi_cos[angle_tok * qwr_p.pairs + pair];
+            sn = qwi_sin[angle_tok * qwr_p.pairs + pair];
+        }
+        // Qwen's native path rotates adjacent dimensions: [0,1], [2,3],
+        // ... .  The earlier half-split form reused pair 0 for output index
+        // `pairs`, which only becomes visible once head_dim exceeds 2.
+        if (i % 2u == 0u) {
+            qv = qwr_q[2u * pair] * cs - qwr_q[2u * pair + 1u] * sn;
+            kv = qwr_k[2u * pair] * cs - qwr_k[2u * pair + 1u] * sn;
+        } else {
+            qv = qwr_q[2u * pair] * sn + qwr_q[2u * pair + 1u] * cs;
+            kv = qwr_k[2u * pair] * sn + qwr_k[2u * pair + 1u] * cs;
+        }
+        qwo_q[base + i] = qv;
+        qwo_k[base + i] = kv;
+        qwo_v[base + i] = qwr_v[i];
+        i = i + 256u;
+    }
+}
 "#;
 
 /// The bake FFN chain's middle link, in its own module (the main module's
@@ -13178,6 +13435,16 @@ struct Ctx {
     dit_softmax: wgpu::ComputePipeline,
     dit_unstack: wgpu::ComputePipeline,
     ffn_silu: wgpu::ComputePipeline,
+    /// Qwen Image's exact tanh-GELU+bias epilogue for a resident FFN.
+    qwen_gelu_bias: wgpu::ComputePipeline,
+    /// Qwen Image's affine-free LayerNorm plus shift/scale modulation.
+    qwen_layernorm_mod: wgpu::ComputePipeline,
+    /// Qwen Image's bias-then-gated residual epilogue.
+    qwen_gated_residual: wgpu::ComputePipeline,
+    /// Qwen Image's exact two-stream qk-norm/RoPE/join pass.  It is kept in
+    /// the portable main shader module because it uses only f32 storage and
+    /// no optional device feature.
+    qwen_rope_pack: wgpu::ComputePipeline,
     q1t_ovmm: wgpu::ComputePipeline,
     rmsnorm: wgpu::ComputePipeline,
     add_rmsnorm: wgpu::ComputePipeline,
@@ -13397,8 +13664,10 @@ struct Ctx {
     dsv4_binds: Mutex<(u64, HashMap<(u8, u64, usize), wgpu::BindGroup>)>,
     /// Access clock for the aging above — one tick per weight lookup.
     res_clock: std::sync::atomic::AtomicU64,
-    /// row_scale buffer per (idx, row0) — small, cached.
-    rs_bufs: Mutex<HashMap<(usize, usize), wgpu::Buffer>>,
+    /// row_scale buffer per (model uid, (tensor idx, row0)) — small, cached.
+    /// The model component is explicit so image-stage cleanup can remove one
+    /// model without touching another model's scales.
+    rs_bufs: Mutex<HashMap<(usize, (usize, usize)), wgpu::Buffer>>,
     /// Device K/V cache mirror per (kv_id, layer) for the token graph:
     /// [nkv, cap, hd] each, persists across decode tokens. `synced` counts
     /// the positions already resident (prefill sync + graph appends).
@@ -13821,6 +14090,18 @@ fn ctx_for(dev: usize) -> Option<&'static Ctx> {
     };
     g.insert(dev, built);
     built
+}
+
+/// Look up an already-created context without initializing a device.  Stage
+/// cleanup must be inert for CPU-only callers and for an explicitly selected
+/// non-wgpu backend.
+fn existing_ctx() -> Option<&'static Ctx> {
+    let map = CTXS.get()?;
+    map.lock()
+        .unwrap()
+        .get(&crate::gpu::current_device())
+        .copied()
+        .flatten()
 }
 
 /// Weight budget of the current device, in bytes (0 when there is no
@@ -14563,6 +14844,10 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let dit_softmax = pipe("dit_softmax");
     let dit_unstack = pipe("dit_unstack");
     let ffn_silu = pipe("ffn_silu_mul");
+    let qwen_gelu_bias = pipe("qwen_gelu_bias");
+    let qwen_layernorm_mod = pipe("qwen_layernorm_mod");
+    let qwen_gated_residual = pipe("qwen_gated_residual");
+    let qwen_rope_pack = pipe("qwen_rope_pack");
     let q1t_ovmm = pipe("q1t_overlay_mm");
     let rmsnorm = pipe("rmsnorm");
     let add_rmsnorm = pipe("add_rmsnorm");
@@ -15044,6 +15329,10 @@ fn init(dev: usize) -> Result<Ctx, String> {
         dit_softmax,
         dit_unstack,
         ffn_silu,
+        qwen_gelu_bias,
+        qwen_layernorm_mod,
+        qwen_gated_residual,
+        qwen_rope_pack,
         q1t_ovmm,
         rmsnorm,
         add_rmsnorm,
@@ -15614,6 +15903,213 @@ fn host_tier_put(key: (usize, usize), bytes: std::sync::Arc<Vec<u8>>) {
     }
 }
 
+/// Remove one model's entries from a UID-prefixed cache and return the exact
+/// bytes owned by the removed values.  The caller holds any surrounding cache
+/// lock; keeping the predicate here makes every scoped cleanup use the same
+/// owner test and prevents an unrelated model from being dropped by a broad
+/// cache clear.
+fn release_uid_entries<K, V, F>(
+    map: &mut std::collections::HashMap<(usize, K), V>,
+    uid: usize,
+    mut bytes: F,
+) -> u64
+where
+    K: std::cmp::Eq + std::hash::Hash,
+    F: FnMut(&V) -> u64,
+{
+    let mut released = 0u64;
+    map.retain(|(owner, _), value| {
+        if *owner == uid {
+            released = released.saturating_add(bytes(value));
+            false
+        } else {
+            true
+        }
+    });
+    released
+}
+
+#[inline]
+fn resident_sub(c: &Ctx, bytes: u64) {
+    if bytes == 0 {
+        return;
+    }
+    c.resident
+        .fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Relaxed,
+            |current| Some(current.saturating_sub(bytes)),
+        )
+        .ok();
+}
+
+/// A synchronous image stage owns the model UID it registered.  The context
+/// is process-lived, but the model-specific device buffers are disposable.
+/// Wait for every submitted command before dropping handles; shared scratch,
+/// content caches, and other model UIDs deliberately remain untouched.
+pub(crate) struct ImageStageGuard {
+    active: bool,
+    model_uid: Option<u64>,
+}
+
+pub(crate) fn image_stage_scope() -> ImageStageGuard {
+    ImageStageGuard {
+        // `selected` only reads configuration.  In particular, this guard
+        // must not initialize a GPU for a CPU-only stage or release a stale
+        // wgpu cache when the caller explicitly selected Metal/CPU.
+        active: selected(),
+        model_uid: None,
+    }
+}
+
+impl ImageStageGuard {
+    pub(crate) fn track_model(&mut self, uid: u64) {
+        if self.active {
+            self.model_uid = Some(uid);
+        }
+    }
+}
+
+impl Drop for ImageStageGuard {
+    fn drop(&mut self) {
+        if self.active {
+            if let Some(uid) = self.model_uid {
+                release_idle_model_buffers(uid);
+            }
+        }
+    }
+}
+
+/// Drop only model-owned wgpu cache entries after all submitted work drains.
+/// This is intentionally narrower than a device/cache reset: shared scratch,
+/// content-keyed buffers, KV state, and every other model UID survive.
+pub(crate) fn release_idle_model_buffers(uid: u64) {
+    let Some(c) = existing_ctx() else { return };
+    let owner = uid as usize;
+    // The image pipeline's GPU calls are synchronous, but a few reusable
+    // paths leave a submission pending while returning a device buffer.  A
+    // completed poll is the lifetime barrier before cache-owned handles go.
+    let _gate = c.mm_gate.lock().unwrap();
+    if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
+        tracing::warn!("wgpu image-stage cache release skipped after device poll failure");
+        return;
+    }
+
+    let weight_bytes = {
+        let mut map = c.weight_bufs.lock().unwrap();
+        let bytes = release_uid_entries(&mut map, owner, |entry| entry.bytes);
+        resident_sub(c, bytes);
+        bytes
+    };
+    let moe_bytes = {
+        let mut map = c.moe_expw.lock().unwrap();
+        let bytes = release_uid_entries(&mut map, owner, |(gate, up, down)| {
+            gate.size()
+                .saturating_add(up.size())
+                .saturating_add(down.size())
+        });
+        resident_sub(c, bytes);
+        bytes
+    };
+    let global_moe_bytes = {
+        let mut map = c.dsv4_global_moe.lock().unwrap();
+        let mut bytes = 0u64;
+        map.retain(|owner, bufs| {
+            if *owner != uid {
+                return true;
+            }
+            for buffer in bufs.gate.iter().chain(&bufs.up).chain(&bufs.down) {
+                bytes = bytes.saturating_add(buffer.size());
+            }
+            false
+        });
+        resident_sub(c, bytes);
+        bytes
+    };
+    let plane_count = {
+        let mut map = c.planes.lock().unwrap();
+        let before = map.len();
+        let _ = release_uid_entries(&mut map, owner, |(_, bytes)| *bytes);
+        before - map.len()
+    };
+    let row_scale_count = {
+        let mut map = c.rs_bufs.lock().unwrap();
+        let before = map.len();
+        let _ = release_uid_entries(&mut map, owner, |_| 0);
+        before - map.len()
+    };
+    {
+        let mut registry = layer_registry().lock().unwrap();
+        let _ = release_uid_entries(&mut registry, owner, |_| 0);
+    }
+    let host_bytes = if let Some(tier) = host_tier() {
+        let mut map = tier.map.lock().unwrap();
+        let bytes = release_uid_entries(&mut map, owner, |(data, _)| data.len() as u64);
+        if bytes != 0 {
+            tier.bytes
+                .fetch_sub(bytes, std::sync::atomic::Ordering::AcqRel);
+        }
+        bytes
+    } else {
+        0
+    };
+    let host_bank_bytes = {
+        let mut map = host_banks().lock().unwrap();
+        let mut bytes = 0u64;
+        map.retain(|(bank_owner, _), banks| {
+            if *bank_owner != owner {
+                return true;
+            }
+            bytes = bytes.saturating_add(
+                (banks.g.len() as u64)
+                    .saturating_add(banks.u.len() as u64)
+                    .saturating_add(banks.d.len() as u64),
+            );
+            false
+        });
+        bytes
+    };
+    if weight_bytes != 0
+        || moe_bytes != 0
+        || global_moe_bytes != 0
+        || plane_count != 0
+        || row_scale_count != 0
+        || host_bytes != 0
+        || host_bank_bytes != 0
+    {
+        tracing::debug!(
+            uid,
+            weight_bytes,
+            moe_bytes,
+            global_moe_bytes,
+            plane_count,
+            row_scale_count,
+            host_bytes,
+            host_bank_bytes,
+            "released wgpu image-stage model caches"
+        );
+    }
+}
+
+#[cfg(test)]
+mod image_stage_cache_tests {
+    use super::release_uid_entries;
+    use std::collections::HashMap;
+
+    #[test]
+    fn uid_release_sums_only_owned_entries() {
+        let mut cache = HashMap::from([
+            ((11usize, 0usize), 17u64),
+            ((11usize, 1usize), 23u64),
+            ((12usize, 0usize), 41u64),
+        ]);
+        let released = release_uid_entries(&mut cache, 11, |bytes| *bytes);
+        assert_eq!(released, 40);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.get(&(12, 0)), Some(&41));
+    }
+}
+
 /// On a network filesystem an mmap MISS is the death of this path: every
 /// 4-128 KB page faults through FUSE one round trip at a time, which is
 /// the measured "1% CPU, looks hung" failure on MooseFS volumes. With
@@ -15798,11 +16294,11 @@ fn weight_buffer_l(
         }
     }
     crate::gpu::probe_note_cold(); // first touch = upload, not a steady sample
-    // DEVICE-LOCAL residency: create_buffer_init maps at creation → the buffer
-    // lands in a HOST_VISIBLE heap and every matvec streams its weights over
-    // PCIe (~25 GB/s) every token. A plain create_buffer + staged write_buffer
-    // lets the allocator pick DEVICE_LOCAL VRAM (~1 TB/s on a 4090). This is
-    // THE discrete-GPU decode fix; on UMA it's a wash.
+                                   // DEVICE-LOCAL residency: create_buffer_init maps at creation → the buffer
+                                   // lands in a HOST_VISIBLE heap and every matvec streams its weights over
+                                   // PCIe (~25 GB/s) every token. A plain create_buffer + staged write_buffer
+                                   // lets the allocator pick DEVICE_LOCAL VRAM (~1 TB/s on a 4090). This is
+                                   // THE discrete-GPU decode fix; on UMA it's a wash.
     let buf = c.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("q1-weights"),
         // Rounded up: write_buffer refuses a size that is not a multiple of
@@ -16668,7 +17164,7 @@ fn dispatch_matvec(
             .rs_bufs
             .lock()
             .unwrap()
-            .entry((base ^ idx.wrapping_mul(1_000_003), row0))
+            .entry((base, (idx, row0)))
             .or_insert_with(|| {
                 crate::gpu::probe_note_cold();
                 make_rs()
@@ -17862,8 +18358,8 @@ pub fn forward_token_graph(
                     return None;
                 }
                 let b = tensor_weight(c, model, gw.idx, rows, cols)?; // device-local
-                // Row scales are token-invariant — cache by (ptr,rows),
-                // fingerprint-checked (the ptr is not a stable identity).
+                                                                      // Row scales are token-invariant — cache by (ptr,rows),
+                                                                      // fingerprint-checked (the ptr is not a stable identity).
                 let key = (gw.row_scale.as_ptr() as usize, rows);
                 let fp = fp_bytes(bytemuck::cast_slice(&gw.row_scale[..rows]));
                 let mut cb = c.const_bufs.lock().unwrap();
@@ -17991,11 +18487,11 @@ pub fn forward_token_graph(
     };
     let mut lws = Vec::with_capacity(layers.len());
     let mut gdn_dims: Option<(usize, usize, usize, usize, usize, usize)> = None; // nv,nk,dk,dv,kk,cdim
-    // Budget-driven device prefix: the first layer whose live graph buffers
-    // no longer fit ends the prefix instead of retaining an over-budget dense
-    // stack behind evicted LRU handles. The caller finishes the remaining
-    // layers on the host from the boundary hidden: one sync per token at the
-    // boundary, not per layer.
+                                                                                 // Budget-driven device prefix: the first layer whose live graph buffers
+                                                                                 // no longer fit ends the prefix instead of retaining an over-budget dense
+                                                                                 // stack behind evicted LRU handles. The caller finishes the remaining
+                                                                                 // layers on the host from the boundary hidden: one sync per token at the
+                                                                                 // boundary, not per layer.
     let mut prefix = false;
     let mut graph_bytes = 0u64;
     for l in layers {
@@ -19623,10 +20119,10 @@ pub fn forward_token_graph(
                                 pass.set_bind_group(0, &bg_rope, &[]);
                                 pass.dispatch_workgroups((nh + nkv) as u32, 1, 1);
                                 tsp!(pass, fine, 21); // rope
-                                // Exact Full attention has now admitted a
-                                // persistent K/V mutation.  If a later
-                                // dispatch or readback fails, the CPU cache
-                                // cannot safely resume this sequence.
+                                                      // Exact Full attention has now admitted a
+                                                      // persistent K/V mutation.  If a later
+                                                      // dispatch or readback fails, the CPU cache
+                                                      // cannot safely resume this sequence.
                                 state_started = true;
                                 pass.set_pipeline(&c.kv_append);
                                 pass.set_bind_group(0, &bg_kv, &[]);
@@ -19754,7 +20250,7 @@ pub fn forward_token_graph(
                                 );
                             }
                         } // fused-vs-split attend arms
-                        // attn_out *= sigmoid(gate) before the O projection.
+                          // attn_out *= sigmoid(gate) before the O projection.
                     }
                     if *output_gate && !attn_done {
                         let gm_u = uniform_u32x4(c, [(nh * hd) as u32, 0, 0, 0]);
@@ -20314,12 +20810,12 @@ pub fn forward_token_graph(
                             pass.set_bind_group(0, &bg_silu, &[]);
                             pass.dispatch_workgroups_flat((inter as u32).div_ceil(256));
                             tsp!(pass, fine, 43); // SiLU × up
-                            // `down` rides here too when its dtype can be
-                            // prepped: dispatches inside one pass serialize
-                            // with memory visibility — the same guarantee the
-                            // MoE arm leans on — so it reads the `abuf` silu
-                            // just wrote. This saves one pass per layer without
-                            // pretending that pass count predicts kernel time.
+                                                  // `down` rides here too when its dtype can be
+                                                  // prepped: dispatches inside one pass serialize
+                                                  // with memory visibility — the same guarantee the
+                                                  // MoE arm leans on — so it reads the `abuf` silu
+                                                  // just wrote. This saves one pass per layer without
+                                                  // pretending that pass count predicts kernel time.
                             if let Some((pdp, bg_d, wd)) = &pd {
                                 pass.set_pipeline(pdp);
                                 pass.set_bind_group(0, bg_d, &[]);
@@ -23895,7 +24391,20 @@ pub(crate) fn fused_gemm_from_device(
     use cortiq_core::TensorDtype as D;
     match model.tensors[idx].dtype {
         D::Q4TiledP => {
-            tp_matmat_impl(model, idx, &[], b, rows, cols, Some(out), Some(src), false).is_some()
+            tp_matmat_impl(
+                model,
+                idx,
+                &[],
+                b,
+                rows,
+                cols,
+                Some(out),
+                Some(src),
+                0,
+                false,
+                None,
+            )
+                .is_some()
         }
         dt @ (D::Q8Row | D::Q8_2f) if fused_any() => {
             let Some(c) = ctx() else { return false };
@@ -24162,7 +24671,7 @@ fn dispatch_matmat_keep(
             .rs_bufs
             .lock()
             .unwrap()
-            .entry((base ^ idx.wrapping_mul(1_000_003), usize::MAX))
+            .entry((base, (idx, usize::MAX)))
             .or_insert_with(|| {
                 crate::gpu::probe_note_cold();
                 c.device
@@ -24268,10 +24777,15 @@ fn dispatch_matmat_keep(
         let ascale: f32 = if dev_scale {
             0.0
         } else {
-            let mx = pre[..b * cols]
-                .iter()
-                .fold(0f32, |m, v| if v.is_finite() { m.max(v.abs()) } else { m });
-            if mx > 1000.0 { 1000.0 / mx } else { 1.0 }
+            let mx =
+                pre[..b * cols]
+                    .iter()
+                    .fold(0f32, |m, v| if v.is_finite() { m.max(v.abs()) } else { m });
+            if mx > 1000.0 {
+                1000.0 / mx
+            } else {
+                1.0
+            }
         };
         let cp = [
             (cols / 4) as u32,
@@ -24498,6 +25012,238 @@ pub(crate) fn q4tp_matmat_dev(
     Some(buf)
 }
 
+/// Qwen's resident chain uses independent panels for the two streams and
+/// therefore cannot use the historical shared `Scratch::y` result slot. The
+/// GEMM implementation already has the complete codec/scale validation; this
+/// narrow wrapper only supplies a caller-owned storage destination and keeps
+/// the result on the device.
+fn qwen_q4tp_gemm_keep(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    src: &wgpu::Buffer,
+    dst: &wgpu::Buffer,
+    batch: usize,
+    rows: usize,
+    cols: usize,
+) -> bool {
+    qwen_q4tp_gemm_keep_offset(model, idx, src, 0, dst, batch, rows, cols)
+}
+
+/// The output projection can bind the image or text window directly from
+/// the joint token-major attention panel.  Keeping the byte offset here
+/// avoids a device-side split copy before the two distinct output weights.
+fn qwen_q4tp_gemm_keep_offset(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    src: &wgpu::Buffer,
+    src_offset: u64,
+    dst: &wgpu::Buffer,
+    batch: usize,
+    rows: usize,
+    cols: usize,
+) -> bool {
+    tp_matmat_impl(
+        model,
+        idx,
+        &[],
+        batch,
+        rows,
+        cols,
+        None,
+        Some(src),
+        src_offset,
+        false,
+        Some(dst),
+    )
+    .is_some()
+}
+
+/// Encode one Q4TP projection into a caller-owned command buffer.  The
+/// resident plane cache is keyed by model/tensor identity and capped by the
+/// existing VRAM policy; a miss falls back to the established in-kernel
+/// Q4TP GEMM.  No submission or host readback occurs here.
+#[allow(clippy::too_many_arguments)]
+fn qwen_q4tp_gemm_encode(
+    c: &Ctx,
+    model: &Arc<CmfModel>,
+    idx: usize,
+    src: &wgpu::Buffer,
+    src_offset: u64,
+    dst: &wgpu::Buffer,
+    batch: usize,
+    rows: usize,
+    cols: usize,
+    enc: &mut wgpu::CommandEncoder,
+) -> bool {
+    if batch == 0 || rows == 0 || cols == 0 || cols % 32 != 0 || rows % 32 != 0 {
+        return false;
+    }
+    let Some(src_bytes) = batch
+        .checked_mul(cols)
+        .and_then(|n| n.checked_mul(4))
+        .and_then(|n| u64::try_from(n).ok())
+    else {
+        return false;
+    };
+    if src_offset % 256 != 0
+        || src_offset
+            .checked_add(src_bytes)
+            .is_none_or(|end| end > src.size())
+        || !qwen_storage_binding_fit(c, src_bytes as usize, "chain activation")
+    {
+        return false;
+    }
+    let Some(dst_bytes) = batch
+        .checked_mul(rows)
+        .and_then(|n| n.checked_mul(4))
+        .and_then(|n| u64::try_from(n).ok())
+    else {
+        return false;
+    };
+    if dst_bytes > dst.size() || !qwen_storage_binding_fit(c, dst_bytes as usize, "chain output") {
+        return false;
+    }
+    let Some(entry) = model.tensors.get(idx) else {
+        return false;
+    };
+    if entry.dtype != cortiq_core::TensorDtype::Q4TiledP
+        || entry.shape.as_slice() != [rows, cols]
+    {
+        return false;
+    }
+    let Some(q_buf) = qwen_q4tp_weight(c, model, idx, rows, cols) else {
+        return false;
+    };
+
+    let can_scale = (c.act_amax_part.is_some() && c.act_amax_fold.is_some())
+        || c.act_absmax.is_some();
+    let coop = c.q4tp_mm_coop_f16.is_some() && c.q4tp_dq_f16.is_some() && can_scale;
+    if coop {
+        if let Some((plane, fresh)) = plane_cached(
+            c,
+            (model.uid() as usize, idx),
+            &q_buf,
+            rows,
+            cols,
+            8192,
+        ) {
+            if let (Some(dq), Some(mm)) = (c.q4tp_dq_f16.as_ref(), c.q4tp_mm_coop_f16.as_ref()) {
+                if let Some(bind_dq) = fresh {
+                    let mut pass = begin_pass_with(enc, Some("qwen-chain-dequant"), None);
+                    pass.set_pipeline(dq);
+                    pass.set_bind_group(0, &bind_dq, &[]);
+                    let pairs = (rows * cols / 2) as u32;
+                    let groups = pairs.div_ceil(256);
+                    pass.dispatch_workgroups(groups.min(MAX_WG), groups.div_ceil(MAX_WG), 1);
+                }
+                let asc = c.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("qwen-chain-ascale"),
+                    size: 4,
+                    usage: wgpu::BufferUsages::STORAGE,
+                    mapped_at_creation: false,
+                });
+                if encode_act_absmax_offset(c, enc, src, src_offset, batch * cols, &asc) {
+                    encode_q4_tile_mm_full_offset(
+                        c,
+                        enc,
+                        mm,
+                        &plane,
+                        src,
+                        src_offset,
+                        dst,
+                        rows,
+                        cols,
+                        batch,
+                        0.0,
+                        Some(&asc),
+                    );
+                    qwen_chain_debug_path(model.uid(), idx, rows, cols, batch, "cached-f16");
+                    return true;
+                }
+            }
+        }
+    }
+    // Once the bounded f16 plane bank is full, keep using the existing
+    // cooperative Q4TP kernel instead of silently dropping to the scalar
+    // tile decoder. It dequantizes in the GEMM's tile loop, so it does not
+    // retain another model-wide plane, while the matrix units still handle
+    // the multiply. The device scale is the same one used by the cached-f16
+    // arm, and the branch remains opt-out for isolating a fallback run.
+    if c.q4tp_mm_coop_s.is_some()
+        && can_scale
+        && std::env::var("CMF_QWEN_IMAGE_FUSED_MLP_COOP").as_deref() != Ok("0")
+    {
+        let asc = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("qwen-chain-ascale-direct"),
+            size: 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        if encode_act_absmax_offset(c, enc, src, src_offset, batch * cols, &asc) {
+            encode_q4_tile_mm_full_offset(
+                c,
+                enc,
+                c.q4tp_mm_coop_s.as_ref().unwrap(),
+                &q_buf,
+                src,
+                src_offset,
+                dst,
+                rows,
+                cols,
+                batch,
+                0.0,
+                Some(&asc),
+            );
+            qwen_chain_debug_path(model.uid(), idx, rows, cols, batch, "direct-coop");
+            return true;
+        }
+    }
+    // The scalar shader is the exact portable GPU fallback. It uses the
+    // same source window and leaves every caller's CPU/Metal fallback intact.
+    qwen_chain_debug_path(model.uid(), idx, rows, cols, batch, "scalar");
+    encode_q4_tile_mm_full_offset(
+        c,
+        enc,
+        &c.q4tp_mm,
+        &q_buf,
+        src,
+        src_offset,
+        dst,
+        rows,
+        cols,
+        batch,
+        0.0,
+        None,
+    );
+    true
+}
+
+/// Emit one bounded diagnostic per Qwen projection/path. The full model has
+/// thousands of block invocations, so logging every call would perturb the
+/// timing and swamp the useful evidence. `CMF_GPU_DEBUG=1` enables this
+/// summary; normal inference does no set allocation or formatting.
+fn qwen_chain_debug_path(
+    uid: u64,
+    idx: usize,
+    rows: usize,
+    cols: usize,
+    batch: usize,
+    path: &'static str,
+) {
+    if std::env::var("CMF_GPU_DEBUG").is_err() {
+        return;
+    }
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<(u64, usize, &'static str)>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    if seen.lock().unwrap().insert((uid, idx, path)) {
+        eprintln!(
+            "qwen-chain GEMM path={path} tensor={idx} shape={rows}x{cols} batch={batch} uid={uid}"
+        );
+    }
+}
+
 /// Music-3's FFN with the activations held on the device: ff_in's
 /// GEMM keeps its result, the GLU runs where that result lives, and
 /// ff_out reads it in place — only `h` goes up (5.6 MB) and only the
@@ -24586,7 +25332,9 @@ pub fn music3_ffn(
         inter,
         Some(out),
         Some(&act),
+        0,
         false,
+        None,
     )
     .is_some()
 }
@@ -24825,7 +25573,21 @@ fn encode_act_absmax(
     n: usize,
     asc: &wgpu::Buffer,
 ) -> bool {
-    encode_act_absmax_with(c, enc, act, n, asc, None)
+    encode_act_absmax_with_offset(c, enc, act, 0, n, asc, None)
+}
+
+/// `encode_act_absmax` for a resident window inside a larger token panel.
+/// The reduction sees exactly `n` f32 values beginning at `offset`; this is
+/// used by Qwen's image/text output projections after joint attention.
+fn encode_act_absmax_offset(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    act: &wgpu::Buffer,
+    offset: u64,
+    n: usize,
+    asc: &wgpu::Buffer,
+) -> bool {
+    encode_act_absmax_with_offset(c, enc, act, offset, n, asc, None)
 }
 
 /// The same, for a caller that already holds the scratch guard: it passes the
@@ -24840,6 +25602,27 @@ fn encode_act_absmax_with(
     asc: &wgpu::Buffer,
     parts: Option<&wgpu::Buffer>,
 ) -> bool {
+    encode_act_absmax_with_offset(c, enc, act, 0, n, asc, parts)
+}
+
+/// Internal activation reduction with an optional source window.  Keeping
+/// the existing zero-offset wrapper avoids changing the many established
+/// GEMM callers while the Qwen chain can bind each stream without a copy.
+fn encode_act_absmax_with_offset(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    act: &wgpu::Buffer,
+    act_offset: u64,
+    n: usize,
+    asc: &wgpu::Buffer,
+    parts: Option<&wgpu::Buffer>,
+) -> bool {
+    let act_bytes = (n as u64).saturating_mul(4);
+    let act_entry = if act_offset == 0 {
+        bind_buf(0, act)
+    } else {
+        bind_buf_off(0, act, act_offset, act_bytes)
+    };
     let ap = c
         .device
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -24866,7 +25649,7 @@ fn encode_act_absmax_with(
             let bg1 = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
                 layout: &part.get_bind_group_layout(0),
-                entries: &[bind_buf(0, act), bind_buf(1, &pbuf), bind_buf(2, &ap)],
+                entries: &[act_entry, bind_buf(1, &pbuf), bind_buf(2, &ap)],
             });
             let fp = c
                 .device
@@ -24896,7 +25679,7 @@ fn encode_act_absmax_with(
                 let bg = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: None,
                     layout: &amax.get_bind_group_layout(0),
-                    entries: &[bind_buf(0, act), bind_buf(1, asc), bind_buf(2, &ap)],
+                    entries: &[act_entry, bind_buf(1, asc), bind_buf(2, &ap)],
                 });
                 let mut pass = begin_pass(enc);
                 pass.set_pipeline(amax);
@@ -24919,7 +25702,7 @@ fn tp_matmat(
     out: &mut [f32],
     two_bit: bool,
 ) -> bool {
-    tp_matmat_impl(model, idx, xs, b, rows, cols, Some(out), None, two_bit).is_some()
+    tp_matmat_impl(model, idx, xs, b, rows, cols, Some(out), None, 0, two_bit, None).is_some()
 }
 
 /// Result stays on the device; the caller owns the returned handle.
@@ -24933,7 +25716,7 @@ fn tp_matmat_keep(
     _unused: &mut Vec<f32>,
     two_bit: bool,
 ) -> Option<wgpu::Buffer> {
-    tp_matmat_impl(model, idx, xs, b, rows, cols, None, None, two_bit)
+    tp_matmat_impl(model, idx, xs, b, rows, cols, None, None, 0, two_bit, None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -24946,7 +25729,9 @@ fn tp_matmat_impl(
     cols: usize,
     out: Option<&mut [f32]>,
     src: Option<&wgpu::Buffer>,
+    src_offset: u64,
     two_bit: bool,
+    dst: Option<&wgpu::Buffer>,
 ) -> Option<wgpu::Buffer> {
     let c = ctx()?;
     let _gate = c.mm_gate.lock().unwrap();
@@ -25026,14 +25811,25 @@ fn tp_matmat_impl(
             bf
         }
     };
+    let src_bytes = (b * cols * 4) as u64;
+    if src_offset % 256 != 0
+        || src_offset
+            .checked_add(src_bytes)
+            .is_none_or(|end| end > xs_buf.size())
+    {
+        return None;
+    }
     let y_size = (b * rows * 4) as u64;
-    let y_buf = Scratch::ensure(
-        &c.device,
-        &mut sc.y,
-        y_size,
-        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        "q4tpmm-y",
-    );
+    let y_buf = match dst {
+        Some(buf) => buf.clone(),
+        None => Scratch::ensure(
+            &c.device,
+            &mut sc.y,
+            y_size,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            "q4tpmm-y",
+        ),
+    };
     // Activation scale for the coop arm: bring max|x| to ~1000 so the
     // f16 operands cannot overflow (the DiT's modulated activations run
     // past 65504 — that overflow was this kernel's NaN). 0 = no scaling,
@@ -25063,7 +25859,11 @@ fn tp_matmat_impl(
         let mx = xs[..b * cols]
             .iter()
             .fold(0f32, |m, v| if v.is_finite() { m.max(v.abs()) } else { m });
-        if mx > 1000.0 { 1000.0 / mx } else { 1.0 }
+        if mx > 1000.0 {
+            1000.0 / mx
+        } else {
+            1.0
+        }
     } else {
         0.0
     };
@@ -25165,9 +25965,14 @@ fn tp_matmat_impl(
             contents: bytemuck::cast_slice(&[0.0f32]),
             usage: wgpu::BufferUsages::STORAGE,
         });
+    let src_entry = if src_offset == 0 {
+        bind_buf(1, &xs_buf)
+    } else {
+        bind_buf_off(1, &xs_buf, src_offset, src_bytes)
+    };
     let mut entries = vec![
         bind_buf(0, w_bind),
-        bind_buf(1, &xs_buf),
+        src_entry,
         bind_buf(2, &y_buf),
         bind_buf(3, &p_buf),
     ];
@@ -27306,7 +28111,11 @@ pub fn q4tp_ffn_packed(
         let mx = xs[..b * hidden]
             .iter()
             .fold(0f32, |m, v| if v.is_finite() { m.max(v.abs()) } else { m });
-        if mx > 1000.0 { 1000.0 / mx } else { 1.0 }
+        if mx > 1000.0 {
+            1000.0 / mx
+        } else {
+            1.0
+        }
     };
     let asc_dev = c.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("pffn-ascale-1"),
@@ -28920,7 +29729,14 @@ fn dit_gemm_coop(@builtin(workgroup_id) wid: vec3<u32>,
             var v = vec4<f32>(0.0);
             if (m0 + m < dcp.nb && col0 < cols) {
                 let base = dcp.a_off + (m0 + m) * cols + col0;
-                v = vec4<f32>(dcx[base], dcx[base + 1u], dcx[base + 2u], dcx[base + 3u]);
+                if (col0 + 3u < cols) {
+                    v = vec4<f32>(dcx[base], dcx[base + 1u], dcx[base + 2u], dcx[base + 3u]);
+                } else {
+                    v.x = dcx[base];
+                    if (col0 + 1u < cols) { v.y = dcx[base + 1u]; }
+                    if (col0 + 2u < cols) { v.z = dcx[base + 2u]; }
+                    if (col0 + 3u < cols) { v.w = dcx[base + 3u]; }
+                }
             }
             dm_a[dst] = f16(v.x); dm_a[dst + 1u] = f16(v.y);
             dm_a[dst + 2u] = f16(v.z); dm_a[dst + 3u] = f16(v.w);
@@ -28933,7 +29749,14 @@ fn dit_gemm_coop(@builtin(workgroup_id) wid: vec3<u32>,
             var wv = vec4<f32>(0.0);
             if (n0 + nn < dcp.rows && col0 < cols) {
                 let base = dcp.b_off + (n0 + nn) * cols + col0;
-                wv = vec4<f32>(dcw[base], dcw[base + 1u], dcw[base + 2u], dcw[base + 3u]);
+                if (col0 + 3u < cols) {
+                    wv = vec4<f32>(dcw[base], dcw[base + 1u], dcw[base + 2u], dcw[base + 3u]);
+                } else {
+                    wv.x = dcw[base];
+                    if (col0 + 1u < cols) { wv.y = dcw[base + 1u]; }
+                    if (col0 + 2u < cols) { wv.z = dcw[base + 2u]; }
+                    if (col0 + 3u < cols) { wv.w = dcw[base + 3u]; }
+                }
             }
             dm_b[bd] = f16(wv.x); dm_b[bd + 1u] = f16(wv.y);
             dm_b[bd + 2u] = f16(wv.z); dm_b[bd + 3u] = f16(wv.w);
@@ -30191,6 +31014,30 @@ fn encode_q4_tile_mm_full(
     ascale: f32,
     scale_buf: Option<&wgpu::Buffer>,
 ) {
+    encode_q4_tile_mm_full_offset(
+        c, enc, pipeline, weight, xs, 0, y, rows, cols, k, ascale, scale_buf,
+    )
+}
+
+/// The same Q4TP dispatch with a byte offset into a larger resident
+/// activation panel.  Qwen's joint attention writes `[text, image]` into one
+/// token-major buffer; its two output projections bind the corresponding
+/// windows directly so the panel never needs a host split or device copy.
+#[allow(clippy::too_many_arguments)]
+fn encode_q4_tile_mm_full_offset(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    pipeline: &wgpu::ComputePipeline,
+    weight: &wgpu::Buffer,
+    xs: &wgpu::Buffer,
+    xs_offset: u64,
+    y: &wgpu::Buffer,
+    rows: usize,
+    cols: usize,
+    k: usize,
+    ascale: f32,
+    scale_buf: Option<&wgpu::Buffer>,
+) {
     // Is this one of the cooperative kernels (both declare binding 4)?
     // wgpu 30 exposes no identity on pipeline handles, so the layouts are
     // compared by their entry count instead: the coop layouts have five
@@ -30227,12 +31074,13 @@ fn encode_q4_tile_mm_full(
             &dummy
         }
     };
-    let mut entries = vec![
-        bind_buf(0, weight),
-        bind_buf(1, xs),
-        bind_buf(2, y),
-        bind_buf(3, &p_buf),
-    ];
+    let src_bytes = (k as u64).saturating_mul(cols as u64).saturating_mul(4);
+    let src_entry = if xs_offset == 0 {
+        bind_buf(1, xs)
+    } else {
+        bind_buf_off(1, xs, xs_offset, src_bytes)
+    };
+    let mut entries = vec![bind_buf(0, weight), src_entry, bind_buf(2, y), bind_buf(3, &p_buf)];
     // Only the f16 twin declares binding 4. Deciding that by comparing
     // pipeline ADDRESSES was wrong — the handle passed in is not the
     // same object as the one in the Ctx, so the entry was never added
@@ -31309,7 +32157,7 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
         let mut rs_map = c.rs_bufs.lock().unwrap();
         let mut cached = |tag: usize, idx: usize, data: &[f32]| -> wgpu::Buffer {
             rs_map
-                .entry((idx.wrapping_mul(1_000_003) ^ tag, usize::MAX - 1))
+                .entry((model.uid() as usize, (idx, tag)))
                 .or_insert_with(|| {
                     crate::gpu::probe_note_cold();
                     storage_bytes(c, bytemuck::cast_slice(data))
@@ -31528,6 +32376,259 @@ mod tests {
     }
 
     #[test]
+    fn qwen_f32_const_keeps_recorded_bias_snapshot() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping qwen constant lifetime test");
+            return;
+        };
+        let _gate = c.mm_gate.lock().unwrap();
+        let mut bias = vec![1.0f32, 2.0, 3.0, 4.0];
+        let zeros = [0.0f32; 4];
+        let make_values = |label: &'static str| {
+            let b = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: (zeros.len() * 4) as u64,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            c.queue.write_buffer(&b, 0, bytemuck::cast_slice(&zeros));
+            b
+        };
+        let out_a = make_values("qwen-const-test-a");
+        let out_b = make_values("qwen-const-test-b");
+        let mut enc = c
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("qwen-const-test"),
+            });
+
+        let old_bias = qwen_f32_const(c, &bias, "qwen-const-test-bias");
+        encode_qwen_gelu_bias(c, &mut enc, &out_a, &old_bias, 4, 4, false);
+
+        // Keep the Vec allocation and pointer unchanged so this exercises
+        // the fingerprint-change branch rather than a new cache key.
+        bias.copy_from_slice(&[5.0, 6.0, 7.0, 8.0]);
+        let new_bias = qwen_f32_const(c, &bias, "qwen-const-test-bias");
+        encode_qwen_gelu_bias(c, &mut enc, &out_b, &new_bias, 4, 4, false);
+
+        let mut got_a = [0.0f32; 4];
+        let mut got_b = [0.0f32; 4];
+        assert!(readback2(
+            c,
+            enc,
+            (&out_a, &mut got_a),
+            (&out_b, &mut got_b),
+        ));
+        assert_eq!(got_a, [1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(got_b, [5.0, 6.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn qwen_layernorm_mod_matches_cpu_across_warps() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping qwen layernorm parity test");
+            return;
+        };
+        let _gate = c.mm_gate.lock().unwrap();
+        let eps = 1.0e-6f32;
+        let batch = 4usize;
+        for width in [64usize, 257, 3072] {
+            let row_means = [3.25f32, -7.5, 19.0, -31.0];
+            let x: Vec<f32> = (0..batch * width)
+                .map(|j| {
+                    let row = j / width;
+                    let col = j % width;
+                    let centered = ((col * 37 + row * 19 + width) % 101) as f32 / 50.0 - 1.0;
+                    row_means[row] + centered + (col % 7) as f32 * 0.013
+                })
+                .collect();
+            let shift: Vec<f32> = (0..width)
+                .map(|i| ((i * 17 + width) % 101) as f32 * 0.002 - 0.1)
+                .collect();
+            let scale: Vec<f32> = (0..width)
+                .map(|i| ((i * 19 + 7) % 89) as f32 * 0.003 - 0.132)
+                .collect();
+            let mut modulation = shift.clone();
+            modulation.extend_from_slice(&scale);
+
+            let mut want = vec![0.0f32; x.len()];
+            for row in 0..batch {
+                let xr = &x[row * width..(row + 1) * width];
+                let mean = xr.iter().map(|&v| v as f64).sum::<f64>() / width as f64;
+                let var = xr
+                    .iter()
+                    .map(|&v| {
+                        let d = v as f64 - mean;
+                        d * d
+                    })
+                    .sum::<f64>()
+                    / width as f64;
+                let inv = 1.0 / (var + eps as f64).sqrt();
+                for i in 0..width {
+                    want[row * width + i] =
+                        (((xr[i] as f64 - mean) * inv) as f32) * (1.0 + scale[i]) + shift[i];
+                }
+            }
+
+            let src = storage_bytes(c, bytemuck::cast_slice(&x));
+            let dst = rw_f32(c, x.len(), true);
+            assert!(qwen_layernorm_mod_keep(
+                c,
+                &src,
+                &modulation,
+                &dst,
+                batch,
+                width,
+                eps,
+            ));
+            let mut got = vec![0.0f32; x.len()];
+            let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("qwen-layernorm-test-stage"),
+                size: (x.len() * 4) as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let enc = c
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("qwen-layernorm-test-readback"),
+                });
+            assert!(readback(
+                c,
+                enc,
+                &dst,
+                &stage,
+                (x.len() * 4) as u64,
+                &mut got
+            ));
+            assert!(
+                got.iter().all(|value| value.is_finite()),
+                "qwen layernorm width={width} produced non-finite output"
+            );
+            let max_d = want
+                .iter()
+                .zip(&got)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_d < 2.0e-3,
+                "qwen layernorm width={width} ≠ CPU: max|Δ| = {max_d}"
+            );
+        }
+    }
+
+    #[test]
+    fn dit_coop_matmul_preserves_odd_reduction_tail() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping DiT cooperative odd-tail test");
+            return;
+        };
+        let _gate = c.mm_gate.lock().unwrap();
+        let Some(pipe) = c.dit_gemm_coop.as_ref() else {
+            eprintln!("cooperative matrix pipeline unavailable — skipping odd-tail test");
+            return;
+        };
+
+        // Both the reduction and the two tiled output dimensions are odd;
+        // nonzero input offsets also exercise the per-head packed layout.
+        for (case, &(k, m, n)) in [(65usize, 65usize, 67usize), (129, 129, 131)]
+            .iter()
+            .enumerate()
+        {
+            let a_off = 5 + case * 3;
+            let b_off = 7 + case * 5;
+            let mut a = vec![0.0f32; a_off + m * k + 1];
+            let mut b = vec![0.0f32; b_off + n * k + 1];
+            for row in 0..m {
+                for col in 0..k {
+                    a[a_off + row * k + col] =
+                        (((row * 13 + col * 7 + case * 5) % 17) as f32 - 8.0) * 0.125;
+                }
+            }
+            for row in 0..n {
+                for col in 0..k {
+                    b[b_off + row * k + col] =
+                        (((row * 11 + col * 3 + case * 9) % 19) as f32 - 9.0) * 0.125;
+                }
+            }
+            let mut want = vec![0.0f32; m * n];
+            for row in 0..m {
+                for col in 0..n {
+                    let mut sum = 0.0f32;
+                    for i in 0..k {
+                        sum += a[a_off + row * k + i] * b[b_off + col * k + i];
+                    }
+                    want[row * n + col] = sum;
+                }
+            }
+
+            let wb = storage_bytes(c, bytemuck::cast_slice(&b));
+            let xb = storage_bytes(c, bytemuck::cast_slice(&a));
+            let yb = rw_f32(c, m * n, true);
+            let p = uniform_u32x8(
+                c,
+                [
+                    k.div_ceil(4) as u32,
+                    n as u32,
+                    m as u32,
+                    1.0f32.to_bits(),
+                    a_off as u32,
+                    b_off as u32,
+                    0,
+                    k as u32,
+                ],
+            );
+            let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("dit-coop-odd-tail-test-bg"),
+                layout: &pipe.get_bind_group_layout(0),
+                entries: &[
+                    bind_buf(0, &wb),
+                    bind_buf(1, &xb),
+                    bind_buf(2, &yb),
+                    bind_buf(3, &p),
+                ],
+            });
+            let mut enc = c
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("dit-coop-odd-tail-test"),
+                });
+            {
+                let mut pass = begin_pass(&mut enc);
+                pass.set_pipeline(pipe);
+                pass.set_bind_group(0, &bind, &[]);
+                pass.dispatch_workgroups((n as u32).div_ceil(64), (m as u32).div_ceil(64), 1);
+            }
+            let mut got = vec![0.0f32; m * n];
+            let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("dit-coop-odd-tail-test-stage"),
+                size: (got.len() * 4) as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            assert!(readback(c, enc, &yb, &stage, (got.len() * 4) as u64, &mut got));
+            assert!(
+                got.iter().all(|value| value.is_finite()),
+                "DiT cooperative odd-tail K={k}, M={m}, N={n} produced non-finite output"
+            );
+            let max_d = want
+                .iter()
+                .zip(&got)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_d < 1.0e-5,
+                "DiT cooperative odd-tail K={k}, M={m}, N={n} ≠ CPU: max|Δ| = {max_d}"
+            );
+        }
+    }
+
+    #[test]
     fn wgpu_q8_matvec_matches_cpu_reference() {
         // Force the wgpu path on (Metal-via-wgpu locally; Vulkan on the server).
         unsafe { std::env::set_var("CMF_GPU", "wgpu") };
@@ -31536,7 +32637,7 @@ mod tests {
             return;
         };
         let (rows, cols) = (256usize, 64usize); // cols % 4 == 0
-        // Synthetic int8 weights + row scales + pre-scaled activations.
+                                                // Synthetic int8 weights + row scales + pre-scaled activations.
         let mut q = vec![0i8; rows * cols];
         for (i, v) in q.iter_mut().enumerate() {
             *v = (((i * 37 + 11) % 255) as i32 - 127) as i8;
@@ -34944,7 +36045,11 @@ fn main() {
         let xs: Vec<f32> = (0..n * cols)
             .map(|i| {
                 let b = ((i % 97) as f32 - 48.0) / 48.0;
-                if i % 11 == 0 { b * 3000.0 } else { b }
+                if i % 11 == 0 {
+                    b * 3000.0
+                } else {
+                    b
+                }
             })
             .collect();
         let mk = |bytes: &[u8]| {
@@ -35088,7 +36193,11 @@ fn main() {
         let xs: Vec<f32> = (0..n * cols)
             .map(|i| {
                 let b = ((i % 97) as f32 - 48.0) / 48.0;
-                if i % 11 == 0 { b * 3000.0 } else { b }
+                if i % 11 == 0 {
+                    b * 3000.0
+                } else {
+                    b
+                }
             })
             .collect();
         let mk = |bytes: &[u8]| {
@@ -35273,7 +36382,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping q1t parity test");
             return;
         };
-        use cortiq_core::quant::{GROUP_SIZE, f32_to_f16, q1t_pack};
+        use cortiq_core::quant::{f32_to_f16, q1t_pack, GROUP_SIZE};
         let (rows, cols) = (33usize, 256usize);
         let gpr = cols / GROUP_SIZE;
         let outliers: [(usize, f32); 3] = [(5, 3.0), (300, -2.0), (600, 1.5)]; // sorted
@@ -35337,7 +36446,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping q4b parity test");
             return;
         };
-        use cortiq_core::quant::{GROUP_SIZE, f32_to_f16};
+        use cortiq_core::quant::{f32_to_f16, GROUP_SIZE};
         let (rows, cols) = (33usize, 256usize);
         let n_groups = rows * (cols / GROUP_SIZE);
         let mut payload = vec![0u8; n_groups * 16]; // packed nibbles
@@ -35380,7 +36489,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping q1t GEMM parity test");
             return;
         };
-        use cortiq_core::quant::{GROUP_SIZE, f32_to_f16, q1t_pack};
+        use cortiq_core::quant::{f32_to_f16, q1t_pack, GROUP_SIZE};
         let (b, rows, cols) = (40usize, 64usize, 256usize);
         let gpr = cols / GROUP_SIZE;
         let outliers: [(usize, f32); 4] = [(5, 3.0), (300, -2.0), (600, 1.5), (2000, -1.0)];
@@ -35534,7 +36643,7 @@ fn main() {
         let (rows, cols, b) = (100usize, 128usize, 70usize); // cols % 64 == 0
         let np = cols / 64;
         let jit = |a: usize| ((a * 2654435761usize) >> 13) as u32; // cheap hash → bits
-        // Build the q1 weight blob + a decoded f32 reference weight in lock-step.
+                                                                   // Build the q1 weight blob + a decoded f32 reference weight in lock-step.
         let mut q1w = vec![0u32; rows * np * 3];
         let mut wref = vec![0f32; rows * cols];
         for o in 0..rows {
@@ -37193,7 +38302,11 @@ fn dsv4_frame_salt() -> usize {
 #[inline]
 fn dsv4_salted_li(li: usize) -> usize {
     let salt = dsv4_frame_salt();
-    if salt == 0 { li } else { li + salt * 1_000_000 }
+    if salt == 0 {
+        li
+    } else {
+        li + salt * 1_000_000
+    }
 }
 
 fn dsv4_layer_frame_enc(
@@ -40122,7 +41235,11 @@ fn dsv4_layer_frame_bt_enc(
         let ew_c = p0.comp.as_ref().map_or(
             0,
             |(_, cg)| {
-                if cg.overlap { cg.width / 2 } else { cg.width }
+                if cg.overlap {
+                    cg.width / 2
+                } else {
+                    cg.width
+                }
             },
         );
         let comp_top = p0.window * a.hd + (p0.n_comp + batch.div_ceil(4).max(1) + 2) * ew_c.max(1);
@@ -42103,7 +43220,11 @@ pub fn dsv4_experts_fit(inter: usize, hidden: usize, gu_q2: bool, dn_q2: bool) -
             // is coming.
             let base = (c.vram_budget / 384).clamp(256 * mib, 512 * mib);
             let draft = DRAFT_RESERVE.load(Ordering::Relaxed);
-            if draft > 0 { 2 * base + draft } else { base }
+            if draft > 0 {
+                2 * base + draft
+            } else {
+                base
+            }
         });
     let usable = c.vram_budget.saturating_sub(reserve);
     ((usable.saturating_sub(used)) / per) as usize
@@ -43886,10 +45007,25 @@ pub fn q4tp_qkv(
     if q_out.len() < b * qrows || k_out.len() < b * kvrows || v_out.len() < b * kvrows {
         return false;
     }
+    let q4tp_weight = |idx: usize, rows: usize| -> Option<wgpu::Buffer> {
+        let entry = model.tensors.get(idx)?;
+        if entry.dtype != cortiq_core::TensorDtype::Q4TiledP
+            || entry.shape.len() != 2
+            || entry.shape[0] != rows
+            || entry.shape[1] != hidden
+        {
+            return None;
+        }
+        let payload = cortiq_core::quant::expected_nbytes(
+            cortiq_core::TensorDtype::Q4TiledP,
+            &[rows, hidden],
+        )?;
+        tensor_weight_sized(c, model, idx, rows, payload)
+    };
     let (Some(q1), Some(q2), Some(q3)) = (
-        tensor_weight(c, model, wq, qrows, hidden),
-        tensor_weight(c, model, wk, kvrows, hidden),
-        tensor_weight(c, model, wv, kvrows, hidden),
+        q4tp_weight(wq, qrows),
+        q4tp_weight(wk, kvrows),
+        q4tp_weight(wv, kvrows),
     ) else {
         return false;
     };
@@ -43973,6 +45109,2471 @@ pub fn q4tp_qkv(
     read(&stage_q, qs, &mut q_out[..b * qrows])
         && read(&stage_k, ks, &mut k_out[..b * kvrows])
         && read(&stage_v, ks, &mut v_out[..b * kvrows])
+}
+
+/// Return whether a scratch/storage binding remains valid after the
+/// grow-only allocator rounds it to a power of two.  The real Qwen Image
+/// prefill intermediate is roughly 240 MiB at 5120×12288, below the RTX
+/// 3090's limit, but the refusal is required before `create_buffer` for
+/// smaller/older adapters whose storage binding wall is lower.
+fn qwen_storage_binding_fit(c: &Ctx, bytes: usize, label: &str) -> bool {
+    let Some(need): Option<u64> = bytes.max(4096).try_into().ok() else {
+        return false;
+    };
+    let rounded = need.checked_next_power_of_two().unwrap_or(u64::MAX);
+    let limits = c.device.limits();
+    let max = limits
+        .max_storage_buffer_binding_size
+        .min(limits.max_buffer_size);
+    if rounded <= max {
+        return true;
+    }
+    if std::env::var("CMF_GPU_DEBUG").is_ok() {
+        eprintln!(
+            "qwen q4tp GELU FFN refused: {label} binding {bytes} B rounds to {rounded} B, limit {max} B"
+        );
+    }
+    false
+}
+
+/// Fetch one exact Q4TP projection without the generic dense-byte-size
+/// assumption.  Q4TP's compressed payload is shorter than rows×cols; using
+/// that raw element count here would bind following tensors as weight bytes.
+fn qwen_q4tp_weight(
+    c: &Ctx,
+    model: &Arc<CmfModel>,
+    idx: usize,
+    rows: usize,
+    cols: usize,
+) -> Option<wgpu::Buffer> {
+    let entry = model.tensors.get(idx)?;
+    if entry.dtype != cortiq_core::TensorDtype::Q4TiledP
+        || entry.shape.len() != 2
+        || entry.shape[0] != rows
+        || entry.shape[1] != cols
+    {
+        return None;
+    }
+    let payload =
+        cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[rows, cols])?;
+    if !qwen_storage_binding_fit(c, payload, "Q4TP weight") {
+        return None;
+    }
+    tensor_weight_sized(c, model, idx, rows, payload)
+}
+
+/// Cache a small f32 vector in the existing constant arena.  Biases are
+/// stable across diffusion steps, and using the same fingerprinted cache as
+/// norms prevents one component's recycled mmap address from serving stale
+/// values in a later component.
+fn qwen_f32_const(c: &Ctx, data: &[f32], label: &'static str) -> wgpu::Buffer {
+    let key = (data.as_ptr() as usize, data.len());
+    let fp = fp_bytes(bytemuck::cast_slice(data));
+    let mut cb = c.const_bufs.lock().unwrap();
+    if let Some((b, f)) = cb.get(&key) {
+        if *f == fp {
+            return b.clone();
+        }
+        // A command encoder may still hold a bind group referring to the
+        // old buffer. Updating that buffer here races commands recorded
+        // before this call, so the unchanged-fingerprint fast path above is
+        // the only case that reuses the cached handle. Fall through to
+        // allocate a replacement and replace the cache entry.
+    }
+    let b = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: (data.len().max(1) * 4) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    c.queue.write_buffer(&b, 0, bytemuck::cast_slice(data));
+    cb.insert(key, (b.clone(), fp));
+    b
+}
+
+/// Encode the Qwen bias/GELU epilogue in the same command buffer as its
+/// surrounding GEMMs.  `gelu=true` applies the input bias followed by the
+/// exact tanh approximation; `false` only adds the output projection bias.
+fn encode_qwen_gelu_bias(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    values: &wgpu::Buffer,
+    bias: &wgpu::Buffer,
+    n: usize,
+    width: usize,
+    gelu: bool,
+) {
+    let p = uniform_u32x4(c, [n as u32, width as u32, u32::from(gelu), 0]);
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("qwen-gelu-bias-bg"),
+        layout: &c.qwen_gelu_bias.get_bind_group_layout(0),
+        entries: &[bind_buf(0, values), bind_buf(1, bias), bind_buf(2, &p)],
+    });
+    let mut pass = begin_pass_with(enc, Some("qwen-gelu-bias"), None);
+    pass.set_pipeline(&c.qwen_gelu_bias);
+    pass.set_bind_group(0, &bind, &[]);
+    let wgs = (n as u32).div_ceil(256);
+    pass.dispatch_workgroups(wgs.min(MAX_WG), wgs.div_ceil(MAX_WG), 1);
+}
+
+/// Encode Qwen's affine-free LayerNorm and modulation into a caller-owned
+/// device buffer.  The submission is ordered before the next queue submit,
+/// so the following resident GEMM can consume the result without a fence or
+/// host copy.
+fn qwen_layernorm_mod_keep(
+    c: &Ctx,
+    src: &wgpu::Buffer,
+    modulation: &[f32],
+    dst: &wgpu::Buffer,
+    batch: usize,
+    hidden: usize,
+    eps: f32,
+) -> bool {
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("qwen-layernorm-mod"),
+        });
+    if !encode_qwen_layernorm_mod(c, &mut enc, src, modulation, dst, batch, hidden, eps) {
+        return false;
+    }
+    submit(c, finish_enc(enc));
+    true
+}
+
+/// Encode Qwen's affine-free LayerNorm and shift/scale modulation into a
+/// caller-owned buffer without submitting.  The full Qwen block uses this
+/// form so attention, residual, and MLP remain in one ordered encoder.
+fn encode_qwen_layernorm_mod(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    src: &wgpu::Buffer,
+    modulation: &[f32],
+    dst: &wgpu::Buffer,
+    batch: usize,
+    hidden: usize,
+    eps: f32,
+) -> bool {
+    if modulation.len() != hidden.saturating_mul(2) {
+        return false;
+    }
+    let mod_buf = qwen_f32_const(c, modulation, "qwen-block-mod");
+    let p = uniform_u32x4(c, [batch as u32, hidden as u32, eps.to_bits(), 0]);
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("qwen-layernorm-mod-bg"),
+        layout: &c.qwen_layernorm_mod.get_bind_group_layout(0),
+        entries: &[
+            bind_buf(0, src),
+            bind_buf(1, &mod_buf),
+            bind_buf(2, dst),
+            bind_buf(3, &p),
+        ],
+    });
+    {
+        let mut pass = begin_pass_with(enc, Some("qwen-layernorm-mod"), None);
+        pass.set_pipeline(&c.qwen_layernorm_mod);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(batch as u32, 1, 1);
+    }
+    true
+}
+
+/// Encode the Qwen residual `base + gate * delta` in place in `delta`.
+fn encode_qwen_gated_residual(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    base: &wgpu::Buffer,
+    delta: &wgpu::Buffer,
+    gate: &wgpu::Buffer,
+    batch: usize,
+    hidden: usize,
+) {
+    let p = uniform_u32x4(c, [batch as u32, hidden as u32, 0, 0]);
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("qwen-gated-residual-bg"),
+        layout: &c.qwen_gated_residual.get_bind_group_layout(0),
+        entries: &[
+            bind_buf(0, base),
+            bind_buf(1, delta),
+            bind_buf(2, gate),
+            bind_buf(3, &p),
+        ],
+    });
+    let mut pass = begin_pass_with(enc, Some("qwen-gated-residual"), None);
+    pass.set_pipeline(&c.qwen_gated_residual);
+    pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups_flat(((batch * hidden) as u32).div_ceil(256));
+}
+
+/// Qwen Image's second sub-block with all position-wise work resident on the
+/// device: LayerNorm/modulation, both Q4TP projections, exact tanh-GELU,
+/// output bias and gated residual.  The input and final state cross the host
+/// boundary once each; all intermediate panels are pooled and bounded.
+pub fn qwen_image_mlp_inplace(
+    model: &Arc<CmfModel>,
+    w_in: usize,
+    w_out: usize,
+    data: &mut [f32],
+    batch: usize,
+    hidden: usize,
+    inter: usize,
+    bias_in: &[f32],
+    bias_out: &[f32],
+    modulation: &[f32],
+    gate: &[f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if batch < 32
+        || hidden == 0
+        || inter == 0
+        || hidden % 32 != 0
+        || inter % 32 != 0
+        || data.len() < batch.saturating_mul(hidden)
+        || bias_in.len() != inter
+        || bias_out.len() != hidden
+        || modulation.len() != hidden.saturating_mul(2)
+        || gate.len() != hidden
+    {
+        return false;
+    }
+    let Some(x_len) = batch.checked_mul(hidden) else {
+        return false;
+    };
+    let Some(mid_len) = batch.checked_mul(inter) else {
+        return false;
+    };
+    let Some(x_bytes) = x_len.checked_mul(4) else {
+        return false;
+    };
+    let Some(mid_bytes) = mid_len.checked_mul(4) else {
+        return false;
+    };
+    if !qwen_storage_binding_fit(c, x_bytes, "block input")
+        || !qwen_storage_binding_fit(c, mid_bytes, "block intermediate")
+        || !qwen_storage_binding_fit(c, x_bytes, "block output")
+    {
+        return false;
+    }
+    let Some(w_in_buf) = qwen_q4tp_weight(c, model, w_in, inter, hidden) else {
+        return false;
+    };
+    let Some(w_out_buf) = qwen_q4tp_weight(c, model, w_out, hidden, inter) else {
+        return false;
+    };
+
+    // Use the existing grow-only DiT pool so repeated blocks reuse their
+    // allocations, while unique labels keep this chain independent from the
+    // attention half's q/k/v scratch slots and later VAE stages.
+    let pooled = |els: usize, usage: wgpu::BufferUsages, label: &'static str| {
+        let want = (els.max(1) * 4) as u64;
+        let mut pool = c.dit_pool.lock().unwrap();
+        if let Some((buf, cap)) = pool.get(label) {
+            if *cap >= want {
+                return buf.clone();
+            }
+        }
+        let size = want.next_power_of_two();
+        let buf = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size,
+            usage,
+            mapped_at_creation: false,
+        });
+        pool.insert(label, (buf.clone(), size));
+        buf
+    };
+    let st = wgpu::BufferUsages::STORAGE;
+    let x_buf = pooled(
+        x_len,
+        st | wgpu::BufferUsages::COPY_DST,
+        "qwen-block-x",
+    );
+    let norm_buf = pooled(mid_len.max(x_len), st, "qwen-block-norm");
+    let mid_buf = pooled(mid_len, st | wgpu::BufferUsages::COPY_DST, "qwen-block-mid");
+    let y_buf = pooled(
+        x_len,
+        st | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        "qwen-block-y",
+    );
+    let stage = pooled(
+        x_len,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "qwen-block-stage",
+    );
+    c.queue
+        .write_buffer(&x_buf, 0, bytemuck::cast_slice(&data[..x_len]));
+
+    if !qwen_layernorm_mod_keep(c, &x_buf, modulation, &norm_buf, batch, hidden, 1.0e-6) {
+        return false;
+    }
+    if !qwen_q4tp_gemm_keep(model, w_in, &norm_buf, &mid_buf, batch, inter, hidden) {
+        return false;
+    }
+    let bias_in_buf = qwen_f32_const(c, bias_in, "qwen-block-bias-in");
+    // Keep the command construction explicit so the queue ordering is
+    // visible and no temporary encoder is dropped before finish.
+    let mut gelu_enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("qwen-block-gelu"),
+        });
+    encode_qwen_gelu_bias(c, &mut gelu_enc, &mid_buf, &bias_in_buf, mid_len, inter, true);
+    submit(c, finish_enc(gelu_enc));
+    if !qwen_q4tp_gemm_keep(model, w_out, &mid_buf, &y_buf, batch, hidden, inter) {
+        return false;
+    }
+    let bias_out_buf = qwen_f32_const(c, bias_out, "qwen-block-bias-out");
+    let mut tail_enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("qwen-block-tail"),
+        });
+    encode_qwen_gelu_bias(c, &mut tail_enc, &y_buf, &bias_out_buf, x_len, hidden, false);
+    let gate_buf = qwen_f32_const(c, gate, "qwen-block-gate");
+    encode_qwen_gated_residual(c, &mut tail_enc, &x_buf, &y_buf, &gate_buf, batch, hidden);
+    let ok = readback(c, tail_enc, &y_buf, &stage, x_bytes as u64, &mut data[..x_len]);
+    ok
+}
+
+/// Qwen Image's two-projection tanh-GELU FFN on WGPU.  The input projection,
+/// exact bias+GELU, output projection and output bias share one command
+/// buffer; only the source and final output cross the host/device boundary.
+/// The cooperative f16 GEMM is reused when available, with a device max
+/// reduction for the resident second operand.  The scalar Q4TP GEMM remains
+/// the exact fallback when cooperative matrices, reductions, or binding
+/// limits are unavailable.
+#[allow(clippy::too_many_arguments)]
+pub fn q4tp_gelu_ffn(
+    model: &Arc<CmfModel>,
+    w_in: usize,
+    w_out: usize,
+    xs: &[f32],
+    b: usize,
+    hidden: usize,
+    inter: usize,
+    bias_in: &[f32],
+    bias_out: &[f32],
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let _gate = c.mm_gate.lock().unwrap();
+    if b < 32
+        || hidden == 0
+        || inter == 0
+        || hidden % 32 != 0
+        || inter % 32 != 0
+        || bias_in.len() != inter
+        || bias_out.len() != hidden
+    {
+        return false;
+    }
+    let Some(x_len) = b.checked_mul(hidden) else {
+        return false;
+    };
+    let Some(mid_len) = b.checked_mul(inter) else {
+        return false;
+    };
+    if xs.len() < x_len
+        || out.len() < x_len
+        || x_len > u32::MAX as usize
+        || mid_len > u32::MAX as usize
+    {
+        return false;
+    }
+    let Some(x_bytes) = x_len.checked_mul(4) else {
+        return false;
+    };
+    let Some(mid_bytes) = mid_len.checked_mul(4) else {
+        return false;
+    };
+    // Scratch::ensure rounds every slot to a power of two.  Check all three
+    // live panels before touching the weight cache or creating any buffers.
+    if !qwen_storage_binding_fit(c, x_bytes, "input")
+        || !qwen_storage_binding_fit(c, mid_bytes, "intermediate")
+        || !qwen_storage_binding_fit(c, x_bytes, "output")
+    {
+        return false;
+    }
+    let Some(w_in_buf) = qwen_q4tp_weight(c, model, w_in, inter, hidden) else {
+        return false;
+    };
+    let Some(w_out_buf) = qwen_q4tp_weight(c, model, w_out, hidden, inter) else {
+        return false;
+    };
+    let bias_in_buf = qwen_f32_const(c, bias_in, "qwen-mlp-bias-in");
+    let bias_out_buf = qwen_f32_const(c, bias_out, "qwen-mlp-bias-out");
+
+    let st = wgpu::BufferUsages::STORAGE;
+    let (x_buf, mid_buf, y_buf, stage, planes, amax_parts) = {
+        let mut sc = c.scratch.lock().unwrap();
+        let x_buf = Scratch::ensure(
+            &c.device,
+            &mut sc.xs,
+            x_bytes as u64,
+            st | wgpu::BufferUsages::COPY_DST,
+            "qwen-mlp-x",
+        );
+        let mid_buf = Scratch::ensure(&c.device, &mut sc.g, mid_bytes as u64, st, "qwen-mlp-mid");
+        let y_buf = Scratch::ensure(
+            &c.device,
+            &mut sc.y,
+            x_bytes as u64,
+            st | wgpu::BufferUsages::COPY_SRC,
+            "qwen-mlp-y",
+        );
+        let stage = Scratch::ensure(
+            &c.device,
+            &mut sc.stage,
+            x_bytes as u64,
+            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            "qwen-mlp-stage",
+        );
+        let coop = c.q4tp_dq_f16.is_some()
+            && c.q4tp_mm_coop_f16.is_some()
+            && (c.act_absmax.is_some() || (c.act_amax_part.is_some() && c.act_amax_fold.is_some()))
+            && std::env::var("CMF_QWEN_IMAGE_FUSED_MLP_COOP").as_deref() != Ok("0");
+        let planes = if coop {
+            let p1 = dq_f16_plane_slot(c, &mut sc, &w_in_buf, inter, hidden, false);
+            let p2 = dq_f16_plane_slot(c, &mut sc, &w_out_buf, hidden, inter, true);
+            match (p1, p2) {
+                (Some(p1), Some(p2)) => Some((p1, p2)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        // `encode_act_absmax_with` can reuse these partials without trying to
+        // lock `scratch` recursively while this scope owns it.
+        let amax_parts =
+            if planes.is_some() && c.act_amax_part.is_some() && c.act_amax_fold.is_some() {
+                Some(Scratch::ensure(
+                    &c.device,
+                    &mut sc.amaxp,
+                    (512 * 4) as u64,
+                    st,
+                    "qwen-mlp-amax-parts",
+                ))
+            } else {
+                None
+            };
+        c.queue
+            .write_buffer(&x_buf, 0, bytemuck::cast_slice(&xs[..x_len]));
+        (x_buf, mid_buf, y_buf, stage, planes, amax_parts)
+    };
+
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("qwen-gelu-ffn"),
+        });
+    let use_coop = planes.is_some();
+    if let Some(((plane1, bind_dq1), (plane2, bind_dq2))) = planes.as_ref() {
+        let dq = c.q4tp_dq_f16.as_ref().unwrap();
+        for (plane_bind, rows, cols) in [(bind_dq1, inter, hidden), (bind_dq2, hidden, inter)] {
+            let mut pass = begin_pass_with(&mut enc, Some("qwen-q4tp-dequant"), None);
+            pass.set_pipeline(dq);
+            pass.set_bind_group(0, plane_bind, &[]);
+            let Some(pairs) = rows.checked_mul(cols).and_then(|n| n.checked_div(2)) else {
+                return false;
+            };
+            let Ok(pairs_u32) = u32::try_from(pairs) else {
+                return false;
+            };
+            let wgs = pairs_u32.div_ceil(256);
+            pass.dispatch_workgroups(wgs.min(MAX_WG), wgs.div_ceil(MAX_WG), 1);
+        }
+        let mx = xs[..x_len].iter().fold(
+            0.0f32,
+            |m, &v| if v.is_finite() { m.max(v.abs()) } else { m },
+        );
+        let ascale = if mx > 1000.0 { 1000.0 / mx } else { 1.0 };
+        encode_q4_tile_mm_full(
+            c,
+            &mut enc,
+            c.q4tp_mm_coop_f16.as_ref().unwrap(),
+            plane1,
+            &x_buf,
+            &mid_buf,
+            inter,
+            hidden,
+            b,
+            ascale,
+            None,
+        );
+        encode_qwen_gelu_bias(c, &mut enc, &mid_buf, &bias_in_buf, mid_len, inter, true);
+        let asc = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("qwen-mlp-ascale"),
+            size: 4,
+            usage: st,
+            mapped_at_creation: false,
+        });
+        if !encode_act_absmax_with(c, &mut enc, &mid_buf, mid_len, &asc, amax_parts.as_ref()) {
+            return false;
+        }
+        encode_q4_tile_mm_full(
+            c,
+            &mut enc,
+            c.q4tp_mm_coop_f16.as_ref().unwrap(),
+            plane2,
+            &mid_buf,
+            &y_buf,
+            hidden,
+            inter,
+            b,
+            0.0,
+            Some(&asc),
+        );
+    } else {
+        encode_q4_tile_mm(
+            c, &mut enc, &c.q4tp_mm, &w_in_buf, &x_buf, &mid_buf, inter, hidden, b,
+        );
+        encode_qwen_gelu_bias(c, &mut enc, &mid_buf, &bias_in_buf, mid_len, inter, true);
+        encode_q4_tile_mm(
+            c, &mut enc, &c.q4tp_mm, &w_out_buf, &mid_buf, &y_buf, hidden, inter, b,
+        );
+    }
+    encode_qwen_gelu_bias(c, &mut enc, &y_buf, &bias_out_buf, x_len, hidden, false);
+    let ok = readback(c, enc, &y_buf, &stage, x_bytes as u64, &mut out[..x_len]);
+    if ok && std::env::var("CMF_GPU_DEBUG").is_ok() {
+        static SEEN: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashSet<(usize, usize, bool)>>,
+        > = std::sync::OnceLock::new();
+        let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+        if seen.lock().unwrap().insert((hidden, inter, use_coop)) {
+            let limits = c.device.limits();
+            eprintln!(
+                "qwen q4tp GELU FFN: fused {} b={b} hidden={hidden} inter={inter} mid_bytes={mid_bytes} storage_limit={} max_buffer={}",
+                if use_coop { "coop_f16" } else { "scalar" },
+                limits.max_storage_buffer_binding_size,
+                limits.max_buffer_size,
+            );
+        }
+    }
+    ok
+}
+
+/// Encode Qwen's joint attention from already-packed head-major planes.
+/// Unlike `dit_attention_inner`, this helper never submits or reads back:
+/// the caller owns the encoder and can append both output projections and
+/// the MLP before the one final fence. The layouts and kernels are the
+/// established DiT attention path; only the ownership of the encoder and
+/// the explicit head-major buffers differ.
+#[allow(clippy::too_many_lines)]
+fn qwen_attention_encode(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    q: &wgpu::Buffer,
+    k: &wgpu::Buffer,
+    v: &wgpu::Buffer,
+    heads: usize,
+    total: usize,
+    head_dim: usize,
+) -> Option<wgpu::Buffer> {
+    if heads == 0 || total == 0 || head_dim == 0 || head_dim % 2 != 0 {
+        return None;
+    }
+    let Some(hidden) = heads.checked_mul(head_dim) else {
+        return None;
+    };
+    let Some(head_bytes) = total
+        .checked_mul(head_dim)
+        .and_then(|n| n.checked_mul(4))
+    else {
+        return None;
+    };
+    let Some(total_bytes) = total.checked_mul(hidden).and_then(|n| n.checked_mul(4)) else {
+        return None;
+    };
+    let Some(score_bytes) = total.checked_mul(total).and_then(|n| n.checked_mul(4)) else {
+        return None;
+    };
+    if !qwen_storage_binding_fit(c, head_bytes, "chain attention head")
+        || !qwen_storage_binding_fit(c, total_bytes, "chain attention output")
+        || !qwen_storage_binding_fit(c, score_bytes, "chain attention scores")
+    {
+        return None;
+    }
+    if (head_bytes as u64) > q.size()
+        || (head_bytes as u64) > k.size()
+        || (head_bytes as u64) > v.size()
+    {
+        return None;
+    }
+
+    let pooled = |bytes: usize, usage: wgpu::BufferUsages, label: &'static str| {
+        let want = bytes.max(4) as u64;
+        let mut pool = c.dit_pool.lock().unwrap();
+        if let Some((buf, cap)) = pool.get(label) {
+            if *cap >= want {
+                return buf.clone();
+            }
+        }
+        let size = want.next_power_of_two();
+        let buf = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size,
+            usage,
+            mapped_at_creation: false,
+        });
+        pool.insert(label, (buf.clone(), size));
+        buf
+    };
+    let st = wgpu::BufferUsages::STORAGE;
+    let score = pooled(score_bytes, st, "qwen-chain-scores");
+    let panel = pooled(total_bytes, st, "qwen-chain-panel");
+    let output = pooled(
+        total_bytes,
+        st | wgpu::BufferUsages::COPY_SRC,
+        "qwen-chain-attn",
+    );
+    let vt = if c.dit_v_transpose.is_some()
+        && c.dit_gemm_coop.is_some()
+        && std::env::var("CMF_DIT_ATTN_COOP").as_deref() != Ok("0")
+        && std::env::var("CMF_DIT_PV_COOP").as_deref() != Ok("0")
+        && head_dim % 4 == 0
+    {
+        Some(pooled(total_bytes, st, "qwen-chain-vt"))
+    } else {
+        None
+    };
+
+    let params = |m: u32, k: u32, n: u32, scale: f32| {
+        uniform_u32x8(c, [m, k, n, scale.to_bits(), 0, 0, 0, 0])
+    };
+    let p_qk = params(total as u32, head_dim as u32, total as u32, 1.0 / (head_dim as f32).sqrt());
+    let p_sm = params(total as u32, head_dim as u32, total as u32, 1.0);
+    let p_pv = params(total as u32, total as u32, head_dim as u32, 1.0);
+    let head = head_bytes as u64;
+    let score_len = score_bytes as u64;
+
+    // The transpose pipeline has a distinct auto layout and entry point.
+    if let (Some(vt), Some(tp)) = (vt.as_ref(), c.dit_v_transpose.as_ref()) {
+        let p = uniform_u32x4(c, [total as u32, heads as u32, head_dim as u32, 0]);
+        let bg = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("qwen-chain-vt-bg"),
+            layout: &tp.get_bind_group_layout(0),
+            entries: &[bind_buf(0, v), bind_buf(1, vt), bind_buf(2, &p)],
+        });
+        let mut pass = begin_pass_with(enc, Some("qwen-chain-vt"), None);
+        pass.set_pipeline(tp);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups_flat(((heads * total * head_dim) as u32).div_ceil(256));
+    }
+
+    let bind = |pipe: &wgpu::ComputePipeline,
+                a: &wgpu::Buffer,
+                ao: u64,
+                al: u64,
+                b: &wgpu::Buffer,
+                bo: u64,
+                bl: u64,
+                cc: &wgpu::Buffer,
+                co: u64,
+                cl: u64,
+                pp: &wgpu::Buffer|
+     -> wgpu::BindGroup {
+        c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("qwen-chain-attn-bg"),
+            layout: &pipe.get_bind_group_layout(0),
+            entries: &[
+                bind_buf_off(0, a, ao, al),
+                bind_buf_off(1, b, bo, bl),
+                bind_buf_off(2, cc, co, cl),
+                bind_buf(3, pp),
+            ],
+        })
+    };
+
+    for h in 0..heads {
+        let hoff = h as u64 * head;
+        let p_pv_coop = match (c.dit_gemm_coop.as_ref(), vt.as_ref()) {
+            (Some(pipe), Some(vt)) => {
+                let p = uniform_u32x8(
+                    c,
+                    [
+                        (total / 4) as u32,
+                        head_dim as u32,
+                        total as u32,
+                        1.0f32.to_bits(),
+                        0,
+                        0,
+                        0,
+                        total as u32,
+                    ],
+                );
+                Some(c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("qwen-chain-pv-coop-bg"),
+                    layout: &pipe.get_bind_group_layout(0),
+                    entries: &[
+                        bind_buf_off(0, vt, hoff, head),
+                        bind_buf(1, &score),
+                        bind_buf_off(2, &panel, hoff, head),
+                        bind_buf(3, &p),
+                    ],
+                }))
+            }
+            _ => None,
+        };
+        let bg_qk = bind(
+            &c.dit_qk,
+            q,
+            hoff,
+            head,
+            k,
+            hoff,
+            head,
+            &score,
+            0,
+            score_len,
+            &p_qk,
+        );
+        let bg_sm = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("qwen-chain-softmax-bg"),
+            layout: &c.dit_softmax.get_bind_group_layout(0),
+            entries: &[bind_buf(2, &score), bind_buf(3, &p_sm)],
+        });
+        let bg_pv = bind(
+            &c.dit_pv,
+            &score,
+            0,
+            score_len,
+            v,
+            hoff,
+            head,
+            &panel,
+            hoff,
+            head,
+            &p_pv,
+        );
+        {
+            // Cooperative QK converts activations to f16; keep this measured
+            // accuracy-sensitive product on the scalar F32 path. PV can use
+            // cooperative math independently after its odd-tail fix.
+            let mut pass = begin_pass_with(enc, Some("qwen-chain-qk"), None);
+            pass.set_pipeline(&c.dit_qk);
+            pass.set_bind_group(0, &bg_qk, &[]);
+            pass.dispatch_workgroups((total as u32).div_ceil(64), (total as u32).div_ceil(64), 1);
+        }
+        {
+            let mut pass = begin_pass_with(enc, Some("qwen-chain-softmax"), None);
+            pass.set_pipeline(&c.dit_softmax);
+            pass.set_bind_group(0, &bg_sm, &[]);
+            pass.dispatch_workgroups(total as u32, 1, 1);
+        }
+        {
+            let mut pass = begin_pass_with(enc, Some("qwen-chain-pv"), None);
+            if let (Some(pipe), Some(bg)) = (c.dit_gemm_coop.as_ref(), p_pv_coop.as_ref()) {
+                pass.set_pipeline(pipe);
+                pass.set_bind_group(0, bg, &[]);
+            } else {
+                pass.set_pipeline(&c.dit_pv);
+                pass.set_bind_group(0, &bg_pv, &[]);
+            }
+            pass.dispatch_workgroups((head_dim as u32).div_ceil(64), (total as u32).div_ceil(64), 1);
+        }
+    }
+    let p_un = uniform_u32x8(c, [heads as u32, total as u32, head_dim as u32, 1, 0, 0, 0, 0]);
+    let bg_un = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("qwen-chain-unstack-bg"),
+        layout: &c.dit_unstack.get_bind_group_layout(0),
+        entries: &[bind_buf(0, &panel), bind_buf(2, &output), bind_buf(3, &p_un)],
+    });
+    let mut pass = begin_pass_with(enc, Some("qwen-chain-unstack"), None);
+    pass.set_pipeline(&c.dit_unstack);
+    pass.set_bind_group(0, &bg_un, &[]);
+    pass.dispatch_workgroups_flat(((heads * total * head_dim) as u32).div_ceil(256));
+    Some(output)
+}
+
+/// Keep one complete Qwen double-stream block in one command encoder.  The
+/// input norm/mod panels are prepared by the native caller; from those
+/// panels through QKV, RoPE/attention, output projections, both gated
+/// residuals and both tanh-GELU MLPs, no activation is returned to the host.
+/// A refusal happens before the caller mutates its state, preserving the
+/// portable per-op path for unsupported devices/codecs.
+#[allow(clippy::too_many_lines)]
+pub fn qwen_image_block(
+    model: &Arc<CmfModel>,
+    a: &mut crate::gpu::QwenImageBlockArgs<'_>,
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let hidden = a.heads.checked_mul(a.head_dim).unwrap_or(0);
+    let total = a.image_tokens.checked_add(a.text_tokens).unwrap_or(0);
+    let pairs = a.head_dim / 2;
+    let image_len = a.image_tokens.checked_mul(hidden).unwrap_or(0);
+    let text_len = a.text_tokens.checked_mul(hidden).unwrap_or(0);
+    let image_bytes = image_len.checked_mul(4).unwrap_or(0);
+    let text_bytes = text_len.checked_mul(4).unwrap_or(0);
+    let total_bytes = total.checked_mul(hidden).and_then(|n| n.checked_mul(4)).unwrap_or(0);
+    if hidden == 0
+        || a.image_tokens == 0
+        || total == 0
+        || a.head_dim == 0
+        || a.head_dim > 256
+        || a.head_dim % 2 != 0
+        || a.image.len() != image_len
+        || a.text.len() != text_len
+        || a.image_norm.len() != image_len
+        || a.text_norm.len() != text_len
+        || a.image_cos.len() != a.image_tokens.saturating_mul(pairs)
+        || a.image_sin.len() != a.image_cos.len()
+        || a.text_cos.len() != a.text_tokens.saturating_mul(pairs)
+        || a.text_sin.len() != a.text_cos.len()
+        || a.image_q_norm.len() != a.head_dim
+        || a.image_k_norm.len() != a.head_dim
+        || a.text_q_norm.len() != a.head_dim
+        || a.text_k_norm.len() != a.head_dim
+        || a.image_q_bias.len() != hidden
+        || a.image_k_bias.len() != hidden
+        || a.image_v_bias.len() != hidden
+        || a.text_q_bias.len() != hidden
+        || a.text_k_bias.len() != hidden
+        || a.text_v_bias.len() != hidden
+        || a.image_out_bias.len() != hidden
+        || a.text_out_bias.len() != hidden
+        || a.image_attn_gate.len() != hidden
+        || a.text_attn_gate.len() != hidden
+        || a.image_mlp_in_bias.len() == 0
+        || a.text_mlp_in_bias.len() == 0
+        || a.image_mlp_out_bias.len() != hidden
+        || a.text_mlp_out_bias.len() != hidden
+        || a.image_mlp_mod.len() != hidden.saturating_mul(2)
+        || a.text_mlp_mod.len() != hidden.saturating_mul(2)
+        || a.image_mlp_gate.len() != hidden
+        || a.text_mlp_gate.len() != hidden
+    {
+        return false;
+    }
+    let Some(image_mlp_entry) = model.tensors.get(a.image_mlp_in) else {
+        return false;
+    };
+    let inter = image_mlp_entry.shape.first().copied().unwrap_or(0);
+    if inter == 0 || inter % 32 != 0 || hidden % 32 != 0 {
+        return false;
+    }
+    if a.image_mlp_in_bias.len() != inter || a.text_mlp_in_bias.len() != inter {
+        return false;
+    }
+    let dims_ok = |idx: usize, rows: usize, cols: usize| {
+        model.tensors.get(idx).is_some_and(|e| {
+            e.dtype == cortiq_core::TensorDtype::Q4TiledP
+                && e.shape.as_slice() == [rows, cols]
+        })
+    };
+    if !dims_ok(a.image_q, hidden, hidden)
+        || !dims_ok(a.image_k, hidden, hidden)
+        || !dims_ok(a.image_v, hidden, hidden)
+        || !dims_ok(a.text_q, hidden, hidden)
+        || !dims_ok(a.text_k, hidden, hidden)
+        || !dims_ok(a.text_v, hidden, hidden)
+        || !dims_ok(a.image_out, hidden, hidden)
+        || !dims_ok(a.text_out, hidden, hidden)
+        || !dims_ok(a.image_mlp_in, inter, hidden)
+        || !dims_ok(a.image_mlp_out, hidden, inter)
+        || !dims_ok(a.text_mlp_in, inter, hidden)
+        || !dims_ok(a.text_mlp_out, hidden, inter)
+    {
+        return false;
+    }
+    if !qwen_storage_binding_fit(c, image_bytes, "chain image state")
+        || (text_len > 0 && !qwen_storage_binding_fit(c, text_bytes, "chain text state"))
+        || !qwen_storage_binding_fit(c, total_bytes, "chain joint state")
+        || !qwen_storage_binding_fit(
+            c,
+            a.image_tokens.saturating_mul(inter).saturating_mul(4),
+            "chain image MLP",
+        )
+        || (a.text_tokens > 0
+            && !qwen_storage_binding_fit(
+                c,
+                a.text_tokens.saturating_mul(inter).saturating_mul(4),
+                "chain text MLP",
+            ))
+    {
+        return false;
+    }
+
+    // The existing matrix path serializes on this gate because its weight
+    // and plane caches are shared.  The encoder-taking helper below never
+    // takes it again, so all eight attention and four MLP projections can be
+    // assembled under one lock without the historical recursive deadlock.
+    let _gate = c.mm_gate.lock().unwrap();
+    let pooled = |bytes: usize, usage: wgpu::BufferUsages, label: &'static str| {
+        let want = bytes.max(4) as u64;
+        let mut pool = c.dit_pool.lock().unwrap();
+        if let Some((buf, cap)) = pool.get(label) {
+            if *cap >= want {
+                return buf.clone();
+            }
+        }
+        let size = want.next_power_of_two();
+        let buf = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size,
+            usage,
+            mapped_at_creation: false,
+        });
+        pool.insert(label, (buf.clone(), size));
+        buf
+    };
+    let st = wgpu::BufferUsages::STORAGE;
+    let img_state = pooled(
+        image_bytes,
+        st | wgpu::BufferUsages::COPY_DST,
+        "qwen-chain-img-state",
+    );
+    let txt_state = pooled(
+        text_bytes,
+        st | wgpu::BufferUsages::COPY_DST,
+        "qwen-chain-txt-state",
+    );
+    let img_norm = pooled(
+        image_bytes,
+        st | wgpu::BufferUsages::COPY_DST,
+        "qwen-chain-img-norm",
+    );
+    let txt_norm = pooled(
+        text_bytes,
+        st | wgpu::BufferUsages::COPY_DST,
+        "qwen-chain-txt-norm",
+    );
+    let img_q = pooled(image_bytes, st, "qwen-chain-img-q");
+    let img_k = pooled(image_bytes, st, "qwen-chain-img-k");
+    let img_v = pooled(image_bytes, st, "qwen-chain-img-v");
+    let txt_q = pooled(text_bytes, st, "qwen-chain-txt-q");
+    let txt_k = pooled(text_bytes, st, "qwen-chain-txt-k");
+    let txt_v = pooled(text_bytes, st, "qwen-chain-txt-v");
+    let joint_q = pooled(total_bytes, st, "qwen-chain-joint-q");
+    let joint_k = pooled(total_bytes, st, "qwen-chain-joint-k");
+    let joint_v = pooled(total_bytes, st, "qwen-chain-joint-v");
+    let img_attn = pooled(
+        image_bytes,
+        st | wgpu::BufferUsages::COPY_SRC,
+        "qwen-chain-img-attn",
+    );
+    let txt_attn = pooled(
+        text_bytes,
+        st | wgpu::BufferUsages::COPY_SRC,
+        "qwen-chain-txt-attn",
+    );
+    let img_norm2 = pooled(image_bytes, st, "qwen-chain-img-norm2");
+    let txt_norm2 = pooled(text_bytes, st, "qwen-chain-txt-norm2");
+    let image_mid_bytes = a.image_tokens.saturating_mul(inter).saturating_mul(4);
+    let text_mid_bytes = a.text_tokens.saturating_mul(inter).saturating_mul(4);
+    let img_mid = pooled(image_mid_bytes, st, "qwen-chain-img-mid");
+    let txt_mid = pooled(text_mid_bytes, st, "qwen-chain-txt-mid");
+    let img_out = pooled(
+        image_bytes,
+        st | wgpu::BufferUsages::COPY_SRC,
+        "qwen-chain-img-out",
+    );
+    let txt_out = pooled(
+        text_bytes,
+        st | wgpu::BufferUsages::COPY_SRC,
+        "qwen-chain-txt-out",
+    );
+    let stage = pooled(
+        image_bytes.saturating_add(text_bytes),
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "qwen-chain-stage",
+    );
+    c.queue
+        .write_buffer(&img_state, 0, bytemuck::cast_slice(a.image));
+    c.queue
+        .write_buffer(&img_norm, 0, bytemuck::cast_slice(a.image_norm));
+    if a.text_tokens > 0 {
+        c.queue
+            .write_buffer(&txt_state, 0, bytemuck::cast_slice(a.text));
+        c.queue
+            .write_buffer(&txt_norm, 0, bytemuck::cast_slice(a.text_norm));
+    }
+
+    let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("qwen-chain-block"),
+    });
+    let _merge_guard = PassMergeGuard::new(&enc);
+    if !qwen_q4tp_gemm_encode(
+        c,
+        model,
+        a.image_q,
+        &img_norm,
+        0,
+        &img_q,
+        a.image_tokens,
+        hidden,
+        hidden,
+        &mut enc,
+    ) || !qwen_q4tp_gemm_encode(
+        c,
+        model,
+        a.image_k,
+        &img_norm,
+        0,
+        &img_k,
+        a.image_tokens,
+        hidden,
+        hidden,
+        &mut enc,
+    ) || !qwen_q4tp_gemm_encode(
+        c,
+        model,
+        a.image_v,
+        &img_norm,
+        0,
+        &img_v,
+        a.image_tokens,
+        hidden,
+        hidden,
+        &mut enc,
+    ) {
+        return false;
+    }
+    if a.text_tokens > 0
+        && (!qwen_q4tp_gemm_encode(
+            c,
+            model,
+            a.text_q,
+            &txt_norm,
+            0,
+            &txt_q,
+            a.text_tokens,
+            hidden,
+            hidden,
+            &mut enc,
+        ) || !qwen_q4tp_gemm_encode(
+            c,
+            model,
+            a.text_k,
+            &txt_norm,
+            0,
+            &txt_k,
+            a.text_tokens,
+            hidden,
+            hidden,
+            &mut enc,
+        ) || !qwen_q4tp_gemm_encode(
+            c,
+            model,
+            a.text_v,
+            &txt_norm,
+            0,
+            &txt_v,
+            a.text_tokens,
+            hidden,
+            hidden,
+            &mut enc,
+        ))
+    {
+        return false;
+    }
+
+    let mut img_bias = Vec::with_capacity(3 * hidden);
+    img_bias.extend_from_slice(a.image_q_bias);
+    img_bias.extend_from_slice(a.image_k_bias);
+    img_bias.extend_from_slice(a.image_v_bias);
+    let mut txt_bias = Vec::with_capacity(3 * hidden);
+    txt_bias.extend_from_slice(a.text_q_bias);
+    txt_bias.extend_from_slice(a.text_k_bias);
+    txt_bias.extend_from_slice(a.text_v_bias);
+    let img_bias_b = qwen_f32_const(c, &img_bias, "qwen-chain-img-qkv-bias");
+    let txt_bias_b = qwen_f32_const(c, &txt_bias, "qwen-chain-txt-qkv-bias");
+    let img_qn_b = qwen_f32_const(c, a.image_q_norm, "qwen-chain-img-qnorm");
+    let img_kn_b = qwen_f32_const(c, a.image_k_norm, "qwen-chain-img-knorm");
+    let txt_qn_b = qwen_f32_const(c, a.text_q_norm, "qwen-chain-txt-qnorm");
+    let txt_kn_b = qwen_f32_const(c, a.text_k_norm, "qwen-chain-txt-knorm");
+    let img_cos_b = qwen_f32_const(c, a.image_cos, "qwen-chain-img-cos");
+    let img_sin_b = qwen_f32_const(c, a.image_sin, "qwen-chain-img-sin");
+    let txt_cos_b = qwen_f32_const(c, a.text_cos, "qwen-chain-txt-cos");
+    let txt_sin_b = qwen_f32_const(c, a.text_sin, "qwen-chain-txt-sin");
+    let rope_p = uniform_u32x8(
+        c,
+        [
+            a.image_tokens as u32,
+            a.text_tokens as u32,
+            a.heads as u32,
+            a.head_dim as u32,
+            hidden as u32,
+            total as u32,
+            pairs as u32,
+            0,
+        ],
+    );
+    let rope_bg = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("qwen-chain-rope-bg"),
+        layout: &c.qwen_rope_pack.get_bind_group_layout(0),
+        entries: &[
+            bind_buf(0, &img_q),
+            bind_buf(1, &img_k),
+            bind_buf(2, &img_v),
+            bind_buf(3, &txt_q),
+            bind_buf(4, &txt_k),
+            bind_buf(5, &txt_v),
+            bind_buf(6, &img_bias_b),
+            bind_buf(7, &txt_bias_b),
+            bind_buf(8, &img_qn_b),
+            bind_buf(9, &img_kn_b),
+            bind_buf(10, &txt_qn_b),
+            bind_buf(11, &txt_kn_b),
+            bind_buf(12, &img_cos_b),
+            bind_buf(13, &img_sin_b),
+            bind_buf(14, &txt_cos_b),
+            bind_buf(15, &txt_sin_b),
+            bind_buf(16, &joint_q),
+            bind_buf(17, &joint_k),
+            bind_buf(18, &joint_v),
+            bind_buf(19, &rope_p),
+        ],
+    });
+    let jobs = total.saturating_mul(a.heads) as u32;
+    let mut pass = begin_pass_with(&mut enc, Some("qwen-chain-rope"), None);
+    pass.set_pipeline(&c.qwen_rope_pack);
+    pass.set_bind_group(0, &rope_bg, &[]);
+    pass.dispatch_workgroups(jobs.min(65_535), jobs.div_ceil(65_535), 1);
+    drop(pass);
+    let Some(attn) = qwen_attention_encode(
+        c,
+        &mut enc,
+        &joint_q,
+        &joint_k,
+        &joint_v,
+        a.heads,
+        total,
+        a.head_dim,
+    ) else {
+        return false;
+    };
+    if !qwen_q4tp_gemm_encode(
+        c,
+        model,
+        a.image_out,
+        &attn,
+        text_bytes as u64,
+        &img_attn,
+        a.image_tokens,
+        hidden,
+        hidden,
+        &mut enc,
+    ) || (a.text_tokens > 0
+        && !qwen_q4tp_gemm_encode(
+            c,
+            model,
+            a.text_out,
+            &attn,
+            0,
+            &txt_attn,
+            a.text_tokens,
+            hidden,
+            hidden,
+            &mut enc,
+        ))
+    {
+        return false;
+    }
+    let img_out_bias = qwen_f32_const(c, a.image_out_bias, "qwen-chain-img-out-bias");
+    let txt_out_bias = qwen_f32_const(c, a.text_out_bias, "qwen-chain-txt-out-bias");
+    encode_qwen_gelu_bias(
+        c,
+        &mut enc,
+        &img_attn,
+        &img_out_bias,
+        image_len,
+        hidden,
+        false,
+    );
+    if a.text_tokens > 0 {
+        encode_qwen_gelu_bias(
+            c,
+            &mut enc,
+            &txt_attn,
+            &txt_out_bias,
+            text_len,
+            hidden,
+            false,
+        );
+    }
+    let img_attn_gate = qwen_f32_const(c, a.image_attn_gate, "qwen-chain-img-attn-gate");
+    encode_qwen_gated_residual(
+        c,
+        &mut enc,
+        &img_state,
+        &img_attn,
+        &img_attn_gate,
+        a.image_tokens,
+        hidden,
+    );
+    if a.text_tokens > 0 {
+        let txt_attn_gate = qwen_f32_const(c, a.text_attn_gate, "qwen-chain-txt-attn-gate");
+        encode_qwen_gated_residual(
+            c,
+            &mut enc,
+            &txt_state,
+            &txt_attn,
+            &txt_attn_gate,
+            a.text_tokens,
+            hidden,
+        );
+    }
+    if !encode_qwen_layernorm_mod(
+        c,
+        &mut enc,
+        &img_attn,
+        a.image_mlp_mod,
+        &img_norm2,
+        a.image_tokens,
+        hidden,
+        1.0e-6,
+    ) {
+        return false;
+    }
+    if a.text_tokens > 0
+        && !encode_qwen_layernorm_mod(
+            c,
+            &mut enc,
+            &txt_attn,
+            a.text_mlp_mod,
+            &txt_norm2,
+            a.text_tokens,
+            hidden,
+            1.0e-6,
+        )
+    {
+        return false;
+    }
+    if !qwen_q4tp_gemm_encode(
+        c,
+        model,
+        a.image_mlp_in,
+        &img_norm2,
+        0,
+        &img_mid,
+        a.image_tokens,
+        inter,
+        hidden,
+        &mut enc,
+    ) {
+        return false;
+    }
+    let img_mlp_in_bias = qwen_f32_const(c, a.image_mlp_in_bias, "qwen-chain-img-mlp-in-bias");
+    encode_qwen_gelu_bias(
+        c,
+        &mut enc,
+        &img_mid,
+        &img_mlp_in_bias,
+        image_len / hidden * inter,
+        inter,
+        true,
+    );
+    if !qwen_q4tp_gemm_encode(
+        c,
+        model,
+        a.image_mlp_out,
+        &img_mid,
+        0,
+        &img_out,
+        a.image_tokens,
+        hidden,
+        inter,
+        &mut enc,
+    ) {
+        return false;
+    }
+    let img_mlp_out_bias = qwen_f32_const(c, a.image_mlp_out_bias, "qwen-chain-img-mlp-out-bias");
+    encode_qwen_gelu_bias(
+        c,
+        &mut enc,
+        &img_out,
+        &img_mlp_out_bias,
+        image_len,
+        hidden,
+        false,
+    );
+    let img_mlp_gate = qwen_f32_const(c, a.image_mlp_gate, "qwen-chain-img-mlp-gate");
+    encode_qwen_gated_residual(
+        c,
+        &mut enc,
+        &img_attn,
+        &img_out,
+        &img_mlp_gate,
+        a.image_tokens,
+        hidden,
+    );
+    if a.text_tokens > 0 {
+        if !qwen_q4tp_gemm_encode(
+            c,
+            model,
+            a.text_mlp_in,
+            &txt_norm2,
+            0,
+            &txt_mid,
+            a.text_tokens,
+            inter,
+            hidden,
+            &mut enc,
+        ) {
+            return false;
+        }
+        let txt_mlp_in_bias = qwen_f32_const(c, a.text_mlp_in_bias, "qwen-chain-txt-mlp-in-bias");
+        encode_qwen_gelu_bias(
+            c,
+            &mut enc,
+            &txt_mid,
+            &txt_mlp_in_bias,
+            text_len / hidden * inter,
+            inter,
+            true,
+        );
+        if !qwen_q4tp_gemm_encode(
+            c,
+            model,
+            a.text_mlp_out,
+            &txt_mid,
+            0,
+            &txt_out,
+            a.text_tokens,
+            hidden,
+            inter,
+            &mut enc,
+        ) {
+            return false;
+        }
+        let txt_mlp_out_bias = qwen_f32_const(c, a.text_mlp_out_bias, "qwen-chain-txt-mlp-out-bias");
+        encode_qwen_gelu_bias(
+            c,
+            &mut enc,
+            &txt_out,
+            &txt_mlp_out_bias,
+            text_len,
+            hidden,
+            false,
+        );
+        let txt_mlp_gate = qwen_f32_const(c, a.text_mlp_gate, "qwen-chain-txt-mlp-gate");
+        encode_qwen_gated_residual(
+            c,
+            &mut enc,
+            &txt_attn,
+            &txt_out,
+            &txt_mlp_gate,
+            a.text_tokens,
+            hidden,
+        );
+    }
+    drop(_merge_guard);
+    if a.text_tokens == 0 {
+        readback(
+            c,
+            enc,
+            &img_out,
+            &stage,
+            image_bytes as u64,
+            a.image,
+        )
+    } else {
+        readback_two(
+            c,
+            enc,
+            &img_out,
+            image_bytes as u64,
+            &txt_out,
+            text_bytes as u64,
+            &stage,
+            a.image,
+            a.text,
+        )
+    }
+}
+
+fn qwen_chain_chunk_size() -> usize {
+    static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        std::env::var("CMF_QWEN_IMAGE_CHAIN_CHUNK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(4)
+            .max(1)
+    })
+}
+
+fn qwen_chain_pooled(
+    c: &Ctx,
+    bytes: usize,
+    usage: wgpu::BufferUsages,
+    label: &'static str,
+) -> wgpu::Buffer {
+    let want = bytes.max(4) as u64;
+    let mut pool = c.dit_pool.lock().unwrap();
+    if let Some((buf, cap)) = pool.get(label) {
+        if *cap >= want {
+            return buf.clone();
+        }
+    }
+    let size = want.next_power_of_two();
+    let buf = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size,
+        usage,
+        mapped_at_creation: false,
+    });
+    pool.insert(label, (buf.clone(), size));
+    buf
+}
+
+fn qwen_chain_validate_block(
+    c: &Ctx,
+    model: &Arc<CmfModel>,
+    a: &crate::gpu::QwenImageChainArgs<'_>,
+    b: &crate::gpu::QwenImageChainBlock<'_>,
+    hidden: usize,
+) -> Option<usize> {
+    if b.image_mod.len() != hidden.saturating_mul(6)
+        || b.text_mod.len() != hidden.saturating_mul(6)
+        || b.image_q_norm.len() != a.head_dim
+        || b.image_k_norm.len() != a.head_dim
+        || b.text_q_norm.len() != a.head_dim
+        || b.text_k_norm.len() != a.head_dim
+        || b.image_q_bias.len() != hidden
+        || b.image_k_bias.len() != hidden
+        || b.image_v_bias.len() != hidden
+        || b.text_q_bias.len() != hidden
+        || b.text_k_bias.len() != hidden
+        || b.text_v_bias.len() != hidden
+        || b.image_out_bias.len() != hidden
+        || b.text_out_bias.len() != hidden
+        || b.image_attn_gate.len() != hidden
+        || b.text_attn_gate.len() != hidden
+        || b.image_mlp_out_bias.len() != hidden
+        || b.text_mlp_out_bias.len() != hidden
+        || b.image_mlp_in_bias.is_empty()
+        || b.text_mlp_in_bias.is_empty()
+    {
+        return None;
+    }
+    let shape = |idx: usize, rows: usize, cols: usize| {
+        model.tensors.get(idx).is_some_and(|e| {
+            e.dtype == cortiq_core::TensorDtype::Q4TiledP
+                && e.shape.as_slice() == [rows, cols]
+        })
+    };
+    if !shape(b.image_q, hidden, hidden)
+        || !shape(b.image_k, hidden, hidden)
+        || !shape(b.image_v, hidden, hidden)
+        || !shape(b.text_q, hidden, hidden)
+        || !shape(b.text_k, hidden, hidden)
+        || !shape(b.text_v, hidden, hidden)
+        || !shape(b.image_out, hidden, hidden)
+        || !shape(b.text_out, hidden, hidden)
+    {
+        return None;
+    }
+    let inter = model
+        .tensors
+        .get(b.image_mlp_in)
+        .and_then(|e| e.shape.first().copied())?;
+    if inter == 0
+        || inter % 32 != 0
+        || hidden % 32 != 0
+        || b.image_mlp_in_bias.len() != inter
+        || b.text_mlp_in_bias.len() != inter
+        || !shape(b.image_mlp_in, inter, hidden)
+        || !shape(b.image_mlp_out, hidden, inter)
+        || !shape(b.text_mlp_in, inter, hidden)
+        || !shape(b.text_mlp_out, hidden, inter)
+    {
+        return None;
+    }
+    let image_bytes = a.image_tokens.checked_mul(hidden)?.checked_mul(4)?;
+    let text_bytes = a.text_tokens.checked_mul(hidden)?.checked_mul(4)?;
+    let total_bytes = a
+        .image_tokens
+        .checked_add(a.text_tokens)?
+        .checked_mul(hidden)?
+        .checked_mul(4)?;
+    if !qwen_storage_binding_fit(c, image_bytes, "qwen chain image")
+        || (a.text_tokens > 0 && !qwen_storage_binding_fit(c, text_bytes, "qwen chain text"))
+        || !qwen_storage_binding_fit(c, total_bytes, "qwen chain joint")
+        || !qwen_storage_binding_fit(
+            c,
+            a.image_tokens.checked_mul(inter)?.checked_mul(4)?,
+            "qwen chain image MLP",
+        )
+        || (a.text_tokens > 0
+            && !qwen_storage_binding_fit(
+                c,
+                a.text_tokens.checked_mul(inter)?.checked_mul(4)?,
+                "qwen chain text MLP",
+            ))
+    {
+        return None;
+    }
+    Some(inter)
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn qwen_chain_encode_block(
+    c: &Ctx,
+    model: &Arc<CmfModel>,
+    b: &crate::gpu::QwenImageChainBlock<'_>,
+    image_tokens: usize,
+    text_tokens: usize,
+    heads: usize,
+    head_dim: usize,
+    hidden: usize,
+    image_cos: &[f32],
+    image_sin: &[f32],
+    text_cos: &[f32],
+    text_sin: &[f32],
+    inter: usize,
+    image_state: &wgpu::Buffer,
+    text_state: &wgpu::Buffer,
+    image_norm: &wgpu::Buffer,
+    text_norm: &wgpu::Buffer,
+    image_out: &wgpu::Buffer,
+    text_out: &wgpu::Buffer,
+    enc: &mut wgpu::CommandEncoder,
+) -> bool {
+    let image_len = image_tokens.saturating_mul(hidden);
+    let text_len = text_tokens.saturating_mul(hidden);
+    let image_bytes = image_len.saturating_mul(4);
+    let text_bytes = text_len.saturating_mul(4);
+    let total = image_tokens.saturating_add(text_tokens);
+    let total_bytes = total.saturating_mul(hidden).saturating_mul(4);
+    let st = wgpu::BufferUsages::STORAGE;
+    let img_q = qwen_chain_pooled(c, image_bytes, st, "qwen-chain-img-q");
+    let img_k = qwen_chain_pooled(c, image_bytes, st, "qwen-chain-img-k");
+    let img_v = qwen_chain_pooled(c, image_bytes, st, "qwen-chain-img-v");
+    let txt_q = qwen_chain_pooled(c, text_bytes, st, "qwen-chain-txt-q");
+    let txt_k = qwen_chain_pooled(c, text_bytes, st, "qwen-chain-txt-k");
+    let txt_v = qwen_chain_pooled(c, text_bytes, st, "qwen-chain-txt-v");
+    let joint_q = qwen_chain_pooled(c, total_bytes, st, "qwen-chain-joint-q");
+    let joint_k = qwen_chain_pooled(c, total_bytes, st, "qwen-chain-joint-k");
+    let joint_v = qwen_chain_pooled(c, total_bytes, st, "qwen-chain-joint-v");
+    let img_attn = qwen_chain_pooled(c, image_bytes, st, "qwen-chain-img-attn");
+    let txt_attn = qwen_chain_pooled(c, text_bytes, st, "qwen-chain-txt-attn");
+    let img_norm2 = qwen_chain_pooled(c, image_bytes, st, "qwen-chain-img-norm2");
+    let txt_norm2 = qwen_chain_pooled(c, text_bytes, st, "qwen-chain-txt-norm2");
+    let img_mid = qwen_chain_pooled(
+        c,
+        image_tokens.saturating_mul(inter).saturating_mul(4),
+        st,
+        "qwen-chain-img-mid",
+    );
+    let txt_mid = qwen_chain_pooled(
+        c,
+        text_tokens.saturating_mul(inter).saturating_mul(4),
+        st,
+        "qwen-chain-txt-mid",
+    );
+
+    if !qwen_q4tp_gemm_encode(
+        c,
+        model,
+        b.image_q,
+        image_norm,
+        0,
+        &img_q,
+        image_tokens,
+        hidden,
+        hidden,
+        enc,
+    ) || !qwen_q4tp_gemm_encode(
+        c,
+        model,
+        b.image_k,
+        image_norm,
+        0,
+        &img_k,
+        image_tokens,
+        hidden,
+        hidden,
+        enc,
+    ) || !qwen_q4tp_gemm_encode(
+        c,
+        model,
+        b.image_v,
+        image_norm,
+        0,
+        &img_v,
+        image_tokens,
+        hidden,
+        hidden,
+        enc,
+    ) {
+        return false;
+    }
+    if text_tokens > 0
+        && (!qwen_q4tp_gemm_encode(
+            c,
+            model,
+            b.text_q,
+            text_norm,
+            0,
+            &txt_q,
+            text_tokens,
+            hidden,
+            hidden,
+            enc,
+        ) || !qwen_q4tp_gemm_encode(
+            c,
+            model,
+            b.text_k,
+            text_norm,
+            0,
+            &txt_k,
+            text_tokens,
+            hidden,
+            hidden,
+            enc,
+        ) || !qwen_q4tp_gemm_encode(
+            c,
+            model,
+            b.text_v,
+            text_norm,
+            0,
+            &txt_v,
+            text_tokens,
+            hidden,
+            hidden,
+            enc,
+        ))
+    {
+        return false;
+    }
+
+    let mut image_bias = Vec::with_capacity(3 * hidden);
+    image_bias.extend_from_slice(b.image_q_bias);
+    image_bias.extend_from_slice(b.image_k_bias);
+    image_bias.extend_from_slice(b.image_v_bias);
+    let mut text_bias = Vec::with_capacity(3 * hidden);
+    text_bias.extend_from_slice(b.text_q_bias);
+    text_bias.extend_from_slice(b.text_k_bias);
+    text_bias.extend_from_slice(b.text_v_bias);
+    let image_bias_b = qwen_f32_const(c, &image_bias, "qwen-chain-img-qkv-bias");
+    let text_bias_b = qwen_f32_const(c, &text_bias, "qwen-chain-txt-qkv-bias");
+    let image_qn_b = qwen_f32_const(c, b.image_q_norm, "qwen-chain-img-qnorm");
+    let image_kn_b = qwen_f32_const(c, b.image_k_norm, "qwen-chain-img-knorm");
+    let text_qn_b = qwen_f32_const(c, b.text_q_norm, "qwen-chain-txt-qnorm");
+    let text_kn_b = qwen_f32_const(c, b.text_k_norm, "qwen-chain-txt-knorm");
+    let image_cos_b = qwen_f32_const(c, image_cos, "qwen-chain-img-cos");
+    let image_sin_b = qwen_f32_const(c, image_sin, "qwen-chain-img-sin");
+    let text_cos_b = qwen_f32_const(c, text_cos, "qwen-chain-txt-cos");
+    let text_sin_b = qwen_f32_const(c, text_sin, "qwen-chain-txt-sin");
+    let pairs = head_dim / 2;
+    let rope_p = uniform_u32x8(
+        c,
+        [
+            image_tokens as u32,
+            text_tokens as u32,
+            heads as u32,
+            head_dim as u32,
+            hidden as u32,
+            total as u32,
+            pairs as u32,
+            0,
+        ],
+    );
+    let rope_bg = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("qwen-chain-rope-bg"),
+        layout: &c.qwen_rope_pack.get_bind_group_layout(0),
+        entries: &[
+            bind_buf(0, &img_q),
+            bind_buf(1, &img_k),
+            bind_buf(2, &img_v),
+            bind_buf(3, &txt_q),
+            bind_buf(4, &txt_k),
+            bind_buf(5, &txt_v),
+            bind_buf(6, &image_bias_b),
+            bind_buf(7, &text_bias_b),
+            bind_buf(8, &image_qn_b),
+            bind_buf(9, &image_kn_b),
+            bind_buf(10, &text_qn_b),
+            bind_buf(11, &text_kn_b),
+            bind_buf(12, &image_cos_b),
+            bind_buf(13, &image_sin_b),
+            bind_buf(14, &text_cos_b),
+            bind_buf(15, &text_sin_b),
+            bind_buf(16, &joint_q),
+            bind_buf(17, &joint_k),
+            bind_buf(18, &joint_v),
+            bind_buf(19, &rope_p),
+        ],
+    });
+    let jobs = total.saturating_mul(heads) as u32;
+    let mut pass = begin_pass_with(enc, Some("qwen-chain-rope"), None);
+    pass.set_pipeline(&c.qwen_rope_pack);
+    pass.set_bind_group(0, &rope_bg, &[]);
+    pass.dispatch_workgroups(jobs.min(65_535), jobs.div_ceil(65_535), 1);
+    drop(pass);
+    let Some(attn) = qwen_attention_encode(c, enc, &joint_q, &joint_k, &joint_v, heads, total, head_dim)
+    else {
+        return false;
+    };
+    if !qwen_q4tp_gemm_encode(
+        c,
+        model,
+        b.image_out,
+        &attn,
+        text_bytes as u64,
+        &img_attn,
+        image_tokens,
+        hidden,
+        hidden,
+        enc,
+    ) || (text_tokens > 0
+        && !qwen_q4tp_gemm_encode(
+            c,
+            model,
+            b.text_out,
+            &attn,
+            0,
+            &txt_attn,
+            text_tokens,
+            hidden,
+            hidden,
+            enc,
+        ))
+    {
+        return false;
+    }
+    let image_out_bias = qwen_f32_const(c, b.image_out_bias, "qwen-chain-img-out-bias");
+    let text_out_bias = qwen_f32_const(c, b.text_out_bias, "qwen-chain-txt-out-bias");
+    encode_qwen_gelu_bias(c, enc, &img_attn, &image_out_bias, image_len, hidden, false);
+    if text_tokens > 0 {
+        encode_qwen_gelu_bias(c, enc, &txt_attn, &text_out_bias, text_len, hidden, false);
+    }
+    let image_attn_gate = qwen_f32_const(c, b.image_attn_gate, "qwen-chain-img-attn-gate");
+    encode_qwen_gated_residual(
+        c,
+        enc,
+        image_state,
+        &img_attn,
+        &image_attn_gate,
+        image_tokens,
+        hidden,
+    );
+    if text_tokens > 0 {
+        let text_attn_gate = qwen_f32_const(c, b.text_attn_gate, "qwen-chain-txt-attn-gate");
+        encode_qwen_gated_residual(
+            c,
+            enc,
+            text_state,
+            &txt_attn,
+            &text_attn_gate,
+            text_tokens,
+            hidden,
+        );
+    }
+    if !encode_qwen_layernorm_mod(
+        c,
+        enc,
+        &img_attn,
+        &b.image_mod[3 * hidden..5 * hidden],
+        &img_norm2,
+        image_tokens,
+        hidden,
+        1.0e-6,
+    ) {
+        return false;
+    }
+    if text_tokens > 0
+        && !encode_qwen_layernorm_mod(
+            c,
+            enc,
+            &txt_attn,
+            &b.text_mod[3 * hidden..5 * hidden],
+            &txt_norm2,
+            text_tokens,
+            hidden,
+            1.0e-6,
+        )
+    {
+        return false;
+    }
+    if !qwen_q4tp_gemm_encode(
+        c,
+        model,
+        b.image_mlp_in,
+        &img_norm2,
+        0,
+        &img_mid,
+        image_tokens,
+        inter,
+        hidden,
+        enc,
+    ) {
+        return false;
+    }
+    let image_mlp_in_bias = qwen_f32_const(c, b.image_mlp_in_bias, "qwen-chain-img-mlp-in-bias");
+    encode_qwen_gelu_bias(
+        c,
+        enc,
+        &img_mid,
+        &image_mlp_in_bias,
+        image_tokens.saturating_mul(inter),
+        inter,
+        true,
+    );
+    if !qwen_q4tp_gemm_encode(
+        c,
+        model,
+        b.image_mlp_out,
+        &img_mid,
+        0,
+        image_out,
+        image_tokens,
+        hidden,
+        inter,
+        enc,
+    ) {
+        return false;
+    }
+    let image_mlp_out_bias = qwen_f32_const(c, b.image_mlp_out_bias, "qwen-chain-img-mlp-out-bias");
+    encode_qwen_gelu_bias(
+        c,
+        enc,
+        image_out,
+        &image_mlp_out_bias,
+        image_len,
+        hidden,
+        false,
+    );
+    let image_mlp_gate = qwen_f32_const(
+        c,
+        &b.image_mod[5 * hidden..6 * hidden],
+        "qwen-chain-img-mlp-gate",
+    );
+    encode_qwen_gated_residual(
+        c,
+        enc,
+        &img_attn,
+        image_out,
+        &image_mlp_gate,
+        image_tokens,
+        hidden,
+    );
+    if text_tokens > 0 {
+        if !qwen_q4tp_gemm_encode(
+            c,
+            model,
+            b.text_mlp_in,
+            &txt_norm2,
+            0,
+            &txt_mid,
+            text_tokens,
+            inter,
+            hidden,
+            enc,
+        ) {
+            return false;
+        }
+        let text_mlp_in_bias = qwen_f32_const(c, b.text_mlp_in_bias, "qwen-chain-txt-mlp-in-bias");
+        encode_qwen_gelu_bias(
+            c,
+            enc,
+            &txt_mid,
+            &text_mlp_in_bias,
+            text_tokens.saturating_mul(inter),
+            inter,
+            true,
+        );
+        if !qwen_q4tp_gemm_encode(
+            c,
+            model,
+            b.text_mlp_out,
+            &txt_mid,
+            0,
+            text_out,
+            text_tokens,
+            hidden,
+            inter,
+            enc,
+        ) {
+            return false;
+        }
+        let text_mlp_out_bias = qwen_f32_const(c, b.text_mlp_out_bias, "qwen-chain-txt-mlp-out-bias");
+        encode_qwen_gelu_bias(
+            c,
+            enc,
+            text_out,
+            &text_mlp_out_bias,
+            text_len,
+            hidden,
+            false,
+        );
+        let text_mlp_gate = qwen_f32_const(
+            c,
+            &b.text_mod[5 * hidden..6 * hidden],
+            "qwen-chain-txt-mlp-gate",
+        );
+        encode_qwen_gated_residual(
+            c,
+            enc,
+            &txt_attn,
+            text_out,
+            &text_mlp_gate,
+            text_tokens,
+            hidden,
+        );
+    }
+    true
+}
+
+/// Keep the complete Qwen transformer forward resident across its layer
+/// boundaries.  Each chunk submits ordered work without a hidden-state fence;
+/// only the final chunk performs the one paired readback.  The explicit args
+/// make this state lifetime visible to the caller and preserve fallback
+/// behavior when a codec, shape, or backend contract declines.
+pub fn qwen_image_chain(
+    model: &Arc<CmfModel>,
+    a: &mut crate::gpu::QwenImageChainArgs<'_>,
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let hidden = a.heads.checked_mul(a.head_dim).unwrap_or(0);
+    let total = a.image_tokens.checked_add(a.text_tokens).unwrap_or(0);
+    let pairs = a.head_dim / 2;
+    let image_len = a.image_tokens.checked_mul(hidden).unwrap_or(0);
+    let text_len = a.text_tokens.checked_mul(hidden).unwrap_or(0);
+    let image_bytes = image_len.checked_mul(4).unwrap_or(0);
+    let text_bytes = text_len.checked_mul(4).unwrap_or(0);
+    if hidden == 0
+        || a.image_tokens == 0
+        || total == 0
+        || a.head_dim == 0
+        || a.head_dim > 256
+        || a.head_dim % 2 != 0
+        || a.blocks.is_empty()
+        || a.image.len() != image_len
+        || a.text.len() != text_len
+        || a.image_cos.len() != a.image_tokens.saturating_mul(pairs)
+        || a.image_sin.len() != a.image_cos.len()
+        || a.text_cos.len() != a.text_tokens.saturating_mul(pairs)
+        || a.text_sin.len() != a.text_cos.len()
+        || !qwen_storage_binding_fit(c, image_bytes, "qwen chain image state")
+        || (text_len > 0 && !qwen_storage_binding_fit(c, text_bytes, "qwen chain text state"))
+    {
+        return false;
+    }
+    let mut inter = Vec::with_capacity(a.blocks.len());
+    for b in a.blocks {
+        let Some(width) = qwen_chain_validate_block(c, model, a, b, hidden) else {
+            return false;
+        };
+        inter.push(width);
+    }
+
+    // The shared matrix cache is serialized once for the whole forward. No
+    // helper below submits or maps an activation, so chunk boundaries only
+    // order device work and never expose a partial hidden state to the host.
+    let _gate = c.mm_gate.lock().unwrap();
+    let st = wgpu::BufferUsages::STORAGE;
+    let image_state = qwen_chain_pooled(
+        c,
+        image_bytes,
+        st | wgpu::BufferUsages::COPY_DST,
+        "qwen-chain-img-state",
+    );
+    let text_state = qwen_chain_pooled(
+        c,
+        text_bytes,
+        st | wgpu::BufferUsages::COPY_DST,
+        "qwen-chain-txt-state",
+    );
+    let image_norm = qwen_chain_pooled(
+        c,
+        image_bytes,
+        st | wgpu::BufferUsages::COPY_DST,
+        "qwen-chain-img-norm",
+    );
+    let text_norm = qwen_chain_pooled(
+        c,
+        text_bytes,
+        st | wgpu::BufferUsages::COPY_DST,
+        "qwen-chain-txt-norm",
+    );
+    let image_out = qwen_chain_pooled(
+        c,
+        image_bytes,
+        st | wgpu::BufferUsages::COPY_SRC,
+        "qwen-chain-img-out",
+    );
+    let text_out = qwen_chain_pooled(
+        c,
+        text_bytes,
+        st | wgpu::BufferUsages::COPY_SRC,
+        "qwen-chain-txt-out",
+    );
+    let stage = qwen_chain_pooled(
+        c,
+        image_bytes.saturating_add(text_bytes),
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "qwen-chain-stage",
+    );
+    c.queue
+        .write_buffer(&image_state, 0, bytemuck::cast_slice(a.image));
+    if a.text_tokens > 0 {
+        c.queue
+            .write_buffer(&text_state, 0, bytemuck::cast_slice(a.text));
+    }
+
+    let chunk_size = qwen_chain_chunk_size();
+    let mut start = 0usize;
+    let mut chunks = 0usize;
+    while start < a.blocks.len() {
+        let end = start.saturating_add(chunk_size).min(a.blocks.len());
+        let mut enc = c
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("qwen-chain-forward"),
+            });
+        let merge_guard = PassMergeGuard::new(&enc);
+        for index in start..end {
+            let b = &a.blocks[index];
+            let state_image = &image_out;
+            let state_text = &text_out;
+            // The first block reads the one initial upload. Every later block
+            // reads the previous block's output in the same pooled buffer;
+            // ordered command encoders make the in-place reuse explicit.
+            let (state_image, state_text) = if index == 0 {
+                (&image_state, &text_state)
+            } else {
+                (state_image, state_text)
+            };
+            if !encode_qwen_layernorm_mod(
+                c,
+                &mut enc,
+                state_image,
+                &b.image_mod[..2 * hidden],
+                &image_norm,
+                a.image_tokens,
+                hidden,
+                1.0e-6,
+            ) || (a.text_tokens > 0
+                && !encode_qwen_layernorm_mod(
+                    c,
+                    &mut enc,
+                    state_text,
+                    &b.text_mod[..2 * hidden],
+                    &text_norm,
+                    a.text_tokens,
+                    hidden,
+                    1.0e-6,
+                ))
+            {
+                return false;
+            }
+            if !qwen_chain_encode_block(
+                c,
+                model,
+                b,
+                a.image_tokens,
+                a.text_tokens,
+                a.heads,
+                a.head_dim,
+                hidden,
+                a.image_cos,
+                a.image_sin,
+                a.text_cos,
+                a.text_sin,
+                inter[index],
+                state_image,
+                state_text,
+                &image_norm,
+                &text_norm,
+                &image_out,
+                &text_out,
+                &mut enc,
+            ) {
+                return false;
+            }
+        }
+        drop(merge_guard);
+        let final_chunk = end == a.blocks.len();
+        if final_chunk {
+            let ok = if a.text_tokens == 0 {
+                readback(c, enc, &image_out, &stage, image_bytes as u64, a.image)
+            } else {
+                readback_two(
+                    c,
+                    enc,
+                    &image_out,
+                    image_bytes as u64,
+                    &text_out,
+                    text_bytes as u64,
+                    &stage,
+                    a.image,
+                    a.text,
+                )
+            };
+            if !ok {
+                return false;
+            }
+        } else {
+            submit(c, finish_enc(enc));
+        }
+        chunks += 1;
+        start = end;
+    }
+    if std::env::var("CMF_QWEN_IMAGE_PROFILE").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("on"))
+        || std::env::var("CMF_GPU_DEBUG").is_ok()
+    {
+        eprintln!(
+            "qwen_image chain: blocks={} chunks={} submissions={} readbacks=1 chunk_size={} hidden={} image_tokens={} text_tokens={}",
+            a.blocks.len(),
+            chunks,
+            chunks,
+            chunk_size,
+            hidden,
+            a.image_tokens,
+            a.text_tokens,
+        );
+    }
+    true
+}
+
+/// Qwen Image's exact double-stream attention half on WGPU. Every large
+/// panel is device-resident from the normalized stream upload through the
+/// two output projections. The only host boundary is the pair of projected
+/// streams returned to the Qwen residual code. This is deliberately a
+/// Qwen-specific path: its two independent streams and per-stream qk norms
+/// do not fit the one-stream `dit_block` contract.
+#[allow(clippy::too_many_lines)]
+pub fn qwen_image_attention(
+    model: &Arc<CmfModel>,
+    a: &mut crate::gpu::QwenImageAttentionArgs<'_>,
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let hidden = a.heads.checked_mul(a.head_dim).unwrap_or(0);
+    let total = a.image_tokens.checked_add(a.text_tokens).unwrap_or(0);
+    let pairs = a.head_dim / 2;
+    if hidden == 0
+        || a.image_tokens == 0
+        || total == 0
+        || a.head_dim == 0
+        || a.head_dim > 256
+        || a.head_dim % 2 != 0
+        || a.image.len() != a.image_tokens.saturating_mul(hidden)
+        || a.text.len() != a.text_tokens.saturating_mul(hidden)
+        || a.image_proj.len() != a.image.len()
+        || a.text_proj.len() != a.text.len()
+        || a.image_cos.len() != a.image_tokens.saturating_mul(pairs)
+        || a.image_sin.len() != a.image_cos.len()
+        || a.text_cos.len() != a.text_tokens.saturating_mul(pairs)
+        || a.text_sin.len() != a.text_cos.len()
+        || a.image_q_norm.len() != a.head_dim
+        || a.image_k_norm.len() != a.head_dim
+        || a.text_q_norm.len() != a.head_dim
+        || a.text_k_norm.len() != a.head_dim
+        || a.image_q_bias.len() != hidden
+        || a.image_k_bias.len() != hidden
+        || a.image_v_bias.len() != hidden
+        || a.text_q_bias.len() != hidden
+        || a.text_k_bias.len() != hidden
+        || a.text_v_bias.len() != hidden
+        || a.image_out_bias.len() != hidden
+        || a.text_out_bias.len() != hidden
+    {
+        return false;
+    }
+    let Some(total_bytes) = total.checked_mul(hidden).and_then(|n| n.checked_mul(4)) else {
+        return false;
+    };
+    let Some(image_bytes) = a
+        .image_tokens
+        .checked_mul(hidden)
+        .and_then(|n| n.checked_mul(4))
+    else {
+        return false;
+    };
+    let Some(text_bytes) = a
+        .text_tokens
+        .checked_mul(hidden)
+        .and_then(|n| n.checked_mul(4))
+    else {
+        return false;
+    };
+    // Each head-major plane is still `[heads, total, head_dim]`, which is
+    // exactly `total * hidden` elements; Q/K/V each use one such plane.
+    let head_bytes = total_bytes;
+    if !qwen_storage_binding_fit(c, image_bytes, "image stream")
+        || !qwen_storage_binding_fit(c, text_bytes, "text stream")
+        || !qwen_storage_binding_fit(c, total_bytes, "joint stream")
+        || !qwen_storage_binding_fit(c, head_bytes, "head-major stream")
+    {
+        return false;
+    }
+    let dims_ok = |idx: usize, rows: usize, cols: usize| {
+        model.tensors.get(idx).is_some_and(|e| {
+            e.dtype == cortiq_core::TensorDtype::Q4TiledP
+                && e.shape.as_slice() == [rows, cols]
+        })
+    };
+    if !dims_ok(a.image_q, hidden, hidden)
+        || !dims_ok(a.image_k, hidden, hidden)
+        || !dims_ok(a.image_v, hidden, hidden)
+        || !dims_ok(a.text_q, hidden, hidden)
+        || !dims_ok(a.text_k, hidden, hidden)
+        || !dims_ok(a.text_v, hidden, hidden)
+        || !dims_ok(a.image_out, hidden, hidden)
+        || !dims_ok(a.text_out, hidden, hidden)
+    {
+        return false;
+    }
+    let rope_pipe = &c.qwen_rope_pack;
+
+    let st = wgpu::BufferUsages::STORAGE;
+    // The shared attention scratch slots are also used by later pipeline
+    // stages that may upload a host panel.  Keep COPY_DST on these pooled
+    // buffers from their first Qwen allocation; WGPU usage flags cannot be
+    // upgraded when Scratch::ensure reuses an existing buffer.
+    let qkv_st = st | wgpu::BufferUsages::COPY_DST;
+    // The block is called once per layer and its output readback completes
+    // before the next layer starts.  Reuse one bounded buffer per role so a
+    // 60-layer render does not turn eight harmless panels into hundreds of
+    // driver allocations while still keeping the chain's live footprint
+    // bounded by one block.
+    let pooled = |bytes: usize, usage: wgpu::BufferUsages, label: &'static str| {
+        let want = bytes.max(4) as u64;
+        let mut pool = c.dit_pool.lock().unwrap();
+        if let Some((buf, cap)) = pool.get(label) {
+            if *cap >= want {
+                return buf.clone();
+            }
+        }
+        let buf = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: want.next_power_of_two(),
+            usage,
+            mapped_at_creation: false,
+        });
+        pool.insert(label, (buf.clone(), want.next_power_of_two()));
+        buf
+    };
+    let img_x = pooled(image_bytes, st | wgpu::BufferUsages::COPY_DST, "qwen-img-x");
+    let txt_x = pooled(text_bytes, st | wgpu::BufferUsages::COPY_DST, "qwen-txt-x");
+    c.queue
+        .write_buffer(&img_x, 0, bytemuck::cast_slice(a.image));
+    if !a.text.is_empty() {
+        c.queue
+            .write_buffer(&txt_x, 0, bytemuck::cast_slice(a.text));
+    }
+
+    // Each projection has its own destination: the historical q4tp helper
+    // reuses one scratch result slot, which would make six independent
+    // stream panels alias one another before the join pass.
+    let img_q = pooled(image_bytes, st, "qwen-img-q");
+    let img_k = pooled(image_bytes, st, "qwen-img-k");
+    let img_v = pooled(image_bytes, st, "qwen-img-v");
+    let txt_q = pooled(text_bytes, st, "qwen-txt-q");
+    let txt_k = pooled(text_bytes, st, "qwen-txt-k");
+    let txt_v = pooled(text_bytes, st, "qwen-txt-v");
+    if !qwen_q4tp_gemm_keep(model, a.image_q, &img_x, &img_q, a.image_tokens, hidden, hidden)
+        || !qwen_q4tp_gemm_keep(model, a.image_k, &img_x, &img_k, a.image_tokens, hidden, hidden)
+        || !qwen_q4tp_gemm_keep(model, a.image_v, &img_x, &img_v, a.image_tokens, hidden, hidden)
+        || (a.text_tokens > 0
+            && (!qwen_q4tp_gemm_keep(
+                model, a.text_q, &txt_x, &txt_q, a.text_tokens, hidden, hidden,
+            ) || !qwen_q4tp_gemm_keep(
+                model, a.text_k, &txt_x, &txt_k, a.text_tokens, hidden, hidden,
+            ) || !qwen_q4tp_gemm_keep(
+                model, a.text_v, &txt_x, &txt_v, a.text_tokens, hidden, hidden,
+            )))
+    {
+        return false;
+    }
+
+    let mut img_bias = Vec::with_capacity(3 * hidden);
+    img_bias.extend_from_slice(a.image_q_bias);
+    img_bias.extend_from_slice(a.image_k_bias);
+    img_bias.extend_from_slice(a.image_v_bias);
+    let mut txt_bias = Vec::with_capacity(3 * hidden);
+    txt_bias.extend_from_slice(a.text_q_bias);
+    txt_bias.extend_from_slice(a.text_k_bias);
+    txt_bias.extend_from_slice(a.text_v_bias);
+    let img_bias_b = qwen_f32_const(c, &img_bias, "qwen-img-qkv-bias");
+    let txt_bias_b = qwen_f32_const(c, &txt_bias, "qwen-txt-qkv-bias");
+    let img_qn_b = qwen_f32_const(c, a.image_q_norm, "qwen-img-qnorm");
+    let img_kn_b = qwen_f32_const(c, a.image_k_norm, "qwen-img-knorm");
+    let txt_qn_b = qwen_f32_const(c, a.text_q_norm, "qwen-txt-qnorm");
+    let txt_kn_b = qwen_f32_const(c, a.text_k_norm, "qwen-txt-knorm");
+    let img_cos_b = qwen_f32_const(c, a.image_cos, "qwen-img-cos");
+    let img_sin_b = qwen_f32_const(c, a.image_sin, "qwen-img-sin");
+    let txt_cos_b = qwen_f32_const(c, a.text_cos, "qwen-txt-cos");
+    let txt_sin_b = qwen_f32_const(c, a.text_sin, "qwen-txt-sin");
+    let (qb, kb, vb) = {
+        let mut sc = c.scratch.lock().unwrap();
+        (
+            Scratch::ensure(
+                &c.device,
+                &mut sc.dq,
+                head_bytes as u64,
+                qkv_st,
+                "qwen-joint-q",
+            ),
+            Scratch::ensure(
+                &c.device,
+                &mut sc.dk,
+                head_bytes as u64,
+                qkv_st,
+                "qwen-joint-k",
+            ),
+            Scratch::ensure(
+                &c.device,
+                &mut sc.dv,
+                head_bytes as u64,
+                qkv_st,
+                "qwen-joint-v",
+            ),
+        )
+    };
+    let rope_p = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("qwen-rope-p"),
+        contents: bytemuck::cast_slice(&[
+            a.image_tokens as u32,
+            a.text_tokens as u32,
+            a.heads as u32,
+            a.head_dim as u32,
+            hidden as u32,
+            total as u32,
+            pairs as u32,
+            0u32,
+        ]),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let rope_bg = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("qwen-rope-bg"),
+        layout: &rope_pipe.get_bind_group_layout(0),
+        entries: &[
+            bind_buf(0, &img_q),
+            bind_buf(1, &img_k),
+            bind_buf(2, &img_v),
+            bind_buf(3, &txt_q),
+            bind_buf(4, &txt_k),
+            bind_buf(5, &txt_v),
+            bind_buf(6, &img_bias_b),
+            bind_buf(7, &txt_bias_b),
+            bind_buf(8, &img_qn_b),
+            bind_buf(9, &img_kn_b),
+            bind_buf(10, &txt_qn_b),
+            bind_buf(11, &txt_kn_b),
+            bind_buf(12, &img_cos_b),
+            bind_buf(13, &img_sin_b),
+            bind_buf(14, &txt_cos_b),
+            bind_buf(15, &txt_sin_b),
+            bind_buf(16, &qb),
+            bind_buf(17, &kb),
+            bind_buf(18, &vb),
+            bind_buf(19, &rope_p),
+        ],
+    });
+    let jobs = total.saturating_mul(a.heads) as u32;
+    let mut rope_enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("qwen-rope-pack"),
+    });
+    {
+        let mut pass = begin_pass(&mut rope_enc);
+        pass.set_pipeline(rope_pipe);
+        pass.set_bind_group(0, &rope_bg, &[]);
+        pass.dispatch_workgroups(jobs.min(65_535), jobs.div_ceil(65_535), 1);
+    }
+    submit(c, finish_enc(rope_enc));
+
+    // The existing joint attention path consumes the same scratch planes and
+    // leaves its token-major result on the card when `keep` is requested.
+    let mut attn_keep = None;
+    if !dit_attention_inner(
+        &[],
+        &[],
+        &[],
+        a.heads,
+        a.heads,
+        total,
+        a.head_dim,
+        1.0 / (a.head_dim as f32).sqrt(),
+        &mut [],
+        true,
+        Some(&mut attn_keep),
+    ) {
+        return false;
+    }
+    let Some(attn) = attn_keep else { return false };
+
+    let img_out_b = pooled(image_bytes, st | wgpu::BufferUsages::COPY_SRC, "qwen-img-proj");
+    let txt_out_b = pooled(text_bytes, st | wgpu::BufferUsages::COPY_SRC, "qwen-txt-proj");
+    if !qwen_q4tp_gemm_keep_offset(
+        model,
+        a.image_out,
+        &attn,
+        text_bytes as u64,
+        &img_out_b,
+        a.image_tokens,
+        hidden,
+        hidden,
+    ) || (a.text_tokens > 0
+        && !qwen_q4tp_gemm_keep_offset(
+            model,
+            a.text_out,
+            &attn,
+            0,
+            &txt_out_b,
+            a.text_tokens,
+            hidden,
+            hidden,
+        ))
+    {
+        return false;
+    }
+    let img_out_bias_b = qwen_f32_const(c, a.image_out_bias, "qwen-img-out-bias");
+    let txt_out_bias_b = qwen_f32_const(c, a.text_out_bias, "qwen-txt-out-bias");
+    let mut bias_enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("qwen-attn-output-bias"),
+    });
+    encode_qwen_gelu_bias(
+        c,
+        &mut bias_enc,
+        &img_out_b,
+        &img_out_bias_b,
+        a.image_tokens * hidden,
+        hidden,
+        false,
+    );
+    if a.text_tokens > 0 {
+        encode_qwen_gelu_bias(
+            c,
+            &mut bias_enc,
+            &txt_out_b,
+            &txt_out_bias_b,
+            a.text_tokens * hidden,
+            hidden,
+            false,
+        );
+    }
+    submit(c, finish_enc(bias_enc));
+
+    let stage = {
+        let mut sc = c.scratch.lock().unwrap();
+        Scratch::ensure(
+            &c.device,
+            &mut sc.dstage,
+            (image_bytes + text_bytes).max(4) as u64,
+            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            "qwen-attn-stage",
+        )
+    };
+    let read_enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("qwen-attn-readback"),
+    });
+    if a.text_tokens == 0 {
+        return readback(c, read_enc, &img_out_b, &stage, image_bytes as u64, a.image_proj);
+    }
+    readback_two(
+        c,
+        read_enc,
+        &img_out_b,
+        image_bytes as u64,
+        &txt_out_b,
+        text_bytes as u64,
+        &stage,
+        a.image_proj,
+        a.text_proj,
+    )
 }
 
 /// One whole modulated DiT block on the card — the norms, the three

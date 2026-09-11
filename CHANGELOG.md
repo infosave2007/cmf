@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.8] - 2026-09-11
+
+### Added
+- Native Qwen-Image-Edit-2509 image editing with a ready self-contained
+  `qwen-image-edit-2509-q4tp.cmf` bundle. The bundle embeds the Qwen Image
+  transformer, Qwen2.5-VL text/vision encoder, tokenizer/processor/config,
+  VAE, scheduler, and bundle manifest; `cortiq imagine` accepts one or more
+  reference images and writes PNG, JPEG, or PPM output.
+- `cortiq imagine-pack --bundle ROOT --out FILE.cmf` for building the one-file
+  bundle from standalone transformer, encoder, VAE, and scheduler files;
+  standalone component files remain supported.
+- `cortiq imagine-pack --component qwen-text-encoder|qwen-vae` for packing the
+  official Qwen companion components.
+- A focused [Qwen Image guide](docs/QWEN_IMAGE.md) with pinned source
+  revisions, one-file and standalone run commands, and the canonical 1024²
+  reference-area profile.
+
+### Changed
+- Qwen Image transformer GGUF import remains the standalone transformer
+  conversion. After packing the companion components, `imagine-pack --bundle`
+  creates the one-file edit artifact; a bundle defaults all component loaders
+  to itself and explicit `--text-encoder`, `--vae`, and `--scheduler` options
+  remain available.
+- Native Qwen Image automatically selects the capability-gated resident Vulkan
+  forward when its memory contract fits. Hidden state stays on the device across
+  transformer blocks, with one final readback per forward; CPU and Metal fallback
+  paths remain available.
+- Qwen Image defaults to 1024×1024 output and 40 steps; Lumina defaults remain unchanged.
+
+### Known limitations
+- Qwen Image editing is available, but image-quality validation remains incomplete.
+
 ## [0.6.7] - 2026-09-11
 
 ### Added
@@ -5551,6 +5583,7 @@ Initial public release.
   (`LICENSE`, `NOTICE`, `PATENTS.md`).
 
 [Unreleased]: https://github.com/infosave2007/cmf/compare/v0.6.7...HEAD
+[0.6.8]: https://github.com/infosave2007/cmf/compare/v0.6.7...v0.6.8
 [0.6.7]: https://github.com/infosave2007/cmf/compare/v0.6.6...v0.6.7
 [0.6.6]: https://github.com/infosave2007/cmf/compare/v0.6.5...v0.6.6
 [0.5.62]: https://github.com/infosave2007/cmf/compare/v0.5.61...v0.5.62
