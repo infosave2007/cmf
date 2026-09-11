@@ -1067,12 +1067,16 @@ enum Commands {
         out: String,
     },
     /// Pack a Diffusers source into CMF. The default packs Lumina into one file;
-    /// --component packs a standalone Qwen text encoder or VAE. Qwen also accepts
-    /// a pinned Hugging Face resolve URL and streams source weights in parallel.
+    /// --component packs a standalone Qwen text encoder or VAE; --bundle merges
+    /// retained Qwen component CMFs into one ready-to-run file.
     ImaginePack {
         /// Optional standalone Qwen component: qwen-text-encoder or qwen-vae
         #[arg(long)]
         component: Option<String>,
+        /// Merge transformer.cmf, text_encoder.cmf and vae.cmf plus the
+        /// scheduler into one mmap-served Qwen Image CMF without requantizing.
+        #[arg(long, default_value_t = false)]
+        bundle: bool,
         /// Diffusers root directory, or a pinned HF resolve base URL for Qwen
         root: String,
         /// Projection codec (Qwen: q4tp/q4t/q8_2f/f16; Lumina: q4t/q8)
@@ -2221,8 +2225,15 @@ async fn main() -> anyhow::Result<()> {
             quant,
             out,
             component,
+            bundle,
         } => {
-            if let Some(component) = component {
+            if bundle {
+                anyhow::ensure!(
+                    component.is_none(),
+                    "--bundle cannot be combined with --component"
+                );
+                qwen_imagepack::bundle(&root, &out)
+            } else if let Some(component) = component {
                 qwen_imagepack::pack(&root, &component, &quant, &out)
             } else {
                 imagepack::cmd_imagine_pack(&root, &quant, &out)
@@ -4987,6 +4998,50 @@ async fn cmd_info(model_path: &str, tensors: Option<&str>) -> anyhow::Result<()>
     Ok(())
 }
 
+fn qwen_component_paths(
+    root: &std::path::Path,
+    qwen_bundle: bool,
+    text_encoder: Option<&str>,
+    vae: Option<&str>,
+    scheduler: Option<&str>,
+) -> cortiq_engine::qwen_imagegen::QwenImagePaths {
+    let parent = if root.is_dir() {
+        root
+    } else {
+        root.parent().unwrap_or_else(|| std::path::Path::new("."))
+    };
+    cortiq_engine::qwen_imagegen::QwenImagePaths {
+        transformer: if root.is_dir() {
+            root.join("transformer.cmf")
+        } else {
+            root.to_path_buf()
+        },
+        text_encoder: text_encoder
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                if qwen_bundle {
+                    root.to_path_buf()
+                } else {
+                    parent.join("text_encoder.cmf")
+                }
+            }),
+        vae: vae.map(std::path::PathBuf::from).unwrap_or_else(|| {
+            if qwen_bundle {
+                root.to_path_buf()
+            } else {
+                parent.join("vae.cmf")
+            }
+        }),
+        scheduler: scheduler.map(std::path::PathBuf::from).or_else(|| {
+            if qwen_bundle {
+                return None;
+            }
+            let path = parent.join("scheduler_config.json");
+            path.is_file().then_some(path)
+        }),
+    }
+}
+
 /// Dispatch native image generation/editing from its CMF architecture.
 #[allow(clippy::too_many_arguments)]
 fn cmd_imagine(
@@ -5006,34 +5061,18 @@ fn cmd_imagine(
     reference_size: usize,
 ) -> anyhow::Result<()> {
     let root = std::path::Path::new(model_dir);
-    let qwen_image = if root.is_file() {
-        CmfModel::open(root)?.header.arch.arch_name == "qwen_image"
+    let (qwen_image, qwen_bundle) = if root.is_file() {
+        let model = CmfModel::open(root)?;
+        let arch = model.header.arch.arch_name.as_str();
+        (
+            arch == "qwen_image" || arch == "qwen_image_bundle",
+            arch == "qwen_image_bundle" || model.tensor("image.bundle_config_json").is_some(),
+        )
     } else {
-        root.join("transformer.cmf").is_file()
+        (root.join("transformer.cmf").is_file(), false)
     };
     if qwen_image || !images.is_empty() || text_encoder.is_some() || vae.is_some() {
-        let parent = if root.is_dir() {
-            root
-        } else {
-            root.parent().unwrap_or_else(|| std::path::Path::new("."))
-        };
-        let paths = cortiq_engine::qwen_imagegen::QwenImagePaths {
-            transformer: if root.is_dir() {
-                root.join("transformer.cmf")
-            } else {
-                root.to_path_buf()
-            },
-            text_encoder: text_encoder
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| parent.join("text_encoder.cmf")),
-            vae: vae
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| parent.join("vae.cmf")),
-            scheduler: scheduler.map(std::path::PathBuf::from).or_else(|| {
-                let path = parent.join("scheduler_config.json");
-                path.is_file().then_some(path)
-            }),
-        };
+        let paths = qwen_component_paths(root, qwen_bundle, text_encoder, vae, scheduler);
         if reference_size != 1024 {
             eprintln!(
                 "Qwen Image: reference area {reference_size}² differs from the official 1024² profile"
@@ -6435,6 +6474,33 @@ mod tests {
         let b2 = SessionState::read(p).unwrap();
         std::fs::remove_file(p).ok();
         assert!(b2.seed.is_none() && b2.skill.is_none() && b2.tokens == vec![7]);
+    }
+
+    #[test]
+    fn qwen_bundle_defaults_to_self_and_honors_component_overrides() {
+        let bundle = std::path::Path::new("/tmp/qwen-image-edit-2509-q4tp.cmf");
+        let paths = qwen_component_paths(bundle, true, None, None, None);
+        assert_eq!(paths.transformer, bundle);
+        assert_eq!(paths.text_encoder, bundle);
+        assert_eq!(paths.vae, bundle);
+        assert!(paths.scheduler.is_none());
+
+        let paths = qwen_component_paths(
+            bundle,
+            true,
+            Some("/tmp/override-text.cmf"),
+            Some("/tmp/override-vae.cmf"),
+            Some("/tmp/override-scheduler.json"),
+        );
+        assert_eq!(
+            paths.text_encoder,
+            std::path::PathBuf::from("/tmp/override-text.cmf")
+        );
+        assert_eq!(paths.vae, std::path::PathBuf::from("/tmp/override-vae.cmf"));
+        assert_eq!(
+            paths.scheduler,
+            Some(std::path::PathBuf::from("/tmp/override-scheduler.json"))
+        );
     }
 
     #[test]

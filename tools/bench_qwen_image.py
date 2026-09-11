@@ -15,7 +15,7 @@ import shutil
 
 p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('--cortiq', type=Path, required=True)
-p.add_argument('--model', type=Path, required=True, help='Directory with the three CMF components')
+p.add_argument('--model', type=Path, required=True, help='Ready CMF file or directory with the three CMF components')
 p.add_argument('--image', type=Path, required=True)
 p.add_argument('--prompt', required=True)
 p.add_argument('--out', type=Path, required=True)
@@ -93,6 +93,11 @@ peak = re.search(r'^\s*(\d+)\s+maximum resident set size\s*$', text, re.M)
 linux_peak = re.search(r'Maximum resident set size \(kbytes\):\s*(\d+)', text)
 receipt = dict(command=cmd, version=version, binary_sha256=binary_sha, exit_code=result.returncode,
                elapsed_s=elapsed, backend=a.backend, gpu_probe='0', stages=stages,
+               engine_env={k: env[k] for k in (
+                   'CMF_THREADS', 'CMF_QWEN_IMAGE_PROFILE', 'CMF_QWEN_IMAGE_FUSED_QKV',
+                   'CMF_QWEN_IMAGE_FUSED_MLP', 'CMF_QWEN_IMAGE_FUSED_MLP_COOP', 'CMF_QWEN_VAE_GPU', 'CMF_GPU_UPLOAD',
+                   'CMF_GPU_UPLOAD_CHUNK_MB', 'CMF_PLANE_CACHE_MB', 'CMF_COOP',
+                   'CMF_GPU_VRAM_MB', 'CMF_RAM_TIER_MB', 'WGPU_BACKEND') if k in env},
                max_rss_bytes=int(peak[1]) if peak else int(linux_peak[1]) * 1024 if linux_peak else None,
                gpu_info=gpu_info, gpu_peak_used_mib=max((x[0] for x in gpu_samples), default=None),
                gpu_utilization_mean=sum(x[1] for x in gpu_samples) / len(gpu_samples) if gpu_samples else None, output=str(a.out.resolve()),

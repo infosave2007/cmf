@@ -9,7 +9,7 @@
 //! activations described by the native runtime spine.
 
 use crate::pool::Pool;
-use crate::qwen_image_ops::{Linear, add_bias};
+use crate::qwen_image_ops::{Linear, add_bias, forward_qkv};
 use cortiq_core::CmfModel;
 use std::sync::Arc;
 use std::time::Instant;
@@ -556,18 +556,28 @@ impl Block {
         let mut txt_q = vec![0.0f32; text_len * hidden];
         let mut txt_k = vec![0.0f32; text_len * hidden];
         let mut txt_v = vec![0.0f32; text_len * hidden];
-        self.attn_to_q
-            .forward(&img_n, image_tokens, &mut img_q, pool)?;
-        self.attn_to_k
-            .forward(&img_n, image_tokens, &mut img_k, pool)?;
-        self.attn_to_v
-            .forward(&img_n, image_tokens, &mut img_v, pool)?;
-        self.attn_add_q
-            .forward(&txt_n, text_len, &mut txt_q, pool)?;
-        self.attn_add_k
-            .forward(&txt_n, text_len, &mut txt_k, pool)?;
-        self.attn_add_v
-            .forward(&txt_n, text_len, &mut txt_v, pool)?;
+        forward_qkv(
+            &self.attn_to_q,
+            &self.attn_to_k,
+            &self.attn_to_v,
+            &img_n,
+            image_tokens,
+            &mut img_q,
+            &mut img_k,
+            &mut img_v,
+            pool,
+        )?;
+        forward_qkv(
+            &self.attn_add_q,
+            &self.attn_add_k,
+            &self.attn_add_v,
+            &txt_n,
+            text_len,
+            &mut txt_q,
+            &mut txt_k,
+            &mut txt_v,
+            pool,
+        )?;
         add_bias(&mut img_q, image_tokens, &self.attn_to_q_bias)?;
         add_bias(&mut img_k, image_tokens, &self.attn_to_k_bias)?;
         add_bias(&mut img_v, image_tokens, &self.attn_to_v_bias)?;
@@ -661,29 +671,104 @@ impl Block {
                 self.txt_mlp_out.cols()
             ));
         }
-        let mut img_mlp = vec![0.0f32; image_tokens * inter];
-        let mut txt_mlp = vec![0.0f32; text_len * inter];
-        self.img_mlp_in
-            .forward(&img_n, image_tokens, &mut img_mlp, pool)?;
-        self.txt_mlp_in
-            .forward(&txt_n, text_len, &mut txt_mlp, pool)?;
-        add_bias(&mut img_mlp, image_tokens, &self.img_mlp_in_bias)?;
-        add_bias(&mut txt_mlp, text_len, &self.txt_mlp_in_bias)?;
-        gelu_tanh_inplace(&mut img_mlp);
-        gelu_tanh_inplace(&mut txt_mlp);
         let mut img_ff = vec![0.0f32; img.len()];
         let mut txt_ff = vec![0.0f32; txt.len()];
-        self.img_mlp_out
-            .forward(&img_mlp, image_tokens, &mut img_ff, pool)?;
-        self.txt_mlp_out
-            .forward(&txt_mlp, text_len, &mut txt_ff, pool)?;
-        add_bias(&mut img_ff, image_tokens, &self.img_mlp_out_bias)?;
-        add_bias(&mut txt_ff, text_len, &self.txt_mlp_out_bias)?;
-        gated_residual(img, &img_ff, &img_mod[5 * hidden..6 * hidden]);
-        gated_residual(txt, &txt_ff, &txt_mod[5 * hidden..6 * hidden]);
+        // On a wide Q4TP batch the WGPU arm keeps the intermediate panel on
+        // the device and applies both biases plus exact tanh-GELU there.  A
+        // refusal (unsupported codec/limits/backend/probe) falls through to
+        // the original bounded projection + pooled pointwise sequence.
+        let img_fused = fused_qwen_gelu_ffn(
+            &self.img_mlp_in,
+            &self.img_mlp_out,
+            &img_n,
+            image_tokens,
+            hidden,
+            inter,
+            &self.img_mlp_in_bias,
+            &self.img_mlp_out_bias,
+            &mut img_ff,
+        );
+        let txt_fused = fused_qwen_gelu_ffn(
+            &self.txt_mlp_in,
+            &self.txt_mlp_out,
+            &txt_n,
+            text_len,
+            hidden,
+            inter,
+            &self.txt_mlp_in_bias,
+            &self.txt_mlp_out_bias,
+            &mut txt_ff,
+        );
+        if !img_fused {
+            let mut img_mlp = vec![0.0f32; image_tokens * inter];
+            self.img_mlp_in
+                .forward(&img_n, image_tokens, &mut img_mlp, pool)?;
+            // Bias and tanh-GELU are one row-parallel pass.  The helper
+            // preserves the original add-then-GELU order.
+            gelu_tanh_bias_inplace(&mut img_mlp, image_tokens, &self.img_mlp_in_bias, pool)?;
+            self.img_mlp_out
+                .forward(&img_mlp, image_tokens, &mut img_ff, pool)?;
+        }
+        if !txt_fused {
+            let mut txt_mlp = vec![0.0f32; text_len * inter];
+            self.txt_mlp_in
+                .forward(&txt_n, text_len, &mut txt_mlp, pool)?;
+            gelu_tanh_bias_inplace(&mut txt_mlp, text_len, &self.txt_mlp_in_bias, pool)?;
+            self.txt_mlp_out
+                .forward(&txt_mlp, text_len, &mut txt_ff, pool)?;
+        }
+        if img_fused {
+            gated_residual(img, &img_ff, &img_mod[5 * hidden..6 * hidden]);
+        } else {
+            gated_residual_bias(
+                img,
+                &img_ff,
+                &self.img_mlp_out_bias,
+                &img_mod[5 * hidden..6 * hidden],
+                pool,
+            )?;
+        }
+        if txt_fused {
+            gated_residual(txt, &txt_ff, &txt_mod[5 * hidden..6 * hidden]);
+        } else {
+            gated_residual_bias(
+                txt,
+                &txt_ff,
+                &self.txt_mlp_out_bias,
+                &txt_mod[5 * hidden..6 * hidden],
+                pool,
+            )?;
+        }
         profile.finish(PROFILE_MLP, profile_span);
         Ok(())
     }
+}
+
+/// Try the device-resident Qwen tanh-GELU FFN for one stream.  All four
+/// projection/bias shapes are checked by the backend; this helper only joins
+/// the two mapped Q4TP identities so a mixed stream can fall back alone.
+#[allow(clippy::too_many_arguments)]
+fn fused_qwen_gelu_ffn(
+    input: &Linear,
+    output: &Linear,
+    x: &[f32],
+    batch: usize,
+    hidden: usize,
+    inter: usize,
+    bias_in: &[f32],
+    bias_out: &[f32],
+    out: &mut [f32],
+) -> bool {
+    if std::env::var("CMF_QWEN_IMAGE_FUSED_MLP").as_deref() == Ok("0") {
+        return false;
+    }
+    let (Some((im, ii)), Some((om, oi))) = (input.mapped_q4tp(), output.mapped_q4tp()) else {
+        return false;
+    };
+    if im.uid() != om.uid() {
+        return false;
+    }
+    crate::gpu::q4tp_gelu_ffn(im, ii, oi, x, batch, hidden, inter, bias_in, bias_out, out)
 }
 
 fn load_block(
@@ -944,16 +1029,126 @@ fn gated_residual(dst: &mut [f32], src: &[f32], gate: &[f32]) {
     }
 }
 
-fn silu_inplace(v: &mut [f32]) {
-    for x in v {
-        *x = *x / (1.0 + (-*x).exp());
+/// A raw mutable panel whose disjoint row ranges may be processed by the
+/// persistent pool.  The caller joins the pool before returning, so no range
+/// outlives the original slice and workers never alias one another.
+struct PanelMut(*mut f32);
+
+unsafe impl Send for PanelMut {}
+unsafe impl Sync for PanelMut {}
+
+impl PanelMut {
+    fn as_ptr(&self) -> *mut f32 {
+        self.0
     }
 }
 
-fn gelu_tanh_inplace(v: &mut [f32]) {
+/// Apply the Qwen MLP input bias and exact tanh GELU in one row-parallel
+/// pass.  The scalar expression intentionally matches the historical helper;
+/// the optimization only changes which worker visits each row.
+fn gelu_tanh_bias_inplace(
+    values: &mut [f32],
+    batch: usize,
+    bias: &[f32],
+    pool: Option<&Pool>,
+) -> Result<(), String> {
+    let expected = batch
+        .checked_mul(bias.len())
+        .ok_or_else(|| "Qwen Image GELU panel size overflows".to_string())?;
+    if bias.is_empty() || values.len() != expected {
+        return Err(format!(
+            "Qwen Image GELU panel length {} != batch {batch} × width {}",
+            values.len(),
+            bias.len()
+        ));
+    }
+    let width = bias.len();
+    let panel = PanelMut(values.as_mut_ptr());
+    let run = |start: usize, end: usize| {
+        // The pool hands out rows, so every worker gets a whole number of
+        // bias vectors and the source slice remains immutable to its peers.
+        let rows = unsafe {
+            std::slice::from_raw_parts_mut(
+                panel.as_ptr().add(start * width),
+                (end - start) * width,
+            )
+        };
+        for row in rows.chunks_exact_mut(width) {
+            for (value, &b) in row.iter_mut().zip(bias) {
+                *value += b;
+                let x = *value;
+                let x3 = x * x * x;
+                *value = 0.5 * x * (1.0 + (GELU_C * (x + GELU_K * x3)).tanh());
+            }
+        }
+    };
+    match pool {
+        Some(pool) if batch >= 256 => pool.run_rows(batch, &run),
+        _ => run(0, batch),
+    }
+    Ok(())
+}
+
+/// Consume a projection bias directly in its gated residual.  It preserves
+/// the two original f32 operations per element while avoiding a temporary
+/// write/read pass over the large output panel.
+fn gated_residual_bias(
+    dst: &mut [f32],
+    src: &[f32],
+    bias: &[f32],
+    gate: &[f32],
+    pool: Option<&Pool>,
+) -> Result<(), String> {
+    if bias.len() != gate.len() {
+        return Err(format!(
+            "Qwen Image residual bias width {} != gate width {}",
+            bias.len(),
+            gate.len()
+        ));
+    }
+    if bias.is_empty() {
+        return Err("Qwen Image residual bias is empty".into());
+    }
+    let expected = dst.len();
+    if src.len() != expected || expected % bias.len() != 0 {
+        return Err(format!(
+            "Qwen Image residual buffers have dst={} src={} width={}",
+            dst.len(),
+            src.len(),
+            bias.len()
+        ));
+    }
+    let width = bias.len();
+    let batch = expected / width;
+    let dst_panel = PanelMut(dst.as_mut_ptr());
+    let run = |start: usize, end: usize| {
+        let rows = unsafe {
+            std::slice::from_raw_parts_mut(
+                dst_panel.as_ptr().add(start * width),
+                (end - start) * width,
+            )
+        };
+        let src_rows = &src[start * width..end * width];
+        for (dst_row, src_row) in rows
+            .chunks_exact_mut(width)
+            .zip(src_rows.chunks_exact(width))
+        {
+            for (((d, &s), &b), &g) in dst_row.iter_mut().zip(src_row).zip(bias).zip(gate) {
+                let biased = s + b;
+                *d += g * biased;
+            }
+        }
+    };
+    match pool {
+        Some(pool) if batch >= 256 => pool.run_rows(batch, &run),
+        _ => run(0, batch),
+    }
+    Ok(())
+}
+
+fn silu_inplace(v: &mut [f32]) {
     for x in v {
-        let x3 = *x * *x * *x;
-        *x = 0.5 * *x * (1.0 + (GELU_C * (*x + GELU_K * x3)).tanh());
+        *x = *x / (1.0 + (-*x).exp());
     }
 }
 
@@ -1111,7 +1306,10 @@ fn softmax_inplace(row: &mut [f32]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{checked_shape_tokens, rope_angles};
+    use super::{
+        checked_shape_tokens, gated_residual_bias, gelu_tanh_bias_inplace, rope_angles, Pool,
+        GELU_C, GELU_K,
+    };
 
     #[test]
     fn rope_shape_and_centered_scaled_positions_cover_reference_streams() {
@@ -1132,5 +1330,43 @@ mod tests {
     fn shape_validation_rejects_empty_and_zero_dimensions() {
         assert!(checked_shape_tokens(&[]).is_err());
         assert!(checked_shape_tokens(&[[1, 0, 2]]).is_err());
+    }
+
+    #[test]
+    fn pooled_mlp_pointwise_paths_are_bit_exact() {
+        let batch = 320;
+        let width = 64;
+        let bias: Vec<f32> = (0..width).map(|i| (i as f32 - 31.0) * 0.003).collect();
+        let gate: Vec<f32> = (0..width).map(|i| 0.2 + i as f32 * 0.001).collect();
+        let source: Vec<f32> = (0..batch * width)
+            .map(|i| ((i as f32 * 0.017).sin()) * 0.7)
+            .collect();
+
+        let mut want_gelu = source.clone();
+        for row in want_gelu.chunks_exact_mut(width) {
+            for (value, &b) in row.iter_mut().zip(&bias) {
+                *value += b;
+                let x = *value;
+                let x3 = x * x * x;
+                *value = 0.5 * x * (1.0 + (GELU_C * (x + GELU_K * x3)).tanh());
+            }
+        }
+        let mut got_gelu = source.clone();
+        let pool = Pool::with_spin(2, 0);
+        gelu_tanh_bias_inplace(&mut got_gelu, batch, &bias, Some(&pool)).unwrap();
+        assert_eq!(got_gelu, want_gelu);
+
+        let mut want_residual = source.clone();
+        for (row, src_row) in want_residual
+            .chunks_exact_mut(width)
+            .zip(source.chunks_exact(width))
+        {
+            for (((dst, &src), &b), &g) in row.iter_mut().zip(src_row).zip(&bias).zip(&gate) {
+                *dst += g * (src + b);
+            }
+        }
+        let mut got_residual = source.clone();
+        gated_residual_bias(&mut got_residual, &source, &bias, &gate, Some(&pool)).unwrap();
+        assert_eq!(got_residual, want_residual);
     }
 }

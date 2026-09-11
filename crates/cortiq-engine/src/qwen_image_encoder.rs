@@ -213,6 +213,19 @@ fn json_blob<'a>(model: &'a CmfModel, name: &str) -> Result<&'a [u8], String> {
     Ok(model.entry_bytes(entry))
 }
 
+/// Standalone encoder CMFs keep the historical `image.config_json` name.
+/// Bundles retain the transformer config at that name and carry this
+/// component's config under an explicit alias so all three loaders can read
+/// one mmap without colliding directory entries.
+fn json_blob_any<'a>(model: &'a CmfModel, names: &[&str]) -> Result<&'a [u8], String> {
+    for name in names {
+        if model.tensor(name).is_some() {
+            return json_blob(model, name);
+        }
+    }
+    Err(format!("missing required U8 asset '{}'", names[0]))
+}
+
 fn value_usize(v: &Value, key: &str) -> Result<usize, String> {
     v.get(key)
         .and_then(Value::as_u64)
@@ -322,7 +335,10 @@ impl QwenImageEncoder {
     /// lazy and no giant F32 embedding copy is created.
     pub fn open(path: &Path) -> Result<Self, String> {
         let model = Arc::new(CmfModel::open_sharded(path).map_err(|e| e.to_string())?);
-        let config_bytes = json_blob(&model, "image.config_json")?;
+        let config_bytes = json_blob_any(
+            &model,
+            &["image.text_encoder.config_json", "image.config_json"],
+        )?;
         let root: Value =
             serde_json::from_slice(config_bytes).map_err(|e| format!("image.config_json: {e}"))?;
         let text = text_config(&root);
