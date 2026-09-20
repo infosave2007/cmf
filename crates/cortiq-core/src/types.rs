@@ -368,23 +368,6 @@ pub struct Qwen4ExpConfig {
     pub seed: u64,
 }
 
-/// GLM-5.3-Flash (`glm5_next`) text-stack geometry. The model combines
-/// four-stream mHC residuals, KDA recurrent mixers and NoPE sparse MLA.
-/// Keeping it in the CMF header makes one artifact portable across CPU,
-/// Vulkan/DX12 and Metal without checkpoint-specific guesses.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Glm5NextConfig {
-    pub hc_mult: usize,
-    pub hc_sinkhorn_iters: usize,
-    pub hc_eps: f32,
-    pub swiglu_limit: f32,
-    pub index_n_heads: usize,
-    pub index_head_dim: usize,
-    pub index_topk: usize,
-    pub index_kpool: usize,
-    pub index_kpool_always_select_tail: bool,
-}
-
 /// Model architecture descriptor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelArch {
@@ -484,9 +467,6 @@ pub struct ModelArch {
     /// Qwen3.8-Flash-Next exact text stack (None for all other families).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub qwen4_exp: Option<Qwen4ExpConfig>,
-    /// GLM-5.3-Flash exact text stack (None for all other families).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub glm5_next: Option<Glm5NextConfig>,
     /// DeepSeek-V4.1 source configuration, preserved verbatim for the
     /// multimodal/Engram runtime. The engine must read the nested
     /// `text_config`, `vision_config`, and `quantization_config` values from
@@ -760,143 +740,19 @@ fn is_one_usize(v: &usize) -> bool {
 /// Linear-core selector: the runtime picks the linear-attention
 /// operator by `kind` (descriptor-driven ops). "gated_delta_net" =
 /// faithful vendor operator carried 1:1 (default for GDN models);
-/// "vmf_phase" = the legacy additive phase core folded at convert time;
-/// "vmf_phase_delta_v1" = the normalized in-place Phase-Delta recurrence.
+/// "vmf_phase" = canonical core folded at convert time (+offline heal).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LinearCoreConfig {
-    /// "gated_delta_net" | "vmf_phase" | "vmf_phase_delta_v1"
+    /// "gated_delta_net" | "vmf_phase"
     pub kind: String,
     pub num_heads: usize,
     /// Phases per head (vmf_phase only)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nphase: Option<usize>,
     pub value_head_dim: usize,
-    /// Zero-based linear-layer indices that use the Phase-Delta v1 write law.
-    /// Required and non-empty for `vmf_phase_delta_v1`; absent for legacy
-    /// cores.  Keeping this in the operator record is important: an older
-    /// reader must reject the new kind instead of ignoring a selector and
-    /// silently executing additive VMF.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub phase_delta_layers: Option<Vec<usize>>,
 }
 
 impl ModelArch {
-    /// Validate the serialized linear-core contract without looking at any
-    /// tensor payloads. This is shared by CMF open/write and consumers that
-    /// copy or compare a model header.
-    pub fn validate_linear_core_metadata(&self) -> Result<(), String> {
-        let Some(lc) = self.linear_core.as_ref() else {
-            return Ok(());
-        };
-        let has_linear = self
-            .layer_types
-            .iter()
-            .any(|t| matches!(t, LayerType::LinearAttention));
-        let selector = lc.phase_delta_layers.as_ref();
-        match lc.kind.as_str() {
-            "vmf_phase" => {
-                if selector.is_some() {
-                    return Err(
-                        "legacy vmf_phase cannot carry phase_delta_layers; use vmf_phase_delta_v1"
-                            .into(),
-                    );
-                }
-                if has_linear
-                    && (lc.num_heads == 0 || lc.nphase.unwrap_or(0) == 0 || lc.value_head_dim == 0)
-                {
-                    return Err(
-                        "vmf_phase requires positive heads, nphase, and value_head_dim".into(),
-                    );
-                }
-            }
-            "vmf_phase_delta_v1" => {
-                let Some(selected) = selector else {
-                    return Err(
-                        "vmf_phase_delta_v1 requires a non-empty phase_delta_layers selector"
-                            .into(),
-                    );
-                };
-                if selected.is_empty() {
-                    return Err("vmf_phase_delta_v1 phase_delta_layers is empty".into());
-                }
-                if self.layer_types.len() != self.num_layers {
-                    return Err(format!(
-                        "phase_delta layer schedule has {} entries, expected {}",
-                        self.layer_types.len(),
-                        self.num_layers
-                    ));
-                }
-                let mut canonical = selected.clone();
-                canonical.sort_unstable();
-                if let Some(pair) = canonical.windows(2).find(|pair| pair[0] == pair[1]) {
-                    let duplicate = pair[0];
-                    return Err(format!(
-                        "phase_delta_layers contains duplicate layer {duplicate}"
-                    ));
-                }
-                for &li in selected {
-                    if li >= self.num_layers {
-                        return Err(format!(
-                            "phase_delta layer {li} out of range for {} layers",
-                            self.num_layers
-                        ));
-                    }
-                    if !matches!(self.layer_types[li], LayerType::LinearAttention) {
-                        return Err(format!(
-                            "phase_delta layer {li} is not a LinearAttention layer"
-                        ));
-                    }
-                }
-                if lc.num_heads == 0 || lc.nphase.unwrap_or(0) == 0 || lc.value_head_dim == 0 {
-                    return Err(
-                        "vmf_phase_delta_v1 requires positive heads, nphase, and value_head_dim"
-                            .into(),
-                    );
-                }
-            }
-            "gated_delta_net" => {
-                if selector.is_some() {
-                    return Err("gated_delta_net cannot carry phase_delta_layers".into());
-                }
-            }
-            other => {
-                return Err(format!(
-                    "unknown linear core '{other}' (this runtime executes: gated_delta_net, vmf_phase, vmf_phase_delta_v1)"
-                ));
-            }
-        }
-        if !has_linear && selector.is_some() {
-            return Err(
-                "phase_delta_layers is only valid with LinearAttention and vmf_phase_delta_v1"
-                    .into(),
-            );
-        }
-        Ok(())
-    }
-
-    /// Stable semantic identity for the executable linear operator. The
-    /// selector is normalized for comparison; callers should validate first.
-    pub fn linear_core_identity(&self) -> Option<serde_json::Value> {
-        let lc = self.linear_core.as_ref()?;
-        let mut selected = lc.phase_delta_layers.clone();
-        if let Some(indices) = selected.as_mut() {
-            indices.sort_unstable();
-        }
-        Some(serde_json::json!({
-            "kind": lc.kind,
-            "num_heads": lc.num_heads,
-            "nphase": lc.nphase,
-            "value_head_dim": lc.value_head_dim,
-            "phase_delta_layers": selected,
-            "linear_num_key_heads": self.linear_num_key_heads,
-            "linear_num_value_heads": self.linear_num_value_heads,
-            "linear_key_head_dim": self.linear_key_head_dim,
-            "linear_value_head_dim": self.linear_value_head_dim,
-            "linear_conv_kernel_dim": self.linear_conv_kernel_dim,
-            "layer_types": self.layer_types,
-        }))
-    }
-
     /// Bytes per FFN bitfield row (one layer).
     pub fn ffn_mask_bytes(&self) -> usize {
         self.intermediate_size.div_ceil(8)

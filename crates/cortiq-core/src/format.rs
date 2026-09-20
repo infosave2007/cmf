@@ -519,10 +519,6 @@ impl CmfModel {
         // Header JSON
         let header: CmfHeader = serde_json::from_slice(section(env.header.0, env.header.1))
             .map_err(|e| CmfError::Parse(format!("header JSON: {e}")))?;
-        header
-            .arch
-            .validate_linear_core_metadata()
-            .map_err(CmfError::Parse)?;
         let prism_bit = env.required_features & features::PRISM_HADAMARD != 0;
         let affine_bit = env.required_features & features::PRISM_AFFINE != 0;
         let has_prism = header.arch.prism_hadamard.is_some();
@@ -695,12 +691,6 @@ impl CmfModel {
         for no in 2..=info.count {
             let sib = path.with_file_name(format!("{stem}-{:05}-of-{:05}.cmf", no, info.count));
             let sh = Self::open(&sib)?;
-            if sh.header.arch.linear_core_identity() != first.header.arch.linear_core_identity() {
-                return Err(CmfError::Parse(format!(
-                    "{}: linear-core identity differs from shard 1",
-                    sib.display()
-                )));
-            }
             match &sh.header.shard {
                 Some(si) if si.no == no && si.count == info.count => {}
                 other => {
@@ -1259,10 +1249,6 @@ impl CmfModel {
         vocab: Option<&[u8]>,
     ) -> Result<(), CmfError> {
         let path = path.as_ref();
-        header
-            .arch
-            .validate_linear_core_metadata()
-            .map_err(CmfError::Parse)?;
         if let Some(prism) = header.arch.prism_hadamard.as_ref() {
             prism.validate().map_err(CmfError::Parse)?;
             if header.arch.arch_name != "prism_hadamard_qwen35" {

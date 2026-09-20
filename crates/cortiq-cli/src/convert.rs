@@ -22,8 +22,8 @@ use cortiq_core::quant::{
     q4tp_code_stride, q4tp_ladder, q4tp_put_code,
 };
 use cortiq_core::types::{
-    Glm5NextConfig, LayerType, LinearCoreConfig, ModelArch, MoeConfig, NormStyle,
-    PrismAffineConfig, PrismHadamardConfig, QuantType, Qwen4ExpConfig, TensorDtype, YarnConfig,
+    LayerType, LinearCoreConfig, ModelArch, MoeConfig, NormStyle, PrismAffineConfig,
+    PrismHadamardConfig, QuantType, Qwen4ExpConfig, TensorDtype, YarnConfig,
 };
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -617,10 +617,6 @@ pub(crate) fn canon_name(raw: &str) -> Option<String> {
     if raw.ends_with(".mlp.experts.e_score_correction_bias") {
         return Some(raw.replace(".mlp.experts.e_score_correction_bias", ".mlp.expert_bias"));
     }
-    // GLM-5.3 keeps the noaux_tc correction beside the router itself.
-    if raw.ends_with(".mlp.gate.e_score_correction_bias") {
-        return Some(raw.replace(".mlp.gate.e_score_correction_bias", ".mlp.expert_bias"));
-    }
     Some(lfm2_canon(raw))
 }
 
@@ -710,27 +706,10 @@ fn lfm2_canon(name: &str) -> String {
 /// DeepSeek-V4's table holds expert ids per vocabulary id (129 280 rows).
 fn force_f32(name: &str) -> bool {
     name.ends_with(".tid2eid")
-        // GLM's noaux_tc correction bias is explicitly kept in fp32 by
-        // Transformers and is applied on every sparse-layer route choice.
         || name.ends_with(".mlp.expert_bias")
         || name.ends_with(".mlp.expert_bias_vl")
-        // DeepSeek-lineage MTP keeps the upstream `ffn.gate.*` spelling.
         || name.ends_with(".ffn.gate.bias")
         || name.ends_with(".ffn.gate.bias_vl")
-        // GLM-5.3 mHC explicitly evaluates its tiny routing projections and
-        // Sinkhorn parameters in fp32. They are <0.1% of the checkpoint and
-        // quantizing them compounds an error twice in every layer.
-        || name.contains(".hc_attn_")
-        || name.contains(".hc_ffn_")
-        // Transformers keeps the KDA state-control tensors in strict fp32
-        // (`_keep_in_fp32_modules_strict`).  They feed exp/sigmoid gates and
-        // are particularly sensitive to bf16/f16 rounding.  The explicit
-        // names also take precedence over the generic f16 conv policy below.
-        || name.ends_with("kda_attn.dt_bias")
-        || name.ends_with("kda_attn.A_log")
-        || name.ends_with("kda_attn.q_conv1d.weight")
-        || name.ends_with("kda_attn.k_conv1d.weight")
-        || name.ends_with("kda_attn.v_conv1d.weight")
 }
 
 /// DeepSeek-V4.1's vision tower and aligner are small relative to the text
@@ -803,11 +782,10 @@ fn quant_for_tensor(arch: &ModelArch, name: &str, base: Quant) -> Quant {
     if arch.arch_name.eq_ignore_ascii_case("granite") && vocabulary_edges {
         return Quant::Q8_2f;
     }
-    if arch.qwen4_exp.is_none() && arch.glm5_next.is_none() {
+    if arch.qwen4_exp.is_none() {
         return base;
     }
     let recurrent_skeleton = name.contains(".linear_attn.")
-        || name.contains(".kda_attn.")
         || name.contains(".self_attn.")
         || (name.contains(".ple.")
             && (name.ends_with("key_proj.weight") || name.ends_with("value_proj.weight")));
@@ -2144,10 +2122,9 @@ pub(crate) fn unpack_fp8_blocks(
     Ok(out)
 }
 
-/// Fine-grained FP8 used by GLM/DeepSeek-V3 checkpoints: one ordinary f32
-/// inverse scale per 128×128 weight block (`weight_scale_inv`). Unlike the
-/// DSV4 E8M0 plane this scale is stored directly, so dequantization is simply
-/// `fp8_value * scale_inv[block_row, block_col]`.
+/// Fine-grained FP8 with one ordinary f32 inverse scale per source block.
+/// V4.1's `weight_block_size` controls the block geometry; older checkpoints
+/// use 128 while the V4.1 source uses 32.
 fn unpack_fp8_scale_inv(
     packed: &[u8],
     scales: &[f32],
@@ -2155,6 +2132,7 @@ fn unpack_fp8_scale_inv(
     cols: usize,
     block: usize,
 ) -> anyhow::Result<Vec<f32>> {
+    anyhow::ensure!(block > 0, "fp8 scale_inv: block size 0");
     anyhow::ensure!(
         packed.len() == rows * cols,
         "fp8 scale_inv: weight size mismatch"
@@ -2794,7 +2772,6 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
     let is_dsv4 = model_type == "deepseek_v4";
     let is_dsv41 = model_type == "deepseek_v41";
     let tc_model_type = tc.get("model_type").and_then(|v| v.as_str()).unwrap_or("");
-    let is_glm5_next = model_type == "glm5_next" || tc_model_type == "glm5_next_text";
     // DeepSeek-V4: the name mapping and both source quantizations (FP8
     // E4M3 with 128x128 block scales, MXFP4 experts) are in place, but
     // five of its blocks have no runtime yet — and without them the file
@@ -2838,15 +2815,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
     // everything else is a KDA layer.
     let is_kimi =
         model_type == "kimi_linear" || model_type == "kimi_k3" || tc_model_type == "kimi_linear";
-    let layer_types = if is_glm5_next {
-        layer_types
-            .into_iter()
-            .map(|t| match t {
-                LayerType::LinearAttention => LayerType::Kda,
-                other => other,
-            })
-            .collect()
-    } else if let Some(lac) = tc.get("linear_attn_config").filter(|_| is_kimi) {
+    let layer_types = if let Some(lac) = tc.get("linear_attn_config").filter(|_| is_kimi) {
         anyhow::ensure!(
             tc.get("attn_res_block_size")
                 .map(|v| v.is_null())
@@ -2891,9 +2860,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
     } else {
         layer_types
     };
-    let kda_lac = tc
-        .get("linear_attn_config")
-        .filter(|_| is_kimi || is_glm5_next);
+    let kimi_lac = tc.get("linear_attn_config").filter(|_| is_kimi);
     let has_linear = layer_types
         .iter()
         .any(|t| matches!(t, LayerType::LinearAttention));
@@ -2905,7 +2872,6 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
             num_heads: lnv.unwrap_or(0),
             nphase: None,
             value_head_dim: lvd.unwrap_or(0),
-            phase_delta_layers: None,
         })
     } else {
         None
@@ -3046,16 +3012,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
                 router_resonance: false,
             }
         });
-    // GLM-5.3 deliberately serializes head_dim=0 because its DSA heads are
-    // NoPE MLA heads. The real attention width is the two qk components.
-    let head_dim = cfg_usize(tc, "head_dim")
-        .filter(|&v| v > 0)
-        .or_else(|| {
-            let d = cfg_usize(tc, "qk_rope_head_dim").unwrap_or(0)
-                + cfg_usize(tc, "qk_nope_head_dim").unwrap_or(0);
-            (d > 0).then_some(d)
-        })
-        .unwrap_or(hidden / n_heads.max(1));
+    let head_dim = cfg_usize(tc, "head_dim").unwrap_or(hidden / n_heads.max(1));
     // Zero-centered RMSNorm x̂·(1+w): Gemma family and native HF
     // Qwen3.5 / Qwen3-Next checkpoints.  Prism/Bonsai is deliberately
     // excluded: its source is the already-sanitized MLX Qwen3.5 runtime
@@ -3386,7 +3343,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         // `mtp_num_hidden_layers`; DeepSeek-lineage configs say
         // `num_nextn_predict_layers`. Absent → no speculative head, which is
         // the honest default for every model that has none.
-        mtp: if mt.contains("qwen4_exp") || is_glm5_next {
+        mtp: if mt.contains("qwen4_exp") {
             // qwen4_exp ships a second hyper-connected hybrid stack.  It is
             // not wire-compatible with the legacy DeepSeek/Qwen MTP block;
             // leave it out until that speculative-only head has an exact op.
@@ -3430,23 +3387,6 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
             split_ngram_parts: cfg_usize(tc, "split_ngram_parts").unwrap_or(128),
             seed: cfg_usize(tc, "seed").unwrap_or(1234) as u64,
         }),
-        glm5_next: is_glm5_next.then(|| Glm5NextConfig {
-            hc_mult: cfg_usize(tc, "hc_mult").unwrap_or(4),
-            hc_sinkhorn_iters: cfg_usize(tc, "hc_sinkhorn_iters").unwrap_or(20),
-            hc_eps: tc.get("hc_eps").and_then(|v| v.as_f64()).unwrap_or(1e-6) as f32,
-            swiglu_limit: tc
-                .get("swiglu_limit")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(10.0) as f32,
-            index_n_heads: cfg_usize(tc, "index_n_heads").unwrap_or(32),
-            index_head_dim: cfg_usize(tc, "index_head_dim").unwrap_or(128),
-            index_topk: cfg_usize(tc, "index_topk").unwrap_or(2048),
-            index_kpool: cfg_usize(tc, "index_kpool").unwrap_or(4),
-            index_kpool_always_select_tail: tc
-                .get("index_kpool_always_select_tail")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true),
-        }),
         // Keep the complete original HF object, including the text/vision
         // sub-configs and quantization policy. V4.1 runtime initialization
         // consumes this verbatim for multimodal and Engram geometry.
@@ -3458,36 +3398,13 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         // `conv_L_cache`; Kimi nests KDA geometry in linear_attn_config.
         linear_conv_kernel_dim: cfg_usize(tc, "linear_conv_kernel_dim")
             .or_else(|| cfg_usize(tc, "conv_L_cache"))
-            .or_else(|| kda_lac.and_then(|l| cfg_usize(l, "short_conv_kernel_size")))
-            .or_else(|| is_glm5_next.then_some(4)),
+            .or_else(|| kimi_lac.and_then(|l| cfg_usize(l, "short_conv_kernel_size"))),
         linear_num_key_heads: cfg_usize(tc, "linear_num_key_heads")
-            // GLM-5.3's text config calls this `linear_num_heads`.
-            .or_else(|| {
-                is_glm5_next
-                    .then(|| cfg_usize(tc, "linear_num_heads"))
-                    .flatten()
-            })
-            .or_else(|| kda_lac.and_then(|l| cfg_usize(l, "num_heads")))
-            .or_else(|| is_glm5_next.then_some(64)),
+            .or_else(|| kimi_lac.and_then(|l| cfg_usize(l, "num_heads"))),
         linear_num_value_heads: lnv,
         linear_key_head_dim: cfg_usize(tc, "linear_key_head_dim")
-            // GLM-5.3 uses the shorter `linear_head_dim` spelling for both
-            // KDA key and value channels.
-            .or_else(|| {
-                is_glm5_next
-                    .then(|| cfg_usize(tc, "linear_head_dim"))
-                    .flatten()
-            })
-            .or_else(|| kda_lac.and_then(|l| cfg_usize(l, "head_dim")))
-            .or_else(|| is_glm5_next.then_some(128)),
-        linear_value_head_dim: lvd
-            .or_else(|| {
-                is_glm5_next
-                    .then(|| cfg_usize(tc, "linear_head_dim"))
-                    .flatten()
-            })
-            .or_else(|| kda_lac.and_then(|l| cfg_usize(l, "head_dim")))
-            .or_else(|| is_glm5_next.then_some(128)),
+            .or_else(|| kimi_lac.and_then(|l| cfg_usize(l, "head_dim"))),
+        linear_value_head_dim: lvd.or_else(|| kimi_lac.and_then(|l| cfg_usize(l, "head_dim"))),
         hidden_act,
         embed_multiplier,
         // Gemma-4 attends with scaling = 1.0 (q-norm carries the scale).
@@ -3546,22 +3463,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         kda_gate_lower_bound: tc
             .get("linear_attn_config")
             .and_then(|c| c.get("gate_lower_bound"))
-            .and_then(|v| v.as_f64())
-            .or_else(|| {
-                // GLM-5.3 keeps the same scalar flat as `linear_lower_bound`.
-                is_glm5_next
-                    .then(|| tc.get("linear_lower_bound").and_then(|v| v.as_f64()))
-                    .flatten()
-            })
-            // An explicit JSON null disables the safe lower bound; only an
-            // omitted GLM field gets the dataclass's -5 default.
-            .or_else(|| {
-                (is_glm5_next
-                    && !tc
-                        .as_object()
-                        .is_some_and(|o| o.contains_key("linear_lower_bound")))
-                .then_some(-5.0)
-            }),
+            .and_then(|v| v.as_f64()),
         // Looped Transformer (Nanbeige 4.2): re-apply the layer stack num_loops times.
         num_loops: cfg_usize(tc, "num_loops").unwrap_or(1),
         // skip_loop_final_norm=false means loop_final_norm=true (apply norm after each loop).
@@ -4769,20 +4671,6 @@ pub fn run_convert_multi(
                 // qwen4 MTP is speculative-only and uses a different stack.
                 // PLE's integer hash tables are deterministic from the header
                 // and are recomputed by the runtime, avoiding lossy casts.
-                continue;
-            }
-            if arch.glm5_next.is_some()
-                && name
-                    .strip_prefix("model.layers.")
-                    .and_then(|r| r.split('.').next())
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .is_some_and(|li| li >= arch.num_layers)
-            {
-                // The release appends layer 45 as a speculative MTP block
-                // (eh_proj/enorm/hnorm + a second 288-expert layer) while
-                // num_hidden_layers is 45. CMF does not execute this draft
-                // stack yet; omitting it saves several GB and never changes
-                // exact trunk generation.
                 continue;
             }
             // Kimi: KDA layers share the `self_attn.` vendor prefix with
@@ -6569,20 +6457,6 @@ pub(crate) mod tests {
         assert!(unpack_fp8_blocks(&[0x7F], &[127], 1, 1, 1).is_err());
     }
 
-    #[test]
-    fn glm_kda_state_controls_stay_strict_f32() {
-        for name in [
-            "model.layers.0.mlp.expert_bias",
-            "model.layers.0.kda_attn.dt_bias",
-            "model.layers.0.kda_attn.A_log",
-            "model.layers.0.kda_attn.q_conv1d.weight",
-            "model.layers.0.kda_attn.k_conv1d.weight",
-            "model.layers.0.kda_attn.v_conv1d.weight",
-        ] {
-            assert!(force_f32(name), "{name} must not be narrowed");
-        }
-    }
-
     /// The block plane must be indexed by TILE, not by element: a wrong
     /// stride still produces plausible numbers, which is how a silently
     /// wrong conversion happens.
@@ -6612,8 +6486,8 @@ pub(crate) mod tests {
         assert!(unpack_fp8_scale_inv(&[0x7F; 4], &[1.0; 4], 2, 2, 1).is_err());
     }
 
-    /// GLM's fine-grained FP8 decode is row-independent just like the output
-    /// encoders.  Keep a non-trivial tail row/column shape here so a future
+    /// Fine-grained FP8 decode is row-independent just like the output
+    /// encoders. Keep a non-trivial tail row/column shape here so a future
     /// parallel rewrite cannot accidentally change block indexing or bytes
     /// while still passing a square toy case.
     #[test]
@@ -6876,89 +6750,6 @@ pub(crate) mod tests {
         assert_eq!(
             canon_name("model.layers.1.mlp.experts.e_score_correction_bias").as_deref(),
             Some("model.layers.1.mlp.expert_bias")
-        );
-    }
-
-    #[test]
-    fn glm5_next_arch_preserves_mhc_kda_dsa_and_router_geometry() {
-        let cfg = serde_json::json!({
-            "model_type": "glm5_next",
-            "num_nextn_predict_layers": 1,
-            "text_config": {
-                "model_type": "glm5_next_text",
-                "hidden_size": 4096,
-                "intermediate_size": 12288,
-                "num_hidden_layers": 4,
-                "num_attention_heads": 64,
-                "num_key_value_heads": 64,
-                "head_dim": 0,
-                "num_nextn_predict_layers": 1,
-                "q_lora_rank": 1536,
-                "kv_lora_rank": 512,
-                "qk_nope_head_dim": 256,
-                "qk_rope_head_dim": 0,
-                "v_head_dim": 256,
-                "vocab_size": 154880,
-                "max_position_embeddings": 1048576,
-                "layer_types": ["linear_attention", "linear_attention", "linear_attention", "deepseek_sparse_attention"],
-                "n_routed_experts": 288,
-                "num_experts_per_tok": 8,
-                "moe_intermediate_size": 2048,
-                "n_shared_experts": 1,
-                "norm_topk_prob": true,
-                "scoring_func": "sigmoid",
-                "routed_scaling_factor": 2.5,
-                "hc_mult": 4,
-                "hc_eps": 0.000001,
-                "hc_sinkhorn_iters": 20,
-                "swiglu_limit": 10.0,
-                "index_n_heads": 32,
-                "index_head_dim": 128,
-                "index_topk": 2048,
-                "index_kpool": 4
-            }
-        });
-        let arch = build_arch(&cfg).unwrap();
-        assert_eq!(arch.head_dim, 256, "serialized head_dim=0 must not survive");
-        assert!(matches!(arch.layer_types[0], LayerType::Kda));
-        assert!(matches!(arch.layer_types[3], LayerType::FullAttention));
-        assert_eq!(arch.kda_gate_lower_bound, Some(-5.0));
-        assert_eq!(arch.linear_num_key_heads, Some(64));
-        assert_eq!(arch.linear_key_head_dim, Some(128));
-        assert_eq!(arch.linear_value_head_dim, Some(128));
-        assert_eq!(arch.linear_conv_kernel_dim, Some(4));
-        assert!(
-            arch.mtp.is_none(),
-            "GLM release has no converted MTP tensors"
-        );
-        let moe = arch.moe.as_ref().unwrap();
-        assert!(moe.router_sigmoid);
-        assert_eq!(moe.top_k, 8);
-        assert_eq!(moe.shared_expert_intermediate_size, Some(2048));
-        assert_eq!(moe.routed_scaling_factor, Some(2.5));
-        let glm = arch.glm5_next.as_ref().unwrap();
-        assert_eq!((glm.hc_mult, glm.hc_sinkhorn_iters), (4, 20));
-        assert_eq!((glm.index_n_heads, glm.index_head_dim), (32, 128));
-        assert_eq!((glm.index_topk, glm.index_kpool), (2048, 4));
-        assert_eq!(
-            canon_name("model.language_model.layers.3.mlp.gate.e_score_correction_bias").as_deref(),
-            Some("model.layers.3.mlp.expert_bias")
-        );
-        assert_eq!(
-            quant_for_tensor(
-                &arch,
-                "model.layers.3.self_attn.q_b_proj.weight",
-                Quant::Q4TiledP,
-            ),
-            Quant::Q8_2f,
-        );
-        assert_eq!(
-            quant_for_tensor(
-                &arch,
-                "model.layers.3.mlp.experts.0.gate_proj.weight",
-                Quant::Q4TiledP,
-            ),
-            Quant::Q4TiledP,
         );
     }
 

@@ -894,7 +894,6 @@ fn arch_from_md(md: &BTreeMap<String, Val>, tensors: &[GgufTensor]) -> anyhow::R
                 num_heads: ssm_vheads.unwrap_or(0),
                 nphase: None,
                 value_head_dim: ssm_state.unwrap_or(0),
-            phase_delta_layers: None,
             })
         } else {
             None
@@ -936,7 +935,6 @@ fn arch_from_md(md: &BTreeMap<String, Val>, tensors: &[GgufTensor]) -> anyhow::R
         rope_freq_factors: None,
         logit_multiplier: None,
         loop_final_norm: false,
-        glm5_next: None,
         prism_hadamard: None,
     })
 }
@@ -1295,7 +1293,6 @@ fn qwen_image_arch(geometry: &QwenImageGeometry) -> ModelArch {
         kda_gate_lower_bound: None,
         num_loops: 1,
         loop_final_norm: false,
-        glm5_next: None,
         prism_hadamard: None,
     }
 }

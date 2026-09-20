@@ -8,7 +8,7 @@ use cortiq_core::mask::zero_tail_bits;
 use cortiq_core::quant::{GROUP_SIZE, dequant_q4_block, dequant_q8_row, f16_to_f32, f32_to_f16};
 use cortiq_core::{
     CMF_VERSION, CmfError, CmfHeader, CmfModel, LayerType, MaskCatalog, MaskPriority, ModelArch,
-    LinearCoreConfig, NormStyle, Quality, QuantType, TaskMask, TensorDtype, TensorSpec, hash64,
+    NormStyle, Quality, QuantType, TaskMask, TensorDtype, TensorSpec, hash64,
 };
 
 // ───────────────────────── helpers ─────────────────────────
@@ -35,7 +35,6 @@ fn tiny_arch() -> ModelArch {
         mtp: None,
         moe: None,
         qwen4_exp: None,
-        glm5_next: None,
         deepseek_v41: None,
         linear_core: None,
         head_clusters: None,
@@ -84,50 +83,6 @@ fn tiny_header() -> CmfHeader {
         quant_type: QuantType::F32,
         provenance: None,
     }
-}
-
-#[test]
-fn linear_core_metadata_is_validated_and_identity_is_canonical() {
-    let mut arch = tiny_arch();
-    arch.layer_types = vec![LayerType::LinearAttention; 2];
-    arch.linear_core = Some(LinearCoreConfig {
-        kind: "vmf_phase_delta_v1".into(),
-        num_heads: 2,
-        nphase: Some(2),
-        value_head_dim: 4,
-        phase_delta_layers: Some(vec![1, 0]),
-    });
-    arch.linear_num_key_heads = Some(2);
-    arch.linear_num_value_heads = Some(2);
-    arch.linear_key_head_dim = Some(2);
-    arch.linear_value_head_dim = Some(4);
-    arch.linear_conv_kernel_dim = Some(2);
-    arch.validate_linear_core_metadata().unwrap();
-    assert_eq!(
-        arch.linear_core_identity().unwrap()["phase_delta_layers"],
-        serde_json::json!([0, 1])
-    );
-
-    arch.linear_core
-        .as_mut()
-        .unwrap()
-        .phase_delta_layers = Some(vec![0, 0]);
-    assert!(arch.validate_linear_core_metadata().is_err());
-    arch.linear_core
-        .as_mut()
-        .unwrap()
-        .phase_delta_layers = Some(vec![0]);
-    arch.layer_types[0] = LayerType::FullAttention;
-    assert!(arch.validate_linear_core_metadata().is_err());
-
-    arch.linear_core = Some(LinearCoreConfig {
-        kind: "vmf_phase".into(),
-        num_heads: 2,
-        nphase: Some(2),
-        value_head_dim: 4,
-        phase_delta_layers: Some(vec![1]),
-    });
-    assert!(arch.validate_linear_core_metadata().is_err());
 }
 
 #[test]
