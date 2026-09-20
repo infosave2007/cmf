@@ -8173,6 +8173,17 @@ pub(crate) mod tests {
 
     #[test]
     fn multi_quant_emits_independent_profiles_and_matches_single_runs() {
+        // This end-to-end fixture uses the ordinary local source path.  The
+        // local-ready tests steer process-global environment variables while
+        // they certify their temporary shards, so only this small group of
+        // tests shares ENV_LOCK; the rest of the suite remains parallel.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var(LOCAL_READY_DIR_ENV);
+            std::env::remove_var(LOCAL_READY_POLL_MS_ENV);
+            std::env::remove_var(CONSUME_SOURCE_SHARDS_ENV);
+            std::env::remove_var(SOURCE_SHARD_PRIORITY_ENV);
+        }
         let dir =
             std::env::temp_dir().join(format!("cortiq-multi-convtest-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
