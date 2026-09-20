@@ -737,6 +737,19 @@ pub(crate) fn probe_reset() {
     }
 }
 
+/// The probe table is process-global by design, while these unit tests reset
+/// and seed selected entries to exercise arbitration. Keep only those tests
+/// out of each other's way; production callers still probe concurrently.
+#[cfg(test)]
+static PROBE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+fn probe_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    PROBE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod probe_tests {
     use super::*;
@@ -746,6 +759,7 @@ mod probe_tests {
     // classes — parallel test threads would race.
     #[test]
     fn probe_alternates_discards_cold_and_decides() {
+        let _probe_guard = probe_test_guard();
         probe_reset();
         // Probing: arms alternate.
         assert!(matches!(probe_arm(OpClass::Ffn), ProbeArm::Gpu));
@@ -783,6 +797,7 @@ mod probe_tests {
 
     #[test]
     fn a_remembered_verdict_is_adopted_and_a_stranger_is_not() {
+        let _probe_guard = probe_test_guard();
         // Probing is not free: on a Snapdragon 778G the deciding classes
         // cost minutes of wall clock before the first token, every
         // process, and reached the same verdict every time. The cache
@@ -3384,6 +3399,7 @@ mod probe_warmup_tests {
     /// them.
     #[test]
     fn a_class_whose_device_always_declines_settles_on_the_host() {
+        let _probe_guard = probe_test_guard();
         // A class no other test in this file touches: `probe_note_decline`
         // works on the process-wide probes by design, and the tests in
         // this binary share them.
