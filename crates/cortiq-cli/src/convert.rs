@@ -22,15 +22,15 @@ use cortiq_core::quant::{
     q4tp_code_stride, q4tp_ladder, q4tp_put_code,
 };
 use cortiq_core::types::{
-    LayerType, LinearCoreConfig, ModelArch, MoeConfig, NormStyle, QuantType, Qwen4ExpConfig,
-    TensorDtype, YarnConfig,
+    Glm5NextConfig, LayerType, LinearCoreConfig, ModelArch, MoeConfig, NormStyle,
+    PrismAffineConfig, PrismHadamardConfig, QuantType, Qwen4ExpConfig, TensorDtype, YarnConfig,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
 const GROUP_SIZE: usize = 32;
@@ -51,6 +51,10 @@ const LOCAL_READY_DIR_ENV: &str = "CMF_LOCAL_READY_DIR";
 /// uses the conservative default so a marker producer is not busy-polled.
 const LOCAL_READY_POLL_MS_ENV: &str = "CMF_LOCAL_READY_POLL_MS";
 const LOCAL_READY_POLL_MS_DEFAULT: u64 = 2_000;
+/// Optional comma-separated source basenames to process first.  This only
+/// affects the streamed source path; an unset variable preserves the index's
+/// validated stable order.
+const SOURCE_SHARD_PRIORITY_ENV: &str = "CMF_SOURCE_SHARD_PRIORITY";
 
 fn consume_source_shards_enabled() -> bool {
     std::env::var(CONSUME_SOURCE_SHARDS_ENV)
@@ -513,7 +517,7 @@ pub(crate) fn canon_name(raw: &str) -> Option<String> {
             return canon_name(&format!("model.{rest}"));
         }
     }
-    // ── DeepSeek-V4 (`deepseek_v4`) ────────────────────────────────────
+    // ── DeepSeek-V4/V4.1 (`deepseek_v4*`) ─────────────────────────────
     // Its checkpoint drops the `model.` wrapper entirely and spells the
     // blocks `attn`/`ffn`, so the names arrive at top level: `embed`,
     // `head`, `norm`, `layers.N.attn.*`, `layers.N.ffn.*`. Everything
@@ -547,7 +551,8 @@ pub(crate) fn canon_name(raw: &str) -> Option<String> {
                     "ffn.gate.weight" => "mlp.gate.weight".to_string(),
                     "ffn.gate.bias" => "mlp.expert_bias".to_string(),
                     // V4.1's vision-language router carries a second bias
-                    // plane consumed explicitly by the multimodal runtime.
+                    // plane; keep it beside the ordinary expert bias so the
+                    // multimodal runtime can apply it explicitly.
                     "ffn.gate.bias_vl" => "mlp.expert_bias_vl".to_string(),
                     // Hash-routed layers carry a token-id → expert table
                     // instead of a learned gate.
@@ -612,7 +617,40 @@ pub(crate) fn canon_name(raw: &str) -> Option<String> {
     if raw.ends_with(".mlp.experts.e_score_correction_bias") {
         return Some(raw.replace(".mlp.experts.e_score_correction_bias", ".mlp.expert_bias"));
     }
+    // GLM-5.3 keeps the noaux_tc correction beside the router itself.
+    if raw.ends_with(".mlp.gate.e_score_correction_bias") {
+        return Some(raw.replace(".mlp.gate.e_score_correction_bias", ".mlp.expert_bias"));
+    }
     Some(lfm2_canon(raw))
+}
+
+/// Prism/Bonsai uses the same text canonical layout as the ordinary Qwen
+/// reader, but its checkpoint wraps the language model one level deeper and
+/// carries a real vision tower.  Keep the generic `canon_name` multimodal
+/// policy unchanged (older readers intentionally drop vision); only this
+/// explicit architecture path maps the retained tower into `vis.*`.
+fn canon_name_for_arch(arch: &ModelArch, raw: &str) -> Option<String> {
+    if arch.prism_hadamard.is_none() {
+        return canon_name(raw);
+    }
+    if let Some(rest) = raw.strip_prefix("language_model.") {
+        if rest == "lm_head.weight" || rest == "lm_head.bias" {
+            return Some(rest.to_string());
+        }
+        if let Some(rest) = rest.strip_prefix("model.") {
+            return canon_name(&format!("model.{rest}"));
+        }
+    }
+    let raw = raw.strip_prefix("model.").unwrap_or(raw);
+    if let Some(rest) = raw.strip_prefix("vision_tower.") {
+        // The Qwen3.5 tower already follows the runtime's patch_embed /
+        // blocks / merger naming; only the source namespace is different.
+        if let Some(rest) = rest.strip_prefix("patch_embed.proj.") {
+            return Some(format!("vis.patch_embed.{rest}"));
+        }
+        return Some(format!("vis.{rest}"));
+    }
+    canon_name(raw)
 }
 
 /// Map LFM2 / LFM2-MoE vendor tensor names onto CMF's canonical (Qwen2)
@@ -672,15 +710,35 @@ fn lfm2_canon(name: &str) -> String {
 /// DeepSeek-V4's table holds expert ids per vocabulary id (129 280 rows).
 fn force_f32(name: &str) -> bool {
     name.ends_with(".tid2eid")
+        // GLM's noaux_tc correction bias is explicitly kept in fp32 by
+        // Transformers and is applied on every sparse-layer route choice.
         || name.ends_with(".mlp.expert_bias")
         || name.ends_with(".mlp.expert_bias_vl")
+        // DeepSeek-lineage MTP keeps the upstream `ffn.gate.*` spelling.
         || name.ends_with(".ffn.gate.bias")
         || name.ends_with(".ffn.gate.bias_vl")
+        // GLM-5.3 mHC explicitly evaluates its tiny routing projections and
+        // Sinkhorn parameters in fp32. They are <0.1% of the checkpoint and
+        // quantizing them compounds an error twice in every layer.
+        || name.contains(".hc_attn_")
+        || name.contains(".hc_ffn_")
+        // Transformers keeps the KDA state-control tensors in strict fp32
+        // (`_keep_in_fp32_modules_strict`).  They feed exp/sigmoid gates and
+        // are particularly sensitive to bf16/f16 rounding.  The explicit
+        // names also take precedence over the generic f16 conv policy below.
+        || name.ends_with("kda_attn.dt_bias")
+        || name.ends_with("kda_attn.A_log")
+        || name.ends_with("kda_attn.q_conv1d.weight")
+        || name.ends_with("kda_attn.k_conv1d.weight")
+        || name.ends_with("kda_attn.v_conv1d.weight")
 }
 
-/// DeepSeek-V4.1 vision and aligner matrices are small and sensitive to
-/// quantization. Keep them exact in a q4tp/q2tp profile without affecting
-/// unrelated model families that use generic `vision.` prefixes.
+/// DeepSeek-V4.1's vision tower and aligner are small relative to the text
+/// checkpoint but unusually sensitive to matrix quantization. Keep their
+/// matrix weights exact in the q4tp profile. The architecture guard is
+/// deliberate: other model families may use the same generic prefixes for
+/// unrelated tensors, and existing F32 controls are checked first by the
+/// emitter below.
 fn force_dsv41_vision_f16(arch: &ModelArch, name: &str, shape: &[usize]) -> bool {
     arch.deepseek_v41.is_some()
         && shape.len() == 2
@@ -711,6 +769,8 @@ fn force_f16(name: &str) -> bool {
         || name.ends_with("mlp.gate.weight")
         || name.ends_with("shared_expert_gate.weight")
         || name.ends_with("self_attn.g_proj.weight")
+        // Engram's tiny lookup-attention projections stay exact; only its
+        // giant embed table is retained as raw FP8 auxiliary bytes.
         || name.ends_with(".engram.q_weight")
         || name.ends_with(".engram.k_weight")
         // Qwen3.8 hyper-connection projections sit directly on sigmoid
@@ -743,10 +803,11 @@ fn quant_for_tensor(arch: &ModelArch, name: &str, base: Quant) -> Quant {
     if arch.arch_name.eq_ignore_ascii_case("granite") && vocabulary_edges {
         return Quant::Q8_2f;
     }
-    if arch.qwen4_exp.is_none() {
+    if arch.qwen4_exp.is_none() && arch.glm5_next.is_none() {
         return base;
     }
     let recurrent_skeleton = name.contains(".linear_attn.")
+        || name.contains(".kda_attn.")
         || name.contains(".self_attn.")
         || (name.contains(".ple.")
             && (name.ends_with("key_proj.weight") || name.ends_with("value_proj.weight")));
@@ -776,6 +837,9 @@ pub(crate) enum Quant {
     /// keeps `down` experts and the skeleton at q4tp — the 2/4 split that
     /// mirrors Escha's 2/3-bit choice.
     Q2TiledP,
+    /// Existing dtype16 Q2TP payload with the explicit Prism affine operator
+    /// `(c - 1.0) * s` enabled by header metadata.
+    Q2TiledPAffine,
     /// 1-bit binary (explicit opt-in): for 1-bit-TRAINED models
     /// (Bonsai / BitNet class), where per-group weights already sit on
     /// two levels ±s and the encoding is (near-)lossless. As PTQ of a
@@ -822,6 +886,10 @@ pub(crate) fn quantize_2d(
             (TensorDtype::Q2TiledP, encode_q2tp(vals, out_dim, in_dim))
         }
         Quant::Q2TiledP => (TensorDtype::Q8_2f, encode_q8_2f(vals, out_dim, in_dim)),
+        Quant::Q2TiledPAffine if in_dim % GROUP_SIZE == 0 => {
+            (TensorDtype::Q2TiledP, encode_q2tp(vals, out_dim, in_dim))
+        }
+        Quant::Q2TiledPAffine => (TensorDtype::Q8_2f, encode_q8_2f(vals, out_dim, in_dim)),
         Quant::Vbit if in_dim % GROUP_SIZE == 0 => {
             (TensorDtype::VbitRo, encode_vbit_ro(vals, out_dim, in_dim))
         }
@@ -857,12 +925,13 @@ pub(crate) fn parse_quant(s: &str) -> anyhow::Result<Quant> {
         "q4t" | "q4_tiled" => Quant::Q4Tiled,
         "q4tp" | "q4t_pred" => Quant::Q4TiledP,
         "q2tp" | "q2t_pred" => Quant::Q2TiledP,
+        "q2tp_affine" | "q2tp-affine" | "q2t_affine" => Quant::Q2TiledPAffine,
         "q1" => Quant::Q1,
         "q1p" | "q1_ptq" => Quant::Q1p,
         "q1s" | "q1_mask" => Quant::Q1s,
         "q1t" | "q1_ternary" => Quant::Q1t,
         other => anyhow::bail!(
-            "unknown quant '{other}' (use q8, q8_2f, q4, q4t, q4tp, q2tp, f16, vbit, q1, q1p, q1s, or q1t)"
+            "unknown quant '{other}' (use q8, q8_2f, q4, q4t, q4tp, q2tp, q2tp_affine, f16, vbit, q1, q1p, q1s, or q1t)"
         ),
     })
 }
@@ -877,10 +946,109 @@ pub(crate) fn quant_name(quant: Quant) -> &'static str {
         Quant::Q4Tiled => "q4t",
         Quant::Q4TiledP => "q4tp",
         Quant::Q2TiledP => "q2tp",
+        Quant::Q2TiledPAffine => "q2tp_affine",
         Quant::Q1 => "q1",
         Quant::Q1p => "q1p",
         Quant::Q1s => "q1s",
         Quant::Q1t => "q1t",
+    }
+}
+
+/// Quantization profile used by the converter's one-pass multi-output path.
+/// `Q2TiledP` is a logical profile: the file keeps the normal q4tp layout for
+/// the skeleton/down planes while putting gate/up expert (or dense FFN) planes
+/// on q2tp. Keeping this decision here means every requested output sees the
+/// same decoded source tensor and only the encoder differs.
+fn profile_quant(arch: &ModelArch, requested: Quant, name: &str) -> Quant {
+    if matches!(requested, Quant::Q2TiledPAffine) {
+        // Prism weights are all trained ternary projections in one rotated
+        // basis; never apply q2tp's mixed expert-only policy.
+        return requested;
+    }
+    let gu = requested;
+    let base = if matches!(requested, Quant::Q2TiledP) {
+        Quant::Q4TiledP
+    } else {
+        requested
+    };
+    let expert_gu = q2tp_expert_gate_or_up(name)
+        || (matches!(requested, Quant::Q2TiledP)
+            && arch.moe.is_none()
+            && q2tp_dense_gate_or_up(name));
+    let q = if expert_gu { gu } else { base };
+    quant_for_tensor(arch, name, q)
+}
+
+#[derive(Clone, Copy)]
+enum EmitMode {
+    /// Apply the normal per-name profile policy (including q2tp gate/up).
+    Auto,
+    /// Keep this tensor in exact f16 regardless of profile.
+    F16,
+    /// Keep this tensor in exact f32 regardless of profile.
+    F32,
+}
+
+/// Encode one canonical tensor into each active output profile. The source
+/// values are borrowed and are therefore decoded exactly once per source
+/// tensor; each profile owns its independent encoded payload and directory
+/// record. `active` is false for outputs that already checkpointed this shard.
+fn emit_profiled_tensor(
+    batches: &mut [Vec<TensorSpec>],
+    profiles: &[Quant],
+    active: &[bool],
+    arch: &ModelArch,
+    name: &str,
+    shape: &[usize],
+    vals: &[f32],
+    mode: EmitMode,
+) {
+    debug_assert_eq!(batches.len(), profiles.len());
+    debug_assert_eq!(active.len(), profiles.len());
+    let numel: usize = shape.iter().product();
+    for ((batch, &requested), &is_active) in batches.iter_mut().zip(profiles).zip(active) {
+        if !is_active {
+            continue;
+        }
+        let (dtype, data) = match mode {
+            EmitMode::F32 => (
+                TensorDtype::F32,
+                vals.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            ),
+            EmitMode::F16 => (TensorDtype::F16, encode_f16(vals)),
+            EmitMode::Auto => {
+                if force_f32(name) {
+                    (
+                        TensorDtype::F32,
+                        vals.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                    )
+                } else if force_dsv41_vision_f16(arch, name, shape) {
+                    (TensorDtype::F16, encode_f16(vals))
+                } else if shape.len() != 2
+                    || numel < GROUP_SIZE
+                    || force_f16(name)
+                    // Prism's Qwen3 vision tower is retained losslessly.  Its
+                    // qwen3vis runtime expects f16/f32 matrices, not the
+                    // language-side q2tp transform.
+                    || name.starts_with("vis.")
+                {
+                    (TensorDtype::F16, encode_f16(vals))
+                } else {
+                    quantize_2d(
+                        profile_quant(arch, requested, name),
+                        vals,
+                        shape[0],
+                        shape[1],
+                    )
+                }
+            }
+        };
+        batch.push(TensorSpec {
+            name: name.to_string(),
+            dtype,
+            shape: shape.to_vec(),
+            data,
+        });
     }
 }
 
@@ -1734,14 +1902,21 @@ pub(crate) fn encode_f16(vals: &[f32]) -> Vec<u8> {
 const RAW_AUX_COPY_CHUNK: usize = 8 * 1024 * 1024;
 
 /// Copy a native auxiliary tensor without decoding it or putting it through a
-/// quantizer. DeepSeek-V4.1's Engram embedding planes remain U8 records with
-/// their original 2-D shape and are interpreted by the V4.1 runtime.
+/// quantizer. DeepSeek-V4.1's Engram embedding planes are enormous FP8 byte
+/// tables; they remain `U8` records with their original 2-D shape and are
+/// interpreted by the V4.1 runtime. The writer hashes and copies them in
+/// bounded chunks directly from the safetensors mmap.
 fn push_raw_u8_tensor(
-    writer: &mut cortiq_core::format::CmfStreamWriter,
+    writers: &mut [Option<cortiq_core::format::CmfStreamWriter>],
+    active: &[bool],
     name: &str,
     shape: &[usize],
     data: &[u8],
 ) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        writers.len() == active.len(),
+        "raw tensor output count mismatch"
+    );
     let expected = shape.iter().try_fold(1usize, |n, &d| n.checked_mul(d));
     let expected =
         expected.ok_or_else(|| anyhow::anyhow!("raw tensor '{name}': shape overflow"))?;
@@ -1752,9 +1927,18 @@ fn push_raw_u8_tensor(
         shape,
         expected
     );
-    writer
-        .push_bounded(name, TensorDtype::U8, shape, data, RAW_AUX_COPY_CHUNK)
-        .map_err(|e| anyhow::anyhow!("write raw tensor '{name}': {e}"))
+    for (i, (writer, &is_active)) in writers.iter_mut().zip(active).enumerate() {
+        if !is_active {
+            continue;
+        }
+        let writer = writer
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("output {i} has no active writer for '{name}'"))?;
+        writer
+            .push_bounded(name, TensorDtype::U8, shape, data, RAW_AUX_COPY_CHUNK)
+            .map_err(|e| anyhow::anyhow!("write raw tensor '{name}': {e}"))?;
+    }
+    Ok(())
 }
 
 fn drain_to_writer(
@@ -1797,6 +1981,67 @@ pub(crate) fn to_f32(dtype: &str, raw: &[u8]) -> anyhow::Result<Vec<f32>> {
             .collect(),
         other => anyhow::bail!("unsupported safetensors dtype '{other}' (need F32/F16/BF16)"),
     })
+}
+
+/// Reorder the source MLX Conv3d patch kernel into the flattened row layout
+/// consumed by the CMF Qwen3 vision tower.  MLX's kernel is
+/// `[out, temporal, patch_h, patch_w, in_channels]`; the CMF preprocessor
+/// presents each patch as `[in_channels, temporal, patch_h, patch_w]`.
+fn flatten_prism_patch_weight(
+    dtype: &str,
+    shape: &[usize],
+    raw: &[u8],
+) -> anyhow::Result<(Vec<usize>, Vec<f32>)> {
+    anyhow::ensure!(
+        dtype == "F16",
+        "Prism vision patch kernel must be F16, got {dtype}"
+    );
+    anyhow::ensure!(
+        shape.len() == 5,
+        "Prism vision patch kernel must be [out,t,h,w,c], got {shape:?}"
+    );
+    let [out, temporal, patch_h, patch_w, channels] =
+        [shape[0], shape[1], shape[2], shape[3], shape[4]];
+    anyhow::ensure!(
+        [out, temporal, patch_h, patch_w, channels]
+            .iter()
+            .all(|&n| n > 0),
+        "Prism vision patch kernel has an empty dimension: {shape:?}"
+    );
+    let source = to_f32(dtype, raw)?;
+    let source_len = out
+        .checked_mul(temporal)
+        .and_then(|n| n.checked_mul(patch_h))
+        .and_then(|n| n.checked_mul(patch_w))
+        .and_then(|n| n.checked_mul(channels))
+        .ok_or_else(|| anyhow::anyhow!("Prism vision patch kernel shape overflows"))?;
+    anyhow::ensure!(
+        source.len() == source_len,
+        "Prism vision patch kernel has {} values, expected {source_len}",
+        source.len()
+    );
+    let patch_width = channels
+        .checked_mul(temporal)
+        .and_then(|n| n.checked_mul(patch_h))
+        .and_then(|n| n.checked_mul(patch_w))
+        .ok_or_else(|| anyhow::anyhow!("Prism vision patch width overflows"))?;
+    let mut out_rows = vec![0.0f32; out * patch_width];
+    for o in 0..out {
+        for c in 0..channels {
+            for t in 0..temporal {
+                for y in 0..patch_h {
+                    for x in 0..patch_w {
+                        let src =
+                            ((((o * temporal + t) * patch_h + y) * patch_w + x) * channels) + c;
+                        let dst =
+                            ((((o * channels + c) * temporal + t) * patch_h + y) * patch_w) + x;
+                        out_rows[dst] = source[src];
+                    }
+                }
+            }
+        }
+    }
+    Ok((vec![out, patch_width], out_rows))
 }
 
 /// OCP MXFP4 (compressed-tensors "mxfp4-pack-quantized", Kimi-K3):
@@ -1846,6 +2091,12 @@ pub(crate) fn fp8_e4m3_to_f32(b: u8) -> f32 {
     let sign = if b & 0x80 != 0 { -1.0f32 } else { 1.0 };
     let exp = ((b >> 3) & 0x0F) as i32;
     let man = (b & 0x07) as f32;
+    // OCP E4M3FN reserves the all-ones exponent/mantissa encoding for NaN
+    // (there are no infinities).  Treating 0x7f as a finite 480.0 silently
+    // poisons every downstream quantization block.
+    if exp == 15 && man == 7.0 {
+        return f32::NAN;
+    }
     let mag = if exp == 0 {
         man * (2f32).powi(-9)
     } else {
@@ -1893,9 +2144,10 @@ pub(crate) fn unpack_fp8_blocks(
     Ok(out)
 }
 
-/// Fine-grained FP8 with one ordinary f32 inverse scale per source block.
-/// V4.1's `weight_block_size` controls the block geometry; older checkpoints
-/// use 128 while the V4.1 source uses 32.
+/// Fine-grained FP8 used by GLM/DeepSeek-V3 checkpoints: one ordinary f32
+/// inverse scale per 128×128 weight block (`weight_scale_inv`). Unlike the
+/// DSV4 E8M0 plane this scale is stored directly, so dequantization is simply
+/// `fp8_value * scale_inv[block_row, block_col]`.
 fn unpack_fp8_scale_inv(
     packed: &[u8],
     scales: &[f32],
@@ -1903,7 +2155,6 @@ fn unpack_fp8_scale_inv(
     cols: usize,
     block: usize,
 ) -> anyhow::Result<Vec<f32>> {
-    anyhow::ensure!(block > 0, "fp8 scale_inv: block size 0");
     anyhow::ensure!(
         packed.len() == rows * cols,
         "fp8 scale_inv: weight size mismatch"
@@ -1999,6 +2250,162 @@ pub(crate) fn unpack_mlx(
         }
     }
     Ok(out)
+}
+
+/// Stream the source MLX ternary planes into the production dtype16 Q2TP
+/// affine profile.  This is intentionally not an experimental ternary dtype: dtype16
+/// reserves rung 0 for an exact zero and has only 31 positive rungs, so row
+/// parameters are refit against `q2tp_ladder` while the source 0/1/2 symbol
+/// plane is copied unchanged.
+fn encode_mlx_q2tp_affine(
+    w_raw: &[u8],
+    s_raw: &[u8],
+    b_raw: &[u8],
+    out_dim: usize,
+    in_dim: usize,
+) -> anyhow::Result<(Vec<u8>, f32)> {
+    anyhow::ensure!(
+        in_dim % 128 == 0,
+        "Prism MLX input width {in_dim} is not g128"
+    );
+    anyhow::ensure!(
+        w_raw.len() == out_dim * in_dim / 16 * 4,
+        "Prism MLX packed weight length mismatch"
+    );
+    anyhow::ensure!(
+        s_raw.len() == out_dim * (in_dim / 128) * 2,
+        "Prism MLX scale length mismatch"
+    );
+    anyhow::ensure!(b_raw.len() == s_raw.len(), "Prism MLX bias length mismatch");
+    let gpr = in_dim / GROUP_SIZE;
+    let src_gpr = in_dim / 128;
+    let stride = q4tp_code_stride(gpr);
+    let mut chunks = vec![0u8; out_dim * gpr * Q2TP_CHUNK];
+    let mut params = vec![0u8; out_dim * 4];
+    let mut codes = vec![0u8; out_dim * stride];
+    let bad_symbol = AtomicU8::new(0);
+    let sum_sq = Mutex::new(0.0f64);
+    let n_scales = AtomicUsize::new(0);
+    encode_rows_parallel(
+        out_dim,
+        [gpr * Q2TP_CHUNK, 4, stride],
+        [&mut chunks, &mut params, &mut codes],
+        &|r, chunks_row, params_row, codes_row| {
+            let mut source_scales = vec![F16_TINY; gpr];
+            let mut lo = f32::INFINITY;
+            let mut hi = f32::NEG_INFINITY;
+            for g in 0..gpr {
+                let sg = g / 4;
+                let off = (r * src_gpr + sg) * 2;
+                let s = f16_to_f32(u16::from_le_bytes([s_raw[off], s_raw[off + 1]]));
+                let bias = f16_to_f32(u16::from_le_bytes([b_raw[off], b_raw[off + 1]]));
+                if !s.is_finite() || s <= 0.0 {
+                    bad_symbol.store(255, Ordering::Relaxed);
+                    return;
+                }
+                if (bias + s).abs() > f32::max(2.0e-3, s.abs() * 2.0e-3) {
+                    bad_symbol.store(254, Ordering::Relaxed);
+                    return;
+                }
+                source_scales[g] = s;
+                let lg = s.log2();
+                lo = lo.min(lg);
+                hi = hi.max(lg);
+            }
+            let lo_h = f32_to_f16(lo);
+            let lo_r = f16_to_f32(lo_h);
+            let mut st_h = f32_to_f16((hi - lo_r).max(0.0) / Q2TP_LMAX as f32);
+            for _ in 0..64 {
+                let st = f16_to_f32(st_h);
+                if st > 0.0 && lo_r + Q2TP_LMAX as f32 * st >= hi {
+                    break;
+                }
+                st_h += 1;
+            }
+            params_row[..2].copy_from_slice(&lo_h.to_le_bytes());
+            params_row[2..].copy_from_slice(&st_h.to_le_bytes());
+            let tab = q2tp_ladder(params_row, 0);
+            let st = f16_to_f32(st_h);
+            for g in 0..gpr {
+                // Rung zero is reserved for an exact zero group in dtype16;
+                // source ternary scales are positive, so use 1..=31.
+                let c = if st > 0.0 {
+                    1 + ((source_scales[g].log2() - lo_r) / st)
+                        .round_ties_even()
+                        .clamp(0.0, Q2TP_LMAX as f32) as usize
+                } else {
+                    1
+                };
+                q4tp_put_code(codes_row, g, c);
+                let fitted = tab[c];
+                let d = fitted - source_scales[g];
+                *sum_sq.lock().unwrap() += (d * d) as f64;
+                n_scales.fetch_add(1, Ordering::Relaxed);
+                let dst = &mut chunks_row[g * Q2TP_CHUNK..(g + 1) * Q2TP_CHUNK];
+                for k in 0..Q2TP_CHUNK {
+                    let col0 = g * GROUP_SIZE + k * 4;
+                    let word0 = (r * (in_dim / 16) + col0 / 16) * 4;
+                    let word = u32::from_le_bytes([
+                        w_raw[word0],
+                        w_raw[word0 + 1],
+                        w_raw[word0 + 2],
+                        w_raw[word0 + 3],
+                    ]);
+                    let mut b = 0u8;
+                    for j in 0..4 {
+                        let c = ((word >> (2 * ((col0 + j) % 16))) & 3) as u8;
+                        if c == 3 {
+                            bad_symbol.store(3, Ordering::Relaxed);
+                        }
+                        b |= c << (2 * j);
+                    }
+                    dst[k] = b;
+                }
+            }
+        },
+    );
+    let bad = bad_symbol.load(Ordering::Relaxed);
+    if bad != 0 {
+        anyhow::bail!("Prism MLX source contains invalid scale or reserved code {bad}");
+    }
+    chunks.extend_from_slice(&params);
+    chunks.extend_from_slice(&codes);
+    let count = n_scales.load(Ordering::Relaxed);
+    let rms = if count == 0 {
+        0.0
+    } else {
+        (sum_sq.into_inner().unwrap() / count as f64).sqrt() as f32
+    };
+    Ok((chunks, rms))
+}
+
+/// Validate the source MLX packed plane before either Prism output profile is
+/// written.  Code 3 is reserved by both CMF codecs; accepting it in the
+/// ordinary q2tp candidate would make the two files disagree about the
+/// source contract and would hide a corrupt checkpoint behind PTQ noise.
+fn validate_mlx_ternary_codes(w_raw: &[u8], out_dim: usize, in_dim: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        in_dim % 16 == 0,
+        "Prism MLX input width {in_dim} is not packed-g16"
+    );
+    let words_per_row = in_dim / 16;
+    anyhow::ensure!(
+        w_raw.len() == out_dim.saturating_mul(words_per_row).saturating_mul(4),
+        "Prism MLX packed weight length mismatch"
+    );
+    for (word_index, raw) in w_raw.chunks_exact(4).enumerate() {
+        let word = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+        for j in 0..16 {
+            if ((word >> (2 * j)) & 3) == 3 {
+                let row = word_index / words_per_row;
+                let col = (word_index % words_per_row) * 16 + j;
+                anyhow::bail!(
+                    "Prism MLX source contains reserved code 3 at row {row}, column {col}"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Blob-layout sort key that puts tensors in decode-traversal order:
@@ -2097,9 +2504,10 @@ impl SafeTensors {
     }
 }
 
-/// Release and unlink one local source shard after its converted payloads and
-/// manifest checkpoint are durable. The metadata remains available for any
-/// companion/name lookups made by the caller before the next shard.
+/// Release and unlink one local source shard after every active output has
+/// checkpointed it. The index/config/tokenizer remain untouched; a missing
+/// source file is reported as already consumed so a resumed output can finish
+/// its cleanup pass without treating the absence as a conversion failure.
 fn consume_source_shard(files: &mut [SafeTensors], index: usize, dir: &Path) -> anyhow::Result<()> {
     let source_name = files
         .get(index)
@@ -2112,10 +2520,12 @@ fn consume_source_shard(files: &mut [SafeTensors], index: usize, dir: &Path) -> 
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             eprintln!("  source shard {source_name} already absent")
         }
-        Err(e) => anyhow::bail!(
-            "remove consumed source shard {}: {e}",
-            source_path.display()
-        ),
+        Err(e) => {
+            anyhow::bail!(
+                "remove consumed source shard {}: {e}",
+                source_path.display()
+            )
+        }
     }
     Ok(())
 }
@@ -2184,9 +2594,56 @@ fn source_shard_name(path: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
-/// Count tensors from safetensors headers/index without mapping payloads.
-/// Resume uses this before opening source files so shards deleted after a
-/// durable checkpoint still contribute to progress and head sizing.
+/// Move the explicitly requested source basenames to the front while keeping
+/// every other validated shard in its original order.  The source list has
+/// already come from the HF index (or the local source index) when this is
+/// called, so an unknown name is a configuration error rather than a reason
+/// to probe arbitrary files.  Empty, repeated, and unknown entries fail
+/// closed before any streamed shard is opened.
+fn apply_source_shard_priority(stream_shards: &mut Vec<String>) -> anyhow::Result<()> {
+    let Some(raw) = std::env::var_os(SOURCE_SHARD_PRIORITY_ENV) else {
+        return Ok(());
+    };
+    let raw = raw
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("{SOURCE_SHARD_PRIORITY_ENV} must be valid UTF-8"))?;
+
+    let known: HashSet<String> = stream_shards.iter().cloned().collect();
+    anyhow::ensure!(
+        known.len() == stream_shards.len(),
+        "validated source shard list contains duplicate filenames"
+    );
+    let mut selected = HashSet::new();
+    let mut priority = Vec::new();
+    for name in raw.split(',') {
+        anyhow::ensure!(
+            !name.is_empty(),
+            "{SOURCE_SHARD_PRIORITY_ENV} contains an empty entry"
+        );
+        anyhow::ensure!(
+            known.contains(name),
+            "{SOURCE_SHARD_PRIORITY_ENV} names unknown source shard {name:?}"
+        );
+        anyhow::ensure!(
+            selected.insert(name.to_string()),
+            "{SOURCE_SHARD_PRIORITY_ENV} repeats source shard {name:?}"
+        );
+        priority.push(name.to_string());
+    }
+    priority.extend(
+        stream_shards
+            .iter()
+            .filter(|name| !selected.contains(name.as_str()))
+            .cloned(),
+    );
+    *stream_shards = priority;
+    Ok(())
+}
+
+/// Count tensors from the small safetensors headers/index without mapping the
+/// payload. Resume uses this before opening source files so shards deleted by
+/// a prior successful checkpoint can still contribute to progress and head
+/// sizing.
 fn source_shard_counts(dir: &Path) -> anyhow::Result<Vec<(String, usize)>> {
     let single = dir.join("model.safetensors");
     if single.exists() {
@@ -2197,11 +2654,11 @@ fn source_shard_counts(dir: &Path) -> anyhow::Result<Vec<(String, usize)>> {
     }
     let index = dir.join("model.safetensors.index.json");
     if index.exists() {
+        let mut counts: HashMap<String, usize> = HashMap::new();
         let idx: serde_json::Value = serde_json::from_slice(&fs::read(&index)?)?;
         let map = idx["weight_map"]
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("bad index json"))?;
-        let mut counts: HashMap<String, usize> = HashMap::new();
         for file in map.values().filter_map(|v| v.as_str()) {
             *counts.entry(source_shard_name(file)).or_default() += 1;
         }
@@ -2236,8 +2693,9 @@ fn safetensors_tensor_count(path: &Path) -> anyhow::Result<usize> {
 }
 
 /// Open only source shards absent from the supplied completed-mark set. A
-/// missing shard is acceptable on resume only when it is proven complete by
-/// the output manifest; an unmarked missing shard remains a hard error.
+/// missing shard is therefore acceptable only when its basename is proven
+/// complete by every output manifest; an unmarked missing shard remains a
+/// hard error in `open_safetensors`.
 pub(crate) fn open_model_filtered(
     dir: &Path,
     completed_shards: &std::collections::HashSet<String>,
@@ -2273,8 +2731,10 @@ pub(crate) fn open_model_filtered(
     )
 }
 
-/// Read only completed source-shard marks from a manifest. A malformed line
-/// ends the durable prefix, so later marks are not trusted for filtering.
+/// Read only completed source-shard marks from a manifest. This mirrors the
+/// corruption boundary in `CmfStreamWriter::resume`: a malformed/truncated
+/// line ends the durable prefix, so later marks are not trusted for filtering
+/// source inputs.
 fn resume_manifest_marks(path: &Path) -> std::collections::HashSet<String> {
     let Ok(text) = fs::read_to_string(path) else {
         return std::collections::HashSet::new();
@@ -2299,12 +2759,15 @@ fn cfg_usize(c: &serde_json::Value, key: &str) -> Option<usize> {
 }
 
 /// Source FP8 tile width for DeepSeek-family checkpoints. V4.1 stores its
-/// E4M3 weight and E8M0 scale plane over 32x32 tiles; older V4 files use 128.
+/// E4M3 weight and E8M0 scale plane over 32×32 tiles; older V4 files use the
+/// 128×128 layout. Keep the source policy separate from the CMF quantizer,
+/// since this value controls lossless decode before q4tp/q2tp encoding.
 fn source_fp8_block(config: &serde_json::Value) -> usize {
-    if config.get("model_type").and_then(|v| v.as_str()) != Some("deepseek_v41") {
+    let model_type = config.get("model_type").and_then(|v| v.as_str());
+    if model_type != Some("deepseek_v41") {
         return 128;
     }
-    config
+    let block = config
         .get("quantization_config")
         .and_then(|q| q.get("weight_block_size"))
         .and_then(|v| v.as_array())
@@ -2312,8 +2775,10 @@ fn source_fp8_block(config: &serde_json::Value) -> usize {
             let row = a.first()?.as_u64()? as usize;
             let col = a.get(1)?.as_u64()? as usize;
             (row > 0 && row == col).then_some(row)
-        })
-        .unwrap_or(32)
+        });
+    // The published V4.1 config carries [32, 32]. Keep the native default
+    // when a compact test/config omits quantization_config entirely.
+    block.unwrap_or(32)
 }
 
 /// Build ModelArch from a HF config.json (dense transformer families).
@@ -2325,8 +2790,11 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_string();
+    let is_prism = model_type == "prism_hadamard_qwen35";
     let is_dsv4 = model_type == "deepseek_v4";
     let is_dsv41 = model_type == "deepseek_v41";
+    let tc_model_type = tc.get("model_type").and_then(|v| v.as_str()).unwrap_or("");
+    let is_glm5_next = model_type == "glm5_next" || tc_model_type == "glm5_next_text";
     // DeepSeek-V4: the name mapping and both source quantizations (FP8
     // E4M3 with 128x128 block scales, MXFP4 experts) are in place, but
     // five of its blocks have no runtime yet — and without them the file
@@ -2368,10 +2836,17 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
     // Kimi Linear / Kimi-K3: the per-layer schedule lives in
     // linear_attn_config.full_attn_layers (1-BASED layer numbers);
     // everything else is a KDA layer.
-    let tc_model_type = tc.get("model_type").and_then(|v| v.as_str()).unwrap_or("");
     let is_kimi =
         model_type == "kimi_linear" || model_type == "kimi_k3" || tc_model_type == "kimi_linear";
-    let layer_types = if let Some(lac) = tc.get("linear_attn_config").filter(|_| is_kimi) {
+    let layer_types = if is_glm5_next {
+        layer_types
+            .into_iter()
+            .map(|t| match t {
+                LayerType::LinearAttention => LayerType::Kda,
+                other => other,
+            })
+            .collect()
+    } else if let Some(lac) = tc.get("linear_attn_config").filter(|_| is_kimi) {
         anyhow::ensure!(
             tc.get("attn_res_block_size")
                 .map(|v| v.is_null())
@@ -2416,7 +2891,9 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
     } else {
         layer_types
     };
-    let kimi_lac = tc.get("linear_attn_config").filter(|_| is_kimi);
+    let kda_lac = tc
+        .get("linear_attn_config")
+        .filter(|_| is_kimi || is_glm5_next);
     let has_linear = layer_types
         .iter()
         .any(|t| matches!(t, LayerType::LinearAttention));
@@ -2428,6 +2905,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
             num_heads: lnv.unwrap_or(0),
             nphase: None,
             value_head_dim: lvd.unwrap_or(0),
+            phase_delta_layers: None,
         })
     } else {
         None
@@ -2517,6 +2995,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         .map(|ne| {
             let mt = model_type.to_lowercase();
             let ntp_default = mt.starts_with("qwen3_5")
+                || is_prism
                 || mt.contains("qwen3_next")
                 || mt.contains("qwen4_exp")
                 || mt.contains("gemma4");
@@ -2551,6 +3030,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
                     }),
                 router_sigmoid: is_lfm2
                     || is_laguna
+                    || tc.get("scoring_func").and_then(|v| v.as_str()) == Some("sigmoid")
                     || tc
                         .get("moe_router_activation_func")
                         .and_then(|v| v.as_str())
@@ -2566,8 +3046,21 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
                 router_resonance: false,
             }
         });
-    let head_dim = cfg_usize(tc, "head_dim").unwrap_or(hidden / n_heads.max(1));
-    // Zero-centered RMSNorm x̂·(1+w): Gemma family and Qwen3.5 / Qwen3-Next.
+    // GLM-5.3 deliberately serializes head_dim=0 because its DSA heads are
+    // NoPE MLA heads. The real attention width is the two qk components.
+    let head_dim = cfg_usize(tc, "head_dim")
+        .filter(|&v| v > 0)
+        .or_else(|| {
+            let d = cfg_usize(tc, "qk_rope_head_dim").unwrap_or(0)
+                + cfg_usize(tc, "qk_nope_head_dim").unwrap_or(0);
+            (d > 0).then_some(d)
+        })
+        .unwrap_or(hidden / n_heads.max(1));
+    // Zero-centered RMSNorm x̂·(1+w): Gemma family and native HF
+    // Qwen3.5 / Qwen3-Next checkpoints.  Prism/Bonsai is deliberately
+    // excluded: its source is the already-sanitized MLX Qwen3.5 runtime
+    // (plain nn.RMSNorm weights), so applying the Gemma +1 shift here would
+    // add one a second time at every input/post/final/QK norm.
     let mt = model_type.to_lowercase();
     let is_laguna = mt == "laguna";
     let is_granite = mt == "granite";
@@ -2893,7 +3386,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         // `mtp_num_hidden_layers`; DeepSeek-lineage configs say
         // `num_nextn_predict_layers`. Absent → no speculative head, which is
         // the honest default for every model that has none.
-        mtp: if mt.contains("qwen4_exp") {
+        mtp: if mt.contains("qwen4_exp") || is_glm5_next {
             // qwen4_exp ships a second hyper-connected hybrid stack.  It is
             // not wire-compatible with the legacy DeepSeek/Qwen MTP block;
             // leave it out until that speculative-only head has an exact op.
@@ -2937,6 +3430,26 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
             split_ngram_parts: cfg_usize(tc, "split_ngram_parts").unwrap_or(128),
             seed: cfg_usize(tc, "seed").unwrap_or(1234) as u64,
         }),
+        glm5_next: is_glm5_next.then(|| Glm5NextConfig {
+            hc_mult: cfg_usize(tc, "hc_mult").unwrap_or(4),
+            hc_sinkhorn_iters: cfg_usize(tc, "hc_sinkhorn_iters").unwrap_or(20),
+            hc_eps: tc.get("hc_eps").and_then(|v| v.as_f64()).unwrap_or(1e-6) as f32,
+            swiglu_limit: tc
+                .get("swiglu_limit")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(10.0) as f32,
+            index_n_heads: cfg_usize(tc, "index_n_heads").unwrap_or(32),
+            index_head_dim: cfg_usize(tc, "index_head_dim").unwrap_or(128),
+            index_topk: cfg_usize(tc, "index_topk").unwrap_or(2048),
+            index_kpool: cfg_usize(tc, "index_kpool").unwrap_or(4),
+            index_kpool_always_select_tail: tc
+                .get("index_kpool_always_select_tail")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
+        }),
+        // Keep the complete original HF object, including the text/vision
+        // sub-configs and quantization policy. V4.1 runtime initialization
+        // consumes this verbatim for multimodal and Engram geometry.
         deepseek_v41: is_dsv41.then(|| config.clone()),
         linear_core,
         head_clusters: None,
@@ -2945,13 +3458,36 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         // `conv_L_cache`; Kimi nests KDA geometry in linear_attn_config.
         linear_conv_kernel_dim: cfg_usize(tc, "linear_conv_kernel_dim")
             .or_else(|| cfg_usize(tc, "conv_L_cache"))
-            .or_else(|| kimi_lac.and_then(|l| cfg_usize(l, "short_conv_kernel_size"))),
+            .or_else(|| kda_lac.and_then(|l| cfg_usize(l, "short_conv_kernel_size")))
+            .or_else(|| is_glm5_next.then_some(4)),
         linear_num_key_heads: cfg_usize(tc, "linear_num_key_heads")
-            .or_else(|| kimi_lac.and_then(|l| cfg_usize(l, "num_heads"))),
+            // GLM-5.3's text config calls this `linear_num_heads`.
+            .or_else(|| {
+                is_glm5_next
+                    .then(|| cfg_usize(tc, "linear_num_heads"))
+                    .flatten()
+            })
+            .or_else(|| kda_lac.and_then(|l| cfg_usize(l, "num_heads")))
+            .or_else(|| is_glm5_next.then_some(64)),
         linear_num_value_heads: lnv,
         linear_key_head_dim: cfg_usize(tc, "linear_key_head_dim")
-            .or_else(|| kimi_lac.and_then(|l| cfg_usize(l, "head_dim"))),
-        linear_value_head_dim: lvd.or_else(|| kimi_lac.and_then(|l| cfg_usize(l, "head_dim"))),
+            // GLM-5.3 uses the shorter `linear_head_dim` spelling for both
+            // KDA key and value channels.
+            .or_else(|| {
+                is_glm5_next
+                    .then(|| cfg_usize(tc, "linear_head_dim"))
+                    .flatten()
+            })
+            .or_else(|| kda_lac.and_then(|l| cfg_usize(l, "head_dim")))
+            .or_else(|| is_glm5_next.then_some(128)),
+        linear_value_head_dim: lvd
+            .or_else(|| {
+                is_glm5_next
+                    .then(|| cfg_usize(tc, "linear_head_dim"))
+                    .flatten()
+            })
+            .or_else(|| kda_lac.and_then(|l| cfg_usize(l, "head_dim")))
+            .or_else(|| is_glm5_next.then_some(128)),
         hidden_act,
         embed_multiplier,
         // Gemma-4 attends with scaling = 1.0 (q-norm carries the scale).
@@ -3010,7 +3546,22 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         kda_gate_lower_bound: tc
             .get("linear_attn_config")
             .and_then(|c| c.get("gate_lower_bound"))
-            .and_then(|v| v.as_f64()),
+            .and_then(|v| v.as_f64())
+            .or_else(|| {
+                // GLM-5.3 keeps the same scalar flat as `linear_lower_bound`.
+                is_glm5_next
+                    .then(|| tc.get("linear_lower_bound").and_then(|v| v.as_f64()))
+                    .flatten()
+            })
+            // An explicit JSON null disables the safe lower bound; only an
+            // omitted GLM field gets the dataclass's -5 default.
+            .or_else(|| {
+                (is_glm5_next
+                    && !tc
+                        .as_object()
+                        .is_some_and(|o| o.contains_key("linear_lower_bound")))
+                .then_some(-5.0)
+            }),
         // Looped Transformer (Nanbeige 4.2): re-apply the layer stack num_loops times.
         num_loops: cfg_usize(tc, "num_loops").unwrap_or(1),
         // skip_loop_final_norm=false means loop_final_norm=true (apply norm after each loop).
@@ -3018,7 +3569,110 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
             .get("skip_loop_final_norm")
             .and_then(|v| v.as_bool())
             .unwrap_or(true),
+        prism_hadamard: None,
     })
+}
+
+/// Load and validate the source-side Hadamard manifest for Prism/Bonsai.
+/// Keeping it in the CMF header makes a converted file independently
+/// executable; no `.signs` sidecar is consulted by the runtime.
+fn load_prism_hadamard(
+    dir: &Path,
+    config: &serde_json::Value,
+) -> anyhow::Result<Option<PrismHadamardConfig>> {
+    if config.get("model_type").and_then(|v| v.as_str()) != Some("prism_hadamard_qwen35") {
+        return Ok(None);
+    }
+    let rel = config
+        .get("hadamard_config")
+        .and_then(|v| v.as_str())
+        .unwrap_or("hadamard.json");
+    anyhow::ensure!(
+        Path::new(rel).is_relative() && !rel.contains(".."),
+        "invalid Prism hadamard_config path {rel:?}"
+    );
+    let raw = fs::read(dir.join(rel)).map_err(|e| {
+        anyhow::anyhow!(
+            "Prism checkpoint requires Hadamard manifest {}: {e}",
+            dir.join(rel).display()
+        )
+    })?;
+    let source: serde_json::Value = serde_json::from_slice(&raw)?;
+    let widths: Vec<usize> = source
+        .get("prism.hadamard.sign_widths")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow::anyhow!("Prism Hadamard manifest has no sign_widths"))?
+        .iter()
+        .map(|v| {
+            v.as_u64()
+                .map(|n| n as usize)
+                .ok_or_else(|| anyhow::anyhow!("Prism Hadamard sign_widths must be integers"))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    let signs: Vec<f32> = source
+        .get("prism.hadamard.sign_values")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow::anyhow!("Prism Hadamard manifest has no sign_values"))?
+        .iter()
+        .map(|v| {
+            v.as_f64()
+                .map(|n| n as f32)
+                .ok_or_else(|| anyhow::anyhow!("Prism Hadamard sign_values must be numbers"))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    let cfg = PrismHadamardConfig {
+        version: source
+            .get("prism.hadamard.version")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32,
+        block_size: source
+            .get("prism.hadamard.block_size")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize,
+        transform: source
+            .get("prism.hadamard.transform")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        axis: source
+            .get("prism.hadamard.axis")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        sign_mode: source
+            .get("prism.hadamard.sign_mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        widths,
+        signs,
+        forward_weight_names: source
+            .get("prism.hadamard.weight_names")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        inverse_weight_names: source
+            .get("prism.hadamard.inverse_weight_names")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        gdn_v_grouped: source
+            .get("prism.hadamard.gdn_v_grouped")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        activation_f16: true,
+        affine: None,
+    };
+    cfg.validate().map_err(|e| anyhow::anyhow!(e))?;
+    Ok(Some(cfg))
 }
 
 /// Collect eos ids from generation_config.json / config.json (int or array).
@@ -3084,16 +3738,42 @@ fn hf_cache_dir(repo: &str) -> anyhow::Result<std::path::PathBuf> {
     Ok(dir)
 }
 
-/// Parallel range chunk size (32 MiB) and default connection count.
+/// Parallel range chunk size (32 MiB), default connection count, and the
+/// safety ceiling for user-selected parallelism.  The ceiling bounds worker
+/// threads, simultaneous range buffers, and the corresponding HTTP sockets.
 const HF_CHUNK: u64 = 32 * 1024 * 1024;
+const HF_DEFAULT_THREADS: usize = 8;
+const HF_MAX_THREADS: usize = 64;
 
-fn hf_threads() -> usize {
-    std::env::var("CORTIQ_HF_THREADS")
-        .ok()
+fn parse_hf_threads(value: Option<&str>) -> usize {
+    value
+        .map(str::trim)
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n >= 1)
-        .unwrap_or(8)
-        .min(16)
+        .unwrap_or(HF_DEFAULT_THREADS)
+        .min(HF_MAX_THREADS)
+}
+
+fn hf_threads() -> usize {
+    parse_hf_threads(std::env::var("CORTIQ_HF_THREADS").ok().as_deref())
+}
+
+/// Build disjoint half-open byte ranges for a remote file.  Keeping this as a
+/// small pure helper makes the partitioning contract explicit and testable;
+/// the downloader still uses one fixed 32 MiB range size, so each worker has a
+/// bounded response buffer.
+fn plan_hf_ranges(size: u64, chunk: u64) -> Vec<(u64, u64)> {
+    if size == 0 || chunk == 0 {
+        return Vec::new();
+    }
+    let mut ranges = Vec::new();
+    let mut start = 0u64;
+    while start < size {
+        let end = start.saturating_add(chunk).min(size);
+        ranges.push((start, end));
+        start = end;
+    }
+    ranges
 }
 
 fn cached(dest: &Path) -> bool {
@@ -3179,6 +3859,10 @@ fn fetch(
     required: bool,
     threads: usize,
 ) -> anyhow::Result<bool> {
+    // Keep the resource bound at the downloader boundary as well as in the
+    // environment parser: all current callers use `hf_threads`, but this
+    // prevents a future/internal caller from bypassing the 64-worker cap.
+    let threads = threads.min(HF_MAX_THREADS);
     if cached(dest) {
         return Ok(true);
     }
@@ -3190,16 +3874,16 @@ fn fetch(
                 let f = fs::File::create(&tmp)?;
                 f.set_len(sz)?;
             }
-            let chunks: Vec<(u64, u64)> = (0..sz)
-                .step_by(HF_CHUNK as usize)
-                .map(|s| (s, (s + HF_CHUNK).min(sz)))
-                .collect();
+            let chunks = plan_hf_ranges(sz, HF_CHUNK);
             let total = chunks.len();
             let queue = Mutex::new(chunks);
             let err: Mutex<Option<String>> = Mutex::new(None);
             let done = std::sync::atomic::AtomicUsize::new(0);
             std::thread::scope(|scope| {
-                for _ in 0..threads {
+                // Do not create idle workers when a small file has only a
+                // handful of ranges; this also keeps the resource bound
+                // proportional to useful work.
+                for _ in 0..threads.min(total) {
                     scope.spawn(|| {
                         loop {
                             if err.lock().unwrap().is_some() {
@@ -3333,6 +4017,10 @@ pub(crate) fn hf_download_opts(
         anyhow::bail!("'{repo}': no config.json — not a Hugging Face safetensors checkpoint");
     }
     for (f, required) in [
+        // Prism/Bonsai's signed FWHT descriptor is part of the checkpoint
+        // identity.  It is optional for ordinary HF models and therefore
+        // fetched best-effort here.
+        ("hadamard.json", false),
         // Kimi ships tiktoken.model instead of tokenizer.json — either
         // satisfies the bundle (checked after conversion).
         ("tokenizer.json", false),
@@ -3699,23 +4387,44 @@ pub fn run_convert(
     // kept, and every source shard the manifest marks done is skipped —
     // download included, which is where the hours are.
     resume: bool,
+    progress: impl FnMut(f32),
+) -> anyhow::Result<()> {
+    let outputs = vec![(quant.to_string(), output.to_string())];
+    run_convert_multi(model, &outputs, hf_token, defrag, o1_hint, resume, progress)
+}
+
+/// Convert one source checkpoint into one or more independently finalized
+/// CMF outputs.  All requested profiles consume each source shard in one
+/// streamed pass; the decoded values are borrowed while each profile's
+/// encoder writes its own payload.
+pub fn run_convert_multi(
+    model: &str,
+    outputs: &[(String, String)],
+    hf_token: Option<&str>,
+    defrag: Option<&str>,
+    o1_hint: Option<serde_json::Value>,
+    resume: bool,
     mut progress: impl FnMut(f32),
 ) -> anyhow::Result<()> {
-    let quant = parse_quant(quant)?;
+    anyhow::ensure!(!outputs.is_empty(), "at least one output is required");
+    for (i, (_, path)) in outputs.iter().enumerate() {
+        anyhow::ensure!(!path.trim().is_empty(), "output path {} is empty", i + 1);
+        anyhow::ensure!(
+            outputs[..i].iter().all(|(_, p)| p != path),
+            "output path '{}' is repeated",
+            path
+        );
+    }
+    let profiles: Vec<Quant> = outputs
+        .iter()
+        .map(|(q, _)| parse_quant(q))
+        .collect::<anyhow::Result<_>>()?;
+    let quant = profiles[0];
     // Some codecs intentionally share a physical dtype (q1/q1p both use
     // Q1).  Preserve the requested encoder so later skill grafts can encode
     // replacement tensors with the same algorithm instead of guessing from
     // the directory dtype alone.
     let requested_quant = quant_name(quant);
-    // The q2tp PROFILE: 2-bit tiles go to the MoE gate/up experts only —
-    // `down` experts and the whole skeleton stay q4tp (the 2/4 split that
-    // mirrors Escha's 2/3-bit choice). `gu_quant` is what gate/up get.
-    let gu_quant = quant;
-    let quant = if matches!(quant, Quant::Q2TiledP) {
-        Quant::Q4TiledP
-    } else {
-        quant
-    };
 
     // Source: a local HF directory, or an HF repo id — hub checkpoints
     // convert STREAMED: one weight shard on disk at a time.
@@ -3746,6 +4455,21 @@ pub fn run_convert(
         &fs::read(dir.join("config.json")).map_err(|e| anyhow::anyhow!("read config.json: {e}"))?,
     )?;
     let mut arch = build_arch(&config)?;
+    arch.prism_hadamard = load_prism_hadamard(dir, &config)?;
+    if arch.prism_hadamard.is_some() {
+        let has_ordinary = profiles.iter().any(|q| matches!(q, Quant::Q2TiledP));
+        let has_affine = profiles.iter().any(|q| matches!(q, Quant::Q2TiledPAffine));
+        eprintln!(
+            "  Prism/Bonsai: signed FWHT-1024 enabled (profiles: q2tp={} q2tp_affine={})",
+            has_ordinary, has_affine
+        );
+        anyhow::ensure!(
+            profiles
+                .iter()
+                .all(|q| matches!(q, Quant::Q2TiledP | Quant::Q2TiledPAffine)),
+            "Prism/Bonsai conversion supports only q2tp and q2tp_affine profiles; other profiles would discard the signed FWHT contract"
+        );
+    }
     let source_fp8_block = source_fp8_block(&config);
     let consume_source_shards =
         stream_repo.is_none() && arch.deepseek_v41.is_some() && consume_source_shards_enabled();
@@ -3755,15 +4479,26 @@ pub fn run_convert(
         );
     }
 
-    let manifest_path = format!("{output}.manifest");
-    let resuming = resume
-        && std::path::Path::new(&manifest_path).exists()
-        && std::path::Path::new(output).exists();
-    let mut done_shards: std::collections::HashSet<String> = if resuming {
-        resume_manifest_marks(std::path::Path::new(&manifest_path))
-    } else {
-        std::collections::HashSet::new()
-    };
+    // Read output checkpoints before opening local source shards. A consumed
+    // shard may no longer exist, but its manifest mark is proof that every
+    // output already wrote it. Only the intersection across all outputs is
+    // safe to filter; a shard missing from any active output remains required.
+    let mut resume_marks: Vec<std::collections::HashSet<String>> =
+        vec![std::collections::HashSet::new(); outputs.len()];
+    let mut resume_completed = vec![false; outputs.len()];
+    if resume {
+        for (i, (_, output_path)) in outputs.iter().enumerate() {
+            let output = std::path::Path::new(output_path);
+            if !output.exists() {
+                continue;
+            }
+            resume_completed[i] = cortiq_core::format::CmfModel::open(output_path).is_ok();
+            let manifest_path = format!("{output_path}.manifest");
+            if std::path::Path::new(&manifest_path).exists() {
+                resume_marks[i] = resume_manifest_marks(std::path::Path::new(&manifest_path));
+            }
+        }
+    }
     let source_shards = if stream_repo.is_none() {
         source_shard_counts(dir)?
     } else {
@@ -3787,15 +4522,31 @@ pub fn run_convert(
     } else {
         None
     };
-    let completed_source_shards: std::collections::HashSet<String> = if resuming {
+    // Both the HF index and the local-ready certificate have been validated
+    // before this point.  Reorder only the streamed list so resume marks and
+    // the resident local conversion path retain their existing semantics.
+    if !stream_shards.is_empty() {
+        apply_source_shard_priority(&mut stream_shards)?;
+    }
+    let completed_source_shards: std::collections::HashSet<String> = if resume {
         source_shards
             .iter()
-            .filter(|(name, _)| done_shards.contains(name))
+            .filter(|(name, _)| {
+                outputs
+                    .iter()
+                    .enumerate()
+                    .all(|(i, _)| resume_completed[i] || resume_marks[i].contains(name))
+            })
             .map(|(name, _)| name.clone())
             .collect()
     } else {
         std::collections::HashSet::new()
     };
+    let resumed_tensor_count: usize = source_shards
+        .iter()
+        .filter(|(name, _)| completed_source_shards.contains(name))
+        .map(|(_, count)| *count)
+        .sum();
 
     // Memory-map the weights and process one tensor at a time — the raw model is
     // never fully loaded into RAM (peak ≈ the .cmf output + one tensor).
@@ -3851,32 +4602,80 @@ pub fn run_convert(
         2usize.saturating_mul(directory_records),
         96,
     );
-    let mut writer = if resuming {
-        let (w, st) = cortiq_core::format::CmfStreamWriter::resume(output, &manifest_path)
-            .map_err(|e| anyhow::anyhow!("resume {output}: {e}"))?;
-        done_shards = st.marks.into_iter().collect();
-        tracing::info!(
-            "resuming: {} tensors already written, {} source shards done",
-            st.names.len(),
-            done_shards.len()
-        );
-        w.appending_manifest(&manifest_path)
-            .map_err(|e| anyhow::anyhow!("resume {output}: {e}"))?
-    } else {
-        cortiq_core::format::CmfStreamWriter::new(output, head_reserve)
-            .and_then(|w| w.with_manifest(&manifest_path))
-            .map_err(|e| anyhow::anyhow!("create {output}: {e}"))?
-    };
-    let mut tensors: Vec<TensorSpec> = Vec::with_capacity(total);
-    let mut done = if stream_repo.is_none() {
-        source_shards
-            .iter()
-            .filter(|(name, _)| done_shards.contains(name))
-            .map(|(_, count)| *count)
-            .sum()
-    } else {
-        0
-    };
+    let mut manifests = Vec::with_capacity(outputs.len());
+    let mut done_shards: Vec<std::collections::HashSet<String>> = Vec::with_capacity(outputs.len());
+    let mut writers: Vec<Option<cortiq_core::format::CmfStreamWriter>> =
+        Vec::with_capacity(outputs.len());
+    let mut completed = vec![false; outputs.len()];
+    for (_, output_path) in outputs {
+        let manifest_path = format!("{output_path}.manifest");
+        // A valid CMF alongside a stale manifest means a previous multi-output
+        // run finished this profile before another profile failed. Treat it as
+        // complete and never append a second directory to the finalized file.
+        if resume && resume_completed[manifests.len()] {
+            completed[manifests.len()] = true;
+            manifests.push(manifest_path);
+            done_shards.push(std::collections::HashSet::new());
+            writers.push(None);
+            continue;
+        }
+        let (writer, marks) = if resume
+            && std::path::Path::new(&manifest_path).exists()
+            && std::path::Path::new(output_path).exists()
+        {
+            let (w, st) = cortiq_core::format::CmfStreamWriter::resume(output_path, &manifest_path)
+                .map_err(|e| anyhow::anyhow!("resume {output_path}: {e}"))?;
+            tracing::info!(
+                "resuming {output_path}: {} tensors already written, {} source shards done",
+                st.names.len(),
+                st.marks.len()
+            );
+            let w = w
+                .appending_manifest(&manifest_path)
+                .map_err(|e| anyhow::anyhow!("resume {output_path}: {e}"))?;
+            (Some(w), st.marks.into_iter().collect())
+        } else {
+            let w = cortiq_core::format::CmfStreamWriter::new(output_path, head_reserve)
+                .and_then(|w| w.with_manifest(&manifest_path))
+                .map_err(|e| anyhow::anyhow!("create {output_path}: {e}"))?;
+            (Some(w), std::collections::HashSet::new())
+        };
+        manifests.push(manifest_path);
+        done_shards.push(marks);
+        writers.push(writer);
+    }
+    let mut tensors: Vec<Vec<TensorSpec>> =
+        outputs.iter().map(|_| Vec::with_capacity(total)).collect();
+    if arch.prism_hadamard.is_some() {
+        let mut vision_cfg = config
+            .get("vision_config")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Prism checkpoint has no vision_config"))?;
+        // qwen3vis accepts this optional list; an empty list is the honest
+        // value for this source (no deepstack merger tensors are present).
+        if let Some(obj) = vision_cfg.as_object_mut() {
+            obj.entry("deepstack_visual_indexes")
+                .or_insert_with(|| serde_json::json!([]));
+        }
+        let cfg_bytes = serde_json::to_vec(&vision_cfg)?;
+        for (i, batch) in tensors.iter_mut().enumerate() {
+            if !completed[i] {
+                batch.push(TensorSpec {
+                    name: "vis.config_json".into(),
+                    dtype: TensorDtype::U8,
+                    shape: vec![cfg_bytes.len()],
+                    data: cfg_bytes.clone(),
+                });
+            }
+        }
+    }
+    // Count source tensors whose durable shard marks let us skip opening the
+    // (possibly already consumed) input. This keeps progress monotonic across
+    // a crash while the remaining files are processed below.
+    let mut done = resumed_tensor_count;
+    if done > 0 {
+        progress(done as f32 / total as f32);
+    }
     // Tiny cross-shard tensors (gemma-4 router.scale, ~128 f32 each):
     // stashed as shards stream by, so a projection in shard 2 can fold
     // a scale that lived in the already-deleted shard 1.
@@ -3905,11 +4704,18 @@ pub fn run_convert(
         .filter(|(_, t)| matches!(t, cortiq_core::LayerType::Kda))
         .map(|(i, _)| i)
         .collect();
+    // The source affine scales are fit to a 32-group ladder once per matrix.
+    // Keep the measured fit error for the immutable conversion report/header
+    // instead of presenting the rung quantization as lossless.
+    let mut prism_affine_scale_sq = 0.0f64;
+    let mut prism_affine_scale_count = 0usize;
 
     let mut process_file = |file: &SafeTensors,
                             files: &[SafeTensors],
-                            writer: &mut cortiq_core::format::CmfStreamWriter,
-                            tensors: &mut Vec<TensorSpec>,
+                            batches: &mut [Vec<TensorSpec>],
+                            profiles: &[Quant],
+                            active: &[bool],
+                            writers: &mut [Option<cortiq_core::format::CmfStreamWriter>],
                             done: &mut usize,
                             total: usize,
                             progress: &mut dyn FnMut(f32)|
@@ -3922,7 +4728,36 @@ pub fn run_convert(
         for m in &file.tensors {
             *done += 1;
             progress(*done as f32 / total as f32);
-            let Some(name) = canon_name(&m.name) else {
+            if let Some(prism) = arch.prism_hadamard.as_ref() {
+                if m.name.ends_with(".signs") {
+                    anyhow::ensure!(
+                        m.dtype == "F32" && m.shape.len() == 1,
+                        "Prism sign tensor {} must be F32 [width], got {} {:?}",
+                        m.name,
+                        m.dtype,
+                        m.shape
+                    );
+                    let expected = prism.signs_for_width(m.shape[0]).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Prism sign tensor {} has unsupported width {}",
+                            m.name,
+                            m.shape[0]
+                        )
+                    })?;
+                    let actual = to_f32(&m.dtype, file.bytes(m))?;
+                    anyhow::ensure!(
+                        actual.len() == expected.len()
+                            && actual
+                                .iter()
+                                .zip(expected)
+                                .all(|(a, b)| a.to_bits() == b.to_bits()),
+                        "Prism sign tensor {} does not match hadamard.json",
+                        m.name
+                    );
+                    continue;
+                }
+            }
+            let Some(name) = canon_name_for_arch(&arch, &m.name) else {
                 continue;
             };
             if arch.qwen4_exp.is_some()
@@ -3934,6 +4769,20 @@ pub fn run_convert(
                 // qwen4 MTP is speculative-only and uses a different stack.
                 // PLE's integer hash tables are deterministic from the header
                 // and are recomputed by the runtime, avoiding lossy casts.
+                continue;
+            }
+            if arch.glm5_next.is_some()
+                && name
+                    .strip_prefix("model.layers.")
+                    .and_then(|r| r.split('.').next())
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .is_some_and(|li| li >= arch.num_layers)
+            {
+                // The release appends layer 45 as a speculative MTP block
+                // (eh_proj/enorm/hnorm + a second 288-expert layer) while
+                // num_hidden_layers is 45. CMF does not execute this draft
+                // stack yet; omitting it saves several GB and never changes
+                // exact trunk generation.
                 continue;
             }
             // Kimi: KDA layers share the `self_attn.` vendor prefix with
@@ -3958,9 +4807,9 @@ pub fn run_convert(
 
             // DeepSeek-V4.1 Engram tables are native FP8 byte planes. Keep
             // both planes lossless as explicit U8 auxiliary tensors before
-            // generic scale skipping or FP8 decode can consume them. Their
-            // companion shape and dtype are checked against the source shard
-            // index before bytes reach the output.
+            // any generic scale skipping or FP8 decode can consume them.
+            // Their companion shape is checked in the source shard (the
+            // published checkpoint co-locates each pair).
             let raw_engram =
                 m.name.ends_with(".engram.embed.weight") || m.name.ends_with(".engram.embed.scale");
             if arch.deepseek_v41.is_some() && raw_engram {
@@ -4031,7 +4880,7 @@ pub fn run_convert(
                         expected_weight_cols
                     );
                 }
-                push_raw_u8_tensor(writer, &name, &m.shape, file.bytes(m))?;
+                push_raw_u8_tensor(writers, active, &name, &m.shape, file.bytes(m))?;
                 continue;
             }
 
@@ -4043,12 +4892,12 @@ pub fn run_convert(
             if m.dtype == "U8" && name.ends_with(".weight_scale") {
                 continue;
             }
-            // DeepSeek-V4 keeps every quantized tensor's E8M0 scale plane in
+            // DeepSeek-V4/V4.1 keeps every quantized tensor's E8M0 scale plane in
             // a sibling `.scale`; it rides with the weight below.
             if m.dtype == "F8_E8M0" && name.ends_with(".scale") {
                 continue;
             }
-            // Fine-grained FP8 inverse scale planes ride with `.weight` below.
+            // Fine-grained FP8 scale planes ride with `.weight` below.
             if name.ends_with(".weight_scale_inv") {
                 continue;
             }
@@ -4081,7 +4930,8 @@ pub fn run_convert(
             // pipeline (defrag, requant to q4tp/q2tp) is layout-agnostic:
             //   * experts  — I8 holding two FP4 (E2M1) values per byte with
             //     one E8M0 scale per 32 values: OCP MXFP4 exactly.
-            //   * skeleton — F8_E4M3 with one E8M0 scale per 128x128 tile.
+            //   * skeleton — F8_E4M3 with one E8M0 scale per source tile
+            //     (128x128 for V4, 32x32 for V4.1).
             let dsv4 = if matches!(m.dtype.as_str(), "I8" | "F8_E4M3") && !name.ends_with(".scale")
             {
                 let scale_name = format!("{}.scale", m.name.trim_end_matches(".weight"));
@@ -4147,8 +4997,137 @@ pub fn run_convert(
             } else {
                 name
             };
+
+            // Prism source matrices are MLX U32 bitplanes.  The production
+            // q2tp_affine profile preserves the source 0/1/2 symbols in the
+            // existing dtype16 plane, while ordinary q2tp uses the existing
+            // midrise encoder.  Both outputs can be produced in one streamed
+            // pass over the source shard.
+            if arch.prism_hadamard.is_some() && m.dtype == "U32" && m.name.ends_with(".weight") {
+                anyhow::ensure!(
+                    m.shape.len() == 2,
+                    "Prism packed matrix {name} must be 2-D, got {:?}",
+                    m.shape
+                );
+                let out_dim = m.shape[0];
+                let in_dim = m.shape[1]
+                    .checked_mul(16)
+                    .ok_or_else(|| anyhow::anyhow!("Prism matrix {name} input width overflows"))?;
+                let find_companion = |suffix: &str| {
+                    let wanted = m.name.replace(".weight", suffix);
+                    files.iter().find_map(|source| {
+                        source
+                            .tensors
+                            .iter()
+                            .find(|t| t.name == wanted)
+                            .map(|t| (source.bytes(t), t.dtype.as_str(), t.shape.clone()))
+                    })
+                };
+                let (scales, scale_dtype, scale_shape) =
+                    find_companion(".scales").ok_or_else(|| {
+                        anyhow::anyhow!("missing {}.scales for Prism matrix {name}", m.name)
+                    })?;
+                let (biases, bias_dtype, bias_shape) =
+                    find_companion(".biases").ok_or_else(|| {
+                        anyhow::anyhow!("missing {}.biases for Prism matrix {name}", m.name)
+                    })?;
+                anyhow::ensure!(
+                    scale_dtype == "F16"
+                        && bias_dtype == "F16"
+                        && scale_shape == vec![out_dim, in_dim / 128]
+                        && bias_shape == scale_shape,
+                    "Prism affine companions for {name} have dtypes/shapes ({scale_dtype} {:?}, {bias_dtype} {:?}), expected F16 [{out_dim}, {}]",
+                    scale_shape,
+                    bias_shape,
+                    in_dim / 128
+                );
+                let descriptor = arch.prism_hadamard.as_ref().unwrap();
+                anyhow::ensure!(
+                    descriptor.signs_for_width(in_dim).is_some(),
+                    "Prism matrix {name} input width {in_dim} has no signed FWHT vector"
+                );
+                validate_mlx_ternary_codes(file.bytes(m), out_dim, in_dim)?;
+
+                let affine_payload = if profiles.iter().any(|q| matches!(q, Quant::Q2TiledPAffine))
+                {
+                    let (payload, fit_rms) =
+                        encode_mlx_q2tp_affine(file.bytes(m), scales, biases, out_dim, in_dim)?;
+                    anyhow::ensure!(
+                        fit_rms.is_finite(),
+                        "Prism matrix {name} produced a non-finite affine scale fit"
+                    );
+                    prism_affine_scale_sq +=
+                        (fit_rms as f64).powi(2) * (out_dim * (in_dim / GROUP_SIZE)) as f64;
+                    prism_affine_scale_count = prism_affine_scale_count
+                        .saturating_add(out_dim.saturating_mul(in_dim / GROUP_SIZE));
+                    Some(payload)
+                } else {
+                    None
+                };
+
+                // Only the ordinary profile needs a dense source view.  It is
+                // bounded to one matrix and is immediately dropped after
+                // both output batches receive their independent payloads.
+                let ordinary_vals = if profiles.iter().any(|q| matches!(q, Quant::Q2TiledP)) {
+                    Some(unpack_mlx(
+                        file.bytes(m),
+                        scales,
+                        Some(biases),
+                        out_dim,
+                        in_dim,
+                        2,
+                    )?)
+                } else {
+                    None
+                };
+
+                for ((batch, requested), &is_active) in batches.iter_mut().zip(profiles).zip(active)
+                {
+                    if !is_active {
+                        continue;
+                    }
+                    match *requested {
+                        Quant::Q2TiledP => {
+                            emit_profiled_tensor(
+                                std::slice::from_mut(batch),
+                                std::slice::from_ref(requested),
+                                std::slice::from_ref(&is_active),
+                                &arch,
+                                &name,
+                                &[out_dim, in_dim],
+                                ordinary_vals
+                                    .as_ref()
+                                    .expect("ordinary q2tp source decode built above"),
+                                EmitMode::Auto,
+                            );
+                        }
+                        Quant::Q2TiledPAffine => {
+                            batch.push(TensorSpec {
+                                name: name.clone(),
+                                dtype: TensorDtype::Q2TiledP,
+                                shape: vec![out_dim, in_dim],
+                                data: affine_payload
+                                    .as_ref()
+                                    .expect("q2tp affine payload built above")
+                                    .clone(),
+                            });
+                        }
+                        _ => unreachable!("Prism profile gate above"),
+                    }
+                }
+                continue;
+            }
             let mxfp4 = fp8_scale_inv.or(mxfp4).or(dsv4);
-            let (m_shape, m_vals) = if let Some(v) = mxfp4 {
+            // MLX Conv3d stores Qwen's patch kernel as [out, temporal, height,
+            // width, channels], while the CMF vision tower consumes flattened
+            // per-patch rows in the source processor's [channels, temporal,
+            // height, width] order.  Keep this tower lossless, but make the
+            // shape/axis contract explicit so VisionTower::from_cmf receives a
+            // normal 2-D projection instead of an unusable 5-D safetensor.
+            let prism_patch = arch.prism_hadamard.is_some() && name == "vis.patch_embed.weight";
+            let (m_shape, m_vals) = if prism_patch {
+                flatten_prism_patch_weight(&m.dtype, &m.shape, file.bytes(m))?
+            } else if let Some(v) = mxfp4 {
                 v
             } else if m.dtype == "U32" && m.name.ends_with(".weight") {
                 let scales_name = m.name.replace(".weight", ".scales");
@@ -4254,13 +5233,16 @@ pub fn run_convert(
                             .copy_from_slice(&m_vals[(h * hd + r) * cols..(h * hd + r + 1) * cols]);
                     }
                 }
-                let (dt, data) = quantize_2d(quant, &w, m_shape[0], cols);
-                tensors.push(TensorSpec {
-                    name,
-                    dtype: dt,
-                    shape: m_shape.clone(),
-                    data,
-                });
+                emit_profiled_tensor(
+                    batches,
+                    &profiles,
+                    active,
+                    &arch,
+                    &name,
+                    &m_shape,
+                    &w,
+                    EmitMode::Auto,
+                );
                 continue;
             }
 
@@ -4290,13 +5272,16 @@ pub fn run_convert(
                     w[(lora + r) * cols..(lora + r + 1) * cols]
                         .copy_from_slice(&m_vals[(lora + src) * cols..(lora + src + 1) * cols]);
                 }
-                let (dt, data) = quantize_2d(quant, &w, m_shape[0], cols);
-                tensors.push(TensorSpec {
-                    name,
-                    dtype: dt,
-                    shape: m_shape.clone(),
-                    data,
-                });
+                emit_profiled_tensor(
+                    batches,
+                    &profiles,
+                    active,
+                    &arch,
+                    &name,
+                    &m_shape,
+                    &w,
+                    EmitMode::Auto,
+                );
                 continue;
             }
 
@@ -4349,24 +5334,6 @@ pub fn run_convert(
                 };
                 for e in 0..ne {
                     let ev = &m_vals[e * d1 * d2..(e + 1) * d1 * d2];
-                    let emit = |tensors: &mut Vec<TensorSpec>,
-                                nm: String,
-                                vals: &[f32],
-                                rows: usize,
-                                cols: usize,
-                                q: Quant| {
-                        let (dt, data) = if rows * cols >= GROUP_SIZE && !force_f16(&nm) {
-                            quantize_2d(q, vals, rows, cols)
-                        } else {
-                            (TensorDtype::F16, encode_f16(vals))
-                        };
-                        tensors.push(TensorSpec {
-                            name: nm,
-                            dtype: dt,
-                            shape: vec![rows, cols],
-                            data,
-                        });
-                    };
                     if is_gu {
                         let mut gate = vec![0.0f32; mi * hid];
                         let mut up = vec![0.0f32; mi * hid];
@@ -4381,21 +5348,27 @@ pub fn run_convert(
                                 }
                             }
                         }
-                        emit(
-                            &mut *tensors,
-                            format!("{base}.mlp.experts.{e}.gate_proj.weight"),
+                        let gate_name = format!("{base}.mlp.experts.{e}.gate_proj.weight");
+                        emit_profiled_tensor(
+                            batches,
+                            &profiles,
+                            active,
+                            &arch,
+                            &gate_name,
+                            &[mi, hid],
                             &gate,
-                            mi,
-                            hid,
-                            gu_quant,
+                            EmitMode::Auto,
                         );
-                        emit(
-                            &mut *tensors,
-                            format!("{base}.mlp.experts.{e}.up_proj.weight"),
+                        let up_name = format!("{base}.mlp.experts.{e}.up_proj.weight");
+                        emit_profiled_tensor(
+                            batches,
+                            &profiles,
+                            active,
+                            &arch,
+                            &up_name,
+                            &[mi, hid],
                             &up,
-                            mi,
-                            hid,
-                            gu_quant,
+                            EmitMode::Auto,
                         );
                     } else {
                         let mut down = vec![0.0f32; hid * mi];
@@ -4408,13 +5381,16 @@ pub fn run_convert(
                                 }
                             }
                         }
-                        emit(
-                            &mut *tensors,
-                            format!("{base}.mlp.experts.{e}.down_proj.weight"),
+                        let down_name = format!("{base}.mlp.experts.{e}.down_proj.weight");
+                        emit_profiled_tensor(
+                            batches,
+                            &profiles,
+                            active,
+                            &arch,
+                            &down_name,
+                            &[hid, mi],
                             &down,
-                            hid,
-                            mi,
-                            quant,
+                            EmitMode::Auto,
                         );
                     }
                 }
@@ -4448,12 +5424,17 @@ pub fn run_convert(
                     }
                 }
                 let base = name.strip_suffix(".router.proj.weight").unwrap();
-                tensors.push(TensorSpec {
-                    name: format!("{base}.mlp.gate.weight"),
-                    dtype: TensorDtype::F16,
-                    shape: vec![ne, hid],
-                    data: encode_f16(&w),
-                });
+                let out_name = format!("{base}.mlp.gate.weight");
+                emit_profiled_tensor(
+                    batches,
+                    &profiles,
+                    active,
+                    &arch,
+                    &out_name,
+                    &[ne, hid],
+                    &w,
+                    EmitMode::F16,
+                );
                 continue;
             }
             if name.ends_with(".router.scale") {
@@ -4461,12 +5442,17 @@ pub fn run_convert(
             }
             if name.ends_with(".router.per_expert_scale") {
                 let base = name.strip_suffix(".router.per_expert_scale").unwrap();
-                tensors.push(TensorSpec {
-                    name: format!("{base}.mlp.per_expert_scale"),
-                    dtype: TensorDtype::F16,
-                    shape: vec![m_vals.len()],
-                    data: encode_f16(&m_vals),
-                });
+                let out_name = format!("{base}.mlp.per_expert_scale");
+                emit_profiled_tensor(
+                    batches,
+                    &profiles,
+                    active,
+                    &arch,
+                    &out_name,
+                    &[m_vals.len()],
+                    &m_vals,
+                    EmitMode::F16,
+                );
                 continue;
             }
 
@@ -4498,19 +5484,16 @@ pub fn run_convert(
                 for (out_name, out_vals, out_rows) in
                     split_fused_gdn(&name, w, hid, nk, dk, nv, dv)?
                 {
-                    let two_d = out_rows * hid >= GROUP_SIZE && !force_f16(&out_name);
-                    let (dt, data) = if two_d {
-                        let q = quant_for_tensor(&arch, &out_name, quant);
-                        quantize_2d(q, &out_vals, out_rows, hid)
-                    } else {
-                        (TensorDtype::F16, encode_f16(&out_vals))
-                    };
-                    tensors.push(TensorSpec {
-                        name: out_name,
-                        dtype: dt,
-                        shape: vec![out_rows, hid],
-                        data,
-                    });
+                    emit_profiled_tensor(
+                        batches,
+                        &profiles,
+                        active,
+                        &arch,
+                        &out_name,
+                        &[out_rows, hid],
+                        &out_vals,
+                        EmitMode::Auto,
+                    );
                 }
                 continue;
             }
@@ -4544,17 +5527,16 @@ pub fn run_convert(
                 };
                 for (out_name, r0, nr) in parts {
                     let vals = &w[r0 * cols..(r0 + nr) * cols];
-                    let (dt, data) = if nr * cols >= GROUP_SIZE && !force_f16(&out_name) {
-                        quantize_2d(quant, vals, nr, cols)
-                    } else {
-                        (TensorDtype::F16, encode_f16(vals))
-                    };
-                    tensors.push(TensorSpec {
-                        name: out_name,
-                        dtype: dt,
-                        shape: vec![nr, cols],
-                        data,
-                    });
+                    emit_profiled_tensor(
+                        batches,
+                        &profiles,
+                        active,
+                        &arch,
+                        &out_name,
+                        &[nr, cols],
+                        vals,
+                        EmitMode::Auto,
+                    );
                 }
                 continue;
             }
@@ -4576,17 +5558,16 @@ pub fn run_convert(
                         let w = &m_vals;
                         let (rows, cols) = (m_shape[0], m_shape[1]);
                         for out_name in [name.clone(), name.replace("k_proj", "v_proj")] {
-                            let (dt, data) = if rows * cols >= GROUP_SIZE && !force_f16(&out_name) {
-                                quantize_2d(quant, w, rows, cols)
-                            } else {
-                                (TensorDtype::F16, encode_f16(w))
-                            };
-                            tensors.push(TensorSpec {
-                                name: out_name,
-                                dtype: dt,
-                                shape: vec![rows, cols],
-                                data,
-                            });
+                            emit_profiled_tensor(
+                                batches,
+                                &profiles,
+                                active,
+                                &arch,
+                                &out_name,
+                                &[rows, cols],
+                                w,
+                                EmitMode::Auto,
+                            );
                         }
                         continue;
                     }
@@ -4604,19 +5585,16 @@ pub fn run_convert(
                             None => (m_shape.clone(), m_vals.clone()),
                         };
                         let (out_shape, out_vals) = slice_ffn(&kind, &shape, &vals, keep)?;
-                        let numel = out_shape[0] * out_shape[1];
-                        let two_d = numel >= GROUP_SIZE && !force_f16(&name);
-                        let (dt, data) = if two_d {
-                            quantize_2d(quant, &out_vals, out_shape[0], out_shape[1])
-                        } else {
-                            (TensorDtype::F16, encode_f16(&out_vals))
-                        };
-                        tensors.push(TensorSpec {
-                            name,
-                            dtype: dt,
-                            shape: out_shape,
-                            data,
-                        });
+                        emit_profiled_tensor(
+                            batches,
+                            &profiles,
+                            active,
+                            &arch,
+                            &name,
+                            &out_shape,
+                            &out_vals,
+                            EmitMode::Auto,
+                        );
                         continue;
                     }
                 }
@@ -4634,55 +5612,33 @@ pub fn run_convert(
             // Index tables ride as raw f32: quantizing them would round
             // expert ids, and f16 cannot even hold a vocabulary id exactly.
             if force_f32(&name) {
-                tensors.push(TensorSpec {
-                    name,
-                    dtype: TensorDtype::F32,
-                    shape: m_shape.clone(),
-                    data: vals.iter().flat_map(|v| v.to_le_bytes()).collect(),
-                });
+                emit_profiled_tensor(
+                    batches,
+                    &profiles,
+                    active,
+                    &arch,
+                    &name,
+                    &m_shape,
+                    &vals,
+                    EmitMode::F32,
+                );
                 continue;
             }
-            let two_d = m_shape.len() == 2
-                && numel >= GROUP_SIZE
-                && !force_f16(&name)
-                && !force_dsv41_vision_f16(&arch, &name, &m_shape);
-            // The q2tp profile covers the gate/up planes of EVERY expert.
-            // Checkpoints that pack their experts into one 3-D tensor are
-            // handled above; the ones that ship a tensor per expert (DeepSeek
-            // among them) arrive here, and reading this condition as
-            // "shared expert only" left the routed experts — which are
-            // essentially the whole model — at 4 bits. That is a 50% size
-            // miss on a 300B MoE, and it looks like nothing but a large file.
-            //
-            // The shared expert additionally MUST match the routed layout: it
-            // rides in the same packed buffer (last slot) and the MoE kernels
-            // index that buffer with one per-expert stride, so a mismatch
-            // makes the whole graph decline, silently, into a CPU MoE.
-            // The q2tp profile on a DENSE model: no experts to carry the
-            // 2-bit planes, so the dense FFN's gate/up take them (down and
-            // the whole skeleton stay q4tp — the same 2/4 split, at the
-            // model's own FFN). Only for models without MoE experts, so the
-            // MoE profiles above are untouched.
-            let expert_gu = q2tp_expert_gate_or_up(&name)
-                || (arch.moe.is_none() && q2tp_dense_gate_or_up(&name));
-            let q_here = if expert_gu { gu_quant } else { quant };
-            let q_here = quant_for_tensor(&arch, &name, q_here);
-            let (dt, data) = if two_d {
-                quantize_2d(q_here, &vals, m_shape[0], m_shape[1])
-            } else {
-                (TensorDtype::F16, encode_f16(&vals))
-            };
-            tensors.push(TensorSpec {
-                name,
-                dtype: dt,
-                shape: m_shape.clone(),
-                data,
-            });
+            emit_profiled_tensor(
+                batches,
+                &profiles,
+                active,
+                &arch,
+                &name,
+                &m_shape,
+                &vals,
+                EmitMode::Auto,
+            );
         }
 
         Ok(())
     };
-    if streamed_source {
+    if stream_repo.is_some() || local_ready_dir.is_some() {
         let base = stream_repo
             .as_deref()
             .map(|repo| format!("https://huggingface.co/{repo}/resolve/main"));
@@ -4693,9 +5649,14 @@ pub fn run_convert(
             .build();
         let ns = stream_shards.len().max(1);
         for (si, sname) in stream_shards.iter().enumerate() {
-            if done_shards.contains(sname) {
+            let active: Vec<bool> = outputs
+                .iter()
+                .enumerate()
+                .map(|(i, _)| !completed[i] && !done_shards[i].contains(sname))
+                .collect();
+            if !active.iter().any(|&v| v) {
                 eprintln!(
-                    "  [stream {}/{}] {sname} — уже в файле, пропуск",
+                    "  [stream {}/{}] {sname} — все выходы уже в файле, пропуск",
                     si + 1,
                     ns
                 );
@@ -4735,8 +5696,10 @@ pub fn run_convert(
             process_file(
                 &one[0],
                 &one,
-                &mut writer,
                 &mut tensors,
+                &profiles,
+                &active,
+                &mut writers,
                 &mut fd,
                 ft,
                 &mut sub,
@@ -4744,34 +5707,58 @@ pub fn run_convert(
             // Spill this shard's payloads before touching the next one:
             // that is what keeps residency at one shard instead of the
             // whole model.
-            drain_to_writer(&mut tensors, &mut writer)?;
-            // Only now is this shard's work durable in the output file.
-            writer
-                .mark(sname)
-                .map_err(|e| anyhow::anyhow!("manifest: {e}"))?;
+            for i in 0..outputs.len() {
+                if !active[i] {
+                    continue;
+                }
+                let writer = writers[i].as_mut().ok_or_else(|| {
+                    anyhow::anyhow!("output {} is already finalized", outputs[i].1)
+                })?;
+                drain_to_writer(&mut tensors[i], writer)?;
+                // Only now is this shard's work durable in the output file.
+                writer
+                    .mark(sname)
+                    .map_err(|e| anyhow::anyhow!("manifest: {e}"))?;
+                done_shards[i].insert(sname.clone());
+            }
             drop(one);
             if stream_repo.is_some() {
-                // Preserve hub-stream cleanup: cache files are disposable.
+                // Preserve the existing hub-stream cleanup behavior. Hub
+                // cache files are disposable and this path predates the
+                // strict local-ready disk-budget contract.
                 let _ = fs::remove_file(&source_path);
             } else if consume_source_shards {
-                // The local-ready path is the bounded-disk contract: an
-                // unlink failure must stop conversion instead of retaining a
-                // full shard after its output checkpoint.
+                // Local-ready consumption is the bounded-disk path: a failed
+                // unlink must stop conversion instead of silently retaining
+                // another 100 GB shard and overrunning the pod volume.
                 consume_local_ready_source(&source_path)?;
             }
         }
     } else {
         for file_index in 0..files.len() {
             let file_name = files[file_index].name.clone();
-            if done_shards.contains(&file_name) {
+            let file_tensor_count = files[file_index].tensors.len();
+            let active: Vec<bool> = outputs
+                .iter()
+                .enumerate()
+                .map(|(i, _)| !completed[i] && !done_shards[i].contains(&file_name))
+                .collect();
+            if !active.iter().any(|&v| v) {
                 eprintln!("  [{file_name}] уже в файле, пропуск");
+                done += file_tensor_count;
+                progress(done as f32 / total as f32);
+                if consume_source_shards {
+                    consume_source_shard(&mut files, file_index, dir)?;
+                }
                 continue;
             }
             process_file(
                 &files[file_index],
                 &files,
-                &mut writer,
                 &mut tensors,
+                &profiles,
+                &active,
+                &mut writers,
                 &mut done,
                 total,
                 &mut progress,
@@ -4779,11 +5766,23 @@ pub fn run_convert(
             // Marking per source file gives a local conversion the same
             // resumability as a streamed one; the payloads have to reach the
             // output first, so the drain comes before the mark.
-            drain_to_writer(&mut tensors, &mut writer)?;
-            writer
-                .mark(&file_name)
-                .map_err(|e| anyhow::anyhow!("manifest: {e}"))?;
+            for i in 0..outputs.len() {
+                if !active[i] {
+                    continue;
+                }
+                let writer = writers[i].as_mut().ok_or_else(|| {
+                    anyhow::anyhow!("output {} is already finalized", outputs[i].1)
+                })?;
+                drain_to_writer(&mut tensors[i], writer)?;
+                writer
+                    .mark(&file_name)
+                    .map_err(|e| anyhow::anyhow!("manifest: {e}"))?;
+                done_shards[i].insert(file_name.clone());
+            }
             if consume_source_shards {
+                // Drop the mmap before unlinking so the filesystem can
+                // reclaim this shard's blocks immediately. Every active
+                // output has flushed its payload and manifest mark above.
                 consume_source_shard(&mut files, file_index, dir)?;
             }
         }
@@ -4836,13 +5835,15 @@ pub fn run_convert(
             .map(|n| n as u32),
     };
 
-    let quant_type = match quant {
+    let quant_type = |q: Quant| match q {
         Quant::Q8Row => QuantType::Q8Row,
         Quant::Q8_2f => QuantType::Q8_2f,
         Quant::Q4Block => QuantType::Q4Block,
         Quant::F16 => QuantType::F16,
         Quant::Vbit => QuantType::Vbit,
-        Quant::Q4Tiled | Quant::Q4TiledP | Quant::Q2TiledP => QuantType::Q4Block,
+        Quant::Q4Tiled | Quant::Q4TiledP | Quant::Q2TiledP | Quant::Q2TiledPAffine => {
+            QuantType::Q4Block
+        }
         // File-level label only (per-tensor truth is in the directory);
         // Vbit is the closest existing informational bucket for q1.
         Quant::Q1 | Quant::Q1p | Quant::Q1s | Quant::Q1t => QuantType::Vbit,
@@ -4892,18 +5893,82 @@ pub fn run_convert(
         }
         None => provenance,
     };
-    let header = CmfHeader {
-        format: "cmf".into(),
-        version: CMF_VERSION,
-        arch,
-        quant_type,
-        provenance: Some(provenance),
-        tokenizer_config: Some(bundle),
-        section_hashes: None,
-        skills: Vec::new(),
-        shard: None,
-        calibration: None,
-        routing: None,
+    let provenance = if let Some(prism) = arch.prism_hadamard.as_ref() {
+        let mut p = provenance;
+        p["prism_hadamard"] = serde_json::json!({
+            "version": prism.version,
+            "block_size": prism.block_size,
+            "transform": prism.transform.clone(),
+            "sign_mode": prism.sign_mode.clone(),
+            "widths": prism.widths.clone(),
+            "gdn_v_grouped": prism.gdn_v_grouped,
+            "activation_f16": prism.activation_f16,
+            "q2tp_affine_profile": profiles
+                .iter()
+                .any(|q| matches!(q, Quant::Q2TiledPAffine)),
+            "q2tp_affine_source_scale_ladder_rms": if prism_affine_scale_count == 0 {
+                0.0
+            } else {
+                (prism_affine_scale_sq / prism_affine_scale_count as f64).sqrt()
+            },
+            "q2tp_affine_source_scale_ladder_groups": prism_affine_scale_count,
+            "ordinary_q2tp_existing_codec": profiles
+                .iter()
+                .any(|q| matches!(q, Quant::Q2TiledP)),
+            "ordinary_q2tp_profile_policy": "existing_mixed_q2tp_gate_up_q4tp_other",
+            "ordinary_q2tp_weight_error_is_lossy": true,
+            "vision_tensors_preserved": true,
+            "vision_runtime": "qwen3vis_tensors_preserved_no_text_fusion",
+        });
+        p
+    } else {
+        provenance
+    };
+    let header_for = |i: usize| {
+        let mut p = provenance.clone();
+        p["weight_quant"] = serde_json::json!(quant_name(profiles[i]));
+        let header_arch = if matches!(profiles[i], Quant::Q2TiledPAffine) {
+            let mut a = arch.clone();
+            let prism = a
+                .prism_hadamard
+                .as_mut()
+                .expect("Prism affine profile requires Hadamard metadata");
+            let mut target_names = prism
+                .forward_weight_names
+                .iter()
+                .chain(prism.inverse_weight_names.iter())
+                .map(|name| {
+                    name.strip_prefix("language_model.")
+                        .unwrap_or(name)
+                        .to_string()
+                })
+                .collect::<Vec<_>>();
+            target_names.sort();
+            target_names.dedup();
+            prism.affine = Some(PrismAffineConfig {
+                version: 1,
+                profile: "q2tp_affine".into(),
+                group_size: GROUP_SIZE,
+                correction_scale: 0.5,
+                target_names,
+            });
+            a
+        } else {
+            arch.clone()
+        };
+        CmfHeader {
+            format: "cmf".into(),
+            version: CMF_VERSION,
+            arch: header_arch,
+            quant_type: quant_type(profiles[i]),
+            provenance: Some(p),
+            tokenizer_config: Some(bundle.clone()),
+            section_hashes: None,
+            skills: Vec::new(),
+            shard: None,
+            calibration: None,
+            routing: None,
+        }
     };
 
     // Lay the blob out in EXECUTION order — embed, then each layer's tensors
@@ -4914,20 +5979,32 @@ pub fn run_convert(
     // reads at disk rate and lets a per-layer `madvise(WILLNEED)` cover one
     // contiguous range. Pure layout — the directory carries offsets, so the
     // reader (which addresses tensors by name/offset) is unaffected.
-    tensors.sort_by(|a, b| {
-        exec_order_key(&a.name)
-            .cmp(&exec_order_key(&b.name))
-            .then_with(|| a.name.cmp(&b.name))
-    });
-
-    // Anything still resident (small tensors produced outside the main
-    // loop) is appended last.
-    drain_to_writer(&mut tensors, &mut writer)?;
-    writer
-        .finish(&header, None, vocab.as_deref())
-        .map_err(|e| anyhow::anyhow!("write {output}: {e}"))?;
-    // The manifest only exists to rescue an interrupted run.
-    let _ = std::fs::remove_file(&manifest_path);
+    for i in 0..outputs.len() {
+        if completed[i] {
+            continue;
+        }
+        tensors[i].sort_by(|a, b| {
+            exec_order_key(&a.name)
+                .cmp(&exec_order_key(&b.name))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        // Anything still resident (small tensors produced outside the main
+        // loop) is appended last.
+        let writer = writers[i]
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("output {} has no writer", outputs[i].1))?;
+        let mut writer = writer;
+        drain_to_writer(&mut tensors[i], &mut writer)?;
+        writer
+            .finish(&header_for(i), None, vocab.as_deref())
+            .map_err(|e| anyhow::anyhow!("write {}: {e}", outputs[i].1))?;
+        // The manifest only exists to rescue an interrupted run. Keep it
+        // until every requested output has finalized, so a crash between two
+        // finish calls can detect the already-valid sibling on resume.
+    }
+    for manifest_path in manifests {
+        let _ = std::fs::remove_file(manifest_path);
+    }
     progress(1.0);
     Ok(())
 }
@@ -4965,6 +6042,100 @@ pub(crate) fn q2tp_expert_gate_or_up(name: &str) -> bool {
 pub(crate) mod tests {
     use super::*;
     use cortiq_core::format::CmfModel;
+
+    #[test]
+    fn hf_thread_env_is_bounded_and_keeps_legacy_default() {
+        assert_eq!(parse_hf_threads(None), HF_DEFAULT_THREADS);
+        assert_eq!(parse_hf_threads(Some("")), HF_DEFAULT_THREADS);
+        assert_eq!(parse_hf_threads(Some("not-a-number")), HF_DEFAULT_THREADS);
+        assert_eq!(parse_hf_threads(Some("0")), HF_DEFAULT_THREADS);
+        assert_eq!(parse_hf_threads(Some(" -4 ")), HF_DEFAULT_THREADS);
+        assert_eq!(parse_hf_threads(Some(" 16 ")), 16);
+        assert_eq!(parse_hf_threads(Some("64")), HF_MAX_THREADS);
+        assert_eq!(parse_hf_threads(Some("65")), HF_MAX_THREADS);
+        assert_eq!(
+            parse_hf_threads(Some("999999999999999999999999")),
+            HF_DEFAULT_THREADS
+        );
+    }
+
+    #[test]
+    fn hf_range_planner_covers_file_without_overlap() {
+        assert!(plan_hf_ranges(0, 32).is_empty());
+        assert!(plan_hf_ranges(100, 0).is_empty());
+
+        let ranges = plan_hf_ranges(100, 32);
+        assert_eq!(ranges, vec![(0, 32), (32, 64), (64, 96), (96, 100)]);
+        assert_eq!(ranges.first().map(|r| r.0), Some(0));
+        assert_eq!(ranges.last().map(|r| r.1), Some(100));
+        for pair in ranges.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0, "ranges must be adjacent");
+            assert!(pair[0].0 < pair[0].1, "ranges must be non-empty");
+        }
+        assert!(ranges.last().unwrap().0 < ranges.last().unwrap().1);
+    }
+
+    #[test]
+    fn source_shard_priority_is_exact_and_stable() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var(SOURCE_SHARD_PRIORITY_ENV);
+        }
+        let mut shards = vec![
+            "model-00001-of-00004.safetensors".to_string(),
+            "model-00002-of-00004.safetensors".to_string(),
+            "model-00003-of-00004.safetensors".to_string(),
+            "model-00004-of-00004.safetensors".to_string(),
+        ];
+        apply_source_shard_priority(&mut shards)
+            .expect("no priority environment should preserve the source order");
+        assert_eq!(
+            shards,
+            vec![
+                "model-00001-of-00004.safetensors",
+                "model-00002-of-00004.safetensors",
+                "model-00003-of-00004.safetensors",
+                "model-00004-of-00004.safetensors",
+            ]
+        );
+
+        unsafe {
+            std::env::set_var(
+                SOURCE_SHARD_PRIORITY_ENV,
+                "model-00003-of-00004.safetensors,model-00001-of-00004.safetensors",
+            );
+        }
+        apply_source_shard_priority(&mut shards).unwrap();
+        assert_eq!(
+            shards,
+            vec![
+                "model-00003-of-00004.safetensors",
+                "model-00001-of-00004.safetensors",
+                "model-00002-of-00004.safetensors",
+                "model-00004-of-00004.safetensors",
+            ]
+        );
+
+        for bad in [
+            "",
+            ",model-00001-of-00004.safetensors",
+            "model-00001-of-00004.safetensors,",
+            "model-00099-of-00004.safetensors",
+            "model-00001-of-00004.safetensors,model-00001-of-00004.safetensors",
+        ] {
+            unsafe {
+                std::env::set_var(SOURCE_SHARD_PRIORITY_ENV, bad);
+            }
+            let mut candidate = shards.clone();
+            assert!(
+                apply_source_shard_priority(&mut candidate).is_err(),
+                "priority {bad:?} must fail closed"
+            );
+        }
+        unsafe {
+            std::env::remove_var(SOURCE_SHARD_PRIORITY_ENV);
+        }
+    }
 
     /// The encoders read their switches from the environment, and the test
     /// harness runs tests on threads of ONE process — so two tests steering
@@ -5255,6 +6426,137 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn deepseek_v41_keeps_full_source_config_and_native_engram_names() {
+        let config = serde_json::json!({
+            "model_type": "deepseek_v41",
+            "quantization_config": {
+                "quant_method": "fp8",
+                "weight_block_size": [32, 32],
+                "scale_fmt": "ue8m0"
+            },
+            "text_config": {
+                "model_type": "deepseek_v41_text",
+                "hidden_size": 8,
+                "intermediate_size": 16,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "head_dim": 4,
+                "qk_rope_head_dim": 2,
+                "qk_nope_head_dim": 2,
+                "vocab_size": 32,
+                "rms_norm_eps": 1e-6,
+                "n_routed_experts": 2,
+                "moe_intermediate_size": 4,
+                "num_experts_per_tok": 1,
+                "n_shared_experts": 1
+            },
+            "vision_config": {
+                "model_type": "deepseek_v41_vision",
+                "hidden_size": 4,
+                "num_hidden_layers": 2
+            }
+        });
+        let arch = build_arch(&config).unwrap();
+        assert_eq!(arch.arch_name, "deepseek_v41");
+        assert_eq!(arch.deepseek_v41.as_ref(), Some(&config));
+        assert_eq!(source_fp8_block(&config), 32);
+        assert_eq!(
+            canon_name("layers.1.engram.embed.weight").as_deref(),
+            Some("model.layers.1.engram.embed.weight")
+        );
+        assert_eq!(
+            canon_name("layers.1.engram.embed.scale").as_deref(),
+            Some("model.layers.1.engram.embed.scale")
+        );
+        assert_eq!(
+            canon_name("layers.1.ffn.gate.bias_vl").as_deref(),
+            Some("model.layers.1.mlp.expert_bias_vl")
+        );
+    }
+
+    #[test]
+    fn dsv41_vision_and_aligner_matrix_weights_stay_f16_in_q4tp() {
+        let config = serde_json::json!({
+            "model_type": "deepseek_v41",
+            "text_config": {
+                "model_type": "deepseek_v41_text",
+                "hidden_size": 8,
+                "intermediate_size": 16,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "head_dim": 4,
+                "vocab_size": 32,
+                "rms_norm_eps": 1e-6
+            },
+            "vision_config": {"hidden_size": 8}
+        });
+        let arch = build_arch(&config).unwrap();
+        let values = vec![0.25f32; 8 * 8];
+        let mut batches = vec![Vec::new()];
+        for name in [
+            "vision.patch_embed.proj.weight",
+            "vision.blocks.0.attn.wqkv.weight",
+            "vision.blocks.0.mlp.w1.weight",
+            "aligner.w1.weight",
+            "aligner.w2.weight",
+        ] {
+            emit_profiled_tensor(
+                &mut batches,
+                &[Quant::Q4TiledP],
+                &[true],
+                &arch,
+                name,
+                &[8, 8],
+                &values,
+                EmitMode::Auto,
+            );
+        }
+        // The pre-existing F32 route remains authoritative when a control
+        // tensor is encountered in the same profile.
+        emit_profiled_tensor(
+            &mut batches,
+            &[Quant::Q4TiledP],
+            &[true],
+            &arch,
+            "model.layers.0.mlp.expert_bias",
+            &[8],
+            &values[..8],
+            EmitMode::Auto,
+        );
+        assert_eq!(
+            batches[0][..5].iter().map(|t| t.dtype).collect::<Vec<_>>(),
+            vec![
+                TensorDtype::F16,
+                TensorDtype::F16,
+                TensorDtype::F16,
+                TensorDtype::F16,
+                TensorDtype::F16
+            ]
+        );
+        assert_eq!(batches[0][5].dtype, TensorDtype::F32);
+    }
+
+    #[test]
+    fn local_ready_consume_reports_unlink_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "cortiq-local-ready-unlink-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let missing = root.join("already-removed.safetensors");
+        let err = consume_local_ready_source(&missing)
+            .expect_err("local-ready consume must fail when the source unlink fails");
+        assert!(
+            err.to_string()
+                .contains("remove consumed local-ready source")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn fp8_e4m3_decodes_the_ocp_reference_points() {
         assert_eq!(fp8_e4m3_to_f32(0x00), 0.0);
         assert_eq!(fp8_e4m3_to_f32(0x38), 1.0); // exp 7 → 2^0
@@ -5263,6 +6565,22 @@ pub(crate) mod tests {
         assert_eq!(fp8_e4m3_to_f32(0x40), 2.0);
         assert_eq!(fp8_e4m3_to_f32(0x01), (2f32).powi(-9)); // smallest subnormal
         assert_eq!(fp8_e4m3_to_f32(0x7E), 448.0); // largest finite
+        assert!(fp8_e4m3_to_f32(0x7F).is_nan()); // E4M3FN NaN sentinel
+        assert!(unpack_fp8_blocks(&[0x7F], &[127], 1, 1, 1).is_err());
+    }
+
+    #[test]
+    fn glm_kda_state_controls_stay_strict_f32() {
+        for name in [
+            "model.layers.0.mlp.expert_bias",
+            "model.layers.0.kda_attn.dt_bias",
+            "model.layers.0.kda_attn.A_log",
+            "model.layers.0.kda_attn.q_conv1d.weight",
+            "model.layers.0.kda_attn.k_conv1d.weight",
+            "model.layers.0.kda_attn.v_conv1d.weight",
+        ] {
+            assert!(force_f32(name), "{name} must not be narrowed");
+        }
     }
 
     /// The block plane must be indexed by TILE, not by element: a wrong
@@ -5282,6 +6600,41 @@ pub(crate) mod tests {
         // a NaN scale must fail rather than poison the tensor
         let bad = vec![255u8, 128, 129, 130];
         assert!(unpack_fp8_blocks(&packed, &bad, rows, cols, block).is_err());
+    }
+
+    #[test]
+    fn fp8_f32_scale_inv_applies_per_block() {
+        // 0x38 is exactly 1.0 in E4M3, so the output exposes the scale plane.
+        let out = unpack_fp8_scale_inv(&[0x38; 4], &[1.0, 2.0, 3.0, 4.0], 2, 2, 1).unwrap();
+        assert_eq!(out, vec![1.0, 2.0, 3.0, 4.0]);
+        assert!(unpack_fp8_scale_inv(&[0x38; 4], &[1.0], 2, 2, 1).is_err());
+        assert!(unpack_fp8_scale_inv(&[0x38; 4], &[f32::NAN; 4], 2, 2, 1).is_err());
+        assert!(unpack_fp8_scale_inv(&[0x7F; 4], &[1.0; 4], 2, 2, 1).is_err());
+    }
+
+    /// GLM's fine-grained FP8 decode is row-independent just like the output
+    /// encoders.  Keep a non-trivial tail row/column shape here so a future
+    /// parallel rewrite cannot accidentally change block indexing or bytes
+    /// while still passing a square toy case.
+    #[test]
+    fn fp8_scale_inv_decode_is_thread_count_invariant() {
+        let (rows, cols, block) = (17usize, 130usize, 8usize);
+        let sr = rows.div_ceil(block);
+        let sc = cols.div_ceil(block);
+        let packed: Vec<u8> = (0..rows * cols)
+            .map(|i| ((i * 37 + 11) as u8) & 0x7e)
+            .collect();
+        let scales: Vec<f32> = (0..sr * sc)
+            .map(|i| 0.125 + (i % 13) as f32 * 0.25)
+            .collect();
+        let _g = env_guard("1", "1");
+        let serial = unpack_fp8_scale_inv(&packed, &scales, rows, cols, block).unwrap();
+        unsafe { std::env::set_var("CMF_ENCODE_THREADS", "8") };
+        let parallel = unpack_fp8_scale_inv(&packed, &scales, rows, cols, block).unwrap();
+        assert_eq!(
+            serial, parallel,
+            "FP8 scale-inverse decode changed with threads"
+        );
     }
 
     #[test]
@@ -5523,6 +6876,89 @@ pub(crate) mod tests {
         assert_eq!(
             canon_name("model.layers.1.mlp.experts.e_score_correction_bias").as_deref(),
             Some("model.layers.1.mlp.expert_bias")
+        );
+    }
+
+    #[test]
+    fn glm5_next_arch_preserves_mhc_kda_dsa_and_router_geometry() {
+        let cfg = serde_json::json!({
+            "model_type": "glm5_next",
+            "num_nextn_predict_layers": 1,
+            "text_config": {
+                "model_type": "glm5_next_text",
+                "hidden_size": 4096,
+                "intermediate_size": 12288,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 64,
+                "num_key_value_heads": 64,
+                "head_dim": 0,
+                "num_nextn_predict_layers": 1,
+                "q_lora_rank": 1536,
+                "kv_lora_rank": 512,
+                "qk_nope_head_dim": 256,
+                "qk_rope_head_dim": 0,
+                "v_head_dim": 256,
+                "vocab_size": 154880,
+                "max_position_embeddings": 1048576,
+                "layer_types": ["linear_attention", "linear_attention", "linear_attention", "deepseek_sparse_attention"],
+                "n_routed_experts": 288,
+                "num_experts_per_tok": 8,
+                "moe_intermediate_size": 2048,
+                "n_shared_experts": 1,
+                "norm_topk_prob": true,
+                "scoring_func": "sigmoid",
+                "routed_scaling_factor": 2.5,
+                "hc_mult": 4,
+                "hc_eps": 0.000001,
+                "hc_sinkhorn_iters": 20,
+                "swiglu_limit": 10.0,
+                "index_n_heads": 32,
+                "index_head_dim": 128,
+                "index_topk": 2048,
+                "index_kpool": 4
+            }
+        });
+        let arch = build_arch(&cfg).unwrap();
+        assert_eq!(arch.head_dim, 256, "serialized head_dim=0 must not survive");
+        assert!(matches!(arch.layer_types[0], LayerType::Kda));
+        assert!(matches!(arch.layer_types[3], LayerType::FullAttention));
+        assert_eq!(arch.kda_gate_lower_bound, Some(-5.0));
+        assert_eq!(arch.linear_num_key_heads, Some(64));
+        assert_eq!(arch.linear_key_head_dim, Some(128));
+        assert_eq!(arch.linear_value_head_dim, Some(128));
+        assert_eq!(arch.linear_conv_kernel_dim, Some(4));
+        assert!(
+            arch.mtp.is_none(),
+            "GLM release has no converted MTP tensors"
+        );
+        let moe = arch.moe.as_ref().unwrap();
+        assert!(moe.router_sigmoid);
+        assert_eq!(moe.top_k, 8);
+        assert_eq!(moe.shared_expert_intermediate_size, Some(2048));
+        assert_eq!(moe.routed_scaling_factor, Some(2.5));
+        let glm = arch.glm5_next.as_ref().unwrap();
+        assert_eq!((glm.hc_mult, glm.hc_sinkhorn_iters), (4, 20));
+        assert_eq!((glm.index_n_heads, glm.index_head_dim), (32, 128));
+        assert_eq!((glm.index_topk, glm.index_kpool), (2048, 4));
+        assert_eq!(
+            canon_name("model.language_model.layers.3.mlp.gate.e_score_correction_bias").as_deref(),
+            Some("model.layers.3.mlp.expert_bias")
+        );
+        assert_eq!(
+            quant_for_tensor(
+                &arch,
+                "model.layers.3.self_attn.q_b_proj.weight",
+                Quant::Q4TiledP,
+            ),
+            Quant::Q8_2f,
+        );
+        assert_eq!(
+            quant_for_tensor(
+                &arch,
+                "model.layers.3.mlp.experts.0.gate_proj.weight",
+                Quant::Q4TiledP,
+            ),
+            Quant::Q4TiledP,
         );
     }
 
@@ -6354,6 +7790,558 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn local_ready_rejects_partial_or_changed_source_before_mmap() {
+        let root = std::env::temp_dir().join(format!(
+            "cortiq-local-ready-boundary-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let source_dir = root.join("hf");
+        let ready_dir = root.join("ready");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&ready_dir).unwrap();
+        let filename = "model-00001-of-00001.safetensors";
+        let source = source_dir.join(filename);
+        let bytes = b"complete safetensors source";
+        fs::write(&source, bytes).unwrap();
+        let (_, sha256) = sha256_file(&source).unwrap();
+        let expected = SourceFileExpectation {
+            size: bytes.len() as u64,
+            sha256,
+        };
+        let marker = ready_marker_path(&ready_dir, filename).unwrap();
+        fs::write(
+            source.with_file_name(format!("{filename}.aria2")),
+            b"partial",
+        )
+        .unwrap();
+        fs::write(
+            &marker,
+            serde_json::to_vec(&serde_json::json!({
+                "filename": filename,
+                "size": expected.size,
+                "sha256": expected.sha256
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let err = validate_local_ready_source(&ready_dir, &source_dir, filename, &expected)
+            .expect_err("a source with .aria2 must never be mmaped");
+        assert!(err.to_string().contains("aria2"), "unexpected error: {err}");
+        fs::remove_file(source.with_file_name(format!("{filename}.aria2"))).unwrap();
+
+        let mut changed = bytes.to_vec();
+        changed[0] ^= 0x01;
+        fs::write(&source, changed).unwrap();
+        let err = validate_local_ready_source(&ready_dir, &source_dir, filename, &expected)
+            .expect_err("a changed source must fail the pinned SHA256 check");
+        assert!(
+            err.to_string().contains("SHA256") || err.to_string().contains("validation"),
+            "unexpected error: {err}"
+        );
+
+        fs::write(&source, bytes).unwrap();
+        assert_eq!(
+            validate_local_ready_source(&ready_dir, &source_dir, filename, &expected).unwrap(),
+            source
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn local_ready_stream_processes_certified_shards_and_preserves_source() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var(LOCAL_READY_POLL_MS_ENV, "0");
+            std::env::remove_var(LOCAL_READY_DIR_ENV);
+            std::env::remove_var(CONSUME_SOURCE_SHARDS_ENV);
+        }
+        let root = std::env::temp_dir().join(format!(
+            "cortiq-local-ready-stream-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let source_dir = root.join("hf");
+        let ready_dir = root.join("ready");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&ready_dir).unwrap();
+        let first = "model-00001-of-00002.safetensors";
+        let second = "model-00002-of-00002.safetensors";
+        let shards = [
+            (
+                first,
+                tiny_safetensors(&[("embed.weight", vec![2, 2], vec![1.0, 2.0, 3.0, 4.0])]),
+            ),
+            (
+                second,
+                tiny_safetensors(&[("norm.weight", vec![2], vec![1.0, 1.0])]),
+            ),
+        ];
+        let mut manifest = serde_json::Map::new();
+        for (name, bytes) in &shards {
+            fs::write(source_dir.join(name), bytes).unwrap();
+            let (size, sha256) = sha256_file(&source_dir.join(name)).unwrap();
+            assert_eq!(size, bytes.len() as u64);
+            manifest.insert(
+                (*name).to_string(),
+                serde_json::json!({"size": size, "sha256": sha256}),
+            );
+            fs::write(
+                ready_dir.join(format!("{name}.json")),
+                serde_json::json!({
+                    "filename": name,
+                    "size": size,
+                    "sha256": sha256
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+        fs::write(
+            root.join("source-files.json"),
+            serde_json::to_vec(&serde_json::Value::Object(manifest)).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            source_dir.join("config.json"),
+            serde_json::json!({
+                "model_type": "deepseek_v41",
+                "text_config": {
+                    "model_type": "deepseek_v41_text",
+                    "hidden_size": 2,
+                    "intermediate_size": 4,
+                    "num_hidden_layers": 1,
+                    "num_attention_heads": 1,
+                    "num_key_value_heads": 1,
+                    "head_dim": 2,
+                    "vocab_size": 2,
+                    "rms_norm_eps": 1e-6
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            source_dir.join("model.safetensors.index.json"),
+            serde_json::json!({
+                "weight_map": {
+                    "embed.weight": first,
+                    "norm.weight": second
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let output = root.join("ready.cmf");
+        let mut last_progress = 0.0f32;
+        unsafe {
+            std::env::set_var(LOCAL_READY_DIR_ENV, &ready_dir);
+        }
+        run_convert_multi(
+            source_dir.to_str().unwrap(),
+            &[("q8".into(), output.to_str().unwrap().into())],
+            None,
+            None,
+            None,
+            false,
+            |p| last_progress = p,
+        )
+        .unwrap();
+        assert_eq!(last_progress, 1.0);
+        assert!(source_dir.join(first).exists());
+        assert!(source_dir.join(second).exists());
+        let model = CmfModel::open(&output).unwrap();
+        assert!(
+            model.verify().is_empty(),
+            "CMF verify: {:?}",
+            model.verify()
+        );
+        unsafe {
+            std::env::remove_var(LOCAL_READY_DIR_ENV);
+            std::env::remove_var(LOCAL_READY_POLL_MS_ENV);
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn source_shard_priority_resume_matches_default_payloads() {
+        // The priority path must remain a pure scheduling change: start with
+        // the second shard already written and durably marked, remove that
+        // source as the consuming pod would, then resume in [second, first]
+        // order.  Comparing every final tensor's bytes against an ordinary
+        // [first, second] conversion catches both duplicate and missing work.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var(SOURCE_SHARD_PRIORITY_ENV);
+            std::env::remove_var(CONSUME_SOURCE_SHARDS_ENV);
+            std::env::set_var(LOCAL_READY_POLL_MS_ENV, "0");
+        }
+        let root = std::env::temp_dir().join(format!(
+            "cortiq-source-priority-resume-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let default_dir = root.join("default");
+        let default_ready = root.join("default-ready");
+        let priority_dir = root.join("priority");
+        let priority_ready = root.join("priority-ready");
+        let first = "model-00001-of-00002.safetensors";
+        let second = "model-00002-of-00002.safetensors";
+        let first_values = vec![1.0f32, 2.0, 3.0, 4.0];
+        let second_values = vec![1.0f32, 1.0];
+
+        let write_fixture = |dir: &Path, ready: &Path| {
+            fs::create_dir_all(dir).unwrap();
+            fs::create_dir_all(ready).unwrap();
+            let shards = [
+                (
+                    first,
+                    tiny_safetensors(&[("embed.weight", vec![2, 2], first_values.clone())]),
+                ),
+                (
+                    second,
+                    tiny_safetensors(&[("norm.weight", vec![2], second_values.clone())]),
+                ),
+            ];
+            let mut manifest = serde_json::Map::new();
+            for (name, bytes) in &shards {
+                let source = dir.join(name);
+                fs::write(&source, bytes).unwrap();
+                let (size, sha256) = sha256_file(&source).unwrap();
+                manifest.insert(
+                    (*name).to_string(),
+                    serde_json::json!({"size": size, "sha256": sha256}),
+                );
+                fs::write(
+                    ready.join(format!("{name}.json")),
+                    serde_json::json!({
+                        "filename": name,
+                        "size": size,
+                        "sha256": sha256
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+            }
+            fs::write(
+                ready
+                    .parent()
+                    .expect("ready directory has a fixture parent")
+                    .join("source-files.json"),
+                serde_json::to_vec(&serde_json::Value::Object(manifest)).unwrap(),
+            )
+            .unwrap();
+            fs::write(
+                dir.join("config.json"),
+                serde_json::json!({
+                    "model_type": "deepseek_v41",
+                    "text_config": {
+                        "model_type": "deepseek_v41_text",
+                        "hidden_size": 2,
+                        "intermediate_size": 4,
+                        "num_hidden_layers": 1,
+                        "num_attention_heads": 1,
+                        "num_key_value_heads": 1,
+                        "head_dim": 2,
+                        "vocab_size": 2,
+                        "rms_norm_eps": 1e-6
+                    }
+                })
+                .to_string(),
+            )
+            .unwrap();
+            fs::write(
+                dir.join("model.safetensors.index.json"),
+                serde_json::json!({
+                    "weight_map": {
+                        "embed.weight": first,
+                        "norm.weight": second
+                    }
+                })
+                .to_string(),
+            )
+            .unwrap();
+        };
+        write_fixture(&default_dir, &default_ready);
+        write_fixture(&priority_dir, &priority_ready);
+
+        let default_output = root.join("default.cmf");
+        unsafe {
+            std::env::set_var(LOCAL_READY_DIR_ENV, &default_ready);
+        }
+        run_convert_multi(
+            default_dir.to_str().unwrap(),
+            &[("f16".into(), default_output.to_str().unwrap().into())],
+            None,
+            None,
+            None,
+            false,
+            |_| {},
+        )
+        .unwrap();
+
+        // Seed the resumed output with the second shard's exact f16 payload.
+        // Its mark is durable before the source is removed, which is the
+        // checkpoint contract exercised by the production consume path.
+        let priority_output = root.join("priority.cmf");
+        let priority_manifest = format!("{}.manifest", priority_output.display());
+        let mut writer = cortiq_core::format::CmfStreamWriter::new(
+            &priority_output,
+            cortiq_core::format::CmfStreamWriter::head_reserve_for(8192, 96),
+        )
+        .unwrap()
+        .with_manifest(&priority_manifest)
+        .unwrap();
+        writer
+            .push(
+                "model.norm.weight",
+                TensorDtype::F16,
+                &[2],
+                &encode_f16(&second_values),
+            )
+            .unwrap();
+        writer.mark(second).unwrap();
+        drop(writer);
+        fs::remove_file(priority_dir.join(second)).unwrap();
+
+        unsafe {
+            std::env::set_var(LOCAL_READY_DIR_ENV, &priority_ready);
+            std::env::set_var(SOURCE_SHARD_PRIORITY_ENV, format!("{second},{first}"));
+        }
+        run_convert_multi(
+            priority_dir.to_str().unwrap(),
+            &[("f16".into(), priority_output.to_str().unwrap().into())],
+            None,
+            None,
+            None,
+            true,
+            |_| {},
+        )
+        .unwrap();
+
+        let default_model = CmfModel::open(&default_output).unwrap();
+        let priority_model = CmfModel::open(&priority_output).unwrap();
+        assert!(default_model.verify().is_empty());
+        assert!(priority_model.verify().is_empty());
+        assert_eq!(default_model.tensors.len(), priority_model.tensors.len());
+        for expected in &default_model.tensors {
+            let actual = priority_model
+                .tensor(&expected.name)
+                .unwrap_or_else(|| panic!("resumed output lacks {}", expected.name));
+            assert_eq!(actual.dtype, expected.dtype, "dtype {}", expected.name);
+            assert_eq!(actual.shape, expected.shape, "shape {}", expected.name);
+            assert_eq!(actual.nbytes, expected.nbytes, "size {}", expected.name);
+            assert_eq!(actual.hash, expected.hash, "hash {}", expected.name);
+            assert_eq!(
+                default_model.tensor_bytes(&expected.name).unwrap(),
+                priority_model.tensor_bytes(&expected.name).unwrap(),
+                "payload {}",
+                expected.name
+            );
+        }
+        assert!(priority_dir.join(first).exists());
+        assert!(!priority_dir.join(second).exists());
+        unsafe {
+            std::env::remove_var(LOCAL_READY_DIR_ENV);
+            std::env::remove_var(LOCAL_READY_POLL_MS_ENV);
+            std::env::remove_var(SOURCE_SHARD_PRIORITY_ENV);
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn resume_skips_deleted_marked_shard_but_rejects_unmarked_missing_input() {
+        // This is the failure mode of a V4.1 pod restart: the first shard was
+        // durably marked and consumed before the process died, while the next
+        // shard still has to be opened. The index and manifest are the only
+        // files that survive source-shard consumption.
+        let dir =
+            std::env::temp_dir().join(format!("cortiq-resume-shard-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let first = "model-00001-of-00002.safetensors";
+        let second = "model-00002-of-00002.safetensors";
+        fs::write(
+            dir.join(first),
+            tiny_safetensors(&[("layers.0.weight", vec![2, 2], vec![1.0, 2.0, 3.0, 4.0])]),
+        )
+        .unwrap();
+        fs::write(
+            dir.join(second),
+            tiny_safetensors(&[("layers.1.weight", vec![2, 2], vec![5.0, 6.0, 7.0, 8.0])]),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("model.safetensors.index.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "metadata": {},
+                "weight_map": {
+                    "layers.0.weight": first,
+                    "layers.1.weight": second
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let counts = source_shard_counts(&dir).unwrap();
+        assert_eq!(
+            counts,
+            vec![(first.to_string(), 1), (second.to_string(), 1)]
+        );
+        let mut files = open_model(&dir).unwrap();
+        assert_eq!(files.len(), 2);
+        consume_source_shard(&mut files, 0, &dir).unwrap();
+        assert!(!dir.join(first).exists());
+        drop(files);
+
+        let manifest = dir.join("resume.cmf.manifest");
+        fs::write(
+            &manifest,
+            format!(
+                "{{\"data_off\":4096}}\n{{\"mark\":\"{first}\",\"at\":16}}\n{{truncated\n{{\"mark\":\"{second}\",\"at\":32}}"
+            ),
+        )
+        .unwrap();
+        let marks = resume_manifest_marks(&manifest);
+        assert!(marks.contains(first));
+        assert!(!marks.contains(second));
+
+        let pending = open_model_filtered(&dir, &marks).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].name, second);
+        assert_eq!(pending[0].tensors[0].name, "layers.1.weight");
+        drop(pending);
+
+        // A missing shard without a durable mark must remain a hard error;
+        // silently skipping it would produce a valid-looking incomplete CMF.
+        fs::remove_file(dir.join(second)).unwrap();
+        assert!(open_model_filtered(&dir, &marks).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn resume_after_checkpoint_consumes_deleted_inputs_and_finalizes_in_place() {
+        // Exercise the complete local path with a partial CMF: its first
+        // source shard is checkpointed, then deleted as if the pod died after
+        // consumption. Resume must retain that durable payload, convert the
+        // remaining shard, and finish the same output without a duplicate.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var(CONSUME_SOURCE_SHARDS_ENV, "1");
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "cortiq-resume-in-place-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let first = "model-00001-of-00002.safetensors";
+        let second = "model-00002-of-00002.safetensors";
+        let first_values = vec![1.0f32, 2.0, 3.0, 4.0];
+        fs::write(
+            dir.join(first),
+            tiny_safetensors(&[("embed.weight", vec![2, 2], first_values.clone())]),
+        )
+        .unwrap();
+        fs::write(
+            dir.join(second),
+            tiny_safetensors(&[("norm.weight", vec![2], vec![1.0, 1.0])]),
+        )
+        .unwrap();
+        let config = serde_json::json!({
+            "model_type": "deepseek_v41",
+            "text_config": {
+                "model_type": "deepseek_v41_text",
+                "hidden_size": 2,
+                "intermediate_size": 4,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "head_dim": 2,
+                "vocab_size": 2,
+                "rms_norm_eps": 1e-6
+            }
+        });
+        fs::write(
+            dir.join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("model.safetensors.index.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "weight_map": {"embed.weight": first, "norm.weight": second}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let output = dir.join("resume.cmf");
+        let manifest = format!("{}.manifest", output.display());
+        let mut writer = cortiq_core::format::CmfStreamWriter::new(
+            &output,
+            cortiq_core::format::CmfStreamWriter::head_reserve_for(8192, 96),
+        )
+        .unwrap()
+        .with_manifest(&manifest)
+        .unwrap();
+        let first_bytes: Vec<u8> = first_values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        writer
+            .push(
+                "model.embed_tokens.weight",
+                TensorDtype::F32,
+                &[2, 2],
+                &first_bytes,
+            )
+            .unwrap();
+        writer.mark(first).unwrap();
+        drop(writer);
+        fs::remove_file(dir.join(first)).unwrap();
+
+        let mut last_progress = 0.0f32;
+        run_convert_multi(
+            dir.to_str().unwrap(),
+            &[("q8".into(), output.to_str().unwrap().into())],
+            None,
+            None,
+            None,
+            true,
+            |p| last_progress = p,
+        )
+        .unwrap();
+        assert_eq!(last_progress, 1.0);
+        assert!(!dir.join(first).exists());
+        assert!(!dir.join(second).exists());
+        assert!(!std::path::Path::new(&manifest).exists());
+        let model = CmfModel::open(&output).unwrap();
+        assert!(
+            model.verify().is_empty(),
+            "CMF verify: {:?}",
+            model.verify()
+        );
+        assert_eq!(
+            model.arch().deepseek_v41.as_ref(),
+            Some(&config),
+            "the original V4.1 config must survive resume/finalization"
+        );
+        assert_eq!(
+            model
+                .tensors
+                .iter()
+                .filter(|t| t.name == "model.embed_tokens.weight")
+                .count(),
+            1,
+            "resuming must not append the checkpointed shard twice"
+        );
+        unsafe {
+            std::env::remove_var(CONSUME_SOURCE_SHARDS_ENV);
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn convert_tiny_model_end_to_end() {
         let dir = std::env::temp_dir().join(format!("cortiq-convtest-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -6390,6 +8378,131 @@ pub(crate) mod tests {
         assert_eq!(model.arch().vocab_size, 32);
         assert_eq!(model.arch().num_layers, 1);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multi_quant_emits_independent_profiles_and_matches_single_runs() {
+        let dir =
+            std::env::temp_dir().join(format!("cortiq-multi-convtest-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("config.json"),
+            r#"{"model_type":"llama","hidden_size":64,"num_hidden_layers":1,"num_attention_heads":4,"num_key_value_heads":4,"intermediate_size":128,"vocab_size":32,"rms_norm_eps":0.000001,"tie_word_embeddings":true}"#,
+        )
+        .unwrap();
+        fs::write(dir.join("tokenizer.json"), b"{}").unwrap();
+        let vals = |n: usize| (0..n).map(|k| (k as f32 * 0.013).sin()).collect::<Vec<_>>();
+        let st = tiny_safetensors(&[
+            ("model.embed_tokens.weight", vec![32, 64], vals(32 * 64)),
+            (
+                "model.layers.0.mlp.gate_proj.weight",
+                vec![128, 64],
+                vals(128 * 64),
+            ),
+            (
+                "model.layers.0.mlp.up_proj.weight",
+                vec![128, 64],
+                vals(128 * 64),
+            ),
+            (
+                "model.layers.0.mlp.down_proj.weight",
+                vec![64, 128],
+                vals(64 * 128),
+            ),
+            ("model.norm.weight", vec![64], vec![1.0f32; 64]),
+        ]);
+        fs::write(dir.join("model.safetensors"), &st).unwrap();
+
+        let q4 = dir.join("single-q4.cmf");
+        let q2 = dir.join("single-q2.cmf");
+        run_convert(
+            dir.to_str().unwrap(),
+            "q4tp",
+            q4.to_str().unwrap(),
+            None,
+            None,
+            None,
+            false,
+            |_| {},
+        )
+        .unwrap();
+        run_convert(
+            dir.to_str().unwrap(),
+            "q2tp",
+            q2.to_str().unwrap(),
+            None,
+            None,
+            None,
+            false,
+            |_| {},
+        )
+        .unwrap();
+        let both4 = dir.join("both-q4.cmf");
+        let both2 = dir.join("both-q2.cmf");
+        run_convert_multi(
+            dir.to_str().unwrap(),
+            &[
+                ("q4tp".into(), both4.to_str().unwrap().into()),
+                ("q2tp".into(), both2.to_str().unwrap().into()),
+            ],
+            None,
+            None,
+            None,
+            false,
+            |_| {},
+        )
+        .unwrap();
+
+        let single4 = CmfModel::open(&q4).unwrap();
+        let single2 = CmfModel::open(&q2).unwrap();
+        let multi4 = CmfModel::open(&both4).unwrap();
+        let multi2 = CmfModel::open(&both2).unwrap();
+        assert_eq!(single4.tensors.len(), multi4.tensors.len());
+        assert_eq!(single2.tensors.len(), multi2.tensors.len());
+        for (a, b) in single4.tensors.iter().zip(&multi4.tensors) {
+            assert_eq!(
+                (a.name.as_str(), a.dtype, a.shape.as_slice()),
+                (b.name.as_str(), b.dtype, b.shape.as_slice())
+            );
+            assert_eq!(single4.entry_bytes(a), multi4.entry_bytes(b));
+        }
+        for (a, b) in single2.tensors.iter().zip(&multi2.tensors) {
+            assert_eq!(
+                (a.name.as_str(), a.dtype, a.shape.as_slice()),
+                (b.name.as_str(), b.dtype, b.shape.as_slice())
+            );
+            assert_eq!(single2.entry_bytes(a), multi2.entry_bytes(b));
+        }
+        let gate4 = multi4
+            .tensor("model.layers.0.mlp.gate_proj.weight")
+            .unwrap();
+        let gate2 = multi2
+            .tensor("model.layers.0.mlp.gate_proj.weight")
+            .unwrap();
+        assert_eq!(gate4.dtype, TensorDtype::Q4TiledP);
+        assert_eq!(gate2.dtype, TensorDtype::Q2TiledP);
+        assert!(!both4.with_extension("cmf.manifest").exists());
+        assert!(!both2.with_extension("cmf.manifest").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multi_quant_rejects_duplicate_outputs() {
+        let err = run_convert_multi(
+            "missing/model",
+            &[
+                ("q4tp".into(), "same.cmf".into()),
+                ("q2tp".into(), "same.cmf".into()),
+            ],
+            None,
+            None,
+            None,
+            false,
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("repeated"));
     }
 
     /// Qwen3.6 ships an MTP head the converter used to drop on the floor.
@@ -6429,5 +8542,34 @@ pub(crate) mod tests {
         );
         // Vision towers are still dropped.
         assert!(m("visual.blocks.0.attn.qkv.weight").is_none());
+    }
+
+    #[test]
+    fn prism_patch_kernel_is_flattened_in_processor_channel_order() {
+        // Source layout is [out, temporal, height, width, channel]; the
+        // runtime's flattened patch rows are [channel, temporal, height,
+        // width].  Use one output row so every source coordinate is visible.
+        let shape = [1, 2, 2, 2, 3];
+        let source: Vec<u16> = (0..shape.iter().product::<usize>())
+            .map(|v| f32_to_f16(v as f32).to_le())
+            .collect();
+        let raw = source
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<_>>();
+        let (flat_shape, flat) = flatten_prism_patch_weight("F16", &shape, &raw).unwrap();
+        assert_eq!(flat_shape, vec![1, 24]);
+        let mut want = Vec::new();
+        for c in 0..3 {
+            for t in 0..2 {
+                for y in 0..2 {
+                    for x in 0..2 {
+                        let src = ((((t * 2 + y) * 2 + x) * 3) + c) as f32;
+                        want.push(src);
+                    }
+                }
+            }
+        }
+        assert_eq!(flat, want);
     }
 }

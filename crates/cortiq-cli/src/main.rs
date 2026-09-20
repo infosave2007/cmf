@@ -54,6 +54,16 @@ use cortiq_engine::dsv41_vision::{self, PreparedVlInputs, VisionConfig};
 use cortiq_engine::{CortiqRuntime, Pipeline, SamplerConfig};
 use cortiq_server::{AppState, build_router};
 use std::sync::Arc;
+use tracing_subscriber::Layer;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+
+// wgpu's Vulkan/GL teardown can emit a driver event from a TLS destructor,
+// after tracing's own per-thread context has already been destroyed.  Keep
+// the normal subscriber for the command lifetime, then gate the layer off
+// before Tokio/wgpu teardown begins so that late driver diagnostics cannot
+// turn a successful inference into a TLS panic/abort.
+static TRACING_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// A frozen conversation state (B2, `.cmfstate`). v1 is LOGICAL: the token
 /// prefix + active skill + seed + a model fingerprint. Resume replays the
@@ -1814,17 +1824,22 @@ async fn main() -> anyhow::Result<()> {
         Commands::Run { .. } => "warn",
         _ => "info",
     };
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| default_level.into()),
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| default_level.into());
+    let shutdown_filter =
+        tracing_subscriber::filter::filter_fn(|_| TRACING_LIVE.load(AtomicOrdering::Relaxed));
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(
+            tracing_subscriber::fmt::layer()
+                // Logs go to stderr: stdout carries the payload (generated
+                // text, `bench --json`) and must stay machine-parseable.
+                .with_writer(std::io::stderr)
+                .with_filter(shutdown_filter),
         )
-        // Logs go to stderr: stdout carries the payload (generated text,
-        // `bench --json`) and must stay machine-parseable.
-        .with_writer(std::io::stderr)
         .init();
 
-    match cli.command {
+    let result = match cli.command {
         Commands::Serve {
             model,
             port,
@@ -2727,7 +2742,17 @@ async fn main() -> anyhow::Result<()> {
             polish_only,
             teacher.as_deref(),
         ),
-    }
+    };
+    // Stop accepting late tracing events before the owned GPU shutdown path:
+    // timestamp/query destruction can enqueue driver work while contexts are
+    // being dropped, and a logger teardown callback must not race that path.
+    TRACING_LIVE.store(false, AtomicOrdering::Relaxed);
+    // Release Vulkan contexts while Tokio and tracing are still alive.  The
+    // engine keeps them resident during inference but must drain/drop them
+    // before the NVIDIA background worker reaches process teardown.
+    #[cfg(feature = "gpu")]
+    cortiq_engine::gpu_wgpu::shutdown();
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3563,7 +3588,11 @@ fn cmd_explain(model_path: &str, prompt: &str, top: usize) -> anyhow::Result<()>
     // Apply the chosen skill to show EXACTLY the routed answer.
     let mut pipeline = match &winner {
         Some(id) => Pipeline::from_model_with_skill(&model, SamplerConfig::default(), Some(id))?,
-        None => Pipeline::from_model(&model, SamplerConfig::default())?,
+        // Flat files do not need a second Pipeline: `probe` already holds
+        // the same backbone and tokenizer, and keeping two GPU-backed
+        // pipelines alive made wgpu teardown/resource reuse racy in this
+        // introspection-only command.
+        None => probe,
     };
     let logits = pipeline.prefill_next_logits(&ids, None);
     let t = pipeline.calib_temp(); // B1: calibrated confidence if the file carries it
@@ -4487,14 +4516,17 @@ async fn cmd_run(
             ids
         }
     };
-    let build_dsv41_inputs =
-        |pipeline: &Pipeline, history: &[(String, String)]| -> anyhow::Result<PreparedVlInputs> {
-            let messages = history
-                .iter()
-                .map(|(role, content)| serde_json::json!({"role":role, "content":content}))
-                .collect::<Vec<_>>();
-            prepare_dsv41_cli_messages(&model, pipeline, &messages, no_think, reasoning_effort)
-        };
+    let build_dsv41_inputs = |pipeline: &Pipeline,
+                              history: &[(String, String)]|
+     -> anyhow::Result<PreparedVlInputs> {
+        let messages = history
+            .iter()
+            .map(|(role, content)| serde_json::json!({"role":role, "content":content}))
+            .collect::<Vec<_>>();
+        let prepared =
+            prepare_dsv41_cli_messages(&model, pipeline, &messages, no_think, reasoning_effort)?;
+        Ok(prepared)
+    };
 
     if let Some(p) = prompt {
         println!("\nPrompt: {p}\n");
@@ -6378,6 +6410,10 @@ async fn cmd_bench(
             "finish_reason": result.finish_reason,
         });
         println!("{}", serde_json::to_string_pretty(&obj)?);
+        cortiq_engine::prism::perf_report();
+        cortiq_engine::linear_core::perf_report();
+        #[cfg(feature = "gpu")]
+        cortiq_engine::gpu_wgpu::perf_report();
         return Ok(());
     }
     println!(
@@ -6404,6 +6440,11 @@ async fn cmd_bench(
     // `bench` is where the dsv4 breakdown is actually wanted — `run` had it
     // and this did not, so every timing question needed a second command
     // measuring a different workload.
+    cortiq_engine::prism::profile_report();
+    cortiq_engine::prism::perf_report();
+    cortiq_engine::linear_core::perf_report();
+    #[cfg(feature = "gpu")]
+    cortiq_engine::gpu_wgpu::perf_report();
     #[cfg(feature = "gpu")]
     cortiq_engine::dsv4::profile_report();
     cortiq_engine::dsv41::profile_report();

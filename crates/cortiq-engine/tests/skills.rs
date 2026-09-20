@@ -70,6 +70,8 @@ fn arch() -> ModelArch {
         rope_freq_factors: None,
         logit_multiplier: None,
         loop_final_norm: false,
+        glm5_next: None,
+        prism_hadamard: None,
     }
 }
 

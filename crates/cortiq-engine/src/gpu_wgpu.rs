@@ -210,6 +210,177 @@ fn q4tp_matvec4_sg(@builtin(workgroup_id) wid: vec3<u32>,
 }
 "#;
 
+/// Optional subgroup reduction for the resident q2tp 16-row matvec.  This is
+/// intentionally a separate module: adapters without SUBGROUP must retain
+/// the validated tree-reduction pipeline, and a validation error in this
+/// shader must never poison the ordinary q2tp module.  The workgroup still
+/// owns four 64-lane row groups; subgroup leaders write partial vec4 sums and
+/// one lane per row group combines them.  The CPU fallback is selected unless
+/// CMF_Q2TP_SG=1 explicitly opts into the A/B after the probe records
+/// CMF_Q2TP_SG_WIDTH=(32|64) and CMF_Q2TP_SG_LINEAR=1.
+const Q2TP_SG_SRC: &str = r#"
+struct Q1Params { np: u32, rows: u32, _p0: u32, _p1: u32 };
+@group(0) @binding(0) var<storage, read>       q1w : array<u32>;
+@group(0) @binding(2) var<storage, read_write> q1y : array<f32>;
+@group(0) @binding(3) var<uniform>             q1p : Q1Params;
+@group(0) @binding(5) var<storage, read>       q4v_x : array<vec4<f32>>;
+
+var<workgroup> lad_q4w: array<f32, 512>;
+// Four f32 components for at most eight subgroups (256 lanes / 32).
+var<workgroup> sg_part: array<f32, 32>;
+
+fn q4tp_byte(off: u32) -> u32 {
+    return (q1w[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu;
+}
+
+fn q2v_c2(w: u32, sh: u32, affine: u32) -> f32 {
+    return bitcast<f32>((((w >> sh) & 3u) << 1u) | 0x4B000000u)
+        - select(8388611.0, 8388610.0, affine != 0u);
+}
+
+fn q2v_d16(w: u32, a: vec4<f32>, b: vec4<f32>, c: vec4<f32>, d: vec4<f32>, affine: u32) -> f32 {
+    return (q2v_c2(w, 0u, affine) * a.x
+         + q2v_c2(w, 2u, affine) * a.y
+         + q2v_c2(w, 4u, affine) * a.z
+         + q2v_c2(w, 6u, affine) * a.w
+         + q2v_c2(w, 8u, affine) * b.x
+         + q2v_c2(w, 10u, affine) * b.y
+         + q2v_c2(w, 12u, affine) * b.z
+         + q2v_c2(w, 14u, affine) * b.w
+         + q2v_c2(w, 16u, affine) * c.x
+         + q2v_c2(w, 18u, affine) * c.y
+         + q2v_c2(w, 20u, affine) * c.z
+         + q2v_c2(w, 22u, affine) * c.w
+         + q2v_c2(w, 24u, affine) * d.x
+         + q2v_c2(w, 26u, affine) * d.y
+         + q2v_c2(w, 28u, affine) * d.z
+         + q2v_c2(w, 30u, affine) * d.w) * 0.5;
+}
+
+@compute @workgroup_size(256)
+fn q2tp_matvec16w_sg(@builtin(workgroup_id) wid: vec3<u32>,
+                      @builtin(num_workgroups) nwg: vec3<u32>,
+                      @builtin(local_invocation_index) lid: u32,
+                      @builtin(subgroup_invocation_id) sg_inv: u32,
+                      @builtin(subgroup_size) ssz: u32) {
+    let gpr = q1p.np;
+    let rows = q1p.rows;
+    let params_w = rows * gpr * 2u;
+    let codes_b = rows * gpr * 8u + rows * 4u;
+    let cstride = (gpr * 5u + 7u) / 8u;
+    let sg_id = lid / ssz;
+    let sub = lid >> 6u;
+    let l = lid & 63u;
+    let blocks = (rows + 15u) / 16u;
+    var wb = wid.x;
+    loop {
+        if (wb >= blocks) { break; }
+        let base = wb * 16u;
+        for (var t = lid; t < 512u; t = t + 256u) {
+            let r = base + (t >> 5u);
+            if (r < rows) {
+                let pr = unpack2x16float(q1w[params_w + r]);
+                let rung = t & 31u;
+                lad_q4w[t] = select(
+                    exp2(pr.x + f32(max(rung, 1u) - 1u) * pr.y),
+                    0.0,
+                    rung == 0u,
+                );
+            }
+        }
+        workgroupBarrier();
+        let r0 = base + sub;
+        let r1 = base + sub + 4u;
+        let r2 = base + sub + 8u;
+        let r3 = base + sub + 12u;
+        var acc = vec4<f32>(0.0);
+        if (r0 < rows) {
+            let c0 = codes_b + r0 * cstride;
+            let c1 = codes_b + r1 * cstride;
+            let c2 = codes_b + r2 * cstride;
+            let c3 = codes_b + r3 * cstride;
+            let l1 = r1 < rows;
+            let l2 = r2 < rows;
+            let l3 = r3 < rows;
+            var g = l;
+            loop {
+                if (g >= gpr) { break; }
+                let bit = g * 5u;
+                let cbo = bit >> 3u;
+                let sh = bit & 7u;
+                let x0 = g * 8u;
+                let xa = q4v_x[x0];      let xb = q4v_x[x0 + 1u];
+                let xc = q4v_x[x0 + 2u]; let xd = q4v_x[x0 + 3u];
+                let xe = q4v_x[x0 + 4u]; let xf = q4v_x[x0 + 5u];
+                let xg = q4v_x[x0 + 6u]; let xh = q4v_x[x0 + 7u];
+                var cv = q4tp_byte(c0 + cbo);
+                if (sh > 3u) { cv = cv | (q4tp_byte(c0 + cbo + 1u) << 8u); }
+                var wi = (r0 * gpr + g) * 2u;
+                acc.x = acc.x + lad_q4w[(sub << 5u) + ((cv >> sh) & 31u)]
+                    * (q2v_d16(q1w[wi], xa, xb, xc, xd, q1p._p1)
+                        + q2v_d16(q1w[wi + 1u], xe, xf, xg, xh, q1p._p1));
+                if (l1) {
+                    cv = q4tp_byte(c1 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte(c1 + cbo + 1u) << 8u); }
+                    wi = (r1 * gpr + g) * 2u;
+                    acc.y = acc.y + lad_q4w[128u + (sub << 5u) + ((cv >> sh) & 31u)]
+                        * (q2v_d16(q1w[wi], xa, xb, xc, xd, q1p._p1)
+                            + q2v_d16(q1w[wi + 1u], xe, xf, xg, xh, q1p._p1));
+                }
+                if (l2) {
+                    cv = q4tp_byte(c2 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte(c2 + cbo + 1u) << 8u); }
+                    wi = (r2 * gpr + g) * 2u;
+                    acc.z = acc.z + lad_q4w[256u + (sub << 5u) + ((cv >> sh) & 31u)]
+                        * (q2v_d16(q1w[wi], xa, xb, xc, xd, q1p._p1)
+                            + q2v_d16(q1w[wi + 1u], xe, xf, xg, xh, q1p._p1));
+                }
+                if (l3) {
+                    cv = q4tp_byte(c3 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte(c3 + cbo + 1u) << 8u); }
+                    wi = (r3 * gpr + g) * 2u;
+                    acc.w = acc.w + lad_q4w[384u + (sub << 5u) + ((cv >> sh) & 31u)]
+                        * (q2v_d16(q1w[wi], xa, xb, xc, xd, q1p._p1)
+                            + q2v_d16(q1w[wi + 1u], xe, xf, xg, xh, q1p._p1));
+                }
+                g = g + 64u;
+            }
+        }
+        // The explicit path is admitted only after the host has observed a
+        // 32/64-lane linear subgroup.  Keep all lanes participating so the
+        // row tails and invalid rows reduce to zero deterministically.
+        let sa = subgroupAdd(acc.x);
+        let sb = subgroupAdd(acc.y);
+        let sc = subgroupAdd(acc.z);
+        let sd = subgroupAdd(acc.w);
+        if (sg_inv == 0u) {
+            let off = sg_id * 4u;
+            sg_part[off] = sa;
+            sg_part[off + 1u] = sb;
+            sg_part[off + 2u] = sc;
+            sg_part[off + 3u] = sd;
+        }
+        workgroupBarrier();
+        if (l == 0u) {
+            let per = 64u / ssz;
+            let first = (lid >> 6u) * per;
+            var a = 0.0; var b = 0.0; var c = 0.0; var d = 0.0;
+            for (var k = 0u; k < per; k = k + 1u) {
+                let off = (first + k) * 4u;
+                a = a + sg_part[off]; b = b + sg_part[off + 1u];
+                c = c + sg_part[off + 2u]; d = d + sg_part[off + 3u];
+            }
+            if (r0 < rows) { q1y[r0] = a; }
+            if (r1 < rows) { q1y[r1] = b; }
+            if (r2 < rows) { q1y[r2] = c; }
+            if (r3 < rows) { q1y[r3] = d; }
+        }
+        workgroupBarrier();
+        wb = wb + nwg.x;
+    }
+}
+"#;
+
 const SELECT_SG_SRC: &str = r#"
 struct MoeSelP { n_exp: u32, top_k: u32, norm: u32, pk: u32 };
 @group(0) @binding(0) var<storage, read>       sg_logit : array<f32>;
@@ -6398,26 +6569,31 @@ fn q4tp_matvec16w_gu(@builtin(workgroup_id) wid: vec3<u32>,
 // mantissa of 2^23, minus 2^23 + 3, is 2c − 3 exactly, and the sum of
 // exactly-doubled terms halved at the end is the undoubled sum to the
 // bit (scaling by two commutes with every rounding here).
-fn q2v_c2(w: u32, sh: u32) -> f32 {
-    return bitcast<f32>((((w >> sh) & 3u) << 1u) | 0x4B000000u) - 8388611.0;
+fn q2v_c2(w: u32, sh: u32, affine: u32) -> f32 {
+    // The raw q2tp center is 1.5: 2c-3, while an explicit q2tp_affine
+    // descriptor requests 1.0: 2c-2. Keep the center in the shader rather
+    // than retagging the payload; `_p1` is set only after the descriptor
+    // target has been validated by the Rust caller.
+    return bitcast<f32>((((w >> sh) & 3u) << 1u) | 0x4B000000u)
+        - select(8388611.0, 8388610.0, affine != 0u);
 }
-fn q2v_d16(w: u32, a: vec4<f32>, b: vec4<f32>, c: vec4<f32>, d: vec4<f32>) -> f32 {
-    return (q2v_c2(w, 0u) * a.x
-         + q2v_c2(w, 2u) * a.y
-         + q2v_c2(w, 4u) * a.z
-         + q2v_c2(w, 6u) * a.w
-         + q2v_c2(w, 8u) * b.x
-         + q2v_c2(w, 10u) * b.y
-         + q2v_c2(w, 12u) * b.z
-         + q2v_c2(w, 14u) * b.w
-         + q2v_c2(w, 16u) * c.x
-         + q2v_c2(w, 18u) * c.y
-         + q2v_c2(w, 20u) * c.z
-         + q2v_c2(w, 22u) * c.w
-         + q2v_c2(w, 24u) * d.x
-         + q2v_c2(w, 26u) * d.y
-         + q2v_c2(w, 28u) * d.z
-         + q2v_c2(w, 30u) * d.w) * 0.5;
+fn q2v_d16(w: u32, a: vec4<f32>, b: vec4<f32>, c: vec4<f32>, d: vec4<f32>, affine: u32) -> f32 {
+    return (q2v_c2(w, 0u, affine) * a.x
+         + q2v_c2(w, 2u, affine) * a.y
+         + q2v_c2(w, 4u, affine) * a.z
+         + q2v_c2(w, 6u, affine) * a.w
+         + q2v_c2(w, 8u, affine) * b.x
+         + q2v_c2(w, 10u, affine) * b.y
+         + q2v_c2(w, 12u, affine) * b.z
+         + q2v_c2(w, 14u, affine) * b.w
+         + q2v_c2(w, 16u, affine) * c.x
+         + q2v_c2(w, 18u, affine) * c.y
+         + q2v_c2(w, 20u, affine) * c.z
+         + q2v_c2(w, 22u, affine) * c.w
+         + q2v_c2(w, 24u, affine) * d.x
+         + q2v_c2(w, 26u, affine) * d.y
+         + q2v_c2(w, 28u, affine) * d.z
+         + q2v_c2(w, 30u, affine) * d.w) * 0.5;
 }
 @compute @workgroup_size(256)
 fn q2tp_matvec16w(@builtin(workgroup_id) wid: vec3<u32>,
@@ -6473,27 +6649,27 @@ fn q2tp_matvec16w(@builtin(workgroup_id) wid: vec3<u32>,
                 if (sh > 3u) { cv = cv | (q4tp_byte(c0 + cbo + 1u) << 8u); }
                 var wi = (r0 * gpr + g) * 2u;
                 acc.x = acc.x + lad_q4w[(sub << 5u) + ((cv >> sh) & 31u)]
-                    * (q2v_d16(q1w[wi], xa, xb, xc, xd) + q2v_d16(q1w[wi + 1u], xe, xf, xg, xh));
+                    * (q2v_d16(q1w[wi], xa, xb, xc, xd, q1p._p1) + q2v_d16(q1w[wi + 1u], xe, xf, xg, xh, q1p._p1));
                 if (l1) {
                     cv = q4tp_byte(c1 + cbo);
                     if (sh > 3u) { cv = cv | (q4tp_byte(c1 + cbo + 1u) << 8u); }
                     wi = (r1 * gpr + g) * 2u;
                     acc.y = acc.y + lad_q4w[128u + (sub << 5u) + ((cv >> sh) & 31u)]
-                        * (q2v_d16(q1w[wi], xa, xb, xc, xd) + q2v_d16(q1w[wi + 1u], xe, xf, xg, xh));
+                        * (q2v_d16(q1w[wi], xa, xb, xc, xd, q1p._p1) + q2v_d16(q1w[wi + 1u], xe, xf, xg, xh, q1p._p1));
                 }
                 if (l2) {
                     cv = q4tp_byte(c2 + cbo);
                     if (sh > 3u) { cv = cv | (q4tp_byte(c2 + cbo + 1u) << 8u); }
                     wi = (r2 * gpr + g) * 2u;
                     acc.z = acc.z + lad_q4w[256u + (sub << 5u) + ((cv >> sh) & 31u)]
-                        * (q2v_d16(q1w[wi], xa, xb, xc, xd) + q2v_d16(q1w[wi + 1u], xe, xf, xg, xh));
+                        * (q2v_d16(q1w[wi], xa, xb, xc, xd, q1p._p1) + q2v_d16(q1w[wi + 1u], xe, xf, xg, xh, q1p._p1));
                 }
                 if (l3) {
                     cv = q4tp_byte(c3 + cbo);
                     if (sh > 3u) { cv = cv | (q4tp_byte(c3 + cbo + 1u) << 8u); }
                     wi = (r3 * gpr + g) * 2u;
                     acc.w = acc.w + lad_q4w[384u + (sub << 5u) + ((cv >> sh) & 31u)]
-                        * (q2v_d16(q1w[wi], xa, xb, xc, xd) + q2v_d16(q1w[wi + 1u], xe, xf, xg, xh));
+                        * (q2v_d16(q1w[wi], xa, xb, xc, xd, q1p._p1) + q2v_d16(q1w[wi + 1u], xe, xf, xg, xh, q1p._p1));
                 }
                 g = g + 64u;
             }
@@ -6511,6 +6687,164 @@ fn q2tp_matvec16w(@builtin(workgroup_id) wid: vec3<u32>,
         }
         if (l == 0u) {
             let r = partial_q4k[sub << 6u];
+            if (r0 < rows) { q1y[r0] = r.x; }
+            if (r1 < rows) { q1y[r1] = r.y; }
+            if (r2 < rows) { q1y[r2] = r.z; }
+            if (r3 < rows) { q1y[r3] = r.w; }
+        }
+        workgroupBarrier();
+        wb = wb + nwg.x;
+    }
+}
+
+// ── q2tp affine decode, one-vector INT8/DP4A shape.  This is deliberately
+// separate from q4tp_matvec4_bk8: q2tp's affine symbols are exact signed
+// ternaries (code − 1), so the q4tp `−8·sum(q)` correction is both unnecessary
+// and wrong here.  The activation is the existing per-32-group symmetric Q8
+// grid produced by x_quant_i8.  The x8 layout is already interleaved as
+// even/odd lanes for each 8-value word; two q2 bytes therefore become the
+// two packed int8 words needed by the same eight DP4A dots.
+//
+// This entry point is opt-in from Rust (`CMF_Q2_DP4A=1`) and is only admitted
+// for the explicitly affine Prism descriptor.  A caller that cannot satisfy
+// those guards stays on q2tp_matvec16w, preserving the validated scalar path.
+fn q2i8_byte(off: u32) -> u32 {
+    return (q1w[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu;
+}
+
+fn q2i8_pack_even(a: u32, b: u32) -> u32 {
+    let x0 = i32(a & 3u) - 1;
+    let x1 = i32((a >> 4u) & 3u) - 1;
+    let x2 = i32(b & 3u) - 1;
+    let x3 = i32((b >> 4u) & 3u) - 1;
+    return (u32(x0) & 0xFFu) | ((u32(x1) & 0xFFu) << 8u)
+        | ((u32(x2) & 0xFFu) << 16u) | ((u32(x3) & 0xFFu) << 24u);
+}
+
+fn q2i8_pack_odd(a: u32, b: u32) -> u32 {
+    let x0 = i32((a >> 2u) & 3u) - 1;
+    let x1 = i32((a >> 6u) & 3u) - 1;
+    let x2 = i32((b >> 2u) & 3u) - 1;
+    let x3 = i32((b >> 6u) & 3u) - 1;
+    return (u32(x0) & 0xFFu) | ((u32(x1) & 0xFFu) << 8u)
+        | ((u32(x2) & 0xFFu) << 16u) | ((u32(x3) & 0xFFu) << 24u);
+}
+
+fn q2i8_dot8(a: u32, b: u32, even: u32, odd: u32) -> i32 {
+    return dot4I8Packed(q2i8_pack_even(a, b), even)
+        + dot4I8Packed(q2i8_pack_odd(a, b), odd);
+}
+
+fn q2i8_dot_group(base: u32, x: vec4<u32>, y: vec4<u32>) -> i32 {
+    let b0 = q2i8_byte(base);
+    let b1 = q2i8_byte(base + 1u);
+    let b2 = q2i8_byte(base + 2u);
+    let b3 = q2i8_byte(base + 3u);
+    let b4 = q2i8_byte(base + 4u);
+    let b5 = q2i8_byte(base + 5u);
+    let b6 = q2i8_byte(base + 6u);
+    let b7 = q2i8_byte(base + 7u);
+    return q2i8_dot8(b0, b1, x.x, x.y)
+        + q2i8_dot8(b2, b3, x.z, x.w)
+        + q2i8_dot8(b4, b5, y.x, y.y)
+        + q2i8_dot8(b6, b7, y.z, y.w);
+}
+
+var<workgroup> partial_q2i8: array<vec4<f32>, 256>;
+
+@compute @workgroup_size(256)
+fn q2tp_matvec1_i8(@builtin(workgroup_id) wid: vec3<u32>,
+                   @builtin(num_workgroups) nwg: vec3<u32>,
+                   @builtin(local_invocation_index) lid: u32) {
+    let gpr = q1p.np;
+    let rows = q1p.rows;
+    let params_w = rows * gpr * 2u;
+    let codes_b = rows * gpr * 8u + rows * 4u;
+    let cstride = (gpr * 5u + 7u) / 8u;
+    let sub = lid >> 6u;
+    let l = lid & 63u;
+    let blocks = (rows + 15u) / 16u;
+    var wb = wid.x;
+    loop {
+        if (wb >= blocks) { break; }
+        let base = wb * 16u;
+        for (var t = lid; t < 512u; t = t + 256u) {
+            let r = base + (t >> 5u);
+            if (r < rows) {
+                let pr = unpack2x16float(q1w[params_w + r]);
+                let rung = t & 31u;
+                lad_q4w[t] = select(
+                    exp2(pr.x + f32(max(rung, 1u) - 1u) * pr.y),
+                    0.0,
+                    rung == 0u,
+                );
+            }
+        }
+        workgroupBarrier();
+        let r0 = base + sub;
+        let r1 = base + sub + 4u;
+        let r2 = base + sub + 8u;
+        let r3 = base + sub + 12u;
+        var acc = vec4<f32>(0.0);
+        if (r0 < rows) {
+            let c0 = codes_b + r0 * cstride;
+            let c1 = codes_b + r1 * cstride;
+            let c2 = codes_b + r2 * cstride;
+            let c3 = codes_b + r3 * cstride;
+            let l1 = r1 < rows;
+            let l2 = r2 < rows;
+            let l3 = r3 < rows;
+            var g = l;
+            loop {
+                if (g >= gpr) { break; }
+                let bit = g * 5u;
+                let cbo = bit >> 3u;
+                let sh = bit & 7u;
+                var cv = q2i8_byte(c0 + cbo);
+                if (sh > 3u) { cv = cv | (q2i8_byte(c0 + cbo + 1u) << 8u); }
+                let rung0 = (cv >> sh) & 31u;
+                let x0 = q4v_x8[g * 2u];
+                let x1 = q4v_x8[g * 2u + 1u];
+                let sx = q4v_xs[g].x;
+                let d0 = q2i8_dot_group((r0 * gpr + g) * 8u, x0, x1);
+                acc.x = acc.x + lad_q4w[(sub << 5u) + rung0] * sx * f32(d0);
+                if (l1) {
+                    cv = q2i8_byte(c1 + cbo);
+                    if (sh > 3u) { cv = cv | (q2i8_byte(c1 + cbo + 1u) << 8u); }
+                    let rung1 = (cv >> sh) & 31u;
+                    let d1 = q2i8_dot_group((r1 * gpr + g) * 8u, x0, x1);
+                    acc.y = acc.y + lad_q4w[128u + (sub << 5u) + rung1] * sx * f32(d1);
+                }
+                if (l2) {
+                    cv = q2i8_byte(c2 + cbo);
+                    if (sh > 3u) { cv = cv | (q2i8_byte(c2 + cbo + 1u) << 8u); }
+                    let rung2 = (cv >> sh) & 31u;
+                    let d2 = q2i8_dot_group((r2 * gpr + g) * 8u, x0, x1);
+                    acc.z = acc.z + lad_q4w[256u + (sub << 5u) + rung2] * sx * f32(d2);
+                }
+                if (l3) {
+                    cv = q2i8_byte(c3 + cbo);
+                    if (sh > 3u) { cv = cv | (q2i8_byte(c3 + cbo + 1u) << 8u); }
+                    let rung3 = (cv >> sh) & 31u;
+                    let d3 = q2i8_dot_group((r3 * gpr + g) * 8u, x0, x1);
+                    acc.w = acc.w + lad_q4w[384u + (sub << 5u) + rung3] * sx * f32(d3);
+                }
+                g = g + 64u;
+            }
+        }
+        partial_q2i8[lid] = acc;
+        workgroupBarrier();
+        var stride = 32u;
+        loop {
+            if (stride == 0u) { break; }
+            if (l < stride) {
+                partial_q2i8[lid] = partial_q2i8[lid] + partial_q2i8[lid + stride];
+            }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        if (l == 0u) {
+            let r = partial_q2i8[sub << 6u];
             if (r0 < rows) { q1y[r0] = r.x; }
             if (r1 < rows) { q1y[r1] = r.y; }
             if (r2 < rows) { q1y[r2] = r.z; }
@@ -7325,8 +7659,13 @@ fn q4tp_mul_mm(@builtin(workgroup_id) wid: vec3<u32>,
         // the whole vector — Metal does, and three lanes in four came back
         // zero while Vulkan was fine.
         {
-            let kk = tid / 16u;
-            let slot = tid % 16u;
+            // `lid.x` selects the input-column group and `lid.y` selects
+            // the four input rows.  The old transposed assignment made
+            // every output block consume the wrong batch rows; k=1 hid it
+            // behind a plausible-looking dot product, while a real prefill
+            // returned corrupted hidden rows.
+            let kk = tid % 16u;
+            let slot = tid / 16u;
             let col = k0 + kk;
             let m = m0 + slot * 4u;
             var xv = vec4<f32>(0.0);
@@ -7442,8 +7781,9 @@ fn q2tp_mul_mm(@builtin(workgroup_id) wid: vec3<u32>,
         // the whole vector — Metal does, and three lanes in four came back
         // zero while Vulkan was fine.
         {
-            let kk = tid / 16u;
-            let slot = tid % 16u;
+            // Keep the shared activation tile indexed [column_group][row_group].
+            let kk = tid % 16u;
+            let slot = tid / 16u;
             let col = k0 + kk;
             let m = m0 + slot * 4u;
             var xv = vec4<f32>(0.0);
@@ -7488,10 +7828,11 @@ fn q2tp_mul_mm(@builtin(workgroup_id) wid: vec3<u32>,
                 // is exactly the vec4 this thread owns.
                 let bo = toff + p / 4u;
                 let by = (qmm[bo >> 2u] >> ((bo & 3u) * 8u)) & 0xFFu;
-                wv[0u] = (f32(by & 3u) - 1.5) * scale;
-                wv[1u] = (f32((by >> 2u) & 3u) - 1.5) * scale;
-                wv[2u] = (f32((by >> 4u) & 3u) - 1.5) * scale;
-                wv[3u] = (f32((by >> 6u) & 3u) - 1.5) * scale;
+                let center = select(1.5, 1.0, pmm._p != 0u);
+                wv[0u] = (f32(by & 3u) - center) * scale;
+                wv[1u] = (f32((by >> 2u) & 3u) - center) * scale;
+                wv[2u] = (f32((by >> 4u) & 3u) - center) * scale;
+                wv[3u] = (f32((by >> 6u) & 3u) - center) * scale;
             }
             let dst = n * TSTRIDE + k4 * 4u;
             q4t_wt[dst] = wv.x; q4t_wt[dst + 1u] = wv.y;
@@ -7549,8 +7890,9 @@ fn q4t_mul_mm(@builtin(workgroup_id) wid: vec3<u32>,
         // One whole vec4 per thread; see `q4tp_mul_mm` for why lanes of a
         // shared vec4 must not be written from four threads.
         {
-            let kk = tid / 16u;
-            let slot = tid % 16u;
+            // Keep the shared activation tile indexed [column_group][row_group].
+            let kk = tid % 16u;
+            let slot = tid / 16u;
             let col = k0 + kk;
             let m = m0 + slot * 4u;
             var xv = vec4<f32>(0.0);
@@ -12651,6 +12993,165 @@ fn qwen_rope_pack(@builtin(workgroup_id) wid: vec3<u32>,
 }
 "#;
 
+/// Signed, normalized FWHT used by the Prism activation boundary.  This is
+/// deliberately a separate f16-capable module: devices without SHADER_F16
+/// keep the conservative per-op/CPU route rather than silently changing the
+/// trained boundary.  One workgroup owns one 1024-wide block, with f32
+/// butterflies and an explicit f16 round at the output.
+const FWHT_SRC: &str = r#"
+enable f16;
+
+struct FwhtP {
+    width: u32,
+    block: u32,
+    sign_offset: u32,
+    inverse: u32,
+    round16: u32,
+    // Zero means one row for the original token-graph entry point.  A
+    // positive value admits the same transform over a contiguous batch,
+    // with the sign table reused for every row (the prefill graph path).
+    rows: u32,
+    _pad1: u32,
+    _pad2: u32,
+};
+
+@group(0) @binding(0) var<storage, read> fwht_x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> fwht_y: array<f32>;
+@group(0) @binding(2) var<storage, read> fwht_signs: array<f32>;
+@group(0) @binding(3) var<uniform> fwht_p: FwhtP;
+
+var<workgroup> fwht_s: array<f32, 1024>;
+
+// Implement the declared Prism f16 boundary in bits.  On the target Vulkan
+// path, both a source-level f32(f16(v)) round-trip and pack/unpack2x16float
+// may be legally folded back to f32 when the intermediate has no observable
+// f16 storage.  Keeping the RNE conversion explicit avoids silently running
+// the graph at f32 while retaining the same bit contract as the CPU oracle.
+fn prism_half_to_f32(h: u32) -> f32 {
+    let sign = (h & 0x8000u) << 16u;
+    let exp = (h >> 10u) & 0x1Fu;
+    let frac = h & 0x03FFu;
+    if (exp == 0u) {
+        if (frac == 0u) {
+            return bitcast<f32>(sign);
+        }
+        let mag = f32(frac) * 0.000000059604644775390625; // 2^-24
+        return select(mag, -mag, sign != 0u);
+    }
+    if (exp == 31u) {
+        return bitcast<f32>(sign | 0x7F800000u | (frac << 13u));
+    }
+    return bitcast<f32>(sign | ((exp + 112u) << 23u) | (frac << 13u));
+}
+
+fn prism_round16(v: f32) -> f32 {
+    let bits = bitcast<u32>(v);
+    let sign = (bits >> 16u) & 0x8000u;
+    let abits = bits & 0x7FFFFFFFu;
+    let exp = (abits >> 23u) & 0xFFu;
+    let frac = abits & 0x007FFFFFu;
+    if (exp == 0xFFu) {
+        // The activation path is finite, but preserve IEEE specials for the
+        // component boundary rather than turning a diagnostic NaN into zero.
+        return v;
+    }
+    if (exp == 0u) {
+        return bitcast<f32>(sign << 16u);
+    }
+    let unbiased = i32(exp) - 127;
+    if (unbiased < -14) {
+        let scaled = v * select(16777216.0, -16777216.0, sign != 0u);
+        var q = u32(floor(abs(scaled)));
+        let rem = abs(scaled) - f32(q);
+        if (rem > 0.5 || (rem == 0.5 && (q & 1u) != 0u)) {
+            q = q + 1u;
+        }
+        if (q >= 1024u) {
+            return prism_half_to_f32(sign | 0x0400u);
+        }
+        return prism_half_to_f32(sign | q);
+    }
+    if (unbiased > 15) {
+        return prism_half_to_f32(sign | 0x7C00u);
+    }
+    let significand = frac | 0x00800000u;
+    var half_frac = (significand >> 13u) & 0x03FFu;
+    let discarded = significand & 0x1FFFu;
+    if (discarded > 0x1000u || (discarded == 0x1000u && (half_frac & 1u) != 0u)) {
+        half_frac = half_frac + 1u;
+    }
+    var half_exp = u32(unbiased + 15);
+    if (half_frac == 0x0400u) {
+        half_frac = 0u;
+        half_exp = half_exp + 1u;
+    }
+    if (half_exp >= 31u) {
+        return prism_half_to_f32(sign | 0x7C00u);
+    }
+    return prism_half_to_f32(sign | (half_exp << 10u) | half_frac);
+}
+
+@compute @workgroup_size(256)
+fn fwht(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_index) lid: u32) {
+    let blocks_per_row = fwht_p.width / fwht_p.block;
+    let rows = max(fwht_p.rows, 1u);
+    let row = wid.x / blocks_per_row;
+    let block = wid.x % blocks_per_row;
+    if (row >= rows) { return; }
+    let base = row * fwht_p.width + block * fwht_p.block;
+    let sign_base = fwht_p.sign_offset + block * fwht_p.block;
+    var i = lid;
+    loop {
+        if (i >= fwht_p.block) { break; }
+        let si = sign_base + i;
+        let sign = fwht_signs[si];
+        let raw = fwht_x[base + i];
+        // Forward is D·H; inverse is H·D.  H is self-inverse after the
+        // normalized 1/sqrt(block) scale, so the sign placement is the
+        // only operator distinction.
+        fwht_s[i] = select(raw, raw * sign, fwht_p.inverse == 0u);
+        i = i + 256u;
+    }
+    workgroupBarrier();
+    var stride = 1u;
+    loop {
+        if (stride >= fwht_p.block) { break; }
+        let span = stride * 2u;
+        var j = lid;
+        loop {
+            if (j >= fwht_p.block / 2u) { break; }
+            let group = j / stride;
+            let lane = j % stride;
+            let a = group * span + lane;
+            let b = a + stride;
+            let va = fwht_s[a];
+            let vb = fwht_s[b];
+            fwht_s[a] = va + vb;
+            fwht_s[b] = va - vb;
+            j = j + 256u;
+        }
+        workgroupBarrier();
+        stride = span;
+    }
+    var inv = lid;
+    loop {
+        if (inv >= fwht_p.block) { break; }
+        var v = fwht_s[inv] * inverseSqrt(f32(fwht_p.block));
+        if (fwht_p.inverse != 0u) {
+            v = v * fwht_signs[sign_base + inv];
+        }
+        // The source runtime's Prism boundary is explicitly f16.  The
+        // f32 storage keeps all downstream existing kernels unchanged.
+        if (fwht_p.round16 != 0u) {
+            v = prism_round16(v);
+        }
+        fwht_y[base + inv] = v;
+        inv = inv + 256u;
+    }
+}
+"#;
+
 /// The bake FFN chain's middle link, in its own module (the main module's
 /// binding slots are all taken): act[r][j] = silu(g)·u·scale[j], where g
 /// and u are the two halves of the fused gate+up GEMM's row. Runs between
@@ -13244,6 +13745,185 @@ const ATTEND_GCK: usize = 256;
 const ATTEND_CK: usize = 128;
 const ATTEND_SPLIT_MIN: usize = 256;
 
+/// Experimental global q2tp ladder-cache component.  The production q2tp
+/// shader keeps its row-local ladder in workgroup memory; this opt-in arm
+/// interns exact `(f16 lo, f16 step)` pairs once and addresses the resulting
+/// 32-slot F32 ladders with a per-row u32 id.  It is deliberately separate
+/// from the main module so a validation failure cannot poison the ordinary
+/// dtype16/affine path.
+const Q2TP_LADDER_CACHE_BUILD_SRC: &str = r#"
+struct LadderParams { pairs: u32, _p0: u32, _p1: u32, _p2: u32 };
+@group(0) @binding(0) var<storage, read> raw_keys : array<u32>;
+@group(0) @binding(1) var<storage, read_write> ladders : array<f32>;
+@group(0) @binding(2) var<uniform> lp : LadderParams;
+
+@compute @workgroup_size(256)
+fn q2_ladder_build(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= lp.pairs * 32u) { return; }
+    let rung = i & 31u;
+    if (rung == 0u) {
+        ladders[i] = 0.0;
+    } else {
+        let pr = unpack2x16float(raw_keys[i >> 5u]);
+        // Keep this operation/order identical to q2tp_matvec16w's row-local
+        // ladder.  The component gate checks the resulting F32 bit pattern.
+        ladders[i] = exp2(pr.x + f32(rung - 1u) * pr.y);
+    }
+}
+"#;
+
+const Q2TP_LADDER_CACHE_MV_SRC: &str = r#"
+struct Q1Params { np: u32, rows: u32, _p0: u32, _p1: u32 };
+@group(0) @binding(0) var<storage, read> q1w : array<u32>;
+@group(0) @binding(2) var<storage, read_write> q1y : array<f32>;
+@group(0) @binding(3) var<uniform> q1p : Q1Params;
+@group(0) @binding(5) var<storage, read> q4v_x : array<vec4<f32>>;
+@group(0) @binding(6) var<storage, read> q2_cache : array<f32>;
+@group(0) @binding(7) var<storage, read> q2_row_ids : array<u32>;
+
+var<workgroup> partial_q2_cache : array<vec4<f32>, 256>;
+
+fn q2tp_byte(off: u32) -> u32 {
+    return (q1w[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu;
+}
+
+fn q2v_c2(w: u32, sh: u32, affine: u32) -> f32 {
+    return bitcast<f32>((((w >> sh) & 3u) << 1u) | 0x4B000000u)
+        - select(8388611.0, 8388610.0, affine != 0u);
+}
+
+fn q2v_d16(w: u32, a: vec4<f32>, b: vec4<f32>, c: vec4<f32>, d: vec4<f32>, affine: u32) -> f32 {
+    return (q2v_c2(w, 0u, affine) * a.x
+         + q2v_c2(w, 2u, affine) * a.y
+         + q2v_c2(w, 4u, affine) * a.z
+         + q2v_c2(w, 6u, affine) * a.w
+         + q2v_c2(w, 8u, affine) * b.x
+         + q2v_c2(w, 10u, affine) * b.y
+         + q2v_c2(w, 12u, affine) * b.z
+         + q2v_c2(w, 14u, affine) * b.w
+         + q2v_c2(w, 16u, affine) * c.x
+         + q2v_c2(w, 18u, affine) * c.y
+         + q2v_c2(w, 20u, affine) * c.z
+         + q2v_c2(w, 22u, affine) * c.w
+         + q2v_c2(w, 24u, affine) * d.x
+         + q2v_c2(w, 26u, affine) * d.y
+         + q2v_c2(w, 28u, affine) * d.z
+         + q2v_c2(w, 30u, affine) * d.w) * 0.5;
+}
+
+@compute @workgroup_size(256)
+fn q2tp_matvec16w_ladder_cache(@builtin(workgroup_id) wid: vec3<u32>,
+                               @builtin(num_workgroups) nwg: vec3<u32>,
+                               @builtin(local_invocation_index) lid: u32) {
+    let gpr = q1p.np;
+    let rows = q1p.rows;
+    let params_w = rows * gpr * 2u;
+    let codes_b = rows * gpr * 8u + rows * 4u;
+    let cstride = (gpr * 5u + 7u) / 8u;
+    let sub = lid >> 6u;
+    let l = lid & 63u;
+    let blocks = (rows + 15u) / 16u;
+    var wb = wid.x;
+    loop {
+        if (wb >= blocks) { break; }
+        let base = wb * 16u;
+        let r0 = base + sub;
+        let r1 = base + sub + 4u;
+        let r2 = base + sub + 8u;
+        let r3 = base + sub + 12u;
+        var acc = vec4<f32>(0.0);
+        if (r0 < rows) {
+            let c0 = codes_b + r0 * cstride;
+            let c1 = codes_b + r1 * cstride;
+            let c2 = codes_b + r2 * cstride;
+            let c3 = codes_b + r3 * cstride;
+            let l1 = r1 < rows;
+            let l2 = r2 < rows;
+            let l3 = r3 < rows;
+            let id0 = q2_row_ids[q1p._p0 + r0] * 32u;
+            let id1 = q2_row_ids[q1p._p0 + r1] * 32u;
+            let id2 = q2_row_ids[q1p._p0 + r2] * 32u;
+            let id3 = q2_row_ids[q1p._p0 + r3] * 32u;
+            var g = l;
+            loop {
+                if (g >= gpr) { break; }
+                let bit = g * 5u;
+                let cbo = bit >> 3u;
+                let sh = bit & 7u;
+                let x0 = g * 8u;
+                let xa = q4v_x[x0];      let xb = q4v_x[x0 + 1u];
+                let xc = q4v_x[x0 + 2u]; let xd = q4v_x[x0 + 3u];
+                let xe = q4v_x[x0 + 4u]; let xf = q4v_x[x0 + 5u];
+                let xg = q4v_x[x0 + 6u]; let xh = q4v_x[x0 + 7u];
+                var cv = q2tp_byte(c0 + cbo);
+                if (sh > 3u) { cv = cv | (q2tp_byte(c0 + cbo + 1u) << 8u); }
+                var wi = (r0 * gpr + g) * 2u;
+                acc.x = acc.x + q2_cache[id0 + ((cv >> sh) & 31u)]
+                    * (q2v_d16(q1w[wi], xa, xb, xc, xd, q1p._p1)
+                     + q2v_d16(q1w[wi + 1u], xe, xf, xg, xh, q1p._p1));
+                if (l1) {
+                    cv = q2tp_byte(c1 + cbo);
+                    if (sh > 3u) { cv = cv | (q2tp_byte(c1 + cbo + 1u) << 8u); }
+                    wi = (r1 * gpr + g) * 2u;
+                    acc.y = acc.y + q2_cache[id1 + ((cv >> sh) & 31u)]
+                        * (q2v_d16(q1w[wi], xa, xb, xc, xd, q1p._p1)
+                         + q2v_d16(q1w[wi + 1u], xe, xf, xg, xh, q1p._p1));
+                }
+                if (l2) {
+                    cv = q2tp_byte(c2 + cbo);
+                    if (sh > 3u) { cv = cv | (q2tp_byte(c2 + cbo + 1u) << 8u); }
+                    wi = (r2 * gpr + g) * 2u;
+                    acc.z = acc.z + q2_cache[id2 + ((cv >> sh) & 31u)]
+                        * (q2v_d16(q1w[wi], xa, xb, xc, xd, q1p._p1)
+                         + q2v_d16(q1w[wi + 1u], xe, xf, xg, xh, q1p._p1));
+                }
+                if (l3) {
+                    cv = q2tp_byte(c3 + cbo);
+                    if (sh > 3u) { cv = cv | (q2tp_byte(c3 + cbo + 1u) << 8u); }
+                    wi = (r3 * gpr + g) * 2u;
+                    acc.w = acc.w + q2_cache[id3 + ((cv >> sh) & 31u)]
+                        * (q2v_d16(q1w[wi], xa, xb, xc, xd, q1p._p1)
+                         + q2v_d16(q1w[wi + 1u], xe, xf, xg, xh, q1p._p1));
+                }
+                g = g + 64u;
+            }
+        }
+        partial_q2_cache[lid] = acc;
+        workgroupBarrier();
+        var stride = 32u;
+        loop {
+            if (stride == 0u) { break; }
+            if (l < stride) {
+                partial_q2_cache[lid] = partial_q2_cache[lid] + partial_q2_cache[lid + stride];
+            }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        if (l == 0u) {
+            let r = partial_q2_cache[sub << 6u];
+            if (r0 < rows) { q1y[r0] = r.x; }
+            if (r1 < rows) { q1y[r1] = r.y; }
+            if (r2 < rows) { q1y[r2] = r.z; }
+            if (r3 < rows) { q1y[r3] = r.w; }
+        }
+        workgroupBarrier();
+        wb = wb + nwg.x;
+    }
+}
+"#;
+
+struct Q2LadderCache {
+    model_uid: u64,
+    pairs: usize,
+    table_bytes: u64,
+    row_id_bytes: u64,
+    row_id_base: HashMap<usize, u32>,
+    row_counts: HashMap<usize, usize>,
+    ladders: wgpu::Buffer,
+    row_ids: wgpu::Buffer,
+}
+
 struct Ctx {
     /// The instance and adapter the device came from, kept for exactly as
     /// long as the device — which Vulkan requires and we were not doing.
@@ -13375,6 +14055,10 @@ struct Ctx {
     q4b_mv8: wgpu::ComputePipeline,
     q4tp_mm: wgpu::ComputePipeline,
     q2tp_mm: wgpu::ComputePipeline,
+    /// Optional Q2TP affine cooperative GEMM. It has its own four-binding
+    /// layout because the uniform word is the affine descriptor bit, not the
+    /// Q4 activation-scale/sentinel field.
+    q2tp_mm_coop: Option<wgpu::ComputePipeline>,
     q4tp_mm_coop: Option<wgpu::ComputePipeline>,
     /// Same kernel, the scale read from a device buffer (binding 4).
     q4tp_mm_coop_s: Option<wgpu::ComputePipeline>,
@@ -13519,6 +14203,24 @@ struct Ctx {
     q4tp_mv4_bku_x2: wgpu::ComputePipeline,
     /// The dense 2-bit (q2tp profile) decode matvec, kind 9.
     q2tp_mv16w: wgpu::ComputePipeline,
+    /// Opt-in affine q2tp NB=1 Q8/DP4A decode.  This stays separate from
+    /// q4tp's batched kernel because q2tp has signed ternary symbols and no
+    /// q4tp zero-sum correction.
+    q2tp_mv1_i8: wgpu::ComputePipeline,
+    /// Experimental global q2tp ladder cache, constructed only when
+    /// CMF_Q2_LADDER_CACHE=1. The ordinary row-local shader remains the
+    /// default and is the fail-closed fallback if this module is rejected.
+    q2_ladder_build: Option<wgpu::ComputePipeline>,
+    q2_ladder_ref: Option<wgpu::ComputePipeline>,
+    q2_ladder_mv: Option<wgpu::ComputePipeline>,
+    /// Optional subgroup-reduction q2tp matvec.  It is never selected unless
+    /// SUBGROUP is present and CMF_Q2TP_SG=1; the tree kernel above remains
+    /// the default/fallback.
+    q2tp_mv16w_sg: Option<wgpu::ComputePipeline>,
+    /// Descriptor-aware signed FWHT for the resident Prism graph.  Kept
+    /// optional so adapters without shader f16 fail closed to the per-op
+    /// implementation instead of changing activation-boundary precision.
+    fwht: Option<wgpu::ComputePipeline>,
     f32_gemm_dx: wgpu::ComputePipeline,
     vae_conv: wgpu::ComputePipeline,
     dit_ropepack: wgpu::ComputePipeline,
@@ -13618,6 +14320,9 @@ struct Ctx {
     /// the other's operand. The scratch lock cannot cover it: `readback`
     /// takes that lock itself, and std mutexes do not re-enter.
     mm_gate: Mutex<()>,
+    /// One run-owned sidecar (the component gate exercises one real matrix).
+    /// A mismatched model/tensor rebuilds it rather than reusing stale row ids.
+    q2_ladder: Mutex<Option<Q2LadderCache>>,
     /// One unpacked f16 plane PER WEIGHT, kept across calls — the
     /// scratch-slot version re-unpacked every weight before every GEMM.
     planes: Mutex<std::collections::HashMap<(usize, usize), (wgpu::Buffer, u64)>>,
@@ -13948,6 +14653,9 @@ struct GraphScratch {
     gbuf: Option<(wgpu::Buffer, u64)>,
     ubuf: Option<(wgpu::Buffer, u64)>,
     abuf: Option<(wgpu::Buffer, u64)>,
+    /// Reusable transform output for one Prism activation row.  It is large
+    /// enough for the widest graph input (usually the FFN intermediate).
+    rot: Option<(wgpu::Buffer, u64)>,
     // GDN intermediates
     qkv_b: Option<(wgpu::Buffer, u64)>,
     // Short-conv intermediates: the fused (B,C,x) projection and the gated y
@@ -14038,7 +14746,7 @@ impl GraphScratch {
 /// device is what keys those caches by device — the alternative (one
 /// global context) is why a second card used to be unreachable from the
 /// same process.
-static CTXS: OnceLock<std::sync::Mutex<std::collections::HashMap<usize, Option<&'static Ctx>>>> =
+static CTXS: OnceLock<std::sync::Mutex<std::collections::HashMap<usize, Option<Box<Ctx>>>>> =
     OnceLock::new();
 
 /// Whether the wgpu path is selected (the facade asks before `enabled()`):
@@ -14070,12 +14778,16 @@ fn ctx_for(dev: usize) -> Option<&'static Ctx> {
     let map = CTXS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let mut g = map.lock().unwrap();
     if let Some(slot) = g.get(&dev) {
-        return *slot;
+        let ptr = slot.as_deref().map(|c| c as *const Ctx);
+        drop(g);
+        // The owning Box remains in CTXS until `shutdown`; callers only keep
+        // this reference for the process-lifetime runtime phase.  Publishing
+        // an owned context lets teardown drop Vulkan objects in order instead
+        // of leaving the NVIDIA background thread behind at process exit.
+        return ptr.map(|p| unsafe { &*p });
     }
     let built = match init(dev) {
-        // Leaked on purpose: a device context lives for the process, and
-        // every caller wants &'static (buffers outlive any one call).
-        Ok(c) => Some(&*Box::leak(Box::new(c))),
+        Ok(c) => Some(Box::new(c)),
         Err(e) => {
             // Tests install no subscriber, so a tracing-only report makes
             // an init failure look exactly like "no GPU here".
@@ -14088,8 +14800,43 @@ fn ctx_for(dev: usize) -> Option<&'static Ctx> {
             None
         }
     };
+    let ptr = built.as_deref().map(|c| c as *const Ctx);
     g.insert(dev, built);
-    built
+    drop(g);
+    ptr.map(|p| unsafe { &*p })
+}
+
+/// Gracefully release process-wide wgpu contexts before the runtime and
+/// tracing dispatcher disappear.  Vulkan drivers commonly keep a background
+/// worker for pipeline compilation; leaking `Ctx` avoids use-after-free during
+/// inference but leaves that worker observing half-destroyed state at exit.
+/// The caller must invoke this only after all model work has stopped.
+pub fn shutdown() {
+    let Some(map) = CTXS.get() else { return };
+    let mut owned = Vec::new();
+    {
+        let mut all = map.lock().unwrap();
+        for (_, slot) in all.drain() {
+            if let Some(ctx) = slot {
+                owned.push(ctx);
+            }
+        }
+    }
+    // Keep a device handle alive across the context drop.  Timestamp query
+    // sets/readback buffers are driver-owned asynchronous resources; polling
+    // before dropping the context is not enough because their final release
+    // can enqueue work after the poll.  Cloning the devices gives the owned
+    // shutdown path a live poll target for that last release without leaking
+    // the full Ctx (or relying on process-exit driver cleanup).
+    let devices: Vec<wgpu::Device> = owned.iter().map(|ctx| ctx.device.clone()).collect();
+    for device in &devices {
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    }
+    drop(owned);
+    for device in &devices {
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    }
+    drop(devices);
 }
 
 /// Look up an already-created context without initializing a device.  Stage
@@ -14097,11 +14844,12 @@ fn ctx_for(dev: usize) -> Option<&'static Ctx> {
 /// non-wgpu backend.
 fn existing_ctx() -> Option<&'static Ctx> {
     let map = CTXS.get()?;
-    map.lock()
+    let ptr = map
+        .lock()
         .unwrap()
         .get(&crate::gpu::current_device())
-        .copied()
-        .flatten()
+        .and_then(|slot| slot.as_deref().map(|c| c as *const Ctx));
+    ptr.map(|p| unsafe { &*p })
 }
 
 /// Weight budget of the current device, in bytes (0 when there is no
@@ -14691,6 +15439,12 @@ fn init(dev: usize) -> Result<Ctx, String> {
         });
         if let Some(e) = pollster::block_on(sc.pop()) {
             tracing::warn!("{mod_label} module rejected: {e}");
+            // A rejected optional module can leave a validation event queued
+            // on NVIDIA Vulkan. Drain it before dropping the failed module;
+            // otherwise a short component-test process may race the driver's
+            // update worker during teardown (the ordinary q2tp path remains
+            // entirely independent of this experimental shader).
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
             return None;
         }
         let sc = device.push_error_scope(wgpu::ErrorFilter::Validation);
@@ -14704,10 +15458,19 @@ fn init(dev: usize) -> Result<Ctx, String> {
         });
         if let Some(e) = pollster::block_on(sc.pop()) {
             tracing::warn!("{entry} pipeline rejected: {e}");
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
             return None;
         }
         Some(p)
     };
+    // Q2TP affine cooperative GEMM is an explicit A/B arm.  Keep it out of
+    // normal initialization until requested: its F16 operand boundary is a
+    // separate precision profile, and failure must leave the scalar Q2TP
+    // module entirely usable.
+    let want_q2_coop = want_coop && std::env::var("CMF_Q2_COOP").as_deref() == Ok("1");
+    let q2tp_mm_coop = want_q2_coop
+        .then(|| mk_coop(COOP_Q2_MM_SRC, "q2tp-mm-coop", "q2tp_mm_coop"))
+        .flatten();
     let ffn_silu_packed = pipe("ffn_silu_mul_packed");
     let act_absmax = mk_coop(COOP_AMAX_SRC, "act-absmax", "act_absmax");
     let dit_qkv_split = mk_coop(DIT_SPLIT_SRC, "dit-split", "dit_qkv_split");
@@ -14803,23 +15566,35 @@ fn init(dev: usize) -> Result<Ctx, String> {
         .map(|v| v != "0")
         .unwrap_or(true);
     // Frame profiler (CMF_GPU_TS=1): 256 timestamp slots + resolve/stage
-    // buffers. Created only when the device carries the feature.
+    // buffers. A bounded batch-kernel profile reserves the query range after
+    // the coarse slots in the same set. Keep that range large enough for all
+    // Q2/GDN/attention projections in one full batch; the profiler reports
+    // any attempted pair that still overflows rather than replaying a prior
+    // frame's first-window totals.
+    let graph_ts_all = std::env::var("CMF_GRAPH_TS_ALL").as_deref() == Ok("1");
     let ts_query = if want_ts && matches!(std::env::var("CMF_GPU_TS").as_deref(), Ok("1") | Ok("2"))
     {
+        let count: u32 = if graph_ts_all
+            || std::env::var("CMF_BATCH_KERNEL_TS").as_deref() == Ok("1")
+        {
+            4096
+        } else {
+            256
+        };
         let qs = device.create_query_set(&wgpu::QuerySetDescriptor {
             label: Some("g-ts"),
             ty: wgpu::QueryType::Timestamp,
-            count: 256,
+            count,
         });
         let resolve = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("g-ts-resolve"),
-            size: 256 * 8,
+            size: count as u64 * 8,
             usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let stage = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("g-ts-stage"),
-            size: 256 * 8,
+            size: count as u64 * 8,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -14910,6 +15685,89 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let use_mv_gu = std::env::var("CMF_MV_GU").map(|v| v != "0").unwrap_or(true);
     let q4tp_mv4_bku_x2 = pipe("q4tp_matvec4_bku_x2");
     let q2tp_mv16w = pipe("q2tp_matvec16w");
+    let q2tp_mv1_i8 = pipe("q2tp_matvec1_i8");
+    let want_q2_ladder = std::env::var("CMF_Q2_LADDER_CACHE").as_deref() == Ok("1");
+    let q2_ladder_build = want_q2_ladder
+        .then(|| mk_coop(Q2TP_LADDER_CACHE_BUILD_SRC, "q2-ladder-build", "q2_ladder_build"))
+        .flatten();
+    // A second GPU dispatch using the baseline expression is used only for
+    // the exact-bit admission check. CPU libm exp2 differs from Vulkan's F32
+    // implementation by a one-ulp result on this adapter, so it is retained
+    // as a diagnostic, never treated as the GPU reference.
+    let q2_ladder_ref = want_q2_ladder
+        .then(|| mk_coop(Q2TP_LADDER_CACHE_BUILD_SRC, "q2-ladder-ref", "q2_ladder_build"))
+        .flatten();
+    let q2_ladder_mv = want_q2_ladder
+        .then(|| mk_coop(Q2TP_LADDER_CACHE_MV_SRC, "q2-ladder-mv", "q2tp_matvec16w_ladder_cache"))
+        .flatten();
+    let q2tp_mv16w_sg = if q2tp_sg_env_admitted() {
+        // Keep the subgroup module isolated: a validation error here must
+        // return None and preserve the ordinary q2tp pipeline/device. Naga
+        // 30 accepts subgroup builtins through the requested capability, but
+        // rejects the WGSL `enable subgroups;` directive itself.
+        let adapter_sg = want_sg;
+        let device_sg = device.features().contains(wgpu::Features::SUBGROUP);
+        if !adapter_sg {
+            let msg = format!(
+                "feature=false adapter_subgroup=false device_subgroup={device_sg}"
+            );
+            eprintln!("q2tp subgroup admission: {msg}");
+            set_q2tp_sg_diag(msg);
+            None
+        } else if !device_sg {
+            let msg = "feature=false adapter_subgroup=true device_subgroup=false".to_string();
+            eprintln!("q2tp subgroup admission: {msg}");
+            set_q2tp_sg_diag(msg);
+            None
+        } else {
+            let sc = device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let m = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("cmf-q2tp-mv-sg"),
+                source: wgpu::ShaderSource::Wgsl(Q2TP_SG_SRC.into()),
+            });
+            if let Some(e) = pollster::block_on(sc.pop()) {
+                let msg = format!(
+                    "module_error adapter_subgroup={adapter_sg} device_subgroup={device_sg}: {e}"
+                );
+                eprintln!("q2tp subgroup admission: {msg}");
+                set_q2tp_sg_diag(msg);
+                let _ = device.poll(wgpu::PollType::wait_indefinitely());
+                None
+            } else {
+                let sc = device.push_error_scope(wgpu::ErrorFilter::Validation);
+                let p = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("q2tp_matvec16w_sg"),
+                    layout: None,
+                    module: &m,
+                    entry_point: Some("q2tp_matvec16w_sg"),
+                    compilation_options: Default::default(),
+                    cache: pcache.as_ref(),
+                });
+                if let Some(e) = pollster::block_on(sc.pop()) {
+                    let msg = format!(
+                        "pipeline_error adapter_subgroup={adapter_sg} device_subgroup={device_sg}: {e}"
+                    );
+                    eprintln!("q2tp subgroup admission: {msg}");
+                    set_q2tp_sg_diag(msg);
+                    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+                    None
+                } else {
+                    let msg = format!(
+                        "admitted=true adapter_subgroup={adapter_sg} device_subgroup={device_sg}"
+                    );
+                    eprintln!("q2tp subgroup admission: {msg}");
+                    set_q2tp_sg_diag(msg);
+                    Some(p)
+                }
+            }
+        }
+    } else {
+        set_q2tp_sg_diag("not_requested");
+        None
+    };
+    let fwht = want_f16
+        .then(|| mk_coop(FWHT_SRC, "prism-fwht", "fwht"))
+        .flatten();
     let f32_gemm_dx = pipe("f32_gemm_dx");
     // Per-kernel validation while these are new: a scope around each
     // names the shader the driver rejected, where the module-wide scope
@@ -15193,6 +16051,13 @@ fn init(dev: usize) -> Result<Ctx, String> {
         return Err(format!("wgpu pipeline validation: {detail}"));
     }
 
+    // Pipeline creation and deferred driver work may outlive the synchronous
+    // `create_compute_pipeline` calls.  Drain it before publishing the
+    // process-lifetime context; otherwise the short GPU parity harness can
+    // reach exit with driver work still queued and the NVIDIA Vulkan loader
+    // may sporadically fault during its late cleanup.
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+
     // Everything the driver compiled during init — written once, read by
     // every process after this one.
     pipeline_cache_store(pcache.as_ref(), &info);
@@ -15286,6 +16151,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         q4b_mv8,
         q4tp_mm,
         q2tp_mm,
+        q2tp_mm_coop,
         q4tp_mm_coop,
         q4tp_mm_coop_s,
         ffn_silu_packed,
@@ -15382,6 +16248,12 @@ fn init(dev: usize) -> Result<Ctx, String> {
         use_mv_gu,
         q4tp_mv4_bku_x2,
         q2tp_mv16w,
+        q2tp_mv1_i8,
+        q2_ladder_build,
+        q2_ladder_ref,
+        q2_ladder_mv,
+        q2tp_mv16w_sg,
+        fwht,
         f32_gemm_dx,
         vae_conv,
         dit_ropepack,
@@ -15451,6 +16323,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         resident: std::sync::atomic::AtomicU64::new(0),
         scratch: Mutex::new(Scratch::default()),
         mm_gate: Mutex::new(()),
+        q2_ladder: Mutex::new(None),
         planes: Mutex::new(std::collections::HashMap::new()),
         weight_bufs: Mutex::new(HashMap::new()),
         dsv4_kv: Mutex::new(HashMap::new()),
@@ -15666,6 +16539,26 @@ pub static RES_MISS_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 pub static RES_EVICTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Misses that fetched bytes and then found no room even after eviction.
 pub static RES_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Peak logical weight-residency bytes in this process. This excludes Vulkan
+/// allocator slack, KV, and graph scratch; it is the honest arena ceiling.
+pub static RES_PEAK_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn note_resident_peak(c: &Ctx) {
+    use std::sync::atomic::Ordering;
+    let now = c.resident.load(Ordering::Relaxed);
+    let mut peak = RES_PEAK_BYTES.load(Ordering::Relaxed);
+    while now > peak {
+        match RES_PEAK_BYTES.compare_exchange_weak(
+            peak,
+            now,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(observed) => peak = observed,
+        }
+    }
+}
 
 /// (hits, misses, miss_bytes, evictions) since process start.
 pub fn residency_stats() -> (u64, u64, u64, u64) {
@@ -15676,6 +16569,20 @@ pub fn residency_stats() -> (u64, u64, u64, u64) {
         RES_MISS_BYTES.load(Relaxed),
         RES_EVICTS.load(Relaxed),
     )
+}
+
+/// Logical weight-residency profile for a bounded benchmark. The peak does
+/// not pretend to be total physical Vulkan allocation; it is paired with the
+/// configured arena budget so a run can report that boundary explicitly.
+pub fn residency_profile_report(label: &str) {
+    let (hits, misses, miss_bytes, evicts) = residency_stats();
+    eprintln!(
+        "resident profile: label={label} current_mb={:.1} peak_mb={:.1} budget_mb={:.1} hits={hits} misses={misses} miss_mb={:.1} evicts={evicts}",
+        resident_bytes() as f64 / 1e6,
+        RES_PEAK_BYTES.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
+        device_vram_budget() as f64 / 1e6,
+        miss_bytes as f64 / 1e6,
+    );
 }
 
 /// The host tier of the expert residency: a pinned-RAM cache of raw
@@ -16365,6 +17272,7 @@ fn weight_buffer_l(
     UPLOAD_NS.fetch_add(t_up.elapsed().as_nanos() as u64, Ordering::Relaxed);
     UPLOAD_BYTES.fetch_add(len, Ordering::Relaxed);
     c.resident.fetch_add(len, Ordering::Relaxed);
+    note_resident_peak(c);
     map.insert(
         key,
         Resident {
@@ -16454,6 +17362,96 @@ fn mv_x2_bind(
     (bind, mv_grid(wg))
 }
 
+#[inline]
+fn q2tp_sg_env_admitted() -> bool {
+    std::env::var("CMF_Q2TP_SG").as_deref() == Ok("1")
+        && std::env::var("CMF_Q2TP_SG_LINEAR").as_deref() == Ok("1")
+        && matches!(
+            std::env::var("CMF_Q2TP_SG_WIDTH")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok()),
+            Some(32) | Some(64)
+        )
+}
+
+// Runtime-owned selection counters make the subgroup A/B observable on the
+// resident graph rather than relying on the standalone component probe. A
+// lookup is counted where the bind layout/pipeline is selected; graph callers
+// use the same selector immediately before their dispatch.
+static Q2TP_SG_PIPELINE_LOOKUPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static Q2TP_TREE_PIPELINE_LOOKUPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+// Resident-graph ladder selection is tracked separately from the ordinary
+// tree/subgroup counters.  The graph must prove that its own prep/emat route
+// actually selected the sidecar; component admission alone is insufficient.
+static Q2TP_LADDER_GRAPH_LOOKUPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+// Number of Prism GDN projection preparations intentionally skipped because
+// the transformed output makes the fused whole-chain arm ineligible.  This is
+// a run-owned aggregate counter; it does not affect dispatch selection.
+static GDN_PRISM_SKIPPED_PREPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Return resident-graph q2tp pipeline-selection counts for a bounded A/B.
+/// This is a run-owned diagnostic hook, not runtime behavior.
+pub fn q2tp_selection_snapshot() -> (u64, u64) {
+    use std::sync::atomic::Ordering;
+    (
+        Q2TP_SG_PIPELINE_LOOKUPS.load(Ordering::Relaxed),
+        Q2TP_TREE_PIPELINE_LOOKUPS.load(Ordering::Relaxed),
+    )
+}
+
+/// Emit one concise admission/selection line when explicitly requested by a
+/// run-owned benchmark helper. Default runtime output is unchanged.
+pub fn q2tp_selection_report(label: &str) {
+    let (subgroup, tree) = q2tp_selection_snapshot();
+    let diagnostics = q2tp_sg_diag();
+    use std::sync::atomic::Ordering;
+    let ladder = Q2TP_LADDER_GRAPH_LOOKUPS.load(Ordering::Relaxed);
+    let gdn_skipped = GDN_PRISM_SKIPPED_PREPS.load(Ordering::Relaxed);
+    eprintln!(
+        "q2tp resident selection: label={label} requested={} admitted={} subgroup_lookups={subgroup} tree_lookups={tree} ladder_lookups={ladder} gdn_prism_skipped_preps={gdn_skipped} diagnostics={diagnostics}",
+        q2tp_sg_env_admitted(),
+        diagnostics.starts_with("admitted="),
+    );
+}
+
+/// Run-owned ladder-cache gate: `(unique_pairs, table_bytes, row_id_bytes)`
+/// after the exact GPU precompute/readback check has admitted the sidecar.
+/// `None` means the optional experiment was not requested or failed closed.
+pub fn q2tp_ladder_cache_snapshot() -> Option<(usize, u64, u64)> {
+    let c = ctx()?;
+    let cache = c.q2_ladder.lock().unwrap();
+    cache
+        .as_ref()
+        .map(|v| (v.pairs, v.table_bytes, v.row_id_bytes))
+}
+
+#[inline]
+fn q2tp_pipeline(c: &Ctx) -> &wgpu::ComputePipeline {
+    if q2tp_sg_env_admitted() {
+        if let Some(p) = c.q2tp_mv16w_sg.as_ref() {
+            use std::sync::atomic::Ordering;
+            Q2TP_SG_PIPELINE_LOOKUPS.fetch_add(1, Ordering::Relaxed);
+            return p;
+        }
+    }
+    use std::sync::atomic::Ordering;
+    Q2TP_TREE_PIPELINE_LOOKUPS.fetch_add(1, Ordering::Relaxed);
+    &c.q2tp_mv16w
+}
+
+/// Opt into the original-engine-style Q8/DP4A decode only for the explicit
+/// affine q2tp experiment.  The default remains the validated scalar kernel;
+/// this guard is intentionally independent of CMF_VERIFY_I8, whose q4tp
+/// batched path has a different zero-sum contract.
+#[inline]
+fn q2tp_dp4a_on() -> bool {
+    std::env::var("CMF_Q2_DP4A").as_deref() == Ok("1")
+}
+
 /// One q2tp (2-bit plane, kind 9) matvec dispatch in its own pass.
 fn encode_q2tp_mv16w(
     c: &Ctx,
@@ -16463,12 +17461,92 @@ fn encode_q2tp_mv16w(
     y: &wgpu::Buffer,
     rows: usize,
     cols: usize,
+    affine: bool,
 ) {
-    let (bind, wg) = q2tp_mv_bind(c, weight, xs, y, rows, cols);
+    let (bind, wg) = q2tp_mv_bind(c, weight, xs, y, rows, cols, affine);
     let mut pass = begin_pass(enc);
-    pass.set_pipeline(&c.q2tp_mv16w);
+    pass.set_pipeline(q2tp_pipeline(c));
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups(wg, 1, 1);
+}
+
+/// One affine q2tp vector through the existing Q8 activation quantizer and a
+/// dedicated signed-ternary DP4A kernel.  Unlike q4tp's NB=2..8 helper this
+/// has a genuine NB=1 specialization and never applies a q4 zero-sum term.
+#[allow(clippy::too_many_arguments)]
+fn encode_q2tp_mv1_i8(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    weight: &wgpu::Buffer,
+    xs: &wgpu::Buffer,
+    y: &wgpu::Buffer,
+    rows: usize,
+    cols: usize,
+) {
+    let gpr = cols / 32;
+    let need = gpr as u64;
+    let (x8, xsb) = {
+        let mut g = c.i8x.lock().unwrap();
+        let grow = match g.as_ref() {
+            Some((_, _, cap)) => *cap < need,
+            None => true,
+        };
+        if grow {
+            let cap = need.max(8 * 1024);
+            let x8 = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("q2-i8-x8"),
+                size: cap * 32,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+            let xsb = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("q2-i8-xs"),
+                size: cap * 8,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+            *g = Some((x8, xsb, cap));
+        }
+        let (a, b, _) = g.as_ref().unwrap();
+        (a.clone(), b.clone())
+    };
+    // x_quant_i8 consumes the same post-FWHT/f16-boundary activation buffer as
+    // the scalar q2 path. It writes one (x8, scale) pair per 32-value group.
+    let qp = uniform_u32x4(c, [gpr as u32, 1, 0, 0]);
+    let ql = c.x_quant_i8.get_bind_group_layout(0);
+    let qbind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("q2-i8-quant"),
+        layout: &ql,
+        entries: &[
+            bind_buf(3, &qp),
+            bind_buf(5, xs),
+            bind_buf(11, &x8),
+            bind_buf(12, &xsb),
+        ],
+    });
+    // `_p1=1` is the already-validated affine center selector. This function
+    // is only called from an affine descriptor gate; it is not a retagging
+    // mechanism for ordinary q2tp tensors.
+    let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, 1, 1]);
+    let layout = c.q2tp_mv1_i8.get_bind_group_layout(0);
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("q2-mv1-i8"),
+        layout: &layout,
+        entries: &[
+            bind_buf(0, weight),
+            bind_buf(2, y),
+            bind_buf(3, &p_buf),
+            bind_buf(9, &x8),
+            bind_buf(10, &xsb),
+        ],
+    });
+    let mut pass = begin_pass_with(enc, Some("q2-mv1-i8"), None);
+    pass.set_pipeline(&c.x_quant_i8);
+    pass.set_bind_group(0, &qbind, &[]);
+    pass.dispatch_workgroups((gpr as u32).div_ceil(256), 1, 1);
+    pass.set_pipeline(&c.q2tp_mv1_i8);
+    pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups(mv_grid((rows as u32).div_ceil(16)), 1, 1);
 }
 
 /// Bind group + grid for the q2tp decode matvec.
@@ -16479,10 +17557,13 @@ fn q2tp_mv_bind(
     y: &wgpu::Buffer,
     rows: usize,
     cols: usize,
+    affine: bool,
 ) -> (wgpu::BindGroup, u32) {
     let gpr = cols / 32;
-    let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, 1, 0]);
-    let layout = c.q2tp_mv16w.get_bind_group_layout(0);
+    // `_p1` is the descriptor-aware center selector: 0 = raw q2tp
+    // `(c-1.5)·s`, 1 = q2tp_affine `(c-1)·s`. The payload is unchanged.
+    let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, 1, affine as u32]);
+    let layout = q2tp_pipeline(c).get_bind_group_layout(0);
     let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("mv-q2"),
         layout: &layout,
@@ -16494,6 +17575,279 @@ fn q2tp_mv_bind(
         ],
     });
     (bind, mv_grid((rows as u32).div_ceil(16)))
+}
+
+/// Build the run-owned global q2tp ladder sidecar.  The table is intentionally
+/// derived from all Q2 rows in the loaded model rather than from the one
+/// benchmark tensor: the gate must exercise the exact 197,295-pair inventory
+/// and its u32 row-id plane, not a per-matrix duplicate that changes the
+/// accounting.  A strict bit check against the same F32 `exp2` expression
+/// rejects the cache before it can affect a projection.
+fn ensure_q2_ladder_cache(
+    c: &Ctx,
+    model: &Arc<CmfModel>,
+    idx: usize,
+    rows: usize,
+    cols: usize,
+) -> Option<(wgpu::Buffer, wgpu::Buffer, u32)> {
+    let _ = cols;
+    let build = c.q2_ladder_build.as_ref()?;
+    let baseline = c.q2_ladder_ref.as_ref()?;
+    c.q2_ladder_mv.as_ref()?;
+    {
+        let cache = c.q2_ladder.lock().unwrap();
+        if let Some(cache) = cache.as_ref().filter(|v| {
+            v.model_uid == model.uid()
+                && v.row_counts.get(&idx).is_some_and(|&count| count >= rows)
+        }) {
+            return Some((
+                cache.ladders.clone(),
+                cache.row_ids.clone(),
+                *cache.row_id_base.get(&idx).unwrap(),
+            ));
+        }
+    }
+
+    let t0 = std::time::Instant::now();
+    let mut pair_ids: HashMap<u32, u32> = HashMap::with_capacity(197_295);
+    let mut raw_keys: Vec<u32> = Vec::with_capacity(197_295);
+    let mut row_ids: Vec<u32> = Vec::new();
+    let mut target_row_base: Option<u32> = None;
+    let mut row_bases: HashMap<usize, u32> = HashMap::new();
+    let mut row_counts: HashMap<usize, usize> = HashMap::new();
+    for (ti, entry) in model.tensors.iter().enumerate() {
+        if entry.dtype != cortiq_core::TensorDtype::Q2TiledP {
+            continue;
+        }
+        let Some(&entry_cols) = entry.shape.get(1) else {
+            return None;
+        };
+        let entry_rows = entry.shape.first().copied().unwrap_or(0);
+        if entry_rows == 0 || entry_cols == 0 || entry_cols % cortiq_core::quant::GROUP_SIZE != 0 {
+            return None;
+        }
+        let (params_off, _, _) = cortiq_core::quant::q2tp_sections(entry_rows, entry_cols);
+        let bytes = model.entry_bytes(entry);
+        let params_end = params_off.checked_add(entry_rows.checked_mul(4)?)?;
+        if params_end > bytes.len() {
+            return None;
+        }
+        row_bases.insert(ti, row_ids.len() as u32);
+        row_counts.insert(ti, entry_rows);
+        for r in 0..entry_rows {
+            let o = params_off + r * 4;
+            let key = u32::from_le_bytes(bytes[o..o + 4].try_into().ok()?);
+            let id = if let Some(&id) = pair_ids.get(&key) {
+                id
+            } else {
+                let id = raw_keys.len() as u32;
+                pair_ids.insert(key, id);
+                raw_keys.push(key);
+                id
+            };
+            if ti == idx && r == 0 {
+                target_row_base = Some(row_ids.len() as u32);
+            }
+            row_ids.push(id);
+        }
+    }
+    let Some(row_id_base) = target_row_base else {
+        eprintln!("q2 ladder cache rejected: target tensor row ids missing");
+        return None;
+    };
+    let target_row_end = row_id_base as usize + rows;
+    if target_row_end > row_ids.len() || raw_keys.is_empty() {
+        eprintln!(
+            "q2 ladder cache rejected: target rows {}/{} pairs {}",
+            target_row_end.saturating_sub(row_id_base as usize),
+            rows,
+            raw_keys.len()
+        );
+        return None;
+    }
+
+    let pairs = raw_keys.len();
+    let table_len = pairs.checked_mul(32)?;
+    let table_bytes = (table_len * std::mem::size_of::<f32>()) as u64;
+    let row_id_bytes = (row_ids.len() * std::mem::size_of::<u32>()) as u64;
+    let expected: Vec<f32> = raw_keys
+        .iter()
+        .flat_map(|&key| {
+            let lo = cortiq_core::quant::f16_to_f32((key & 0xffff) as u16);
+            let step = cortiq_core::quant::f16_to_f32((key >> 16) as u16);
+            (0..32)
+                .map(move |r| if r == 0 { 0.0 } else { (lo + (r - 1) as f32 * step).exp2() })
+        })
+        .collect();
+    let raw_buf = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("q2-ladder-raw-keys"),
+        contents: bytemuck::cast_slice(&raw_keys),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let ladders = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("q2-ladder-global"),
+        size: table_bytes.max(4),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let row_ids_buf = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("q2-ladder-row-ids"),
+        contents: bytemuck::cast_slice(&row_ids),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let p_buf = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("q2-ladder-params"),
+        contents: bytemuck::cast_slice(&[pairs as u32, 0u32, 0u32, 0u32]),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let build_bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("q2-ladder-build-bg"),
+        layout: &build.get_bind_group_layout(0),
+        entries: &[bind_buf(0, &raw_buf), bind_buf(1, &ladders), bind_buf(2, &p_buf)],
+    });
+    let baseline_buf = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("q2-ladder-baseline"),
+        size: table_bytes.max(4),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let baseline_bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("q2-ladder-baseline-bg"),
+        layout: &baseline.get_bind_group_layout(0),
+        entries: &[
+            bind_buf(0, &raw_buf),
+            bind_buf(1, &baseline_buf),
+            bind_buf(2, &p_buf),
+        ],
+    });
+    let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("q2-ladder-build"),
+    });
+    {
+        let mut pass = begin_pass_with(&mut enc, Some("q2-ladder-build"), None);
+        pass.set_pipeline(build);
+        pass.set_bind_group(0, &build_bind, &[]);
+        pass.dispatch_workgroups((table_len as u32).div_ceil(256).min(MAX_WG), 1, 1);
+    }
+    {
+        let mut pass = begin_pass_with(&mut enc, Some("q2-ladder-baseline"), None);
+        pass.set_pipeline(baseline);
+        pass.set_bind_group(0, &baseline_bind, &[]);
+        pass.dispatch_workgroups((table_len as u32).div_ceil(256).min(MAX_WG), 1, 1);
+    }
+    let mut got = vec![0f32; table_len];
+    let mut gpu_baseline = vec![0f32; table_len];
+    if !readback2(
+        c,
+        enc,
+        (&ladders, &mut got),
+        (&baseline_buf, &mut gpu_baseline),
+    ) {
+        eprintln!("q2 ladder cache rejected: GPU table readback failed");
+        return None;
+    }
+    let cpu_mismatches = got
+        .iter()
+        .zip(expected.iter())
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    let gpu_mismatches = got
+        .iter()
+        .zip(gpu_baseline.iter())
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    if gpu_mismatches != 0 {
+        let first = got
+            .iter()
+            .zip(gpu_baseline.iter())
+            .position(|(a, b)| a.to_bits() != b.to_bits())
+            .unwrap_or(0);
+        eprintln!(
+            "q2 ladder cache rejected: gpu_baseline_scale_mismatches={} first={} cache=0x{:08x} baseline=0x{:08x}",
+            gpu_mismatches,
+            first,
+            got[first].to_bits(),
+            gpu_baseline[first].to_bits()
+        );
+        return None;
+    }
+    let build_ms = t0.elapsed().as_secs_f64() * 1e3;
+    eprintln!(
+        "q2 ladder cache admitted: pairs={} table_bytes={} row_id_bytes={} total_bytes={} build_ms={:.3} gpu_baseline_scale_mismatches=0 cpu_exp2_diagnostic_mismatches={}",
+        pairs,
+        table_bytes,
+        row_id_bytes,
+        table_bytes + row_id_bytes,
+        build_ms,
+        cpu_mismatches
+    );
+    let fresh = Q2LadderCache {
+        model_uid: model.uid(),
+        pairs,
+        table_bytes,
+        row_id_bytes,
+        ladders,
+        row_ids: row_ids_buf,
+        row_id_base: row_bases,
+        row_counts,
+    };
+    let mut cache = c.q2_ladder.lock().unwrap();
+    if let Some(old) = cache.as_ref().filter(|v| {
+        v.model_uid == model.uid()
+            && v.row_counts.get(&idx).is_some_and(|&count| count >= rows)
+    }) {
+        return Some((
+            old.ladders.clone(),
+            old.row_ids.clone(),
+            *old.row_id_base.get(&idx).unwrap(),
+        ));
+    }
+    let result = (
+        fresh.ladders.clone(),
+        fresh.row_ids.clone(),
+        *fresh.row_id_base.get(&idx).unwrap(),
+    );
+    *cache = Some(fresh);
+    Some(result)
+}
+
+/// Encode one q2tp matvec using the global ladder table and target-row IDs.
+/// The symbol plane and affine center selector are unchanged from the
+/// production shader; only the scale source is replaced.
+fn encode_q2tp_ladder_cache(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    weight: &wgpu::Buffer,
+    xs: &wgpu::Buffer,
+    y: &wgpu::Buffer,
+    ladders: &wgpu::Buffer,
+    row_ids: &wgpu::Buffer,
+    row_id_base: u32,
+    rows: usize,
+    cols: usize,
+    affine: bool,
+) {
+    let Some(pipe) = c.q2_ladder_mv.as_ref() else {
+        return;
+    };
+    let gpr = cols / 32;
+    let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, row_id_base, affine as u32]);
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("q2-ladder-mv-bg"),
+        layout: &pipe.get_bind_group_layout(0),
+        entries: &[
+            bind_buf(0, weight),
+            bind_buf(2, y),
+            bind_buf(3, &p_buf),
+            bind_buf(5, xs),
+            bind_buf(6, ladders),
+            bind_buf(7, row_ids),
+        ],
+    });
+    let mut pass = begin_pass_with(enc, Some("q2-ladder-mv"), None);
+    pass.set_pipeline(pipe);
+    pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups(mv_grid((rows as u32).div_ceil(16)), 1, 1);
 }
 
 // An OCT-row variant (8 rows a lane, 32 a workgroup, bit-identical rows)
@@ -16547,8 +17901,8 @@ fn wgsl_main_source() -> String {
         "return f32((w >> sh) & 0xFu) - 8.0;",
     )
     .replace(
-        "return bitcast<f32>((((w >> sh) & 3u) << 1u) | 0x4B000000u) - 8388611.0;",
-        "return f32(((w >> sh) & 3u) << 1u) - 3.0;",
+        "return bitcast<f32>((((w >> sh) & 3u) << 1u) | 0x4B000000u) - select(8388611.0, 8388610.0, affine != 0u);",
+        "return f32(((w >> sh) & 3u) << 1u) - select(3.0, 2.0, affine != 0u);",
     )
 }
 
@@ -16717,6 +18071,29 @@ fn graph_refused(why: &'static str) {
     if !SAID.swap(true, Ordering::Relaxed) {
         tracing::warn!("wgpu token graph declined: {why}");
     }
+}
+
+// The optional subgroup pipeline is deliberately fail-closed, but a plain
+// `None` is not enough for the component gate: it cannot distinguish a card
+// without the feature from a WGSL/module/pipeline rejection.  Keep the full
+// scoped diagnostic for the test-visible admission line without making the
+// ordinary decode path depend on a tracing subscriber.
+fn q2tp_sg_diag_slot() -> &'static std::sync::Mutex<Option<String>> {
+    static DIAG: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
+        std::sync::OnceLock::new();
+    DIAG.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn set_q2tp_sg_diag(message: impl Into<String>) {
+    *q2tp_sg_diag_slot().lock().unwrap() = Some(message.into());
+}
+
+fn q2tp_sg_diag() -> String {
+    q2tp_sg_diag_slot()
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| "not_requested".to_string())
 }
 
 /// Device bytes one layer's expert stack wants (gate + up + down, all
@@ -16908,6 +18285,7 @@ fn moe_expert_bufs(
         model.evict_ranges(&uploaded.borrow());
     }
     c.resident.fetch_add(total, Ordering::Relaxed);
+    note_resident_peak(c);
     c.moe_expw
         .lock()
         .unwrap()
@@ -17009,6 +18387,7 @@ pub fn moe_expert_bufs_requant_gu(
         total / (1024 * 1024),
     );
     c.resident.fetch_add(total, Ordering::Relaxed);
+    note_resident_peak(c);
     c.moe_expw
         .lock()
         .unwrap()
@@ -18255,6 +19634,7 @@ pub fn forward_token_graph(
     hidden_too: bool,
 ) -> crate::gpu::TokenGraphOutcome {
     let _hp_t0 = std::time::Instant::now(); // CMF_GRAPH_HOSTPROF
+    let span_submit_start = SUBMITS.load(std::sync::atomic::Ordering::Relaxed);
     let mut o1_started = false;
     // Persistent GDN/short-conv state makes a submitted graph mutation-sensitive
     // even when O(1) is not enabled.  A failed readback must therefore abort
@@ -18287,7 +19667,12 @@ pub fn forward_token_graph(
     struct GMat {
         buf: wgpu::Buffer,
         rs: Option<wgpu::Buffer>,
+        // Model tensor identity is part of the graph descriptor: the global
+        // ladder sidecar indexes row IDs by tensor, never by a guessed shape.
+        idx: usize,
         kind: u8,
+        prism: crate::gpu::GraphPrismOp,
+        affine: bool,
     }
     enum LAttn {
         Full {
@@ -18351,6 +19736,22 @@ pub fn forward_token_graph(
     // Resolve + cache every layer's weights (q8_row or q1) up front; bail (CPU)
     // on any refusal (budget/shape/dtype).
     let resolve = |gw: &crate::gpu::GraphW, rows: usize, cols: usize| -> Option<GMat> {
+        if std::env::var("CMF_GRAPH_RESOLVE").is_ok() {
+            eprintln!(
+                "graph resolve: idx={} kind={} want={}x{} prism={:?} affine={}",
+                gw.idx, gw.kind, rows, cols, gw.prism, gw.affine
+            );
+        }
+        // The resident graph currently has a descriptor-aware affine kernel
+        // only for the dense q2tp plane.  Refuse any other declared affine
+        // target rather than silently applying the raw center.  Embedding
+        // inverse operators belong to the separate embedding path, never a
+        // layer projection.
+        if gw.prism == crate::gpu::GraphPrismOp::InverseEmbedding
+            || (gw.affine && gw.kind != 9)
+        {
+            return None;
+        }
         match gw.kind {
             0 => {
                 // q8_row: weight bytes = rows*cols, plus per-row scales.
@@ -18385,7 +19786,10 @@ pub fn forward_token_graph(
                 Some(GMat {
                     buf: b,
                     rs: Some(rsb),
+                    idx: gw.idx,
                     kind: 0,
+                    prism: gw.prism,
+                    affine: gw.affine,
                 })
             }
             1 => {
@@ -18396,7 +19800,10 @@ pub fn forward_token_graph(
                 Some(GMat {
                     buf: b,
                     rs: None,
+                    idx: gw.idx,
                     kind: 1,
+                    prism: gw.prism,
+                    affine: gw.affine,
                 })
             }
             2 | 3 | 5 | 6 | 7 | 9 => {
@@ -18444,7 +19851,10 @@ pub fn forward_token_graph(
                 Some(GMat {
                     buf: b,
                     rs: None,
+                    idx: gw.idx,
                     kind: gw.kind,
+                    prism: gw.prism,
+                    affine: gw.affine,
                 })
             }
             4 => {
@@ -18479,7 +19889,10 @@ pub fn forward_token_graph(
                 Some(GMat {
                     buf: b,
                     rs: None,
+                    idx: gw.idx,
                     kind: 4,
+                    prism: gw.prism,
+                    affine: gw.affine,
                 })
             }
             _ => None,
@@ -18675,6 +20088,15 @@ pub fn forward_token_graph(
                     prefix = true;
                     break;
                 }
+                if experts.iter().flat_map(|&(g, u, d)| [g, u, d]).any(|idx| {
+                    model
+                        .tensors
+                        .get(idx)
+                        .is_some_and(|e| crate::prism::is_forward_weight(model, &e.name))
+                }) {
+                    graph_decline("Prism MoE experts require an unimplemented resident transform");
+                    return token_graph_outcome(o1_started || state_started, false);
+                }
                 let Some((gate_all, up_all, down_all)) =
                     moe_expert_bufs(c, model, experts, *mi, hidden, *q4tp, *gu_q2, false)
                 else {
@@ -18867,6 +20289,16 @@ pub fn forward_token_graph(
     );
     c.queue
         .write_buffer(&h_buf, 0, bytemuck::cast_slice(&h[..hidden]));
+    let token_tap_layer = std::env::var("CMF_GRAPH_TAP_LAYER")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&li| li < layers.len());
+    let token_tap_stage = token_tap_layer.map(|_| c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("token-graph-tap"),
+        size: (hidden * 4) as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    }));
     let n1 = GraphScratch::ensure(
         &c.device,
         &mut gs.n1,
@@ -18947,6 +20379,44 @@ pub fn forward_token_graph(
         "g-scbcx",
     );
     let sc_y = GraphScratch::ensure(&c.device, &mut gs.sc_y, (hidden * 4) as u64, st, "g-scy");
+    // A single reusable transform destination is enough because the graph
+    // emits Prism FWHTs in dependency order.  It is sized for both the
+    // hidden input projections and the widest dense-FFN down input.
+    let rot_width = hidden.max(inter);
+    let rot = GraphScratch::ensure(
+        &c.device,
+        &mut gs.rot,
+        (rot_width * 4) as u64,
+        st | wgpu::BufferUsages::COPY_DST,
+        "g-prism-rot",
+    );
+    // The validated Prism header stores one concatenated sign vector per
+    // supported width.  Keep that table resident and address the selected
+    // width by an explicit offset in the FWHT uniform; no name/dtype guess
+    // is permitted in the graph.
+    let prism_signs = model
+        .header
+        .arch
+        .prism_hadamard
+        .as_ref()
+        .map(|cfg| stor(bytemuck::cast_slice(&cfg.signs)));
+    let prism_sign_offset = |width: usize| -> Option<usize> {
+        let cfg = model.header.arch.prism_hadamard.as_ref()?;
+        let mut off = 0usize;
+        for &w in &cfg.widths {
+            if w == width {
+                return Some(off);
+            }
+            off = off.checked_add(w)?;
+        }
+        None
+    };
+    let prism_round16 = model
+        .header
+        .arch
+        .prism_hadamard
+        .as_ref()
+        .is_some_and(|cfg| cfg.activation_f16);
     // Sync each Full layer's device K/V mirror from the CPU cache (once);
     // GDN layers carry a persistent (ring, S) recurrent state instead.
     let mut kvbufs: Vec<Option<(wgpu::Buffer, wgpu::Buffer)>> = Vec::with_capacity(layers.len());
@@ -19153,11 +20623,25 @@ pub fn forward_token_graph(
         .map(|v| v != "0")
         .unwrap_or(true);
     // Hand strictly-serial single-dispatch stages to the NEXT pass instead of
-    // opening a pass for each. Dispatch ORDER is unchanged, so the answer is
-    // unchanged; only pass boundaries move. CMF_PASSFUSE=0 reverts.
+    // opening a pass for each. This is opt-in: it defers selected residual/norm
+    // producers, and is separate from PassMergeGuard's pass-merging switch.
+    // CMF_PASSFUSE=1 is an explicit experimental override; the narrower
+    // GRAPH_FUSE_* switches below remain off unless requested. Prism inputs
+    // force a deferred FFN norm back before their FWHT consumer.
     let passfuse = std::env::var("CMF_PASSFUSE")
         .map(|v| v != "0")
-        .unwrap_or(true);
+        .unwrap_or(false);
+    // Keep the two residual/norm joins independently switchable. The safe
+    // default leaves both producers in their own encoded stage; any explicit
+    // fusion must preserve producer-before-transform ordering below.
+    let fuse_pre = passfuse
+        && std::env::var("CMF_GRAPH_FUSE_PRE")
+            .map(|v| v != "0")
+            .unwrap_or(false);
+    let fuse_tail = passfuse
+        && std::env::var("CMF_GRAPH_FUSE_TAIL")
+            .map(|v| v != "0")
+            .unwrap_or(false);
     // CMF_SKIP_PROBE=moe|gdn — TIMING ONLY, the answer is garbage. Drops a
     // whole stage's dispatches while leaving every buffer, pass and shape
     // in place, so the delta is that stage's real share of the frame. The
@@ -19196,12 +20680,170 @@ pub fn forward_token_graph(
     // slot, same key): every begin_pass below hands back one open pass;
     // copies, timestamps, swaps and finishes flush it first.
     let _merge_guard = PassMergeGuard::new(&enc);
+    batch_kernel_ts_begin(c);
     let go =
         |enc: &mut wgpu::CommandEncoder, p: &wgpu::ComputePipeline, b: &wgpu::BindGroup, g: u32| {
             let mut pass = begin_pass(enc);
             pass.set_pipeline(p);
             pass.set_bind_group(0, b, &[]);
             pass.dispatch_workgroups(g, 1, 1);
+        };
+    // Full-frame token microscope.  The normal 256-slot profile intentionally
+    // samples only a few early layers; this opt-in route reserves at most the
+    // 4096 slots allocated above and stamps every selected dispatch class.
+    // It is diagnostics only and never changes the graph's math or grouping.
+    // Interior mutability keeps the long-lived prism closure from holding a
+    // mutable borrow over the rest of graph encoding.
+    let ts_n = std::cell::Cell::new(0u32);
+    let ts_lbl = std::cell::RefCell::new(Vec::<(u8, u8)>::new());
+    // Bounded architecture discriminator: when requested, only two endpoint
+    // timestamps are emitted and all work remains in the ordinary graph
+    // passes.  This is deliberately separate from the detailed microscope:
+    // its span must not inherit per-dispatch timestamp flushes or labels.
+    let device_span_probe = std::env::var("CMF_GRAPH_DEVICE_SPAN").as_deref() == Ok("1")
+        && steps == 1;
+    // CMF_GRAPH_PREENCODE=1 disables only the historical mid-stack split for
+    // this probe.  It does not fuse passes or alter dispatch/math ordering;
+    // the caller still submits the finished encoder through the same readback.
+    let preencode_frame = std::env::var("CMF_GRAPH_PREENCODE").as_deref() == Ok("1")
+        && steps == 1;
+    let ts_fine = !device_span_probe && std::env::var("CMF_GPU_TS").as_deref() == Ok("2");
+    let ts_full = !device_span_probe && std::env::var("CMF_GRAPH_TS_ALL").as_deref() == Ok("1");
+    let ts_cap = if device_span_probe { 2 } else if ts_full { 4096 } else { 255 };
+    macro_rules! ts_point {
+        ($enc:expr, $stage:expr) => {
+            if !device_span_probe && steps == 1 && ts_full {
+                if let Some((qs, _, _)) = &c.ts_query {
+                    if ts_n.get() < ts_cap {
+                        flush_pass(&$enc);
+                        $enc.write_timestamp(qs, ts_n.get());
+                        ts_lbl.borrow_mut().push(($stage, 9));
+                        ts_n.set(ts_n.get() + 1);
+                    }
+                }
+            }
+        };
+    }
+    macro_rules! ts {
+        ($enc:expr, $stage:expr, $kind:expr) => {
+            if !device_span_probe && steps == 1 {
+                if let Some((qs, _, _)) = &c.ts_query {
+                    if ts_n.get() < ts_cap {
+                        flush_pass(&$enc);
+                        $enc.write_timestamp(qs, ts_n.get());
+                        ts_lbl.borrow_mut().push(($stage, $kind));
+                        ts_n.set(ts_n.get() + 1);
+                    }
+                }
+            }
+        };
+    }
+    macro_rules! tsp {
+        ($pass:expr, $on:expr, $stage:expr) => {
+            if ts_fine && $on && steps == 1 {
+                if let Some((qs, _, _)) = &c.ts_query {
+                    if ts_n.get() < ts_cap {
+                        $pass.write_timestamp(qs, ts_n.get());
+                        ts_lbl.borrow_mut().push(($stage, 9));
+                        ts_n.set(ts_n.get() + 1);
+                    }
+                }
+            }
+        };
+    }
+    let write_span_endpoint = |enc: &mut wgpu::CommandEncoder| {
+        if device_span_probe {
+            if let Some((qs, _, _)) = &c.ts_query {
+                if ts_n.get() < 2 {
+                    flush_pass(enc);
+                    let slot = ts_n.get();
+                    enc.write_timestamp(qs, slot);
+                    ts_lbl.borrow_mut().push((60 + slot as u8, 0));
+                    ts_n.set(slot + 1);
+                }
+            }
+        }
+    };
+    write_span_endpoint(&mut enc);
+    // Resolve the timestamp query on every readback route.  Previously this
+    // lived only in the logits/head arm, so hidden-only frames mapped stale
+    // query data and reported it as if it belonged to the current graph.
+    let resolve_timestamps = |enc: &mut wgpu::CommandEncoder| {
+        if let Some((qs, resolve, tstage)) = &c.ts_query {
+            if steps == 1 && ts_n.get() > 0 {
+                flush_pass(enc);
+                enc.resolve_query_set(qs, 0..ts_n.get(), resolve, 0);
+                flush_pass(enc);
+                enc.copy_buffer_to_buffer(resolve, 0, tstage, 0, ts_n.get() as u64 * 8);
+            }
+        }
+    };
+    // Encode a descriptor-aware signed FWHT without a host round trip.  The
+    // output is the pooled `rot` buffer and is consumed by the immediately
+    // following projection dispatch(es) in queue order.  Refusal is explicit:
+    // callers must not fall back to an untransformed Prism matvec.
+    let prism_transform =
+        |enc: &mut wgpu::CommandEncoder,
+         src: &wgpu::Buffer,
+         width: usize,
+         op: crate::gpu::GraphPrismOp|
+         -> Option<wgpu::Buffer> {
+            if op == crate::gpu::GraphPrismOp::None {
+                return Some(src.clone());
+            }
+            let pipe = c.fwht.as_ref()?;
+            let cfg = model.header.arch.prism_hadamard.as_ref()?;
+            let block = cfg.block_size;
+            let sign_offset = prism_sign_offset(width)?;
+            if block != 1024 || width == 0 || width % block != 0 || width > rot_width {
+                return None;
+            }
+            let signs = prism_signs.as_ref()?;
+            let p = uniform_u32x8(
+                c,
+                [
+                    width as u32,
+                    block as u32,
+                    sign_offset as u32,
+                    u32::from(op == crate::gpu::GraphPrismOp::InverseEmbedding),
+                    u32::from(prism_round16),
+                    0,
+                    0,
+                    0,
+                ],
+            );
+            let layout = pipe.get_bind_group_layout(0);
+            let bg = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("prism-fwht"),
+                layout: &layout,
+                entries: &[
+                    bind_buf(0, src),
+                    bind_buf(1, &rot),
+                    bind_buf(2, signs),
+                    bind_buf(3, &p),
+                ],
+            });
+            ts_point!(enc, 50);
+            go(enc, pipe, &bg, (width / block) as u32);
+            ts_point!(enc, 51);
+            Some(rot.clone())
+        };
+    let prism_input =
+        |enc: &mut wgpu::CommandEncoder,
+         mats: &[&GMat],
+         src: &wgpu::Buffer,
+         width: usize|
+         -> Option<wgpu::Buffer> {
+            let mut op = crate::gpu::GraphPrismOp::None;
+            for m in mats {
+                if m.prism != crate::gpu::GraphPrismOp::None {
+                    if op != crate::gpu::GraphPrismOp::None && op != m.prism {
+                        return None;
+                    }
+                    op = m.prism;
+                }
+            }
+            prism_transform(enc, src, width, op)
         };
     let flags = |qn: bool, kn: bool| {
         (if qn { 2u32 } else { 0 }) | (if kn { 4 } else { 0 }) | (if gemma { 8 } else { 0 })
@@ -19255,6 +20897,43 @@ pub fn forward_token_graph(
     let kv_us = std::mem::take(&mut gs.kv_us);
     let at_us = std::mem::take(&mut gs.at_us);
     let rope_us = std::mem::take(&mut gs.rope_us);
+    // The ladder sidecar is selected from the same resolved tensor identity
+    // used by the graph's prep/emat descriptors.  Keeping this in one helper
+    // prevents the graph path from accidentally using a component-only or
+    // shape-only cache binding, and lets every fallback retain the ordinary
+    // row-local q2tp kernel.
+    let ladder = |m: &GMat,
+                  xs: &wgpu::Buffer,
+                  y: &wgpu::Buffer,
+                  rows: usize,
+                  cols: usize|
+     -> Option<(&wgpu::ComputePipeline, wgpu::BindGroup, u32)> {
+        if m.kind != 9
+            || !m.affine
+            || std::env::var("CMF_Q2_LADDER_CACHE").as_deref() != Ok("1")
+        {
+            return None;
+        }
+        let (ladders, row_ids, row_id_base) = ensure_q2_ladder_cache(c, model, m.idx, rows, cols)?;
+        let pipe = c.q2_ladder_mv.as_ref()?;
+        let gpr = cols / 32;
+        let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, row_id_base, 1]);
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("graph-q2-ladder-mv-bg"),
+            layout: &pipe.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, &m.buf),
+                bind_buf(2, y),
+                bind_buf(3, &p_buf),
+                bind_buf(5, xs),
+                bind_buf(6, &ladders),
+                bind_buf(7, &row_ids),
+            ],
+        });
+        use std::sync::atomic::Ordering;
+        Q2TP_LADDER_GRAPH_LOOKUPS.fetch_add(1, Ordering::Relaxed);
+        Some((pipe, bind, mv_grid((rows as u32).div_ceil(16))))
+    };
     // Encode one matvec, dtype-dispatched: q8_row (encode_matvec + row
     // scales) or q1 (encode_matvec_q1). Each is its own pass.
     //
@@ -19340,9 +21019,20 @@ pub fn forward_token_graph(
                 pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
             }
             9 => {
+                if let Some((pipe, bind, groups)) = ladder(m, xs, y, rows, cols) {
+                    let mut pass = begin_pass(enc);
+                    pass.set_pipeline(pipe);
+                    pass.set_bind_group(0, &bind, &[]);
+                    pass.dispatch_workgroups(groups, 1, 1);
+                    return;
+                }
+                if q2tp_dp4a_on() && m.affine && cols % 32 == 0 {
+                    encode_q2tp_mv1_i8(c, enc, &m.buf, xs, y, rows, cols);
+                    return;
+                }
                 let gpr = cols / 32;
-                let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, 1, 0]);
-                let layout = c.q2tp_mv16w.get_bind_group_layout(0);
+                let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, 1, m.affine as u32]);
+                let layout = q2tp_pipeline(c).get_bind_group_layout(0);
                 let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: None,
                     layout: &layout,
@@ -19354,7 +21044,7 @@ pub fn forward_token_graph(
                     ],
                 });
                 let mut pass = begin_pass(enc);
-                pass.set_pipeline(&c.q2tp_mv16w);
+                pass.set_pipeline(q2tp_pipeline(c));
                 pass.set_bind_group(0, &bind, &[]);
                 pass.dispatch_workgroups(mv_grid((rows as u32).div_ceil(16)), 1, 1);
             }
@@ -19552,9 +21242,19 @@ pub fn forward_token_graph(
                 if cols % 32 != 0 {
                     return None;
                 }
+                if let Some((pipe, bind, groups)) = ladder(m, xs, y, rows, cols) {
+                    return Some((pipe, bind, groups));
+                }
+                // The NB=1 Q8/DP4A arm needs a preceding activation-quantize
+                // dispatch, so it intentionally declines grouping; `group_mats`
+                // then routes this operation through `emat`, which emits the
+                // quantizer and the dedicated affine kernel in one pass.
+                if q2tp_dp4a_on() && m.affine {
+                    return None;
+                }
                 let gpr = cols / 32;
-                let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, 1, 0]);
-                let layout = c.q2tp_mv16w.get_bind_group_layout(0);
+                let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, 1, m.affine as u32]);
+                let layout = q2tp_pipeline(c).get_bind_group_layout(0);
                 let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: None,
                     layout: &layout,
@@ -19565,7 +21265,7 @@ pub fn forward_token_graph(
                         bind_buf(5, xs),
                     ],
                 });
-                Some((&c.q2tp_mv16w, bind, mv_grid((rows as u32).div_ceil(16))))
+                Some((q2tp_pipeline(c), bind, mv_grid((rows as u32).div_ceil(16))))
             }
             _ => None,
         }
@@ -19645,41 +21345,6 @@ pub fn forward_token_graph(
         true
     };
     let mut o1_dbg: Vec<(usize, wgpu::Buffer)> = Vec::new();
-    // ── Frame profiler (CMF_GPU_TS=1, single-step): GPU timestamps at pass
-    // granularity, aggregated per (stage, layer-kind). The microscope that
-    // replaces cost-model guessing.
-    let mut ts_n: u32 = 0;
-    let mut ts_lbl: Vec<(u8, u8)> = Vec::new();
-    let ts_fine = std::env::var("CMF_GPU_TS").as_deref() == Ok("2");
-    macro_rules! ts {
-        ($enc:expr, $stage:expr, $kind:expr) => {
-            if steps == 1 {
-                if let Some((qs, _, _)) = &c.ts_query {
-                    if ts_n < 255 {
-                        flush_pass(&$enc);
-                        $enc.write_timestamp(qs, ts_n);
-                        ts_lbl.push(($stage, $kind));
-                        ts_n += 1;
-                    }
-                }
-            }
-        };
-    }
-    // Per-dispatch stamps INSIDE a pass (CMF_GPU_TS=2), for the first layer
-    // of each kind only — 256 slots cannot carry every dispatch of a frame.
-    macro_rules! tsp {
-        ($pass:expr, $on:expr, $stage:expr) => {
-            if ts_fine && $on && steps == 1 {
-                if let Some((qs, _, _)) = &c.ts_query {
-                    if ts_n < 255 {
-                        $pass.write_timestamp(qs, ts_n);
-                        ts_lbl.push(($stage, 9));
-                        ts_n += 1;
-                    }
-                }
-            }
-        };
-    }
     // ── Multi-step prerequisites: the lm_head fold and a q4tp embedding,
     // both resolved up front. Anything missing refuses the WHOLE call so
     // the pipeline can fall back to single-step.
@@ -19691,7 +21356,12 @@ pub fn forward_token_graph(
     let emb_pre =
         embed.and_then(|(gw, rows, mult)| resolve(gw, rows, hidden).map(|m| (m, rows, mult)));
     if multi {
-        let embed_ok = matches!(&emb_pre, Some((m, _, _)) if m.kind == 6);
+        // The initial resident slice deliberately keeps the inverse embedding
+        // on the CPU.  The existing gather kernel has no descriptor/sign
+        // binding, so declining here is safer than returning a plausible but
+        // untransformed multi-step stream.
+        let embed_ok = matches!(&emb_pre, Some((m, _, _)) if m.kind == 6
+            && m.prism == crate::gpu::GraphPrismOp::None);
         if lm_pre.is_none() || !embed_ok {
             graph_refused("multi-step needs the lm_head fold and a q4tp embedding");
             return token_graph_outcome(o1_started || state_started, false);
@@ -19819,7 +21489,7 @@ pub fn forward_token_graph(
         // 110.4): it hides the encode AND the driver's submit latency.
         // Same queue, same order; nothing about the computation changes.
         // `CMF_GRAPH_SPLIT=N` pieces; 0/1 = historical single submit.
-        let split_n = graph_split_n();
+        let split_n = if preencode_frame { 1 } else { graph_split_n() };
         let chunk = if steps == 1 && split_n > 1 {
             // Never below four layers a piece: a short device prefix cut
             // into per-layer submits pays more in submissions than it
@@ -19888,17 +21558,29 @@ pub fn forward_token_graph(
                             0,
                         ]),
                     );
+                    let qkv_in = match prism_input(
+                        &mut enc,
+                        &[wq, wk, wv],
+                        &n1,
+                        hidden,
+                    ) {
+                        Some(x) => x,
+                        None => {
+                            graph_decline("Prism QKV transform unavailable");
+                            return token_graph_outcome(o1_started || state_started, false);
+                        }
+                    };
                     // Gated wq emits 2·nh·hd (q||gate interleaved per head); the rope
                     // kernel splits it, roping q and passing gate through to `gout`.
                     let qrows = nh * hd * (1 + *output_gate as usize);
                     // k+v in ONE dispatch (the x2 kernel) next to q, when
                     // both are wide q4tp; otherwise the grouped pass.
                     let pkv = if group {
-                        prep2(wk, wv, &n1, &kb, &vb, nkv * hd, nkv * hd, hidden)
+                        prep2(wk, wv, &qkv_in, &kb, &vb, nkv * hd, nkv * hd, hidden)
                     } else {
                         None
                     };
-                    match (pkv, prep(wq, &n1, &qraw, qrows, hidden)) {
+                    match (pkv, prep(wq, &qkv_in, &qraw, qrows, hidden)) {
                         (Some((p2, b2, w2)), Some((pq, bq, wgq))) => {
                             let mut pass = begin_pass(&mut enc);
                             pass.set_pipeline(pq);
@@ -19911,9 +21593,9 @@ pub fn forward_token_graph(
                         _ => group_mats(
                             &mut enc,
                             &[
-                                (wq, &n1, &qraw, qrows, hidden),
-                                (wk, &n1, &kb, nkv * hd, hidden),
-                                (wv, &n1, &vb, nkv * hd, hidden),
+                                (wq, &qkv_in, &qraw, qrows, hidden),
+                                (wk, &qkv_in, &kb, nkv * hd, hidden),
+                                (wv, &qkv_in, &vb, nkv * hd, hidden),
                             ],
                         ),
                     }
@@ -20104,7 +21786,14 @@ pub fn forward_token_graph(
                             } else {
                                 None
                             };
-                            let wo_prep = prep(wo, &attn, &ob, hidden, nh * hd);
+                            // A Prism O projection needs its FWHT after the
+                            // attention result exists, so it cannot be
+                            // pre-bound into this earlier fused pass.
+                            let wo_prep = if wo.prism == crate::gpu::GraphPrismOp::None {
+                                prep(wo, &attn, &ob, hidden, nh * hd)
+                            } else {
+                                None
+                            };
                             {
                                 let bg_rope = bg(
                                     &c.layout_attn_rope,
@@ -20113,7 +21802,7 @@ pub fn forward_token_graph(
                                 let bg_kv =
                                     bgc(19, li, &c.layout_kv, &[&kb, &vb, kbuf, vbuf, &kv_u]);
                                 let mut pass = begin_pass(&mut enc);
-                                let fine = li < 4;
+                                let fine = ts_full || li < 4;
                                 tsp!(pass, fine, 20); // pass start (after qkv projections)
                                 pass.set_pipeline(&c.attn_rope);
                                 pass.set_bind_group(0, &bg_rope, &[]);
@@ -20150,7 +21839,13 @@ pub fn forward_token_graph(
                                 tsp!(pass, fine, 25); // o-proj
                             }
                             if wo_prep.is_none() {
-                                emat(&mut enc, wo, &attn, &ob, hidden, nh * hd);
+                                let Some(wo_in) =
+                                    prism_input(&mut enc, &[wo], &attn, nh * hd)
+                                else {
+                                    graph_decline("Prism O transform unavailable");
+                                    return token_graph_outcome(o1_started || state_started, false);
+                                };
+                                emat(&mut enc, wo, &wo_in, &ob, hidden, nh * hd);
                             }
                         } else {
                             {
@@ -20262,7 +21957,11 @@ pub fn forward_token_graph(
                         );
                     }
                     if !attn_done {
-                        emat(&mut enc, wo, &attn, &ob, hidden, nh * hd);
+                        let Some(wo_in) = prism_input(&mut enc, &[wo], &attn, nh * hd) else {
+                            graph_decline("Prism O transform unavailable");
+                            return token_graph_outcome(o1_started || state_started, false);
+                        };
+                        emat(&mut enc, wo, &wo_in, &ob, hidden, nh * hd);
                     }
                 }
                 (
@@ -20395,44 +22094,71 @@ pub fn forward_token_graph(
                     // dispatch of the pair kernel, whose f32 arm is
                     // `f32_matvec` lane for lane (64-stride, same tree) —
                     // four projection launches become two.
-                    let pqz = prep2(qkv, z, &n1, &qkv_b, &z_b, *cdim, nv * dv, hidden);
-                    let pab = if pqz.is_some() && a.kind == 4 && b.kind == 4 && c.use_mv_x2 {
-                        let pu = unif(&[
-                            *nv as u32,
-                            hidden as u32,
-                            4,
-                            0,
-                            *nv as u32,
-                            hidden as u32,
-                            4,
-                            0,
-                        ]);
-                        let bind = bg(&c.layout_mv2, &[&a.buf, &b.buf, &n1, &a_b, &b_b, &pu]);
-                        Some((&c.matvec_pair, bind, ((2 * *nv) as u32).min(MAX_WG)))
+                    let qz_in = match prism_input(&mut enc, &[qkv, z], &n1, hidden) {
+                        Some(x) => x,
+                        None => {
+                            graph_decline("Prism GDN QKV transform unavailable");
+                            return token_graph_outcome(o1_started || state_started, false);
+                        }
+                    };
+                    // The GDN output transform depends on the recurrent step,
+                    // so a Prism output cannot be pre-bound into the same
+                    // projection pass.  The fallback arm below emits it after
+                    // the stateful step has written gdo_b. Decide that
+                    // eligibility before preparing any of the input
+                    // projections: Prism's transformed output necessarily
+                    // takes the fallback below, so its first four prep calls
+                    // would be discarded and repeated by group_mats.
+                    let prism_output = out.prism != crate::gpu::GraphPrismOp::None;
+                    let outp = if !prism_output {
+                        prep(out, &gdo_b, &ob, hidden, nv * dv)
                     } else {
                         None
                     };
-                    let n_proj = match (pqz.is_some(), pab.is_some()) {
-                        (true, true) => 2,
-                        (true, false) => 3,
-                        _ => 4,
+                    let (n_proj, projs) = if prism_output {
+                        use std::sync::atomic::Ordering;
+                        GDN_PRISM_SKIPPED_PREPS.fetch_add(4, Ordering::Relaxed);
+                        (4, std::array::from_fn(|_| None))
+                    } else {
+                        let pqz = prep2(qkv, z, &qz_in, &qkv_b, &z_b, *cdim, nv * dv, hidden);
+                        let pab = if pqz.is_some() && a.kind == 4 && b.kind == 4 && c.use_mv_x2 {
+                            let pu = unif(&[
+                                *nv as u32,
+                                hidden as u32,
+                                4,
+                                0,
+                                *nv as u32,
+                                hidden as u32,
+                                4,
+                                0,
+                            ]);
+                            let bind = bg(&c.layout_mv2, &[&a.buf, &b.buf, &n1, &a_b, &b_b, &pu]);
+                            Some((&c.matvec_pair, bind, ((2 * *nv) as u32).min(MAX_WG)))
+                        } else {
+                            None
+                        };
+                        let n_proj = match (pqz.is_some(), pab.is_some()) {
+                            (true, true) => 2,
+                            (true, false) => 3,
+                            _ => 4,
+                        };
+                        let projs = match (pqz, pab) {
+                            (Some(p2), Some(pp)) => [Some(p2), Some(pp), None, None],
+                            (Some(p2), None) => [
+                                Some(p2),
+                                prep(a, &n1, &a_b, *nv, hidden),
+                                prep(b, &n1, &b_b, *nv, hidden),
+                                None,
+                            ],
+                            (None, _) => [
+                                prep(qkv, &qz_in, &qkv_b, *cdim, hidden),
+                                prep(z, &qz_in, &z_b, nv * dv, hidden),
+                                prep(a, &n1, &a_b, *nv, hidden),
+                                prep(b, &n1, &b_b, *nv, hidden),
+                            ],
+                        };
+                        (n_proj, projs)
                     };
-                    let projs = match (pqz, pab) {
-                        (Some(p2), Some(pp)) => [Some(p2), Some(pp), None, None],
-                        (Some(p2), None) => [
-                            Some(p2),
-                            prep(a, &n1, &a_b, *nv, hidden),
-                            prep(b, &n1, &b_b, *nv, hidden),
-                            None,
-                        ],
-                        (None, _) => [
-                            prep(qkv, &n1, &qkv_b, *cdim, hidden),
-                            prep(z, &n1, &z_b, nv * dv, hidden),
-                            prep(a, &n1, &a_b, *nv, hidden),
-                            prep(b, &n1, &b_b, *nv, hidden),
-                        ],
-                    };
-                    let outp = prep(out, &gdo_b, &ob, hidden, nv * dv);
                     let projs_ok = projs.iter().take(n_proj).all(|p| p.is_some());
                     if projs_ok && outp.is_some() {
                         let _ = (skip_proj, skip_outp);
@@ -20444,7 +22170,7 @@ pub fn forward_token_graph(
                                 pass.dispatch_workgroups(p.2, 1, 1);
                             }
                         }
-                        let fine = li == 0;
+                        let fine = ts_full || li == 0;
                         tsp!(pass, fine, 10); // after projections
                         if !skip_gdn {
                             if c.gdn_par && c.gdn_inline {
@@ -20493,8 +22219,8 @@ pub fn forward_token_graph(
                         group_mats(
                             &mut enc,
                             &[
-                                (qkv, &n1, &qkv_b, *cdim, hidden),
-                                (z, &n1, &z_b, nv * dv, hidden),
+                                (qkv, &qz_in, &qkv_b, *cdim, hidden),
+                                (z, &qz_in, &z_b, nv * dv, hidden),
                                 (a, &n1, &a_b, *nv, hidden),
                                 (b, &n1, &b_b, *nv, hidden),
                             ],
@@ -20518,7 +22244,11 @@ pub fn forward_token_graph(
                         } else {
                             go(&mut enc, &c.gdn_step, &bg_step, *nv as u32);
                         }
-                        emat(&mut enc, out, &gdo_b, &ob, hidden, nv * dv);
+                        let Some(out_in) = prism_input(&mut enc, &[out], &gdo_b, nv * dv) else {
+                            graph_decline("Prism GDN output transform unavailable");
+                            return token_graph_outcome(o1_started || state_started, false);
+                        };
+                        emat(&mut enc, out, &out_in, &ob, hidden, nv * dv);
                     }
                 }
                 (
@@ -20530,7 +22260,11 @@ pub fn forward_token_graph(
                     let taps_b = stor(bytemuck::cast_slice(*taps));
                     // GcP reused verbatim: cdim = hidden, kk = kernel.
                     let sc_u = uniform_u32x4(c, [hidden as u32, *kernel as u32, 0, 0]);
-                    emat(&mut enc, inp, &n1, &sc_bcx, 3 * hidden, hidden);
+                    let Some(inp_in) = prism_input(&mut enc, &[inp], &n1, hidden) else {
+                        graph_decline("Prism short-conv input transform unavailable");
+                        return token_graph_outcome(o1_started || state_started, false);
+                    };
+                    emat(&mut enc, inp, &inp_in, &sc_bcx, 3 * hidden, hidden);
                     let bg_sc = bgc(
                         33,
                         li,
@@ -20543,7 +22277,11 @@ pub fn forward_token_graph(
                         pass.set_bind_group(0, &bg_sc, &[]);
                         pass.dispatch_workgroups((hidden as u32).div_ceil(256), 1, 1);
                     }
-                    emat(&mut enc, out, &sc_y, &ob, hidden, hidden);
+                    let Some(out_in) = prism_input(&mut enc, &[out], &sc_y, hidden) else {
+                        graph_decline("Prism short-conv output transform unavailable");
+                        return token_graph_outcome(o1_started || state_started, false);
+                    };
+                    emat(&mut enc, out, &out_in, &ob, hidden, hidden);
                 }
                 _ => return token_graph_outcome(o1_started || state_started, false),
             }
@@ -20563,7 +22301,7 @@ pub fn forward_token_graph(
                     &c.layout_add_rmsnorm,
                     &[&h_buf, &ob, &pnw, &n1, &rms_u],
                 );
-                if passfuse {
+                if fuse_pre {
                     ffn_pre = Some((&c.add_rmsnorm, nbg, 1));
                 } else {
                     go(&mut enc, &c.add_rmsnorm, &nbg, 1);
@@ -20574,7 +22312,7 @@ pub fn forward_token_graph(
             // dispatch writes — the same within-pass ordering the block above
             // relies on. With both ends folded in, a layer is TWO passes
             // (token-mix, then FFN) instead of four.
-            let simple_tail = passfuse && !loop_norm_at.contains(&li);
+            let simple_tail = fuse_tail && !loop_norm_at.contains(&li);
             let mut ffn_post: Option<(&wgpu::ComputePipeline, wgpu::BindGroup, u32)> = None;
             let mut tail_done = false;
             if simple_tail {
@@ -20612,7 +22350,13 @@ pub fn forward_token_graph(
                     // between serialized dispatches, and this deletes one
                     // of the four per layer. Falls through to the split
                     // path whenever either side is not plain q4tp.
-                    if c.use_mv_dual && gate.kind == 2 && up.kind == 2 && hidden % 32 == 0 {
+                    if c.use_mv_dual
+                        && gate.kind == 2
+                        && up.kind == 2
+                        && gate.prism == crate::gpu::GraphPrismOp::None
+                        && up.prism == crate::gpu::GraphPrismOp::None
+                        && hidden % 32 == 0
+                    {
                         let gpr = hidden / 32;
                         let p_buf = uniform_u32x4(
                             c,
@@ -20690,10 +22434,31 @@ pub fn forward_token_graph(
                         // gate+up+SiLU in one dispatch when both are wide q4tp
                         // (`prep_gu`); else gate+up in one and SiLU separate
                         // (`prep2`); else the three-dispatch path.
+                        // A Prism FFN input consumes `n1` through a device FWHT.
+                        // Do not defer the residual+norm producer into the same
+                        // pass in that case: the FWHT would be encoded before
+                        // its producer and observe stale `n1` regardless of
+                        // storage visibility barriers.  Keep the fusion for
+                        // ordinary Q2TP, but make the Prism ordering explicit.
+                        if (gate.prism != crate::gpu::GraphPrismOp::None
+                            || up.prism != crate::gpu::GraphPrismOp::None)
+                            && let Some((p, b, w)) = ffn_pre.take()
+                        {
+                            go(&mut enc, p, &b, w);
+                        }
+                        let ffn_in = match prism_input(&mut enc, &[gate, up], &n1, hidden) {
+                            Some(x) => x,
+                            None => {
+                                graph_decline("Prism FFN input transform unavailable");
+                                return token_graph_outcome(o1_started || state_started, false);
+                            }
+                        };
                         let gu_ok = c.use_mv_gu
                             && c.use_mv4
                             && gate.kind == 6
                             && up.kind == 6
+                            && gate.prism == crate::gpu::GraphPrismOp::None
+                            && up.prism == crate::gpu::GraphPrismOp::None
                             && hidden % 32 == 0
                             && hidden / 32 > 64
                             && c.q4tp_mv16w_probe.is_none();
@@ -20707,21 +22472,25 @@ pub fn forward_token_graph(
                         let pgu = if pgu_fused.is_some() {
                             None
                         } else {
-                            prep2(gate, up, &n1, &gbuf, &ubuf, inter, inter, hidden)
-                        };
+                                prep2(gate, up, &ffn_in, &gbuf, &ubuf, inter, inter, hidden)
+                            };
                         let (pg, pu) = if pgu.is_some() || pgu_fused.is_some() {
                             (None, None)
                         } else {
                             (
-                                prep(gate, &n1, &gbuf, inter, hidden),
-                                prep(up, &n1, &ubuf, inter, hidden),
+                                prep(gate, &ffn_in, &gbuf, inter, hidden),
+                                prep(up, &ffn_in, &ubuf, inter, hidden),
                             )
                         };
-                        let pd = prep(down, &abuf, &ob, hidden, inter);
+                        let pd = if down.prism == crate::gpu::GraphPrismOp::None {
+                            prep(down, &abuf, &ob, hidden, inter)
+                        } else {
+                            None
+                        };
                         let mut down_rode_along = false;
                         if let Some((pf, bgf, wf)) = pgu_fused {
                             let mut pass = begin_pass(&mut enc);
-                            let fine = li < 32;
+                            let fine = ts_full || li < 32;
                             if let Some((p, b, w)) = &ffn_pre {
                                 pass.set_pipeline(p);
                                 pass.set_bind_group(0, b, &[]);
@@ -20754,7 +22523,7 @@ pub fn forward_token_graph(
                                 &[&gbuf, &ubuf, &dummy_hd, &abuf, &silu_u],
                             );
                             let mut pass = begin_pass(&mut enc);
-                            let fine = li < 32;
+                            let fine = ts_full || li < 32;
                             if let Some((p, b, w)) = &ffn_pre {
                                 pass.set_pipeline(p);
                                 pass.set_bind_group(0, b, &[]);
@@ -20791,7 +22560,7 @@ pub fn forward_token_graph(
                                 &[&gbuf, &ubuf, &dummy_hd, &abuf, &silu_u],
                             );
                             let mut pass = begin_pass(&mut enc);
-                            let fine = li < 32;
+                            let fine = ts_full || li < 32;
                             if let Some((p, b, w)) = &ffn_pre {
                                 pass.set_pipeline(p);
                                 pass.set_bind_group(0, b, &[]);
@@ -20834,8 +22603,8 @@ pub fn forward_token_graph(
                             group_mats(
                                 &mut enc,
                                 &[
-                                    (gate, &n1, &gbuf, inter, hidden),
-                                    (up, &n1, &ubuf, inter, hidden),
+                                    (gate, &ffn_in, &gbuf, inter, hidden),
+                                    (up, &ffn_in, &ubuf, inter, hidden),
                                 ],
                             );
                             go(
@@ -20851,7 +22620,13 @@ pub fn forward_token_graph(
                             );
                         }
                         if !down_rode_along {
-                            emat(&mut enc, down, &abuf, &ob, hidden, inter);
+                            let Some(down_in) =
+                                prism_input(&mut enc, &[down], &abuf, inter)
+                            else {
+                                graph_decline("Prism FFN down transform unavailable");
+                                return token_graph_outcome(o1_started || state_started, false);
+                            };
+                            emat(&mut enc, down, &down_in, &ob, hidden, inter);
                         }
                     } // !continue_ffn
                 }
@@ -21084,7 +22859,7 @@ pub fn forward_token_graph(
                                 pass.set_bind_group(0, b, &[]);
                                 pass.dispatch_workgroups(*w, 1, 1);
                             }
-                            let fine = li == 0;
+                        let fine = ts_full || li == 0;
                             tsp!(pass, fine, 30); // pass start (after prologue norm)
                             if !skip_router {
                                 pass.set_pipeline(prp);
@@ -21217,6 +22992,12 @@ pub fn forward_token_graph(
                     (hidden as u32).div_ceil(256),
                 );
             }
+            if token_tap_layer == Some(li) {
+                if let Some(tap) = token_tap_stage.as_ref() {
+                    flush_pass(&enc);
+                    enc.copy_buffer_to_buffer(&h_buf, 0, tap, 0, (hidden * 4) as u64);
+                }
+            }
         }
         // ── Multi-step tail: final norm + lm_head + on-device argmax; the
         // winner's embedding becomes the next step's h. All inside the SAME
@@ -21232,7 +23013,11 @@ pub fn forward_token_graph(
                 &bgc(0, 0, &c.layout_rmsnorm, &[&h_buf, &fnw, &n1, &rms_u]),
                 1,
             );
-            emat(&mut enc, lm, &n1, lbuf, lrows, hidden);
+            let Some(lm_in) = prism_input(&mut enc, &[&lm], &n1, hidden) else {
+                graph_decline("Prism lm_head transform unavailable");
+                return token_graph_outcome(o1_started || state_started, false);
+            };
+            emat(&mut enc, lm, &lm_in, lbuf, lrows, hidden);
             let am_u = uniform_u32x4(c, [lrows as u32, AM_PARTS, stp as u32, 0]);
             let l_ap = c.argmax_part.get_bind_group_layout(0);
             let bg_ap = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -21384,16 +23169,16 @@ pub fn forward_token_graph(
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             "g-logits",
         );
-        emat(&mut enc, &lm, &n1, &lbuf, lrows, hidden);
-        ts!(enc, 3, 0);
-        if let Some((qs, resolve, tstage)) = &c.ts_query {
-            if steps == 1 && ts_n > 0 {
-                flush_pass(&enc);
-                enc.resolve_query_set(qs, 0..ts_n, resolve, 0);
-                flush_pass(&enc);
-                enc.copy_buffer_to_buffer(resolve, 0, tstage, 0, ts_n as u64 * 8);
-            }
+        let Some(lm_in) = prism_input(&mut enc, &[&lm], &n1, hidden) else {
+            graph_decline("Prism lm_head transform unavailable");
+            return token_graph_outcome(o1_started || state_started, false);
+        };
+        emat(&mut enc, &lm, &lm_in, &lbuf, lrows, hidden);
+        if !device_span_probe {
+            ts!(enc, 3, 0);
         }
+        write_span_endpoint(&mut enc);
+        resolve_timestamps(&mut enc);
         logits.resize(lrows, 0.0);
         let hsize = if hidden_too { (hidden * 4) as u64 } else { 0 };
         let stage = GraphScratch::ensure(
@@ -21431,32 +23216,48 @@ pub fn forward_token_graph(
             wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             "g-stage",
         );
+        write_span_endpoint(&mut enc);
+        resolve_timestamps(&mut enc);
         let r = readback(c, enc, &h_buf, &stage, size, &mut h[..hidden]);
         drop(gs);
         r
     };
-    if ok && ts_n > 1 {
+    if ok && ts_n.get() > 1 {
         if let Some((_, _, tstage)) = &c.ts_query {
             let (tx, rx) = std::sync::mpsc::channel();
-            tstage.map_async(wgpu::MapMode::Read, ..(ts_n as u64 * 8), move |r| {
+            tstage.map_async(wgpu::MapMode::Read, ..(ts_n.get() as u64 * 8), move |r| {
                 let _ = tx.send(r);
             });
             let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
             if rx.recv().map(|r| r.is_ok()).unwrap_or(false) {
-                let raw = tstage.get_mapped_range(..(ts_n as u64 * 8)).unwrap();
+                let raw = tstage.get_mapped_range(..(ts_n.get() as u64 * 8)).unwrap();
                 let t: Vec<u64> = bytemuck::cast_slice::<u8, u64>(&raw).to_vec();
                 drop(raw);
-                // Attribute each delta to the LATER stamp's (stage, kind).
-                let mut agg = std::collections::BTreeMap::<(u8, u8), (f64, u32)>::new();
-                for i in 1..ts_n as usize {
-                    let dt = t[i].saturating_sub(t[i - 1]) as f64 * c.ts_period as f64 / 1000.0;
-                    let e = agg.entry(ts_lbl[i]).or_insert((0.0, 0));
-                    e.0 += dt;
-                    e.1 += 1;
-                }
-                let name = |k: (u8, u8)| match k {
-                    (1, 0) => "gdn-mix",
-                    (1, 1) => "attn-mix",
+                let labels = ts_lbl.borrow();
+                if device_span_probe {
+                    let us = t[1].saturating_sub(t[0]) as f64 * c.ts_period as f64 / 1000.0;
+                    let submits = SUBMITS
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .saturating_sub(span_submit_start);
+                    eprintln!(
+                        "gpu-device-span: preencoded={} span_ms={:.3} slots={} submits={} frames=one",
+                        preencode_frame,
+                        us / 1000.0,
+                        ts_n.get(),
+                        submits,
+                    );
+                } else {
+                    // Attribute each delta to the LATER stamp's (stage, kind).
+                    let mut agg = std::collections::BTreeMap::<(u8, u8), (f64, u32)>::new();
+                    for i in 1..ts_n.get() as usize {
+                        let dt = t[i].saturating_sub(t[i - 1]) as f64 * c.ts_period as f64 / 1000.0;
+                        let e = agg.entry(labels[i]).or_insert((0.0, 0));
+                        e.0 += dt;
+                        e.1 += 1;
+                    }
+                    let name = |k: (u8, u8)| match k {
+                    (1, 0) => "gdn-after-fwht-residual",
+                    (1, 1) => "attention-after-fwht-residual",
                     (2, 0) => "ffn@gdn",
                     (2, 1) => "ffn@attn",
                     (3, _) => "tail(norm+lm)",
@@ -21482,17 +23283,44 @@ pub fn forward_token_graph(
                     (43, _) => "|ffn:silu",
                     (44, _) => "|ffn:down",
                     (45, _) => "|ffn:tail",
+                    (50, _) => "|pre-fwht-span",
+                    (51, _) => "|fwht-dispatch-span",
                     _ => "start",
                 };
-                let mut line = String::from("gpu-ts:");
-                let total: f64 = agg.values().map(|v| v.0).sum();
-                for (k, (us, n)) in &agg {
-                    line.push_str(&format!(" {}={:.0}us/{}", name(*k), us, n));
+                    let mut line = String::from("gpu-ts: timeline spans (later-stamp attribution):");
+                    let total: f64 = agg.values().map(|v| v.0).sum();
+                    for (k, (us, n)) in &agg {
+                        line.push_str(&format!(" {}={:.0}us/{}", name(*k), us, n));
+                    }
+                    line.push_str(&format!(" | timeline_span {:.2} ms | slots {}", total / 1000.0, ts_n.get()));
+                    eprintln!("{line}");
                 }
-                line.push_str(&format!(" | total {:.2} ms", total / 1000.0));
-                eprintln!("{line}");
             }
             tstage.unmap();
+        }
+    }
+    if ok {
+        if let Some(tap) = token_tap_stage.as_ref() {
+            let bytes = (hidden * 4) as u64;
+            let (tx, rx) = std::sync::mpsc::channel();
+            tap.slice(..bytes).map_async(wgpu::MapMode::Read, move |r| {
+                let _ = tx.send(r);
+            });
+            let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+            if rx.recv().map(|r| r.is_ok()).unwrap_or(false) {
+                if let Ok(raw) = tap.get_mapped_range(..bytes) {
+                    let vals: &[f32] = bytemuck::cast_slice(&raw);
+                    let norm = vals.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>().sqrt();
+                    eprintln!(
+                        "token-tap layer={} row0={:?} norm={:.9e}",
+                        token_tap_layer.unwrap_or(usize::MAX),
+                        &vals[..hidden.min(4)],
+                        norm
+                    );
+                    drop(raw);
+                }
+            }
+            tap.unmap();
         }
     }
     if ok {
@@ -21547,7 +23375,7 @@ pub fn forward_token_graph(
     if prof {
         let setup = t_enc0.duration_since(t_start).as_secs_f64() * 1000.0;
         eprintln!(
-            "token-graph: setup {setup:.2} ms | encode {t_enc:.2} ms | submit+readback {:.2} ms",
+            "token-graph: setup {setup:.2} ms | encode {t_enc:.2} ms | tail+submit+readback {:.2} ms",
             t_sub0.elapsed().as_secs_f64() * 1000.0
         );
     }
@@ -21606,6 +23434,12 @@ pub fn forward_batch_graph(
         bgraph_refused("no ctx");
         return batch_outcome(o1_started || state_started, false);
     };
+    // This is the true entry for the resident batch graph.  The token graph
+    // has its own reset, but a batch call normally follows a completed
+    // readback without passing through that path.  Reset before resolving
+    // weights or encoding any timestamped pass so kernel totals belong only
+    // to this batch (and never replay the previous first-use window).
+    batch_kernel_ts_begin(c);
     let graph_live_budget = graph_live_weight_budget(c, model);
     if k == 0 || positions.len() != k {
         bgraph_refused("k/positions mismatch");
@@ -21654,6 +23488,8 @@ pub fn forward_batch_graph(
         buf: wgpu::Buffer,
         rs: Option<wgpu::Buffer>,
         kind: u8,
+        prism: crate::gpu::GraphPrismOp,
+        affine: bool,
     }
     enum LAttn {
         Full {
@@ -21733,6 +23569,8 @@ pub fn forward_batch_graph(
                     buf: b,
                     rs: Some(rsb),
                     kind: 0,
+                    prism: gw.prism,
+                    affine: gw.affine,
                 })
             }
             1 => {
@@ -21744,6 +23582,8 @@ pub fn forward_batch_graph(
                     buf: b,
                     rs: None,
                     kind: 1,
+                    prism: gw.prism,
+                    affine: gw.affine,
                 })
             }
             4 => {
@@ -21762,6 +23602,8 @@ pub fn forward_batch_graph(
                     buf: b,
                     rs: None,
                     kind: 4,
+                    prism: gw.prism,
+                    affine: gw.affine,
                 })
             }
             // q4_tiled and q4tp: same buffer shape, the kernel differs.
@@ -21777,6 +23619,8 @@ pub fn forward_batch_graph(
                     buf: b,
                     rs: None,
                     kind: k,
+                    prism: gw.prism,
+                    affine: gw.affine,
                 })
             }
             _ => None, // q1t not batched here → CPU/per-position path
@@ -22167,7 +24011,112 @@ pub fn forward_batch_graph(
     let h_buf = rwc(k * hidden);
     c.queue
         .write_buffer(&h_buf, 0, bytemuck::cast_slice(&h[..k * hidden]));
+    // Narrow, opt-in parity tap for the batch-vs-token bring-up.  It copies
+    // the post-residual hidden of one layer without changing the normal
+    // graph or readback contract; the result is printed only after the final
+    // submit has completed.  Keep this diagnostic off the hot path.
+    let tap_layer = std::env::var("CMF_GRAPH_TAP_LAYER")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&li| li < layers.len());
+    let tap_stage = tap_layer.map(|_| c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("batch-graph-tap"),
+        size: (k * hidden * 4) as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    }));
     let n1 = rwc(k * hidden);
+    // The token graph's Prism transform is one 1024-block per activation
+    // row.  Reuse that shader for the batched graph by carrying an explicit
+    // row count in FwhtP; the sign table remains one validated vector per
+    // supported width, not k duplicated copies.
+    let prism_signs = model
+        .header
+        .arch
+        .prism_hadamard
+        .as_ref()
+        .map(|cfg| stor(bytemuck::cast_slice(&cfg.signs)));
+    let prism_sign_offset = |width: usize| -> Option<usize> {
+        let cfg = model.header.arch.prism_hadamard.as_ref()?;
+        let mut off = 0usize;
+        for &w in &cfg.widths {
+            if w == width {
+                return Some(off);
+            }
+            off = off.checked_add(w)?;
+        }
+        None
+    };
+    let prism_round16 = model
+        .header
+        .arch
+        .prism_hadamard
+        .as_ref()
+        .is_some_and(|cfg| cfg.activation_f16);
+    let prism_rot_width = hidden.max(inter).max(nh * hd).max(nkv * hd);
+    let prism_rot = rwc(k * prism_rot_width);
+    let prism_input_b =
+        |enc: &mut wgpu::CommandEncoder,
+         mats: &[&GMat],
+         src: &wgpu::Buffer,
+         width: usize|
+         -> Option<wgpu::Buffer> {
+            let mut op = crate::gpu::GraphPrismOp::None;
+            for m in mats {
+                if m.prism != crate::gpu::GraphPrismOp::None {
+                    if op != crate::gpu::GraphPrismOp::None && op != m.prism {
+                        return None;
+                    }
+                    op = m.prism;
+                }
+            }
+            if op == crate::gpu::GraphPrismOp::None {
+                return Some(src.clone());
+            }
+            if op != crate::gpu::GraphPrismOp::Forward
+                || width == 0
+                || width > prism_rot_width
+                || k == 0
+            {
+                return None;
+            }
+            let cfg = model.header.arch.prism_hadamard.as_ref()?;
+            let block = cfg.block_size;
+            let sign_offset = prism_sign_offset(width)?;
+            let signs = prism_signs.as_ref()?;
+            if block != 1024 || width % block != 0 {
+                return None;
+            }
+            let pipe = c.fwht.as_ref()?;
+            let p = unif(&[
+                width as u32,
+                block as u32,
+                sign_offset as u32,
+                0,
+                u32::from(prism_round16),
+                k as u32,
+                0,
+                0,
+            ]);
+            let layout = pipe.get_bind_group_layout(0);
+            let bg = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("prism-fwht-batch"),
+                layout: &layout,
+                entries: &[
+                    bind_buf(0, src),
+                    bind_buf(1, &prism_rot),
+                    bind_buf(2, signs),
+                    bind_buf(3, &p),
+                ],
+            });
+            let active_bytes = (k * width * std::mem::size_of::<f32>() * 2) as u64;
+            let tsw = batch_kernel_ts_pair(c, 1, active_bytes);
+            let mut pass = begin_pass_with(enc, Some("prism-fwht-batch"), tsw);
+            pass.set_pipeline(pipe);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups((k * width / block) as u32, 1, 1);
+            Some(prism_rot.clone())
+        };
     let any_gate = layers.iter().any(|l| {
         matches!(
             &l.attn,
@@ -22362,8 +24311,58 @@ pub fn forward_batch_graph(
             0 => encode_q8_mm(c, enc, &m.buf, m.rs.as_ref().unwrap(), xs, y, rows, cols, k),
             5 => encode_q4_tile_mm(c, enc, &c.q4t_mm, &m.buf, xs, y, rows, cols, k),
             // The 2-bit plane: the tile GEMM handles any k (the MoE prefill's
-            // kernel); a batched q2 matvec for small k is not written yet.
-            9 => encode_q4_tile_mm(c, enc, &c.q2tp_mm, &m.buf, xs, y, rows, cols, k),
+            // kernel).  Its fourth uniform word is the descriptor-aware
+            // center bit, not the q4 cooperative activation scale: affine
+            // q2tp must stay `(code-1)·s` on the batched path just as it is
+            // on the resident single-token matvec.  Passing the generic
+            // q4 helper here used zero for every source and silently applied
+            // the ordinary `(code-1.5)·s` center.
+            9 => {
+                // The coop arm is only for a validated Prism forward
+                // activation_f16 boundary.  Ordinary Q2TP and non-Prism
+                // affine-looking descriptors remain on the scalar decoder.
+                let use_q2_coop = m.affine
+                    && m.prism == crate::gpu::GraphPrismOp::Forward
+                    && prism_round16
+                    && c.q2tp_mm_coop.is_some()
+                    && k >= 16
+                    && cols % 32 == 0;
+                encode_q2_tile_mm(
+                    c,
+                    enc,
+                    &m.buf,
+                    xs,
+                    y,
+                    rows,
+                    cols,
+                    k,
+                    m.affine,
+                    use_q2_coop,
+                );
+            }
+            6 if std::env::var("CMF_BATCH_Q4_SCALAR").is_ok_and(|v| v != "0") => {
+                // Diagnostic parity arm for q4tp: use the established
+                // one-row matvec over offset slices, keeping batch state and
+                // attention unchanged while isolating tiled-GEMM behavior.
+                let p_buf = uniform_u32x4(c, [(cols / 32) as u32, rows as u32, cols as u32, 0]);
+                let layout = c.q4tp_mv.get_bind_group_layout(0);
+                for i in 0..k {
+                    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("batch-q4-scalar"),
+                        layout: &layout,
+                        entries: &[
+                            bind_buf(0, &m.buf),
+                            bind_buf_off(1, xs, (i * cols * 4) as u64, (cols * 4) as u64),
+                            bind_buf_off(2, y, (i * rows * 4) as u64, (rows * 4) as u64),
+                            bind_buf(3, &p_buf),
+                        ],
+                    });
+                    let mut pass = begin_pass(enc);
+                    pass.set_pipeline(&c.q4tp_mv);
+                    pass.set_bind_group(0, &bind, &[]);
+                    pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
+                }
+            }
             6 => {
                 // The 64-wide GEMM tile wastes a small batch (a k=3 verify
                 // keeps 3 rows of 64 busy). The batched matvec kernel
@@ -22538,10 +24537,35 @@ pub fn forward_batch_graph(
                 pass.set_bind_group(0, &bind, &[]);
                 pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
             }
+            9 if std::env::var("CMF_BATCH_Q2_SCALAR").is_ok_and(|v| v != "0") => {
+                // Diagnostic/correctness arm: run the established single-row
+                // q2tp kernel over offset slices.  It preserves the same
+                // descriptor center and activation layout while isolating a
+                // possible tiled-GEMM mismatch from the recurrent graph.
+                let gpr = cols / 32;
+                let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, 1, m.affine as u32]);
+                let layout = q2tp_pipeline(c).get_bind_group_layout(0);
+                for i in 0..k {
+                    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("batch-q2-scalar"),
+                        layout: &layout,
+                        entries: &[
+                            bind_buf(0, &m.buf),
+                            bind_buf_off(2, y, (i * rows * 4) as u64, (rows * 4) as u64),
+                            bind_buf(3, &p_buf),
+                            bind_buf_off(5, xs, (i * cols * 4) as u64, (cols * 4) as u64),
+                        ],
+                    });
+                    let mut pass = begin_pass(enc);
+                    pass.set_pipeline(q2tp_pipeline(c));
+                    pass.set_bind_group(0, &bind, &[]);
+                    pass.dispatch_workgroups(mv_grid((rows as u32).div_ceil(16)), 1, 1);
+                }
+            }
             9 => {
                 let gpr = cols / 32;
-                let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, 1, 0]);
-                let layout = c.q2tp_mv16w.get_bind_group_layout(0);
+                let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, 1, m.affine as u32]);
+                let layout = q2tp_pipeline(c).get_bind_group_layout(0);
                 let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: None,
                     layout: &layout,
@@ -22553,7 +24577,7 @@ pub fn forward_batch_graph(
                     ],
                 });
                 let mut pass = begin_pass(enc);
-                pass.set_pipeline(&c.q2tp_mv16w);
+                pass.set_pipeline(q2tp_pipeline(c));
                 pass.set_bind_group(0, &bind, &[]);
                 pass.dispatch_workgroups(mv_grid((rows as u32).div_ceil(16)), 1, 1);
             }
@@ -22634,7 +24658,12 @@ pub fn forward_batch_graph(
             if bts_on {
                 if let Some((qs, _, _)) = c.ts_query.as_ref() {
                     let n = bts_lbl.len() as u32;
-                    if n < 250 {
+                    let cap = if std::env::var("CMF_BATCH_KERNEL_TS").as_deref() == Ok("1") {
+                        1024
+                    } else {
+                        250
+                    };
+                    if n < cap {
                         flush_pass(&$enc);
                         $enc.write_timestamp(qs, n);
                         bts_lbl.push($lbl);
@@ -22681,12 +24710,16 @@ pub fn forward_batch_graph(
                 let qnw = stor(bytemuck::cast_slice(q_norm.unwrap_or(&vec![0f32; hd])));
                 let knw = stor(bytemuck::cast_slice(k_norm.unwrap_or(&vec![0f32; hd])));
                 let qrows = nh * hd * (1 + *output_gate as usize);
-                ematb(&mut enc, wq, &n1, &qraw_b, qrows, hidden);
+                let Some(n1_p) = prism_input_b(&mut enc, &[wq, wk, wv], &n1, hidden) else {
+                    bgraph_refused("Prism transform unavailable for batched attention input");
+                    return batch_outcome(o1_started || state_started, false);
+                };
+                ematb(&mut enc, wq, &n1_p, &qraw_b, qrows, hidden);
                 ematb2(
                     &mut enc,
                     wk,
                     wv,
-                    &n1,
+                    &n1_p,
                     &kb_b,
                     &vb_b,
                     nkv * hd,
@@ -22981,7 +25014,11 @@ pub fn forward_batch_graph(
                         );
                     }
                 }
-                ematb(&mut enc, wo, &attn_bb, &ob, hidden, nh * hd);
+                let Some(attn_p) = prism_input_b(&mut enc, &[wo], &attn_bb, nh * hd) else {
+                    bgraph_refused("Prism transform unavailable for batched output projection");
+                    return batch_outcome(o1_started || state_started, false);
+                };
+                ematb(&mut enc, wo, &attn_p, &ob, hidden, nh * hd);
                 bts!(enc, 1);
             }
             (
@@ -23050,7 +25087,28 @@ pub fn forward_batch_graph(
                 let dtb = stor(bytemuck::cast_slice(dt_bias));
                 let gnorm = stor(bytemuck::cast_slice(norm));
                 bts!(enc, 6);
-                ematb2(&mut enc, qkv, z, &n1, &qkv_b, &z_b, *cdim, nv * dv, hidden);
+                if a.prism != crate::gpu::GraphPrismOp::None
+                    || b.prism != crate::gpu::GraphPrismOp::None
+                    || a.affine
+                    || b.affine
+                {
+                    // This specialized F32 auxiliary lane has no transform
+                    // slot.  Refuse a descriptor that would otherwise make
+                    // the original normalized-input binding ambiguous.
+                    bgraph_refused("batched GDN a/b carries unsupported transform");
+                    return batch_outcome(o1_started || state_started, false);
+                }
+                // Prism rotates only the wide learned projections.  The
+                // GDN a/b auxiliaries are plain f32 vectors in source space;
+                // unlike qkv/z they must consume the original RMS-normalized
+                // input, not the FWHT/F16 view used by the tiled projections.
+                // Keeping them in this transform group silently changed the
+                // recurrent decay/update coefficients for every batch row.
+                let Some(n1_p) = prism_input_b(&mut enc, &[qkv, z], &n1, hidden) else {
+                    bgraph_refused("Prism transform unavailable for batched GDN input");
+                    return batch_outcome(o1_started || state_started, false);
+                };
+                ematb2(&mut enc, qkv, z, &n1_p, &qkv_b, &z_b, *cdim, nv * dv, hidden);
                 let _gc_p = unif(&[*cdim as u32, *kk as u32, 0, 0]);
                 let _gd_p = unif(&[
                     *nv as u32,
@@ -23074,6 +25132,9 @@ pub fn forward_batch_graph(
                     let mut pass = begin_pass(&mut enc);
                     for (w, y) in [(&a.buf, &a_bb), (&b.buf, &b_bb)] {
                         pass.set_pipeline(&c.f32_matvec_b);
+                        // a/b are untransformed auxiliary projections.  They
+                        // intentionally use the original normalized input,
+                        // matching the token graph's GDN path.
                         pass.set_bind_group(0, &bg(&c.layout_f32b, &[w, &n1, y, &fb_u]), &[]);
                         pass.dispatch_workgroups((*nv as u32).min(MAX_WG), k as u32, 1);
                     }
@@ -23141,54 +25202,160 @@ pub fn forward_batch_graph(
                         &[],
                     );
                     pass.dispatch_workgroups((*cdim as u32).div_ceil(256), 1, 1);
-                    pass.set_pipeline(&c.gdn_step_par_k);
-                    pass.set_bind_group(
-                        0,
-                        &{
-                            let l = c.gdn_step_par_k.get_bind_group_layout(0);
-                            // The auto layout keeps only what the entry
-                            // point touches: no z, no norm weight here.
-                            c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    // Keep the proven scalar k-loop available as an explicit
+                    // correctness arm.  The vec4 parallel kernel is useful
+                    // only after its state layout has been independently
+                    // matched; CMF_BATCH_GDN_SAFE=1 intentionally exercises
+                    // the same reduction/order as the token graph and does
+                    // not silently trade a wrong recurrent state for speed.
+                    let token_gdn = std::env::var("CMF_BATCH_GDN_TOKEN")
+                        .map(|v| v != "0")
+                        .unwrap_or(false)
+                        && snap.is_none();
+                    let safe_gdn = std::env::var("CMF_BATCH_GDN_SAFE")
+                        .map(|v| v != "0")
+                        .unwrap_or(false)
+                        && snap.is_none();
+                    let needs_norm_k;
+                    if token_gdn {
+                        // Exact token-kernel A/B: keep the batched
+                        // projections/conv, but run the already validated
+                        // per-position GDN step and norm over offset views.
+                        // This isolates the k-looped vec4 recurrence without
+                        // changing state ownership or the batch handoff.
+                        for i in 0..k {
+                            let gd_pi = unif(&[
+                                *nv as u32,
+                                *dk as u32,
+                                *dv as u32,
+                                (nk * dk) as u32,
+                                (nv / nk) as u32,
+                                *cdim as u32,
+                                eps.to_bits(),
+                                i as u32,
+                            ]);
+                            let bg_i = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                                 label: None,
-                                layout: &l,
+                                layout: &c.gdn_step_par.get_bind_group_layout(0),
                                 entries: &[
-                                    bind_buf(0, &cq_s),
+                                    bind_buf_off(0, &cq_s, (i * gcdim * 4) as u64, (gcdim * 4) as u64),
                                     bind_buf(2, &a_bb),
                                     bind_buf(3, &b_bb),
                                     bind_buf(4, &alog),
                                     bind_buf(5, &dtb),
                                     bind_buf(7, s),
                                     bind_buf(8, &gdo_b),
-                                    bind_buf(9, &gd_pt),
-                                    bind_buf(10, &snap_buf),
+                                    bind_buf(9, &gd_pi),
                                 ],
-                            })
-                        },
-                        &[],
-                    );
-                    pass.dispatch_workgroups(*nv as u32, (*dv as u32).div_ceil(4), 1);
-                    pass.set_pipeline(&c.gdn_step_norm_k);
-                    pass.set_bind_group(
-                        0,
-                        &{
-                            let l = c.gdn_step_norm_k.get_bind_group_layout(0);
-                            c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            });
+                            pass.set_pipeline(&c.gdn_step_par);
+                            pass.set_bind_group(0, &bg_i, &[]);
+                            pass.dispatch_workgroups(*nv as u32, (*dv as u32).div_ceil(4), 1);
+                            let bn_i = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                                 label: None,
-                                layout: &l,
+                                layout: &c.gdn_step_norm.get_bind_group_layout(0),
                                 entries: &[
                                     bind_buf(1, &z_b),
                                     bind_buf(6, &gnorm),
                                     bind_buf(8, &gdo_b),
-                                    bind_buf(9, &gd_pt),
+                                    bind_buf(9, &gd_pi),
                                 ],
-                            })
-                        },
-                        &[],
-                    );
-                    pass.dispatch_workgroups(*nv as u32, 1, 1);
+                            });
+                            pass.set_pipeline(&c.gdn_step_norm);
+                            pass.set_bind_group(0, &bn_i, &[]);
+                            pass.dispatch_workgroups(*nv as u32, 1, 1);
+                        }
+                        // gdn_step_par + gdn_step_norm already emits the
+                        // gated/normalized output for every row.
+                        needs_norm_k = false;
+                    } else if safe_gdn {
+                        pass.set_pipeline(&c.gdn_step_k);
+                        pass.set_bind_group(
+                            0,
+                            &{
+                                let l = c.gdn_step_k.get_bind_group_layout(0);
+                                c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                    label: None,
+                                    layout: &l,
+                                    entries: &[
+                                        bind_buf(0, &cq_s),
+                                        bind_buf(1, &z_b),
+                                        bind_buf(2, &a_bb),
+                                        bind_buf(3, &b_bb),
+                                        bind_buf(4, &alog),
+                                        bind_buf(5, &dtb),
+                                        bind_buf(6, &gnorm),
+                                        bind_buf(7, s),
+                                        bind_buf(8, &gdo_b),
+                                        bind_buf(9, &gd_pt),
+                                        bind_buf(10, &snap_buf),
+                                    ],
+                                })
+                            },
+                            &[],
+                        );
+                        pass.dispatch_workgroups(*nv as u32, 1, 1);
+                        // gdn_step_k includes the gated RMS normalization.
+                        needs_norm_k = false;
+                    } else {
+                        pass.set_pipeline(&c.gdn_step_par_k);
+                        pass.set_bind_group(
+                            0,
+                            &{
+                                let l = c.gdn_step_par_k.get_bind_group_layout(0);
+                                // The auto layout keeps only what the entry
+                                // point touches: no z, no norm weight here.
+                                c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                    label: None,
+                                    layout: &l,
+                                    entries: &[
+                                        bind_buf(0, &cq_s),
+                                        bind_buf(2, &a_bb),
+                                        bind_buf(3, &b_bb),
+                                        bind_buf(4, &alog),
+                                        bind_buf(5, &dtb),
+                                        bind_buf(7, s),
+                                        bind_buf(8, &gdo_b),
+                                        bind_buf(9, &gd_pt),
+                                        bind_buf(10, &snap_buf),
+                                    ],
+                                })
+                            },
+                            &[],
+                        );
+                        pass.dispatch_workgroups(*nv as u32, (*dv as u32).div_ceil(4), 1);
+                        // The parallel raw step leaves normalization to its
+                        // separate k-wide pass below.
+                        needs_norm_k = true;
+                    }
+                    if needs_norm_k {
+                        pass.set_pipeline(&c.gdn_step_norm_k);
+                        pass.set_bind_group(
+                            0,
+                            &{
+                                let l = c.gdn_step_norm_k.get_bind_group_layout(0);
+                                c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                    label: None,
+                                    layout: &l,
+                                    entries: &[
+                                        bind_buf(1, &z_b),
+                                        bind_buf(6, &gnorm),
+                                        bind_buf(8, &gdo_b),
+                                        bind_buf(9, &gd_pt),
+                                    ],
+                                })
+                            },
+                            &[],
+                        );
+                        pass.dispatch_workgroups(*nv as u32, 1, 1);
+                    }
                 }
                 bts!(enc, 5);
-                ematb(&mut enc, out, &gdo_b, &ob, hidden, nv * dv);
+                let Some(gdo_p) = prism_input_b(&mut enc, &[out], &gdo_b, nv * dv) else {
+                    bgraph_refused("Prism transform unavailable for batched GDN output");
+                    return batch_outcome(o1_started || state_started, false);
+                };
+                ematb(&mut enc, out, &gdo_p, &ob, hidden, nv * dv);
                 bts!(enc, 2);
             }
             _ => return batch_outcome(o1_started || state_started, false),
@@ -23207,14 +25374,22 @@ pub fn forward_batch_graph(
                 width,
             } => {
                 let inter = *width; // this layer's, not the model's
-                ematb2(&mut enc, gate, up, &n1, &gbuf, &ubuf, inter, inter, hidden);
+                let Some(n1_p) = prism_input_b(&mut enc, &[gate, up], &n1, hidden) else {
+                    bgraph_refused("Prism transform unavailable for batched FFN input");
+                    return batch_outcome(o1_started || state_started, false);
+                };
+                ematb2(&mut enc, gate, up, &n1_p, &gbuf, &ubuf, inter, inter, hidden);
                 go(
                     &mut enc,
                     &c.silu,
                     &bg(&c.layout_silu, &[&gbuf, &ubuf, &dummy_hd, &abuf, &silu_u]),
                     ((k * inter) as u32).div_ceil(256),
                 );
-                ematb(&mut enc, down, &abuf, &ob, hidden, inter);
+                let Some(abuf_p) = prism_input_b(&mut enc, &[down], &abuf, inter) else {
+                    bgraph_refused("Prism transform unavailable for batched FFN output");
+                    return batch_outcome(o1_started || state_started, false);
+                };
+                ematb(&mut enc, down, &abuf_p, &ob, hidden, inter);
             }
             // Routing is per token, so the experts run token by token —
             // but inside THIS submit, next to the batched attention and
@@ -23421,6 +25596,12 @@ pub fn forward_batch_graph(
             );
         }
         bts!(enc, 4);
+        if tap_layer == Some(li) {
+            if let Some(tap) = tap_stage.as_ref() {
+                flush_pass(&enc);
+                enc.copy_buffer_to_buffer(&h_buf, 0, tap, 0, (k * hidden * 4) as u64);
+            }
+        }
     }
     let size = (k * hidden * 4) as u64;
     let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
@@ -23459,8 +25640,13 @@ pub fn forward_batch_graph(
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        ematb(&mut enc, &lm, &n1b, &lbuf, sp.lm_rows, hidden);
+        let Some(n1b_p) = prism_input_b(&mut enc, &[&lm], &n1b, hidden) else {
+            bgraph_refused("Prism transform unavailable for batched lm_head");
+            return batch_outcome(o1_started || state_started, false);
+        };
+        ematb(&mut enc, &lm, &n1b_p, &lbuf, sp.lm_rows, hidden);
         bts!(enc, 5);
+        batch_kernel_ts_resolve(c, &mut enc);
         if bts_on && bts_lbl.len() > 1 {
             if let Some((qs, resolve, tstage)) = c.ts_query.as_ref() {
                 flush_pass(&enc);
@@ -23477,6 +25663,7 @@ pub fn forward_batch_graph(
             (&lbuf, &mut sp.logits_out[..]),
         )
     } else {
+        batch_kernel_ts_resolve(c, &mut enc);
         if bts_on && bts_lbl.len() > 1 {
             if let Some((qs, resolve, tstage)) = c.ts_query.as_ref() {
                 flush_pass(&enc);
@@ -23494,6 +25681,34 @@ pub fn forward_batch_graph(
             t_bfn.elapsed().as_secs_f64() * 1e3 - post,
             post,
         );
+    }
+    if ok {
+        if let Some(tap) = tap_stage.as_ref() {
+            let bytes = (k * hidden * 4) as u64;
+            let (tx, rx) = std::sync::mpsc::channel();
+            tap.slice(..bytes).map_async(wgpu::MapMode::Read, move |r| {
+                let _ = tx.send(r);
+            });
+            let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+            if rx.recv().map(|r| r.is_ok()).unwrap_or(false) {
+                if let Ok(raw) = tap.get_mapped_range(..bytes) {
+                    let vals: &[f32] = bytemuck::cast_slice(&raw);
+                    let last = &vals[(k - 1) * hidden..k * hidden];
+                    let mut norm = 0.0f64;
+                    for &v in last { norm += (v as f64) * (v as f64); }
+                    eprintln!(
+                        "batch-tap layer={} rows={} row0={:?} rowlast={:?} normlast={:.9e}",
+                        tap_layer.unwrap_or(usize::MAX),
+                        k,
+                        &vals[..hidden.min(4)],
+                        &vals[(k - 1) * hidden..(k - 1) * hidden + hidden.min(4)],
+                        norm.sqrt()
+                    );
+                    drop(raw);
+                }
+            }
+            tap.unmap();
+        }
     }
     if ok && bts_on && bts_lbl.len() > 1 {
         if let Some((_, _, tstage)) = c.ts_query.as_ref() {
@@ -23528,6 +25743,9 @@ pub fn forward_batch_graph(
             }
             tstage.unmap();
         }
+    }
+    if ok {
+        batch_kernel_ts_report(c, k);
     }
     if ok {
         let mut kvm = c.attn_kv.lock().unwrap();
@@ -25364,6 +27582,172 @@ pub fn q2tp_matmat(
     tp_matmat(model, idx, xs, b, rows, cols, out, true)
 }
 
+/// Batched q2tp GEMM with the explicit descriptor center correction.
+pub fn q2tp_affine_matmat(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    if !crate::prism::is_affine_target(model, &model.tensors[idx].name) {
+        return false;
+    }
+    tp_matmat(model, idx, xs, b, rows, cols, out, true)
+}
+
+/// Single-token q2tp matvec through the descriptor-aware WGSL kernel. The
+/// payload is the ordinary dtype16 plane in both modes; `affine` only selects
+/// the explicit center correction required by the model descriptor.
+pub fn q2tp_matvec(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    q2tp_matvec_impl(model, idx, xs, rows, cols, out, false)
+}
+
+/// The q2tp_affine twin of [`q2tp_matvec`]. It refuses a tensor that is not
+/// explicitly listed by the affine descriptor, so a caller cannot
+/// accidentally apply the center shift to an ordinary q2tp payload.
+pub fn q2tp_affine_matvec(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    q2tp_matvec_impl(model, idx, xs, rows, cols, out, true)
+}
+
+fn q2tp_matvec_impl(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+    affine: bool,
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if cols % 32 != 0 || rows == 0 || xs.len() < cols || out.len() < rows {
+        return false;
+    }
+    let entry = &model.tensors[idx];
+    if entry.dtype != cortiq_core::TensorDtype::Q2TiledP
+        || entry.shape.first().copied().unwrap_or(0) < rows
+        || affine != crate::prism::is_affine_target(model, &entry.name)
+    {
+        return false;
+    }
+    let Some(abs) = model.entry_abs_offset(entry) else {
+        return false;
+    };
+    let bytes = model.primary_bytes();
+    let plen = entry.nbytes as usize;
+    let Some(need) =
+        cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q2TiledP, &[rows, cols])
+    else {
+        return false;
+    };
+    if plen < need || abs + plen > bytes.len() {
+        return false;
+    }
+    if std::env::var("CMF_Q2TP_TRACE").as_deref() == Ok("1") {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        if n < 512 {
+            eprintln!(
+                "q2tp-gpu matvec #{n} name={} shape={}x{} affine={affine}",
+                entry.name, rows, cols
+            );
+        }
+    }
+    let Some(q_buf) = weight_buffer_l(
+        c,
+        (model.uid() as usize, idx),
+        &bytes[abs..abs + plen],
+        layer_of_name(&entry.name),
+    ) else {
+        return false;
+    };
+    // The ladder cache is a run-owned component experiment. It is built
+    // only for the explicit affine target and only when both optional
+    // pipelines were admitted; every failure falls back to the validated
+    // row-local shader below.
+    let ladder_cache = if affine
+        && std::env::var("CMF_Q2_LADDER_CACHE").as_deref() == Ok("1")
+    {
+        ensure_q2_ladder_cache(c, model, idx, rows, cols)
+    } else {
+        None
+    };
+    let mut sc = c.scratch.lock().unwrap();
+    let xs_buf = Scratch::ensure(
+        &c.device,
+        &mut sc.xs,
+        (cols * 4) as u64,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        "q2tp-xs",
+    );
+    c.queue
+        .write_buffer(&xs_buf, 0, bytemuck::cast_slice(&xs[..cols]));
+    let y_buf = Scratch::ensure(
+        &c.device,
+        &mut sc.y,
+        (rows * 4) as u64,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        "q2tp-y",
+    );
+    let stage_buf = Scratch::ensure(
+        &c.device,
+        &mut sc.stage,
+        (rows * 4) as u64,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "q2tp-stage",
+    );
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("q2tp-mv"),
+        });
+    if let Some((ladders, row_ids, row_id_base)) = ladder_cache {
+        encode_q2tp_ladder_cache(
+            c,
+            &mut enc,
+            &q_buf,
+            &xs_buf,
+            &y_buf,
+            &ladders,
+            &row_ids,
+            row_id_base,
+            rows,
+            cols,
+            affine,
+        );
+    } else if q2tp_dp4a_on() && affine {
+        encode_q2tp_mv1_i8(c, &mut enc, &q_buf, &xs_buf, &y_buf, rows, cols);
+    } else {
+        encode_q2tp_mv16w(c, &mut enc, &q_buf, &xs_buf, &y_buf, rows, cols, affine);
+    }
+    let ok = readback(
+        c,
+        enc,
+        &y_buf,
+        &stage_buf,
+        (rows * 4) as u64,
+        &mut out[..rows],
+    );
+    ok
+}
+
 /// `q4tp` and `q2tp` differ in their weight plane and their ladder, and
 /// in nothing this function does: same buffers, same bind group, same
 /// dispatch. Only the pipeline and the expected byte count follow the
@@ -25744,7 +28128,12 @@ fn tp_matmat_impl(
     // tensor in another codec it would read int8 as tiles and return plausible
     // garbage — which is how an eight-bit VAE decoded to a flat grey frame for
     // an hour this afternoon. Refusing sends the caller to a path that can.
-    if entry.dtype != cortiq_core::TensorDtype::Q4TiledP {
+    let expected_dtype = if two_bit {
+        cortiq_core::TensorDtype::Q2TiledP
+    } else {
+        cortiq_core::TensorDtype::Q4TiledP
+    };
+    if entry.dtype != expected_dtype {
         return None;
     }
     if entry.shape.first().copied().unwrap_or(0) < rows {
@@ -25868,6 +28257,12 @@ fn tp_matmat_impl(
         0.0
     };
     let mut params = [(cols / 4) as u32, rows as u32, b as u32, ascale.to_bits()];
+    // The q2tp MM shader shares this fourth word with q4tp's activation
+    // scale. For q2tp it is instead a validated descriptor bit selecting
+    // `(c-1)·s`; ordinary q2tp remains the raw `(c-1.5)·s` decode.
+    if two_bit && crate::prism::is_affine_target(model, &entry.name) {
+        params[3] = 1;
+    }
     let stage_buf = Scratch::ensure(
         &c.device,
         &mut sc.stage,
@@ -28698,6 +31093,49 @@ fn spin_wait() -> bool {
 /// derivable from anything else the profile prints.
 pub static SUBMITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Aggregate readback cost for the ordinary per-op path.  Unlike the
+/// opt-in line trace, these counters make the bounded benchmark's fence and
+/// mapped-copy cost joinable with its submit/pass counters without printing
+/// once per projection.
+pub static READBACK_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static READBACK_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static READBACK_WAIT_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static READBACK_COPY_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static READBACK_TOTAL_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Print the minimum per-op GPU accounting for a bounded decode.  GPU
+/// timestamp queries remain a separate graph-only facility; on this path the
+/// empty/one-dispatch round trip and fence/readback counters are the honest
+/// measurements available without changing command ordering.
+pub fn perf_report() {
+    if std::env::var("CMF_PERF_PROFILE").as_deref() != Ok("1") {
+        return;
+    }
+    let n = READBACK_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+    let submits = SUBMITS.load(std::sync::atomic::Ordering::Relaxed);
+    let passes = PASSES.load(std::sync::atomic::Ordering::Relaxed);
+    eprintln!(
+        "[perf-wgpu] submits={} passes={} readback_calls={} readback_mb={:.3} readback_wait_ms={:.3} readback_copy_ms={:.3} readback_total_ms={:.3} weight_upload_ms={:.3} weight_upload_mb={:.3} dispatched_weight_mb={:.3} cache_hits={} cache_misses={}",
+        submits,
+        passes,
+        n,
+        READBACK_BYTES.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
+        READBACK_WAIT_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
+        READBACK_COPY_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
+        READBACK_TOTAL_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
+        UPLOAD_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
+        UPLOAD_BYTES.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
+        WEIGHT_BYTES.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
+        RES_HITS.load(std::sync::atomic::Ordering::Relaxed),
+        RES_MISSES.load(std::sync::atomic::Ordering::Relaxed),
+    );
+}
+
 /// What a round trip to this device costs, with nothing in it.
 ///
 /// The number the whole mobile-GPU investigation needed and did not
@@ -29395,6 +31833,158 @@ fn q4tp_mm_coop_s(@builtin(workgroup_id) wid: vec3<u32>,
     let asc = select(bitcast<f32>(pmm.pad), qmm_s[0], pmm.pad == 0xFFFFFFFFu);
     coop_body(wid, tid, sg, asc);
 }
+"#;
+
+const COOP_Q2_MM_SRC: &str = r#"
+enable wgpu_cooperative_matrix;
+enable f16;
+
+struct MmP { cols4: u32, rows: u32, nb: u32, pad: u32 };
+@group(0) @binding(0) var<storage, read> qmm: array<u32>;
+@group(0) @binding(1) var<storage, read> xmm: array<f32>;
+@group(0) @binding(2) var<storage, read_write> ymm: array<f32>;
+@group(0) @binding(3) var<uniform> pmm: MmP;
+const KS: u32 = 32u;
+
+// Operands are f16 because that is what the matrix units take; the
+// accumulator stays f32, which is the configuration the hardware reports
+// (M16 N16 K16, f16 x f16 -> f32).
+var<workgroup> cm_a: array<f16, 64 * 32>;
+// k-major: the B role is K x N read row by row, and the layout probe
+// settled that `coopLoad` means row-major for both operands. Staging the
+// weights the other way round and asking for a transposed load reads
+// something else again — measured, twice, both wrong.
+var<workgroup> cm_b: array<f16, 64 * 32>;
+// The result plane must be f32: storing an f32 accumulator into an f16
+// array compiles and writes nothing usable.
+var<workgroup> cm_c: array<f32, 64 * 64>;
+
+fn cm_byte(off: u32) -> u32 {
+    return (qmm[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu;
+}
+
+// The fourth uniform word is the explicit Q2 affine descriptor bit. It is
+// not an activation scale/sentinel: the Q2 candidate deliberately starts
+// with the validated Prism activation_f16 boundary and scale 1.0.
+fn coop_body(wid: vec3<u32>, tid: u32, sg: u32) {
+    let cols = pmm.cols4 * 4u;
+    let gpr = cols >> 5u;
+    let m0 = wid.y * 64u;
+    let n0 = wid.x * 64u;
+    // Four subgroups, and which one this is comes from the builtin rather
+    // than from `tid / 32`: nothing promises the driver hands out lanes to
+    // subgroups in that order, and a cooperative matrix belongs to a
+    // subgroup, not to a range of local indices.
+
+    var c0: coop_mat16x16<f32, C>;
+    var c1: coop_mat16x16<f32, C>;
+    var c2: coop_mat16x16<f32, C>;
+    var c3: coop_mat16x16<f32, C>;
+    let params_b = pmm.rows * gpr * 8u;
+    let codes_b = params_b + pmm.rows * 4u;
+    let cstride = (gpr * 5u + 7u) / 8u;
+
+    var k0 = 0u;
+    loop {
+        if (k0 >= cols) { break; }
+        // 64 rows x 32 k of each side; 128 threads take sixteen apiece.
+        for (var t = tid; t < 64u * 8u; t = t + 128u) {
+            let m = t / 8u;
+            let k4 = (t % 8u) * 4u;
+            let col0 = k0 + k4;
+            let dst = m * KS + k4;
+            var v = vec4<f32>(0.0);
+            if (m0 + m < pmm.nb && col0 < cols) {
+                let base = (m0 + m) * cols + col0;
+                v = vec4<f32>(xmm[base], xmm[base + 1u], xmm[base + 2u], xmm[base + 3u]);
+            }
+            cm_a[dst] = f16(v.x); cm_a[dst + 1u] = f16(v.y);
+            cm_a[dst + 2u] = f16(v.z); cm_a[dst + 3u] = f16(v.w);
+        }
+        for (var t = tid; t < 64u * 8u; t = t + 128u) {
+            let n = t / 8u;
+            let k4 = (t % 8u) * 4u;
+            let col0 = k0 + k4;
+            var wv = vec4<f32>(0.0);
+            if (n0 + n < pmm.rows && col0 < cols) {
+                let g = col0 >> 5u;
+                let wrow = n0 + n;
+                let bit = g * 5u;
+                let cb = codes_b + wrow * cstride + (bit >> 3u);
+                let sh = bit & 7u;
+                var cv = cm_byte(cb);
+                if (sh > 3u) { cv = cv | (cm_byte(cb + 1u) << 8u); }
+                let pr = unpack2x16float(qmm[(params_b >> 2u) + wrow]);
+                let rung = (cv >> sh) & 31u;
+                var scale = 0.0;
+                if (rung != 0u) {
+                    scale = exp2(pr.x + f32(rung - 1u) * pr.y);
+                }
+                let toff = (wrow * gpr + g) * 8u;
+                let pp = col0 - g * 32u;
+                let bo = toff + pp / 4u;
+                let by = cm_byte(bo);
+                let center = select(1.5, 1.0, pmm.pad != 0u);
+                wv[0u] = (f32(by & 3u) - center) * scale;
+                wv[1u] = (f32((by >> 2u) & 3u) - center) * scale;
+                wv[2u] = (f32((by >> 4u) & 3u) - center) * scale;
+                wv[3u] = (f32((by >> 6u) & 3u) - center) * scale;
+            }
+            // n-major, four consecutive k in a row: `coopLoad` reads it
+            // ColumnMajor, which turns [n][k] into the K x N the B role
+            // wants without a transposing load.
+            let bd = n * KS + k4;
+            cm_b[bd] = f16(wv.x); cm_b[bd + 1u] = f16(wv.y);
+            cm_b[bd + 2u] = f16(wv.z); cm_b[bd + 3u] = f16(wv.w);
+        }
+        workgroupBarrier();
+        {
+            let a = coopLoadT<coop_mat16x16<f16, A>>(&cm_a[sg * 512u + 0u], 32u);
+            let b0 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[0u + 0u], 32u);
+            let b1 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[512u + 0u], 32u);
+            let b2 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[1024u + 0u], 32u);
+            let b3 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[1536u + 0u], 32u);
+            c0 = coopMultiplyAdd(a, b0, c0);
+            c1 = coopMultiplyAdd(a, b1, c1);
+            c2 = coopMultiplyAdd(a, b2, c2);
+            c3 = coopMultiplyAdd(a, b3, c3);
+        }
+        {
+            let a = coopLoadT<coop_mat16x16<f16, A>>(&cm_a[sg * 512u + 16u], 32u);
+            let b0 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[0u + 16u], 32u);
+            let b1 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[512u + 16u], 32u);
+            let b2 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[1024u + 16u], 32u);
+            let b3 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[1536u + 16u], 32u);
+            c0 = coopMultiplyAdd(a, b0, c0);
+            c1 = coopMultiplyAdd(a, b1, c1);
+            c2 = coopMultiplyAdd(a, b2, c2);
+            c3 = coopMultiplyAdd(a, b3, c3);
+        }
+        workgroupBarrier();
+        k0 = k0 + KS;
+    }
+    workgroupBarrier();
+    coopStoreT(c0, &cm_c[sg * 16u * 64u + 0u], 64u);
+    coopStoreT(c1, &cm_c[sg * 16u * 64u + 16u], 64u);
+    coopStoreT(c2, &cm_c[sg * 16u * 64u + 32u], 64u);
+    coopStoreT(c3, &cm_c[sg * 16u * 64u + 48u], 64u);
+    workgroupBarrier();
+    for (var t = tid; t < 64u * 64u; t = t + 128u) {
+        let m = t / 64u;
+        let n = t % 64u;
+        if (m0 + m < pmm.nb && n0 + n < pmm.rows) {
+            ymm[(m0 + m) * pmm.rows + n0 + n] = cm_c[m * 64u + n];
+        }
+    }
+}
+
+@compute @workgroup_size(128)
+fn q2tp_mm_coop(@builtin(workgroup_id) wid: vec3<u32>,
+                @builtin(local_invocation_index) tid: u32,
+                @builtin(subgroup_id) sg: u32) {
+    coop_body(wid, tid, sg);
+}
+
 "#;
 
 /// The bake's forward GEMM on the same matrix units: y[nb,rows] =
@@ -30417,8 +33007,8 @@ fn readback(
         return false;
     }
 
+    let t_cp = std::time::Instant::now();
     {
-        let t_cp = std::time::Instant::now();
         let Ok(data) = slice.get_mapped_range() else {
             staging.unmap();
             return false;
@@ -30439,6 +33029,20 @@ fn readback(
         }
     }
     staging.unmap();
+    READBACK_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    READBACK_BYTES.fetch_add(y_size, std::sync::atomic::Ordering::Relaxed);
+    READBACK_WAIT_NS.fetch_add(
+        t_cp.duration_since(t_dma).as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    READBACK_COPY_NS.fetch_add(
+        t_cp.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    READBACK_TOTAL_NS.fetch_add(
+        t_dma.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     true
 }
 
@@ -30976,6 +33580,65 @@ fn encode_q4_tile_mm(
     k: usize,
 ) {
     encode_q4_tile_mm_scaled(c, enc, pipeline, weight, xs, y, rows, cols, k, 0.0)
+}
+
+/// Encode the scalar q2tp prefill GEMM with its explicit descriptor center.
+/// q2tp reuses the four-word MM parameter block, but word 3 is a boolean
+/// affine selector (`0 = code-1.5`, `1 = code-1`), not the f32 activation
+/// scale used by the q4 cooperative variants.  Keeping this wrapper separate
+/// prevents the generic q4 helper from erasing that format bit.
+fn encode_q2_tile_mm(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    weight: &wgpu::Buffer,
+    xs: &wgpu::Buffer,
+    y: &wgpu::Buffer,
+    rows: usize,
+    cols: usize,
+    k: usize,
+    affine: bool,
+    use_coop: bool,
+) {
+    let pipeline = if use_coop {
+        c.q2tp_mm_coop.as_ref().unwrap_or(&c.q2tp_mm)
+    } else {
+        &c.q2tp_mm
+    };
+    let p_buf = uniform_u32x4(c, [
+        (cols / 4) as u32,
+        rows as u32,
+        k as u32,
+        u32::from(affine),
+    ]);
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("q2tp-mm"),
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &[
+            bind_buf(0, weight),
+            bind_buf(1, xs),
+            bind_buf(2, y),
+            bind_buf(3, &p_buf),
+        ],
+    });
+    let active_bytes = cortiq_core::quant::expected_nbytes(
+        cortiq_core::TensorDtype::Q2TiledP,
+        &[rows, cols],
+    )
+    .unwrap_or(0) as u64
+        + ((k * cols + k * rows) * std::mem::size_of::<f32>()) as u64;
+    let tsw = batch_kernel_ts_pair(c, 0, active_bytes);
+    let mut pass = begin_pass_with(
+        enc,
+        Some(if use_coop { "q2tp-mm-coop" } else { "q2tp-mm" }),
+        tsw,
+    );
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups(
+        (rows as u32).div_ceil(64).min(MAX_WG),
+        (k as u32).div_ceil(64),
+        1,
+    );
 }
 
 /// The same, carrying the activation scale the cooperative kernel reads
@@ -32337,6 +35000,18 @@ pub fn matvec_batch(model: &Arc<CmfModel>, jobs: &[BatchJob], out: &mut [&mut [f
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// wgpu defers destruction of Vulkan objects until a device poll.  The
+    /// q2tp tests deliberately create and map several short-lived buffers;
+    /// polling after those locals drop keeps driver deferred frees inside the
+    /// test process instead of racing harness exit.
+    struct TestGpuDrain;
+
+    impl Drop for TestGpuDrain {
+        fn drop(&mut self) {
+            shutdown();
+        }
+    }
 
     #[test]
     fn o1_admission_accepts_bounded_extended_window() {
@@ -34563,6 +37238,78 @@ mod tests {
             .unwrap_or(d)
     }
 
+    /// CPU model of the q2tp subgroup reduction.  Keeping this independent
+    /// from the WGSL tree/subgroup implementation catches a lane-grouping
+    /// mistake before an optional GPU A/B is allowed to touch model output.
+    fn q2tp_subgroup_cpu(acc: &[[f32; 4]], subgroup_width: usize) -> Option<[[f32; 4]; 4]> {
+        if acc.len() != 256 || !matches!(subgroup_width, 32 | 64) {
+            return None;
+        }
+        let subgroups_per_row_group = 64 / subgroup_width;
+        let mut out = [[0.0f32; 4]; 4];
+        for row_group in 0..4 {
+            let first_subgroup = row_group * subgroups_per_row_group;
+            for subgroup in 0..subgroups_per_row_group {
+                let lo = (first_subgroup + subgroup) * subgroup_width;
+                let hi = lo + subgroup_width;
+                for lane in lo..hi {
+                    for component in 0..4 {
+                        out[row_group][component] += acc[lane][component];
+                    }
+                }
+            }
+        }
+        Some(out)
+    }
+
+    #[test]
+    fn q2tp_subgroup_cpu_reduction_matches_64_lane_rows() {
+        let acc: Vec<[f32; 4]> = (0..256)
+            .map(|lane| {
+                [
+                    (lane as f32 + 1.0) * 0.03125,
+                    ((lane * 7 % 53) as f32 - 26.0) * 0.125,
+                    if lane & 1 == 0 { 1.0 } else { -1.0 },
+                    (lane * lane % 97) as f32 * 0.0078125,
+                ]
+            })
+            .collect();
+        for width in [32usize, 64] {
+            let got = q2tp_subgroup_cpu(&acc, width).expect("supported subgroup width");
+            for row_group in 0..4 {
+                let lo = row_group * 64;
+                let hi = lo + 64;
+                for component in 0..4 {
+                    let want: f32 = acc[lo..hi].iter().map(|v| v[component]).sum();
+                    assert_eq!(got[row_group][component].to_bits(), want.to_bits());
+                }
+            }
+        }
+        assert!(q2tp_subgroup_cpu(&acc, 16).is_none());
+        assert!(q2tp_subgroup_cpu(&acc, 128).is_none());
+    }
+
+    /// Direct f64 Walsh-sign reference for the device FWHT tests.  This is
+    /// deliberately not `cortiq_core::hadamard::fwht_f32`, so a shared
+    /// butterfly bug cannot make the GPU test pass on both sides.
+    fn fwht_reference_f64(values: &[f32], signs: &[f32], block: usize) -> Vec<f32> {
+        assert_eq!(values.len(), signs.len());
+        assert!(block.is_power_of_two() && values.len() % block == 0);
+        let inv = 1.0f64 / (block as f64).sqrt();
+        let mut out = vec![0.0f32; values.len()];
+        for base in (0..values.len()).step_by(block) {
+            for row in 0..block {
+                let mut sum = 0.0f64;
+                for col in 0..block {
+                    let h = if (row & col).count_ones() & 1 == 0 { 1.0 } else { -1.0 };
+                    sum += h * values[base + col] as f64 * signs[base + col] as f64;
+                }
+                out[base + row] = (sum * inv) as f32;
+            }
+        }
+        out
+    }
+
     /// The cooperative GEMM on the smallest shape that still exercises it:
     /// one K-step, one tile, sixteen tokens. Everything the full kernel
     /// does, with few enough numbers to read.
@@ -34763,7 +37510,6 @@ fn main(@builtin(local_invocation_index) tid: u32,
         // this says 32 and the assignment is linear.
         {
             let probe = r#"
-enable subgroups;
 @group(0) @binding(0) var<storage, read_write> o: array<f32>;
 @compute @workgroup_size(128)
 fn main(@builtin(local_invocation_index) tid: u32,
@@ -35236,6 +37982,20 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let sg_requested = q2tp_sg_env_admitted();
+        eprintln!(
+            "q2tp matvec pipeline: subgroup_requested={sg_requested} admitted={} diagnostics={}",
+            c.q2tp_mv16w_sg.is_some(),
+            q2tp_sg_diag()
+        );
+        if sg_requested {
+            assert!(
+                c.q2tp_mv16w_sg.is_some(),
+                "requested q2tp subgroup optimization was not admitted: {}",
+                q2tp_sg_diag()
+            );
+        }
+        let _drain = TestGpuDrain;
         let (rows, cols) = (300usize, 4096usize);
         let gpr = cols / 32;
         let total =
@@ -35290,7 +38050,7 @@ fn main() {
         let mut enc = c
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        encode_q2tp_mv16w(c, &mut enc, &wbuf, &xbuf, &ybuf, rows, cols);
+        encode_q2tp_mv16w(c, &mut enc, &wbuf, &xbuf, &ybuf, rows, cols, false);
         let mut got = vec![0f32; rows];
         assert!(readback(c, enc, &ybuf, &stage, (rows * 4) as u64, &mut got));
         let (mut num, mut den) = (0f64, 0f64);
@@ -35304,6 +38064,781 @@ fn main() {
             rel < 1e-5,
             "q2tp kernel drifted from the CPU dequant: {rel:.2e}"
         );
+
+        // The same physical payload must also match the explicit affine
+        // center `(c-1)·s`; this catches a shader that silently applies the
+        // ordinary 1.5 center to a q2tp_affine descriptor.
+        let params = &wb[params_off..params_off + rows * 4];
+        let want_aff: Vec<f32> = (0..rows)
+            .map(|r| {
+                let tab = cortiq_core::quant::q2tp_ladder(params, r);
+                let codes = &wb[codes_off + r * stride..codes_off + (r + 1) * stride];
+                let mut acc = 0f64;
+                for g in 0..gpr {
+                    let s = tab[cortiq_core::quant::q4tp_code(codes, g)] as f64;
+                    let chunk = &wb[(r * gpr + g) * 8..(r * gpr + g + 1) * 8];
+                    for (k, &byte) in chunk.iter().enumerate() {
+                        for j in 0..4 {
+                            let c = ((byte >> (2 * j)) & 3) as f64;
+                            let i = g * 32 + k * 4 + j;
+                            acc += (c - 1.0) * s * xs[i] as f64;
+                        }
+                    }
+                }
+                acc as f32
+            })
+            .collect();
+        let ya = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (rows * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let stage_a = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (rows * 4) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut enc_a = c
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        encode_q2tp_mv16w(c, &mut enc_a, &wbuf, &xbuf, &ya, rows, cols, true);
+        let mut got_aff = vec![0f32; rows];
+        assert!(readback(
+            c,
+            enc_a,
+            &ya,
+            &stage_a,
+            (rows * 4) as u64,
+            &mut got_aff,
+        ));
+        let (mut num_aff, mut den_aff) = (0f64, 0f64);
+        for (a, b) in got_aff.iter().zip(&want_aff) {
+            num_aff += ((a - b) as f64).powi(2);
+            den_aff += (*b as f64).powi(2);
+        }
+        let rel_aff = (num_aff / den_aff.max(1e-30)).sqrt();
+        eprintln!("q2tp affine matvec vs cpu dequant: rel rms {rel_aff:.2e}");
+        assert!(
+            rel_aff < 1e-5,
+            "q2tp affine kernel drifted from the CPU affine decode: {rel_aff:.2e}"
+        );
+    }
+
+    /// The original-engine transfer's first decode gate: the dedicated NB=1
+    /// Q8/DP4A affine kernel must agree with an independent CPU Q8 oracle. The
+    /// scalar affine q2tp result is also reported, but is intentionally not
+    /// used as the Q8 acceptance target because activation quantization is the
+    /// explicitly measured approximation in this experiment.
+    #[test]
+    fn wgpu_q2tp_affine_dp4a_matches_independent_q8_oracle() {
+        unsafe {
+            std::env::set_var("CMF_GPU", "wgpu");
+            std::env::set_var("CMF_Q2_DP4A", "1");
+        }
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping");
+            return;
+        };
+        let _drain = TestGpuDrain;
+        let (rows, cols) = (129usize, 4096usize);
+        let gpr = cols / cortiq_core::quant::GROUP_SIZE;
+        let total = cortiq_core::quant::expected_nbytes(
+            cortiq_core::TensorDtype::Q2TiledP,
+            &[rows, cols],
+        )
+        .unwrap();
+        let (params_off, codes_off, stride) = cortiq_core::quant::q2tp_sections(rows, cols);
+        let mut wb = vec![0u8; total];
+        let lo = cortiq_core::quant::f32_to_f16(-3.0);
+        let step = cortiq_core::quant::f32_to_f16(0.125);
+        for r in 0..rows {
+            let p = params_off + r * 4;
+            wb[p..p + 2].copy_from_slice(&lo.to_le_bytes());
+            wb[p + 2..p + 4].copy_from_slice(&step.to_le_bytes());
+            let codes = &mut wb[codes_off + r * stride..codes_off + (r + 1) * stride];
+            codes.fill(0);
+            for g in 0..gpr {
+                cortiq_core::quant::q4tp_put_code(codes, g, 1 + ((r * 11 + g * 7) % 30));
+            }
+            for g in 0..gpr {
+                let chunk = &mut wb[(r * gpr + g) * 8..(r * gpr + g + 1) * 8];
+                for (k, byte) in chunk.iter_mut().enumerate() {
+                    let base = r.wrapping_mul(13).wrapping_add(g * 5).wrapping_add(k * 3);
+                    *byte = (0..4)
+                        .map(|j| ((base + j * 2) % 3) as u8)
+                        .enumerate()
+                        .fold(0u8, |acc, (j, v)| acc | (v << (2 * j)));
+                }
+            }
+        }
+        let xs: Vec<f32> = (0..cols)
+            .map(|i| ((i.wrapping_mul(7919) % 4093) as f32 - 2046.0) / 513.0)
+            .collect();
+        let params = &wb[params_off..params_off + rows * 4];
+        let mut want_q8 = vec![0f32; rows];
+        let mut want_f32 = vec![0f32; rows];
+        for r in 0..rows {
+            let tab = cortiq_core::quant::q2tp_ladder(params, r);
+            let codes = &wb[codes_off + r * stride..codes_off + (r + 1) * stride];
+            // The test's x is one activation vector, so each 32-group uses
+            // its own scale, exactly as x_quant_i8 does on the device.
+            let mut q8 = 0f64;
+            let mut f32v = 0f64;
+            for g in 0..gpr {
+                let base = g * 32;
+                let mut gmax = 0f32;
+                for &v in &xs[base..base + 32] {
+                    gmax = gmax.max(v.abs());
+                }
+                let sx = if gmax == 0.0 { 1.0 } else { gmax / 127.0 };
+                let code = cortiq_core::quant::q4tp_code(codes, g);
+                let scale = tab[code];
+                let chunk = &wb[(r * gpr + g) * 8..(r * gpr + g + 1) * 8];
+                for (k, &byte) in chunk.iter().enumerate() {
+                    for j in 0..4 {
+                        let i = base + k * 4 + j;
+                        let sym = ((byte >> (2 * j)) & 3) as f32 - 1.0;
+                        let q = (xs[i] / sx).round().clamp(-127.0, 127.0);
+                        q8 += q as f64 * sx as f64 * sym as f64 * scale as f64;
+                        f32v += xs[i] as f64 * sym as f64 * scale as f64;
+                    }
+                }
+            }
+            want_q8[r] = q8 as f32;
+            want_f32[r] = f32v as f32;
+        }
+        let mk = |bytes: &[u8]| {
+            c.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("q2-dp4a-component"),
+                    contents: bytes,
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+        };
+        let wbuf = mk(&wb);
+        let xbuf = mk(bytemuck::cast_slice(&xs));
+        let y_dp = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("q2-dp4a-y"),
+            size: (rows * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("q2-dp4a-stage"),
+            size: (rows * 4) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut enc = c
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("q2-dp4a-component"),
+            });
+        encode_q2tp_mv1_i8(c, &mut enc, &wbuf, &xbuf, &y_dp, rows, cols);
+        let mut got = vec![0f32; rows];
+        assert!(readback(
+            c,
+            enc,
+            &y_dp,
+            &stage,
+            (rows * 4) as u64,
+            &mut got,
+        ));
+        let mut num = 0f64;
+        let mut den = 0f64;
+        let mut num_f32 = 0f64;
+        let mut den_f32 = 0f64;
+        for ((&a, &b), &f) in got.iter().zip(&want_q8).zip(&want_f32) {
+            assert!(a.is_finite(), "q2 dp4a produced non-finite output");
+            num += (a as f64 - b as f64).powi(2);
+            den += (b as f64).powi(2);
+            num_f32 += (a as f64 - f as f64).powi(2);
+            den_f32 += (f as f64).powi(2);
+        }
+        let rel_q8 = (num / den.max(1e-30)).sqrt();
+        let rel_f32 = (num_f32 / den_f32.max(1e-30)).sqrt();
+        eprintln!(
+            "q2 affine dp4a NB1: q8_oracle_rel={rel_q8:.3e} f32_route_rel={rel_f32:.3e}"
+        );
+        assert!(rel_q8 <= 1e-3, "q2 DP4A drifted from independent Q8 oracle: {rel_q8:.3e}");
+    }
+
+    /// The optional Q2TP affine cooperative GEMM is a declared F16 operand
+    /// boundary, not a retagged Q4 path.  Run with
+    /// `CMF_Q2_COOP=1 CMF_COOP=1` and this ignored test to require admission,
+    /// compare every output against the scalar F32 decoder, and check a small
+    /// prefix against an independent F16-rounded-weight reference.  The
+    /// default matrix exercises real Prism FFN/down widths plus a row tail;
+    /// `CMF_Q2_COOP_HEAD=1` adds the 248320-row vocabulary head.
+    #[test]
+    #[ignore]
+    fn wgpu_q2tp_mm_coop_affine_component_matrix() {
+        unsafe {
+            std::env::set_var("CMF_GPU", "wgpu");
+            std::env::set_var("CMF_COOP", "1");
+            std::env::set_var("CMF_Q2_COOP", "1");
+        }
+        let Some(c) = ctx() else {
+            panic!("Q2 cooperative component requires a wgpu adapter");
+        };
+        let _drain = TestGpuDrain;
+        assert!(
+            c.q2tp_mm_coop.is_some(),
+            "CMF_Q2_COOP=1 did not admit the isolated q2tp cooperative pipeline"
+        );
+        let mut shapes = vec![
+            (17_408usize, 5_120usize, 16usize, "gate-up-k16"),
+            (17_408, 5_120, 32, "gate-up-k32"),
+            (5_120, 17_408, 32, "down-k32"),
+            (513, 5_120, 32, "row-tail-k32"),
+            (5_120, 6_144, 32, "out-k32"),
+        ];
+        if std::env::var("CMF_Q2_COOP_HEAD").as_deref() == Ok("1") {
+            shapes.push((248_320, 5_120, 16, "lm-head-k16"));
+        }
+        for (rows, cols, batch, label) in shapes {
+            let total = cortiq_core::quant::expected_nbytes(
+                cortiq_core::TensorDtype::Q2TiledP,
+                &[rows, cols],
+            )
+            .unwrap();
+            let (params_off, codes_off, stride) = cortiq_core::quant::q2tp_sections(rows, cols);
+            let gpr = cols / cortiq_core::quant::GROUP_SIZE;
+            let mut wb_host = vec![0u8; total];
+            let lo = cortiq_core::quant::f32_to_f16(-4.0);
+            let step = cortiq_core::quant::f32_to_f16(0.1);
+            for r in 0..rows {
+                let p = params_off + r * 4;
+                wb_host[p..p + 2].copy_from_slice(&lo.to_le_bytes());
+                wb_host[p + 2..p + 4].copy_from_slice(&step.to_le_bytes());
+                let codes = &mut wb_host[codes_off + r * stride..codes_off + (r + 1) * stride];
+                codes.fill(0);
+                // Affine Prism symbols are ternary 0/1/2; keep the reserved
+                // two-bit symbol 3 out of this candidate's payload.
+                for g in 0..gpr {
+                    cortiq_core::quant::q4tp_put_code(codes, g, (r * 13 + g * 7) % 31);
+                }
+                let chunk = &mut wb_host[(r * gpr) * 8..(r * gpr + gpr) * 8];
+                for (i, byte) in chunk.iter_mut().enumerate() {
+                    let base = r.wrapping_mul(17).wrapping_add(i * 5);
+                    *byte = (0..4)
+                        .map(|j| ((base + j * 3) % 3) as u8)
+                        .enumerate()
+                        .fold(0u8, |acc, (j, v)| acc | (v << (2 * j)));
+                }
+            }
+            let xs: Vec<f32> = (0..batch * cols)
+                .map(|i| ((i.wrapping_mul(7919) % 4093) as f32 - 2046.0) / 257.0)
+                .collect();
+            let mk = |bytes: &[u8]| {
+                c.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("q2tp-coop-component"),
+                        contents: bytes,
+                        usage: wgpu::BufferUsages::STORAGE,
+                    })
+            };
+            let wb = mk(&wb_host);
+            let xb = mk(bytemuck::cast_slice(&xs));
+            let out_bytes = (batch * rows * 4) as u64;
+            let y_scalar = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("q2tp-coop-scalar"),
+                size: out_bytes,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let y_coop = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("q2tp-coop-output"),
+                size: out_bytes,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("q2tp-coop-stage"),
+                size: out_bytes * 2,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let mut enc = c
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("q2tp-coop-component"),
+                });
+            encode_q2_tile_mm(
+                c, &mut enc, &wb, &xb, &y_scalar, rows, cols, batch, true, false,
+            );
+            encode_q2_tile_mm(
+                c, &mut enc, &wb, &xb, &y_coop, rows, cols, batch, true, true,
+            );
+            flush_pass(&enc);
+            enc.copy_buffer_to_buffer(&y_scalar, 0, &stage, 0, out_bytes);
+            flush_pass(&enc);
+            enc.copy_buffer_to_buffer(&y_coop, 0, &stage, out_bytes, out_bytes);
+            submit(c, finish_enc(enc));
+            let slice = stage.slice(..);
+            slice.map_async(wgpu::MapMode::Read, |_| {});
+            let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+            let data = slice.get_mapped_range().expect("q2 coop map");
+            let all: &[f32] = bytemuck::cast_slice(&data);
+            let (scalar, coop) = all.split_at(batch * rows);
+            let mut num = 0f64;
+            let mut den = 0f64;
+            let mut max_abs = 0f32;
+            let mut max_ref = 0f32;
+            for (&a, &b) in scalar.iter().zip(coop) {
+                assert!(a.is_finite() && b.is_finite(), "{label}: non-finite output");
+                let d = a as f64 - b as f64;
+                num += d * d;
+                den += (a as f64) * (a as f64);
+                max_abs = max_abs.max(d.abs() as f32);
+                max_ref = max_ref.max(a.abs());
+            }
+            let rel = (num / den.max(1e-30)).sqrt();
+            let nlinf = max_abs / max_ref.max(1e-30);
+            eprintln!(
+                "q2tp coop {label} rows={rows} cols={cols} k={batch}: rel_l2={rel:.3e} normalized_linf={nlinf:.3e}"
+            );
+            assert!(rel <= 1e-3 && nlinf <= 1e-3, "{label}: scalar/coop drift exceeds 1e-3");
+            // A bounded independent oracle: enough full columns to exercise
+            // every scale/code pattern while keeping CPU work finite for the
+            // vocabulary-head option.
+            let params = &wb_host[..];
+            let (params_off, codes_off, stride) =
+                cortiq_core::quant::q2tp_sections(rows, cols);
+            let sample_rows = rows.min(8);
+            let mut sample_num = 0f64;
+            let mut sample_den = 0f64;
+            for r in 0..sample_rows {
+                let tab = cortiq_core::quant::q2tp_ladder(&params[params_off..], r);
+                let codes = &params[codes_off + r * stride..codes_off + (r + 1) * stride];
+                for t in 0..batch {
+                    let mut want = 0f64;
+                    for g in 0..gpr {
+                        let scale = tab[cortiq_core::quant::q4tp_code(codes, g)];
+                        let chunk = &params[(r * gpr + g) * 8..(r * gpr + g + 1) * 8];
+                        for (i, &byte) in chunk.iter().enumerate() {
+                            for j in 0..4 {
+                                let sym = ((byte >> (2 * j)) & 3) as f32;
+                                let w = (sym - 1.0) * scale;
+                                let wf = cortiq_core::quant::f16_to_f32(
+                                    cortiq_core::hadamard::prism_f32_to_f16_rne(w),
+                                );
+                                let xf = cortiq_core::quant::f16_to_f32(
+                                    cortiq_core::hadamard::prism_f32_to_f16_rne(xs[t * cols + g * 32 + i * 4 + j]),
+                                );
+                                want += wf as f64 * xf as f64;
+                            }
+                        }
+                    }
+                    let got = coop[t * rows + r] as f64;
+                    let d = got - want;
+                    sample_num += d * d;
+                    sample_den += want * want;
+                }
+            }
+            let sample_rel = (sample_num / sample_den.max(1e-30)).sqrt();
+            eprintln!("q2tp coop {label}: independent_f16_sample_rel={sample_rel:.3e}");
+            assert!(sample_rel <= 1e-3, "{label}: independent F16 sample drift {sample_rel:.3e}");
+            drop(data);
+            stage.unmap();
+        }
+    }
+
+    /// The resident graph's activation boundary must be the same signed,
+    /// normalized FWHT as the CPU Prism oracle, including the source f16
+    /// round.  Keep this as a device test: a visually plausible generation
+    /// can survive a wrong butterfly/sign placement for several tokens.
+    #[test]
+    fn wgpu_prism_fwht_matches_cpu_oracle() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping");
+            return;
+        };
+        let _drain = TestGpuDrain;
+        let Some(pipe) = c.fwht.as_ref() else {
+            eprintln!("shader-f16 unavailable — skipping Prism FWHT test");
+            return;
+        };
+        let width = 1024usize;
+        let signs: Vec<f32> = (0..width)
+            .map(|i| if (i * 17 + i / 7) & 1 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        let xs: Vec<f32> = (0..width)
+            .map(|i| ((i * 7919 % 1000) as f32 - 500.0) / 137.0)
+            .collect();
+        let mut want = xs.clone();
+        cortiq_core::hadamard::signed_fwht_forward(&mut want, &signs, width).unwrap();
+        for v in &mut want {
+            *v = cortiq_core::quant::f16_to_f32(cortiq_core::hadamard::prism_f32_to_f16_rne(*v));
+        }
+        let mk = |bytes: &[u8], usage: wgpu::BufferUsages| {
+            c.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("prism-fwht-test"),
+                    contents: bytes,
+                    usage,
+                })
+        };
+        let xb = mk(
+            bytemuck::cast_slice(&xs),
+            wgpu::BufferUsages::STORAGE,
+        );
+        let sb = mk(
+            bytemuck::cast_slice(&signs),
+            wgpu::BufferUsages::STORAGE,
+        );
+        let yb = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("prism-fwht-test-y"),
+            size: (width * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("prism-fwht-test-stage"),
+            size: (width * 4) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let p = uniform_u32x8(c, [width as u32, 1024, 0, 0, 1, 0, 0, 0]);
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("prism-fwht-test-bind"),
+            layout: &pipe.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, &xb),
+                bind_buf(1, &yb),
+                bind_buf(2, &sb),
+                bind_buf(3, &p),
+            ],
+        });
+        let mut enc = c
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("prism-fwht-test-enc"),
+            });
+        {
+            let mut pass = begin_pass(&mut enc);
+            pass.set_pipeline(pipe);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        let mut got = vec![0f32; width];
+        assert!(readback(
+            c,
+            enc,
+            &yb,
+            &stage,
+            (width * 4) as u64,
+            &mut got,
+        ));
+        let mut max_abs = 0.0f32;
+        let mut rms = 0.0f64;
+        for (a, b) in got.iter().zip(&want) {
+            max_abs = max_abs.max((a - b).abs());
+            rms += (*a as f64 - *b as f64).powi(2);
+        }
+        let rms = (rms / width as f64).sqrt();
+        eprintln!("Prism FWHT GPU/CPU f16 oracle: rms={rms:.3e} max={max_abs:.3e}");
+        assert!(rms < 2e-3 && max_abs < 1e-2, "FWHT drift rms={rms:.3e} max={max_abs:.3e}");
+    }
+
+    /// Independent full-width FWHT coverage.  The existing smoke above is
+    /// retained for the historical gate; this test separates raw f32 error
+    /// from the declared f16 boundary and exercises every Prism activation
+    /// width used by the model.
+    #[test]
+    fn wgpu_prism_fwht_matches_independent_f32_and_f16_widths() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping");
+            return;
+        };
+        let _drain = TestGpuDrain;
+        let Some(pipe) = c.fwht.as_ref() else {
+            eprintln!("shader-f16 unavailable — skipping Prism FWHT width test");
+            return;
+        };
+        let run = |width: usize, round16: bool| -> (Vec<f32>, Vec<f32>) {
+            let signs: Vec<f32> = (0..width)
+                .map(|i| if (i * 17 + i / 7 + width) & 1 == 0 { 1.0 } else { -1.0 })
+                .collect();
+            let xs: Vec<f32> = (0..width)
+                .map(|i| {
+                    if width == 1024 && i == 127 {
+                        f32::from_bits(1)
+                    } else if width == 1024 && i == 255 {
+                        f32::from_bits(0x3380_0000)
+                    } else if width == 1024 && i == 767 {
+                        65504.0
+                    } else {
+                        ((i * 7919 % 4093) as f32 - 2046.0) / 257.0
+                    }
+                })
+                .collect();
+            let mut want = fwht_reference_f64(&xs, &signs, 1024);
+            if round16 {
+                for v in &mut want {
+                    *v = cortiq_core::quant::f16_to_f32(cortiq_core::hadamard::prism_f32_to_f16_rne(*v));
+                }
+            }
+            let mk = |bytes: &[u8], usage: wgpu::BufferUsages| {
+                c.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("prism-fwht-independent"),
+                        contents: bytes,
+                        usage,
+                    })
+            };
+            let xb = mk(bytemuck::cast_slice(&xs), wgpu::BufferUsages::STORAGE);
+            let sb = mk(bytemuck::cast_slice(&signs), wgpu::BufferUsages::STORAGE);
+            let yb = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("prism-fwht-independent-y"),
+                size: (width * 4) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("prism-fwht-independent-stage"),
+                size: (width * 4) as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let p = uniform_u32x8(
+                c,
+                [width as u32, 1024, 0, 0, u32::from(round16), 0, 0, 0],
+            );
+            let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("prism-fwht-independent-bind"),
+                layout: &pipe.get_bind_group_layout(0),
+                entries: &[
+                    bind_buf(0, &xb),
+                    bind_buf(1, &yb),
+                    bind_buf(2, &sb),
+                    bind_buf(3, &p),
+                ],
+            });
+            let mut enc = c
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("prism-fwht-independent-enc"),
+                });
+            {
+                let mut pass = begin_pass(&mut enc);
+                pass.set_pipeline(pipe);
+                pass.set_bind_group(0, &bind, &[]);
+                pass.dispatch_workgroups((width / 1024) as u32, 1, 1);
+            }
+            let mut got = vec![0f32; width];
+            assert!(readback(
+                c,
+                enc,
+                &yb,
+                &stage,
+                (width * 4) as u64,
+                &mut got,
+            ));
+            (got, want)
+        };
+        for &width in &[1024usize, 5120, 6144, 17408] {
+            // First establish the raw f32 device result against an
+            // independent f64 CPU oracle.  Then use that same device result
+            // as the input to the local RNE oracle for the second dispatch:
+            // this isolates the declared f16 boundary from valid f32
+            // butterfly-association/driver differences, while still checking
+            // every output half bit rather than only an aggregate RMS.
+            let (got, want) = run(width, false);
+            let (mut num, mut den, mut max_abs) = (0.0f64, 0.0f64, 0.0f32);
+            for (&a, &b) in got.iter().zip(&want) {
+                let d = a as f64 - b as f64;
+                num += d * d;
+                den += (b as f64) * (b as f64);
+                max_abs = max_abs.max(d.abs() as f32);
+            }
+            let rel = (num / den.max(1e-30)).sqrt();
+            eprintln!(
+                "Prism FWHT width={width} f32: rel_rms={rel:.3e} max={max_abs:.3e}"
+            );
+            assert!(rel <= 1e-5 && max_abs <= 2e-3);
+
+            let (got16, source_want16) = run(width, true);
+            let want16: Vec<f32> = got
+                .iter()
+                .map(|&v| {
+                    cortiq_core::quant::f16_to_f32(
+                        cortiq_core::hadamard::prism_f32_to_f16_rne(v),
+                    )
+                })
+                .collect();
+            let mismatches: Vec<(usize, u32, u32)> = got16
+                .iter()
+                .zip(&want16)
+                .enumerate()
+                .filter_map(|(i, (&a, &b))| {
+                    (a.to_bits() != b.to_bits()).then_some((i, a.to_bits(), b.to_bits()))
+                })
+                .take(8)
+                .collect();
+            assert!(
+                mismatches.is_empty(),
+                "Prism FWHT f16 per-element mismatch width={width}: {mismatches:?}"
+            );
+
+            let (mut num, mut den, mut max_abs, mut max_scaled) =
+                (0.0f64, 0.0f64, 0.0f32, 0.0f32);
+            for (&a, &b) in got16.iter().zip(&source_want16) {
+                let d = a as f64 - b as f64;
+                num += d * d;
+                den += (b as f64) * (b as f64);
+                max_abs = max_abs.max(d.abs() as f32);
+                // A final RNE f16 cast has an absolute error proportional
+                // to the exponent (the 65504 impulse intentionally
+                // exercises that boundary), so a fixed absolute bound
+                // would reject a correct half-round at large outputs.
+                max_scaled = max_scaled.max((d.abs() as f32) / b.abs().max(1.0));
+            }
+            let rel = (num / den.max(1e-30)).sqrt();
+            eprintln!(
+                "Prism FWHT width={width} f16: rel_rms={rel:.3e} max={max_abs:.3e} scaled={max_scaled:.3e}"
+            );
+            assert!(rel <= 3e-3 && max_scaled <= 2e-3);
+        }
+    }
+
+    /// The q2tp prefill GEMM must carry the same explicit center bit as the
+    /// single-token kernel. This is a direct shader parity check; no model
+    /// descriptor is needed because the caller supplies the validated bit.
+    #[test]
+    fn wgpu_q2tp_mm_affine_matches_cpu_decode() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping");
+            return;
+        };
+        let _drain = TestGpuDrain;
+        let (rows, cols, batch) = (64usize, 512usize, 3usize);
+        let gpr = cols / 32;
+        let total =
+            cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q2TiledP, &[rows, cols])
+                .unwrap();
+        let (params_off, codes_off, stride) = cortiq_core::quant::q2tp_sections(rows, cols);
+        let mut wb: Vec<u8> = (0..total).map(|i| ((i * 19 + 7) % 251) as u8).collect();
+        let lo = cortiq_core::quant::f32_to_f16(-4.0);
+        let step = cortiq_core::quant::f32_to_f16(0.1);
+        for r in 0..rows {
+            let o = params_off + r * 4;
+            wb[o..o + 2].copy_from_slice(&lo.to_le_bytes());
+            wb[o + 2..o + 4].copy_from_slice(&step.to_le_bytes());
+            let crow = &mut wb[codes_off + r * stride..codes_off + (r + 1) * stride];
+            crow.fill(0);
+            for g in 0..gpr {
+                cortiq_core::quant::q4tp_put_code(crow, g, (g * 11 + r * 3) % 32);
+            }
+        }
+        let xs: Vec<f32> = (0..batch * cols)
+            .map(|i| ((i * 29 % 127) as f32 - 63.0) / 63.0)
+            .collect();
+        let mk = |bytes: &[u8]| {
+            c.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: bytes,
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+        };
+        let wbuf = mk(&wb);
+        let xbuf = mk(bytemuck::cast_slice(&xs));
+        let params = &wb[params_off..params_off + rows * 4];
+        let want = |affine: bool| -> Vec<f32> {
+            let mut out = Vec::with_capacity(batch * rows);
+            for bi in 0..batch {
+                for r in 0..rows {
+                    let tab = cortiq_core::quant::q2tp_ladder(params, r);
+                    let codes = &wb[codes_off + r * stride..codes_off + (r + 1) * stride];
+                    let mut acc = 0.0f32;
+                    for i in 0..cols {
+                        let g = i / 32;
+                        let p = i % 32;
+                        let byte = wb[(r * gpr + g) * 8 + p / 4];
+                        let code = cortiq_core::quant::q4tp_code(codes, g);
+                        let s = tab[code];
+                        let center = if affine { 1.0 } else { 1.5 };
+                        acc += (f32::from((byte >> (2 * (p % 4))) & 3) - center)
+                            * s
+                            * xs[bi * cols + i];
+                    }
+                    out.push(acc);
+                }
+            }
+            out
+        };
+        let run = |affine: bool| -> Vec<f32> {
+            let y = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: (batch * rows * 4) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: (batch * rows * 4) as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let p = uniform_u32x4(
+                c,
+                [(cols / 4) as u32, rows as u32, batch as u32, affine as u32],
+            );
+            let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("q2tp-mm-test"),
+                layout: &c.q2tp_mm.get_bind_group_layout(0),
+                entries: &[
+                    bind_buf(0, &wbuf),
+                    bind_buf(1, &xbuf),
+                    bind_buf(2, &y),
+                    bind_buf(3, &p),
+                ],
+            });
+            let mut enc = c
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            {
+                let mut pass = begin_pass(&mut enc);
+                pass.set_pipeline(&c.q2tp_mm);
+                pass.set_bind_group(0, &bind, &[]);
+                pass.dispatch_workgroups(
+                    (rows as u32).div_ceil(64),
+                    (batch as u32).div_ceil(64),
+                    1,
+                );
+            }
+            let mut out = vec![0f32; batch * rows];
+            assert!(readback(
+                c,
+                enc,
+                &y,
+                &stage,
+                (batch * rows * 4) as u64,
+                &mut out,
+            ));
+            out
+        };
+        for affine in [false, true] {
+            let got = run(affine);
+            let expected = want(affine);
+            let (mut num, mut den) = (0f64, 0f64);
+            for (a, b) in got.iter().zip(&expected) {
+                num += ((*a - *b) as f64).powi(2);
+                den += (*b as f64).powi(2);
+            }
+            let rel = (num / den.max(1e-30)).sqrt();
+            eprintln!(
+                "q2tp {} mm vs cpu dequant: rel rms {rel:.2e}",
+                if affine { "affine" } else { "raw" }
+            );
+            assert!(rel < 1e-5, "q2tp mm drifted from CPU decode: {rel:.2e}");
+        }
     }
 
     /// The int8-activation batched kernel (dp4a) against the f32 singles:
@@ -35977,7 +39512,7 @@ fn main() {
                         .device
                         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
                     for _ in 0..reps {
-                        let (bind, wg) = q2tp_mv_bind(c, &wbuf, &xbuf, &ybuf, rows, cols);
+                        let (bind, wg) = q2tp_mv_bind(c, &wbuf, &xbuf, &ybuf, rows, cols, false);
                         let mut pass = begin_pass(&mut enc);
                         pass.set_pipeline(&c.q2tp_mv16w);
                         pass.set_bind_group(0, &bind, &[]);
@@ -43037,6 +46572,7 @@ fn dsv4_global_moe_create_with_segments(
         segments,
     });
     c.resident.fetch_add(total, Ordering::Relaxed);
+    note_resident_peak(c);
     c.dsv4_global_moe.lock().unwrap().insert(model.uid(), bufs);
     tracing::info!(
         "DSV4 unified global pool: {} slots, {} segments × {}, {} MB, gate/up {}, requested {}",
@@ -52255,6 +55791,182 @@ const BT_TS_NAMES: [&str; 16] = [
     "", "q", "comp", "окно", "ix-mv", "ix-score", "attend", "olora", "glue1", "nextq", "commit",
     "route", "gu", "dn", "glue2", "wo_b",
 ];
+
+// `CMF_BATCH_KERNEL_TS=1` reserves query slots 1024..4095 for the actual
+// resident batch kernels while the coarse batch-stage trace keeps 0..1023.
+// This is a bounded microscope, not a production timing path.  The helper
+// resets the records at every true batch entry and maps them only after the
+// frame fence. Any overflow is counted per stage instead of silently reusing
+// an older frame's records.
+const BATCH_KERNEL_TS_BASE: u32 = 1024;
+const BATCH_KERNEL_TS_LIMIT: u32 = 4096;
+static BATCH_KERNEL_TS_SLOT: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(BATCH_KERNEL_TS_BASE);
+static BATCH_KERNEL_TS_PAIRS: Mutex<Vec<(u8, u32, u64)>> = Mutex::new(Vec::new());
+static BATCH_KERNEL_TS_DROPPED: [std::sync::atomic::AtomicU32; 2] = [
+    std::sync::atomic::AtomicU32::new(0),
+    std::sync::atomic::AtomicU32::new(0),
+];
+
+fn batch_kernel_ts_on(c: &Ctx) -> bool {
+    std::env::var("CMF_BATCH_KERNEL_TS").as_deref() == Ok("1") && c.ts_query.is_some()
+}
+
+fn batch_kernel_ts_begin(c: &Ctx) {
+    if !batch_kernel_ts_on(c) {
+        return;
+    }
+    BATCH_KERNEL_TS_SLOT.store(BATCH_KERNEL_TS_BASE, std::sync::atomic::Ordering::Relaxed);
+    BATCH_KERNEL_TS_PAIRS.lock().unwrap().clear();
+    for n in &BATCH_KERNEL_TS_DROPPED {
+        n.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn batch_kernel_ts_pair(
+    c: &Ctx,
+    stage: u8,
+    active_bytes: u64,
+) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
+    if !batch_kernel_ts_on(c) {
+        return None;
+    }
+    let slot = BATCH_KERNEL_TS_SLOT.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+    if slot + 1 >= BATCH_KERNEL_TS_LIMIT {
+        if let Some(n) = BATCH_KERNEL_TS_DROPPED.get(stage as usize) {
+            n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        return None;
+    }
+    let (qs, _, _) = c.ts_query.as_ref()?;
+    BATCH_KERNEL_TS_PAIRS
+        .lock()
+        .unwrap()
+        .push((stage, slot, active_bytes));
+    Some(wgpu::ComputePassTimestampWrites {
+        query_set: qs,
+        beginning_of_pass_write_index: Some(slot),
+        end_of_pass_write_index: Some(slot + 1),
+    })
+}
+
+fn batch_kernel_ts_resolve(c: &Ctx, enc: &mut wgpu::CommandEncoder) {
+    if !batch_kernel_ts_on(c) {
+        return;
+    }
+    let pairs = BATCH_KERNEL_TS_PAIRS.lock().unwrap().clone();
+    if pairs.is_empty() {
+        return;
+    }
+    let end = BATCH_KERNEL_TS_SLOT
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .min(BATCH_KERNEL_TS_LIMIT);
+    if end <= BATCH_KERNEL_TS_BASE {
+        return;
+    }
+    if let Some((qs, resolve, stage)) = c.ts_query.as_ref() {
+        flush_pass(enc);
+        enc.resolve_query_set(
+            qs,
+            BATCH_KERNEL_TS_BASE..end,
+            resolve,
+            (BATCH_KERNEL_TS_BASE * 8) as u64,
+        );
+        flush_pass(enc);
+        enc.copy_buffer_to_buffer(
+            resolve,
+            (BATCH_KERNEL_TS_BASE * 8) as u64,
+            stage,
+            (BATCH_KERNEL_TS_BASE * 8) as u64,
+            ((end - BATCH_KERNEL_TS_BASE) * 8) as u64,
+        );
+    }
+}
+
+fn batch_kernel_ts_report(c: &Ctx, batch_tokens: usize) {
+    if !batch_kernel_ts_on(c) {
+        return;
+    }
+    let pairs = BATCH_KERNEL_TS_PAIRS.lock().unwrap().clone();
+    if pairs.is_empty() {
+        eprintln!("batch-kernel-ts: no timestamped kernels");
+        return;
+    }
+    let Some((_, _, stage)) = c.ts_query.as_ref() else {
+        return;
+    };
+    let end = BATCH_KERNEL_TS_SLOT
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .min(BATCH_KERNEL_TS_LIMIT);
+    let bytes = ((end - BATCH_KERNEL_TS_BASE) * 8) as u64;
+    let (tx, rx) = std::sync::mpsc::channel();
+    stage.map_async(
+        wgpu::MapMode::Read,
+        (BATCH_KERNEL_TS_BASE * 8) as u64..(BATCH_KERNEL_TS_BASE as u64 * 8 + bytes),
+        move |r| {
+            let _ = tx.send(r);
+        },
+    );
+    let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+    if !rx.recv().map(|r| r.is_ok()).unwrap_or(false) {
+        stage.unmap();
+        eprintln!("batch-kernel-ts: timestamp map failed");
+        return;
+    }
+    let Ok(raw) = stage.get_mapped_range(
+        (BATCH_KERNEL_TS_BASE * 8) as u64..(BATCH_KERNEL_TS_BASE as u64 * 8 + bytes),
+    ) else {
+        stage.unmap();
+        eprintln!("batch-kernel-ts: timestamp range unavailable");
+        return;
+    };
+    let ticks: &[u64] = bytemuck::cast_slice(&raw);
+    let mut ms = [0.0f64; 2];
+    let mut counts = [0u32; 2];
+    let mut active = [0u64; 2];
+    for &(which, slot, active_bytes) in &pairs {
+        let off = ((slot - BATCH_KERNEL_TS_BASE) as usize).min(ticks.len().saturating_sub(2));
+        let elapsed = ticks[off + 1].saturating_sub(ticks[off]) as f64 * c.ts_period as f64 / 1e6;
+        let i = which as usize;
+        if i < ms.len() {
+            ms[i] += elapsed;
+            counts[i] += 1;
+            active[i] = active[i].saturating_add(active_bytes);
+        }
+    }
+    drop(raw);
+    stage.unmap();
+    let q2_gbps = if ms[0] > 0.0 {
+        active[0] as f64 / 1e9 / (ms[0] / 1e3)
+    } else {
+        0.0
+    };
+    let fwht_gbps = if ms[1] > 0.0 {
+        active[1] as f64 / 1e9 / (ms[1] / 1e3)
+    } else {
+        0.0
+    };
+    let dropped_q2 = BATCH_KERNEL_TS_DROPPED[0].load(std::sync::atomic::Ordering::Relaxed);
+    let dropped_fwht = BATCH_KERNEL_TS_DROPPED[1].load(std::sync::atomic::Ordering::Relaxed);
+    eprintln!(
+        "batch-kernel-ts: k={} q2-mm={:.2}ms/{}(+{} dropped) active={:.3}GB ({:.1}MB/token) logical_bw={:.2}GB/s fwht={:.2}ms/{}(+{} dropped) active={:.3}GB ({:.1}MB/token) logical_bw={:.2}GB/s slots={}/{}",
+        batch_tokens,
+        ms[0],
+        counts[0],
+        dropped_q2,
+        active[0] as f64 / 1e9,
+        active[0] as f64 / 1e6 / batch_tokens.max(1) as f64,
+        q2_gbps,
+        ms[1],
+        counts[1],
+        dropped_fwht,
+        active[1] as f64 / 1e9,
+        active[1] as f64 / 1e6 / batch_tokens.max(1) as f64,
+        fwht_gbps,
+        pairs.len(),
+        BATCH_KERNEL_TS_LIMIT - BATCH_KERNEL_TS_BASE,
+    );
+}
 
 fn bt_ts_lis() -> &'static [usize] {
     static L: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();

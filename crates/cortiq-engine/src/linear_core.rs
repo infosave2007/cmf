@@ -25,6 +25,20 @@
 
 use crate::pool::Pool;
 use crate::qtensor::QTensor;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static PERF_GDN_FORWARD_CALLS: AtomicU64 = AtomicU64::new(0);
+static PERF_GDN_FORWARD_NS: AtomicU64 = AtomicU64::new(0);
+static PERF_GDN_BATCH_CALLS: AtomicU64 = AtomicU64::new(0);
+static PERF_GDN_BATCH_NS: AtomicU64 = AtomicU64::new(0);
+static PERF_GDN_STEP_CALLS: AtomicU64 = AtomicU64::new(0);
+static PERF_GDN_STEP_NS: AtomicU64 = AtomicU64::new(0);
+
+fn perf_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_PERF_PROFILE").as_deref() == Ok("1"))
+}
 
 /// Weights of one vmf_phase layer (`model.layers.{i}.vmf_attn.*`).
 pub struct VmfPhaseWeights {
@@ -392,6 +406,7 @@ fn gdn_step(
     of: &mut [f32],
     pool: Option<&Pool>,
 ) {
+    let perf_t0 = perf_enabled().then(std::time::Instant::now);
     let (nv, nk, dk, dv, kk) = (
         cfg.num_v_heads,
         cfg.num_k_heads,
@@ -514,6 +529,10 @@ fn gdn_step(
         }),
         _ => head_range(0, nv),
     }
+    if let Some(t0) = perf_t0 {
+        PERF_GDN_STEP_CALLS.fetch_add(1, Ordering::Relaxed);
+        PERF_GDN_STEP_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
 }
 
 /// Forward one position through a GatedDeltaNet layer, advancing `state`.
@@ -524,6 +543,7 @@ pub fn gdn_forward(
     state: &mut Vec<f32>,
     pool: Option<&Pool>,
 ) -> Vec<f32> {
+    let perf_t0 = perf_enabled().then(std::time::Instant::now);
     if state.len() != cfg.state_len() {
         *state = vec![0f32; cfg.state_len()];
     }
@@ -584,6 +604,10 @@ pub fn gdn_forward(
 
     let mut out = vec![0.0f32; cfg.hidden_size];
     w.out_proj.matvec(&of, &mut out, pool);
+    if let Some(t0) = perf_t0 {
+        PERF_GDN_FORWARD_CALLS.fetch_add(1, Ordering::Relaxed);
+        PERF_GDN_FORWARD_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
     out
 }
 
@@ -599,6 +623,7 @@ pub fn gdn_forward_batch(
     state: &mut Vec<f32>,
     pool: Option<&Pool>,
 ) -> Vec<f32> {
+    let perf_t0 = perf_enabled().then(std::time::Instant::now);
     if state.len() != cfg.state_len() {
         *state = vec![0f32; cfg.state_len()];
     }
@@ -644,7 +669,32 @@ pub fn gdn_forward_batch(
             n(state)
         );
     }
+    if let Some(t0) = perf_t0 {
+        PERF_GDN_BATCH_CALLS.fetch_add(1, Ordering::Relaxed);
+        PERF_GDN_BATCH_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
     out
+}
+
+/// Aggregate host-side GDN costs for the bounded warm-decode profile.
+pub fn perf_report() {
+    if !perf_enabled() {
+        return;
+    }
+    let fc = PERF_GDN_FORWARD_CALLS.load(Ordering::Relaxed);
+    let bc = PERF_GDN_BATCH_CALLS.load(Ordering::Relaxed);
+    let sc = PERF_GDN_STEP_CALLS.load(Ordering::Relaxed);
+    eprintln!(
+        "[perf-gdn] forward_calls={} forward_ms={:.3} forward_ms_per_call={:.3} batch_calls={} batch_ms={:.3} step_calls={} step_ms={:.3} step_ms_per_call={:.3}",
+        fc,
+        PERF_GDN_FORWARD_NS.load(Ordering::Relaxed) as f64 / 1e6,
+        PERF_GDN_FORWARD_NS.load(Ordering::Relaxed) as f64 / 1e6 / fc.max(1) as f64,
+        bc,
+        PERF_GDN_BATCH_NS.load(Ordering::Relaxed) as f64 / 1e6,
+        sc,
+        PERF_GDN_STEP_NS.load(Ordering::Relaxed) as f64 / 1e6,
+        PERF_GDN_STEP_NS.load(Ordering::Relaxed) as f64 / 1e6 / sc.max(1) as f64,
+    );
 }
 
 /// GDN qkv+z GPU eligibility: q1 mixers offload by default (the CPU q1

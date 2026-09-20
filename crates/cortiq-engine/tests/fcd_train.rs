@@ -95,6 +95,8 @@ fn tiny_arch() -> ModelArch {
         rope_freq_factors: None,
         logit_multiplier: None,
         loop_final_norm: false,
+        glm5_next: None,
+        prism_hadamard: None,
     }
 }
 
@@ -267,6 +269,7 @@ fn write_tiny_model_variant(
             num_heads: G_NV,
             nphase: None,
             value_head_dim: G_DV,
+            phase_delta_layers: None,
         });
         arch.linear_num_key_heads = Some(G_NK);
         arch.linear_num_value_heads = Some(G_NV);
