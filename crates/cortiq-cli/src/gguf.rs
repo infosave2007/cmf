@@ -894,6 +894,7 @@ fn arch_from_md(md: &BTreeMap<String, Val>, tensors: &[GgufTensor]) -> anyhow::R
                 num_heads: ssm_vheads.unwrap_or(0),
                 nphase: None,
                 value_head_dim: ssm_state.unwrap_or(0),
+            phase_delta_layers: None,
             })
         } else {
             None
@@ -935,6 +936,8 @@ fn arch_from_md(md: &BTreeMap<String, Val>, tensors: &[GgufTensor]) -> anyhow::R
         rope_freq_factors: None,
         logit_multiplier: None,
         loop_final_norm: false,
+        glm5_next: None,
+        prism_hadamard: None,
     })
 }
 
@@ -1080,7 +1083,9 @@ pub(crate) fn quant_type_for(quant: Quant) -> QuantType {
         Quant::Q4Block => QuantType::Q4Block,
         Quant::F16 => QuantType::F16,
         Quant::Vbit => QuantType::Vbit,
-        Quant::Q4Tiled | Quant::Q4TiledP | Quant::Q2TiledP => QuantType::Q4Block,
+        Quant::Q4Tiled | Quant::Q4TiledP | Quant::Q2TiledP | Quant::Q2TiledPAffine => {
+            QuantType::Q4Block
+        }
         Quant::Q1 | Quant::Q1p | Quant::Q1s | Quant::Q1t => QuantType::Vbit,
     }
 }
@@ -1290,6 +1295,8 @@ fn qwen_image_arch(geometry: &QwenImageGeometry) -> ModelArch {
         kda_gate_lower_bound: None,
         num_loops: 1,
         loop_final_norm: false,
+        glm5_next: None,
+        prism_hadamard: None,
     }
 }
 
@@ -1872,7 +1879,17 @@ pub fn run_import_gguf(
     }
 
     let (vocab, bundle) = tokenizer(&g.md);
-    let quant_type = quant_type_for(quant);
+    let quant_type = match quant {
+        Quant::Q8Row => QuantType::Q8Row,
+        Quant::Q8_2f => QuantType::Q8_2f,
+        Quant::Q4Block => QuantType::Q4Block,
+        Quant::F16 => QuantType::F16,
+        Quant::Vbit => QuantType::Vbit,
+        Quant::Q4Tiled | Quant::Q4TiledP | Quant::Q2TiledP | Quant::Q2TiledPAffine => {
+            QuantType::Q4Block
+        }
+        Quant::Q1 | Quant::Q1p | Quant::Q1s | Quant::Q1t => QuantType::Vbit,
+    };
     let header = CmfHeader {
         format: "cmf".into(),
         version: CMF_VERSION,

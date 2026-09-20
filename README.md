@@ -40,7 +40,7 @@ cortiq verify model.cmf
 
 ## Native Qwen Image Edit
 
-Version 0.6.8 adds the native Qwen-Image-Edit-2509 path. The ready default is
+Version 0.6.9 adds the native Qwen-Image-Edit-2509 path and the explicit `q2tp_affine` Prism profile. The ready default is
 one self-contained CMF, while the standalone component files remain available
 when users want to stage them independently. Build the bundle from a directory
 that contains `transformer.cmf`, `text_encoder.cmf`, `vae.cmf`, and
@@ -118,12 +118,19 @@ precision while large matrix blocks use a compact codec.
 | `f16`, `f32` | norms, embeddings and exact control tensors |
 | `q8`, `q8_2f` | high-fidelity weights; `q8_2f` adds input-channel scales |
 | `q4`, `q4t`, `q4tp` | general dense and MoE weights |
-| `q2tp`, `vbit`, `vbit_ro` | size-constrained or mixed-bit profiles |
+| `q2tp` | existing dtype-16 midrise four-level codec; zero is not an individual code |
+| `q2tp_affine` | dtype-16 Prism profile with explicit `(c - 1) * s` affine operator; requires signed-Hadamard and affine metadata |
+| `vbit`, `vbit_ro` | size-constrained or mixed-bit profiles |
 | `q1`, `q1t`, `q1s` | trained binary or experimental ternary/PTQ paths |
 
 See [Q1T/PTQ](docs/Q1T_PTQ.md) for the experimental low-bit path and the
 [quantization coverage matrix](docs/QUANT_COVERAGE.ru.md) for codec support by
 execution path.
+
+The `q2tp_affine` profile is an explicit Prism/Bonsai operator, not a
+reinterpretation of ordinary `q2tp`: its signed Hadamard descriptor and affine
+feature metadata are required at load time, and older readers must reject it.
+It preserves the public `q2tp` codec and its existing semantics unchanged.
 
 ## Runtime capabilities
 

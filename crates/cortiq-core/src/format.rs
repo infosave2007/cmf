@@ -69,9 +69,59 @@ pub mod features {
     /// running half a network; runtimes that know it refuse to RUN it and
     /// say `cortiq skill apply` instead.
     pub const SKILL_FILE: u32 = 1 << 6;
+    /// Signed FWHT Prism/Bonsai matrices and activation-boundary contract.
+    pub const PRISM_HADAMARD: u32 = 1 << 7;
+    /// Explicit q2tp affine correction (`(c - 1.0) * s`) for the listed
+    /// Prism matrices.  This is deliberately separate from the transform bit
+    /// so readers cannot infer the correction from arch_name alone.
+    pub const PRISM_AFFINE: u32 = 1 << 8;
 
     /// Features this reader implements today.
-    pub const SUPPORTED: u32 = TENSOR_DIR | BINARY_MASKS | QUANT_2F | LOOP_MASKS | SKILL_FILE;
+    pub const SUPPORTED: u32 = TENSOR_DIR
+        | BINARY_MASKS
+        | QUANT_2F
+        | LOOP_MASKS
+        | SKILL_FILE
+        | PRISM_HADAMARD
+        | PRISM_AFFINE;
+}
+
+fn validate_prism_affine_targets(
+    arch: &ModelArch,
+    tensors: &[TensorEntry],
+) -> Result<(), CmfError> {
+    let Some(prism) = arch.prism_hadamard.as_ref() else {
+        return Ok(());
+    };
+    let Some(affine) = prism.affine.as_ref() else {
+        return Ok(());
+    };
+    affine.validate().map_err(CmfError::Parse)?;
+    for name in &affine.target_names {
+        let matches = tensors
+            .iter()
+            .filter(|t| t.name == *name)
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return Err(CmfError::Parse(format!(
+                "Prism affine target '{}' appears {} times (expected exactly once)",
+                name,
+                matches.len()
+            )));
+        }
+        let t = matches[0];
+        if t.dtype != TensorDtype::Q2TiledP
+            || t.shape.len() != 2
+            || t.shape[1] == 0
+            || t.shape[1] % 32 != 0
+        {
+            return Err(CmfError::Parse(format!(
+                "Prism affine target '{}' must be dtype q2tp [rows, positive cols multiple of 32], got {:?}{:?}",
+                name, t.dtype, t.shape
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// JSON header — architecture and provenance (human-readable part;
@@ -469,9 +519,42 @@ impl CmfModel {
         // Header JSON
         let header: CmfHeader = serde_json::from_slice(section(env.header.0, env.header.1))
             .map_err(|e| CmfError::Parse(format!("header JSON: {e}")))?;
-
+        header
+            .arch
+            .validate_linear_core_metadata()
+            .map_err(CmfError::Parse)?;
+        let prism_bit = env.required_features & features::PRISM_HADAMARD != 0;
+        let affine_bit = env.required_features & features::PRISM_AFFINE != 0;
+        let has_prism = header.arch.prism_hadamard.is_some();
+        let has_affine = header
+            .arch
+            .prism_hadamard
+            .as_ref()
+            .and_then(|p| p.affine.as_ref())
+            .is_some();
+        if prism_bit != has_prism {
+            return Err(CmfError::Parse(format!(
+                "required_features PRISM_HADAMARD={} disagrees with prism_hadamard metadata={has_prism}",
+                prism_bit
+            )));
+        }
+        if affine_bit != has_affine {
+            return Err(CmfError::Parse(format!(
+                "required_features PRISM_AFFINE={} disagrees with affine metadata={has_affine}",
+                affine_bit
+            )));
+        }
+        if let Some(prism) = header.arch.prism_hadamard.as_ref() {
+            prism.validate().map_err(CmfError::Parse)?;
+            if header.arch.arch_name != "prism_hadamard_qwen35" {
+                return Err(CmfError::Parse(
+                    "prism_hadamard metadata requires arch_name prism_hadamard_qwen35".into(),
+                ));
+            }
+        }
         // Tensor directory
         let tensors = Self::decode_directory(section(env.dir.0, env.dir.1))?;
+        validate_prism_affine_targets(&header.arch, &tensors)?;
         for t in &tensors {
             if t.off % TENSOR_ALIGNMENT != 0 {
                 return Err(CmfError::Bounds(format!(
@@ -612,6 +695,12 @@ impl CmfModel {
         for no in 2..=info.count {
             let sib = path.with_file_name(format!("{stem}-{:05}-of-{:05}.cmf", no, info.count));
             let sh = Self::open(&sib)?;
+            if sh.header.arch.linear_core_identity() != first.header.arch.linear_core_identity() {
+                return Err(CmfError::Parse(format!(
+                    "{}: linear-core identity differs from shard 1",
+                    sib.display()
+                )));
+            }
             match &sh.header.shard {
                 Some(si) if si.no == no && si.count == info.count => {}
                 other => {
@@ -1170,7 +1259,18 @@ impl CmfModel {
         vocab: Option<&[u8]>,
     ) -> Result<(), CmfError> {
         let path = path.as_ref();
-
+        header
+            .arch
+            .validate_linear_core_metadata()
+            .map_err(CmfError::Parse)?;
+        if let Some(prism) = header.arch.prism_hadamard.as_ref() {
+            prism.validate().map_err(CmfError::Parse)?;
+            if header.arch.arch_name != "prism_hadamard_qwen35" {
+                return Err(CmfError::Parse(
+                    "prism_hadamard metadata requires arch_name prism_hadamard_qwen35".into(),
+                ));
+            }
+        }
         // Directory + data layout.
         let mut entries = Vec::with_capacity(tensors.len());
         let mut data_cursor = 0u64;
@@ -1213,6 +1313,8 @@ impl CmfModel {
         }
         let data_len = data_cursor;
 
+        validate_prism_affine_targets(&header.arch, &entries)?;
+
         let dir_bytes = Self::encode_directory(&entries);
 
         let masks_bytes = match masks {
@@ -1244,6 +1346,18 @@ impl CmfModel {
             serde_json::to_vec(&header).map_err(|e| CmfError::Parse(format!("header: {e}")))?;
 
         let mut required_features = features::TENSOR_DIR;
+        if header.arch.prism_hadamard.is_some() {
+            required_features |= features::PRISM_HADAMARD;
+        }
+        if header
+            .arch
+            .prism_hadamard
+            .as_ref()
+            .and_then(|p| p.affine.as_ref())
+            .is_some()
+        {
+            required_features |= features::PRISM_AFFINE;
+        }
         if masks_bytes.is_some() {
             required_features |= features::BINARY_MASKS;
             if header.arch.num_loops > 1 {
@@ -1369,9 +1483,13 @@ fn zeros(n: usize) -> Vec<u8> {
 }
 
 /// Persist a directory entry after a file it contains is created or updated.
-/// A converter checkpoint is only safe once the payload, manifest, and their
-/// containing directory are durable. Filesystems without directory fsync keep
-/// the file-level ordering through the no-op fallback.
+///
+/// A checkpoint mark is the boundary at which the converter may consume its
+/// source shard.  Syncing the containing directory after the output payload
+/// and manifest has been synced closes the small rename/create window where a
+/// crash could otherwise leave durable bytes without a durable directory
+/// entry.  Unix filesystems expose directory fsync; other platforms retain
+/// the file-level ordering and use the no-op fallback below.
 fn sync_parent_dir(path: &Path) -> Result<(), CmfError> {
     #[cfg(unix)]
     {
@@ -1464,8 +1582,13 @@ impl CmfStreamWriter {
     }
 
     /// Append one tensor while limiting each write syscall to `chunk_bytes`.
-    /// This keeps very large native auxiliary tensors bounded while preserving
-    /// the same directory entry and hash as [`Self::push`].
+    ///
+    /// The source is normally an mmap, so this does not change the caller's
+    /// memory residency. It does make the bounded-copy contract explicit for
+    /// very large auxiliary tensors (DeepSeek-V4.1's native Engram tables are
+    /// hundreds of gigabytes): the writer never asks an I/O layer to stage the
+    /// whole payload as one buffer. Hashing remains one streaming pass over the
+    /// borrowed bytes, and the directory entry is identical to [`Self::push`].
     pub fn push_bounded(
         &mut self,
         name: &str,
@@ -1538,6 +1661,9 @@ impl CmfStreamWriter {
         let mut f = BufWriter::new(File::create(&path)?);
         writeln!(f, "{{\"data_off\":{}}}", self.data_off)?;
         f.flush()?;
+        // The first line establishes the resume geometry.  Make both its
+        // contents and its directory entry durable before any source shard
+        // can reach a later checkpoint.
         f.get_ref().sync_data()?;
         sync_parent_dir(&path)?;
         self.manifest = Some(f);
@@ -1549,6 +1675,8 @@ impl CmfStreamWriter {
     pub fn appending_manifest(mut self, path: impl AsRef<Path>) -> Result<Self, CmfError> {
         let path = path.as_ref().to_path_buf();
         let file = std::fs::OpenOptions::new().append(true).open(&path)?;
+        // A resumed writer is allowed to consume the next shard immediately;
+        // preserve the same directory ordering guarantee as a fresh writer.
         file.sync_data()?;
         sync_parent_dir(&path)?;
         self.manifest = Some(BufWriter::new(file));
@@ -1673,6 +1801,8 @@ impl CmfStreamWriter {
             m.flush()?;
             m.get_ref().sync_data()?;
         }
+        // This is deliberately after both file syncs: the converter removes
+        // a consumed source shard only after mark() returns.
         sync_parent_dir(&self.path)?;
         Ok(())
     }
@@ -1720,6 +1850,8 @@ impl CmfStreamWriter {
 
         let dir_bytes = CmfModel::encode_directory(&self.entries);
 
+        validate_prism_affine_targets(&header.arch, &self.entries)?;
+
         let hex = |b: Option<&[u8]>| b.map(|b| format!("{:016x}", hash64(b)));
         let mut header = header.clone();
         if masks_bytes.is_some() || vocab.is_some() || index_bytes.is_some() {
@@ -1733,6 +1865,18 @@ impl CmfStreamWriter {
             serde_json::to_vec(&header).map_err(|e| CmfError::Parse(format!("header: {e}")))?;
 
         let mut required_features = features::TENSOR_DIR;
+        if header.arch.prism_hadamard.is_some() {
+            required_features |= features::PRISM_HADAMARD;
+        }
+        if header
+            .arch
+            .prism_hadamard
+            .as_ref()
+            .and_then(|p| p.affine.as_ref())
+            .is_some()
+        {
+            required_features |= features::PRISM_AFFINE;
+        }
         if masks_bytes.is_some() {
             required_features |= features::BINARY_MASKS;
             if header.arch.num_loops > 1 {

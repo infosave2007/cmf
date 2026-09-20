@@ -740,7 +740,16 @@ fn project_matvecs(
     // Runtime probe (Batch class): the batch either amortizes its
     // submit+poll on this driver stack or the fused CPU dispatch wins.
     let mut done = false;
-    if crate::gpu::enabled_here() && (wq.rows() >= crate::gpu::min_rows() || wq.is_q1()) {
+    // Prism matrices need one descriptor-aware FWHT per projection, while the
+    // fused batch job has no transform metadata.  Bypassing that unsupported
+    // probe is deliberate: matvec_many sees the Prism contract and routes
+    // each matrix through the correct per-op GPU kernel instead of putting the
+    // whole Q/K/V set in cpu_scope after a structural batch decline.
+    let prism_projections =
+        wq.has_prism_contract() || wk.has_prism_contract() || wv.has_prism_contract();
+    if !prism_projections
+        && crate::gpu::enabled_here()
+        && (wq.rows() >= crate::gpu::min_rows() || wq.is_q1()) {
         let arm = if wq.is_q1() && crate::gpu::q1_force() {
             crate::gpu::ProbeArm::Gpu
         } else {
