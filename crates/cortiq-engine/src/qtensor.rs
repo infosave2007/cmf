@@ -376,6 +376,9 @@ impl QTensor {
     /// dtype). Q4-block lets a precise down_proj/lm_head stay on-device.
     /// Named `q1_parts` for historical reasons.
     pub(crate) fn q1_parts(&self) -> Option<(usize, usize, usize)> {
+        if self.has_prism_contract() {
+            return None;
+        }
         match self {
             #[cfg(target_os = "macos")]
             Self::Mapped {
@@ -403,12 +406,35 @@ impl QTensor {
         }
     }
 
+    /// `(directory idx, rows, cols)` for the native Metal token graph.  The
+    /// historical q1 graph gate intentionally refuses every Prism tensor so
+    /// an untransformed q2 payload cannot slip into the resident path.  The
+    /// Metal2 graph is descriptor-aware and admits only the production
+    /// q2tp-affine forward targets; ordinary q1/q4 callers retain the old
+    /// `q1_parts` behaviour.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn metal_graph_parts(&self) -> Option<(usize, usize, usize)> {
+        if let Some((model, idx, kind, _)) = self.graph_weight_descriptor() {
+            let name = &model.tensors[idx].name;
+            let forward = kind == 9 && crate::prism::is_forward_weight(model, name);
+            let affine = kind == 9 && crate::prism::is_affine_target(model, name);
+            if forward && affine {
+                let e = model.tensors.get(idx)?;
+                return Some((idx, *e.shape.first()?, *e.shape.get(1)?));
+            }
+        }
+        self.q1_parts()
+    }
+
     /// (directory idx, rows, cols) of a q4_tiled mapped tensor. The
     /// chunk-prefill graph takes it in the same 4-tuple slot as
     /// `q8_row_parts` with an EMPTY row_scale — q4t carries its scales
     /// inside the 18-byte tiles, and the empty slice is what tells the
     /// encoder to reach for the q4t kernels.
     pub(crate) fn q4t_parts(&self) -> Option<(usize, usize, usize)> {
+        if self.has_prism_contract() {
+            return None;
+        }
         match self {
             Self::Mapped {
                 idx,
@@ -425,6 +451,9 @@ impl QTensor {
     /// slot as `q4t_parts` in the chunk graph — the encoder tells the two
     /// apart by the tensor's dtype, not by the slot.
     pub(crate) fn q4tp_parts(&self) -> Option<(usize, usize, usize)> {
+        if self.has_prism_contract() {
+            return None;
+        }
         match self {
             Self::Mapped {
                 idx,
@@ -442,6 +471,9 @@ impl QTensor {
     /// q8_2f is excluded on purpose: its column field would need a
     /// prescale stage on the device.
     pub(crate) fn q8_row_parts(&self) -> Option<(usize, usize, usize, &[f32])> {
+        if self.has_prism_contract() {
+            return None;
+        }
         match self {
             Self::Mapped {
                 idx,
@@ -488,6 +520,14 @@ impl QTensor {
         }
     }
 
+    /// Whether this mapped tensor belongs to the Prism/Bonsai transform
+    /// contract.  Device graphs do not carry the descriptor, so callers use
+    /// this conservative predicate to stay on the descriptor-aware CPU path
+    /// instead of silently executing an unrotated matrix.
+    pub(crate) fn has_prism_contract(&self) -> bool {
+        matches!(self, Self::Mapped { model, .. } if crate::prism::has_contract(model))
+    }
+
     pub fn rows(&self) -> usize {
         match self {
             Self::F32 { rows, .. } | Self::Mapped { rows, .. } => *rows,
@@ -497,6 +537,9 @@ impl QTensor {
     /// Mapped q4t handle (model + directory index) — the fused GPU FFN
     /// needs the raw file coordinates of its three projections.
     pub(crate) fn mapped_q4t(&self) -> Option<(&Arc<CmfModel>, usize)> {
+        if self.has_prism_contract() {
+            return None;
+        }
         match self {
             Self::Mapped {
                 model,
@@ -511,6 +554,9 @@ impl QTensor {
     /// Same slot as `mapped_q4t` for a q4tp tensor — the fused DiT FFN picks
     /// its kernels by which of the two answers.
     pub fn mapped_q4tp(&self) -> Option<(&Arc<CmfModel>, usize)> {
+        if self.has_prism_contract() {
+            return None;
+        }
         match self {
             Self::Mapped {
                 model,
@@ -530,6 +576,9 @@ impl QTensor {
     /// after those kernels learned its codec. The gate is what the codec has
     /// a device GEMM for, not which codec it is.
     pub fn mapped_device_gemm(&self) -> Option<(&Arc<CmfModel>, usize)> {
+        if self.has_prism_contract() {
+            return None;
+        }
         match self {
             Self::Mapped {
                 model,
@@ -544,6 +593,9 @@ impl QTensor {
     /// (model, tensor idx) for a q2tp mapped weight — the 2-bit twin of
     /// `mapped_q4tp`, used by the mixed MoE profile.
     pub fn mapped_q2tp(&self) -> Option<(&Arc<CmfModel>, usize)> {
+        if self.has_prism_contract() {
+            return None;
+        }
         match self {
             Self::Mapped {
                 model,
@@ -564,6 +616,9 @@ impl QTensor {
     /// (model, tensor idx) for a q1 mapped weight — the wgpu token graph
     /// keys its resident VRAM cache by idx. None for any other dtype/kind.
     pub fn mapped_q1(&self) -> Option<(&std::sync::Arc<CmfModel>, usize)> {
+        if self.has_prism_contract() {
+            return None;
+        }
         match self {
             Self::Mapped {
                 model,
@@ -585,6 +640,19 @@ impl QTensor {
     /// stopped being true — a stale comment on this function is how a
     /// model silently loses the graph, so it is worth keeping honest.
     pub fn graph_weight(&self) -> Option<(&std::sync::Arc<CmfModel>, usize, u8, &[f32])> {
+        if self.has_prism_contract() {
+            return None;
+        }
+        self.graph_weight_descriptor()
+    }
+
+    /// Descriptor-aware graph handle used only by the Prism token graph.
+    /// Ordinary graph callers continue to use [`graph_weight`] and therefore
+    /// remain fail-closed until they provide the same explicit transform
+    /// contract.
+    pub(crate) fn graph_weight_descriptor(
+        &self,
+    ) -> Option<(&std::sync::Arc<CmfModel>, usize, u8, &[f32])> {
         match self {
             Self::Mapped {
                 model,
@@ -676,6 +744,8 @@ impl QTensor {
         match self {
             Self::F32 { data, .. } => dst.copy_from_slice(&data[r * cols..(r + 1) * cols]),
             Self::Mapped {
+                model,
+                idx,
                 dtype,
                 row_scale,
                 col_field,
@@ -693,6 +763,9 @@ impl QTensor {
                             dst[gi * GROUP_SIZE + k * 2 + 1] = (((b >> 4) & 0x0F) as f32 - 8.0) * s;
                         }
                     }
+                    if crate::prism::is_inverse_embedding(model, &model.tensors[*idx].name) {
+                        crate::prism::inverse_embedding(model, dst);
+                    }
                     return;
                 }
                 if *dtype == TensorDtype::Q4TiledP {
@@ -709,6 +782,9 @@ impl QTensor {
                             dst[gi * GROUP_SIZE + k * 2 + 1] = (((b >> 4) & 0x0F) as f32 - 8.0) * s;
                         }
                     }
+                    if crate::prism::is_inverse_embedding(model, &model.tensors[*idx].name) {
+                        crate::prism::inverse_embedding(model, dst);
+                    }
                     return;
                 }
                 if *dtype == TensorDtype::Q2TiledP {
@@ -723,10 +799,21 @@ impl QTensor {
                         let s = sc[gi];
                         for (k, &b) in ch.iter().enumerate() {
                             for j in 0..4 {
+                                let center = if crate::prism::is_affine_target(
+                                    model,
+                                    &model.tensors[*idx].name,
+                                ) {
+                                    1.0
+                                } else {
+                                    1.5
+                                };
                                 dst[gi * GROUP_SIZE + k * 4 + j] =
-                                    (((b >> (2 * j)) & 3) as f32 - 1.5) * s;
+                                    (((b >> (2 * j)) & 3) as f32 - center) * s;
                             }
                         }
+                    }
+                    if crate::prism::is_inverse_embedding(model, &model.tensors[*idx].name) {
+                        crate::prism::inverse_embedding(model, dst);
                     }
                     return;
                 }
@@ -740,6 +827,9 @@ impl QTensor {
                             dst[gi * GROUP_SIZE + k * 2] = ((b & 0x0F) as f32 - 8.0) * s;
                             dst[gi * GROUP_SIZE + k * 2 + 1] = (((b >> 4) & 0x0F) as f32 - 8.0) * s;
                         }
+                    }
+                    if crate::prism::is_inverse_embedding(model, &model.tensors[*idx].name) {
+                        crate::prism::inverse_embedding(model, dst);
                     }
                     return;
                 }
@@ -755,6 +845,9 @@ impl QTensor {
                                     (((b >> k) & 1) as f32 * 2.0 - 1.0) * s;
                             }
                         }
+                    }
+                    if crate::prism::is_inverse_embedding(model, &model.tensors[*idx].name) {
+                        crate::prism::inverse_embedding(model, dst);
                     }
                     return;
                 }
@@ -807,6 +900,9 @@ impl QTensor {
                             }
                         }
                     }
+                    if crate::prism::is_inverse_embedding(model, &model.tensors[*idx].name) {
+                        crate::prism::inverse_embedding(model, dst);
+                    }
                     return;
                 }
                 if matches!(dtype, TensorDtype::Vbit | TensorDtype::VbitRo) {
@@ -821,11 +917,11 @@ impl QTensor {
                     let b = bits[r] as usize;
                     let l = ((1usize << (b - 1)) - 1) as f32;
                     let data = &bytes[off..];
-                    let (mut acc, mut nbits, mut idx) = (0u64, 0usize, 0usize);
+                    let (mut acc, mut nbits, mut byte_idx) = (0u64, 0usize, 0usize);
                     for (i, d) in dst.iter_mut().enumerate() {
                         while nbits < b {
-                            acc = (acc << 8) | data[idx] as u64;
-                            idx += 1;
+                            acc = (acc << 8) | data[byte_idx] as u64;
+                            byte_idx += 1;
                             nbits += 8;
                         }
                         let u = ((acc >> (nbits - b)) & ((1u64 << b) - 1)) as f32;
@@ -836,6 +932,9 @@ impl QTensor {
                             bytes[sc_off + so + 1],
                         ]));
                         *d = (u - l) * sv;
+                    }
+                    if crate::prism::is_inverse_embedding(model, &model.tensors[*idx].name) {
+                        crate::prism::inverse_embedding(model, dst);
                     }
                     return;
                 }
@@ -853,6 +952,9 @@ impl QTensor {
                         }
                     }
                     _ => unreachable!(),
+                }
+                if crate::prism::is_inverse_embedding(model, &model.tensors[*idx].name) {
+                    crate::prism::inverse_embedding(model, dst);
                 }
             }
         }
@@ -993,24 +1095,49 @@ impl QTensor {
                 row.iter().zip(x).map(|(w, v)| w * v).sum()
             }
             Self::Mapped {
+                model,
+                idx,
                 dtype,
                 row_scale,
                 col_field,
                 ..
-            } => match dtype {
-                TensorDtype::Q8Row => {
-                    let q = &self.quant_bytes()[r * cols..(r + 1) * cols];
-                    dot_i8_f32(q, x) * row_scale[r]
+            } => {
+                let prism_forward =
+                    crate::prism::is_forward_weight(model, &model.tensors[*idx].name);
+                if prism_forward {
+                    let transformed = crate::prism::forward(model, &x[..cols]);
+                    let gpr = cols / GROUP_SIZE;
+                    match dtype {
+                        TensorDtype::Q2TiledP => {
+                            let v = Q4tpView::new_q2(self.quant_bytes(), self.rows(), cols);
+                            let mut sc = vec![0f32; gpr];
+                            v.scales_into(r, gpr, &mut sc);
+                            if crate::prism::is_affine_target(model, &model.tensors[*idx].name) {
+                                return q2tp_affine_row_exact(v.nib, r, gpr, &transformed, &sc);
+                            }
+                            return q2tp_row_exact(v.nib, r, gpr, &transformed, &sc);
+                        }
+                        _ => {
+                            self.row_f32(r, scratch);
+                            return scratch.iter().zip(&transformed).map(|(w, v)| w * v).sum();
+                        }
+                    }
                 }
-                TensorDtype::Q8_2f => {
-                    let q = &self.quant_bytes()[r * cols..(r + 1) * cols];
-                    dot_i8_col_f32(q, x, col_field) * row_scale[r]
+                match dtype {
+                    TensorDtype::Q8Row => {
+                        let q = &self.quant_bytes()[r * cols..(r + 1) * cols];
+                        dot_i8_f32(q, x) * row_scale[r]
+                    }
+                    TensorDtype::Q8_2f => {
+                        let q = &self.quant_bytes()[r * cols..(r + 1) * cols];
+                        dot_i8_col_f32(q, x, col_field) * row_scale[r]
+                    }
+                    _ => {
+                        self.row_f32(r, scratch);
+                        scratch.iter().zip(x).map(|(w, v)| w * v).sum()
+                    }
                 }
-                _ => {
-                    self.row_f32(r, scratch);
-                    scratch.iter().zip(x).map(|(w, v)| w * v).sum()
-                }
-            },
+            }
         }
     }
 
@@ -1049,6 +1176,124 @@ impl QTensor {
                     out.len(),
                     x.len(),
                 );
+                let prism_forward =
+                    crate::prism::is_forward_weight(model, &model.tensors[*idx].name);
+                if *dtype == TensorDtype::Q2TiledP
+                    && std::env::var("CMF_Q2TP_TRACE").as_deref() == Ok("1")
+                {
+                    use std::sync::atomic::{AtomicUsize, Ordering};
+                    static N: AtomicUsize = AtomicUsize::new(0);
+                    let n = N.fetch_add(1, Ordering::Relaxed);
+                    if n < 128 {
+                        eprintln!(
+                            "q2tp-dispatch #{n} name={} prism={} rows={} cols={} gpu={} optin={} layer={}",
+                            model.tensors[*idx].name,
+                            prism_forward,
+                            rows,
+                            cols,
+                            crate::gpu::enabled_here(),
+                            crate::gpu::q2tp_gpu_opt_in(),
+                            crate::gpu::cur_layer(),
+                        );
+                    }
+                }
+                // Prism stores every manifest-listed forward matrix in the
+                // signed-Hadamard basis.  The q2tp WGSL path receives that
+                // transformed vector and an explicit affine bit; codecs
+                // without a descriptor-aware kernel remain on CPU below.
+                if prism_forward {
+                    let transformed = crate::prism::forward(model, &x[..*cols]);
+                    match dtype {
+                        TensorDtype::Q4Block => {
+                            q4matvec(self.quant_bytes(), &transformed, *rows, *cols, out, pool)
+                        }
+                        TensorDtype::Q4Tiled => {
+                            q4t_matvec(self.quant_bytes(), &transformed, *rows, *cols, out, pool)
+                        }
+                        TensorDtype::Q4TiledP => {
+                            q4tp_matvec(self.quant_bytes(), &transformed, *rows, *cols, out, pool)
+                        }
+                        TensorDtype::Q2TiledP => {
+                            let affine =
+                                crate::prism::is_affine_target(model, &model.tensors[*idx].name);
+                            if *rows * *cols >= 8_388_608
+                                && crate::gpu::enabled_here()
+                                && crate::gpu::q2tp_gpu_opt_in()
+                            {
+                                let gpu_ok = if affine {
+                                    crate::gpu::q2tp_affine_matvec(
+                                        model,
+                                        *idx,
+                                        &transformed,
+                                        *rows,
+                                        *cols,
+                                        out,
+                                    )
+                                } else {
+                                    crate::gpu::q2tp_matvec(
+                                        model,
+                                        *idx,
+                                        &transformed,
+                                        *rows,
+                                        *cols,
+                                        out,
+                                    )
+                                };
+                                if gpu_ok {
+                                    return;
+                                }
+                            }
+                            if affine {
+                                q2tp_affine_matvec(
+                                    self.quant_bytes(),
+                                    &transformed,
+                                    *rows,
+                                    *cols,
+                                    out,
+                                    pool,
+                                )
+                            } else {
+                                q2tp_matvec(
+                                    self.quant_bytes(),
+                                    &transformed,
+                                    *rows,
+                                    *cols,
+                                    out,
+                                    pool,
+                                )
+                            }
+                        }
+                        TensorDtype::Q1 => {
+                            q1_matvec(self.quant_bytes(), &transformed, *rows, *cols, out, pool)
+                        }
+                        TensorDtype::Q1T => {
+                            q1t_matvec(self.quant_bytes(), &transformed, *rows, *cols, out, pool)
+                        }
+                        TensorDtype::Vbit | TensorDtype::VbitRo => vbitmatvec(
+                            self.quant_bytes(),
+                            vbit_offsets,
+                            &transformed,
+                            *rows,
+                            *cols,
+                            out,
+                            pool,
+                        ),
+                        TensorDtype::Q8Row | TensorDtype::Q8_2f => qmatvec(
+                            self.quant_bytes(),
+                            repack,
+                            row_scale,
+                            &transformed,
+                            col_field,
+                            *dtype,
+                            *rows,
+                            *cols,
+                            out,
+                            pool,
+                        ),
+                        _ => unreachable!("unsupported mapped Prism dtype {dtype:?}"),
+                    }
+                    return;
+                }
                 if *dtype == TensorDtype::Q4Block {
                     // GPU route (wgpu q4b kernel) for large q4_block matvecs —
                     // gives NVIDIA/AMD/Intel q4 models a GPU path. Probe keeps
@@ -1352,6 +1597,8 @@ impl QTensor {
         match self {
             Self::F32 { data, .. } => matvec_rows2(pool, data, x1, x2, o1, o2),
             Self::Mapped {
+                model,
+                idx,
                 dtype,
                 rows,
                 cols,
@@ -1360,6 +1607,78 @@ impl QTensor {
                 vbit_offsets,
                 ..
             } => {
+                if crate::prism::is_forward_weight(model, &model.tensors[*idx].name) {
+                    let tx1 = crate::prism::forward(model, &x1[..*cols]);
+                    let tx2 = crate::prism::forward(model, &x2[..*cols]);
+                    match dtype {
+                        TensorDtype::Q4Block => {
+                            q4matvec2(self.quant_bytes(), &tx1, &tx2, *rows, *cols, o1, o2, pool)
+                        }
+                        TensorDtype::Q4Tiled => {
+                            q4t_matvec2(self.quant_bytes(), &tx1, &tx2, *rows, *cols, o1, o2, pool)
+                        }
+                        TensorDtype::Q4TiledP => {
+                            q4tp_matvec2(self.quant_bytes(), &tx1, &tx2, *rows, *cols, o1, o2, pool)
+                        }
+                        TensorDtype::Q2TiledP => {
+                            if crate::prism::is_affine_target(model, &model.tensors[*idx].name) {
+                                q2tp_affine_matvec2(
+                                    self.quant_bytes(),
+                                    &tx1,
+                                    &tx2,
+                                    *rows,
+                                    *cols,
+                                    o1,
+                                    o2,
+                                    pool,
+                                )
+                            } else {
+                                q2tp_matvec2(
+                                    self.quant_bytes(),
+                                    &tx1,
+                                    &tx2,
+                                    *rows,
+                                    *cols,
+                                    o1,
+                                    o2,
+                                    pool,
+                                )
+                            }
+                        }
+                        TensorDtype::Q1 => {
+                            q1_matvec2(self.quant_bytes(), &tx1, &tx2, *rows, *cols, o1, o2, pool)
+                        }
+                        TensorDtype::Q1T => {
+                            q1t_matvec2(self.quant_bytes(), &tx1, &tx2, *rows, *cols, o1, o2, pool)
+                        }
+                        TensorDtype::Vbit | TensorDtype::VbitRo => vbitmatvec2(
+                            self.quant_bytes(),
+                            vbit_offsets,
+                            &tx1,
+                            &tx2,
+                            *rows,
+                            *cols,
+                            o1,
+                            o2,
+                            pool,
+                        ),
+                        TensorDtype::Q8Row | TensorDtype::Q8_2f => qmatvec2(
+                            self.quant_bytes(),
+                            row_scale,
+                            &tx1,
+                            &tx2,
+                            col_field,
+                            *dtype,
+                            *rows,
+                            *cols,
+                            o1,
+                            o2,
+                            pool,
+                        ),
+                        _ => unreachable!("unsupported mapped Prism dtype {dtype:?}"),
+                    }
+                    return;
+                }
                 if *dtype == TensorDtype::Q4Block {
                     q4matvec2(self.quant_bytes(), x1, x2, *rows, *cols, o1, o2, pool);
                     return;
@@ -1430,6 +1749,9 @@ impl QTensor {
     /// identity a device-resident chain needs to hand `tp_matmat` the
     /// weight without going through this struct's own dispatch.
     pub fn q4tp_mapped(&self) -> Option<(&std::sync::Arc<CmfModel>, usize)> {
+        if self.has_prism_contract() {
+            return None;
+        }
         match self {
             Self::Mapped {
                 model, idx, dtype, ..
@@ -1470,12 +1792,148 @@ impl QTensor {
                 dispatch_rows(pool, rows, &run);
             }
             Self::Mapped {
+                model,
+                idx,
                 dtype,
                 row_scale,
                 col_field,
                 vbit_offsets,
                 ..
             } => {
+                if crate::prism::is_forward_weight(model, &model.tensors[*idx].name) {
+                    let mut transformed = Vec::with_capacity(xs_all.len());
+                    for bi in 0..b {
+                        transformed.extend_from_slice(&crate::prism::forward(
+                            model,
+                            &xs_all[bi * cols..(bi + 1) * cols],
+                        ));
+                    }
+                    match dtype {
+                        TensorDtype::Q4Block => {
+                            q4matmat(self.quant_bytes(), &transformed, b, rows, cols, out, pool)
+                        }
+                        TensorDtype::Q4Tiled => {
+                            q4t_matmat(self.quant_bytes(), &transformed, b, rows, cols, out, pool)
+                        }
+                        TensorDtype::Q4TiledP => {
+                            q4tp_matmat(self.quant_bytes(), &transformed, b, rows, cols, out, pool)
+                        }
+                        TensorDtype::Q2TiledP => {
+                            let affine =
+                                crate::prism::is_affine_target(model, &model.tensors[*idx].name);
+                            // Affine Prism Q2TP has a descriptor-aware GPU
+                            // kernel for short/tail batches too.  Unlike the
+                            // ordinary Q2TP path, don't force b<32 back to a
+                            // scalar CPU matmat: prefill chunks and the final
+                            // tail both need to stay on the tested GPU arm.
+                            let gpu_batch_ok = if affine {
+                                b >= 2
+                            } else {
+                                b >= 32 && b * rows * cols >= 128_000_000
+                            };
+                            if gpu_batch_ok
+                                && cols % 32 == 0
+                                && crate::gpu::enabled_here()
+                                && crate::gpu::q2tp_gpu_opt_in()
+                            {
+                                let gpu_ok = if affine {
+                                    crate::gpu::q2tp_affine_matmat(
+                                        model,
+                                        *idx,
+                                        &transformed,
+                                        b,
+                                        rows,
+                                        cols,
+                                        out,
+                                    )
+                                } else {
+                                    crate::gpu::q2tp_matmat(
+                                        model,
+                                        *idx,
+                                        &transformed,
+                                        b,
+                                        rows,
+                                        cols,
+                                        out,
+                                    )
+                                };
+                                if gpu_ok {
+                                    return;
+                                }
+                            }
+                            // A one-token Prism decode is the other short
+                            // case.  Use the descriptor-aware matvec kernel
+                            // before falling back to the exact CPU path.
+                            if affine
+                                && b == 1
+                                && cols % 32 == 0
+                                && crate::gpu::enabled_here()
+                                && crate::gpu::q2tp_gpu_opt_in()
+                                && crate::gpu::q2tp_affine_matvec(
+                                    model,
+                                    *idx,
+                                    &transformed[..cols],
+                                    rows,
+                                    cols,
+                                    &mut out[..rows],
+                                )
+                            {
+                                return;
+                            }
+                            if affine {
+                                q2tp_affine_matmat(
+                                    self.quant_bytes(),
+                                    &transformed,
+                                    b,
+                                    rows,
+                                    cols,
+                                    out,
+                                    pool,
+                                )
+                            } else {
+                                q2tp_matmat(
+                                    self.quant_bytes(),
+                                    &transformed,
+                                    b,
+                                    rows,
+                                    cols,
+                                    out,
+                                    pool,
+                                )
+                            }
+                        }
+                        TensorDtype::Q1 => {
+                            q1_matmat(self.quant_bytes(), &transformed, b, rows, cols, out, pool)
+                        }
+                        TensorDtype::Q1T => {
+                            q1t_matmat(self.quant_bytes(), &transformed, b, rows, cols, out, pool)
+                        }
+                        TensorDtype::Vbit | TensorDtype::VbitRo => vbitmatmat(
+                            self.quant_bytes(),
+                            vbit_offsets,
+                            &transformed,
+                            b,
+                            rows,
+                            cols,
+                            out,
+                            pool,
+                        ),
+                        TensorDtype::Q8Row | TensorDtype::Q8_2f => {
+                            let pre: Vec<std::borrow::Cow<'_, [f32]>> = (0..b)
+                                .map(|bi| {
+                                    prescale(
+                                        &transformed[bi * cols..(bi + 1) * cols],
+                                        col_field,
+                                        *dtype,
+                                    )
+                                })
+                                .collect();
+                            qmatmat(self.quant_bytes(), row_scale, &pre, rows, cols, out, pool)
+                        }
+                        _ => unreachable!("unsupported mapped Prism dtype {dtype:?}"),
+                    }
+                    return;
+                }
                 if *dtype == TensorDtype::Q4Block {
                     q4matmat(self.quant_bytes(), xs_all, b, rows, cols, out, pool);
                     return;
@@ -1884,6 +2342,9 @@ impl QTensor {
         else {
             return false;
         };
+        if crate::prism::has_contract(model) {
+            return false;
+        }
         match *dtype {
             TensorDtype::Q4TiledP => crate::gpu::q4tp_matmat(model, *idx, xs, b, rows, cols, out),
             // The two-field codec folds its column field into the
@@ -1924,6 +2385,15 @@ impl QTensor {
         pool: Option<&Pool>,
     ) {
         let total_rows: usize = ts.iter().map(|t| t.rows()).sum();
+        if ts.iter().any(|t| t.has_prism_contract()) {
+            // The fused range kernels have no transform descriptor.  Let
+            // each tensor's ordinary matvec dispatch perform the explicit
+            // signed FWHT (and retain CPU fallback for mixed q2tp/q4tp).
+            for (t, o) in ts.iter().zip(outs.iter_mut()) {
+                t.matvec(x, o, pool);
+            }
+            return;
+        }
         let uniform_q8 = ts.iter().all(|t| {
             matches!(
                 t,
@@ -2321,6 +2791,12 @@ impl QTensor {
         pool: Option<&Pool>,
     ) {
         let total_rows: usize = ts.iter().map(|t| t.rows()).sum();
+        if ts.iter().any(|t| t.has_prism_contract()) {
+            for i in 0..N {
+                ts[i].matvec2(x1, x2, o1s[i], o2s[i], pool);
+            }
+            return;
+        }
         let uniform_q8 = ts.iter().all(|t| {
             matches!(
                 t,
@@ -2571,6 +3047,28 @@ impl QTensor {
         out: &mut [f32],
         pool: Option<&Pool>,
     ) -> bool {
+        Self::matvec_silu_mul_limited(gate, up, x, out, 0.0, pool)
+    }
+
+    /// Fused gate+up+SiLU with the GLM asymmetrical clamp.  `limit == 0`
+    /// preserves the historical unclamped helper; a positive limit clamps
+    /// `up` to both sides and `gate` only from above, matching the GLM
+    /// SwiGLU reference.  Keeping the limit in the row kernel avoids the two
+    /// intermediate vectors and the extra combine pass on the Q2TP experts.
+    pub fn matvec_silu_mul_limited(
+        gate: &QTensor,
+        up: &QTensor,
+        x: &[f32],
+        out: &mut [f32],
+        limit: f32,
+        pool: Option<&Pool>,
+    ) -> bool {
+        if gate.has_prism_contract() || up.has_prism_contract() {
+            // The fused gate/up kernels consume x directly.  Prism requires
+            // a per-matrix signed FWHT, so the caller must use two ordinary
+            // descriptor-aware matvecs instead of an unrotated fast path.
+            return false;
+        }
         let inter = gate.rows();
         debug_assert_eq!(up.rows(), inter);
         debug_assert_eq!(out.len(), inter);
@@ -4889,6 +5387,26 @@ fn dot_q2tp_row_i8(
 /// Scalar on purpose — the 2-bit class targets the GPU graph; the CPU
 /// path exists for parity gates and small-machine fallback.
 fn q2tp_row_exact(chunks: &[u8], r: usize, gpr: usize, x: &[f32], scales: &[f32]) -> f32 {
+    q2tp_row_exact_center(chunks, r, gpr, x, scales, 1.5)
+}
+
+/// Fused Prism affine row: the derived correction is applied inside the
+/// decoded code, avoiding a second accumulated dot and avoiding cancellation
+/// between `B=(c-1.5)s` and `+.5s` for long 5120/17408 rows.
+#[inline]
+fn q2tp_affine_row_exact(chunks: &[u8], r: usize, gpr: usize, x: &[f32], scales: &[f32]) -> f32 {
+    q2tp_row_exact_center(chunks, r, gpr, x, scales, 1.0)
+}
+
+#[inline]
+fn q2tp_row_exact_center(
+    chunks: &[u8],
+    r: usize,
+    gpr: usize,
+    x: &[f32],
+    scales: &[f32],
+    center: f32,
+) -> f32 {
     let mut acc = 0f32;
     for gi in 0..gpr {
         let ch = &chunks[(r * gpr + gi) * Q2TP_CHUNK..(r * gpr + gi + 1) * Q2TP_CHUNK];
@@ -4896,10 +5414,10 @@ fn q2tp_row_exact(chunks: &[u8], r: usize, gpr: usize, x: &[f32], scales: &[f32]
         let xb = &x[gi * GROUP_SIZE..(gi + 1) * GROUP_SIZE];
         let mut g = 0f32;
         for (k, &b) in ch.iter().enumerate() {
-            g += ((b & 3) as f32 - 1.5) * xb[k * 4]
-                + (((b >> 2) & 3) as f32 - 1.5) * xb[k * 4 + 1]
-                + (((b >> 4) & 3) as f32 - 1.5) * xb[k * 4 + 2]
-                + (((b >> 6) & 3) as f32 - 1.5) * xb[k * 4 + 3];
+            g += ((b & 3) as f32 - center) * xb[k * 4]
+                + (((b >> 2) & 3) as f32 - center) * xb[k * 4 + 1]
+                + (((b >> 4) & 3) as f32 - center) * xb[k * 4 + 2]
+                + (((b >> 6) & 3) as f32 - center) * xb[k * 4 + 3];
         }
         acc += s * g;
     }
@@ -4914,6 +5432,29 @@ fn q2tp_matvec(
     out: &mut [f32],
     pool: Option<&Pool>,
 ) {
+    q2tp_matvec_mode(bytes, x, rows, cols, out, pool, false);
+}
+
+fn q2tp_affine_matvec(
+    bytes: &[u8],
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+    pool: Option<&Pool>,
+) {
+    q2tp_matvec_mode(bytes, x, rows, cols, out, pool, true);
+}
+
+fn q2tp_matvec_mode(
+    bytes: &[u8],
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+    pool: Option<&Pool>,
+    affine: bool,
+) {
     debug_assert_eq!(out.len(), rows);
     let gpr = cols / GROUP_SIZE;
     let v = Q4tpView::new_q2(bytes, rows, cols);
@@ -4922,7 +5463,7 @@ fn q2tp_matvec(
     // code dots + group sums, exact outlier correction — the same
     // contract as every sibling kernel; measured 2-bit rows were the
     // only scalar holdout in the family.
-    if a8w8_enabled() {
+    if !affine && a8w8_enabled() {
         let act = split_act(x);
         let gsum = q1_group_sums(&act.xq, gpr);
         let (act, gsum) = (&act, &gsum);
@@ -4948,7 +5489,13 @@ fn q2tp_matvec(
             for r in start..end {
                 v.scales_into(r, gpr, sc);
                 // SAFETY: disjoint row ranges per worker.
-                unsafe { *out_addr.at(r) = q2tp_row_exact(v.nib, r, gpr, x, sc) };
+                unsafe {
+                    *out_addr.at(r) = if affine {
+                        q2tp_affine_row_exact(v.nib, r, gpr, x, sc)
+                    } else {
+                        q2tp_row_exact(v.nib, r, gpr, x, sc)
+                    }
+                };
             }
         })
     };
@@ -4967,6 +5514,35 @@ fn q2tp_matvec2(
     o2: &mut [f32],
     pool: Option<&Pool>,
 ) {
+    q2tp_matvec2_mode(bytes, x1, x2, rows, cols, o1, o2, pool, false);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn q2tp_affine_matvec2(
+    bytes: &[u8],
+    x1: &[f32],
+    x2: &[f32],
+    rows: usize,
+    cols: usize,
+    o1: &mut [f32],
+    o2: &mut [f32],
+    pool: Option<&Pool>,
+) {
+    q2tp_matvec2_mode(bytes, x1, x2, rows, cols, o1, o2, pool, true);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn q2tp_matvec2_mode(
+    bytes: &[u8],
+    x1: &[f32],
+    x2: &[f32],
+    rows: usize,
+    cols: usize,
+    o1: &mut [f32],
+    o2: &mut [f32],
+    pool: Option<&Pool>,
+    affine: bool,
+) {
     let gpr = cols / GROUP_SIZE;
     let v = Q4tpView::new_q2(bytes, rows, cols);
     let (p1, p2) = (SendMut(o1.as_mut_ptr()), SendMut(o2.as_mut_ptr()));
@@ -4976,8 +5552,16 @@ fn q2tp_matvec2(
             v.scales_into(r, gpr, &mut sc);
             // SAFETY: disjoint row ranges per worker.
             unsafe {
-                *p1.at(r) = q2tp_row_exact(v.nib, r, gpr, x1, &sc);
-                *p2.at(r) = q2tp_row_exact(v.nib, r, gpr, x2, &sc);
+                *p1.at(r) = if affine {
+                    q2tp_affine_row_exact(v.nib, r, gpr, x1, &sc)
+                } else {
+                    q2tp_row_exact(v.nib, r, gpr, x1, &sc)
+                };
+                *p2.at(r) = if affine {
+                    q2tp_affine_row_exact(v.nib, r, gpr, x2, &sc)
+                } else {
+                    q2tp_row_exact(v.nib, r, gpr, x2, &sc)
+                };
             }
         }
     };
@@ -5005,6 +5589,18 @@ pub fn q2tp_matvec_for_test(bytes: &[u8], x: &[f32], rows: usize, cols: usize, o
     });
 }
 
+/// Test door for the descriptor-specific fused affine decode.  Production
+/// callers select this through a validated Prism header, never by dtype alone.
+pub fn q2tp_affine_matvec_for_test(
+    bytes: &[u8],
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) {
+    q2tp_affine_matvec(bytes, x, rows, cols, out, None);
+}
+
 pub fn q2tp_matmat_for_test(
     bytes: &[u8],
     xs_all: &[f32],
@@ -5025,6 +5621,31 @@ fn q2tp_matmat(
     out: &mut [f32],
     pool: Option<&Pool>,
 ) {
+    q2tp_matmat_mode(bytes, xs_all, b, rows, cols, out, pool, false);
+}
+
+fn q2tp_affine_matmat(
+    bytes: &[u8],
+    xs_all: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+    pool: Option<&Pool>,
+) {
+    q2tp_matmat_mode(bytes, xs_all, b, rows, cols, out, pool, true);
+}
+
+fn q2tp_matmat_mode(
+    bytes: &[u8],
+    xs_all: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+    pool: Option<&Pool>,
+    affine: bool,
+) {
     debug_assert_eq!(out.len(), b * rows);
     let gpr = cols / GROUP_SIZE;
     let v = Q4tpView::new_q2(bytes, rows, cols);
@@ -5036,7 +5657,13 @@ fn q2tp_matmat(
             for bi in 0..b {
                 let x = &xs_all[bi * cols..(bi + 1) * cols];
                 // SAFETY: disjoint row ranges per worker.
-                unsafe { *out_addr.at(bi * rows + r) = q2tp_row_exact(v.nib, r, gpr, x, &sc) };
+                unsafe {
+                    *out_addr.at(bi * rows + r) = if affine {
+                        q2tp_affine_row_exact(v.nib, r, gpr, x, &sc)
+                    } else {
+                        q2tp_row_exact(v.nib, r, gpr, x, &sc)
+                    }
+                };
             }
         }
     };
@@ -10244,6 +10871,64 @@ mod tests {
                 (exact - fast).abs() <= exact.abs() * 1e-5 + 1e-5,
                 "row {r}: exact {exact} vs i8 {fast}"
             );
+        }
+    }
+
+    #[test]
+    fn q2tp_affine_fuses_half_scale_correction_without_changing_raw_decode() {
+        let (rows, cols) = (1usize, GROUP_SIZE);
+        let mut bytes = vec![0u8; Q2TP_CHUNK + 4 + 1];
+        // Repeating symbols 0,1,2,0 at unit scale.  q2tp's raw B is
+        // (c-1.5), while the affine Prism operator is (c-1.0).
+        bytes[..Q2TP_CHUNK].fill(0x24); // codes 0,1,2,0 in LSB-first order
+        bytes[Q2TP_CHUNK..Q2TP_CHUNK + 2].copy_from_slice(&0u16.to_le_bytes());
+        bytes[Q2TP_CHUNK + 2..Q2TP_CHUNK + 4].copy_from_slice(&0u16.to_le_bytes());
+        bytes[Q2TP_CHUNK + 4] = 1; // dtype16 rung 1 = 1.0
+        let x = vec![1.0f32; cols];
+        let mut raw = vec![0.0f32; rows];
+        let mut affine = vec![0.0f32; rows];
+        q2tp_matvec_for_test(&bytes, &x, rows, cols, &mut raw);
+        q2tp_affine_matvec_for_test(&bytes, &x, rows, cols, &mut affine);
+        assert_eq!(raw, vec![-24.0]);
+        assert_eq!(affine, vec![-8.0]);
+        assert!((affine[0] - (raw[0] + 0.5 * cols as f32)).abs() < 1e-6);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn q2tp_avx2_dot_matches_scalar_for_random_patterns() {
+        // Compare the release AVX2 integer dot against the scalar oracle over
+        // arbitrary packed bytes/activation signs.  This guards the exact
+        // table-load path used after rejecting a faster-looking decoder whose
+        // full-checkpoint greedy output drifted.
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut seed = 0x9e3779b9u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed
+        };
+        for _ in 0..20_000 {
+            let mut ch = [0u8; Q2TP_CHUNK];
+            let mut x = [0i8; GROUP_SIZE];
+            for b in &mut ch {
+                *b = next() as u8;
+            }
+            for v in &mut x {
+                *v = (next() >> 24) as i8;
+            }
+            let mut reference = 0i32;
+            for (k, &b) in ch.iter().enumerate() {
+                reference += (b & 3) as i32 * x[k * 4] as i32;
+                reference += ((b >> 2) & 3) as i32 * x[k * 4 + 1] as i32;
+                reference += ((b >> 4) & 3) as i32 * x[k * 4 + 2] as i32;
+                reference += ((b >> 6) & 3) as i32 * x[k * 4 + 3] as i32;
+            }
+            // SAFETY: guarded by the runtime AVX2 feature check and fixed
+            // 8-byte/32-byte slice lengths above.
+            let got = unsafe { q2tp_code_dot_avx2(&ch, &x) };
+            assert_eq!(got, reference, "packed q2 lane mismatch");
         }
     }
 

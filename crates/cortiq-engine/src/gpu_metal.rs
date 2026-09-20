@@ -4597,13 +4597,165 @@ kernel void q4tp_matvec_jobs(
 // code_i = (word >> 2i) & 3 for the flat element order), and rung 0 of
 // the ladder is an EXACT ZERO (a pruned group must not come back as
 // noise): lad = lane == 0 ? 0 : 2^(lo + (lane-1)·step).
-inline float q2_dot16(uint b, float4 x0, float4 x1, float4 x2, float4 x3) {
-    const float4 h = float4(1.5f);
+inline float q2_dot16_center(uint b, float4 x0, float4 x1, float4 x2, float4 x3, float center) {
+    const float4 h = float4(center);
     float4 c0 = float4((b      ) & 3u, (b >> 2u ) & 3u, (b >> 4u ) & 3u, (b >> 6u ) & 3u);
     float4 c1 = float4((b >> 8u) & 3u, (b >> 10u) & 3u, (b >> 12u) & 3u, (b >> 14u) & 3u);
     float4 c2 = float4((b >> 16u) & 3u, (b >> 18u) & 3u, (b >> 20u) & 3u, (b >> 22u) & 3u);
     float4 c3 = float4((b >> 24u) & 3u, (b >> 26u) & 3u, (b >> 28u) & 3u, (b >> 30u) & 3u);
     return dot(c0 - h, x0) + dot(c1 - h, x1) + dot(c2 - h, x2) + dot(c3 - h, x3);
+}
+
+inline float q2_dot16(uint b, float4 x0, float4 x1, float4 x2, float4 x3) {
+    return q2_dot16_center(b, x0, x1, x2, x3, 1.5f);
+}
+
+// Descriptor-validated affine Prism symbols are code 0/1/2 => -1/0/+1.
+// The host admission scan rejects reserved code 3 before selecting this
+// production kernel.  The two bit planes are consumed directly, retaining
+// the original Q2 payload and g32 reduction order.
+inline float q2_dot16_affine_select(uint b, float4 x0, float4 x1, float4 x2, float4 x3) {
+    const float4 z = float4(0.0f);
+    float4 v0 = select(select(-x0, x0, bool4((b >> 1u) & 1u, (b >> 3u) & 1u, (b >> 5u) & 1u, (b >> 7u) & 1u)), z, bool4(b & 1u, (b >> 2u) & 1u, (b >> 4u) & 1u, (b >> 6u) & 1u));
+    float4 v1 = select(select(-x1, x1, bool4((b >> 9u) & 1u, (b >> 11u) & 1u, (b >> 13u) & 1u, (b >> 15u) & 1u)), z, bool4((b >> 8u) & 1u, (b >> 10u) & 1u, (b >> 12u) & 1u, (b >> 14u) & 1u));
+    float4 v2 = select(select(-x2, x2, bool4((b >> 17u) & 1u, (b >> 19u) & 1u, (b >> 21u) & 1u, (b >> 23u) & 1u)), z, bool4((b >> 16u) & 1u, (b >> 18u) & 1u, (b >> 20u) & 1u, (b >> 22u) & 1u));
+    float4 v3 = select(select(-x3, x3, bool4((b >> 25u) & 1u, (b >> 27u) & 1u, (b >> 29u) & 1u, (b >> 31u) & 1u)), z, bool4((b >> 24u) & 1u, (b >> 26u) & 1u, (b >> 28u) & 1u, (b >> 30u) & 1u));
+    return (v0.x + v0.y + v0.z + v0.w)
+         + (v1.x + v1.y + v1.z + v1.w)
+         + (v2.x + v2.y + v2.z + v2.w)
+         + (v3.x + v3.y + v3.z + v3.w);
+}
+
+// Production affine Prism row matvec. It is selected only after the host
+// has admitted the immutable tensor as legal ternary Q2; generic Q2TP keeps
+// the centre-based kernel and reserved-code behaviour.
+kernel void q2tp_affine_select_matvec(
+    device const uchar*  q       [[buffer(0)]],
+    device const float*  x       [[buffer(1)]],
+    device float*        y       [[buffer(2)]],
+    constant uint&       gpr     [[buffer(3)]],
+    constant uint&       rows    [[buffer(4)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tgpos [[threadgroup_position_in_grid]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    threadgroup float lad[8u * 4u * 32u];
+    uint r0 = (tgpos * sgs + sg) * 4u;
+    bool active = r0 < rows;
+    uint nr = active ? min(rows - r0, 4u) : 0u;
+    ulong params_off = (ulong)rows * (ulong)gpr * 8ul;
+    ulong codes_off  = params_off + (ulong)rows * 4ul;
+    uint stride       = (gpr * 5u + 7u) / 8u;
+    for (uint ri = 0u; ri < nr; ++ri) {
+        device const half* ph = (device const half*)(q + params_off + (ulong)(r0 + ri) * 4ul);
+        float scale = (lane == 0u)
+            ? 0.0f
+            : exp2((float)ph[0] + (float)(lane - 1u) * (float)ph[1]);
+        lad[(sg * 4u + ri) * 32u + lane] = scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!active) return;
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    for (uint g = lane; g < gpr; g += 32u) {
+        uint xb = g * 32u;
+        device const float4* xv = (device const float4*)(x + xb);
+        float4 x0 = xv[0], x1 = xv[1], x2 = xv[2], x3 = xv[3];
+        float4 x4 = xv[4], x5 = xv[5], x6 = xv[6], x7 = xv[7];
+        uint bit = g * 5u;
+        uint cb = bit >> 3u;
+        uint shf = bit & 7u;
+        for (uint ri = 0u; ri < nr; ++ri) {
+            uint r = r0 + ri;
+            device const uint* p32 = (device const uint*)(q + ((ulong)r * gpr + (ulong)g) * 8ul);
+            uint b0 = p32[0], b1 = p32[1];
+            device const uchar* cp = q + codes_off + (ulong)r * (ulong)stride + cb;
+            uint code = (((uint)cp[0] | ((shf > 3u) ? ((uint)cp[1] << 8) : 0u)) >> shf) & 31u;
+            float scale = lad[(sg * 4u + ri) * 32u + code];
+            float gsum = q2_dot16_affine_select(b0, x0, x1, x2, x3)
+                       + q2_dot16_affine_select(b1, x4, x5, x6, x7);
+            float contrib = scale * gsum;
+            if (ri == 0u) acc0 += contrib;
+            else if (ri == 1u) acc1 += contrib;
+            else if (ri == 2u) acc2 += contrib;
+            else acc3 += contrib;
+        }
+    }
+    acc0 = simd_sum(acc0); acc1 = simd_sum(acc1);
+    acc2 = simd_sum(acc2); acc3 = simd_sum(acc3);
+    if (lane == 0u) {
+        y[r0] = acc0;
+        if (nr > 1u) y[r0 + 1u] = acc1;
+        if (nr > 2u) y[r0 + 2u] = acc2;
+        if (nr > 3u) y[r0 + 3u] = acc3;
+    }
+}
+
+// Standalone q2tp row matvec for the graph's single-token affine Prism path.
+// This is the same 4-row/SIMDgroup ladder preload as the existing expert-job
+// kernel, with an explicit center uniform so ordinary and affine payloads
+// cannot silently share the wrong `(c - centre)` operator.
+kernel void q2tp_matvec(
+    device const uchar*  q       [[buffer(0)]],
+    device const float*  x       [[buffer(1)]],
+    device float*        y       [[buffer(2)]],
+    constant uint&       gpr     [[buffer(3)]],
+    constant uint&       rows    [[buffer(4)]],
+    constant float&      center  [[buffer(5)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tgpos [[threadgroup_position_in_grid]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    threadgroup float lad[8u * 4u * 32u];
+    uint r0 = (tgpos * sgs + sg) * 4u;
+    bool active = r0 < rows;
+    uint nr = active ? min(rows - r0, 4u) : 0u;
+    ulong params_off = (ulong)rows * (ulong)gpr * 8ul;
+    ulong codes_off  = params_off + (ulong)rows * 4ul;
+    uint stride       = (gpr * 5u + 7u) / 8u;
+    for (uint ri = 0u; ri < nr; ++ri) {
+        device const half* ph = (device const half*)(q + params_off + (ulong)(r0 + ri) * 4ul);
+        float scale = (lane == 0u)
+            ? 0.0f
+            : exp2((float)ph[0] + (float)(lane - 1u) * (float)ph[1]);
+        lad[(sg * 4u + ri) * 32u + lane] = scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!active) return;
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    for (uint g = lane; g < gpr; g += 32u) {
+        uint xb = g * 32u;
+        device const float4* xv = (device const float4*)(x + xb);
+        float4 x0 = xv[0], x1 = xv[1], x2 = xv[2], x3 = xv[3];
+        float4 x4 = xv[4], x5 = xv[5], x6 = xv[6], x7 = xv[7];
+        uint bit = g * 5u;
+        uint cb = bit >> 3u;
+        uint shf = bit & 7u;
+        for (uint ri = 0u; ri < nr; ++ri) {
+            uint r = r0 + ri;
+            device const uint* p32 = (device const uint*)(q + ((ulong)r * gpr + (ulong)g) * 8ul);
+            uint b0 = p32[0], b1 = p32[1];
+            device const uchar* cp = q + codes_off + (ulong)r * (ulong)stride + cb;
+            uint code = (((uint)cp[0] | ((shf > 3u) ? ((uint)cp[1] << 8) : 0u)) >> shf) & 31u;
+            float scale = lad[(sg * 4u + ri) * 32u + code];
+            float gsum = q2_dot16_center(b0, x0, x1, x2, x3, center)
+                       + q2_dot16_center(b1, x4, x5, x6, x7, center);
+            float contrib = scale * gsum;
+            if (ri == 0u) acc0 += contrib;
+            else if (ri == 1u) acc1 += contrib;
+            else if (ri == 2u) acc2 += contrib;
+            else acc3 += contrib;
+        }
+    }
+    acc0 = simd_sum(acc0); acc1 = simd_sum(acc1);
+    acc2 = simd_sum(acc2); acc3 = simd_sum(acc3);
+    if (lane == 0u) {
+        y[r0] = acc0;
+        if (nr > 1u) y[r0 + 1u] = acc1;
+        if (nr > 2u) y[r0 + 2u] = acc2;
+        if (nr > 3u) y[r0 + 3u] = acc3;
+    }
 }
 
 kernel void q2tp_matvec_jobs(
@@ -4859,6 +5011,167 @@ kernel void q4tp_mul_mm(
                 uint bb = nib[i];
                 wv[2u * i]      = ((float)(bb & 0xFu) - 8.0f) * scale;
                 wv[2u * i + 1u] = ((float)(bb >> 4u) - 8.0f) * scale;
+            }
+            uint ib0 = 8u * (2u * il0) + sy;
+            uint ib1 = 8u * (2u * il0 + 1u) + sy;
+            for (uint i = 0; i < 8u; ++i) {
+                sa[64u * ib0 + 8u * i + lx] = (half)(wv[i] * wboost);
+                sa[64u * ib1 + 8u * i + lx] = (half)(wv[i + 8u] * wboost);
+            }
+        }
+        // X: 8 consecutive floats → one 8x8-block row (identical to q8).
+        {
+            uint sx = tiitg % 4u;
+            uint sy = (tiitg / 4u) / 8u;
+            uint ly = (tiitg / 4u) % 8u;
+            uint ib = 4u * sx + sy;
+            device const float4* y4 = (device const float4*)yrow;
+            float4 v0 = y4[0];
+            float4 v1 = y4[1];
+            threadgroup half* dst = sb + 64u * ib + 8u * ly;
+            dst[0] = (half)v0.x; dst[1] = (half)v0.y;
+            dst[2] = (half)v0.z; dst[3] = (half)v0.w;
+            dst[4] = (half)v1.x; dst[5] = (half)v1.y;
+            dst[6] = (half)v1.z; dst[7] = (half)v1.w;
+        }
+        yrow += NK;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half* lsma = sa + 4u * 64u * (sgitg % 2u);
+        threadgroup const half* lsmb = sb + 2u * 64u * (sgitg / 2u);
+        #pragma clang loop unroll(full)
+        for (short ik = 0; ik < 4; ++ik) {
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 4; ++i) {
+                simdgroup_load(ma[i], lsma + 64 * i, 8, ulong2(0, 0), false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 2; ++i) {
+                simdgroup_load(mb[i], lsmb + 64 * i, 8, ulong2(0, 0), false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 8; ++i) {
+                simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
+            }
+            lsma += 8 * 64;
+            lsmb += 4 * 64;
+        }
+    }
+
+    if (r0 + 64u <= rows && r1 + 32u <= nb) {
+        device float* C = y + (r0 + 32u * (sgitg & 1u))
+            + (ulong)(r1 + 16u * (sgitg >> 1u)) * rows;
+        for (short i = 0; i < 8; ++i) {
+            simdgroup_store(mc[i], C + 8 * (i % 4) + 8 * (ulong)rows * (i / 4),
+                            rows, ulong2(0, 0), false);
+        }
+    } else {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float* temp_str = ((threadgroup float*)shmem)
+            + 32u * (sgitg & 1u) + (16u * (sgitg >> 1u)) * 64u;
+        for (short i = 0; i < 8; ++i) {
+            simdgroup_store(mc[i], temp_str + 8 * (i % 4) + 8 * 64 * (i / 4),
+                            64, ulong2(0, 0), false);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgitg == 0) {
+            for (uint j = tiitg; j < nr1; j += 128u) {
+                device float* D = y + r0 + (ulong)(r1 + j) * rows;
+                threadgroup const float* Cr = ((threadgroup float*)shmem) + j * 64u;
+                for (uint i = 0; i < nr0; ++i) {
+                    D[i] = Cr[i];
+                }
+            }
+        }
+    }
+}
+
+kernel void q2tp_mul_mm(
+    device const uchar*  q      [[buffer(0)]],
+    device const float*  xs     [[buffer(1)]],
+    device float*        y      [[buffer(2)]],
+    constant uint&       cols_b [[buffer(3)]],
+    constant uint&       rows_b [[buffer(4)]],
+    constant uint&       nb     [[buffer(5)]],
+    // Activations are staged as `half` below, where anything past 65504
+    // is inf. When the host saw a row that would overflow it scaled the
+    // activations down by a power of two and sends the reciprocal here,
+    // to be folded into the WEIGHT side so the product is unchanged.
+    // Normally 1.0, and then this multiply changes no bit.
+    constant float&      wboost [[buffer(6)]],
+    constant float&      center [[buffer(7)]],
+    uint tiitg [[thread_index_in_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint2 tg  [[threadgroup_position_in_grid]])
+{
+    uint cols = cols_b;
+    uint rows = rows_b;
+    uint gpr = cols >> 5u;
+    threadgroup char shmem[8192];
+    threadgroup half* sa = (threadgroup half*)shmem;
+    threadgroup half* sb = (threadgroup half*)(shmem + 4096);
+    const uint NK = 32u;
+    uint r0 = tg.y * 64u;
+    uint r1 = tg.x * 32u;
+    uint nr0 = min(rows - r0, 64u);
+    uint nr1 = min(nb - r1, 32u);
+    uint lr0 = min(tiitg / 2u, nr0 - 1u);
+    uint il0 = tiitg % 2u;
+    uint lr1 = min(tiitg / 4u, nr1 - 1u);
+    uint iy  = 8u * (tiitg % 4u);
+
+    device const float* yrow = xs + (ulong)(r1 + lr1) * cols + iy;
+
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[2];
+    simdgroup_float8x8 mc[8];
+    for (uint i = 0; i < 8u; ++i) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+
+    ulong params_off = (ulong)rows * (ulong)gpr * 8ul;
+    ulong codes_off = params_off + (ulong)rows * 4ul;
+    uint cstride = (gpr * 5u + 7u) / 8u;
+    device const half* prow = (device const half*)(q + params_off + (ulong)(r0 + lr0) * 4ul);
+    float row_lo = (float)prow[0];
+    float row_st = (float)prow[1];
+    device const uchar* codes_row = q + codes_off + (ulong)(r0 + lr0) * (ulong)cstride;
+    for (uint k0 = 0; k0 < cols; k0 += NK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // W: this thread's 16 weights (row r0+lr0, K-half il0) — 8
+        // nibble bytes of one tile, low nibble first.
+        {
+            uint g = k0 >> 5u;
+            uint bit = g * 5u;
+            uint shf = bit & 7u;
+            device const uchar* cp = codes_row + (bit >> 3u);
+            uint code = (((uint)cp[0] | ((shf > 3u) ? ((uint)cp[1] << 8) : 0u)) >> shf) & 31u;
+            // lo/step are loop-invariant for this thread (its row is fixed
+            // across the whole K loop), so they are read ONCE above. Leaving
+            // them in the loop cost Lumina's DiT enough that the runtime probe
+            // preferred the CPU GEMM outright — the "the GEMM's arithmetic
+            // hides the chain" argument held for FFN shapes and not for this.
+            // Q2TP's five-bit ladder reserves rung 0 as an exact zero. The
+            // positive rungs are numbered 1..31, so their exponent is
+            // lo + (rung-1)*step. Do not use the Q4TP midrise decoder here.
+            float scale = (code == 0u)
+                ? 0.0f
+                : exp2(row_lo + (float)(code - 1u) * row_st);
+            // A q2 group is 8 bytes for 32 weights. This thread owns one
+            // 16-weight half (four bytes), preserving q2tp's 8x8 staging map.
+            device const uchar* nib = q + ((ulong)(r0 + lr0) * gpr + (ulong)g) * 8ul + 4u * il0;
+            uint sy = (tiitg / 2u) / 8u;
+            uint lx = (tiitg / 2u) % 8u;
+            float wv[16];
+            for (uint i = 0; i < 4u; ++i) {
+                uint bb = nib[i];
+                wv[4u * i]      = ((float)((bb      ) & 3u) - center) * scale;
+                wv[4u * i + 1u] = ((float)((bb >> 2u) & 3u) - center) * scale;
+                wv[4u * i + 2u] = ((float)((bb >> 4u) & 3u) - center) * scale;
+                wv[4u * i + 3u] = ((float)((bb >> 6u) & 3u) - center) * scale;
             }
             uint ib0 = 8u * (2u * il0) + sy;
             uint ib1 = 8u * (2u * il0 + 1u) + sy;
@@ -5498,7 +5811,150 @@ kernel void q4t_mul_mm_silu(
     }
 }
 
-"#;
+// Native Metal Prism activation boundary.  One threadgroup owns one
+// block-sized slice of the input vector.  The source contract is D·H with a
+// normalized Sylvester FWHT, followed by an explicit f16 round when the
+// header requests it.  Keeping the round in this standalone kernel (rather
+// than relying on a driver-visible half buffer) preserves the same f32
+// scratch/storage ABI as the existing graph kernels while retaining the
+// source's exact RNE boundary.
+inline float prism_half_to_f32(ushort h) {
+    uint sign = (uint)(h & 0x8000u) << 16u;
+    uint exp = ((uint)h >> 10u) & 0x1Fu;
+    uint frac = (uint)h & 0x03FFu;
+    if (exp == 0u) {
+        if (frac == 0u) return as_type<float>(sign);
+        float mag = (float)frac * 0.000000059604644775390625f;
+        return (sign != 0u) ? -mag : mag;
+    }
+    if (exp == 31u) {
+        return as_type<float>(sign | 0x7F800000u | (frac << 13u));
+    }
+    return as_type<float>(sign | ((exp + 112u) << 23u) | (frac << 13u));
+}
+
+inline float prism_round16(float v) {
+    uint bits = as_type<uint>(v);
+    uint sign = (bits >> 16u) & 0x8000u;
+    uint abits = bits & 0x7FFFFFFFu;
+    uint exp = (abits >> 23u) & 0xFFu;
+    uint frac = abits & 0x007FFFFFu;
+    if (exp == 0xFFu) return v;
+    if (exp == 0u) return as_type<float>(sign << 16u);
+    int unbiased = (int)exp - 127;
+    if (unbiased < -14) {
+        float scaled = v * ((sign != 0u) ? -16777216.0f : 16777216.0f);
+        uint q = (uint)floor(abs(scaled));
+        float rem = abs(scaled) - (float)q;
+        if (rem > 0.5f || (rem == 0.5f && (q & 1u) != 0u)) q += 1u;
+        if (q >= 1024u) return prism_half_to_f32((ushort)(sign | 0x0400u));
+        return prism_half_to_f32((ushort)(sign | q));
+    }
+    if (unbiased > 15) return prism_half_to_f32((ushort)(sign | 0x7C00u));
+    uint significand = frac | 0x00800000u;
+    uint half_frac = (significand >> 13u) & 0x03FFu;
+    uint discarded = significand & 0x1FFFu;
+    if (discarded > 0x1000u || (discarded == 0x1000u && (half_frac & 1u) != 0u)) {
+        half_frac += 1u;
+    }
+    uint half_exp = (uint)(unbiased + 15);
+    if (half_frac == 0x0400u) {
+        half_frac = 0u;
+        half_exp += 1u;
+    }
+    if (half_exp >= 31u) return prism_half_to_f32((ushort)(sign | 0x7C00u));
+    return prism_half_to_f32((ushort)(sign | (half_exp << 10u) | half_frac));
+}
+
+kernel void prism_fwht(
+    device const float* x        [[buffer(0)]],
+    device float*       y        [[buffer(1)]],
+    device const float* signs    [[buffer(2)]],
+    constant uint&      width    [[buffer(3)]],
+    constant uint&      block    [[buffer(4)]],
+    constant uint&      sign_off [[buffer(5)]],
+    constant uint&      round16  [[buffer(6)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint gid [[threadgroup_position_in_grid]])
+{
+    threadgroup float shared[1024];
+    // The validated Prism production descriptor uses 1024-wide blocks.  The
+    // uniform keeps the host-side contract explicit and lets the same kernel
+    // fail closed for any future descriptor with a different block width.
+    if (block == 0u || block > 1024u || width == 0u || width % block != 0u) return;
+    uint base = gid * block;
+    if (base >= width) return;
+    for (uint i = tid; i < block; i += 256u) {
+        shared[i] = x[base + i] * signs[sign_off + (gid * block) + i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 1u; stride < block; stride <<= 1u) {
+        uint span = stride << 1u;
+        for (uint j = tid; j < block / 2u; j += 256u) {
+            uint group = j / stride;
+            uint lane = j % stride;
+            uint a = group * span + lane;
+            uint b = a + stride;
+            float va = shared[a];
+            float vb = shared[b];
+            shared[a] = va + vb;
+            shared[b] = va - vb;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint i = tid; i < block; i += 256u) {
+        float v = shared[i] * rsqrt((float)block);
+        y[base + i] = (round16 != 0u) ? prism_round16(v) : v;
+    }
+}
+
+// Batched Prism activation boundary used by the ordinary prefill graph.
+// Each threadgroup owns one FWHT block of one input row.  The sign index is
+// deliberately independent of the row: the descriptor describes one
+// model-wide D sign table, not one table per token.  The output is laid out
+// [batch][width] so the following q2tp matrix kernel can consume it directly.
+kernel void prism_fwht_rows(
+    device const float* x        [[buffer(0)]],
+    device float* y              [[buffer(1)]],
+    device const float* signs    [[buffer(2)]],
+    constant uint& width         [[buffer(3)]],
+    constant uint& block         [[buffer(4)]],
+    constant uint& sign_off      [[buffer(5)]],
+    constant uint& round16       [[buffer(6)]],
+    constant uint& batch         [[buffer(7)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint3 gid [[threadgroup_position_in_grid]])
+{
+    threadgroup float shared[1024];
+    if (block == 0u || block > 1024u || width == 0u || width % block != 0u
+        || gid.y >= batch) return;
+    uint base = gid.y * width + gid.x * block;
+    if (gid.x * block >= width) return;
+    for (uint i = tid; i < block; i += 256u) {
+        shared[i] = x[base + i] * signs[sign_off + gid.x * block + i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 1u; stride < block; stride <<= 1u) {
+        uint span = stride << 1u;
+        for (uint j = tid; j < block / 2u; j += 256u) {
+            uint group = j / stride;
+            uint lane = j % stride;
+            uint a = group * span + lane;
+            uint b = a + stride;
+            float va = shared[a];
+            float vb = shared[b];
+            shared[a] = va + vb;
+            shared[b] = va - vb;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint i = tid; i < block; i += 256u) {
+        float v = shared[i] * rsqrt((float)block);
+        y[base + i] = (round16 != 0u) ? prism_round16(v) : v;
+    }
+}
+
+    "#;
 
 struct Ctx {
     _device: Device,
@@ -5520,6 +5976,16 @@ struct Ctx {
     q4t_dual: ComputePipelineState,
     q4t_dsilu: ComputePipelineState,
     q4tp: ComputePipelineState,
+    /// Standalone q2tp matvec with explicit ordinary/affine centre.
+    q2tp: ComputePipelineState,
+    /// Production affine Prism sign/zero-select matvec; legal tensors only.
+    q2tp_affine: ComputePipelineState,
+    /// Simdgroup-matrix q2tp GEMM with explicit ordinary/affine centre.
+    q2tpmm: ComputePipelineState,
+    /// Signed normalized FWHT activation boundary for Prism forward weights.
+    fwht: ComputePipelineState,
+    /// Row-aware FWHT boundary for the ordinary b-row prefill graph.
+    fwht_rows: ComputePipelineState,
     /// Batched (b ≤ 8) q4tp matvec — the speculative verify's kernel.
     q4tpbk: ComputePipelineState,
     /// q4tp matvec over a row prefix (draft-head shortlist).
@@ -5625,6 +6091,13 @@ struct Ctx {
     /// addresses — so a hit whose bytes changed is memcpy-refreshed in
     /// place (StorageModeShared) instead of trusted.
     cv_bufs: Mutex<HashMap<(usize, usize), (Buffer, u64)>>,
+    /// Cached strict admission for immutable affine Prism Q2 tensors. The
+    /// payload is scanned once per (model identity, tensor index, rows, cols),
+    /// never once per token/graph; false entries preserve generic Q2/code3
+    /// semantics. The shape fields prevent a partial/tail view from reusing a
+    /// verdict for a different view of the same tensor; the model UID keeps
+    /// overlays and re-opened mappings distinct.
+    q2_affine_admission: Mutex<HashMap<(usize, usize, usize, usize), bool>>,
     /// Shared completion-flag word + monotone ticket (fast wait).
     flag_buf: Buffer,
     ticket: std::sync::atomic::AtomicU32,
@@ -5741,6 +6214,11 @@ fn init() -> Result<Ctx, String> {
     let q4t_dual = pso("q4t_matvec_dual")?;
     let q4t_dsilu = pso("q4t_matvec_dsilu")?;
     let q4tp = pso("q4tp_matvec")?;
+    let q2tp = pso("q2tp_matvec")?;
+    let q2tp_affine = pso("q2tp_affine_select_matvec")?;
+    let q2tpmm = pso("q2tp_mul_mm")?;
+    let fwht = pso("prism_fwht")?;
+    let fwht_rows = pso("prism_fwht_rows")?;
     let q4tpbk = pso("q4tp_matvec_bk")?;
     let q4tppart = pso("q4tp_matvec_part")?;
     let q4tpjobs = pso("q4tp_matvec_jobs")?;
@@ -5832,6 +6310,11 @@ fn init() -> Result<Ctx, String> {
         q4t_dual,
         q4t_dsilu,
         q4tp,
+        q2tp,
+        q2tp_affine,
+        q2tpmm,
+        fwht,
+        fwht_rows,
         q4tpbk,
         q4tppart,
         q4tpjobs,
@@ -5910,6 +6393,7 @@ fn init() -> Result<Ctx, String> {
         cf_bufs: Mutex::new(HashMap::new()),
         io_bufs: Mutex::new(HashMap::new()),
         cv_bufs: Mutex::new(HashMap::new()),
+        q2_affine_admission: Mutex::new(HashMap::new()),
         flag_buf,
         ticket: std::sync::atomic::AtomicU32::new(0),
     })
@@ -6042,7 +6526,12 @@ static WAIT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 ///
 /// So the budget follows the work: an average wait past a few milliseconds
 /// means the wake-up cost is noise and the thread should sleep.
-fn wait_fast(cmd: &metal::CommandBufferRef) {
+/// Wait for a command buffer and surface a terminal Metal error.  The old
+/// helper treated `MTLCommandBufferStatus::Error` exactly like Completed;
+/// graph callers then copied stale hidden/state buffers and silently fell
+/// back to CPU execution.  Keep the legacy fire-and-forget wrapper for the
+/// older per-op APIs, while checked graph completion uses this result.
+fn wait_fast_checked(cmd: &metal::CommandBufferRef) -> Result<(), String> {
     use metal::MTLCommandBufferStatus as S;
     let t0 = std::time::Instant::now();
     let ewma = WAIT_US.load(std::sync::atomic::Ordering::Relaxed);
@@ -6064,6 +6553,20 @@ fn wait_fast(cmd: &metal::CommandBufferRef) {
     }
     let took = t0.elapsed().as_micros() as u64;
     WAIT_US.store((ewma * 7 + took) / 8, std::sync::atomic::Ordering::Relaxed);
+    match cmd.status() {
+        S::Completed => Ok(()),
+        S::Error => Err(format!(
+            "Metal command buffer failed: status={:?}",
+            cmd.status()
+        )),
+        status => Err(format!(
+            "Metal command buffer did not complete: status={status:?}"
+        )),
+    }
+}
+
+fn wait_fast(cmd: &metal::CommandBufferRef) {
+    let _ = wait_fast_checked(cmd);
 }
 
 fn page_size() -> usize {
@@ -6581,12 +7084,30 @@ pub enum MmKind {
 
 /// Which GPU kernel a graph projection uses.
 #[derive(Clone)]
+struct PrismSpec {
+    /// The model-wide concatenated ±1 sign table.
+    signs: Buffer,
+    /// Reused f32 scratch for the transformed activation row.
+    scratch: Buffer,
+    width: usize,
+    block: usize,
+    sign_offset: usize,
+    round16: bool,
+    /// Cached once per immutable tensor: direct ternary select is legal.
+    affine_select: bool,
+}
+
+#[derive(Clone)]
 enum ProjKind {
     Q1,
     Q1t,
     Q4b,
     Q4t,
     Q4tp,
+    Q2tp {
+        center: f32,
+        prism: Option<PrismSpec>,
+    },
     Q8 {
         row_scale: Buffer,
         col_field: Option<Buffer>,
@@ -6684,6 +7205,95 @@ fn encode_q4tp_matvec(
     enc.dispatch_thread_groups(
         MTLSize::new((rows as u64).div_ceil(sgs * 4), 1, 1),
         MTLSize::new(sgs * 32, 1, 1),
+    );
+}
+
+/// Encode standalone q2tp matvec. The explicit centre is bound separately
+/// from the packed payload: ordinary q2tp is 1.5, validated Prism affine
+/// q2tp is 1.0, and no descriptor state is inferred inside MSL.
+fn encode_q2tp_matvec(
+    c: &Ctx,
+    enc: &metal::ComputeCommandEncoderRef,
+    fbuf: &WeightArena,
+    abs: usize,
+    xs: &Buffer,
+    y: &Buffer,
+    rows: usize,
+    gpr: usize,
+    center: f32,
+) {
+    enc.set_compute_pipeline_state(&c.q2tp);
+    fbuf.bind(enc, 0, abs);
+    enc.set_buffer(1, Some(xs), 0);
+    enc.set_buffer(2, Some(y), 0);
+    let gpr_u = gpr as u32;
+    let rows_u = rows as u32;
+    enc.set_bytes(3, 4, &gpr_u as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(5, 4, &center as *const f32 as *const std::ffi::c_void);
+    let sgs = 8u64;
+    enc.dispatch_thread_groups(
+        MTLSize::new((rows as u64).div_ceil(sgs * 4), 1, 1),
+        MTLSize::new(sgs * 32, 1, 1),
+    );
+}
+
+/// Encode the production affine sign/zero-select q2tp matvec. The host
+/// selects this only for a cached, descriptor-admitted legal Prism tensor.
+fn encode_q2tp_affine_select_matvec(
+    c: &Ctx,
+    enc: &metal::ComputeCommandEncoderRef,
+    fbuf: &WeightArena,
+    abs: usize,
+    xs: &Buffer,
+    y: &Buffer,
+    rows: usize,
+    gpr: usize,
+) {
+    enc.set_compute_pipeline_state(&c.q2tp_affine);
+    fbuf.bind(enc, 0, abs);
+    enc.set_buffer(1, Some(xs), 0);
+    enc.set_buffer(2, Some(y), 0);
+    let gpr_u = gpr as u32;
+    let rows_u = rows as u32;
+    enc.set_bytes(3, 4, &gpr_u as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+    let sgs = 8u64;
+    enc.dispatch_thread_groups(
+        MTLSize::new((rows as u64).div_ceil(sgs * 4), 1, 1),
+        MTLSize::new(sgs * 32, 1, 1),
+    );
+}
+
+/// Encode the q2tp simdgroup-matrix GEMM. `pre`/`out` are element-major
+/// `[batch][row]`, matching q4tp_mul_mm and the CPU q2tp matmat contract.
+#[allow(clippy::too_many_arguments)]
+fn encode_q2tp_matmat(
+    c: &Ctx,
+    enc: &metal::ComputeCommandEncoderRef,
+    fbuf: &WeightArena,
+    abs: usize,
+    xs: &Buffer,
+    y: &Buffer,
+    cols: usize,
+    rows: usize,
+    batch: usize,
+    wboost: f32,
+    center: f32,
+) {
+    enc.set_compute_pipeline_state(&c.q2tpmm);
+    fbuf.bind(enc, 0, abs);
+    enc.set_buffer(1, Some(xs), 0);
+    enc.set_buffer(2, Some(y), 0);
+    let (cols_u, rows_u, batch_u) = (cols as u32, rows as u32, batch as u32);
+    enc.set_bytes(3, 4, &cols_u as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(5, 4, &batch_u as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(6, 4, &wboost as *const f32 as *const std::ffi::c_void);
+    enc.set_bytes(7, 4, &center as *const f32 as *const std::ffi::c_void);
+    enc.dispatch_thread_groups(
+        MTLSize::new((batch as u64).div_ceil(32), (rows as u64).div_ceil(64), 1),
+        MTLSize::new(128, 1, 1),
     );
 }
 
@@ -6956,11 +7566,25 @@ pub static WCAT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::ne
 /// Calls into the dense-FFN encoder — ~layer count per token unless
 /// something encodes twice.
 pub static FFN_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Number of actual production Prism affine projections routed to the
+/// sign/zero-select kernel. These counters are incremented at encode time,
+/// not by a diagnostic helper, and are intentionally split by WCAT stage.
+pub static TERNARY_PROD_DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static TERNARY_PROD_ROWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static TERNARY_PROD_BY_CAT: [std::sync::atomic::AtomicU64; 6] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
 
 fn note_weight_bytes(kind: &ProjKind, rows: usize, gpr: usize) {
     let tile: u64 = match kind {
         ProjKind::Q4t => 18,
         ProjKind::Q4tp => 17, // 16 B codes + ~1 B/group amortized ladder
+        ProjKind::Q2tp { .. } => 9, // 8 B two-bit plane + 5-bit ladder code
         ProjKind::Q4b => 18,
         ProjKind::Q1 | ProjKind::Q1t => 5,
         _ => 16,
@@ -6997,6 +7621,29 @@ fn encode_proj(
         ProjKind::Q4tp => {
             encode_q4tp_matvec(c, enc, fbuf, abs, in_buf, out_buf, rows, gpr);
         }
+        ProjKind::Q2tp { center, prism } => {
+            let affine = prism
+                .as_ref()
+                .map(|spec| spec.affine_select)
+                .unwrap_or(false);
+            let input = if let Some(spec) = prism {
+                encode_prism_fwht(c, enc, spec, in_buf);
+                &spec.scratch
+            } else {
+                in_buf
+            };
+            if affine {
+                // This branch is reachable only after proj_abs has performed
+                // the cached legal-code admission for the immutable tensor.
+                TERNARY_PROD_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                TERNARY_PROD_ROWS.fetch_add(rows as u64, std::sync::atomic::Ordering::Relaxed);
+                let cat = WCAT.load(std::sync::atomic::Ordering::Relaxed) as usize % 6;
+                TERNARY_PROD_BY_CAT[cat].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                encode_q2tp_affine_select_matvec(c, enc, fbuf, abs, input, out_buf, rows, gpr);
+            } else {
+                encode_q2tp_matvec(c, enc, fbuf, abs, input, out_buf, rows, gpr, *center);
+            }
+        }
         ProjKind::Q1 => {
             encode_q1_matvec(c, enc, fbuf, abs, in_buf, out_buf, rows, gpr);
         }
@@ -7018,6 +7665,65 @@ fn encode_proj(
             );
         }
     }
+}
+
+/// Encode the source Prism activation boundary before a forward q2tp matrix.
+/// The transform writes a dedicated scratch row and is immediately consumed
+/// by the following q2 kernel in the same serial compute encoder.
+fn encode_prism_fwht(
+    c: &Ctx,
+    enc: &metal::ComputeCommandEncoderRef,
+    spec: &PrismSpec,
+    input: &Buffer,
+) {
+    enc.set_compute_pipeline_state(&c.fwht);
+    enc.set_buffer(0, Some(input), 0);
+    enc.set_buffer(1, Some(&spec.scratch), 0);
+    enc.set_buffer(2, Some(&spec.signs), 0);
+    let width = spec.width as u32;
+    let block = spec.block as u32;
+    let sign_offset = spec.sign_offset as u32;
+    let round16 = spec.round16 as u32;
+    enc.set_bytes(3, 4, &width as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(4, 4, &block as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(5, 4, &sign_offset as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(6, 4, &round16 as *const u32 as *const std::ffi::c_void);
+    enc.dispatch_thread_groups(
+        MTLSize::new((spec.width / spec.block) as u64, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
+}
+
+/// Batched row-aware Prism FWHT.  The input/output rows are contiguous and
+/// the transform is encoded before the q2tp GEMM in the same serial encoder.
+/// `out` must hold `batch * spec.width` floats; the kernel itself has no
+/// implicit padding or row replication.
+fn encode_prism_fwht_rows(
+    c: &Ctx,
+    enc: &metal::ComputeCommandEncoderRef,
+    spec: &PrismSpec,
+    input: &Buffer,
+    out: &Buffer,
+    batch: usize,
+) {
+    enc.set_compute_pipeline_state(&c.fwht_rows);
+    enc.set_buffer(0, Some(input), 0);
+    enc.set_buffer(1, Some(out), 0);
+    enc.set_buffer(2, Some(&spec.signs), 0);
+    let width = spec.width as u32;
+    let block = spec.block as u32;
+    let sign_offset = spec.sign_offset as u32;
+    let round16 = spec.round16 as u32;
+    let batch_u = batch as u32;
+    enc.set_bytes(3, 4, &width as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(4, 4, &block as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(5, 4, &sign_offset as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(6, 4, &round16 as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(7, 4, &batch_u as *const u32 as *const std::ffi::c_void);
+    enc.dispatch_thread_groups(
+        MTLSize::new((spec.width / spec.block) as u64, batch as u64, 1),
+        MTLSize::new(256, 1, 1),
+    );
 }
 
 /// Encode q8_row matvec.
@@ -9065,6 +9771,207 @@ pub fn q4tp_matmat(
     }
     tracing::debug!("gpu q4tp matmat: {rows}x{cols} b={b}");
     true
+}
+
+/// Single-token q2tp matvec on Metal. The payload is always the raw Q2TP
+/// plane; `affine` only selects the descriptor-validated centre (1.0 versus
+/// ordinary 1.5). Unsupported shapes or descriptors return false so the
+/// caller's exact CPU path remains the fallback.
+fn q2tp_matvec_mode(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+    affine: bool,
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if cols % GROUP_SIZE != 0 || rows == 0 || xs.len() < cols || out.len() < rows {
+        return false;
+    }
+    let entry = &model.tensors[idx];
+    if entry.dtype != cortiq_core::TensorDtype::Q2TiledP
+        || entry.shape.first().copied().unwrap_or(0) < rows
+        || entry.shape.get(1).copied().unwrap_or(cols) < cols
+        || affine != crate::prism::is_affine_target(model, &entry.name)
+    {
+        return false;
+    }
+    let Some(abs) = model.entry_abs_offset(entry) else { return false };
+    let Some((fbuf, safe_len)) = file_buffer(c, model) else { return false };
+    let Some(need) = cortiq_core::quant::expected_nbytes(
+        cortiq_core::TensorDtype::Q2TiledP,
+        &[rows, cols],
+    ) else {
+        return false;
+    };
+    if abs.checked_add(need).is_none_or(|end| end > safe_len) {
+        return false;
+    }
+    let get_io = |key: usize, nbytes: usize| -> Buffer {
+        let mut cache = c.io_bufs.lock().unwrap();
+        cache
+            .entry(io_key(key))
+            .or_insert_with(|| {
+                crate::gpu::probe_note_cold();
+                c._device
+                    .new_buffer(nbytes as u64, MTLResourceOptions::StorageModeShared)
+            })
+            .clone()
+    };
+    let xs_buf = get_io(27_000_000_701 + xs.len(), xs.len() * 4);
+    unsafe {
+        std::ptr::copy_nonoverlapping(xs.as_ptr(), xs_buf.contents() as *mut f32, xs.len());
+    }
+    let y_buf = get_io(28_000_000_709 + rows, rows * 4);
+    let use_affine_select = affine && q2tp_affine_admitted(c, model, (idx, rows, cols));
+    let center = if affine { 1.0 } else { 1.5 };
+    let cmd = c.queue.new_command_buffer();
+    let enc = cmd.new_compute_command_encoder();
+    if use_affine_select {
+        TERNARY_PROD_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        TERNARY_PROD_ROWS.fetch_add(rows as u64, std::sync::atomic::Ordering::Relaxed);
+        let cat = WCAT.load(std::sync::atomic::Ordering::Relaxed) as usize % 6;
+        TERNARY_PROD_BY_CAT[cat].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        encode_q2tp_affine_select_matvec(c, enc, &fbuf, abs, &xs_buf, &y_buf, rows, cols / GROUP_SIZE);
+    } else {
+        // Ordinary midrise Q2 and illegal affine/code3 payloads retain the
+        // established centre decoder, including its reserved-code result.
+        encode_q2tp_matvec(c, enc, &fbuf, abs, &xs_buf, &y_buf, rows, cols / GROUP_SIZE, center);
+    }
+    enc.end_encoding();
+    submit_and_wait(c, cmd, &[&y_buf]);
+    unsafe {
+        std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, out.as_mut_ptr(), rows);
+    }
+    true
+}
+
+pub fn q2tp_matvec(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    q2tp_matvec_mode(model, idx, xs, rows, cols, out, false)
+}
+
+pub fn q2tp_affine_matvec(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    q2tp_matvec_mode(model, idx, xs, rows, cols, out, true)
+}
+
+/// q2tp simdgroup-matrix GEMM. Metal stages the packed 2-bit rows into the
+/// same 64x32 half tiles as q4tp, then performs the existing 8x8x8 matrix
+/// multiply; only the decoded centre and q2 plane offsets differ.
+fn q2tp_matmat_mode(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    pre: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+    affine: bool,
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if cols % GROUP_SIZE != 0 || rows == 0 || b == 0
+        || pre.len() < b * cols || out.len() < b * rows
+    {
+        return false;
+    }
+    let entry = &model.tensors[idx];
+    if entry.dtype != cortiq_core::TensorDtype::Q2TiledP
+        || entry.shape.first().copied().unwrap_or(0) < rows
+        || entry.shape.get(1).copied().unwrap_or(cols) < cols
+        || affine != crate::prism::is_affine_target(model, &entry.name)
+    {
+        return false;
+    }
+    let Some(abs) = model.entry_abs_offset(entry) else { return false };
+    let Some((fbuf, safe_len)) = file_buffer(c, model) else { return false };
+    let Some(need) = cortiq_core::quant::expected_nbytes(
+        cortiq_core::TensorDtype::Q2TiledP,
+        &[rows, cols],
+    ) else {
+        return false;
+    };
+    if abs.checked_add(need).is_none_or(|end| end > safe_len) {
+        return false;
+    }
+    let get_io = |key: usize, nbytes: usize| -> Buffer {
+        let mut cache = c.io_bufs.lock().unwrap();
+        cache
+            .entry(io_key(key))
+            .or_insert_with(|| {
+                crate::gpu::probe_note_cold();
+                c._device
+                    .new_buffer(nbytes as u64, MTLResourceOptions::StorageModeShared)
+            })
+            .clone()
+    };
+    let xs_buf = get_io(29_000_000_719 + pre.len(), pre.len() * 4);
+    unsafe {
+        std::ptr::copy_nonoverlapping(pre.as_ptr(), xs_buf.contents() as *mut f32, pre.len());
+    }
+    let wboost = activation_boost(pre, &xs_buf);
+    let y_buf = get_io(30_000_000_727 + b * rows, b * rows * 4);
+    let center = if affine { 1.0 } else { 1.5 };
+    let cmd = c.queue.new_command_buffer();
+    let enc = cmd.new_compute_command_encoder();
+    encode_q2tp_matmat(
+        c,
+        enc,
+        &fbuf,
+        abs,
+        &xs_buf,
+        &y_buf,
+        cols,
+        rows,
+        b,
+        wboost,
+        center,
+    );
+    enc.end_encoding();
+    submit_and_wait(c, cmd, &[&y_buf]);
+    unsafe {
+        std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, out.as_mut_ptr(), b * rows);
+    }
+    tracing::debug!("gpu q2tp matmat: {rows}x{cols} b={b} affine={affine}");
+    true
+}
+
+pub fn q2tp_matmat(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    pre: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    q2tp_matmat_mode(model, idx, pre, b, rows, cols, out, false)
+}
+
+pub fn q2tp_affine_matmat(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    pre: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    q2tp_matmat_mode(model, idx, pre, b, rows, cols, out, true)
 }
 
 pub fn q4t_matmat(
@@ -11428,7 +12335,11 @@ pub struct TokenGraph {
     dims: GraphDims,
     cmd: Option<metal::CommandBuffer>,
     /// Committed-but-unawaited predecessor (see `commit`).
-    in_flight: Option<metal::CommandBuffer>,
+    /// Every committed graph buffer remains until checked completion. The
+    /// queue is ordered, but checking only the newest buffer can hide an
+    /// earlier command-buffer Error before its output/state is read.
+    in_flight: Vec<metal::CommandBuffer>,
+    failed: bool,
     /// CMF_METAL_GPUPROF=1: every command buffer this token committed
     /// (with the item kind that committed it), so `sync` can sum GPU
     /// busy time per category and expose the gap to the wall.
@@ -11438,6 +12349,10 @@ pub struct TokenGraph {
     h_b: Buffer,
     n_b: Buffer,
     d_b: Buffer,
+    /// Dedicated activation scratch for the descriptor-aware Prism FWHT.
+    /// It is sized to the model's largest declared intermediate width and is
+    /// reused serially between projection dispatches.
+    prism_b: Buffer,
     /// Recurrent-state buffers awaiting readback (buffer, f32 len).
     dirty: Vec<(Buffer, usize)>,
     /// Next state-buffer cache slot (reset when `dirty` drains).
@@ -11458,6 +12373,13 @@ impl TokenGraph {
         let h_b = io_buf(c, 20_000_000_003 + dims.hidden, dims.hidden * 4);
         let n_b = io_buf(c, 21_000_000_011 + dims.hidden, dims.hidden * 4);
         let d_b = io_buf(c, 32_000_000_207 + dims.hidden, dims.hidden * 4);
+        let max_width = model
+            .header
+            .arch
+            .intermediate_size
+            .max(dims.hidden)
+            .max(1);
+        let prism_b = io_buf(c, 33_000_000_223 + max_width, max_width * 4);
         unsafe {
             std::ptr::copy_nonoverlapping(h.as_ptr(), h_b.contents() as *mut f32, dims.hidden);
         }
@@ -11468,12 +12390,14 @@ impl TokenGraph {
             safe_len,
             dims,
             cmd: None,
-            in_flight: None,
+            in_flight: Vec::new(),
+            failed: false,
             gpuprof: Vec::new(),
             commit_kind: 0,
             h_b,
             n_b,
             d_b,
+            prism_b,
             dirty: Vec::new(),
             st_next: 0,
             qkv_bufs: None,
@@ -11547,6 +12471,63 @@ impl TokenGraph {
         Some(abs)
     }
 
+    /// Validate one q2_tiled predicted-scale tensor.  Its payload layout is
+    /// the q4tp ladder with an 8-byte two-bit plane per 32-weight group.
+    fn q2tp_abs(&self, t: (usize, usize, usize)) -> Option<usize> {
+        let (idx, rows, cols) = t;
+        if cols % GROUP_SIZE != 0 {
+            return None;
+        }
+        let entry = &self.model.tensors[idx];
+        let abs = self.model.entry_abs_offset(entry)?;
+        let need = cortiq_core::quant::expected_nbytes(
+            cortiq_core::TensorDtype::Q2TiledP,
+            &[rows, cols],
+        )?;
+        if abs + need > self.safe_len || (entry.nbytes as usize) < need {
+            return None;
+        }
+        Some(abs)
+    }
+
+    fn q2tp_affine_admitted(&self, t: (usize, usize, usize)) -> bool {
+        q2tp_affine_admitted(self.c, &self.model, t)
+    }
+
+    /// Build the exact forward Prism activation descriptor for a q2tp
+    /// projection.  The model header owns one concatenated sign table; the
+    /// width list determines the stable offset for this projection.
+    fn prism_spec(&self, width: usize) -> Option<PrismSpec> {
+        let cfg = self.model.header.arch.prism_hadamard.as_ref()?;
+        if cfg.block_size == 0
+            || cfg.block_size > 1024
+            || width == 0
+            || width % cfg.block_size != 0
+            || !cfg.widths.contains(&width)
+        {
+            return None;
+        }
+        let mut sign_offset = 0usize;
+        for &w in &cfg.widths {
+            if w == width {
+                break;
+            }
+            sign_offset = sign_offset.checked_add(w)?;
+        }
+        if sign_offset.checked_add(width)? > cfg.signs.len() {
+            return None;
+        }
+        Some(PrismSpec {
+            signs: const_buf(self.c, &cfg.signs),
+            scratch: self.prism_b.clone(),
+            width,
+            block: cfg.block_size,
+            sign_offset,
+            round16: cfg.activation_f16,
+            affine_select: false,
+        })
+    }
+
     fn q4t_abs(&self, t: (usize, usize, usize)) -> Option<usize> {
         let (idx, rows, cols) = t;
         if cols % GROUP_SIZE != 0 {
@@ -11569,6 +12550,45 @@ impl TokenGraph {
             cortiq_core::TensorDtype::Q4Block => self.q4b_abs(t).map(|a| (a, ProjKind::Q4b)),
             cortiq_core::TensorDtype::Q4Tiled => self.q4t_abs(t).map(|a| (a, ProjKind::Q4t)),
             cortiq_core::TensorDtype::Q4TiledP => self.q4tp_abs(t).map(|a| (a, ProjKind::Q4tp)),
+            cortiq_core::TensorDtype::Q2TiledP => {
+                let entry = &self.model.tensors[t.0];
+                let model_prism = crate::prism::has_contract(&self.model);
+                if model_prism {
+                    // A Prism q2 matrix is graph-safe only when both halves
+                    // of the descriptor are present: forward D·H and the
+                    // explicit affine centre correction.  Never infer either
+                    // property from dtype or architecture name.
+                    if !crate::prism::is_forward_weight(&self.model, &entry.name)
+                        || !crate::prism::is_affine_target(&self.model, &entry.name)
+                    {
+                        return None;
+                    }
+                    let mut spec = self.prism_spec(t.2)?;
+                    // Illegal/reserved-code tensors retain the historical
+                    // centre decoder; only legal members select the new
+                    // arithmetic kernel. The scan result is cached in Ctx.
+                    spec.affine_select = self.q2tp_affine_admitted(t);
+                    self.q2tp_abs(t).map(|a| {
+                        (
+                            a,
+                            ProjKind::Q2tp {
+                                center: 1.0,
+                                prism: Some(spec),
+                            },
+                        )
+                    })
+                } else {
+                    self.q2tp_abs(t).map(|a| {
+                        (
+                            a,
+                            ProjKind::Q2tp {
+                                center: 1.5,
+                                prism: None,
+                            },
+                        )
+                    })
+                }
+            }
             cortiq_core::TensorDtype::Q8Row | cortiq_core::TensorDtype::Q8_2f => {
                 self.q8_abs(t).map(|(a, row_scale, col_field)| {
                     (
@@ -11741,9 +12761,9 @@ impl TokenGraph {
     }
 
     /// Commit the current command buffer WITHOUT waiting: the GPU
-    /// starts on it while the CPU keeps encoding the next one. Queue
-    /// order makes the eventual `sync` wait (on the last buffer) cover
-    /// every earlier commit.
+    /// starts on it while the CPU keeps encoding the next one. Queue order
+    /// makes the eventual checked sync wait all buffers without reading any
+    /// output until every status has been validated.
     pub fn commit(&mut self) {
         // CMF_METAL_ONEBUF=1: keep encoding into one command buffer and
         // let `sync` commit it — probe for the per-buffer scheduling
@@ -11758,22 +12778,49 @@ impl TokenGraph {
             if gpuprof_on() {
                 self.gpuprof.push((cmd.clone(), self.commit_kind));
             }
-            self.in_flight = Some(cmd);
+            self.in_flight.push(cmd);
         }
     }
 
     /// Submit everything encoded so far and wait for completion.
+    ///
+    /// This compatibility wrapper preserves the historical public API. New
+    /// graph callers must use `sync_checked` so a Metal command-buffer error
+    /// cannot be mistaken for a completed state/output readback.
     pub fn sync(&mut self) {
+        if let Err(err) = self.sync_checked() {
+            self.failed = true;
+            tracing::error!("Metal TokenGraph sync failed: {err}");
+        }
+    }
+
+    /// Checked graph completion. No caller may read hidden, logits, or
+    /// recurrent state after this returns an error.
+    pub fn sync_checked(&mut self) -> Result<(), String> {
+        if self.failed {
+            return Err("Metal TokenGraph is already failed".to_string());
+        }
         if let Some(cmd) = self.cmd.take() {
             METAL_SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             cmd.commit();
             if gpuprof_on() {
                 self.gpuprof.push((cmd.clone(), self.commit_kind));
             }
-            self.in_flight = Some(cmd);
+            self.in_flight.push(cmd);
         }
-        if let Some(cmd) = self.in_flight.take() {
-            wait_fast(&cmd);
+        let flights = std::mem::take(&mut self.in_flight);
+        let mut wait_error = None;
+        for cmd in flights {
+            if let Err(err) = wait_fast_checked(&cmd) {
+                wait_error.get_or_insert(err);
+            }
+        }
+        if let Some(err) = wait_error {
+            // GPU timestamps are not trustworthy after a failed command;
+            // discard them rather than exposing a partial profile as proof.
+            self.gpuprof.clear();
+            self.failed = true;
+            return Err(err);
         }
         if gpuprof_on() && !self.gpuprof.is_empty() {
             use std::sync::atomic::{AtomicU64, Ordering};
@@ -11813,11 +12860,15 @@ impl TokenGraph {
                 }
             }
         }
+        Ok(())
     }
 
     /// Copy finished recurrent states back to their CPU owners (call
     /// after `sync`; order matches the `encode_gdn_run` calls).
     pub fn read_states(&mut self, outs: &mut [&mut [f32]]) {
+        if self.failed {
+            return;
+        }
         debug_assert_eq!(outs.len(), self.dirty.len());
         for ((buf, len), out) in self.dirty.drain(..).zip(outs.iter_mut()) {
             // len 0 = a zero-copy wrap: the device already wrote the owner
@@ -11834,7 +12885,12 @@ impl TokenGraph {
 
     /// Final sync + hidden readback.
     pub fn finish(mut self, h: &mut [f32]) {
-        self.sync();
+        let _ = self.finish_checked(h);
+    }
+
+    /// Checked final sync + hidden readback for graph callers.
+    pub fn finish_checked(mut self, h: &mut [f32]) -> Result<(), String> {
+        self.sync_checked()?;
         debug_assert!(self.dirty.is_empty(), "unread recurrent states at finish");
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -11843,6 +12899,7 @@ impl TokenGraph {
                 self.dims.hidden,
             );
         }
+        Ok(())
     }
 
     /// Replace the resident hidden with a projection of a host vector:
@@ -11879,6 +12936,9 @@ impl TokenGraph {
 
     /// Hidden state readback (after `sync`) — debug/oracle use.
     pub fn read_h(&self, out: &mut [f32]) {
+        if self.failed {
+            return;
+        }
         unsafe {
             std::ptr::copy_nonoverlapping(
                 self.h_b.contents() as *const f32,
@@ -11928,7 +12988,9 @@ impl TokenGraph {
         if !g2.attn_device_ok(l, &p2) || !g2.encode_attn_device(l, &p2) {
             return None;
         }
-        g2.sync();
+        if g2.sync_checked().is_err() {
+            return None;
+        }
         let nhd = p.nh * p.hd;
         let qr_b = io_buf(self.c, 44_000_000_007 + nhd, nhd * 4);
         let ao_b = io_buf(self.c, 43_000_000_057 + nhd, nhd * 4);
@@ -12070,6 +13132,10 @@ impl TokenGraph {
     /// Copy the finished logits (call after `sync`; out may be shorter
     /// than the head's rows — trailing rows are padding vocab).
     pub fn read_logits(&mut self, out: &mut [f32]) {
+        if self.failed {
+            self.logits_b.take();
+            return;
+        }
         let lg_b = self
             .logits_b
             .take()
@@ -13328,6 +14394,9 @@ pub struct VerifyGraph {
     ones: Buffer,
     xsc: Buffer,
     imp_scratch: Buffer,
+    /// Row-major scratch for descriptor-aware batched Prism FWHT.  The
+    /// TokenGraph's one-row `prism_b` cannot be reused for a b-row GEMM.
+    prism_rows: Buffer,
     gdn: Vec<VerifyGdnSlot>,
     logits_b: Option<(Buffer, usize)>,
     /// Prefill mode: every row is real — the GDN recurrence writes its
@@ -13337,6 +14406,10 @@ pub struct VerifyGraph {
     /// d_b holds a residual delta not yet added to h_b: the next norm
     /// folds `h += d` in (one dispatch instead of axpy + norm).
     pending_delta: bool,
+    /// A command-buffer error is terminal for this graph.  No state, KV, or
+    /// output readback is allowed after it, and callers must not fall back to
+    /// a serial path against partially mutated device state.
+    failed: bool,
 }
 
 const VBUF_BASE: usize = 60_000_000_000;
@@ -13348,6 +14421,177 @@ fn verify_skip(what: char) -> bool {
     static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     V.get_or_init(|| std::env::var("CMF_VERIFY_SKIP").unwrap_or_default())
         .contains(what)
+}
+
+/// Scan only the immutable Q2 payload planes for the legal affine ternary
+/// contract. Codes 0/1/2 are exact sign/zero symbols; reserved code 3 (or
+/// non-finite row ladder parameters) selects the generic centre decoder.
+///
+/// This pure shape/payload helper is kept separate from the model/cache lookup
+/// so the complete 32-symbol u64 word (including the upper half) has a direct
+/// regression surface.
+fn q2tp_affine_payload_admitted(bytes: &[u8], rows: usize, cols: usize) -> bool {
+    if cols == 0 || cols % GROUP_SIZE != 0 || rows == 0 {
+        return false;
+    }
+    let groups = cols / GROUP_SIZE;
+    let Some(params_off) = rows.checked_mul(groups).and_then(|n| n.checked_mul(8)) else {
+        return false;
+    };
+    let Some(codes_off) = params_off.checked_add(rows.checked_mul(4).unwrap_or(usize::MAX)) else {
+        return false;
+    };
+    let Some(stride) = groups.checked_mul(5).map(|n| n.div_ceil(8)) else {
+        return false;
+    };
+    let Some(need) = codes_off.checked_add(rows.checked_mul(stride).unwrap_or(usize::MAX)) else {
+        return false;
+    };
+    if need > bytes.len() {
+        return false;
+    }
+    for r in 0..rows {
+        let po = params_off + r * 4;
+        let lo = f16_to_f32(u16::from_le_bytes([bytes[po], bytes[po + 1]]));
+        let step = f16_to_f32(u16::from_le_bytes([bytes[po + 2], bytes[po + 3]]));
+        if !lo.is_finite() || !step.is_finite() {
+            return false;
+        }
+        // The first plane is 32 two-bit symbols per group. The later
+        // `codes_off` plane is the predicted-scale rung and may legitimately
+        // contain rung value 3; never confuse it with the reserved symbol.
+        for g in 0..groups {
+            let wo = (r * groups + g) * 8;
+            let Some(word_bytes) = bytes.get(wo..wo + 8) else {
+                return false;
+            };
+            let Ok(word_bytes) = <[u8; 8]>::try_from(word_bytes) else {
+                return false;
+            };
+            let word = u64::from_le_bytes(word_bytes);
+            for j in 0..32 {
+                if ((word >> (2 * j)) & 3) == 3 {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Scan an immutable Prism Q2 payload once for the legal affine ternary
+/// contract and cache the result by stable model/tensor/view identity. The
+/// tensor index identifies its shard/overlay and nbytes inside this model;
+/// rows/cols are also in the key because callers may request a bounded view.
+fn q2tp_affine_admitted(c: &Ctx, model: &Arc<CmfModel>, t: (usize, usize, usize)) -> bool {
+    let (idx, rows, cols) = t;
+    let key = (model_key(model), idx, rows, cols);
+    if let Some(&cached) = c.q2_affine_admission.lock().unwrap().get(&key) {
+        return cached;
+    }
+    let valid = (|| {
+        let entry = model.tensors.get(idx)?;
+        if entry.dtype != cortiq_core::TensorDtype::Q2TiledP {
+            return Some(false);
+        }
+        // Q2TP row/code strides are tensor-shape dependent.  A bounded view
+        // therefore cannot safely reuse the full-payload layout; keep it on
+        // the established decoder rather than admitting a misaligned scan.
+        if entry.shape.as_slice() != [rows, cols] {
+            return Some(false);
+        }
+        if cols == 0 || cols % GROUP_SIZE != 0 || rows == 0 {
+            return Some(false);
+        }
+        let need = cortiq_core::quant::expected_nbytes(
+            cortiq_core::TensorDtype::Q2TiledP,
+            &[rows, cols],
+        )?;
+        let bytes = model.entry_bytes(entry);
+        if (entry.nbytes as usize) < need || need > bytes.len() {
+            return Some(false);
+        }
+        Some(q2tp_affine_payload_admitted(bytes, rows, cols))
+    })()
+    .unwrap_or(false);
+    c.q2_affine_admission.lock().unwrap().insert(key, valid);
+    valid
+}
+
+#[cfg(test)]
+mod q2tp_affine_admission_tests {
+    use super::*;
+
+    fn payload(rows: usize, groups: usize) -> Vec<u8> {
+        let params_off = rows * groups * 8;
+        let stride = (groups * 5).div_ceil(8);
+        let mut bytes = vec![0u8; params_off + rows * 4 + rows * stride];
+        let one = cortiq_core::quant::f32_to_f16(1.0).to_le_bytes();
+        for r in 0..rows {
+            bytes[params_off + r * 4..params_off + r * 4 + 2].copy_from_slice(&one);
+            bytes[params_off + r * 4 + 2..params_off + r * 4 + 4].copy_from_slice(&one);
+        }
+        // Legal symbols vary across all 32 positions; the rung plane is also
+        // populated independently so rung 3/31 cannot be mistaken for code3.
+        for r in 0..rows {
+            for g in 0..groups {
+                for j in 0..32 {
+                    set_symbol(&mut bytes, rows, groups, r, g, j, (j % 3) as u8);
+                }
+                set_rung(&mut bytes, rows, groups, r, g, if (r + g) % 2 == 0 { 3 } else { 31 });
+            }
+        }
+        bytes
+    }
+
+    fn set_symbol(bytes: &mut [u8], _rows: usize, groups: usize, r: usize, g: usize, j: usize, code: u8) {
+        let off = (r * groups + g) * 8;
+        let mut word = u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
+        let shift = 2 * j;
+        word = (word & !(3u64 << shift)) | ((code as u64) << shift);
+        bytes[off..off + 8].copy_from_slice(&word.to_le_bytes());
+    }
+
+    fn set_rung(bytes: &mut [u8], rows: usize, groups: usize, r: usize, g: usize, rung: u8) {
+        let params_off = rows * groups * 8;
+        let codes_off = params_off + rows * 4;
+        let stride = (groups * 5).div_ceil(8);
+        let bit = g * 5;
+        let pos = codes_off + r * stride + bit / 8;
+        let mut raw = u16::from_le_bytes([bytes[pos], bytes[pos + 1]]);
+        raw = (raw & !(31u16 << (bit & 7))) | ((rung as u16) << (bit & 7));
+        bytes[pos..pos + 2].copy_from_slice(&raw.to_le_bytes());
+    }
+
+    #[test]
+    fn admits_all_legal_symbols_and_independent_rungs() {
+        let bytes = payload(2, 2);
+        assert!(q2tp_affine_payload_admitted(&bytes, 2, 64));
+    }
+
+    #[test]
+    fn rejects_code3_at_every_position_of_last_group_and_last_row() {
+        for j in 0..32 {
+            let mut bytes = payload(2, 2);
+            set_symbol(&mut bytes, 2, 2, 1, 1, j, 3);
+            assert!(
+                !q2tp_affine_payload_admitted(&bytes, 2, 64),
+                "reserved code3 at upper-plane symbol {j} was admitted"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_nonfinite_ladder_parameters_but_not_rung3_or_31() {
+        let mut bytes = payload(2, 2);
+        assert!(q2tp_affine_payload_admitted(&bytes, 2, 64));
+        let params_off = 2 * 2 * 8;
+        bytes[params_off..params_off + 2].copy_from_slice(&0x7e00u16.to_le_bytes());
+        assert!(!q2tp_affine_payload_admitted(&bytes, 2, 64));
+        let mut bytes = payload(2, 2);
+        bytes[params_off + 2..params_off + 4].copy_from_slice(&0x7e00u16.to_le_bytes());
+        assert!(!q2tp_affine_payload_admitted(&bytes, 2, 64));
+    }
 }
 
 impl VerifyGraph {
@@ -13383,6 +14627,13 @@ impl VerifyGraph {
             }
         }
         let imp_scratch = Self::vbuf(c, 6, 0, 1 << 20);
+        let max_width = model
+            .header
+            .arch
+            .intermediate_size
+            .max(dims.hidden)
+            .max(1);
+        let prism_rows = Self::vbuf(c, 29, 0, b * max_width * 4);
         Some(VerifyGraph {
             tg,
             b,
@@ -13393,10 +14644,12 @@ impl VerifyGraph {
             ones,
             xsc,
             imp_scratch,
+            prism_rows,
             gdn: Vec::new(),
             logits_b: None,
             prefill: false,
             pending_delta: false,
+            failed: false,
         })
     }
 
@@ -13437,7 +14690,7 @@ impl VerifyGraph {
         }
         let zeros = vec![0f32; b * dims.hidden];
         let mut g = VerifyGraph::new(model, dims, &zeros, b)?;
-        g.n8_abs(t)?;
+        g.batch_abs(t)?;
         let c = g.tg.c;
         let x_b = Self::vbuf(c, 28, 0, b * t.2 * 4);
         unsafe {
@@ -13450,13 +14703,15 @@ impl VerifyGraph {
         Some(g)
     }
 
-    /// A projection the n8 GEMM can take: q4tp with cols % 64 == 0.
-    fn n8_abs(&self, t: (usize, usize, usize)) -> Option<usize> {
+    /// A projection the b-row matrix GEMM can take. Q4TP keeps its existing
+    /// path; descriptor-validated Q2TP is admitted for ordinary and Prism
+    /// batches. Both simdgroup kernels handle row/batch tails explicitly.
+    fn batch_abs(&self, t: (usize, usize, usize)) -> Option<(usize, ProjKind)> {
         if t.2 % 64 != 0 {
             return None;
         }
         match self.tg.proj_abs(t) {
-            Some((abs, ProjKind::Q4tp)) => Some(abs),
+            Some((abs, kind @ (ProjKind::Q4tp | ProjKind::Q2tp { .. }))) => Some((abs, kind)),
             _ => None,
         }
     }
@@ -13465,7 +14720,9 @@ impl VerifyGraph {
         match f {
             MetalFfn::Dense { gate, up, down } => {
                 down.1 == self.tg.dims.hidden
-                    && [gate, up, down].iter().all(|t| self.n8_abs(**t).is_some())
+                    && [gate, up, down]
+                        .iter()
+                        .all(|t| self.batch_abs(**t).is_some())
             }
             MetalFfn::Moe(_) => false,
         }
@@ -13479,7 +14736,7 @@ impl VerifyGraph {
             && cfg.nv % cfg.nk == 0
             && [l.qkv, l.z, l.out]
                 .iter()
-                .all(|t| self.n8_abs(*t).is_some())
+                .all(|t| self.batch_abs(*t).is_some())
             && self.ffn_n8_ok(&l.ffn)
     }
 
@@ -13489,12 +14746,12 @@ impl VerifyGraph {
             && p.o1.is_none()
             && [l.wq, l.wk, l.wv, l.wo]
                 .iter()
-                .all(|t| self.n8_abs(*t).is_some())
+                .all(|t| self.batch_abs(*t).is_some())
             && self.ffn_n8_ok(&l.ffn)
     }
 
     pub fn lm_head_ok(&self, lm: (usize, usize, usize)) -> bool {
-        lm.2 == self.tg.dims.hidden && self.n8_abs(lm).is_some()
+        lm.2 == self.tg.dims.hidden && self.batch_abs(lm).is_some()
     }
 
     /// n = rmsnorm(h, w) — folding a pending `h += d` in when there is one.
@@ -13562,37 +14819,76 @@ impl VerifyGraph {
         if verify_skip('g') {
             return;
         }
-        let abs = self.n8_abs(t).unwrap();
-        note_weight_bytes(&ProjKind::Q4tp, t.1, t.2 / GROUP_SIZE);
-        if self.b <= 8 {
-            encode_q4tp_mm_n8(
-                self.tg.c,
-                enc,
-                &self.tg.fbuf,
-                abs,
-                xs,
-                y,
-                xsc,
-                t.1,
-                t.2,
-                self.b,
-            );
-        } else {
-            // the wide simdgroup GEMM (compute-bound, ~1.5 TMAC/s on the
-            // M4); its activations ride at scale 1 — no per-row pre-scale
-            enc_mul_mm(
-                self.tg.c,
-                enc,
-                &self.tg.fbuf,
-                abs,
-                &self.ones,
-                MmKind::Q4tp,
-                xs,
-                y,
-                self.b,
-                t.1,
-                t.2,
-            );
+        let (abs, kind) = self.batch_abs(t).unwrap();
+        note_weight_bytes(&kind, t.1, t.2 / GROUP_SIZE);
+        match &kind {
+            ProjKind::Q4tp => {
+                if self.b <= 8 {
+                    encode_q4tp_mm_n8(
+                        self.tg.c,
+                        enc,
+                        &self.tg.fbuf,
+                        abs,
+                        xs,
+                        y,
+                        xsc,
+                        t.1,
+                        t.2,
+                        self.b,
+                    );
+                } else {
+                    // The wide simdgroup GEMM keeps the historical q4tp
+                    // path and its all-ones activation scale.
+                    enc_mul_mm(
+                        self.tg.c,
+                        enc,
+                        &self.tg.fbuf,
+                        abs,
+                        &self.ones,
+                        MmKind::Q4tp,
+                        xs,
+                        y,
+                        self.b,
+                        t.1,
+                        t.2,
+                    );
+                }
+            }
+            ProjKind::Q2tp { center, prism } => {
+                // A Prism Q2 projection consumes D·H(x), rounded to the
+                // source's f16 boundary, row by row.  Its scratch is dense
+                // [batch][cols] and never aliases the one-row TokenGraph
+                // scratch or the original a/b projections.
+                let input = if let Some(spec) = prism {
+                    encode_prism_fwht_rows(
+                        self.tg.c,
+                        enc,
+                        spec,
+                        xs,
+                        &self.prism_rows,
+                        self.b,
+                    );
+                    &self.prism_rows
+                } else {
+                    xs
+                };
+                // Prism activations are finite source-rounded values and the
+                // Q2 matrix kernel must not apply the Q4 overflow pre-scale.
+                encode_q2tp_matmat(
+                    self.tg.c,
+                    enc,
+                    &self.tg.fbuf,
+                    abs,
+                    input,
+                    y,
+                    t.2,
+                    t.1,
+                    self.b,
+                    1.0,
+                    *center,
+                );
+            }
+            _ => unreachable!("VerifyGraph::batch_abs admitted an unsupported projection"),
         }
     }
 
@@ -14083,7 +15379,13 @@ impl VerifyGraph {
 
     /// Submit and wait (a pending residual add is flushed first so h_b is
     /// the true hidden for readback).
-    pub fn sync(&mut self) {
+    /// Submit and wait, returning false on a terminal command-buffer error.
+    /// A false result means no caller may read state/output or fall back to a
+    /// serial path against this graph's partially mutated device state.
+    pub fn sync(&mut self) -> bool {
+        if self.failed {
+            return false;
+        }
         if self.pending_delta {
             let cmd = self.ensure_cmd();
             let enc = cmd.new_compute_command_encoder();
@@ -14093,11 +15395,21 @@ impl VerifyGraph {
         if let Some(cmd) = self.cmd.take() {
             METAL_SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             cmd.commit();
-            wait_fast(&cmd);
+            if let Err(err) = wait_fast_checked(&cmd) {
+                self.failed = true;
+                self.logits_b = None;
+                tracing::error!("Metal VerifyGraph command buffer failed: {err}");
+                return false;
+            }
         }
+        true
     }
 
     pub fn read_logits(&mut self, out: &mut [f32]) -> bool {
+        if self.failed {
+            self.logits_b = None;
+            return false;
+        }
         let Some((lg_b, rows)) = self.logits_b.take() else {
             return false;
         };
@@ -14109,17 +15421,29 @@ impl VerifyGraph {
     }
 
     /// The b output hiddens (after `sync`).
-    pub fn read_hidden(&self, h: &mut [f32]) {
+    pub fn read_hidden(&self, h: &mut [f32]) -> bool {
+        if self.failed || h.len() < self.b * self.tg.dims.hidden {
+            return false;
+        }
         let n = (self.b * self.tg.dims.hidden).min(h.len());
         unsafe {
             std::ptr::copy_nonoverlapping(self.h_b.contents() as *const f32, h.as_mut_ptr(), n);
         }
+        true
     }
 
     /// Prefill mode: copy the (already written) states back to the CPU
     /// owners after `sync` (order = the `encode_gdn_run_b` calls).
     pub fn finish_states(&mut self, states_out: &mut [&mut [f32]]) -> bool {
-        if !self.prefill || states_out.len() != self.gdn.len() {
+        if self.failed || !self.prefill || states_out.len() != self.gdn.len() {
+            return false;
+        }
+        if self
+            .gdn
+            .iter()
+            .zip(states_out.iter())
+            .any(|(slot, out)| slot.st_len > 0 && out.len() != slot.st_len)
+        {
             return false;
         }
         for (slot, out) in self.gdn.iter().zip(states_out.iter_mut()) {
@@ -14130,7 +15454,7 @@ impl VerifyGraph {
                 std::ptr::copy_nonoverlapping(
                     slot.st.contents() as *const f32,
                     out.as_mut_ptr(),
-                    slot.st_len.min(out.len()),
+                    slot.st_len,
                 );
             }
         }
@@ -14142,7 +15466,15 @@ impl VerifyGraph {
     /// state and shifting the ring, then copy the results to the CPU
     /// owners (order = the `encode_gdn_run_b` calls). One submit + wait.
     pub fn commit(&mut self, n_pos: usize, states_out: &mut [&mut [f32]]) -> bool {
-        if n_pos == 0 || n_pos > self.b || states_out.len() != self.gdn.len() {
+        if self.failed || n_pos == 0 || n_pos > self.b || states_out.len() != self.gdn.len() {
+            return false;
+        }
+        if self
+            .gdn
+            .iter()
+            .zip(states_out.iter())
+            .any(|(slot, out)| slot.st_len > 0 && out.len() != slot.st_len)
+        {
             return false;
         }
         let c = self.tg.c;
@@ -14190,13 +15522,11 @@ impl VerifyGraph {
         enc.end_encoding();
         METAL_SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         cmd.commit();
-        // Every slot zero-copy → nothing to read back on the CPU: leave the
-        // replay in the queue (the next graph run is ordered behind it, the
-        // owner memory is written by the device either way) and return.
-        if self.gdn.iter().all(|s| s.st_len == 0) {
-            return true;
+        if let Err(err) = wait_fast_checked(&cmd) {
+            self.failed = true;
+            tracing::error!("Metal VerifyGraph commit failed: {err}");
+            return false;
         }
-        wait_fast(&cmd);
         for (slot, out) in self.gdn.iter().zip(states_out.iter_mut()) {
             if slot.st_len == 0 {
                 continue; // zero-copy: the replay wrote the owner directly
@@ -14205,7 +15535,7 @@ impl VerifyGraph {
                 std::ptr::copy_nonoverlapping(
                     slot.st.contents() as *const f32,
                     out.as_mut_ptr(),
-                    slot.st_len.min(out.len()),
+                    slot.st_len,
                 );
             }
         }
@@ -14238,9 +15568,11 @@ pub fn gdn_block(
     if !g.encode_gdn_run(layers, &ro, cfg) {
         return false;
     }
-    g.sync();
+    if g.sync_checked().is_err() {
+        return false;
+    }
     g.read_states(states);
-    g.finish(h);
+    g.read_h(h);
     true
 }
 
@@ -14449,6 +15781,7 @@ mod tests {
             rope_freq_factors: None,
             logit_multiplier: None,
             loop_final_norm: false,
+        prism_hadamard: None,
         };
         let header = CmfHeader {
             format: "cmf".into(),
@@ -14579,6 +15912,7 @@ mod tests {
             rope_freq_factors: None,
             logit_multiplier: None,
             loop_final_norm: false,
+        prism_hadamard: None,
         };
         let header = CmfHeader {
             format: "cmf".into(),
@@ -14738,6 +16072,7 @@ mod tests {
             rope_freq_factors: None,
             logit_multiplier: None,
             loop_final_norm: false,
+        prism_hadamard: None,
         };
         let header = CmfHeader {
             format: "cmf".into(),

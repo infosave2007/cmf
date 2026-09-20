@@ -468,8 +468,9 @@ pub struct ModelArch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub qwen4_exp: Option<Qwen4ExpConfig>,
     /// DeepSeek-V4.1 source configuration, preserved verbatim for the
-    /// multimodal/Engram runtime. The engine reads the nested `text_config`,
-    /// `vision_config`, and `quantization_config` values from this copy.
+    /// multimodal/Engram runtime. The engine must read the nested
+    /// `text_config`, `vision_config`, and `quantization_config` values from
+    /// this copy instead of reconstructing them from flattened fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deepseek_v41: Option<serde_json::Value>,
     /// Canonical linear core carried by the file (None = no linear layers
@@ -523,6 +524,182 @@ pub struct ModelArch {
     /// Apply final normalization after each loop iteration (Nanbeige 4.2).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub loop_final_norm: bool,
+    /// Explicit Prism/Bonsai transform identity. Ordinary CMF models leave
+    /// this absent and retain all pre-existing dtype/runtime semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prism_hadamard: Option<PrismHadamardConfig>,
+}
+
+/// Typed descriptor for Prism/Bonsai's folded signed Walsh-Hadamard basis.
+/// A reader that cannot apply this exact transform must refuse the artifact
+/// rather than run ternary planes in the stored basis.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PrismHadamardConfig {
+    pub version: u32,
+    pub block_size: usize,
+    pub transform: String,
+    pub axis: String,
+    pub sign_mode: String,
+    /// Concatenated explicit ±1 vectors in `widths` order.
+    pub widths: Vec<usize>,
+    pub signs: Vec<f32>,
+    #[serde(default)]
+    pub forward_weight_names: Vec<String>,
+    #[serde(default)]
+    pub inverse_weight_names: Vec<String>,
+    /// GDN V channels are already grouped in the source MLX layout.
+    #[serde(default)]
+    pub gdn_v_grouped: bool,
+    /// Source runtime casts transformed activations to f16 at the matmul
+    /// boundary. The pure FWHT oracle remains f32.
+    #[serde(default)]
+    pub activation_f16: bool,
+    /// Optional Q2TP affine correction.  Raw dtype16 decoding remains the
+    /// ordinary mid-rise `(c - 1.5) * s` contract; when this descriptor is
+    /// present the listed Prism matrices are evaluated as `(c - 1.0) * s`.
+    /// Keeping this as an explicit, versioned operator prevents ordinary
+    /// q2tp files from acquiring a hidden correction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub affine: Option<PrismAffineConfig>,
+}
+
+/// Descriptor for the production `q2tp_affine` Prism profile.  The correction
+/// is derived from the same q2tp ladder scale (`+.5 * s`), so it introduces no
+/// second weight plane or per-weight state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PrismAffineConfig {
+    pub version: u32,
+    pub profile: String,
+    pub group_size: usize,
+    pub correction_scale: f32,
+    /// Canonical CMF names, including the inverse embedding target.
+    #[serde(default)]
+    pub target_names: Vec<String>,
+}
+
+impl PrismAffineConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.version != 1 {
+            return Err(format!("unsupported Prism affine version {}", self.version));
+        }
+        if self.profile != "q2tp_affine" {
+            return Err(format!(
+                "unsupported Prism affine profile {:?}",
+                self.profile
+            ));
+        }
+        if self.group_size != 32 {
+            return Err(format!(
+                "Prism affine group_size {} != required 32",
+                self.group_size
+            ));
+        }
+        if !self.correction_scale.is_finite() || self.correction_scale != 0.5 {
+            return Err(format!(
+                "Prism affine correction_scale {} != required 0.5",
+                self.correction_scale
+            ));
+        }
+        if self.target_names.is_empty() {
+            return Err("Prism affine target_names must not be empty".into());
+        }
+        let mut seen = std::collections::HashSet::with_capacity(self.target_names.len());
+        if self
+            .target_names
+            .iter()
+            .any(|n| n.is_empty() || !seen.insert(n))
+        {
+            return Err("Prism affine target_names must be nonempty and unique".into());
+        }
+        Ok(())
+    }
+
+    pub fn applies_to(&self, name: &str) -> bool {
+        self.target_names.iter().any(|n| n == name)
+    }
+}
+
+impl PrismHadamardConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.version != 1 {
+            return Err(format!(
+                "unsupported Prism Hadamard version {}",
+                self.version
+            ));
+        }
+        if self.block_size == 0 || !self.block_size.is_power_of_two() {
+            return Err(format!(
+                "Prism Hadamard block_size {} is not a positive power of two",
+                self.block_size
+            ));
+        }
+        if self.transform != "normalized-sylvester-walsh-hadamard"
+            || self.axis != "input-last-dimension"
+            || self.sign_mode != "explicit"
+        {
+            return Err("unsupported Prism Hadamard transform/axis/sign mode".into());
+        }
+        if self.widths.is_empty()
+            || self
+                .widths
+                .iter()
+                .any(|&w| w == 0 || w % self.block_size != 0)
+        {
+            return Err("Prism Hadamard widths must be nonzero block multiples".into());
+        }
+        let total: usize = self.widths.iter().sum();
+        if self.signs.len() != total {
+            return Err(format!(
+                "Prism Hadamard sign vector length {} != declared width total {total}",
+                self.signs.len()
+            ));
+        }
+        if self
+            .signs
+            .iter()
+            .any(|&s| !s.is_finite() || (s != -1.0 && s != 1.0))
+        {
+            return Err("Prism Hadamard signs must be finite ±1".into());
+        }
+        if self
+            .forward_weight_names
+            .iter()
+            .any(|n| self.inverse_weight_names.contains(n))
+        {
+            return Err("Prism Hadamard forward/inverse manifests overlap".into());
+        }
+        if let Some(affine) = self.affine.as_ref() {
+            affine.validate()?;
+            let mut canonical = std::collections::HashSet::new();
+            for name in self
+                .forward_weight_names
+                .iter()
+                .chain(self.inverse_weight_names.iter())
+            {
+                canonical.insert(name.strip_prefix("language_model.").unwrap_or(name));
+            }
+            if affine
+                .target_names
+                .iter()
+                .any(|name| !canonical.contains(name.as_str()))
+            {
+                return Err("Prism affine target is not in the Hadamard manifest".into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Return the explicit sign vector for an activation width.
+    pub fn signs_for_width(&self, width: usize) -> Option<&[f32]> {
+        let mut off = 0usize;
+        for &w in &self.widths {
+            if w == width {
+                return self.signs.get(off..off + w);
+            }
+            off += w;
+        }
+        None
+    }
 }
 
 fn default_rope_theta() -> f64 {
