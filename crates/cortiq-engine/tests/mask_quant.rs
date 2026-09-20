@@ -137,7 +137,6 @@ fn sparse_ffn_quant_agrees_with_dequant() {
         rope_freq_factors: None,
         logit_multiplier: None,
         loop_final_norm: false,
-        glm5_next: None,
         prism_hadamard: None,
     };
     let header = CmfHeader {

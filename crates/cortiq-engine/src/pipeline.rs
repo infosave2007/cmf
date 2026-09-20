@@ -827,6 +827,14 @@ fn prefill_batched() -> bool {
         .unwrap_or(true)
 }
 
+/// The strict fused-head NLL contract belongs only to the native Metal
+/// TokenGraph. Other GPU backends may keep a resident hidden-state graph
+/// while retaining the established CPU/per-op lm_head fallback.
+#[inline]
+fn fused_head_nll_route(task_mask_is_none: bool, graph_prefill: bool, native_metal: bool) -> bool {
+    task_mask_is_none && graph_prefill && native_metal
+}
+
 /// Input to the layer-major batched span walk: token ids (embeds itself,
 /// full-stack and coordinator prefill) or ready boundary hiddens (the
 /// network worker's side of a split).
@@ -6132,12 +6140,23 @@ impl Pipeline {
             // using it here would silently score a different execution.  Keep
             // masked scoring on the exact per-position path as before, and
             // let the serial arm below drive the graph-aware scorer.
-            let graph_quality = task_mask.is_none() && self.graph_prefill_preferred();
-            // Quality scoring must exercise the same native graph head used
-            // by decode. A missing graph head is a hard route failure, not a
-            // reason to quietly score a separate CPU norm/head.
-            self.graph_head_required = graph_quality;
-            self.graph_want_logits = graph_quality;
+            let graph_quality = fused_head_nll_route(
+                task_mask.is_none(),
+                self.graph_prefill_preferred(),
+                crate::gpu::q1_force(),
+            );
+            // Only native Metal has a fused graph lm_head contract.  Vulkan
+            // and other graph backends may expose hidden state without the
+            // optional logits side channel; preserve their established CPU
+            // norm/head fallback instead of turning that valid route into a
+            // hard missing-logits error.
+            let fused_head_quality = fused_head_nll_route(
+                task_mask.is_none(),
+                graph_quality,
+                crate::gpu::q1_force(),
+            );
+            self.graph_head_required = fused_head_quality;
+            self.graph_want_logits = fused_head_quality;
             #[cfg(target_os = "macos")]
             if graph_quality && std::env::var("CMF_METAL_BATCH_NLL").as_deref() != Ok("0") {
                 match self.nll_batch_metal(ids, start) {
@@ -13765,6 +13784,24 @@ fn ffn_forward_pair(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn fused_nll_head_requires_native_metal() {
+        assert!(super::fused_head_nll_route(true, true, true));
+        assert!(!super::fused_head_nll_route(true, true, false));
+        assert!(!super::fused_head_nll_route(false, true, true));
+        assert!(!super::fused_head_nll_route(true, false, true));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn nonmac_graph_quality_keeps_the_head_fallback() {
+        assert!(!super::fused_head_nll_route(
+            true,
+            true,
+            crate::gpu::q1_force(),
+        ));
+    }
 
     #[test]
     fn mtp_prefill_pair_boundaries_skip_only_final_prompt_row() {
