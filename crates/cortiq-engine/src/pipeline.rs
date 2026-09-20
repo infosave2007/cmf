@@ -827,6 +827,20 @@ fn prefill_batched() -> bool {
         .unwrap_or(true)
 }
 
+/// Decide the graph NLL route without conflating graph quality with the
+/// optional native-Metal fused head. A hidden-state graph remains a valid
+/// quality route on Vulkan/Wgpu; only native Metal requires graph logits.
+#[inline]
+fn nll_graph_policy(
+    unmasked: bool,
+    prefer_graph: bool,
+    native_metal: bool,
+) -> (bool, bool) {
+    let graph_quality = unmasked && prefer_graph;
+    let fused_head_quality = graph_quality && native_metal;
+    (graph_quality, fused_head_quality)
+}
+
 /// Input to the layer-major batched span walk: token ids (embeds itself,
 /// full-stack and coordinator prefill) or ready boundary hiddens (the
 /// network worker's side of a split).
@@ -6132,13 +6146,16 @@ impl Pipeline {
             // using it here would silently score a different execution.  Keep
             // masked scoring on the exact per-position path as before, and
             // let the serial arm below drive the graph-aware scorer.
-            let graph_quality = task_mask.is_none() && self.graph_prefill_preferred();
             // Only native Metal has a fused graph lm_head contract.  Vulkan
             // and other graph backends may expose hidden state without the
             // optional logits side channel; preserve their established CPU
             // norm/head fallback instead of turning that valid route into a
             // hard missing-logits error.
-            let fused_head_quality = graph_quality && crate::gpu::q1_force();
+            let (graph_quality, fused_head_quality) = nll_graph_policy(
+                task_mask.is_none(),
+                self.graph_prefill_preferred(),
+                crate::gpu::q1_force(),
+            );
             self.graph_head_required = fused_head_quality;
             self.graph_want_logits = fused_head_quality;
             #[cfg(target_os = "macos")]
@@ -13770,24 +13787,21 @@ fn ffn_forward_pair(
 mod tests {
 
     #[test]
-    fn fused_nll_head_requires_native_metal() {
-        let graph_quality = true;
-        let native_metal_q1_force = true;
-        let fused_head_quality = graph_quality && native_metal_q1_force;
-        assert!(fused_head_quality);
-        assert!(!(false && native_metal_q1_force));
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    #[test]
-    fn nonmac_graph_quality_keeps_the_head_fallback() {
-        // Vulkan/Wgpu graph prefill is still quality-eligible; q1_force is
-        // deliberately false off native Metal, so hidden-only graph output
-        // must retain the established CPU/per-operation head fallback.
-        let graph_quality = true;
-        let graph_head_required = graph_quality && crate::gpu::q1_force();
-        assert!(graph_quality);
-        assert!(!graph_head_required);
+    fn nll_graph_policy_scopes_only_the_fused_head() {
+        for (label, unmasked, prefer_graph, native_metal, want_graph, want_head) in [
+            // A Vulkan/Wgpu hidden-only graph remains the quality route.
+            ("vulkan graph", true, true, false, true, false),
+            // Native Metal adds the strict fused graph-head contract.
+            ("native Metal graph", true, true, true, true, true),
+            // Masked NLL and the explicit non-graph fallback remain unchanged.
+            ("masked", false, true, false, false, false),
+            ("graph disabled", true, false, true, false, false),
+        ] {
+            let (graph_quality, graph_head_required) =
+                super::nll_graph_policy(unmasked, prefer_graph, native_metal);
+            assert_eq!(graph_quality, want_graph, "{label}: graph quality");
+            assert_eq!(graph_head_required, want_head, "{label}: fused head");
+        }
     }
 
     #[test]
