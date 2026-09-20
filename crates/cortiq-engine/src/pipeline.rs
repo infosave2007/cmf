@@ -258,6 +258,11 @@ pub struct Pipeline {
     /// the device (drops the separate per-op lm_head round trip).
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     graph_want_logits: bool,
+    /// NLL quality gates require the graph's fused head rather than silently
+    /// accepting a CPU head fallback. Generation keeps the historical
+    /// best-effort `graph_want_logits` behavior.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    graph_head_required: bool,
     /// Logits the graph produced for the token just forwarded (taken by
     /// the decode loop; None = compute on the CPU path).
     graph_logits: Option<Vec<f32>>,
@@ -677,6 +682,30 @@ struct MetalVerifyPending {
     attn_layers: Vec<(usize, usize)>,
 }
 
+#[cfg(target_os = "macos")]
+enum MetalRowsRun {
+    /// Capability/preflight refusal before a command buffer was committed.
+    Declined,
+    /// A graph was admitted and then failed; callers must clear the sequence
+    /// rather than replaying it through CPU/serial state.
+    Failed,
+    Completed(MetalVerifyPending),
+}
+
+#[cfg(target_os = "macos")]
+enum MetalPrefillOutcome {
+    Declined,
+    Failed,
+    Completed(Vec<f32>),
+}
+
+#[cfg(target_os = "macos")]
+enum MetalBatchNllOutcome {
+    Declined,
+    Failed(String),
+    Completed(f64, usize),
+}
+
 /// The speculation trial's phases (see the decode loop): four timed
 /// speculative rounds, eight timed plain tokens, then the faster arm
 /// until a re-check.
@@ -796,6 +825,20 @@ fn prefill_batched() -> bool {
     std::env::var("CMF_PREFILL")
         .map(|v| v != "seq")
         .unwrap_or(true)
+}
+
+/// Decide the graph NLL route without conflating graph quality with the
+/// optional native-Metal fused head. A hidden-state graph remains a valid
+/// quality route on Vulkan/Wgpu; only native Metal requires graph logits.
+#[inline]
+fn nll_graph_policy(
+    unmasked: bool,
+    prefer_graph: bool,
+    native_metal: bool,
+) -> (bool, bool) {
+    let graph_quality = unmasked && prefer_graph;
+    let fused_head_quality = graph_quality && native_metal;
+    (graph_quality, fused_head_quality)
 }
 
 /// Input to the layer-major batched span walk: token ids (embeds itself,
@@ -932,6 +975,7 @@ impl Pipeline {
             }
         }
         self.graph_want_logits = false;
+        self.graph_head_required = false;
         self.graph_logits = None;
         self.graph_failed
             .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -956,9 +1000,23 @@ impl Pipeline {
             self.clear_sequence_state();
             self.graph_logits = None;
             self.graph_want_logits = false;
+            self.graph_head_required = false;
             return Err(format!("GPU graph failed during {phase} at position {pos}"));
         }
         Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn fail_metal_graph(&mut self, reason: &str) {
+        crate::pipeline::METAL_GRAPH_ERRORS
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.clear_sequence_state();
+        self.graph_logits = None;
+        self.graph_failed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        tracing::error!("native Metal TokenGraph failed closed: {reason}");
     }
 
     /// Start an NLL/PPL request with all graph side channels in a known
@@ -975,11 +1033,13 @@ impl Pipeline {
             self.clear_sequence_state();
             self.graph_logits = None;
             self.graph_want_logits = false;
+            self.graph_head_required = false;
             return Err("GPU graph failed before NLL scoring".to_string());
         }
         self.clear_sequence_state();
         self.graph_logits = None;
         self.graph_want_logits = false;
+        self.graph_head_required = false;
         Ok(())
     }
 
@@ -990,6 +1050,7 @@ impl Pipeline {
         self.clear_sequence_state();
         self.graph_logits = None;
         self.graph_want_logits = false;
+        self.graph_head_required = false;
         self.graph_failed
             .store(false, std::sync::atomic::Ordering::Relaxed);
     }
@@ -1059,8 +1120,9 @@ impl Pipeline {
     /// prompt: 85 tok/s chunked vs 14 through the graph).
     #[cfg(target_os = "macos")]
     fn graph_prefill_preferred(&self) -> bool {
+        let graph_force = crate::gpu::q1_force() || crate::gpu::q2tp_gpu_opt_in();
         if !crate::gpu::enabled_here()
-            || !crate::gpu::q1_force()
+            || !graph_force
             || std::env::var("CMF_GPU_BLOCK")
                 .map(|v| v == "0")
                 .unwrap_or(false)
@@ -1073,7 +1135,9 @@ impl Pipeline {
         self.weights
             .layers
             .iter()
-            .any(|lw| matches!(&lw.attn, AttnKind::LinearGdn(w) if w.in_proj_qkv.is_q1()))
+            .any(|lw| {
+                matches!(&lw.attn, AttnKind::LinearGdn(w) if w.in_proj_qkv.metal_graph_parts().is_some())
+            })
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -1089,6 +1153,11 @@ impl Pipeline {
         if !graph_on || !crate::gpu::enabled_here() {
             return false;
         }
+        // The descriptor-aware Prism graph now carries both the FWHT/affine
+        // transforms and resident GDN state, so it is also the exact prefill
+        // path for this model.  Keeping it here (rather than falling through
+        // to the CPU chunk walk) is required for a long prompt to seed the
+        // same device state that decode consumes.
         // O(1) needs the CPU prefill: the q-trace that seals the Nyström
         // skeleton is recorded there and nowhere else. The GDN half of
         // the hybrid loses nothing — the graph's first decode creates
@@ -1116,20 +1185,24 @@ impl Pipeline {
     ) -> usize {
         let _mt0 = std::time::Instant::now(); // CMF_METAL_HOSTPROF
         use crate::gpu::{AttnGpuLayer, GdnGpuCfg, GdnGpuLayer, GraphDims, MetalFfn, TokenGraph};
+        let graph_force = crate::gpu::q1_force() || crate::gpu::q2tp_gpu_opt_in();
         if self.attn_softcap > 0.0 // capped scores: no graph kernel — CPU path
             || !crate::gpu::enabled_here()
-            || !crate::gpu::q1_force()
+            || !graph_force
             || std::env::var("CMF_GPU_BLOCK")
                 .map(|v| v == "0")
                 .unwrap_or(false)
         {
             if std::env::var("CMF_GRAPH_DBG").is_ok() {
                 eprintln!(
-                    "block-graph: front gate (softcap={} enabled_here={} q1_force={})",
+                    "block-graph: front gate (softcap={} enabled_here={} graph_force={})",
                     self.attn_softcap > 0.0,
                     crate::gpu::enabled_here(),
-                    crate::gpu::q1_force(),
+                    graph_force,
                 );
+            }
+            if self.graph_head_required {
+                self.fail_metal_graph("native graph front gate refused");
             }
             return start;
         }
@@ -1156,6 +1229,9 @@ impl Pipeline {
                     self.attn_v_norm,
                     (self.attn_scale - 1.0 / (self.head_dim as f32).sqrt()).abs(),
                 );
+            }
+            if self.graph_head_required {
+                self.fail_metal_graph("native graph architecture gate refused");
             }
             return start;
         }
@@ -1211,9 +1287,9 @@ impl Pipeline {
             let ffn = match &lw.ffn {
                 FfnKind::Dense(d) if d.segs.is_empty() => {
                     let (Some(g), Some(u), Some(dn)) = (
-                        d.gate_proj.q1_parts(),
-                        d.up_proj.q1_parts(),
-                        d.down_proj.q1_parts(),
+                        d.gate_proj.metal_graph_parts(),
+                        d.up_proj.metal_graph_parts(),
+                        d.down_proj.metal_graph_parts(),
                     ) else {
                         if block_diag {
                             eprintln!(
@@ -1252,21 +1328,21 @@ impl Pipeline {
             match &lw.attn {
                 AttnKind::LinearGdn(w) if self.gdn_cfg.is_some() => {
                     let parts = (
-                        w.in_proj_qkv.q1_parts(),
-                        w.in_proj_z.q1_parts(),
+                        w.in_proj_qkv.metal_graph_parts(),
+                        w.in_proj_z.metal_graph_parts(),
                         w.in_proj_a.f32_parts(),
                         w.in_proj_b.f32_parts(),
-                        w.out_proj.q1_parts(),
+                        w.out_proj.metal_graph_parts(),
                     );
                     let (Some(qkv), Some(z), Some(a), Some(b), Some(out)) = parts else {
                         if block_diag {
                             eprintln!(
                                 "block-graph: L{scan} GDN parts refused (qkv={} z={} a_f32={} b_f32={} out={})",
-                                w.in_proj_qkv.q1_parts().is_some(),
-                                w.in_proj_z.q1_parts().is_some(),
+                                w.in_proj_qkv.metal_graph_parts().is_some(),
+                                w.in_proj_z.metal_graph_parts().is_some(),
                                 w.in_proj_a.f32_parts().is_some(),
                                 w.in_proj_b.f32_parts().is_some(),
-                                w.out_proj.q1_parts().is_some(),
+                                w.out_proj.metal_graph_parts().is_some(),
                             );
                         }
                         break;
@@ -1313,7 +1389,12 @@ impl Pipeline {
                     // core routes sealed layers through the nystrom step.
                     || std::env::var("CMF_O1_METAL").as_deref() == Ok("1") =>
                 {
-                    let parts = (wq.q1_parts(), wk.q1_parts(), wv.q1_parts(), wo.q1_parts());
+                    let parts = (
+                        wq.metal_graph_parts(),
+                        wk.metal_graph_parts(),
+                        wv.metal_graph_parts(),
+                        wo.metal_graph_parts(),
+                    );
                     let (Some(pq), Some(pk), Some(pv), Some(po)) = parts else {
                         break;
                     };
@@ -1363,11 +1444,17 @@ impl Pipeline {
             if std::env::var("CMF_GRAPH_DBG").is_ok() {
                 eprintln!("q1-graph: no model ref (start {start}, scanned to {scan})");
             }
+            if self.graph_head_required {
+                self.fail_metal_graph("native graph has no mapped model reference");
+            }
             return start;
         };
         if plan.is_empty() {
             if std::env::var("CMF_GRAPH_DBG").is_ok() {
                 eprintln!("q1-graph: empty plan at layer {start}");
+            }
+            if self.graph_head_required {
+                self.fail_metal_graph("native graph plan is empty");
             }
             return start;
         }
@@ -1428,6 +1515,9 @@ impl Pipeline {
             gemma: self.norm_style == cortiq_core::NormStyle::Gemma,
         };
         let Some(mut graph) = TokenGraph::new(&model, dims, h) else {
+            if self.graph_head_required {
+                self.fail_metal_graph("native TokenGraph allocation refused");
+            }
             return start;
         };
         let gcfg = self.gdn_cfg.map(|cfg| GdnGpuCfg {
@@ -1492,6 +1582,14 @@ impl Pipeline {
         }
         plan.truncate(valid);
         if plan.is_empty() {
+            if self.graph_head_required {
+                self.fail_metal_graph("native graph preflight produced no valid items");
+            }
+            return start;
+        }
+
+        if self.graph_head_required && (upto.is_some() || end != self.num_layers) {
+            self.fail_metal_graph("fused-head NLL requires a complete 64-layer graph");
             return start;
         }
 
@@ -1625,7 +1723,10 @@ impl Pipeline {
                         // Mirror refused (nothing encoded) → sandwich.
                     }
                     graph.encode_attn_prefix(l);
-                    graph.sync();
+                    if let Err(err) = graph.sync_checked() {
+                        self.fail_metal_graph(&err);
+                        return start;
+                    }
                     if !pending.is_empty() {
                         let idxs: Vec<usize> =
                             pending.drain(..).flat_map(|(f, n)| f..f + n).collect();
@@ -1789,15 +1890,23 @@ impl Pipeline {
                 .map(|v| v != "0")
                 .unwrap_or(true)
         {
-            if let Some(lm) = self.weights.lm_head.q1_parts() {
+            if let Some(lm) = self.weights.lm_head.metal_graph_parts() {
                 if graph.lm_head_ok(lm) {
                     graph.encode_lm_head(&self.weights.final_norm, lm);
                     lm_rows = Some(lm.1);
                 }
             }
         }
+        if self.graph_head_required && lm_rows.is_none() {
+            METAL_GRAPH_HEAD_MISS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.fail_metal_graph("fused graph head was requested but not encodable");
+            return start;
+        }
         let _sy0 = std::time::Instant::now();
-        graph.sync();
+        if let Err(err) = graph.sync_checked() {
+            self.fail_metal_graph(&err);
+            return start;
+        }
         let _rs0 = std::time::Instant::now();
         if !pending.is_empty() {
             let idxs: Vec<usize> = pending.drain(..).flat_map(|(f, n)| f..f + n).collect();
@@ -1840,7 +1949,20 @@ impl Pipeline {
             }
             self.graph_logits = Some(lg);
         }
-        graph.finish(h);
+        graph.read_h(h);
+        if self.graph_head_required && self.graph_logits.is_none() {
+            METAL_GRAPH_HEAD_MISS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.fail_metal_graph("fused graph head completed without logits readback");
+            return start;
+        }
+        METAL_GRAPH_TOK_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        METAL_GRAPH_LAYERS.fetch_add(
+            end.saturating_sub(start) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        if self.graph_head_required {
+            METAL_GRAPH_HEAD_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         // Device-attended layers: replay the CPU bookkeeping — append
         // the mirror's new K/V row (rope'd on the GPU) into the owner
         // cache, then bank this token's attention-importance mass.
@@ -1978,6 +2100,7 @@ impl Pipeline {
             head_clusters: None,
             attn_softcap: 0.0,
             graph_want_logits: false,
+            graph_head_required: false,
             graph_logits: None,
             graph_kv_id: {
                 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -2843,7 +2966,7 @@ impl Pipeline {
         #[cfg(target_os = "macos")]
         if task_mask.is_none()
             && !dyn_prefill
-            && crate::gpu::q1_force()
+            && (crate::gpu::q1_force() || crate::gpu::q2tp_gpu_opt_in())
             && crate::gpu::enabled_here()
             && self.gdn_cfg.is_some()
             && self.g3n.is_none()
@@ -2860,8 +2983,13 @@ impl Pipeline {
             let _tp = std::time::Instant::now();
             while pos < input_ids.len() && !self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 let end = (pos + chunk).min(input_ids.len());
-                let Some(hb) = self.prefill_batch_metal(&input_ids[pos..end], pos) else {
-                    break;
+                let hb = match self.prefill_batch_metal(&input_ids[pos..end], pos) {
+                    MetalPrefillOutcome::Completed(hb) => hb,
+                    MetalPrefillOutcome::Declined => break,
+                    MetalPrefillOutcome::Failed => {
+                        self.finish_generation(&mut mtp, &mut router, true);
+                        return Err("ordinary Metal prefill failed after admission".into());
+                    }
                 };
                 if let Some(m) = &mut mtp {
                     let n_pairs = if end < input_ids.len() {
@@ -4240,6 +4368,8 @@ impl Pipeline {
                 kind,
                 row_scale: rs,
                 data: &[],
+                prism: crate::gpu::GraphPrismOp::None,
+                affine: false,
             })
         }
         let (model, _, _, _) = wq.graph_weight()?;
@@ -4252,6 +4382,8 @@ impl Pipeline {
                     kind,
                     row_scale: rs,
                     data: &[],
+                    prism: crate::gpu::GraphPrismOp::None,
+                    affine: false,
                 },
                 self.weights.lm_head.rows(),
             )
@@ -4387,6 +4519,8 @@ impl Pipeline {
                 kind,
                 row_scale: rs,
                 data: &[],
+                prism: crate::gpu::GraphPrismOp::None,
+                affine: false,
             })
         }
         let Some((model, _, _, _)) = wq.graph_weight() else {
@@ -4823,6 +4957,8 @@ impl Pipeline {
                     kind,
                     row_scale: rs,
                     data: &[],
+                    prism: crate::gpu::GraphPrismOp::None,
+                    affine: false,
                 },
                 self.weights.lm_head.rows(),
             )
@@ -5152,7 +5288,15 @@ impl Pipeline {
         if metal_native {
             // the Metal verify never wrote its states: the commit replays the
             // accepted prefix into the CPU owners and appends the K/V rows
-            self.metal_verify_commit(a);
+            if !self.metal_verify_commit(a) {
+                self.clear_sequence_state();
+                self.graph_failed
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                self.cancel
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                tracing::error!("Metal verify state/KV handoff failed after admission");
+                return None;
+            }
             if let Some((plain_states, rows)) = commit_ref {
                 crate::gpu_metal::queue_fence();
                 let (nkv, hd) = (self.num_kv_heads, self.head_dim);
@@ -5995,7 +6139,36 @@ impl Pipeline {
         let result: Result<(f64, usize), String> = (|| {
             let mut nll = 0f64;
             let mut cnt = 0usize;
-            if self.can_prefill_batched() {
+            // An unmasked quality run with the resident wgpu graph must score
+            // the same stateful path used by generation.  The layer-major
+            // GEMM prefill below is a valid CPU/GEMM oracle, but it seeds
+            // neither the graph's device GDN state nor its device KV mirrors;
+            // using it here would silently score a different execution.  Keep
+            // masked scoring on the exact per-position path as before, and
+            // let the serial arm below drive the graph-aware scorer.
+            // Only native Metal has a fused graph lm_head contract.  Vulkan
+            // and other graph backends may expose hidden state without the
+            // optional logits side channel; preserve their established CPU
+            // norm/head fallback instead of turning that valid route into a
+            // hard missing-logits error.
+            let (graph_quality, fused_head_quality) = nll_graph_policy(
+                task_mask.is_none(),
+                self.graph_prefill_preferred(),
+                crate::gpu::q1_force(),
+            );
+            self.graph_head_required = fused_head_quality;
+            self.graph_want_logits = fused_head_quality;
+            #[cfg(target_os = "macos")]
+            if graph_quality && std::env::var("CMF_METAL_BATCH_NLL").as_deref() != Ok("0") {
+                match self.nll_batch_metal(ids, start) {
+                    MetalBatchNllOutcome::Completed(nll, count) => {
+                        return Ok((nll, count));
+                    }
+                    MetalBatchNllOutcome::Declined => {}
+                    MetalBatchNllOutcome::Failed(err) => return Err(err),
+                }
+            }
+            if self.can_prefill_batched() && !graph_quality {
                 // prefill-GEMM: layer-major position chunks, lm_head batched
                 // (254MB lm_head read once per chunk, not per position).
                 // The layer chunk is large (grouping positions by MoE experts
@@ -6110,6 +6283,15 @@ impl Pipeline {
                 // size, which is a uniform distribution reported as a
                 // measurement. `generate` already reads this channel.
                 let out_of_band = self.graph_logits.take();
+                if self.graph_head_required && out_of_band.is_none() {
+                    METAL_GRAPH_HEAD_MISS.fetch_add(
+                        1,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    return Err(format!(
+                        "fused Metal graph head did not complete at NLL position {pos}"
+                    ));
+                }
                 if pos < start {
                     continue;
                 }
@@ -7704,21 +7886,44 @@ impl Pipeline {
         let mut model = None;
         let dbg = std::env::var("CMF_GRAPH_DEBUG").is_ok();
         fn gw(t: &QTensor) -> Option<crate::gpu::GraphW<'_>> {
-            if let Some((_, i, kind, rs)) = t.graph_weight() {
+            if let Some((m, i, kind, rs)) = t
+                .graph_weight()
+                .or_else(|| t.graph_weight_descriptor())
+            {
+                let name = &m.tensors[i].name;
+                let prism = if crate::prism::is_inverse_embedding(m, name) {
+                    crate::gpu::GraphPrismOp::InverseEmbedding
+                } else if crate::prism::is_forward_weight(m, name) {
+                    crate::gpu::GraphPrismOp::Forward
+                } else {
+                    crate::gpu::GraphPrismOp::None
+                };
                 return Some(crate::gpu::GraphW {
                     idx: i,
                     kind,
                     row_scale: rs,
                     data: &[],
+                    prism,
+                    affine: crate::prism::is_affine_target(m, name),
                 });
             }
             // Small unquantized projections (GDN in_proj_a/b) stay f32.
-            t.as_f32().map(|d| crate::gpu::GraphW {
-                idx: 0,
-                kind: 4,
-                row_scale: &[],
-                data: d,
-            })
+            match t.as_f32() {
+                Some(d) => Some(crate::gpu::GraphW {
+                    idx: 0,
+                    kind: 4,
+                    row_scale: &[],
+                    data: d,
+                    prism: crate::gpu::GraphPrismOp::None,
+                    affine: false,
+                }),
+                None => {
+                    if std::env::var_os("CMF_BATCH_DEBUG").is_some() {
+                        eprintln!("batch graph: weight has no graph/f32 representation");
+                    }
+                    None
+                }
+            }
         }
         for li in from..upto_excl {
             let lw = &self.weights.layers[self.phys_layer(li)];
@@ -7772,6 +7977,21 @@ impl Pipeline {
                         None => gw(&m.router)?,
                     };
                     let router = gw(&m.router)?;
+                    // The resident MoE kernels do not yet carry the
+                    // descriptor-aware transform through router/shared-gate
+                    // selection.  Refuse the complete layer instead of
+                    // scoring with an untransformed Prism plane (the dense
+                    // path has an explicit FWHT boundary below).
+                    if router.prism != crate::gpu::GraphPrismOp::None
+                        || sgate.prism != crate::gpu::GraphPrismOp::None
+                        || router.affine
+                        || sgate.affine
+                    {
+                        tracing::warn!(
+                            "resident MoE declined: Prism/affine router or shared gate transform is not implemented"
+                        );
+                        return None;
+                    }
                     let inter = m.experts.first()?.gate_proj.rows();
                     let mut experts = Vec::with_capacity(m.experts.len() + 1);
                     // q4t or q4tp, but not both in one layer — the kernels
@@ -7786,6 +8006,28 @@ impl Pipeline {
                             || e.up_proj.rows() != inter
                         {
                             return None;
+                        }
+                        // Expert tensors are packed into one resident buffer
+                        // and the MoE kernels have no transform slot per
+                        // expert.  Keep the CPU/per-op owner for Prism or
+                        // affine experts rather than silently using raw bytes.
+                        for expert_weight in [&e.gate_proj, &e.up_proj, &e.down_proj] {
+                            let Some((em, ei, _, _)) = expert_weight
+                                .graph_weight()
+                                .or_else(|| expert_weight.graph_weight_descriptor())
+                            else {
+                                return None;
+                            };
+                            let name = &em.tensors[ei].name;
+                            if crate::prism::is_forward_weight(em, name)
+                                || crate::prism::is_inverse_embedding(em, name)
+                                || crate::prism::is_affine_target(em, name)
+                            {
+                                tracing::warn!(
+                                    "resident MoE declined: expert Prism/affine transform is not implemented"
+                                );
+                                return None;
+                            }
                         }
                         let (mm, gi, ui, di, is_p, is_q2) = match e.gate_proj.mapped_q4t() {
                             Some((mm, gi)) => (
@@ -7873,7 +8115,9 @@ impl Pipeline {
                     if softplus_gate.is_some() || self.attention_heads_per_layer.is_some() {
                         return None;
                     }
-                    let (m, _, _, _) = wq.graph_weight()?;
+                    let (m, _, _, _) = wq
+                        .graph_weight()
+                        .or_else(|| wq.graph_weight_descriptor())?;
                     model = Some(m.clone());
                     crate::gpu::GraphAttn::Full {
                         wq: gw(wq)?,
@@ -7892,7 +8136,10 @@ impl Pipeline {
                 }
                 AttnKind::LinearGdn(w) => {
                     let cfg = self.gdn_cfg?;
-                    let (m, _, _, _) = w.in_proj_qkv.graph_weight()?;
+                    let (m, _, _, _) = w
+                        .in_proj_qkv
+                        .graph_weight()
+                        .or_else(|| w.in_proj_qkv.graph_weight_descriptor())?;
                     model = Some(m.clone());
                     crate::gpu::GraphAttn::Gdn {
                         qkv: gw(&w.in_proj_qkv)?,
@@ -7914,7 +8161,10 @@ impl Pipeline {
                 }
                 AttnKind::ShortConv(w) => {
                     let cfg = self.short_conv_cfg?;
-                    let (m, _, _, _) = w.in_proj.graph_weight()?;
+                    let (m, _, _, _) = w
+                        .in_proj
+                        .graph_weight()
+                        .or_else(|| w.in_proj.graph_weight_descriptor())?;
                     model = Some(m.clone());
                     crate::gpu::GraphAttn::ShortConv {
                         inp: gw(&w.in_proj)?,
@@ -7945,13 +8195,27 @@ impl Pipeline {
                 .map(|v| v != "0")
                 .unwrap_or(true)
         {
-            self.weights.lm_head.graph_weight().map(|(_, i, kind, rs)| {
+            self.weights
+                .lm_head
+                .graph_weight()
+                .or_else(|| self.weights.lm_head.graph_weight_descriptor())
+                .map(|(m, i, kind, rs)| {
+                let name = &m.tensors[i].name;
+                let prism = if crate::prism::is_inverse_embedding(m, name) {
+                    crate::gpu::GraphPrismOp::InverseEmbedding
+                } else if crate::prism::is_forward_weight(m, name) {
+                    crate::gpu::GraphPrismOp::Forward
+                } else {
+                    crate::gpu::GraphPrismOp::None
+                };
                 (
                     crate::gpu::GraphW {
                         idx: i,
                         kind,
                         row_scale: rs,
                         data: &[],
+                        prism,
+                        affine: crate::prism::is_affine_target(m, name),
                     },
                     self.weights.lm_head.rows(),
                 )
@@ -7965,13 +8229,24 @@ impl Pipeline {
             self.weights
                 .embed_tokens
                 .graph_weight()
-                .map(|(_, i, kind, rs)| {
+                .or_else(|| self.weights.embed_tokens.graph_weight_descriptor())
+                .map(|(m, i, kind, rs)| {
+                    let name = &m.tensors[i].name;
+                    let prism = if crate::prism::is_inverse_embedding(m, name) {
+                        crate::gpu::GraphPrismOp::InverseEmbedding
+                    } else if crate::prism::is_forward_weight(m, name) {
+                        crate::gpu::GraphPrismOp::Forward
+                    } else {
+                        crate::gpu::GraphPrismOp::None
+                    };
                     (
                         crate::gpu::GraphW {
                             idx: i,
                             kind,
                             row_scale: rs,
                             data: &[],
+                            prism,
+                            affine: crate::prism::is_affine_target(m, name),
                         },
                         self.weights.embed_tokens.rows(),
                         self.embed_multiplier,
@@ -7995,6 +8270,12 @@ impl Pipeline {
             Vec::new()
         };
         let mut h = hidden.to_vec();
+        // The normal decode path only needs the fused lm-head logits.  A
+        // CMF_LOGIT_DUMP diagnostic, however, promises a prompt-boundary
+        // post-stack hidden alongside those logits; request the existing
+        // second readback only for that explicit probe instead of dumping
+        // the input copy left in `h` by a folded-head graph.
+        let dump_hidden = std::env::var_os("CMF_LOGIT_DUMP").is_some();
         let outcome = crate::gpu::forward_token_graph(
             &model,
             self.graph_kv_id,
@@ -8023,7 +8304,7 @@ impl Pipeline {
             ids_out,
             layers_run,
             from,
-            false,
+            dump_hidden,
         );
         match outcome {
             crate::gpu::TokenGraphOutcome::Completed => Some(Ok(h)),
@@ -8050,7 +8331,8 @@ impl Pipeline {
         Option<crate::gpu_metal::GdnGpuCfg>,
     )> {
         use crate::gpu_metal::{AttnGpuLayer, GdnGpuCfg, GdnGpuLayer, MetalFfn};
-        if !crate::gpu::q1_force()
+        let graph_force = crate::gpu::q1_force() || crate::gpu::q2tp_gpu_opt_in();
+        if !graph_force
             || !crate::gpu::enabled_here()
             || std::env::var("CMF_GPU_BLOCK")
                 .map(|v| v == "0")
@@ -8085,9 +8367,9 @@ impl Pipeline {
             let ffn = match &lw.ffn {
                 FfnKind::Dense(d) if d.act == Act::Silu && d.segs.is_empty() => {
                     let (Some(g), Some(u), Some(dn)) = (
-                        d.gate_proj.q1_parts(),
-                        d.up_proj.q1_parts(),
-                        d.down_proj.q1_parts(),
+                        d.gate_proj.metal_graph_parts(),
+                        d.up_proj.metal_graph_parts(),
+                        d.down_proj.metal_graph_parts(),
                     ) else {
                         return None;
                     };
@@ -8102,11 +8384,11 @@ impl Pipeline {
             match &lw.attn {
                 AttnKind::LinearGdn(w) if self.gdn_cfg.is_some() => {
                     let (Some(qkv), Some(z), Some(a), Some(bb), Some(out)) = (
-                        w.in_proj_qkv.q1_parts(),
-                        w.in_proj_z.q1_parts(),
+                        w.in_proj_qkv.metal_graph_parts(),
+                        w.in_proj_z.metal_graph_parts(),
                         w.in_proj_a.f32_parts(),
                         w.in_proj_b.f32_parts(),
-                        w.out_proj.q1_parts(),
+                        w.out_proj.metal_graph_parts(),
                     ) else {
                         return None;
                     };
@@ -8147,7 +8429,12 @@ impl Pipeline {
                     bias: None,
                 } => {
                     let (Some(pq), Some(pk), Some(pv), Some(po)) =
-                        (wq.q1_parts(), wk.q1_parts(), wv.q1_parts(), wo.q1_parts())
+                        (
+                            wq.metal_graph_parts(),
+                            wk.metal_graph_parts(),
+                            wv.metal_graph_parts(),
+                            wo.metal_graph_parts(),
+                        )
                     else {
                         return None;
                     };
@@ -8252,7 +8539,7 @@ impl Pipeline {
         b: usize,
         prefill: bool,
         spec: Option<((usize, usize, usize), &[f32], &mut Vec<f32>)>,
-    ) -> Option<MetalVerifyPending> {
+    ) -> MetalRowsRun {
         use crate::gpu_metal::{GraphDims, VerifyGraph};
         let want = self.gdn_cfg.map(|c| c.state_len()).unwrap_or(0);
         for l in &mut self.kv_cache.layers {
@@ -8260,16 +8547,20 @@ impl Pipeline {
                 l.linear_state = vec![0f32; want];
             }
         }
-        let (plan, model, gcfg) = self.metal_rows_plan()?;
+        let Some((plan, model, gcfg)) = self.metal_rows_plan() else {
+            return MetalRowsRun::Declined;
+        };
         let dims = GraphDims {
             hidden: self.hidden_size,
             eps: self.rms_eps as f32,
             gemma: self.norm_style == cortiq_core::NormStyle::Gemma,
         };
-        let mut graph = if prefill {
-            VerifyGraph::new_prefill(&model, dims, hiddens, b)?
+        let Some(mut graph) = (if prefill {
+            VerifyGraph::new_prefill(&model, dims, hiddens, b)
         } else {
-            VerifyGraph::new(&model, dims, hiddens, b)?
+            VerifyGraph::new(&model, dims, hiddens, b)
+        }) else {
+            return MetalRowsRun::Declined;
         };
         let geom = (
             self.num_heads,
@@ -8317,13 +8608,13 @@ impl Pipeline {
                 if !SAID.swap(true, Ordering::Relaxed) {
                     tracing::warn!("metal rows graph: a layer failed preflight — declining");
                 }
-                return None;
+                return MetalRowsRun::Declined;
             }
         }
         let lm = match &spec {
             Some((lm, _, _)) => {
                 if !graph.lm_head_ok(*lm) {
-                    return None;
+                    return MetalRowsRun::Declined;
                 }
                 Some(*lm)
             }
@@ -8339,7 +8630,7 @@ impl Pipeline {
                         .map(|l| l.linear_state.as_slice())
                         .collect();
                     if !graph.encode_gdn_run_b(run, &ro, gcfg.as_ref().unwrap()) {
-                        return None;
+                        return MetalRowsRun::Declined;
                     }
                     gdn_layers.extend(*first..*first + run.len());
                 }
@@ -8365,7 +8656,7 @@ impl Pipeline {
                         gemma,
                     );
                     if !graph.encode_attn_b(l, &p) {
-                        return None;
+                        return MetalRowsRun::Declined;
                     }
                     attn_layers.push((*li, cpu_stored));
                 }
@@ -8373,16 +8664,22 @@ impl Pipeline {
         }
         if let (Some(lm), Some((_, final_norm, _))) = (lm, spec.as_ref()) {
             if !graph.encode_lm_head_b(final_norm, lm) {
-                return None;
+                return MetalRowsRun::Declined;
             }
         }
-        graph.sync();
+        if !graph.sync() {
+            return MetalRowsRun::Failed;
+        }
         if let Some((lm, _, logits)) = spec {
             logits.resize(b * lm.1, 0.0);
-            graph.read_logits(logits);
+            if !graph.read_logits(logits) {
+                return MetalRowsRun::Failed;
+            }
         }
-        graph.read_hidden(hiddens);
-        Some(MetalVerifyPending {
+        if !graph.read_hidden(hiddens) {
+            return MetalRowsRun::Failed;
+        }
+        MetalRowsRun::Completed(MetalVerifyPending {
             graph,
             gdn_layers,
             attn_layers,
@@ -8409,8 +8706,10 @@ impl Pipeline {
         {
             return crate::gpu::BatchGraphOutcome::Declined;
         }
-        let Some(pending) = self.metal_rows_run(hiddens, positions[0], b, false, spec) else {
-            return crate::gpu::BatchGraphOutcome::Declined;
+        let pending = match self.metal_rows_run(hiddens, positions[0], b, false, spec) {
+            MetalRowsRun::Declined => return crate::gpu::BatchGraphOutcome::Declined,
+            MetalRowsRun::Failed => return crate::gpu::BatchGraphOutcome::Failed,
+            MetalRowsRun::Completed(pending) => pending,
         };
         if std::env::var("CMF_GRAPH_SPEC_TIME").is_ok() {
             eprintln!(
@@ -8424,21 +8723,35 @@ impl Pipeline {
 
     /// Batched prefill on the Metal rows graph: `ids` (≤ 512) at
     /// `start_pos..`, states written in place, K/V rows appended to the
-    /// CPU caches; returns every position's output hidden (`[b][hidden]`).
-    /// None = the graph declined before touching anything.
+    /// CPU caches; optional final norm/head logits are returned in `spec`.
+    /// Declined means no command buffer was admitted; Failed is terminal.
     #[cfg(target_os = "macos")]
-    fn prefill_batch_metal(&mut self, ids: &[u32], start_pos: usize) -> Option<Vec<f32>> {
+    fn prefill_rows_metal(
+        &mut self,
+        ids: &[u32],
+        start_pos: usize,
+        spec: Option<((usize, usize, usize), &[f32], &mut Vec<f32>)>,
+    ) -> MetalPrefillOutcome {
         let b = ids.len();
         if b == 0 || b > 512 {
-            return None;
+            return MetalPrefillOutcome::Declined;
         }
+        METAL_PREFILL_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let with_head = spec.is_some();
         let hs = self.hidden_size;
         let mut hiddens = vec![0f32; b * hs];
         for (j, &id) in ids.iter().enumerate() {
             let e = self.embed_single(id);
             hiddens[j * hs..(j + 1) * hs].copy_from_slice(&e);
         }
-        let mut pending = self.metal_rows_run(&mut hiddens, start_pos, b, true, None)?;
+        let mut pending = match self.metal_rows_run(&mut hiddens, start_pos, b, true, spec) {
+            MetalRowsRun::Declined => return MetalPrefillOutcome::Declined,
+            MetalRowsRun::Failed => {
+                METAL_PREFILL_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return MetalPrefillOutcome::Failed;
+            }
+            MetalRowsRun::Completed(pending) => pending,
+        };
         // states are final: copy them to the owners
         let idxs = pending.gdn_layers.clone();
         let mut outs: Vec<&mut [f32]> = self
@@ -8449,12 +8762,19 @@ impl Pipeline {
             .filter(|(i, _)| idxs.binary_search(i).is_ok())
             .map(|(_, l)| l.linear_state.as_mut_slice())
             .collect();
-        pending.graph.finish_states(&mut outs);
+        if !pending.graph.finish_states(&mut outs) {
+            METAL_PREFILL_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return MetalPrefillOutcome::Failed;
+        }
         let (nkv, hd) = (self.num_kv_heads, self.head_dim);
-        let mut kbuf = vec![0f32; b * nkv * hd];
-        let mut vbuf = vec![0f32; b * nkv * hd];
+        // Read every layer before mutating any CPU cache.  A missing mirror
+        // row is a terminal graph failure, not a reason to append a partial
+        // prefix and replay the remainder serially.
+        let mut rows = Vec::with_capacity(pending.attn_layers.len());
         for (li, cpu_stored) in &pending.attn_layers {
-            if crate::gpu_metal::kv_mirror_read_rows(
+            let mut kbuf = vec![0f32; b * nkv * hd];
+            let mut vbuf = vec![0f32; b * nkv * hd];
+            if !crate::gpu_metal::kv_mirror_read_rows(
                 self.graph_kv_id,
                 *li,
                 nkv,
@@ -8464,18 +8784,123 @@ impl Pipeline {
                 &mut kbuf,
                 &mut vbuf,
             ) {
-                let cache = &mut self.kv_cache.layers[*li];
-                for r in 0..b {
-                    cache.append(
-                        &kbuf[r * nkv * hd..(r + 1) * nkv * hd],
-                        &vbuf[r * nkv * hd..(r + 1) * nkv * hd],
-                        &[],
+                METAL_PREFILL_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return MetalPrefillOutcome::Failed;
+            }
+            rows.push((*li, *cpu_stored, kbuf, vbuf));
+        }
+        for (li, cpu_stored, kbuf, vbuf) in rows {
+            let cache = &mut self.kv_cache.layers[li];
+            for r in 0..b {
+                cache.append(
+                    &kbuf[r * nkv * hd..(r + 1) * nkv * hd],
+                    &vbuf[r * nkv * hd..(r + 1) * nkv * hd],
+                    &[],
+                );
+            }
+            crate::gpu_metal::kv_mirror_set_stored(self.graph_kv_id, li, cpu_stored + b);
+        }
+        METAL_PREFILL_ROWS.fetch_add(b as u64, std::sync::atomic::Ordering::Relaxed);
+        if with_head {
+            METAL_PREFILL_HEAD_ROWS.fetch_add(b as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        MetalPrefillOutcome::Completed(hiddens)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn prefill_batch_metal(&mut self, ids: &[u32], start_pos: usize) -> MetalPrefillOutcome {
+        self.prefill_rows_metal(ids, start_pos, None)
+    }
+
+    /// Exact teacher-forced NLL through the ordinary Metal rows graph.  This
+    /// is intentionally separate from the serial TokenGraph scorer: every
+    /// chunk owns a real b-row graph/head completion and the recurrent/KV
+    /// handoff is committed before the next chunk begins.
+    #[cfg(target_os = "macos")]
+    fn nll_batch_metal(&mut self, ids: &[u32], start: usize) -> MetalBatchNllOutcome {
+        if ids.len() < 2 || self.o1_active() || self.head_clusters.is_some() {
+            return MetalBatchNllOutcome::Declined;
+        }
+        let Some(lm) = self.weights.lm_head.metal_graph_parts() else {
+            return MetalBatchNllOutcome::Declined;
+        };
+        let chunk = std::env::var("CMF_METAL_PREFILL_CHUNK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| (1..=512).contains(&v))
+            .unwrap_or(32);
+        let final_norm = self.weights.final_norm.clone();
+        let mut nll = 0.0f64;
+        let mut count = 0usize;
+        let mut pos = 0usize;
+        let mut completed = 0usize;
+        while pos < ids.len() {
+            let end = (pos + chunk).min(ids.len());
+            let mut logits = Vec::new();
+            let outcome = self.prefill_rows_metal(
+                &ids[pos..end],
+                pos,
+                Some((lm, &final_norm, &mut logits)),
+            );
+            match outcome {
+                MetalPrefillOutcome::Declined => {
+                    return if completed == 0 {
+                        MetalBatchNllOutcome::Declined
+                    } else {
+                        MetalBatchNllOutcome::Failed(format!(
+                            "ordinary Metal NLL batch declined after {completed} chunks"
+                        ))
+                    };
+                }
+                MetalPrefillOutcome::Failed => {
+                    return MetalBatchNllOutcome::Failed(
+                        "ordinary Metal NLL batch failed after admission".to_string(),
                     );
                 }
-                crate::gpu_metal::kv_mirror_set_stored(self.graph_kv_id, *li, cpu_stored + b);
+                MetalPrefillOutcome::Completed(_) => {}
             }
+            completed += 1;
+            let vocab = self.vocab_size.min(lm.1);
+            if logits.len() != (end - pos) * lm.1 || vocab == 0 {
+                return MetalBatchNllOutcome::Failed(
+                    "ordinary Metal NLL head returned an invalid shape".to_string(),
+                );
+            }
+            for row in 0..(end - pos) {
+                let absolute = pos + row;
+                if absolute < start || absolute + 1 >= ids.len() {
+                    continue;
+                }
+                let lg = &mut logits[row * lm.1..row * lm.1 + vocab];
+                if let Some(mu) = self.logit_multiplier {
+                    for v in lg.iter_mut() {
+                        *v *= mu;
+                    }
+                }
+                if let Some(c) = self.final_softcap {
+                    for v in lg.iter_mut() {
+                        *v = c * (*v / c).tanh();
+                    }
+                }
+                let target = ids[absolute + 1] as usize;
+                if target >= vocab {
+                    return MetalBatchNllOutcome::Failed(format!(
+                        "target token {target} exceeds Metal head rows {vocab}"
+                    ));
+                }
+                let max = lg.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
+                let lse: f64 = lg
+                    .iter()
+                    .map(|&v| ((v - max) as f64).exp())
+                    .sum::<f64>()
+                    .ln()
+                    + max as f64;
+                nll += lse - lg[target] as f64;
+                count += 1;
+            }
+            pos = end;
         }
-        Some(hiddens)
+        MetalBatchNllOutcome::Completed(nll, count)
     }
 
     /// Commit a Metal verify round: replay the GDN recurrences over the
@@ -8501,10 +8926,14 @@ impl Pipeline {
             return false;
         }
         let (nkv, hd) = (self.num_kv_heads, self.head_dim);
-        let mut kbuf = vec![0f32; n * nkv * hd];
-        let mut vbuf = vec![0f32; n * nkv * hd];
+        // Read every layer before mutating any CPU cache.  Missing rows are
+        // terminal after the replay has executed; never append a partial KV
+        // prefix and continue on a serial path.
+        let mut rows = Vec::with_capacity(pending.attn_layers.len());
         for (li, cpu_stored) in &pending.attn_layers {
-            if crate::gpu_metal::kv_mirror_read_rows(
+            let mut kbuf = vec![0f32; n * nkv * hd];
+            let mut vbuf = vec![0f32; n * nkv * hd];
+            if !crate::gpu_metal::kv_mirror_read_rows(
                 self.graph_kv_id,
                 *li,
                 nkv,
@@ -8514,16 +8943,20 @@ impl Pipeline {
                 &mut kbuf,
                 &mut vbuf,
             ) {
-                let cache = &mut self.kv_cache.layers[*li];
-                for r in 0..n {
-                    cache.append(
-                        &kbuf[r * nkv * hd..(r + 1) * nkv * hd],
-                        &vbuf[r * nkv * hd..(r + 1) * nkv * hd],
-                        &[],
-                    );
-                }
-                crate::gpu_metal::kv_mirror_set_stored(self.graph_kv_id, *li, cpu_stored + n);
+                return false;
             }
+            rows.push((*li, *cpu_stored, kbuf, vbuf));
+        }
+        for (li, cpu_stored, kbuf, vbuf) in rows {
+            let cache = &mut self.kv_cache.layers[li];
+            for r in 0..n {
+                cache.append(
+                    &kbuf[r * nkv * hd..(r + 1) * nkv * hd],
+                    &vbuf[r * nkv * hd..(r + 1) * nkv * hd],
+                    &[],
+                );
+            }
+            crate::gpu_metal::kv_mirror_set_stored(self.graph_kv_id, li, cpu_stored + n);
         }
         true
     }
@@ -8654,7 +9087,9 @@ impl Pipeline {
                 return false;
             }
         }
-        graph.sync();
+        if !graph.sync() {
+            return false;
+        }
         let mut kbuf = vec![0f32; b * nkv * hd];
         let mut vbuf = vec![0f32; b * nkv * hd];
         if !crate::gpu_metal::kv_mirror_read_rows(
@@ -8855,7 +9290,9 @@ impl Pipeline {
                 graph.encode_lm_head(&m.final_norm, lm);
             }
         }
-        graph.sync();
+        if graph.sync_checked().is_err() {
+            return None;
+        }
         let mut logits = Vec::new();
         if let Some(lm) = lm {
             let n_read = draft_rows.min(lm.1).min(self.vocab_size);
@@ -8890,6 +9327,7 @@ impl Pipeline {
         spec: Option<crate::gpu::SpecTail<'_>>,
     ) -> crate::gpu::BatchGraphOutcome {
         let _tb = std::time::Instant::now();
+        let batch_debug = std::env::var_os("CMF_BATCH_DEBUG").is_some();
         if self.attn_softcap > 0.0 {
             return crate::gpu::BatchGraphOutcome::Declined; // capped scores: no graph kernel — CPU path
         }
@@ -8897,19 +9335,41 @@ impl Pipeline {
         let (nkv, hd, rd) = self.layer_geom(0);
         let gemma = self.norm_style == cortiq_core::NormStyle::Gemma;
         fn gw(t: &QTensor) -> Option<crate::gpu::GraphW<'_>> {
-            if let Some((_, i, kind, rs)) = t.graph_weight() {
+            if let Some((m, i, kind, rs)) = t
+                .graph_weight()
+                .or_else(|| t.graph_weight_descriptor())
+            {
+                let name = &m.tensors[i].name;
+                let prism = if crate::prism::is_inverse_embedding(m, name) {
+                    crate::gpu::GraphPrismOp::InverseEmbedding
+                } else if crate::prism::is_forward_weight(m, name) {
+                    crate::gpu::GraphPrismOp::Forward
+                } else {
+                    crate::gpu::GraphPrismOp::None
+                };
                 return Some(crate::gpu::GraphW {
                     idx: i,
                     kind,
                     row_scale: rs,
                     data: &[],
+                    prism,
+                    affine: crate::prism::is_affine_target(m, name),
                 });
+            }
+            if std::env::var_os("CMF_BATCH_DEBUG").is_some() {
+                eprintln!(
+                    "batch graph: tensor has no graph descriptor/f32 fallback rows={} cols={}",
+                    t.rows(),
+                    t.cols()
+                );
             }
             t.as_f32().map(|d| crate::gpu::GraphW {
                 idx: 0,
                 kind: 4,
                 row_scale: &[],
                 data: d,
+                prism: crate::gpu::GraphPrismOp::None,
+                affine: false,
             })
         }
         let built: Option<(
@@ -8927,7 +9387,12 @@ impl Pipeline {
                 // 54 on decode, i.e. reading the prompt was slower than
                 // writing the answer.
                 let gffn = match &lw.ffn {
-                    FfnKind::Dense(d) if !d.segs.is_empty() => return None,
+                    FfnKind::Dense(d) if !d.segs.is_empty() => {
+                        if batch_debug {
+                            eprintln!("batch graph: dense segmented FFN at layer {li}");
+                        }
+                        return None;
+                    }
                     FfnKind::Dense(d) => crate::gpu::GraphFfn::Dense {
                         gate: gw(&d.gate_proj)?,
                         up: gw(&d.up_proj)?,
@@ -8944,6 +9409,18 @@ impl Pipeline {
                         let (se, sg) = m.shared.as_ref()?;
                         let sgate = gw(sg.as_ref()?)?;
                         let router = gw(&m.router)?;
+                        // The batch MoE kernels still consume raw per-token
+                        // rows and do not carry the descriptor-aware Prism
+                        // transform/affine bit for router or shared-gate
+                        // planes.  Refuse rather than route an untransformed
+                        // source activation.
+                        if router.prism != crate::gpu::GraphPrismOp::None
+                            || router.affine
+                            || sgate.prism != crate::gpu::GraphPrismOp::None
+                            || sgate.affine
+                        {
+                            return None;
+                        }
                         let inter = m.experts.first()?.gate_proj.rows();
                         let mut experts = Vec::with_capacity(m.experts.len() + 1);
                         let mut q4tp: Option<bool> = None;
@@ -8994,6 +9471,16 @@ impl Pipeline {
                             {
                                 return None;
                             }
+                            if [gi, ui, di].into_iter().any(|idx| {
+                                mm.tensors
+                                    .get(idx)
+                                    .is_some_and(|t| {
+                                        crate::prism::is_forward_weight(mm, &t.name)
+                                            || crate::prism::is_affine_target(mm, &t.name)
+                                    })
+                            }) {
+                                return None;
+                            }
                             model.get_or_insert_with(|| mm.clone());
                             experts.push((gi, ui, di));
                         }
@@ -9027,9 +9514,18 @@ impl Pipeline {
                         bias,
                     } => {
                         if softplus_gate.is_some() || self.attention_heads_per_layer.is_some() {
+                            if batch_debug {
+                                eprintln!(
+                                    "batch graph: unsupported Full attention gate at layer {li} softplus={} heads={}",
+                                    softplus_gate.is_some(),
+                                    self.attention_heads_per_layer.is_some()
+                                );
+                            }
                             return None;
                         }
-                        let (m, _, _, _) = wq.graph_weight()?;
+                        let (m, _, _, _) = wq
+                            .graph_weight()
+                            .or_else(|| wq.graph_weight_descriptor())?;
                         model = Some(m.clone());
                         crate::gpu::GraphAttn::Full {
                             wq: gw(wq)?,
@@ -9047,8 +9543,16 @@ impl Pipeline {
                         }
                     }
                     AttnKind::LinearGdn(w) => {
-                        let cfg = self.gdn_cfg?;
-                        let (m, _, _, _) = w.in_proj_qkv.graph_weight()?;
+                        let Some(cfg) = self.gdn_cfg else {
+                            if batch_debug {
+                                eprintln!("batch graph: no GDN config at layer {li}");
+                            }
+                            return None;
+                        };
+                        let (m, _, _, _) = w
+                            .in_proj_qkv
+                            .graph_weight()
+                            .or_else(|| w.in_proj_qkv.graph_weight_descriptor())?;
                         model = Some(m.clone());
                         crate::gpu::GraphAttn::Gdn {
                             qkv: gw(&w.in_proj_qkv)?,
@@ -10032,6 +10536,15 @@ impl Pipeline {
                 }
                 if task_mask.is_none() {
                     let end = self.q1_graph_gpu(li, upto, position, &mut h);
+                    if self
+                        .graph_failed
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        // The graph may have mutated device state before a
+                        // command-buffer error. Never continue with a CPU
+                        // tail or read a stale host mirror after admission.
+                        return vec![0.0; self.hidden_size];
+                    }
                     if end > li {
                         gpu_skip_until = end;
                         // Looped Transformer: the graph stopped at a loop
@@ -10360,7 +10873,7 @@ impl Pipeline {
                     let tm = task_mask.unwrap();
                     let alive = tm.ffn_active_count(li);
                     let deep = alive * 2 <= self.intermediate_size;
-                    if deep && d.down_proj.sparse_col_ok() {
+                    if deep && d.down_proj.sparse_col_ok() && !d.gate_proj.has_prism_contract() {
                         let active = tm.ffn_active_indices(li);
                         sparse_ffn_quant(
                             d,
@@ -11368,7 +11881,16 @@ fn dense_ffn(d: &DenseFfn, x: &[f32], pool: Option<&Pool>) -> Vec<f32> {
     // q1 FFNs offload at any practical size: the q1 CPU kernel is
     // compute-bound, so the UMA threshold logic does not apply — the
     // probe measures and decides either way.
-    if crate::gpu::enabled_here()
+    // The fused GPU block has no descriptor-aware Prism path: it would either
+    // consume an unrotated activation or decline after inspecting the mixed
+    // q2tp/q4tp tensors.  Do not let that structural refusal enter the FFN
+    // probe's CPU_ONLY scope; the ordinary body below dispatches each matrix
+    // through QTensor::matvec, which owns the signed FWHT + affine q2tp route.
+    let prism_body = d.gate_proj.has_prism_contract()
+        || d.up_proj.has_prism_contract()
+        || d.down_proj.has_prism_contract();
+    if !prism_body
+        && crate::gpu::enabled_here()
         && (d.gate_proj.rows() >= crate::gpu::min_rows() || d.gate_proj.is_q1())
     {
         let arm = if d.gate_proj.is_q1() && crate::gpu::q1_force() {
@@ -12059,6 +12581,16 @@ thread_local! {
 /// Returns `None` when the file has no transposed `down` (the caller
 /// then runs the ordinary dense path).
 fn dense_ffn_dynamic(d: &DenseFfn, x: &[f32], pool: Option<&Pool>, k: usize) -> Option<Vec<f32>> {
+    // The scatter path reads individual rows/columns and cannot express the
+    // per-matrix signed FWHT boundary.  Let the descriptor-aware dense path
+    // handle Prism files rather than silently running an unrotated sparse
+    // approximation.
+    if d.gate_proj.has_prism_contract()
+        || d.up_proj.has_prism_contract()
+        || d.down_proj.has_prism_contract()
+    {
+        return None;
+    }
     let dt = d.down_t.as_ref()?;
     let inter = d.gate_proj.rows();
     let hidden = dt.cols();
@@ -12210,6 +12742,12 @@ fn dense_ffn_masked(d: &DenseFfn, x: &[f32], pool: Option<&Pool>, mask_row: &[u8
 /// not q8-mapped in the primary shard / over the VRAM budget / backend
 /// refusal → honest CPU path.
 fn dense_ffn_gpu(d: &DenseFfn, x: &[f32], _pool: Option<&Pool>) -> Option<Vec<f32>> {
+    if d.gate_proj.has_prism_contract()
+        || d.up_proj.has_prism_contract()
+        || d.down_proj.has_prism_contract()
+    {
+        return None;
+    }
     // The GPU block hardcodes SiLU; GeLU FFNs (Gemma) stay on CPU.
     if d.act != Act::Silu {
         return None;
@@ -12830,6 +13368,31 @@ pub static GRAPH_TOK_PREFIX: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 /// Graph calls that covered the complete requested layer span.
 pub static GRAPH_TOK_FULL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Native Metal TokenGraph completion counters. These are incremented only
+/// after checked command-buffer completion and successful readback, so a
+/// fused-head NLL report can prove the route rather than infer it from env.
+pub static METAL_GRAPH_TOK_OK: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static METAL_GRAPH_HEAD_OK: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static METAL_GRAPH_HEAD_MISS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static METAL_GRAPH_LAYERS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static METAL_GRAPH_ERRORS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Ordinary native-Metal rows-prefill admissions and completed rows.  These
+/// counters are separate from TokenGraph token/head counts so a batch NLL
+/// receipt cannot accidentally claim serial execution as batched.
+pub static METAL_PREFILL_CHUNKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static METAL_PREFILL_ROWS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static METAL_PREFILL_HEAD_ROWS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static METAL_PREFILL_ERRORS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// `CMF_MOE_BATCH=0` restores the per-expert serial loop — the A/B lever
 /// for the batched kernel, and how its bit-identity is checked.
 fn moe_batch_enabled() -> bool {
@@ -13222,6 +13785,24 @@ fn ffn_forward_pair(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn nll_graph_policy_scopes_only_the_fused_head() {
+        for (label, unmasked, prefer_graph, native_metal, want_graph, want_head) in [
+            // A Vulkan/Wgpu hidden-only graph remains the quality route.
+            ("vulkan graph", true, true, false, true, false),
+            // Native Metal adds the strict fused graph-head contract.
+            ("native Metal graph", true, true, true, true, true),
+            // Masked NLL and the explicit non-graph fallback remain unchanged.
+            ("masked", false, true, false, false, false),
+            ("graph disabled", true, false, true, false, false),
+        ] {
+            let (graph_quality, graph_head_required) =
+                super::nll_graph_policy(unmasked, prefer_graph, native_metal);
+            assert_eq!(graph_quality, want_graph, "{label}: graph quality");
+            assert_eq!(graph_head_required, want_head, "{label}: fused head");
+        }
+    }
 
     #[test]
     fn mtp_prefill_pair_boundaries_skip_only_final_prompt_row() {

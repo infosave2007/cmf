@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.9] - 2026-09-20
+
+### Added
+- Added the explicit `q2tp_affine` dtype-16 Prism profile with signed
+  Hadamard and affine metadata. It preserves ordinary `q2tp` midrise semantics
+  and requires the corresponding feature bits at load time.
+- Added streamed affine conversion, descriptor validation, and CPU/GPU
+  regression coverage for the affine Q2TP operator while retaining the public
+  Qwen Image modules and existing backends.
+
+### Changed
+- Native Vulkan and Metal dispatch use the affine operator only for validated
+  tensors; unsupported or malformed tensors keep the established fallback.
+- The release version is `0.6.9` across the workspace and all internal crate
+  dependency constraints.
+
+### Known limitations
+- The affine Bonsai profile is an experimental, model-specific text-generation
+  path. Reported quality and speed are workload/device measurements, not a
+  general performance guarantee; no VLM support claim is made for that model.
+
 ## [0.6.8] - 2026-09-11
 
 ### Added
@@ -5582,7 +5603,8 @@ Initial public release.
 - **Licensing** — Apache-2.0 with an explicit patent-grant explanation
   (`LICENSE`, `NOTICE`, `PATENTS.md`).
 
-[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.6.7...HEAD
+[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.6.9...HEAD
+[0.6.9]: https://github.com/infosave2007/cmf/compare/v0.6.8...v0.6.9
 [0.6.8]: https://github.com/infosave2007/cmf/compare/v0.6.7...v0.6.8
 [0.6.7]: https://github.com/infosave2007/cmf/compare/v0.6.6...v0.6.7
 [0.6.6]: https://github.com/infosave2007/cmf/compare/v0.6.5...v0.6.6

@@ -84,6 +84,8 @@ impl Proj {
                         kind,
                         row_scale: rs,
                         data: &[],
+                        prism: crate::gpu::GraphPrismOp::None,
+                        affine: false,
                     },
                 )
             }),

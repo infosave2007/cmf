@@ -293,6 +293,15 @@ pub fn enabled_here() -> bool {
     !CPU_ONLY.with(|c| c.get()) && enabled() && layer_allowed()
 }
 
+/// Descriptor-aware q2tp Vulkan kernels are kept behind an explicit opt-in
+/// until the Prism full-graph/resident-weight path has a coherent generation
+/// gate.  `CMF_GPU=1` alone must not silently turn synchronous per-op
+/// readbacks into the default model path; callers and validation tests can
+/// request the measured kernels with `CMF_Q2TP_GPU=1`.
+pub fn q2tp_gpu_opt_in() -> bool {
+    std::env::var("CMF_Q2TP_GPU").as_deref() == Ok("1")
+}
+
 // ── Runtime GPU-vs-CPU probe ────────────────────────────────────────────
 // CMF_GPU=1 does not TRUST that the device wins — it MEASURES. For each
 // op class the first calls alternate arms: GPU timed vs pure-CPU timed
@@ -1305,6 +1314,16 @@ pub fn attn_dropin(
     }
 }
 
+/// Descriptor operation attached to a graph weight.  `None` is the default
+/// for ordinary CMF files; Prism weights are admitted only when the token
+/// graph carries this explicit transform contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GraphPrismOp {
+    None,
+    Forward,
+    InverseEmbedding,
+}
+
 /// One weight in the whole-token graph: tensor idx + a codec tag (0=q8_row,
 /// 1=q1, 2=q4_tiled, 3=q1t, 4=f32) + per-row scales (q8_row only) + the raw f32
 /// data (kind 4 only — small unquantized projections like GDN in_proj_a/b).
@@ -1313,6 +1332,8 @@ pub struct GraphW<'a> {
     pub kind: u8,
     pub row_scale: &'a [f32],
     pub data: &'a [f32],
+    pub prism: GraphPrismOp,
+    pub affine: bool,
 }
 
 /// A layer's token-mixing op: standard attention or a GDN (linear-attention)
@@ -2759,8 +2780,8 @@ pub fn q4tp_matmat(
     }
 }
 
-/// The same over a two-bit weight plane. Metal has no q2tp kernel, so
-/// there it declines and the host takes it.
+/// The same over a two-bit weight plane. Native Metal uses the dedicated
+/// q2tp tile; unsupported shapes return false and preserve the host fallback.
 pub fn q2tp_matmat(
     model: &Arc<CmfModel>,
     idx: usize,
@@ -2771,8 +2792,71 @@ pub fn q2tp_matmat(
     out: &mut [f32],
 ) -> bool {
     match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::q2tp_matmat(model, idx, xs, b, rows, cols, out),
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::q2tp_matmat(model, idx, xs, b, rows, cols, out),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
+/// Descriptor-aware q2tp GEMM. The affine center is selected only for a
+/// validated q2tp_affine target; the raw dtype16 payload remains unchanged.
+pub fn q2tp_affine_matmat(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::q2tp_affine_matmat(model, idx, xs, b, rows, cols, out),
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::q2tp_affine_matmat(model, idx, xs, b, rows, cols, out),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
+/// Single-token q2tp matvec through the ordinary (center=1.5) WGSL kernel.
+pub fn q2tp_matvec(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::q2tp_matvec(model, idx, xs, rows, cols, out),
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::q2tp_matvec(model, idx, xs, rows, cols, out),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
+/// Single-token q2tp matvec with the explicit affine center=1 descriptor
+/// operator. This is kept separate from ordinary q2tp to make accidental
+/// center changes impossible at a call site.
+pub fn q2tp_affine_matvec(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::q2tp_affine_matvec(model, idx, xs, rows, cols, out),
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::q2tp_affine_matvec(model, idx, xs, rows, cols, out),
         #[allow(unreachable_patterns)]
         _ => false,
     }

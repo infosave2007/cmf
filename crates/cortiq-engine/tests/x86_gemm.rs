@@ -86,6 +86,7 @@ fn blocked_vs_per_row() {
         rope_freq_factors: None,
         logit_multiplier: None,
         loop_final_norm: false,
+        prism_hadamard: None,
     };
     let header = CmfHeader {
         format: "cmf".into(),
@@ -232,6 +233,7 @@ fn q1_blocked_vs_per_row() {
         rope_freq_factors: None,
         logit_multiplier: None,
         loop_final_norm: false,
+        prism_hadamard: None,
     };
     let header = CmfHeader {
         format: "cmf".into(),
@@ -377,6 +379,7 @@ fn q4b_blocked_vs_per_row() {
         rope_freq_factors: None,
         logit_multiplier: None,
         loop_final_norm: false,
+        prism_hadamard: None,
     };
     let header = CmfHeader {
         format: "cmf".into(),
@@ -530,6 +533,7 @@ fn q4t_blocked_vs_per_row() {
         rope_freq_factors: None,
         logit_multiplier: None,
         loop_final_norm: false,
+        prism_hadamard: None,
     };
     let header = CmfHeader {
         format: "cmf".into(),
@@ -675,6 +679,7 @@ fn q4t_silu_mul_fused_matches_composed() {
         rope_freq_factors: None,
         logit_multiplier: None,
         loop_final_norm: false,
+        prism_hadamard: None,
     };
     let header = CmfHeader {
         format: "cmf".into(),

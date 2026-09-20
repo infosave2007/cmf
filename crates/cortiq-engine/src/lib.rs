@@ -38,6 +38,7 @@ pub mod nystrom;
 pub mod pin;
 pub mod pipeline;
 pub mod pool;
+pub mod prism;
 pub mod qtensor;
 pub mod qwen3te;
 pub mod qwen3vis;

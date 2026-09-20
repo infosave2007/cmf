@@ -1,7 +1,9 @@
 //! Stage-1 tests: envelope roundtrip, strict validation, hash64
 //! cross-vectors, canonical quant layouts, bitwise mask diff.
 
-use cortiq_core::format::{build_sparse_index, decode_sparse_index, encode_sparse_index};
+use cortiq_core::format::{
+    CmfStreamWriter, build_sparse_index, decode_sparse_index, encode_sparse_index,
+};
 use cortiq_core::mask::zero_tail_bits;
 use cortiq_core::quant::{GROUP_SIZE, dequant_q4_block, dequant_q8_row, f16_to_f32, f32_to_f16};
 use cortiq_core::{
@@ -63,6 +65,7 @@ fn tiny_arch() -> ModelArch {
         rope_freq_factors: None,
         logit_multiplier: None,
         loop_final_norm: false,
+        prism_hadamard: None,
     }
 }
 
@@ -80,6 +83,84 @@ fn tiny_header() -> CmfHeader {
         quant_type: QuantType::F32,
         provenance: None,
     }
+}
+
+#[test]
+fn bounded_writer_keeps_raw_u8_auxiliary_bytes_and_shape() {
+    let dir = std::env::temp_dir().join(format!(
+        "cmf-bounded-raw-test-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("raw.cmf");
+    let bytes: Vec<u8> = (0..14).map(|i| (i * 17) as u8).collect();
+    let gap = CmfStreamWriter::head_reserve_for(1, 48);
+    let mut writer = CmfStreamWriter::new(&path, gap).unwrap();
+    writer
+        .push_bounded(
+            "model.layers.1.engram.embed.scale",
+            TensorDtype::U8,
+            &[2, 7],
+            &bytes,
+            3,
+        )
+        .unwrap();
+    writer.finish(&tiny_header(), None, None).unwrap();
+
+    let model = CmfModel::open(&path).unwrap();
+    let entry = model
+        .tensor("model.layers.1.engram.embed.scale")
+        .unwrap();
+    assert_eq!(entry.dtype, TensorDtype::U8);
+    assert_eq!(entry.shape, vec![2, 7]);
+    assert_eq!(model.tensor_bytes(&entry.name).unwrap(), bytes.as_slice());
+    assert_eq!(entry.hash, hash64(&bytes));
+    assert!(model.verify().is_empty());
+    drop(model);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn checkpoint_mark_orders_payload_and_manifest_before_resume() {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let dir = std::env::temp_dir().join(format!(
+        "cmf-checkpoint-order-test-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("checkpoint.cmf");
+    let manifest = dir.join("checkpoint.cmf.manifest");
+    let bytes = [0x31u8, 0x42, 0x53, 0x64];
+    let gap = CmfStreamWriter::head_reserve_for(1, 48);
+    let mut writer = CmfStreamWriter::new(&path, gap)
+        .unwrap()
+        .with_manifest(&manifest)
+        .unwrap();
+    writer
+        .push_bounded("checkpoint.weight", TensorDtype::U8, &[4], &bytes, 2)
+        .unwrap();
+    writer.mark("source-00001.safetensors").unwrap();
+    drop(writer);
+
+    let mark_text = std::fs::read_to_string(&manifest).unwrap();
+    assert!(mark_text.contains("source-00001.safetensors"));
+    let mut file = std::fs::File::open(&path).unwrap();
+    file.seek(SeekFrom::Start(gap)).unwrap();
+    let mut payload = [0u8; 4];
+    file.read_exact(&mut payload).unwrap();
+    assert_eq!(payload, bytes, "payload must precede the durable mark");
+    drop(file);
+
+    let (writer, state) = CmfStreamWriter::resume(&path, &manifest).unwrap();
+    assert_eq!(state.marks, vec!["source-00001.safetensors"]);
+    writer.finish(&tiny_header(), None, None).unwrap();
+    let model = CmfModel::open(&path).unwrap();
+    assert!(model.verify().is_empty(), "CMF verify: {:?}", model.verify());
+    assert_eq!(model.tensor_bytes("checkpoint.weight").unwrap(), &bytes);
+    drop(model);
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 /// Reference q8_row encoder (canonical layout: quants then row scales).
@@ -445,15 +526,16 @@ fn open_rejects_garbage_and_corruption() {
         Err(CmfError::UnsupportedVersion(1))
     ));
 
-    // Unknown required feature bit.
+    // Unknown required feature bit (bits 7 and 8 are assigned to Prism).
     let path = dir.join("f.cmf");
     write_tiny_file(&path);
     let mut bytes = std::fs::read(&path).unwrap();
-    bytes[12] |= 1 << 7;
+    let unknown_feature = 1u32 << 9;
+    bytes[12..16].copy_from_slice(&unknown_feature.to_le_bytes());
     std::fs::write(&path, &bytes).unwrap();
     assert!(matches!(
         CmfModel::open(&path),
-        Err(CmfError::UnsupportedFeature(f)) if f == 1 << 7
+        Err(CmfError::UnsupportedFeature(f)) if f == unknown_feature
     ));
 
     // A hostile directory count must return an error, never overflow/panic.

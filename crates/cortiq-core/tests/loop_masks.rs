@@ -64,6 +64,7 @@ fn arch(loops: usize) -> ModelArch {
         rope_freq_factors: None,
         logit_multiplier: None,
         loop_final_norm: loops > 1,
+        prism_hadamard: None,
     }
 }
 

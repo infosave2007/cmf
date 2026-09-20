@@ -27,11 +27,13 @@ CMF_MAGIC = b"CMF\x01"
 ENVELOPE_LEN = 128
 DIR_RECORD_LEN = 56
 GROUP_SIZE = 32
-KNOWN_FEATURES = 0b111  # tensor dir | binary masks | 2f quant
+# tensor dir | binary masks | 2f quant | loop masks | skill | Prism FWHT | affine
+KNOWN_FEATURES = (1 << 9) - 1
 
 DTYPE_NAME = {0: "f32", 1: "f16", 2: "bf16", 3: "q8_row", 4: "q4_block",
               5: "mix8_4", 6: "u8", 7: "q4_col", 8: "vbit", 9: "q8_2f",
-              10: "vbit_ro", 11: "q4_tiled", 12: "q1"}
+              10: "vbit_ro", 11: "q4_tiled", 12: "q1", 13: "q1s",
+              14: "q1t", 15: "q4tp", 16: "q2tp"}
 
 _SHARD_RE = re.compile(r"^(.*)-(\d{5})-of-(\d{5})\.cmf$")
 
