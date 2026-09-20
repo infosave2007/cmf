@@ -35001,16 +35001,63 @@ pub fn matvec_batch(model: &Arc<CmfModel>, jobs: &[BatchJob], out: &mut [&mut [f
 mod tests {
     use super::*;
 
-    /// wgpu defers destruction of Vulkan objects until a device poll.  The
+    /// wgpu defers destruction of device objects until a device poll.  The
     /// q2tp tests deliberately create and map several short-lived buffers;
     /// polling after those locals drop keeps driver deferred frees inside the
     /// test process instead of racing harness exit.
-    struct TestGpuDrain;
+    ///
+    /// `Ctx` is process-global and `ctx()` publishes references into boxes
+    /// owned by `CTXS`.  A test teardown must therefore never call the public
+    /// process-final `shutdown`: another test can still be using the same
+    /// context while the Rust test harness runs tests in parallel.  Retaining
+    /// only a cloned device here gives the teardown a safe poll target without
+    /// draining the shared context map.
+    struct TestGpuDrain {
+        device: wgpu::Device,
+    }
+
+    impl TestGpuDrain {
+        fn new(c: &Ctx) -> Self {
+            Self {
+                device: c.device.clone(),
+            }
+        }
+    }
 
     impl Drop for TestGpuDrain {
         fn drop(&mut self) {
-            shutdown();
+            let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         }
+    }
+
+    /// Test teardown may poll a shared device, but it must not invalidate a
+    /// context acquired by the surrounding test (or by a parallel test).
+    #[test]
+    fn gpu_test_drain_keeps_shared_context_live() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping shared-context teardown test");
+            return;
+        };
+        {
+            let drain = TestGpuDrain::new(c);
+            let probe = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("gpu-test-drain-probe"),
+                size: 4,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+            drop(probe);
+            drop(drain);
+        }
+        let probe_after_drain = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpu-test-drain-after"),
+            size: 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        drop(probe_after_drain);
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
     }
 
     #[test]
@@ -37995,7 +38042,7 @@ fn main() {
                 q2tp_sg_diag()
             );
         }
-        let _drain = TestGpuDrain;
+        let _drain = TestGpuDrain::new(c);
         let (rows, cols) = (300usize, 4096usize);
         let gpr = cols / 32;
         let total =
@@ -38141,7 +38188,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
-        let _drain = TestGpuDrain;
+        let _drain = TestGpuDrain::new(c);
         let (rows, cols) = (129usize, 4096usize);
         let gpr = cols / cortiq_core::quant::GROUP_SIZE;
         let total = cortiq_core::quant::expected_nbytes(
@@ -38283,7 +38330,7 @@ fn main() {
         let Some(c) = ctx() else {
             panic!("Q2 cooperative component requires a wgpu adapter");
         };
-        let _drain = TestGpuDrain;
+        let _drain = TestGpuDrain::new(c);
         assert!(
             c.q2tp_mm_coop.is_some(),
             "CMF_Q2_COOP=1 did not admit the isolated q2tp cooperative pipeline"
@@ -38457,7 +38504,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
-        let _drain = TestGpuDrain;
+        let _drain = TestGpuDrain::new(c);
         let Some(pipe) = c.fwht.as_ref() else {
             eprintln!("shader-f16 unavailable — skipping Prism FWHT test");
             return;
@@ -38555,7 +38602,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
-        let _drain = TestGpuDrain;
+        let _drain = TestGpuDrain::new(c);
         let Some(pipe) = c.fwht.as_ref() else {
             eprintln!("shader-f16 unavailable — skipping Prism FWHT width test");
             return;
@@ -38716,7 +38763,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
-        let _drain = TestGpuDrain;
+        let _drain = TestGpuDrain::new(c);
         let (rows, cols, batch) = (64usize, 512usize, 3usize);
         let gpr = cols / 32;
         let total =
