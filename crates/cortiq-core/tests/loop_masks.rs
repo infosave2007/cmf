@@ -58,6 +58,7 @@ fn arch(loops: usize) -> ModelArch {
         activation_situ_beta: None,
         activation_situ_linear_beta: None,
         attn_v_norm: false,
+        qk_norm_after_rope: false,
         num_loops: loops,
         kda_gate_lower_bound: None,
         g3n: None,

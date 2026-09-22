@@ -12,6 +12,8 @@ hf upload infosave/MiniMax-H3-Turbo-cmf \
     docs/hf/MiniMax-H3-Turbo-cmf.md README.md
 hf upload infosave/Granite-4.2-cmf \
     docs/hf/Granite-4.2-cmf.md README.md
+hf upload infosave/Hy-MT2-cmf \
+    docs/hf/Hy-MT2-cmf.md README.md
 hf upload infosave/cmf docs/hf/cmf.md README.md
 hf upload infosave/cmf docs/hf/FORMATS.md FORMATS.md
 ```

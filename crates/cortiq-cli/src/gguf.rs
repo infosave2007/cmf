@@ -4,8 +4,10 @@
 //! tensor names to HF names, reconstructs a Hugging Face tokenizer.json from the
 //! embedded ggml metadata, and writes a `.cmf`. No Python. A GGUF repo id can be
 //! passed directly (the matching `.gguf` is downloaded). IQ4_NL / IQ4_XS (the
-//! non-linear 4-bit codebook, used inside q2_k/q3_k mixes) are handled; the
-//! IQ1/IQ2/IQ3 grid-codebook types are the only ggml types not yet supported.
+//! non-linear 4-bit codebook, used inside q2_k/q3_k mixes) are handled, and
+//! STQ1_0 (Tencent's sparse-ternary 1.25-bit) is carried over EXACTLY as
+//! `q1t`; the IQ1/IQ2/IQ3 grid-codebook types are the only ggml types not
+//! yet supported.
 //! Qwen Image diffusion-transformer GGUFs use a separate component branch
 //! which preserves source tensor names and stores the official image
 //! transformer config instead of interpreting the file as an LLM.
@@ -54,6 +56,17 @@ const GGML_Q8_K: u32 = 15;
 const GGML_IQ4_NL: u32 = 20;
 const GGML_IQ4_XS: u32 = 23;
 const GGML_BF16: u32 = 30;
+/// Sparse ternary, 1.3125 bpw (Tencent AngelSlim "1.25-bit"; llama.cpp
+/// PR #22836). Imported EXACTLY as `q1t`, never requantized.
+const GGML_STQ1_0: u32 = 42;
+
+/// STQ1_0 codebook: index `(sign << 4) | slot` → 4 packed 2-bit lanes
+/// (−1 → 0b00, 0 → 0b01, +1 → 0b10; lane p at bits 2p..2p+1). Every group
+/// has exactly one zero lane and three ±1 lanes.
+const STQ1_0_CODEBOOK: [u8; 32] = [
+    0xA9, 0x89, 0x29, 0x09, 0xA6, 0x86, 0x26, 0x06, 0x9A, 0x92, 0x1A, 0x12, 0x6A, 0x62, 0x4A, 0x42,
+    0x01, 0x21, 0x81, 0xA1, 0x04, 0x24, 0x84, 0xA4, 0x10, 0x18, 0x90, 0x98, 0x40, 0x48, 0x60, 0x68,
+];
 
 /// Non-linear 4-bit codebook shared by IQ4_NL and IQ4_XS.
 const KVALUES_IQ4NL: [i8; 16] = [
@@ -299,9 +312,10 @@ fn dequant(ggml_type: u32, raw: &[u8], n: usize) -> anyhow::Result<Vec<f32>> {
         GGML_Q8_K => dequant_q8_k(raw, n),
         GGML_IQ4_NL => dequant_iq4_nl(raw, n),
         GGML_IQ4_XS => dequant_iq4_xs(raw, n),
+        GGML_STQ1_0 => dequant_stq1_0(raw, n),
         other => anyhow::bail!(
             "ggml tensor type {other} not supported by the native importer (supported: F32, F16, BF16, \
-             Q4_0/1, Q5_0/1, Q8_0, Q2_K..Q6_K, Q8_K, IQ4_NL, IQ4_XS; the IQ1/IQ2/IQ3 grid codebooks are not)"
+             Q4_0/1, Q5_0/1, Q8_0, Q2_K..Q6_K, Q8_K, IQ4_NL, IQ4_XS, STQ1_0; the IQ1/IQ2/IQ3 grid codebooks are not)"
         ),
     })
 }
@@ -325,8 +339,37 @@ fn nbytes(ggml_type: u32, n: usize) -> anyhow::Result<usize> {
         GGML_Q8_K => blk(256, 292),
         GGML_IQ4_NL => blk(32, 18),
         GGML_IQ4_XS => blk(256, 136),
+        GGML_STQ1_0 => blk(256, 42),
         other => anyhow::bail!("ggml type {other} unsupported by the native importer"),
     })
+}
+
+// block_stq1_0 (42 bytes, 256 elems): [qs[32]: 4-bit slot per 4-lane group]
+// [sign[8]: 1 bit per group][d: f16]. The 4 lanes of group g (g in 0..64)
+// sit at stride 16 inside a 64-weight chunk: x[c·64 + (g % 16) + p·16],
+// c = g / 16, p = 0..4. Faithful port of ggml `dequantize_row_stq1_0`.
+fn dequant_stq1_0(raw: &[u8], n: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; n];
+    let nb = n.div_ceil(256);
+    for i in 0..nb {
+        let b = &raw[i * 42..(i + 1) * 42];
+        let (qs, sign) = (&b[0..32], &b[32..40]);
+        let d = f16_to_f32(u16::from_le_bytes([b[40], b[41]]));
+        for g in 0..64 {
+            let code = (qs[g / 2] >> (4 * (g & 1))) & 0x0F;
+            let s = (sign[g / 8] >> (g % 8)) & 1;
+            let qpack = STQ1_0_CODEBOOK[((s as usize) << 4) | code as usize];
+            let (chunk, gloc) = (g / 16, g % 16);
+            for p in 0..4 {
+                let q = (qpack >> (2 * p)) & 0x3;
+                let j = i * 256 + chunk * 64 + gloc + p * 16;
+                if j < n {
+                    out[j] = (q as f32 - 1.0) * d;
+                }
+            }
+        }
+    }
+    out
 }
 
 // BF16: contiguous 2-byte little-endian bfloat16 (top 16 bits of an f32).
@@ -806,6 +849,9 @@ fn arch_from_md(md: &BTreeMap<String, Val>, tensors: &[GgufTensor]) -> anyhow::R
         .unwrap_or(0);
     let is_q35 = arch.starts_with("qwen35");
     let is_gemma2 = arch == "gemma2";
+    // llama.cpp spells Tencent's dense family `hunyuan-dense`; the engine
+    // keys the RoPE-then-norm attention order on the HF model_type.
+    let is_hunyuan_dense = arch == "hunyuan-dense";
     let norm_style = if arch.contains("gemma") || is_q35 {
         // qwen3.5 / qwen3.6 use zero-centered x̂·(1+w) norms.
         NormStyle::Gemma
@@ -858,6 +904,8 @@ fn arch_from_md(md: &BTreeMap<String, Val>, tensors: &[GgufTensor]) -> anyhow::R
     Ok(ModelArch {
         arch_name: if is_q35 {
             "qwen3_5_moe".into()
+        } else if is_hunyuan_dense {
+            "hunyuan_v1_dense".into()
         } else {
             arch.clone()
         },
@@ -929,6 +977,7 @@ fn arch_from_md(md: &BTreeMap<String, Val>, tensors: &[GgufTensor]) -> anyhow::R
         activation_situ_beta: None,
         activation_situ_linear_beta: None,
         attn_v_norm: false,
+        qk_norm_after_rope: is_hunyuan_dense,
         num_loops: 1,
         kda_gate_lower_bound: None,
         g3n: None,
@@ -1275,6 +1324,7 @@ fn qwen_image_arch(geometry: &QwenImageGeometry) -> ModelArch {
         activation_situ_beta: None,
         activation_situ_linear_beta: None,
         attn_v_norm: false,
+        qk_norm_after_rope: false,
         mtp: None,
         moe: None,
         qwen4_exp: None,
@@ -1669,6 +1719,7 @@ pub fn run_import_gguf(
     quant: &str,
     output: &str,
     hf_token: Option<&str>,
+    tokenizer_dir: Option<&str>,
     mut progress: impl FnMut(f32),
 ) -> anyhow::Result<()> {
     let quant = convert::parse_quant(quant)?;
@@ -1857,8 +1908,24 @@ pub fn run_import_gguf(
             shape
         };
         let two_d = shape.len() == 2 && numel >= 32 && !keep_f32;
-        let (dt, data) = if two_d {
-            convert::quantize_2d(quant, &vals, shape[0], shape[1])
+        let (dt, data) = if two_d && t.ggml_type == GGML_STQ1_0 {
+            // Sparse-ternary source: re-encode exactly as q1t, whatever the
+            // requested profile — requantizing trained ternary weights can
+            // only lose.
+            (
+                TensorDtype::Q1T,
+                convert::encode_q1t_exact(&vals, shape[0], shape[1])?,
+            )
+        } else if two_d {
+            // A ternary profile on a NON-ternary tensor (the token table of
+            // a STQ1_0 file) would be post-training quantization, never the
+            // intent of `--quant q1t` on such a file — keep it at q8_2f.
+            let q = if quant == Quant::Q1t {
+                Quant::Q8_2f
+            } else {
+                quant
+            };
+            convert::quantize_2d(q, &vals, shape[0], shape[1])
         } else if keep_f32 {
             (
                 TensorDtype::F32,
@@ -1876,6 +1943,46 @@ pub fn run_import_gguf(
     }
 
     let (vocab, bundle) = tokenizer(&g.md);
+    // `--tokenizer-dir`: embed the vendor's HF tokenizer.json verbatim instead
+    // of the byte-level BPE reconstructed from ggml metadata. Required when
+    // the pre-tokenizer is not plain ByteLevel — HunYuan splits digits in
+    // runs of 1–3 and isolates CJK before the byte-level step, which the
+    // reconstruction cannot express.
+    let (vocab, bundle) = match tokenizer_dir {
+        Some(dir) => {
+            let dir = std::path::Path::new(dir);
+            let tj = fs::read(dir.join("tokenizer.json")).map_err(|e| {
+                anyhow::anyhow!("--tokenizer-dir {}: tokenizer.json: {e}", dir.display())
+            })?;
+            let tok_cfg: serde_json::Value = fs::read(dir.join("tokenizer_config.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .unwrap_or(serde_json::Value::Null);
+            let chat_template = fs::read_to_string(dir.join("chat_template.jinja"))
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| {
+                    tok_cfg
+                        .get("chat_template")
+                        .and_then(|v| v.as_str().map(String::from))
+                })
+                .or_else(|| bundle.chat_template.clone());
+            eprintln!(
+                "  tokenizer: {} (HF tokenizer.json, {} bytes; chat template {})",
+                dir.display(),
+                tj.len(),
+                if chat_template.is_some() { "present" } else { "absent" }
+            );
+            (
+                Some(tj),
+                TokenizerBundle {
+                    chat_template,
+                    ..bundle
+                },
+            )
+        }
+        None => (vocab, bundle),
+    };
     let quant_type = match quant {
         Quant::Q8Row => QuantType::Q8Row,
         Quant::Q8_2f => QuantType::Q8_2f,
@@ -2233,6 +2340,7 @@ mod dequant_tests {
             "q8",
             out.to_str().unwrap(),
             None,
+            None,
             |_| {},
         )
         .unwrap();
@@ -2348,6 +2456,7 @@ mod dequant_tests {
             "q8",
             source.to_str().unwrap(),
             None,
+            None,
             |_| {},
         )
         .unwrap();
@@ -2368,6 +2477,7 @@ mod dequant_tests {
             bad_source.to_str().unwrap(),
             "q8",
             bad_output.to_str().unwrap(),
+            None,
             None,
             |_| {},
         )
@@ -2531,11 +2641,12 @@ mod dequant_tests {
             "q8",
             local_out.to_str().unwrap(),
             None,
+            None,
             |_| {},
         )
         .unwrap();
         let (url, server) = serve_gguf(Arc::new(gguf_bytes.clone()), HttpReply::Normal, 8);
-        run_import_gguf(&url, "q8", remote_out.to_str().unwrap(), None, |_| {}).unwrap();
+        run_import_gguf(&url, "q8", remote_out.to_str().unwrap(), None, None, |_| {}).unwrap();
         server.join().unwrap().unwrap();
         let local = cortiq_core::CmfModel::open(&local_out).unwrap();
         let remote = cortiq_core::CmfModel::open(&remote_out).unwrap();
@@ -2556,7 +2667,7 @@ mod dequant_tests {
                 1
             };
             let (url, server) = serve_gguf(Arc::new(gguf_bytes.clone()), reply, requests);
-            assert!(run_import_gguf(&url, "q8", output.to_str().unwrap(), None, |_| {}).is_err());
+            assert!(run_import_gguf(&url, "q8", output.to_str().unwrap(), None, None, |_| {}).is_err());
             server.join().unwrap().unwrap();
             assert_eq!(std::fs::read(&output).unwrap(), preserved);
             let _ = std::fs::remove_file(output);
@@ -2565,5 +2676,104 @@ mod dequant_tests {
         let _ = std::fs::remove_file(source);
         let _ = std::fs::remove_file(local_out);
         let _ = std::fs::remove_file(remote_out);
+    }
+}
+
+#[cfg(test)]
+mod stq1_0_tests {
+    use super::*;
+
+    /// Port of ggml `quantize_row_stq1_0_ref` (the encoder half of PR #22836),
+    /// driven by the codebook's inverse so the test does not share the
+    /// decoder's bit plumbing.
+    fn quantize_stq1_0_ref(x: &[f32]) -> Vec<u8> {
+        assert_eq!(x.len() % 256, 0);
+        let mut out = Vec::new();
+        for blk in x.chunks(256) {
+            let mut qs = [0u8; 32];
+            let mut sign = [0u8; 8];
+            let amax = blk.iter().fold(0f32, |m, v| m.max(v.abs()));
+            for g in 0..64 {
+                let (chunk, gloc) = (g / 16, g % 16);
+                let lane = |p: usize| blk[chunk * 64 + gloc + p * 16];
+                let mut zero_pos = 0;
+                let mut min_abs = lane(0).abs();
+                for p in 1..4 {
+                    if lane(p).abs() < min_abs {
+                        min_abs = lane(p).abs();
+                        zero_pos = p;
+                    }
+                }
+                let mut qpack = 0u8;
+                for p in 0..4 {
+                    let l = if p == zero_pos {
+                        1
+                    } else if lane(p) < 0.0 {
+                        0
+                    } else {
+                        2
+                    };
+                    qpack |= l << (2 * p);
+                }
+                let idx = STQ1_0_CODEBOOK
+                    .iter()
+                    .position(|&b| b == qpack)
+                    .expect("every one-zero pattern is in the codebook");
+                let (s, code) = ((idx >> 4) as u8, (idx & 0x0F) as u8);
+                qs[g / 2] |= code << (4 * (g & 1));
+                sign[g / 8] |= s << (g % 8);
+            }
+            out.extend_from_slice(&qs);
+            out.extend_from_slice(&sign);
+            out.extend_from_slice(&cortiq_core::quant::f32_to_f16(amax).to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn stq1_0_decodes_the_documented_patterns() {
+        // Block: d = 0.5; group 0 = slot 0 / sign 0 → lanes (0,+1,+1,+1) = 0xA9;
+        // group 1 = slot 3 / sign 1 → 0xA1 = 10 10 00 01 → (0,-1,+1,+1).
+        let mut raw = vec![0u8; 42];
+        raw[0] = 0x00 | (0x3 << 4);
+        raw[32] = 0b10; // sign bit of group 1
+        raw[40..42].copy_from_slice(&cortiq_core::quant::f32_to_f16(0.5).to_le_bytes());
+        let y = dequant_stq1_0(&raw, 256);
+        assert_eq!(&[y[0], y[16], y[32], y[48]], &[0.0, 0.5, 0.5, 0.5]);
+        assert_eq!(&[y[1], y[17], y[33], y[49]], &[0.0, -0.5, 0.5, 0.5]);
+        // untouched groups (slot 0, sign 0) also decode to (0,+d,+d,+d)
+        assert_eq!(&[y[2], y[18], y[34], y[50]], &[0.0, 0.5, 0.5, 0.5]);
+    }
+
+    #[test]
+    fn stq1_0_roundtrip_keeps_the_3_of_4_structure() {
+        let x: Vec<f32> = (0..512)
+            .map(|i| ((i * 7919) % 1000) as f32 / 500.0 - 1.0)
+            .collect();
+        let raw = quantize_stq1_0_ref(&x);
+        assert_eq!(raw.len(), nbytes(GGML_STQ1_0, 512).unwrap());
+        let y = dequant_stq1_0(&raw, 512);
+        for (b, blk) in x.chunks(256).enumerate() {
+            let amax = blk.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let d = f16_to_f32(cortiq_core::quant::f32_to_f16(amax));
+            for g in 0..64 {
+                let (chunk, gloc) = (g / 16, g % 16);
+                let idx: Vec<usize> = (0..4).map(|p| chunk * 64 + gloc + p * 16).collect();
+                let zeros = idx.iter().filter(|&&j| y[b * 256 + j] == 0.0).count();
+                assert_eq!(zeros, 1, "exactly one zero lane per group");
+                for &j in &idx {
+                    let v = y[b * 256 + j];
+                    if v != 0.0 {
+                        assert_eq!(v.abs(), d);
+                        assert_eq!(v.is_sign_negative(), blk[j] < 0.0);
+                    }
+                }
+            }
+        }
+        // …and the exact q1t re-encode reproduces the decoded values bit for bit.
+        let enc = convert::encode_q1t_exact(&y, 2, 256).unwrap();
+        let mut back = vec![0f32; 512];
+        cortiq_core::quant::dequant_q1t(&enc, 2, 256, &mut back);
+        assert_eq!(back, y);
     }
 }

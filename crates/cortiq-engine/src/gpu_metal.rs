@@ -1965,7 +1965,7 @@ kernel void attn_rope_qkn(
     constant uint&  hd    [[buffer(9)]],
     constant uint&  rd    [[buffer(10)]],
     constant uint&  pos   [[buffer(11)]],
-    constant uint&  flags [[buffer(12)]], // 1=gate 2=qnorm 4=knorm 8=gemma
+    constant uint&  flags [[buffer(12)]], // 1=gate 2=qnorm 4=knorm 8=gemma 32=norm-after-rope
     constant float& eps   [[buffer(13)]],
     uint gid [[thread_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]])
@@ -1996,6 +1996,26 @@ kernel void attn_rope_qkn(
     }
     ss = simd_sum(ss);
     bool normed = isq ? (flags & 2u) != 0u : (flags & 4u) != 0u;
+    // HunYuan dense (flag 32): rotate FIRST, then norm. The rotation keeps
+    // the head's sum of squares, so `ss` serves both orders; only the
+    // elementwise norm weights must see the rotated vector.
+    bool late = (flags & 32u) != 0u;
+    // Partial RoPE: pair (i, i + rd/2); with (rd/2) % 32 == 0 both
+    // halves live in the same lane, slots t and t + (rd/2)/32.
+    uint hlf = rd / 2u;
+    uint toff = hlf / 32u;
+    if (late) {
+        for (uint t = 0; t < toff; ++t) {
+            uint i = t * 32u + lane;
+            if (i < hlf) {
+                float angle = (float)pos * invf[i];
+                float c = cos(angle), s = sin(angle);
+                float x0 = xv[t], x1 = xv[t + toff];
+                xv[t] = x0 * c - x1 * s;
+                xv[t + toff] = x0 * s + x1 * c;
+            }
+        }
+    }
     if (normed) {
         float inv = 1.0f / sqrt(ss / (float)hd + eps);
         device const float* w = isq ? qnw : knw;
@@ -2008,18 +2028,16 @@ kernel void attn_rope_qkn(
             }
         }
     }
-    // Partial RoPE: pair (i, i + rd/2); with (rd/2) % 32 == 0 both
-    // halves live in the same lane, slots t and t + (rd/2)/32.
-    uint hlf = rd / 2u;
-    uint toff = hlf / 32u;
-    for (uint t = 0; t < toff; ++t) {
-        uint i = t * 32u + lane;
-        if (i < hlf) {
-            float angle = (float)pos * invf[i];
-            float c = cos(angle), s = sin(angle);
-            float x0 = xv[t], x1 = xv[t + toff];
-            xv[t] = x0 * c - x1 * s;
-            xv[t + toff] = x0 * s + x1 * c;
+    if (!late) {
+        for (uint t = 0; t < toff; ++t) {
+            uint i = t * 32u + lane;
+            if (i < hlf) {
+                float angle = (float)pos * invf[i];
+                float c = cos(angle), s = sin(angle);
+                float x0 = xv[t], x1 = xv[t + toff];
+                xv[t] = x0 * c - x1 * s;
+                xv[t + toff] = x0 * s + x1 * c;
+            }
         }
     }
     device float* dst = isq ? qout + (ulong)head * hd : k + (ulong)(head - nh) * hd;
@@ -2052,7 +2070,7 @@ kernel void attn_rope_qkn_b(
     constant uint&  hd    [[buffer(9)]],
     constant uint&  rd    [[buffer(10)]],
     constant uint&  pos   [[buffer(11)]],
-    constant uint&  flags [[buffer(12)]], // 1=gate 2=qnorm 4=knorm 8=gemma
+    constant uint&  flags [[buffer(12)]], // 1=gate 2=qnorm 4=knorm 8=gemma 32=norm-after-rope
     constant float& eps   [[buffer(13)]],
     constant uint&  nb    [[buffer(14)]],
     uint2 gid2 [[thread_position_in_grid]],
@@ -2093,6 +2111,26 @@ kernel void attn_rope_qkn_b(
     }
     ss = simd_sum(ss);
     bool normed = isq ? (flags & 2u) != 0u : (flags & 4u) != 0u;
+    // HunYuan dense (flag 32): rotate FIRST, then norm. The rotation keeps
+    // the head's sum of squares, so `ss` serves both orders; only the
+    // elementwise norm weights must see the rotated vector.
+    bool late = (flags & 32u) != 0u;
+    // Partial RoPE: pair (i, i + rd/2); with (rd/2) % 32 == 0 both
+    // halves live in the same lane, slots t and t + (rd/2)/32.
+    uint hlf = rd / 2u;
+    uint toff = hlf / 32u;
+    if (late) {
+        for (uint t = 0; t < toff; ++t) {
+            uint i = t * 32u + lane;
+            if (i < hlf) {
+                float angle = (float)pos_e * invf[i];
+                float c = cos(angle), s = sin(angle);
+                float x0 = xv[t], x1 = xv[t + toff];
+                xv[t] = x0 * c - x1 * s;
+                xv[t + toff] = x0 * s + x1 * c;
+            }
+        }
+    }
     if (normed) {
         float inv = 1.0f / sqrt(ss / (float)hd + eps);
         device const float* w = isq ? qnw : knw;
@@ -2105,18 +2143,16 @@ kernel void attn_rope_qkn_b(
             }
         }
     }
-    // Partial RoPE: pair (i, i + rd/2); with (rd/2) % 32 == 0 both
-    // halves live in the same lane, slots t and t + (rd/2)/32.
-    uint hlf = rd / 2u;
-    uint toff = hlf / 32u;
-    for (uint t = 0; t < toff; ++t) {
-        uint i = t * 32u + lane;
-        if (i < hlf) {
-            float angle = (float)pos_e * invf[i];
-            float c = cos(angle), s = sin(angle);
-            float x0 = xv[t], x1 = xv[t + toff];
-            xv[t] = x0 * c - x1 * s;
-            xv[t + toff] = x0 * s + x1 * c;
+    if (!late) {
+        for (uint t = 0; t < toff; ++t) {
+            uint i = t * 32u + lane;
+            if (i < hlf) {
+                float angle = (float)pos_e * invf[i];
+                float c = cos(angle), s = sin(angle);
+                float x0 = xv[t], x1 = xv[t + toff];
+                xv[t] = x0 * c - x1 * s;
+                xv[t + toff] = x0 * s + x1 * c;
+            }
         }
     }
     device float* dst = isq ? qout + (ulong)head * hd : k + (ulong)(head - nh) * hd;
@@ -3046,6 +3082,23 @@ kernel void chunk_rope_kv(
     if (!isv) {
         ss = simd_sum(ss);
         bool normed = isq ? (flags & 2u) != 0u : (flags & 4u) != 0u;
+        // HunYuan dense (flag 32): rotate first, then norm (see attn_rope_qkn).
+        bool late = (flags & 32u) != 0u;
+        uint hlf = rd / 2u;
+        uint toff = hlf / 32u;
+        uint pos = pos0 + bi;
+        if (late) {
+            for (uint t = 0; t < toff; ++t) {
+                uint i = t * 32u + lane;
+                if (i < hlf) {
+                    float angle = (float)pos * invf[i];
+                    float c = cos(angle), sn = sin(angle);
+                    float x0 = xv[t], x1 = xv[t + toff];
+                    xv[t] = x0 * c - x1 * sn;
+                    xv[t + toff] = x0 * sn + x1 * c;
+                }
+            }
+        }
         if (normed) {
             float inv = 1.0f / sqrt(ss / (float)hd + eps);
             device const float* w = isq ? qnw : knw;
@@ -3058,17 +3111,16 @@ kernel void chunk_rope_kv(
                 }
             }
         }
-        uint hlf = rd / 2u;
-        uint toff = hlf / 32u;
-        uint pos = pos0 + bi;
-        for (uint t = 0; t < toff; ++t) {
-            uint i = t * 32u + lane;
-            if (i < hlf) {
-                float angle = (float)pos * invf[i];
-                float c = cos(angle), sn = sin(angle);
-                float x0 = xv[t], x1 = xv[t + toff];
-                xv[t] = x0 * c - x1 * sn;
-                xv[t + toff] = x0 * sn + x1 * c;
+        if (!late) {
+            for (uint t = 0; t < toff; ++t) {
+                uint i = t * 32u + lane;
+                if (i < hlf) {
+                    float angle = (float)pos * invf[i];
+                    float c = cos(angle), sn = sin(angle);
+                    float x0 = xv[t], x1 = xv[t + toff];
+                    xv[t] = x0 * c - x1 * sn;
+                    xv[t + toff] = x0 * sn + x1 * c;
+                }
             }
         }
     }
@@ -8313,6 +8365,8 @@ pub struct ChunkLayer<'a> {
     pub bias: Option<(&'a [f32], &'a [f32], &'a [f32])>,
     pub q_norm: Option<&'a [f32]>,
     pub k_norm: Option<&'a [f32]>,
+    /// HunYuan dense: q/k norm after RoPE (rope-kernel flag bit 32).
+    pub late_qk_norm: bool,
     pub inv_freq: &'a [f32],
     pub rd: usize,
     pub nh: usize,
@@ -8851,7 +8905,8 @@ pub fn chunk_run_gpu(
             let flags = ((l.q_norm.is_some() as u32) << 1)
                 | ((l.k_norm.is_some() as u32) << 2)
                 | ((l.gemma as u32) << 3)
-                | ((has_bias as u32) << 4);
+                | ((has_bias as u32) << 4)
+                | ((l.late_qk_norm as u32) << 5);
             let words = [
                 nh as u32,
                 nkv as u32,
@@ -12976,6 +13031,7 @@ impl TokenGraph {
             output_gate: p.output_gate,
             q_norm: p.q_norm,
             k_norm: p.k_norm,
+            late_qk_norm: p.late_qk_norm,
             inv_freq: p.inv_freq,
             cpu_k: p.cpu_k.clone(),
             cpu_v: p.cpu_v.clone(),
@@ -13457,7 +13513,8 @@ impl TokenGraph {
         let flags = (p.output_gate as u32)
             | ((p.q_norm.is_some() as u32) << 1)
             | ((p.k_norm.is_some() as u32) << 2)
-            | ((p.gemma as u32) << 3);
+            | ((p.gemma as u32) << 3)
+            | ((p.late_qk_norm as u32) << 5);
         let qn_b = p
             .q_norm
             .map(|w| const_buf(self.c, w))
@@ -14225,6 +14282,8 @@ pub struct AttnDeviceParams<'a> {
     pub output_gate: bool,
     pub q_norm: Option<&'a [f32]>,
     pub k_norm: Option<&'a [f32]>,
+    /// HunYuan dense: q/k norm after RoPE (rope-kernel flag bit 32).
+    pub late_qk_norm: bool,
     pub inv_freq: &'a [f32],
     /// CPU rows per head (`[stored × hd]` each) — the owner of record,
     /// used to (re)build the mirror when it diverges.
@@ -15213,7 +15272,8 @@ impl VerifyGraph {
         let flags = (p.output_gate as u32)
             | ((p.q_norm.is_some() as u32) << 1)
             | ((p.k_norm.is_some() as u32) << 2)
-            | ((p.gemma as u32) << 3);
+            | ((p.gemma as u32) << 3)
+            | ((p.late_qk_norm as u32) << 5);
         let qn_b = p
             .q_norm
             .map(|w| const_buf(c, w))
@@ -15775,6 +15835,7 @@ mod tests {
             activation_situ_beta: None,
             activation_situ_linear_beta: None,
             attn_v_norm: false,
+            qk_norm_after_rope: false,
             num_loops: 1,
             kda_gate_lower_bound: None,
             g3n: None,
@@ -15906,6 +15967,7 @@ mod tests {
             activation_situ_beta: None,
             activation_situ_linear_beta: None,
             attn_v_norm: false,
+            qk_norm_after_rope: false,
             num_loops: 1,
             kda_gate_lower_bound: None,
             g3n: None,
@@ -16066,6 +16128,7 @@ mod tests {
             activation_situ_beta: None,
             activation_situ_linear_beta: None,
             attn_v_norm: false,
+            qk_norm_after_rope: false,
             num_loops: 1,
             kda_gate_lower_bound: None,
             g3n: None,

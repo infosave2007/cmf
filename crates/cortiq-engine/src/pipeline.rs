@@ -291,6 +291,8 @@ pub struct Pipeline {
     pub inv_freq_global: Option<std::sync::Arc<Vec<f32>>>,
     /// Scale-less RMS normalization of V heads before caching (Gemma-4).
     pub attn_v_norm: bool,
+    /// HunYuan dense: per-head q/k norm runs after RoPE (see the arch flag).
+    pub qk_norm_after_rope: bool,
     /// Final-logit soft-capping C: logits = C·tanh(logits/C) (Gemma-4).
     pub final_softcap: Option<f32>,
     /// Cortiq Embryo hierarchical head: cluster matrix [C, hidden]. The
@@ -1696,6 +1698,7 @@ impl Pipeline {
                             scale: self.attn_scale,
                             eps: eps as f32,
                             gemma,
+                            late_qk_norm: self.qk_norm_after_rope,
                             output_gate: *output_gate,
                             q_norm: *q_norm,
                             k_norm: *k_norm,
@@ -1756,6 +1759,7 @@ impl Pipeline {
                         softcap: self.attn_softcap,
                         window: None,
                         v_norm: false,
+                        qk_norm_after_rope: self.qk_norm_after_rope,
                         q_norm: *q_norm,
                         k_norm: *k_norm,
                         output_gate: *output_gate,
@@ -1839,6 +1843,7 @@ impl Pipeline {
                             scale: self.attn_scale,
                             eps: eps as f32,
                             gemma,
+                            late_qk_norm: self.qk_norm_after_rope,
                             output_gate: *output_gate,
                             q_norm: *q_norm,
                             k_norm: *k_norm,
@@ -2096,6 +2101,7 @@ impl Pipeline {
             global_attn: None,
             inv_freq_global: None,
             attn_v_norm: false,
+            qk_norm_after_rope: false,
             final_softcap: None,
             head_clusters: None,
             attn_softcap: 0.0,
@@ -2416,6 +2422,7 @@ impl Pipeline {
             softcap: self.attn_softcap,
             window: None,
             v_norm: false,
+            qk_norm_after_rope: self.qk_norm_after_rope,
             q_norm: None,
             k_norm: None,
             output_gate: false,
@@ -4397,6 +4404,7 @@ impl Pipeline {
                 wo: gw(wo)?,
                 q_norm: q_norm.as_deref(),
                 k_norm: k_norm.as_deref(),
+                late_qk_norm: self.qk_norm_after_rope,
                 bias: bias
                     .as_ref()
                     .map(|(a, b, c)| (a.as_slice(), b.as_slice(), c.as_slice())),
@@ -4547,6 +4555,7 @@ impl Pipeline {
                 wo: gwo,
                 q_norm: q_norm.as_deref(),
                 k_norm: k_norm.as_deref(),
+                late_qk_norm: self.qk_norm_after_rope,
                 bias: bias
                     .as_ref()
                     .map(|(a, b, c)| (a.as_slice(), b.as_slice(), c.as_slice())),
@@ -5702,6 +5711,7 @@ impl Pipeline {
                         softcap: self.attn_softcap,
                         window: self.layer_window(li),
                         v_norm: self.attn_v_norm,
+                        qk_norm_after_rope: self.qk_norm_after_rope,
                         q_norm: q_norm.as_deref(),
                         k_norm: k_norm.as_deref(),
                         output_gate: *output_gate,
@@ -7039,6 +7049,7 @@ impl Pipeline {
                         softcap: self.attn_softcap,
                         window: self.layer_window(li),
                         v_norm: self.attn_v_norm,
+                        qk_norm_after_rope: self.qk_norm_after_rope,
                         q_norm: q_norm.as_deref(),
                         k_norm: k_norm.as_deref(),
                         output_gate: *output_gate,
@@ -7381,6 +7392,7 @@ impl Pipeline {
                 hs,
                 inter: d.gate_proj.rows(),
                 gemma: matches!(self.norm_style, cortiq_core::NormStyle::Gemma),
+                late_qk_norm: self.qk_norm_after_rope,
                 eps: self.rms_eps as f32,
             });
         }
@@ -7957,24 +7969,24 @@ impl Pipeline {
                 },
                 FfnKind::Moe(m) => {
                     // Adaptive τ and expert masks keep the CPU path, where
-                    // they are implemented; so does a routed scale ≠ 1 (rare,
-                    // and folding it into the select kernel is not written).
-                    // Sigmoid routing with a selection bias (LFM2-MoE /
-                    // DeepSeek noaux_tc) IS graphed — before it was, every
-                    // LFM2-MoE token fell to the per-op path whole.
-                    if m.route_tau.is_some()
-                        || m.mask.is_some()
-                        || (m.routed_scaling - 1.0).abs() > 1e-9
-                    {
+                    // they are implemented. Sigmoid routing with a selection
+                    // bias (LFM2-MoE / DeepSeek noaux_tc), a routed scale ≠ 1
+                    // and an UNGATED shared expert (HunYuan hy_v3: ×2.826 on
+                    // the routed mix, the shared expert at weight 1) are all
+                    // graphed — before, every such token fell to the per-op
+                    // path whole (145 submits/token on Hy-MT2-30B-A3B).
+                    if m.route_tau.is_some() || m.mask.is_some() {
                         return None;
                     }
                     let shared = m.shared.as_ref();
                     let has_shared = shared.is_some();
+                    let shared_gated = matches!(shared, Some((_, Some(_))));
                     let sgate = match shared {
-                        Some((_, sg)) => gw(sg.as_ref()?)?,
-                        // Unused by the kernel when has_shared is false; the
-                        // router weight stands in so the plumbing stays total.
-                        None => gw(&m.router)?,
+                        Some((_, Some(sg))) => gw(sg)?,
+                        // No gate (hy_v3) or no shared expert at all: the
+                        // router weight stands in so the plumbing stays
+                        // total; the select kernels pin weight 1 or skip.
+                        _ => gw(&m.router)?,
                     };
                     let router = gw(&m.router)?;
                     // The resident MoE kernels do not yet carry the
@@ -8097,6 +8109,8 @@ impl Pipeline {
                         sigmoid: m.router_sigmoid,
                         bias: m.expert_bias.as_deref(),
                         has_shared,
+                        shared_gated,
+                        route_scale: m.routed_scaling,
                     }
                 }
             };
@@ -8126,6 +8140,7 @@ impl Pipeline {
                         wo: gw(wo)?,
                         q_norm: q_norm.as_deref(),
                         k_norm: k_norm.as_deref(),
+                        late_qk_norm: self.qk_norm_after_rope,
                         bias: bias
                             .as_ref()
                             .map(|(a, b, c)| (a.as_slice(), b.as_slice(), c.as_slice())),
@@ -8496,6 +8511,7 @@ impl Pipeline {
         scale: f32,
         eps: f32,
         gemma: bool,
+        late_qk_norm: bool,
     ) -> (crate::gpu_metal::AttnDeviceParams<'a>, usize) {
         let (nh, nkv, hd, rd) = geom;
         let cpu_k: Vec<&[f32]> = (0..nkv).map(|g| cache.head_keys(g)).collect();
@@ -8513,6 +8529,7 @@ impl Pipeline {
                 scale,
                 eps,
                 gemma,
+                late_qk_norm,
                 output_gate,
                 q_norm,
                 k_norm,
@@ -8598,6 +8615,7 @@ impl Pipeline {
                         self.attn_scale,
                         eps,
                         gemma,
+                        self.qk_norm_after_rope,
                     );
                     graph.attn_ok(l, &p)
                 }
@@ -8654,6 +8672,7 @@ impl Pipeline {
                         self.attn_scale,
                         eps,
                         gemma,
+                        self.qk_norm_after_rope,
                     );
                     if !graph.encode_attn_b(l, &p) {
                         return MetalRowsRun::Declined;
@@ -9074,6 +9093,7 @@ impl Pipeline {
                 scale: self.attn_scale,
                 eps: self.rms_eps as f32,
                 gemma: self.norm_style == cortiq_core::NormStyle::Gemma,
+                late_qk_norm: self.qk_norm_after_rope,
                 output_gate: *output_gate,
                 q_norm: q_norm.as_deref(),
                 k_norm: k_norm.as_deref(),
@@ -9255,6 +9275,7 @@ impl Pipeline {
                 scale: self.attn_scale,
                 eps: self.rms_eps as f32,
                 gemma: self.norm_style == cortiq_core::NormStyle::Gemma,
+                late_qk_norm: self.qk_norm_after_rope,
                 output_gate: *output_gate,
                 q_norm: q_norm.as_deref(),
                 k_norm: k_norm.as_deref(),
@@ -9497,6 +9518,8 @@ impl Pipeline {
                             sigmoid: false,
                             bias: None,
                             has_shared: true,
+                            shared_gated: true,
+                            route_scale: 1.0,
                         }
                     }
                     _ => return None,
@@ -9534,6 +9557,7 @@ impl Pipeline {
                             wo: gw(wo)?,
                             q_norm: q_norm.as_deref(),
                             k_norm: k_norm.as_deref(),
+                            late_qk_norm: self.qk_norm_after_rope,
                             bias: bias
                                 .as_ref()
                                 .map(|(a, b, c)| (a.as_slice(), b.as_slice(), c.as_slice())),
@@ -10668,6 +10692,7 @@ impl Pipeline {
                         softcap: self.attn_softcap,
                         window: None,
                         v_norm: self.attn_v_norm,
+                        qk_norm_after_rope: self.qk_norm_after_rope,
                         q_norm: q_norm.as_deref(),
                         k_norm: k_norm.as_deref(),
                         output_gate: *output_gate,
@@ -10735,6 +10760,7 @@ impl Pipeline {
                                 oi,
                                 q_norm.as_deref(),
                                 k_norm.as_deref(),
+                                self.qk_norm_after_rope,
                                 &inv_freq_l,
                                 nh,
                                 nkv_l,
@@ -10799,6 +10825,7 @@ impl Pipeline {
                                 softcap: self.attn_softcap,
                                 window: self.layer_window(li),
                                 v_norm: self.attn_v_norm,
+                                qk_norm_after_rope: self.qk_norm_after_rope,
                                 q_norm: q_norm.as_deref(),
                                 k_norm: k_norm.as_deref(),
                                 output_gate: *output_gate,
