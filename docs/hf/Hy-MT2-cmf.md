@@ -210,8 +210,13 @@ Qwen3.8-27B decodes at 5.7 tok/s there) and on Metal a sigmoid-routed,
 ungated-shared MoE layer still runs its experts on the CPU — the Metal
 select kernel is the next port.
 
-Prompt ingest on the M4 (41-token prompt): 469 tok/s for the 1.8B q4tp,
-218 for the ternary file.
+Prompt ingest (41-token prompt): on the RTX PRO 4000 the dense files take
+180 (1.8B) and 118 (7B) tok/s; the 30B ingests at **8 tok/s** on this card
+— its batched prefill re-stages the expert buffers per 32-token chunk
+instead of sharing the decode graph's resident copy, so a long source
+paragraph costs seconds before the first token. Decode is unaffected;
+sharing the buffers is the next item on the MoE list. On the M4: 469 tok/s
+for the 1.8B q4tp, 218 for the ternary file, 122 for the 7B.
 
 **First answer vs. the rest.** On a discrete card the weights are uploaded
 when the whole-token graph is first built — 18.5 GB for the 30B, ~26 s on
