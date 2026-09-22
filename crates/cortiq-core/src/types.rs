@@ -458,6 +458,12 @@ pub struct ModelArch {
     /// Scale-less RMS normalization of V heads before caching (Gemma-4).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub attn_v_norm: bool,
+    /// Per-head q/k RMSNorm applied AFTER RoPE (HunYuan dense: rotate, then
+    /// `query_layernorm` / `key_layernorm`). False = the Qwen3 order (norm,
+    /// then rotate). The two are not interchangeable: a rotation keeps the
+    /// head's RMS but not its elementwise norm weights.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub qk_norm_after_rope: bool,
     /// Multi-token-prediction head (None = absent)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtp: Option<MtpConfig>,

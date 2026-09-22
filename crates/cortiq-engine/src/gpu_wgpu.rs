@@ -382,7 +382,7 @@ fn q2tp_matvec16w_sg(@builtin(workgroup_id) wid: vec3<u32>,
 "#;
 
 const SELECT_SG_SRC: &str = r#"
-struct MoeSelP { n_exp: u32, top_k: u32, norm: u32, pk: u32 };
+struct MoeSelP { n_exp: u32, top_k: u32, norm: u32, pk: u32, scale: f32, _s0: u32, _s1: u32, _s2: u32 };
 @group(0) @binding(0) var<storage, read>       sg_logit : array<f32>;
 @group(0) @binding(1) var<storage, read>       sg_slog  : array<f32>;
 @group(0) @binding(2) var<storage, read_write> sg_sel   : array<u32>;
@@ -3021,7 +3021,8 @@ fn add_rmsnorm_b(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocatio
 // RoPE + optional qk-norm + gate-split, one 32-thread workgroup per head
 // (WGSL twin of Metal attn_rope_qkn; the qk-norm sum-of-squares reduces in
 // workgroup memory — no subgroup ops, portable). Heads [0,nh)=Q (2·hd each
-// when gated: q||gate), [nh,nh+nkv)=K. flags: 1=gate 2=qnorm 4=knorm 8=gemma.
+// when gated: q||gate), [nh,nh+nkv)=K. flags: 1=gate 2=qnorm 4=knorm 8=gemma
+// 32=norm-after-rope (HunYuan dense).
 struct RqP { nh: u32, nkv: u32, hd: u32, rd: u32, pos: u32, flags: u32, eps: f32, tok: u32 };
 @group(0) @binding(0) var<storage, read>       rq_qraw : array<f32>;
 @group(0) @binding(1) var<storage, read_write> rq_k    : array<f32>;
@@ -3067,6 +3068,42 @@ fn attn_rope_qkn(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocatio
         stride = stride / 2u;
     }
     let normed = select((rq_p.flags & 4u) != 0u, (rq_p.flags & 2u) != 0u, isq);
+    // HunYuan dense (flag 32): rotate FIRST, then norm. The rotation keeps
+    // the head's sum of squares (rq_red[0] serves both orders); only the
+    // elementwise norm weights must see the rotated vector. Both orders
+    // run the same barrier sequence — the branches hold no barriers.
+    let late = (rq_p.flags & 32u) != 0u;
+    let hlf = rq_p.rd / 2u;
+    // RoPE over the first rd dims, pairing dim i with dim i+hlf. Staged through
+    // workgroup memory because the pair partner lands on a DIFFERENT lane when
+    // hlf isn't a multiple of 32 (partial RoPE — Qwen3.5 rotates head_dim/4, so
+    // hlf can be 16). The old register tiling (xv[t+toff], toff=hlf/32) silently
+    // did nothing for hlf<32; here each lane ropes the pairs i=lane,lane+32,…
+    for (var t = 0u; t < nt; t = t + 1u) {
+        let d = t * 32u + lane;
+        if (d < hd) { rq_head[d] = xv[t]; }
+    }
+    workgroupBarrier();
+    if (late) {
+        var ri0 = lane;
+        loop {
+            if (ri0 >= hlf) { break; }
+            let angle0 = f32(rq_p.pos) * rq_invf[ri0];
+            let cc0 = cos(angle0);
+            let sf0 = sin(angle0);
+            let y0 = rq_head[ri0];
+            let y1 = rq_head[ri0 + hlf];
+            rq_head[ri0] = y0 * cc0 - y1 * sf0;
+            rq_head[ri0 + hlf] = y0 * sf0 + y1 * cc0;
+            ri0 = ri0 + 32u;
+        }
+    }
+    workgroupBarrier();
+    for (var t = 0u; t < nt; t = t + 1u) {
+        let d = t * 32u + lane;
+        if (d < hd) { xv[t] = rq_head[d]; }
+    }
+    workgroupBarrier();
     if (normed) {
         let inv = 1.0 / sqrt(rq_red[0] / f32(hd) + rq_p.eps);
         let gemma = (rq_p.flags & 8u) != 0u;
@@ -3079,28 +3116,24 @@ fn attn_rope_qkn(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocatio
             }
         }
     }
-    // RoPE over the first rd dims, pairing dim i with dim i+hlf. Staged through
-    // workgroup memory because the pair partner lands on a DIFFERENT lane when
-    // hlf isn't a multiple of 32 (partial RoPE — Qwen3.5 rotates head_dim/4, so
-    // hlf can be 16). The old register tiling (xv[t+toff], toff=hlf/32) silently
-    // did nothing for hlf<32; here each lane ropes the pairs i=lane,lane+32,…
     for (var t = 0u; t < nt; t = t + 1u) {
         let d = t * 32u + lane;
         if (d < hd) { rq_head[d] = xv[t]; }
     }
     workgroupBarrier();
-    let hlf = rq_p.rd / 2u;
-    var ri = lane;
-    loop {
-        if (ri >= hlf) { break; }
-        let angle = f32(rq_p.pos) * rq_invf[ri];
-        let cc = cos(angle);
-        let sfac = sin(angle);
-        let x0 = rq_head[ri];
-        let x1 = rq_head[ri + hlf];
-        rq_head[ri] = x0 * cc - x1 * sfac;
-        rq_head[ri + hlf] = x0 * sfac + x1 * cc;
-        ri = ri + 32u;
+    if (!late) {
+        var ri = lane;
+        loop {
+            if (ri >= hlf) { break; }
+            let angle = f32(rq_p.pos) * rq_invf[ri];
+            let cc = cos(angle);
+            let sfac = sin(angle);
+            let x0 = rq_head[ri];
+            let x1 = rq_head[ri + hlf];
+            rq_head[ri] = x0 * cc - x1 * sfac;
+            rq_head[ri + hlf] = x0 * sfac + x1 * cc;
+            ri = ri + 32u;
+        }
     }
     workgroupBarrier();
     let dst_base = select((head - nh) * hd, head * hd, isq);
@@ -7996,7 +8029,7 @@ fn q1t_overlay_mm(@builtin(global_invocation_id) gid: vec3<u32>) {
 // by sweeping the layer count. Folding it into a kernel that already runs
 // one workgroup is free. Any other dtype keeps the separate matvec and
 // this kernel reads its result from `ms_slog`.
-struct MoeSelP { n_exp: u32, top_k: u32, norm: u32, pk: u32 };
+struct MoeSelP { n_exp: u32, top_k: u32, norm: u32, pk: u32, scale: f32, _s0: u32, _s1: u32, _s2: u32 };
 @group(0) @binding(0) var<storage, read>       ms_logit : array<f32>;
 @group(0) @binding(1) var<storage, read>       ms_slog  : array<f32>;
 @group(0) @binding(2) var<storage, read_write> ms_sel   : array<u32>;
@@ -8137,9 +8170,18 @@ fn moe_select(@builtin(local_invocation_index) lid: u32) {
             let dn = select(wsum, wsum + 1e-6, msig);
             for (var slot = 0u; slot < k; slot = slot + 1u) { ms_w[slot] = ms_w[slot] / dn; }
         }
+        // routed_scaling_factor (DeepSeek-V3 lineage, HunYuan hy_v3 2.826):
+        // on the ROUTED mix only; the shared expert below is not scaled.
+        // Every other family passes 1.0, which changes no bit.
+        for (var slot = 0u; slot < k; slot = slot + 1u) { ms_w[slot] = ms_w[slot] * ms_p.scale; }
         if ((mflags & 8u) != 0u) {
             ms_sel[k] = n;
-            ms_w[k] = 1.0 / (1.0 + exp(-ms_sg));
+            // bit4: the shared expert has NO gate (hy_v3) — weight 1.
+            if ((mflags & 16u) != 0u) {
+                ms_w[k] = 1.0;
+            } else {
+                ms_w[k] = 1.0 / (1.0 + exp(-ms_sg));
+            }
         }
     }
 }
@@ -8702,17 +8744,22 @@ fn moe_down_q4tp_m(@builtin(workgroup_id) wid: vec3<u32>,
 // the batch hidden at its token offset. No logits buffer, no row
 // staging. f32 router weights only — the converter leaves the router
 // unquantized; anything else falls back to the per-token path.
-struct MoeSelBP { n_exp: u32, top_k: u32, norm: u32, pk: u32 };
+struct MoeSelBP { n_exp: u32, top_k: u32, norm: u32, pk: u32, scale: f32, _s0: u32, _s1: u32, _s2: u32 };
 @group(0) @binding(0) var<storage, read>       sb_lgin: array<f32>;
 @group(0) @binding(1) var<storage, read>       sb_x   : array<f32>;
 @group(0) @binding(2) var<storage, read_write> sb_sel : array<u32>;
 @group(0) @binding(3) var<storage, read_write> sb_w   : array<f32>;
 @group(0) @binding(4) var<uniform>             sb_p   : MoeSelBP;
 @group(0) @binding(5) var<storage, read>       sb_sgw : array<u32>;
+// Per-expert SELECTION bias (noaux_tc), a 4-byte dummy when absent.
+@group(0) @binding(6) var<storage, read>       sb_bias: array<f32>;
 var<workgroup> sb_lg:  array<f32, 256>;
 var<workgroup> sb_red: array<f32, 256>;
 var<workgroup> sb_ri:  array<u32, 256>;
 var<workgroup> sb_sg:  f32;
+// The mixing score per expert (softmax prob or sigmoid); the RANKING key
+// in sb_lg may carry the selection bias, the weight never does.
+var<workgroup> sb_sc:  array<f32, 256>;
 
 @compute @workgroup_size(256)
 fn moe_select_b(@builtin(workgroup_id) wid: vec3<u32>,
@@ -8773,6 +8820,25 @@ fn moe_select_b(@builtin(workgroup_id) wid: vec3<u32>,
     }
     let denom = sb_red[0];
     workgroupBarrier();
+    // norm word: bit0 renorm, bit1 sigmoid scores, bit2 selection bias,
+    // bit4 ungated shared expert — the single-token kernel's contract.
+    let mflags = sb_p.norm;
+    let msig = (mflags & 2u) != 0u;
+    var msc = 0.0;
+    if (lid < n) {
+        if (msig) {
+            msc = 1.0 / (1.0 + exp(-v));
+        } else {
+            msc = exp(v - mx) / denom;
+        }
+    }
+    sb_sc[lid] = msc;
+    if (msig) {
+        var mkey = msc;
+        if ((mflags & 4u) != 0u && lid < n) { mkey = mkey + sb_bias[lid]; }
+        sb_lg[lid] = select(-3.0e38, mkey, lid < n);
+    }
+    workgroupBarrier();
     let kk = sb_p.top_k;
     let ob = t * (kk + 1u);
     var wsum = 0.0;
@@ -8799,21 +8865,29 @@ fn moe_select_b(@builtin(workgroup_id) wid: vec3<u32>,
         if (lid == 0u) {
             let bi = sb_ri[0];
             sb_sel[ob + slot] = bi;
-            sb_w[ob + slot] = exp(sb_red[0] - mx) / denom;
+            sb_w[ob + slot] = sb_sc[bi];
         }
         workgroupBarrier();
-        wsum = wsum + exp(sb_red[0] - mx) / denom;
+        wsum = wsum + sb_sc[sb_ri[0]];
         if (lid == sb_ri[0]) { sb_lg[lid] = -3.0e38; }
         workgroupBarrier();
     }
     if (lid == 0u) {
-        if (sb_p.norm != 0u) {
+        if ((mflags & 1u) != 0u) {
+            let dn = select(wsum, wsum + 1e-6, msig);
             for (var slot = 0u; slot < kk; slot = slot + 1u) {
-                sb_w[ob + slot] = sb_w[ob + slot] / wsum;
+                sb_w[ob + slot] = sb_w[ob + slot] / dn;
             }
         }
+        for (var slot = 0u; slot < kk; slot = slot + 1u) {
+            sb_w[ob + slot] = sb_w[ob + slot] * sb_p.scale;
+        }
         sb_sel[ob + kk] = n;
-        sb_w[ob + kk] = 1.0 / (1.0 + exp(-sb_sg));
+        if ((mflags & 16u) != 0u) {
+            sb_w[ob + kk] = 1.0;
+        } else {
+            sb_w[ob + kk] = 1.0 / (1.0 + exp(-sb_sg));
+        }
     }
 }
 
@@ -19279,6 +19353,7 @@ pub fn attn_dropin_gpu(
     wo_idx: usize,
     q_norm: Option<&[f32]>,
     k_norm: Option<&[f32]>,
+    late_qk_norm: bool,
     invf: &[f32],
     nh: usize,
     nkv: usize,
@@ -19375,7 +19450,8 @@ pub fn attn_dropin_gpu(
     let o_b = rw_f32(c, hidden, true);
     let flags = if q_norm.is_some() { 2u32 } else { 0 }
         | if k_norm.is_some() { 4 } else { 0 }
-        | if gemma { 8 } else { 0 };
+        | if gemma { 8 } else { 0 }
+        | if late_qk_norm { 32 } else { 0 };
     let unif = |d: &[u32]| {
         c.device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -19727,6 +19803,8 @@ pub fn forward_token_graph(
             sigmoid: bool,
             bias: Option<wgpu::Buffer>,
             has_shared: bool,
+            shared_gated: bool,
+            route_scale: f32,
         },
     }
     struct LW {
@@ -20043,6 +20121,8 @@ pub fn forward_token_graph(
                 sigmoid,
                 bias,
                 has_shared,
+                shared_gated,
+                route_scale,
             } => {
                 // Select kernel: logits live in a 256-slot workgroup array;
                 // with a shared expert it rides as the last block.
@@ -20125,6 +20205,8 @@ pub fn forward_token_graph(
                             })
                     }),
                     has_shared: *has_shared,
+                    shared_gated: *shared_gated,
+                    route_scale: *route_scale,
                 }
             }
         };
@@ -20845,8 +20927,11 @@ pub fn forward_token_graph(
             }
             prism_transform(enc, src, width, op)
         };
-    let flags = |qn: bool, kn: bool| {
-        (if qn { 2u32 } else { 0 }) | (if kn { 4 } else { 0 }) | (if gemma { 8 } else { 0 })
+    let flags = |qn: bool, kn: bool, late: bool| {
+        (if qn { 2u32 } else { 0 })
+            | (if kn { 4 } else { 0 })
+            | (if gemma { 8 } else { 0 })
+            | (if late { 32 } else { 0 })
     };
     // Constant uniforms for the whole token (position is fixed for this call).
     // Token-invariant ones use the content-keyed cache; position-dependent ones
@@ -21528,6 +21613,7 @@ pub fn forward_token_graph(
                     crate::gpu::GraphAttn::Full {
                         q_norm,
                         k_norm,
+                        late_qk_norm,
                         bias,
                         output_gate,
                         ..
@@ -21553,7 +21639,7 @@ pub fn forward_token_graph(
                             hd as u32,
                             rd as u32,
                             position as u32,
-                            flags(q_norm.is_some(), k_norm.is_some()) | gate_flag,
+                            flags(q_norm.is_some(), k_norm.is_some(), *late_qk_norm) | gate_flag,
                             eps.to_bits(),
                             0,
                         ]),
@@ -22645,6 +22731,8 @@ pub fn forward_token_graph(
                     sigmoid,
                     bias,
                     has_shared,
+                    shared_gated,
+                    route_scale,
                 } => {
                     // The WHOLE MoE FFN — router + shared-gate matvecs, top-k
                     // select, fused gate+up+SiLU over the selected experts, and
@@ -22661,20 +22749,27 @@ pub fn forward_token_graph(
                     // Cached uniform: `unif` mints a fresh buffer per call, and one
                     // per MoE layer per token exhausted the device. hidden and the
                     // fold flag share the spare word.
-                    let sel_u = uniform_u32x4(
+                    let sel_u = uniform_u32x8(
                         c,
                         [
                             *n_exp as u32,
                             *top_k as u32,
                             // One flags word: bit0 renorm, bit1 sigmoid
                             // scores, bit2 selection bias, bit3 shared
-                            // expert present. Softmax models pass 0/1
-                            // exactly as before.
+                            // expert present, bit4 shared expert UNGATED
+                            // (weight 1). Softmax models pass 0/1 exactly
+                            // as before.
                             u32::from(*norm_topk)
                                 | (u32::from(*sigmoid) << 1)
                                 | (u32::from(bias.is_some()) << 2)
-                                | (u32::from(*has_shared) << 3),
+                                | (u32::from(*has_shared) << 3)
+                                | (u32::from(*has_shared && !*shared_gated) << 4),
                             ((hidden as u32) << 8) | (u32::from(sg_fold) * 4),
+                            // routed_scaling_factor on the routed mix (f32 bits).
+                            route_scale.to_bits(),
+                            0,
+                            0,
+                            0,
                         ],
                     );
                     // Per-expert stride in u16 units: q4t is 9 per group flat,
@@ -22872,7 +22967,11 @@ pub fn forward_token_graph(
                                 pass.set_bind_group(0, &bgs, &[]);
                                 pass.dispatch_workgroups(ws, 1, 1);
                             }
-                            let plain = !*sigmoid && bias.is_none() && *has_shared;
+                            // The subgroup select hard-codes the GATED
+                            // shared expert; hy_v3's ungated one stays on
+                            // the tree kernel.
+                            let plain =
+                                !*sigmoid && bias.is_none() && *has_shared && *shared_gated;
                             if let (Some(sgp), true) = (&c.moe_select_sg, plain) {
                                 // Same binding ORDER as the tree kernel's bg_sel —
                                 // but its OWN layout (auto layouts are exclusive).
@@ -23544,6 +23643,10 @@ pub fn forward_batch_graph(
             /// Mixed 2-bit profile: q2tp gate/up over a q4tp down. The
             /// whole-chunk q4tp fast lane must NOT take these bytes.
             gu_q2: bool,
+            sigmoid: bool,
+            bias: Option<wgpu::Buffer>,
+            shared_gated: bool,
+            route_scale: f32,
         },
     }
     struct LW {
@@ -23767,6 +23870,8 @@ pub fn forward_batch_graph(
                 sigmoid,
                 bias,
                 has_shared,
+                shared_gated,
+                route_scale,
             } => {
                 if *top_k >= 16 || *n_exp > 256 || experts.len() != n_exp + 1 {
                     bgraph_refused("site:5979");
@@ -23797,6 +23902,17 @@ pub fn forward_batch_graph(
                     norm_topk: *norm_topk,
                     q4tp: *q4tp,
                     gu_q2: *gu_q2,
+                    sigmoid: *sigmoid,
+                    bias: bias.map(|b| {
+                        c.device
+                            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                label: Some("bmoe-sel-bias"),
+                                contents: bytemuck::cast_slice(b),
+                                usage: wgpu::BufferUsages::STORAGE,
+                            })
+                    }),
+                    shared_gated: *shared_gated,
+                    route_scale: *route_scale,
                 }
             }
         };
@@ -24295,8 +24411,11 @@ pub fn forward_batch_graph(
             pass.set_bind_group(0, b, &[]);
             pass.dispatch_workgroups(g, 1, 1);
         };
-    let flags = |qn: bool, kn: bool| {
-        (if qn { 2u32 } else { 0 }) | (if kn { 4 } else { 0 }) | (if gemma { 8 } else { 0 })
+    let flags = |qn: bool, kn: bool, late: bool| {
+        (if qn { 2u32 } else { 0 })
+            | (if kn { 4 } else { 0 })
+            | (if gemma { 8 } else { 0 })
+            | (if late { 32 } else { 0 })
     };
     let rms_u = unif(&[hidden as u32, if gemma { 1 } else { 0 }, eps.to_bits(), 0]);
     let silu_u = unif(&[(k * inter) as u32, 0, 0, 0]);
@@ -24702,6 +24821,7 @@ pub fn forward_batch_graph(
                 crate::gpu::GraphAttn::Full {
                     q_norm,
                     k_norm,
+                    late_qk_norm,
                     output_gate,
                     ..
                 },
@@ -24788,7 +24908,7 @@ pub fn forward_batch_graph(
                                 hd as u32,
                                 rd as u32,
                                 p as u32,
-                                flags(q_norm.is_some(), k_norm.is_some())
+                                flags(q_norm.is_some(), k_norm.is_some(), *late_qk_norm)
                                     | if *output_gate { 1 } else { 0 },
                                 eps.to_bits(),
                                 i as u32,
@@ -24880,7 +25000,7 @@ pub fn forward_batch_graph(
                                 hd as u32,
                                 rd as u32,
                                 p as u32,
-                                flags(q_norm.is_some(), k_norm.is_some()) | gate_flag,
+                                flags(q_norm.is_some(), k_norm.is_some(), *late_qk_norm) | gate_flag,
                                 eps.to_bits(),
                                 i as u32,
                             ],
@@ -25407,9 +25527,21 @@ pub fn forward_batch_graph(
                 norm_topk,
                 q4tp,
                 gu_q2,
+                sigmoid,
+                bias,
+                shared_gated,
+                route_scale,
             } => {
                 let (mlogit, mslog, msel, mwt, mact) = moe_bufs.as_ref().unwrap();
                 let mut continue_ffn = true;
+                let bias_buf = bias.clone().unwrap_or_else(|| {
+                    c.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("bmoe-sel-bias0"),
+                            contents: &[0u8; 4],
+                            usage: wgpu::BufferUsages::STORAGE,
+                        })
+                });
                 let slots = *top_k + 1;
                 let mat16 = |rows: usize, cols: usize| -> u32 {
                     let n = if *q4tp {
@@ -25424,13 +25556,24 @@ pub fn forward_batch_graph(
                     (n / 2) as u32
                 };
                 let sg_fold = sgate.kind == 4;
-                let sel_u = uniform_u32x4(
+                // Same flags word as the token graph's select kernel (the
+                // batch shares the layer's ungated-shared / sigmoid / bias
+                // routing; the shared slot is always present here).
+                let sel_u = uniform_u32x8(
                     c,
                     [
                         *n_exp as u32,
                         *top_k as u32,
-                        *norm_topk as u32,
+                        u32::from(*norm_topk)
+                            | (u32::from(*sigmoid) << 1)
+                            | (u32::from(bias.is_some()) << 2)
+                            | (1u32 << 3)
+                            | (u32::from(!*shared_gated) << 4),
                         ((hidden as u32) << 8) | (u32::from(sg_fold) * 4),
+                        route_scale.to_bits(),
+                        0,
+                        0,
+                        0,
                     ],
                 );
                 // Gate/up stride follows the GU dtype: the mixed profile
@@ -25525,7 +25668,7 @@ pub fn forward_batch_graph(
                     }
                     let bg_sel = bg(
                         &c.layout_moe_sel_b,
-                        &[mlogit, &n1, msel, mwt, &sel_u, &sgate.buf],
+                        &[mlogit, &n1, msel, mwt, &sel_u, &sgate.buf, &bias_buf],
                     );
                     let bg_gu = bg(
                         &c.layout_moe_gu_b,
@@ -25550,7 +25693,7 @@ pub fn forward_batch_graph(
                         cp(&mut enc, &n1, i * hidden, &row_in, hidden);
                         let bg_sel = bg(
                             &c.layout_moe_sel,
-                            &[mlogit, mslog, msel, mwt, &sel_u, &sgate.buf, &row_in],
+                            &[mlogit, mslog, msel, mwt, &sel_u, &sgate.buf, &row_in, &bias_buf],
                         );
                         let bg_gu = bg(l_gu, &[gate_all, up_all, &row_in, msel, mact, &gu_u]);
                         let bg_dn = bg(l_dn, &[down_all, mact, msel, mwt, &row_out, &dn_u]);

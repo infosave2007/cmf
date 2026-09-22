@@ -658,6 +658,9 @@ pub struct QwenAttnCfg<'a> {
     /// Scale-less RMS normalization of each V head before it enters
     /// the cache (Gemma-4).
     pub v_norm: bool,
+    /// HunYuan dense: the per-head q/k RMSNorm runs AFTER RoPE
+    /// (`ModelArch::qk_norm_after_rope`). False = norm, then rotate.
+    pub qk_norm_after_rope: bool,
     /// Norm-weight semantics for qk-norm (same as the layer norms).
     pub norm_style: cortiq_core::NormStyle,
     /// Qwen2-family q/k/v projection biases (added after the matvecs).
@@ -831,6 +834,59 @@ pub(crate) fn finish_projection_debug(
     (p.q.clone(), p.gate.clone(), p.k.clone(), p.v.clone())
 }
 
+/// Per-head qk-norm and partial RoPE in the architecture's order. Qwen3
+/// (and every family before HunYuan) norms, then rotates; HunYuan dense
+/// rotates, then norms — `cfg.qk_norm_after_rope`. The V norm (Gemma-4)
+/// is independent of both and stays with the caller.
+pub(crate) fn qk_norm_and_rope(
+    cfg: &QwenAttnCfg,
+    q: &mut [f32],
+    k: &mut [f32],
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    position: usize,
+) {
+    let rd = cfg.rotary_dim.min(hd);
+    let norm = |q: &mut [f32], k: &mut [f32]| {
+        if let Some(qw) = cfg.q_norm {
+            for h in 0..nh {
+                rmsnorm_head(&mut q[h * hd..h * hd + hd], qw, cfg.rms_eps, cfg.norm_style);
+            }
+        }
+        if let Some(kw) = cfg.k_norm {
+            for g in 0..nkv {
+                rmsnorm_head(&mut k[g * hd..g * hd + hd], kw, cfg.rms_eps, cfg.norm_style);
+            }
+        }
+    };
+    let rope = |q: &mut [f32], k: &mut [f32]| {
+        for h in 0..nh {
+            rope_rotate_scaled(
+                &mut q[h * hd..h * hd + rd],
+                position,
+                cfg.inv_freq,
+                cfg.rope_scale,
+            );
+        }
+        for g in 0..nkv {
+            rope_rotate_scaled(
+                &mut k[g * hd..g * hd + rd],
+                position,
+                cfg.inv_freq,
+                cfg.rope_scale,
+            );
+        }
+    };
+    if cfg.qk_norm_after_rope {
+        rope(q, k);
+        norm(q, k);
+    } else {
+        norm(q, k);
+        rope(q, k);
+    }
+}
+
 fn finish_projection(
     mut q_raw: Vec<f32>,
     mut k: Vec<f32>,
@@ -867,41 +923,14 @@ fn finish_projection(
         (q_raw, Vec::new())
     };
 
-    // qk-norm before RoPE.
-    if let Some(qw) = cfg.q_norm {
-        for h in 0..nh {
-            rmsnorm_head(&mut q[h * hd..h * hd + hd], qw, cfg.rms_eps, cfg.norm_style);
-        }
-    }
-    if let Some(kw) = cfg.k_norm {
-        for g in 0..nkv {
-            rmsnorm_head(&mut k[g * hd..g * hd + hd], kw, cfg.rms_eps, cfg.norm_style);
-        }
-    }
     if cfg.v_norm {
         for g in 0..nkv {
             vnorm_head(&mut v[g * hd..g * hd + hd], cfg.rms_eps);
         }
     }
-
-    // Partial RoPE: rotate only the first rotary_dim dims of each head.
-    let rd = cfg.rotary_dim.min(hd);
-    for h in 0..nh {
-        rope_rotate_scaled(
-            &mut q[h * hd..h * hd + rd],
-            position,
-            cfg.inv_freq,
-            cfg.rope_scale,
-        );
-    }
-    for g in 0..nkv {
-        rope_rotate_scaled(
-            &mut k[g * hd..g * hd + rd],
-            position,
-            cfg.inv_freq,
-            cfg.rope_scale,
-        );
-    }
+    // qk-norm and partial RoPE (first rotary_dim dims of each head), in
+    // the architecture's order.
+    qk_norm_and_rope(cfg, &mut q, &mut k, nh, nkv, hd, position);
     Projected { q, gate, k, v }
 }
 
@@ -1226,7 +1255,6 @@ pub fn qwen_attention_batch(
     } else {
         Vec::new()
     };
-    let rd = cfg.rotary_dim.min(hd);
     for bi in 0..b {
         let pos = cfg.position + bi;
         let q_raw = &mut q_all[bi * qrows..(bi + 1) * qrows];
@@ -1260,42 +1288,12 @@ pub fn qwen_attention_batch(
         if !cfg.output_gate {
             q.copy_from_slice(&q_raw[..nh * hd]);
         }
-        if let Some(qw) = cfg.q_norm {
-            for hh in 0..nh {
-                rmsnorm_head(
-                    &mut q[hh * hd..hh * hd + hd],
-                    qw,
-                    cfg.rms_eps,
-                    cfg.norm_style,
-                );
-            }
-        }
-        if let Some(kw) = cfg.k_norm {
-            for g in 0..nkv {
-                rmsnorm_head(&mut k[g * hd..g * hd + hd], kw, cfg.rms_eps, cfg.norm_style);
-            }
-        }
         if cfg.v_norm {
             for g in 0..nkv {
                 vnorm_head(&mut v[g * hd..g * hd + hd], cfg.rms_eps);
             }
         }
-        for hh in 0..nh {
-            rope_rotate_scaled(
-                &mut q[hh * hd..hh * hd + rd],
-                pos,
-                cfg.inv_freq,
-                cfg.rope_scale,
-            );
-        }
-        for g in 0..nkv {
-            rope_rotate_scaled(
-                &mut k[g * hd..g * hd + rd],
-                pos,
-                cfg.inv_freq,
-                cfg.rope_scale,
-            );
-        }
+        qk_norm_and_rope(cfg, &mut q, k, nh, nkv, hd, pos);
 
         cache.o1_push_q(&q);
         cache.append(k, v, &[]);
@@ -1582,33 +1580,7 @@ pub fn qwen_attention_pair(
         } else {
             (q_raw, Vec::new())
         };
-        if let Some(qw) = cfg.q_norm {
-            for h in 0..nh {
-                rmsnorm_head(&mut q[h * hd..h * hd + hd], qw, cfg.rms_eps, cfg.norm_style);
-            }
-        }
-        if let Some(kw) = cfg.k_norm {
-            for g in 0..nkv {
-                rmsnorm_head(&mut k[g * hd..g * hd + hd], kw, cfg.rms_eps, cfg.norm_style);
-            }
-        }
-        let rd = cfg.rotary_dim.min(hd);
-        for h in 0..nh {
-            rope_rotate_scaled(
-                &mut q[h * hd..h * hd + rd],
-                pos,
-                cfg.inv_freq,
-                cfg.rope_scale,
-            );
-        }
-        for g in 0..nkv {
-            rope_rotate_scaled(
-                &mut k[g * hd..g * hd + rd],
-                pos,
-                cfg.inv_freq,
-                cfg.rope_scale,
-            );
-        }
+        qk_norm_and_rope(cfg, &mut q, k, nh, nkv, hd, pos);
         let _ = &mut gate;
         (q, gate)
     };
@@ -1722,6 +1694,7 @@ mod tests {
             softcap: 0.0,
             window: None,
             v_norm: false,
+            qk_norm_after_rope: false,
             q_norm: None,
             k_norm: None,
             output_gate: false,
@@ -1771,6 +1744,7 @@ mod tests {
             softcap: 0.0,
             window: None,
             v_norm: true,
+            qk_norm_after_rope: false,
             q_norm: None,
             k_norm: None,
             output_gate: false,
@@ -1832,6 +1806,7 @@ mod tests {
             softcap: 0.0,
             window: None,
             v_norm: false,
+            qk_norm_after_rope: false,
             norm_style: cortiq_core::NormStyle::Qwen,
             bias: None,
             pool: None,
@@ -2005,6 +1980,110 @@ mod tests {
         );
         for (a, b) in dense.iter().zip(&masked) {
             assert_eq!(a, b, "full mask must be bit-identical to dense");
+        }
+    }
+}
+
+/// HunYuan dense applies the per-head q/k RMSNorm AFTER RoPE. A rotation
+/// keeps a head's RMS, so the two orders differ exactly by where the norm
+/// WEIGHTS land — which is why the flag exists instead of a weight fold.
+#[cfg(test)]
+mod qk_norm_order_tests {
+    use super::*;
+
+    fn cfg<'a>(
+        inv: &'a [f32],
+        qw: &'a [f32],
+        kw: &'a [f32],
+        late: bool,
+        hd: usize,
+    ) -> QwenAttnCfg<'a> {
+        QwenAttnCfg {
+            num_heads: 2,
+            num_kv_heads: 1,
+            head_dim: hd,
+            hidden_size: 4 * hd,
+            position: 7,
+            inv_freq: inv,
+            rotary_dim: hd,
+            scale: 1.0 / (hd as f32).sqrt(),
+            softcap: 0.0,
+            window: None,
+            v_norm: false,
+            qk_norm_after_rope: late,
+            q_norm: Some(qw),
+            k_norm: Some(kw),
+            output_gate: false,
+            softplus_gate: None,
+            rope_scale: 1.0,
+            bias: None,
+            rms_eps: 1e-6,
+            norm_style: cortiq_core::NormStyle::Qwen,
+            pool: None,
+        }
+    }
+
+    /// Reference for the late order, written independently of the helper:
+    /// rotate every head, then x̂·w with the RMS of the ROTATED head.
+    fn late_reference(x: &[f32], w: &[f32], hd: usize, pos: usize, inv: &[f32]) -> Vec<f32> {
+        let mut y = x.to_vec();
+        for h in 0..x.len() / hd {
+            let head = &mut y[h * hd..(h + 1) * hd];
+            rope_rotate(head, pos, inv);
+            let ss: f64 = head.iter().map(|&v| (v as f64) * (v as f64)).sum();
+            let inv_rms = 1.0 / (ss / hd as f64 + 1e-6).sqrt();
+            for (d, v) in head.iter_mut().enumerate() {
+                *v = ((*v as f64) * inv_rms) as f32 * w[d];
+            }
+        }
+        y
+    }
+
+    #[test]
+    fn late_order_matches_reference_and_differs_from_early() {
+        let hd = 16;
+        let inv = rope_inv_freq(hd, 10_000.0);
+        // Non-pair-symmetric norm weights: the only case where the order matters.
+        let qw: Vec<f32> = (0..hd).map(|d| 0.5 + 0.1 * d as f32).collect();
+        let kw: Vec<f32> = (0..hd).map(|d| 1.5 - 0.05 * d as f32).collect();
+        let q0: Vec<f32> = (0..2 * hd).map(|i| ((i * 7) % 11) as f32 * 0.3 - 1.0).collect();
+        let k0: Vec<f32> = (0..hd).map(|i| ((i * 5) % 13) as f32 * 0.2 - 1.2).collect();
+
+        let (mut q_late, mut k_late) = (q0.clone(), k0.clone());
+        let c_late = cfg(&inv, &qw, &kw, true, hd);
+        qk_norm_and_rope(&c_late, &mut q_late, &mut k_late, 2, 1, hd, 7);
+        let q_ref = late_reference(&q0, &qw, hd, 7, &inv);
+        let k_ref = late_reference(&k0, &kw, hd, 7, &inv);
+        for (a, b) in q_late.iter().zip(&q_ref) {
+            assert!((a - b).abs() < 1e-5, "q late: {a} vs {b}");
+        }
+        for (a, b) in k_late.iter().zip(&k_ref) {
+            assert!((a - b).abs() < 1e-5, "k late: {a} vs {b}");
+        }
+
+        let (mut q_early, mut k_early) = (q0.clone(), k0.clone());
+        let c_early = cfg(&inv, &qw, &kw, false, hd);
+        qk_norm_and_rope(&c_early, &mut q_early, &mut k_early, 2, 1, hd, 7);
+        let dq: f32 = q_early.iter().zip(&q_late).map(|(a, b)| (a - b).abs()).sum();
+        assert!(dq > 1e-2, "orders must differ with non-symmetric weights ({dq})");
+    }
+
+    #[test]
+    fn orders_coincide_for_pair_symmetric_weights() {
+        // w_i == w_{i+hd/2}: the rotation commutes with the diagonal scale,
+        // so both orders must agree to float precision.
+        let hd = 8;
+        let inv = rope_inv_freq(hd, 10_000.0);
+        let half: Vec<f32> = vec![0.7, 1.3, 0.9, 1.1];
+        let w: Vec<f32> = half.iter().chain(&half).copied().collect();
+        let q0: Vec<f32> = (0..2 * hd).map(|i| (i as f32 * 0.37).sin()).collect();
+        let k0: Vec<f32> = (0..hd).map(|i| (i as f32 * 0.53).cos()).collect();
+        let (mut qa, mut ka) = (q0.clone(), k0.clone());
+        let (mut qb, mut kb) = (q0.clone(), k0.clone());
+        qk_norm_and_rope(&cfg(&inv, &w, &w, true, hd), &mut qa, &mut ka, 2, 1, hd, 7);
+        qk_norm_and_rope(&cfg(&inv, &w, &w, false, hd), &mut qb, &mut kb, 2, 1, hd, 7);
+        for (a, b) in qa.iter().zip(&qb).chain(ka.iter().zip(&kb)) {
+            assert!((a - b).abs() < 1e-5, "{a} vs {b}");
         }
     }
 }

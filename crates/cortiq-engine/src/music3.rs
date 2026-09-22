@@ -1161,6 +1161,7 @@ impl Music3Ar {
                         wo,
                         q_norm: Some(&blk.qn.w),
                         k_norm: Some(&blk.kn.w),
+                        late_qk_norm: false,
                         bias: None,
                         output_gate: false,
                         cpu_k: &cache[li][bi].k,

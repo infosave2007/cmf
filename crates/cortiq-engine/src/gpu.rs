@@ -1304,6 +1304,7 @@ pub fn attn_dropin(
     wo_idx: usize,
     q_norm: Option<&[f32]>,
     k_norm: Option<&[f32]>,
+    late_qk_norm: bool,
     invf: &[f32],
     nh: usize,
     nkv: usize,
@@ -1321,8 +1322,8 @@ pub fn attn_dropin(
     match backend() {
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::attn_dropin_gpu(
-            model, kv_id, layer, normed, wq_idx, wk_idx, wv_idx, wo_idx, q_norm, k_norm, invf, nh,
-            nkv, hd, rd, hidden, pos, cap, gemma, eps, cpu_k, cpu_v, out,
+            model, kv_id, layer, normed, wq_idx, wk_idx, wv_idx, wo_idx, q_norm, k_norm,
+            late_qk_norm, invf, nh, nkv, hd, rd, hidden, pos, cap, gemma, eps, cpu_k, cpu_v, out,
         ),
         #[allow(unused_variables)]
         _ => false,
@@ -1361,6 +1362,8 @@ pub enum GraphAttn<'a> {
         wo: GraphW<'a>,
         q_norm: Option<&'a [f32]>,
         k_norm: Option<&'a [f32]>,
+        /// HunYuan dense: q/k norm after RoPE (rope-kernel flag bit 32).
+        late_qk_norm: bool,
         /// (bq, bk, bv) attention biases (Qwen2). None ⇒ no bias.
         bias: Option<(&'a [f32], &'a [f32], &'a [f32])>,
         /// Qwen3.5 gated attention: wq emits 2·nh·hd (q||gate per head), the
@@ -1465,6 +1468,14 @@ pub enum GraphFfn<'a> {
         /// LFM2-MoE has none; the select kernel then leaves slot `top_k`
         /// unwritten and the expert loop runs `top_k` slots, not +1.
         has_shared: bool,
+        /// The shared expert carries a sigmoid gate (Qwen2/3-MoE). `false`
+        /// with `has_shared`: the shared expert enters with weight 1
+        /// (DeepSeek-V3 / HunYuan hy_v3) and `shared_gate` is a stand-in
+        /// the select kernels ignore.
+        shared_gated: bool,
+        /// Multiplier on the routed mixing weights after the optional
+        /// renormalization (`routed_scaling_factor`); 1.0 = none.
+        route_scale: f32,
     },
 }
 

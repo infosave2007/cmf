@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-22
+
+### Added
+- Tencent HunYuan support: the dense family (`hunyuan_v1_dense` — Hy-MT2-1.8B
+  / 7B) and the hy_v3 MoE (Hy-MT2-30B-A3B). The converter maps
+  `query_layernorm` / `key_layernorm`, `mlp.router.gate` and
+  `mlp.shared_mlp` onto the canonical layout, applies the NTK-alpha RoPE
+  base once (`base · alpha^(d/(d−2))`, full native window), reads the
+  sigmoid + expert-bias router with `route_norm` and
+  `router_scaling_factor`, adds `eod_token_id` to the stop set, and skips
+  the duplicated tied `lm_head` of the dense checkpoints.
+- `ModelArch::qk_norm_after_rope`: per-head q/k RMSNorm applied after RoPE
+  (HunYuan dense). Honoured on the CPU path and by the Metal
+  (`attn_rope_qkn`, `attn_rope_qkn_b`, `chunk_rope_kv`) and WGSL
+  (`attn_rope_qkn`) rope kernels via flag bit 32; the default order is
+  unchanged for every other family.
+- `cortiq import-gguf` decodes ggml `STQ1_0` (Tencent AngelSlim sparse
+  ternary, 1.3125 bpw) and carries it over as `q1t` **exactly** — per-group
+  scale, base-3 codes, empty overlay — never through a second quantizer.
+  `--quant q1t` on such a file keeps the non-ternary token table at
+  `q8_2f`. New `--tokenizer-dir DIR` embeds the vendor `tokenizer.json` and
+  chat template verbatim for pre-tokenizers the GGUF reconstruction cannot
+  express (HunYuan splits digits 1–3 and isolates CJK).
+
+- The wgpu whole-token and batch graphs now carry a routed scaling factor
+  (`routed_scaling_factor`, applied to the routed mix only) and an UNGATED
+  shared expert (weight 1), and the batch select kernel learned sigmoid scores
+  with a selection bias. Before, any MoE layer with a scale ≠ 1 or a shared
+  expert without a gate fell to the per-op path whole — Hy-MT2-30B-A3B decoded
+  at 1.2 tok/s (145 submits/token) on an RTX PRO 4000; on the graph it decodes
+  at 53 tok/s with 12 submits/token. Softmax / gated models pass scale 1.0 and
+  the old flag bits, so their kernels change no bit.
+
+### Fixed
+- 0.6.9 regression: `prism::is_inverse_embedding` answered the embedding's
+  name before the Prism header gate, so every non-Prism file whose
+  embedding row is decoded through `row_f32` (any q4t/q4tp/q8_2f embedding)
+  panicked with "Prism tensor without prism_hadamard metadata" on the first
+  token. The header gate now comes first; regression test
+  `tests/prism_guard.rs`.
+
+### Changed
+- The release version is `0.7.0` across the workspace and all internal crate
+  dependency constraints.
+
 ## [0.6.9] - 2026-09-20
 
 ### Added

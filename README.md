@@ -38,6 +38,15 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+## Tencent Hy-MT2 (HunYuan)
+
+Version 0.7.0 adds the HunYuan architectures — the dense `hunyuan_v1_dense`
+(Hy-MT2-1.8B / 7B) and the `hy_v3` MoE (Hy-MT2-30B-A3B) — including the
+family's q/k-norm-after-RoPE attention order and NTK-alpha RoPE base, and an
+exact `import-gguf` path for Tencent's 1.25-bit `STQ1_0` checkpoint into `q1t`.
+Ready files: [infosave/Hy-MT2-cmf](https://huggingface.co/infosave/Hy-MT2-cmf).
+0.7.0 also fixes the 0.6.9 crash on any non-Prism file with a 4-bit embedding.
+
 ## Native Qwen Image Edit
 
 Version 0.6.9 adds the native Qwen-Image-Edit-2509 path and the explicit `q2tp_affine` Prism profile. The ready default is

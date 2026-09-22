@@ -60,6 +60,12 @@ the overlay by `|W|·RMS(x)` — amplitude times activation, not amplitude alone
 It is calibration-driven, not a flag on `convert`: see
 [`docs/Q1T_PTQ.md`](https://github.com/infosave2007/cmf/blob/master/docs/Q1T_PTQ.md).
 
+The other way into `q1t` is a checkpoint that is *already* ternary:
+`cortiq import-gguf` reads llama.cpp's `STQ1_0` (Tencent's 1.25-bit
+sparse-ternary QAT, one zero in every four lanes) and re-encodes each
+32-group exactly — same values, f16 scale, no overlay — at 2.25 bits
+against the GGUF's 1.31. `Hy-MT2-cmf` carries one such file.
+
 ## q1 — only for models trained at one bit
 
 For a BitNet-class checkpoint (Bonsai, and the 1-bit trained families) the

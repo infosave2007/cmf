@@ -131,6 +131,7 @@ fn sparse_ffn_quant_agrees_with_dequant() {
         activation_situ_beta: None,
         activation_situ_linear_beta: None,
         attn_v_norm: false,
+        qk_norm_after_rope: false,
         num_loops: 1,
         kda_gate_lower_bound: None,
         g3n: None,

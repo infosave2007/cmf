@@ -464,7 +464,7 @@ enum Commands {
         #[arg(long, default_value = "cortiq-signing.key")]
         key: String,
     },
-    /// Import a GGUF model to .cmf — native Rust (LLM GGUFs plus the Qwen Image diffusion transformer; F32/F16/BF16/Q4_0..Q6_K + K-quants)
+    /// Import a GGUF model to .cmf — native Rust (LLM GGUFs plus the Qwen Image diffusion transformer; F32/F16/BF16/Q4_0..Q6_K + K-quants; STQ1_0 ternary → exact q1t)
     ImportGguf {
         /// A local .gguf file, an HF repo id (owner/name — best .gguf auto-picked), or owner/name/file.gguf
         gguf: String,
@@ -477,6 +477,12 @@ enum Commands {
         /// Hugging Face token for gated/private GGUF repos
         #[arg(long)]
         hf_token: Option<String>,
+        /// Directory with the vendor's HF tokenizer.json (+ chat_template.jinja /
+        /// tokenizer_config.json) to embed verbatim instead of the tokenizer
+        /// reconstructed from ggml metadata — needed when the pre-tokenizer is
+        /// not plain byte-level BPE (HunYuan / Hy-MT2)
+        #[arg(long)]
+        tokenizer_dir: Option<String>,
     },
     /// 1-bit PTQ via error-feedback transfer (GPTQ). Calibrates each
     /// linear's input Hessian on a corpus, then quantizes it to `q1s`:
@@ -1965,12 +1971,14 @@ async fn main() -> anyhow::Result<()> {
             output,
             quant,
             hf_token,
+            tokenizer_dir,
         } => {
             gguf::run_import_gguf(
                 &gguf,
                 &quant,
                 &output,
                 hf_token.as_deref(),
+                tokenizer_dir.as_deref(),
                 progress_reporter("importing"),
             )?;
             println!("✓ wrote {output}");

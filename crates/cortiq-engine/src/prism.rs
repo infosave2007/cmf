@@ -280,11 +280,16 @@ pub fn inverse_embedding(model: &CmfModel, x: &mut [f32]) {
 /// canonical runtime name.  The embedding is the only inverse matrix in the
 /// Prism checkpoint; all other projections use `forward` activations.
 pub fn is_inverse_embedding(model: &CmfModel, name: &str) -> bool {
-    if name == "model.embed_tokens.weight" {
-        return true;
-    }
+    // The header gate comes FIRST: without a Prism descriptor no tensor is
+    // an inverse matrix, the embedding included. Checking the name before
+    // the header sent every non-Prism model whose embedding row is decoded
+    // through `row_f32` into `inverse_embedding`, which panics on the
+    // missing descriptor (HunYuan q4tp was the first to trip it).
     if model.header.arch.prism_hadamard.is_none() {
         return false;
+    }
+    if name == "model.embed_tokens.weight" {
+        return true;
     }
     descriptor_for(model).inverse_names.contains(name)
 }

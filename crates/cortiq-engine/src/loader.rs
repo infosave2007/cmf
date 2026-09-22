@@ -1428,6 +1428,7 @@ impl Pipeline {
             pipeline.inv_freq = std::sync::Arc::new(f);
         }
         pipeline.attn_v_norm = arch.attn_v_norm;
+        pipeline.qk_norm_after_rope = arch.qk_norm_after_rope;
         pipeline.final_softcap = arch.final_logit_softcapping.map(|c| c as f32);
         // Cortiq Embryo hierarchical head: cluster matrix → two-level log-probs.
         if let Some(ncl) = arch.head_clusters {

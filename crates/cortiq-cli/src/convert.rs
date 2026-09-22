@@ -617,6 +617,25 @@ pub(crate) fn canon_name(raw: &str) -> Option<String> {
     if raw.ends_with(".mlp.experts.e_score_correction_bias") {
         return Some(raw.replace(".mlp.experts.e_score_correction_bias", ".mlp.expert_bias"));
     }
+    // HunYuan dense (Hy-MT2-1.8B/7B, `hunyuan_v1_dense`): the per-head q/k
+    // norms are spelled `query_layernorm` / `key_layernorm`; the loader
+    // reads `q_norm` / `k_norm`. The ORDER (norm after RoPE) rides in the
+    // header flag `qk_norm_after_rope`, not in the names.
+    if raw.contains(".self_attn.query_layernorm.") || raw.contains(".self_attn.key_layernorm.") {
+        return Some(
+            raw.replace(".self_attn.query_layernorm.", ".self_attn.q_norm.")
+                .replace(".self_attn.key_layernorm.", ".self_attn.k_norm."),
+        );
+    }
+    // HunYuan hy_v3 MoE (Hy-MT2-30B-A3B): the router is `mlp.router.gate`,
+    // the always-on shared expert `mlp.shared_mlp`; `mlp.expert_bias` (the
+    // noaux_tc selection bias) is already the canonical spelling.
+    if raw.contains(".mlp.router.gate.") || raw.contains(".mlp.shared_mlp.") {
+        return Some(
+            raw.replace(".mlp.router.gate.", ".mlp.gate.")
+                .replace(".mlp.shared_mlp.", ".mlp.shared_expert."),
+        );
+    }
     Some(lfm2_canon(raw))
 }
 
@@ -1646,6 +1665,60 @@ fn encode_q1s(vals: &[f32], out_dim: usize, in_dim: usize, keep_frac: f32) -> Ve
         }
     }
     out
+}
+
+/// Exact ternary re-encode for weights that ALREADY sit on `{−s, 0, +s}`
+/// within every 32-group — a ternary-trained checkpoint such as the STQ1_0
+/// GGUF of Hy-MT2-1.8B (AngelSlim 1.25-bit). Per group: scale = the
+/// group's max |w| (an f16 in the source, so it survives the round trip),
+/// base-3 codes, and an EMPTY outlier overlay. `dequant_q1t` reproduces
+/// the input bit for bit; no calibration, no requantization.
+pub(crate) fn encode_q1t_exact(
+    vals: &[f32],
+    out_dim: usize,
+    in_dim: usize,
+) -> anyhow::Result<Vec<u8>> {
+    use cortiq_core::quant::{GROUP_SIZE, Q1T_TILE, q1t_pack};
+    anyhow::ensure!(
+        vals.len() == out_dim * in_dim,
+        "q1t exact: {} values != {out_dim}×{in_dim}",
+        vals.len()
+    );
+    anyhow::ensure!(
+        in_dim % GROUP_SIZE == 0,
+        "q1t exact: in_dim {in_dim} is not a multiple of {GROUP_SIZE}"
+    );
+    anyhow::ensure!(
+        in_dim <= u16::MAX as usize + 1,
+        "q1t overlay: in_dim {in_dim} exceeds u16"
+    );
+    let n_groups = vals.len() / GROUP_SIZE;
+    let mut out = Vec::with_capacity(n_groups * Q1T_TILE + (out_dim + 1) * 4);
+    for g in 0..n_groups {
+        let grp = &vals[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
+        let s = grp.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let s16 = f32_to_f16(s);
+        let s_rt = f16_to_f32(s16);
+        let mut codes = [0u8; 7];
+        for (k, &v) in grp.iter().enumerate() {
+            let code = if v == 0.0 {
+                0
+            } else {
+                anyhow::ensure!(
+                    (v.abs() - s_rt).abs() <= s_rt * 1e-3,
+                    "q1t exact: group {g} is not ternary (|w| {} vs scale {s_rt})",
+                    v.abs()
+                );
+                if v > 0.0 { 1 } else { 2 }
+            };
+            q1t_pack(&mut codes, k, code);
+        }
+        out.extend_from_slice(&s16.to_le_bytes());
+        out.extend_from_slice(&codes);
+    }
+    // Empty per-row overlay: row_ptr[out_dim + 1], all zero.
+    out.resize(out.len() + (out_dim + 1) * 4, 0);
+    Ok(out)
 }
 
 pub(crate) fn encode_q8_2f(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8> {
@@ -2769,6 +2842,32 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         .unwrap_or("unknown")
         .to_string();
     let is_prism = model_type == "prism_hadamard_qwen35";
+    // Tencent HunYuan: the dense family (Hy-MT2-1.8B / 7B, `hunyuan_v1_dense`)
+    // and the hy_v3 MoE (Hy-MT2-30B-A3B). Dense: Llama block + per-head qk
+    // RMSNorm applied AFTER RoPE + NTK-alpha rope base. MoE: sigmoid router
+    // with a selection bias, renormalized top-k × router_scaling_factor, one
+    // shared expert, first layer dense.
+    let is_hunyuan_dense = model_type == "hunyuan_v1_dense";
+    if is_hunyuan_dense {
+        anyhow::ensure!(
+            !tc.get("use_cla").and_then(|v| v.as_bool()).unwrap_or(false),
+            "hunyuan_v1_dense: cross-layer attention (use_cla) is not supported"
+        );
+        anyhow::ensure!(
+            tc.get("norm_type").and_then(|v| v.as_str()).unwrap_or("rms") == "rms",
+            "hunyuan_v1_dense: only RMS norms are supported"
+        );
+        anyhow::ensure!(
+            !tc.get("add_classification_head")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            "hunyuan_v1_dense: classification heads are not supported"
+        );
+        anyhow::ensure!(
+            tc.get("use_qk_norm").and_then(|v| v.as_bool()).unwrap_or(true),
+            "hunyuan_v1_dense: use_qk_norm=false is not supported"
+        );
+    }
     let is_dsv4 = model_type == "deepseek_v4";
     let is_dsv41 = model_type == "deepseek_v41";
     let tc_model_type = tc.get("model_type").and_then(|v| v.as_str()).unwrap_or("");
@@ -2982,6 +3081,8 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
                     .and_then(|v| v.as_bool())
                     // Kimi: moe_renormalize is the same switch.
                     .or_else(|| tc.get("moe_renormalize").and_then(|v| v.as_bool()))
+                    // HunYuan hy_v3: route_norm.
+                    .or_else(|| tc.get("route_norm").and_then(|v| v.as_bool()))
                     .unwrap_or(ntp_default),
                 shared_expert_intermediate_size: cfg_usize(tc, "shared_expert_intermediate_size")
                     .or_else(|| {
@@ -3000,12 +3101,20 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
                     || tc
                         .get("moe_router_activation_func")
                         .and_then(|v| v.as_str())
-                        == Some("sigmoid"),
+                        == Some("sigmoid")
+                    // HunYuan hy_v3: sigmoid scores, selection by score +
+                    // expert_bias, weights from the unbiased scores.
+                    || tc
+                        .get("moe_router_use_sigmoid")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
                 // A stored scale of 1.0 is the no-op default; only non-trivial
                 // scales need to ride in the header.
                 routed_scaling_factor: tc
                     .get("routed_scaling_factor")
                     .or_else(|| tc.get("moe_routed_scaling_factor"))
+                    // HunYuan hy_v3 spells it router_scaling_factor.
+                    .or_else(|| tc.get("router_scaling_factor"))
                     .and_then(|v| v.as_f64())
                     .map(|v| v as f32)
                     .filter(|&v| (v - 1.0).abs() > 1e-9),
@@ -3252,12 +3361,32 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
     // declared max honestly instead of serving stretched positions.
     let mut max_pos =
         cfg_usize(tc, "max_position_embeddings").unwrap_or(if is_kimi { 1_048_576 } else { 32768 });
+    let mut ntk_theta: Option<f64> = None;
     if let Some(rs) = tc.get("rope_scaling").filter(|v| !v.is_null()) {
         let kind = rs
             .get("type")
             .or_else(|| rs.get("rope_type"))
             .and_then(|v| v.as_str());
+        // HunYuan "dynamic" + alpha is NTK-alpha: ONE rescaled base,
+        // base' = base · alpha^(d/(d−2)), fixed for every position — the
+        // reference rotary module computes exactly this and never
+        // rescales at inference. (Hy-MT2: 10000 · 1000^(128/126) =
+        // 11 158 840, the value llama.cpp writes as rope.freq_base.)
+        let ntk_alpha = rs
+            .get("alpha")
+            .and_then(|v| v.as_f64())
+            .filter(|&a| a > 0.0 && (a - 1.0).abs() > 1e-12);
         match kind {
+            Some("dynamic") if ntk_alpha.is_some() => {
+                let alpha = ntk_alpha.unwrap();
+                let d = head_dim as f64;
+                let theta = rope_theta * alpha.powf(d / (d - 2.0));
+                eprintln!(
+                    "  rope: NTK-alpha {alpha} → base {theta:.1} (head_dim {head_dim}); \
+                     the full {max_pos}-token window is native"
+                );
+                ntk_theta = Some(theta);
+            }
             Some("longrope") | Some("su") | Some("yarn") | Some("linear") | Some("dynamic")
             | Some("mrope") => {
                 let orig = cfg_usize(tc, "original_max_position_embeddings")
@@ -3318,7 +3447,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
             .and_then(|v| v.as_f64())
             .unwrap_or(1e-6),
         norm_style,
-        rope_theta,
+        rope_theta: ntk_theta.unwrap_or(rope_theta),
         // Gemma ties embeddings by default and its configs omit the key.
         tie_word_embeddings: config
             .get("tie_word_embeddings")
@@ -3456,6 +3585,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
             .get("activation_situ_linear_beta")
             .and_then(|v| v.as_f64()),
         attn_v_norm: is_gemma4,
+        qk_norm_after_rope: is_hunyuan_dense,
         rope_freq_factors,
         logit_multiplier,
         g3n: g3n_cfg,
@@ -4662,6 +4792,16 @@ pub fn run_convert_multi(
             let Some(name) = canon_name_for_arch(&arch, &m.name) else {
                 continue;
             };
+            // HunYuan dense ships the tied `lm_head.weight` as a second copy
+            // of the embedding; the loader reads the embedding when the
+            // header says tied, so the copy would only be dead bytes.
+            if arch.arch_name == "hunyuan_v1_dense"
+                && arch.tie_word_embeddings
+                && name == "lm_head.weight"
+            {
+                tracing::info!("hunyuan_v1_dense: tied lm_head.weight not written (embedding serves)");
+                continue;
+            }
             if arch.qwen4_exp.is_some()
                 && (name.starts_with("model.mtp.")
                     || name.ends_with("ple_embedding.layer_multipliers")
@@ -5712,7 +5852,17 @@ pub fn run_convert_multi(
         });
     let bundle = TokenizerBundle {
         chat_template,
-        eos_token_ids: eos_ids(&gen_cfg, &config),
+        eos_token_ids: {
+            let mut e = eos_ids(&gen_cfg, &config);
+            // HunYuan hy_v3 declares a separate end-of-document id; a
+            // generation that emits it is finished too.
+            if let Some(eod) = config.get("eod_token_id").and_then(|v| v.as_u64()) {
+                if !e.contains(&(eod as u32)) {
+                    e.push(eod as u32);
+                }
+            }
+            e
+        },
         bos_token_id: config
             .get("bos_token_id")
             .and_then(|v| v.as_u64())
@@ -8373,5 +8523,137 @@ pub(crate) mod tests {
             }
         }
         assert_eq!(flat, want);
+    }
+}
+
+#[cfg(test)]
+mod hunyuan_tests {
+    use super::*;
+    use cortiq_core::quant::{GROUP_SIZE, Q1T_TILE, dequant_q1t};
+
+    #[test]
+    fn hunyuan_dense_config_builds_ntk_alpha_and_late_qk_norm() {
+        let cfg: serde_json::Value = serde_json::from_str(
+            r#"{"architectures":["HunYuanDenseV1ForCausalLM"],"model_type":"hunyuan_v1_dense",
+                "hidden_size":2048,"intermediate_size":6144,"num_hidden_layers":32,
+                "num_attention_heads":16,"num_key_value_heads":4,"head_dim":128,
+                "attention_head_dim":128,"vocab_size":120818,"rms_norm_eps":1e-5,
+                "rope_theta":10000.0,"max_position_embeddings":262144,
+                "rope_scaling":{"alpha":1000.0,"beta_fast":32,"beta_slow":1,"factor":1.0,
+                                "mscale":1.0,"mscale_all_dim":1.0,"type":"dynamic"},
+                "tie_word_embeddings":true,"use_qk_norm":true,"use_cla":false,
+                "norm_type":"rms","hidden_act":"silu","bos_token_id":120000,
+                "eos_token_id":120020,"pad_token_id":120002}"#,
+        )
+        .unwrap();
+        let arch = build_arch(&cfg).unwrap();
+        assert_eq!(arch.arch_name, "hunyuan_v1_dense");
+        assert!(arch.qk_norm_after_rope, "HunYuan dense norms after RoPE");
+        // 10000 · 1000^(128/126) — the base llama.cpp writes as rope.freq_base.
+        assert!(
+            (arch.rope_theta - 11_158_840.0).abs() / 11_158_840.0 < 1e-5,
+            "rope_theta {}",
+            arch.rope_theta
+        );
+        assert_eq!(arch.max_position_embeddings, 262_144, "no window cap");
+        assert_eq!((arch.head_dim, arch.num_kv_heads, arch.num_attention_heads), (128, 4, 16));
+        assert!(arch.tie_word_embeddings);
+        assert!(arch.moe.is_none());
+        assert_eq!(arch.partial_rotary_factor, 1.0);
+        assert!(arch.yarn.is_none());
+    }
+
+    #[test]
+    fn hunyuan_dense_refuses_cross_layer_attention() {
+        let cfg: serde_json::Value = serde_json::from_str(
+            r#"{"model_type":"hunyuan_v1_dense","hidden_size":64,"intermediate_size":128,
+                "num_hidden_layers":2,"num_attention_heads":4,"num_key_value_heads":2,
+                "head_dim":16,"vocab_size":100,"use_cla":true}"#,
+        )
+        .unwrap();
+        let err = build_arch(&cfg).unwrap_err().to_string();
+        assert!(err.contains("use_cla"), "{err}");
+    }
+
+    #[test]
+    fn hy_v3_moe_config_builds_sigmoid_biased_router() {
+        let cfg: serde_json::Value = serde_json::from_str(
+            r#"{"architectures":["HYV3ForCausalLM"],"model_type":"hy_v3",
+                "hidden_size":2048,"intermediate_size":6912,"num_hidden_layers":48,
+                "num_attention_heads":32,"num_key_value_heads":4,"head_dim":128,
+                "vocab_size":120832,"rms_norm_eps":1e-5,"rope_theta":11158840.0,
+                "max_position_embeddings":262144,"tie_word_embeddings":false,
+                "num_experts":128,"num_experts_per_tok":8,"moe_intermediate_size":768,
+                "expert_hidden_dim":768,"num_shared_experts":1,"first_k_dense_replace":1,
+                "moe_router_enable_expert_bias":true,"moe_router_use_sigmoid":true,
+                "route_norm":true,"router_scaling_factor":2.826,"qk_norm":true,
+                "hidden_act":"silu","bos_token_id":120000,"eos_token_id":120025,
+                "eod_token_id":120026,"pad_token_id":120002}"#,
+        )
+        .unwrap();
+        let arch = build_arch(&cfg).unwrap();
+        assert_eq!(arch.arch_name, "hy_v3");
+        assert!(!arch.qk_norm_after_rope, "hy_v3 keeps the Qwen3 order");
+        assert_eq!(arch.rope_theta, 11_158_840.0);
+        assert_eq!(arch.intermediate_size, 6912, "layer-0 dense FFN width");
+        let moe = arch.moe.as_ref().expect("num_experts → MoE");
+        assert_eq!((moe.num_experts, moe.top_k, moe.moe_intermediate_size), (128, 8, 768));
+        assert!(moe.norm_topk_prob, "route_norm");
+        assert!(moe.router_sigmoid, "moe_router_use_sigmoid");
+        assert_eq!(moe.shared_expert_intermediate_size, Some(768));
+        assert!((moe.routed_scaling_factor.unwrap() - 2.826).abs() < 1e-6);
+        assert!(!moe.router_resonance);
+    }
+
+    #[test]
+    fn hunyuan_tensor_names_land_on_the_canonical_layout() {
+        let m = |s: &str| canon_name(s).unwrap();
+        assert_eq!(
+            m("model.layers.3.self_attn.query_layernorm.weight"),
+            "model.layers.3.self_attn.q_norm.weight"
+        );
+        assert_eq!(
+            m("model.layers.3.self_attn.key_layernorm.weight"),
+            "model.layers.3.self_attn.k_norm.weight"
+        );
+        assert_eq!(
+            m("model.layers.1.mlp.router.gate.weight"),
+            "model.layers.1.mlp.gate.weight"
+        );
+        assert_eq!(
+            m("model.layers.1.mlp.shared_mlp.up_proj.weight"),
+            "model.layers.1.mlp.shared_expert.up_proj.weight"
+        );
+        assert_eq!(m("model.layers.1.mlp.expert_bias"), "model.layers.1.mlp.expert_bias");
+        assert_eq!(
+            m("model.layers.1.mlp.experts.17.down_proj.weight"),
+            "model.layers.1.mlp.experts.17.down_proj.weight"
+        );
+        assert!(force_f32("model.layers.1.mlp.expert_bias"));
+    }
+
+    #[test]
+    fn q1t_exact_reproduces_ternary_weights_bit_for_bit() {
+        let (rows, cols) = (3usize, 96usize);
+        let mut w = vec![0f32; rows * cols];
+        for (g, grp) in w.chunks_mut(GROUP_SIZE).enumerate() {
+            let s = f16_to_f32(f32_to_f16(0.013 * (g as f32 + 1.0)));
+            for (k, v) in grp.iter_mut().enumerate() {
+                *v = match (k * 7 + g) % 3 {
+                    0 => 0.0,
+                    1 => s,
+                    _ => -s,
+                };
+            }
+        }
+        let enc = encode_q1t_exact(&w, rows, cols).unwrap();
+        assert_eq!(enc.len(), (rows * cols / GROUP_SIZE) * Q1T_TILE + (rows + 1) * 4);
+        let mut back = vec![0f32; rows * cols];
+        dequant_q1t(&enc, rows, cols, &mut back);
+        assert_eq!(back, w);
+        // Non-ternary input is refused, never silently rounded.
+        let mut bad = w.clone();
+        bad[5] = 0.5 * bad.iter().find(|v| **v > 0.0).copied().unwrap();
+        assert!(encode_q1t_exact(&bad, rows, cols).is_err());
     }
 }
