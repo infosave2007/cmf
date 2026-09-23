@@ -505,6 +505,167 @@ pub struct VaeDecoder {
     pub latent_channels: usize,
     pub scaling_factor: f32,
     pub shift_factor: f32,
+    /// Process-unique id of this loaded decoder (`VaeChainArgs::key`).
+    uid: u64,
+}
+
+// ── Device-chain view of the decoder (Z-Image WP0, additive) ─────────
+
+/// One conv of the decoder as the device chain sees it: weight
+/// `[oc, ic, k, k]` row-major f32, bias `[oc]`, stride 1, pad k/2.
+#[derive(Clone, Copy)]
+pub struct VaeConvRef<'a> {
+    pub w: &'a [f32],
+    pub b: &'a [f32],
+    pub oc: usize,
+    pub ic: usize,
+    pub k: usize,
+}
+
+/// GroupNorm (eps 1e-6, affine) weight/bias `[c]` over `groups` groups.
+#[derive(Clone, Copy)]
+pub struct VaeNormRef<'a> {
+    pub w: &'a [f32],
+    pub b: &'a [f32],
+    pub groups: usize,
+}
+
+/// One resnet: `x + conv2(silu(norm2(conv1(silu(norm1(x))))))`, with the
+/// skip through the 1×1 `shortcut` when in/out channels differ.
+#[derive(Clone, Copy)]
+pub struct VaeResnetRef<'a> {
+    pub norm1: VaeNormRef<'a>,
+    pub conv1: VaeConvRef<'a>,
+    pub norm2: VaeNormRef<'a>,
+    pub conv2: VaeConvRef<'a>,
+    pub shortcut: Option<VaeConvRef<'a>>,
+}
+
+/// The mid-block single-head spatial attention: GroupNorm, then token-major
+/// q/k/v Linear `[c, c]` (row-major out×in) + bias, softmax(q·kᵀ/√c)·v,
+/// `out` Linear + bias, residual add onto the block input.
+#[derive(Clone, Copy)]
+pub struct VaeAttnRef<'a> {
+    pub norm: VaeNormRef<'a>,
+    pub q: (&'a [f32], &'a [f32]),
+    pub k: (&'a [f32], &'a [f32]),
+    pub v: (&'a [f32], &'a [f32]),
+    pub out: (&'a [f32], &'a [f32]),
+    pub c: usize,
+}
+
+/// One up block: its resnets in order, then (if present) nearest-2×
+/// upsample followed by `upsample` conv.
+pub struct VaeUpRef<'a> {
+    pub resnets: Vec<VaeResnetRef<'a>>,
+    pub upsample: Option<VaeConvRef<'a>>,
+}
+
+/// The whole decoder as borrowed slices, in execution order:
+/// `conv_in → mid_res1 → mid_attn → mid_res2 → ups[0..] → norm_out+SiLU →
+/// conv_out`. Consumed by `gpu::vae_decode_chain`; `key` is stable for the
+/// life of the `VaeDecoder`, so a backend caches its uploaded weights by it
+/// instead of fingerprinting every conv on every call.
+pub struct VaeChainArgs<'a> {
+    pub key: u64,
+    pub conv_in: VaeConvRef<'a>,
+    pub mid_res1: VaeResnetRef<'a>,
+    pub mid_attn: VaeAttnRef<'a>,
+    pub mid_res2: VaeResnetRef<'a>,
+    pub ups: Vec<VaeUpRef<'a>>,
+    pub norm_out: VaeNormRef<'a>,
+    pub conv_out: VaeConvRef<'a>,
+    pub latent_channels: usize,
+    pub scaling_factor: f32,
+    pub shift_factor: f32,
+}
+
+impl Conv2d {
+    fn chain_ref(&self) -> VaeConvRef<'_> {
+        VaeConvRef {
+            w: &self.w,
+            b: &self.b,
+            oc: self.oc,
+            ic: self.ic,
+            k: self.k,
+        }
+    }
+}
+
+impl GroupNorm {
+    fn chain_ref(&self) -> VaeNormRef<'_> {
+        VaeNormRef {
+            w: &self.w,
+            b: &self.b,
+            groups: self.g,
+        }
+    }
+}
+
+impl ResnetBlock {
+    fn chain_ref(&self) -> VaeResnetRef<'_> {
+        VaeResnetRef {
+            norm1: self.norm1.chain_ref(),
+            conv1: self.conv1.chain_ref(),
+            norm2: self.norm2.chain_ref(),
+            conv2: self.conv2.chain_ref(),
+            shortcut: self.shortcut.as_ref().map(Conv2d::chain_ref),
+        }
+    }
+}
+
+static VAE_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+impl VaeDecoder {
+    /// The borrowed device-chain view (see `VaeChainArgs`).
+    pub fn chain_args(&self) -> VaeChainArgs<'_> {
+        let a = &self.mid_attn;
+        VaeChainArgs {
+            key: self.uid,
+            conv_in: self.conv_in.chain_ref(),
+            mid_res1: self.mid_res1.chain_ref(),
+            mid_attn: VaeAttnRef {
+                norm: a.norm.chain_ref(),
+                q: (&a.q.0, &a.q.1),
+                k: (&a.k.0, &a.k.1),
+                v: (&a.v.0, &a.v.1),
+                out: (&a.out.0, &a.out.1),
+                c: a.c,
+            },
+            mid_res2: self.mid_res2.chain_ref(),
+            ups: self
+                .ups
+                .iter()
+                .map(|u| VaeUpRef {
+                    resnets: u.resnets.iter().map(ResnetBlock::chain_ref).collect(),
+                    upsample: u.upsample.as_ref().map(Conv2d::chain_ref),
+                })
+                .collect(),
+            norm_out: self.norm_out.chain_ref(),
+            conv_out: self.conv_out.chain_ref(),
+            latent_channels: self.latent_channels,
+            scaling_factor: self.scaling_factor,
+            shift_factor: self.shift_factor,
+        }
+    }
+
+    /// `decode` with the resident device chain first: de-normalise on the
+    /// host, try `gpu::vae_decode_chain`, and fall back to `decode` (the
+    /// unchanged Lumina path) when the backend declines. Same contract as
+    /// `decode`: model-scale latents in, RGB `[3, 8h, 8w]` in ≈[-1, 1] out.
+    pub fn decode_fast(&self, z: &[f32], h: usize, w: usize) -> Vec<f32> {
+        if crate::gpu::enabled_here() {
+            let zin: Vec<f32> = z
+                .iter()
+                .map(|&v| v / self.scaling_factor + self.shift_factor)
+                .collect();
+            let mut out = vec![0f32; 3 * 64 * h * w];
+            if crate::gpu::vae_decode_chain(&self.chain_args(), &zin, h, w, &mut out) {
+                return out;
+            }
+        }
+        self.decode(z, h, w)
+    }
 }
 
 impl VaeDecoder {
@@ -629,6 +790,7 @@ impl VaeDecoder {
             latent_channels: cfg["latent_channels"].as_u64().unwrap_or(16) as usize,
             scaling_factor: cfg["scaling_factor"].as_f64().unwrap_or(1.0) as f32,
             shift_factor: cfg["shift_factor"].as_f64().unwrap_or(0.0) as f32,
+            uid: VAE_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         })
     }
 

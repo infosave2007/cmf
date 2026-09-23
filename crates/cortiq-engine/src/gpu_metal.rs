@@ -21,6 +21,10 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
+// Z-Image-Turbo device path (plan WP3) — child module, `gpu_metal/zimage.rs`.
+#[doc(hidden)]
+pub mod zimage;
+
 // Native Metal scratch buffers are process-wide (the command queue and
 // `Ctx::io_bufs` are shared by all pipelines).  A buffer is safe to reuse
 // only after the owning pipeline's command buffer has completed; two server

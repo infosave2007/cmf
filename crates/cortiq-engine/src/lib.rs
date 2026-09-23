@@ -59,6 +59,8 @@ pub mod tokenizer;
 pub mod vae;
 pub mod vae3d;
 pub mod videogen;
+pub mod zimage;
+pub mod zimagegen;
 /// The native Vulkan lane — an accelerator behind a capability probe,
 /// present only where Vulkan is.
 #[cfg(all(
