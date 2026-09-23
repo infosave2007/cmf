@@ -407,6 +407,62 @@ pub(crate) fn step(a: &mut ZStepArgs) -> bool {
     ok
 }
 
+/// The DiT half of `release`: planes, prepared programs, the context
+/// refiner — the VAE chain stays.
+pub(crate) fn release_dit() {
+    if let Ok(mut g) = ZSTATE.lock() {
+        *g = None;
+    }
+    if let Ok(mut g) = ZREFINER.lock() {
+        *g = None;
+    }
+}
+
+/// Upload the VAE weights and compile every kernel the decode uses.
+pub(crate) fn vae_prewarm(a: &crate::vae::VaeChainArgs) -> bool {
+    if !zi_enabled() || std::env::var("CMF_ZI_VAE").as_deref() == Ok("0") {
+        return false;
+    }
+    let Some(c) = zctx() else { return false };
+    let t0 = std::time::Instant::now();
+    {
+        let Ok(mut g) = ZVAE.lock() else { return false };
+        if !g.as_ref().is_some_and(|v| v.key == a.key) {
+            *g = None;
+            match VaeDev::build(c, a) {
+                Some(v) => *g = Some(v),
+                None => return false,
+            }
+        }
+    }
+    let kernels: [(&str, &str, &str); 7] = [
+        ("zv_gn_part", VAE_GN_PART_SRC, "vae_gn_part"),
+        ("zv_gn_fin", VAE_GN_FIN_SRC, "vae_gn_fin"),
+        ("zv_gn_apply", VAE_GN_APPLY_SRC, "vae_gn_apply"),
+        ("zv_combine", VAE_COMBINE_SRC, "vae_combine"),
+        ("zv_cast", VAE_CAST_SRC, "vae_cast"),
+        ("zv_softmax", VAE_SOFTMAX_SRC, "vae_softmax"),
+        ("zv_out", VAE_OUT_SRC, "vae_out"),
+    ];
+    for (k, src, e) in kernels {
+        if pipeline(c, k, src, e).is_none() {
+            return false;
+        }
+    }
+    for g in [
+        MmCfg { conv: 1, ..default_cfg(Epi::F32) },
+        MmCfg { conv: 2, ..default_cfg(Epi::F32) },
+        default_cfg(Epi::F32),
+        default_cfg(Epi::F16),
+    ] {
+        if mm_pipe(c, g).is_none() {
+            return false;
+        }
+    }
+    prof("vae prewarm (weights + kernels)", t0);
+    true
+}
+
 /// Drop all module-local device state (planes, prepared states, VAE chain).
 /// Never brings a device up: it only drops what this module holds.
 pub(crate) fn release() {
@@ -3862,6 +3918,7 @@ fn vae_decode_dev(a: &crate::vae::VaeChainArgs, z: &[f32], h0: usize, w0: usize,
         *g = Some(VaeDev::build(c, a)?);
         prof("vae weights", t0);
     }
+    let t0 = std::time::Instant::now();
     let v = g.as_ref().unwrap();
     // Walk the shapes once: the largest NHWC tensor sizes every buffer.
     let mut elems = mp_of(h0 * w0) * 512;

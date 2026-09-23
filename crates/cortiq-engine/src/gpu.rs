@@ -3699,6 +3699,26 @@ pub fn zimage_flush_pipelines() {
     }
 }
 
+/// OPTIONAL (B2): upload the resident VAE's weights and compile its
+/// kernels ahead of `vae_decode_chain` (the caller runs it on a helper
+/// thread while the DiT steps keep the device busy). `false` = not done.
+#[allow(unused_variables)]
+pub fn vae_prewarm(a: &crate::vae::VaeChainArgs) -> bool {
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::zimage::vae_prewarm(a),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
+/// Drop the Z-Image DiT device state (planes, prepared programs) but keep
+/// the VAE chain (B2: the generator frees the DiT before decoding).
+pub fn zimage_release_dit() {
+    #[cfg(feature = "gpu")]
+    crate::gpu_wgpu::zimage::release_dit();
+}
+
 /// Drop every Z-Image device resource (planes, prepared states, VAE chain
 /// buffers): stage change or process end. Calls each compiled backend's
 /// release directly, without `backend()`, so it never brings a device up;

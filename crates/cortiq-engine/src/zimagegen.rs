@@ -459,6 +459,20 @@ pub fn generate_images(
     // guided prediction before the negation), `lat_{i+1}`, and under CFG
     // `vpos_i`/`vneg_i` — the oracle `run_*` names, for parity scripts.
     let trace = std::env::var("CMF_ZIMAGE_TRACE").ok();
+    // The VAE loads (host) and uploads/compiles (device) on a helper thread
+    // while the steps run — the device is busy with the DiT and the CPU is
+    // idle then (B2: 0.3–0.4 s off the critical path).
+    let vae_warm = {
+        let m = model.clone();
+        let dev = crate::zimage::gpu_allowed();
+        std::thread::spawn(move || -> Result<crate::vae::VaeDecoder, String> {
+            let vae = crate::vae::VaeDecoder::from_cmf(&m)?;
+            if dev && crate::gpu::enabled() {
+                crate::gpu::vae_prewarm(&vae.chain_args());
+            }
+            Ok(vae)
+        })
+    };
     let mut latents: Vec<Vec<f32>> = Vec::with_capacity(p.num_images);
     for img in 0..p.num_images {
         let mut lat = gauss_latent(c * lh * lw, p.seed.wrapping_add(img as u64))?;
@@ -529,7 +543,7 @@ pub fn generate_images(
     drop(prep);
     drop(nprep);
     drop(dit);
-    crate::gpu::zimage_release();
+    crate::gpu::zimage_release_dit();
     drop(_stage);
 
     // ── VAE ──
@@ -537,7 +551,7 @@ pub fn generate_images(
     let mut out = Vec::with_capacity(latents.len());
     {
         let _stage = crate::gpu::image_stage_scope();
-        let vae = crate::vae::VaeDecoder::from_cmf(&model)?;
+        let vae = vae_warm.join().map_err(|_| "VAE loader panicked".to_string())??;
         for (img, lat) in latents.iter().enumerate() {
             let rgb = vae.decode_fast(lat, lh, lw);
             let (h, w) = (p.height, p.width);
