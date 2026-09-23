@@ -206,9 +206,25 @@ versions silently fell back to the CPU because the 14.4 GiB file
 exceeds Metal's single-buffer cap (the engine now maps it as
 overlapping windows).
 
+**How to run on a Mac — one command, no flags:**
+
 ```bash
-cortiq run qwen38-27b-q4t.cmf --prompt "..."   # no env vars needed
+cortiq run qwen38-27b-q4tp.cmf --greedy --no-think --prompt "..."
 ```
+
+That is the whole fast path. Every Metal lever defaults to its measured-best
+setting: the batched verify graph with seven drafts per round, the
+65536-row draft shortlist (Cyrillic/CJK hand back to the full head), the
+4-lane GDN state, the asynchronous state replay, the prefill graph, the
+MTP graph and the device attend. No `CMF_*` variable is needed for any of
+them; they exist only to switch a lever OFF for diagnosis. `RUST_LOG=info`
+prints one line at the first generation naming the route
+(`metal native: spec k=7 greedy (batched verify, draft shortlist 65536, …)`)
+so you can confirm it. On Metal speculation is on for sampling as well
+as for greedy decoding (and with a repetition penalty); `--greedy` is
+still the fastest and the reproducible one. The engine no longer spends eight plain tokens measuring itself before
+speculating: it speculates from the first token and only times the plain
+path (two tokens) when the rounds look doubtful, then keeps the faster arm.
 
 Measured on an M4 Mac mini, 24 GB unified memory (`qwen38-27b-q4tp.cmf`,
 cortiq 0.5.82):
@@ -503,7 +519,18 @@ CPU-шаг (отказ виден при RUST_LOG=info). По умолчанию
 Качество и точное извлечение произвольных дальних фактов этим замером не
 утверждаются.
 
-**macOS (Apple Silicon, Metal).** С 0.5.79 модель работает на GPU мака
+**macOS (Apple Silicon, Metal).** Запуск на маке — одна команда, без
+флагов: `cortiq run qwen38-27b-q4tp.cmf --greedy --no-think --prompt "..."`.
+Все рычаги Metal (пакетная верификация на 7 черновиков, шорт-лист головы
+65536, 4-канальное GDN-состояние, асинхронный replay, граф префилла, граф
+MTP, device-attend) включены по умолчанию; переменные `CMF_*` нужны только
+чтобы ВЫКЛЮЧИТЬ рычаг для диагностики. `RUST_LOG=info` печатает одну
+строку `metal native: spec k=7 …` — по ней видно, что быстрый путь
+включён. На Metal спекуляция включена и при сэмплировании, и с
+repetition penalty, не только при greedy (`--greedy` по-прежнему
+быстрее всего и воспроизводим); движок больше не тратит восемь plain-токенов на пробу перед
+спекуляцией — спекулирует с первого токена и замеряет plain (два токена)
+только когда раунды выглядят сомнительно. С 0.5.79 модель работает на GPU мака
 из коробки (раньше файл не влезал в лимит одного Metal-буфера и всё
 тихо уходило на CPU). С 0.5.82 — нативная Metal-спекуляция и
 префилл-граф, и починены две тихие ошибки численности Metal (промпт
@@ -626,7 +653,15 @@ Metal 用 `CMF_O1_METAL=1`（0.5.79 起）。
 单模型单硬件结果；不代表普遍速度、精确的无限上下文记忆或质量提升，
 `window=2048` 仍是实验选项，默认值是 128。
 
-**macOS（Apple Silicon，Metal）。** 自 **0.5.79** 起，27B 可直接在 Mac
+**macOS（Apple Silicon，Metal）。** 在 Mac 上只需一条命令、无需任何环境变量：
+`cortiq run qwen38-27b-q4tp.cmf --greedy --no-think --prompt "..."`。
+所有 Metal 优化（每轮 7 个草稿的批量验证图、65536 行草稿头短名单、4 通道 GDN
+状态、异步状态回放、预填充图、MTP 图、设备端注意力）默认全部开启；`CMF_*`
+变量仅用于在诊断时关闭某一项。`RUST_LOG=info` 会在首次生成时打印一行
+`metal native: spec k=7 …`，用于确认已走快速路径。在 Metal 上，采样解码和带
+重复惩罚的解码也默认启用推测（`--greedy` 仍是最快且可复现的）；引擎不再在推测前用八个 plain
+token 自测，而是从第一个 token 起就推测，仅在轮次看起来不划算时才计时
+plain 路径（两个 token）。自 **0.5.79** 起，27B 可直接在 Mac
 GPU 上运行（此前文件超出单个 Metal 缓冲区上限，会静默回退到 CPU）。
 M4 mini 24 GB 实测：解码 **5.8 tok/s**，2k 上下文预填充 20.8 tok/s
 （纯 CPU 为 3.7）。长上下文请使用 Metal 版 O(1) 模式：

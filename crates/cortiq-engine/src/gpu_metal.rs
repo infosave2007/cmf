@@ -1073,6 +1073,52 @@ kernel void softmax_rows(
     for (uint i = tid; i < n; i += TPT) row[i] *= inv;
 }
 
+// Per-row argmax of the verify head's logits ([b][stride], the first n
+// of every row scored): (index, value) a row, ties to the HIGHEST index
+// and NaN never winning — the host `sampler::argmax` contract, so the
+// greedy round reads back b ids instead of b × 248k floats. One
+// threadgroup a row; every thread keeps its own best over a strided
+// scan (ascending index with `>=` keeps the last of equal maxima), the
+// tree merge prefers the higher index on a tie.
+kernel void argmax_rows(
+    device const float* lg  [[buffer(0)]],
+    device uint*        out [[buffer(1)]],   // [b] index, then [b] value bits
+    constant uint& n      [[buffer(2)]],
+    constant uint& stride [[buffer(3)]],
+    constant uint& b      [[buffer(4)]],
+    uint tg  [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tpt [[threads_per_threadgroup]])
+{
+    device const float* row = lg + (ulong)tg * stride;
+    threadgroup float rv[1024];
+    threadgroup uint  ri[1024];
+    float bv = -INFINITY;
+    uint  bi = 0u;
+    for (uint i = tid; i < n; i += tpt) {
+        float v = row[i];
+        if (v >= bv) { bv = v; bi = i; }
+    }
+    rv[tid] = bv;
+    ri[tid] = bi;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint off = tpt >> 1u; off > 0u; off >>= 1u) {
+        if (tid < off) {
+            float ov = rv[tid + off];
+            uint  oi = ri[tid + off];
+            if (ov > rv[tid] || (ov == rv[tid] && oi > ri[tid])) {
+                rv[tid] = ov;
+                ri[tid] = oi;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) {
+        out[tg] = ri[0];
+        out[b + tg] = as_type<uint>(rv[0]);
+    }
+}
+
 // DiT flash attention V2: bidirectional, online softmax, no n×n
 // scores in device memory. V1 staged Q/K/V through a 31 KB
 // threadgroup arena — occupancy collapsed to one group per core and
@@ -2921,6 +2967,124 @@ kernel void embed_q8_rows(
     if (d >= hs || bi >= nb) return;
     uint id = ids[bi];
     h[(ulong)bi * hs + d] = (float)q[(ulong)id * hs + d] * rs[id] * mult;
+}
+
+// ── The device-resident draft chain (speculative MTP drafts without a
+// host round trip per step). Two small kernels close the loop that the
+// host used to close: the embedding of the token the previous step
+// chose, and the argmax that chooses the next one.
+
+// o = rmsnorm(dequant(embed_q4tp[ids[slot]]) · mult, w): ONE q4tp row
+// gathered and normalised by one threadgroup of 256. The row is decoded
+// the way the CPU's `row_f32` decodes it — nibble − 8 times the row's
+// 32-rung ladder, the ladder walked geometrically from exp2(lo) by
+// exp2(step) so the rungs land on the CPU's bits. ids past `rows` give
+// the zero row (the CPU embed does the same).
+kernel void embed_q4tp_norm(
+    device const uchar* q     [[buffer(0)]],
+    device const uint*  ids   [[buffer(1)]],
+    device const float* w     [[buffer(2)]],
+    device float*       o     [[buffer(3)]],
+    constant uint&      gpr   [[buffer(4)]],
+    constant uint&      rows  [[buffer(5)]],
+    constant uint&      slot  [[buffer(6)]],
+    constant uint&      n     [[buffer(7)]],
+    constant uint&      gemma [[buffer(8)]],
+    constant float&     eps   [[buffer(9)]],
+    constant float&     mult  [[buffer(10)]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg   [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float lad[32];
+    threadgroup float part[8];
+    uint id = ids[slot];
+    bool have = id < rows;
+    ulong params_off = (ulong)rows * (ulong)gpr * 16ul;
+    ulong codes_off  = params_off + (ulong)rows * 4ul;
+    uint  stride     = (gpr * 5u + 7u) / 8u;
+    if (tid < 32u) {
+        float t = 0.0f;
+        if (have) {
+            device const half* ph = (device const half*)(q + params_off + (ulong)id * 4ul);
+            t = precise::exp2((float)ph[0]);
+            float ratio = precise::exp2((float)ph[1]);
+            for (uint c = 0u; c < tid; ++c) t *= ratio;
+        }
+        lad[tid] = t;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device const uchar* nib = q + (ulong)id * (ulong)gpr * 16ul;
+    device const uchar* cp  = q + codes_off + (ulong)id * (ulong)stride;
+    float acc = 0.0f;
+    for (uint i = tid; i < n; i += 256u) {
+        float e = 0.0f;
+        if (have) {
+            uint g = i >> 5u, k = i & 31u;
+            uint byte = nib[g * 16u + (k >> 1u)];
+            uint v = (k & 1u) ? (byte >> 4u) : (byte & 15u);
+            uint bit = g * 5u, cb = bit >> 3u, shf = bit & 7u;
+            uint code = (((uint)cp[cb] | ((shf > 3u) ? ((uint)cp[cb + 1u] << 8) : 0u)) >> shf) & 31u;
+            e = ((float)v - 8.0f) * lad[code] * mult;
+        }
+        acc += e * e;
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) part[sg] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tot = 0.0f;
+    for (uint k = 0; k < 8u; ++k) tot += part[k];
+    float inv = 1.0f / precise::sqrt(tot / (float)n + eps);
+    for (uint i = tid; i < n; i += 256u) {
+        float e = 0.0f;
+        if (have) {
+            uint g = i >> 5u, k = i & 31u;
+            uint byte = nib[g * 16u + (k >> 1u)];
+            uint v = (k & 1u) ? (byte >> 4u) : (byte & 15u);
+            uint bit = g * 5u, cb = bit >> 3u, shf = bit & 7u;
+            uint code = (((uint)cp[cb] | ((shf > 3u) ? ((uint)cp[cb + 1u] << 8) : 0u)) >> shf) & 31u;
+            e = ((float)v - 8.0f) * lad[code] * mult;
+        }
+        float wv = gemma != 0u ? (1.0f + w[i]) : w[i];
+        o[i] = e * inv * wv;
+    }
+}
+
+// out[slot] = argmax(x[0..n]) with the sampler's tie rule — the HIGHEST
+// index among equal maxima (`sampler::argmax` scans with `>=`). One
+// threadgroup: each thread keeps its strided best, simdgroups combine
+// through simd_max on the value and then on the index among the lanes
+// that hold it, and simdgroup 0 folds the partials the same way.
+kernel void argmax_slot(
+    device const float* x    [[buffer(0)]],
+    device uint*        out  [[buffer(1)]],
+    constant uint&      n    [[buffer(2)]],
+    constant uint&      slot [[buffer(3)]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint tpg  [[threads_per_threadgroup]])
+{
+    threadgroup float pv[32];
+    threadgroup uint  pi[32];
+    float bv = -INFINITY;
+    uint  bi = 0u;
+    for (uint i = tid; i < n; i += tpg) {
+        float v = x[i];
+        if (v > bv || (v == bv && i > bi)) { bv = v; bi = i; }
+    }
+    float mv = simd_max(bv);
+    uint  mi = simd_max(bv == mv ? bi : 0u);
+    if (lane == 0) { pv[sg] = mv; pi[sg] = mi; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        uint nsg = tpg / 32u;
+        float v2 = lane < nsg ? pv[lane] : -INFINITY;
+        uint  i2 = lane < nsg ? pi[lane] : 0u;
+        float m2 = simd_max(v2);
+        uint  j2 = simd_max(v2 == m2 ? i2 : 0u);
+        if (lane == 0) out[slot] = j2;
+    }
 }
 
 // rmsnorm_k over a batch: one threadgroup per row.
@@ -6243,12 +6407,17 @@ struct Ctx {
     impcol: ComputePipelineState,
     unstack: ComputePipelineState,
     embedq8: ComputePipelineState,
+    /// Draft-chain closers: q4tp embedding row gather + norm, argmax.
+    embedq4tpn: ComputePipelineState,
+    argmaxslot: ComputePipelineState,
     addnorm: ComputePipelineState,
     sgate: ComputePipelineState,
     /// Batched-verify twins (b ≤ 8 rows).
     f32mvb: ComputePipelineState,
     gdnconvb: ComputePipelineState,
     gdnringcb: ComputePipelineState,
+    /// Greedy verify: per-row argmax of the head's logits on the device.
+    argmaxrows: ComputePipelineState,
     gdngatesb: ComputePipelineState,
     gdnqknb: ComputePipelineState,
     gdnstb64: ComputePipelineState,
@@ -6470,11 +6639,14 @@ fn init() -> Result<Ctx, String> {
     let impcol = pso("imp_colsum")?;
     let unstack = pso("panel_unstack")?;
     let embedq8 = pso("embed_q8_rows")?;
+    let embedq4tpn = pso("embed_q4tp_norm")?;
+    let argmaxslot = pso("argmax_slot")?;
     let addnorm = pso("add_rmsnorm_rows")?;
     let sgate = pso("sig_gate")?;
     let f32mvb = pso("f32_matvec_b")?;
     let gdnconvb = pso("gdn_conv_b")?;
     let gdnringcb = pso("gdn_ring_commit_b")?;
+    let argmaxrows = pso("argmax_rows")?;
     let gdngatesb = pso("gdn_gates_b")?;
     let gdnqknb = pso("gdn_qk_norms_b")?;
     let gdnstb64 = pso("gdn_state_b64")?;
@@ -6574,11 +6746,14 @@ fn init() -> Result<Ctx, String> {
         impcol,
         unstack,
         embedq8,
+        embedq4tpn,
+        argmaxslot,
         addnorm,
         sgate,
         f32mvb,
         gdnconvb,
         gdnringcb,
+        argmaxrows,
         gdngatesb,
         gdnqknb,
         gdnstb64,
@@ -12301,12 +12476,19 @@ pub struct AttnGpuLayer<'a> {
     pub ffn: MetalFfn<'a>,
 }
 
+/// Buffers `io_buf` had to allocate (cache misses). A first-touch Shared
+/// allocation is zero-filled lazily by the driver, so one landing inside a
+/// round's command buffer shows up as a long GPU wait — this counter is
+/// what a `CMF_GRAPH_SPEC_TIME` outlier line reports.
+pub static IO_BUF_ALLOCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn io_buf(c: &Ctx, key: usize, nbytes: usize) -> Buffer {
     let mut cache = c.io_bufs.lock().unwrap();
     cache
         .entry(io_key(key))
         .or_insert_with(|| {
             crate::gpu::probe_note_cold();
+            IO_BUF_ALLOCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             c._device
                 .new_buffer(nbytes as u64, MTLResourceOptions::StorageModeShared)
         })
@@ -12317,7 +12499,7 @@ fn io_buf(c: &Ctx, key: usize, nbytes: usize) -> Buffer {
 /// (`gdn_state_b64/128`, `gdn_state_update`); the default is the 4-lane
 /// re-tile (`gdn_state_b4_*`) on the verify, the replay and the plain
 /// token alike.
-fn state4_on() -> bool {
+pub(crate) fn state4_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("CMF_METAL_STATE4").as_deref() != Ok("0"))
 }
@@ -12700,6 +12882,9 @@ pub struct TokenGraph {
     qkv_bufs: Option<(Buffer, Buffer, Buffer)>,
     /// Logits buffer of an encoded final-norm+lm_head tail (rows).
     logits_b: Option<Buffer>,
+    /// The draft chain's token ids: slot 0 is the host's input token,
+    /// slot j+1 the argmax the device chose at step j (`chain_ids_init`).
+    ids_b: Option<Buffer>,
 }
 
 impl TokenGraph {
@@ -12741,6 +12926,7 @@ impl TokenGraph {
             st_next: 0,
             qkv_bufs: None,
             logits_b: None,
+            ids_b: None,
         })
     }
 
@@ -13270,6 +13456,160 @@ impl TokenGraph {
             t.2 / GROUP_SIZE,
         );
         enc.end_encoding();
+        true
+    }
+
+    // ── The draft chain: k MTP steps in one command buffer. The host
+    // seeds slot 0 of the id buffer with the round's input token; every
+    // step gathers its embedding from the id the step before it chose
+    // (`encode_chain_input`), runs the block, and `encode_argmax` writes
+    // the next slot. One sync, then `chain_ids_read`.
+
+    /// Pre-flight for `encode_chain_input`: the embedding table is a q4tp
+    /// tensor of this model with `hidden` columns.
+    pub fn chain_embed_ok(&self, embed: (usize, usize, usize)) -> bool {
+        embed.2 == self.dims.hidden && matches!(self.proj_abs(embed), Some((_, ProjKind::Q4tp)))
+    }
+
+    /// Allocate the chain's id buffer (`k + 1` slots) and seed slot 0.
+    pub fn chain_ids_init(&mut self, first: u32, k: usize) {
+        let ids_b = io_buf(self.c, 47_000_000_103 + k, (k + 1) * 4);
+        unsafe {
+            let p = ids_b.contents() as *mut u32;
+            std::ptr::write_bytes(p, 0, k + 1);
+            *p = first;
+        }
+        self.ids_b = Some(ids_b);
+    }
+
+    /// The chosen ids after the sync: `out[j]` = slot `j + 1`.
+    pub fn chain_ids_read(&self, out: &mut [u32]) -> bool {
+        if self.failed {
+            return false;
+        }
+        let Some(ids_b) = &self.ids_b else {
+            return false;
+        };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                (ids_b.contents() as *const u32).add(1),
+                out.as_mut_ptr(),
+                out.len(),
+            );
+        }
+        true
+    }
+
+    /// One chain step's block input, all on the device:
+    /// `h_b = eh · [enorm(embed[ids[slot]]) ; hnorm(h_b)]`. The hidden the
+    /// previous step left in `h_b` is normalised before the projection
+    /// overwrites it (dispatches in one encoder are serial).
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_chain_input(
+        &mut self,
+        embed: (usize, usize, usize),
+        slot: u32,
+        enorm: &[f32],
+        hnorm: &[f32],
+        mult: f32,
+        eh: (usize, usize, usize),
+    ) -> bool {
+        let hs = self.dims.hidden;
+        if eh.1 != hs || eh.2 != 2 * hs || eh.2 % GROUP_SIZE != 0 {
+            return false;
+        }
+        if enorm.len() != hs || hnorm.len() != hs || !self.chain_embed_ok(embed) {
+            return false;
+        }
+        let Some((eabs, ProjKind::Q4tp)) = self.proj_abs(embed) else {
+            return false;
+        };
+        let Some((abs, kind)) = self.proj_abs(eh) else {
+            return false;
+        };
+        let Some(ids_b) = self.ids_b.clone() else {
+            return false;
+        };
+        let x_b = io_buf(self.c, 46_000_000_091 + eh.2, eh.2 * 4);
+        let cmd = self.ensure_cmd();
+        let enc = cmd.new_compute_command_encoder();
+        // hnorm(h_b) → x[hs..2hs]
+        disp(
+            enc,
+            &self.c.rmsn,
+            &[
+                (&self.h_b, 0),
+                (&const_buf(self.c, hnorm), 0),
+                (&x_b, (hs * 4) as u64),
+            ],
+            &[hs as u32, self.dims.gemma as u32],
+            &[self.dims.eps],
+            (256, 256),
+        );
+        // enorm(embed[ids[slot]]) → x[0..hs]
+        {
+            let c = self.c;
+            enc.set_compute_pipeline_state(&c.embedq4tpn);
+            self.fbuf.bind(enc, 0, eabs);
+            enc.set_buffer(1, Some(&ids_b), 0);
+            enc.set_buffer(2, Some(&const_buf(c, enorm)), 0);
+            enc.set_buffer(3, Some(&x_b), 0);
+            let words = [
+                (embed.2 / GROUP_SIZE) as u32,
+                embed.1 as u32,
+                slot,
+                hs as u32,
+                self.dims.gemma as u32,
+            ];
+            for (i, w) in words.iter().enumerate() {
+                enc.set_bytes(4 + i as u64, 4, w as *const u32 as *const std::ffi::c_void);
+            }
+            enc.set_bytes(9, 4, &self.dims.eps as *const f32 as *const std::ffi::c_void);
+            enc.set_bytes(10, 4, &mult as *const f32 as *const std::ffi::c_void);
+            enc.dispatch_threads(MTLSize::new(256, 1, 1), MTLSize::new(256, 1, 1));
+        }
+        encode_proj(
+            self.c,
+            enc,
+            &self.fbuf,
+            abs,
+            &kind,
+            &x_b,
+            &self.h_b,
+            eh.1,
+            eh.2 / GROUP_SIZE,
+        );
+        enc.end_encoding();
+        true
+    }
+
+    /// `ids[slot] = argmax(logits[0..n])` over the tail `encode_lm_head`
+    /// / `encode_lm_head_part` just encoded (the logits buffer stays for
+    /// `read_logits`).
+    pub fn encode_argmax(&mut self, n: usize, slot: u32) -> bool {
+        let (Some(lg_b), Some(ids_b)) = (self.logits_b.clone(), self.ids_b.clone()) else {
+            return false;
+        };
+        if n == 0 {
+            return false;
+        }
+        let cmd = self.ensure_cmd();
+        let threads = self
+            .c
+            .argmaxslot
+            .max_total_threads_per_threadgroup()
+            .min(1024)
+            .max(32)
+            / 32
+            * 32;
+        enc_simple(
+            &cmd,
+            &self.c.argmaxslot,
+            &[(&lg_b, 0), (&ids_b, 0)],
+            &[n as u32, slot],
+            &[],
+            (threads, threads),
+        );
         true
     }
 
@@ -14699,7 +15039,7 @@ unsafe impl Send for PendingReplay {}
 /// `CMF_METAL_ASYNC_REPLAY=0` keeps the verify commit synchronous (one
 /// submit + wait on the main queue — the pre-0.7.3 behaviour). Default:
 /// the replay goes to the second queue and overlaps the next draft chain.
-fn async_replay_on() -> bool {
+pub(crate) fn async_replay_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("CMF_METAL_ASYNC_REPLAY").as_deref() != Ok("0"))
 }
@@ -14842,7 +15182,16 @@ struct VerifyGdnSlot {
 pub struct VerifyGraph {
     tg: TokenGraph,
     b: usize,
+    /// Rows the row-scaled scratch is SIZED for: 8 whenever b ≤ 8, so
+    /// the verify (b = 8) and the round's warm-up (b = accepted, 1..7)
+    /// share one set of cached buffers instead of allocating a fresh
+    /// set for every new b — each first-time size was a Metal
+    /// allocation inside the round (measured as a 0.5 s round when it
+    /// landed in the warm-up's command buffer).
+    bc: usize,
     cmd: Option<metal::CommandBuffer>,
+    /// Committed, not yet waited (`submit`); `sync` drains it.
+    inflight: Vec<metal::CommandBuffer>,
     h_b: Buffer,
     n_b: Buffer,
     d_b: Buffer,
@@ -15050,6 +15399,21 @@ mod q2tp_affine_admission_tests {
 }
 
 impl VerifyGraph {
+    /// The row count the row-scaled scratch is SIZED for. `io_buf` keys a
+    /// cached buffer by its byte size, so a graph built for a new `b`
+    /// allocates a whole fresh set — and a first-touch Shared allocation
+    /// is zero-filled by the driver inside the command buffer that first
+    /// uses it. The verify runs at b = 8 and the round's MTP warm-up at
+    /// b = accepted (1..7), so every first occurrence of an accepted
+    /// count used to pay one such set mid-round. Rounding every b ≤ 8 up
+    /// to 8 makes the warm-up reuse the verify's buffers.
+    /// `CMF_METAL_VBUF_BC=0` restores the old per-b sizing (diagnostic).
+    fn bcap(b: usize) -> usize {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *ON.get_or_init(|| std::env::var("CMF_METAL_VBUF_BC").as_deref() != Ok("0"));
+        if on && b <= 8 { 8 } else { b }
+    }
+
     fn vbuf(c: &Ctx, kind: usize, slot: usize, nbytes: usize) -> Buffer {
         // the key carries the size (io_buf caches by key alone)
         io_buf(
@@ -15065,7 +15429,8 @@ impl VerifyGraph {
         }
         let tg = TokenGraph::new(model, dims, &h[..dims.hidden])?;
         let c = tg.c;
-        let hb = b * dims.hidden * 4;
+        let bc = Self::bcap(b);
+        let hb = bc * dims.hidden * 4;
         let h_b = Self::vbuf(c, 1, 0, hb);
         let n_b = Self::vbuf(c, 2, 0, hb);
         let d_b = Self::vbuf(c, 3, 0, hb);
@@ -15073,11 +15438,11 @@ impl VerifyGraph {
             std::ptr::copy_nonoverlapping(h.as_ptr(), h_b.contents() as *mut f32, b * dims.hidden);
         }
         // per-row scales: b entries (the pow2 pre-scale writes one a row)
-        let ones = Self::vbuf(c, 4, 0, b.max(8) * 4);
-        let xsc = Self::vbuf(c, 5, 0, b.max(8) * 4);
+        let ones = Self::vbuf(c, 4, 0, bc * 4);
+        let xsc = Self::vbuf(c, 5, 0, bc * 4);
         unsafe {
             let p = ones.contents() as *mut f32;
-            for i in 0..b.max(8) {
+            for i in 0..bc {
                 *p.add(i) = 1.0;
             }
         }
@@ -15088,11 +15453,13 @@ impl VerifyGraph {
             .intermediate_size
             .max(dims.hidden)
             .max(1);
-        let prism_rows = Self::vbuf(c, 29, 0, b * max_width * 4);
+        let prism_rows = Self::vbuf(c, 29, 0, bc * max_width * 4);
         Some(VerifyGraph {
             tg,
             b,
+            bc,
             cmd: None,
+            inflight: Vec::new(),
             h_b,
             n_b,
             d_b,
@@ -15147,7 +15514,7 @@ impl VerifyGraph {
         let mut g = VerifyGraph::new(model, dims, &zeros, b)?;
         g.batch_abs(t)?;
         let c = g.tg.c;
-        let x_b = Self::vbuf(c, 28, 0, b * t.2 * 4);
+        let x_b = Self::vbuf(c, 28, 0, g.bc * t.2 * 4);
         unsafe {
             std::ptr::copy_nonoverlapping(xin.as_ptr(), x_b.contents() as *mut f32, xin.len());
         }
@@ -15362,9 +15729,9 @@ impl VerifyGraph {
         // h += d (the mixer's output); n = rmsnorm(h, post_norm)
         self.add_norm(enc, post_norm);
         let inter = gate.1;
-        let fg = Self::vbuf(c, 7, 0, self.b * inter * 4);
-        let fu = Self::vbuf(c, 8, 0, self.b * inter * 4);
-        let fa = Self::vbuf(c, 9, 0, self.b * inter * 4);
+        let fg = Self::vbuf(c, 7, 0, self.bc * inter * 4);
+        let fu = Self::vbuf(c, 8, 0, self.bc * inter * 4);
+        let fa = Self::vbuf(c, 9, 0, self.bc * inter * 4);
         self.gemm(enc, *gate, &self.n_b, &fg, &self.ones);
         self.gemm(enc, *up, &self.n_b, &fu, &self.ones);
         // silu(g)·u and the row pre-scale in one pass
@@ -15419,16 +15786,17 @@ impl VerifyGraph {
                 Some(b) => (b, 0usize),
                 None => (Self::vbuf(c, 10, slot, (ring_len + s_len) * 4), st.len()),
             };
-            let qkv_b = Self::vbuf(c, 11, slot, b * cfg.c_dim * 4);
-            let cq_b = Self::vbuf(c, 12, slot, b * cfg.c_dim * 4);
-            let z_b = Self::vbuf(c, 13, slot, b * vd * 4);
-            let g_b = Self::vbuf(c, 14, slot, b * cfg.nv * 4);
-            let bt_b = Self::vbuf(c, 15, slot, b * cfg.nv * 4);
-            let iq_b = Self::vbuf(c, 16, slot, b * cfg.nk * 4);
-            let ik_b = Self::vbuf(c, 17, slot, b * cfg.nk * 4);
-            let a_b = Self::vbuf(c, 18, 0, b * cfg.nv * 4);
-            let bb_b = Self::vbuf(c, 19, 0, b * cfg.nv * 4);
-            let of_b = Self::vbuf(c, 20, 0, b * vd * 4);
+            let bc = self.bc;
+            let qkv_b = Self::vbuf(c, 11, slot, bc * cfg.c_dim * 4);
+            let cq_b = Self::vbuf(c, 12, slot, bc * cfg.c_dim * 4);
+            let z_b = Self::vbuf(c, 13, slot, bc * vd * 4);
+            let g_b = Self::vbuf(c, 14, slot, bc * cfg.nv * 4);
+            let bt_b = Self::vbuf(c, 15, slot, bc * cfg.nv * 4);
+            let iq_b = Self::vbuf(c, 16, slot, bc * cfg.nk * 4);
+            let ik_b = Self::vbuf(c, 17, slot, bc * cfg.nk * 4);
+            let a_b = Self::vbuf(c, 18, 0, bc * cfg.nv * 4);
+            let bb_b = Self::vbuf(c, 19, 0, bc * cfg.nv * 4);
+            let of_b = Self::vbuf(c, 20, 0, bc * vd * 4);
             if st_len > 0 {
                 unsafe {
                     std::ptr::copy_nonoverlapping(
@@ -15655,12 +16023,13 @@ impl VerifyGraph {
         self.rows_norm(enc, l.attn_norm);
         let nhd = p.nh * p.hd;
         let kvd = p.nkv * p.hd;
-        let q_b = Self::vbuf(c, 21, 0, b * l.wq.1 * 4);
-        let k_b = Self::vbuf(c, 22, 0, b * kvd * 4);
-        let v_b = Self::vbuf(c, 23, 0, b * kvd * 4);
-        let qr_b = Self::vbuf(c, 24, 0, b * nhd * 4);
-        let g_b = Self::vbuf(c, 25, 0, b * nhd * 4);
-        let ao_b = Self::vbuf(c, 26, 0, b * nhd * 4);
+        let bc = self.bc;
+        let q_b = Self::vbuf(c, 21, 0, bc * l.wq.1 * 4);
+        let k_b = Self::vbuf(c, 22, 0, bc * kvd * 4);
+        let v_b = Self::vbuf(c, 23, 0, bc * kvd * 4);
+        let qr_b = Self::vbuf(c, 24, 0, bc * nhd * 4);
+        let g_b = Self::vbuf(c, 25, 0, bc * nhd * 4);
+        let ao_b = Self::vbuf(c, 26, 0, bc * nhd * 4);
         self.gemm(enc, l.wq, &self.n_b, &q_b, &self.ones);
         self.gemm(enc, l.wk, &self.n_b, &k_b, &self.ones);
         self.gemm(enc, l.wv, &self.n_b, &v_b, &self.ones);
@@ -15820,7 +16189,7 @@ impl VerifyGraph {
         }
         let c = self.tg.c;
         let cmd = self.ensure_cmd();
-        let lg_b = Self::vbuf(c, 27, 0, self.b * lm.1 * 4);
+        let lg_b = Self::vbuf(c, 27, 0, self.bc * lm.1 * 4);
         let enc = cmd.new_compute_command_encoder();
         // the last layer's residual add lands in h_b (the hidden is read
         // back) — then the final norm
@@ -15832,12 +16201,81 @@ impl VerifyGraph {
         true
     }
 
+    /// Greedy verify: the per-row argmax of the head's logits (the first
+    /// `n` of every row) in the same command buffer, so the round reads
+    /// back b ids (`read_argmax`) instead of the b × rows f32 plane.
+    /// Encode after `encode_lm_head_b`.
+    pub fn encode_argmax_b(&mut self, n: usize) -> bool {
+        let Some((lg_b, rows)) = self.logits_b.clone() else {
+            return false;
+        };
+        if n == 0 || n > rows || self.b > 512 {
+            return false;
+        }
+        let c = self.tg.c;
+        let tpt = c
+            .argmaxrows
+            .max_total_threads_per_threadgroup()
+            .min(1024)
+            .max(32);
+        // a power of two: the tree merge halves it
+        let tpt = 1u64 << (63 - tpt.leading_zeros() as u64);
+        let out = Self::vbuf(c, 30, 0, 512 * 2 * 4);
+        let cmd = self.ensure_cmd();
+        let enc = cmd.new_compute_command_encoder();
+        disp(
+            enc,
+            &c.argmaxrows,
+            &[(&lg_b, 0), (&out, 0)],
+            &[n as u32, rows as u32, self.b as u32],
+            &[],
+            (self.b as u64 * tpt, tpt),
+        );
+        enc.end_encoding();
+        true
+    }
+
+    /// The b argmax ids of `encode_argmax_b` (after `sync`); `logits_b`
+    /// is left in place for a caller that still wants the rows.
+    pub fn read_argmax(&self, out: &mut [u32]) -> bool {
+        if self.failed || out.len() < self.b || self.b > 512 {
+            return false;
+        }
+        let c = self.tg.c;
+        let buf = Self::vbuf(c, 30, 0, 512 * 2 * 4);
+        unsafe {
+            std::ptr::copy_nonoverlapping(buf.contents() as *const u32, out.as_mut_ptr(), self.b);
+        }
+        true
+    }
+
     /// Submit and wait (a pending residual add is flushed first so h_b is
     /// the true hidden for readback).
     /// Submit and wait, returning false on a terminal command-buffer error.
     /// A false result means no caller may read state/output or fall back to a
     /// serial path against this graph's partially mutated device state.
     pub fn sync(&mut self) -> bool {
+        if !self.submit() {
+            return false;
+        }
+        for cmd in std::mem::take(&mut self.inflight) {
+            if let Err(err) = wait_fast_checked(&cmd) {
+                self.failed = true;
+                self.logits_b = None;
+                tracing::error!("Metal VerifyGraph command buffer failed: {err}");
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Flush and commit the open command buffer WITHOUT waiting; `sync`
+    /// collects it. Lets the caller put other work on the queues between
+    /// the submit and the wait: the round's MTP warm-up is submitted, the
+    /// trunk's GDN replay goes to the second queue behind it, and only
+    /// then is the warm-up waited — the replay no longer sits in front of
+    /// the warm-up's wait.
+    pub fn submit(&mut self) -> bool {
         if self.failed {
             return false;
         }
@@ -15850,12 +16288,10 @@ impl VerifyGraph {
         if let Some(cmd) = self.cmd.take() {
             METAL_SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             cmd.commit();
-            if let Err(err) = wait_fast_checked(&cmd) {
-                self.failed = true;
-                self.logits_b = None;
-                tracing::error!("Metal VerifyGraph command buffer failed: {err}");
-                return false;
-            }
+            // the commit itself (driver-side residency work lands here,
+            // not in the wait) — a CMF_GRAPH_SPEC_TIME=2 stamp
+            crate::pipeline::spec_stamp("s.commit");
+            self.inflight.push(cmd);
         }
         true
     }
@@ -17094,6 +17530,144 @@ mod tests {
             assert!((got_w[top_k] - want_shared).abs() < 1e-5, "shared weight");
         }
     }
+
+    /// The draft chain's two closers against their CPU references:
+    /// `argmax_slot` lands on `sampler::argmax`'s index (the HIGHEST
+    /// among equal maxima) at sizes below and above one threadgroup's
+    /// stride, and `embed_q4tp_norm` gathers + normalises a q4tp row the
+    /// way `dequant_q4tp` + `rms_norm_into` do (ids past the table give
+    /// the zero row).
+    #[test]
+    fn chain_argmax_and_embed_match_cpu() {
+        use cortiq_core::quant::{Q4TP_NIB, dequant_q4tp, f32_to_f16, q4tp_put_code, q4tp_sections};
+        unsafe { std::env::set_var("CMF_GPU", "1") };
+        let Some(c) = ctx() else {
+            eprintln!("gpu test skipped: no Metal device");
+            return;
+        };
+        let buf = |bytes: &[u8]| {
+            c._device.new_buffer_with_data(
+                bytes.as_ptr() as *const std::ffi::c_void,
+                bytes.len() as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        };
+        let f32s = |v: &[f32]| buf(unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) });
+        let ids_b = c
+            ._device
+            .new_buffer(16, MTLResourceOptions::StorageModeShared);
+        let threads = c
+            .argmaxslot
+            .max_total_threads_per_threadgroup()
+            .min(1024)
+            .max(32)
+            / 32
+            * 32;
+        for (n, ties) in [
+            (5usize, vec![0usize, 4]),
+            (1000, vec![17, 500, 999]),
+            (1000, vec![]),
+            (70000, vec![3, 40000, 69999]),
+            (248320, vec![131072, 200000]),
+        ] {
+            let mut x: Vec<f32> = (0..n)
+                .map(|i| (((i * 7919) % 10007) as f32) / 10007.0 - 0.5)
+                .collect();
+            let mx = x.iter().cloned().fold(f32::MIN, f32::max) + 1.0;
+            for &t in &ties {
+                x[t] = mx;
+            }
+            let want = crate::sampler::argmax(&x);
+            let x_b = f32s(&x);
+            let cmd = c.queue.new_command_buffer();
+            enc_simple(
+                cmd,
+                &c.argmaxslot,
+                &[(&x_b, 0), (&ids_b, 0)],
+                &[n as u32, 2u32],
+                &[],
+                (threads, threads),
+            );
+            cmd.commit();
+            cmd.wait_until_completed();
+            let got = unsafe { *(ids_b.contents() as *const u32).add(2) };
+            assert_eq!(got, want, "argmax n={n} ties={ties:?}");
+        }
+
+        // a q4tp table of 6 rows × 96 cols: per-row ladders, per-group codes
+        let (rows, cols) = (6usize, 96usize);
+        let gpr = cols / GROUP_SIZE;
+        let (params_off, codes_off, stride) = q4tp_sections(rows, cols);
+        let mut payload = vec![0u8; codes_off + rows * stride];
+        for r in 0..rows {
+            for g in 0..gpr {
+                let t = (r * gpr + g) * Q4TP_NIB;
+                for k in 0..Q4TP_NIB {
+                    payload[t + k] = ((r * 37 + g * 11 + k * 13) % 251) as u8;
+                }
+                q4tp_put_code(
+                    &mut payload[codes_off + r * stride..codes_off + (r + 1) * stride],
+                    g,
+                    (r * 5 + g * 7) % 32,
+                );
+            }
+            let lo = -9.0f32 + 0.3 * r as f32;
+            let step = 0.25f32 + 0.01 * r as f32;
+            payload[params_off + r * 4..params_off + r * 4 + 2]
+                .copy_from_slice(&f32_to_f16(lo).to_le_bytes());
+            payload[params_off + r * 4 + 2..params_off + r * 4 + 4]
+                .copy_from_slice(&f32_to_f16(step).to_le_bytes());
+        }
+        let mut full = vec![0f32; rows * cols];
+        dequant_q4tp(&payload, rows, cols, &mut full);
+        let w: Vec<f32> = (0..cols).map(|i| 0.5 + 0.01 * i as f32).collect();
+        let ids = [3u32, 0, rows as u32 + 5, 5];
+        let mult = 1.5f32;
+        let eps = 1e-6f32;
+        let q_b = buf(&payload);
+        let id_b = buf(unsafe { std::slice::from_raw_parts(ids.as_ptr() as *const u8, 16) });
+        let w_b = f32s(&w);
+        let o_b = c
+            ._device
+            .new_buffer((cols * 4) as u64, MTLResourceOptions::StorageModeShared);
+        for slot in 0..ids.len() {
+            let cmd = c.queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&c.embedq4tpn);
+            enc.set_buffer(0, Some(&q_b), 0);
+            enc.set_buffer(1, Some(&id_b), 0);
+            enc.set_buffer(2, Some(&w_b), 0);
+            enc.set_buffer(3, Some(&o_b), 0);
+            let words = [gpr as u32, rows as u32, slot as u32, cols as u32, 0u32];
+            for (i, wv) in words.iter().enumerate() {
+                enc.set_bytes(4 + i as u64, 4, wv as *const u32 as *const std::ffi::c_void);
+            }
+            enc.set_bytes(9, 4, &eps as *const f32 as *const std::ffi::c_void);
+            enc.set_bytes(10, 4, &mult as *const f32 as *const std::ffi::c_void);
+            enc.dispatch_threads(MTLSize::new(256, 1, 1), MTLSize::new(256, 1, 1));
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+            let got = unsafe { std::slice::from_raw_parts(o_b.contents() as *const f32, cols) };
+            let id = ids[slot] as usize;
+            let row: Vec<f32> = if id < rows {
+                full[id * cols..(id + 1) * cols].iter().map(|v| v * mult).collect()
+            } else {
+                vec![0f32; cols]
+            };
+            let mut want = vec![0f32; cols];
+            crate::inference::rms_norm_into(&row, &w, eps as f64, NormStyle::Qwen, &mut want);
+            let scale = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-12);
+            for i in 0..cols {
+                assert!(
+                    (got[i] - want[i]).abs() <= 2e-5 * scale,
+                    "embed slot {slot} (id {id}) col {i}: device {} vs cpu {}",
+                    got[i],
+                    want[i]
+                );
+            }
+        }
+    }
 }
 
 /// A synchronous image stage has its own scratch namespace. Once the stage
@@ -17334,5 +17908,91 @@ mod replay_queue_tests {
         } else {
             assert!(async_replay_on());
         }
+    }
+}
+
+#[cfg(test)]
+mod argmax_rows_tests {
+    use super::*;
+
+    /// The greedy verify's device argmax against the host contract
+    /// (`sampler::argmax`: ties to the highest index, NaN never wins),
+    /// over b rows of a vocabulary-sized plane with a scored prefix
+    /// shorter than the stride, planted ties, a −∞ tail and a NaN.
+    #[test]
+    fn argmax_rows_matches_the_host_argmax() {
+        unsafe { std::env::set_var("CMF_GPU", "1") };
+        let Some(c) = ctx() else {
+            eprintln!("gpu test skipped: no Metal device");
+            return;
+        };
+        let (b, stride, n) = (8usize, 248_320usize, 248_000usize);
+        let mut rows = vec![0f32; b * stride];
+        let mut s = 0x9e37_79b9_7f4a_7c15u64;
+        for (i, v) in rows.iter_mut().enumerate() {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *v = ((s >> 40) as f32 / (1u64 << 24) as f32) * 20.0 - 10.0;
+            if i % stride >= n {
+                *v = 1e9; // past the scored prefix: must be ignored
+            }
+        }
+        // row 0: a planted tie at two indices (the highest wins)
+        rows[100] = 50.0;
+        rows[200_000] = 50.0;
+        // row 1: the maximum at index 0
+        rows[stride] = 99.0;
+        // row 2: the maximum at the last scored index
+        rows[2 * stride + n - 1] = 99.0;
+        // row 3: a NaN in the middle (never the answer)
+        rows[3 * stride + 777] = f32::NAN;
+        // row 4: a −∞ tail
+        for v in &mut rows[4 * stride + 1000..4 * stride + n] {
+            *v = f32::NEG_INFINITY;
+        }
+        let lg = c._device.new_buffer_with_data(
+            rows.as_ptr() as *const std::ffi::c_void,
+            (rows.len() * 4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let out = c
+            ._device
+            .new_buffer((2 * b * 4) as u64, MTLResourceOptions::StorageModeShared);
+        let tpt = c
+            .argmaxrows
+            .max_total_threads_per_threadgroup()
+            .min(1024)
+            .max(32);
+        let tpt = 1u64 << (63 - tpt.leading_zeros() as u64);
+        let cmd = c.queue.new_command_buffer().to_owned();
+        let enc = cmd.new_compute_command_encoder();
+        disp(
+            enc,
+            &c.argmaxrows,
+            &[(&lg, 0), (&out, 0)],
+            &[n as u32, stride as u32, b as u32],
+            &[],
+            (b as u64 * tpt, tpt),
+        );
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+        assert_eq!(cmd.status(), metal::MTLCommandBufferStatus::Completed);
+        let got = unsafe { std::slice::from_raw_parts(out.contents() as *const u32, 2 * b) };
+        for r in 0..b {
+            let row = &rows[r * stride..r * stride + n];
+            let want = crate::sampler::argmax(row);
+            assert_eq!(got[r], want, "row {r}: device argmax {} vs host {want}", got[r]);
+            let want_v = row[want as usize];
+            let got_v = f32::from_bits(got[b + r]);
+            assert!(
+                got_v == want_v || (got_v.is_nan() && want_v.is_nan()),
+                "row {r}: device max {got_v} vs host {want_v}"
+            );
+        }
+        assert_eq!(got[0], 200_000, "the planted tie must resolve to the higher index");
+        assert_eq!(got[1], 0);
+        assert_eq!(got[2], (n - 1) as u32);
     }
 }

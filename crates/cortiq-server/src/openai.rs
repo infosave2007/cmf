@@ -362,11 +362,29 @@ async fn run_classification(
     }
 }
 
-fn request_sampler(
+/// Per-request sampler options (vLLM-style extras on top of the OpenAI
+/// fields). `temperature: 0` means GREEDY in the `cortiq run --greedy`
+/// sense — repetition penalty 1.0 unless the request sets one — so a
+/// greedy request takes the speculative fast path (the engine keeps
+/// penalized rows on the plain path: a 1.1 penalty measured 2 of 16
+/// drafts accepted).
+#[derive(Default, Clone, Copy)]
+struct SamplerOptions {
     temperature: Option<f32>,
     top_p: Option<f32>,
     seed: Option<u64>,
-) -> Result<SamplerConfig, Response> {
+    repetition_penalty: Option<f32>,
+    presence_penalty: Option<f32>,
+}
+
+fn request_sampler(opts: SamplerOptions) -> Result<SamplerConfig, Response> {
+    let SamplerOptions {
+        temperature,
+        top_p,
+        seed,
+        repetition_penalty,
+        presence_penalty,
+    } = opts;
     if temperature.is_some_and(|v| !v.is_finite() || v < 0.0) {
         return Err(error_response(
             StatusCode::BAD_REQUEST,
@@ -379,12 +397,33 @@ fn request_sampler(
             "top_p must be finite and between 0 and 1",
         ));
     }
+    if repetition_penalty.is_some_and(|v| !v.is_finite() || v <= 0.0) {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "repetition_penalty must be finite and > 0",
+        ));
+    }
+    if presence_penalty.is_some_and(|v| !v.is_finite()) {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "presence_penalty must be finite",
+        ));
+    }
     let mut config = SamplerConfig::default();
     if let Some(v) = temperature {
         config.temperature = v;
+        if v < 1e-6 {
+            config.repetition_penalty = 1.0;
+        }
     }
     if let Some(v) = top_p {
         config.top_p = v;
+    }
+    if let Some(v) = repetition_penalty {
+        config.repetition_penalty = v;
+    }
+    if let Some(v) = presence_penalty {
+        config.presence_penalty = v;
     }
     config.seed = seed;
     Ok(config)
@@ -399,6 +438,13 @@ struct ChatCompletionsRequest {
     temperature: Option<f32>,
     top_p: Option<f32>,
     seed: Option<u64>,
+    /// vLLM-style extras: multiplicative repetition penalty (the engine
+    /// default is 1.1; `temperature: 0` alone makes it 1.0) and a flat
+    /// presence penalty on every seen token.
+    #[serde(default)]
+    repetition_penalty: Option<f32>,
+    #[serde(default)]
+    presence_penalty: Option<f32>,
     #[serde(default = "default_max_tokens")]
     max_tokens: u32,
     #[serde(default)]
@@ -660,7 +706,13 @@ async fn chat_completions(
         } else {
             state.runtime.active_selection().await
         };
-    let mut sampler_config = match request_sampler(req.temperature, req.top_p, req.seed) {
+    let mut sampler_config = match request_sampler(SamplerOptions {
+        temperature: req.temperature,
+        top_p: req.top_p,
+        seed: req.seed,
+        repetition_penalty: req.repetition_penalty,
+        presence_penalty: req.presence_penalty,
+    }) {
         Ok(config) => config,
         Err(response) => return response,
     };
@@ -1366,6 +1418,10 @@ struct CompletionsRequest {
     model: String,
     prompt: String,
     temperature: Option<f32>,
+    #[serde(default)]
+    repetition_penalty: Option<f32>,
+    #[serde(default)]
+    presence_penalty: Option<f32>,
     #[serde(default = "default_max_tokens")]
     max_tokens: u32,
 }
@@ -1393,7 +1449,12 @@ async fn completions(
 ) -> Response {
     let prompt_ids = state.tokenizer.encode(&req.prompt);
 
-    let sampler_config = match request_sampler(req.temperature, None, None) {
+    let sampler_config = match request_sampler(SamplerOptions {
+        temperature: req.temperature,
+        repetition_penalty: req.repetition_penalty,
+        presence_penalty: req.presence_penalty,
+        ..Default::default()
+    }) {
         Ok(config) => config,
         Err(response) => return response,
     };
@@ -1494,19 +1555,54 @@ mod tests {
 
     #[test]
     fn sampler_options_start_from_defaults_and_validate_ranges() {
-        let changed = request_sampler(Some(0.2), Some(0.5), Some(7)).unwrap();
+        let opts = |temperature, top_p, seed| SamplerOptions {
+            temperature,
+            top_p,
+            seed,
+            ..Default::default()
+        };
+        let changed = request_sampler(opts(Some(0.2), Some(0.5), Some(7))).unwrap();
         assert_eq!(changed.temperature, 0.2);
         assert_eq!(changed.top_p, 0.5);
         assert_eq!(changed.seed, Some(7));
+        assert_eq!(changed.repetition_penalty, SamplerConfig::default().repetition_penalty);
 
-        let fresh = request_sampler(None, None, None).unwrap();
+        let fresh = request_sampler(opts(None, None, None)).unwrap();
         let defaults = SamplerConfig::default();
         assert_eq!(fresh.temperature, defaults.temperature);
         assert_eq!(fresh.top_p, defaults.top_p);
         assert_eq!(fresh.seed, None);
 
-        assert!(request_sampler(Some(-1.0), None, None).is_err());
-        assert!(request_sampler(None, Some(1.1), None).is_err());
+        assert!(request_sampler(opts(Some(-1.0), None, None)).is_err());
+        assert!(request_sampler(opts(None, Some(1.1), None)).is_err());
+        assert!(request_sampler(SamplerOptions {
+            repetition_penalty: Some(0.0),
+            ..Default::default()
+        })
+        .is_err());
+    }
+
+    /// `temperature: 0` is greedy in the CLI's `--greedy` sense: no
+    /// repetition penalty unless the request sets one, so the request
+    /// takes the engine's speculative fast path.
+    #[test]
+    fn greedy_request_drops_the_repetition_penalty_unless_set() {
+        let greedy = request_sampler(SamplerOptions {
+            temperature: Some(0.0),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(greedy.repetition_penalty, 1.0);
+        assert_eq!(greedy.presence_penalty, 0.0);
+        let pinned = request_sampler(SamplerOptions {
+            temperature: Some(0.0),
+            repetition_penalty: Some(1.1),
+            presence_penalty: Some(1.5),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(pinned.repetition_penalty, 1.1);
+        assert_eq!(pinned.presence_penalty, 1.5);
     }
 
     /// Cline / Roo-style clients send `content` as a block array once they
