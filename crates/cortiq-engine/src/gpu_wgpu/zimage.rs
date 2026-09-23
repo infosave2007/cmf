@@ -1,4 +1,4 @@
-//! Z-Image-Turbo on wgpu/Vulkan (plan WP2). OWNER: WP2 — this file only.
+//! Z-Image-Turbo / Z-Image on wgpu/Vulkan (plan WP2). OWNER: WP2 — this file only.
 //!
 //! Implements the `gpu::zimage_*` / `gpu::vae_decode_chain` contract
 //! (`gpu.rs`, "Z-Image-Turbo device contract"). Rules (plan §2.2):
@@ -14,11 +14,45 @@
 //! The module is `pub` (doc-hidden) so WP2's examples/tests can reach
 //! `pub` helpers added here without touching `gpu_wgpu.rs`.
 //!
-//! WP0 state: stubs, every entry declines.
+//! # B1 state: the fast-path kernels and the resident chain (synthetic weights)
+//!
+//! Everything below the contract stubs is the device machinery the
+//! integration package wires into `prepare`/`step`:
+//!
+//! - [`MmCfg`] / `zi_mm`: f16 plane × f16 activation → f32 accumulate on
+//!   the cooperative-matrix units (16×16×16), large tiles, register
+//!   prefetch of the next K slice, three epilogues: f32 store (O-proj, w2),
+//!   f16 store (qkv), SwiGLU (w1‖w3 interleaved in 16-row panels →
+//!   `silu(g)·u` stored f16 for w2).
+//! - `zi_flash`: bidirectional flash attention, heads 30×128, read straight
+//!   out of the fused qkv panel (no head-major pack), f16 Q·K and P·V on the
+//!   matrix units, f32 online softmax with the lazy (threshold) rescale, and
+//!   the output written in the `[token][head·128]` layout the O GEMM eats.
+//!   Per-segment dispatch = batch 2 (CFG cond + uncond) with each item's own
+//!   padded length, which is exactly diffusers' key mask.
+//! - `zi_rowop`: gated residual with the post-norm (x += tanh(g)·RMS(br)·w)
+//!   fused with the NEXT pre-norm·(1+s) → f16, one pass over the row.
+//! - `zi_qkrope`: per-head qk-RMSNorm + complex-interleaved RoPE, in place
+//!   on the f16 qkv panel.
+//! - `zi_embed` / `zi_final`: x_embedder (64→3840 +b, pad rows := x_pad) and
+//!   the final LayerNorm·scale + Linear(3840→64) +b, both f32.
+//! - [`ZChain`]: planes + per-(prompt, resolution) state + prebuilt bind
+//!   groups; the hidden state never leaves the device inside a step, the
+//!   modulation of all 32 blocks is one buffer written once per step.
+//!
+//! Batch 2 (base model with CFG) is first-class: tokens of both items are
+//! stacked along M, so every GEMM reads each weight tile once for both.
+//!
+//! Measurements live in the B1 report (`zimage_gemmbench` example); every
+//! kept kernel carries its own measured number in its doc comment.
 
-use crate::gpu::{ZGeom, ZPrepareArgs, ZStepArgs, ZBlockRef};
+use crate::gpu::{ZBlockRef, ZGeom, ZPrepareArgs, ZStepArgs};
 use cortiq_core::CmfModel;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+use wgpu::util::DeviceExt;
+
+use super::Ctx;
 
 /// Build/refresh the per-(prompt, resolution) state for `a.key`.
 pub(crate) fn prepare(_a: &ZPrepareArgs) -> bool {
@@ -31,7 +65,13 @@ pub(crate) fn step(_a: &mut ZStepArgs) -> bool {
 }
 
 /// Drop all module-local device state (planes, prepared states, VAE chain).
-pub(crate) fn release() {}
+pub(crate) fn release() {
+    if let Some(z) = ZP.get() {
+        if let Ok(mut g) = z.pipes.lock() {
+            g.clear();
+        }
+    }
+}
 
 /// Unmodulated context refiner on the device (s = 0, gate = 1).
 pub(crate) fn refine_caption(
@@ -53,4 +93,1347 @@ pub(crate) fn vae_decode_chain(
     _out: &mut [f32],
 ) -> bool {
     false
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Pipeline cache (module-local; never a field of the parent's Ctx).
+// ════════════════════════════════════════════════════════════════════
+
+struct ZPipes {
+    pipes: Mutex<HashMap<String, Arc<wgpu::ComputePipeline>>>,
+}
+
+static ZP: OnceLock<ZPipes> = OnceLock::new();
+
+/// The device context, but only where the fast path can run at all:
+/// cooperative matrices with the 16×16×16 f16→f32 shape (the parent's
+/// init checked the shape before raising `COOP_OK`), f16 in shaders, and
+/// 32-wide subgroups (the epilogues index lanes as `tid − 32·sg`).
+fn zctx() -> Option<&'static Ctx> {
+    let c = super::ctx()?;
+    if !super::coop_matrix_active() {
+        return None;
+    }
+    let f = c.device.features();
+    if !f.contains(wgpu::Features::SHADER_F16)
+        || !f.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
+    {
+        return None;
+    }
+    let i = c._adapter.get_info();
+    if i.subgroup_min_size != 32 || i.subgroup_max_size != 32 {
+        // Only NVIDIA-style 32-wide subgroups are written for; AMD wave64
+        // or Intel would need a lane map. Decline, CPU/Lumina path runs.
+        if std::env::var("CMF_ZI_ANY_SUBGROUP").as_deref() != Ok("1") {
+            return None;
+        }
+    }
+    Some(c)
+}
+
+/// Compile (once) and return a pipeline. Performance kernels are built
+/// WITHOUT naga's injected bounds checks and loop bounding: every buffer the
+/// chain binds is padded so the kernels stay in range by construction (M to
+/// the tile + one flash block, N and K to the tile). `CMF_ZI_CHECKED=1`
+/// builds them checked, for debugging an out-of-range suspicion.
+fn pipeline(c: &Ctx, key: &str, src: &str, entry: &str) -> Option<Arc<wgpu::ComputePipeline>> {
+    let zp = ZP.get_or_init(|| ZPipes {
+        pipes: Mutex::new(HashMap::new()),
+    });
+    if let Some(p) = zp.pipes.lock().ok()?.get(key) {
+        return Some(p.clone());
+    }
+    let checked = std::env::var("CMF_ZI_CHECKED").as_deref() == Ok("1");
+    let sc = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let desc = wgpu::ShaderModuleDescriptor {
+        label: Some(key),
+        source: wgpu::ShaderSource::Wgsl(src.into()),
+    };
+    let m = if checked {
+        c.device.create_shader_module(desc)
+    } else {
+        // SAFETY: the kernels in this file index only inside buffers the
+        // chain sizes for them (see the padding rules on `ZState`), and
+        // every loop has a uniform, finite trip count.
+        unsafe {
+            c.device
+                .create_shader_module_trusted(desc, wgpu::ShaderRuntimeChecks::unchecked())
+        }
+    };
+    if let Some(e) = pollster::block_on(sc.pop()) {
+        eprintln!("zimage: shader {key} rejected: {e}");
+        if std::env::var("CMF_ZI_DUMP_WGSL").is_ok() {
+            eprintln!("{src}");
+        }
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+        return None;
+    }
+    let sc = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let p = c.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some(key),
+        layout: None,
+        module: &m,
+        entry_point: Some(entry),
+        compilation_options: Default::default(),
+        cache: c.pipeline_cache.as_ref(),
+    });
+    if let Some(e) = pollster::block_on(sc.pop()) {
+        eprintln!("zimage: pipeline {key} rejected: {e}");
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+        return None;
+    }
+    let p = Arc::new(p);
+    zp.pipes.lock().ok()?.insert(key.to_string(), p.clone());
+    Some(p)
+}
+
+// ════════════════════════════════════════════════════════════════════
+// zi_mm — the tensor-core GEMM (plan S2/S4).
+// ════════════════════════════════════════════════════════════════════
+
+/// What a `zi_mm` tile does with its f32 accumulators.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Epi {
+    /// `out[m][ocol+n]` f32, stored straight from the accumulators.
+    F32,
+    /// `out[m][ocol+n]` f16 (qkv panel).
+    F16,
+    /// Plane rows interleaved in 16-row panels (gate, up, gate, up …):
+    /// writes `silu(gate)·up` as f16, output width N/2.
+    SwiGlu,
+}
+
+/// Tile geometry of one `zi_mm` pipeline. `bm × bn` output tile per
+/// workgroup, `bk` K slice per stage, `wm × wn` subgroups (32 lanes each),
+/// so every subgroup owns a `(bm/wm) × (bn/wn)` block of 16×16 accumulators.
+/// `direct` = coop-load the operands straight from global memory (no
+/// shared staging) — the A/B arm for the staging choreography.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MmCfg {
+    pub bm: u32,
+    pub bn: u32,
+    pub bk: u32,
+    pub wm: u32,
+    pub wn: u32,
+    pub epi: Epi,
+    pub direct: bool,
+}
+
+impl MmCfg {
+    pub const fn new(bm: u32, bn: u32, bk: u32, wm: u32, wn: u32, epi: Epi) -> Self {
+        Self { bm, bn, bk, wm, wn, epi, direct: false }
+    }
+    pub fn valid(&self) -> bool {
+        let nt = self.wm * self.wn * 32;
+        let (tm, tn) = (self.bm / self.wm.max(1), self.bn / self.wn.max(1));
+        let vpr = self.bk / 4;
+        nt > 0
+            && nt <= 1024
+            && self.bk % 16 == 0
+            && tm % 16 == 0
+            && tn % 16 == 0
+            && tm * self.wm == self.bm
+            && tn * self.wn == self.bn
+            && (self.bm * vpr) % nt == 0
+            && (self.bn * vpr) % nt == 0
+            && (self.epi != Epi::SwiGlu || (tn / 16) % 2 == 0)
+            && (self.epi == Epi::F32 || (16 * tn / 8) % 32 == 0)
+    }
+    fn key(&self) -> String {
+        format!(
+            "zi_mm_{}x{}x{}_{}x{}_{:?}{}",
+            self.bm,
+            self.bn,
+            self.bk,
+            self.wm,
+            self.wn,
+            self.epi,
+            if self.direct { "_d" } else { "" }
+        )
+    }
+    /// Workgroup-shared bytes this variant declares.
+    pub fn shared_bytes(&self) -> u32 {
+        let lds = self.bk + 8;
+        let stage = if self.direct { 0 } else { (self.bm + self.bn) * lds * 2 };
+        let tn = self.bn / self.wn;
+        let sc = if self.epi == Epi::F32 { 0 } else { self.wm * self.wn * 16 * tn * 4 };
+        stage + sc
+    }
+}
+
+/// The default tiles, picked by `zimage_gemmbench mm` on the RTX 3090
+/// (see the module doc of the report). Overridable per epilogue with
+/// `CMF_ZI_TILE=bm,bn,bk,wm,wn`.
+pub fn default_cfg(epi: Epi) -> MmCfg {
+    if let Ok(s) = std::env::var("CMF_ZI_TILE") {
+        let v: Vec<u32> = s.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+        if v.len() == 5 {
+            let c = MmCfg::new(v[0], v[1], v[2], v[3], v[4], epi);
+            if c.valid() {
+                return c;
+            }
+        }
+    }
+    MmCfg::new(128, 128, 32, 2, 4, epi)
+}
+
+/// WGSL of one `zi_mm` variant. Bindings: 0 plane `[N][K]` f16 (as
+/// `vec4<f16>`), 1 activation `[M][K]` f16, 2 output, 3 `MmP`.
+pub fn mm_src(g: MmCfg) -> String {
+    use std::fmt::Write;
+    assert!(g.valid(), "invalid zi_mm cfg {g:?}");
+    let nw = g.wm * g.wn;
+    let nt = nw * 32;
+    let tm = g.bm / g.wm;
+    let tn = g.bn / g.wn;
+    let fm = tm / 16;
+    let fnn = tn / 16;
+    let lds = g.bk + 8;
+    let vpr = g.bk / 4;
+    let la = g.bm * vpr / nt;
+    let lb = g.bn * vpr / nt;
+    let mut s = String::new();
+    let _ = writeln!(s, "enable f16;\nenable wgpu_cooperative_matrix;");
+    let _ = writeln!(s, "diagnostic(off, derivative_uniformity);");
+    let _ = writeln!(
+        s,
+        "struct MmP {{ m: u32, n: u32, k: u32, ldo: u32, ocol: u32, arow: u32, oscale: f32, _p: u32 }};"
+    );
+    if g.direct {
+        let _ = writeln!(s, "@group(0) @binding(0) var<storage, read> wt: array<f16>;");
+        let _ = writeln!(s, "@group(0) @binding(1) var<storage, read> act: array<f16>;");
+    } else {
+        let _ = writeln!(s, "@group(0) @binding(0) var<storage, read> wt: array<vec4<f16>>;");
+        let _ = writeln!(s, "@group(0) @binding(1) var<storage, read> act: array<vec4<f16>>;");
+    }
+    match g.epi {
+        Epi::F32 => {
+            let _ = writeln!(s, "@group(0) @binding(2) var<storage, read_write> outp: array<f32>;");
+        }
+        _ => {
+            let _ = writeln!(s, "@group(0) @binding(2) var<storage, read_write> outp: array<vec4<u32>>;");
+        }
+    }
+    let _ = writeln!(s, "@group(0) @binding(3) var<uniform> p: MmP;");
+    if !g.direct {
+        let _ = writeln!(s, "var<workgroup> sa: array<f16, {}>;", g.bm * lds);
+        let _ = writeln!(s, "var<workgroup> sb: array<f16, {}>;", g.bn * lds);
+    }
+    if g.epi != Epi::F32 {
+        let _ = writeln!(s, "var<workgroup> sc: array<f32, {}>;", nw * 16 * tn);
+    }
+    let _ = writeln!(
+        s,
+        "@compute @workgroup_size({nt})\nfn zi_mm(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) tid: u32, @builtin(subgroup_id) sg: u32) {{"
+    );
+    let _ = writeln!(s, "  let m0 = wid.y * {}u; let n0 = wid.x * {}u;", g.bm, g.bn);
+    let _ = writeln!(s, "  let wy = sg / {}u; let wx = sg % {}u;", g.wn, g.wn);
+    for i in 0..fm {
+        for j in 0..fnn {
+            let _ = writeln!(s, "  var c{i}_{j}: coop_mat16x16<f32, C>;");
+        }
+    }
+    let _ = writeln!(s, "  let nkt = p.k / {}u;", g.bk);
+    if g.direct {
+        // Operands straight from global memory: no barriers at all.
+        let _ = writeln!(s, "  let ar = p.arow + m0 + wy * {tm}u; let br = n0 + wx * {tn}u;");
+        let _ = writeln!(s, "  for (var kt = 0u; kt < nkt; kt = kt + 1u) {{");
+        for kk in 0..g.bk / 16 {
+            let _ = writeln!(s, "    {{ let k0 = kt * {}u + {}u;", g.bk, kk * 16);
+            for j in 0..fnn {
+                let _ = writeln!(
+                    s,
+                    "      let b{j} = coopLoad<coop_mat16x16<f16, B>>(&wt[(br + {}u) * p.k + k0], p.k);",
+                    j * 16
+                );
+            }
+            for i in 0..fm {
+                let _ = writeln!(
+                    s,
+                    "      let a{i} = coopLoadT<coop_mat16x16<f16, A>>(&act[(ar + {}u) * p.k + k0], p.k);",
+                    i * 16
+                );
+                for j in 0..fnn {
+                    let _ = writeln!(s, "      c{i}_{j} = coopMultiplyAdd(a{i}, b{j}, c{i}_{j});");
+                }
+            }
+            let _ = writeln!(s, "    }}");
+        }
+        let _ = writeln!(s, "  }}");
+    } else {
+        let _ = writeln!(s, "  let kq = p.k / 4u;");
+        for t in 0..la {
+            let _ = writeln!(
+                s,
+                "  var ra{t} = act[(p.arow + m0 + (tid + {o}u) / {vpr}u) * kq + (tid + {o}u) % {vpr}u];",
+                o = t * nt
+            );
+        }
+        for t in 0..lb {
+            let _ = writeln!(
+                s,
+                "  var rb{t} = wt[(n0 + (tid + {o}u) / {vpr}u) * kq + (tid + {o}u) % {vpr}u];",
+                o = t * nt
+            );
+        }
+        let _ = writeln!(s, "  for (var kt = 0u; kt < nkt; kt = kt + 1u) {{");
+        for (arr, reg, cnt) in [("sa", "ra", la), ("sb", "rb", lb)] {
+            for t in 0..cnt {
+                let _ = writeln!(
+                    s,
+                    "    {{ let d = ((tid + {o}u) / {vpr}u) * {lds}u + ((tid + {o}u) % {vpr}u) * 4u; {arr}[d] = {reg}{t}.x; {arr}[d + 1u] = {reg}{t}.y; {arr}[d + 2u] = {reg}{t}.z; {arr}[d + 3u] = {reg}{t}.w; }}",
+                    o = t * nt
+                );
+            }
+        }
+        let _ = writeln!(s, "    workgroupBarrier();");
+        let _ = writeln!(s, "    if (kt + 1u < nkt) {{ let kb = (kt + 1u) * {vpr}u;");
+        for t in 0..la {
+            let _ = writeln!(
+                s,
+                "      ra{t} = act[(p.arow + m0 + (tid + {o}u) / {vpr}u) * kq + kb + (tid + {o}u) % {vpr}u];",
+                o = t * nt
+            );
+        }
+        for t in 0..lb {
+            let _ = writeln!(
+                s,
+                "      rb{t} = wt[(n0 + (tid + {o}u) / {vpr}u) * kq + kb + (tid + {o}u) % {vpr}u];",
+                o = t * nt
+            );
+        }
+        let _ = writeln!(s, "    }}");
+        for kk in 0..g.bk / 16 {
+            let _ = writeln!(s, "    {{");
+            for j in 0..fnn {
+                let _ = writeln!(
+                    s,
+                    "      let b{j} = coopLoad<coop_mat16x16<f16, B>>(&sb[(wx * {tn}u + {}u) * {lds}u + {}u], {lds}u);",
+                    j * 16,
+                    kk * 16
+                );
+            }
+            for i in 0..fm {
+                let _ = writeln!(
+                    s,
+                    "      let a{i} = coopLoadT<coop_mat16x16<f16, A>>(&sa[(wy * {tm}u + {}u) * {lds}u + {}u], {lds}u);",
+                    i * 16,
+                    kk * 16
+                );
+                for j in 0..fnn {
+                    let _ = writeln!(s, "      c{i}_{j} = coopMultiplyAdd(a{i}, b{j}, c{i}_{j});");
+                }
+            }
+            let _ = writeln!(s, "    }}");
+        }
+        let _ = writeln!(s, "    workgroupBarrier();");
+        let _ = writeln!(s, "  }}");
+    }
+    // ── epilogue
+    let _ = writeln!(s, "  let orow = m0 + wy * {tm}u;");
+    match g.epi {
+        Epi::F32 => {
+            let _ = writeln!(s, "  let ocol = p.ocol + n0 + wx * {tn}u;");
+            for i in 0..fm {
+                for j in 0..fnn {
+                    let _ = writeln!(
+                        s,
+                        "  coopStoreT(c{i}_{j}, &outp[(orow + {}u) * p.ldo + ocol + {}u], p.ldo);",
+                        i * 16,
+                        j * 16
+                    );
+                }
+            }
+        }
+        Epi::F16 => {
+            let _ = writeln!(s, "  let ocol = p.ocol + n0 + wx * {tn}u;");
+            let _ = writeln!(s, "  let lane = tid - sg * 32u;");
+            let _ = writeln!(s, "  let sb0 = sg * {}u;", 16 * tn);
+            let chunks = 16 * tn / 8 / 32;
+            let cpr = tn / 8;
+            for i in 0..fm {
+                for j in 0..fnn {
+                    let _ = writeln!(s, "  coopStoreT(c{i}_{j}, &sc[sb0 + {}u], {tn}u);", j * 16);
+                }
+                let _ = writeln!(s, "  workgroupBarrier();");
+                for q in 0..chunks {
+                    let _ = writeln!(
+                        s,
+                        "  {{ let idx = lane + {}u; let r = idx / {cpr}u; let c8 = (idx % {cpr}u) * 8u; let b = sb0 + r * {tn}u + c8;",
+                        q * 32
+                    );
+                    let _ = writeln!(s, "    let v = vec4<u32>(pack2x16float(vec2<f32>(sc[b], sc[b + 1u]) * p.oscale), pack2x16float(vec2<f32>(sc[b + 2u], sc[b + 3u]) * p.oscale), pack2x16float(vec2<f32>(sc[b + 4u], sc[b + 5u]) * p.oscale), pack2x16float(vec2<f32>(sc[b + 6u], sc[b + 7u]) * p.oscale));");
+                    let _ = writeln!(
+                        s,
+                        "    outp[((orow + {}u + r) * p.ldo + ocol + c8) / 8u] = v; }}",
+                        i * 16
+                    );
+                }
+                let _ = writeln!(s, "  workgroupBarrier();");
+            }
+        }
+        Epi::SwiGlu => {
+            // Output column base: the plane's 32-row panel (gate16, up16)
+            // → 16 output columns.
+            let _ = writeln!(s, "  let ocol = (p.ocol + n0 + wx * {tn}u) / 2u;");
+            let _ = writeln!(s, "  let lane = tid - sg * 32u;");
+            let _ = writeln!(s, "  let sb0 = sg * {}u;", 16 * tn);
+            let half = tn / 2;
+            let cpr = half / 8;
+            let chunks = 16 * half / 8 / 32;
+            for i in 0..fm {
+                for j in 0..fnn {
+                    let _ = writeln!(s, "  coopStoreT(c{i}_{j}, &sc[sb0 + {}u], {tn}u);", j * 16);
+                }
+                let _ = writeln!(s, "  workgroupBarrier();");
+                for q in 0..chunks {
+                    let _ = writeln!(
+                        s,
+                        "  {{ let idx = lane + {}u; let r = idx / {cpr}u; let c8 = (idx % {cpr}u) * 8u;",
+                        q * 32
+                    );
+                    let _ = writeln!(
+                        s,
+                        "    let gb = sb0 + r * {tn}u + (c8 / 16u) * 32u + (c8 % 16u); let ub = gb + 16u;"
+                    );
+                    let _ = writeln!(s, "    var h: array<f32, 8>;");
+                    let _ = writeln!(s, "    for (var e = 0u; e < 8u; e = e + 1u) {{ let gg = sc[gb + e]; h[e] = gg / (1.0 + exp(-gg)) * sc[ub + e] * p.oscale; }}");
+                    let _ = writeln!(s, "    outp[((orow + {}u + r) * p.ldo + ocol + c8) / 8u] = vec4<u32>(pack2x16float(vec2<f32>(h[0], h[1])), pack2x16float(vec2<f32>(h[2], h[3])), pack2x16float(vec2<f32>(h[4], h[5])), pack2x16float(vec2<f32>(h[6], h[7]))); }}", i * 16);
+                }
+                let _ = writeln!(s, "  workgroupBarrier();");
+            }
+        }
+    }
+    let _ = writeln!(s, "}}");
+    s
+}
+
+fn mm_pipe(c: &Ctx, g: MmCfg) -> Option<Arc<wgpu::ComputePipeline>> {
+    if !g.valid() || g.shared_bytes() > c.device.limits().max_compute_workgroup_storage_size {
+        return None;
+    }
+    pipeline(c, &g.key(), &mm_src(g), "zi_mm")
+}
+
+/// Uniform of one `zi_mm` dispatch.
+#[derive(Clone, Copy, Debug)]
+pub struct MmArgs {
+    /// Rows the dispatch covers (padded to `bm` by the caller's buffers).
+    pub m: u32,
+    /// Plane rows (output columns before SwiGLU halving).
+    pub n: u32,
+    pub k: u32,
+    /// Output row stride in elements, and output column offset (for SwiGLU:
+    /// in plane-row units; the kernel halves it).
+    pub ldo: u32,
+    pub ocol: u32,
+    /// First activation row.
+    pub arow: u32,
+    /// Output multiplier (1.0 = none); for the f16 epilogues it is the
+    /// power-of-two range guard the next GEMM divides back out.
+    pub oscale: f32,
+}
+
+fn mm_uniform(c: &Ctx, a: &MmArgs) -> wgpu::Buffer {
+    let w: [u32; 8] = [a.m, a.n, a.k, a.ldo, a.ocol, a.arow, a.oscale.to_bits(), 0];
+    c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("zi_mm_p"),
+        contents: bytemuck::cast_slice(&w),
+        usage: wgpu::BufferUsages::UNIFORM,
+    })
+}
+
+/// One prebuilt GEMM dispatch.
+struct MmCall {
+    pipe: Arc<wgpu::ComputePipeline>,
+    bg: wgpu::BindGroup,
+    grid: (u32, u32),
+}
+
+fn mm_call(
+    c: &Ctx,
+    g: MmCfg,
+    a: &MmArgs,
+    plane: &wgpu::Buffer,
+    act: &wgpu::Buffer,
+    out: &wgpu::Buffer,
+) -> Option<MmCall> {
+    if a.n % g.bn != 0 || a.k % g.bk != 0 {
+        return None;
+    }
+    let pipe = mm_pipe(c, g)?;
+    let u = mm_uniform(c, a);
+    let bg = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("zi_mm"),
+        layout: &pipe.get_bind_group_layout(0),
+        entries: &[
+            super::bind_buf(0, plane),
+            super::bind_buf(1, act),
+            super::bind_buf(2, out),
+            super::bind_buf(3, &u),
+        ],
+    });
+    Some(MmCall {
+        pipe,
+        bg,
+        grid: (a.n / g.bn, a.m.div_ceil(g.bm)),
+    })
+}
+
+impl MmCall {
+    fn record(&self, pass: &mut wgpu::ComputePass) {
+        pass.set_pipeline(&self.pipe);
+        pass.set_bind_group(0, &self.bg, &[]);
+        pass.dispatch_workgroups(self.grid.0, self.grid.1, 1);
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════
+// zi_flash — bidirectional flash attention on the matrix units (plan S3).
+// ════════════════════════════════════════════════════════════════════
+
+/// Flash-attention variant: `nw` subgroups × 16 query rows per workgroup,
+/// `bc` keys per block (multiple of 16; Z-Image segment lengths are
+/// multiples of 32, so bc ∈ {16, 32} never needs a key mask).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FlashCfg {
+    pub nw: u32,
+    pub bc: u32,
+}
+
+impl FlashCfg {
+    pub fn shared_bytes(&self) -> u32 {
+        let ldk = 128 + 8;
+        let ldp = self.bc + 8;
+        2 * self.bc * ldk * 2 + self.nw * 16 * self.bc * 4 + self.nw * 16 * ldp * 2
+            + self.nw * 32 * 4 * 2
+            + 8
+    }
+    fn key(&self) -> String {
+        format!("zi_flash_{}_{}", self.nw, self.bc)
+    }
+}
+
+pub fn default_flash() -> FlashCfg {
+    if let Ok(s) = std::env::var("CMF_ZI_FLASH") {
+        let v: Vec<u32> = s.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+        if v.len() == 2 {
+            return FlashCfg { nw: v[0], bc: v[1] };
+        }
+    }
+    FlashCfg { nw: 4, bc: 32 }
+}
+
+/// WGSL of `zi_flash`. hd is fixed at 128 (8 fragments of 16).
+/// Bindings: 0 qkv panel as f16 (Q fragments load straight from it),
+/// 1 the same buffer as `vec4<f16>` (K/V tiles), 2 output `[M][o_ld]` f16
+/// (as `vec4<u32>`), 3 `FP`.
+///
+/// Per block of `bc` keys, per subgroup (16 query rows):
+///   S = Q·Kᵀ (f32 acc) → shared → lanes (row = lane&15, half = lane>>4)
+///   take the row max; if ANY row of the workgroup grew past the max the
+///   exponentials are anchored at by > 8 (log2 units) every subgroup
+///   rescales its O accumulators through shared (the FA4 lazy rescale —
+///   exact; P ≤ 2⁸ so f16 P is safe), P = 2^(s·scale·log2e − m) → f16 →
+///   O += P·V. The workgroup-uniform decision costs one
+///   `workgroupUniformLoad` per block instead of a per-row rescale.
+pub fn flash_src(f: FlashCfg) -> String {
+    use std::fmt::Write;
+    let nt = f.nw * 32;
+    let bc = f.bc;
+    let ldk = 136u32;
+    let ldp = bc + 8;
+    let nkf = bc / 16;
+    let vk = bc * 16; // vec4<f16> per K (or V) tile: bc rows × 128/8… (128 halves = 32 vec4<f16>)
+    let vk = vk * 2; // 128 halves / 4 = 32 vec4<f16> per row
+    let per = vk / nt;
+    assert!(per * nt == vk, "flash cfg {f:?}");
+    let half = bc / 2;
+    let mut s = String::new();
+    let _ = writeln!(s, "enable f16;\nenable wgpu_cooperative_matrix;\ndiagnostic(off, derivative_uniformity);");
+    let _ = writeln!(s, "struct FP {{ q_off: u32, len: u32, ld: u32, k_col: u32, v_col: u32, o_ld: u32, scl: f32, nh: u32 }};");
+    let _ = writeln!(s, "@group(0) @binding(0) var<storage, read> qh: array<f16>;");
+    let _ = writeln!(s, "@group(0) @binding(1) var<storage, read> qv: array<vec4<f16>>;");
+    let _ = writeln!(s, "@group(0) @binding(2) var<storage, read_write> oh: array<vec4<u32>>;");
+    let _ = writeln!(s, "@group(0) @binding(3) var<uniform> p: FP;");
+    let _ = writeln!(s, "var<workgroup> sk: array<f16, {}>;", bc * ldk);
+    let _ = writeln!(s, "var<workgroup> sv: array<f16, {}>;", bc * ldk);
+    let _ = writeln!(s, "var<workgroup> ss: array<f32, {}>;", f.nw * 16 * bc);
+    let _ = writeln!(s, "var<workgroup> sp: array<f16, {}>;", f.nw * 16 * ldp);
+    let _ = writeln!(s, "var<workgroup> smx: array<f32, {}>;", nt);
+    let _ = writeln!(s, "var<workgroup> sfl: array<u32, 2>;");
+    let _ = writeln!(s, "@compute @workgroup_size({nt})\nfn zi_flash(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) tid: u32, @builtin(subgroup_id) sg: u32) {{");
+    let _ = writeln!(s, "  let h = wid.y;");
+    let _ = writeln!(s, "  let q0 = wid.x * {}u + sg * 16u;", f.nw * 16);
+    let _ = writeln!(s, "  let qrow = p.q_off + q0;");
+    let _ = writeln!(s, "  let lane = tid - sg * 32u;");
+    let _ = writeln!(s, "  let r = lane & 15u; let hf = lane >> 4u;");
+    let _ = writeln!(s, "  let ldq = p.ld / 4u;");
+    for d in 0..8 {
+        let _ = writeln!(s, "  let qa{d} = coopLoadT<coop_mat16x16<f16, A>>(&qh[qrow * p.ld + h * 128u + {}u], p.ld);", d * 16);
+    }
+    for j in 0..8 {
+        let _ = writeln!(s, "  var o{j}: coop_mat16x16<f32, C>;");
+    }
+    let _ = writeln!(s, "  var mu = -1.0e30; var ls = 0.0;");
+    let _ = writeln!(s, "  if (tid < 2u) {{ sfl[tid] = 0u; }}");
+    let _ = writeln!(s, "  let nkb = p.len / {bc}u;");
+    // prefetch registers for K and V tiles
+    for t in 0..per {
+        let _ = writeln!(s, "  var rk{t}: vec4<f16>; var rv{t}: vec4<f16>;");
+        let _ = writeln!(s, "  {{ let idx = tid + {o}u; let row = p.q_off + idx / 32u; let c4 = idx % 32u; rk{t} = qv[row * ldq + (p.k_col + h * 128u) / 4u + c4]; rv{t} = qv[row * ldq + (p.v_col + h * 128u) / 4u + c4]; }}", o = t * nt);
+    }
+    let _ = writeln!(s, "  for (var kb = 0u; kb < nkb; kb = kb + 1u) {{");
+    for t in 0..per {
+        let _ = writeln!(s, "    {{ let idx = tid + {o}u; let d = (idx / 32u) * {ldk}u + (idx % 32u) * 4u; sk[d] = rk{t}.x; sk[d + 1u] = rk{t}.y; sk[d + 2u] = rk{t}.z; sk[d + 3u] = rk{t}.w; sv[d] = rv{t}.x; sv[d + 1u] = rv{t}.y; sv[d + 2u] = rv{t}.z; sv[d + 3u] = rv{t}.w; }}", o = t * nt);
+    }
+    let _ = writeln!(s, "    workgroupBarrier();");
+    let _ = writeln!(s, "    if (kb + 1u < nkb) {{");
+    for t in 0..per {
+        let _ = writeln!(s, "      {{ let idx = tid + {o}u; let row = p.q_off + (kb + 1u) * {bc}u + idx / 32u; let c4 = idx % 32u; rk{t} = qv[row * ldq + (p.k_col + h * 128u) / 4u + c4]; rv{t} = qv[row * ldq + (p.v_col + h * 128u) / 4u + c4]; }}", o = t * nt);
+    }
+    let _ = writeln!(s, "    }}");
+    // S = Q K^T
+    for j in 0..nkf {
+        let _ = writeln!(s, "    var s{j}: coop_mat16x16<f32, C>;");
+        for d in 0..8 {
+            let _ = writeln!(s, "    s{j} = coopMultiplyAdd(qa{d}, coopLoad<coop_mat16x16<f16, B>>(&sk[{}u], {ldk}u), s{j});", j * 16 * ldk + d * 16);
+        }
+        let _ = writeln!(s, "    coopStoreT(s{j}, &ss[sg * {}u + {}u], {bc}u);", 16 * bc, j * 16);
+    }
+    let _ = writeln!(s, "    workgroupBarrier();");
+    // partial row max
+    let _ = writeln!(s, "    let sbase = sg * {}u + r * {bc}u + hf * {half}u;", 16 * bc);
+    let _ = writeln!(s, "    var pm = -1.0e30;");
+    let _ = writeln!(s, "    for (var e = 0u; e < {half}u; e = e + 1u) {{ pm = max(pm, ss[sbase + e] * p.scl); }}");
+    let _ = writeln!(s, "    smx[tid] = pm;");
+    let _ = writeln!(s, "    if (pm > mu + 8.0) {{ sfl[kb & 1u] = 1u; }}");
+    let _ = writeln!(s, "    let need = workgroupUniformLoad(&sfl[kb & 1u]);");
+    let _ = writeln!(s, "    if (tid == 0u) {{ sfl[(kb + 1u) & 1u] = 0u; }}");
+    let _ = writeln!(s, "    let rmax = max(pm, smx[tid ^ 16u]);");
+    let _ = writeln!(s, "    if (need != 0u) {{");
+    let _ = writeln!(s, "      let mn = max(mu, rmax);");
+    let _ = writeln!(s, "      let alpha = exp2(mu - mn);");
+    let _ = writeln!(s, "      ls = ls * alpha; mu = mn;");
+    let _ = writeln!(s, "      if (kb > 0u) {{");
+    // rescale O through ss, nkf accumulators per round
+    let rounds = 8 / nkf;
+    for rd in 0..rounds {
+        for q in 0..nkf {
+            let j = rd * nkf + q;
+            let _ = writeln!(s, "        coopStoreT(o{j}, &ss[sg * {}u + {}u], {bc}u);", 16 * bc, q * 16);
+        }
+        let _ = writeln!(s, "        workgroupBarrier();");
+        let _ = writeln!(s, "        for (var e = 0u; e < {half}u; e = e + 1u) {{ ss[sbase + e] = ss[sbase + e] * alpha; }}");
+        let _ = writeln!(s, "        workgroupBarrier();");
+        for q in 0..nkf {
+            let j = rd * nkf + q;
+            let _ = writeln!(s, "        o{j} = coopLoadT<coop_mat16x16<f32, C>>(&ss[sg * {}u + {}u], {bc}u);", 16 * bc, q * 16);
+        }
+        let _ = writeln!(s, "        workgroupBarrier();");
+    }
+    let _ = writeln!(s, "      }}");
+    // the S values were overwritten by the rescale rounds when kb > 0:
+    // recompute S is too costly; instead the rescale rounds run BEFORE
+    // reading S? — no: S lives in ss too. Store S again from registers.
+    for j in 0..nkf {
+        let _ = writeln!(s, "      coopStoreT(s{j}, &ss[sg * {}u + {}u], {bc}u);", 16 * bc, j * 16);
+    }
+    let _ = writeln!(s, "      workgroupBarrier();");
+    let _ = writeln!(s, "    }}");
+    // P = exp2(s*scl - mu) → f16, row sums
+    let _ = writeln!(s, "    let pbase = sg * {}u + r * {ldp}u + hf * {half}u;", 16 * ldp);
+    let _ = writeln!(s, "    for (var e = 0u; e < {half}u; e = e + 1u) {{ let pv = exp2(ss[sbase + e] * p.scl - mu); ls = ls + pv; sp[pbase + e] = f16(pv); }}");
+    let _ = writeln!(s, "    workgroupBarrier();");
+    // O += P V
+    for kk in 0..nkf {
+        let _ = writeln!(s, "    {{ let pa = coopLoadT<coop_mat16x16<f16, A>>(&sp[sg * {}u + {}u], {ldp}u);", 16 * ldp, kk * 16);
+        for j in 0..8 {
+            let _ = writeln!(s, "      o{j} = coopMultiplyAdd(pa, coopLoadT<coop_mat16x16<f16, B>>(&sv[{}u], {ldk}u), o{j});", kk * 16 * ldk + j * 16);
+        }
+        let _ = writeln!(s, "    }}");
+    }
+    let _ = writeln!(s, "    workgroupBarrier();");
+    let _ = writeln!(s, "  }}");
+    // finalize: l per row, O / l → f16 out
+    let _ = writeln!(s, "  smx[tid] = ls;");
+    let _ = writeln!(s, "  workgroupBarrier();");
+    let _ = writeln!(s, "  let lt = ls + smx[tid ^ 16u];");
+    let _ = writeln!(s, "  let inv = select(0.0, 1.0 / lt, lt > 0.0);");
+    let _ = writeln!(s, "  let sbase = sg * {}u + r * {bc}u + hf * {half}u;", 16 * bc);
+    let _ = writeln!(s, "  let orow = qrow + r;");
+    let _ = writeln!(s, "  let live = q0 + r < p.len;");
+    for rd in 0..rounds {
+        for q in 0..nkf {
+            let j = rd * nkf + q;
+            let _ = writeln!(s, "  coopStoreT(o{j}, &ss[sg * {}u + {}u], {bc}u);", 16 * bc, q * 16);
+        }
+        let _ = writeln!(s, "  workgroupBarrier();");
+        // this lane's `half` columns → half/8 vec4<u32> stores
+        let _ = writeln!(s, "  if (live) {{");
+        for c8 in 0..half / 8 {
+            let b = format!("sbase + {}u", c8 * 8);
+            let _ = writeln!(s, "    {{ let b = {b}; oh[(orow * p.o_ld + h * 128u + {}u + hf * {half}u + {}u) / 8u] = vec4<u32>(pack2x16float(vec2<f32>(ss[b], ss[b + 1u]) * inv), pack2x16float(vec2<f32>(ss[b + 2u], ss[b + 3u]) * inv), pack2x16float(vec2<f32>(ss[b + 4u], ss[b + 5u]) * inv), pack2x16float(vec2<f32>(ss[b + 6u], ss[b + 7u]) * inv)); }}", rd * bc, c8 * 8);
+        }
+        let _ = writeln!(s, "  }}");
+        let _ = writeln!(s, "  workgroupBarrier();");
+    }
+    let _ = writeln!(s, "}}");
+    s
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Row kernels: gated residual + next pre-norm, qk-norm + RoPE, embed,
+// final layer, fills.
+// ════════════════════════════════════════════════════════════════════
+
+/// `zi_rowop` mode bits.
+pub const ROW_GRES: u32 = 1; // x += gate · RMS(br)·w_post
+pub const ROW_GATE_MOD: u32 = 2; // gate = tanh(mods[g_off..]) (else 1)
+pub const ROW_SCALE_MOD: u32 = 4; // pre-norm ·(1 + mods[s_off..]) (else ·1)
+pub const ROW_PRE: u32 = 8; // write the next pre-norm as f16 into xn
+
+const ROWOP_SRC: &str = r#"
+struct RP { h: u32, mode: u32, g_off: u32, s_off: u32, eps_post: f32, eps_pre: f32, oscale: f32, _p: u32 };
+@group(0) @binding(0) var<storage, read> br: array<f32>;
+@group(0) @binding(1) var<storage, read_write> x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> xn: array<u32>;
+@group(0) @binding(3) var<storage, read> wpost: array<f32>;
+@group(0) @binding(4) var<storage, read> wpre: array<f32>;
+@group(0) @binding(5) var<storage, read> mods: array<f32>;
+@group(0) @binding(6) var<uniform> rp: RP;
+var<workgroup> red: array<f32, 256>;
+
+fn wsum(v: f32, lid: u32) -> f32 {
+    red[lid] = v;
+    workgroupBarrier();
+    var st = 128u;
+    loop {
+        if (st == 0u) { break; }
+        if (lid < st) { red[lid] = red[lid] + red[lid + st]; }
+        workgroupBarrier();
+        st = st >> 1u;
+    }
+    let r = red[0];
+    workgroupBarrier();
+    return r;
+}
+
+// One workgroup per token row; each thread owns up to 8 pairs (hidden ≤ 4096).
+@compute @workgroup_size(256)
+fn zi_rowop(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let row = wid.x + wid.y * 65535u;
+    let np = rp.h / 2u;
+    let base = row * rp.h;
+    var xv: array<vec2<f32>, 8>;
+    if ((rp.mode & 1u) != 0u) {
+        var bv: array<vec2<f32>, 8>;
+        var ss = 0.0;
+        for (var j = 0u; j < 8u; j = j + 1u) {
+            let pi = lid + j * 256u;
+            if (pi < np) {
+                let b = vec2<f32>(br[base + 2u * pi], br[base + 2u * pi + 1u]);
+                bv[j] = b;
+                ss = ss + b.x * b.x + b.y * b.y;
+            }
+        }
+        let rr = inverseSqrt(wsum(ss, lid) / f32(rp.h) + rp.eps_post);
+        for (var j = 0u; j < 8u; j = j + 1u) {
+            let pi = lid + j * 256u;
+            if (pi < np) {
+                let c = 2u * pi;
+                var g = vec2<f32>(1.0, 1.0);
+                if ((rp.mode & 2u) != 0u) {
+                    g = tanh(vec2<f32>(mods[rp.g_off + c], mods[rp.g_off + c + 1u]));
+                }
+                let w = vec2<f32>(wpost[c], wpost[c + 1u]);
+                let xo = vec2<f32>(x[base + c], x[base + c + 1u]) + g * (bv[j] * rr) * w;
+                x[base + c] = xo.x;
+                x[base + c + 1u] = xo.y;
+                xv[j] = xo;
+            }
+        }
+    } else {
+        for (var j = 0u; j < 8u; j = j + 1u) {
+            let pi = lid + j * 256u;
+            if (pi < np) {
+                xv[j] = vec2<f32>(x[base + 2u * pi], x[base + 2u * pi + 1u]);
+            }
+        }
+    }
+    if ((rp.mode & 8u) == 0u) { return; }
+    var ss2 = 0.0;
+    for (var j = 0u; j < 8u; j = j + 1u) {
+        let pi = lid + j * 256u;
+        if (pi < np) { ss2 = ss2 + xv[j].x * xv[j].x + xv[j].y * xv[j].y; }
+    }
+    let r2 = inverseSqrt(wsum(ss2, lid) / f32(rp.h) + rp.eps_pre);
+    for (var j = 0u; j < 8u; j = j + 1u) {
+        let pi = lid + j * 256u;
+        if (pi < np) {
+            let c = 2u * pi;
+            var s = vec2<f32>(1.0, 1.0);
+            if ((rp.mode & 4u) != 0u) {
+                s = s + vec2<f32>(mods[rp.s_off + c], mods[rp.s_off + c + 1u]);
+            }
+            let y = xv[j] * r2 * vec2<f32>(wpre[c], wpre[c + 1u]) * s * rp.oscale;
+            xn[row * np + pi] = pack2x16float(y);
+        }
+    }
+}
+"#;
+
+const QKROPE_SRC: &str = r#"
+struct QP { ld: u32, nh: u32, eps: f32, _p: u32 };
+@group(0) @binding(0) var<storage, read_write> qkv: array<u32>;
+@group(0) @binding(1) var<storage, read> wq: array<f32>;
+@group(0) @binding(2) var<storage, read> wk: array<f32>;
+@group(0) @binding(3) var<storage, read> rc: array<f32>;
+@group(0) @binding(4) var<storage, read> rs: array<f32>;
+@group(0) @binding(5) var<uniform> qp: QP;
+var<workgroup> red: array<f32, 64>;
+
+// One workgroup (64 lanes = 64 complex pairs of hd 128) per (token, q|k
+// head). RMSNorm over the head (eps from QP), weight, then the
+// complex-interleaved rotation by the token's (cos, sin) row.
+@compute @workgroup_size(64)
+fn zi_qkrope(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let row = wid.y + wid.z * 65535u;
+    let hv = wid.x;
+    let isk = hv >= qp.nh;
+    let hh = hv % qp.nh;
+    let col = select(0u, qp.nh * 128u, isk) + hh * 128u;
+    let idx = (row * qp.ld + col) / 2u + lid;
+    let v = unpack2x16float(qkv[idx]);
+    red[lid] = v.x * v.x + v.y * v.y;
+    workgroupBarrier();
+    var st = 32u;
+    loop {
+        if (st == 0u) { break; }
+        if (lid < st) { red[lid] = red[lid] + red[lid + st]; }
+        workgroupBarrier();
+        st = st >> 1u;
+    }
+    let rr = inverseSqrt(red[0] / 128.0 + qp.eps);
+    var w = vec2<f32>(wq[2u * lid], wq[2u * lid + 1u]);
+    if (isk) { w = vec2<f32>(wk[2u * lid], wk[2u * lid + 1u]); }
+    let a = v.x * rr * w.x;
+    let b = v.y * rr * w.y;
+    let c = rc[row * 64u + lid];
+    let s = rs[row * 64u + lid];
+    qkv[idx] = pack2x16float(vec2<f32>(a * c - b * s, a * s + b * c));
+}
+"#;
+
+const EMBED_SRC: &str = r#"
+struct EP { h: u32, n_img: u32, seg: u32, pd: u32 };
+@group(0) @binding(0) var<storage, read> tok: array<f32>;
+@group(0) @binding(1) var<storage, read> w: array<f32>;
+@group(0) @binding(2) var<storage, read> b: array<f32>;
+@group(0) @binding(3) var<storage, read> xpad: array<f32>;
+@group(0) @binding(4) var<storage, read_write> x: array<f32>;
+@group(0) @binding(5) var<uniform> ep: EP;
+var<workgroup> tr: array<f32, 64>;
+
+// x_embedder: one workgroup per token row, 256 threads over the hidden
+// width; rows whose index inside their segment is ≥ n_img get x_pad.
+@compute @workgroup_size(256)
+fn zi_embed(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let row = wid.x;
+    let pad = (row % ep.seg) >= ep.n_img;
+    if (lid < ep.pd) { tr[lid] = tok[row * ep.pd + lid]; }
+    workgroupBarrier();
+    for (var c = lid; c < ep.h; c = c + 256u) {
+        var acc = b[c];
+        for (var k = 0u; k < ep.pd; k = k + 1u) { acc = acc + tr[k] * w[c * ep.pd + k]; }
+        x[row * ep.h + c] = select(acc, xpad[c], pad);
+    }
+}
+"#;
+
+const FINAL_SRC: &str = r#"
+struct FP { h: u32, pd: u32, eps: f32, n_img: u32, seg: u32, _a: u32, _b: u32, _c: u32 };
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> fsc: array<f32>;
+@group(0) @binding(2) var<storage, read> w: array<f32>;
+@group(0) @binding(3) var<storage, read> b: array<f32>;
+@group(0) @binding(4) var<storage, read_write> outp: array<f32>;
+@group(0) @binding(5) var<uniform> fp: FP;
+var<workgroup> y: array<f32, 4096>;
+var<workgroup> red: array<f32, 256>;
+
+fn wsum(v: f32, lid: u32) -> f32 {
+    red[lid] = v;
+    workgroupBarrier();
+    var st = 128u;
+    loop {
+        if (st == 0u) { break; }
+        if (lid < st) { red[lid] = red[lid] + red[lid + st]; }
+        workgroupBarrier();
+        st = st >> 1u;
+    }
+    let r = red[0];
+    workgroupBarrier();
+    return r;
+}
+
+// Final layer on IMAGE rows only: LayerNorm(eps, no affine)·scale, then
+// Linear(h → pd) + b, all f32. Workgroup = one output row; the output is
+// compacted to [batch][n_img][pd].
+@compute @workgroup_size(256)
+fn zi_final(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let bi = wid.x / fp.n_img;
+    let r = wid.x % fp.n_img;
+    let row = bi * fp.seg + r;
+    let base = row * fp.h;
+    var s = 0.0;
+    for (var c = lid; c < fp.h; c = c + 256u) { s = s + x[base + c]; }
+    let mean = wsum(s, lid) / f32(fp.h);
+    var v = 0.0;
+    for (var c = lid; c < fp.h; c = c + 256u) { let d = x[base + c] - mean; v = v + d * d; }
+    let rs = inverseSqrt(wsum(v, lid) / f32(fp.h) + fp.eps);
+    for (var c = lid; c < fp.h; c = c + 256u) { y[c] = (x[base + c] - mean) * rs * fsc[c]; }
+    workgroupBarrier();
+    // pd outputs × 4 partial sums each (pd ≤ 64).
+    let o = lid & 63u;
+    let part = lid >> 6u;
+    var acc = 0.0;
+    if (o < fp.pd) {
+        let q = fp.h / 4u;
+        for (var k = part * q; k < part * q + q; k = k + 1u) { acc = acc + y[k] * w[o * fp.h + k]; }
+    }
+    red[lid] = acc;
+    workgroupBarrier();
+    if (lid < 64u && lid < fp.pd) {
+        outp[wid.x * fp.pd + lid] = red[lid] + red[lid + 64u] + red[lid + 128u] + red[lid + 192u] + b[lid];
+    }
+}
+"#;
+
+const FILL_SRC: &str = r#"
+struct FlP { n: u32, seed: u32, amp: f32, mode: u32 };
+@group(0) @binding(0) var<storage, read_write> dst: array<u32>;
+@group(0) @binding(1) var<uniform> fl: FlP;
+
+fn hash(x0: u32) -> u32 {
+    var x = x0;
+    x = x ^ (x >> 16u); x = x * 0x7feb352du;
+    x = x ^ (x >> 15u); x = x * 0x846ca68bu;
+    x = x ^ (x >> 16u);
+    return x;
+}
+fn uni(i: u32) -> f32 { return f32(hash(i) >> 8u) * (2.0 / 16777216.0) - 1.0; }
+
+// Synthetic weights on the device: mode 0 = u32 words of two f16 in
+// [-amp, amp], mode 1 = f32 words in [-amp, amp].
+@compute @workgroup_size(256)
+fn zi_fill(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x + gid.y * 65535u * 256u;
+    if (i >= fl.n) { return; }
+    let s = fl.seed * 0x9e3779b9u;
+    if (fl.mode == 0u) {
+        dst[i] = pack2x16float(vec2<f32>(uni(2u * i ^ s), uni((2u * i + 1u) ^ s)) * fl.amp);
+    } else {
+        dst[i] = bitcast<u32>(uni(i ^ s) * fl.amp);
+    }
+}
+"#;
+
+/// Pure-MMA ceiling: fragments loaded once, 8 independent accumulator
+/// chains per subgroup, no global traffic inside the loop.
+fn peak_src(acc16: bool) -> String {
+    let cty = if acc16 { "f16" } else { "f32" };
+    let mut s = String::from(
+        "enable f16;\nenable wgpu_cooperative_matrix;\ndiagnostic(off, derivative_uniformity);\n",
+    );
+    s += &format!(
+        "struct PP {{ iters: u32, a: u32, b: u32, c: u32 }};\n@group(0) @binding(0) var<storage, read_write> outp: array<{cty}>;\n@group(0) @binding(1) var<uniform> pp: PP;\nvar<workgroup> sa: array<f16, 512>;\n"
+    );
+    s += "@compute @workgroup_size(256)\nfn zi_peak(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wid: vec3<u32>, @builtin(subgroup_id) sg: u32) {\n";
+    s += "  sa[tid] = f16(f32(tid % 7u) * 0.001); sa[tid + 256u] = f16(f32(tid % 5u) * 0.001);\n  workgroupBarrier();\n";
+    s += "  let a = coopLoadT<coop_mat16x16<f16, A>>(&sa[0], 16u);\n  let b = coopLoad<coop_mat16x16<f16, B>>(&sa[256], 16u);\n";
+    for j in 0..8 {
+        s += &format!("  var c{j}: coop_mat16x16<{cty}, C>;\n");
+    }
+    s += "  for (var i = 0u; i < pp.iters; i = i + 1u) {\n";
+    for j in 0..8 {
+        s += &format!("    c{j} = coopMultiplyAdd(a, b, c{j});\n");
+    }
+    s += "  }\n";
+    s += "  let o = (wid.x * 8u + sg) * 8u * 256u;\n";
+    for j in 0..8 {
+        s += &format!("  coopStoreT(c{j}, &outp[o + {}u], 16u);\n", j * 256);
+    }
+    s += "}\n";
+    s
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Small host helpers.
+// ════════════════════════════════════════════════════════════════════
+
+fn sbuf(c: &Ctx, bytes: u64, label: &str) -> wgpu::Buffer {
+    c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: bytes.max(16).next_multiple_of(16),
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    })
+}
+
+fn sbuf_init(c: &Ctx, data: &[u8], label: &str) -> wgpu::Buffer {
+    let b = sbuf(c, data.len() as u64, label);
+    c.queue.write_buffer(&b, 0, data);
+    b
+}
+
+fn ubuf(c: &Ctx, words: &[u32]) -> wgpu::Buffer {
+    c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("zi_u"),
+        contents: bytemuck::cast_slice(words),
+        usage: wgpu::BufferUsages::UNIFORM,
+    })
+}
+
+fn bg(c: &Ctx, pipe: &wgpu::ComputePipeline, bufs: &[&wgpu::Buffer]) -> wgpu::BindGroup {
+    let entries: Vec<_> = bufs
+        .iter()
+        .enumerate()
+        .map(|(i, b)| super::bind_buf(i as u32, b))
+        .collect();
+    c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("zi_bg"),
+        layout: &pipe.get_bind_group_layout(0),
+        entries: &entries,
+    })
+}
+
+fn wait(c: &Ctx) {
+    let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+}
+
+/// Read a device buffer back (blocking).
+fn read_bytes(c: &Ctx, src: &wgpu::Buffer, bytes: u64) -> Option<Vec<u8>> {
+    let st = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("zi_rb"),
+        size: bytes.next_multiple_of(4),
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut enc = c.device.create_command_encoder(&Default::default());
+    enc.copy_buffer_to_buffer(src, 0, &st, 0, bytes.next_multiple_of(4));
+    c.queue.submit(Some(enc.finish()));
+    let sl = st.slice(..);
+    sl.map_async(wgpu::MapMode::Read, |_| {});
+    wait(c);
+    let v = sl.get_mapped_range().ok()?.to_vec();
+    st.unmap();
+    Some(v[..bytes as usize].to_vec())
+}
+
+fn fill(c: &Ctx, dst: &wgpu::Buffer, words: u64, seed: u32, amp: f32, f32_mode: bool) -> Option<()> {
+    let pipe = pipeline(c, "zi_fill", FILL_SRC, "zi_fill")?;
+    let u = ubuf(c, &[words as u32, seed, amp.to_bits(), f32_mode as u32]);
+    let b = bg(c, &pipe, &[dst, &u]);
+    let mut enc = c.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = enc.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&pipe);
+        pass.set_bind_group(0, &b, &[]);
+        let wgs = (words as u32).div_ceil(256);
+        pass.dispatch_workgroups(wgs.min(65535), wgs.div_ceil(65535), 1);
+    }
+    c.queue.submit(Some(enc.finish()));
+    Some(())
+}
+
+/// Median seconds per repetition of `rec` (recorded `reps` times into one
+/// pass, `rounds` submissions, after one warm-up submission).
+fn time_pass(c: &Ctx, reps: usize, rounds: usize, rec: &dyn Fn(&mut wgpu::ComputePass)) -> f64 {
+    let run = || {
+        let mut enc = c.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            for _ in 0..reps {
+                rec(&mut pass);
+            }
+        }
+        let t = std::time::Instant::now();
+        c.queue.submit(Some(enc.finish()));
+        wait(c);
+        t.elapsed().as_secs_f64() / reps as f64
+    };
+    run();
+    let mut v: Vec<f64> = (0..rounds.max(1)).map(|_| run()).collect();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    v[v.len() / 2]
+}
+
+fn time_enc(c: &Ctx, reps: usize, rounds: usize, rec: &dyn Fn(&mut wgpu::CommandEncoder)) -> f64 {
+    let run = || {
+        let mut enc = c.device.create_command_encoder(&Default::default());
+        for _ in 0..reps {
+            rec(&mut enc);
+        }
+        let cb = super::finish_enc(enc);
+        let t = std::time::Instant::now();
+        c.queue.submit(Some(cb));
+        wait(c);
+        t.elapsed().as_secs_f64() / reps as f64
+    };
+    run();
+    let mut v: Vec<f64> = (0..rounds.max(1)).map(|_| run()).collect();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    v[v.len() / 2]
+}
+
+/// Round `m` up so every kernel's reads past the last real row stay inside
+/// the buffer: the GEMM tile (128) plus one flash query block (128).
+pub fn pad_rows(m: usize) -> usize {
+    m.div_ceil(128) * 128 + 128
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Bench / test API (used by examples/zimage_gemmbench.rs and
+// tests/zimage_wgpu.rs). Doc-hidden, not part of the engine surface.
+// ════════════════════════════════════════════════════════════════════
+
+#[doc(hidden)]
+pub mod bench {
+    use super::*;
+
+    /// Adapter, driver, coop shapes, limits.
+    pub fn info() -> Option<String> {
+        let c = super::super::ctx()?;
+        let i = c._adapter.get_info();
+        let l = c.device.limits();
+        let mut s = format!(
+            "adapter {} / {:?} / driver {} {}\ncoop active: {}  f16: {}  subgroup {}..{}\nmax wg storage {} B, max storage binding {} MB, max buffer {} MB\n",
+            i.name,
+            i.backend,
+            i.driver,
+            i.driver_info,
+            super::super::coop_matrix_active(),
+            c.device.features().contains(wgpu::Features::SHADER_F16),
+            i.subgroup_min_size,
+            i.subgroup_max_size,
+            l.max_compute_workgroup_storage_size,
+            l.max_storage_buffer_binding_size >> 20,
+            l.max_buffer_size >> 20,
+        );
+        for p in c._adapter.cooperative_matrix_properties() {
+            s += &format!(
+                "  coop shape {}x{}x{} ab {:?} c {:?} sat {}\n",
+                p.m_size, p.n_size, p.k_size, p.ab_type, p.cr_type, p.saturating_accumulation
+            );
+        }
+        s += &format!("zi fast path usable: {}\n", zctx().is_some());
+        Some(s)
+    }
+
+    /// Tensor-core ceiling in TFLOPS (f16 operands, f32 or f16 accumulate).
+    pub fn peak(acc16: bool) -> Option<f64> {
+        let c = zctx()?;
+        let src = peak_src(acc16);
+        let pipe = pipeline(c, if acc16 { "zi_peak16" } else { "zi_peak32" }, &src, "zi_peak")?;
+        let wgs = 82 * 8u32;
+        let iters = 4096u32;
+        let out = sbuf(c, (wgs as u64) * 8 * 8 * 256 * 4, "peak");
+        let u = ubuf(c, &[iters, 0, 0, 0]);
+        let b = bg(c, &pipe, &[&out, &u]);
+        let t = time_pass(c, 4, 5, &|pass| {
+            pass.set_pipeline(&pipe);
+            pass.set_bind_group(0, &b, &[]);
+            pass.dispatch_workgroups(wgs, 1, 1);
+        });
+        let flops = wgs as f64 * 8.0 * 8.0 * iters as f64 * 2.0 * 4096.0;
+        Some(flops / t / 1e12)
+    }
+
+    /// The parent's existing GEMMs at M×K×N (activation f32 [M][K]):
+    /// `arm` = "scalar" (q4tp_mm), "coop_q4" (q4tp_mm_coop, in-kernel
+    /// dequant), "coop_f16" (q4tp_mm_coop_f16 on an f16 plane).
+    /// `q4tp` = the Q4TP payload for the first two arms. Seconds per GEMM.
+    pub fn existing(arm: &str, m: usize, k: usize, n: usize, q4tp: &[u8]) -> Option<f64> {
+        let c = super::super::ctx()?;
+        let x = sbuf(c, (m * k * 4) as u64, "x");
+        fill(c, &x, (m * k) as u64, 3, 1.0, true)?;
+        let y = sbuf(c, (m * n * 4) as u64, "y");
+        let (pipe, w) = match arm {
+            "scalar" => (&c.q4tp_mm, sbuf_init(c, q4tp, "w")),
+            "coop_q4" => (c.q4tp_mm_coop.as_ref()?, sbuf_init(c, q4tp, "w")),
+            "coop_f16" => {
+                let w = sbuf(c, (n * k * 2) as u64, "plane");
+                fill(c, &w, (n * k / 2) as u64, 5, 0.02, false)?;
+                (c.q4tp_mm_coop_f16.as_ref()?, w)
+            }
+            _ => return None,
+        };
+        wait(c);
+        let reps = if m * n * k > 50_000_000_000 { 3 } else { 6 };
+        Some(time_enc(c, reps, 3, &|enc| {
+            super::super::encode_q4_tile_mm_full(c, enc, pipe, &w, &x, &y, n, k, m, 0.0, None)
+        }))
+    }
+
+    /// Run one `zi_mm` on host data (f16 bit patterns) and return the
+    /// output as f32 (`[m][n]`, or `[m][n/2]` for SwiGLU).
+    pub fn mm_run(cfg: MmCfg, m: usize, k: usize, n: usize, act: &[u16], plane: &[u16]) -> Option<Vec<f32>> {
+        let c = zctx()?;
+        let mp = pad_rows(m);
+        let mut a = act.to_vec();
+        a.resize(mp * k, 0);
+        let ab = sbuf_init(c, bytemuck::cast_slice(&a), "act");
+        let wb = sbuf_init(c, bytemuck::cast_slice(plane), "plane");
+        let ncol = if cfg.epi == Epi::SwiGlu { n / 2 } else { n };
+        let ob = sbuf(c, (mp * ncol * 4) as u64, "out");
+        let args = MmArgs { m: m as u32, n: n as u32, k: k as u32, ldo: ncol as u32, ocol: 0, arow: 0, oscale: 1.0 };
+        let call = mm_call(c, cfg, &args, &wb, &ab, &ob)?;
+        let mut enc = c.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            call.record(&mut pass);
+        }
+        c.queue.submit(Some(enc.finish()));
+        let raw = read_bytes(c, &ob, (m * ncol * if cfg.epi == Epi::F32 { 4 } else { 2 }) as u64)?;
+        Some(match cfg.epi {
+            Epi::F32 => bytemuck::cast_slice::<u8, f32>(&raw).to_vec(),
+            _ => bytemuck::cast_slice::<u8, u16>(&raw)
+                .iter()
+                .map(|&h| cortiq_core::quant::f16_to_f32(h))
+                .collect(),
+        })
+    }
+
+    /// Seconds per `zi_mm` at M×K×N on device-filled data.
+    pub fn mm_time(cfg: MmCfg, m: usize, k: usize, n: usize) -> Option<f64> {
+        let c = zctx()?;
+        let mp = pad_rows(m);
+        let ab = sbuf(c, (mp * k * 2) as u64, "act");
+        fill(c, &ab, (mp * k / 2) as u64, 7, 1.0, false)?;
+        let wb = sbuf(c, (n * k * 2) as u64, "plane");
+        fill(c, &wb, (n * k / 2) as u64, 9, 0.02, false)?;
+        let ncol = if cfg.epi == Epi::SwiGlu { n / 2 } else { n };
+        let ob = sbuf(c, (mp * ncol * 4) as u64, "out");
+        let args = MmArgs { m: m as u32, n: n as u32, k: k as u32, ldo: ncol as u32, ocol: 0, arow: 0, oscale: 1.0 };
+        let call = mm_call(c, cfg, &args, &wb, &ab, &ob)?;
+        wait(c);
+        let reps = if m * n * k > 50_000_000_000 { 4 } else { 10 };
+        Some(time_pass(c, reps, 5, &|pass| call.record(pass)))
+    }
+
+    /// Flash attention over a packed qkv panel `[m][3·nh·128]` (f16 bits),
+    /// segments `(offset, len)`; returns `[m][nh·128]` f32.
+    pub fn flash_run(f: FlashCfg, nh: usize, qkv: &[u16], segs: &[(usize, usize)]) -> Option<Vec<f32>> {
+        let c = zctx()?;
+        let ld = 3 * nh * 128;
+        let m = qkv.len() / ld;
+        let mp = pad_rows(m);
+        let mut q = qkv.to_vec();
+        q.resize(mp * ld, 0);
+        let qb = sbuf_init(c, bytemuck::cast_slice(&q), "qkv");
+        let ob = sbuf(c, (mp * nh * 128 * 2) as u64, "att");
+        let calls = flash_calls(c, f, nh, &qb, &ob, segs)?;
+        let mut enc = c.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            for cl in &calls {
+                cl.record(&mut pass);
+            }
+        }
+        c.queue.submit(Some(enc.finish()));
+        let raw = read_bytes(c, &ob, (m * nh * 128 * 2) as u64)?;
+        Some(
+            bytemuck::cast_slice::<u8, u16>(&raw)
+                .iter()
+                .map(|&h| cortiq_core::quant::f16_to_f32(h))
+                .collect(),
+        )
+    }
+
+    /// Seconds per full attention (all segments, all heads).
+    pub fn flash_time(f: FlashCfg, nh: usize, segs: &[(usize, usize)]) -> Option<f64> {
+        let c = zctx()?;
+        let ld = 3 * nh * 128;
+        let m: usize = segs.iter().map(|s| s.0 + s.1).max()?;
+        let mp = pad_rows(m);
+        let qb = sbuf(c, (mp * ld * 2) as u64, "qkv");
+        fill(c, &qb, (mp * ld / 2) as u64, 11, 1.0, false)?;
+        let ob = sbuf(c, (mp * nh * 128 * 2) as u64, "att");
+        let calls = flash_calls(c, f, nh, &qb, &ob, segs)?;
+        wait(c);
+        Some(time_pass(c, 5, 5, &|pass| {
+            for cl in &calls {
+                cl.record(pass);
+            }
+        }))
+    }
+}
+
+/// One prebuilt dispatch of any of the small kernels.
+struct Call {
+    pipe: Arc<wgpu::ComputePipeline>,
+    bg: wgpu::BindGroup,
+    grid: (u32, u32, u32),
+}
+
+impl Call {
+    fn record(&self, pass: &mut wgpu::ComputePass) {
+        pass.set_pipeline(&self.pipe);
+        pass.set_bind_group(0, &self.bg, &[]);
+        pass.dispatch_workgroups(self.grid.0, self.grid.1, self.grid.2);
+    }
+}
+
+fn flash_calls(
+    c: &Ctx,
+    f: FlashCfg,
+    nh: usize,
+    qkv: &wgpu::Buffer,
+    out: &wgpu::Buffer,
+    segs: &[(usize, usize)],
+) -> Option<Vec<Call>> {
+    if f.shared_bytes() > c.device.limits().max_compute_workgroup_storage_size {
+        return None;
+    }
+    let pipe = pipeline(c, &f.key(), &flash_src(f), "zi_flash")?;
+    let hsz = nh * 128;
+    let scl = (1.0f32 / (128f32).sqrt()) * std::f32::consts::LOG2_E;
+    let mut v = Vec::new();
+    for &(off, len) in segs {
+        if len % f.bc as usize != 0 {
+            return None;
+        }
+        let u = ubuf(
+            c,
+            &[
+                off as u32,
+                len as u32,
+                (3 * hsz) as u32,
+                hsz as u32,
+                (2 * hsz) as u32,
+                hsz as u32,
+                scl.to_bits(),
+                nh as u32,
+            ],
+        );
+        let b = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("zi_flash"),
+            layout: &pipe.get_bind_group_layout(0),
+            entries: &[
+                super::bind_buf(0, qkv),
+                super::bind_buf(1, qkv),
+                super::bind_buf(2, out),
+                super::bind_buf(3, &u),
+            ],
+        });
+        v.push(Call {
+            pipe: pipe.clone(),
+            bg: b,
+            grid: ((len as u32).div_ceil(f.nw * 16), nh as u32, 1),
+        });
+    }
+    Some(v)
 }
