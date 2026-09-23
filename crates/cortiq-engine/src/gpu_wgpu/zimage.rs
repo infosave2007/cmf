@@ -228,7 +228,7 @@ pub(crate) fn prepare(a: &ZPrepareArgs) -> bool {
         st.progs.remove(0);
     }
     let io = ZIo { x_emb_w: a.x_emb_w, x_emb_b: a.x_emb_b, x_pad: a.x_pad, final_w: a.final_w, final_b: a.final_b };
-    let t = ZTiles::default();
+    let t = ZTiles { guards: ZGuards::for_model(a.model), ..ZTiles::default() };
     let (nr, layers) = st.blocks.split_at(2);
     let prog = match &a.neg {
         None => {
@@ -389,9 +389,9 @@ pub(crate) fn step(a: &mut ZStepArgs) -> bool {
         for (si, name) in AMAX_SITES.iter().enumerate() {
             // ffn_hid is stored ×2⁻ᵏ (range guard): report the true value.
             let g = match si {
-                0 => (attn_shift() as f32).exp2(),
-                1 | 2 => (qkv_shift() as f32).exp2(),
-                5 => (hid_shift() as f32).exp2(),
+                0 => (prog.guards.attn as f32).exp2(),
+                1 | 2 => (prog.guards.qkv as f32).exp2(),
+                5 => (prog.guards.hid as f32).exp2(),
                 _ => 1.0,
             };
             let (bi, m) = (0..v.len() / ns).map(|b| (b, v[b * ns + si] * g)).fold((0, 0f32), |acc, x| if x.1 > acc.1 { x } else { acc });
@@ -452,7 +452,7 @@ pub(crate) fn refine_caption(
     seq.write_x(cap);
     // Unmodulated: the row ops read no mods (scale 0, gate 1).
     let mods = sbuf(c, 16, "zi_nomods");
-    let t = ZTiles::default();
+    let t = ZTiles { guards: ZGuards::for_model(model), ..ZTiles::default() };
     let mut calls = ZCalls::default();
     for (k, blk) in devs.iter().enumerate() {
         let next = devs.get(k + 1).map(|nb| (nb, 0));
@@ -2752,23 +2752,55 @@ impl ZCalls {
     }
 }
 
-/// log2 of the SwiGLU hidden's range guard (see `block_calls_probe`).
-/// log2 of the qkv panel's range guard: the q/k/v GEMM stores ×2⁻ᵏ, the
-/// qk-RMSNorm is scale-free, so only v (→ attention output) carries the
-/// factor and the O GEMM's f32 epilogue multiplies 2ᵏ back in. The base
-/// model's qkv reaches 5.7e4 at step 0 (f16 max 6.55e4).
-/// log2 of the attention-input guard (the pre-norm·(1+scale) the qkv GEMM
-/// reads): the base model's reaches > 6.55e4 at layer 28.
-pub fn attn_shift() -> i32 {
-    std::env::var("CMF_ZI_ATTN_SHIFT").ok().and_then(|v| v.parse().ok()).unwrap_or(0).clamp(0, 14)
+/// f16 range guards of the chain, log2 of the power-of-two each f16 site is
+/// stored divided by (the consumer multiplies it back, or is scale-free):
+/// - `attn`: the attention input (pre-norm·(1+scale_msa)) the qkv GEMM
+///   reads; the qkv GEMM's epilogue applies 2^(attn − qkv);
+/// - `qkv`: the q/k/v panel; the qk-RMSNorm is scale-free (its eps is
+///   scaled by 2⁻²ᵠ), v carries the factor into the attention output and
+///   the O GEMM's f32 epilogue multiplies 2ᵠ back;
+/// - `hid`: the SwiGLU hidden; w2's f32 epilogue multiplies 2ʰ back.
+///
+/// Measured maxima over all steps, both prompts, 512² and 1024²
+/// (`CMF_ZI_AMAX=1`, q8 containers): Turbo attn 6.3e2, qkv 5.8e3,
+/// hidden 3.1e5 → (0, 0, 6). Base (CFG pair) attn > 6.55e4 (layer 28 was
+/// inf unguarded), qkv 3.2e5, hidden 4.9e6 → (4, 5, 10). One forward's v
+/// against the CPU: base 3.0e-4 / 1.8e-4 (r512 i0 / i2) with (4, 5, 10);
+/// Turbo 8.8e-4 / 5.7e-4 / 1.7e-3 (r512 i0, i5, r1024 i0) with (0, 0, 6)
+/// and 1.1e-3 / 6.1e-4 / 1.6e-3 with the base guards — the same within
+/// noise; each model keeps the smallest guards that hold.
+/// `CMF_ZI_ATTN_SHIFT` / `CMF_ZI_QKV_SHIFT` / `CMF_ZI_HID_SHIFT` override.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ZGuards {
+    pub attn: i32,
+    pub qkv: i32,
+    pub hid: i32,
 }
 
-pub fn qkv_shift() -> i32 {
-    std::env::var("CMF_ZI_QKV_SHIFT").ok().and_then(|v| v.parse().ok()).unwrap_or(0).clamp(0, 14)
-}
+impl ZGuards {
+    pub const TURBO: ZGuards = ZGuards { attn: 0, qkv: 0, hid: 6 };
+    pub const BASE: ZGuards = ZGuards { attn: 4, qkv: 5, hid: 10 };
 
-pub fn hid_shift() -> i32 {
-    std::env::var("CMF_ZI_HID_SHIFT").ok().and_then(|v| v.parse().ok()).unwrap_or(6).clamp(0, 14)
+    /// The guards of a container's variant (`zimage.config_json`), env
+    /// overrides applied.
+    pub fn for_model(model: &CmfModel) -> ZGuards {
+        let variant = model
+            .tensor_bytes("zimage.config_json")
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
+            .and_then(|v| v["variant"].as_str().map(str::to_string));
+        let base = if variant.as_deref() == Some("base") { Self::BASE } else { Self::TURBO };
+        base.with_env()
+    }
+
+    pub fn with_env(self) -> ZGuards {
+        let e = |k: &str, d: i32| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d).clamp(0, 14);
+        ZGuards {
+            attn: e("CMF_ZI_ATTN_SHIFT", self.attn),
+            qkv: e("CMF_ZI_QKV_SHIFT", self.qkv),
+            hid: e("CMF_ZI_HID_SHIFT", self.hid),
+        }
+    }
 }
 
 /// A device buffer holding `data` (mods, caption rows …) — test helper.
@@ -2813,6 +2845,8 @@ pub struct ZTiles {
     pub w13: MmCfg,
     pub w2: MmCfg,
     pub flash: FlashCfg,
+    /// f16 range guards (per model variant).
+    pub guards: ZGuards,
 }
 
 impl Default for ZTiles {
@@ -2823,6 +2857,7 @@ impl Default for ZTiles {
             w13: default_cfg(Epi::SwiGlu),
             w2: default_cfg(Epi::F32),
             flash: default_flash(),
+            guards: ZGuards::TURBO.with_env(),
         }
     }
 }
@@ -2877,7 +2912,8 @@ pub fn block_calls_probe(
     let gm = if modulated { ROW_GATE_MOD } else { 0 };
     // Range guards (B2): the attention input is stored ×2⁻ᵃ, the qkv panel
     // ×2⁻ᵠ (so the qkv GEMM scales by 2^(a−q)), the SwiGLU hidden ×2⁻ʰ.
-    let att_in_scale = (-(attn_shift() as f32)).exp2();
+    let gd = t.guards;
+    let att_in_scale = (-(gd.attn as f32)).exp2();
     let sm = if modulated { ROW_SCALE_MOD } else { 0 };
     let mut v = ZCalls::default();
     if first {
@@ -2888,8 +2924,8 @@ pub fn block_calls_probe(
     }
     pr(&mut v, 0, &seq.xn, mhalf, false)?;
     let a = |n: u32, k: u32, ldo: u32| MmArgs { m, n, k, ldo, ocol: 0, arow: 0, oscale: 1.0, conv: [0; 3] };
-    let qs = qkv_shift();
-    let aq = MmArgs { oscale: ((attn_shift() - qs) as f32).exp2(), ..a(3 * h, h, 3 * h) };
+    let qs = gd.qkv;
+    let aq = MmArgs { oscale: ((gd.attn - qs) as f32).exp2(), ..a(3 * h, h, 3 * h) };
     let ao = MmArgs { oscale: (qs as f32).exp2(), ..a(h, h, h) };
     v.push_mm(Class::MmQkv, mm_call(c, t.qkv, &aq, &blk.qkv, &seq.xn, &seq.qkv)?);
     pr(&mut v, 1, &seq.qkv, 3 * mhalf, false)?;
@@ -2928,7 +2964,7 @@ pub fn block_calls_probe(
     // at t≈0 and overflows f16 (inf) from step 2 (measured, CMF_ZI_AMAX on
     // the q8 Turbo container, 512²). It is stored ×2⁻ᵏ and w2 multiplies
     // 2ᵏ back in its f32 epilogue. `CMF_ZI_HID_SHIFT=k` (default 6).
-    let hs = hid_shift();
+    let hs = gd.hid;
     let a13 = MmArgs { oscale: (-(hs as f32)).exp2(), ..a(2 * i, h, i) };
     let a2 = MmArgs { oscale: (hs as f32).exp2(), ..a(h, i, h) };
     v.push_mm(Class::MmW13, mm_call(c, t.w13, &a13, &blk.w13, &seq.xn, &seq.hid)?);
@@ -2970,6 +3006,8 @@ pub struct ZStepDev {
     out_rows: usize,
     /// `CMF_ZI_AMAX=1`: per (block, site) max|x| of the last forward.
     amax: Option<wgpu::Buffer>,
+    /// The range guards the program was built with.
+    pub guards: ZGuards,
 }
 
 /// Host-side small weights of the embed and final layers.
@@ -3101,6 +3139,7 @@ impl ZStepDev {
             fin,
             out_rows,
             amax,
+            guards: t.guards,
         })
     }
 

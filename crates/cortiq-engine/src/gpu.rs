@@ -3689,6 +3689,16 @@ pub fn zimage_preload(
     }
 }
 
+/// Persist the driver's compiled pipelines after a Z-Image generation (the
+/// chain's kernels are built at first use, after the context came up), so
+/// the next process skips the compile. Best-effort, no-op off wgpu.
+pub fn zimage_flush_pipelines() {
+    #[cfg(feature = "gpu")]
+    if matches!(backend(), Backend::Wgpu) {
+        crate::gpu_wgpu::pipeline_cache_flush();
+    }
+}
+
 /// Drop every Z-Image device resource (planes, prepared states, VAE chain
 /// buffers): stage change or process end. Calls each compiled backend's
 /// release directly, without `backend()`, so it never brings a device up;
