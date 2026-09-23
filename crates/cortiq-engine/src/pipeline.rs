@@ -2224,6 +2224,27 @@ impl Pipeline {
     /// graph.  The bench uses this to label the measured generation prefill
     /// honestly; keep the predicate in Pipeline so CLI labels cannot drift
     /// from the production route.
+    /// Positions per batched-graph submit for the prompt: `CMF_BATCH_K`
+    /// when set (0 = one position at a time through the token graph),
+    /// otherwise 32 on a discrete card whose prompt takes the graph route.
+    /// The batched graph read a 2048-token prompt at 53 tok/s against 28.5
+    /// one position at a time on an RTX PRO 4000 (Qwen3.8-27B q4tp: TTFT
+    /// 39 s against 72), and its states are the speculative verify's,
+    /// measured identical to the plain path. macOS keeps its own arm.
+    pub fn generation_batch_k(&self) -> usize {
+        if let Some(k) = std::env::var("CMF_BATCH_K")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            return k;
+        }
+        #[cfg(not(target_os = "macos"))]
+        if self.graph_prefill_preferred() && !self.o1_active() {
+            return 32;
+        }
+        0
+    }
+
     pub fn generation_graph_prefill(&self) -> bool {
         let graph = self.graph_prefill_preferred();
         // On wgpu, an active MTP head now consumes the trunk's graph batches
@@ -2236,10 +2257,7 @@ impl Pipeline {
         #[cfg(not(target_os = "macos"))]
         if graph
             && self.mtp.is_some()
-            && std::env::var("CMF_BATCH_K")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .is_some_and(|k| k > 0)
+            && self.generation_batch_k() > 0
             && std::env::var("CMF_MTP_CHAIN_PROBE").is_err()
         {
             return false;
@@ -2836,10 +2854,7 @@ impl Pipeline {
         self.graph_logits = None;
         self.graph_want_logits = false;
         let _tpf = std::time::Instant::now();
-        let batch_k = std::env::var("CMF_BATCH_K")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(0);
+        let batch_k = self.generation_batch_k();
         // DeepSeek-V4 owns a separate hyper-connection stack. Route it
         // before the generic prefill choices: those correctly reject an
         // empty `weights.layers`, but their final per-position fallback used
