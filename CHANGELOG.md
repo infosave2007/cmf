@@ -7,6 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-09-23
+
+### Changed
+- Speculative decode picks its draft depth adaptively: a round starts at
+  k=3 on discrete cards (7 on native Metal, whose verify tile is flat in
+  the batch) and moves with the accepted fraction — up to the card's
+  optimum while nearly every draft lands, down to 2 where fewer than half
+  do. The verify's cost climbs with the rows on a discrete card (RTX PRO
+  4000, Qwen3.8-27B q4tp: 52 ms at 2 rows, 74 at 5, 80 at 6), so prose
+  wants a short round and code or the repetitive bench a long one:
+  measured k=3 33.6 vs k=5 27.6 tok/s on an essay, 45.6 vs 38 on code.
+  `CMF_GRAPH_SPEC_K` still pins it; `CMF_GRAPH_SPEC_TIME=1` prints the
+  moves.
+- The draft head's vocabulary shortlist (`CMF_DRAFT_VOCAB`, default 65536,
+  the cut the native Metal draft already took) now applies on wgpu too — a
+  draft step reads 170 MB of head instead of 660 — and it is adaptive: a
+  committed token past the cut (Cyrillic and CJK ids sit above 131072 in
+  Qwen's table) switches the next 32 draft steps to the full head, so
+  Russian or Chinese prose keeps the full-head acceptance while Latin text
+  keeps the cheaper draft. RTX PRO 4000: bench 50.5 → 54.9 tok/s, a code
+  prompt 38.7 → 42.3.
+- `bench --ignore-eos` is a loop flag now, not a sampler suppression. The
+  suppression counted as a penalty and switched the speculative round and
+  the greedy burst off, so `bench --ignore-eos` never measured either
+  (`mtp_drafted` stayed 0 on every card). Qwen3.8-27B on an RTX PRO 4000
+  reads 54.7 tok/s with the default speculation against 27.6 plain.
+- wgpu q4tp matvecs of few row blocks (the GDN and attention projections,
+  the FFN down) run on a persistent grid of 192 workgroups
+  (`CMF_MV_GRID_NARROW`, `CMF_MV_NARROW_BLOCKS`): measured on an RTX PRO
+  4000 the GDN block 9.72 → 9.08 ms and the down projections 3.37 → 3.12 ms
+  a token, while the same cap on the wide gate+up lost 6.5% and stays off.
+- The GDN a/b control projections (two f32 [heads, hidden] planes a layer)
+  take a vectorized 256-lane kernel instead of 64 lanes of scalar loads:
+  31 → 8 µs a layer, 1.1 ms a token on Qwen3.8-27B, output unchanged
+  (`CMF_MV_PAIR4=0` restores the old kernel).
+- The int8 speculative verify runs eight rows a workgroup (two a lane,
+  `q4tp_matvec4_bk8h`, bit-identical to the sixteen-row kernel): 74.4 →
+  72.4 ms for five rows on an RTX PRO 4000; `CMF_VERIFY_HALF=0` reverts.
+- The greedy burst (`CMF_MULTISTEP`) keeps the mid-stack chain split for
+  steps > 1, so its k frames of host encode overlap the card instead of
+  serializing before one submit; still opt-in (+2% on a bare-metal card,
+  the win is on virtualized queues where a submit costs ~0.7 ms).
+
+- Native Metal: the GDN run of the token graph encodes a whole run of
+  layers into ONE compute encoder instead of seven per layer (a serial
+  encoder orders its dispatches; the boundaries were pipeline drains,
+  ~330 a token on Qwen3.8-27B). The speculative verify's chunk attend no
+  longer walks the K mirror a seventh time for an attention-importance
+  mass that nothing reads (the verify's scratch was a throwaway). The
+  draft depth stays pinned at 7 on Metal — its verify tile is flat in the
+  batch, so a shorter round only forfeits tokens.
+
+### Measured and closed (kept behind flags so they are not re-opened)
+- `CMF_VERIFY_COOP=1` (the verify on the cooperative-matrix GEMM): 175 ms
+  against 73 for five rows — a 64-row tile over five live rows does not
+  stream, although the same kernel wins the k=32 batched prefill 1.7x.
+- `CMF_VERIFY_STAGE=1` (activations of the whole batch staged in
+  workgroup memory per 64-group slab): 99.9 ms against 74.4 — the slab
+  barriers cost more than the L2 traffic they save.
+
 ## [0.7.1] - 2026-09-23
 
 ### Fixed

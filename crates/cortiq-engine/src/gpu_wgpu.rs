@@ -18444,12 +18444,15 @@ pub(crate) fn verify_stage_on() -> bool {
     *N.get_or_init(|| std::env::var("CMF_VERIFY_STAGE").as_deref() == Ok("1"))
 }
 
-/// `CMF_VERIFY_HALF=1`: the int8 verify on the eight-rows-a-workgroup
-/// kernel (`q4tp_matvec4_bk8h`, two rows a lane) — an occupancy
-/// experiment, see the kernel's note.
+/// `CMF_VERIFY_HALF=0`: the int8 verify back on the sixteen-row kernel.
+/// The eight-rows-a-workgroup twin (`q4tp_matvec4_bk8h`, two rows a lane)
+/// is the default: bit-identical, and measured 74.4 → 72.4 ms for the
+/// 5-row verify on an RTX PRO 4000 (k=4; code prompt 37.9 → 42.1 tok/s
+/// at k=5). Small, because the verify's cost there is mostly a fixed
+/// batch-graph overhead, not the matvec — see the batch-ts breakdown.
 pub(crate) fn verify_half_on() -> bool {
     static N: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *N.get_or_init(|| std::env::var("CMF_VERIFY_HALF").as_deref() == Ok("1"))
+    *N.get_or_init(|| std::env::var("CMF_VERIFY_HALF").as_deref() != Ok("0"))
 }
 
 /// Quantize `batch` activation vectors (cols wide, f32) to the packed

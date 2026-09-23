@@ -177,6 +177,22 @@ pub struct Pipeline {
     /// speculative round and the greedy burst off, so a benchmark that
     /// suppressed EOS never measured either.
     pub ignore_eos: bool,
+    /// Draft-head shortlist guard: tokens left during which the draft
+    /// uses the FULL head because a recently committed id lay past the
+    /// `CMF_DRAFT_VOCAB` cut (Cyrillic and CJK ids sit above 131072 in
+    /// Qwen's table, so a prefix shortlist would draft nothing usable
+    /// there — measured on Russian prose: 2.9 → 1.6 accepted a round).
+    pub draft_full_streak: u32,
+    /// Adaptive draft depth for the speculative round (None until the
+    /// first round): grows while nearly every draft is accepted, shrinks
+    /// when fewer than half are. The verify's cost climbs with the rows on
+    /// a discrete card (RTX PRO 4000: 52 ms at 2 rows, 74 at 5, 80 at 6),
+    /// so prose wants k≈3 and code or the repetitive bench k≈5 — measured
+    /// 33.6 vs 27.6 tok/s on an essay at k=3 vs 5, 45.6 vs 38 on code.
+    /// `CMF_GRAPH_SPEC_K` pins it.
+    pub spec_k_adapt: Option<usize>,
+    /// EWMA of the accepted fraction that drives `spec_k_adapt`.
+    pub spec_acc_ewma: f32,
     rng: SplitMix64,
     sampler_scratch: SamplerScratch,
     /// Speculative SAMPLING state (graph_spec_step, temperature > 0): the
@@ -2086,6 +2102,9 @@ impl Pipeline {
             mtp: None,
             speculative: std::env::var("CMF_MTP").map(|v| v != "0").unwrap_or(true),
             ignore_eos: false,
+            draft_full_streak: 0,
+            spec_k_adapt: None,
+            spec_acc_ewma: 0.7,
             rng,
             sampler_scratch: SamplerScratch::default(),
             spec_forced: None,
@@ -3415,6 +3434,7 @@ impl Pipeline {
             ($id:expr) => {{
                 all_ids.push($id);
                 generated += 1;
+                self.note_draft_id($id);
                 if self.tokenizer.is_eos($id) && !self.ignore_eos {
                     finish_reason = "stop".to_string();
                     false
@@ -4413,7 +4433,7 @@ impl Pipeline {
             // cut the native Metal draft takes): 662 MB a step on Qwen3.8
             // becomes 170 MB at 65536; the verify keeps the full head.
             let rows = if kind == 6 {
-                Self::draft_vocab_rows(self.weights.lm_head.rows())
+                self.draft_head_rows(self.weights.lm_head.rows())
             } else {
                 self.weights.lm_head.rows()
             };
@@ -4826,11 +4846,16 @@ impl Pipeline {
         };
         #[cfg(not(feature = "gpu"))]
         let k_default = 4;
-        let k_spec: usize = std::env::var("CMF_GRAPH_SPEC_K")
+        let k_env: Option<usize> = std::env::var("CMF_GRAPH_SPEC_K")
             .ok()
             .and_then(|v| v.parse().ok())
-            .filter(|&v| (1..=8).contains(&v))
-            .unwrap_or(k_default);
+            .filter(|&v| (1..=8).contains(&v));
+        // Adaptive depth: start below the card's flat-verify optimum and
+        // let the accepted fraction move it — predictable text climbs to
+        // the old default within a few rounds, prose settles at 2-3 where
+        // the shorter verify pays.
+        let (k_start, k_max) = if metal_native { (7, 7) } else { (3, k_default.max(5)) };
+        let k_spec: usize = k_env.unwrap_or_else(|| self.spec_k_adapt.unwrap_or(k_start));
         if next_pos == 0 {
             return None;
         }
@@ -5553,14 +5578,39 @@ impl Pipeline {
             let end = subs();
             eprintln!(
                 "spec-round: draft {:.1} ms/{} sub | verify {:.1} ms/{} sub | \
-                 commit {:.1} ms/{} sub (accepted {a} of {k_spec})",
+                 commit {:.1} ms/{} sub (accepted {a} of {k_spec}, full-head streak {})",
                 t_draft.as_secs_f64() * 1e3,
                 sub_draft - sub0,
                 (t_verify - t_draft).as_secs_f64() * 1e3,
                 sub_verify - sub_draft,
                 (t_round.elapsed() - t_verify).as_secs_f64() * 1e3,
                 end - sub_verify,
+                self.draft_full_streak,
             );
+        }
+        // Native Metal's verify tile is flat in b (eight rows for the price
+        // of one), so a shorter round only forfeits tokens — measured on
+        // the M4: an essay round at k=2 still verified in 260 ms. The
+        // adaptation is for cards whose verify grows with the rows.
+        if k_env.is_none() && !metal_native {
+            // Slow average and a wide band: a fast one oscillated 2↔3 on
+            // an essay every other round (measured), which forfeits the
+            // draft it just paid for.
+            let f = a as f32 / k_spec.max(1) as f32;
+            self.spec_acc_ewma += 0.2 * (f - self.spec_acc_ewma);
+            let mut k_next = k_spec;
+            if self.spec_acc_ewma >= 0.75 && k_spec < k_max {
+                k_next = k_spec + 1;
+            } else if self.spec_acc_ewma < 0.4 && k_spec > 2 {
+                k_next = k_spec - 1;
+            }
+            if k_next != k_spec {
+                self.spec_acc_ewma = 0.6;
+                if std::env::var("CMF_GRAPH_SPEC_TIME").is_ok() {
+                    eprintln!("spec-k: {k_spec} → {k_next}");
+                }
+            }
+            self.spec_k_adapt = Some(k_next);
         }
         Some((drafts[..a].to_vec(), next_pos + a + 1, new_hidden))
     }
@@ -9173,6 +9223,31 @@ impl Pipeline {
         true
     }
 
+    /// A committed token id from the high table (Cyrillic, CJK and the
+    /// like sit above 131072 in Qwen's vocabulary; Latin subwords past
+    /// the 65536 cut are rare enough to lose as rejected drafts) switches
+    /// the draft to the full head for the next 16 tokens; other ids count
+    /// down. On an M4 the full 660 MB head costs 5.5 ms a draft step
+    /// against 1.4 for the shortlist, so the streak is kept short.
+    pub(crate) fn note_draft_id(&mut self, id: u32) {
+        let cut = Self::draft_vocab_rows(usize::MAX).max(131_072);
+        if (id as usize) >= cut {
+            self.draft_full_streak = 16;
+        } else {
+            self.draft_full_streak = self.draft_full_streak.saturating_sub(1);
+        }
+    }
+
+    /// The draft head's rows for the next step: the shortlist, or the full
+    /// head while `draft_full_streak` runs.
+    fn draft_head_rows(&self, head_rows: usize) -> usize {
+        if self.draft_full_streak > 0 {
+            head_rows
+        } else {
+            Self::draft_vocab_rows(head_rows)
+        }
+    }
+
     /// Draft-head shortlist size: `CMF_DRAFT_VOCAB` rows (default 65536,
     /// capped at the head; 0 = full head).
     fn draft_vocab_rows(head_rows: usize) -> usize {
@@ -9329,7 +9404,7 @@ impl Pipeline {
         // token past the cut is only a rejected draft, never a wrong token.
         // 662 MB a step on Qwen3.8 becomes 170 MB at 65536.
         let draft_rows = if let Some(lm) = lm {
-            Self::draft_vocab_rows(lm.1)
+            self.draft_head_rows(lm.1)
         } else {
             0
         };
