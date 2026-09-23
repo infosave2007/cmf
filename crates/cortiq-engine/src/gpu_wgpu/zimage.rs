@@ -221,11 +221,14 @@ pub struct MmCfg {
     /// measures the speed ceiling of the f16-accumulate rate. Wrong answer
     /// at real K; never used by the chain.
     pub acc16_probe: bool,
+    /// 2 = double-buffered shared staging (one barrier per K slice instead
+    /// of two); 1 = single buffer + register prefetch.
+    pub stages: u32,
 }
 
 impl MmCfg {
     pub const fn new(bm: u32, bn: u32, bk: u32, wm: u32, wn: u32, epi: Epi) -> Self {
-        Self { bm, bn, bk, wm, wn, epi, direct: false, acc16_probe: false }
+        Self { bm, bn, bk, wm, wn, epi, direct: false, acc16_probe: false, stages: 1 }
     }
     pub fn valid(&self) -> bool {
         let nt = self.wm * self.wn * 32;
@@ -251,13 +254,21 @@ impl MmCfg {
             self.wm,
             self.wn,
             self.epi,
-            if self.direct { "_d" } else if self.acc16_probe { "_h" } else { "" }
+            if self.direct {
+                "_d".to_string()
+            } else if self.acc16_probe {
+                "_h".to_string()
+            } else if self.stages == 2 {
+                "_s2".to_string()
+            } else {
+                String::new()
+            }
         )
     }
     /// Workgroup-shared bytes this variant declares.
     pub fn shared_bytes(&self) -> u32 {
         let lds = self.bk + 8;
-        let stage = if self.direct { 0 } else { (self.bm + self.bn) * lds * 2 };
+        let stage = if self.direct { 0 } else { (self.bm + self.bn) * lds * 2 * self.stages.max(1) };
         let nw = self.wm * self.wn;
         let sc = match self.epi {
             Epi::F32 => 0,
@@ -326,8 +337,9 @@ pub fn mm_src(g: MmCfg) -> String {
     }
     let _ = writeln!(s, "@group(0) @binding(3) var<uniform> p: MmP;");
     if !g.direct {
-        let _ = writeln!(s, "var<workgroup> sa: array<f16, {}>;", g.bm * lds);
-        let _ = writeln!(s, "var<workgroup> sb: array<f16, {}>;", g.bn * lds);
+        let st = g.stages.max(1);
+        let _ = writeln!(s, "var<workgroup> sa: array<f16, {}>;", g.bm * lds * st);
+        let _ = writeln!(s, "var<workgroup> sb: array<f16, {}>;", g.bn * lds * st);
     }
     match g.epi {
         _ if g.acc16_probe => {}
@@ -393,58 +405,63 @@ pub fn mm_src(g: MmCfg) -> String {
                 o = t * nt
             );
         }
-        let _ = writeln!(s, "  for (var kt = 0u; kt < nkt; kt = kt + 1u) {{");
-        for (arr, reg, cnt) in [("sa", "ra", la), ("sb", "rb", lb)] {
-            for t in 0..cnt {
+        if g.stages == 2 {
+            mm_loop_2stage(&mut s, g, nt, tm, tn, fm, fnn, lds, vpr, la, lb);
+        } else {
+            let _ = writeln!(s, "  for (var kt = 0u; kt < nkt; kt = kt + 1u) {{");
+            for (arr, reg, cnt) in [("sa", "ra", la), ("sb", "rb", lb)] {
+                for t in 0..cnt {
+                    let _ = writeln!(
+                        s,
+                        "    {{ let d = ((tid + {o}u) / {vpr}u) * {lds}u + ((tid + {o}u) % {vpr}u) * 4u; {arr}[d] = {reg}{t}.x; {arr}[d + 1u] = {reg}{t}.y; {arr}[d + 2u] = {reg}{t}.z; {arr}[d + 3u] = {reg}{t}.w; }}",
+                        o = t * nt
+                    );
+                }
+            }
+            let _ = writeln!(s, "    workgroupBarrier();");
+            let _ = writeln!(s, "    if (kt + 1u < nkt) {{ let kb = (kt + 1u) * {vpr}u;");
+            for t in 0..la {
                 let _ = writeln!(
                     s,
-                    "    {{ let d = ((tid + {o}u) / {vpr}u) * {lds}u + ((tid + {o}u) % {vpr}u) * 4u; {arr}[d] = {reg}{t}.x; {arr}[d + 1u] = {reg}{t}.y; {arr}[d + 2u] = {reg}{t}.z; {arr}[d + 3u] = {reg}{t}.w; }}",
+                    "      ra{t} = act[(p.arow + m0 + (tid + {o}u) / {vpr}u) * kq + kb + (tid + {o}u) % {vpr}u];",
                     o = t * nt
                 );
             }
-        }
-        let _ = writeln!(s, "    workgroupBarrier();");
-        let _ = writeln!(s, "    if (kt + 1u < nkt) {{ let kb = (kt + 1u) * {vpr}u;");
-        for t in 0..la {
-            let _ = writeln!(
-                s,
-                "      ra{t} = act[(p.arow + m0 + (tid + {o}u) / {vpr}u) * kq + kb + (tid + {o}u) % {vpr}u];",
-                o = t * nt
-            );
-        }
-        for t in 0..lb {
-            let _ = writeln!(
-                s,
-                "      rb{t} = wt[(n0 + (tid + {o}u) / {vpr}u) * kq + kb + (tid + {o}u) % {vpr}u];",
-                o = t * nt
-            );
-        }
-        let _ = writeln!(s, "    }}");
-        for kk in 0..g.bk / 16 {
-            let _ = writeln!(s, "    {{");
-            for j in 0..fnn {
+            for t in 0..lb {
                 let _ = writeln!(
                     s,
-                    "      let b{j} = coopLoad<coop_mat16x16<f16, B>>(&sb[(wx * {tn}u + {}u) * {lds}u + {}u], {lds}u);",
-                    j * 16,
-                    kk * 16
+                    "      rb{t} = wt[(n0 + (tid + {o}u) / {vpr}u) * kq + kb + (tid + {o}u) % {vpr}u];",
+                    o = t * nt
                 );
-            }
-            for i in 0..fm {
-                let _ = writeln!(
-                    s,
-                    "      let a{i} = coopLoadT<coop_mat16x16<f16, A>>(&sa[(wy * {tm}u + {}u) * {lds}u + {}u], {lds}u);",
-                    i * 16,
-                    kk * 16
-                );
-                for j in 0..fnn {
-                    let _ = writeln!(s, "      c{i}_{j} = coopMultiplyAdd(a{i}, b{j}, c{i}_{j});");
-                }
             }
             let _ = writeln!(s, "    }}");
-        }
+            for kk in 0..g.bk / 16 {
+                let _ = writeln!(s, "    {{");
+                for j in 0..fnn {
+                    let _ = writeln!(
+                        s,
+                        "      let b{j} = coopLoad<coop_mat16x16<f16, B>>(&sb[(wx * {tn}u + {}u) * {lds}u + {}u], {lds}u);",
+                        j * 16,
+                        kk * 16
+                    );
+                }
+                for i in 0..fm {
+                    let _ = writeln!(
+                        s,
+                        "      let a{i} = coopLoadT<coop_mat16x16<f16, A>>(&sa[(wy * {tm}u + {}u) * {lds}u + {}u], {lds}u);",
+                        i * 16,
+                        kk * 16
+                    );
+                    for j in 0..fnn {
+                        let _ = writeln!(s, "      c{i}_{j} = coopMultiplyAdd(a{i}, b{j}, c{i}_{j});");
+                    }
+                }
+                let _ = writeln!(s, "    }}");
+            }
+
         let _ = writeln!(s, "    workgroupBarrier();");
         let _ = writeln!(s, "  }}");
+        }
     }
     // ── epilogue
     let _ = writeln!(s, "  let orow = m0 + wy * {tm}u;");
@@ -510,6 +527,75 @@ pub fn mm_src(g: MmCfg) -> String {
     }
     let _ = writeln!(s, "}}");
     s
+}
+
+/// The K loop with two shared stages: while slice kt is multiplied out of
+/// stage kt%2, slice kt+1 (already in registers) is stored into the other
+/// stage and slice kt+2 is fetched from global memory — one barrier per
+/// slice. The first slice is staged before the loop.
+#[allow(clippy::too_many_arguments)]
+fn mm_loop_2stage(
+    s: &mut String,
+    g: MmCfg,
+    nt: u32,
+    tm: u32,
+    tn: u32,
+    fm: u32,
+    fnn: u32,
+    lds: u32,
+    vpr: u32,
+    la: u32,
+    lb: u32,
+) {
+    use std::fmt::Write;
+    let (sza, szb) = (g.bm * lds, g.bn * lds);
+    let store = |s: &mut String, stage: &str| {
+        for (arr, reg, cnt, sz) in [("sa", "ra", la, sza), ("sb", "rb", lb, szb)] {
+            for t in 0..cnt {
+                let _ = writeln!(
+                    s,
+                    "    {{ let d = {stage} * {sz}u + ((tid + {o}u) / {vpr}u) * {lds}u + ((tid + {o}u) % {vpr}u) * 4u; {arr}[d] = {reg}{t}.x; {arr}[d + 1u] = {reg}{t}.y; {arr}[d + 2u] = {reg}{t}.z; {arr}[d + 3u] = {reg}{t}.w; }}",
+                    o = t * nt
+                );
+            }
+        }
+    };
+    let fetch = |s: &mut String, kb: &str| {
+        for t in 0..la {
+            let _ = writeln!(s, "      ra{t} = act[(p.arow + m0 + (tid + {o}u) / {vpr}u) * kq + {kb} + (tid + {o}u) % {vpr}u];", o = t * nt);
+        }
+        for t in 0..lb {
+            let _ = writeln!(s, "      rb{t} = wt[(n0 + (tid + {o}u) / {vpr}u) * kq + {kb} + (tid + {o}u) % {vpr}u];", o = t * nt);
+        }
+    };
+    store(s, "0u");
+    let _ = writeln!(s, "  workgroupBarrier();");
+    let _ = writeln!(s, "  if (1u < nkt) {{");
+    fetch(s, &format!("{vpr}u"));
+    let _ = writeln!(s, "  }}");
+    let _ = writeln!(s, "  for (var kt = 0u; kt < nkt; kt = kt + 1u) {{");
+    let _ = writeln!(s, "    let ca = (kt & 1u) * {sza}u; let cb = (kt & 1u) * {szb}u;");
+    for kk in 0..g.bk / 16 {
+        let _ = writeln!(s, "    {{");
+        for j in 0..fnn {
+            let _ = writeln!(s, "      let b{j} = coopLoad<coop_mat16x16<f16, B>>(&sb[cb + (wx * {tn}u + {}u) * {lds}u + {}u], {lds}u);", j * 16, kk * 16);
+        }
+        for i in 0..fm {
+            let _ = writeln!(s, "      let a{i} = coopLoadT<coop_mat16x16<f16, A>>(&sa[ca + (wy * {tm}u + {}u) * {lds}u + {}u], {lds}u);", i * 16, kk * 16);
+            for j in 0..fnn {
+                let _ = writeln!(s, "      c{i}_{j} = coopMultiplyAdd(a{i}, b{j}, c{i}_{j});");
+            }
+        }
+        let _ = writeln!(s, "    }}");
+    }
+    let _ = writeln!(s, "    if (kt + 1u < nkt) {{");
+    store(s, "((kt + 1u) & 1u)");
+    let _ = writeln!(s, "    }}");
+    let _ = writeln!(s, "    workgroupBarrier();");
+    let _ = writeln!(s, "    if (kt + 2u < nkt) {{ let kb2 = (kt + 2u) * {vpr}u;");
+    fetch(s, "kb2");
+    let _ = writeln!(s, "    }}");
+    let _ = writeln!(s, "  }}");
 }
 
 fn mm_pipe(c: &Ctx, g: MmCfg) -> Option<Arc<wgpu::ComputePipeline>> {
@@ -632,7 +718,7 @@ fn flash_pad() -> u32 {
 }
 
 fn flash_vt() -> bool {
-    std::env::var("CMF_ZI_FLASH_VT").as_deref() != Ok("0")
+    std::env::var("CMF_ZI_FLASH_VT").as_deref() == Ok("1")
 }
 
 /// Lazy-rescale threshold in log2 units (P ≤ 2^thr in f16). `CMF_ZI_FLASH_THR`
@@ -649,7 +735,7 @@ pub fn default_flash() -> FlashCfg {
             return FlashCfg { nw: v[0], bc: v[1] };
         }
     }
-    FlashCfg { nw: 4, bc: 32 }
+    FlashCfg { nw: 4, bc: 16 }
 }
 
 /// WGSL of `zi_flash`. hd is fixed at 128 (8 fragments of 16).
@@ -677,8 +763,8 @@ pub fn flash_src(f: FlashCfg) -> String {
     let per = vk / nt;
     assert!(per * nt == vk, "flash cfg {f:?}");
     let half = bc / 2;
-    // V staged transposed ([dim][key]) and read as a column-major B —
-    // the operand form the GEMM proves; `CMF_ZI_FLASH_VT=0` = row-major B.
+    // `CMF_ZI_FLASH_VT=1`: V staged transposed ([dim][key]) and read as a
+    // column-major B. Measured slower (35 vs 51 TF at 1024²): row-major B.
     let vt = flash_vt();
     let ldv = bc + flash_pad();
     let dbg = std::env::var("CMF_ZI_FLASH_DBG").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
