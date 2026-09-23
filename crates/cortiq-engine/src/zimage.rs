@@ -844,7 +844,7 @@ impl ZImageDit {
     }
 
     fn build(cfg: ZConfig, src: &Src, model: Option<Arc<CmfModel>>) -> Result<Self, String> {
-        let block = |pfx: &str, modulated: bool| -> Result<ZBlock, String> {
+        fn block(src: &Src, pfx: &str, modulated: bool) -> Result<ZBlock, String> {
             let (q, iq) = src.proj(&format!("{pfx}.attention.to_q.weight"))?;
             let (k, ik) = src.proj(&format!("{pfx}.attention.to_k.weight"))?;
             let (v, iv) = src.proj(&format!("{pfx}.attention.to_v.weight"))?;
@@ -882,16 +882,27 @@ impl ZImageDit {
                 w3,
                 idx,
             })
+        }
+        // A container's blocks load in parallel (B2: the adaLN widening of
+        // 34 blocks was a serial 0.5 s of every cold start).
+        let blocks = |names: Vec<(String, bool)>| -> Result<Vec<ZBlock>, String> {
+            match src {
+                Src::Cmf(m) => std::thread::scope(|sc| {
+                    let hs: Vec<_> = names
+                        .iter()
+                        .map(|(pfx, md)| sc.spawn(move || block(&Src::Cmf(m), pfx, *md)))
+                        .collect();
+                    hs.into_iter()
+                        .map(|h| h.join().map_err(|_| "block loader panicked".to_string())?)
+                        .collect()
+                }),
+                _ => names.iter().map(|(pfx, md)| block(src, pfx, *md)).collect(),
+            }
         };
-        let noise_refiner = (0..cfg.n_refiner)
-            .map(|i| block(&format!("noise_refiner.{i}"), true))
-            .collect::<Result<Vec<_>, _>>()?;
-        let context_refiner = (0..cfg.n_refiner)
-            .map(|i| block(&format!("context_refiner.{i}"), false))
-            .collect::<Result<Vec<_>, _>>()?;
-        let layers = (0..cfg.n_layers)
-            .map(|i| block(&format!("layers.{i}"), true))
-            .collect::<Result<Vec<_>, _>>()?;
+        let noise_refiner = blocks((0..cfg.n_refiner).map(|i| (format!("noise_refiner.{i}"), true)).collect())?;
+        let context_refiner =
+            blocks((0..cfg.n_refiner).map(|i| (format!("context_refiner.{i}"), false)).collect())?;
+        let layers = blocks((0..cfg.n_layers).map(|i| (format!("layers.{i}"), true)).collect())?;
         let pk = format!("{}-1", cfg.patch);
         let (cap_w, _) = src.proj("cap_embedder.1.weight")?;
         Ok(Self {
