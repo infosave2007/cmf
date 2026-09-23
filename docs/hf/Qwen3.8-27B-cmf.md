@@ -201,75 +201,95 @@ token.
 
 ## macOS — Apple Silicon (Metal)
 
-Since **0.5.79** the 27B runs on the Mac GPU out of the box — earlier
-versions silently fell back to the CPU because the 14.4 GiB file
-exceeds Metal's single-buffer cap (the engine now maps it as
-overlapping windows).
+Since **0.5.79** the 27B runs on the Mac GPU out of the box (the 14.3 GB
+file is mapped as overlapping windows under Metal's single-buffer cap;
+before that it silently fell back to the CPU).
 
 **How to run on a Mac — one command, no flags:**
 
 ```bash
-cortiq run qwen38-27b-q4tp.cmf --greedy --no-think --prompt "..."
+cortiq run qwen38-27b-q4tp.cmf --prompt "..."
 ```
 
-That is the whole fast path. Every Metal lever defaults to its measured-best
-setting: the batched verify graph with seven drafts per round, the
-65536-row draft shortlist (Cyrillic/CJK hand back to the full head), the
-4-lane GDN state, the asynchronous state replay, the prefill graph, the
-MTP graph and the device attend. No `CMF_*` variable is needed for any of
-them; they exist only to switch a lever OFF for diagnosis. `RUST_LOG=info`
-prints one line at the first generation naming the route
-(`metal native: spec k=7 greedy (batched verify, draft shortlist 65536, …)`)
-so you can confirm it. On Metal speculation is on for sampling as well
-as for greedy decoding (and with a repetition penalty); `--greedy` is
-still the fastest and the reproducible one. The engine no longer spends eight plain tokens measuring itself before
-speculating: it speculates from the first token and only times the plain
-path (two tokens) when the rounds look doubtful, then keeps the faster arm.
+That is the whole fast path. Since **0.7.3** it holds for the CLI's default
+sampling too (temperature 0.7, repetition penalty 1.1, top-k 40): before,
+Metal speculated only for greedy decoding without penalties — the default
+temperature and the repetition penalty each switched it off — so the plain
+command decoded at the plain rate. Every Metal lever defaults to its
+measured-best setting: the batched verify graph with seven drafts a round,
+the 65536-row shortlist of the draft head (Cyrillic and CJK hand back to the
+full head), the 4-lane GDN state, the asynchronous state replay, the prefill
+graph and the device attend; plain greedy rounds (`--greedy`) also draft the
+whole chain in one command buffer and take the verify's argmax on the
+device, which is why `--greedy` is still the fastest arm. None of these
+levers needs a `CMF_*` variable; each has one only to switch it OFF for
+diagnosis. `RUST_LOG=info` prints one line at the first generation naming
+the route (`metal native: spec k=7 sampling (batched verify, draft shortlist
+65536, trial: proxy), state4 on, async replay on, prefill graph on, …`).
+Add `--greedy` for reproducible output, `--no-think` to skip Qwen's
+thinking block.
 
-Measured on an M4 Mac mini, 24 GB unified memory (`qwen38-27b-q4tp.cmf`,
-cortiq 0.5.82):
+### 0.7.3 on the M4
 
-| | tok/s |
-|---|---|
-| decode, plain | **6.7** (0.5.79–0.5.81: 5.8) |
-| decode, greedy with speculation — code body | **12.2** (avg 3 of 7 drafts accepted) |
-| decode, greedy with speculation — prose | ~7 (the monitor sits at the plain rate) |
-| prefill (447-token prompt, chunks of 256) | **38** (11.6 s to first token; 0.5.81: 42 s) |
-| CPU-only (pre-0.5.79) | 3.7 |
+M4 Mac mini, 24 GB unified memory, `qwen38-27b-q4tp.cmf`, `--no-think`; the
+0.7.2 release binary against the 0.7.3 code, alternating in cooled windows
+(sampled rows `--seed 42`; plain decode from a separate A/B, three runs an
+arm, mean):
 
-0.5.82 also fixed two silent Metal numerics bugs that this file was
-subject to (every prompt longer than a chunk came back as noise, and
-the device attend ran 15–20% off the CPU on every token) — **update to
-0.5.82 or later on a Mac.** Speculation is on by default for greedy
-decoding (`CMF_GRAPH_SPEC=0` turns it off; `CMF_METAL_VERIFY_CHECK=1`
-diffs every verified row against the plain path).
+| | 0.7.2 | 0.7.3 |
+|---|---|---|
+| code, default command (sampling, 160 tokens) | 6.5 | **16.1** |
+| code, `--greedy` (160 tokens) | 13.6 | **17.3** |
+| short answer, `--greedy` (40 tokens) | 10.3 | **17.4** |
+| essay, `--greedy` / default command | 6.8 / 6.8 | 8.1 / 6.7 |
+| Russian essay, `--greedy` | 7.1 | 8.1 |
+| speculative bench (`bench --core --tokens 96 --ignore-eos`) | 15.3 | **20.0** |
+| plain decode (`CMF_GRAPH_SPEC=0`) | 6.70 | 6.77 |
 
-For long context on a Mac, add the Metal O(1) mode: the retained M4 profile
-measured ~4.7 tok/s after transition with fixed attention state instead of a
-growing KV cache; throughput still depends on backend and profile:
+tok/s of decode. What moved: speculation on the sampling and the penalized
+arms (the Metal verify tile is flat in the batch, so a round of seven drafts
+costs about two plain tokens and pays there); no eight plain tokens timed
+inside every answer (about 1.1 s at ~143 ms a token) — Metal speculates from
+the first token and times the plain path over two tokens only when the
+rounds look doubtful; a verify that reads back eight ids from a device argmax
+instead of eight 248k-float logit rows, with its scratch sized once — the
+400+ ms rounds (two in 34 on a code prompt) were the driver zero-filling
+freshly allocated buffers inside the command buffer; the draft chain in one
+submit (35.5 → 31.6 ms a round); and, from the work after 0.7.2, a 4-lane
+re-tile of the GDN state kernel and the commit's state replay on a second
+queue. A speculative round also no longer runs past `max_tokens` (0.7.2
+could return a token or two more than asked). Greedy output is
+byte-identical to 0.7.2 on code, essay and Russian prompts; greedy with a
+repetition penalty (`--temperature 0 --rep-penalty 1.1`) speculates with
+text byte-identical to the plain path and to 0.7.2 (code and essay); the
+commit oracle (`CMF_METAL_VERIFY_CHECK=2`) reads the appended K/V rows
+exactly and the GDN states within 1.2e-3 of the plain path (8e-4 with the
+old state kernel over the same 15 rounds).
+
+Where the Mac's ceiling is: a code round is ~268 ms (draft 32, verify about
+220) for ~4.8 tokens. The verify's eight-row q4tp GEMM streams the 14.3 GB
+at 64-71 GB/s against the plain matvec's 97: on the M4 a half-precision
+simdgroup multiply-accumulate issues at the plain FP32 FMA rate (1.7 of
+1.88 TMAC/s measured), so at eight rows the matrix work and the weight
+stream are nearly equal and cannot fully overlap. Four kernel redesigns
+(fewer ALU ops, other threadgroup shapes, contiguous group runs, two rows in
+flight a thread) all measured slower in a clean window. More Mac speed now
+has to come from more accepted tokens per round.
+
+0.5.82 fixed two silent Metal numerics bugs this file was subject to
+(prompts longer than a chunk came back as noise; the device attend ran
+15–20% off the CPU) — **use 0.5.82 or later on a Mac.**
+
+For long context on a Mac, add the Metal O(1) mode (it decodes without
+speculation): the retained M4 profile measured ~4.7 tok/s after transition
+with fixed attention state instead of a growing KV cache; throughput still
+depends on backend and profile:
 
 ```bash
 CMF_O1_METAL=1 cortiq run qwen38-27b-q4t.cmf --o1 all --prompt "..."
 ```
 
 `q4tp` is the Mac build (`q4t` also runs); `q8_2f` (27.4 GB) does not fit 24 GB machines.
-
-### 0.7.2 on the M4
-
-The Metal path kept its draft depth at 7 (the verify tile is flat in the
-batch, so a shorter round only forfeits tokens) and gained the adaptive
-draft-head shortlist (the 65536-row head halves the draft: 66 → 32 ms for
-seven steps; Cyrillic and CJK hand back to the full head), the GDN run of
-the token graph on one compute encoder instead of seven per layer, and a
-verify attend that no longer walks the K mirror for an importance mass
-nothing reads. Greedy output is byte-identical to 0.7.1 on both the plain
-and the speculative path, and the speed is the same: a cooled, alternating
-A/B on the M4 (24 GB) reads 6.65 vs 6.63 tok/s plain (GPU span 145 ms
-either way — the 14.3 GB file at ~100 GB/s) and 10.5 vs 10.5 on a code
-prompt with speculation (k=7, 3-5 of 7 accepted). The Mac's remaining
-lever is the verify's eight-row GEMM at 68 GB/s against the plain
-matvec's ~100; the shortlist is what moved this release (draft 66 → 32 ms
-for seven steps).
 
 ## Sampling
 
@@ -519,29 +539,46 @@ CPU-шаг (отказ виден при RUST_LOG=info). По умолчанию
 Качество и точное извлечение произвольных дальних фактов этим замером не
 утверждаются.
 
-**macOS (Apple Silicon, Metal).** Запуск на маке — одна команда, без
-флагов: `cortiq run qwen38-27b-q4tp.cmf --greedy --no-think --prompt "..."`.
-Все рычаги Metal (пакетная верификация на 7 черновиков, шорт-лист головы
-65536, 4-канальное GDN-состояние, асинхронный replay, граф префилла, граф
-MTP, device-attend) включены по умолчанию; переменные `CMF_*` нужны только
-чтобы ВЫКЛЮЧИТЬ рычаг для диагностики. `RUST_LOG=info` печатает одну
-строку `metal native: spec k=7 …` — по ней видно, что быстрый путь
-включён. На Metal спекуляция включена и при сэмплировании, и с
-repetition penalty, не только при greedy (`--greedy` по-прежнему
-быстрее всего и воспроизводим); движок больше не тратит восемь plain-токенов на пробу перед
-спекуляцией — спекулирует с первого токена и замеряет plain (два токена)
-только когда раунды выглядят сомнительно. С 0.5.79 модель работает на GPU мака
-из коробки (раньше файл не влезал в лимит одного Metal-буфера и всё
-тихо уходило на CPU). С 0.5.82 — нативная Metal-спекуляция и
-префилл-граф, и починены две тихие ошибки численности Metal (промпт
-длиннее чанка возвращался шумом; device-attend отклонялся от CPU на
-15–20% на каждом токене) — **на маке обновляйтесь до 0.5.82**. Замер на
-M4 mini 24 ГБ (q4tp): декод plain **6.7 tok/s** (было 5.8), greedy со
-спекуляцией на коде **12.2 tok/s** (в среднем 3 из 7 черновиков),
-проза ~7; промпт 447 токенов — **11.6 с** до первого токена (было 42). Для длинного
-контекста — Metal-режим O(1): `CMF_O1_METAL=1 cortiq run … --o1 all` —
+**macOS (Apple Silicon, Metal).** С 0.5.79 модель работает на GPU мака
+из коробки (файл 14.3 ГБ отображается перекрывающимися окнами под лимит
+одного Metal-буфера; раньше всё тихо уходило на CPU). Запуск — одна
+команда, без флагов: `cortiq run qwen38-27b-q4tp.cmf --prompt "..."`. С
+**0.7.3** быстрый путь работает и на сэмплировании CLI по умолчанию
+(температура 0.7, repetition penalty 1.1, top-k 40): раньше Metal
+спекулировал только при greedy без штрафов — и температура по умолчанию, и
+штраф за повтор выключали спекуляцию, поэтому команда без флагов шла на
+скорости plain. Все рычаги Metal включены по умолчанию: пакетная
+верификация на 7 черновиков, шорт-лист головы черновика на 65536 строк
+(кириллица и CJK возвращаются к полной голове), 4-канальное GDN-состояние,
+асинхронный replay, граф префилла, device-attend; в раундах plain greedy
+(`--greedy`) вся цепочка черновика идёт одним командным буфером, а argmax
+верификации считается на устройстве — поэтому `--greedy` по-прежнему
+быстрее всего. Ни один из этих рычагов не требует переменных `CMF_*` — они
+есть только чтобы ВЫКЛЮЧИТЬ рычаг для диагностики; `RUST_LOG=info`
+печатает строку `metal native: …`. `--greedy` даёт воспроизводимый вывод,
+`--no-think` убирает блок размышлений. M4 mini 24 ГБ, q4tp, `--no-think`,
+бинарь релиза 0.7.2 против кода 0.7.3 попеременно в остывших окнах, tok/s
+декода: код командой по умолчанию 6.5 → **16.1**, код с `--greedy`
+13.6 → **17.3**, короткий ответ с `--greedy` (40 токенов) 10.3 → **17.4**,
+эссе с `--greedy` 6.8 → 8.1 (командой по умолчанию 6.8 → 6.7), русское эссе
+с `--greedy` 7.1 → 8.1, бенч со спекуляцией 15.3 → **20.0**, plain
+6.70 → 6.77 (отдельный остывший A/B, по три прогона). Раунд спекуляции
+больше не выходит за `max_tokens`. Greedy-вывод побитово совпадает с 0.7.2 на
+промптах кода, эссе и русского текста; greedy со штрафом за повтор
+побитово совпадает с plain-путём и с 0.7.2. Раунд на коде ~268 мс (черновик
+32, верификация около 220) на ~4.8 токена; потолок мака — восьмистрочный
+GEMM верификации (64-71 ГБ/с против 97 у plain-матвека): на M4
+simdgroup-MMA половинной точности идёт с темпом обычного FP32 FMA (1.7 из
+1.88 TMAC/s), и при восьми строках вычисления и поток весов почти равны;
+четыре переделки ядра в чистом замере оказались медленнее, так что дальше
+ускорять мак можно только за счёт большего числа принятых токенов за
+раунд. С 0.5.82 починены две тихие численные ошибки Metal (промпт длиннее
+чанка возвращался шумом; device-attend отклонялся от CPU на 15–20%) — **на
+маке нужна 0.5.82 или новее**. Для длинного контекста — Metal-режим O(1)
+(спекуляция в нём выключена): `CMF_O1_METAL=1 cortiq run … --o1 all` —
 сохранённый профиль даёт ~4.7 tok/s после перехода при фиксированной
-памяти внимания; фактическая скорость зависит от backend и профиля. Для мака берите `q4t`; `q8_2f` (27.4 ГБ) в 24 ГБ не
+памяти внимания; фактическая скорость зависит от backend и профиля. Для
+мака берите `q4tp` (`q4t` тоже работает); `q8_2f` (27.4 ГБ) в 24 ГБ не
 помещается.
 
 ---
@@ -653,18 +690,30 @@ Metal 用 `CMF_O1_METAL=1`（0.5.79 起）。
 单模型单硬件结果；不代表普遍速度、精确的无限上下文记忆或质量提升，
 `window=2048` 仍是实验选项，默认值是 128。
 
-**macOS（Apple Silicon，Metal）。** 在 Mac 上只需一条命令、无需任何环境变量：
-`cortiq run qwen38-27b-q4tp.cmf --greedy --no-think --prompt "..."`。
-所有 Metal 优化（每轮 7 个草稿的批量验证图、65536 行草稿头短名单、4 通道 GDN
-状态、异步状态回放、预填充图、MTP 图、设备端注意力）默认全部开启；`CMF_*`
-变量仅用于在诊断时关闭某一项。`RUST_LOG=info` 会在首次生成时打印一行
-`metal native: spec k=7 …`，用于确认已走快速路径。在 Metal 上，采样解码和带
-重复惩罚的解码也默认启用推测（`--greedy` 仍是最快且可复现的）；引擎不再在推测前用八个 plain
-token 自测，而是从第一个 token 起就推测，仅在轮次看起来不划算时才计时
-plain 路径（两个 token）。自 **0.5.79** 起，27B 可直接在 Mac
-GPU 上运行（此前文件超出单个 Metal 缓冲区上限，会静默回退到 CPU）。
-M4 mini 24 GB 实测：解码 **5.8 tok/s**，2k 上下文预填充 20.8 tok/s
-（纯 CPU 为 3.7）。长上下文请使用 Metal 版 O(1) 模式：
-`CMF_O1_METAL=1 cortiq run … --o1 all` — 保留的 M4 配置在切换后约
-4.7 tok/s，注意力状态恒定大小；实际速度取决于后端和配置。Mac 请选 `q4t`；`q8_2f`
-（27.4 GB）无法装入 24 GB 内存。
+**macOS（Apple Silicon，Metal）。** 自 **0.5.79** 起，27B 可直接在 Mac GPU
+上运行（14.3 GB 文件以重叠窗口映射，绕过 Metal 单缓冲区上限；此前会静默回退到
+CPU）。在 Mac 上只需一条命令、无需额外参数或环境变量：
+`cortiq run qwen38-27b-q4tp.cmf --prompt "..."`。自 **0.7.3** 起，CLI 默认的采样
+设置（温度 0.7、重复惩罚 1.1、top-k 40）也走快速路径：此前 Metal 只在无惩罚的贪心
+解码时启用推测，默认温度和重复惩罚都会关闭推测，因此不带参数的命令只能以普通速度
+解码。所有 Metal 优化默认开启：每轮 7 个草稿的批量验证图、65536 行的草稿头短名单
+（西里尔文与中日韩文字回退到完整输出头）、4 通道 GDN 状态、异步状态回放、预填充图、
+设备端注意力；在普通贪心轮次（`--greedy`）中，整条草稿链只用一个命令缓冲区，验证的
+argmax 也在设备端完成——因此 `--greedy` 仍是最快的。这些优化都无需设置 `CMF_*`
+变量，相应变量仅用于诊断时关闭某一项；`RUST_LOG=info` 会打印一行 `metal native: …`。
+`--greedy` 输出可复现，`--no-think` 跳过思考块。M4 mini 24 GB、q4tp、`--no-think`，
+0.7.2 发布版二进制与 0.7.3 代码在冷却窗口内交替测量（解码 tok/s）：默认命令写代码
+6.5 → **16.1**，`--greedy` 写代码 13.6 → **17.3**，`--greedy` 40 token 短回答
+10.3 → **17.4**，`--greedy` 散文 6.8 → 8.1（默认命令 6.8 → 6.7），`--greedy` 俄语
+散文 7.1 → 8.1，推测基准 15.3 → **20.0**，普通解码 6.70 → 6.77（单独冷却 A/B，每组
+3 次）。推测轮次不再超出 `max_tokens`。在代码、散文和俄语提示上，贪心输出与 0.7.2
+逐字节一致；带重复惩罚的贪心输出与普通路径及 0.7.2 逐字节一致。代码场景每轮约
+268 ms（草稿 32、验证约 220）产出约 4.8 个 token；Mac 当前的上限是验证用的八行
+GEMM（64-71 GB/s，普通矩阵向量乘为 97）：在 M4 上，半精度 simdgroup MMA 的吞吐与
+普通 FP32 FMA 相同（实测 1.7 / 1.88 TMAC/s），八行时计算与权重读取几乎相等；四种内核
+重写在干净测量中都更慢，因此 Mac 上的进一步提速只能来自每轮更多被接受的 token。
+0.5.82 修复了两处 Metal 静默数值错误（超过一个分块的提示会输出噪声；设备端注意力与
+CPU 偏差 15–20%）——**Mac 上请使用 0.5.82 或更新版本**。长上下文请使用 Metal 版
+O(1) 模式（该模式下不启用推测解码）：`CMF_O1_METAL=1 cortiq run … --o1 all`——保留的
+M4 配置在切换后测得约 4.7 tok/s，注意力状态大小恒定；实际速度取决于后端和配置。Mac 请选
+`q4tp`（`q4t` 也可运行）；`q8_2f`（27.4 GB）无法装入 24 GB 内存。

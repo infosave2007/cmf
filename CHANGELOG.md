@@ -7,34 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-09-23
+
 ### Changed
 - Native Metal is now fast with no flags at all. Qwen3.8-27B q4tp on an
-  M4 (24 GB), cooled and interleaved against the previous build: a code
-  prompt at the CLI defaults (sampling 0.7 / repetition penalty 1.1 /
-  top-k 40) 6.6 → 15.8 tok/s, the same prompt with `--greedy`
-  14.0 → 17.0, a 40-token answer 10.3 → 17.1, the speculative bench
-  16.1 → 20.2, essays unchanged (greedy 7.5 → 7.9, sampled 6.6 → 6.5).
+  M4 (24 GB), the 0.7.2 and 0.7.3 binaries alternating in one cooled
+  window: a code prompt at the CLI defaults (sampling 0.7 / repetition
+  penalty 1.1 / top-k 40) 6.5 → 16.1 tok/s, the same prompt with
+  `--greedy` 13.6 → 17.3, a 40-token answer 10.3 → 17.4, the speculative
+  bench 15.3 → 20.0, a greedy essay 6.8 → 8.1 and a Russian one
+  7.1 → 8.1, a sampled essay 6.8 → 6.7, plain decode 6.70 → 6.77. Greedy
+  output is byte-identical to 0.7.2 on code, essay and Russian prompts.
   The pieces follow.
 - Native Metal runs its fastest known configuration with no environment
   variables, and says so: the first generation logs one line under
   `RUST_LOG=info` (`metal native: spec k=7 greedy (batched verify, draft
   shortlist 65536, trial: proxy), state4 on, async replay on, prefill
   graph on, MTP graph on, attend auto, probe bypassed (q1 force)`). The speculation
-  trial no longer decodes eight plain tokens up front on Metal (about
-  1.2 s of every answer on the 27B): the loop speculates from the first
-  token, keeps speculating while the rounds land 3.5+ tokens each, and
-  otherwise times the plain path over the fewest tokens that measure it
-  (two on the 27B, up to eight on a small model) before the unchanged
-  keep/stop rule decides. Greedy output is byte-identical to the previous
-  binary on the code, essay and Russian prompts.
+  trial no longer times eight plain tokens inside every answer on Metal
+  (about 1.1 s on the 27B at ~143 ms a token): the loop speculates from
+  the first token, keeps speculating while the rounds land 3.5+ tokens
+  each, and otherwise times the plain path over the fewest tokens that
+  measure it (two on the 27B, up to eight on a small model) before the
+  unchanged keep/stop rule decides. Greedy output is byte-identical to
+  0.7.2 on the code, essay and Russian prompts.
 - Native Metal speculates on the sampling and the penalized arms by
   default, not only on plain greedy: the Metal verify tile is flat in
   the batch (a round costs ~1.9 plain tokens), so both pay there where
-  they did not on the 5090. Before this the CLI's own defaults (rep 1.1)
-  never speculated on Metal. Measured on the 27B / M4, cooled and
-  interleaved, CLI defaults with seed 42, code prompt: 6.6 → 15.8 tok/s;
-  greedy with rep 1.1 speculates with the text byte-identical to the
-  plain path and to the previous binary (code and essay prompts). The per-round watchdog
+  they did not on the 5090. Before this Metal speculated only for greedy
+  decoding without penalties, so the CLI's own defaults (temperature 0.7,
+  rep 1.1) never did. Measured on the 27B / M4 against 0.7.2, cooled and
+  interleaved, CLI defaults with seed 42, code prompt: 6.5 → 16.1 tok/s;
+  greedy with rep 1.1 (`--temperature 0 --rep-penalty 1.1`) speculates
+  with the text byte-identical to the plain path and to 0.7.2 (code and
+  essay prompts). The per-round watchdog
   still turns speculation off where it loses. `CMF_GRAPH_SPEC_SAMPLE=0`
   keeps the sampling arm plain, `CMF_GRAPH_SPEC=0` all of it; a sampled
   answer for a fixed seed differs from the previous binary (the
@@ -58,7 +64,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The verify's b-row scratch is sized once for eight rows, so a round
   of a different width no longer allocates fresh Shared buffers — their
   first touch is zero-filled by the driver inside the command buffer,
-  which is what the 400-450 ms outlier rounds were (two in 34 on a code
+  which is what the 400+ ms outlier rounds were (two in 34 on a code
   prompt, now none). The MTP warm-up is split into submit and finish so
   its wait overlaps host work. `CMF_GRAPH_SPEC_TIME=2` prints per-round
   host stamps; `CMF_METAL_VBUF_BC=0` restores the old scratch sizing.
@@ -97,9 +103,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   6.71 → 6.74 tok/s, a code prompt with speculation 10.9 → 11.5, the
   speculative bench 15.3 → 15.9; a round is draft 32 + verify 229 +
   commit 5-21 ms (was verify 253, commit 25-45). Greedy output is
-  bit-identical to 0.7.2 and the commit oracle
-  (`CMF_METAL_VERIFY_CHECK=2`) reads the same 7e-4 state deviation as
-  the old kernels.
+  bit-identical to 0.7.2; the commit oracle (`CMF_METAL_VERIFY_CHECK=2`)
+  reads the appended K/V rows exactly and the GDN states within 1.2e-3
+  of the plain path (8e-4 with the old state kernel over the same 15
+  rounds of a code prompt).
+
+### Fixed
+- A speculative round no longer runs past `max_tokens`: the round's
+  draft depth is capped by the tokens left, so `-n 40` returns 40 tokens
+  (0.7.2 could return a token or two more, and a server response could
+  exceed its `max_tokens`). The cap is applied before drafting, because
+  the accepted drafts are already in the KV cache when the round returns;
+  a capped tail round does not move the adaptive draft depth.
 
 ## [0.7.2] - 2026-09-23
 
