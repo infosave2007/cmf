@@ -245,17 +245,70 @@ pub(crate) fn release() {
     if let Ok(mut g) = ZSTATE.lock() {
         *g = None;
     }
+    if let Ok(mut g) = ZREFINER.lock() {
+        *g = None;
+    }
 }
 
 /// Unmodulated context refiner on the device (s = 0, gate = 1).
+/// The planes of the context-refiner blocks are cached apart from the 32
+/// per-step blocks: (model uid, first weight index) → planes.
+static ZREFINER: Mutex<Option<(u64, usize, Vec<ZBlockDev>)>> = Mutex::new(None);
+
 pub(crate) fn refine_caption(
-    _model: &Arc<CmfModel>,
-    _geom: &ZGeom,
-    _blocks: &[ZBlockRef],
-    _rope_cap: (&[f32], &[f32]),
-    _cap: &mut [f32],
+    model: &Arc<CmfModel>,
+    geom: &ZGeom,
+    blocks: &[ZBlockRef],
+    rope_cap: (&[f32], &[f32]),
+    cap: &mut [f32],
 ) -> bool {
-    false
+    if !zi_enabled() || blocks.is_empty() {
+        return false;
+    }
+    let Some(d) = ZDims::from_geom(geom) else { return false };
+    let n = cap.len() / d.h;
+    if n == 0 || n % 32 != 0 || cap.len() != n * d.h || rope_cap.0.len() < n * 64 || rope_cap.1.len() < n * 64 {
+        return false;
+    }
+    let Some(c) = zctx() else { return false };
+    let Ok(mut g) = ZREFINER.lock() else { return false };
+    let key = (model.uid(), blocks[0].wq);
+    if !g.as_ref().is_some_and(|(u, w, v)| (*u, *w) == key && v.len() == blocks.len()) {
+        *g = None;
+        let mut v = Vec::with_capacity(blocks.len());
+        for r in blocks {
+            match ZBlockDev::from_model(model, &d, r) {
+                Some(b) => v.push(b),
+                None => return false,
+            }
+        }
+        *g = Some((key.0, key.1, v));
+    }
+    let devs = &g.as_ref().unwrap().2;
+    let Some(seq) = ZSeq::new(&d, &[(0, n)]) else { return false };
+    seq.set_rope(&rope_cap.0[..n * 64], &rope_cap.1[..n * 64]);
+    seq.write_x(cap);
+    // Unmodulated: the row ops read no mods (scale 0, gate 1).
+    let mods = sbuf(c, 16, "zi_nomods");
+    let t = ZTiles::default();
+    let mut calls = ZCalls::default();
+    for (k, blk) in devs.iter().enumerate() {
+        let next = devs.get(k + 1).map(|nb| (nb, 0));
+        match block_calls(&d, &t, &seq, blk, &mods, 0, k == 0, next, false) {
+            Some(cl) => calls.extend(cl),
+            None => return false,
+        }
+    }
+    if calls.run().is_none() {
+        return false;
+    }
+    match seq.read_x(&d) {
+        Some(x) => {
+            cap.copy_from_slice(&x[..n * d.h]);
+            true
+        }
+        None => false,
+    }
 }
 
 /// Resident Flux-VAE decoder; `z` is already de-normalised.
