@@ -96,8 +96,9 @@
 //!
 //! - `prepare` and `step` implement the contract for batch 1 (Turbo).
 //!   `prepare` builds the f16 planes once per model, using
-//!   [`ZBlockDev::from_model`]: F16 as stored, Bf16/F32 converted, Q4TiledP
-//!   dequantized by the parent's `q4tp_dq_f16`. Any other codec declines.
+//!   [`ZBlockDev::from_model`]: F16 as stored, Bf16/F32 converted,
+//!   Q4TiledP / Q8Row / Q8_2f dequantized by the parent's `q4tp_dq_f16` /
+//!   `q8_dq_f16`. Any other codec declines.
 //!   The contract then builds a [`ZStepDev`] for (n_img, n_cap_p) and
 //!   uploads both RoPE tables. `step` uploads x_tok, mods and the final
 //!   scale, replays the program and reads back `[n_img][64]`.
@@ -111,7 +112,6 @@
 //!   - the context refiner (`refine_caption` still declines; use
 //!     `block_calls(.., modulated = false)` on a `ZSeq` of the caption);
 //!   - the resident VAE (`vae_decode_chain`);
-//!   - q8 plane codecs;
 //!   - the text encoder.
 //! - Knobs:
 //!   - `CMF_ZI_WGPU=0`: device path off;
@@ -1969,9 +1969,10 @@ impl ZBlockDev {
 
 /// f16 plane rows of one weight tensor, written into `dst`: tensor row
 /// panel `p` (rows 16p..16p+16) lands at plane row `panel_row(p)`.
-/// F16 = bytes as stored; Bf16/F32 converted on the host; Q4TiledP
-/// dequantized on the device by the parent's `q4tp_dq_f16` (the plane
-/// layout the parent's coop GEMM eats). Other codecs → `None`.
+/// F16 = bytes as stored; Bf16/F32 converted on the host; Q4TiledP,
+/// Q8Row and Q8_2f dequantized on the device by the parent's
+/// `q4tp_dq_f16` / `q8_dq_f16` (the plane layout the parent's coop GEMM
+/// eats). Other codecs → `None`.
 fn tensor_to_plane(
     c: &Ctx,
     model: &Arc<CmfModel>,
@@ -2019,28 +2020,49 @@ fn tensor_to_plane(
             }
             Some(())
         }
-        T::Q4TiledP => {
-            let dq = c.q4tp_dq_f16.as_ref()?;
-            let need = cortiq_core::quant::expected_nbytes(T::Q4TiledP, &[rows, cols])?;
+        T::Q4TiledP | T::Q8Row | T::Q8_2f => {
+            // Device dequant into a temporary [rows][cols] plane with the
+            // parent's kernels, then copy the panels into place.
+            let need = cortiq_core::quant::expected_nbytes(e.dtype, &[rows, cols])?;
             if bytes.len() < need {
                 return None;
             }
-            let mut payload = bytes[..need].to_vec();
-            payload.resize(need.next_multiple_of(4), 0);
-            let src = sbuf_init(c, &payload, "zi_q4tp");
-            let tmp = sbuf(c, (rows * cols * 2) as u64, "zi_dq");
-            let u = ubuf(c, &[cols as u32, rows as u32, 0, 0]);
-            let b = bg(c, dq, &[&src, &tmp, &u]);
+            let n = rows * cols;
+            let tmp = sbuf(c, (n * 2) as u64, "zi_dq");
+            let pad4 = |v: &[u8]| {
+                let mut v = v.to_vec();
+                v.resize(v.len().next_multiple_of(4), 0);
+                v
+            };
+            let (pipe, bufs): (&wgpu::ComputePipeline, Vec<wgpu::Buffer>) = if e.dtype == T::Q4TiledP {
+                let src = sbuf_init(c, &pad4(&bytes[..need]), "zi_q4tp");
+                (c.q4tp_dq_f16.as_ref()?, vec![src, tmp.clone(), ubuf(c, &[cols as u32, rows as u32, 0, 0])])
+            } else {
+                // q8_row: int8 [rows][cols] + f16 row scales; q8_2f adds f16
+                // column scales. The kernel takes both fields as f32.
+                let h2f = |b: &[u8]| -> Vec<f32> {
+                    b.chunks_exact(2).map(|x| cortiq_core::quant::f16_to_f32(u16::from_le_bytes([x[0], x[1]]))).collect()
+                };
+                let rsc = h2f(&bytes[n..n + rows * 2]);
+                let col = if e.dtype == T::Q8_2f { Some(h2f(&bytes[n + rows * 2..n + rows * 2 + cols * 2])) } else { None };
+                let q = sbuf_init(c, &pad4(&bytes[..n]), "zi_q8");
+                let rs = sbuf_init(c, bytemuck::cast_slice(&rsc), "zi_q8_rs");
+                let cs = sbuf_init(c, bytemuck::cast_slice(col.as_deref().unwrap_or(&[1.0f32])), "zi_q8_cs");
+                let u = ubuf(c, &[cols as u32, rows as u32, u32::from(col.is_some()), 0]);
+                (c.q8_dq_f16.as_ref()?, vec![q, tmp.clone(), u, rs, cs])
+            };
+            let refs: Vec<&wgpu::Buffer> = bufs.iter().collect();
+            let b = bg(c, pipe, &refs);
             let mut enc = c.device.create_command_encoder(&Default::default());
             {
                 let mut pass = enc.begin_compute_pass(&Default::default());
-                pass.set_pipeline(dq);
+                pass.set_pipeline(pipe);
                 pass.set_bind_group(0, &b, &[]);
-                let wgs = ((rows * cols / 2) as u32).div_ceil(256);
+                let wgs = ((n / 2) as u32).div_ceil(256);
                 pass.dispatch_workgroups(wgs.min(65535), wgs.div_ceil(65535), 1);
             }
             if contiguous {
-                enc.copy_buffer_to_buffer(&tmp, 0, dst, (panel_row(0) * cols * 2) as u64, (rows * cols * 2) as u64);
+                enc.copy_buffer_to_buffer(&tmp, 0, dst, (panel_row(0) * cols * 2) as u64, (n * 2) as u64);
             } else {
                 for p in 0..rows / 16 {
                     enc.copy_buffer_to_buffer(&tmp, p as u64 * panel_bytes, dst, (panel_row(p) * cols * 2) as u64, panel_bytes);
@@ -2055,10 +2077,9 @@ fn tensor_to_plane(
 
 impl ZBlockDev {
     /// Planes of one block straight from the container (`ZBlockRef`
-    /// indices, diffusers names). F16 / Bf16 / F32 / Q4TiledP; any other
-    /// codec → `None` (the caller declines and the CPU path runs). The
-    /// integration package adds q8_row / q8_2f here via the parent's
-    /// `q8_dq_f16` when the WP4 codec policy picks them.
+    /// indices, diffusers names). F16 / Bf16 / F32 / Q4TiledP / Q8Row /
+    /// Q8_2f; any other codec → `None` (the caller declines and the CPU
+    /// path runs).
     pub fn from_model(model: &Arc<CmfModel>, d: &ZDims, r: &ZBlockRef) -> Option<ZBlockDev> {
         let c = zctx()?;
         let (h, i) = (d.h, d.inter);

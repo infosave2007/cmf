@@ -794,17 +794,47 @@ mod imp {
         let mut specs = Vec::new();
         let mut host = Vec::new();
         for bi in 0..nblk {
-            // block 3 stored BF16, the rest F16
-            let bf = bi == 3;
+            // one codec per block: F16, Q8_2f, Q8Row, BF16 (every plane
+            // path of `ZBlockDev::from_model` except Q4TP, whose dequant
+            // kernel is the parent's tested `q4tp_dq_f16`).
+            let codec = [TensorDtype::F16, TensorDtype::Q8_2f, TensorDtype::Q8Row, TensorDtype::Bf16][bi];
             let mut t = |name: String, rows: usize, cols: usize| -> Vec<f64> {
                 let a = 1.7 / (cols as f32).sqrt();
                 let vals: Vec<f32> = (0..rows * cols).map(|_| rng.uni() * a).collect();
-                let (dtype, data, back): (TensorDtype, Vec<u8>, Vec<f64>) = if bf {
-                    let bits: Vec<u16> = vals.iter().map(|v| (v.to_bits() >> 16) as u16).collect();
-                    (TensorDtype::Bf16, bits.iter().flat_map(|b| b.to_le_bytes()).collect(), bits.iter().map(|&b| f32h(f16(f32::from_bits((b as u32) << 16))) as f64).collect())
-                } else {
-                    let bits: Vec<u16> = vals.iter().map(|&v| f16(v)).collect();
-                    (TensorDtype::F16, bits.iter().flat_map(|b| b.to_le_bytes()).collect(), bits.iter().map(|&b| f32h(b) as f64).collect())
+                let (dtype, data, back): (TensorDtype, Vec<u8>, Vec<f64>) = match codec {
+                    TensorDtype::Bf16 => {
+                        let bits: Vec<u16> = vals.iter().map(|v| (v.to_bits() >> 16) as u16).collect();
+                        (TensorDtype::Bf16, bits.iter().flat_map(|b| b.to_le_bytes()).collect(), bits.iter().map(|&b| f32h(f16(f32::from_bits((b as u32) << 16))) as f64).collect())
+                    }
+                    TensorDtype::Q8_2f | TensorDtype::Q8Row => {
+                        // int8 rows, f16 row scale; q8_2f adds f16 column scales
+                        let two = codec == TensorDtype::Q8_2f;
+                        let colf: Vec<u16> = (0..cols).map(|i| f16(if two { 0.75 + 0.5 * ((i * 7 % 11) as f32 / 11.0) } else { 1.0 })).collect();
+                        let mut q = vec![0u8; rows * cols];
+                        let mut rsc = vec![0u16; rows];
+                        let mut back = vec![0f64; rows * cols];
+                        for r in 0..rows {
+                            let mx = (0..cols).map(|i| (vals[r * cols + i] / f32h(colf[i])).abs()).fold(0f32, f32::max).max(1e-8);
+                            rsc[r] = f16(mx / 127.0);
+                            let sc = f32h(rsc[r]);
+                            for i in 0..cols {
+                                let qi = (vals[r * cols + i] / f32h(colf[i]) / sc).round().clamp(-127.0, 127.0) as i8;
+                                q[r * cols + i] = qi as u8;
+                                // the device plane is f16: the reference rounds the same way
+                                back[r * cols + i] = f32h(f16(qi as f32 * sc * f32h(colf[i]))) as f64;
+                            }
+                        }
+                        let mut data = q;
+                        data.extend(rsc.iter().flat_map(|b| b.to_le_bytes()));
+                        if two {
+                            data.extend(colf.iter().flat_map(|b| b.to_le_bytes()));
+                        }
+                        (codec, data, back)
+                    }
+                    _ => {
+                        let bits: Vec<u16> = vals.iter().map(|&v| f16(v)).collect();
+                        (TensorDtype::F16, bits.iter().flat_map(|b| b.to_le_bytes()).collect(), bits.iter().map(|&b| f32h(b) as f64).collect())
+                    }
                 };
                 specs.push(TensorSpec { name, dtype, shape: vec![rows, cols], data });
                 back
