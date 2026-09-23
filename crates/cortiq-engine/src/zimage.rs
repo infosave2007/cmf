@@ -360,6 +360,239 @@ fn softmax_inplace(row: &mut [f32]) {
     }
 }
 
+/// The host GEMM of the reference path: y[n, m] = x[n, k] · w[m, k]ᵀ.
+///
+/// On x86-64 with AVX2+FMA a register-blocked kernel (3×3 micro-tiles of
+/// 8-wide FMAs, K blocked by 256, tiles pool-parallel); the engine's
+/// `fcd_ops::gemm_nt` only blocks under AVX-512, and on an AVX2 EPYC its
+/// per-output dot ran the 6B DiT at ~0.17 TFLOP/s on 14 threads. Elsewhere
+/// (aarch64: Accelerate/NEON) it defers to `fcd_ops::gemm_nt`. f32
+/// accumulation; the summation order differs from torch only by rounding.
+/// `CMF_ZIMAGE_HOST_GEMM=engine` forces `fcd_ops::gemm_nt` everywhere.
+pub(crate) mod host_gemm {
+    use crate::pool::Pool;
+
+    const KC: usize = 256;
+    const MB: usize = 48;
+    const NB: usize = 48;
+
+    fn native() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            if matches!(std::env::var("CMF_ZIMAGE_HOST_GEMM").as_deref(), Ok("engine")) {
+                return false;
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                std::arch::is_x86_feature_detected!("avx2")
+                    && std::arch::is_x86_feature_detected!("fma")
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                false
+            }
+        })
+    }
+
+    struct YPtr(*mut f32);
+    unsafe impl Send for YPtr {}
+    unsafe impl Sync for YPtr {}
+
+    /// y[i·ldy + j] = Σ_k x[i·k + ..]·w[j·k + ..] for i < n, j < m.
+    /// `y` rows are `ldy` apart (≥ m): a column slice of a wider output.
+    pub(crate) fn gemm_nt_ld(
+        x: &[f32],
+        w: &[f32],
+        y: &mut [f32],
+        ldy: usize,
+        n: usize,
+        k: usize,
+        m: usize,
+        pool: Option<&Pool>,
+    ) {
+        debug_assert!(x.len() >= n * k && w.len() >= m * k);
+        debug_assert!(n == 0 || y.len() >= (n - 1) * ldy + m);
+        #[cfg(target_arch = "x86_64")]
+        if native() && k % 8 == 0 {
+            for i in 0..n {
+                y[i * ldy..i * ldy + m].fill(0.0);
+            }
+            let (ti, tj) = (n.div_ceil(MB), m.div_ceil(NB));
+            let yp = YPtr(y.as_mut_ptr());
+            let work = |lo: usize, hi: usize| {
+                let yp = &yp;
+                for t in lo..hi {
+                    let (bi, bj) = (t / tj, t % tj);
+                    let (i0, i1) = (bi * MB, ((bi + 1) * MB).min(n));
+                    let (j0, j1) = (bj * NB, ((bj + 1) * NB).min(m));
+                    // SAFETY: ISA checked; tiles write disjoint y blocks.
+                    unsafe { tile(x, w, yp.0, ldy, k, i0, i1, j0, j1) };
+                }
+            };
+            match pool {
+                Some(p) => p.run_rows(ti * tj, &work),
+                None => work(0, ti * tj),
+            }
+            return;
+        }
+        if ldy == m {
+            crate::fcd_ops::gemm_nt(&x[..n * k], &w[..m * k], &mut y[..n * m], n, k, m, pool);
+        } else {
+            let mut tmp = vec![0f32; n * m];
+            crate::fcd_ops::gemm_nt(&x[..n * k], &w[..m * k], &mut tmp, n, k, m, pool);
+            for i in 0..n {
+                y[i * ldy..i * ldy + m].copy_from_slice(&tmp[i * m..(i + 1) * m]);
+            }
+        }
+    }
+
+    pub(crate) fn gemm_nt(
+        x: &[f32],
+        w: &[f32],
+        y: &mut [f32],
+        n: usize,
+        k: usize,
+        m: usize,
+        pool: Option<&Pool>,
+    ) {
+        gemm_nt_ld(x, w, y, m, n, k, m, pool)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn hsum(v: std::arch::x86_64::__m256) -> f32 {
+        use std::arch::x86_64::*;
+        let lo = _mm256_castps256_ps128(v);
+        let hi = _mm256_extractf128_ps(v, 1);
+        let s = _mm_add_ps(lo, hi);
+        let s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+        let s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
+        _mm_cvtss_f32(s)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn tile(
+        x: &[f32],
+        w: &[f32],
+        y: *mut f32,
+        ldy: usize,
+        k: usize,
+        i0: usize,
+        i1: usize,
+        j0: usize,
+        j1: usize,
+    ) {
+        use std::arch::x86_64::*;
+        let xp = x.as_ptr();
+        let wp = w.as_ptr();
+        let mut kb = 0;
+        while kb < k {
+            let kl = (k - kb).min(KC);
+            let mut i = i0;
+            while i < i1 {
+                let ih = (i1 - i).min(3);
+                let mut j = j0;
+                while j < j1 {
+                    let jh = (j1 - j).min(3);
+                    if ih == 3 && jh == 3 {
+                        let (x0, x1, x2) = (
+                            xp.add(i * k + kb),
+                            xp.add((i + 1) * k + kb),
+                            xp.add((i + 2) * k + kb),
+                        );
+                        let (w0, w1, w2) = (
+                            wp.add(j * k + kb),
+                            wp.add((j + 1) * k + kb),
+                            wp.add((j + 2) * k + kb),
+                        );
+                        let mut a = [_mm256_setzero_ps(); 9];
+                        let mut kk = 0;
+                        while kk < kl {
+                            let b0 = _mm256_loadu_ps(w0.add(kk));
+                            let b1 = _mm256_loadu_ps(w1.add(kk));
+                            let b2 = _mm256_loadu_ps(w2.add(kk));
+                            let r0 = _mm256_loadu_ps(x0.add(kk));
+                            a[0] = _mm256_fmadd_ps(r0, b0, a[0]);
+                            a[1] = _mm256_fmadd_ps(r0, b1, a[1]);
+                            a[2] = _mm256_fmadd_ps(r0, b2, a[2]);
+                            let r1 = _mm256_loadu_ps(x1.add(kk));
+                            a[3] = _mm256_fmadd_ps(r1, b0, a[3]);
+                            a[4] = _mm256_fmadd_ps(r1, b1, a[4]);
+                            a[5] = _mm256_fmadd_ps(r1, b2, a[5]);
+                            let r2 = _mm256_loadu_ps(x2.add(kk));
+                            a[6] = _mm256_fmadd_ps(r2, b0, a[6]);
+                            a[7] = _mm256_fmadd_ps(r2, b1, a[7]);
+                            a[8] = _mm256_fmadd_ps(r2, b2, a[8]);
+                            kk += 8;
+                        }
+                        for r in 0..3 {
+                            for c in 0..3 {
+                                *y.add((i + r) * ldy + j + c) += hsum(a[r * 3 + c]);
+                            }
+                        }
+                    } else {
+                        for r in 0..ih {
+                            for c in 0..jh {
+                                let (xr, wr) = (xp.add((i + r) * k + kb), wp.add((j + c) * k + kb));
+                                let mut acc = _mm256_setzero_ps();
+                                let mut kk = 0;
+                                while kk < kl {
+                                    acc = _mm256_fmadd_ps(
+                                        _mm256_loadu_ps(xr.add(kk)),
+                                        _mm256_loadu_ps(wr.add(kk)),
+                                        acc,
+                                    );
+                                    kk += 8;
+                                }
+                                *y.add((i + r) * ldy + j + c) += hsum(acc);
+                            }
+                        }
+                    }
+                    j += jh;
+                }
+                i += ih;
+            }
+            kb += kl;
+        }
+    }
+}
+
+/// y[n, rows] = x[n, cols] · Wᵀ for a projection of any codec, on the host
+/// reference GEMM: f32 weights directly; a quantized weight is dequantized
+/// to f32 in row chunks (weight-only error — the activations stay f32, as
+/// on the device paths). `CMF_ZIMAGE_HOST_GEMM=engine` uses the engine's
+/// own `Proj::matmat` (its quantized CPU kernels and per-op device arms).
+fn lin(p: &Proj, x: &[f32], n: usize, y: &mut [f32], pool: Option<&Pool>) {
+    if matches!(std::env::var("CMF_ZIMAGE_HOST_GEMM").as_deref(), Ok("engine")) {
+        return p.matmat(x, n, y, pool);
+    }
+    let (rows, cols) = (p.rows(), p.cols());
+    match p {
+        Proj::F32 { w, .. } => host_gemm::gemm_nt(x, w, y, n, cols, rows, pool),
+        Proj::Q(q) => {
+            const CH: usize = 768;
+            let mut wbuf = vec![0f32; CH.min(rows) * cols];
+            let mut r0 = 0;
+            while r0 < rows {
+                let rc = CH.min(rows - r0);
+                {
+                    let wp = SendRows(wbuf.as_mut_ptr());
+                    pool_rows(pool, rc, &|lo, hi| {
+                        for r in lo..hi {
+                            // SAFETY: disjoint rows.
+                            q.row_f32(r0 + r, unsafe { wp.row(r * cols, cols) });
+                        }
+                    });
+                }
+                host_gemm::gemm_nt_ld(x, &wbuf[..rc * cols], &mut y[r0..], rows, n, cols, rc, pool);
+                r0 += rc;
+            }
+        }
+    }
+}
+
 /// Any CMF entry → f32.
 fn cmf_f32(model: &CmfModel, name: &str) -> Result<Vec<f32>, String> {
     crate::dit::cmf_f32(model, name)
@@ -743,7 +976,7 @@ impl ZImageDit {
             rms_norm_into(src, &self.cap_norm, self.cfg.norm_eps as f64, o);
         }
         let mut out = vec![0f32; l_p * dim];
-        self.cap_w.matmat(&xn, l, &mut out[..l * dim], self.pool());
+        lin(&self.cap_w, &xn, l, &mut out[..l * dim], self.pool());
         for row in out[..l * dim].chunks_exact_mut(dim) {
             for (v, &b) in row.iter_mut().zip(&self.cap_b) {
                 *v += b;
@@ -802,7 +1035,7 @@ impl ZImageDit {
                     }
                 });
             }
-            crate::fcd_ops::gemm_nt(&qh, &kh, &mut scores, n, hd, n, pool);
+            host_gemm::gemm_nt(&qh, &kh, &mut scores, n, hd, n, pool);
             {
                 let sp = SendRows(scores.as_mut_ptr());
                 pool_rows(pool, n, &|lo, hi| {
@@ -812,7 +1045,7 @@ impl ZImageDit {
                     }
                 });
             }
-            crate::fcd_ops::gemm_nt(&scores, &vt, &mut oh, n, n, hd, pool);
+            host_gemm::gemm_nt(&scores, &vt, &mut oh, n, n, hd, pool);
             let sa = SendRows(attn.as_mut_ptr());
             pool_rows(pool, n, &|lo, hi| {
                 for p in lo..hi {
@@ -898,9 +1131,9 @@ impl ZImageDit {
         let mut q_all = vec![0f32; n * nh * hd];
         let mut k_all = vec![0f32; n * nkv * hd];
         let mut v_all = vec![0f32; n * nkv * hd];
-        b.q.matmat(&xn, n, &mut q_all, pool);
-        b.k.matmat(&xn, n, &mut k_all, pool);
-        b.v.matmat(&xn, n, &mut v_all, pool);
+        lin(&b.q, &xn, n, &mut q_all, pool);
+        lin(&b.k, &xn, n, &mut k_all, pool);
+        lin(&b.v, &xn, n, &mut v_all, pool);
         let (cos, sin) = rope;
         let pairs = hd / 2;
         for (all, heads, w) in [(&mut q_all, nh, &b.norm_q), (&mut k_all, nkv, &b.norm_k)] {
@@ -925,7 +1158,7 @@ impl ZImageDit {
         self.attention(&q_all, &k_all, &v_all, n, &mut attn);
         drop((q_all, k_all, v_all));
         let mut proj = vec![0f32; n * hs];
-        b.o.matmat(&attn, n, &mut proj, pool);
+        lin(&b.o, &attn, n, &mut proj, pool);
         drop(attn);
         residual(&proj, &b.norm2, g_msa.as_deref(), x);
         // ── SwiGLU FFN ──
@@ -933,8 +1166,8 @@ impl ZImageDit {
         let inter = b.w1.rows();
         let mut g_all = vec![0f32; n * inter];
         let mut u_all = vec![0f32; n * inter];
-        b.w1.matmat(&xn, n, &mut g_all, pool);
-        b.w3.matmat(&xn, n, &mut u_all, pool);
+        lin(&b.w1, &xn, n, &mut g_all, pool);
+        lin(&b.w3, &xn, n, &mut u_all, pool);
         {
             let sg = SendRows(g_all.as_mut_ptr());
             pool_rows(pool, n, &|lo, hi| {
@@ -948,7 +1181,7 @@ impl ZImageDit {
             });
         }
         drop(u_all);
-        b.w2.matmat(&g_all, n, &mut proj, pool);
+        lin(&b.w2, &g_all, n, &mut proj, pool);
         residual(&proj, &b.ffn_norm2, g_mlp.as_deref(), x);
     }
 
@@ -1082,7 +1315,7 @@ impl ZImageDit {
     pub fn embed_image(&self, x_tok: &[f32], n_img: usize, n_img_p: usize) -> Vec<f32> {
         let (dim, pd) = (self.cfg.dim, self.geom().patch_dim);
         let mut x = vec![0f32; n_img_p * dim];
-        crate::fcd_ops::gemm_nt(
+        host_gemm::gemm_nt(
             &x_tok[..n_img * pd],
             &self.x_emb_w,
             &mut x[..n_img * dim],
@@ -1126,7 +1359,7 @@ impl ZImageDit {
             });
         }
         let mut out = vec![0f32; n * pd];
-        crate::fcd_ops::gemm_nt(&y, &self.final_w, &mut out, n, dim, pd, self.pool());
+        host_gemm::gemm_nt(&y, &self.final_w, &mut out, n, dim, pd, self.pool());
         for row in out.chunks_exact_mut(pd) {
             for (v, &b) in row.iter_mut().zip(&self.final_b) {
                 *v += b;
