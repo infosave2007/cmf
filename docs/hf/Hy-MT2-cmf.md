@@ -177,7 +177,7 @@ tokenizes exactly like the 4-bit ones.
 ## Measured
 
 Steady-state decode, single stream, `cortiq bench --core --tokens 128
---ignore-eos`, cortiq 0.7.0. The dense files are latency-bound on a
+--ignore-eos`, cortiq 0.7.1. The dense files are latency-bound on a
 discrete card (a 1 GB model needs ~8 submits per token), so the CPU
 matters as much as the GPU there; the MoE row is where the card counts.
 
@@ -186,7 +186,7 @@ matters as much as the GPU there; the MoE row is where the card counts.
 | `hy-mt2-1.8b-q4tp.cmf` | 137.7 | 29.1 | 72.8 | 56.9 |
 | `hy-mt2-1.8b-q1t.cmf` | 63.7 | 21.9 | 66.9 | 38.1 |
 | `hy-mt2-7b-q4tp.cmf` | 77.2 | 9.3 | 23.1 | 16.7 |
-| `hy-mt2-30b-a3b-q4tp.cmf` | 52.7 | 11.0 | —⁵ | — |
+| `hy-mt2-30b-a3b-q4tp.cmf` | 57.4 | 11.0 | 32.5⁵ | 22.7 |
 
 ### The MoE on any card (dynamic loading)
 
@@ -198,25 +198,36 @@ auto-detect (the CPU alone: 10.5 tok/s on this 14-core Xeon):
 
 | VRAM budget | 4 GB | 6 GB | 8 GB | 12 GB | 16 GB | 24 GB |
 |---|---:|---:|---:|---:|---:|---:|
-| layers on the card | 7/48 | 14/48 | 20/48 | 33/48 | 45/48 | **48/48** |
-| decode, tok/s | 9.9 | 11.1 | 14.5 | 21.9 | 39.2 | **53.7** |
+| layers on the card | 7/48 | 14/48 | 20/48 | 33/48 | **48/48** | **48/48** |
+| decode, tok/s | 9.0 | 12.5 | 14.2 | 19.6 | 51.9 | **57.4** |
 
 Perplexity and the greedy continuation do not move along the ladder — the
 split changes where a layer runs, never what it computes. `CMF_GPU_VRAM_MB`
-overrides the auto-detected budget when you want to cap it by hand.
+overrides the auto-detected budget when you want to cap it by hand. The
+16 GB point held 45 layers in 0.7.0; with the prompt on the graph (0.7.1)
+the per-op prefill arena no longer competes for the budget and the whole
+stack fits (16.8 GB resident), so a 16 GB card decodes at the full rate.
 
-⁵ Not measured: the 15.8 GB file is at the edge of a 24 GB Mac (the 14.3 GB
-Qwen3.8-27B decodes at 5.7 tok/s there) and on Metal a sigmoid-routed,
-ungated-shared MoE layer still runs its experts on the CPU — the Metal
-select kernel is the next port.
+⁵ The 15.8 GB file is larger than one Metal buffer (13.6 GB on a 24 GB
+M4), so its weights map as two overlapping windows; 0.7.1 taught the
+expert kernels to address them (before, every MoE layer of a windowed
+file ran on the CPU: 17.9 tok/s, under the M4's own CPU). The experts themselves stream at the
+card's bandwidth (~12 ms of the 31 ms token); the rest is the fixed cost
+of the ~12 dispatches each of the 48 layers needs, which is why the
+dense 7B, with a third of the layers' bytes per layer, is not faster.
 
-Prompt ingest (41-token prompt): on the RTX PRO 4000 the dense files take
-180 (1.8B) and 118 (7B) tok/s; the 30B ingests at **8 tok/s** on this card
-— its batched prefill re-stages the expert buffers per 32-token chunk
-instead of sharing the decode graph's resident copy, so a long source
-paragraph costs seconds before the first token. Decode is unaffected;
-sharing the buffers is the next item on the MoE list. On the M4: 469 tok/s
-for the 1.8B q4tp, 218 for the ternary file, 122 for the 7B.
+Prompt ingest: on the RTX PRO 4000 the dense files take 180 (1.8B) and
+118 (7B) tok/s. The 30B ingests at **65 tok/s** (41-token prompt) and
+56 tok/s at 512 tokens — through the same resident graph that decodes,
+one position at a time; `CMF_BATCH_K=32` switches the prompt to the
+batched graph (32 positions per submit) for 80 / 71 tok/s. In 0.7.0 the
+30B's prompt went through the chunked host prefill, where every expert
+ran on the CPU: 8 tok/s, ten seconds before the first token of a
+paragraph. The graph route needs the whole stack on the card; on the
+VRAM ladder below the chunked path stays (7–12 tok/s of ingest), because
+walking a prompt through a device prefix finishes every position on the
+host. On the M4: 469 tok/s for the 1.8B q4tp, 218 for the ternary file,
+122 for the 7B, 74 for the 30B.
 
 **First answer vs. the rest.** On a discrete card the weights are uploaded
 when the whole-token graph is first built — 18.5 GB for the 30B, ~26 s on

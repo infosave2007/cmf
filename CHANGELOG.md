@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-09-23
+
+### Fixed
+- Metal: a model whose file exceeds `maxBufferLength` (the 15.8 GB
+  Hy-MT2-30B-A3B on a 24 GB M4, cap 13.6 GB) maps as overlapping windows,
+  and the MoE jobs kernels — which read expert bases the select kernel
+  emits — refused the windowed arena, so every MoE layer of such a file ran
+  on the CPU. The jobs kernels now take up to four windows and the stride
+  and resolve the window themselves (`WeightArena::locate` on the device).
+  Hy-MT2-30B-A3B on the M4: 17.9 → 32.3 tok/s, one command buffer per
+  layer, greedy output identical to the CPU path.
+- Metal: the token-graph select kernel learned sigmoid scores with a
+  selection bias, the routed scale on the routed mix only and an ungated
+  shared expert (weight 1), so hy_v3 / DeepSeek-style routers ride the
+  graph instead of the CPU; the softmax / gated contract is unchanged.
+- wgpu: prompt ingest of MoE models with no linear-attention layers
+  (Hy-MT2-30B-A3B, Qwen3-MoE-style stacks) went through the chunked host
+  prefill, where every expert ran on the CPU — 8 tok/s on an RTX PRO 4000
+  against 53 of decode. The graph-prefill predicate now admits MoE stacks
+  when the whole model is resident (per-position: 65 tok/s on a 41-token
+  prompt, 56 at 512; `CMF_BATCH_K=32` batched: 80 / 71), and the batch
+  graph's admission stopped rejecting sigmoid / biased routers it already
+  implemented. With a VRAM prefix the chunked path stays, because the
+  per-position walk would finish every prompt position on the host. The
+  same predicate carries LFM2.5-8B-A1B (short-conv + MoE, no GDN): 33 →
+  166 tok/s of ingest on the same card, greedy output unchanged.
+
 ## [0.7.0] - 2026-09-22
 
 ### Added
