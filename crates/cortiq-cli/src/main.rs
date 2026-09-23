@@ -1146,7 +1146,9 @@ enum Commands {
         #[arg(long)]
         te_embed_quant: Option<String>,
         /// Z-Image text-encoder projections kept at the source precision
-        /// (comma list: `layers.N.mlp.down_proj` or a suffix like `down_proj`)
+        /// (comma list: `layers.N.mlp.down_proj` or a suffix like `down_proj`;
+        /// default `layers.6.mlp.down_proj`, the massive-activation writer;
+        /// `none` keeps nothing)
         #[arg(long, value_delimiter = ',')]
         te_keep: Vec<String>,
         /// Z-Image recipe stored in the file: turbo or base (default: from
@@ -2389,7 +2391,11 @@ async fn main() -> anyhow::Result<()> {
                             .as_deref()
                             .map(zimagepack::parse_codec)
                             .transpose()?,
-                        te_keep,
+                        te_keep: if te_keep.is_empty() {
+                            zimagepack::DEFAULT_TE_KEEP.iter().map(|s| s.to_string()).collect()
+                        } else {
+                            te_keep.into_iter().filter(|k| k != "none").collect()
+                        },
                         layers: dit_layers,
                         variant,
                         source_sha: !no_source_sha,
