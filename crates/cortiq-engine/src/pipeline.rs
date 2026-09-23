@@ -3927,6 +3927,7 @@ impl Pipeline {
                         &mut drafted,
                         &mut accepted,
                         &mut all_ids,
+                        max_tokens - generated,
                     ) {
                         next_pos = n_pos;
                         hidden = new_h;
@@ -5187,6 +5188,11 @@ impl Pipeline {
         // included): the sampler chain's penalties read it, and the
         // sampling arm extends it with the drafts position by position.
         all_ids: &mut Vec<u32>,
+        // Tokens left before `max_tokens`. A round commits up to k
+        // accepted drafts, and those positions are already in the cache,
+        // so the depth is capped here — trimming the output afterwards
+        // would leave cache rows the committed stream does not have.
+        room: usize,
     ) -> Option<(Vec<u32>, usize, Vec<f32>)> {
         // 3 is the measured optimum on Qwen3.6-27B / RTX 5090 (medians
         // of three, greedy): 51.1 tok/s against a plain 49.4, where k=2
@@ -5223,7 +5229,11 @@ impl Pipeline {
         // the old default within a few rounds, prose settles at 2-3 where
         // the shorter verify pays.
         let (k_start, k_max) = if metal_native { (7, 7) } else { (3, k_default.max(5)) };
-        let k_spec: usize = k_env.unwrap_or_else(|| self.spec_k_adapt.unwrap_or(k_start));
+        let k_full: usize = k_env.unwrap_or_else(|| self.spec_k_adapt.unwrap_or(k_start));
+        let k_spec = k_full.min(room).max(1);
+        // a tail round cut short by `room` says nothing about the text:
+        // it must not move the adaptive depth the next request starts at
+        let k_capped = k_spec < k_full;
         if next_pos == 0 {
             return None;
         }
@@ -6071,7 +6081,7 @@ impl Pipeline {
         // of one), so a shorter round only forfeits tokens — measured on
         // the M4: an essay round at k=2 still verified in 260 ms. The
         // adaptation is for cards whose verify grows with the rows.
-        if k_env.is_none() && !metal_native {
+        if k_env.is_none() && !metal_native && !k_capped {
             // Slow average and a wide band: a fast one oscillated 2↔3 on
             // an essay every other round (measured), which forfeits the
             // draft it just paid for.
