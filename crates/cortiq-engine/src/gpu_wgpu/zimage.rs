@@ -238,7 +238,37 @@ pub(crate) fn step(a: &mut ZStepArgs) -> bool {
         return false;
     }
     prog.upload(&a.x_tok[..prog.n_img_p * d.pd], &a.mods[..nblk * 4 * d.h], &a.final_scale[..d.h]);
-    prog.run(&mut a.out[..prog.n_img * d.pd]).is_some()
+    let ok = match std::env::var("CMF_ZI_TAPS") {
+        Ok(dir) if !dir.is_empty() => match prog.run_taps(&mut a.out[..prog.n_img * d.pd]) {
+            Some(taps) => {
+                let dir = std::path::Path::new(&dir).join(format!("step{}", a.step));
+                let _ = std::fs::create_dir_all(&dir);
+                for (name, v) in taps {
+                    let _ = std::fs::write(dir.join(format!("{name}.f32")), bytemuck::cast_slice(&v));
+                }
+                true
+            }
+            None => false,
+        },
+        _ => prog.run(&mut a.out[..prog.n_img * d.pd]).is_some(),
+    };
+    if let Some(v) = prog.amax_read() {
+        let ns = AMAX_SITES.len();
+        let mut line = format!("zi amax step {}:", a.step);
+        for (si, name) in AMAX_SITES.iter().enumerate() {
+            // ffn_hid is stored ×2⁻ᵏ (range guard): report the true value.
+            let g = if si == 5 { (hid_shift() as f32).exp2() } else { 1.0 };
+            let (bi, m) = (0..v.len() / ns).map(|b| (b, v[b * ns + si] * g)).fold((0, 0f32), |acc, x| if x.1 > acc.1 { x } else { acc });
+            line += &format!(" {name} {m:.3e}@{bi}");
+        }
+        eprintln!("{line}");
+        if std::env::var("CMF_ZI_AMAX_ALL").is_ok() {
+            for b in 0..v.len() / ns {
+                eprintln!("  blk {b:2}: {:?}", &v[b * ns..(b + 1) * ns]);
+            }
+        }
+    }
+    ok
 }
 
 /// Drop all module-local device state (planes, prepared states, VAE chain).
@@ -707,12 +737,15 @@ pub fn mm_src(g: MmCfg) -> String {
             }
         }
         Epi::F32 => {
+            // `oscale` undoes the producer's range guard (w2 reads the
+            // SwiGLU hidden stored ×2⁻ᵏ): one scalar multiply per fragment.
             let _ = writeln!(s, "  let ocol = p.ocol + n0 + wx * {tn}u;");
+            let _ = writeln!(s, "  let osc = p.oscale;");
             for i in 0..fm {
                 for j in 0..fnn {
                     let _ = writeln!(
                         s,
-                        "  {{ let oi = (orow + {}u) * ldo + ocol + {}u; coopStoreT(c{i}_{j}, &outp[oi], ldo); }}",
+                        "  {{ let oi = (orow + {}u) * ldo + ocol + {}u; let cv = c{i}_{j} * osc; coopStoreT(cv, &outp[oi], ldo); }}",
                         i * 16,
                         j * 16
                     );
@@ -1435,6 +1468,54 @@ fn zi_fill(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 }
 "#;
+
+/// max|x| of a panel into one slot of a u32 array (float bits, atomicMax;
+/// NaN counts as +inf). `is_f32 = 0`: the panel is packed f16 pairs.
+const AMAX_SRC: &str = r#"
+struct AP { n: u32, slot: u32, is_f32: u32, _p: u32 };
+@group(0) @binding(0) var<storage, read> src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> outm: array<atomic<u32>>;
+@group(0) @binding(2) var<uniform> ap: AP;
+var<workgroup> red: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn zi_amax(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_index) lid: u32,
+           @builtin(num_workgroups) nwg: vec3<u32>) {
+    var m = 0.0;
+    for (var i = gid.x; i < ap.n; i = i + nwg.x * 256u) {
+        var v = 0.0;
+        if (ap.is_f32 != 0u) {
+            v = abs(bitcast<f32>(src[i]));
+        } else {
+            let p = unpack2x16float(src[i]);
+            v = max(abs(p.x), abs(p.y));
+            if (p.x != p.x || p.y != p.y) { v = 3.0e38; }
+        }
+        if (v != v) { v = 3.0e38; }
+        m = max(m, v);
+    }
+    red[lid] = m;
+    workgroupBarrier();
+    var st = 128u;
+    loop {
+        if (st == 0u) { break; }
+        if (lid < st) { red[lid] = max(red[lid], red[lid + st]); }
+        workgroupBarrier();
+        st = st >> 1u;
+    }
+    if (lid == 0u) { atomicMax(&outm[ap.slot], bitcast<u32>(red[0])); }
+}
+"#;
+
+/// Probe sites recorded per block when `CMF_ZI_AMAX=1` (block-major slots).
+pub const AMAX_SITES: [&str; 8] = ["attn_in", "qkv", "attn_out", "o_proj", "ffn_in", "ffn_hid", "w2_out", "x"];
+
+fn amax_call(c: &Ctx, src: &wgpu::Buffer, words: usize, is_f32: bool, dst: &wgpu::Buffer, slot: u32) -> Option<Call> {
+    let pipe = pipeline(c, "zi_amax", AMAX_SRC, "zi_amax")?;
+    let u = ubuf(c, &[words as u32, slot, is_f32 as u32, 0]);
+    let b = bg(c, &pipe, &[src, dst, &u]);
+    Some(Call { pipe, bg: b, grid: (256, 1, 1) })
+}
 
 /// Pure-MMA ceiling: fragments loaded once, 8 independent accumulator
 /// chains per subgroup, no global traffic inside the loop.
@@ -2254,6 +2335,11 @@ impl ZCalls {
     }
 }
 
+/// log2 of the SwiGLU hidden's range guard (see `block_calls_probe`).
+pub fn hid_shift() -> i32 {
+    std::env::var("CMF_ZI_HID_SHIFT").ok().and_then(|v| v.parse().ok()).unwrap_or(6).clamp(0, 14)
+}
+
 /// A device buffer holding `data` (mods, caption rows …) — test helper.
 pub fn upload_f32(data: &[f32]) -> Option<wgpu::Buffer> {
     let c = zctx()?;
@@ -2328,7 +2414,33 @@ pub fn block_calls(
     next: Option<(&ZBlockDev, usize)>,
     modulated: bool,
 ) -> Option<ZCalls> {
+    block_calls_probe(d, t, seq, blk, mods, bi, first, next, modulated, None)
+}
+
+/// `block_calls` with an optional max|x| probe: after every producer a
+/// `zi_amax` dispatch folds the site's panel into `probe.0[probe.1 + site]`
+/// (sites: [`AMAX_SITES`]).
+#[allow(clippy::too_many_arguments)]
+pub fn block_calls_probe(
+    d: &ZDims,
+    t: &ZTiles,
+    seq: &ZSeq,
+    blk: &ZBlockDev,
+    mods: &wgpu::Buffer,
+    bi: usize,
+    first: bool,
+    next: Option<(&ZBlockDev, usize)>,
+    modulated: bool,
+    probe: Option<(&wgpu::Buffer, u32)>,
+) -> Option<ZCalls> {
     let c = zctx()?;
+    let (mh, mhalf) = (seq.m * d.h, seq.m * d.h / 2);
+    let pr = |v: &mut ZCalls, site: u32, buf: &wgpu::Buffer, words: usize, f32w: bool| -> Option<()> {
+        if let Some((pb, base)) = probe {
+            v.push(Class::Io, amax_call(c, buf, words, f32w, pb, base + site)?);
+        }
+        Some(())
+    };
     let (h, i, m) = (d.h as u32, d.inter as u32, seq.m as u32);
     let gm = if modulated { ROW_GATE_MOD } else { 0 };
     let sm = if modulated { ROW_SCALE_MOD } else { 0 };
@@ -2339,8 +2451,10 @@ pub fn block_calls(
             rowop_call(c, d, seq, ROW_PRE | sm, &blk.norm1, &blk.norm1, mods, 0, mod_off(d, bi, 0))?,
         );
     }
+    pr(&mut v, 0, &seq.xn, mhalf, false)?;
     let a = |n: u32, k: u32, ldo: u32| MmArgs { m, n, k, ldo, ocol: 0, arow: 0, oscale: 1.0 };
     v.push_mm(Class::MmQkv, mm_call(c, t.qkv, &a(3 * h, h, 3 * h), &blk.qkv, &seq.xn, &seq.qkv)?);
+    pr(&mut v, 1, &seq.qkv, 3 * mhalf, false)?;
     {
         let pipe = pipeline(c, "zi_qkrope", QKROPE_SRC, "zi_qkrope")?;
         let u = ubuf(c, &[3 * h, d.nh as u32, d.eps.to_bits(), 0]);
@@ -2350,7 +2464,9 @@ pub fn block_calls(
     for cl in flash_calls(c, t.flash, d.nh, &seq.qkv, &seq.att, &seq.segs)? {
         v.push(Class::Flash, cl);
     }
+    pr(&mut v, 2, &seq.att, mhalf, false)?;
     v.push_mm(Class::MmO, mm_call(c, t.o, &a(h, h, h), &blk.o, &seq.att, &seq.br)?);
+    pr(&mut v, 3, &seq.br, mh, true)?;
     v.push(
         Class::Rows,
         rowop_call(
@@ -2365,13 +2481,24 @@ pub fn block_calls(
             mod_off(d, bi, 2),
         )?,
     );
-    v.push_mm(Class::MmW13, mm_call(c, t.w13, &a(2 * i, h, i), &blk.w13, &seq.xn, &seq.hid)?);
-    v.push_mm(Class::MmW2, mm_call(c, t.w2, &a(h, i, h), &blk.w2, &seq.hid, &seq.br)?);
+    pr(&mut v, 4, &seq.xn, mhalf, false)?;
+    // Range guard: the SwiGLU hidden of real Z-Image weights reaches 6.3e4
+    // at t≈0 and overflows f16 (inf) from step 2 (measured, CMF_ZI_AMAX on
+    // the q8 Turbo container, 512²). It is stored ×2⁻ᵏ and w2 multiplies
+    // 2ᵏ back in its f32 epilogue. `CMF_ZI_HID_SHIFT=k` (default 6).
+    let hs = hid_shift();
+    let a13 = MmArgs { oscale: (-(hs as f32)).exp2(), ..a(2 * i, h, i) };
+    let a2 = MmArgs { oscale: (hs as f32).exp2(), ..a(h, i, h) };
+    v.push_mm(Class::MmW13, mm_call(c, t.w13, &a13, &blk.w13, &seq.xn, &seq.hid)?);
+    pr(&mut v, 5, &seq.hid, seq.m * d.inter / 2, false)?;
+    v.push_mm(Class::MmW2, mm_call(c, t.w2, &a2, &blk.w2, &seq.hid, &seq.br)?);
+    pr(&mut v, 6, &seq.br, mh, true)?;
     let (mode, wpre, s_off) = match next {
         Some((nb, nbi)) => (ROW_GRES | gm | ROW_PRE | sm, &nb.norm1, mod_off(d, nbi, 0)),
         None => (ROW_GRES | gm, &blk.ffn_norm2, 0),
     };
     v.push(Class::Rows, rowop_call(c, d, seq, mode, &blk.ffn_norm2, wpre, mods, mod_off(d, bi, 3), s_off)?);
+    pr(&mut v, 7, &seq.x, mh, true)?;
     Some(v)
 }
 
@@ -2393,8 +2520,14 @@ pub struct ZStepDev {
     out: wgpu::Buffer,
     pre_a: ZCalls,
     joint_calls: ZCalls,
+    /// Call-list lengths after each block (noise refiner in `pre_a`, main
+    /// layers in `joint_calls`): the tap points of `run_taps`.
+    pre_ends: Vec<usize>,
+    joint_ends: Vec<usize>,
     fin: Vec<Call>,
     out_rows: usize,
+    /// `CMF_ZI_AMAX=1`: per (block, site) max|x| of the last forward.
+    amax: Option<wgpu::Buffer>,
 }
 
 /// Host-side small weights of the embed and final layers.
@@ -2446,6 +2579,9 @@ impl ZStepDev {
         let ep = sbuf_init(c, bytemuck::cast_slice(io.x_pad), "zi_ep");
         let fw = sbuf_init(c, bytemuck::cast_slice(io.final_w), "zi_fw");
         let fb = sbuf_init(c, bytemuck::cast_slice(io.final_b), "zi_fb");
+        let amax = (std::env::var("CMF_ZI_AMAX").as_deref() == Ok("1"))
+            .then(|| sbuf(c, (nblk * AMAX_SITES.len() * 4) as u64, "zi_amax"));
+        let probe = |bi: usize| amax.as_ref().map(|b| (b, (bi * AMAX_SITES.len()) as u32));
         let mut pre_a = ZCalls::default();
         {
             let pipe = pipeline(c, "zi_embed", EMBED_SRC, "zi_embed")?;
@@ -2453,15 +2589,19 @@ impl ZStepDev {
             let bgr = bg(c, &pipe, &[&tok, &ew, &eb, &ep, &img.x, &u]);
             pre_a.push(Class::Io, Call { pipe, bg: bgr, grid: (img.m as u32, 1, 1) });
         }
+        let mut pre_ends = Vec::new();
         for (k, blk) in nr.iter().enumerate() {
             let next = nr.get(k + 1).map(|nb| (nb, k + 1));
-            pre_a.extend(block_calls(&d, t, &img, blk, &mods, k, k == 0, next, true)?);
+            pre_a.extend(block_calls_probe(&d, t, &img, blk, &mods, k, k == 0, next, true, probe(k))?);
+            pre_ends.push(pre_a.len());
         }
         let mut joint_calls = ZCalls::default();
+        let mut joint_ends = Vec::new();
         for (k, blk) in layers.iter().enumerate() {
             let bi = nr.len() + k;
             let next = layers.get(k + 1).map(|nb| (nb, bi + 1));
-            joint_calls.extend(block_calls(&d, t, &joint, blk, &mods, bi, k == 0, next, true)?);
+            joint_calls.extend(block_calls_probe(&d, t, &joint, blk, &mods, bi, k == 0, next, true, probe(bi))?);
+            joint_ends.push(joint_calls.len());
         }
         // Final layer, one dispatch per batch item (rows of item bi start
         // at its segment offset; output compacted to [bi][n_img][pd]).
@@ -2514,9 +2654,22 @@ impl ZStepDev {
             out,
             pre_a,
             joint_calls,
+            pre_ends,
+            joint_ends,
             fin,
             out_rows,
+            amax,
         })
+    }
+
+    /// The probe of the last forward: `[blocks][AMAX_SITES]` max|x|
+    /// (None unless built with `CMF_ZI_AMAX=1`). Resets the slots.
+    pub fn amax_read(&self) -> Option<Vec<f32>> {
+        let c = zctx()?;
+        let b = self.amax.as_ref()?;
+        let raw = read_bytes(c, b, b.size())?;
+        c.queue.write_buffer(b, 0, &vec![0u8; b.size() as usize]);
+        Some(bytemuck::cast_slice(&raw).to_vec())
     }
 
     /// Record one whole forward into `enc` (two passes + the assembly
@@ -2599,6 +2752,63 @@ impl ZStepDev {
         let mut v: Vec<f64> = (0..rounds.max(1)).map(|_| run()).collect();
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
         Some(v[v.len() / 2])
+    }
+
+    /// One forward that also returns the residual stream after every block
+    /// (the oracle's `nr{i}_out` [n_img_p·batch rows] and `l{i}_out`
+    /// [S·batch rows] taps, f32). Debug path: one submit per block.
+    pub fn run_taps(&self, out: &mut [f32]) -> Option<Vec<(String, Vec<f32>)>> {
+        let c = zctx()?;
+        let mut taps = Vec::new();
+        let rec = |calls: &ZCalls, from: usize, to: usize| {
+            let mut enc = c.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                for (_, r) in &calls.list[from..to] {
+                    match r {
+                        Rec::Mm(m) => m.record(&mut pass),
+                        Rec::K(k) => k.record(&mut pass),
+                    }
+                }
+            }
+            c.queue.submit(Some(enc.finish()));
+        };
+        let mut from = 0;
+        for (i, &e) in self.pre_ends.iter().enumerate() {
+            rec(&self.pre_a, from, e);
+            from = e;
+            let raw = read_bytes(c, &self.img.x, (self.img.m * self.d.h * 4) as u64)?;
+            taps.push((format!("nr{i}_out"), bytemuck::cast_slice(&raw).to_vec()));
+        }
+        // the assembly copies
+        let mut enc = c.device.create_command_encoder(&Default::default());
+        let h4 = (self.d.h * 4) as u64;
+        let mut cap_off = 0u64;
+        for (bi, &(off, _)) in self.joint.segs.iter().enumerate() {
+            enc.copy_buffer_to_buffer(&self.img.x, (bi * self.n_img_p) as u64 * h4, &self.joint.x, off as u64 * h4, self.n_img_p as u64 * h4);
+            let cp = self.n_cap_p[bi] as u64;
+            enc.copy_buffer_to_buffer(&self.cap, cap_off * h4, &self.joint.x, (off + self.n_img_p) as u64 * h4, cp * h4);
+            cap_off += cp;
+        }
+        c.queue.submit(Some(enc.finish()));
+        let mut from = 0;
+        for (i, &e) in self.joint_ends.iter().enumerate() {
+            rec(&self.joint_calls, from, e);
+            from = e;
+            let raw = read_bytes(c, &self.joint.x, (self.joint.m * self.d.h * 4) as u64)?;
+            taps.push((format!("l{i}_out"), bytemuck::cast_slice(&raw).to_vec()));
+        }
+        let mut enc = c.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            for f in &self.fin {
+                f.record(&mut pass);
+            }
+        }
+        c.queue.submit(Some(enc.finish()));
+        let raw = read_bytes(c, &self.out, (self.out_rows * self.d.pd * 4) as u64)?;
+        out[..self.out_rows * self.d.pd].copy_from_slice(bytemuck::cast_slice(&raw));
+        Some(taps)
     }
 
     /// Dispatches per forward.

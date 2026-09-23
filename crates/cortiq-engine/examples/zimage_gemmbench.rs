@@ -989,6 +989,23 @@ mod imp {
         cortiq_engine::gpu::zimage_release();
     }
 
+    /// `tstat <cmf> <substring>`: max|x| / rms of the f32 tensors whose name
+    /// contains the substring (norm weights, pad tokens …).
+    pub fn cmd_tstat(args: &[String]) {
+        let (Some(path), Some(sub)) = (args.first(), args.get(1)) else { return };
+        let m = cortiq_core::CmfModel::open(path).expect("open");
+        for t in &m.tensors {
+            if !t.name.contains(sub.as_str()) || t.dtype != cortiq_core::TensorDtype::F32 {
+                continue;
+            }
+            let b = m.entry_bytes(t);
+            let v: Vec<f32> = b.chunks_exact(4).map(|x| f32::from_le_bytes([x[0], x[1], x[2], x[3]])).collect();
+            let mx = v.iter().fold(0f32, |a, x| a.max(x.abs()));
+            let rms = (v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>() / v.len() as f64).sqrt();
+            println!("{:60} {:?} max {mx:.3} rms {rms:.3}", t.name, t.shape);
+        }
+    }
+
     pub fn main() {
         // SAFETY: set before any thread or GPU init.
         unsafe {
@@ -1007,6 +1024,7 @@ mod imp {
             Some("step") => cmd_step(rest),
             Some("lumina") => cmd_lumina(rest),
             Some("stepcheck") => cmd_stepcheck(rest),
+            Some("tstat") => cmd_tstat(rest),
             Some(x) => eprintln!("unknown subcommand {x}"),
         }
     }
