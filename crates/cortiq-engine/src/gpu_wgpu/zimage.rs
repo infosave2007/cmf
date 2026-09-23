@@ -218,16 +218,8 @@ pub(crate) fn prepare(a: &ZPrepareArgs) -> bool {
         return false;
     }
     let Ok(mut g) = ZSTATE.lock() else { return false };
-    let uid = a.model.uid();
-    let nblk = a.noise_refiner.len() + a.layers.len();
-    let have = g.as_ref().is_some_and(|st| st.model_uid == uid && st.blocks.len() == nblk);
-    if !have {
-        *g = None; // free the old planes before building new ones
-        let t0 = std::time::Instant::now();
-        let refs: Vec<&ZBlockRef> = a.noise_refiner.iter().chain(a.layers.iter()).collect();
-        let Some(blocks) = ZBlockDev::from_model_all(a.model, &d, &refs) else { return false };
-        prof(&format!("planes {} blocks", blocks.len()), t0);
-        *g = Some(ZState { model_uid: uid, blocks, progs: Vec::new() });
+    if !ensure_planes(&mut g, a.model, &d, a.noise_refiner, a.layers) {
+        return false;
     }
     let t0 = std::time::Instant::now();
     let st = g.as_mut().unwrap();
@@ -289,6 +281,57 @@ fn prof(what: &str, t0: std::time::Instant) {
     if std::env::var("CMF_ZIMAGE_PROF").is_ok_and(|v| v != "0") {
         eprintln!("zimage wgpu: {what} {:.3}s", t0.elapsed().as_secs_f64());
     }
+}
+
+/// The 32 per-step blocks' planes of `model` in `g` (built if missing).
+fn ensure_planes(g: &mut Option<ZState>, model: &Arc<CmfModel>, d: &ZDims, nr: &[ZBlockRef], layers: &[ZBlockRef]) -> bool {
+    let uid = model.uid();
+    let nblk = nr.len() + layers.len();
+    if g.as_ref().is_some_and(|st| st.model_uid == uid && st.blocks.len() == nblk) {
+        return true;
+    }
+    *g = None; // free the old planes before building new ones
+    let t0 = std::time::Instant::now();
+    let refs: Vec<&ZBlockRef> = nr.iter().chain(layers.iter()).collect();
+    let Some(blocks) = ZBlockDev::from_model_all(model, d, &refs) else { return false };
+    prof(&format!("planes {} blocks", blocks.len()), t0);
+    *g = Some(ZState { model_uid: uid, blocks, progs: Vec::new() });
+    true
+}
+
+/// The context refiner's planes (cached apart: model uid, first weight).
+fn ensure_refiner(g: &mut Option<(u64, usize, Vec<ZBlockDev>)>, model: &Arc<CmfModel>, d: &ZDims, blocks: &[ZBlockRef]) -> bool {
+    let key = (model.uid(), blocks[0].wq);
+    if g.as_ref().is_some_and(|(u, w, v)| (*u, *w) == key && v.len() == blocks.len()) {
+        return true;
+    }
+    *g = None;
+    let t0 = std::time::Instant::now();
+    let refs: Vec<&ZBlockRef> = blocks.iter().collect();
+    let Some(v) = ZBlockDev::from_model_all(model, d, &refs) else { return false };
+    prof("context-refiner planes", t0);
+    *g = Some((key.0, key.1, v));
+    true
+}
+
+/// Build every plane ahead of `prepare` (B2): the caller overlaps this
+/// with the CPU text encoder, which the planes do not depend on.
+pub(crate) fn preload(model: &Arc<CmfModel>, geom: &ZGeom, nr: &[ZBlockRef], layers: &[ZBlockRef], cr: &[ZBlockRef]) -> bool {
+    if !zi_enabled() || nr.len() != 2 || layers.is_empty() || cr.is_empty() {
+        return false;
+    }
+    let Some(d) = ZDims::from_geom(geom) else { return false };
+    if zctx().is_none() {
+        return false;
+    }
+    {
+        let Ok(mut g) = ZREFINER.lock() else { return false };
+        if !ensure_refiner(&mut g, model, &d, cr) {
+            return false;
+        }
+    }
+    let Ok(mut g) = ZSTATE.lock() else { return false };
+    ensure_planes(&mut g, model, &d, nr, layers)
 }
 
 /// One DiT forward for a prepared `a.key`; writes `a.out`.
@@ -400,14 +443,8 @@ pub(crate) fn refine_caption(
     }
     let Some(c) = zctx() else { return false };
     let Ok(mut g) = ZREFINER.lock() else { return false };
-    let key = (model.uid(), blocks[0].wq);
-    if !g.as_ref().is_some_and(|(u, w, v)| (*u, *w) == key && v.len() == blocks.len()) {
-        *g = None;
-        let t0 = std::time::Instant::now();
-        let refs: Vec<&ZBlockRef> = blocks.iter().collect();
-        let Some(v) = ZBlockDev::from_model_all(model, &d, &refs) else { return false };
-        prof("context-refiner planes", t0);
-        *g = Some((key.0, key.1, v));
+    if !ensure_refiner(&mut g, model, &d, blocks) {
+        return false;
     }
     let devs = &g.as_ref().unwrap().2;
     let Some(seq) = ZSeq::new(&d, &[(0, n)]) else { return false };
@@ -2468,6 +2505,7 @@ impl ZBlockDev {
         let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 16);
         let mut out = Vec::with_capacity(refs.len());
         let mut last: Option<wgpu::SubmissionIndex> = None;
+        let (mut t_view, mut t_copy, mut t_wait) = (0f64, 0f64, 0f64);
         for (bi, (r, plan)) in refs.iter().zip(plans).enumerate() {
             let Some((jobs, total)) = plan else {
                 if let Some(ix) = last.take() {
@@ -2483,7 +2521,10 @@ impl ZBlockDev {
             }
             let src = &srcs[bi % 2];
             {
+                let tv = std::time::Instant::now();
                 let mut view = c.queue.write_buffer_with(src, 0, wgpu::BufferSize::new(total as u64)?)?;
+                t_view += tv.elapsed().as_secs_f64();
+                let tv = std::time::Instant::now();
                 // Cut the view into ≤ 8 MB pieces, one list pulled by the
                 // threads (the mmap page faults run in parallel too).
                 // (destination address, source) — `WriteOnly<[u8]>` is not
@@ -2521,6 +2562,7 @@ impl ZBlockDev {
                         });
                     }
                 });
+                t_copy += tv.elapsed().as_secs_f64();
             }
             let planes = [
                 sbuf(c, (3 * h * h * 2) as u64, "zi_plane_qkv"),
@@ -2550,7 +2592,9 @@ impl ZBlockDev {
             // Bound the staging memory: block bi−1 must be done before
             // bi+1 reuses its source buffer.
             if let Some(prev) = last.replace(ix) {
+                let tw = std::time::Instant::now();
                 let _ = c.device.poll(wgpu::PollType::Wait { submission_index: Some(prev), timeout: None });
+                t_wait += tw.elapsed().as_secs_f64();
             }
             let upf = |v: &[f32]| sbuf_init(c, bytemuck::cast_slice(v), "zi_norm");
             let [qkv, o, w13, w2] = planes;
@@ -2568,6 +2612,9 @@ impl ZBlockDev {
             });
         }
         wait(c);
+        if std::env::var("CMF_ZIMAGE_PROF").is_ok_and(|v| v != "0") {
+            eprintln!("zimage wgpu: planes: staging views {t_view:.3}s · parallel copy {t_copy:.3}s ({nthreads} threads) · waits {t_wait:.3}s");
+        }
         Some(out)
     }
 }

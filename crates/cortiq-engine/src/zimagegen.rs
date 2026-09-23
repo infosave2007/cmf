@@ -337,31 +337,8 @@ pub fn generate_images(
     let defaults = ZDefaults::of(&model);
     let do_cfg = p.guidance > 0.0;
 
-    // ── text encoder ──
-    let t0 = Instant::now();
-    let ids = prompt_ids(&tok, prompt, p.max_tokens);
-    let neg_text = p
-        .negative_prompt
-        .clone()
-        .unwrap_or_else(|| defaults.negative_prompt.clone());
-    let neg_ids = do_cfg.then(|| prompt_ids(&tok, &neg_text, p.max_tokens));
-    let (cap, ncap) = {
-        // The text encoder runs on the CPU (measured, B2): on the 3090 the
-        // per-op device path took 3.2–4.2 s against 0.6 s here and moved
-        // the caption by 3–7 %. `pause_gpu` is process-wide, so the
-        // pool's workers stay off the device too (`cpu_scope` would not).
-        // `CMF_ZIMAGE_TE_GPU=1` restores the device arm for A/B work.
-        let _cpu = (std::env::var("CMF_ZIMAGE_TE_GPU").as_deref() != Ok("1"))
-            .then(crate::gpu::pause_gpu);
-        let _stage = crate::gpu::image_stage_scope();
-        let enc = crate::qwen3te::Qwen3Encoder::from_cmf(&model)?;
-        let cap = enc.encode(&ids);
-        let ncap = neg_ids.as_ref().map(|n| enc.encode(n));
-        (cap, ncap)
-    };
-    tm.text_encode = t0.elapsed().as_secs_f64();
-
-    // ── DiT ──
+    // ── DiT host weights, then the text encoder on the CPU while a helper
+    // thread uploads the device planes (they do not depend on the caption).
     let t0 = Instant::now();
     let _stage = crate::gpu::image_stage_scope();
     let dit = match std::env::var("CMF_ZIMAGE_DIT_DIR") {
@@ -369,6 +346,54 @@ pub fn generate_images(
         Err(_) => ZImageDit::from_cmf(&model)?,
     };
     tm.dit_load = t0.elapsed().as_secs_f64();
+    let ids = prompt_ids(&tok, prompt, p.max_tokens);
+    let neg_text = p
+        .negative_prompt
+        .clone()
+        .unwrap_or_else(|| defaults.negative_prompt.clone());
+    let neg_ids = do_cfg.then(|| prompt_ids(&tok, &neg_text, p.max_tokens));
+    let t0 = Instant::now();
+    let overlap = crate::zimage::gpu_allowed()
+        && std::env::var("CMF_ZIMAGE_OVERLAP").as_deref() != Ok("0")
+        && std::env::var("CMF_ZIMAGE_TE_GPU").as_deref() != Ok("1");
+    let (te, preload) = std::thread::scope(|sc| {
+        let helper = overlap.then(|| {
+            sc.spawn(|| {
+                let t = Instant::now();
+                let ok = dit.preload_device();
+                (ok, t.elapsed().as_secs_f64())
+            })
+        });
+        let t = Instant::now();
+        let te = (|| -> Result<(Vec<f32>, Option<Vec<f32>>), String> {
+            // The text encoder runs on the CPU (measured, B2): on the 3090
+            // the per-op device path took 3.2–4.2 s against 0.6 s here and
+            // moved the caption by 3–7 %. `pause_gpu` is process-wide, so
+            // the pool's workers stay off the device too (`cpu_scope` would
+            // not); the plane upload beside it goes straight to the device
+            // context, which the pause does not gate.
+            // `CMF_ZIMAGE_TE_GPU=1` restores the device arm for A/B work.
+            let _cpu = (std::env::var("CMF_ZIMAGE_TE_GPU").as_deref() != Ok("1"))
+                .then(crate::gpu::pause_gpu);
+            let enc = crate::qwen3te::Qwen3Encoder::from_cmf(&model)?;
+            let cap = enc.encode(&ids);
+            let ncap = neg_ids.as_ref().map(|n| enc.encode(n));
+            Ok((cap, ncap))
+        })();
+        let te_s = t.elapsed().as_secs_f64();
+        (te.map(|v| (v, te_s)), helper.map(|h| h.join().unwrap_or((false, 0.0))))
+    });
+    let ((cap, ncap), te_s) = te?;
+    tm.text_encode = te_s;
+    let overlapped = t0.elapsed().as_secs_f64();
+    if prof_on() {
+        match preload {
+            Some((ok, s)) => eprintln!(
+                "zimage: text-encode {te_s:.3}s beside the plane upload {s:.3}s (ok {ok}) -> {overlapped:.3}s"
+            ),
+            None => eprintln!("zimage: text-encode {te_s:.3}s"),
+        }
+    }
     let t0 = Instant::now();
     let sig = crate::zimage::sigmas_torch_f32(p.steps, p.shift);
     let t_models: Vec<f32> = sig[..p.steps]
@@ -377,6 +402,7 @@ pub fn generate_images(
         .collect();
     let mods = dit.mods_for_steps(&t_models);
     let fscale = dit.final_scale_for_steps(&t_models);
+    let t_mods = t0.elapsed().as_secs_f64();
     let per_mod = dit.cfg.n_mod_blocks() * 4 * dit.cfg.dim;
     let dim = dit.cfg.dim;
     static KEY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -399,6 +425,7 @@ pub fn generate_images(
         )?),
         _ => None,
     };
+    let t_caps = t0.elapsed().as_secs_f64();
     // CFG steps run cond + uncond as ONE batch-2 device forward; steps
     // without CFG (Turbo, or past the truncation) use the single program.
     let pair_key = next_key();
@@ -417,6 +444,14 @@ pub fn generate_images(
         }
     }
     tm.prepare = t0.elapsed().as_secs_f64();
+    if prof_on() {
+        eprintln!(
+            "zimage prepare: mods {:.3}s · captions {:.3}s · device {:.3}s",
+            t_mods,
+            t_caps - t_mods,
+            tm.prepare - t_caps
+        );
+    }
     let c = dit.cfg.in_channels;
     let (lh, lw) = (shape.h_lat, shape.w_lat);
     let pd = dit.geom().patch_dim;
