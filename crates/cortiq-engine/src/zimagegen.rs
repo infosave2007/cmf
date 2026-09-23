@@ -346,6 +346,13 @@ pub fn generate_images(
         .unwrap_or_else(|| defaults.negative_prompt.clone());
     let neg_ids = do_cfg.then(|| prompt_ids(&tok, &neg_text, p.max_tokens));
     let (cap, ncap) = {
+        // The text encoder runs on the CPU (measured, B2): on the 3090 the
+        // per-op device path took 3.2–4.2 s against 0.6 s here and moved
+        // the caption by 3–7 %. `pause_gpu` is process-wide, so the
+        // pool's workers stay off the device too (`cpu_scope` would not).
+        // `CMF_ZIMAGE_TE_GPU=1` restores the device arm for A/B work.
+        let _cpu = (std::env::var("CMF_ZIMAGE_TE_GPU").as_deref() != Ok("1"))
+            .then(crate::gpu::pause_gpu);
         let _stage = crate::gpu::image_stage_scope();
         let enc = crate::qwen3te::Qwen3Encoder::from_cmf(&model)?;
         let cap = enc.encode(&ids);
@@ -375,16 +382,40 @@ pub fn generate_images(
     static KEY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let next_key = || KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let shape = ZShape::new(p.height, p.width, ids.len());
-    let prep = dit.prepare(&cap, shape, next_key(), Some((&mods, &fscale)))?;
-    let nprep = match (&ncap, &neg_ids) {
-        (Some(nc), Some(ni)) => Some(dit.prepare(
+    // Which steps run CFG (cfg truncation: t_norm = (1000 − t)/1000 > τ
+    // turns it off).
+    let cfg_at: Vec<bool> = (0..p.steps)
+        .map(|i| do_cfg && !(p.cfg_truncation <= 1.0 && t_models[i] > p.cfg_truncation))
+        .collect();
+    let dev = crate::zimage::gpu_allowed();
+    let mods_all = Some((&mods[..], &fscale[..]));
+    let mut prep = dit.prepare_host(&cap, shape, next_key(), dev)?;
+    let mut nprep = match (&ncap, &neg_ids) {
+        (Some(nc), Some(ni)) => Some(dit.prepare_host(
             nc,
             ZShape::new(p.height, p.width, ni.len()),
             next_key(),
-            Some((&mods, &fscale)),
+            dev,
         )?),
         _ => None,
     };
+    // CFG steps run cond + uncond as ONE batch-2 device forward; steps
+    // without CFG (Turbo, or past the truncation) use the single program.
+    let pair_key = next_key();
+    let pair_dev = match &nprep {
+        Some(np) if dev && cfg_at.iter().any(|&c| c) => {
+            dit.attach_device_pair(&prep, np, pair_key, mods_all)
+        }
+        _ => false,
+    };
+    if dev && (cfg_at.iter().any(|&c| !c) || (do_cfg && !pair_dev)) {
+        dit.attach_device(&mut prep, mods_all);
+    }
+    if let Some(np) = nprep.as_mut() {
+        if dev && !pair_dev {
+            dit.attach_device(np, mods_all);
+        }
+    }
     tm.prepare = t0.elapsed().as_secs_f64();
     let c = dit.cfg.in_channels;
     let (lh, lw) = (shape.h_lat, shape.w_lat);
@@ -406,12 +437,21 @@ pub fn generate_images(
             );
             let m = &mods[i * per_mod..(i + 1) * per_mod];
             let fs = &fscale[i * dim..(i + 1) * dim];
-            let mut pred = dit.step(&prep, i, &x_tok, m, fs);
-            // cfg truncation: t_norm = (1000 − t)/1000 with t = σ·1000
-            let apply_cfg = do_cfg && !(p.cfg_truncation <= 1.0 && t_models[i] > p.cfg_truncation);
+            let apply_cfg = cfg_at[i];
+            let pair = if apply_cfg && pair_dev {
+                dit.step_pair_device(pair_key, shape.n_img, i, &x_tok, m, fs)
+            } else {
+                None
+            };
+            let (mut pred, neg) = match pair {
+                Some((a, b)) => (a, Some(b)),
+                None => (dit.step(&prep, i, &x_tok, m, fs), None),
+            };
             if apply_cfg {
-                let np = nprep.as_ref().expect("negative prepared");
-                let neg = dit.step(np, i, &x_tok, m, fs);
+                let neg = match neg {
+                    Some(n) => n,
+                    None => dit.step(nprep.as_ref().expect("negative prepared"), i, &x_tok, m, fs),
+                };
                 if let Some(d) = &trace {
                     trace_write(d, img, &format!("vpos_{i}"), &crate::zimage::unpatchify(&pred, c, lh, lw))?;
                     trace_write(d, img, &format!("vneg_{i}"), &crate::zimage::unpatchify(&neg, c, lh, lw))?;

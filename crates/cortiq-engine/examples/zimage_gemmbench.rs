@@ -913,6 +913,7 @@ mod imp {
             layers: &refs[2..],
             mods_all: None,
             final_scale_all: None,
+            neg: None,
         };
         let t0 = std::time::Instant::now();
         if !cortiq_engine::gpu::zimage_prepare(&pa) {
@@ -929,7 +930,7 @@ mod imp {
             let mods: Vec<f32> = (0..nblk * 4 * h).map(|_| 0.4 * rng.gauss()).collect();
             let fscale: Vec<f32> = (0..h).map(|_| 1.0 + 0.2 * rng.uni()).collect();
             let mut out = vec![0f32; n_img * 64];
-            let mut sa = ZStepArgs { key: 77, step, x_tok: &x_tok, mods: &mods, final_scale: &fscale, out: &mut out };
+            let mut sa = ZStepArgs { key: 77, step, x_tok: &x_tok, mods: &mods, final_scale: &fscale, out: &mut out, out_neg: None };
             if !cortiq_engine::gpu::zimage_step(&mut sa) {
                 println!("stepcheck: zimage_step declined");
                 return;
