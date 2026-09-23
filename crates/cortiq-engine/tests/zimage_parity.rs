@@ -282,6 +282,54 @@ fn zimage_dit_forward() {
     assert!(all_ok, "DiT parity failed");
 }
 
+/// M5 handoff gate for the device backends (WP2 wgpu, WP3 Metal): the
+/// device `step` (`gpu::zimage_prepare` + `gpu::zimage_step`) against the
+/// host `step_cpu` on the SAME container, at the oracle's inputs, plus both
+/// against the fp32 oracle `v`. Skips while the backend declines. Run with
+/// the GPU enabled (no `CMF_GPU=0`).
+#[test]
+fn zimage_device_vs_cpu() {
+    let (Some(oracle), Some(cmf)) = (env("CMF_ZIMAGE_ORACLE"), env("CMF_ZIMAGE_CMF")) else {
+        eprintln!("skip: CMF_ZIMAGE_ORACLE / CMF_ZIMAGE_CMF not set");
+        return;
+    };
+    let od = PathBuf::from(&oracle);
+    let case = env("CMF_ZIMAGE_CASES").unwrap_or_else(|| "r512_p0_t8_i0".into());
+    let model = Arc::new(cortiq_core::CmfModel::open(&cmf).unwrap());
+    let dit = ZImageDit::from_cmf(&model).unwrap();
+    let mut all_ok = true;
+    for case in case.split(',') {
+        let (o, meta) = read_st(&od.join(format!("dit_{case}_fp32.safetensors")));
+        let (hh, ww, l) = (meta_usize(&meta, "H"), meta_usize(&meta, "W"), meta_usize(&meta, "L"));
+        let t = f(&o, "t_model")[0];
+        let cap = f(&o, "cap");
+        let shape = ZShape::new(hh, ww, l);
+        let mods = dit.mods_for_steps(&[t]);
+        let fs = dit.final_scale_for_steps(&[t]);
+        let x_tok = dit.tokens(&f(&o, "x_in"), &shape);
+        let host = dit.prepare_with(&cap, shape, 7001, None, false).unwrap();
+        let dev = dit.prepare_with(&cap, shape, 7002, Some((&mods, &fs)), true).unwrap();
+        if !dev.device {
+            eprintln!("skip {case}: the device backend declined zimage_prepare");
+            continue;
+        }
+        let (c, lh, lw) = (dit.cfg.in_channels, hh / 8, ww / 8);
+        let t0 = std::time::Instant::now();
+        let v_dev = dit.step(&dev, 0, &x_tok, &mods, &fs);
+        let td = t0.elapsed().as_secs_f64();
+        let t0 = std::time::Instant::now();
+        let v_cpu = dit.step_cpu(&host, &x_tok, &mods, &fs);
+        let tc = t0.elapsed().as_secs_f64();
+        println!("── {case}: device step {td:.3}s, host step {tc:.2}s");
+        all_ok &= report("device cap vs host cap", &dev.cap, &host.cap, 3e-3);
+        all_ok &= report("device v vs step_cpu", &v_dev, &v_cpu, 3e-3);
+        let want = f(&o, "v");
+        report("step_cpu v vs fp32 oracle", &zimage::unpatchify(&v_cpu, c, lh, lw), &want, 1.0);
+        report("device v vs fp32 oracle", &zimage::unpatchify(&v_dev, c, lh, lw), &want, 1.0);
+    }
+    assert!(all_ok, "device vs host gate failed");
+}
+
 #[test]
 fn zimage_vae() {
     let (Some(oracle), Some(cmf)) = (env("CMF_ZIMAGE_ORACLE"), env("CMF_ZIMAGE_CMF")) else {
