@@ -14710,30 +14710,18 @@ fn async_replay_on() -> bool {
 /// waited here anyway rather than dropped, so a second writer can never
 /// be forgotten.
 fn park_replay(c: &Ctx, cmd: metal::CommandBuffer, value: u64) {
-    let prev = c.replay_pending.lock().unwrap().replace(PendingReplay { cmd, value });
-    if let Some(p) = prev {
+    let mut slot = c.replay_pending.lock().unwrap();
+    if let Some(p) = slot.take() {
         tracing::warn!("metal replay: a pending replay was still parked when the next one landed");
-        let _ = wait_fast_checked(&p.cmd);
+        p.cmd.wait_until_completed();
     }
-}
-
-/// Device-side ordering behind the pending replay: encode a wait for its
-/// event value on `cmd` (legal between encoders). A no-op when nothing is
-/// pending or the value is already signaled. The b-row GDN encoder uses
-/// it so a graph that writes the replay's slot buffers (VBUF kinds
-/// 10-17: a GDN-mixer MTP block warmed on the main queue) cannot overtake
-/// the replay reading them; the trunk verify has already host-waited, so
-/// for it this costs nothing.
-fn encode_replay_wait(c: &Ctx, cmd: &metal::CommandBufferRef) {
-    let value = c.replay_pending.lock().unwrap().as_ref().map(|p| p.value);
-    if let Some(v) = value {
-        cmd.encode_wait_for_event(&c.replay_event, v);
-    }
+    *slot = Some(PendingReplay { cmd, value });
 }
 
 /// Is a replay still parked (unwaited)? Diagnostics/tests.
 pub fn replay_pending() -> bool {
-    ctx().is_some_and(|c| c.replay_pending.lock().unwrap().is_some())
+    // Probe only: never build the Metal context for this question.
+    matches!(CTX.get(), Some(Ok(c)) if c.replay_pending.lock().unwrap().is_some())
 }
 
 /// Wait for the pending asynchronous replay (the speculative commit's
@@ -14746,22 +14734,29 @@ pub fn replay_pending() -> bool {
 /// command buffer failed: the states are undefined and the caller must
 /// fail closed exactly as it would for a synchronous commit error.
 pub fn wait_replay() -> bool {
-    let Some(c) = ctx() else {
+    // Never build the context for this question (a wgpu-routed run on
+    // macOS would otherwise compile the whole Metal library here).
+    let Some(Ok(c)) = CTX.get() else {
         return true;
     };
-    let pending = c.replay_pending.lock().unwrap().take();
-    let Some(p) = pending else {
+    // The slot stays LOCKED for the whole wait: a second pipeline (the
+    // server runs one per slot) probing meanwhile blocks instead of
+    // seeing an empty slot while the GPU is still writing the states.
+    let mut slot = c.replay_pending.lock().unwrap();
+    let Some(p) = slot.take() else {
         return true;
     };
     let done = c.replay_event.signaled_value() >= p.value
         && p.cmd.status() == metal::MTLCommandBufferStatus::Completed;
-    if done {
-        return true;
+    if !done {
+        // A plain wait: this is the replay queue, not the main queue, so
+        // it must not feed the spin-or-sleep average of main-queue waits.
+        p.cmd.wait_until_completed();
     }
-    match wait_fast_checked(&p.cmd) {
-        Ok(()) => true,
-        Err(err) => {
-            tracing::error!("Metal async replay failed: {err}");
+    match p.cmd.status() {
+        metal::MTLCommandBufferStatus::Completed => true,
+        st => {
+            tracing::error!("Metal async replay failed: command buffer status {st:?}");
             false
         }
     }
@@ -15405,11 +15400,19 @@ impl VerifyGraph {
                 return false;
             }
         }
+        // A replay still parked on the second queue may be writing the
+        // slot buffers this graph reuses (VBUF kinds 10-17: a GDN-mixer
+        // MTP block warmed on the main queue). Wait on the HOST: a failed
+        // replay never signals its event, so a GPU-side event wait could
+        // park the main queue forever. The trunk verify has already
+        // host-waited, so for it this costs nothing.
+        if !wait_replay() {
+            return false;
+        }
         let c = self.tg.c;
         let b = self.b;
         let vd = cfg.nv * cfg.dv;
         let cmd = self.ensure_cmd();
-        encode_replay_wait(c, &cmd);
         for (l, st) in layers.iter().zip(states) {
             let slot = self.gdn.len();
             let (s_b, st_len) = match host_state_buffer(c, st.as_ptr(), st.len()) {

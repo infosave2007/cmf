@@ -991,8 +991,10 @@ impl Pipeline {
         // the second queue: whoever reads the host cache after generate()
         // returns (session export, the network split's KV wire, a KV
         // reuse) must see the final states.
+        // A replay that failed leaves the GDN owners half-written: fail
+        // closed and drop the sequence instead of handing the cache on.
         #[cfg(target_os = "macos")]
-        let _ = crate::gpu_metal::wait_replay();
+        let clear_sequence = clear_sequence || !crate::gpu_metal::wait_replay();
         if clear_sequence {
             self.clear_sequence_state();
             if let Some(m) = mtp.as_mut() {
@@ -5396,6 +5398,9 @@ impl Pipeline {
             }
             if let Some((plain_states, rows)) = commit_ref {
                 crate::gpu_metal::queue_fence();
+                // the commit's replay runs on the second queue: collect it
+                // before the oracle reads the CPU owners it writes into
+                let _ = crate::gpu_metal::wait_replay();
                 let (nkv, hd) = (self.num_kv_heads, self.head_dim);
                 let mut worst_s = 0f32;
                 let mut worst_li = 0usize;
