@@ -345,7 +345,12 @@ pub(crate) fn step(a: &mut ZStepArgs) -> bool {
         let mut line = format!("zi amax step {}:", a.step);
         for (si, name) in AMAX_SITES.iter().enumerate() {
             // ffn_hid is stored ×2⁻ᵏ (range guard): report the true value.
-            let g = if si == 5 { (hid_shift() as f32).exp2() } else { 1.0 };
+            let g = match si {
+                0 => (attn_shift() as f32).exp2(),
+                1 | 2 => (qkv_shift() as f32).exp2(),
+                5 => (hid_shift() as f32).exp2(),
+                _ => 1.0,
+            };
             let (bi, m) = (0..v.len() / ns).map(|b| (b, v[b * ns + si] * g)).fold((0, 0f32), |acc, x| if x.1 > acc.1 { x } else { acc });
             line += &format!(" {name} {m:.3e}@{bi}");
         }
@@ -366,6 +371,9 @@ pub(crate) fn release() {
         *g = None;
     }
     if let Ok(mut g) = ZREFINER.lock() {
+        *g = None;
+    }
+    if let Ok(mut g) = ZVAE.lock() {
         *g = None;
     }
 }
@@ -429,14 +437,18 @@ pub(crate) fn refine_caption(
 }
 
 /// Resident Flux-VAE decoder; `z` is already de-normalised.
+/// `CMF_ZI_VAE=0` declines (the parent's per-conv path runs).
 pub(crate) fn vae_decode_chain(
-    _a: &crate::vae::VaeChainArgs,
-    _z: &[f32],
-    _h: usize,
-    _w: usize,
-    _out: &mut [f32],
+    a: &crate::vae::VaeChainArgs,
+    z: &[f32],
+    h: usize,
+    w: usize,
+    out: &mut [f32],
 ) -> bool {
-    false
+    if !zi_enabled() || std::env::var("CMF_ZI_VAE").as_deref() == Ok("0") {
+        return false;
+    }
+    vae_decode_dev(a, z, h, w, out).is_some()
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -568,11 +580,16 @@ pub struct MmCfg {
     /// 2 = double-buffered shared staging (one barrier per K slice instead
     /// of two); 1 = single buffer + register prefetch.
     pub stages: u32,
+    /// Implicit-GEMM 3×3 convolution (the VAE, B2): 0 = plain GEMM,
+    /// 1 = 3×3 pad-1 conv over an NHWC f16 image (`act` = the image,
+    /// K = 9·cin in (tap, channel) order), 2 = the same on the nearest-2×
+    /// upsample of `act` (the image is at half the output size).
+    pub conv: u32,
 }
 
 impl MmCfg {
     pub const fn new(bm: u32, bn: u32, bk: u32, wm: u32, wn: u32, epi: Epi) -> Self {
-        Self { bm, bn, bk, wm, wn, epi, direct: false, acc16_probe: false, stages: 1 }
+        Self { bm, bn, bk, wm, wn, epi, direct: false, acc16_probe: false, stages: 1, conv: 0 }
     }
     pub fn valid(&self) -> bool {
         let nt = self.wm * self.wn * 32;
@@ -588,6 +605,7 @@ impl MmCfg {
             && (self.bm * vpr) % nt == 0
             && (self.bn * vpr) % nt == 0
             && (self.epi != Epi::SwiGlu || (tn / 16) % 2 == 0)
+            && (self.conv == 0 || (!self.direct && self.stages == 1 && !self.acc16_probe && nt % vpr == 0))
     }
     fn key(&self) -> String {
         format!(
@@ -604,6 +622,8 @@ impl MmCfg {
                 "_h".to_string()
             } else if self.stages == 2 {
                 "_s2".to_string()
+            } else if self.conv != 0 {
+                format!("_conv{}", self.conv)
             } else {
                 String::new()
             }
@@ -657,10 +677,19 @@ pub fn mm_src(g: MmCfg) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "enable f16;\nenable wgpu_cooperative_matrix;");
     let _ = writeln!(s, "diagnostic(off, derivative_uniformity);");
-    let _ = writeln!(
-        s,
-        "struct MmP {{ m: u32, n: u32, k: u32, ldo: u32, ocol: u32, arow: u32, oscale: f32, _p: u32 }};"
-    );
+    if g.conv == 0 {
+        let _ = writeln!(
+            s,
+            "struct MmP {{ m: u32, n: u32, k: u32, ldo: u32, ocol: u32, arow: u32, oscale: f32, _p: u32 }};"
+        );
+    } else {
+        // cw/ch = OUTPUT width/height, cin = input channels (a multiple of
+        // bk, so one K slice never straddles two taps).
+        let _ = writeln!(
+            s,
+            "struct MmP {{ m: u32, n: u32, k: u32, ldo: u32, ocol: u32, arow: u32, oscale: f32, _p: u32, cw: u32, ch: u32, cin: u32, _q: u32 }};"
+        );
+    }
     if g.direct {
         let _ = writeln!(s, "@group(0) @binding(0) var<storage, read> wt: array<f16>;");
         let _ = writeln!(s, "@group(0) @binding(1) var<storage, read> act: array<f16>;");
@@ -680,6 +709,23 @@ pub fn mm_src(g: MmCfg) -> String {
         }
     }
     let _ = writeln!(s, "@group(0) @binding(3) var<uniform> p: MmP;");
+    if g.conv != 0 {
+        let up = if g.conv == 2 { 1 } else { 0 };
+        let _ = writeln!(
+            s,
+            "fn ldc(y: i32, x: i32, kt: u32, vc: u32) -> vec4<f16> {{
+  let k0 = kt * {bk}u;
+  let tap = k0 / p.cin;
+  let ci = k0 - tap * p.cin + vc * 4u;
+  let sy = y + i32(tap / 3u) - 1;
+  let sx = x + i32(tap % 3u) - 1;
+  if (sy < 0 || sx < 0 || sy >= i32(p.ch) || sx >= i32(p.cw)) {{ return vec4<f16>(0.0h); }}
+  let src = (u32(sy) >> {up}u) * (p.cw >> {up}u) + (u32(sx) >> {up}u);
+  return act[(src * p.cin + ci) / 4u];
+}}",
+            bk = g.bk
+        );
+    }
     if !g.direct {
         let st = g.stages.max(1);
         let _ = writeln!(s, "var<workgroup> sa: array<f16, {}>;", g.bm * lds * st);
@@ -735,12 +781,24 @@ pub fn mm_src(g: MmCfg) -> String {
         let _ = writeln!(s, "  }}");
     } else {
         let _ = writeln!(s, "  let kq = p.k / 4u;");
-        for t in 0..la {
-            let _ = writeln!(
-                s,
-                "  var ra{t} = act[(p.arow + m0 + (tid + {o}u) / {vpr}u) * kq + (tid + {o}u) % {vpr}u];",
-                o = t * nt
-            );
+        if g.conv != 0 {
+            // Output pixel of each loaded row, fixed for the whole K loop.
+            let _ = writeln!(s, "  let vc = tid % {vpr}u;");
+            for t in 0..la {
+                let _ = writeln!(
+                    s,
+                    "  let r{t} = m0 + (tid + {o}u) / {vpr}u; let y{t} = i32(r{t} / p.cw); let x{t} = i32(r{t} % p.cw);\n  var ra{t} = ldc(y{t}, x{t}, 0u, vc);",
+                    o = t * nt
+                );
+            }
+        } else {
+            for t in 0..la {
+                let _ = writeln!(
+                    s,
+                    "  var ra{t} = act[(p.arow + m0 + (tid + {o}u) / {vpr}u) * kq + (tid + {o}u) % {vpr}u];",
+                    o = t * nt
+                );
+            }
         }
         for t in 0..lb {
             let _ = writeln!(
@@ -765,11 +823,15 @@ pub fn mm_src(g: MmCfg) -> String {
             let _ = writeln!(s, "    workgroupBarrier();");
             let _ = writeln!(s, "    if (kt + 1u < nkt) {{ let kb = (kt + 1u) * {vpr}u;");
             for t in 0..la {
-                let _ = writeln!(
-                    s,
-                    "      ra{t} = act[(p.arow + m0 + (tid + {o}u) / {vpr}u) * kq + kb + (tid + {o}u) % {vpr}u];",
-                    o = t * nt
-                );
+                if g.conv != 0 {
+                    let _ = writeln!(s, "      ra{t} = ldc(y{t}, x{t}, kt + 1u, vc);");
+                } else {
+                    let _ = writeln!(
+                        s,
+                        "      ra{t} = act[(p.arow + m0 + (tid + {o}u) / {vpr}u) * kq + kb + (tid + {o}u) % {vpr}u];",
+                        o = t * nt
+                    );
+                }
             }
             for t in 0..lb {
                 let _ = writeln!(
@@ -969,10 +1031,13 @@ pub struct MmArgs {
     /// Output multiplier (1.0 = none); for the f16 epilogues it is the
     /// power-of-two range guard the next GEMM divides back out.
     pub oscale: f32,
+    /// Conv variants only: [output width, output height, input channels].
+    pub conv: [u32; 3],
 }
 
 fn mm_uniform(c: &Ctx, a: &MmArgs) -> wgpu::Buffer {
-    let w: [u32; 8] = [a.m, a.n, a.k, a.ldo, a.ocol, a.arow, a.oscale.to_bits(), 0];
+    let w: [u32; 12] =
+        [a.m, a.n, a.k, a.ldo, a.ocol, a.arow, a.oscale.to_bits(), 0, a.conv[0], a.conv[1], a.conv[2], 0];
     c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("zi_mm_p"),
         contents: bytemuck::cast_slice(&w),
@@ -1852,7 +1917,7 @@ pub mod bench {
         let wb = sbuf_init(c, bytemuck::cast_slice(plane), "plane");
         let ncol = if cfg.epi == Epi::SwiGlu { n / 2 } else { n };
         let ob = sbuf(c, (mp * ncol * 4) as u64, "out");
-        let args = MmArgs { m: m as u32, n: n as u32, k: k as u32, ldo: ncol as u32, ocol: 0, arow: 0, oscale: 1.0 };
+        let args = MmArgs { m: m as u32, n: n as u32, k: k as u32, ldo: ncol as u32, ocol: 0, arow: 0, oscale: 1.0, conv: [0; 3] };
         let call = mm_call(c, cfg, &args, &wb, &ab, &ob)?;
         let mut enc = c.device.create_command_encoder(&Default::default());
         {
@@ -1880,7 +1945,7 @@ pub mod bench {
         fill(c, &wb, (n * k / 2) as u64, 9, 0.02, false)?;
         let ncol = if cfg.epi == Epi::SwiGlu { n / 2 } else { n };
         let ob = sbuf(c, (mp * ncol * 4) as u64, "out");
-        let args = MmArgs { m: m as u32, n: n as u32, k: k as u32, ldo: ncol as u32, ocol: 0, arow: 0, oscale: 1.0 };
+        let args = MmArgs { m: m as u32, n: n as u32, k: k as u32, ldo: ncol as u32, ocol: 0, arow: 0, oscale: 1.0, conv: [0; 3] };
         let call = mm_call(c, cfg, &args, &wb, &ab, &ob)?;
         wait(c);
         let reps = if m * n * k > 50_000_000_000 { 4 } else { 10 };
@@ -2641,6 +2706,20 @@ impl ZCalls {
 }
 
 /// log2 of the SwiGLU hidden's range guard (see `block_calls_probe`).
+/// log2 of the qkv panel's range guard: the q/k/v GEMM stores ×2⁻ᵏ, the
+/// qk-RMSNorm is scale-free, so only v (→ attention output) carries the
+/// factor and the O GEMM's f32 epilogue multiplies 2ᵏ back in. The base
+/// model's qkv reaches 5.7e4 at step 0 (f16 max 6.55e4).
+/// log2 of the attention-input guard (the pre-norm·(1+scale) the qkv GEMM
+/// reads): the base model's reaches > 6.55e4 at layer 28.
+pub fn attn_shift() -> i32 {
+    std::env::var("CMF_ZI_ATTN_SHIFT").ok().and_then(|v| v.parse().ok()).unwrap_or(0).clamp(0, 14)
+}
+
+pub fn qkv_shift() -> i32 {
+    std::env::var("CMF_ZI_QKV_SHIFT").ok().and_then(|v| v.parse().ok()).unwrap_or(0).clamp(0, 14)
+}
+
 pub fn hid_shift() -> i32 {
     std::env::var("CMF_ZI_HID_SHIFT").ok().and_then(|v| v.parse().ok()).unwrap_or(6).clamp(0, 14)
 }
@@ -2668,11 +2747,12 @@ fn rowop_call(
     mods: &wgpu::Buffer,
     g_off: u32,
     s_off: u32,
+    oscale: f32,
 ) -> Option<Call> {
     let pipe = pipeline(c, "zi_rowop", ROWOP_SRC, "zi_rowop")?;
     let u = ubuf(
         c,
-        &[d.h as u32, mode, g_off, s_off, d.eps.to_bits(), d.eps.to_bits(), 1f32.to_bits(), 0],
+        &[d.h as u32, mode, g_off, s_off, d.eps.to_bits(), d.eps.to_bits(), oscale.to_bits(), 0],
     );
     let b = bg(c, &pipe, &[&seq.br, &seq.x, &seq.xn, wpost, wpre, mods, &u]);
     Some(Call { pipe, bg: b, grid: ((seq.m as u32).min(65535), (seq.m as u32).div_ceil(65535), 1) })
@@ -2748,21 +2828,30 @@ pub fn block_calls_probe(
     };
     let (h, i, m) = (d.h as u32, d.inter as u32, seq.m as u32);
     let gm = if modulated { ROW_GATE_MOD } else { 0 };
+    // Range guards (B2): the attention input is stored ×2⁻ᵃ, the qkv panel
+    // ×2⁻ᵠ (so the qkv GEMM scales by 2^(a−q)), the SwiGLU hidden ×2⁻ʰ.
+    let att_in_scale = (-(attn_shift() as f32)).exp2();
     let sm = if modulated { ROW_SCALE_MOD } else { 0 };
     let mut v = ZCalls::default();
     if first {
         v.push(
             Class::Rows,
-            rowop_call(c, d, seq, ROW_PRE | sm, &blk.norm1, &blk.norm1, mods, 0, mod_off(d, bi, 0))?,
+            rowop_call(c, d, seq, ROW_PRE | sm, &blk.norm1, &blk.norm1, mods, 0, mod_off(d, bi, 0), att_in_scale)?,
         );
     }
     pr(&mut v, 0, &seq.xn, mhalf, false)?;
-    let a = |n: u32, k: u32, ldo: u32| MmArgs { m, n, k, ldo, ocol: 0, arow: 0, oscale: 1.0 };
-    v.push_mm(Class::MmQkv, mm_call(c, t.qkv, &a(3 * h, h, 3 * h), &blk.qkv, &seq.xn, &seq.qkv)?);
+    let a = |n: u32, k: u32, ldo: u32| MmArgs { m, n, k, ldo, ocol: 0, arow: 0, oscale: 1.0, conv: [0; 3] };
+    let qs = qkv_shift();
+    let aq = MmArgs { oscale: ((attn_shift() - qs) as f32).exp2(), ..a(3 * h, h, 3 * h) };
+    let ao = MmArgs { oscale: (qs as f32).exp2(), ..a(h, h, h) };
+    v.push_mm(Class::MmQkv, mm_call(c, t.qkv, &aq, &blk.qkv, &seq.xn, &seq.qkv)?);
     pr(&mut v, 1, &seq.qkv, 3 * mhalf, false)?;
     {
         let pipe = pipeline(c, "zi_qkrope", QKROPE_SRC, "zi_qkrope")?;
-        let u = ubuf(c, &[3 * h, d.nh as u32, d.eps.to_bits(), 0]);
+        // q/k arrive ×2⁻ᵏ (qkv range guard): scale eps by 2⁻²ᵏ so the
+        // RMSNorm is exactly the unscaled one.
+        let eps = d.eps * (-2.0 * qs as f32).exp2();
+        let u = ubuf(c, &[3 * h, d.nh as u32, eps.to_bits(), 0]);
         let b = bg(c, &pipe, &[&seq.qkv, &blk.norm_q, &blk.norm_k, &seq.rope_c, &seq.rope_s, &u]);
         v.push(Class::Rows, Call { pipe, bg: b, grid: (2 * d.nh as u32, m.min(65535), m.div_ceil(65535)) });
     }
@@ -2770,7 +2859,7 @@ pub fn block_calls_probe(
         v.push(Class::Flash, cl);
     }
     pr(&mut v, 2, &seq.att, mhalf, false)?;
-    v.push_mm(Class::MmO, mm_call(c, t.o, &a(h, h, h), &blk.o, &seq.att, &seq.br)?);
+    v.push_mm(Class::MmO, mm_call(c, t.o, &ao, &blk.o, &seq.att, &seq.br)?);
     pr(&mut v, 3, &seq.br, mh, true)?;
     v.push(
         Class::Rows,
@@ -2784,6 +2873,7 @@ pub fn block_calls_probe(
             mods,
             mod_off(d, bi, 1),
             mod_off(d, bi, 2),
+            1.0,
         )?,
     );
     pr(&mut v, 4, &seq.xn, mhalf, false)?;
@@ -2802,7 +2892,7 @@ pub fn block_calls_probe(
         Some((nb, nbi)) => (ROW_GRES | gm | ROW_PRE | sm, &nb.norm1, mod_off(d, nbi, 0)),
         None => (ROW_GRES | gm, &blk.ffn_norm2, 0),
     };
-    v.push(Class::Rows, rowop_call(c, d, seq, mode, &blk.ffn_norm2, wpre, mods, mod_off(d, bi, 3), s_off)?);
+    v.push(Class::Rows, rowop_call(c, d, seq, mode, &blk.ffn_norm2, wpre, mods, mod_off(d, bi, 3), s_off, att_in_scale)?);
     pr(&mut v, 7, &seq.x, mh, true)?;
     Some(v)
 }
@@ -3120,4 +3210,681 @@ impl ZStepDev {
     pub fn dispatches(&self) -> usize {
         self.pre_a.len() + self.joint_calls.len() + self.fin.len()
     }
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Resident Flux-VAE decoder (plan S6, B2).
+//
+// The whole decoder in one submission: NHWC activations stay on the
+// device, every 3×3 conv is `zi_mm` as an implicit GEMM (the A tile is
+// gathered from the NHWC f16 image, K = 9·cin in (tap, channel) order;
+// the nearest-2× upsample is folded into that gather), GroupNorm is a
+// two-pass f32 reduction (sum, then centred sum of squares) fused with
+// the affine, SiLU and the f16 cast of the next conv's input, and the
+// mid-block single-head attention is QKᵀ → softmax → P·V as three
+// `zi_mm` passes over query chunks. The host uploads the latent once and
+// reads back [3][H·W] once.
+// ════════════════════════════════════════════════════════════════════
+
+const VAE_GN_PART_SRC: &str = r#"
+struct VP { m: u32, c: u32, cpg: u32, rows: u32, nchunk: u32, flags: u32, g: u32, _b: u32 };
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> bias: array<f32>;
+@group(0) @binding(2) var<storage, read> stat: array<f32>;
+@group(0) @binding(3) var<storage, read_write> part: array<f32>;
+@group(0) @binding(4) var<uniform> p: VP;
+var<workgroup> sh: array<f32, 512>;
+// One workgroup per chunk of `rows` pixels, all groups at once (coalesced
+// NHWC rows). flags: 1 = add bias[c] on read, 4 = pass 2 (Σ (v − mean)²).
+// Thread t always sees channel t % c (c ≤ 256) or channels t, t + 256
+// (c = 512).
+@compute @workgroup_size(256)
+fn vae_gn_part(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) {
+  let chunk = wid.x;
+  let r0 = chunk * p.rows;
+  let r1 = min(r0 + p.rows, p.m);
+  let n = (r1 - r0) * p.c;
+  let base = r0 * p.c;
+  let hb = (p.flags & 1u) != 0u;
+  let pass2 = (p.flags & 4u) != 0u;
+  var a0 = 0.0;
+  var a1 = 0.0;
+  for (var e = t; e < n; e = e + 256u) {
+    let ch = e % p.c;
+    var v = x[base + e];
+    if (hb) { v = v + bias[ch]; }
+    if (pass2) { let d = v - stat[ch / p.cpg]; v = d * d; }
+    if (p.c <= 256u || ch == t) { a0 = a0 + v; } else { a1 = a1 + v; }
+  }
+  sh[t] = a0;
+  sh[256u + t] = a1;
+  workgroupBarrier();
+  if (t < p.g) {
+    var s = 0.0;
+    for (var i = 0u; i < 256u; i = i + 1u) {
+      var c0 = i;
+      if (p.c <= 256u) { c0 = i % p.c; }
+      if (c0 / p.cpg == t) { s = s + sh[i]; }
+      if (p.c > 256u && (i + 256u) / p.cpg == t) { s = s + sh[256u + i]; }
+    }
+    part[t * p.nchunk + chunk] = s;
+  }
+}
+"#;
+
+const VAE_GN_FIN_SRC: &str = r#"
+struct VP { m: u32, c: u32, cpg: u32, rows: u32, nchunk: u32, flags: u32, g: u32, eps: f32 };
+@group(0) @binding(0) var<storage, read> part: array<f32>;
+@group(0) @binding(1) var<storage, read_write> stat: array<f32>;
+@group(0) @binding(2) var<uniform> p: VP;
+var<workgroup> sh: array<f32, 256>;
+// One workgroup per group: Σ over chunks → mean (pass 1) or rstd (pass 2),
+// stat = [mean[g] …, rstd[g] …].
+@compute @workgroup_size(256)
+fn vae_gn_fin(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) {
+  let g = wid.x;
+  var s = 0.0;
+  for (var i = t; i < p.nchunk; i = i + 256u) { s = s + part[g * p.nchunk + i]; }
+  sh[t] = s;
+  workgroupBarrier();
+  var st = 128u;
+  loop {
+    if (st == 0u) { break; }
+    if (t < st) { sh[t] = sh[t] + sh[t + st]; }
+    workgroupBarrier();
+    st = st >> 1u;
+  }
+  if (t == 0u) {
+    let n = f32(p.m) * f32(p.cpg);
+    if ((p.flags & 4u) != 0u) {
+      stat[p.g + g] = inverseSqrt(sh[0] / n + p.eps);
+    } else {
+      stat[g] = sh[0] / n;
+    }
+  }
+}
+"#;
+
+const VAE_GN_APPLY_SRC: &str = r#"
+enable f16;
+struct VP { m: u32, c: u32, cpg: u32, rows: u32, nchunk: u32, flags: u32, g: u32, mp: u32 };
+@group(0) @binding(0) var<storage, read> x: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> bias: array<f32>;
+@group(0) @binding(2) var<storage, read> stat: array<f32>;
+@group(0) @binding(3) var<storage, read> gw: array<f32>;
+@group(0) @binding(4) var<storage, read> gb: array<f32>;
+@group(0) @binding(5) var<storage, read_write> outp: array<vec2<u32>>;
+@group(0) @binding(6) var<uniform> p: VP;
+// y = ((x + bias) − mean)·rstd·w + b, then SiLU (flags 2), stored f16;
+// rows ≥ m are written as zeros (the conv gathers never read them, but
+// the plain GEMMs and the attention keys do).
+@compute @workgroup_size(256)
+fn vae_gn_apply(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+  let c4 = p.c / 4u;
+  let idx = gid.y * (nwg.x * 256u) + gid.x;
+  if (idx >= p.mp * c4) { return; }
+  let row = idx / c4;
+  if (row >= p.m) { outp[idx] = vec2<u32>(0u, 0u); return; }
+  let ch = (idx % c4) * 4u;
+  var v = x[idx];
+  var o = vec4<f32>(0.0);
+  for (var j = 0u; j < 4u; j = j + 1u) {
+    var a = v[j];
+    if ((p.flags & 1u) != 0u) { a = a + bias[ch + j]; }
+    let g = (ch + j) / p.cpg;
+    var y = (a - stat[g]) * stat[p.g + g] * gw[ch + j] + gb[ch + j];
+    if ((p.flags & 2u) != 0u) { y = y / (1.0 + exp(-y)); }
+    o[j] = y;
+  }
+  outp[idx] = vec2<u32>(pack2x16float(o.xy), pack2x16float(o.zw));
+}
+"#;
+
+const VAE_COMBINE_SRC: &str = r#"
+struct CP { n: u32, c: u32, mode: u32, _a: u32 };
+@group(0) @binding(0) var<storage, read_write> xo: array<f32>;
+@group(0) @binding(1) var<storage, read> h: array<f32>;
+@group(0) @binding(2) var<storage, read> hb: array<f32>;
+@group(0) @binding(3) var<storage, read> s: array<f32>;
+@group(0) @binding(4) var<storage, read> sb: array<f32>;
+@group(0) @binding(5) var<uniform> p: CP;
+// mode 0: x += h + hb;  mode 1: x = s + sb + h + hb;  mode 2: x = h + hb.
+@compute @workgroup_size(256)
+fn vae_combine(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+  let i = gid.y * (nwg.x * 256u) + gid.x;
+  if (i >= p.n) { return; }
+  let ch = i % p.c;
+  let hv = h[i] + hb[ch];
+  if (p.mode == 0u) { xo[i] = xo[i] + hv; }
+  else if (p.mode == 1u) { xo[i] = s[i] + sb[ch] + hv; }
+  else { xo[i] = hv; }
+}
+"#;
+
+const VAE_CAST_SRC: &str = r#"
+enable f16;
+struct KP { m: u32, mp: u32, c: u32, hasb: u32 };
+@group(0) @binding(0) var<storage, read> x: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> outp: array<vec2<u32>>;
+@group(0) @binding(3) var<uniform> p: KP;
+@compute @workgroup_size(256)
+fn vae_cast(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+  let c4 = p.c / 4u;
+  let idx = gid.y * (nwg.x * 256u) + gid.x;
+  if (idx >= p.mp * c4) { return; }
+  if (idx / c4 >= p.m) { outp[idx] = vec2<u32>(0u, 0u); return; }
+  var v = x[idx];
+  if (p.hasb != 0u) {
+    let ch = (idx % c4) * 4u;
+    v = v + vec4<f32>(b[ch], b[ch + 1u], b[ch + 2u], b[ch + 3u]);
+  }
+  outp[idx] = vec2<u32>(pack2x16float(v.xy), pack2x16float(v.zw));
+}
+"#;
+
+const VAE_SOFTMAX_SRC: &str = r#"
+enable f16;
+struct SP { ld: u32, nv: u32, _a: u32, _b: u32 };
+@group(0) @binding(0) var<storage, read> sc: array<f32>;
+@group(0) @binding(1) var<storage, read_write> pr: array<u32>;
+@group(0) @binding(2) var<uniform> p: SP;
+var<workgroup> red: array<f32, 256>;
+// One workgroup per score row: softmax over the first nv columns in f32,
+// P stored f16 (columns ≥ nv = 0).
+@compute @workgroup_size(256)
+fn vae_softmax(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) {
+  let row = wid.x + wid.y * 65535u;
+  let base = row * p.ld;
+  var mx = -3.0e38;
+  for (var j = t; j < p.nv; j = j + 256u) { mx = max(mx, sc[base + j]); }
+  red[t] = mx;
+  workgroupBarrier();
+  var st = 128u;
+  loop {
+    if (st == 0u) { break; }
+    if (t < st) { red[t] = max(red[t], red[t + st]); }
+    workgroupBarrier();
+    st = st >> 1u;
+  }
+  let m = red[0];
+  workgroupBarrier();
+  var s = 0.0;
+  for (var j = t; j < p.nv; j = j + 256u) { s = s + exp(sc[base + j] - m); }
+  red[t] = s;
+  workgroupBarrier();
+  st = 128u;
+  loop {
+    if (st == 0u) { break; }
+    if (t < st) { red[t] = red[t] + red[t + st]; }
+    workgroupBarrier();
+    st = st >> 1u;
+  }
+  let inv = 1.0 / red[0];
+  for (var j = 2u * t; j < p.ld; j = j + 512u) {
+    var a = 0.0;
+    var b = 0.0;
+    if (j < p.nv) { a = exp(sc[base + j] - m) * inv; }
+    if (j + 1u < p.nv) { b = exp(sc[base + j + 1u] - m) * inv; }
+    pr[(base + j) / 2u] = pack2x16float(vec2<f32>(a, b));
+  }
+}
+"#;
+
+const VAE_OUT_SRC: &str = r#"
+struct OP { m: u32, ld: u32, _a: u32, _b: u32 };
+@group(0) @binding(0) var<storage, read> y: array<f32>;
+@group(0) @binding(1) var<storage, read> b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> outp: array<f32>;
+@group(0) @binding(3) var<uniform> p: OP;
+// NHWC [m][ld] (first 3 channels) + bias → NCHW [3][m].
+@compute @workgroup_size(256)
+fn vae_out(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+  let i = gid.y * (nwg.x * 256u) + gid.x;
+  if (i >= p.m) { return; }
+  for (var ch = 0u; ch < 3u; ch = ch + 1u) {
+    outp[ch * p.m + i] = y[i * p.ld + ch] + b[ch];
+  }
+}
+"#;
+
+/// One conv's device weights: an f16 plane [cout_p][k²·cin_p] in (tap,
+/// channel) order (zero rows/columns for the padding) and an f32 bias
+/// [cout_p].
+struct VConv {
+    plane: wgpu::Buffer,
+    bias: wgpu::Buffer,
+    cin_p: usize,
+    cout: usize,
+    cout_p: usize,
+    k: usize,
+}
+
+struct VNorm {
+    w: wgpu::Buffer,
+    b: wgpu::Buffer,
+    groups: usize,
+}
+
+struct VRes {
+    n1: VNorm,
+    c1: VConv,
+    n2: VNorm,
+    c2: VConv,
+    sc: Option<VConv>,
+}
+
+/// The attention's linears as 1×1 convs (planes [c][c]).
+struct VAttn {
+    norm: VNorm,
+    q: VConv,
+    k: VConv,
+    v: VConv,
+    o: VConv,
+    c: usize,
+}
+
+struct VaeDev {
+    key: u64,
+    conv_in: VConv,
+    mid1: VRes,
+    attn: VAttn,
+    mid2: VRes,
+    ups: Vec<(Vec<VRes>, Option<VConv>)>,
+    norm_out: VNorm,
+    conv_out: VConv,
+}
+
+static ZVAE: Mutex<Option<VaeDev>> = Mutex::new(None);
+
+fn vconv(c: &Ctx, r: &crate::vae::VaeConvRef) -> Option<VConv> {
+    let (ic, oc, k) = (r.ic, r.oc, r.k);
+    if (k != 1 && k != 3) || r.w.len() < oc * ic * k * k || r.b.len() < oc {
+        return None;
+    }
+    let cin_p = ic.next_multiple_of(32);
+    let cout_p = oc.next_multiple_of(128);
+    let kk = k * k;
+    let kd = kk * cin_p;
+    let mut plane = vec![0u16; cout_p * kd];
+    for o in 0..oc {
+        for ci in 0..ic {
+            for tap in 0..kk {
+                plane[o * kd + tap * cin_p + ci] = cortiq_core::quant::f32_to_f16(r.w[(o * ic + ci) * kk + tap]);
+            }
+        }
+    }
+    let mut bias = vec![0f32; cout_p];
+    bias[..oc].copy_from_slice(&r.b[..oc]);
+    Some(VConv {
+        plane: sbuf_init(c, bytemuck::cast_slice(&plane), "zv_plane"),
+        bias: sbuf_init(c, bytemuck::cast_slice(&bias), "zv_bias"),
+        cin_p,
+        cout: oc,
+        cout_p,
+        k,
+    })
+}
+
+fn vlin(c: &Ctx, w: &[f32], b: &[f32], n: usize) -> Option<VConv> {
+    vconv(c, &crate::vae::VaeConvRef { w, b, oc: n, ic: n, k: 1 })
+}
+
+fn vnorm(c: &Ctx, r: &crate::vae::VaeNormRef) -> VNorm {
+    VNorm {
+        w: sbuf_init(c, bytemuck::cast_slice(r.w), "zv_gw"),
+        b: sbuf_init(c, bytemuck::cast_slice(r.b), "zv_gb"),
+        groups: r.groups,
+    }
+}
+
+fn vres(c: &Ctx, r: &crate::vae::VaeResnetRef) -> Option<VRes> {
+    Some(VRes {
+        n1: vnorm(c, &r.norm1),
+        c1: vconv(c, &r.conv1)?,
+        n2: vnorm(c, &r.norm2),
+        c2: vconv(c, &r.conv2)?,
+        sc: match &r.shortcut {
+            Some(s) => Some(vconv(c, s)?),
+            None => None,
+        },
+    })
+}
+
+impl VaeDev {
+    fn build(c: &Ctx, a: &crate::vae::VaeChainArgs) -> Option<VaeDev> {
+        let at = &a.mid_attn;
+        Some(VaeDev {
+            key: a.key,
+            conv_in: vconv(c, &a.conv_in)?,
+            mid1: vres(c, &a.mid_res1)?,
+            attn: VAttn {
+                norm: vnorm(c, &at.norm),
+                q: vlin(c, at.q.0, at.q.1, at.c)?,
+                k: vlin(c, at.k.0, at.k.1, at.c)?,
+                v: vlin(c, at.v.0, at.v.1, at.c)?,
+                o: vlin(c, at.out.0, at.out.1, at.c)?,
+                c: at.c,
+            },
+            mid2: vres(c, &a.mid_res2)?,
+            ups: a
+                .ups
+                .iter()
+                .map(|u| -> Option<(Vec<VRes>, Option<VConv>)> {
+                    Some((
+                        u.resnets.iter().map(|r| vres(c, r)).collect::<Option<Vec<_>>>()?,
+                        match &u.upsample {
+                            Some(s) => Some(vconv(c, s)?),
+                            None => None,
+                        },
+                    ))
+                })
+                .collect::<Option<Vec<_>>>()?,
+            norm_out: vnorm(c, &a.norm_out),
+            conv_out: vconv(c, &a.conv_out)?,
+        })
+    }
+}
+
+/// Dispatch grid for `n` threads of 256.
+fn grid1(n: usize) -> (u32, u32, u32) {
+    let wgs = (n as u32).div_ceil(256).max(1);
+    (wgs.min(65535), wgs.div_ceil(65535), 1)
+}
+
+/// The recorder of one decode: every buffer it binds and the calls.
+struct VRec<'a> {
+    c: &'a Ctx,
+    calls: ZCalls,
+    dummy: wgpu::Buffer,
+    stat: wgpu::Buffer,
+    part: wgpu::Buffer,
+    nchunk_max: usize,
+}
+
+const GN_ROWS: usize = 1024;
+
+impl VRec<'_> {
+    fn k(&mut self, key: &str, src: &str, entry: &str, bufs: &[&wgpu::Buffer], grid: (u32, u32, u32)) -> Option<()> {
+        let pipe = pipeline(self.c, key, src, entry)?;
+        let b = bg(self.c, &pipe, bufs);
+        self.calls.push(Class::Io, Call { pipe, bg: b, grid });
+        Some(())
+    }
+
+    /// GroupNorm (+ optional bias on read) of x [m][ch] → f16 `out`
+    /// [mp][ch], SiLU when `silu`.
+    #[allow(clippy::too_many_arguments)]
+    fn gn(&mut self, x: &wgpu::Buffer, bias: Option<&wgpu::Buffer>, n: &VNorm, m: usize, mp: usize, ch: usize, silu: bool, out: &wgpu::Buffer) -> Option<()> {
+        let g = n.groups;
+        if ch % g != 0 || g > 256 || ch % 4 != 0 || !(ch <= 256 && 256 % ch == 0 || ch == 512) {
+            return None;
+        }
+        let cpg = ch / g;
+        let nchunk = m.div_ceil(GN_ROWS);
+        if nchunk > self.nchunk_max {
+            return None;
+        }
+        let hb = bias.is_some() as u32;
+        let d = self.dummy.clone();
+        let bb = bias.unwrap_or(&d);
+        for pass2 in [false, true] {
+            let flags = hb | if pass2 { 4 } else { 0 };
+            let u = ubuf(self.c, &[m as u32, ch as u32, cpg as u32, GN_ROWS as u32, nchunk as u32, flags, g as u32, 0]);
+            let (stat, part) = (self.stat.clone(), self.part.clone());
+            self.k("zv_gn_part", VAE_GN_PART_SRC, "vae_gn_part", &[x, bb, &stat, &part, &u], (nchunk as u32, 1, 1))?;
+            let u = ubuf(self.c, &[m as u32, ch as u32, cpg as u32, GN_ROWS as u32, nchunk as u32, flags, g as u32, 1e-6f32.to_bits()]);
+            self.k("zv_gn_fin", VAE_GN_FIN_SRC, "vae_gn_fin", &[&part, &stat, &u], (g as u32, 1, 1))?;
+        }
+        let flags = hb | if silu { 2 } else { 0 };
+        let u = ubuf(self.c, &[m as u32, ch as u32, cpg as u32, 0, 0, flags, g as u32, mp as u32]);
+        let stat = self.stat.clone();
+        self.k("zv_gn_apply", VAE_GN_APPLY_SRC, "vae_gn_apply", &[x, bb, &stat, &n.w, &n.b, out, &u], grid1(mp * ch / 4))
+    }
+
+    /// conv of the f16 NHWC image `act` [(h·w or h/2·w/2)][cin_p] → raw
+    /// (bias-free) f32 [mp][cout_p]. `up` = the input is at half size.
+    #[allow(clippy::too_many_arguments)]
+    fn conv(&mut self, cv: &VConv, act: &wgpu::Buffer, h: usize, w: usize, up: bool, out: &wgpu::Buffer) -> Option<()> {
+        let m = h * w;
+        let conv = match (cv.k, up) {
+            (3, false) => 1,
+            (3, true) => 2,
+            (1, false) => 0,
+            _ => return None,
+        };
+        let g = MmCfg { conv, ..default_cfg(Epi::F32) };
+        let a = MmArgs {
+            m: m as u32,
+            n: cv.cout_p as u32,
+            k: (cv.k * cv.k * cv.cin_p) as u32,
+            ldo: cv.cout_p as u32,
+            ocol: 0,
+            arow: 0,
+            oscale: 1.0,
+            conv: [w as u32, h as u32, cv.cin_p as u32],
+        };
+        let mc = mm_call(self.c, g, &a, &cv.plane, act, out)?;
+        self.calls.push_mm(Class::Io, mc);
+        Some(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn combine(&mut self, x: &wgpu::Buffer, h: &wgpu::Buffer, hb: &wgpu::Buffer, s: Option<(&wgpu::Buffer, &wgpu::Buffer)>, mode: u32, n: usize, ch: usize) -> Option<()> {
+        let u = ubuf(self.c, &[n as u32, ch as u32, mode, 0]);
+        let d = self.dummy.clone();
+        let (sb, sbb) = s.unwrap_or((&d, &d));
+        self.k("zv_combine", VAE_COMBINE_SRC, "vae_combine", &[x, h, hb, sb, sbb, &u], grid1(n))
+    }
+
+    fn cast(&mut self, x: &wgpu::Buffer, b: Option<&wgpu::Buffer>, m: usize, mp: usize, ch: usize, out: &wgpu::Buffer) -> Option<()> {
+        let u = ubuf(self.c, &[m as u32, mp as u32, ch as u32, b.is_some() as u32]);
+        let d = self.dummy.clone();
+        self.k("zv_cast", VAE_CAST_SRC, "vae_cast", &[x, b.unwrap_or(&d), out, &u], grid1(mp * ch / 4))
+    }
+}
+
+/// Activation buffers of one decode (NHWC, rows padded to 128).
+struct VBufs {
+    x: wgpu::Buffer,
+    h: wgpu::Buffer,
+    s: wgpu::Buffer,
+    xn: wgpu::Buffer,
+}
+
+fn mp_of(m: usize) -> usize {
+    m.next_multiple_of(128)
+}
+
+/// One resnet on x [h·w][ic] (f32) → x [h·w][oc].
+fn vae_resnet(r: &mut VRec, b: &VBufs, rs: &VRes, h: usize, w: usize, ic: usize) -> Option<usize> {
+    let (m, mp) = (h * w, mp_of(h * w));
+    let oc = rs.c1.cout;
+    if rs.c1.cin_p != ic || rs.c1.cout_p != oc || rs.c2.cout_p != oc {
+        return None;
+    }
+    r.gn(&b.x, None, &rs.n1, m, mp, ic, true, &b.xn)?;
+    r.conv(&rs.c1, &b.xn, h, w, false, &b.h)?;
+    r.gn(&b.h, Some(&rs.c1.bias), &rs.n2, m, mp, oc, true, &b.xn)?;
+    r.conv(&rs.c2, &b.xn, h, w, false, &b.h)?;
+    match &rs.sc {
+        Some(sc) => {
+            if sc.cin_p != ic || sc.cout_p != oc {
+                return None;
+            }
+            r.cast(&b.x, None, m, mp, ic, &b.xn)?;
+            r.conv(sc, &b.xn, h, w, false, &b.s)?;
+            r.combine(&b.x, &b.h, &rs.c2.bias, Some((&b.s, &sc.bias)), 1, mp * oc, oc)?;
+        }
+        None => {
+            if ic != oc {
+                return None;
+            }
+            r.combine(&b.x, &b.h, &rs.c2.bias, None, 0, mp * oc, oc)?;
+        }
+    }
+    Some(oc)
+}
+
+/// Resident decode; see the section comment. `None` = declined (nothing
+/// was written to `out`).
+fn vae_decode_dev(a: &crate::vae::VaeChainArgs, z: &[f32], h0: usize, w0: usize, out: &mut [f32]) -> Option<()> {
+    let c = zctx()?;
+    let t0 = std::time::Instant::now();
+    let lc = a.latent_channels;
+    if z.len() < lc * h0 * w0 || out.len() < 3 * 64 * h0 * w0 || lc > 32 {
+        return None;
+    }
+    let mut g = ZVAE.lock().ok()?;
+    if !g.as_ref().is_some_and(|v| v.key == a.key) {
+        *g = None;
+        *g = Some(VaeDev::build(c, a)?);
+        prof("vae weights", t0);
+    }
+    let v = g.as_ref().unwrap();
+    // Walk the shapes once: the largest NHWC tensor sizes every buffer.
+    let mut elems = mp_of(h0 * w0) * 512;
+    let (mut hh, mut ww) = (h0, w0);
+    for (res, upc) in &v.ups {
+        for r in res {
+            elems = elems.max(mp_of(hh * ww) * r.c1.cin_p.max(r.c1.cout_p));
+        }
+        if let Some(u) = upc {
+            hh *= 2;
+            ww *= 2;
+            elems = elems.max(mp_of(hh * ww) * u.cout_p);
+        }
+    }
+    elems = elems.max(mp_of(hh * ww) * v.conv_out.cout_p);
+    let lim = c.device.limits();
+    let maxb = lim.max_storage_buffer_binding_size.min(lim.max_buffer_size);
+    if (elems * 4) as u64 > maxb {
+        prof(&format!("vae declined: {} MB tensor over the {} MB binding limit", elems * 4 >> 20, maxb >> 20), t0);
+        return None;
+    }
+    let bufs = VBufs {
+        x: sbuf(c, (elems * 4) as u64, "zv_x"),
+        h: sbuf(c, (elems * 4) as u64, "zv_h"),
+        s: sbuf(c, (elems * 4) as u64, "zv_s"),
+        xn: sbuf(c, (elems * 2) as u64, "zv_xn"),
+    };
+    let nchunk_max = (elems / 128).div_ceil(GN_ROWS) + 1;
+    let mut r = VRec {
+        c,
+        calls: ZCalls::default(),
+        dummy: sbuf(c, 64, "zv_dummy"),
+        stat: sbuf(c, 1024 * 4, "zv_stat"),
+        part: sbuf(c, (512 * nchunk_max * 4) as u64, "zv_part"),
+        nchunk_max,
+    };
+    // conv_in input: NHWC f16 with the channels padded to cin_p.
+    let cin0 = v.conv_in.cin_p;
+    let (m0, mp0) = (h0 * w0, mp_of(h0 * w0));
+    let mut zin = vec![0u16; mp0 * cin0];
+    for ch in 0..lc {
+        for p in 0..m0 {
+            zin[p * cin0 + ch] = cortiq_core::quant::f32_to_f16(z[ch * m0 + p]);
+        }
+    }
+    let zbuf = sbuf_init(c, bytemuck::cast_slice(&zin), "zv_z");
+    r.conv(&v.conv_in, &zbuf, h0, w0, false, &bufs.h)?;
+    let mut ch = v.conv_in.cout_p;
+    r.combine(&bufs.x, &bufs.h, &v.conv_in.bias, None, 2, mp0 * ch, ch)?;
+    ch = vae_resnet(&mut r, &bufs, &v.mid1, h0, w0, ch)?;
+    // ── mid attention (single head over the h0·w0 grid)
+    {
+        let at = &v.attn;
+        let cc = at.c;
+        if cc != ch || cc % 128 != 0 {
+            return None;
+        }
+        let (m, mp) = (m0, mp0);
+        r.gn(&bufs.x, None, &at.norm, m, mp, cc, false, &bufs.xn)?;
+        let q16 = sbuf(c, (mp * cc * 2) as u64, "zv_q");
+        let k16 = sbuf(c, (mp * cc * 2) as u64, "zv_k");
+        let vt16 = sbuf(c, (cc * mp * 2) as u64, "zv_vt");
+        let o32 = sbuf(c, (mp * cc * 4) as u64, "zv_o");
+        r.conv(&at.q, &bufs.xn, m, 1, false, &bufs.h)?;
+        r.cast(&bufs.h, Some(&at.q.bias), m, mp, cc, &q16)?;
+        r.conv(&at.k, &bufs.xn, m, 1, false, &bufs.h)?;
+        r.cast(&bufs.h, Some(&at.k.bias), m, mp, cc, &k16)?;
+        // Vᵀ [c][mp] = Wv · xnᵀ (the bias is added after P·V: rows of P
+        // sum to one).
+        {
+            let a = MmArgs { m: cc as u32, n: mp as u32, k: cc as u32, ldo: mp as u32, ocol: 0, arow: 0, oscale: 1.0, conv: [0; 3] };
+            let mc = mm_call(c, default_cfg(Epi::F16), &a, &bufs.xn, &at.v.plane, &vt16)?;
+            r.calls.push_mm(Class::Io, mc);
+        }
+        // Query chunks: S [rows][mp] f32 ≤ 128 MB.
+        let rows = ((32usize << 20) / mp).clamp(128, mp) / 128 * 128;
+        let sc = sbuf(c, (rows * mp * 4) as u64, "zv_sc");
+        let pr = sbuf(c, (rows * mp * 2) as u64, "zv_p");
+        let scale = 1.0 / (cc as f32).sqrt();
+        let mut q0 = 0;
+        while q0 < mp {
+            let rq = rows.min(mp - q0);
+            let a = MmArgs { m: rq as u32, n: mp as u32, k: cc as u32, ldo: mp as u32, ocol: 0, arow: q0 as u32, oscale: scale, conv: [0; 3] };
+            let mc = mm_call(c, default_cfg(Epi::F32), &a, &k16, &q16, &sc)?;
+            r.calls.push_mm(Class::Io, mc);
+            let u = ubuf(c, &[mp as u32, m as u32, 0, 0]);
+            r.k("zv_softmax", VAE_SOFTMAX_SRC, "vae_softmax", &[&sc, &pr, &u], ((rq as u32).min(65535), (rq as u32).div_ceil(65535), 1))?;
+            // O rows q0.. = P · V (output bound at the chunk's row offset).
+            let a = MmArgs { m: rq as u32, n: cc as u32, k: mp as u32, ldo: cc as u32, ocol: 0, arow: 0, oscale: 1.0, conv: [0; 3] };
+            let g = default_cfg(Epi::F32);
+            if a.n % g.bn != 0 || a.k % g.bk != 0 {
+                return None;
+            }
+            let pipe = mm_pipe(c, g)?;
+            let u = mm_uniform(c, &a);
+            let off = (q0 * cc * 4) as u64;
+            let bgr = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("zv_pv"),
+                layout: &pipe.get_bind_group_layout(0),
+                entries: &[
+                    super::bind_buf(0, &vt16),
+                    super::bind_buf(1, &pr),
+                    super::bind_buf_off(2, &o32, off, (rq * cc * 4) as u64),
+                    super::bind_buf(3, &u),
+                ],
+            });
+            r.calls.push_mm(Class::Io, MmCall { pipe, bg: bgr, grid: (a.n / g.bn, a.m.div_ceil(g.bm)) });
+            q0 += rq;
+        }
+        r.cast(&o32, Some(&at.v.bias), m, mp, cc, &bufs.xn)?;
+        r.conv(&at.o, &bufs.xn, m, 1, false, &bufs.h)?;
+        r.combine(&bufs.x, &bufs.h, &at.o.bias, None, 0, mp * cc, cc)?;
+    }
+    ch = vae_resnet(&mut r, &bufs, &v.mid2, h0, w0, ch)?;
+    let (mut hh, mut ww) = (h0, w0);
+    for (res, upc) in &v.ups {
+        for rs in res {
+            ch = vae_resnet(&mut r, &bufs, rs, hh, ww, ch)?;
+        }
+        if let Some(u) = upc {
+            if u.cin_p != ch {
+                return None;
+            }
+            r.cast(&bufs.x, None, hh * ww, mp_of(hh * ww), ch, &bufs.xn)?;
+            hh *= 2;
+            ww *= 2;
+            r.conv(u, &bufs.xn, hh, ww, true, &bufs.h)?;
+            ch = u.cout_p;
+            r.combine(&bufs.x, &bufs.h, &u.bias, None, 2, mp_of(hh * ww) * ch, ch)?;
+        }
+    }
+    let (m, mp) = (hh * ww, mp_of(hh * ww));
+    if v.conv_out.cin_p != ch || v.conv_out.cout != 3 {
+        return None;
+    }
+    r.gn(&bufs.x, None, &v.norm_out, m, mp, ch, true, &bufs.xn)?;
+    r.conv(&v.conv_out, &bufs.xn, hh, ww, false, &bufs.h)?;
+    let ob = sbuf(c, (3 * m * 4) as u64, "zv_out");
+    let u = ubuf(c, &[m as u32, v.conv_out.cout_p as u32, 0, 0]);
+    r.k("zv_out", VAE_OUT_SRC, "vae_out", &[&bufs.h, &v.conv_out.bias, &ob, &u], grid1(m))?;
+    prof(&format!("vae record ({} dispatches)", r.calls.len()), t0);
+    r.calls.run()?;
+    let raw = read_bytes(c, &ob, (3 * m * 4) as u64)?;
+    out[..3 * m].copy_from_slice(bytemuck::cast_slice(&raw));
+    prof("vae decode", t0);
+    Some(())
 }
