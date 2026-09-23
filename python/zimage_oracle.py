@@ -273,10 +273,36 @@ def cmd_te(args, out, prec):
 # ------------------------------------------------------------------ noise + schedule
 
 
-def noise_for(res):
+def noise_for(res, seed=SEED):
     H, W = RES[res]
-    g = torch.Generator("cpu").manual_seed(SEED)
+    g = torch.Generator("cpu").manual_seed(seed)
     return torch.randn((1, 16, H // 8, W // 8), generator=g, dtype=torch.float32)
+
+
+def cmd_sweep(args, out, prec):
+    """Seed sweep for the E2E quality gate: one prompt, several injected noises,
+    fp32 (CPU) or bf16 (CUDA) images. Single-image PSNR of an 8-step distilled
+    trajectory is chaotic, so the gate compares distributions over seeds."""
+    dev = torch.device("cpu") if prec == "fp32" else torch.device("cuda")
+    dtype = torch.float32 if prec == "fp32" else torch.bfloat16
+    if prec == "fp32":
+        strict_fp32()
+    tr = load_dit(args.root, dtype, dev)
+    vae32 = load_vae(args.root, torch.float32, torch.device("cpu"))
+    ted = te_dir(args)
+    rk = "t8" if args.model == "turbo" else "c3"
+    rc = RECIPES[rk]
+    res, pk = "r512", args.sweep_prompt
+    cap = ted.load("te_%s_%s" % (pk, prec))["h_m2"]
+    ncap = ted.load("te_%s_%s" % (rc["neg"], prec))["h_m2"] if rc["neg"] else None
+    for s in [int(x) for x in args.seeds.split(",")]:
+        n = noise_for(res, s)
+        out.raw_f32("noise_%s_s%d.f32" % (res, s), n)
+        _, rec = manual_run(tr, args.root, cap, ncap, n, dtype, dev, rc)
+        _, img = decode(vae32, rec["lat"][-1].unsqueeze(0), torch.device("cpu"))
+        save_png(os.path.join(out.root, "sweep_%s_%s_%s_s%d_%s.png" % (res, pk, rk, s, prec)), to_u8(img))
+        print("sweep seed", s, prec, flush=True)
+    del tr, vae32
 
 
 def schedule(root, steps, dev):
@@ -694,8 +720,11 @@ def main():
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--threads", type=int, default=14)
     ap.add_argument("--qset", action="store_true", help="also TE-encode the WP4 quality prompts")
+    ap.add_argument("--seeds", default="1,2,3,4,5,6", help="sweep32/sweep16 noise seeds")
+    ap.add_argument("--sweep-prompt", default="p0")
     ap.add_argument("what", nargs="+",
-                    choices=["tok", "te32", "te16", "run32", "run16", "dit32", "dit16", "vae", "full", "bench", "qrun"])
+                    choices=["tok", "te32", "te16", "run32", "run16", "dit32", "dit16", "vae", "full", "bench", "qrun",
+                             "sweep32", "sweep16"])
     args = ap.parse_args()
     args.root = ROOTS[args.model]
     torch.set_num_threads(args.threads)
@@ -735,6 +764,10 @@ def main():
             cmd_full(args, out)
         elif w == "bench":
             cmd_bench(args, out)
+        elif w == "sweep32":
+            cmd_sweep(args, out, "fp32")
+        elif w == "sweep16":
+            cmd_sweep(args, out, "bf16")
         elif w == "qrun":
             qs = [("r512", q, "t8") for q in QSET] if args.model == "turbo" else [("r512", q, "c28") for q in QSET]
             for q in QSET:
