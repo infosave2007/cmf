@@ -3475,6 +3475,119 @@ kernel void NAME( \
 GDN_STATE_B_KERNEL(gdn_state_b64, 64u)
 GDN_STATE_B_KERNEL(gdn_state_b128, 128u)
 
+// The 4-lane re-tile of `gdn_state_b_impl`: each S column is split over
+// 4 CONSECUTIVE lanes of one simdgroup (lane p owns the rows di ≡ p mod
+// 4, DK/4 floats in registers), so a V head runs 4·dv threads (16
+// simdgroups at dv=128) instead of dv — four times the state loads in
+// flight and a quarter of the live registers a thread, which is what
+// the 151 MB state pass of the verify was short of (measured 10.8 GB/s
+// with 48 × 128 threads on the M4). The kv and o dots are 4 partial sums
+// joined by a 2-step xor butterfly; every lane of the column ends with
+// the bit-identical total (float addition commutes), so delta and the
+// update are the same in all 4 lanes and the verify (mode 1) and the
+// replay (mode 2) still walk ONE state trajectory. The interleaved row
+// split (4i+p, not p·DK/4+i) keeps the kq broadcast reads on 4 distinct
+// threadgroup-memory banks. Otherwise term for term gdn_state_b_impl —
+// the only numeric change is the order of the two DK-long sums (and of
+// the ss row sum, now 16 simdgroup partials). CMF_METAL_STATE4=0 keeps
+// the old kernel on both the verify/replay and the plain-token path.
+template <uint DK>
+inline void gdn_state_b4_impl(
+    device float* S, device const float* cq, device const float* z,
+    device const float* g, device const float* beta,
+    device const float* invq, device const float* invk,
+    device const float* gnorm, device float* of,
+    uint nv, uint nk, uint dv, uint c_dim, uint nb, uint mode, float eps,
+    threadgroup float* part, uint h, uint tid, uint lane, uint sg)
+{
+    constexpr uint DQ = DK / 4u;
+    uint dj = tid >> 2;
+    uint p = tid & 3u;
+    uint nthr = dv * 4u;
+    uint rep = nv / nk;
+    uint ko = h / rep;
+    uint kd = nk * DK;
+    uint vd = nv * dv;
+    device float* s = S + (ulong)h * DK * dv;
+    float sc[DQ];
+    #pragma clang loop unroll(full)
+    for (uint i = 0u; i < DQ; ++i) sc[i] = s[(4u * i + p) * dv + dj];
+    threadgroup float* kq = part + 32;
+    for (uint e = 0u; e < nb; ++e) {
+        device const float* cqe = cq + (ulong)e * c_dim;
+        float gh = g[e * nv + h];
+        float bh = beta[e * nv + h];
+        float iq = invq[e * nk + ko];
+        float ik = invk[e * nk + ko];
+        float vt = cqe[2u * kd + h * dv + dj];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint di = tid; di < DK; di += nthr) {
+            kq[di] = cqe[kd + ko * DK + di] * ik;
+            kq[DK + di] = cqe[ko * DK + di] * iq;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float kv = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint i = 0u; i < DQ; ++i) kv += kq[4u * i + p] * sc[i];
+        kv += simd_shuffle_xor(kv, 1u);
+        kv += simd_shuffle_xor(kv, 2u);
+        float delta = (vt - gh * kv) * bh;
+        float o = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint i = 0u; i < DQ; ++i) {
+            float cell = gh * sc[i] + kq[4u * i + p] * delta;
+            sc[i] = cell;
+            o += kq[DK + 4u * i + p] * cell;
+        }
+        if (mode & 1u) {
+            o += simd_shuffle_xor(o, 1u);
+            o += simd_shuffle_xor(o, 2u);
+            float ss = simd_sum(p == 0u ? o * o : 0.0f);
+            if (lane == 0) part[sg] = ss;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float tot = 0.0f;
+            for (uint k2 = 0; k2 < (nthr + 31u) / 32u; ++k2) tot += part[k2];
+            float inv = rsqrt(tot / (float)dv + eps);
+            if (p == 0u) {
+                float zz = z[(ulong)e * vd + h * dv + dj];
+                of[(ulong)e * vd + h * dv + dj] = o * inv * gnorm[dj] * (zz / (1.0f + exp(-zz)));
+            }
+        }
+    }
+    if (mode & 2u) {
+        #pragma clang loop unroll(full)
+        for (uint i = 0u; i < DQ; ++i) s[(4u * i + p) * dv + dj] = sc[i];
+    }
+}
+#define GDN_STATE_B4_KERNEL(NAME, DK) \
+kernel void NAME( \
+    device float*       S     [[buffer(0)]], \
+    device const float* cq    [[buffer(1)]], \
+    device const float* z     [[buffer(2)]], \
+    device const float* g     [[buffer(3)]], \
+    device const float* beta  [[buffer(4)]], \
+    device const float* invq  [[buffer(5)]], \
+    device const float* invk  [[buffer(6)]], \
+    device const float* gnorm [[buffer(7)]], \
+    device float*       of    [[buffer(8)]], \
+    constant uint&      nv    [[buffer(9)]], \
+    constant uint&      nk    [[buffer(10)]], \
+    constant uint&      dv    [[buffer(11)]], \
+    constant uint&      c_dim [[buffer(12)]], \
+    constant uint&      nb    [[buffer(13)]], \
+    constant uint&      mode  [[buffer(14)]], \
+    constant float&     eps   [[buffer(15)]], \
+    uint h    [[threadgroup_position_in_grid]], \
+    uint tid  [[thread_position_in_threadgroup]], \
+    uint lane [[thread_index_in_simdgroup]], \
+    uint sg   [[simdgroup_index_in_threadgroup]]) \
+{ \
+    threadgroup float part[32 + 2 * DK]; \
+    gdn_state_b4_impl<DK>(S, cq, z, g, beta, invq, invk, gnorm, of, nv, nk, dv, c_dim, nb, mode, eps, part, h, tid, lane, sg); \
+}
+GDN_STATE_B4_KERNEL(gdn_state_b4_64, 64u)
+GDN_STATE_B4_KERNEL(gdn_state_b4_128, 128u)
+
 // kv_append over nb positions: row e lands at index stored + e.
 kernel void kv_append_b(
     device const float* k    [[buffer(0)]],   // [nb][nkv·hd]
@@ -6128,6 +6241,8 @@ struct Ctx {
     gdnqknb: ComputePipelineState,
     gdnstb64: ComputePipelineState,
     gdnstb128: ComputePipelineState,
+    gdnstb4_64: ComputePipelineState,
+    gdnstb4_128: ComputePipelineState,
     kvappb: ComputePipelineState,
     gqablk: ComputePipelineState,
     gqacomb: ComputePipelineState,
@@ -6352,6 +6467,8 @@ fn init() -> Result<Ctx, String> {
     let gdnqknb = pso("gdn_qk_norms_b")?;
     let gdnstb64 = pso("gdn_state_b64")?;
     let gdnstb128 = pso("gdn_state_b128")?;
+    let gdnstb4_64 = pso("gdn_state_b4_64")?;
+    let gdnstb4_128 = pso("gdn_state_b4_128")?;
     let kvappb = pso("kv_append_b")?;
     let gqablk = pso("gqa_attend_blk")?;
     let gqacomb = pso("gqa_combine")?;
@@ -6448,6 +6565,8 @@ fn init() -> Result<Ctx, String> {
         gdnqknb,
         gdnstb64,
         gdnstb128,
+        gdnstb4_64,
+        gdnstb4_128,
         kvappb,
         gqablk,
         gqacomb,
@@ -12176,6 +12295,105 @@ fn io_buf(c: &Ctx, key: usize, nbytes: usize) -> Buffer {
         .clone()
 }
 
+/// CMF_METAL_STATE4=0 keeps the one-thread-per-column GDN state kernel
+/// (`gdn_state_b64/128`, `gdn_state_update`); the default is the 4-lane
+/// re-tile (`gdn_state_b4_*`) on the verify, the replay and the plain
+/// token alike.
+fn state4_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_METAL_STATE4").as_deref() != Ok("0"))
+}
+
+/// The 4-lane state kernel for `cfg`, or None where it does not apply
+/// (DK outside {64, 128}, or 4·dv threads over the pipeline's ceiling).
+fn state4_pso<'a>(c: &'a Ctx, cfg: &GdnGpuCfg) -> Option<&'a ComputePipelineState> {
+    let pso = match cfg.dk {
+        64 => &c.gdnstb4_64,
+        128 => &c.gdnstb4_128,
+        _ => return None,
+    };
+    let threads = (cfg.dv * 4) as u64;
+    let fits = cfg.dv % 8 == 0 && threads <= pso.max_total_threads_per_threadgroup();
+    if !fits {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                "metal: 4-lane GDN state kernel declined (dv={} → {threads} threads, ceiling {}); \
+                 using the one-thread-per-column kernel",
+                cfg.dv,
+                pso.max_total_threads_per_threadgroup()
+            );
+        });
+    }
+    fits.then_some(pso)
+}
+
+/// The GDN recurrence over `n_pos` positions of the [nb][·] batch
+/// buffers into ONE open encoder: `s_b` at `s_off` bytes is the [nv][DK]
+/// [dv] state, `mode` bit 0 emits the gated-normed outputs into `of`, bit
+/// 1 writes the final state back. `legacy` selects the one-thread-per-
+/// column kernel (nv × dv threads); otherwise the 4-lane re-tile (nv ×
+/// 4·dv) where it applies. Both callers of a speculative round — the
+/// verify and the replay — and the parity test come through here.
+#[allow(clippy::too_many_arguments)]
+fn encode_gdn_state_b(
+    c: &Ctx,
+    enc: &metal::ComputeCommandEncoderRef,
+    s_b: &Buffer,
+    s_off: u64,
+    cq: &Buffer,
+    z: &Buffer,
+    g: &Buffer,
+    beta: &Buffer,
+    iq: &Buffer,
+    ik: &Buffer,
+    gnorm: &Buffer,
+    of: &Buffer,
+    cfg: &GdnGpuCfg,
+    n_pos: usize,
+    mode: u32,
+    legacy: bool,
+) {
+    let fast = if legacy { None } else { state4_pso(c, cfg) };
+    let (pso, threads) = match fast {
+        Some(p) => (p, (cfg.dv * 4) as u64),
+        None => (
+            if cfg.dk == 64 {
+                &c.gdnstb64
+            } else {
+                &c.gdnstb128
+            },
+            cfg.dv as u64,
+        ),
+    };
+    enc.set_compute_pipeline_state(pso);
+    enc.set_buffer(0, Some(s_b), s_off);
+    enc.set_buffer(1, Some(cq), 0);
+    enc.set_buffer(2, Some(z), 0);
+    enc.set_buffer(3, Some(g), 0);
+    enc.set_buffer(4, Some(beta), 0);
+    enc.set_buffer(5, Some(iq), 0);
+    enc.set_buffer(6, Some(ik), 0);
+    enc.set_buffer(7, Some(gnorm), 0);
+    enc.set_buffer(8, Some(of), 0);
+    let w = [
+        cfg.nv as u32,
+        cfg.nk as u32,
+        cfg.dv as u32,
+        cfg.c_dim as u32,
+        n_pos as u32,
+        mode,
+    ];
+    for (i, v) in w.iter().enumerate() {
+        enc.set_bytes(9 + i as u64, 4, v as *const u32 as *const std::ffi::c_void);
+    }
+    enc.set_bytes(15, 4, &cfg.eps as *const f32 as *const std::ffi::c_void);
+    enc.dispatch_thread_groups(
+        MTLSize::new(cfg.nv as u64, 1, 1),
+        MTLSize::new(threads, 1, 1),
+    );
+}
+
 /// Small constant vectors (norms, inv_freq, biases) cached by data
 /// pointer + length, fingerprint-checked: these slices point into the
 /// model's mmap, and a reloaded model maps where the dropped one was —
@@ -14256,8 +14474,31 @@ impl TokenGraph {
                     MTLSize::new(sgs * 32, 1, 1),
                 );
             }
-            // 5. recurrence + gated norm → of
-            {
+            // 5. recurrence + gated norm → of. The 4-lane batched kernel
+            //    at nb = 1, mode 3 IS `gdn_state_update` term for term
+            //    (row 0 of every [nb][·] buffer is the plain layout), and
+            //    reads S once instead of twice; the plain token and the
+            //    verify then share one arithmetic.
+            if state4_on() && state4_pso(c, cfg).is_some() {
+                encode_gdn_state_b(
+                    c,
+                    enc,
+                    sb,
+                    s_off,
+                    &cq_b,
+                    &z_b,
+                    &g_b,
+                    &bt_b,
+                    &iq_b,
+                    &ik_b,
+                    &vec_buf(l.gnorm),
+                    &of_b,
+                    cfg,
+                    1,
+                    3,
+                    false,
+                );
+            } else {
                 enc.set_compute_pipeline_state(&c.stateup);
                 enc.set_buffer(0, Some(sb), s_off);
                 enc.set_buffer(1, Some(&cq_b), 0);
@@ -15213,36 +15454,26 @@ impl VerifyGraph {
         n_pos: usize,
         mode: u32,
     ) {
-        let pso = if cfg.dk == 64 {
-            &c.gdnstb64
-        } else {
-            &c.gdnstb128
-        };
-        enc.set_compute_pipeline_state(pso);
-        enc.set_buffer(0, Some(s_b), (ring_len * 4) as u64);
-        enc.set_buffer(1, Some(cq), 0);
-        enc.set_buffer(2, Some(z), 0);
-        enc.set_buffer(3, Some(g), 0);
-        enc.set_buffer(4, Some(beta), 0);
-        enc.set_buffer(5, Some(iq), 0);
-        enc.set_buffer(6, Some(ik), 0);
-        enc.set_buffer(7, Some(gnorm), 0);
-        enc.set_buffer(8, Some(of), 0);
-        let w = [
-            cfg.nv as u32,
-            cfg.nk as u32,
-            cfg.dv as u32,
-            cfg.c_dim as u32,
-            n_pos as u32,
+        // The verify (mode 1) and the replay of the accepted prefix
+        // (mode 2) both come through here: one kernel, one geometry, so
+        // the replayed trajectory is the verified one bit for bit.
+        encode_gdn_state_b(
+            c,
+            enc,
+            s_b,
+            (ring_len * 4) as u64,
+            cq,
+            z,
+            g,
+            beta,
+            iq,
+            ik,
+            gnorm,
+            of,
+            cfg,
+            n_pos,
             mode,
-        ];
-        for (i, v) in w.iter().enumerate() {
-            enc.set_bytes(9 + i as u64, 4, v as *const u32 as *const std::ffi::c_void);
-        }
-        enc.set_bytes(15, 4, &cfg.eps as *const f32 as *const std::ffi::c_void);
-        enc.dispatch_thread_groups(
-            MTLSize::new(cfg.nv as u64, 1, 1),
-            MTLSize::new(cfg.dv as u64, 1, 1),
+            !state4_on(),
         );
     }
 
@@ -15811,6 +16042,327 @@ mod tests {
         CMF_VERSION, CmfHeader, CmfModel, LayerType, ModelArch, NormStyle, QuantType, TensorDtype,
         TensorSpec,
     };
+
+    /// Deterministic pseudo-random floats in [lo, hi).
+    fn lcg_fill(seed: &mut u64, n: usize, lo: f32, hi: f32) -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let u = ((*seed >> 40) as f32) / ((1u64 << 24) as f32);
+                lo + (hi - lo) * u
+            })
+            .collect()
+    }
+
+    /// Synthetic inputs of one GDN layer over `nb` positions in the
+    /// [nb][·] batch layout the state kernels read: q|k|v rows of `cq`,
+    /// per-(position, head) gates, per-(position, K head) norm inverses
+    /// as `gdn_qk_norms_b` would compute them.
+    struct GdnStateCase {
+        cfg: GdnGpuCfg,
+        nb: usize,
+        ring: usize,
+        s0: Vec<f32>,
+        cq: Vec<f32>,
+        z: Vec<f32>,
+        g: Vec<f32>,
+        beta: Vec<f32>,
+        iq: Vec<f32>,
+        ik: Vec<f32>,
+        gnorm: Vec<f32>,
+    }
+
+    fn gdn_state_case(dk: usize, nb: usize, seed: u64) -> GdnStateCase {
+        let (nv, nk, dv) = (4usize, 2usize, 128usize);
+        let kd = nk * dk;
+        let c_dim = 2 * kd + nv * dv;
+        let cfg = GdnGpuCfg {
+            nv,
+            nk,
+            dk,
+            dv,
+            kk: 4,
+            hidden: 64,
+            inter: 64,
+            c_dim,
+            eps: 1e-6,
+            gemma: false,
+        };
+        let mut sd = seed;
+        let ring = 3 * c_dim;
+        let s0 = lcg_fill(&mut sd, ring + nv * dk * dv, -0.5, 0.5);
+        let cq = lcg_fill(&mut sd, nb * c_dim, -1.0, 1.0);
+        let z = lcg_fill(&mut sd, nb * nv * dv, -2.0, 2.0);
+        let g = lcg_fill(&mut sd, nb * nv, 0.85, 0.999);
+        let beta = lcg_fill(&mut sd, nb * nv, 0.2, 0.9);
+        let gnorm = lcg_fill(&mut sd, dv, 0.5, 1.5);
+        let mut iq = vec![0f32; nb * nk];
+        let mut ik = vec![0f32; nb * nk];
+        for e in 0..nb {
+            for h in 0..nk {
+                let row = &cq[e * c_dim..(e + 1) * c_dim];
+                let nq: f32 = row[h * dk..(h + 1) * dk].iter().map(|v| v * v).sum();
+                let nkn: f32 = row[kd + h * dk..kd + (h + 1) * dk].iter().map(|v| v * v).sum();
+                iq[e * nk + h] = 1.0 / ((nq + 1e-6).sqrt() * (dk as f32).sqrt());
+                ik[e * nk + h] = 1.0 / (nkn + 1e-6).sqrt();
+            }
+        }
+        GdnStateCase { cfg, nb, ring, s0, cq, z, g, beta, iq, ik, gnorm }
+    }
+
+    /// f64 reference of the recurrence over the first `n_pos` positions:
+    /// returns (state after, outputs [n_pos][nv·dv]).
+    fn gdn_state_reference(t: &GdnStateCase, n_pos: usize) -> (Vec<f32>, Vec<f32>) {
+        let c = &t.cfg;
+        let (nv, nk, dk, dv) = (c.nv, c.nk, c.dk, c.dv);
+        let kd = nk * dk;
+        let rep = nv / nk;
+        let mut s: Vec<f64> = t.s0[t.ring..].iter().map(|&v| v as f64).collect();
+        let mut of = vec![0f32; n_pos * nv * dv];
+        for e in 0..n_pos {
+            let row = &t.cq[e * c.c_dim..(e + 1) * c.c_dim];
+            for h in 0..nv {
+                let ko = h / rep;
+                let gh = t.g[e * nv + h] as f64;
+                let bh = t.beta[e * nv + h] as f64;
+                let iq = t.iq[e * nk + ko] as f64;
+                let ik = t.ik[e * nk + ko] as f64;
+                let sh = &mut s[h * dk * dv..(h + 1) * dk * dv];
+                let mut o = vec![0f64; dv];
+                for dj in 0..dv {
+                    let vt = row[2 * kd + h * dv + dj] as f64;
+                    let mut kv = 0f64;
+                    for di in 0..dk {
+                        kv += row[kd + ko * dk + di] as f64 * ik * sh[di * dv + dj];
+                    }
+                    let delta = (vt - gh * kv) * bh;
+                    for di in 0..dk {
+                        let kf = row[kd + ko * dk + di] as f64 * ik;
+                        let qf = row[ko * dk + di] as f64 * iq;
+                        let cell = gh * sh[di * dv + dj] + kf * delta;
+                        sh[di * dv + dj] = cell;
+                        o[dj] += qf * cell;
+                    }
+                }
+                let tot: f64 = o.iter().map(|v| v * v).sum();
+                let inv = 1.0 / (tot / dv as f64 + c.eps as f64).sqrt();
+                for dj in 0..dv {
+                    let zz = t.z[e * nv * dv + h * dv + dj] as f64;
+                    of[e * nv * dv + h * dv + dj] =
+                        (o[dj] * inv * t.gnorm[dj] as f64 * (zz / (1.0 + (-zz).exp()))) as f32;
+                }
+            }
+        }
+        let mut s_out = t.s0.clone();
+        for (d, v) in s_out[t.ring..].iter_mut().zip(&s) {
+            *d = *v as f32;
+        }
+        (s_out, of)
+    }
+
+    fn shared_f32(c: &Ctx, data: &[f32]) -> Buffer {
+        c._device.new_buffer_with_data(
+            data.as_ptr() as *const std::ffi::c_void,
+            (data.len().max(1) * 4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+
+    fn read_f32(b: &Buffer, n: usize) -> Vec<f32> {
+        unsafe { std::slice::from_raw_parts(b.contents() as *const f32, n).to_vec() }
+    }
+
+    /// One state pass on the device: `which` = 0 the 4-lane kernel, 1 the
+    /// legacy batched kernel, 2 the legacy plain-token kernel (nb = 1,
+    /// mode 3 by construction). Returns (whole state buffer, outputs).
+    fn gdn_state_device(
+        c: &Ctx,
+        t: &GdnStateCase,
+        which: u32,
+        n_pos: usize,
+        mode: u32,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let cfg = &t.cfg;
+        let s_b = shared_f32(c, &t.s0);
+        let cq = shared_f32(c, &t.cq);
+        let z = shared_f32(c, &t.z);
+        let g = shared_f32(c, &t.g);
+        let beta = shared_f32(c, &t.beta);
+        let iq = shared_f32(c, &t.iq);
+        let ik = shared_f32(c, &t.ik);
+        let gnorm = shared_f32(c, &t.gnorm);
+        let n_of = t.nb * cfg.nv * cfg.dv;
+        let of = shared_f32(c, &vec![f32::NAN; n_of]);
+        let cmd = c.queue.new_command_buffer().to_owned();
+        let enc = cmd.new_compute_command_encoder();
+        let s_off = (t.ring * 4) as u64;
+        if which == 2 {
+            assert_eq!((n_pos, mode), (1, 3));
+            enc.set_compute_pipeline_state(&c.stateup);
+            enc.set_buffer(0, Some(&s_b), s_off);
+            for (i, b) in [&cq, &z, &g, &beta, &iq, &ik, &gnorm, &of].iter().enumerate() {
+                enc.set_buffer(1 + i as u64, Some(*b), 0);
+            }
+            let w4 = [cfg.nv as u32, cfg.nk as u32, cfg.dk as u32, cfg.dv as u32];
+            for (i, w) in w4.iter().enumerate() {
+                enc.set_bytes(9 + i as u64, 4, w as *const u32 as *const std::ffi::c_void);
+            }
+            enc.set_bytes(13, 4, &cfg.eps as *const f32 as *const std::ffi::c_void);
+            enc.dispatch_thread_groups(
+                MTLSize::new(cfg.nv as u64, 1, 1),
+                MTLSize::new(cfg.dv as u64, 1, 1),
+            );
+        } else {
+            encode_gdn_state_b(
+                c, enc, &s_b, s_off, &cq, &z, &g, &beta, &iq, &ik, &gnorm, &of, cfg, n_pos, mode,
+                which == 1,
+            );
+        }
+        enc.end_encoding();
+        cmd.commit();
+        wait_fast_checked(&cmd).expect("gdn state pass");
+        (read_f32(&s_b, t.s0.len()), read_f32(&of, n_of))
+    }
+
+    /// max over elements of |a−b| / max(|b|, 1e-2·max|b|).
+    fn rel_max(a: &[f32], b: &[f32]) -> f64 {
+        assert_eq!(a.len(), b.len());
+        let floor = b.iter().fold(0f64, |m, v| m.max(v.abs() as f64)) * 1e-2;
+        a.iter()
+            .zip(b)
+            .map(|(&x, &y)| (x as f64 - y as f64).abs() / (y.abs() as f64).max(floor))
+            .fold(0f64, f64::max)
+    }
+
+    /// The verify's state pass at the Qwen3.8-27B shape (48 layers × 48
+    /// V heads, DK = DV = 128, 151 MB of state, nb = 8) — legacy kernel
+    /// against the 4-lane re-tile, one command buffer per pass like the
+    /// VerifyGraph; prints ms and GB/s. Synthetic state, no model.
+    /// `cargo test -p cortiq-engine --release --features gpu --lib \
+    ///   gdn_state4_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore = "timing probe; run explicitly on a quiet machine"]
+    fn gdn_state4_bench_27b_shape() {
+        unsafe { std::env::set_var("CMF_GPU", "1") };
+        if !enabled() {
+            eprintln!("gpu test skipped: no Metal device");
+            return;
+        }
+        let c = ctx().unwrap();
+        let (layers, nv, nk, dk, dv, nb) = (48usize, 48usize, 16usize, 128usize, 128usize, 8usize);
+        let kd = nk * dk;
+        let c_dim = 2 * kd + nv * dv;
+        let cfg = GdnGpuCfg {
+            nv,
+            nk,
+            dk,
+            dv,
+            kk: 4,
+            hidden: 64,
+            inter: 64,
+            c_dim,
+            eps: 1e-6,
+            gemma: false,
+        };
+        let mut sd = 7u64;
+        let states: Vec<Buffer> = (0..layers)
+            .map(|_| shared_f32(c, &lcg_fill(&mut sd, nv * dk * dv, -0.5, 0.5)))
+            .collect();
+        let cq = shared_f32(c, &lcg_fill(&mut sd, nb * c_dim, -1.0, 1.0));
+        let z = shared_f32(c, &lcg_fill(&mut sd, nb * nv * dv, -2.0, 2.0));
+        let g = shared_f32(c, &lcg_fill(&mut sd, nb * nv, 0.85, 0.999));
+        let beta = shared_f32(c, &lcg_fill(&mut sd, nb * nv, 0.2, 0.9));
+        let iq = shared_f32(c, &lcg_fill(&mut sd, nb * nk, 0.05, 0.1));
+        let ik = shared_f32(c, &lcg_fill(&mut sd, nb * nk, 0.5, 1.0));
+        let gnorm = shared_f32(c, &lcg_fill(&mut sd, dv, 0.5, 1.5));
+        let of = shared_f32(c, &vec![0f32; nb * nv * dv]);
+        let bytes = (layers * nv * dk * dv * 4) as f64;
+        let pass = |legacy: bool, n_pos: usize, mode: u32| -> f64 {
+            let cmd = c.queue.new_command_buffer().to_owned();
+            let enc = cmd.new_compute_command_encoder();
+            for s_b in &states {
+                encode_gdn_state_b(
+                    c, enc, s_b, 0, &cq, &z, &g, &beta, &iq, &ik, &gnorm, &of, &cfg, n_pos, mode,
+                    legacy,
+                );
+            }
+            enc.end_encoding();
+            let t0 = std::time::Instant::now();
+            cmd.commit();
+            cmd.wait_until_completed();
+            t0.elapsed().as_secs_f64() * 1e3
+        };
+        for (label, n_pos, mode) in [("verify  nb=8 mode 1", nb, 1u32), ("replay  n=5 mode 2", 5, 2)] {
+            for legacy in [true, false] {
+                let mut ts: Vec<f64> = (0..7).map(|_| pass(legacy, n_pos, mode)).collect();
+                ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let (min, med) = (ts[0], ts[3]);
+                let rd = if mode & 2 == 2 { 2.0 } else { 1.0 };
+                eprintln!(
+                    "gdn_state4 bench {label} {}: min {min:.2} ms  median {med:.2} ms  ({:.1} GB/s at median, {} traffic)",
+                    if legacy { "legacy 1-lane" } else { "4-lane       " },
+                    bytes * rd / (med * 1e-3) / 1e9,
+                    if rd == 2.0 { "read+write" } else { "read" },
+                );
+            }
+        }
+    }
+
+    /// The 4-lane GDN state kernel (`gdn_state_b4_*`, CMF_METAL_STATE4)
+    /// against the legacy one-thread-per-column kernels and an f64
+    /// reference: same trajectory to 1e-4 relative at DK = 64 and 128,
+    /// nb = 1 (the plain-token twin `gdn_state_update` included) and
+    /// nb = 8; the verify (mode 1) leaves S alone; the replay (mode 2)
+    /// and the prefill fold (mode 3) write the bit-identical state.
+    #[test]
+    fn gdn_state4_matches_legacy_and_reference() {
+        unsafe { std::env::set_var("CMF_GPU", "1") };
+        if !enabled() {
+            eprintln!("gpu test skipped: no Metal device");
+            return;
+        }
+        let c = ctx().unwrap();
+        const TOL: f64 = 1e-4;
+        for (dk, nb) in [(128usize, 8usize), (64, 8), (128, 1), (64, 1)] {
+            let t = gdn_state_case(dk, nb, 0x9e37_79b9_7f4a_7c15 ^ (dk * 131 + nb) as u64);
+            assert!(state4_pso(c, &t.cfg).is_some(), "dk={dk}: 4-lane kernel not applicable");
+            let (s_ref, of_ref) = gdn_state_reference(&t, nb);
+            let (s_new, of_new) = gdn_state_device(c, &t, 0, nb, 3);
+            let (s_old, of_old) = gdn_state_device(c, &t, 1, nb, 3);
+            assert_eq!(&s_new[..t.ring], &t.s0[..t.ring], "dk={dk} nb={nb}: ring prefix touched");
+            let (rs_new, ro_new) = (rel_max(&s_new, &s_ref), rel_max(&of_new, &of_ref));
+            let (rs_old, ro_old) = (rel_max(&s_old, &s_ref), rel_max(&of_old, &of_ref));
+            let (rs_x, ro_x) = (rel_max(&s_new, &s_old), rel_max(&of_new, &of_old));
+            eprintln!(
+                "gdn_state4 dk={dk} nb={nb}: new vs ref S {rs_new:.2e} of {ro_new:.2e} | \
+                 old vs ref S {rs_old:.2e} of {ro_old:.2e} | new vs old S {rs_x:.2e} of {ro_x:.2e}"
+            );
+            assert!(rs_new <= TOL && ro_new <= TOL, "dk={dk} nb={nb}: new kernel vs reference");
+            assert!(rs_old <= TOL && ro_old <= TOL, "dk={dk} nb={nb}: legacy kernel vs reference");
+            assert!(rs_x <= TOL && ro_x <= TOL, "dk={dk} nb={nb}: new vs legacy kernel");
+            if nb == 1 {
+                let (s_pl, of_pl) = gdn_state_device(c, &t, 2, 1, 3);
+                let (rs, ro) = (rel_max(&s_new, &s_pl), rel_max(&of_new, &of_pl));
+                eprintln!("gdn_state4 dk={dk} plain: new vs gdn_state_update S {rs:.2e} of {ro:.2e}");
+                assert!(rs <= TOL && ro <= TOL, "dk={dk}: new kernel vs plain gdn_state_update");
+            } else {
+                // verify: outputs only, S untouched
+                let (s_v, of_v) = gdn_state_device(c, &t, 0, nb, 1);
+                assert_eq!(s_v, t.s0, "dk={dk}: mode 1 wrote the state");
+                assert_eq!(of_v, of_new, "dk={dk}: mode 1 outputs differ from mode 3");
+                // replay of an accepted prefix == the same prefix folded with
+                // outputs (one kernel, one order) and == the reference
+                let n_acc = 5;
+                let (s_r, _) = gdn_state_device(c, &t, 0, n_acc, 2);
+                let (s_f, _) = gdn_state_device(c, &t, 0, n_acc, 3);
+                assert_eq!(s_r, s_f, "dk={dk}: replay (mode 2) and fold (mode 3) states differ");
+                let (s_ref5, _) = gdn_state_reference(&t, n_acc);
+                let r5 = rel_max(&s_r, &s_ref5);
+                eprintln!("gdn_state4 dk={dk} replay of {n_acc}: vs ref S {r5:.2e}");
+                assert!(r5 <= TOL, "dk={dk}: replayed state vs reference");
+            }
+        }
+    }
 
     /// GPU kernel == CPU path on an lm_head-class q8_row tensor over
     /// a REAL mmap (no-copy buffer). Skipped without a Metal device.
