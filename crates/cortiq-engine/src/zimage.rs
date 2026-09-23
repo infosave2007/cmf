@@ -1238,6 +1238,23 @@ impl ZImageDit {
         mods_all: Option<(&[f32], &[f32])>,
         device: bool,
     ) -> Result<ZPrepared, String> {
+        let mut p = self.prepare_host(cap_feats, shape, key, device)?;
+        if device {
+            self.attach_device(&mut p, mods_all);
+        }
+        Ok(p)
+    }
+
+    /// The host half of `prepare`: caption embed → context refiner
+    /// (`gpu::zimage_refine_caption` when `device_refine`, else CPU) →
+    /// rope tables. `device` is false until `attach_device`.
+    pub fn prepare_host(
+        &self,
+        cap_feats: &[f32],
+        shape: ZShape,
+        key: u64,
+        device_refine: bool,
+    ) -> Result<ZPrepared, String> {
         if cap_feats.len() != shape.l * self.cfg.cap_feat_dim || shape.l == 0 {
             return Err(format!(
                 "caption features: {} floats for {} tokens of {}",
@@ -1248,7 +1265,7 @@ impl ZImageDit {
         }
         let rope = ids_and_rope(shape.grid, shape.l, self.cfg.rope_theta, self.cfg.axes_dims);
         let mut cap = self.embed_caption(cap_feats, shape.l);
-        let refs = if device { self.block_refs() } else { None };
+        let refs = if device_refine { self.block_refs() } else { None };
         let geom = self.geom();
         let dev_refined = match (&refs, &self.model) {
             (Some(r), Some(m)) => crate::gpu::zimage_refine_caption(
@@ -1263,37 +1280,113 @@ impl ZImageDit {
         if !dev_refined {
             self.refine_caption_cpu(&mut cap, (&rope.cap.0, &rope.cap.1));
         }
-        let device = match (&refs, &self.model) {
-            (Some(r), Some(m)) => crate::gpu::zimage_prepare(&crate::gpu::ZPrepareArgs {
-                model: m,
-                geom,
-                key,
-                n_img: shape.n_img,
-                n_img_p: shape.n_img_p,
-                n_cap_p: shape.l_p,
-                grid: shape.grid,
-                cap: &cap,
-                rope_img: (&rope.img.0, &rope.img.1),
-                rope_joint: (&rope.joint.0, &rope.joint.1),
-                x_emb_w: &self.x_emb_w,
-                x_emb_b: &self.x_emb_b,
-                x_pad: &self.x_pad,
-                final_w: &self.final_w,
-                final_b: &self.final_b,
-                noise_refiner: &r.noise_refiner,
-                layers: &r.layers,
-                mods_all: mods_all.map(|m| m.0),
-                final_scale_all: mods_all.map(|m| m.1),
-            }),
-            _ => false,
-        };
         Ok(ZPrepared {
             key,
             shape,
             cap,
             rope,
-            device,
+            device: false,
         })
+    }
+
+    fn prepare_args<'a>(
+        &'a self,
+        m: &'a Arc<CmfModel>,
+        r: &'a ZBlockRefs<'a>,
+        p: &'a ZPrepared,
+        key: u64,
+        mods_all: Option<(&'a [f32], &'a [f32])>,
+        neg: Option<&'a ZPrepared>,
+    ) -> crate::gpu::ZPrepareArgs<'a> {
+        let shape = p.shape;
+        crate::gpu::ZPrepareArgs {
+            model: m,
+            geom: self.geom(),
+            key,
+            n_img: shape.n_img,
+            n_img_p: shape.n_img_p,
+            n_cap_p: shape.l_p,
+            grid: shape.grid,
+            cap: &p.cap,
+            rope_img: (&p.rope.img.0, &p.rope.img.1),
+            rope_joint: (&p.rope.joint.0, &p.rope.joint.1),
+            x_emb_w: &self.x_emb_w,
+            x_emb_b: &self.x_emb_b,
+            x_pad: &self.x_pad,
+            final_w: &self.final_w,
+            final_b: &self.final_b,
+            noise_refiner: &r.noise_refiner,
+            layers: &r.layers,
+            mods_all: mods_all.map(|m| m.0),
+            final_scale_all: mods_all.map(|m| m.1),
+            neg: neg.map(|n| crate::gpu::ZNegArgs {
+                cap: &n.cap,
+                n_cap_p: n.shape.l_p,
+                rope_img: (&n.rope.img.0, &n.rope.img.1),
+                rope_joint: (&n.rope.joint.0, &n.rope.joint.1),
+            }),
+        }
+    }
+
+    /// `gpu::zimage_prepare` for a host state (sets `p.device`).
+    pub fn attach_device(&self, p: &mut ZPrepared, mods_all: Option<(&[f32], &[f32])>) -> bool {
+        let refs = self.block_refs();
+        p.device = match (&refs, &self.model) {
+            (Some(r), Some(m)) => {
+                crate::gpu::zimage_prepare(&self.prepare_args(m, r, p, p.key, mods_all, None))
+            }
+            _ => false,
+        };
+        p.device
+    }
+
+    /// One batch-2 device program for a CFG pair (item 0 = `pos`, item 1 =
+    /// `neg`, both at the same resolution) under `key`. `false` = the
+    /// backend has no batch 2 here; the caller steps the items one by one.
+    pub fn attach_device_pair(
+        &self,
+        pos: &ZPrepared,
+        neg: &ZPrepared,
+        key: u64,
+        mods_all: Option<(&[f32], &[f32])>,
+    ) -> bool {
+        if pos.shape.grid != neg.shape.grid {
+            return false;
+        }
+        let refs = self.block_refs();
+        match (&refs, &self.model) {
+            (Some(r), Some(m)) => {
+                crate::gpu::zimage_prepare(&self.prepare_args(m, r, pos, key, mods_all, Some(neg)))
+            }
+            _ => false,
+        }
+    }
+
+    /// Both items of a CFG pair prepared by `attach_device_pair` under
+    /// `key`, in one device forward: returns (v_pos, v_neg), or None when
+    /// the backend declined (the caller steps the items separately).
+    pub fn step_pair_device(
+        &self,
+        key: u64,
+        n_img: usize,
+        step: usize,
+        x_tok: &[f32],
+        mods: &[f32],
+        final_scale: &[f32],
+    ) -> Option<(Vec<f32>, Vec<f32>)> {
+        let pd = self.geom().patch_dim;
+        let mut out = vec![0f32; n_img * pd];
+        let mut out_neg = vec![0f32; n_img * pd];
+        crate::gpu::zimage_step(&mut crate::gpu::ZStepArgs {
+            key,
+            step,
+            x_tok,
+            mods,
+            final_scale,
+            out: &mut out,
+            out_neg: Some(&mut out_neg),
+        })
+        .then_some((out, out_neg))
     }
 
     /// One DiT forward: `gpu::zimage_step` if `p.device`, else `step_cpu`.
@@ -1317,6 +1410,7 @@ impl ZImageDit {
                 mods,
                 final_scale,
                 out: &mut out,
+                out_neg: None,
             }) {
                 return out;
             }
@@ -1450,7 +1544,8 @@ impl ZImageDit {
 
 /// Device paths are off under `CMF_GPU=0` or `CMF_ZIMAGE_GPU=0` (the
 /// CPU-exact reference run).
-fn gpu_allowed() -> bool {
+/// The Z-Image device path may run (`CMF_ZIMAGE_GPU=0` / `CMF_GPU=0` off).
+pub fn gpu_allowed() -> bool {
     !matches!(std::env::var("CMF_ZIMAGE_GPU").as_deref(), Ok("0"))
         && !matches!(std::env::var("CMF_GPU").as_deref(), Ok("0"))
 }

@@ -223,15 +223,13 @@ pub(crate) fn prepare(a: &ZPrepareArgs) -> bool {
     let have = g.as_ref().is_some_and(|st| st.model_uid == uid && st.blocks.len() == nblk);
     if !have {
         *g = None; // free the old planes before building new ones
-        let mut blocks = Vec::with_capacity(nblk);
-        for r in a.noise_refiner.iter().chain(a.layers.iter()) {
-            match ZBlockDev::from_model(a.model, &d, r) {
-                Some(b) => blocks.push(b),
-                None => return false,
-            }
-        }
+        let t0 = std::time::Instant::now();
+        let refs: Vec<&ZBlockRef> = a.noise_refiner.iter().chain(a.layers.iter()).collect();
+        let Some(blocks) = ZBlockDev::from_model_all(a.model, &d, &refs) else { return false };
+        prof(&format!("planes {} blocks", blocks.len()), t0);
         *g = Some(ZState { model_uid: uid, blocks, progs: Vec::new() });
     }
+    let t0 = std::time::Instant::now();
     let st = g.as_mut().unwrap();
     st.progs.retain(|(k, _)| *k != a.key);
     while st.progs.len() >= MAX_PROGS {
@@ -240,13 +238,57 @@ pub(crate) fn prepare(a: &ZPrepareArgs) -> bool {
     let io = ZIo { x_emb_w: a.x_emb_w, x_emb_b: a.x_emb_b, x_pad: a.x_pad, final_w: a.final_w, final_b: a.final_b };
     let t = ZTiles::default();
     let (nr, layers) = st.blocks.split_at(2);
-    let Some(prog) = ZStepDev::new(d, &t, nr, layers, &io, n_img, &[n_cap_p], &a.cap[..n_cap_p * d.h]) else {
-        return false;
+    let prog = match &a.neg {
+        None => {
+            let Some(prog) = ZStepDev::new(d, &t, nr, layers, &io, n_img, &[n_cap_p], &a.cap[..n_cap_p * d.h]) else {
+                return false;
+            };
+            prog.img.set_rope(&a.rope_img.0[..n_img_p * 64], &a.rope_img.1[..n_img_p * 64]);
+            prog.joint.set_rope(&a.rope_joint.0[..s_len * 64], &a.rope_joint.1[..s_len * 64]);
+            prog
+        }
+        Some(ng) => {
+            // CFG pair: item 0 = this prompt, item 1 = the negative, each
+            // with its own caption length and RoPE rows (batch 2, B1).
+            let nc = ng.n_cap_p;
+            let s2 = n_img_p + nc;
+            if nc % 32 != 0
+                || ng.cap.len() < nc * d.h
+                || ng.rope_img.0.len() < n_img_p * 64
+                || ng.rope_img.1.len() < n_img_p * 64
+                || ng.rope_joint.0.len() < s2 * 64
+                || ng.rope_joint.1.len() < s2 * 64
+            {
+                return false;
+            }
+            let mut cap = Vec::with_capacity((n_cap_p + nc) * d.h);
+            cap.extend_from_slice(&a.cap[..n_cap_p * d.h]);
+            cap.extend_from_slice(&ng.cap[..nc * d.h]);
+            let Some(prog) = ZStepDev::new(d, &t, nr, layers, &io, n_img, &[n_cap_p, nc], &cap) else {
+                return false;
+            };
+            let cat = |x: &[f32], y: &[f32]| -> Vec<f32> { x.iter().chain(y).copied().collect() };
+            prog.img.set_rope(
+                &cat(&a.rope_img.0[..n_img_p * 64], &ng.rope_img.0[..n_img_p * 64]),
+                &cat(&a.rope_img.1[..n_img_p * 64], &ng.rope_img.1[..n_img_p * 64]),
+            );
+            prog.joint.set_rope(
+                &cat(&a.rope_joint.0[..s_len * 64], &ng.rope_joint.0[..s2 * 64]),
+                &cat(&a.rope_joint.1[..s_len * 64], &ng.rope_joint.1[..s2 * 64]),
+            );
+            prog
+        }
     };
-    prog.img.set_rope(&a.rope_img.0[..n_img_p * 64], &a.rope_img.1[..n_img_p * 64]);
-    prog.joint.set_rope(&a.rope_joint.0[..s_len * 64], &a.rope_joint.1[..s_len * 64]);
+    prof(if a.neg.is_some() { "program (batch 2)" } else { "program (batch 1)" }, t0);
     st.progs.push((a.key, prog));
     true
+}
+
+/// `CMF_ZIMAGE_PROF=1`: in-process sub-stage times of the device path.
+fn prof(what: &str, t0: std::time::Instant) {
+    if std::env::var("CMF_ZIMAGE_PROF").is_ok_and(|v| v != "0") {
+        eprintln!("zimage wgpu: {what} {:.3}s", t0.elapsed().as_secs_f64());
+    }
 }
 
 /// One DiT forward for a prepared `a.key`; writes `a.out`.
@@ -256,16 +298,30 @@ pub(crate) fn step(a: &mut ZStepArgs) -> bool {
     let Some((_, prog)) = st.progs.iter().find(|(k, _)| *k == a.key) else { return false };
     let d = prog.d;
     let nblk = st.blocks.len();
-    if a.x_tok.len() < prog.n_img_p * d.pd
+    let batch = prog.n_cap_p.len();
+    let (ni, np) = (prog.n_img * d.pd, prog.n_img_p * d.pd);
+    if a.x_tok.len() < np
         || a.mods.len() < nblk * 4 * d.h
         || a.final_scale.len() < d.h
-        || a.out.len() < prog.n_img * d.pd
+        || a.out.len() < ni
+        || (batch == 2) != a.out_neg.is_some()
+        || batch > 2
+        || a.out_neg.as_ref().is_some_and(|o| o.len() < ni)
     {
         return false;
     }
-    prog.upload(&a.x_tok[..prog.n_img_p * d.pd], &a.mods[..nblk * 4 * d.h], &a.final_scale[..d.h]);
+    // Both CFG items denoise the same latent: x_tok twice.
+    let x2: Vec<f32>;
+    let x_in: &[f32] = if batch == 2 {
+        x2 = a.x_tok[..np].iter().chain(&a.x_tok[..np]).copied().collect();
+        &x2
+    } else {
+        &a.x_tok[..np]
+    };
+    prog.upload(x_in, &a.mods[..nblk * 4 * d.h], &a.final_scale[..d.h]);
+    let mut outb = vec![0f32; batch * ni];
     let ok = match std::env::var("CMF_ZI_TAPS") {
-        Ok(dir) if !dir.is_empty() => match prog.run_taps(&mut a.out[..prog.n_img * d.pd]) {
+        Ok(dir) if !dir.is_empty() => match prog.run_taps(&mut outb) {
             Some(taps) => {
                 let dir = std::path::Path::new(&dir).join(format!("step{}", a.step));
                 let _ = std::fs::create_dir_all(&dir);
@@ -276,8 +332,14 @@ pub(crate) fn step(a: &mut ZStepArgs) -> bool {
             }
             None => false,
         },
-        _ => prog.run(&mut a.out[..prog.n_img * d.pd]).is_some(),
+        _ => prog.run(&mut outb).is_some(),
     };
+    if ok {
+        a.out[..ni].copy_from_slice(&outb[..ni]);
+        if let Some(o) = a.out_neg.as_mut() {
+            o[..ni].copy_from_slice(&outb[ni..2 * ni]);
+        }
+    }
     if let Some(v) = prog.amax_read() {
         let ns = AMAX_SITES.len();
         let mut line = format!("zi amax step {}:", a.step);
@@ -333,13 +395,10 @@ pub(crate) fn refine_caption(
     let key = (model.uid(), blocks[0].wq);
     if !g.as_ref().is_some_and(|(u, w, v)| (*u, *w) == key && v.len() == blocks.len()) {
         *g = None;
-        let mut v = Vec::with_capacity(blocks.len());
-        for r in blocks {
-            match ZBlockDev::from_model(model, &d, r) {
-                Some(b) => v.push(b),
-                None => return false,
-            }
-        }
+        let t0 = std::time::Instant::now();
+        let refs: Vec<&ZBlockRef> = blocks.iter().collect();
+        let Some(v) = ZBlockDev::from_model_all(model, &d, &refs) else { return false };
+        prof("context-refiner planes", t0);
         *g = Some((key.0, key.1, v));
     }
     let devs = &g.as_ref().unwrap().2;
@@ -2225,6 +2284,226 @@ impl ZBlockDev {
         c.queue.submit(std::iter::empty());
         wait(c);
         Some(b)
+    }
+}
+
+/// `zi_dq8`: q8_row / q8_2f tensor bytes exactly as stored in the file
+/// (`[int8 rows·cols][f16 row scale][f16 col scale]`) → f16 plane rows,
+/// 4 weights per thread, `w = (q·rs)·cs` in f32 (the CPU order), with the
+/// destination row remap of the plane (mode 0 = linear from `dst_row0`,
+/// 1/2 = the w13 gate/up panel interleave).
+const DQ8_SRC: &str = r#"
+struct DP { cols: u32, rows: u32, has_col: u32, mode: u32, src_w: u32, rs_w: u32, cs_w: u32, dst_row0: u32 };
+@group(0) @binding(0) var<storage, read> src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<vec2<u32>>;
+@group(0) @binding(2) var<uniform> p: DP;
+fn f16at(w0: u32, i: u32) -> f32 {
+  let v = unpack2x16float(src[w0 + i / 2u]);
+  return select(v.x, v.y, (i & 1u) == 1u);
+}
+fn s8(w: u32, j: u32) -> f32 {
+  let b = (w >> (8u * j)) & 0xFFu;
+  return select(f32(b), f32(b) - 256.0, b > 127u);
+}
+@compute @workgroup_size(256)
+fn zi_dq8(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+  let q4 = p.cols / 4u;
+  let idx = gid.y * (nwg.x * 256u) + gid.x;
+  if (idx >= p.rows * q4) { return; }
+  let r = idx / q4;
+  let c4 = idx % q4;
+  let w = src[p.src_w + idx];
+  let rs = f16at(p.rs_w, r);
+  var cs = vec4<f32>(1.0);
+  if (p.has_col != 0u) {
+    let a = unpack2x16float(src[p.cs_w + 2u * c4]);
+    let b = unpack2x16float(src[p.cs_w + 2u * c4 + 1u]);
+    cs = vec4<f32>(a.x, a.y, b.x, b.y);
+  }
+  let v = vec4<f32>(s8(w, 0u) * rs * cs.x, s8(w, 1u) * rs * cs.y, s8(w, 2u) * rs * cs.z, s8(w, 3u) * rs * cs.w);
+  var pr = r;
+  if (p.mode == 1u) { pr = 32u * (r / 16u) + r % 16u; }
+  if (p.mode == 2u) { pr = 32u * (r / 16u) + r % 16u + 16u; }
+  dst[(p.dst_row0 + pr) * q4 + c4] = vec2<u32>(pack2x16float(v.xy), pack2x16float(v.zw));
+}
+"#;
+
+/// One q8 tensor → plane job of the streamed builder.
+struct Dq8Job {
+    /// Which plane of the block (0 qkv, 1 o, 2 w13, 3 w2).
+    plane: usize,
+    rows: usize,
+    cols: usize,
+    has_col: bool,
+    mode: u32,
+    dst_row0: usize,
+    /// The tensor's bytes in the file (mmap).
+    bytes: &'static [u8],
+    /// Their byte offset in the block's source buffer.
+    src_off: usize,
+}
+
+impl ZBlockDev {
+    /// Planes of MANY blocks, streamed (B2). For q8_row / q8_2f weights the
+    /// raw file bytes of one block (7 tensors, 177 MB for Turbo) go into a
+    /// staging view filled by parallel threads straight from the mmap (one
+    /// host copy), and `zi_dq8` expands them on the device while the next
+    /// block is being filled (two alternating source buffers). Any other
+    /// codec falls back to `from_model` for that block.
+    /// `CMF_ZI_PLANE_FAST=0` = the B1 per-tensor path (A/B arm).
+    pub fn from_model_all(model: &Arc<CmfModel>, d: &ZDims, refs: &[&ZBlockRef]) -> Option<Vec<ZBlockDev>> {
+        use cortiq_core::TensorDtype as T;
+        let c = zctx()?;
+        if std::env::var("CMF_ZI_PLANE_FAST").as_deref() == Ok("0") {
+            return refs.iter().map(|r| ZBlockDev::from_model(model, d, r)).collect();
+        }
+        let (h, i) = (d.h, d.inter);
+        let jobs_of = |r: &ZBlockRef| -> Option<(Vec<Dq8Job>, usize)> {
+            let spec: [(usize, usize, usize, usize, u32, usize); 7] = [
+                (r.wq, 0, h, h, 0, 0),
+                (r.wk, 0, h, h, 0, h),
+                (r.wv, 0, h, h, 0, 2 * h),
+                (r.wo, 1, h, h, 0, 0),
+                (r.w1, 2, i, h, 1, 0),
+                (r.w3, 2, i, h, 2, 0),
+                (r.w2, 3, h, i, 0, 0),
+            ];
+            let mut jobs = Vec::with_capacity(7);
+            let mut off = 0usize;
+            for (idx, plane, rows, cols, mode, dst_row0) in spec {
+                let e = model.tensors.get(idx)?;
+                if e.shape.len() != 2 || e.shape[0] != rows || e.shape[1] != cols || rows % 32 != 0 || cols % 4 != 0 {
+                    return None;
+                }
+                if !matches!(e.dtype, T::Q8_2f | T::Q8Row) {
+                    return None;
+                }
+                let need = cortiq_core::quant::expected_nbytes(e.dtype, &[rows, cols])?;
+                let b = model.entry_bytes(e);
+                if b.len() < need {
+                    return None;
+                }
+                // SAFETY: the mmap lives as long as `model` (an Arc the
+                // caller holds for the whole build); the slice never
+                // outlives this function.
+                let bytes: &'static [u8] = unsafe { std::slice::from_raw_parts(b.as_ptr(), need) };
+                jobs.push(Dq8Job { plane, rows, cols, has_col: e.dtype == T::Q8_2f, mode, dst_row0, bytes, src_off: off });
+                off += need.next_multiple_of(256);
+            }
+            Some((jobs, off))
+        };
+        let plans: Vec<Option<(Vec<Dq8Job>, usize)>> = refs.iter().map(|r| jobs_of(r)).collect();
+        let max_src = plans.iter().flatten().map(|p| p.1).max().unwrap_or(0);
+        let pipe = pipeline(c, "zi_dq8", DQ8_SRC, "zi_dq8")?;
+        let srcs: Vec<wgpu::Buffer> = if max_src > 0 {
+            (0..2).map(|_| sbuf(c, max_src as u64, "zi_dq8_src")).collect()
+        } else {
+            Vec::new()
+        };
+        let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 16);
+        let mut out = Vec::with_capacity(refs.len());
+        let mut last: Option<wgpu::SubmissionIndex> = None;
+        for (bi, (r, plan)) in refs.iter().zip(plans).enumerate() {
+            let Some((jobs, total)) = plan else {
+                if let Some(ix) = last.take() {
+                    let _ = c.device.poll(wgpu::PollType::Wait { submission_index: Some(ix), timeout: None });
+                }
+                out.push(ZBlockDev::from_model(model, d, r)?);
+                continue;
+            };
+            if r.norm1.len() < h || r.norm2.len() < h || r.ffn_norm1.len() < h || r.ffn_norm2.len() < h
+                || r.norm_q.len() < 128 || r.norm_k.len() < 128
+            {
+                return None;
+            }
+            let src = &srcs[bi % 2];
+            {
+                let mut view = c.queue.write_buffer_with(src, 0, wgpu::BufferSize::new(total as u64)?)?;
+                // Cut the view into ≤ 8 MB pieces, one list pulled by the
+                // threads (the mmap page faults run in parallel too).
+                // (destination address, source) — `WriteOnly<[u8]>` is not
+                // Send, so the threads get the raw staging address.
+                let mut pieces: Vec<(usize, &[u8])> = Vec::new();
+                let mut rest = view.slice(..);
+                let mut cur = 0usize;
+                for j in &jobs {
+                    let (_, r2) = rest.split_at(j.src_off - cur);
+                    let (mut piece, r3) = r2.split_at(j.bytes.len());
+                    rest = r3;
+                    cur = j.src_off + j.bytes.len();
+                    let mut sb = j.bytes;
+                    while !sb.is_empty() {
+                        let n = sb.len().min(8 << 20);
+                        let (mut head, tail) = piece.split_at(n);
+                        pieces.push((head.as_raw_ptr().as_ptr() as *mut u8 as usize, &sb[..n]));
+                        piece = tail;
+                        sb = &sb[n..];
+                    }
+                }
+                let work = Mutex::new(pieces);
+                std::thread::scope(|sc| {
+                    for _ in 0..nthreads {
+                        sc.spawn(|| loop {
+                            let job = work.lock().ok().and_then(|mut v| v.pop());
+                            match job {
+                                // SAFETY: disjoint pieces of one live
+                                // write mapping, each exactly `srcb.len()`.
+                                Some((dst, srcb)) => unsafe {
+                                    std::ptr::copy_nonoverlapping(srcb.as_ptr(), dst as *mut u8, srcb.len())
+                                },
+                                None => break,
+                            }
+                        });
+                    }
+                });
+            }
+            let planes = [
+                sbuf(c, (3 * h * h * 2) as u64, "zi_plane_qkv"),
+                sbuf(c, (h * h * 2) as u64, "zi_plane_o"),
+                sbuf(c, (2 * i * h * 2) as u64, "zi_plane_w13"),
+                sbuf(c, (h * i * 2) as u64, "zi_plane_w2"),
+            ];
+            let mut enc = c.device.create_command_encoder(&Default::default());
+            let mut keep = Vec::new();
+            {
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&pipe);
+                for j in &jobs {
+                    let sw = (j.src_off / 4) as u32;
+                    let rs_w = sw + (j.rows * j.cols / 4) as u32;
+                    let cs_w = rs_w + (j.rows / 2) as u32;
+                    let u = ubuf(c, &[j.cols as u32, j.rows as u32, j.has_col as u32, j.mode, sw, rs_w, cs_w, j.dst_row0 as u32]);
+                    let bgr = bg(c, &pipe, &[src, &planes[j.plane], &u]);
+                    pass.set_bind_group(0, &bgr, &[]);
+                    let wgs = ((j.rows * j.cols / 4) as u32).div_ceil(256);
+                    pass.dispatch_workgroups(wgs.min(65535), wgs.div_ceil(65535), 1);
+                    keep.push((u, bgr));
+                }
+            }
+            let ix = c.queue.submit(Some(enc.finish()));
+            drop(keep);
+            // Bound the staging memory: block bi−1 must be done before
+            // bi+1 reuses its source buffer.
+            if let Some(prev) = last.replace(ix) {
+                let _ = c.device.poll(wgpu::PollType::Wait { submission_index: Some(prev), timeout: None });
+            }
+            let upf = |v: &[f32]| sbuf_init(c, bytemuck::cast_slice(v), "zi_norm");
+            let [qkv, o, w13, w2] = planes;
+            out.push(ZBlockDev {
+                qkv,
+                o,
+                w13,
+                w2,
+                norm1: upf(&r.norm1[..h]),
+                norm2: upf(&r.norm2[..h]),
+                ffn_norm1: upf(&r.ffn_norm1[..h]),
+                ffn_norm2: upf(&r.ffn_norm2[..h]),
+                norm_q: upf(&r.norm_q[..128]),
+                norm_k: upf(&r.norm_k[..128]),
+            });
+        }
+        wait(c);
+        Some(out)
     }
 }
 

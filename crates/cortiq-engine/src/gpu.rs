@@ -3592,6 +3592,25 @@ pub struct ZPrepareArgs<'a> {
     /// always supplied and is authoritative.
     pub mods_all: Option<&'a [f32]>,
     pub final_scale_all: Option<&'a [f32]>,
+    /// OPTIONAL (B2): the CFG negative item. When `Some`, the backend
+    /// prepares ONE batch-2 program under `key` — item 0 is this prompt,
+    /// item 1 the negative — and every `ZStepArgs` of that key must carry
+    /// `out_neg`. A backend without batch 2 returns `false` (the caller
+    /// then prepares the two items separately or runs the CPU path).
+    pub neg: Option<ZNegArgs<'a>>,
+}
+
+/// The negative (unconditional) item of a CFG pair: its own refined
+/// caption, padded caption length and joint RoPE table (the image ids sit
+/// at axis-0 position L_p+1, so both tables depend on the item's L_p).
+pub struct ZNegArgs<'a> {
+    /// [n_cap_p, hidden], context-refined.
+    pub cap: &'a [f32],
+    pub n_cap_p: usize,
+    /// [n_img_p · hd/2] cos, sin (noise refiner) of this item.
+    pub rope_img: (&'a [f32], &'a [f32]),
+    /// [(n_img_p + n_cap_p) · hd/2] cos, sin, rows [img, cap].
+    pub rope_joint: (&'a [f32], &'a [f32]),
 }
 
 /// Once per denoising step.
@@ -3615,6 +3634,9 @@ pub struct ZStepArgs<'a> {
     /// [n_img, 64]: the model output v (before the pipeline's negation),
     /// image rows only, patchified order.
     pub out: &'a mut [f32],
+    /// [n_img, 64]: the negative item's v — required (and only valid) for
+    /// a key prepared with `ZPrepareArgs::neg`. Both items see `x_tok`.
+    pub out_neg: Option<&'a mut [f32]>,
 }
 
 /// Prepare the per-(prompt, resolution) device state. Backends: wgpu →
