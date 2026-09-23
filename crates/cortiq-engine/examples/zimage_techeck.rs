@@ -5,7 +5,8 @@
 //! For each prompt key, encodes the oracle's `ids` (te_{p}_fp32.safetensors)
 //! and prints `h_m2` rel / cos / maxabs against the oracle plus the
 //! in-process time of each repetition. The device is paused (the pipeline's
-//! CPU text encoder); `CMF_SDOT=0` selects the exact weight-only kernels.
+//! CPU text encoder) unless `ZC_TE_GPU=1`; `CMF_SDOT=0` selects the exact
+//! weight-only kernels.
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -34,7 +35,9 @@ fn main() {
     let model = Arc::new(cortiq_core::CmfModel::open(&a[1]).unwrap());
     let keys = a.get(3).cloned().unwrap_or("p0,p1".into());
     let reps: usize = a.get(4).and_then(|v| v.parse().ok()).unwrap_or(2);
-    let _p = cortiq_engine::gpu::pause_gpu();
+    // `ZC_TE_GPU=1`: leave the device on (the engine's per-op device path,
+    // the arm the pipeline used before B2).
+    let _p = (std::env::var("ZC_TE_GPU").as_deref() != Ok("1")).then(cortiq_engine::gpu::pause_gpu);
     let t = std::time::Instant::now();
     let enc = cortiq_engine::qwen3te::Qwen3Encoder::from_cmf(&model).unwrap();
     println!("load {:.3} s", t.elapsed().as_secs_f64());
