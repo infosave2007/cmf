@@ -59,13 +59,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   speculative verify's. `CMF_BATCH_K=0` restores the per-position walk;
   `bench` reports the route the pipeline actually takes.
 - Native Metal: the GDN run of the token graph encodes a whole run of
-  layers into ONE compute encoder instead of seven per layer (a serial
-  encoder orders its dispatches; the boundaries were pipeline drains,
-  ~330 a token on Qwen3.8-27B). The speculative verify's chunk attend no
-  longer walks the K mirror a seventh time for an attention-importance
-  mass that nothing reads (the verify's scratch was a throwaway). The
-  draft depth stays pinned at 7 on Metal — its verify tile is flat in the
-  batch, so a shorter round only forfeits tokens.
+  layers into ONE compute encoder instead of seven per layer, and the
+  speculative verify's chunk attend no longer walks the K mirror a seventh
+  time for an attention-importance mass that nothing reads. Both are
+  structural: a cooled, alternating A/B on an M4 (Qwen3.8-27B q4tp)
+  measured them neutral (plain 6.65 vs 6.63 tok/s, GPU span 145 ms either
+  way; code with speculation 10.5 vs 10.5), greedy output byte-identical.
+  The draft depth stays pinned at 7 on Metal — its verify tile is flat in
+  the batch, so a shorter round only forfeits tokens.
 
 ### Measured and closed (kept behind flags so they are not re-opened)
 - `CMF_VERIFY_COOP=1` (the verify on the cooperative-matrix GEMM): 175 ms

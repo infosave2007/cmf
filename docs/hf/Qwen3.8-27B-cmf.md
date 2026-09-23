@@ -236,6 +236,23 @@ CMF_O1_METAL=1 cortiq run qwen38-27b-q4t.cmf --o1 all --prompt "..."
 
 `q4tp` is the Mac build (`q4t` also runs); `q8_2f` (27.4 GB) does not fit 24 GB machines.
 
+### 0.7.2 on the M4
+
+The Metal path kept its draft depth at 7 (the verify tile is flat in the
+batch, so a shorter round only forfeits tokens) and gained the adaptive
+draft-head shortlist (the 65536-row head halves the draft: 66 → 32 ms for
+seven steps; Cyrillic and CJK hand back to the full head), the GDN run of
+the token graph on one compute encoder instead of seven per layer, and a
+verify attend that no longer walks the K mirror for an importance mass
+nothing reads. Greedy output is byte-identical to 0.7.1 on both the plain
+and the speculative path, and the speed is the same: a cooled, alternating
+A/B on the M4 (24 GB) reads 6.65 vs 6.63 tok/s plain (GPU span 145 ms
+either way — the 14.3 GB file at ~100 GB/s) and 10.5 vs 10.5 on a code
+prompt with speculation (k=7, 3-5 of 7 accepted). The Mac's remaining
+lever is the verify's eight-row GEMM at 68 GB/s against the plain
+matvec's ~100; the shortlist is what moved this release (draft 66 → 32 ms
+for seven steps).
+
 ## Sampling
 
 Qwen's recommended parameters for this release:
