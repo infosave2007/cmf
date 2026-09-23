@@ -708,6 +708,16 @@ struct MetalVerifyPending {
     attn_layers: Vec<(usize, usize)>,
 }
 
+/// A round's batched MTP warm-up, submitted but not yet waited
+/// (`mtp_warm_batch_submit` → `mtp_warm_batch_finish`): the trunk commit's
+/// GDN replay is queued between the two.
+#[cfg(target_os = "macos")]
+struct MetalWarmPending {
+    graph: crate::gpu_metal::VerifyGraph,
+    cpu_stored: usize,
+    b: usize,
+}
+
 #[cfg(target_os = "macos")]
 enum MetalRowsRun {
     /// Capability/preflight refusal before a command buffer was committed.
@@ -752,6 +762,88 @@ enum SpecTrial {
     },
 }
 
+/// `CMF_GRAPH_SPEC_TIME`: 0 = off, 1 = one line per speculative round
+/// plus the host stamps of any OUTLIER round (wall > 1.4× the running
+/// median), 2 = the host stamps of every round.
+pub(crate) fn spec_time_level() -> u8 {
+    static L: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *L.get_or_init(|| match std::env::var("CMF_GRAPH_SPEC_TIME") {
+        Ok(v) => v.trim().parse::<u8>().map(|n| n.max(1)).unwrap_or(1),
+        Err(_) => 0,
+    })
+}
+
+/// The round's host stamps: `spec_stamp(name)` records the time since
+/// the previous stamp (the section that just ended) — from anywhere on
+/// the round's call chain (the Metal verify, the draft step, the commit),
+/// no plumbing. Off (a single atomic load) unless `CMF_GRAPH_SPEC_TIME`
+/// is set; one decode thread at a time is assumed (diagnostics).
+struct SpecStampLog {
+    t_last: std::time::Instant,
+    items: Vec<(&'static str, f32)>,
+}
+
+static SPEC_STAMPS: std::sync::Mutex<Option<SpecStampLog>> = std::sync::Mutex::new(None);
+
+pub(crate) fn spec_stamp(name: &'static str) {
+    if spec_time_level() == 0 {
+        return;
+    }
+    if let Ok(mut g) = SPEC_STAMPS.lock() {
+        if let Some(log) = g.as_mut() {
+            let now = std::time::Instant::now();
+            log.items
+                .push((name, (now - log.t_last).as_secs_f32() * 1e3));
+            log.t_last = now;
+        }
+    }
+}
+
+fn spec_stamps_begin() {
+    if spec_time_level() == 0 {
+        return;
+    }
+    if let Ok(mut g) = SPEC_STAMPS.lock() {
+        *g = Some(SpecStampLog {
+            t_last: std::time::Instant::now(),
+            items: Vec::with_capacity(64),
+        });
+    }
+}
+
+fn spec_stamps_take() -> Vec<(&'static str, f32)> {
+    SPEC_STAMPS
+        .lock()
+        .ok()
+        .and_then(|mut g| g.take())
+        .map(|l| l.items)
+        .unwrap_or_default()
+}
+
+/// One line: every stamp name in first-seen order with its total over the
+/// round and, when it fired more than once (the draft steps), the count.
+fn spec_stamps_format(items: &[(&'static str, f32)]) -> String {
+    let mut agg: Vec<(&'static str, f32, u32)> = Vec::with_capacity(items.len());
+    for &(n, ms) in items {
+        match agg.iter_mut().find(|e| e.0 == n) {
+            Some(e) => {
+                e.1 += ms;
+                e.2 += 1;
+            }
+            None => agg.push((n, ms, 1)),
+        }
+    }
+    let mut s = String::with_capacity(agg.len() * 16);
+    for (n, ms, k) in agg {
+        if k > 1 {
+            s.push_str(&format!("{n} {ms:.1}/{k} "));
+        } else {
+            s.push_str(&format!("{n} {ms:.1} "));
+        }
+    }
+    s
+}
+
 /// The speculation monitor: exponential averages of a round's wall time
 /// and of the tokens it produced, and the plain token's wall time — the
 /// three numbers the keep/stop rule needs. A round pays when
@@ -762,6 +854,17 @@ enum SpecTrial {
 /// "speculate"), so the rule now runs on EVERY round and stops after four
 /// consecutive losing rounds; a stopped speculation is retried 128 tokens
 /// later.
+///
+/// Native Metal (`metal: true`) does not pay the eight plain tokens up
+/// front: on the 27B a plain token is ~150 ms, so the trial alone cost
+/// ~1.2 s of every answer. There the plain phase is (a) skipped while the
+/// rounds land at least `SPEC_PROXY_TOKENS` tokens each — a k=7 round on
+/// Metal costs ~1.9 plain tokens (286 against 148 ms measured on the M4),
+/// so 3.5 tokens/round cannot lose on any Metal round/plain ratio seen —
+/// and (b) otherwise bounded to the fewest tokens that time it: two, or
+/// as many as fit in `SPEC_PLAIN_MIN_MS` (a 150-ms token measures itself;
+/// a 10-ms one needs the eight). The keep/stop rule itself is unchanged:
+/// the moment a plain rate exists, it decides.
 #[derive(Default, Clone, Copy)]
 struct SpecMon {
     round_ms: f64,
@@ -769,7 +872,15 @@ struct SpecMon {
     plain_ms: f64,
     n: u32,
     fails: u32,
+    metal: bool,
 }
+
+/// Tokens per round at or above which a Metal round pays without a plain
+/// measurement (see `SpecMon`).
+const SPEC_PROXY_TOKENS: f64 = 3.5;
+/// The Metal plain phase: at least two tokens, and more until this much
+/// wall time has been timed (up to the eight the other backends time).
+const SPEC_PLAIN_MIN_MS: f64 = 200.0;
 
 impl SpecMon {
     fn round(&mut self, dt_ms: f64, produced: usize) {
@@ -782,7 +893,19 @@ impl SpecMon {
         self.tokens += a * (produced as f64 - self.tokens);
     }
     fn pays(&self) -> bool {
-        self.plain_ms > 0.0 && self.tokens * self.plain_ms > self.round_ms * 1.03
+        if self.plain_ms > 0.0 {
+            self.tokens * self.plain_ms > self.round_ms * 1.03
+        } else {
+            self.metal && self.tokens >= SPEC_PROXY_TOKENS
+        }
+    }
+    /// Has the plain phase timed enough tokens to decide?
+    fn plain_done(&self, t0: std::time::Instant, gen0: usize, generated: usize) -> bool {
+        let n = generated.saturating_sub(gen0);
+        if n >= 8 {
+            return true;
+        }
+        self.metal && n >= 2 && t0.elapsed().as_secs_f64() * 1e3 >= SPEC_PLAIN_MIN_MS
     }
 }
 
@@ -2713,8 +2836,38 @@ impl Pipeline {
         // distributions a round plus a lower acceptance than greedy's,
         // against a verify that costs 2.7 single tokens. The greedy arms
         // pay +10%; the sampling arm needs a cheaper verify first.
+        // Native Metal HAS that verify: its eight-row tile is flat in b,
+        // so a round costs ~1.9 plain tokens and the sampling arm pays at
+        // 2.3 accepted per round — measured on Qwen3.8-27B q4tp / M4 at
+        // the CLI defaults (0.7 / rep 1.1 / top-k 40, seed 42), a code
+        // prompt: 9.0 tok/s against a plain 5.4 in the same window, and
+        // the per-round watchdog turns it off where prose loses. So on
+        // Metal the sampling arm is ON (`CMF_GRAPH_SPEC_SAMPLE=0` opts out)
+        // — but only for a config the SPARSE chain serves (a top-k within
+        // `sparse_ok`): without it a round builds nine 248k-float
+        // distributions on the host, which is the 5090's measured loss and
+        // not a cost the round-token proxy below can see. A top-k-less
+        // sampling config keeps the plain path unless asked for by name.
+        #[cfg(target_os = "macos")]
+        let metal_graph = crate::gpu::q1_force()
+            && crate::gpu::enabled_here()
+            && std::env::var("CMF_GPU_BLOCK")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+        #[cfg(not(target_os = "macos"))]
+        let metal_graph = false;
+        let spec_sample_env = std::env::var("CMF_GRAPH_SPEC_SAMPLE").ok();
+        // A round whose cost is the MEASURED one: greedy (argmax rows), or
+        // sampling through the sparse chain. Anything else pays the dense
+        // chain's host time, which no proxy can price.
+        let spec_cheap_round = self.sampler_config.temperature < 1e-6
+            || sampler::sparse_ok(&self.sampler_config);
         let spec_sampling_ok = self.sampler_config.temperature < 1e-6
-            || std::env::var("CMF_GRAPH_SPEC_SAMPLE").as_deref() == Ok("1");
+            || match spec_sample_env.as_deref() {
+                Some("1") => true,
+                Some(_) => false,
+                None => metal_graph && spec_cheap_round,
+            };
         // ON by default for greedy on the wgpu graph: with the draft on
         // the graph and the verify bit-exact, it measured 58.7 tok/s
         // against a plain 48.1 on Qwen3.8-27B q4tp / RTX 5090 (k=4) and
@@ -2745,10 +2898,19 @@ impl Pipeline {
         let spec_default_ok = dense_n == 0 || dense_q4tp * 10 >= dense_n * 9;
         // Penalties break the draft head's agreement with the trunk (a
         // 1.1 repetition penalty measured 2 of 16 accepted): not by
-        // default there either.
-        let penalized = self.sampler_config.repetition_penalty != 1.0
-            || self.sampler_config.presence_penalty != 0.0
-            || !self.sampler_config.suppress_tokens.is_empty();
+        // default there either — off Metal that rule is untouched, and
+        // suppressed ids keep counting as a penalty there, because no
+        // measurement on a discrete card says otherwise.
+        //
+        // On native Metal the penalized arms DO pay: the draft applies
+        // the same penalty and the verify scores the penalized rows
+        // exactly (`greedy_pen`, the plain loop's arithmetic), so the
+        // text is the plain path's and only the round's shape changes.
+        // Measured on this M4 — see the report for the interleaved run.
+        let penalized = !metal_graph
+            && (self.sampler_config.repetition_penalty != 1.0
+                || self.sampler_config.presence_penalty != 0.0
+                || !self.sampler_config.suppress_tokens.is_empty());
         // …and not on wgpu-over-Metal: the batched verify graph there
         // returned 0 accepted drafts and garbage text on a GDN hybrid
         // (16.08, Qwen3.5-0.8B) while Vulkan is bit-exact; the Mac's
@@ -2772,15 +2934,8 @@ impl Pipeline {
             None => spec_default_ok && !penalized && !metal_wgpu,
         };
         // Native Metal: the b-row verify graph (`try_batch_graph_metal`)
-        // stands where the wgpu batch graph stands on discrete cards.
-        #[cfg(target_os = "macos")]
-        let metal_graph = crate::gpu::q1_force()
-            && crate::gpu::enabled_here()
-            && std::env::var("CMF_GPU_BLOCK")
-                .map(|v| v != "0")
-                .unwrap_or(true);
-        #[cfg(not(target_os = "macos"))]
-        let metal_graph = false;
+        // stands where the wgpu batch graph stands on discrete cards
+        // (`metal_graph`, above).
         let graph_spec = self.speculative
             && (graph_on || metal_graph)
             && self.mtp.is_some()
@@ -2788,6 +2943,66 @@ impl Pipeline {
             && !self.o1_active()
             && spec_sampling_ok
             && spec_wanted;
+        // Native Metal: say the route ONCE (RUST_LOG=info), so a user can
+        // confirm the fast path without setting a single flag — every
+        // knob below defaults to the measured-best value on the M4.
+        #[cfg(target_os = "macos")]
+        if metal_graph {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| {
+                let spec = if graph_spec {
+                    let k = std::env::var("CMF_GRAPH_SPEC_K")
+                        .ok()
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .filter(|&v| (1..=8).contains(&v))
+                        .unwrap_or(7);
+                    let arm = if self.sampler_config.temperature < 1e-6 {
+                        "greedy"
+                    } else {
+                        "sampling"
+                    };
+                    format!(
+                        "spec k={k} {arm} (batched verify, draft shortlist {}, trial: proxy)",
+                        Self::draft_vocab_rows(usize::MAX)
+                    )
+                } else if !self.speculative {
+                    "spec off (CMF_MTP=0)".to_string()
+                } else if self.mtp.is_none() {
+                    "spec off (no MTP head)".to_string()
+                } else if !spec_sampling_ok {
+                    if spec_cheap_round {
+                        "spec off (CMF_GRAPH_SPEC_SAMPLE=0)".to_string()
+                    } else {
+                        "spec off (sampling without a top-k: the dense chain \
+                         costs more than it saves)"
+                            .to_string()
+                    }
+                } else if !spec_wanted {
+                    "spec off (CMF_GRAPH_SPEC=0 or non-q4tp FFNs)".to_string()
+                } else if task_mask.is_some() {
+                    "spec off (task mask)".to_string()
+                } else {
+                    "spec off (O(1) attention)".to_string()
+                };
+                let on = |var: &str| {
+                    if std::env::var(var).as_deref() == Ok("0") {
+                        "off"
+                    } else {
+                        "on"
+                    }
+                };
+                tracing::info!(
+                    "metal native: {spec}, state4 {}, async replay {}, prefill graph {}, \
+                     MTP graph {}, attend {}, probe {}",
+                    if crate::gpu_metal::state4_on() { "on" } else { "off" },
+                    if crate::gpu_metal::async_replay_on() { "on" } else { "off" },
+                    on("CMF_METAL_PREFILL"),
+                    on("CMF_MTP_GRAPH"),
+                    std::env::var("CMF_GPU_ATTEND").unwrap_or_else(|_| "auto".into()),
+                    if crate::gpu::probe_enabled() { "bypassed (q1 force)" } else { "off" },
+                );
+            });
+        }
         // GDN hybrids sit the fused-pair speculation out by default: the
         // recurrence is sequential, so the pair lane cannot parallelize
         // (the bench's own Pair line reads fused 1.28x TWO singles on the
@@ -3498,8 +3713,22 @@ impl Pipeline {
             gen0: generated,
             rounds: 0,
         };
-        let mut spec_mon = SpecMon::default();
+        // The token-count proxy prices a round at ~1.9 plain tokens. That
+        // holds for the Metal rounds whose cost was measured — greedy and
+        // the sparse sampling chain — so an expensive round (the dense
+        // chain, reachable only by `CMF_GRAPH_SPEC_SAMPLE=1`) still times
+        // the plain path before it decides.
+        let mut spec_mon = SpecMon {
+            metal: graph_spec && crate::gpu::q1_force() && spec_cheap_round,
+            ..SpecMon::default()
+        };
         let mut spec_watchdog_off = false;
+        // CMF_GRAPH_SPEC_TIME: the round walls so far (round 1 excluded —
+        // it pays the scratch), for the outlier test on each new one
+        let mut spec_walls: Vec<f32> = Vec::new();
+        // ... and the end of the last round: the host time between rounds
+        // (token commits, streaming, the loop top) is printed at level 2
+        let mut spec_round_end: Option<std::time::Instant> = None;
         // ── Decode ──
         let mut next_pos = input_ids.len();
         'decode: while generated < max_tokens {
@@ -3630,7 +3859,7 @@ impl Pipeline {
             // the periodic re-check happen here, on every token.
             if graph_spec {
                 match spec_trial {
-                    SpecTrial::Plain { t0, gen0 } if generated >= gen0 + 8 => {
+                    SpecTrial::Plain { t0, gen0 } if spec_mon.plain_done(t0, gen0, generated) => {
                         spec_mon.plain_ms =
                             t0.elapsed().as_secs_f64() * 1e3 / (generated - gen0) as f64;
                         let keep = spec_mon.pays();
@@ -3672,6 +3901,24 @@ impl Pipeline {
                         && next_pos > 0 =>
                 {
                     let t_round = std::time::Instant::now();
+                    if spec_time_level() >= 2 {
+                        if let Some(t) = spec_round_end.take() {
+                            eprintln!(
+                                "spec-gap {:.2} ms (host between rounds)",
+                                t.elapsed().as_secs_f64() * 1e3
+                            );
+                        }
+                    }
+                    spec_stamps_begin();
+                    // device buffers allocated during this round: a
+                    // first-touch Shared allocation is zero-filled inside
+                    // the command buffer that uses it, which is what the
+                    // long outlier rounds were
+                    #[cfg(target_os = "macos")]
+                    let allocs0 = crate::gpu_metal::IO_BUF_ALLOCS
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    #[cfg(not(target_os = "macos"))]
+                    let allocs0 = 0u64;
                     if let Some((extra, n_pos, new_h)) = self.graph_spec_step(
                         m,
                         &hidden,
@@ -3683,12 +3930,50 @@ impl Pipeline {
                     ) {
                         next_pos = n_pos;
                         hidden = new_h;
-                        if std::env::var("CMF_GRAPH_SPEC_TIME").is_ok() {
+                        let level = spec_time_level();
+                        if level > 0 {
+                            let wall = t_round.elapsed().as_secs_f32() * 1e3;
+                            let stamps = spec_stamps_take();
+                            // the running median of the rounds before this
+                            // one (round 1 pays the scratch: not a sample)
+                            let median = if spec_walls.len() >= 3 {
+                                let mut s = spec_walls.clone();
+                                s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                                Some(s[s.len() / 2])
+                            } else {
+                                None
+                            };
+                            let outlier = median.is_some_and(|m| wall > 1.4 * m);
+                            #[cfg(target_os = "macos")]
+                            let allocs = crate::gpu_metal::IO_BUF_ALLOCS
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                                - allocs0;
+                            #[cfg(not(target_os = "macos"))]
+                            let allocs = allocs0;
                             eprintln!(
-                                "spec-round wall {:.1} ms → {} tokens",
-                                t_round.elapsed().as_secs_f64() * 1e3,
-                                extra.len() + 1
+                                "spec-round wall {wall:.1} ms → {} tokens{}{}",
+                                extra.len() + 1,
+                                if allocs > 0 {
+                                    format!(" [{allocs} new device buffers]")
+                                } else {
+                                    String::new()
+                                },
+                                match (outlier, median) {
+                                    (true, Some(m)) => format!(" OUTLIER (median {m:.1})"),
+                                    _ => String::new(),
+                                }
                             );
+                            if level >= 2 || outlier {
+                                let sum: f32 = stamps.iter().map(|s| s.1).sum();
+                                eprintln!(
+                                    "spec-stamps: {}| untracked {:.1}",
+                                    spec_stamps_format(&stamps),
+                                    wall - sum
+                                );
+                            }
+                            if spec_mon.n >= 1 {
+                                spec_walls.push(wall);
+                            }
                         }
                         // One speculative round done: the monitor counts it
                         // (round 1 untimed — it pays the batch scratch and
@@ -3713,6 +3998,9 @@ impl Pipeline {
                         }
                         if stopped {
                             break 'decode;
+                        }
+                        if spec_time_level() >= 2 {
+                            spec_round_end = Some(std::time::Instant::now());
                         }
                         continue 'decode;
                     }
@@ -3958,6 +4246,26 @@ impl Pipeline {
                         }
                         if stopped {
                             break 'decode;
+                        }
+                    }
+                    // Metal: keep the draft head's cache in step through
+                    // the trial's plain phase and a paused speculation —
+                    // the pair (hidden, t_fwd) at next_pos−1, the step the
+                    // round's draft 0 would take. Without it the head's
+                    // cache lagged the trunk by every plain token for the
+                    // rest of the generation: the batched warm-up declined
+                    // every later round and its rows went one by one (a
+                    // whole MTP step per accepted token), and the drafts
+                    // attended a context with those tokens missing.
+                    #[cfg(target_os = "macos")]
+                    if graph_spec
+                        && spec_watchdog_off
+                        && next_pos > 0
+                        && self.mtp_graph_mode == Some(true)
+                        && crate::gpu::q1_force()
+                    {
+                        if let Some(m) = mtp.as_mut() {
+                            let _ = self.mtp_step_metal(m, &hidden, t_fwd, next_pos - 1, false);
                         }
                     }
                     hidden = self.forward_layers(&self.embed_single(t_fwd), next_pos, task_mask);
@@ -4246,6 +4554,21 @@ impl Pipeline {
                             spec: keep,
                             recheck_at: if keep { usize::MAX } else { generated + 128 },
                         }
+                    } else if mon.pays() {
+                        // Metal: the rounds land enough tokens each that no
+                        // plain measurement is needed — keep speculating,
+                        // and re-check every round (a losing streak sends
+                        // the loop to the plain phase, below).
+                        mon.fails = 0;
+                        tracing::info!(
+                            "speculation trial: {:.2} tok/round in {:.1} ms — speculating (plain not timed)",
+                            mon.tokens,
+                            mon.round_ms,
+                        );
+                        SpecTrial::Decided {
+                            spec: true,
+                            recheck_at: usize::MAX,
+                        }
                     } else {
                         SpecTrial::Plain {
                             t0: std::time::Instant::now(),
@@ -4263,6 +4586,20 @@ impl Pipeline {
                 } else {
                     mon.fails += 1;
                     if mon.fails >= 4 {
+                        if mon.plain_ms <= 0.0 {
+                            // Metal, plain never timed: four doubtful rounds
+                            // buy the (bounded) plain measurement, and the
+                            // exact rule decides from it.
+                            tracing::info!(
+                                "speculation doubtful: {:.2} tok/round in {:.1} ms — timing plain",
+                                mon.tokens,
+                                mon.round_ms,
+                            );
+                            return SpecTrial::Plain {
+                                t0: std::time::Instant::now(),
+                                gen0: generated,
+                            };
+                        }
                         tracing::info!(
                             "speculation stopped: {:.2} tok/round in {:.1} ms vs plain {:.1} ms/tok",
                             mon.tokens,
@@ -4944,7 +5281,32 @@ impl Pipeline {
         // CMF_SPEC_DBG=1: draft 0 through BOTH MTP arms (graph and per-op)
         // from the same inputs — are the arms the difference, or the inputs?
         let spec_dbg = std::env::var("CMF_SPEC_DBG").is_ok();
-        for j in 0..k_spec {
+        spec_stamp("pro");
+        // Plain greedy on native Metal: the whole chain as one command
+        // buffer (device argmax + embedding gather between the steps).
+        // A decline before commit hands the round to the per-step loop
+        // below; a failure after commit is terminal, like any graph
+        // failure after admission.
+        #[cfg(target_os = "macos")]
+        if metal_native && !sampling && !greedy_pen && self.mtp_graph_mode != Some(false) {
+            match self.mtp_draft_chain_metal(m, hidden, t_next, next_pos - 1, k_spec) {
+                Ok(ids) => {
+                    self.mtp_graph_mode = Some(true);
+                    drafts = ids;
+                }
+                Err(true) => {
+                    tracing::error!("mtp Metal draft chain failed after commit");
+                    self.clear_sequence_state();
+                    self.graph_failed
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.cancel
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    return None;
+                }
+                Err(false) => {}
+            }
+        }
+        for j in drafts.len()..k_spec {
             let tok_in = if j == 0 { t_next } else { drafts[j - 1] };
             let mut dbg_ref: Option<(Vec<f32>, Vec<f32>)> = None;
             if spec_dbg {
@@ -5034,6 +5396,7 @@ impl Pipeline {
             attention::recycle_buf(&mut lg);
             drafts.push(dj);
             hx = hj;
+            spec_stamp("d.pick");
         }
         all_ids.truncate(base_len);
         *drafted += k_spec;
@@ -5048,6 +5411,7 @@ impl Pipeline {
             hiddens[i * self.hidden_size..(i + 1) * self.hidden_size].copy_from_slice(&e);
         }
         let positions: Vec<usize> = (next_pos..next_pos + b).collect();
+        spec_stamp("v.emb");
         let (lm_gw, lm_rows) = {
             let (_, i, kind, rs) = self.weights.lm_head.graph_weight()?;
             (
@@ -5064,14 +5428,46 @@ impl Pipeline {
         };
         let mut logits = Vec::new();
         let final_norm = self.weights.final_norm.clone();
+        // Plain greedy on Metal: the b argmaxes come from the device
+        // (`argmax_rows` after the head) and the 7.9 MB logits plane is
+        // never read back — the round's decision needs only the ids, and
+        // the loop top takes the last verified id as `spec_forced`, which
+        // is exactly what its argmax of the row would give. The full rows
+        // stay for anything that reads them: sampling, penalties,
+        // confidence, the verify oracle, the logit dump.
+        // `CMF_METAL_DEV_ARGMAX=0` keeps the host path.
+        #[cfg(target_os = "macos")]
+        let greedy_dev = metal_native
+            && !sampling
+            && !greedy_pen
+            && !self.confidence_on
+            && self.final_softcap.is_none()
+            // The host acceptance argmax scans the WHOLE head row
+            // (`lm_rows`), the sampler's own row only `vocab_size`: they
+            // coincide exactly when the head has no padding rows, and
+            // only then is the device argmax (which scores `vocab_size`)
+            // bit-identical to both.
+            && self.vocab_size == lm_rows
+            && std::env::var_os("CMF_METAL_VERIFY_CHECK").is_none()
+            && std::env::var_os("CMF_LOGIT_DUMP").is_none()
+            && std::env::var("CMF_METAL_DEV_ARGMAX").as_deref() != Ok("0");
+        #[cfg(not(target_os = "macos"))]
+        let greedy_dev = false;
+        let mut dev_ids: Vec<u32> = Vec::new();
         #[cfg(target_os = "macos")]
         let verify_outcome = if metal_native {
             let lm = self.weights.lm_head.q1_parts()?;
+            let n_score = self.vocab_size.min(lm_rows);
             self.try_batch_graph_metal(
                 &mut hiddens,
                 &positions,
                 b,
                 Some((lm, &final_norm, &mut logits)),
+                if greedy_dev {
+                    Some((n_score, &mut dev_ids))
+                } else {
+                    None
+                },
             )
         } else {
             self.try_batch_graph_wgpu(
@@ -5304,7 +5700,24 @@ impl Pipeline {
             // rows past the first mismatch were never scored; the loop
             // top re-samples the last verified row itself.
             ids
+        } else if greedy_dev && dev_ids.len() == b {
+            let ids = std::mem::take(&mut dev_ids);
+            while a < k_spec && ids[a] == drafts[a] {
+                a += 1;
+            }
+            ids
         } else {
+            if logits.len() < b * lm_rows {
+                // the device argmax was asked for and came back short:
+                // no rows to fall back on — terminal like a failed batch
+                self.clear_sequence_state();
+                self.graph_failed
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                self.cancel
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                tracing::error!("Metal verify returned neither logits nor argmax ids");
+                return None;
+            }
             let ids: Vec<u32> = (0..b)
                 .map(|i| sampler::argmax(&logits[i * lm_rows..(i + 1) * lm_rows]))
                 .collect();
@@ -5313,6 +5726,7 @@ impl Pipeline {
             }
             ids
         };
+        spec_stamp("acc");
         if spec_dbg {
             eprintln!(
                 "spec-dbg round: t_next {t_next} drafts {:?} verified {:?} accepted {a}",
@@ -5382,6 +5796,42 @@ impl Pipeline {
         } else {
             None
         };
+        let warm_off = std::env::var("CMF_SPEC_WARM").is_ok_and(|v| v == "0");
+        // Metal: the MTP cache cut and the round's warm-up SUBMIT come
+        // BEFORE the trunk commit, so the warm-up's command buffer is
+        // queued ahead of the GDN replay (second queue) and its wait
+        // below no longer sits behind the replay — measured: the warm-up's
+        // wait grew with the accepted count exactly like the replay does
+        // (8 ms at a=1, 17 ms at a=3, 25 ms at a=5 for ~2 ms of its own
+        // work). The replay now overlaps the warm-up's readback, the
+        // round's return and the next draft chain.
+        #[cfg(target_os = "macos")]
+        let mut warm_pending: Option<MetalWarmPending> = None;
+        #[cfg(target_os = "macos")]
+        if metal_native {
+            m.kv.truncate_last(k_spec.saturating_sub(1));
+            if self.mtp_graph_mode == Some(true) {
+                // the mirror rows below the cut are the CPU rows: re-point,
+                // no re-upload
+                crate::gpu_metal::kv_mirror_set_stored(
+                    self.mtp_kv_id(),
+                    Self::MTP_LAYER_BASE,
+                    m.kv.seq_len,
+                );
+                if !warm_off && a > 0 {
+                    let pairs: Vec<(&[f32], u32)> = (0..a)
+                        .map(|j| {
+                            (
+                                &hiddens[j * self.hidden_size..(j + 1) * self.hidden_size],
+                                ids[j],
+                            )
+                        })
+                        .collect();
+                    warm_pending = self.mtp_warm_batch_submit(m, &pairs, next_pos);
+                }
+            }
+            spec_stamp("c.wsub");
+        }
         // a fully-accepted round needs no restore: every input was real.
         #[cfg(target_os = "macos")]
         if metal_native {
@@ -5491,17 +5941,11 @@ impl Pipeline {
         // (50.3 against 50.5) and backwards at k=4 (48.1 against 50.1).
         // The knob stays so the next person can re-price it after the
         // warms are batched instead of assuming either way.
-        m.kv.truncate_last(k_spec.saturating_sub(1));
-        #[cfg(target_os = "macos")]
-        if metal_native && self.mtp_graph_mode == Some(true) {
-            // the mirror rows below the cut are the CPU rows: re-point,
-            // no re-upload
-            crate::gpu_metal::kv_mirror_set_stored(
-                self.mtp_kv_id(),
-                Self::MTP_LAYER_BASE,
-                m.kv.seq_len,
-            );
+        if !metal_native {
+            // (Metal cut its MTP cache before the trunk commit, above)
+            m.kv.truncate_last(k_spec.saturating_sub(1));
         }
+        spec_stamp("c.trunc");
         if !metal_native
             && self.mtp_graph_mode == Some(true)
             && !self.rewind_mtp_graph_mirror(next_pos)
@@ -5517,25 +5961,19 @@ impl Pipeline {
             tracing::error!("MTP graph mirror rewind failed after verify commit");
             return None;
         }
-        let warm_off = std::env::var("CMF_SPEC_WARM").is_ok_and(|v| v == "0");
         if !warm_off && a > 0 {
             // Graph arm: all accepted pairs in ONE batched run over the
             // MTP block; the token graph one by one if the batch declines.
             let mut warmed = false;
             #[cfg(target_os = "macos")]
             if metal_native && self.mtp_graph_mode == Some(true) {
-                // all accepted pairs in ONE b-row graph run over the MTP
-                // block (its input projection folded in); one by one on
-                // the token graph if that declines
-                let pairs: Vec<(&[f32], u32)> = (0..a)
-                    .map(|j| {
-                        (
-                            &hiddens[j * self.hidden_size..(j + 1) * self.hidden_size],
-                            ids[j],
-                        )
-                    })
-                    .collect();
-                warmed = self.mtp_warm_batch_metal(m, &pairs, next_pos);
+                // the batched warm-up was submitted before the trunk
+                // commit: collect it here; one by one on the token graph
+                // if it declined (or failed)
+                warmed = match warm_pending.take() {
+                    Some(p) => self.mtp_warm_batch_finish(m, p),
+                    None => false,
+                };
                 if !warmed {
                     warmed = true;
                     for j in 0..a {
@@ -5589,8 +6027,14 @@ impl Pipeline {
         // The sampler's contract: logits of the LAST verified position —
         // unless a rejected draft already drew the correction, in which
         // case the loop top commits that token and samples nothing.
+        spec_stamp("c.warm");
         if let Some(c) = forced {
             self.spec_forced = Some(c);
+            self.graph_logits = None;
+        } else if greedy_dev && logits.is_empty() {
+            // the row's argmax IS the token the loop top would pick from
+            // it (plain greedy, no penalties): commit it as forced
+            self.spec_forced = Some(ids[a]);
             self.graph_logits = None;
         } else {
             let mut row = logits[a * lm_rows..(a + 1) * lm_rows].to_vec();
@@ -5603,6 +6047,7 @@ impl Pipeline {
             self.graph_logits = Some(row);
         }
         let new_hidden = hiddens[a * self.hidden_size..(a + 1) * self.hidden_size].to_vec();
+        spec_stamp("c.row");
         // Three phases, not two. The round's wall clock was 4 ms longer
         // than draft+verify and the difference had nowhere to be seen:
         // the accepted prefix re-runs the MTP block once per token to
@@ -5646,6 +6091,7 @@ impl Pipeline {
             }
             self.spec_k_adapt = Some(k_next);
         }
+        spec_stamp("end");
         Some((drafts[..a].to_vec(), next_pos + a + 1, new_hidden))
     }
 
@@ -8674,6 +9120,10 @@ impl Pipeline {
         b: usize,
         prefill: bool,
         spec: Option<((usize, usize, usize), &[f32], &mut Vec<f32>)>,
+        // Greedy verify: (row length scored, the b argmax ids out) — the
+        // head's argmax runs on the device and the logits plane is NOT
+        // read back (`spec.2` stays empty).
+        mut argmax_out: Option<(usize, &mut Vec<u32>)>,
     ) -> MetalRowsRun {
         use crate::gpu_metal::{GraphDims, VerifyGraph};
         // The previous round's commit may still be replaying into the
@@ -8685,6 +9135,7 @@ impl Pipeline {
             tracing::error!("Metal rows graph: the pending async replay failed");
             return MetalRowsRun::Failed;
         }
+        spec_stamp("v.wait");
         let want = self.gdn_cfg.map(|c| c.state_len()).unwrap_or(0);
         for l in &mut self.kv_cache.layers {
             if l.linear_state.len() != want && want > 0 {
@@ -8694,6 +9145,7 @@ impl Pipeline {
         let Some((plan, model, gcfg)) = self.metal_rows_plan() else {
             return MetalRowsRun::Declined;
         };
+        spec_stamp("v.plan");
         let dims = GraphDims {
             hidden: self.hidden_size,
             eps: self.rms_eps as f32,
@@ -8812,19 +9264,42 @@ impl Pipeline {
             if !graph.encode_lm_head_b(final_norm, lm) {
                 return MetalRowsRun::Declined;
             }
+            // The device argmax is an OPTIMISATION, never a reason to
+            // decline the round: if it will not encode, drop it and read
+            // the logits plane back the old way (the head is encoded
+            // either way, so the rows are there).
+            if let Some((n, _)) = argmax_out.as_ref() {
+                if !graph.encode_argmax_b(*n) {
+                    argmax_out = None;
+                }
+            }
         }
+        spec_stamp("v.enc");
         if !graph.sync() {
             return MetalRowsRun::Failed;
         }
-        if let Some((lm, _, logits)) = spec {
-            logits.resize(b * lm.1, 0.0);
-            if !graph.read_logits(logits) {
-                return MetalRowsRun::Failed;
+        spec_stamp("v.gpu");
+        match (spec, argmax_out) {
+            (Some(_), Some((_, ids))) => {
+                ids.resize(b, 0);
+                if !graph.read_argmax(ids) {
+                    return MetalRowsRun::Failed;
+                }
+                spec_stamp("v.am");
             }
+            (Some((lm, _, logits)), None) => {
+                logits.resize(b * lm.1, 0.0);
+                if !graph.read_logits(logits) {
+                    return MetalRowsRun::Failed;
+                }
+                spec_stamp("v.lg");
+            }
+            (None, _) => {}
         }
         if !graph.read_hidden(hiddens) {
             return MetalRowsRun::Failed;
         }
+        spec_stamp("v.hid");
         MetalRowsRun::Completed(MetalVerifyPending {
             graph,
             gdn_layers,
@@ -8844,6 +9319,7 @@ impl Pipeline {
         positions: &[usize],
         b: usize,
         spec: Option<((usize, usize, usize), &[f32], &mut Vec<f32>)>,
+        argmax_out: Option<(usize, &mut Vec<u32>)>,
     ) -> crate::gpu::BatchGraphOutcome {
         let _t0 = std::time::Instant::now();
         if positions.len() != b
@@ -8852,7 +9328,7 @@ impl Pipeline {
         {
             return crate::gpu::BatchGraphOutcome::Declined;
         }
-        let pending = match self.metal_rows_run(hiddens, positions[0], b, false, spec) {
+        let pending = match self.metal_rows_run(hiddens, positions[0], b, false, spec, argmax_out) {
             MetalRowsRun::Declined => return crate::gpu::BatchGraphOutcome::Declined,
             MetalRowsRun::Failed => return crate::gpu::BatchGraphOutcome::Failed,
             MetalRowsRun::Completed(pending) => pending,
@@ -8890,7 +9366,7 @@ impl Pipeline {
             let e = self.embed_single(id);
             hiddens[j * hs..(j + 1) * hs].copy_from_slice(&e);
         }
-        let mut pending = match self.metal_rows_run(&mut hiddens, start_pos, b, true, spec) {
+        let mut pending = match self.metal_rows_run(&mut hiddens, start_pos, b, true, spec, None) {
             MetalRowsRun::Declined => return MetalPrefillOutcome::Declined,
             MetalRowsRun::Failed => {
                 METAL_PREFILL_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -9071,6 +9547,7 @@ impl Pipeline {
         if !pending.graph.commit(n, &mut outs) {
             return false;
         }
+        spec_stamp("c.replay");
         let (nkv, hd) = (self.num_kv_heads, self.head_dim);
         // Read every layer before mutating any CPU cache.  Missing rows are
         // terminal after the replay has executed; never append a partial KV
@@ -9104,25 +9581,27 @@ impl Pipeline {
             }
             crate::gpu_metal::kv_mirror_set_stored(self.graph_kv_id, li, cpu_stored + n);
         }
+        spec_stamp("c.kv");
         true
     }
 
     /// The round's warm-ups as ONE b-row graph run over the MTP block on
     /// Metal: `pairs` = (trunk hidden, next token) at consecutive positions
-    /// from `first_pos`; the block's input projection is folded in, the
-    /// appended K/V rows are pulled into the CPU MTP cache. False = the
-    /// graph declined (nothing appended).
+    /// from `first_pos`; the block's input projection is folded in. This
+    /// half encodes and SUBMITS (no wait); `mtp_warm_batch_finish` waits
+    /// and pulls the appended K/V rows into the CPU MTP cache. None = the
+    /// graph declined (nothing submitted, nothing appended).
     #[cfg(target_os = "macos")]
-    fn mtp_warm_batch_metal(
+    fn mtp_warm_batch_submit(
         &mut self,
         m: &mut MtpModule,
         pairs: &[(&[f32], u32)],
         first_pos: usize,
-    ) -> bool {
+    ) -> Option<MetalWarmPending> {
         use crate::gpu_metal::{AttnDeviceParams, AttnGpuLayer, GraphDims, MetalFfn, VerifyGraph};
         let b = pairs.len();
         if b == 0 || b > 512 || m.kv.mode != crate::kv_cache::KvMode::F32 || m.kv.o1.is_some() {
-            return false;
+            return None;
         }
         let AttnKind::Full {
             wq,
@@ -9136,31 +9615,31 @@ impl Pipeline {
             bias: None,
         } = &m.layer.attn
         else {
-            return false;
+            return None;
         };
         let FfnKind::Dense(d) = &m.layer.ffn else {
-            return false;
+            return None;
         };
         if !d.segs.is_empty() {
-            return false;
+            return None;
         }
         let (Some(pq), Some(pk), Some(pv), Some(po)) =
             (wq.q1_parts(), wk.q1_parts(), wv.q1_parts(), wo.q1_parts())
         else {
-            return false;
+            return None;
         };
         let (Some(g), Some(u), Some(dn)) = (
             d.gate_proj.q1_parts(),
             d.up_proj.q1_parts(),
             d.down_proj.q1_parts(),
         ) else {
-            return false;
+            return None;
         };
         let Some(eh) = m.eh_proj.q1_parts() else {
-            return false;
+            return None;
         };
         let QTensor::Mapped { model, .. } = wq else {
-            return false;
+            return None;
         };
         let model = model.clone();
         let hs = self.hidden_size;
@@ -9177,9 +9656,11 @@ impl Pipeline {
             eps: self.rms_eps as f32,
             gemma: self.norm_style == cortiq_core::NormStyle::Gemma,
         };
+        spec_stamp("w.cat");
         let Some(mut graph) = VerifyGraph::new_via_proj(&model, dims, eh, &cat, b) else {
-            return false;
+            return None;
         };
+        spec_stamp("w.new");
         let l = AttnGpuLayer {
             attn_norm: &m.layer.input_norm,
             post_norm: &m.layer.post_norm,
@@ -9206,8 +9687,13 @@ impl Pipeline {
             let cpu_k: Vec<&[f32]> = (0..nkv).map(|g| cache.head_keys(g)).collect();
             let cpu_v: Vec<&[f32]> = (0..nkv).map(|g| cache.head_values(g)).collect();
             cpu_stored = cpu_k[0].len() / hd;
-            if cpu_stored != first_pos {
-                return false;
+            // The cache may LAG the position (rows nobody warmed): the
+            // pairs land at cpu_stored.. with their true RoPE positions
+            // first_pos.., exactly what the one-by-one warm does. A cache
+            // AHEAD of the position is a real inconsistency.
+            if cpu_stored > first_pos {
+                spec_stamp("w.decl");
+                return None;
             }
             let p = AttnDeviceParams {
                 kv_id: self.mtp_kv_id(),
@@ -9231,12 +9717,52 @@ impl Pipeline {
                 o1: None,
             };
             if !graph.attn_ok(&l, &p) || !graph.encode_attn_b(&l, &p) {
-                return false;
+                return None;
             }
         }
+        spec_stamp("w.enc");
+        if !graph.submit() {
+            return None;
+        }
+        spec_stamp("w.sub");
+        Some(MetalWarmPending {
+            graph,
+            cpu_stored,
+            b,
+        })
+    }
+
+    /// Submit and finish in one call (the prefill's MTP warm-up, where
+    /// nothing runs in between).
+    #[cfg(target_os = "macos")]
+    fn mtp_warm_batch_metal(
+        &mut self,
+        m: &mut MtpModule,
+        pairs: &[(&[f32], u32)],
+        first_pos: usize,
+    ) -> bool {
+        match self.mtp_warm_batch_submit(m, pairs, first_pos) {
+            Some(p) => self.mtp_warm_batch_finish(m, p),
+            None => false,
+        }
+    }
+
+    /// Second half of the batched warm-up: wait for the submitted graph,
+    /// pull its b appended K/V rows into the CPU MTP cache, re-point the
+    /// mirror. False = the command buffer failed or the rows are missing
+    /// (nothing appended; the caller falls back to the one-by-one warm).
+    #[cfg(target_os = "macos")]
+    fn mtp_warm_batch_finish(&mut self, m: &mut MtpModule, pending: MetalWarmPending) -> bool {
+        let MetalWarmPending {
+            mut graph,
+            cpu_stored,
+            b,
+        } = pending;
+        let (nkv, hd) = (self.num_kv_heads, self.head_dim);
         if !graph.sync() {
             return false;
         }
+        spec_stamp("w.gpu");
         let mut kbuf = vec![0f32; b * nkv * hd];
         let mut vbuf = vec![0f32; b * nkv * hd];
         if !crate::gpu_metal::kv_mirror_read_rows(
@@ -9263,6 +9789,7 @@ impl Pipeline {
             Self::MTP_LAYER_BASE,
             cpu_stored + b,
         );
+        spec_stamp("w.kv");
         true
     }
 
@@ -9391,6 +9918,7 @@ impl Pipeline {
             x = self.mtp_block_input(m, hidden, next_token);
             graph = TokenGraph::new(&model, dims, &x)?;
         }
+        spec_stamp("d.in");
         let l = AttnGpuLayer {
             attn_norm: &m.layer.input_norm,
             post_norm: &m.layer.post_norm,
@@ -9463,9 +9991,11 @@ impl Pipeline {
                 graph.encode_lm_head(&m.final_norm, lm);
             }
         }
+        spec_stamp("d.enc");
         if graph.sync_checked().is_err() {
             return None;
         }
+        spec_stamp("d.gpu");
         let mut logits = Vec::new();
         if let Some(lm) = lm {
             let n_read = draft_rows.min(lm.1).min(self.vocab_size);
@@ -9489,7 +10019,273 @@ impl Pipeline {
         }
         attention::recycle_buf(&mut krow);
         attention::recycle_buf(&mut vrow);
+        spec_stamp("d.rd");
         Some((logits, x))
+    }
+
+    /// `CMF_MTP_CHAIN=0` keeps the per-step draft (one submit and one
+    /// host round trip per MTP step); the default drafts the whole chain
+    /// in one command buffer when the round is plain greedy.
+    ///
+    /// Measured on an M4 (24 GB), Qwen3.8-27B q4tp, P3 at 160 tokens,
+    /// k=7, six runs per arm alternating inside one lock window — the
+    /// round's draft phase (median over the 34 rounds of a run) is
+    /// 34.5 ms per round old against 30.1 new, i.e. 4.93 → 4.31 ms per
+    /// draft step. That is the whole prize: the 7 submits cost ~0.6 ms
+    /// each in host and submit latency and nothing else changes —
+    /// acceptance (3.41 of 7) and tokens per round (4.41) are identical,
+    /// and the round is 289 → 285 ms, decode 13.8 → 14.0 tok/s.
+    fn mtp_chain_on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("CMF_MTP_CHAIN").as_deref() != Ok("0"))
+    }
+
+    /// The round's k greedy drafts as ONE command buffer on Metal: the MTP
+    /// block k times back to back, each step's token embedding gathered
+    /// on the device from the argmax the step before it wrote, the head
+    /// over the round's shortlist (or the full head during a full-head
+    /// streak — decided once, before the chain, exactly as the per-step
+    /// path decides it per step, since `draft_full_streak` only moves on
+    /// a commit). One wait, then the k ids and the k appended K/V rows
+    /// come back; the CPU MTP cache ends where k `mtp_step_metal` calls
+    /// would have left it. `Err(false)` = declined before anything was
+    /// committed (the per-step path takes the round); `Err(true)` = the
+    /// command buffer failed after commit.
+    #[cfg(target_os = "macos")]
+    fn mtp_draft_chain_metal(
+        &mut self,
+        m: &mut MtpModule,
+        hidden: &[f32],
+        t_next: u32,
+        position: usize,
+        k: usize,
+    ) -> Result<Vec<u32>, bool> {
+        use crate::gpu_metal::{AttnDeviceParams, AttnGpuLayer, GraphDims, MetalFfn, TokenGraph};
+        if k == 0
+            || k > 64
+            || !Self::mtp_chain_on()
+            || std::env::var("CMF_MTP_GRAPH").as_deref() == Ok("0")
+            || !crate::gpu::q1_force()
+            || !crate::gpu::enabled_here()
+            || self.attn_softcap > 0.0
+            || self.attention_heads_per_layer.is_some()
+            || m.kv.mode != crate::kv_cache::KvMode::F32
+            || m.kv.o1.is_some()
+            // the chain gathers embeddings itself: only the plain table
+            || self.dsv4.is_some()
+            || self.dsv41.is_some()
+            || self.qwen4_exp.is_some()
+            || self.g3n.is_some()
+        {
+            return Err(false);
+        }
+        let AttnKind::Full {
+            wq,
+            wk,
+            wv,
+            wo,
+            q_norm,
+            k_norm,
+            output_gate,
+            softplus_gate: None,
+            bias: None,
+        } = &m.layer.attn
+        else {
+            return Err(false);
+        };
+        let FfnKind::Dense(d) = &m.layer.ffn else {
+            return Err(false);
+        };
+        if d.act != Act::Silu || !d.segs.is_empty() {
+            return Err(false);
+        }
+        let (Some(pq), Some(pk), Some(pv), Some(po)) =
+            (wq.q1_parts(), wk.q1_parts(), wv.q1_parts(), wo.q1_parts())
+        else {
+            return Err(false);
+        };
+        let (Some(g), Some(u), Some(dn)) = (
+            d.gate_proj.q1_parts(),
+            d.up_proj.q1_parts(),
+            d.down_proj.q1_parts(),
+        ) else {
+            return Err(false);
+        };
+        let (Some(eh), Some(lm)) = (m.eh_proj.q1_parts(), self.weights.lm_head.q1_parts()) else {
+            return Err(false);
+        };
+        let QTensor::Mapped { model, .. } = wq else {
+            return Err(false);
+        };
+        let model = model.clone();
+        // the embedding table: a q4tp tensor of the SAME blob, no Prism
+        // inverse-embedding post-pass
+        let QTensor::Mapped {
+            model: em,
+            idx: eidx,
+            dtype: cortiq_core::TensorDtype::Q4TiledP,
+            ..
+        } = &self.weights.embed_tokens
+        else {
+            return Err(false);
+        };
+        if !std::sync::Arc::ptr_eq(em, &model)
+            || crate::prism::is_inverse_embedding(&model, &model.tensors[*eidx].name)
+        {
+            return Err(false);
+        }
+        let embed = (
+            *eidx,
+            self.weights.embed_tokens.rows(),
+            self.weights.embed_tokens.cols(),
+        );
+        if embed.2 != self.hidden_size || hidden.len() != self.hidden_size {
+            return Err(false);
+        }
+        let dims = GraphDims {
+            hidden: self.hidden_size,
+            eps: self.rms_eps as f32,
+            gemma: self.norm_style == cortiq_core::NormStyle::Gemma,
+        };
+        let Some(mut graph) = TokenGraph::new(&model, dims, hidden) else {
+            return Err(false);
+        };
+        if !graph.chain_embed_ok(embed) || !graph.lm_head_ok(lm) {
+            return Err(false);
+        }
+        let l = AttnGpuLayer {
+            attn_norm: &m.layer.input_norm,
+            post_norm: &m.layer.post_norm,
+            wq: pq,
+            wk: pk,
+            wv: pv,
+            wo: po,
+            ffn: MetalFfn::Dense {
+                gate: g,
+                up: u,
+                down: dn,
+            },
+        };
+        let (nh, nkv, hd, rd) = (
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            self.rotary_dim,
+        );
+        let inv_freq = self.inv_freq.clone();
+        let draft_rows = self.draft_head_rows(lm.1);
+        let n_arg = draft_rows.min(lm.1).min(self.vocab_size);
+        if n_arg == 0 {
+            return Err(false);
+        }
+        // `CMF_MTP_CHAIN_SPLIT=1` commits each step as it is encoded, so
+        // the GPU starts on step 0 while the host is still encoding step
+        // 1 — a probe for whether the host encode is on the critical
+        // path. It is not: three runs each, draft 30.0 ms per round split
+        // against 30.1 whole, and the whole chain's host encode measures
+        // 0.3 ms against a 29.7 ms wait. Kept as a probe, off by default.
+        let split = std::env::var("CMF_MTP_CHAIN_SPLIT").as_deref() == Ok("1");
+        let t_chain = std::time::Instant::now();
+        graph.chain_ids_init(t_next, k);
+        let cpu_stored;
+        {
+            let cache = &m.kv;
+            let cpu_k: Vec<&[f32]> = (0..nkv).map(|g| cache.head_keys(g)).collect();
+            let cpu_v: Vec<&[f32]> = (0..nkv).map(|g| cache.head_values(g)).collect();
+            cpu_stored = cpu_k[0].len() / hd;
+            for j in 0..k {
+                if !graph.encode_chain_input(
+                    embed,
+                    j as u32,
+                    &m.enorm,
+                    &m.hnorm,
+                    self.embed_multiplier,
+                    eh,
+                ) {
+                    return Err(false);
+                }
+                // step j's mirror row: the mirror is re-pointed at the CPU
+                // rows before step 0 and advances by one per step; its
+                // resync (never taken past step 0) reads the CPU rows
+                let p = AttnDeviceParams {
+                    kv_id: self.mtp_kv_id(),
+                    layer: Self::MTP_LAYER_BASE,
+                    nh,
+                    nkv,
+                    hd,
+                    rd,
+                    position: position + j,
+                    scale: self.attn_scale,
+                    eps: self.rms_eps as f32,
+                    gemma: self.norm_style == cortiq_core::NormStyle::Gemma,
+                    late_qk_norm: self.qk_norm_after_rope,
+                    output_gate: *output_gate,
+                    q_norm: q_norm.as_deref(),
+                    k_norm: k_norm.as_deref(),
+                    inv_freq: &inv_freq,
+                    cpu_k: cpu_k.clone(),
+                    cpu_v: cpu_v.clone(),
+                    cpu_stored: cpu_stored + j,
+                    o1: None,
+                };
+                if !graph.attn_device_ok(&l, &p) || !graph.encode_attn_device(&l, &p) {
+                    return Err(false);
+                }
+                if draft_rows < lm.1 {
+                    if !graph.encode_lm_head_part(&m.final_norm, lm, draft_rows) {
+                        return Err(false);
+                    }
+                } else {
+                    graph.encode_lm_head(&m.final_norm, lm);
+                }
+                if !graph.encode_argmax(n_arg, j as u32 + 1) {
+                    return Err(false);
+                }
+                if split {
+                    // CMF_MTP_CHAIN_SPLIT=1: commit every step so the GPU
+                    // starts on step 0 while the host encodes the rest
+                    graph.commit();
+                }
+            }
+        }
+        let t_enc = t_chain.elapsed();
+        if graph.sync_checked().is_err() {
+            return Err(true);
+        }
+        if std::env::var_os("CMF_GRAPH_SPEC_TIME").is_some() {
+            eprintln!(
+                "mtp-chain: encode {:.1} ms | wait {:.1} ms (k={k}, head rows {draft_rows}{})",
+                t_enc.as_secs_f64() * 1e3,
+                (t_chain.elapsed() - t_enc).as_secs_f64() * 1e3,
+                if split { ", split" } else { "" }
+            );
+        }
+        let mut ids = vec![0u32; k];
+        if !graph.chain_ids_read(&mut ids) {
+            return Err(true);
+        }
+        let mut kbuf = vec![0f32; k * nkv * hd];
+        let mut vbuf = vec![0f32; k * nkv * hd];
+        if !crate::gpu_metal::kv_mirror_read_rows(
+            self.mtp_kv_id(),
+            Self::MTP_LAYER_BASE,
+            nkv,
+            hd,
+            cpu_stored,
+            k,
+            &mut kbuf,
+            &mut vbuf,
+        ) {
+            return Err(true);
+        }
+        for r in 0..k {
+            m.kv.append(
+                &kbuf[r * nkv * hd..(r + 1) * nkv * hd],
+                &vbuf[r * nkv * hd..(r + 1) * nkv * hd],
+                &[],
+            );
+        }
+        Ok(ids)
     }
 
     fn try_batch_graph_wgpu(

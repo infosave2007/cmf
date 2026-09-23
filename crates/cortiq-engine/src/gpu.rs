@@ -479,6 +479,13 @@ fn probe_on_for(c: OpClass) -> bool {
     probe_on()
 }
 
+/// Is the per-op GPU/CPU probe enabled (`CMF_GPU_PROBE`, default on)?
+/// The native Metal decode route never consults it — `q1_force` routes
+/// the token graph to the device outright — so it is reported, not used.
+pub fn probe_enabled() -> bool {
+    probe_on()
+}
+
 fn probe_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {

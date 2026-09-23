@@ -8,6 +8,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Native Metal is now fast with no flags at all. Qwen3.8-27B q4tp on an
+  M4 (24 GB), cooled and interleaved against the previous build: a code
+  prompt at the CLI defaults (sampling 0.7 / repetition penalty 1.1 /
+  top-k 40) 6.6 → 15.8 tok/s, the same prompt with `--greedy`
+  14.0 → 17.0, a 40-token answer 10.3 → 17.1, the speculative bench
+  16.1 → 20.2, essays unchanged (greedy 7.5 → 7.9, sampled 6.6 → 6.5).
+  The pieces follow.
+- Native Metal runs its fastest known configuration with no environment
+  variables, and says so: the first generation logs one line under
+  `RUST_LOG=info` (`metal native: spec k=7 greedy (batched verify, draft
+  shortlist 65536, trial: proxy), state4 on, async replay on, prefill
+  graph on, MTP graph on, attend auto, probe bypassed (q1 force)`). The speculation
+  trial no longer decodes eight plain tokens up front on Metal (about
+  1.2 s of every answer on the 27B): the loop speculates from the first
+  token, keeps speculating while the rounds land 3.5+ tokens each, and
+  otherwise times the plain path over the fewest tokens that measure it
+  (two on the 27B, up to eight on a small model) before the unchanged
+  keep/stop rule decides. Greedy output is byte-identical to the previous
+  binary on the code, essay and Russian prompts.
+- Native Metal speculates on the sampling and the penalized arms by
+  default, not only on plain greedy: the Metal verify tile is flat in
+  the batch (a round costs ~1.9 plain tokens), so both pay there where
+  they did not on the 5090. Before this the CLI's own defaults (rep 1.1)
+  never speculated on Metal. Measured on the 27B / M4, cooled and
+  interleaved, CLI defaults with seed 42, code prompt: 6.6 → 15.8 tok/s;
+  greedy with rep 1.1 speculates with the text byte-identical to the
+  plain path and to the previous binary (code and essay prompts). The per-round watchdog
+  still turns speculation off where it loses. `CMF_GRAPH_SPEC_SAMPLE=0`
+  keeps the sampling arm plain, `CMF_GRAPH_SPEC=0` all of it; a sampled
+  answer for a fixed seed differs from the previous binary (the
+  speculative sampler draws the same distribution through a different
+  random stream). wgpu/CUDA/CPU keep their gates.
+- Suppressed token ids (`enable_thinking: false` over the API suppresses
+  `<think>`) no longer keep a request off the speculative path on native
+  Metal: the draft and the verify mask the same ids, and the
+  penalized-argmax verify regime scores them exactly. wgpu/CUDA/CPU keep
+  the old rule — penalties and suppressed ids take the plain path there —
+  because no card but this Mac was measured.
+- OpenAI endpoints: `temperature: 0` is greedy in the `cortiq run
+  --greedy` sense (repetition penalty 1.0 unless the request sets one),
+  so a greedy request speculates; `repetition_penalty` and
+  `presence_penalty` are accepted as vLLM-style request fields on
+  `/v1/chat/completions` and `/v1/completions`.
+- The native-Metal verify reads back b draft ids instead of b × 248320
+  logits when the round is plain greedy: `argmax_rows` reduces each row
+  on the device (the host's tie rule, the highest index among equal
+  maxima), and the logits readback stays for sampling and penalties.
+  The verify's b-row scratch is sized once for eight rows, so a round
+  of a different width no longer allocates fresh Shared buffers — their
+  first touch is zero-filled by the driver inside the command buffer,
+  which is what the 400-450 ms outlier rounds were (two in 34 on a code
+  prompt, now none). The MTP warm-up is split into submit and finish so
+  its wait overlaps host work. `CMF_GRAPH_SPEC_TIME=2` prints per-round
+  host stamps; `CMF_METAL_VBUF_BC=0` restores the old scratch sizing.
+- A native-Metal speculative round drafts its whole chain in ONE command
+  buffer. The k MTP steps are encoded back to back; between them the
+  device closes the loop the host used to close — `argmax_slot` picks
+  each step's draft id from the head's logits (the sampler's tie rule,
+  the highest index among equal maxima) and `embed_q4tp_norm` gathers
+  and normalises that id's embedding row straight out of the q4tp table
+  — so the round pays one submit and one wait instead of seven of each.
+  The shortlist-versus-full-head decision is taken once before the chain
+  (`draft_full_streak` only moves on a commit, so per-step and whole-
+  chain see the same head), the MTP KV mirror advances one row per step
+  and the k appended rows land in the CPU cache exactly where k
+  `mtp_step_metal` calls would have left them. The chain takes the round
+  only when it is plain greedy on a q4tp embedding table of the loaded
+  blob; anything else (sampling, penalties, DSV4/Qwen4-exp/G3n routing,
+  a Prism inverse embedding) falls back to the per-step path, and
+  `CMF_MTP_CHAIN=0` forces it. Qwen3.8-27B q4tp on an M4 (24 GB), a code
+  prompt at 160 tokens, k=7, three runs an arm interleaved on a quiet
+  machine: the round's draft phase 35.5 → 31.6 ms, the round
+  272 → 268 ms, decode 16.8 → 17.1 tok/s, acceptance unchanged. Greedy output is byte-identical
+  to 0.7.2 on the code, essay and Russian prompts, and the per-round
+  draft ids are identical to the per-step path's.
 - Native Metal speculation folds the GDN state with a 4-lane re-tile of
   the state kernel (`gdn_state_b4`, `CMF_METAL_STATE4=0` restores the
   old tile): the 27B verify pass over 8 rows spends 6.7 ms on the state
