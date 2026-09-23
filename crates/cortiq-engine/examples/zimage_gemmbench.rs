@@ -61,9 +61,11 @@ mod imp {
         let mut v: Vec<MmCfg> = args
             .iter()
             .filter_map(|a| {
+                // suffix d = direct (no shared staging), h = f16-accumulate probe
                 let direct = a.ends_with('d');
-                let t: Vec<u32> = a.trim_end_matches('d').split(',').filter_map(|x| x.parse().ok()).collect();
-                (t.len() == 5).then(|| MmCfg { direct, ..MmCfg::new(t[0], t[1], t[2], t[3], t[4], epi) })
+                let acc16_probe = a.ends_with('h');
+                let t: Vec<u32> = a.trim_end_matches(['d', 'h']).split(',').filter_map(|x| x.parse().ok()).collect();
+                (t.len() == 5).then(|| MmCfg { direct, acc16_probe, ..MmCfg::new(t[0], t[1], t[2], t[3], t[4], epi) })
             })
             .collect();
         if v.is_empty() {
@@ -119,7 +121,7 @@ mod imp {
     fn cmd_mm(args: &[String]) {
         for &(name, n, k, epi) in &SITES {
             for cfg in parse_cfgs(args, epi) {
-                let mut line = format!("{name:>4} N={n:<5} K={k:<5} {:?}", (cfg.bm, cfg.bn, cfg.bk, cfg.wm, cfg.wn, cfg.direct));
+                let mut line = format!("{name:>4} N={n:<5} K={k:<5} {:?}", (cfg.bm, cfg.bn, cfg.bk, cfg.wm, cfg.wn, cfg.direct, cfg.acc16_probe));
                 for &m in &MS {
                     match bench::mm_time(cfg, m, k, n) {
                         Some(s) => line += &format!("  M{m} {:.2}ms {:.1}TF", s * 1e3, tflops(m, n, k, s)),
@@ -242,7 +244,7 @@ mod imp {
         let nh = 1usize;
         let ld = 384usize;
         let len: usize = args.first().and_then(|s| s.parse().ok()).unwrap_or(64);
-        for case in ["zeroq", "rand", "onehotv"] {
+        for case in ["zeroq", "rand", "onehotv", "vk", "vd"] {
             let mut rng = Rng(31);
             let mut qkv = vec![0u16; len * ld];
             for r in 0..len {
@@ -250,6 +252,12 @@ mod imp {
                     let v = match (case, c / 128) {
                         ("zeroq", 0) => 0.0,
                         ("onehotv", 2) => if c - 256 == r % 128 { 1.0 } else { 0.0 },
+                        // zero Q (uniform softmax) with V depending only on the
+                        // key (vk: missing keys show) or only on the dim (vd:
+                        // a dim permutation shows).
+                        ("vk" | "vd", 0) => 0.0,
+                        ("vk", 2) => r as f32 / len as f32,
+                        ("vd", 2) => (c - 256) as f32 / 128.0,
                         _ => rng.gauss(),
                     };
                     qkv[r * ld + c] = f16(v);
@@ -269,9 +277,9 @@ mod imp {
                     }
                 }
                 let rf = attn_ref(&qkv, nh, (0, len), 0, worst.1);
-                println!("{case} {f:?}: nonfinite {nan}, worst |err| {:.3e} at q{} d{} (got {:.4} ref {:.4}); q0 d0..4 got {:?} ref {:?}",
+                println!("{case} {f:?}: nonfinite {nan}, worst |err| {:.3e} at q{} d{} (got {:.4} ref {:.4}); q0 d[0,1,2,3,17,64,100,127] got {:?} ref {:?}",
                     worst.0, worst.1, worst.2, out[worst.1 * 128 + worst.2], rf[worst.2],
-                    &out[0..4], attn_ref(&qkv, nh, (0, len), 0, 0)[0..4].iter().map(|v| *v as f32).collect::<Vec<_>>());
+                    [0usize, 1, 2, 3, 17, 64, 100, 127].map(|d| out[d]), { let r0 = attn_ref(&qkv, nh, (0, len), 0, 0); [0usize, 1, 2, 3, 17, 64, 100, 127].map(|d| r0[d] as f32) });
             }
         }
     }
@@ -589,7 +597,7 @@ mod imp {
         let resident = std::env::var("ZB_RESIDENT").as_deref() == Ok("1");
         let d = zi::ZDims::TURBO;
         let (h, inter, nh) = (d.h, d.inter, d.nh);
-        let path = std::path::PathBuf::from(std::env::var("ZB_TMP").unwrap_or("/root/zb/tmp".into())).join("lumina_q4tp_block.cmf");
+        let path = std::path::PathBuf::from(std::env::var("ZB_TMP").unwrap_or("/root/zb/tmp".into())).join("lumina_q4tp_block_v2.cmf");
         if !path.exists() {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             let mut tensors = Vec::new();
@@ -601,6 +609,9 @@ mod imp {
                 ("b.w1", inter, h),
                 ("b.w3", inter, h),
                 ("b.w2", h, inter),
+                // `tensor_weight` bounds-checks rows·cols BYTES past the
+                // offset (not the q4tp payload): tail padding for the last one.
+                ("b.pad", inter, h),
             ] {
                 // Constant nibbles/params: finite values, speed is value-blind.
                 tensors.push(TensorSpec { name: name.into(), dtype: TensorDtype::Q4TiledP, shape: vec![rows, cols], data: vec![0x11u8; q4tp_len(rows, cols)] });
