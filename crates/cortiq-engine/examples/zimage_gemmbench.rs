@@ -678,6 +678,257 @@ mod imp {
         );
     }
 
+
+    // ── the contract end to end on a tiny container vs an f64 host forward ──
+
+    struct HostBlk {
+        wq: Vec<f64>,
+        wk: Vec<f64>,
+        wv: Vec<f64>,
+        wo: Vec<f64>,
+        w1: Vec<f64>,
+        w3: Vec<f64>,
+        w2: Vec<f64>,
+        norms: Vec<Vec<f32>>,
+    }
+
+    /// One Z-Image block in f64 (spec §2.4), segments attend within
+    /// themselves; `mods` = [scale_msa, gate_msa, scale_mlp, gate_mlp][h].
+    fn host_block(x: &mut [Vec<f64>], segs: &[(usize, usize)], rc: &[f32], rs: &[f32], b: &HostBlk, mods: &[f64], h: usize, nh: usize, inter: usize) {
+        let m = x.len();
+        let nf: Vec<Vec<f64>> = b.norms.iter().map(|v| v.iter().map(|&x| x as f64).collect()).collect();
+        let (s_msa, g_msa, s_mlp, g_mlp) = (&mods[0..h], &mods[h..2 * h], &mods[2 * h..3 * h], &mods[3 * h..4 * h]);
+        let mut q = vec![vec![0f64; h]; m];
+        let mut k = vec![vec![0f64; h]; m];
+        let mut v = vec![vec![0f64; h]; m];
+        for r in 0..m {
+            let xn: Vec<f64> = rms(&x[r], &nf[0], 1e-5).iter().zip(s_msa).map(|(a, s)| a * (1.0 + s)).collect();
+            q[r] = matvec(&xn, &b.wq, h);
+            k[r] = matvec(&xn, &b.wk, h);
+            v[r] = matvec(&xn, &b.wv, h);
+            for hh in 0..nh {
+                for (buf, w) in [(&mut q[r], &nf[4]), (&mut k[r], &nf[5])] {
+                    let n = rms(&buf[hh * 128..(hh + 1) * 128], w, 1e-5);
+                    for p in 0..64 {
+                        let (c, s) = (rc[r * 64 + p] as f64, rs[r * 64 + p] as f64);
+                        buf[hh * 128 + 2 * p] = n[2 * p] * c - n[2 * p + 1] * s;
+                        buf[hh * 128 + 2 * p + 1] = n[2 * p] * s + n[2 * p + 1] * c;
+                    }
+                }
+            }
+        }
+        let mut att = vec![vec![0f64; h]; m];
+        for &(off, len) in segs {
+            for i in 0..len {
+                for hh in 0..nh {
+                    let sc: Vec<f64> = (0..len)
+                        .map(|j| (0..128).map(|dd| q[off + i][hh * 128 + dd] * k[off + j][hh * 128 + dd]).sum::<f64>() / (128f64).sqrt())
+                        .collect();
+                    let mx = sc.iter().cloned().fold(f64::MIN, f64::max);
+                    let e: Vec<f64> = sc.iter().map(|s| (s - mx).exp()).collect();
+                    let l: f64 = e.iter().sum();
+                    for dd in 0..128 {
+                        att[off + i][hh * 128 + dd] = (0..len).map(|j| e[j] * v[off + j][hh * 128 + dd]).sum::<f64>() / l;
+                    }
+                }
+            }
+        }
+        for r in 0..m {
+            let on = rms(&matvec(&att[r], &b.wo, h), &nf[1], 1e-5);
+            for c in 0..h {
+                x[r][c] += g_msa[c].tanh() * on[c];
+            }
+            let xn2: Vec<f64> = rms(&x[r], &nf[2], 1e-5).iter().zip(s_mlp).map(|(a, s)| a * (1.0 + s)).collect();
+            let a1 = matvec(&xn2, &b.w1, inter);
+            let a3 = matvec(&xn2, &b.w3, inter);
+            let hid: Vec<f64> = a1.iter().zip(&a3).map(|(g, u)| g / (1.0 + (-g).exp()) * u).collect();
+            let yn = rms(&matvec(&hid, &b.w2, h), &nf[3], 1e-5);
+            for c in 0..h {
+                x[r][c] += g_mlp[c].tanh() * yn[c];
+            }
+        }
+    }
+
+    fn rope_rows(ids: &[[usize; 3]]) -> (Vec<f32>, Vec<f32>) {
+        let (mut c, mut s) = (vec![0f32; ids.len() * 64], vec![0f32; ids.len() * 64]);
+        for (t, pos) in ids.iter().enumerate() {
+            let mut j = 0;
+            for (ax, dim) in [(0usize, 32usize), (1, 48), (2, 48)] {
+                for pp in 0..dim / 2 {
+                    let f = 1.0 / 256f64.powf(2.0 * pp as f64 / dim as f64);
+                    let ang = (pos[ax] as f64 * f) as f32;
+                    c[t * 64 + j] = ang.cos();
+                    s[t * 64 + j] = ang.sin();
+                    j += 1;
+                }
+            }
+        }
+        (c, s)
+    }
+
+    /// `gpu::zimage_prepare` + `zimage_step` (this crate's wgpu backend) on a
+    /// tiny F16/BF16 container — embed, x_pad rows, 2 noise-refiner blocks,
+    /// [img, cap] assembly, 2 layers, final layer — against the same forward
+    /// in f64 on the host.
+    pub fn cmd_stepcheck(_args: &[String]) {
+        use cortiq_core::{CmfHeader, CmfModel, TensorDtype, TensorSpec, CMF_VERSION};
+        use cortiq_engine::gpu::{ZBlockRef, ZGeom, ZPrepareArgs, ZStepArgs};
+        use std::sync::Arc;
+        let (nh, h, inter) = (2usize, 256usize, 512usize);
+        let (gh, gw) = (6usize, 8usize);
+        let n_img = gh * gw; // 48 → n_img_p 64: 16 x_pad rows
+        let n_img_p = 64;
+        let n_cap_p = 32;
+        let nblk = 4;
+        let mut rng = Rng(2024);
+        let mut specs = Vec::new();
+        let mut host = Vec::new();
+        for bi in 0..nblk {
+            // block 3 stored BF16, the rest F16
+            let bf = bi == 3;
+            let mut t = |name: String, rows: usize, cols: usize| -> Vec<f64> {
+                let a = 1.7 / (cols as f32).sqrt();
+                let vals: Vec<f32> = (0..rows * cols).map(|_| rng.uni() * a).collect();
+                let (dtype, data, back): (TensorDtype, Vec<u8>, Vec<f64>) = if bf {
+                    let bits: Vec<u16> = vals.iter().map(|v| (v.to_bits() >> 16) as u16).collect();
+                    (TensorDtype::Bf16, bits.iter().flat_map(|b| b.to_le_bytes()).collect(), bits.iter().map(|&b| f32h(f16(f32::from_bits((b as u32) << 16))) as f64).collect())
+                } else {
+                    let bits: Vec<u16> = vals.iter().map(|&v| f16(v)).collect();
+                    (TensorDtype::F16, bits.iter().flat_map(|b| b.to_le_bytes()).collect(), bits.iter().map(|&b| f32h(b) as f64).collect())
+                };
+                specs.push(TensorSpec { name, dtype, shape: vec![rows, cols], data });
+                back
+            };
+            let wq = t(format!("b{bi}.q"), h, h);
+            let wk = t(format!("b{bi}.k"), h, h);
+            let wv = t(format!("b{bi}.v"), h, h);
+            let wo = t(format!("b{bi}.o"), h, h);
+            let w1 = t(format!("b{bi}.w1"), inter, h);
+            let w3 = t(format!("b{bi}.w3"), inter, h);
+            let w2 = t(format!("b{bi}.w2"), h, inter);
+            let mut nv = |n: usize| -> Vec<f32> { (0..n).map(|_| 1.0 + 0.2 * rng.uni()).collect() };
+            let norms = vec![nv(h), nv(h), nv(h), nv(h), nv(128), nv(128)];
+            host.push(HostBlk { wq, wk, wv, wo, w1, w3, w2, norms });
+        }
+        let hdr: CmfHeader = serde_json::from_value(serde_json::json!({
+            "version": CMF_VERSION,
+            "arch": { "arch_name": "zimage-stepcheck", "hidden_size": h, "intermediate_size": inter,
+                      "num_layers": 2, "num_attention_heads": nh, "num_kv_heads": nh, "head_dim": 128,
+                      "vocab_size": 0, "layer_types": [], "rms_norm_eps": 1e-5, "max_position_embeddings": 8192 },
+            "quant_type": "F32"
+        }))
+        .unwrap();
+        let dir = std::path::PathBuf::from(std::env::var("ZB_TMP").unwrap_or("/root/zb/tmp".into()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("zimage_stepcheck.cmf");
+        CmfModel::write(&path, &hdr, &specs, None, None).unwrap();
+        let model = Arc::new(CmfModel::open(&path).unwrap());
+        let idx = |n: String| model.tensors.iter().position(|t| t.name == n).unwrap();
+        let refs: Vec<ZBlockRef> = (0..nblk)
+            .map(|bi| ZBlockRef {
+                wq: idx(format!("b{bi}.q")),
+                wk: idx(format!("b{bi}.k")),
+                wv: idx(format!("b{bi}.v")),
+                wo: idx(format!("b{bi}.o")),
+                w1: idx(format!("b{bi}.w1")),
+                w3: idx(format!("b{bi}.w3")),
+                w2: idx(format!("b{bi}.w2")),
+                norm1: &host[bi].norms[0],
+                norm2: &host[bi].norms[1],
+                ffn_norm1: &host[bi].norms[2],
+                ffn_norm2: &host[bi].norms[3],
+                norm_q: &host[bi].norms[4],
+                norm_k: &host[bi].norms[5],
+            })
+            .collect();
+        let ew: Vec<f32> = (0..h * 64).map(|_| rng.uni() * 0.2).collect();
+        let eb: Vec<f32> = (0..h).map(|_| rng.uni() * 0.1).collect();
+        let ep: Vec<f32> = (0..h).map(|_| rng.uni()).collect();
+        let fw: Vec<f32> = (0..64 * h).map(|_| rng.uni() * 0.05).collect();
+        let fb: Vec<f32> = (0..64).map(|_| rng.uni() * 0.1).collect();
+        let cap: Vec<f32> = (0..n_cap_p * h).map(|_| 2.0 * rng.gauss()).collect();
+        let img_ids: Vec<[usize; 3]> = (0..n_img_p).map(|t| if t < n_img { [n_cap_p + 1, t / gw, t % gw] } else { [0, 0, 0] }).collect();
+        let cap_ids: Vec<[usize; 3]> = (0..n_cap_p).map(|j| [1 + j, 0, 0]).collect();
+        let (ric, ris) = rope_rows(&img_ids);
+        let joint_ids: Vec<[usize; 3]> = img_ids.iter().chain(cap_ids.iter()).cloned().collect();
+        let (rjc, rjs) = rope_rows(&joint_ids);
+        let geom = ZGeom { hidden: h, nh, hd: 128, inter, eps: 1e-5, final_eps: 1e-6, patch_dim: 64 };
+        let pa = ZPrepareArgs {
+            model: &model,
+            geom,
+            key: 77,
+            n_img,
+            n_img_p,
+            n_cap_p,
+            grid: (gh, gw),
+            cap: &cap,
+            rope_img: (&ric, &ris),
+            rope_joint: (&rjc, &rjs),
+            x_emb_w: &ew,
+            x_emb_b: &eb,
+            x_pad: &ep,
+            final_w: &fw,
+            final_b: &fb,
+            noise_refiner: &refs[..2],
+            layers: &refs[2..],
+            mods_all: None,
+            final_scale_all: None,
+        };
+        let t0 = std::time::Instant::now();
+        if !cortiq_engine::gpu::zimage_prepare(&pa) {
+            println!("stepcheck: zimage_prepare declined");
+            return;
+        }
+        println!("prepare {:.2} s", t0.elapsed().as_secs_f64());
+        for step in 0..2 {
+            let mut x_tok: Vec<f32> = (0..n_img_p * 64).map(|_| rng.gauss()).collect();
+            for r in n_img..n_img_p {
+                let last: Vec<f32> = x_tok[(n_img - 1) * 64..n_img * 64].to_vec();
+                x_tok[r * 64..(r + 1) * 64].copy_from_slice(&last);
+            }
+            let mods: Vec<f32> = (0..nblk * 4 * h).map(|_| 0.4 * rng.gauss()).collect();
+            let fscale: Vec<f32> = (0..h).map(|_| 1.0 + 0.2 * rng.uni()).collect();
+            let mut out = vec![0f32; n_img * 64];
+            let mut sa = ZStepArgs { key: 77, step, x_tok: &x_tok, mods: &mods, final_scale: &fscale, out: &mut out };
+            if !cortiq_engine::gpu::zimage_step(&mut sa) {
+                println!("stepcheck: zimage_step declined");
+                return;
+            }
+            // host forward
+            let md: Vec<f64> = mods.iter().map(|&v| v as f64).collect();
+            let mut xi: Vec<Vec<f64>> = (0..n_img_p)
+                .map(|r| {
+                    if r >= n_img {
+                        return ep.iter().map(|&v| v as f64).collect();
+                    }
+                    (0..h).map(|c| eb[c] as f64 + (0..64).map(|k| x_tok[r * 64 + k] as f64 * ew[c * 64 + k] as f64).sum::<f64>()).collect()
+                })
+                .collect();
+            for bi in 0..2 {
+                host_block(&mut xi, &[(0, n_img_p)], &ric, &ris, &host[bi], &md[bi * 4 * h..(bi + 1) * 4 * h], h, nh, inter);
+            }
+            let mut xj = xi;
+            xj.extend((0..n_cap_p).map(|r| cap[r * h..(r + 1) * h].iter().map(|&v| v as f64).collect::<Vec<f64>>()));
+            for bi in 2..nblk {
+                host_block(&mut xj, &[(0, n_img_p + n_cap_p)], &rjc, &rjs, &host[bi], &md[bi * 4 * h..(bi + 1) * 4 * h], h, nh, inter);
+            }
+            let (mut e2, mut r2) = (0f64, 0f64);
+            for r in 0..n_img {
+                let mean = xj[r].iter().sum::<f64>() / h as f64;
+                let var = xj[r].iter().map(|v| (v - mean).powi(2)).sum::<f64>() / h as f64;
+                let y: Vec<f64> = xj[r].iter().enumerate().map(|(c, v)| (v - mean) / (var + 1e-6).sqrt() * fscale[c] as f64).collect();
+                for o in 0..64 {
+                    let want = fb[o] as f64 + (0..h).map(|c| y[c] * fw[o * h + c] as f64).sum::<f64>();
+                    let d = out[r * 64 + o] as f64 - want;
+                    e2 += d * d;
+                    r2 += want * want;
+                }
+            }
+            println!("stepcheck step {step}: out rel {:.2e} (device vs f64 host, {} image rows × 64)", (e2 / r2).sqrt(), n_img);
+        }
+        cortiq_engine::gpu::zimage_release();
+    }
+
     pub fn main() {
         // SAFETY: set before any thread or GPU init.
         unsafe {
@@ -695,6 +946,7 @@ mod imp {
             Some("blockcheck") => cmd_blockcheck(rest),
             Some("step") => cmd_step(rest),
             Some("lumina") => cmd_lumina(rest),
+            Some("stepcheck") => cmd_stepcheck(rest),
             Some(x) => eprintln!("unknown subcommand {x}"),
         }
     }
