@@ -92,6 +92,26 @@
 //!   assembly, 2 layers, final layer) against an f64 host forward:
 //!   4e-4 (`zimage_gemmbench stepcheck`).
 //!
+//! Real weights (the core package's q8 Turbo container, run through its
+//! own `zimagegen` with this file dropped in; its tree otherwise
+//! untouched):
+//! - One oracle forward (r512 p0, step 0, fp32 caption), device against
+//!   the core's `step_cpu_taps` on the same inputs: v 8.8e-4. Per block
+//!   1e-5 to 1.4e-3, growing with depth. Refined caption 4.4e-5.
+//! - Whole pipeline with the same (device) text encoder in both arms:
+//!   v_0 1.3e-3 against the CPU DiT.
+//!   The remaining image-level gap to an all-CPU run (v_0 3–7 %) comes from
+//!   the text encoder running on the device, not from this path.
+//! - Step times on real weights: 0.243–0.256 s at 512² and 0.984–1.028 s
+//!   at 1024². diffusers bf16 on the same 3090 (all resident, SDPA) takes
+//!   0.261 s and 0.997 s per DiT step.
+//! - Range guard: the SwiGLU hidden reaches 6.3e4 at step 0 and overflowed
+//!   f16 (inf, then NaN) from step 2. It is stored ×2⁻⁶ and w2's f32
+//!   epilogue multiplies the 2⁶ back in. Every other f16 site has ≥ 10×
+//!   headroom (qkv ≤ 5.7e3, attention input ≤ 622, attention output
+//!   ≤ 1.6e3). `CMF_ZI_AMAX=1` prints the per-block, per-site max|x|;
+//!   `CMF_ZI_TAPS=<dir>` writes every block's residual stream.
+//!
 //! # Integration recipe (for the core package)
 //!
 //! - `prepare` and `step` implement the contract for batch 1 (Turbo).
@@ -108,11 +128,17 @@
 //!   The contract has no batch-2 entry yet. Adding one means an
 //!   `Option<…>` field agreed with the WP1 lead (plan §2.1). Unequal
 //!   caption lengths are supported: segments, per-item final dispatch.
-//! - Still to do on the device side:
-//!   - the context refiner (`refine_caption` still declines; use
-//!     `block_calls(.., modulated = false)` on a `ZSeq` of the caption);
-//!   - the resident VAE (`vae_decode_chain`);
-//!   - the text encoder.
+//! - `refine_caption` runs the context refiner on the device: the same
+//!   chain, unmodulated, with its planes cached separately.
+//! - Still to do on the device side, by measured cost in a real 1024²
+//!   image:
+//!   - the resident VAE (`vae_decode_chain` declines). The existing wgpu
+//!     VAE takes 40–44 s at 1024² and 9 s at 512², against 8 s for all
+//!     8 DiT steps. It is the largest item left.
+//!   - `prepare` builds the planes cold in 9–12 s (q8 upload + dequant,
+//!     once per process).
+//!   - The text encoder on the device takes 3.7 s, slower than on the CPU,
+//!     and moves v_0 by 3–7 %. That code belongs to the core package.
 //! - Knobs:
 //!   - `CMF_ZI_WGPU=0`: device path off;
 //!   - `CMF_ZI_TILE=bm,bn,bk,wm,wn`: GEMM tile;
