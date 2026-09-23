@@ -340,6 +340,8 @@ pub struct Pipeline {
 #[cfg(target_os = "macos")]
 impl Drop for Pipeline {
     fn drop(&mut self) {
+        // the async replay writes into `kv_cache` Vecs about to be freed
+        let _ = crate::gpu_metal::wait_replay();
         crate::gpu::kv_mirror_drop(self.graph_kv_id);
     }
 }
@@ -951,6 +953,10 @@ impl Pipeline {
     /// sequence entry point on this one reset path so a new request cannot
     /// inherit the prior request's device state.
     fn clear_sequence_state(&mut self) {
+        // a replay still writing the GDN owners must land before they are
+        // cleared or reallocated (the device holds raw pointers to them)
+        #[cfg(target_os = "macos")]
+        let _ = crate::gpu_metal::wait_replay();
         self.kv_cache.clear();
         self.kv_history.clear();
         if let Some(b) = &mut self.dsv41 {
@@ -981,6 +987,12 @@ impl Pipeline {
         if router.is_some() {
             let _ = self.set_active_skill(None);
         }
+        // The last speculative round's replay may still be in flight on
+        // the second queue: whoever reads the host cache after generate()
+        // returns (session export, the network split's KV wire, a KV
+        // reuse) must see the final states.
+        #[cfg(target_os = "macos")]
+        let _ = crate::gpu_metal::wait_replay();
         if clear_sequence {
             self.clear_sequence_state();
             if let Some(m) = mtp.as_mut() {
@@ -8659,6 +8671,15 @@ impl Pipeline {
         spec: Option<((usize, usize, usize), &[f32], &mut Vec<f32>)>,
     ) -> MetalRowsRun {
         use crate::gpu_metal::{GraphDims, VerifyGraph};
+        // The previous round's commit may still be replaying into the
+        // trunk GDN owners on the second queue: this graph reads them
+        // (zero-copy wraps) and may reallocate them below — collect the
+        // replay first. Normally already complete (the draft chain ran
+        // in between); a failed replay is terminal like a failed commit.
+        if !crate::gpu_metal::wait_replay() {
+            tracing::error!("Metal rows graph: the pending async replay failed");
+            return MetalRowsRun::Failed;
+        }
         let want = self.gdn_cfg.map(|c| c.state_len()).unwrap_or(0);
         for l in &mut self.kv_cache.layers {
             if l.linear_state.len() != want && want > 0 {
@@ -10391,6 +10412,16 @@ impl Pipeline {
                     && self.qwen4_exp.is_none()
                     && self.g3n.is_none())
         );
+        // Every plain forward — the whole-token Metal graph (`q1_graph_gpu`
+        // wraps the GDN owners zero-copy and reallocates them on a size
+        // change) and the CPU layer loop (reads/swaps `linear_state`) —
+        // must see the previous speculative commit's asynchronous replay
+        // complete. One mutex probe when nothing is pending.
+        #[cfg(target_os = "macos")]
+        if !crate::gpu_metal::wait_replay() {
+            self.fail_metal_graph("the pending async replay failed before a plain forward");
+            return vec![0.0; self.hidden_size];
+        }
         if let Some(b) = &mut self.qwen4_exp {
             let _ = (task_mask, upto);
             let token_id = hidden.first().copied().unwrap_or(0.0) as u32;
