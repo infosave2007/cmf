@@ -237,7 +237,6 @@ impl MmCfg {
             && (self.bm * vpr) % nt == 0
             && (self.bn * vpr) % nt == 0
             && (self.epi != Epi::SwiGlu || (tn / 16) % 2 == 0)
-            && (self.epi == Epi::F32 || (16 * tn / 8) % 32 == 0)
     }
     fn key(&self) -> String {
         format!(
@@ -255,8 +254,12 @@ impl MmCfg {
     pub fn shared_bytes(&self) -> u32 {
         let lds = self.bk + 8;
         let stage = if self.direct { 0 } else { (self.bm + self.bn) * lds * 2 };
-        let tn = self.bn / self.wn;
-        let sc = if self.epi == Epi::F32 { 0 } else { self.wm * self.wn * 16 * tn * 4 };
+        let nw = self.wm * self.wn;
+        let sc = match self.epi {
+            Epi::F32 => 0,
+            Epi::F16 => nw * 256 * 4,
+            Epi::SwiGlu => nw * 512 * 4,
+        };
         stage + sc
     }
 }
@@ -319,8 +322,14 @@ pub fn mm_src(g: MmCfg) -> String {
         let _ = writeln!(s, "var<workgroup> sa: array<f16, {}>;", g.bm * lds);
         let _ = writeln!(s, "var<workgroup> sb: array<f16, {}>;", g.bn * lds);
     }
-    if g.epi != Epi::F32 {
-        let _ = writeln!(s, "var<workgroup> sc: array<f32, {}>;", nw * 16 * tn);
+    match g.epi {
+        Epi::F32 => {}
+        Epi::F16 => {
+            let _ = writeln!(s, "var<workgroup> sc: array<f32, {}>;", nw * 256);
+        }
+        Epi::SwiGlu => {
+            let _ = writeln!(s, "var<workgroup> sc: array<f32, {}>;", nw * 512);
+        }
     }
     let _ = writeln!(
         s,
@@ -431,6 +440,9 @@ pub fn mm_src(g: MmCfg) -> String {
     }
     // ── epilogue
     let _ = writeln!(s, "  let orow = m0 + wy * {tm}u;");
+    // naga 30 does not emit a runtime coopStore stride before the store
+    // (panics "Expression is not cached"): bind it to a `let` first.
+    let _ = writeln!(s, "  let ldo = p.ldo;");
     match g.epi {
         Epi::F32 => {
             let _ = writeln!(s, "  let ocol = p.ocol + n0 + wx * {tn}u;");
@@ -438,7 +450,7 @@ pub fn mm_src(g: MmCfg) -> String {
                 for j in 0..fnn {
                     let _ = writeln!(
                         s,
-                        "  coopStoreT(c{i}_{j}, &outp[(orow + {}u) * p.ldo + ocol + {}u], p.ldo);",
+                        "  coopStoreT(c{i}_{j}, &outp[(orow + {}u) * ldo + ocol + {}u], ldo);",
                         i * 16,
                         j * 16
                     );
@@ -446,61 +458,37 @@ pub fn mm_src(g: MmCfg) -> String {
             }
         }
         Epi::F16 => {
+            // One 16×16 fragment at a time through a 1 KB per-subgroup
+            // scratch: lane → (row lane/2, 8 columns) → one 16-byte store.
             let _ = writeln!(s, "  let ocol = p.ocol + n0 + wx * {tn}u;");
             let _ = writeln!(s, "  let lane = tid - sg * 32u;");
-            let _ = writeln!(s, "  let sb0 = sg * {}u;", 16 * tn);
-            let chunks = 16 * tn / 8 / 32;
-            let cpr = tn / 8;
+            let _ = writeln!(s, "  let sb0 = sg * 256u;");
+            let _ = writeln!(s, "  let er = lane / 2u; let ec = (lane % 2u) * 8u; let eb = sb0 + er * 16u + ec;");
             for i in 0..fm {
                 for j in 0..fnn {
-                    let _ = writeln!(s, "  coopStoreT(c{i}_{j}, &sc[sb0 + {}u], {tn}u);", j * 16);
+                    let _ = writeln!(s, "  coopStoreT(c{i}_{j}, &sc[sb0], 16u);");
+                    let _ = writeln!(s, "  workgroupBarrier();");
+                    let _ = writeln!(s, "  outp[((orow + {}u + er) * ldo + ocol + {}u + ec) / 8u] = vec4<u32>(pack2x16float(vec2<f32>(sc[eb], sc[eb + 1u]) * p.oscale), pack2x16float(vec2<f32>(sc[eb + 2u], sc[eb + 3u]) * p.oscale), pack2x16float(vec2<f32>(sc[eb + 4u], sc[eb + 5u]) * p.oscale), pack2x16float(vec2<f32>(sc[eb + 6u], sc[eb + 7u]) * p.oscale));", i * 16, j * 16);
+                    let _ = writeln!(s, "  workgroupBarrier();");
                 }
-                let _ = writeln!(s, "  workgroupBarrier();");
-                for q in 0..chunks {
-                    let _ = writeln!(
-                        s,
-                        "  {{ let idx = lane + {}u; let r = idx / {cpr}u; let c8 = (idx % {cpr}u) * 8u; let b = sb0 + r * {tn}u + c8;",
-                        q * 32
-                    );
-                    let _ = writeln!(s, "    let v = vec4<u32>(pack2x16float(vec2<f32>(sc[b], sc[b + 1u]) * p.oscale), pack2x16float(vec2<f32>(sc[b + 2u], sc[b + 3u]) * p.oscale), pack2x16float(vec2<f32>(sc[b + 4u], sc[b + 5u]) * p.oscale), pack2x16float(vec2<f32>(sc[b + 6u], sc[b + 7u]) * p.oscale));");
-                    let _ = writeln!(
-                        s,
-                        "    outp[((orow + {}u + r) * p.ldo + ocol + c8) / 8u] = v; }}",
-                        i * 16
-                    );
-                }
-                let _ = writeln!(s, "  workgroupBarrier();");
             }
         }
         Epi::SwiGlu => {
-            // Output column base: the plane's 32-row panel (gate16, up16)
-            // → 16 output columns.
+            // Fragment pair (gate j=2q, up j=2q+1) → 16 output columns.
             let _ = writeln!(s, "  let ocol = (p.ocol + n0 + wx * {tn}u) / 2u;");
             let _ = writeln!(s, "  let lane = tid - sg * 32u;");
-            let _ = writeln!(s, "  let sb0 = sg * {}u;", 16 * tn);
-            let half = tn / 2;
-            let cpr = half / 8;
-            let chunks = 16 * half / 8 / 32;
+            let _ = writeln!(s, "  let sb0 = sg * 512u;");
+            let _ = writeln!(s, "  let er = lane / 2u; let ec = (lane % 2u) * 8u; let eb = sb0 + er * 16u + ec;");
             for i in 0..fm {
-                for j in 0..fnn {
-                    let _ = writeln!(s, "  coopStoreT(c{i}_{j}, &sc[sb0 + {}u], {tn}u);", j * 16);
+                for q in 0..fnn / 2 {
+                    let _ = writeln!(s, "  coopStoreT(c{i}_{}, &sc[sb0], 16u);", 2 * q);
+                    let _ = writeln!(s, "  coopStoreT(c{i}_{}, &sc[sb0 + 256u], 16u);", 2 * q + 1);
+                    let _ = writeln!(s, "  workgroupBarrier();");
+                    let _ = writeln!(s, "  {{ var hv: array<f32, 8>;");
+                    let _ = writeln!(s, "    for (var e = 0u; e < 8u; e = e + 1u) {{ let gg = sc[eb + e]; hv[e] = gg / (1.0 + exp(-gg)) * sc[eb + 256u + e] * p.oscale; }}");
+                    let _ = writeln!(s, "    outp[((orow + {}u + er) * ldo + ocol + {}u + ec) / 8u] = vec4<u32>(pack2x16float(vec2<f32>(hv[0], hv[1])), pack2x16float(vec2<f32>(hv[2], hv[3])), pack2x16float(vec2<f32>(hv[4], hv[5])), pack2x16float(vec2<f32>(hv[6], hv[7]))); }}", i * 16, q * 16);
+                    let _ = writeln!(s, "  workgroupBarrier();");
                 }
-                let _ = writeln!(s, "  workgroupBarrier();");
-                for q in 0..chunks {
-                    let _ = writeln!(
-                        s,
-                        "  {{ let idx = lane + {}u; let r = idx / {cpr}u; let c8 = (idx % {cpr}u) * 8u;",
-                        q * 32
-                    );
-                    let _ = writeln!(
-                        s,
-                        "    let gb = sb0 + r * {tn}u + (c8 / 16u) * 32u + (c8 % 16u); let ub = gb + 16u;"
-                    );
-                    let _ = writeln!(s, "    var h: array<f32, 8>;");
-                    let _ = writeln!(s, "    for (var e = 0u; e < 8u; e = e + 1u) {{ let gg = sc[gb + e]; h[e] = gg / (1.0 + exp(-gg)) * sc[ub + e] * p.oscale; }}");
-                    let _ = writeln!(s, "    outp[((orow + {}u + r) * p.ldo + ocol + c8) / 8u] = vec4<u32>(pack2x16float(vec2<f32>(h[0], h[1])), pack2x16float(vec2<f32>(h[2], h[3])), pack2x16float(vec2<f32>(h[4], h[5])), pack2x16float(vec2<f32>(h[6], h[7]))); }}", i * 16);
-                }
-                let _ = writeln!(s, "  workgroupBarrier();");
             }
         }
     }
@@ -675,6 +663,10 @@ pub fn flash_src(f: FlashCfg) -> String {
     for j in 0..8 {
         let _ = writeln!(s, "  var o{j}: coop_mat16x16<f32, C>;");
     }
+    // Never assigned: the zero every block's S accumulation starts from.
+    // (A `var` declared INSIDE the loop is zeroed once at function entry by
+    // naga, not per iteration — S then summed across key blocks.)
+    let _ = writeln!(s, "  var zc: coop_mat16x16<f32, C>;");
     let _ = writeln!(s, "  var mu = -1.0e30; var ls = 0.0;");
     let _ = writeln!(s, "  if (tid < 2u) {{ sfl[tid] = 0u; }}");
     let _ = writeln!(s, "  let nkb = p.len / {bc}u;");
@@ -695,8 +687,8 @@ pub fn flash_src(f: FlashCfg) -> String {
     let _ = writeln!(s, "    }}");
     // S = Q K^T
     for j in 0..nkf {
-        let _ = writeln!(s, "    var s{j}: coop_mat16x16<f32, C>;");
-        for d in 0..8 {
+        let _ = writeln!(s, "    var s{j} = coopMultiplyAdd(qa0, coopLoad<coop_mat16x16<f16, B>>(&sk[{}u], {ldk}u), zc);", j * 16 * ldk);
+        for d in 1..8 {
             let _ = writeln!(s, "    s{j} = coopMultiplyAdd(qa{d}, coopLoad<coop_mat16x16<f16, B>>(&sk[{}u], {ldk}u), s{j});", j * 16 * ldk + d * 16);
         }
         let _ = writeln!(s, "    coopStoreT(s{j}, &ss[sg * {}u + {}u], {bc}u);", 16 * bc, j * 16);
@@ -1436,4 +1428,624 @@ fn flash_calls(
         });
     }
     Some(v)
+}
+
+// ════════════════════════════════════════════════════════════════════
+// The resident chain (plan S1–S5 machinery): planes, sequence state,
+// prebuilt dispatch lists. The integration package builds these from a
+// container in `prepare` and records them in `step`.
+// ════════════════════════════════════════════════════════════════════
+
+/// Z-Image dimensions the chain is built for.
+#[derive(Clone, Copy, Debug)]
+pub struct ZDims {
+    pub h: usize,
+    pub nh: usize,
+    pub inter: usize,
+    pub eps: f32,
+    pub final_eps: f32,
+    /// Patch vector width (64).
+    pub pd: usize,
+}
+
+impl ZDims {
+    pub const TURBO: ZDims = ZDims { h: 3840, nh: 30, inter: 10240, eps: 1e-5, final_eps: 1e-6, pd: 64 };
+    pub fn from_geom(g: &ZGeom) -> Option<ZDims> {
+        (g.hd == 128 && g.hidden == g.nh * 128 && g.hidden % 128 == 0 && g.inter % 128 == 0).then_some(ZDims {
+            h: g.hidden,
+            nh: g.nh,
+            inter: g.inter,
+            eps: g.eps,
+            final_eps: g.final_eps,
+            pd: g.patch_dim,
+        })
+    }
+}
+
+/// One block's device weights: row-major f16 planes (the `q4tp_dq_f16`
+/// layout: two halves per u32) and f32 norm vectors.
+pub struct ZBlockDev {
+    /// `[3h][h]`: to_q rows, then to_k, then to_v.
+    pub qkv: wgpu::Buffer,
+    /// `[h][h]`: to_out.0.
+    pub o: wgpu::Buffer,
+    /// `[2·inter][h]`: w1 (gate) and w3 (up) interleaved in 16-row panels,
+    /// plane row `32q + t` = gate row `16q + t` (t < 16) or up row
+    /// `16q + t − 16` — what the SwiGLU epilogue expects.
+    pub w13: wgpu::Buffer,
+    /// `[h][inter]`: w2.
+    pub w2: wgpu::Buffer,
+    pub norm1: wgpu::Buffer,
+    pub norm2: wgpu::Buffer,
+    pub ffn_norm1: wgpu::Buffer,
+    pub ffn_norm2: wgpu::Buffer,
+    pub norm_q: wgpu::Buffer,
+    pub norm_k: wgpu::Buffer,
+}
+
+/// Plane row of the interleaved w1‖w3 plane that holds gate row `j`
+/// (`up = false`) or up row `j` (`up = true`).
+pub fn w13_plane_row(j: usize, up: bool) -> usize {
+    32 * (j / 16) + (j % 16) + if up { 16 } else { 0 }
+}
+
+impl ZBlockDev {
+    /// Random weights generated on the device (synthetic benchmarks).
+    pub fn synthetic(d: &ZDims, seed: u32) -> Option<ZBlockDev> {
+        let c = zctx()?;
+        let (h, i) = (d.h as u64, d.inter as u64);
+        let mk = |rows: u64, cols: u64, s: u32| -> Option<wgpu::Buffer> {
+            let b = sbuf(c, rows * cols * 2, "zi_plane");
+            fill(c, &b, rows * cols / 2, s, 1.7 / (cols as f32).sqrt(), false)?;
+            Some(b)
+        };
+        let norm = |n: usize, s: u32| -> wgpu::Buffer {
+            let v: Vec<f32> = (0..n).map(|j| 1.0 + 0.1 * (((j as u32 ^ s) % 7) as f32 - 3.0) / 3.0).collect();
+            sbuf_init(c, bytemuck::cast_slice(&v), "zi_norm")
+        };
+        Some(ZBlockDev {
+            qkv: mk(3 * h, h, seed * 8 + 1)?,
+            o: mk(h, h, seed * 8 + 2)?,
+            w13: mk(2 * i, h, seed * 8 + 3)?,
+            w2: mk(h, i, seed * 8 + 4)?,
+            norm1: norm(d.h, seed + 1),
+            norm2: norm(d.h, seed + 2),
+            ffn_norm1: norm(d.h, seed + 3),
+            ffn_norm2: norm(d.h, seed + 4),
+            norm_q: norm(128, seed + 5),
+            norm_k: norm(128, seed + 6),
+        })
+    }
+
+    /// Planes from host f16 bit patterns (tests; the integration package
+    /// adds the codec paths: q4tp/q8 via the parent's dequant kernels,
+    /// F16 = direct upload, Bf16 = convert). `w1`, `w3` are `[inter][h]`
+    /// and are interleaved here. `norms` = norm1, norm2, ffn_norm1,
+    /// ffn_norm2, norm_q, norm_k.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_host(
+        d: &ZDims,
+        wq: &[u16],
+        wk: &[u16],
+        wv: &[u16],
+        wo: &[u16],
+        w1: &[u16],
+        w3: &[u16],
+        w2: &[u16],
+        norms: [&[f32]; 6],
+    ) -> Option<ZBlockDev> {
+        let c = zctx()?;
+        let h = d.h;
+        let mut qkv = Vec::with_capacity(3 * h * h);
+        qkv.extend_from_slice(wq);
+        qkv.extend_from_slice(wk);
+        qkv.extend_from_slice(wv);
+        let mut w13 = vec![0u16; 2 * d.inter * h];
+        for j in 0..d.inter {
+            let g = w13_plane_row(j, false);
+            let u = w13_plane_row(j, true);
+            w13[g * h..(g + 1) * h].copy_from_slice(&w1[j * h..(j + 1) * h]);
+            w13[u * h..(u + 1) * h].copy_from_slice(&w3[j * h..(j + 1) * h]);
+        }
+        let up = |v: &[u16]| sbuf_init(c, bytemuck::cast_slice(v), "zi_plane");
+        let upf = |v: &[f32]| sbuf_init(c, bytemuck::cast_slice(v), "zi_norm");
+        Some(ZBlockDev {
+            qkv: up(&qkv),
+            o: up(wo),
+            w13: up(&w13),
+            w2: up(w2),
+            norm1: upf(norms[0]),
+            norm2: upf(norms[1]),
+            ffn_norm1: upf(norms[2]),
+            ffn_norm2: upf(norms[3]),
+            norm_q: upf(norms[4]),
+            norm_k: upf(norms[5]),
+        })
+    }
+}
+
+/// Activation state of one stacked sequence layout (all batch items).
+/// Every buffer has `mp = pad_rows(m)` rows so the unchecked kernels'
+/// tile over-reads stay inside it.
+pub struct ZSeq {
+    pub segs: Vec<(usize, usize)>,
+    pub m: usize,
+    pub mp: usize,
+    pub x: wgpu::Buffer,
+    xn: wgpu::Buffer,
+    qkv: wgpu::Buffer,
+    att: wgpu::Buffer,
+    br: wgpu::Buffer,
+    hid: wgpu::Buffer,
+    pub rope_c: wgpu::Buffer,
+    pub rope_s: wgpu::Buffer,
+}
+
+impl ZSeq {
+    /// `segs` = (row offset, rows) per batch item; lengths multiples of 32.
+    pub fn new(d: &ZDims, segs: &[(usize, usize)]) -> Option<ZSeq> {
+        let c = zctx()?;
+        let m = segs.iter().map(|s| s.0 + s.1).max()?;
+        if segs.iter().any(|s| s.1 % 32 != 0) {
+            return None;
+        }
+        let mp = pad_rows(m) as u64;
+        let (h, i) = (d.h as u64, d.inter as u64);
+        Some(ZSeq {
+            segs: segs.to_vec(),
+            m,
+            mp: mp as usize,
+            x: sbuf(c, mp * h * 4, "zi_x"),
+            xn: sbuf(c, mp * h * 2, "zi_xn"),
+            qkv: sbuf(c, mp * 3 * h * 2, "zi_qkv"),
+            att: sbuf(c, mp * h * 2, "zi_att"),
+            br: sbuf(c, mp * h * 4, "zi_br"),
+            hid: sbuf(c, mp * i * 2, "zi_hid"),
+            rope_c: sbuf(c, mp * 64 * 4, "zi_rc"),
+            rope_s: sbuf(c, mp * 64 * 4, "zi_rs"),
+        })
+    }
+
+    /// Upload the RoPE table rows `[m][64]` (cos, sin).
+    pub fn set_rope(&self, cos: &[f32], sin: &[f32]) {
+        if let Some(c) = zctx() {
+            c.queue.write_buffer(&self.rope_c, 0, bytemuck::cast_slice(cos));
+            c.queue.write_buffer(&self.rope_s, 0, bytemuck::cast_slice(sin));
+        }
+    }
+
+    /// Upload / read the residual stream `[m][h]` f32 (tests, and the
+    /// context refiner's in/out).
+    pub fn write_x(&self, x: &[f32]) {
+        if let Some(c) = zctx() {
+            c.queue.write_buffer(&self.x, 0, bytemuck::cast_slice(x));
+        }
+    }
+    pub fn read_x(&self, d: &ZDims) -> Option<Vec<f32>> {
+        let c = zctx()?;
+        let raw = read_bytes(c, &self.x, (self.m * d.h * 4) as u64)?;
+        Some(bytemuck::cast_slice(&raw).to_vec())
+    }
+}
+
+/// Kernel class of a recorded dispatch (for the per-class profile).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Class {
+    MmQkv,
+    Flash,
+    MmO,
+    MmW13,
+    MmW2,
+    Rows,
+    Io,
+}
+
+impl Class {
+    pub const ALL: [Class; 7] =
+        [Class::MmQkv, Class::Flash, Class::MmO, Class::MmW13, Class::MmW2, Class::Rows, Class::Io];
+}
+
+enum Rec {
+    Mm(MmCall),
+    K(Call),
+}
+
+/// A prebuilt list of dispatches (one or more blocks).
+#[derive(Default)]
+pub struct ZCalls {
+    list: Vec<(Class, Rec)>,
+}
+
+impl ZCalls {
+    pub fn record(&self, pass: &mut wgpu::ComputePass, only: Option<Class>) {
+        for (cl, r) in &self.list {
+            if only.is_some_and(|o| o != *cl) {
+                continue;
+            }
+            match r {
+                Rec::Mm(m) => m.record(pass),
+                Rec::K(k) => k.record(pass),
+            }
+        }
+    }
+    pub fn len(&self) -> usize {
+        self.list.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.list.is_empty()
+    }
+    fn push_mm(&mut self, cl: Class, m: MmCall) {
+        self.list.push((cl, Rec::Mm(m)));
+    }
+    fn push(&mut self, cl: Class, k: Call) {
+        self.list.push((cl, Rec::K(k)));
+    }
+    pub fn extend(&mut self, o: ZCalls) {
+        self.list.extend(o.list);
+    }
+    /// Record into a fresh encoder, submit, wait (tests / context refiner).
+    pub fn run(&self) -> Option<()> {
+        let c = zctx()?;
+        let mut enc = c.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            self.record(&mut pass, None);
+        }
+        c.queue.submit(Some(enc.finish()));
+        wait(c);
+        Some(())
+    }
+}
+
+/// A device buffer holding `data` (mods, caption rows …) — test helper.
+pub fn upload_f32(data: &[f32]) -> Option<wgpu::Buffer> {
+    let c = zctx()?;
+    Some(sbuf_init(c, bytemuck::cast_slice(data), "zi_host"))
+}
+
+/// Offsets of one block's raw modulation chunks inside the mods buffer
+/// (`[block][scale_msa, gate_msa, scale_mlp, gate_mlp][h]`, f32 words).
+fn mod_off(d: &ZDims, bi: usize, chunk: usize) -> u32 {
+    ((bi * 4 + chunk) * d.h) as u32
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rowop_call(
+    c: &Ctx,
+    d: &ZDims,
+    seq: &ZSeq,
+    mode: u32,
+    wpost: &wgpu::Buffer,
+    wpre: &wgpu::Buffer,
+    mods: &wgpu::Buffer,
+    g_off: u32,
+    s_off: u32,
+) -> Option<Call> {
+    let pipe = pipeline(c, "zi_rowop", ROWOP_SRC, "zi_rowop")?;
+    let u = ubuf(
+        c,
+        &[d.h as u32, mode, g_off, s_off, d.eps.to_bits(), d.eps.to_bits(), 1f32.to_bits(), 0],
+    );
+    let b = bg(c, &pipe, &[&seq.br, &seq.x, &seq.xn, wpost, wpre, mods, &u]);
+    Some(Call { pipe, bg: b, grid: ((seq.m as u32).min(65535), (seq.m as u32).div_ceil(65535), 1) })
+}
+
+/// Tiles per site (defaults from the S0/S4 sweep; env overrides).
+#[derive(Clone, Copy, Debug)]
+pub struct ZTiles {
+    pub qkv: MmCfg,
+    pub o: MmCfg,
+    pub w13: MmCfg,
+    pub w2: MmCfg,
+    pub flash: FlashCfg,
+}
+
+impl Default for ZTiles {
+    fn default() -> Self {
+        ZTiles {
+            qkv: default_cfg(Epi::F16),
+            o: default_cfg(Epi::F32),
+            w13: default_cfg(Epi::SwiGlu),
+            w2: default_cfg(Epi::F32),
+            flash: default_flash(),
+        }
+    }
+}
+
+/// The dispatches of one transformer block on `seq`.
+///
+/// `bi` = this block's index in the mods buffer; `first` = also compute
+/// this block's own pre-norm from `seq.x` (the chain entry); `next` = the
+/// following block (its norm1 and scale_msa index) whose pre-norm the last
+/// row op writes, or `None` (the last block: gated residual only).
+/// `modulated = false` is the context refiner (scale 0, gate 1).
+#[allow(clippy::too_many_arguments)]
+pub fn block_calls(
+    d: &ZDims,
+    t: &ZTiles,
+    seq: &ZSeq,
+    blk: &ZBlockDev,
+    mods: &wgpu::Buffer,
+    bi: usize,
+    first: bool,
+    next: Option<(&ZBlockDev, usize)>,
+    modulated: bool,
+) -> Option<ZCalls> {
+    let c = zctx()?;
+    let (h, i, m) = (d.h as u32, d.inter as u32, seq.m as u32);
+    let gm = if modulated { ROW_GATE_MOD } else { 0 };
+    let sm = if modulated { ROW_SCALE_MOD } else { 0 };
+    let mut v = ZCalls::default();
+    if first {
+        v.push(
+            Class::Rows,
+            rowop_call(c, d, seq, ROW_PRE | sm, &blk.norm1, &blk.norm1, mods, 0, mod_off(d, bi, 0))?,
+        );
+    }
+    let a = |n: u32, k: u32, ldo: u32| MmArgs { m, n, k, ldo, ocol: 0, arow: 0, oscale: 1.0 };
+    v.push_mm(Class::MmQkv, mm_call(c, t.qkv, &a(3 * h, h, 3 * h), &blk.qkv, &seq.xn, &seq.qkv)?);
+    {
+        let pipe = pipeline(c, "zi_qkrope", QKROPE_SRC, "zi_qkrope")?;
+        let u = ubuf(c, &[3 * h, d.nh as u32, d.eps.to_bits(), 0]);
+        let b = bg(c, &pipe, &[&seq.qkv, &blk.norm_q, &blk.norm_k, &seq.rope_c, &seq.rope_s, &u]);
+        v.push(Class::Rows, Call { pipe, bg: b, grid: (2 * d.nh as u32, m.min(65535), m.div_ceil(65535)) });
+    }
+    for cl in flash_calls(c, t.flash, d.nh, &seq.qkv, &seq.att, &seq.segs)? {
+        v.push(Class::Flash, cl);
+    }
+    v.push_mm(Class::MmO, mm_call(c, t.o, &a(h, h, h), &blk.o, &seq.att, &seq.br)?);
+    v.push(
+        Class::Rows,
+        rowop_call(
+            c,
+            d,
+            seq,
+            ROW_GRES | gm | ROW_PRE | sm,
+            &blk.norm2,
+            &blk.ffn_norm1,
+            mods,
+            mod_off(d, bi, 1),
+            mod_off(d, bi, 2),
+        )?,
+    );
+    v.push_mm(Class::MmW13, mm_call(c, t.w13, &a(2 * i, h, i), &blk.w13, &seq.xn, &seq.hid)?);
+    v.push_mm(Class::MmW2, mm_call(c, t.w2, &a(h, i, h), &blk.w2, &seq.hid, &seq.br)?);
+    let (mode, wpre, s_off) = match next {
+        Some((nb, nbi)) => (ROW_GRES | gm | ROW_PRE | sm, &nb.norm1, mod_off(d, nbi, 0)),
+        None => (ROW_GRES | gm, &blk.ffn_norm2, 0),
+    };
+    v.push(Class::Rows, rowop_call(c, d, seq, mode, &blk.ffn_norm2, wpre, mods, mod_off(d, bi, 3), s_off)?);
+    Some(v)
+}
+
+/// The per-step device program for one image (or a CFG pair): x_embed →
+/// noise refiner (image rows) → [img, cap] assembly → 30 layers → final
+/// layer on image rows. Built once per (prompt, resolution, batch); a
+/// step then only writes `x_tok` and the step's mods and replays it.
+pub struct ZStepDev {
+    pub d: ZDims,
+    pub n_img: usize,
+    pub n_img_p: usize,
+    pub n_cap_p: Vec<usize>,
+    pub img: ZSeq,
+    pub joint: ZSeq,
+    pub mods: wgpu::Buffer,
+    tok: wgpu::Buffer,
+    cap: wgpu::Buffer,
+    fscale: wgpu::Buffer,
+    out: wgpu::Buffer,
+    pre_a: ZCalls,
+    joint_calls: ZCalls,
+    fin: Vec<Call>,
+    out_rows: usize,
+}
+
+/// Host-side small weights of the embed and final layers.
+pub struct ZIo<'a> {
+    pub x_emb_w: &'a [f32],
+    pub x_emb_b: &'a [f32],
+    pub x_pad: &'a [f32],
+    pub final_w: &'a [f32],
+    pub final_b: &'a [f32],
+}
+
+impl ZStepDev {
+    /// `nr` = the 2 noise-refiner blocks, `layers` = the 30 main layers
+    /// (mods indices 0,1 and 2..32). `n_cap_p[b]` = padded caption rows of
+    /// batch item b (CFG: cond, uncond — may differ). `cap` = the refined
+    /// captions stacked `[Σ n_cap_p][h]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        d: ZDims,
+        t: &ZTiles,
+        nr: &[ZBlockDev],
+        layers: &[ZBlockDev],
+        io: &ZIo,
+        n_img: usize,
+        n_cap_p: &[usize],
+        cap: &[f32],
+    ) -> Option<ZStepDev> {
+        let c = zctx()?;
+        let b = n_cap_p.len();
+        let n_img_p = n_img.div_ceil(32) * 32;
+        let img_segs: Vec<(usize, usize)> = (0..b).map(|i| (i * n_img_p, n_img_p)).collect();
+        let mut joint_segs = Vec::new();
+        let mut off = 0;
+        for &cp in n_cap_p {
+            joint_segs.push((off, n_img_p + cp));
+            off += n_img_p + cp;
+        }
+        let img = ZSeq::new(&d, &img_segs)?;
+        let joint = ZSeq::new(&d, &joint_segs)?;
+        let nblk = nr.len() + layers.len();
+        let mods = sbuf(c, (nblk * 4 * d.h * 4) as u64, "zi_mods");
+        let tok = sbuf(c, (img.mp * d.pd * 4) as u64, "zi_tok");
+        let capb = sbuf_init(c, bytemuck::cast_slice(cap), "zi_cap");
+        let fscale = sbuf(c, (d.h * 4) as u64, "zi_fscale");
+        let out_rows = b * n_img;
+        let out = sbuf(c, (out_rows * d.pd * 4) as u64, "zi_out");
+        let ew = sbuf_init(c, bytemuck::cast_slice(io.x_emb_w), "zi_ew");
+        let eb = sbuf_init(c, bytemuck::cast_slice(io.x_emb_b), "zi_eb");
+        let ep = sbuf_init(c, bytemuck::cast_slice(io.x_pad), "zi_ep");
+        let fw = sbuf_init(c, bytemuck::cast_slice(io.final_w), "zi_fw");
+        let fb = sbuf_init(c, bytemuck::cast_slice(io.final_b), "zi_fb");
+        let mut pre_a = ZCalls::default();
+        {
+            let pipe = pipeline(c, "zi_embed", EMBED_SRC, "zi_embed")?;
+            let u = ubuf(c, &[d.h as u32, n_img as u32, n_img_p as u32, d.pd as u32]);
+            let bgr = bg(c, &pipe, &[&tok, &ew, &eb, &ep, &img.x, &u]);
+            pre_a.push(Class::Io, Call { pipe, bg: bgr, grid: (img.m as u32, 1, 1) });
+        }
+        for (k, blk) in nr.iter().enumerate() {
+            let next = nr.get(k + 1).map(|nb| (nb, k + 1));
+            pre_a.extend(block_calls(&d, t, &img, blk, &mods, k, k == 0, next, true)?);
+        }
+        let mut joint_calls = ZCalls::default();
+        for (k, blk) in layers.iter().enumerate() {
+            let bi = nr.len() + k;
+            let next = layers.get(k + 1).map(|nb| (nb, bi + 1));
+            joint_calls.extend(block_calls(&d, t, &joint, blk, &mods, bi, k == 0, next, true)?);
+        }
+        // Final layer, one dispatch per batch item (rows of item bi start
+        // at its segment offset; output compacted to [bi][n_img][pd]).
+        let mut fin = Vec::new();
+        let pipe = pipeline(c, "zi_final", FINAL_SRC, "zi_final")?;
+        for (bi, &(off, _)) in joint_segs.iter().enumerate() {
+            let u = ubuf(c, &[d.h as u32, d.pd as u32, d.final_eps.to_bits(), n_img as u32, 1u32 << 30, 0, 0, 0]);
+            let xo = off;
+            let ob = (bi * n_img * d.pd * 4) as u64;
+            let entries = [
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &joint.x,
+                        offset: (xo * d.h * 4) as u64,
+                        size: std::num::NonZeroU64::new((n_img * d.h * 4) as u64),
+                    }),
+                },
+                super::bind_buf(1, &fscale),
+                super::bind_buf(2, &fw),
+                super::bind_buf(3, &fb),
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &out,
+                        offset: ob,
+                        size: std::num::NonZeroU64::new((n_img * d.pd * 4) as u64),
+                    }),
+                },
+                super::bind_buf(5, &u),
+            ];
+            let bgr = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("zi_final"),
+                layout: &pipe.get_bind_group_layout(0),
+                entries: &entries,
+            });
+            fin.push(Call { pipe: pipe.clone(), bg: bgr, grid: (n_img as u32, 1, 1) });
+        }
+        Some(ZStepDev {
+            d,
+            n_img,
+            n_img_p,
+            n_cap_p: n_cap_p.to_vec(),
+            img,
+            joint,
+            mods,
+            tok,
+            cap: capb,
+            fscale,
+            out,
+            pre_a,
+            joint_calls,
+            fin,
+            out_rows,
+        })
+    }
+
+    /// Record one whole forward into `enc` (two passes + the assembly
+    /// copies). `only` restricts the recorded kernels to one class (the
+    /// profile; the result is then meaningless).
+    pub fn encode(&self, enc: &mut wgpu::CommandEncoder, only: Option<Class>) {
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            self.pre_a.record(&mut pass, only);
+        }
+        if only.is_none() || only == Some(Class::Io) {
+            let h4 = (self.d.h * 4) as u64;
+            let mut cap_off = 0u64;
+            for (bi, &(off, _)) in self.joint.segs.iter().enumerate() {
+                enc.copy_buffer_to_buffer(
+                    &self.img.x,
+                    (bi * self.n_img_p) as u64 * h4,
+                    &self.joint.x,
+                    off as u64 * h4,
+                    self.n_img_p as u64 * h4,
+                );
+                let cp = self.n_cap_p[bi] as u64;
+                enc.copy_buffer_to_buffer(
+                    &self.cap,
+                    cap_off * h4,
+                    &self.joint.x,
+                    (off + self.n_img_p) as u64 * h4,
+                    cp * h4,
+                );
+                cap_off += cp;
+            }
+        }
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            self.joint_calls.record(&mut pass, only);
+            if only.is_none() || only == Some(Class::Io) {
+                for f in &self.fin {
+                    f.record(&mut pass);
+                }
+            }
+        }
+    }
+
+    /// Upload one step's inputs: `x_tok` `[batch][n_img_p][pd]`, the raw
+    /// mods `[blocks][4][h]`, the final scale `[h]` (already 1 + …).
+    pub fn upload(&self, x_tok: &[f32], mods: &[f32], final_scale: &[f32]) {
+        if let Some(c) = zctx() {
+            c.queue.write_buffer(&self.tok, 0, bytemuck::cast_slice(x_tok));
+            c.queue.write_buffer(&self.mods, 0, bytemuck::cast_slice(mods));
+            c.queue.write_buffer(&self.fscale, 0, bytemuck::cast_slice(final_scale));
+        }
+    }
+
+    /// One forward: record, submit, read back `[batch][n_img][pd]`.
+    pub fn run(&self, out: &mut [f32]) -> Option<()> {
+        let c = zctx()?;
+        let mut enc = c.device.create_command_encoder(&Default::default());
+        self.encode(&mut enc, None);
+        c.queue.submit(Some(enc.finish()));
+        let raw = read_bytes(c, &self.out, (self.out_rows * self.d.pd * 4) as u64)?;
+        out[..self.out_rows * self.d.pd].copy_from_slice(bytemuck::cast_slice(&raw));
+        Some(())
+    }
+
+    /// Seconds per forward (device: one submit per forward, fence at the
+    /// end of `reps`), median of `rounds`; `only` = one kernel class.
+    pub fn time(&self, reps: usize, rounds: usize, only: Option<Class>) -> Option<f64> {
+        let c = zctx()?;
+        let run = || {
+            let t = std::time::Instant::now();
+            for _ in 0..reps {
+                let mut enc = c.device.create_command_encoder(&Default::default());
+                self.encode(&mut enc, only);
+                c.queue.submit(Some(enc.finish()));
+            }
+            wait(c);
+            t.elapsed().as_secs_f64() / reps as f64
+        };
+        run();
+        let mut v: Vec<f64> = (0..rounds.max(1)).map(|_| run()).collect();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        Some(v[v.len() / 2])
+    }
+
+    /// Dispatches per forward.
+    pub fn dispatches(&self) -> usize {
+        self.pre_a.len() + self.joint_calls.len() + self.fin.len()
+    }
 }
