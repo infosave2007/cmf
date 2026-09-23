@@ -90,8 +90,10 @@ hands back to the full head for Cyrillic and CJK; the verify runs eight
 rows a workgroup; the narrow projections take a persistent grid and the
 GDN control projections a vectorized kernel (plain 27.0 → 27.9). Prompt
 ingest on this card goes through the batched graph by default: a
-2048-token prompt at 53 tok/s (TTFT 39 s) against 28.5 one position at a
-time. `bench --ignore-eos` now measures speculation (it used to suppress
+2048-token prompt at 53 tok/s (TTFT 38 s) against 28.5 one position at a
+time; the batched kernels sum in a different order, so a long prompt's
+greedy continuation can resolve a near-tie differently (`CMF_BATCH_K=0`
+restores the per-position walk). `bench --ignore-eos` now measures speculation (it used to suppress
 EOS through the sampler, which switched the round off — every
 `--ignore-eos` number before 0.7.2 is the plain rate).
 
@@ -429,8 +431,10 @@ MTP-голова модели предлагает пять токенов, од
 верификация идёт по восемь строк на рабочую группу; узкие проекции —
 на персистентной сетке, управляющие проекции GDN — на векторном ядре
 (plain 27.0 → 27.9). Промпт на этой карте читается батч-графом по
-умолчанию: 2048 токенов на 53 tok/s (TTFT 39 с) против 28.5 по одной
-позиции. `bench --ignore-eos` теперь меряет спекуляцию (раньше он
+умолчанию: 2048 токенов на 53 tok/s (TTFT 38 с) против 28.5 по одной
+позиции; батч-ядра суммируют в другом порядке, поэтому на длинном промпте
+greedy-продолжение может по-другому разрешить почти-ничью
+(`CMF_BATCH_K=0` возвращает обход по позициям). `bench --ignore-eos` теперь меряет спекуляцию (раньше он
 подавлял EOS через сэмплер, что выключало раунд — все числа с
 `--ignore-eos` до 0.7.2 были plain).
 
@@ -565,7 +569,8 @@ token，一次批量提交在 int8 激活的矩阵向量核上完成验证，监
 可固定）；草稿头读取 65536 行的候选表（`CMF_DRAFT_VOCAB`），遇到西里尔文和 CJK
 时回退到完整词表头；验证每工作组八行；窄投影使用持久网格，GDN 控制投影使用向量化
 内核（plain 27.0 → 27.9）。这张卡上的提示默认走批量图：2048 token 提示 53 tok/s
-（TTFT 39 s），逐位置为 28.5。`bench --ignore-eos` 现在会测量推测解码（此前它通过
+（TTFT 38 s），逐位置为 28.5；批量内核的累加顺序不同，长提示的贪心续写可能在近似平局处
+选出另一个 token（`CMF_BATCH_K=0` 恢复逐位置路径）。`bench --ignore-eos` 现在会测量推测解码（此前它通过
 采样器抑制 EOS，从而关闭了回合——0.7.2 之前所有 `--ignore-eos` 数字都是 plain）。
 
 **OpenAI 兼容 API 服务器：** `cortiq serve qwen38-27b-q4t.cmf --port

@@ -54,10 +54,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The batched graph prefill is the default on discrete cards whenever the
   prompt takes the graph route (GDN hybrids and MoE stacks): 32 positions
   per submit instead of one. Qwen3.8-27B q4tp on an RTX PRO 4000 reads a
-  2048-token prompt at 53 tok/s against 28.5 (TTFT 39 s against 72), with
-  the greedy continuation unchanged — the batch graph's states are the
-  speculative verify's. `CMF_BATCH_K=0` restores the per-position walk;
-  `bench` reports the route the pipeline actually takes.
+  2048-token prompt at 53 tok/s against 28.5 (TTFT 38 s against 72).
+  Prompt chunks keep f32 activations (the int8 batched matvec is the
+  speculative verify's alone). The batched kernels accumulate in a
+  different order than the per-position walk — after a 600-token prompt
+  the hidden state differs by ~7% of its rms at the worst element, the
+  same band as Metal against the CPU — so a long prompt's greedy
+  continuation can resolve a near-tie differently (both continuations
+  were measured plausible; the first token and its margin agree).
+  `CMF_BATCH_K=0` restores the per-position walk; `bench` reports the
+  route the pipeline actually takes.
 - Native Metal: the GDN run of the token graph encodes a whole run of
   layers into ONE compute encoder instead of seven per layer, and the
   speculative verify's chunk attend no longer walks the K mirror a seventh
