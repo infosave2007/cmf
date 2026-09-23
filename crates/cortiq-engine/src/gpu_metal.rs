@@ -14,7 +14,9 @@
 use crate::gpu::{BatchJob, MoeJob};
 use cortiq_core::CmfModel;
 use cortiq_core::quant::{GROUP_SIZE, Q1_TILE, Q1T_TILE, Q4_TILE, f16_to_f32};
-use metal::{Buffer, CommandQueue, ComputePipelineState, Device, MTLResourceOptions, MTLSize};
+use metal::{
+    Buffer, CommandQueue, ComputePipelineState, Device, MTLResourceOptions, MTLSize, SharedEvent,
+};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -6143,6 +6145,16 @@ kernel void prism_fwht_rows(
 struct Ctx {
     _device: Device,
     queue: CommandQueue,
+    /// Second queue for the speculative round's commit (the GDN replay of
+    /// the accepted prefix): committed here WITHOUT a wait so the next
+    /// round's draft chain on `queue` overlaps it instead of queueing
+    /// behind it. See `VerifyGraph::commit` / `wait_replay`.
+    replay_queue: CommandQueue,
+    /// Signaled (monotone value) at the end of every replay command
+    /// buffer; `replay_pending` keeps the buffer itself for the host wait.
+    replay_event: SharedEvent,
+    replay_pending: Mutex<Option<PendingReplay>>,
+    replay_epoch: std::sync::atomic::AtomicU64,
     q8: ComputePipelineState,
     q8f: ComputePipelineState,
     q8f_r4: ComputePipelineState,
@@ -6476,11 +6488,17 @@ fn init() -> Result<Ctx, String> {
     let f32mv2b = pso("f32_matvec2_b")?;
     let silurows = pso("silu_rows")?;
     let queue = device.new_command_queue();
+    let replay_queue = device.new_command_queue();
+    let replay_event = device.new_shared_event();
     let flag_buf = device.new_buffer(64, MTLResourceOptions::StorageModeShared);
     unsafe { *(flag_buf.contents() as *mut u32) = 0 };
     Ok(Ctx {
         _device: device,
         queue,
+        replay_queue,
+        replay_event,
+        replay_pending: Mutex::new(None),
+        replay_epoch: std::sync::atomic::AtomicU64::new(0),
         q8,
         q8f,
         q8f_r4,
@@ -14652,12 +14670,100 @@ pub fn kv_mirror_drop(kv_id: u64) {
 
 /// Wait for everything queued so far (an empty command buffer behind the
 /// queue's tail) — the oracles use it before reading state the device
-/// writes asynchronously (the verify commit's replay).
+/// writes asynchronously (the verify commit's replay). The replay lives
+/// on its own queue since it went asynchronous, so the pending one is
+/// waited first (`wait_replay`), then the main queue is drained.
 pub fn queue_fence() {
+    let _ = wait_replay();
     if let Some(c) = ctx() {
         let cmd = c.queue.new_command_buffer();
         cmd.commit();
         cmd.wait_until_completed();
+    }
+}
+
+/// A replay command buffer in flight on `Ctx::replay_queue`: the GDN
+/// state owners (host Vecs wrapped zero-copy) are being written by the
+/// device until it completes. `value` is what `replay_event` reaches at
+/// its end.
+struct PendingReplay {
+    cmd: metal::CommandBuffer,
+    value: u64,
+}
+
+// metal-rs command buffers are retained ObjC pointers; the slot is
+// only touched from the decode thread (and the oracle/test threads
+// after it), under the Mutex.
+unsafe impl Send for PendingReplay {}
+
+/// `CMF_METAL_ASYNC_REPLAY=0` keeps the verify commit synchronous (one
+/// submit + wait on the main queue — the pre-0.7.3 behaviour). Default:
+/// the replay goes to the second queue and overlaps the next draft chain.
+fn async_replay_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_METAL_ASYNC_REPLAY").as_deref() != Ok("0"))
+}
+
+/// Park a committed replay buffer in the pending slot. Exactly one may
+/// be in flight: the caller has already drained the previous one (the
+/// verify that produced this graph waited on it), but a stale entry is
+/// waited here anyway rather than dropped, so a second writer can never
+/// be forgotten.
+fn park_replay(c: &Ctx, cmd: metal::CommandBuffer, value: u64) {
+    let prev = c.replay_pending.lock().unwrap().replace(PendingReplay { cmd, value });
+    if let Some(p) = prev {
+        tracing::warn!("metal replay: a pending replay was still parked when the next one landed");
+        let _ = wait_fast_checked(&p.cmd);
+    }
+}
+
+/// Device-side ordering behind the pending replay: encode a wait for its
+/// event value on `cmd` (legal between encoders). A no-op when nothing is
+/// pending or the value is already signaled. The b-row GDN encoder uses
+/// it so a graph that writes the replay's slot buffers (VBUF kinds
+/// 10-17: a GDN-mixer MTP block warmed on the main queue) cannot overtake
+/// the replay reading them; the trunk verify has already host-waited, so
+/// for it this costs nothing.
+fn encode_replay_wait(c: &Ctx, cmd: &metal::CommandBufferRef) {
+    let value = c.replay_pending.lock().unwrap().as_ref().map(|p| p.value);
+    if let Some(v) = value {
+        cmd.encode_wait_for_event(&c.replay_event, v);
+    }
+}
+
+/// Is a replay still parked (unwaited)? Diagnostics/tests.
+pub fn replay_pending() -> bool {
+    ctx().is_some_and(|c| c.replay_pending.lock().unwrap().is_some())
+}
+
+/// Wait for the pending asynchronous replay (the speculative commit's
+/// GDN state fold on `replay_queue`) before anything reads or reallocates
+/// the trunk GDN states it writes: the next verify graph, the plain token
+/// graph, the batched prefill, the CPU forward, the commit oracle,
+/// sequence reset/drop. Cheap when nothing is pending (one mutex probe);
+/// when the buffer already completed (the usual case — the draft chain is
+/// longer than the replay) it costs one status read. False = the replay
+/// command buffer failed: the states are undefined and the caller must
+/// fail closed exactly as it would for a synchronous commit error.
+pub fn wait_replay() -> bool {
+    let Some(c) = ctx() else {
+        return true;
+    };
+    let pending = c.replay_pending.lock().unwrap().take();
+    let Some(p) = pending else {
+        return true;
+    };
+    let done = c.replay_event.signaled_value() >= p.value
+        && p.cmd.status() == metal::MTLCommandBufferStatus::Completed;
+    if done {
+        return true;
+    }
+    match wait_fast_checked(&p.cmd) {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::error!("Metal async replay failed: {err}");
+            false
+        }
     }
 }
 
@@ -15303,6 +15409,7 @@ impl VerifyGraph {
         let b = self.b;
         let vd = cfg.nv * cfg.dv;
         let cmd = self.ensure_cmd();
+        encode_replay_wait(c, &cmd);
         for (l, st) in layers.iter().zip(states) {
             let slot = self.gdn.len();
             let (s_b, st_len) = match host_state_buffer(c, st.as_ptr(), st.len()) {
@@ -15833,7 +15940,27 @@ impl VerifyGraph {
                 return false;
             }
         }
-        let cmd = c.queue.new_command_buffer().to_owned();
+        // Asynchronous arm: every state is a zero-copy wrap of its CPU
+        // owner, so the replay has nothing to copy back — it goes to the
+        // second queue with a signal at its end and NO wait here; the
+        // next reader of the trunk states (`wait_replay`) collects it.
+        // The next round's draft chain (MTP block + its own mirror on the
+        // main queue) never touches the trunk states or the slot buffers
+        // (VBUF kinds 10-17), so it overlaps the replay. A non-zero-copy
+        // slot needs the host copy below → synchronous as before.
+        let async_ok = async_replay_on() && self.gdn.iter().all(|s| s.st_len == 0);
+        // a stale pending replay would write the same owners: drain it
+        // before a second writer is committed (normally already drained
+        // by the verify that built this graph)
+        if async_ok && !wait_replay() {
+            self.failed = true;
+            return false;
+        }
+        let cmd = if async_ok {
+            c.replay_queue.new_command_buffer().to_owned()
+        } else {
+            c.queue.new_command_buffer().to_owned()
+        };
         let enc = cmd.new_compute_command_encoder();
         for slot in &self.gdn {
             let cfg = &slot.cfg;
@@ -15866,6 +15993,16 @@ impl VerifyGraph {
         }
         enc.end_encoding();
         METAL_SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if async_ok {
+            let value = c
+                .replay_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+                + 1;
+            cmd.encode_signal_event(&c.replay_event, value);
+            cmd.commit();
+            park_replay(c, cmd, value);
+            return true;
+        }
         cmd.commit();
         if let Err(err) = wait_fast_checked(&cmd) {
             self.failed = true;
@@ -17086,5 +17223,113 @@ mod image_stage_tests {
             "idle no-copy model must be released"
         );
         std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod replay_queue_tests {
+    use super::*;
+
+    /// The two-queue handoff the asynchronous verify commit relies on:
+    /// queue B (the replay queue) writes a buffer and signals the shared
+    /// event; queue A (the main queue) waits on that value before it
+    /// copies the buffer out. The copy must see B's bytes.
+    #[test]
+    fn shared_event_orders_queue_b_before_queue_a() {
+        unsafe { std::env::set_var("CMF_GPU", "1") };
+        let Some(c) = ctx() else {
+            eprintln!("gpu test skipped: no Metal device");
+            return;
+        };
+        let n = 4096u64;
+        let src = c
+            ._device
+            .new_buffer(n, MTLResourceOptions::StorageModeShared);
+        let dst = c
+            ._device
+            .new_buffer(n, MTLResourceOptions::StorageModeShared);
+        unsafe {
+            std::ptr::write_bytes(src.contents() as *mut u8, 0x00, n as usize);
+            std::ptr::write_bytes(dst.contents() as *mut u8, 0x11, n as usize);
+        }
+        let ev = c._device.new_shared_event();
+        let value = 7u64;
+        // queue B: fill, then signal (committed, not waited)
+        let cb = c.replay_queue.new_command_buffer().to_owned();
+        {
+            let blit = cb.new_blit_command_encoder();
+            blit.fill_buffer(&src, metal::NSRange::new(0, n), 0xAB);
+            blit.end_encoding();
+        }
+        cb.encode_signal_event(&ev, value);
+        cb.commit();
+        // queue A: wait for the value, then copy src → dst
+        let ca = c.queue.new_command_buffer().to_owned();
+        ca.encode_wait_for_event(&ev, value);
+        {
+            let blit = ca.new_blit_command_encoder();
+            blit.copy_from_buffer(&src, 0, &dst, 0, n);
+            blit.end_encoding();
+        }
+        ca.commit();
+        ca.wait_until_completed();
+        assert_eq!(ca.status(), metal::MTLCommandBufferStatus::Completed);
+        assert!(ev.signaled_value() >= value, "signal not observed");
+        let out = unsafe { std::slice::from_raw_parts(dst.contents() as *const u8, n as usize) };
+        assert!(
+            out.iter().all(|&b| b == 0xAB),
+            "queue A copied before queue B's fill landed: first byte {:#x}",
+            out[0]
+        );
+    }
+
+    /// The pending-replay slot: a buffer parked on the replay queue is
+    /// collected by `wait_replay`, its writes are visible afterwards, and
+    /// the slot is empty; a second wait is a no-op.
+    #[test]
+    fn wait_replay_collects_the_parked_buffer() {
+        unsafe { std::env::set_var("CMF_GPU", "1") };
+        let Some(c) = ctx() else {
+            eprintln!("gpu test skipped: no Metal device");
+            return;
+        };
+        // nothing pending → true, cheap
+        assert!(wait_replay());
+        let n = 8192u64;
+        let buf = c
+            ._device
+            .new_buffer(n, MTLResourceOptions::StorageModeShared);
+        unsafe { std::ptr::write_bytes(buf.contents() as *mut u8, 0x00, n as usize) };
+        let value = c
+            .replay_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            + 1;
+        let cb = c.replay_queue.new_command_buffer().to_owned();
+        {
+            let blit = cb.new_blit_command_encoder();
+            blit.fill_buffer(&buf, metal::NSRange::new(0, n), 0x5C);
+            blit.end_encoding();
+        }
+        cb.encode_signal_event(&c.replay_event, value);
+        cb.commit();
+        park_replay(c, cb, value);
+        assert!(replay_pending());
+        assert!(wait_replay(), "replay buffer must complete cleanly");
+        assert!(!replay_pending(), "the slot must be empty after the wait");
+        assert!(c.replay_event.signaled_value() >= value);
+        let out = unsafe { std::slice::from_raw_parts(buf.contents() as *const u8, n as usize) };
+        assert!(out.iter().all(|&b| b == 0x5C));
+        assert!(wait_replay(), "a second wait with nothing pending is a no-op");
+    }
+
+    #[test]
+    fn async_replay_knob_defaults_on() {
+        // the knob is read once per process; this pins the documented
+        // parse (CMF_METAL_ASYNC_REPLAY=0 → off, anything else → on)
+        if std::env::var("CMF_METAL_ASYNC_REPLAY").as_deref() == Ok("0") {
+            assert!(!async_replay_on());
+        } else {
+            assert!(async_replay_on());
+        }
     }
 }
