@@ -19,6 +19,7 @@ mod sign;
 mod skill;
 mod tube;
 mod videopack;
+mod zimagepack;
 
 use clap::{Parser, Subcommand};
 use cortiq_core::CmfModel;
@@ -1039,25 +1040,57 @@ enum Commands {
         #[arg(long)]
         teacher: Option<String>,
     },
-    /// Generate with Lumina or edit reference images with Qwen Image CMFs.
+    /// Text-to-image with Z-Image / Z-Image-Turbo or Lumina CMFs, or edit
+    /// reference images with Qwen Image CMFs.
+    ///
+    /// Z-Image (one .cmf from `imagine-pack`): every option defaults to the
+    /// recipe stored in the file — Turbo: 1024x1024, 8 steps, guidance 0;
+    /// Z-Image (base): 1024x1024, 28 steps, guidance 4 with CFG — so
+    /// `cortiq imagine z-image-turbo.cmf --prompt "…"` needs no other flag.
     /// Qwen takes a transformer.cmf plus text_encoder.cmf and vae.cmf beside it;
     /// pass --image once per reference. Metal/Vulkan/DX12 are selected when available.
     Imagine {
-        /// Model root directory
+        /// Model: a Z-Image/Lumina/Qwen .cmf, or a Lumina/Qwen root directory
         model_dir: String,
         /// Text prompt
         #[arg(long)]
         prompt: String,
+        /// Image height in pixels (Z-Image: multiple of 16; default from the file)
         #[arg(long)]
         height: Option<usize>,
+        /// Image width in pixels (Z-Image: multiple of 16; default from the file)
         #[arg(long)]
         width: Option<usize>,
-        /// Denoising steps
+        /// Denoising steps = DiT forwards per image (Z-Image default from the
+        /// file: Turbo 8, base 28; Lumina 30)
         #[arg(long)]
         steps: Option<usize>,
-        /// Guidance scale (≤1 disables CFG and halves the work)
-        #[arg(long, default_value_t = 4.0)]
-        cfg: f32,
+        /// Classifier-free guidance scale. Z-Image: 0 disables CFG (one DiT
+        /// forward per step; the Turbo default), > 0 runs pos + g·(pos − neg)
+        /// (base default 4). Lumina/Qwen: default 4, ≤1 disables CFG.
+        #[arg(long, visible_alias = "guidance")]
+        cfg: Option<f32>,
+        /// Z-Image CFG renormalization: clip ‖pred‖ to C·‖pos‖ (the whole
+        /// tensor norm). A bare flag means 1.0 (diffusers `True`); 0 = off.
+        #[arg(long, num_args = 0..=1, default_missing_value = "1.0")]
+        cfg_normalization: Option<f32>,
+        /// Z-Image CFG truncation: CFG only while t_norm = 1 − σ ≤ this value
+        /// (1.0 = every step; e.g. 0.5 drops CFG for the last half of the
+        /// noise range)
+        #[arg(long)]
+        cfg_truncation: Option<f32>,
+        /// Z-Image scheduler shift override (default from the file: Turbo 3, base 6)
+        #[arg(long)]
+        shift: Option<f32>,
+        /// Z-Image prompt token cap after the chat template (default 512)
+        #[arg(long)]
+        max_sequence_length: Option<usize>,
+        /// Images to generate (Z-Image); image i uses seed + i and the prompt
+        /// is encoded once. Files: <out-stem>_<i>.<ext> when more than one.
+        #[arg(long, default_value_t = 1)]
+        num_images: usize,
+        /// Random seed (Z-Image: SplitMix64 + Box-Muller noise; CMF_INIT_LATENT
+        /// injects a raw f32 [1,16,H/8,W/8] latent instead)
         #[arg(long, default_value_t = 42)]
         seed: u64,
         /// Reference image for Qwen Image Edit; repeat for multiple images
@@ -1069,7 +1102,8 @@ enum Commands {
         /// Qwen Image VAE CMF (default: vae.cmf beside the transformer)
         #[arg(long)]
         vae: Option<String>,
-        /// Qwen Image negative prompt (default: a space, enabling true CFG)
+        /// Negative prompt. Z-Image: used when guidance > 0 (default "", the
+        /// diffusers default). Qwen Image: default a space, enabling true CFG.
         #[arg(long)]
         negative_prompt: Option<String>,
         /// Optional Qwen Image FlowMatch Euler scheduler JSON
@@ -1078,13 +1112,17 @@ enum Commands {
         /// Qwen Image reference area as side squared; 1024 is the official profile
         #[arg(long, default_value_t = 1024)]
         reference_size: usize,
-        /// Output image path (Qwen: PNG/JPEG/PPM; Lumina: P6 PPM)
-        #[arg(long, default_value = "out.ppm")]
-        out: String,
+        /// Output image path (Z-Image/Qwen: PNG/JPEG/PPM by extension, Z-Image
+        /// default out.png; Lumina: P6 PPM, default out.ppm)
+        #[arg(long)]
+        out: Option<String>,
     },
-    /// Pack a Diffusers source into CMF. The default packs Lumina into one file;
-    /// --component packs a standalone Qwen text encoder or VAE; --bundle merges
-    /// retained Qwen component CMFs into one ready-to-run file.
+    /// Pack a Diffusers source into CMF. A Z-Image / Z-Image-Turbo pipeline
+    /// directory (model_index.json = ZImagePipeline) becomes ONE ready-to-run
+    /// file (DiT + Qwen3 text encoder + VAE + tokenizer + the model's default
+    /// recipe) and a <out>.sha256; otherwise the default packs Lumina into one
+    /// file; --component packs a standalone Qwen text encoder or VAE; --bundle
+    /// merges retained Qwen component CMFs into one ready-to-run file.
     ImaginePack {
         /// Optional standalone Qwen component: qwen-text-encoder or qwen-vae
         #[arg(long)]
@@ -1095,9 +1133,34 @@ enum Commands {
         bundle: bool,
         /// Diffusers root directory, or a pinned HF resolve base URL for Qwen
         root: String,
-        /// Projection codec (Qwen: q4tp/q4t/q8_2f/f16; Lumina: q4t/q8)
-        #[arg(long, default_value = "q4t")]
-        quant: String,
+        /// Projection codec (Z-Image DiT: q8 (=q8_2f, default)/q4tp/f16/bf16/raw;
+        /// Qwen: q4tp/q4t/q8_2f/f16; Lumina: q4t (default)/q8)
+        #[arg(long)]
+        quant: Option<String>,
+        /// Z-Image text-encoder projection codec: q8 (=q8_2f, default)/q4tp/
+        /// f16/bf16/raw (embed_tokens stays q8_row unless raw/bf16/f16)
+        #[arg(long)]
+        te_quant: Option<String>,
+        /// Z-Image `te.embed_tokens` codec (default q8_row with a quantized
+        /// --te-quant; raw/bf16/f16/f32 keep it 16/32-bit)
+        #[arg(long)]
+        te_embed_quant: Option<String>,
+        /// Z-Image text-encoder projections kept at the source precision
+        /// (comma list: `layers.N.mlp.down_proj` or a suffix like `down_proj`;
+        /// default `layers.6.mlp.down_proj`, the massive-activation writer;
+        /// `none` keeps nothing)
+        #[arg(long, value_delimiter = ',')]
+        te_keep: Vec<String>,
+        /// Z-Image recipe stored in the file: turbo or base (default: from
+        /// the scheduler shift — 3 = turbo, 6 = base)
+        #[arg(long)]
+        variant: Option<String>,
+        /// Z-Image dev: pack only the first N main DiT layers (kernel tests)
+        #[arg(long)]
+        dit_layers: Option<usize>,
+        /// Z-Image: skip hashing the source shards into the provenance
+        #[arg(long, default_value_t = false)]
+        no_source_sha: bool,
         /// Output .cmf path
         #[arg(long)]
         out: String,
@@ -2219,6 +2282,11 @@ async fn main() -> anyhow::Result<()> {
             width,
             steps,
             cfg,
+            cfg_normalization,
+            cfg_truncation,
+            shift,
+            max_sequence_length,
+            num_images,
             seed,
             images,
             text_encoder,
@@ -2227,29 +2295,79 @@ async fn main() -> anyhow::Result<()> {
             scheduler,
             reference_size,
             out,
-        } => cmd_imagine(
-            &model_dir,
-            &prompt,
-            height,
-            width,
-            steps,
-            cfg,
-            seed,
-            &out,
-            &images,
-            text_encoder.as_deref(),
-            vae.as_deref(),
-            negative_prompt.as_deref(),
-            scheduler.as_deref(),
-            reference_size,
-        ),
+        } => {
+            let zimage = std::path::Path::new(&model_dir).is_file()
+                && CmfModel::open(&model_dir)
+                    .map(|m| m.header.arch.arch_name == cortiq_engine::zimagegen::ARCH_NAME)
+                    .unwrap_or(false);
+            if zimage {
+                anyhow::ensure!(
+                    images.is_empty()
+                        && text_encoder.is_none()
+                        && vae.is_none()
+                        && scheduler.is_none()
+                        && reference_size == 1024,
+                    "--image/--text-encoder/--vae/--scheduler/--reference-size are Qwen Image options"
+                );
+                cmd_zimage(
+                    &model_dir,
+                    &prompt,
+                    ZimageCli {
+                        height,
+                        width,
+                        steps,
+                        cfg,
+                        cfg_normalization,
+                        cfg_truncation,
+                        shift,
+                        max_sequence_length,
+                        num_images,
+                        seed,
+                        negative_prompt,
+                        out,
+                    },
+                )
+            } else {
+                anyhow::ensure!(
+                    cfg_normalization.is_none()
+                        && cfg_truncation.is_none()
+                        && shift.is_none()
+                        && max_sequence_length.is_none()
+                        && num_images == 1,
+                    "--cfg-normalization/--cfg-truncation/--shift/--max-sequence-length/--num-images are Z-Image options"
+                );
+                cmd_imagine(
+                    &model_dir,
+                    &prompt,
+                    height,
+                    width,
+                    steps,
+                    cfg.unwrap_or(4.0),
+                    seed,
+                    out.as_deref().unwrap_or("out.ppm"),
+                    &images,
+                    text_encoder.as_deref(),
+                    vae.as_deref(),
+                    negative_prompt.as_deref(),
+                    scheduler.as_deref(),
+                    reference_size,
+                )
+            }
+        }
         Commands::ImaginePack {
             root,
             quant,
+            te_quant,
+            te_embed_quant,
+            te_keep,
+            variant,
+            dit_layers,
+            no_source_sha,
             out,
             component,
             bundle,
         } => {
+            let zroot = std::path::Path::new(&root);
             if bundle {
                 anyhow::ensure!(
                     component.is_none(),
@@ -2257,9 +2375,42 @@ async fn main() -> anyhow::Result<()> {
                 );
                 qwen_imagepack::bundle(&root, &out)
             } else if let Some(component) = component {
-                qwen_imagepack::pack(&root, &component, &quant, &out)
+                qwen_imagepack::pack(&root, &component, quant.as_deref().unwrap_or("q4t"), &out)
+            } else if zimagepack::is_zimage_root(zroot) {
+                zimagepack::pack(
+                    zroot,
+                    &out,
+                    &zimagepack::PackOpts {
+                        dit: zimagepack::parse_codec(
+                            quant.as_deref().unwrap_or(zimagepack::DEFAULT_DIT_CODEC),
+                        )?,
+                        te: zimagepack::parse_codec(
+                            te_quant.as_deref().unwrap_or(zimagepack::DEFAULT_TE_CODEC),
+                        )?,
+                        te_embed: te_embed_quant
+                            .as_deref()
+                            .map(zimagepack::parse_codec)
+                            .transpose()?,
+                        te_keep: if te_keep.is_empty() {
+                            zimagepack::DEFAULT_TE_KEEP.iter().map(|s| s.to_string()).collect()
+                        } else {
+                            te_keep.into_iter().filter(|k| k != "none").collect()
+                        },
+                        layers: dit_layers,
+                        variant,
+                        source_sha: !no_source_sha,
+                    },
+                )
             } else {
-                imagepack::cmd_imagine_pack(&root, &quant, &out)
+                anyhow::ensure!(
+                    te_quant.is_none()
+                        && te_embed_quant.is_none()
+                        && te_keep.is_empty()
+                        && variant.is_none()
+                        && dit_layers.is_none(),
+                    "--te-quant/--variant/--dit-layers are Z-Image options"
+                );
+                imagepack::cmd_imagine_pack(&root, quant.as_deref().unwrap_or("q4t"), &out)
             }
         }
         Commands::Music {
@@ -5080,6 +5231,117 @@ fn qwen_component_paths(
             path.is_file().then_some(path)
         }),
     }
+}
+
+/// `cortiq imagine` options that apply to a Z-Image container.
+struct ZimageCli {
+    height: Option<usize>,
+    width: Option<usize>,
+    steps: Option<usize>,
+    cfg: Option<f32>,
+    cfg_normalization: Option<f32>,
+    cfg_truncation: Option<f32>,
+    shift: Option<f32>,
+    max_sequence_length: Option<usize>,
+    num_images: usize,
+    seed: u64,
+    negative_prompt: Option<String>,
+    out: Option<String>,
+}
+
+/// Z-Image / Z-Image-Turbo text-to-image: every unset option comes from the
+/// recipe stored in the container (`zimage.config_json`).
+fn cmd_zimage(model: &str, prompt: &str, o: ZimageCli) -> anyhow::Result<()> {
+    use cortiq_engine::zimagegen::{generate_images, ZDefaults, ZParams};
+    let d = ZDefaults::of(&CmfModel::open(model)?);
+    let mut p = ZParams::from_defaults(&d);
+    p.height = o.height.unwrap_or(d.height);
+    p.width = o.width.unwrap_or(d.width);
+    p.steps = o.steps.unwrap_or(d.steps);
+    p.guidance = o.cfg.unwrap_or(d.guidance);
+    p.cfg_normalization = o.cfg_normalization.unwrap_or(d.cfg_normalization);
+    p.cfg_truncation = o.cfg_truncation.unwrap_or(d.cfg_truncation);
+    p.shift = o.shift.unwrap_or(d.shift);
+    p.max_tokens = o.max_sequence_length.unwrap_or(d.max_sequence_length);
+    p.num_images = o.num_images.max(1);
+    p.seed = o.seed;
+    p.negative_prompt = o.negative_prompt;
+    anyhow::ensure!(
+        p.height % 16 == 0 && p.width % 16 == 0 && p.height > 0 && p.width > 0,
+        "--height/--width must be positive multiples of 16 (got {}x{})",
+        p.width,
+        p.height
+    );
+    anyhow::ensure!(p.guidance >= 0.0, "--cfg must be >= 0");
+    if p.guidance == 0.0 && p.negative_prompt.is_some() {
+        eprintln!("note: --negative-prompt has no effect at guidance 0 (pass --cfg > 0)");
+    }
+    if d.variant == "turbo" && p.guidance > 0.0 {
+        eprintln!("note: Z-Image-Turbo is distilled for guidance 0; CFG doubles the work");
+    }
+    let out = o.out.unwrap_or_else(|| "out.png".into());
+    let path = std::path::Path::new(&out);
+    let names: Vec<std::path::PathBuf> = if p.num_images == 1 {
+        vec![path.to_path_buf()]
+    } else {
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("out");
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("png");
+        (0..p.num_images)
+            .map(|i| path.with_file_name(format!("{stem}_{i}.{ext}")))
+            .collect()
+    };
+    eprintln!(
+        "z-image ({}): {}x{}, {} steps, guidance {}{}{}, shift {}, seed {}, {} image(s)",
+        d.variant,
+        p.width,
+        p.height,
+        p.steps,
+        p.guidance,
+        if p.guidance > 0.0 && p.cfg_normalization > 0.0 {
+            format!(", cfg-normalization {}", p.cfg_normalization)
+        } else {
+            String::new()
+        },
+        if p.guidance > 0.0 && p.cfg_truncation < 1.0 {
+            format!(", cfg-truncation {}", p.cfg_truncation)
+        } else {
+            String::new()
+        },
+        p.shift,
+        p.seed,
+        p.num_images
+    );
+    let t0 = std::time::Instant::now();
+    let (imgs, tm) = generate_images(std::path::Path::new(model), prompt, &p, |img, i, n| {
+        eprintln!(
+            "image {}/{}: step {i}/{n} ({:.1}s)",
+            img + 1,
+            p.num_images,
+            t0.elapsed().as_secs_f64()
+        );
+    })
+    .map_err(anyhow::Error::msg)?;
+    for (img, name) in imgs.iter().zip(&names) {
+        img.save(name).map_err(anyhow::Error::msg)?;
+        println!(
+            "{}: {}x{}, seed {}",
+            name.display(),
+            img.width,
+            img.height,
+            img.seed
+        );
+    }
+    println!(
+        "{} image(s), {} steps in {:.1}s (text {:.1}s, dit load {:.1}s, median step {:.2}s, vae {:.1}s)",
+        imgs.len(),
+        p.steps,
+        tm.total,
+        tm.text_encode,
+        tm.dit_load,
+        tm.median_step(),
+        tm.vae
+    );
+    Ok(())
 }
 
 /// Dispatch native image generation/editing from its CMF architecture.
