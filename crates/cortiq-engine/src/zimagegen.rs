@@ -336,6 +336,8 @@ pub fn generate_images(
     let tok = Tokenizer::from_bytes(vocab).map_err(|e| format!("tokenizer: {e}"))?;
     let defaults = ZDefaults::of(&model);
     let do_cfg = p.guidance > 0.0;
+    // Device up + kernels compiled beside the host-side loading below.
+    let warm = crate::zimage::gpu_allowed().then(|| std::thread::spawn(crate::gpu::zimage_warmup));
 
     // ── DiT host weights, then the text encoder on the CPU while a helper
     // thread uploads the device planes (they do not depend on the caption).
@@ -384,6 +386,9 @@ pub fn generate_images(
         (te.map(|v| (v, te_s)), helper.map(|h| h.join().unwrap_or((false, 0.0))))
     });
     let ((cap, ncap), te_s) = te?;
+    if let Some(w) = warm {
+        let _ = w.join();
+    }
     tm.text_encode = te_s;
     let overlapped = t0.elapsed().as_secs_f64();
     if prof_on() {
