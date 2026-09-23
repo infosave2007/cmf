@@ -114,38 +114,74 @@
 //!
 //! # Integration recipe (for the core package)
 //!
-//! - `prepare` and `step` implement the contract for batch 1 (Turbo).
-//!   `prepare` builds the f16 planes once per model, using
-//!   [`ZBlockDev::from_model`]: F16 as stored, Bf16/F32 converted,
-//!   Q4TiledP / Q8Row / Q8_2f dequantized by the parent's `q4tp_dq_f16` /
-//!   `q8_dq_f16`. Any other codec declines.
+//! - `prepare` and `step` implement the contract (batch 1, and batch 2
+//!   through `ZPrepareArgs::neg`). `prepare` builds the f16 planes once
+//!   per model: q8_row / q8_2f through the streamed `zi_dq8` builder,
+//!   otherwise [`ZBlockDev::from_model`] (F16 as stored, Bf16/F32
+//!   converted, Q4TiledP by the parent's `q4tp_dq_f16`). Any other codec
+//!   declines.
 //!   The contract then builds a [`ZStepDev`] for (n_img, n_cap_p) and
 //!   uploads both RoPE tables. `step` uploads x_tok, mods and the final
 //!   scale, replays the program and reads back `[n_img][64]`.
 //! - The base model with CFG (batch 2) goes through
 //!   `ZStepDev::new(.., n_cap_p = &[cond, uncond], cap = both stacked)`
 //!   plus `upload(x_tok for both items, ..)` and `run(out [2][n_img][64])`.
-//!   The contract has no batch-2 entry yet. Adding one means an
-//!   `Option<…>` field agreed with the WP1 lead (plan §2.1). Unequal
-//!   caption lengths are supported: segments, per-item final dispatch.
+//!   The contract's `ZPrepareArgs::neg` / `ZStepArgs::out_neg` (B2) do
+//!   exactly that. Unequal caption lengths are supported: segments,
+//!   per-item final dispatch.
 //! - `refine_caption` runs the context refiner on the device: the same
 //!   chain, unmodulated, with its planes cached separately.
-//! - Still to do on the device side, by measured cost in a real 1024²
-//!   image:
-//!   - the resident VAE (`vae_decode_chain` declines). The existing wgpu
-//!     VAE takes 40–44 s at 1024² and 9 s at 512², against 8 s for all
-//!     8 DiT steps. It is the largest item left.
-//!   - `prepare` builds the planes cold in 9–12 s (q8 upload + dequant,
-//!     once per process).
-//!   - The text encoder on the device takes 3.7 s, slower than on the CPU,
-//!     and moves v_0 by 3–7 %. That code belongs to the core package.
+//! - B2 finished the whole image (see "# B2" below): CFG pairs, the
+//!   resident VAE, the streamed plane build, the range guards.
 //! - Knobs:
 //!   - `CMF_ZI_WGPU=0`: device path off;
 //!   - `CMF_ZI_TILE=bm,bn,bk,wm,wn`: GEMM tile;
 //!   - `CMF_ZI_FLASH=nw,bc`: flash tile;
 //!   - `CMF_ZI_FLASH_THR`, `CMF_ZI_FLASH_VT`, `CMF_ZI_FLASH_PAD`,
 //!     `CMF_ZI_FLASH_DBG`: flash debug arms;
-//!   - `CMF_ZI_CHECKED=1`: build with naga bounds checks.
+//!   - `CMF_ZI_CHECKED=1`: build with naga bounds checks;
+//!   - `CMF_ZI_VAE=0`: the per-conv VAE instead of the resident chain;
+//!   - `CMF_ZI_PLANE_FAST=0`: the B1 per-tensor plane build;
+//!   - `CMF_ZI_ATTN_SHIFT` / `CMF_ZI_QKV_SHIFT` / `CMF_ZI_HID_SHIFT`: the
+//!     range guards ([`ZGuards`]);
+//!   - `CMF_ZI_AMAX=1` (`CMF_ZI_AMAX_ALL=1`): per-block f16 site maxima.
+//!
+//! # B2: the whole image on the device
+//!
+//! Measured on the same 3090 (in-process timers, `CMF_ZIMAGE_PROF=1`).
+//!
+//! - CFG: `ZPrepareArgs::neg` prepares the cond/uncond pair as ONE batch-2
+//!   program (each item its own caption length and RoPE rows);
+//!   `ZStepArgs::out_neg` returns both. Base 512² step 0.48 s against
+//!   2 × 0.25 s for two batch-1 forwards. Steps past `cfg_truncation` use a
+//!   second, batch-1 program (the last two programs stay live).
+//! - Range guards ([`ZGuards`], per model variant). The base model
+//!   overflowed f16 (NaN from step 0) at three sites, all worst at layer 28:
+//!   attention input 3.0e5, qkv 1.25e6, SwiGLU hidden 7.1e6. Each f16
+//!   site is stored ×2⁻ᵏ and the consumer multiplies it back (the qk-norm
+//!   is scale-free with its eps scaled by 2⁻²ᵏ).
+//! - Plane build (`ZBlockDev::from_model_all`): the raw q8 file bytes of a
+//!   block go into one of two persistent mapped staging buffers (16
+//!   threads straight from the mmap), one copy to the device, and
+//!   `zi_dq8` expands them in place (row scale, column field, the w13
+//!   interleave). 32 blocks: 9–12 s (B1, per-tensor) → 1.9 s with a
+//!   fresh `write_buffer_with` view per block (28 ms each) → 0.77–0.85 s
+//!   with the ring. It runs on a helper thread beside the CPU text
+//!   encoder (`gpu::zimage_preload`); the device context and every
+//!   kernel compile on another helper from the start (`gpu::zimage_warmup`).
+//! - Resident VAE (`vae_decode_chain`): NHWC f16 activations, every 3×3
+//!   conv an implicit GEMM on `zi_mm` (`MmCfg::conv`: the A tile gathered
+//!   from the image, the nearest-2× upsample folded into the gather), a
+//!   two-pass f32 GroupNorm fused with the affine, SiLU and the f16 cast,
+//!   the mid attention as QKᵀ → softmax → P·V over query chunks, one
+//!   submission, one readback. Against the fp32 oracle decoder: rel
+//!   1.4–1.6e-4, u8 PSNR 69.3–69.9 dB (r512, r400x592, r1024). Steady
+//!   state 0.10–0.13 s at 512² and 0.40–0.50 s at 1024², against 9 s and
+//!   40–44 s for the per-conv path; the weights and kernels are prepared
+//!   on a helper thread while the steps run (`gpu::vae_prewarm`).
+//! - Host work per step (patchify, 1 MB up, 1 MB down, Euler, CFG combine)
+//!   is ≤ 1 % of a step (512² step 0.251 s in the pipeline vs 0.250 s for
+//!   the device program alone), so it stays on the host.
 //!
 //! Traps found here (they cost time; keep them):
 //! - A workgroup array whose byte size is not a multiple of 16 misaligns
