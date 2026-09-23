@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.4] - 2026-09-24
+
+### Added
+- Z-Image text-to-image (Tongyi-MAI's Z-Image-Turbo and the Z-Image base
+  model): `cortiq imagine <file.cmf> --prompt …` renders with the recipe
+  stored in the file (Turbo: 1024², 8 steps, no CFG; base: 28 steps,
+  guidance 4 with CFG, negative prompt) and exposes every option
+  (`--width/--height`, `--steps`, `--cfg`, `--negative-prompt`,
+  `--cfg-normalization`, `--cfg-truncation`, `--shift`, `--seed`,
+  `--num-images`, `--max-sequence-length`, `--out`). `cortiq imagine-pack
+  <diffusers dir>` packs the 6.15B DiT, the Qwen3-4B text encoder (layers
+  0..34, `hidden_states[-2]`) and the Flux VAE into one file; the defaults
+  are an 8-bit DiT and an 8-bit text encoder with `layers.6.mlp.down_proj`
+  kept bf16 — measured: the 4-bit DiT loses 3–15 dB of image PSNR, the
+  8-bit one is comparable to bf16 inference, and a 4-bit text encoder loses
+  6–10 dB. A CPU-exact reference path (`CMF_GPU=0`) matches diffusers fp32
+  to 5e-5 on the final latent (PNG 78 dB).
+- On Vulkan (NVIDIA, 32-wide subgroups) the whole image runs on the
+  device: a tensor-core f16 GEMM (`zi_mm`, 55–61 TFLOPS on an RTX 3090),
+  flash attention without a score matrix (`zi_flash`, 51–54 TFLOPS), a
+  resident chain that keeps the hidden state on the GPU for the whole
+  step, CFG as one batch-2 forward, a resident VAE decoder (1024²:
+  0.5 s instead of 40 s), a device q8→f16 plane build (0.8 s instead of
+  10 s) overlapped with the CPU text encoder, and f16 range guards for the
+  SwiGLU hidden, the attention input and the qkv panel. RTX 3090, no
+  flags: Turbo 512² in 4.6 s and 1024² in 11.4 s per process (steps at
+  0.255 / 1.04 s, the speed of diffusers bf16 on the same card, with
+  14–15 GB of VRAM against 20–22), the base model 16.2 s and 60 s. The
+  text encoder stays on the CPU with an exact AVX2 q8 kernel (0.6 s;
+  3.3× more accurate than the int8-activation kernel). The device path
+  matches the CPU path to 9e-4 per DiT step and ≥45 dB per image.
+- Lumina-2 and every other model are untouched (their parity tests pass).
+
 ## [0.7.3] - 2026-09-23
 
 ### Changed
