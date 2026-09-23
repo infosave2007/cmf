@@ -39,7 +39,9 @@ fn main() {
     // the arm the pipeline used before B2).
     let _p = (std::env::var("ZC_TE_GPU").as_deref() != Ok("1")).then(cortiq_engine::gpu::pause_gpu);
     let t = std::time::Instant::now();
-    let enc = cortiq_engine::qwen3te::Qwen3Encoder::from_cmf(&model).unwrap();
+    let mut enc = cortiq_engine::qwen3te::Qwen3Encoder::from_cmf(&model).unwrap();
+    // `ZC_TE_EXACT=1`: the weight-only exact q8 kernel (the pipeline's).
+    enc.set_exact_q8(std::env::var("ZC_TE_EXACT").as_deref() == Ok("1"));
     println!("load {:.3} s", t.elapsed().as_secs_f64());
     for k in keys.split(',') {
         let o = read_st(&format!("{}/te_{k}_fp32.safetensors", a[2]));
