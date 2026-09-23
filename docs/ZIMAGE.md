@@ -142,6 +142,7 @@ the outputs.
 | the same, base (r512 c3 i0 / i2) | 3.0e-4 / 1.8e-4 |
 | CFG pair (one batch-2 forward) against the two items stepped one by one (base r512 i0) | cond 2.2e-4, uncond 0 (bit-identical); uncond single vs CPU 1.7e-4 |
 | VAE on the oracle latent (r512, r400x592, r1024) | `img` rel 1.4e-4 to 1.6e-4, u8 PSNR 69.3 to 69.9 dB vs the fp32 decoder |
+| Turbo 512², whole CLI run, device vs the CPU pipeline (same file, same exact text encoder), p0 / p1 | `v_0` 8.9e-4 / 1.1e-3, `lat_8` 8.8e-3 / 1.9e-2, PNG PSNR 53.4 / 45.5 dB |
 | Turbo, 6 seeds 512², device vs the CPU pipeline, both with the older int8-activation text encoder | PSNR median 52.8 dB, min 49.1 dB |
 | Turbo images vs fp32 (512² p0, p1, 400×592 p0, 1024² p0) | 26.1, 26.1, 23.6, 33.3 dB; diffusers bf16 vs fp32: 24.2, 30.0, 33.3, 35.2 |
 | base, 3 steps CFG + negative (512² p0, 400×592 p1) vs fp32 | 35.4, 29.5 dB; diffusers bf16: 25.5 |
