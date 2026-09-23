@@ -377,7 +377,11 @@ pub fn generate_images(
             // `CMF_ZIMAGE_TE_GPU=1` restores the device arm for A/B work.
             let _cpu = (std::env::var("CMF_ZIMAGE_TE_GPU").as_deref() != Ok("1"))
                 .then(crate::gpu::pause_gpu);
-            let enc = crate::qwen3te::Qwen3Encoder::from_cmf(&model)?;
+            let mut enc = crate::qwen3te::Qwen3Encoder::from_cmf(&model)?;
+            // Weight-only exact q8 projections (B2): the default a8w8
+            // kernel triples the caption error (h_m2 1.35e-2 vs 4.1e-3).
+            // `CMF_ZIMAGE_TE_EXACT=0` = the a8w8 arm.
+            enc.set_exact_q8(std::env::var("CMF_ZIMAGE_TE_EXACT").as_deref() != Ok("0"));
             let cap = enc.encode(&ids);
             let ncap = neg_ids.as_ref().map(|n| enc.encode(n));
             Ok((cap, ncap))

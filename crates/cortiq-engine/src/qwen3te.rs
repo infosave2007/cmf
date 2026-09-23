@@ -63,6 +63,9 @@ pub struct Qwen3Encoder {
     hd: usize,
     theta: f32,
     eps: f64,
+    /// Weight-only exact q8 projections (`q8_exact_matmat`); off by
+    /// default — the Z-Image pipeline turns it on.
+    exact_q8: bool,
 }
 
 fn rms_norm_into(x: &[f32], w: &[f32], eps: f64, dst: &mut [f32]) {
@@ -322,7 +325,22 @@ impl Qwen3Encoder {
             hd: u("head_dim", 128),
             theta: cfg["rope_theta"].as_f64().unwrap_or(5e6) as f32,
             eps: cfg["rms_norm_eps"].as_f64().unwrap_or(1e-6),
+            exact_q8: false,
         })
+    }
+
+    /// Weight-only exact q8 projections (f32 activations; see
+    /// `q8_exact_matmat`). Off by default, so every existing caller keeps
+    /// its numbers; Z-Image turns it on.
+    pub fn set_exact_q8(&mut self, on: bool) {
+        self.exact_q8 = on;
+    }
+
+    fn mm(&self, p: &Proj, xs: &[f32], n: usize, out: &mut [f32], pool: Option<&Pool>) {
+        if self.exact_q8 && q8_exact_matmat(p, xs, n, out, pool).is_some() {
+            return;
+        }
+        p.matmat(xs, n, out, pool);
     }
 
     /// Per-head RMSNorm then split-half RoPE over the whole head, in
@@ -454,9 +472,9 @@ impl Qwen3Encoder {
             for (o, src) in xn.chunks_exact_mut(hs).zip(h.chunks_exact(hs)) {
                 rms_norm_into(src, &layer.input_norm, self.eps, o);
             }
-            layer.q.matmat(&xn, n, &mut q_all, pool);
-            layer.k.matmat(&xn, n, &mut k_all, pool);
-            layer.v.matmat(&xn, n, &mut v_all, pool);
+            self.mm(&layer.q, &xn, n, &mut q_all, pool);
+            self.mm(&layer.k, &xn, n, &mut k_all, pool);
+            self.mm(&layer.v, &xn, n, &mut v_all, pool);
             self.norm_rope(&mut q_all, n, nh, &layer.q_norm, &pos);
             self.norm_rope(&mut k_all, n, nkv, &layer.k_norm, &pos);
 
@@ -497,7 +515,7 @@ impl Qwen3Encoder {
                 None => heads(0, nh),
             }
 
-            layer.o.matmat(&attn, n, &mut proj, pool);
+            self.mm(&layer.o, &attn, n, &mut proj, pool);
             for (d, &v) in h.iter_mut().zip(&proj) {
                 *d += v;
             }
@@ -508,12 +526,12 @@ impl Qwen3Encoder {
             let inter = layer.gate.rows();
             let mut g = vec![0f32; n * inter];
             let mut u = vec![0f32; n * inter];
-            layer.gate.matmat(&xn, n, &mut g, pool);
-            layer.up.matmat(&xn, n, &mut u, pool);
+            self.mm(&layer.gate, &xn, n, &mut g, pool);
+            self.mm(&layer.up, &xn, n, &mut u, pool);
             for (a, &b) in g.iter_mut().zip(&u) {
                 *a = silu(*a) * b;
             }
-            layer.down.matmat(&g, n, &mut proj, pool);
+            self.mm(&layer.down, &g, n, &mut proj, pool);
             for (d, &v) in h.iter_mut().zip(&proj) {
                 *d += v;
             }
@@ -582,5 +600,112 @@ impl Qwen3Encoder {
     /// encoder's own hidden size otherwise.
     pub fn out_hidden(&self) -> usize {
         self.proj.as_ref().map_or(self.hidden, |p| p.d_out)
+    }
+}
+
+// ── Exact q8 projections (Z-Image, B2) ───────────────────────────────
+//
+// The default CPU q8 matmat quantizes the ACTIVATIONS to int8 too (the
+// a8w8 / SDOT contract). For the Z-Image caption that costs a factor of
+// three in accuracy: h_m2 rel 1.35e-2 against the fp32 oracle, against
+// 4.1e-3 weight-only (and 8.7e-3 for diffusers bf16). The exact scalar
+// path (`CMF_SDOT=0`) gets 4.1e-3 but is 7× slower (3.2 s for 22
+// tokens). This kernel is weight-only exact AND fast: f32 activations
+// pre-multiplied by the q8_2f column field, int8 rows widened to f32 in
+// registers, f32 FMA, the row scale applied once per output
+// (x86_64 AVX2+FMA; elsewhere the caller keeps the default path).
+
+/// `Some(())` when `p` is a q8_row / q8_2f weight the fast exact kernel
+/// handled; `None` = run the default `matmat`.
+fn q8_exact_matmat(p: &Proj, xs: &[f32], n: usize, out: &mut [f32], pool: Option<&Pool>) -> Option<()> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use crate::qtensor::QTensor;
+        use cortiq_core::TensorDtype as T;
+        if !(std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")) {
+            return None;
+        }
+        let Proj::Q(QTensor::Mapped { model, idx, dtype, rows, cols, row_scale, col_field, .. }) = p else {
+            return None;
+        };
+        if !matches!(dtype, T::Q8_2f | T::Q8Row) || row_scale.len() != *rows {
+            return None;
+        }
+        let (rows, cols) = (*rows, *cols);
+        let bytes = model.entry_bytes(&model.tensors[*idx]);
+        if bytes.len() < rows * cols || xs.len() < n * cols || out.len() < n * rows {
+            return None;
+        }
+        // x' = x ⊙ col_field (q8_2f), so w·x = rs · Σ q·x'.
+        let xs2: Vec<f32> = if *dtype == T::Q8_2f && col_field.len() == cols {
+            xs[..n * cols].chunks_exact(cols).flat_map(|r| r.iter().zip(col_field).map(|(a, c)| a * c)).collect()
+        } else {
+            xs[..n * cols].to_vec()
+        };
+        let q = &bytes[..rows * cols];
+        let op = SendPtr(out.as_mut_ptr());
+        let work = |lo: usize, hi: usize| {
+            for o in lo..hi {
+                let wrow = &q[o * cols..(o + 1) * cols];
+                let mut b0 = 0;
+                while b0 < n {
+                    let nb = (n - b0).min(4);
+                    let mut acc = [0f32; 4];
+                    // SAFETY: AVX2+FMA checked above; slices sized above.
+                    unsafe { q8_dot4(wrow, &xs2[b0 * cols..], cols, nb, &mut acc) };
+                    for (k, a) in acc.iter().take(nb).enumerate() {
+                        // SAFETY: each (token, row) cell has one writer.
+                        unsafe { op.row((b0 + k) * rows + o, 1)[0] = a * row_scale[o] };
+                    }
+                    b0 += nb;
+                }
+            }
+        };
+        match pool {
+            Some(pl) => pl.run_rows(rows, &work),
+            None => work(0, rows),
+        }
+        Some(())
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (p, xs, n, out, pool);
+        None
+    }
+}
+
+/// Σ_j w[j]·x_k[j] for up to 4 activation rows x_k = xs[k·cols..].
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn q8_dot4(w: &[u8], xs: &[f32], cols: usize, nb: usize, acc: &mut [f32; 4]) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let mut a = [_mm256_setzero_ps(); 4];
+        let wp = w.as_ptr() as *const i8;
+        let xp = xs.as_ptr();
+        let mut j = 0;
+        while j + 8 <= cols {
+            let wi = _mm_loadl_epi64(wp.add(j) as *const __m128i);
+            let wf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(wi));
+            for k in 0..4 {
+                if k < nb {
+                    a[k] = _mm256_fmadd_ps(wf, _mm256_loadu_ps(xp.add(k * cols + j)), a[k]);
+                }
+            }
+            j += 8;
+        }
+        for k in 0..nb {
+            let v = a[k];
+            let hi = _mm256_extractf128_ps(v, 1);
+            let lo = _mm256_castps256_ps128(v);
+            let s = _mm_add_ps(lo, hi);
+            let s = _mm_hadd_ps(s, s);
+            let s = _mm_hadd_ps(s, s);
+            let mut t = _mm_cvtss_f32(s);
+            for jj in j..cols {
+                t += (w[jj] as i8) as f32 * *xp.add(k * cols + jj);
+            }
+            acc[k] = t;
+        }
     }
 }
