@@ -38,6 +38,13 @@ use std::path::{Path, PathBuf};
 pub(crate) const DEFAULT_DIT_CODEC: &str = "q8";
 /// Default text-encoder projection codec.
 pub(crate) const DEFAULT_TE_CODEC: &str = "q8";
+/// Text-encoder projections kept at the source precision by default. Qwen3-4B
+/// writes its massive activations through layer 6's MLP down projection:
+/// that ONE matrix (26 M params, +26 MB of file) carries most of the q8
+/// error — measured h_m2 rel vs fp32: all-q8 1.33e-2, this kept 4.1e-3
+/// (every down_proj kept 3.0e-3; diffusers bf16 8.7e-3; layers 0-5 and
+/// 7-34, o/qkv/gate/up kept: no change).
+pub(crate) const DEFAULT_TE_KEEP: &[&str] = &["layers.6.mlp.down_proj"];
 
 /// Codec of one family of weights.
 #[derive(Clone, Copy, PartialEq, Debug)]
