@@ -277,7 +277,7 @@ pub fn default_cfg(epi: Epi) -> MmCfg {
             }
         }
     }
-    MmCfg::new(128, 128, 32, 2, 4, epi)
+    MmCfg::new(128, 128, 32, 2, 2, epi)
 }
 
 /// WGSL of one `zi_mm` variant. Bindings: 0 plane `[N][K]` f16 (as
@@ -450,7 +450,7 @@ pub fn mm_src(g: MmCfg) -> String {
                 for j in 0..fnn {
                     let _ = writeln!(
                         s,
-                        "  coopStoreT(c{i}_{j}, &outp[(orow + {}u) * ldo + ocol + {}u], ldo);",
+                        "  {{ let oi = (orow + {}u) * ldo + ocol + {}u; coopStoreT(c{i}_{j}, &outp[oi], ldo); }}",
                         i * 16,
                         j * 16
                     );
@@ -598,8 +598,15 @@ impl FlashCfg {
             + 8
     }
     fn key(&self) -> String {
-        format!("zi_flash_{}_{}", self.nw, self.bc)
+        format!("zi_flash_{}_{}_{}", self.nw, self.bc, flash_thr())
     }
+}
+
+/// Lazy-rescale threshold in log2 units (P ≤ 2^thr in f16). `CMF_ZI_FLASH_THR`
+/// overrides (0 = rescale whenever the max grows: the exact-classic path).
+fn flash_thr() -> String {
+    let v: f32 = std::env::var("CMF_ZI_FLASH_THR").ok().and_then(|v| v.parse().ok()).unwrap_or(8.0);
+    format!("{:.1}", v.clamp(0.0, 14.0))
 }
 
 pub fn default_flash() -> FlashCfg {
@@ -699,7 +706,7 @@ pub fn flash_src(f: FlashCfg) -> String {
     let _ = writeln!(s, "    var pm = -1.0e30;");
     let _ = writeln!(s, "    for (var e = 0u; e < {half}u; e = e + 1u) {{ pm = max(pm, ss[sbase + e] * p.scl); }}");
     let _ = writeln!(s, "    smx[tid] = pm;");
-    let _ = writeln!(s, "    if (pm > mu + 8.0) {{ sfl[kb & 1u] = 1u; }}");
+    let _ = writeln!(s, "    if (pm > mu + {}) {{ sfl[kb & 1u] = 1u; }}", flash_thr());
     let _ = writeln!(s, "    let need = workgroupUniformLoad(&sfl[kb & 1u]);");
     let _ = writeln!(s, "    if (tid == 0u) {{ sfl[(kb + 1u) & 1u] = 0u; }}");
     let _ = writeln!(s, "    let rmax = max(pm, smx[tid ^ 16u]);");
