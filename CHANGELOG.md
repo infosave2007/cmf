@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Native Metal speculation folds the GDN state with a 4-lane re-tile of
+  the state kernel (`gdn_state_b4`, `CMF_METAL_STATE4=0` restores the
+  old tile): the 27B verify pass over 8 rows spends 6.7 ms on the state
+  instead of 16.4 and a 5-token replay 4.8 instead of 11.8. The
+  speculative commit's replay now runs on a second command queue behind
+  an `MTLSharedEvent`, overlapped with the next round's draft chain
+  (`CMF_METAL_ASYNC_REPLAY=0` keeps it synchronous); every reader of the
+  GDN owners — the plain forward, the rows graph, the session export,
+  the sequence reset and the pipeline drop — collects it first, and a
+  failed replay fails the generation closed. Qwen3.8-27B q4tp on an M4
+  (24 GB), cooled and interleaved against the 0.7.2 binary: plain
+  6.71 → 6.74 tok/s, a code prompt with speculation 10.9 → 11.5, the
+  speculative bench 15.3 → 15.9; a round is draft 32 + verify 229 +
+  commit 5-21 ms (was verify 253, commit 25-45). Greedy output is
+  bit-identical to 0.7.2 and the commit oracle
+  (`CMF_METAL_VERIFY_CHECK=2`) reads the same 7e-4 state deviation as
+  the old kernels.
+
 ## [0.7.2] - 2026-09-23
 
 ### Changed
