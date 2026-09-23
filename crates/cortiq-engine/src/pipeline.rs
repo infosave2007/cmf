@@ -171,6 +171,12 @@ pub struct Pipeline {
     pub mtp: Option<MtpModule>,
     /// Speculative decode via MTP (greedy only; `CMF_MTP=0` disables).
     pub speculative: bool,
+    /// Keep generating past end-of-sequence ids (the llama-bench contract
+    /// for a timed run). A loop flag, deliberately NOT a sampler
+    /// suppression: suppressed ids count as a penalty and switch the
+    /// speculative round and the greedy burst off, so a benchmark that
+    /// suppressed EOS never measured either.
+    pub ignore_eos: bool,
     rng: SplitMix64,
     sampler_scratch: SamplerScratch,
     /// Speculative SAMPLING state (graph_spec_step, temperature > 0): the
@@ -2079,6 +2085,7 @@ impl Pipeline {
             short_conv_cfg: None,
             mtp: None,
             speculative: std::env::var("CMF_MTP").map(|v| v != "0").unwrap_or(true),
+            ignore_eos: false,
             rng,
             sampler_scratch: SamplerScratch::default(),
             spec_forced: None,
@@ -3408,7 +3415,7 @@ impl Pipeline {
             ($id:expr) => {{
                 all_ids.push($id);
                 generated += 1;
-                if self.tokenizer.is_eos($id) {
+                if self.tokenizer.is_eos($id) && !self.ignore_eos {
                     finish_reason = "stop".to_string();
                     false
                 } else {
@@ -4402,6 +4409,14 @@ impl Pipeline {
         let model = model.clone();
         let (lm_gw, lm_rows) = {
             let (_, i, kind, rs) = self.weights.lm_head.graph_weight()?;
+            // The draft's head over the CMF_DRAFT_VOCAB shortlist (the same
+            // cut the native Metal draft takes): 662 MB a step on Qwen3.8
+            // becomes 170 MB at 65536; the verify keeps the full head.
+            let rows = if kind == 6 {
+                Self::draft_vocab_rows(self.weights.lm_head.rows())
+            } else {
+                self.weights.lm_head.rows()
+            };
             (
                 crate::gpu::GraphW {
                     idx: i,
@@ -4411,7 +4426,7 @@ impl Pipeline {
                     prism: crate::gpu::GraphPrismOp::None,
                     affine: false,
                 },
-                self.weights.lm_head.rows(),
+                rows,
             )
         };
         let layer = crate::gpu::GraphLayer {

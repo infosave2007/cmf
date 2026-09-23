@@ -5935,16 +5935,13 @@ async fn cmd_bench(
         },
     )?;
     if ignore_eos {
-        // Every id the tokenizer treats as end-of-sequence, suppressed:
-        // the greedy loop then never sees "stop" (a one-pass penalized
-        // argmax, so the core number stays a core number).
-        let vocab = pipeline.tokenizer.vocab_size() as u32;
-        let eos: Vec<u32> = (0..vocab)
-            .filter(|&id| pipeline.tokenizer.is_eos(id))
-            .collect();
-        let mut cfg = pipeline.sampler_config.clone();
-        cfg.suppress_tokens = eos;
-        pipeline.set_sampler_config(cfg);
+        // A loop flag, not a suppression: the earlier form put every EOS id
+        // into `suppress_tokens`, which the engine counts as a penalty and
+        // answers by switching the speculative round and the greedy burst
+        // off — so `bench --ignore-eos` never measured either (mtp_drafted
+        // stayed 0 on every card). The stream may now carry EOS ids; the
+        // timing is what the flag is for.
+        pipeline.ignore_eos = true;
     }
     if core {
         pipeline.set_confidence(false);
