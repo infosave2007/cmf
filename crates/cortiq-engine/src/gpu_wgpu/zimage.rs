@@ -14,37 +14,122 @@
 //! The module is `pub` (doc-hidden) so WP2's examples/tests can reach
 //! `pub` helpers added here without touching `gpu_wgpu.rs`.
 //!
-//! # B1 state: the fast-path kernels and the resident chain (synthetic weights)
+//! # B1: the fast-path kernels and the resident chain
 //!
-//! Everything below the contract stubs is the device machinery the
-//! integration package wires into `prepare`/`step`:
+//! Measured on the pod's RTX 3090 (Ampere GA102, NVIDIA 610.43, Vulkan
+//! 1.4), `examples/zimage_gemmbench.rs`, in-process device time, medians:
 //!
-//! - [`MmCfg`] / `zi_mm`: f16 plane × f16 activation → f32 accumulate on
-//!   the cooperative-matrix units (16×16×16), large tiles, register
-//!   prefetch of the next K slice, three epilogues: f32 store (O-proj, w2),
-//!   f16 store (qkv), SwiGLU (w1‖w3 interleaved in 16-row panels →
-//!   `silu(g)·u` stored f16 for w2).
+//! - Ceilings (S0): coop is available (16×16×16 f16 in, f32 or f16 acc).
+//!   A pure-MMA loop reaches 81.5 TFLOPS with f32 accumulation and 162.9
+//!   with f16 accumulation. The parent's existing arms at the Z-Image
+//!   shapes reach: scalar `q4tp_mm` 7.4–8.3 TF, `q4tp_mm_coop` (in-kernel
+//!   dequant) 15.5–19.5 TF, `q4tp_mm_coop_f16` (plane) 16–19 TF.
+//! - [`MmCfg`] / `zi_mm`: f16 plane × f16 activation, f32 accumulation.
+//!   The default tile is 128×128×32 with 2×2 subgroups (a 64×64 warp tile)
+//!   and a register prefetch of the next K slice. It reaches 55–61 TF on
+//!   all four sites at 1024² (qkv, o, w13 with SwiGLU, w2), which is
+//!   70–75 % of the f32-accumulate ceiling and 3.1× the parent's coop
+//!   arms. At 512² it reaches 50–55 TF.
+//!   Precision against an f64 reference on f16 operands: the f32 epilogue
+//!   gives 6.2e-6 at K=3840 and 1.6e-5 at K=10240; the f16 and SwiGLU
+//!   epilogues give 2.1e-4, which is the f16 output rounding.
+//!   Measured and rejected (kept only as `MmCfg` fields):
+//!   - two shared stages: −5…−12 %;
+//!   - direct global coop loads (`direct`): 25 TF;
+//!   - 2×4 / 4×2 / 256-wide tiles: 42–52 TF;
+//!   - BK=64: equal or −3 %.
+//!   `acc16_probe` (f16 accumulators with no flush, so a wrong answer)
+//!   runs the BK=64 tile at 80 TF. That is the ceiling a flushed
+//!   f16-accumulate arm could approach. It is not built, because its
+//!   precision at K=10240 needs the real-weight gates first.
 //! - `zi_flash`: bidirectional flash attention, heads 30×128, read straight
-//!   out of the fused qkv panel (no head-major pack), f16 Q·K and P·V on the
-//!   matrix units, f32 online softmax with the lazy (threshold) rescale, and
-//!   the output written in the `[token][head·128]` layout the O GEMM eats.
-//!   Per-segment dispatch = batch 2 (CFG cond + uncond) with each item's own
-//!   padded length, which is exactly diffusers' key mask.
-//! - `zi_rowop`: gated residual with the post-norm (x += tanh(g)·RMS(br)·w)
-//!   fused with the NEXT pre-norm·(1+s) → f16, one pass over the row.
-//! - `zi_qkrope`: per-head qk-RMSNorm + complex-interleaved RoPE, in place
-//!   on the f16 qkv panel.
-//! - `zi_embed` / `zi_final`: x_embedder (64→3840 +b, pad rows := x_pad) and
-//!   the final LayerNorm·scale + Linear(3840→64) +b, both f32.
-//! - [`ZChain`]: planes + per-(prompt, resolution) state + prebuilt bind
-//!   groups; the hidden state never leaves the device inside a step, the
-//!   modulation of all 32 blocks is one buffer written once per step.
+//!   out of the fused qkv panel (no head-major pack). Q·K and P·V are f16
+//!   on the matrix units. The softmax is f32 online with the lazy
+//!   (threshold 2⁸) rescale, which is exact. Output goes straight into the
+//!   `[token][head·128]` layout the O GEMM reads. There is one dispatch per
+//!   segment, so batch 2 (CFG cond + uncond) keeps each item's own padded
+//!   length, which is exactly diffusers' key mask.
+//!   The default is 4 subgroups × 16 queries and 16 keys per block, with V
+//!   staged row-major. It measures 51–54 TF at 1024² (5.4 ms per layer)
+//!   and 38 TF at 512².
+//!   Error against f64 is 2.1e-4, the f16 output floor, including the
+//!   rescale path.
+//!   Rescaling on every max increase (`CMF_ZI_FLASH_THR=0`) runs at
+//!   22 TF. A transposed V (`CMF_ZI_FLASH_VT=1`) runs at 35 TF.
+//! - `zi_rowop` fuses the gated residual with the post-norm
+//!   (x += tanh(g)·RMS(br)·w) and the next pre-norm·(1+s) → f16 into one
+//!   pass over the row.
+//! - `zi_qkrope` applies the per-head qk-RMSNorm and the complex-interleaved
+//!   RoPE, in place on the f16 qkv panel.
+//! - `zi_embed` is the x_embedder (64→3840 + b, pad rows := x_pad).
+//!   `zi_final` is the final LayerNorm·scale + Linear(3840→64) + b.
+//!   Both run in f32.
+//!   Row kernels together take 2.7 % of a 1024² step, so fusing them into
+//!   the GEMM epilogues is not worth doing.
+//! - [`ZStepDev`] holds the planes, the per-(prompt, resolution) state and
+//!   the prebuilt bind groups. The hidden state never leaves the device
+//!   inside a step. The modulation of all 32 blocks is one buffer, written
+//!   once per step. A step needs one upload (x_tok, mods, scale) and one
+//!   1 MB readback.
 //!
-//! Batch 2 (base model with CFG) is first-class: tokens of both items are
-//! stacked along M, so every GEMM reads each weight tile once for both.
+//! Synthetic whole step (32 blocks, distinct random f16 planes, 11.6 GB):
 //!
-//! Measurements live in the B1 report (`zimage_gemmbench` example); every
-//! kept kernel carries its own measured number in its doc comment.
+//! | case          | zi chain            | Lumina path (`dit_block_seg` as is) |
+//! |---------------|---------------------|-------------------------------------|
+//! | 512², b1      | 0.250 s (50 TF eff) | 1.06 s (0.815 s with resident x)    |
+//! | 512², b2      | 0.479 s (52 TF)     | 2.66 s                              |
+//! | 1024², b1     | 1.034 s (55 TF)     | 4.95 s                              |
+//! | 1024², b2     | 2.063 s (55 TF)     | —                                   |
+//!
+//! At 1024² b1, per class: GEMMs 821 ms (w13 368, qkv 206, w2 180, o 67),
+//! flash 164 ms, row kernels 29 ms, embed/final/copies 16 ms.
+//!
+//! Correctness of the assembled pieces:
+//! - one block against an f64 host block: 1.5e-4 of x (5e-4 of the
+//!   block's update);
+//! - the whole contract path (`gpu::zimage_prepare` + `zimage_step`) on a
+//!   tiny F16/BF16 container (x_pad rows, 2 refiner blocks, [img, cap]
+//!   assembly, 2 layers, final layer) against an f64 host forward:
+//!   4e-4 (`zimage_gemmbench stepcheck`).
+//!
+//! # Integration recipe (for the core package)
+//!
+//! - `prepare` and `step` implement the contract for batch 1 (Turbo).
+//!   `prepare` builds the f16 planes once per model, using
+//!   [`ZBlockDev::from_model`]: F16 as stored, Bf16/F32 converted, Q4TiledP
+//!   dequantized by the parent's `q4tp_dq_f16`. Any other codec declines.
+//!   The contract then builds a [`ZStepDev`] for (n_img, n_cap_p) and
+//!   uploads both RoPE tables. `step` uploads x_tok, mods and the final
+//!   scale, replays the program and reads back `[n_img][64]`.
+//! - The base model with CFG (batch 2) goes through
+//!   `ZStepDev::new(.., n_cap_p = &[cond, uncond], cap = both stacked)`
+//!   plus `upload(x_tok for both items, ..)` and `run(out [2][n_img][64])`.
+//!   The contract has no batch-2 entry yet. Adding one means an
+//!   `Option<…>` field agreed with the WP1 lead (plan §2.1). Unequal
+//!   caption lengths are supported: segments, per-item final dispatch.
+//! - Still to do on the device side:
+//!   - the context refiner (`refine_caption` still declines; use
+//!     `block_calls(.., modulated = false)` on a `ZSeq` of the caption);
+//!   - the resident VAE (`vae_decode_chain`);
+//!   - q8 plane codecs;
+//!   - the text encoder.
+//! - Knobs:
+//!   - `CMF_ZI_WGPU=0`: device path off;
+//!   - `CMF_ZI_TILE=bm,bn,bk,wm,wn`: GEMM tile;
+//!   - `CMF_ZI_FLASH=nw,bc`: flash tile;
+//!   - `CMF_ZI_FLASH_THR`, `CMF_ZI_FLASH_VT`, `CMF_ZI_FLASH_PAD`,
+//!     `CMF_ZI_FLASH_DBG`: flash debug arms;
+//!   - `CMF_ZI_CHECKED=1`: build with naga bounds checks.
+//!
+//! Traps found here (they cost time; keep them):
+//! - A workgroup array whose byte size is not a multiple of 16 misaligns
+//!   every array after it. Cooperative loads ignore the low address bits,
+//!   so each 16-half row is read 4 halves early.
+//! - naga 30 does not emit a runtime `coopStore` stride or pointer index
+//!   before the store and panics with "Expression is not cached". Bind
+//!   both to `let`s first.
+//! - A `var` of cooperative-matrix type declared inside a loop is zeroed
+//!   once, at function entry, not once per iteration.
 
 use crate::gpu::{ZBlockRef, ZGeom, ZPrepareArgs, ZStepArgs};
 use cortiq_core::CmfModel;
@@ -54,22 +139,111 @@ use wgpu::util::DeviceExt;
 
 use super::Ctx;
 
-/// Build/refresh the per-(prompt, resolution) state for `a.key`.
-pub(crate) fn prepare(_a: &ZPrepareArgs) -> bool {
-    false
+/// Module-local device state: the f16 planes of the 32 per-step blocks
+/// (keyed by the model, they survive prompts) and the prepared step
+/// program of the current (prompt, resolution) key.
+struct ZState {
+    model_uid: u64,
+    blocks: Vec<ZBlockDev>,
+    key: Option<u64>,
+    prog: Option<ZStepDev>,
+}
+
+static ZSTATE: Mutex<Option<ZState>> = Mutex::new(None);
+
+/// `CMF_ZI_WGPU=0` turns the whole device path off (the caller runs CPU).
+fn zi_enabled() -> bool {
+    std::env::var("CMF_ZI_WGPU").as_deref() != Ok("0")
+}
+
+/// Build/refresh the per-(prompt, resolution) state for `a.key` (batch 1,
+/// the contract's shape). Planes are built once per model: every codec
+/// `ZBlockDev::from_model` knows is expanded to f16 (11.6 GB for Turbo).
+pub(crate) fn prepare(a: &ZPrepareArgs) -> bool {
+    if !zi_enabled() {
+        return false;
+    }
+    let Some(d) = ZDims::from_geom(&a.geom) else { return false };
+    let (n_img, n_img_p, n_cap_p) = (a.n_img, a.n_img_p, a.n_cap_p);
+    let s_len = n_img_p + n_cap_p;
+    if n_img_p % 32 != 0
+        || n_cap_p % 32 != 0
+        || n_img > n_img_p
+        || n_img == 0
+        || d.pd != 64
+        || a.noise_refiner.len() != 2
+        || a.layers.is_empty()
+        || a.cap.len() < n_cap_p * d.h
+        || a.rope_img.0.len() < n_img_p * 64
+        || a.rope_img.1.len() < n_img_p * 64
+        || a.rope_joint.0.len() < s_len * 64
+        || a.rope_joint.1.len() < s_len * 64
+        || a.x_emb_w.len() < d.h * 64
+        || a.x_emb_b.len() < d.h
+        || a.x_pad.len() < d.h
+        || a.final_w.len() < 64 * d.h
+        || a.final_b.len() < 64
+    {
+        return false;
+    }
+    if zctx().is_none() {
+        return false;
+    }
+    let Ok(mut g) = ZSTATE.lock() else { return false };
+    let uid = a.model.uid();
+    let nblk = a.noise_refiner.len() + a.layers.len();
+    let have = g.as_ref().is_some_and(|st| st.model_uid == uid && st.blocks.len() == nblk);
+    if !have {
+        *g = None; // free the old planes before building new ones
+        let mut blocks = Vec::with_capacity(nblk);
+        for r in a.noise_refiner.iter().chain(a.layers.iter()) {
+            match ZBlockDev::from_model(a.model, &d, r) {
+                Some(b) => blocks.push(b),
+                None => return false,
+            }
+        }
+        *g = Some(ZState { model_uid: uid, blocks, key: None, prog: None });
+    }
+    let st = g.as_mut().unwrap();
+    st.prog = None;
+    st.key = None;
+    let io = ZIo { x_emb_w: a.x_emb_w, x_emb_b: a.x_emb_b, x_pad: a.x_pad, final_w: a.final_w, final_b: a.final_b };
+    let t = ZTiles::default();
+    let (nr, layers) = st.blocks.split_at(2);
+    let Some(prog) = ZStepDev::new(d, &t, nr, layers, &io, n_img, &[n_cap_p], &a.cap[..n_cap_p * d.h]) else {
+        return false;
+    };
+    prog.img.set_rope(&a.rope_img.0[..n_img_p * 64], &a.rope_img.1[..n_img_p * 64]);
+    prog.joint.set_rope(&a.rope_joint.0[..s_len * 64], &a.rope_joint.1[..s_len * 64]);
+    st.prog = Some(prog);
+    st.key = Some(a.key);
+    true
 }
 
 /// One DiT forward for a prepared `a.key`; writes `a.out`.
-pub(crate) fn step(_a: &mut ZStepArgs) -> bool {
-    false
+pub(crate) fn step(a: &mut ZStepArgs) -> bool {
+    let Ok(g) = ZSTATE.lock() else { return false };
+    let Some(st) = g.as_ref() else { return false };
+    let (Some(key), Some(prog)) = (st.key, st.prog.as_ref()) else { return false };
+    let d = prog.d;
+    let nblk = st.blocks.len();
+    if key != a.key
+        || a.x_tok.len() < prog.n_img_p * d.pd
+        || a.mods.len() < nblk * 4 * d.h
+        || a.final_scale.len() < d.h
+        || a.out.len() < prog.n_img * d.pd
+    {
+        return false;
+    }
+    prog.upload(&a.x_tok[..prog.n_img_p * d.pd], &a.mods[..nblk * 4 * d.h], &a.final_scale[..d.h]);
+    prog.run(&mut a.out[..prog.n_img * d.pd]).is_some()
 }
 
 /// Drop all module-local device state (planes, prepared states, VAE chain).
+/// Never brings a device up: it only drops what this module holds.
 pub(crate) fn release() {
-    if let Some(z) = ZP.get() {
-        if let Ok(mut g) = z.pipes.lock() {
-            g.clear();
-        }
+    if let Ok(mut g) = ZSTATE.lock() {
+        *g = None;
     }
 }
 
@@ -1737,6 +1911,137 @@ impl ZBlockDev {
             norm_q: upf(norms[4]),
             norm_k: upf(norms[5]),
         })
+    }
+}
+
+/// f16 plane rows of one weight tensor, written into `dst`: tensor row
+/// panel `p` (rows 16p..16p+16) lands at plane row `panel_row(p)`.
+/// F16 = bytes as stored; Bf16/F32 converted on the host; Q4TiledP
+/// dequantized on the device by the parent's `q4tp_dq_f16` (the plane
+/// layout the parent's coop GEMM eats). Other codecs → `None`.
+fn tensor_to_plane(
+    c: &Ctx,
+    model: &Arc<CmfModel>,
+    idx: usize,
+    rows: usize,
+    cols: usize,
+    dst: &wgpu::Buffer,
+    panel_row: &dyn Fn(usize) -> usize,
+) -> Option<()> {
+    use cortiq_core::TensorDtype as T;
+    let e = model.tensors.get(idx)?;
+    if e.shape.len() != 2 || e.shape[0] != rows || e.shape[1] != cols || rows % 16 != 0 {
+        return None;
+    }
+    let bytes = model.entry_bytes(e);
+    let panel_bytes = (16 * cols * 2) as u64;
+    let contiguous = (0..rows / 16).all(|p| panel_row(p) == panel_row(0) + 16 * p);
+    match e.dtype {
+        T::F16 | T::Bf16 | T::F32 => {
+            let h: std::borrow::Cow<[u8]> = match e.dtype {
+                T::F16 => std::borrow::Cow::Borrowed(&bytes[..rows * cols * 2]),
+                T::Bf16 => std::borrow::Cow::Owned(
+                    bytes[..rows * cols * 2]
+                        .chunks_exact(2)
+                        .flat_map(|b| {
+                            let f = f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16);
+                            cortiq_core::quant::f32_to_f16(f).to_le_bytes()
+                        })
+                        .collect(),
+                ),
+                _ => std::borrow::Cow::Owned(
+                    bytes[..rows * cols * 4]
+                        .chunks_exact(4)
+                        .flat_map(|b| cortiq_core::quant::f32_to_f16(f32::from_le_bytes([b[0], b[1], b[2], b[3]])).to_le_bytes())
+                        .collect(),
+                ),
+            };
+            if contiguous {
+                c.queue.write_buffer(dst, (panel_row(0) * cols * 2) as u64, &h);
+            } else {
+                for p in 0..rows / 16 {
+                    let src = &h[p * panel_bytes as usize..(p + 1) * panel_bytes as usize];
+                    c.queue.write_buffer(dst, (panel_row(p) * cols * 2) as u64, src);
+                }
+            }
+            Some(())
+        }
+        T::Q4TiledP => {
+            let dq = c.q4tp_dq_f16.as_ref()?;
+            let need = cortiq_core::quant::expected_nbytes(T::Q4TiledP, &[rows, cols])?;
+            if bytes.len() < need {
+                return None;
+            }
+            let mut payload = bytes[..need].to_vec();
+            payload.resize(need.next_multiple_of(4), 0);
+            let src = sbuf_init(c, &payload, "zi_q4tp");
+            let tmp = sbuf(c, (rows * cols * 2) as u64, "zi_dq");
+            let u = ubuf(c, &[cols as u32, rows as u32, 0, 0]);
+            let b = bg(c, dq, &[&src, &tmp, &u]);
+            let mut enc = c.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                pass.set_pipeline(dq);
+                pass.set_bind_group(0, &b, &[]);
+                let wgs = ((rows * cols / 2) as u32).div_ceil(256);
+                pass.dispatch_workgroups(wgs.min(65535), wgs.div_ceil(65535), 1);
+            }
+            if contiguous {
+                enc.copy_buffer_to_buffer(&tmp, 0, dst, (panel_row(0) * cols * 2) as u64, (rows * cols * 2) as u64);
+            } else {
+                for p in 0..rows / 16 {
+                    enc.copy_buffer_to_buffer(&tmp, p as u64 * panel_bytes, dst, (panel_row(p) * cols * 2) as u64, panel_bytes);
+                }
+            }
+            c.queue.submit(Some(enc.finish()));
+            Some(())
+        }
+        _ => None,
+    }
+}
+
+impl ZBlockDev {
+    /// Planes of one block straight from the container (`ZBlockRef`
+    /// indices, diffusers names). F16 / Bf16 / F32 / Q4TiledP; any other
+    /// codec → `None` (the caller declines and the CPU path runs). The
+    /// integration package adds q8_row / q8_2f here via the parent's
+    /// `q8_dq_f16` when the WP4 codec policy picks them.
+    pub fn from_model(model: &Arc<CmfModel>, d: &ZDims, r: &ZBlockRef) -> Option<ZBlockDev> {
+        let c = zctx()?;
+        let (h, i) = (d.h, d.inter);
+        if r.norm1.len() < h || r.norm2.len() < h || r.ffn_norm1.len() < h || r.ffn_norm2.len() < h
+            || r.norm_q.len() < 128 || r.norm_k.len() < 128
+        {
+            return None;
+        }
+        let qkv = sbuf(c, (3 * h * h * 2) as u64, "zi_plane_qkv");
+        for (k, idx) in [r.wq, r.wk, r.wv].into_iter().enumerate() {
+            tensor_to_plane(c, model, idx, h, h, &qkv, &|p| k * h + 16 * p)?;
+        }
+        let o = sbuf(c, (h * h * 2) as u64, "zi_plane_o");
+        tensor_to_plane(c, model, r.wo, h, h, &o, &|p| 16 * p)?;
+        let w13 = sbuf(c, (2 * i * h * 2) as u64, "zi_plane_w13");
+        tensor_to_plane(c, model, r.w1, i, h, &w13, &|p| w13_plane_row(16 * p, false))?;
+        tensor_to_plane(c, model, r.w3, i, h, &w13, &|p| w13_plane_row(16 * p, true))?;
+        let w2 = sbuf(c, (h * i * 2) as u64, "zi_plane_w2");
+        tensor_to_plane(c, model, r.w2, h, i, &w2, &|p| 16 * p)?;
+        let upf = |v: &[f32]| sbuf_init(c, bytemuck::cast_slice(v), "zi_norm");
+        let b = ZBlockDev {
+            qkv,
+            o,
+            w13,
+            w2,
+            norm1: upf(&r.norm1[..h]),
+            norm2: upf(&r.norm2[..h]),
+            ffn_norm1: upf(&r.ffn_norm1[..h]),
+            ffn_norm2: upf(&r.ffn_norm2[..h]),
+            norm_q: upf(&r.norm_q[..128]),
+            norm_k: upf(&r.norm_k[..128]),
+        };
+        // Flush the staged writes and bound their memory block by block.
+        c.queue.submit(std::iter::empty());
+        wait(c);
+        Some(b)
     }
 }
 
