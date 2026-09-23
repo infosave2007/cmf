@@ -694,7 +694,17 @@ mod imp {
 
     /// One Z-Image block in f64 (spec §2.4), segments attend within
     /// themselves; `mods` = [scale_msa, gate_msa, scale_mlp, gate_mlp][h].
+    #[allow(clippy::too_many_arguments)]
     fn host_block(x: &mut [Vec<f64>], segs: &[(usize, usize)], rc: &[f32], rs: &[f32], b: &HostBlk, mods: &[f64], h: usize, nh: usize, inter: usize) {
+        host_block_m(x, segs, rc, rs, b, mods, h, nh, inter, true)
+    }
+
+    /// `modulated = false`: the context refiner (scale 0, gate 1, no tanh).
+    #[allow(clippy::too_many_arguments)]
+    fn host_block_m(x: &mut [Vec<f64>], segs: &[(usize, usize)], rc: &[f32], rs: &[f32], b: &HostBlk, mods: &[f64], h: usize, nh: usize, inter: usize, modulated: bool) {
+        let zeros = vec![0f64; 4 * h];
+        let mods = if modulated { mods } else { &zeros[..] };
+        let gate = |g: f64| if modulated { g.tanh() } else { 1.0 };
         let m = x.len();
         let nf: Vec<Vec<f64>> = b.norms.iter().map(|v| v.iter().map(|&x| x as f64).collect()).collect();
         let (s_msa, g_msa, s_mlp, g_mlp) = (&mods[0..h], &mods[h..2 * h], &mods[2 * h..3 * h], &mods[3 * h..4 * h]);
@@ -736,7 +746,7 @@ mod imp {
         for r in 0..m {
             let on = rms(&matvec(&att[r], &b.wo, h), &nf[1], 1e-5);
             for c in 0..h {
-                x[r][c] += g_msa[c].tanh() * on[c];
+                x[r][c] += gate(g_msa[c]) * on[c];
             }
             let xn2: Vec<f64> = rms(&x[r], &nf[2], 1e-5).iter().zip(s_mlp).map(|(a, s)| a * (1.0 + s)).collect();
             let a1 = matvec(&xn2, &b.w1, inter);
@@ -744,7 +754,7 @@ mod imp {
             let hid: Vec<f64> = a1.iter().zip(&a3).map(|(g, u)| g / (1.0 + (-g).exp()) * u).collect();
             let yn = rms(&matvec(&hid, &b.w2, h), &nf[3], 1e-5);
             for c in 0..h {
-                x[r][c] += g_mlp[c].tanh() * yn[c];
+                x[r][c] += gate(g_mlp[c]) * yn[c];
             }
         }
     }
@@ -925,6 +935,26 @@ mod imp {
                 }
             }
             println!("stepcheck step {step}: out rel {:.2e} (device vs f64 host, {} image rows × 64)", (e2 / r2).sqrt(), n_img);
+        }
+        // Context refiner (unmodulated) on the caption rows, blocks 0..2 reused.
+        let mut capd = cap.clone();
+        let (rcc, rcs) = rope_rows(&cap_ids);
+        if cortiq_engine::gpu::zimage_refine_caption(&model, &geom, &refs[..2], (&rcc, &rcs), &mut capd) {
+            let mut xc: Vec<Vec<f64>> = (0..n_cap_p).map(|r| cap[r * h..(r + 1) * h].iter().map(|&v| v as f64).collect()).collect();
+            for bi in 0..2 {
+                host_block_m(&mut xc, &[(0, n_cap_p)], &rcc, &rcs, &host[bi], &[], h, nh, inter, false);
+            }
+            let (mut e2, mut r2) = (0f64, 0f64);
+            for r in 0..n_cap_p {
+                for c in 0..h {
+                    let d = capd[r * h + c] as f64 - xc[r][c];
+                    e2 += d * d;
+                    r2 += xc[r][c] * xc[r][c];
+                }
+            }
+            println!("refine_caption: rel {:.2e} (device vs f64 host, {n_cap_p} rows)", (e2 / r2).sqrt());
+        } else {
+            println!("refine_caption: declined");
         }
         cortiq_engine::gpu::zimage_release();
     }
