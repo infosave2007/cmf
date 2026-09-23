@@ -560,6 +560,9 @@ pub fn generate_images(
     }
     tm.vae = t0.elapsed().as_secs_f64();
     tm.total = t_all.elapsed().as_secs_f64();
+    if crate::zimage::gpu_allowed() {
+        crate::gpu::zimage_flush_pipelines();
+    }
     if prof_on() {
         eprintln!(
             "zimage stages: text-encode {:.2}s · dit-load {:.2}s · prepare {:.2}s · steps {:.2}s (median {:.3}s, {} forwards/step) · vae {:.2}s · total {:.2}s",
