@@ -16901,7 +16901,21 @@ mod tests {
         const TOL: f64 = 1e-4;
         for (dk, nb) in [(128usize, 8usize), (64, 8), (128, 1), (64, 1)] {
             let t = gdn_state_case(dk, nb, 0x9e37_79b9_7f4a_7c15 ^ (dk * 131 + nb) as u64);
-            assert!(state4_pso(c, &t.cfg).is_some(), "dk={dk}: 4-lane kernel not applicable");
+            // A device whose pipeline ceiling is below 4·dv threads (the
+            // paravirtual GPU of the CI's macOS VM is one) declines the
+            // 4-lane tile, and `encode_gdn_state_b` falls back to the
+            // legacy kernel — which is what the engine runs there too.
+            // The checks below then pin that fallback to the reference
+            // instead of failing on the hardware.
+            if state4_pso(c, &t.cfg).is_none() {
+                let pso = if dk == 128 { &c.gdnstb4_128 } else { &c.gdnstb4_64 };
+                eprintln!(
+                    "gdn_state4 dk={dk} nb={nb}: 4-lane kernel declined on this device \
+                     (ceiling {} threads, needs {}); checking the legacy fallback",
+                    pso.max_total_threads_per_threadgroup(),
+                    t.cfg.dv * 4
+                );
+            }
             let (s_ref, of_ref) = gdn_state_reference(&t, nb);
             let (s_new, of_new) = gdn_state_device(c, &t, 0, nb, 3);
             let (s_old, of_old) = gdn_state_device(c, &t, 1, nb, 3);
