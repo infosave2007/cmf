@@ -17,6 +17,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use wgpu::util::DeviceExt;
 
+// Z-Image-Turbo device path (plan WP2) — child module, `gpu_wgpu/zimage.rs`.
+#[doc(hidden)]
+pub mod zimage;
+
 /// Workgroup limit per dimension (WebGPU minimum; lm_head has more
 /// rows — we use grid-stride in the shader).
 const MAX_WG: u32 = 65_535;

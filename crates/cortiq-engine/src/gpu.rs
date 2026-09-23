@@ -3489,3 +3489,221 @@ impl ImageStageGuard {
         let _ = uid;
     }
 }
+
+// ════════════════════════════════════════════════════════════════════
+// Z-Image-Turbo device contract (WP0 scaffold, plan §2.1). APPEND-ONLY.
+//
+// Owner of the contract: the WP1 lead. The backends implement it in their
+// own child modules — `gpu_wgpu/zimage.rs` (WP2) and `gpu_metal/zimage.rs`
+// (WP3) — and never edit the parent files. New fields are added only as
+// `Option<…>` with agreed semantics; existing fields never change meaning.
+//
+// Convention (the same as every `gpu::*` entry): `false` = "not handled",
+// nothing observable was changed, and the caller runs the CPU path
+// (`zimage::ZImageDit::step_cpu` etc.), which is the bit-level reference.
+//
+// Sequence order everywhere is diffusers' [img rows…, cap rows…], with
+// padded lengths n_img_p = ceil32(n_img) and n_cap_p = ceil32(L).
+// ════════════════════════════════════════════════════════════════════
+
+/// One Z-Image transformer block's device inputs (noise refiner, context
+/// refiner or main layer — all share this shape). Weights are tensor
+/// indices into `model.tensors` (diffusers names under `dit.`); the codec
+/// is whatever the container holds (F16/Bf16/Q8Row/Q8_2f/Q4TiledP…), and a
+/// backend that cannot expand a codec declines (returns `false`).
+/// Norm vectors are f32 host slices that live as long as the caller's
+/// `ZImageDit`; a backend may cache them by pointer (they do not change).
+#[derive(Clone, Copy)]
+pub struct ZBlockRef<'a> {
+    /// `attention.to_q/to_k/to_v/to_out.0.weight`, each [hidden, hidden].
+    pub wq: usize,
+    pub wk: usize,
+    pub wv: usize,
+    pub wo: usize,
+    /// `feed_forward.w1` (gate) / `w3` (up) [inter, hidden], `w2` (down)
+    /// [hidden, inter]. FFN = w2(silu(w1·x) ⊙ w3·x).
+    pub w1: usize,
+    pub w3: usize,
+    pub w2: usize,
+    /// `attention_norm1` / `attention_norm2`, [hidden] (plain-w RMSNorm).
+    pub norm1: &'a [f32],
+    pub norm2: &'a [f32],
+    /// `ffn_norm1` / `ffn_norm2`, [hidden].
+    pub ffn_norm1: &'a [f32],
+    pub ffn_norm2: &'a [f32],
+    /// `attention.norm_q` / `norm_k`, [hd] (per-head RMSNorm before RoPE).
+    pub norm_q: &'a [f32],
+    pub norm_k: &'a [f32],
+}
+
+/// Z-Image geometry. Turbo: hidden 3840, nh 30 (MHA, no GQA), hd 128,
+/// inter 10240, eps 1e-5 (all RMSNorms incl. qk-norm), final_eps 1e-6
+/// (the affine-free final LayerNorm), patch_dim 64 (2×2×16).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ZGeom {
+    pub hidden: usize,
+    pub nh: usize,
+    pub hd: usize,
+    pub inter: usize,
+    pub eps: f32,
+    pub final_eps: f32,
+    pub patch_dim: usize,
+}
+
+/// Once per (prompt, resolution). The backend uploads/caches what it needs
+/// keyed by `key`; weight planes are keyed by the MODEL (not by `key`) and
+/// survive across prompts until `zimage_release`.
+pub struct ZPrepareArgs<'a> {
+    pub model: &'a Arc<CmfModel>,
+    pub geom: ZGeom,
+    /// Caller-chosen identity of this (prompt, resolution) state; every
+    /// `ZStepArgs` of the same image carries the same key.
+    pub key: u64,
+    /// Image tokens (H/16 · W/16), padded count ceil32(n_img), caption
+    /// padded count ceil32(L). S = n_img_p + n_cap_p.
+    pub n_img: usize,
+    pub n_img_p: usize,
+    pub n_cap_p: usize,
+    /// The patch grid (H/16, W/16); n_img = grid.0 · grid.1. Row-major
+    /// token order `hp·grid.1 + wp`.
+    pub grid: (usize, usize),
+    /// [n_cap_p, hidden], ALREADY context-refined (host or device).
+    pub cap: &'a [f32],
+    /// Noise-refiner RoPE: [n_img_p · hd/2] cos, sin (complex-interleaved
+    /// pairs, hd/2 angles per token).
+    pub rope_img: (&'a [f32], &'a [f32]),
+    /// Main-layer RoPE: [(n_img_p + n_cap_p) · hd/2], rows ordered [img, cap].
+    pub rope_joint: (&'a [f32], &'a [f32]),
+    /// `all_x_embedder.2-1.weight` [hidden, 64], `.bias` [hidden],
+    /// `x_pad_token` [hidden] (replaces rows ≥ n_img after the embed).
+    pub x_emb_w: &'a [f32],
+    pub x_emb_b: &'a [f32],
+    pub x_pad: &'a [f32],
+    /// `all_final_layer.2-1.linear.weight` [64, hidden], `.bias` [64].
+    pub final_w: &'a [f32],
+    pub final_b: &'a [f32],
+    /// 2 noise-refiner blocks (image rows only) and 30 main layers.
+    pub noise_refiner: &'a [ZBlockRef<'a>],
+    pub layers: &'a [ZBlockRef<'a>],
+    /// OPTIONAL (backends may ignore): the modulation of EVERY step of this
+    /// image, [steps][(2+30)·4·hidden] in the `ZStepArgs::mods` layout, and
+    /// [steps][hidden] final scales, so a backend can upload them once per
+    /// image and index them by `ZStepArgs::step`. `ZStepArgs::mods` is still
+    /// always supplied and is authoritative.
+    pub mods_all: Option<&'a [f32]>,
+    pub final_scale_all: Option<&'a [f32]>,
+}
+
+/// Once per denoising step.
+pub struct ZStepArgs<'a> {
+    /// The `ZPrepareArgs::key` this step belongs to. A key the backend has
+    /// not prepared → `false`.
+    pub key: u64,
+    /// Step index into the schedule (0..steps); selects the row of
+    /// `ZPrepareArgs::mods_all` when a backend uses it.
+    pub step: usize,
+    /// [n_img_p, 64] patchified latent, inner order (dy·2+dx)·16+c. Rows
+    /// ≥ n_img are copies of the last row; the backend replaces them with
+    /// `x_pad` after the embed.
+    pub x_tok: &'a [f32],
+    /// Per block (noise_refiner then layers) the RAW chunks
+    /// [scale_msa, gate_msa, scale_mlp, gate_mlp] of Linear(temb) (no SiLU
+    /// before it), [(2+30)·4·hidden]. The backend applies (1+s) and tanh(g).
+    pub mods: &'a [f32],
+    /// [hidden] = 1 + Linear(SiLU(temb)) — already includes the +1.
+    pub final_scale: &'a [f32],
+    /// [n_img, 64]: the model output v (before the pipeline's negation),
+    /// image rows only, patchified order.
+    pub out: &'a mut [f32],
+}
+
+/// Prepare the per-(prompt, resolution) device state. Backends: wgpu →
+/// `gpu_wgpu::zimage::prepare` (WP2), Metal → `gpu_metal::zimage::prepare`
+/// (WP3).
+#[allow(unused_variables)]
+pub fn zimage_prepare(a: &ZPrepareArgs) -> bool {
+    match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::zimage::prepare(a),
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::zimage::prepare(a),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
+/// One full DiT forward on the device: x_embed → pad rows → noise refiner
+/// ×2 → concat [img, cap] → 30 layers → final LayerNorm·scale → Linear →
+/// image rows into `a.out`.
+#[allow(unused_variables)]
+pub fn zimage_step(a: &mut ZStepArgs) -> bool {
+    match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::zimage::step(a),
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::zimage::step(a),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
+/// Drop every Z-Image device resource (planes, prepared states, VAE chain
+/// buffers): stage change or process end. Calls each compiled backend's
+/// release directly, without `backend()`, so it never brings a device up;
+/// the child modules' `release` must touch module-local state only.
+pub fn zimage_release() {
+    #[cfg(target_os = "macos")]
+    crate::gpu_metal::zimage::release();
+    #[cfg(feature = "gpu")]
+    crate::gpu_wgpu::zimage::release();
+}
+
+/// Optional device context refiner: the same block math with scale = 0 and
+/// gate = 1 (unmodulated): x += norm2(attn(norm1(x))); x += ffn_norm2(ffn(
+/// ffn_norm1(x))). `cap` is [n_cap_p, hidden] in/out (the cap_embedder
+/// output with pad rows already = cap_pad_token); `rope_cap` is
+/// [n_cap_p · hd/2] cos, sin. `false` = untouched, run the CPU refiner.
+#[allow(unused_variables)]
+pub fn zimage_refine_caption(
+    model: &Arc<CmfModel>,
+    geom: &ZGeom,
+    blocks: &[ZBlockRef],
+    rope_cap: (&[f32], &[f32]),
+    cap: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => {
+            crate::gpu_metal::zimage::refine_caption(model, geom, blocks, rope_cap, cap)
+        }
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => {
+            crate::gpu_wgpu::zimage::refine_caption(model, geom, blocks, rope_cap, cap)
+        }
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
+/// Resident Flux-VAE decode (the whole decoder on the device, one latent
+/// upload, one RGB readback). `a` comes from `VaeDecoder::chain_args()`.
+/// `z` is [latent_channels, h, w] ALREADY de-normalised
+/// (z/scaling_factor + shift_factor — the conv_in input); `out` is
+/// [3, 8h, 8w], the raw decoder output (≈[-1, 1], before x/2+0.5).
+#[allow(unused_variables)]
+pub fn vae_decode_chain(
+    a: &crate::vae::VaeChainArgs,
+    z: &[f32],
+    h: usize,
+    w: usize,
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::zimage::vae_decode_chain(a, z, h, w, out),
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::zimage::vae_decode_chain(a, z, h, w, out),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
