@@ -418,6 +418,29 @@ pub(crate) fn release_dit() {
     }
 }
 
+/// Device context + every DiT/VAE kernel compiled (see `gpu::zimage_warmup`).
+pub(crate) fn warmup() -> bool {
+    if !zi_enabled() {
+        return false;
+    }
+    let t0 = std::time::Instant::now();
+    let Some(c) = zctx() else { return false };
+    let t = ZTiles::default();
+    let mut ok = [t.qkv, t.o, t.w13, t.w2].into_iter().all(|g| mm_pipe(c, g).is_some())
+        && pipeline(c, &t.flash.key(), &flash_src(t.flash), "zi_flash").is_some();
+    for (k, src, e) in [
+        ("zi_rowop", ROWOP_SRC, "zi_rowop"),
+        ("zi_qkrope", QKROPE_SRC, "zi_qkrope"),
+        ("zi_embed", EMBED_SRC, "zi_embed"),
+        ("zi_final", FINAL_SRC, "zi_final"),
+        ("zi_dq8", DQ8_SRC, "zi_dq8"),
+    ] {
+        ok &= pipeline(c, k, src, e).is_some();
+    }
+    prof("device + DiT kernels warm", t0);
+    ok
+}
+
 /// Upload the VAE weights and compile every kernel the decode uses.
 pub(crate) fn vae_prewarm(a: &crate::vae::VaeChainArgs) -> bool {
     if !zi_enabled() || std::env::var("CMF_ZI_VAE").as_deref() == Ok("0") {

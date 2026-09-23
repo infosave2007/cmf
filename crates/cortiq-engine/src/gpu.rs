@@ -3699,6 +3699,19 @@ pub fn zimage_flush_pipelines() {
     }
 }
 
+/// OPTIONAL (B2): bring the device up and compile the Z-Image kernels, on
+/// a helper thread at the start of a generation (the context and the
+/// compiles cost ~1 s cold, beside the host-side loading). `false` = no
+/// device path here.
+pub fn zimage_warmup() -> bool {
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::zimage::warmup(),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
 /// OPTIONAL (B2): upload the resident VAE's weights and compile its
 /// kernels ahead of `vae_decode_chain` (the caller runs it on a helper
 /// thread while the DiT steps keep the device busy). `false` = not done.
