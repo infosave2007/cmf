@@ -23,11 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The draft head's vocabulary shortlist (`CMF_DRAFT_VOCAB`, default 65536,
   the cut the native Metal draft already took) now applies on wgpu too — a
   draft step reads 170 MB of head instead of 660 — and it is adaptive: a
-  committed token past the cut (Cyrillic and CJK ids sit above 131072 in
-  Qwen's table) switches the next 32 draft steps to the full head, so
-  Russian or Chinese prose keeps the full-head acceptance while Latin text
-  keeps the cheaper draft. RTX PRO 4000: bench 50.5 → 54.9 tok/s, a code
-  prompt 38.7 → 42.3.
+  committed id from the high table (at or above 131072, where Cyrillic and
+  CJK sit in Qwen's vocabulary) switches the next 16 draft steps to the
+  full head, so Russian or Chinese prose keeps the full-head acceptance
+  while Latin text keeps the cheaper draft. RTX PRO 4000: bench 50.5 →
+  54.9 tok/s, a code prompt 38.7 → 42.3, Russian prose unchanged; on an M4
+  the shortlist halves the draft (66 → 32 ms for seven steps).
 - `bench --ignore-eos` is a loop flag now, not a sampler suppression. The
   suppression counted as a penalty and switched the speculative round and
   the greedy burst off, so `bench --ignore-eos` never measured either
@@ -50,6 +51,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   serializing before one submit; still opt-in (+2% on a bare-metal card,
   the win is on virtualized queues where a submit costs ~0.7 ms).
 
+- The batched graph prefill is the default on discrete cards whenever the
+  prompt takes the graph route (GDN hybrids and MoE stacks): 32 positions
+  per submit instead of one. Qwen3.8-27B q4tp on an RTX PRO 4000 reads a
+  2048-token prompt at 53 tok/s against 28.5 (TTFT 39 s against 72), with
+  the greedy continuation unchanged — the batch graph's states are the
+  speculative verify's. `CMF_BATCH_K=0` restores the per-position walk;
+  `bench` reports the route the pipeline actually takes.
 - Native Metal: the GDN run of the token graph encodes a whole run of
   layers into ONE compute encoder instead of seven per layer (a serial
   encoder orders its dispatches; the boundaries were pipeline drains,

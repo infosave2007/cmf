@@ -68,6 +68,33 @@ stays on the plain path — the speculative *sampling* arm exists
 (`CMF_GRAPH_SPEC_SAMPLE=1`, exact by construction) but at the instruct
 row 60% of drafts are accepted and the round breaks even.
 
+### 0.7.2 on a 24 GB card (RTX PRO 4000 Blackwell, Vulkan)
+
+The 5090 rows above are the 0.5.80 measurement. 0.7.2 was tuned on a
+second card, an RTX PRO 4000 Blackwell (24 GB, ~672 GB/s), where the
+q4tp file decodes at **27.9 tok/s plain** and the default speculative
+round reads:
+
+| text (greedy, 300 tokens) | 0.7.2 default | plain |
+|---|---:|---:|
+| `bench --core --ignore-eos` (repetitive) | **54.8** | 27.9 |
+| a list of primes + explanation | **52.5** | 27.7 |
+| Python code prompt | **43.9** | 27.8 |
+| English essay | **31.3** | 28.0 |
+| Russian essay | **29.7** | 27.7 |
+
+What changed: the draft depth adapts to the accepted fraction (a short
+round pays on prose, a long one on code — `CMF_GRAPH_SPEC_K` pins it);
+the draft head reads a 65536-row shortlist (`CMF_DRAFT_VOCAB`) that
+hands back to the full head for Cyrillic and CJK; the verify runs eight
+rows a workgroup; the narrow projections take a persistent grid and the
+GDN control projections a vectorized kernel (plain 27.0 → 27.9). Prompt
+ingest on this card goes through the batched graph by default: a
+2048-token prompt at 53 tok/s (TTFT 39 s) against 28.5 one position at a
+time. `bench --ignore-eos` now measures speculation (it used to suppress
+EOS through the sampler, which switched the round off — every
+`--ignore-eos` number before 0.7.2 is the plain rate).
+
 ## Server and API
 
 ```bash
@@ -365,6 +392,31 @@ MTP-голова модели предлагает пять токенов, од
 `CMF_GRAPH_SPEC_SAMPLE=1`, но на instruct-ряду принимается 60% черновиков
 и раунд выходит в ноль).
 
+**0.7.2 на карте 24 ГБ (RTX PRO 4000 Blackwell, Vulkan).** Строки про
+5090 выше — замер 0.5.80. 0.7.2 настраивался на второй карте, RTX PRO
+4000 Blackwell (24 ГБ, ~672 ГБ/с): q4tp декодирует **27.9 tok/s plain**,
+спекуляция по умолчанию даёт:
+
+| текст (greedy, 300 токенов) | 0.7.2 по умолчанию | plain |
+|---|---:|---:|
+| `bench --core --ignore-eos` (повторяющийся) | **54.8** | 27.9 |
+| список простых чисел + объяснение | **52.5** | 27.7 |
+| промпт на Python-код | **43.9** | 27.8 |
+| эссе по-английски | **31.3** | 28.0 |
+| эссе по-русски | **29.7** | 27.7 |
+
+Что изменилось: глубина черновика подстраивается под долю принятых
+(короткий раунд окупается на прозе, длинный — на коде; `CMF_GRAPH_SPEC_K`
+фиксирует); голова черновика читает шортлист из 65536 строк
+(`CMF_DRAFT_VOCAB`) и возвращается к полной голове на кириллице и CJK;
+верификация идёт по восемь строк на рабочую группу; узкие проекции —
+на персистентной сетке, управляющие проекции GDN — на векторном ядре
+(plain 27.0 → 27.9). Промпт на этой карте читается батч-графом по
+умолчанию: 2048 токенов на 53 tok/s (TTFT 39 с) против 28.5 по одной
+позиции. `bench --ignore-eos` теперь меряет спекуляцию (раньше он
+подавлял EOS через сэмплер, что выключало раунд — все числа с
+`--ignore-eos` до 0.7.2 были plain).
+
 **Сервер с OpenAI-совместимым API:** `cortiq serve qwen38-27b-q4t.cmf
 --port 8080` — работают `/v1/chat/completions`, `/v1/completions`,
 `/v1/models`; флаг `--ollama` добавляет Ollama-совместимый порт.
@@ -479,6 +531,25 @@ token，一次批量提交在 int8 激活的矩阵向量核上完成验证，监
 逐位一致；默认的 int8 可能把接近平局的 token 解成另一个同样贪心的续写。
 `CMF_GRAPH_SPEC=0` 关闭推测。采样（temperature > 0）
 走普通路径。
+
+**0.7.2 在 24 GB 显卡上（RTX PRO 4000 Blackwell，Vulkan）。** 上表的 5090
+数据是 0.5.80 的测量。0.7.2 在第二张卡 RTX PRO 4000 Blackwell（24 GB，约
+672 GB/s）上调优：q4tp 文件 plain 解码 **27.9 tok/s**，默认推测解码：
+
+| 文本（贪心，300 token） | 0.7.2 默认 | plain |
+|---|---:|---:|
+| `bench --core --ignore-eos`（重复文本） | **54.8** | 27.9 |
+| 素数列表 + 解释 | **52.5** | 27.7 |
+| Python 代码提示 | **43.9** | 27.8 |
+| 英文作文 | **31.3** | 28.0 |
+| 俄文作文 | **29.7** | 27.7 |
+
+变化：草稿深度随接受比例自适应（散文用短回合，代码用长回合；`CMF_GRAPH_SPEC_K`
+可固定）；草稿头读取 65536 行的候选表（`CMF_DRAFT_VOCAB`），遇到西里尔文和 CJK
+时回退到完整词表头；验证每工作组八行；窄投影使用持久网格，GDN 控制投影使用向量化
+内核（plain 27.0 → 27.9）。这张卡上的提示默认走批量图：2048 token 提示 53 tok/s
+（TTFT 39 s），逐位置为 28.5。`bench --ignore-eos` 现在会测量推测解码（此前它通过
+采样器抑制 EOS，从而关闭了回合——0.7.2 之前所有 `--ignore-eos` 数字都是 plain）。
 
 **OpenAI 兼容 API 服务器：** `cortiq serve qwen38-27b-q4t.cmf --port
 8080` — 支持 `/v1/chat/completions`、`/v1/completions`、`/v1/models`；

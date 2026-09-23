@@ -6170,9 +6170,9 @@ async fn cmd_bench(
     let o1_prefill_requested = std::env::var("CMF_O1_PREFILL")
         .ok()
         .and_then(|v| v.parse::<usize>().ok());
-    let batch_k_requested = std::env::var("CMF_BATCH_K")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok());
+    // The pipeline's own route (env or the discrete-card default), so the
+    // reported prefill is the one generation takes.
+    let batch_k_requested = Some(pipeline.generation_batch_k()).filter(|k| *k > 0);
     let prefill_measurement = bench_generation_prefill_path(
         pipeline.o1_active(),
         mask.is_some(),
