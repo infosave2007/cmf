@@ -64,8 +64,9 @@ mod imp {
                 // suffix d = direct (no shared staging), h = f16-accumulate probe
                 let direct = a.ends_with('d');
                 let acc16_probe = a.ends_with('h');
-                let t: Vec<u32> = a.trim_end_matches(['d', 'h']).split(',').filter_map(|x| x.parse().ok()).collect();
-                (t.len() == 5).then(|| MmCfg { direct, acc16_probe, ..MmCfg::new(t[0], t[1], t[2], t[3], t[4], epi) })
+                let stages = if a.ends_with('s') { 2 } else { 1 };
+                let t: Vec<u32> = a.trim_end_matches(['d', 'h', 's']).split(',').filter_map(|x| x.parse().ok()).collect();
+                (t.len() == 5).then(|| MmCfg { direct, acc16_probe, stages, ..MmCfg::new(t[0], t[1], t[2], t[3], t[4], epi) })
             })
             .collect();
         if v.is_empty() {
@@ -121,7 +122,7 @@ mod imp {
     fn cmd_mm(args: &[String]) {
         for &(name, n, k, epi) in &SITES {
             for cfg in parse_cfgs(args, epi) {
-                let mut line = format!("{name:>4} N={n:<5} K={k:<5} {:?}", (cfg.bm, cfg.bn, cfg.bk, cfg.wm, cfg.wn, cfg.direct, cfg.acc16_probe));
+                let mut line = format!("{name:>4} N={n:<5} K={k:<5} {:?}", (cfg.bm, cfg.bn, cfg.bk, cfg.wm, cfg.wn, cfg.direct, cfg.acc16_probe, cfg.stages));
                 for &m in &MS {
                     match bench::mm_time(cfg, m, k, n) {
                         Some(s) => line += &format!("  M{m} {:.2}ms {:.1}TF", s * 1e3, tflops(m, n, k, s)),
