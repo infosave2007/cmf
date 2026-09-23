@@ -4577,6 +4577,13 @@ kernel void q4tp_matvec_jobs(
     device const ulong*  bases   [[buffer(5)]],
     constant uint&       tg_per  [[buffer(6)]],
     constant uint&       xstride [[buffer(7)]],
+    // Windowed arena (a file past maxBufferLength — the 15 GB Hy-MT2-30B
+    // on a 24 GB M4 whose cap is 13.6 GB): windows 1..3 and the window
+    // stride. `wstride == 0` = a single window and `q` is the whole blob.
+    device const uchar*  qw1     [[buffer(8)]],
+    device const uchar*  qw2     [[buffer(9)]],
+    device const uchar*  qw3     [[buffer(10)]],
+    constant ulong&      wstride [[buffer(11)]],
     uint sg   [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint tgpos [[threadgroup_position_in_grid]],
@@ -4586,7 +4593,17 @@ kernel void q4tp_matvec_jobs(
 
     uint j   = tgpos / tg_per;
     uint tgl = tgpos - j * tg_per;
-    device const uchar* qj = q + bases[j];
+    ulong jb = bases[j];
+    device const uchar* qj;
+    if (wstride == 0ul) {
+        qj = q + jb;
+    } else {
+        // The host's `WeightArena::locate`: a tensor lands whole in window
+        // base / stride, because the windows overlap by the largest tensor.
+        uint w = (uint)(jb / wstride);
+        ulong rel = jb - (ulong)w * wstride;
+        qj = ((w == 0u) ? q : (w == 1u) ? qw1 : (w == 2u) ? qw2 : qw3) + rel;
+    }
     device const float* xj = x + (ulong)j * (ulong)xstride;
     device float*       yj = y + (ulong)j * (ulong)rows;
 
@@ -4810,6 +4827,7 @@ kernel void q2tp_matvec(
     }
 }
 
+
 kernel void q2tp_matvec_jobs(
     device const uchar*  q       [[buffer(0)]],
     device const float*  x       [[buffer(1)]],
@@ -4819,6 +4837,13 @@ kernel void q2tp_matvec_jobs(
     device const ulong*  bases   [[buffer(5)]],
     constant uint&       tg_per  [[buffer(6)]],
     constant uint&       xstride [[buffer(7)]],
+    // Windowed arena (a file past maxBufferLength — the 15 GB Hy-MT2-30B
+    // on a 24 GB M4 whose cap is 13.6 GB): windows 1..3 and the window
+    // stride. `wstride == 0` = a single window and `q` is the whole blob.
+    device const uchar*  qw1     [[buffer(8)]],
+    device const uchar*  qw2     [[buffer(9)]],
+    device const uchar*  qw3     [[buffer(10)]],
+    constant ulong&      wstride [[buffer(11)]],
     uint sg   [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint tgpos [[threadgroup_position_in_grid]],
@@ -4828,7 +4853,17 @@ kernel void q2tp_matvec_jobs(
 
     uint j   = tgpos / tg_per;
     uint tgl = tgpos - j * tg_per;
-    device const uchar* qj = q + bases[j];
+    ulong jb = bases[j];
+    device const uchar* qj;
+    if (wstride == 0ul) {
+        qj = q + jb;
+    } else {
+        // The host's `WeightArena::locate`: a tensor lands whole in window
+        // base / stride, because the windows overlap by the largest tensor.
+        uint w = (uint)(jb / wstride);
+        ulong rel = jb - (ulong)w * wstride;
+        qj = ((w == 0u) ? q : (w == 1u) ? qw1 : (w == 2u) ? qw2 : qw3) + rel;
+    }
     device const float* xj = x + (ulong)j * (ulong)xstride;
     device float*       yj = y + (ulong)j * (ulong)rows;
 
@@ -4909,31 +4944,50 @@ kernel void moe_topk_select(
     constant uint&      top_k  [[buffer(10)]],
     constant uint&      norm   [[buffer(11)]],
     constant float&     scale  [[buffer(12)]],
+    // 2 = sigmoid scores, 4 = selection bias present, 16 = the shared
+    // expert has NO gate (weight 1). 0 = the historical softmax contract.
+    constant uint&      flags  [[buffer(13)]],
+    device const float* bias   [[buffer(14)]],
     uint tid [[thread_position_in_grid]])
 {
     if (tid != 0u) return;
-    float p[256];
-    float mx = -3.0e38f;
-    for (uint i = 0u; i < n_exp; ++i) mx = max(mx, logits[i]);
-    float den = 0.0f;
-    for (uint i = 0u; i < n_exp; ++i) den += exp(logits[i] - mx);
-    for (uint i = 0u; i < n_exp; ++i) p[i] = exp(logits[i] - mx) / den;
+    bool msig = (flags & 2u) != 0u;
+    bool hasb = (flags & 4u) != 0u;
+    float p[256];   // mixing score: softmax prob or sigmoid
+    float key[256]; // ranking key: the score, plus the selection bias
+    if (msig) {
+        for (uint i = 0u; i < n_exp; ++i) {
+            p[i] = 1.0f / (1.0f + exp(-logits[i]));
+            key[i] = p[i] + (hasb ? bias[i] : 0.0f);
+        }
+    } else {
+        float mx = -3.0e38f;
+        for (uint i = 0u; i < n_exp; ++i) mx = max(mx, logits[i]);
+        float den = 0.0f;
+        for (uint i = 0u; i < n_exp; ++i) den += exp(logits[i] - mx);
+        for (uint i = 0u; i < n_exp; ++i) { p[i] = exp(logits[i] - mx) / den; key[i] = p[i]; }
+    }
     float wsum = 0.0f;
     uint k = top_k;
     for (uint s = 0u; s < k; ++s) {
-        uint bi = 0u; float bv = -1.0f;
+        // Highest key wins, the LOWER index on a tie (strict >), as the
+        // host's stable descending sort.
+        uint bi = 0u; float bv = -3.0e38f;
         for (uint i = 0u; i < n_exp; ++i) {
-            if (p[i] > bv) { bv = p[i]; bi = i; }
+            if (key[i] > bv) { bv = key[i]; bi = i; }
         }
-        w[s] = bv; wsum += bv;
+        w[s] = p[bi]; wsum += p[bi];
         bgu[s] = gtbl[bi];
         bgu[k + 1u + s] = utbl[bi];
         bdn[s] = dtbl[bi];
-        p[bi] = -2.0f;
+        key[bi] = -3.0e38f;
     }
-    float div = (norm != 0u) ? (wsum / scale) : (1.0f / scale);
+    // Sigmoid routers floor the renorm denominator (HF's + 1e-6); the
+    // routed scale multiplies the routed mix only — never the shared slot.
+    float wden = (msig && norm != 0u) ? (wsum + 1e-6f) : wsum;
+    float div = (norm != 0u) ? (wden / scale) : (1.0f / scale);
     for (uint s = 0u; s < k; ++s) w[s] = w[s] / div;
-    w[k] = 1.0f / (1.0f + exp(-slog[0]));
+    w[k] = ((flags & 16u) != 0u) ? 1.0f : (1.0f / (1.0f + exp(-slog[0])));
     bgu[k] = stbl[0];
     bgu[2u * k + 1u] = stbl[1];
     bdn[k] = stbl[2];
@@ -6712,11 +6766,30 @@ impl WeightArena {
         let i = (abs / self.stride).min(self.bufs.len() - 1);
         (self.window(i), abs - i * self.stride)
     }
-    /// Paths that index the arena from the GPU by absolute bases (the
-    /// MoE jobs kernels) have no per-tensor bind to rebase — they must
-    /// refuse the windowed arena and take the per-tensor fallback.
-    pub(crate) fn is_multi(&self) -> bool {
-        self.bufs.len() > 1
+    /// The MoE jobs kernels index the arena from the GPU by absolute
+    /// bases and resolve the window themselves (`bind_jobs_windows`), up
+    /// to four windows — past that (a 54 GB file on this M4) they refuse
+    /// and the per-tensor fallback runs.
+    pub(crate) fn jobs_ok(&self) -> bool {
+        self.bufs.len() <= 4
+    }
+    /// Windows 1..3 at buffer slots 8-10 (window 0 stands in for the
+    /// ones that do not exist) and the stride at slot 11 — 0 for a single
+    /// window, which the kernels take as "no split". Every window bound
+    /// here goes on the driver's working-set books for the command
+    /// buffer; the overlap is one tensor, so the sum stays the file.
+    fn bind_jobs_windows(&self, enc: &metal::ComputeCommandEncoderRef) {
+        let multi = self.bufs.len() > 1;
+        for (slot, i) in (8u64..=10).zip(1usize..) {
+            let b = if multi && i < self.bufs.len() {
+                self.window(i)
+            } else {
+                self.window(0)
+            };
+            enc.set_buffer(slot, Some(b), 0);
+        }
+        let st: u64 = if multi { self.stride as u64 } else { 0 };
+        enc.set_bytes(11, 8, &st as *const u64 as *const std::ffi::c_void);
     }
     fn bind(&self, enc: &metal::ComputeCommandEncoderRef, index: u64, abs: usize) {
         let (b, rel) = self.locate(abs);
@@ -11446,8 +11519,8 @@ fn moe_block_jobs_q4tp(
     out: &mut [f32],
     get_io: &dyn Fn(usize, usize) -> Buffer,
 ) -> Option<()> {
-    if fbuf.is_multi() {
-        return None; // jobs kernels read absolute bases — no rebase
+    if !fbuf.jobs_ok() {
+        return None; // more windows than the jobs kernels address
     }
     let ne = jobs.len();
     let gcols = jobs[0].gate.2;
@@ -11500,6 +11573,7 @@ fn moe_block_jobs_q4tp(
         let tg_per = (rows as u64).div_ceil(sgs * 4);
         enc.set_compute_pipeline_state(if q2 { &c.q2tpjobs } else { &c.q4tpjobs });
         enc.set_buffer(0, Some(fbuf.window(0)), 0);
+        fbuf.bind_jobs_windows(enc);
         enc.set_buffer(1, Some(x), 0);
         enc.set_buffer(2, Some(y), 0);
         let gpr_u = (cols / GROUP_SIZE) as u32;
@@ -12076,6 +12150,15 @@ pub struct GpuMoe<'a> {
     pub route_scale: f32,
     /// Mixed 2-bit profile: q2tp gate/up over a q4tp down.
     pub gu_q2: bool,
+    /// Sigmoid scores instead of a softmax (LFM2-MoE / DeepSeek-V3 /
+    /// HunYuan hy_v3); the top-k renorm then floors the sum at 1e-6.
+    pub sigmoid: bool,
+    /// Per-expert SELECTION bias [n_exp]: added to the score for the
+    /// top-k choice only — the mixing weights stay unbiased (noaux_tc).
+    pub bias: Option<&'a [f32]>,
+    /// The shared expert carries a sigmoid gate (`sgate`). `false`: it
+    /// enters with weight 1 and `sgate` is a stand-in the kernel ignores.
+    pub shared_gated: bool,
 }
 
 /// Shared dims of the block (identical across GDN layers of a model).
@@ -12734,8 +12817,8 @@ impl TokenGraph {
                         .all(|t| self.proj_abs(**t).is_some())
             }
             MetalFfn::Moe(m) => {
-                if self.fbuf.is_multi() {
-                    return false; // select kernel emits absolute bases
+                if !self.fbuf.jobs_ok() {
+                    return false; // more windows than the jobs kernels address
                 }
                 if m.n_exp == 0
                     || m.n_exp > 256
@@ -13961,6 +14044,14 @@ impl TokenGraph {
                 4,
                 &m.route_scale as *const f32 as *const std::ffi::c_void,
             );
+            let fl_u: u32 = (u32::from(m.sigmoid) << 1)
+                | (u32::from(m.bias.is_some()) << 2)
+                | (u32::from(!m.shared_gated) << 4);
+            enc.set_bytes(13, 4, &fl_u as *const u32 as *const std::ffi::c_void);
+            // A 4-byte stand-in keeps the binding total when there is no bias.
+            static NO_BIAS: [f32; 1] = [0.0];
+            let bias_b = const_buf(c, m.bias.unwrap_or(&NO_BIAS));
+            enc.set_buffer(14, Some(&bias_b), 0);
             enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
         }
         // 4-6. The jobs ladder of `moe_block_jobs_q4tp`, bases from the
@@ -13977,6 +14068,7 @@ impl TokenGraph {
             let tg_per = (rows as u64).div_ceil(sgs * 4);
             enc.set_compute_pipeline_state(if q2 { &c.q2tpjobs } else { &c.q4tpjobs });
             enc.set_buffer(0, Some(self.fbuf.window(0)), 0);
+            self.fbuf.bind_jobs_windows(enc);
             enc.set_buffer(1, Some(x), 0);
             enc.set_buffer(2, Some(y), 0);
             let gpr_u = (cols / GROUP_SIZE) as u32;
@@ -16233,18 +16325,40 @@ mod tests {
         let dtbl: Vec<u64> = (0..n_exp as u64).map(|i| 3000 + i * 7).collect();
         let stbl: Vec<u64> = vec![91, 92, 93];
 
-        for (norm, scale) in [(true, 2.5f32), (false, 1.0f32), (true, 1.0f32)] {
+        // (norm, scale, sigmoid, bias, ungated shared): the softmax rows are
+        // the historical contract; the sigmoid rows are LFM2 / hy_v3.
+        let bias_v: Vec<f32> = (0..n_exp).map(|i| ((i as f32 * 1.7).cos()) * 0.8).collect();
+        for (norm, scale, msig, hasb, ungated) in [
+            (true, 2.5f32, false, false, false),
+            (false, 1.0f32, false, false, false),
+            (true, 1.0f32, false, false, false),
+            (true, 2.826f32, true, true, true),
+            (true, 1.0f32, true, false, false),
+            (false, 1.0f32, true, true, true),
+        ] {
             // Reference: the semantics of `moe_route`.
-            let mx = logits.iter().cloned().fold(f32::MIN, f32::max);
-            let den: f32 = logits.iter().map(|&l| (l - mx).exp()).sum();
-            let p: Vec<f32> = logits.iter().map(|&l| (l - mx).exp() / den).collect();
+            let p: Vec<f32> = if msig {
+                logits.iter().map(|&l| 1.0 / (1.0 + (-l).exp())).collect()
+            } else {
+                let mx = logits.iter().cloned().fold(f32::MIN, f32::max);
+                let den: f32 = logits.iter().map(|&l| (l - mx).exp()).sum();
+                logits.iter().map(|&l| (l - mx).exp() / den).collect()
+            };
+            let key: Vec<f32> = (0..n_exp)
+                .map(|i| p[i] + if msig && hasb { bias_v[i] } else { 0.0 })
+                .collect();
             let mut order: Vec<usize> = (0..n_exp).collect();
-            order.sort_by(|&a, &b| p[b].partial_cmp(&p[a]).unwrap().then(a.cmp(&b)));
+            order.sort_by(|&a, &b| key[b].partial_cmp(&key[a]).unwrap().then(a.cmp(&b)));
             let idx = &order[..top_k];
             let wsum: f32 = idx.iter().map(|&e| p[e]).sum();
-            let div = if norm { wsum / scale } else { 1.0 / scale };
+            let wden = if msig && norm { wsum + 1e-6 } else { wsum };
+            let div = if norm { wden / scale } else { 1.0 / scale };
             let want_w: Vec<f32> = idx.iter().map(|&e| p[e] / div).collect();
-            let want_shared = 1.0 / (1.0 + (-slog[0]).exp());
+            let want_shared = if ungated {
+                1.0
+            } else {
+                1.0 / (1.0 + (-slog[0]).exp())
+            };
 
             let buf = |bytes: &[u8]| {
                 c._device.new_buffer_with_data(
@@ -16293,6 +16407,12 @@ mod tests {
             enc.set_bytes(10, 4, &tk_u as *const u32 as *const std::ffi::c_void);
             enc.set_bytes(11, 4, &no_u as *const u32 as *const std::ffi::c_void);
             enc.set_bytes(12, 4, &scale as *const f32 as *const std::ffi::c_void);
+            let fl_u: u32 = (u32::from(msig) << 1) | (u32::from(hasb) << 2) | (u32::from(ungated) << 4);
+            enc.set_bytes(13, 4, &fl_u as *const u32 as *const std::ffi::c_void);
+            let bias_b = buf(unsafe {
+                std::slice::from_raw_parts(bias_v.as_ptr() as *const u8, n_exp * 4)
+            });
+            enc.set_buffer(14, Some(&bias_b), 0);
             enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
             enc.end_encoding();
             cmd.commit();
@@ -16309,7 +16429,7 @@ mod tests {
                 let rel = (got_w[s] - want_w[s]).abs() / want_w[s].abs().max(1e-12);
                 assert!(
                     rel < 1e-4,
-                    "w[{s}]: device {} vs cpu {} (norm={norm} scale={scale})",
+                    "w[{s}]: device {} vs cpu {} (norm={norm} scale={scale} sigmoid={msig} bias={hasb})",
                     got_w[s],
                     want_w[s]
                 );

@@ -1171,10 +1171,29 @@ impl Pipeline {
         if self.o1_active() {
             return false;
         }
-        self.weights
+        if self
+            .weights
             .layers
             .iter()
             .any(|lw| matches!(&lw.attn, AttnKind::LinearGdn(_)))
+        {
+            return true;
+        }
+        // MoE models too: the chunked CPU prefill runs every expert on the
+        // host (Hy-MT2-30B-A3B on a Xeon: 8 tok/s of ingest against 53 of
+        // graph decode), while the token graph — and the batched graph under
+        // CMF_BATCH_K — keep the experts resident. Full attention in the
+        // graph writes the KV mirror that decode reads, exactly as it does
+        // for the hybrids' attention layers. Only when the whole stack is
+        // resident: with a device prefix the per-position walk finishes
+        // every token on the host, and the chunked prefill (GEMMs on the
+        // card, the expert loop batched on the host) is the faster ingest
+        // (the 8 GB ladder point: 7 tok/s chunked against ~1 walked).
+        self.weights
+            .layers
+            .iter()
+            .any(|lw| matches!(&lw.ffn, FfnKind::Moe(_)))
+            && self.automatic_gpu_prefix().is_none()
     }
 
     #[cfg(target_os = "macos")]
@@ -9420,15 +9439,25 @@ impl Pipeline {
                         down: gw(&d.down_proj)?,
                     },
                     FfnKind::Moe(m) => {
-                        if m.router_sigmoid
-                            || m.expert_bias.is_some()
-                            || m.route_tau.is_some()
-                            || m.mask.is_some()
-                        {
+                        // Adaptive τ and expert masks stay on the CPU path.
+                        // Sigmoid scores, the selection bias, a routed scale
+                        // ≠ 1 and an ungated shared expert (hy_v3) ride the
+                        // same flags word as the token graph — before, this
+                        // refusal sent every Hy-MT2-30B prompt to the chunked
+                        // fallback (8 tok/s of ingest against 53 of decode).
+                        if m.route_tau.is_some() || m.mask.is_some() {
                             return None;
                         }
+                        // The batch MoE kernels need the shared slot (k+1
+                        // rows); gated or not is a flag on the select kernel.
                         let (se, sg) = m.shared.as_ref()?;
-                        let sgate = gw(sg.as_ref()?)?;
+                        let shared_gated = sg.is_some();
+                        let sgate = match sg {
+                            Some(sg) => gw(sg)?,
+                            // Ungated: the router plane stands in so the
+                            // plumbing stays total; the kernel pins weight 1.
+                            None => gw(&m.router)?,
+                        };
                         let router = gw(&m.router)?;
                         // The batch MoE kernels still consume raw per-token
                         // rows and do not carry the descriptor-aware Prism
@@ -9515,11 +9544,11 @@ impl Pipeline {
                             norm_topk: m.norm_topk_prob,
                             q4tp: q4tp?,
                             gu_q2: gu_q2.unwrap_or(false),
-                            sigmoid: false,
-                            bias: None,
+                            sigmoid: m.router_sigmoid,
+                            bias: m.expert_bias.as_deref(),
                             has_shared: true,
-                            shared_gated: true,
-                            route_scale: 1.0,
+                            shared_gated,
+                            route_scale: m.routed_scaling,
                         }
                     }
                     _ => return None,
@@ -12913,16 +12942,16 @@ pub(crate) fn moe_parts(
     }
 }
 
-/// Map a softmax-router MoE onto the Metal token graph's contract:
-/// f32 router, gated shared expert, experts uniformly q4tp (or the
-/// mixed profile: q2tp gate/up over a q4tp down). Sigmoid/bias/τ
-/// routers, masks, per-expert scales and Gemma's router-input norm
-/// refuse here — those semantics stay on the CPU path.
+/// Map a MoE onto the Metal token graph's contract: f32 router, a
+/// shared expert (gated — Qwen — or ungated at weight 1 — DeepSeek-V3 /
+/// HunYuan hy_v3), softmax or sigmoid scores with an optional selection
+/// bias and routed scale, experts uniformly q4tp (or the mixed profile:
+/// q2tp gate/up over a q4tp down). τ routers, masks, per-expert scales
+/// and Gemma's router-input norm refuse here — those semantics stay on
+/// the CPU path.
 #[cfg(target_os = "macos")]
 fn metal_moe_graph_parts(m: &MoeFfn, hidden: usize) -> Option<crate::gpu::GpuMoe<'_>> {
-    if m.router_sigmoid
-        || m.router_input_norm
-        || m.expert_bias.is_some()
+    if m.router_input_norm
         || m.route_tau.is_some()
         || m.mask.is_some()
         || m.per_expert_scale.is_some()
@@ -12932,19 +12961,33 @@ fn metal_moe_graph_parts(m: &MoeFfn, hidden: usize) -> Option<crate::gpu::GpuMoe
     {
         return None;
     }
-    // The select kernel hard-codes the gated shared expert; an
-    // ungated one would need its own weight-1 slot.
+    // The select kernel always fills the shared slot: a model without a
+    // shared expert (LFM2-MoE) stays on the CPU path here.
     let (sh, sg) = match &m.shared {
-        Some((sh, Some(sg))) => (sh, sg),
-        _ => return None,
+        Some((sh, sg)) => (sh, sg.as_ref()),
+        None => return None,
     };
     let (rf, rr, rc) = m.router.f32_parts()?;
     if rr != m.experts.len() || rc != hidden {
         return None;
     }
-    let (sf, sr, sc) = sg.f32_parts()?;
-    if sr * sc != hidden {
-        return None;
+    let shared_gated = sg.is_some();
+    let sf = match sg {
+        Some(sg) => {
+            let (sf, sr, sc) = sg.f32_parts()?;
+            if sr * sc != hidden {
+                return None;
+            }
+            sf
+        }
+        // Ungated: the router's first row stands in for the gate matvec
+        // (its logit is never read — the kernel pins weight 1).
+        None => &rf[..hidden],
+    };
+    if let Some(b) = &m.expert_bias {
+        if b.len() != m.experts.len() {
+            return None;
+        }
     }
     let inter = m.experts[0].gate_proj.rows();
     // The first expert's gate decides the profile; every trio (shared
@@ -12987,6 +13030,9 @@ fn metal_moe_graph_parts(m: &MoeFfn, hidden: usize) -> Option<crate::gpu::GpuMoe
         norm_topk: m.norm_topk_prob,
         route_scale: m.routed_scaling,
         gu_q2,
+        sigmoid: m.router_sigmoid,
+        bias: m.expert_bias.as_deref(),
+        shared_gated,
     })
 }
 

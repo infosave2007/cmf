@@ -46,6 +46,9 @@ family's q/k-norm-after-RoPE attention order and NTK-alpha RoPE base, and an
 exact `import-gguf` path for Tencent's 1.25-bit `STQ1_0` checkpoint into `q1t`.
 Ready files: [infosave/Hy-MT2-cmf](https://huggingface.co/infosave/Hy-MT2-cmf).
 0.7.0 also fixes the 0.6.9 crash on any non-Prism file with a 4-bit embedding.
+0.7.1 puts the 30B's prompt through the resident graph on discrete cards
+(8 → 65 tok/s of ingest) and its experts on the GPU on a 24 GB Mac, whose
+Metal buffer cap splits the 15.8 GB file into windows (17.9 → 32 tok/s).
 
 ## Native Qwen Image Edit
 
