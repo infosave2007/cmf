@@ -1141,6 +1141,14 @@ enum Commands {
         /// f16/bf16/raw (embed_tokens stays q8_row unless raw/bf16/f16)
         #[arg(long)]
         te_quant: Option<String>,
+        /// Z-Image `te.embed_tokens` codec (default q8_row with a quantized
+        /// --te-quant; raw/bf16/f16/f32 keep it 16/32-bit)
+        #[arg(long)]
+        te_embed_quant: Option<String>,
+        /// Z-Image text-encoder projections kept at the source precision
+        /// (comma list: `layers.N.mlp.down_proj` or a suffix like `down_proj`)
+        #[arg(long, value_delimiter = ',')]
+        te_keep: Vec<String>,
         /// Z-Image recipe stored in the file: turbo or base (default: from
         /// the scheduler shift — 3 = turbo, 6 = base)
         #[arg(long)]
@@ -2348,6 +2356,8 @@ async fn main() -> anyhow::Result<()> {
             root,
             quant,
             te_quant,
+            te_embed_quant,
+            te_keep,
             variant,
             dit_layers,
             no_source_sha,
@@ -2375,6 +2385,11 @@ async fn main() -> anyhow::Result<()> {
                         te: zimagepack::parse_codec(
                             te_quant.as_deref().unwrap_or(zimagepack::DEFAULT_TE_CODEC),
                         )?,
+                        te_embed: te_embed_quant
+                            .as_deref()
+                            .map(zimagepack::parse_codec)
+                            .transpose()?,
+                        te_keep,
                         layers: dit_layers,
                         variant,
                         source_sha: !no_source_sha,
@@ -2382,7 +2397,11 @@ async fn main() -> anyhow::Result<()> {
                 )
             } else {
                 anyhow::ensure!(
-                    te_quant.is_none() && variant.is_none() && dit_layers.is_none(),
+                    te_quant.is_none()
+                        && te_embed_quant.is_none()
+                        && te_keep.is_empty()
+                        && variant.is_none()
+                        && dit_layers.is_none(),
                     "--te-quant/--variant/--dit-layers are Z-Image options"
                 );
                 imagepack::cmd_imagine_pack(&root, quant.as_deref().unwrap_or("q4t"), &out)

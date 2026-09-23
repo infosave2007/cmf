@@ -223,11 +223,28 @@ fn keep16(t: &StTensor, raw: &[u8]) -> anyhow::Result<Codec> {
 pub(crate) struct PackOpts {
     pub dit: Codec,
     pub te: Codec,
+    /// `te.embed_tokens` codec override (default: q8_row for a quantized
+    /// `te`, else the `te` codec).
+    pub te_embed: Option<Codec>,
+    /// Text-encoder projections kept at the source dtype: each entry is
+    /// `layers.N.<suffix>` (exact prefix) or a bare suffix like `down_proj`
+    /// (every layer).
+    pub te_keep: Vec<String>,
     /// Dev: keep only the first N main DiT layers (config says so).
     pub layers: Option<usize>,
     /// "turbo" | "base" | None = from the scheduler shift.
     pub variant: Option<String>,
     pub source_sha: bool,
+}
+
+/// `--te-keep` entry match: "layers.3.mlp.down_proj" matches that tensor;
+/// "down_proj" matches every layer's.
+fn te_keep_match(name: &str, key: &str) -> bool {
+    if key.starts_with("layers.") {
+        name.starts_with(&format!("{key}.")) || name == key
+    } else {
+        name.contains(&format!(".{key}."))
+    }
 }
 
 /// Is `root` a diffusers Z-Image pipeline directory?
@@ -405,12 +422,18 @@ pub(crate) fn pack(root: &Path, out: &str, o: &PackOpts) -> anyhow::Result<()> {
             }
             let rule = if n == "embed_tokens.weight" {
                 // A per-token lookup table: never 4-bit (LTX lesson).
-                Rule::Fixed(match o.te {
-                    Codec::Raw | Codec::F32 | Codec::Bf16 | Codec::F16 => o.te,
-                    Codec::Q(_) => Codec::Q(convert::Quant::Q8Row),
+                Rule::Fixed(match (o.te_embed, o.te) {
+                    (Some(c), _) => c,
+                    (None, Codec::Raw | Codec::F32 | Codec::Bf16 | Codec::F16) => o.te,
+                    (None, Codec::Q(_)) => Codec::Q(convert::Quant::Q8Row),
                 })
             } else if t.shape.len() == 2 && n.ends_with("_proj.weight") {
-                Rule::Fixed(o.te)
+                // Outlier-carrying projections stay at the source precision.
+                if o.te_keep.iter().any(|k| te_keep_match(n, k)) {
+                    Rule::Fixed(Codec::Raw)
+                } else {
+                    Rule::Fixed(o.te)
+                }
             } else {
                 Rule::Fixed(Codec::F32)
             };
