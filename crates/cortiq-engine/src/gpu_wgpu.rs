@@ -24995,6 +24995,12 @@ pub fn forward_batch_graph(
     let rms_u = unif(&[hidden as u32, if gemma { 1 } else { 0 }, eps.to_bits(), 0]);
     let silu_u = unif(&[(k * inter) as u32, 0, 0, 0]);
     // Batched GEMM matvec (q8_row / q1) into a [k·rows] output.
+    // The int8-activation batched matvec is the speculative VERIFY's
+    // trade (a near-tie may resolve differently, the round tolerates it);
+    // a prompt chunk of ≤ 16 rows — the tail of every prompt, or a short
+    // prompt whole — keeps f32 activations so the batched prefill differs
+    // from the per-position walk in accumulation order only.
+    let i8_rows = spec.is_some() && verify_i8_on();
     let ematb = |enc: &mut wgpu::CommandEncoder,
                  m: &GMat,
                  xs: &wgpu::Buffer,
@@ -25091,7 +25097,7 @@ pub fn forward_batch_graph(
                     && c.use_mv4
                     && !(verify_coop_on() && c.q4tp_mm_coop_s.is_some() && cols % 32 == 0)
                 {
-                    let _ = encode_q4tp_mv4_b(c, enc, &m.buf, xs, y, rows, cols, k);
+                    let _ = encode_q4tp_mv4_b_with(c, enc, &m.buf, xs, y, rows, cols, k, i8_rows);
                 } else if (batch_coop_on() || (k <= 16 && verify_coop_on()))
                     && c.q4tp_mm_coop_s.is_some()
                     && cols % 32 == 0

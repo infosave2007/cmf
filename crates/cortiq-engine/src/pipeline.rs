@@ -2254,9 +2254,11 @@ impl Pipeline {
         // predicate.  Keep the CLI label tied to the actual route.  Native
         // Metal has a separate prefill-batch arm and retains its historical
         // label here.
+        // A batched prompt (`generation_batch_k` > 0) is the batched graph
+        // for every model on the graph route, not only those with an MTP
+        // head — the label follows the route.
         #[cfg(not(target_os = "macos"))]
         if graph
-            && self.mtp.is_some()
             && self.generation_batch_k() > 0
             && std::env::var("CMF_MTP_CHAIN_PROBE").is_err()
         {
