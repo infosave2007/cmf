@@ -325,6 +325,27 @@ fn rms_norm_inplace(v: &mut [f32], w: &[f32], eps: f64) {
 }
 
 /// y = x·Wᵀ + b for ONE row, f64 accumulation, pool-parallel over outputs.
+/// `linear_row` for several inputs at once (each weight row read once);
+/// bit-identical per input to `linear_row`.
+fn linear_rows_multi(xs: &[Vec<f32>], w: &[f32], b: &[f32], pool: Option<&Pool>) -> Vec<Vec<f32>> {
+    let rows = b.len();
+    let n = xs.len();
+    let mut out = vec![0f32; n * rows];
+    let op = SendRows(out.as_mut_ptr());
+    pool_rows(pool, rows, &|lo, hi| {
+        for o in lo..hi {
+            for (si, x) in xs.iter().enumerate() {
+                let k = x.len();
+                let row = &w[o * k..(o + 1) * k];
+                let s: f64 = row.iter().zip(x).map(|(&a, &c)| a as f64 * c as f64).sum();
+                // SAFETY: disjoint output indices per worker.
+                unsafe { op.set(si * rows + o, (s + b[o] as f64) as f32) };
+            }
+        }
+    });
+    out.chunks(rows.max(1)).map(|c| c.to_vec()).collect()
+}
+
 fn linear_row(x: &[f32], w: &[f32], b: &[f32], pool: Option<&Pool>) -> Vec<f32> {
     let k = x.len();
     let rows = b.len();
@@ -940,13 +961,21 @@ impl ZImageDit {
     /// scale_mlp, gate_mlp] (no +1, no tanh). f64 accumulation.
     pub fn mods_for_steps(&self, t_models: &[f32]) -> Vec<f32> {
         let per = self.cfg.n_mod_blocks() * 4 * self.cfg.dim;
-        let mut out = Vec::with_capacity(t_models.len() * per);
-        for &t in t_models {
-            let te = self.temb(t);
-            for b in self.noise_refiner.iter().chain(&self.layers) {
-                let (w, bias) = b.adaln.as_ref().expect("modulated block");
-                out.extend(linear_row(&te, w, bias, self.pool()));
+        let mut out = vec![0f32; t_models.len() * per];
+        // Every step's temb against each weight row while the row is in
+        // cache (B2: the per-step loop streamed the 0.5 GB of adaLN
+        // weights once per step — ~1 s for the base model's 28 steps).
+        // Same f64 dot per (row, step), so the values are unchanged.
+        let tembs: Vec<Vec<f32>> = t_models.iter().map(|&t| self.temb(t)).collect();
+        let mut off = 0;
+        for b in self.noise_refiner.iter().chain(&self.layers) {
+            let (w, bias) = b.adaln.as_ref().expect("modulated block");
+            let rows = bias.len();
+            let ys = linear_rows_multi(&tembs, w, bias, self.pool());
+            for (si, y) in ys.iter().enumerate() {
+                out[si * per + off..si * per + off + rows].copy_from_slice(y);
             }
+            off += rows;
         }
         out
     }
@@ -1325,6 +1354,21 @@ impl ZImageDit {
                 rope_img: (&n.rope.img.0, &n.rope.img.1),
                 rope_joint: (&n.rope.joint.0, &n.rope.joint.1),
             }),
+        }
+    }
+
+    /// Upload every device plane now (`gpu::zimage_preload`); independent
+    /// of the caption, so it can run beside the text encoder.
+    pub fn preload_device(&self) -> bool {
+        match (self.block_refs(), &self.model) {
+            (Some(r), Some(m)) => crate::gpu::zimage_preload(
+                m,
+                &self.geom(),
+                &r.noise_refiner,
+                &r.layers,
+                &r.context_refiner,
+            ),
+            _ => false,
         }
     }
 

@@ -3669,6 +3669,26 @@ pub fn zimage_step(a: &mut ZStepArgs) -> bool {
     }
 }
 
+/// OPTIONAL (B2): build the backend's weight planes for the per-step blocks
+/// and the context refiner ahead of `zimage_prepare`, so the caller can
+/// overlap the upload with the (CPU) text encoder. `false` = not done;
+/// `zimage_prepare` builds whatever is missing either way.
+#[allow(unused_variables)]
+pub fn zimage_preload(
+    model: &Arc<CmfModel>,
+    geom: &ZGeom,
+    noise_refiner: &[ZBlockRef],
+    layers: &[ZBlockRef],
+    context_refiner: &[ZBlockRef],
+) -> bool {
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::zimage::preload(model, geom, noise_refiner, layers, context_refiner),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
 /// Drop every Z-Image device resource (planes, prepared states, VAE chain
 /// buffers): stage change or process end. Calls each compiled backend's
 /// release directly, without `backend()`, so it never brings a device up;
