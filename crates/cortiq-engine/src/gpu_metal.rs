@@ -2785,47 +2785,12 @@ kernel void chunk_attend(
         uint d = t * 32u + lane;
         if (d < hd) oh[d] = acc[t] * invl;
     }
-    // Attention importance, lane-sliced like the main loop (see gqa_attend:
-    // the per-lane serial dot reads the mirror uncoalesced and dominated
-    // the whole chunk). Four positions per step for reduction ILP.
-    uint p = 0;
-    for (; p + 4u <= n; p += 4u) {
-        device const float* r0 = kh0 + (ulong)p * hd;
-        device const float* r1 = r0 + hd;
-        device const float* r2 = r1 + hd;
-        device const float* r3 = r2 + hd;
-        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
-        for (uint t = 0; t < nt; ++t) {
-            uint d = t * 32u + lane;
-            if (d < hd) {
-                float qd = qv[t];
-                a0 += qd * r0[d];
-                a1 += qd * r1[d];
-                a2 += qd * r2[d];
-                a3 += qd * r3[d];
-            }
-        }
-        float s0 = simd_sum(a0), s1 = simd_sum(a1);
-        float s2 = simd_sum(a2), s3 = simd_sum(a3);
-        if (lane == 0) {
-            atomic_fetch_add_explicit(&imp[p], exp(s0 - m) * invl, memory_order_relaxed);
-            atomic_fetch_add_explicit(&imp[p + 1u], exp(s1 - m) * invl, memory_order_relaxed);
-            atomic_fetch_add_explicit(&imp[p + 2u], exp(s2 - m) * invl, memory_order_relaxed);
-            atomic_fetch_add_explicit(&imp[p + 3u], exp(s3 - m) * invl, memory_order_relaxed);
-        }
-    }
-    for (; p < n; ++p) {
-        device const float* kr = kh0 + (ulong)p * hd;
-        float a = 0.0f;
-        for (uint t = 0; t < nt; ++t) {
-            uint d = t * 32u + lane;
-            if (d < hd) a += qv[t] * kr[d];
-        }
-        float s = simd_sum(a);
-        if (lane == 0) {
-            atomic_fetch_add_explicit(&imp[p], exp(s - m) * invl, memory_order_relaxed);
-        }
-    }
+    // No attention-importance pass here: this kernel serves the
+    // speculative VERIFY rows only (the prefill rows graph has its own
+    // chunk kernel), and the verify's `imp` is a throwaway scratch that
+    // nothing reads — the seventh walk over the mirror was pure cost
+    // (measured ~5 ms of an 8 ms attend per round on the M4, 27B).
+    (void)imp;
 }
 
 // a *= sigmoid(g) — the Qwen3.5 attention output gate.
@@ -14182,12 +14147,18 @@ impl TokenGraph {
         let cmd = self.ensure_cmd();
         let fbuf = self.fbuf.clone();
         let (h_b, n_b, d_b) = (self.h_b.clone(), self.n_b.clone(), self.d_b.clone());
+        // ONE compute encoder for the whole run: a serial encoder orders
+        // its dispatches and makes their writes visible to the next, so the
+        // seven encoders a layer used to open (norm, mixer, conv, gates,
+        // recurrence, out-proj, FFN) were only pipeline drains — ~330
+        // boundaries a token on the 27B.
+        let enc = cmd.new_compute_command_encoder();
         let enc_one = |pso: &ComputePipelineState,
                        bufs: &[(&Buffer, u64)],
                        words: &[u32],
                        floats: &[f32],
                        grid: (u64, u64)| {
-            enc_simple(&cmd, pso, bufs, words, floats, grid);
+            disp(enc, pso, bufs, words, floats, grid);
         };
         let vec_buf = |data: &[f32]| -> Buffer { const_buf(c, data) };
 
@@ -14203,7 +14174,6 @@ impl TokenGraph {
             );
             // 2. mixer: qkv, z, a, b (independent — one encoder)
             {
-                let enc = cmd.new_compute_command_encoder();
                 encode_proj(
                     c,
                     enc,
@@ -14242,7 +14212,6 @@ impl TokenGraph {
                         MTLSize::new(sgs * 32, 1, 1),
                     );
                 }
-                enc.end_encoding();
             }
             // 3. conv + silu (reads ring BEFORE the shift)
             enc_one(
@@ -14254,7 +14223,6 @@ impl TokenGraph {
             );
             // 4. ring shift + gates + qk norms (one encoder, independent)
             {
-                let enc = cmd.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(&c.ring);
                 enc.set_buffer(0, Some(sb), 0);
                 enc.set_buffer(1, Some(&qkv_b), 0);
@@ -14287,11 +14255,9 @@ impl TokenGraph {
                     MTLSize::new((cfg.nk as u64).div_ceil(sgs), 1, 1),
                     MTLSize::new(sgs * 32, 1, 1),
                 );
-                enc.end_encoding();
             }
             // 5. recurrence + gated norm → of
             {
-                let enc = cmd.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(&c.stateup);
                 enc.set_buffer(0, Some(sb), s_off);
                 enc.set_buffer(1, Some(&cq_b), 0);
@@ -14311,11 +14277,9 @@ impl TokenGraph {
                     MTLSize::new(cfg.nv as u64, 1, 1),
                     MTLSize::new(cfg.dv as u64, 1, 1),
                 );
-                enc.end_encoding();
             }
             // 6. out_proj of → d;  7. h += d
             {
-                let enc = cmd.new_compute_command_encoder();
                 encode_proj(
                     c,
                     enc,
@@ -14327,12 +14291,10 @@ impl TokenGraph {
                     l.out.1,
                     l.out.2 / GROUP_SIZE,
                 );
-                enc.end_encoding();
             }
             // 8–12. post-norm + FFN + residual (shared with attn suffix)
             // Fused: h += d, n = rmsnorm(h, post_norm) — one dispatch.
             {
-                let enc = cmd.new_compute_command_encoder();
                 match &l.ffn {
                     MetalFfn::Dense { gate, up, down } => {
                         self.encode_post_ffn(enc, l.post_norm, *gate, *up, *down, Some(&d_b));
@@ -14341,10 +14303,10 @@ impl TokenGraph {
                         self.encode_post_moe_ffn(enc, l.post_norm, m, Some(&d_b));
                     }
                 }
-                enc.end_encoding();
             }
         }
 
+        enc.end_encoding();
         for ((sb, st), w) in st_bs.iter().zip(states).zip(wrapped) {
             self.dirty.push((sb.clone(), if w { 0 } else { st.len() }));
         }
