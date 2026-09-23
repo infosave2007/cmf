@@ -2505,7 +2505,24 @@ impl ZBlockDev {
         let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 16);
         let mut out = Vec::with_capacity(refs.len());
         let mut last: Option<wgpu::SubmissionIndex> = None;
-        let (mut t_view, mut t_copy, mut t_wait) = (0f64, 0f64, 0f64);
+        let (mut t_view, mut t_copy, mut t_wait, mut t_alloc) = (0f64, 0f64, 0f64, 0f64);
+        // Two persistent host staging buffers (mapped at creation for their
+        // first block) and the submission that last read each.
+        let stg: Vec<wgpu::Buffer> = if max_src > 0 {
+            (0..2)
+                .map(|_| {
+                    c.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("zi_dq8_stage"),
+                        size: (max_src as u64).next_multiple_of(4),
+                        usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
+                        mapped_at_creation: true,
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut stg_sub: [Option<wgpu::SubmissionIndex>; 2] = [None, None];
         for (bi, (r, plan)) in refs.iter().zip(plans).enumerate() {
             let Some((jobs, total)) = plan else {
                 if let Some(ix) = last.take() {
@@ -2519,10 +2536,21 @@ impl ZBlockDev {
             {
                 return None;
             }
-            let src = &srcs[bi % 2];
+            let k = bi % 2;
+            let src = &srcs[k];
+            let st = &stg[k];
             {
+                // The staging buffer is reused: wait for the block that
+                // last read it, then map it again (a fresh 177 MB staging
+                // allocation per block — `write_buffer_with` — cost 28 ms
+                // each, 0.9 s of the 1.9 s build).
                 let tv = std::time::Instant::now();
-                let mut view = c.queue.write_buffer_with(src, 0, wgpu::BufferSize::new(total as u64)?)?;
+                if let Some(ix) = stg_sub[k].take() {
+                    let _ = c.device.poll(wgpu::PollType::Wait { submission_index: Some(ix), timeout: None });
+                    st.slice(..).map_async(wgpu::MapMode::Write, |_| {});
+                    let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+                }
+                let mut view = st.slice(..total as u64).get_mapped_range_mut().ok()?;
                 t_view += tv.elapsed().as_secs_f64();
                 let tv = std::time::Instant::now();
                 // Cut the view into ≤ 8 MB pieces, one list pulled by the
@@ -2564,13 +2592,17 @@ impl ZBlockDev {
                 });
                 t_copy += tv.elapsed().as_secs_f64();
             }
+            st.unmap();
+            let ta = std::time::Instant::now();
             let planes = [
                 sbuf(c, (3 * h * h * 2) as u64, "zi_plane_qkv"),
                 sbuf(c, (h * h * 2) as u64, "zi_plane_o"),
                 sbuf(c, (2 * i * h * 2) as u64, "zi_plane_w13"),
                 sbuf(c, (h * i * 2) as u64, "zi_plane_w2"),
             ];
+            t_alloc += ta.elapsed().as_secs_f64();
             let mut enc = c.device.create_command_encoder(&Default::default());
+            enc.copy_buffer_to_buffer(st, 0, src, 0, total as u64);
             let mut keep = Vec::new();
             {
                 let mut pass = enc.begin_compute_pass(&Default::default());
@@ -2588,6 +2620,7 @@ impl ZBlockDev {
                 }
             }
             let ix = c.queue.submit(Some(enc.finish()));
+            stg_sub[k] = Some(ix.clone());
             drop(keep);
             // Bound the staging memory: block bi−1 must be done before
             // bi+1 reuses its source buffer.
@@ -2613,7 +2646,7 @@ impl ZBlockDev {
         }
         wait(c);
         if std::env::var("CMF_ZIMAGE_PROF").is_ok_and(|v| v != "0") {
-            eprintln!("zimage wgpu: planes: staging views {t_view:.3}s · parallel copy {t_copy:.3}s ({nthreads} threads) · waits {t_wait:.3}s");
+            eprintln!("zimage wgpu: planes: staging maps {t_view:.3}s · parallel copy {t_copy:.3}s ({nthreads} threads) · plane allocs {t_alloc:.3}s · waits {t_wait:.3}s");
         }
         Some(out)
     }
@@ -2763,9 +2796,11 @@ impl ZCalls {
 ///
 /// Measured maxima over all steps, both prompts, 512² and 1024²
 /// (`CMF_ZI_AMAX=1`, q8 containers): Turbo attn 6.3e2, qkv 5.8e3,
-/// hidden 3.1e5 → (0, 0, 6). Base (CFG pair) attn > 6.55e4 (layer 28 was
-/// inf unguarded), qkv 3.2e5, hidden 4.9e6 → (4, 5, 10). One forward's v
-/// against the CPU: base 3.0e-4 / 1.8e-4 (r512 i0 / i2) with (4, 5, 10);
+/// hidden 3.1e5 → (0, 0, 6). Base (CFG pair, 28 steps): attn 3.0e5, qkv
+/// 1.25e6, attention output 3.4e5, hidden 7.1e6, all at layer 28 (it was
+/// inf unguarded) → (6, 7, 11), which keeps every stored f16 ≤ 1.1e4.
+/// One forward's v against the CPU: base 3.0e-4 / 1.8e-4 (r512 i0 / i2)
+/// with (4, 5, 10);
 /// Turbo 8.8e-4 / 5.7e-4 / 1.7e-3 (r512 i0, i5, r1024 i0) with (0, 0, 6)
 /// and 1.1e-3 / 6.1e-4 / 1.6e-3 with the base guards — the same within
 /// noise; each model keeps the smallest guards that hold.
@@ -2779,7 +2814,7 @@ pub struct ZGuards {
 
 impl ZGuards {
     pub const TURBO: ZGuards = ZGuards { attn: 0, qkv: 0, hid: 6 };
-    pub const BASE: ZGuards = ZGuards { attn: 4, qkv: 5, hid: 10 };
+    pub const BASE: ZGuards = ZGuards { attn: 6, qkv: 7, hid: 11 };
 
     /// The guards of a container's variant (`zimage.config_json`), env
     /// overrides applied.
