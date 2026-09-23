@@ -236,6 +236,46 @@ mod imp {
             .collect()
     }
 
+    /// Tiny flash cases (nh = 1): zero Q (uniform softmax → mean of V),
+    /// then random Q/K, printing the first values against the reference.
+    fn cmd_flashdbg(args: &[String]) {
+        let nh = 1usize;
+        let ld = 384usize;
+        let len: usize = args.first().and_then(|s| s.parse().ok()).unwrap_or(64);
+        for case in ["zeroq", "rand", "onehotv"] {
+            let mut rng = Rng(31);
+            let mut qkv = vec![0u16; len * ld];
+            for r in 0..len {
+                for c in 0..ld {
+                    let v = match (case, c / 128) {
+                        ("zeroq", 0) => 0.0,
+                        ("onehotv", 2) => if c - 256 == r % 128 { 1.0 } else { 0.0 },
+                        _ => rng.gauss(),
+                    };
+                    qkv[r * ld + c] = f16(v);
+                }
+            }
+            for f in flash_cfgs(&args[1.min(args.len())..]) {
+                let Some(out) = bench::flash_run(f, nh, &qkv, &[(0, len)]) else { continue };
+                let mut worst = (0f64, 0usize, 0usize);
+                let mut nan = 0;
+                for qi in 0..len {
+                    let rf = attn_ref(&qkv, nh, (0, len), 0, qi);
+                    for d in 0..128 {
+                        let g = out[qi * 128 + d] as f64;
+                        if !g.is_finite() { nan += 1; continue; }
+                        let e = (g - rf[d]).abs();
+                        if e > worst.0 { worst = (e, qi, d); }
+                    }
+                }
+                let rf = attn_ref(&qkv, nh, (0, len), 0, worst.1);
+                println!("{case} {f:?}: nonfinite {nan}, worst |err| {:.3e} at q{} d{} (got {:.4} ref {:.4}); q0 d0..4 got {:?} ref {:?}",
+                    worst.0, worst.1, worst.2, out[worst.1 * 128 + worst.2], rf[worst.2],
+                    &out[0..4], attn_ref(&qkv, nh, (0, len), 0, 0)[0..4].iter().map(|v| *v as f32).collect::<Vec<_>>());
+            }
+        }
+    }
+
     fn cmd_flash(args: &[String]) {
         let nh = 30usize;
         // Correctness: two segments (batch 2, unequal caption lengths), with a
@@ -244,13 +284,15 @@ mod imp {
         let m = 2080;
         let ld = 3 * nh * 128;
         let mut rng = Rng(777);
+        // ZB_KGROW: per-row growth of |k| (default 1/300); 0 = stationary keys.
+        let kgrow: f32 = std::env::var("ZB_KGROW").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0 / 300.0);
         let mut qkv = vec![0u16; m * ld];
         for row in 0..m {
             for col in 0..ld {
                 let base = rng.gauss();
                 // k grows with the row index inside the segment → the running
                 // max climbs block after block (exercises the rescale path).
-                let v = if (nh * 128..2 * nh * 128).contains(&col) { base * (1.0 + (row % 1056) as f32 / 300.0) } else { base };
+                let v = if (nh * 128..2 * nh * 128).contains(&col) { base * (1.0 + (row % 1056) as f32 * kgrow) } else { base };
                 qkv[row * ld + col] = f16(v * 1.5);
             }
         }
@@ -637,6 +679,7 @@ mod imp {
             Some("mm") => cmd_mm(rest),
             Some("prec") => cmd_prec(rest),
             Some("flash") => cmd_flash(rest),
+            Some("flashdbg") => cmd_flashdbg(rest),
             Some("blockcheck") => cmd_blockcheck(rest),
             Some("step") => cmd_step(rest),
             Some("lumina") => cmd_lumina(rest),
