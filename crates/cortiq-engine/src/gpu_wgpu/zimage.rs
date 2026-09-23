@@ -141,13 +141,15 @@ use super::Ctx;
 
 /// Module-local device state: the f16 planes of the 32 per-step blocks
 /// (keyed by the model, they survive prompts) and the prepared step
-/// program of the current (prompt, resolution) key.
+/// programs by key — CFG prepares cond and uncond under two keys and then
+/// alternates their steps, so the last `MAX_PROGS` stay live.
 struct ZState {
     model_uid: u64,
     blocks: Vec<ZBlockDev>,
-    key: Option<u64>,
-    prog: Option<ZStepDev>,
+    progs: Vec<(u64, ZStepDev)>,
 }
+
+const MAX_PROGS: usize = 2;
 
 static ZSTATE: Mutex<Option<ZState>> = Mutex::new(None);
 
@@ -202,11 +204,13 @@ pub(crate) fn prepare(a: &ZPrepareArgs) -> bool {
                 None => return false,
             }
         }
-        *g = Some(ZState { model_uid: uid, blocks, key: None, prog: None });
+        *g = Some(ZState { model_uid: uid, blocks, progs: Vec::new() });
     }
     let st = g.as_mut().unwrap();
-    st.prog = None;
-    st.key = None;
+    st.progs.retain(|(k, _)| *k != a.key);
+    while st.progs.len() >= MAX_PROGS {
+        st.progs.remove(0);
+    }
     let io = ZIo { x_emb_w: a.x_emb_w, x_emb_b: a.x_emb_b, x_pad: a.x_pad, final_w: a.final_w, final_b: a.final_b };
     let t = ZTiles::default();
     let (nr, layers) = st.blocks.split_at(2);
@@ -215,8 +219,7 @@ pub(crate) fn prepare(a: &ZPrepareArgs) -> bool {
     };
     prog.img.set_rope(&a.rope_img.0[..n_img_p * 64], &a.rope_img.1[..n_img_p * 64]);
     prog.joint.set_rope(&a.rope_joint.0[..s_len * 64], &a.rope_joint.1[..s_len * 64]);
-    st.prog = Some(prog);
-    st.key = Some(a.key);
+    st.progs.push((a.key, prog));
     true
 }
 
@@ -224,11 +227,10 @@ pub(crate) fn prepare(a: &ZPrepareArgs) -> bool {
 pub(crate) fn step(a: &mut ZStepArgs) -> bool {
     let Ok(g) = ZSTATE.lock() else { return false };
     let Some(st) = g.as_ref() else { return false };
-    let (Some(key), Some(prog)) = (st.key, st.prog.as_ref()) else { return false };
+    let Some((_, prog)) = st.progs.iter().find(|(k, _)| *k == a.key) else { return false };
     let d = prog.d;
     let nblk = st.blocks.len();
-    if key != a.key
-        || a.x_tok.len() < prog.n_img_p * d.pd
+    if a.x_tok.len() < prog.n_img_p * d.pd
         || a.mods.len() < nblk * 4 * d.h
         || a.final_scale.len() < d.h
         || a.out.len() < prog.n_img * d.pd
