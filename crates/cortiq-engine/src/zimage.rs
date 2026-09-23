@@ -1224,6 +1224,20 @@ impl ZImageDit {
         key: u64,
         mods_all: Option<(&[f32], &[f32])>,
     ) -> Result<ZPrepared, String> {
+        self.prepare_with(cap_feats, shape, key, mods_all, gpu_allowed())
+    }
+
+    /// `prepare` with the device use explicit: `device = false` builds a
+    /// pure host state (CPU context refiner, no `gpu::zimage_prepare`) —
+    /// the reference a device test diffs `step` against.
+    pub fn prepare_with(
+        &self,
+        cap_feats: &[f32],
+        shape: ZShape,
+        key: u64,
+        mods_all: Option<(&[f32], &[f32])>,
+        device: bool,
+    ) -> Result<ZPrepared, String> {
         if cap_feats.len() != shape.l * self.cfg.cap_feat_dim || shape.l == 0 {
             return Err(format!(
                 "caption features: {} floats for {} tokens of {}",
@@ -1234,7 +1248,7 @@ impl ZImageDit {
         }
         let rope = ids_and_rope(shape.grid, shape.l, self.cfg.rope_theta, self.cfg.axes_dims);
         let mut cap = self.embed_caption(cap_feats, shape.l);
-        let refs = if gpu_allowed() { self.block_refs() } else { None };
+        let refs = if device { self.block_refs() } else { None };
         let geom = self.geom();
         let dev_refined = match (&refs, &self.model) {
             (Some(r), Some(m)) => crate::gpu::zimage_refine_caption(
@@ -1308,6 +1322,17 @@ impl ZImageDit {
             }
         }
         self.step_cpu(p, x_tok, mods, final_scale)
+    }
+
+    /// The step input for a latent [16, h_lat, w_lat]: patchify, then pad
+    /// to n_img_p rows by repeating the last row.
+    pub fn tokens(&self, latent: &[f32], shape: &ZShape) -> Vec<f32> {
+        pad_rows_repeat_last(
+            &patchify(latent, self.cfg.in_channels, shape.h_lat, shape.w_lat),
+            shape.n_img,
+            shape.n_img_p,
+            self.geom().patch_dim,
+        )
     }
 
     /// x_tok [n_img_p, 64] → [n_img_p, dim]: Linear + b, rows ≥ n_img :=
