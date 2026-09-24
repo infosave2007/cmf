@@ -28,6 +28,13 @@
 //! [`MimoVit::from_model`]. Dense (F32/F16/BF16) matrices become exact f32
 //! GEMM operands; quantized ones (q4tp, q8_2f) stay mapped on the engine's
 //! kernels, CPU or GPU.
+//!
+//! The tower is unusually sensitive to weight quantization (G4.1, measured
+//! against the exact tower on 5 fixture images): q4tp gives a mean row cosine
+//! of 0.935, GPTQ-rounded q4tp 0.976, q8_2f 0.995 (CPU, int8 activations) to
+//! 0.998 (Vulkan). Every matrix group fails at q4tp on its own except the
+//! merger. The residual reaches ~4e5 in the last block, which is also why
+//! GEMM inputs are range-guarded (`Lin::mm`).
 
 use crate::dit::Proj;
 use crate::media::RgbFrame;
