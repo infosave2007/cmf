@@ -219,7 +219,7 @@ Default = with the CPU share; "GPU only" = `CMF_ZI_CPU_FRAC=0`.
 | the same, the CPU pipeline and diffusers bf16 vs fp32 | CPU 28.54 / 26.80; bf16 32.89 / 16.03 | |
 | the same 6 seeds, PSNR vs the CPU pipeline, median / min | 52.9 / 46.5 dB | 57.4 / 45.2 dB |
 | Turbo whole run vs the CPU pipeline (s42 oracle noise): 512² p0 / 400×592 / 1024² p0 | 32.3 / 45.3 / 54.6 dB | 48.6 / 53.2 / 53.9 dB |
-| Turbo s42 images vs fp32 (512² p0, 1024² p0; the CPU path 26.12 / 33.31) | 28.01 / — dB | 26.25 / 33.29 dB |
+| Turbo s42 images vs fp32 (512² p0, 1024² p0; the CPU path 26.12 / 33.31) | 28.01 / 33.24 dB | 26.25 / 33.29 dB |
 | base, 3 steps CFG + negative, 512²: vs the CPU pipeline; vs fp32 (CPU 35.4) | 45.3 dB (`lat_3` 1.5e-2); 35.6 dB | 53.8 dB (4.6e-3); 35.6 dB |
 
 Per step on identical inputs the share is closer to the CPU path (a fifth
