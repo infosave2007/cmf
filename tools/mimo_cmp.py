@@ -12,7 +12,8 @@ Inputs (raw little-endian f32, one vector per file):
                                     instead give --engine-logits in CMF_LOGIT_DUMP
                                     format: final hidden then logits, one position)
   moe_trace.txt                     CMF_MOE_TRACE lines 'li:e1,...,ek', one per
-                                    (token, MoE layer), position-major (CMF_PREFILL=seq)
+                                    (token, MoE layer); the n-th line of a layer is
+                                    position n (either prefill order works)
   picks.jsonl                       oracle margins; a mismatched pick whose oracle
                                     k-th vs (k+1)-th margin is below --tie-margin is
                                     reported as a near-tie, not an error
@@ -167,20 +168,20 @@ def compare_logits(eng_lg, ref_lg, positions, a, vocab=None):
 
 
 def read_trace(path, pos0=0):
-    """CMF_MOE_TRACE -> {(pos, li): [experts]}. Position advances whenever the
-    layer index does not increase (position-major order, CMF_PREFILL=seq)."""
-    out = {}
-    pos, last = pos0 - 1, None
+    """CMF_MOE_TRACE -> {(pos, li): [experts]}. The n-th line of layer li is
+    position pos0 + n, which holds for position-major (CMF_PREFILL=seq) and
+    layer-major (batched prefill) order alike, as long as every token logs
+    each MoE layer once (a second forward over the same tokens continues the
+    count -- trace one run per file)."""
+    out, seen = {}, defaultdict(int)
     for line in open(path):
         line = line.strip()
         if not line or ":" not in line:
             continue
         li, ex = line.split(":", 1)
         li = int(li)
-        if last is None or li <= last:
-            pos += 1
-        last = li
-        out[(pos, li)] = [int(x) for x in ex.split(",") if x != ""]
+        out[(pos0 + seen[li], li)] = [int(x) for x in ex.split(",") if x != ""]
+        seen[li] += 1
     return out
 
 
