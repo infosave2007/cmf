@@ -15153,8 +15153,37 @@ fn q8_2f_matvec_b(@builtin(workgroup_id) wid: vec3<u32>,
 }
 "#;
 
+// Same lane/reduction order, but no unused batch accumulators. In the
+// dynamic tail k=1 used to reserve/reduce eight rows in every Q/K/V/O
+// dispatch. Keeping the row count compile-time also removes its inner
+// uniform branch; weights still stream once for the short panel.
+fn q82_short_source(rows: usize) -> String {
+    assert!((1..=4).contains(&rows));
+    let at = ATTEND_X_SRC.find("// y[b·rows + r]").unwrap();
+    let prefix = ATTEND_X_SRC[..at].replace(
+        "qb_part: array<f32, 2048>",
+        &format!("qb_part: array<f32, {}>", 256 * rows),
+    );
+    let body = ATTEND_X_SRC[at..]
+        .replace("8u", &format!("{rows}u"))
+        .replace("array<f32, 8>", &format!("array<f32, {rows}>"));
+    format!("{prefix}{body}")
+}
+
 #[cfg(test)]
 mod attend_x_shader_tests {
+    #[test]
+    fn short_q82_shaders_validate() {
+        for rows in 1..=4 {
+            let source = super::q82_short_source(rows);
+            let module = wgpu::naga::front::wgsl::parse_str(&source).unwrap();
+            wgpu::naga::valid::Validator::new(
+                wgpu::naga::valid::ValidationFlags::all(),
+                wgpu::naga::valid::Capabilities::all(),
+            ).validate(&module).unwrap();
+        }
+    }
+
     #[test]
     fn attend_x_shader_validates() {
         let module =
@@ -15189,6 +15218,7 @@ struct GraphX {
     part: wgpu::ComputePipeline,
     merge: wgpu::ComputePipeline,
     q82_b: wgpu::ComputePipeline,
+    q82_short: Vec<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
     // Auto layouts (pipeline-exclusive; each lists only the bindings its
     // entry point reads).
     kv_l: wgpu::BindGroupLayout,
@@ -15970,6 +16000,9 @@ struct Ctx {
     /// Pooled graph scratch: eliminates per-token buffer allocations in the
     /// whole-token graph path (the dominant decode cost on Vulkan/DX12).
     graph_scratch: Mutex<GraphScratch>,
+    /// Bounded scratch for singleton dynamic-tail attention graphs. Held
+    /// until readback completes, so independent pipelines cannot alias it.
+    attn_batch_scratch: Mutex<Vec<(wgpu::BufferUsages, wgpu::Buffer)>>,
 }
 
 struct Dsv4GlobalMoeBufs {
@@ -17701,7 +17734,22 @@ fn init(dev: usize) -> Result<Ctx, String> {
                 px("gqa_attend_merge_x"),
                 px("q8_2f_matvec_b"),
             );
+            let mut q82_short = Vec::new();
+            for rows in 1..=4 {
+                let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("q82-short"),
+                    source: wgpu::ShaderSource::Wgsl(q82_short_source(rows).into()),
+                });
+                let pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("q82-short"), layout: None, module: &module,
+                    entry_point: Some("q8_2f_matvec_b"),
+                    compilation_options: Default::default(), cache: pcache.as_ref(),
+                });
+                let layout = pipe.get_bind_group_layout(0);
+                q82_short.push((pipe, layout));
+            }
             let gx = GraphX {
+                q82_short,
                 kv_l: kv_append.get_bind_group_layout(0),
                 attend_l: attend.get_bind_group_layout(0),
                 part_l: part.get_bind_group_layout(0),
@@ -18093,6 +18141,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         moe_expw: Mutex::new(HashMap::new()),
         dsv4_global_moe: Mutex::new(HashMap::new()),
         graph_scratch: Mutex::new(GraphScratch::default()),
+        attn_batch_scratch: Mutex::new(Vec::new()),
     })
 }
 
@@ -21550,6 +21599,7 @@ fn graph_layer_payload_bytes(
         }
     }
     match &layer.ffn {
+        crate::gpu::GraphFfn::AttentionOnly => {}
         crate::gpu::GraphFfn::Dense { gate, up, down } => {
             add(gate)?;
             add(up)?;
@@ -22047,6 +22097,9 @@ pub fn forward_token_graph(
             }
         };
         let ffn = match &l.ffn {
+            crate::gpu::GraphFfn::AttentionOnly => {
+                return token_graph_outcome(o1_started || state_started, false);
+            }
             crate::gpu::GraphFfn::Dense { gate, up, down } => {
                 // The tensor knows its own width; the config only knows
                 // the widest. Ask the weight.
@@ -25739,9 +25792,10 @@ pub fn forward_token_graph(
 /// sequence position of batch row i (contiguous causal run starting at
 /// `positions[0]`); `h` is [k·hidden] in/out.
 #[allow(clippy::too_many_arguments)]
-pub fn forward_batch_graph(
+pub fn forward_batch_graph_at(
     model: &Arc<CmfModel>,
     kv_id: u64,
+    layer_base: usize,
     layers: &[crate::gpu::GraphLayer],
     invf: &[f32],
     h: &mut [f32],
@@ -25790,6 +25844,12 @@ pub fn forward_batch_graph(
     if k == 0 || positions.len() != k {
         bgraph_refused("k/positions mismatch");
         return batch_outcome(o1_started || state_started, false);
+    }
+    if layers.iter().any(|l| matches!(l.ffn, crate::gpu::GraphFfn::AttentionOnly))
+        && (layers.len() != 1 || spec.is_some() || !matches!(layers[0].attn, crate::gpu::GraphAttn::Full { .. }))
+    {
+        bgraph_refused("attention-only graph must be a singleton Full layer without a head");
+        return batch_outcome(false, false);
     }
     let pos0 = positions[0];
     let Some(pos_end) = pos0.checked_add(k) else {
@@ -25929,6 +25989,7 @@ pub fn forward_batch_graph(
     /// «одна позиция за submit»: префилл 33 tok/s против 54 на декоде,
     /// то есть промпт обрабатывался медленнее, чем генерация.
     enum BFfn {
+        AttentionOnly,
         Dense {
             gate: GMat,
             up: GMat,
@@ -26181,6 +26242,7 @@ pub fn forward_batch_graph(
             }
         };
         let bffn = match &l.ffn {
+            crate::gpu::GraphFfn::AttentionOnly => BFfn::AttentionOnly,
             crate::gpu::GraphFfn::Dense {
                 gate: lg,
                 up: lu,
@@ -26295,7 +26357,7 @@ pub fn forward_batch_graph(
         let gcm = c.gdn_cursor.lock().unwrap();
         let om = c.o1m.lock().unwrap();
         for (li, l) in layers.iter().enumerate() {
-            let key = (kv_id, li);
+            let key = (kv_id, layer_base + li);
             let o1_here = o1.get(li).is_some_and(|v| v.is_some());
             if o1_here
                 && om
@@ -26424,7 +26486,7 @@ pub fn forward_batch_graph(
         o1_started = true;
         for (li, views) in o1.iter().enumerate() {
             if let Some(views) = views {
-                if o1_ensure(c, kv_id, li, views, o1_epoch).is_none() {
+                if o1_ensure(c, kv_id, layer_base + li, views, o1_epoch).is_none() {
                     graph_refused("o1 state not portable");
                     return batch_outcome(o1_started || state_started, false);
                 }
@@ -26478,17 +26540,34 @@ pub fn forward_batch_graph(
             entries: &e,
         })
     };
-    // Buffers usable both as compute storage and copy src/dst (K-loop slicing).
-    let rwc = |n: usize| {
-        c.device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: (n.max(1) * 4) as u64,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_SRC
-                | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        })
+    // A short dynamic-tail graph used to allocate ~40 scratch buffers on
+    // every layer and token. Reuse only this restricted graph's scratch:
+    // all live lanes are overwritten before reads, no GDN/O1/FFN scratch
+    // can accidentally inherit state, and the lock spans submit/readback.
+    let pooled = k <= 4 && layers.len() == 1
+        && matches!(layers[0].ffn, crate::gpu::GraphFfn::AttentionOnly)
+        && crate::gpu::mimo_attention_scratch_enabled()
+        && std::env::var("CMF_MIMO_ATTN_POOL").as_deref() != Ok("0");
+    let scratch = std::cell::RefCell::new(pooled.then(|| c.attn_batch_scratch.lock().unwrap()));
+    let scratch_index = std::cell::Cell::new(0usize);
+    let scratch_buffer = |size: u64, usage: wgpu::BufferUsages, label: &'static str| {
+        let make = || c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label), size: size.max(4), usage, mapped_at_creation: false,
+        });
+        let mut guard = scratch.borrow_mut();
+        let Some(cache) = guard.as_mut() else { return make() };
+        let i = scratch_index.get();
+        scratch_index.set(i + 1);
+        if i == cache.len() { cache.push((usage, make())); }
+        if cache[i].0 != usage || cache[i].1.size() < size {
+            cache[i] = (usage, make());
+        }
+        cache[i].1.clone()
     };
+    // Buffers usable both as compute storage and copy src/dst (K-loop slicing).
+    let rwc = |n: usize| scratch_buffer((n.max(1) * 4) as u64,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        "attention-batch-scratch");
     let h_buf = rwc(k * hidden);
     c.queue
         .write_buffer(&h_buf, 0, bytemuck::cast_slice(&h[..k * hidden]));
@@ -26673,7 +26752,7 @@ pub fn forward_batch_graph(
                     let e = kv_mirror_ensure_x(
                         c,
                         &mut kvm,
-                        (kv_id, li),
+                        (kv_id, layer_base + li),
                         g.nkv,
                         hd,
                         g.dv,
@@ -26701,7 +26780,7 @@ pub fn forward_batch_graph(
                         gdnbufs.push(None);
                         continue;
                     }
-                    let e = kv_mirror_ensure(c, &mut kvm, (kv_id, li), nkv, hd, cap);
+                    let e = kv_mirror_ensure(c, &mut kvm, (kv_id, layer_base + li), nkv, hd, cap);
                     if e.synced > pos0 {
                         bgraph_refused("KV mirror is ahead of batch position");
                         return batch_outcome(true, false);
@@ -26744,7 +26823,7 @@ pub fn forward_batch_graph(
                     kk,
                     ..
                 } => {
-                    let key = (kv_id, li);
+                    let key = (kv_id, layer_base + li);
                     let e = gsm.entry(key).or_insert_with(|| {
                         let ring_sz = (gcdim * (_gkk.max(1).saturating_sub(1)) * 4) as u64;
                         let s_sz = (gnv * gdk * gdv * 4) as u64;
@@ -26844,14 +26923,20 @@ pub fn forward_batch_graph(
                 let gx = c.graph_x.as_ref().expect("gemmable checked graph_x");
                 let p_buf =
                     uniform_u32x4(c, [(cols / 4) as u32, rows as u32, cols as u32, k as u32]);
-                let bind = bind_pairs(c, &gx.q82_l, &[(0, &m.buf), (1, xs), (2, y), (3, &p_buf)]);
+                let short = (k <= 4 && crate::gpu::mimo_q8_short_enabled()
+                    && std::env::var("CMF_Q82_SHORT").as_deref() != Ok("0"))
+                    .then(|| &gx.q82_short[k - 1]);
+                let (pipe, layout, width) = match short {
+                    Some((p, l)) => (p, l, k as u32),
+                    None => (&gx.q82_b, &gx.q82_l, 8),
+                };
+                let bind = bind_pairs(c, layout, &[(0, &m.buf), (1, xs), (2, y), (3, &p_buf)]);
                 let mut pass = begin_pass(enc);
-                pass.set_pipeline(&gx.q82_b);
+                pass.set_pipeline(pipe);
                 pass.set_bind_group(0, &bind, &[]);
                 pass.dispatch_workgroups(
                     (rows as u32).div_ceil(4).min(MAX_WG),
-                    (k as u32).div_ceil(8),
-                    1,
+                    (k as u32).div_ceil(width), 1,
                 );
             }
             // The 2-bit plane: the tile GEMM handles any k (the MoE prefill's
@@ -27310,7 +27395,7 @@ pub fn forward_batch_graph(
                         sc,
                     ) = {
                         let map = c.o1m.lock().unwrap();
-                        let Some(d) = map.get(&(kv_id, li)) else {
+                        let Some(d) = map.get(&(kv_id, layer_base + li)) else {
                             graph_refused("o1 batch mirror missing after admission");
                             return batch_outcome(o1_started || state_started, false);
                         };
@@ -27761,7 +27846,7 @@ pub fn forward_batch_graph(
                     let ring_sz = (cdim * kk.saturating_sub(1) * 4) as u64;
                     let s_sz = (nv * dk * dv * 4) as u64;
                     let mut m = c.gdn_snap.lock().unwrap();
-                    let e = m.entry((kv_id, li)).or_insert_with(|| {
+                    let e = m.entry((kv_id, layer_base + li)).or_insert_with(|| {
                         let b = c.device.create_buffer(&wgpu::BufferDescriptor {
                             label: Some("gdn-snap"),
                             size: (k as u64 * (ring_sz + s_sz)).max(4),
@@ -28076,6 +28161,9 @@ pub fn forward_batch_graph(
             k as u32,
         );
         match &lw.ffn {
+            // add_rmsnorm_b above has already added the attention residual
+            // into h_buf. A singleton graph must not add ob a second time.
+            BFfn::AttentionOnly => continue,
             BFfn::Dense {
                 gate,
                 up,
@@ -28337,12 +28425,8 @@ pub fn forward_batch_graph(
         }
     }
     let size = (k * hidden * 4) as u64;
-    let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("bg-stage"),
-        size,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
+    let stage = scratch_buffer(size,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, "bg-stage");
     let t_enc_done = std::time::Instant::now();
     let ok = if let Some(sp) = spec.as_mut() {
         // Speculative tail: final-norm each row, one batched lm_head GEMM,
@@ -28483,14 +28567,14 @@ pub fn forward_batch_graph(
     if ok {
         let mut kvm = c.attn_kv.lock().unwrap();
         for li in 0..layers.len() {
-            if let Some(m) = kvm.get_mut(&(kv_id, li)) {
+            if let Some(m) = kvm.get_mut(&(kv_id, layer_base + li)) {
                 m.synced = pos0 + k;
             }
         }
         let next = pos0 + k;
         let mut gcm = c.gdn_cursor.lock().unwrap();
         for li in 0..layers.len() {
-            if let Some(cur) = gcm.get_mut(&(kv_id, li)) {
+            if let Some(cur) = gcm.get_mut(&(kv_id, layer_base + li)) {
                 cur.next_pos = next;
             }
         }
@@ -28498,7 +28582,7 @@ pub fn forward_batch_graph(
         let mut om = c.o1m.lock().unwrap();
         for (li, views) in o1.iter().enumerate() {
             if views.is_some() {
-                if let Some(d) = om.get_mut(&(kv_id, li)) {
+                if let Some(d) = om.get_mut(&(kv_id, layer_base + li)) {
                     d.next_pos = Some(next);
                 }
             }
@@ -29336,6 +29420,94 @@ fn dispatch_q1(
 /// GEMM of the prefill batch: `pre` are prescaled inputs row-major [b, cols],
 /// out — row-major [b, rows]. Weights are resident in VRAM. false = CPU path.
 #[allow(clippy::too_many_arguments)]
+/// Decode-exact 1–4-row q8_2f projection, sharing each weight word across
+/// rows. Only scratch changes on failure; callers may safely use matvecs.
+pub fn q82_short_rows(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let Some(gx) = c.graph_x.as_ref() else {
+        return false;
+    };
+    if !(1..=4).contains(&b)
+        || cols % 4 != 0
+        || rows == 0
+        || xs.len() != b * cols
+        || out.len() != b * rows
+    {
+        return false;
+    }
+    let Some(e) = model.tensors.get(idx) else {
+        return false;
+    };
+    if e.dtype != cortiq_core::TensorDtype::Q8_2f || e.shape != [rows, cols] {
+        return false;
+    }
+    let Some(abs) = model.entry_abs_offset(e) else {
+        return false;
+    };
+    let Some(bytes) = model.primary_bytes().get(abs..abs + e.nbytes as usize) else {
+        return false;
+    };
+    let Some(w) = weight_buffer_l(
+        c,
+        (model.uid() as usize, idx),
+        bytes,
+        layer_of_name(&e.name),
+    ) else {
+        return false;
+    };
+    let mut scratch = c.scratch.lock().unwrap();
+    let x = Scratch::ensure(
+        &c.device,
+        &mut scratch.xs,
+        (xs.len() * 4) as u64,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        "q82-short-x",
+    );
+    let y = Scratch::ensure(
+        &c.device,
+        &mut scratch.y,
+        (out.len() * 4) as u64,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        "q82-short-y",
+    );
+    let stage = Scratch::ensure(
+        &c.device,
+        &mut scratch.stage,
+        (out.len() * 4) as u64,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "q82-short-stage",
+    );
+    c.queue.write_buffer(&x, 0, bytemuck::cast_slice(xs));
+    let params = uniform_u32x4(c, [(cols / 4) as u32, rows as u32, cols as u32, b as u32]);
+    let (pipe, layout) = if crate::gpu::mimo_q8_short_enabled() {
+        let (p, l) = &gx.q82_short[b - 1];
+        (p, l)
+    } else {
+        (&gx.q82_b, &gx.q82_l)
+    };
+    let bind = bind_pairs(c, layout, &[(0, &w), (1, &x), (2, &y), (3, &params)]);
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("q82-short-rows"),
+        });
+    {
+        let mut pass = begin_pass(&mut enc);
+        pass.set_pipeline(pipe);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups((rows as u32).div_ceil(4).min(MAX_WG), 1, 1);
+    }
+    readback(c, enc, &y, &stage, (out.len() * 4) as u64, out)
+}
+
 /// The two-field int8 GEMM with the column field handed to the device.
 ///
 /// `q8_matmat` takes an activation the caller has already multiplied by that

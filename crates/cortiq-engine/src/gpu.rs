@@ -1227,6 +1227,24 @@ pub fn q8_matvec_range(
     }
 }
 
+/// Decode-exact short q8_2f panel for the banked MiMo head.
+pub(crate) fn q82_short_rows(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    #[cfg(feature = "gpu")]
+    if enabled_here() && backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::q82_short_rows(model, idx, xs, b, rows, cols, out);
+    }
+    let _ = (model, idx, xs, b, rows, cols, out);
+    false
+}
+
 /// GEMM of a prefill batch: `pre` — prescaled inputs row-major [b, cols],
 /// out — row-major [b, rows].
 #[allow(clippy::too_many_arguments, unused_variables)]
@@ -1464,6 +1482,9 @@ pub struct GraphLayer<'a> {
 /// routing decision depends on the resident hidden state, so a CPU
 /// round-trip per layer would forfeit the one-submit design).
 pub enum GraphFfn<'a> {
+    /// A singleton attention-only batch graph. Returns the post-attention
+    /// residual, allowing a dynamic expert bank to own the FFN separately.
+    AttentionOnly,
     Dense {
         gate: GraphW<'a>,
         up: GraphW<'a>,
@@ -1676,11 +1697,90 @@ pub fn forward_batch_graph(
     // None = all layers or a decline, as before.
     layers_run: Option<&mut usize>,
 ) -> BatchGraphOutcome {
+    forward_batch_graph_at(model, kv_id, 0, layers, invf, h, nh, nkv, hd, rd, hidden, inter, positions, cap, gemma, eps, attn_scale, k, o1, o1_epoch, spec, layers_run)
+}
+
+thread_local! {
+    static MIMO_ATTN_SCRATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+pub(crate) fn mimo_attention_scratch_enabled() -> bool {
+    MIMO_ATTN_SCRATCH.with(std::cell::Cell::get)
+}
+
+/// Scoped diagnostic A/B switch; unlike process environment mutations it
+/// cannot race a model's background workers. Restores on panic as well.
+#[doc(hidden)]
+pub fn mimo_attention_scratch_scope<R>(enabled: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            MIMO_ATTN_SCRATCH.with(|v| v.set(self.0));
+        }
+    }
+    let _restore = Restore(MIMO_ATTN_SCRATCH.with(|v| v.replace(enabled)));
+    f()
+}
+
+thread_local! {
+    static MIMO_Q8_SHORT: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+pub(crate) fn mimo_q8_short_enabled() -> bool {
+    MIMO_Q8_SHORT.with(std::cell::Cell::get)
+}
+
+/// Diagnostic A/B switch for row-exact short q8 graph kernels.
+#[doc(hidden)]
+pub fn mimo_q8_short_scope<R>(enabled: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            MIMO_Q8_SHORT.with(|v| v.set(self.0));
+        }
+    }
+    let _restore = Restore(MIMO_Q8_SHORT.with(|v| v.replace(enabled)));
+    f()
+}
+
+/// Batched graph over a span whose first absolute layer is `layer_base`.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_batch_graph_at(
+    model: &Arc<CmfModel>,
+    kv_id: u64,
+    layer_base: usize,
+    layers: &[GraphLayer],
+    invf: &[f32],
+    h: &mut [f32],
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    rd: usize,
+    hidden: usize,
+    inter: usize,
+    positions: &[usize],
+    cap: usize,
+    gemma: bool,
+    eps: f32,
+    attn_scale: f32,
+    k: usize,
+    // Per-layer sealed O(1) device views. An empty slice means the ordinary
+    // exact-KV path; otherwise it must have one entry per graph layer.
+    o1: &[Option<Vec<crate::nystrom::O1DeviceView<'_>>>],
+    o1_epoch: u64,
+    spec: Option<SpecTail<'_>>,
+    // Device-prefix mode (plain prefill only): Some = when the whole stack
+    // does not fit the weight budget, run the leading layers that do — the
+    // same prefix rule as the token graph — leave the boundary hidden in
+    // `h` and report the count here; the caller runs the rest on the host.
+    // None = all layers or a decline, as before.
+    layers_run: Option<&mut usize>,
+) -> BatchGraphOutcome {
     match backend() {
         #[cfg(feature = "gpu")]
-        Backend::Wgpu => crate::gpu_wgpu::forward_batch_graph(
-            model, kv_id, layers, invf, h, nh, nkv, hd, rd, hidden, inter, positions, cap, gemma,
-            eps, attn_scale, k, o1, o1_epoch, spec, layers_run,
+        Backend::Wgpu => crate::gpu_wgpu::forward_batch_graph_at(
+            model, kv_id, layer_base, layers, invf, h, nh, nkv, hd, rd, hidden, inter, positions,
+            cap, gemma, eps, attn_scale, k, o1, o1_epoch, spec, layers_run,
         ),
         #[allow(unreachable_patterns)]
         _ => {

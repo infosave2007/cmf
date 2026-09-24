@@ -147,3 +147,69 @@ Earlier v1/v2 logs are diagnostic, not the final release measurements.
 - The VRAM ladder/three-run medians, multimodal merge and release/HF/card
   work remain pending. The auto-placement cost model has not been qualified
   as fastest across all budgets. No release or public upload was made.
+
+## Continued optimization and the two distributions
+
+The preceding table is a checkpoint, **not task completion**. The required
+performance gate remains 40+ tok/s; aquarium generation must wait until the
+performance work and practical measured optimizations are exhausted.
+
+Both q4tp distributions remain required:
+
+- **Text-only:** the q4tp-profile backbone plus its automatically discovered
+  `.mtp.cmf` draft companion; no multimodal towers required at startup.
+- **Full:** the identical backbone/MTP plus the matching `.mm.cmf` companion
+  providing image, video and audio inputs. This follows the agreed companion
+  packaging and does not duplicate the 164 GB backbone. It must pass separate
+  multimodal quality gates; the text benchmark does not qualify those towers.
+
+The q4tp profile is unchanged: q4tp experts, q8_2f text skeleton, and the
+existing precision exceptions for routers/sinks. A "full" label must not be
+published until the companion conversion, runtime integration and media
+checks have actually passed.
+
+### Attention-tail and short-q8 follow-up
+
+The dynamic tail now uses a singleton GPU attention graph, keyed by its
+absolute layer index. Decode and verification share that path. The host KV
+is pulled only when a layer actually falls back to CPU. Short attention
+scratch is pooled under a lock held through readback; wide/non-attention
+batch graphs retain their old allocation behavior.
+
+The new GPU regression exposed one remaining activation-policy hole: a
+single-row bank frame with **all** picks cold had omitted the float scope.
+That branch now follows the same precision contract as mixed/hot frames.
+
+The eight-row q8_2f graph kernel now has 1–4-row specializations, preserving
+lane and reduction order while eliminating unused accumulators/reductions.
+A GPU test compares every short width bit for bit with the original kernel.
+MTP's verified head rows also use one exact device projection instead of
+multiple independent head streams. Refusal falls back to the existing head
+without mutating KV.
+
+First actual 128-token core run: **40.9757 tok/s**, 95/95 drafts accepted.
+This is **one run**, not yet a three-run median or an all-prompt speed claim.
+The preceding attention-only revision measured 36.6801 on the same core
+command; forced-dynamic placement measured 32.5527 and was not adopted.
+Short-q8 EN/64 in-process A/B: warm plain 32.73 → 36.42 tok/s, all token IDs
+equal. The first MTP arm includes one-time draft warmup, so its 23.36 versus
+30.60 tok/s comparison must **not** be attributed wholly to the kernel change.
+K=1/K=2/K=3 warm EN rates were 34.28/33.97/30.60; no universal MTP speedup is
+claimed. Further repeat/default/natural-128 gates are still in progress.
+
+Evidence: `/root/mimo/out/codex-mimo-gpu-full/attn-graph/` and `short-q8/`.
+
+Repeat gate (same short-q8 revision): core 40.9757 / 37.9655 / 38.4552,
+**median 38.4552 tok/s**. A run with the GPU probe override removed gave
+39.9565. Thus 40+ is **not yet sustained**; the single best run is not the
+acceptance result. EN/RU/code at 128 tokens, cold/warm plain plus K=1/2/3,
+all preserved every token ID and exercised SWA rollback. Warm plain was
+29.44 (code), 34.35 (RU), 33.13 (EN); K=2 was 33.29/35.82/30.43 and K=3
+32.19/30.92/28.60. The first K=1 arm on code includes draft warmup.
+
+Next candidate, currently under GPU verification: use the same exact q8
+projection entry for single-row plain/draft heads, avoiding per-op scale
+preparation. The GPU regression now extends beyond position 300 to exercise
+split-K full attention as well as SWA. Separate 8/16-worker trials compare
+CPU scheduling overhead against the previous revision. Do not assume these
+candidates passed until the `head2/` logs say so.
