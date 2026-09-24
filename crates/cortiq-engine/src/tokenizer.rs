@@ -18,6 +18,26 @@ use unicode_normalization::UnicodeNormalization;
 /// explicit Split regex (Qwen files carry their own; see `from_json`).
 const DEFAULT_SPLIT: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
+/// Tool-call grammar tokens that decode as TEXT even when the vocabulary
+/// marks them special.
+///
+/// `decode` drops special tokens, which is right for control tokens
+/// (`<|im_end|>`, `</s>` …) and wrong for these: they ARE the tool call.
+/// MiniCPM5's tokenizer marks `<function`, `</function>`, `<param`,
+/// `</param>` (and `<tool_call>` …) special, so a call came out as
+/// ` name="get_weather">…Paris` — nothing a parser can find. Qwen's
+/// tokenizer marks its `<tool_call>` non-special for the same reason;
+/// this list gives every vocabulary that behaviour. Only exact tool
+/// markup is listed, so no chat control token can leak into content.
+pub const TOOL_MARKUP_TOKENS: &[&str] = &[
+    "<tool_call>",
+    "</tool_call>",
+    "<function",
+    "</function>",
+    "<param",
+    "</param>",
+];
+
 /// A loaded BPE tokenizer.
 pub struct Tokenizer {
     /// Token string → ID
@@ -342,7 +362,7 @@ impl Tokenizer {
             vocab.insert(at.content.clone(), at.id);
             added.push((at.content.clone(), at.id));
             added_ids.insert(at.id);
-            if at.special {
+            if at.special && !TOOL_MARKUP_TOKENS.contains(&at.content.as_str()) {
                 special_ids.insert(at.id);
             }
             match at.content.as_str() {
@@ -906,14 +926,45 @@ impl Tokenizer {
         tools: Option<&[serde_json::Value]>,
         enable_thinking: Option<bool>,
     ) -> Vec<u32> {
-        if let Some(tpl) = &self.chat_template {
-            match self.render_template_json(tpl, messages, tools, enable_thinking) {
-                Ok(text) => return self.with_bos(self.encode(&text)),
-                Err(e) => {
-                    tracing::error!("chat template render failed ({e}); ChatML fallback");
-                }
+        match self.try_apply_chat_template_json(messages, tools, enable_thinking) {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::error!("chat template render failed ({e}); ChatML fallback");
+                self.chatml_json_fallback(messages, enable_thinking)
             }
         }
+    }
+
+    /// Like [`Self::apply_chat_template_json`], but a template that fails
+    /// to render is an ERROR instead of a quiet ChatML approximation.
+    ///
+    /// The fallback flattens every message to (role, text): it has no
+    /// place for `tools`, `tool_calls` or `role: "tool"`. For a plain chat
+    /// that is a tolerable degradation; for a request with tools it means
+    /// the model never sees the functions and answers as if none were
+    /// offered — a failure no client can detect. The server calls this
+    /// variant when tools are present and reports the error instead.
+    /// Files without a template still take the ChatML path (Ok).
+    pub fn try_apply_chat_template_json(
+        &self,
+        messages: &[serde_json::Value],
+        tools: Option<&[serde_json::Value]>,
+        enable_thinking: Option<bool>,
+    ) -> Result<Vec<u32>, String> {
+        if let Some(tpl) = &self.chat_template {
+            return self
+                .render_template_json(tpl, messages, tools, enable_thinking)
+                .map(|text| self.with_bos(self.encode(&text)))
+                .map_err(|e| format!("{e:#}"));
+        }
+        Ok(self.chatml_json_fallback(messages, enable_thinking))
+    }
+
+    fn chatml_json_fallback(
+        &self,
+        messages: &[serde_json::Value],
+        enable_thinking: Option<bool>,
+    ) -> Vec<u32> {
         let pairs: Vec<(String, String)> = messages
             .iter()
             .map(|m| {
@@ -957,34 +1008,7 @@ impl Tokenizer {
         tools: Option<&[serde_json::Value]>,
         enable_thinking: Option<bool>,
     ) -> Result<String, minijinja::Error> {
-        let mut env = minijinja::Environment::new();
-        env.set_trim_blocks(true);
-        env.set_lstrip_blocks(true);
-        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-        // `visible_text` is a helper transformers injects into its
-        // template env (it flattens multimodal content to its text).
-        // Nanbeige's template calls it unconditionally in the tools
-        // branch; without it the render errors and the fallback quietly
-        // serves a TOOLLESS prompt.
-        env.add_function("visible_text", |v: minijinja::Value| -> String {
-            if let Some(s) = v.as_str() {
-                return s.to_string();
-            }
-            if let Ok(iter) = v.try_iter() {
-                let mut out = Vec::new();
-                for item in iter {
-                    if let Some(s) = item.as_str() {
-                        out.push(s.to_string());
-                    } else if let Ok(t) = item.get_attr("text") {
-                        if let Some(s) = t.as_str() {
-                            out.push(s.to_string());
-                        }
-                    }
-                }
-                return out.join("\n");
-            }
-            String::new()
-        });
+        let mut env = crate::chat_template::environment();
         let tpl_src = strip_generation_tags(tpl);
         env.add_template("chat", &tpl_src)?;
         let msgs: Vec<minijinja::Value> = messages
@@ -1076,11 +1100,7 @@ impl Tokenizer {
         messages: &[(String, String)],
         enable_thinking: Option<bool>,
     ) -> Result<String, minijinja::Error> {
-        let mut env = minijinja::Environment::new();
-        env.set_trim_blocks(true);
-        env.set_lstrip_blocks(true);
-        // HF templates use python string methods (.startswith, .strip…).
-        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+        let mut env = crate::chat_template::environment();
         let tpl_src = strip_generation_tags(tpl);
         env.add_template("chat", &tpl_src)?;
         let msgs: Vec<minijinja::Value> = messages
@@ -1250,6 +1270,36 @@ mod tests {
               ]
             }}"#
         )
+    }
+
+    /// MiniCPM5 marks its tool grammar special. Decoding must keep the
+    /// markup (the call IS that text) and still drop the chat control
+    /// tokens around it.
+    #[test]
+    fn tool_markup_decodes_even_when_special() {
+        let json = r#"{
+          "model": {"type": "BPE", "vocab": {"h": 0, "e": 1, "l": 2, "o": 3}, "merges": []},
+          "added_tokens": [
+            {"id": 10, "content": "<|im_end|>", "special": true},
+            {"id": 11, "content": "<function", "special": true},
+            {"id": 12, "content": "</function>", "special": true},
+            {"id": 13, "content": "<param", "special": true},
+            {"id": 14, "content": "</param>", "special": true},
+            {"id": 15, "content": "<tool_call>", "special": true}
+          ]
+        }"#;
+        let t = Tokenizer::from_json(json).unwrap();
+        let ids = [11, 0, 1, 13, 2, 14, 12, 15, 10];
+        assert_eq!(
+            t.decode(&ids),
+            "<functionhe<paraml</param></function><tool_call>"
+        );
+        let streamed: String = ids.iter().map(|&i| t.decode_token(i)).collect();
+        assert_eq!(streamed, t.decode(&ids), "streaming must agree with decode");
+        assert!(
+            !t.decode(&[10]).contains("im_end"),
+            "control tokens stay hidden"
+        );
     }
 
     /// Parity against HuggingFace on a real tokenizer, run only when the

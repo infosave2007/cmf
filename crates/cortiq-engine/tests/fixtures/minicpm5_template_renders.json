@@ -1,0 +1,458 @@
+{
+ "source": "transformers 5.17.0 apply_chat_template(add_generation_prompt=True) on the original openbmb/MiniCPM5-2B chat_template.jinja; leading bos_token <s> removed (cortiq adds BOS as a token, not template text)",
+ "cases": [
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "hf_text": "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Write a haiku about the sea."
+    }
+   ],
+   "hf_text": "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWrite a haiku about the sea.<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "用一句话介绍北京。"
+    }
+   ],
+   "enable_thinking": false,
+   "hf_text": "<|im_start|>user\n用一句话介绍北京。<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Solve 17*23."
+    }
+   ],
+   "enable_thinking": true,
+   "hf_text": "<|im_start|>user\nSolve 17*23.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Paris?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "celsius",
+          "fahrenheit"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "calculator",
+      "description": "Evaluate an arithmetic expression",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "expression": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "expression"
+       ]
+      }
+     }
+    }
+   ],
+   "hf_text": "<|im_start|>system\nYou are a helpful assistant.\n\n# Tools\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"calculator\", \"description\": \"Evaluate an arithmetic expression\", \"parameters\": {\"type\": \"object\", \"properties\": {\"expression\": {\"type\": \"string\"}}, \"required\": [\"expression\"]}}}\n</tools>\n\nTool usage guidelines:\n- You may call zero or more functions. If no function calls are needed, just answer normally and do not include any <function ... </function>.\n- When calling a function, return an XML object within <function ... </function> using:\n<function name=\"function-name\"><param name=\"param-name\">param-value</param></function>\n- param-value may be multi-line. If it contains <, & or newline characters, wrap it in a CDATA block: <param name=\"param-name\"><![CDATA[...multi-line value...]]></param><|im_end|>\n<|im_start|>user\nWhat's the weather in Paris?<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "What's the weather in Paris?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "celsius",
+          "fahrenheit"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "hf_text": "<|im_start|>system\n# Tools\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n</tools>\n\nTool usage guidelines:\n- You may call zero or more functions. If no function calls are needed, just answer normally and do not include any <function ... </function>.\n- When calling a function, return an XML object within <function ... </function> using:\n<function name=\"function-name\"><param name=\"param-name\">param-value</param></function>\n- param-value may be multi-line. If it contains <, & or newline characters, wrap it in a CDATA block: <param name=\"param-name\"><![CDATA[...multi-line value...]]></param><|im_end|>\n<|im_start|>user\nWhat's the weather in Paris?<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "What's the weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_1",
+     "content": "{\"temp_c\": 18, \"sky\": \"cloudy\"}"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "celsius",
+          "fahrenheit"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "hf_text": "<|im_start|>system\n# Tools\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n</tools>\n\nTool usage guidelines:\n- You may call zero or more functions. If no function calls are needed, just answer normally and do not include any <function ... </function>.\n- When calling a function, return an XML object within <function ... </function> using:\n<function name=\"function-name\"><param name=\"param-name\">param-value</param></function>\n- param-value may be multi-line. If it contains <, & or newline characters, wrap it in a CDATA block: <param name=\"param-name\"><![CDATA[...multi-line value...]]></param><|im_end|>\n<|im_start|>user\nWhat's the weather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<function name=\"get_weather\"><param name=\"city\">Paris</param></function><|im_end|>\n<|im_start|>user\n<tool_response>\n{\"temp_c\": 18, \"sky\": \"cloudy\"}\n</tool_response><|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    },
+    {
+     "role": "assistant",
+     "content": "Hello! How can I help?"
+    },
+    {
+     "role": "user",
+     "content": "Tell me a joke."
+    }
+   ],
+   "hf_text": "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nHello! How can I help?<|im_end|>\n<|im_start|>user\nTell me a joke.<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Переведи «доброе утро» на китайский."
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "translate",
+      "description": "Перевести текст — 翻译文本 <html> & \"quotes\"",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "text": {
+         "type": "string",
+         "description": "исходный текст"
+        },
+        "target_lang": {
+         "type": "string"
+        },
+        "formal": {
+         "type": "boolean"
+        },
+        "max_len": {
+         "type": "integer",
+         "minimum": 1
+        }
+       },
+       "required": [
+        "text",
+        "target_lang"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "celsius",
+          "fahrenheit"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "hf_text": "<|im_start|>system\n# Tools\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"translate\", \"description\": \"Перевести текст — 翻译文本 <html> & \\\"quotes\\\"\", \"parameters\": {\"type\": \"object\", \"properties\": {\"text\": {\"type\": \"string\", \"description\": \"исходный текст\"}, \"target_lang\": {\"type\": \"string\"}, \"formal\": {\"type\": \"boolean\"}, \"max_len\": {\"type\": \"integer\", \"minimum\": 1}}, \"required\": [\"text\", \"target_lang\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n</tools>\n\nTool usage guidelines:\n- You may call zero or more functions. If no function calls are needed, just answer normally and do not include any <function ... </function>.\n- When calling a function, return an XML object within <function ... </function> using:\n<function name=\"function-name\"><param name=\"param-name\">param-value</param></function>\n- param-value may be multi-line. If it contains <, & or newline characters, wrap it in a CDATA block: <param name=\"param-name\"><![CDATA[...multi-line value...]]></param><|im_end|>\n<|im_start|>user\nПереведи «доброе утро» на китайский.<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Translate two lines and check Oslo weather."
+    },
+    {
+     "role": "assistant",
+     "content": "Doing both.",
+     "tool_calls": [
+      {
+       "id": "c1",
+       "type": "function",
+       "function": {
+        "name": "translate",
+        "arguments": {
+         "text": "line one\n<b>line two</b> & more",
+         "target_lang": "de",
+         "max_len": 80
+        }
+       }
+      },
+      {
+       "id": "c2",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Oslo",
+         "unit": "celsius"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "c1",
+     "content": "Zeile eins"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "c2",
+     "content": {
+      "temp_c": 7,
+      "sky": "облачно"
+     }
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "translate",
+      "description": "Перевести текст — 翻译文本 <html> & \"quotes\"",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "text": {
+         "type": "string",
+         "description": "исходный текст"
+        },
+        "target_lang": {
+         "type": "string"
+        },
+        "formal": {
+         "type": "boolean"
+        },
+        "max_len": {
+         "type": "integer",
+         "minimum": 1
+        }
+       },
+       "required": [
+        "text",
+        "target_lang"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "celsius",
+          "fahrenheit"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "hf_text": "<|im_start|>system\n# Tools\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"translate\", \"description\": \"Перевести текст — 翻译文本 <html> & \\\"quotes\\\"\", \"parameters\": {\"type\": \"object\", \"properties\": {\"text\": {\"type\": \"string\", \"description\": \"исходный текст\"}, \"target_lang\": {\"type\": \"string\"}, \"formal\": {\"type\": \"boolean\"}, \"max_len\": {\"type\": \"integer\", \"minimum\": 1}}, \"required\": [\"text\", \"target_lang\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n</tools>\n\nTool usage guidelines:\n- You may call zero or more functions. If no function calls are needed, just answer normally and do not include any <function ... </function>.\n- When calling a function, return an XML object within <function ... </function> using:\n<function name=\"function-name\"><param name=\"param-name\">param-value</param></function>\n- param-value may be multi-line. If it contains <, & or newline characters, wrap it in a CDATA block: <param name=\"param-name\"><![CDATA[...multi-line value...]]></param><|im_end|>\n<|im_start|>user\nTranslate two lines and check Oslo weather.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nDoing both.\n<function name=\"translate\"><param name=\"text\"><![CDATA[line one\n<b>line two</b> & more]]></param><param name=\"target_lang\">de</param><param name=\"max_len\">80</param></function>\n<function name=\"get_weather\"><param name=\"city\">Oslo</param><param name=\"unit\">celsius</param></function><|im_end|>\n<|im_start|>user\n<tool_response>\nZeile eins\n</tool_response>\n<tool_response>\n{\"temp_c\": 7, \"sky\": \"облачно\"}\n</tool_response><|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Formal German for hello."
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "c1",
+       "type": "function",
+       "function": {
+        "name": "translate",
+        "arguments": {
+         "text": "hello",
+         "target_lang": "de",
+         "formal": true
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "c1",
+     "content": "Guten Tag"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "translate",
+      "description": "Перевести текст — 翻译文本 <html> & \"quotes\"",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "text": {
+         "type": "string",
+         "description": "исходный текст"
+        },
+        "target_lang": {
+         "type": "string"
+        },
+        "formal": {
+         "type": "boolean"
+        },
+        "max_len": {
+         "type": "integer",
+         "minimum": 1
+        }
+       },
+       "required": [
+        "text",
+        "target_lang"
+       ]
+      }
+     }
+    }
+   ],
+   "hf_text": "<|im_start|>system\n# Tools\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"translate\", \"description\": \"Перевести текст — 翻译文本 <html> & \\\"quotes\\\"\", \"parameters\": {\"type\": \"object\", \"properties\": {\"text\": {\"type\": \"string\", \"description\": \"исходный текст\"}, \"target_lang\": {\"type\": \"string\"}, \"formal\": {\"type\": \"boolean\"}, \"max_len\": {\"type\": \"integer\", \"minimum\": 1}}, \"required\": [\"text\", \"target_lang\"]}}}\n</tools>\n\nTool usage guidelines:\n- You may call zero or more functions. If no function calls are needed, just answer normally and do not include any <function ... </function>.\n- When calling a function, return an XML object within <function ... </function> using:\n<function name=\"function-name\"><param name=\"param-name\">param-value</param></function>\n- param-value may be multi-line. If it contains <, & or newline characters, wrap it in a CDATA block: <param name=\"param-name\"><![CDATA[...multi-line value...]]></param><|im_end|>\n<|im_start|>user\nFormal German for hello.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<function name=\"translate\"><param name=\"text\">hello</param><param name=\"target_lang\">de</param><param name=\"formal\">True</param></function><|im_end|>\n<|im_start|>user\n<tool_response>\nGuten Tag\n</tool_response><|im_end|>\n<|im_start|>assistant\n"
+  }
+ ]
+}
