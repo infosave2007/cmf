@@ -1067,6 +1067,66 @@ fn mtp_prefill_pair_count(start: usize, end: usize, input_len: usize) -> usize {
 /// Callback for streaming tokens. Return `false` to cancel.
 pub type TokenCallback = Box<dyn FnMut(&str) -> bool + Send>;
 
+/// One layer's cache ownership at a cross-turn KV reuse boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReuseLayer {
+    /// Exact-attention layer (rows in `LayerKvCache`); otherwise a
+    /// recurrent / latent mixer whose state cannot be rewound.
+    pub full: bool,
+    /// Rows the host owner cache holds.
+    pub host_rows: usize,
+    /// Rows the wgpu token graph's device mirror holds (None: no mirror).
+    pub device_rows: Option<usize>,
+    /// A recurrent state lives on the device (advanced past the host copy).
+    pub device_state: bool,
+}
+
+/// What a reused turn must do before its tail prefill runs on the HOST.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReusePlan {
+    /// Host caches already hold exactly the reused prefix.
+    Ready,
+    /// Copy device mirror rows `[from..to)` into the host cache of each
+    /// listed layer (the rows decode wrote on the device only).
+    Pull(Vec<(usize, usize, usize)>),
+    /// The prefix cannot be continued on the host exactly: start fresh.
+    Fresh,
+}
+
+/// The wgpu whole-token graph decodes into a DEVICE K/V mirror and never
+/// writes those rows back to the host cache, while the chunked prefill of a
+/// pure-attention model reads (and appends to) the host cache. A reused turn
+/// therefore found its host cache ending at the previous PROMPT, not at the
+/// previous answer: the tail prefill attended without the model's own
+/// answer and appended its rows at the wrong index (MiniCPM5 on Vulkan
+/// repeated its tool call instead of reading the tool result). Every layer
+/// must hold exactly `reuse_from` host rows before the host continues; rows
+/// that exist only on the device are pulled back, anything else is fresh.
+pub(crate) fn kv_reuse_plan(reuse_from: usize, layers: &[ReuseLayer]) -> ReusePlan {
+    let mut pulls = Vec::new();
+    for (li, l) in layers.iter().enumerate() {
+        if !l.full {
+            if l.device_state {
+                return ReusePlan::Fresh;
+            }
+            continue;
+        }
+        if l.host_rows == reuse_from {
+            continue;
+        }
+        if l.host_rows < reuse_from && l.device_rows.is_some_and(|d| d >= reuse_from) {
+            pulls.push((li, l.host_rows, reuse_from));
+            continue;
+        }
+        return ReusePlan::Fresh;
+    }
+    if pulls.is_empty() {
+        ReusePlan::Ready
+    } else {
+        ReusePlan::Pull(pulls)
+    }
+}
+
 impl Pipeline {
     /// Clear all per-sequence state, including backend device mirrors.
     ///
@@ -1091,6 +1151,93 @@ impl Pipeline {
         // derived id as well: a failed/aborted warm-up must never leave a
         // mirror that a later request can mistake for a current MTP cache.
         crate::gpu::graph_kv_reset(self.mtp_kv_id());
+    }
+
+    /// Make the host caches own exactly the reused prefix `[0..reuse_from)`
+    /// before a reused turn's tail prefill runs on the host (see
+    /// [`kv_reuse_plan`]). Returns false when the prefix cannot be continued
+    /// exactly — the caller then starts a fresh sequence. A model whose
+    /// prefill runs through the token graph keeps its device state as the
+    /// authority and is left untouched.
+    fn prepare_kv_reuse(&mut self, reuse_from: usize) -> bool {
+        if self.graph_prefill_preferred() {
+            return true;
+        }
+        let kv_id = self.graph_kv_id;
+        let layers: Vec<ReuseLayer> = (0..self.num_layers)
+            .map(|li| {
+                let full = matches!(
+                    self.weights.layers[self.phys_layer(li)].attn,
+                    AttnKind::Full { .. }
+                );
+                ReuseLayer {
+                    full,
+                    host_rows: self.kv_cache.layers[li].seq_len,
+                    device_rows: crate::gpu::graph_kv_stored(kv_id, li),
+                    device_state: crate::gpu::graph_state_resident(kv_id, li),
+                }
+            })
+            .collect();
+        // No wgpu device state at all (CPU, Metal — whose graph appends every
+        // decoded row to the owner cache itself): the host is the owner and
+        // the extension check already proved the prefix.
+        if layers
+            .iter()
+            .all(|l| l.device_rows.is_none() && !l.device_state)
+        {
+            return true;
+        }
+        let plan = kv_reuse_plan(reuse_from, &layers);
+        if std::env::var("CMF_PREFILL_PROF").is_ok() {
+            let pulled = match &plan {
+                ReusePlan::Pull(p) => p.iter().map(|&(_, a, b)| b - a).max().unwrap_or(0),
+                _ => 0,
+            };
+            eprintln!(
+                "kv-reuse: {} → {} row(s) pulled from the device mirror",
+                match plan {
+                    ReusePlan::Ready => "host ready",
+                    ReusePlan::Pull(_) => "pull",
+                    ReusePlan::Fresh => "fresh",
+                },
+                pulled
+            );
+        }
+        match plan {
+            ReusePlan::Fresh => return false,
+            ReusePlan::Ready => {}
+            ReusePlan::Pull(pulls) => {
+                for (li, from, to) in pulls {
+                    let cache = &self.kv_cache.layers[li];
+                    let (nkv, hd) = (cache.num_kv_heads, cache.head_dim);
+                    let Some((k, v)) =
+                        crate::gpu::graph_kv_read_rows(kv_id, li, from, to, nkv, hd)
+                    else {
+                        return false;
+                    };
+                    let cache = &mut self.kv_cache.layers[li];
+                    let row = nkv * hd;
+                    for p in 0..to - from {
+                        cache.append(&k[p * row..(p + 1) * row], &v[p * row..(p + 1) * row], &[]);
+                    }
+                    if cache.seq_len != to {
+                        return false;
+                    }
+                }
+            }
+        }
+        // A mirror past the prefix (a greedy burst that ran beyond the stop)
+        // holds rows of the OLD continuation: rewind it so the next graph
+        // token re-syncs those positions from the host.
+        for (li, l) in layers.iter().enumerate() {
+            if l.full
+                && l.device_rows.is_some_and(|d| d > reuse_from)
+                && !crate::gpu::graph_kv_set_stored(kv_id, li, reuse_from)
+            {
+                return false;
+            }
+        }
+        true
     }
 
     /// Finish a generation lifecycle after the MTP/router owners were
@@ -2761,7 +2908,7 @@ impl Pipeline {
         // Extension-only (no rollback), so it is exact for every layer
         // kind including recurrent state; MTP/o1/task-mask runs keep
         // the fresh-sequence path. CMF_KV_REUSE=0 disables.
-        let reuse_from = {
+        let mut reuse_from = {
             let on = !std::env::var("CMF_KV_REUSE").is_ok_and(|v| v == "0");
             let h = &self.kv_history;
             if on
@@ -2778,6 +2925,11 @@ impl Pipeline {
                 0
             }
         };
+        // The device may own rows the host tail prefill needs (wgpu decode
+        // writes only its mirror): hand them to the host, or start fresh.
+        if reuse_from > 0 && !self.prepare_kv_reuse(reuse_from) {
+            reuse_from = 0;
+        }
         if reuse_from == 0 {
             // Fresh sequence — the cache holds absolute positions.
             self.clear_sequence_state();
@@ -14807,6 +14959,49 @@ fn ffn_forward_pair(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn kv_reuse_plan_pulls_rows_decode_wrote_only_on_the_device() {
+        use super::{ReuseLayer, ReusePlan, kv_reuse_plan};
+        let full = |host_rows, device_rows| ReuseLayer {
+            full: true,
+            host_rows,
+            device_rows,
+            device_state: false,
+        };
+        // Turn 1: 300-token prompt prefilled on the host, 40 tokens decoded
+        // by the wgpu graph into the device mirror only. Turn 2 reuses 339.
+        assert_eq!(
+            kv_reuse_plan(339, &[full(300, Some(339)), full(300, Some(339))]),
+            ReusePlan::Pull(vec![(0, 300, 339), (1, 300, 339)])
+        );
+        // CPU / Metal: the host owner already holds every forwarded row.
+        assert_eq!(kv_reuse_plan(339, &[full(339, None)]), ReusePlan::Ready);
+        // A mirror past the prefix is fine for the host (it gets rewound).
+        assert_eq!(kv_reuse_plan(339, &[full(339, Some(345))]), ReusePlan::Ready);
+        // GPU prefix / CPU tail: only the device layers lag.
+        assert_eq!(
+            kv_reuse_plan(339, &[full(300, Some(339)), full(339, None)]),
+            ReusePlan::Pull(vec![(0, 300, 339)])
+        );
+        // The device cannot supply the missing rows: never continue.
+        assert_eq!(kv_reuse_plan(339, &[full(300, Some(320))]), ReusePlan::Fresh);
+        assert_eq!(kv_reuse_plan(339, &[full(300, None)]), ReusePlan::Fresh);
+        assert_eq!(kv_reuse_plan(339, &[full(350, None)]), ReusePlan::Fresh);
+        // A recurrent state advanced on the device cannot be handed to a
+        // host prefill (it is not rewindable and the host copy is stale).
+        let conv = |device_state| ReuseLayer {
+            full: false,
+            host_rows: 0,
+            device_rows: None,
+            device_state,
+        };
+        assert_eq!(
+            kv_reuse_plan(339, &[conv(true), full(300, Some(339))]),
+            ReusePlan::Fresh
+        );
+        assert_eq!(kv_reuse_plan(339, &[conv(false), full(339, None)]), ReusePlan::Ready);
+    }
 
     #[test]
     fn nll_graph_policy_scopes_only_the_fused_head() {
