@@ -3682,6 +3682,8 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
             .and_then(|v| v.as_bool())
             .unwrap_or(true),
         prism_hadamard: None,
+        kv_heads_per_layer: None,
+        v_head_dim: None,
     })
 }
 

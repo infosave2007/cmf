@@ -985,6 +985,8 @@ fn arch_from_md(md: &BTreeMap<String, Val>, tensors: &[GgufTensor]) -> anyhow::R
         logit_multiplier: None,
         loop_final_norm: false,
         prism_hadamard: None,
+        kv_heads_per_layer: None,
+        v_head_dim: None,
     })
 }
 
@@ -1344,6 +1346,8 @@ fn qwen_image_arch(geometry: &QwenImageGeometry) -> ModelArch {
         num_loops: 1,
         loop_final_norm: false,
         prism_hadamard: None,
+        kv_heads_per_layer: None,
+        v_head_dim: None,
     }
 }
 

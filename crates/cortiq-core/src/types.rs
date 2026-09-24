@@ -409,6 +409,16 @@ pub struct ModelArch {
     /// Per-layer Q-head counts for architectures whose attention width varies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention_heads_per_layer: Option<Vec<usize>>,
+    /// Per-layer KV head counts for architectures whose GQA width varies by
+    /// layer (MiMo-V2: 4 KV heads on full-attention layers, 8 on SWA
+    /// layers). One entry per layer; None = every layer uses `num_kv_heads`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_heads_per_layer: Option<Vec<usize>>,
+    /// Width of each V head when it differs from the Q/K head width
+    /// (MiMo-V2: Q/K heads are 192 wide, V heads 128). Applies to every
+    /// attention layer; None = V heads are `head_dim` wide.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v_head_dim: Option<usize>,
     /// FFN activation: "silu" (default) or "gelu_tanh" (Gemma's GeGLU).
     #[serde(default = "default_hidden_act", skip_serializing_if = "is_default_act")]
     pub hidden_act: String,
@@ -838,4 +848,70 @@ pub struct PerformanceMetrics {
     pub uptime_seconds: u64,
     pub vram_used_mb: f64,
     pub ram_used_mb: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A header block written before `kv_heads_per_layer` / `v_head_dim`
+    /// existed: neither key is present.
+    fn legacy_arch_json() -> serde_json::Value {
+        serde_json::json!({
+            "arch_name": "legacy",
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "num_layers": 3,
+            "num_attention_heads": 4,
+            "num_kv_heads": 2,
+            "head_dim": 16,
+            "vocab_size": 32,
+            "layer_types": ["FullAttention", "SlidingAttention", "SlidingAttention"],
+            "rms_norm_eps": 1e-6,
+            "max_position_embeddings": 256,
+            "linear_conv_kernel_dim": null,
+            "linear_num_key_heads": null,
+            "linear_num_value_heads": null
+        })
+    }
+
+    #[test]
+    fn header_without_kv_geometry_fields_deserializes_to_none() {
+        let arch: ModelArch = serde_json::from_value(legacy_arch_json()).unwrap();
+        assert_eq!(arch.kv_heads_per_layer, None);
+        assert_eq!(arch.v_head_dim, None);
+        assert_eq!(arch.num_kv_heads, 2);
+        assert_eq!(arch.head_dim, 16);
+    }
+
+    #[test]
+    fn absent_kv_geometry_fields_round_trip_and_are_not_written() {
+        let arch: ModelArch = serde_json::from_value(legacy_arch_json()).unwrap();
+        let value = serde_json::to_value(&arch).unwrap();
+        let obj = value.as_object().unwrap();
+        // skip_serializing_if keeps the headers of every existing family
+        // identical to what older writers produced.
+        assert!(!obj.contains_key("kv_heads_per_layer"));
+        assert!(!obj.contains_key("v_head_dim"));
+        let text = serde_json::to_string(&arch).unwrap();
+        let back: ModelArch = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.kv_heads_per_layer, None);
+        assert_eq!(back.v_head_dim, None);
+        assert_eq!(serde_json::to_value(&back).unwrap(), value);
+    }
+
+    #[test]
+    fn present_kv_geometry_fields_round_trip() {
+        let mut arch: ModelArch = serde_json::from_value(legacy_arch_json()).unwrap();
+        arch.kv_heads_per_layer = Some(vec![2, 4, 4]);
+        arch.v_head_dim = Some(8);
+        let value = serde_json::to_value(&arch).unwrap();
+        assert_eq!(value["kv_heads_per_layer"], serde_json::json!([2, 4, 4]));
+        assert_eq!(value["v_head_dim"], serde_json::json!(8));
+        let text = serde_json::to_string(&arch).unwrap();
+        let back: ModelArch = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.kv_heads_per_layer, Some(vec![2, 4, 4]));
+        assert_eq!(back.v_head_dim, Some(8));
+        assert_eq!(serde_json::to_value(&back).unwrap(), value);
+    }
 }
