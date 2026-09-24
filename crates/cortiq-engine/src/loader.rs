@@ -1287,7 +1287,13 @@ impl Pipeline {
                  loading without it"
             );
         }
-        let mtp = if let Some(cfg) = arch.mtp.as_ref().filter(|_| mtp_present) {
+        // MiMo-V2 carries its own three-layer stack (sidecar or main file),
+        // loaded by `mimo_mtp::load_for` below — never this single block.
+        let mtp = if let Some(cfg) = arch
+            .mtp
+            .as_ref()
+            .filter(|_| mtp_present && arch.arch_name != "mimo_v2")
+        {
             if cfg.num_layers != 1 {
                 return Err(CmfError::Parse(format!(
                     "MTP with {} blocks not supported yet (only 1)",
@@ -2073,6 +2079,9 @@ impl Pipeline {
         }
         pipeline.short_conv_cfg = short_conv_cfg;
         pipeline.mtp = mtp;
+        if arch.arch_name == "mimo_v2" {
+            pipeline.mimo_mtp = crate::pipeline::mimo_mtp::load_for(model, &arch)?;
+        }
         pipeline.install_dynamic_routing(model, false);
         // Record the load-time overlay so a later set_active_skill(None)
         // correctly reverts it (the union-diff assumes dyn_active mirrors

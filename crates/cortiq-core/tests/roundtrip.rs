@@ -1005,3 +1005,13 @@ fn recode_in_place_shrinks_within_slot_and_stays_verifiable() {
         "refused recode still dirtied the file"
     );
 }
+
+/// The MTP sidecar name the converter writes and the loader probes.
+#[test]
+fn mtp_sidecar_path_is_stem_dot_mtp_dot_cmf() {
+    use std::path::Path;
+    let p = |s: &str| cortiq_core::mtp_sidecar_path(Path::new(s));
+    assert_eq!(p("/a/b/mimo-q4tp.cmf"), Path::new("/a/b/mimo-q4tp.mtp.cmf"));
+    assert_eq!(p("x.mtp.cmf"), Path::new("x.mtp.cmf"), "a sidecar maps to itself");
+    assert_eq!(p("noext"), Path::new("noext.mtp.cmf"));
+}
