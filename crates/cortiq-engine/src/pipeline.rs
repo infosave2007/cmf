@@ -1020,29 +1020,135 @@ impl Pipeline {
         let (model, _, _, _) = self.weights.embed_tokens.graph_weight()?;
         crate::gpu::automatic_layer_prefix(&model, self.num_layers, self.physical_layers)
     }
+
+    /// Positions per batched pass of the layer-stack prefill for THIS
+    /// model on THIS backend (see [`prefill_chunk_rule`]). Pub: the network
+    /// split must chunk exactly like the local path to reproduce it.
+    pub fn prefill_chunk(&self) -> usize {
+        let env = env_prefill_chunk();
+        if env.is_some() || ChunkHost::here() != ChunkHost::Other {
+            return prefill_chunk_rule(env, ChunkHost::here(), false);
+        }
+        prefill_chunk_rule(None, ChunkHost::Other, self.chunk_stack_facts().dense_on_discrete())
+    }
+
+    fn chunk_stack_facts(&self) -> ChunkStackFacts {
+        let plain_dense = !self.weights.layers.is_empty()
+            && self.g3n.is_none()
+            && self.dsv4.is_none()
+            && self.dsv41.is_none()
+            && self.qwen4_exp.is_none()
+            && self.weights.layers.iter().all(|lw| {
+                matches!(lw.attn, AttnKind::Full { .. }) && matches!(lw.ffn, FfnKind::Dense(_))
+            });
+        let gpu_on = crate::gpu::enabled();
+        ChunkStackFacts {
+            plain_dense,
+            discrete: gpu_on && crate::gpu::discrete(),
+            gpu_on,
+            // Only asked when the rest already qualifies: it opens the
+            // backend's capacity plan.
+            capacity_split: std::env::var_os("CMF_GPU_LAYERS").is_some()
+                || (plain_dense && gpu_on && self.automatic_gpu_prefix().is_some()),
+            multi_gpu: self.gpu_plan.is_some(),
+            o1: self.o1_active(),
+        }
+    }
 }
 
-/// Prefill chunk (positions per batched pass). On macOS the AMX GEMM
-/// path wants tall panels — M=48 starves the matrix units (ggml uses
-/// ubatch 512); elsewhere the historical 48 stays. CMF_PREFILL_CHUNK
-/// overrides. Pub: the network split MUST chunk identically to the
-/// local path — panel width reorders float accumulation, so a different
-/// chunk is a different (equally valid) generation.
+/// Prefill chunk (positions per batched pass), model-agnostic form. On
+/// macOS the AMX GEMM path wants tall panels — M=48 starves the matrix
+/// units (ggml uses ubatch 512); elsewhere the historical 48 stays.
+/// CMF_PREFILL_CHUNK overrides. The architectures with their own stacks
+/// (DeepSeek-V4/V4.1) chunk with this; the layer-stack prefill asks
+/// [`Pipeline::prefill_chunk`], which also knows the model and the card.
+/// A different chunk is a different (equally valid) generation: panel
+/// width reorders float accumulation.
 pub fn prefill_chunk() -> usize {
-    if let Some(n) = std::env::var("CMF_PREFILL_CHUNK")
+    prefill_chunk_rule(env_prefill_chunk(), ChunkHost::here(), false)
+}
+
+fn env_prefill_chunk() -> Option<usize> {
+    std::env::var("CMF_PREFILL_CHUNK")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-    {
+}
+
+/// The host classes the chunk width distinguishes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChunkHost {
+    Macos,
+    /// Linux/Android aarch64 (phones, SBCs).
+    Aarch64,
+    /// Everything else: x86-64 Linux/Windows, CPU or Vulkan/DX12.
+    Other,
+}
+
+impl ChunkHost {
+    fn here() -> Self {
+        if cfg!(target_os = "macos") {
+            ChunkHost::Macos
+        } else if cfg!(target_arch = "aarch64") {
+            ChunkHost::Aarch64
+        } else {
+            ChunkHost::Other
+        }
+    }
+}
+
+/// Chunk for a plain dense stack whose every layer lives on a discrete
+/// card. On x86 the layer-stack prefill is host-driven: each GEMM and the
+/// chunk attention (which re-uploads the whole KV prefix per layer) is a
+/// separate submit + readback, so 48 positions a pass left the card idle
+/// between them. Measured in-process on an RTX 3090 (Vulkan), 2048-token
+/// prompt — see CHANGELOG 0.7.6 for the table.
+const DISCRETE_DENSE_PREFILL_CHUNK: usize = 512;
+
+/// The chunk-width rule. `dense_on_discrete` is true only for a plain
+/// dense transformer (full attention, dense FFN, no special stack) that
+/// is entirely resident on one discrete card — the one case measured
+/// here. GDN hybrids, MoE, DeepSeek stacks, capacity-split and CPU-only
+/// runs keep the width they were tuned with.
+fn prefill_chunk_rule(env: Option<usize>, host: ChunkHost, dense_on_discrete: bool) -> usize {
+    if let Some(n) = env {
         return n.max(1);
     }
-    if cfg!(target_os = "macos") {
-        512
-    } else if cfg!(target_arch = "aarch64") {
+    match host {
+        ChunkHost::Macos => 512,
         // Mobile: big enough to feed the batched attend (gate b ≥ 32)
         // and the blocked SDOT GEMM without the memory of 512.
-        256
-    } else {
-        48
+        ChunkHost::Aarch64 => 256,
+        ChunkHost::Other if dense_on_discrete => DISCRETE_DENSE_PREFILL_CHUNK,
+        ChunkHost::Other => 48,
+    }
+}
+
+/// What the chunk rule needs to know about a loaded stack.
+#[derive(Clone, Copy, Debug, Default)]
+struct ChunkStackFacts {
+    /// Every layer is `AttnKind::Full` + `FfnKind::Dense`, and no
+    /// architecture-owned stack (g3n, DeepSeek-V4/V4.1, qwen4-exp) is set.
+    plain_dense: bool,
+    /// The active GPU backend is a discrete card.
+    discrete: bool,
+    /// The backend is up and not paused.
+    gpu_on: bool,
+    /// A capacity-derived device prefix: some layers run on the host.
+    capacity_split: bool,
+    /// An in-process multi-GPU plan is set.
+    multi_gpu: bool,
+    /// O(1) layers (their Q trace is recorded by the prefill).
+    o1: bool,
+}
+
+impl ChunkStackFacts {
+    fn dense_on_discrete(self) -> bool {
+        self.plain_dense
+            && self.discrete
+            && self.gpu_on
+            && !self.capacity_split
+            && !self.multi_gpu
+            && !self.o1
     }
 }
 
@@ -3216,7 +3322,7 @@ impl Pipeline {
             // Reuse the exact batched prefix machinery when available; it
             // records the same per-position Q trace as the full prefill.
             if self.can_prefill_batched() && limit > 2 {
-                let chunk = prefill_chunk();
+                let chunk = self.prefill_chunk();
                 let hs = self.hidden_size;
                 while pos < limit && !self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
                     let end = (pos + chunk).min(limit);
@@ -3332,7 +3438,7 @@ impl Pipeline {
             // the prompt with the slower pair path — the published
             // prefill number didn't match real TTFT). MTP warm-up reads
             // each position's hidden straight from the chunk result.
-            let chunk = prefill_chunk();
+            let chunk = self.prefill_chunk();
             let hs = self.hidden_size;
             while pos < input_ids.len() && !self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 let end = (pos + chunk).min(input_ids.len());
@@ -6476,7 +6582,7 @@ impl Pipeline {
             // prefill-GEMM in chunks; only the last position's hidden is
             // needed. (o1-compatible: the batch path attends per position
             // through qwen_attention, which carries the collection hook.)
-            let chunk = prefill_chunk();
+            let chunk = self.prefill_chunk();
             let hs = self.hidden_size;
             while pos < ids.len() {
                 let end = (pos + chunk).min(ids.len());
@@ -14807,6 +14913,57 @@ fn ffn_forward_pair(
 
 #[cfg(test)]
 mod tests {
+
+    /// The 0.7.6 prefill-chunk rule: a plain dense stack wholly on a
+    /// discrete card reads the prompt in wide chunks on x86; every other
+    /// case keeps the width it had (the GDN-hybrid, MoE and DeepSeek paths
+    /// were tuned on hardware not measured for this change).
+    #[test]
+    fn prefill_chunk_rule_widens_only_dense_on_discrete() {
+        use super::{
+            prefill_chunk_rule, ChunkHost, ChunkStackFacts, DISCRETE_DENSE_PREFILL_CHUNK,
+        };
+        let dense_card = ChunkStackFacts {
+            plain_dense: true,
+            discrete: true,
+            gpu_on: true,
+            ..Default::default()
+        };
+        assert!(dense_card.dense_on_discrete());
+        // The bug: a dense Llama on a Vulkan RTX 3090 got 48.
+        assert_eq!(
+            prefill_chunk_rule(None, ChunkHost::Other, dense_card.dense_on_discrete()),
+            DISCRETE_DENSE_PREFILL_CHUNK
+        );
+        assert!(DISCRETE_DENSE_PREFILL_CHUNK > 48);
+        for (label, facts) in [
+            ("GDN hybrid / MoE / DeepSeek stack", ChunkStackFacts { plain_dense: false, ..dense_card }),
+            ("integrated GPU", ChunkStackFacts { discrete: false, ..dense_card }),
+            ("CPU only", ChunkStackFacts { gpu_on: false, discrete: false, ..dense_card }),
+            ("capacity split", ChunkStackFacts { capacity_split: true, ..dense_card }),
+            ("multi-GPU plan", ChunkStackFacts { multi_gpu: true, ..dense_card }),
+            ("O(1) layers", ChunkStackFacts { o1: true, ..dense_card }),
+        ] {
+            assert!(!facts.dense_on_discrete(), "{label}");
+            assert_eq!(
+                prefill_chunk_rule(None, ChunkHost::Other, facts.dense_on_discrete()),
+                48,
+                "{label} keeps the historical x86 chunk"
+            );
+        }
+        // Other hosts are untouched whatever the model.
+        for dense in [false, true] {
+            assert_eq!(prefill_chunk_rule(None, ChunkHost::Macos, dense), 512);
+            assert_eq!(prefill_chunk_rule(None, ChunkHost::Aarch64, dense), 256);
+        }
+        // CMF_PREFILL_CHUNK still wins everywhere (and is clamped to ≥ 1).
+        for host in [ChunkHost::Macos, ChunkHost::Aarch64, ChunkHost::Other] {
+            for dense in [false, true] {
+                assert_eq!(prefill_chunk_rule(Some(48), host, dense), 48);
+                assert_eq!(prefill_chunk_rule(Some(0), host, dense), 1);
+            }
+        }
+    }
 
     #[test]
     fn nll_graph_policy_scopes_only_the_fused_head() {

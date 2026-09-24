@@ -72,7 +72,7 @@ use std::net::TcpStream;
 /// half-described cache.
 pub const WIRE_VERSION: u32 = 7;
 
-// Prefill chunking follows the engine's `pipeline::prefill_chunk()` —
+// Prefill chunking follows the engine's `Pipeline::prefill_chunk()` —
 // panel width reorders float accumulation, so the network split MUST
 // chunk exactly like the local path to reproduce local generations.
 

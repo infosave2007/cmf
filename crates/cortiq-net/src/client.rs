@@ -412,7 +412,7 @@ pub fn generate_split(
     // ── Prefill: pipelined — the worker chews chunk k while we compute
     // chunk k+1; one barrier (Sync) at the end. Wall ≈ max(sides), not sum.
     let t_prefill = Instant::now();
-    let chunk = cortiq_engine::pipeline::prefill_chunk();
+    let chunk = p.prefill_chunk();
     let mut flat: Vec<f32> = Vec::with_capacity(chunk * hs);
     let mut pos = reuse_from;
     while pos < input_ids.len() {
@@ -593,7 +593,7 @@ pub fn prefill_on_peer(
     remote.reset()?;
 
     let t0 = Instant::now();
-    let chunk = cortiq_engine::pipeline::prefill_chunk();
+    let chunk = p.prefill_chunk();
     let mut flat: Vec<f32> = Vec::with_capacity(chunk * hs);
     let mut pos = 0usize;
     while pos < take {
