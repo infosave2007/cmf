@@ -531,6 +531,19 @@ fn g4_1_q4tp_tower_tracks_exact() {
             input.tokens(),
             backend_label()
         );
+        // The reference's own noise floor, when the oracle ran with --bf16:
+        // HF in bf16 (the serving numerics) against HF in fp32.
+        let stem = p.file_stem().unwrap().to_string_lossy().to_string();
+        if let Some(r) = man.get("vit").and_then(|v| v.get(&stem)) {
+            if let (Some(m), Some(n)) = (
+                r.get("bf16_vs_fp32_row_cos_mean").and_then(Value::as_f64),
+                r.get("bf16_vs_fp32_row_cos_min").and_then(Value::as_f64),
+            ) {
+                println!(
+                    "    reference noise floor (HF bf16 vs HF fp32): row cos mean {m:.5} min {n:.5}"
+                );
+            }
+        }
         means.push(cm);
         mins.push(cmin);
         all_rows.extend((0..a.len() / 4096).map(|r| {
