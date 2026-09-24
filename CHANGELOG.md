@@ -30,6 +30,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   chunk. On the toy checkpoint the token graph, the batched prefill and a
   2-of-4-layer device prefix match the CPU (`CMF_GPU=0 CMF_SDOT=0`) over a
   384-token prompt and 64 greedy steps within 4.1e-6 of the largest logit.
+- `convert --mimo-towers mm-only` writes the MiMo-V2 multimodal towers as a
+  companion file `<stem>.mm.cmf` (`mimo_v2_mm`): the vision tower (364
+  tensors), the audio encoder and speech embeddings (95), and the audio
+  tokenizer encoder from `audio_tokenizer/model.safetensors` (389, under
+  `audio_tokenizer.`; its decoder and codebook training state are dropped),
+  plus `config.json` and the tokenizer config as U8 blobs. Tower matrices
+  are q4tp by default; the RVQ codebooks stay F32, and the speech
+  embeddings and every non-matrix tensor keep their BF16 source bytes
+  (F16 cannot hold 195 467 of the 1.3 G values). The release companion is
+  751 MB. `--mimo-towers multimodal` puts the same tensors into the text
+  file instead. `cortiq_engine::mimo_mm::MimoMm` loads either, finds a
+  sibling `*.mm.cmf`, and refuses a text model with another hidden size or
+  a tokenizer that moves any of the nine special tokens.
 
 ## [0.7.6] - 2026-09-24
 
