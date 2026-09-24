@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Z-Image on Vulkan: in a CFG pair, the first item now matches its own
+  single forward bit for bit. Before, it was 2.2e-4 off, because rows past
+  the end of its attention segment took part in the flash kernel's
+  workgroup-wide rescale decision. Turbo output is unchanged bit for bit.
+  Base output changes by rounding only: 26.58 dB before and 26.64 dB after
+  against diffusers bf16, base 1024² with 28 steps.
+- The Qwen3 text encoder's exact mode keeps F32 projections (Z-Image's
+  bf16 `layers.6.mlp.down_proj`) on the host f32 GEMM. With the device on,
+  they had gone through the tf32-class cooperative GEMM, which moved the
+  residual by 2.2e-4 from the massive-activation layer on.
+
+### Added
+- `CMF_ZI_ACC16` / `CMF_ZI_TILE16`: a flushed f16-accumulate arm of the
+  Z-Image GEMM, measured and left off. It is 19–21 % slower per step on an
+  RTX 3090 and 20–50× less precise per GEMM, because the tensor core
+  rounds the f16 accumulator after every MMA.
+- `CMF_ZIMAGE_TE_DEV`, `CMF_TE_TAPS`: device text-encoder projections with
+  exact host fallback, and per-layer taps. They show that the 3–7 % the
+  device text encoder used to cost came from its host int8-activation arm.
+  Device projections with the exact fallback reach the exact encoder's
+  numbers.
+
 ## [0.7.4] - 2026-09-24
 
 ### Added
