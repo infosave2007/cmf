@@ -9535,22 +9535,30 @@ pub(crate) fn float_activations_scope<R>(f: impl FnOnce() -> R) -> R {
 /// token's result does not depend on the batch it rides in and equals its
 /// matvec. The MiMo speculative verify holds it (`row_exact_scope`) — its
 /// accepted rows must be the rows plain decode would have produced.
-static ROW_EXACT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+// Shared with pool workers, so overlapping requests must keep the mode
+// enabled until the LAST scope leaves. Saving/restoring a global bool is
+// incorrect when two threads enter and leave in a non-LIFO order.
+static ROW_EXACT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub(crate) fn row_exact() -> bool {
-    ROW_EXACT.load(std::sync::atomic::Ordering::Relaxed)
+    ROW_EXACT.load(std::sync::atomic::Ordering::Acquire) != 0
 }
 
-/// Run `f` with row-exact batching on (restored after, also on unwind).
-pub(crate) fn row_exact_scope<R>(f: impl FnOnce() -> R) -> R {
-    struct Restore(bool);
-    impl Drop for Restore {
+fn counted_row_exact_scope<R>(active: &std::sync::atomic::AtomicUsize, f: impl FnOnce() -> R) -> R {
+    struct Restore<'a>(&'a std::sync::atomic::AtomicUsize);
+    impl Drop for Restore<'_> {
         fn drop(&mut self) {
-            ROW_EXACT.store(self.0, std::sync::atomic::Ordering::Relaxed);
+            self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         }
     }
-    let _restore = Restore(ROW_EXACT.swap(true, std::sync::atomic::Ordering::Relaxed));
+    active.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    let _restore = Restore(active);
     f()
+}
+
+/// Run `f` with row-exact batching on (also released on unwind).
+pub(crate) fn row_exact_scope<R>(f: impl FnOnce() -> R) -> R {
+    counted_row_exact_scope(&ROW_EXACT, f)
 }
 
 /// A8W8 quantized-activation path available on THIS machine? One
@@ -12528,8 +12536,47 @@ mod tests {
                 "row-exact matmat token {tk}"
             );
         }
-        assert!(!row_exact(), "the scope restores the flag");
+        // Other concurrent tests/requests may still hold the shared mode.
+        // Nested, overlapping and unwind restoration is checked separately.
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn row_exact_scopes_survive_overlap_nesting_and_unwind() {
+        use std::sync::{Barrier, atomic::{AtomicUsize, Ordering}};
+        // A private counter makes this restoration test independent of
+        // numerical tests concurrently using the production counter.
+        let active = AtomicUsize::new(0);
+        counted_row_exact_scope(&active, || {
+            assert_eq!(active.load(Ordering::Acquire), 1);
+            counted_row_exact_scope(&active, || {
+                assert_eq!(active.load(Ordering::Acquire), 2);
+            });
+            assert_eq!(active.load(Ordering::Acquire), 1);
+        });
+        assert_eq!(active.load(Ordering::Acquire), 0);
+
+        let both_entered = Barrier::new(2);
+        let release_last = Barrier::new(2);
+        std::thread::scope(|s| {
+            let first = s.spawn(|| counted_row_exact_scope(&active, || {
+                both_entered.wait();
+            }));
+            let last = s.spawn(|| counted_row_exact_scope(&active, || {
+                both_entered.wait();
+                release_last.wait();
+            }));
+            first.join().unwrap();
+            assert_eq!(active.load(Ordering::Acquire), 1, "second request must remain exact");
+            release_last.wait();
+            last.join().unwrap();
+        });
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        let panic = std::panic::catch_unwind(|| {
+            counted_row_exact_scope(&active, || panic!("scope unwind"));
+        });
+        assert!(panic.is_err());
+        assert_eq!(active.load(Ordering::Acquire), 0);
     }
 
     #[test]

@@ -1964,6 +1964,25 @@ mod bank_tests {
         crate::gpu::enabled()
             && crate::gpu::wgpu_active()
             && crate::gpu_wgpu::dsv4_global_moe_supported()
+            // Match Slot::decide_with: UMA intentionally keeps experts on
+            // the host/shared-memory path, even if descriptor arrays exist.
+            && crate::gpu_wgpu::dsv4_vram_budget().is_some_and(|b| b != u64::MAX)
+    }
+
+    #[test]
+    fn unified_memory_keeps_the_expert_bank_off() {
+        let _g = serial();
+        if !crate::gpu::enabled() || !crate::gpu::wgpu_active()
+            || crate::gpu_wgpu::dsv4_vram_budget() != Some(u64::MAX)
+        {
+            return;
+        }
+        let (dir, model, _) = write_model("unified-placement");
+        let p = Pipeline::from_model(&model, SamplerConfig::default()).unwrap();
+        assert!(!bank(&p).is_on(), "UMA must retain host-paged expert placement");
+        drop(p);
+        drop(model);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn serial() -> std::sync::MutexGuard<'static, ()> {
