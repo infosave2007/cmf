@@ -458,9 +458,11 @@ pub(crate) fn decode(a: &VaeChainArgs, z: &[f32], h: usize, w: usize, out: &mut 
     };
     let lc = d.latent_c;
     let n0 = h * w;
-    if z.len() != lc * n0 || out.len() != 3 * 64 * n0 || d.attn.c % 64 != 0 || n0 % 64 != 0 {
+    if z.len() != lc * n0 || out.len() != 3 * 64 * n0 || d.attn.c % 64 != 0 || n0 % 4 != 0 {
         return false;
     }
+    // attention keys padded to the GEMM tile (zero keys, masked in the softmax)
+    let n0p = n0.div_ceil(64) * 64;
     // largest n·C of any stage
     let mut cmax = 0usize;
     {
@@ -500,13 +502,13 @@ pub(crate) fn decode(a: &VaeChainArgs, z: &[f32], h: usize, w: usize, out: &mut 
     let ac = d.attn.c;
     let chunk = n0.min(env_chunk());
     let (qb, kb, vt, ob) = (
-        buf_zeroed(c, n0 * ac * 2),
-        buf_zeroed(c, n0 * ac * 2),
-        buf_zeroed(c, n0 * ac * 2),
-        buf_zeroed(c, n0 * ac * 2),
+        buf_zeroed(c, n0p * ac * 2),
+        buf_zeroed(c, n0p * ac * 2),
+        buf_zeroed(c, n0p * ac * 2),
+        buf_zeroed(c, n0p * ac * 2),
     );
-    let sb = buf_zeroed(c, chunk * n0 * 4);
-    let pb = buf_zeroed(c, chunk * n0 * 2);
+    let sb = buf_zeroed(c, chunk * n0p * 4);
+    let pb = buf_zeroed(c, chunk * n0p * 2);
     let mut r = VRec {
         c,
         p,
@@ -527,22 +529,23 @@ pub(crate) fn decode(a: &VaeChainArgs, z: &[f32], h: usize, w: usize, out: &mut 
         r.gn(&at.norm, &b.xa, &b.hh, n0, ac, false, true);
         r.conv(&at.q, (&b.hh, 0), (&qb, 0), None, n0, (0, 0), false, 1, ac, ac, ac);
         r.conv(&at.k, (&b.hh, 0), (&kb, 0), None, n0, (0, 0), false, 1, ac, ac, ac);
-        r.conv(&at.v, (&b.hh, 0), (&vt, 0), None, n0, (0, 0), false, 2, n0, ac, ac);
+        r.conv(&at.v, (&b.hh, 0), (&vt, 0), None, n0, (0, 0), false, 2, n0p, ac, ac);
         let mut q0 = 0;
         while q0 < n0 {
             let m = chunk.min(n0 - q0);
-            r.gemm((&kb, 0), n0, ac, (&qb, (q0 * ac * 2) as u64), ac, (&sb, 0), n0, m, 0);
+            r.gemm((&kb, 0), n0p, ac, (&qb, (q0 * ac * 2) as u64), ac, (&sb, 0), n0p, m, 0);
             {
                 let pp = r.p;
-                let n0u = n0 as u32;
+                let (n0u, ldu) = (n0 as u32, n0p as u32);
                 let enc = r.enc();
                 enc.set_compute_pipeline_state(&pp.vsoftmax);
                 enc.set_buffer(0, Some(&sb), 0);
                 enc.set_buffer(1, Some(&pb), 0);
                 set_p(enc, 2, &n0u);
+                set_p(enc, 3, &ldu);
                 enc.dispatch_thread_groups(MTLSize::new(m as u64, 1, 1), MTLSize::new(256, 1, 1));
             }
-            r.gemm((&vt, 0), ac, n0, (&pb, 0), n0, (&ob, (q0 * ac * 2) as u64), ac, m, 1);
+            r.gemm((&vt, 0), ac, n0p, (&pb, 0), n0p, (&ob, (q0 * ac * 2) as u64), ac, m, 1);
             q0 += m;
         }
         r.conv(&at.o, (&ob, 0), (&b.xa, 0), Some((&b.xa, 0)), n0, (0, 0), false, 0, ac, ac, ac);

@@ -725,6 +725,7 @@ kernel void zv_conv(
         const float b1 = p.has_bias != 0u ? bias[o + 1] : 0.0f;
         for (ushort i = 0; i < 4; ++i) {
             const uint t = t0 + 32u * sgt + 8u * i + (uint)fc.x;
+            if (t >= p.n) continue;
             float v0 = acc[i][j].thread_elements()[0] * p.mul + b0;
             float v1 = acc[i][j].thread_elements()[1] * p.mul + b1;
             if (p.epi == 2u) {
@@ -842,14 +843,15 @@ kernel void zv_cvt(
 kernel void zv_softmax(
     device const float* s [[buffer(0)]],
     device half* pr [[buffer(1)]],
-    constant uint& n [[buffer(2)]],
+    constant uint& n [[buffer(2)]],        // valid keys (row stride ld ≥ n; tail columns stay 0)
+    constant uint& ld [[buffer(3)]],
     uint row [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]],
     ushort sg [[simdgroup_index_in_threadgroup]],
     ushort lane [[thread_index_in_simdgroup]])
 {
     threadgroup float red[8];
-    device const float* sr = s + (ulong)row * n;
+    device const float* sr = s + (ulong)row * ld;
     float mx = -INFINITY;
     for (uint j = tid; j < n; j += 256u) mx = max(mx, sr[j]);
     mx = simd_max(mx);
@@ -861,7 +863,7 @@ kernel void zv_softmax(
     float sum = 0.0f;
     for (uint j = tid; j < n; j += 256u) sum += exp(sr[j] - m);
     const float inv = 1.0f / zi_block_sum(sum, red, sg, lane);
-    device half* pw = pr + (ulong)row * n;
+    device half* pw = pr + (ulong)row * ld;
     for (uint j = tid; j < n; j += 256u) pw[j] = (half)(exp(sr[j] - m) * inv);
 }
 
