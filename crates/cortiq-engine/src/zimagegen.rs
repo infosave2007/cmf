@@ -313,6 +313,14 @@ pub fn generate_images(
             p.width, p.height
         ));
     }
+    // the models are made for ~1024²; past 4096 a side the device paths run
+    // out of rows or buffer length and the host path takes hours
+    if p.height > 4096 || p.width > 4096 {
+        return Err(format!(
+            "height and width must be at most 4096 (got {}x{})",
+            p.width, p.height
+        ));
+    }
     if p.steps == 0 {
         return Err("steps must be at least 1".into());
     }

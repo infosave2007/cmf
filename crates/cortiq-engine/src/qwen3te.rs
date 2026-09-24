@@ -346,7 +346,7 @@ impl Qwen3Encoder {
 
     /// Route the named projections (`all`, or a comma list of
     /// `PROJ_NAMES`) through the device GEMM of their codec; the host
-    /// kernels stay the fallback. Experiment knob (`CMF_TE_DEV`).
+    /// kernels stay the fallback. Experiment knob (`CMF_ZIMAGE_TE_DEV` in the Z-Image pipeline, `ZC_TE_DEV` in examples/zimage_techeck.rs).
     pub fn set_device_ops(&mut self, spec: &str) {
         self.dev_ops = 0;
         for t in spec.split(',').map(str::trim) {
