@@ -7,85 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-- `convert` reads XiaomiMiMo MiMo-V2 checkpoints (`mimo_v2`, text decoder).
-  The fused FP8 qkv is stored in 4 tensor-parallel chunks, and each chunk
-  has its own 128-row scale blocks; the converter decodes it on that grid,
-  splits it into q/k/v and folds `attention_value_scale` into V. MXFP4
-  experts are read from U8 `.weight` + `.weight_scale`. The header carries
-  the full/sliding layer schedule, the per-layer KV head counts (4/8) and
-  the 128-wide V heads. The router bias and the sliding-window sinks are
-  kept at f32. The MTP head and the vision/audio/speech towers are dropped.
-  Without `--quant`, a MiMo-V2 checkpoint converts to q4tp experts with the
-  attention, dense layer 0, embedding and lm_head at q8_2f. Other models
-  still default to q8.
-- The wgpu whole-token graph and the batched prefill graph run MiMo-V2
-  attention on the card: 4 KV heads on full layers and 8 on sliding ones,
-  128-wide V heads under 192-wide Q/K heads, two RoPE tables, the 128-token
-  sliding window over a ring of the last 256 positions, and the learned
-  sinks. Before, both graphs declined MiMo-V2 and every token ran its
-  attention on the CPU. The batched graph also runs q8_2f projections and
-  MoE layers without a shared expert. When the stack does not fit the card,
-  it runs the layers that fit and the host runs the rest of each prompt
-  chunk. On the toy checkpoint the token graph, the batched prefill and a
-  2-of-4-layer device prefix match the CPU (`CMF_GPU=0 CMF_SDOT=0`) over a
-  384-token prompt and 64 greedy steps within 4.1e-6 of the largest logit.
-- `convert --mimo-towers mm-only` writes the MiMo-V2 multimodal towers as a
-  companion file `<stem>.mm.cmf` (`mimo_v2_mm`): the vision tower (364
-  tensors), the audio encoder and speech embeddings (95), and the audio
-  tokenizer encoder from `audio_tokenizer/model.safetensors` (389, under
-  `audio_tokenizer.`; its decoder and codebook training state are dropped),
-  plus `config.json` and the tokenizer config as U8 blobs. Tower matrices
-  are q4tp by default; the RVQ codebooks stay F32, and the speech
-  embeddings and every non-matrix tensor keep their BF16 source bytes
-  (F16 cannot hold 195 467 of the 1.3 G values). The release companion is
-  751 MB. `--mimo-towers multimodal` puts the same tensors into the text
-  file instead. `cortiq_engine::mimo_mm::MimoMm` loads either, finds a
-  sibling `*.mm.cmf`, and refuses a text model with another hidden size or
-  a tokenizer that moves any of the nine special tokens.
-- Engine: the MiMo-V2.6 vision tower and its inputs (`mimo_vision`), not yet
-  wired to the CLI or the server. Images follow the upstream processor:
-  smart resize to multiples of 32 (up to 8,388,608 pixels by default),
-  bilinear resize on 0..255, ImageNet mean/std, two identical frames per
-  image. Video comes from a directory of frames with a given frame rate, or
-  from a Y4M file; frame count, frame choice, the per-frame pixel budget and
-  the `MM:SS` labels match the processor. The prompt's image, video and
-  audio placeholders expand to the processor's token layout. The ViT runs on
-  the CPU, or with the full-attention blocks on the GPU; the windowed blocks
-  run on the CPU. Against the HF module in fp32 the output differs by at most
-  6e-5 of the largest value (CPU and Vulkan with `CMF_COOP=0`). Image loading
-  from a request (`load_image_bytes`) moved to a shared `media` module and
-  accepts `file://`.
-- MiMo-V2.6 audio input towers in the engine (`mimo_audio`), not yet wired
-  to `run`/`serve`. WAV input: PCM 8/16/24/32-bit, float 32/64 and
-  `WAVE_FORMAT_EXTENSIBLE`, any channel count. Other rates are resampled to
-  24 kHz with torchaudio's default sinc filter, down to its float32 output
-  length. Then come the log-mel frontend, the audio tokenizer encoder with
-  its 20-level RVQ (each 6000-frame segment encoded on its own) and the
-  LLM-side encoder: the 20 speech embeddings summed, a 6-layer
-  bidirectional Qwen2 over groups of 4 frames, and the projection to 4096.
-  Weights load from a CMF that keeps the source tensor names, or straight
-  from the HF checkpoint. Measured against the HF modules in fp32 on a 5 s,
-  a 4.5 s and a 65 s clip:
-  - tokenizer features within 1.7e-5 relative;
-  - all 20 code levels identical;
-  - LLM rows within 1.2e-5 relative.
+## [0.7.7] - 2026-09-24
 
-  On 21 WAV files, decoding matches numpy exactly, resampling is within
-  2.8e-7 of peak of torchaudio, and the log-mel is within 6.7e-5 of
-  torchaudio's arithmetic done in float64.
-- Codecs for the audio towers, measured against exact weights:
-  - Tokenizer layers need q8_2f. With q4tp, level-0 codes agree on 79–89%
-    of frames (plain rounding) or 90–94% (GPTQ). With q8_2f they agree on
-    96.5–98.6%; HF's own bf16 run agrees with its fp32 run on 96.0–97.4%.
-  - The encoder and projection take GPTQ q4tp: mean row cosine 0.9999,
-    against 0.95 with plain rounding.
-  - Quantized tower weights are dequantized at load. The int8-activation
-    host kernels cost the tokenizer another 0.9–3.2 points of level-0
-    agreement.
-- `requant --quant q4tp-quantize` and the converter's float rules keep
-  MiMo's RVQ codebooks (f32) and speech-embedding tables (f16) out of
-  quantization.
+### Added
+- Native MiMo-V2.6-Flash text conversion and inference: MXFP4-to-q4tp experts,
+  q8_2f text backbone, mixed full/sliding attention, RoPE and learned sinks.
+- Automatic resident/dynamic/hybrid MoE placement with a device expert bank,
+  attention graphs and batched GPU speculative verification for the three-layer
+  MTP companion. Greedy MTP preserves the accepted reference token sequences;
+  nonzero-temperature generation remains on the ordinary sampling path.
+- Two MiMo distributions sharing one backbone: text-only (backbone + MTP),
+  and full (backbone + MTP + multimodal companion). The model card includes
+  measured throughput, weight-budget VRAM results and checksum verification.
+- Image, silent-video (frame directory/Y4M), and WAV input in the CLI and
+  OpenAI-compatible server. Ordered media parts are retained, invalid media
+  is rejected before streaming, and text-only requests do not map media towers.
+- Native vision/audio processing, companion assembly, conversion validation,
+  independent reference fixtures and real-model parity/media gate tools.
+
+### Fixed
+- CPU-only placement now propagates through MoE worker tasks. The 128-token
+  smoke PPL agrees at 3.647 on CPU, full GPU and repeated 24-GB-budget runs.
+- MiMo GPU tower GEMM and attention preserve f32 operands instead of implicitly
+  rounding them to fp16 cooperative matrices. All six exact-weight vision/video
+  reference fixtures pass with default cooperative-kernel settings.
+- Dynamic bank shutdown joins the filler before freeing device storage, and
+  explicit graph-off diagnostics also disable singleton attention graphs.
+
+### Performance and limits
+- RTX PRO 6000 Blackwell 96 GB: default 128-token core benchmark median
+  40.85 tok/s (32.20 / 41.40 / 40.85); a 64000-MiB weight budget measured
+  44.48 tok/s median. Natural prompts vary; MTP is not always faster.
+- Budget tests used one 96-GB GPU, not physical cards at every capacity.
+  Temporary upload memory can exceed the configured weight budget.
+- Full-model OCR, shape/chart and five ASR checks pass. Strict quantized-vision
+  row-cosine and precise video timestamp acceptance remain open; this release
+  does not claim complete multimodal quality qualification. Compressed audio,
+  MP4 and interleaved video/audio are not supported.
 
 ## [0.7.6] - 2026-09-24
 
@@ -6099,7 +6057,8 @@ Initial public release.
 - **Licensing** — Apache-2.0 with an explicit patent-grant explanation
   (`LICENSE`, `NOTICE`, `PATENTS.md`).
 
-[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.6.9...HEAD
+[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.7.7...HEAD
+[0.7.7]: https://github.com/infosave2007/cmf/compare/v0.7.6...v0.7.7
 [0.6.9]: https://github.com/infosave2007/cmf/compare/v0.6.8...v0.6.9
 [0.6.8]: https://github.com/infosave2007/cmf/compare/v0.6.7...v0.6.8
 [0.6.7]: https://github.com/infosave2007/cmf/compare/v0.6.6...v0.6.7

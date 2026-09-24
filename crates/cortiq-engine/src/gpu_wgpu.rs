@@ -29577,8 +29577,12 @@ thread_local! {
     // changed its 128-token PPL from 3.647 to 3.656 at a 24-GB budget.
     static MIMO_F32_GEMM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
-struct MimoF32Gemm(bool, std::marker::PhantomData<std::rc::Rc<()>>);
+pub(crate) struct MimoF32Gemm(bool, std::marker::PhantomData<std::rc::Rc<()>>);
 impl MimoF32Gemm {
+    pub(crate) fn for_tower() -> Self {
+        Self::enter("mimo_v2")
+    }
+
     fn enter(arch: &str) -> Self {
         let before = MIMO_F32_GEMM.get();
         MIMO_F32_GEMM.set(before || arch == "mimo_v2");
@@ -32642,6 +32646,7 @@ fn dit_attention_inner(
     let coop_dit = c
         .dit_gemm_coop
         .as_ref()
+        .filter(|_| !MIMO_F32_GEMM.get())
         .filter(|_| std::env::var("CMF_DIT_ATTN_COOP").as_deref() != Ok("0"));
     // PV's right operand is read down columns in v's [n][hd] layout —
     // 4.76 s a step against QK's 1.65 at the same FLOPs. Transpose it
@@ -51126,6 +51131,7 @@ pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: u
     let coop = c
         .gemm_nt_coop
         .as_ref()
+        .filter(|_| !MIMO_F32_GEMM.get())
         .filter(|_| k % 4 == 0 && m.div_ceil(64) <= 65_535 && n.div_ceil(64) <= 65_535)
         .filter(|_| c.discrete || (m <= 65_000 && n <= 65_000));
     // The scalar arm's dispatch is (m, n) workgroups — huge dims are
@@ -60250,6 +60256,18 @@ mod buffer_ceiling_tests {
 #[cfg(test)]
 mod mimo_precision_scope_tests {
     use super::*;
+    #[test]
+    fn mimo_tower_precision_restores_the_callers_contract() {
+        assert!(!MIMO_F32_GEMM.get());
+        {
+            let _tower = MimoF32Gemm::for_tower();
+            assert!(MIMO_F32_GEMM.get());
+            let _mapped_mm = MimoF32Gemm::enter("mimo_v2_mm");
+            assert!(MIMO_F32_GEMM.get());
+        }
+        assert!(!MIMO_F32_GEMM.get());
+    }
+
     #[test]
     fn mimo_gemm_precision_is_nested_thread_local_and_restored() {
         assert!(!MIMO_F32_GEMM.get());

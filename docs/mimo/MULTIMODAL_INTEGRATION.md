@@ -78,3 +78,14 @@ streamed media fails with HTTP 400 before SSE. Text-only correctly rejects
 media with HTTP 400. CLI and server expanded image prompt IDs are identical.
 The packages contain regular hardlinks to the shared backbone/MTP (not
 absolute symlinks); text-only contains no `.mm.cmf`.
+
+## Release 0.7.7 precision gate
+
+A default-GPU rerun exposed fp16 cooperative operand rounding in the exact-weight
+vision tower (relative error 0.0026–0.0256). A request-local f32 precision guard
+now covers dense projection GEMMs and full attention as well as mapped q8/q4
+operations. All six real vision/video fixtures pass without `CMF_COOP=0`:
+maximum relative error 3.663e-5 and row cosine rounded to 1.0000000. The guard is
+scoped and restored, leaving other architectures' cooperative kernels unchanged.
+This closes the exact-weight GPU gate, not the separate q8 row-cosine/video
+semantic quality gates.
