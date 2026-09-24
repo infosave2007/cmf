@@ -40,6 +40,8 @@ Commands (python tools/mimo_ref.py <cmd> --help for all flags):
   selfcheck [--hf-dir DIR]                          oracle math vs HF modules (split layout)
   tiles                                             FP8 scale-tiling proof on the checkpoint
   pt2raw    --in DIR --ids JSON --out DIR           old h{li}.pt dumps -> raw per-position files
+  mtp       --seqs JSON --cache F --out R.json      MTP draft acceptance (variants A..C_pre)
+  mtpcheck                                          MTP explicit-KV path == causal block
 
 Dump layout (the engine's CMF_LAYER_DUMP contract, one comparator for both):
   p{pos:06}_l{li:02}.f32          hidden state AFTER layer li, raw little-endian f32 [hidden]
@@ -131,6 +133,14 @@ class MimoCfg:
             raise SystemExit("only sigmoid routing is implemented")
         if cfg.get("n_shared_experts"):
             raise SystemExit("shared experts are not implemented (MiMo-V2 has none)")
+
+    def first_swa(self) -> int:
+        """Index of a sliding-window layer: the MTP blocks use that geometry
+        (swa heads / KV heads / head dims, swa theta, window, sinks)."""
+        for li, p in enumerate(self.pattern):
+            if p == 1:
+                return li
+        raise SystemExit("no sliding-window layer: MTP geometry undefined")
 
     def geom(self, li: int) -> Geo:
         swa = self.pattern[li] == 1
@@ -491,6 +501,116 @@ class Oracle:
 
 
 # --------------------------------------------------------------------------
+# MTP draft layers (model.mtp.layers.K.*, model_mtp.safetensors)
+# --------------------------------------------------------------------------
+# HF modeling_mimo_v2.py ignores the MTP head. The forward below is the one
+# vLLM (vllm/model_executor/models/mimo_v2_mtp.py, MiMoV2MTPLayer.forward)
+# and SGLang (sglang/srt/models/mimo_v2_nextn.py, MiMoV2ModelNextN.forward)
+# run for ONE layer:
+#     u = eh_proj(cat[enorm(embed(tok)), hnorm(hid)])      embedding FIRST
+#     u = u + o_proj(swa_attn(input_layernorm(u)))         SWA geometry, sinks
+#     u = u + mlp(pre_mlp_layernorm(u))                    dense FFN
+#     logits = lm_head(final_layernorm(u))                 shared lm_head
+# `hid` is the backbone's POST-final-norm hidden (both servers' target model
+# returns model.norm(h)). How the three layers chain differs between servers,
+# hence the variants of `cmd_mtp`.
+class MtpLayer:
+    def __init__(self, src, cfg: MimoCfg, k: int, dt=torch.float32):
+        p = f"model.mtp.layers.{k}."
+        li = cfg.first_swa()
+        L = LayerW.__new__(LayerW)
+        L.li, L.src, L.dt, L.p = li, src, dt, p
+        L.g = g = cfg.geom(li)
+        a = p + "self_attn."
+        w = src.get(a + "qkv_proj.weight")
+        if w.dtype == torch.float8_e4m3fn:
+            sinv = src.get(a + "qkv_proj.weight_scale_inv")
+            W = fp8_deq(w, sinv, qkv_scale_rows(cfg, li, sinv.shape[0]))
+        else:
+            W = w.float()
+        wq, wk, wv = split_fused_qkv(cfg, li, W, "chunked")
+        L.wq, L.wk, L.wv = wq.to(dt), wk.to(dt), wv.to(dt)
+        L.wo = dense_weight(src, a + "o_proj.weight", dt)
+        L.sink = src.get(a + "attention_sink_bias").to(dt) if g.sink else None
+        L.n_in = src.get(p + "input_layernorm.weight").to(dt)
+        L.n_post = src.get(p + "pre_mlp_layernorm.weight").to(dt)
+        L.moe = False
+        L.dg = dense_weight(src, p + "mlp.gate_proj.weight", dt)
+        L.du = dense_weight(src, p + "mlp.up_proj.weight", dt)
+        L.dd = dense_weight(src, p + "mlp.down_proj.weight", dt)
+        self.L = L
+        self.k = k
+        self.enorm = src.get(p + "enorm.weight").to(dt)
+        self.hnorm = src.get(p + "hnorm.weight").to(dt)
+        self.eh = dense_weight(src, p + "eh_proj.weight", dt)
+        self.fnorm = src.get(p + "final_layernorm.weight").to(dt)
+
+    def fuse(self, emb, hid, cfg):
+        return torch.cat([rms(emb, self.enorm, cfg.eps), rms(hid, self.hnorm, cfg.eps)], -1) @ self.eh.T
+
+    def forward(self, emb, hid, pos, cfg):
+        """emb/hid [B, S, H] at positions `pos` (teacher-forced, causal over
+        the S rows) -> (block output pre-final-norm, post-final-norm)."""
+        y = layer_forward(self.fuse(emb, hid, cfg), self.L, pos, cfg)
+        return y, rms(y, self.fnorm, cfg.eps)
+
+
+def kv_rows(xn, L: LayerW, pos, cfg: MimoCfg):
+    """Normed rows [n, H] at positions `pos` [n] -> rotated K [nkv, n, hd]
+    and scaled V [nkv, n, vd]."""
+    g = L.g
+    n = xn.shape[0]
+    k = (xn @ L.wk.T).view(n, g.nkv, g.hd).transpose(0, 1)
+    v = (xn @ L.wv.T).view(n, g.nkv, g.vd).transpose(0, 1)
+    if cfg.vscale is not None:
+        v = v * cfg.vscale
+    cos, sin = rope_tables(g, pos, xn.dtype)
+    return apply_rope(k, cos, sin, g.rope), v
+
+
+def attend_kv(xn, qpos, K, V, kpos, L: LayerW, cfg: MimoCfg):
+    """Queries from normed rows xn [n, H] at qpos [n] over explicit keys
+    K/V at kpos (key visible iff kp <= qp and kp > qp - window) with the
+    layer's sinks -> o_proj output [n, H]. Same math as `attention` for any
+    key set, so a row can attend to rows computed in other passes."""
+    g = L.g
+    n = xn.shape[0]
+    q = (xn @ L.wq.T).view(n, g.nq, g.hd).transpose(0, 1)
+    cos, sin = rope_tables(g, qpos, xn.dtype)
+    q = apply_rope(q, cos, sin, g.rope)
+    rep = g.nq // g.nkv
+    Kr, Vr = K.repeat_interleave(rep, 0), V.repeat_interleave(rep, 0)
+    s = (q @ Kr.transpose(-1, -2)) * (g.hd ** -0.5)              # [nq, n, m]
+    ok = kpos[None, :] <= qpos[:, None]
+    if g.window is not None:
+        ok = ok & (kpos[None, :] > qpos[:, None] - g.window)
+    s = s.masked_fill(~ok[None], float("-inf"))
+    if L.sink is not None:
+        s = torch.cat([s, L.sink.view(g.nq, 1, 1).expand(g.nq, n, 1)], -1)
+    s = s - s.amax(-1, keepdim=True)
+    pr = torch.softmax(s, -1)
+    if L.sink is not None:
+        pr = pr[..., :-1]
+    o = (pr @ Vr).transpose(0, 1).reshape(n, g.nq * g.vd)
+    return o @ L.wo.T
+
+
+def mtp_rows(m: MtpLayer, x, qpos, ctxK, ctxV, ctxpos, cfg: MimoCfg):
+    """Fused MTP inputs x [n, H] (after eh_proj) at qpos, causal among
+    themselves and over a context of earlier K/V rows -> (pre-norm out,
+    post-final-norm out, own K, own V)."""
+    L = m.L
+    xn = rms(x, L.n_in, cfg.eps)
+    Kn, Vn = kv_rows(xn, L, qpos, cfg)
+    K = torch.cat([ctxK, Kn], 1) if ctxK is not None else Kn
+    V = torch.cat([ctxV, Vn], 1) if ctxV is not None else Vn
+    kpos = torch.cat([ctxpos, qpos]) if ctxpos is not None else qpos
+    h = x + attend_kv(xn, qpos, K, V, kpos, L, cfg)
+    h = h + mlp(rms(h, L.n_post, cfg.eps), L, cfg)
+    return h, rms(h, m.fnorm, cfg.eps), Kn, Vn
+
+
+# --------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------
 def load_cfg(src_dir):
@@ -642,6 +762,306 @@ def cmd_gen(a):
         ids.append(int(top2.indices[0]))
         print(f"{int(top2.indices[0])} margin {float(top2.values[0] - top2.values[1]):.4f} "
               f"{tk.decode(ids)!r}", flush=True)
+
+
+PAD_ID = 151643
+MTP_VARIANTS = ("A", "A_pre", "B_pre", "B_post", "C", "C_pre")
+MTP_VARIANT_DOC = {
+    "A": "layer k at round start t: (embed x[t+k+1], POST-norm backbone h[t]); each layer its own "
+         "KV cache at positions <= t (SGLang multi-layer MTP, MiMoV2MTP not in its chain list)",
+    "A_pre": "A with the PRE-final-norm backbone hidden (control)",
+    "B_pre": "DeepSeek-V3 chain: layer k at position t takes layer k-1's PRE-final-norm output at t",
+    "B_post": "chain with layer k-1's POST-final-norm output",
+    "C": "vLLM: layer 0 only, recursive: step s at position t+s with (x[t+s+1], its own "
+         "post-final-norm output of step s-1)",
+    "C_pre": "C with the pre-final-norm recursion (control)",
+}
+
+
+def load_seqs(path, src_dir):
+    """--seqs JSON: [{"name", "ids" | "text" | "text_file"+"tokens"[+"offset"],
+    optional "continuation" (ids appended), "eval_from"}]."""
+    tk = None
+    out = []
+    for s in json.load(open(path)):
+        if "ids" in s:
+            ids = [int(x) for x in s["ids"]]
+        else:
+            tk = tk or tokenizer(src_dir)
+            text = s["text"] if "text" in s else open(s["text_file"]).read()
+            ids = tk.encode(text, add_special_tokens=False).ids
+            off = s.get("offset", 0)
+            ids = ids[off:off + s["tokens"]] if "tokens" in s else ids[off:]
+        ids = ids + [int(x) for x in s.get("continuation", [])]
+        out.append({"name": s["name"], "ids": ids, "eval_from": int(s.get("eval_from", 0))})
+    return out
+
+
+def head_argmax(x, lm, chunk=64):
+    """Rows [n, H] (post-norm) -> (argmax [n], top1-top2 margin [n])."""
+    am, mg = [], []
+    for i in range(0, x.shape[0], chunk):
+        lg = x[i:i + chunk] @ lm.T
+        t2 = lg.topk(2, dim=-1)
+        am.append(t2.indices[:, 0])
+        mg.append(t2.values[:, 0] - t2.values[:, 1])
+    return torch.cat(am), torch.cat(mg)
+
+
+def mtp_main_pass(orc: Oracle, seqs, cache):
+    """Backbone pass over every sequence (right-padded into one batch: the
+    causal mask keeps real rows exact). Cached by ids."""
+    if cache and os.path.exists(cache):
+        c = torch.load(cache)
+        if c["ids"] == [s["ids"] for s in seqs]:
+            print(f"main pass: cached {cache}", flush=True)
+            return c
+        print("main pass: cache holds other ids, recomputing", flush=True)
+    S = max(len(s["ids"]) for s in seqs)
+    batch = torch.tensor([s["ids"] + [PAD_ID] * (S - len(s["ids"])) for s in seqs])
+    t0 = time.time()
+    picks = {}   # MoE layer -> routed experts [B, S, k]
+
+    def on_layer(li, hh, sub, p):
+        if p is not None:
+            picks[li] = p[0].view(batch.shape[0], S, -1).to(torch.int16).clone()
+
+    h = orc.forward(batch, on_layer=on_layer)
+    nw, lm = orc.head()
+    c = {"ids": [s["ids"] for s in seqs], "h": [], "m": [], "margin": [], "picks": []}
+    for b, s in enumerate(seqs):
+        hb = h[b, :len(s["ids"])].clone()
+        am, mg = head_argmax(rms(hb, nw, orc.cfg.eps), lm)
+        c["h"].append(hb)
+        c["m"].append(am)
+        c["margin"].append(mg)
+        c["picks"].append({li: pk[b, :len(s["ids"])] for li, pk in picks.items()})
+    print(f"main pass: {len(seqs)} x {S} positions in {time.time() - t0:.0f}s", flush=True)
+    if cache:
+        torch.save(c, cache)
+    return c
+
+
+def mtp_drafts(mtps, cfg, emb_w, nw, lm, ids, h, variant, K):
+    """Teacher-forced drafts D[k][t] (k < K) of one variant: the token the
+    round starting at t (backbone at t, pending x[t+1]) drafts for position
+    t+k+2. Positions whose inputs run past the sequence are -1."""
+    S = len(ids)
+    ids_t = torch.tensor(ids)
+    g_post = rms(h, nw, cfg.eps)
+    back = h if variant == "A_pre" else g_post
+    D = torch.full((K, S), -1, dtype=torch.long)
+    W = cfg.geom(cfg.first_swa()).window or S
+    if variant in ("A", "A_pre", "B_pre", "B_post"):
+        prev = None
+        for k in range(K):
+            n = S - k - 1
+            if n <= 0:
+                break
+            emb = emb_w[ids_t[k + 1:k + 1 + n]].to(h.dtype)
+            if variant.startswith("B") and k > 0:
+                hid = prev[:n]
+            else:
+                hid = back[:n]
+            y, yn = mtps[k].forward(emb[None], hid[None], torch.arange(n), cfg)
+            D[k, :n] = head_argmax(yn[0], lm)[0]
+            prev = y[0] if variant == "B_pre" else yn[0]
+        return D
+    # C / C_pre: layer 0 recursion, per round start t
+    m0 = mtps[0]
+    n = S - 1
+    x0 = m0.fuse(emb_w[ids_t[1:]].to(h.dtype), g_post[:n], cfg)
+    pos0 = torch.arange(n)
+    y0, yn0, K0, V0 = mtp_rows(m0, x0, pos0, None, None, None, cfg)
+    D[0, :n] = head_argmax(yn0, lm)[0]
+    for t in range(S - 2):
+        ctxK, ctxV, ctxpos = K0[:, :t + 1], V0[:, :t + 1], pos0[:t + 1]
+        lo = max(0, t + 1 - W)
+        ctxK, ctxV, ctxpos = ctxK[:, lo:], ctxV[:, lo:], ctxpos[lo:]
+        rec = (yn0 if variant == "C" else y0)[t]
+        for s in range(1, K):
+            if t + s + 1 >= S:
+                break
+            x = m0.fuse(emb_w[ids_t[t + s + 1:t + s + 2]].to(h.dtype), rec[None], cfg)
+            qp = torch.tensor([t + s])
+            y, yn, Kn, Vn = mtp_rows(m0, x, qp, ctxK, ctxV, ctxpos, cfg)
+            D[s, t] = head_argmax(yn, lm)[0][0]
+            ctxK, ctxV, ctxpos = torch.cat([ctxK, Kn], 1), torch.cat([ctxV, Vn], 1), torch.cat([ctxpos, qp])
+            rec = (yn if variant == "C" else y)[0]
+    return D
+
+
+def mtp_stats(D, ids, m, lo, K):
+    """Acceptance of a draft table against the backbone's own argmax m
+    (m[j] = argmax of the logits at j-1, i.e. the greedy token FOR j).
+    Round starts t in [lo, S-K-2]. `cons` = the teacher-forced inputs are
+    the backbone's greedy path, so the round is exactly what speculative
+    greedy decoding would do there."""
+    S = len(ids)
+    ids_t = torch.tensor(ids)
+    m_for = torch.full((S + 1,), -2, dtype=torch.long)
+    m_for[1:S + 1] = m            # m_for[j] = greedy token for position j
+    hi = S - K - 1
+    ts = list(range(max(lo, 0), hi))
+    out = {"rounds": len(ts)}
+    if not ts:
+        return out
+    acc = torch.zeros(len(ts), K, dtype=torch.bool)
+    marg = torch.zeros(len(ts), K, dtype=torch.bool)
+    cons = torch.zeros(len(ts), K, dtype=torch.bool)
+    for r, t in enumerate(ts):
+        ok, c = True, True
+        for k in range(K):
+            hit = int(D[k, t]) == int(m_for[t + k + 2])
+            marg[r, k] = hit
+            ok = ok and hit
+            acc[r, k] = ok
+            c = c and int(ids_t[t + k + 1]) == int(m_for[t + k + 1])
+            cons[r, k] = c
+    out["marginal"] = [float(marg[:, k].float().mean()) for k in range(K)]
+    out["chain"] = [float(acc[:, k].float().mean()) for k in range(K)]
+    out["conditional"] = [float(acc[:, 0].float().mean())] + [
+        float(acc[:, k].sum()) / max(1, int(acc[:, k - 1].sum())) for k in range(1, K)]
+    ex = cons[:, K - 1]
+    out["exact_rounds"] = int(ex.sum())
+    out["exact_chain"] = [float(acc[ex, k].float().mean()) if ex.any() else None for k in range(K)]
+    # greedy walk: rounds of depth K' from `lo` (exact where consistent)
+    walk = {}
+    for kk in range(1, K + 1):
+        t, steps, toks = ts[0], 0, 0
+        while t < hi:
+            r = t - ts[0]
+            a = 0
+            for k in range(kk):
+                if bool(acc[r, k]):
+                    a = k + 1
+                else:
+                    break
+            steps += 1
+            toks += a + 1
+            t += a + 1
+        walk[f"K{kk}"] = {"steps": steps, "tokens": toks, "tokens_per_step": toks / max(1, steps)}
+    out["walk"] = walk
+    return out
+
+
+def cmd_mtp(a):
+    cfg = load_cfg(a.src)
+    src = DirSource(a.src)
+    seqs = load_seqs(a.seqs, a.src)
+    orc = Oracle(src, cfg, full=a.full, swa=a.swa)
+    c = mtp_main_pass(orc, seqs, a.cache)
+    if a.main_only:
+        return
+    nw, lm = orc.head()
+    emb_w = src.get("model.embed_tokens.weight")
+    K = a.depth
+    mtps = [MtpLayer(src, cfg, k) for k in range(K)]
+    variants = a.variants.split(",")
+    tk = tokenizer(a.src)
+    report = {"variants": {v: MTP_VARIANT_DOC[v] for v in variants}, "depth": K, "seqs": {}}
+    rows_out = open(a.out + ".positions.jsonl", "w") if a.out else None
+    for si, s in enumerate(seqs):
+        ids, h, m = s["ids"], c["h"][si], c["m"][si]
+        lo = s["eval_from"]
+        cons_rate = float((torch.tensor(ids[lo + 1:]) == m[lo:len(ids) - 1]).float().mean()) \
+            if len(ids) > lo + 1 else None
+        rep = {"tokens": len(ids), "eval_from": lo, "greedy_consistency": cons_rate, "variants": {}}
+        # Expert union of a verify batch: w consecutive rows route to how
+        # many distinct experts per MoE layer (8 for one row). A K-draft
+        # round verifies w = K+1 rows; its expert bytes scale with this.
+        pk = c.get("picks", [None] * len(seqs))[si]
+        if pk:
+            union = {}
+            for w in range(1, K + 2):
+                tot, cnt = 0, 0
+                for li, p in pk.items():
+                    for t in range(lo, len(ids) - w + 1):
+                        tot += int(torch.unique(p[t:t + w].reshape(-1)).numel())
+                        cnt += 1
+                union[f"w{w}"] = tot / max(1, cnt)
+            rep["expert_union_per_layer"] = union
+            print(f"[{s['name']}] experts per MoE layer for a {K + 1}-row window: "
+                  + ", ".join(f"{k} {v:.2f}" for k, v in union.items()), flush=True)
+        tables = {}
+        for v in variants:
+            t0 = time.time()
+            D = mtp_drafts(mtps, cfg, emb_w, nw, lm, ids, h, v, K)
+            tables[v] = D
+            st = mtp_stats(D, ids, m, lo, K)
+            st["seconds"] = round(time.time() - t0, 1)
+            rep["variants"][v] = st
+            w = st.get("walk", {}).get(f"K{K}", {})
+            print(f"[{s['name']}] {v:6s} marginal {['%.3f' % x for x in st.get('marginal', [])]} "
+                  f"chain {['%.3f' % x for x in st.get('chain', [])]} "
+                  f"exact {['%.3f' % x if x is not None else '-' for x in st.get('exact_chain', [])]} "
+                  f"({st.get('exact_rounds')}/{st['rounds']} rounds) "
+                  f"walk K{K} {w.get('tokens_per_step', 0):.2f} tok/step", flush=True)
+        report["seqs"][s["name"]] = rep
+        if rows_out:
+            for t in range(lo, len(ids) - K - 1):
+                rows_out.write(json.dumps({
+                    "seq": s["name"], "t": t, "pending": ids[t + 1],
+                    "pending_text": tk.decode([ids[t + 1]]),
+                    "main_greedy": [int(m[t + k + 1]) for k in range(K)],
+                    "teacher": [ids[t + k + 2] for k in range(K)],
+                    "drafts": {v: [int(tables[v][k, t]) for k in range(K)] for v in variants},
+                }) + "\n")
+    if rows_out:
+        rows_out.close()
+        json.dump(report, open(a.out, "w"), indent=1)
+        print(f"wrote {a.out} and {a.out}.positions.jsonl")
+
+
+def cmd_mtpcheck(a):
+    """Self-check of the MTP helpers on a random tiny config: the explicit-KV
+    path (`mtp_rows`, used by the recursive variants) equals the causal
+    teacher-forced block (`MtpLayer.forward`), row by row, and the window
+    and sinks are live."""
+    torch.manual_seed(a.seed)
+    c = tiny_cfg(2, 4, False)
+    c["num_nextn_predict_layers"] = 2
+    cfg = MimoCfg(c)
+    H, g = cfg.H, cfg.geom(cfg.first_swa())
+    sd = {}
+    rows = g.nq * g.hd + g.nkv * (g.hd + g.vd)
+    for k in range(2):
+        p = f"model.mtp.layers.{k}."
+        sd[p + "self_attn.qkv_proj.weight"] = torch.randn(rows, H) / math.sqrt(H)
+        sd[p + "self_attn.o_proj.weight"] = torch.randn(H, g.nq * g.vd) / math.sqrt(g.nq * g.vd)
+        sd[p + "self_attn.attention_sink_bias"] = 0.5 + torch.randn(g.nq)
+        sd[p + "eh_proj.weight"] = torch.randn(H, 2 * H) / math.sqrt(2 * H)
+        for n in ("enorm", "hnorm", "final_layernorm", "input_layernorm", "pre_mlp_layernorm"):
+            sd[p + f"{n}.weight"] = 1.0 + 0.2 * torch.randn(H)
+        I = c["intermediate_size"]
+        sd[p + "mlp.gate_proj.weight"] = torch.randn(I, H) / math.sqrt(H)
+        sd[p + "mlp.up_proj.weight"] = torch.randn(I, H) / math.sqrt(H)
+        sd[p + "mlp.down_proj.weight"] = torch.randn(H, I) / math.sqrt(I)
+    src = DictSource(sd)
+    m = MtpLayer(src, cfg, 1)
+    S = 3 * (g.window or 8)
+    emb, hid = torch.randn(1, S, H), torch.randn(1, S, H)
+    y, yn = m.forward(emb, hid, torch.arange(S), cfg)
+    x = m.fuse(emb[0], hid[0], cfg)
+    worst = 0.0
+    K = V = P = None
+    for t in range(S):
+        yt, ynt, Kn, Vn = mtp_rows(m, x[t:t + 1], torch.tensor([t]), K, V, P, cfg)
+        worst = max(worst, float((ynt[0] - yn[0, t]).abs().max()))
+        K = Kn if K is None else torch.cat([K, Kn], 1)
+        V = Vn if V is None else torch.cat([V, Vn], 1)
+        P = torch.tensor([t]) if P is None else torch.cat([P, torch.tensor([t])])
+    # all rows at once through the explicit path too
+    ya, yna, _, _ = mtp_rows(m, x, torch.arange(S), None, None, None, cfg)
+    worst = max(worst, float((yna - yn[0]).abs().max()))
+    # sensitivity: sinks and window change the output
+    m.L.sink = None
+    _, yn_ns = m.forward(emb, hid, torch.arange(S), cfg)
+    d_sink = float((yn_ns - yn).abs().max())
+    ok = worst < a.tol and d_sink > 100 * a.tol
+    print(f"MTPCHECK {'PASS' if ok else 'FAIL'}: explicit-KV vs causal block max|d| {worst:.3e} "
+          f"(tol {a.tol:g}); no-sink change {d_sink:.3e}")
+    sys.exit(0 if ok else 1)
 
 
 def segment_scale_rows(cfg: MimoCfg, li: int, block=FP8_BLOCK):
@@ -913,6 +1333,18 @@ def main(argv=None):
     p.add_argument("--n", type=int, default=16)
     p = sp.add_parser("tiles")
     common(p)
+    p = sp.add_parser("mtp", help="MTP draft acceptance vs the backbone's greedy (teacher-forced)")
+    common(p)
+    p.add_argument("--seqs", required=True, help="JSON list of sequences (see load_seqs)")
+    p.add_argument("--cache", help="torch file caching the backbone pass (ids-keyed)")
+    p.add_argument("--out", help="report JSON (+ .positions.jsonl with per-position drafts)")
+    p.add_argument("--depth", type=int, default=3)
+    p.add_argument("--variants", default=",".join(MTP_VARIANTS))
+    p.add_argument("--main-only", action="store_true", help="only run and cache the backbone pass")
+    p = sp.add_parser("mtpcheck")
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--tol", type=float, default=1e-5)
+    p.add_argument("--threads", type=int, default=8)
     p = sp.add_parser("pt2raw")
     p.add_argument("--in", dest="inp", required=True)
     p.add_argument("--out", required=True)
@@ -932,7 +1364,8 @@ def main(argv=None):
         if getattr(a, attr, None) == "shard4":
             setattr(a, attr, "chunked")
     {"ppl": cmd_ppl, "dump": cmd_dump, "gen": cmd_gen, "pt2raw": cmd_pt2raw,
-     "selfcheck": cmd_selfcheck, "tiles": cmd_tiles}[a.cmd](a)
+     "selfcheck": cmd_selfcheck, "tiles": cmd_tiles, "mtp": cmd_mtp,
+     "mtpcheck": cmd_mtpcheck}[a.cmd](a)
 
 
 if __name__ == "__main__":

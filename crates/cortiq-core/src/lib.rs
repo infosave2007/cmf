@@ -10,7 +10,7 @@ pub mod quant;
 pub mod types;
 
 pub use format::{
-    build_sparse_index, CmfError, CmfHeader, CmfModel, SelectionDescriptor, SkillRecord,
+    build_sparse_index, mtp_sidecar_path, CmfError, CmfHeader, CmfModel, SelectionDescriptor, SkillRecord,
     SparseIndexEntry, TensorEntry, TensorSpec, TensorSpecRef, CMF_MAGIC, CMF_VERSION,
 };
 pub use hash::hash64;
