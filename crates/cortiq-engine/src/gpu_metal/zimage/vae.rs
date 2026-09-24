@@ -443,6 +443,49 @@ fn resnet(r: &mut VRec, b: &Bufs, rs: &VRes, n: usize, hw: (usize, usize)) {
     r.conv(&rs.c2, (&b.hh, 0), (&b.xa, 0), Some((&b.xa, 0)), n, hw, false, 0, rs.cout, 0, 0);
 }
 
+/// The f16-plane arm of the codec A/B (plan M5c): the same 64×64×32 tile
+/// with half weights (`zv_conv`, plain mode) on y[n, rows] = x[n, k]·Wᵀ.
+/// Returns (min ms, median ms) of GPU time.
+pub(crate) fn bench_plane(rows: usize, k: usize, n: usize, reps: usize) -> Option<(f64, f64)> {
+    let c = super::super::ctx()?;
+    let p = pipes(c)?;
+    let w: Vec<u16> = (0..rows * k).map(|i| cortiq_core::quant::f32_to_f16(((i * 7) % 255) as f32 - 127.0)).collect();
+    let x: Vec<u16> = (0..(n.div_ceil(64) * 64 + 64) * k).map(|i| cortiq_core::quant::f32_to_f16(((i * 5) % 17) as f32 * 0.01)).collect();
+    let wb = c._device.new_buffer_with_data(w.as_ptr() as *const c_void, (w.len() * 2) as u64, MTLResourceOptions::StorageModeShared);
+    let xb = c._device.new_buffer_with_data(x.as_ptr() as *const c_void, (x.len() * 2) as u64, MTLResourceOptions::StorageModeShared);
+    let yb = buf_zeroed(c, n * rows * 4);
+    let pv = PVc {
+        n: n as u32,
+        rows: rows as u32,
+        k: k as u32,
+        ic: k as u32,
+        ldy: rows as u32,
+        mul: 1.0,
+        ldx: k as u32,
+        ..Default::default()
+    };
+    let mut t = Vec::new();
+    for _ in 0..reps + 1 {
+        let cmd = c.queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&p.vconv);
+        enc.set_buffer(0, Some(&wb), 0);
+        enc.set_buffer(1, Some(&yb), 0);
+        enc.set_buffer(2, Some(&xb), 0);
+        enc.set_buffer(3, Some(&yb), 0);
+        enc.set_buffer(4, Some(&yb), 0);
+        set_p(enc, 5, &pv);
+        enc.dispatch_thread_groups(MTLSize::new(n.div_ceil(64) as u64, (rows / 64) as u64, 1), MTLSize::new(128, 1, 1));
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+        t.push(super::super::cmd_gpu_ms(cmd));
+    }
+    t.remove(0);
+    t.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    Some((t[0], t[t.len() / 2]))
+}
+
 /// Resident Flux-VAE decoder; `z` is already de-normalised, [lc, h, w];
 /// `out` [3, 8h, 8w].
 pub(crate) fn decode(a: &VaeChainArgs, z: &[f32], h: usize, w: usize, out: &mut [f32]) -> bool {
