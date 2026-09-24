@@ -1710,19 +1710,18 @@ pub fn graph_state_resident(_kv_id: u64, _layer: usize) -> bool {
     false
 }
 
-/// Copy rows `[from..to)` of the wgpu token graph's K/V mirror back to the
-/// host, position-major (`[(to − from) × nkv × hd]` each for K and V).
+/// Copy rows back from the wgpu token graph's K/V mirrors in one submit:
+/// for each `(layer, from, to)` the K and V rows `[from..to)`, position-major
+/// (`[(to − from) × nkv × hd]` each).
 pub fn graph_kv_read_rows(
     _kv_id: u64,
-    _layer: usize,
-    _from: usize,
-    _to: usize,
+    _reqs: &[(usize, usize, usize)],
     _nkv: usize,
     _hd: usize,
-) -> Option<(Vec<f32>, Vec<f32>)> {
+) -> Option<Vec<(Vec<f32>, Vec<f32>)>> {
     #[cfg(feature = "gpu")]
     if backend() == Backend::Wgpu {
-        return crate::gpu_wgpu::kv_mirror_read_rows(_kv_id, _layer, _from, _to, _nkv, _hd);
+        return crate::gpu_wgpu::kv_mirror_read_rows(_kv_id, _reqs, _nkv, _hd);
     }
     None
 }

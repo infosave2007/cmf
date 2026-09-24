@@ -1220,14 +1220,22 @@ impl Pipeline {
             ReusePlan::Fresh => return false,
             ReusePlan::Ready => {}
             ReusePlan::Pull(pulls) => {
-                for (li, from, to) in pulls {
-                    let cache = &self.kv_cache.layers[li];
-                    let (nkv, hd) = (cache.num_kv_heads, cache.head_dim);
-                    let Some((k, v)) =
-                        crate::gpu::graph_kv_read_rows(kv_id, li, from, to, nkv, hd)
-                    else {
-                        return false;
-                    };
+                // The graph's mirrors share one geometry (it declines a
+                // model whose layers differ), so one batched read serves all.
+                let (nkv, hd) = {
+                    let c = &self.kv_cache.layers[pulls[0].0];
+                    (c.num_kv_heads, c.head_dim)
+                };
+                if pulls.iter().any(|&(li, _, _)| {
+                    let c = &self.kv_cache.layers[li];
+                    (c.num_kv_heads, c.head_dim) != (nkv, hd)
+                }) {
+                    return false;
+                }
+                let Some(rows) = crate::gpu::graph_kv_read_rows(kv_id, &pulls, nkv, hd) else {
+                    return false;
+                };
+                for ((li, from, to), (k, v)) in pulls.into_iter().zip(rows) {
                     let cache = &mut self.kv_cache.layers[li];
                     let row = nkv * hd;
                     for p in 0..to - from {
