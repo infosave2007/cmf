@@ -16701,7 +16701,9 @@ mod tests {
             "no attention decline logged: {:?}",
             p.graph_declines()
         );
-        assert!(!p.graph_prefill_preferred());
+        // (No assertion on graph_prefill_preferred: with no attention
+        // decline it follows the device — a test process that brought a
+        // wgpu adapter up routes this resident MoE through the graph.)
 
         let plain = || create_test_pipeline(8, 16, 2, 1, 4, 2, 32);
         assert_eq!(plain().graph_attn_decline_reason(), None);

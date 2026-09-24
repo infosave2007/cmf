@@ -16,11 +16,14 @@
 #   batch    batched prefill graph (k=32 chunks) + token-graph decode, COOP=0
 #   prefix   a VRAM budget that holds only part of the stack: the batch and
 #            token graphs run a device prefix, the host finishes each token
+#   split    a budget that holds the layers but not the lm_head: the batched
+#            prefill runs every layer, decode a prefix one layer shorter —
+#            the host pulls that layer's prompt rows from the device mirror
 #   coop     batch with the tf32-class coop GEMMs allowed (reported only)
 #   default  no flags at all (int8 host activations, coop): reported only
 # Each arm is compared step by step with tools/logit_steps_cmp.py; the
 # gate needs top-1 equal at every step and max|d|/max|logit| < 1e-3 on
-# tok/batch/prefix. GPU runs take /root/gpu.lock when it exists.
+# tok/batch/prefix/split. GPU runs take /root/gpu.lock when it exists.
 set -u
 TOY=${TOY:-/root/mimo/toy}
 OUT=${OUT:-$TOY/gpu_gate}
@@ -56,12 +59,13 @@ for f in pos_q4tp pos_f16x; do
   run "$f.tok" "$F" CMF_SDOT=0 CMF_BATCH_K=0 CMF_COOP=0
   run "$f.batch" "$F" CMF_SDOT=0 CMF_COOP=0
   run "$f.prefix" "$F" CMF_SDOT=0 CMF_COOP=0 CMF_GPU_VRAM_MB="${PREFIX_MB:-1}"
+  run "$f.split" "$F" CMF_SDOT=0 CMF_COOP=0 CMF_GPU_VRAM_MB="${SPLIT_MB:-20}"
   run "$f.coop" "$F" CMF_SDOT=0
   run "$f.default" "$F"
-  for arm in tok batch prefix; do cmp "$f.cpu" "$f.$arm" 1e-3 || fail=1; done
+  for arm in tok batch prefix split; do cmp "$f.cpu" "$f.$arm" 1e-3 || fail=1; done
   cmp "$f.cpu" "$f.coop" 1e-2 || true
   cmp "$f.cpu" "$f.default" 1e-2 || true
-  for arm in tok batch prefix coop default; do
+  for arm in tok batch prefix split coop default; do
     grep -ah "declined\|refused\|device prefix\|batch-prefix\|batched prefill\|whole-token graph" "$OUT/$f.$arm.log" \
       | sed 's/\x1b\[[0-9;]*m//g' | sed 's/^.*\(INFO\|WARN\|ERROR\) //' | sort -u | sed "s/^/  [$arm] /" | head -8
   done
