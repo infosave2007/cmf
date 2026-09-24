@@ -513,9 +513,9 @@ impl Bank {
             admitted: 0,
             max_pending: env("CMF_MIMO_FILL_QUEUE").unwrap_or(256) as usize,
             prime_queue: env("CMF_MIMO_PRIME_QUEUE").unwrap_or(4096) as usize,
-            min_seen: env("CMF_MIMO_FETCH_MIN_SEEN").unwrap_or(default_min_seen(
-                capacity / moe_layers.max(1),
-            )) as u16,
+            min_seen: env("CMF_MIMO_FETCH_MIN_SEEN")
+                .unwrap_or(default_min_seen(capacity / moe_layers.max(1)))
+                as u16,
             decay_tokens: env("CMF_MIMO_SEEN_DECAY").unwrap_or(16).max(1),
             tx: Some(tx),
             done,
@@ -835,6 +835,16 @@ impl Slot {
         }
     }
 
+    /// First bank-owned layer. Graph builders must stop before it even
+    /// when the generic capacity heuristic would admit more layers.
+    pub(crate) fn graph_prefix_end(&self) -> Option<usize> {
+        match self {
+            #[cfg(feature = "gpu")]
+            Self::On(d) => Some(d.dyn_from),
+            _ => None,
+        }
+    }
+
     /// Does layer `li` run its experts through the bank? `host_tail` = the
     /// walk reached this layer after a device graph prefix handed it over:
     /// with a bank present every such MoE layer takes the bank (a whole-layer
@@ -1090,6 +1100,35 @@ impl Slot {
         self.forward_bank(li, m, x, route, pool)
     }
 
+    /// Verify a short block against one stable snapshot of the bank. The
+    /// union route is pinned before any admission, so filling a later row
+    /// cannot overwrite a slot used by an earlier row in the same submit.
+    pub(crate) fn forward_rows(
+        &mut self,
+        li: usize,
+        m: &MoeFfn,
+        xs: &[f32],
+        routes: &[MoeRoute],
+        pool: Option<&Pool>,
+    ) -> Option<Vec<f32>> {
+        #[cfg(feature = "gpu")]
+        {
+            let Self::On(d) = self else { return None };
+            if d.failed || d.fast == Some(false) {
+                return None;
+            }
+            let t0 = std::time::Instant::now();
+            let out = d.run_rows(li, m, xs, routes, pool);
+            STATS.lock().unwrap().call_ns += t0.elapsed().as_nanos() as u64;
+            out
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            let _ = (li, m, xs, routes, pool);
+            None
+        }
+    }
+
     #[cfg(feature = "gpu")]
     fn forward_bank(
         &mut self,
@@ -1153,6 +1192,107 @@ impl Slot {
 
 #[cfg(feature = "gpu")]
 impl Dynamic {
+    fn run_rows(
+        &mut self,
+        li: usize,
+        m: &MoeFfn,
+        xs: &[f32],
+        routes: &[MoeRoute],
+        pool: Option<&Pool>,
+    ) -> Option<Vec<f32>> {
+        let rows = routes.len();
+        let top_k = routes.first()?.idx.len();
+        let hidden = m.experts.first()?.gate_proj.cols();
+        let inter = m.experts[0].gate_proj.rows();
+        if rows > 4
+            || top_k == 0
+            || xs.len() != rows * hidden
+            || routes
+                .iter()
+                .any(|r| r.idx.len() != top_k || r.logits.len() != m.experts.len())
+            || std::env::var("CMF_MIMO_BANK_KERNEL").as_deref() == Ok("generic")
+        {
+            return None;
+        }
+        let triples = self.ids.get(li).filter(|t| t.len() == m.experts.len())?;
+        let mut union = Vec::new();
+        for r in routes {
+            for &e in &r.idx {
+                if e >= triples.len() {
+                    return None;
+                }
+                if !union.contains(&e) {
+                    union.push(e);
+                }
+            }
+        }
+        let mut bank = self.bank.lock().unwrap();
+        if li == self.first_moe {
+            bank.next_token();
+        }
+        let admitted0 = bank.admitted;
+        let remap = bank.resolve(li, &union, triples)?;
+        let mut sel = Vec::with_capacity(rows * top_k);
+        let mut wt = Vec::with_capacity(rows * top_k);
+        let mut cold_jobs = Vec::with_capacity(rows);
+        for r in routes {
+            let mut jobs = Vec::new();
+            for &e in &r.idx {
+                let w = r.p[e] / r.wsum;
+                sel.push(remap[e]);
+                wt.push(w);
+                if remap[e] == u32::MAX {
+                    jobs.push((&m.experts[e], w));
+                }
+            }
+            cold_jobs.push(jobs);
+        }
+        let cold = sel.iter().filter(|&&s| s == u32::MAX).count();
+        let host_rows = || {
+            crate::gpu::cpu_scope(|| {
+                crate::pipeline::moe_cold_experts_rows_cpu(&cold_jobs, xs, hidden, pool)
+            })
+        };
+        let t_frame = std::time::Instant::now();
+        let mut out = vec![0.0; xs.len()];
+        if cold == sel.len() {
+            out = host_rows();
+        } else {
+            let (ok, host) = std::thread::scope(|scope| {
+                let host = (cold > 0).then(|| scope.spawn(host_rows));
+                let ok = crate::gpu_wgpu::mimo_bank::mimo_bank_rows(
+                    &self.model,
+                    xs,
+                    &sel,
+                    &wt,
+                    inter,
+                    rows,
+                    &mut out,
+                );
+                (
+                    ok,
+                    host.map(|h| h.join().expect("MiMo cold-expert worker panicked")),
+                )
+            });
+            if !ok {
+                return None;
+            }
+            if let Some(host) = host {
+                for (o, h) in out.iter_mut().zip(host) {
+                    *o += h;
+                }
+            }
+        }
+        let mut st = STATS.lock().unwrap();
+        st.calls += 1;
+        st.picks += sel.len() as u64;
+        st.hits += (sel.len() - cold) as u64;
+        st.cold += cold as u64;
+        st.fills += bank.admitted - admitted0;
+        st.frame_ns += t_frame.elapsed().as_nanos() as u64;
+        Some(out)
+    }
+
     fn run(
         &mut self,
         li: usize,
@@ -1406,7 +1546,12 @@ mod tests {
                 graph.bank_slots,
                 graph.predicted_s * 1e3,
             );
-            assert_eq!(no_graph.mode, MoeMode::Dynamic, "{mb} MB: {}", no_graph.reason);
+            assert_eq!(
+                no_graph.mode,
+                MoeMode::Dynamic,
+                "{mb} MB: {}",
+                no_graph.reason
+            );
             assert!(graph.predicted_s <= no_graph.predicted_s + 1e-12);
         }
     }
@@ -1877,6 +2022,93 @@ mod bank_tests {
         );
         drop(p);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cold_batch_rows_equal_single_token_kernels() {
+        let (dir, model, _) = write_model("cold-rows");
+        let p = Pipeline::from_model(&model, SamplerConfig::default()).unwrap();
+        let (_, m) = moe_layers(&p)[0];
+        let xs: Vec<f32> = (0..4 * HS).map(|i| (i as f32 * 0.17).sin()).collect();
+        let jobs = vec![
+            vec![(&m.experts[0], 0.3), (&m.experts[1], 0.7)],
+            vec![],
+            vec![(&m.experts[1], 0.2), (&m.experts[0], 0.8)],
+            vec![(&m.experts[0], 1.0)],
+        ];
+        crate::gpu::cpu_scope(|| {
+            let batch = crate::pipeline::moe_cold_experts_rows_cpu(&jobs, &xs, HS, None);
+            for (r, jobs) in jobs.iter().enumerate() {
+                let one =
+                    crate::pipeline::moe_cold_experts_cpu(jobs, &xs[r * HS..(r + 1) * HS], None);
+                assert_eq!(batch[r * HS..(r + 1) * HS], one, "cold row {r}");
+            }
+        });
+        drop(p);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn bank_batch_frame_equals_single_token_frames() {
+        let _g = serial();
+        if !bank_ready() {
+            return;
+        }
+        let (dir, model, _) = write_model("batch-frames");
+        let p = Pipeline::from_model(&model, SamplerConfig::default()).unwrap();
+        let mut slot = bank(&p);
+        assert_eq!(slot.graph_prefix_end(), Some(1));
+        let Slot::On(d) = &mut slot else {
+            panic!("bank unavailable")
+        };
+        let bank_arc = d.bank.clone();
+        {
+            let mut b = bank_arc.lock().unwrap();
+            b.next_token();
+            b.resolve(1, &[0, 1, 2, 3], &d.ids[1]).unwrap();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let mut b = bank_arc.lock().unwrap();
+            b.drain();
+            if b.pending() == 0 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "bank fills timed out");
+            drop(b);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let mut b = bank_arc.lock().unwrap();
+        let remap = b.resolve(1, &[0, 1, 2, 3], &d.ids[1]).unwrap();
+        assert!((0..4).all(|e| remap[e] != u32::MAX));
+        for rows in 1..=4 {
+            let xs: Vec<f32> = (0..rows * HS).map(|i| (i as f32 * 0.13).cos()).collect();
+            let sel: Vec<u32> = (0..rows * TOPK)
+                .map(|i| if i % 5 == 0 { u32::MAX } else { remap[i % 4] })
+                .collect();
+            let wt: Vec<f32> = (0..sel.len())
+                .map(|i| 0.1 + 0.03 * (i % 4) as f32)
+                .collect();
+            let mut batch = vec![0.0; xs.len()];
+            assert!(crate::gpu_wgpu::mimo_bank::mimo_bank_rows(
+                &model, &xs, &sel, &wt, INTER, rows, &mut batch
+            ));
+            for row in 0..rows {
+                let mut one = vec![0.0; HS];
+                assert!(crate::gpu_wgpu::mimo_bank::mimo_bank_frame(
+                    &model,
+                    &xs[row * HS..(row + 1) * HS],
+                    &sel[row * TOPK..(row + 1) * TOPK],
+                    &wt[row * TOPK..(row + 1) * TOPK],
+                    INTER,
+                    &mut one
+                ));
+                assert_eq!(batch[row * HS..(row + 1) * HS], one, "GPU row {row}/{rows}");
+            }
+        }
+        drop(b);
+        drop(p);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// Model level: greedy decode of a prompt through the bank equals the

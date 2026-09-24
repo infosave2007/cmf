@@ -77,7 +77,8 @@ fn gu_ub(seg: u32, b: u32) -> u32 { return (gu_uw(seg, b >> 2u) >> ((b & 3u) * 8
 @compute @workgroup_size(256)
 fn mimo_bank_gate_up(@builtin(workgroup_id) wid: vec3<u32>,
                      @builtin(local_invocation_index) lid: u32) {
-    let slot = wid.y;
+    let token = wid.z;
+    let slot = token * mb_p.slots + wid.y;
     let flat = gu_sel[slot];
     let live = flat != 0xFFFFFFFFu;
     var seg = 0u;
@@ -130,7 +131,7 @@ fn mimo_bank_gate_up(@builtin(workgroup_id) wid: vec3<u32>,
             }
             let vg = gu_g[seg].v[wrow + g];
             let vu = gu_u[seg].v[wrow + g];
-            let xq = g * 8u;
+            let xq = token * (mb_p.hidden / 4u) + g * 8u;
             let x0 = gu_x[xq];      let x1 = gu_x[xq + 1u];
             let x2 = gu_x[xq + 2u]; let x3 = gu_x[xq + 3u];
             let x4 = gu_x[xq + 4u]; let x5 = gu_x[xq + 5u];
@@ -185,6 +186,7 @@ fn dn_db(seg: u32, b: u32) -> u32 { return (dn_dw(seg, b >> 2u) >> ((b & 3u) * 8
 @compute @workgroup_size(256)
 fn mimo_bank_down(@builtin(workgroup_id) wid: vec3<u32>,
                   @builtin(local_invocation_index) lid: u32) {
+    let token = wid.y;
     let sub = lid >> 6u;
     let l = lid & 63u;
     let row = wid.x * 4u + sub;
@@ -198,8 +200,9 @@ fn mimo_bank_down(@builtin(workgroup_id) wid: vec3<u32>,
         var i = l;
         loop {
             if (i >= total) { break; }
-            let slot = i / gpr;
-            let g = i - slot * gpr;
+            let local_slot = i / gpr;
+            let g = i - local_slot * gpr;
+            let slot = token * mb_p.slots + local_slot;
             let flat = dn_sel[slot];
             let w = dn_wt[slot];
             if (flat != 0xFFFFFFFFu && w != 0.0) {
@@ -236,7 +239,7 @@ fn mimo_bank_down(@builtin(workgroup_id) wid: vec3<u32>,
         workgroupBarrier();
         stride = stride >> 1u;
     }
-    if (l == 0u && row < rows) { dn_out[row] = dn_pt[sub << 6u]; }
+    if (l == 0u && row < rows) { dn_out[token * mb_p.hidden + row] = dn_pt[sub << 6u]; }
 }
 "#;
 
@@ -353,6 +356,7 @@ struct State {
     hidden: usize,
     inter: usize,
     slots: usize,
+    rows: usize,
 }
 
 static STATES: Mutex<Vec<(u64, Arc<State>)>> = Mutex::new(Vec::new());
@@ -363,9 +367,13 @@ fn state(
     hidden: usize,
     inter: usize,
     slots: usize,
+    rows: usize,
 ) -> Option<Arc<State>> {
     let mut cache = STATES.lock().unwrap();
-    if let Some((_, s)) = cache.iter().find(|(u, _)| *u == model.uid()) {
+    if let Some((_, s)) = cache
+        .iter()
+        .find(|(u, s)| *u == model.uid() && s.rows == rows)
+    {
         return (s.hidden == hidden && s.inter == inter && s.slots == slots).then(|| s.clone());
     }
     let bank = c
@@ -383,6 +391,8 @@ fn state(
         || inter % 32 != 0
         || slots == 0
         || slots > 64
+        || rows == 0
+        || rows > 4
     {
         return None;
     }
@@ -403,22 +413,22 @@ fn state(
         })
     };
     let st = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
-    let x = mk("mimo-bank-x", hidden * 4, st);
-    let sel = mk("mimo-bank-sel", slots * 4, st);
-    let wt = mk("mimo-bank-wt", slots * 4, st);
+    let x = mk("mimo-bank-x", rows * hidden * 4, st);
+    let sel = mk("mimo-bank-sel", rows * slots * 4, st);
+    let wt = mk("mimo-bank-wt", rows * slots * 4, st);
     let act = mk(
         "mimo-bank-act",
-        slots * inter * 4,
+        rows * slots * inter * 4,
         wgpu::BufferUsages::STORAGE,
     );
     let out = mk(
         "mimo-bank-out",
-        hidden * 4,
+        rows * hidden * 4,
         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
     );
     let stage = mk(
         "mimo-bank-stage",
-        hidden * 4,
+        rows * hidden * 4,
         wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
     );
     let params = mk(
@@ -498,6 +508,7 @@ fn state(
         hidden,
         inter,
         slots,
+        rows,
     });
     cache.push((model.uid(), s.clone()));
     Some(s)
@@ -505,7 +516,7 @@ fn state(
 
 /// Whether the dedicated kernels serve this model's bank.
 pub fn mimo_bank_ready(model: &Arc<CmfModel>, hidden: usize, inter: usize, slots: usize) -> bool {
-    super::ctx().is_some_and(|c| state(c, model, hidden, inter, slots).is_some())
+    super::ctx().is_some_and(|c| state(c, model, hidden, inter, slots, 1).is_some())
 }
 
 /// Σ over `sel`'s resident slots of `wt[s]·down(silu(gate·x)⊙up·x)` into
@@ -519,12 +530,32 @@ pub fn mimo_bank_frame(
     inter: usize,
     out: &mut [f32],
 ) -> bool {
+    mimo_bank_rows(model, x, sel, wt, inter, 1, out)
+}
+
+/// K independent token routes in two dispatches and one readback. Token
+/// indexing is outside every reduction, so each row uses the same f32
+/// arithmetic as `mimo_bank_frame`, even when several rows pick one expert.
+/// The caller holds the bank lock, pinning the UNION of all selected slots.
+pub fn mimo_bank_rows(
+    model: &Arc<CmfModel>,
+    x: &[f32],
+    sel: &[u32],
+    wt: &[f32],
+    inter: usize,
+    rows: usize,
+    out: &mut [f32],
+) -> bool {
     let Some(c) = super::ctx() else { return false };
-    let hidden = x.len();
-    if sel.len() != wt.len() || out.len() < hidden {
+    if rows == 0 || rows > 4 || x.len() % rows != 0 || sel.len() % rows != 0 {
         return false;
     }
-    let Some(s) = state(c, model, hidden, inter, sel.len()) else {
+    let hidden = x.len() / rows;
+    let slots = sel.len() / rows;
+    if sel.len() != wt.len() || out.len() < x.len() {
+        return false;
+    }
+    let Some(s) = state(c, model, hidden, inter, slots, rows) else {
         return false;
     };
     c.queue.write_buffer(&s.x, 0, bytemuck::cast_slice(x));
@@ -543,13 +574,13 @@ pub fn mimo_bank_frame(
         pass.set_pipeline(&s.pipes.gu);
         pass.set_bind_group(0, &s.bg_gu, &[]);
         pass.set_bind_group(1, &s.bg_p, &[]);
-        pass.dispatch_workgroups(inter.div_ceil(4) as u32, sel.len() as u32, 1);
+        pass.dispatch_workgroups(inter.div_ceil(4) as u32, slots as u32, rows as u32);
         pass.set_pipeline(&s.pipes.dn);
         pass.set_bind_group(0, &s.bg_dn, &[]);
         pass.set_bind_group(1, &s.bg_pd, &[]);
-        pass.dispatch_workgroups(hidden.div_ceil(4) as u32, 1, 1);
+        pass.dispatch_workgroups(hidden.div_ceil(4) as u32, rows as u32, 1);
     }
-    let bytes = (hidden * 4) as u64;
+    let bytes = (x.len() * 4) as u64;
     enc.copy_buffer_to_buffer(&s.out, 0, &s.stage, 0, bytes);
     super::submit(c, enc.finish());
     let slice = s.stage.slice(..bytes);
@@ -565,7 +596,7 @@ pub fn mimo_bank_frame(
     }
     let ok = match slice.get_mapped_range() {
         Ok(data) => {
-            out[..hidden].copy_from_slice(bytemuck::cast_slice(&data[..hidden * 4]));
+            out[..x.len()].copy_from_slice(bytemuck::cast_slice(&data[..x.len() * 4]));
             true
         }
         Err(_) => false,
