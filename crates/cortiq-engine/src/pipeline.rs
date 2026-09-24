@@ -15143,7 +15143,9 @@ fn moe_ffn_banked(
     x: &[f32],
     pool: Option<&Pool>,
 ) -> Vec<f32> {
+    let t0 = std::time::Instant::now();
     let r = moe_ffn_route(m, x, pool, None);
+    slot.note_route(t0.elapsed().as_nanos() as u64);
     match slot.forward(li, m, x, &r, pool) {
         Some(out) => out,
         None => moe_ffn_experts(m, x, &r, pool),
