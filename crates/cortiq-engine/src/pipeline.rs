@@ -8589,7 +8589,10 @@ impl Pipeline {
         if self.kv_heads_per_layer.is_some() {
             for li in 0..self.kv_cache.layers.len() {
                 let full = matches!(
-                    self.weights.layers.get(self.phys_layer(li)).map(|lw| &lw.attn),
+                    self.weights
+                        .layers
+                        .get(self.phys_layer(li))
+                        .map(|lw| &lw.attn),
                     Some(AttnKind::Full { .. })
                 );
                 let nkv = self.layer_num_kv_heads(li);
@@ -12359,9 +12362,8 @@ impl Pipeline {
                     // one submit, device K/V mirror. q1 only, no gate/bias/mask.
                     // Its kernel has no window, sink or narrow-V slot and
                     // one mirror geometry: such models stay on the CPU attend.
-                    let dropin_reason = graph_on
-                        .then(|| self.graph_attn_decline_reason())
-                        .flatten();
+                    let dropin_reason =
+                        graph_on.then(|| self.graph_attn_decline_reason()).flatten();
                     if let Some(reason) = dropin_reason {
                         self.note_graph_decline("wgpu attn dropin", reason);
                     }
@@ -16220,7 +16222,11 @@ mod tests {
         let hb = p.prefill_batch_span(PrefillIn::Ids(&ids), 0, None, 0, p.num_layers);
         for pos in 0..ids.len() {
             let lg = p.logits_from_hidden(&hb[pos * hs..(pos + 1) * hs]);
-            assert_eq!(f32_bits(&decode[pos]), f32_bits(&lg), "whole prompt, pos {pos}");
+            assert_eq!(
+                f32_bits(&decode[pos]),
+                f32_bits(&lg),
+                "whole prompt, pos {pos}"
+            );
         }
 
         p.clear_sequence_state();
@@ -16233,7 +16239,11 @@ mod tests {
                 &b[(pos - 5) * hs..(pos - 4) * hs]
             };
             let lg = p.logits_from_hidden(row);
-            assert_eq!(f32_bits(&decode[pos]), f32_bits(&lg), "two chunks, pos {pos}");
+            assert_eq!(
+                f32_bits(&decode[pos]),
+                f32_bits(&lg),
+                "two chunks, pos {pos}"
+            );
         }
 
         // The fixture is not degenerate: the sinks and the window each
@@ -16248,10 +16258,18 @@ mod tests {
         for l in &mut no_sinks.kv_cache.layers {
             l.sinks = None;
         }
-        assert_ne!(f32_bits(&last(&mut no_sinks)), f32_bits(&base), "sinks are live");
+        assert_ne!(
+            f32_bits(&last(&mut no_sinks)),
+            f32_bits(&base),
+            "sinks are live"
+        );
         let mut wide = mimo_test_pipeline();
         wide.swa = Some((64, usize::MAX));
-        assert_ne!(f32_bits(&last(&mut wide)), f32_bits(&base), "window is live");
+        assert_ne!(
+            f32_bits(&last(&mut wide)),
+            f32_bits(&base),
+            "window is live"
+        );
 
         // Generation runs end to end on the same stack.
         p.clear_sequence_state();
@@ -16266,7 +16284,10 @@ mod tests {
     #[test]
     fn mimo_shaped_model_declines_the_gpu_graphs_and_logs_why() {
         let p = mimo_test_pipeline();
-        assert_eq!(p.graph_attn_decline_reason(), Some("per-layer KV head counts"));
+        assert_eq!(
+            p.graph_attn_decline_reason(),
+            Some("per-layer KV head counts")
+        );
         let emb = p.embed_single(3);
         let mut lg = Vec::new();
         assert!(
@@ -16300,10 +16321,16 @@ mod tests {
         assert_eq!(plain().graph_attn_decline_reason(), None);
         let mut q = plain();
         q.set_layer_sinks(1, vec![0.25, -0.25]).unwrap();
-        assert_eq!(q.graph_attn_decline_reason(), Some("learned attention sinks"));
+        assert_eq!(
+            q.graph_attn_decline_reason(),
+            Some("learned attention sinks")
+        );
         let mut q = plain();
         q.set_attn_geometry(None, Some(2)).unwrap();
-        assert_eq!(q.graph_attn_decline_reason(), Some("V heads narrower than Q/K heads"));
+        assert_eq!(
+            q.graph_attn_decline_reason(),
+            Some("V heads narrower than Q/K heads")
+        );
         let mut q = plain();
         q.sliding_layers = Some(vec![true, false]);
         q.swa = Some((4, usize::MAX));
@@ -16349,20 +16376,38 @@ mod tests {
     #[test]
     fn attn_geometry_and_sinks_are_validated() {
         let mut p = create_test_pipeline(8, 16, 4, 2, 4, 2, 32);
-        assert!(p.set_attn_geometry(Some(vec![2]), None).is_err(), "one entry per layer");
-        assert!(p.set_attn_geometry(Some(vec![2, 3]), None).is_err(), "3 does not divide 4");
+        assert!(
+            p.set_attn_geometry(Some(vec![2]), None).is_err(),
+            "one entry per layer"
+        );
+        assert!(
+            p.set_attn_geometry(Some(vec![2, 3]), None).is_err(),
+            "3 does not divide 4"
+        );
         assert!(p.set_attn_geometry(Some(vec![2, 0]), None).is_err());
         assert!(p.set_attn_geometry(None, Some(0)).is_err());
-        assert!(p.set_attn_geometry(None, Some(5)).is_err(), "V wider than the head");
+        assert!(
+            p.set_attn_geometry(None, Some(5)).is_err(),
+            "V wider than the head"
+        );
         p.set_attn_geometry(None, Some(4)).unwrap();
-        assert_eq!(p.v_head_dim, None, "v_head_dim == head_dim is the uniform case");
+        assert_eq!(
+            p.v_head_dim, None,
+            "v_head_dim == head_dim is the uniform case"
+        );
         p.set_layer_sinks(1, vec![0.1; 4]).unwrap();
         p.set_attn_geometry(Some(vec![1, 4]), None).unwrap();
         assert_eq!(p.kv_cache.layers[0].num_kv_heads, 1);
         assert_eq!(p.kv_cache.layers[1].num_kv_heads, 4);
-        assert!(p.kv_cache.layers[1].sinks.is_some(), "a reshape keeps the layer's sinks");
+        assert!(
+            p.kv_cache.layers[1].sinks.is_some(),
+            "a reshape keeps the layer's sinks"
+        );
         assert_eq!(p.layer_geom(1).0, 4);
-        assert!(p.set_layer_sinks(0, vec![0.0; 3]).is_err(), "one sink per Q head");
+        assert!(
+            p.set_layer_sinks(0, vec![0.0; 3]).is_err(),
+            "one sink per Q head"
+        );
         assert!(p.set_layer_sinks(7, vec![0.0; 4]).is_err());
         assert!(p.set_layer_sinks(0, vec![f32::NAN, 0.0, 0.0, 0.0]).is_err());
     }

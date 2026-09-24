@@ -1918,11 +1918,17 @@ mod tests {
         let mut c = LayerKvCache::new(nkv, hd);
         c.mode = KvMode::F32;
         for r in 0..rows {
-            let k: Vec<f32> = (0..hd).map(|i| ((r * 13 + i * 5) % 29) as f32 / 29.0 - 0.5).collect();
-            let v: Vec<f32> = (0..hd).map(|i| ((r * 7 + i * 3) % 31) as f32 / 31.0 - 0.5).collect();
+            let k: Vec<f32> = (0..hd)
+                .map(|i| ((r * 13 + i * 5) % 29) as f32 / 29.0 - 0.5)
+                .collect();
+            let v: Vec<f32> = (0..hd)
+                .map(|i| ((r * 7 + i * 3) % 31) as f32 / 31.0 - 0.5)
+                .collect();
             c.append(&k, &v, &[]);
         }
-        let q: Vec<f32> = (0..hpk * hd).map(|i| ((i * 19) % 23) as f32 / 23.0 - 0.5).collect();
+        let q: Vec<f32> = (0..hpk * hd)
+            .map(|i| ((i * 19) % 23) as f32 / 23.0 - 0.5)
+            .collect();
         let scale = 0.25f32;
         for w in [1usize, 7, 39, 40, 100] {
             let first = rows.saturating_sub(w);

@@ -764,7 +764,12 @@ fn check_v_width(cfg: &QwenAttnCfg) {
 #[inline]
 fn check_sinks(cache: &LayerKvCache, nh: usize) {
     if let Some(s) = cache.sinks.as_deref() {
-        assert_eq!(s.len(), nh, "layer sinks: {} logits for {nh} Q heads", s.len());
+        assert_eq!(
+            s.len(),
+            nh,
+            "layer sinks: {} logits for {nh} Q heads",
+            s.len()
+        );
     }
 }
 
@@ -2060,8 +2065,16 @@ mod tests {
                     );
                     let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
                     let s = sink.is_some();
-                    assert_eq!(bits(&a), bits(&b), "out rows={rows} window={window:?} sink={s}");
-                    assert_eq!(bits(&ia), bits(&ib), "imp rows={rows} window={window:?} sink={s}");
+                    assert_eq!(
+                        bits(&a),
+                        bits(&b),
+                        "out rows={rows} window={window:?} sink={s}"
+                    );
+                    assert_eq!(
+                        bits(&ia),
+                        bits(&ib),
+                        "imp rows={rows} window={window:?} sink={s}"
+                    );
                 }
             }
         }
@@ -2226,7 +2239,9 @@ mod tests {
                     }
                 }
                 for i in 0..hs {
-                    let want: f64 = (0..nh * vd).map(|j| fo[i * nh * vd + j] as f64 * ao[j]).sum();
+                    let want: f64 = (0..nh * vd)
+                        .map(|j| fo[i * nh * vd + j] as f64 * ao[j])
+                        .sum();
                     assert!(
                         (got[i] as f64 - want).abs() < 1e-6,
                         "nkv {nkv} window {window:?} sinks {} pos {pos} out[{i}]: {} vs {want}",
@@ -2263,7 +2278,11 @@ mod tests {
         let wo = synth(hs, 4 * vd, 24);
         let sinks = Some(vec![0.3f32, -0.8, 1.2, 0.0]);
         let xs: Vec<Vec<f32>> = (0..9)
-            .map(|p| (0..hs).map(|i| ((i * 3 + p * 5) as f32 * 0.21).cos()).collect())
+            .map(|p| {
+                (0..hs)
+                    .map(|i| ((i * 3 + p * 5) as f32 * 0.21).cos())
+                    .collect()
+            })
             .collect();
         let fresh = || {
             let mut c = LayerKvCache::new(nkv, hd);
@@ -2337,8 +2356,16 @@ mod tests {
                 for p in 0..xs.len() {
                     let w = window;
                     let pl = pool.is_some();
-                    assert_eq!(bits(&singles[p]), bits(&batched[p]), "batch p{p} w{w:?} pool {pl}");
-                    assert_eq!(bits(&singles[p]), bits(&paired[p]), "pair p{p} w{w:?} pool {pl}");
+                    assert_eq!(
+                        bits(&singles[p]),
+                        bits(&batched[p]),
+                        "batch p{p} w{w:?} pool {pl}"
+                    );
+                    assert_eq!(
+                        bits(&singles[p]),
+                        bits(&paired[p]),
+                        "pair p{p} w{w:?} pool {pl}"
+                    );
                 }
                 assert_eq!(c1.head_values(0), c2.head_values(0));
                 assert_eq!(c1.head_values(1), c3.head_values(1));

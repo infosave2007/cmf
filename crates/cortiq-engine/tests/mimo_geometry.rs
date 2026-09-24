@@ -134,7 +134,11 @@ fn tensors(edit: &dyn Fn(&str) -> Option<Vec<usize>>) -> Vec<TensorSpec> {
         .collect()
 }
 
-fn write_model(tag: &str, arch: ModelArch, tensors: &[TensorSpec]) -> (std::path::PathBuf, Arc<CmfModel>) {
+fn write_model(
+    tag: &str,
+    arch: ModelArch,
+    tensors: &[TensorSpec],
+) -> (std::path::PathBuf, Arc<CmfModel>) {
     let dir = std::env::temp_dir().join(format!("cmf-mimo-geometry-{}-{tag}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -189,7 +193,10 @@ fn consistent_mimo_file_loads_with_its_geometry_and_runs() {
     if std::env::var_os("CMF_MAX_SEQ").is_none() {
         assert_eq!(p.kv_cache.max_seq_len, 32_768);
     }
-    assert_eq!(p.graph_attn_decline_reason(), Some("per-layer KV head counts"));
+    assert_eq!(
+        p.graph_attn_decline_reason(),
+        Some("per-layer KV head counts")
+    );
     p.layer_dump = None;
     let ids: Vec<u32> = (0..9u32).map(|i| (i * 5 + 1) % VOCAB as u32).collect();
     let logits = p.forward_ids(&ids, None).expect("forward");
@@ -202,18 +209,41 @@ fn consistent_mimo_file_loads_with_its_geometry_and_runs() {
 fn mis_shaped_attention_tensors_fail_at_load() {
     let cases: [(&str, &str, Vec<usize>, &str); 4] = [
         // Layer 1 has 2 KV heads: 1·head_dim K rows is the full layers' shape.
-        ("k", "model.layers.1.self_attn.k_proj.weight", vec![HD, HS], "k_proj rows"),
+        (
+            "k",
+            "model.layers.1.self_attn.k_proj.weight",
+            vec![HD, HS],
+            "k_proj rows",
+        ),
         // V padded to head_dim in the FILE is not what the header says.
-        ("v", "model.layers.1.self_attn.v_proj.weight", vec![2 * HD, HS], "v_proj rows"),
+        (
+            "v",
+            "model.layers.1.self_attn.v_proj.weight",
+            vec![2 * HD, HS],
+            "v_proj rows",
+        ),
         // o_proj reading nh·head_dim instead of nh·v_head_dim.
-        ("o", "model.layers.0.self_attn.o_proj.weight", vec![HS, NH * HD], "o_proj cols"),
+        (
+            "o",
+            "model.layers.0.self_attn.o_proj.weight",
+            vec![HS, NH * HD],
+            "o_proj cols",
+        ),
         // One sink per Q head.
-        ("sinks", "model.layers.1.self_attn.sinks", vec![NH - 1], "sinks"),
+        (
+            "sinks",
+            "model.layers.1.self_attn.sinks",
+            vec![NH - 1],
+            "sinks",
+        ),
     ];
     for (tag, name, shape, want) in cases {
         let edit = |n: &str| (n == name).then(|| shape.clone());
         let msg = load_err(tag, mimo_arch(), &edit);
-        assert!(msg.contains(want), "{tag}: error does not name {want:?}: {msg}");
+        assert!(
+            msg.contains(want),
+            "{tag}: error does not name {want:?}: {msg}"
+        );
     }
     // A header that forgets the per-layer KV heads: layer 1's 2-head K no
     // longer matches num_kv_heads = 1.
