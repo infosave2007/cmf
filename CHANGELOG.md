@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `convert` reads XiaomiMiMo MiMo-V2 checkpoints (`mimo_v2`, text decoder).
+  The fused FP8 qkv is stored in 4 tensor-parallel chunks, and each chunk
+  has its own 128-row scale blocks; the converter decodes it on that grid,
+  splits it into q/k/v and folds `attention_value_scale` into V. MXFP4
+  experts are read from U8 `.weight` + `.weight_scale`. The header carries
+  the full/sliding layer schedule, the per-layer KV head counts (4/8) and
+  the 128-wide V heads. The router bias and the sliding-window sinks are
+  kept at f32. The MTP head and the vision/audio/speech towers are dropped.
+  Without `--quant`, a MiMo-V2 checkpoint converts to q4tp experts with the
+  attention, dense layer 0, embedding and lm_head at q8_2f. Other models
+  still default to q8.
+
 ## [0.7.6] - 2026-09-24
 
 ### Added
