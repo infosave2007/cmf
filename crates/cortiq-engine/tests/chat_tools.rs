@@ -190,9 +190,8 @@ fn nanbeige_tool_history_round_trips() {
 #[test]
 fn a_failing_template_is_reported_not_swallowed() {
     let mut t = Tokenizer::byte_level();
-    t.chat_template = Some(
-        "{% for m in messages %}{{ m.content | no_such_filter }}{% endfor %}".to_string(),
-    );
+    t.chat_template =
+        Some("{% for m in messages %}{{ m.content | no_such_filter }}{% endfor %}".to_string());
     let msgs = vec![serde_json::json!({"role": "user", "content": "hi"})];
     let tools = vec![serde_json::json!({"type": "function", "function": {"name": "f"}})];
     let err = t
@@ -202,7 +201,9 @@ fn a_failing_template_is_reported_not_swallowed() {
     assert!(!t.apply_chat_template_json(&msgs, None, None).is_empty());
     // `raise_exception` carries the template's own message out.
     t.chat_template = Some("{{ raise_exception('Conversation roles must alternate') }}".into());
-    let err = t.try_apply_chat_template_json(&msgs, None, None).unwrap_err();
+    let err = t
+        .try_apply_chat_template_json(&msgs, None, None)
+        .unwrap_err();
     assert!(err.contains("roles must alternate"), "{err}");
 }
 
@@ -236,5 +237,8 @@ fn minicpm5_vendor_template_renders_like_transformers() {
         let got = t.render_chat_json(&msgs, tools.as_deref(), think).unwrap();
         assert_eq!(got, case["hf_text"].as_str().unwrap(), "case {i}");
     }
-    assert!(with_tools >= 3, "the fixture must exercise the tools branch");
+    assert!(
+        with_tools >= 3,
+        "the fixture must exercise the tools branch"
+    );
 }

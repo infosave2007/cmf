@@ -1080,10 +1080,9 @@ async fn chat_completions(
                         .record_generation(result.tokens_generated, elapsed_ms, elapsed_ms)
                         .await;
                     // Held tool markup: calls out, the rest back as content.
-                    let (held_text, held_calls) = std::mem::take(
-                        &mut *holdback.lock().expect("tool holdback"),
-                    )
-                    .finish(tools_owned.as_deref());
+                    let (held_text, held_calls) =
+                        std::mem::take(&mut *holdback.lock().expect("tool holdback"))
+                            .finish(tools_owned.as_deref());
                     if !held_text.is_empty() {
                         let _ = tx
                             .send(streaming::token_chunk(&id, &model, &held_text, created))

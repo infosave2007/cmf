@@ -283,7 +283,8 @@ fn param_value(s: &str) -> Option<(String, usize)> {
         let after = &inner[end + CDATA_CLOSE.len()..];
         let gap = after.len() - after.trim_start().len();
         if after[gap..].starts_with(PARAM_CLOSE) {
-            let consumed = lead + CDATA_OPEN.len() + end + CDATA_CLOSE.len() + gap + PARAM_CLOSE.len();
+            let consumed =
+                lead + CDATA_OPEN.len() + end + CDATA_CLOSE.len() + gap + PARAM_CLOSE.len();
             return Some((inner[..end].trim().to_string(), consumed));
         }
         // Text after the CDATA section: fall through to the plain form.
@@ -318,7 +319,9 @@ fn xml_unescape(s: &str) -> String {
             "quot" => Some('"'),
             "apos" => Some('\''),
             _ if ent.starts_with("#x") || ent.starts_with("#X") => {
-                u32::from_str_radix(&ent[2..], 16).ok().and_then(char::from_u32)
+                u32::from_str_radix(&ent[2..], 16)
+                    .ok()
+                    .and_then(char::from_u32)
             }
             _ if ent.starts_with('#') => ent[1..].parse::<u32>().ok().and_then(char::from_u32),
             _ => None,
@@ -514,12 +517,7 @@ pub struct ToolHoldback {
     in_think: bool,
 }
 
-const MARKERS: &[&str] = &[
-    "<tool_call>",
-    "<function ",
-    "<function\n",
-    "<function\t",
-];
+const MARKERS: &[&str] = &["<tool_call>", "<function ", "<function\n", "<function\t"];
 
 impl ToolHoldback {
     pub fn new() -> Self {
@@ -690,9 +688,16 @@ mod tests {
         let tools = weather_tools();
         let out = "<think>\nI could call <function name=\"get_weather\"><param name=\"city\">Rome</param></function> here.\n</think>\n\nChecking both.\n<function name=\"get_weather\"><param name=\"city\">Paris</param></function>\n<function name='get_weather'><param name='city'>Oslo</param><param name=\"days\">3</param></function>";
         let (text, calls) = extract_tool_calls(out, Some(&tools));
-        assert_eq!(calls.len(), 2, "the call drafted inside <think> is not a call");
+        assert_eq!(
+            calls.len(),
+            2,
+            "the call drafted inside <think> is not a call"
+        );
         assert_eq!(args(&calls[0]), serde_json::json!({"city": "Paris"}));
-        assert_eq!(args(&calls[1]), serde_json::json!({"city": "Oslo", "days": 3}));
+        assert_eq!(
+            args(&calls[1]),
+            serde_json::json!({"city": "Oslo", "days": 3})
+        );
         assert!(text.starts_with("<think>") && text.contains("Rome"));
         assert!(text.ends_with("Checking both."), "{text}");
     }
@@ -706,7 +711,11 @@ mod tests {
         );
         let (text, calls) = extract_tool_calls(&out, Some(&tools));
         assert_eq!(text, "");
-        assert_eq!(calls.len(), 1, "a </function> inside CDATA must not end the call");
+        assert_eq!(
+            calls.len(),
+            1,
+            "a </function> inside CDATA must not end the call"
+        );
         assert_eq!(args(&calls[0])["code"], code);
         // Multi-line without CDATA, and XML entities in a well-formed value.
         let (_, calls) = extract_tool_calls(
@@ -742,10 +751,12 @@ mod tests {
             })
         );
         // Order of the arguments string follows the call, not the schema.
-        assert!(calls[0]["function"]["arguments"]
-            .as_str()
-            .unwrap()
-            .starts_with("{\"city\":\"1984\",\"days\":5"));
+        assert!(
+            calls[0]["function"]["arguments"]
+                .as_str()
+                .unwrap()
+                .starts_with("{\"city\":\"1984\",\"days\":5")
+        );
         // A non-string value that parses as neither stays a string.
         let (_, calls) = extract_tool_calls(
             "<function name=\"get_weather\"><param name=\"city\">X</param><param name=\"days\">three</param></function>",
@@ -816,13 +827,22 @@ mod tests {
     fn holdback_keeps_calls_out_of_content_even_split_across_tokens() {
         let tools = weather_tools();
         let (content, calls) = stream(
-            &["Let me ", "check.\n<fun", "ction", " name=\"get_weather\"><param name=\"city\">", "Paris</param></function>"],
+            &[
+                "Let me ",
+                "check.\n<fun",
+                "ction",
+                " name=\"get_weather\"><param name=\"city\">",
+                "Paris</param></function>",
+            ],
             &tools,
         );
         assert_eq!(content, "Let me check.\n");
         assert_eq!(calls.len(), 1);
         let (content, calls) = stream(
-            &["ok <tool", "_call>\n{\"name\": \"a\", \"arguments\": {}}\n</tool_call>"],
+            &[
+                "ok <tool",
+                "_call>\n{\"name\": \"a\", \"arguments\": {}}\n</tool_call>",
+            ],
             &tools,
         );
         assert_eq!(content, "ok ");
@@ -833,7 +853,11 @@ mod tests {
     fn holdback_ignores_markup_in_reasoning_and_never_drops_text() {
         let tools = weather_tools();
         let (content, calls) = stream(
-            &["<think>maybe <function name=\"get_weather\">", "…</function></think>", "\n\nNo call needed."],
+            &[
+                "<think>maybe <function name=\"get_weather\">",
+                "…</function></think>",
+                "\n\nNo call needed.",
+            ],
             &tools,
         );
         assert!(calls.is_empty());
