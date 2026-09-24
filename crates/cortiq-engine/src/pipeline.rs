@@ -3199,6 +3199,46 @@ impl Pipeline {
         input_ids: &[u32],
         max_tokens: usize,
         task_mask: Option<&TaskMask>,
+        on_token: Option<TokenCallback>,
+    ) -> Result<GenerateResult, String> {
+        self.generate_with_prompt_rows(input_ids, None, max_tokens, task_mask, on_token)
+    }
+
+    /// Generate from complete prompt embeddings [token_count, hidden_size].
+    /// Text rows can be obtained with `embed_id`; media rows replace only
+    /// their expanded placeholder positions. Rows are already scaled and
+    /// enter `PrefillIn::Hidden`, so a device graph must not re-embed them.
+    /// Token-only KV reuse is disabled both into and out of this request.
+    pub fn generate_from_embeds(
+        &mut self,
+        input_ids: &[u32],
+        prompt_rows: &[f32],
+        max_tokens: usize,
+        task_mask: Option<&TaskMask>,
+        on_token: Option<TokenCallback>,
+    ) -> Result<GenerateResult, String> {
+        if input_ids.is_empty()
+            || input_ids.len().checked_mul(self.hidden_size) != Some(prompt_rows.len())
+        {
+            return Err("embedded prompt dimensions must be [tokens, hidden_size]".into());
+        }
+        if prompt_rows.iter().any(|x| !x.is_finite()) {
+            return Err("embedded prompt contains non-finite values".into());
+        }
+        if !self.can_prefill_batched() || self.dyn_router.is_some()
+            || self.o1_active() || self.mtp.is_some() || self.gpu_plan.is_some()
+        {
+            return Err("embedded prompts require the ordinary transformer path without O(1), dynamic routing, GPU splitting or a generic MTP head".into());
+        }
+        self.generate_with_prompt_rows(input_ids, Some(prompt_rows), max_tokens, task_mask, on_token)
+    }
+
+    fn generate_with_prompt_rows(
+        &mut self,
+        input_ids: &[u32],
+        prompt_rows: Option<&[f32]>,
+        max_tokens: usize,
+        task_mask: Option<&TaskMask>,
         mut on_token: Option<TokenCallback>,
     ) -> Result<GenerateResult, String> {
         if std::env::var("CMF_TRACE_H").is_ok() {
@@ -3229,6 +3269,7 @@ impl Pipeline {
             let on = !std::env::var("CMF_KV_REUSE").is_ok_and(|v| v == "0");
             let h = &self.kv_history;
             if on
+                && prompt_rows.is_none()
                 && task_mask.is_none()
                 && self.mtp.is_none()
                 && !(self.mimo_mtp.is_some() && self.speculative)
@@ -3572,6 +3613,25 @@ impl Pipeline {
         self.graph_want_logits = false;
         let _tpf = std::time::Instant::now();
         let batch_k = self.generation_batch_k();
+        if let Some(rows) = prompt_rows {
+            let hs = self.hidden_size;
+            let chunk = self.prefill_chunk().max(1);
+            while pos < input_ids.len() && !self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                let end = (pos + chunk).min(input_ids.len());
+                let hb = match self.prefill_input_rows(
+                    PrefillIn::Hidden(&rows[pos * hs..end * hs]), pos, task_mask,
+                ) {
+                    Ok(hb) => hb,
+                    Err(err) => {
+                        self.finish_generation(&mut mtp, &mut router, true);
+                        return Err(err);
+                    }
+                };
+                if mimo_spec { self.mimo_note_rows(&hb, pos); }
+                hidden.copy_from_slice(&hb[hb.len() - hs..]);
+                pos = end;
+            }
+        }
         // DeepSeek-V4 owns a separate hyper-connection stack. Route it
         // before the generic prefill choices: those correctly reject an
         // empty `weights.layers`, but their final per-position fallback used
@@ -4961,7 +5021,7 @@ impl Pipeline {
         // A MiMo speculative round that stopped on an accepted draft (EOS,
         // cancel) leaves verify rows past the committed stream in the cache:
         // never offer that cache for reuse.
-        if cancelled || mimo_spec {
+        if cancelled || mimo_spec || prompt_rows.is_some() {
             self.kv_history.clear();
         } else {
             self.kv_history = all_ids[..forwarded.min(all_ids.len())].to_vec();
@@ -8039,22 +8099,34 @@ impl Pipeline {
         pos: usize,
         task_mask: Option<&TaskMask>,
     ) -> Result<Vec<f32>, String> {
+        self.prefill_input_rows(PrefillIn::Ids(ids), pos, task_mask)
+    }
+
+    fn prefill_input_rows(
+        &mut self,
+        input: PrefillIn<'_>,
+        pos: usize,
+        task_mask: Option<&TaskMask>,
+    ) -> Result<Vec<f32>, String> {
         self.mimo_moe_prepare();
+        let hs = self.hidden_size;
+        let bk = match input {
+            PrefillIn::Ids(ids) => ids.len(),
+            PrefillIn::Hidden(rows) => rows.len() / hs,
+        };
         #[cfg(not(target_os = "macos"))]
         if task_mask.is_none()
             && !self.o1_active()
-            && ids.len() > 1
+            && bk > 1
             && (self.batch_prefix_prefill()
                 || (self.verify_exact_moe
                     && crate::gpu::enabled_here()
                     && crate::gpu::wgpu_graph_on(crate::gpu::GraphPhase::Decode)))
         {
-            let hs = self.hidden_size;
-            let bk = ids.len();
-            let mut hiddens = vec![0f32; bk * hs];
-            for (j, &id) in ids.iter().enumerate() {
-                hiddens[j * hs..(j + 1) * hs].copy_from_slice(&self.embed_single(id));
-            }
+            let mut hiddens = match input {
+                PrefillIn::Hidden(rows) => rows.to_vec(),
+                PrefillIn::Ids(ids) => ids.iter().flat_map(|&id| self.embed_single(id)).collect(),
+            };
             let positions: Vec<usize> = (pos..pos + bk).collect();
             let mut run = 0usize;
             match self.try_batch_graph_wgpu_prefix(
@@ -8090,7 +8162,7 @@ impl Pipeline {
                 }
             }
         }
-        let out = self.prefill_batch_masked(ids, pos, task_mask);
+        let out = self.prefill_batch_span(input, pos, task_mask, 0, usize::MAX);
         if self.graph_failed.load(std::sync::atomic::Ordering::Relaxed) {
             Err("batch tail graph failed after admission".into())
         } else { Ok(out) }
@@ -17284,6 +17356,53 @@ mod tests {
         p.set_layer_sinks(1, vec![0.5, -1.0, 1.5, 0.0]).unwrap();
         p.set_layer_sinks(2, vec![-0.25, 2.0, 0.75, -1.5]).unwrap();
         p
+    }
+
+    #[test]
+    fn mimo_embedded_prompt_uses_rows_and_never_reuses_token_only_kv() {
+        let mut p = mimo_test_pipeline();
+        p.speculative = false;
+        p.ignore_eos = true;
+        p.sampler_config.temperature = 0.0;
+        p.sampler_config.repetition_penalty = 1.0;
+        let a = vec![3, 5, 7, 9, 11, 13];
+        let b = vec![4, 8, 12, 16, 20, 24];
+        let rows: Vec<_> = b.iter().flat_map(|&id| p.embed_id(id)).collect();
+        let expected = p.generate_from_ids(&b, 8, None, None).unwrap().token_ids;
+        // Same placeholder IDs as an earlier request are not a cache key
+        // for different media. The actual rows, not a re-embedding of a,
+        // must determine the continuation.
+        let actual = p.generate_from_embeds(&a, &rows, 8, None, None).unwrap().token_ids;
+        assert_eq!(actual, expected);
+        assert!(p.kv_history.is_empty());
+        let mut extended = a.clone();
+        extended.push(17);
+        let after_media = p.generate_from_ids(&extended, 8, None, None).unwrap().token_ids;
+        p.reset_session();
+        let fresh = p.generate_from_ids(&extended, 8, None, None).unwrap().token_ids;
+        assert_eq!(after_media, fresh);
+        assert!(p.generate_from_embeds(&a, &rows[..rows.len()-1], 1, None, None).is_err());
+        // Force a real token-prefix reuse opportunity into the media call.
+        // Those labels are unchanged, but their embeddings now describe a
+        // different source sequence and every KV row must be rebuilt.
+        p.reset_session();
+        p.generate_from_ids(&a, 1, None, None).unwrap();
+        let mut media_ids = p.kv_history.clone();
+        assert!(!media_ids.is_empty());
+        media_ids.extend_from_slice(&[19, 21, 23]);
+        let source_ids: Vec<_> = (0..media_ids.len()).map(|i| b[i % b.len()]).collect();
+        let source_rows: Vec<_> = source_ids.iter().flat_map(|&id| p.embed_id(id)).collect();
+        let mut oracle = mimo_test_pipeline();
+        oracle.speculative = false;
+        oracle.ignore_eos = true;
+        oracle.sampler_config.temperature = 0.0;
+        oracle.sampler_config.repetition_penalty = 1.0;
+        let expected = oracle.generate_from_ids(&source_ids, 8, None, None).unwrap().token_ids;
+        assert_eq!(p.generate_from_embeds(&media_ids, &source_rows, 8, None, None).unwrap().token_ids, expected);
+        assert!(p.kv_history.is_empty());
+        let mut bad = rows;
+        bad[0] = f32::NAN;
+        assert!(p.generate_from_embeds(&a, &bad, 1, None, None).is_err());
     }
 
     fn f32_bits(v: &[f32]) -> Vec<u32> {

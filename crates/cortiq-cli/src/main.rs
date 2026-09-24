@@ -582,10 +582,25 @@ enum Commands {
         /// Single prompt (non-interactive)
         #[arg(short, long)]
         prompt: Option<String>,
-        /// Image path, data URL, or HTTP(S) URL for a V4.1 multimodal prompt.
+        /// Image path, data URL, or HTTP(S) URL for a V4.1 or MiMo prompt.
         /// Repeat the flag to place images after the text in prompt order.
         #[arg(long = "image")]
         images: Vec<String>,
+        /// MiMo video: local Y4M file or directory of image frames.
+        #[arg(long = "video")]
+        videos: Vec<String>,
+        /// Frame-directory sampling rate (MiMo video).
+        #[arg(long)]
+        video_fps: Option<f64>,
+        /// MiMo WAV file, data URL, or HTTP(S) URL; repeat for multiple clips.
+        #[arg(long = "audio")]
+        audios: Vec<String>,
+        /// Explicit MiMo multimodal companion (otherwise discovered beside text).
+        #[arg(long)]
+        mm: Option<std::path::PathBuf>,
+        /// Maximum pixels per MiMo image/video frame before patchification.
+        #[arg(long)]
+        image_max_pixels: Option<usize>,
         /// V4.1 reasoning budget: 1..=100 or low/high/max.
         #[arg(long, value_name = "1..100|low|high|max")]
         reasoning_effort: Option<String>,
@@ -2179,6 +2194,11 @@ async fn main() -> anyhow::Result<()> {
             task,
             prompt,
             images,
+            videos,
+            video_fps,
+            audios,
+            mm,
+            image_max_pixels,
             reasoning_effort,
             max_tokens,
             skill,
@@ -2223,6 +2243,9 @@ async fn main() -> anyhow::Result<()> {
                 &task,
                 prompt.as_deref(),
                 &images,
+                &videos,
+                &audios,
+                &cortiq_engine::mimo_ingress::MediaOptions { companion: mm, image_max_pixels, video_fps },
                 reasoning_effort.as_deref(),
                 max_tokens,
                 skill.as_deref(),
@@ -4293,6 +4316,9 @@ async fn cmd_run(
     task: &str,
     prompt: Option<&str>,
     images: &[String],
+    videos: &[String],
+    audios: &[String],
+    media_options: &cortiq_engine::mimo_ingress::MediaOptions,
     reasoning_effort: Option<&str>,
     max_tokens: usize,
     skill: Option<&str>,
@@ -4424,12 +4450,17 @@ async fn cmd_run(
         pipeline.ignore_eos = true;
     }
     let is_dsv41 = model.arch().arch_name == "deepseek_v41";
-    if !is_dsv41 && (!images.is_empty() || reasoning_effort.is_some()) {
-        anyhow::bail!("--image and --reasoning-effort are supported only for DeepSeek-V4.1");
-    }
-    if !images.is_empty() && prompt.is_none() {
-        anyhow::bail!("--image requires --prompt so image order is unambiguous");
-    }
+    let is_mimo = model.arch().arch_name == "mimo_v2";
+    let mimo_media = is_mimo && (!images.is_empty() || !videos.is_empty() || !audios.is_empty());
+    anyhow::ensure!(is_dsv41 || reasoning_effort.is_none(), "--reasoning-effort requires DeepSeek-V4.1");
+    anyhow::ensure!(is_dsv41 || is_mimo || images.is_empty(), "--image requires DeepSeek-V4.1 or MiMo");
+    anyhow::ensure!(is_mimo || (videos.is_empty() && audios.is_empty() && media_options.companion.is_none()
+        && media_options.video_fps.is_none() && media_options.image_max_pixels.is_none()), "--video/--audio/--mm and MiMo processing options require MiMo");
+    anyhow::ensure!((images.is_empty() && videos.is_empty() && audios.is_empty()) || prompt.is_some(),
+        "media input requires --prompt so media order is unambiguous");
+    anyhow::ensure!(!mimo_media || (!raw && state.is_none() && peer.is_none() && gpus.is_none()
+        && std::env::var_os("CMF_PROMPT_IDS").is_none()),
+        "MiMo media requires a fresh local chat prompt (no --raw/--state/--peer/--gpus/CMF_PROMPT_IDS)");
     // Same rule for the CLI: the vocabulary-wide softmax runs when its
     // output is going to be shown, not on every run.
     pipeline.set_confidence(confidence || trace);
@@ -4622,7 +4653,8 @@ async fn cmd_run(
     let noninteractive_generate = prompt.is_some();
     let mut generate_and_print = |pipeline: &mut Pipeline,
                                   ids: &[u32],
-                                  vl_inputs: Option<&PreparedVlInputs>|
+                                  vl_inputs: Option<&PreparedVlInputs>,
+                                  mimo_rows: Option<&[f32]>|
      -> anyhow::Result<Option<String>> {
         use std::io::Write;
         // Stream silently when the confidence view will reprint coloured;
@@ -4655,7 +4687,7 @@ async fn cmd_run(
             })
         };
         let started = std::time::Instant::now();
-        if vl_inputs.is_some() && remote_opt.is_some() {
+        if (vl_inputs.is_some() || mimo_rows.is_some()) && remote_opt.is_some() {
             anyhow::bail!(
                 "DeepSeek-V4.1 multimodal generation is not supported with --peer; use a local pipeline"
             );
@@ -4714,7 +4746,10 @@ async fn cmd_run(
                 Some(inputs) => {
                     pipeline.generate_from_vl(inputs, max_tokens, mask.as_ref(), Some(cb))
                 }
-                None => pipeline.generate_from_ids(ids, max_tokens, mask.as_ref(), Some(cb)),
+                None => match mimo_rows {
+                    Some(rows) => pipeline.generate_from_embeds(ids, rows, max_tokens, mask.as_ref(), Some(cb)),
+                    None => pipeline.generate_from_ids(ids, max_tokens, mask.as_ref(), Some(cb)),
+                },
             },
         };
         match gen_res {
@@ -4837,9 +4872,19 @@ async fn cmd_run(
                 prepare_dsv41_cli_prompt(&model, &pipeline, p, images, no_think, reasoning_effort)
             })
             .transpose()?;
+        let mimo_inputs = if mimo_media {
+            let mut content = vec![serde_json::json!({"type":"text", "text":p})];
+            content.extend(images.iter().map(|path| serde_json::json!({"type":"image_url", "image_url":{"url":path}})));
+            content.extend(videos.iter().map(|path| serde_json::json!({"type":"video", "video":{"path":path}})));
+            content.extend(audios.iter().map(|path| serde_json::json!({"type":"audio", "audio":{"url":path}})));
+            Some(cortiq_engine::mimo_ingress::prepare(&model, &pipeline,
+                &[serde_json::json!({"role":"user", "content":content})], None, thinking, media_options)
+                .map_err(anyhow::Error::msg)?)
+        } else { None };
         let mut ids = vl_inputs
             .as_ref()
             .map(|inputs| inputs.token_ids.clone())
+            .or_else(|| mimo_inputs.as_ref().map(|inputs| inputs.token_ids.clone()))
             .unwrap_or_else(|| build_ids(&pipeline, &history, p));
         // CMF_PROMPT_IDS=<file>: feed exactly these token ids (a JSON array,
         // or ids separated by commas/whitespace) instead of the tokenized
@@ -4874,7 +4919,7 @@ async fn cmd_run(
                 .collect();
             eprintln!("head {}\ntail {}", head.join(" "), tail.join(" "));
         }
-        generate_and_print(&mut pipeline, &ids, vl_inputs.as_ref())?;
+        generate_and_print(&mut pipeline, &ids, vl_inputs.as_ref(), mimo_inputs.as_ref().and_then(|p| p.rows.as_deref()))?;
     } else {
         println!("\nType your message (Ctrl+C to exit):\n");
         let stdin = std::io::stdin();
@@ -4927,7 +4972,7 @@ async fn cmd_run(
             if use_template {
                 println!();
             }
-            match generate_and_print(&mut pipeline, &ids, vl_inputs.as_ref())? {
+            match generate_and_print(&mut pipeline, &ids, vl_inputs.as_ref(), None)? {
                 Some(reply) => history.push(("assistant".to_string(), reply)),
                 // A failed turn leaves no dangling user message.
                 None => {
@@ -6911,6 +6956,25 @@ async fn cmd_bench(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mimo_run_media_flags_parse() {
+        let cli = Cli::try_parse_from(["cortiq", "run", "text.cmf", "--prompt", "describe",
+            "--image", "one.png", "--image", "two.png", "--video", "clip.y4m",
+            "--video-fps", "2", "--audio", "clip.wav", "--mm", "full.mm.cmf",
+            "--image-max-pixels", "200704"]).unwrap();
+        match cli.command {
+            Commands::Run { images, videos, audios, video_fps, mm, image_max_pixels, .. } => {
+                assert_eq!(images, ["one.png", "two.png"]);
+                assert_eq!(videos, ["clip.y4m"]);
+                assert_eq!(audios, ["clip.wav"]);
+                assert_eq!(video_fps, Some(2.0));
+                assert_eq!(mm.unwrap(), std::path::PathBuf::from("full.mm.cmf"));
+                assert_eq!(image_max_pixels, Some(200704));
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
 
     #[test]
     fn session_state_roundtrips() {
