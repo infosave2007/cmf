@@ -6959,10 +6959,24 @@ mod tests {
 
     #[test]
     fn mimo_run_media_flags_parse() {
-        let cli = Cli::try_parse_from(["cortiq", "run", "text.cmf", "--prompt", "describe",
-            "--image", "one.png", "--image", "two.png", "--video", "clip.y4m",
-            "--video-fps", "2", "--audio", "clip.wav", "--mm", "full.mm.cmf",
-            "--image-max-pixels", "200704"]).unwrap();
+        // Parsing the complete CLI command tree in an unoptimized build
+        // exceeds libtest's 2 MiB worker stack on both Linux and macOS.
+        // Match the CLI main-thread stack for this parser test only; keep
+        // the actual parser and every assertion (and other tests) unchanged.
+        let cli = std::thread::Builder::new()
+            .name("mimo-cli-parser".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                Cli::try_parse_from([
+                    "cortiq", "run", "text.cmf", "--prompt", "describe",
+                    "--image", "one.png", "--image", "two.png", "--video", "clip.y4m",
+                    "--video-fps", "2", "--audio", "clip.wav", "--mm", "full.mm.cmf",
+                    "--image-max-pixels", "200704",
+                ]).unwrap()
+            })
+            .unwrap()
+            .join()
+            .unwrap();
         match cli.command {
             Commands::Run { images, videos, audios, video_fps, mm, image_max_pixels, .. } => {
                 assert_eq!(images, ["one.png", "two.png"]);
