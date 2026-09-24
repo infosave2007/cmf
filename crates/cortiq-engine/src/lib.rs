@@ -23,6 +23,7 @@ pub mod inference;
 pub mod kv_cache;
 pub mod linear_core;
 pub mod loader;
+pub mod mimo_moe;
 pub mod ltxaudio;
 pub mod ltxdit;
 pub mod ltxdur;
