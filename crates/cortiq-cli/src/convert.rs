@@ -8431,6 +8431,14 @@ pub(crate) mod tests {
     /// that no other converting test writes.
     #[test]
     fn tensor_quant_override_changes_only_matching_tensors() {
+        // The overrides are process-global and run_convert reads the
+        // local-ready env, which the resume tests set under ENV_LOCK.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var(LOCAL_READY_DIR_ENV);
+            std::env::remove_var(SOURCE_SHARD_PRIORITY_ENV);
+            std::env::remove_var(CONSUME_SOURCE_SHARDS_ENV);
+        }
         let dir = std::env::temp_dir().join(format!("cortiq-tqtest-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
