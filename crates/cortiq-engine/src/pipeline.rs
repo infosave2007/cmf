@@ -2517,6 +2517,16 @@ impl Pipeline {
         let pool = Pool::from_env();
         if let Some(p) = &pool {
             tracing::info!("worker pool: {} threads", p.n_workers());
+            // Keep the workers on the socket that holds the weights.
+            if let Some(model) = weights
+                .lm_head
+                .model_arc()
+                .or_else(|| weights.embed_tokens.model_arc())
+            {
+                let regions: Vec<&[u8]> =
+                    model.tensors.iter().map(|t| model.entry_bytes(t)).collect();
+                p.bind_numa(&regions);
+            }
         }
         Self {
             gpu_plan: None,
@@ -4088,6 +4098,7 @@ impl Pipeline {
                 (Some(_), _) => Vec::new(),
                 (None, Some(lg)) => lg,
                 (None, None) => {
+                    let _prof = crate::cpuprof::time(crate::cpuprof::Slot::Head);
                     inference::rms_norm_into(
                         &hidden,
                         &self.weights.final_norm,
@@ -4120,14 +4131,17 @@ impl Pipeline {
             }
             let t_next = match forced {
                 Some(c) => c,
-                None => sampler::sample_with_scratch_pool(
-                    &logits,
-                    &self.sampler_config,
-                    &all_ids,
-                    &mut self.rng,
-                    &mut self.sampler_scratch,
-                    self.pool.as_deref(),
-                ),
+                None => {
+                    let _prof = crate::cpuprof::time(crate::cpuprof::Slot::Sampler);
+                    sampler::sample_with_scratch_pool(
+                        &logits,
+                        &self.sampler_config,
+                        &all_ids,
+                        &mut self.rng,
+                        &mut self.sampler_scratch,
+                        self.pool.as_deref(),
+                    )
+                }
             };
             if self.confidence_on {
                 confidence.push(if logits.is_empty() {
@@ -11840,6 +11854,7 @@ impl Pipeline {
         let _host_tail = (tail_start > from).then(crate::gpu::enter_cpu_scope);
         let automatic_gpu_prefix = self.automatic_gpu_prefix();
 
+        let _prof_layers = crate::cpuprof::time(crate::cpuprof::Slot::Layers);
         #[cfg(target_os = "macos")]
         let mut gpu_skip_until = 0usize;
         for li in tail_start.max(from)..self.num_layers {
@@ -11905,6 +11920,7 @@ impl Pipeline {
             }
             // Norm into the pipeline scratch — the returning rms_norm
             // allocated twice per layer per token (roadmap §3 P0).
+            let prof = crate::cpuprof::time(crate::cpuprof::Slot::Norms);
             inference::rms_norm_into(
                 &h,
                 &lw.input_norm,
@@ -11912,6 +11928,7 @@ impl Pipeline {
                 self.norm_style,
                 &mut self.ws.n1,
             );
+            drop(prof);
 
             let attn_out = match &lw.attn {
                 AttnKind::Mla(w) => {
@@ -12167,6 +12184,7 @@ impl Pipeline {
                 None => attn_out,
             };
             let lw = &self.weights.layers[self.phys_layer(li)];
+            let prof = crate::cpuprof::time(crate::cpuprof::Slot::Norms);
             inference::add_rmsnorm_fused_into(
                 &mut h,
                 &attn_out,
@@ -12175,6 +12193,7 @@ impl Pipeline {
                 self.norm_style,
                 &mut self.ws.p1,
             );
+            drop(prof);
             let mut attn_out = attn_out;
             attention::recycle_buf(&mut attn_out);
             let post_normed = &self.ws.p1;
@@ -13280,13 +13299,15 @@ fn dense_ffn_cpu(d: &DenseFfn, x: &[f32], pool: Option<&Pool>) -> Vec<f32> {
             for i in 0..inter {
                 g[i] *= u[i];
             }
-        } else if d.act == Act::Silu
-            && QTensor::matvec_silu_mul(&d.gate_proj, &d.up_proj, x, g, pool)
-        {
+        } else if d.act == Act::Silu && {
+            let _prof = crate::cpuprof::time(crate::cpuprof::Slot::FfnGateUp);
+            QTensor::matvec_silu_mul(&d.gate_proj, &d.up_proj, x, g, pool)
+        } {
             // g now holds silu(gate)·up directly.
         } else {
             u.resize(inter, 0.0);
             // Multi-matrix job: gate+up under one pool dispatch.
+            let _prof = crate::cpuprof::time(crate::cpuprof::Slot::FfnGateUp);
             QTensor::matvec_many([&d.gate_proj, &d.up_proj], x, [g, u], pool);
             for i in 0..inter {
                 g[i] = d.act.combine(g[i], u[i]);
@@ -13349,6 +13370,7 @@ fn dense_ffn_cpu(d: &DenseFfn, x: &[f32], pool: Option<&Pool>) -> Vec<f32> {
             }
         }
         let mut out = attention::take_buf(d.down_proj.rows());
+        let _prof = crate::cpuprof::time(crate::cpuprof::Slot::FfnDown);
         d.down_proj.matvec(g, &mut out, pool);
         out
     })

@@ -1765,6 +1765,7 @@ impl QTensor {
         let rows = self.rows();
         debug_assert_eq!(xs_all.len(), b * cols);
         debug_assert_eq!(out.len(), b * rows);
+        let _prof = crate::cpuprof::time(crate::cpuprof::Slot::Matmat);
         // GPTQ calibration: fold this layer's inputs into its Hessian. Only
         // Mapped tensors carry a directory name; the check is a relaxed
         // atomic load, free when not calibrating.
@@ -9928,7 +9929,33 @@ fn with_krow<R>(n: usize, f: impl FnOnce(&mut [f32]) -> R) -> R {
     })
 }
 
+/// `t.round().clamp(-127.0, 127.0) as i8`, bit for bit, without the libm
+/// call. On baseline x86-64 (no SSE4.1 `roundps`) `f32::round` is a
+/// function call per element, and split_act runs it over every hidden
+/// state before every matvec: measured 27 us a call on a 2048-wide
+/// activation on an EPYC 7763 — 5.4 ms of a 55 ms decode token, all of
+/// it on the caller's thread while thirty workers wait. Clamping first is
+/// equivalent (round is monotonic and ±127 are integers), and after the
+/// clamp `t - trunc(t)` is exact, so the half-away-from-zero decision is
+/// the one `round` makes. NaN clamps to NaN and converts to 0, as before.
+/// The loop vectorizes (cvttps2dq + compare/select).
+#[inline(always)]
+fn q8_round(t: f32) -> i8 {
+    let t = t.clamp(-127.0, 127.0);
+    let i = t as i32;
+    let f = t - i as f32;
+    let r = if f >= 0.5 {
+        i + 1
+    } else if f <= -0.5 {
+        i - 1
+    } else {
+        i
+    };
+    r as i8
+}
+
 fn split_act(x: &[f32]) -> SplitAct {
+    let _prof = crate::cpuprof::time(crate::cpuprof::Slot::SplitAct);
     let n = x.len();
     let rms = (x.iter().map(|&v| (v * v) as f64).sum::<f64>() / n.max(1) as f64).sqrt() as f32;
     let thr = 8.0 * rms;
@@ -9953,7 +9980,7 @@ fn split_act(x: &[f32]) -> SplitAct {
     if outliers.is_empty() {
         xq.extend(
             x.iter()
-                .map(|&v| (v * inv).round().clamp(-127.0, 127.0) as i8),
+                .map(|&v| q8_round(v * inv)),
         );
     } else {
         // Outlier slots quantize to 0 (their exact term is added later).
@@ -9961,7 +9988,7 @@ fn split_act(x: &[f32]) -> SplitAct {
             if v.abs() > thr {
                 0
             } else {
-                (v * inv).round().clamp(-127.0, 127.0) as i8
+                q8_round(v * inv)
             }
         }));
     }
@@ -9975,6 +10002,7 @@ fn split_act(x: &[f32]) -> SplitAct {
 }
 
 fn split_act_q8_2f(x: &[f32], col: &[f32]) -> SplitAct {
+    let _prof = crate::cpuprof::time(crate::cpuprof::Slot::SplitAct);
     let n = x.len();
     let rms = (x
         .iter()
@@ -10009,7 +10037,7 @@ fn split_act_q8_2f(x: &[f32], col: &[f32]) -> SplitAct {
         xq.extend(
             x.iter()
                 .zip(col)
-                .map(|(&a, &c)| ((a * c) * inv).round().clamp(-127.0, 127.0) as i8),
+                .map(|(&a, &c)| q8_round((a * c) * inv)),
         );
     } else {
         xq.extend(x.iter().zip(col).map(|(&a, &c)| {
@@ -10017,7 +10045,7 @@ fn split_act_q8_2f(x: &[f32], col: &[f32]) -> SplitAct {
             if v.abs() > thr {
                 0
             } else {
-                (v * inv).round().clamp(-127.0, 127.0) as i8
+                q8_round(v * inv)
             }
         }));
     }
@@ -10839,6 +10867,44 @@ impl SendMut {
 
 #[cfg(test)]
 mod tests {
+    /// `q8_round` must be `round().clamp(±127) as i8` bit for bit: every
+    /// half-integer, their neighbours one ulp either side, the clamp
+    /// boundary, huge values, infinities and NaN, plus a dense sweep.
+    #[test]
+    fn q8_round_is_round_clamp() {
+        let reference = |t: f32| t.round().clamp(-127.0, 127.0) as i8;
+        let mut probe = vec![
+            0.0f32,
+            -0.0,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::MAX,
+            f32::MIN,
+            1e30,
+            -1e30,
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+        ];
+        for k in -300i32..=300 {
+            let h = k as f32 * 0.5;
+            let up = f32::from_bits(h.to_bits() + 1);
+            let down = f32::from_bits(h.to_bits().wrapping_sub(1));
+            for t in [h, up, down] {
+                probe.push(t);
+                probe.push(-t);
+            }
+        }
+        let mut t = -140.0f32;
+        while t < 140.0 {
+            probe.push(t);
+            t += 0.000_731;
+        }
+        for t in probe {
+            assert_eq!(q8_round(t), reference(t), "t = {t:e} ({:#x})", t.to_bits());
+        }
+    }
+
     use super::*;
 
     #[test]

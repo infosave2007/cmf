@@ -2,6 +2,7 @@
 
 pub mod attention;
 pub mod chat_template;
+pub mod cpuprof;
 pub mod audiovae;
 pub mod dit;
 pub mod dsv4;
