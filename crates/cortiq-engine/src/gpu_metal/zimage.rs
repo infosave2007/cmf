@@ -72,10 +72,23 @@
 //! - CFG: the batch-2 program costs 2 × the single forward (8.11 s vs
 //!   4.06 s at 512²; compute-bound, no batching gain) and is bit-identical
 //!   to the two single forwards.
-//! - CPU + GPU co-run (not built): Accelerate sgemm 1.65 TF/s alone, the
-//!   GPU GEMM 3.2 alone; together 1.25 + 2.5..3.1 = 3.8..4.3 TF/s — the
-//!   only lever left above the MMA ceiling, at the price of sharing the
-//!   package's power and heat.
+//! - CPU share (M8, `cpu.rs`): Accelerate sgemm runs 1.65 TF/s alone and
+//!   1.14–1.23 beside the busy GPU (30 s co-run, the GPU 3.28 → 3.10), so
+//!   the CPU computes the last output features of every GEMM of ≥ 256
+//!   rows, ordered with the chain by an `MTLSharedEvent`. One-step sweep at
+//!   512² (6 steps a value, alternating): share 0 → 3.99–4.04 s, 0.20 →
+//!   3.30–3.43, 0.25 → 3.14–3.36, 0.30 → 3.10–3.65, 0.35 → 3.43–3.92.
+//!   Whole CLI, alternating with cool-downs: Turbo 512² 34.5 → 30.1 s per
+//!   image at 0.25 (−13 %), 1024² 165.4 → 155.2 s at 0.20 (−6 %: the gain
+//!   is largest on the cool first steps and fades as the package heats);
+//!   base CFG pair at 512² 8.11 → 6.66 s a step. The CPU's features are
+//!   f32, so a step is closer to the CPU path (Turbo r512 v 1.15e-3 →
+//!   7.0e-4, base 2.7e-4 → 2.2e-4). The default is fixed per chip (a
+//!   seed gives the same image every run; measured on "Apple M4" only,
+//!   off elsewhere); `CMF_ZI_CPU_FRAC=<x>` fixes a share, `=auto` runs a
+//!   controller that moves it ±0.03 a forward toward the CPU and GPU parts
+//!   finishing together (it settles at 0.20–0.27 on the M4 at 512²; the
+//!   partition then depends on timing and the image is not bit-stable).
 //!
 //! Range guards ([`Guards`], measured with `CMF_ZI_AMAX=1`, stored value
 //! after the guard, worst block): Turbo over 8 steps at 512² — q/k/v input
@@ -88,7 +101,9 @@
 //! buffer, default 2), `CMF_ZI_METAL_PROF=1` (per-class GPU ms; one command
 //! buffer per op), `CMF_ZI_AMAX=1`, `CMF_ZI_{ATTN,QKV,AO,FFN,HID}_SHIFT`,
 //! `CMF_ZI_METAL_REFINE=0` (CPU context refiner), `CMF_ZI_VAE=0` (the
-//! per-conv VAE), `CMF_ZI_VAE_CHUNK` (attention query chunk).
+//! per-conv VAE), `CMF_ZI_VAE_CHUNK` (attention query chunk),
+//! `CMF_ZI_CPU_FRAC=<x>|auto` (the CPU share; 0 = GPU only),
+//! `CMF_ZI_CPU_THREADS` (conversion workers, 4), `CMF_ZI_CPU_PROF=1`.
 
 use crate::gpu::{ZBlockRef, ZGeom, ZPrepareArgs, ZStepArgs};
 use cortiq_core::{CmfModel, TensorDtype};
