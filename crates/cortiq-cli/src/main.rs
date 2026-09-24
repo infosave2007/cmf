@@ -4226,6 +4226,28 @@ fn prepare_dsv41_cli_messages(
     .map_err(|e| anyhow::anyhow!(e))
 }
 
+/// Token ids for `CMF_PROMPT_IDS`: a JSON array (`[1, 2, 3]`) or plain ids
+/// separated by commas and/or whitespace. An empty list is an error.
+fn parse_prompt_ids(text: &str) -> anyhow::Result<Vec<u32>> {
+    let body = text.trim().trim_start_matches('[').trim_end_matches(']');
+    let ids = body
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<u32>()
+                .map_err(|e| anyhow::anyhow!("CMF_PROMPT_IDS: bad token id {s:?}: {e}"))
+        })
+        .collect::<anyhow::Result<Vec<u32>>>()?;
+    anyhow::ensure!(!ids.is_empty(), "CMF_PROMPT_IDS: no token ids");
+    Ok(ids)
+}
+
+fn read_prompt_ids(path: &std::path::Path) -> anyhow::Result<Vec<u32>> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("CMF_PROMPT_IDS: cannot read {}: {e}", path.display()))?;
+    parse_prompt_ids(&text)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn cmd_run(
     model_path: &str,
@@ -4776,10 +4798,21 @@ async fn cmd_run(
                 prepare_dsv41_cli_prompt(&model, &pipeline, p, images, no_think, reasoning_effort)
             })
             .transpose()?;
-        let ids = vl_inputs
+        let mut ids = vl_inputs
             .as_ref()
             .map(|inputs| inputs.token_ids.clone())
             .unwrap_or_else(|| build_ids(&pipeline, &history, p));
+        // CMF_PROMPT_IDS=<file>: feed exactly these token ids (a JSON array,
+        // or ids separated by commas/whitespace) instead of the tokenized
+        // prompt — parity runs against an oracle that tokenized elsewhere.
+        if let Some(path) = std::env::var_os("CMF_PROMPT_IDS") {
+            ids = read_prompt_ids(std::path::Path::new(&path))?;
+            eprintln!(
+                "CMF_PROMPT_IDS: {} ids from {}",
+                ids.len(),
+                path.to_string_lossy()
+            );
+        }
         // CMF_PROMPT_DUMP=1: the rendered prompt as the model sees it
         // (template applied, decoded back to text) — for template audits.
         if std::env::var("CMF_PROMPT_DUMP").is_ok() {
