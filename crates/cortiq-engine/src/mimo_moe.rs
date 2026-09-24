@@ -366,6 +366,8 @@ pub struct Stats {
     pub call_ns: u64,
     /// Calls that fell back to the host path.
     pub fallbacks: u64,
+    /// Wall time of the host route (router matvec + top-k) of bank calls, ns.
+    pub route_ns: u64,
 }
 
 static STATS: std::sync::Mutex<Stats> = std::sync::Mutex::new(Stats {
@@ -377,6 +379,7 @@ static STATS: std::sync::Mutex<Stats> = std::sync::Mutex::new(Stats {
     frame_ns: 0,
     call_ns: 0,
     fallbacks: 0,
+    route_ns: 0,
 });
 
 /// Process-wide executor counters (benches read deltas).
@@ -1061,6 +1064,13 @@ impl Slot {
         let _ = (li, m, before);
     }
 
+    /// Charge a bank call's host route time (the caller routes).
+    pub(crate) fn note_route(&self, ns: u64) {
+        if self.is_on() {
+            STATS.lock().unwrap().route_ns += ns;
+        }
+    }
+
     /// Run a routed MoE layer through the bank. `None` = not served (the
     /// caller runs the host path with the SAME route).
     pub(crate) fn forward(
@@ -1111,7 +1121,8 @@ impl Slot {
             eprintln!(
                 "mimo-moe token: {:.1} ms wall, bank calls {} | hits {:.1}% fills {} cold {} of {} \
                  picks | frame {:.2} ms (encode {:.2} wait {:.2} upload {:.2} pass {:.2}), bank \
-                 calls {:.2} ms | submits {} | card {:.2} ms over {} frames | bank free {} of {}",
+                 calls {:.2} ms, route {:.2} ms | submits {} | card {:.2} ms over {} frames | bank \
+                 free {} of {}",
                 t.elapsed().as_secs_f64() * 1e3,
                 s1.calls - s0.calls,
                 (s1.hits - s0.hits) as f64 / picks as f64 * 100.0,
@@ -1124,6 +1135,7 @@ impl Slot {
                 ms(2),
                 ms(3),
                 (s1.call_ns - s0.call_ns) as f64 / 1e6,
+                (s1.route_ns - s0.route_ns) as f64 / 1e6,
                 c1[4] - c0[4],
                 ms(5),
                 c1[6] - c0[6],
