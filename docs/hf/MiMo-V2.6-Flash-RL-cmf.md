@@ -17,7 +17,7 @@ language:
 
 # MiMo-V2.6-Flash-RL — CMF q4tp
 
-> **Release draft — do not publish yet.** The reference-layer drift audit and aquarium example are not complete.
+> **Release draft — do not publish yet.** The aquarium example is not yet browser-qualified.
 > The VRAM ladder exposed staging-memory peaks; a bounded-upload fix is under test.
 > Strict vision cosine and video timestamp gates remain open. These packages
 > are candidates; the MiMo-enabled engine has not been released as 0.7.7.
@@ -81,7 +81,8 @@ cortiq bench MiMo-V2.6-Flash-RL-q4tp.cmf --core --tokens 128 --ignore-eos --json
 ```
 
 Three default-setting runs: **32.20 / 41.40 / 40.85 tok/s; median 40.85**.
-No steady-window weight uploads were recorded. This is a warmed synthetic
+The generic upload counter reported zero in the steady window; it is not a
+measurement of all dynamic-bank PCIe traffic. This is a warmed synthetic
 core benchmark, not a promise of 40 tok/s for every prompt or sampling mode.
 
 Natural 128-token greedy prompts, one loaded model:
@@ -112,6 +113,14 @@ These runs expose temporary allocations above the configured weight budget;
 candidate is under test. Host RAM must also accommodate mapped text weights
 and execution state. No unverified low-memory compatibility is claimed.
 
+The long-context reference audit localized the earlier drift to one **exact
+router tie** (position 79, layer index 7, experts 16 versus 45). Replaying
+engine expert IDs in the independent CMF-weight oracle, while recomputing
+router weights from its own activations, left a maximum layer relative-L2 of
+**3.75e-5** over the audited positions. Only that one route set differed from
+the oracle's natural choices, with score gap zero. This is the specified
+near-tie explanation gate, not a claim of free-running bitwise HF parity.
+
 ## Full package
 
 ```bash
@@ -135,7 +144,8 @@ scores and prevent claiming full qualification.
 
 ## Verify the download
 
-Checksum files must be generated/verified before publication. After release:
+Candidate SHA-256 files have been generated, and all three files passed
+`cortiq verify` (envelope, tensor directory and per-tensor hashes). After release:
 
 ```bash
 sha256sum -c MiMo-V2.6-Flash-RL-q4tp.cmf.sha256

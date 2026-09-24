@@ -213,3 +213,32 @@ preparation. The GPU regression now extends beyond position 300 to exercise
 split-K full attention as well as SWA. Separate 8/16-worker trials compare
 CPU scheduling overhead against the previous revision. Do not assume these
 candidates passed until the `head2/` logs say so.
+
+
+## Accepted worker-placement correction and reference audit (2026-09-24)
+
+The later `fb5ac916` gate supersedes the older trial summaries above. CPU-only
+placement was thread-local but whole expert FFNs were dispatched to Pool
+workers without inheriting that scope. Propagating the guard prevents workers
+from re-entering GPU hooks. A regression checks inheritance and restoration
+on real worker threads. Graph-off diagnostics now also disable the singleton
+attention graph, so rewinding host KV cannot leave its device mirror ahead.
+
+PPL128 is 3.647 on CPU, full-budget GPU and two 24000-MiB repetitions. All 12
+EN/RU/code arms (128 tokens each) match; a 456-token exact-float CPU/GPU prompt
+matches all 64 subsequent greedy IDs. Actual CLI core128 is
+32.2043/41.3997/40.8517 tok/s, median 40.8517; not every run or natural prompt
+exceeds 40. MTP is not a universal speedup.
+
+The independent CMF-weight oracle's forced-route audit explains the earlier
+position127+ drift: at layer index7, position79, experts 16/45 tie exactly.
+Keeping engine expert IDs but independently recomputing router weights reduces
+the maximum audited per-layer relative-L2 to 3.7506e-5. There is exactly one
+natural route-set disagreement along that trajectory and its forced score
+gap is 0. This passes the documented alternative near-tie explanation gate;
+it is explicitly a counterfactual, not free-running bitwise HF parity.
+
+The budget ladder exposes two further checks: 64000 MiB gives a 44.48 tok/s
+median, but temporary VRAM peaks exceed configured **weight** budgets. A
+bounded background-upload candidate and fresh placement A/B are under test.
+Do not present these budget tests as physical 16–80GB-card qualification.
