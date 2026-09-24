@@ -1553,7 +1553,14 @@ pub fn flash_src(f: FlashCfg) -> String {
         let _ = writeln!(s, "    pm = max(pm, ss[sbase + {e}u] * p.scl);");
     }
     let _ = writeln!(s, "    smx[tid] = pm;");
-    let _ = writeln!(s, "    if (pm > mu + {}) {{ sfl[kb & 1u] = 1u; }}", flash_thr());
+    // Only rows inside the segment vote for the (workgroup-wide) rescale.
+    // The last query block of a segment whose length is not a multiple
+    // of nw·16 also holds rows past its end — the next CFG item's rows in
+    // a batch-2 program, pad rows in a batch-1 one — and their votes
+    // re-anchored the live rows' max: exact in real arithmetic, but a
+    // different f16 rounding of P, so a CFG pair's first item came out
+    // 2.2e-4 away from its own single forward (vk2).
+    let _ = writeln!(s, "    if (pm > mu + {} && q0 + r < p.len) {{ sfl[kb & 1u] = 1u; }}", flash_thr());
     let _ = writeln!(s, "    let need = workgroupUniformLoad(&sfl[kb & 1u]);");
     let _ = writeln!(s, "    if (tid == 0u) {{ sfl[(kb + 1u) & 1u] = 0u; }}");
     let _ = writeln!(s, "    let rmax = max(pm, smx[tid ^ 16u]);");

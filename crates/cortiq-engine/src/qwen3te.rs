@@ -369,6 +369,18 @@ impl Qwen3Encoder {
         if self.exact_q8 && q8_exact_matmat(p, xs, n, out, pool).is_some() {
             return;
         }
+        // The projections kept at 16 bit (Z-Image: layer 6's down_proj,
+        // the massive-activation layer) are F32 here, and `matmat` sends a
+        // large F32 GEMM to the device whenever the device is on — the
+        // cooperative f32 GEMM, which is tf32-class (vk2: it alone moved
+        // the residual by 2.2e-4 at layer 6 and kept it there). The exact
+        // mode keeps them on the host f32 GEMM (0.5 GFLOP at 22 tokens).
+        if self.exact_q8 {
+            if let Proj::F32 { w, rows, cols } = p {
+                crate::fcd_ops::gemm_nt_host(xs, w, out, n, *cols, *rows, pool);
+                return;
+            }
+        }
         p.matmat(xs, n, out, pool);
     }
 
