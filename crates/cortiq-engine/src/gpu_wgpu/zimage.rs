@@ -39,9 +39,9 @@
 //!   - 2×4 / 4×2 / 256-wide tiles: 42–52 TF;
 //!   - BK=64: equal or −3 %.
 //!   `acc16_probe` (f16 accumulators with no flush, so a wrong answer)
-//!   runs the BK=64 tile at 80 TF. That is the ceiling a flushed
-//!   f16-accumulate arm could approach. It is not built, because its
-//!   precision at K=10240 needs the real-weight gates first.
+//!   runs the BK=64 tile at 80 TF. The flushed arm built on it
+//!   ([`MmCfg::acc16`], vk2) loses on both counts and stays off; see
+//!   "# vk2" below.
 //! - `zi_flash`: bidirectional flash attention, heads 30×128, read straight
 //!   out of the fused qkv panel (no head-major pack). Q·K and P·V are f16
 //!   on the matrix units. The softmax is f32 online with the lazy
@@ -192,6 +192,48 @@
 //!   both to `let`s first.
 //! - A `var` of cooperative-matrix type declared inside a loop is zeroed
 //!   once, at function entry, not once per iteration.
+//!
+//! # vk2: f16 accumulation measured and rejected; CFG pair made exact
+//!
+//! - Flushed f16 accumulation ([`MmCfg::acc16`] = F, `CMF_ZI_ACC16`,
+//!   `CMF_ZI_TILE16`): the MMAs of F K slices accumulate in f16
+//!   fragments, which are then added exactly into the f32 accumulators
+//!   (WGSL has no conversion between cooperative-matrix types, so a
+//!   fragment is stored through the idle staging arrays, reloaded as an A
+//!   operand and multiplied by the identity into the f32 C: one f32 MMA
+//!   and 1 KB of shared traffic per fragment per flush, two barriers).
+//!   - Speed (`zimage_gemmbench mm`, the four sites, M 1056–8448): the
+//!     best tile, 128×64×64 2×2 flushed every slice, 41–48 TF; 128×128×64
+//!     42–50; flushing every 2–4 slices 25–40 (the conditional flush and
+//!     the doubled accumulator set cost more than the rarer flush saves);
+//!     the f32 arm 51–61 TF. Real steps (flag-free CLI, 3 alternating
+//!     runs, medians): Turbo 512² 0.256 → 0.308 s, 1024² 1.039 → 1.224 s,
+//!     base 512² 0.486 → 0.585 s, 1024² 2.030 → 2.417 s: +19–21 %.
+//!   - Precision against f64 (`prec`): the matrix unit rounds the f16
+//!     accumulator after every 16-deep MMA, so the error grows with the
+//!     flush period and does not shrink below one rounding per MMA: f32
+//!     epilogue 3.3e-4 (F·BK = 32), 4.4e-4 (64), 6.0e-4 (128), 8.5e-4
+//!     (256) at K = 3840 and 10240 alike, against 6.2e-6 / 1.6e-5 for the
+//!     f32 arm; f16 epilogues 3.9e-4 to 8.7e-4 against the 2.1e-4 output
+//!     rounding floor. A numpy model of per-MMA f16 rounding predicts the
+//!     same numbers, so no flush schedule meets the f16-epilogue gate.
+//!   - Whole images (Turbo 512² p0 / p1 on the oracle noise): PSNR vs the
+//!     CPU pipeline 46.3 / 45.6 dB (f32 arm 53.4 / 45.5), vs fp32 26.10 /
+//!     25.97 dB (f32 arm 26.11 / 26.08); v_0 vs CPU 1.3e-3 / 1.5e-3 (f32
+//!     arm 8.9e-4 / 1.1e-3).
+//!   Slower and less precise, so the chain keeps f32 accumulation
+//!   (`ACC16_DEFAULT = 0`); the arm stays as a knob and a test.
+//! - CFG pair: `zi_flash`'s lazy-rescale decision is workgroup-wide
+//!   (`workgroupUniformLoad`, the matrix ops need uniform control flow),
+//!   and the last query block of a segment whose length is not a multiple
+//!   of 64 also holds rows past the segment's end. Those rows voted, so the
+//!   pair's first item (whose block spills into the second item's rows)
+//!   was re-anchored differently from its single forward (pad rows there):
+//!   exact in real arithmetic, a different f16 rounding of P, 2.2e-4 on v
+//!   (base r512 i0, both orders: always the first item). Only rows inside
+//!   the segment vote now; the pair is bit-identical to the two singles, in
+//!   either order, block by block. Turbo (batch 1) outputs are unchanged
+//!   bit for bit (its pad query rows are zero and never outvote).
 
 use crate::gpu::{ZBlockRef, ZGeom, ZPrepareArgs, ZStepArgs};
 use cortiq_core::CmfModel;

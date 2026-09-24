@@ -509,6 +509,18 @@ impl Qwen3Encoder {
         let mut attn = vec![0f32; n * nh * hd];
         let mut proj = vec![0f32; n * hs];
 
+        // `CMF_TE_TAPS=<dir>`: the residual after every layer and the
+        // intermediates of every layer (parity work).
+        let taps = std::env::var("CMF_TE_TAPS").ok();
+        let tap = |name: String, v: &[f32]| {
+            if let Some(dir) = &taps {
+                let _ = std::fs::create_dir_all(dir);
+                let _ = std::fs::write(
+                    std::path::Path::new(dir).join(format!("{name}.f32")),
+                    v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>(),
+                );
+            }
+        };
         for (li, layer) in self.layers.iter().enumerate() {
             for (o, src) in xn.chunks_exact_mut(hs).zip(h.chunks_exact(hs)) {
                 rms_norm_into(src, &layer.input_norm, self.eps, o);
@@ -556,10 +568,13 @@ impl Qwen3Encoder {
                 None => heads(0, nh),
             }
 
+            tap(format!("layer{li}_q"), &q_all);
+            tap(format!("layer{li}_attn"), &attn);
             self.mm(&layer.o, 3, &attn, n, &mut proj, pool);
             for (d, &v) in h.iter_mut().zip(&proj) {
                 *d += v;
             }
+            tap(format!("layer{li}_h_mid"), &h);
 
             for (o, src) in xn.chunks_exact_mut(hs).zip(h.chunks_exact(hs)) {
                 rms_norm_into(src, &layer.post_attn_norm, self.eps, o);
@@ -569,20 +584,17 @@ impl Qwen3Encoder {
             let mut u = vec![0f32; n * inter];
             self.mm(&layer.gate, 4, &xn, n, &mut g, pool);
             self.mm(&layer.up, 5, &xn, n, &mut u, pool);
+            tap(format!("layer{li}_gate"), &g);
             for (a, &b) in g.iter_mut().zip(&u) {
                 *a = silu(*a) * b;
             }
+            tap(format!("layer{li}_act"), &g);
             self.mm(&layer.down, 6, &g, n, &mut proj, pool);
+            tap(format!("layer{li}_down"), &proj);
             for (d, &v) in h.iter_mut().zip(&proj) {
                 *d += v;
             }
-            if let Ok(dir) = std::env::var("CMF_TE_TAPS") {
-                let _ = std::fs::create_dir_all(&dir);
-                let _ = std::fs::write(
-                    std::path::Path::new(&dir).join(format!("layer{li}.f32")),
-                    h.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
-                );
-            }
+            tap(format!("layer{li}"), &h);
             if let Some(f) = deepstack.get(li) {
                 for (k, &row) in visual.iter().enumerate() {
                     for c in 0..hs {
