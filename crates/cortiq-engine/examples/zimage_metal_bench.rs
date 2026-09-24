@@ -66,16 +66,18 @@ fn main() {
             let (_, med, _) = bench_gemm(10240, 3840, 1056, reps, "base").unwrap();
             2.0 * 10240.0 * 3840.0 * 1056.0 / med / 1e9
         };
+        // ZB_SECS: the co-run window (default 4 s; the GPU arm runs ~40 GEMMs a second)
+        let secs: f64 = std::env::var("ZB_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(4.0);
         for round in 0..2 {
-            let c = cpu_run(&mut y, 4.0);
-            let g = gpu_run(40);
+            let c = cpu_run(&mut y, secs);
+            let g = gpu_run((secs * 10.0) as usize);
             let (c2, g2) = std::thread::scope(|s| {
                 let h = s.spawn(|| {
                     let mut yy = vec![0f32; n * m];
-                    cpu_run(&mut yy, 4.0)
+                    cpu_run(&mut yy, secs)
                 });
                 std::thread::sleep(std::time::Duration::from_millis(200));
-                let g2 = gpu_run(80);
+                let g2 = gpu_run((secs * 20.0) as usize);
                 (h.join().unwrap(), g2)
             });
             println!("corun r{round}: cpu alone {c:.2} TF · gpu alone {g:.2} TF · together cpu {c2:.2} + gpu {g2:.2} = {:.2} TF", c2 + g2);
