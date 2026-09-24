@@ -357,7 +357,8 @@ pub fn generate_images(
     let t0 = Instant::now();
     let overlap = crate::zimage::gpu_allowed()
         && std::env::var("CMF_ZIMAGE_OVERLAP").as_deref() != Ok("0")
-        && std::env::var("CMF_ZIMAGE_TE_GPU").as_deref() != Ok("1");
+        && std::env::var("CMF_ZIMAGE_TE_GPU").as_deref() != Ok("1")
+        && std::env::var("CMF_ZIMAGE_TE_DEV").is_err();
     let (te, preload) = std::thread::scope(|sc| {
         let helper = overlap.then(|| {
             sc.spawn(|| {
@@ -375,13 +376,20 @@ pub fn generate_images(
             // not); the plane upload beside it goes straight to the device
             // context, which the pause does not gate.
             // `CMF_ZIMAGE_TE_GPU=1` restores the device arm for A/B work.
-            let _cpu = (std::env::var("CMF_ZIMAGE_TE_GPU").as_deref() != Ok("1"))
+            // `CMF_ZIMAGE_TE_DEV=all|q,k,…`: those projections through the
+            // device GEMM of their codec, the rest exact on the host (the
+            // device-TE experiment, vk2; see qwen3te `set_device_ops`).
+            let te_dev = std::env::var("CMF_ZIMAGE_TE_DEV").ok();
+            let _cpu = (std::env::var("CMF_ZIMAGE_TE_GPU").as_deref() != Ok("1") && te_dev.is_none())
                 .then(crate::gpu::pause_gpu);
             let mut enc = crate::qwen3te::Qwen3Encoder::from_cmf(&model)?;
             // Weight-only exact q8 projections (B2): the default a8w8
             // kernel triples the caption error (h_m2 1.35e-2 vs 4.1e-3).
             // `CMF_ZIMAGE_TE_EXACT=0` = the a8w8 arm.
             enc.set_exact_q8(std::env::var("CMF_ZIMAGE_TE_EXACT").as_deref() != Ok("0"));
+            if let Some(spec) = &te_dev {
+                enc.set_device_ops(spec);
+            }
             let cap = enc.encode(&ids);
             let ncap = neg_ids.as_ref().map(|n| enc.encode(n));
             Ok((cap, ncap))

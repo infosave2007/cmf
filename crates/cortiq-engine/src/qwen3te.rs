@@ -66,7 +66,14 @@ pub struct Qwen3Encoder {
     /// Weight-only exact q8 projections (`q8_exact_matmat`); off by
     /// default — the Z-Image pipeline turns it on.
     exact_q8: bool,
+    /// Projections (bit per `PROJ_NAMES` entry) that go through the
+    /// device GEMM of their codec (`QTensor::device_matmat`) before the
+    /// host kernels — the device-text-encoder experiment (vk2). 0 = off.
+    dev_ops: u8,
 }
+
+/// Projection names, in `dev_ops` bit order.
+pub const PROJ_NAMES: [&str; 7] = ["q", "k", "v", "o", "gate", "up", "down"];
 
 fn rms_norm_into(x: &[f32], w: &[f32], eps: f64, dst: &mut [f32]) {
     let ss = x.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / x.len() as f64;
@@ -326,6 +333,7 @@ impl Qwen3Encoder {
             theta: cfg["rope_theta"].as_f64().unwrap_or(5e6) as f32,
             eps: cfg["rms_norm_eps"].as_f64().unwrap_or(1e-6),
             exact_q8: false,
+            dev_ops: 0,
         })
     }
 
@@ -336,7 +344,28 @@ impl Qwen3Encoder {
         self.exact_q8 = on;
     }
 
-    fn mm(&self, p: &Proj, xs: &[f32], n: usize, out: &mut [f32], pool: Option<&Pool>) {
+    /// Route the named projections (`all`, or a comma list of
+    /// `PROJ_NAMES`) through the device GEMM of their codec; the host
+    /// kernels stay the fallback. Experiment knob (`CMF_TE_DEV`).
+    pub fn set_device_ops(&mut self, spec: &str) {
+        self.dev_ops = 0;
+        for t in spec.split(',').map(str::trim) {
+            if t == "all" {
+                self.dev_ops = 0x7f;
+            } else if let Some(i) = PROJ_NAMES.iter().position(|n| *n == t) {
+                self.dev_ops |= 1 << i;
+            }
+        }
+    }
+
+    fn mm(&self, p: &Proj, which: usize, xs: &[f32], n: usize, out: &mut [f32], pool: Option<&Pool>) {
+        if self.dev_ops & (1 << which) != 0 {
+            if let Proj::Q(q) = p {
+                if q.device_matmat(&xs[..n * q.cols()], n, &mut out[..n * q.rows()]) {
+                    return;
+                }
+            }
+        }
         if self.exact_q8 && q8_exact_matmat(p, xs, n, out, pool).is_some() {
             return;
         }
@@ -472,9 +501,9 @@ impl Qwen3Encoder {
             for (o, src) in xn.chunks_exact_mut(hs).zip(h.chunks_exact(hs)) {
                 rms_norm_into(src, &layer.input_norm, self.eps, o);
             }
-            self.mm(&layer.q, &xn, n, &mut q_all, pool);
-            self.mm(&layer.k, &xn, n, &mut k_all, pool);
-            self.mm(&layer.v, &xn, n, &mut v_all, pool);
+            self.mm(&layer.q, 0, &xn, n, &mut q_all, pool);
+            self.mm(&layer.k, 1, &xn, n, &mut k_all, pool);
+            self.mm(&layer.v, 2, &xn, n, &mut v_all, pool);
             self.norm_rope(&mut q_all, n, nh, &layer.q_norm, &pos);
             self.norm_rope(&mut k_all, n, nkv, &layer.k_norm, &pos);
 
@@ -515,7 +544,7 @@ impl Qwen3Encoder {
                 None => heads(0, nh),
             }
 
-            self.mm(&layer.o, &attn, n, &mut proj, pool);
+            self.mm(&layer.o, 3, &attn, n, &mut proj, pool);
             for (d, &v) in h.iter_mut().zip(&proj) {
                 *d += v;
             }
@@ -526,14 +555,21 @@ impl Qwen3Encoder {
             let inter = layer.gate.rows();
             let mut g = vec![0f32; n * inter];
             let mut u = vec![0f32; n * inter];
-            self.mm(&layer.gate, &xn, n, &mut g, pool);
-            self.mm(&layer.up, &xn, n, &mut u, pool);
+            self.mm(&layer.gate, 4, &xn, n, &mut g, pool);
+            self.mm(&layer.up, 5, &xn, n, &mut u, pool);
             for (a, &b) in g.iter_mut().zip(&u) {
                 *a = silu(*a) * b;
             }
-            self.mm(&layer.down, &g, n, &mut proj, pool);
+            self.mm(&layer.down, 6, &g, n, &mut proj, pool);
             for (d, &v) in h.iter_mut().zip(&proj) {
                 *d += v;
+            }
+            if let Ok(dir) = std::env::var("CMF_TE_TAPS") {
+                let _ = std::fs::create_dir_all(&dir);
+                let _ = std::fs::write(
+                    std::path::Path::new(&dir).join(format!("layer{li}.f32")),
+                    h.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+                );
             }
             if let Some(f) = deepstack.get(li) {
                 for (k, &row) in visual.iter().enumerate() {

@@ -797,11 +797,17 @@ pub struct MmCfg {
     /// K = 9·cin in (tap, channel) order), 2 = the same on the nearest-2×
     /// upsample of `act` (the image is at half the output size).
     pub conv: u32,
+    /// f16 accumulation flushed into f32 (vk2): 0 = f32 accumulators;
+    /// F > 0 = the MMAs of F consecutive K slices accumulate in f16
+    /// fragments (the 2x matrix-unit rate), which are then added into the
+    /// f32 accumulators exactly (stored through the idle staging arrays,
+    /// reloaded as an A operand, multiplied by the identity).
+    pub acc16: u32,
 }
 
 impl MmCfg {
     pub const fn new(bm: u32, bn: u32, bk: u32, wm: u32, wn: u32, epi: Epi) -> Self {
-        Self { bm, bn, bk, wm, wn, epi, direct: false, acc16_probe: false, stages: 1, conv: 0 }
+        Self { bm, bn, bk, wm, wn, epi, direct: false, acc16_probe: false, stages: 1, conv: 0, acc16: 0 }
     }
     pub fn valid(&self) -> bool {
         let nt = self.wm * self.wn * 32;
@@ -818,6 +824,15 @@ impl MmCfg {
             && (self.bn * vpr) % nt == 0
             && (self.epi != Epi::SwiGlu || (tn / 16) % 2 == 0)
             && (self.conv == 0 || (!self.direct && self.stages == 1 && !self.acc16_probe && nt % vpr == 0))
+            && (self.acc16 == 0 || (!self.direct && self.stages == 1 && !self.acc16_probe && self.conv == 0))
+            && (self.acc16 == 0 || self.flush_slots().0 + self.flush_slots().1 > 0)
+    }
+    /// Flush slots (16x16 f16 fragments) per subgroup in the staging
+    /// arrays `sa`, `sb` (acc16 arm).
+    pub fn flush_slots(&self) -> (u32, u32) {
+        let lds = self.bk + 8;
+        let nw = (self.wm * self.wn).max(1);
+        ((self.bm * lds / 256) / nw, (self.bn * lds / 256) / nw)
     }
     fn key(&self) -> String {
         format!(
@@ -836,6 +851,8 @@ impl MmCfg {
                 "_s2".to_string()
             } else if self.conv != 0 {
                 format!("_conv{}", self.conv)
+            } else if self.acc16 != 0 {
+                format!("_a{}", self.acc16)
             } else {
                 String::new()
             }
@@ -962,7 +979,21 @@ pub fn mm_src(g: MmCfg) -> String {
     for i in 0..fm {
         for j in 0..fnn {
             let _ = writeln!(s, "  var c{i}_{j}: coop_mat16x16<{}, C>;", if g.acc16_probe { "f16" } else { "f32" });
+            if g.acc16 != 0 {
+                let _ = writeln!(s, "  var h{i}_{j}: coop_mat16x16<f16, C>;");
+            }
         }
+    }
+    if g.acc16 != 0 {
+        // The identity (B operand of the flush) through the idle `sa`,
+        // then a barrier so the K loop's first store cannot clobber it
+        // before every subgroup has loaded it. `z16` is never written:
+        // the zero every flushed fragment restarts from.
+        let _ = writeln!(s, "  var z16: coop_mat16x16<f16, C>;");
+        let _ = writeln!(s, "  for (var e = tid; e < 256u; e = e + {nt}u) {{ sa[e] = select(0.0h, 1.0h, e / 16u == e % 16u); }}");
+        let _ = writeln!(s, "  workgroupBarrier();");
+        let _ = writeln!(s, "  let eye = coopLoad<coop_mat16x16<f16, B>>(&sa[0], 16u);");
+        let _ = writeln!(s, "  workgroupBarrier();");
     }
     let _ = writeln!(s, "  let nkt = p.k / {}u;", g.bk);
     if g.direct {
@@ -1071,13 +1102,17 @@ pub fn mm_src(g: MmCfg) -> String {
                         kk * 16
                     );
                     for j in 0..fnn {
-                        let _ = writeln!(s, "      c{i}_{j} = coopMultiplyAdd(a{i}, b{j}, c{i}_{j});");
+                        let acc = if g.acc16 != 0 { "h" } else { "c" };
+                        let _ = writeln!(s, "      {acc}{i}_{j} = coopMultiplyAdd(a{i}, b{j}, {acc}{i}_{j});");
                     }
                 }
                 let _ = writeln!(s, "    }}");
             }
 
         let _ = writeln!(s, "    workgroupBarrier();");
+        if g.acc16 != 0 {
+            mm_flush16(&mut s, g, fm, fnn);
+        }
         let _ = writeln!(s, "  }}");
         }
     }
@@ -1148,6 +1183,46 @@ pub fn mm_src(g: MmCfg) -> String {
     }
     let _ = writeln!(s, "}}");
     s
+}
+
+/// The acc16 flush after K slice `kt` (every `acc16` slices and after the
+/// last one), with `sa`/`sb` idle (the slice's trailing barrier has run):
+/// each f16 fragment is stored into this subgroup's slots, reloaded as an
+/// A operand and added into its f32 accumulator as `h*I` (exact), then
+/// restarted from zero. Rounds of as many fragments as the slots hold,
+/// two workgroup barriers each (store -> load, load -> the next store).
+fn mm_flush16(s: &mut String, g: MmCfg, fm: u32, fnn: u32) {
+    use std::fmt::Write;
+    let (na, nb) = g.flush_slots();
+    let cap = (na + nb) as usize;
+    let frags: Vec<(u32, u32)> = (0..fm).flat_map(|i| (0..fnn).map(move |j| (i, j))).collect();
+    let _ = writeln!(s, "    if ((kt + 1u) % {}u == 0u || kt + 1u == nkt) {{", g.acc16);
+    // (array, index expression) of slot k; naga 30 wants a coop store's
+    // runtime index bound to a `let` before the store.
+    let slot = |k: usize| -> (&'static str, String) {
+        let k = k as u32;
+        if k < na {
+            ("sa", format!("(sg * {na}u + {k}u) * 256u"))
+        } else {
+            ("sb", format!("(sg * {nb}u + {}u) * 256u", k - na))
+        }
+    };
+    for round in frags.chunks(cap) {
+        for (k, (i, j)) in round.iter().enumerate() {
+            let (arr, ix) = slot(k);
+            let _ = writeln!(s, "      {{ let fo = {ix}; coopStore(h{i}_{j}, &{arr}[fo], 16u); }}");
+        }
+        let _ = writeln!(s, "      workgroupBarrier();");
+        for (k, (i, j)) in round.iter().enumerate() {
+            let (arr, ix) = slot(k);
+            let _ = writeln!(
+                s,
+                "      {{ let fo = {ix}; let hm = coopLoad<coop_mat16x16<f16, A>>(&{arr}[fo], 16u); c{i}_{j} = coopMultiplyAdd(hm, eye, c{i}_{j}); h{i}_{j} = z16; }}"
+            );
+        }
+        let _ = writeln!(s, "      workgroupBarrier();");
+    }
+    let _ = writeln!(s, "    }}");
 }
 
 /// The K loop with two shared stages: while slice kt is multiplied out of
@@ -3059,13 +3134,53 @@ pub struct ZTiles {
     pub guards: ZGuards,
 }
 
+/// The flush period of the f16-accumulate arm at one chain GEMM site
+/// (`qkv`, `o`, `w13`, `w2`), 0 = f32 accumulation. `CMF_ZI_ACC16`:
+/// `0` (off), `N` (every site), or `qkv=N,o=N,w13=N,w2=N` (unnamed
+/// sites off). Unset = [`ACC16_DEFAULT`].
+pub fn acc16_for(site: &str) -> u32 {
+    let Ok(v) = std::env::var("CMF_ZI_ACC16") else {
+        return ACC16_DEFAULT;
+    };
+    if let Ok(n) = v.trim().parse::<u32>() {
+        return n;
+    }
+    v.split(',')
+        .filter_map(|kv| kv.split_once('='))
+        .find(|(k, _)| k.trim() == site)
+        .and_then(|(_, n)| n.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// The chain's default flush period (0 = the f32-accumulate arm).
+pub const ACC16_DEFAULT: u32 = 0;
+
+/// A chain site's tile with the acc16 arm applied: `CMF_ZI_TILE16`
+/// (`bm,bn,bk,wm,wn`) overrides the tile of an acc16 site; an invalid
+/// combination keeps the f32 arm.
+pub fn site_cfg(epi: Epi, site: &str) -> MmCfg {
+    let base = default_cfg(epi);
+    let f = acc16_for(site);
+    if f == 0 {
+        return base;
+    }
+    let mut g = MmCfg { acc16: f, ..base };
+    if let Ok(t) = std::env::var("CMF_ZI_TILE16") {
+        let v: Vec<u32> = t.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        if v.len() == 5 {
+            g = MmCfg { acc16: f, ..MmCfg::new(v[0], v[1], v[2], v[3], v[4], epi) };
+        }
+    }
+    if g.valid() { g } else { base }
+}
+
 impl Default for ZTiles {
     fn default() -> Self {
         ZTiles {
-            qkv: default_cfg(Epi::F16),
-            o: default_cfg(Epi::F32),
-            w13: default_cfg(Epi::SwiGlu),
-            w2: default_cfg(Epi::F32),
+            qkv: site_cfg(Epi::F16, "qkv"),
+            o: site_cfg(Epi::F32, "o"),
+            w13: site_cfg(Epi::SwiGlu, "w13"),
+            w2: site_cfg(Epi::F32, "w2"),
             flash: default_flash(),
             guards: ZGuards::TURBO.with_env(),
         }
