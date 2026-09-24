@@ -183,3 +183,36 @@ fn nanbeige_tool_history_round_trips() {
         "tool result lost:\n{text}"
     );
 }
+
+// ── MiniCPM5 — the vendor template, byte-for-byte ──
+
+/// The ORIGINAL openbmb/MiniCPM5-2B template calls
+/// `tojson(ensure_ascii=False)`, which minijinja's built-in rejected:
+/// every request with tools failed to render and the server served a
+/// toolless ChatML prompt instead. The fixture holds transformers'
+/// renders of the same conversations — tool declarations with
+/// non-ASCII text, `<>&"`, non-alphabetical key order, tool-call
+/// history with CDATA, int and bool arguments, a dict tool result —
+/// and every one must come out identical.
+#[test]
+fn minicpm5_vendor_template_renders_like_transformers() {
+    let mut t = Tokenizer::byte_level();
+    t.chat_template = Some(include_str!("fixtures/minicpm5_chat_template.jinja").to_string());
+    let fx: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/minicpm5_template_renders.json")).unwrap();
+    let cases = fx["cases"].as_array().unwrap();
+    let mut with_tools = 0;
+    for (i, case) in cases.iter().enumerate() {
+        let msgs: Vec<serde_json::Value> = case["messages"].as_array().unwrap().clone();
+        let tools: Option<Vec<serde_json::Value>> =
+            case.get("tools").and_then(|t| t.as_array()).cloned();
+        with_tools += tools.is_some() as usize;
+        let think = case.get("enable_thinking").and_then(|v| v.as_bool());
+        if let Err(e) = t.try_apply_chat_template_json(&msgs, tools.as_deref(), think) {
+            panic!("case {i}: render error {e}");
+        }
+        let got = t.render_chat_json(&msgs, tools.as_deref(), think).unwrap();
+        assert_eq!(got, case["hf_text"].as_str().unwrap(), "case {i}");
+    }
+    assert!(with_tools >= 3, "the fixture must exercise the tools branch");
+}

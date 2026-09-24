@@ -1,6 +1,7 @@
 //! Cortiq inference engine — sparse forward pass, attention, tokenization, sampling.
 
 pub mod attention;
+pub mod chat_template;
 pub mod audiovae;
 pub mod dit;
 pub mod dsv4;
