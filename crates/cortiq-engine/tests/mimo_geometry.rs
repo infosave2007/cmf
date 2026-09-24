@@ -3,8 +3,9 @@
 //! with its header must fail to load with a message naming the tensor —
 //! the mapped matvec would otherwise read a short V or a wide o_proj
 //! silently. A consistent file loads, carries the geometry, gets the 32k
-//! context cap despite a 1M `max_position_embeddings`, declines the GPU
-//! graphs and runs.
+//! context cap despite a 1M `max_position_embeddings`, reports the
+//! per-layer geometry (which the wgpu graphs carry and the Metal graphs
+//! decline) and runs.
 
 use std::sync::Arc;
 

@@ -1166,6 +1166,7 @@ impl Music3Ar {
                         output_gate: false,
                         cpu_k: &cache[li][bi].k,
                         cpu_v: &cache[li][bi].v,
+                        geom: None,
                     },
                     post_norm: &blk.n2.w,
                     ffn: crate::gpu::GraphFfn::Dense {

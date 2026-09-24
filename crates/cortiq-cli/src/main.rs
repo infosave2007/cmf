@@ -4357,6 +4357,11 @@ async fn cmd_run(
         None => Pipeline::from_model_with_skill(&model, sampler, skill.as_deref())?,
     };
     o1.apply(&mut pipeline);
+    // CMF_IGNORE_EOS=1: decode the full --max-tokens (backend parity runs
+    // compare a fixed number of steps; `bench --ignore-eos` is the twin).
+    if std::env::var("CMF_IGNORE_EOS").as_deref() == Ok("1") {
+        pipeline.ignore_eos = true;
+    }
     let is_dsv41 = model.arch().arch_name == "deepseek_v41";
     if !is_dsv41 && (!images.is_empty() || reasoning_effort.is_some()) {
         anyhow::bail!("--image and --reasoning-effort are supported only for DeepSeek-V4.1");
