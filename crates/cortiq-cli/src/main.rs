@@ -6450,11 +6450,14 @@ async fn cmd_bench(
     let prefill_s = if generation_prefill {
         None
     } else {
+        cortiq_engine::cpuprof::reset();
         let t0 = std::time::Instant::now();
         let _ = pipeline
             .forward_ids(&prompt_ids, mask.as_ref())
             .map_err(|e| anyhow::anyhow!(e))?;
-        Some(t0.elapsed().as_secs_f64())
+        let dt = t0.elapsed().as_secs_f64();
+        cortiq_engine::cpuprof::report("prefill forward_ids", prompt_ids.len());
+        Some(dt)
     };
 
     // Pair-fusion micro-bench: the memory-traffic win MTP verify rides
@@ -6490,11 +6493,13 @@ async fn cmd_bench(
         ));
         true
     });
+    cortiq_engine::cpuprof::reset();
     let t1 = std::time::Instant::now();
     let result = pipeline
         .generate_from_ids(&prompt_ids, tokens as usize, mask.as_ref(), Some(cb))
         .map_err(|e| anyhow::anyhow!(e))?;
     let total_s = t1.elapsed().as_secs_f64();
+    cortiq_engine::cpuprof::report("generation (prefill + decode)", result.tokens_generated);
     let graph_ok = cortiq_engine::pipeline::GRAPH_TOK_OK
         .load(AtomicOrdering::Relaxed)
         .saturating_sub(graph_ok0);
