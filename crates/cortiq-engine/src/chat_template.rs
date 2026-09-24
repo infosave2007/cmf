@@ -57,7 +57,6 @@ pub(crate) fn environment<'a>() -> Environment<'a> {
     // integers and every other kind keep minijinja's default path.
     env.set_formatter(|out, state, value| {
         if needs_py_str(value) {
-            use std::fmt::Write as _;
             write!(out, "{}", py_str(value))
                 .map_err(|_| Error::new(ErrorKind::WriteFailure, "formatter write failed"))
         } else {
