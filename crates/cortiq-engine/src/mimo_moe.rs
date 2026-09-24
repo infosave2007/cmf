@@ -350,6 +350,10 @@ pub fn place(inp: &PlacementInputs, costs: &Costs, forced: Option<MoeMode>) -> P
 /// Per-process counters of the dynamic executor.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Stats {
+    /// Completed attention-only graph calls / rows in the dynamic tail.
+    pub attn_graph_calls: u64,
+    pub attn_graph_rows: u64,
+    pub attn_graph_ns: u64,
     /// Layer calls served by the bank frame.
     pub calls: u64,
     /// Expert picks seen by those calls.
@@ -371,6 +375,9 @@ pub struct Stats {
 }
 
 static STATS: std::sync::Mutex<Stats> = std::sync::Mutex::new(Stats {
+    attn_graph_calls: 0,
+    attn_graph_rows: 0,
+    attn_graph_ns: 0,
     calls: 0,
     picks: 0,
     hits: 0,
@@ -381,6 +388,13 @@ static STATS: std::sync::Mutex<Stats> = std::sync::Mutex::new(Stats {
     fallbacks: 0,
     route_ns: 0,
 });
+
+pub(crate) fn note_attention_graph(rows: usize, ns: u64) {
+    let mut s = STATS.lock().unwrap();
+    s.attn_graph_calls += 1;
+    s.attn_graph_rows += rows as u64;
+    s.attn_graph_ns += ns;
+}
 
 /// Process-wide executor counters (benches read deltas).
 pub fn stats() -> Stats {
@@ -1373,7 +1387,9 @@ impl Dynamic {
             let fills = bank.admitted - admitted0;
             drop(bank);
             let out = crate::gpu::cpu_scope(|| {
-                crate::pipeline::moe_cold_experts_cpu(&cold_jobs, x, pool)
+                crate::qtensor::float_activations_scope(|| {
+                    crate::pipeline::moe_cold_experts_cpu(&cold_jobs, x, pool)
+                })
             });
             let mut st = STATS.lock().unwrap();
             st.calls += 1;
@@ -1753,13 +1769,26 @@ mod bank_tests {
                 ("v_proj", [kv * VD, HS]),
                 ("o_proj", [HS, NH * VD]),
             ] {
-                specs.push(f32_spec(
+                let mut spec = f32_spec(
                     format!("{p}self_attn.{n}.weight"),
                     &shape,
                     &mut rng,
                     0.2,
                     0.0,
-                ));
+                );
+                if tag == "attn-graph" {
+                    // The real MiMo graph skeleton is q8_2f. F32 fixture
+                    // projections deliberately cannot enter the batch GEMM.
+                    let scale = 0.2f32 / 127.0;
+                    let mut data: Vec<u8> = spec.data.chunks_exact(4)
+                        .map(|v| (f32::from_le_bytes(v.try_into().unwrap()) / scale)
+                            .round().clamp(-127.0, 127.0) as i8 as u8).collect();
+                    for _ in 0..shape[0] { data.extend_from_slice(&f32_to_f16(scale).to_le_bytes()); }
+                    for _ in 0..shape[1] { data.extend_from_slice(&f32_to_f16(1.0).to_le_bytes()); }
+                    spec.dtype = TensorDtype::Q8_2f;
+                    spec.data = data;
+                }
+                specs.push(spec);
             }
             if li == 1 || li == 2 {
                 specs.push(f32_spec(
@@ -2047,6 +2076,107 @@ mod bank_tests {
             }
         });
         drop(p);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn dynamic_attention_graph_batches_preserve_layer_keys_and_rewind() {
+        let _g = serial();
+        if !bank_ready() {
+            return;
+        }
+        let (dir, model, _) = write_model("attn-graph");
+        let mut batch = Pipeline::from_model(&model, SamplerConfig::default()).unwrap();
+        let mut single = Pipeline::from_model(&model, SamplerConfig::default()).unwrap();
+        batch.mimo_moe = bank(&batch);
+        single.mimo_moe = bank(&single);
+        // The short-panel head/projection kernel must equal the old
+        // eight-lane panel bit for bit, including every batch width.
+        let crate::pipeline::AttnKind::Full { wq, .. } = &batch.weights.layers[2].attn else {
+            unreachable!()
+        };
+        let (owner, idx, _, _) = wq.graph_weight().unwrap();
+        for b in 1..=4 {
+            let xs: Vec<f32> = (0..b * HS).map(|i| (i as f32 * 0.071).cos()).collect();
+            let mut actual = vec![0.0; b * NH * HD];
+            let mut expected = actual.clone();
+            assert!(crate::gpu::q82_short_rows(
+                owner,
+                idx,
+                &xs,
+                b,
+                NH * HD,
+                HS,
+                &mut actual
+            ));
+            assert!(crate::gpu::mimo_q8_short_scope(false, || {
+                crate::gpu::q82_short_rows(owner, idx, &xs, b, NH * HD, HS, &mut expected)
+            }));
+            assert_eq!(actual, expected, "q82 short/wide panel b={b}");
+        }
+        // Distinct global/SWA geometries; neither may overwrite layer zero.
+        // Pass 300 absolute positions to cover split-K full attention as
+        // well as many SWA wraps and rejected suffix overwrites.
+        batch.kv_cache.max_seq_len = 512;
+        single.kv_cache.max_seq_len = 512;
+        for li in [2, 3] {
+            let mut pos = 0;
+            for b in (0..180).map(|i| i % 4 + 1) {
+                let positions: Vec<_> = (pos..pos + b).collect();
+                let xs: Vec<f32> = (0..b * HS)
+                    .map(|i| ((i + pos * HS) as f32 * 0.017).sin())
+                    .collect();
+                let mut ys = xs.clone();
+                assert!(
+                    matches!(
+                        batch.mimo_graph_layer_rows(li, &mut ys, &positions),
+                        crate::gpu::BatchGraphOutcome::Completed
+                    ),
+                    "batch admission li={li}, b={b}"
+                );
+                let mut want = xs;
+                for (row, &p) in want.chunks_exact_mut(HS).zip(&positions) {
+                    let outcome = crate::gpu::mimo_q8_short_scope(false, || {
+                        crate::gpu::mimo_attention_scratch_scope(false, || {
+                            single.mimo_graph_layer_rows(li, row, &[p])
+                        })
+                    });
+                    assert!(matches!(outcome, crate::gpu::BatchGraphOutcome::Completed));
+                }
+                assert!(
+                    rel(&ys, &want) < 2e-5,
+                    "li={li}, b={b}: {}",
+                    rel(&ys, &want)
+                );
+                pos += b;
+                assert_eq!(
+                    crate::gpu::graph_kv_stored(batch.test_graph_kv_id(), li),
+                    Some(pos)
+                );
+                assert_eq!(
+                    crate::gpu::graph_kv_stored(batch.test_graph_kv_id(), 0),
+                    None
+                );
+                // Rejected suffix must be overwritable on both full and SWA KV.
+                if b > 1 {
+                    pos -= 1;
+                    assert!(crate::gpu::graph_kv_set_stored(
+                        batch.test_graph_kv_id(),
+                        li,
+                        pos
+                    ));
+                    assert!(crate::gpu::graph_kv_set_stored(
+                        single.test_graph_kv_id(),
+                        li,
+                        pos
+                    ));
+                }
+            }
+            assert!(pos > 300);
+        }
+        drop(batch);
+        drop(single);
+        drop(model);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -610,6 +610,51 @@ impl Pipeline {
         drafts
     }
 
+    fn mimo_verify_head_rows(&self, hb: &[f32], b: usize) -> Option<Vec<f32>> {
+        if !self.mimo_moe.is_on()
+            || !crate::gpu::mimo_q8_short_enabled()
+            || std::env::var("CMF_MIMO_BATCH_HEAD").as_deref() == Ok("0")
+            || !(2..=4).contains(&b)
+            || self.head_clusters.is_some()
+            || self.weights.lm_head.rows() != self.vocab_size
+        {
+            return None;
+        }
+        let (model, idx, kind, _) = self.weights.lm_head.graph_weight()?;
+        if kind != 7 || self.weights.lm_head.has_prism_contract() {
+            return None;
+        }
+        let hs = self.hidden_size;
+        if hb.len() != b * hs {
+            return None;
+        }
+        let mut xs = vec![0.0; b * hs];
+        for (row, out) in hb.chunks_exact(hs).zip(xs.chunks_exact_mut(hs)) {
+            inference::rms_norm_into(
+                row,
+                &self.weights.final_norm,
+                self.rms_eps,
+                self.norm_style,
+                out,
+            );
+        }
+        let mut logits = vec![0.0; b * self.vocab_size];
+        if !crate::gpu::q82_short_rows(model, idx, &xs, b, self.vocab_size, hs, &mut logits) {
+            return None;
+        }
+        if let Some(m) = self.logit_multiplier {
+            for l in &mut logits {
+                *l *= m;
+            }
+        }
+        if let Some(c) = self.final_softcap {
+            for l in &mut logits {
+                *l = c * (*l / c).tanh();
+            }
+        }
+        Some(logits)
+    }
+
     /// One speculative greedy round. On entry the backbone has processed
     /// positions `..next_pos` and `all_ids[next_pos]` is the pending token
     /// (committed, not yet forwarded). Drafts `k`, verifies `[pending,
@@ -659,6 +704,10 @@ impl Pipeline {
             self.prefill_rows(&ids, next_pos, None)
         }?;
         let hs = self.hidden_size;
+        // One exact head panel instead of up to four independent 0.6+ GB
+        // weight streams and readback fences. A refused device projection
+        // does not mutate KV and falls back to the established row path.
+        let batch_logits = self.mimo_verify_head_rows(&hb, k + 1);
         let mut history = all_ids.to_vec();
         let mut a = 0usize;
         let mut normed = vec![0.0f32; hs];
@@ -671,7 +720,11 @@ impl Pipeline {
                 self.norm_style,
                 &mut normed,
             );
-            let mut lg = self.lm_head_forward(&normed);
+            let mut lg = if let Some(all) = batch_logits.as_ref() {
+                all[i * self.vocab_size..(i + 1) * self.vocab_size].to_vec()
+            } else {
+                self.lm_head_forward(&normed)
+            };
             let tok = sampler::sample_with_scratch_pool(
                 &lg,
                 &self.sampler_config,

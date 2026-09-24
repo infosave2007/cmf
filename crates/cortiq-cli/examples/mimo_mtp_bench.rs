@@ -6,6 +6,8 @@
 //!       model.cmf prompt.txt [-n 128] [--raw] [--think] [--modes plain,spec] \
 //!       [--ids-out ids.json] [--k 3] [--ids prompt_ids.json] [--extra-prompt file]
 //!
+//! `plain:nopool` disables attention scratch reuse for an in-process A/B.
+//! `--modes plain,plain,spec:1,spec:2,spec:3` compares draft depths on one load.
 //! `--ids` feeds a JSON id array verbatim (the prompt file is then only
 //! a placeholder).
 //! The draft stack loads from `<stem>.mtp.cmf` beside the model. Greedy,
@@ -96,6 +98,7 @@ fn main() -> anyhow::Result<()> {
             None => "absent".into(),
         }
     );
+    let default_depth = p.mimo_mtp.as_ref().map(|s| s.depth);
     let mut rows = Vec::new();
     let mut all_identical = true;
     for prompt in &prompts {
@@ -117,28 +120,40 @@ fn main() -> anyhow::Result<()> {
 
         let mut first_ids: Option<Vec<u32>> = None;
         for mode in &modes {
-            let spec = match mode.as_str() {
-                "plain" => false,
-                "spec" => true,
-                other => anyhow::bail!("mode {other}: plain | spec"),
+            let (spec, depth) = match mode.as_str() {
+                "plain" | "plain:nopool" | "plain:q8wide" => (false, default_depth),
+                "spec" | "spec:q8wide" => (true, default_depth),
+                other if other.starts_with("spec:") => {
+                    let k: usize = other[5..].parse()?;
+                    anyhow::ensure!((1..=3).contains(&k), "spec depth must be 1..=3");
+                    anyhow::ensure!(p.mimo_mtp.is_some(), "spec depth requires an MTP sidecar");
+                    (true, Some(k))
+                }
+                other => anyhow::bail!("mode {other}: plain | spec | spec:1 | spec:2 | spec:3"),
             };
+            if let (Some(st), Some(k)) = (&mut p.mimo_mtp, depth) {
+                st.depth = k;
+            }
             p.speculative = spec;
             p.reset_session();
             let stamps: Arc<Mutex<Vec<Instant>>> = Arc::new(Mutex::new(Vec::with_capacity(n)));
             let s2 = stamps.clone();
             let bank_before = cortiq_engine::mimo_moe::stats();
             let t0 = Instant::now();
-            let r = p
-                .generate_from_ids(
-                    &ids,
-                    n,
-                    None,
-                    Some(Box::new(move |_t: &str| {
-                        s2.lock().unwrap().push(Instant::now());
-                        true
-                    })),
-                )
-                .map_err(|e| anyhow::anyhow!(e))?;
+            let r = cortiq_engine::gpu::mimo_q8_short_scope(!mode.ends_with(":q8wide"), || {
+                cortiq_engine::gpu::mimo_attention_scratch_scope(mode != "plain:nopool", || {
+                    p.generate_from_ids(
+                        &ids,
+                        n,
+                        None,
+                        Some(Box::new(move |_t: &str| {
+                            s2.lock().unwrap().push(Instant::now());
+                            true
+                        })),
+                    )
+                })
+            })
+            .map_err(|e| anyhow::anyhow!(e))?;
             let st = stamps.lock().unwrap().clone();
             let ttft = st
                 .first()
@@ -186,6 +201,11 @@ fn main() -> anyhow::Result<()> {
             rows.push(serde_json::json!({
                 "mode": mode,
                 "moe_placement": cortiq_engine::mimo_moe::last_decision(),
+                "attn_graph_calls": bank_after.attn_graph_calls - bank_before.attn_graph_calls,
+                "attn_graph_rows": bank_after.attn_graph_rows - bank_before.attn_graph_rows,
+                "attn_graph_s": (bank_after.attn_graph_ns - bank_before.attn_graph_ns) as f64 / 1e9,
+                "moe_call_s": (bank_after.call_ns - bank_before.call_ns) as f64 / 1e9,
+                "moe_route_s": (bank_after.route_ns - bank_before.route_ns) as f64 / 1e9,
                 "moe_picks": bank_after.picks - bank_before.picks,
                 "moe_hits": bank_after.hits - bank_before.hits,
                 "moe_fills": bank_after.fills - bank_before.fills,

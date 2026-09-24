@@ -8065,9 +8065,7 @@ impl Pipeline {
                 Some(&mut run),
             ) {
                 crate::gpu::BatchGraphOutcome::Completed => {
-                    #[cfg(feature = "gpu")]
-                    self.pull_lagging_host_kv(run, self.num_layers, pos);
-                    return Ok(if run < self.num_layers {
+                    let out = if run < self.num_layers {
                         self.prefill_batch_span(
                             PrefillIn::Hidden(&hiddens),
                             pos,
@@ -8077,7 +8075,10 @@ impl Pipeline {
                         )
                     } else {
                         hiddens
-                    });
+                    };
+                    return if self.graph_failed.load(std::sync::atomic::Ordering::Relaxed) {
+                        Err("MiMo attention graph failed after admission".into())
+                    } else { Ok(out) };
                 }
                 crate::gpu::BatchGraphOutcome::Failed => {
                     return Err("batched prefix prefill failed after admission".into());
@@ -8089,7 +8090,10 @@ impl Pipeline {
                 }
             }
         }
-        Ok(self.prefill_batch_masked(ids, pos, task_mask))
+        let out = self.prefill_batch_masked(ids, pos, task_mask);
+        if self.graph_failed.load(std::sync::atomic::Ordering::Relaxed) {
+            Err("batch tail graph failed after admission".into())
+        } else { Ok(out) }
     }
 
     /// The layer-major batched walk over a layer span [from..upto_excl):
@@ -8218,6 +8222,16 @@ impl Pipeline {
                 fill_h(&mut h, self);
                 h_ready = true;
             }
+            if task_mask.is_none() && self.verify_exact_moe {
+                let positions: Vec<_> = (start_pos..start_pos + b).collect();
+                match self.mimo_graph_layer_rows(li, &mut h, &positions) {
+                    crate::gpu::BatchGraphOutcome::Completed => continue,
+                    crate::gpu::BatchGraphOutcome::Failed => return h,
+                    crate::gpu::BatchGraphOutcome::Declined => {},
+                }
+            }
+            #[cfg(feature = "gpu")]
+            self.pull_lagging_host_kv(li, li + 1, start_pos);
             let lw = &self.weights.layers[self.phys_layer(li)];
             // ── attention ──
             match &lw.attn {
@@ -9240,6 +9254,195 @@ impl Pipeline {
             }
         };
         self.mimo_moe = slot;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_graph_kv_id(&self) -> u64 {
+        self.graph_kv_id
+    }
+
+    /// Dynamic MiMo layer: one device attention graph, followed by a bank
+    /// frame. Both decode and short verification use this same attention
+    /// path and absolute layer key; the host KV may intentionally lag.
+    pub(crate) fn mimo_graph_layer_rows(
+        &mut self,
+        li: usize,
+        h: &mut [f32],
+        positions: &[usize],
+    ) -> crate::gpu::BatchGraphOutcome {
+        use crate::gpu::BatchGraphOutcome as Out;
+        let b = positions.len();
+        if !(1..=4).contains(&b)
+            || h.len() != b * self.hidden_size
+            || !self.mimo_moe.is_dynamic(li, true)
+            || !crate::gpu::enabled_here()
+            || !crate::gpu::wgpu_active()
+            || self.o1_active()
+            || self.physical_layers != self.num_layers
+            || std::env::var("CMF_MIMO_ATTN_GRAPH").as_deref() == Ok("0")
+            || self.wgpu_graph_attn_decline().is_some()
+        {
+            return Out::Declined;
+        }
+        let attn_started = std::time::Instant::now();
+        let outcome = {
+            let lw = &self.weights.layers[li];
+            if lw.attn_out_norm.is_some() || lw.ffn_out_norm.is_some() || lw.layer_scale.is_some() {
+                return Out::Declined;
+            }
+            let FfnKind::Moe(m) = &lw.ffn else {
+                return Out::Declined;
+            };
+            let AttnKind::Full {
+                wq,
+                wk,
+                wv,
+                wo,
+                q_norm,
+                k_norm,
+                output_gate,
+                softplus_gate,
+                bias,
+            } = &lw.attn
+            else {
+                return Out::Declined;
+            };
+            if *output_gate || softplus_gate.is_some() {
+                return Out::Declined;
+            }
+            let Some(model) = wq.graph_weight().map(|(m, ..)| m.clone()).or_else(|| {
+                m.experts
+                    .first()?
+                    .gate_proj
+                    .mapped_q4tp()
+                    .map(|(m, _)| m.clone())
+            }) else {
+                return Out::Declined;
+            };
+            fn gw<'a>(
+                t: &'a QTensor,
+                owner: &std::sync::Arc<cortiq_core::CmfModel>,
+            ) -> Option<crate::gpu::GraphW<'a>> {
+                if let Some((m, idx, kind, rs)) = t.graph_weight() {
+                    if m.uid() != owner.uid() || t.has_prism_contract() {
+                        return None;
+                    }
+                    return Some(crate::gpu::GraphW {
+                        idx,
+                        kind,
+                        row_scale: rs,
+                        data: &[],
+                        prism: crate::gpu::GraphPrismOp::None,
+                        affine: false,
+                    });
+                }
+                t.as_f32().map(|data| crate::gpu::GraphW {
+                    idx: 0,
+                    kind: 4,
+                    row_scale: &[],
+                    data,
+                    prism: crate::gpu::GraphPrismOp::None,
+                    affine: false,
+                })
+            }
+            let (Some(q), Some(k), Some(v), Some(o)) = (
+                gw(wq, &model),
+                gw(wk, &model),
+                gw(wv, &model),
+                gw(wo, &model),
+            ) else {
+                return Out::Declined;
+            };
+            let layer = crate::gpu::GraphLayer {
+                input_norm: &lw.input_norm,
+                post_norm: &lw.post_norm,
+                ffn: crate::gpu::GraphFfn::AttentionOnly,
+                attn: crate::gpu::GraphAttn::Full {
+                    wq: q,
+                    wk: k,
+                    wv: v,
+                    wo: o,
+                    q_norm: q_norm.as_deref(),
+                    k_norm: k_norm.as_deref(),
+                    late_qk_norm: self.qk_norm_after_rope,
+                    bias: bias
+                        .as_ref()
+                        .map(|(q, k, v)| (q.as_slice(), k.as_slice(), v.as_slice())),
+                    output_gate: false,
+                    cpu_k: self.kv_cache.layers[li].k_heads(),
+                    cpu_v: self.kv_cache.layers[li].v_heads(),
+                    geom: self.graph_attn_geom(li),
+                },
+            };
+            let (nkv, hd, rd) = self.layer_geom(li);
+            crate::gpu::forward_batch_graph_at(
+                &model,
+                self.graph_kv_id,
+                li,
+                &[layer],
+                &self.inv_freq,
+                h,
+                self.layer_num_heads(li),
+                nkv,
+                hd,
+                rd,
+                self.hidden_size,
+                1,
+                positions,
+                self.kv_cache.max_seq_len,
+                self.norm_style == cortiq_core::NormStyle::Gemma,
+                self.rms_eps as f32,
+                self.attn_scale,
+                b,
+                &[],
+                self.o1_epoch,
+                None,
+                None,
+            )
+        };
+        match outcome {
+            Out::Completed => {}
+            Out::Declined => return Out::Declined,
+            Out::Failed => {
+                self.graph_failed
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                return Out::Failed;
+            }
+        }
+        let attn_ns = attn_started.elapsed().as_nanos() as u64;
+        let hs = self.hidden_size;
+        let lw = &self.weights.layers[li];
+        let FfnKind::Moe(m) = &lw.ffn else {
+            unreachable!()
+        };
+        let mut post = vec![0.0; h.len()];
+        for (x, y) in h.chunks_exact(hs).zip(post.chunks_exact_mut(hs)) {
+            inference::rms_norm_into(x, &lw.post_norm, self.rms_eps, self.norm_style, y);
+        }
+        let mut ffn = if b == 1 {
+            moe_ffn_banked(&mut self.mimo_moe, li, m, &post, self.pool.as_deref())
+        } else {
+            moe_ffn_banked_rows(
+                &mut self.mimo_moe,
+                li,
+                m,
+                &post,
+                b,
+                hs,
+                self.pool.as_deref(),
+            )
+        };
+        for (x, &f) in h.iter_mut().zip(&ffn) {
+            *x += f;
+        }
+        attention::recycle_buf(&mut ffn);
+        if self.layer_dump.is_some() {
+            for (&pos, row) in positions.iter().zip(h.chunks_exact(hs)) {
+                self.dump_layer_row(pos, li, row);
+            }
+        }
+        crate::mimo_moe::note_attention_graph(b, attn_ns);
+        Out::Completed
     }
 
     fn layer_attn_plain(&self, li: usize) -> bool {
@@ -12728,11 +12931,6 @@ impl Pipeline {
         // of the host cache (a device prefix that shrank since the prompt,
         // a batched-prefill prefix longer than this token's): bring their
         // rows over first. One comparison per layer when nothing lags.
-        #[cfg(feature = "gpu")]
-        {
-            let upto_excl = upto.map_or(self.num_layers, |u| u + 1);
-            self.pull_lagging_host_kv(tail_start.max(from), upto_excl, position);
-        }
         let t_race_cpu = (race_eligible && !graph_trusted).then(std::time::Instant::now);
 
         // A partial graph is an explicit GPU-prefix / CPU-tail split. Keep
@@ -12802,6 +13000,15 @@ impl Pipeline {
                 }
             }
 
+            if task_mask.is_none() {
+                match self.mimo_graph_layer_rows(li, &mut h, &[position]) {
+                    crate::gpu::BatchGraphOutcome::Completed => continue,
+                    crate::gpu::BatchGraphOutcome::Failed => return vec![0.0; self.hidden_size],
+                    crate::gpu::BatchGraphOutcome::Declined => {},
+                }
+            }
+            #[cfg(feature = "gpu")]
+            self.pull_lagging_host_kv(li, li + 1, position);
             let lw = &self.weights.layers[self.phys_layer(li)];
             if let Ok(tp) = std::env::var("CMF_TRACE_POS") {
                 if tp.parse::<usize>().ok() == Some(position) {
@@ -13376,9 +13583,18 @@ impl Pipeline {
             .then(crate::qtensor::enter_full_gpu_q8_scope);
         let rows = self.weights.lm_head.rows();
         let mut logits = attention::take_buf(rows.min(self.vocab_size));
-        self.weights
-            .lm_head
-            .matvec(hidden, &mut logits, self.pool.as_deref());
+        // Banked MiMo uses the same exact projection family for the
+        // plain/draft head and the batched verification head. Read both
+        // scale planes in-place instead of preparing per-op scale buffers.
+        let served = self.mimo_moe.is_on() && crate::gpu::mimo_q8_short_enabled()
+            && rows == self.vocab_size && !self.weights.lm_head.has_prism_contract()
+            && self.weights.lm_head.graph_weight().is_some_and(|(model, idx, kind, _)| {
+                kind == 7 && crate::gpu::q82_short_rows(model, idx, hidden, 1,
+                    rows, self.hidden_size, &mut logits)
+            });
+        if !served {
+            self.weights.lm_head.matvec(hidden, &mut logits, self.pool.as_deref());
+        }
         logits.resize(self.vocab_size, 0.0);
         if let Some(m) = self.logit_multiplier {
             for l in logits.iter_mut() {
