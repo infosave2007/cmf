@@ -61,8 +61,9 @@ runs on the device with no flags:
 - **VAE**: resident decoder — implicit-GEMM 3×3 convs on the tensor cores
   (the 2× upsample folded into the gather), device GroupNorm, the mid-block
   attention in query chunks; one upload, one readback.
-- **Text encoder**: on the CPU, with weight-only exact q8 projections, while
-  a helper thread uploads the DiT weights; the device context and the kernel
+- **Text encoder**: on the CPU, with weight-only exact q8 projections on
+  x86-64 with AVX2 (other CPUs use the int8-activation kernel, 3.3× less
+  accurate), while a helper thread uploads the DiT weights; the device context and the kernel
   compiles start on another helper at the beginning of the run, and the VAE
   weights upload while the steps run.
 
