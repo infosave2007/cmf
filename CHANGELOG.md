@@ -26,6 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   independent reference fixtures and real-model parity/media gate tools.
 
 ### Fixed
+- Overlapping MTP requests keep row-exact batching active until the last scope
+  exits, including nested calls and unwinding; no global flag can be left stuck
+  or cleared while another verification is still using it.
 - CPU-only placement now propagates through MoE worker tasks. The 128-token
   smoke PPL agrees at 3.647 on CPU, full GPU and repeated 24-GB-budget runs.
 - MiMo GPU tower GEMM and attention preserve f32 operands instead of implicitly
