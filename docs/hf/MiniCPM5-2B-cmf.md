@@ -32,7 +32,7 @@ hf download infosave/MiniCPM5-2B-cmf MiniCPM5-2B-q8_2f.cmf --local-dir .
 cortiq run MiniCPM5-2B-q8_2f.cmf --prompt "Explain quicksort in three sentences." --no-think
 ```
 
-Use cortiq 0.7.4 or later; prebuilt binaries for Linux, macOS and Windows are
+Use cortiq 0.7.6 or later; prebuilt binaries for Linux, macOS and Windows are
 on the [releases page](https://github.com/infosave2007/cmf/releases). The
 engine picks the GPU and its settings itself. `--no-think` asks for a direct
 answer; without it the model reasons in a `<think>` block first, so raise
@@ -42,12 +42,13 @@ answer; without it the model reasons in a `<think>` block first, so raise
 
 | file | quantization | size | wikitext-2 ppl | recommended for |
 |---|---|---:|---:|---|
-| `MiniCPM5-2B-q4tp.cmf` | 4-bit, ladder scales | 1.32 GB | 21.21 | smallest and fastest (+19 % ppl) |
+| `MiniCPM5-2B-q4tp.cmf` | 4-bit GPTQ; embeddings and output head 8-bit | 1.57 GB | 18.91 | smallest and fastest (+6 % ppl) |
 | `MiniCPM5-2B-q8_2f.cmf` | 8-bit | 2.53 GB | 17.83 | **default**: practically lossless |
 
-Both files are quantized directly from the bf16 checkpoint. Perplexity: twelve
-512-token windows of wikitext-2; the unquantized model scores 17.81 on the
-same windows.
+Both files are quantized from the bf16 checkpoint; the 4-bit weights are
+rounded with GPTQ on 2k tokens of wikitext-2 train. Perplexity: twelve
+512-token windows of wikitext-2 test; the unquantized model scores 17.81 on
+the same windows.
 
 ## Performance
 
@@ -55,15 +56,12 @@ One stream, medians of three runs:
 
 | hardware | backend | file | `cortiq bench --core`, tok/s | chat, 300 tokens, tok/s | 2k-token prompt, time to first token |
 |---|---|---|---:|---:|---:|
-| RTX 3090 (24 GB) | Vulkan | `q4tp` | 104.5 | 87.7 | 18.6 s |
-| RTX 3090 (24 GB) | Vulkan | `q8_2f` | 90.1 | 74.0 | 37.4 s |
+| RTX 3090 (24 GB) | Vulkan | `q4tp` | 157.7 | 112.9 | 5.8 s |
+| RTX 3090 (24 GB) | Vulkan | `q8_2f` | 134.9 | 98.2 | 28.4 s |
 | Mac mini M4 (24 GB) | Metal | `q4tp` | 49.1 | 42.2 | 6.6 s |
 
 The chat and prompt columns are measured through `cortiq serve` after one
-warm-up request, with the recommended sampling below. On Vulkan/DX12, long
-prompts are read much faster with `CMF_PREFILL_CHUNK=512`: 8.2 s instead of
-18.6 s (`q4tp`) and 25.0 s instead of 37.4 s (`q8_2f`) for the same 2k-token
-prompt, with the same output. Apple silicon already uses that setting.
+warm-up request, with the recommended sampling below.
 
 ## Usage
 
@@ -117,12 +115,9 @@ From cortiq 0.7.6 the server turns this into `message.tool_calls` with
 `finish_reason: "tool_calls"`, streamed or not; `arguments` is a JSON string
 whose values follow the types in the tool's schema. Older versions leave the
 XML in `message.content`. Run the tool, then send the assistant turn back with
-`tool_calls` and the result as a `{"role": "tool", ...}` message. On
-Vulkan/DX12 start the server with `CMF_KV_REUSE=0` for tool conversations:
-with the default cross-turn cache the model often repeats the call instead of
-answering from the result. With it, and on Apple silicon by default, the call
+`tool_calls` and the result as a `{"role": "tool", ...}` message. The call
 and the answer from the result were correct in 6 of 6 test conversations for
-both files. The embedded template differs from the upstream file only in
+both files, on Vulkan and on Apple silicon. The embedded template differs from the upstream file only in
 writing `tojson` without `ensure_ascii=False`, which gives the same output, and
 the four tool-markup tokens are marked as ordinary text. cortiq 0.7.6 and later
 also accept the upstream template and tokenizer unchanged.
@@ -178,7 +173,7 @@ hf download infosave/MiniCPM5-2B-cmf MiniCPM5-2B-q8_2f.cmf --local-dir .
 cortiq run MiniCPM5-2B-q8_2f.cmf --prompt "Объясни квиксорт в трёх предложениях." --no-think
 ```
 
-Используйте cortiq 0.7.4 или новее; готовые сборки для Linux, macOS и
+Используйте cortiq 0.7.6 или новее; готовые сборки для Linux, macOS и
 Windows — на [странице релизов](https://github.com/infosave2007/cmf/releases).
 Движок сам выбирает GPU и настройки. `--no-think` даёт прямой ответ; без него
 модель сначала рассуждает в блоке `<think>`, поэтому увеличьте `--max-tokens`
@@ -188,12 +183,12 @@ Windows — на [странице релизов](https://github.com/infosave20
 
 | файл | квантизация | размер | ppl wikitext-2 | назначение |
 |---|---|---:|---:|---|
-| `MiniCPM5-2B-q4tp.cmf` | 4 бита, лестница масштабов | 1.32 ГБ | 21.21 | самый компактный и быстрый (+19 % ppl) |
+| `MiniCPM5-2B-q4tp.cmf` | 4 бита GPTQ; эмбеддинги и выходная голова 8 бит | 1.57 ГБ | 18.91 | самый компактный и быстрый (+6 % ppl) |
 | `MiniCPM5-2B-q8_2f.cmf` | 8 бит | 2.53 ГБ | 17.83 | **по умолчанию**: практически без потерь |
 
-Оба файла квантованы напрямую из bf16-чекпойнта. Перплексия измерена на 12
-окнах wikitext-2 по 512 токенов; неквантованная модель на тех же окнах даёт
-17.81.
+Оба файла квантованы из bf16-чекпойнта; 4-битные веса округлены GPTQ на 2k
+токенах wikitext-2 train. Перплексия измерена на 12 окнах wikitext-2 test по
+512 токенов; неквантованная модель на тех же окнах даёт 17.81.
 
 ### Скорость
 
@@ -201,15 +196,12 @@ Windows — на [странице релизов](https://github.com/infosave20
 
 | железо | бэкенд | файл | `cortiq bench --core`, ток/с | чат, 300 токенов, ток/с | промпт 2k токенов, время до первого токена |
 |---|---|---|---:|---:|---:|
-| RTX 3090 (24 ГБ) | Vulkan | `q4tp` | 104.5 | 87.7 | 18.6 с |
-| RTX 3090 (24 ГБ) | Vulkan | `q8_2f` | 90.1 | 74.0 | 37.4 с |
+| RTX 3090 (24 ГБ) | Vulkan | `q4tp` | 157.7 | 112.9 | 5.8 с |
+| RTX 3090 (24 ГБ) | Vulkan | `q8_2f` | 134.9 | 98.2 | 28.4 с |
 | Mac mini M4 (24 ГБ) | Metal | `q4tp` | 49.1 | 42.2 | 6.6 с |
 
 Столбцы «чат» и «промпт» измерены через `cortiq serve` после одного
-прогревочного запроса, с рекомендуемым сэмплированием (ниже). На Vulkan/DX12
-длинные промпты читаются заметно быстрее с `CMF_PREFILL_CHUNK=512`: 8.2 с
-вместо 18.6 (`q4tp`) и 25.0 с вместо 37.4 (`q8_2f`) на том же промпте в 2k
-токенов, вывод тот же. На Apple silicon эта настройка уже действует.
+прогревочного запроса, с рекомендуемым сэмплированием (ниже).
 
 ### Использование
 
@@ -261,12 +253,8 @@ curl http://localhost:8080/v1/chat/completions \
 JSON, значения в которой приведены к типам из схемы инструмента. Более старые
 версии оставляют XML в `message.content`. Выполните инструмент и отправьте
 обратно ход ассистента с `tool_calls` и результат сообщением
-`{"role": "tool", ...}`. На
-Vulkan/DX12 для диалогов с инструментами запускайте сервер с
-`CMF_KV_REUSE=0`: с межходовым кэшем по умолчанию модель часто повторяет
-вызов вместо ответа по результату. С этой настройкой, а на Apple silicon и
-без неё, вызов и ответ по результату были верны в 6 из 6 тестовых диалогов
-для обоих файлов. Встроенный шаблон отличается от исходного только тем, что
+`{"role": "tool", ...}`. Вызов и ответ по результату были верны в 6 из 6
+тестовых диалогов для обоих файлов, на Vulkan и на Apple silicon. Встроенный шаблон отличается от исходного только тем, что
 `tojson` записан без `ensure_ascii=False` (результат тот же), а четыре токена
 разметки вызова помечены как обычный текст. cortiq 0.7.6 и новее принимает и
 исходные шаблон и токенизатор без изменений.
@@ -318,7 +306,7 @@ hf download infosave/MiniCPM5-2B-cmf MiniCPM5-2B-q8_2f.cmf --local-dir .
 cortiq run MiniCPM5-2B-q8_2f.cmf --prompt "用三句话解释快速排序。" --no-think
 ```
 
-建议使用 cortiq 0.7.4 或更新版本；Linux、macOS、Windows 预编译二进制见
+建议使用 cortiq 0.7.6 或更新版本；Linux、macOS、Windows 预编译二进制见
 [发布页面](https://github.com/infosave2007/cmf/releases)。引擎会自动选择 GPU 和
 设置。`--no-think` 直接给出回答；不加该参数时模型会先在 `<think>` 块中思考，
 请调高 `--max-tokens`（默认 256）。
@@ -327,11 +315,12 @@ cortiq run MiniCPM5-2B-q8_2f.cmf --prompt "用三句话解释快速排序。" --
 
 | 文件 | 量化 | 大小 | wikitext-2 困惑度 | 适用场景 |
 |---|---|---:|---:|---|
-| `MiniCPM5-2B-q4tp.cmf` | 4 位，阶梯缩放 | 1.32 GB | 21.21 | 体积最小、速度最快（困惑度 +19%） |
+| `MiniCPM5-2B-q4tp.cmf` | 4 位 GPTQ；嵌入层和输出头为 8 位 | 1.57 GB | 18.91 | 体积最小、速度最快（困惑度 +6%） |
 | `MiniCPM5-2B-q8_2f.cmf` | 8 位 | 2.53 GB | 17.83 | **默认**：几乎无损 |
 
-两个文件均直接由 bf16 检查点量化。困惑度基于 wikitext-2 的 12 个 512 token
-窗口；未量化模型在相同窗口上为 17.81。
+两个文件均由 bf16 检查点量化；4 位权重使用 GPTQ 在 2k 个 wikitext-2 train token 上
+取整。困惑度基于 wikitext-2 test 的 12 个 512 token 窗口；未量化模型在相同窗口上为
+17.81。
 
 ### 性能
 
@@ -339,14 +328,12 @@ cortiq run MiniCPM5-2B-q8_2f.cmf --prompt "用三句话解释快速排序。" --
 
 | 硬件 | 后端 | 文件 | `cortiq bench --core`，tok/s | 对话，300 token，tok/s | 2k token 提示词，首 token 时间 |
 |---|---|---|---:|---:|---:|
-| RTX 3090（24 GB） | Vulkan | `q4tp` | 104.5 | 87.7 | 18.6 s |
-| RTX 3090（24 GB） | Vulkan | `q8_2f` | 90.1 | 74.0 | 37.4 s |
+| RTX 3090（24 GB） | Vulkan | `q4tp` | 157.7 | 112.9 | 5.8 s |
+| RTX 3090（24 GB） | Vulkan | `q8_2f` | 134.9 | 98.2 | 28.4 s |
 | Mac mini M4（24 GB） | Metal | `q4tp` | 49.1 | 42.2 | 6.6 s |
 
 「对话」和「提示词」两列通过 `cortiq serve` 测得（先发一次预热请求），使用下文
-推荐的采样参数。在 Vulkan/DX12 上，设置 `CMF_PREFILL_CHUNK=512` 可显著加快长
-提示词的读取：同一 2k token 提示词，`q4tp` 由 18.6 s 降至 8.2 s，`q8_2f` 由
-37.4 s 降至 25.0 s，输出不变。Apple silicon 默认已使用该设置。
+推荐的采样参数。
 
 ### 使用
 
@@ -394,10 +381,8 @@ curl http://localhost:8080/v1/chat/completions \
 `finish_reason: "tool_calls"`，流式输出同样如此；`arguments` 是 JSON 字符串，其中的值
 按工具 schema 声明的类型转换。更早的版本会把 XML 留在 `message.content` 中。
 执行工具后，把带 `tool_calls` 的助手回合和
-`{"role": "tool", ...}` 结果消息一并发回。在 Vulkan/DX12 上进行工具对话时，请用
-`CMF_KV_REUSE=0` 启动服务器：默认的跨回合缓存下，模型常会重复调用而不是根据结果
-作答。设置后（Apple silicon 默认即可），两个文件在 6 个测试对话中调用和基于结果的
-回答全部正确。内置模板与上游文件的唯一区别是 `tojson` 去掉了
+`{"role": "tool", ...}` 结果消息一并发回。在 Vulkan 和 Apple silicon 上，两个文件在
+6 个测试对话中调用和基于结果的回答全部正确。内置模板与上游文件的唯一区别是 `tojson` 去掉了
 `ensure_ascii=False`（输出相同），并且四个工具标记 token 被标为普通文本。
 cortiq 0.7.6 及以后版本也可以直接使用未经修改的上游模板和分词器。
 
