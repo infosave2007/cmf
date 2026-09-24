@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- The server turns MiniCPM5's tool calls into OpenAI `tool_calls`. The model
+  writes `<function name="…"><param name="…">…</param></function>`, with
+  several calls in a row, multi-line values and `<![CDATA[…]]>`. The parser
+  follows SGLang's `minicpm5` parser. Each value takes the type declared in
+  the tool's JSON schema: a string stays a string, anything else is read as
+  JSON and then as a Python literal (`True`, `['a', 'b']`). A call to a
+  tool the request did not declare stays text, and so does a call with an
+  undeclared, repeated or missing required parameter. Hermes/Qwen
+  `<tool_call>` calls work as before. With the published MiniCPM5-2B q4tp
+  file on an M4, `tooleval` gets a structured call on the first turn in 6
+  of 6 conversations and an answer from the tool result on the second turn
+  in 6 of 6, streamed and not (0.7.5: 0 of 6; the call was left as XML in
+  `content`).
+
+### Fixed
+- Chat templates render the way transformers renders them.
+  - `tojson` is Python's `json.dumps`. It takes `ensure_ascii` (default
+    False), `indent`, `separators` and `sort_keys`, and it writes `", "` and
+    `": "` separators, leaves `<>&'` unescaped and keeps keys in request
+    order. minijinja's built-in wrote compact separators, sorted the keys
+    and escaped `<` as `\u003c`. Every tool declaration reached Qwen-family
+    models in a shape they were not trained on.
+  - MiniCPM5's own template calls `tojson(ensure_ascii=False)`. That call
+    was a render error, and every request with tools fell back to plain
+    ChatML without the tools.
+  - `{{ x }}` and `| string` print `True`, `False`, `None` and Python
+    literals, as Python's `str()` does. A boolean argument in tool-call
+    history used to render as `true`.
+  - Checked against transformers 5.17 `apply_chat_template`, prompt ids
+    identical: the original MiniCPM5 template 11/11 (was 5/11), Qwen3 8/8
+    (was 5/8), Qwen3.8 8/8 (was 5/8), Hy-MT2 8/8 (was 8/8). The failures
+    before were every case with tools or tool history.
+- A request with `tools` whose chat template fails to render now gets HTTP
+  400 with the template error. Before, the server answered from a ChatML
+  prompt without the tools and said nothing.
+- Tool-markup tokens that a vocabulary marks as special (`<function`,
+  `</function>`, `<param`, `</param>`, `<tool_call>`, `</tool_call>`, as in
+  MiniCPM5's original tokenizer) now stay in decoded text. Decoding used to
+  drop them, which left calls impossible to parse. Other special tokens are
+  still hidden.
+- Streaming with tools: text after a held tool-call marker that turns out
+  not to be a call is now sent at the end. Before, it was dropped. Markup
+  inside `<think>` is not treated as a call.
+
 ## [0.7.5] - 2026-09-24
 
 ### Added
