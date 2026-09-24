@@ -744,6 +744,13 @@ fn force_dsv41_vision_f16(arch: &ModelArch, name: &str, shape: &[usize]) -> bool
         && (name.starts_with("vision.") || name.starts_with("aligner."))
 }
 
+/// Name-level "never quantize this matrix" rule, for tools that re-encode a
+/// float container outside the streaming emitter (GPTQ). The arch-gated
+/// vision rule is not included — it needs shapes and the arch.
+pub(crate) fn keeps_float(name: &str) -> bool {
+    force_f32(name) || force_f16(name) || name.starts_with("vis.")
+}
+
 fn force_f16(name: &str) -> bool {
     name.ends_with("linear_attn.in_proj_a.weight")
         || name.ends_with("linear_attn.in_proj_b.weight")
@@ -813,6 +820,79 @@ fn quant_for_tensor(arch: &ModelArch, name: &str, base: Quant) -> Quant {
     } else {
         base
     }
+}
+
+/// User per-tensor quantization overrides (`cortiq convert --tensor-quant
+/// PATTERN=QUANT`, repeatable). Checked before the profile policy for every
+/// tensor the converter would quantize (2-D, not force-kept at f16/f32);
+/// the FIRST matching pattern wins. Patterns are matched against canonical
+/// tensor names with `*` as the only wildcard (it spans dots), e.g.
+/// `lm_head.weight=q8_2f`, `model.layers.*.mlp.down_proj.weight=q8_2f`.
+/// The file keeps its profile name (the requested `--quant`); only the
+/// per-tensor dtypes in the directory change, which every reader already
+/// dispatches on.
+static TENSOR_QUANT_OVERRIDES: Mutex<Vec<(String, Quant)>> = Mutex::new(Vec::new());
+
+/// Parse one `PATTERN=QUANT` override.
+pub(crate) fn parse_tensor_quant(spec: &str) -> anyhow::Result<(String, Quant)> {
+    let (pat, q) = spec
+        .rsplit_once('=')
+        .ok_or_else(|| anyhow::anyhow!("--tensor-quant '{spec}': expected PATTERN=QUANT"))?;
+    let pat = pat.trim();
+    anyhow::ensure!(!pat.is_empty(), "--tensor-quant '{spec}': empty pattern");
+    let quant = parse_quant(q.trim())?;
+    anyhow::ensure!(
+        !matches!(quant, Quant::Q2TiledPAffine),
+        "--tensor-quant '{spec}': q2tp_affine is a whole-file profile, not a per-tensor choice"
+    );
+    Ok((pat.to_string(), quant))
+}
+
+/// Install the converter's per-tensor overrides (replaces any earlier set).
+pub fn set_tensor_quant_overrides(specs: &[String]) -> anyhow::Result<()> {
+    let parsed = specs
+        .iter()
+        .map(|s| parse_tensor_quant(s))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    *TENSOR_QUANT_OVERRIDES.lock().unwrap() = parsed;
+    Ok(())
+}
+
+/// `*`-glob match (the only wildcard; it matches any run, dots included).
+fn glob_match(pat: &str, name: &str) -> bool {
+    let (p, n) = (pat.as_bytes(), name.as_bytes());
+    let (mut pi, mut ni) = (0usize, 0usize);
+    let (mut star, mut mark) = (None::<usize>, 0usize);
+    while ni < n.len() {
+        if pi < p.len() && p[pi] == b'*' {
+            star = Some(pi);
+            mark = ni;
+            pi += 1;
+        } else if pi < p.len() && p[pi] == n[ni] {
+            pi += 1;
+            ni += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            mark += 1;
+            ni = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+fn tensor_quant_override(name: &str) -> Option<Quant> {
+    let o = TENSOR_QUANT_OVERRIDES.lock().unwrap();
+    o.iter().find(|(p, _)| glob_match(p, name)).map(|&(_, q)| q)
+}
+
+/// The quant one 2-D tensor gets: a user override, else the profile policy.
+pub(crate) fn effective_quant(arch: &ModelArch, requested: Quant, name: &str) -> Quant {
+    tensor_quant_override(name).unwrap_or_else(|| profile_quant(arch, requested, name))
 }
 
 /// Quantization choice for 2-D weight matrices.
@@ -1032,7 +1112,7 @@ fn emit_profiled_tensor(
                     (TensorDtype::F16, encode_f16(vals))
                 } else {
                     quantize_2d(
-                        profile_quant(arch, requested, name),
+                        effective_quant(arch, requested, name),
                         vals,
                         shape[0],
                         shape[1],
@@ -8318,6 +8398,91 @@ pub(crate) mod tests {
         let model = CmfModel::open(&out).unwrap();
         assert_eq!(model.arch().vocab_size, 32);
         assert_eq!(model.arch().num_layers, 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tensor_quant_spec_and_glob() {
+        assert!(glob_match("lm_head.weight", "lm_head.weight"));
+        assert!(!glob_match("lm_head.weight", "lm_head.weight2"));
+        assert!(glob_match(
+            "model.layers.*.mlp.down_proj.weight",
+            "model.layers.41.mlp.down_proj.weight"
+        ));
+        assert!(!glob_match(
+            "model.layers.*.mlp.down_proj.weight",
+            "model.layers.41.mlp.up_proj.weight"
+        ));
+        assert!(glob_match("*v_proj*", "model.layers.3.self_attn.v_proj.weight"));
+        assert!(glob_match("model.layers.0.*", "model.layers.0.self_attn.q_proj.weight"));
+        assert!(!glob_match("model.layers.0.*", "model.layers.10.self_attn.q_proj.weight"));
+        assert!(glob_match("*", "anything"));
+        let (p, q) = parse_tensor_quant("model.embed_tokens.weight=q8_2f").unwrap();
+        assert_eq!((p.as_str(), q), ("model.embed_tokens.weight", Quant::Q8_2f));
+        assert_eq!(parse_tensor_quant("x=F16").unwrap().1, Quant::F16);
+        assert!(parse_tensor_quant("no-equals").is_err());
+        assert!(parse_tensor_quant("=q8").is_err());
+        assert!(parse_tensor_quant("x=q9").is_err());
+    }
+
+    /// `--tensor-quant` reaches the directory: the named tensors change
+    /// dtype, everything else keeps the profile's, and the file loads.
+    /// The overrides are process-global, so the fixture uses names (layer 1)
+    /// that no other converting test writes.
+    #[test]
+    fn tensor_quant_override_changes_only_matching_tensors() {
+        let dir = std::env::temp_dir().join(format!("cortiq-tqtest-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("config.json"),
+            r#"{"model_type":"llama","hidden_size":64,"num_hidden_layers":2,"num_attention_heads":4,"num_key_value_heads":4,"intermediate_size":128,"vocab_size":32,"rms_norm_eps":0.000001,"tie_word_embeddings":true}"#,
+        )
+        .unwrap();
+        fs::write(dir.join("tokenizer.json"), b"{}").unwrap();
+        let vals = |n: usize| (0..n).map(|k| (k as f32 * 0.017).sin()).collect::<Vec<_>>();
+        let mut tensors = vec![("model.embed_tokens.weight".to_string(), vec![32, 64], vals(32 * 64))];
+        for li in 0..2 {
+            for (t, shape) in [
+                ("mlp.gate_proj", vec![128, 64]),
+                ("mlp.up_proj", vec![128, 64]),
+                ("mlp.down_proj", vec![64, 128]),
+            ] {
+                let n = shape[0] * shape[1];
+                tensors.push((format!("model.layers.{li}.{t}.weight"), shape, vals(n)));
+            }
+        }
+        tensors.push(("model.norm.weight".to_string(), vec![64], vec![1.0f32; 64]));
+        let refs: Vec<(&str, Vec<usize>, Vec<f32>)> = tensors
+            .iter()
+            .map(|(n, s, v)| (n.as_str(), s.clone(), v.clone()))
+            .collect();
+        fs::write(dir.join("model.safetensors"), tiny_safetensors(&refs)).unwrap();
+        let out = dir.join("mixed.cmf");
+        set_tensor_quant_overrides(&[
+            "model.layers.1.mlp.down_proj.weight=q8_2f".into(),
+            "model.layers.1.mlp.up_*=f16".into(),
+        ])
+        .unwrap();
+        let r = run_convert(
+            dir.to_str().unwrap(),
+            "q4tp",
+            out.to_str().unwrap(),
+            None,
+            None,
+            None,
+            false,
+            |_| {},
+        );
+        set_tensor_quant_overrides(&[]).unwrap();
+        r.unwrap();
+        let model = CmfModel::open(&out).unwrap();
+        let dt = |n: &str| model.tensors.iter().find(|e| e.name == n).unwrap().dtype;
+        assert_eq!(dt("model.layers.1.mlp.down_proj.weight"), TensorDtype::Q8_2f);
+        assert_eq!(dt("model.layers.1.mlp.up_proj.weight"), TensorDtype::F16);
+        assert_eq!(dt("model.layers.1.mlp.gate_proj.weight"), TensorDtype::Q4TiledP);
+        assert_eq!(dt("model.layers.0.mlp.down_proj.weight"), TensorDtype::Q4TiledP);
+        assert_eq!(dt("model.layers.0.mlp.up_proj.weight"), TensorDtype::Q4TiledP);
         let _ = fs::remove_dir_all(&dir);
     }
 
