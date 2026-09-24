@@ -9351,6 +9351,10 @@ impl Pipeline {
             || !crate::gpu::wgpu_active()
             || self.o1_active()
             || self.physical_layers != self.num_layers
+            // The pair-fusion diagnostic (and an explicit graph-off run)
+            // rewinds only host KV. A hidden singleton attention graph here
+            // would leave device mirrors ahead of the next host position.
+            || std::env::var("CMF_GPU_WGPU_GRAPH").as_deref() == Ok("0")
             || std::env::var("CMF_MIMO_ATTN_GRAPH").as_deref() == Ok("0")
             || self.wgpu_graph_attn_decline().is_some()
         {
@@ -14365,7 +14369,9 @@ fn moe_ffn_batch(
             // stats and must not cross the pool boundary.
             let experts = &m.experts;
             let (active_r, assign_r) = (&active, &assign);
+            let inherit_cpu = crate::gpu::inherit_cpu_scope();
             let run = |start: usize, end: usize| {
+                let _cpu_scope = inherit_cpu();
                 for ai in start..end {
                     let e = active_r[ai];
                     let list = &assign_r[e];
