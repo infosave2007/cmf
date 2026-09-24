@@ -55,6 +55,15 @@ pub fn cpu_scope<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// Capture CPU-only placement before dispatching whole operators to workers.
+/// `cpu_scope` is thread-local, while a MoE panel worker calls QTensor again;
+/// without inheritance, which expert happened to land on the caller changed
+/// its precision/backend from run to run.
+pub(crate) fn inherit_cpu_scope() -> impl Fn() -> Option<CpuScopeGuard> + Copy {
+    let on = CPU_ONLY.get();
+    move || on.then(enter_cpu_scope)
+}
+
 /// Backends: name the device once at init. The probe cache is keyed by
 /// it, because a verdict is a property of THIS silicon and nothing else.
 /// First writer wins: a process runs one backend, and on the rare host
@@ -761,6 +770,19 @@ fn probe_test_guard() -> std::sync::MutexGuard<'static, ()> {
 mod probe_tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn cpu_only_whole_operator_dispatch_inherits_and_restores_scope() {
+        let pool = crate::pool::Pool::with_spin(3, 0);
+        cpu_scope(|| {
+            let inherit = inherit_cpu_scope();
+            pool.run_rows(64, &|_, _| {
+                let _guard = inherit();
+                assert!(CPU_ONLY.get());
+            });
+        });
+        pool.run_rows(64, &|_, _| assert!(!CPU_ONLY.get()));
+    }
 
     // One test fn: PROBES is process-global and probe_reset touches all
     // classes — parallel test threads would race.
