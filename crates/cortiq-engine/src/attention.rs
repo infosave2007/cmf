@@ -1096,14 +1096,20 @@ pub fn qwen_attention(
     if cache.o1_sealed() {
         return qwen_attention_nystrom(hidden, wq, wk, wv, wo, cache, cfg);
     }
+    let prof = crate::cpuprof::time(crate::cpuprof::Slot::Qkv);
     let (q_raw, k, v) = project_matvecs(hidden, wq, wk, wv, cfg);
+    drop(prof);
     let mut projected = projected_gate(hidden, cfg);
+    let prof = crate::cpuprof::time(crate::cpuprof::Slot::AttnCore);
     let mut ao = qwen_attention_core(q_raw, k, v, cache, cfg);
+    drop(prof);
     if let (Some(raw), Some((_, per_head))) = (projected.as_deref(), cfg.softplus_gate) {
         apply_projected_gate(&mut ao, raw, per_head, cfg.head_dim);
     }
     let mut out = take_buf(cfg.hidden_size);
+    let prof = crate::cpuprof::time(crate::cpuprof::Slot::AttnO);
     wo.matvec(&ao, &mut out, cfg.pool);
+    drop(prof);
     recycle_buf(&mut ao);
     if let Some(mut gate) = projected.take() {
         recycle_buf(&mut gate);
@@ -1243,6 +1249,7 @@ pub fn qwen_attention_batch(
     #[cfg(not(target_arch = "aarch64"))]
     let cpu_attend = false;
     let batched_attend = cpu_attend || gpu_attend;
+    let prof_attend = crate::cpuprof::time(crate::cpuprof::Slot::PrefillAttend);
     let s0 = cache.seq_len;
     let mut ao_all = take_buf(b * nh * hd);
     let mut q_rope_all = if batched_attend {
@@ -1448,6 +1455,7 @@ pub fn qwen_attention_batch(
     }
     recycle_buf(&mut q_rope_all);
     recycle_buf(&mut gates_all);
+    drop(prof_attend);
 
     // ── chunk-GEMM output projection ──
     let mut out = vec![0.0f32; b * cfg.hidden_size];
