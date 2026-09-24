@@ -107,24 +107,25 @@ request gives a direct answer.
 ### Tool calling
 
 Send `tools` in the usual OpenAI format; the embedded template puts them in the
-system prompt the way MiniCPM5 was trained. The model answers with an XML call
-in `message.content` (cortiq does not convert this format into `tool_calls`
-yet):
+system prompt the way MiniCPM5 was trained. The model calls a tool in XML:
 
 ```
 <function name="get_weather"><param name="city">Paris</param></function>
 ```
 
-Parse it on the client, run the tool, then send the assistant turn back with
+From cortiq 0.7.6 the server turns this into `message.tool_calls` with
+`finish_reason: "tool_calls"`, streamed or not; `arguments` is a JSON string
+whose values follow the types in the tool's schema. Older versions leave the
+XML in `message.content`. Run the tool, then send the assistant turn back with
 `tool_calls` and the result as a `{"role": "tool", ...}` message. On
 Vulkan/DX12 start the server with `CMF_KV_REUSE=0` for tool conversations:
 with the default cross-turn cache the model often repeats the call instead of
 answering from the result. With it, and on Apple silicon by default, the call
 and the answer from the result were correct in 6 of 6 test conversations for
 both files. The embedded template differs from the upstream file only in
-writing `tojson` without `ensure_ascii=False` (the runtime's template engine
-does not take the argument; the output is the same), and the four tool-markup
-tokens are kept in decoded text.
+writing `tojson` without `ensure_ascii=False`, which gives the same output, and
+the four tool-markup tokens are marked as ordinary text. cortiq 0.7.6 and later
+also accept the upstream template and tokenizer unchanged.
 
 ## Hardware
 
@@ -249,23 +250,26 @@ curl http://localhost:8080/v1/chat/completions \
 
 **Вызов инструментов.** Передавайте `tools` в обычном формате OpenAI;
 встроенный шаблон помещает их в системный промпт так, как модель обучали.
-Модель отвечает XML-вызовом в `message.content` (в `tool_calls` cortiq этот
-формат пока не превращает):
+Модель вызывает инструмент в XML:
 
 ```
 <function name="get_weather"><param name="city">Paris</param></function>
 ```
 
-Разберите его на клиенте, выполните инструмент и отправьте обратно ход
-ассистента с `tool_calls` и результат сообщением `{"role": "tool", ...}`. На
+Начиная с cortiq 0.7.6 сервер превращает такой вызов в `message.tool_calls` с
+`finish_reason: "tool_calls"`, и в потоковом режиме тоже; `arguments` — строка
+JSON, значения в которой приведены к типам из схемы инструмента. Более старые
+версии оставляют XML в `message.content`. Выполните инструмент и отправьте
+обратно ход ассистента с `tool_calls` и результат сообщением
+`{"role": "tool", ...}`. На
 Vulkan/DX12 для диалогов с инструментами запускайте сервер с
 `CMF_KV_REUSE=0`: с межходовым кэшем по умолчанию модель часто повторяет
 вызов вместо ответа по результату. С этой настройкой, а на Apple silicon и
 без неё, вызов и ответ по результату были верны в 6 из 6 тестовых диалогов
 для обоих файлов. Встроенный шаблон отличается от исходного только тем, что
-`tojson` записан без `ensure_ascii=False` (шаблонизатор движка не принимает
-этот аргумент, результат тот же), а четыре токена разметки вызова сохраняются
-в декодированном тексте.
+`tojson` записан без `ensure_ascii=False` (результат тот же), а четыре токена
+разметки вызова помечены как обычный текст. cortiq 0.7.6 и новее принимает и
+исходные шаблон и токенизатор без изменений.
 
 ### Железо
 
@@ -380,20 +384,22 @@ curl http://localhost:8080/v1/chat/completions \
 解码；`"enable_thinking": false` 直接给出回答。
 
 **工具调用。** 按常规 OpenAI 格式传入 `tools`；内置模板会按 MiniCPM5 的训练方式
-把它们放进系统提示词。模型在 `message.content` 中以 XML 形式给出调用（cortiq
-暂不把该格式转换为 `tool_calls`）：
+把它们放进系统提示词。模型以 XML 形式调用工具：
 
 ```
 <function name="get_weather"><param name="city">Paris</param></function>
 ```
 
-请在客户端解析，执行工具后，把带 `tool_calls` 的助手回合和
+从 cortiq 0.7.6 起，服务器会把它转换为 `message.tool_calls`，并给出
+`finish_reason: "tool_calls"`，流式输出同样如此；`arguments` 是 JSON 字符串，其中的值
+按工具 schema 声明的类型转换。更早的版本会把 XML 留在 `message.content` 中。
+执行工具后，把带 `tool_calls` 的助手回合和
 `{"role": "tool", ...}` 结果消息一并发回。在 Vulkan/DX12 上进行工具对话时，请用
 `CMF_KV_REUSE=0` 启动服务器：默认的跨回合缓存下，模型常会重复调用而不是根据结果
 作答。设置后（Apple silicon 默认即可），两个文件在 6 个测试对话中调用和基于结果的
 回答全部正确。内置模板与上游文件的唯一区别是 `tojson` 去掉了
-`ensure_ascii=False`（引擎的模板引擎不接受该参数，输出相同），并且四个工具标记
-token 会保留在解码文本中。
+`ensure_ascii=False`（输出相同），并且四个工具标记 token 被标为普通文本。
+cortiq 0.7.6 及以后版本也可以直接使用未经修改的上游模板和分词器。
 
 ### 硬件
 
