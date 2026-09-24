@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.5] - 2026-09-24
+
+### Added
+- Z-Image on Apple silicon (Metal): the whole image runs on the device —
+  the DiT as one resident chain per step reading the file's 8-bit weights
+  straight from the mapping (no f16 copies: measured equal or slower on the
+  M4 and 11.6 GB), a 64-query attention kernel with prefetch, the CFG pair
+  as one batch-2 program, the context refiner, and the VAE decoder on the
+  device (512²: 1.0 s, 1024²: 4.8 s). On an M4 the CPU's matrix unit
+  (Accelerate) computes a fixed slice of every large GEMM beside the GPU,
+  ordered by a shared event, which is bit-stable run to run
+  (`CMF_ZI_CPU_FRAC=0` for GPU-only; other Apple chips run GPU-only until
+  measured). Mac mini M4 (24 GB), no flags: Turbo 512² in 30 s (was 82 on
+  the CPU path) and 1024² in 160 s (was 372); the base model 512² in
+  232 s and 1024² in about 21 min; ~8 GB of memory. The chain's GEMMs run
+  at 91–94 % of the M4's measured simdgroup-matrix peak (3.55 TFLOPS);
+  attention is the remaining gap. One DiT step matches the CPU path to
+  1e-3 and the fp32 oracle as closely as the CPU path does; whole images
+  ≥ 45 dB against the CPU path on every case but one Turbo seed (32 dB,
+  itself closer to fp32 than the CPU path's own image). diffusers bf16 on
+  MPS takes 4.8 s per 512² forward on the same Mac (ours 3.6 s) and swaps
+  at 1024².
+
 ### Fixed
 - Z-Image on Vulkan: in a CFG pair, the first item now matches its own
   single forward bit for bit. Before, it was 2.2e-4 off, because rows past
