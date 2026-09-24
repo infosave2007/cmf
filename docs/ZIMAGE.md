@@ -231,6 +231,13 @@ the CPU through Accelerate, the per-conv VAE).
 first run after switching between the two files pays the page-in of the
 new file (base 512²: 257.7 s, text encoder 3.7 s and prepare 3.3 s).
 
+diffusers 0.36 bf16 on MPS (`torch 2.8`), the transformer alone on the
+same Mac, same day: one forward at 512² takes 4.80 s (the CFG pair 9.77 s;
+the first call 23 s, loading 18 s, peak footprint 14.5 GB) — cortiq's step
+is 0.88× (the pair 0.91×). At 1024² diffusers needs 30 GB and swaps: 48–66 s
+a forward, and the CFG pair was killed after its first 154 s forward;
+cortiq takes 20.9 s (0.32–0.44×) in 4.3 GB.
+
 The DiT step is 3.0 TF/s effective at 512² and 2.6–2.8 TF/s at 1024²
 (12.5 / 55.1 TFLOP per forward). The GEMMs run at 3.2–3.35 TF/s, 91–94 %
 of what the chip's simdgroup matrix units issue in a pure multiply loop
