@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.6] - 2026-09-24
+
 ### Added
 - The server turns MiniCPM5's tool calls into OpenAI `tool_calls`. The model
   writes `<function name="…"><param name="…">…</param></function>`, with
@@ -21,6 +23,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of 6 conversations and an answer from the tool result on the second turn
   in 6 of 6, streamed and not (0.7.5: 0 of 6; the call was left as XML in
   `content`).
+- `quantize-gptq --codec q4tp`: GPTQ-rounded q4tp (act order, Hessian
+  cache), and `--tensor-quant PATTERN=QUANT` on `convert` and
+  `quantize-gptq` to keep chosen tensors at another codec. MiniCPM5-2B q4tp
+  with the head and embeddings at q8_2f: wikitext-2 ppl 18.91 (bf16 17.81,
+  plain q4tp 21.21), 1.57 GB.
+
+### Changed
+- Dense decode on Vulkan/DX12: short-context attention runs on the
+  256-thread kernel, and k+v and gate+up+SiLU fuse for 2048-wide models.
+  MiniCPM5-2B q4tp on an RTX 3090: 87 -> 118 tok/s.
+- Prefill on a discrete card reads the prompt of a plain dense model in
+  512-position chunks (was 48): 46 -> 190-200 tok/s at 8k context on an
+  RTX 3090, greedy text identical. `CMF_PREFILL_CHUNK` still overrides.
+- Dense q4tp decode on Metal: a masked-nibble matvec, a concurrent layer
+  encoder and fused epilogues (14 -> 10 dispatches a layer). MiniCPM5-2B
+  q4tp on an M4: 0.82x the time per token.
+- CPU: attention runs heads (decode) and positions (prefill) in parallel,
+  activation rounding no longer calls libm, and the worker pool stays on
+  the NUMA node that holds the weights. MiniCPM5-2B q4tp prefill on an
+  EPYC 7763: 15-19 -> 30-34 tok/s. `CMF_CPU_PROF=1` prints per-stage ms.
 
 ### Fixed
 - Chat templates render the way transformers renders them.
