@@ -834,8 +834,21 @@ fn attention(
     }
 }
 
+/// A projection with its source name (the GPTQ Hessian hook keys on it).
+struct Mat {
+    p: Proj,
+    name: String,
+}
+
 /// `y [b][rows] = x [b][cols] · Wᵀ (+ bias)`.
-fn linear(p: &Proj, bias: Option<&[f32]>, x: &[f32], b: usize, pool: Option<&Pool>) -> Vec<f32> {
+///
+/// Under `gptq_capture`, exact (f32) weights report their inputs here;
+/// mapped quantized ones report from `QTensor::matmat` itself.
+fn linear(m: &Mat, bias: Option<&[f32]>, x: &[f32], b: usize, pool: Option<&Pool>) -> Vec<f32> {
+    let p = &m.p;
+    if b > 0 && crate::gptq_capture::capturing() && matches!(p, Proj::F32 { .. }) {
+        crate::gptq_capture::accumulate(&m.name, x, b, p.cols());
+    }
     let mut y = vec![0f32; b * p.rows()];
     if b > 0 {
         p.matmat(x, b, &mut y, pool);
@@ -877,13 +890,26 @@ impl WeightSource for CmfSource {
             .map_err(|e| format!("mimo audio: tensor '{name}': {e}"))?;
         Ok((dst, entry.shape.clone()))
     }
+    /// Quantized tower matrices are dequantized to f32 at load (about 2 GB
+    /// for the audio towers) and run through the f32 GEMM. Left mapped,
+    /// `QTensor::matmat`'s host arm quantizes the activations to int8,
+    /// which the tokenizer's codes do not survive: with q8_2f weights the
+    /// level-0 codes agreed with the exact tower on 95.2–96.3 % of frames
+    /// that way against 96.5–98.6 % with f32 activations, and the encoder
+    /// rows' mean cosine was 0.978–0.985 against 0.9994 (3 clips).
+    /// `CMF_MIMO_AUDIO_MAPPED=1` keeps them mapped (less RAM, int8 host
+    /// activations).
     fn proj(&mut self, name: &str) -> Result<Proj, String> {
         let entry = self
             .0
             .tensor(name)
             .ok_or_else(|| format!("mimo audio: missing tensor '{name}'"))?;
         if entry.shape.len() == 2 {
-            return Proj::from_model(&self.0, name);
+            let p = Proj::from_model(&self.0, name)?;
+            let keep_mapped = std::env::var("CMF_MIMO_AUDIO_MAPPED").is_ok_and(|v| v == "1");
+            if matches!(p, Proj::F32 { .. }) || keep_mapped {
+                return Ok(p);
+            }
         }
         let (w, shape) = self.dense(name)?;
         let cols = shape[1..].iter().product::<usize>();
@@ -1104,7 +1130,7 @@ fn take_proj(
     name: &str,
     rows: usize,
     cols: usize,
-) -> Result<Proj, String> {
+) -> Result<Mat, String> {
     let p = src.proj(name)?;
     if p.rows() != rows || p.cols() != cols {
         return Err(format!(
@@ -1113,7 +1139,10 @@ fn take_proj(
             p.cols()
         ));
     }
-    Ok(p)
+    Ok(Mat {
+        p,
+        name: name.to_string(),
+    })
 }
 
 // ───────────────────────────── configs ─────────────────────────────
@@ -1338,32 +1367,32 @@ impl EncoderConfig {
 struct TokLayer {
     ln1_w: Vec<f32>,
     ln1_b: Vec<f32>,
-    q: Proj,
+    q: Mat,
     q_b: Vec<f32>,
-    k: Proj,
-    v: Proj,
+    k: Mat,
+    v: Mat,
     v_b: Vec<f32>,
-    o: Proj,
+    o: Mat,
     o_b: Vec<f32>,
     ln2_w: Vec<f32>,
     ln2_b: Vec<f32>,
-    fc1: Proj,
+    fc1: Mat,
     fc1_b: Vec<f32>,
-    fc2: Proj,
+    fc2: Mat,
     fc2_b: Vec<f32>,
 }
 
 /// The MiMo audio tokenizer encoder and its residual VQ.
 pub struct AudioTokenizer {
     pub cfg: TokenizerConfig,
-    conv1: Proj, // [d, n_mels·3]
+    conv1: Mat, // [d, n_mels·3]
     conv1_b: Vec<f32>,
-    conv2: Proj, // [d, d·3]
+    conv2: Mat, // [d, d·3]
     conv2_b: Vec<f32>,
     layers: Vec<TokLayer>,
     ln_w: Vec<f32>,
     ln_b: Vec<f32>,
-    pool_w: Proj, // [d, d·2], no bias
+    pool_w: Mat, // [d, d·2], no bias
     pool_ln_w: Vec<f32>,
     pool_ln_b: Vec<f32>,
     /// Codebooks as stored (f32), `[size][d]` each.
@@ -1601,17 +1630,17 @@ impl AudioTokenizer {
 
 struct LocalLayer {
     ln1: Vec<f32>,
-    q: Proj,
+    q: Mat,
     q_b: Vec<f32>,
-    k: Proj,
+    k: Mat,
     k_b: Vec<f32>,
-    v: Proj,
+    v: Mat,
     v_b: Vec<f32>,
-    o: Proj,
+    o: Mat,
     ln2: Vec<f32>,
-    gate: Proj,
-    up: Proj,
-    down: Proj,
+    gate: Mat,
+    up: Mat,
+    down: Mat,
 }
 
 /// Speech embeddings + the local Qwen2 transformer + the projection.
@@ -1621,8 +1650,8 @@ pub struct AudioEncoder {
     speech_emb: Vec<Vec<f32>>,
     layers: Vec<LocalLayer>,
     norm: Option<Vec<f32>>,
-    proj0: Proj,
-    proj2: Option<Proj>,
+    proj0: Mat,
+    proj2: Option<Mat>,
 }
 
 impl AudioEncoder {
@@ -2057,10 +2086,16 @@ mod tests {
     #[test]
     fn hann_fixups_are_single_ulp_corrections() {
         let step = (2.0 * std::f64::consts::PI / N_FFT as f64) as f32;
+        // Each fixup is torch's cos landing one ulp away from the correctly
+        // rounded one (the window value itself can move by many ulps near
+        // zero, where `0.5 − 0.5·c` cancels).
         for (i, bits) in TORCH_HANN_960_FIXUPS {
             let c = ((i as f32 * step) as f64).cos() as f32;
-            let r = (c * -0.5f32 + 0.5f32).to_bits();
-            assert_eq!((r as i64 - bits as i64).abs(), 1, "index {i}");
+            let win = |c: f32| (c * -0.5f32 + 0.5f32).to_bits();
+            assert_ne!(win(c), bits, "index {i} needs no fixup");
+            let up = f32::from_bits(c.to_bits() + 1);
+            let dn = f32::from_bits(c.to_bits() - 1);
+            assert!(win(up) == bits || win(dn) == bits, "index {i}: not a one-ulp cos difference");
         }
         let w = torch_hann_960();
         assert_eq!(w[0], 0.0);

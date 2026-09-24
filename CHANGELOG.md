@@ -19,6 +19,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Without `--quant`, a MiMo-V2 checkpoint converts to q4tp experts with the
   attention, dense layer 0, embedding and lm_head at q8_2f. Other models
   still default to q8.
+- MiMo-V2.6 audio input towers in the engine (`mimo_audio`), not yet wired
+  to `run`/`serve`. WAV input: PCM 8/16/24/32-bit, float 32/64 and
+  `WAVE_FORMAT_EXTENSIBLE`, any channel count. Other rates are resampled to
+  24 kHz with torchaudio's default sinc filter, down to its float32 output
+  length. Then come the log-mel frontend, the audio tokenizer encoder with
+  its 20-level RVQ (each 6000-frame segment encoded on its own) and the
+  LLM-side encoder: the 20 speech embeddings summed, a 6-layer
+  bidirectional Qwen2 over groups of 4 frames, and the projection to 4096.
+  Weights load from a CMF that keeps the source tensor names, or straight
+  from the HF checkpoint. Measured against the HF modules in fp32 on a 5 s,
+  a 4.5 s and a 65 s clip:
+  - tokenizer features within 1.7e-5 relative;
+  - all 20 code levels identical;
+  - LLM rows within 1.2e-5 relative.
+
+  On 21 WAV files, decoding matches numpy exactly, resampling is within
+  2.8e-7 of peak of torchaudio, and the log-mel is within 6.7e-5 of
+  torchaudio's arithmetic done in float64.
+- Codecs for the audio towers, measured against exact weights:
+  - Tokenizer layers need q8_2f. With q4tp, level-0 codes agree on 79–89%
+    of frames (plain rounding) or 90–94% (GPTQ). With q8_2f they agree on
+    96.5–98.6%; HF's own bf16 run agrees with its fp32 run on 96.0–97.4%.
+  - The encoder and projection take GPTQ q4tp: mean row cosine 0.9999,
+    against 0.95 with plain rounding.
+  - Quantized tower weights are dequantized at load. The int8-activation
+    host kernels cost the tokenizer another 0.9–3.2 points of level-0
+    agreement.
+- `requant --quant q4tp-quantize` and the converter's float rules keep
+  MiMo's RVQ codebooks (f32) and speech-embedding tables (f16) out of
+  quantization.
 
 ## [0.7.6] - 2026-09-24
 

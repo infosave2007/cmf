@@ -13,6 +13,17 @@
 //!
 //! `requant q4tp-quantize` turns the 2-D matrices into q4tp and leaves the
 //! codebooks, the speech-embedding tables and every rank≠2 tensor as they are.
+//!
+//! That plain q4tp fails the audio gates (G9.4, G10.1). The companion that
+//! passes keeps the tokenizer layers at q8_2f and puts GPTQ q4tp on the
+//! LLM-side encoder, with Hessians from `mimo_audio_dump calib`:
+//!
+//! ```text
+//! mimo_audio_dump calib --src audio.exact.mm.cmf --wav-dir CALIB_WAVS --out hess.bin
+//! cortiq quantize-gptq audio.exact.mm.cmf --calib /dev/null --output audio.mm.cmf \
+//!     --codec q4tp --hessians hess.bin --act-order \
+//!     --tensor-quant 'audio_tokenizer.encoder.layers.*=q8_2f'
+//! ```
 
 use cortiq_core::format::{CmfHeader, CmfModel, TensorSpec};
 use cortiq_core::types::{ModelArch, QuantType, TensorDtype};
