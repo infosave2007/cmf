@@ -201,21 +201,22 @@ static inline uint zfa_row(constant ZFa& p, uint j) {
     return j < p.n_img ? p.img_off + j : p.cap_off + (j - p.n_img);
 }
 
-kernel void zi_flash(
-    device const half* P [[buffer(0)]],
-    device half* O [[buffer(1)]],
-    device const float* colo [[buffer(2)]],
-    constant ZFa& p [[buffer(3)]],
-    uint tid [[thread_index_in_threadgroup]],
-    ushort sg [[simdgroup_index_in_threadgroup]],
-    ushort lane [[thread_index_in_simdgroup]],
-    uint2 tg [[threadgroup_position_in_grid]])
+// Flash body. NSG simdgroups × 8 queries per group (32 or 64 queries);
+// keys in blocks of 32, K/V staged row-major in threadgroup memory (Kᵀ
+// fragments load transposed). PF: the next block's K/V are prefetched
+// into registers before this block's math. Measured (M4, n 1056/4224,
+// 1.34-1.51 TF/s, all within noise of each other): the Q·Kᵀ loop order
+// and a transposed K staging (`[d][key]`) — kept out.
+template <ushort NSG, bool PF, ushort SKIP>
+static inline void zi_flash_body(
+    device const half* P, device half* O, device const float* colo, constant ZFa& p,
+    threadgroup half* sk, threadgroup half* sv,
+    uint tid, ushort sg, ushort lane, uint2 tg)
 {
-    threadgroup half sk[32 * 128];
-    threadgroup half sv[32 * 128];
+    constexpr uint NT = 32u * NSG, CH = 512u / NT;   // uint4 chunks of K (and of V) per thread
     const uint h = tg.y;
     const uint ntot = p.n_img + p.n_cap;
-    const uint q0 = tg.x * 32u + 8u * sg;
+    const uint q0 = tg.x * (8u * NSG) + 8u * sg;
     const uint qr = zfa_row(p, q0);
     const uint hq = h * 128u;
     simdgroup_half8x8 qf[16];
@@ -224,28 +225,53 @@ kernel void zi_flash(
     simdgroup_float8x8 of[16];
     for (ushort d = 0; d < 16; ++d) of[d] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     float m = -INFINITY, l = 0.0f;
-    const uint key = tid >> 2, part = (tid & 3u) * 32u;
     const short2 fc = zi_fc(lane);
-    threadgroup uint4* kd = (threadgroup uint4*)(sk + key * 128u + part);
-    threadgroup uint4* vd = (threadgroup uint4*)(sv + key * 128u + part);
+    uint4 kq[CH], vq[CH];
+    uint ckey[CH], cpart[CH];
+    for (uint c = 0; c < CH; ++c) {
+        const uint ch = tid + c * NT;
+        ckey[c] = ch / 16u;
+        cpart[c] = (ch % 16u) * 8u;
+    }
+    if (PF) {
+        for (uint c = 0; c < CH; ++c) {
+            const uint kr = zfa_row(p, ckey[c]);
+            kq[c] = *(device const uint4*)(P + (ulong)kr * p.ldp + p.H + hq + cpart[c]);
+            vq[c] = *(device const uint4*)(P + (ulong)kr * p.ldp + 2u * p.H + hq + cpart[c]);
+        }
+    }
     for (uint kb0 = 0; kb0 < ntot; kb0 += 32u) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        {
-            const uint kr = zfa_row(p, kb0 + key);
-            device const uint4* ks = (device const uint4*)(P + (ulong)kr * p.ldp + p.H + hq + part);
-            device const uint4* vs = (device const uint4*)(P + (ulong)kr * p.ldp + 2u * p.H + hq + part);
-            for (ushort i = 0; i < 4; ++i) { kd[i] = ks[i]; vd[i] = vs[i]; }
+        if (!PF) {
+            for (uint c = 0; c < CH; ++c) {
+                const uint kr = zfa_row(p, kb0 + ckey[c]);
+                kq[c] = *(device const uint4*)(P + (ulong)kr * p.ldp + p.H + hq + cpart[c]);
+                vq[c] = *(device const uint4*)(P + (ulong)kr * p.ldp + 2u * p.H + hq + cpart[c]);
+            }
+        }
+        for (uint c = 0; c < CH; ++c) {
+            *(threadgroup uint4*)(sk + ckey[c] * 128u + cpart[c]) = kq[c];
+            *(threadgroup uint4*)(sv + ckey[c] * 128u + cpart[c]) = vq[c];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (PF && kb0 + 32u < ntot) {
+            for (uint c = 0; c < CH; ++c) {
+                const uint kr = zfa_row(p, kb0 + 32u + ckey[c]);
+                kq[c] = *(device const uint4*)(P + (ulong)kr * p.ldp + p.H + hq + cpart[c]);
+                vq[c] = *(device const uint4*)(P + (ulong)kr * p.ldp + 2u * p.H + hq + cpart[c]);
+            }
+        }
         simdgroup_float8x8 s[4];
         #pragma clang loop unroll(full)
         for (ushort c = 0; c < 4; ++c) {
             s[c] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-            #pragma clang loop unroll(full)
-            for (ushort d = 0; d < 16; ++d) {
-                simdgroup_half8x8 kf;
-                simdgroup_load(kf, sk + 8u * c * 128u + 8u * d, 128, ulong2(0, 0), true);
-                simdgroup_multiply_accumulate(s[c], qf[d], kf, s[c]);
+            if (SKIP != 2) {
+                #pragma clang loop unroll(full)
+                for (ushort d = 0; d < 16; ++d) {
+                    simdgroup_half8x8 kf;
+                    simdgroup_load(kf, sk + 8u * c * 128u + 8u * d, 128, ulong2(0, 0), true);
+                    simdgroup_multiply_accumulate(s[c], qf[d], kf, s[c]);
+                }
             }
         }
         float mx = -INFINITY;
@@ -274,16 +300,21 @@ kernel void zi_flash(
                 of[d].thread_elements()[1] *= alpha;
             }
         }
-        #pragma clang loop unroll(full)
-        for (ushort c = 0; c < 4; ++c) {
+        if (SKIP != 1) {
             #pragma clang loop unroll(full)
-            for (ushort d = 0; d < 16; ++d) {
-                simdgroup_half8x8 vf;
-                simdgroup_load(vf, sv + 8u * c * 128u + 8u * d, 128);
-                simdgroup_multiply_accumulate(of[d], pf[c], vf, of[d]);
+            for (ushort c = 0; c < 4; ++c) {
+                #pragma clang loop unroll(full)
+                for (ushort d = 0; d < 16; ++d) {
+                    simdgroup_half8x8 vf;
+                    simdgroup_load(vf, sv + 8u * c * 128u + 8u * d, 128);
+                    simdgroup_multiply_accumulate(of[d], pf[c], vf, of[d]);
+                }
             }
+        } else {
+            for (ushort d = 0; d < 16; ++d) of[d].thread_elements()[0] += (float)pf[d % 4].thread_elements()[0];
         }
     }
+    if (q0 >= ntot) return;   // the tail group of a 64-query tile
     const float inv = 1.0f / l;
     const uint orow = qr + (uint)fc.x;
     for (ushort d = 0; d < 16; ++d) {
@@ -293,6 +324,28 @@ kernel void zi_flash(
         *(device half2*)(O + (ulong)orow * p.ldo + col) = v;
     }
 }
+
+#define ZI_FLASH(NAME, NSG, PF, SKIP) \
+kernel void NAME( \
+    device const half* P [[buffer(0)]], \
+    device half* O [[buffer(1)]], \
+    device const float* colo [[buffer(2)]], \
+    constant ZFa& p [[buffer(3)]], \
+    uint tid [[thread_index_in_threadgroup]], \
+    ushort sg [[simdgroup_index_in_threadgroup]], \
+    ushort lane [[thread_index_in_simdgroup]], \
+    uint2 tg [[threadgroup_position_in_grid]]) \
+{ \
+    threadgroup half sk[32 * 128]; \
+    threadgroup half sv[32 * 128]; \
+    zi_flash_body<NSG, PF, SKIP>(P, O, colo, p, sk, sv, tid, sg, lane, tg); \
+}
+
+ZI_FLASH(zi_flash_q64pf, 8, true, 0)
+ZI_FLASH(zi_flash_q32, 4, false, 0)
+ZI_FLASH(zi_flash_nopv, 8, true, 1)
+ZI_FLASH(zi_flash_noqk, 8, true, 2)
+
 
 // ───────── qk RMSNorm + interleaved RoPE, in place on the panel ─────────
 struct ZQk {
@@ -531,6 +584,39 @@ kernel void zi_copy4(
     uint i [[thread_position_in_grid]])
 {
     if (i < n4) dst[i] = src[i];
+}
+
+// ───────────── probe: pure simdgroup MMA issue rate (no loads) ─────────────
+template <typename T>
+static inline void zi_peak_body(device float* out, uint iters, ushort lane, uint gid) {
+    simdgroup_matrix<T, 8, 8> a[4], b[4];
+    for (ushort i = 0; i < 4; ++i) {
+        a[i] = make_filled_simdgroup_matrix<T, 8, 8>((T)(0.001f * (lane + i)));
+        b[i] = make_filled_simdgroup_matrix<T, 8, 8>((T)(0.002f * (lane + 2 * i)));
+    }
+    simdgroup_float8x8 acc[4][4];
+    for (ushort i = 0; i < 4; ++i)
+        for (ushort j = 0; j < 4; ++j) acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    for (uint it = 0; it < iters; ++it) {
+        #pragma clang loop unroll(full)
+        for (ushort i = 0; i < 4; ++i)
+            #pragma clang loop unroll(full)
+            for (ushort j = 0; j < 4; ++j)
+                simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+    }
+    float s = 0.0f;
+    for (ushort i = 0; i < 4; ++i)
+        for (ushort j = 0; j < 4; ++j) s += acc[i][j].thread_elements()[0];
+    if (s == 12345.678f) out[gid] = s;
+}
+
+kernel void zi_peak_h(device float* out [[buffer(0)]], constant uint& iters [[buffer(1)]],
+    ushort lane [[thread_index_in_simdgroup]], uint gid [[thread_position_in_grid]]) {
+    zi_peak_body<half>(out, iters, lane, gid);
+}
+kernel void zi_peak_f(device float* out [[buffer(0)]], constant uint& iters [[buffer(1)]],
+    ushort lane [[thread_index_in_simdgroup]], uint gid [[thread_position_in_grid]]) {
+    zi_peak_body<float>(out, iters, lane, gid);
 }
 
 // ───────────── debug: max|x| of a half range into slot (float bits) ─────────────
