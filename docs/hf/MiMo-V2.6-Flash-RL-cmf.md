@@ -17,8 +17,8 @@ language:
 
 # MiMo-V2.6-Flash-RL — CMF q4tp
 
-> **Release draft — do not publish yet.** The VRAM ladder, reference-layer drift audit,
-> HTTP media check and aquarium example are not complete.
+> **Release draft — do not publish yet.** The reference-layer drift audit and aquarium example are not complete.
+> The VRAM ladder exposed staging-memory peaks; a bounded-upload fix is under test.
 > Strict vision cosine and video timestamp gates remain open. These packages
 > are candidates; the MiMo-enabled engine has not been released as 0.7.7.
 
@@ -95,10 +95,22 @@ Natural 128-token greedy prompts, one loaded model:
 All four arms (cold plain, warm plain, MTP, repeated plain) emitted identical
 IDs for each prompt. A separate exact-float CPU/GPU check used a 456-token
 natural prompt and matched all 64 subsequent greedy token IDs, beyond the
-sliding-window boundary. MTP is not faster on every text. The 16/24/32/48/64/80-GB
-budget table and sampled peak VRAM are pending; simulated budgets must not be
-presented as measurements on six different physical cards. Host RAM must also
-accommodate the mapped text weights and execution state.
+sliding-window boundary. MTP is not faster on every text. The following are **weight budgets on the
+same 96-GB card**, not measurements on six different physical cards:
+
+| `CMF_GPU_VRAM_MB` (MiB) | Auto placement | Median tok/s, 3 runs | Largest sampled VRAM peak (MiB) |
+|---:|---|---:|---:|
+| 16000 | dynamic | 10.96 | 20417 |
+| 24000 | dynamic | 17.27 | 33111 |
+| 32000 | dynamic | 29.66 | 46585 |
+| 48000 | dynamic | 36.47 | 58102 |
+| 64000 | dynamic | 44.48 | 70164 |
+| 80000 | hybrid, 8 prefix layers | 42.36 | 85497 |
+
+These runs expose temporary allocations above the configured weight budget;
+**they do not qualify operation on physical 16–80-GB cards**. A bounded staging
+candidate is under test. Host RAM must also accommodate mapped text weights
+and execution state. No unverified low-memory compatibility is claimed.
 
 ## Full package
 
@@ -160,7 +172,9 @@ RTX PRO 6000 96 ГБ: медиана трёх `bench --core --tokens 128 --ignor
 равна **40.85 ток/с** (32.20 / 41.40 / 40.85). На естественных промптах скорость
 другая; MTP не всегда быстрее. На EN/RU/коде все 128 ID совпали в четырёх руках.
 PPL128 = 3.647 на CPU, полном GPU и в двух повторах с бюджетом 24 ГБ.
-Таблица 16–96 ГБ ещё не завершена.
+Лестница бюджетов приведена выше: при 64000 MiB медиана 44.48 ток/с.
+Пики VRAM превышали бюджет весов, поэтому это не подтверждение работы
+на физических картах 16–80 ГБ; исправление временных аллокаций проверяется.
 
 Полная версия читает изображения, WAV и немые видео из Y4M/каталога кадров.
 OCR, фигуры, диаграмма и пять ASR-клипов прошли; строгий минимум cosine для
@@ -190,7 +204,9 @@ RTX PRO 6000 96 GB 上，三次 128-token core 基准为
 32.20 / 41.40 / 40.85 token/s，中位数 **40.85**。这不代表所有自然语言
 请求都达到该速度。英、俄、代码提示的四种执行均输出相同的 128 个 ID。
 CPU、完整 GPU 预算及两次 24-GB 预算测试的 PPL128 均为 3.647。
-16–96 GB 预算表尚未完成。
+上表列出同一张卡的预算测试；64000 MiB 预算中位数为 44.48 token/s。
+显存峰值超过权重预算，不能据此声称已验证实体 16–80 GB 显卡；
+限制临时上传缓冲区的修复仍在测试中。
 
 完整套件接受图像、WAV，以及 Y4M 或帧目录形式的无声视频。
 OCR、形状、图表和五段语音测试已通过；严格视觉行余弦与精确视频时间戳

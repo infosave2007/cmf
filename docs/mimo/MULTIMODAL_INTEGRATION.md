@@ -65,3 +65,16 @@ Current integration is a candidate, **not a qualified/published release**:
 * Previous tower work found plain q4tp/GPTQ vision below its quality threshold;
   q8_2f vision and audio-tokenizer fallback candidates are used alongside the
   GPTQ-q4tp audio encoder. The base text q4tp is not requantized.
+
+Final ingress repeat on `26c02083`: 46 MiMo unit tests, 7 actual-device bank
+checks, the CLI media-flag parser and server content-preservation test pass.
+The repeated real-media suite retains identical ID/Hidden/MTP output, exact
+OCR and zero WER on all five speech clips; the video answer remains 6.
+
+Both staged variants were exercised through the HTTP server. Multipart text
+IDs equal concatenated single-text IDs; neither server startup nor pure text
+maps the MM companion. Full-package image OCR returns `CORTIQ 7392`; malformed
+streamed media fails with HTTP 400 before SSE. Text-only correctly rejects
+media with HTTP 400. CLI and server expanded image prompt IDs are identical.
+The packages contain regular hardlinks to the shared backbone/MTP (not
+absolute symlinks); text-only contains no `.mm.cmf`.
