@@ -732,6 +732,9 @@ fn force_f32(name: &str) -> bool {
     name.ends_with(".tid2eid")
         // MiMo-V2's per-head softmax sink logits: tiny, and a logit.
         || name.ends_with(".self_attn.sinks")
+        // MiMo audio tokenizer RVQ codebooks: nearest-neighbour tables,
+        // F32 in the source; a nudged codeword changes codes.
+        || name.ends_with("._codebook.embed")
         || name.ends_with(".mlp.expert_bias")
         || name.ends_with(".mlp.expert_bias_vl")
         || name.ends_with(".ffn.gate.bias")
@@ -759,7 +762,9 @@ pub(crate) fn keeps_float(name: &str) -> bool {
 }
 
 fn force_f16(name: &str) -> bool {
-    name.ends_with("linear_attn.in_proj_a.weight")
+    // MiMo speech embeddings: 20 gather tables summed per frame, not matmuls.
+    name.starts_with("speech_embeddings.")
+        || name.ends_with("linear_attn.in_proj_a.weight")
         || name.ends_with("linear_attn.in_proj_b.weight")
         // KDA (Kimi): decay/β/gate low-rank stages and conv taps are tiny
         // and sit on exp/σ paths — keep them exact.
