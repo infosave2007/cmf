@@ -68,6 +68,31 @@ pub fn rope_rotate(x: &mut [f32], position: usize, inv_freq: &[f32]) {
 }
 
 /// RoPE with an optional post-processing scale on both cos and sin (YaRN).
+thread_local! {
+    /// (sin, cos) per rotary frequency for the position being rotated.
+    static ROPE_TAB: std::cell::RefCell<Vec<(f32, f32)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Fill `tab` with `(position·freq).sin_cos()` per frequency — exactly the
+/// values `rope_rotate_scaled` computes inline.
+fn rope_table(tab: &mut Vec<(f32, f32)>, position: usize, inv_freq: &[f32]) {
+    tab.clear();
+    tab.extend(inv_freq.iter().map(|&freq| (position as f32 * freq).sin_cos()));
+}
+
+/// `rope_rotate_scaled` with the sin/cos precomputed (bit-identical).
+#[inline]
+fn rope_rotate_table(x: &mut [f32], tab: &[(f32, f32)], scale: f32) {
+    let half = tab.len();
+    for (i, &(sin, cos)) in tab.iter().enumerate() {
+        let x0 = x[i];
+        let x1 = x[i + half];
+        x[i] = (x0 * cos - x1 * sin) * scale;
+        x[i + half] = (x0 * sin + x1 * cos) * scale;
+    }
+}
+
 pub fn rope_rotate_scaled(x: &mut [f32], position: usize, inv_freq: &[f32], scale: f32) {
     let half = inv_freq.len();
     for (i, &freq) in inv_freq.iter().enumerate() {
@@ -860,23 +885,22 @@ pub(crate) fn qk_norm_and_rope(
             }
         }
     };
+    // One sin/cos table per position, shared by every head: the angle of
+    // frequency i does not depend on the head, and `rope_rotate_scaled`
+    // recomputed it for each of the nh + nkv heads — 1152 libm `sin_cos`
+    // a layer on MiniCPM5-2B (16 + 2 heads × 64). Same angle expression,
+    // same sin_cos, same rotation → bit-identical.
     let rope = |q: &mut [f32], k: &mut [f32]| {
-        for h in 0..nh {
-            rope_rotate_scaled(
-                &mut q[h * hd..h * hd + rd],
-                position,
-                cfg.inv_freq,
-                cfg.rope_scale,
-            );
-        }
-        for g in 0..nkv {
-            rope_rotate_scaled(
-                &mut k[g * hd..g * hd + rd],
-                position,
-                cfg.inv_freq,
-                cfg.rope_scale,
-            );
-        }
+        ROPE_TAB.with(|t| {
+            let mut t = t.borrow_mut();
+            rope_table(&mut t, position, cfg.inv_freq);
+            for h in 0..nh {
+                rope_rotate_table(&mut q[h * hd..h * hd + rd], &t, cfg.rope_scale);
+            }
+            for g in 0..nkv {
+                rope_rotate_table(&mut k[g * hd..g * hd + rd], &t, cfg.rope_scale);
+            }
+        })
     };
     if cfg.qk_norm_after_rope {
         rope(q, k);
@@ -944,6 +968,123 @@ pub(crate) fn attend_all_heads(
     window: Option<usize>,
     softcap: f32,
 ) -> (Vec<f32>, Vec<f32>) {
+    attend_all_heads_pool(q, cache, nh, heads_per_kv, hd, scale, window, softcap, None)
+}
+
+/// `attend_all_heads` as it ran when the cache held `upto` rows, into
+/// zeroed caller buffers (`out` = nh·hd, `imp` = the importance row of
+/// that moment). The serial group loop verbatim, with every group's rows
+/// capped at `upto`.
+#[allow(clippy::too_many_arguments)]
+fn attend_all_heads_upto(
+    q: &[f32],
+    cache: &LayerKvCache,
+    nh: usize,
+    heads_per_kv: usize,
+    hd: usize,
+    scale: f32,
+    window: Option<usize>,
+    softcap: f32,
+    upto: usize,
+    out: &mut [f32],
+    imp: &mut [f32],
+) {
+    let nkv = nh / heads_per_kv;
+    for g in 0..nkv {
+        let stored = cache.head_len(g).min(upto);
+        if stored == 0 {
+            continue;
+        }
+        let first = window.map(|w| stored.saturating_sub(w)).unwrap_or(0);
+        let span = g * heads_per_kv * hd..(g + 1) * heads_per_kv * hd;
+        cache.attend_group_upto(
+            &q[span.clone()],
+            g,
+            &mut out[span],
+            imp,
+            scale,
+            first,
+            softcap,
+            upto,
+        );
+    }
+}
+
+/// Decode attend below this many (head × stored row) cells stays serial:
+/// the pool's barrier costs more than the work.
+const ATTEND_PAR_MIN_CELLS: usize = 16 * 96;
+
+/// `attend_all_heads`, one pool job over the heads once the context is
+/// long enough. The serial kernel was the whole CPU attention of a decode
+/// step on one core: 16 heads × `stored` rows of dot + libm `exp` + axpy,
+/// ~70 us a layer at 100 tokens and linear in the context. Each head is
+/// attended by the same `attend_group` arithmetic (a group of one head:
+/// every per-head loop runs over the same rows in the same order), and
+/// the importance sums are added afterwards in the serial path's (group,
+/// head) order — output and importance are bit-identical.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attend_all_heads_pool(
+    q: &[f32],
+    cache: &LayerKvCache,
+    nh: usize,
+    heads_per_kv: usize,
+    hd: usize,
+    scale: f32,
+    window: Option<usize>,
+    softcap: f32,
+    pool: Option<&crate::pool::Pool>,
+) -> (Vec<f32>, Vec<f32>) {
+    let nkv = nh / heads_per_kv.max(1);
+    let longest = (0..nkv).map(|g| cache.head_len(g)).max().unwrap_or(0);
+    if let Some(pool) = pool
+        && nh >= 2
+        && nh * longest >= ATTEND_PAR_MIN_CELLS
+    {
+        let mut attn_out = take_buf(nh * hd);
+        let mut imp = take_buf(cache.seq_len);
+        // Per-head probabilities, each head's own row: [nh × longest].
+        let mut probs = take_buf(nh * longest);
+        let (out_p, probs_p) = (
+            crate::pool::SendMut::new(attn_out.as_mut_ptr()),
+            crate::pool::SendMut::new(probs.as_mut_ptr()),
+        );
+        let run = |h0: usize, h1: usize| {
+            for h in h0..h1 {
+                let g = h / heads_per_kv;
+                let stored = cache.head_len(g);
+                // SAFETY: head h owns out[h·hd..] and probs[h·longest..].
+                let (out_h, probs_h) = unsafe {
+                    (
+                        std::slice::from_raw_parts_mut(out_p.at(h * hd), hd),
+                        std::slice::from_raw_parts_mut(probs_p.at(h * longest), longest),
+                    )
+                };
+                if stored == 0 {
+                    continue;
+                }
+                let first = window.map(|w| stored.saturating_sub(w)).unwrap_or(0);
+                cache.attend_group(&q[h * hd..(h + 1) * hd], g, out_h, probs_h, scale, first, softcap);
+            }
+        };
+        pool.run_rows(nh, &run);
+        // Importance in the serial order: groups, then their heads. Each
+        // probs row is 0 + p exactly, so the sums match attend_group's.
+        for g in 0..nkv {
+            let stored = cache.head_len(g);
+            if stored == 0 {
+                continue;
+            }
+            let n = imp.len().min(stored);
+            for h in g * heads_per_kv..(g + 1) * heads_per_kv {
+                let row = &probs[h * longest..h * longest + n];
+                for (dst, &p) in imp[..n].iter_mut().zip(row) {
+                    *dst += p;
+                }
+            }
+        }
+        recycle_buf(&mut probs);
+        return (attn_out, imp);
+    }
     let mut attn_out = take_buf(nh * hd);
     let mut imp = take_buf(cache.seq_len);
     // Grouped GQA kernel: the group's shared K/V storage is streamed
@@ -1049,7 +1190,7 @@ pub fn qwen_attention_core(
     // — the vec![true; nkv] here was one allocation per layer per token.
     cache.append(&p.k, &p.v, &[]);
 
-    let (mut ao, mut imp) = attend_all_heads(
+    let (mut ao, mut imp) = attend_all_heads_pool(
         &p.q,
         cache,
         nh,
@@ -1058,6 +1199,7 @@ pub fn qwen_attention_core(
         cfg.scale,
         cfg.window,
         cfg.softcap,
+        cfg.pool,
     );
     cache.accumulate_imp(&imp);
     if cfg.output_gate {
@@ -1096,14 +1238,20 @@ pub fn qwen_attention(
     if cache.o1_sealed() {
         return qwen_attention_nystrom(hidden, wq, wk, wv, wo, cache, cfg);
     }
+    let prof = crate::cpuprof::time(crate::cpuprof::Slot::Qkv);
     let (q_raw, k, v) = project_matvecs(hidden, wq, wk, wv, cfg);
+    drop(prof);
     let mut projected = projected_gate(hidden, cfg);
+    let prof = crate::cpuprof::time(crate::cpuprof::Slot::AttnCore);
     let mut ao = qwen_attention_core(q_raw, k, v, cache, cfg);
+    drop(prof);
     if let (Some(raw), Some((_, per_head))) = (projected.as_deref(), cfg.softplus_gate) {
         apply_projected_gate(&mut ao, raw, per_head, cfg.head_dim);
     }
     let mut out = take_buf(cfg.hidden_size);
+    let prof = crate::cpuprof::time(crate::cpuprof::Slot::AttnO);
     wo.matvec(&ao, &mut out, cfg.pool);
+    drop(prof);
     recycle_buf(&mut ao);
     if let Some(mut gate) = projected.take() {
         recycle_buf(&mut gate);
@@ -1243,14 +1391,30 @@ pub fn qwen_attention_batch(
     #[cfg(not(target_arch = "aarch64"))]
     let cpu_attend = false;
     let batched_attend = cpu_attend || gpu_attend;
+    // Without a batched attend (x86 has no CPU twin of the chunk kernel)
+    // every position used to attend right after its own append, serially
+    // on the caller: a scalar-core loop of dot + libm exp + axpy that was
+    // 30% of a 512-token and 46% of a 1024-token prefill on a 256-core
+    // EPYC. Appending the whole chunk first and attending each position
+    // over exactly the rows it would have seen (`upto = s0 + i + 1`) is
+    // the same arithmetic per position — so the pool can take the
+    // positions in parallel and the result stays bit-identical. The
+    // importance rows are added back in position order afterwards.
+    let par_positions = !batched_attend
+        && cfg.pool.is_some()
+        && b >= 2
+        && cache.mode == crate::kv_cache::KvMode::F32
+        && std::env::var("CMF_PAR_ATTEND").map_or(true, |v| v != "0");
+    let stash_q = batched_attend || par_positions;
+    let prof_attend = crate::cpuprof::time(crate::cpuprof::Slot::PrefillAttend);
     let s0 = cache.seq_len;
     let mut ao_all = take_buf(b * nh * hd);
-    let mut q_rope_all = if batched_attend {
+    let mut q_rope_all = if stash_q {
         take_buf(b * nh * hd)
     } else {
         Vec::new()
     };
-    let mut gates_all = if batched_attend && cfg.output_gate {
+    let mut gates_all = if stash_q && cfg.output_gate {
         take_buf(b * nh * hd)
     } else {
         Vec::new()
@@ -1297,7 +1461,7 @@ pub fn qwen_attention_batch(
 
         cache.o1_push_q(&q);
         cache.append(k, v, &[]);
-        if batched_attend {
+        if stash_q {
             q_rope_all[bi * nh * hd..(bi + 1) * nh * hd].copy_from_slice(&q);
             if cfg.output_gate {
                 gates_all[bi * nh * hd..(bi + 1) * nh * hd].copy_from_slice(&gate);
@@ -1329,6 +1493,58 @@ pub fn qwen_attention_batch(
         }
         recycle_buf(&mut q);
         recycle_buf(&mut gate);
+    }
+    if par_positions {
+        let pool = cfg.pool.expect("par_positions requires a pool");
+        let s_end = cache.seq_len;
+        let row = s0 + b;
+        let mut imp_all = take_buf(b * row);
+        let (ao_p, imp_p) = (
+            crate::pool::SendMut::new(ao_all.as_mut_ptr()),
+            crate::pool::SendMut::new(imp_all.as_mut_ptr()),
+        );
+        let (qr, gr) = (&q_rope_all, &gates_all);
+        let proj = projected_all.as_deref();
+        let cache_ref: &LayerKvCache = cache;
+        let run = |b0: usize, b1: usize| {
+            for bi in b0..b1 {
+                let upto = s0 + bi + 1;
+                let imp_len = upto.min(s_end);
+                // SAFETY: position bi owns ao[bi·nh·hd..] and imp[bi·row..].
+                let (ao, imp) = unsafe {
+                    (
+                        std::slice::from_raw_parts_mut(ao_p.at(bi * nh * hd), nh * hd),
+                        std::slice::from_raw_parts_mut(imp_p.at(bi * row), imp_len),
+                    )
+                };
+                attend_all_heads_upto(
+                    &qr[bi * nh * hd..(bi + 1) * nh * hd],
+                    cache_ref,
+                    nh,
+                    heads_per_kv,
+                    hd,
+                    cfg.scale,
+                    cfg.window,
+                    cfg.softcap,
+                    upto,
+                    ao,
+                    imp,
+                );
+                if cfg.output_gate {
+                    apply_gate(ao, &gr[bi * nh * hd..(bi + 1) * nh * hd]);
+                }
+                if let (Some(all), Some((pj, per_head))) = (proj, cfg.softplus_gate) {
+                    let raw = &all[bi * pj.rows()..(bi + 1) * pj.rows()];
+                    apply_projected_gate(ao, raw, per_head, hd);
+                }
+            }
+        };
+        pool.run_rows(b, &run);
+        for bi in 0..b {
+            let imp_len = (s0 + bi + 1).min(s_end);
+            cache.accumulate_imp(&imp_all[bi * row..bi * row + imp_len]);
+        }
+        recycle_buf(&mut imp_all);
     }
     if batched_attend {
         // Head-major pack for the device kernel: [b][nh·hd] -> [nh][b][hd].
@@ -1448,6 +1664,7 @@ pub fn qwen_attention_batch(
     }
     recycle_buf(&mut q_rope_all);
     recycle_buf(&mut gates_all);
+    drop(prof_attend);
 
     // ── chunk-GEMM output projection ──
     let mut out = vec![0.0f32; b * cfg.hidden_size];
@@ -1657,6 +1874,88 @@ pub fn qwen_attention_pair(
 mod tests {
     use super::*;
     use crate::kv_cache::LayerKvCache;
+
+    fn gqa_cache(nkv: usize, hd: usize, rows: usize) -> LayerKvCache {
+        let mut c = LayerKvCache::new(nkv, hd);
+        c.mode = crate::kv_cache::KvMode::F32;
+        for r in 0..rows {
+            let k: Vec<f32> = (0..nkv * hd)
+                .map(|i| (((r * 31 + i * 7) % 101) as f32 / 101.0 - 0.5) * 3.0)
+                .collect();
+            let v: Vec<f32> = (0..nkv * hd)
+                .map(|i| (((r * 17 + i * 11) % 89) as f32 / 89.0 - 0.5) * 2.0)
+                .collect();
+            c.append(&k, &v, &[]);
+        }
+        c
+    }
+
+    /// The pooled decode attend (one job over the heads) must equal the
+    /// serial grouped kernel bit for bit — output AND importance — at the
+    /// MiniCPM5 geometry (16 q-heads over 2 kv-heads, head_dim 128).
+    #[test]
+    fn pooled_attend_is_bit_identical_to_serial() {
+        let (nh, nkv, hd) = (16usize, 2usize, 128usize);
+        let pool = crate::pool::Pool::new(3);
+        for rows in [7usize, 96, 300] {
+            let cache = gqa_cache(nkv, hd, rows);
+            let q: Vec<f32> = (0..nh * hd)
+                .map(|i| (((i * 29) % 113) as f32 / 113.0 - 0.5) * 1.7)
+                .collect();
+            for window in [None, Some(50usize)] {
+                let (a, ia) = attend_all_heads(&q, &cache, nh, nh / nkv, hd, 0.088, window, 0.0);
+                let (b, ib) = attend_all_heads_pool(
+                    &q,
+                    &cache,
+                    nh,
+                    nh / nkv,
+                    hd,
+                    0.088,
+                    window,
+                    0.0,
+                    Some(&pool),
+                );
+                let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(&a), bits(&b), "out rows={rows} window={window:?}");
+                assert_eq!(bits(&ia), bits(&ib), "imp rows={rows} window={window:?}");
+            }
+        }
+    }
+
+    /// A position attended after the whole chunk was appended, capped at
+    /// the rows it could see (`upto`), equals attending right after its
+    /// own append — the contract of the parallel prefill attend.
+    #[test]
+    fn capped_attend_equals_incremental_attend() {
+        let (nh, nkv, hd) = (8usize, 2usize, 64usize);
+        let total = 40usize;
+        let full = gqa_cache(nkv, hd, total);
+        for upto in [1usize, 5, 23, 40] {
+            let partial = gqa_cache(nkv, hd, upto);
+            let q: Vec<f32> = (0..nh * hd)
+                .map(|i| (((i * 37 + upto) % 97) as f32 / 97.0 - 0.5) * 2.1)
+                .collect();
+            let (a, ia) = attend_all_heads(&q, &partial, nh, nh / nkv, hd, 0.125, None, 0.0);
+            let mut b = vec![0f32; nh * hd];
+            let mut ib = vec![0f32; upto];
+            attend_all_heads_upto(
+                &q,
+                &full,
+                nh,
+                nh / nkv,
+                hd,
+                0.125,
+                None,
+                0.0,
+                upto,
+                &mut b,
+                &mut ib,
+            );
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&a), bits(&b), "out upto={upto}");
+            assert_eq!(bits(&ia), bits(&ib), "imp upto={upto}");
+        }
+    }
 
     fn synth(rows: usize, cols: usize, salt: usize) -> QTensor {
         QTensor::from_f32(

@@ -332,6 +332,56 @@ impl Pool {
         self.threads.len()
     }
 
+    /// Keep the pool on the NUMA node that holds `regions` (the model's
+    /// weight bytes). Linux with two or more nodes only; `CMF_NUMA=0`
+    /// turns it off, `CMF_NUMA=node:<n>` forces a node.
+    ///
+    /// WHY: decode streams every weight once per token, and on a
+    /// two-socket host the page cache holds a file on whichever node
+    /// read it. Unpinned, the scheduler spreads the workers over both
+    /// sockets and half the matvec rows cross the socket link. Measured
+    /// on a 2×EPYC 7763 pod with the model's pages all on node 0 (31 CPUs
+    /// of cgroup quota): a STREAM-style read over a node-0 buffer gives
+    /// 42 GB/s from 31 unpinned threads and 74 GB/s from 31 threads kept
+    /// on node 0. The mask is the node's physical cores (first SMT
+    /// sibling) when there are enough of them for the pool, else the
+    /// whole node; never narrower than the pool, so nothing oversubscribes.
+    /// Threads are bound to a SET of cores, not to one core each: the
+    /// scheduler still balances inside the node. The calling thread
+    /// adopts the same mask on its next dispatch.
+    pub fn bind_numa(&self, regions: &[&[u8]]) {
+        #[cfg(target_os = "linux")]
+        {
+            let Some((node, cpus)) = numa::choose(regions, self.threads.len() + 1) else {
+                return;
+            };
+            let mut applied = 0usize;
+            if let Ok(tids) = self.inner.worker_tids.lock() {
+                for &tid in tids.iter() {
+                    if numa::set_affinity(tid, &cpus) {
+                        applied += 1;
+                    }
+                }
+            }
+            numa::publish(cpus.clone());
+            numa::adopt_caller();
+            tracing::info!(
+                "numa: pool bound to node {node} ({} cpus, {applied}/{} workers)",
+                cpus.len(),
+                self.threads.len()
+            );
+            if std::env::var("CMF_NUMA_TRACE").is_ok_and(|v| v != "0") {
+                eprintln!(
+                    "numa: pool bound to node {node}: {} cpus, {applied}/{} workers",
+                    cpus.len(),
+                    self.threads.len()
+                );
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = regions;
+    }
+
     /// Retune an already-created pool for an architecture with a measured
     /// dispatch cadence. The environment remains the operator override; this
     /// hook only changes the automatic default after model geometry is known.
@@ -369,6 +419,8 @@ impl Pool {
     /// come through here: the caller identifies itself as `limit`,
     /// which under a cap is NOT `n_workers()`.
     fn run_limited(&self, max_workers: usize, f: &(dyn Fn(usize, usize) + Sync)) {
+        #[cfg(target_os = "linux")]
+        numa::adopt_caller();
         let nw = self.threads.len().min(max_workers);
         if nw == self.threads.len() {
             return self.run(f);
@@ -440,6 +492,8 @@ impl Pool {
     /// calling thread (`worker_idx = n_workers()` for the caller);
     /// returns when all participants have finished.
     pub fn run(&self, f: &(dyn Fn(usize, usize) + Sync)) {
+        #[cfg(target_os = "linux")]
+        numa::adopt_caller();
         DISPATCHES.fetch_add(1, Ordering::Relaxed);
         let nw = self.threads.len();
         let n = nw + 1; // caller participates
@@ -485,6 +539,303 @@ impl Drop for Pool {
         }
         for h in self.joins.drain(..) {
             let _ = h.join();
+        }
+    }
+}
+
+/// NUMA placement for the pool (see `Pool::bind_numa`).
+#[cfg(target_os = "linux")]
+mod numa {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The published mask; `EPOCH` bumps on every publish so a calling
+    /// thread re-adopts at most once per bind.
+    static MASK: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+    static EPOCH: AtomicUsize = AtomicUsize::new(0);
+    thread_local! {
+        static SEEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn publish(cpus: Vec<usize>) {
+        if let Ok(mut m) = MASK.lock() {
+            *m = cpus;
+        }
+        EPOCH.fetch_add(1, Ordering::Release);
+    }
+
+    /// One relaxed load + one TLS read per dispatch when nothing changed.
+    #[inline]
+    pub(super) fn adopt_caller() {
+        let e = EPOCH.load(Ordering::Acquire);
+        if e == 0 || SEEN.with(|c| c.get()) == e {
+            return;
+        }
+        SEEN.with(|c| c.set(e));
+        if let Ok(m) = MASK.lock() {
+            if !m.is_empty() {
+                set_affinity(0, &m);
+            }
+        }
+    }
+
+    pub(super) fn parse_list(s: &str) -> Vec<usize> {
+        let mut out = Vec::new();
+        for part in s.trim().split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            match part.split_once('-') {
+                Some((a, b)) => {
+                    if let (Ok(a), Ok(b)) = (a.parse::<usize>(), b.parse::<usize>()) {
+                        out.extend(a..=b);
+                    }
+                }
+                None => {
+                    if let Ok(a) = part.parse() {
+                        out.push(a);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn nodes() -> Vec<(usize, Vec<usize>)> {
+        let mut v = Vec::new();
+        let Ok(rd) = std::fs::read_dir("/sys/devices/system/node") else {
+            return v;
+        };
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let Some(id) = name.strip_prefix("node").and_then(|x| x.parse::<usize>().ok()) else {
+                continue;
+            };
+            if let Ok(l) = std::fs::read_to_string(e.path().join("cpulist")) {
+                let cpus = parse_list(&l);
+                if !cpus.is_empty() {
+                    v.push((id, cpus));
+                }
+            }
+        }
+        v.sort();
+        v
+    }
+
+    fn allowed() -> Vec<usize> {
+        // SAFETY: plain syscall into a zeroed, correctly sized set.
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
+                return Vec::new();
+            }
+            (0..libc::CPU_SETSIZE as usize)
+                .filter(|&c| libc::CPU_ISSET(c, &set))
+                .collect()
+        }
+    }
+
+    /// First SMT sibling of its core (or no topology info: count it).
+    fn primary(cpu: usize) -> bool {
+        let p = format!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list");
+        match std::fs::read_to_string(p) {
+            Ok(l) => parse_list(&l).first().is_none_or(|&f| f == cpu),
+            Err(_) => true,
+        }
+    }
+
+    /// Where the weights live: (pages sampled, sampled pages in the page
+    /// cache, mapped pages per node). The sample is ≤ 4096 pages spread
+    /// over `regions`; every sampled page that is already cached is mapped
+    /// here with one read (a minor fault — `mincore` says it is cached, so
+    /// no disk I/O), because both node queries below only see pages mapped
+    /// into THIS process. Per-node counts come from `move_pages` in query
+    /// mode, or — where a container's seccomp profile refuses that syscall
+    /// (EPERM on the RunPod image) — from `/proc/self/numa_maps` for the
+    /// mappings that hold the regions.
+    fn page_nodes(regions: &[&[u8]]) -> (usize, usize, Vec<usize>) {
+        const PAGE: usize = 4096;
+        let total: usize = regions.iter().map(|r| r.len() / PAGE).sum();
+        if total == 0 {
+            return (0, 0, Vec::new());
+        }
+        let stride = total.div_ceil(4096).max(1);
+        let mut pages: Vec<*mut libc::c_void> = Vec::new();
+        for r in regions {
+            let base = (r.as_ptr() as usize).div_ceil(PAGE) * PAGE;
+            let end = r.as_ptr() as usize + r.len();
+            let mut a = base;
+            while a + PAGE <= end {
+                pages.push(a as *mut libc::c_void);
+                a += PAGE * stride;
+            }
+        }
+        let mut incore = 0usize;
+        for &p in &pages {
+            let mut vec = 0u8;
+            // SAFETY: `p` is a page-aligned address inside a live mapping.
+            let cached = unsafe { libc::mincore(p, PAGE, &mut vec) } == 0 && vec & 1 == 1;
+            if cached {
+                incore += 1;
+                // SAFETY: readable mapped byte; volatile so it is not elided.
+                unsafe { std::ptr::read_volatile(p as *const u8) };
+            }
+        }
+        let mut status = vec![-1i32; pages.len()];
+        // SAFETY: query-only move_pages on our own mappings; `nodes` is
+        // NULL so nothing moves, `status` has one slot per page.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_move_pages,
+                0,
+                pages.len() as libc::c_ulong,
+                pages.as_mut_ptr(),
+                std::ptr::null::<libc::c_int>(),
+                status.as_mut_ptr(),
+                0,
+            )
+        };
+        let mut by = Vec::new();
+        if rc == 0 {
+            for &st in &status {
+                if st >= 0 {
+                    let n = st as usize;
+                    if by.len() <= n {
+                        by.resize(n + 1, 0);
+                    }
+                    by[n] += 1;
+                }
+            }
+        } else {
+            by = numa_maps_nodes(regions);
+        }
+        (pages.len(), incore, by)
+    }
+
+    /// Mapped pages per node of every mapping that overlaps `regions`,
+    /// from `/proc/self/maps` (ranges) + `/proc/self/numa_maps` (`N<k>=`).
+    fn numa_maps_nodes(regions: &[&[u8]]) -> Vec<usize> {
+        let (Ok(maps), Ok(nm)) = (
+            std::fs::read_to_string("/proc/self/maps"),
+            std::fs::read_to_string("/proc/self/numa_maps"),
+        ) else {
+            return Vec::new();
+        };
+        let spans: Vec<(usize, usize)> = regions
+            .iter()
+            .map(|r| (r.as_ptr() as usize, r.as_ptr() as usize + r.len()))
+            .collect();
+        let mut starts = std::collections::HashSet::new();
+        for line in maps.lines() {
+            let Some((range, _)) = line.split_once(' ') else {
+                continue;
+            };
+            let Some((a, b)) = range.split_once('-') else {
+                continue;
+            };
+            let (Ok(a), Ok(b)) = (usize::from_str_radix(a, 16), usize::from_str_radix(b, 16)) else {
+                continue;
+            };
+            if spans.iter().any(|&(s, e)| s < b && a < e) {
+                starts.insert(a);
+            }
+        }
+        let mut by = Vec::new();
+        for line in nm.lines() {
+            let mut it = line.split_whitespace();
+            let Some(a) = it.next().and_then(|a| usize::from_str_radix(a, 16).ok()) else {
+                continue;
+            };
+            if !starts.contains(&a) {
+                continue;
+            }
+            for f in it {
+                let Some((k, v)) = f.split_once('=') else {
+                    continue;
+                };
+                let (Some(n), Ok(v)) = (
+                    k.strip_prefix('N').and_then(|n| n.parse::<usize>().ok()),
+                    v.parse::<usize>(),
+                ) else {
+                    continue;
+                };
+                if by.len() <= n {
+                    by.resize(n + 1, 0);
+                }
+                by[n] += v;
+            }
+        }
+        by
+    }
+
+    /// (node, cpu mask) for a pool of `threads` participants, or None.
+    pub(super) fn choose(regions: &[&[u8]], threads: usize) -> Option<(usize, Vec<usize>)> {
+        let env = std::env::var("CMF_NUMA").ok();
+        if matches!(env.as_deref(), Some("0") | Some("off")) {
+            return None;
+        }
+        let trace = std::env::var("CMF_NUMA_TRACE").is_ok_and(|v| v != "0");
+        let nodes = nodes();
+        if nodes.len() < 2 {
+            if trace {
+                eprintln!("numa: {} node(s) visible — nothing to bind", nodes.len());
+            }
+            return None;
+        }
+        // `CMF_NUMA=node:<n>` forces a node (plain "0" means OFF).
+        let forced = env
+            .as_deref()
+            .and_then(|v| v.strip_prefix("node:"))
+            .and_then(|v| v.parse::<usize>().ok());
+        let node = match forced {
+            Some(n) => n,
+            None => {
+                // Auto: only when the weights already sit on ONE node
+                // (≥ 90% of the resident sample, and most of the sample
+                // resident). A file spread over both nodes is better
+                // served by both sockets; a cold file has no home yet.
+                let (sampled, incore, by) = page_nodes(regions);
+                let resident: usize = by.iter().sum();
+                if trace {
+                    eprintln!(
+                        "numa: sampled {sampled} weight pages, {incore} cached, mapped by node {by:?}"
+                    );
+                }
+                if sampled == 0 || incore * 2 < sampled || resident == 0 {
+                    return None;
+                }
+                let (n, &cnt) = by.iter().enumerate().max_by_key(|(_, c)| **c)?;
+                if cnt * 10 < resident * 9 {
+                    return None;
+                }
+                n
+            }
+        };
+        let cpus = &nodes.iter().find(|(id, _)| *id == node)?.1;
+        let allowed = allowed();
+        let usable: Vec<usize> = cpus.iter().copied().filter(|c| allowed.contains(c)).collect();
+        let prim: Vec<usize> = usable.iter().copied().filter(|&c| primary(c)).collect();
+        if prim.len() >= threads {
+            Some((node, prim))
+        } else if usable.len() >= threads {
+            Some((node, usable))
+        } else {
+            None
+        }
+    }
+
+    /// Bind thread `tid` (0 = the calling thread) to `cpus`.
+    pub(super) fn set_affinity(tid: i32, cpus: &[usize]) -> bool {
+        // SAFETY: plain syscall with a zeroed, correctly sized set.
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            for &c in cpus {
+                if c < libc::CPU_SETSIZE as usize {
+                    libc::CPU_SET(c, &mut set);
+                }
+            }
+            libc::sched_setaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0
         }
     }
 }
@@ -744,6 +1095,13 @@ impl SendMut {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn numa_cpulist_parses_ranges_and_singles() {
+        assert_eq!(super::numa::parse_list("0-3,8,10-11\n"), vec![0, 1, 2, 3, 8, 10, 11]);
+        assert_eq!(super::numa::parse_list(""), Vec::<usize>::new());
+    }
+
     #[test]
     #[cfg(any(target_os = "android", target_os = "linux"))]
     fn worker_tids_registered_before_new_returns() {
