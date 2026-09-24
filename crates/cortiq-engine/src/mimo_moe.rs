@@ -713,10 +713,31 @@ impl Bank {
 #[cfg(feature = "gpu")]
 impl Drop for Bank {
     fn drop(&mut self) {
+        self.stop_filler();
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl Bank {
+    fn stop_filler(&mut self) {
+        // Dropping the only sender lets the worker drain every queued upload
+        // while the device still exists, then exit. Joining is essential:
+        // BANKS owns an Arc after the final Pipeline has already dropped.
         self.tx = None;
         if let Some(h) = self.filler.take() {
             let _ = h.join();
         }
+    }
+}
+
+/// Process-final only, with no inference running. Stop model-bank uploads
+/// BEFORE wgpu drains its contexts; otherwise a late fill can dereference a
+/// freed context or initialize a second device during Vulkan destruction.
+#[cfg(feature = "gpu")]
+pub(crate) fn shutdown_banks() {
+    let banks = std::mem::take(&mut *BANKS.lock().unwrap());
+    for (_, bank) in banks {
+        bank.lock().unwrap().stop_filler();
     }
 }
 
