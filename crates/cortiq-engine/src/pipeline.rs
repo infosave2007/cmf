@@ -1805,12 +1805,20 @@ impl Pipeline {
             Item::Gdn { .. } => false,
         });
         let ab = crate::gpu_metal::dense_ab_arm().filter(|_| dense_fast);
-        let (mv_on, conc_on) = match ab {
-            Some((m, c, _)) => (m, c),
-            None => (dense_fast, dense_fast),
+        let _mv_fast = match ab {
+            Some((bits, _)) => {
+                graph.set_dense_concurrent_raw(bits & crate::gpu_metal::DENSE_CONC != 0);
+                crate::gpu_metal::MvFastGuard::set_raw(bits)
+            }
+            None => {
+                graph.set_dense_concurrent(dense_fast);
+                crate::gpu_metal::MvFastGuard::set_bits(if dense_fast {
+                    crate::gpu_metal::DENSE_MV | crate::gpu_metal::DENSE_FUSE
+                } else {
+                    0
+                })
+            }
         };
-        let _mv_fast = crate::gpu_metal::MvFastGuard::set(mv_on);
-        graph.set_dense_concurrent(conc_on);
 
         let inv_freq = self.inv_freq.clone();
         let pool = self.pool.clone();
@@ -2203,7 +2211,7 @@ impl Pipeline {
             attention::recycle_buf(&mut krow);
             attention::recycle_buf(&mut vrow);
         }
-        if let Some((_, _, arm)) = ab {
+        if let Some((_, arm)) = ab {
             crate::gpu_metal::dense_ab_record(arm, _mt0.elapsed());
         }
         end

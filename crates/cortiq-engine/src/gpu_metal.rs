@@ -4651,6 +4651,7 @@ kernel void q4tp_matvec_m(
     device float*       y    [[buffer(2)]],
     constant uint&      gpr  [[buffer(3)]],
     constant uint&      rows [[buffer(4)]],
+    constant uint&      addy [[buffer(5)]], // 1: y += W·x (the residual add)
     uint sg   [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint tgpos [[threadgroup_position_in_grid]],
@@ -4701,10 +4702,100 @@ kernel void q4tp_matvec_m(
     acc0 = simd_sum(acc0); acc1 = simd_sum(acc1);
     acc2 = simd_sum(acc2); acc3 = simd_sum(acc3);
     if (lane == 0u) {
-        y[r0] = acc0;
-        if (nr > 1u) y[r0 + 1u] = acc1;
-        if (nr > 2u) y[r0 + 2u] = acc2;
-        if (nr > 3u) y[r0 + 3u] = acc3;
+        // The residual form rounds once, y + acc: exactly what `axpy`
+        // (y += 1·d) did with the stored product, so the fusion is bit-exact.
+        if (addy != 0u) {
+            y[r0] = y[r0] + acc0;
+            if (nr > 1u) y[r0 + 1u] = y[r0 + 1u] + acc1;
+            if (nr > 2u) y[r0 + 2u] = y[r0 + 2u] + acc2;
+            if (nr > 3u) y[r0 + 3u] = y[r0 + 3u] + acc3;
+        } else {
+            y[r0] = acc0;
+            if (nr > 1u) y[r0 + 1u] = acc1;
+            if (nr > 2u) y[r0 + 2u] = acc2;
+            if (nr > 3u) y[r0 + 3u] = acc3;
+        }
+    }
+}
+
+// gate and up of a SiLU FFN in one dispatch, `q4tp_matvec_m` math: each
+// simdgroup owns the same four rows of both matrices (so one x preparation
+// serves eight rows) and writes silu(g)·u — the `silu_mul_pre` expression,
+// verbatim — straight into the activation. Replaces two matvecs and the
+// SiLU dispatch, and the drains between them.
+kernel void q4tp_matvec_m_gu(
+    device const uchar* qg   [[buffer(0)]],
+    device const float* x    [[buffer(1)]],
+    device float*       act  [[buffer(2)]],
+    constant uint&      gpr  [[buffer(3)]],
+    constant uint&      rows [[buffer(4)]],
+    device const uchar* qu   [[buffer(5)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tgpos [[threadgroup_position_in_grid]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    threadgroup float lad[8u * 8u * 32u];
+    uint r0 = (tgpos * sgs + sg) * 4u;
+    bool active = r0 < rows;
+    uint nr = active ? min(rows - r0, 4u) : 0u;
+    ulong params_off = (ulong)rows * (ulong)gpr * 16ul;
+    ulong codes_off  = params_off + (ulong)rows * 4ul;
+    uint  stride     = (gpr * 5u + 7u) / 8u;
+    for (uint ri = 0u; ri < nr; ++ri) {
+        device const half* pg = (device const half*)(qg + params_off + (ulong)(r0 + ri) * 4ul);
+        device const half* pu = (device const half*)(qu + params_off + (ulong)(r0 + ri) * 4ul);
+        lad[(sg * 8u + ri) * 32u + lane] = exp2((float)pg[0] + (float)lane * (float)pg[1]);
+        lad[(sg * 8u + 4u + ri) * 32u + lane] = exp2((float)pu[0] + (float)lane * (float)pu[1]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!active) return;
+    const float4 sc = float4(1.0f, 1.0f / 16.0f, 1.0f / 256.0f, 1.0f / 4096.0f);
+    float ag0 = 0.0f, ag1 = 0.0f, ag2 = 0.0f, ag3 = 0.0f;
+    float au0 = 0.0f, au1 = 0.0f, au2 = 0.0f, au3 = 0.0f;
+    for (uint g = lane; g < gpr; g += 32u) {
+        device const float4* xv = (device const float4*)(x + g * 32u);
+        float4 x0 = xv[0], x1 = xv[1], x2 = xv[2], x3 = xv[3];
+        float4 x4 = xv[4], x5 = xv[5], x6 = xv[6], x7 = xv[7];
+        float4 s4 = x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7;
+        float m8 = -8.0f * (s4.x + s4.y + s4.z + s4.w);
+        x0 *= sc; x1 *= sc; x2 *= sc; x3 *= sc; x4 *= sc; x5 *= sc; x6 *= sc; x7 *= sc;
+        uint bit = g * 5u;
+        uint cb  = bit >> 3u;
+        uint shf = bit & 7u;
+        for (uint j = 0u; j < 2u * nr; ++j) {
+            uint ri = j >> 1u;
+            bool up = (j & 1u) != 0u;
+            device const uchar* q = up ? qu : qg;
+            uint r = r0 + ri;
+            uint4 b = *(device const uint4*)(q + ((ulong)r * gpr + (ulong)g) * 16ul);
+            device const uchar* cp = q + codes_off + (ulong)r * (ulong)stride + cb;
+            uint code = (((uint)cp[0] | ((shf > 3u) ? ((uint)cp[1] << 8) : 0u)) >> shf) & 31u;
+            float scale = lad[(sg * 8u + (up ? 4u : 0u) + ri) * 32u + code];
+            float gsum = dot(q4_nib4_scaled(b.x), x0) + dot(q4_nib4_scaled(b.x >> 16), x1)
+                       + dot(q4_nib4_scaled(b.y), x2) + dot(q4_nib4_scaled(b.y >> 16), x3)
+                       + dot(q4_nib4_scaled(b.z), x4) + dot(q4_nib4_scaled(b.z >> 16), x5)
+                       + dot(q4_nib4_scaled(b.w), x6) + dot(q4_nib4_scaled(b.w >> 16), x7);
+            float contrib = scale * (gsum + m8);
+            if (j == 0u) ag0 += contrib;
+            else if (j == 1u) au0 += contrib;
+            else if (j == 2u) ag1 += contrib;
+            else if (j == 3u) au1 += contrib;
+            else if (j == 4u) ag2 += contrib;
+            else if (j == 5u) au2 += contrib;
+            else if (j == 6u) ag3 += contrib;
+            else au3 += contrib;
+        }
+    }
+    ag0 = simd_sum(ag0); ag1 = simd_sum(ag1); ag2 = simd_sum(ag2); ag3 = simd_sum(ag3);
+    au0 = simd_sum(au0); au1 = simd_sum(au1); au2 = simd_sum(au2); au3 = simd_sum(au3);
+    if (lane == 0u) {
+        float cv = 1.0f;
+        float gv = ag0;
+        act[r0] = (gv / (1.0f + exp(-gv))) * au0 * cv;
+        if (nr > 1u) { gv = ag1; act[r0 + 1u] = (gv / (1.0f + exp(-gv))) * au1 * cv; }
+        if (nr > 2u) { gv = ag2; act[r0 + 2u] = (gv / (1.0f + exp(-gv))) * au2 * cv; }
+        if (nr > 3u) { gv = ag3; act[r0 + 3u] = (gv / (1.0f + exp(-gv))) * au3 * cv; }
     }
 }
 
@@ -6424,6 +6515,8 @@ struct Ctx {
     q4tp: ComputePipelineState,
     /// `q4tp_matvec_m`: the masked-nibble decode matvec (see `mv_fast`).
     q4tp_m: ComputePipelineState,
+    /// `q4tp_matvec_m_gu`: fused gate|up|SiLU of the dense decode.
+    q4tp_mgu: ComputePipelineState,
     /// Standalone q2tp matvec with explicit ordinary/affine centre.
     q2tp: ComputePipelineState,
     /// Production affine Prism sign/zero-select matvec; legal tensors only.
@@ -6670,6 +6763,7 @@ fn init() -> Result<Ctx, String> {
     let q4t_dsilu = pso("q4t_matvec_dsilu")?;
     let q4tp = pso("q4tp_matvec")?;
     let q4tp_m = pso("q4tp_matvec_m")?;
+    let q4tp_mgu = pso("q4tp_matvec_m_gu")?;
     let q2tp = pso("q2tp_matvec")?;
     let q2tp_affine = pso("q2tp_affine_select_matvec")?;
     let q2tpmm = pso("q2tp_mul_mm")?;
@@ -6778,6 +6872,7 @@ fn init() -> Result<Ctx, String> {
         q4t_dsilu,
         q4tp,
         q4tp_m,
+        q4tp_mgu,
         q2tp,
         q2tp_affine,
         q2tpmm,
@@ -7673,33 +7768,71 @@ fn encode_q4t_matvec(
 }
 
 thread_local! {
-    static MV_FAST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Dense decode levers for the encodes on this thread: `DENSE_MV` |
+    /// `DENSE_FUSE`. Scoped by `MvFastGuard`.
+    static MV_FAST: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
 }
+
+/// Lever bits of the plain dense decode (`MvFastGuard`, `dense_ab_arm`).
+pub const DENSE_MV: u8 = 1;
+/// Concurrent layer encoder (`TokenGraph::set_dense_concurrent`).
+pub const DENSE_CONC: u8 = 2;
+/// Fused epilogues: h += O·ao, gate|up|SiLU in one pass, h += Down·act.
+pub const DENSE_FUSE: u8 = 4;
 
 /// Whether q4tp decode matvecs encoded on this thread take the
-/// masked-nibble kernel (`q4tp_matvec_m`). Scoped by `MvFastGuard`.
+/// masked-nibble kernel (`q4tp_matvec_m`).
 fn mv_fast() -> bool {
-    MV_FAST.with(|f| f.get())
+    MV_FAST.with(|f| f.get() & DENSE_MV != 0)
 }
 
-/// Scope in which the token graph's q4tp matvecs use `q4tp_matvec_m`.
+/// Whether the dense decode's fused projections are on (needs the
+/// masked-nibble kernel: the fused kernels are its variants).
+fn fuse_on() -> bool {
+    MV_FAST.with(|f| f.get() & (DENSE_MV | DENSE_FUSE) == DENSE_MV | DENSE_FUSE)
+}
+
+/// Scope in which the token graph's q4tp matvecs use `q4tp_matvec_m`
+/// (and, with `DENSE_FUSE`, its fused residual / gate|up|SiLU forms).
 ///
 /// The caller decides eligibility: it was measured on plain dense
 /// full-attention models (MiniCPM5-2B, Qwen3-0.6B), so the pipeline only
 /// opens the scope for plans with no GDN run, no MoE and every layer
 /// attended on the device. Every other architecture keeps the historical
-/// kernel and its bit-exact outputs. `CMF_METAL_MVFAST=0` closes the
-/// scope everywhere (the A/B and rollback switch). Restores the previous
-/// value on drop.
+/// kernels and their bit-exact outputs. `CMF_METAL_MVFAST=0` and
+/// `CMF_METAL_FUSE=0` close the respective levers everywhere (rollback
+/// switches). Restores the previous value on drop.
 pub struct MvFastGuard {
-    prev: bool,
+    prev: u8,
 }
 
 impl MvFastGuard {
+    /// The masked-nibble kernel alone.
     pub fn set(on: bool) -> MvFastGuard {
-        static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let allowed = *ENV.get_or_init(|| std::env::var("CMF_METAL_MVFAST").as_deref() != Ok("0"));
-        let prev = MV_FAST.with(|f| f.replace(on && allowed));
+        Self::set_bits(if on { DENSE_MV } else { 0 })
+    }
+
+    /// Raw bits for the in-process A/B (no env gating).
+    pub fn set_raw(bits: u8) -> MvFastGuard {
+        let prev = MV_FAST.with(|f| f.replace(bits));
+        MvFastGuard { prev }
+    }
+
+    /// `DENSE_MV` / `DENSE_FUSE` bits (other bits ignored).
+    pub fn set_bits(bits: u8) -> MvFastGuard {
+        static ENV: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        let allowed = *ENV.get_or_init(|| {
+            let off = |k: &str| std::env::var(k).as_deref() == Ok("0");
+            let mut a = DENSE_MV | DENSE_FUSE;
+            if off("CMF_METAL_MVFAST") {
+                a &= !DENSE_MV;
+            }
+            if off("CMF_METAL_FUSE") {
+                a &= !DENSE_FUSE;
+            }
+            a
+        });
+        let prev = MV_FAST.with(|f| f.replace(bits & allowed));
         MvFastGuard { prev }
     }
 }
@@ -7710,30 +7843,41 @@ impl Drop for MvFastGuard {
     }
 }
 
-/// In-process A/B of the dense decode levers (`CMF_METAL_AB=a/b`, each
-/// side one of off|mv|conc|both): tokens alternate between the two arms
-/// and the whole token-graph call (encode + GPU + readback) is timed per
-/// arm, so a drifting or shared GPU loads both arms alike. Returns the
-/// (mv_fast, concurrent) pair for this token and its arm index, or None
-/// when the A/B is off. Diagnostics only.
-pub fn dense_ab_arm() -> Option<(bool, bool, usize)> {
-    static CFG: std::sync::OnceLock<Option<[(bool, bool); 2]>> = std::sync::OnceLock::new();
+/// In-process A/B of the dense decode levers (`CMF_METAL_AB=a/b`): each
+/// side is `off`, `all`, or letters from m (masked-nibble kernel), c
+/// (concurrent encoder), f (fused epilogues). Tokens alternate between the
+/// two arms and the whole token-graph call (encode + GPU + readback) is
+/// timed per arm, so a drifting or shared GPU loads both arms alike.
+/// Returns this token's lever bits and its arm index, or None when the
+/// A/B is off. Diagnostics only: the rollback env switches do not apply.
+pub fn dense_ab_arm() -> Option<(u8, usize)> {
+    static CFG: std::sync::OnceLock<Option<[u8; 2]>> = std::sync::OnceLock::new();
     static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let cfg = CFG.get_or_init(|| {
         let v = std::env::var("CMF_METAL_AB").ok()?;
-        let side = |s: &str| match s {
-            "mv" => Some((true, false)),
-            "conc" => Some((false, true)),
-            "both" => Some((true, true)),
-            "off" => Some((false, false)),
-            _ => None,
+        let side = |s: &str| -> Option<u8> {
+            match s {
+                "off" => return Some(0),
+                "all" => return Some(DENSE_MV | DENSE_CONC | DENSE_FUSE),
+                _ => {}
+            }
+            let mut b = 0u8;
+            for ch in s.chars() {
+                b |= match ch {
+                    'm' => DENSE_MV,
+                    'c' => DENSE_CONC,
+                    'f' => DENSE_FUSE,
+                    _ => return None,
+                };
+            }
+            Some(b)
         };
         let (a, b) = v.split_once('/')?;
         Some([side(a)?, side(b)?])
     });
     let cfg = (*cfg)?;
     let arm = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 2;
-    Some((cfg[arm].0, cfg[arm].1, arm))
+    Some((cfg[arm], arm))
 }
 
 /// Account one token of `dense_ab_arm`'s arm; prints both arms' mean
@@ -7741,23 +7885,62 @@ pub fn dense_ab_arm() -> Option<(bool, bool, usize)> {
 pub fn dense_ab_record(arm: usize, dt: std::time::Duration) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+    static GPU: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
     static CNT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
-    NS[arm].fetch_add(dt.as_nanos() as u64, Ordering::Relaxed);
+    // Adjacent-pair ratios (arm1 token / the arm0 token right before it):
+    // a burst of foreign load hits one pair, not the mean. Wall and, under
+    // CMF_METAL_GPUPROF=1, the token's summed GPU busy time (immune to the
+    // host thread being descheduled on a loaded CPU).
+    static LAST0: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+    static PAIRS: Mutex<(Vec<f64>, Vec<f64>)> = Mutex::new((Vec::new(), Vec::new()));
+    let ns = dt.as_nanos() as u64;
+    let gpu = GPU_BUSY_LAST_NS.swap(0, Ordering::Relaxed);
+    NS[arm].fetch_add(ns, Ordering::Relaxed);
+    GPU[arm].fetch_add(gpu, Ordering::Relaxed);
     let n = CNT[arm].fetch_add(1, Ordering::Relaxed) + 1;
-    if arm == 1 && n % 100 == 0 {
-        let m = |i: usize| {
-            NS[i].load(Ordering::Relaxed) as f64
-                / CNT[i].load(Ordering::Relaxed).max(1) as f64
-                / 1e6
+    if arm == 0 {
+        LAST0[0].store(ns, Ordering::Relaxed);
+        LAST0[1].store(gpu, Ordering::Relaxed);
+        return;
+    }
+    let (l0, g0) = (
+        LAST0[0].load(Ordering::Relaxed),
+        LAST0[1].load(Ordering::Relaxed),
+    );
+    let mut pairs = PAIRS.lock().unwrap();
+    if l0 > 0 {
+        pairs.0.push(ns as f64 / l0 as f64);
+    }
+    if g0 > 0 && gpu > 0 {
+        pairs.1.push(gpu as f64 / g0 as f64);
+    }
+    if n % 100 == 0 && !pairs.0.is_empty() {
+        let m = |a: &[AtomicU64; 2], i: usize| {
+            a[i].load(Ordering::Relaxed) as f64 / CNT[i].load(Ordering::Relaxed).max(1) as f64 / 1e6
         };
+        let qs = |v: &Vec<f64>| -> (f64, f64, f64) {
+            if v.is_empty() {
+                return (0.0, 0.0, 0.0);
+            }
+            let mut v = v.clone();
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let q = |f: f64| v[((v.len() - 1) as f64 * f) as usize];
+            (q(0.25), q(0.5), q(0.75))
+        };
+        let (w1, w2, w3) = qs(&pairs.0);
+        let (g1, g2, g3) = qs(&pairs.1);
         eprintln!(
-            "metal-ab: arm0 {:.3} ms/tok | arm1 {:.3} ms/tok | arm1/arm0 {:.3} ({n} tok/arm)",
-            m(0),
-            m(1),
-            m(1) / m(0)
+            "metal-ab: wall arm0 {:.3} arm1 {:.3} ms/tok, pair median {w2:.3} (q1 {w1:.3} q3 {w3:.3}) | gpu arm0 {:.3} arm1 {:.3} ms/tok, pair median {g2:.3} (q1 {g1:.3} q3 {g3:.3}) ({n} tok/arm)",
+            m(&NS, 0),
+            m(&NS, 1),
+            m(&GPU, 0),
+            m(&GPU, 1),
         );
     }
 }
+
+/// Summed GPU busy time of the last synced token graph (gpuprof only).
+static GPU_BUSY_LAST_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// q4tp twin of `encode_q4t_matvec` — same 4-rows-per-simdgroup shape; the
 /// kernel derives its three plane offsets from `rows`/`gpr`, so the argument
@@ -7784,6 +7967,8 @@ fn encode_q4tp_matvec(
         let rows_u = rows as u32;
         enc.set_bytes(3, 4, &gpr_u as *const u32 as *const std::ffi::c_void);
         enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+        let addy = 0u32;
+        enc.set_bytes(5, 4, &addy as *const u32 as *const std::ffi::c_void);
         let sgs = 4u64;
         enc.dispatch_thread_groups(
             MTLSize::new((rows as u64).div_ceil(sgs * 4), 1, 1),
@@ -7800,6 +7985,65 @@ fn encode_q4tp_matvec(
     enc.set_bytes(3, 4, &gpr_u as *const u32 as *const std::ffi::c_void);
     enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
     let sgs = 8u64;
+    enc.dispatch_thread_groups(
+        MTLSize::new((rows as u64).div_ceil(sgs * 4), 1, 1),
+        MTLSize::new(sgs * 32, 1, 1),
+    );
+}
+
+/// `y += W·x` with the masked-nibble kernel: the residual add fused into
+/// the O / down projection's epilogue (bit-exact against matvec + axpy).
+#[allow(clippy::too_many_arguments)]
+fn encode_q4tp_matvec_m_add(
+    c: &Ctx,
+    enc: &metal::ComputeCommandEncoderRef,
+    fbuf: &WeightArena,
+    abs: usize,
+    xs: &Buffer,
+    y: &Buffer,
+    rows: usize,
+    gpr: usize,
+) {
+    note_weight_bytes(&ProjKind::Q4tp, rows, gpr);
+    enc.set_compute_pipeline_state(&c.q4tp_m);
+    fbuf.bind(enc, 0, abs);
+    enc.set_buffer(1, Some(xs), 0);
+    enc.set_buffer(2, Some(y), 0);
+    let (gpr_u, rows_u, addy) = (gpr as u32, rows as u32, 1u32);
+    enc.set_bytes(3, 4, &gpr_u as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(5, 4, &addy as *const u32 as *const std::ffi::c_void);
+    let sgs = 4u64;
+    enc.dispatch_thread_groups(
+        MTLSize::new((rows as u64).div_ceil(sgs * 4), 1, 1),
+        MTLSize::new(sgs * 32, 1, 1),
+    );
+}
+
+/// act = silu(G·x) ⊙ (U·x) in one dispatch (`q4tp_matvec_m_gu`); both
+/// tensors are `rows × gpr·32` q4tp.
+#[allow(clippy::too_many_arguments)]
+fn encode_q4tp_matvec_m_gu(
+    c: &Ctx,
+    enc: &metal::ComputeCommandEncoderRef,
+    fbuf: &WeightArena,
+    abs_g: usize,
+    abs_u: usize,
+    xs: &Buffer,
+    act: &Buffer,
+    rows: usize,
+    gpr: usize,
+) {
+    note_weight_bytes(&ProjKind::Q4tp, 2 * rows, gpr);
+    enc.set_compute_pipeline_state(&c.q4tp_mgu);
+    fbuf.bind(enc, 0, abs_g);
+    enc.set_buffer(1, Some(xs), 0);
+    enc.set_buffer(2, Some(act), 0);
+    let (gpr_u, rows_u) = (gpr as u32, rows as u32);
+    enc.set_bytes(3, 4, &gpr_u as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+    fbuf.bind(enc, 5, abs_u);
+    let sgs = 4u64;
     enc.dispatch_thread_groups(
         MTLSize::new((rows as u64).div_ceil(sgs * 4), 1, 1),
         MTLSize::new(sgs * 32, 1, 1),
@@ -8535,6 +8779,78 @@ pub fn q4t_matvec_for_test(
     let cmd = c.queue.new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
     encode_q4t_matvec(c, enc, &fbuf, abs, &xs_buf, &y_buf, rows, gpr);
+    enc.end_encoding();
+    submit_and_wait(c, cmd, &[&y_buf]);
+    unsafe {
+        std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, out.as_mut_ptr(), rows);
+    }
+    true
+}
+
+/// Test entry for the dense decode's fused q4tp kernels.
+/// `mode` 0: `out = silu(G·x) ⊙ (U·x)` (`q4tp_matvec_m_gu`, `idx` = gate,
+/// `idx_up` = up); 1: `out = y0 + W·x` (`q4tp_matvec_m` with the residual
+/// epilogue, `idx` = W, `y0` the incoming residual). false = refused.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn q4tp_fused_for_test(
+    model: &Arc<CmfModel>,
+    mode: u32,
+    idx: usize,
+    idx_up: usize,
+    xs: &[f32],
+    y0: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if cols % GROUP_SIZE != 0 || out.len() < rows {
+        return false;
+    }
+    let gpr = cols / GROUP_SIZE;
+    let Some((fbuf, safe_len)) = file_buffer(c, model) else {
+        return false;
+    };
+    let Some(need) =
+        cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[rows, cols])
+    else {
+        return false;
+    };
+    let abs_of = |i: usize| -> Option<usize> {
+        let e = &model.tensors[i];
+        let a = model.entry_abs_offset(e)?;
+        (e.dtype == cortiq_core::TensorDtype::Q4TiledP && a + need <= safe_len).then_some(a)
+    };
+    let (Some(abs), Some(abs_u)) = (abs_of(idx), abs_of(idx_up)) else {
+        return false;
+    };
+    let xs_buf = c._device.new_buffer_with_data(
+        xs.as_ptr() as *const std::ffi::c_void,
+        (xs.len() * 4) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let y_buf = c
+        ._device
+        .new_buffer((rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+    if mode == 1 {
+        if y0.len() < rows {
+            return false;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(y0.as_ptr(), y_buf.contents() as *mut f32, rows);
+        }
+    }
+    let cmd = c.queue.new_command_buffer();
+    let enc = cmd.new_compute_command_encoder();
+    match mode {
+        0 => encode_q4tp_matvec_m_gu(c, enc, &fbuf, abs, abs_u, &xs_buf, &y_buf, rows, gpr),
+        1 => encode_q4tp_matvec_m_add(c, enc, &fbuf, abs, &xs_buf, &y_buf, rows, gpr),
+        _ => {
+            enc.end_encoding();
+            return false;
+        }
+    }
     enc.end_encoding();
     submit_and_wait(c, cmd, &[&y_buf]);
     unsafe {
@@ -13154,6 +13470,11 @@ impl TokenGraph {
         self.conc = on && allowed;
     }
 
+    /// `set_dense_concurrent` without the env gate (the in-process A/B).
+    pub fn set_dense_concurrent_raw(&mut self, on: bool) {
+        self.conc = on;
+    }
+
     /// Buffer barrier between two dependent dispatches of a concurrent
     /// layer encoder; nothing in a serial one (dispatch order already is
     /// the barrier there).
@@ -13591,6 +13912,7 @@ impl TokenGraph {
             static SPAN_US: AtomicU64 = AtomicU64::new(0);
             static N: AtomicU64 = AtomicU64::new(0);
             let (mut lo, mut hi) = (f64::MAX, 0.0f64);
+            let mut busy = 0.0f64;
             for (cmd, kind) in self.gpuprof.drain(..) {
                 use metal::objc::{msg_send, sel, sel_impl};
                 let p: *mut metal::objc::runtime::Object =
@@ -13599,10 +13921,12 @@ impl TokenGraph {
                 let e: f64 = unsafe { msg_send![p, GPUEndTime] };
                 if e > s {
                     BUSY_US[kind as usize % 4].fetch_add(((e - s) * 1e6) as u64, Ordering::Relaxed);
+                    busy += e - s;
                     lo = lo.min(s);
                     hi = hi.max(e);
                 }
             }
+            GPU_BUSY_LAST_NS.store((busy * 1e9) as u64, Ordering::Relaxed);
             if hi > 0.0 {
                 SPAN_US.fetch_add(((hi - lo) * 1e6) as u64, Ordering::Relaxed);
                 let n = N.fetch_add(1, Ordering::Relaxed) + 1;
@@ -14153,26 +14477,43 @@ impl TokenGraph {
     /// + post-norm + FFN + residual.
     fn encode_o_ffn(&self, enc: &metal::ComputeCommandEncoderRef, l: &AttnGpuLayer, ao_b: &Buffer) {
         let (abs, q1t) = self.proj_abs(l.wo).unwrap();
-        encode_proj(
-            self.c,
-            enc,
-            &self.fbuf,
-            abs,
-            &q1t,
-            ao_b,
-            &self.d_b,
-            l.wo.1,
-            l.wo.2 / GROUP_SIZE,
-        );
+        // Dense decode (`fuse_on`): h += O·ao in the projection's epilogue,
+        // so the norm below runs without a delta — bit-exact, one pass less.
+        let o_fused = fuse_on() && matches!(q1t, ProjKind::Q4tp);
+        if o_fused {
+            encode_q4tp_matvec_m_add(
+                self.c,
+                enc,
+                &self.fbuf,
+                abs,
+                ao_b,
+                &self.h_b,
+                l.wo.1,
+                l.wo.2 / GROUP_SIZE,
+            );
+        } else {
+            encode_proj(
+                self.c,
+                enc,
+                &self.fbuf,
+                abs,
+                &q1t,
+                ao_b,
+                &self.d_b,
+                l.wo.1,
+                l.wo.2 / GROUP_SIZE,
+            );
+        }
         self.bar(enc);
         // Fused: h += d_b, n = rmsnorm(h, post_norm) — one dispatch
         // instead of separate enc_axpy + rmsnorm.
+        let delta = (!o_fused).then_some(&self.d_b);
         match &l.ffn {
             MetalFfn::Dense { gate, up, down } => {
-                self.encode_post_ffn(enc, l.post_norm, *gate, *up, *down, Some(&self.d_b));
+                self.encode_post_ffn(enc, l.post_norm, *gate, *up, *down, delta);
             }
             MetalFfn::Moe(m) => {
-                self.encode_post_moe_ffn(enc, l.post_norm, m, Some(&self.d_b));
+                self.encode_post_moe_ffn(enc, l.post_norm, m, delta);
             }
         }
     }
@@ -14391,29 +14732,75 @@ impl TokenGraph {
             .k_norm
             .map(|w| const_buf(self.c, w))
             .unwrap_or_else(|| qr_b.clone());
-        disp(
-            enc,
-            &self.c.rqkn,
-            &[
-                (&q_b, 0),
-                (&k_b, 0),
-                (&qr_b, 0),
-                (&g_b, 0),
-                (&qn_b, 0),
-                (&kn_b, 0),
-                (&const_buf(self.c, p.inv_freq), 0),
-            ],
-            &[
+        // Dense decode (`fuse_on`): qk-norm + RoPE + the K/V append as ONE
+        // pass — `chunk_rope_kv` at nb = 1 is `attn_rope_qkn` + `kv_append`
+        // op for op (same sum of squares, same norm and rotation order), K
+        // and V landing in the mirror directly. Not for the output-gate
+        // layout (the chunk kernel has no gate split).
+        let rope_app = fuse_on() && !p.output_gate && mirror.is_some();
+        if rope_app {
+            let (k_mb, v_mb, _, cap, stored) = mirror.as_ref().unwrap();
+            let flags_c = ((p.q_norm.is_some() as u32) << 1)
+                | ((p.k_norm.is_some() as u32) << 2)
+                | ((p.gemma as u32) << 3)
+                | ((p.late_qk_norm as u32) << 5);
+            let invf = const_buf(self.c, p.inv_freq);
+            enc.set_compute_pipeline_state(&self.c.cropekv);
+            // No bias (flag 16 clear): slots 6..8 are never read.
+            for (i, buf) in [
+                &q_b, &k_b, &v_b, &qr_b, k_mb, v_mb, &qr_b, &qr_b, &qr_b, &qn_b, &kn_b, &invf,
+            ]
+            .iter()
+            .enumerate()
+            {
+                enc.set_buffer(i as u64, Some(buf), 0);
+            }
+            let words = [
                 p.nh as u32,
                 p.nkv as u32,
                 p.hd as u32,
                 p.rd as u32,
                 p.position as u32,
-                flags,
-            ],
-            &[p.eps],
-            (((p.nh + p.nkv) * 32) as u64, 256),
-        );
+                *stored as u32,
+                *cap as u32,
+                flags_c,
+            ];
+            for (i, w) in words.iter().enumerate() {
+                enc.set_bytes(12 + i as u64, 4, w as *const u32 as *const std::ffi::c_void);
+            }
+            enc.set_bytes(20, 4, &p.eps as *const f32 as *const std::ffi::c_void);
+            let nb_u = 1u32;
+            enc.set_bytes(21, 4, &nb_u as *const u32 as *const std::ffi::c_void);
+            let sgs = 8u64;
+            enc.dispatch_thread_groups(
+                MTLSize::new(((p.nh + 2 * p.nkv) as u64).div_ceil(sgs), 1, 1),
+                MTLSize::new(sgs * 32, 1, 1),
+            );
+        } else {
+            disp(
+                enc,
+                &self.c.rqkn,
+                &[
+                    (&q_b, 0),
+                    (&k_b, 0),
+                    (&qr_b, 0),
+                    (&g_b, 0),
+                    (&qn_b, 0),
+                    (&kn_b, 0),
+                    (&const_buf(self.c, p.inv_freq), 0),
+                ],
+                &[
+                    p.nh as u32,
+                    p.nkv as u32,
+                    p.hd as u32,
+                    p.rd as u32,
+                    p.position as u32,
+                    flags,
+                ],
+                &[p.eps],
+                (((p.nh + p.nkv) * 32) as u64, 256),
+            );
+        }
         self.bar(enc);
         let ao_b = io_buf(self.c, 43_000_000_057 + nhd, nhd * 4);
         if let Some(od) = &o1dev {
@@ -14488,16 +14875,19 @@ impl TokenGraph {
             );
         } else {
             let (k_mb, v_mb, imp_mb, cap, stored) = mirror.unwrap();
-            // 4. append this position's K/V into the mirror
-            disp(
-                enc,
-                &self.c.kvapp,
-                &[(&k_b, 0), (&v_b, 0), (&k_mb, 0), (&v_mb, 0)],
-                &[p.nkv as u32, p.hd as u32, cap as u32, stored as u32],
-                &[],
-                ((p.nkv * p.hd) as u64, 256),
-            );
-            self.bar(enc);
+            // 4. append this position's K/V into the mirror (done above
+            //    when the RoPE pass wrote the mirror itself)
+            if !rope_app {
+                disp(
+                    enc,
+                    &self.c.kvapp,
+                    &[(&k_b, 0), (&v_b, 0), (&k_mb, 0), (&v_mb, 0)],
+                    &[p.nkv as u32, p.hd as u32, cap as u32, stored as u32],
+                    &[],
+                    ((p.nkv * p.hd) as u64, 256),
+                );
+                self.bar(enc);
+            }
             // 5. grouped attend (+ attention importance into the mirror's imp).
             //    Flash-decoding: one threadgroup per Q-head, its simdgroups
             //    splitting the stored positions. ~32 positions per simdgroup
@@ -14620,8 +15010,26 @@ impl TokenGraph {
             enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
         }
         self.bar(enc);
-        {
-            let (ag, au) = (self.proj_abs(gate).unwrap(), self.proj_abs(up).unwrap());
+        let (ag, au) = (self.proj_abs(gate).unwrap(), self.proj_abs(up).unwrap());
+        // Dense decode (`fuse_on`): gate|up|SiLU as one dispatch into fa_b.
+        let gu_fused = fuse_on()
+            && matches!(ag.1, ProjKind::Q4tp)
+            && matches!(au.1, ProjKind::Q4tp)
+            && gate.1 == up.1
+            && gate.2 == up.2;
+        if gu_fused {
+            encode_q4tp_matvec_m_gu(
+                self.c,
+                enc,
+                &self.fbuf,
+                ag.0,
+                au.0,
+                &self.n_b,
+                &fa_b,
+                gate.1,
+                gate.2 / GROUP_SIZE,
+            );
+        } else {
             // Gate and up as ONE dispatch when both are q4t
             // (CMF_METAL_DUAL=1): a serial encoder pays a hazard
             // barrier between every dispatch pair, and this pair never
@@ -14680,13 +15088,41 @@ impl TokenGraph {
         }
         self.bar(enc);
         let ad = self.proj_abs(down).unwrap();
+        let down_fused = gu_fused && matches!(ad.1, ProjKind::Q4tp);
         // Part two of the fusion stack (same CMF_METAL_DUAL=1 gate):
         // down consumes gate and up directly with SiLU inline — the
         // silu dispatch and its dependent-stage drain disappear.
         let dsilu_ok = std::env::var("CMF_METAL_DUAL").as_deref() == Ok("1")
             && matches!(ad.1, ProjKind::Q4t)
             && inter % 4 == 0;
-        if dsilu_ok {
+        if down_fused {
+            // h += Down·act in the epilogue: no axpy pass.
+            encode_q4tp_matvec_m_add(
+                self.c,
+                enc,
+                &self.fbuf,
+                ad.0,
+                &fa_b,
+                &self.h_b,
+                down.1,
+                down.2 / GROUP_SIZE,
+            );
+            return;
+        }
+        if gu_fused {
+            // gate|up|SiLU already produced fa_b; only down remains.
+            encode_proj(
+                self.c,
+                enc,
+                &self.fbuf,
+                ad.0,
+                &ad.1,
+                &fa_b,
+                &self.d_b,
+                down.1,
+                down.2 / GROUP_SIZE,
+            );
+        } else if dsilu_ok {
             note_weight_bytes(&ProjKind::Q4t, down.1, down.2 / GROUP_SIZE);
             let c = self.c;
             enc.set_compute_pipeline_state(&c.q4t_dsilu);
