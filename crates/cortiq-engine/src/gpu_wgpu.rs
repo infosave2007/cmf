@@ -22571,13 +22571,35 @@ pub fn forward_token_graph(
                                 pass.set_bind_group(0, &bg_merge, &[]);
                                 pass.dispatch_workgroups(nh as u32, 1, 1);
                             } else if !skip_attn {
-                                let (ap, al) = attend_pipes(c, hd);
-                                go(
-                                    &mut enc,
-                                    ap,
-                                    &bg(al, &[&qout, kbuf, vbuf, &attn, &at_u]),
-                                    nh as u32,
-                                );
+                                // Short context: the 256-thread decode attend,
+                                // as the fused arm above already does. The
+                                // 32-lane kernel cost 62 us per layer at ~50
+                                // positions on an RTX 3090 (MiniCPM5-2B, 42
+                                // layers: 2.6 of 7.2 ms of GPU per token).
+                                if c.attend_dec && hd <= 256 {
+                                    let dec_l = c.gqa_attend_dec.get_bind_group_layout(0);
+                                    go(
+                                        &mut enc,
+                                        &c.gqa_attend_dec,
+                                        // Keyed per step: `at_u` is the step's
+                                        // own uniform in a greedy burst.
+                                        &bgc(
+                                            34,
+                                            stp * layers.len() + li,
+                                            &dec_l,
+                                            &[&qout, kbuf, vbuf, &attn, &at_u],
+                                        ),
+                                        nh as u32,
+                                    );
+                                } else {
+                                    let (ap, al) = attend_pipes(c, hd);
+                                    go(
+                                        &mut enc,
+                                        ap,
+                                        &bg(al, &[&qout, kbuf, vbuf, &attn, &at_u]),
+                                        nh as u32,
+                                    );
+                                }
                             }
                         } // fused-vs-split attend arms
                           // attn_out *= sigmoid(gate) before the O projection.
@@ -38683,12 +38705,18 @@ fn main() {
     /// Uneven row counts on purpose (a partial last block on each side).
     #[test]
     fn wgpu_q4tp_matvec16w_x2_matches_two_singles() {
+        // gpr 128 > 64 (the 16w regime) and gpr 64 exactly, where the
+        // single reference is the narrow `q4tp_matvec16` kernel.
+        x2_matches_two_singles(4096);
+        x2_matches_two_singles(2048);
+    }
+
+    fn x2_matches_two_singles(cols: usize) {
         unsafe { std::env::set_var("CMF_GPU", "wgpu") };
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
-        let cols = 4096usize; // gpr 128 > 64: the 16w regime
         let mk_w = |rows: usize, seed: usize| -> Vec<u8> {
             let total = cortiq_core::quant::expected_nbytes(
                 cortiq_core::TensorDtype::Q4TiledP,
@@ -40153,12 +40181,19 @@ fn main() {
     /// `silu_mul_pre` on the device — bit for bit.
     #[test]
     fn wgpu_q4tp_matvec16w_gu_matches_three_dispatches() {
+        // 4096 wide (gpr 128) and 2048 wide (gpr 64, the MiniCPM5-2B
+        // hidden), whose reference matvec is the narrow 16-row kernel.
+        gu_matches_three_dispatches(4096);
+        gu_matches_three_dispatches(2048);
+    }
+
+    fn gu_matches_three_dispatches(cols: usize) {
         unsafe { std::env::set_var("CMF_GPU", "wgpu") };
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
-        let (inter, cols) = (1000usize, 4096usize);
+        let inter = 1000usize;
         let mk_w = |seed: usize| -> Vec<u8> {
             let total = cortiq_core::quant::expected_nbytes(
                 cortiq_core::TensorDtype::Q4TiledP,
@@ -40385,13 +40420,28 @@ fn main() {
                 (best - best1) * 1e6 / n as f64
             );
         }
-        for (rows, cols, label) in [
-            (17408usize, 5120usize, "gate/up 17408x5120"),
-            (5120, 17408, "down 5120x17408"),
-            (16384, 5120, "gdn qkv 16384x5120"),
-            (5120, 6144, "o/out 5120x6144"),
-            (248320, 5120, "lm_head 248320x5120"),
-        ] {
+        // `CMF_MV_SHAPES=2048x2048,6144x2048` (rows x cols) measures other
+        // models' decode shapes instead of the Qwen3.8-27B defaults.
+        let shapes: Vec<(usize, usize, String)> = match std::env::var("CMF_MV_SHAPES") {
+            Ok(s) => s
+                .split(',')
+                .filter_map(|p| {
+                    let (r, c) = p.trim().split_once('x')?;
+                    Some((r.parse().ok()?, c.parse().ok()?, p.trim().to_string()))
+                })
+                .collect(),
+            Err(_) => [
+                (17408usize, 5120usize, "gate/up 17408x5120"),
+                (5120, 17408, "down 5120x17408"),
+                (16384, 5120, "gdn qkv 16384x5120"),
+                (5120, 6144, "o/out 5120x6144"),
+                (248320, 5120, "lm_head 248320x5120"),
+            ]
+            .into_iter()
+            .map(|(r, c, l)| (r, c, l.to_string()))
+            .collect(),
+        };
+        for (rows, cols, label) in shapes {
             let total = cortiq_core::quant::expected_nbytes(
                 cortiq_core::TensorDtype::Q4TiledP,
                 &[rows, cols],
