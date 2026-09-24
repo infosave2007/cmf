@@ -619,6 +619,257 @@ kernel void zi_peak_f(device float* out [[buffer(0)]], constant uint& iters [[bu
     zi_peak_body<float>(out, iters, lane, gid);
 }
 
+// ═══════════════════════════ resident Flux VAE ═══════════════════════════
+// Activations NHWC; the residual stream f32, conv inputs half. Every conv
+// is an implicit GEMM on the DiT GEMM's tile (64 pixels × 64 out-channels
+// × 32 K, half weights [oc][tap][ic], f32 accumulation); the nearest-2×
+// upsample is folded into the gather.
+struct ZVc {
+    uint n;        // output pixels (GEMM rows)
+    uint rows;     // output channels (multiple of 64)
+    uint K;        // taps · ic (plain mode: the row length)
+    uint ic;       // input channels (multiple of 32)
+    uint H;        // output height
+    uint W;        // output width
+    uint taps;     // 9 = 3×3 pad 1, 1 = 1×1, 0 = plain rows (X [n][ldx])
+    uint up;       // 1: the source image is (H/2, W/2), nearest-upsampled
+    uint epi;      // 0 f32 [n][ldy], 1 half [n][ldy], 2 half transposed [o][ldy]
+    uint ldy;
+    uint has_bias;
+    uint has_res;  // f32 residual R[n][ldy] added (may alias Y)
+    float mul;
+    uint ldx;
+    uint pad0;
+    uint pad1;
+};
+
+static inline uint4 zv_gather(device const half* X, constant ZVc& p, uint pix, uint k) {
+    if (pix >= p.n) return uint4(0);
+    if (p.taps == 0u) return *(device const uint4*)(X + (ulong)pix * p.ldx + k);
+    const uint tap = k / p.ic, c = k - tap * p.ic;
+    int dy = 0, dx = 0;
+    if (p.taps == 9u) { dy = (int)(tap / 3u) - 1; dx = (int)(tap % 3u) - 1; }
+    const int y = (int)(pix / p.W) + dy, x = (int)(pix % p.W) + dx;
+    if (y < 0 || x < 0 || y >= (int)p.H || x >= (int)p.W) return uint4(0);
+    uint src;
+    if (p.up != 0u) src = ((uint)y >> 1) * (p.W >> 1) + ((uint)x >> 1);
+    else src = (uint)y * p.W + (uint)x;
+    return *(device const uint4*)(X + (ulong)src * p.ic + c);
+}
+
+kernel void zv_conv(
+    device const half* Wt [[buffer(0)]],
+    device const float* bias [[buffer(1)]],
+    device const half* X [[buffer(2)]],
+    device float* Y [[buffer(3)]],
+    device const float* R [[buffer(4)]],
+    constant ZVc& p [[buffer(5)]],
+    uint tid [[thread_index_in_threadgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]],
+    uint2 tg [[threadgroup_position_in_grid]])
+{
+    threadgroup half sw[2048];
+    threadgroup half sx[2048];
+    const uint t0 = tg.x * 64u, o0 = tg.y * 64u, K = p.K;
+    const uint r = tid >> 1, kh = (tid & 1u) * 16u;
+    device const uint4* wp = (device const uint4*)(Wt + (ulong)(o0 + r) * K + kh);
+    const ushort sgo = sg & 1, sgt = sg >> 1;
+    simdgroup_float8x8 acc[4][4];
+    for (ushort i = 0; i < 4; ++i)
+        for (ushort j = 0; j < 4; ++j)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    uint4 wa = wp[0], wb = wp[1];
+    uint4 xa = zv_gather(X, p, t0 + r, kh), xb = zv_gather(X, p, t0 + r, kh + 8u);
+    threadgroup uint4* xd = (threadgroup uint4*)(sx + ((r / 8u) * 4u + kh / 8u) * 64u + (r % 8u) * 8u);
+    threadgroup uint4* wd = (threadgroup uint4*)(sw + ((r / 8u) * 4u + kh / 8u) * 64u + (r % 8u) * 8u);
+    for (uint k0 = 0; k0 < K; k0 += 32u) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        wd[0] = wa; wd[8] = wb;
+        xd[0] = xa; xd[8] = xb;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (k0 + 32u < K) {
+            wp += 4;
+            wa = wp[0];
+            wb = wp[1];
+            xa = zv_gather(X, p, t0 + r, k0 + 32u + kh);
+            xb = zv_gather(X, p, t0 + r, k0 + 32u + kh + 8u);
+        }
+        #pragma clang loop unroll(full)
+        for (ushort kb = 0; kb < 4; ++kb) {
+            simdgroup_half8x8 a[4], b[4];
+            #pragma clang loop unroll(full)
+            for (ushort i = 0; i < 4; ++i)
+                simdgroup_load(a[i], sx + ((4u * sgt + i) * 4u + kb) * 64u, 8);
+            #pragma clang loop unroll(full)
+            for (ushort j = 0; j < 4; ++j)
+                simdgroup_load(b[j], sw + ((4u * sgo + j) * 4u + kb) * 64u, 8, ulong2(0, 0), true);
+            #pragma clang loop unroll(full)
+            for (ushort i = 0; i < 4; ++i)
+                #pragma clang loop unroll(full)
+                for (ushort j = 0; j < 4; ++j)
+                    simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+        }
+    }
+    if (t0 + 32u * sgt >= p.n) return;
+    const short2 fc = zi_fc(lane);
+    for (ushort j = 0; j < 4; ++j) {
+        const uint o = o0 + 32u * sgo + 8u * j + (uint)fc.y;
+        const float b0 = p.has_bias != 0u ? bias[o] : 0.0f;
+        const float b1 = p.has_bias != 0u ? bias[o + 1] : 0.0f;
+        for (ushort i = 0; i < 4; ++i) {
+            const uint t = t0 + 32u * sgt + 8u * i + (uint)fc.x;
+            float v0 = acc[i][j].thread_elements()[0] * p.mul + b0;
+            float v1 = acc[i][j].thread_elements()[1] * p.mul + b1;
+            if (p.epi == 2u) {
+                device half* Yh = (device half*)Y;
+                Yh[(ulong)o * p.ldy + t] = (half)v0;
+                Yh[(ulong)(o + 1) * p.ldy + t] = (half)v1;
+                continue;
+            }
+            const ulong yi = (ulong)t * p.ldy + o;
+            if (p.has_res != 0u) {
+                const float2 rr = *(device const float2*)(R + yi);
+                v0 += rr.x;
+                v1 += rr.y;
+            }
+            if (p.epi == 0u) *(device float2*)(Y + yi) = float2(v0, v1);
+            else *(device half2*)((device half*)Y + yi) = half2(v0, v1);
+        }
+    }
+}
+
+// GroupNorm statistics, two exact passes: pass 0 sums x, pass 1 sums
+// (x - mean)². Grid (groups, blocks); each group reads its cg = C/groups
+// contiguous channels of every pixel of the block.
+struct ZGn {
+    uint n;        // pixels
+    uint C;
+    uint groups;
+    uint nblk;     // blocks per group (grid.y)
+    uint pass;     // 0 = sum, 1 = centred sum of squares
+    float eps;
+    uint silu;     // apply: SiLU after the affine
+    uint half_out; // apply: 1 = half output, 0 = f32
+};
+
+kernel void zv_gn_part(
+    device const float* x [[buffer(0)]],
+    device float* part [[buffer(1)]],      // [groups][nblk]
+    device const float* stat [[buffer(2)]],// [groups][2] mean, inv (pass 1 reads mean)
+    constant ZGn& p [[buffer(3)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]])
+{
+    threadgroup float red[8];
+    const uint g = tg.x, b = tg.y;
+    const uint cg = p.C / p.groups;
+    const uint per = (p.n + p.nblk - 1) / p.nblk;
+    const uint p0 = b * per, p1 = min(p.n, p0 + per);
+    const float mean = p.pass == 1u ? stat[2u * g] : 0.0f;
+    float acc = 0.0f;
+    for (uint px = p0 + tid; px < p1; px += 256u) {
+        device const float4* v4 = (device const float4*)(x + (ulong)px * p.C + g * cg);
+        for (uint c = 0; c < cg / 4u; ++c) {
+            float4 v = v4[c];
+            if (p.pass == 1u) { v -= mean; acc += dot(v, v); }
+            else acc += v.x + v.y + v.z + v.w;
+        }
+    }
+    acc = zi_block_sum(acc, red, sg, lane);
+    if (tid == 0) part[g * p.nblk + b] = acc;
+}
+
+// Reduce the partials of one pass: pass 0 → mean, pass 1 → inv std.
+kernel void zv_gn_fin(
+    device const float* part [[buffer(0)]],
+    device float* stat [[buffer(1)]],
+    constant ZGn& p [[buffer(2)]],
+    uint g [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]])
+{
+    float s = 0.0f;
+    for (uint b = lane; b < p.nblk; b += 32u) s += part[g * p.nblk + b];
+    s = simd_sum(s);
+    if (lane == 0) {
+        const float cnt = (float)p.n * (float)(p.C / p.groups);
+        if (p.pass == 0u) stat[2u * g] = s / cnt;
+        else stat[2u * g + 1u] = rsqrt(s / cnt + p.eps);
+    }
+}
+
+// y = affine(norm(x)) [· SiLU] → half or f32, NHWC, float4 at a time.
+kernel void zv_gn_apply(
+    device const float* x [[buffer(0)]],
+    device void* y [[buffer(1)]],
+    device const float* stat [[buffer(2)]],
+    device const float* w [[buffer(3)]],
+    device const float* bb [[buffer(4)]],
+    constant ZGn& p [[buffer(5)]],
+    uint i [[thread_position_in_grid]])
+{
+    const uint n4 = p.n * p.C / 4u;
+    if (i >= n4) return;
+    const uint c = (4u * i) % p.C;
+    const uint g = c / (p.C / p.groups);
+    const float mean = stat[2u * g], inv = stat[2u * g + 1u];
+    float4 v = (((device const float4*)x)[i] - mean) * inv * *(device const float4*)(w + c)
+             + *(device const float4*)(bb + c);
+    if (p.silu != 0u) v = v / (1.0f + exp(-v));
+    if (p.half_out != 0u) ((device half4*)y)[i] = half4(v);
+    else ((device float4*)y)[i] = v;
+}
+
+// f32 → half, float4 at a time.
+kernel void zv_cvt(
+    device const float4* x [[buffer(0)]],
+    device half4* y [[buffer(1)]],
+    constant uint& n4 [[buffer(2)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i < n4) y[i] = half4(x[i]);
+}
+
+// Row softmax of f32 scores [rows][n] → half P (one 256-thread group per row).
+kernel void zv_softmax(
+    device const float* s [[buffer(0)]],
+    device half* pr [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]])
+{
+    threadgroup float red[8];
+    device const float* sr = s + (ulong)row * n;
+    float mx = -INFINITY;
+    for (uint j = tid; j < n; j += 256u) mx = max(mx, sr[j]);
+    mx = simd_max(mx);
+    if (lane == 0) red[sg] = mx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float m = red[0];
+    for (ushort i = 1; i < 8; ++i) m = max(m, red[i]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float sum = 0.0f;
+    for (uint j = tid; j < n; j += 256u) sum += exp(sr[j] - m);
+    const float inv = 1.0f / zi_block_sum(sum, red, sg, lane);
+    device half* pw = pr + (ulong)row * n;
+    for (uint j = tid; j < n; j += 256u) pw[j] = (half)(exp(sr[j] - m) * inv);
+}
+
+// conv_out [n][64] f32 (3 real channels) → RGB planes [3][n].
+kernel void zv_rgb(
+    device const float* y [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i >= n) return;
+    for (uint c = 0; c < 3u; ++c) out[(ulong)c * n + i] = y[(ulong)i * 64u + c];
+}
+
 // ───────────── debug: max|x| of a half range into slot (float bits) ─────────────
 kernel void zi_amax(
     device const half* a [[buffer(0)]],
