@@ -3682,6 +3682,10 @@ pub fn zimage_preload(
     context_refiner: &[ZBlockRef],
 ) -> bool {
     match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => {
+            crate::gpu_metal::zimage::preload(model, geom, noise_refiner, layers, context_refiner)
+        }
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::zimage::preload(model, geom, noise_refiner, layers, context_refiner),
         #[allow(unreachable_patterns)]
@@ -3705,6 +3709,8 @@ pub fn zimage_flush_pipelines() {
 /// device path here.
 pub fn zimage_warmup() -> bool {
     match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::zimage::warmup(),
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::zimage::warmup(),
         #[allow(unreachable_patterns)]
@@ -3718,6 +3724,8 @@ pub fn zimage_warmup() -> bool {
 #[allow(unused_variables)]
 pub fn vae_prewarm(a: &crate::vae::VaeChainArgs) -> bool {
     match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::zimage::vae_prewarm(a),
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::zimage::vae_prewarm(a),
         #[allow(unreachable_patterns)]
@@ -3728,6 +3736,8 @@ pub fn vae_prewarm(a: &crate::vae::VaeChainArgs) -> bool {
 /// Drop the Z-Image DiT device state (planes, prepared programs) but keep
 /// the VAE chain (B2: the generator frees the DiT before decoding).
 pub fn zimage_release_dit() {
+    #[cfg(target_os = "macos")]
+    crate::gpu_metal::zimage::release_dit();
     #[cfg(feature = "gpu")]
     crate::gpu_wgpu::zimage::release_dit();
 }
