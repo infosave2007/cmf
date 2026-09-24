@@ -41,6 +41,8 @@ use super::{Ctx, WeightArena};
 
 const ZMSL: &str = include_str!("zimage_msl.metal");
 
+mod vae;
+
 /// `CMF_ZI_METAL=0` turns the device path off (the caller runs the CPU).
 fn zi_enabled() -> bool {
     std::env::var("CMF_ZI_METAL").as_deref() != Ok("0")
@@ -108,6 +110,14 @@ struct Pipes {
     copy4: ComputePipelineState,
     amax: ComputePipelineState,
     probe: ComputePipelineState,
+    // resident VAE
+    vconv: ComputePipelineState,
+    vgnpart: ComputePipelineState,
+    vgnfin: ComputePipelineState,
+    vgnapply: ComputePipelineState,
+    vcvt: ComputePipelineState,
+    vsoftmax: ComputePipelineState,
+    vrgb: ComputePipelineState,
 }
 // metal-rs objects are retained ObjC pointers; used under the state mutex.
 unsafe impl Send for Pipes {}
@@ -145,6 +155,13 @@ fn build_pipes(c: &Ctx) -> Result<Pipes, String> {
         copy4: pso("zi_copy4")?,
         amax: pso("zi_amax")?,
         probe: pso("zi_fragprobe")?,
+        vconv: pso("zv_conv")?,
+        vgnpart: pso("zv_gn_part")?,
+        vgnfin: pso("zv_gn_fin")?,
+        vgnapply: pso("zv_gn_apply")?,
+        vcvt: pso("zv_cvt")?,
+        vsoftmax: pso("zv_softmax")?,
+        vrgb: pso("zv_rgb")?,
     })
 }
 
@@ -1200,6 +1217,7 @@ pub(crate) fn release() {
     if let Ok(mut st) = ZSTATE.lock() {
         st.0 = None;
     }
+    vae::release();
 }
 
 /// Drop the DiT state (keep the VAE chain).
@@ -1263,19 +1281,19 @@ pub(crate) fn refine_caption(
 }
 
 /// Upload the VAE weights and compile its kernels ahead of the decode.
-pub(crate) fn vae_prewarm(_a: &crate::vae::VaeChainArgs) -> bool {
-    false
+pub(crate) fn vae_prewarm(a: &crate::vae::VaeChainArgs) -> bool {
+    zi_enabled() && vae::prewarm(a)
 }
 
 /// Resident Flux-VAE decoder; `z` is already de-normalised.
 pub(crate) fn vae_decode_chain(
-    _a: &crate::vae::VaeChainArgs,
-    _z: &[f32],
-    _h: usize,
-    _w: usize,
-    _out: &mut [f32],
+    a: &crate::vae::VaeChainArgs,
+    z: &[f32],
+    h: usize,
+    w: usize,
+    out: &mut [f32],
 ) -> bool {
-    false
+    zi_enabled() && vae::decode(a, z, h, w, out)
 }
 
 // ───────────────────────────── bench hooks ─────────────────────────────
