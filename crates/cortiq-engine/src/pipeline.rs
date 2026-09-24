@@ -8119,7 +8119,12 @@ impl Pipeline {
                 // the prompt's expert panels stay on the host rather than
                 // stream through (and evict) the arena the projections use.
                 FfnKind::Moe(m) if self.mimo_moe.is_dynamic(li, false) => {
-                    crate::gpu::cpu_scope(|| moe_ffn_batch(m, &post, b, hs, pool.as_deref(), None))
+                    let before = m.stats.borrow().clone();
+                    let out = crate::gpu::cpu_scope(|| {
+                        moe_ffn_batch(m, &post, b, hs, pool.as_deref(), None)
+                    });
+                    self.mimo_moe.prime(li, m, &before);
+                    out
                 }
                 FfnKind::Moe(m) => moe_ffn_batch(m, &post, b, hs, pool.as_deref(), None),
                 // Dual-branch layers run per position (the expert branch
