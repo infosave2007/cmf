@@ -1689,6 +1689,44 @@ pub fn graph_kv_set_stored(kv_id: u64, layer: usize, stored: usize) -> bool {
     false
 }
 
+/// Rows the wgpu token graph's exact-attention mirror holds for one layer
+/// (None: no wgpu mirror). Metal keeps its owner cache current per token
+/// and reports None here.
+pub fn graph_kv_stored(_kv_id: u64, _layer: usize) -> Option<usize> {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::kv_mirror_stored(_kv_id, _layer);
+    }
+    None
+}
+
+/// Does the wgpu token graph hold a device-resident recurrent state for
+/// this layer (one the host `linear_state` has not seen)?
+pub fn graph_state_resident(_kv_id: u64, _layer: usize) -> bool {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::graph_state_resident(_kv_id, _layer);
+    }
+    false
+}
+
+/// Copy rows `[from..to)` of the wgpu token graph's K/V mirror back to the
+/// host, position-major (`[(to − from) × nkv × hd]` each for K and V).
+pub fn graph_kv_read_rows(
+    _kv_id: u64,
+    _layer: usize,
+    _from: usize,
+    _to: usize,
+    _nkv: usize,
+    _hd: usize,
+) -> Option<(Vec<f32>, Vec<f32>)> {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::kv_mirror_read_rows(_kv_id, _layer, _from, _to, _nkv, _hd);
+    }
+    None
+}
+
 /// Drop the wgpu token graph's device K/V mirror for a pipeline.
 pub fn graph_kv_reset(_kv_id: u64) {
     #[cfg(feature = "gpu")]

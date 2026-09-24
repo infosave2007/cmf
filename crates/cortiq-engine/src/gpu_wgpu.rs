@@ -26641,6 +26641,90 @@ pub fn kv_mirror_set_stored(kv_id: u64, layer: usize, stored: usize) -> bool {
     true
 }
 
+/// Rows one exact-attention mirror holds (its logical cursor), or None when
+/// this pipeline has no mirror for the layer.
+pub fn kv_mirror_stored(kv_id: u64, layer: usize) -> Option<usize> {
+    let c = ctx()?;
+    c.attn_kv.lock().unwrap().get(&(kv_id, layer)).map(|m| m.synced)
+}
+
+/// Does the token graph hold a recurrent (GDN ring+S / short-conv ring)
+/// state for this layer? Such a state has advanced on the device past the
+/// host's `linear_state`.
+pub fn graph_state_resident(kv_id: u64, layer: usize) -> bool {
+    ctx().is_some_and(|c| c.gdn_state.lock().unwrap().contains_key(&(kv_id, layer)))
+}
+
+/// Read rows `[from..to)` of one exact-attention mirror back to the host,
+/// position-major (`[(to − from) × nkv × hd]` for K, the same for V) — the
+/// layout `LayerKvCache::append` takes one position of. None when the mirror
+/// does not hold those rows or the geometry does not match its buffers.
+pub fn kv_mirror_read_rows(
+    kv_id: u64,
+    layer: usize,
+    from: usize,
+    to: usize,
+    nkv: usize,
+    hd: usize,
+) -> Option<(Vec<f32>, Vec<f32>)> {
+    let c = ctx()?;
+    if to <= from {
+        return Some((Vec::new(), Vec::new()));
+    }
+    let (kb, vb, cap) = {
+        let mirrors = c.attn_kv.lock().unwrap();
+        let m = mirrors.get(&(kv_id, layer))?;
+        if m.synced < to || m.cap < to {
+            return None;
+        }
+        (m.k.clone(), m.v.clone(), m.cap)
+    };
+    if kb.size() < (nkv * cap * hd * 4) as u64 || vb.size() < (nkv * cap * hd * 4) as u64 {
+        return None;
+    }
+    let n = to - from;
+    let per = (n * hd * 4) as u64;
+    let total = per * (2 * nkv) as u64;
+    let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("kv-mirror-pull"),
+        size: total.max(4),
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("kv-mirror-pull"),
+        });
+    flush_pass(&enc);
+    for h in 0..nkv {
+        let src = ((h * cap + from) * hd * 4) as u64;
+        enc.copy_buffer_to_buffer(&kb, src, &stage, h as u64 * per, per);
+        enc.copy_buffer_to_buffer(&vb, src, &stage, (nkv + h) as u64 * per, per);
+    }
+    submit(c, finish_enc(enc));
+    let slice = stage.slice(..total);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    c.device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
+    let data = slice.get_mapped_range().ok()?;
+    let head_major: &[f32] = bytemuck::cast_slice(&data);
+    // [K | V] × [head][pos][hd] → [pos][head][hd]
+    let mut k = vec![0.0f32; n * nkv * hd];
+    let mut v = vec![0.0f32; n * nkv * hd];
+    for h in 0..nkv {
+        for p in 0..n {
+            let s = (h * n + p) * hd;
+            let d = (p * nkv + h) * hd;
+            k[d..d + hd].copy_from_slice(&head_major[s..s + hd]);
+            let s = ((nkv + h) * n + p) * hd;
+            v[d..d + hd].copy_from_slice(&head_major[s..s + hd]);
+        }
+    }
+    drop(data);
+    stage.unmap();
+    Some((k, v))
+}
+
 /// GDN depthwise conv step (bring-up / parity): updates cq [cdim] and shifts
 /// the ring [(kk-1)·cdim] in place.
 pub fn gdn_conv_gpu(
