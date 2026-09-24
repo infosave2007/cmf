@@ -5,6 +5,7 @@ pub mod dashboard;
 pub mod ood;
 pub mod openai;
 pub mod streaming;
+pub mod tool_calls;
 
 use axum::extract::State;
 use axum::{Json, Router, routing::get};

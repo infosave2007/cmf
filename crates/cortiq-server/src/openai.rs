@@ -4,6 +4,7 @@
 
 use crate::AppState;
 use crate::streaming::{self, ChatStream};
+use crate::tool_calls::{ToolHoldback, extract_tool_calls};
 use axum::{
     Router,
     extract::State,
@@ -812,9 +813,31 @@ async fn chat_completions(
                 }
             }
             eprintln!("[serve] msgs[0]={:?}", msgs.first());
-            state
-                .tokenizer
-                .apply_chat_template_json(&msgs, req.effective_tools(), req.thinking())
+            match req.effective_tools() {
+                // With tools a failed render is an ERROR: the ChatML
+                // fallback has no place for them, and the model would
+                // answer as if no functions were offered — silently.
+                Some(tools) => match state.tokenizer.try_apply_chat_template_json(
+                    &msgs,
+                    Some(tools),
+                    req.thinking(),
+                ) {
+                    Ok(ids) => ids,
+                    Err(e) => {
+                        tracing::error!("chat template render failed with tools: {e}");
+                        return error_response(
+                            StatusCode::BAD_REQUEST,
+                            format!(
+                                "the model's chat template failed to render this request with tools ({e}); \
+                                 refusing to run it without them"
+                            ),
+                        );
+                    }
+                },
+                None => state
+                    .tokenizer
+                    .apply_chat_template_json(&msgs, None, req.thinking()),
+            }
         };
         (prompt_ids, None)
     };
@@ -927,6 +950,7 @@ async fn chat_completions(
                     .collect()
             })
             .unwrap_or_default();
+        let tools_owned: Option<Vec<serde_json::Value>> = req.effective_tools().map(|t| t.to_vec());
         let (tx, stream) = ChatStream::new(64);
         let model = req.model.clone();
         let id = request_id.clone();
@@ -965,49 +989,32 @@ async fn chat_completions(
             let filter_shared = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
             let filter_cb = filter_shared.clone();
             let mut filter_passthrough = req.thinking() != Some(false);
-            // Tool-call holdback: once the model opens a <tool_call>
-            // block, nothing more goes out as content — the calls are
-            // parsed whole at the end and shipped as a tool_calls delta.
-            // Until the marker is certain, the last few characters stay
-            // buffered so a marker split across tokens cannot leak.
+            // Tool-call holdback: once the model opens a call (any grammar
+            // the parser knows), nothing more goes out as content — the
+            // calls are parsed whole at the end and shipped as a
+            // tool_calls delta; text that turns out not to be a call is
+            // flushed then, never dropped.
             let tools_active = req.effective_tools().is_some();
-            let mut tool_tail = String::new();
-            let mut tool_holding = false;
-            const MARK: &str = "<tool_call>";
+            let holdback = std::sync::Arc::new(std::sync::Mutex::new(ToolHoldback::new()));
+            let holdback_cb = holdback.clone();
 
             let callback: cortiq_engine::TokenCallback = Box::new(move |token: &str| {
-                if filter_passthrough {
-                    if tools_active {
-                        if tool_holding {
-                            return !tx_tokens.is_closed();
-                        }
-                        tool_tail.push_str(token);
-                        if let Some(pos) = tool_tail.find(MARK) {
-                            tool_holding = true;
-                            let before = tool_tail[..pos].to_string();
-                            if !before.is_empty() {
-                                let chunk = streaming::token_chunk(&id2, &model2, &before, created);
-                                return tx_tokens.blocking_send(chunk).is_ok();
-                            }
-                            return !tx_tokens.is_closed();
-                        }
-                        // Flush all but a marker's worth of tail.
-                        if tool_tail.len() > MARK.len() {
-                            let cut = tool_tail.len() - (MARK.len() - 1);
-                            let safe_cut = (0..=cut)
-                                .rev()
-                                .find(|&c| tool_tail.is_char_boundary(c))
-                                .unwrap_or(0);
-                            if safe_cut > 0 {
-                                let out: String = tool_tail.drain(..safe_cut).collect();
-                                let chunk = streaming::token_chunk(&id2, &model2, &out, created);
-                                return tx_tokens.blocking_send(chunk).is_ok();
-                            }
-                        }
+                // Every piece of content goes out through here, so the
+                // think filter's flushes pass the tool holdback too.
+                let emit = |text: &str| -> bool {
+                    let out = if tools_active {
+                        holdback_cb.lock().expect("tool holdback").push(text)
+                    } else {
+                        text.to_string()
+                    };
+                    if out.is_empty() {
                         return !tx_tokens.is_closed();
                     }
-                    let chunk = streaming::token_chunk(&id2, &model2, token, created);
-                    return tx_tokens.blocking_send(chunk).is_ok();
+                    let chunk = streaming::token_chunk(&id2, &model2, &out, created);
+                    tx_tokens.blocking_send(chunk).is_ok()
+                };
+                if filter_passthrough {
+                    return emit(token);
                 }
                 let mut filter_buf = filter_cb.lock().expect("think filter buf");
                 filter_buf.push_str(token);
@@ -1017,16 +1024,14 @@ async fn chat_completions(
                     filter_passthrough = true;
                     let tail_trimmed = tail.trim_start_matches('\n');
                     if !tail_trimmed.is_empty() {
-                        let chunk = streaming::token_chunk(&id2, &model2, tail_trimmed, created);
-                        return tx_tokens.blocking_send(chunk).is_ok();
+                        return emit(tail_trimmed);
                     }
                     return true;
                 }
                 if filter_buf.len() > 100 && !filter_buf.contains("<think>") {
                     let b = std::mem::take(&mut *filter_buf);
                     filter_passthrough = true;
-                    let chunk = streaming::token_chunk(&id2, &model2, &b, created);
-                    return tx_tokens.blocking_send(chunk).is_ok();
+                    return emit(&b);
                 }
                 true
             });
@@ -1059,6 +1064,11 @@ async fn chat_completions(
                         } else {
                             String::new()
                         };
+                        let out = if tools_active {
+                            holdback.lock().expect("tool holdback").push(&out)
+                        } else {
+                            out
+                        };
                         if !out.is_empty() {
                             let _ = tx
                                 .send(streaming::token_chunk(&id, &model, &out, created))
@@ -1069,11 +1079,21 @@ async fn chat_completions(
                         .runtime
                         .record_generation(result.tokens_generated, elapsed_ms, elapsed_ms)
                         .await;
+                    // Held tool markup: calls out, the rest back as content.
+                    let (held_text, held_calls) = std::mem::take(
+                        &mut *holdback.lock().expect("tool holdback"),
+                    )
+                    .finish(tools_owned.as_deref());
+                    if !held_text.is_empty() {
+                        let _ = tx
+                            .send(streaming::token_chunk(&id, &model, &held_text, created))
+                            .await;
+                    }
                     let (plain2, mut calls, _) = if dsv41 {
                         extract_dsv41_result(&result, dsv41_thinking, &state2.tokenizer)
                     } else {
-                        let (plain, calls) = extract_tool_calls(&result.text);
-                        (plain, calls, None)
+                        let (plain, _) = extract_tool_calls(&result.text, tools_owned.as_deref());
+                        (plain, held_calls, None)
                     };
                     if calls.is_empty() {
                         if let Some(c) = bare_call_fallback(&plain2, &tool_names) {
@@ -1163,10 +1183,10 @@ async fn chat_completions(
             extract_dsv41_result(&result, dsv41_thinking, &state.tokenizer)
         } else if req.thinking() == Some(false) {
             let content = strip_think_block(&result.text);
-            let (plain, calls) = extract_tool_calls(&content);
+            let (plain, calls) = extract_tool_calls(&content, req.effective_tools());
             (plain, calls, None)
         } else {
-            let (plain, calls) = extract_tool_calls(&result.text);
+            let (plain, calls) = extract_tool_calls(&result.text, req.effective_tools());
             (plain, calls, None)
         };
         if calls.is_empty() {
@@ -1252,88 +1272,6 @@ fn bare_call_fallback(text: &str, allowed: &[String]) -> Option<serde_json::Valu
             "arguments": serde_json::to_string(&args).unwrap_or_else(|_| "{}".into()),
         }
     }))
-}
-
-/// Nanbeige's XML tool grammar, normalised to the JSON shape:
-/// `<function=NAME>\n<parameter=K>\nV\n</parameter>...</function>`.
-/// Parameter values keep inner newlines (the format allows multi-line
-/// values); the surrounding single newline the grammar inserts is
-/// trimmed.
-fn parse_xml_function(body: &str) -> Option<serde_json::Value> {
-    let t = body.trim();
-    let name_start = t.find("<function=")? + "<function=".len();
-    let name_end = t[name_start..].find(['>', '\n'])? + name_start;
-    let name = t[name_start..name_end].trim().to_string();
-    if name.is_empty() {
-        return None;
-    }
-    let mut args = serde_json::Map::new();
-    let mut rest = &t[name_end..];
-    while let Some(ps) = rest.find("<parameter=") {
-        let key_start = ps + "<parameter=".len();
-        let key_end = rest[key_start..].find('>')? + key_start;
-        let key = rest[key_start..key_end].trim().to_string();
-        let val_start = key_end + 1;
-        let val_end = rest[val_start..].find("</parameter>")? + val_start;
-        let val = rest[val_start..val_end]
-            .strip_prefix('\n')
-            .unwrap_or(&rest[val_start..val_end])
-            .strip_suffix('\n')
-            .unwrap_or(&rest[val_start..val_end])
-            .to_string();
-        args.insert(key, serde_json::Value::String(val));
-        rest = &rest[val_end + "</parameter>".len()..];
-    }
-    Some(serde_json::json!({"name": name, "arguments": args}))
-}
-
-/// Extract `<tool_call>{...}</tool_call>` blocks from generated text —
-/// the format every Qwen-family template (Nanbeige included) trains the
-/// model to emit. Returns the text OUTSIDE the blocks and the calls in
-/// OpenAI shape. `arguments` stays a STRING of JSON per the OpenAI
-/// contract; a block whose body does not parse as JSON is left in the
-/// text rather than shipped as a broken call — a client can read prose,
-/// but it cannot execute garbage.
-fn extract_tool_calls(text: &str) -> (String, Vec<serde_json::Value>) {
-    const OPEN: &str = "<tool_call>";
-    const CLOSE: &str = "</tool_call>";
-    let mut rest = text;
-    let mut plain = String::new();
-    let mut calls = Vec::new();
-    while let Some(i) = rest.find(OPEN) {
-        let Some(j) = rest[i + OPEN.len()..].find(CLOSE) else {
-            break; // unterminated block: keep as text (truncated output)
-        };
-        let body = rest[i + OPEN.len()..i + OPEN.len() + j].trim();
-        let after = &rest[i + OPEN.len() + j + CLOSE.len()..];
-        // Two trained grammars share the <tool_call> wrapper: the JSON
-        // object, and Nanbeige's XML `<function=name><parameter=k>v...`.
-        // Parse whichever arrived.
-        let parsed = serde_json::from_str::<serde_json::Value>(body)
-            .ok()
-            .or_else(|| parse_xml_function(body));
-        match parsed {
-            Some(v) if v.get("name").map(|n| n.is_string()) == Some(true) => {
-                plain.push_str(&rest[..i]);
-                let args = v.get("arguments").cloned().unwrap_or(serde_json::json!({}));
-                calls.push(serde_json::json!({
-                    "id": format!("call_{}", uuid::Uuid::new_v4().simple()),
-                    "type": "function",
-                    "function": {
-                        "name": v["name"],
-                        "arguments": serde_json::to_string(&args).unwrap_or_else(|_| "{}".into()),
-                    }
-                }));
-            }
-            _ => {
-                // Not a call: keep the whole block verbatim as text.
-                plain.push_str(&rest[..i + OPEN.len() + j + CLOSE.len()]);
-            }
-        }
-        rest = after;
-    }
-    plain.push_str(rest);
-    (plain.trim().to_string(), calls)
 }
 
 /// Parse a DeepSeek-V4.1 harmony completion. The engine normally decodes the
@@ -1505,51 +1443,6 @@ fn default_max_tokens() -> u32 {
 
 #[cfg(test)]
 mod tests {
-
-    #[test]
-    fn tool_calls_extract_single() {
-        let (text, calls) = extract_tool_calls(
-            "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>",
-        );
-        assert_eq!(text, "");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0]["function"]["name"], "get_weather");
-        // arguments is a STRING of JSON per the OpenAI contract
-        let args: serde_json::Value =
-            serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
-        assert_eq!(args["city"], "Paris");
-        assert!(calls[0]["id"].as_str().unwrap().starts_with("call_"));
-    }
-
-    #[test]
-    fn tool_calls_extract_text_and_multiple() {
-        let (text, calls) = extract_tool_calls(
-            "Let me check both.\n<tool_call>\n{\"name\": \"a\", \"arguments\": {}}\n</tool_call>\n<tool_call>\n{\"name\": \"b\", \"arguments\": {\"x\": 1}}\n</tool_call>",
-        );
-        assert_eq!(text, "Let me check both.");
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[1]["function"]["name"], "b");
-    }
-
-    #[test]
-    fn tool_calls_malformed_body_stays_text() {
-        let (text, calls) = extract_tool_calls("<tool_call>\nnot json at all\n</tool_call> done");
-        assert!(calls.is_empty());
-        assert!(
-            text.contains("not json at all"),
-            "broken call must stay readable text"
-        );
-    }
-
-    #[test]
-    fn tool_calls_unterminated_stays_text() {
-        let (text, calls) = extract_tool_calls("<tool_call>\n{\"name\": \"a\"");
-        assert!(calls.is_empty());
-        assert!(
-            text.contains("<tool_call>"),
-            "truncated output must not vanish"
-        );
-    }
 
     use super::*;
 
