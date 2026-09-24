@@ -61,12 +61,18 @@ mod imp {
         let mut v: Vec<MmCfg> = args
             .iter()
             .filter_map(|a| {
-                // suffix d = direct (no shared staging), h = f16-accumulate probe
+                // suffix d = direct (no shared staging), h = f16-accumulate probe,
+                // s = two shared stages; `@F` = the flushed f16-accumulate arm
+                // (flush every F K slices)
+                let (a, acc16) = match a.split_once('@') {
+                    Some((x, f)) => (x, f.parse().unwrap_or(0)),
+                    None => (a.as_str(), 0),
+                };
                 let direct = a.ends_with('d');
                 let acc16_probe = a.ends_with('h');
                 let stages = if a.ends_with('s') { 2 } else { 1 };
                 let t: Vec<u32> = a.trim_end_matches(['d', 'h', 's']).split(',').filter_map(|x| x.parse().ok()).collect();
-                (t.len() == 5).then(|| MmCfg { direct, acc16_probe, stages, ..MmCfg::new(t[0], t[1], t[2], t[3], t[4], epi) })
+                (t.len() == 5).then(|| MmCfg { direct, acc16_probe, stages, acc16, ..MmCfg::new(t[0], t[1], t[2], t[3], t[4], epi) })
             })
             .collect();
         if v.is_empty() {
@@ -122,7 +128,7 @@ mod imp {
     fn cmd_mm(args: &[String]) {
         for &(name, n, k, epi) in &SITES {
             for cfg in parse_cfgs(args, epi) {
-                let mut line = format!("{name:>4} N={n:<5} K={k:<5} {:?}", (cfg.bm, cfg.bn, cfg.bk, cfg.wm, cfg.wn, cfg.direct, cfg.acc16_probe, cfg.stages));
+                let mut line = format!("{name:>4} N={n:<5} K={k:<5} {:?}", (cfg.bm, cfg.bn, cfg.bk, cfg.wm, cfg.wn, cfg.direct, cfg.acc16_probe, cfg.stages, cfg.acc16));
                 for &m in &MS {
                     match bench::mm_time(cfg, m, k, n) {
                         Some(s) => line += &format!("  M{m} {:.2}ms {:.1}TF", s * 1e3, tflops(m, n, k, s)),
@@ -198,7 +204,7 @@ mod imp {
                 println!(
                     "{name:>4} K={k:<5} {:?} {:?}: rel {:.2e}  maxabs {:.2e}  (ref rms {:.3})",
                     epi,
-                    (cfg.bm, cfg.bn, cfg.bk, cfg.wm, cfg.wn, cfg.direct),
+                    (cfg.bm, cfg.bn, cfg.bk, cfg.wm, cfg.wn, cfg.direct, cfg.acc16),
                     (e2 / r2).sqrt(),
                     mx,
                     (r2 / (rows.len() * ncol) as f64).sqrt()

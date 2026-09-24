@@ -42,6 +42,12 @@ fn main() {
     let mut enc = cortiq_engine::qwen3te::Qwen3Encoder::from_cmf(&model).unwrap();
     // `ZC_TE_EXACT=1`: the weight-only exact q8 kernel (the pipeline's).
     enc.set_exact_q8(std::env::var("ZC_TE_EXACT").as_deref() == Ok("1"));
+    // `ZC_TE_DEV=all|q,k,v,o,gate,up,down`: those projections through the
+    // device GEMM of their codec (needs `ZC_TE_GPU=1`), the rest on the
+    // host arm chosen above.
+    if let Ok(spec) = std::env::var("ZC_TE_DEV") {
+        enc.set_device_ops(&spec);
+    }
     println!("load {:.3} s", t.elapsed().as_secs_f64());
     for k in keys.split(',') {
         let o = read_st(&format!("{}/te_{k}_fp32.safetensors", a[2]));

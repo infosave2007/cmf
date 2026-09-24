@@ -67,16 +67,82 @@ fn main() {
         };
         let mut np = dit.prepare(&ncap, ZShape::new(hh, ww, nids.len()), 2, None).unwrap();
         let tok_a = dit.tokens(&xa, &shape);
+        // `ZC_TAPS=<dir>`: every block's residual stream of the three
+        // forwards (single pos, single neg, pair) into <dir>/{pos,neg,pair},
+        // then compared block by block (the pair's item rows vs the single).
+        let taps = std::env::var("ZC_TAPS").ok();
+        let set_taps = |sub: &str| {
+            if let Some(d) = &taps {
+                unsafe { std::env::set_var("CMF_ZI_TAPS", format!("{d}/{sub}")) };
+            }
+        };
+        set_taps("pos");
         let vp = dit.step(&prep, i, &tok_a, &mods, &fs);
+        set_taps("neg");
         let vn = dit.step(&np, i, &tok_a, &mods, &fs);
+        unsafe { std::env::remove_var("CMF_ZI_TAPS") };
         np.device = false;
         let vn_cpu = dit.step(&np, i, &tok_a, &mods, &fs);
-        let ok = dit.attach_device_pair(&prep, &np, 3, None);
-        println!("pair prepared: {ok}  (neg L = {})", nids.len());
-        if let Some((pp, pn)) = dit.step_pair_device(3, shape.n_img, i, &tok_a, &mods, &fs) {
+        np.device = true;
+        // `ZC_SWAP=1`: the pair as (neg, pos) — tells a positional cause
+        // (item 0 vs item 1) from a content one (the caption length).
+        let swap = std::env::var("ZC_SWAP").as_deref() == Ok("1");
+        let (first, second) = if swap { (&np, &prep) } else { (&prep, &np) };
+        let ok = dit.attach_device_pair(first, second, 3, None);
+        println!(
+            "pair prepared: {ok}  (pos L = {}, neg L = {}, n_img_p {}, order {})",
+            ids.len(),
+            nids.len(),
+            shape.n_img_p,
+            if swap { "neg,pos" } else { "pos,neg" }
+        );
+        set_taps("pair");
+        if let Some((p0, p1)) = dit.step_pair_device(3, shape.n_img, i, &tok_a, &mods, &fs) {
+            let (pp, pn) = if swap { (p1, p0) } else { (p0, p1) };
             let nan = pp.iter().chain(&pn).filter(|v| !v.is_finite()).count();
             println!("pair vs singles: pos {:.3e}  neg {:.3e}  non-finite {nan}   single neg dev vs cpu {:.3e}",
                 rel(&pp, &vp), rel(&pn, &vn), rel(&vn, &vn_cpu));
+        }
+        unsafe { std::env::remove_var("CMF_ZI_TAPS") };
+        if let Some(d) = &taps {
+            // Row layout of the pair: image stage [item][n_img_p]; joint
+            // stage [item0: n_img_p + cp0][item1: n_img_p + cp1].
+            let h = dit.cfg.dim;
+            let cp = |l: usize| l.div_ceil(32) * 32;
+            let (cp_pos, cp_neg) = (cp(ids.len()), cp(nids.len()));
+            let (cp0, cp1) = if swap { (cp_neg, cp_pos) } else { (cp_pos, cp_neg) };
+            let nip = shape.n_img_p;
+            let rd = |p: String| -> Option<Vec<f32>> {
+                std::fs::read(&p).ok().map(|b| b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+            };
+            let mut names: Vec<String> = (0..2).map(|k| format!("nr{k}_out")).collect();
+            names.extend((0..dit.cfg.n_layers).map(|k| format!("l{k}_out")));
+            for n in names {
+                let (Some(sp), Some(sn), Some(pr)) = (
+                    rd(format!("{d}/pos/step{i}/{n}.f32")),
+                    rd(format!("{d}/neg/step{i}/{n}.f32")),
+                    rd(format!("{d}/pair/step{i}/{n}.f32")),
+                ) else {
+                    continue;
+                };
+                let (r0, r1) = if n.starts_with("nr") {
+                    ((0, nip), (nip, nip))
+                } else {
+                    ((0, nip + cp0), (nip + cp0, nip + cp1))
+                };
+                let item = |r: (usize, usize)| &pr[r.0 * h..(r.0 + r.1) * h];
+                let (ip, ineg) = if swap { (item(r1), item(r0)) } else { (item(r0), item(r1)) };
+                // image rows and caption rows separately
+                let split = |v: &[f32]| (v[..nip * h].to_vec(), v[nip * h..].to_vec());
+                let (pi, pc) = split(ip);
+                let (spi, spc) = split(&sp[..ip.len().min(sp.len())]);
+                println!(
+                    "{n:9} pos: img {:.3e} cap {:.3e}   neg: all {:.3e}",
+                    rel(&pi, &spi),
+                    if pc.is_empty() { 0.0 } else { rel(&pc, &spc) },
+                    rel(ineg, &sn[..ineg.len().min(sn.len())])
+                );
+            }
         }
         return;
     }
