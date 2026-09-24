@@ -1773,6 +1773,45 @@ impl Pipeline {
             return start;
         }
 
+        // Plain dense decode (every item a device-attended full-attention
+        // layer with a dense FFN, no O(1) state): the only plan shape the
+        // masked-nibble q4tp matvec and the concurrent layer encoder were
+        // measured on (MiniCPM5-2B, Qwen3-0.6B on the M4). Hybrids, MoE and
+        // o1 layers keep the historical serial path bit for bit.
+        // Every projection must be ONE dispatch (q1t adds an overlay pass,
+        // Prism q2tp a transform pass — dependent pairs a concurrent
+        // encoder would race).
+        let one_pass = |t: (usize, usize, usize)| {
+            use cortiq_core::TensorDtype as D;
+            matches!(
+                model.tensors[t.0].dtype,
+                D::Q4TiledP | D::Q4Tiled | D::Q4Block | D::Q8Row | D::Q8_2f | D::Q1
+            )
+        };
+        let dense_fast = plan.iter().all(|it| match it {
+            Item::Attn {
+                l, li, full_gpu, ..
+            } => {
+                *full_gpu
+                    && self.kv_cache.layers[*li].o1.is_none()
+                    && [l.wq, l.wk, l.wv, l.wo].into_iter().all(one_pass)
+                    && match l.ffn {
+                        MetalFfn::Dense { gate, up, down } => {
+                            one_pass(gate) && one_pass(up) && one_pass(down)
+                        }
+                        _ => false,
+                    }
+            }
+            Item::Gdn { .. } => false,
+        });
+        let ab = crate::gpu_metal::dense_ab_arm().filter(|_| dense_fast);
+        let (mv_on, conc_on) = match ab {
+            Some((m, c, _)) => (m, c),
+            None => (dense_fast, dense_fast),
+        };
+        let _mv_fast = crate::gpu_metal::MvFastGuard::set(mv_on);
+        graph.set_dense_concurrent(conc_on);
+
         let inv_freq = self.inv_freq.clone();
         let pool = self.pool.clone();
         let (nh, nkv, hd, hs, rd, eps) = (
@@ -2163,6 +2202,9 @@ impl Pipeline {
             }
             attention::recycle_buf(&mut krow);
             attention::recycle_buf(&mut vrow);
+        }
+        if let Some((_, _, arm)) = ab {
+            crate::gpu_metal::dense_ab_record(arm, _mt0.elapsed());
         }
         end
     }

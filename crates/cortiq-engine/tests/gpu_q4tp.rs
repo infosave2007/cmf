@@ -168,6 +168,54 @@ fn metal_q4tp_matvec_matches_dequant_reference() {
     check("metal-mv", cortiq_engine::gpu_metal::q4tp_matvec_for_test);
 }
 
+/// The masked-nibble decode kernel (`q4tp_matvec_m`, what the plain dense
+/// token graph encodes under `MvFastGuard`) against the scalar dequant: its
+/// "-8" folds into -8·Σx per group and x is pre-scaled by 16^-k, so a slip in
+/// either shows as a per-group bias, not as noise. Ragged shapes on both
+/// axes: a row tail inside a simdgroup and group counts that are not a
+/// multiple of the 32 lanes.
+#[cfg(target_os = "macos")]
+#[test]
+fn metal_q4tp_matvec_masked_matches_dequant_reference() {
+    let _gpu = gpu_serial();
+    unsafe { std::env::set_var("CMF_GPU", "1") };
+    assert!(
+        cortiq_engine::gpu_metal::enabled(),
+        "Metal did not initialize — check the MSL compile log above"
+    );
+    let _fast = cortiq_engine::gpu_metal::MvFastGuard::set(true);
+    let mut built = Vec::new();
+    for (rows, cols) in [(512usize, 1024usize), (203, 2048), (37, 96)] {
+        let payload = synth(rows, cols);
+        let mut w = vec![0f32; rows * cols];
+        dequant_q4tp(&payload, rows, cols, &mut w);
+        let (model, idx) = tiny_model(&format!("metal-mvm-{rows}-{cols}"), rows, cols, payload);
+        built.push((rows, cols, w, model, idx));
+    }
+    for (rows, cols, w, model, idx) in &built {
+        let (rows, cols, idx) = (*rows, *cols, *idx);
+        // Non-zero mean on purpose: the folded offset is -8·Σx, which a
+        // zero-mean x would hide.
+        let xs: Vec<f32> = (0..cols)
+            .map(|i| ((i * 37 + 11) % 101) as f32 / 101.0 - 0.3)
+            .collect();
+        let mut got = vec![0f32; rows];
+        assert!(
+            cortiq_engine::gpu_metal::q4tp_matvec_for_test(model, idx, &xs, rows, cols, &mut got),
+            "GPU refused a well-formed q4tp tensor ({rows}x{cols})"
+        );
+        for r in 0..rows {
+            let want: f32 = (0..cols).map(|c| w[r * cols + c] * xs[c]).sum();
+            let mag: f32 = (0..cols).map(|c| (w[r * cols + c] * xs[c]).abs()).sum();
+            assert!(
+                (got[r] - want).abs() <= 1e-5 * mag,
+                "{rows}x{cols} row {r}: GPU {} vs dequant {want}",
+                got[r]
+            );
+        }
+    }
+}
+
 /// wgpu covers Vulkan/DX12; `CMF_GPU=wgpu` selects it on macOS too, so this
 /// runs locally instead of only on the machines that have no other backend.
 #[cfg(feature = "gpu")]
