@@ -26641,6 +26641,109 @@ pub fn kv_mirror_set_stored(kv_id: u64, layer: usize, stored: usize) -> bool {
     true
 }
 
+/// Rows one exact-attention mirror holds (its logical cursor), or None when
+/// this pipeline has no mirror for the layer.
+pub fn kv_mirror_stored(kv_id: u64, layer: usize) -> Option<usize> {
+    let c = ctx()?;
+    c.attn_kv.lock().unwrap().get(&(kv_id, layer)).map(|m| m.synced)
+}
+
+/// Does the token graph hold a recurrent (GDN ring+S / short-conv ring)
+/// state for this layer? Such a state has advanced on the device past the
+/// host's `linear_state`.
+pub fn graph_state_resident(kv_id: u64, layer: usize) -> bool {
+    ctx().is_some_and(|c| c.gdn_state.lock().unwrap().contains_key(&(kv_id, layer)))
+}
+
+/// Read rows back from several exact-attention mirrors in ONE submit: for
+/// each `(layer, from, to)` the K and V rows `[from..to)`, position-major
+/// (`[(to − from) × nkv × hd]` each) — the layout `LayerKvCache::append`
+/// takes one position of. None when any mirror does not hold its rows or
+/// the geometry does not match its buffers.
+pub fn kv_mirror_read_rows(
+    kv_id: u64,
+    reqs: &[(usize, usize, usize)],
+    nkv: usize,
+    hd: usize,
+) -> Option<Vec<(Vec<f32>, Vec<f32>)>> {
+    let c = ctx()?;
+    let row_bytes = (hd * 4) as u64;
+    let mut srcs = Vec::with_capacity(reqs.len());
+    {
+        let mirrors = c.attn_kv.lock().unwrap();
+        for &(layer, from, to) in reqs {
+            let m = mirrors.get(&(kv_id, layer))?;
+            if to < from || m.synced < to || m.cap < to {
+                return None;
+            }
+            let need = (nkv * m.cap) as u64 * row_bytes;
+            if m.k.size() < need || m.v.size() < need {
+                return None;
+            }
+            srcs.push((m.k.clone(), m.v.clone(), m.cap, from, to - from));
+        }
+    }
+    // Staging layout: per request [K heads | V heads], each head n rows.
+    let mut offs = Vec::with_capacity(srcs.len());
+    let mut total = 0u64;
+    for &(_, _, _, _, n) in &srcs {
+        offs.push(total);
+        total += 2 * nkv as u64 * n as u64 * row_bytes;
+    }
+    if total == 0 {
+        return Some(srcs.iter().map(|_| (Vec::new(), Vec::new())).collect());
+    }
+    let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("kv-mirror-pull"),
+        size: total,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("kv-mirror-pull"),
+        });
+    flush_pass(&enc);
+    for ((kb, vb, cap, from, n), &off) in srcs.iter().zip(&offs) {
+        if *n == 0 {
+            continue;
+        }
+        let per = *n as u64 * row_bytes;
+        for h in 0..nkv {
+            let src = (h * cap + from) as u64 * row_bytes;
+            enc.copy_buffer_to_buffer(kb, src, &stage, off + h as u64 * per, per);
+            enc.copy_buffer_to_buffer(vb, src, &stage, off + (nkv + h) as u64 * per, per);
+        }
+    }
+    submit(c, finish_enc(enc));
+    let slice = stage.slice(..total);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    c.device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
+    let data = slice.get_mapped_range().ok()?;
+    let all: &[f32] = bytemuck::cast_slice(&data);
+    let mut out = Vec::with_capacity(srcs.len());
+    for (&(_, _, _, _, n), &off) in srcs.iter().zip(&offs) {
+        let base = (off / 4) as usize;
+        // [K | V] × [head][pos][hd] → [pos][head][hd]
+        let mut k = vec![0.0f32; n * nkv * hd];
+        let mut v = vec![0.0f32; n * nkv * hd];
+        for h in 0..nkv {
+            for p in 0..n {
+                let d = (p * nkv + h) * hd;
+                let s = base + (h * n + p) * hd;
+                k[d..d + hd].copy_from_slice(&all[s..s + hd]);
+                let s = base + ((nkv + h) * n + p) * hd;
+                v[d..d + hd].copy_from_slice(&all[s..s + hd]);
+            }
+        }
+        out.push((k, v));
+    }
+    drop(data);
+    stage.unmap();
+    Some(out)
+}
+
 /// GDN depthwise conv step (bring-up / parity): updates cq [cdim] and shifts
 /// the ring [(kk-1)·cdim] in place.
 pub fn gdn_conv_gpu(
