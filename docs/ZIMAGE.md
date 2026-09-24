@@ -46,6 +46,9 @@ Environment variables:
 | `CMF_ZIMAGE_TE_EXACT=0` | the text encoder's q8 projections through the default int8-activation kernel (3.3× less accurate, see below) |
 | `CMF_ZIMAGE_OVERLAP=0` | uploads the device weights after the text encoder instead of beside it |
 | `CMF_ZI_AMAX=1` | prints the per-block f16 maxima of the device chain |
+| `CMF_ZI_ACC16=N` | the DiT GEMMs accumulate in f16, flushed into f32 every N K slices (`qkv=N,o=N,w13=N,w2=N` per site; `CMF_ZI_TILE16` sets its tile). Off by default: slower and less precise, see "f16 accumulation" below |
+| `CMF_ZIMAGE_TE_DEV=all\|q,k,v,o,gate,up,down` | those text-encoder projections through the device GEMM of their codec, the rest exact on the host (experiment; see "Text encoder on the device") |
+| `CMF_TE_TAPS=<dir>` | dumps the text encoder's residual after every layer and each layer's intermediates |
 
 ## Where it runs
 
@@ -159,7 +162,7 @@ the outputs.
 |---|---|
 | one DiT forward on the oracle inputs, device vs the CPU path on the same container (Turbo r512 i0 / i5, r1024 i0) | `v` rel 8.8e-4 / 5.7e-4 / 1.7e-3 |
 | the same, base (r512 c3 i0 / i2) | 3.0e-4 / 1.8e-4 |
-| CFG pair (one batch-2 forward) against the two items stepped one by one (base r512 i0) | cond 2.2e-4, uncond 0 (bit-identical); uncond single vs CPU 1.7e-4 |
+| CFG pair (one batch-2 forward) against the two items stepped one by one (base r512 i0, either order) | both 0 (bit-identical, every block); single vs CPU 1.7e-4. Earlier builds put the first item 2.2e-4 off (see "CFG pair" below) |
 | VAE on the oracle latent (r512, r400x592, r1024) | `img` rel 1.4e-4 to 1.6e-4, u8 PSNR 69.3 to 69.9 dB vs the fp32 decoder |
 | Turbo 512², whole CLI run, device vs the CPU pipeline (same file, same exact text encoder), p0 / p1 | `v_0` 8.9e-4 / 1.1e-3, `lat_8` 8.8e-3 / 1.9e-2, PNG PSNR 53.4 / 45.5 dB |
 | Turbo, 6 seeds 512², device vs the CPU pipeline, both with the older int8-activation text encoder | PSNR median 52.8 dB, min 49.1 dB |
@@ -171,6 +174,75 @@ Turbo's trajectory is chaotic in the first steps: a 1.4e-4 change of
 `lat_1` moves `v_1` by 3.5e-2 on the same program, and diffusers bf16 itself
 ends at `lat_8` rel 0.23 from fp32 on p0. Per-step error is therefore
 checked on identical inputs (first rows above), and whole images over seeds.
+
+### CFG pair
+
+The flash kernel rescales its running softmax lazily, and the decision is
+taken for the whole workgroup (64 queries). When a segment's length is not a
+multiple of 64, its last query block also holds rows past its end: the next
+CFG item's rows in a batch-2 program, pad rows in a batch-1 one. Those rows
+used to vote, so the first item of a pair was re-anchored differently from
+its own single forward. That is exact in real arithmetic but rounds P to f16
+differently, and it put the first item 2.2e-4 off (in either order it was
+always the first item). Now only rows inside the segment vote. The pair
+matches both singles bit for bit, block by block. Turbo outputs are
+unchanged bit for bit, because its pad query rows are zero and never
+outvote. Base images move by rounding only. Over 28 CFG steps at 1024² that
+is 33 to 47 dB between the two builds on the four card prompts. Quality is
+unchanged: base 1024² p0 (negative prompt, oracle noise) scores 26.58 dB
+before and 26.64 dB after, both against diffusers bf16.
+
+### f16 accumulation (measured, off)
+
+The DiT GEMMs can accumulate in f16 (`CMF_ZI_ACC16`), which runs at twice
+the matrix-unit rate, flushing into the f32 accumulators every N K slices.
+WGSL has no conversion between cooperative-matrix types, so each flush
+stores the f16 fragment, reloads it as an A operand and multiplies it by
+the identity into the f32 accumulator. That step is exact, but it costs one
+f32 MMA and 1 KB of shared traffic per fragment per flush. On the 3090 this
+arm loses on both counts:
+
+| | f32 accumulate (default) | f16, flushed every slice |
+|---|---|---|
+| GEMM, the four sites, M 1056–8448 | 51–61 TF | 41–48 TF (best tile 128×64×64); 25–40 TF flushing every 2–4 slices |
+| GEMM rel vs f64, f32 epilogue (K 3840 / 10240) | 6.2e-6 / 1.6e-5 | 3.3e-4 to 8.5e-4 (grows with the flush period) |
+| GEMM rel vs f64, f16 epilogues | 2.1e-4 (the output rounding) | 3.9e-4 to 1.2e-3 |
+| median step, Turbo 512² / 1024² | 0.256 / 1.039 s | 0.308 / 1.224 s |
+| median step, base 512² / 1024² | 0.486 / 2.030 s | 0.585 / 2.417 s |
+| Turbo 512² p0 / p1 vs the CPU pipeline | 53.4 / 45.5 dB, `v_0` 8.9e-4 / 1.1e-3 | 46.3 / 45.6 dB, `v_0` 1.3e-3 / 1.5e-3 |
+| Turbo 512² p0 / p1 vs fp32 | 26.11 / 26.08 dB | 26.10 / 25.97 dB |
+
+The tensor core rounds the f16 accumulator after every 16-deep MMA. The
+error therefore has a floor of one rounding per MMA, and a model of that
+rounding in numpy predicts the measured numbers. No flush schedule meets
+the f16-epilogue gate (2e-4), and every schedule is slower than f32.
+
+### Text encoder on the device
+
+The text encoder runs on the CPU. Before this was measured, the per-op
+device arm (`CMF_ZIMAGE_TE_GPU=1`) was said to move the caption and `v_0`
+by 3–7 %. That movement does not come from the device. With per-layer taps
+(`CMF_TE_TAPS`, `zimage_techeck` with `ZC_TE_DEV`) and a whole Turbo 512²
+run per arm on the oracle noise (`v_0` against the CPU pipeline), three
+causes show up:
+
+| cause | effect | status |
+|---|---|---|
+| the host int8-activation (a8w8) kernel, which the old arm used whenever the probe picked the CPU and for every projection below the device size gate (k and v at 22 tokens) | residual 1.9e-2 at layer 0; `v_0` 1.0e-1 / 4.4e-2 (p0 / p1), PSNR 20.2 / 29.0 dB | the pipeline uses the exact weight-only kernel (the default since B2) |
+| layer 6's `down_proj`, kept bf16 (F32 in memory), sent through the device's cooperative f32 GEMM, which is tf32-class | residual 2.2e-4 from layer 6 on, the massive-activation layer; `v_0` 1.4e-3 against 8.9e-4 (p0) | fixed: the exact mode keeps F32 projections on the host f32 GEMM |
+| the q8 matrix-unit arm (at 64 tokens and more: f16 activations, scaled down when their largest magnitude exceeds 1000, times an f16 plane) | residual 2.8e-4 at layer 0 (p1, 67 tokens) | documented; `CMF_Q8_COOP=0` selects the f32-activation scalar arm |
+
+RMSNorm eps and RoPE are not causes. Both run on the host in every arm,
+and the taps (q after RoPE, attention output) are bit-identical between
+arms until the first device GEMM. With the F32 fix and the scalar arms,
+device projections plus exact host fallback (`CMF_ZIMAGE_TE_DEV=all
+CMF_Q8_COOP=0`) put the residual within 3.1e-6 of the exact CPU encoder
+at every layer. `v_0` is then 8.3e-4 / 1.3e-3 against the CPU pipeline,
+where the exact CPU encoder gives 8.9e-4 / 1.1e-3, so both sit at the
+DiT's own device-vs-CPU floor. Even so, it takes 3.6–5.1 s against
+0.5–1.7 s on the host, because each projection is a synchronous upload,
+dispatch and readback. A future device encoder therefore needs a resident
+chain like the DiT's, not the per-op path.
 
 ## Speed (RTX 3090, driver 610.43, in-process timers)
 
