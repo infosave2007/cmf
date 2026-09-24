@@ -1371,6 +1371,42 @@ mod tests {
         }
     }
 
+    /// The measured costs on MiMo-V2.6-Flash q4tp: without a device graph
+    /// for its layers every ladder budget places the experts in the bank
+    /// (a per-op whole-layer prefix pays the same fences as a bank layer and
+    /// streams the rest from RAM); `cargo test -- --nocapture` prints the
+    /// predictions with and without a graph prefix.
+    #[test]
+    fn ladder_choices_for_mimo() {
+        let c = Costs::measured();
+        for mb in [16_000u64, 24_000, 48_000, 80_000, 93_791] {
+            let budget = mb * 1024 * 1024;
+            let no_graph = place(&mimo(budget, false), &c, None);
+            let graph = place(&mimo(budget, true), &c, None);
+            println!(
+                "{mb} MB: no graph → {:?} P={} bank {} ({:.1} ms); graph → {:?} P={} bank {} ({:.1} ms)",
+                no_graph.mode,
+                no_graph.prefix_layers,
+                no_graph.bank_slots,
+                no_graph.predicted_s * 1e3,
+                graph.mode,
+                graph.prefix_layers,
+                graph.bank_slots,
+                graph.predicted_s * 1e3,
+            );
+            assert_eq!(no_graph.mode, MoeMode::Dynamic, "{mb} MB: {}", no_graph.reason);
+            assert!(graph.predicted_s <= no_graph.predicted_s + 1e-12);
+        }
+    }
+
+    #[test]
+    fn default_min_seen_follows_bank_size() {
+        assert_eq!(default_min_seen(142), 2);
+        assert_eq!(default_min_seen(48), 2);
+        assert_eq!(default_min_seen(47), 3);
+        assert_eq!(default_min_seen(13), 3);
+    }
+
     #[test]
     fn a_budget_below_the_non_expert_weights_leaves_no_bank() {
         let inp = mimo(4 * GB, false);
