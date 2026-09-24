@@ -356,6 +356,14 @@ enum Commands {
         /// Permanent exact sink keys for the --o1 hint (validated default 4)
         #[arg(long)]
         o1_sink: Option<usize>,
+        /// MiMo-V2 only: write JUST the multi-token-prediction draft layers
+        /// (model_mtp.safetensors, `num_nextn_predict_layers` of them) as the
+        /// sidecar `<stem>.mtp.cmf` beside --output — the file the runtime
+        /// loads automatically for speculative decoding. The main file is
+        /// not read or rewritten. Matrices at --quant (default q8_2f, the
+        /// skeleton policy), norms and sinks f32.
+        #[arg(long)]
+        mtp_sidecar: bool,
     },
     /// Rewrite a container tightly: reclaim dead directory/header tails
     /// left by append-only skill growth (spec §9). Streams from mmap.
@@ -1998,7 +2006,22 @@ async fn main() -> anyhow::Result<()> {
             o1_m,
             o1_window,
             o1_sink,
+            mtp_sidecar,
         } => {
+            if mtp_sidecar {
+                let q = match quant.as_deref() {
+                    None => "q8_2f",
+                    Some(q) if q.eq_ignore_ascii_case(convert::AUTO_QUANT) => "q8_2f",
+                    Some(q) => q,
+                };
+                let path = convert::write_mimo_mtp_sidecar(
+                    std::path::Path::new(&model),
+                    std::path::Path::new(&output),
+                    q,
+                )?;
+                println!("✓ wrote MTP sidecar {}", path.display());
+                return Ok(());
+            }
             convert::set_vbit_mean_bits(mean_bits);
             convert::set_tensor_quant_overrides(&tensor_quant)?;
             // --o1: record the runtime hint in header provenance; the
