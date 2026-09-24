@@ -332,6 +332,12 @@ pub fn gemm_nt(
     gemm_nt_cpu(x, w, y, n, k, m, pool)
 }
 
+/// `gemm_nt` on the host, whatever the device state (the plain f32 GEMM;
+/// the device arm of `gemm_nt` is tf32-class on NVIDIA).
+pub(crate) fn gemm_nt_host(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: usize, pool: Option<&Pool>) {
+    gemm_nt_cpu(x, w, y, n, k, m, pool)
+}
+
 fn gemm_nt_cpu(
     x: &[f32],
     w: &[f32],
