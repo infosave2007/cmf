@@ -4,7 +4,7 @@
 //!   CMF_MIMO_VIS_FX   fixture dir written by `mimo_vis_ref.py fixtures` (+ `vit`)
 //!   CMF_MIMO_VIS_TOK  dir with tokenizer.json + chat_template.jinja (prompt ids)
 //!   CMF_MIMO_VIS_CMF  exact tower (BF16/F16 `visual.*` + mm.config_json)
-//!   CMF_MIMO_VIS_Q4   the same tower at q4tp (G4.1)
+//!   CMF_MIMO_VIS_Q4   the same tower quantized (q4tp for G4.1; any codec compares)
 //!   CMF_MIMO_VIS_EXTRA_IMAGES  optional comma list of extra images for G4.1
 //! The toy tower is `$CMF_MIMO_VIS_FX/toy.cmf` (packed by the
 //! `mimo_vis_devpack` example from the oracle's toy.safetensors).
@@ -524,7 +524,7 @@ fn g4_1_q4tp_tower_tracks_exact() {
             print_worst_rows(&b, &a, 4096, input.grid_w / 2);
         }
         println!(
-            "G4.1 {} ({}x{} → {} tokens): q4tp vs exact row cos mean {cm:.5} min {cmin:.5} (q4tp forward {dt:.2} s) [{}]",
+            "G4.1 {} ({}x{} → {} tokens): quantized vs exact row cos mean {cm:.5} min {cmin:.5} (quantized forward {dt:.2} s) [{}]",
             p.file_name().unwrap().to_string_lossy(),
             frame.width,
             frame.height,

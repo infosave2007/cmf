@@ -19,6 +19,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Without `--quant`, a MiMo-V2 checkpoint converts to q4tp experts with the
   attention, dense layer 0, embedding and lm_head at q8_2f. Other models
   still default to q8.
+- Engine: the MiMo-V2.6 vision tower and its inputs (`mimo_vision`), not yet
+  wired to the CLI or the server. Images follow the upstream processor:
+  smart resize to multiples of 32 (up to 8,388,608 pixels by default),
+  bilinear resize on 0..255, ImageNet mean/std, two identical frames per
+  image. Video comes from a directory of frames with a given frame rate, or
+  from a Y4M file; frame count, frame choice, the per-frame pixel budget and
+  the `MM:SS` labels match the processor. The prompt's image, video and
+  audio placeholders expand to the processor's token layout. The ViT runs on
+  the CPU, or with the full-attention blocks on the GPU; the windowed blocks
+  run on the CPU. Against the HF module in fp32 the output differs by at most
+  6e-5 of the largest value (CPU and Vulkan with `CMF_COOP=0`). Image loading
+  from a request (`load_image_bytes`) moved to a shared `media` module and
+  accepts `file://`.
 
 ## [0.7.6] - 2026-09-24
 
