@@ -1,5 +1,5 @@
 """diffusers ZImageTransformer2DModel forward time on MPS (bf16), the Mac baseline for WP3.
-usage: zm_mps.py <transformer dir> <res,res> [reps]"""
+usage: zimage_mps_bench.py <transformer dir> <res,res> [reps]"""
 import sys
 import time
 
