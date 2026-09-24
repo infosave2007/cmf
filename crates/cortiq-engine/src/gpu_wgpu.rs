@@ -16574,6 +16574,7 @@ fn ctx_for(dev: usize) -> Option<&'static Ctx> {
 /// inference but leaves that worker observing half-destroyed state at exit.
 /// The caller must invoke this only after all model work has stopped.
 pub fn shutdown() {
+    crate::mimo_moe::shutdown_banks();
     let Some(map) = CTXS.get() else { return };
     let mut owned = Vec::new();
     {
