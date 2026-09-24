@@ -34,6 +34,8 @@ pub mod ltxte;
 pub mod ltxups;
 pub mod ltxvae;
 pub mod mimo_mm;
+pub mod media;
+pub mod mimo_vision;
 pub mod mm_ab;
 pub mod mmh3;
 pub mod mmh3ups;
