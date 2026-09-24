@@ -737,9 +737,8 @@ pub struct Dynamic {
     failed: bool,
     /// The dedicated bank kernels serve this model (decided on first use).
     fast: Option<bool>,
-    /// First and last layer with experts: a token starts at the first,
-    /// `CMF_MIMO_PROF` prints a line at the last.
-    first_moe: usize,
+    /// Last layer with experts (`CMF_MIMO_PROF` prints here). A bank
+    /// epoch starts at `dyn_from`, not the first graph-resident MoE layer.
     last_moe: usize,
     prof: bool,
     prof_mark: (std::time::Instant, Stats, [u64; 7]),
@@ -988,7 +987,7 @@ impl Slot {
                     inter,
                     hidden,
                     n_layers,
-                    layers.len(),
+                    layers.len().saturating_sub(placement.prefix_layers),
                     n_experts,
                     placement.bank_slots,
                 )
@@ -1046,7 +1045,6 @@ impl Slot {
             dyn_from,
             failed: false,
             fast: None,
-            first_moe: layers.first().map_or(0, |&(li, _)| li),
             last_moe: layers.last().map_or(0, |&(li, _)| li),
             prof: std::env::var_os("CMF_MIMO_PROF").is_some(),
             prof_mark: (std::time::Instant::now(), stats(), device_counters()),
@@ -1227,7 +1225,7 @@ impl Dynamic {
             }
         }
         let mut bank = self.bank.lock().unwrap();
-        if li == self.first_moe {
+        if li == self.dyn_from {
             bank.next_token();
         }
         let admitted0 = bank.admitted;
@@ -1250,7 +1248,9 @@ impl Dynamic {
         let cold = sel.iter().filter(|&&s| s == u32::MAX).count();
         let host_rows = || {
             crate::gpu::cpu_scope(|| {
-                crate::pipeline::moe_cold_experts_rows_cpu(&cold_jobs, xs, hidden, pool)
+                crate::qtensor::float_activations_scope(|| {
+                    crate::pipeline::moe_cold_experts_rows_cpu(&cold_jobs, xs, hidden, pool)
+                })
             })
         };
         let t_frame = std::time::Instant::now();
@@ -1318,7 +1318,7 @@ impl Dynamic {
         // frame that reads it.
         let bank_arc = self.bank.clone();
         let mut bank = bank_arc.lock().unwrap();
-        if li == self.first_moe {
+        if li == self.dyn_from {
             bank.next_token();
         }
         let admitted0 = bank.admitted;
@@ -1398,7 +1398,9 @@ impl Dynamic {
             let host = (!cold_jobs.is_empty()).then(|| {
                 s.spawn(|| {
                     crate::gpu::cpu_scope(|| {
-                        crate::pipeline::moe_cold_experts_cpu(&cold_jobs, x, pool)
+                        crate::qtensor::float_activations_scope(|| {
+                            crate::pipeline::moe_cold_experts_cpu(&cold_jobs, x, pool)
+                        })
                     })
                 })
             });
@@ -2044,6 +2046,49 @@ mod bank_tests {
                 assert_eq!(batch[r * HS..(r + 1) * HS], one, "cold row {r}");
             }
         });
+        drop(p);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn hybrid_bank_epoch_advances_at_dynamic_boundary() {
+        let _g = serial();
+        if !bank_ready() {
+            return;
+        }
+        let (dir, model, _) = write_model("hybrid-epoch");
+        let p = Pipeline::from_model(&model, SamplerConfig::default()).unwrap();
+        let mut slot = bank(&p);
+        let Slot::On(d) = &mut slot else {
+            panic!("bank unavailable")
+        };
+        // The first MoE layer (1) runs in the graph and never visits the
+        // bank. Layer 2 must still release last round's eviction pins.
+        d.dyn_from = 2;
+        d.placement.mode = MoeMode::Hybrid;
+        d.placement.prefix_layers = 1;
+        let bank = d.bank.clone();
+        let initial = bank.lock().unwrap().tok;
+        let x: Vec<f32> = (0..HS).map(|i| (i as f32 * 0.13).sin()).collect();
+        for li in [2, 3] {
+            let FfnKind::Moe(m) = &p.weights.layers[li].ffn else {
+                unreachable!()
+            };
+            let route = crate::pipeline::moe_ffn_route(m, &x, None, None);
+            assert!(slot.forward(li, m, &x, &route, None).is_some());
+            assert_eq!(bank.lock().unwrap().tok, initial + 1, "decode layer {li}");
+        }
+        let xs = [x.as_slice(), x.as_slice()].concat();
+        for li in [2, 3] {
+            let FfnKind::Moe(m) = &p.weights.layers[li].ffn else {
+                unreachable!()
+            };
+            let routes: Vec<_> = xs.chunks_exact(HS)
+                .map(|row| crate::pipeline::moe_ffn_route(m, row, None, None))
+                .collect();
+            assert!(slot.forward_rows(li, m, &xs, &routes, None).is_some());
+            assert_eq!(bank.lock().unwrap().tok, initial + 2, "verify layer {li}");
+        }
         drop(p);
         std::fs::remove_dir_all(dir).unwrap();
     }
