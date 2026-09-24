@@ -223,7 +223,7 @@ the CPU through Accelerate, the per-conv VAE).
 | model, size | total | text encoder | prepare | steps (median step) | VAE | peak RSS / footprint |
 |---|---|---|---|---|---|---|
 | Turbo 512² | 35.5 s (before 81.6 s) | 0.69 s | 0.24 s | 33.5 s (4.21 s; CPU 9.69 s) | 1.03 s (before 3.28 s) | 5.4 / 2.2 GB |
-| Turbo 1024² | 171–173 s (before ≈ 370 s) | 0.68 s | 0.24 s | 166 s (20.9 s; CPU 44.2 s) | 4.6 s | 5.4 / 4.3 GB |
+| Turbo 1024² | 171–173 s (before 371.5 s) | 0.68 s | 0.24 s | 166 s (20.9 s; CPU 44.0 s) | 4.6 s (before 13.5 s) | 5.4 / 4.3 GB (before 13.3 / 17.5 GB) |
 | base 512² | 251 s (before ≈ 548 s, derived) | 1.29 s | 0.42 s | 248 s (8.85 s, CFG pair; CPU 19.4 s) | 1.16 s | 5.4 / 2.0 GB |
 | base 1024² | 1277 s (before ≈ 2490 s, derived) | 1.28 s | 0.42 s | 1270 s (45.9 s, CFG pair; CPU ≈ 88 s) | 4.75 s | 5.4 / 4.5 GB |
 
