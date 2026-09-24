@@ -12567,9 +12567,10 @@ mod tests {
                 release_last.wait();
             }));
             first.join().unwrap();
-            assert_eq!(active.load(Ordering::Acquire), 1, "second request must remain exact");
+            let after_first = active.load(Ordering::Acquire);
             release_last.wait();
             last.join().unwrap();
+            assert_eq!(after_first, 1, "second request must remain exact");
         });
         assert_eq!(active.load(Ordering::Acquire), 0);
         let panic = std::panic::catch_unwind(|| {
