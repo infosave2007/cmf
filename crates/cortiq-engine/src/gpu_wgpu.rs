@@ -20,6 +20,9 @@ use wgpu::util::DeviceExt;
 // Z-Image-Turbo device path (plan WP2) — child module, `gpu_wgpu/zimage.rs`.
 #[doc(hidden)]
 pub mod zimage;
+// MiMo-V2 expert-bank frame — child module, `gpu_wgpu/mimo_bank.rs`.
+#[doc(hidden)]
+pub mod mimo_bank;
 
 /// Workgroup limit per dimension (WebGPU minimum; lm_head has more
 /// rows — we use grid-stride in the shader).
@@ -15758,6 +15761,14 @@ struct Ctx {
     dsv4_global_gu_s16: Option<wgpu::ComputePipeline>,
     dsv4_global_gu_q2_s16: Option<wgpu::ComputePipeline>,
     dsv4_global_dn_s16: Option<wgpu::ComputePipeline>,
+    /// The adapter's limits admit S16; a caller that needs more than S8's
+    /// capacity (MiMo-V2's bank) builds the family on first use.
+    dsv4_global_s16_capable: bool,
+    dsv4_global_s16_lazy: std::sync::OnceLock<(
+        Option<wgpu::ComputePipeline>,
+        Option<wgpu::ComputePipeline>,
+        Option<wgpu::ComputePipeline>,
+    )>,
     moe_down_q4tp_b2: wgpu::ComputePipeline,
     moe_down_q4tp_part: wgpu::ComputePipeline,
     moe_down_q4tp_b4: wgpu::ComputePipeline,
@@ -17568,120 +17579,8 @@ fn init(dev: usize) -> Result<Ctx, String> {
     // remains the default used by every model; S16 is constructed only for an
     // explicitly opted-in V4.1 profile on adapters whose binding-array limits
     // cover the complete six-binding gate/up group and two-bank shader.
-    let make_global = |segments: usize| {
-        let source = dsv4_global_moe_shader_source(segments)
-            .expect("global MoE shader geometry must be one of the supported sizes");
-        let suffix = if segments == DSV4_GLOBAL_MOE_SEGMENTS {
-            ""
-        } else {
-            "-s16"
-        };
-        let gm = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some(if segments == DSV4_GLOBAL_MOE_SEGMENTS {
-                "dsv4-global-moe"
-            } else {
-                "dsv4-global-moe-s16"
-            }),
-            source: wgpu::ShaderSource::Wgsl(source.into()),
-        });
-        let storage =
-            |binding: u32, read_only: bool, count: Option<u32>| wgpu::BindGroupLayoutEntry {
-                binding,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: count.and_then(std::num::NonZeroU32::new),
-            };
-        let gu0 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some(if suffix.is_empty() {
-                "dsv4-global-gu0"
-            } else {
-                "dsv4-global-gu0-s16"
-            }),
-            entries: &[
-                storage(0, true, Some(segments as u32)),
-                storage(1, true, Some(segments as u32)),
-                storage(2, true, None),
-                storage(3, true, None),
-                storage(4, false, None),
-                // V4.1 binds route weights here before the BF16 down input;
-                // generic callers still provide their mwt buffer, ignored
-                // when the BF16 flag is clear.
-                storage(5, true, None),
-            ],
-        });
-        let dn0 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some(if suffix.is_empty() {
-                "dsv4-global-dn0"
-            } else {
-                "dsv4-global-dn0-s16"
-            }),
-            entries: &[
-                storage(0, true, Some(segments as u32)),
-                storage(1, true, None),
-                storage(2, true, None),
-                storage(3, true, None),
-                storage(4, false, None),
-            ],
-        });
-        let params = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some(if suffix.is_empty() {
-                "dsv4-global-params"
-            } else {
-                "dsv4-global-params-s16"
-            }),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
-        let gu_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some(if suffix.is_empty() {
-                "dsv4-global-gu-layout"
-            } else {
-                "dsv4-global-gu-layout-s16"
-            }),
-            bind_group_layouts: &[Some(&gu0), Some(&params)],
-            immediate_size: 0,
-        });
-        let dn_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some(if suffix.is_empty() {
-                "dsv4-global-dn-layout"
-            } else {
-                "dsv4-global-dn-layout-s16"
-            }),
-            bind_group_layouts: &[Some(&dn0), Some(&params)],
-            immediate_size: 0,
-        });
-        let gp = |entry: &str| {
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some(entry),
-                layout: Some(if entry == "dsv4_global_down_q4tp" {
-                    &dn_layout
-                } else {
-                    &gu_layout
-                }),
-                module: &gm,
-                entry_point: Some(entry),
-                compilation_options: Default::default(),
-                cache: pcache.as_ref(),
-            })
-        };
-        (
-            Some(gp("dsv4_global_gate_up_q4tp")),
-            Some(gp("dsv4_global_gate_up_q2tp")),
-            Some(gp("dsv4_global_down_q4tp")),
-        )
-    };
+    let make_global =
+        |segments: usize| build_global_moe_pipelines(&device, pcache.as_ref(), segments);
     let (dsv4_global_gu, dsv4_global_gu_q2, dsv4_global_dn) = if want_bind_arrays {
         make_global(DSV4_GLOBAL_MOE_SEGMENTS)
     } else {
@@ -18113,6 +18012,8 @@ fn init(dev: usize) -> Result<Ctx, String> {
         dsv4_global_gu_s16,
         dsv4_global_gu_q2_s16,
         dsv4_global_dn_s16,
+        dsv4_global_s16_capable: s16_capable,
+        dsv4_global_s16_lazy: std::sync::OnceLock::new(),
         moe_down_q4tp_b2,
         moe_down_q4tp_part,
         moe_down_q4tp_b4,
@@ -18316,6 +18217,131 @@ fn pipeline_cache_path(info: &wgpu::AdapterInfo) -> Option<std::path::PathBuf> {
 /// Load the blob and hand it to the driver. Unsafe by wgpu's contract —
 /// the data goes straight to the driver — which the key above bounds:
 /// only this build on this driver can produce a matching file name.
+/// The segmented global MoE bank's pipeline family for one descriptor-array
+/// width (S8 or S16): gate/up (q4tp and q2tp) and down.
+fn build_global_moe_pipelines(
+    device: &wgpu::Device,
+    pcache: Option<&wgpu::PipelineCache>,
+    segments: usize,
+) -> (
+    Option<wgpu::ComputePipeline>,
+    Option<wgpu::ComputePipeline>,
+    Option<wgpu::ComputePipeline>,
+) {
+    let source = dsv4_global_moe_shader_source(segments)
+        .expect("global MoE shader geometry must be one of the supported sizes");
+    let suffix = if segments == DSV4_GLOBAL_MOE_SEGMENTS {
+        ""
+    } else {
+        "-s16"
+    };
+    let gm = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(if segments == DSV4_GLOBAL_MOE_SEGMENTS {
+            "dsv4-global-moe"
+        } else {
+            "dsv4-global-moe-s16"
+        }),
+        source: wgpu::ShaderSource::Wgsl(source.into()),
+    });
+    let storage =
+        |binding: u32, read_only: bool, count: Option<u32>| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: count.and_then(std::num::NonZeroU32::new),
+        };
+    let gu0 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some(if suffix.is_empty() {
+            "dsv4-global-gu0"
+        } else {
+            "dsv4-global-gu0-s16"
+        }),
+        entries: &[
+            storage(0, true, Some(segments as u32)),
+            storage(1, true, Some(segments as u32)),
+            storage(2, true, None),
+            storage(3, true, None),
+            storage(4, false, None),
+            // V4.1 binds route weights here before the BF16 down input;
+            // generic callers still provide their mwt buffer, ignored
+            // when the BF16 flag is clear.
+            storage(5, true, None),
+        ],
+    });
+    let dn0 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some(if suffix.is_empty() {
+            "dsv4-global-dn0"
+        } else {
+            "dsv4-global-dn0-s16"
+        }),
+        entries: &[
+            storage(0, true, Some(segments as u32)),
+            storage(1, true, None),
+            storage(2, true, None),
+            storage(3, true, None),
+            storage(4, false, None),
+        ],
+    });
+    let params = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some(if suffix.is_empty() {
+            "dsv4-global-params"
+        } else {
+            "dsv4-global-params-s16"
+        }),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+    let gu_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(if suffix.is_empty() {
+            "dsv4-global-gu-layout"
+        } else {
+            "dsv4-global-gu-layout-s16"
+        }),
+        bind_group_layouts: &[Some(&gu0), Some(&params)],
+        immediate_size: 0,
+    });
+    let dn_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(if suffix.is_empty() {
+            "dsv4-global-dn-layout"
+        } else {
+            "dsv4-global-dn-layout-s16"
+        }),
+        bind_group_layouts: &[Some(&dn0), Some(&params)],
+        immediate_size: 0,
+    });
+    let gp = |entry: &str| {
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(entry),
+            layout: Some(if entry == "dsv4_global_down_q4tp" {
+                &dn_layout
+            } else {
+                &gu_layout
+            }),
+            module: &gm,
+            entry_point: Some(entry),
+            compilation_options: Default::default(),
+            cache: pcache,
+        })
+    };
+    (
+        Some(gp("dsv4_global_gate_up_q4tp")),
+        Some(gp("dsv4_global_gate_up_q2tp")),
+        Some(gp("dsv4_global_down_q4tp")),
+    )
+}
+
 fn pipeline_cache_load(
     device: &wgpu::Device,
     info: &wgpu::AdapterInfo,
@@ -49977,7 +50003,7 @@ fn dsv4_global_moe_pipelines(
             },
             c.dsv4_global_dn.as_ref()?,
         )),
-        DSV4_GLOBAL_MOE_SEGMENTS_S16 => Some((
+        DSV4_GLOBAL_MOE_SEGMENTS_S16 if c.dsv4_global_dn_s16.is_some() => Some((
             if gu_q2 {
                 c.dsv4_global_gu_q2_s16.as_ref()?
             } else {
@@ -49985,6 +50011,13 @@ fn dsv4_global_moe_pipelines(
             },
             c.dsv4_global_dn_s16.as_ref()?,
         )),
+        DSV4_GLOBAL_MOE_SEGMENTS_S16 => {
+            let (gu, gu2, dn) = c.dsv4_global_s16_lazy.get()?;
+            Some((
+                if gu_q2 { gu2.as_ref()? } else { gu.as_ref()? },
+                dn.as_ref()?,
+            ))
+        }
         _ => None,
     }
 }
@@ -50055,6 +50088,59 @@ pub fn dsv4_global_moe_create_for_dsv41(
     dsv4_global_moe_create_with_segments(model, requested, inter, hidden, gu_q2, segments)
 }
 
+/// The S8 bank with exactly `slots` slots (rounded down to whole segments),
+/// without the workspace carve-out: for an operator-pinned slot count, whose
+/// caller has already left its own reserve. The residency budget check still
+/// applies.
+pub fn dsv4_global_moe_create_slots(
+    model: &Arc<CmfModel>,
+    slots: usize,
+    inter: usize,
+    hidden: usize,
+    gu_q2: bool,
+) -> Option<(usize, usize)> {
+    let c = ctx()?;
+    // One segment buffer is bounded by the binding range; past S8's
+    // capacity the S16 family (built here on first need) doubles it.
+    let gu_len = cortiq_core::quant::expected_nbytes(
+        if gu_q2 {
+            cortiq_core::TensorDtype::Q2TiledP
+        } else {
+            cortiq_core::TensorDtype::Q4TiledP
+        },
+        &[inter, hidden],
+    )?;
+    let d_len =
+        cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[hidden, inter])?;
+    let range = c
+        .device
+        .limits()
+        .max_storage_buffer_binding_size
+        .min(c.device.limits().max_buffer_size);
+    let per_segment = (range / gu_len.max(d_len).max(1) as u64) as usize;
+    let mut segments = DSV4_GLOBAL_MOE_SEGMENTS;
+    if slots > per_segment.saturating_mul(DSV4_GLOBAL_MOE_SEGMENTS)
+        && c.dsv4_global_s16_capable
+        && c.dsv4_global_gu_s16.is_none()
+    {
+        let built = c.dsv4_global_s16_lazy.get_or_init(|| {
+            build_global_moe_pipelines(
+                &c.device,
+                c.pipeline_cache.as_ref(),
+                DSV4_GLOBAL_MOE_SEGMENTS_S16,
+            )
+        });
+        if built.0.is_some() && built.2.is_some() {
+            segments = DSV4_GLOBAL_MOE_SEGMENTS_S16;
+        }
+    } else if slots > per_segment.saturating_mul(DSV4_GLOBAL_MOE_SEGMENTS)
+        && c.dsv4_global_gu_s16.is_some()
+    {
+        segments = DSV4_GLOBAL_MOE_SEGMENTS_S16;
+    }
+    dsv4_global_moe_create_inner(model, slots, inter, hidden, gu_q2, segments, false)
+}
+
 fn dsv4_global_moe_create_with_segments(
     model: &Arc<CmfModel>,
     requested: usize,
@@ -50062,6 +50148,18 @@ fn dsv4_global_moe_create_with_segments(
     hidden: usize,
     gu_q2: bool,
     segments: usize,
+) -> Option<(usize, usize)> {
+    dsv4_global_moe_create_inner(model, requested, inter, hidden, gu_q2, segments, true)
+}
+
+fn dsv4_global_moe_create_inner(
+    model: &Arc<CmfModel>,
+    requested: usize,
+    inter: usize,
+    hidden: usize,
+    gu_q2: bool,
+    segments: usize,
+    carve_workspace: bool,
 ) -> Option<(usize, usize)> {
     use std::sync::atomic::Ordering;
     let c = ctx()?;
@@ -50092,7 +50190,11 @@ fn dsv4_global_moe_create_with_segments(
     // KV growth and queue staging are physical VRAM too but are not counted
     // as resident weights. Reserve 2-4 GiB before rounding the logical bank.
     let gib = 1024 * 1024 * 1024u64;
-    let workspace = (c.vram_budget / 10).clamp(2 * gib, 4 * gib);
+    let workspace = if carve_workspace {
+        (c.vram_budget / 10).clamp(2 * gib, 4 * gib)
+    } else {
+        0
+    };
     let (capacity, segment_slots) = dsv4_global_moe_capacity(
         requested,
         per,
