@@ -67,6 +67,19 @@ runs on the device with no flags:
   compiles start on another helper at the beginning of the run, and the VAE
   weights upload while the steps run.
 
+On Apple silicon (Metal), the DiT and the VAE run on the GPU with no flags:
+
+- **DiT**: the int8 weights are read in place from the mapped file (no f16
+  planes: 11.6 GB would not fit beside the text encoder in the shared
+  memory, and planes measured no faster). A step is one resident chain —
+  simdgroup-matrix GEMMs that stage the int8 tile as half, flash attention,
+  fused row kernels — split into command buffers of two blocks each. CFG
+  runs the pair as one batch-2 program; the context refiner runs on the GPU.
+- **VAE**: resident decoder — NHWC half activations, implicit-GEMM convs
+  (the 2× upsample folded into the gather), two-pass GroupNorm, the mid
+  attention as GEMMs; its weights upload while the steps run.
+- **Text encoder**: on the CPU (Accelerate), beside the device setup.
+
 Other devices and backends fall back to the CPU path piece by piece.
 
 ## Pack
@@ -186,6 +199,43 @@ Ratios (cortiq / diffusers):
   (1.06×; 1.13×); base 13.8 s at 512² (0.97×; 1.03×), 57.4 s at 1024²
   (1.07×; 1.09×);
 - DiT step: 0.98× / 1.04× (Turbo 512² / 1024²), 0.97× / 1.07× (base).
+
+## Device parity (Mac mini M4, Metal)
+
+| check | result |
+|---|---|
+| one DiT forward on the oracle inputs, device vs the CPU path on the same file (Turbo r512 i0 / r1024 i0, base r512 c3 i0) | `v` rel 1.15e-3 / 8.0e-4 / 2.7e-4 |
+| the same against the fp32 oracle | 2.89e-2 / 4.28e-2 / 8.5e-3 (the CPU path itself: 2.90e-2 / 4.26e-2 / 8.6e-3) |
+| CFG pair (one batch-2 forward) against the two single forwards | bit-identical |
+| VAE on the oracle latent (r512) | `img` rel 1.6e-4, u8 PSNR 69.3 dB vs the fp32 decoder |
+| Turbo whole CLI run vs the CPU pipeline (same file, same noise): 512² p0 / 400×592 / 1024² p0 | PNG PSNR 48.6 / 53.2 / 53.9 dB, `lat_8` rel 2.2e-2 / 9.6e-3 / 8.1e-3 |
+| Turbo images vs fp32 (512² p0, 1024² p0) | 26.25 / 33.29 dB (the CPU path: 26.12 / 33.31) |
+| base, 3 steps CFG + negative, 512² | vs the CPU pipeline 53.8 dB (`lat_3` rel 4.6e-3); vs fp32 35.6 dB (CPU 35.4) |
+
+## Speed (Mac mini M4, 10-core GPU, 24 GB, in-process timers)
+
+`cortiq imagine <file> --prompt P --width W --height W`, one image per
+process (model open and kernel compile included), cool-down between runs.
+The M4 slows as it heats: a 1024² step goes from 19.6 s to ~23 s over a
+run. Before = the same binary with the Metal DiT/VAE declined (the DiT on
+the CPU through Accelerate, the per-conv VAE).
+
+| model, size | total | text encoder | prepare | steps (median step) | VAE | peak RSS / footprint |
+|---|---|---|---|---|---|---|
+| Turbo 512² | 35.5 s (before 81.6 s) | 0.69 s | 0.24 s | 33.5 s (4.21 s; CPU 9.69 s) | 1.03 s (before 3.28 s) | 5.4 / 2.2 GB |
+| Turbo 1024² | 171–173 s (before ≈ 370 s) | 0.68 s | 0.24 s | 166 s (20.9 s; CPU 44.2 s) | 4.6 s | 5.4 / 4.3 GB |
+| base 512² | 251 s (before ≈ 548 s, derived) | 1.29 s | 0.42 s | 248 s (8.85 s, CFG pair; CPU 19.4 s) | 1.16 s | 5.4 / 2.0 GB |
+| base 1024² | 1277 s (before ≈ 2490 s, derived) | 1.28 s | 0.42 s | 1270 s (45.9 s, CFG pair; CPU ≈ 88 s) | 4.75 s | 5.4 / 4.5 GB |
+
+"Derived" = the measured CPU step × steps plus the measured stages. The
+first run after switching between the two files pays the page-in of the
+new file (base 512²: 257.7 s, text encoder 3.7 s and prepare 3.3 s).
+
+The DiT step is 3.0 TF/s effective at 512² and 2.6–2.8 TF/s at 1024²
+(12.5 / 55.1 TFLOP per forward). The GEMMs run at 3.2–3.35 TF/s, 91–94 %
+of what the chip's simdgroup matrix units issue in a pure multiply loop
+(3.55 TF/s); attention runs at 1.5–1.7 TF/s and is a quarter of a 1024²
+step. The text encoder is 2 % of a Turbo 512² image.
 
 ## Oracles
 

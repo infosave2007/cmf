@@ -29,7 +29,66 @@
 //! flash attention → O GEMM → row op → w1/w3 GEMM (z = 2) → SwiGLU → w2
 //! GEMM. The CFG pair is one batch-2 program: rows [img0 | img1 | cap0 |
 //! cap1], every row-local kernel runs once over all rows, attention runs
-//! per item over its two row ranges.
+//! per item over its two row ranges. The context refiner runs the same
+//! block encoder unmodulated; the VAE is `vae.rs` (resident, NHWC).
+//!
+//! # Measured (Mac mini M4, 10-core GPU, 24 GB; in-process GPU timers)
+//!
+//! `examples/zimage_metal_bench.rs` (peak / gemm / plane / flash / corun)
+//! and `examples/zimage_metal_check.rs` (one forward vs the CPU path and
+//! the fp32 oracle, per-class GPU ms with `CMF_ZI_METAL_PROF=1`).
+//!
+//! - Ceiling: a pure simdgroup-MMA loop (16 independent 8×8 accumulators,
+//!   no loads) issues 3.55 TF/s with half operands, 3.36-3.46 with float
+//!   operands, 3.69 with half accumulators (not used: +4% for f16 sums).
+//! - GEMM `zi_q8mm`: 3.2-3.35 TF/s on all four DiT shapes at 1056 and 4224
+//!   tokens = 91-94% of that ceiling; rel 5e-7 against f64 on the same
+//!   operands. Measured and rejected (do not reopen): the transposed-W
+//!   staging (`CMF_ZI_MM=wt`, equal); 32-accumulator tiles 64×128 /
+//!   128×64 (register spill, 0.5 TF/s); 256-thread 64×128 (−2%); 32×128
+//!   (−5%); f16 weight planes (the same tile with half weights: equal or up
+//!   to −6%, and 11.6 GB the shared 24 GB cannot spare).
+//! - Flash `zi_flash_q64pf` (64 queries = 8 simdgroups × 8, 32-key blocks
+//!   staged in threadgroup memory, register prefetch of the next block):
+//!   1.50 TF/s at 1056 tokens, 1.65-1.73 at 4224; 2.6e-4 against f64 (the
+//!   f16 output floor). Attribution at 4224 (per layer): full 162 ms, Q·Kᵀ
+//!   ≈ 57 and P·V ≈ 60 against an ideal 39 each (one threadgroup load per
+//!   MMA), the MMA-free skeleton (staging, softmax, barriers) 45 ms.
+//!   Rejected: 32 queries (v1, −7..−11%), head-dim-outer Q·Kᵀ (−6%),
+//!   transposed-K staging (equal), split partial sums (−20%), direct device
+//!   loads without threadgroup memory (−15..−40%), 128 queries (−7%),
+//!   double-buffered K/V tiles (32 KB, −7%), K/V tiles packed as dense
+//!   8×8 blocks (−2%: not bank conflicts). What is left is structural: one
+//!   threadgroup fragment load per MMA (the GEMM has one per two); the next
+//!   step would split the head dim across simdgroup pairs (16 queries a
+//!   pair, partial Q·Kᵀ exchanged through threadgroup memory).
+//! - One step, Turbo 512² (1056 rows): 4.1-4.2 s = GEMM 3.70 + flash 0.35
+//!   + row ops 0.09 (3.0 TF/s effective); 1024² (4128 rows): 19.7 s = GEMM
+//!   14.4 + flash 4.84 + row ops 0.37 (2.8 TF/s), rising to 21-23 s as the
+//!   machine heats up over a run. Host work per step (upload, patchify,
+//!   readback, Euler) is < 1%: wall ≈ GPU time.
+//! - Command buffers: one per step vs one per two blocks (default, each
+//!   buffer ≤ ~1.3 s at 1024²): equal (4.11 vs 4.11 s, 3 alternating pairs).
+//! - CFG: the batch-2 program costs 2 × the single forward (8.11 s vs
+//!   4.06 s at 512²; compute-bound, no batching gain) and is bit-identical
+//!   to the two single forwards.
+//! - CPU + GPU co-run (not built): Accelerate sgemm 1.65 TF/s alone, the
+//!   GPU GEMM 3.2 alone; together 1.25 + 2.5..3.1 = 3.8..4.3 TF/s — the
+//!   only lever left above the MMA ceiling, at the price of sharing the
+//!   package's power and heat.
+//!
+//! Range guards ([`Guards`], measured with `CMF_ZI_AMAX=1`, stored value
+//! after the guard, worst block): Turbo over 8 steps at 512² — q/k/v input
+//! 102, qkv panel 5720 (guard 2⁻¹ → 2860), attention output 202, FFN input
+//! 19, hidden 310 (with 2⁻⁶); base r512 c3 step 0 — 784, 9192 (at 2⁻⁷;
+//! now 2⁻⁸), 734, 9, 1350 (at 2⁻¹¹).
+//!
+//! Knobs: `CMF_ZI_METAL=0` (device path off), `CMF_ZI_MM` / `CMF_ZI_FLASH`
+//! (kernel variants, A/B only), `CMF_ZI_METAL_CHUNK` (blocks per command
+//! buffer, default 2), `CMF_ZI_METAL_PROF=1` (per-class GPU ms; one command
+//! buffer per op), `CMF_ZI_AMAX=1`, `CMF_ZI_{ATTN,QKV,AO,FFN,HID}_SHIFT`,
+//! `CMF_ZI_METAL_REFINE=0` (CPU context refiner), `CMF_ZI_VAE=0` (the
+//! per-conv VAE), `CMF_ZI_VAE_CHUNK` (attention query chunk).
 
 use crate::gpu::{ZBlockRef, ZGeom, ZPrepareArgs, ZStepArgs};
 use cortiq_core::{CmfModel, TensorDtype};
