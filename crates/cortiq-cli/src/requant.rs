@@ -64,7 +64,12 @@ fn target_dtype(mode: &Mode, name: &str, src: TensorDtype, shape: &[usize]) -> O
                 && !name.contains("lm_head")
                 && !name.contains(".desc.")
                 && !name.contains("mlp.gate.weight")
-                && !name.contains("k_gate") =>
+                && !name.contains("k_gate")
+                // MiMo audio towers: the RVQ codebooks are nearest-neighbour
+                // tables (a nudged codeword changes codes) and the speech
+                // embeddings are gathers, not matmuls.
+                && !name.contains("._codebook.")
+                && !name.starts_with("speech_embeddings.") =>
         {
             Some(TensorDtype::Q4TiledP)
         }

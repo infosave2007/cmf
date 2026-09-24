@@ -8,6 +8,11 @@
 
 use crate::attention::{self, QwenAttnCfg};
 use crate::inference;
+
+/// MiMo-V2 multi-token prediction (draft stack + speculative round). A
+/// child module so it runs on the pipeline's own helpers.
+#[path = "mimo_mtp.rs"]
+pub mod mimo_mtp;
 use crate::kv_cache::KvCache;
 use crate::linear_core::{
     GdnCfg, GdnWeights, ShortConvCfg, ShortConvWeights, VmfPhaseCfg, VmfPhaseWeights, gdn_forward,
@@ -77,6 +82,35 @@ pub struct Pipeline {
     pub rotary_dim: usize,
     /// Optional Q-head count override for each attention layer (Laguna).
     pub attention_heads_per_layer: Option<Vec<usize>>,
+    /// Optional KV-head count of each PHYSICAL attention layer (MiMo-V2:
+    /// 4 on full-attention layers, 8 on sliding ones). Set only through
+    /// [`Pipeline::set_attn_geometry`], which also reshapes the layer
+    /// caches. None = every layer has `num_kv_heads`.
+    pub kv_heads_per_layer: Option<Vec<usize>>,
+    /// Width of each V head when it is narrower than `head_dim` (MiMo-V2:
+    /// 128 against 192). V is zero-padded to `head_dim` inside the cache
+    /// and the attention output is compacted back to nh·v_head_dim before
+    /// o_proj (see `QwenAttnCfg::v_head_dim`). None = `head_dim`.
+    pub v_head_dim: Option<usize>,
+    /// `CMF_LAYER_DUMP=<dir>` (read once at construction; tests set it
+    /// directly): the hidden state after every layer, for every position,
+    /// as raw little-endian f32 files `p{pos:06}_l{li:02}.f32` of
+    /// `hidden_size` floats each. Written by the CPU layer walks — the
+    /// batched prefill (`prefill_batch_span`) and the single-token forward
+    /// (`forward_layers_span`) — so both prompt ingest and decode can be
+    /// diffed layer by layer against an external oracle (tools/mimo_ref).
+    /// Layers a device graph runs (wgpu token/batch graph, Metal chunk or
+    /// block graphs) and the own-stack families (DeepSeek-V4/V4.1,
+    /// Qwen3.8-Flash-Next, Gemma-3n) are not dumped: run with CMF_GPU=0
+    /// for a complete set. `li` is the virtual layer index. Final logits:
+    /// `CMF_LOGIT_DUMP=<file>` (hidden + logits of the first decode step).
+    pub layer_dump: Option<std::path::PathBuf>,
+    /// GPU-graph declines already logged for this pipeline, as (graph
+    /// site, reason) — one line each, see `graph_attn_decline_reason`.
+    graph_declines: std::cell::RefCell<Vec<(&'static str, &'static str)>>,
+    /// MiMo-V2 expert placement (prefix / dynamic bank / hybrid), decided
+    /// on the first forward — see `crate::mimo_moe`.
+    pub(crate) mimo_moe: crate::mimo_moe::Slot,
     /// Linear-core geometry (present when the model has linear layers).
     pub vmf_cfg: Option<VmfPhaseCfg>,
     /// GatedDeltaNet geometry (faithful vendor operator).
@@ -169,6 +203,13 @@ pub struct Pipeline {
     pub short_conv_cfg: Option<ShortConvCfg>,
     /// Multi-token-prediction head (None = absent).
     pub mtp: Option<MtpModule>,
+    /// MiMo-V2's draft stack (three chained MTP layers from the
+    /// `<stem>.mtp.cmf` sidecar); None = absent. Speculative greedy decode
+    /// uses it unless `CMF_MTP=0` / `CMF_MIMO_MTP=0`.
+    pub mimo_mtp: Option<mimo_mtp::MimoMtp>,
+    /// Set while the MiMo speculative verify runs `prefill_batch`: its MoE
+    /// layers take `moe_ffn_rows_exact` (each row bit-identical to decode).
+    verify_exact_moe: bool,
     /// Speculative decode via MTP (greedy only; `CMF_MTP=0` disables).
     pub speculative: bool,
     /// Keep generating past end-of-sequence ids (the llama-bench contract
@@ -1326,24 +1367,55 @@ impl Pipeline {
             ReusePlan::Fresh => return false,
             ReusePlan::Ready => {}
             ReusePlan::Pull(pulls) => {
-                // The graph's mirrors share one geometry (it declines a
-                // model whose layers differ), so one batched read serves all.
+                // Mirrors of one uniform geometry: one batched read serves
+                // every layer. Per-layer geometry (MiMo-V2: 4/8 KV heads,
+                // narrow V, sliding rings) is read layer by layer in the
+                // host layout instead.
                 let (nkv, hd) = {
                     let c = &self.kv_cache.layers[pulls[0].0];
                     (c.num_kv_heads, c.head_dim)
                 };
-                if pulls.iter().any(|&(li, _, _)| {
+                let uniform = pulls.iter().all(|&(li, _, _)| {
                     let c = &self.kv_cache.layers[li];
-                    (c.num_kv_heads, c.head_dim) != (nkv, hd)
-                }) {
-                    return false;
-                }
-                let Some(rows) = crate::gpu::graph_kv_read_rows(kv_id, &pulls, nkv, hd) else {
-                    return false;
+                    (c.num_kv_heads, c.head_dim) == (nkv, hd)
+                });
+                let batched = if uniform {
+                    crate::gpu::graph_kv_read_rows(kv_id, &pulls, nkv, hd)
+                } else {
+                    None
+                };
+                let rows: Vec<(Vec<f32>, Vec<f32>)> = match batched {
+                    Some(rows) => rows,
+                    None => {
+                        let mut rows = Vec::with_capacity(pulls.len());
+                        for &(li, from, to) in &pulls {
+                            let (lnkv, lhd) = {
+                                let c = &self.kv_cache.layers[li];
+                                (c.num_kv_heads, c.head_dim)
+                            };
+                            let Some((k, v, first_valid)) =
+                                crate::gpu::graph_kv_pull_host(kv_id, li, from, to, lnkv, lhd)
+                            else {
+                                return false;
+                            };
+                            // The host continues at `to`: a sliding layer
+                            // reads back only its last window, a full one
+                            // every row it lacks.
+                            let need_from = match self.layer_window(li) {
+                                Some(w) => from.max((to + 1).saturating_sub(w)),
+                                None => from,
+                            };
+                            if first_valid > need_from {
+                                return false;
+                            }
+                            rows.push((k, v));
+                        }
+                        rows
+                    }
                 };
                 for ((li, from, to), (k, v)) in pulls.into_iter().zip(rows) {
                     let cache = &mut self.kv_cache.layers[li];
-                    let row = nkv * hd;
+                    let row = cache.num_kv_heads * cache.head_dim;
                     for p in 0..to - from {
                         cache.append(&k[p * row..(p + 1) * row], &v[p * row..(p + 1) * row], &[]);
                     }
@@ -1575,6 +1647,33 @@ impl Pipeline {
             })
     }
 
+    /// Prompt ingest through the batched wgpu graph in device-prefix mode:
+    /// a MoE stack that does not fit the card runs each chunk's leading
+    /// layers on the device (experts resident) and the rest on the host's
+    /// batched walk. On by default for models with per-layer attention
+    /// geometry (MiMo-V2 — its measured default); `CMF_BATCH_PREFIX=1`
+    /// opts any other MoE model in, `=0` keeps the chunked host prefill.
+    #[cfg(not(target_os = "macos"))]
+    fn batch_prefix_prefill(&self) -> bool {
+        let forced = match std::env::var("CMF_BATCH_PREFIX").as_deref() {
+            Ok("0") => return false,
+            Ok("1") => true,
+            _ => false,
+        };
+        crate::gpu::wgpu_graph_on(crate::gpu::GraphPhase::Prefill)
+            && crate::gpu::enabled_here()
+            && !crate::gpu::graph_unsupported()
+            && (forced || self.graph_attn_decline_reason().is_some())
+            && self.wgpu_graph_attn_decline().is_none()
+            && self.attn_softcap == 0.0
+            && self
+                .weights
+                .layers
+                .iter()
+                .any(|lw| matches!(&lw.ffn, FfnKind::Moe(_)))
+            && self.automatic_gpu_prefix().is_some()
+    }
+
     #[cfg(not(target_os = "macos"))]
     fn graph_prefill_preferred(&self) -> bool {
         // Discrete-GPU wgpu whole-token graph: GDN layers carry recurrent state
@@ -1602,6 +1701,12 @@ impl Pipeline {
         // never becomes graph-portable: prefill through the graph
         // records no trace, so views stay None forever.
         if self.o1_active() {
+            return false;
+        }
+        // A model the wgpu graphs decline outright would walk its prompt
+        // one position at a time through a graph that never runs: the
+        // batched CPU chunk prefill is the right ingest for it.
+        if self.wgpu_graph_attn_decline().is_some() {
             return false;
         }
         if self
@@ -1667,6 +1772,8 @@ impl Pipeline {
             || self.global_attn.is_some()
             || self.attention_heads_per_layer.is_some()
             || self.attn_v_norm
+            // per-layer KV heads, narrow V, learned sinks (MiMo-V2)
+            || self.graph_attn_decline_reason().is_some()
             || self.weights.layers.iter().any(|lw| {
                 lw.attn_out_norm.is_some()
                     || lw.ffn_out_norm.is_some()
@@ -1674,6 +1781,11 @@ impl Pipeline {
                     || matches!(&lw.ffn, FfnKind::Dense(d) if d.act != Act::Silu)
             })
         {
+            // The Metal graphs have no per-layer attention geometry (the
+            // wgpu graphs do): say so once, by name.
+            if let Some(reason) = self.graph_attn_decline_reason() {
+                self.note_graph_decline("metal block graph", reason);
+            }
             if std::env::var("CMF_GRAPH_DBG").is_ok() {
                 eprintln!(
                     "block-graph: arch ineligible (swa={} gattn={} hpl={} vnorm={} scale_delta={:.2e})",
@@ -2268,6 +2380,7 @@ impl Pipeline {
                         rms_eps: eps,
                         norm_style,
                         pool: pool.as_deref(),
+                        v_head_dim: hd,
                     };
                     // CMF_ATTN_ORACLE=1: diff the device attend against
                     // this CPU attend on identical inputs (bring-up).
@@ -2548,6 +2661,13 @@ impl Pipeline {
             norm_style,
             rotary_dim: head_dim,
             attention_heads_per_layer: None,
+            kv_heads_per_layer: None,
+            v_head_dim: None,
+            layer_dump: std::env::var_os("CMF_LAYER_DUMP")
+                .filter(|v| !v.is_empty())
+                .map(std::path::PathBuf::from),
+            graph_declines: std::cell::RefCell::new(Vec::new()),
+            mimo_moe: Default::default(),
             vmf_cfg: None,
             gdn_cfg: None,
             kda_cfg: None,
@@ -2571,6 +2691,8 @@ impl Pipeline {
             kv_history: Vec::new(),
             short_conv_cfg: None,
             mtp: None,
+            mimo_mtp: None,
+            verify_exact_moe: false,
             speculative: std::env::var("CMF_MTP").map(|v| v != "0").unwrap_or(true),
             ignore_eos: false,
             draft_full_streak: 0,
@@ -2659,11 +2781,18 @@ impl Pipeline {
             Some(c) => {
                 let mut flags = c.layer_flags(self.num_layers);
                 for (li, f) in flags.iter_mut().enumerate() {
+                    // The Nyström state replaces a full-context plain
+                    // softmax: a sliding window or a learned sink is not
+                    // something it can represent, and a V narrower than
+                    // the head is not what its streaming state stores.
+                    // Those layers keep exact cache attention.
                     if *f
-                        && !matches!(
+                        && (!matches!(
                             self.weights.layers[self.phys_layer(li)].attn,
                             AttnKind::Full { .. }
-                        )
+                        ) || self.layer_window(li).is_some()
+                            || self.kv_cache.layers[li].sinks.is_some()
+                            || self.layer_v_dim(li) != self.layer_geom(li).1)
                     {
                         *f = false;
                     }
@@ -2968,6 +3097,7 @@ impl Pipeline {
             rms_eps: self.rms_eps,
             norm_style: self.norm_style,
             pool: self.pool.as_deref(),
+            v_head_dim: self.v_head_dim.unwrap_or(self.head_dim),
         }
     }
 
@@ -3069,6 +3199,46 @@ impl Pipeline {
         input_ids: &[u32],
         max_tokens: usize,
         task_mask: Option<&TaskMask>,
+        on_token: Option<TokenCallback>,
+    ) -> Result<GenerateResult, String> {
+        self.generate_with_prompt_rows(input_ids, None, max_tokens, task_mask, on_token)
+    }
+
+    /// Generate from complete prompt embeddings [token_count, hidden_size].
+    /// Text rows can be obtained with `embed_id`; media rows replace only
+    /// their expanded placeholder positions. Rows are already scaled and
+    /// enter `PrefillIn::Hidden`, so a device graph must not re-embed them.
+    /// Token-only KV reuse is disabled both into and out of this request.
+    pub fn generate_from_embeds(
+        &mut self,
+        input_ids: &[u32],
+        prompt_rows: &[f32],
+        max_tokens: usize,
+        task_mask: Option<&TaskMask>,
+        on_token: Option<TokenCallback>,
+    ) -> Result<GenerateResult, String> {
+        if input_ids.is_empty()
+            || input_ids.len().checked_mul(self.hidden_size) != Some(prompt_rows.len())
+        {
+            return Err("embedded prompt dimensions must be [tokens, hidden_size]".into());
+        }
+        if prompt_rows.iter().any(|x| !x.is_finite()) {
+            return Err("embedded prompt contains non-finite values".into());
+        }
+        if !self.can_prefill_batched() || self.dyn_router.is_some()
+            || self.o1_active() || self.mtp.is_some() || self.gpu_plan.is_some()
+        {
+            return Err("embedded prompts require the ordinary transformer path without O(1), dynamic routing, GPU splitting or a generic MTP head".into());
+        }
+        self.generate_with_prompt_rows(input_ids, Some(prompt_rows), max_tokens, task_mask, on_token)
+    }
+
+    fn generate_with_prompt_rows(
+        &mut self,
+        input_ids: &[u32],
+        prompt_rows: Option<&[f32]>,
+        max_tokens: usize,
+        task_mask: Option<&TaskMask>,
         mut on_token: Option<TokenCallback>,
     ) -> Result<GenerateResult, String> {
         if std::env::var("CMF_TRACE_H").is_ok() {
@@ -3099,8 +3269,10 @@ impl Pipeline {
             let on = !std::env::var("CMF_KV_REUSE").is_ok_and(|v| v == "0");
             let h = &self.kv_history;
             if on
+                && prompt_rows.is_none()
                 && task_mask.is_none()
                 && self.mtp.is_none()
+                && !(self.mimo_mtp.is_some() && self.speculative)
                 && self.o1_cfg.is_none()
                 && self.dsv41.is_none()
                 && !h.is_empty()
@@ -3371,6 +3543,22 @@ impl Pipeline {
             crate::gpu::graph_kv_reset(self.mtp_kv_id());
             self.mtp_graph_mode = None;
         }
+        // MiMo-V2's draft stack: greedy rounds (draft K with the chained
+        // MTP layers, verify K+1 rows in one batched forward). Sampling
+        // decodes plain; `CMF_MTP=0` / `CMF_MIMO_MTP=0` turn it off.
+        let mimo_spec = self.speculative
+            && self.mimo_mtp.is_some()
+            && task_mask.is_none()
+            && !self.o1_active()
+            && self.dyn_router.is_none()
+            && self.sampler_config.temperature < 1e-6
+            && std::env::var("CMF_MIMO_MTP").as_deref() != Ok("0");
+        if let Some(st) = self.mimo_mtp.as_mut() {
+            st.reset();
+            if mimo_spec && std::env::var_os("CMF_MIMO_MTP_PROBE").is_some() {
+                Self::mimo_mtp_hist_cap(st, input_ids.len());
+            }
+        }
         // Dynamic router detached during decode (same borrow trick as MTP).
         // Speculative decode and dynamic routing are mutually exclusive
         // for now — the fused-pair path doesn't carry per-token φ.
@@ -3425,6 +3613,25 @@ impl Pipeline {
         self.graph_want_logits = false;
         let _tpf = std::time::Instant::now();
         let batch_k = self.generation_batch_k();
+        if let Some(rows) = prompt_rows {
+            let hs = self.hidden_size;
+            let chunk = self.prefill_chunk().max(1);
+            while pos < input_ids.len() && !self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                let end = (pos + chunk).min(input_ids.len());
+                let hb = match self.prefill_input_rows(
+                    PrefillIn::Hidden(&rows[pos * hs..end * hs]), pos, task_mask,
+                ) {
+                    Ok(hb) => hb,
+                    Err(err) => {
+                        self.finish_generation(&mut mtp, &mut router, true);
+                        return Err(err);
+                    }
+                };
+                if mimo_spec { self.mimo_note_rows(&hb, pos); }
+                hidden.copy_from_slice(&hb[hb.len() - hs..]);
+                pos = end;
+            }
+        }
         // DeepSeek-V4 owns a separate hyper-connection stack. Route it
         // before the generic prefill choices: those correctly reject an
         // empty `weights.layers`, but their final per-position fallback used
@@ -3658,6 +3865,85 @@ impl Pipeline {
                 );
             }
         }
+        self.mimo_moe_prepare();
+        // A MoE stack larger than the card (MiMo-V2 q4tp on 96 GB): the
+        // batched wgpu graph runs the device prefix of every chunk — its
+        // experts resident — and the host's batched layer walk finishes
+        // the chunk. Any refusal leaves the rest of the prompt to the
+        // chunked prefill below.
+        #[cfg(not(target_os = "macos"))]
+        if task_mask.is_none()
+            && !dyn_prefill
+            && !graph_prefill
+            && mtp.is_none()
+            && o1_prefill.is_none()
+            && !self.o1_active()
+            && input_ids.len() > 2
+            && self.batch_prefix_prefill()
+        {
+            let chunk = self.prefill_chunk().max(1);
+            let hs = self.hidden_size;
+            let t_bp = std::time::Instant::now();
+            let pos0 = pos;
+            while pos < input_ids.len() && !self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                let end = (pos + chunk).min(input_ids.len());
+                let bk = end - pos;
+                let mut hiddens = vec![0f32; bk * hs];
+                for (j, &id) in input_ids[pos..end].iter().enumerate() {
+                    hiddens[j * hs..(j + 1) * hs].copy_from_slice(&self.embed_single(id));
+                }
+                let positions: Vec<usize> = (pos..end).collect();
+                let mut run = 0usize;
+                let outcome = self.try_batch_graph_wgpu_prefix(
+                    &mut hiddens,
+                    &positions,
+                    bk,
+                    None,
+                    Some(&mut run),
+                );
+                match outcome {
+                    crate::gpu::BatchGraphOutcome::Completed => {
+                        let hb = if run < self.num_layers {
+                            self.prefill_batch_span(
+                                PrefillIn::Hidden(&hiddens),
+                                pos,
+                                None,
+                                run,
+                                self.num_layers,
+                            )
+                        } else {
+                            hiddens
+                        };
+                        if mimo_spec {
+                            self.mimo_note_rows(&hb, pos);
+                        }
+                        hidden.copy_from_slice(&hb[(bk - 1) * hs..]);
+                        pos = end;
+                    }
+                    crate::gpu::BatchGraphOutcome::Failed => {
+                        self.finish_generation(&mut mtp, &mut router, true);
+                        return Err("batched prefix prefill failed after admission".into());
+                    }
+                    crate::gpu::BatchGraphOutcome::Declined => {
+                        // Earlier chunks left their prefix rows on the
+                        // device only: the host walk below needs them.
+                        #[cfg(feature = "gpu")]
+                        if pos > pos0 {
+                            self.pull_lagging_host_kv(0, self.num_layers, pos);
+                        }
+                        break;
+                    }
+                }
+            }
+            if std::env::var("CMF_PREFILL_PROF").is_ok() {
+                eprintln!(
+                    "batch-prefix prefill: {} of {} tokens in {:.1} ms",
+                    pos - pos0,
+                    input_ids.len(),
+                    t_bp.elapsed().as_secs_f64() * 1e3
+                );
+            }
+        }
         if task_mask.is_none()
             && !dyn_prefill
             && !graph_prefill
@@ -3676,6 +3962,9 @@ impl Pipeline {
             while pos < input_ids.len() && !self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 let end = (pos + chunk).min(input_ids.len());
                 let hb = self.prefill_batch(&input_ids[pos..end], pos);
+                if mimo_spec {
+                    self.mimo_note_rows(&hb, pos);
+                }
                 if let Some(m) = &mut mtp {
                     let probe: usize = std::env::var("CMF_MTP_CHAIN_PROBE")
                         .ok()
@@ -3738,6 +4027,10 @@ impl Pipeline {
                 let e1 = self.embed_single(input_ids[pos]);
                 let e2 = self.embed_single(input_ids[pos + 1]);
                 let (h1, h2) = self.forward_pair(&e1, &e2, pos);
+                if mimo_spec {
+                    self.mimo_note_rows(&h1, pos);
+                    self.mimo_note_rows(&h2, pos + 1);
+                }
                 // Both prefill tokens are real → commit lane-2 states.
                 self.commit_linear_scratch();
                 if let Some(m) = &mut mtp {
@@ -3863,6 +4156,9 @@ impl Pipeline {
                     }
                 }
                 if ok_b {
+                    if mimo_spec {
+                        self.mimo_note_rows(&hiddens, pos);
+                    }
                     if mtp_batch_prefill {
                         let n_pairs = mtp_prefill_pair_count(pos, end, input_ids.len());
                         if n_pairs > 0 {
@@ -3923,6 +4219,9 @@ impl Pipeline {
         while pos < input_ids.len() && !self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
             self.graph_want_logits = fuse_lm && pos + 1 == input_ids.len();
             hidden = self.forward_layers(&self.embed_single(input_ids[pos]), pos, task_mask);
+            if mimo_spec {
+                self.mimo_note_rows(&hidden, pos);
+            }
             if let Some(m) = &mut mtp {
                 if pos + 1 < input_ids.len() {
                     // `CMF_MTP_CHAIN_PROBE=k`: teacher-forced acceptance of a
@@ -4068,6 +4367,14 @@ impl Pipeline {
         // ... and the end of the last round: the host time between rounds
         // (token commits, streaming, the loop top) is printed at level 2
         let mut spec_round_end: Option<std::time::Instant> = None;
+        if mimo_spec {
+            if let Ok(path) = std::env::var("CMF_MIMO_MTP_PROBE") {
+                if let Some(mut st) = self.mimo_mtp.take() {
+                    self.mimo_mtp_probe(&mut st, input_ids, &path);
+                    self.mimo_mtp = Some(st);
+                }
+            }
+        }
         // ── Decode ──
         let mut next_pos = input_ids.len();
         'decode: while generated < max_tokens {
@@ -4093,6 +4400,11 @@ impl Pipeline {
             // token from the residual distribution (graph_spec_step); it
             // is committed as-is — sampling again from the row's logits
             // would bias the stream toward the target's mode.
+            if mimo_spec && next_pos > 0 {
+                // Every path leaves `hidden` = the backbone output at
+                // next_pos-1; the draft layers read it (idempotent).
+                self.mimo_note_rows(&hidden, next_pos - 1);
+            }
             let forced = self.spec_forced.take();
             let mut logits = match (forced, self.graph_logits.take()) {
                 (Some(_), _) => Vec::new(),
@@ -4126,6 +4438,20 @@ impl Pipeline {
                         eprintln!("logit dump: failed to write {path}: {e}");
                         self.finish_generation(&mut mtp, &mut router, true);
                         return Err(format!("logit dump write failed: {e}"));
+                    }
+                }
+            }
+            // CMF_LOGIT_DUMP_ALL=<dir>: every decode step's logits as raw
+            // f32, `<dir>/step{n:05}.f32` — step-by-step backend diffing
+            // (a greedy run on two backends compares until they diverge).
+            if let Ok(dir) = std::env::var("CMF_LOGIT_DUMP_ALL") {
+                if !logits.is_empty() {
+                    let path = std::path::Path::new(&dir).join(format!("step{generated:05}.f32"));
+                    let bytes: Vec<u8> = logits.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    if let Err(e) =
+                        std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, &bytes))
+                    {
+                        eprintln!("logit dump: failed to write {}: {e}", path.display());
                     }
                 }
             }
@@ -4233,6 +4559,45 @@ impl Pipeline {
                     spec_trial,
                     SpecTrial::Plain { .. } | SpecTrial::Decided { spec: false, .. }
                 );
+            }
+            // ── MiMo-V2 draft stack: draft K, verify K+1 rows in one batch ──
+            if mimo_spec && generated + 1 < max_tokens && next_pos > 0 {
+                let budget = max_tokens - generated - 1;
+                if let Some(mut st) = self.mimo_mtp.take() {
+                    let k = st.depth.min(budget);
+                    let r = self.mimo_spec_round(&mut st, next_pos, &all_ids, k);
+                    self.mimo_mtp = Some(st);
+                    let r = match r {
+                        Ok(r) => r,
+                        Err(err) => {
+                            self.finish_generation(&mut mtp, &mut router, true);
+                            return Err(err);
+                        }
+                    };
+                    if let Some(r) = r {
+                        drafted += r.drafted;
+                        accepted += r.accepted.len();
+                        let mut stopped = false;
+                        for &id in &r.accepted {
+                            if self.confidence_on {
+                                confidence.push(0.0);
+                            }
+                            if !commit!(id) {
+                                stopped = true;
+                                break;
+                            }
+                        }
+                        if stopped {
+                            break 'decode;
+                        }
+                        next_pos += r.accepted.len() + 1;
+                        hidden = r.hidden;
+                        // The loop top chooses the round's own token from
+                        // these logits — the same sampler, same history.
+                        self.graph_logits = Some(r.logits);
+                        continue 'decode;
+                    }
+                }
             }
             match &mut mtp {
                 // ── Graph speculation: chain-draft, batch-verify on device ──
@@ -4637,6 +5002,15 @@ impl Pipeline {
         }
 
         let cancelled = finish_reason == "cancelled";
+        if mimo_spec {
+            if let Some(st) = self.mimo_mtp.as_ref() {
+                let line = st.stats.line();
+                tracing::info!("{line}");
+                if std::env::var_os("CMF_MIMO_MTP_STATS").is_some() {
+                    eprintln!("{line}");
+                }
+            }
+        }
         self.finish_generation(&mut mtp, &mut router, cancelled);
 
         let output_ids = &all_ids[input_ids.len()..];
@@ -4644,7 +5018,10 @@ impl Pipeline {
         // (emitted without being fed back). Exact only without MTP —
         // reuse is gated off when MTP is active.
         let forwarded = input_ids.len() + output_ids.len().saturating_sub(1);
-        if cancelled {
+        // A MiMo speculative round that stopped on an accepted draft (EOS,
+        // cancel) leaves verify rows past the committed stream in the cache:
+        // never offer that cache for reuse.
+        if cancelled || mimo_spec || prompt_rows.is_some() {
             self.kv_history.clear();
         } else {
             self.kv_history = all_ids[..forwarded.min(all_ids.len())].to_vec();
@@ -5046,6 +5423,9 @@ impl Pipeline {
             || !crate::gpu::enabled_here()
             || self.attn_softcap > 0.0
             || self.attention_heads_per_layer.is_some()
+            // The block graph caches V as wide as K and feeds o_proj
+            // nh·head_dim; a narrow-V model keeps its MTP block per-op.
+            || self.v_head_dim.is_some()
         {
             return false;
         }
@@ -5177,6 +5557,7 @@ impl Pipeline {
                 output_gate: *output_gate,
                 cpu_k: m.kv.k_heads(),
                 cpu_v: m.kv.v_heads(),
+                geom: None,
             },
             post_norm: &lw.post_norm,
             ffn: crate::gpu::GraphFfn::Dense {
@@ -5328,6 +5709,7 @@ impl Pipeline {
                 output_gate: *output_gate,
                 cpu_k: m.kv.k_heads(),
                 cpu_v: m.kv.v_heads(),
+                geom: None,
             },
             post_norm: &lw.post_norm,
             ffn: crate::gpu::GraphFfn::Dense {
@@ -5360,6 +5742,7 @@ impl Pipeline {
             pairs.len(),
             &[],
             0,
+            None,
             None,
         )
     }
@@ -6526,6 +6909,9 @@ impl Pipeline {
         emb2: &[f32],
         position: usize,
     ) -> (Vec<f32>, Vec<f32>) {
+        // A two-token prompt starts here, not in the layer walk: decide the
+        // MiMo placement before the pair's per-op MoE uploads any expert.
+        self.mimo_moe_prepare();
         let mut h1 = emb1.to_vec();
         let mut h2 = emb2.to_vec();
         let (_nkv, _hd, hs, _rd, eps) = (
@@ -6642,6 +7028,7 @@ impl Pipeline {
                         rms_eps: eps,
                         norm_style: self.norm_style,
                         pool: pool.as_deref(),
+                        v_head_dim: self.layer_v_dim(li),
                     };
                     attention::qwen_attention_pair(
                         &self.ws.n1,
@@ -6705,6 +7092,10 @@ impl Pipeline {
                         self.norm_style,
                         self.pool.as_deref(),
                     ),
+                ),
+                FfnKind::Moe(m) if self.mimo_moe.is_dynamic(li, false) => (
+                    moe_ffn_banked(&mut self.mimo_moe, li, m, &self.ws.p1, self.pool.as_deref()),
+                    moe_ffn_banked(&mut self.mimo_moe, li, m, &self.ws.p2, self.pool.as_deref()),
                 ),
                 _ => ffn_forward_pair(
                     &lw.ffn,
@@ -6823,7 +7214,7 @@ impl Pipeline {
             let hs = self.hidden_size;
             while pos < ids.len() {
                 let end = (pos + chunk).min(ids.len());
-                let hb = self.prefill_batch_masked(&ids[pos..end], pos, task_mask);
+                let hb = self.prefill_rows(&ids[pos..end], pos, task_mask)?;
                 self.check_forward_graph("forward_ids batched prefill", end - 1)?;
                 hidden.copy_from_slice(&hb[(end - pos - 1) * hs..]);
                 pos = end;
@@ -7110,7 +7501,7 @@ impl Pipeline {
                 while pos < n {
                     let end = (pos + CHUNK).min(n);
                     let bsz = end - pos;
-                    let hb = self.prefill_batch_masked(&ids[pos..end], pos, task_mask);
+                    let hb = self.prefill_rows(&ids[pos..end], pos, task_mask)?;
                     self.nll_check_graph("batched prefill", pos)?;
                     let mut k0 = 0usize;
                     while k0 < bsz {
@@ -7695,6 +8086,88 @@ impl Pipeline {
         self.prefill_batch_span(PrefillIn::Ids(ids), start_pos, task_mask, 0, usize::MAX)
     }
 
+    /// One prompt chunk through the whole stack, post-stack rows out (no
+    /// final norm) — the ingest generation uses, shared by scoring and
+    /// `forward_ids` so they measure the same execution: the batched wgpu
+    /// graph's device prefix plus the host's batched walk for the rest when
+    /// `batch_prefix_prefill` holds and the graph admits the chunk, else
+    /// the host's chunked prefill. Err only when a graph that had mutated
+    /// device state failed.
+    fn prefill_rows(
+        &mut self,
+        ids: &[u32],
+        pos: usize,
+        task_mask: Option<&TaskMask>,
+    ) -> Result<Vec<f32>, String> {
+        self.prefill_input_rows(PrefillIn::Ids(ids), pos, task_mask)
+    }
+
+    fn prefill_input_rows(
+        &mut self,
+        input: PrefillIn<'_>,
+        pos: usize,
+        task_mask: Option<&TaskMask>,
+    ) -> Result<Vec<f32>, String> {
+        self.mimo_moe_prepare();
+        let hs = self.hidden_size;
+        let bk = match input {
+            PrefillIn::Ids(ids) => ids.len(),
+            PrefillIn::Hidden(rows) => rows.len() / hs,
+        };
+        #[cfg(not(target_os = "macos"))]
+        if task_mask.is_none()
+            && !self.o1_active()
+            && bk > 1
+            && (self.batch_prefix_prefill()
+                || (self.verify_exact_moe
+                    && crate::gpu::enabled_here()
+                    && crate::gpu::wgpu_graph_on(crate::gpu::GraphPhase::Decode)))
+        {
+            let mut hiddens = match input {
+                PrefillIn::Hidden(rows) => rows.to_vec(),
+                PrefillIn::Ids(ids) => ids.iter().flat_map(|&id| self.embed_single(id)).collect(),
+            };
+            let positions: Vec<usize> = (pos..pos + bk).collect();
+            let mut run = 0usize;
+            match self.try_batch_graph_wgpu_prefix(
+                &mut hiddens,
+                &positions,
+                bk,
+                None,
+                Some(&mut run),
+            ) {
+                crate::gpu::BatchGraphOutcome::Completed => {
+                    let out = if run < self.num_layers {
+                        self.prefill_batch_span(
+                            PrefillIn::Hidden(&hiddens),
+                            pos,
+                            None,
+                            run,
+                            self.num_layers,
+                        )
+                    } else {
+                        hiddens
+                    };
+                    return if self.graph_failed.load(std::sync::atomic::Ordering::Relaxed) {
+                        Err("MiMo attention graph failed after admission".into())
+                    } else { Ok(out) };
+                }
+                crate::gpu::BatchGraphOutcome::Failed => {
+                    return Err("batched prefix prefill failed after admission".into());
+                }
+                crate::gpu::BatchGraphOutcome::Declined => {
+                    // Rows an earlier chunk left on the device only.
+                    #[cfg(feature = "gpu")]
+                    self.pull_lagging_host_kv(0, self.num_layers, pos);
+                }
+            }
+        }
+        let out = self.prefill_batch_span(input, pos, task_mask, 0, usize::MAX);
+        if self.graph_failed.load(std::sync::atomic::Ordering::Relaxed) {
+            Err("batch tail graph failed after admission".into())
+        } else { Ok(out) }
+    }
+
     /// The layer-major batched walk over a layer span [from..upto_excl):
     /// the whole prefill machinery (chunk graph, batched attends, GEMM
     /// panels) for a PARTIAL stack — the network split's prefill rides
@@ -7762,13 +8235,16 @@ impl Pipeline {
         );
         let pool = self.pool.clone();
         let norm_style = self.norm_style;
+        self.mimo_moe_prepare();
         let automatic_gpu_prefix = self.automatic_gpu_prefix();
 
         #[cfg(target_os = "macos")]
         let mut chunk_skip_until = 0usize;
         for li in from..upto_excl {
             let _capacity_tail = automatic_gpu_prefix
-                .filter(|&prefix| li >= prefix)
+                .filter(|&prefix| {
+                    li >= prefix && !(self.verify_exact_moe && self.mimo_moe.is_dynamic(li, false))
+                })
                 .map(|_| crate::gpu::enter_cpu_scope());
             crate::gpu::set_layer(li as i64); // layer-split GPU/CPU
             // GPU chunk graph (default-on under CMF_GPU=1): a run of
@@ -7818,6 +8294,16 @@ impl Pipeline {
                 fill_h(&mut h, self);
                 h_ready = true;
             }
+            if task_mask.is_none() && self.verify_exact_moe {
+                let positions: Vec<_> = (start_pos..start_pos + b).collect();
+                match self.mimo_graph_layer_rows(li, &mut h, &positions) {
+                    crate::gpu::BatchGraphOutcome::Completed => continue,
+                    crate::gpu::BatchGraphOutcome::Failed => return h,
+                    crate::gpu::BatchGraphOutcome::Declined => {},
+                }
+            }
+            #[cfg(feature = "gpu")]
+            self.pull_lagging_host_kv(li, li + 1, start_pos);
             let lw = &self.weights.layers[self.phys_layer(li)];
             // ── attention ──
             match &lw.attn {
@@ -7980,6 +8466,7 @@ impl Pipeline {
                         rms_eps: eps,
                         norm_style,
                         pool: pool.as_deref(),
+                        v_head_dim: self.layer_v_dim(li),
                     };
                     let mut attn = attention::qwen_attention_batch(
                         &normed,
@@ -8048,6 +8535,22 @@ impl Pipeline {
                     tube_ffn(d, &post, b, pool.as_deref(), mask_row)
                 }
                 FfnKind::Dense(d) => dense_ffn_batch(d, &post, b, pool.as_deref(), mask_row),
+                FfnKind::Moe(m) if self.verify_exact_moe && self.mimo_moe.is_dynamic(li, false) => {
+                    moe_ffn_banked_rows(&mut self.mimo_moe, li, m, &post, b, hs, pool.as_deref())
+                }
+                FfnKind::Moe(m) if self.verify_exact_moe => {
+                    moe_ffn_rows_exact(m, &post, b, hs, pool.as_deref())
+                }
+                // Keep prompt expert panels off the projection arena and
+                // use their routes to prime the model-wide bank.
+                FfnKind::Moe(m) if self.mimo_moe.is_dynamic(li, false) => {
+                    let before = m.stats.borrow().clone();
+                    let out = crate::gpu::cpu_scope(|| {
+                        moe_ffn_batch(m, &post, b, hs, pool.as_deref(), None)
+                    });
+                    self.mimo_moe.prime(li, m, &before);
+                    out
+                }
                 FfnKind::Moe(m) => moe_ffn_batch(m, &post, b, hs, pool.as_deref(), None),
                 // Dual-branch layers run per position (the expert branch
                 // reads the raw residual — nothing to batch yet).
@@ -8085,6 +8588,12 @@ impl Pipeline {
             if let Some(sc) = lw.layer_scale {
                 for v in h.iter_mut() {
                     *v *= sc;
+                }
+            }
+            // CMF_LAYER_DUMP: every position's hidden after layer li.
+            if self.layer_dump.is_some() {
+                for bi in 0..b {
+                    self.dump_layer_row(start_pos + bi, li, &h[bi * hs..(bi + 1) * hs]);
                 }
             }
             if let Ok(tp) = std::env::var("CMF_TRACE_POS") {
@@ -8205,6 +8714,8 @@ impl Pipeline {
             || b < 32
             || self.swa.is_some()
             || self.global_attn.is_some()
+            // per-layer KV heads, narrow V, learned sinks (MiMo-V2)
+            || self.graph_attn_decline_reason().is_some()
             // Collection owns the exact Q trace and boundary conversion;
             // this chunk graph appends dense KV without feeding that trace.
             || self.o1_active()
@@ -8430,7 +8941,7 @@ impl Pipeline {
             }
         }
         (
-            self.num_kv_heads,
+            self.layer_num_kv_heads(li),
             self.head_dim,
             if self.layer_is_local(li) {
                 self.rotary_dim_local.unwrap_or(self.rotary_dim)
@@ -8438,6 +8949,584 @@ impl Pipeline {
                 self.rotary_dim
             },
         )
+    }
+
+    /// KV heads of layer `li` (virtual index): the per-layer count when the
+    /// model has one (MiMo-V2), else the uniform `num_kv_heads`.
+    fn layer_num_kv_heads(&self, li: usize) -> usize {
+        self.kv_heads_per_layer
+            .as_ref()
+            .and_then(|v| v.get(self.phys_layer(li)).copied())
+            .unwrap_or(self.num_kv_heads)
+    }
+
+    /// V head width of layer `li` (≤ its head_dim).
+    fn layer_v_dim(&self, li: usize) -> usize {
+        let (_, hd, _) = self.layer_geom(li);
+        self.v_head_dim.unwrap_or(hd).min(hd)
+    }
+
+    /// Install a per-layer KV geometry: KV heads per PHYSICAL layer and/or
+    /// a V head width narrower than `head_dim` (MiMo-V2). Validates it and
+    /// reshapes the caches of every layer whose KV head count differs from
+    /// `num_kv_heads`. The loader and the tests share this one path, so a
+    /// hand-built pipeline cannot hold a geometry the loader would refuse.
+    /// Call before the first forward (it drops cached rows of reshaped
+    /// layers). Refuses combinations whose paths would read it wrong:
+    /// Gemma-4 global layers and MLA carry their own geometry.
+    pub fn set_attn_geometry(
+        &mut self,
+        kv_heads_per_layer: Option<Vec<usize>>,
+        v_head_dim: Option<usize>,
+    ) -> Result<(), String> {
+        if kv_heads_per_layer.is_some() || v_head_dim.is_some() {
+            if self.global_attn.is_some() {
+                return Err(
+                    "per-layer KV heads / v_head_dim cannot combine with Gemma-4 global \
+                     attention geometry"
+                        .into(),
+                );
+            }
+            if self
+                .weights
+                .layers
+                .iter()
+                .any(|lw| matches!(lw.attn, AttnKind::Mla(_)))
+            {
+                return Err("per-layer KV heads / v_head_dim cannot combine with MLA".into());
+            }
+        }
+        if let Some(vd) = v_head_dim {
+            if vd == 0 || vd > self.head_dim {
+                return Err(format!(
+                    "v_head_dim {vd} must be in 1..={} (head_dim)",
+                    self.head_dim
+                ));
+            }
+        }
+        if let Some(v) = &kv_heads_per_layer {
+            if v.len() != self.physical_layers {
+                return Err(format!(
+                    "kv_heads_per_layer has {} entries, expected {} layers",
+                    v.len(),
+                    self.physical_layers
+                ));
+            }
+            for (li, &nkv) in v.iter().enumerate() {
+                let is_attn = matches!(
+                    self.weights.layers.get(li).map(|lw| &lw.attn),
+                    Some(AttnKind::Full { .. }) | None
+                );
+                if !is_attn {
+                    continue;
+                }
+                let nh = self
+                    .attention_heads_per_layer
+                    .as_ref()
+                    .and_then(|h| h.get(li).copied())
+                    .unwrap_or(self.num_heads);
+                if nkv == 0 || nh % nkv != 0 {
+                    return Err(format!(
+                        "layer {li}: {nkv} KV heads must be nonzero and divide {nh} Q heads"
+                    ));
+                }
+            }
+        }
+        self.kv_heads_per_layer = kv_heads_per_layer;
+        self.v_head_dim = v_head_dim.filter(|&vd| vd != self.head_dim);
+        if self.kv_heads_per_layer.is_some() {
+            for li in 0..self.kv_cache.layers.len() {
+                let full = matches!(
+                    self.weights
+                        .layers
+                        .get(self.phys_layer(li))
+                        .map(|lw| &lw.attn),
+                    Some(AttnKind::Full { .. })
+                );
+                let nkv = self.layer_num_kv_heads(li);
+                let cache = &self.kv_cache.layers[li];
+                if full && (cache.num_kv_heads != nkv || cache.head_dim != self.head_dim) {
+                    let sinks = cache.sinks.clone();
+                    self.kv_cache.layers[li] =
+                        crate::kv_cache::LayerKvCache::new(nkv, self.head_dim);
+                    self.kv_cache.layers[li].sinks = sinks;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Attach learned attention-sink logits (one per Q head) to PHYSICAL
+    /// layer `phys` — every virtual layer that runs it. The loader calls
+    /// this for each `model.layers.N.self_attn.sinks` tensor.
+    pub fn set_layer_sinks(&mut self, phys: usize, sinks: Vec<f32>) -> Result<(), String> {
+        let Some(lw) = self.weights.layers.get(phys) else {
+            return Err(format!("sinks for layer {phys}: no such layer"));
+        };
+        if !matches!(lw.attn, AttnKind::Full { .. }) {
+            return Err(format!(
+                "sinks for layer {phys}: only softmax (Full) attention layers take sinks"
+            ));
+        }
+        let nh = self
+            .attention_heads_per_layer
+            .as_ref()
+            .and_then(|h| h.get(phys).copied())
+            .unwrap_or(self.num_heads);
+        if sinks.len() != nh {
+            return Err(format!(
+                "sinks for layer {phys}: {} values, expected one per Q head ({nh})",
+                sinks.len()
+            ));
+        }
+        if let Some(bad) = sinks.iter().find(|v| !v.is_finite()) {
+            return Err(format!("sinks for layer {phys}: non-finite value {bad}"));
+        }
+        for li in 0..self.kv_cache.layers.len() {
+            if self.phys_layer(li) == phys {
+                self.kv_cache.layers[li].sinks = Some(sinks.clone());
+            }
+        }
+        Ok(())
+    }
+
+    /// Why the GPU attention graphs cannot serve this model, if they
+    /// cannot: the wgpu whole-token and batched graphs, the greedy
+    /// multi-burst, the q1 attention dropin and the Metal block/chunk/rows
+    /// graphs all assume ONE (num_kv_heads, head_dim) geometry, V heads as
+    /// wide as K, a single RoPE table, full-context attention and a plain
+    /// softmax. A model outside that contract runs on the CPU layer walk
+    /// (and the per-op GPU matvecs) until a graph learns it — never on a
+    /// graph that would read it wrong. None = no attention-level reason
+    /// (the graph builders still check weights and layer kinds).
+    pub fn graph_attn_decline_reason(&self) -> Option<&'static str> {
+        if self.kv_heads_per_layer.is_some() {
+            return Some("per-layer KV head counts");
+        }
+        if self.v_head_dim.is_some_and(|vd| vd != self.head_dim) {
+            return Some("V heads narrower than Q/K heads");
+        }
+        if self.kv_cache.layers.iter().any(|l| l.sinks.is_some()) {
+            return Some("learned attention sinks");
+        }
+        if self.swa.is_some() || self.sliding_layers.is_some() {
+            return Some("sliding-window layers");
+        }
+        None
+    }
+
+    /// Why the WGPU graphs (whole-token, batched prefill, greedy burst)
+    /// cannot run this model's attention, if they cannot. Per-layer KV
+    /// heads, V narrower than K, learned sinks and sliding windows ride
+    /// their per-layer geometry (`GraphAttnGeom`, the ATTEND_X kernels);
+    /// what that geometry does not express keeps the decline, by name.
+    /// None for every model with one attention geometry.
+    pub fn wgpu_graph_attn_decline(&self) -> Option<&'static str> {
+        self.graph_attn_decline_reason()?;
+        if self.global_attn.is_some() {
+            return Some("per-layer head width (Gemma-4 global layers) with per-layer geometry");
+        }
+        if self.attention_heads_per_layer.is_some() {
+            return Some("per-layer Q head counts with per-layer geometry");
+        }
+        if self.attn_v_norm {
+            return Some("V norm with per-layer geometry");
+        }
+        if (0..self.num_layers).any(|li| self.layer_rope_scale(li) != 1.0) {
+            return Some("scaled RoPE positions with per-layer geometry");
+        }
+        if self.weights.layers.iter().any(|lw| {
+            lw.attn_out_norm.is_some() || lw.ffn_out_norm.is_some() || lw.layer_scale.is_some()
+        }) {
+            return Some("sandwich norms / layer scale with per-layer geometry");
+        }
+        if self.weights.layers.iter().any(|lw| {
+            matches!(
+                &lw.attn,
+                AttnKind::Full {
+                    output_gate: true,
+                    ..
+                }
+            )
+        }) && self.v_head_dim.is_some()
+        {
+            return Some("gated attention with V narrower than K");
+        }
+        if (0..self.num_layers).any(|li| {
+            self.layer_is_local(li)
+                && self.inv_freq_local.is_none()
+                && self.rotary_dim_local.is_some_and(|r| r != self.rotary_dim)
+        }) {
+            return Some("local rotary width without a local RoPE table");
+        }
+        None
+    }
+
+    /// The wgpu graphs' attention geometry for layer `li` (virtual index):
+    /// Some only for a model whose layers do not share one (MiMo-V2) — KV
+    /// heads, V width, rotary width and RoPE table, window and sinks of
+    /// THIS layer, exactly what the CPU attention reads for it.
+    fn graph_attn_geom(&self, li: usize) -> Option<crate::gpu::GraphAttnGeom<'_>> {
+        self.graph_attn_decline_reason()?;
+        let (nkv, _hd, rd) = self.layer_geom(li);
+        let invf: &[f32] = if self.layer_is_local(li) {
+            match &self.inv_freq_local {
+                Some(f) => f.as_slice(),
+                None => self.inv_freq.as_slice(),
+            }
+        } else {
+            match &self.inv_freq_global {
+                Some(f) => f.as_slice(),
+                None => self.inv_freq.as_slice(),
+            }
+        };
+        Some(crate::gpu::GraphAttnGeom {
+            nkv,
+            dv: self.layer_v_dim(li),
+            rd,
+            invf,
+            window: self.layer_window(li),
+            sink: self.kv_cache.layers[li].sinks.as_deref(),
+        })
+    }
+
+    /// Bring the host KV cache of every Full-attention layer in
+    /// `[from, upto)` up to `position` rows from the wgpu mirrors, where a
+    /// device graph advanced a layer that the host is about to run: a
+    /// device prefix that shrank since the prompt (or a batched prefill
+    /// prefix longer than the decode one). A layer whose mirror does not
+    /// hold the missing rows is left alone. Rows a sliding layer's ring
+    /// no longer holds come back as zeros — outside every window that
+    /// will read them.
+    #[cfg(feature = "gpu")]
+    fn pull_lagging_host_kv(&mut self, from: usize, upto: usize, position: usize) {
+        let kv_id = self.graph_kv_id;
+        for li in from..upto.min(self.num_layers) {
+            if !matches!(
+                self.weights.layers[self.phys_layer(li)].attn,
+                AttnKind::Full { .. }
+            ) {
+                continue;
+            }
+            let host = self.kv_cache.layers[li].seq_len;
+            if host >= position {
+                continue;
+            }
+            let Some(dev) = crate::gpu::graph_kv_stored(kv_id, li) else {
+                continue;
+            };
+            let to = dev.min(position);
+            if to <= host {
+                continue;
+            }
+            let (nkv, hd) = {
+                let c = &self.kv_cache.layers[li];
+                (c.num_kv_heads, c.head_dim)
+            };
+            let Some((k, v, first_valid)) =
+                crate::gpu::graph_kv_pull_host(kv_id, li, host, to, nkv, hd)
+            else {
+                continue;
+            };
+            // A sliding layer only ever reads its last `window` rows; a
+            // full-context layer needs every row it did not have.
+            let need_from = match self.layer_window(li) {
+                Some(w) => host.max((position + 1).saturating_sub(w)),
+                None => host,
+            };
+            if first_valid > need_from {
+                tracing::warn!(
+                    "layer {li}: device KV rows {host}..{to} no longer resident \
+                     (from {first_valid}); host attention will miss them"
+                );
+            }
+            let row = nkv * hd;
+            let cache = &mut self.kv_cache.layers[li];
+            for p in 0..to - host {
+                cache.append(&k[p * row..(p + 1) * row], &v[p * row..(p + 1) * row], &[]);
+            }
+        }
+    }
+
+    /// Log (once per graph site and pipeline) that `site` declined for
+    /// `reason`. The lines are kept so a caller or a test can read them.
+    fn note_graph_decline(&self, site: &'static str, reason: &'static str) {
+        let mut seen = self.graph_declines.borrow_mut();
+        if !seen.iter().any(|&(s, r)| s == site && r == reason) {
+            tracing::warn!("{site} declined: {reason} (CPU attention path)");
+            seen.push((site, reason));
+        }
+    }
+
+    /// The GPU-graph declines this pipeline has logged so far, as the
+    /// logged lines.
+    pub fn graph_declines(&self) -> Vec<String> {
+        self.graph_declines
+            .borrow()
+            .iter()
+            .map(|(site, reason)| format!("{site} declined: {reason} (CPU attention path)"))
+            .collect()
+    }
+
+    /// Does layer `li` have the plain attention geometry the historical
+    /// head-masked f32 path (`multi_head_attention`) assumes — pipeline-wide
+    /// KV heads / head_dim / RoPE table, full context, no sink, V as wide
+    /// as K? Anything else runs the dense `qwen_attention` instead.
+    /// `CMF_LAYER_DUMP` writer (see `Pipeline::layer_dump`): one position's
+    /// hidden after layer `li` as raw little-endian f32 into
+    /// `<dir>/p{pos:06}_l{li:02}.f32`. A failed write is reported once and
+    /// never stops the forward — the dump is a diagnostic.
+    fn dump_layer_row(&self, pos: usize, li: usize, row: &[f32]) {
+        let Some(dir) = &self.layer_dump else {
+            return;
+        };
+        let mut bytes = Vec::with_capacity(row.len() * 4);
+        for v in row {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let path = dir.join(format!("p{pos:06}_l{li:02}.f32"));
+        if let Err(e) = std::fs::create_dir_all(dir).and_then(|_| std::fs::write(&path, &bytes)) {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static SAID: AtomicBool = AtomicBool::new(false);
+            if !SAID.swap(true, Ordering::Relaxed) {
+                tracing::error!("CMF_LAYER_DUMP: cannot write {}: {e}", path.display());
+            }
+        }
+    }
+
+    /// Decide the MiMo-V2 expert placement once (`crate::mimo_moe`). Any
+    /// other model turns the slot off on the first call.
+    fn mimo_moe_prepare(&mut self) {
+        if !self.mimo_moe.is_undecided() {
+            return;
+        }
+        let slot = {
+            let layers: Vec<(usize, &MoeFfn)> = (0..self.num_layers)
+                .filter_map(
+                    |li| match &self.weights.layers.get(self.phys_layer(li))?.ffn {
+                        FfnKind::Moe(m) => Some((li, m)),
+                        _ => None,
+                    },
+                )
+                .collect();
+            // One bank lives on one device: an in-process multi-GPU split
+            // keeps the whole-layer path.
+            if layers.is_empty()
+                || self.physical_layers != self.num_layers
+                || self.gpu_plan.is_some()
+            {
+                crate::mimo_moe::Slot::Off
+            } else {
+                // Whether a whole-token graph could run this model's layers
+                // (then a whole-layer prefix is one submit, not per-layer
+                // fences).
+                let graph_prefix =
+                    self.wgpu_graph_attn_decline().is_none() && crate::gpu::wgpu_graph_default();
+                crate::mimo_moe::Slot::decide(&layers, self.num_layers, graph_prefix)
+            }
+        };
+        self.mimo_moe = slot;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_graph_kv_id(&self) -> u64 {
+        self.graph_kv_id
+    }
+
+    /// Dynamic MiMo layer: one device attention graph, followed by a bank
+    /// frame. Both decode and short verification use this same attention
+    /// path and absolute layer key; the host KV may intentionally lag.
+    pub(crate) fn mimo_graph_layer_rows(
+        &mut self,
+        li: usize,
+        h: &mut [f32],
+        positions: &[usize],
+    ) -> crate::gpu::BatchGraphOutcome {
+        use crate::gpu::BatchGraphOutcome as Out;
+        let b = positions.len();
+        if !(1..=4).contains(&b)
+            || h.len() != b * self.hidden_size
+            || !self.mimo_moe.is_dynamic(li, true)
+            || !crate::gpu::enabled_here()
+            || !crate::gpu::wgpu_active()
+            || self.o1_active()
+            || self.physical_layers != self.num_layers
+            // The pair-fusion diagnostic (and an explicit graph-off run)
+            // rewinds only host KV. A hidden singleton attention graph here
+            // would leave device mirrors ahead of the next host position.
+            || std::env::var("CMF_GPU_WGPU_GRAPH").as_deref() == Ok("0")
+            || std::env::var("CMF_MIMO_ATTN_GRAPH").as_deref() == Ok("0")
+            || self.wgpu_graph_attn_decline().is_some()
+        {
+            return Out::Declined;
+        }
+        let attn_started = std::time::Instant::now();
+        let outcome = {
+            let lw = &self.weights.layers[li];
+            if lw.attn_out_norm.is_some() || lw.ffn_out_norm.is_some() || lw.layer_scale.is_some() {
+                return Out::Declined;
+            }
+            let FfnKind::Moe(m) = &lw.ffn else {
+                return Out::Declined;
+            };
+            let AttnKind::Full {
+                wq,
+                wk,
+                wv,
+                wo,
+                q_norm,
+                k_norm,
+                output_gate,
+                softplus_gate,
+                bias,
+            } = &lw.attn
+            else {
+                return Out::Declined;
+            };
+            if *output_gate || softplus_gate.is_some() {
+                return Out::Declined;
+            }
+            let Some(model) = wq.graph_weight().map(|(m, ..)| m.clone()).or_else(|| {
+                m.experts
+                    .first()?
+                    .gate_proj
+                    .mapped_q4tp()
+                    .map(|(m, _)| m.clone())
+            }) else {
+                return Out::Declined;
+            };
+            fn gw<'a>(
+                t: &'a QTensor,
+                owner: &std::sync::Arc<cortiq_core::CmfModel>,
+            ) -> Option<crate::gpu::GraphW<'a>> {
+                if let Some((m, idx, kind, rs)) = t.graph_weight() {
+                    if m.uid() != owner.uid() || t.has_prism_contract() {
+                        return None;
+                    }
+                    return Some(crate::gpu::GraphW {
+                        idx,
+                        kind,
+                        row_scale: rs,
+                        data: &[],
+                        prism: crate::gpu::GraphPrismOp::None,
+                        affine: false,
+                    });
+                }
+                t.as_f32().map(|data| crate::gpu::GraphW {
+                    idx: 0,
+                    kind: 4,
+                    row_scale: &[],
+                    data,
+                    prism: crate::gpu::GraphPrismOp::None,
+                    affine: false,
+                })
+            }
+            let (Some(q), Some(k), Some(v), Some(o)) = (
+                gw(wq, &model),
+                gw(wk, &model),
+                gw(wv, &model),
+                gw(wo, &model),
+            ) else {
+                return Out::Declined;
+            };
+            let layer = crate::gpu::GraphLayer {
+                input_norm: &lw.input_norm,
+                post_norm: &lw.post_norm,
+                ffn: crate::gpu::GraphFfn::AttentionOnly,
+                attn: crate::gpu::GraphAttn::Full {
+                    wq: q,
+                    wk: k,
+                    wv: v,
+                    wo: o,
+                    q_norm: q_norm.as_deref(),
+                    k_norm: k_norm.as_deref(),
+                    late_qk_norm: self.qk_norm_after_rope,
+                    bias: bias
+                        .as_ref()
+                        .map(|(q, k, v)| (q.as_slice(), k.as_slice(), v.as_slice())),
+                    output_gate: false,
+                    cpu_k: self.kv_cache.layers[li].k_heads(),
+                    cpu_v: self.kv_cache.layers[li].v_heads(),
+                    geom: self.graph_attn_geom(li),
+                },
+            };
+            let (nkv, hd, rd) = self.layer_geom(li);
+            crate::gpu::forward_batch_graph_at(
+                &model,
+                self.graph_kv_id,
+                li,
+                &[layer],
+                &self.inv_freq,
+                h,
+                self.layer_num_heads(li),
+                nkv,
+                hd,
+                rd,
+                self.hidden_size,
+                1,
+                positions,
+                self.kv_cache.max_seq_len,
+                self.norm_style == cortiq_core::NormStyle::Gemma,
+                self.rms_eps as f32,
+                self.attn_scale,
+                b,
+                &[],
+                self.o1_epoch,
+                None,
+                None,
+            )
+        };
+        match outcome {
+            Out::Completed => {}
+            Out::Declined => return Out::Declined,
+            Out::Failed => {
+                self.graph_failed
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                return Out::Failed;
+            }
+        }
+        let attn_ns = attn_started.elapsed().as_nanos() as u64;
+        let hs = self.hidden_size;
+        let lw = &self.weights.layers[li];
+        let FfnKind::Moe(m) = &lw.ffn else {
+            unreachable!()
+        };
+        let mut post = vec![0.0; h.len()];
+        for (x, y) in h.chunks_exact(hs).zip(post.chunks_exact_mut(hs)) {
+            inference::rms_norm_into(x, &lw.post_norm, self.rms_eps, self.norm_style, y);
+        }
+        let mut ffn = if b == 1 {
+            moe_ffn_banked(&mut self.mimo_moe, li, m, &post, self.pool.as_deref())
+        } else {
+            moe_ffn_banked_rows(
+                &mut self.mimo_moe,
+                li,
+                m,
+                &post,
+                b,
+                hs,
+                self.pool.as_deref(),
+            )
+        };
+        for (x, &f) in h.iter_mut().zip(&ffn) {
+            *x += f;
+        }
+        attention::recycle_buf(&mut ffn);
+        if self.layer_dump.is_some() {
+            for (&pos, row) in positions.iter().zip(h.chunks_exact(hs)) {
+                self.dump_layer_row(pos, li, row);
+            }
+        }
+        crate::mimo_moe::note_attention_graph(b, attn_ns);
+        Out::Completed
+    }
+
+    fn layer_attn_plain(&self, li: usize) -> bool {
+        self.kv_heads_per_layer.is_none()
+            && self.v_head_dim.is_none()
+            && self.global_attn.is_none()
+            && self.layer_window(li).is_none()
+            && self.kv_cache.layers[li].sinks.is_none()
     }
 
     /// Forward one position through all layers (hybrid dispatch).
@@ -8707,6 +9796,12 @@ impl Pipeline {
         if self.o1_active() || self.attn_softcap > 0.0 {
             return None;
         }
+        // The burst builds the whole-token graph; attention the graph's
+        // per-layer geometry cannot express keeps the per-token path.
+        if let Some(reason) = self.wgpu_graph_attn_decline() {
+            self.note_graph_decline("wgpu multi-burst", reason);
+            return None;
+        }
         let graph_on = crate::gpu::wgpu_graph_on(crate::gpu::GraphPhase::Decode);
         if !graph_on || crate::gpu::graph_unsupported() {
             // Same memo as the decode site: this path builds the very
@@ -8759,6 +9854,17 @@ impl Pipeline {
         from: usize,
         upto_excl: usize,
     ) -> Option<Result<Vec<f32>, ()>> {
+        // The bank has already reserved its VRAM. Never build a second
+        // all-expert arena across bank-owned layers (including bursts).
+        let upto_excl = match self.mimo_moe.graph_prefix_end() {
+            Some(end) if end < upto_excl => {
+                if steps != 1 || layers_run.is_none() || from >= end {
+                    return None;
+                }
+                end
+            }
+            _ => upto_excl,
+        };
         // O(1) Nyström decode runs off the sealed state, not the KV cache the
         // graph mirrors — never take the graph while o1 is active.
         let o1_gpu = std::env::var("CMF_O1_GPU").as_deref() == Ok("1");
@@ -8766,6 +9872,16 @@ impl Pipeline {
             // Softcapped scores have no graph kernel yet — CPU owns them.
             // o1 rides the graph only behind CMF_O1_GPU=1 while the port
             // proves itself; without it the CPU path owns o1 as before.
+            return None;
+        }
+        // Per-layer KV heads, narrow V, sinks and sliding windows ride
+        // `GraphAttn::Full::geom` (the ATTEND_X kernels). Anything that
+        // geometry cannot express declines here, by name — before the
+        // per-layer gate existed a sliding/sink model ran the graph as
+        // full-context attention, fluent and wrong. The caller memoizes
+        // the refusal.
+        if let Some(reason) = self.wgpu_graph_attn_decline() {
+            self.note_graph_decline("wgpu token graph", reason);
             return None;
         }
         // Per-layer sealed o1 state for the graph. During prefill the
@@ -9064,6 +10180,7 @@ impl Pipeline {
                         output_gate: *output_gate,
                         cpu_k: self.kv_cache.layers[li].k_heads(),
                         cpu_v: self.kv_cache.layers[li].v_heads(),
+                        geom: self.graph_attn_geom(li),
                     }
                 }
                 AttnKind::LinearGdn(w) => {
@@ -9274,6 +10391,8 @@ impl Pipeline {
             || self.swa.is_some()
             || self.global_attn.is_some()
             || self.attention_heads_per_layer.is_some()
+            // per-layer KV heads, narrow V, learned sinks (MiMo-V2)
+            || self.graph_attn_decline_reason().is_some()
             || self.attn_v_norm
             || self.loop_final_norm
         {
@@ -10648,10 +11767,40 @@ impl Pipeline {
         k: usize,
         spec: Option<crate::gpu::SpecTail<'_>>,
     ) -> crate::gpu::BatchGraphOutcome {
+        self.try_batch_graph_wgpu_prefix(hiddens, positions, k, spec, None)
+    }
+
+    /// `try_batch_graph_wgpu` with the device-prefix mode: `layers_run`
+    /// Some lets a stack that does not fit run its leading layers (the
+    /// token graph's prefix rule) and reports how many; `hiddens` then
+    /// holds the boundary rows and the caller runs the rest on the host.
+    fn try_batch_graph_wgpu_prefix(
+        &self,
+        hiddens: &mut [f32],
+        positions: &[usize],
+        k: usize,
+        spec: Option<crate::gpu::SpecTail<'_>>,
+        layers_run: Option<&mut usize>,
+    ) -> crate::gpu::BatchGraphOutcome {
+        let graph_end = match self.mimo_moe.graph_prefix_end() {
+            Some(end) if end < self.num_layers => {
+                if layers_run.is_none() || spec.is_some() || end == 0 {
+                    return crate::gpu::BatchGraphOutcome::Declined;
+                }
+                end
+            }
+            _ => self.num_layers,
+        };
         let _tb = std::time::Instant::now();
         let batch_debug = std::env::var_os("CMF_BATCH_DEBUG").is_some();
         if self.attn_softcap > 0.0 {
             return crate::gpu::BatchGraphOutcome::Declined; // capped scores: no graph kernel — CPU path
+        }
+        // Same attention contract as the token graph: per-layer geometry
+        // rides `geom`, anything it cannot express declines by name.
+        if let Some(reason) = self.wgpu_graph_attn_decline() {
+            self.note_graph_decline("wgpu batch graph", reason);
+            return crate::gpu::BatchGraphOutcome::Declined;
         }
         let nh = self.num_heads;
         let (nkv, hd, rd) = self.layer_geom(0);
@@ -10698,9 +11847,9 @@ impl Pipeline {
             Vec<crate::gpu::GraphLayer<'_>>,
             std::sync::Arc<cortiq_core::CmfModel>,
         )> = (|| {
-            let mut layers = Vec::with_capacity(self.num_layers);
+            let mut layers = Vec::with_capacity(graph_end);
             let mut model = None;
-            for li in 0..self.num_layers {
+            for li in 0..graph_end {
                 let lw = &self.weights.layers[self.phys_layer(li)];
                 // MoE routes per token, so its experts are encoded token by
                 // token inside the batched submit while attention and the
@@ -10730,15 +11879,18 @@ impl Pipeline {
                         if m.route_tau.is_some() || m.mask.is_some() {
                             return None;
                         }
-                        // The batch MoE kernels need the shared slot (k+1
-                        // rows); gated or not is a flag on the select kernel.
-                        let (se, sg) = m.shared.as_ref()?;
-                        let shared_gated = sg.is_some();
-                        let sgate = match sg {
-                            Some(sg) => gw(sg)?,
-                            // Ungated: the router plane stands in so the
-                            // plumbing stays total; the kernel pins weight 1.
-                            None => gw(&m.router)?,
+                        // A shared expert rides as slot top_k (gated or
+                        // not is a flag on the select kernel); without one
+                        // (MiMo-V2, LFM2-MoE) the kernels run top_k slots.
+                        let shared = m.shared.as_ref();
+                        let has_shared = shared.is_some();
+                        let shared_gated = matches!(shared, Some((_, Some(_))));
+                        let sgate = match shared {
+                            Some((_, Some(sg))) => gw(sg)?,
+                            // Ungated or absent: the router plane stands in
+                            // so the plumbing stays total; the kernel pins
+                            // weight 1 or never reads it.
+                            _ => gw(&m.router)?,
                         };
                         let router = gw(&m.router)?;
                         // The batch MoE kernels still consume raw per-token
@@ -10757,7 +11909,7 @@ impl Pipeline {
                         let mut experts = Vec::with_capacity(m.experts.len() + 1);
                         let mut q4tp: Option<bool> = None;
                         let mut gu_q2: Option<bool> = None;
-                        for e in m.experts.iter().chain(std::iter::once(se)) {
+                        for e in m.experts.iter().chain(shared.map(|(se, _)| se)) {
                             if !matches!(e.act, Act::Silu)
                                 || e.gate_proj.rows() != inter
                                 || e.up_proj.rows() != inter
@@ -10828,7 +11980,7 @@ impl Pipeline {
                             gu_q2: gu_q2.unwrap_or(false),
                             sigmoid: m.router_sigmoid,
                             bias: m.expert_bias.as_deref(),
-                            has_shared: true,
+                            has_shared,
                             shared_gated,
                             route_scale: m.routed_scaling,
                         }
@@ -10875,6 +12027,7 @@ impl Pipeline {
                             output_gate: *output_gate,
                             cpu_k: self.kv_cache.layers[li].k_heads(),
                             cpu_v: self.kv_cache.layers[li].v_heads(),
+                            geom: self.graph_attn_geom(li),
                         }
                     }
                     AttnKind::LinearGdn(w) => {
@@ -10949,11 +12102,12 @@ impl Pipeline {
             self.rms_eps as f32,
             self.attn_scale,
             k,
-            &(0..self.num_layers)
+            &(0..graph_end)
                 .map(|li| self.kv_cache.layers[self.phys_layer(li)].o1_views())
                 .collect::<Vec<_>>(),
             self.o1_epoch,
             spec,
+            layers_run,
         )
     }
 
@@ -11657,6 +12811,11 @@ impl Pipeline {
             );
         }
         let mut h = hidden.to_vec();
+        // MiMo-V2 expert placement: decided before the graph or the per-op
+        // arena can claim the budget the expert bank needs.
+        self.mimo_moe_prepare();
+        let _mimo_q8 = self.mimo_moe.is_on()
+            .then(crate::qtensor::enter_full_gpu_q8_scope);
         // Split borrows: copy scalars / clone handles so the per-layer
         // cfg does not hold `&self` while the KV cache is `&mut`.
         let (nh, _nkv, _hd, hs, _rd, eps) = (
@@ -11844,6 +13003,10 @@ impl Pipeline {
                 tail_start = from + gl;
             }
         }
+        // Layers the host is about to run whose device mirror moved ahead
+        // of the host cache (a device prefix that shrank since the prompt,
+        // a batched-prefill prefix longer than this token's): bring their
+        // rows over first. One comparison per layer when nothing lags.
         let t_race_cpu = (race_eligible && !graph_trusted).then(std::time::Instant::now);
 
         // A partial graph is an explicit GPU-prefix / CPU-tail split. Keep
@@ -11851,7 +13014,12 @@ impl Pipeline {
         // residency arena streams every omitted layer through Vulkan and the
         // driver's freed-allocation cache can grow to the full model size
         // (25.4 GiB observed with a 14 GiB budget on Granite 30B Q8_2F).
-        let _host_tail = (tail_start > from).then(crate::gpu::enter_cpu_scope);
+        // With a MiMo expert bank the tail is not a whole-layer host
+        // stream: its experts run from the bank (never the arena) and its
+        // projections stay per-op on the device, which the bank's placement
+        // left room for.
+        let host_tail = tail_start > from;
+        let _host_tail = (host_tail && !self.mimo_moe.is_on()).then(crate::gpu::enter_cpu_scope);
         let automatic_gpu_prefix = self.automatic_gpu_prefix();
 
         let _prof_layers = crate::cpuprof::time(crate::cpuprof::Slot::Layers);
@@ -11859,7 +13027,7 @@ impl Pipeline {
         let mut gpu_skip_until = 0usize;
         for li in tail_start.max(from)..self.num_layers {
             let _capacity_tail = automatic_gpu_prefix
-                .filter(|&prefix| li >= prefix)
+                .filter(|&prefix| li >= prefix && !self.mimo_moe.is_dynamic(li, host_tail))
                 .map(|_| crate::gpu::enter_cpu_scope());
             crate::gpu::set_layer(li as i64); // layer-split GPU/CPU (CMF_GPU_LAYERS)
             if let Some(u) = upto {
@@ -11908,6 +13076,15 @@ impl Pipeline {
                 }
             }
 
+            if task_mask.is_none() {
+                match self.mimo_graph_layer_rows(li, &mut h, &[position]) {
+                    crate::gpu::BatchGraphOutcome::Completed => continue,
+                    crate::gpu::BatchGraphOutcome::Failed => return vec![0.0; self.hidden_size],
+                    crate::gpu::BatchGraphOutcome::Declined => {},
+                }
+            }
+            #[cfg(feature = "gpu")]
+            self.pull_lagging_host_kv(li, li + 1, position);
             let lw = &self.weights.layers[self.phys_layer(li)];
             if let Ok(tp) = std::env::var("CMF_TRACE_POS") {
                 if tp.parse::<usize>().ok() == Some(position) {
@@ -12030,6 +13207,7 @@ impl Pipeline {
                         rms_eps: eps,
                         norm_style: self.norm_style,
                         pool: pool.as_deref(),
+                        v_head_dim: self.layer_v_dim(li),
                     };
                     attention::qwen_attention_nystrom(
                         &self.ws.n1,
@@ -12054,7 +13232,15 @@ impl Pipeline {
                 } => 'attn: {
                     // wgpu token-graph attention (opt-in): whole sub-block in
                     // one submit, device K/V mirror. q1 only, no gate/bias/mask.
+                    // Its kernel has no window, sink or narrow-V slot and
+                    // one mirror geometry: such models stay on the CPU attend.
+                    let dropin_reason =
+                        graph_on.then(|| self.graph_attn_decline_reason()).flatten();
+                    if let Some(reason) = dropin_reason {
+                        self.note_graph_decline("wgpu attn dropin", reason);
+                    }
                     if graph_on
+                        && dropin_reason.is_none()
                         && !*output_gate
                         && softplus_gate.is_none()
                         && self.attention_heads_per_layer.is_none()
@@ -12107,10 +13293,13 @@ impl Pipeline {
                         .map(|m| m.head_flags(li, self.num_heads).iter().any(|&a| !a))
                         .unwrap_or(false);
                     let f32_view = (wq.as_f32(), wk.as_f32(), wv.as_f32(), wo.as_f32());
+                    // The masked kernel knows one pipeline-wide geometry and
+                    // RoPE table, no window and no sink.
+                    let plain = self.layer_attn_plain(li);
                     match (masked, f32_view) {
                         // Historical masked path (f32 slices; the loader
                         // keeps masked models in f32).
-                        (true, (Some(q), Some(k), Some(v), Some(o))) => {
+                        (true, (Some(q), Some(k), Some(v), Some(o))) if plain => {
                             let active_heads = task_mask.unwrap().head_flags(li, self.num_heads);
                             attention::multi_head_attention(
                                 &self.ws.n1,
@@ -12131,8 +13320,9 @@ impl Pipeline {
                         (masked, _) => {
                             if masked {
                                 tracing::warn!(
-                                    "layer {li}: head mask on quantized weights not \
-                                     supported yet — executing dense"
+                                    "layer {li}: head mask on quantized weights or on a \
+                                     window/sink/per-layer-geometry layer not supported \
+                                     yet — executing dense"
                                 );
                             }
                             let inv_freq_l = self.layer_inv_freq(li);
@@ -12163,6 +13353,7 @@ impl Pipeline {
                                 rms_eps: eps,
                                 norm_style: self.norm_style,
                                 pool: pool.as_deref(),
+                                v_head_dim: self.layer_v_dim(li),
                             };
                             attention::qwen_attention(
                                 &self.ws.n1,
@@ -12287,6 +13478,11 @@ impl Pipeline {
                         self.norm_style,
                         self.pool.as_deref(),
                     ),
+                    FfnKind::Moe(m)
+                        if task_mask.is_none() && self.mimo_moe.is_dynamic(li, host_tail) =>
+                    {
+                        moe_ffn_banked(&mut self.mimo_moe, li, m, post_normed, self.pool.as_deref())
+                    }
                     _ => {
                         let allowed = match (&lw.ffn, task_mask) {
                             (FfnKind::Moe(m), Some(tm)) => tm.expert_flags(li, m.experts.len()),
@@ -12316,6 +13512,10 @@ impl Pipeline {
                 for v in h.iter_mut() {
                     *v *= sc;
                 }
+            }
+            // CMF_LAYER_DUMP: this position's hidden after layer li.
+            if self.layer_dump.is_some() {
+                self.dump_layer_row(position, li, &h);
             }
 
             // Looped Transformer: apply final norm at the end of each loop iteration.
@@ -12455,11 +13655,22 @@ impl Pipeline {
     /// LM head: hidden → logits [vocab_size]. The dominant matvec of
     /// every decode step — row-parallel on the worker pool.
     fn lm_head_forward(&self, hidden: &[f32]) -> Vec<f32> {
+        let _mimo_q8 = self.mimo_moe.is_on()
+            .then(crate::qtensor::enter_full_gpu_q8_scope);
         let rows = self.weights.lm_head.rows();
         let mut logits = attention::take_buf(rows.min(self.vocab_size));
-        self.weights
-            .lm_head
-            .matvec(hidden, &mut logits, self.pool.as_deref());
+        // Banked MiMo uses the same exact projection family for the
+        // plain/draft head and the batched verification head. Read both
+        // scale planes in-place instead of preparing per-op scale buffers.
+        let served = self.mimo_moe.is_on() && crate::gpu::mimo_q8_short_enabled()
+            && rows == self.vocab_size && !self.weights.lm_head.has_prism_contract()
+            && self.weights.lm_head.graph_weight().is_some_and(|(model, idx, kind, _)| {
+                kind == 7 && crate::gpu::q82_short_rows(model, idx, hidden, 1,
+                    rows, self.hidden_size, &mut logits)
+            });
+        if !served {
+            self.weights.lm_head.matvec(hidden, &mut logits, self.pool.as_deref());
+        }
         logits.resize(self.vocab_size, 0.0);
         if let Some(m) = self.logit_multiplier {
             for l in logits.iter_mut() {
@@ -13158,7 +14369,9 @@ fn moe_ffn_batch(
             // stats and must not cross the pool boundary.
             let experts = &m.experts;
             let (active_r, assign_r) = (&active, &assign);
+            let inherit_cpu = crate::gpu::inherit_cpu_scope();
             let run = |start: usize, end: usize| {
+                let _cpu_scope = inherit_cpu();
                 for ai in start..end {
                     let e = active_r[ai];
                     let list = &assign_r[e];
@@ -13203,6 +14416,129 @@ fn moe_ffn_batch(
             (0..b).map(|bi| (bi, 1.0)).collect()
         };
         run_expert(se, &all, &mut out);
+    }
+    out
+}
+
+/// Decode-exact multi-token MoE — the MiMo speculative verify's FFN. Row
+/// `r` of the result is bit-identical to `moe_ffn(m, x_r)` on the CPU
+/// (`moe_ffn_cpu` → `moe_ffn_cpu_batched`): router matvec per row, the same
+/// routing, the same int8 gate/up/SiLU and down terms
+/// (`QTensor::moe_gate_up_rows` / `moe_down_rows`), and the row's experts
+/// summed in ITS route order from 0. What the rows share is the weight
+/// traffic: each routed expert is read once for every row that picked it.
+/// (`moe_ffn_batch`, the prompt path, groups the same way but sums in
+/// expert-index order and runs blocked kernels on wide groups — close, not
+/// bit-equal to decode.) Any layer the kernels do not cover, or a device
+/// that could answer `moe_ffn` itself, walks `moe_ffn` row by row.
+fn moe_ffn_rows_exact(
+    m: &MoeFfn,
+    xs: &[f32],
+    b: usize,
+    hidden: usize,
+    pool: Option<&Pool>,
+) -> Vec<f32> {
+    let mut out = vec![0.0f32; b * hidden];
+    let per_row = |out: &mut [f32]| {
+        for r in 0..b {
+            let o = moe_ffn(m, &xs[r * hidden..(r + 1) * hidden], pool, None);
+            out[r * hidden..(r + 1) * hidden].copy_from_slice(&o);
+        }
+    };
+    let covered = !crate::gpu::enabled_here()
+        && moe_batch_enabled()
+        && m.shared.is_none()
+        && m.resonance.is_none()
+        && FFN_PROBE.with(|pr| pr.borrow().is_none())
+        && m.experts.iter().all(|d| d.act == Act::Silu);
+    if !covered {
+        per_row(&mut out);
+        return out;
+    }
+    let ne = m.experts.len();
+    // Routing, row by row, exactly as `moe_ffn`.
+    let mut routes: Vec<(Vec<usize>, Vec<f32>)> = Vec::with_capacity(b);
+    for r in 0..b {
+        let x = &xs[r * hidden..(r + 1) * hidden];
+        accumulate_act(m, x, 1);
+        let mut logits = vec![0.0f32; ne];
+        m.router.matvec(x, &mut logits, pool);
+        let (idx, p, wsum) = moe_route(&logits, m, None);
+        {
+            let mut st = m.stats.borrow_mut();
+            if st.len() < ne {
+                st.resize(ne, 0);
+            }
+            for &e in &idx {
+                st[e] += 1;
+            }
+        }
+        let w: Vec<f32> = idx
+            .iter()
+            .map(|&e| p[e] / wsum * m.per_expert_scale.as_ref().map_or(1.0, |v| v[e]))
+            .collect();
+        routes.push((idx, w));
+    }
+    if routes.iter().any(|(idx, _)| idx.is_empty()) {
+        per_row(&mut out);
+        return out;
+    }
+    // Group the (row, expert) picks by expert, in first-seen order.
+    let mut experts: Vec<usize> = Vec::new();
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (r, (idx, _)) in routes.iter().enumerate() {
+        for &e in idx {
+            match experts.iter().position(|&x| x == e) {
+                Some(g) => groups[g].push(r),
+                None => {
+                    experts.push(e);
+                    groups.push(vec![r]);
+                }
+            }
+        }
+    }
+    let n_pairs: usize = groups.iter().map(|g| g.len()).sum();
+    let inter = m.experts[experts[0]].gate_proj.rows();
+    let pairs: Vec<(&QTensor, &QTensor)> = experts
+        .iter()
+        .map(|&e| (&m.experts[e].gate_proj, &m.experts[e].up_proj))
+        .collect();
+    let mut gs: Vec<Vec<f32>> = (0..n_pairs).map(|_| vec![0f32; inter]).collect();
+    if !QTensor::moe_gate_up_rows(&pairs, &groups, xs, &mut gs, pool) {
+        per_row(&mut out);
+        return out;
+    }
+    let downs: Vec<&QTensor> = experts.iter().map(|&e| &m.experts[e].down_proj).collect();
+    let lens: Vec<usize> = groups.iter().map(|g| g.len()).collect();
+    let mut ds: Vec<Vec<f32>> = (0..n_pairs).map(|_| vec![0f32; hidden]).collect();
+    if !QTensor::moe_down_rows(&downs, &lens, &gs, &mut ds, pool) {
+        per_row(&mut out);
+        return out;
+    }
+    // Where each (row, expert) term landed in the flat pair list.
+    let mut slot = std::collections::HashMap::with_capacity(n_pairs);
+    let mut p = 0usize;
+    for (g, &e) in experts.iter().enumerate() {
+        for &r in &groups[g] {
+            slot.insert((r, e), p);
+            p += 1;
+        }
+    }
+    for (r, (idx, w)) in routes.iter().enumerate() {
+        let terms: Vec<(&[f32], f32)> = idx
+            .iter()
+            .zip(w)
+            .map(|(&e, &we)| (ds[slot[&(r, e)]].as_slice(), we))
+            .collect();
+        let row = &mut out[r * hidden..(r + 1) * hidden];
+        for (i, dst) in row.iter_mut().enumerate() {
+            // `moe_down_many`'s per-row sum: from 0, in route order.
+            let mut acc = 0f32;
+            for (d, we) in &terms {
+                acc += we * d[i];
+            }
+            *dst = acc;
+        }
     }
     out
 }
@@ -14653,6 +15989,31 @@ pub(crate) fn moe_ffn(
     pool: Option<&Pool>,
     allowed: Option<&[bool]>,
 ) -> Vec<f32> {
+    let r = moe_ffn_route(m, x, pool, allowed);
+    moe_ffn_experts(m, x, &r, pool)
+}
+
+/// One token's host route through a MoE layer: the chosen experts in
+/// selection order, the per-expert scores and the normalizer (see
+/// `moe_route`), plus the raw router logits.
+pub(crate) struct MoeRoute {
+    pub idx: Vec<usize>,
+    pub p: Vec<f32>,
+    pub wsum: f32,
+    pub logits: Vec<f32>,
+}
+
+/// The routing half of `moe_ffn`, shared by every executor of the chosen
+/// experts (the host/per-op path below and the MiMo dynamic device cache,
+/// `crate::mimo_moe`): activation accounting, router logits, `moe_route`,
+/// the selection statistics and the `CMF_MOE_TRACE` line — so switching
+/// executors can never change which experts a token gets.
+pub(crate) fn moe_ffn_route(
+    m: &MoeFfn,
+    x: &[f32],
+    pool: Option<&Pool>,
+    allowed: Option<&[bool]>,
+) -> MoeRoute {
     accumulate_act(m, x, 1);
     let ne = m.experts.len();
     let mut logits = vec![0.0f32; ne];
@@ -14676,6 +16037,23 @@ pub(crate) fn moe_ffn(
     // cannot answer — whether CONSECUTIVE tokens reuse experts (the
     // temporal locality an LRU cache lives on, FreeToken §4).
     moe_trace(&idx);
+    MoeRoute {
+        idx,
+        p,
+        wsum,
+        logits,
+    }
+}
+
+/// The expert half of `moe_ffn`: run a route's experts on the per-op GPU
+/// block or the host.
+pub(crate) fn moe_ffn_experts(
+    m: &MoeFfn,
+    x: &[f32],
+    r: &MoeRoute,
+    pool: Option<&Pool>,
+) -> Vec<f32> {
+    let (idx, p, wsum) = (&r.idx, &r.p, r.wsum);
     // D5: the whole layer MoE block in one GPU command buffer (experts — the
     // same mmap via a no-copy buffer; intermediate activations on the GPU).
     // Same Ffn probe class as the dense chain: one submit per layer
@@ -14701,6 +16079,59 @@ pub(crate) fn moe_ffn(
         }
     }
     moe_ffn_cpu(m, x, &idx, &p, wsum, pool)
+}
+
+/// One MoE token through the MiMo expert bank (`crate::mimo_moe`), or —
+/// when the bank does not serve it — through the host path with the SAME
+/// route, so the routing statistics and `CMF_MOE_TRACE` see it once.
+fn moe_ffn_banked(
+    slot: &mut crate::mimo_moe::Slot,
+    li: usize,
+    m: &MoeFfn,
+    x: &[f32],
+    pool: Option<&Pool>,
+) -> Vec<f32> {
+    let t0 = std::time::Instant::now();
+    let r = moe_ffn_route(m, x, pool, None);
+    slot.note_route(t0.elapsed().as_nanos() as u64);
+    match slot.forward(li, m, x, &r, pool) {
+        Some(out) => out,
+        None => crate::qtensor::float_activations_scope(|| {
+            crate::gpu::cpu_scope(|| moe_ffn_experts(m, x, &r, pool))
+        }),
+    }
+}
+
+/// Verify rows share a bank frame; routing and fallback are decode's.
+fn moe_ffn_banked_rows(
+    slot: &mut crate::mimo_moe::Slot,
+    li: usize,
+    m: &MoeFfn,
+    xs: &[f32],
+    b: usize,
+    hidden: usize,
+    pool: Option<&Pool>,
+) -> Vec<f32> {
+    let t0 = std::time::Instant::now();
+    let routes: Vec<_> = xs
+        .chunks_exact(hidden)
+        .map(|x| moe_ffn_route(m, x, pool, None))
+        .collect();
+    slot.note_route(t0.elapsed().as_nanos() as u64);
+    if let Some(out) = slot.forward_rows(li, m, xs, &routes, pool) {
+        return out;
+    }
+    let mut out = Vec::with_capacity(b * hidden);
+    for (x, r) in xs.chunks_exact(hidden).zip(&routes) {
+        let row = slot.forward(li, m, x, r, pool).unwrap_or_else(|| {
+            // A failed bank must not stream missing experts into the arena.
+            crate::qtensor::float_activations_scope(|| {
+                crate::gpu::cpu_scope(|| moe_ffn_experts(m, x, r, pool))
+            })
+        });
+        out.extend(row);
+    }
+    out
 }
 
 /// One-shot report of whether the whole-token wgpu graph actually formed.
@@ -14870,6 +16301,76 @@ pub(crate) fn moe_cold_experts_cpu(
             *o += weight * v;
         }
         attention::recycle_buf(&mut one);
+    }
+    out
+}
+
+/// Cold part of a short bank batch. Share each expert's weight stream
+/// across its tokens, but reduce contributions in each token's route order.
+/// On an unsupported CPU/layout, retain the single-token cold kernels.
+pub(crate) fn moe_cold_experts_rows_cpu(
+    jobs: &[Vec<(&DenseFfn, f32)>],
+    xs: &[f32],
+    hidden: usize,
+    pool: Option<&Pool>,
+) -> Vec<f32> {
+    let mut out = vec![0.0; xs.len()];
+    let mut experts: Vec<&DenseFfn> = Vec::new();
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut terms = vec![Vec::new(); jobs.len()];
+    for (r, row) in jobs.iter().enumerate() {
+        for &(e, w) in row {
+            let g = match experts.iter().position(|&d| std::ptr::eq(d, e)) {
+                Some(g) => g,
+                None => {
+                    experts.push(e);
+                    groups.push(Vec::new());
+                    groups.len() - 1
+                }
+            };
+            terms[r].push((g, groups[g].len(), w));
+            groups[g].push(r);
+        }
+    }
+    if experts.is_empty() {
+        return out;
+    }
+    let pairs: Vec<_> = experts.iter().map(|e| (&e.gate_proj, &e.up_proj)).collect();
+    let downs: Vec<_> = experts.iter().map(|e| &e.down_proj).collect();
+    let lens: Vec<_> = groups.iter().map(Vec::len).collect();
+    let count: usize = lens.iter().sum();
+    let mut acts = vec![vec![0.0; experts[0].gate_proj.rows()]; count];
+    let mut ds = vec![vec![0.0; hidden]; count];
+    if QTensor::moe_gate_up_rows(&pairs, &groups, xs, &mut acts, pool)
+        && QTensor::moe_down_rows(&downs, &lens, &acts, &mut ds, pool)
+    {
+        let mut offset = 0;
+        let offsets: Vec<_> = lens
+            .iter()
+            .map(|&n| {
+                let start = offset;
+                offset += n;
+                start
+            })
+            .collect();
+        for (r, terms) in terms.iter().enumerate() {
+            for &(g, slot, w) in terms {
+                for (o, &v) in out[r * hidden..(r + 1) * hidden]
+                    .iter_mut()
+                    .zip(&ds[offsets[g] + slot])
+                {
+                    *o += w * v;
+                }
+            }
+        }
+    } else {
+        for (r, jobs) in jobs.iter().enumerate() {
+            if !jobs.is_empty() {
+                let mut row = moe_cold_experts_cpu(jobs, &xs[r * hidden..(r + 1) * hidden], pool);
+                out[r * hidden..(r + 1) * hidden].copy_from_slice(&row);
+                attention::recycle_buf(&mut row);
+            }
+        }
     }
     out
 }
@@ -15753,6 +17254,681 @@ mod tests {
         for (actual, expected) in actual.iter().zip(expected) {
             assert!((actual - expected).abs() < 1e-6);
         }
+    }
+
+    /// A tiny MiMo-V2-shaped stack (the M3 fixture): layers [full, sliding,
+    /// sliding, full]; 4 Q heads over 1 (full) / 2 (sliding) KV heads;
+    /// head_dim 8 with 4-wide V heads; partial rotary 4 at θ 1e7 (full) /
+    /// 1e4 (sliding); window 3; learned sinks on the sliding layers; layer
+    /// 0 a dense FFN, layers 1..3 sigmoid-routed MoE with a selection bias
+    /// (4 experts, top-2, renormalized, no shared expert). Geometry and
+    /// sinks go through the same `set_attn_geometry` / `set_layer_sinks`
+    /// the loader calls.
+    fn mimo_test_pipeline() -> Pipeline {
+        let (hs, inter, nh, hd, vd, vocab) = (16usize, 24usize, 4usize, 8usize, 4usize, 64usize);
+        let kvh = [1usize, 2, 2, 1];
+        let synth = |n: usize, salt: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| (((i * 31 + salt * 17 + 7) % 97) as f32 / 97.0 - 0.5) * 0.4)
+                .collect()
+        };
+        let qt = |rows: usize, cols: usize, salt: usize| {
+            QTensor::from_f32(synth(rows * cols, salt), rows, cols)
+        };
+        let dense = |inter: usize, salt: usize| DenseFfn {
+            gate_proj: qt(inter, hs, salt),
+            up_proj: qt(inter, hs, salt + 1),
+            down_proj: qt(hs, inter, salt + 2),
+            act: Act::Silu,
+            down_t: None,
+            segs: Vec::new(),
+        };
+        let layers: Vec<LayerWeights> = (0..4)
+            .map(|li| LayerWeights {
+                input_norm: vec![1.0; hs],
+                post_norm: vec![1.0; hs],
+                attn_out_norm: None,
+                ffn_out_norm: None,
+                layer_scale: None,
+                ffn: if li == 0 {
+                    FfnKind::Dense(dense(inter, 50))
+                } else {
+                    FfnKind::Moe(MoeFfn {
+                        router: qt(4, hs, 60 + li),
+                        experts: (0..4).map(|e| dense(8, 70 + li * 10 + e * 3)).collect(),
+                        top_k: 2,
+                        norm_topk_prob: true,
+                        router_sigmoid: true,
+                        expert_bias: Some(vec![0.02, -0.03, 0.01, 0.0]),
+                        routed_scaling: 1.0,
+                        route_tau: None,
+                        shared: None,
+                        stats: std::cell::RefCell::new(Vec::new()),
+                        act_sq: std::cell::RefCell::new(Vec::new()),
+                        act_rows: std::cell::RefCell::new(Vec::new()),
+                        mask: None,
+                        per_expert_scale: None,
+                        router_input_norm: false,
+                        resonance: None,
+                    })
+                },
+                attn: AttnKind::Full {
+                    wq: qt(nh * hd, hs, li * 10 + 1),
+                    wk: qt(kvh[li] * hd, hs, li * 10 + 2),
+                    wv: qt(kvh[li] * vd, hs, li * 10 + 3),
+                    wo: qt(hs, nh * vd, li * 10 + 4),
+                    q_norm: None,
+                    k_norm: None,
+                    output_gate: false,
+                    softplus_gate: None,
+                    bias: None,
+                },
+            })
+            .collect();
+        let mut p = Pipeline::new(
+            Tokenizer::byte_level(),
+            PipelineWeights {
+                embed_tokens: qt(vocab, hs, 100),
+                layers,
+                lm_head: qt(vocab, hs, 200),
+                final_norm: vec![1.0; hs],
+            },
+            hs,
+            inter,
+            nh,
+            1, // header num_kv_heads (the full layers')
+            hd,
+            4,
+            4,
+            false,
+            vocab,
+            1e-6,
+            1e7,
+            NormStyle::Qwen,
+            4096,
+            SamplerConfig {
+                seed: Some(7),
+                ..Default::default()
+            },
+        );
+        // Diagnostics stay off whatever the test environment exports.
+        p.layer_dump = None;
+        p.set_rotary(4, 1e7);
+        p.sliding_layers = Some(vec![false, true, true, false]);
+        p.swa = Some((3, usize::MAX));
+        p.rotary_dim_local = Some(4);
+        p.inv_freq_local = Some(std::sync::Arc::new(attention::rope_inv_freq(4, 1e4)));
+        p.set_attn_geometry(Some(kvh.to_vec()), Some(vd)).unwrap();
+        p.set_layer_sinks(1, vec![0.5, -1.0, 1.5, 0.0]).unwrap();
+        p.set_layer_sinks(2, vec![-0.25, 2.0, 0.75, -1.5]).unwrap();
+        p
+    }
+
+    #[test]
+    fn mimo_embedded_prompt_uses_rows_and_never_reuses_token_only_kv() {
+        let mut p = mimo_test_pipeline();
+        p.speculative = false;
+        p.ignore_eos = true;
+        p.sampler_config.temperature = 0.0;
+        p.sampler_config.repetition_penalty = 1.0;
+        let a = vec![3, 5, 7, 9, 11, 13];
+        let b = vec![4, 8, 12, 16, 20, 24];
+        let rows: Vec<_> = b.iter().flat_map(|&id| p.embed_id(id)).collect();
+        let expected = p.generate_from_ids(&b, 8, None, None).unwrap().token_ids;
+        // Same placeholder IDs as an earlier request are not a cache key
+        // for different media. The actual rows, not a re-embedding of a,
+        // must determine the continuation.
+        let actual = p.generate_from_embeds(&a, &rows, 8, None, None).unwrap().token_ids;
+        assert_eq!(actual, expected);
+        assert!(p.kv_history.is_empty());
+        let mut extended = a.clone();
+        extended.push(17);
+        let after_media = p.generate_from_ids(&extended, 8, None, None).unwrap().token_ids;
+        p.reset_session();
+        let fresh = p.generate_from_ids(&extended, 8, None, None).unwrap().token_ids;
+        assert_eq!(after_media, fresh);
+        assert!(p.generate_from_embeds(&a, &rows[..rows.len()-1], 1, None, None).is_err());
+        // Force a real token-prefix reuse opportunity into the media call.
+        // Those labels are unchanged, but their embeddings now describe a
+        // different source sequence and every KV row must be rebuilt.
+        p.reset_session();
+        p.generate_from_ids(&a, 1, None, None).unwrap();
+        let mut media_ids = p.kv_history.clone();
+        assert!(!media_ids.is_empty());
+        media_ids.extend_from_slice(&[19, 21, 23]);
+        let source_ids: Vec<_> = (0..media_ids.len()).map(|i| b[i % b.len()]).collect();
+        let source_rows: Vec<_> = source_ids.iter().flat_map(|&id| p.embed_id(id)).collect();
+        let mut oracle = mimo_test_pipeline();
+        oracle.speculative = false;
+        oracle.ignore_eos = true;
+        oracle.sampler_config.temperature = 0.0;
+        oracle.sampler_config.repetition_penalty = 1.0;
+        let expected = oracle.generate_from_ids(&source_ids, 8, None, None).unwrap().token_ids;
+        assert_eq!(p.generate_from_embeds(&media_ids, &source_rows, 8, None, None).unwrap().token_ids, expected);
+        assert!(p.kv_history.is_empty());
+        let mut bad = rows;
+        bad[0] = f32::NAN;
+        assert!(p.generate_from_embeds(&a, &bad, 1, None, None).is_err());
+    }
+
+    fn f32_bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    /// M3 acceptance: on the MiMo-shaped stack the decode walk (one
+    /// position at a time through `forward_layers`) and the batched
+    /// prefill (`prefill_batch_span`, whole prompt and split in two
+    /// chunks) give bit-identical logits at all 12 positions — per-layer
+    /// KV heads, narrow V, sinks, the window and the biased sigmoid MoE all
+    /// agree across the two walks.
+    #[test]
+    fn mimo_shaped_decode_matches_prefill_batch_bitwise() {
+        let mut p = mimo_test_pipeline();
+        let kv: Vec<usize> = p.kv_cache.layers.iter().map(|l| l.num_kv_heads).collect();
+        assert_eq!(kv, vec![1, 2, 2, 1]);
+        assert!(p.kv_cache.layers[0].sinks.is_none() && p.kv_cache.layers[3].sinks.is_none());
+        assert!(p.kv_cache.layers[1].sinks.is_some() && p.kv_cache.layers[2].sinks.is_some());
+        let ids: Vec<u32> = (0..12u32).map(|i| (i * 7 + 3) % 64).collect();
+        let hs = p.hidden_size;
+        let mut decode = Vec::new();
+        for (pos, &id) in ids.iter().enumerate() {
+            let e = p.embed_single(id);
+            let h = p.forward_layers(&e, pos, None);
+            decode.push(p.logits_from_hidden(&h));
+        }
+        for l in &p.kv_cache.layers {
+            assert_eq!(l.seq_len, 12);
+            // V rows are padded to head_dim inside the cache.
+            assert_eq!(l.head_values(0).len(), 12 * 8);
+        }
+        assert!(decode.iter().flatten().all(|v| v.is_finite()));
+
+        p.clear_sequence_state();
+        let hb = p.prefill_batch_span(PrefillIn::Ids(&ids), 0, None, 0, p.num_layers);
+        for pos in 0..ids.len() {
+            let lg = p.logits_from_hidden(&hb[pos * hs..(pos + 1) * hs]);
+            assert_eq!(
+                f32_bits(&decode[pos]),
+                f32_bits(&lg),
+                "whole prompt, pos {pos}"
+            );
+        }
+
+        p.clear_sequence_state();
+        let a = p.prefill_batch_span(PrefillIn::Ids(&ids[..5]), 0, None, 0, p.num_layers);
+        let b = p.prefill_batch_span(PrefillIn::Ids(&ids[5..]), 5, None, 0, p.num_layers);
+        for pos in 0..ids.len() {
+            let row = if pos < 5 {
+                &a[pos * hs..(pos + 1) * hs]
+            } else {
+                &b[(pos - 5) * hs..(pos - 4) * hs]
+            };
+            let lg = p.logits_from_hidden(row);
+            assert_eq!(
+                f32_bits(&decode[pos]),
+                f32_bits(&lg),
+                "two chunks, pos {pos}"
+            );
+        }
+
+        // The fixture is not degenerate: the sinks and the window each
+        // change the answer.
+        let last = |p: &mut Pipeline| {
+            p.clear_sequence_state();
+            let hb = p.prefill_batch_span(PrefillIn::Ids(&ids), 0, None, 0, p.num_layers);
+            p.logits_from_hidden(&hb[11 * hs..12 * hs])
+        };
+        let base = last(&mut p);
+        let mut no_sinks = mimo_test_pipeline();
+        for l in &mut no_sinks.kv_cache.layers {
+            l.sinks = None;
+        }
+        assert_ne!(
+            f32_bits(&last(&mut no_sinks)),
+            f32_bits(&base),
+            "sinks are live"
+        );
+        let mut wide = mimo_test_pipeline();
+        wide.swa = Some((64, usize::MAX));
+        assert_ne!(
+            f32_bits(&last(&mut wide)),
+            f32_bits(&base),
+            "window is live"
+        );
+
+        // Generation runs end to end on the same stack.
+        p.clear_sequence_state();
+        p.ignore_eos = true;
+        let r = p.generate_from_ids(&ids, 4, None, None).unwrap();
+        assert_eq!(r.token_ids.len(), 4);
+    }
+
+    /// A synthetic MiMo draft stack of `n` layers for `mimo_test_pipeline`
+    /// (the SWA geometry of its sliding layers: 2 KV heads, head 8 / V 4).
+    fn mimo_test_mtp(n: usize, gain: f32) -> mimo_mtp::MimoMtp {
+        let (hs, inter, nh, hd, vd, nkv) = (16usize, 24usize, 4usize, 8usize, 4usize, 2usize);
+        let synth = |len: usize, salt: usize| -> Vec<f32> {
+            (0..len)
+                .map(|i| (((i * 37 + salt * 13 + 3) % 89) as f32 / 89.0 - 0.5) * 0.6 * gain)
+                .collect()
+        };
+        let qt = |rows: usize, cols: usize, salt: usize| {
+            QTensor::from_f32(synth(rows * cols, salt), rows, cols)
+        };
+        let layers = (0..n)
+            .map(|k| {
+                let s = 500 + k * 40;
+                let mut kv = crate::kv_cache::LayerKvCache::new(nkv, hd);
+                kv.sinks = Some(vec![0.3, -0.7, 1.1, 0.0]);
+                MtpModule {
+                    enorm: vec![1.0; hs],
+                    hnorm: vec![1.0; hs],
+                    eh_proj: qt(hs, 2 * hs, s),
+                    layer: LayerWeights {
+                        input_norm: vec![1.0; hs],
+                        post_norm: vec![1.0; hs],
+                        attn_out_norm: None,
+                        ffn_out_norm: None,
+                        layer_scale: None,
+                        attn: AttnKind::Full {
+                            wq: qt(nh * hd, hs, s + 1),
+                            wk: qt(nkv * hd, hs, s + 2),
+                            wv: qt(nkv * vd, hs, s + 3),
+                            wo: qt(hs, nh * vd, s + 4),
+                            q_norm: None,
+                            k_norm: None,
+                            output_gate: false,
+                            softplus_gate: None,
+                            bias: None,
+                        },
+                        ffn: FfnKind::Dense(DenseFfn {
+                            gate_proj: qt(inter, hs, s + 5),
+                            up_proj: qt(inter, hs, s + 6),
+                            down_proj: qt(hs, inter, s + 7),
+                            act: Act::Silu,
+                            down_t: None,
+                            segs: Vec::new(),
+                        }),
+                    },
+                    final_norm: vec![1.0; hs],
+                    kv,
+                }
+            })
+            .collect();
+        mimo_mtp::MimoMtp::from_layers(layers)
+    }
+
+    fn mimo_greedy(p: &mut Pipeline, ids: &[u32], n: usize, spec: bool) -> GenerateResult {
+        p.clear_sequence_state();
+        p.speculative = spec;
+        p.ignore_eos = true;
+        p.sampler_config.temperature = 0.0;
+        p.generate_from_ids(ids, n, None, None).unwrap()
+    }
+
+    /// The draft stack's incremental rounds (a few rows per layer, last
+    /// round's provisional rows dropped) give exactly the teacher-forced
+    /// table of one causal pass per layer over the whole sequence — the
+    /// table `tools/mimo_ref.py mtp` computes for variant A: layer k, row
+    /// j reads (x[j+k+1], norm(h_j)) at RoPE position j.
+    #[test]
+    fn mimo_mtp_incremental_rounds_equal_the_teacher_forced_table() {
+        // Both readings of the backbone hidden: pre-final-norm (default)
+        // and post-final-norm (`CMF_MIMO_MTP_HIDDEN=post`).
+        for post in [false, true] {
+            let mut p = mimo_test_pipeline();
+            // A non-trivial final norm, so the two readings differ.
+            p.weights.final_norm = (0..p.hidden_size).map(|i| 0.5 + 0.1 * i as f32).collect();
+            let mut st0 = mimo_test_mtp(3, 1.0);
+            st0.post_norm_hidden = post;
+            p.mimo_mtp = Some(st0);
+            let ids: Vec<u32> = (0..14u32).map(|i| (i * 11 + 5) % 64).collect();
+            let hs = p.hidden_size;
+            let hb = p.prefill_batch_span(PrefillIn::Ids(&ids), 0, None, 0, p.num_layers);
+            p.mimo_note_rows(&hb, 0);
+            let mut st = p.mimo_mtp.take().unwrap();
+            // Incremental: one round per t through the decode path (later
+            // tokens from `ids`, the probe's teacher forcing).
+            let k = 3;
+            let mut inc = Vec::new();
+            for t in 0..ids.len() - k - 1 {
+                inc.push(p.mimo_mtp_draft(&mut st, t, &ids, k));
+            }
+            // Reference: per layer, ONE batched causal pass over all rows
+            // with fresh caches.
+            let s = ids.len();
+            let mut reference = vec![vec![0u32; k]; s - k - 1];
+            let mut fresh = mimo_test_mtp(3, 1.0);
+            for (layer, m) in fresh.layers.iter_mut().enumerate() {
+                let n = s - layer - 1;
+                let mut cats = vec![0.0f32; n * 2 * hs];
+                for j in 0..n {
+                    let e = p.embed_single(ids[j + layer + 1]);
+                    let raw = &hb[j * hs..(j + 1) * hs];
+                    let g = if post {
+                        inference::rms_norm(raw, &p.weights.final_norm, p.rms_eps, p.norm_style)
+                    } else {
+                        raw.to_vec()
+                    };
+                    let (ce, ch) = cats[j * 2 * hs..(j + 1) * 2 * hs].split_at_mut(hs);
+                    inference::rms_norm_into(&e, &m.enorm, p.rms_eps, p.norm_style, ce);
+                    inference::rms_norm_into(&g, &m.hnorm, p.rms_eps, p.norm_style, ch);
+                }
+                let mut x = vec![0.0f32; n * hs];
+                m.eh_proj.matmat(&cats, n, &mut x, None);
+                p.mimo_mtp_block(m, &mut x, n, 0);
+                for (t, row) in reference.iter_mut().enumerate() {
+                    let y = inference::rms_norm(
+                        &x[t * hs..(t + 1) * hs],
+                        &m.final_norm,
+                        p.rms_eps,
+                        p.norm_style,
+                    );
+                    row[layer] = sampler::argmax(&p.lm_head_forward(&y));
+                }
+            }
+            assert_eq!(inc, reference, "post_norm_hidden = {post}");
+            // Not a degenerate table: the drafts vary.
+            let distinct: std::collections::HashSet<u32> =
+                inc.iter().flatten().copied().collect();
+            assert!(distinct.len() > 3, "{inc:?}");
+            // Each layer's cache ends holding rows up to the last round start.
+            let last_t = ids.len() - k - 2;
+            for m in &st.layers {
+                assert_eq!(m.kv.seq_len, last_t + 1);
+            }
+        }
+    }
+
+    /// Greedy with the MiMo draft stack is the plain greedy stream, token
+    /// for token — with the real draft layers (low acceptance) and with a
+    /// drafter that is right most of the time (exercises accepted prefixes
+    /// of every length, the KV truncation of the rejected rows and the
+    /// logits hand-off to the loop top), under the default repetition
+    /// penalty.
+    #[test]
+    fn mimo_speculative_greedy_equals_plain_greedy() {
+        unsafe { std::env::set_var("CMF_GPU_WGPU_GRAPH", "0") };
+        let ids: Vec<u32> = (0..9u32).map(|i| (i * 7 + 3) % 64).collect();
+        let n = 24;
+        let mut p = mimo_test_pipeline();
+        let plain = mimo_greedy(&mut p, &ids, n, false);
+        assert_eq!(plain.mtp_drafted, 0);
+        assert_eq!(plain.token_ids.len(), n);
+        let plain_kv = p.kv_cache.layers[0].seq_len;
+
+        // Real draft layers.
+        p.mimo_mtp = Some(mimo_test_mtp(3, 1.0));
+        let spec = mimo_greedy(&mut p, &ids, n, true);
+        assert!(spec.mtp_drafted > 0, "the round must draft");
+        assert_eq!(spec.token_ids, plain.token_ids);
+        assert_eq!(p.kv_cache.layers[0].seq_len, plain_kv);
+
+        // A drafter reading the true continuation with every fifth token
+        // wrong: accepted prefixes of 0..=3 all occur.
+        let mut truth: Vec<u32> = ids.clone();
+        truth.extend(&plain.token_ids);
+        let mut noisy = truth.clone();
+        for (i, t) in noisy.iter_mut().enumerate() {
+            if i % 5 == 0 {
+                *t = (*t + 1) % 64;
+            }
+        }
+        let mut st = mimo_test_mtp(3, 1.0);
+        st.draft_override = Some(noisy);
+        p.mimo_mtp = Some(st);
+        let spec = mimo_greedy(&mut p, &ids, n, true);
+        assert_eq!(spec.token_ids, plain.token_ids);
+        assert_eq!(p.kv_cache.layers[0].seq_len, plain_kv);
+        let stats = p.mimo_mtp.as_ref().unwrap().stats.clone();
+        assert_eq!(stats.accepted as usize, spec.mtp_accepted);
+        assert!(spec.mtp_accepted > 0 && spec.mtp_accepted < spec.mtp_drafted);
+        assert!(
+            stats.accept_hist.iter().filter(|&&c| c > 0).count() >= 3,
+            "{:?}",
+            stats.accept_hist
+        );
+        assert!(stats.tokens_per_round() > 1.5, "{}", stats.line());
+
+        // A perfect drafter: every draft accepted, rounds of K+1 tokens,
+        // and the budget is never overrun.
+        let mut st = mimo_test_mtp(3, 1.0);
+        st.draft_override = Some(truth);
+        p.mimo_mtp = Some(st);
+        let spec = mimo_greedy(&mut p, &ids, n, true);
+        assert_eq!(spec.token_ids, plain.token_ids);
+        assert_eq!(spec.mtp_accepted, spec.mtp_drafted);
+        assert_eq!(p.kv_cache.layers[0].seq_len, plain_kv);
+
+        // CMF_MTP=0 path: the stack is attached but idle.
+        let off = mimo_greedy(&mut p, &ids, n, false);
+        assert_eq!(off.token_ids, plain.token_ids);
+        assert_eq!(off.mtp_drafted, 0);
+    }
+
+    /// The wgpu graphs carry MiMo-V2's attention per layer (KV heads,
+    /// narrow V, sinks, windows, two RoPE tables): no attention-level
+    /// decline for it any more, and the geometry each layer hands the
+    /// graph is exactly what the CPU attention reads for that layer. The
+    /// descriptive reasons stay (the Metal graphs and the q1 dropin still
+    /// decline on them), and what the per-layer geometry cannot express
+    /// keeps a named wgpu decline.
+
+    #[test]
+    fn mimo_shaped_model_rides_the_wgpu_graph_geometry() {
+        let p = mimo_test_pipeline();
+        assert_eq!(
+            p.graph_attn_decline_reason(),
+            Some("per-layer KV head counts")
+        );
+        assert_eq!(p.wgpu_graph_attn_decline(), None);
+        let g0 = p.graph_attn_geom(0).expect("full layer geometry");
+        assert_eq!(
+            (g0.nkv, g0.dv, g0.rd, g0.window, g0.sink.is_some()),
+            (1, 4, 4, None, false)
+        );
+        assert_eq!(g0.invf, p.inv_freq.as_slice());
+        let g1 = p.graph_attn_geom(1).expect("sliding layer geometry");
+        assert_eq!((g1.nkv, g1.dv, g1.rd, g1.window), (2, 4, 4, Some(3)));
+        assert_eq!(g1.sink, Some(&[0.5f32, -1.0, 1.5, 0.0][..]));
+        assert_eq!(g1.invf, p.inv_freq_local.as_ref().unwrap().as_slice());
+        assert_ne!(g0.invf, g1.invf, "two RoPE tables");
+        let g3 = p.graph_attn_geom(3).expect("full layer geometry");
+        assert_eq!((g3.nkv, g3.window, g3.sink.is_some()), (1, None, false));
+
+        // No wgpu device in this process: the builders run and decline on
+        // the (f32, unmapped) experts — never with an attention line.
+        let emb = p.embed_single(3);
+        let mut lg = Vec::new();
+        assert!(
+            p.try_token_graph_wgpu_steps(&emb, 0, &mut lg, 1, None, None, 0, p.num_layers)
+                .is_none()
+        );
+        let mut hid = emb.clone();
+        assert_eq!(
+            p.try_batch_graph_wgpu(&mut hid, &[0], 1, None),
+            crate::gpu::BatchGraphOutcome::Declined
+        );
+        assert_eq!(hid, emb, "a declined batch graph leaves the rows untouched");
+        assert!(p.try_multi_burst(3, 0, 4).is_none());
+        assert!(
+            p.graph_declines().is_empty(),
+            "no attention decline logged: {:?}",
+            p.graph_declines()
+        );
+        // (No assertion on graph_prefill_preferred: with no attention
+        // decline it follows the device — a test process that brought a
+        // wgpu adapter up routes this resident MoE through the graph.)
+
+        let plain = || create_test_pipeline(8, 16, 2, 1, 4, 2, 32);
+        assert_eq!(plain().graph_attn_decline_reason(), None);
+        assert_eq!(plain().wgpu_graph_attn_decline(), None);
+        assert!(
+            plain().graph_attn_geom(0).is_none(),
+            "uniform models keep the historical arms"
+        );
+        let mut q = plain();
+        q.set_layer_sinks(1, vec![0.25, -0.25]).unwrap();
+        assert_eq!(
+            q.graph_attn_decline_reason(),
+            Some("learned attention sinks")
+        );
+        assert_eq!(
+            q.graph_attn_geom(1).unwrap().sink,
+            Some(&[0.25f32, -0.25][..])
+        );
+        let mut q = plain();
+        q.set_attn_geometry(None, Some(2)).unwrap();
+        assert_eq!(
+            q.graph_attn_decline_reason(),
+            Some("V heads narrower than Q/K heads")
+        );
+        assert_eq!(q.graph_attn_geom(0).unwrap().dv, 2);
+        let mut q = plain();
+        q.sliding_layers = Some(vec![true, false]);
+        q.swa = Some((4, usize::MAX));
+        assert_eq!(q.graph_attn_decline_reason(), Some("sliding-window layers"));
+        assert_eq!(q.graph_attn_geom(0).unwrap().window, Some(4));
+        assert_eq!(q.graph_attn_geom(1).unwrap().window, None);
+
+        // Outside the per-layer geometry: a named wgpu decline, logged
+        // once per site.
+        let mut q = mimo_test_pipeline();
+        q.rope_scale = 2.0;
+        assert_eq!(
+            q.wgpu_graph_attn_decline(),
+            Some("scaled RoPE positions with per-layer geometry")
+        );
+        let emb = q.embed_single(3);
+        assert!(
+            q.try_token_graph_wgpu_steps(&emb, 0, &mut lg, 1, None, None, 0, q.num_layers)
+                .is_none()
+        );
+        let _ = q.try_token_graph_wgpu_steps(&emb, 1, &mut lg, 1, None, None, 0, q.num_layers);
+        let lines = q.graph_declines();
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l.starts_with("wgpu token graph") && l.contains("scaled RoPE"))
+                .count(),
+            1,
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn mimo_verify_rewind_preserves_lagging_host_caches() {
+        let mut p = mimo_test_pipeline();
+        for (li, layer) in p.kv_cache.layers.iter_mut().enumerate() {
+            let row = vec![0.0; layer.num_kv_heads * layer.head_dim];
+            for _ in 0..if li == 0 { 2 } else { 12 } {
+                layer.append(&row, &row, &[]);
+            }
+        }
+        p.mimo_verify_rewind(9).unwrap();
+        assert_eq!(p.kv_cache.layers[0].seq_len, 2);
+        for layer in &p.kv_cache.layers[1..] {
+            assert_eq!(layer.seq_len, 9);
+        }
+    }
+
+    /// CMF_LAYER_DUMP: the decode walk and the batched prefill both write
+    /// every (position, layer) hidden, the two sets agree byte for byte,
+    /// and the last layer's file is the stack output.
+    #[test]
+    fn layer_dump_covers_every_position_and_layer_on_both_walks() {
+        let dir = std::env::temp_dir().join(format!("cmf-layer-dump-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut p = mimo_test_pipeline();
+        let hs = p.hidden_size;
+        let ids = [5u32, 9, 11, 2, 40];
+        p.layer_dump = Some(dir.join("decode"));
+        for (pos, &id) in ids.iter().enumerate() {
+            let e = p.embed_single(id);
+            let _ = p.forward_layers(&e, pos, None);
+        }
+        p.clear_sequence_state();
+        p.layer_dump = Some(dir.join("prefill"));
+        let hb = p.prefill_batch_span(PrefillIn::Ids(&ids), 0, None, 0, p.num_layers);
+        for pos in 0..ids.len() {
+            for li in 0..p.num_layers {
+                let name = format!("p{pos:06}_l{li:02}.f32");
+                let a = std::fs::read(dir.join("decode").join(&name)).unwrap();
+                let b = std::fs::read(dir.join("prefill").join(&name)).unwrap();
+                assert_eq!(a.len(), hs * 4, "{name}");
+                assert_eq!(a, b, "{name}");
+            }
+        }
+        let last = std::fs::read(dir.join("prefill").join("p000004_l03.f32")).unwrap();
+        let vals: Vec<f32> = last
+            .chunks(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(f32_bits(&vals), f32_bits(&hb[4 * hs..5 * hs]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn attn_geometry_and_sinks_are_validated() {
+        let mut p = create_test_pipeline(8, 16, 4, 2, 4, 2, 32);
+        assert!(
+            p.set_attn_geometry(Some(vec![2]), None).is_err(),
+            "one entry per layer"
+        );
+        assert!(
+            p.set_attn_geometry(Some(vec![2, 3]), None).is_err(),
+            "3 does not divide 4"
+        );
+        assert!(p.set_attn_geometry(Some(vec![2, 0]), None).is_err());
+        assert!(p.set_attn_geometry(None, Some(0)).is_err());
+        assert!(
+            p.set_attn_geometry(None, Some(5)).is_err(),
+            "V wider than the head"
+        );
+        p.set_attn_geometry(None, Some(4)).unwrap();
+        assert_eq!(
+            p.v_head_dim, None,
+            "v_head_dim == head_dim is the uniform case"
+        );
+        p.set_layer_sinks(1, vec![0.1; 4]).unwrap();
+        p.set_attn_geometry(Some(vec![1, 4]), None).unwrap();
+        assert_eq!(p.kv_cache.layers[0].num_kv_heads, 1);
+        assert_eq!(p.kv_cache.layers[1].num_kv_heads, 4);
+        assert!(
+            p.kv_cache.layers[1].sinks.is_some(),
+            "a reshape keeps the layer's sinks"
+        );
+        assert_eq!(p.layer_geom(1).0, 4);
+        assert!(
+            p.set_layer_sinks(0, vec![0.0; 3]).is_err(),
+            "one sink per Q head"
+        );
+        assert!(p.set_layer_sinks(7, vec![0.0; 4]).is_err());
+        assert!(p.set_layer_sinks(0, vec![f32::NAN, 0.0, 0.0, 0.0]).is_err());
+    }
+
+    /// The O(1) Nyström state replaces a plain full-context softmax; it
+    /// must never be armed on a sliding, sink or narrow-V layer.
+    #[test]
+    fn o1_is_never_armed_on_sink_window_or_narrow_v_layers() {
+        let cfg = || {
+            Some(crate::nystrom::O1Cfg {
+                layers: crate::nystrom::O1Layers::All,
+                m: 4,
+                w: 8,
+                sink: 2,
+                rect: crate::nystrom::O1Rect::Aggregate,
+            })
+        };
+        let mut p = mimo_test_pipeline();
+        p.set_o1(cfg());
+        assert!(!p.o1_active(), "every MiMo-shaped layer is ineligible");
+        let mut q = create_test_pipeline(8, 16, 2, 1, 4, 3, 64);
+        q.set_layer_sinks(1, vec![0.0, 0.0]).unwrap();
+        q.sliding_layers = Some(vec![false, false, true]);
+        q.swa = Some((4, usize::MAX));
+        q.set_o1(cfg());
+        assert_eq!(q.o1_flags, vec![true, false, false]);
     }
 
     #[test]
