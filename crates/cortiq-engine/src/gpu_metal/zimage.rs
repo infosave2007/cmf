@@ -64,10 +64,42 @@ fn env_usize(k: &str, d: usize) -> usize {
 
 // ───────────────────────────── pipelines ─────────────────────────────
 
+/// A GEMM kernel variant: pipeline, tile tokens, tile features, threads.
+struct MmVar {
+    name: &'static str,
+    pso: ComputePipelineState,
+    bt: usize,
+    bo: usize,
+    threads: u64,
+}
+
+/// (name, kernel, tile tokens, tile features, threads) of every GEMM
+/// variant; "base" is the v1 kernel (`zi_q8mm`), "wt" its transposed-W twin.
+const MM_VARIANTS: &[(&str, &str, usize, usize, u64)] = &[
+    ("base", "zi_q8mm", 64, 64, 128),
+    ("wt", "zi_q8mm_wt", 64, 64, 128),
+];
+
+/// Flash-attention variants (name, kernel); the first is the default.
+const FLASH_VARIANTS: &[(&str, &str, usize)] = &[
+    ("q64pf", "zi_flash_q64pf", 8),
+    ("q32", "zi_flash_q32", 4),
+    ("nopv", "zi_flash_nopv", 8),
+    ("noqk", "zi_flash_noqk", 8),
+];
+
+/// (pipeline, simdgroups) of the chosen flash variant.
+fn flash_var(p: &Pipes) -> (&ComputePipelineState, usize) {
+    static V: OnceLock<String> = OnceLock::new();
+    let want = V.get_or_init(|| std::env::var("CMF_ZI_FLASH").unwrap_or_default());
+    let f = p.flashes.iter().find(|f| f.0 == want).unwrap_or(&p.flashes[0]);
+    (&f.1, f.2)
+}
+
 struct Pipes {
-    mm: ComputePipelineState,
-    mm_wt: ComputePipelineState,
-    flash: ComputePipelineState,
+    mms: Vec<MmVar>,
+    /// (name, pipeline) of the flash variants; `CMF_ZI_FLASH=<name>`.
+    flashes: Vec<(&'static str, ComputePipelineState, usize)>,
     qkrope: ComputePipelineState,
     rowop: ComputePipelineState,
     swiglu: ComputePipelineState,
@@ -97,9 +129,14 @@ fn build_pipes(c: &Ctx) -> Result<Pipes, String> {
             .map_err(|e| format!("pipeline {name}: {e}"))
     };
     Ok(Pipes {
-        mm: pso("zi_q8mm")?,
-        mm_wt: pso("zi_q8mm_wt")?,
-        flash: pso("zi_flash")?,
+        mms: MM_VARIANTS
+            .iter()
+            .map(|&(name, k, bt, bo, threads)| Ok(MmVar { name, pso: pso(k)?, bt, bo, threads }))
+            .collect::<Result<Vec<_>, String>>()?,
+        flashes: FLASH_VARIANTS
+            .iter()
+            .map(|&(n, k, nsg)| Ok((n, pso(k)?, nsg)))
+            .collect::<Result<Vec<_>, String>>()?,
         qkrope: pso("zi_qkrope")?,
         rowop: pso("zi_rowop")?,
         swiglu: pso("zi_swiglu")?,
@@ -312,7 +349,7 @@ struct Acts {
 
 impl Acts {
     fn new(c: &Ctx, rows: usize, g: &ZGeom) -> Acts {
-        let alloc = rows.div_ceil(64) * 64 + 64;
+        let alloc = rows.div_ceil(128) * 128 + 128;
         let (h, i) = (g.hidden, g.inter);
         Acts {
             rows,
@@ -374,8 +411,8 @@ fn geom_ok(g: &ZGeom) -> Result<(), String> {
     if g.hd != 128 || g.nh * g.hd != g.hidden || g.hidden % 256 != 0 || g.hidden > 4096 {
         return Err(format!("geometry {g:?} (the kernels need hd 128, hidden % 256 == 0, ≤ 4096)"));
     }
-    if g.inter % 64 != 0 || g.patch_dim != 64 {
-        return Err(format!("geometry {g:?} (inter % 64, patch 64)"));
+    if g.inter % 128 != 0 || g.hidden % 128 != 0 || g.patch_dim != 64 {
+        return Err(format!("geometry {g:?} (inter % 128, patch 64)"));
     }
     Ok(())
 }
@@ -606,10 +643,11 @@ fn prof_on() -> bool {
     std::env::var("CMF_ZI_METAL_PROF").as_deref() == Ok("1")
 }
 
-/// Which GEMM kernel variant (`CMF_ZI_MM=wt` → the transposed-W staging).
-fn mm_wt() -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("CMF_ZI_MM").as_deref() == Ok("wt"))
+/// The GEMM kernel variant (`CMF_ZI_MM=<name>`, see `MM_VARIANTS`).
+fn mm_var(p: &Pipes) -> &MmVar {
+    static V: OnceLock<String> = OnceLock::new();
+    let want = V.get_or_init(|| std::env::var("CMF_ZI_MM").unwrap_or_else(|_| "base".into()));
+    p.mms.iter().find(|m| m.name == want).unwrap_or(&p.mms[0])
 }
 
 struct Enc<'r, 'a> {
@@ -653,10 +691,10 @@ impl Enc<'_, '_> {
             pm.y_off[z] = (y_off[z] + row0 * ldy) as u32;
         }
         let p = self.p;
-        let pipe = if mm_wt() { &p.mm_wt } else { &p.mm };
+        let mv = mm_var(p);
         let arena = self.d.arena.clone();
         let enc = self.rec.enc("gemm");
-        enc.set_compute_pipeline_state(pipe);
+        enc.set_compute_pipeline_state(&mv.pso);
         for s in 0..3 {
             let t = blk.t[ts[s.min(ts.len() - 1)]];
             arena.bind(enc, s as u64, t.abs);
@@ -666,8 +704,8 @@ impl Enc<'_, '_> {
         enc.set_buffer(7, Some(y), 0);
         set_p(enc, 8, &pm);
         enc.dispatch_thread_groups(
-            MTLSize::new(n.div_ceil(64) as u64, (t0.rows / 64) as u64, ts.len() as u64),
-            MTLSize::new(128, 1, 1),
+            MTLSize::new(n.div_ceil(mv.bt) as u64, (t0.rows / mv.bo) as u64, ts.len() as u64),
+            MTLSize::new(mv.threads, 1, 1),
         );
     }
 
@@ -793,7 +831,8 @@ impl Enc<'_, '_> {
         {
             let p = self.p;
             let enc = self.rec.enc("flash");
-            enc.set_compute_pipeline_state(&p.flash);
+            let (fpso, nsg) = flash_var(p);
+            enc.set_compute_pipeline_state(fpso);
             enc.set_buffer(0, Some(&a.panel), 0);
             enc.set_buffer(1, Some(&a.attn), 0);
             enc.set_buffer(2, Some(&blk.aux), (blk.col[TO] * 4) as u64);
@@ -805,7 +844,8 @@ impl Enc<'_, '_> {
                 pf.oscale = p2(gd.qkv - gd.ao);
                 set_p(enc, 3, &pf);
                 let nt = (pf.n_img + pf.n_cap) as u64;
-                enc.dispatch_thread_groups(MTLSize::new(nt / 32, g.nh as u64, 1), MTLSize::new(128, 1, 1));
+                let qt = 8 * nsg as u64;
+                enc.dispatch_thread_groups(MTLSize::new(nt.div_ceil(qt), g.nh as u64, 1), MTLSize::new(32 * nsg as u64, 1, 1));
             }
         }
         self.amax(&a.attn, row0 * h, n * h, 2);
@@ -1240,6 +1280,38 @@ pub(crate) fn vae_decode_chain(
 
 // ───────────────────────────── bench hooks ─────────────────────────────
 
+/// Pure simdgroup-MMA issue rate (no memory traffic), `ty` "h" (half
+/// operands) or "f" (float operands), f32 accumulation. Returns TFLOP/s
+/// (best of `reps`).
+#[doc(hidden)]
+pub fn bench_mma_peak(ty: &str, reps: usize) -> Option<f64> {
+    let c = super::ctx()?;
+    let opts = metal::CompileOptions::new();
+    opts.set_language_version(metal::MTLLanguageVersion::V3_0);
+    let lib = c._device.new_library_with_source(ZMSL, &opts).ok()?;
+    let f = lib.get_function(if ty == "f" { "zi_peak_f" } else { "zi_peak_h" }, None).ok()?;
+    let pso = c._device.new_compute_pipeline_state_with_function(&f).ok()?;
+    let out = buf_zeroed(c, 1 << 20);
+    let iters = 4096u32;
+    let tgs = 2048u64;
+    let mut best = 0f64;
+    for _ in 0..reps {
+        let cmd = c.queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pso);
+        enc.set_buffer(0, Some(&out), 0);
+        set_p(enc, 1, &iters);
+        enc.dispatch_thread_groups(MTLSize::new(tgs, 1, 1), MTLSize::new(128, 1, 1));
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+        let ms = super::cmd_gpu_ms(cmd);
+        let fl = tgs as f64 * 4.0 * iters as f64 * 16.0 * 1024.0;
+        best = best.max(fl / ms / 1e9);
+    }
+    Some(best)
+}
+
 /// GEMM microbench: y[n, rows] = x[n, k] · W[rows, k]ᵀ with synthetic int8
 /// weights, `reps` timed dispatches (GPU time per dispatch, min and
 /// median), variant "base" or "wt". Returns (min ms, median ms, rel err vs
@@ -1248,7 +1320,7 @@ pub(crate) fn vae_decode_chain(
 pub fn bench_gemm(rows: usize, k: usize, n: usize, reps: usize, variant: &str) -> Option<(f64, f64, f64)> {
     let c = super::ctx()?;
     let p = pipes(c)?;
-    let pipe = if variant == "wt" { &p.mm_wt } else { &p.mm };
+    let mv = p.mms.iter().find(|m| m.name == variant)?;
     let mut seed = 0x1234_5678_9abc_def0u64;
     let mut rnd = move || {
         seed ^= seed << 13;
@@ -1258,7 +1330,7 @@ pub fn bench_gemm(rows: usize, k: usize, n: usize, reps: usize, variant: &str) -
     };
     let wq: Vec<i8> = (0..rows * k).map(|_| (rnd() % 255) as i8).collect();
     let rs: Vec<f32> = (0..rows).map(|i| 0.001 + (i % 7) as f32 * 1e-4).collect();
-    let xh: Vec<u16> = (0..(n.div_ceil(64) * 64 + 64) * k)
+    let xh: Vec<u16> = (0..(n.div_ceil(128) * 128 + 128) * k)
         .map(|_| cortiq_core::quant::f32_to_f16(((rnd() % 2001) as f32 - 1000.0) / 1000.0))
         .collect();
     let wb = c._device.new_buffer_with_data(wq.as_ptr() as *const c_void, wq.len() as u64, MTLResourceOptions::StorageModeShared);
@@ -1279,7 +1351,7 @@ pub fn bench_gemm(rows: usize, k: usize, n: usize, reps: usize, variant: &str) -
     for _ in 0..reps + 1 {
         let cmd = c.queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(pipe);
+        enc.set_compute_pipeline_state(&mv.pso);
         for s in 0..3u64 {
             enc.set_buffer(s, Some(&wb), 0);
             enc.set_buffer(3 + s, Some(&rb), 0);
@@ -1287,7 +1359,7 @@ pub fn bench_gemm(rows: usize, k: usize, n: usize, reps: usize, variant: &str) -
         enc.set_buffer(6, Some(&xb), 0);
         enc.set_buffer(7, Some(&yb), 0);
         set_p(enc, 8, &pm);
-        enc.dispatch_thread_groups(MTLSize::new(n.div_ceil(64) as u64, (rows / 64) as u64, 1), MTLSize::new(128, 1, 1));
+        enc.dispatch_thread_groups(MTLSize::new(n.div_ceil(mv.bt) as u64, (rows / mv.bo) as u64, 1), MTLSize::new(mv.threads, 1, 1));
         enc.end_encoding();
         cmd.commit();
         cmd.wait_until_completed();
@@ -1306,6 +1378,87 @@ pub fn bench_gemm(rows: usize, k: usize, n: usize, reps: usize, variant: &str) -
         acc *= rs[o] as f64;
         dd += (y[t * rows + o] as f64 - acc).powi(2);
         rr += acc * acc;
+    }
+    let mut s = times.clone();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    Some((s[0], s[s.len() / 2], (dd / rr.max(1e-300)).sqrt()))
+}
+
+/// Flash-attention microbench over one item of `n` rows (30 heads × 128):
+/// synthetic normalised q/k and v, GPU ms (min, median), rel error of a
+/// sample of (row, head) outputs against an f64 host softmax.
+#[doc(hidden)]
+pub fn bench_flash(n: usize, reps: usize, variant: &str) -> Option<(f64, f64, f64)> {
+    let c = super::ctx()?;
+    let p = pipes(c)?;
+    let fv = p.flashes.iter().find(|f| f.0 == variant)?;
+    let (pso, nsg) = (&fv.1, fv.2);
+    let (h, nh) = (3840usize, 30usize);
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut rnd = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        ((seed >> 11) as f64 / (1u64 << 53) as f64) as f32 * 2.0 - 1.0
+    };
+    let qmul = std::f32::consts::LOG2_E / (128f32).sqrt();
+    let panel_f: Vec<f32> = (0..n * 3 * h)
+        .map(|i| {
+            let col = i % (3 * h);
+            let v = rnd() * 2.0;
+            if col < h { v * qmul } else { v }
+        })
+        .collect();
+    let panel: Vec<u16> = panel_f.iter().map(|&v| cortiq_core::quant::f32_to_f16(v)).collect();
+    let pb = c._device.new_buffer_with_data(panel.as_ptr() as *const c_void, (panel.len() * 2) as u64, MTLResourceOptions::StorageModeShared);
+    let ob = buf_zeroed(c, n * h * 2);
+    let colo = buf_from(c, &vec![1.0f32; h]);
+    let pf = PFa {
+        img_off: 0,
+        n_img: n as u32,
+        cap_off: 0,
+        n_cap: 0,
+        ldp: (3 * h) as u32,
+        h: h as u32,
+        ldo: h as u32,
+        oscale: 1.0,
+    };
+    let mut times = Vec::new();
+    for _ in 0..reps + 1 {
+        let cmd = c.queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(pso);
+        enc.set_buffer(0, Some(&pb), 0);
+        enc.set_buffer(1, Some(&ob), 0);
+        enc.set_buffer(2, Some(&colo), 0);
+        set_p(enc, 3, &pf);
+        enc.dispatch_thread_groups(MTLSize::new(n.div_ceil(8 * nsg) as u64, nh as u64, 1), MTLSize::new(32 * nsg as u64, 1, 1));
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+        times.push(super::cmd_gpu_ms(cmd));
+    }
+    times.remove(0);
+    let out = unsafe { std::slice::from_raw_parts(ob.contents() as *const u16, n * h) };
+    let hf = |i: usize| cortiq_core::quant::f16_to_f32(panel[i]) as f64;
+    let (mut dd, mut rr) = (0f64, 0f64);
+    for sidx in 0..8usize {
+        let row = (sidx * 7919) % n;
+        let head = (sidx * 13) % nh;
+        let sc: Vec<f64> = (0..n)
+            .map(|j| {
+                (0..128).map(|d| hf(row * 3 * h + head * 128 + d) * hf(j * 3 * h + h + head * 128 + d)).sum::<f64>()
+            })
+            .collect();
+        let mx = sc.iter().cloned().fold(f64::MIN, f64::max);
+        let w: Vec<f64> = sc.iter().map(|s| (2f64).powf(s - mx)).collect();
+        let l: f64 = w.iter().sum();
+        for d in 0..128 {
+            let r: f64 = (0..n).map(|j| w[j] * hf(j * 3 * h + 2 * h + head * 128 + d)).sum::<f64>() / l;
+            let g = cortiq_core::quant::f16_to_f32(out[row * h + head * 128 + d]) as f64;
+            dd += (g - r).powi(2);
+            rr += r * r;
+        }
     }
     let mut s = times.clone();
     s.sort_by(|a, b| a.partial_cmp(b).unwrap());
