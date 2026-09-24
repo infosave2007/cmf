@@ -118,11 +118,19 @@ pub struct LayerKvCache {
     /// Set when a collecting state actually becomes sealed. Pipeline owns
     /// the epoch bump and consumes this bit after a complete forward.
     o1_transitioned: bool,
+    /// Learned per-Q-head attention-sink logits of this layer (gpt-oss /
+    /// MiMo-V2 `self_attn.sinks`, one f32 per Q head). The sink is an
+    /// extra softmax column with no value: it joins the max and the
+    /// denominator of every head's softmax and so lets a head attend to
+    /// "nothing". These are WEIGHTS, not sequence state — `clear()` and
+    /// the wire import keep them. None = an ordinary softmax.
+    pub sinks: Option<Vec<f32>>,
 }
 
 impl LayerKvCache {
     pub fn new(num_kv_heads: usize, head_dim: usize) -> Self {
         Self {
+            sinks: None,
             mode: KvMode::from_env(),
             k: vec![Vec::new(); num_kv_heads],
             v: vec![Vec::new(); num_kv_heads],
@@ -674,6 +682,9 @@ impl LayerKvCache {
     /// `scale` is the score scale (1/√hd unless the arch overrides);
     /// `first` is the earliest visible position — sliding-window layers
     /// pass `stored − window` so older rows get zero probability.
+    /// `sinks` holds one learned sink logit per head of `q_group` (the
+    /// caller slices `self.sinks` to the group's heads) or is empty for
+    /// an ordinary softmax.
     #[allow(clippy::too_many_arguments)]
     pub fn attend_group(
         &self,
@@ -684,8 +695,19 @@ impl LayerKvCache {
         scale: f32,
         first: usize,
         softcap: f32,
+        sinks: &[f32],
     ) {
-        self.attend_group_upto(q_group, kv_head, out, imp_acc, scale, first, softcap, usize::MAX)
+        self.attend_group_upto(
+            q_group,
+            kv_head,
+            out,
+            imp_acc,
+            scale,
+            first,
+            softcap,
+            usize::MAX,
+            sinks,
+        )
     }
 
     /// `attend_group` over the first `upto` stored rows only — what the
@@ -693,6 +715,18 @@ impl LayerKvCache {
     /// chunk appends all its rows first and then attends every position
     /// in parallel; position `i` passes `upto = s0 + i + 1`, which makes
     /// its result bit-identical to the sequential append-then-attend.
+    ///
+    /// Only the visible rows `[first, stored)` are scored, so a
+    /// sliding-window decode step costs O(window), not O(context). The
+    /// rows before `first` get probability exactly 0 — what the former
+    /// −inf-filled score row produced (exp(−inf) = 0 adds nothing to the
+    /// max, the sum, V or the importance), so the result is bit-identical
+    /// to scoring the whole row.
+    ///
+    /// Learned sinks (`sinks` non-empty, one per head): the sink logit
+    /// joins the softmax max and adds exp(sink − max) to the denominator;
+    /// it has no value row. Identical to appending a value-less column,
+    /// which is how gpt-oss and MiMo-V2 define it.
     #[allow(clippy::too_many_arguments)]
     pub fn attend_group_upto(
         &self,
@@ -704,10 +738,16 @@ impl LayerKvCache {
         first: usize,
         softcap: f32,
         upto: usize,
+        sinks: &[f32],
     ) {
         let hd = self.head_dim;
         let nheads = q_group.len() / hd;
         debug_assert_eq!(out.len(), nheads * hd);
+        assert!(
+            sinks.is_empty() || sinks.len() == nheads,
+            "attend_group: {} sink logits for {nheads} heads",
+            sinks.len()
+        );
         let stored = if self.mode == KvMode::F32 {
             self.k[kv_head].len() / hd
         } else {
@@ -719,9 +759,11 @@ impl LayerKvCache {
             return;
         }
         let first = first.min(stored.saturating_sub(1));
+        // Visible span: row p ∈ [first, stored) lives at column p − first.
+        let span = stored - first;
 
         thread_local! {
-            /// scores [nheads × stored] — reused across layers/tokens.
+            /// scores [nheads × span] — reused across layers/tokens.
             static GQA_SCORES: std::cell::RefCell<Vec<f32>> =
                 const { std::cell::RefCell::new(Vec::new()) };
             /// q ⊙ col_k per head (q8 K mode).
@@ -731,14 +773,7 @@ impl LayerKvCache {
 
         GQA_SCORES.with(|sc| {
             let mut scores = sc.borrow_mut();
-            if first > 0 {
-                // Out-of-window rows stay at −inf → exp gives exactly 0,
-                // so softmax / V / importance need no special-casing.
-                scores.clear();
-                scores.resize(nheads * stored, f32::NEG_INFINITY);
-            } else {
-                scores.resize(nheads * stored, 0.0);
-            }
+            scores.resize(nheads * span, 0.0);
 
             // ── score pass: each stored K row is read ONCE for all heads.
             if self.mode.quant_k() {
@@ -770,7 +805,7 @@ impl LayerKvCache {
                                 dot += crate::qtensor::dot_i8_f32(&row_u8[g0..g1], &qch[g0..g1])
                                     * ks[p * ng + g];
                             }
-                            scores[h * stored + p] = dot * scale;
+                            scores[h * span + (p - first)] = dot * scale;
                         }
                     }
                 });
@@ -779,32 +814,38 @@ impl LayerKvCache {
                 for p in first..stored {
                     let row = &k[p * hd..(p + 1) * hd];
                     for h in 0..nheads {
-                        scores[h * stored + p] =
+                        scores[h * span + (p - first)] =
                             crate::attention::dot_f32(&q_group[h * hd..(h + 1) * hd], row) * scale;
                     }
                 }
             }
 
             // Gemma-2 attention-logit soft-capping: tanh-squash the
-            // COMPUTED scores before the softmax. Out-of-window rows sit
-            // at −inf and must stay there (tanh would resurrect them at
-            // −cap), hence the finiteness guard.
+            // COMPUTED scores before the softmax (every scored row is in
+            // the window; a learned sink is not a score and is not capped).
             if softcap > 0.0 {
                 for v in scores.iter_mut() {
-                    if v.is_finite() {
-                        *v = softcap * (*v / softcap).tanh();
-                    }
+                    *v = softcap * (*v / softcap).tanh();
                 }
             }
 
-            // ── per-head softmax (identical to attend / attention_head).
+            // ── per-head softmax (identical to attend / attention_head;
+            // a sink joins the max and the denominator, never the rows).
             for h in 0..nheads {
-                let s = &mut scores[h * stored..(h + 1) * stored];
-                let max_score = s.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let s = &mut scores[h * span..(h + 1) * span];
+                let row_max = s.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let sink = sinks.get(h).copied();
+                let max_score = match sink {
+                    Some(z) => row_max.max(z),
+                    None => row_max,
+                };
                 let mut sum = 0.0f32;
                 for v in s.iter_mut() {
                     *v = (*v - max_score).exp();
                     sum += *v;
+                }
+                if let Some(z) = sink {
+                    sum += (z - max_score).exp();
                 }
                 if sum > 0.0 {
                     for v in s.iter_mut() {
@@ -820,7 +861,7 @@ impl LayerKvCache {
                 for p in first..stored {
                     let row = &vq[p * hd..(p + 1) * hd];
                     for h in 0..nheads {
-                        let w = scores[h * stored + p] * vs[p];
+                        let w = scores[h * span + (p - first)] * vs[p];
                         if w.abs() < 1e-12 {
                             continue;
                         }
@@ -840,7 +881,7 @@ impl LayerKvCache {
                 for p in first..stored {
                     let row = &v[p * hd..(p + 1) * hd];
                     for h in 0..nheads {
-                        let w = scores[h * stored + p];
+                        let w = scores[h * span + (p - first)];
                         if w.abs() < 1e-12 {
                             continue;
                         }
@@ -850,12 +891,15 @@ impl LayerKvCache {
             }
 
             // ── Attention-importance accumulation (Σ probs over heads), same
-            // head order as the caller's former per-head loop.
+            // head order as the caller's former per-head loop. Rows before
+            // `first` carry probability 0 and are left untouched.
             let n = imp_acc.len().min(stored);
-            for h in 0..nheads {
-                let s = &scores[h * stored..(h + 1) * stored];
-                for (dst, &p) in imp_acc[..n].iter_mut().zip(s) {
-                    *dst += p;
+            if n > first {
+                for h in 0..nheads {
+                    let s = &scores[h * span..(h + 1) * span];
+                    for (dst, &p) in imp_acc[first..n].iter_mut().zip(s) {
+                        *dst += p;
+                    }
                 }
             }
         });
@@ -1748,6 +1792,7 @@ mod tests {
                     1.0 / (hd as f32).sqrt(),
                     0,
                     0.0,
+                    &[],
                 );
                 let mut imp_ref = vec![0f32; 70];
                 for h in 0..hpk {
@@ -1768,6 +1813,176 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Learned sinks (gpt-oss / MiMo-V2): the grouped softmax must equal a
+    /// softmax over the visible rows PLUS an explicit value-less sink
+    /// column, computed independently in f64 — at position 0 (one stored
+    /// row), mid-sequence, and with the window truncating the rows. The
+    /// importance row must be the row probabilities (the sink's share is
+    /// nobody's importance).
+    #[test]
+    fn sink_attend_matches_explicit_sink_column() {
+        let (nkv, hd, hpk) = (2usize, 8usize, 3usize);
+        let rows = 9usize;
+        let mut c = LayerKvCache::new(nkv, hd);
+        c.mode = KvMode::F32;
+        let kv = |r: usize, i: usize, a: usize, m: usize| {
+            (((r * a + i * 7 + 3) % m) as f32 / m as f32 - 0.5) * 2.0
+        };
+        let mut ks = Vec::new();
+        let mut vs = Vec::new();
+        for r in 0..rows {
+            let k: Vec<f32> = (0..nkv * hd).map(|i| kv(r, i, 31, 97)).collect();
+            let v: Vec<f32> = (0..nkv * hd).map(|i| kv(r, i, 17, 89)).collect();
+            c.append(&k, &v, &[]);
+            ks.push(k);
+            vs.push(v);
+        }
+        let q: Vec<f32> = (0..nkv * hpk * hd)
+            .map(|i| (((i * 11 + 5) % 83) as f32 / 83.0 - 0.5) * 3.0)
+            .collect();
+        // Mixed signs and one sink that dominates its head.
+        let sinks = [0.7f32, -1.3, 2.5, 0.0, -4.0, 6.0];
+        let scale = 1.0 / (hd as f32).sqrt();
+        let mut checked = 0usize;
+        for upto in [1usize, 2, 5, 9] {
+            for window in [None, Some(3usize), Some(1)] {
+                let first = window.map(|w| upto.saturating_sub(w)).unwrap_or(0);
+                for g in 0..nkv {
+                    let qg = &q[g * hpk * hd..(g + 1) * hpk * hd];
+                    let sg = &sinks[g * hpk..(g + 1) * hpk];
+                    let mut out = vec![0f32; hpk * hd];
+                    let mut imp = vec![0f32; upto];
+                    c.attend_group_upto(qg, g, &mut out, &mut imp, scale, first, 0.0, upto, sg);
+                    let mut imp_ref = vec![0f64; upto];
+                    for h in 0..hpk {
+                        let qh = &qg[h * hd..(h + 1) * hd];
+                        // Logits of the visible rows, then the sink column.
+                        let mut z: Vec<f64> = (first..upto)
+                            .map(|p| {
+                                let k = &ks[p][g * hd..(g + 1) * hd];
+                                qh.iter()
+                                    .zip(k)
+                                    .map(|(&a, &b)| a as f64 * b as f64)
+                                    .sum::<f64>()
+                                    * scale as f64
+                            })
+                            .collect();
+                        z.push(sg[h] as f64);
+                        let m = z.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                        let e: Vec<f64> = z.iter().map(|&x| (x - m).exp()).collect();
+                        let s: f64 = e.iter().sum();
+                        let p: Vec<f64> = e.iter().map(|&x| x / s).collect();
+                        // The sink column carries a zero value vector.
+                        for d in 0..hd {
+                            let want: f64 = (first..upto)
+                                .map(|r| p[r - first] * vs[r][g * hd + d] as f64)
+                                .sum();
+                            let got = out[h * hd + d] as f64;
+                            assert!(
+                                (got - want).abs() < 1e-6,
+                                "upto {upto} window {window:?} g{g} h{h} d{d}: {got} vs {want}"
+                            );
+                        }
+                        for r in first..upto {
+                            imp_ref[r] += p[r - first];
+                        }
+                        checked += 1;
+                    }
+                    for r in 0..upto {
+                        assert!(
+                            (imp[r] as f64 - imp_ref[r]).abs() < 1e-6,
+                            "imp upto {upto} window {window:?} g{g} row {r}: {} vs {}",
+                            imp[r],
+                            imp_ref[r]
+                        );
+                    }
+                    // The sink takes real mass: rows sum below 1.
+                    let row_mass: f32 = imp.iter().sum();
+                    assert!(row_mass < hpk as f32, "sinks must absorb some mass");
+                }
+            }
+        }
+        assert_eq!(checked, 4 * 3 * nkv * hpk);
+    }
+
+    /// Scoring only the window's rows must be bit-identical to the former
+    /// whole-row scoring (−inf outside the window) — with and without a
+    /// sink, output and importance. The reference is the plain per-head
+    /// softmax over the same rows written out here.
+    #[test]
+    fn windowed_attend_equals_masked_full_row() {
+        let (nkv, hd, hpk) = (1usize, 16usize, 2usize);
+        let rows = 40usize;
+        let mut c = LayerKvCache::new(nkv, hd);
+        c.mode = KvMode::F32;
+        for r in 0..rows {
+            let k: Vec<f32> = (0..hd).map(|i| ((r * 13 + i * 5) % 29) as f32 / 29.0 - 0.5).collect();
+            let v: Vec<f32> = (0..hd).map(|i| ((r * 7 + i * 3) % 31) as f32 / 31.0 - 0.5).collect();
+            c.append(&k, &v, &[]);
+        }
+        let q: Vec<f32> = (0..hpk * hd).map(|i| ((i * 19) % 23) as f32 / 23.0 - 0.5).collect();
+        let scale = 0.25f32;
+        for w in [1usize, 7, 39, 40, 100] {
+            let first = rows.saturating_sub(w);
+            let mut out = vec![0f32; hpk * hd];
+            let mut imp = vec![0f32; rows];
+            c.attend_group(&q, 0, &mut out, &mut imp, scale, first, 0.0, &[]);
+            // Reference: the historical full-row −inf-masked kernel.
+            let mut out_ref = vec![0f32; hpk * hd];
+            let mut imp_ref = vec![0f32; rows];
+            for h in 0..hpk {
+                let mut s = vec![f32::NEG_INFINITY; rows];
+                for p in first..rows {
+                    s[p] = crate::attention::dot_f32(
+                        &q[h * hd..(h + 1) * hd],
+                        &c.head_keys(0)[p * hd..(p + 1) * hd],
+                    ) * scale;
+                }
+                let m = s.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0f32;
+                for v in s.iter_mut() {
+                    *v = (*v - m).exp();
+                    sum += *v;
+                }
+                for v in s.iter_mut() {
+                    *v /= sum;
+                }
+                for p in first..rows {
+                    if s[p].abs() < 1e-12 {
+                        continue;
+                    }
+                    crate::attention::axpy_f32(
+                        &mut out_ref[h * hd..(h + 1) * hd],
+                        &c.head_values(0)[p * hd..(p + 1) * hd],
+                        s[p],
+                    );
+                }
+                for (d, &p) in imp_ref.iter_mut().zip(&s) {
+                    *d += p;
+                }
+            }
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&out), bits(&out_ref), "out window {w}");
+            assert_eq!(bits(&imp), bits(&imp_ref), "imp window {w}");
+        }
+    }
+
+    /// Sinks are weights: a new conversation (clear) and a wire import
+    /// must keep them.
+    #[test]
+    fn sinks_survive_clear_and_wire_import() {
+        let mut c = LayerKvCache::new(1, 4);
+        c.mode = KvMode::F32;
+        c.sinks = Some(vec![0.5, -0.5]);
+        c.append(&[1.0; 4], &[2.0; 4], &[]);
+        let wire = c.export_wire(false).unwrap();
+        c.clear();
+        assert_eq!(c.sinks.as_deref(), Some(&[0.5f32, -0.5][..]));
+        c.import_wire(&wire).unwrap();
+        assert_eq!(c.sinks.as_deref(), Some(&[0.5f32, -0.5][..]));
+        assert_eq!(c.seq_len, 1);
     }
 
     /// Review regression: mass-based eviction in MIXED modes. q8v used to
