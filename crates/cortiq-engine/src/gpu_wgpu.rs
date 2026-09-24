@@ -29570,6 +29570,25 @@ pub fn q8_matmat_2f(
     .is_some()
 }
 
+thread_local! {
+    // A model-scoped precision contract, not a global backend downgrade.
+    // MiMo's wide prefill must not round activations/weights to f16 only
+    // when the runtime probe happens to choose a cooperative GEMM: that
+    // changed its 128-token PPL from 3.647 to 3.656 at a 24-GB budget.
+    static MIMO_F32_GEMM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+struct MimoF32Gemm(bool, std::marker::PhantomData<std::rc::Rc<()>>);
+impl MimoF32Gemm {
+    fn enter(arch: &str) -> Self {
+        let before = MIMO_F32_GEMM.get();
+        MIMO_F32_GEMM.set(before || arch == "mimo_v2");
+        Self(before, std::marker::PhantomData)
+    }
+}
+impl Drop for MimoF32Gemm {
+    fn drop(&mut self) { MIMO_F32_GEMM.set(self.0); }
+}
+
 pub fn q8_matmat(
     model: &Arc<CmfModel>,
     idx: usize,
@@ -29580,6 +29599,7 @@ pub fn q8_matmat(
     cols: usize,
     out: &mut [f32],
 ) -> bool {
+    let _precision = MimoF32Gemm::enter(&model.arch().arch_name);
     let Some(c) = ctx() else { return false };
     if cols % 4 != 0 || rows == 0 || b == 0 {
         return false;
@@ -30107,7 +30127,7 @@ fn dispatch_matmat_keep(
     // GEMM after it is the same — only the unpacker differs, and int8's is
     // one multiply. Worth its pass only when the batch amortizes it, hence
     // the same b >= 64 gate the four-bit arm uses.
-    let coop = if b >= 64 && cols % 2 == 0 && !std::env::var("CMF_Q8_COOP").is_ok_and(|v| v == "0")
+    let coop = if !MIMO_F32_GEMM.get() && b >= 64 && cols % 2 == 0 && !std::env::var("CMF_Q8_COOP").is_ok_and(|v| v == "0")
     {
         c.q4tp_mm_coop_f16
             .as_ref()
@@ -31361,7 +31381,7 @@ fn tp_matmat_impl(
     // f16 operands cannot overflow (the DiT's modulated activations run
     // past 65504 — that overflow was this kernel's NaN). 0 = no scaling,
     // so the scalar arm and every other caller keep their numerics.
-    let coop_arm = !two_bit && c.q4tp_mm_coop.is_some();
+    let coop_arm = !MIMO_F32_GEMM.get() && !two_bit && c.q4tp_mm_coop.is_some();
     if std::env::var("CMF_GPU_DEBUG").is_ok() && b >= 512 {
         use std::collections::HashSet;
         use std::sync::Mutex;
@@ -31592,6 +31612,7 @@ pub fn q4t_matmat(
     cols: usize,
     out: &mut [f32],
 ) -> bool {
+    let _precision = MimoF32Gemm::enter(&model.arch().arch_name);
     let Some(c) = ctx() else { return false };
     let _gate = c.mm_gate.lock().unwrap();
     let gpr = cols / 32;
@@ -36923,7 +36944,7 @@ fn mm_pipeline(c: &Ctx, q4tp: bool, two_bit: bool) -> &wgpu::ComputePipeline {
         return &c.q2tp_mm;
     }
     if q4tp {
-        if let Some(p) = c.q4tp_mm_coop.as_ref() {
+        if !MIMO_F32_GEMM.get() && let Some(p) = c.q4tp_mm_coop.as_ref() {
             return p;
         }
         return &c.q4tp_mm;
@@ -60223,5 +60244,24 @@ mod buffer_ceiling_tests {
         assert!(buffers_fit(100, &[100]));
         assert!(!buffers_fit(100, &[101]));
         assert!(buffers_fit(100, &[]));
+    }
+}
+
+#[cfg(test)]
+mod mimo_precision_scope_tests {
+    use super::*;
+    #[test]
+    fn mimo_gemm_precision_is_nested_thread_local_and_restored() {
+        assert!(!MIMO_F32_GEMM.get());
+        {
+            let _mimo = MimoF32Gemm::enter("mimo_v2");
+            assert!(MIMO_F32_GEMM.get());
+            { let _nested = MimoF32Gemm::enter("other"); assert!(MIMO_F32_GEMM.get()); }
+            std::thread::spawn(|| assert!(!MIMO_F32_GEMM.get())).join().unwrap();
+            assert!(MIMO_F32_GEMM.get());
+        }
+        assert!(!MIMO_F32_GEMM.get());
+        let _ = std::panic::catch_unwind(|| { let _mimo = MimoF32Gemm::enter("mimo_v2"); panic!("scope test"); });
+        assert!(!MIMO_F32_GEMM.get());
     }
 }
