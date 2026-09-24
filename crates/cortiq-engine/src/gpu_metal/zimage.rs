@@ -88,6 +88,8 @@ const FLASH_VARIANTS: &[(&str, &str, usize)] = &[
     ("q32", "zi_flash_q32", 4),
     ("nopv", "zi_flash_nopv", 8),
     ("noqk", "zi_flash_noqk", 8),
+    ("nomma", "zi_flash_nomma", 8),
+    ("noload", "zi_flash_noload", 8),
 ];
 
 /// (pipeline, simdgroups) of the chosen flash variant.
@@ -213,8 +215,8 @@ pub struct Guards {
 }
 
 impl Guards {
-    pub const TURBO: Guards = Guards { attn: 0, qkv: 0, ao: 0, ffn: 0, hid: 6 };
-    pub const BASE: Guards = Guards { attn: 6, qkv: 7, ao: 6, ffn: 6, hid: 11 };
+    pub const TURBO: Guards = Guards { attn: 0, qkv: 1, ao: 0, ffn: 0, hid: 6 };
+    pub const BASE: Guards = Guards { attn: 6, qkv: 8, ao: 6, ffn: 6, hid: 11 };
 
     fn for_model(model: &CmfModel) -> Guards {
         let variant = model

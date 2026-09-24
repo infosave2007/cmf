@@ -202,6 +202,8 @@ static inline uint zfa_row(constant ZFa& p, uint j) {
 }
 
 // Flash body. NSG simdgroups × 8 queries per group (32 or 64 queries);
+// SKIP (cost attribution only): 1 no P·V, 2 no Q·Kᵀ, 3 neither, 4 no
+// device K/V loads.
 // keys in blocks of 32, K/V staged row-major in threadgroup memory (Kᵀ
 // fragments load transposed). PF: the next block's K/V are prefetched
 // into registers before this block's math. Measured (M4, n 1056/4224,
@@ -217,7 +219,7 @@ static inline void zi_flash_body(
     const uint h = tg.y;
     const uint ntot = p.n_img + p.n_cap;
     const uint q0 = tg.x * (8u * NSG) + 8u * sg;
-    const uint qr = zfa_row(p, q0);
+    const uint qr = zfa_row(p, min(q0, ntot - 8u));
     const uint hq = h * 128u;
     simdgroup_half8x8 qf[16];
     for (ushort d = 0; d < 16; ++d)
@@ -241,6 +243,8 @@ static inline void zi_flash_body(
         }
     }
     for (uint kb0 = 0; kb0 < ntot; kb0 += 32u) {
+        threadgroup const half* skb = sk;
+        threadgroup const half* svb = sv;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (!PF) {
             for (uint c = 0; c < CH; ++c) {
@@ -254,7 +258,7 @@ static inline void zi_flash_body(
             *(threadgroup uint4*)(sv + ckey[c] * 128u + cpart[c]) = vq[c];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (PF && kb0 + 32u < ntot) {
+        if (PF && SKIP != 4 && kb0 + 32u < ntot) {
             for (uint c = 0; c < CH; ++c) {
                 const uint kr = zfa_row(p, kb0 + 32u + ckey[c]);
                 kq[c] = *(device const uint4*)(P + (ulong)kr * p.ldp + p.H + hq + cpart[c]);
@@ -265,11 +269,11 @@ static inline void zi_flash_body(
         #pragma clang loop unroll(full)
         for (ushort c = 0; c < 4; ++c) {
             s[c] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-            if (SKIP != 2) {
+            if (SKIP != 2 && SKIP != 3) {
                 #pragma clang loop unroll(full)
                 for (ushort d = 0; d < 16; ++d) {
                     simdgroup_half8x8 kf;
-                    simdgroup_load(kf, sk + 8u * c * 128u + 8u * d, 128, ulong2(0, 0), true);
+                    simdgroup_load(kf, skb + 8u * c * 128u + 8u * d, 128, ulong2(0, 0), true);
                     simdgroup_multiply_accumulate(s[c], qf[d], kf, s[c]);
                 }
             }
@@ -300,13 +304,13 @@ static inline void zi_flash_body(
                 of[d].thread_elements()[1] *= alpha;
             }
         }
-        if (SKIP != 1) {
+        if (SKIP != 1 && SKIP != 3) {
             #pragma clang loop unroll(full)
             for (ushort c = 0; c < 4; ++c) {
                 #pragma clang loop unroll(full)
                 for (ushort d = 0; d < 16; ++d) {
                     simdgroup_half8x8 vf;
-                    simdgroup_load(vf, sv + 8u * c * 128u + 8u * d, 128);
+                    simdgroup_load(vf, svb + 8u * c * 128u + 8u * d, 128);
                     simdgroup_multiply_accumulate(of[d], pf[c], vf, of[d]);
                 }
             }
@@ -345,6 +349,8 @@ ZI_FLASH(zi_flash_q64pf, 8, true, 0)
 ZI_FLASH(zi_flash_q32, 4, false, 0)
 ZI_FLASH(zi_flash_nopv, 8, true, 1)
 ZI_FLASH(zi_flash_noqk, 8, true, 2)
+ZI_FLASH(zi_flash_nomma, 8, true, 3)
+ZI_FLASH(zi_flash_noload, 8, true, 4)
 
 
 // ───────── qk RMSNorm + interleaved RoPE, in place on the panel ─────────
