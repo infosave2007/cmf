@@ -20,8 +20,13 @@
 //! logits = lm_head(final_layernorm(u))                 lm_head shared with the trunk
 //! ```
 //!
-//! `hid` is the backbone's hidden AFTER its final norm (both servers' target
-//! model returns `model.norm(h)` as the hidden the draft consumes).
+//! `hid` is the backbone's last-layer output BEFORE its final norm. Both
+//! servers feed `model.norm(h)` instead (their target returns the normed
+//! hidden), but the exact oracle (`tools/mimo_ref.py mtp`, 3 × 320 natural
+//! tokens) measures the pre-norm hidden better at every depth: teacher-forced
+//! chain acceptance d1/d2/d3 wikitext .589/.313/.152 vs .551/.263/.098,
+//! HTML/JS .943/.864/.801 vs .937/.854/.772, Russian .845/.623/.424 vs
+//! .813/.576/.383. `CMF_MIMO_MTP_HIDDEN=post` selects the servers' reading.
 //!
 //! # How the three layers chain (SGLang multi-layer MTP)
 //!
@@ -33,7 +38,7 @@
 //! position `t` (hidden `h_t`) with `x_{t+1}` sampled:
 //!
 //! ```text
-//! layer k, row j:  (embed(x_{j+k+1}), norm(h_j))  at RoPE position j
+//! layer k, row j:  (embed(x_{j+k+1}), h_j)        at RoPE position j
 //! draft d_{k+1} = argmax of layer k's row t        (the token for t+k+2)
 //! ```
 //!
@@ -138,11 +143,16 @@ pub struct MimoMtp {
     committed: Vec<usize>,
     /// Per layer: absolute position of the cache's first row.
     base: Vec<usize>,
-    /// Backbone hiddens after the final norm, positions `hist_start..`.
+    /// Backbone hiddens the draft layers read (pre-final-norm unless
+    /// `post_norm_hidden`), positions `hist_start..`.
     hist: VecDeque<Vec<f32>>,
     hist_start: usize,
     hist_cap: usize,
     pub stats: MtpStats,
+    /// The draft layers read the backbone hidden AFTER the final norm
+    /// (vLLM / SGLang) instead of before it (the default, measured better:
+    /// see the module doc). `CMF_MIMO_MTP_HIDDEN=post`.
+    pub post_norm_hidden: bool,
     /// Test hook: drafts are read from this sequence (by position) instead
     /// of the layers — to drive exact partial acceptance through the round.
     #[cfg(test)]
@@ -178,6 +188,7 @@ impl MimoMtp {
             hist_start: 0,
             hist_cap: HIST_CAP,
             stats: MtpStats::default(),
+            post_norm_hidden: std::env::var("CMF_MIMO_MTP_HIDDEN").as_deref() == Ok("post"),
             #[cfg(test)]
             draft_override: None,
         }
@@ -412,14 +423,19 @@ impl Pipeline {
             st.hist.clear();
             st.hist_start = pos;
         }
-        let mut g = vec![0.0f32; self.hidden_size];
-        inference::rms_norm_into(
-            hidden,
-            &self.weights.final_norm,
-            self.rms_eps,
-            self.norm_style,
-            &mut g,
-        );
+        let g = if st.post_norm_hidden {
+            let mut g = vec![0.0f32; self.hidden_size];
+            inference::rms_norm_into(
+                hidden,
+                &self.weights.final_norm,
+                self.rms_eps,
+                self.norm_style,
+                &mut g,
+            );
+            g
+        } else {
+            hidden.to_vec()
+        };
         st.hist.push_back(g);
         while st.hist.len() > st.hist_cap {
             st.hist.pop_front();
@@ -616,7 +632,18 @@ impl Pipeline {
         let mut ids = Vec::with_capacity(k + 1);
         ids.push(all_ids[next_pos]);
         ids.extend_from_slice(&drafts);
-        let hb = self.prefill_batch(&ids, next_pos);
+        // Decode-exact batched verify: row-exact kernels and the exact
+        // multi-row MoE (`CMF_MIMO_MTP_VERIFY=fast` = the prompt path's
+        // blocked kernels / expert-order sums: close to decode, not equal).
+        let exact = std::env::var("CMF_MIMO_MTP_VERIFY").as_deref() != Ok("fast");
+        let hb = if exact {
+            self.verify_exact_moe = true;
+            let hb = crate::qtensor::row_exact_scope(|| self.prefill_batch(&ids, next_pos));
+            self.verify_exact_moe = false;
+            hb
+        } else {
+            self.prefill_batch(&ids, next_pos)
+        };
         let hs = self.hidden_size;
         let mut history = all_ids.to_vec();
         let mut a = 0usize;
