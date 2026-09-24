@@ -75,6 +75,11 @@ On Apple silicon (Metal), the DiT and the VAE run on the GPU with no flags:
   simdgroup-matrix GEMMs that stage the int8 tile as half, flash attention,
   fused row kernels — split into command buffers of two blocks each. CFG
   runs the pair as one batch-2 program; the context refiner runs on the GPU.
+  On the M4 the CPU's matrix unit (Accelerate) computes a fixed share of
+  every large GEMM's output features beside the GPU (a quarter at 512²,
+  a fifth above 1600 rows), ordered with the GPU chain by a shared event;
+  `CMF_ZI_CPU_FRAC=0` runs the GPU alone, `=auto` adapts the share (then
+  the image depends on timing and is not bit-stable run to run).
 - **VAE**: resident decoder — NHWC half activations, implicit-GEMM convs
   (the 2× upsample folded into the gather), two-pass GroupNorm, the mid
   attention as GEMMs; its weights upload while the steps run.
@@ -202,47 +207,65 @@ Ratios (cortiq / diffusers):
 
 ## Device parity (Mac mini M4, Metal)
 
-| check | result |
-|---|---|
-| one DiT forward on the oracle inputs, device vs the CPU path on the same file (Turbo r512 i0 / r1024 i0, base r512 c3 i0) | `v` rel 1.15e-3 / 8.0e-4 / 2.7e-4 |
-| the same against the fp32 oracle | 2.89e-2 / 4.28e-2 / 8.5e-3 (the CPU path itself: 2.90e-2 / 4.26e-2 / 8.6e-3) |
-| CFG pair (one batch-2 forward) against the two single forwards | bit-identical |
-| VAE on the oracle latent (r512) | `img` rel 1.6e-4, u8 PSNR 69.3 dB vs the fp32 decoder |
-| Turbo whole CLI run vs the CPU pipeline (same file, same noise): 512² p0 / 400×592 / 1024² p0 | PNG PSNR 48.6 / 53.2 / 53.9 dB, `lat_8` rel 2.2e-2 / 9.6e-3 / 8.1e-3 |
-| Turbo images vs fp32 (512² p0, 1024² p0) | 26.25 / 33.29 dB (the CPU path: 26.12 / 33.31) |
-| base, 3 steps CFG + negative, 512² | vs the CPU pipeline 53.8 dB (`lat_3` rel 4.6e-3); vs fp32 35.6 dB (CPU 35.4) |
+Default = with the CPU share; "GPU only" = `CMF_ZI_CPU_FRAC=0`.
+
+| check | default | GPU only |
+|---|---|---|
+| one DiT forward on the oracle inputs, device vs the CPU path on the same file: Turbo r512 i0 / r1024 i0, base r512 c3 i0 | `v` rel 7.0e-4 / 9.4e-4 / 2.2e-4 | 1.15e-3 / 8.0e-4 / 2.7e-4 |
+| the same against the fp32 oracle (the CPU path: 2.90e-2 / 4.26e-2 / 8.6e-3) | 2.86e-2 / 4.25e-2 / 8.6e-3 | 2.89e-2 / 4.28e-2 / 8.5e-3 |
+| CFG pair (one batch-2 forward) against the two single forwards | 2.6e-4 (the pair and the singles get different shares) | bit-identical |
+| VAE on the oracle latent (r512) | `img` rel 1.6e-4, u8 PSNR 69.3 dB vs the fp32 decoder | same |
+| Turbo 512² p0, 6 seeds (the oracle's sweep noise), PNG PSNR vs fp32, median / min | 28.58 / 27.03 dB | 28.55 / 26.83 dB |
+| the same, the CPU pipeline and diffusers bf16 vs fp32 | CPU 28.54 / 26.80; bf16 32.89 / 16.03 | |
+| the same 6 seeds, PSNR vs the CPU pipeline, median / min | 52.9 / 46.5 dB | 57.4 / 45.2 dB |
+| Turbo whole run vs the CPU pipeline (s42 oracle noise): 512² p0 / 400×592 / 1024² p0 | 32.3 / 45.3 / 54.6 dB | 48.6 / 53.2 / 53.9 dB |
+| Turbo s42 images vs fp32 (512² p0, 1024² p0; the CPU path 26.12 / 33.31) | 28.01 / — dB | 26.25 / 33.29 dB |
+| base, 3 steps CFG + negative, 512²: vs the CPU pipeline; vs fp32 (CPU 35.4) | 45.3 dB (`lat_3` 1.5e-2); 35.6 dB | 53.8 dB (4.6e-3); 35.6 dB |
+
+Per step on identical inputs the share is closer to the CPU path (a fifth
+to a quarter of the features are f32); whole Turbo runs then diverge
+chaotically in either arm (`lat_1` 5e-5 → `lat_8` 8e-2 for the s42 case),
+which is why single images vs the CPU pipeline scatter from 32 to 60 dB
+while every arm stays as close to fp32 as the CPU path itself.
 
 ## Speed (Mac mini M4, 10-core GPU, 24 GB, in-process timers)
 
 `cortiq imagine <file> --prompt P --width W --height W`, one image per
 process (model open and kernel compile included), cool-down between runs.
-The M4 slows as it heats: a 1024² step goes from 19.6 s to ~23 s over a
-run. Before = the same binary with the Metal DiT/VAE declined (the DiT on
-the CPU through Accelerate, the per-conv VAE).
+The M4 slows as it heats: a 1024² step goes from ~17 s (share) / 19.6 s
+(GPU only) to ~20–23 s over a run, and a base 1024² CFG step from 33 s to
+45 s. "Before" = the same binary with the Metal DiT/VAE declined (the DiT
+on the CPU through Accelerate, the per-conv VAE). Default = with the CPU
+share; GPU only = `CMF_ZI_CPU_FRAC=0`.
 
-| model, size | total | text encoder | prepare | steps (median step) | VAE | peak RSS / footprint |
-|---|---|---|---|---|---|---|
-| Turbo 512² | 35.5 s (before 81.6 s) | 0.69 s | 0.24 s | 33.5 s (4.21 s; CPU 9.69 s) | 1.03 s (before 3.28 s) | 5.4 / 2.2 GB |
-| Turbo 1024² | 171–173 s (before 371.5 s) | 0.68 s | 0.24 s | 166 s (20.9 s; CPU 44.0 s) | 4.6 s (before 13.5 s) | 5.4 / 4.3 GB (before 13.3 / 17.5 GB) |
-| base 512² | 251 s (before ≈ 548 s, derived) | 1.29 s | 0.42 s | 248 s (8.85 s, CFG pair; CPU 19.4 s) | 1.16 s | 5.4 / 2.0 GB |
-| base 1024² | 1277 s (before ≈ 2490 s, derived) | 1.28 s | 0.42 s | 1270 s (45.9 s, CFG pair; CPU ≈ 88 s) | 4.75 s | 5.4 / 4.5 GB |
+| model, size | total, default | GPU only | before | text encoder | prepare | steps (median step), default | VAE | peak RSS / footprint |
+|---|---|---|---|---|---|---|---|---|
+| Turbo 512² | 30.1–30.5 s | 34.5–35.6 s | 81.6 s | 0.63 s | 0.20 s | 28.2–28.6 s (3.61–3.69 s; GPU only 4.10–4.21, CPU 9.69) | 1.03 s (before 3.28) | 7.5 / 2.6 GB (GPU only 5.4 / 2.2) |
+| Turbo 1024² | 160.1–160.9 s | 165–173 s | 371.5 s | 0.63 s | 0.20 s | 154.3–155.0 s (19.5–19.6 s; GPU only 20.2–20.9, CPU 44.0) | 4.8 s (before 13.5) | 7.6 / 4.6 GB (before 13.3 / 17.5) |
+| base 512² | 231.8 s | 251.2 s | ≈ 548 s, derived | 1.19 s | 0.38 s | 228.8 s (8.42 s a CFG pair; GPU only 8.85, CPU 19.4) | 1.30 s | 7.5 / 2.6 GB |
+| base 1024² | 1234.3 s | 1276.7 s | ≈ 2490 s, derived | 1.19 s | 0.37 s | 1227.6 s (44.8 s; GPU only 45.9, CPU ≈ 88) | 5.0 s | 8.6 / 5.2 GB |
 
 "Derived" = the measured CPU step × steps plus the measured stages. The
 first run after switching between the two files pays the page-in of the
-new file (base 512²: 257.7 s, text encoder 3.7 s and prepare 3.3 s).
+new file (text encoder ~3.7 s and prepare ~3 s instead of 1.2 and 0.4).
+The CPU share is worth −13 % per Turbo 512² image and −6 % at 1024²
+(alternating A/B), but only −3 % on a 20-minute base 1024² image: once
+the package is hot, the CPU's power comes out of the GPU's.
 
 diffusers 0.36 bf16 on MPS (`torch 2.8`), the transformer alone on the
 same Mac, same day: one forward at 512² takes 4.80 s (the CFG pair 9.77 s;
 the first call 23 s, loading 18 s, peak footprint 14.5 GB) — cortiq's step
-is 0.88× (the pair 0.91×). At 1024² diffusers needs 30 GB and swaps: 48–66 s
-a forward, and the CFG pair was killed after its first 154 s forward;
-cortiq takes 20.9 s (0.32–0.44×) in 4.3 GB.
+is 0.75× with the CPU share, 0.88× on the GPU alone (the pair 0.86× /
+0.91×). At 1024² diffusers needs 30 GB and swaps: 48–66 s a forward, and
+the CFG pair was killed after its first 154 s forward; cortiq takes 19.5 s
+(0.30–0.41×) in 4.6 GB.
 
-The DiT step is 3.0 TF/s effective at 512² and 2.6–2.8 TF/s at 1024²
-(12.5 / 55.1 TFLOP per forward). The GEMMs run at 3.2–3.35 TF/s, 91–94 %
-of what the chip's simdgroup matrix units issue in a pure multiply loop
-(3.55 TF/s); attention runs at 1.5–1.7 TF/s and is a quarter of a 1024²
-step. The text encoder is 2 % of a Turbo 512² image.
+The DiT step is 3.5 TF/s effective at 512² (3.0 on the GPU alone) and
+2.8 TF/s at 1024² (12.5 / 55.1 TFLOP per forward). The GEMMs run at
+3.2–3.35 TF/s on the GPU, 91–94 % of what the chip's simdgroup matrix
+units issue in a pure multiply loop (3.55 TF/s), plus ~1.1–1.5 TF/s on the
+CPU's matrix unit; attention runs at 1.5–1.7 TF/s and is a quarter of a
+1024² step. The text encoder is 2 % of a Turbo 512² image.
 
 ## Oracles
 
