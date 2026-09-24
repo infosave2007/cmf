@@ -685,6 +685,26 @@ impl LayerKvCache {
         first: usize,
         softcap: f32,
     ) {
+        self.attend_group_upto(q_group, kv_head, out, imp_acc, scale, first, softcap, usize::MAX)
+    }
+
+    /// `attend_group` over the first `upto` stored rows only — what the
+    /// same call saw when the cache held exactly `upto` rows. A prefill
+    /// chunk appends all its rows first and then attends every position
+    /// in parallel; position `i` passes `upto = s0 + i + 1`, which makes
+    /// its result bit-identical to the sequential append-then-attend.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attend_group_upto(
+        &self,
+        q_group: &[f32],
+        kv_head: usize,
+        out: &mut [f32],
+        imp_acc: &mut [f32],
+        scale: f32,
+        first: usize,
+        softcap: f32,
+        upto: usize,
+    ) {
         let hd = self.head_dim;
         let nheads = q_group.len() / hd;
         debug_assert_eq!(out.len(), nheads * hd);
@@ -692,7 +712,8 @@ impl LayerKvCache {
             self.k[kv_head].len() / hd
         } else {
             self.head_len(kv_head)
-        };
+        }
+        .min(upto);
         if stored == 0 {
             out.fill(0.0);
             return;
