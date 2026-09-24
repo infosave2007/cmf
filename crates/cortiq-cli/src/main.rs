@@ -302,9 +302,11 @@ enum Commands {
         /// or a hub repo id like `Qwen/Qwen2.5-0.5B-Instruct` (downloaded)
         #[arg(long)]
         model: String,
-        /// Quantization for 2-D weights: q8 | q8_2f | q4 | q4t | q4tp | q2tp | q1 | q1p | q1s | q1t | f16 | vbit
-        #[arg(long, default_value = "q8")]
-        quant: String,
+        /// Quantization for 2-D weights: q8 | q8_2f | q4 | q4t | q4tp | q2tp | q1 | q1p | q1s | q1t | f16 | vbit | auto.
+        /// Default (or `auto`): q8, except MiMo-V2 (`mimo_v2`), which converts to
+        /// q4tp experts with a q8_2f skeleton.
+        #[arg(long)]
+        quant: Option<String>,
         /// Output .cmf path
         #[arg(long)]
         output: String,
@@ -2022,7 +2024,7 @@ async fn main() -> anyhow::Result<()> {
             };
             convert::run_convert(
                 &model,
-                &quant,
+                quant.as_deref().unwrap_or(convert::AUTO_QUANT),
                 &output,
                 hf_token.as_deref(),
                 defrag.as_deref(),
