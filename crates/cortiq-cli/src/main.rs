@@ -316,6 +316,13 @@ enum Commands {
         /// (e.g. GatedDeltaNet) may need 5.5–6 to stay coherent.
         #[arg(long, default_value = "4.25")]
         mean_bits: f32,
+        /// Per-tensor quantization override, PATTERN=QUANT (repeatable; first
+        /// match wins; `*` is the only wildcard and spans dots). Applies to
+        /// the 2-D weights the profile would quantize, e.g.
+        /// `--tensor-quant lm_head.weight=q8_2f` keeps a q4tp file's output
+        /// head at 8 bits; `--tensor-quant 'model.layers.*.mlp.down_proj.weight=q8_2f'`.
+        #[arg(long = "tensor-quant", value_name = "PATTERN=QUANT")]
+        tensor_quant: Vec<String>,
         /// Continue a conversion that was interrupted. Keeps the payloads
         /// already in <output> and skips every source shard its manifest
         /// records as done — the download included, which is where a
@@ -511,6 +518,27 @@ enum Commands {
         /// Relative Hessian damping λ (adds `λ·mean(diag)` to the diagonal)
         #[arg(long, default_value = "0.01")]
         lambda: f64,
+        /// Target codec: q1s (default; the 1-bit error-feedback path) or
+        /// q4tp (GPTQ-rounded q4tp — same layout and kernels as `convert
+        /// --quant q4tp`; give it an f16 export as INPUT)
+        #[arg(long, default_value = "q1s")]
+        codec: String,
+        /// q4tp: the file the calibration forward runs on (default INPUT).
+        /// The Hessian hook only sees memory-mapped quantized tensors, so an
+        /// f16 INPUT needs its q8/q8_2f sibling here
+        #[arg(long)]
+        calib_model: Option<String>,
+        /// q4tp: calibration window length (each window a fresh context)
+        #[arg(long, default_value = "2048")]
+        window: usize,
+        /// q4tp: per-tensor override for the tensors GPTQ does not touch,
+        /// PATTERN=QUANT as in `convert --tensor-quant` (e.g.
+        /// `lm_head.weight=q8_2f`)
+        #[arg(long = "tensor-quant", value_name = "PATTERN=QUANT")]
+        tensor_quant: Vec<String>,
+        /// q4tp: worker threads (default: all cores)
+        #[arg(long)]
+        threads: Option<usize>,
     },
     /// Chat with a model (applies the file's chat template), or one-shot
     /// with --prompt
@@ -1953,6 +1981,7 @@ async fn main() -> anyhow::Result<()> {
             output,
             hf_token,
             mean_bits,
+            tensor_quant,
             resume,
             defrag,
             o1,
@@ -1961,6 +1990,7 @@ async fn main() -> anyhow::Result<()> {
             o1_sink,
         } => {
             convert::set_vbit_mean_bits(mean_bits);
+            convert::set_tensor_quant_overrides(&tensor_quant)?;
             // --o1: record the runtime hint in header provenance; the
             // weights pass through unchanged (this is metadata only).
             let o1_hint = match o1.as_deref() {
@@ -2054,8 +2084,40 @@ async fn main() -> anyhow::Result<()> {
             keep,
             tokens,
             lambda,
+            codec,
+            calib_model,
+            window,
+            tensor_quant,
+            threads,
         } => {
-            gptq::run_quantize_gptq(&input, &calib, &output, keep, tokens, lambda)?;
+            match codec.to_ascii_lowercase().as_str() {
+                "q4tp" => {
+                    convert::set_tensor_quant_overrides(&tensor_quant)?;
+                    let threads = threads.unwrap_or_else(|| {
+                        std::thread::available_parallelism()
+                            .map(|n| n.get())
+                            .unwrap_or(4)
+                    });
+                    gptq::run_quantize_gptq_q4tp(
+                        &input,
+                        calib_model.as_deref(),
+                        &calib,
+                        &output,
+                        tokens,
+                        window,
+                        lambda,
+                        threads,
+                    )?;
+                }
+                "q1s" => {
+                    anyhow::ensure!(
+                        calib_model.is_none() && tensor_quant.is_empty(),
+                        "--calib-model / --tensor-quant apply to --codec q4tp"
+                    );
+                    gptq::run_quantize_gptq(&input, &calib, &output, keep, tokens, lambda)?
+                }
+                other => anyhow::bail!("--codec {other}: expected q1s or q4tp"),
+            }
             println!("✓ wrote {output}");
             Ok(())
         }

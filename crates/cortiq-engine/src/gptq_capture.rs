@@ -48,10 +48,23 @@ pub fn begin(full_h: bool) {
     ON.store(true, Ordering::SeqCst);
 }
 
-/// Stop capturing and take the accumulated Hessians.
+/// Stop capturing and take the accumulated Hessians. `accumulate` fills
+/// only the upper triangle of each dense `H`; it is mirrored here so every
+/// consumer sees the full symmetric matrix.
 pub fn end() -> HashMap<String, HessianAcc> {
     ON.store(false, Ordering::SeqCst);
-    REG.lock().unwrap().take().unwrap_or_default()
+    let mut map = REG.lock().unwrap().take().unwrap_or_default();
+    for acc in map.values_mut() {
+        let n = acc.cols;
+        if acc.h.len() == n * n {
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    acc.h[j * n + i] = acc.h[i * n + j];
+                }
+            }
+        }
+    }
+    map
 }
 
 #[inline]
@@ -81,19 +94,101 @@ pub fn accumulate(name: &str, xs: &[f32], b: usize, cols: usize) {
     }
     for bi in 0..b {
         let x = &xs[bi * cols..(bi + 1) * cols];
-        for i in 0..cols {
-            let xi = x[i] as f64;
-            if xi == 0.0 {
-                continue;
-            }
-            acc.sumsq[i] += xi * xi;
-            if full {
-                let hrow = &mut acc.h[i * cols..i * cols + cols];
-                for (j, &xj) in x.iter().enumerate() {
-                    hrow[j] += xi * xj as f64;
-                }
-            }
+        for (i, &xi) in x.iter().enumerate() {
+            acc.sumsq[i] += xi as f64 * xi as f64;
         }
         acc.count += 1;
+    }
+    if full {
+        gram_upper_add(&mut acc.h, xs, b, cols);
+    }
+}
+
+/// `H[i][j] += Σ_t x_t[i]·x_t[j]` for `j ≥ i` (upper triangle only; `end()`
+/// mirrors it). The batch is transposed so each entry is one contiguous
+/// length-`b` dot product, and rows are dealt round-robin over threads so
+/// the triangle's uneven row lengths balance out. The former rank-1 update
+/// per token streamed the whole `cols²` matrix once per token and made
+/// calibrating even a 2B model take hours; this is compute-bound instead.
+fn gram_upper_add(h: &mut [f64], xs: &[f32], b: usize, cols: usize) {
+    if b == 0 || cols == 0 {
+        return;
+    }
+    let mut xt = vec![0f32; cols * b];
+    for t in 0..b {
+        let row = &xs[t * cols..(t + 1) * cols];
+        for (i, &v) in row.iter().enumerate() {
+            xt[i * b + t] = v;
+        }
+    }
+    let nth = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(cols.div_ceil(16))
+        .max(1);
+    struct SendPtr(*mut f64);
+    unsafe impl Sync for SendPtr {}
+    unsafe impl Send for SendPtr {}
+    let hp = SendPtr(h.as_mut_ptr());
+    let hp = &hp;
+    let xt = &xt;
+    std::thread::scope(|s| {
+        for k in 0..nth {
+            s.spawn(move || {
+                let mut i = k;
+                while i < cols {
+                    let xi = &xt[i * b..(i + 1) * b];
+                    for j in i..cols {
+                        let xj = &xt[j * b..(j + 1) * b];
+                        let d = dot_f32(xi, xj);
+                        // Each (i, j) belongs to exactly one thread (row i).
+                        unsafe { *hp.0.add(i * cols + j) += d as f64 };
+                    }
+                    i += nth;
+                }
+            });
+        }
+    });
+}
+
+#[inline]
+fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+    let mut acc = [0f32; 8];
+    let chunks = a.len() / 8;
+    for c in 0..chunks {
+        for l in 0..8 {
+            acc[l] += a[c * 8 + l] * b[c * 8 + l];
+        }
+    }
+    let mut s = acc.iter().sum::<f32>();
+    for k in chunks * 8..a.len() {
+        s += a[k] * b[k];
+    }
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gram_matches_rank1_reference() {
+        let (b, cols) = (13usize, 37usize);
+        let xs: Vec<f32> = (0..b * cols)
+            .map(|k| ((k * 7919 % 101) as f32 - 50.0) / 17.0)
+            .collect();
+        let mut h = vec![0f64; cols * cols];
+        gram_upper_add(&mut h, &xs, b, cols);
+        for i in 0..cols {
+            for j in i..cols {
+                let r: f64 = (0..b)
+                    .map(|t| xs[t * cols + i] as f64 * xs[t * cols + j] as f64)
+                    .sum();
+                assert!((h[i * cols + j] - r).abs() < 1e-3 * (1.0 + r.abs()), "{i},{j}");
+            }
+            for j in 0..i {
+                assert_eq!(h[i * cols + j], 0.0);
+            }
+        }
     }
 }
