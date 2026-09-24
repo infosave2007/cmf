@@ -51,6 +51,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Streaming with tools: text after a held tool-call marker that turns out
   not to be a call is now sent at the end. Before, it was dropped. Markup
   inside `<think>` is not treated as a call.
+- Cross-turn KV reuse on Vulkan/DX12 no longer corrupts the next turn. The
+  whole-token graph decodes into a device K/V mirror and never wrote those
+  rows back to the host cache, while the chunked prefill of a
+  pure-attention model reads and appends to the host cache: a reused turn
+  found the host cache ending at the previous prompt, attended without the
+  model's own answer and wrote the new rows at the wrong index. MiniCPM5-2B
+  on an RTX 3090 repeated its tool call instead of answering from the tool
+  result (1 of 6 turns right, 6 of 6 with `CMF_KV_REUSE=0`). Before a
+  reused turn the rows only the device holds are now copied back to the
+  host (one readback per turn), and a recurrent state advanced on the
+  device starts the turn fresh; reuse stays on by default. 6 of 6 on both
+  MiniCPM5-2B files with no flags; Metal, CPU and models whose prefill runs
+  through the graph are unchanged.
 
 ## [0.7.5] - 2026-09-24
 
