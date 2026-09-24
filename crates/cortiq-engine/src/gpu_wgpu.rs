@@ -26655,39 +26655,47 @@ pub fn graph_state_resident(kv_id: u64, layer: usize) -> bool {
     ctx().is_some_and(|c| c.gdn_state.lock().unwrap().contains_key(&(kv_id, layer)))
 }
 
-/// Read rows `[from..to)` of one exact-attention mirror back to the host,
-/// position-major (`[(to − from) × nkv × hd]` for K, the same for V) — the
-/// layout `LayerKvCache::append` takes one position of. None when the mirror
-/// does not hold those rows or the geometry does not match its buffers.
+/// Read rows back from several exact-attention mirrors in ONE submit: for
+/// each `(layer, from, to)` the K and V rows `[from..to)`, position-major
+/// (`[(to − from) × nkv × hd]` each) — the layout `LayerKvCache::append`
+/// takes one position of. None when any mirror does not hold its rows or
+/// the geometry does not match its buffers.
 pub fn kv_mirror_read_rows(
     kv_id: u64,
-    layer: usize,
-    from: usize,
-    to: usize,
+    reqs: &[(usize, usize, usize)],
     nkv: usize,
     hd: usize,
-) -> Option<(Vec<f32>, Vec<f32>)> {
+) -> Option<Vec<(Vec<f32>, Vec<f32>)>> {
     let c = ctx()?;
-    if to <= from {
-        return Some((Vec::new(), Vec::new()));
-    }
-    let (kb, vb, cap) = {
+    let row_bytes = (hd * 4) as u64;
+    let mut srcs = Vec::with_capacity(reqs.len());
+    {
         let mirrors = c.attn_kv.lock().unwrap();
-        let m = mirrors.get(&(kv_id, layer))?;
-        if m.synced < to || m.cap < to {
-            return None;
+        for &(layer, from, to) in reqs {
+            let m = mirrors.get(&(kv_id, layer))?;
+            if to < from || m.synced < to || m.cap < to {
+                return None;
+            }
+            let need = (nkv * m.cap) as u64 * row_bytes;
+            if m.k.size() < need || m.v.size() < need {
+                return None;
+            }
+            srcs.push((m.k.clone(), m.v.clone(), m.cap, from, to - from));
         }
-        (m.k.clone(), m.v.clone(), m.cap)
-    };
-    if kb.size() < (nkv * cap * hd * 4) as u64 || vb.size() < (nkv * cap * hd * 4) as u64 {
-        return None;
     }
-    let n = to - from;
-    let per = (n * hd * 4) as u64;
-    let total = per * (2 * nkv) as u64;
+    // Staging layout: per request [K heads | V heads], each head n rows.
+    let mut offs = Vec::with_capacity(srcs.len());
+    let mut total = 0u64;
+    for &(_, _, _, _, n) in &srcs {
+        offs.push(total);
+        total += 2 * nkv as u64 * n as u64 * row_bytes;
+    }
+    if total == 0 {
+        return Some(srcs.iter().map(|_| (Vec::new(), Vec::new())).collect());
+    }
     let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("kv-mirror-pull"),
-        size: total.max(4),
+        size: total,
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -26697,32 +26705,43 @@ pub fn kv_mirror_read_rows(
             label: Some("kv-mirror-pull"),
         });
     flush_pass(&enc);
-    for h in 0..nkv {
-        let src = ((h * cap + from) * hd * 4) as u64;
-        enc.copy_buffer_to_buffer(&kb, src, &stage, h as u64 * per, per);
-        enc.copy_buffer_to_buffer(&vb, src, &stage, (nkv + h) as u64 * per, per);
+    for ((kb, vb, cap, from, n), &off) in srcs.iter().zip(&offs) {
+        if *n == 0 {
+            continue;
+        }
+        let per = *n as u64 * row_bytes;
+        for h in 0..nkv {
+            let src = (h * cap + from) as u64 * row_bytes;
+            enc.copy_buffer_to_buffer(kb, src, &stage, off + h as u64 * per, per);
+            enc.copy_buffer_to_buffer(vb, src, &stage, off + (nkv + h) as u64 * per, per);
+        }
     }
     submit(c, finish_enc(enc));
     let slice = stage.slice(..total);
     slice.map_async(wgpu::MapMode::Read, |_| {});
     c.device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
     let data = slice.get_mapped_range().ok()?;
-    let head_major: &[f32] = bytemuck::cast_slice(&data);
-    // [K | V] × [head][pos][hd] → [pos][head][hd]
-    let mut k = vec![0.0f32; n * nkv * hd];
-    let mut v = vec![0.0f32; n * nkv * hd];
-    for h in 0..nkv {
-        for p in 0..n {
-            let s = (h * n + p) * hd;
-            let d = (p * nkv + h) * hd;
-            k[d..d + hd].copy_from_slice(&head_major[s..s + hd]);
-            let s = ((nkv + h) * n + p) * hd;
-            v[d..d + hd].copy_from_slice(&head_major[s..s + hd]);
+    let all: &[f32] = bytemuck::cast_slice(&data);
+    let mut out = Vec::with_capacity(srcs.len());
+    for (&(_, _, _, _, n), &off) in srcs.iter().zip(&offs) {
+        let base = (off / 4) as usize;
+        // [K | V] × [head][pos][hd] → [pos][head][hd]
+        let mut k = vec![0.0f32; n * nkv * hd];
+        let mut v = vec![0.0f32; n * nkv * hd];
+        for h in 0..nkv {
+            for p in 0..n {
+                let d = (p * nkv + h) * hd;
+                let s = base + (h * n + p) * hd;
+                k[d..d + hd].copy_from_slice(&all[s..s + hd]);
+                let s = base + ((nkv + h) * n + p) * hd;
+                v[d..d + hd].copy_from_slice(&all[s..s + hd]);
+            }
         }
+        out.push((k, v));
     }
     drop(data);
     stage.unmap();
-    Some((k, v))
+    Some(out)
 }
 
 /// GDN depthwise conv step (bring-up / parity): updates cq [cdim] and shifts
