@@ -51,8 +51,17 @@ Current integration is a candidate, **not a qualified/published release**:
 * Mac `cargo check` with GPU, engine tests, CLI and server: passes.
 * Synthetic ingress tests cover interleaving, strict unsupported blocks, pad
   count/embedding alignment and token-only KV-reuse isolation.
-* Runtime execution of those tests and full OCR/video/transcription gates is
-  being performed on the pod; no pass is claimed until the results exist.
+* Pod engine checks: 44 MiMo unit tests and 7 GPU bank tests pass. The newer
+  multipart regression cases still need runtime execution.
+* The actual assembled companion passes OCR (`CORTIQ 7392`), ordered colored
+  shapes, the chart question and five ASR clips (WER 0%, including 16 kHz and
+  stereo 44.1 kHz inputs). Real-model ID/embedded-row/MTP 32-token parity passes.
+* Video timestamp acceptance remains open: the eight-frame `00:04` fixture
+  expects 5 but both the candidate and exact BF16 tower answer 6. Identical
+  failure in the baseline does not turn the gate into a pass.
+* Strict vision row-cosine acceptance also remains open: q8 mean is 0.99774,
+  but 6/1488 rows fall below 0.98 (minimum 0.85990). The HF bf16/fp32 baseline
+  has comparable outliers; the specified minimum is not silently relaxed.
 * Previous tower work found plain q4tp/GPTQ vision below its quality threshold;
   q8_2f vision and audio-tokenizer fallback candidates are used alongside the
   GPTQ-q4tp audio encoder. The base text q4tp is not requantized.
