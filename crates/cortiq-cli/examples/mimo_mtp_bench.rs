@@ -96,6 +96,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut first_ids: Option<Vec<u32>> = None;
     let mut rows = Vec::new();
+    let mut all_identical = true;
     for mode in &modes {
         let spec = match mode.as_str() {
             "plain" => false,
@@ -137,6 +138,11 @@ fn main() -> anyhow::Result<()> {
             }
             Some(f) => *f == r.token_ids,
         };
+        all_identical &= same;
+        let first_mismatch = first_ids.as_ref().and_then(|f| {
+            f.iter().zip(&r.token_ids).position(|(a, b)| a != b)
+                .or_else(|| (f.len() != r.token_ids.len()).then_some(f.len().min(r.token_ids.len())))
+        });
         let text_out = p.tokenizer.decode(&r.token_ids);
         eprintln!(
             "[{mode}] {} tokens, TTFT {ttft:.2}s, decode {tps:.2} tok/s, identical to first arm: {same}",
@@ -154,6 +160,8 @@ fn main() -> anyhow::Result<()> {
             "decode_tok_s": tps,
             "decode_s": decode_s,
             "identical_to_first": same,
+            "first_mismatch": first_mismatch,
+            "token_ids": r.token_ids,
             "mtp_drafted": r.mtp_drafted,
             "mtp_accepted": r.mtp_accepted,
             "rounds": stats.as_ref().filter(|_| spec).map(|s| s.rounds),
@@ -174,5 +182,6 @@ fn main() -> anyhow::Result<()> {
         }
     }
     println!("{}", serde_json::to_string(&rows)?);
+    anyhow::ensure!(all_identical, "MTP token parity failed; see first_mismatch and token_ids in JSON");
     Ok(())
 }

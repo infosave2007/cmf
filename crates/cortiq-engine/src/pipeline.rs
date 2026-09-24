@@ -3805,6 +3805,7 @@ impl Pipeline {
                 );
             }
         }
+        self.mimo_moe_prepare();
         // A MoE stack larger than the card (MiMo-V2 q4tp on 96 GB): the
         // batched wgpu graph runs the device prefix of every chunk — its
         // experts resident — and the host's batched layer walk finishes
@@ -3853,6 +3854,9 @@ impl Pipeline {
                         } else {
                             hiddens
                         };
+                        if mimo_spec {
+                            self.mimo_note_rows(&hb, pos);
+                        }
                         hidden.copy_from_slice(&hb[(bk - 1) * hs..]);
                         pos = end;
                     }
@@ -4092,6 +4096,9 @@ impl Pipeline {
                     }
                 }
                 if ok_b {
+                    if mimo_spec {
+                        self.mimo_note_rows(&hiddens, pos);
+                    }
                     if mtp_batch_prefill {
                         let n_pairs = mtp_prefill_pair_count(pos, end, input_ids.len());
                         if n_pairs > 0 {
@@ -4500,6 +4507,13 @@ impl Pipeline {
                     let k = st.depth.min(budget);
                     let r = self.mimo_spec_round(&mut st, next_pos, &all_ids, k);
                     self.mimo_mtp = Some(st);
+                    let r = match r {
+                        Ok(r) => r,
+                        Err(err) => {
+                            self.finish_generation(&mut mtp, &mut router, true);
+                            return Err(err);
+                        }
+                    };
                     if let Some(r) = r {
                         drafted += r.drafted;
                         accepted += r.accepted.len();
@@ -8025,8 +8039,15 @@ impl Pipeline {
         pos: usize,
         task_mask: Option<&TaskMask>,
     ) -> Result<Vec<f32>, String> {
+        self.mimo_moe_prepare();
         #[cfg(not(target_os = "macos"))]
-        if task_mask.is_none() && !self.o1_active() && ids.len() > 1 && self.batch_prefix_prefill()
+        if task_mask.is_none()
+            && !self.o1_active()
+            && ids.len() > 1
+            && (self.batch_prefix_prefill()
+                || (self.verify_exact_moe
+                    && crate::gpu::enabled_here()
+                    && crate::gpu::wgpu_graph_on(crate::gpu::GraphPhase::Decode)))
         {
             let hs = self.hidden_size;
             let bk = ids.len();
@@ -8044,6 +8065,8 @@ impl Pipeline {
                 Some(&mut run),
             ) {
                 crate::gpu::BatchGraphOutcome::Completed => {
+                    #[cfg(feature = "gpu")]
+                    self.pull_lagging_host_kv(run, self.num_layers, pos);
                     return Ok(if run < self.num_layers {
                         self.prefill_batch_span(
                             PrefillIn::Hidden(&hiddens),
@@ -8143,7 +8166,9 @@ impl Pipeline {
         let mut chunk_skip_until = 0usize;
         for li in from..upto_excl {
             let _capacity_tail = automatic_gpu_prefix
-                .filter(|&prefix| li >= prefix)
+                .filter(|&prefix| {
+                    li >= prefix && !(self.verify_exact_moe && self.mimo_moe.is_dynamic(li, false))
+                })
                 .map(|_| crate::gpu::enter_cpu_scope());
             crate::gpu::set_layer(li as i64); // layer-split GPU/CPU
             // GPU chunk graph (default-on under CMF_GPU=1): a run of
@@ -8424,6 +8449,9 @@ impl Pipeline {
                     tube_ffn(d, &post, b, pool.as_deref(), mask_row)
                 }
                 FfnKind::Dense(d) => dense_ffn_batch(d, &post, b, pool.as_deref(), mask_row),
+                FfnKind::Moe(m) if self.verify_exact_moe && self.mimo_moe.is_dynamic(li, false) => {
+                    moe_ffn_banked_rows(&mut self.mimo_moe, li, m, &post, b, hs, pool.as_deref())
+                }
                 FfnKind::Moe(m) if self.verify_exact_moe => {
                     moe_ffn_rows_exact(m, &post, b, hs, pool.as_deref())
                 }
@@ -9207,7 +9235,7 @@ impl Pipeline {
                 // (then a whole-layer prefix is one submit, not per-layer
                 // fences).
                 let graph_prefix =
-                    self.graph_attn_decline_reason().is_none() && crate::gpu::wgpu_graph_default();
+                    self.wgpu_graph_attn_decline().is_none() && crate::gpu::wgpu_graph_default();
                 crate::mimo_moe::Slot::decide(&layers, self.num_layers, graph_prefix)
             }
         };
@@ -9547,6 +9575,17 @@ impl Pipeline {
         from: usize,
         upto_excl: usize,
     ) -> Option<Result<Vec<f32>, ()>> {
+        // The bank has already reserved its VRAM. Never build a second
+        // all-expert arena across bank-owned layers (including bursts).
+        let upto_excl = match self.mimo_moe.graph_prefix_end() {
+            Some(end) if end < upto_excl => {
+                if steps != 1 || layers_run.is_none() || from >= end {
+                    return None;
+                }
+                end
+            }
+            _ => upto_excl,
+        };
         // O(1) Nyström decode runs off the sealed state, not the KV cache the
         // graph mirrors — never take the graph while o1 is active.
         let o1_gpu = std::env::var("CMF_O1_GPU").as_deref() == Ok("1");
@@ -11464,6 +11503,15 @@ impl Pipeline {
         spec: Option<crate::gpu::SpecTail<'_>>,
         layers_run: Option<&mut usize>,
     ) -> crate::gpu::BatchGraphOutcome {
+        let graph_end = match self.mimo_moe.graph_prefix_end() {
+            Some(end) if end < self.num_layers => {
+                if layers_run.is_none() || spec.is_some() || end == 0 {
+                    return crate::gpu::BatchGraphOutcome::Declined;
+                }
+                end
+            }
+            _ => self.num_layers,
+        };
         let _tb = std::time::Instant::now();
         let batch_debug = std::env::var_os("CMF_BATCH_DEBUG").is_some();
         if self.attn_softcap > 0.0 {
@@ -11520,9 +11568,9 @@ impl Pipeline {
             Vec<crate::gpu::GraphLayer<'_>>,
             std::sync::Arc<cortiq_core::CmfModel>,
         )> = (|| {
-            let mut layers = Vec::with_capacity(self.num_layers);
+            let mut layers = Vec::with_capacity(graph_end);
             let mut model = None;
-            for li in 0..self.num_layers {
+            for li in 0..graph_end {
                 let lw = &self.weights.layers[self.phys_layer(li)];
                 // MoE routes per token, so its experts are encoded token by
                 // token inside the batched submit while attention and the
@@ -11775,7 +11823,7 @@ impl Pipeline {
             self.rms_eps as f32,
             self.attn_scale,
             k,
-            &(0..self.num_layers)
+            &(0..graph_end)
                 .map(|li| self.kv_cache.layers[self.phys_layer(li)].o1_views())
                 .collect::<Vec<_>>(),
             self.o1_epoch,
@@ -15754,6 +15802,36 @@ fn moe_ffn_banked(
     }
 }
 
+/// Verify rows share a bank frame; routing and fallback are decode's.
+fn moe_ffn_banked_rows(
+    slot: &mut crate::mimo_moe::Slot,
+    li: usize,
+    m: &MoeFfn,
+    xs: &[f32],
+    b: usize,
+    hidden: usize,
+    pool: Option<&Pool>,
+) -> Vec<f32> {
+    let t0 = std::time::Instant::now();
+    let routes: Vec<_> = xs
+        .chunks_exact(hidden)
+        .map(|x| moe_ffn_route(m, x, pool, None))
+        .collect();
+    slot.note_route(t0.elapsed().as_nanos() as u64);
+    if let Some(out) = slot.forward_rows(li, m, xs, &routes, pool) {
+        return out;
+    }
+    let mut out = Vec::with_capacity(b * hidden);
+    for (x, r) in xs.chunks_exact(hidden).zip(&routes) {
+        let row = slot.forward(li, m, x, r, pool).unwrap_or_else(|| {
+            // A failed bank must not stream missing experts into the arena.
+            crate::gpu::cpu_scope(|| moe_ffn_experts(m, x, r, pool))
+        });
+        out.extend(row);
+    }
+    out
+}
+
 /// One-shot report of whether the whole-token wgpu graph actually formed.
 /// A refusal silently reverts to the per-op path, which is how a model can
 /// look "GPU-accelerated" while every layer walks the host.  A device prefix
@@ -15921,6 +15999,76 @@ pub(crate) fn moe_cold_experts_cpu(
             *o += weight * v;
         }
         attention::recycle_buf(&mut one);
+    }
+    out
+}
+
+/// Cold part of a short bank batch. Share each expert's weight stream
+/// across its tokens, but reduce contributions in each token's route order.
+/// On an unsupported CPU/layout, retain the single-token cold kernels.
+pub(crate) fn moe_cold_experts_rows_cpu(
+    jobs: &[Vec<(&DenseFfn, f32)>],
+    xs: &[f32],
+    hidden: usize,
+    pool: Option<&Pool>,
+) -> Vec<f32> {
+    let mut out = vec![0.0; xs.len()];
+    let mut experts: Vec<&DenseFfn> = Vec::new();
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut terms = vec![Vec::new(); jobs.len()];
+    for (r, row) in jobs.iter().enumerate() {
+        for &(e, w) in row {
+            let g = match experts.iter().position(|&d| std::ptr::eq(d, e)) {
+                Some(g) => g,
+                None => {
+                    experts.push(e);
+                    groups.push(Vec::new());
+                    groups.len() - 1
+                }
+            };
+            terms[r].push((g, groups[g].len(), w));
+            groups[g].push(r);
+        }
+    }
+    if experts.is_empty() {
+        return out;
+    }
+    let pairs: Vec<_> = experts.iter().map(|e| (&e.gate_proj, &e.up_proj)).collect();
+    let downs: Vec<_> = experts.iter().map(|e| &e.down_proj).collect();
+    let lens: Vec<_> = groups.iter().map(Vec::len).collect();
+    let count: usize = lens.iter().sum();
+    let mut acts = vec![vec![0.0; experts[0].gate_proj.rows()]; count];
+    let mut ds = vec![vec![0.0; hidden]; count];
+    if QTensor::moe_gate_up_rows(&pairs, &groups, xs, &mut acts, pool)
+        && QTensor::moe_down_rows(&downs, &lens, &acts, &mut ds, pool)
+    {
+        let mut offset = 0;
+        let offsets: Vec<_> = lens
+            .iter()
+            .map(|&n| {
+                let start = offset;
+                offset += n;
+                start
+            })
+            .collect();
+        for (r, terms) in terms.iter().enumerate() {
+            for &(g, slot, w) in terms {
+                for (o, &v) in out[r * hidden..(r + 1) * hidden]
+                    .iter_mut()
+                    .zip(&ds[offsets[g] + slot])
+                {
+                    *o += w * v;
+                }
+            }
+        }
+    } else {
+        for (r, jobs) in jobs.iter().enumerate() {
+            if !jobs.is_empty() {
+                let mut row = moe_cold_experts_cpu(jobs, &xs[r * hidden..(r + 1) * hidden], pool);
+                out[r * hidden..(r + 1) * hidden].copy_from_slice(&row);
+                attention::recycle_buf(&mut row);
+            }
+        }
     }
     out
 }
@@ -17317,6 +17465,22 @@ mod tests {
             1,
             "{lines:?}"
         );
+    }
+
+    #[test]
+    fn mimo_verify_rewind_preserves_lagging_host_caches() {
+        let mut p = mimo_test_pipeline();
+        for (li, layer) in p.kv_cache.layers.iter_mut().enumerate() {
+            let row = vec![0.0; layer.num_kv_heads * layer.head_dim];
+            for _ in 0..if li == 0 { 2 } else { 12 } {
+                layer.append(&row, &row, &[]);
+            }
+        }
+        p.mimo_verify_rewind(9).unwrap();
+        assert_eq!(p.kv_cache.layers[0].seq_len, 2);
+        for layer in &p.kv_cache.layers[1..] {
+            assert_eq!(layer.seq_len, 9);
+        }
     }
 
     /// CMF_LAYER_DUMP: the decode walk and the batched prefill both write

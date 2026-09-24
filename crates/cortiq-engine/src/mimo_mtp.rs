@@ -218,7 +218,10 @@ impl MimoMtp {
             let vec = |name: &str, len: usize| -> Result<Vec<f32>, CmfError> {
                 let v = crate::loader::load_f32(model, &format!("{p}{name}"), &ov).map_err(err)?;
                 if v.len() != len {
-                    return Err(err(format!("{p}{name}: {} values, expected {len}", v.len())));
+                    return Err(err(format!(
+                        "{p}{name}: {} values, expected {len}",
+                        v.len()
+                    )));
                 }
                 Ok(v)
             };
@@ -324,10 +327,7 @@ pub fn load_for(
             })
             .count()
     };
-    let (src, n, from) = if main
-        .tensor("model.mtp.layers.0.eh_proj.weight")
-        .is_some()
-    {
+    let (src, n, from) = if main.tensor("model.mtp.layers.0.eh_proj.weight").is_some() {
         (main.clone(), count(main), main.path.display().to_string())
     } else {
         let path = cortiq_core::mtp_sidecar_path(&main.path);
@@ -445,7 +445,13 @@ impl Pipeline {
 
     /// Run `x` (n rows at positions first_pos.., after eh_proj) through one
     /// draft block in place, appending its K/V rows to the block's cache.
-    pub(crate) fn mimo_mtp_block(&self, m: &mut MtpModule, x: &mut [f32], n: usize, first_pos: usize) {
+    pub(crate) fn mimo_mtp_block(
+        &self,
+        m: &mut MtpModule,
+        x: &mut [f32],
+        n: usize,
+        first_pos: usize,
+    ) {
         let hs = self.hidden_size;
         let li = self.mimo_mtp_geom_layer();
         let MtpModule { layer, kv, .. } = m;
@@ -616,16 +622,16 @@ impl Pipeline {
         next_pos: usize,
         all_ids: &[u32],
         k: usize,
-    ) -> Option<MimoRound> {
+    ) -> Result<Option<MimoRound>, String> {
         if next_pos == 0 || all_ids.len() != next_pos + 1 || k == 0 {
-            return None;
+            return Ok(None);
         }
         let t = next_pos - 1;
         let t0 = std::time::Instant::now();
         let drafts = self.mimo_mtp_draft(st, t, all_ids, k);
         st.stats.draft_ns += t0.elapsed().as_nanos();
         if drafts.is_empty() {
-            return None;
+            return Ok(None);
         }
         let k = drafts.len();
         let t1 = std::time::Instant::now();
@@ -638,12 +644,12 @@ impl Pipeline {
         let exact = std::env::var("CMF_MIMO_MTP_VERIFY").as_deref() != Ok("fast");
         let hb = if exact {
             self.verify_exact_moe = true;
-            let hb = crate::qtensor::row_exact_scope(|| self.prefill_batch(&ids, next_pos));
+            let hb = crate::qtensor::row_exact_scope(|| self.prefill_rows(&ids, next_pos, None));
             self.verify_exact_moe = false;
             hb
         } else {
-            self.prefill_batch(&ids, next_pos)
-        };
+            self.prefill_rows(&ids, next_pos, None)
+        }?;
         let hs = self.hidden_size;
         let mut history = all_ids.to_vec();
         let mut a = 0usize;
@@ -675,12 +681,11 @@ impl Pipeline {
                 break;
             }
         }
-        let drop = k - a;
-        if drop > 0 {
-            for layer in &mut self.kv_cache.layers {
-                layer.truncate_last(drop);
-            }
-        }
+        // Host caches can lag graph-owned layers: rewind to an absolute
+        // position, not by K-a from a possibly stale host cursor. SWA rings
+        // retain two windows; the backend refuses if the needed old rows
+        // have already been overwritten. Such a failure is terminal.
+        self.mimo_verify_rewind(next_pos + a + 1)?;
         for i in 0..=a {
             self.mimo_mtp_note(st, next_pos + i, &hb[i * hs..(i + 1) * hs]);
         }
@@ -703,12 +708,31 @@ impl Pipeline {
                 s.depth_accepted[d] += 1;
             }
         }
-        Some(MimoRound {
+        Ok(Some(MimoRound {
             accepted: drafts[..a].to_vec(),
             hidden: hb[a * hs..(a + 1) * hs].to_vec(),
             logits,
             drafted: k,
-        })
+        }))
+    }
+
+    /// Reconcile both KV owners after a speculative suffix is rejected.
+    pub(super) fn mimo_verify_rewind(&mut self, keep: usize) -> Result<(), String> {
+        for li in 0..self.num_layers {
+            if crate::gpu::graph_kv_stored(self.graph_kv_id, li).is_some_and(|n| n > keep)
+                && !crate::gpu::graph_kv_set_stored(self.graph_kv_id, li, keep)
+            {
+                self.clear_sequence_state();
+                return Err(format!("MiMo MTP: GPU KV rollback refused at layer {li}"));
+            }
+            let layer = &mut self.kv_cache.layers[li];
+            if layer.seq_len > keep {
+                layer.truncate_last(layer.seq_len - keep);
+            }
+        }
+        // No out-of-band logits from a discarded speculative row survive.
+        self.graph_logits = None;
+        Ok(())
     }
 
     /// `CMF_MIMO_MTP_PROBE=<file>`: teacher-forced drafts of every prompt

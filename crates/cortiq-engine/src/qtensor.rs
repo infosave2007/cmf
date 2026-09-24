@@ -2265,6 +2265,20 @@ impl QTensor {
                 let pre: Vec<std::borrow::Cow<'_, [f32]>> = (0..b)
                     .map(|bi| prescale(&xs_all[bi * cols..(bi + 1) * cols], col_field, *dtype))
                     .collect();
+                // MiMo verification is a 2–4 row decode panel, not a wide
+                // prompt GEMM. Keep q8 projections on the same device as
+                // decode; the generic b>=8 gate otherwise silently moves
+                // every projection back to CPU. The short wgpu matmat uses
+                // the same 64-lane reduction as its single-token matvec.
+                if row_exact() && (1..=4).contains(&b)
+                    && matches!(dtype, TensorDtype::Q8Row | TensorDtype::Q8_2f)
+                    && crate::gpu::enabled_here() && crate::gpu::wgpu_active()
+                {
+                    let flat: Vec<f32> = pre.iter().flat_map(|v| v.iter().copied()).collect();
+                    if crate::gpu::q8_matmat(model, *idx, row_scale, &flat, b, rows, cols, out) {
+                        return;
+                    }
+                }
                 // D5: large prefill-batch GEMMs — on the GPU (threshold by
                 // work volume: submission carries b×rows×cols MACs).
                 // Runtime probe: the naive GEMM shader + sync readback
