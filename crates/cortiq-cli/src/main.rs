@@ -10,6 +10,7 @@ mod http_range;
 mod imagepack;
 mod ltxcmd;
 mod ltxpack;
+mod mimo_towers;
 mod moedefrag;
 mod music;
 mod npy;
@@ -362,8 +363,20 @@ enum Commands {
         /// loads automatically for speculative decoding. The main file is
         /// not read or rewritten. Matrices at --quant (default q8_2f, the
         /// skeleton policy), norms and sinks f32.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "mimo_towers")]
         mtp_sidecar: bool,
+        /// MiMo-V2 towers: `text` (default) drops them; `mm-only` writes the
+        /// companion `<stem>.mm.cmf` (vision, audio encoder, speech
+        /// embeddings, audio tokenizer encoder — no text tensors; `auto`
+        /// quant = q4tp matrices); `multimodal` writes one file with the text
+        /// model and the towers. Needs a local checkpoint dir with
+        /// `audio_tokenizer/`.
+        #[arg(
+            long = "mimo-towers",
+            default_value = "text",
+            value_name = "text|mm-only|multimodal"
+        )]
+        mimo_towers: String,
     },
     /// Rewrite a container tightly: reclaim dead directory/header tails
     /// left by append-only skill growth (spec §9). Streams from mmap.
@@ -2007,7 +2020,9 @@ async fn main() -> anyhow::Result<()> {
             o1_window,
             o1_sink,
             mtp_sidecar,
+            mimo_towers,
         } => {
+            let towers = convert::parse_mimo_towers(&mimo_towers)?;
             if mtp_sidecar {
                 let q = match quant.as_deref() {
                     None => "q8_2f",
@@ -2045,7 +2060,7 @@ async fn main() -> anyhow::Result<()> {
                     }))
                 }
             };
-            convert::run_convert(
+            convert::run_convert_towers(
                 &model,
                 quant.as_deref().unwrap_or(convert::AUTO_QUANT),
                 &output,
@@ -2053,6 +2068,7 @@ async fn main() -> anyhow::Result<()> {
                 defrag.as_deref(),
                 o1_hint,
                 resume,
+                towers,
                 progress_reporter("converting"),
             )?;
             println!("✓ wrote {output}");
