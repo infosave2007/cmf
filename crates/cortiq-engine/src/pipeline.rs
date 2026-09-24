@@ -8,6 +8,11 @@
 
 use crate::attention::{self, QwenAttnCfg};
 use crate::inference;
+
+/// MiMo-V2 multi-token prediction (draft stack + speculative round). A
+/// child module so it runs on the pipeline's own helpers.
+#[path = "mimo_mtp.rs"]
+pub mod mimo_mtp;
 use crate::kv_cache::KvCache;
 use crate::linear_core::{
     GdnCfg, GdnWeights, ShortConvCfg, ShortConvWeights, VmfPhaseCfg, VmfPhaseWeights, gdn_forward,
@@ -195,6 +200,10 @@ pub struct Pipeline {
     pub short_conv_cfg: Option<ShortConvCfg>,
     /// Multi-token-prediction head (None = absent).
     pub mtp: Option<MtpModule>,
+    /// MiMo-V2's draft stack (three chained MTP layers from the
+    /// `<stem>.mtp.cmf` sidecar); None = absent. Speculative greedy decode
+    /// uses it unless `CMF_MTP=0` / `CMF_MIMO_MTP=0`.
+    pub mimo_mtp: Option<mimo_mtp::MimoMtp>,
     /// Speculative decode via MTP (greedy only; `CMF_MTP=0` disables).
     pub speculative: bool,
     /// Keep generating past end-of-sequence ids (the llama-bench contract
@@ -2613,6 +2622,7 @@ impl Pipeline {
             kv_history: Vec::new(),
             short_conv_cfg: None,
             mtp: None,
+            mimo_mtp: None,
             speculative: std::env::var("CMF_MTP").map(|v| v != "0").unwrap_or(true),
             ignore_eos: false,
             draft_full_streak: 0,
@@ -3151,6 +3161,7 @@ impl Pipeline {
             if on
                 && task_mask.is_none()
                 && self.mtp.is_none()
+                && !(self.mimo_mtp.is_some() && self.speculative)
                 && self.o1_cfg.is_none()
                 && self.dsv41.is_none()
                 && !h.is_empty()
@@ -3420,6 +3431,22 @@ impl Pipeline {
             // The MTP block's own device mirror starts over with its cache.
             crate::gpu::graph_kv_reset(self.mtp_kv_id());
             self.mtp_graph_mode = None;
+        }
+        // MiMo-V2's draft stack: greedy rounds (draft K with the chained
+        // MTP layers, verify K+1 rows in one batched forward). Sampling
+        // decodes plain; `CMF_MTP=0` / `CMF_MIMO_MTP=0` turn it off.
+        let mimo_spec = self.speculative
+            && self.mimo_mtp.is_some()
+            && task_mask.is_none()
+            && !self.o1_active()
+            && self.dyn_router.is_none()
+            && self.sampler_config.temperature < 1e-6
+            && std::env::var("CMF_MIMO_MTP").as_deref() != Ok("0");
+        if let Some(st) = self.mimo_mtp.as_mut() {
+            st.reset();
+            if mimo_spec && std::env::var_os("CMF_MIMO_MTP_PROBE").is_some() {
+                Self::mimo_mtp_hist_cap(st, input_ids.len());
+            }
         }
         // Dynamic router detached during decode (same borrow trick as MTP).
         // Speculative decode and dynamic routing are mutually exclusive
@@ -3726,6 +3753,9 @@ impl Pipeline {
             while pos < input_ids.len() && !self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 let end = (pos + chunk).min(input_ids.len());
                 let hb = self.prefill_batch(&input_ids[pos..end], pos);
+                if mimo_spec {
+                    self.mimo_note_rows(&hb, pos);
+                }
                 if let Some(m) = &mut mtp {
                     let probe: usize = std::env::var("CMF_MTP_CHAIN_PROBE")
                         .ok()
@@ -3788,6 +3818,10 @@ impl Pipeline {
                 let e1 = self.embed_single(input_ids[pos]);
                 let e2 = self.embed_single(input_ids[pos + 1]);
                 let (h1, h2) = self.forward_pair(&e1, &e2, pos);
+                if mimo_spec {
+                    self.mimo_note_rows(&h1, pos);
+                    self.mimo_note_rows(&h2, pos + 1);
+                }
                 // Both prefill tokens are real → commit lane-2 states.
                 self.commit_linear_scratch();
                 if let Some(m) = &mut mtp {
@@ -3973,6 +4007,9 @@ impl Pipeline {
         while pos < input_ids.len() && !self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
             self.graph_want_logits = fuse_lm && pos + 1 == input_ids.len();
             hidden = self.forward_layers(&self.embed_single(input_ids[pos]), pos, task_mask);
+            if mimo_spec {
+                self.mimo_note_rows(&hidden, pos);
+            }
             if let Some(m) = &mut mtp {
                 if pos + 1 < input_ids.len() {
                     // `CMF_MTP_CHAIN_PROBE=k`: teacher-forced acceptance of a
@@ -4118,6 +4155,14 @@ impl Pipeline {
         // ... and the end of the last round: the host time between rounds
         // (token commits, streaming, the loop top) is printed at level 2
         let mut spec_round_end: Option<std::time::Instant> = None;
+        if mimo_spec {
+            if let Ok(path) = std::env::var("CMF_MIMO_MTP_PROBE") {
+                if let Some(mut st) = self.mimo_mtp.take() {
+                    self.mimo_mtp_probe(&mut st, input_ids, &path);
+                    self.mimo_mtp = Some(st);
+                }
+            }
+        }
         // ── Decode ──
         let mut next_pos = input_ids.len();
         'decode: while generated < max_tokens {
@@ -4143,6 +4188,11 @@ impl Pipeline {
             // token from the residual distribution (graph_spec_step); it
             // is committed as-is — sampling again from the row's logits
             // would bias the stream toward the target's mode.
+            if mimo_spec && next_pos > 0 {
+                // Every path leaves `hidden` = the backbone output at
+                // next_pos-1; the draft layers read it (idempotent).
+                self.mimo_note_rows(&hidden, next_pos - 1);
+            }
             let forced = self.spec_forced.take();
             let mut logits = match (forced, self.graph_logits.take()) {
                 (Some(_), _) => Vec::new(),
@@ -4283,6 +4333,38 @@ impl Pipeline {
                     spec_trial,
                     SpecTrial::Plain { .. } | SpecTrial::Decided { spec: false, .. }
                 );
+            }
+            // ── MiMo-V2 draft stack: draft K, verify K+1 rows in one batch ──
+            if mimo_spec && generated + 1 < max_tokens && next_pos > 0 {
+                let budget = max_tokens - generated - 1;
+                if let Some(mut st) = self.mimo_mtp.take() {
+                    let k = st.depth.min(budget);
+                    let r = self.mimo_spec_round(&mut st, next_pos, &all_ids, k);
+                    self.mimo_mtp = Some(st);
+                    if let Some(r) = r {
+                        drafted += r.drafted;
+                        accepted += r.accepted.len();
+                        let mut stopped = false;
+                        for &id in &r.accepted {
+                            if self.confidence_on {
+                                confidence.push(0.0);
+                            }
+                            if !commit!(id) {
+                                stopped = true;
+                                break;
+                            }
+                        }
+                        if stopped {
+                            break 'decode;
+                        }
+                        next_pos += r.accepted.len() + 1;
+                        hidden = r.hidden;
+                        // The loop top chooses the round's own token from
+                        // these logits — the same sampler, same history.
+                        self.graph_logits = Some(r.logits);
+                        continue 'decode;
+                    }
+                }
             }
             match &mut mtp {
                 // ── Graph speculation: chain-draft, batch-verify on device ──
@@ -4687,6 +4769,15 @@ impl Pipeline {
         }
 
         let cancelled = finish_reason == "cancelled";
+        if mimo_spec {
+            if let Some(st) = self.mimo_mtp.as_ref() {
+                let line = st.stats.line();
+                tracing::info!("{line}");
+                if std::env::var_os("CMF_MIMO_MTP_STATS").is_some() {
+                    eprintln!("{line}");
+                }
+            }
+        }
         self.finish_generation(&mut mtp, &mut router, cancelled);
 
         let output_ids = &all_ids[input_ids.len()..];
@@ -16276,6 +16367,203 @@ mod tests {
         p.ignore_eos = true;
         let r = p.generate_from_ids(&ids, 4, None, None).unwrap();
         assert_eq!(r.token_ids.len(), 4);
+    }
+
+    /// A synthetic MiMo draft stack of `n` layers for `mimo_test_pipeline`
+    /// (the SWA geometry of its sliding layers: 2 KV heads, head 8 / V 4).
+    fn mimo_test_mtp(n: usize, gain: f32) -> mimo_mtp::MimoMtp {
+        let (hs, inter, nh, hd, vd, nkv) = (16usize, 24usize, 4usize, 8usize, 4usize, 2usize);
+        let synth = |len: usize, salt: usize| -> Vec<f32> {
+            (0..len)
+                .map(|i| (((i * 37 + salt * 13 + 3) % 89) as f32 / 89.0 - 0.5) * 0.6 * gain)
+                .collect()
+        };
+        let qt = |rows: usize, cols: usize, salt: usize| {
+            QTensor::from_f32(synth(rows * cols, salt), rows, cols)
+        };
+        let layers = (0..n)
+            .map(|k| {
+                let s = 500 + k * 40;
+                let mut kv = crate::kv_cache::LayerKvCache::new(nkv, hd);
+                kv.sinks = Some(vec![0.3, -0.7, 1.1, 0.0]);
+                MtpModule {
+                    enorm: vec![1.0; hs],
+                    hnorm: vec![1.0; hs],
+                    eh_proj: qt(hs, 2 * hs, s),
+                    layer: LayerWeights {
+                        input_norm: vec![1.0; hs],
+                        post_norm: vec![1.0; hs],
+                        attn_out_norm: None,
+                        ffn_out_norm: None,
+                        layer_scale: None,
+                        attn: AttnKind::Full {
+                            wq: qt(nh * hd, hs, s + 1),
+                            wk: qt(nkv * hd, hs, s + 2),
+                            wv: qt(nkv * vd, hs, s + 3),
+                            wo: qt(hs, nh * vd, s + 4),
+                            q_norm: None,
+                            k_norm: None,
+                            output_gate: false,
+                            softplus_gate: None,
+                            bias: None,
+                        },
+                        ffn: FfnKind::Dense(DenseFfn {
+                            gate_proj: qt(inter, hs, s + 5),
+                            up_proj: qt(inter, hs, s + 6),
+                            down_proj: qt(hs, inter, s + 7),
+                            act: Act::Silu,
+                            down_t: None,
+                            segs: Vec::new(),
+                        }),
+                    },
+                    final_norm: vec![1.0; hs],
+                    kv,
+                }
+            })
+            .collect();
+        mimo_mtp::MimoMtp::from_layers(layers)
+    }
+
+    fn mimo_greedy(p: &mut Pipeline, ids: &[u32], n: usize, spec: bool) -> GenerateResult {
+        p.clear_sequence_state();
+        p.speculative = spec;
+        p.ignore_eos = true;
+        p.sampler_config.temperature = 0.0;
+        p.generate_from_ids(ids, n, None, None).unwrap()
+    }
+
+    /// The draft stack's incremental rounds (a few rows per layer, last
+    /// round's provisional rows dropped) give exactly the teacher-forced
+    /// table of one causal pass per layer over the whole sequence — the
+    /// table `tools/mimo_ref.py mtp` computes for variant A: layer k, row
+    /// j reads (x[j+k+1], norm(h_j)) at RoPE position j.
+    #[test]
+    fn mimo_mtp_incremental_rounds_equal_the_teacher_forced_table() {
+        let mut p = mimo_test_pipeline();
+        p.mimo_mtp = Some(mimo_test_mtp(3, 1.0));
+        let ids: Vec<u32> = (0..14u32).map(|i| (i * 11 + 5) % 64).collect();
+        let hs = p.hidden_size;
+        let hb = p.prefill_batch_span(PrefillIn::Ids(&ids), 0, None, 0, p.num_layers);
+        p.mimo_note_rows(&hb, 0);
+        let mut st = p.mimo_mtp.take().unwrap();
+        // Incremental: one round per t through the decode path (later
+        // tokens from `ids`, the probe's teacher forcing).
+        let k = 3;
+        let mut inc = Vec::new();
+        for t in 0..ids.len() - k - 1 {
+            inc.push(p.mimo_mtp_draft(&mut st, t, &ids, k));
+        }
+        // Reference: per layer, ONE batched causal pass over all rows with
+        // fresh caches.
+        let s = ids.len();
+        let mut reference = vec![vec![0u32; k]; s - k - 1];
+        let mut fresh = mimo_test_mtp(3, 1.0);
+        for (layer, m) in fresh.layers.iter_mut().enumerate() {
+            let n = s - layer - 1;
+            let mut cats = vec![0.0f32; n * 2 * hs];
+            for j in 0..n {
+                let e = p.embed_single(ids[j + layer + 1]);
+                let mut g = vec![0.0f32; hs];
+                inference::rms_norm_into(
+                    &hb[j * hs..(j + 1) * hs],
+                    &p.weights.final_norm,
+                    p.rms_eps,
+                    p.norm_style,
+                    &mut g,
+                );
+                let (ce, ch) = cats[j * 2 * hs..(j + 1) * 2 * hs].split_at_mut(hs);
+                inference::rms_norm_into(&e, &m.enorm, p.rms_eps, p.norm_style, ce);
+                inference::rms_norm_into(&g, &m.hnorm, p.rms_eps, p.norm_style, ch);
+            }
+            let mut x = vec![0.0f32; n * hs];
+            m.eh_proj.matmat(&cats, n, &mut x, None);
+            p.mimo_mtp_block(m, &mut x, n, 0);
+            for (t, row) in reference.iter_mut().enumerate() {
+                let y = inference::rms_norm(
+                    &x[t * hs..(t + 1) * hs],
+                    &m.final_norm,
+                    p.rms_eps,
+                    p.norm_style,
+                );
+                row[layer] = sampler::argmax(&p.lm_head_forward(&y));
+            }
+        }
+        assert_eq!(inc, reference);
+        // Not a degenerate table: the drafts vary.
+        let distinct: std::collections::HashSet<u32> = inc.iter().flatten().copied().collect();
+        assert!(distinct.len() > 3, "{inc:?}");
+        // Each layer's cache ends holding committed + provisional rows only
+        // up to the last round start.
+        let last_t = ids.len() - k - 2;
+        for m in &st.layers {
+            assert_eq!(m.kv.seq_len, last_t + 1);
+        }
+    }
+
+    /// Greedy with the MiMo draft stack is the plain greedy stream, token
+    /// for token — with the real draft layers (low acceptance) and with a
+    /// drafter that is right most of the time (exercises accepted prefixes
+    /// of every length, the KV truncation of the rejected rows and the
+    /// logits hand-off to the loop top), under the default repetition
+    /// penalty.
+    #[test]
+    fn mimo_speculative_greedy_equals_plain_greedy() {
+        unsafe { std::env::set_var("CMF_GPU_WGPU_GRAPH", "0") };
+        let ids: Vec<u32> = (0..9u32).map(|i| (i * 7 + 3) % 64).collect();
+        let n = 24;
+        let mut p = mimo_test_pipeline();
+        let plain = mimo_greedy(&mut p, &ids, n, false);
+        assert_eq!(plain.mtp_drafted, 0);
+        assert_eq!(plain.token_ids.len(), n);
+        let plain_kv = p.kv_cache.layers[0].seq_len;
+
+        // Real draft layers.
+        p.mimo_mtp = Some(mimo_test_mtp(3, 1.0));
+        let spec = mimo_greedy(&mut p, &ids, n, true);
+        assert!(spec.mtp_drafted > 0, "the round must draft");
+        assert_eq!(spec.token_ids, plain.token_ids);
+        assert_eq!(p.kv_cache.layers[0].seq_len, plain_kv);
+
+        // A drafter reading the true continuation with every fifth token
+        // wrong: accepted prefixes of 0..=3 all occur.
+        let mut truth: Vec<u32> = ids.clone();
+        truth.extend(&plain.token_ids);
+        let mut noisy = truth.clone();
+        for (i, t) in noisy.iter_mut().enumerate() {
+            if i % 5 == 0 {
+                *t = (*t + 1) % 64;
+            }
+        }
+        let mut st = mimo_test_mtp(3, 1.0);
+        st.draft_override = Some(noisy);
+        p.mimo_mtp = Some(st);
+        let spec = mimo_greedy(&mut p, &ids, n, true);
+        assert_eq!(spec.token_ids, plain.token_ids);
+        assert_eq!(p.kv_cache.layers[0].seq_len, plain_kv);
+        let stats = p.mimo_mtp.as_ref().unwrap().stats.clone();
+        assert_eq!(stats.accepted as usize, spec.mtp_accepted);
+        assert!(spec.mtp_accepted > 0 && spec.mtp_accepted < spec.mtp_drafted);
+        assert!(
+            stats.accept_hist.iter().filter(|&&c| c > 0).count() >= 3,
+            "{:?}",
+            stats.accept_hist
+        );
+        assert!(stats.tokens_per_round() > 1.5, "{}", stats.line());
+
+        // A perfect drafter: every draft accepted, rounds of K+1 tokens,
+        // and the budget is never overrun.
+        let mut st = mimo_test_mtp(3, 1.0);
+        st.draft_override = Some(truth);
+        p.mimo_mtp = Some(st);
+        let spec = mimo_greedy(&mut p, &ids, n, true);
+        assert_eq!(spec.token_ids, plain.token_ids);
+        assert_eq!(spec.mtp_accepted, spec.mtp_drafted);
+        assert_eq!(p.kv_cache.layers[0].seq_len, plain_kv);
+
+        // CMF_MTP=0 path: the stack is attached but idle.
+        let off = mimo_greedy(&mut p, &ids, n, false);
+        assert_eq!(off.token_ids, plain.token_ids);
+        assert_eq!(off.mtp_drafted, 0);
     }
 
     /// Every GPU graph declines a model outside its attention contract —

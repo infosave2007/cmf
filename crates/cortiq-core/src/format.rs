@@ -1938,6 +1938,26 @@ impl CmfStreamWriter {
     }
 }
 
+// ───────────────────── MTP sidecar naming ─────────────────────
+
+/// The multi-token-prediction sidecar that belongs to a main CMF file:
+/// `<stem>.mtp.cmf` beside it (`mimo-v26-flash-q4tp.cmf` →
+/// `mimo-v26-flash-q4tp.mtp.cmf`). A path that already names a sidecar is
+/// returned unchanged. The converter writes the draft layers there so a
+/// 164 GB main file never has to be rewritten to gain (or drop) them, and
+/// the loader looks exactly there — one rule, shared by both.
+pub fn mtp_sidecar_path(main: &Path) -> std::path::PathBuf {
+    let name = main
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if name.ends_with(".mtp.cmf") {
+        return main.to_path_buf();
+    }
+    let stem = name.strip_suffix(".cmf").unwrap_or(&name);
+    main.with_file_name(format!("{stem}.mtp.cmf"))
+}
+
 // ───────────────────── sparse index (§7 of the spec) ─────────────────────
 
 /// Build the sparse index from mask bitfields: a 32-neuron FFN group is

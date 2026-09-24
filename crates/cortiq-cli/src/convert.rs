@@ -3403,6 +3403,297 @@ fn mimo_v2_split_qkv(
     Ok((q, k, v))
 }
 
+// ── MiMo-V2 MTP sidecar (`<stem>.mtp.cmf`) ───────────────────────────────
+//
+// The release ships `num_nextn_predict_layers` (3) draft layers in
+// `model_mtp.safetensors`, 47 tensors, under `model.mtp.layers.N.*`. Each is
+// one SWA transformer block with a dense MLP (vLLM `MiMoV2MTPLayer`, SGLang
+// `MiMoV2ModelNextN`):
+//     u = eh_proj·[enorm(embed(tok)); hnorm(hidden)]        embedding FIRST
+//     u += o_proj(swa_attn(input_layernorm(u)))            sinks, window, narrow V
+//     u += mlp(pre_mlp_layernorm(u))
+//     logits = lm_head(final_layernorm(u))                 shared lm_head
+// Their fused qkv uses the SWA geometry with the SAME TP-chunked layout and
+// per-chunk FP8 scale grid as the backbone's sliding layers (14848 rows =
+// 4 chunks × 3712, 116 = 4 × 29 scale rows), so `mimo_v2_split_qkv` decodes
+// it unchanged. Embedding and lm_head are shared with the main model and are
+// NOT written. The main text file never carries MTP (`mimo_v2_canon` drops
+// `model.mtp.*`), so the draft layers live in a sidecar the loader finds by
+// name (`cortiq_core::mtp_sidecar_path`) — a 164 GB main file never has to be
+// rewritten to gain or drop them.
+
+/// Canonical sidecar names: `pre_mlp_layernorm` becomes the loader's
+/// `post_attention_layernorm`, the sink bias becomes `self_attn.sinks`;
+/// everything else keeps its release name.
+const MIMO_MTP_NORMS: [(&str, &str); 5] = [
+    ("enorm", "enorm"),
+    ("hnorm", "hnorm"),
+    ("input_layernorm", "input_layernorm"),
+    ("pre_mlp_layernorm", "post_attention_layernorm"),
+    ("final_layernorm", "final_layernorm"),
+];
+
+/// Write the MiMo-V2 MTP sidecar for the checkpoint in `model_dir` (a local
+/// release directory) to `output` (a main-file path is mapped to its
+/// sidecar name). Attention, eh_proj and MLP matrices go to `quant` (the
+/// skeleton policy: q8_2f); norms and sinks stay f32. Returns the path
+/// written.
+pub fn write_mimo_mtp_sidecar(
+    model_dir: &Path,
+    output: &Path,
+    quant: &str,
+) -> anyhow::Result<PathBuf> {
+    let out = cortiq_core::mtp_sidecar_path(output);
+    let config: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(model_dir.join("config.json"))
+            .map_err(|e| anyhow::anyhow!("{}: {e}", model_dir.join("config.json").display()))?,
+    )?;
+    let arch = build_arch(&config)?;
+    anyhow::ensure!(
+        arch.arch_name == MIMO_V2,
+        "MTP sidecar: only mimo_v2 checkpoints are supported (got {})",
+        arch.arch_name
+    );
+    let tc = config.get("text_config").unwrap_or(&config);
+    let n_mtp = tc
+        .get("num_nextn_predict_layers")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    anyhow::ensure!(n_mtp > 0, "MTP sidecar: config has num_nextn_predict_layers = 0");
+    let quant = parse_quant(quant)?;
+    anyhow::ensure!(
+        matches!(quant, Quant::Q8_2f | Quant::Q8Row | Quant::F16),
+        "MTP sidecar: --quant must be q8_2f, q8 or f16 (the skeleton policy)"
+    );
+    // SWA geometry: the draft layers are sliding-window blocks.
+    let li_swa = arch
+        .layer_types
+        .iter()
+        .position(|t| matches!(t, LayerType::SlidingAttention))
+        .ok_or_else(|| anyhow::anyhow!("MTP sidecar: the backbone has no sliding layer"))?;
+    let kv = arch.kv_heads_per_layer.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("MTP sidecar: mimo_v2 arch without per-layer KV heads")
+    })?;
+    let (h, nh, hd) = (arch.hidden_size, arch.num_attention_heads, arch.head_dim);
+    let vd = arch.v_head_dim.unwrap_or(hd);
+    let layout = MimoQkvLayout {
+        n_heads: nh,
+        n_kv_heads: kv[li_swa],
+        head_dim: hd,
+        v_head_dim: vd,
+        ckpt_tp: arch.num_kv_heads,
+    };
+    let inter = arch.intermediate_size;
+    let value_scale = mimo_v2_value_scale(tc)?;
+    let block = source_fp8_block(&config);
+
+    // Source files: whatever the index maps model.mtp.* to (the release:
+    // model_mtp.safetensors), else that file by name.
+    let mut files: Vec<String> = Vec::new();
+    let idx_path = model_dir.join("model.safetensors.index.json");
+    if idx_path.exists() {
+        let idx: serde_json::Value = serde_json::from_str(&fs::read_to_string(&idx_path)?)?;
+        if let Some(map) = idx.get("weight_map").and_then(|m| m.as_object()) {
+            for (name, file) in map {
+                if let (true, Some(f)) = (name.starts_with("model.mtp."), file.as_str()) {
+                    if !files.iter().any(|x| x == f) {
+                        files.push(f.to_string());
+                    }
+                }
+            }
+        }
+    }
+    if files.is_empty() {
+        files.push("model_mtp.safetensors".into());
+    }
+    let sources: Vec<SafeTensors> = files
+        .iter()
+        .map(|f| open_safetensors(&model_dir.join(f)))
+        .collect::<anyhow::Result<_>>()?;
+    let find = |name: &str| -> Option<(&SafeTensors, &TensorMeta)> {
+        sources
+            .iter()
+            .find_map(|s| s.tensors.iter().find(|t| t.name == name).map(|t| (s, t)))
+    };
+    let need = |name: &str| {
+        find(name).ok_or_else(|| anyhow::anyhow!("MTP sidecar: {name} not found in {files:?}"))
+    };
+    // A 2-D weight in any release storage: FP8 + scale_inv, or a float dtype.
+    let dense = |name: &str, rows: usize, cols: usize| -> anyhow::Result<Vec<f32>> {
+        let (src, m) = need(name)?;
+        anyhow::ensure!(
+            m.shape == [rows, cols],
+            "MTP sidecar: {name} is {:?}, expected [{rows}, {cols}]",
+            m.shape
+        );
+        if m.dtype == "F8_E4M3" {
+            let sname = format!("{name}_scale_inv");
+            let (ss, sm) = need(&sname)?;
+            let scales = to_f32(&sm.dtype, ss.bytes(sm))?;
+            unpack_fp8_scale_inv(src.bytes(m), &scales, rows, cols, block)
+                .map_err(|e| anyhow::anyhow!("{name}: {e}"))
+        } else {
+            to_f32(&m.dtype, src.bytes(m))
+        }
+    };
+    let vector = |name: &str, len: usize| -> anyhow::Result<Vec<f32>> {
+        let (src, m) = need(name)?;
+        anyhow::ensure!(
+            m.shape.iter().product::<usize>() == len,
+            "MTP sidecar: {name} is {:?}, expected {len} values",
+            m.shape
+        );
+        to_f32(&m.dtype, src.bytes(m))
+    };
+    let f32_spec = |name: String, vals: &[f32]| TensorSpec {
+        name,
+        dtype: TensorDtype::F32,
+        shape: vec![vals.len()],
+        data: vals.iter().flat_map(|v| v.to_le_bytes()).collect(),
+    };
+    let mat_spec = |name: String, vals: &[f32], rows: usize, cols: usize| {
+        let (dtype, data) = quantize_2d(quant, vals, rows, cols);
+        TensorSpec {
+            name,
+            dtype,
+            shape: vec![rows, cols],
+            data,
+        }
+    };
+
+    let mut tensors: Vec<TensorSpec> = Vec::new();
+    for k in 0..n_mtp {
+        let p = format!("model.mtp.layers.{k}.");
+        for (src_n, dst_n) in MIMO_MTP_NORMS {
+            let v = vector(&format!("{p}{src_n}.weight"), h)?;
+            tensors.push(f32_spec(format!("{p}{dst_n}.weight"), &v));
+        }
+        let eh = dense(&format!("{p}eh_proj.weight"), h, 2 * h)?;
+        tensors.push(mat_spec(format!("{p}eh_proj.weight"), &eh, h, 2 * h));
+
+        let qkv = format!("{p}self_attn.qkv_proj.weight");
+        let (src, m) = need(&qkv)?;
+        anyhow::ensure!(
+            m.dtype == "F8_E4M3" && m.shape.len() == 2 && m.shape[1] == h,
+            "MTP sidecar: {qkv} must be a 2-D F8_E4M3 [rows, {h}], got {} {:?}",
+            m.dtype,
+            m.shape
+        );
+        let (ss, sm) = need(&format!("{qkv}_scale_inv"))?;
+        let scales = to_f32(&sm.dtype, ss.bytes(sm))?;
+        let (q, kk, v) = mimo_v2_split_qkv(
+            src.bytes(m),
+            &scales,
+            &sm.shape,
+            m.shape[0],
+            h,
+            layout,
+            block,
+            value_scale,
+        )
+        .map_err(|e| anyhow::anyhow!("{qkv}: {e}"))?;
+        let nkv = layout.n_kv_heads;
+        tensors.push(mat_spec(format!("{p}self_attn.q_proj.weight"), &q, nh * hd, h));
+        tensors.push(mat_spec(format!("{p}self_attn.k_proj.weight"), &kk, nkv * hd, h));
+        tensors.push(mat_spec(format!("{p}self_attn.v_proj.weight"), &v, nkv * vd, h));
+        let o = dense(&format!("{p}self_attn.o_proj.weight"), h, nh * vd)?;
+        tensors.push(mat_spec(format!("{p}self_attn.o_proj.weight"), &o, h, nh * vd));
+        let sinks = vector(&format!("{p}self_attn.attention_sink_bias"), nh)?;
+        anyhow::ensure!(
+            sinks.iter().all(|s| s.is_finite()),
+            "MTP sidecar: layer {k} has non-finite sinks"
+        );
+        tensors.push(f32_spec(format!("{p}self_attn.sinks"), &sinks));
+        for (t, rows, cols) in [
+            ("gate_proj", inter, h),
+            ("up_proj", inter, h),
+            ("down_proj", h, inter),
+        ] {
+            let w = dense(&format!("{p}mlp.{t}.weight"), rows, cols)?;
+            tensors.push(mat_spec(format!("{p}mlp.{t}.weight"), &w, rows, cols));
+        }
+    }
+    // Nothing in the MTP files may go unaccounted for: a tensor this writer
+    // does not know is a layout it would silently drop.
+    let known = |n: &str| {
+        let Some(rest) = n.strip_prefix("model.mtp.layers.") else {
+            return false;
+        };
+        let Some((li, tail)) = rest.split_once('.') else {
+            return false;
+        };
+        li.parse::<usize>().is_ok_and(|li| li < n_mtp)
+            && (MIMO_MTP_NORMS
+                .iter()
+                .any(|(s, _)| tail == format!("{s}.weight"))
+                || [
+                    "eh_proj.weight",
+                    "self_attn.qkv_proj.weight",
+                    "self_attn.qkv_proj.weight_scale_inv",
+                    "self_attn.o_proj.weight",
+                    "self_attn.o_proj.weight_scale_inv",
+                    "self_attn.attention_sink_bias",
+                    "eh_proj.weight_scale_inv",
+                ]
+                .contains(&tail)
+                || ["gate_proj", "up_proj", "down_proj"].iter().any(|t| {
+                    tail == format!("mlp.{t}.weight") || tail == format!("mlp.{t}.weight_scale_inv")
+                }))
+    };
+    for s in &sources {
+        for t in &s.tensors {
+            if t.name.starts_with("model.mtp.") {
+                anyhow::ensure!(
+                    known(&t.name),
+                    "MTP sidecar: unexpected tensor {} — refusing to drop it silently",
+                    t.name
+                );
+            }
+        }
+    }
+
+    let mut header_arch = arch.clone();
+    header_arch.mtp = Some(cortiq_core::MtpConfig {
+        num_layers: n_mtp,
+        share_lm_head: true,
+        share_embed: true,
+    });
+    let header = CmfHeader {
+        format: "cmf".into(),
+        version: CMF_VERSION,
+        arch: header_arch,
+        quant_type: match quant {
+            Quant::Q8Row => QuantType::Q8Row,
+            Quant::F16 => QuantType::F16,
+            _ => QuantType::Q8_2f,
+        },
+        provenance: Some(serde_json::json!({
+            "kind": "mimo_mtp_sidecar",
+            "source": model_dir.display().to_string(),
+            "source_files": files,
+            "mtp_layers": n_mtp,
+            "weight_quant": quant_name(quant),
+            "attention_value_scale_folded": value_scale,
+            "names": "model.mtp.layers.N.{enorm,hnorm,eh_proj,input_layernorm,self_attn.{q,k,v,o}_proj,self_attn.sinks,post_attention_layernorm (= pre_mlp_layernorm),mlp.{gate,up,down}_proj,final_layernorm}",
+            "semantics": "u = eh_proj([enorm(embed(tok)); hnorm(hidden)]); SWA block (sinks, window, narrow V, swa theta); logits = lm_head(final_layernorm(u)); embed and lm_head shared with the main file",
+            "converter": format!("cortiq {}", env!("CARGO_PKG_VERSION")),
+        })),
+        tokenizer_config: None,
+        section_hashes: None,
+        skills: Vec::new(),
+        shard: None,
+        calibration: None,
+        routing: None,
+    };
+    if let Some(dir) = out.parent() {
+        if !dir.as_os_str().is_empty() {
+            fs::create_dir_all(dir)?;
+        }
+    }
+    cortiq_core::CmfModel::write(&out, &header, &tensors, None, None)?;
+    Ok(out)
+}
+
 /// Layer index of a `model.layers.N.*` name.
 fn layer_index_of(name: &str) -> Option<usize> {
     name.strip_prefix("model.layers.")?
@@ -10662,5 +10953,213 @@ mod mimo_v2_tests {
             serde_json::json!(["model.layers.1.self_attn.*"])
         );
         let _ = fs::remove_dir_all(&fx.dir);
+    }
+    /// A release-format `model_mtp.safetensors` with `n` draft layers (SWA
+    /// geometry: 4 KV heads) and the canonical values every sidecar tensor
+    /// must hold.
+    fn write_mtp_fixture(
+        tag: &str,
+        n: usize,
+        extra: Option<RawTensor>,
+    ) -> (std::path::PathBuf, HashMap<String, (Vec<usize>, Vec<f32>)>) {
+        let dir =
+            std::env::temp_dir().join(format!("cortiq-mimo-mtp-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut cfg = tiny_config();
+        cfg["num_nextn_predict_layers"] = serde_json::json!(n);
+        fs::write(dir.join("config.json"), cfg.to_string()).unwrap();
+        let mut raw: Vec<RawTensor> = Vec::new();
+        let mut want: HashMap<String, (Vec<usize>, Vec<f32>)> = HashMap::new();
+        for k in 0..n {
+            let p = format!("model.mtp.layers.{k}.");
+            for (i, (src, dst)) in MIMO_MTP_NORMS.iter().enumerate() {
+                let v: Vec<f32> = bf16_vals(H, 300 + k * 10 + i)
+                    .iter()
+                    .map(|x| f32::from_bits((1.0 + x).to_bits() & 0xFFFF_0000))
+                    .collect();
+                raw.push((format!("{p}{src}.weight"), "BF16", vec![H], bf16_of(&v)));
+                want.insert(format!("{p}{dst}.weight"), (vec![H], v));
+            }
+            let eh = bf16_vals(H * 2 * H, 320 + k);
+            raw.push((
+                format!("{p}eh_proj.weight"),
+                "BF16",
+                vec![H, 2 * H],
+                bf16_of(&eh),
+            ));
+            want.insert(format!("{p}eh_proj.weight"), (vec![H, 2 * H], eh));
+            let l = MimoQkvLayout {
+                n_heads: NH,
+                n_kv_heads: 4,
+                head_dim: HD,
+                v_head_dim: VD,
+                ckpt_tp: CKPT_TP,
+            };
+            let rpc = (NH / CKPT_TP + 4 / CKPT_TP) * HD + 4 / CKPT_TP * VD;
+            let rows = CKPT_TP * rpc;
+            let s_rows = CKPT_TP * rpc.div_ceil(128);
+            let packed = fp8_bytes(rows * H, 330 + k);
+            let scales: Vec<f32> = (0..s_rows)
+                .map(|i| ((i % 3) as f32 - 1.0).exp2())
+                .collect();
+            let (q, kk, v) = expected_split(&packed, &scales, 1, rows, H, l, 0.707);
+            want.insert(format!("{p}self_attn.q_proj.weight"), (vec![NH * HD, H], q));
+            want.insert(format!("{p}self_attn.k_proj.weight"), (vec![4 * HD, H], kk));
+            want.insert(format!("{p}self_attn.v_proj.weight"), (vec![4 * VD, H], v));
+            raw.push((
+                format!("{p}self_attn.qkv_proj.weight"),
+                "F8_E4M3",
+                vec![rows, H],
+                packed,
+            ));
+            raw.push((
+                format!("{p}self_attn.qkv_proj.weight_scale_inv"),
+                "F32",
+                vec![s_rows, 1],
+                scales.iter().flat_map(|s| s.to_le_bytes()).collect(),
+            ));
+            let o = bf16_vals(H * NH * VD, 340 + k);
+            raw.push((
+                format!("{p}self_attn.o_proj.weight"),
+                "BF16",
+                vec![H, NH * VD],
+                bf16_of(&o),
+            ));
+            want.insert(format!("{p}self_attn.o_proj.weight"), (vec![H, NH * VD], o));
+            let sinks = bf16_vals(NH, 350 + k);
+            raw.push((
+                format!("{p}self_attn.attention_sink_bias"),
+                "BF16",
+                vec![NH],
+                bf16_of(&sinks),
+            ));
+            want.insert(format!("{p}self_attn.sinks"), (vec![NH], sinks));
+            for (t, shape, sc) in [
+                ("gate_proj", vec![INTER, H], 0.5f32),
+                ("up_proj", vec![INTER, H], 0.25),
+                ("down_proj", vec![H, INTER], 2.0),
+            ] {
+                let cnt = shape[0] * shape[1];
+                let packed = fp8_bytes(cnt, 360 + k + shape[0]);
+                let vals: Vec<f32> = packed.iter().map(|&b| fp8_e4m3_to_f32(b) * sc).collect();
+                let name = format!("{p}mlp.{t}.weight");
+                raw.push((name.clone(), "F8_E4M3", shape.clone(), packed));
+                raw.push((
+                    format!("{name}_scale_inv"),
+                    "F32",
+                    vec![shape[0].div_ceil(128), shape[1].div_ceil(128)],
+                    sc.to_le_bytes().to_vec(),
+                ));
+                want.insert(name, (shape, vals));
+            }
+        }
+        if let Some(t) = extra {
+            raw.push(t);
+        }
+        fs::write(dir.join("model_mtp.safetensors"), raw_safetensors(&raw)).unwrap();
+        // Like the release: the index maps the MTP names to their file.
+        let mut map = serde_json::Map::new();
+        for (name, ..) in &raw {
+            map.insert(name.clone(), serde_json::json!("model_mtp.safetensors"));
+        }
+        fs::write(
+            dir.join("model.safetensors.index.json"),
+            serde_json::json!({ "weight_map": map }).to_string(),
+        )
+        .unwrap();
+        (dir, want)
+    }
+
+    #[test]
+    fn mimo_v2_mtp_sidecar_holds_every_draft_tensor() {
+        let (dir, want) = write_mtp_fixture("ok", 2, None);
+        let main = dir.join("mimo-q4tp.cmf");
+        for (quant, exact) in [("q8_2f", false), ("f16", true)] {
+            let out = write_mimo_mtp_sidecar(&dir, &main, quant).unwrap();
+            assert_eq!(out, dir.join("mimo-q4tp.mtp.cmf"));
+            let m = CmfModel::open(&out).unwrap();
+            assert!(m.verify().is_empty(), "verify: {:?}", m.verify());
+            let a = m.arch();
+            assert_eq!(a.arch_name, "mimo_v2");
+            assert_eq!(a.mtp.as_ref().map(|c| c.num_layers), Some(2));
+            assert_eq!(a.kv_heads_per_layer, Some(vec![2, 4, 4]));
+            assert_eq!(
+                m.header.provenance.as_ref().unwrap()["kind"],
+                serde_json::json!("mimo_mtp_sidecar")
+            );
+            let mut names: Vec<&str> = m.tensors.iter().map(|t| t.name.as_str()).collect();
+            names.sort();
+            let mut want_names: Vec<&str> = want.keys().map(|s| s.as_str()).collect();
+            want_names.sort();
+            assert_eq!(names, want_names, "exactly the canonical draft tensors");
+            for (name, (shape, vals)) in &want {
+                let e = m.tensor(name).unwrap();
+                assert_eq!(&e.shape, shape, "{name}");
+                let bytes = m.tensor_bytes(name).unwrap();
+                if shape.len() == 1 {
+                    assert_eq!(e.dtype, TensorDtype::F32, "{name}");
+                    let got: Vec<f32> = bytes
+                        .chunks_exact(4)
+                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                        .collect();
+                    assert_eq!(&got, vals, "{name}");
+                    continue;
+                }
+                let back: Vec<f32> = if exact {
+                    assert_eq!(e.dtype, TensorDtype::F16, "{name}");
+                    bytes
+                        .chunks_exact(2)
+                        .map(|b| f16_to_f32(u16::from_le_bytes([b[0], b[1]])))
+                        .collect()
+                } else {
+                    assert_eq!(e.dtype, TensorDtype::Q8_2f, "{name}");
+                    let mut back = vec![0f32; vals.len()];
+                    dequant_q8_2f(bytes, shape[0], shape[1], &mut back);
+                    back
+                };
+                if exact {
+                    let worst = back
+                        .iter()
+                        .zip(vals)
+                        .map(|(a, b)| (a - b).abs() / b.abs().max(1e-3))
+                        .fold(0.0f32, f32::max);
+                    assert!(worst < 1e-3, "{name}: rel err {worst}");
+                } else {
+                    let dot: f64 = back.iter().zip(vals).map(|(a, b)| (a * b) as f64).sum();
+                    let na: f64 = back.iter().map(|a| (a * a) as f64).sum::<f64>().sqrt();
+                    let nb: f64 = vals.iter().map(|b| (b * b) as f64).sum::<f64>().sqrt();
+                    assert!(dot / (na * nb) > 0.9999, "{name}: cos {}", dot / (na * nb));
+                }
+            }
+        }
+        // A path that already names a sidecar is kept.
+        let direct = write_mimo_mtp_sidecar(&dir, &dir.join("x.mtp.cmf"), "q8_2f").unwrap();
+        assert_eq!(direct, dir.join("x.mtp.cmf"));
+        // A main-file profile is refused: the sidecar is skeleton.
+        assert!(write_mimo_mtp_sidecar(&dir, &main, "q4tp").is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mimo_v2_mtp_sidecar_refuses_unknown_and_missing_tensors() {
+        let extra: RawTensor = (
+            "model.mtp.layers.0.mlp.shared_expert.weight".into(),
+            "BF16",
+            vec![H],
+            bf16_of(&[0.5; H]),
+        );
+        let (dir, _) = write_mtp_fixture("extra", 1, Some(extra));
+        let err = write_mimo_mtp_sidecar(&dir, &dir.join("m.cmf"), "q8_2f").unwrap_err();
+        assert!(err.to_string().contains("unexpected tensor"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+        // The config promises two layers, the file holds one.
+        let (dir, _) = write_mtp_fixture("short", 1, None);
+        let mut cfg = tiny_config();
+        cfg["num_nextn_predict_layers"] = serde_json::json!(2);
+        fs::write(dir.join("config.json"), cfg.to_string()).unwrap();
+        let err = write_mimo_mtp_sidecar(&dir, &dir.join("m.cmf"), "q8_2f").unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
     }
 }
