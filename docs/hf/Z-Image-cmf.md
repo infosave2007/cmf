@@ -54,11 +54,12 @@ Mac mini M4 (24 GB), Metal, no flags:
 
 | size | time to image | of which DiT steps | VAE |
 |---|---:|---:|---:|
-| 512×512 | 3.9 min | 3.9 min (28 steps, CFG) | 1.3 s |
+| 512×512 | 3.9 min | 3.8 min (28 steps, CFG) | 1.3 s |
 | 1024×1024 | 21 min | 21 min (28 steps, CFG) | 5.0 s |
 
-About 8 GB of memory; the M4's GPU is compute-bound, so this is its ceiling —
-use fewer `--steps` and 512² for drafts, or Z-Image-Turbo.
+About 8 GB of memory. The GEMMs run at 91–94 % of the M4 GPU's matrix peak;
+attention is the remaining gap. Use fewer `--steps` and 512² for drafts, or
+Z-Image-Turbo.
 
 RTX 3090: peak VRAM 14–15 GB (16 GB cards fit). Per image, the DiT runs at the speed of diffusers
 bf16 on the same card and the whole process starts about four times faster.
@@ -118,8 +119,8 @@ sha256 `d7138e6fe1b6af76…` (полностью в `z-image.cmf.sha256`). 8 б�
 | 1024×1024 | 60 с | 57 с (28 шагов, CFG) | 0.49 с |
 
 Mac mini M4 (24 ГБ), Metal, без флагов: 512² за 3.9 мин, 1024² за 21 мин (28 шагов с
-CFG); память около 8 ГБ. GPU M4 упирается в вычисления — для черновиков берите
-меньше `--steps` и 512², либо Z-Image-Turbo.
+CFG); память около 8 ГБ. GEMM идут на 91–94 % матричного пика GPU M4, остаток —
+внимание; для черновиков берите меньше `--steps` и 512², либо Z-Image-Turbo.
 
 RTX 3090: пик видеопамяти 14–15 ГБ (хватает карты на 16 ГБ). DiT идёт со скоростью diffusers bf16 на той же
 карте, а старт процесса примерно в четыре раза быстрее.
@@ -164,7 +165,7 @@ PSNR 下降 3–15 dB，8 位则与 bf16 推理相当。
 | 1024×1024 | 60 s | 57 s（28 步，CFG） | 0.49 s |
 
 Mac mini M4（24 GB），Metal，无参数：512² 用时 3.9 分钟，1024² 用时 21 分钟（28 步，CFG）；
-内存约 8 GB。M4 的 GPU 受算力限制——草稿请减少 `--steps` 并使用 512²，或改用 Z-Image-Turbo。
+内存约 8 GB。GEMM 已达 M4 GPU 矩阵峰值的 91–94%，剩余差距在注意力；草稿请减少 `--steps` 并使用 512²，或改用 Z-Image-Turbo。
 
 RTX 3090：显存峰值 14–15 GB（16 GB 显卡可用）。DiT 与同一显卡上的 diffusers bf16 速度相同，进程启动快约四倍。
 

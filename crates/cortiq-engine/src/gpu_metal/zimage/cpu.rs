@@ -306,7 +306,14 @@ pub(super) fn execute(
     for j in jobs {
         let tw = std::time::Instant::now();
         if !wait(ev, j.ready, cmds) {
-            ev.set_signaled_value(jobs.last().map_or(0, |l| l.done) + 1);
+            // Release the GPU (its waits on our `done` values are satisfied
+            // by a jump past every job) and move the value counter past the
+            // jump: the next step's first `ready` must be a value the GPU
+            // has not signaled yet, or the CPU would read that step's input
+            // before the GPU wrote it.
+            let past = jobs.last().map_or(0, |l| l.done) + 1;
+            ev.set_signaled_value(past);
+            super::ZEVENT_NEXT.fetch_max(past + 1, std::sync::atomic::Ordering::SeqCst);
             return false;
         }
         s.t[0] += tw.elapsed().as_secs_f64();

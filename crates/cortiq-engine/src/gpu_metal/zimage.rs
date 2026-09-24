@@ -71,7 +71,9 @@
 //!   buffer ≤ ~1.3 s at 1024²): equal (4.11 vs 4.11 s, 3 alternating pairs).
 //! - CFG: the batch-2 program costs 2 × the single forward (8.11 s vs
 //!   4.06 s at 512²; compute-bound, no batching gain) and is bit-identical
-//!   to the two single forwards.
+//!   to the two single forwards with a fixed CPU share (or none); with the
+//!   per-chip default the pair (> 1600 rows → 0.20) and the singles (0.25)
+//!   split the features differently, 2.6e-4 apart.
 //! - CPU share (M8, `cpu.rs`): Accelerate sgemm runs 1.65 TF/s alone and
 //!   1.14–1.23 beside the busy GPU (30 s co-run, the GPU 3.28 → 3.10), so
 //!   the CPU computes the last output features of every GEMM of ≥ 256
@@ -1480,7 +1482,7 @@ pub(crate) fn refine_caption(
 
 /// Upload the VAE weights and compile its kernels ahead of the decode.
 pub(crate) fn vae_prewarm(a: &crate::vae::VaeChainArgs) -> bool {
-    zi_enabled() && vae::prewarm(a)
+    zi_enabled() && std::env::var("CMF_ZI_VAE").as_deref() != Ok("0") && vae::prewarm(a)
 }
 
 /// Resident Flux-VAE decoder; `z` is already de-normalised.

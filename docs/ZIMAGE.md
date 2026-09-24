@@ -49,6 +49,8 @@ Environment variables:
 | `CMF_ZI_ACC16=N` | the DiT GEMMs accumulate in f16, flushed into f32 every N K slices (`qkv=N,o=N,w13=N,w2=N` per site; `CMF_ZI_TILE16` sets its tile). Off by default: slower and less precise, see "f16 accumulation" below |
 | `CMF_ZIMAGE_TE_DEV=all\|q,k,v,o,gate,up,down` | those text-encoder projections through the device GEMM of their codec, the rest exact on the host (experiment; see "Text encoder on the device") |
 | `CMF_TE_TAPS=<dir>` | dumps the text encoder's residual after every layer and each layer's intermediates |
+| `CMF_ZI_METAL=0` | the Metal Z-Image chain off (the DiT and the VAE fall back to the CPU path) |
+| `CMF_ZI_CPU_FRAC=<x>\|auto` | the CPU share of the GEMMs on Metal: 0.25 up to 1600 rows and 0.20 above on an "Apple M4", 0 on every other chip; clamped to 0..0.6; `0` = GPU only; `auto` adapts to timing and is not bit-stable run to run |
 
 ## Where it runs
 
@@ -65,7 +67,8 @@ runs on the device with no flags:
   (the 2× upsample folded into the gather), device GroupNorm, the mid-block
   attention in query chunks; one upload, one readback.
 - **Text encoder**: on the CPU, with weight-only exact q8 projections on
-  x86-64 with AVX2 (other CPUs use the int8-activation kernel, 3.3× less
+  x86-64 with AVX2 (macOS: weight-only exact through Accelerate's
+  dequantized sgemm; other CPUs use the int8-activation kernel, 3.3× less
   accurate), while a helper thread uploads the DiT weights; the device context and the kernel
   compiles start on another helper at the beginning of the run, and the VAE
   weights upload while the steps run.
@@ -79,8 +82,9 @@ On Apple silicon (Metal), the DiT and the VAE run on the GPU with no flags:
   fused row kernels — split into command buffers of two blocks each. CFG
   runs the pair as one batch-2 program; the context refiner runs on the GPU.
   On the M4 the CPU's matrix unit (Accelerate) computes a fixed share of
-  every large GEMM's output features beside the GPU (a quarter at 512²,
-  a fifth above 1600 rows), ordered with the GPU chain by a shared event;
+  every large GEMM's output features beside the GPU (a quarter for programs
+  up to 1600 rows — Turbo 512² — and a fifth above: 1024² and every CFG
+  pair, the base's 512² included), ordered with the GPU chain by a shared event;
   `CMF_ZI_CPU_FRAC=0` runs the GPU alone, `=auto` adapts the share (then
   the image depends on timing and is not bit-stable run to run).
 - **VAE**: resident decoder — NHWC half activations, implicit-GEMM convs

@@ -30,6 +30,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   MPS takes 4.8 s per 512² forward on the same Mac (ours 3.6 s) and swaps
   at 1024².
 
+- `CMF_ZI_ACC16` / `CMF_ZI_TILE16`: a flushed f16-accumulate arm of the
+  Z-Image GEMM, measured and left off. It is 19–21 % slower per step on an
+  RTX 3090 and 20–50× less precise per GEMM, because the tensor core
+  rounds the f16 accumulator after every MMA.
+- `CMF_ZIMAGE_TE_DEV`, `CMF_TE_TAPS`: device text-encoder projections with
+  exact host fallback, and per-layer taps. They show that the 3–7 % the
+  device text encoder used to cost came from its host int8-activation arm.
+  Device projections with the exact fallback reach the exact encoder's
+  numbers.
+
 ### Fixed
 - Z-Image on Vulkan: in a CFG pair, the first item now matches its own
   single forward bit for bit. Before, it was 2.2e-4 off, because rows past
@@ -40,18 +50,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The Qwen3 text encoder's exact mode keeps F32 projections (Z-Image's
   bf16 `layers.6.mlp.down_proj`) on the host f32 GEMM. With the device on,
   they had gone through the tf32-class cooperative GEMM, which moved the
-  residual by 2.2e-4 from the massive-activation layer on.
-
-### Added
-- `CMF_ZI_ACC16` / `CMF_ZI_TILE16`: a flushed f16-accumulate arm of the
-  Z-Image GEMM, measured and left off. It is 19–21 % slower per step on an
-  RTX 3090 and 20–50× less precise per GEMM, because the tensor core
-  rounds the f16 accumulator after every MMA.
-- `CMF_ZIMAGE_TE_DEV`, `CMF_TE_TAPS`: device text-encoder projections with
-  exact host fallback, and per-layer taps. They show that the 3–7 % the
-  device text encoder used to cost came from its host int8-activation arm.
-  Device projections with the exact fallback reach the exact encoder's
-  numbers.
+  residual by 2.2e-4 from the massive-activation layer on (only with
+  `CMF_ZIMAGE_TE_GPU=1` / `CMF_ZIMAGE_TE_DEV`; the default output is
+  unchanged).
 
 ## [0.7.4] - 2026-09-24
 

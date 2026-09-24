@@ -524,6 +524,14 @@ pub(crate) fn decode(a: &VaeChainArgs, z: &[f32], h: usize, w: usize, out: &mut 
         }
         cmax = cmax.max(hh * ww * 64);
     }
+    // Metal returns nil past maxBufferLength (13.6 GB on a 24 GB M4) and the
+    // uploads below would write through a null pointer: decline instead.
+    if (cmax * 4) as u64 > c._device.max_buffer_length() {
+        return super::decline(&format!(
+            "the VAE activation buffer ({:.1} GB) exceeds the device's maxBufferLength",
+            (cmax * 4) as f64 / 1e9
+        ));
+    }
     let bufs = Bufs {
         xa: buf_zeroed(c, cmax * 4),
         t: buf_zeroed(c, cmax * 4),
