@@ -438,13 +438,33 @@ pub fn mel_filterbank(n_freqs: usize, n_mels: usize, sample_rate: u32) -> Vec<f6
 /// top band of a resampled clip by 0.12 in log, so the stored window is
 /// reproduced bit for bit.
 const TORCH_HANN_960_FIXUPS: [(usize, u32); 27] = [
-    (30, 0x3C1D6820), (42, 0x3C99C880), (70, 0x3D533468), (87, 0x3DA191D0),
-    (99, 0x3DCF8B30), (109, 0x3DF9B6B0), (125, 0x3E220032), (166, 0x3E88CD7D),
-    (172, 0x3E91CA07), (315, 0x3F3C56BC), (331, 0x3F47CEDC), (338, 0x3F4C95E8),
-    (384, 0x3F678DDE), (466, 0x3F7F7689), (468, 0x3F7F9AFC), (522, 0x3F7B31BC),
-    (558, 0x3F6FADF2), (582, 0x3F648543), (639, 0x3F40B962), (661, 0x3F30355E),
-    (695, 0x3F14D9C0), (857, 0x3DE00070), (859, 0x3DD7B41C), (866, 0x3DBBC250),
-    (871, 0x3DA8DEB4), (924, 0x3C625860), (940, 0x3B8C2B00),
+    (30, 0x3C1D6820),
+    (42, 0x3C99C880),
+    (70, 0x3D533468),
+    (87, 0x3DA191D0),
+    (99, 0x3DCF8B30),
+    (109, 0x3DF9B6B0),
+    (125, 0x3E220032),
+    (166, 0x3E88CD7D),
+    (172, 0x3E91CA07),
+    (315, 0x3F3C56BC),
+    (331, 0x3F47CEDC),
+    (338, 0x3F4C95E8),
+    (384, 0x3F678DDE),
+    (466, 0x3F7F7689),
+    (468, 0x3F7F9AFC),
+    (522, 0x3F7B31BC),
+    (558, 0x3F6FADF2),
+    (582, 0x3F648543),
+    (639, 0x3F40B962),
+    (661, 0x3F30355E),
+    (695, 0x3F14D9C0),
+    (857, 0x3DE00070),
+    (859, 0x3DD7B41C),
+    (866, 0x3DBBC250),
+    (871, 0x3DA8DEB4),
+    (924, 0x3C625860),
+    (940, 0x3B8C2B00),
 ];
 
 /// `torch.hann_window(960)` (periodic, float32) as ATen builds it —
@@ -486,7 +506,9 @@ pub fn log_mel(wave: &[f32], pool: Option<&Pool>) -> Result<(Vec<f32>, usize), S
     // Each mel band touches a short run of bins; keep only those.
     let bands: Vec<(usize, Vec<f64>)> = (0..N_MELS)
         .map(|m| {
-            let nz: Vec<usize> = (0..n_freqs).filter(|&k| fb[k * N_MELS + m] != 0.0).collect();
+            let nz: Vec<usize> = (0..n_freqs)
+                .filter(|&k| fb[k * N_MELS + m] != 0.0)
+                .collect();
             match (nz.first(), nz.last()) {
                 (Some(&a), Some(&b)) => (a, (a..=b).map(|k| fb[k * N_MELS + m]).collect()),
                 _ => (0, Vec::new()),
@@ -727,7 +749,10 @@ fn apply_rope(
     let width = heads * hd;
     for (r, row) in x.chunks_exact_mut(width).enumerate() {
         let p = pos(r);
-        let (c, s) = (&cos[p * half..(p + 1) * half], &sin[p * half..(p + 1) * half]);
+        let (c, s) = (
+            &cos[p * half..(p + 1) * half],
+            &sin[p * half..(p + 1) * half],
+        );
         for h in 0..heads {
             let v = &mut row[h * hd..(h + 1) * hd];
             for i in 0..half {
@@ -964,10 +989,7 @@ fn read_safetensors_selected(
         let offs = meta["data_offsets"]
             .as_array()
             .ok_or_else(|| format!("{name}: no data_offsets"))?;
-        let (s, e) = (
-            offs[0].as_u64().unwrap_or(0),
-            offs[1].as_u64().unwrap_or(0),
-        );
+        let (s, e) = (offs[0].as_u64().unwrap_or(0), offs[1].as_u64().unwrap_or(0));
         picks.push((s, e, canon, dtype, shape));
     }
     picks.sort_by_key(|p| p.0);
@@ -1014,10 +1036,20 @@ impl RawTensor {
                 .chunks_exact(2)
                 .map(|c| cortiq_core::quant::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                 .collect(),
-            other => return Err(format!("{}: unsupported safetensors dtype {other}", self.name)),
+            other => {
+                return Err(format!(
+                    "{}: unsupported safetensors dtype {other}",
+                    self.name
+                ));
+            }
         };
         if data.len() != self.shape.iter().product::<usize>().max(1) {
-            return Err(format!("{}: {} values for shape {:?}", self.name, data.len(), self.shape));
+            return Err(format!(
+                "{}: {} values for shape {:?}",
+                self.name,
+                data.len(),
+                self.shape
+            ));
         }
         Ok(data)
     }
@@ -1035,7 +1067,9 @@ fn tokenizer_tensor_unused(name: &str) -> bool {
 /// prefixed to the tokenizer file's `encoder.*`; its decoder and EMA state
 /// are skipped), plus the config blobs `mm.config_json` and
 /// `audio_tokenizer.config_json` when the files exist.
-pub fn read_hf_audio_tensors(dir: &Path) -> Result<(Vec<RawTensor>, Vec<(String, Vec<u8>)>), String> {
+pub fn read_hf_audio_tensors(
+    dir: &Path,
+) -> Result<(Vec<RawTensor>, Vec<(String, Vec<u8>)>), String> {
     let mut tensors = Vec::new();
     let at_dir = dir.join("audio_tokenizer");
     read_safetensors_selected(
@@ -1064,7 +1098,11 @@ pub fn read_hf_audio_tensors(dir: &Path) -> Result<(Vec<RawTensor>, Vec<(String,
     files.sort();
     files.dedup();
     for file in files {
-        read_safetensors_selected(&dir.join(&file), &|n| keep(n).then(|| n.to_string()), &mut tensors)?;
+        read_safetensors_selected(
+            &dir.join(&file),
+            &|n| keep(n).then(|| n.to_string()),
+            &mut tensors,
+        )?;
     }
     let mut blobs = Vec::new();
     for (blob, file) in [
@@ -1190,10 +1228,14 @@ impl TokenizerConfig {
     }
 
     pub fn from_json(bytes: &[u8]) -> Result<Self, String> {
-        let v: Value = serde_json::from_slice(bytes)
-            .map_err(|e| format!("audio_tokenizer config: {e}"))?;
+        let v: Value =
+            serde_json::from_slice(bytes).map_err(|e| format!("audio_tokenizer config: {e}"))?;
         let d = Self::mimo_default();
-        let us = |k: &str, dflt: usize| v.get(k).and_then(Value::as_u64).map_or(dflt, |x| x as usize);
+        let us = |k: &str, dflt: usize| {
+            v.get(k)
+                .and_then(Value::as_u64)
+                .map_or(dflt, |x| x as usize)
+        };
         let bl = |k: &str, dflt: bool| v.get(k).and_then(Value::as_bool).unwrap_or(dflt);
         // Only the geometry this implementation computes is accepted.
         for (k, want) in [
@@ -1207,7 +1249,9 @@ impl TokenizerConfig {
         ] {
             if let Some(got) = v.get(k).and_then(Value::as_u64) {
                 if got != want {
-                    return Err(format!("audio_tokenizer config: {k} = {got}, only {want} is supported"));
+                    return Err(format!(
+                        "audio_tokenizer config: {k} = {got}, only {want} is supported"
+                    ));
                 }
             }
         }
@@ -1216,12 +1260,18 @@ impl TokenizerConfig {
         }
         if let Some(ln) = v.get("ln_type").and_then(Value::as_str) {
             if ln != "LayerNorm" {
-                return Err(format!("audio_tokenizer config: ln_type {ln} is not supported"));
+                return Err(format!(
+                    "audio_tokenizer config: ln_type {ln} is not supported"
+                ));
             }
         }
         let n_q = us("num_quantizers", 20);
         let mut books: Vec<usize> = match v.get("codebook_size") {
-            Some(Value::Array(a)) => a.iter().filter_map(Value::as_u64).map(|x| x as usize).collect(),
+            Some(Value::Array(a)) => a
+                .iter()
+                .filter_map(Value::as_u64)
+                .map(|x| x as usize)
+                .collect(),
             Some(x) => vec![x.as_u64().unwrap_or(1024) as usize],
             None => d.codebook_sizes.clone(),
         };
@@ -1254,7 +1304,10 @@ impl TokenizerConfig {
             window,
             hybrid: bl("hybrid_attention", d.hybrid),
             swa_per_block: us("swa_per_block", d.swa_per_block).max(1),
-            rope_theta: v.get("rope_theta").and_then(Value::as_f64).unwrap_or(d.rope_theta),
+            rope_theta: v
+                .get("rope_theta")
+                .and_then(Value::as_f64)
+                .unwrap_or(d.rope_theta),
             codebook_sizes: books,
             ln_eps: d.ln_eps,
         })
@@ -1315,7 +1368,11 @@ impl EncoderConfig {
             .filter(|a| a.is_object())
             .ok_or("mimo config.json: no audio_config")?;
         let d = Self::mimo_default();
-        let us = |k: &str, dflt: usize| a.get(k).and_then(Value::as_u64).map_or(dflt, |x| x as usize);
+        let us = |k: &str, dflt: usize| {
+            a.get(k)
+                .and_then(Value::as_u64)
+                .map_or(dflt, |x| x as usize)
+        };
         let first_num = |k: &str, dflt: usize| -> usize {
             match a.get(k) {
                 Some(Value::String(s)) => s
@@ -1334,9 +1391,14 @@ impl EncoderConfig {
                 ));
             }
         }
-        let prf = a.get("partial_rotary_factor").and_then(Value::as_f64).unwrap_or(1.0);
+        let prf = a
+            .get("partial_rotary_factor")
+            .and_then(Value::as_f64)
+            .unwrap_or(1.0);
         if (prf - 1.0).abs() > 1e-9 {
-            return Err(format!("mimo audio_config: partial_rotary_factor {prf} is not supported"));
+            return Err(format!(
+                "mimo audio_config: partial_rotary_factor {prf} is not supported"
+            ));
         }
         let dim = us("input_local_dim", d.dim);
         let heads = us("input_local_attn_heads", d.heads);
@@ -1348,14 +1410,20 @@ impl EncoderConfig {
             heads,
             head_dim: dim / heads.max(1),
             ffn: us("input_local_intermediate_size", d.ffn),
-            rope_theta: a.get("rope_theta").and_then(Value::as_f64).unwrap_or(d.rope_theta),
+            rope_theta: a
+                .get("rope_theta")
+                .and_then(Value::as_f64)
+                .unwrap_or(d.rope_theta),
             out_dim: us("out_hidden_size", d.out_dim),
             vocab: first_num("speech_vocab_size", d.vocab),
             bidirectional: a
                 .get("input_full_attention")
                 .and_then(Value::as_bool)
                 .unwrap_or(true),
-            post_norm: a.get("add_post_norm").and_then(Value::as_bool).unwrap_or(true),
+            post_norm: a
+                .get("add_post_norm")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
             projection_layers: us("projection_layers", d.projection_layers),
             rms_eps: d.rms_eps,
         })
@@ -1416,13 +1484,18 @@ impl AudioTokenizer {
         let p = "audio_tokenizer.encoder";
         let d = cfg.d_model;
         if d % cfg.heads != 0 || (d / cfg.heads) % 2 != 0 {
-            return Err(format!("audio tokenizer: d_model {d} / heads {} is not an even head width", cfg.heads));
+            return Err(format!(
+                "audio tokenizer: d_model {d} / heads {} is not an even head width",
+                cfg.heads
+            ));
         }
         let mut layers = Vec::with_capacity(cfg.layers);
         for i in 0..cfg.layers {
             let l = format!("{p}.layers.{i}");
             if src.has(&format!("{l}.self_attn.k_proj.bias")) {
-                return Err(format!("audio tokenizer: unexpected {l}.self_attn.k_proj.bias (k has no bias)"));
+                return Err(format!(
+                    "audio tokenizer: unexpected {l}.self_attn.k_proj.bias (k has no bias)"
+                ));
             }
             layers.push(TokLayer {
                 ln1_w: take_vec(src, &format!("{l}.self_attn_layer_norm.weight"), d)?,
@@ -1477,7 +1550,10 @@ impl AudioTokenizer {
         let cfg = &self.cfg;
         let (d, nm) = (cfg.d_model, cfg.n_mels);
         if m == 0 || mel.len() != m * nm {
-            return Err(format!("audio tokenizer: mel has {} values for {m} frames", mel.len()));
+            return Err(format!(
+                "audio tokenizer: mel has {} values for {m} frames",
+                mel.len()
+            ));
         }
         // conv1: k3 p1 stride 1, im2col row t = [x[t+k−1][c]] in (c, k) order.
         let mut col = vec![0f32; m * nm * 3];
@@ -1584,9 +1660,19 @@ impl AudioTokenizer {
     /// `‖E‖² − 2 r·E` (the row's ‖r‖² does not move the argmin), then
     /// `r −= E[idx]`. `bf16_books` selects the bf16-rounded codebooks a
     /// bf16 serving load holds. Returns `[rows][levels]`.
-    pub fn quantize(&self, feats: &[f32], rows: usize, bf16_books: bool, pool: Option<&Pool>) -> Vec<u32> {
+    pub fn quantize(
+        &self,
+        feats: &[f32],
+        rows: usize,
+        bf16_books: bool,
+        pool: Option<&Pool>,
+    ) -> Vec<u32> {
         let d = self.cfg.d_model;
-        let books = if bf16_books { &self.books_bf16 } else { &self.books };
+        let books = if bf16_books {
+            &self.books_bf16
+        } else {
+            &self.books
+        };
         let nq = books.len();
         let norms: Vec<Vec<f64>> = books
             .iter()
@@ -1660,7 +1746,11 @@ impl AudioEncoder {
         let qd = cfg.heads * cfg.head_dim;
         let mut speech_emb = Vec::with_capacity(cfg.channels);
         for c in 0..cfg.channels {
-            speech_emb.push(take_vec(src, &format!("speech_embeddings.{c}.weight"), cfg.vocab * d)?);
+            speech_emb.push(take_vec(
+                src,
+                &format!("speech_embeddings.{c}.weight"),
+                cfg.vocab * d,
+            )?);
         }
         let p = "audio_encoder.input_local_transformer";
         let mut layers = Vec::with_capacity(cfg.layers);
@@ -1690,10 +1780,22 @@ impl AudioEncoder {
         let (proj0, proj2) = match cfg.projection_layers {
             2 => (
                 take_proj(src, "audio_encoder.projection.mlp.0.weight", flat * 4, flat)?,
-                Some(take_proj(src, "audio_encoder.projection.mlp.2.weight", cfg.out_dim, flat * 4)?),
+                Some(take_proj(
+                    src,
+                    "audio_encoder.projection.mlp.2.weight",
+                    cfg.out_dim,
+                    flat * 4,
+                )?),
             ),
-            1 => (take_proj(src, "audio_encoder.projection.weight", cfg.out_dim, flat)?, None),
-            n => return Err(format!("mimo audio_config: projection_layers = {n} is not supported")),
+            1 => (
+                take_proj(src, "audio_encoder.projection.weight", cfg.out_dim, flat)?,
+                None,
+            ),
+            n => {
+                return Err(format!(
+                    "mimo audio_config: projection_layers = {n} is not supported"
+                ));
+            }
         };
         Ok(Self {
             cfg,
@@ -1708,13 +1810,21 @@ impl AudioEncoder {
     /// Codes `[t][cols]` (cols ≥ channels; extra columns are ignored) →
     /// grouped `[G][group][channels]`, the tail padded by repeating the last
     /// row.
-    pub fn group_codes(&self, codes: &[u32], t: usize, cols: usize) -> Result<(Vec<u32>, usize), String> {
+    pub fn group_codes(
+        &self,
+        codes: &[u32],
+        t: usize,
+        cols: usize,
+    ) -> Result<(Vec<u32>, usize), String> {
         let (c, g) = (self.cfg.channels, self.cfg.group);
         if cols < c {
             return Err(format!("audio codes have {cols} channels, need {c}"));
         }
         if t == 0 || codes.len() != t * cols {
-            return Err(format!("audio codes: {} values for {t}×{cols}", codes.len()));
+            return Err(format!(
+                "audio codes: {} values for {t}×{cols}",
+                codes.len()
+            ));
         }
         let padded = t.div_ceil(g) * g;
         let mut out = Vec::with_capacity(padded * c);
@@ -1726,7 +1836,13 @@ impl AudioEncoder {
     }
 
     /// Codes `[t][cols]` → LLM rows `[G][out_dim]`, `G = ⌈t/group⌉`.
-    pub fn forward(&self, codes: &[u32], t: usize, cols: usize, pool: Option<&Pool>) -> Result<Vec<f32>, String> {
+    pub fn forward(
+        &self,
+        codes: &[u32],
+        t: usize,
+        cols: usize,
+        pool: Option<&Pool>,
+    ) -> Result<Vec<f32>, String> {
         let cfg = &self.cfg;
         let (grouped, groups) = self.group_codes(codes, t, cols)?;
         let (d, c, g) = (cfg.dim, cfg.channels, cfg.group);
@@ -1738,7 +1854,10 @@ impl AudioEncoder {
             for ch in 0..c {
                 let id = grouped[r * c + ch] as usize;
                 if id >= cfg.vocab {
-                    return Err(format!("audio code {id} in channel {ch} is outside the {} embedding rows", cfg.vocab));
+                    return Err(format!(
+                        "audio code {id} in channel {ch} is outside the {} embedding rows",
+                        cfg.vocab
+                    ));
                 }
                 let e = &self.speech_emb[ch][id * d..(id + 1) * d];
                 for (a, b) in dst.iter_mut().zip(e) {
@@ -1829,7 +1948,9 @@ impl MimoAudio {
         model
             .tensor_index("audio_tokenizer.encoder.conv1.weight")
             .is_some()
-            && model.tensor_index("audio_encoder.projection.mlp.0.weight").is_some()
+            && model
+                .tensor_index("audio_encoder.projection.mlp.0.weight")
+                .is_some()
     }
 
     fn configs(src: &dyn WeightSource) -> Result<(TokenizerConfig, EncoderConfig), String> {
@@ -1904,7 +2025,11 @@ impl MimoAudio {
         let mut out = Vec::new();
         let mut start = 0usize;
         for seg in segment_lengths(m) {
-            out.extend(self.tokenizer.features(&mel[start * nm..(start + seg) * nm], seg, self.pool())?);
+            out.extend(self.tokenizer.features(
+                &mel[start * nm..(start + seg) * nm],
+                seg,
+                self.pool(),
+            )?);
             start += seg;
         }
         Ok(out)
@@ -1916,7 +2041,9 @@ impl MimoAudio {
         let feats = self.features(mel, m)?;
         let frames = feats.len() / d;
         debug_assert_eq!(frames, codes_for_mel(m));
-        let codes = self.tokenizer.quantize(&feats, frames, self.bf16_codebooks, self.pool());
+        let codes = self
+            .tokenizer
+            .quantize(&feats, frames, self.bf16_codebooks, self.pool());
         Ok(AudioCodes {
             frames,
             levels: self.tokenizer.books.len(),
@@ -1926,7 +2053,9 @@ impl MimoAudio {
 
     /// Codes → LLM embedding rows.
     pub fn embed_codes(&self, codes: &AudioCodes) -> Result<AudioEmbeds, String> {
-        let rows = self.encoder.forward(&codes.codes, codes.frames, codes.levels, self.pool())?;
+        let rows = self
+            .encoder
+            .forward(&codes.codes, codes.frames, codes.levels, self.pool())?;
         let dim = self.encoder.cfg.out_dim;
         Ok(AudioEmbeds {
             n_tokens: rows.len() / dim,
@@ -1955,7 +2084,14 @@ impl MimoAudio {
 mod tests {
     use super::*;
 
-    fn wav_bytes(tag: u16, channels: u16, rate: u32, bits: u16, extensible: bool, data: &[u8]) -> Vec<u8> {
+    fn wav_bytes(
+        tag: u16,
+        channels: u16,
+        rate: u32,
+        bits: u16,
+        extensible: bool,
+        data: &[u8],
+    ) -> Vec<u8> {
         let block = channels * bits.div_ceil(8);
         let mut fmt = Vec::new();
         fmt.extend_from_slice(&(if extensible { 0xFFFEu16 } else { tag }).to_le_bytes());
@@ -1993,10 +2129,16 @@ mod tests {
     #[test]
     fn wav_decodes_every_supported_layout() {
         // Two stereo frames: (min, max-ish) then (0, −half).
-        let pcm16: Vec<u8> = [-32768i16, 32767, 0, -16384].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let pcm16: Vec<u8> = [-32768i16, 32767, 0, -16384]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
         let w = decode_wav(&wav_bytes(1, 2, 16000, 16, false, &pcm16)).unwrap();
         assert_eq!(w.sample_rate, 16000);
-        assert_eq!(w.channels, vec![vec![-1.0, 0.0], vec![32767.0 / 32768.0, -0.5]]);
+        assert_eq!(
+            w.channels,
+            vec![vec![-1.0, 0.0], vec![32767.0 / 32768.0, -0.5]]
+        );
 
         let u8d = [0u8, 128, 255];
         let w = decode_wav(&wav_bytes(1, 1, 8000, 8, false, &u8d)).unwrap();
@@ -2011,17 +2153,28 @@ mod tests {
             assert_eq!(w.channels[0], vec![-1.0, 0.5, -1.0 / 8_388_608.0]);
         }
 
-        let s32: Vec<u8> = [i32::MIN, 1 << 30].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let s32: Vec<u8> = [i32::MIN, 1 << 30]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
         let w = decode_wav(&wav_bytes(1, 1, 48000, 32, false, &s32)).unwrap();
         assert_eq!(w.channels[0], vec![-1.0, 0.5]);
 
-        let f32d: Vec<u8> = [0.25f32, -0.75].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let f32d: Vec<u8> = [0.25f32, -0.75]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
         for ext in [false, true] {
             let w = decode_wav(&wav_bytes(3, 1, 22050, 32, ext, &f32d)).unwrap();
             assert_eq!(w.channels[0], vec![0.25, -0.75]);
         }
         let f64d: Vec<u8> = [0.125f64].iter().flat_map(|v| v.to_le_bytes()).collect();
-        assert_eq!(decode_wav(&wav_bytes(3, 1, 24000, 64, false, &f64d)).unwrap().channels[0], vec![0.125]);
+        assert_eq!(
+            decode_wav(&wav_bytes(3, 1, 24000, 64, false, &f64d))
+                .unwrap()
+                .channels[0],
+            vec![0.125]
+        );
 
         // A-law is refused, not misread.
         assert!(decode_wav(&wav_bytes(6, 1, 8000, 8, false, &[0])).is_err());
@@ -2030,7 +2183,10 @@ mod tests {
 
     #[test]
     fn wav_data_size_past_the_end_reads_to_the_end() {
-        let pcm16: Vec<u8> = [1000i16, -1000, 5].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let pcm16: Vec<u8> = [1000i16, -1000, 5]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
         let mut b = wav_bytes(1, 1, 24000, 16, false, &pcm16);
         let n = b.len();
         // data size field sits 4 + data bytes before the end.
@@ -2041,7 +2197,12 @@ mod tests {
     #[test]
     fn resample_kernel_widths_match_torchaudio() {
         // (orig, new) → width, from torchaudio's formula.
-        for (o, n, w) in [(2usize, 3usize, 7usize), (147, 80, 12), (147, 160, 7), (2, 1, 13)] {
+        for (o, n, w) in [
+            (2usize, 3usize, 7usize),
+            (147, 80, 12),
+            (147, 160, 7),
+            (2, 1, 13),
+        ] {
             let (k, width) = sinc_resample_kernel(o, n);
             assert_eq!(width, w, "{o}->{n}");
             assert_eq!(k.len(), n * (2 * w + o));
@@ -2069,7 +2230,9 @@ mod tests {
     #[test]
     fn fft_matches_a_direct_dft() {
         let n = 960;
-        let x: Vec<f64> = (0..n).map(|i| ((i * 7919) % 97) as f64 / 97.0 - 0.5).collect();
+        let x: Vec<f64> = (0..n)
+            .map(|i| ((i * 7919) % 97) as f64 / 97.0 - 0.5)
+            .collect();
         let mut out = vec![(0.0, 0.0); n];
         Fft::new(n).forward_real(&x, &mut out);
         for k in [0usize, 1, 37, 240, 480, 959] {
@@ -2079,7 +2242,10 @@ mod tests {
                 re += v * a.cos();
                 im += v * a.sin();
             }
-            assert!((re - out[k].0).abs() < 1e-9 && (im - out[k].1).abs() < 1e-9, "bin {k}");
+            assert!(
+                (re - out[k].0).abs() < 1e-9 && (im - out[k].1).abs() < 1e-9,
+                "bin {k}"
+            );
         }
     }
 
@@ -2095,7 +2261,10 @@ mod tests {
             assert_ne!(win(c), bits, "index {i} needs no fixup");
             let up = f32::from_bits(c.to_bits() + 1);
             let dn = f32::from_bits(c.to_bits() - 1);
-            assert!(win(up) == bits || win(dn) == bits, "index {i}: not a one-ulp cos difference");
+            assert!(
+                win(up) == bits || win(dn) == bits,
+                "index {i}: not a one-ulp cos difference"
+            );
         }
         let w = torch_hann_960();
         assert_eq!(w[0], 0.0);
@@ -2108,7 +2277,10 @@ mod tests {
         let (mel, m) = log_mel(&vec![0.0; 481], None).unwrap();
         assert_eq!((m, mel.len()), (3, 3 * N_MELS));
         // Silence floors at ln(1e-7).
-        assert!(mel.iter().all(|&v| (v - (1e-7f64).ln() as f32).abs() < 1e-6));
+        assert!(
+            mel.iter()
+                .all(|&v| (v - (1e-7f64).ln() as f32).abs() < 1e-6)
+        );
         assert_eq!(mel_frames(120_000), 501);
         // Filterbank: every band is non-empty (torchaudio warns otherwise).
         let fb = mel_filterbank(481, 128, 24000);
@@ -2129,21 +2301,49 @@ mod tests {
         // every length from 1 s to 65 s at 24 kHz (and beyond a segment edge).
         for n in (24_000..=65 * 24_000).step_by(240 * 7) {
             let m = mel_frames(n);
-            assert_eq!(codes_for_mel(m).div_ceil(4), audio_token_count(m, 4), "M={m}");
+            assert_eq!(
+                codes_for_mel(m).div_ceil(4),
+                audio_token_count(m, 4),
+                "M={m}"
+            );
         }
         for m in 5990..6020 {
-            assert_eq!(codes_for_mel(m).div_ceil(4), audio_token_count(m, 4), "M={m}");
+            assert_eq!(
+                codes_for_mel(m).div_ceil(4),
+                audio_token_count(m, 4),
+                "M={m}"
+            );
         }
     }
 
     #[test]
     fn placeholder_expansion() {
-        let ids = [1, AUDIO_START_ID, AUDIO_PAD_ID, AUDIO_END_ID, 2, AUDIO_START_ID, AUDIO_PAD_ID, AUDIO_END_ID];
+        let ids = [
+            1,
+            AUDIO_START_ID,
+            AUDIO_PAD_ID,
+            AUDIO_END_ID,
+            2,
+            AUDIO_START_ID,
+            AUDIO_PAD_ID,
+            AUDIO_END_ID,
+        ];
         let out = expand_audio_placeholders(&ids, &[2, 3]).unwrap();
         assert_eq!(
             out,
-            vec![1, AUDIO_START_ID, AUDIO_PAD_ID, AUDIO_PAD_ID, AUDIO_END_ID, 2, AUDIO_START_ID,
-                 AUDIO_PAD_ID, AUDIO_PAD_ID, AUDIO_PAD_ID, AUDIO_END_ID]
+            vec![
+                1,
+                AUDIO_START_ID,
+                AUDIO_PAD_ID,
+                AUDIO_PAD_ID,
+                AUDIO_END_ID,
+                2,
+                AUDIO_START_ID,
+                AUDIO_PAD_ID,
+                AUDIO_PAD_ID,
+                AUDIO_PAD_ID,
+                AUDIO_END_ID
+            ]
         );
         assert!(expand_audio_placeholders(&ids, &[2]).is_err());
         assert!(expand_audio_placeholders(&ids, &[2, 3, 4]).is_err());
@@ -2159,6 +2359,9 @@ mod tests {
         }
         assert_eq!(bf16_round(1.0), 1.0);
         assert_eq!(bf16_round(f32::from_bits(0x3F80_8000)), 1.0); // tie → even
-        assert_eq!(bf16_round(f32::from_bits(0x3F81_8000)), f32::from_bits(0x3F82_0000));
+        assert_eq!(
+            bf16_round(f32::from_bits(0x3F81_8000)),
+            f32::from_bits(0x3F82_0000)
+        );
     }
 }

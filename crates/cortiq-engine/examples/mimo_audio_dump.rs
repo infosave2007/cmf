@@ -25,7 +25,11 @@ fn npy_write(path: &Path, descr: &str, shape: &[usize], bytes: &[u8]) {
         1 => format!("({},)", shape[0]),
         _ => format!(
             "({})",
-            shape.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", ")
+            shape
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
     };
     let mut hdr = format!("{{'descr': '{descr}', 'fortran_order': False, 'shape': {shape_s}, }}");
@@ -41,7 +45,12 @@ fn npy_write(path: &Path, descr: &str, shape: &[usize], bytes: &[u8]) {
 }
 
 fn save_f32(path: &Path, shape: &[usize], v: &[f32]) {
-    assert_eq!(shape.iter().product::<usize>(), v.len(), "{}", path.display());
+    assert_eq!(
+        shape.iter().product::<usize>(),
+        v.len(),
+        "{}",
+        path.display()
+    );
     let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
     npy_write(path, "<f4", shape, &bytes);
 }
@@ -63,7 +72,14 @@ fn npy_read(path: &Path) -> (String, Vec<usize>, Vec<u8>) {
     };
     let hdr = std::str::from_utf8(&b[start..start + hlen]).unwrap();
     assert!(!hdr.contains("'fortran_order': True"), "fortran order");
-    let descr = hdr.split("'descr':").nth(1).unwrap().split('\'').nth(1).unwrap().to_string();
+    let descr = hdr
+        .split("'descr':")
+        .nth(1)
+        .unwrap()
+        .split('\'')
+        .nth(1)
+        .unwrap()
+        .to_string();
     let shape_s = hdr.split("'shape':").nth(1).unwrap();
     let shape_s = &shape_s[shape_s.find('(').unwrap() + 1..shape_s.find(')').unwrap()];
     let shape = shape_s
@@ -78,13 +94,21 @@ fn npy_read(path: &Path) -> (String, Vec<usize>, Vec<u8>) {
 fn load_f32(path: &Path) -> (Vec<usize>, Vec<f32>) {
     let (d, shape, p) = npy_read(path);
     assert_eq!(d, "<f4", "{}", path.display());
-    (shape, p.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+    (
+        shape,
+        p.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+    )
 }
 
 fn load_codes(path: &Path) -> (Vec<usize>, Vec<u32>) {
     let (d, shape, p) = npy_read(path);
     let v = match d.as_str() {
-        "<i4" => p.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32).collect(),
+        "<i4" => p
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
+            .collect(),
         "<i8" => p
             .chunks_exact(8)
             .map(|c| i64::from_le_bytes(c.try_into().unwrap()) as u32)
@@ -97,17 +121,19 @@ fn load_codes(path: &Path) -> (Vec<usize>, Vec<u32>) {
 /// The `cortiq quantize-gptq --hessians` cache (`CMFHESS1`, the layout of
 /// cortiq-cli's `save_hessians`): identical Hessians are stored once under
 /// all their names, each as its upper triangle.
-fn save_hessians(path: &Path, hess: &std::collections::HashMap<String, cortiq_engine::gptq_capture::HessianAcc>) {
+fn save_hessians(
+    path: &Path,
+    hess: &std::collections::HashMap<String, cortiq_engine::gptq_capture::HessianAcc>,
+) {
     use std::io::Write;
     let mut names: Vec<&String> = hess.keys().collect();
     names.sort();
     let mut uniq: Vec<(Vec<&String>, &cortiq_engine::gptq_capture::HessianAcc)> = Vec::new();
     for n in names {
         let a = &hess[n];
-        if let Some(u) = uniq
-            .iter_mut()
-            .find(|(_, b)| b.cols == a.cols && b.count == a.count && b.sumsq == a.sumsq && b.h == a.h)
-        {
+        if let Some(u) = uniq.iter_mut().find(|(_, b)| {
+            b.cols == a.cols && b.count == a.count && b.sumsq == a.sumsq && b.h == a.h
+        }) {
             u.0.push(n);
         } else {
             uniq.push((vec![n], a));
@@ -141,7 +167,9 @@ fn save_hessians(path: &Path, hess: &std::collections::HashMap<String, cortiq_en
 }
 
 fn arg(args: &[String], name: &str) -> Option<String> {
-    args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned())
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1).cloned())
 }
 
 fn main() {
@@ -154,20 +182,33 @@ fn main() {
             let w = mimo_audio::decode_wav(&wav).unwrap();
             let flat: Vec<f32> = w.channels.concat();
             save_f32(&out, &[w.channels.len(), w.frames()], &flat);
-            println!("rate {} channels {} frames {}", w.sample_rate, w.channels.len(), w.frames());
+            println!(
+                "rate {} channels {} frames {}",
+                w.sample_rate,
+                w.channels.len(),
+                w.frames()
+            );
         }
         "frontend" => {
             std::fs::create_dir_all(&out).unwrap();
             let wav = std::fs::read(arg(&args, "--wav").expect("--wav")).unwrap();
             let t0 = Instant::now();
             let w = mimo_audio::decode_wav(&wav).unwrap();
-            save_f32(&out.join("dec.npy"), &[w.channels.len(), w.frames()], &w.channels.concat());
+            save_f32(
+                &out.join("dec.npy"),
+                &[w.channels.len(), w.frames()],
+                &w.channels.concat(),
+            );
             let chans: Vec<Vec<f32>> = w
                 .channels
                 .iter()
                 .map(|c| mimo_audio::resample_sinc(c, w.sample_rate, mimo_audio::SAMPLE_RATE))
                 .collect();
-            save_f32(&out.join("chan24k.npy"), &[chans.len(), chans[0].len()], &chans.concat());
+            save_f32(
+                &out.join("chan24k.npy"),
+                &[chans.len(), chans[0].len()],
+                &chans.concat(),
+            );
             let mono = mimo_audio::wav_to_mono_24k(&w).unwrap();
             save_f32(&out.join("wave24k.npy"), &[mono.len()], &mono);
             let pool = cortiq_engine::pool::Pool::from_env();
@@ -218,12 +259,20 @@ fn main() {
             let own = mimo_audio::AudioCodes {
                 frames: rows,
                 levels,
-                codes: if audio.bf16_codebooks { rounded.clone() } else { exact.clone() },
+                codes: if audio.bf16_codebooks {
+                    rounded.clone()
+                } else {
+                    exact.clone()
+                },
             };
             let t3 = Instant::now();
             let emb_own = audio.embed_codes(&own).unwrap();
             let t_enc = t3.elapsed().as_secs_f64();
-            save_f32(&out.join("embeds_own.npy"), &[emb_own.n_tokens, emb_own.dim], &emb_own.rows);
+            save_f32(
+                &out.join("embeds_own.npy"),
+                &[emb_own.n_tokens, emb_own.dim],
+                &emb_own.rows,
+            );
             let fixed = match arg(&args, "--codes") {
                 Some(cp) => {
                     let (shape, v) = load_codes(Path::new(&cp));
@@ -253,7 +302,11 @@ fn main() {
                 "bf16_codebooks_default": audio.bf16_codebooks,
                 "threads": cortiq_engine::pool::Pool::effective_threads(),
             });
-            std::fs::write(out.join("tower.json"), serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+            std::fs::write(
+                out.join("tower.json"),
+                serde_json::to_string_pretty(&meta).unwrap(),
+            )
+            .unwrap();
             println!("{meta}");
             assert_eq!(emb_own.n_tokens, k, "placeholder count != encoder rows");
         }
@@ -274,7 +327,12 @@ fn main() {
             for w in &wavs {
                 let emb = audio.embed_wav(&std::fs::read(w).unwrap()).unwrap();
                 frames += emb.n_tokens;
-                eprintln!("  {} -> {} rows ({:.0}s)", w.display(), emb.n_tokens, t0.elapsed().as_secs_f64());
+                eprintln!(
+                    "  {} -> {} rows ({:.0}s)",
+                    w.display(),
+                    emb.n_tokens,
+                    t0.elapsed().as_secs_f64()
+                );
             }
             let hess = cortiq_engine::gptq_capture::end();
             save_hessians(&out, &hess);
@@ -287,7 +345,9 @@ fn main() {
             );
         }
         _ => {
-            eprintln!("usage: mimo_audio_dump (decode|frontend|tower|calib) --out ... (see the source header)");
+            eprintln!(
+                "usage: mimo_audio_dump (decode|frontend|tower|calib) --out ... (see the source header)"
+            );
             std::process::exit(2);
         }
     }

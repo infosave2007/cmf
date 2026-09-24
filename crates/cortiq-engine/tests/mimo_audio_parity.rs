@@ -26,7 +26,12 @@ fn npy(path: &Path) -> Option<(Vec<usize>, Vec<u8>, String)> {
         (u32::from_le_bytes([b[8], b[9], b[10], b[11]]) as usize, 12)
     };
     let hdr = std::str::from_utf8(&b[start..start + hlen]).unwrap();
-    let descr = hdr.split("'descr':").nth(1)?.split('\'').nth(1)?.to_string();
+    let descr = hdr
+        .split("'descr':")
+        .nth(1)?
+        .split('\'')
+        .nth(1)?
+        .to_string();
     let s = hdr.split("'shape':").nth(1)?;
     let s = &s[s.find('(')? + 1..s.find(')')?];
     let shape = s
@@ -41,14 +46,25 @@ fn npy(path: &Path) -> Option<(Vec<usize>, Vec<u8>, String)> {
 fn f32s(path: &Path) -> Option<(Vec<usize>, Vec<f32>)> {
     let (shape, p, d) = npy(path)?;
     assert_eq!(d, "<f4", "{}", path.display());
-    Some((shape, p.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()))
+    Some((
+        shape,
+        p.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+    ))
 }
 
 fn i32s(path: &Path) -> Option<(Vec<usize>, Vec<u32>)> {
     let (shape, p, d) = npy(path)?;
     let v = match d.as_str() {
-        "<i4" => p.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32).collect(),
-        "<i8" => p.chunks_exact(8).map(|c| i64::from_le_bytes(c.try_into().unwrap()) as u32).collect(),
+        "<i4" => p
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
+            .collect(),
+        "<i8" => p
+            .chunks_exact(8)
+            .map(|c| i64::from_le_bytes(c.try_into().unwrap()) as u32)
+            .collect(),
         other => panic!("{}: {other}", path.display()),
     };
     Some((shape, v))
@@ -60,7 +76,10 @@ fn fixtures() -> Option<PathBuf> {
 }
 
 fn max_abs(a: &[f32], b: &[f32]) -> f64 {
-    a.iter().zip(b).map(|(x, y)| (*x as f64 - *y as f64).abs()).fold(0.0, f64::max)
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (*x as f64 - *y as f64).abs())
+        .fold(0.0, f64::max)
 }
 
 fn peak(a: &[f32]) -> f64 {
@@ -84,7 +103,9 @@ fn g8_1_wav_decode_matches_numpy() {
     let mut n = 0;
     for wav in wavs(&dir) {
         let stem = wav.file_stem().unwrap().to_str().unwrap();
-        let Some((shape, want)) = f32s(&dir.join("ref").join(stem).join("dec.npy")) else { continue };
+        let Some((shape, want)) = f32s(&dir.join("ref").join(stem).join("dec.npy")) else {
+            continue;
+        };
         let got = mimo_audio::decode_wav(&std::fs::read(&wav).unwrap()).unwrap();
         assert_eq!(vec![got.channels.len(), got.frames()], shape, "{stem}");
         let flat = got.channels.concat();
@@ -103,8 +124,10 @@ fn g8_2_g8_3_frontend_matches_torchaudio_port() {
     for wav in wavs(&dir) {
         let stem = wav.file_stem().unwrap().to_str().unwrap();
         let r = dir.join("ref").join(stem);
-        let (Some((_, w_ref)), Some((mshape, m_ref))) = (f32s(&r.join("wave24k_f64.npy")), f32s(&r.join("mel_f64.npy")))
-        else {
+        let (Some((_, w_ref)), Some((mshape, m_ref))) = (
+            f32s(&r.join("wave24k_f64.npy")),
+            f32s(&r.join("mel_f64.npy")),
+        ) else {
             continue;
         };
         let w = mimo_audio::decode_wav(&std::fs::read(&wav).unwrap()).unwrap();
@@ -131,7 +154,9 @@ fn g8_2_g8_3_frontend_matches_torchaudio_port() {
 #[test]
 fn g9_g10_towers_match_hf_fp32() {
     let Some(dir) = fixtures() else { return };
-    let Ok(src) = std::env::var("MIMO_AUDIO_SRC") else { return };
+    let Ok(src) = std::env::var("MIMO_AUDIO_SRC") else {
+        return;
+    };
     let src = PathBuf::from(src);
     let audio = if src.extension().is_some_and(|e| e == "cmf") {
         MimoAudio::from_model(&Arc::new(cortiq_core::CmfModel::open(&src).unwrap())).unwrap()
@@ -141,9 +166,11 @@ fn g9_g10_towers_match_hf_fp32() {
     let mut n = 0;
     for entry in std::fs::read_dir(dir.join("ref")).unwrap() {
         let r = entry.unwrap().path();
-        let (Some((ms, mel)), Some((fs, f_ref)), Some((_, c_ref))) =
-            (f32s(&r.join("mel.npy")), f32s(&r.join("feats.npy")), i32s(&r.join("codes_exact.npy")))
-        else {
+        let (Some((ms, mel)), Some((fs, f_ref)), Some((_, c_ref))) = (
+            f32s(&r.join("mel.npy")),
+            f32s(&r.join("feats.npy")),
+            i32s(&r.join("codes_exact.npy")),
+        ) else {
             continue;
         };
         if ms[0] > mimo_audio::SEGMENT_FRAMES {
@@ -166,7 +193,11 @@ fn g9_g10_towers_match_hf_fp32() {
                 ab / (aa.sqrt() * bb.sqrt())
             })
             .fold(1.0, f64::min);
-        assert!(rel <= 1e-3 && min_cos >= 0.9999, "{}: G9.1 rel {rel:.3e} cos {min_cos:.6}", r.display());
+        assert!(
+            rel <= 1e-3 && min_cos >= 0.9999,
+            "{}: G9.1 rel {rel:.3e} cos {min_cos:.6}",
+            r.display()
+        );
         let codes = audio.tokenizer.quantize(&feats, fs[0], false, audio.pool());
         let lv = c_ref.len() / fs[0];
         let flips = codes.iter().zip(&c_ref).filter(|(a, b)| a != b).count();

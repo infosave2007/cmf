@@ -31,10 +31,15 @@ use std::path::PathBuf;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let get = |n: &str| args.iter().position(|a| a == n).and_then(|i| args.get(i + 1).cloned());
+    let get = |n: &str| {
+        args.iter()
+            .position(|a| a == n)
+            .and_then(|i| args.get(i + 1).cloned())
+    };
     let src = PathBuf::from(get("--src").expect("--src HF_DIR"));
     let out = PathBuf::from(get("--out").expect("--out X.mm.cmf"));
-    let (raw, blobs) = cortiq_engine::mimo_audio::read_hf_audio_tensors(&src).expect("read checkpoint");
+    let (raw, blobs) =
+        cortiq_engine::mimo_audio::read_hf_audio_tensors(&src).expect("read checkpoint");
     let mut specs = Vec::with_capacity(raw.len() + blobs.len());
     let mut counts = std::collections::BTreeMap::<String, usize>::new();
     for t in raw {
