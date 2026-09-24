@@ -216,6 +216,9 @@ static inline void zi_flash_body(
     uint tid, ushort sg, ushort lane, uint2 tg)
 {
     constexpr uint NT = 32u * NSG, CH = 512u / NT;   // uint4 chunks of K (and of V) per thread
+    // PK: K/V tiles packed as dense 8×8 blocks [key blk][d blk][key 8][d 8]
+    // instead of row-major [key][128] — measured −2% (not instantiated).
+    constexpr bool PK = (SKIP & 8) != 0;
     const uint h = tg.y;
     const uint ntot = p.n_img + p.n_cap;
     const uint q0 = tg.x * (8u * NSG) + 8u * sg;
@@ -254,8 +257,10 @@ static inline void zi_flash_body(
             }
         }
         for (uint c = 0; c < CH; ++c) {
-            *(threadgroup uint4*)(sk + ckey[c] * 128u + cpart[c]) = kq[c];
-            *(threadgroup uint4*)(sv + ckey[c] * 128u + cpart[c]) = vq[c];
+            const uint off = PK ? ((ckey[c] / 8u) * 16u + cpart[c] / 8u) * 64u + (ckey[c] % 8u) * 8u
+                                : ckey[c] * 128u + cpart[c];
+            *(threadgroup uint4*)(sk + off) = kq[c];
+            *(threadgroup uint4*)(sv + off) = vq[c];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (PF && SKIP != 4 && kb0 + 32u < ntot) {
@@ -273,7 +278,8 @@ static inline void zi_flash_body(
                 #pragma clang loop unroll(full)
                 for (ushort d = 0; d < 16; ++d) {
                     simdgroup_half8x8 kf;
-                    simdgroup_load(kf, skb + 8u * c * 128u + 8u * d, 128, ulong2(0, 0), true);
+                    if (PK) simdgroup_load(kf, skb + (c * 16u + d) * 64u, 8, ulong2(0, 0), true);
+                    else simdgroup_load(kf, skb + 8u * c * 128u + 8u * d, 128, ulong2(0, 0), true);
                     simdgroup_multiply_accumulate(s[c], qf[d], kf, s[c]);
                 }
             }
@@ -310,7 +316,8 @@ static inline void zi_flash_body(
                 #pragma clang loop unroll(full)
                 for (ushort d = 0; d < 16; ++d) {
                     simdgroup_half8x8 vf;
-                    simdgroup_load(vf, svb + 8u * c * 128u + 8u * d, 128);
+                    if (PK) simdgroup_load(vf, svb + (c * 16u + d) * 64u, 8);
+                    else simdgroup_load(vf, svb + 8u * c * 128u + 8u * d, 128);
                     simdgroup_multiply_accumulate(of[d], pf[c], vf, of[d]);
                 }
             }
