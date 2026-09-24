@@ -371,7 +371,11 @@ pub fn generate_images(
         let te = (|| -> Result<(Vec<f32>, Option<Vec<f32>>), String> {
             // The text encoder runs on the CPU (measured, B2): on the 3090
             // the per-op device path took 3.2–4.2 s against 0.6 s here and
-            // moved the caption by 3–7 %. `pause_gpu` is process-wide, so
+            // moved v_0 by 4–10 %. vk2 traced that to its host a8w8 arm
+            // (the probe's CPU turns and the sub-gate projections), not the
+            // device; with exact host fallback the device projections land
+            // at the DiT's own floor, but stay 3–4 s (docs/ZIMAGE.md, "Text
+            // encoder on the device"). `pause_gpu` is process-wide, so
             // the pool's workers stay off the device too (`cpu_scope` would
             // not); the plane upload beside it goes straight to the device
             // context, which the pause does not gate.
