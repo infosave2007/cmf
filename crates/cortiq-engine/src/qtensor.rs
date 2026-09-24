@@ -3535,6 +3535,166 @@ impl QTensor {
         dispatch_rows(pool, rows, &run);
         true
     }
+
+    /// `moe_gate_up_many` for SEVERAL tokens at once, decode-exact: expert
+    /// `e` (`pairs[e]`, q4tp) serves the tokens `groups[e]` (row indices
+    /// into `xs`, each `cols` wide). Every (expert, token) output is
+    /// bit-identical to `moe_gate_up_many` run on that token alone — the
+    /// same int8 activation split, VNNI dots, outlier terms and inline
+    /// SiLU — while each weight row is read once for all the tokens routed
+    /// to its expert (the speculative verify's expert sharing). `outs` is
+    /// flat in (expert, token-of-group) order. False = not covered (not
+    /// a8w8, not q4tp): the caller takes the per-token path.
+    pub fn moe_gate_up_rows(
+        pairs: &[(&QTensor, &QTensor)],
+        groups: &[Vec<usize>],
+        xs: &[f32],
+        outs: &mut [Vec<f32>],
+        pool: Option<&Pool>,
+    ) -> bool {
+        if pairs.is_empty() || pairs.len() != groups.len() || !a8w8_enabled() {
+            return false;
+        }
+        let inter = pairs[0].0.rows();
+        let cols = pairs[0].0.cols();
+        let n_pairs: usize = groups.iter().map(|g| g.len()).sum();
+        if cols % GROUP_SIZE != 0 || outs.len() != n_pairs || xs.len() % cols != 0 {
+            return false;
+        }
+        let b = xs.len() / cols;
+        let gpr = cols / GROUP_SIZE;
+        let mut views = Vec::with_capacity(pairs.len() * 2);
+        for (g, u) in pairs {
+            let q4tp = |t: &QTensor| {
+                matches!(
+                    t,
+                    Self::Mapped {
+                        dtype: TensorDtype::Q4TiledP,
+                        ..
+                    }
+                )
+            };
+            if !q4tp(g) || !q4tp(u) || g.rows() != inter || u.rows() != inter || g.cols() != cols
+                || u.cols() != cols
+            {
+                return false;
+            }
+            views.push(Q4tpView::new(g.quant_bytes(), inter, cols));
+            views.push(Q4tpView::new(u.quant_bytes(), inter, cols));
+        }
+        if outs.iter().any(|o| o.len() != inter) || groups.iter().flatten().any(|&t| t >= b) {
+            return false;
+        }
+        let acts: Vec<SplitAct> = (0..b)
+            .map(|t| split_act(&xs[t * cols..(t + 1) * cols]))
+            .collect();
+        let mut offs = Vec::with_capacity(groups.len());
+        let mut o = 0usize;
+        for g in groups {
+            offs.push(o);
+            o += g.len();
+        }
+        let ptrs: Vec<SendMut> = outs.iter_mut().map(|o| SendMut(o.as_mut_ptr())).collect();
+        let (views, ptrs, acts, offs) = (&views, &ptrs, &acts, &offs);
+        let run = |start: usize, end: usize| {
+            let (mut gsc, mut usc) = (vec![0f32; gpr], vec![0f32; gpr]);
+            for flat in start..end {
+                let (e, r) = (flat / inter, flat % inter);
+                let (gv_view, uv_view) = (&views[e * 2], &views[e * 2 + 1]);
+                gv_view.scales_into(r, gpr, &mut gsc);
+                uv_view.scales_into(r, gpr, &mut usc);
+                for (k, &t) in groups[e].iter().enumerate() {
+                    let act = &acts[t];
+                    let mut gv = dot_q4tp_row_i8(gv_view.nib, r, gpr, &act.xq, &gsc) * act.sx;
+                    let mut uv = dot_q4tp_row_i8(uv_view.nib, r, gpr, &act.xq, &usc) * act.sx;
+                    for &(j, xv) in &act.outliers {
+                        let og = q4tp_outlier(gv_view.nib, r, gpr, j, &gsc);
+                        let ou = q4tp_outlier(uv_view.nib, r, gpr, j, &usc);
+                        gv += og.0 * og.1 * xv;
+                        uv += ou.0 * ou.1 * xv;
+                    }
+                    let silu_g = gv / (1.0 + (-gv).exp());
+                    // SAFETY: one worker owns each (expert, row) cell of
+                    // every output of the expert's group.
+                    unsafe { *ptrs[offs[e] + k].at(r) = silu_g * uv };
+                }
+            }
+        };
+        dispatch_rows(pool, pairs.len() * inter, &run);
+        true
+    }
+
+    /// The per-(expert, token) down terms `moe_down_many` weights and sums,
+    /// for SEVERAL tokens: `outs[p][o] = down_e[o] · gs[p]` (int8 split of
+    /// `gs[p]`, VNNI dot, outlier terms — bit-identical to that kernel's
+    /// `d`), each down row read once for its expert's whole group. The
+    /// caller sums `w·d` per token in its route order, which reproduces
+    /// `moe_down_many`'s f32 sequence exactly. Layout as `moe_gate_up_rows`.
+    pub fn moe_down_rows(
+        downs: &[&QTensor],
+        group_lens: &[usize],
+        gs: &[Vec<f32>],
+        outs: &mut [Vec<f32>],
+        pool: Option<&Pool>,
+    ) -> bool {
+        if downs.is_empty() || downs.len() != group_lens.len() || !a8w8_enabled() {
+            return false;
+        }
+        let rows = downs[0].rows();
+        let cols = downs[0].cols();
+        let n_pairs: usize = group_lens.iter().sum();
+        if cols % GROUP_SIZE != 0 || gs.len() != n_pairs || outs.len() != n_pairs {
+            return false;
+        }
+        let gpr = cols / GROUP_SIZE;
+        let mut views = Vec::with_capacity(downs.len());
+        for d in downs {
+            if !matches!(
+                d,
+                Self::Mapped {
+                    dtype: TensorDtype::Q4TiledP,
+                    ..
+                }
+            ) || d.rows() != rows
+                || d.cols() != cols
+            {
+                return false;
+            }
+            views.push(Q4tpView::new(d.quant_bytes(), rows, cols));
+        }
+        if gs.iter().any(|g| g.len() != cols) || outs.iter().any(|o| o.len() != rows) {
+            return false;
+        }
+        let acts: Vec<SplitAct> = gs.iter().map(|g| split_act(g)).collect();
+        let mut offs = Vec::with_capacity(group_lens.len());
+        let mut o = 0usize;
+        for &l in group_lens {
+            offs.push(o);
+            o += l;
+        }
+        let ptrs: Vec<SendMut> = outs.iter_mut().map(|o| SendMut(o.as_mut_ptr())).collect();
+        let (views, ptrs, acts, offs) = (&views, &ptrs, &acts, &offs);
+        let run = |start: usize, end: usize| {
+            let mut sc = vec![0f32; gpr];
+            for flat in start..end {
+                let (e, r) = (flat / rows, flat % rows);
+                let v = &views[e];
+                v.scales_into(r, gpr, &mut sc);
+                for k in 0..group_lens[e] {
+                    let a = &acts[offs[e] + k];
+                    let mut d = dot_q4tp_row_i8(v.nib, r, gpr, &a.xq, &sc) * a.sx;
+                    for &(j, xv) in &a.outliers {
+                        let (w, s) = q4tp_outlier(v.nib, r, gpr, j, &sc);
+                        d += w * s * xv;
+                    }
+                    // SAFETY: one worker owns each (expert, row) cell.
+                    unsafe { *ptrs[offs[e] + k].at(r) = d };
+                }
+            }
+        };
+        dispatch_rows(pool, downs.len() * rows, &run);
+        true
+    }
 }
 
 /// Batched q8 kernel: same math as qmatvec, the row makes a single
@@ -3972,7 +4132,7 @@ fn qmatmat(
         // CMF_X86_BLOCKED=0 forces the per-row path (paired in-process
         // A/B on noisy shared-vCPU hosts).
         let blocked_ok = blocked_enabled();
-        if !avx512vnni_enabled() && blocked_ok {
+        if !avx512vnni_enabled() && blocked_ok && !row_exact() {
             let run = |start: usize, end: usize| {
                 let mut o = start;
                 while o < end {
@@ -6176,7 +6336,7 @@ fn q4tp_matmat(
         // for ARM's dotprod and is hard-wired false everywhere else, so
         // asking it here left the whole blocked path unreachable on x86.
         #[cfg(target_arch = "x86_64")]
-        let blocked_ok = q4tp_blocked_x86();
+        let blocked_ok = q4tp_blocked_x86() && !row_exact();
         #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         let blocked_ok = false;
         // Columns are swept in panels that fit L2. Without this a
@@ -9199,6 +9359,30 @@ fn avx2_a8w8_enabled() -> bool {
     })
 }
 
+/// Row-exact batching: while set, the x86 batched kernels (`qmatmat`,
+/// `q4tp_matmat`) compute every (weight row, token) cell with the
+/// single-token kernel instead of the blocked 2×4 / 1×4 / 1×8 tiles, so a
+/// token's result does not depend on the batch it rides in and equals its
+/// matvec. The MiMo speculative verify holds it (`row_exact_scope`) — its
+/// accepted rows must be the rows plain decode would have produced.
+static ROW_EXACT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn row_exact() -> bool {
+    ROW_EXACT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Run `f` with row-exact batching on (restored after, also on unwind).
+pub(crate) fn row_exact_scope<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ROW_EXACT.store(self.0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let _restore = Restore(ROW_EXACT.swap(true, std::sync::atomic::Ordering::Relaxed));
+    f()
+}
+
 /// A8W8 quantized-activation path available on THIS machine? One
 /// switch across architectures: ARM dotprod (CMF_SDOT) or x86 AVX2
 /// (CMF_AVX2 + the same CMF_SDOT exact-contract override).
@@ -11952,6 +12136,175 @@ mod tests {
         QTensor::matvec_many([&a, &b], &x, [&mut ga, &mut gb], Some(&pool));
         assert_eq!(ea, ga, "Q4TP fused lane 1 must be bit-identical");
         assert_eq!(eb, gb, "Q4TP fused lane 2 must be bit-identical");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The MiMo speculative verify's kernels: several tokens' MoE through
+    /// `moe_gate_up_rows` / `moe_down_rows` (+ the caller's route-order sum)
+    /// is bit-identical to each token alone through `moe_gate_up_many` /
+    /// `moe_down_many` (decode), and a row-exact `q4tp_matmat` of five
+    /// tokens (wide enough for the blocked tiles) equals five matvecs.
+    #[test]
+    fn multi_token_moe_rows_equal_single_token_decode() {
+        use crate::pool::Pool;
+        use cortiq_core::{CMF_VERSION, CmfHeader, CmfModel, QuantType, TensorSpec};
+        if !a8w8_enabled() {
+            return; // the kernels decline; the caller walks decode per row
+        }
+        let (h, inter, ne) = (64usize, 128usize, 3usize);
+        let arch: cortiq_core::ModelArch = serde_json::from_value(serde_json::json!({
+            "arch_name": "tiny-q4tp-moe",
+            "hidden_size": h,
+            "intermediate_size": inter,
+            "num_layers": 1,
+            "num_attention_heads": 2,
+            "num_kv_heads": 1,
+            "head_dim": 32,
+            "vocab_size": 8,
+            "layer_types": ["FullAttention"],
+            "rms_norm_eps": 1e-6,
+            "max_position_embeddings": 8,
+            "linear_conv_kernel_dim": 0,
+            "linear_num_key_heads": 0,
+            "linear_num_value_heads": 0
+        }))
+        .unwrap();
+        let header = CmfHeader {
+            format: "cmf".into(),
+            version: CMF_VERSION,
+            arch,
+            quant_type: QuantType::Q4Block,
+            provenance: None,
+            tokenizer_config: None,
+            section_hashes: None,
+            skills: Vec::new(),
+            shard: None,
+            calibration: None,
+            routing: None,
+        };
+        let mut specs = Vec::new();
+        for e in 0..ne {
+            for (k, (n, r, c)) in [("g", inter, h), ("u", inter, h), ("d", h, inter)]
+                .into_iter()
+                .enumerate()
+            {
+                // Distinct experts: perturb only the nibble plane (any byte
+                // is a valid pair of codes; the ladder stays intact).
+                let mut data = synth_q4tp(r, c);
+                for (i, byte) in data[..r * (c / GROUP_SIZE) * Q4TP_NIB].iter_mut().enumerate() {
+                    *byte ^= ((i * (e * 3 + k + 1)) % 251) as u8;
+                }
+                specs.push(TensorSpec {
+                    name: format!("{n}{e}"),
+                    dtype: TensorDtype::Q4TiledP,
+                    shape: vec![r, c],
+                    data,
+                });
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("cmf-moe-rows-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("m.cmf");
+        CmfModel::write(&path, &header, &specs, None, None).unwrap();
+        let model = Arc::new(CmfModel::open(&path).unwrap());
+        let t = |n: String| QTensor::from_model(&model, &n).unwrap();
+        let g: Vec<QTensor> = (0..ne).map(|e| t(format!("g{e}"))).collect();
+        let u: Vec<QTensor> = (0..ne).map(|e| t(format!("u{e}"))).collect();
+        let d: Vec<QTensor> = (0..ne).map(|e| t(format!("d{e}"))).collect();
+        let b = 4usize;
+        let mut xs: Vec<f32> = (0..b * h)
+            .map(|i| ((i * 31 + 7) % 89) as f32 / 89.0 - 0.5)
+            .collect();
+        xs[5] = 9.0; // an activation outlier on token 0
+        // Token -> (experts in route order, weights).
+        let routes: Vec<(Vec<usize>, Vec<f32>)> = vec![
+            (vec![2, 0], vec![0.6, 0.4]),
+            (vec![0, 1, 2], vec![0.2, 0.5, 0.3]),
+            (vec![1], vec![1.0]),
+            (vec![2, 1, 0], vec![0.25, 0.25, 0.5]),
+        ];
+        let pool = Pool::new(3);
+        // Decode reference, token by token.
+        let mut want = vec![0f32; b * h];
+        for (tk, (idx, w)) in routes.iter().enumerate() {
+            let x = &xs[tk * h..(tk + 1) * h];
+            let pairs: Vec<(&QTensor, &QTensor)> = idx.iter().map(|&e| (&g[e], &u[e])).collect();
+            let mut gs: Vec<Vec<f32>> = idx.iter().map(|_| vec![0f32; inter]).collect();
+            assert!(QTensor::moe_gate_up_many(&pairs, x, &mut gs, Some(&pool)));
+            let downs: Vec<&QTensor> = idx.iter().map(|&e| &d[e]).collect();
+            assert!(QTensor::moe_down_many(
+                &downs,
+                &gs,
+                w,
+                &mut want[tk * h..(tk + 1) * h],
+                Some(&pool)
+            ));
+        }
+        // All four tokens at once, grouped by expert.
+        let mut experts: Vec<usize> = Vec::new();
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for (tk, (idx, _)) in routes.iter().enumerate() {
+            for &e in idx {
+                match experts.iter().position(|&x| x == e) {
+                    Some(k) => groups[k].push(tk),
+                    None => {
+                        experts.push(e);
+                        groups.push(vec![tk]);
+                    }
+                }
+            }
+        }
+        let n_pairs: usize = groups.iter().map(|g| g.len()).sum();
+        let pairs: Vec<(&QTensor, &QTensor)> = experts.iter().map(|&e| (&g[e], &u[e])).collect();
+        let mut gs: Vec<Vec<f32>> = (0..n_pairs).map(|_| vec![0f32; inter]).collect();
+        assert!(QTensor::moe_gate_up_rows(&pairs, &groups, &xs, &mut gs, Some(&pool)));
+        let downs: Vec<&QTensor> = experts.iter().map(|&e| &d[e]).collect();
+        let lens: Vec<usize> = groups.iter().map(|g| g.len()).collect();
+        let mut ds: Vec<Vec<f32>> = (0..n_pairs).map(|_| vec![0f32; h]).collect();
+        assert!(QTensor::moe_down_rows(&downs, &lens, &gs, &mut ds, Some(&pool)));
+        let slot = |tk: usize, e: usize| {
+            let k = experts.iter().position(|&x| x == e).unwrap();
+            groups[..k].iter().map(|g| g.len()).sum::<usize>()
+                + groups[k].iter().position(|&x| x == tk).unwrap()
+        };
+        let mut got = vec![0f32; b * h];
+        for (tk, (idx, w)) in routes.iter().enumerate() {
+            for i in 0..h {
+                let mut acc = 0f32;
+                for (&e, &we) in idx.iter().zip(w) {
+                    acc += we * ds[slot(tk, e)][i];
+                }
+                got[tk * h + i] = acc;
+            }
+        }
+        assert!(want.iter().any(|v| *v != 0.0));
+        assert_eq!(
+            want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "multi-token MoE must equal decode bit for bit"
+        );
+
+        // Row-exact q4tp_matmat: five tokens (a blocked 1x4 tile + tail
+        // otherwise) equal five matvecs.
+        let b5 = 5usize;
+        let x5: Vec<f32> = (0..b5 * h)
+            .map(|i| ((i * 13 + 5) % 71) as f32 / 71.0 - 0.5)
+            .collect();
+        let mut mm = vec![0f32; b5 * inter];
+        row_exact_scope(|| g[1].matmat(&x5, b5, &mut mm, Some(&pool)));
+        for tk in 0..b5 {
+            let mut mv = vec![0f32; inter];
+            g[1].matvec(&x5[tk * h..(tk + 1) * h], &mut mv, Some(&pool));
+            assert_eq!(
+                mv.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                mm[tk * inter..(tk + 1) * inter]
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+                "row-exact matmat token {tk}"
+            );
+        }
+        assert!(!row_exact(), "the scope restores the flag");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

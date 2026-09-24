@@ -204,6 +204,9 @@ pub struct Pipeline {
     /// `<stem>.mtp.cmf` sidecar); None = absent. Speculative greedy decode
     /// uses it unless `CMF_MTP=0` / `CMF_MIMO_MTP=0`.
     pub mimo_mtp: Option<mimo_mtp::MimoMtp>,
+    /// Set while the MiMo speculative verify runs `prefill_batch`: its MoE
+    /// layers take `moe_ffn_rows_exact` (each row bit-identical to decode).
+    verify_exact_moe: bool,
     /// Speculative decode via MTP (greedy only; `CMF_MTP=0` disables).
     pub speculative: bool,
     /// Keep generating past end-of-sequence ids (the llama-bench contract
@@ -2623,6 +2626,7 @@ impl Pipeline {
             short_conv_cfg: None,
             mtp: None,
             mimo_mtp: None,
+            verify_exact_moe: false,
             speculative: std::env::var("CMF_MTP").map(|v| v != "0").unwrap_or(true),
             ignore_eos: false,
             draft_full_streak: 0,
@@ -4785,7 +4789,10 @@ impl Pipeline {
         // (emitted without being fed back). Exact only without MTP —
         // reuse is gated off when MTP is active.
         let forwarded = input_ids.len() + output_ids.len().saturating_sub(1);
-        if cancelled {
+        // A MiMo speculative round that stopped on an accepted draft (EOS,
+        // cancel) leaves verify rows past the committed stream in the cache:
+        // never offer that cache for reuse.
+        if cancelled || mimo_spec {
             self.kv_history.clear();
         } else {
             self.kv_history = all_ids[..forwarded.min(all_ids.len())].to_vec();
@@ -8194,6 +8201,9 @@ impl Pipeline {
                     tube_ffn(d, &post, b, pool.as_deref(), mask_row)
                 }
                 FfnKind::Dense(d) => dense_ffn_batch(d, &post, b, pool.as_deref(), mask_row),
+                FfnKind::Moe(m) if self.verify_exact_moe => {
+                    moe_ffn_rows_exact(m, &post, b, hs, pool.as_deref())
+                }
                 FfnKind::Moe(m) => moe_ffn_batch(m, &post, b, hs, pool.as_deref(), None),
                 // Dual-branch layers run per position (the expert branch
                 // reads the raw residual — nothing to batch yet).
@@ -13621,6 +13631,129 @@ fn moe_ffn_batch(
     out
 }
 
+/// Decode-exact multi-token MoE — the MiMo speculative verify's FFN. Row
+/// `r` of the result is bit-identical to `moe_ffn(m, x_r)` on the CPU
+/// (`moe_ffn_cpu` → `moe_ffn_cpu_batched`): router matvec per row, the same
+/// routing, the same int8 gate/up/SiLU and down terms
+/// (`QTensor::moe_gate_up_rows` / `moe_down_rows`), and the row's experts
+/// summed in ITS route order from 0. What the rows share is the weight
+/// traffic: each routed expert is read once for every row that picked it.
+/// (`moe_ffn_batch`, the prompt path, groups the same way but sums in
+/// expert-index order and runs blocked kernels on wide groups — close, not
+/// bit-equal to decode.) Any layer the kernels do not cover, or a device
+/// that could answer `moe_ffn` itself, walks `moe_ffn` row by row.
+fn moe_ffn_rows_exact(
+    m: &MoeFfn,
+    xs: &[f32],
+    b: usize,
+    hidden: usize,
+    pool: Option<&Pool>,
+) -> Vec<f32> {
+    let mut out = vec![0.0f32; b * hidden];
+    let per_row = |out: &mut [f32]| {
+        for r in 0..b {
+            let o = moe_ffn(m, &xs[r * hidden..(r + 1) * hidden], pool, None);
+            out[r * hidden..(r + 1) * hidden].copy_from_slice(&o);
+        }
+    };
+    let covered = !crate::gpu::enabled_here()
+        && moe_batch_enabled()
+        && m.shared.is_none()
+        && m.resonance.is_none()
+        && FFN_PROBE.with(|pr| pr.borrow().is_none())
+        && m.experts.iter().all(|d| d.act == Act::Silu);
+    if !covered {
+        per_row(&mut out);
+        return out;
+    }
+    let ne = m.experts.len();
+    // Routing, row by row, exactly as `moe_ffn`.
+    let mut routes: Vec<(Vec<usize>, Vec<f32>)> = Vec::with_capacity(b);
+    for r in 0..b {
+        let x = &xs[r * hidden..(r + 1) * hidden];
+        accumulate_act(m, x, 1);
+        let mut logits = vec![0.0f32; ne];
+        m.router.matvec(x, &mut logits, pool);
+        let (idx, p, wsum) = moe_route(&logits, m, None);
+        {
+            let mut st = m.stats.borrow_mut();
+            if st.len() < ne {
+                st.resize(ne, 0);
+            }
+            for &e in &idx {
+                st[e] += 1;
+            }
+        }
+        let w: Vec<f32> = idx
+            .iter()
+            .map(|&e| p[e] / wsum * m.per_expert_scale.as_ref().map_or(1.0, |v| v[e]))
+            .collect();
+        routes.push((idx, w));
+    }
+    if routes.iter().any(|(idx, _)| idx.is_empty()) {
+        per_row(&mut out);
+        return out;
+    }
+    // Group the (row, expert) picks by expert, in first-seen order.
+    let mut experts: Vec<usize> = Vec::new();
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (r, (idx, _)) in routes.iter().enumerate() {
+        for &e in idx {
+            match experts.iter().position(|&x| x == e) {
+                Some(g) => groups[g].push(r),
+                None => {
+                    experts.push(e);
+                    groups.push(vec![r]);
+                }
+            }
+        }
+    }
+    let n_pairs: usize = groups.iter().map(|g| g.len()).sum();
+    let inter = m.experts[experts[0]].gate_proj.rows();
+    let pairs: Vec<(&QTensor, &QTensor)> = experts
+        .iter()
+        .map(|&e| (&m.experts[e].gate_proj, &m.experts[e].up_proj))
+        .collect();
+    let mut gs: Vec<Vec<f32>> = (0..n_pairs).map(|_| vec![0f32; inter]).collect();
+    if !QTensor::moe_gate_up_rows(&pairs, &groups, xs, &mut gs, pool) {
+        per_row(&mut out);
+        return out;
+    }
+    let downs: Vec<&QTensor> = experts.iter().map(|&e| &m.experts[e].down_proj).collect();
+    let lens: Vec<usize> = groups.iter().map(|g| g.len()).collect();
+    let mut ds: Vec<Vec<f32>> = (0..n_pairs).map(|_| vec![0f32; hidden]).collect();
+    if !QTensor::moe_down_rows(&downs, &lens, &gs, &mut ds, pool) {
+        per_row(&mut out);
+        return out;
+    }
+    // Where each (row, expert) term landed in the flat pair list.
+    let mut slot = std::collections::HashMap::with_capacity(n_pairs);
+    let mut p = 0usize;
+    for (g, &e) in experts.iter().enumerate() {
+        for &r in &groups[g] {
+            slot.insert((r, e), p);
+            p += 1;
+        }
+    }
+    for (r, (idx, w)) in routes.iter().enumerate() {
+        let terms: Vec<(&[f32], f32)> = idx
+            .iter()
+            .zip(w)
+            .map(|(&e, &we)| (ds[slot[&(r, e)]].as_slice(), we))
+            .collect();
+        let row = &mut out[r * hidden..(r + 1) * hidden];
+        for (i, dst) in row.iter_mut().enumerate() {
+            // `moe_down_many`'s per-row sum: from 0, in route order.
+            let mut acc = 0f32;
+            for (d, we) in &terms {
+                acc += we * d[i];
+            }
+            *dst = acc;
+        }
+    }
+    out
+}
+
 thread_local! {
     /// gate/up activation scratch for the dense FFN paths (single uses
     /// two slots, the fused pair all four) — these were fresh
@@ -16439,64 +16572,70 @@ mod tests {
     /// j reads (x[j+k+1], norm(h_j)) at RoPE position j.
     #[test]
     fn mimo_mtp_incremental_rounds_equal_the_teacher_forced_table() {
-        let mut p = mimo_test_pipeline();
-        p.mimo_mtp = Some(mimo_test_mtp(3, 1.0));
-        let ids: Vec<u32> = (0..14u32).map(|i| (i * 11 + 5) % 64).collect();
-        let hs = p.hidden_size;
-        let hb = p.prefill_batch_span(PrefillIn::Ids(&ids), 0, None, 0, p.num_layers);
-        p.mimo_note_rows(&hb, 0);
-        let mut st = p.mimo_mtp.take().unwrap();
-        // Incremental: one round per t through the decode path (later
-        // tokens from `ids`, the probe's teacher forcing).
-        let k = 3;
-        let mut inc = Vec::new();
-        for t in 0..ids.len() - k - 1 {
-            inc.push(p.mimo_mtp_draft(&mut st, t, &ids, k));
-        }
-        // Reference: per layer, ONE batched causal pass over all rows with
-        // fresh caches.
-        let s = ids.len();
-        let mut reference = vec![vec![0u32; k]; s - k - 1];
-        let mut fresh = mimo_test_mtp(3, 1.0);
-        for (layer, m) in fresh.layers.iter_mut().enumerate() {
-            let n = s - layer - 1;
-            let mut cats = vec![0.0f32; n * 2 * hs];
-            for j in 0..n {
-                let e = p.embed_single(ids[j + layer + 1]);
-                let mut g = vec![0.0f32; hs];
-                inference::rms_norm_into(
-                    &hb[j * hs..(j + 1) * hs],
-                    &p.weights.final_norm,
-                    p.rms_eps,
-                    p.norm_style,
-                    &mut g,
-                );
-                let (ce, ch) = cats[j * 2 * hs..(j + 1) * 2 * hs].split_at_mut(hs);
-                inference::rms_norm_into(&e, &m.enorm, p.rms_eps, p.norm_style, ce);
-                inference::rms_norm_into(&g, &m.hnorm, p.rms_eps, p.norm_style, ch);
+        // Both readings of the backbone hidden: pre-final-norm (default)
+        // and post-final-norm (`CMF_MIMO_MTP_HIDDEN=post`).
+        for post in [false, true] {
+            let mut p = mimo_test_pipeline();
+            // A non-trivial final norm, so the two readings differ.
+            p.weights.final_norm = (0..p.hidden_size).map(|i| 0.5 + 0.1 * i as f32).collect();
+            let mut st0 = mimo_test_mtp(3, 1.0);
+            st0.post_norm_hidden = post;
+            p.mimo_mtp = Some(st0);
+            let ids: Vec<u32> = (0..14u32).map(|i| (i * 11 + 5) % 64).collect();
+            let hs = p.hidden_size;
+            let hb = p.prefill_batch_span(PrefillIn::Ids(&ids), 0, None, 0, p.num_layers);
+            p.mimo_note_rows(&hb, 0);
+            let mut st = p.mimo_mtp.take().unwrap();
+            // Incremental: one round per t through the decode path (later
+            // tokens from `ids`, the probe's teacher forcing).
+            let k = 3;
+            let mut inc = Vec::new();
+            for t in 0..ids.len() - k - 1 {
+                inc.push(p.mimo_mtp_draft(&mut st, t, &ids, k));
             }
-            let mut x = vec![0.0f32; n * hs];
-            m.eh_proj.matmat(&cats, n, &mut x, None);
-            p.mimo_mtp_block(m, &mut x, n, 0);
-            for (t, row) in reference.iter_mut().enumerate() {
-                let y = inference::rms_norm(
-                    &x[t * hs..(t + 1) * hs],
-                    &m.final_norm,
-                    p.rms_eps,
-                    p.norm_style,
-                );
-                row[layer] = sampler::argmax(&p.lm_head_forward(&y));
+            // Reference: per layer, ONE batched causal pass over all rows
+            // with fresh caches.
+            let s = ids.len();
+            let mut reference = vec![vec![0u32; k]; s - k - 1];
+            let mut fresh = mimo_test_mtp(3, 1.0);
+            for (layer, m) in fresh.layers.iter_mut().enumerate() {
+                let n = s - layer - 1;
+                let mut cats = vec![0.0f32; n * 2 * hs];
+                for j in 0..n {
+                    let e = p.embed_single(ids[j + layer + 1]);
+                    let raw = &hb[j * hs..(j + 1) * hs];
+                    let g = if post {
+                        inference::rms_norm(raw, &p.weights.final_norm, p.rms_eps, p.norm_style)
+                    } else {
+                        raw.to_vec()
+                    };
+                    let (ce, ch) = cats[j * 2 * hs..(j + 1) * 2 * hs].split_at_mut(hs);
+                    inference::rms_norm_into(&e, &m.enorm, p.rms_eps, p.norm_style, ce);
+                    inference::rms_norm_into(&g, &m.hnorm, p.rms_eps, p.norm_style, ch);
+                }
+                let mut x = vec![0.0f32; n * hs];
+                m.eh_proj.matmat(&cats, n, &mut x, None);
+                p.mimo_mtp_block(m, &mut x, n, 0);
+                for (t, row) in reference.iter_mut().enumerate() {
+                    let y = inference::rms_norm(
+                        &x[t * hs..(t + 1) * hs],
+                        &m.final_norm,
+                        p.rms_eps,
+                        p.norm_style,
+                    );
+                    row[layer] = sampler::argmax(&p.lm_head_forward(&y));
+                }
             }
-        }
-        assert_eq!(inc, reference);
-        // Not a degenerate table: the drafts vary.
-        let distinct: std::collections::HashSet<u32> = inc.iter().flatten().copied().collect();
-        assert!(distinct.len() > 3, "{inc:?}");
-        // Each layer's cache ends holding committed + provisional rows only
-        // up to the last round start.
-        let last_t = ids.len() - k - 2;
-        for m in &st.layers {
-            assert_eq!(m.kv.seq_len, last_t + 1);
+            assert_eq!(inc, reference, "post_norm_hidden = {post}");
+            // Not a degenerate table: the drafts vary.
+            let distinct: std::collections::HashSet<u32> =
+                inc.iter().flatten().copied().collect();
+            assert!(distinct.len() > 3, "{inc:?}");
+            // Each layer's cache ends holding rows up to the last round start.
+            let last_t = ids.len() - k - 2;
+            for m in &st.layers {
+                assert_eq!(m.kv.seq_len, last_t + 1);
+            }
         }
     }
 

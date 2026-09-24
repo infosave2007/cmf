@@ -511,9 +511,13 @@ class Oracle:
 #     u = u + o_proj(swa_attn(input_layernorm(u)))         SWA geometry, sinks
 #     u = u + mlp(pre_mlp_layernorm(u))                    dense FFN
 #     logits = lm_head(final_layernorm(u))                 shared lm_head
-# `hid` is the backbone's POST-final-norm hidden (both servers' target model
-# returns model.norm(h)). How the three layers chain differs between servers,
-# hence the variants of `cmd_mtp`.
+# Both servers feed `hid` = the backbone's POST-final-norm hidden (their target
+# returns model.norm(h)); how the three layers chain differs between them. The
+# variants of `cmd_mtp` measure every reading against the backbone's own
+# greedy: A_pre (layer k per step, target hidden BEFORE the final norm) is the
+# best on wikitext, HTML/JS and Russian (2026-09-24, 3 x 320 tokens), the
+# DeepSeek chain (B_*) collapses at depth 2, vLLM's layer-0 recursion (C) is
+# far behind at depth 2-3.
 class MtpLayer:
     def __init__(self, src, cfg: MimoCfg, k: int, dt=torch.float32):
         p = f"model.mtp.layers.{k}."
@@ -769,7 +773,7 @@ MTP_VARIANTS = ("A", "A_pre", "B_pre", "B_post", "C", "C_pre")
 MTP_VARIANT_DOC = {
     "A": "layer k at round start t: (embed x[t+k+1], POST-norm backbone h[t]); each layer its own "
          "KV cache at positions <= t (SGLang multi-layer MTP, MiMoV2MTP not in its chain list)",
-    "A_pre": "A with the PRE-final-norm backbone hidden (control)",
+    "A_pre": "A with the PRE-final-norm backbone hidden (the engine default: measured best)",
     "B_pre": "DeepSeek-V3 chain: layer k at position t takes layer k-1's PRE-final-norm output at t",
     "B_post": "chain with layer k-1's POST-final-norm output",
     "C": "vLLM: layer 0 only, recursive: step s at position t+s with (x[t+s+1], its own "
