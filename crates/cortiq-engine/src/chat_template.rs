@@ -175,7 +175,7 @@ fn tojson_filter(value: &Value, args: Rest<Value>) -> Result<Value, Error> {
                     return Err(Error::new(
                         ErrorKind::InvalidOperation,
                         "tojson(): separators must be a pair of strings",
-                    ))
+                    ));
                 }
             }
         }
@@ -380,7 +380,7 @@ impl Dumper<'_> {
                 return Err(Error::new(
                     ErrorKind::InvalidOperation,
                     format!("tojson(): object of type {other} is not JSON serializable"),
-                ))
+                ));
             }
         }
         Ok(())
@@ -399,7 +399,7 @@ impl Dumper<'_> {
                 return Err(Error::new(
                     ErrorKind::InvalidOperation,
                     format!("tojson(): keys must be str, int, float, bool or None, not {other}"),
-                ))
+                ));
             }
         })
     }
@@ -560,7 +560,11 @@ mod tests {
             "{\n  \"b\": [\n    1,\n    2\n  ],\n  \"a\": {},\n  \"c\": []\n}"
         );
         assert_eq!(
-            render("{{ v | tojson(indent='\\t', sort_keys=true) }}", ctx.clone()).unwrap(),
+            render(
+                "{{ v | tojson(indent='\\t', sort_keys=true) }}",
+                ctx.clone()
+            )
+            .unwrap(),
             "{\n\t\"a\": {},\n\t\"b\": [\n\t\t1,\n\t\t2\n\t],\n\t\"c\": []\n}"
         );
         assert_eq!(
@@ -651,8 +655,14 @@ mod tests {
 
     #[test]
     fn raise_exception_carries_the_template_message() {
-        let err = render("{{ raise_exception('roles must alternate') }}", serde_json::json!({}))
-            .unwrap_err();
-        assert!(format!("{err:#}").contains("roles must alternate"), "{err:#}");
+        let err = render(
+            "{{ raise_exception('roles must alternate') }}",
+            serde_json::json!({}),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("roles must alternate"),
+            "{err:#}"
+        );
     }
 }
