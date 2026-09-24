@@ -628,7 +628,15 @@ impl Pipeline {
         }
         let t = next_pos - 1;
         let t0 = std::time::Instant::now();
-        let drafts = self.mimo_mtp_draft(st, t, all_ids, k);
+        // The draft stack normally catches up by 1–4 rows. Use the same
+        // short-panel q8 GPU kernels as verification, rather than silently
+        // sending those projections to the CPU's wide-prefill fallback.
+        // Draft numerics may change acceptance, but never the verified target.
+        let drafts = {
+            let _q8 = self.mimo_moe.is_on()
+                .then(crate::qtensor::enter_full_gpu_q8_scope);
+            crate::qtensor::row_exact_scope(|| self.mimo_mtp_draft(st, t, all_ids, k))
+        };
         st.stats.draft_ns += t0.elapsed().as_nanos();
         if drafts.is_empty() {
             return Ok(None);

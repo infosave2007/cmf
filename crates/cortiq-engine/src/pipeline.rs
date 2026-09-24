@@ -12535,6 +12535,8 @@ impl Pipeline {
         // MiMo-V2 expert placement: decided before the graph or the per-op
         // arena can claim the budget the expert bank needs.
         self.mimo_moe_prepare();
+        let _mimo_q8 = self.mimo_moe.is_on()
+            .then(crate::qtensor::enter_full_gpu_q8_scope);
         // Split borrows: copy scalars / clone handles so the per-layer
         // cfg does not hold `&self` while the KV cache is `&mut`.
         let (nh, _nkv, _hd, hs, _rd, eps) = (
@@ -13370,6 +13372,8 @@ impl Pipeline {
     /// LM head: hidden → logits [vocab_size]. The dominant matvec of
     /// every decode step — row-parallel on the worker pool.
     fn lm_head_forward(&self, hidden: &[f32]) -> Vec<f32> {
+        let _mimo_q8 = self.mimo_moe.is_on()
+            .then(crate::qtensor::enter_full_gpu_q8_scope);
         let rows = self.weights.lm_head.rows();
         let mut logits = attention::take_buf(rows.min(self.vocab_size));
         self.weights
@@ -15798,7 +15802,9 @@ fn moe_ffn_banked(
     slot.note_route(t0.elapsed().as_nanos() as u64);
     match slot.forward(li, m, x, &r, pool) {
         Some(out) => out,
-        None => moe_ffn_experts(m, x, &r, pool),
+        None => crate::qtensor::float_activations_scope(|| {
+            crate::gpu::cpu_scope(|| moe_ffn_experts(m, x, &r, pool))
+        }),
     }
 }
 
@@ -15825,7 +15831,9 @@ fn moe_ffn_banked_rows(
     for (x, r) in xs.chunks_exact(hidden).zip(&routes) {
         let row = slot.forward(li, m, x, r, pool).unwrap_or_else(|| {
             // A failed bank must not stream missing experts into the arena.
-            crate::gpu::cpu_scope(|| moe_ffn_experts(m, x, r, pool))
+            crate::qtensor::float_activations_scope(|| {
+                crate::gpu::cpu_scope(|| moe_ffn_experts(m, x, r, pool))
+            })
         });
         out.extend(row);
     }
