@@ -102,6 +102,13 @@ fn main() -> anyhow::Result<()> {
             med(&mut ttft[i])
         );
     }
+    // PREFILL_AB_DUMP=<dir>: the prompt ids, and per arm the greedy ids and
+    // the last prompt position's logits (f32 LE), for an outside reference.
+    let dump = std::env::var("PREFILL_AB_DUMP").ok();
+    if let Some(d) = &dump {
+        std::fs::create_dir_all(d)?;
+        std::fs::write(format!("{d}/ids.json"), serde_json::to_string(&ids)?)?;
+    }
     if n_gen > 0 {
         let mut base: Option<Vec<u32>> = None;
         for &c in &chunks {
@@ -109,6 +116,13 @@ fn main() -> anyhow::Result<()> {
             p.reset_session();
             let r = p.generate_from_ids(&ids, n_gen, None, None).map_err(anyhow::Error::msg)?;
             let out = r.token_ids.clone();
+            if let Some(d) = &dump {
+                p.reset_session();
+                let lg = p.forward_ids(&ids, None).map_err(anyhow::Error::msg)?;
+                let bytes: Vec<u8> = lg.iter().flat_map(|x| x.to_le_bytes()).collect();
+                std::fs::write(format!("{d}/logits_{c}.f32"), bytes)?;
+                std::fs::write(format!("{d}/greedy_{c}.json"), serde_json::to_string(&out)?)?;
+            }
             let same = match &base {
                 None => {
                     base = Some(out.clone());
