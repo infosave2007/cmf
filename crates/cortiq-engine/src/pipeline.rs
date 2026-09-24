@@ -1188,21 +1188,34 @@ impl Pipeline {
             return true;
         }
         let plan = kv_reuse_plan(reuse_from, &layers);
+        let (what, rows, n) = match &plan {
+            ReusePlan::Ready => ("host ready", 0, 0),
+            ReusePlan::Fresh => ("fresh", 0, 0),
+            ReusePlan::Pull(p) => (
+                "pull",
+                p.iter().map(|&(_, a, b)| b - a).max().unwrap_or(0),
+                p.len(),
+            ),
+        };
+        let t0 = std::time::Instant::now();
+        let ok = self.apply_kv_reuse_plan(reuse_from, plan, &layers);
         if std::env::var("CMF_PREFILL_PROF").is_ok() {
-            let pulled = match &plan {
-                ReusePlan::Pull(p) => p.iter().map(|&(_, a, b)| b - a).max().unwrap_or(0),
-                _ => 0,
-            };
             eprintln!(
-                "kv-reuse: {} → {} row(s) pulled from the device mirror",
-                match plan {
-                    ReusePlan::Ready => "host ready",
-                    ReusePlan::Pull(_) => "pull",
-                    ReusePlan::Fresh => "fresh",
-                },
-                pulled
+                "kv-reuse: {what}{}: {rows} device row(s) × {n} layer(s) to the host in {:.2} ms",
+                if ok { "" } else { " (failed → fresh)" },
+                t0.elapsed().as_secs_f64() * 1e3
             );
         }
+        ok
+    }
+
+    fn apply_kv_reuse_plan(
+        &mut self,
+        reuse_from: usize,
+        plan: ReusePlan,
+        layers: &[ReuseLayer],
+    ) -> bool {
+        let kv_id = self.graph_kv_id;
         match plan {
             ReusePlan::Fresh => return false,
             ReusePlan::Ready => {}
