@@ -19,6 +19,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Without `--quant`, a MiMo-V2 checkpoint converts to q4tp experts with the
   attention, dense layer 0, embedding and lm_head at q8_2f. Other models
   still default to q8.
+- The wgpu whole-token graph and the batched prefill graph run MiMo-V2
+  attention on the card: 4 KV heads on full layers and 8 on sliding ones,
+  128-wide V heads under 192-wide Q/K heads, two RoPE tables, the 128-token
+  sliding window over a ring of the last 256 positions, and the learned
+  sinks. Before, both graphs declined MiMo-V2 and every token ran its
+  attention on the CPU. The batched graph also runs q8_2f projections and
+  MoE layers without a shared expert. When the stack does not fit the card,
+  it runs the layers that fit and the host runs the rest of each prompt
+  chunk. On the toy checkpoint the token graph, the batched prefill and a
+  2-of-4-layer device prefix match the CPU (`CMF_GPU=0 CMF_SDOT=0`) over a
+  384-token prompt and 64 greedy steps within 4.1e-6 of the largest logit.
 
 ## [0.7.6] - 2026-09-24
 
