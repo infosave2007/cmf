@@ -1475,6 +1475,12 @@ impl MimoVit {
     /// Encode one image or video: `[tokens, out_hidden]`, in the order the
     /// item's placeholders take them (raster (t, block row, block col)).
     pub fn forward(&self, input: &VisualInput) -> Result<Vec<f32>, String> {
+        // Keep the fp32 oracle contract with default GPU settings as well:
+        // cooperative GEMMs/attention otherwise round operands to fp16.
+        // This also covers the dense patch projection and exact dev towers,
+        // which do not carry a mapped model identity into their GEMM calls.
+        #[cfg(feature = "gpu")]
+        let _precision = crate::gpu_wgpu::MimoF32Gemm::for_tower();
         let c = &self.cfg;
         let m = c.merge_size;
         let (gt, gh, gw) = (input.grid_t, input.grid_h, input.grid_w);
