@@ -539,6 +539,14 @@ enum Commands {
         /// q4tp: worker threads (default: all cores)
         #[arg(long)]
         threads: Option<usize>,
+        /// q4tp: act-order GPTQ (channels by descending input energy, tile
+        /// rungs fixed up front from the original weights)
+        #[arg(long)]
+        act_order: bool,
+        /// q4tp: Hessian cache file — loaded when it exists (calibration
+        /// skipped), written after calibrating when it does not
+        #[arg(long)]
+        hessians: Option<String>,
     },
     /// Chat with a model (applies the file's chat template), or one-shot
     /// with --prompt
@@ -2089,6 +2097,8 @@ async fn main() -> anyhow::Result<()> {
             window,
             tensor_quant,
             threads,
+            act_order,
+            hessians,
         } => {
             match codec.to_ascii_lowercase().as_str() {
                 "q4tp" => {
@@ -2107,6 +2117,8 @@ async fn main() -> anyhow::Result<()> {
                         window,
                         lambda,
                         threads,
+                        act_order,
+                        hessians.as_deref(),
                     )?;
                 }
                 "q1s" => {
