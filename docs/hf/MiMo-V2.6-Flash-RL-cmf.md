@@ -17,8 +17,8 @@ language:
 
 # MiMo-V2.6-Flash-RL — CMF q4tp
 
-> **Release draft — do not publish yet.** The VRAM ladder, long-context
-> CPU/GPU check, HTTP media check and aquarium example are not complete.
+> **Release draft — do not publish yet.** The VRAM ladder, reference-layer drift audit,
+> HTTP media check and aquarium example are not complete.
 > Strict vision cosine and video timestamp gates remain open. These packages
 > are candidates; the MiMo-enabled engine has not been released as 0.7.7.
 
@@ -93,7 +93,9 @@ Natural 128-token greedy prompts, one loaded model:
 | Code | 29.90 / 30.12 | 33.62 |
 
 All four arms (cold plain, warm plain, MTP, repeated plain) emitted identical
-IDs for each prompt. MTP is not faster on every text. The 16/24/32/48/64/80-GB
+IDs for each prompt. A separate exact-float CPU/GPU check used a 456-token
+natural prompt and matched all 64 subsequent greedy token IDs, beyond the
+sliding-window boundary. MTP is not faster on every text. The 16/24/32/48/64/80-GB
 budget table and sampled peak VRAM are pending; simulated budgets must not be
 presented as measurements on six different physical cards. Host RAM must also
 accommodate the mapped text weights and execution state.
