@@ -28,6 +28,41 @@ fn main() {
             }
         }
     }
+    if mode == "corun" {
+        // CPU (Accelerate sgemm) alone, GPU (zi_q8mm) alone, then both at once
+        let (n, k, m) = (1056usize, 3840usize, 2560usize);
+        let x: Vec<f32> = (0..n * k).map(|i| ((i * 7) % 13) as f32 * 0.01).collect();
+        let w: Vec<f32> = (0..m * k).map(|i| ((i * 5) % 11) as f32 * 0.01).collect();
+        let mut y = vec![0f32; n * m];
+        let fl_cpu = 2.0 * (n * k * m) as f64;
+        let cpu_run = |y: &mut Vec<f32>, secs: f64| -> f64 {
+            let t = std::time::Instant::now();
+            let mut it = 0usize;
+            while t.elapsed().as_secs_f64() < secs {
+                cortiq_engine::fcd_ops::gemm_nt(&x, &w, y, n, k, m, None);
+                it += 1;
+            }
+            fl_cpu * it as f64 / t.elapsed().as_secs_f64() / 1e12
+        };
+        let gpu_run = |reps: usize| -> f64 {
+            let (_, med, _) = bench_gemm(10240, 3840, 1056, reps, "base").unwrap();
+            2.0 * 10240.0 * 3840.0 * 1056.0 / med / 1e9
+        };
+        for round in 0..2 {
+            let c = cpu_run(&mut y, 4.0);
+            let g = gpu_run(40);
+            let (c2, g2) = std::thread::scope(|s| {
+                let h = s.spawn(|| {
+                    let mut yy = vec![0f32; n * m];
+                    cpu_run(&mut yy, 4.0)
+                });
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                let g2 = gpu_run(80);
+                (h.join().unwrap(), g2)
+            });
+            println!("corun r{round}: cpu alone {c:.2} TF · gpu alone {g:.2} TF · together cpu {c2:.2} + gpu {g2:.2} = {:.2} TF", c2 + g2);
+        }
+    }
     if mode == "flash" {
         let vs: Vec<String> = a
             .get(4)
