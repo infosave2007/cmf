@@ -769,6 +769,8 @@ pub fn run_quantize_gptq_q4tp(
     window: usize,
     lambda: f64,
     threads: usize,
+    act_order: bool,
+    hessians: Option<&str>,
 ) -> anyhow::Result<()> {
     use cortiq_core::format::{CmfModel, TensorSpec};
     use cortiq_core::quant::dequant_tensor;
@@ -783,8 +785,12 @@ pub fn run_quantize_gptq_q4tp(
     }
     let t0 = Instant::now();
     let cal_path = calib_model.unwrap_or(input);
-    eprintln!("calibration model {cal_path} …");
-    let hess = {
+    let cached = hessians.filter(|p| std::path::Path::new(p).exists());
+    let hess = if let Some(p) = cached {
+        eprintln!("Hessians from cache {p} (calibration skipped) …");
+        load_hessians(p)?
+    } else {
+        eprintln!("calibration model {cal_path} …");
         let cmodel = Arc::new(CmfModel::open_sharded(cal_path)?);
         let mut pipe = Pipeline::from_model(&cmodel, SamplerConfig::default())
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -820,7 +826,12 @@ pub fn run_quantize_gptq_q4tp(
             );
         }
         eprintln!();
-        cortiq_engine::gptq_capture::end()
+        let h = cortiq_engine::gptq_capture::end();
+        if let Some(p) = hessians {
+            save_hessians(p, &h)?;
+            eprintln!("Hessians cached to {p}");
+        }
+        h
     };
     eprintln!(
         "captured input Hessians for {} linears ({:.0}s)",
@@ -950,7 +961,16 @@ pub fn run_quantize_gptq_q4tp(
                     };
                     let n = model.tensors[groups[gi].1[0]].shape[1];
                     let hdiag: Vec<f32> = (0..n).map(|i| h[i * n + i] as f32).collect();
-                    let (u, dead) = gptq_fold_operator(h, n, lambda);
+                    let perm = act_order.then(|| act_order_perm(&hdiag));
+                    let (u, dead) = match &perm {
+                        Some(p) => {
+                            let hp = permute_sym(&h, n, p);
+                            drop(h);
+                            let (u, _) = gptq_fold_operator(hp, n, lambda);
+                            (u, hdiag.iter().map(|&d| !(d > 0.0)).collect::<Vec<bool>>())
+                        }
+                        None => gptq_fold_operator(h, n, lambda),
+                    };
                     for &slot in &groups[gi].1 {
                         let entry = &model.tensors[slot];
                         let (rows, cols) = (entry.shape[0], entry.shape[1]);
@@ -958,7 +978,12 @@ pub fn run_quantize_gptq_q4tp(
                         if dequant_tensor(entry, model.entry_bytes(entry), &mut w).is_err() {
                             continue;
                         }
-                        let bytes = gptq_quantize_q4tp(&w, rows, cols, &u, &dead, &hdiag, inner);
+                        let bytes = match &perm {
+                            Some(p) => gptq_quantize_q4tp_act_order(
+                                &w, rows, cols, &u, &dead, p, inner,
+                            ),
+                            None => gptq_quantize_q4tp(&w, rows, cols, &u, &dead, &hdiag, inner),
+                        };
                         results.lock().unwrap().push((slot, bytes));
                         let k = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                         eprint!(
@@ -1002,6 +1027,7 @@ pub fn run_quantize_gptq_q4tp(
         "calibration_tokens": tokens,
         "window": window,
         "lambda": lambda,
+        "act_order": act_order,
         "linears": n_gptq,
     });
     header.provenance = Some(prov);
@@ -1284,6 +1310,249 @@ pub fn gptq_quantize_q4tp(
     out
 }
 
+const HESS_MAGIC: &[u8; 8] = b"CMFHESS1";
+
+/// Save captured Hessians so GPTQ variants (damping, act order, which
+/// tensors) can be re-run without re-calibrating. Identical Hessians (q/k/v
+/// and gate/up read one input) are stored once under all their names; only
+/// the upper triangle is written. f64 throughout — bit-exact round trip.
+pub fn save_hessians(
+    path: &str,
+    hess: &std::collections::HashMap<String, cortiq_engine::gptq_capture::HessianAcc>,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+    let mut names: Vec<&String> = hess.keys().collect();
+    names.sort();
+    // Group exact duplicates.
+    let mut uniq: Vec<(Vec<&String>, &cortiq_engine::gptq_capture::HessianAcc)> = Vec::new();
+    for n in names {
+        let a = &hess[n];
+        if let Some(u) = uniq
+            .iter_mut()
+            .find(|(_, b)| b.cols == a.cols && b.count == a.count && b.sumsq == a.sumsq && b.h == a.h)
+        {
+            u.0.push(n);
+        } else {
+            uniq.push((vec![n], a));
+        }
+    }
+    let tmp = format!("{path}.tmp");
+    let mut f = std::io::BufWriter::with_capacity(1 << 22, std::fs::File::create(&tmp)?);
+    f.write_all(HESS_MAGIC)?;
+    f.write_all(&(uniq.len() as u64).to_le_bytes())?;
+    for (ns, a) in &uniq {
+        f.write_all(&(ns.len() as u32).to_le_bytes())?;
+        for n in ns {
+            f.write_all(&(n.len() as u32).to_le_bytes())?;
+            f.write_all(n.as_bytes())?;
+        }
+        f.write_all(&(a.cols as u64).to_le_bytes())?;
+        f.write_all(&(a.count as u64).to_le_bytes())?;
+        f.write_all(&(a.h.len() as u64).to_le_bytes())?;
+        for v in &a.sumsq {
+            f.write_all(&v.to_le_bytes())?;
+        }
+        let n = a.cols;
+        if a.h.len() == n * n {
+            for i in 0..n {
+                for v in &a.h[i * n + i..i * n + n] {
+                    f.write_all(&v.to_le_bytes())?;
+                }
+            }
+        }
+    }
+    f.flush()?;
+    drop(f);
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Inverse of [`save_hessians`].
+pub fn load_hessians(
+    path: &str,
+) -> anyhow::Result<std::collections::HashMap<String, cortiq_engine::gptq_capture::HessianAcc>> {
+    use std::io::Read;
+    let mut f = std::io::BufReader::with_capacity(1 << 22, std::fs::File::open(path)?);
+    let mut m = [0u8; 8];
+    f.read_exact(&mut m)?;
+    anyhow::ensure!(&m == HESS_MAGIC, "{path}: not a Hessian cache");
+    let mut u64b = [0u8; 8];
+    let mut u32b = [0u8; 4];
+    let mut rd_u64 = |f: &mut std::io::BufReader<std::fs::File>| -> anyhow::Result<u64> {
+        f.read_exact(&mut u64b)?;
+        Ok(u64::from_le_bytes(u64b))
+    };
+    let n_uniq = rd_u64(&mut f)?;
+    let mut out = std::collections::HashMap::new();
+    for _ in 0..n_uniq {
+        f.read_exact(&mut u32b)?;
+        let nn = u32::from_le_bytes(u32b) as usize;
+        let mut ns = Vec::with_capacity(nn);
+        for _ in 0..nn {
+            f.read_exact(&mut u32b)?;
+            let mut s = vec![0u8; u32::from_le_bytes(u32b) as usize];
+            f.read_exact(&mut s)?;
+            ns.push(String::from_utf8(s)?);
+        }
+        let cols = rd_u64(&mut f)? as usize;
+        let count = rd_u64(&mut f)? as usize;
+        let hlen = rd_u64(&mut f)? as usize;
+        let mut buf = vec![0u8; cols * 8];
+        f.read_exact(&mut buf)?;
+        let sumsq: Vec<f64> = buf
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let mut h = vec![0f64; hlen];
+        if hlen == cols * cols {
+            let mut row = vec![0u8; cols * 8];
+            for i in 0..cols {
+                let r = &mut row[..(cols - i) * 8];
+                f.read_exact(r)?;
+                for (k, c) in r.chunks_exact(8).enumerate() {
+                    let v = f64::from_le_bytes(c.try_into().unwrap());
+                    h[i * cols + i + k] = v;
+                    h[(i + k) * cols + i] = v;
+                }
+            }
+        }
+        for n in ns {
+            out.insert(
+                n,
+                cortiq_engine::gptq_capture::HessianAcc {
+                    cols,
+                    h: h.clone(),
+                    sumsq: sumsq.clone(),
+                    count,
+                },
+            );
+        }
+    }
+    Ok(out)
+}
+
+/// Channel order for act-order GPTQ: descending input energy `H_ii`.
+pub fn act_order_perm(hdiag: &[f32]) -> Vec<usize> {
+    let mut perm: Vec<usize> = (0..hdiag.len()).collect();
+    perm.sort_by(|&a, &b| hdiag[b].total_cmp(&hdiag[a]).then(a.cmp(&b)));
+    perm
+}
+
+/// `H[perm][perm]` — the Hessian in act-order channel order.
+pub fn permute_sym(h: &[f64], n: usize, perm: &[usize]) -> Vec<f64> {
+    let mut p = vec![0f64; n * n];
+    for (a, &pa) in perm.iter().enumerate() {
+        for (b, &pb) in perm.iter().enumerate() {
+            p[a * n + b] = h[pa * n + pb];
+        }
+    }
+    p
+}
+
+/// Act-order GPTQ into q4tp: channels are eliminated in `perm` order (the
+/// loudest inputs first, while the most columns remain to absorb their
+/// error), `u` being the fold operator of the PERMUTED Hessian. Because a
+/// tile's channels are now visited out of order, its rung is fixed up front
+/// — the converter's own choice from the original weights ("static
+/// groups") — and only the nibbles move. Same layout as `encode_q4tp`.
+pub fn gptq_quantize_q4tp_act_order(
+    w0: &[f32],
+    rows: usize,
+    cols: usize,
+    u: &[f32],
+    dead: &[bool],
+    perm: &[usize],
+    threads: usize,
+) -> Vec<u8> {
+    use cortiq_core::quant::{Q4TP_NIB, q4tp_code, q4tp_ladder, q4tp_sections};
+    assert_eq!(w0.len(), rows * cols);
+    assert_eq!(cols % GROUP_SIZE, 0);
+    assert_eq!(u.len(), cols * cols);
+    assert_eq!(perm.len(), cols);
+    let gpr = cols / GROUP_SIZE;
+    let mut w_init = w0.to_vec();
+    for r in 0..rows {
+        for (c, &d) in dead.iter().enumerate() {
+            if d {
+                w_init[r * cols + c] = 0.0;
+            }
+        }
+    }
+    let mut out = crate::convert::encode_q4tp(&w_init, rows, cols);
+    let (params_off, codes_off, stride) = q4tp_sections(rows, cols);
+    let params = out[params_off..params_off + rows * 4].to_vec();
+    let codes = out[codes_off..codes_off + rows * stride].to_vec();
+    // `dead` is in original channel order; `u` is in permuted order.
+    const RB: usize = 8;
+    let nib_all = &mut out[..params_off];
+    let jobs: Vec<(usize, &mut [u8])> = nib_all
+        .chunks_mut(RB * gpr * Q4TP_NIB)
+        .enumerate()
+        .map(|(b, n)| (b * RB, n))
+        .collect();
+    let queue = std::sync::Mutex::new(jobs);
+    let (w_init, params, codes) = (&w_init, &params, &codes);
+    std::thread::scope(|s| {
+        for _ in 0..threads.max(1) {
+            s.spawn(|| {
+                loop {
+                    let job = queue.lock().unwrap().pop();
+                    let Some((r0, nib)) = job else { break };
+                    let rb = (rows - r0).min(RB);
+                    // Working rows in permuted channel order.
+                    let mut w = vec![0f32; rb * cols];
+                    let mut scl = vec![0f32; rb * cols];
+                    for k in 0..rb {
+                        let r = r0 + k;
+                        let tab = q4tp_ladder(params, r);
+                        let crow = &codes[r * stride..(r + 1) * stride];
+                        for (a, &pa) in perm.iter().enumerate() {
+                            w[k * cols + a] = w_init[r * cols + pa];
+                            scl[k * cols + a] = tab[q4tp_code(crow, pa / GROUP_SIZE)];
+                        }
+                    }
+                    nib.fill(0);
+                    let mut e = [0f32; RB];
+                    for a in 0..cols {
+                        let pa = perm[a];
+                        let (g, within) = (pa / GROUP_SIZE, pa % GROUP_SIZE);
+                        let d = u[a * cols + a];
+                        for k in 0..rb {
+                            let wv = w[k * cols + a];
+                            let s_ = scl[k * cols + a];
+                            let q = if s_ > 0.0 {
+                                (wv / s_).round_ties_even().clamp(-8.0, 7.0)
+                            } else {
+                                0.0
+                            };
+                            let nb = (q as i8 + 8) as u8 & 0x0F;
+                            let byte = &mut nib[(k * gpr + g) * Q4TP_NIB + within / 2];
+                            if within % 2 == 0 {
+                                *byte |= nb;
+                            } else {
+                                *byte |= nb << 4;
+                            }
+                            e[k] = if d > 0.0 { (wv - q * s_) / d } else { 0.0 };
+                        }
+                        let urow = &u[a * cols + a + 1..(a + 1) * cols];
+                        for k in 0..rb {
+                            let ek = e[k];
+                            if ek == 0.0 {
+                                continue;
+                            }
+                            let wr = &mut w[k * cols + a + 1..(k + 1) * cols];
+                            for (x, &uu) in wr.iter_mut().zip(urow) {
+                                *x -= ek * uu;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1347,9 +1616,57 @@ mod tests {
         };
         let (eg, er) = (out_err(&g), out_err(&r));
         assert!(eg < 0.8 * er, "gptq {eg} vs rtn {er}");
+        // Act-order: same ladder AND same rungs as RTN (static groups).
+        let perm = act_order_perm(&hdiag);
+        assert_eq!(perm[0], 5, "the loud channel goes first");
+        let mut h2 = vec![0f64; cols * cols];
+        for s in 0..t {
+            for i in 0..cols {
+                for j in 0..cols {
+                    h2[i * cols + j] += x[s * cols + i] as f64 * x[s * cols + j] as f64;
+                }
+            }
+        }
+        let (up, _) = gptq_fold_operator(permute_sym(&h2, cols, &perm), cols, 0.01);
+        let ga = gptq_quantize_q4tp_act_order(&w, rows, cols, &up, &dead, &perm, 2);
+        let ea = out_err(&ga);
+        assert!(ea < 0.8 * er, "act-order {ea} vs rtn {er}");
+        let (po2, _, _) = cortiq_core::quant::q4tp_sections(rows, cols);
+        assert_eq!(&ga[po2..], &r[po2..], "act-order keeps the converter's ladder and rungs");
         // Same ladder parameters as the converter (only nibbles/codes move).
         let (po, _, _) = cortiq_core::quant::q4tp_sections(rows, cols);
         assert_eq!(&g[po..po + rows * 4], &r[po..po + rows * 4]);
+    }
+
+    #[test]
+    fn hessian_cache_roundtrip_is_exact_and_dedups() {
+        use cortiq_engine::gptq_capture::HessianAcc;
+        let n = 5;
+        let mk = |k: f64| {
+            let mut h = vec![0f64; n * n];
+            for i in 0..n {
+                for j in 0..n {
+                    h[i * n + j] = k * (1 + i.min(j)) as f64 + 0.125 * (i + j) as f64;
+                }
+            }
+            HessianAcc { cols: n, h, sumsq: (0..n).map(|i| k + i as f64).collect(), count: 7 }
+        };
+        let mut m = std::collections::HashMap::new();
+        m.insert("a.q".to_string(), mk(1.5));
+        m.insert("a.k".to_string(), mk(1.5));
+        m.insert("b".to_string(), mk(-2.25));
+        let p = std::env::temp_dir().join(format!("cortiq-hess-{}.bin", std::process::id()));
+        save_hessians(p.to_str().unwrap(), &m).unwrap();
+        // two unique payloads: header + 2 × (names, cols, count, len, sumsq, upper)
+        let back = load_hessians(p.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(back.len(), 3);
+        for (k, v) in &m {
+            let b = &back[k];
+            assert_eq!((b.cols, b.count), (v.cols, v.count));
+            assert_eq!(b.sumsq, v.sumsq);
+            assert_eq!(b.h, v.h);
+        }
     }
 
     /// With an identity Hessian GPTQ has nothing to fold: it must reproduce

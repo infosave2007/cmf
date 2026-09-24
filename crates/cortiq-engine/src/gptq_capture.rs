@@ -135,20 +135,89 @@ fn gram_upper_add(h: &mut [f64], xs: &[f32], b: usize, cols: usize) {
     std::thread::scope(|s| {
         for k in 0..nth {
             s.spawn(move || {
-                let mut i = k;
+                // Rows in pairs; pair p goes to thread p % nth. Each (i, j)
+                // belongs to exactly one thread (the owner of row i).
+                let mut i = 2 * k;
                 while i < cols {
-                    let xi = &xt[i * b..(i + 1) * b];
-                    for j in i..cols {
-                        let xj = &xt[j * b..(j + 1) * b];
-                        let d = dot_f32(xi, xj);
-                        // Each (i, j) belongs to exactly one thread (row i).
-                        unsafe { *hp.0.add(i * cols + j) += d as f64 };
-                    }
-                    i += nth;
+                    // SAFETY: disjoint rows of H per thread (see above).
+                    unsafe { gram_pair_dispatch(xt, b, cols, i, hp.0) };
+                    i += 2 * nth;
                 }
             });
         }
     });
+}
+
+unsafe fn gram_pair_dispatch(xt: &[f32], b: usize, cols: usize, i: usize, h: *mut f64) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+        {
+            return unsafe { gram_pair_avx2(xt, b, cols, i, h) };
+        }
+    }
+    unsafe { gram_pair(xt, b, cols, i, h) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn gram_pair_avx2(xt: &[f32], b: usize, cols: usize, i: usize, h: *mut f64) {
+    unsafe { gram_pair(xt, b, cols, i, h) }
+}
+
+/// Upper-triangle entries of rows `i` and `i+1`: a 2×4 register block of
+/// 8-lane accumulators over the batch axis (10 vector registers — fits the
+/// 16 of AVX2), so each loaded activation lane feeds 4 or 2 products
+/// instead of one.
+#[inline(always)]
+unsafe fn gram_pair(xt: &[f32], b: usize, cols: usize, i: usize, h: *mut f64) {
+    let two = i + 1 < cols;
+    let a0 = &xt[i * b..(i + 1) * b];
+    let a1 = if two { &xt[(i + 1) * b..(i + 2) * b] } else { a0 };
+    let n8 = b / 8;
+    let mut j = i;
+    while j + 4 <= cols {
+        let ys = [
+            &xt[j * b..(j + 1) * b],
+            &xt[(j + 1) * b..(j + 2) * b],
+            &xt[(j + 2) * b..(j + 3) * b],
+            &xt[(j + 3) * b..(j + 4) * b],
+        ];
+        let mut acc = [[[0f32; 8]; 4]; 2];
+        for c in 0..n8 {
+            let x0: &[f32; 8] = a0[c * 8..c * 8 + 8].try_into().unwrap();
+            let x1: &[f32; 8] = a1[c * 8..c * 8 + 8].try_into().unwrap();
+            for q in 0..4 {
+                let y: &[f32; 8] = ys[q][c * 8..c * 8 + 8].try_into().unwrap();
+                for l in 0..8 {
+                    acc[0][q][l] += x0[l] * y[l];
+                    acc[1][q][l] += x1[l] * y[l];
+                }
+            }
+        }
+        for q in 0..4 {
+            let mut s0 = acc[0][q].iter().sum::<f32>();
+            let mut s1 = acc[1][q].iter().sum::<f32>();
+            for t in n8 * 8..b {
+                s0 += a0[t] * ys[q][t];
+                s1 += a1[t] * ys[q][t];
+            }
+            let jj = j + q;
+            unsafe { *h.add(i * cols + jj) += s0 as f64 };
+            if two && jj > i {
+                unsafe { *h.add((i + 1) * cols + jj) += s1 as f64 };
+            }
+        }
+        j += 4;
+    }
+    while j < cols {
+        let y = &xt[j * b..(j + 1) * b];
+        unsafe { *h.add(i * cols + j) += dot_f32(a0, y) as f64 };
+        if two && j > i {
+            unsafe { *h.add((i + 1) * cols + j) += dot_f32(a1, y) as f64 };
+        }
+        j += 1;
+    }
 }
 
 #[inline]
