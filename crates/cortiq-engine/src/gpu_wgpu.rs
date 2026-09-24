@@ -15197,7 +15197,11 @@ struct GraphX {
 
 /// Bind group from explicit (binding, buffer) pairs — the ATTEND_X entry
 /// points each read a different subset of their module's bindings.
-fn bind_pairs(c: &Ctx, layout: &wgpu::BindGroupLayout, pairs: &[(u32, &wgpu::Buffer)]) -> wgpu::BindGroup {
+fn bind_pairs(
+    c: &Ctx,
+    layout: &wgpu::BindGroupLayout,
+    pairs: &[(u32, &wgpu::Buffer)],
+) -> wgpu::BindGroup {
     let e: Vec<_> = pairs.iter().map(|(i, b)| bind_buf(*i, b)).collect();
     c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("attend-x"),
@@ -15214,13 +15218,17 @@ fn graph_geom_problem(
     hd: usize,
 ) -> Option<&'static str> {
     if c.graph_x.is_none() {
-        return Some("per-layer attention geometry: the attend-x module did not build on this device");
+        return Some(
+            "per-layer attention geometry: the attend-x module did not build on this device",
+        );
     }
     if g.nkv == 0 || nh % g.nkv != 0 {
         return Some("per-layer attention geometry: KV heads must divide the Q heads");
     }
     if g.dv == 0 || g.dv % 4 != 0 || g.dv > hd || g.dv > 256 {
-        return Some("per-layer attention geometry: V width must be a multiple of 4 in 4..=head_dim");
+        return Some(
+            "per-layer attention geometry: V width must be a multiple of 4 in 4..=head_dim",
+        );
     }
     if g.rd > hd || g.rd % 2 != 0 || g.invf.len() < g.rd / 2 {
         return Some("per-layer attention geometry: rotary width / RoPE table out of range");
@@ -16158,7 +16166,13 @@ fn kv_mirror_ensure_x<'a>(
                 for (src_b, dst_b, width) in [(&old.k, &fresh.k, hd), (&old.v, &fresh.v, dv)] {
                     let src = (h * old.cap * width * 4) as u64;
                     let dst = (h * want_cap * width * 4) as u64;
-                    enc.copy_buffer_to_buffer(src_b, src, dst_b, dst, (copy_pos * width * 4) as u64);
+                    enc.copy_buffer_to_buffer(
+                        src_b,
+                        src,
+                        dst_b,
+                        dst,
+                        (copy_pos * width * 4) as u64,
+                    );
                 }
             }
             submit(c, finish_enc(enc));
@@ -16175,7 +16189,13 @@ fn kv_mirror_ensure_x<'a>(
 /// wide; host V rows are `hd` wide too, zero-padded past `dv`, and are
 /// compacted to the mirror's `dv`. False (nothing written) when the host
 /// holds fewer than `to` rows for some head.
-fn kv_mirror_seed_x(c: &Ctx, m: &mut KvMirror, cpu_k: &[Vec<f32>], cpu_v: &[Vec<f32>], to: usize) -> bool {
+fn kv_mirror_seed_x(
+    c: &Ctx,
+    m: &mut KvMirror,
+    cpu_k: &[Vec<f32>],
+    cpu_v: &[Vec<f32>],
+    to: usize,
+) -> bool {
     let (nkv, hd, dv, cap) = (m.nkv, m.hd, m.dv, m.cap);
     if m.synced >= to {
         return true;
@@ -26184,9 +26204,7 @@ pub fn forward_batch_graph(
                 shared_gated,
                 route_scale,
             } => {
-                if *top_k >= 16
-                    || *n_exp > 256
-                    || experts.len() != n_exp + usize::from(*has_shared)
+                if *top_k >= 16 || *n_exp > 256 || experts.len() != n_exp + usize::from(*has_shared)
                 {
                     bgraph_refused("site:5979");
                     return batch_outcome(o1_started || state_started, false);
@@ -26626,7 +26644,16 @@ pub fn forward_batch_graph(
                     geom: Some(g),
                     ..
                 } if o1.get(li).is_none_or(|v| v.is_none()) => {
-                    let e = kv_mirror_ensure_x(c, &mut kvm, (kv_id, li), g.nkv, hd, g.dv, cap, g.window);
+                    let e = kv_mirror_ensure_x(
+                        c,
+                        &mut kvm,
+                        (kv_id, li),
+                        g.nkv,
+                        hd,
+                        g.dv,
+                        cap,
+                        g.window,
+                    );
                     if e.synced > pos0 {
                         bgraph_refused("KV mirror is ahead of batch position");
                         return batch_outcome(true, false);
@@ -26789,7 +26816,8 @@ pub fn forward_batch_graph(
             // decode kernel's bit for bit (`q8_2f_matvec_b`).
             7 => {
                 let gx = c.graph_x.as_ref().expect("gemmable checked graph_x");
-                let p_buf = uniform_u32x4(c, [(cols / 4) as u32, rows as u32, cols as u32, k as u32]);
+                let p_buf =
+                    uniform_u32x4(c, [(cols / 4) as u32, rows as u32, cols as u32, k as u32]);
                 let bind = bind_pairs(c, &gx.q82_l, &[(0, &m.buf), (1, xs), (2, y), (3, &p_buf)]);
                 let mut pass = begin_pass(enc);
                 pass.set_pipeline(&gx.q82_b);
@@ -27391,19 +27419,18 @@ pub fn forward_batch_graph(
                     let mut pass = begin_pass(&mut enc);
                     for i in 0..k {
                         let p = positions[i];
-                        let rope_u = uniform_u32x8(
-                            c,
-                            [
-                                nh as u32,
-                                g.nkv as u32,
-                                hd as u32,
-                                g.rd as u32,
-                                p as u32,
-                                flags(q_norm.is_some(), k_norm.is_some(), *late_qk_norm),
-                                eps.to_bits(),
-                                i as u32,
-                            ],
-                        );
+                        // Fresh, not the content-keyed cache: a long prompt
+                        // would park one cached uniform per position there.
+                        let rope_u = unif(&[
+                            nh as u32,
+                            g.nkv as u32,
+                            hd as u32,
+                            g.rd as u32,
+                            p as u32,
+                            flags(q_norm.is_some(), k_norm.is_some(), *late_qk_norm),
+                            eps.to_bits(),
+                            i as u32,
+                        ]);
                         let kvx_u = unif(&[
                             g.nkv as u32,
                             hd as u32,
@@ -27444,7 +27471,11 @@ pub fn forward_batch_graph(
                         pass.dispatch_workgroups((nh + g.nkv) as u32, 1, 1);
                         state_started = true;
                         pass.set_pipeline(&gx.kv_append);
-                        pass.set_bind_group(0, &bg(&gx.kv_l, &[&kb_b, &vb_b, kbuf, vbuf, &kvx_u]), &[]);
+                        pass.set_bind_group(
+                            0,
+                            &bg(&gx.kv_l, &[&kb_b, &vb_b, kbuf, vbuf, &kvx_u]),
+                            &[],
+                        );
                         pass.dispatch_workgroups(((g.nkv * hd) as u32).div_ceil(256), 1, 1);
                         if g.window.is_none() && n > ATTEND_SPLIT_MIN {
                             pass.set_pipeline(&gx.part);
@@ -28738,7 +28769,13 @@ pub fn kv_mirror_pull_host(
         if m.ring.is_none() && m.cap < to {
             return None;
         }
-        (m.k.clone(), m.v.clone(), m.cap, m.dv, m.resident_from().max(from).min(to))
+        (
+            m.k.clone(),
+            m.v.clone(),
+            m.cap,
+            m.dv,
+            m.resident_from().max(from).min(to),
+        )
     };
     let n = to - from;
     let mut k = vec![0.0f32; n * nkv * hd];
@@ -59562,6 +59599,150 @@ pub fn sparse_attend_for_test(
     );
     let ok = readback(c, enc, &ob, &stage, (nh * hd * 4) as u64, out);
     drop(sc);
+    ok
+}
+
+/// The per-layer-geometry attention kernels on their own (component test):
+/// append every position's K (`hd` wide) and V (`dv` wide) rows of
+/// `[npos × nkv × …]` through `kv_append_x` — into a ring of
+/// `kv_ring_cap(window)` rows for a windowed layer, else one row per
+/// position — then attend the last position's queries `q` (`nh × hd`)
+/// with `gqa_attend_x`, or with `gqa_attend_part_x` + `gqa_attend_merge_x`
+/// when `split`. `out` is `nh × dv`. False when the device or the module
+/// is missing.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn attend_x_for_test(
+    q: &[f32],
+    k_rows: &[f32],
+    v_rows: &[f32],
+    sink: Option<&[f32]>,
+    window: Option<usize>,
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    dv: usize,
+    scale: f32,
+    split: bool,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let Some(gx) = c.graph_x.as_ref() else {
+        return false;
+    };
+    let npos = k_rows.len() / (nkv * hd).max(1);
+    if npos == 0
+        || q.len() != nh * hd
+        || v_rows.len() != npos * nkv * dv
+        || out.len() != nh * dv
+        || sink.is_some_and(|s| s.len() != nh)
+    {
+        return false;
+    }
+    let cap = match window {
+        Some(w) => kv_ring_cap(w),
+        None => npos.next_power_of_two(),
+    };
+    let kb = storage_bytes(c, bytemuck::cast_slice(k_rows));
+    let vb = storage_bytes(c, bytemuck::cast_slice(v_rows));
+    let qb = storage_bytes(c, bytemuck::cast_slice(q));
+    let zeros = vec![0f32; nh];
+    let sb = storage_bytes(c, bytemuck::cast_slice(sink.unwrap_or(&zeros)));
+    let kc = rw_f32(c, nkv * cap * hd, true);
+    let vc = rw_f32(c, nkv * cap * dv, true);
+    let ob = rw_f32(c, nh * dv, true);
+    let nc = cap.div_ceil(ATTEND_X_CK);
+    let xacc = rw_f32(c, nh * nc * dv, false);
+    let xml = rw_f32(c, nh * nc * 2, false);
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("ax-test"),
+        });
+    let mut keep = Vec::new();
+    {
+        let mut pass = begin_pass(&mut enc);
+        for p in 0..npos {
+            let u = uniform_u32x8(
+                c,
+                [
+                    nkv as u32, hd as u32, dv as u32, cap as u32, p as u32, p as u32, 0, 0,
+                ],
+            );
+            let bgk = bind_pairs(
+                c,
+                &gx.kv_l,
+                &[(0, &kb), (1, &vb), (2, &kc), (3, &vc), (4, &u)],
+            );
+            pass.set_pipeline(&gx.kv_append);
+            pass.set_bind_group(0, &bgk, &[]);
+            pass.dispatch_workgroups(((nkv * hd) as u32).div_ceil(256), 1, 1);
+            keep.push(u);
+        }
+        let n = window.map_or(npos, |w| npos.min(w));
+        let au = c
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("ax-test-u"),
+                contents: bytemuck::cast_slice(&[
+                    nh as u32,
+                    (nh / nkv) as u32,
+                    hd as u32,
+                    dv as u32,
+                    cap as u32,
+                    n as u32,
+                    (npos - n) as u32,
+                    scale.to_bits(),
+                    u32::from(sink.is_some()),
+                    nc as u32,
+                    0,
+                    0,
+                ]),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        if split {
+            let bgp = bind_pairs(
+                c,
+                &gx.part_l,
+                &[
+                    (0, &qb),
+                    (1, &kc),
+                    (2, &vc),
+                    (4, &au),
+                    (6, &xacc),
+                    (7, &xml),
+                ],
+            );
+            let bgm = bind_pairs(
+                c,
+                &gx.merge_l,
+                &[(3, &ob), (4, &au), (5, &sb), (6, &xacc), (7, &xml)],
+            );
+            pass.set_pipeline(&gx.part);
+            pass.set_bind_group(0, &bgp, &[]);
+            pass.dispatch_workgroups(nh as u32, n.div_ceil(ATTEND_X_CK) as u32, 1);
+            pass.set_pipeline(&gx.merge);
+            pass.set_bind_group(0, &bgm, &[]);
+            pass.dispatch_workgroups(nh as u32, 1, 1);
+        } else {
+            let bga = bind_pairs(
+                c,
+                &gx.attend_l,
+                &[(0, &qb), (1, &kc), (2, &vc), (3, &ob), (4, &au), (5, &sb)],
+            );
+            pass.set_pipeline(&gx.attend);
+            pass.set_bind_group(0, &bga, &[]);
+            pass.dispatch_workgroups(nh as u32, 1, 1);
+        }
+    }
+    let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("ax-test-stage"),
+        size: (nh * dv * 4) as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let ok = readback(c, enc, &ob, &stage, (nh * dv * 4) as u64, out);
+    drop(keep);
     ok
 }
 

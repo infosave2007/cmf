@@ -1766,6 +1766,11 @@ impl Pipeline {
                     || matches!(&lw.ffn, FfnKind::Dense(d) if d.act != Act::Silu)
             })
         {
+            // The Metal graphs have no per-layer attention geometry (the
+            // wgpu graphs do): say so once, by name.
+            if let Some(reason) = self.graph_attn_decline_reason() {
+                self.note_graph_decline("metal block graph", reason);
+            }
             if std::env::var("CMF_GRAPH_DBG").is_ok() {
                 eprintln!(
                     "block-graph: arch ineligible (swa={} gattn={} hpl={} vnorm={} scale_delta={:.2e})",
@@ -3793,8 +3798,13 @@ impl Pipeline {
                 }
                 let positions: Vec<usize> = (pos..end).collect();
                 let mut run = 0usize;
-                let outcome =
-                    self.try_batch_graph_wgpu_prefix(&mut hiddens, &positions, bk, None, Some(&mut run));
+                let outcome = self.try_batch_graph_wgpu_prefix(
+                    &mut hiddens,
+                    &positions,
+                    bk,
+                    None,
+                    Some(&mut run),
+                );
                 match outcome {
                     crate::gpu::BatchGraphOutcome::Completed => {
                         let hb = if run < self.num_layers {
@@ -3815,7 +3825,15 @@ impl Pipeline {
                         self.finish_generation(&mut mtp, &mut router, true);
                         return Err("batched prefix prefill failed after admission".into());
                     }
-                    crate::gpu::BatchGraphOutcome::Declined => break,
+                    crate::gpu::BatchGraphOutcome::Declined => {
+                        // Earlier chunks left their prefix rows on the
+                        // device only: the host walk below needs them.
+                        #[cfg(feature = "gpu")]
+                        if pos > pos0 {
+                            self.pull_lagging_host_kv(0, self.num_layers, pos);
+                        }
+                        break;
+                    }
                 }
             }
             if std::env::var("CMF_PREFILL_PROF").is_ok() {
@@ -4305,7 +4323,9 @@ impl Pipeline {
                 if !logits.is_empty() {
                     let path = std::path::Path::new(&dir).join(format!("step{generated:05}.f32"));
                     let bytes: Vec<u8> = logits.iter().flat_map(|v| v.to_le_bytes()).collect();
-                    if let Err(e) = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, &bytes)) {
+                    if let Err(e) =
+                        std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, &bytes))
+                    {
                         eprintln!("logit dump: failed to write {}: {e}", path.display());
                     }
                 }
@@ -7011,7 +7031,7 @@ impl Pipeline {
             let hs = self.hidden_size;
             while pos < ids.len() {
                 let end = (pos + chunk).min(ids.len());
-                let hb = self.prefill_batch_masked(&ids[pos..end], pos, task_mask);
+                let hb = self.prefill_rows(&ids[pos..end], pos, task_mask)?;
                 self.check_forward_graph("forward_ids batched prefill", end - 1)?;
                 hidden.copy_from_slice(&hb[(end - pos - 1) * hs..]);
                 pos = end;
@@ -7298,7 +7318,7 @@ impl Pipeline {
                 while pos < n {
                     let end = (pos + CHUNK).min(n);
                     let bsz = end - pos;
-                    let hb = self.prefill_batch_masked(&ids[pos..end], pos, task_mask);
+                    let hb = self.prefill_rows(&ids[pos..end], pos, task_mask)?;
                     self.nll_check_graph("batched prefill", pos)?;
                     let mut k0 = 0usize;
                     while k0 < bsz {
@@ -7881,6 +7901,63 @@ impl Pipeline {
         task_mask: Option<&TaskMask>,
     ) -> Vec<f32> {
         self.prefill_batch_span(PrefillIn::Ids(ids), start_pos, task_mask, 0, usize::MAX)
+    }
+
+    /// One prompt chunk through the whole stack, post-stack rows out (no
+    /// final norm) — the ingest generation uses, shared by scoring and
+    /// `forward_ids` so they measure the same execution: the batched wgpu
+    /// graph's device prefix plus the host's batched walk for the rest when
+    /// `batch_prefix_prefill` holds and the graph admits the chunk, else
+    /// the host's chunked prefill. Err only when a graph that had mutated
+    /// device state failed.
+    fn prefill_rows(
+        &mut self,
+        ids: &[u32],
+        pos: usize,
+        task_mask: Option<&TaskMask>,
+    ) -> Result<Vec<f32>, String> {
+        #[cfg(not(target_os = "macos"))]
+        if task_mask.is_none() && !self.o1_active() && ids.len() > 1 && self.batch_prefix_prefill()
+        {
+            let hs = self.hidden_size;
+            let bk = ids.len();
+            let mut hiddens = vec![0f32; bk * hs];
+            for (j, &id) in ids.iter().enumerate() {
+                hiddens[j * hs..(j + 1) * hs].copy_from_slice(&self.embed_single(id));
+            }
+            let positions: Vec<usize> = (pos..pos + bk).collect();
+            let mut run = 0usize;
+            match self.try_batch_graph_wgpu_prefix(
+                &mut hiddens,
+                &positions,
+                bk,
+                None,
+                Some(&mut run),
+            ) {
+                crate::gpu::BatchGraphOutcome::Completed => {
+                    return Ok(if run < self.num_layers {
+                        self.prefill_batch_span(
+                            PrefillIn::Hidden(&hiddens),
+                            pos,
+                            None,
+                            run,
+                            self.num_layers,
+                        )
+                    } else {
+                        hiddens
+                    });
+                }
+                crate::gpu::BatchGraphOutcome::Failed => {
+                    return Err("batched prefix prefill failed after admission".into());
+                }
+                crate::gpu::BatchGraphOutcome::Declined => {
+                    // Rows an earlier chunk left on the device only.
+                    #[cfg(feature = "gpu")]
+                    self.pull_lagging_host_kv(0, self.num_layers, pos);
+                }
+            }
+        }
+        Ok(self.prefill_batch_masked(ids, pos, task_mask))
     }
 
     /// The layer-major batched walk over a layer span [from..upto_excl):
@@ -8826,12 +8903,15 @@ impl Pipeline {
         }) {
             return Some("sandwich norms / layer scale with per-layer geometry");
         }
-        if self
-            .weights
-            .layers
-            .iter()
-            .any(|lw| matches!(&lw.attn, AttnKind::Full { output_gate: true, .. }))
-            && self.v_head_dim.is_some()
+        if self.weights.layers.iter().any(|lw| {
+            matches!(
+                &lw.attn,
+                AttnKind::Full {
+                    output_gate: true,
+                    ..
+                }
+            )
+        }) && self.v_head_dim.is_some()
         {
             return Some("gated attention with V narrower than K");
         }
@@ -16626,14 +16706,20 @@ mod tests {
         let plain = || create_test_pipeline(8, 16, 2, 1, 4, 2, 32);
         assert_eq!(plain().graph_attn_decline_reason(), None);
         assert_eq!(plain().wgpu_graph_attn_decline(), None);
-        assert!(plain().graph_attn_geom(0).is_none(), "uniform models keep the historical arms");
+        assert!(
+            plain().graph_attn_geom(0).is_none(),
+            "uniform models keep the historical arms"
+        );
         let mut q = plain();
         q.set_layer_sinks(1, vec![0.25, -0.25]).unwrap();
         assert_eq!(
             q.graph_attn_decline_reason(),
             Some("learned attention sinks")
         );
-        assert_eq!(q.graph_attn_geom(1).unwrap().sink, Some(&[0.25f32, -0.25][..]));
+        assert_eq!(
+            q.graph_attn_geom(1).unwrap().sink,
+            Some(&[0.25f32, -0.25][..])
+        );
         let mut q = plain();
         q.set_attn_geometry(None, Some(2)).unwrap();
         assert_eq!(
