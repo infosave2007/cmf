@@ -7,6 +7,9 @@
 //! mimo_audio_dump tower --src (HF_DIR | X.cmf) --out DIR (--wav F | --mel M.npy) [--codes C.npy]
 //!     feats.npy, codes_exact.npy, codes_bf16books.npy, embeds.npy (from --codes,
 //!     else from codes_bf16books), embeds_own.npy, tower.json (timings)
+//! mimo_audio_dump calib --src X.cmf --wav-dir D --out H.bin
+//!     GPTQ input Hessians of every tower linear over the clips in D, in the
+//!     `cortiq quantize-gptq --codec q4tp --hessians H.bin` cache format
 //! ```
 //!
 //! The array names match the oracle's, so `mimo_audio_ref.py cmp --ref R
@@ -89,6 +92,52 @@ fn load_codes(path: &Path) -> (Vec<usize>, Vec<u32>) {
         other => panic!("{}: codes dtype {other}", path.display()),
     };
     (shape, v)
+}
+
+/// The `cortiq quantize-gptq --hessians` cache (`CMFHESS1`, the layout of
+/// cortiq-cli's `save_hessians`): identical Hessians are stored once under
+/// all their names, each as its upper triangle.
+fn save_hessians(path: &Path, hess: &std::collections::HashMap<String, cortiq_engine::gptq_capture::HessianAcc>) {
+    use std::io::Write;
+    let mut names: Vec<&String> = hess.keys().collect();
+    names.sort();
+    let mut uniq: Vec<(Vec<&String>, &cortiq_engine::gptq_capture::HessianAcc)> = Vec::new();
+    for n in names {
+        let a = &hess[n];
+        if let Some(u) = uniq
+            .iter_mut()
+            .find(|(_, b)| b.cols == a.cols && b.count == a.count && b.sumsq == a.sumsq && b.h == a.h)
+        {
+            u.0.push(n);
+        } else {
+            uniq.push((vec![n], a));
+        }
+    }
+    let mut f = std::io::BufWriter::with_capacity(1 << 22, std::fs::File::create(path).unwrap());
+    f.write_all(b"CMFHESS1").unwrap();
+    f.write_all(&(uniq.len() as u64).to_le_bytes()).unwrap();
+    for (ns, a) in &uniq {
+        f.write_all(&(ns.len() as u32).to_le_bytes()).unwrap();
+        for n in ns {
+            f.write_all(&(n.len() as u32).to_le_bytes()).unwrap();
+            f.write_all(n.as_bytes()).unwrap();
+        }
+        f.write_all(&(a.cols as u64).to_le_bytes()).unwrap();
+        f.write_all(&(a.count as u64).to_le_bytes()).unwrap();
+        f.write_all(&(a.h.len() as u64).to_le_bytes()).unwrap();
+        for v in &a.sumsq {
+            f.write_all(&v.to_le_bytes()).unwrap();
+        }
+        let n = a.cols;
+        if a.h.len() == n * n {
+            for i in 0..n {
+                for v in &a.h[i * n + i..i * n + n] {
+                    f.write_all(&v.to_le_bytes()).unwrap();
+                }
+            }
+        }
+    }
+    f.flush().unwrap();
 }
 
 fn arg(args: &[String], name: &str) -> Option<String> {
@@ -208,8 +257,37 @@ fn main() {
             println!("{meta}");
             assert_eq!(emb_own.n_tokens, k, "placeholder count != encoder rows");
         }
+        "calib" => {
+            let src = PathBuf::from(arg(&args, "--src").expect("--src"));
+            let model = Arc::new(cortiq_core::CmfModel::open(&src).expect("open cmf"));
+            let audio = MimoAudio::from_model(&model).expect("load towers");
+            let dir = PathBuf::from(arg(&args, "--wav-dir").expect("--wav-dir"));
+            let mut wavs: Vec<PathBuf> = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|e| e == "wav"))
+                .collect();
+            wavs.sort();
+            let t0 = Instant::now();
+            cortiq_engine::gptq_capture::begin(true);
+            let mut frames = 0usize;
+            for w in &wavs {
+                let emb = audio.embed_wav(&std::fs::read(w).unwrap()).unwrap();
+                frames += emb.n_tokens;
+                eprintln!("  {} -> {} rows ({:.0}s)", w.display(), emb.n_tokens, t0.elapsed().as_secs_f64());
+            }
+            let hess = cortiq_engine::gptq_capture::end();
+            save_hessians(&out, &hess);
+            println!(
+                "{} clips, {frames} LLM rows, {} linears -> {} ({:.0}s)",
+                wavs.len(),
+                hess.len(),
+                out.display(),
+                t0.elapsed().as_secs_f64()
+            );
+        }
         _ => {
-            eprintln!("usage: mimo_audio_dump (decode|frontend|tower) --out ... (see the source header)");
+            eprintln!("usage: mimo_audio_dump (decode|frontend|tower|calib) --out ... (see the source header)");
             std::process::exit(2);
         }
     }
