@@ -691,6 +691,96 @@ pub struct QwenAttnCfg<'a> {
     /// Qwen2-family q/k/v projection biases (added after the matvecs).
     pub bias: Option<(&'a [f32], &'a [f32], &'a [f32])>,
     pub pool: Option<&'a Pool>,
+    /// Width of each V head, ≤ `head_dim` (MiMo-V2: 128 against 192-wide
+    /// Q/K heads; every other family: `head_dim`). V projects to
+    /// `num_kv_heads·v_head_dim`, is zero-padded to `head_dim` per head
+    /// inside the KV cache (the pad rows carry no value, so the attend's
+    /// pad dims come out exactly 0), and the attention output is
+    /// compacted back to `num_heads·v_head_dim` before o_proj.
+    pub v_head_dim: usize,
+}
+
+/// `[n × vd]` heads → `[n × hd]`, each head zero-padded at its tail (a V
+/// row narrower than the cache's head width). A no-copy move when vd == hd.
+pub(crate) fn pad_heads(src: Vec<f32>, n: usize, vd: usize, hd: usize) -> Vec<f32> {
+    if vd == hd {
+        return src;
+    }
+    assert!(
+        vd < hd && src.len() == n * vd,
+        "pad_heads: {} values for {n} heads of {vd} (cache width {hd})",
+        src.len()
+    );
+    let mut out = take_buf(n * hd);
+    for h in 0..n {
+        out[h * hd..h * hd + vd].copy_from_slice(&src[h * vd..(h + 1) * vd]);
+    }
+    let mut src = src;
+    recycle_buf(&mut src);
+    out
+}
+
+/// `[rows × n × hd]` → `[rows × n × vd]`: drop each head's pad tail (the
+/// inverse of `pad_heads` on the attention output, before o_proj).
+pub(crate) fn compact_heads(src: Vec<f32>, n: usize, hd: usize, vd: usize) -> Vec<f32> {
+    if vd == hd {
+        return src;
+    }
+    let rows = src.len() / (n * hd);
+    assert!(
+        vd < hd && src.len() == rows * n * hd,
+        "compact_heads: {} values for {n} heads of {hd}",
+        src.len()
+    );
+    let mut out = take_buf(rows * n * vd);
+    for r in 0..rows * n {
+        out[r * vd..(r + 1) * vd].copy_from_slice(&src[r * hd..r * hd + vd]);
+    }
+    let mut src = src;
+    recycle_buf(&mut src);
+    out
+}
+
+/// V narrower than the head width is compacted out of the attention
+/// output before o_proj, which leaves no defined width for an output gate
+/// (Qwen3.5 / Laguna gates are head_dim wide). The loader refuses the
+/// combination; this keeps a hand-built cfg from running it silently.
+#[inline]
+fn check_v_width(cfg: &QwenAttnCfg) {
+    assert!(
+        cfg.v_head_dim > 0 && cfg.v_head_dim <= cfg.head_dim,
+        "v_head_dim {} must be in 1..={}",
+        cfg.v_head_dim,
+        cfg.head_dim
+    );
+    assert!(
+        cfg.v_head_dim == cfg.head_dim || (!cfg.output_gate && cfg.softplus_gate.is_none()),
+        "an attention output gate needs V heads as wide as Q/K heads"
+    );
+}
+
+/// A layer's sinks are one logit per Q head; anything else is a loader
+/// bug that would otherwise attend with some other head's sink.
+#[inline]
+fn check_sinks(cache: &LayerKvCache, nh: usize) {
+    if let Some(s) = cache.sinks.as_deref() {
+        assert_eq!(
+            s.len(),
+            nh,
+            "layer sinks: {} logits for {nh} Q heads",
+            s.len()
+        );
+    }
+}
+
+/// The learned sink logits of the Q heads `[h0, h1)` of `cache`'s layer
+/// (empty when the layer has none).
+#[inline]
+fn sink_slice(cache: &LayerKvCache, h0: usize, h1: usize) -> &[f32] {
+    match cache.sinks.as_deref() {
+        Some(s) => &s[h0..h1],
+        None => &[],
+    }
 }
 
 thread_local! {
@@ -761,7 +851,8 @@ fn project_matvecs(
     let (_, nkv, hd) = (cfg.num_heads, cfg.num_kv_heads, cfg.head_dim);
     let mut q_raw = take_buf(wq.rows());
     let mut k = take_buf(nkv * hd);
-    let mut v = take_buf(nkv * hd);
+    // V heads may be narrower than Q/K (MiMo-V2); padded before the cache.
+    let mut v = take_buf(nkv * cfg.v_head_dim);
     // QKV in ONE device submission (этап 4): three matvecs, one poll —
     // gated by the same discrete-card threshold as every GPU op. Any
     // refusal (budget/dtype/shard) falls through to the CPU path.
@@ -948,13 +1039,17 @@ fn finish_projection(
     };
 
     if cfg.v_norm {
+        let vd = cfg.v_head_dim;
         for g in 0..nkv {
-            vnorm_head(&mut v[g * hd..g * hd + hd], cfg.rms_eps);
+            vnorm_head(&mut v[g * vd..g * vd + vd], cfg.rms_eps);
         }
     }
     // qk-norm and partial RoPE (first rotary_dim dims of each head), in
     // the architecture's order.
     qk_norm_and_rope(cfg, &mut q, &mut k, nh, nkv, hd, position);
+    // V narrower than the cache's head width: zero-pad each head (the
+    // output is compacted back before o_proj by the caller).
+    let v = pad_heads(v, nkv, cfg.v_head_dim, hd);
     Projected { q, gate, k, v }
 }
 
@@ -989,6 +1084,7 @@ fn attend_all_heads_upto(
     out: &mut [f32],
     imp: &mut [f32],
 ) {
+    check_sinks(cache, nh);
     let nkv = nh / heads_per_kv;
     for g in 0..nkv {
         let stored = cache.head_len(g).min(upto);
@@ -1006,6 +1102,7 @@ fn attend_all_heads_upto(
             first,
             softcap,
             upto,
+            sink_slice(cache, g * heads_per_kv, (g + 1) * heads_per_kv),
         );
     }
 }
@@ -1034,6 +1131,7 @@ pub(crate) fn attend_all_heads_pool(
     softcap: f32,
     pool: Option<&crate::pool::Pool>,
 ) -> (Vec<f32>, Vec<f32>) {
+    check_sinks(cache, nh);
     let nkv = nh / heads_per_kv.max(1);
     let longest = (0..nkv).map(|g| cache.head_len(g)).max().unwrap_or(0);
     if let Some(pool) = pool
@@ -1063,7 +1161,16 @@ pub(crate) fn attend_all_heads_pool(
                     continue;
                 }
                 let first = window.map(|w| stored.saturating_sub(w)).unwrap_or(0);
-                cache.attend_group(&q[h * hd..(h + 1) * hd], g, out_h, probs_h, scale, first, softcap);
+                cache.attend_group(
+                    &q[h * hd..(h + 1) * hd],
+                    g,
+                    out_h,
+                    probs_h,
+                    scale,
+                    first,
+                    softcap,
+                    sink_slice(cache, h, h + 1),
+                );
             }
         };
         pool.run_rows(nh, &run);
@@ -1106,6 +1213,7 @@ pub(crate) fn attend_all_heads_pool(
             scale,
             first,
             softcap,
+            sink_slice(cache, g * heads_per_kv, (g + 1) * heads_per_kv),
         );
     }
     (attn_out, imp)
@@ -1159,6 +1267,7 @@ pub fn qwen_attention_core(
 ) -> Vec<f32> {
     let (nh, nkv, hd) = (cfg.num_heads, cfg.num_kv_heads, cfg.head_dim);
     let heads_per_kv = nh / nkv;
+    check_v_width(cfg);
     // A direct caller may have appended the completed boundary without
     // passing through the usual post-row hook. Seal before accepting another
     // exact row so the first row after B cannot re-open ordinary KV growth.
@@ -1180,7 +1289,7 @@ pub fn qwen_attention_core(
         if cfg.output_gate {
             apply_gate(&mut ao, &p.gate);
         }
-        return ao;
+        return compact_heads(ao, nh, hd, cfg.v_head_dim);
     }
     // O(1) prefill trace: while a nystrom layer is collecting, the exact
     // prompt pass also records this position's queries for the seal
@@ -1218,7 +1327,9 @@ pub fn qwen_attention_core(
         }
     }
     recycle_buf(&mut imp);
-    ao
+    // V narrower than the head width: the pad dims of every head are
+    // exactly 0 (zero V rows), drop them so o_proj reads nh·v_head_dim.
+    compact_heads(ao, nh, hd, cfg.v_head_dim)
 }
 
 /// Dense GQA attention for one position (QTensor weights, Qwen3.5 extras).
@@ -1246,6 +1357,8 @@ pub fn qwen_attention(
     let mut ao = qwen_attention_core(q_raw, k, v, cache, cfg);
     drop(prof);
     if let (Some(raw), Some((_, per_head))) = (projected.as_deref(), cfg.softplus_gate) {
+        // A gate is refused at load when V is narrower than the head
+        // (the core output is compacted), so ao is nh·head_dim here.
         apply_projected_gate(&mut ao, raw, per_head, cfg.head_dim);
     }
     let mut out = take_buf(cfg.hidden_size);
@@ -1280,6 +1393,11 @@ pub fn qwen_attention_batch(
     let (nh, nkv, hd) = (cfg.num_heads, cfg.num_kv_heads, cfg.head_dim);
     let heads_per_kv = nh / nkv;
     let qrows = wq.rows();
+    check_v_width(cfg);
+    // V row width per position: nkv·v_head_dim (== nkv·hd unless V heads
+    // are narrower, MiMo-V2); padded to hd per head before the append.
+    let vd = cfg.v_head_dim;
+    let vrow = nkv * vd;
     debug_assert_eq!(normed_all.len(), b * cfg.hidden_size);
 
     // A chunk that reaches the deferred barrier is walked row by row so the
@@ -1307,7 +1425,7 @@ pub fn qwen_attention_batch(
     // ── chunk-GEMM projections ──
     let mut q_all = take_buf(b * qrows);
     let mut k_all = take_buf(b * nkv * hd);
-    let mut v_all = take_buf(b * nkv * hd);
+    let mut v_all = take_buf(b * vrow);
     // One fused submission when the device is in play: three `matmat`
     // calls upload the SAME normed chunk three times and pay three round
     // trips per layer. Falls through to the per-projection path on any
@@ -1359,10 +1477,15 @@ pub fn qwen_attention_batch(
     // Batched causal attend: Accelerate on macOS, the portable NEON
     // micro-GEMM elsewhere on aarch64 (mobile prefill was per-position
     // — the quadratic wall).
+    // The batched attends below (device chunk_attend, the aarch64
+    // attend_chunk, the portable fallback) know neither a window nor a
+    // learned sink: such layers keep the per-position grouped attend,
+    // which carries both.
     let attend_ok = b >= 32
         && cache.mode == crate::kv_cache::KvMode::F32
         && cfg.softcap == 0.0 // capped scores: per-position attend (correctness first)
-        && cfg.window.is_none();
+        && cfg.window.is_none()
+        && cache.sinks.is_none();
     // The device can batch it on any architecture. That matters because
     // the CPU twin needs Accelerate or the NEON micro-GEMM, so x86 had
     // no batched attend at all and prefill fell back to a per-position
@@ -1423,7 +1546,7 @@ pub fn qwen_attention_batch(
         let pos = cfg.position + bi;
         let q_raw = &mut q_all[bi * qrows..(bi + 1) * qrows];
         let k = &mut k_all[bi * nkv * hd..(bi + 1) * nkv * hd];
-        let v = &mut v_all[bi * nkv * hd..(bi + 1) * nkv * hd];
+        let v = &mut v_all[bi * vrow..(bi + 1) * vrow];
         if let Some((bq, bk, bv)) = cfg.bias {
             for (x, bb) in q_raw.iter_mut().zip(bq) {
                 *x += bb;
@@ -1454,13 +1577,19 @@ pub fn qwen_attention_batch(
         }
         if cfg.v_norm {
             for g in 0..nkv {
-                vnorm_head(&mut v[g * hd..g * hd + hd], cfg.rms_eps);
+                vnorm_head(&mut v[g * vd..g * vd + vd], cfg.rms_eps);
             }
         }
         qk_norm_and_rope(cfg, &mut q, k, nh, nkv, hd, pos);
 
         cache.o1_push_q(&q);
-        cache.append(k, v, &[]);
+        if vd == hd {
+            cache.append(k, v, &[]);
+        } else {
+            let mut vp = pad_heads(v.to_vec(), nkv, vd, hd);
+            cache.append(k, &vp, &[]);
+            recycle_buf(&mut vp);
+        }
         if stash_q {
             q_rope_all[bi * nh * hd..(bi + 1) * nh * hd].copy_from_slice(&q);
             if cfg.output_gate {
@@ -1667,6 +1796,9 @@ pub fn qwen_attention_batch(
     drop(prof_attend);
 
     // ── chunk-GEMM output projection ──
+    // V narrower than the head width: drop every head's (zero) pad dims so
+    // o_proj reads b × nh·v_head_dim.
+    let mut ao_all = compact_heads(ao_all, nh, hd, vd);
     let mut out = vec![0.0f32; b * cfg.hidden_size];
     wo.matmat(&ao_all, b, &mut out, cfg.pool);
     recycle_buf(&mut q_all);
@@ -1695,9 +1827,12 @@ pub fn qwen_attention_nystrom(
     cache: &mut LayerKvCache,
     cfg: &QwenAttnCfg,
 ) -> Vec<f32> {
+    check_v_width(cfg);
     let p = project_position(hidden, wq, wk, wv, cfg, cfg.position);
     let mut projected = projected_gate(hidden, cfg);
-    let mut ao = cache.o1_step(&p.q, &p.k, &p.v, cfg.num_heads);
+    let ao = cache.o1_step(&p.q, &p.k, &p.v, cfg.num_heads);
+    // (p.v was padded to head_dim; drop the zero pad dims again.)
+    let mut ao = compact_heads(ao, cfg.num_heads, cfg.head_dim, cfg.v_head_dim);
     if std::env::var("CMF_O1_TRACE").is_ok() {
         eprintln!(
             "o1-trace cpu attn[..8] = {:?} (q[..4]={:?} k[..4]={:?})",
@@ -1736,6 +1871,8 @@ pub fn qwen_attention_pair(
 ) -> (Vec<f32>, Vec<f32>) {
     let (nh, nkv, hd) = (cfg.num_heads, cfg.num_kv_heads, cfg.head_dim);
     let heads_per_kv = nh / nkv;
+    check_v_width(cfg);
+    let vd = cfg.v_head_dim;
 
     // Preserve causal ordering across a deferred boundary. The ordinary
     // pair kernel is exact-only and would append both rows before a seal;
@@ -1757,8 +1894,8 @@ pub fn qwen_attention_pair(
     let mut q2r = take_buf(wq.rows());
     let mut k1 = take_buf(nkv * hd);
     let mut k2 = take_buf(nkv * hd);
-    let mut v1 = take_buf(nkv * hd);
-    let mut v2 = take_buf(nkv * hd);
+    let mut v1 = take_buf(nkv * vd);
+    let mut v2 = take_buf(nkv * vd);
     QTensor::matvec2_many(
         [wq, wk, wv],
         h1,
@@ -1808,10 +1945,13 @@ pub fn qwen_attention_pair(
     // the pair prefill caches raw V while singles cache normalized.
     if cfg.v_norm {
         for g in 0..nkv {
-            vnorm_head(&mut v1[g * hd..g * hd + hd], cfg.rms_eps);
-            vnorm_head(&mut v2[g * hd..g * hd + hd], cfg.rms_eps);
+            vnorm_head(&mut v1[g * vd..g * vd + vd], cfg.rms_eps);
+            vnorm_head(&mut v2[g * vd..g * vd + vd], cfg.rms_eps);
         }
     }
+    // V narrower than the head width: zero-pad each head for the cache.
+    let mut v1 = pad_heads(v1, nkv, vd, hd);
+    let mut v2 = pad_heads(v2, nkv, vd, hd);
 
     // O(1) prefill trace (see qwen_attention): lane order = position
     // order, so the collected buffer stays position-major.
@@ -1858,6 +1998,9 @@ pub fn qwen_attention_pair(
         recycle_buf(&mut g2);
     }
 
+    // V narrower than the head width: o_proj reads nh·v_head_dim.
+    let mut a1 = compact_heads(a1, nh, hd, vd);
+    let mut a2 = compact_heads(a2, nh, hd, vd);
     let mut o1 = take_buf(cfg.hidden_size);
     let mut o2 = take_buf(cfg.hidden_size);
     wo.matvec2(&a1, &a2, &mut o1, &mut o2, cfg.pool);
@@ -1898,26 +2041,334 @@ mod tests {
         let (nh, nkv, hd) = (16usize, 2usize, 128usize);
         let pool = crate::pool::Pool::new(3);
         for rows in [7usize, 96, 300] {
-            let cache = gqa_cache(nkv, hd, rows);
+            let mut cache = gqa_cache(nkv, hd, rows);
             let q: Vec<f32> = (0..nh * hd)
                 .map(|i| (((i * 29) % 113) as f32 / 113.0 - 0.5) * 1.7)
                 .collect();
-            for window in [None, Some(50usize)] {
-                let (a, ia) = attend_all_heads(&q, &cache, nh, nh / nkv, hd, 0.088, window, 0.0);
-                let (b, ib) = attend_all_heads_pool(
-                    &q,
-                    &cache,
-                    nh,
-                    nh / nkv,
-                    hd,
-                    0.088,
-                    window,
-                    0.0,
-                    Some(&pool),
+            // Learned sinks (MiMo-V2 SWA layers) ride both kernels too.
+            let sinks: Vec<f32> = (0..nh).map(|h| (h as f32 * 0.37).sin() * 3.0).collect();
+            for sink in [None, Some(sinks)] {
+                cache.sinks = sink.clone();
+                for window in [None, Some(50usize)] {
+                    let (a, ia) =
+                        attend_all_heads(&q, &cache, nh, nh / nkv, hd, 0.088, window, 0.0);
+                    let (b, ib) = attend_all_heads_pool(
+                        &q,
+                        &cache,
+                        nh,
+                        nh / nkv,
+                        hd,
+                        0.088,
+                        window,
+                        0.0,
+                        Some(&pool),
+                    );
+                    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                    let s = sink.is_some();
+                    assert_eq!(
+                        bits(&a),
+                        bits(&b),
+                        "out rows={rows} window={window:?} sink={s}"
+                    );
+                    assert_eq!(
+                        bits(&ia),
+                        bits(&ib),
+                        "imp rows={rows} window={window:?} sink={s}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The capped (parallel-prefill) attend equals the incremental one for
+    /// a sliding window with learned sinks as well.
+    #[test]
+    fn capped_attend_with_sinks_and_window_equals_incremental() {
+        let (nh, nkv, hd) = (6usize, 2usize, 16usize);
+        let total = 20usize;
+        let sinks: Vec<f32> = (0..nh).map(|h| h as f32 * 0.6 - 1.5).collect();
+        let mut full = gqa_cache(nkv, hd, total);
+        full.sinks = Some(sinks.clone());
+        for upto in [1usize, 2, 3, 4, 11, 20] {
+            let mut partial = gqa_cache(nkv, hd, upto);
+            partial.sinks = Some(sinks.clone());
+            let q: Vec<f32> = (0..nh * hd)
+                .map(|i| (((i * 41 + upto) % 89) as f32 / 89.0 - 0.5) * 2.3)
+                .collect();
+            let (a, ia) = attend_all_heads(&q, &partial, nh, nh / nkv, hd, 0.25, Some(3), 0.0);
+            let mut b = vec![0f32; nh * hd];
+            let mut ib = vec![0f32; upto];
+            attend_all_heads_upto(
+                &q,
+                &full,
+                nh,
+                nh / nkv,
+                hd,
+                0.25,
+                Some(3),
+                0.0,
+                upto,
+                &mut b,
+                &mut ib,
+            );
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&a), bits(&b), "out upto={upto}");
+            assert_eq!(bits(&ia), bits(&ib), "imp upto={upto}");
+        }
+    }
+
+    /// MiMo-V2-shaped layer config: 4 Q heads over `nkv` KV heads, head_dim
+    /// 8, V heads 4 wide, partial rotary 4, optional window and sinks.
+    #[allow(clippy::too_many_arguments)]
+    fn narrow_cfg<'a>(
+        nkv: usize,
+        inv: &'a [f32],
+        position: usize,
+        window: Option<usize>,
+        pool: Option<&'a crate::pool::Pool>,
+    ) -> QwenAttnCfg<'a> {
+        QwenAttnCfg {
+            num_heads: 4,
+            num_kv_heads: nkv,
+            head_dim: 8,
+            hidden_size: 16,
+            position,
+            inv_freq: inv,
+            rotary_dim: 4,
+            scale: 1.0 / (8f32).sqrt(),
+            softcap: 0.0,
+            window,
+            v_norm: false,
+            qk_norm_after_rope: false,
+            q_norm: None,
+            k_norm: None,
+            output_gate: false,
+            softplus_gate: None,
+            rope_scale: 1.0,
+            bias: None,
+            rms_eps: 1e-6,
+            norm_style: cortiq_core::NormStyle::Qwen,
+            pool,
+            v_head_dim: 4,
+        }
+    }
+
+    /// V heads narrower than Q/K (MiMo-V2: 128 vs 192): the padded-cache /
+    /// compacted-output path must equal a direct reference that never pads
+    /// — native vd-wide V rows, per-head softmax (with the window and the
+    /// learned sink), o_proj over nh·vd — to < 1e-6, position by position.
+    #[test]
+    fn narrow_v_attention_matches_direct_reference() {
+        let (nh, hd, vd, hs, rd) = (4usize, 8usize, 4usize, 16usize, 4usize);
+        let inv = rope_inv_freq(rd, 10_000.0);
+        for (nkv, window, sinks) in [
+            (1usize, None, None),
+            (2, Some(3usize), Some(vec![0.4f32, -1.0, 2.0, 0.1])),
+            (2, None, Some(vec![-0.3f32, 0.9, 0.0, 1.7])),
+        ] {
+            let hpk = nh / nkv;
+            let wq = synth(nh * hd, hs, 11);
+            let wk = synth(nkv * hd, hs, 12);
+            let wv = synth(nkv * vd, hs, 13);
+            let wo = synth(hs, nh * vd, 14);
+            let (fq, fk, fv, fo) = (
+                wq.as_f32().unwrap().to_vec(),
+                wk.as_f32().unwrap().to_vec(),
+                wv.as_f32().unwrap().to_vec(),
+                wo.as_f32().unwrap().to_vec(),
+            );
+            let mut cache = LayerKvCache::new(nkv, hd);
+            cache.mode = crate::kv_cache::KvMode::F32;
+            cache.sinks = sinks.clone();
+            // Reference state: rotated keys and NATIVE-width values.
+            let mut ref_k: Vec<Vec<f32>> = Vec::new();
+            let mut ref_v: Vec<Vec<f64>> = Vec::new();
+            for pos in 0..7usize {
+                let x: Vec<f32> = (0..hs)
+                    .map(|i| ((i as f32 + 1.0) * (pos as f32 + 0.5) * 0.37).sin())
+                    .collect();
+                let got = qwen_attention(
+                    &x,
+                    &wq,
+                    &wk,
+                    &wv,
+                    &wo,
+                    &mut cache,
+                    &narrow_cfg(nkv, &inv, pos, window, None),
                 );
+                // ── direct reference ──
+                let mv = |w: &[f32], rows: usize| -> Vec<f32> {
+                    (0..rows)
+                        .map(|r| (0..hs).map(|j| w[r * hs + j] * x[j]).sum::<f32>())
+                        .collect()
+                };
+                let mut q = mv(&fq, nh * hd);
+                let mut k = mv(&fk, nkv * hd);
+                let v = mv(&fv, nkv * vd);
+                for h in 0..nh {
+                    rope_rotate(&mut q[h * hd..h * hd + rd], pos, &inv);
+                }
+                for g in 0..nkv {
+                    rope_rotate(&mut k[g * hd..g * hd + rd], pos, &inv);
+                }
+                ref_k.push(k);
+                ref_v.push(v.iter().map(|&a| a as f64).collect());
+                let stored = pos + 1;
+                let first = window.map(|w| stored.saturating_sub(w)).unwrap_or(0);
+                let mut ao = vec![0f64; nh * vd];
+                for h in 0..nh {
+                    let g = h / hpk;
+                    let mut z: Vec<f64> = (first..stored)
+                        .map(|p| {
+                            (0..hd)
+                                .map(|d| q[h * hd + d] as f64 * ref_k[p][g * hd + d] as f64)
+                                .sum::<f64>()
+                                / (hd as f64).sqrt()
+                        })
+                        .collect();
+                    if let Some(s) = &sinks {
+                        z.push(s[h] as f64);
+                    }
+                    let m = z.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    let e: Vec<f64> = z.iter().map(|&a| (a - m).exp()).collect();
+                    let sum: f64 = e.iter().sum();
+                    for (j, p) in (first..stored).enumerate() {
+                        for d in 0..vd {
+                            ao[h * vd + d] += e[j] / sum * ref_v[p][g * vd + d];
+                        }
+                    }
+                }
+                for i in 0..hs {
+                    let want: f64 = (0..nh * vd)
+                        .map(|j| fo[i * nh * vd + j] as f64 * ao[j])
+                        .sum();
+                    assert!(
+                        (got[i] as f64 - want).abs() < 1e-6,
+                        "nkv {nkv} window {window:?} sinks {} pos {pos} out[{i}]: {} vs {want}",
+                        sinks.is_some(),
+                        got[i]
+                    );
+                }
+            }
+            // The cache holds V padded to head_dim with exact zeros.
+            for g in 0..nkv {
+                let vals = cache.head_values(g);
+                assert_eq!(vals.len(), 7 * hd);
+                for p in 0..7 {
+                    assert!(vals[p * hd + vd..(p + 1) * hd].iter().all(|&x| x == 0.0));
+                    for d in 0..vd {
+                        assert_eq!(vals[p * hd + d] as f64, ref_v[p][g * vd + d]);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The batched-chunk and the fused-pair attention paths reach the same
+    /// narrow-V / sink / window layer: both must be bit-identical to the
+    /// single-position path (same kernels, same order).
+    #[test]
+    fn narrow_v_batch_and_pair_equal_singles() {
+        let (hd, vd, hs, rd) = (8usize, 4usize, 16usize, 4usize);
+        let inv = rope_inv_freq(rd, 10_000.0);
+        let nkv = 2usize;
+        let wq = synth(4 * hd, hs, 21);
+        let wk = synth(nkv * hd, hs, 22);
+        let wv = synth(nkv * vd, hs, 23);
+        let wo = synth(hs, 4 * vd, 24);
+        let sinks = Some(vec![0.3f32, -0.8, 1.2, 0.0]);
+        let xs: Vec<Vec<f32>> = (0..9)
+            .map(|p| {
+                (0..hs)
+                    .map(|i| ((i * 3 + p * 5) as f32 * 0.21).cos())
+                    .collect()
+            })
+            .collect();
+        let fresh = || {
+            let mut c = LayerKvCache::new(nkv, hd);
+            c.mode = crate::kv_cache::KvMode::F32;
+            c.sinks = sinks.clone();
+            c
+        };
+        let pool = crate::pool::Pool::new(2);
+        for pool in [None, Some(&pool)] {
+            for window in [None, Some(3usize)] {
+                let mut c1 = fresh();
+                let singles: Vec<Vec<f32>> = (0..xs.len())
+                    .map(|p| {
+                        qwen_attention(
+                            &xs[p],
+                            &wq,
+                            &wk,
+                            &wv,
+                            &wo,
+                            &mut c1,
+                            &narrow_cfg(nkv, &inv, p, window, pool),
+                        )
+                    })
+                    .collect();
+                // Batched chunks of 4 + 5 positions.
+                let mut c2 = fresh();
+                let mut batched = Vec::new();
+                for (p0, n) in [(0usize, 4usize), (4, 5)] {
+                    let flat: Vec<f32> = xs[p0..p0 + n].iter().flatten().copied().collect();
+                    let out = qwen_attention_batch(
+                        &flat,
+                        n,
+                        &wq,
+                        &wk,
+                        &wv,
+                        &wo,
+                        &mut c2,
+                        &narrow_cfg(nkv, &inv, p0, window, pool),
+                    );
+                    for bi in 0..n {
+                        batched.push(out[bi * hs..(bi + 1) * hs].to_vec());
+                    }
+                }
+                // Pairs (the last position single).
+                let mut c3 = fresh();
+                let mut paired = Vec::new();
+                for p in (0..8).step_by(2) {
+                    let (a, b) = qwen_attention_pair(
+                        &xs[p],
+                        &xs[p + 1],
+                        &wq,
+                        &wk,
+                        &wv,
+                        &wo,
+                        &mut c3,
+                        &narrow_cfg(nkv, &inv, p, window, pool),
+                    );
+                    paired.push(a);
+                    paired.push(b);
+                }
+                paired.push(qwen_attention(
+                    &xs[8],
+                    &wq,
+                    &wk,
+                    &wv,
+                    &wo,
+                    &mut c3,
+                    &narrow_cfg(nkv, &inv, 8, window, pool),
+                ));
                 let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
-                assert_eq!(bits(&a), bits(&b), "out rows={rows} window={window:?}");
-                assert_eq!(bits(&ia), bits(&ib), "imp rows={rows} window={window:?}");
+                for p in 0..xs.len() {
+                    let w = window;
+                    let pl = pool.is_some();
+                    assert_eq!(
+                        bits(&singles[p]),
+                        bits(&batched[p]),
+                        "batch p{p} w{w:?} pool {pl}"
+                    );
+                    assert_eq!(
+                        bits(&singles[p]),
+                        bits(&paired[p]),
+                        "pair p{p} w{w:?} pool {pl}"
+                    );
+                }
+                assert_eq!(c1.head_values(0), c2.head_values(0));
+                assert_eq!(c1.head_values(1), c3.head_values(1));
             }
         }
     }
@@ -2003,6 +2454,7 @@ mod tests {
             rms_eps: 1e-6,
             norm_style: cortiq_core::NormStyle::Qwen,
             pool: None,
+            v_head_dim: hd,
         };
         let h1: Vec<f32> = (0..hs).map(|i| (i as f32 * 0.3).sin()).collect();
         let h2: Vec<f32> = (0..hs).map(|i| (i as f32 * 0.7).cos()).collect();
@@ -2053,6 +2505,7 @@ mod tests {
             rms_eps: 1e-6,
             norm_style: cortiq_core::NormStyle::Qwen,
             pool: None,
+            v_head_dim: hd,
         };
         let h1: Vec<f32> = (0..hs).map(|i| (i as f32 * 0.4).sin()).collect();
         let h2: Vec<f32> = (0..hs).map(|i| (i as f32 * 0.9).cos()).collect();
@@ -2109,6 +2562,7 @@ mod tests {
             norm_style: cortiq_core::NormStyle::Qwen,
             bias: None,
             pool: None,
+            v_head_dim: hd,
         };
         let hidden = vec![0.0, 1.0, 2.0, 3.0];
         let mut cache = LayerKvCache::new(nkv, hd);
@@ -2319,6 +2773,7 @@ mod qk_norm_order_tests {
             rms_eps: 1e-6,
             norm_style: cortiq_core::NormStyle::Qwen,
             pool: None,
+            v_head_dim: hd,
         }
     }
 
