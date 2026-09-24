@@ -168,6 +168,196 @@ fn metal_q4tp_matvec_matches_dequant_reference() {
     check("metal-mv", cortiq_engine::gpu_metal::q4tp_matvec_for_test);
 }
 
+/// The masked-nibble decode kernel (`q4tp_matvec_m`, what the plain dense
+/// token graph encodes under `MvFastGuard`) against the scalar dequant: its
+/// "-8" folds into -8·Σx per group and x is pre-scaled by 16^-k, so a slip in
+/// either shows as a per-group bias, not as noise. Ragged shapes on both
+/// axes: a row tail inside a simdgroup and group counts that are not a
+/// multiple of the 32 lanes.
+#[cfg(target_os = "macos")]
+#[test]
+fn metal_q4tp_matvec_masked_matches_dequant_reference() {
+    let _gpu = gpu_serial();
+    unsafe { std::env::set_var("CMF_GPU", "1") };
+    assert!(
+        cortiq_engine::gpu_metal::enabled(),
+        "Metal did not initialize — check the MSL compile log above"
+    );
+    let _fast = cortiq_engine::gpu_metal::MvFastGuard::set(true);
+    let mut built = Vec::new();
+    for (rows, cols) in [(512usize, 1024usize), (203, 2048), (37, 96)] {
+        let payload = synth(rows, cols);
+        let mut w = vec![0f32; rows * cols];
+        dequant_q4tp(&payload, rows, cols, &mut w);
+        let (model, idx) = tiny_model(&format!("metal-mvm-{rows}-{cols}"), rows, cols, payload);
+        built.push((rows, cols, w, model, idx));
+    }
+    for (rows, cols, w, model, idx) in &built {
+        let (rows, cols, idx) = (*rows, *cols, *idx);
+        // Non-zero mean on purpose: the folded offset is -8·Σx, which a
+        // zero-mean x would hide.
+        let xs: Vec<f32> = (0..cols)
+            .map(|i| ((i * 37 + 11) % 101) as f32 / 101.0 - 0.3)
+            .collect();
+        let mut got = vec![0f32; rows];
+        assert!(
+            cortiq_engine::gpu_metal::q4tp_matvec_for_test(model, idx, &xs, rows, cols, &mut got),
+            "GPU refused a well-formed q4tp tensor ({rows}x{cols})"
+        );
+        for r in 0..rows {
+            let want: f32 = (0..cols).map(|c| w[r * cols + c] * xs[c]).sum();
+            let mag: f32 = (0..cols).map(|c| (w[r * cols + c] * xs[c]).abs()).sum();
+            assert!(
+                (got[r] - want).abs() <= 1e-5 * mag,
+                "{rows}x{cols} row {r}: GPU {} vs dequant {want}",
+                got[r]
+            );
+        }
+    }
+}
+
+/// The dense decode's fused kernels against the scalar dequant: gate|up|SiLU
+/// in one pass (`q4tp_matvec_m_gu`) and the residual epilogue (`y += W·x`).
+/// Ragged row counts (a tail inside a simdgroup) and a small group count.
+#[cfg(target_os = "macos")]
+#[test]
+fn metal_q4tp_fused_decode_kernels_match_dequant_reference() {
+    let _gpu = gpu_serial();
+    unsafe { std::env::set_var("CMF_GPU", "1") };
+    assert!(
+        cortiq_engine::gpu_metal::enabled(),
+        "Metal did not initialize — check the MSL compile log above"
+    );
+    for (rows, cols) in [(203usize, 2048usize), (512, 1024), (37, 96)] {
+        let gpr = cols / GROUP_SIZE;
+        let pg = synth(rows, cols);
+        // Up: same ladders and codes, different nibbles.
+        let mut pu = pg.clone();
+        for b in &mut pu[..rows * gpr * 16] {
+            *b ^= 0x5A;
+        }
+        let (mut wg, mut wu) = (vec![0f32; rows * cols], vec![0f32; rows * cols]);
+        dequant_q4tp(&pg, rows, cols, &mut wg);
+        dequant_q4tp(&pu, rows, cols, &mut wu);
+        let (mg, ig) = tiny_model(&format!("metal-add-{rows}-{cols}"), rows, cols, pg.clone());
+        let xs: Vec<f32> = (0..cols)
+            .map(|i| ((i * 37 + 11) % 101) as f32 / 101.0 - 0.3)
+            .collect();
+        let y0: Vec<f32> = (0..rows).map(|r| (r % 13) as f32 * 0.25 - 1.5).collect();
+
+        // Residual epilogue on the gate tensor: out = y0 + G·x.
+        let mut got = vec![0f32; rows];
+        assert!(cortiq_engine::gpu_metal::q4tp_fused_for_test(
+            &mg, 1, ig, ig, &xs, &y0, rows, cols, &mut got
+        ));
+        for r in 0..rows {
+            let dot: f32 = (0..cols).map(|c| wg[r * cols + c] * xs[c]).sum();
+            let mag: f32 = (0..cols).map(|c| (wg[r * cols + c] * xs[c]).abs()).sum();
+            let want = y0[r] + dot;
+            assert!(
+                (got[r] - want).abs() <= 1e-5 * mag + 1e-6 * y0[r].abs(),
+                "{rows}x{cols} add row {r}: GPU {} vs {want}",
+                got[r]
+            );
+        }
+
+        // gate|up|SiLU needs both matrices in one model: g at `ig`, u at the
+        // second tensor of a two-tensor file.
+        let (m2, i_g, i_u) =
+            two_tensor_model(&format!("metal-gu-{rows}-{cols}"), rows, cols, &pg, &pu);
+        let mut act = vec![0f32; rows];
+        assert!(cortiq_engine::gpu_metal::q4tp_fused_for_test(
+            &m2,
+            0,
+            i_g,
+            i_u,
+            &xs,
+            &[],
+            rows,
+            cols,
+            &mut act
+        ));
+        for r in 0..rows {
+            let g: f32 = (0..cols).map(|c| wg[r * cols + c] * xs[c]).sum();
+            let u: f32 = (0..cols).map(|c| wu[r * cols + c] * xs[c]).sum();
+            let mg_: f32 = (0..cols).map(|c| (wg[r * cols + c] * xs[c]).abs()).sum();
+            let mu_: f32 = (0..cols).map(|c| (wu[r * cols + c] * xs[c]).abs()).sum();
+            let want = g / (1.0 + (-g).exp()) * u;
+            // First-order error of silu(g)·u from the two dot products.
+            let tol = 1e-5 * (mg_ * u.abs() * 1.1 + mu_ * (g / (1.0 + (-g).exp())).abs()) + 1e-6;
+            assert!(
+                (act[r] - want).abs() <= tol,
+                "{rows}x{cols} gu row {r}: GPU {} vs {want}",
+                act[r]
+            );
+        }
+    }
+}
+
+/// Two q4tp tensors `g` and `u` of one shape in ONE file (the fused
+/// gate|up kernel binds both from the same mapping).
+#[cfg(target_os = "macos")]
+fn two_tensor_model(
+    tag: &str,
+    rows: usize,
+    cols: usize,
+    pg: &[u8],
+    pu: &[u8],
+) -> (std::sync::Arc<CmfModel>, usize, usize) {
+    let arch: ModelArch = serde_json::from_value(serde_json::json!({
+        "arch_name": "tiny",
+        "hidden_size": cols,
+        "intermediate_size": rows,
+        "num_layers": 1,
+        "num_attention_heads": 2,
+        "num_kv_heads": 1,
+        "head_dim": 4,
+        "vocab_size": rows,
+        "layer_types": ["FullAttention"],
+        "rms_norm_eps": 1e-6,
+        "max_position_embeddings": 8,
+        "linear_conv_kernel_dim": 0,
+        "linear_num_key_heads": 0,
+        "linear_num_value_heads": 0,
+    }))
+    .unwrap();
+    let header = CmfHeader {
+        format: "cmf".into(),
+        version: CMF_VERSION,
+        arch,
+        quant_type: QuantType::Q4Block,
+        provenance: None,
+        tokenizer_config: None,
+        section_hashes: None,
+        skills: Vec::new(),
+        shard: None,
+        calibration: None,
+        routing: None,
+    };
+    let t = |name: &str, data: &[u8]| TensorSpec {
+        name: name.into(),
+        dtype: TensorDtype::Q4TiledP,
+        shape: vec![rows, cols],
+        data: data.to_vec(),
+    };
+    let pad = TensorSpec {
+        name: "pad".into(),
+        dtype: TensorDtype::F32,
+        shape: vec![8192, 2],
+        data: vec![0u8; 8192 * 8],
+    };
+    let dir = std::env::temp_dir().join(format!("cmf-q4tp-{}-{tag}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("m.cmf");
+    CmfModel::write(&path, &header, &[t("g", pg), t("u", pu), pad], None, None).unwrap();
+    let model = std::sync::Arc::new(CmfModel::open(&path).unwrap());
+    let (ig, iu) = (
+        model.tensor_index("g").unwrap(),
+        model.tensor_index("u").unwrap(),
+    );
+    (model, ig, iu)
+}
+
 /// wgpu covers Vulkan/DX12; `CMF_GPU=wgpu` selects it on macOS too, so this
 /// runs locally instead of only on the machines that have no other backend.
 #[cfg(feature = "gpu")]
