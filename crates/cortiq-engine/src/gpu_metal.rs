@@ -4626,6 +4626,88 @@ kernel void q4tp_matvec(
 }
 
 
+// Masked nibbles in place: lane k of the returned float4 is nibble k of the
+// low 16 bits of `u` times 16^k (no shift) — paired with x pre-scaled by
+// 16^-k, the product is the plain nibble·x product (power-of-two scaling is
+// exact).
+inline float4 q4_nib4_scaled(uint u) {
+    return float4((float)(u & 0xFu), (float)(u & 0xF0u),
+                  (float)(u & 0xF00u), (float)(u & 0xF000u));
+}
+
+// `q4tp_matvec` with a third of the ALU per weight (the llama.cpp q4_0
+// trick): x is pre-scaled once per group so each nibble is used masked in
+// place — AND + convert + FMA a weight instead of shift + AND + convert +
+// subtract + FMA — and the "-8" offset folds into -8·Σx per group. On the
+// M4 the small decode shapes (hidden 2048) are ALU-bound under the serial
+// dispatch chain: the whole-token walk of MiniCPM5-2B ran 0.70-0.78× the
+// time of `q4tp_matvec` (mv_lab, alternating arms). Reassociated sums, so
+// not bitwise: |Δ|/rms ≤ 2.2e-6 on the model's tensors. Same dispatch shape
+// (four rows a simdgroup, the ladder in threadgroup memory for up to eight
+// simdgroups).
+kernel void q4tp_matvec_m(
+    device const uchar* q    [[buffer(0)]],
+    device const float* x    [[buffer(1)]],
+    device float*       y    [[buffer(2)]],
+    constant uint&      gpr  [[buffer(3)]],
+    constant uint&      rows [[buffer(4)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tgpos [[threadgroup_position_in_grid]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    threadgroup float lad[8u * 4u * 32u];
+    uint r0 = (tgpos * sgs + sg) * 4u;
+    bool active = r0 < rows;
+    uint nr = active ? min(rows - r0, 4u) : 0u;
+    ulong params_off = (ulong)rows * (ulong)gpr * 16ul;
+    ulong codes_off  = params_off + (ulong)rows * 4ul;
+    uint  stride     = (gpr * 5u + 7u) / 8u;
+    for (uint ri = 0u; ri < nr; ++ri) {
+        device const half* ph = (device const half*)(q + params_off + (ulong)(r0 + ri) * 4ul);
+        lad[(sg * 4u + ri) * 32u + lane] = exp2((float)ph[0] + (float)lane * (float)ph[1]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!active) return;
+    const float4 sc = float4(1.0f, 1.0f / 16.0f, 1.0f / 256.0f, 1.0f / 4096.0f);
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    for (uint g = lane; g < gpr; g += 32u) {
+        device const float4* xv = (device const float4*)(x + g * 32u);
+        float4 x0 = xv[0], x1 = xv[1], x2 = xv[2], x3 = xv[3];
+        float4 x4 = xv[4], x5 = xv[5], x6 = xv[6], x7 = xv[7];
+        float4 s4 = x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7;
+        float m8 = -8.0f * (s4.x + s4.y + s4.z + s4.w);
+        x0 *= sc; x1 *= sc; x2 *= sc; x3 *= sc; x4 *= sc; x5 *= sc; x6 *= sc; x7 *= sc;
+        uint bit = g * 5u;
+        uint cb  = bit >> 3u;
+        uint shf = bit & 7u;
+        for (uint ri = 0u; ri < nr; ++ri) {
+            uint r = r0 + ri;
+            uint4 b = *(device const uint4*)(q + ((ulong)r * gpr + (ulong)g) * 16ul);
+            device const uchar* cp = q + codes_off + (ulong)r * (ulong)stride + cb;
+            uint code = (((uint)cp[0] | ((shf > 3u) ? ((uint)cp[1] << 8) : 0u)) >> shf) & 31u;
+            float scale = lad[(sg * 4u + ri) * 32u + code];
+            float gsum = dot(q4_nib4_scaled(b.x), x0) + dot(q4_nib4_scaled(b.x >> 16), x1)
+                       + dot(q4_nib4_scaled(b.y), x2) + dot(q4_nib4_scaled(b.y >> 16), x3)
+                       + dot(q4_nib4_scaled(b.z), x4) + dot(q4_nib4_scaled(b.z >> 16), x5)
+                       + dot(q4_nib4_scaled(b.w), x6) + dot(q4_nib4_scaled(b.w >> 16), x7);
+            float contrib = scale * (gsum + m8);
+            if (ri == 0u) acc0 += contrib;
+            else if (ri == 1u) acc1 += contrib;
+            else if (ri == 2u) acc2 += contrib;
+            else acc3 += contrib;
+        }
+    }
+    acc0 = simd_sum(acc0); acc1 = simd_sum(acc1);
+    acc2 = simd_sum(acc2); acc3 = simd_sum(acc3);
+    if (lane == 0u) {
+        y[r0] = acc0;
+        if (nr > 1u) y[r0 + 1u] = acc1;
+        if (nr > 2u) y[r0 + 2u] = acc2;
+        if (nr > 3u) y[r0 + 3u] = acc3;
+    }
+}
+
 // `q4tp_matvec` over the FIRST `rows_do` rows of a `rows`-row tensor: the
 // planes are laid out by the full row count, the dispatch stops early —
 // the draft head's vocabulary shortlist (CMF_DRAFT_VOCAB).
@@ -6340,6 +6422,8 @@ struct Ctx {
     q4t_dual: ComputePipelineState,
     q4t_dsilu: ComputePipelineState,
     q4tp: ComputePipelineState,
+    /// `q4tp_matvec_m`: the masked-nibble decode matvec (see `mv_fast`).
+    q4tp_m: ComputePipelineState,
     /// Standalone q2tp matvec with explicit ordinary/affine centre.
     q2tp: ComputePipelineState,
     /// Production affine Prism sign/zero-select matvec; legal tensors only.
@@ -6585,6 +6669,7 @@ fn init() -> Result<Ctx, String> {
     let q4t_dual = pso("q4t_matvec_dual")?;
     let q4t_dsilu = pso("q4t_matvec_dsilu")?;
     let q4tp = pso("q4tp_matvec")?;
+    let q4tp_m = pso("q4tp_matvec_m")?;
     let q2tp = pso("q2tp_matvec")?;
     let q2tp_affine = pso("q2tp_affine_select_matvec")?;
     let q2tpmm = pso("q2tp_mul_mm")?;
@@ -6692,6 +6777,7 @@ fn init() -> Result<Ctx, String> {
         q4t_dual,
         q4t_dsilu,
         q4tp,
+        q4tp_m,
         q2tp,
         q2tp_affine,
         q2tpmm,
@@ -7586,6 +7672,93 @@ fn encode_q4t_matvec(
     );
 }
 
+thread_local! {
+    static MV_FAST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether q4tp decode matvecs encoded on this thread take the
+/// masked-nibble kernel (`q4tp_matvec_m`). Scoped by `MvFastGuard`.
+fn mv_fast() -> bool {
+    MV_FAST.with(|f| f.get())
+}
+
+/// Scope in which the token graph's q4tp matvecs use `q4tp_matvec_m`.
+///
+/// The caller decides eligibility: it was measured on plain dense
+/// full-attention models (MiniCPM5-2B, Qwen3-0.6B), so the pipeline only
+/// opens the scope for plans with no GDN run, no MoE and every layer
+/// attended on the device. Every other architecture keeps the historical
+/// kernel and its bit-exact outputs. `CMF_METAL_MVFAST=0` closes the
+/// scope everywhere (the A/B and rollback switch). Restores the previous
+/// value on drop.
+pub struct MvFastGuard {
+    prev: bool,
+}
+
+impl MvFastGuard {
+    pub fn set(on: bool) -> MvFastGuard {
+        static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let allowed = *ENV.get_or_init(|| std::env::var("CMF_METAL_MVFAST").as_deref() != Ok("0"));
+        let prev = MV_FAST.with(|f| f.replace(on && allowed));
+        MvFastGuard { prev }
+    }
+}
+
+impl Drop for MvFastGuard {
+    fn drop(&mut self) {
+        MV_FAST.with(|f| f.set(self.prev));
+    }
+}
+
+/// In-process A/B of the dense decode levers (`CMF_METAL_AB=a/b`, each
+/// side one of off|mv|conc|both): tokens alternate between the two arms
+/// and the whole token-graph call (encode + GPU + readback) is timed per
+/// arm, so a drifting or shared GPU loads both arms alike. Returns the
+/// (mv_fast, concurrent) pair for this token and its arm index, or None
+/// when the A/B is off. Diagnostics only.
+pub fn dense_ab_arm() -> Option<(bool, bool, usize)> {
+    static CFG: std::sync::OnceLock<Option<[(bool, bool); 2]>> = std::sync::OnceLock::new();
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let cfg = CFG.get_or_init(|| {
+        let v = std::env::var("CMF_METAL_AB").ok()?;
+        let side = |s: &str| match s {
+            "mv" => Some((true, false)),
+            "conc" => Some((false, true)),
+            "both" => Some((true, true)),
+            "off" => Some((false, false)),
+            _ => None,
+        };
+        let (a, b) = v.split_once('/')?;
+        Some([side(a)?, side(b)?])
+    });
+    let cfg = (*cfg)?;
+    let arm = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 2;
+    Some((cfg[arm].0, cfg[arm].1, arm))
+}
+
+/// Account one token of `dense_ab_arm`'s arm; prints both arms' mean
+/// every 100 tokens of arm 1.
+pub fn dense_ab_record(arm: usize, dt: std::time::Duration) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+    static CNT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+    NS[arm].fetch_add(dt.as_nanos() as u64, Ordering::Relaxed);
+    let n = CNT[arm].fetch_add(1, Ordering::Relaxed) + 1;
+    if arm == 1 && n % 100 == 0 {
+        let m = |i: usize| {
+            NS[i].load(Ordering::Relaxed) as f64
+                / CNT[i].load(Ordering::Relaxed).max(1) as f64
+                / 1e6
+        };
+        eprintln!(
+            "metal-ab: arm0 {:.3} ms/tok | arm1 {:.3} ms/tok | arm1/arm0 {:.3} ({n} tok/arm)",
+            m(0),
+            m(1),
+            m(1) / m(0)
+        );
+    }
+}
+
 /// q4tp twin of `encode_q4t_matvec` — same 4-rows-per-simdgroup shape; the
 /// kernel derives its three plane offsets from `rows`/`gpr`, so the argument
 /// list stays identical to q4t's.
@@ -7599,6 +7772,25 @@ fn encode_q4tp_matvec(
     rows: usize,
     gpr: usize,
 ) {
+    if mv_fast() {
+        // Masked-nibble kernel, four simdgroups a threadgroup (the lab's
+        // best shape at hidden 2048: more threadgroups for the small
+        // k/v projections, same ladder table).
+        enc.set_compute_pipeline_state(&c.q4tp_m);
+        fbuf.bind(enc, 0, abs);
+        enc.set_buffer(1, Some(xs), 0);
+        enc.set_buffer(2, Some(y), 0);
+        let gpr_u = gpr as u32;
+        let rows_u = rows as u32;
+        enc.set_bytes(3, 4, &gpr_u as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+        let sgs = 4u64;
+        enc.dispatch_thread_groups(
+            MTLSize::new((rows as u64).div_ceil(sgs * 4), 1, 1),
+            MTLSize::new(sgs * 32, 1, 1),
+        );
+        return;
+    }
     enc.set_compute_pipeline_state(&c.q4tp);
     fbuf.bind(enc, 0, abs);
     enc.set_buffer(1, Some(xs), 0);
@@ -12675,6 +12867,15 @@ fn disp(
     enc.dispatch_threads(MTLSize::new(grid.0, 1, 1), MTLSize::new(grid.1, 1, 1));
 }
 
+/// `memoryBarrierWithScope:MTLBarrierScopeBuffers` — orders every buffer
+/// write of the dispatches before it against the dispatches after it,
+/// inside a concurrent compute encoder.
+fn enc_barrier(enc: &metal::ComputeCommandEncoderRef) {
+    use metal::objc::{msg_send, sel, sel_impl};
+    let scope: u64 = 1; // MTLBarrierScopeBuffers
+    let _: () = unsafe { msg_send![enc, memoryBarrierWithScope: scope] };
+}
+
 /// `disp` plus a threadgroup-memory allocation at index 0 — for kernels
 /// whose simdgroups combine partials through shared memory
 /// (`gqa_attend`'s flash-decoding split). The length is encoder state,
@@ -12889,6 +13090,13 @@ pub struct TokenGraph {
     /// The draft chain's token ids: slot 0 is the host's input token,
     /// slot j+1 the argmax the device chose at step j (`chain_ids_init`).
     ids_b: Option<Buffer>,
+    /// Plain dense plan (`set_dense_concurrent`): device-attended layers
+    /// encode into a CONCURRENT compute encoder with explicit buffer
+    /// barriers only between dependent stages, so q|k|v and gate|up
+    /// overlap instead of draining the GPU between them.
+    conc: bool,
+    /// True while an open layer encoder is concurrent: `bar` emits.
+    in_conc: std::cell::Cell<bool>,
 }
 
 impl TokenGraph {
@@ -12931,7 +13139,28 @@ impl TokenGraph {
             qkv_bufs: None,
             logits_b: None,
             ids_b: None,
+            conc: false,
+            in_conc: std::cell::Cell::new(false),
         })
+    }
+
+    /// Opt this token's device-attended layers into the concurrent layer
+    /// encoder (see `conc`). Only the plain dense plan asks for it — the
+    /// hybrid/MoE/o1 encoders stay serial. `CMF_METAL_CONC=0` refuses.
+    pub fn set_dense_concurrent(&mut self, on: bool) {
+        static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let allowed =
+            *ENV.get_or_init(|| std::env::var("CMF_METAL_CONC").as_deref() != Ok("0"));
+        self.conc = on && allowed;
+    }
+
+    /// Buffer barrier between two dependent dispatches of a concurrent
+    /// layer encoder; nothing in a serial one (dispatch order already is
+    /// the barrier there).
+    fn bar(&self, enc: &metal::ComputeCommandEncoderRef) {
+        if self.in_conc.get() {
+            enc_barrier(enc);
+        }
     }
 
     /// Validate one q1 tensor and resolve its absolute payload offset.
@@ -13935,6 +14164,7 @@ impl TokenGraph {
             l.wo.1,
             l.wo.2 / GROUP_SIZE,
         );
+        self.bar(enc);
         // Fused: h += d_b, n = rmsnorm(h, post_norm) — one dispatch
         // instead of separate enc_axpy + rmsnorm.
         match &l.ffn {
@@ -14075,8 +14305,16 @@ impl TokenGraph {
         // The whole layer — norm, QKV, RoPE, append, attend, O, FFN,
         // both residuals — is ONE encoder: every step reads the step
         // before it, which serial dispatch already guarantees, so the
-        // per-pass kick was pure overhead (see `disp`).
-        let enc = cmd.new_compute_command_encoder();
+        // per-pass kick was pure overhead (see `disp`). The plain dense
+        // plan opens it CONCURRENT instead (`conc`), with a buffer barrier
+        // (`bar`) at every true dependency: the independent q/k/v and
+        // gate/up dispatches then overlap instead of draining in between.
+        let enc = if self.conc {
+            cmd.compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Concurrent)
+        } else {
+            cmd.new_compute_command_encoder()
+        };
+        self.in_conc.set(self.conc);
         // 1. attn rmsnorm h → n
         disp(
             enc,
@@ -14090,6 +14328,7 @@ impl TokenGraph {
             &[self.dims.eps],
             (256, 256),
         );
+        self.bar(enc);
         // 2. QKV projections n → q_raw / k / v
         let q_b = io_buf(self.c, 40_000_000_003 + l.wq.1, l.wq.1 * 4);
         let k_b = io_buf(self.c, 41_000_000_019 + l.wk.1, l.wk.1 * 4);
@@ -14134,6 +14373,7 @@ impl TokenGraph {
                 l.wv.2 / GROUP_SIZE,
             );
         }
+        self.bar(enc);
         // 3. per-head qk-norm + RoPE (gate split into g_b)
         let nhd = p.nh * p.hd;
         let qr_b = io_buf(self.c, 44_000_000_007 + nhd, nhd * 4);
@@ -14174,6 +14414,7 @@ impl TokenGraph {
             &[p.eps],
             (((p.nh + p.nkv) * 32) as u64, 256),
         );
+        self.bar(enc);
         let ao_b = io_buf(self.c, 43_000_000_057 + nhd, nhd * 4);
         if let Some(od) = &o1dev {
             // 4-5. O(1): absorb the ring slot being evicted into the far
@@ -14202,6 +14443,7 @@ impl TokenGraph {
                 &[od.scale],
                 (gg * hh * mm * 64, 64),
             );
+            self.bar(enc);
             disp(
                 enc,
                 &self.c.o1push,
@@ -14216,6 +14458,7 @@ impl TokenGraph {
                 &[],
                 (gg * 256, 256),
             );
+            self.bar(enc);
             disp(
                 enc,
                 &self.c.o1att,
@@ -14254,6 +14497,7 @@ impl TokenGraph {
                 &[],
                 ((p.nkv * p.hd) as u64, 256),
             );
+            self.bar(enc);
             // 5. grouped attend (+ attention importance into the mirror's imp).
             //    Flash-decoding: one threadgroup per Q-head, its simdgroups
             //    splitting the stored positions. ~32 positions per simdgroup
@@ -14265,8 +14509,20 @@ impl TokenGraph {
             let blk = thr > 0
                 && n_pos > thr
                 && encode_gqa_attend_blk(
-                    self.c, enc, &qr_b, &k_mb, &v_mb, &ao_b, p.nh, p.nkv, p.hd, cap, stored, 1,
+                    self.c,
+                    enc,
+                    &qr_b,
+                    &k_mb,
+                    &v_mb,
+                    &ao_b,
+                    p.nh,
+                    p.nkv,
+                    p.hd,
+                    cap,
+                    stored,
+                    1,
                     p.scale,
+                    self.in_conc.get(),
                 );
             let cap_sgs = (self.c.gqat.max_total_threads_per_threadgroup() as usize / 32)
                 .clamp(1, gqa_split_max());
@@ -14290,6 +14546,7 @@ impl TokenGraph {
                 );
             }
         }
+        self.bar(enc);
         // 6. output gate
         if p.output_gate {
             disp(
@@ -14300,10 +14557,12 @@ impl TokenGraph {
                 &[],
                 (nhd as u64, 256),
             );
+            self.bar(enc);
         }
         // 7. O + residual + FFN + residual
         self.encode_o_ffn(enc, l, &ao_b);
         enc.end_encoding();
+        self.in_conc.set(false);
         true
     }
     /// post-norm(h) → n_b, gate/up, SiLU·mul, down, h += d — shared by
@@ -14360,6 +14619,7 @@ impl TokenGraph {
             enc.set_bytes(7, 4, &hd_u as *const u32 as *const std::ffi::c_void);
             enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
         }
+        self.bar(enc);
         {
             let (ag, au) = (self.proj_abs(gate).unwrap(), self.proj_abs(up).unwrap());
             // Gate and up as ONE dispatch when both are q4t
@@ -14418,6 +14678,7 @@ impl TokenGraph {
                 );
             }
         }
+        self.bar(enc);
         let ad = self.proj_abs(down).unwrap();
         // Part two of the fusion stack (same CMF_METAL_DUAL=1 gate):
         // down consumes gate and up directly with SiLU inline — the
@@ -14454,6 +14715,7 @@ impl TokenGraph {
                 enc.set_bytes(5, 4, &hc as *const u32 as *const std::ffi::c_void);
                 enc.dispatch_threads(MTLSize::new(inter as u64, 1, 1), MTLSize::new(256, 1, 1));
             }
+            self.bar(enc);
             {
                 encode_proj(
                     self.c,
@@ -14468,6 +14730,7 @@ impl TokenGraph {
                 );
             }
         }
+        self.bar(enc);
         disp_axpy(self.c, enc, &self.d_b, &self.h_b, 1.0, self.dims.hidden);
     }
 
@@ -16106,6 +16369,7 @@ impl VerifyGraph {
             && !verify_skip('a')
             && encode_gqa_attend_blk(
                 c, enc, &qr_b, &k_mb, &v_mb, &ao_b, p.nh, p.nkv, p.hd, cap, stored, b, p.scale,
+                false,
             );
         if b >= 2 && !blk {
             // the chunk attend: one simdgroup per (row, head), row e over
@@ -16524,6 +16788,7 @@ fn encode_gqa_attend_blk(
     stored: usize,
     nb: usize,
     scale: f32,
+    conc: bool,
 ) -> bool {
     let hpk = nh / nkv;
     if hpk == 0 || hpk > 8 || hd > 1024 || nb == 0 {
@@ -16558,6 +16823,9 @@ fn encode_gqa_attend_blk(
         MTLSize::new(nkv as u64, nblk as u64, nb as u64),
         MTLSize::new((hpk * 32) as u64, 1, 1),
     );
+    if conc {
+        enc_barrier(enc);
+    }
     enc.set_compute_pipeline_state(&c.gqacomb);
     enc.set_buffer(0, Some(&part), 0);
     enc.set_buffer(1, Some(ao), 0);
