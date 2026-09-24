@@ -103,6 +103,9 @@ pub struct Pipeline {
     /// GPU-graph declines already logged for this pipeline, as (graph
     /// site, reason) — one line each, see `graph_attn_decline_reason`.
     graph_declines: std::cell::RefCell<Vec<(&'static str, &'static str)>>,
+    /// MiMo-V2 expert placement (prefix / dynamic bank / hybrid), decided
+    /// on the first forward — see `crate::mimo_moe`.
+    pub(crate) mimo_moe: crate::mimo_moe::Slot,
     /// Linear-core geometry (present when the model has linear layers).
     pub vmf_cfg: Option<VmfPhaseCfg>,
     /// GatedDeltaNet geometry (faithful vendor operator).
@@ -2590,6 +2593,7 @@ impl Pipeline {
                 .filter(|v| !v.is_empty())
                 .map(std::path::PathBuf::from),
             graph_declines: std::cell::RefCell::new(Vec::new()),
+            mimo_moe: Default::default(),
             vmf_cfg: None,
             gdn_cfg: None,
             kda_cfg: None,
@@ -6579,6 +6583,9 @@ impl Pipeline {
         emb2: &[f32],
         position: usize,
     ) -> (Vec<f32>, Vec<f32>) {
+        // A two-token prompt starts here, not in the layer walk: decide the
+        // MiMo placement before the pair's per-op MoE uploads any expert.
+        self.mimo_moe_prepare();
         let mut h1 = emb1.to_vec();
         let mut h2 = emb2.to_vec();
         let (_nkv, _hd, hs, _rd, eps) = (
@@ -6759,6 +6766,10 @@ impl Pipeline {
                         self.norm_style,
                         self.pool.as_deref(),
                     ),
+                ),
+                FfnKind::Moe(m) if self.mimo_moe.is_dynamic(li, false) => (
+                    moe_ffn_banked(&mut self.mimo_moe, li, m, &self.ws.p1, self.pool.as_deref()),
+                    moe_ffn_banked(&mut self.mimo_moe, li, m, &self.ws.p2, self.pool.as_deref()),
                 ),
                 _ => ffn_forward_pair(
                     &lw.ffn,
@@ -7816,6 +7827,7 @@ impl Pipeline {
         );
         let pool = self.pool.clone();
         let norm_style = self.norm_style;
+        self.mimo_moe_prepare();
         let automatic_gpu_prefix = self.automatic_gpu_prefix();
 
         #[cfg(target_os = "macos")]
@@ -8103,6 +8115,12 @@ impl Pipeline {
                     tube_ffn(d, &post, b, pool.as_deref(), mask_row)
                 }
                 FfnKind::Dense(d) => dense_ffn_batch(d, &post, b, pool.as_deref(), mask_row),
+                // A bank layer's experts do not live in the residency arena:
+                // the prompt's expert panels stay on the host rather than
+                // stream through (and evict) the arena the projections use.
+                FfnKind::Moe(m) if self.mimo_moe.is_dynamic(li, false) => {
+                    crate::gpu::cpu_scope(|| moe_ffn_batch(m, &post, b, hs, pool.as_deref(), None))
+                }
                 FfnKind::Moe(m) => moe_ffn_batch(m, &post, b, hs, pool.as_deref(), None),
                 // Dual-branch layers run per position (the expert branch
                 // reads the raw residual — nothing to batch yet).
@@ -8711,6 +8729,35 @@ impl Pipeline {
                 tracing::error!("CMF_LAYER_DUMP: cannot write {}: {e}", path.display());
             }
         }
+    }
+
+    /// Decide the MiMo-V2 expert placement once (`crate::mimo_moe`). Any
+    /// other model turns the slot off on the first call.
+    fn mimo_moe_prepare(&mut self) {
+        if !self.mimo_moe.is_undecided() {
+            return;
+        }
+        let slot = {
+            let layers: Vec<(usize, &MoeFfn)> = (0..self.num_layers)
+                .filter_map(
+                    |li| match &self.weights.layers.get(self.phys_layer(li))?.ffn {
+                        FfnKind::Moe(m) => Some((li, m)),
+                        _ => None,
+                    },
+                )
+                .collect();
+            if layers.is_empty() || self.physical_layers != self.num_layers {
+                crate::mimo_moe::Slot::Off
+            } else {
+                // Whether a whole-token graph could run this model's layers
+                // (then a whole-layer prefix is one submit, not per-layer
+                // fences).
+                let graph_prefix =
+                    self.graph_attn_decline_reason().is_none() && crate::gpu::wgpu_graph_default();
+                crate::mimo_moe::Slot::decide(&layers, self.num_layers, graph_prefix)
+            }
+        };
+        self.mimo_moe = slot;
     }
 
     fn layer_attn_plain(&self, li: usize) -> bool {
@@ -11962,6 +12009,9 @@ impl Pipeline {
             );
         }
         let mut h = hidden.to_vec();
+        // MiMo-V2 expert placement: decided before the graph or the per-op
+        // arena can claim the budget the expert bank needs.
+        self.mimo_moe_prepare();
         // Split borrows: copy scalars / clone handles so the per-layer
         // cfg does not hold `&self` while the KV cache is `&mut`.
         let (nh, _nkv, _hd, hs, _rd, eps) = (
@@ -12156,7 +12206,12 @@ impl Pipeline {
         // residency arena streams every omitted layer through Vulkan and the
         // driver's freed-allocation cache can grow to the full model size
         // (25.4 GiB observed with a 14 GiB budget on Granite 30B Q8_2F).
-        let _host_tail = (tail_start > from).then(crate::gpu::enter_cpu_scope);
+        // With a MiMo expert bank the tail is not a whole-layer host
+        // stream: its experts run from the bank (never the arena) and its
+        // projections stay per-op on the device, which the bank's placement
+        // left room for.
+        let host_tail = tail_start > from;
+        let _host_tail = (host_tail && !self.mimo_moe.is_on()).then(crate::gpu::enter_cpu_scope);
         let automatic_gpu_prefix = self.automatic_gpu_prefix();
 
         let _prof_layers = crate::cpuprof::time(crate::cpuprof::Slot::Layers);
@@ -12164,7 +12219,7 @@ impl Pipeline {
         let mut gpu_skip_until = 0usize;
         for li in tail_start.max(from)..self.num_layers {
             let _capacity_tail = automatic_gpu_prefix
-                .filter(|&prefix| li >= prefix)
+                .filter(|&prefix| li >= prefix && !self.mimo_moe.is_dynamic(li, host_tail))
                 .map(|_| crate::gpu::enter_cpu_scope());
             crate::gpu::set_layer(li as i64); // layer-split GPU/CPU (CMF_GPU_LAYERS)
             if let Some(u) = upto {
@@ -12606,6 +12661,11 @@ impl Pipeline {
                         self.norm_style,
                         self.pool.as_deref(),
                     ),
+                    FfnKind::Moe(m)
+                        if task_mask.is_none() && self.mimo_moe.is_dynamic(li, host_tail) =>
+                    {
+                        moe_ffn_banked(&mut self.mimo_moe, li, m, post_normed, self.pool.as_deref())
+                    }
                     _ => {
                         let allowed = match (&lw.ffn, task_mask) {
                             (FfnKind::Moe(m), Some(tm)) => tm.expert_flags(li, m.experts.len()),
@@ -14976,6 +15036,31 @@ pub(crate) fn moe_ffn(
     pool: Option<&Pool>,
     allowed: Option<&[bool]>,
 ) -> Vec<f32> {
+    let r = moe_ffn_route(m, x, pool, allowed);
+    moe_ffn_experts(m, x, &r, pool)
+}
+
+/// One token's host route through a MoE layer: the chosen experts in
+/// selection order, the per-expert scores and the normalizer (see
+/// `moe_route`), plus the raw router logits.
+pub(crate) struct MoeRoute {
+    pub idx: Vec<usize>,
+    pub p: Vec<f32>,
+    pub wsum: f32,
+    pub logits: Vec<f32>,
+}
+
+/// The routing half of `moe_ffn`, shared by every executor of the chosen
+/// experts (the host/per-op path below and the MiMo dynamic device cache,
+/// `crate::mimo_moe`): activation accounting, router logits, `moe_route`,
+/// the selection statistics and the `CMF_MOE_TRACE` line — so switching
+/// executors can never change which experts a token gets.
+pub(crate) fn moe_ffn_route(
+    m: &MoeFfn,
+    x: &[f32],
+    pool: Option<&Pool>,
+    allowed: Option<&[bool]>,
+) -> MoeRoute {
     accumulate_act(m, x, 1);
     let ne = m.experts.len();
     let mut logits = vec![0.0f32; ne];
@@ -14999,6 +15084,23 @@ pub(crate) fn moe_ffn(
     // cannot answer — whether CONSECUTIVE tokens reuse experts (the
     // temporal locality an LRU cache lives on, FreeToken §4).
     moe_trace(&idx);
+    MoeRoute {
+        idx,
+        p,
+        wsum,
+        logits,
+    }
+}
+
+/// The expert half of `moe_ffn`: run a route's experts on the per-op GPU
+/// block or the host.
+pub(crate) fn moe_ffn_experts(
+    m: &MoeFfn,
+    x: &[f32],
+    r: &MoeRoute,
+    pool: Option<&Pool>,
+) -> Vec<f32> {
+    let (idx, p, wsum) = (&r.idx, &r.p, r.wsum);
     // D5: the whole layer MoE block in one GPU command buffer (experts — the
     // same mmap via a no-copy buffer; intermediate activations on the GPU).
     // Same Ffn probe class as the dense chain: one submit per layer
@@ -15024,6 +15126,23 @@ pub(crate) fn moe_ffn(
         }
     }
     moe_ffn_cpu(m, x, &idx, &p, wsum, pool)
+}
+
+/// One MoE token through the MiMo expert bank (`crate::mimo_moe`), or —
+/// when the bank does not serve it — through the host path with the SAME
+/// route, so the routing statistics and `CMF_MOE_TRACE` see it once.
+fn moe_ffn_banked(
+    slot: &mut crate::mimo_moe::Slot,
+    li: usize,
+    m: &MoeFfn,
+    x: &[f32],
+    pool: Option<&Pool>,
+) -> Vec<f32> {
+    let r = moe_ffn_route(m, x, pool, None);
+    match slot.forward(li, m, x, &r, pool) {
+        Some(out) => out,
+        None => moe_ffn_experts(m, x, &r, pool),
+    }
 }
 
 /// One-shot report of whether the whole-token wgpu graph actually formed.
