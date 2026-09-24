@@ -8751,7 +8751,12 @@ impl Pipeline {
                     },
                 )
                 .collect();
-            if layers.is_empty() || self.physical_layers != self.num_layers {
+            // One bank lives on one device: an in-process multi-GPU split
+            // keeps the whole-layer path.
+            if layers.is_empty()
+                || self.physical_layers != self.num_layers
+                || self.gpu_plan.is_some()
+            {
                 crate::mimo_moe::Slot::Off
             } else {
                 // Whether a whole-token graph could run this model's layers
