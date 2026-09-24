@@ -22,9 +22,27 @@ fn main() {
         .unwrap_or(vec!["base".into(), "wt".into()]);
     if mode == "peak" {
         for round in 0..3 {
-            for ty in ["h", "f"] {
+            for ty in ["h", "f", "hh"] {
                 let tf = cortiq_engine::gpu_metal::zimage::bench_mma_peak(ty, 5).unwrap();
                 println!("mma peak {ty} r{round}: {tf:.2} TF/s");
+            }
+        }
+    }
+    if mode == "plane" {
+        // q8 bytes staged in-kernel (zi_q8mm) vs f16 planes (zv_conv plain)
+        let shapes = [(3840usize, 3840usize, "qkv/o"), (10240, 3840, "w1/w3"), (3840, 10240, "w2")];
+        for &n in &ns {
+            for &(rows, k, name) in &shapes {
+                let fl = 2.0 * rows as f64 * k as f64 * n as f64;
+                for round in 0..2 {
+                    let (_, q8, _) = bench_gemm(rows, k, n, reps, "base").unwrap();
+                    let (_, pl) = cortiq_engine::gpu_metal::zimage::bench_plane(rows, k, n, reps).unwrap();
+                    println!(
+                        "plane n {n:5} {name:6} r{round}: q8 {q8:7.3} ms ({:.2} TF)  f16 plane {pl:7.3} ms ({:.2} TF)",
+                        fl / q8 / 1e9,
+                        fl / pl / 1e9
+                    );
+                }
             }
         }
     }

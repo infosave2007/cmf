@@ -624,6 +624,29 @@ kernel void zi_peak_f(device float* out [[buffer(0)]], constant uint& iters [[bu
     ushort lane [[thread_index_in_simdgroup]], uint gid [[thread_position_in_grid]]) {
     zi_peak_body<float>(out, iters, lane, gid);
 }
+// half operands AND half accumulators
+kernel void zi_peak_hh(device float* out [[buffer(0)]], constant uint& iters [[buffer(1)]],
+    ushort lane [[thread_index_in_simdgroup]], uint gid [[thread_position_in_grid]]) {
+    simdgroup_half8x8 a[4], b[4];
+    for (ushort i = 0; i < 4; ++i) {
+        a[i] = make_filled_simdgroup_matrix<half, 8, 8>((half)(0.001f * (lane + i)));
+        b[i] = make_filled_simdgroup_matrix<half, 8, 8>((half)(0.002f * (lane + 2 * i)));
+    }
+    simdgroup_half8x8 acc[4][4];
+    for (ushort i = 0; i < 4; ++i)
+        for (ushort j = 0; j < 4; ++j) acc[i][j] = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);
+    for (uint it = 0; it < iters; ++it) {
+        #pragma clang loop unroll(full)
+        for (ushort i = 0; i < 4; ++i)
+            #pragma clang loop unroll(full)
+            for (ushort j = 0; j < 4; ++j)
+                simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+    }
+    float s = 0.0f;
+    for (ushort i = 0; i < 4; ++i)
+        for (ushort j = 0; j < 4; ++j) s += (float)acc[i][j].thread_elements()[0];
+    if (s == 12345.678f) out[gid] = s;
+}
 
 // ═══════════════════════════ resident Flux VAE ═══════════════════════════
 // Activations NHWC; the residual stream f32, conv inputs half. Every conv

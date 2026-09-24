@@ -1309,7 +1309,7 @@ pub fn bench_mma_peak(ty: &str, reps: usize) -> Option<f64> {
     let opts = metal::CompileOptions::new();
     opts.set_language_version(metal::MTLLanguageVersion::V3_0);
     let lib = c._device.new_library_with_source(ZMSL, &opts).ok()?;
-    let f = lib.get_function(if ty == "f" { "zi_peak_f" } else { "zi_peak_h" }, None).ok()?;
+    let f = lib.get_function(match ty { "f" => "zi_peak_f", "hh" => "zi_peak_hh", _ => "zi_peak_h" }, None).ok()?;
     let pso = c._device.new_compute_pipeline_state_with_function(&f).ok()?;
     let out = buf_zeroed(c, 1 << 20);
     let iters = 4096u32;
@@ -1402,6 +1402,13 @@ pub fn bench_gemm(rows: usize, k: usize, n: usize, reps: usize, variant: &str) -
     let mut s = times.clone();
     s.sort_by(|a, b| a.partial_cmp(b).unwrap());
     Some((s[0], s[s.len() / 2], (dd / rr.max(1e-300)).sqrt()))
+}
+
+/// Codec A/B arm: the f16-plane GEMM (half weights, same tile) — (min ms,
+/// median ms) of GPU time.
+#[doc(hidden)]
+pub fn bench_plane(rows: usize, k: usize, n: usize, reps: usize) -> Option<(f64, f64)> {
+    vae::bench_plane(rows, k, n, reps)
 }
 
 /// Flash-attention microbench over one item of `n` rows (30 heads × 128):
