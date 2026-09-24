@@ -184,6 +184,28 @@ fn nanbeige_tool_history_round_trips() {
     );
 }
 
+/// The server asks `try_apply_chat_template_json` when tools are present
+/// and answers 400 on Err: a render failure must surface there, while the
+/// lenient call keeps its ChatML fallback for plain chat.
+#[test]
+fn a_failing_template_is_reported_not_swallowed() {
+    let mut t = Tokenizer::byte_level();
+    t.chat_template = Some(
+        "{% for m in messages %}{{ m.content | no_such_filter }}{% endfor %}".to_string(),
+    );
+    let msgs = vec![serde_json::json!({"role": "user", "content": "hi"})];
+    let tools = vec![serde_json::json!({"type": "function", "function": {"name": "f"}})];
+    let err = t
+        .try_apply_chat_template_json(&msgs, Some(&tools), None)
+        .unwrap_err();
+    assert!(err.contains("no_such_filter"), "{err}");
+    assert!(!t.apply_chat_template_json(&msgs, None, None).is_empty());
+    // `raise_exception` carries the template's own message out.
+    t.chat_template = Some("{{ raise_exception('Conversation roles must alternate') }}".into());
+    let err = t.try_apply_chat_template_json(&msgs, None, None).unwrap_err();
+    assert!(err.contains("roles must alternate"), "{err}");
+}
+
 // ── MiniCPM5 — the vendor template, byte-for-byte ──
 
 /// The ORIGINAL openbmb/MiniCPM5-2B template calls
