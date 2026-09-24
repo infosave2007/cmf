@@ -72,6 +72,8 @@ fn arch() -> ModelArch {
         logit_multiplier: None,
         loop_final_norm: false,
         prism_hadamard: None,
+        kv_heads_per_layer: None,
+        v_head_dim: None,
     }
 }
 

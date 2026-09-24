@@ -66,6 +66,8 @@ fn arch(loops: usize) -> ModelArch {
         logit_multiplier: None,
         loop_final_norm: loops > 1,
         prism_hadamard: None,
+        kv_heads_per_layer: None,
+        v_head_dim: None,
     }
 }
 

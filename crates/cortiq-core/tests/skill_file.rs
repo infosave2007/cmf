@@ -63,6 +63,8 @@ fn tiny_header() -> CmfHeader {
         logit_multiplier: None,
         loop_final_norm: false,
         prism_hadamard: None,
+        kv_heads_per_layer: None,
+        v_head_dim: None,
     };
     let mut h: CmfHeader = serde_json::from_value(serde_json::json!({
         "version": 2,

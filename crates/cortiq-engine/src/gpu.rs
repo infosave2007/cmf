@@ -55,6 +55,15 @@ pub fn cpu_scope<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// Capture CPU-only placement before dispatching whole operators to workers.
+/// `cpu_scope` is thread-local, while a MoE panel worker calls QTensor again;
+/// without inheritance, which expert happened to land on the caller changed
+/// its precision/backend from run to run.
+pub(crate) fn inherit_cpu_scope() -> impl Fn() -> Option<CpuScopeGuard> + Copy {
+    let on = CPU_ONLY.get();
+    move || on.then(enter_cpu_scope)
+}
+
 /// Backends: name the device once at init. The probe cache is keyed by
 /// it, because a verdict is a property of THIS silicon and nothing else.
 /// First writer wins: a process runs one backend, and on the rare host
@@ -762,6 +771,19 @@ mod probe_tests {
     use super::*;
     use std::time::Duration;
 
+    #[test]
+    fn cpu_only_whole_operator_dispatch_inherits_and_restores_scope() {
+        let pool = crate::pool::Pool::with_spin(3, 0);
+        cpu_scope(|| {
+            let inherit = inherit_cpu_scope();
+            pool.run_rows(64, &|_, _| {
+                let _guard = inherit();
+                assert!(CPU_ONLY.get());
+            });
+        });
+        pool.run_rows(64, &|_, _| assert!(!CPU_ONLY.get()));
+    }
+
     // One test fn: PROBES is process-global and probe_reset touches all
     // classes — parallel test threads would race.
     #[test]
@@ -1227,6 +1249,24 @@ pub fn q8_matvec_range(
     }
 }
 
+/// Decode-exact short q8_2f panel for the banked MiMo head.
+pub(crate) fn q82_short_rows(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    #[cfg(feature = "gpu")]
+    if enabled_here() && backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::q82_short_rows(model, idx, xs, b, rows, cols, out);
+    }
+    let _ = (model, idx, xs, b, rows, cols, out);
+    false
+}
+
 /// GEMM of a prefill batch: `pre` — prescaled inputs row-major [b, cols],
 /// out — row-major [b, rows].
 #[allow(clippy::too_many_arguments, unused_variables)]
@@ -1378,6 +1418,13 @@ pub enum GraphAttn<'a> {
         output_gate: bool,
         cpu_k: &'a [Vec<f32>],
         cpu_v: &'a [Vec<f32>],
+        /// This layer's own attention geometry, when the model's layers do
+        /// not share one (MiMo-V2: 4/8 KV heads, 128-wide V under 192-wide
+        /// heads, sliding windows with learned sinks, two RoPE tables).
+        /// None = the call-wide (nkv, hd, rd, invf), V as wide as K, full
+        /// context and a plain softmax — the historical contract, whose
+        /// kernels and dispatch are untouched.
+        geom: Option<GraphAttnGeom<'a>>,
     },
     Gdn {
         qkv: GraphW<'a>,
@@ -1422,6 +1469,28 @@ pub enum GraphAttn<'a> {
     },
 }
 
+/// Per-layer attention geometry for the wgpu graphs (see
+/// `GraphAttn::Full::geom`). The layer's CPU cache keeps K rows `hd` wide
+/// and V rows zero-padded to `hd`; the device mirror stores V `dv` wide,
+/// and a windowed layer keeps a ring of the last positions only.
+#[derive(Clone, Copy)]
+pub struct GraphAttnGeom<'a> {
+    /// KV heads of this layer (divides the Q heads).
+    pub nkv: usize,
+    /// V head width, `4 <= dv <= head_dim`, a multiple of 4.
+    pub dv: usize,
+    /// Rotary width of this layer (NeoX half-split over `[0, rd)`).
+    pub rd: usize,
+    /// This layer's RoPE inverse frequencies (`rd / 2` of them).
+    pub invf: &'a [f32],
+    /// Positions a query sees, its own included (MiMo-V2 SWA: 128);
+    /// None = the whole context.
+    pub window: Option<usize>,
+    /// Learned per-Q-head sink logits (gpt-oss / MiMo-V2): they join the
+    /// softmax max and denominator and carry no value row.
+    pub sink: Option<&'a [f32]>,
+}
+
 /// Per-layer weights for the whole-token wgpu graph.
 pub struct GraphLayer<'a> {
     pub input_norm: &'a [f32],
@@ -1435,6 +1504,9 @@ pub struct GraphLayer<'a> {
 /// routing decision depends on the resident hidden state, so a CPU
 /// round-trip per layer would forfeit the one-submit design).
 pub enum GraphFfn<'a> {
+    /// A singleton attention-only batch graph. Returns the post-attention
+    /// residual, allowing a dynamic expert bank to own the FFN separately.
+    AttentionOnly,
     Dense {
         gate: GraphW<'a>,
         up: GraphW<'a>,
@@ -1640,16 +1712,101 @@ pub fn forward_batch_graph(
     o1: &[Option<Vec<crate::nystrom::O1DeviceView<'_>>>],
     o1_epoch: u64,
     spec: Option<SpecTail<'_>>,
+    // Device-prefix mode (plain prefill only): Some = when the whole stack
+    // does not fit the weight budget, run the leading layers that do — the
+    // same prefix rule as the token graph — leave the boundary hidden in
+    // `h` and report the count here; the caller runs the rest on the host.
+    // None = all layers or a decline, as before.
+    layers_run: Option<&mut usize>,
+) -> BatchGraphOutcome {
+    forward_batch_graph_at(model, kv_id, 0, layers, invf, h, nh, nkv, hd, rd, hidden, inter, positions, cap, gemma, eps, attn_scale, k, o1, o1_epoch, spec, layers_run)
+}
+
+thread_local! {
+    static MIMO_ATTN_SCRATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+pub(crate) fn mimo_attention_scratch_enabled() -> bool {
+    MIMO_ATTN_SCRATCH.with(std::cell::Cell::get)
+}
+
+/// Scoped diagnostic A/B switch; unlike process environment mutations it
+/// cannot race a model's background workers. Restores on panic as well.
+#[doc(hidden)]
+pub fn mimo_attention_scratch_scope<R>(enabled: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            MIMO_ATTN_SCRATCH.with(|v| v.set(self.0));
+        }
+    }
+    let _restore = Restore(MIMO_ATTN_SCRATCH.with(|v| v.replace(enabled)));
+    f()
+}
+
+thread_local! {
+    static MIMO_Q8_SHORT: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+pub(crate) fn mimo_q8_short_enabled() -> bool {
+    MIMO_Q8_SHORT.with(std::cell::Cell::get)
+}
+
+/// Diagnostic A/B switch for row-exact short q8 graph kernels.
+#[doc(hidden)]
+pub fn mimo_q8_short_scope<R>(enabled: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            MIMO_Q8_SHORT.with(|v| v.set(self.0));
+        }
+    }
+    let _restore = Restore(MIMO_Q8_SHORT.with(|v| v.replace(enabled)));
+    f()
+}
+
+/// Batched graph over a span whose first absolute layer is `layer_base`.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_batch_graph_at(
+    model: &Arc<CmfModel>,
+    kv_id: u64,
+    layer_base: usize,
+    layers: &[GraphLayer],
+    invf: &[f32],
+    h: &mut [f32],
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    rd: usize,
+    hidden: usize,
+    inter: usize,
+    positions: &[usize],
+    cap: usize,
+    gemma: bool,
+    eps: f32,
+    attn_scale: f32,
+    k: usize,
+    // Per-layer sealed O(1) device views. An empty slice means the ordinary
+    // exact-KV path; otherwise it must have one entry per graph layer.
+    o1: &[Option<Vec<crate::nystrom::O1DeviceView<'_>>>],
+    o1_epoch: u64,
+    spec: Option<SpecTail<'_>>,
+    // Device-prefix mode (plain prefill only): Some = when the whole stack
+    // does not fit the weight budget, run the leading layers that do — the
+    // same prefix rule as the token graph — leave the boundary hidden in
+    // `h` and report the count here; the caller runs the rest on the host.
+    // None = all layers or a decline, as before.
+    layers_run: Option<&mut usize>,
 ) -> BatchGraphOutcome {
     match backend() {
         #[cfg(feature = "gpu")]
-        Backend::Wgpu => crate::gpu_wgpu::forward_batch_graph(
-            model, kv_id, layers, invf, h, nh, nkv, hd, rd, hidden, inter, positions, cap, gemma,
-            eps, attn_scale, k, o1, o1_epoch, spec,
+        Backend::Wgpu => crate::gpu_wgpu::forward_batch_graph_at(
+            model, kv_id, layer_base, layers, invf, h, nh, nkv, hd, rd, hidden, inter, positions,
+            cap, gemma, eps, attn_scale, k, o1, o1_epoch, spec, layers_run,
         ),
         #[allow(unreachable_patterns)]
         _ => {
-            let _ = (o1, o1_epoch, spec);
+            let _ = (o1, o1_epoch, spec, layers_run);
             BatchGraphOutcome::Declined
         }
     }
@@ -1722,6 +1879,26 @@ pub fn graph_kv_read_rows(
     #[cfg(feature = "gpu")]
     if backend() == Backend::Wgpu {
         return crate::gpu_wgpu::kv_mirror_read_rows(_kv_id, _reqs, _nkv, _hd);
+    }
+    None
+}
+
+/// Rows `[from, to)` of one wgpu exact-attention mirror in the host
+/// cache's layout (V zero-padded to `hd`), whatever the mirror's geometry
+/// (narrow V, a sliding layer's ring). The third value is the first
+/// position actually read: a ring returns zeros below it. None: no wgpu
+/// mirror holding those rows at (nkv, hd).
+pub fn graph_kv_pull_host(
+    _kv_id: u64,
+    _layer: usize,
+    _from: usize,
+    _to: usize,
+    _nkv: usize,
+    _hd: usize,
+) -> Option<(Vec<f32>, Vec<f32>, usize)> {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::kv_mirror_pull_host(_kv_id, _layer, _from, _to, _nkv, _hd);
     }
     None
 }

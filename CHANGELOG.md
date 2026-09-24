@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.7] - 2026-09-24
+
+### Added
+- Native MiMo-V2.6-Flash text conversion and inference: MXFP4-to-q4tp experts,
+  q8_2f text backbone, mixed full/sliding attention, RoPE and learned sinks.
+- Automatic resident/dynamic/hybrid MoE placement with a device expert bank,
+  attention graphs and batched GPU speculative verification for the three-layer
+  MTP companion. Greedy MTP preserves the accepted reference token sequences;
+  nonzero-temperature generation remains on the ordinary sampling path.
+- Two MiMo distributions sharing one backbone: text-only (backbone + MTP),
+  and full (backbone + MTP + multimodal companion). The model card includes
+  measured throughput, weight-budget VRAM results and checksum verification.
+- Image, silent-video (frame directory/Y4M), and WAV input in the CLI and
+  OpenAI-compatible server. Ordered media parts are retained, invalid media
+  is rejected before streaming, and text-only requests do not map media towers.
+- Native vision/audio processing, companion assembly, conversion validation,
+  independent reference fixtures and real-model parity/media gate tools.
+
+### Fixed
+- Overlapping MTP requests keep row-exact batching active until the last scope
+  exits, including nested calls and unwinding; no global flag can be left stuck
+  or cleared while another verification is still using it.
+- CPU-only placement now propagates through MoE worker tasks. The 128-token
+  smoke PPL agrees at 3.647 on CPU, full GPU and repeated 24-GB-budget runs.
+- MiMo GPU tower GEMM and attention preserve f32 operands instead of implicitly
+  rounding them to fp16 cooperative matrices. All six exact-weight vision/video
+  reference fixtures pass with default cooperative-kernel settings.
+- Dynamic bank shutdown joins the filler before freeing device storage, and
+  explicit graph-off diagnostics also disable singleton attention graphs.
+
+### Performance and limits
+- RTX PRO 6000 Blackwell 96 GB: default 128-token core benchmark median
+  40.85 tok/s (32.20 / 41.40 / 40.85); a 64000-MiB weight budget measured
+  44.48 tok/s median. Natural prompts vary; MTP is not always faster.
+- Budget tests used one 96-GB GPU, not physical cards at every capacity.
+  Temporary upload memory can exceed the configured weight budget.
+- Full-model OCR, shape/chart and five ASR checks pass. Strict quantized-vision
+  row-cosine and precise video timestamp acceptance remain open; this release
+  does not claim complete multimodal quality qualification. Compressed audio,
+  MP4 and interleaved video/audio are not supported.
+
 ## [0.7.6] - 2026-09-24
 
 ### Added
@@ -6019,7 +6060,8 @@ Initial public release.
 - **Licensing** — Apache-2.0 with an explicit patent-grant explanation
   (`LICENSE`, `NOTICE`, `PATENTS.md`).
 
-[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.6.9...HEAD
+[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.7.7...HEAD
+[0.7.7]: https://github.com/infosave2007/cmf/compare/v0.7.6...v0.7.7
 [0.6.9]: https://github.com/infosave2007/cmf/compare/v0.6.8...v0.6.9
 [0.6.8]: https://github.com/infosave2007/cmf/compare/v0.6.7...v0.6.8
 [0.6.7]: https://github.com/infosave2007/cmf/compare/v0.6.6...v0.6.7

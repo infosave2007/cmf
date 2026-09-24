@@ -644,7 +644,12 @@ pub(crate) fn canon_name(raw: &str) -> Option<String> {
 /// carries a real vision tower.  Keep the generic `canon_name` multimodal
 /// policy unchanged (older readers intentionally drop vision); only this
 /// explicit architecture path maps the retained tower into `vis.*`.
-fn canon_name_for_arch(arch: &ModelArch, raw: &str) -> Option<String> {
+fn canon_name_for_arch(arch: &ModelArch, raw: &str, towers: MimoTowers) -> Option<String> {
+    // MiMo-V2's rules (router bias, sinks, tower/MTP drops) are gated on the
+    // arch so the generic canon policy of every other family is untouched.
+    if arch.arch_name == MIMO_V2 {
+        return mimo_v2_canon(raw, towers);
+    }
     if arch.prism_hadamard.is_none() {
         return canon_name(raw);
     }
@@ -725,6 +730,11 @@ fn lfm2_canon(name: &str) -> String {
 /// DeepSeek-V4's table holds expert ids per vocabulary id (129 280 rows).
 fn force_f32(name: &str) -> bool {
     name.ends_with(".tid2eid")
+        // MiMo-V2's per-head softmax sink logits: tiny, and a logit.
+        || name.ends_with(".self_attn.sinks")
+        // MiMo audio tokenizer RVQ codebooks: nearest-neighbour tables,
+        // F32 in the source; a nudged codeword changes codes.
+        || name.ends_with("._codebook.embed")
         || name.ends_with(".mlp.expert_bias")
         || name.ends_with(".mlp.expert_bias_vl")
         || name.ends_with(".ffn.gate.bias")
@@ -752,7 +762,9 @@ pub(crate) fn keeps_float(name: &str) -> bool {
 }
 
 fn force_f16(name: &str) -> bool {
-    name.ends_with("linear_attn.in_proj_a.weight")
+    // MiMo speech embeddings: 20 gather tables summed per frame, not matmuls.
+    name.starts_with("speech_embeddings.")
+        || name.ends_with("linear_attn.in_proj_a.weight")
         || name.ends_with("linear_attn.in_proj_b.weight")
         // KDA (Kimi): decay/β/gate low-rank stages and conv taps are tiny
         // and sit on exp/σ paths — keep them exact.
@@ -807,6 +819,18 @@ fn quant_for_tensor(arch: &ModelArch, name: &str, base: Quant) -> Quant {
     // first and final projection.  The full q8_2f profile is unchanged.
     if arch.arch_name.eq_ignore_ascii_case("granite") && vocabulary_edges {
         return Quant::Q8_2f;
+    }
+    // MiMo-V2: the routed experts (256 per layer, 8 active) are the whole
+    // memory wall and take the requested 4-/2-bit plane. Everything a token
+    // always traverses — q/k/v/o, the dense layer-0 MLP, the embedding and
+    // lm_head — stays q8_2f. (The router is f16 and the bias/sinks f32 by
+    // the force rules, before this policy is consulted.)
+    if arch.arch_name == MIMO_V2 {
+        return if name.contains(".mlp.experts.") {
+            base
+        } else {
+            Quant::Q8_2f
+        };
     }
     if arch.qwen4_exp.is_none() {
         return base;
@@ -885,7 +909,7 @@ fn glob_match(pat: &str, name: &str) -> bool {
     pi == p.len()
 }
 
-fn tensor_quant_override(name: &str) -> Option<Quant> {
+pub(crate) fn tensor_quant_override(name: &str) -> Option<Quant> {
     let o = TENSOR_QUANT_OVERRIDES.lock().unwrap();
     o.iter().find(|(p, _)| glob_match(p, name)).map(|&(_, q)| q)
 }
@@ -2196,22 +2220,46 @@ pub(crate) fn unpack_mxfp4(
         scales.len()
     );
     let mut out = vec![0.0f32; rows * cols];
-    for r in 0..rows {
-        for g in 0..gpr {
-            let k = scales[r * gpr + g];
-            // E8M0: value = 2^(k−127); 255 = NaN per OCP — refuse loudly.
-            anyhow::ensure!(k != 255, "mxfp4: NaN scale at row {r} group {g}");
-            let scale = (k as f32 - 127.0).exp2();
-            for b in 0..16 {
-                let byte = packed[r * cols_packed + g * 16 + b];
-                for (half, nib) in [(0usize, byte & 0x0F), (1usize, byte >> 4)] {
-                    let mag = LUT[(nib & 0x7) as usize];
-                    let v = if nib & 0x8 != 0 { -mag } else { mag };
-                    out[r * cols + g * 32 + b * 2 + half] = v * scale;
-                }
-            }
-        }
+    if rows == 0 || cols == 0 {
+        return Ok(out);
     }
+    // Rows are independent, so the decode splits on rows exactly like the
+    // FP8 decoder: a 256-expert layer is 768 of these matrices, and the
+    // serial loop was a visible share of a conversion's wall time.
+    let threads = encode_threads().min(rows).max(1);
+    let rows_per_thread = rows.div_ceil(threads);
+    std::thread::scope(|scope| -> anyhow::Result<()> {
+        let mut workers = Vec::with_capacity(threads);
+        for (chunk_index, out_chunk) in out.chunks_mut(rows_per_thread * cols).enumerate() {
+            let first_row = chunk_index * rows_per_thread;
+            workers.push(scope.spawn(move || -> anyhow::Result<()> {
+                for (local_row, out_row) in out_chunk.chunks_mut(cols).enumerate() {
+                    let r = first_row + local_row;
+                    for g in 0..gpr {
+                        let k = scales[r * gpr + g];
+                        // E8M0: value = 2^(k−127); 255 = NaN per OCP — refuse loudly.
+                        anyhow::ensure!(k != 255, "mxfp4: NaN scale at row {r} group {g}");
+                        let scale = (k as f32 - 127.0).exp2();
+                        for b in 0..16 {
+                            let byte = packed[r * cols_packed + g * 16 + b];
+                            for (half, nib) in [(0usize, byte & 0x0F), (1usize, byte >> 4)] {
+                                let mag = LUT[(nib & 0x7) as usize];
+                                let v = if nib & 0x8 != 0 { -mag } else { mag };
+                                out_row[g * 32 + b * 2 + half] = v * scale;
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }));
+        }
+        for worker in workers {
+            worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("mxfp4 worker panicked"))??;
+        }
+        Ok(())
+    })?;
     Ok(out)
 }
 
@@ -2286,16 +2334,51 @@ fn unpack_fp8_scale_inv(
     block: usize,
 ) -> anyhow::Result<Vec<f32>> {
     anyhow::ensure!(block > 0, "fp8 scale_inv: block size 0");
+    unpack_fp8_scale_inv_rows(
+        packed,
+        scales,
+        rows,
+        cols,
+        block,
+        rows.div_ceil(block),
+        |r| r / block,
+    )
+}
+
+/// [`unpack_fp8_scale_inv`] with an explicit weight-row → scale-row map, for
+/// checkpoints whose scale grid is not one continuous tiling of the rows
+/// (MiMo-V2's fused qkv restarts its 128-row blocks at every stored TP
+/// chunk). `scale_rows` is the height of the scale plane; the column tiling
+/// stays the ordinary `ceil(cols / block)`.
+fn unpack_fp8_scale_inv_rows(
+    packed: &[u8],
+    scales: &[f32],
+    rows: usize,
+    cols: usize,
+    block: usize,
+    scale_rows: usize,
+    scale_row: impl Fn(usize) -> usize + Sync,
+) -> anyhow::Result<Vec<f32>> {
+    anyhow::ensure!(block > 0, "fp8 scale_inv: block size 0");
     anyhow::ensure!(
         packed.len() == rows * cols,
         "fp8 scale_inv: weight size mismatch"
     );
-    let (sr, sc) = (rows.div_ceil(block), cols.div_ceil(block));
+    let (sr, sc) = (scale_rows, cols.div_ceil(block));
     anyhow::ensure!(
         scales.len() == sr * sc,
         "fp8 scale_inv: {} scales, expected {sr}x{sc}",
         scales.len()
     );
+    // The map is checked once up front, so a bad map fails loudly instead
+    // of panicking on an index inside a worker.
+    if let Some(r) = (0..rows).find(|&r| scale_row(r) >= sr) {
+        anyhow::bail!(
+            "fp8 scale_inv: row {r} maps to scale row {} of {sr}",
+            scale_row(r)
+        );
+    }
+    let scale_row = &scale_row;
     let mut out = vec![0.0f32; rows * cols];
     let threads = encode_threads().min(rows.max(1)).max(1);
     let rows_per_thread = rows.div_ceil(threads);
@@ -2307,10 +2390,12 @@ fn unpack_fp8_scale_inv(
                 for (local_row, out_row) in out_chunk.chunks_mut(cols).enumerate() {
                     let r = first_row + local_row;
                     let packed_row = &packed[r * cols..(r + 1) * cols];
+                    let sr0 = scale_row(r) * sc;
+                    let scale_plane_row = &scales[sr0..sr0 + sc];
                     for (c, (&byte, dst)) in packed_row.iter().zip(out_row).enumerate() {
                         let v = fp8_e4m3_to_f32(byte);
                         anyhow::ensure!(v.is_finite(), "fp8 scale_inv: NaN weight at ({r},{c})");
-                        let scale = scales[(r / block) * sc + c / block];
+                        let scale = scale_plane_row[c / block];
                         anyhow::ensure!(
                             scale.is_finite(),
                             "fp8 scale_inv: non-finite scale at ({r},{c})"
@@ -2666,7 +2751,7 @@ fn consume_local_ready_source(path: &Path) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("remove consumed local-ready source {}: {e}", path.display()))
 }
 
-fn open_safetensors(path: &Path) -> anyhow::Result<SafeTensors> {
+pub(crate) fn open_safetensors(path: &Path) -> anyhow::Result<SafeTensors> {
     let file = fs::File::open(path).map_err(|e| anyhow::anyhow!("open {}: {e}", path.display()))?;
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
     if mmap.len() < 8 {
@@ -2910,6 +2995,766 @@ fn source_fp8_block(config: &serde_json::Value) -> usize {
     // The published V4.1 config carries [32, 32]. Keep the native default
     // when a compact test/config omits quantization_config entirely.
     block.unwrap_or(32)
+}
+
+// ── Xiaomi MiMo-V2 (`mimo_v2`) ───────────────────────────────────────────
+//
+// A hybrid MoE decoder: full-attention layers (config `num_key_value_heads`
+// KV heads) interleaved with sliding-window layers (`swa_num_key_value_heads`
+// KV heads, a window that includes the current token, and a learned per-head
+// softmax sink). Q/K heads are `head_dim` wide with the first
+// `head_dim·partial_rotary_factor` dims rotated; V heads are `v_head_dim`
+// wide and scaled by `attention_value_scale`. The router is a sigmoid over
+// the routed experts with a noaux selection bias; the first layer is dense.
+//
+// The release checkpoint stores q/k/v as ONE fused FP8 matrix per layer,
+// pre-sharded for `num_key_value_heads` tensor-parallel ranks, with the FP8
+// block scales tiled per shard — see `mimo_v2_split_qkv`. The routed experts
+// are MXFP4 (U8 `.weight` + U8 E8M0 `.weight_scale`).
+
+const MIMO_V2: &str = "mimo_v2";
+
+/// Which towers of a MiMo-V2 checkpoint a conversion keeps
+/// (`cortiq convert --mimo-towers`). The checkpoint ships a vision tower
+/// (`visual.*`), an audio encoder (`audio_encoder.*`) and speech embeddings
+/// (`speech_embeddings.*`) beside the text decoder, and the audio tokenizer
+/// in its own `audio_tokenizer/` file. Names and codecs of the kept towers:
+/// `cortiq_engine::mimo_mm` / `crate::mimo_towers`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MimoTowers {
+    /// `text` (default): the text decoder alone; every tower is dropped.
+    TextOnly,
+    /// `mm-only`: the companion `<stem>.mm.cmf` — the towers and nothing
+    /// of the text decoder (`mimo_towers::run_convert_mimo_mm`).
+    MmOnly,
+    /// `multimodal`: one file with the text decoder AND the towers under
+    /// the companion's tensor names.
+    Multimodal,
+}
+
+impl MimoTowers {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::TextOnly => "text",
+            Self::MmOnly => "mm-only",
+            Self::Multimodal => "multimodal",
+        }
+    }
+}
+
+/// Parse `--mimo-towers text|mm-only|multimodal`.
+pub fn parse_mimo_towers(s: &str) -> anyhow::Result<MimoTowers> {
+    Ok(match s.trim().to_ascii_lowercase().as_str() {
+        "text" | "text-only" => MimoTowers::TextOnly,
+        "mm-only" | "mm_only" | "mm" => MimoTowers::MmOnly,
+        "multimodal" | "full" => MimoTowers::Multimodal,
+        other => anyhow::bail!("--mimo-towers '{other}': expected text, mm-only or multimodal"),
+    })
+}
+
+/// MiMo-V2 tensor names → the CMF layout, or `None` to drop the tensor.
+fn mimo_v2_canon(raw: &str, towers: MimoTowers) -> Option<String> {
+    // The MTP head is three draft layers with their own fused qkv; the
+    // runtime has no MiMo MTP (and the loader refuses a multi-layer head).
+    // Plain greedy decoding is exact without it, so it is dropped in every
+    // mode.
+    if raw.starts_with("model.mtp.") {
+        return None;
+    }
+    if ["visual.", "audio_encoder.", "speech_embeddings."]
+        .iter()
+        .any(|p| raw.starts_with(p))
+    {
+        return match towers {
+            MimoTowers::TextOnly => None,
+            MimoTowers::MmOnly | MimoTowers::Multimodal => Some(raw.to_string()),
+        };
+    }
+    // The noaux selection bias lives under the router in the checkpoint;
+    // the loader reads it as `mlp.expert_bias` (F32 via `force_f32`).
+    // Without this rename the file converts and routes without the bias.
+    if let Some(stem) = raw.strip_suffix(".mlp.gate.e_score_correction_bias") {
+        return Some(format!("{stem}.mlp.expert_bias"));
+    }
+    // Per-head learned softmax sink of the sliding-window layers.
+    if let Some(stem) = raw.strip_suffix(".self_attn.attention_sink_bias") {
+        return Some(format!("{stem}.self_attn.sinks"));
+    }
+    canon_name(raw)
+}
+
+/// Header geometry of a `mimo_v2` config (validated).
+#[derive(Clone, Debug, PartialEq)]
+struct MimoV2Geometry {
+    layer_types: Vec<LayerType>,
+    kv_heads_per_layer: Vec<usize>,
+    v_head_dim: usize,
+    sliding_window: usize,
+    swa_rope_theta: f64,
+    rotary_dim: usize,
+    rms_norm_eps: f64,
+}
+
+/// Read and validate the MiMo-V2 attention geometry. Every variant the
+/// converter (or the runtime) does not implement is refused here, at the
+/// config, rather than after a 300 GB download.
+fn mimo_v2_geometry(
+    tc: &serde_json::Value,
+    n_layers: usize,
+    n_heads: usize,
+    head_dim: usize,
+) -> anyhow::Result<MimoV2Geometry> {
+    let flag = |k: &str| tc.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+    let layout = tc
+        .get("attention_projection_layout")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<missing>");
+    anyhow::ensure!(
+        layout == "fused_qkv",
+        "mimo_v2: attention_projection_layout '{layout}' is not supported (only fused_qkv)"
+    );
+    anyhow::ensure!(
+        !flag("attention_bias"),
+        "mimo_v2: attention_bias=true is not supported"
+    );
+    anyhow::ensure!(
+        !flag("add_full_attention_sink_bias"),
+        "mimo_v2: sinks on full-attention layers (add_full_attention_sink_bias) are not supported"
+    );
+    let same = |k: &str, want: usize| -> anyhow::Result<()> {
+        if let Some(v) = tc.get(k).filter(|v| !v.is_null()) {
+            let got = v
+                .as_u64()
+                .ok_or_else(|| anyhow::anyhow!("mimo_v2: {k} must be an integer"))?;
+            anyhow::ensure!(
+                got as usize == want,
+                "mimo_v2: {k}={got} differs from the full-attention value {want}; \
+                 per-layer head width/count is not supported"
+            );
+        }
+        Ok(())
+    };
+    same("swa_head_dim", head_dim)?;
+    same("swa_num_attention_heads", n_heads)?;
+    let v_head_dim = cfg_usize(tc, "v_head_dim").unwrap_or(head_dim);
+    same("swa_v_head_dim", v_head_dim)?;
+    anyhow::ensure!(
+        v_head_dim > 0 && v_head_dim <= head_dim,
+        "mimo_v2: v_head_dim {v_head_dim} must be in 1..={head_dim}"
+    );
+    // The fused qkv is stored pre-sharded for `num_key_value_heads` ranks
+    // (vLLM's ckpt_tp), so both KV head counts must split over it.
+    let ckpt_tp = cfg_usize(tc, "num_key_value_heads")
+        .ok_or_else(|| anyhow::anyhow!("mimo_v2: config missing num_key_value_heads"))?;
+    let swa_kv = cfg_usize(tc, "swa_num_key_value_heads").unwrap_or(ckpt_tp);
+    for (what, nkv) in [
+        ("num_key_value_heads", ckpt_tp),
+        ("swa_num_key_value_heads", swa_kv),
+    ] {
+        anyhow::ensure!(
+            nkv > 0 && n_heads % nkv == 0 && nkv % ckpt_tp == 0 && n_heads % ckpt_tp == 0,
+            "mimo_v2: {what}={nkv} must divide num_attention_heads={n_heads} and be a \
+             multiple of the checkpoint's qkv shard count {ckpt_tp}"
+        );
+    }
+    let pattern = tc
+        .get("hybrid_layer_pattern")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow::anyhow!("mimo_v2: config missing hybrid_layer_pattern"))?;
+    anyhow::ensure!(
+        pattern.len() == n_layers,
+        "mimo_v2: hybrid_layer_pattern has {} entries, expected {n_layers}",
+        pattern.len()
+    );
+    let mut layer_types = Vec::with_capacity(n_layers);
+    let mut kv_heads_per_layer = Vec::with_capacity(n_layers);
+    for (li, v) in pattern.iter().enumerate() {
+        match v.as_u64() {
+            Some(0) => {
+                layer_types.push(LayerType::FullAttention);
+                kv_heads_per_layer.push(ckpt_tp);
+            }
+            Some(1) => {
+                layer_types.push(LayerType::SlidingAttention);
+                kv_heads_per_layer.push(swa_kv);
+            }
+            _ => anyhow::bail!("mimo_v2: hybrid_layer_pattern[{li}]={v} (expected 0 or 1)"),
+        }
+    }
+    let window = cfg_usize(tc, "sliding_window")
+        .or_else(|| cfg_usize(tc, "sliding_window_size"))
+        .ok_or_else(|| anyhow::anyhow!("mimo_v2: config missing sliding_window"))?;
+    if let (Some(a), Some(b)) = (
+        cfg_usize(tc, "sliding_window"),
+        cfg_usize(tc, "sliding_window_size"),
+    ) {
+        anyhow::ensure!(
+            a == b,
+            "mimo_v2: sliding_window {a} != sliding_window_size {b}"
+        );
+    }
+    anyhow::ensure!(window > 0, "mimo_v2: sliding_window must be positive");
+    let swa_rope_theta = tc
+        .get("swa_rope_theta")
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| anyhow::anyhow!("mimo_v2: config missing swa_rope_theta"))?;
+    // RoPE: default profile only, on the first int(head_dim·factor) dims.
+    // The attention split reads the top-level factor and the rotary init
+    // reads rope_parameters' — they must agree.
+    let rope_params = tc.get("rope_parameters").filter(|v| !v.is_null());
+    for r in [rope_params, tc.get("rope_scaling").filter(|v| !v.is_null())]
+        .into_iter()
+        .flatten()
+    {
+        let kind = r
+            .get("rope_type")
+            .or_else(|| r.get("type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("default");
+        anyhow::ensure!(
+            kind == "default",
+            "mimo_v2: rope type '{kind}' is not supported (only default)"
+        );
+    }
+    let top_prf = tc.get("partial_rotary_factor").and_then(|v| v.as_f64());
+    let rope_prf = rope_params
+        .and_then(|r| r.get("partial_rotary_factor"))
+        .and_then(|v| v.as_f64());
+    if let (Some(a), Some(b)) = (top_prf, rope_prf) {
+        anyhow::ensure!(
+            a == b,
+            "mimo_v2: partial_rotary_factor {a} != rope_parameters.partial_rotary_factor {b}"
+        );
+    }
+    let prf = top_prf.or(rope_prf).unwrap_or(1.0);
+    // Python `int(head_dim * factor)`: 192·0.334 = 64.128 → 64.
+    let rotary_dim = (head_dim as f64 * prf).floor() as usize;
+    anyhow::ensure!(
+        rotary_dim >= 2 && rotary_dim % 2 == 0 && rotary_dim <= head_dim,
+        "mimo_v2: rotary dim {rotary_dim} (head_dim {head_dim} × {prf}) must be even and in 2..={head_dim}"
+    );
+    // Router: plain top-k over all experts (no group-limited routing).
+    for k in ["n_group", "topk_group"] {
+        if let Some(v) = tc.get(k).filter(|v| !v.is_null()) {
+            anyhow::ensure!(
+                v.as_u64() == Some(1),
+                "mimo_v2: {k}={v} (group-limited routing) is not supported"
+            );
+        }
+    }
+    if let Some(m) = tc.get("topk_method").and_then(|v| v.as_str()) {
+        anyhow::ensure!(
+            m == "noaux_tc",
+            "mimo_v2: topk_method '{m}' is not supported (only noaux_tc)"
+        );
+    }
+    if let Some(s) = tc.get("scoring_func").and_then(|v| v.as_str()) {
+        anyhow::ensure!(
+            s == "sigmoid",
+            "mimo_v2: scoring_func '{s}' is not supported (only sigmoid)"
+        );
+    }
+    // Source quantization: the decoders below implement exactly FP8 E4M3
+    // with 128×128 f32 inverse scales and MXFP4 experts in blocks of 32.
+    let q = tc
+        .get("quantization_config")
+        .filter(|v| !v.is_null())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "mimo_v2: no quantization_config — only the FP8/MXFP4 release checkpoint is supported"
+            )
+        })?;
+    let qs = |k: &str| q.get(k).and_then(|v| v.as_str()).unwrap_or("<missing>");
+    anyhow::ensure!(
+        qs("quant_method") == "fp8" && qs("fmt") == "e4m3",
+        "mimo_v2: source quantization {}/{} is not supported (only fp8/e4m3)",
+        qs("quant_method"),
+        qs("fmt")
+    );
+    let block: Vec<u64> = q
+        .get("weight_block_size")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
+        .unwrap_or_default();
+    anyhow::ensure!(
+        block == [128, 128],
+        "mimo_v2: FP8 weight_block_size {block:?} is not supported (only [128, 128])"
+    );
+    if let Some(store) = q.get("store_dtype").and_then(|v| v.as_str()) {
+        anyhow::ensure!(
+            store == "mxfp4",
+            "mimo_v2: expert store_dtype '{store}' is not supported (only mxfp4)"
+        );
+        let mb = q
+            .get("mxfp4_block_size")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(32);
+        anyhow::ensure!(
+            mb == 32,
+            "mimo_v2: mxfp4_block_size {mb} is not supported (only 32)"
+        );
+    }
+    let rms_norm_eps = tc
+        .get("layernorm_epsilon")
+        .or_else(|| tc.get("rms_norm_eps"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1e-6);
+    Ok(MimoV2Geometry {
+        layer_types,
+        kv_heads_per_layer,
+        v_head_dim,
+        sliding_window: window,
+        swa_rope_theta,
+        rotary_dim,
+        rms_norm_eps,
+    })
+}
+
+/// `attention_value_scale`, folded into the V rows at conversion (the
+/// attention output is linear in V, and HF scales V before the cache, so
+/// the cached V matches the reference). Absent = 1.
+fn mimo_v2_value_scale(tc: &serde_json::Value) -> anyhow::Result<f32> {
+    match tc.get("attention_value_scale").filter(|v| !v.is_null()) {
+        None => Ok(1.0),
+        Some(v) => {
+            let s = v.as_f64().ok_or_else(|| {
+                anyhow::anyhow!("mimo_v2: attention_value_scale must be a number")
+            })?;
+            anyhow::ensure!(
+                s.is_finite() && s > 0.0,
+                "mimo_v2: attention_value_scale {s} must be finite and positive"
+            );
+            Ok(s as f32)
+        }
+    }
+}
+
+/// Row layout of one stored MiMo-V2 fused qkv: `ckpt_tp` chunks, each
+/// `[Q_c | K_c | V_c]` holding that shard's `n_heads/ckpt_tp` query heads and
+/// `n_kv_heads/ckpt_tp` key/value heads.
+#[derive(Clone, Copy, Debug)]
+struct MimoQkvLayout {
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    v_head_dim: usize,
+    ckpt_tp: usize,
+}
+
+impl MimoQkvLayout {
+    /// Q, K and V rows per stored chunk.
+    fn per_chunk(&self) -> anyhow::Result<(usize, usize, usize)> {
+        let t = self.ckpt_tp;
+        anyhow::ensure!(
+            t > 0 && self.n_heads % t == 0 && self.n_kv_heads % t == 0,
+            "mimo_v2 qkv: {} q / {} kv heads do not split over {t} stored chunks",
+            self.n_heads,
+            self.n_kv_heads
+        );
+        Ok((
+            self.n_heads / t * self.head_dim,
+            self.n_kv_heads / t * self.head_dim,
+            self.n_kv_heads / t * self.v_head_dim,
+        ))
+    }
+}
+
+/// Decode one stored MiMo-V2 fused qkv (FP8 E4M3 + f32 inverse block
+/// scales) and split it into canonical `(q, k, v)` row-major matrices, with
+/// `value_scale` folded into every V row.
+///
+/// Storage (vLLM `_shard_fp8_qkv_proj`, SGLang `_deinterleave_qkv_shards`):
+/// `[Q_0|K_0|V_0 | Q_1|K_1|V_1 | …]`, one chunk per checkpoint TP rank, and
+/// the 128-row scale blocks restart at every chunk: chunk `c` owns scale rows
+/// `c·ceil(rpc/128) ..`, so `scale_row(r) = (r / rpc)·ceil(rpc/128) +
+/// (r % rpc)/128`. On a full-attention layer a chunk is 3392 rows = 26.5
+/// blocks, and the stored plane has 4·27 = 108 rows where one continuous
+/// grid would have 106 — reading it continuously mis-scales most rows. The
+/// continuous grid is accepted only when it is the same map (every chunk a
+/// whole number of blocks). De-interleaving concatenates Q_c, K_c and V_c
+/// over c, which keeps query head h on KV head h / (n_heads / n_kv_heads).
+fn mimo_v2_split_qkv(
+    packed: &[u8],
+    scales: &[f32],
+    scale_shape: &[usize],
+    rows: usize,
+    cols: usize,
+    layout: MimoQkvLayout,
+    block: usize,
+    value_scale: f32,
+) -> anyhow::Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+    let (q_pc, k_pc, v_pc) = layout.per_chunk()?;
+    let t = layout.ckpt_tp;
+    let rpc = q_pc + k_pc + v_pc;
+    anyhow::ensure!(
+        rows == t * rpc,
+        "mimo_v2 qkv: {rows} rows, expected {t} chunks of {q_pc} q + {k_pc} k + {v_pc} v = {}",
+        t * rpc
+    );
+    anyhow::ensure!(block > 0, "mimo_v2 qkv: block size 0");
+    anyhow::ensure!(
+        scale_shape.len() == 2 && scale_shape[1] == cols.div_ceil(block),
+        "mimo_v2 qkv: scale plane {scale_shape:?} for {rows}x{cols} (block {block})"
+    );
+    let s_rows = scale_shape[0];
+    let chunk_blocks = rpc.div_ceil(block);
+    let chunked = s_rows == t * chunk_blocks;
+    let continuous_same_map = s_rows == rows.div_ceil(block) && rpc % block == 0;
+    anyhow::ensure!(
+        chunked || continuous_same_map,
+        "mimo_v2 qkv: scale plane has {s_rows} rows; expected {} ({t} chunks of {chunk_blocks} \
+         blocks). A continuous {}-row grid over {rpc}-row chunks is a different layout and \
+         would mis-scale the rows",
+        t * chunk_blocks,
+        rows.div_ceil(block)
+    );
+    let deq = unpack_fp8_scale_inv_rows(packed, scales, rows, cols, block, s_rows, |r| {
+        (r / rpc) * chunk_blocks + (r % rpc) / block
+    })?;
+    let mut q = Vec::with_capacity(t * q_pc * cols);
+    let mut k = Vec::with_capacity(t * k_pc * cols);
+    let mut v = Vec::with_capacity(t * v_pc * cols);
+    for c in 0..t {
+        let base = c * rpc;
+        q.extend_from_slice(&deq[base * cols..(base + q_pc) * cols]);
+        k.extend_from_slice(&deq[(base + q_pc) * cols..(base + q_pc + k_pc) * cols]);
+        v.extend(
+            deq[(base + q_pc + k_pc) * cols..(base + rpc) * cols]
+                .iter()
+                .map(|&x| x * value_scale),
+        );
+    }
+    Ok((q, k, v))
+}
+
+// ── MiMo-V2 MTP sidecar (`<stem>.mtp.cmf`) ───────────────────────────────
+//
+// The release ships `num_nextn_predict_layers` (3) draft layers in
+// `model_mtp.safetensors`, 47 tensors, under `model.mtp.layers.N.*`. Each is
+// one SWA transformer block with a dense MLP (vLLM `MiMoV2MTPLayer`, SGLang
+// `MiMoV2ModelNextN`):
+//     u = eh_proj·[enorm(embed(tok)); hnorm(hidden)]        embedding FIRST
+//     u += o_proj(swa_attn(input_layernorm(u)))            sinks, window, narrow V
+//     u += mlp(pre_mlp_layernorm(u))
+//     logits = lm_head(final_layernorm(u))                 shared lm_head
+// Their fused qkv uses the SWA geometry with the SAME TP-chunked layout and
+// per-chunk FP8 scale grid as the backbone's sliding layers (14848 rows =
+// 4 chunks × 3712, 116 = 4 × 29 scale rows), so `mimo_v2_split_qkv` decodes
+// it unchanged. Embedding and lm_head are shared with the main model and are
+// NOT written. The main text file never carries MTP (`mimo_v2_canon` drops
+// `model.mtp.*`), so the draft layers live in a sidecar the loader finds by
+// name (`cortiq_core::mtp_sidecar_path`) — a 164 GB main file never has to be
+// rewritten to gain or drop them.
+
+/// Canonical sidecar names: `pre_mlp_layernorm` becomes the loader's
+/// `post_attention_layernorm`, the sink bias becomes `self_attn.sinks`;
+/// everything else keeps its release name.
+const MIMO_MTP_NORMS: [(&str, &str); 5] = [
+    ("enorm", "enorm"),
+    ("hnorm", "hnorm"),
+    ("input_layernorm", "input_layernorm"),
+    ("pre_mlp_layernorm", "post_attention_layernorm"),
+    ("final_layernorm", "final_layernorm"),
+];
+
+/// Write the MiMo-V2 MTP sidecar for the checkpoint in `model_dir` (a local
+/// release directory) to `output` (a main-file path is mapped to its
+/// sidecar name). Attention, eh_proj and MLP matrices go to `quant` (the
+/// skeleton policy: q8_2f); norms and sinks stay f32. Returns the path
+/// written.
+pub fn write_mimo_mtp_sidecar(
+    model_dir: &Path,
+    output: &Path,
+    quant: &str,
+) -> anyhow::Result<PathBuf> {
+    let out = cortiq_core::mtp_sidecar_path(output);
+    let config: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(model_dir.join("config.json"))
+            .map_err(|e| anyhow::anyhow!("{}: {e}", model_dir.join("config.json").display()))?,
+    )?;
+    let arch = build_arch(&config)?;
+    anyhow::ensure!(
+        arch.arch_name == MIMO_V2,
+        "MTP sidecar: only mimo_v2 checkpoints are supported (got {})",
+        arch.arch_name
+    );
+    let tc = config.get("text_config").unwrap_or(&config);
+    let n_mtp = tc
+        .get("num_nextn_predict_layers")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    anyhow::ensure!(n_mtp > 0, "MTP sidecar: config has num_nextn_predict_layers = 0");
+    let quant = parse_quant(quant)?;
+    anyhow::ensure!(
+        matches!(quant, Quant::Q8_2f | Quant::Q8Row | Quant::F16),
+        "MTP sidecar: --quant must be q8_2f, q8 or f16 (the skeleton policy)"
+    );
+    // SWA geometry: the draft layers are sliding-window blocks.
+    let li_swa = arch
+        .layer_types
+        .iter()
+        .position(|t| matches!(t, LayerType::SlidingAttention))
+        .ok_or_else(|| anyhow::anyhow!("MTP sidecar: the backbone has no sliding layer"))?;
+    let kv = arch.kv_heads_per_layer.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("MTP sidecar: mimo_v2 arch without per-layer KV heads")
+    })?;
+    let (h, nh, hd) = (arch.hidden_size, arch.num_attention_heads, arch.head_dim);
+    let vd = arch.v_head_dim.unwrap_or(hd);
+    let layout = MimoQkvLayout {
+        n_heads: nh,
+        n_kv_heads: kv[li_swa],
+        head_dim: hd,
+        v_head_dim: vd,
+        ckpt_tp: arch.num_kv_heads,
+    };
+    let inter = arch.intermediate_size;
+    let value_scale = mimo_v2_value_scale(tc)?;
+    let block = source_fp8_block(&config);
+
+    // Source files: whatever the index maps model.mtp.* to (the release:
+    // model_mtp.safetensors), else that file by name.
+    let mut files: Vec<String> = Vec::new();
+    let idx_path = model_dir.join("model.safetensors.index.json");
+    if idx_path.exists() {
+        let idx: serde_json::Value = serde_json::from_str(&fs::read_to_string(&idx_path)?)?;
+        if let Some(map) = idx.get("weight_map").and_then(|m| m.as_object()) {
+            for (name, file) in map {
+                if let (true, Some(f)) = (name.starts_with("model.mtp."), file.as_str()) {
+                    if !files.iter().any(|x| x == f) {
+                        files.push(f.to_string());
+                    }
+                }
+            }
+        }
+    }
+    if files.is_empty() {
+        files.push("model_mtp.safetensors".into());
+    }
+    let sources: Vec<SafeTensors> = files
+        .iter()
+        .map(|f| open_safetensors(&model_dir.join(f)))
+        .collect::<anyhow::Result<_>>()?;
+    let find = |name: &str| -> Option<(&SafeTensors, &TensorMeta)> {
+        sources
+            .iter()
+            .find_map(|s| s.tensors.iter().find(|t| t.name == name).map(|t| (s, t)))
+    };
+    let need = |name: &str| {
+        find(name).ok_or_else(|| anyhow::anyhow!("MTP sidecar: {name} not found in {files:?}"))
+    };
+    // A 2-D weight in any release storage: FP8 + scale_inv, or a float dtype.
+    let dense = |name: &str, rows: usize, cols: usize| -> anyhow::Result<Vec<f32>> {
+        let (src, m) = need(name)?;
+        anyhow::ensure!(
+            m.shape == [rows, cols],
+            "MTP sidecar: {name} is {:?}, expected [{rows}, {cols}]",
+            m.shape
+        );
+        if m.dtype == "F8_E4M3" {
+            let sname = format!("{name}_scale_inv");
+            let (ss, sm) = need(&sname)?;
+            let scales = to_f32(&sm.dtype, ss.bytes(sm))?;
+            unpack_fp8_scale_inv(src.bytes(m), &scales, rows, cols, block)
+                .map_err(|e| anyhow::anyhow!("{name}: {e}"))
+        } else {
+            to_f32(&m.dtype, src.bytes(m))
+        }
+    };
+    let vector = |name: &str, len: usize| -> anyhow::Result<Vec<f32>> {
+        let (src, m) = need(name)?;
+        anyhow::ensure!(
+            m.shape.iter().product::<usize>() == len,
+            "MTP sidecar: {name} is {:?}, expected {len} values",
+            m.shape
+        );
+        to_f32(&m.dtype, src.bytes(m))
+    };
+    let f32_spec = |name: String, vals: &[f32]| TensorSpec {
+        name,
+        dtype: TensorDtype::F32,
+        shape: vec![vals.len()],
+        data: vals.iter().flat_map(|v| v.to_le_bytes()).collect(),
+    };
+    let mat_spec = |name: String, vals: &[f32], rows: usize, cols: usize| {
+        let (dtype, data) = quantize_2d(quant, vals, rows, cols);
+        TensorSpec {
+            name,
+            dtype,
+            shape: vec![rows, cols],
+            data,
+        }
+    };
+
+    let mut tensors: Vec<TensorSpec> = Vec::new();
+    for k in 0..n_mtp {
+        let p = format!("model.mtp.layers.{k}.");
+        for (src_n, dst_n) in MIMO_MTP_NORMS {
+            let v = vector(&format!("{p}{src_n}.weight"), h)?;
+            tensors.push(f32_spec(format!("{p}{dst_n}.weight"), &v));
+        }
+        let eh = dense(&format!("{p}eh_proj.weight"), h, 2 * h)?;
+        tensors.push(mat_spec(format!("{p}eh_proj.weight"), &eh, h, 2 * h));
+
+        let qkv = format!("{p}self_attn.qkv_proj.weight");
+        let (src, m) = need(&qkv)?;
+        anyhow::ensure!(
+            m.dtype == "F8_E4M3" && m.shape.len() == 2 && m.shape[1] == h,
+            "MTP sidecar: {qkv} must be a 2-D F8_E4M3 [rows, {h}], got {} {:?}",
+            m.dtype,
+            m.shape
+        );
+        let (ss, sm) = need(&format!("{qkv}_scale_inv"))?;
+        let scales = to_f32(&sm.dtype, ss.bytes(sm))?;
+        let (q, kk, v) = mimo_v2_split_qkv(
+            src.bytes(m),
+            &scales,
+            &sm.shape,
+            m.shape[0],
+            h,
+            layout,
+            block,
+            value_scale,
+        )
+        .map_err(|e| anyhow::anyhow!("{qkv}: {e}"))?;
+        let nkv = layout.n_kv_heads;
+        tensors.push(mat_spec(format!("{p}self_attn.q_proj.weight"), &q, nh * hd, h));
+        tensors.push(mat_spec(format!("{p}self_attn.k_proj.weight"), &kk, nkv * hd, h));
+        tensors.push(mat_spec(format!("{p}self_attn.v_proj.weight"), &v, nkv * vd, h));
+        let o = dense(&format!("{p}self_attn.o_proj.weight"), h, nh * vd)?;
+        tensors.push(mat_spec(format!("{p}self_attn.o_proj.weight"), &o, h, nh * vd));
+        let sinks = vector(&format!("{p}self_attn.attention_sink_bias"), nh)?;
+        anyhow::ensure!(
+            sinks.iter().all(|s| s.is_finite()),
+            "MTP sidecar: layer {k} has non-finite sinks"
+        );
+        tensors.push(f32_spec(format!("{p}self_attn.sinks"), &sinks));
+        for (t, rows, cols) in [
+            ("gate_proj", inter, h),
+            ("up_proj", inter, h),
+            ("down_proj", h, inter),
+        ] {
+            let w = dense(&format!("{p}mlp.{t}.weight"), rows, cols)?;
+            tensors.push(mat_spec(format!("{p}mlp.{t}.weight"), &w, rows, cols));
+        }
+    }
+    // Nothing in the MTP files may go unaccounted for: a tensor this writer
+    // does not know is a layout it would silently drop.
+    let known = |n: &str| {
+        let Some(rest) = n.strip_prefix("model.mtp.layers.") else {
+            return false;
+        };
+        let Some((li, tail)) = rest.split_once('.') else {
+            return false;
+        };
+        li.parse::<usize>().is_ok_and(|li| li < n_mtp)
+            && (MIMO_MTP_NORMS
+                .iter()
+                .any(|(s, _)| tail == format!("{s}.weight"))
+                || [
+                    "eh_proj.weight",
+                    "self_attn.qkv_proj.weight",
+                    "self_attn.qkv_proj.weight_scale_inv",
+                    "self_attn.o_proj.weight",
+                    "self_attn.o_proj.weight_scale_inv",
+                    "self_attn.attention_sink_bias",
+                    "eh_proj.weight_scale_inv",
+                ]
+                .contains(&tail)
+                || ["gate_proj", "up_proj", "down_proj"].iter().any(|t| {
+                    tail == format!("mlp.{t}.weight") || tail == format!("mlp.{t}.weight_scale_inv")
+                }))
+    };
+    for s in &sources {
+        for t in &s.tensors {
+            if t.name.starts_with("model.mtp.") {
+                anyhow::ensure!(
+                    known(&t.name),
+                    "MTP sidecar: unexpected tensor {} — refusing to drop it silently",
+                    t.name
+                );
+            }
+        }
+    }
+
+    let mut header_arch = arch.clone();
+    header_arch.mtp = Some(cortiq_core::MtpConfig {
+        num_layers: n_mtp,
+        share_lm_head: true,
+        share_embed: true,
+    });
+    let header = CmfHeader {
+        format: "cmf".into(),
+        version: CMF_VERSION,
+        arch: header_arch,
+        quant_type: match quant {
+            Quant::Q8Row => QuantType::Q8Row,
+            Quant::F16 => QuantType::F16,
+            _ => QuantType::Q8_2f,
+        },
+        provenance: Some(serde_json::json!({
+            "kind": "mimo_mtp_sidecar",
+            "source": model_dir.display().to_string(),
+            "source_files": files,
+            "mtp_layers": n_mtp,
+            "weight_quant": quant_name(quant),
+            "attention_value_scale_folded": value_scale,
+            "names": "model.mtp.layers.N.{enorm,hnorm,eh_proj,input_layernorm,self_attn.{q,k,v,o}_proj,self_attn.sinks,post_attention_layernorm (= pre_mlp_layernorm),mlp.{gate,up,down}_proj,final_layernorm}",
+            "semantics": "u = eh_proj([enorm(embed(tok)); hnorm(hidden)]); SWA block (sinks, window, narrow V, swa theta); logits = lm_head(final_layernorm(u)); embed and lm_head shared with the main file",
+            "converter": format!("cortiq {}", env!("CARGO_PKG_VERSION")),
+        })),
+        tokenizer_config: None,
+        section_hashes: None,
+        skills: Vec::new(),
+        shard: None,
+        calibration: None,
+        routing: None,
+    };
+    if let Some(dir) = out.parent() {
+        if !dir.as_os_str().is_empty() {
+            fs::create_dir_all(dir)?;
+        }
+    }
+    cortiq_core::CmfModel::write(&out, &header, &tensors, None, None)?;
+    Ok(out)
+}
+
+/// Layer index of a `model.layers.N.*` name.
+fn layer_index_of(name: &str) -> Option<usize> {
+    name.strip_prefix("model.layers.")?
+        .split('.')
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// The profile `cortiq convert` uses when `--quant` is not given (or is
+/// `auto`): q8 for every family, except MiMo-V2, whose 256 routed experts
+/// per layer make 8 bits pointless — it converts to q4tp, and its profile
+/// rule (`quant_for_tensor`) keeps the always-active skeleton at q8_2f.
+fn default_quant_for_arch(arch: &ModelArch) -> Quant {
+    if arch.arch_name == MIMO_V2 {
+        Quant::Q4TiledP
+    } else {
+        Quant::Q8Row
+    }
+}
+
+/// `--quant` value that selects [`default_quant_for_arch`].
+pub(crate) const AUTO_QUANT: &str = "auto";
+
+/// Probe knob: `CMF_CONVERT_ONLY=glob[,glob…]` keeps only the source tensors
+/// whose canonical name matches one of the `*`-globs (for a fused tensor, the
+/// fused name). The result is a PARTIAL file — for checking a converter on a
+/// few layers of a huge checkpoint, never for serving; its provenance says so.
+const CONVERT_ONLY_ENV: &str = "CMF_CONVERT_ONLY";
+
+fn parse_convert_only(spec: &str) -> anyhow::Result<Vec<String>> {
+    let pats: Vec<String> = spec.split(',').map(|p| p.trim().to_string()).collect();
+    anyhow::ensure!(
+        !pats.is_empty() && pats.iter().all(|p| !p.is_empty()),
+        "{CONVERT_ONLY_ENV}='{spec}': expected comma-separated non-empty globs"
+    );
+    Ok(pats)
 }
 
 /// Build ModelArch from a HF config.json (dense transformer families).
@@ -3202,6 +4047,11 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
             }
         });
     let head_dim = cfg_usize(tc, "head_dim").unwrap_or(hidden / n_heads.max(1));
+    let mimo = if model_type == MIMO_V2 {
+        Some(mimo_v2_geometry(tc, n_layers, n_heads, head_dim)?)
+    } else {
+        None
+    };
     // Zero-centered RMSNorm x̂·(1+w): Gemma family and native HF
     // Qwen3.5 / Qwen3-Next checkpoints.  Prism/Bonsai is deliberately
     // excluded: its source is the already-sanitized MLX Qwen3.5 runtime
@@ -3495,7 +4345,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
             None => {}
         }
     }
-    Ok(ModelArch {
+    let mut arch = ModelArch {
         arch_name: model_type.clone(),
         hidden_size: hidden,
         intermediate_size: cfg_usize(tc, "intermediate_size")
@@ -3682,7 +4532,35 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
             .and_then(|v| v.as_bool())
             .unwrap_or(true),
         prism_hadamard: None,
-    })
+        kv_heads_per_layer: None,
+        v_head_dim: None,
+    };
+    if let Some(g) = mimo {
+        // MiMo-V2: an explicit per-layer full/sliding schedule (the loader's
+        // explicit_sliding path: window on the tagged layers, their own
+        // local RoPE base), per-layer KV head counts, narrower V heads.
+        arch.layer_types = g.layer_types;
+        arch.kv_heads_per_layer = Some(g.kv_heads_per_layer);
+        arch.v_head_dim = Some(g.v_head_dim);
+        arch.sliding_window = Some(g.sliding_window);
+        arch.sliding_window_pattern = None;
+        arch.rope_local_base_freq = Some(g.swa_rope_theta);
+        arch.local_partial_rotary_factor = None;
+        // Store the rotary width as an exact ratio: the runtime computes
+        // `(head_dim · factor) as usize`, and 64/192 lands on 64 by
+        // construction instead of by the rounding of 192·0.334 = 64.128.
+        let factor = g.rotary_dim as f32 / head_dim as f32;
+        anyhow::ensure!(
+            (head_dim as f32 * factor) as usize == g.rotary_dim,
+            "mimo_v2: rotary factor {factor} does not reproduce {} dims",
+            g.rotary_dim
+        );
+        arch.partial_rotary_factor = factor;
+        arch.rms_norm_eps = g.rms_norm_eps;
+        // The 3-layer MTP head is dropped at conversion (mimo_v2_canon).
+        arch.mtp = None;
+    }
+    Ok(arch)
 }
 
 /// Load and validate the source-side Hadamard manifest for Prism/Bonsai.
@@ -4486,6 +5364,7 @@ fn directory_record_estimate(source_tensors: usize, arch: &ModelArch) -> usize {
         .max(4096)
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // the CLI calls run_convert_towers
 pub fn run_convert(
     model: &str,
     quant: &str,
@@ -4505,10 +5384,30 @@ pub fn run_convert(
     run_convert_multi(model, &outputs, hf_token, defrag, o1_hint, resume, progress)
 }
 
+/// [`run_convert`] with the MiMo-V2 tower mode (`--mimo-towers`).
+#[allow(clippy::too_many_arguments)]
+pub fn run_convert_towers(
+    model: &str,
+    quant: &str,
+    output: &str,
+    hf_token: Option<&str>,
+    defrag: Option<&str>,
+    o1_hint: Option<serde_json::Value>,
+    resume: bool,
+    towers: MimoTowers,
+    progress: impl FnMut(f32),
+) -> anyhow::Result<()> {
+    let outputs = vec![(quant.to_string(), output.to_string())];
+    run_convert_multi_towers(
+        model, &outputs, hf_token, defrag, o1_hint, resume, towers, progress,
+    )
+}
+
 /// Convert one source checkpoint into one or more independently finalized
 /// CMF outputs.  All requested profiles consume each source shard in one
 /// streamed pass; the decoded values are borrowed while each profile's
 /// encoder writes its own payload.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn run_convert_multi(
     model: &str,
     outputs: &[(String, String)],
@@ -4516,9 +5415,42 @@ pub fn run_convert_multi(
     defrag: Option<&str>,
     o1_hint: Option<serde_json::Value>,
     resume: bool,
+    progress: impl FnMut(f32),
+) -> anyhow::Result<()> {
+    run_convert_multi_towers(
+        model,
+        outputs,
+        hf_token,
+        defrag,
+        o1_hint,
+        resume,
+        MimoTowers::TextOnly,
+        progress,
+    )
+}
+
+/// [`run_convert_multi`] with the MiMo-V2 tower mode. `MmOnly` writes the
+/// companion (no text tensors are read); `Multimodal` adds the towers, the
+/// audio tokenizer encoder and the config blobs to each text output.
+#[allow(clippy::too_many_arguments)]
+pub fn run_convert_multi_towers(
+    model: &str,
+    outputs: &[(String, String)],
+    hf_token: Option<&str>,
+    defrag: Option<&str>,
+    o1_hint: Option<serde_json::Value>,
+    resume: bool,
+    towers: MimoTowers,
     mut progress: impl FnMut(f32),
 ) -> anyhow::Result<()> {
     anyhow::ensure!(!outputs.is_empty(), "at least one output is required");
+    if towers == MimoTowers::MmOnly {
+        anyhow::ensure!(
+            defrag.is_none() && o1_hint.is_none() && !resume,
+            "--mimo-towers mm-only writes only the towers: --defrag, --o1 and --resume do not apply"
+        );
+        return crate::mimo_towers::run_convert_mimo_mm(model, outputs, progress);
+    }
     for (i, (_, path)) in outputs.iter().enumerate() {
         anyhow::ensure!(!path.trim().is_empty(), "output path {} is empty", i + 1);
         anyhow::ensure!(
@@ -4527,16 +5459,18 @@ pub fn run_convert_multi(
             path
         );
     }
-    let profiles: Vec<Quant> = outputs
+    // `auto` resolves once the config is read (default_quant_for_arch);
+    // every explicit profile is validated now, before any download.
+    let requested_profiles: Vec<Option<Quant>> = outputs
         .iter()
-        .map(|(q, _)| parse_quant(q))
+        .map(|(q, _)| {
+            if q.trim().eq_ignore_ascii_case(AUTO_QUANT) {
+                Ok(None)
+            } else {
+                parse_quant(q).map(Some)
+            }
+        })
         .collect::<anyhow::Result<_>>()?;
-    let quant = profiles[0];
-    // Some codecs intentionally share a physical dtype (q1/q1p both use
-    // Q1).  Preserve the requested encoder so later skill grafts can encode
-    // replacement tensors with the same algorithm instead of guessing from
-    // the directory dtype alone.
-    let requested_quant = quant_name(quant);
 
     // Source: a local HF directory, or an HF repo id — hub checkpoints
     // convert STREAMED: one weight shard on disk at a time.
@@ -4567,6 +5501,45 @@ pub fn run_convert_multi(
         &fs::read(dir.join("config.json")).map_err(|e| anyhow::anyhow!("read config.json: {e}"))?,
     )?;
     let mut arch = build_arch(&config)?;
+    // The multimodal towers (checked before any shard is touched: a missing
+    // audio tokenizer must not surface after a multi-hour text pass).
+    let tower_source = match towers {
+        MimoTowers::TextOnly => None,
+        MimoTowers::MmOnly => unreachable!("dispatched above"),
+        MimoTowers::Multimodal => {
+            anyhow::ensure!(
+                arch.arch_name == MIMO_V2,
+                "--mimo-towers multimodal applies to {MIMO_V2} checkpoints, not '{}'",
+                arch.arch_name
+            );
+            anyhow::ensure!(
+                stream_repo.is_none(),
+                "--mimo-towers multimodal needs a local checkpoint dir (with {}/)",
+                crate::mimo_towers::AUDIO_TOKENIZER_DIR
+            );
+            Some(crate::mimo_towers::TowerSource::open(dir)?)
+        }
+    };
+    let profiles: Vec<Quant> = requested_profiles
+        .iter()
+        .map(|q| {
+            q.unwrap_or_else(|| {
+                let d = default_quant_for_arch(&arch);
+                eprintln!(
+                    "  quant: none requested — {} converts to {} by default",
+                    arch.arch_name,
+                    quant_name(d)
+                );
+                d
+            })
+        })
+        .collect();
+    let quant = profiles[0];
+    // Some codecs intentionally share a physical dtype (q1/q1p both use
+    // Q1).  Preserve the requested encoder so later skill grafts can encode
+    // replacement tensors with the same algorithm instead of guessing from
+    // the directory dtype alone.
+    let requested_quant = quant_name(quant);
     arch.prism_hadamard = load_prism_hadamard(dir, &config)?;
     if arch.prism_hadamard.is_some() {
         let has_ordinary = profiles.iter().any(|q| matches!(q, Quant::Q2TiledP));
@@ -4758,6 +5731,7 @@ pub fn run_convert_multi(
     }
     let mut tensors: Vec<Vec<TensorSpec>> =
         outputs.iter().map(|_| Vec::with_capacity(total)).collect();
+    let mut tower_stats = vec![crate::mimo_towers::TowerStats::default(); outputs.len()];
     if arch.prism_hadamard.is_some() {
         let mut vision_cfg = config
             .get("vision_config")
@@ -4821,6 +5795,23 @@ pub fn run_convert_multi(
     // instead of presenting the rung quantization as lossless.
     let mut prism_affine_scale_sq = 0.0f64;
     let mut prism_affine_scale_count = 0usize;
+    // MiMo-V2 folds attention_value_scale into the V rows it splits out of
+    // the fused qkv.
+    let mimo_value_scale = if arch.arch_name == MIMO_V2 {
+        mimo_v2_value_scale(config.get("text_config").unwrap_or(&config))?
+    } else {
+        1.0
+    };
+    let convert_only = match std::env::var(CONVERT_ONLY_ENV) {
+        Ok(spec) => {
+            let pats = parse_convert_only(&spec)?;
+            eprintln!(
+                "  {CONVERT_ONLY_ENV}={spec}: writing a PARTIAL file (only matching tensors) — a probe, not a model"
+            );
+            Some(pats)
+        }
+        Err(_) => None,
+    };
 
     let mut process_file = |file: &SafeTensors,
                             files: &[SafeTensors],
@@ -4869,9 +5860,31 @@ pub fn run_convert_multi(
                     continue;
                 }
             }
-            let Some(name) = canon_name_for_arch(&arch, &m.name) else {
+            let Some(name) = canon_name_for_arch(&arch, &m.name, towers) else {
                 continue;
             };
+            if let Some(pats) = convert_only.as_ref() {
+                if !pats.iter().any(|p| glob_match(p, &name)) {
+                    continue;
+                }
+            }
+            // MiMo-V2 towers (multimodal mode only — text mode dropped them
+            // in canon): the tower codec policy, not the text profile rules.
+            if arch.arch_name == MIMO_V2
+                && cortiq_engine::mimo_mm::MimoTowerGroup::of(&name).is_some()
+            {
+                crate::mimo_towers::emit_tower(
+                    batches,
+                    profiles,
+                    active,
+                    &mut tower_stats,
+                    &name,
+                    &m.shape,
+                    &m.dtype,
+                    file.bytes(m),
+                )?;
+                continue;
+            }
             // HunYuan dense ships the tied `lm_head.weight` as a second copy
             // of the embedding; the loader reads the embedding when the
             // header says tied, so the copy would only be dead bytes.
@@ -4996,7 +6009,8 @@ pub fn run_convert_multi(
             if m.dtype == "F16" && (name.ends_with(".scales") || name.ends_with(".biases")) {
                 continue;
             }
-            // MXFP4 group scales ride with their .weight_packed twin.
+            // MXFP4 group scales ride with their .weight_packed (Kimi-K3) or
+            // U8 .weight (MiMo-V2) twin.
             if m.dtype == "U8" && name.ends_with(".weight_scale") {
                 continue;
             }
@@ -5007,6 +6021,78 @@ pub fn run_convert_multi(
             }
             // Fine-grained FP8 scale planes ride with `.weight` below.
             if name.ends_with(".weight_scale_inv") {
+                continue;
+            }
+            // MiMo-V2 fused qkv: TP-chunked rows AND a TP-chunked scale grid.
+            // It must be decoded here, before the generic FP8 path: that
+            // path tiles the scales continuously, which refuses the
+            // full-attention layers (108 vs 106 scale rows) but silently
+            // ACCEPTS the sliding layers (116 = 116), and the Phi-3 split
+            // below would then read global [q|k|v] out of chunked rows.
+            if arch.arch_name == MIMO_V2 && name.ends_with(".self_attn.qkv_proj.weight") {
+                let li = layer_index_of(&name)
+                    .ok_or_else(|| anyhow::anyhow!("{name}: no layer index"))?;
+                anyhow::ensure!(
+                    m.dtype == "F8_E4M3" && m.shape.len() == 2,
+                    "{name}: expected a 2-D F8_E4M3 fused qkv, got {} {:?}",
+                    m.dtype,
+                    m.shape
+                );
+                let scale_name = format!("{}_scale_inv", m.name);
+                let (scale_vals, scale_shape) = files
+                    .iter()
+                    .find_map(|source| {
+                        source
+                            .tensors
+                            .iter()
+                            .find(|t| t.name == scale_name)
+                            .map(|t| (source, t))
+                    })
+                    .map(|(source, t)| {
+                        anyhow::ensure!(
+                            t.dtype == "F32",
+                            "{scale_name}: expected F32 inverse scales, got {}",
+                            t.dtype
+                        );
+                        Ok((to_f32(&t.dtype, source.bytes(t))?, t.shape.clone()))
+                    })
+                    .ok_or_else(|| anyhow::anyhow!("{name}: missing {scale_name}"))??;
+                let n_kv_heads = arch
+                    .kv_heads_per_layer
+                    .as_ref()
+                    .and_then(|k| k.get(li).copied())
+                    .ok_or_else(|| anyhow::anyhow!("{name}: no KV head count for layer {li}"))?;
+                let layout = MimoQkvLayout {
+                    n_heads: arch.num_attention_heads,
+                    n_kv_heads,
+                    head_dim: arch.head_dim,
+                    v_head_dim: arch.v_head_dim.unwrap_or(arch.head_dim),
+                    ckpt_tp: arch.num_kv_heads,
+                };
+                let (rows, cols) = (m.shape[0], m.shape[1]);
+                let (q, k, v) = mimo_v2_split_qkv(
+                    file.bytes(m),
+                    &scale_vals,
+                    &scale_shape,
+                    rows,
+                    cols,
+                    layout,
+                    source_fp8_block,
+                    mimo_value_scale,
+                )
+                .map_err(|e| anyhow::anyhow!("{name}: {e}"))?;
+                for (part, vals) in [("q_proj", &q), ("k_proj", &k), ("v_proj", &v)] {
+                    emit_profiled_tensor(
+                        batches,
+                        profiles,
+                        active,
+                        &arch,
+                        &name.replace("qkv_proj", part),
+                        &[vals.len() / cols, cols],
+                        vals,
+                        EmitMode::Auto,
+                    );
+                }
                 continue;
             }
             let fp8_scale_inv = if m.dtype == "F8_E4M3" && m.shape.len() == 2 {
@@ -5077,7 +6163,8 @@ pub fn run_convert_multi(
                 None
             };
 
-            let mxfp4 = if m.dtype == "U8" && m.name.ends_with(".weight_packed") {
+            let mxfp4_packed = m.dtype == "U8" && m.name.ends_with(".weight_packed");
+            let mxfp4 = if mxfp4_packed {
                 // MXFP4 (Kimi-K3 experts): decode to f32 and continue the
                 // normal path under the plain `.weight` name.
                 let scale_name = m.name.replace(".weight_packed", ".weight_scale");
@@ -5095,10 +6182,43 @@ pub fn run_convert_multi(
                     vec![rows, cp * 2],
                     unpack_mxfp4(file.bytes(m), scales, rows, cp)?,
                 ))
+            } else if m.dtype == "U8" && m.name.ends_with(".weight") {
+                // MXFP4 under the plain `.weight` name (MiMo-V2 experts): U8
+                // [rows, cols/2] nibble pairs + a U8 E8M0 sibling
+                // `.weight_scale` [rows, cols/32]. Without that sibling the
+                // bytes are some other packing, and the generic path below
+                // refuses the U8 dtype as before.
+                let scale_name = format!("{}_scale", m.name);
+                let scale = files.iter().find_map(|f| {
+                    f.tensors
+                        .iter()
+                        .find(|t| t.name == scale_name)
+                        .map(|t| (f.bytes(t), t.dtype.as_str(), t.shape.clone()))
+                });
+                match scale {
+                    Some((scales, scale_dtype, scale_shape)) => {
+                        anyhow::ensure!(m.shape.len() == 2, "{name}: mxfp4 expects 2-D");
+                        let (rows, cp) = (m.shape[0], m.shape[1]);
+                        anyhow::ensure!(
+                            scale_dtype == "U8"
+                                && (cp * 2) % 32 == 0
+                                && scale_shape == vec![rows, cp * 2 / 32],
+                            "{name}: U8 weight [{rows}, {cp}] with {scale_name} {scale_dtype} {:?} \
+                             is not MXFP4 (expected U8 [{rows}, {}])",
+                            scale_shape,
+                            cp * 2 / 32
+                        );
+                        Some((
+                            vec![rows, cp * 2],
+                            unpack_mxfp4(file.bytes(m), scales, rows, cp)?,
+                        ))
+                    }
+                    None => None,
+                }
             } else {
                 None
             };
-            let name = if mxfp4.is_some() {
+            let name = if mxfp4_packed {
                 name.strip_suffix("_packed")
                     .expect("suffix checked")
                     .to_string()
@@ -5896,6 +7016,14 @@ pub fn run_convert_multi(
         }
     }
 
+    // MiMo-V2 multimodal: the audio tokenizer encoder (its own file) and
+    // the two config blobs, after the shard pass so the text outputs'
+    // resumable shard marks stay exactly the index's shards.
+    if let Some(src) = tower_source.as_ref() {
+        let active: Vec<bool> = (0..outputs.len()).map(|i| !completed[i]).collect();
+        src.emit_tail(&mut tensors, &profiles, &active, &mut tower_stats)?;
+    }
+
     // Tokenizer + chat bundle (optional but recommended).
     let tok_cfg: serde_json::Value = fs::read(dir.join("tokenizer_config.json"))
         .ok()
@@ -6011,6 +7139,15 @@ pub fn run_convert_multi(
         }
         None => provenance,
     };
+    // A CMF_CONVERT_ONLY probe must never pass for a model.
+    let provenance = match &convert_only {
+        Some(pats) => {
+            let mut p = provenance;
+            p["partial_convert_only"] = serde_json::json!(pats);
+            p
+        }
+        None => provenance,
+    };
     let provenance = if let Some(prism) = arch.prism_hadamard.as_ref() {
         let mut p = provenance;
         p["prism_hadamard"] = serde_json::json!({
@@ -6045,6 +7182,13 @@ pub fn run_convert_multi(
     let header_for = |i: usize| {
         let mut p = provenance.clone();
         p["weight_quant"] = serde_json::json!(quant_name(profiles[i]));
+        if let Some(src) = tower_source.as_ref() {
+            let mut mm = src.provenance(towers.label(), &tower_stats[i]);
+            // A resumed run did not see the towers of shards finished
+            // earlier; its codec summary covers only this run's part.
+            mm["resumed_run"] = serde_json::json!(resume);
+            p["mimo_mm"] = mm;
+        }
         let header_arch = if matches!(profiles[i], Quant::Q2TiledPAffine) {
             let mut a = arch.clone();
             let prism = a
@@ -8828,5 +9972,1432 @@ mod hunyuan_tests {
         let mut bad = w.clone();
         bad[5] = 0.5 * bad.iter().find(|v| **v > 0.0).copied().unwrap();
         assert!(encode_q1t_exact(&bad, rows, cols).is_err());
+    }
+}
+
+#[cfg(test)]
+mod mimo_v2_tests {
+    use super::tests::{ENV_LOCK, env_guard};
+    use super::*;
+    use cortiq_core::format::CmfModel;
+    use cortiq_core::quant::dequant_q8_2f;
+
+    /// The text-relevant keys of XiaomiMiMo/MiMo-V2.6-Flash-RL config.json,
+    /// verbatim (the vision/audio/processor sub-configs and the 49-entry
+    /// ignored_layers list are left out; nothing reads them).
+    fn real_config() -> serde_json::Value {
+        serde_json::json!({
+            "add_full_attention_sink_bias": false,
+            "add_swa_attention_sink_bias": true,
+            "architectures": ["MiMoV2ForCausalLM"],
+            "attention_bias": false,
+            "attention_chunk_size": 128,
+            "attention_dropout": 0.0,
+            "attention_projection_layout": "fused_qkv",
+            "attention_value_scale": 0.707,
+            "moe_router_dtype": "bfloat16",
+            "bos_token_id": null,
+            "dtype": "bfloat16",
+            "eos_token_id": 151645,
+            "head_dim": 192,
+            "hidden_act": "silu",
+            "hidden_size": 4096,
+            "hybrid_block_size": null,
+            "hybrid_layer_pattern": [0, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 0, 1, 1,
+                                     1, 1, 1, 0, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1,
+                                     1, 0, 1, 1, 1, 1, 1, 0],
+            "initializer_range": 0.02,
+            "intermediate_size": 16384,
+            "layernorm_epsilon": 1e-06,
+            "max_position_embeddings": 1048576,
+            "model_type": "mimo_v2",
+            "moe_intermediate_size": 2048,
+            "moe_layer_freq": [0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                               1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                               1, 1, 1, 1],
+            "n_group": 1,
+            "n_routed_experts": 256,
+            "n_shared_experts": null,
+            "norm_topk_prob": true,
+            "num_attention_heads": 64,
+            "num_experts_per_tok": 8,
+            "num_hidden_layers": 48,
+            "num_key_value_heads": 4,
+            "num_nextn_predict_layers": 3,
+            "pad_token_id": 151643,
+            "partial_rotary_factor": 0.334,
+            "quantization_config": {
+                "activation_scheme": "dynamic",
+                "fmt": "e4m3",
+                "ignored_layers": ["model.layers.0.self_attn.o_proj"],
+                "mxfp4_block_size": 32,
+                "quant_method": "fp8",
+                "store_dtype": "mxfp4",
+                "weight_block_size": [128, 128]
+            },
+            "rope_parameters": {
+                "partial_rotary_factor": 0.334,
+                "rope_theta": 10000000.0,
+                "rope_type": "default",
+                "type": "default"
+            },
+            "rope_theta": 10000000.0,
+            "routed_scaling_factor": null,
+            "scoring_func": "sigmoid",
+            "sliding_window": 128,
+            "sliding_window_size": 128,
+            "swa_head_dim": 192,
+            "swa_num_attention_heads": 64,
+            "swa_num_key_value_heads": 8,
+            "swa_rope_theta": 10000.0,
+            "swa_v_head_dim": 128,
+            "tie_word_embeddings": false,
+            "topk_group": 1,
+            "topk_method": "noaux_tc",
+            "use_cache": true,
+            "v_head_dim": 128,
+            "vocab_size": 152576
+        })
+    }
+
+    #[test]
+    fn mimo_v2_real_config_maps_to_exact_cmf_contract() {
+        let config = real_config();
+        let arch = build_arch(&config).unwrap();
+        assert_eq!(arch.arch_name, "mimo_v2");
+        assert_eq!(arch.num_layers, 48);
+        assert_eq!(arch.hidden_size, 4096);
+        assert_eq!(arch.intermediate_size, 16384, "dense layer-0 MLP width");
+        assert_eq!(arch.num_attention_heads, 64);
+        assert_eq!(arch.num_kv_heads, 4);
+        assert_eq!(arch.head_dim, 192);
+        assert_eq!(arch.v_head_dim, Some(128));
+        assert_eq!(arch.vocab_size, 152576);
+        assert!(!arch.tie_word_embeddings);
+        assert_eq!(arch.norm_style, NormStyle::Qwen, "MiMo RMSNorm is x̂·w");
+        assert_eq!(arch.rms_norm_eps, 1e-6);
+        let full: Vec<usize> = arch
+            .layer_types
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| matches!(t, LayerType::FullAttention))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(full, vec![0, 5, 11, 17, 23, 29, 35, 41, 47]);
+        assert_eq!(
+            arch.layer_types
+                .iter()
+                .filter(|t| matches!(t, LayerType::SlidingAttention))
+                .count(),
+            39
+        );
+        let kv = arch.kv_heads_per_layer.as_ref().unwrap();
+        assert_eq!(kv.len(), 48);
+        for (li, &n) in kv.iter().enumerate() {
+            let want = if full.contains(&li) { 4 } else { 8 };
+            assert_eq!(n, want, "layer {li}");
+        }
+        assert_eq!(arch.sliding_window, Some(128));
+        assert_eq!(arch.sliding_window_pattern, None);
+        assert_eq!(arch.rope_theta, 1e7);
+        assert_eq!(arch.rope_local_base_freq, Some(1e4));
+        assert_eq!(arch.local_partial_rotary_factor, None);
+        // The loader's formula must land on 64 rotary dims.
+        assert_eq!(
+            (arch.head_dim as f32 * arch.partial_rotary_factor) as usize,
+            64
+        );
+        assert_eq!(arch.partial_rotary_factor, 64.0 / 192.0);
+        assert!(arch.yarn.is_none());
+        assert!(arch.mtp.is_none(), "the 3-layer MTP head is dropped");
+        assert_eq!(arch.max_position_embeddings, 1048576);
+        assert_eq!(arch.query_pre_attn_scalar, None, "softmax scale = 192^-0.5");
+        let moe = arch.moe.as_ref().unwrap();
+        assert_eq!(moe.num_experts, 256);
+        assert_eq!(moe.top_k, 8);
+        assert_eq!(moe.moe_intermediate_size, 2048);
+        assert!(moe.router_sigmoid);
+        assert!(moe.norm_topk_prob);
+        assert_eq!(moe.shared_expert_intermediate_size, None);
+        assert_eq!(moe.routed_scaling_factor, None);
+        // Generation stops on all three ids of generation_config.json.
+        let gen_cfg = serde_json::json!({
+            "bos_token_id": 151643,
+            "eos_token_id": [151643, 151645, 151672]
+        });
+        assert_eq!(eos_ids(&gen_cfg, &config), vec![151643, 151645, 151672]);
+        // No --quant: q4tp.
+        assert_eq!(default_quant_for_arch(&arch), Quant::Q4TiledP);
+        assert_eq!(mimo_v2_value_scale(&config).unwrap(), 0.707);
+    }
+
+    #[test]
+    fn mimo_v2_refuses_unsupported_config_variants() {
+        let cases: Vec<(&str, serde_json::Value, &str)> = vec![
+            ("swa_head_dim", serde_json::json!(128), "swa_head_dim"),
+            (
+                "swa_num_attention_heads",
+                serde_json::json!(32),
+                "swa_num_attention_heads",
+            ),
+            ("swa_v_head_dim", serde_json::json!(192), "swa_v_head_dim"),
+            (
+                "swa_num_key_value_heads",
+                serde_json::json!(6),
+                "swa_num_key_value_heads",
+            ),
+            ("n_group", serde_json::json!(8), "n_group"),
+            ("topk_group", serde_json::json!(4), "topk_group"),
+            ("topk_method", serde_json::json!("greedy"), "topk_method"),
+            (
+                "attention_projection_layout",
+                serde_json::json!("split_qkv"),
+                "fused_qkv",
+            ),
+            (
+                "add_full_attention_sink_bias",
+                serde_json::json!(true),
+                "add_full_attention_sink_bias",
+            ),
+            ("attention_bias", serde_json::json!(true), "attention_bias"),
+            (
+                "hybrid_layer_pattern",
+                serde_json::json!([0, 1]),
+                "hybrid_layer_pattern",
+            ),
+            (
+                "sliding_window_size",
+                serde_json::json!(256),
+                "sliding_window",
+            ),
+            (
+                "partial_rotary_factor",
+                serde_json::json!(0.5),
+                "partial_rotary_factor",
+            ),
+            (
+                "rope_parameters",
+                serde_json::json!({"rope_type": "yarn", "factor": 4.0, "rope_theta": 1e7,
+                                   "partial_rotary_factor": 0.334}),
+                "yarn",
+            ),
+            (
+                "quantization_config",
+                serde_json::Value::Null,
+                "quantization_config",
+            ),
+        ];
+        for (key, value, needle) in cases {
+            let mut config = real_config();
+            config[key] = value;
+            let err = build_arch(&config)
+                .err()
+                .unwrap_or_else(|| panic!("{key}: accepted"))
+                .to_string();
+            assert!(err.contains(needle), "{key}: {err}");
+        }
+        let mut config = real_config();
+        config["hybrid_layer_pattern"][3] = serde_json::json!(2);
+        assert!(build_arch(&config).is_err());
+        let mut config = real_config();
+        config["quantization_config"]["weight_block_size"] = serde_json::json!([64, 64]);
+        let err = build_arch(&config).unwrap_err().to_string();
+        assert!(err.contains("weight_block_size"), "{err}");
+        let mut config = real_config();
+        config["quantization_config"]["mxfp4_block_size"] = serde_json::json!(16);
+        assert!(build_arch(&config).is_err());
+    }
+
+    #[test]
+    fn mimo_v2_canon_rules_are_arch_gated_and_switchable() {
+        let arch = build_arch(&real_config()).unwrap();
+        let c = |raw: &str| canon_name_for_arch(&arch, raw, MimoTowers::TextOnly);
+        assert_eq!(
+            c("model.layers.3.mlp.gate.e_score_correction_bias").as_deref(),
+            Some("model.layers.3.mlp.expert_bias")
+        );
+        assert_eq!(
+            c("model.layers.3.self_attn.attention_sink_bias").as_deref(),
+            Some("model.layers.3.self_attn.sinks")
+        );
+        for kept in [
+            "model.embed_tokens.weight",
+            "lm_head.weight",
+            "model.norm.weight",
+            "model.layers.3.self_attn.qkv_proj.weight",
+            "model.layers.3.self_attn.o_proj.weight",
+            "model.layers.3.mlp.gate.weight",
+            "model.layers.3.mlp.experts.17.down_proj.weight",
+            "model.layers.0.mlp.gate_proj.weight",
+            "model.layers.3.input_layernorm.weight",
+        ] {
+            assert_eq!(c(kept).as_deref(), Some(kept), "{kept}");
+        }
+        for dropped in [
+            "model.mtp.layers.0.self_attn.qkv_proj.weight",
+            "model.mtp.layers.2.enorm.weight",
+            "visual.blocks.0.attn.qkv.weight",
+            "visual.merger.mlp.0.weight",
+            "audio_encoder.layers.0.self_attn.q_proj.weight",
+            "speech_embeddings.3.weight",
+        ] {
+            assert_eq!(c(dropped), None, "{dropped}");
+        }
+        // The multimodal mode keeps the towers (MTP stays dropped).
+        let mm = |raw: &str| mimo_v2_canon(raw, MimoTowers::Multimodal);
+        assert_eq!(
+            mm("visual.merger.mlp.0.weight").as_deref(),
+            Some("visual.merger.mlp.0.weight")
+        );
+        assert_eq!(
+            mm("audio_encoder.x.weight").as_deref(),
+            Some("audio_encoder.x.weight")
+        );
+        assert_eq!(
+            mm("speech_embeddings.0.weight").as_deref(),
+            Some("speech_embeddings.0.weight")
+        );
+        assert_eq!(mm("model.mtp.layers.0.enorm.weight"), None);
+        assert_eq!(
+            mm("model.layers.1.mlp.gate.e_score_correction_bias").as_deref(),
+            Some("model.layers.1.mlp.expert_bias")
+        );
+        // Other families keep the generic policy: the MiMo drops and
+        // renames do not leak into them.
+        let mut other = arch.clone();
+        other.arch_name = "qwen3_moe".into();
+        assert_eq!(
+            canon_name_for_arch(&other, "audio_encoder.x.weight", MimoTowers::Multimodal)
+                .as_deref(),
+            Some("audio_encoder.x.weight")
+        );
+        assert_eq!(
+            canon_name_for_arch(
+                &other,
+                "model.layers.3.self_attn.attention_sink_bias",
+                MimoTowers::TextOnly
+            )
+            .as_deref(),
+            Some("model.layers.3.self_attn.attention_sink_bias")
+        );
+        // Dtype rules: bias and sinks exact f32, router f16.
+        assert!(force_f32("model.layers.3.self_attn.sinks"));
+        assert!(force_f32("model.layers.3.mlp.expert_bias"));
+        assert!(force_f16("model.layers.3.mlp.gate.weight"));
+    }
+
+    #[test]
+    fn mimo_v2_profile_puts_only_experts_on_the_low_bit_plane() {
+        let arch = build_arch(&real_config()).unwrap();
+        let q = |requested: Quant, name: &str| profile_quant(&arch, requested, name);
+        for skeleton in [
+            "model.embed_tokens.weight",
+            "lm_head.weight",
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.1.self_attn.k_proj.weight",
+            "model.layers.1.self_attn.v_proj.weight",
+            "model.layers.1.self_attn.o_proj.weight",
+            "model.layers.0.mlp.gate_proj.weight",
+            "model.layers.0.mlp.up_proj.weight",
+            "model.layers.0.mlp.down_proj.weight",
+        ] {
+            assert_eq!(q(Quant::Q4TiledP, skeleton), Quant::Q8_2f, "{skeleton}");
+            assert_eq!(q(Quant::Q2TiledP, skeleton), Quant::Q8_2f, "{skeleton}");
+            assert_eq!(q(Quant::Q8Row, skeleton), Quant::Q8Row, "{skeleton}");
+        }
+        for e in ["gate_proj", "up_proj", "down_proj"] {
+            let n = format!("model.layers.7.mlp.experts.200.{e}.weight");
+            assert_eq!(q(Quant::Q4TiledP, &n), Quant::Q4TiledP, "{n}");
+        }
+        // q2tp: 2-bit gate/up, 4-bit down, 8-bit skeleton.
+        assert_eq!(
+            q(
+                Quant::Q2TiledP,
+                "model.layers.7.mlp.experts.200.gate_proj.weight"
+            ),
+            Quant::Q2TiledP
+        );
+        assert_eq!(
+            q(
+                Quant::Q2TiledP,
+                "model.layers.7.mlp.experts.200.down_proj.weight"
+            ),
+            Quant::Q4TiledP
+        );
+    }
+
+    // ── synthetic fused-qkv fixtures ─────────────────────────────────────
+
+    /// FP8 bytes that are all finite (never the 0x7F/0xFF NaN codes).
+    fn fp8_bytes(n: usize, seed: usize) -> Vec<u8> {
+        (0..n)
+            .map(|i| {
+                let mag = ((i * 29 + seed * 13 + 7) % 126) as u8;
+                if (i + seed) % 3 == 0 { mag | 0x80 } else { mag }
+            })
+            .collect()
+    }
+
+    /// The expected split, written independently of the converter: walk the
+    /// STORED rows in order, find each row's chunk, its section (Q/K/V) and
+    /// its scale row on the per-chunk grid, and append it where it belongs.
+    fn expected_split(
+        packed: &[u8],
+        scales: &[f32],
+        s_cols: usize,
+        rows: usize,
+        cols: usize,
+        l: MimoQkvLayout,
+        vscale: f32,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let t = l.ckpt_tp;
+        let q_pc = l.n_heads / t * l.head_dim;
+        let k_pc = l.n_kv_heads / t * l.head_dim;
+        let v_pc = l.n_kv_heads / t * l.v_head_dim;
+        let rpc = q_pc + k_pc + v_pc;
+        let blocks_per_chunk = rpc.div_ceil(128);
+        let (mut q, mut k, mut v) = (vec![], vec![], vec![]);
+        for r in 0..rows {
+            let (chunk, within) = (r / rpc, r % rpc);
+            let srow = chunk * blocks_per_chunk + within / 128;
+            let row: Vec<f32> = (0..cols)
+                .map(|c| fp8_e4m3_to_f32(packed[r * cols + c]) * scales[srow * s_cols + c / 128])
+                .collect();
+            if within < q_pc {
+                q.extend(row);
+            } else if within < q_pc + k_pc {
+                k.extend(row);
+            } else {
+                v.extend(row.into_iter().map(|x| x * vscale));
+            }
+        }
+        (q, k, v)
+    }
+
+    fn check_split(l: MimoQkvLayout, cols: usize) {
+        let t = l.ckpt_tp;
+        let rpc = (l.n_heads / t + l.n_kv_heads / t) * l.head_dim + l.n_kv_heads / t * l.v_head_dim;
+        let rows = t * rpc;
+        let s_rows = t * rpc.div_ceil(128);
+        let s_cols = cols.div_ceil(128);
+        let packed = fp8_bytes(rows * cols, rows);
+        // Powers of two, different on neighbouring scale cells: a wrong
+        // grid changes values, it cannot hide in rounding.
+        let scales: Vec<f32> = (0..s_rows * s_cols)
+            .map(|i| ((i % 9) as f32 - 4.0).exp2())
+            .collect();
+        let (q, k, v) = mimo_v2_split_qkv(
+            &packed,
+            &scales,
+            &[s_rows, s_cols],
+            rows,
+            cols,
+            l,
+            128,
+            0.707,
+        )
+        .unwrap();
+        let (eq, ek, ev) = expected_split(&packed, &scales, s_cols, rows, cols, l, 0.707);
+        assert_eq!(q.len(), l.n_heads * l.head_dim * cols);
+        assert_eq!(k.len(), l.n_kv_heads * l.head_dim * cols);
+        assert_eq!(v.len(), l.n_kv_heads * l.v_head_dim * cols);
+        let bits = |x: &[f32]| x.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&q), bits(&eq), "q {l:?}");
+        assert_eq!(bits(&k), bits(&ek), "k {l:?}");
+        assert_eq!(bits(&v), bits(&ev), "v {l:?}");
+        // Head identity: query head h sits in chunk h / (n_heads / t), and
+        // so does its KV head h / (n_heads / n_kv_heads).
+        let qh_per_chunk = l.n_heads / t;
+        for h in [0, l.n_heads - 1] {
+            let chunk = h / qh_per_chunk;
+            let src_row = chunk * rpc + (h % qh_per_chunk) * l.head_dim;
+            let srow = chunk * rpc.div_ceil(128) + (src_row % rpc) / 128;
+            let want = fp8_e4m3_to_f32(packed[src_row * cols]) * scales[srow * s_cols];
+            assert_eq!(q[h * l.head_dim * cols], want, "q head {h}");
+            let kvh = h / (l.n_heads / l.n_kv_heads);
+            assert_eq!(
+                kvh / (l.n_kv_heads / t),
+                chunk,
+                "kv head {kvh} of q head {h}"
+            );
+        }
+        // The continuous-grid count is refused whenever it is a DIFFERENT map.
+        if rpc % 128 != 0 {
+            let cont = rows.div_ceil(128);
+            assert_ne!(cont, s_rows);
+            let err = mimo_v2_split_qkv(
+                &packed,
+                &scales[..cont * s_cols],
+                &[cont, s_cols],
+                rows,
+                cols,
+                l,
+                128,
+                0.707,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("scale plane"), "{err}");
+        }
+    }
+
+    #[test]
+    fn mimo_v2_qkv_deinterleave_is_bit_exact_with_chunked_scales() {
+        // ckpt_tp = 2, rows per chunk 96+48+32 = 176 (not a multiple of
+        // 128): 2 scale rows per chunk → 4, where a continuous grid has 3.
+        check_split(
+            MimoQkvLayout {
+                n_heads: 4,
+                n_kv_heads: 2,
+                head_dim: 48,
+                v_head_dim: 32,
+                ckpt_tp: 2,
+            },
+            160,
+        );
+        // ckpt_tp = 4 with one KV head per chunk: 96+48+32 = 176 again.
+        check_split(
+            MimoQkvLayout {
+                n_heads: 8,
+                n_kv_heads: 4,
+                head_dim: 48,
+                v_head_dim: 32,
+                ckpt_tp: 4,
+            },
+            130,
+        );
+        // ckpt_tp = 4 with two KV heads per chunk (the SWA shape): 96+96+64
+        // = 256 = two whole blocks — both grids coincide.
+        check_split(
+            MimoQkvLayout {
+                n_heads: 8,
+                n_kv_heads: 8,
+                head_dim: 48,
+                v_head_dim: 32,
+                ckpt_tp: 4,
+            },
+            128,
+        );
+        // The real geometry (one 128-column block): full layer 4×3392 rows
+        // with 108 scale rows, SWA layer 4×3712 rows with 116.
+        check_split(
+            MimoQkvLayout {
+                n_heads: 64,
+                n_kv_heads: 4,
+                head_dim: 192,
+                v_head_dim: 128,
+                ckpt_tp: 4,
+            },
+            128,
+        );
+        check_split(
+            MimoQkvLayout {
+                n_heads: 64,
+                n_kv_heads: 8,
+                head_dim: 192,
+                v_head_dim: 128,
+                ckpt_tp: 4,
+            },
+            128,
+        );
+    }
+
+    #[test]
+    fn mimo_v2_qkv_refuses_wrong_row_counts() {
+        let l = MimoQkvLayout {
+            n_heads: 4,
+            n_kv_heads: 2,
+            head_dim: 48,
+            v_head_dim: 32,
+            ckpt_tp: 2,
+        };
+        let (rows, cols) = (352usize, 128usize);
+        let packed = fp8_bytes(rows * cols, 1);
+        let scales = vec![1.0f32; 4];
+        assert!(mimo_v2_split_qkv(&packed, &scales, &[4, 1], rows, cols, l, 128, 1.0).is_ok());
+        // One row short of 2×176.
+        let short = &packed[..(rows - 1) * cols];
+        assert!(mimo_v2_split_qkv(short, &scales, &[4, 1], rows - 1, cols, l, 128, 1.0).is_err());
+        // KV heads that do not split over the chunks.
+        let odd = MimoQkvLayout { n_kv_heads: 3, ..l };
+        assert!(mimo_v2_split_qkv(&packed, &scales, &[4, 1], rows, cols, odd, 128, 1.0).is_err());
+        // A scale plane with the wrong column count.
+        assert!(mimo_v2_split_qkv(&packed, &[1.0; 8], &[4, 2], rows, cols, l, 128, 1.0).is_err());
+    }
+
+    #[test]
+    fn mxfp4_decode_is_thread_count_invariant() {
+        let (rows, cols) = (37usize, 96usize);
+        let packed: Vec<u8> = (0..rows * cols / 2).map(|i| (i * 53 + 5) as u8).collect();
+        let scales: Vec<u8> = (0..rows * cols / 32)
+            .map(|i| 118 + (i % 17) as u8)
+            .collect();
+        let _g = env_guard("1", "1");
+        let serial = unpack_mxfp4(&packed, &scales, rows, cols / 2).unwrap();
+        unsafe { std::env::set_var("CMF_ENCODE_THREADS", "8") };
+        let parallel = unpack_mxfp4(&packed, &scales, rows, cols / 2).unwrap();
+        assert_eq!(serial, parallel);
+    }
+
+    #[test]
+    fn convert_only_spec_parses() {
+        assert_eq!(
+            parse_convert_only(" model.layers.0.* ,model.layers.1.*").unwrap(),
+            vec!["model.layers.0.*", "model.layers.1.*"]
+        );
+        assert!(parse_convert_only("").is_err());
+        assert!(parse_convert_only("a,,b").is_err());
+    }
+
+    // ── end to end ───────────────────────────────────────────────────────
+
+    type RawTensor = (String, &'static str, Vec<usize>, Vec<u8>);
+
+    fn raw_safetensors(tensors: &[RawTensor]) -> Vec<u8> {
+        let mut header = serde_json::Map::new();
+        let mut data = Vec::new();
+        for (name, dtype, shape, bytes) in tensors {
+            let start = data.len();
+            data.extend_from_slice(bytes);
+            header.insert(
+                name.clone(),
+                serde_json::json!({"dtype": dtype, "shape": shape, "data_offsets": [start, data.len()]}),
+            );
+        }
+        let hjson = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        let mut out = (hjson.len() as u64).to_le_bytes().to_vec();
+        out.extend_from_slice(&hjson);
+        out.extend_from_slice(&data);
+        out
+    }
+
+    /// bf16 bytes of f32 values that are exactly representable in bf16.
+    fn bf16_of(vals: &[f32]) -> Vec<u8> {
+        vals.iter()
+            .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+            .collect()
+    }
+
+    fn bf16_vals(n: usize, seed: usize) -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                let x = ((i * 31 + seed * 7) % 97) as f32 / 97.0 - 0.5;
+                f32::from_bits((x * 0.25).to_bits() & 0xFFFF_0000)
+            })
+            .collect()
+    }
+
+    /// Independent MXFP4 reference (E2M1 LUT, E8M0 2^(k−127), low nibble
+    /// first).
+    fn mxfp4_ref(packed: &[u8], scales: &[u8], rows: usize, cols: usize) -> Vec<f32> {
+        const LUT: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+        let mut out = Vec::with_capacity(rows * cols);
+        for r in 0..rows {
+            for c in 0..cols {
+                let byte = packed[r * cols / 2 + c / 2];
+                let nib = if c % 2 == 0 { byte & 0xF } else { byte >> 4 };
+                let mag = LUT[(nib & 7) as usize];
+                let s = (scales[r * cols / 32 + c / 32] as f32 - 127.0).exp2();
+                out.push(if nib & 8 != 0 { -mag } else { mag } * s);
+            }
+        }
+        out
+    }
+
+    const H: usize = 64;
+    const NH: usize = 4;
+    const HD: usize = 48;
+    const VD: usize = 32;
+    const CKPT_TP: usize = 2;
+    const INTER: usize = 128;
+    const MOE_I: usize = 32;
+    const N_EXP: usize = 4;
+    const VOCAB: usize = 32;
+    const PATTERN: [u64; 3] = [0, 1, 1];
+
+    fn nkv(li: usize) -> usize {
+        if PATTERN[li] == 1 { 4 } else { 2 }
+    }
+
+    fn tiny_config() -> serde_json::Value {
+        serde_json::json!({
+            "model_type": "mimo_v2",
+            "architectures": ["MiMoV2ForCausalLM"],
+            "attention_projection_layout": "fused_qkv",
+            "attention_bias": false,
+            "add_full_attention_sink_bias": false,
+            "add_swa_attention_sink_bias": true,
+            "attention_value_scale": 0.707,
+            "hidden_size": H,
+            "intermediate_size": INTER,
+            "moe_intermediate_size": MOE_I,
+            "num_hidden_layers": PATTERN.len(),
+            "hybrid_layer_pattern": PATTERN,
+            "moe_layer_freq": [0, 1, 1],
+            "num_attention_heads": NH,
+            "num_key_value_heads": CKPT_TP,
+            "swa_num_attention_heads": NH,
+            "swa_num_key_value_heads": 4,
+            "head_dim": HD, "swa_head_dim": HD,
+            "v_head_dim": VD, "swa_v_head_dim": VD,
+            "partial_rotary_factor": 0.334,
+            "rope_parameters": {"partial_rotary_factor": 0.334, "rope_theta": 10000000.0,
+                                "rope_type": "default", "type": "default"},
+            "rope_theta": 10000000.0,
+            "swa_rope_theta": 10000.0,
+            "sliding_window": 8,
+            "sliding_window_size": 8,
+            "layernorm_epsilon": 1e-6,
+            "n_routed_experts": N_EXP,
+            "num_experts_per_tok": 2,
+            "n_shared_experts": null,
+            "n_group": 1,
+            "topk_group": 1,
+            "topk_method": "noaux_tc",
+            "scoring_func": "sigmoid",
+            "norm_topk_prob": true,
+            "routed_scaling_factor": null,
+            "num_nextn_predict_layers": 1,
+            "vocab_size": VOCAB,
+            "max_position_embeddings": 4096,
+            "tie_word_embeddings": false,
+            "hidden_act": "silu",
+            "bos_token_id": null,
+            "eos_token_id": 3,
+            "pad_token_id": 0,
+            "quantization_config": {"quant_method": "fp8", "fmt": "e4m3",
+                                    "weight_block_size": [128, 128], "store_dtype": "mxfp4",
+                                    "mxfp4_block_size": 32, "activation_scheme": "dynamic"}
+        })
+    }
+
+    struct Fixture {
+        dir: std::path::PathBuf,
+        /// Expected f32 values of every emitted tensor, by canonical name.
+        want: HashMap<String, (Vec<usize>, Vec<f32>)>,
+    }
+
+    fn write_fixture(tag: &str) -> Fixture {
+        write_fixture_towers(tag, false)
+    }
+
+    /// The tiny text checkpoint; with `towers`, the placeholder tower
+    /// tensors are replaced by a complete tiny tower set
+    /// (`mimo_towers::tests`), the tower config keys are merged into
+    /// config.json and `audio_tokenizer/` is written. `want` stays the TEXT
+    /// tensors only.
+    fn write_fixture_towers(tag: &str, towers: bool) -> Fixture {
+        let dir = std::env::temp_dir().join(format!("cortiq-mimo-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut skel: Vec<RawTensor> = Vec::new();
+        let mut experts: Vec<RawTensor> = Vec::new();
+        let mut want: HashMap<String, (Vec<usize>, Vec<f32>)> = HashMap::new();
+        let plain = |skel: &mut Vec<RawTensor>,
+                     want: &mut HashMap<String, (Vec<usize>, Vec<f32>)>,
+                     name: &str,
+                     shape: Vec<usize>,
+                     seed: usize| {
+            let n: usize = shape.iter().product();
+            let v = bf16_vals(n, seed);
+            skel.push((name.to_string(), "BF16", shape.clone(), bf16_of(&v)));
+            want.insert(name.to_string(), (shape, v));
+        };
+        plain(
+            &mut skel,
+            &mut want,
+            "model.embed_tokens.weight",
+            vec![VOCAB, H],
+            1,
+        );
+        plain(&mut skel, &mut want, "lm_head.weight", vec![VOCAB, H], 2);
+        plain(&mut skel, &mut want, "model.norm.weight", vec![H], 3);
+        for li in 0..PATTERN.len() {
+            let p = format!("model.layers.{li}.");
+            let kv = nkv(li);
+            plain(
+                &mut skel,
+                &mut want,
+                &format!("{p}input_layernorm.weight"),
+                vec![H],
+                10 + li,
+            );
+            plain(
+                &mut skel,
+                &mut want,
+                &format!("{p}post_attention_layernorm.weight"),
+                vec![H],
+                20 + li,
+            );
+            plain(
+                &mut skel,
+                &mut want,
+                &format!("{p}self_attn.o_proj.weight"),
+                vec![H, NH * VD],
+                30 + li,
+            );
+            // Fused qkv, stored TP-chunked with per-chunk scale blocks.
+            let l = MimoQkvLayout {
+                n_heads: NH,
+                n_kv_heads: kv,
+                head_dim: HD,
+                v_head_dim: VD,
+                ckpt_tp: CKPT_TP,
+            };
+            let rpc = (NH / CKPT_TP + kv / CKPT_TP) * HD + kv / CKPT_TP * VD;
+            let rows = CKPT_TP * rpc;
+            let s_rows = CKPT_TP * rpc.div_ceil(128);
+            let packed = fp8_bytes(rows * H, li);
+            let scales: Vec<f32> = (0..s_rows).map(|i| ((i % 5) as f32 - 2.0).exp2()).collect();
+            let (q, k, v) = expected_split(&packed, &scales, 1, rows, H, l, 0.707);
+            want.insert(format!("{p}self_attn.q_proj.weight"), (vec![NH * HD, H], q));
+            want.insert(format!("{p}self_attn.k_proj.weight"), (vec![kv * HD, H], k));
+            want.insert(format!("{p}self_attn.v_proj.weight"), (vec![kv * VD, H], v));
+            skel.push((
+                format!("{p}self_attn.qkv_proj.weight"),
+                "F8_E4M3",
+                vec![rows, H],
+                packed,
+            ));
+            skel.push((
+                format!("{p}self_attn.qkv_proj.weight_scale_inv"),
+                "F32",
+                vec![s_rows, 1],
+                scales.iter().flat_map(|s| s.to_le_bytes()).collect(),
+            ));
+            if PATTERN[li] == 1 {
+                let sinks = bf16_vals(NH, 40 + li);
+                skel.push((
+                    format!("{p}self_attn.attention_sink_bias"),
+                    "BF16",
+                    vec![NH],
+                    bf16_of(&sinks),
+                ));
+                want.insert(format!("{p}self_attn.sinks"), (vec![NH], sinks));
+            }
+            if li == 0 {
+                // Dense FP8 MLP with one scale per 128×128 tile.
+                for (t, shape, s) in [
+                    ("gate_proj", vec![INTER, H], 0.5f32),
+                    ("up_proj", vec![INTER, H], 0.25),
+                    ("down_proj", vec![H, INTER], 2.0),
+                ] {
+                    let n = shape[0] * shape[1];
+                    let packed = fp8_bytes(n, 50 + shape[0]);
+                    let vals: Vec<f32> = packed.iter().map(|&b| fp8_e4m3_to_f32(b) * s).collect();
+                    let name = format!("{p}mlp.{t}.weight");
+                    skel.push((name.clone(), "F8_E4M3", shape.clone(), packed));
+                    skel.push((
+                        format!("{name}_scale_inv"),
+                        "F32",
+                        vec![shape[0].div_ceil(128), shape[1].div_ceil(128)],
+                        s.to_le_bytes().to_vec(),
+                    ));
+                    want.insert(name, (shape, vals));
+                }
+            } else {
+                plain(
+                    &mut skel,
+                    &mut want,
+                    &format!("{p}mlp.gate.weight"),
+                    vec![N_EXP, H],
+                    60 + li,
+                );
+                let bias: Vec<f32> = (0..N_EXP).map(|e| 0.001 * e as f32 + li as f32).collect();
+                skel.push((
+                    format!("{p}mlp.gate.e_score_correction_bias"),
+                    "F32",
+                    vec![N_EXP],
+                    bias.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                ));
+                want.insert(format!("{p}mlp.expert_bias"), (vec![N_EXP], bias));
+                for e in 0..N_EXP {
+                    for (t, rows, cols) in [
+                        ("gate_proj", MOE_I, H),
+                        ("up_proj", MOE_I, H),
+                        ("down_proj", H, MOE_I),
+                    ] {
+                        let packed: Vec<u8> = (0..rows * cols / 2)
+                            .map(|i| (i * 37 + e * 11 + li * 5 + rows) as u8)
+                            .collect();
+                        let scales: Vec<u8> = (0..rows * cols / 32)
+                            .map(|i| 120 + ((i + e) % 9) as u8)
+                            .collect();
+                        let name = format!("{p}mlp.experts.{e}.{t}.weight");
+                        want.insert(
+                            name.clone(),
+                            (vec![rows, cols], mxfp4_ref(&packed, &scales, rows, cols)),
+                        );
+                        experts.push((name.clone(), "U8", vec![rows, cols / 2], packed));
+                        experts.push((
+                            format!("{name}_scale"),
+                            "U8",
+                            vec![rows, cols / 32],
+                            scales,
+                        ));
+                    }
+                }
+            }
+        }
+        // Everything a text-only conversion must drop. The MTP qkv has a
+        // shape no split accepts, so processing it would fail the run.
+        let half = bf16_of(&[0.5; 256]);
+        skel.push((
+            "model.mtp.layers.0.self_attn.qkv_proj.weight".into(),
+            "F8_E4M3",
+            vec![10, H],
+            vec![0x38; 10 * H],
+        ));
+        skel.push((
+            "model.mtp.layers.0.self_attn.qkv_proj.weight_scale_inv".into(),
+            "F32",
+            vec![1, 1],
+            1f32.to_le_bytes().to_vec(),
+        ));
+        skel.push((
+            "model.mtp.layers.0.enorm.weight".into(),
+            "BF16",
+            vec![H],
+            bf16_of(&[1.0; H]),
+        ));
+        let mut config = tiny_config();
+        if towers {
+            let (main, tok, _) = crate::mimo_towers::tests::tower_fixture_tensors();
+            skel.extend(main);
+            crate::mimo_towers::tests::write_audio_tokenizer(&dir, &tok);
+            let (tcfg, _) = crate::mimo_towers::tests::tiny_configs();
+            for (k, v) in tcfg.as_object().unwrap() {
+                if config.get(k).is_none() {
+                    config[k] = v.clone();
+                }
+            }
+        } else {
+            skel.push((
+                "visual.blocks.0.attn.qkv.weight".into(),
+                "BF16",
+                vec![8, 32],
+                half.clone(),
+            ));
+            skel.push((
+                "audio_encoder.layers.0.fc1.weight".into(),
+                "BF16",
+                vec![8, 32],
+                half.clone(),
+            ));
+            skel.push((
+                "speech_embeddings.0.weight".into(),
+                "BF16",
+                vec![8, 32],
+                half,
+            ));
+        }
+
+        let shards = [
+            ("model_pp0_ep0_shard0.safetensors", skel),
+            ("model_pp0_ep1_shard0.safetensors", experts),
+        ];
+        let mut weight_map = serde_json::Map::new();
+        for (file, tensors) in &shards {
+            fs::write(dir.join(file), raw_safetensors(tensors)).unwrap();
+            for (name, ..) in tensors {
+                weight_map.insert(name.clone(), serde_json::json!(file));
+            }
+        }
+        fs::write(
+            dir.join("model.safetensors.index.json"),
+            serde_json::json!({"weight_map": weight_map}).to_string(),
+        )
+        .unwrap();
+        fs::write(dir.join("config.json"), config.to_string()).unwrap();
+        fs::write(
+            dir.join("generation_config.json"),
+            r#"{"bos_token_id": 0, "eos_token_id": [0, 3, 5]}"#,
+        )
+        .unwrap();
+        fs::write(dir.join("tokenizer.json"), b"{}").unwrap();
+        fs::write(dir.join("chat_template.jinja"), "{{ messages }}").unwrap();
+        Fixture { dir, want }
+    }
+
+    fn clear_convert_env() {
+        unsafe {
+            std::env::remove_var(LOCAL_READY_DIR_ENV);
+            std::env::remove_var(SOURCE_SHARD_PRIORITY_ENV);
+            std::env::remove_var(CONSUME_SOURCE_SHARDS_ENV);
+            std::env::remove_var(CONVERT_ONLY_ENV);
+        }
+    }
+
+    #[test]
+    fn mimo_v2_tiny_checkpoint_converts_end_to_end() {
+        // The tensor-quant overrides are process-global, and the resume
+        // tests steer the local-ready env; both are taken under ENV_LOCK.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_convert_env();
+        set_tensor_quant_overrides(&[]).unwrap();
+        let fx = write_fixture("e2e");
+        let auto_out = fx.dir.join("auto.cmf");
+        let f16_out = fx.dir.join("f16.cmf");
+        // One pass, two profiles: `auto` (what a bare `cortiq convert`
+        // asks for) and an exact f16 file for the value checks.
+        run_convert_multi(
+            fx.dir.to_str().unwrap(),
+            &[
+                (AUTO_QUANT.into(), auto_out.to_str().unwrap().into()),
+                ("f16".into(), f16_out.to_str().unwrap().into()),
+            ],
+            None,
+            None,
+            None,
+            false,
+            |_| {},
+        )
+        .unwrap();
+
+        let auto = CmfModel::open(&auto_out).unwrap();
+        let exact = CmfModel::open(&f16_out).unwrap();
+        for m in [&auto, &exact] {
+            assert!(m.verify().is_empty(), "verify: {:?}", m.verify());
+            let a = m.arch();
+            assert_eq!(a.arch_name, "mimo_v2");
+            assert_eq!(a.num_layers, 3);
+            assert_eq!(a.num_kv_heads, CKPT_TP);
+            assert_eq!(a.kv_heads_per_layer, Some(vec![2, 4, 4]));
+            assert_eq!(a.v_head_dim, Some(VD));
+            assert_eq!(a.head_dim, HD);
+            assert_eq!(
+                a.layer_types,
+                vec![
+                    LayerType::FullAttention,
+                    LayerType::SlidingAttention,
+                    LayerType::SlidingAttention
+                ]
+            );
+            assert_eq!(a.sliding_window, Some(8));
+            assert_eq!(a.rope_local_base_freq, Some(10000.0));
+            assert_eq!((a.head_dim as f32 * a.partial_rotary_factor) as usize, 16);
+            assert!(a.mtp.is_none());
+            let tok = m.header.tokenizer_config.as_ref().unwrap();
+            assert_eq!(tok.eos_token_ids, vec![0, 3, 5]);
+            assert_eq!(tok.bos_token_id, None);
+            assert_eq!(tok.pad_token_id, Some(0));
+            assert_eq!(tok.chat_template.as_deref(), Some("{{ messages }}"));
+        }
+        let prov = |m: &CmfModel| m.header.provenance.as_ref().unwrap()["weight_quant"].clone();
+        assert_eq!(prov(&auto), serde_json::json!("q4tp"));
+        assert_eq!(prov(&exact), serde_json::json!("f16"));
+
+        // The directory: exactly the canonical tensors — nothing dropped
+        // leaks in, and no fused or scale tensor survives.
+        let mut want_names: Vec<&str> = fx.want.keys().map(|s| s.as_str()).collect();
+        want_names.sort();
+        for m in [&auto, &exact] {
+            let mut names: Vec<&str> = m.tensors.iter().map(|t| t.name.as_str()).collect();
+            names.sort();
+            assert_eq!(names, want_names);
+        }
+
+        for (name, (shape, vals)) in &fx.want {
+            let e = exact.tensor(name).unwrap();
+            assert_eq!(&e.shape, shape, "{name}");
+            let bytes = exact.tensor_bytes(name).unwrap();
+            let is_f32 = name.ends_with(".mlp.expert_bias") || name.ends_with(".self_attn.sinks");
+            if is_f32 {
+                assert_eq!(e.dtype, TensorDtype::F32, "{name}");
+                let got: Vec<f32> = bytes
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect();
+                assert_eq!(&got, vals, "{name}");
+            } else {
+                // Every value path — de-interleave, chunked scales, the
+                // 0.707 V fold, MXFP4 nibbles — lands bit-exactly in f16.
+                assert_eq!(e.dtype, TensorDtype::F16, "{name}");
+                assert_eq!(bytes, encode_f16(vals).as_slice(), "{name}");
+            }
+
+            // The default (q4tp) profile.
+            let a = auto.tensor(name).unwrap();
+            assert_eq!(&a.shape, shape, "{name}");
+            let want_dtype = if is_f32 {
+                TensorDtype::F32
+            } else if shape.len() == 1 || name.ends_with(".mlp.gate.weight") {
+                TensorDtype::F16
+            } else if name.contains(".mlp.experts.") {
+                TensorDtype::Q4TiledP
+            } else {
+                TensorDtype::Q8_2f
+            };
+            assert_eq!(a.dtype, want_dtype, "{name}");
+            if a.dtype == TensorDtype::Q8_2f {
+                let mut back = vec![0f32; vals.len()];
+                dequant_q8_2f(
+                    auto.tensor_bytes(name).unwrap(),
+                    shape[0],
+                    shape[1],
+                    &mut back,
+                );
+                let dot: f64 = back.iter().zip(vals).map(|(a, b)| (a * b) as f64).sum();
+                let na: f64 = back.iter().map(|a| (a * a) as f64).sum::<f64>().sqrt();
+                let nb: f64 = vals.iter().map(|b| (b * b) as f64).sum::<f64>().sqrt();
+                assert!(dot / (na * nb) > 0.9999, "{name}: cos {}", dot / (na * nb));
+            }
+        }
+        // Split attention shapes: q 4·48 everywhere, k/v per layer type.
+        let shape = |n: &str| auto.tensor(n).unwrap().shape.clone();
+        assert_eq!(
+            shape("model.layers.0.self_attn.q_proj.weight"),
+            vec![NH * HD, H]
+        );
+        assert_eq!(
+            shape("model.layers.0.self_attn.k_proj.weight"),
+            vec![2 * HD, H]
+        );
+        assert_eq!(
+            shape("model.layers.1.self_attn.k_proj.weight"),
+            vec![4 * HD, H]
+        );
+        assert_eq!(
+            shape("model.layers.0.self_attn.v_proj.weight"),
+            vec![2 * VD, H]
+        );
+        assert_eq!(
+            shape("model.layers.2.self_attn.v_proj.weight"),
+            vec![4 * VD, H]
+        );
+        assert!(auto.tensor("model.layers.0.self_attn.sinks").is_none());
+        let _ = fs::remove_dir_all(&fx.dir);
+    }
+
+    #[test]
+    fn mimo_v2_multimodal_single_file_carries_the_towers() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_convert_env();
+        set_tensor_quant_overrides(&[]).unwrap();
+        let fx = write_fixture_towers("mmfull", true);
+        let full = fx.dir.join("full.cmf");
+        let text = fx.dir.join("text.cmf");
+        run_convert_multi_towers(
+            fx.dir.to_str().unwrap(),
+            &[(AUTO_QUANT.into(), full.to_str().unwrap().into())],
+            None,
+            None,
+            None,
+            false,
+            MimoTowers::Multimodal,
+            |_| {},
+        )
+        .unwrap();
+        // The same checkpoint in text mode: no tower, blob or tokenizer tensor.
+        run_convert(
+            fx.dir.to_str().unwrap(),
+            AUTO_QUANT,
+            text.to_str().unwrap(),
+            None,
+            None,
+            None,
+            false,
+            |_| {},
+        )
+        .unwrap();
+        let text = CmfModel::open(&text).unwrap();
+        let mut text_names: Vec<&str> = text.tensors.iter().map(|t| t.name.as_str()).collect();
+        text_names.sort();
+        let mut want_text: Vec<&str> = fx.want.keys().map(|s| s.as_str()).collect();
+        want_text.sort();
+        assert_eq!(text_names, want_text);
+
+        let full = std::sync::Arc::new(CmfModel::open(&full).unwrap());
+        assert!(full.verify().is_empty(), "{:?}", full.verify());
+        assert_eq!(full.arch().arch_name, "mimo_v2");
+        let (tcfg, tat) = crate::mimo_towers::tests::tiny_configs();
+        let inv = cortiq_engine::mimo_mm::mimo_tower_inventory(&tcfg, &tat).unwrap();
+        assert_eq!(full.tensors.len(), fx.want.len() + inv.len() + 2);
+        // Text tensors: byte-identical to the text-mode file.
+        for name in &want_text {
+            let (a, b) = (full.tensor(name).unwrap(), text.tensor(name).unwrap());
+            assert_eq!((a.dtype, &a.shape), (b.dtype, &b.shape), "{name}");
+            assert_eq!(
+                full.tensor_bytes(name).unwrap(),
+                text.tensor_bytes(name).unwrap(),
+                "{name}"
+            );
+        }
+        // Towers: the tower policy (q4tp matrices, not the text skeleton's
+        // q8_2f), and the engine accepts the file as-is.
+        let mm = cortiq_engine::mimo_mm::MimoMm::from_model(&full).unwrap();
+        assert_eq!(mm.source, cortiq_engine::mimo_mm::MimoMmSource::SingleFile);
+        assert_eq!(
+            mm.dtype("visual.blocks.0.attn.qkv.weight"),
+            Some(TensorDtype::Q4TiledP)
+        );
+        assert_eq!(
+            mm.dtype("audio_tokenizer.encoder.layers.1.fc1.weight"),
+            Some(TensorDtype::Q4TiledP)
+        );
+        assert_eq!(
+            mm.dtype("audio_tokenizer.encoder.quantizer.vq.layers.2._codebook.embed"),
+            Some(TensorDtype::F32)
+        );
+        assert_eq!(
+            mm.dtype("speech_embeddings.0.weight"),
+            Some(TensorDtype::Bf16)
+        );
+        let prov = &full.header.provenance.as_ref().unwrap()["mimo_mm"];
+        assert_eq!(prov["towers"], "multimodal");
+        assert_eq!(prov["codec"]["visual"]["matrices"], "q4tp");
+        let _ = fs::remove_dir_all(&fx.dir);
+    }
+
+    #[test]
+    fn convert_only_probe_writes_a_marked_partial_file() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_convert_env();
+        set_tensor_quant_overrides(&[]).unwrap();
+        let fx = write_fixture("only");
+        let out = fx.dir.join("probe.cmf");
+        unsafe {
+            std::env::set_var(CONVERT_ONLY_ENV, "model.layers.1.self_attn.*");
+        }
+        let r = run_convert(
+            fx.dir.to_str().unwrap(),
+            "f16",
+            out.to_str().unwrap(),
+            None,
+            None,
+            None,
+            false,
+            |_| {},
+        );
+        unsafe {
+            std::env::remove_var(CONVERT_ONLY_ENV);
+        }
+        r.unwrap();
+        let m = CmfModel::open(&out).unwrap();
+        let mut names: Vec<&str> = m.tensors.iter().map(|t| t.name.as_str()).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "model.layers.1.self_attn.k_proj.weight",
+                "model.layers.1.self_attn.o_proj.weight",
+                "model.layers.1.self_attn.q_proj.weight",
+                "model.layers.1.self_attn.sinks",
+                "model.layers.1.self_attn.v_proj.weight",
+            ]
+        );
+        assert_eq!(
+            m.header.provenance.as_ref().unwrap()["partial_convert_only"],
+            serde_json::json!(["model.layers.1.self_attn.*"])
+        );
+        let _ = fs::remove_dir_all(&fx.dir);
+    }
+    /// A release-format `model_mtp.safetensors` with `n` draft layers (SWA
+    /// geometry: 4 KV heads) and the canonical values every sidecar tensor
+    /// must hold.
+    fn write_mtp_fixture(
+        tag: &str,
+        n: usize,
+        extra: Option<RawTensor>,
+    ) -> (std::path::PathBuf, HashMap<String, (Vec<usize>, Vec<f32>)>) {
+        let dir =
+            std::env::temp_dir().join(format!("cortiq-mimo-mtp-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut cfg = tiny_config();
+        cfg["num_nextn_predict_layers"] = serde_json::json!(n);
+        fs::write(dir.join("config.json"), cfg.to_string()).unwrap();
+        let mut raw: Vec<RawTensor> = Vec::new();
+        let mut want: HashMap<String, (Vec<usize>, Vec<f32>)> = HashMap::new();
+        for k in 0..n {
+            let p = format!("model.mtp.layers.{k}.");
+            for (i, (src, dst)) in MIMO_MTP_NORMS.iter().enumerate() {
+                let v: Vec<f32> = bf16_vals(H, 300 + k * 10 + i)
+                    .iter()
+                    .map(|x| f32::from_bits((1.0 + x).to_bits() & 0xFFFF_0000))
+                    .collect();
+                raw.push((format!("{p}{src}.weight"), "BF16", vec![H], bf16_of(&v)));
+                want.insert(format!("{p}{dst}.weight"), (vec![H], v));
+            }
+            let eh = bf16_vals(H * 2 * H, 320 + k);
+            raw.push((
+                format!("{p}eh_proj.weight"),
+                "BF16",
+                vec![H, 2 * H],
+                bf16_of(&eh),
+            ));
+            want.insert(format!("{p}eh_proj.weight"), (vec![H, 2 * H], eh));
+            let l = MimoQkvLayout {
+                n_heads: NH,
+                n_kv_heads: 4,
+                head_dim: HD,
+                v_head_dim: VD,
+                ckpt_tp: CKPT_TP,
+            };
+            let rpc = (NH / CKPT_TP + 4 / CKPT_TP) * HD + 4 / CKPT_TP * VD;
+            let rows = CKPT_TP * rpc;
+            let s_rows = CKPT_TP * rpc.div_ceil(128);
+            let packed = fp8_bytes(rows * H, 330 + k);
+            let scales: Vec<f32> = (0..s_rows)
+                .map(|i| ((i % 3) as f32 - 1.0).exp2())
+                .collect();
+            let (q, kk, v) = expected_split(&packed, &scales, 1, rows, H, l, 0.707);
+            want.insert(format!("{p}self_attn.q_proj.weight"), (vec![NH * HD, H], q));
+            want.insert(format!("{p}self_attn.k_proj.weight"), (vec![4 * HD, H], kk));
+            want.insert(format!("{p}self_attn.v_proj.weight"), (vec![4 * VD, H], v));
+            raw.push((
+                format!("{p}self_attn.qkv_proj.weight"),
+                "F8_E4M3",
+                vec![rows, H],
+                packed,
+            ));
+            raw.push((
+                format!("{p}self_attn.qkv_proj.weight_scale_inv"),
+                "F32",
+                vec![s_rows, 1],
+                scales.iter().flat_map(|s| s.to_le_bytes()).collect(),
+            ));
+            let o = bf16_vals(H * NH * VD, 340 + k);
+            raw.push((
+                format!("{p}self_attn.o_proj.weight"),
+                "BF16",
+                vec![H, NH * VD],
+                bf16_of(&o),
+            ));
+            want.insert(format!("{p}self_attn.o_proj.weight"), (vec![H, NH * VD], o));
+            let sinks = bf16_vals(NH, 350 + k);
+            raw.push((
+                format!("{p}self_attn.attention_sink_bias"),
+                "BF16",
+                vec![NH],
+                bf16_of(&sinks),
+            ));
+            want.insert(format!("{p}self_attn.sinks"), (vec![NH], sinks));
+            for (t, shape, sc) in [
+                ("gate_proj", vec![INTER, H], 0.5f32),
+                ("up_proj", vec![INTER, H], 0.25),
+                ("down_proj", vec![H, INTER], 2.0),
+            ] {
+                let cnt = shape[0] * shape[1];
+                let packed = fp8_bytes(cnt, 360 + k + shape[0]);
+                let vals: Vec<f32> = packed.iter().map(|&b| fp8_e4m3_to_f32(b) * sc).collect();
+                let name = format!("{p}mlp.{t}.weight");
+                raw.push((name.clone(), "F8_E4M3", shape.clone(), packed));
+                raw.push((
+                    format!("{name}_scale_inv"),
+                    "F32",
+                    vec![shape[0].div_ceil(128), shape[1].div_ceil(128)],
+                    sc.to_le_bytes().to_vec(),
+                ));
+                want.insert(name, (shape, vals));
+            }
+        }
+        if let Some(t) = extra {
+            raw.push(t);
+        }
+        fs::write(dir.join("model_mtp.safetensors"), raw_safetensors(&raw)).unwrap();
+        // Like the release: the index maps the MTP names to their file.
+        let mut map = serde_json::Map::new();
+        for (name, ..) in &raw {
+            map.insert(name.clone(), serde_json::json!("model_mtp.safetensors"));
+        }
+        fs::write(
+            dir.join("model.safetensors.index.json"),
+            serde_json::json!({ "weight_map": map }).to_string(),
+        )
+        .unwrap();
+        (dir, want)
+    }
+
+    #[test]
+    fn mimo_v2_mtp_sidecar_holds_every_draft_tensor() {
+        let (dir, want) = write_mtp_fixture("ok", 2, None);
+        let main = dir.join("mimo-q4tp.cmf");
+        for (quant, exact) in [("q8_2f", false), ("f16", true)] {
+            let out = write_mimo_mtp_sidecar(&dir, &main, quant).unwrap();
+            assert_eq!(out, dir.join("mimo-q4tp.mtp.cmf"));
+            let m = CmfModel::open(&out).unwrap();
+            assert!(m.verify().is_empty(), "verify: {:?}", m.verify());
+            let a = m.arch();
+            assert_eq!(a.arch_name, "mimo_v2");
+            assert_eq!(a.mtp.as_ref().map(|c| c.num_layers), Some(2));
+            assert_eq!(a.kv_heads_per_layer, Some(vec![2, 4, 4]));
+            assert_eq!(
+                m.header.provenance.as_ref().unwrap()["kind"],
+                serde_json::json!("mimo_mtp_sidecar")
+            );
+            let mut names: Vec<&str> = m.tensors.iter().map(|t| t.name.as_str()).collect();
+            names.sort();
+            let mut want_names: Vec<&str> = want.keys().map(|s| s.as_str()).collect();
+            want_names.sort();
+            assert_eq!(names, want_names, "exactly the canonical draft tensors");
+            for (name, (shape, vals)) in &want {
+                let e = m.tensor(name).unwrap();
+                assert_eq!(&e.shape, shape, "{name}");
+                let bytes = m.tensor_bytes(name).unwrap();
+                if shape.len() == 1 {
+                    assert_eq!(e.dtype, TensorDtype::F32, "{name}");
+                    let got: Vec<f32> = bytes
+                        .chunks_exact(4)
+                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                        .collect();
+                    assert_eq!(&got, vals, "{name}");
+                    continue;
+                }
+                let back: Vec<f32> = if exact {
+                    assert_eq!(e.dtype, TensorDtype::F16, "{name}");
+                    bytes
+                        .chunks_exact(2)
+                        .map(|b| f16_to_f32(u16::from_le_bytes([b[0], b[1]])))
+                        .collect()
+                } else {
+                    assert_eq!(e.dtype, TensorDtype::Q8_2f, "{name}");
+                    let mut back = vec![0f32; vals.len()];
+                    dequant_q8_2f(bytes, shape[0], shape[1], &mut back);
+                    back
+                };
+                if exact {
+                    let worst = back
+                        .iter()
+                        .zip(vals)
+                        .map(|(a, b)| (a - b).abs() / b.abs().max(1e-3))
+                        .fold(0.0f32, f32::max);
+                    assert!(worst < 1e-3, "{name}: rel err {worst}");
+                } else {
+                    let dot: f64 = back.iter().zip(vals).map(|(a, b)| (a * b) as f64).sum();
+                    let na: f64 = back.iter().map(|a| (a * a) as f64).sum::<f64>().sqrt();
+                    let nb: f64 = vals.iter().map(|b| (b * b) as f64).sum::<f64>().sqrt();
+                    assert!(dot / (na * nb) > 0.9999, "{name}: cos {}", dot / (na * nb));
+                }
+            }
+        }
+        // A path that already names a sidecar is kept.
+        let direct = write_mimo_mtp_sidecar(&dir, &dir.join("x.mtp.cmf"), "q8_2f").unwrap();
+        assert_eq!(direct, dir.join("x.mtp.cmf"));
+        // A main-file profile is refused: the sidecar is skeleton.
+        assert!(write_mimo_mtp_sidecar(&dir, &main, "q4tp").is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mimo_v2_mtp_sidecar_refuses_unknown_and_missing_tensors() {
+        let extra: RawTensor = (
+            "model.mtp.layers.0.mlp.shared_expert.weight".into(),
+            "BF16",
+            vec![H],
+            bf16_of(&[0.5; H]),
+        );
+        let (dir, _) = write_mtp_fixture("extra", 1, Some(extra));
+        let err = write_mimo_mtp_sidecar(&dir, &dir.join("m.cmf"), "q8_2f").unwrap_err();
+        assert!(err.to_string().contains("unexpected tensor"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+        // The config promises two layers, the file holds one.
+        let (dir, _) = write_mtp_fixture("short", 1, None);
+        let mut cfg = tiny_config();
+        cfg["num_nextn_predict_layers"] = serde_json::json!(2);
+        fs::write(dir.join("config.json"), cfg.to_string()).unwrap();
+        let err = write_mimo_mtp_sidecar(&dir, &dir.join("m.cmf"), "q8_2f").unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -20,6 +20,9 @@ use wgpu::util::DeviceExt;
 // Z-Image-Turbo device path (plan WP2) — child module, `gpu_wgpu/zimage.rs`.
 #[doc(hidden)]
 pub mod zimage;
+// MiMo-V2 expert-bank frame — child module, `gpu_wgpu/mimo_bank.rs`.
+#[doc(hidden)]
+pub mod mimo_bank;
 
 /// Workgroup limit per dimension (WebGPU minimum; lm_head has more
 /// rows — we use grid-stride in the shader).
@@ -9851,7 +9854,11 @@ fn moe_select_b(@builtin(workgroup_id) wid: vec3<u32>,
     }
     workgroupBarrier();
     let kk = sb_p.top_k;
-    let ob = t * (kk + 1u);
+    // bit3: a shared expert rides as slot kk (per-token stride kk + 1).
+    // Without one (MiMo-V2, LFM2-MoE) the stride is kk and no shared slot
+    // is written — the expert kernels then run kk slots.
+    let has_sh = (mflags & 8u) != 0u;
+    let ob = t * (kk + select(0u, 1u, has_sh));
     var wsum = 0.0;
     for (var slot = 0u; slot < kk; slot = slot + 1u) {
         sb_red[lid] = sb_lg[lid];
@@ -9893,11 +9900,13 @@ fn moe_select_b(@builtin(workgroup_id) wid: vec3<u32>,
         for (var slot = 0u; slot < kk; slot = slot + 1u) {
             sb_w[ob + slot] = sb_w[ob + slot] * sb_p.scale;
         }
-        sb_sel[ob + kk] = n;
-        if ((mflags & 16u) != 0u) {
-            sb_w[ob + kk] = 1.0;
-        } else {
-            sb_w[ob + kk] = 1.0 / (1.0 + exp(-sb_sg));
+        if (has_sh) {
+            sb_sel[ob + kk] = n;
+            if ((mflags & 16u) != 0u) {
+                sb_w[ob + kk] = 1.0;
+            } else {
+                sb_w[ob + kk] = 1.0 / (1.0 + exp(-sb_sg));
+            }
         }
     }
 }
@@ -14830,6 +14839,442 @@ const ATTEND_GCK: usize = 256;
 const ATTEND_CK: usize = 128;
 const ATTEND_SPLIT_MIN: usize = 256;
 
+/// Positions per chunk of the per-layer-geometry attend (`gqa_attend_x`,
+/// `gqa_attend_part_x`): one 256-lane workgroup scores one chunk.
+const ATTEND_X_CK: usize = 256;
+
+/// Attention for layers whose geometry is their own (`GraphAttnGeom`):
+/// MiMo-V2's 128-wide V under 192-wide heads, sliding windows over a ring
+/// mirror, learned sink logits, per-layer KV heads. Its own module: the
+/// main one's historical kernels (and their binding slots) stay exactly as
+/// they were for every model with one attention geometry.
+///
+/// Mirror layout: K `[nkv, cap, hd]`, V `[nkv, cap, dv]`. Position `p`
+/// lives in row `p % cap` — the identity for a full-context mirror
+/// (`p < cap`), a ring for a windowed layer (`cap >= window`). A query
+/// sees the `n` positions `first .. first + n` (its own last).
+///
+/// The attend kernels do `gqa_attend_dec`'s math in its order — 256-lane
+/// chunks, lanes as positions for the scores and as V dimensions for the
+/// value sum, max and sum through the same trees — plus:
+///   * a sink starts the online softmax at m = sink[h], l = 1 (the
+///     value-less column: max includes it, the denominator gets
+///     exp(sink − max)), which is the CPU `attend_group` definition;
+///   * V rows are `dv` wide and the output is `nh × dv`.
+/// Past `ATTEND_SPLIT_MIN` positions a full-context layer splits the
+/// chunks across workgroups (`gqa_attend_part_x`) and merges them
+/// (`gqa_attend_merge_x`, which also folds the sink in).
+///
+/// `q8_2f_matvec_b` is the batch graph's q8_2f projection: the decode
+/// kernel `q8_2f_matvec4`'s row walk, lane order and reduction tree, each
+/// lane carrying eight batch rows, so a weight word is read once for
+/// eight positions and every output equals the one-row kernel's bit for
+/// bit.
+const ATTEND_X_SRC: &str = r#"
+struct KxP { nkv: u32, hd: u32, dv: u32, cap: u32, pos: u32, tok: u32, _a: u32, _b: u32 };
+@group(0) @binding(0) var<storage, read>       kx_k  : array<f32>;
+@group(0) @binding(1) var<storage, read>       kx_v  : array<f32>;
+@group(0) @binding(2) var<storage, read_write> kx_kc : array<f32>;
+@group(0) @binding(3) var<storage, read_write> kx_vc : array<f32>;
+@group(0) @binding(4) var<uniform>             kx_p  : KxP;
+
+// This position's K (hd wide) and V (dv wide) rows of every KV head into
+// mirror row pos % cap. `tok` selects the row of a batched projection.
+@compute @workgroup_size(256)
+fn kv_append_x(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    let slot = kx_p.pos % kx_p.cap;
+    let kw = kx_p.nkv * kx_p.hd;
+    if (i < kw) {
+        let h = i / kx_p.hd;
+        kx_kc[(h * kx_p.cap + slot) * kx_p.hd + (i % kx_p.hd)] = kx_k[kx_p.tok * kw + i];
+    }
+    let vw = kx_p.nkv * kx_p.dv;
+    if (i < vw) {
+        let h = i / kx_p.dv;
+        kx_vc[(h * kx_p.cap + slot) * kx_p.dv + (i % kx_p.dv)] = kx_v[kx_p.tok * vw + i];
+    }
+}
+
+struct AxP {
+    nh: u32, hpk: u32, hd: u32, dv: u32,
+    cap: u32, n: u32, first: u32, scale: f32,
+    sink: u32, nc: u32, _a: u32, _b: u32,
+};
+@group(0) @binding(0) var<storage, read>       ax_q    : array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read>       ax_k    : array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read>       ax_v    : array<f32>;
+@group(0) @binding(3) var<storage, read_write> ax_o    : array<f32>;
+@group(0) @binding(4) var<uniform>             ax_p    : AxP;
+@group(0) @binding(5) var<storage, read>       ax_sink : array<f32>;
+@group(0) @binding(6) var<storage, read_write> ax_acc  : array<f32>;
+@group(0) @binding(7) var<storage, read_write> ax_ml   : array<vec2<f32>>;
+var<workgroup> ax_sc: array<f32, 256>;
+var<workgroup> ax_red: array<f32, 256>;
+
+// Mirror row of chunk position p (chunk start c0): (first + c0 + p) % cap
+// without a division per position — p < n <= cap.
+fn ax_slot(s0: u32, p: u32) -> u32 {
+    let s = s0 + p;
+    return select(s, s - ax_p.cap, s >= ax_p.cap);
+}
+
+// Scores of the chunk [c0, c0 + cn) into ax_sc (lane = position, -1e30
+// past the chunk); returns the chunk max.
+fn ax_scores(h: u32, c0: u32, cn: u32, lid: u32) -> f32 {
+    let hd4 = ax_p.hd / 4u;
+    let kbase = (h / ax_p.hpk) * ax_p.cap * hd4;
+    let qbase = h * hd4;
+    var sc = -1.0e30;
+    if (lid < cn) {
+        let krow = kbase + ax_slot((ax_p.first + c0) % ax_p.cap, lid) * hd4;
+        var dot4 = vec4<f32>(0.0);
+        for (var d = 0u; d < hd4; d = d + 1u) {
+            dot4 = dot4 + ax_q[qbase + d] * ax_k[krow + d];
+        }
+        sc = (dot4.x + dot4.y + dot4.z + dot4.w) * ax_p.scale;
+    }
+    ax_sc[lid] = sc;
+    ax_red[lid] = sc;
+    workgroupBarrier();
+    var st = 128u;
+    loop {
+        if (st == 0u) { break; }
+        if (lid < st) { ax_red[lid] = max(ax_red[lid], ax_red[lid + st]); }
+        workgroupBarrier();
+        st = st >> 1u;
+    }
+    let cm = ax_red[0];
+    workgroupBarrier();
+    return cm;
+}
+
+// Workgroup sum of one value per lane (the same tree as the max).
+fn ax_sum(v: f32, lid: u32) -> f32 {
+    ax_red[lid] = v;
+    workgroupBarrier();
+    var st = 128u;
+    loop {
+        if (st == 0u) { break; }
+        if (lid < st) { ax_red[lid] = ax_red[lid] + ax_red[lid + st]; }
+        workgroupBarrier();
+        st = st >> 1u;
+    }
+    let s = ax_red[0];
+    workgroupBarrier();
+    return s;
+}
+
+// Σ_p ax_sc[p] · V[row(p)][lid] over the chunk, for lane lid < dv.
+fn ax_values(h: u32, c0: u32, cn: u32, lid: u32) -> f32 {
+    let dv = ax_p.dv;
+    let vbase = (h / ax_p.hpk) * ax_p.cap * dv;
+    let s0 = (ax_p.first + c0) % ax_p.cap;
+    var acc = 0.0;
+    for (var p = 0u; p < cn; p = p + 1u) {
+        acc = acc + ax_sc[p] * ax_v[vbase + ax_slot(s0, p) * dv + lid];
+    }
+    return acc;
+}
+
+@compute @workgroup_size(256)
+fn gqa_attend_x(@builtin(workgroup_id) wid: vec3<u32>,
+                @builtin(local_invocation_index) lid: u32) {
+    let h = wid.x;
+    if (h >= ax_p.nh) { return; }
+    let n = ax_p.n;
+    var m = -1.0e30;
+    var l = 0.0;
+    if (ax_p.sink != 0u) {
+        m = ax_sink[h];
+        l = 1.0;
+    }
+    var acc = 0.0;
+    var c0 = 0u;
+    loop {
+        if (c0 >= n) { break; }
+        let cn = min(256u, n - c0);
+        let cm = ax_scores(h, c0, cn, lid);
+        let mp = max(m, cm);
+        let f = exp(m - mp);
+        let w = select(0.0, exp(ax_sc[lid] - mp), lid < cn);
+        ax_sc[lid] = w;
+        l = l * f + ax_sum(w, lid);
+        if (lid < ax_p.dv) {
+            acc = acc * f + ax_values(h, c0, cn, lid);
+        }
+        m = mp;
+        c0 = c0 + 256u;
+        workgroupBarrier();
+    }
+    if (lid < ax_p.dv) {
+        ax_o[h * ax_p.dv + lid] = acc / l;
+    }
+}
+
+// One chunk per workgroup (grid nh × chunks): the chunk's unnormalized
+// value sum and its (max, sum) frame, for gqa_attend_merge_x.
+@compute @workgroup_size(256)
+fn gqa_attend_part_x(@builtin(workgroup_id) wid: vec3<u32>,
+                     @builtin(local_invocation_index) lid: u32) {
+    let h = wid.x;
+    let ch = wid.y;
+    if (h >= ax_p.nh) { return; }
+    let c0 = ch * 256u;
+    if (c0 >= ax_p.n) { return; }
+    let cn = min(256u, ax_p.n - c0);
+    let cm = ax_scores(h, c0, cn, lid);
+    let w = select(0.0, exp(ax_sc[lid] - cm), lid < cn);
+    ax_sc[lid] = w;
+    let s = ax_sum(w, lid);
+    let idx = h * ax_p.nc + ch;
+    if (lid < ax_p.dv) {
+        ax_acc[idx * ax_p.dv + lid] = ax_values(h, c0, cn, lid);
+    }
+    if (lid == 0u) {
+        ax_ml[idx] = vec2<f32>(cm, s);
+    }
+}
+
+@compute @workgroup_size(256)
+fn gqa_attend_merge_x(@builtin(workgroup_id) wid: vec3<u32>,
+                      @builtin(local_invocation_index) lid: u32) {
+    let h = wid.x;
+    if (h >= ax_p.nh) { return; }
+    let used = (ax_p.n + 255u) / 256u;
+    let base = h * ax_p.nc;
+    var mg = -1.0e30;
+    if (ax_p.sink != 0u) { mg = ax_sink[h]; }
+    for (var ci = 0u; ci < used; ci = ci + 1u) { mg = max(mg, ax_ml[base + ci].x); }
+    var lg = 0.0;
+    if (ax_p.sink != 0u) { lg = exp(ax_sink[h] - mg); }
+    for (var ci = 0u; ci < used; ci = ci + 1u) {
+        let ml = ax_ml[base + ci];
+        lg = lg + ml.y * exp(ml.x - mg);
+    }
+    for (var d = lid; d < ax_p.dv; d = d + 256u) {
+        var a = 0.0;
+        for (var ci = 0u; ci < used; ci = ci + 1u) {
+            let idx = base + ci;
+            a = a + ax_acc[idx * ax_p.dv + d] * exp(ax_ml[idx].x - mg);
+        }
+        ax_o[h * ax_p.dv + d] = a / lg;
+    }
+}
+
+struct QbP { cols4: u32, rows: u32, cols: u32, nb: u32 };
+@group(0) @binding(0) var<storage, read>       qb_w : array<u32>;
+@group(0) @binding(1) var<storage, read>       qb_x : array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> qb_y : array<f32>;
+@group(0) @binding(3) var<uniform>             qb_p : QbP;
+var<workgroup> qb_part: array<f32, 2048>;
+
+fn qb_i8x4(w: u32) -> vec4<f32> {
+    let s = i32(w);
+    let b0 = (s << 24u) >> 24u;
+    let b1 = (s << 16u) >> 24u;
+    let b2 = (s <<  8u) >> 24u;
+    let b3 =  s          >> 24u;
+    return vec4<f32>(f32(b0), f32(b1), f32(b2), f32(b3));
+}
+
+fn qb_f16x4(half: u32) -> vec4<f32> {
+    let w = half >> 1u;
+    let a = unpack2x16float(qb_w[w]);
+    let b = unpack2x16float(qb_w[w + 1u]);
+    if ((half & 1u) == 0u) {
+        return vec4<f32>(a.x, a.y, b.x, b.y);
+    }
+    let c = unpack2x16float(qb_w[w + 2u]);
+    return vec4<f32>(a.y, b.x, b.y, c.x);
+}
+
+// y[b·rows + r] for the batch rows b0 .. b0 + 8 of workgroup column wid.y.
+// Word-aligned rows only (cols % 4 == 0; the caller checks).
+@compute @workgroup_size(256)
+fn q8_2f_matvec_b(@builtin(workgroup_id) wid: vec3<u32>,
+                  @builtin(num_workgroups) nwg: vec3<u32>,
+                  @builtin(local_invocation_index) lid: u32) {
+    let rows = qb_p.rows;
+    let ngrp = qb_p.cols4;
+    let qbytes = rows * qb_p.cols;
+    let rs0 = qbytes >> 2u;
+    let cs0h = (qbytes >> 1u) + rows;
+    let sub = lid >> 6u;
+    let l = lid & 63u;
+    let b0 = wid.y * 8u;
+    let nbh = min(8u, qb_p.nb - b0);
+    let blocks = (rows + 3u) / 4u;
+    var wb = wid.x;
+    loop {
+        if (wb >= blocks) { break; }
+        let row = wb * 4u + sub;
+        var acc: array<f32, 8>;
+        for (var j = 0u; j < 8u; j = j + 1u) { acc[j] = 0.0; }
+        if (row < rows) {
+            let roww = row * ngrp;
+            var i = l;
+            loop {
+                if (i >= ngrp) { break; }
+                let wq = qb_i8x4(qb_w[roww + i]);
+                let cs = qb_f16x4(cs0h + i * 4u);
+                for (var j = 0u; j < 8u; j = j + 1u) {
+                    if (j < nbh) {
+                        acc[j] = acc[j] + dot(wq, qb_x[(b0 + j) * ngrp + i] * cs);
+                    }
+                }
+                i = i + 64u;
+            }
+        }
+        for (var j = 0u; j < 8u; j = j + 1u) { qb_part[lid * 8u + j] = acc[j]; }
+        workgroupBarrier();
+        var stride = 32u;
+        loop {
+            if (stride == 0u) { break; }
+            if (l < stride) {
+                for (var j = 0u; j < 8u; j = j + 1u) {
+                    qb_part[lid * 8u + j] = qb_part[lid * 8u + j] + qb_part[(lid + stride) * 8u + j];
+                }
+            }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        if (l == 0u && row < rows) {
+            let rw = unpack2x16float(qb_w[rs0 + (row >> 1u)]);
+            var sc = rw.x;
+            if ((row & 1u) == 1u) { sc = rw.y; }
+            for (var j = 0u; j < nbh; j = j + 1u) {
+                qb_y[(b0 + j) * rows + row] = qb_part[lid * 8u + j] * sc;
+            }
+        }
+        workgroupBarrier();
+        wb = wb + nwg.x;
+    }
+}
+"#;
+
+// Same lane/reduction order, but no unused batch accumulators. In the
+// dynamic tail k=1 used to reserve/reduce eight rows in every Q/K/V/O
+// dispatch. Keeping the row count compile-time also removes its inner
+// uniform branch; weights still stream once for the short panel.
+fn q82_short_source(rows: usize) -> String {
+    assert!((1..=4).contains(&rows));
+    let at = ATTEND_X_SRC.find("// y[b·rows + r]").unwrap();
+    let prefix = ATTEND_X_SRC[..at].replace(
+        "qb_part: array<f32, 2048>",
+        &format!("qb_part: array<f32, {}>", 256 * rows),
+    );
+    let body = ATTEND_X_SRC[at..]
+        .replace("8u", &format!("{rows}u"))
+        .replace("array<f32, 8>", &format!("array<f32, {rows}>"));
+    format!("{prefix}{body}")
+}
+
+#[cfg(test)]
+mod attend_x_shader_tests {
+    #[test]
+    fn short_q82_shaders_validate() {
+        for rows in 1..=4 {
+            let source = super::q82_short_source(rows);
+            let module = wgpu::naga::front::wgsl::parse_str(&source).unwrap();
+            wgpu::naga::valid::Validator::new(
+                wgpu::naga::valid::ValidationFlags::all(),
+                wgpu::naga::valid::Capabilities::all(),
+            ).validate(&module).unwrap();
+        }
+    }
+
+    #[test]
+    fn attend_x_shader_validates() {
+        let module =
+            wgpu::naga::front::wgsl::parse_str(super::ATTEND_X_SRC).expect("ATTEND_X_SRC parses");
+        wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .expect("ATTEND_X_SRC validates");
+        for ep in [
+            "kv_append_x",
+            "gqa_attend_x",
+            "gqa_attend_part_x",
+            "gqa_attend_merge_x",
+            "q8_2f_matvec_b",
+        ] {
+            assert!(
+                module.entry_points.iter().any(|e| e.name == ep),
+                "entry point {ep} missing"
+            );
+        }
+    }
+}
+
+/// The per-layer-geometry attention pipelines (`ATTEND_X_SRC`). None on a
+/// device that rejected the module: the graphs then decline a layer that
+/// needs them, with that reason, and never run it on the uniform kernels.
+struct GraphX {
+    kv_append: wgpu::ComputePipeline,
+    attend: wgpu::ComputePipeline,
+    part: wgpu::ComputePipeline,
+    merge: wgpu::ComputePipeline,
+    q82_b: wgpu::ComputePipeline,
+    q82_short: Vec<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
+    // Auto layouts (pipeline-exclusive; each lists only the bindings its
+    // entry point reads).
+    kv_l: wgpu::BindGroupLayout,
+    attend_l: wgpu::BindGroupLayout,
+    part_l: wgpu::BindGroupLayout,
+    merge_l: wgpu::BindGroupLayout,
+    q82_l: wgpu::BindGroupLayout,
+}
+
+/// Bind group from explicit (binding, buffer) pairs — the ATTEND_X entry
+/// points each read a different subset of their module's bindings.
+fn bind_pairs(
+    c: &Ctx,
+    layout: &wgpu::BindGroupLayout,
+    pairs: &[(u32, &wgpu::Buffer)],
+) -> wgpu::BindGroup {
+    let e: Vec<_> = pairs.iter().map(|(i, b)| bind_buf(*i, b)).collect();
+    c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("attend-x"),
+        layout,
+        entries: &e,
+    })
+}
+
+/// Why the ATTEND_X kernels cannot serve a layer geometry, if they cannot.
+fn graph_geom_problem(
+    c: &Ctx,
+    g: &crate::gpu::GraphAttnGeom<'_>,
+    nh: usize,
+    hd: usize,
+) -> Option<&'static str> {
+    if c.graph_x.is_none() {
+        return Some(
+            "per-layer attention geometry: the attend-x module did not build on this device",
+        );
+    }
+    if g.nkv == 0 || nh % g.nkv != 0 {
+        return Some("per-layer attention geometry: KV heads must divide the Q heads");
+    }
+    if g.dv == 0 || g.dv % 4 != 0 || g.dv > hd || g.dv > 256 {
+        return Some(
+            "per-layer attention geometry: V width must be a multiple of 4 in 4..=head_dim",
+        );
+    }
+    if g.rd > hd || g.rd % 2 != 0 || g.invf.len() < g.rd / 2 {
+        return Some("per-layer attention geometry: rotary width / RoPE table out of range");
+    }
+    if g.window == Some(0) {
+        return Some("per-layer attention geometry: zero-width window");
+    }
+    if g.sink.is_some_and(|s| s.len() != nh) {
+        return Some("per-layer attention geometry: one sink logit per Q head required");
+    }
+    None
+}
+
 /// Experimental global q2tp ladder-cache component.  The production q2tp
 /// shader keeps its row-local ladder in workgroup memory; this opt-in arm
 /// interns exact `(f16 lo, f16 step)` pairs once and addresses the resulting
@@ -15235,6 +15680,9 @@ struct Ctx {
     /// `CMF_ATTEND_GQA=0` returns to the per-head split kernel.
     attend_gpart: Option<wgpu::ComputePipeline>,
     layout_attend_gpart: Option<wgpu::BindGroupLayout>,
+    /// Per-layer-geometry attention + the batch graph's q8_2f projection
+    /// (`ATTEND_X_SRC`); None when the device rejected the module.
+    graph_x: Option<GraphX>,
     /// Max head_dim the attend kernels can serve on this device: 256
     /// when 33 KB of workgroup storage fits (desktop), 128 on 32 KB
     /// devices (Adreno/Mali/wgpu-Metal) where only the stride-129
@@ -15343,6 +15791,14 @@ struct Ctx {
     dsv4_global_gu_s16: Option<wgpu::ComputePipeline>,
     dsv4_global_gu_q2_s16: Option<wgpu::ComputePipeline>,
     dsv4_global_dn_s16: Option<wgpu::ComputePipeline>,
+    /// The adapter's limits admit S16; a caller that needs more than S8's
+    /// capacity (MiMo-V2's bank) builds the family on first use.
+    dsv4_global_s16_capable: bool,
+    dsv4_global_s16_lazy: std::sync::OnceLock<(
+        Option<wgpu::ComputePipeline>,
+        Option<wgpu::ComputePipeline>,
+        Option<wgpu::ComputePipeline>,
+    )>,
     moe_down_q4tp_b2: wgpu::ComputePipeline,
     moe_down_q4tp_part: wgpu::ComputePipeline,
     moe_down_q4tp_b4: wgpu::ComputePipeline,
@@ -15544,6 +16000,9 @@ struct Ctx {
     /// Pooled graph scratch: eliminates per-token buffer allocations in the
     /// whole-token graph path (the dominant decode cost on Vulkan/DX12).
     graph_scratch: Mutex<GraphScratch>,
+    /// Bounded scratch for singleton dynamic-tail attention graphs. Held
+    /// until readback completes, so independent pipelines cannot alias it.
+    attn_batch_scratch: Mutex<Vec<(wgpu::BufferUsages, wgpu::Buffer)>>,
 }
 
 struct Dsv4GlobalMoeBufs {
@@ -15563,6 +16022,37 @@ struct KvMirror {
     v: wgpu::Buffer,
     synced: usize,
     cap: usize,
+    /// Geometry the buffers were made for: KV heads, K row width, V row
+    /// width (`dv == hd` for every uniform-geometry model).
+    nkv: usize,
+    hd: usize,
+    dv: usize,
+    /// Some(window) = a sliding layer's RING: position p lives in row
+    /// p % cap and only the newest `cap` positions exist (cap >= window,
+    /// with slack so a short rewind keeps the window intact). None = one
+    /// row per position, growing with the context.
+    ring: Option<usize>,
+    /// Ring only: the oldest position the ring ever received (a CPU
+    /// seed may skip the rows a window can no longer see). The resident
+    /// rows are `[resident_from(), synced)`.
+    lo: usize,
+}
+
+impl KvMirror {
+    /// Oldest position whose row is still in the mirror.
+    fn resident_from(&self) -> usize {
+        match self.ring {
+            Some(_) => self.lo.max(self.synced.saturating_sub(self.cap)),
+            None => 0,
+        }
+    }
+}
+
+/// Rows of a sliding layer's ring mirror: twice the window (a power of
+/// two), so a rewind of up to `window` positions — a KV-reuse prefix, a
+/// speculative rejection — still finds every row its window needs.
+fn kv_ring_cap(window: usize) -> usize {
+    window.max(1).saturating_mul(2).next_power_of_two()
 }
 
 #[derive(Clone, Copy)]
@@ -15601,6 +16091,14 @@ fn kv_mirror_ensure<'a>(
     hd: usize,
     want_cap: usize,
 ) -> &'a mut KvMirror {
+    // A mirror of another geometry (a per-layer-geometry mirror under the
+    // same key) is not this one: start over from the host rows.
+    if mirrors
+        .get(&key)
+        .is_some_and(|m| m.ring.is_some() || m.dv != hd || m.hd != hd || m.nkv != nkv)
+    {
+        mirrors.remove(&key);
+    }
     let grow = mirrors.get(&key).is_none_or(|m| m.cap < want_cap);
     if grow {
         let old = mirrors.remove(&key);
@@ -15620,6 +16118,11 @@ fn kv_mirror_ensure<'a>(
             v: mk(),
             synced: old.as_ref().map_or(0, |m| m.synced.min(want_cap)),
             cap: want_cap,
+            nkv,
+            hd,
+            dv: hd,
+            ring: None,
+            lo: 0,
         };
         if let Some(old) = old.filter(|m| m.synced > 0) {
             let copy_pos = old.synced.min(want_cap);
@@ -15641,6 +16144,153 @@ fn kv_mirror_ensure<'a>(
         mirrors.insert(key, fresh);
     }
     mirrors.get_mut(&key).unwrap()
+}
+
+/// `kv_mirror_ensure` for a layer with its own geometry (`GraphAttnGeom`):
+/// V rows `dv` wide, and for a sliding layer (`window` Some) a fixed ring
+/// of `kv_ring_cap(window)` rows instead of one row per position. A
+/// full-context mirror grows like the uniform one, copying K and V rows at
+/// their own widths. A mirror of another geometry under the key is
+/// dropped (the caller then seeds from the host rows).
+#[allow(clippy::too_many_arguments)]
+fn kv_mirror_ensure_x<'a>(
+    c: &Ctx,
+    mirrors: &'a mut HashMap<(u64, usize), KvMirror>,
+    key: (u64, usize),
+    nkv: usize,
+    hd: usize,
+    dv: usize,
+    want_cap: usize,
+    window: Option<usize>,
+) -> &'a mut KvMirror {
+    if mirrors
+        .get(&key)
+        .is_some_and(|m| m.ring != window || m.dv != dv || m.hd != hd || m.nkv != nkv)
+    {
+        mirrors.remove(&key);
+    }
+    let want_cap = match window {
+        Some(w) => kv_ring_cap(w),
+        None => want_cap,
+    };
+    let grow = mirrors.get(&key).is_none_or(|m| m.cap < want_cap);
+    if grow {
+        let old = mirrors.remove(&key);
+        let mk = |width: usize| {
+            c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("kv-mirror-x"),
+                size: ((nkv * want_cap * width * 4) as u64).max(4),
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            })
+        };
+        let fresh = KvMirror {
+            k: mk(hd),
+            v: mk(dv),
+            synced: old.as_ref().map_or(0, |m| m.synced.min(want_cap)),
+            cap: want_cap,
+            nkv,
+            hd,
+            dv,
+            ring: window,
+            lo: 0,
+        };
+        // Only a full-context mirror grows (a ring's size is fixed), so the
+        // history copies row for row at the new stride.
+        if let Some(old) = old.filter(|m| m.synced > 0 && m.ring.is_none()) {
+            let copy_pos = old.synced.min(want_cap);
+            let mut enc = c
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("kv-grow-x"),
+                });
+            for h in 0..nkv {
+                for (src_b, dst_b, width) in [(&old.k, &fresh.k, hd), (&old.v, &fresh.v, dv)] {
+                    let src = (h * old.cap * width * 4) as u64;
+                    let dst = (h * want_cap * width * 4) as u64;
+                    enc.copy_buffer_to_buffer(
+                        src_b,
+                        src,
+                        dst_b,
+                        dst,
+                        (copy_pos * width * 4) as u64,
+                    );
+                }
+            }
+            submit(c, finish_enc(enc));
+            let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+        }
+        mirrors.insert(key, fresh);
+    }
+    mirrors.get_mut(&key).unwrap()
+}
+
+/// Seed a per-layer-geometry mirror from the host cache: positions
+/// `[synced, to)` (a ring takes only the newest `cap` of them — anything
+/// older is a row its window can no longer see). Host K rows are `hd`
+/// wide; host V rows are `hd` wide too, zero-padded past `dv`, and are
+/// compacted to the mirror's `dv`. False (nothing written) when the host
+/// holds fewer than `to` rows for some head.
+fn kv_mirror_seed_x(
+    c: &Ctx,
+    m: &mut KvMirror,
+    cpu_k: &[Vec<f32>],
+    cpu_v: &[Vec<f32>],
+    to: usize,
+) -> bool {
+    let (nkv, hd, dv, cap) = (m.nkv, m.hd, m.dv, m.cap);
+    if m.synced >= to {
+        return true;
+    }
+    if cpu_k.len() < nkv
+        || cpu_v.len() < nkv
+        || (0..nkv).any(|h| cpu_k[h].len() < to * hd || cpu_v[h].len() < to * hd)
+    {
+        return false;
+    }
+    let from = match m.ring {
+        Some(_) => m.synced.max(to.saturating_sub(cap)),
+        None => m.synced,
+    };
+    for h in 0..nkv {
+        let mut p = from;
+        while p < to {
+            let slot = p % cap;
+            let run = (cap - slot).min(to - p);
+            c.queue.write_buffer(
+                &m.k,
+                ((h * cap + slot) * hd * 4) as u64,
+                bytemuck::cast_slice(&cpu_k[h][p * hd..(p + run) * hd]),
+            );
+            if dv == hd {
+                c.queue.write_buffer(
+                    &m.v,
+                    ((h * cap + slot) * dv * 4) as u64,
+                    bytemuck::cast_slice(&cpu_v[h][p * hd..(p + run) * hd]),
+                );
+            } else {
+                let mut rows = Vec::with_capacity(run * dv);
+                for r in p..p + run {
+                    rows.extend_from_slice(&cpu_v[h][r * hd..r * hd + dv]);
+                }
+                c.queue.write_buffer(
+                    &m.v,
+                    ((h * cap + slot) * dv * 4) as u64,
+                    bytemuck::cast_slice(&rows),
+                );
+            }
+            p += run;
+        }
+    }
+    if m.ring.is_some() && from > m.synced {
+        // Rows [synced, from) were skipped, and the seed's `cap` rows have
+        // overwritten every older one.
+        m.lo = from;
+    }
+    m.synced = to;
+    true
 }
 
 #[derive(Default)]
@@ -15794,6 +16444,14 @@ struct GraphScratch {
     kv_us: Vec<wgpu::Buffer>,
     at_us: Vec<wgpu::Buffer>,
     rope_us: Vec<wgpu::Buffer>,
+    // Per-layer-geometry layers: one append (32 B, KxP) and one attend
+    // (48 B, AxP) uniform per (step, layer) — their KV heads, V width,
+    // window and cursor differ layer by layer.
+    kvx_us: Vec<wgpu::Buffer>,
+    atx_us: Vec<wgpu::Buffer>,
+    // Split-K partials of the per-layer-geometry attend.
+    xacc: Option<(wgpu::Buffer, u64)>,
+    xml: Option<(wgpu::Buffer, u64)>,
     ids: Option<(wgpu::Buffer, u64)>,
     ids_stage: Option<(wgpu::Buffer, u64)>,
     am_pv: Option<(wgpu::Buffer, u64)>,
@@ -15916,6 +16574,7 @@ fn ctx_for(dev: usize) -> Option<&'static Ctx> {
 /// inference but leaves that worker observing half-destroyed state at exit.
 /// The caller must invoke this only after all model work has stopped.
 pub fn shutdown() {
+    crate::mimo_moe::shutdown_banks();
     let Some(map) = CTXS.get() else { return };
     let mut owned = Vec::new();
     {
@@ -16954,120 +17613,8 @@ fn init(dev: usize) -> Result<Ctx, String> {
     // remains the default used by every model; S16 is constructed only for an
     // explicitly opted-in V4.1 profile on adapters whose binding-array limits
     // cover the complete six-binding gate/up group and two-bank shader.
-    let make_global = |segments: usize| {
-        let source = dsv4_global_moe_shader_source(segments)
-            .expect("global MoE shader geometry must be one of the supported sizes");
-        let suffix = if segments == DSV4_GLOBAL_MOE_SEGMENTS {
-            ""
-        } else {
-            "-s16"
-        };
-        let gm = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some(if segments == DSV4_GLOBAL_MOE_SEGMENTS {
-                "dsv4-global-moe"
-            } else {
-                "dsv4-global-moe-s16"
-            }),
-            source: wgpu::ShaderSource::Wgsl(source.into()),
-        });
-        let storage =
-            |binding: u32, read_only: bool, count: Option<u32>| wgpu::BindGroupLayoutEntry {
-                binding,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: count.and_then(std::num::NonZeroU32::new),
-            };
-        let gu0 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some(if suffix.is_empty() {
-                "dsv4-global-gu0"
-            } else {
-                "dsv4-global-gu0-s16"
-            }),
-            entries: &[
-                storage(0, true, Some(segments as u32)),
-                storage(1, true, Some(segments as u32)),
-                storage(2, true, None),
-                storage(3, true, None),
-                storage(4, false, None),
-                // V4.1 binds route weights here before the BF16 down input;
-                // generic callers still provide their mwt buffer, ignored
-                // when the BF16 flag is clear.
-                storage(5, true, None),
-            ],
-        });
-        let dn0 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some(if suffix.is_empty() {
-                "dsv4-global-dn0"
-            } else {
-                "dsv4-global-dn0-s16"
-            }),
-            entries: &[
-                storage(0, true, Some(segments as u32)),
-                storage(1, true, None),
-                storage(2, true, None),
-                storage(3, true, None),
-                storage(4, false, None),
-            ],
-        });
-        let params = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some(if suffix.is_empty() {
-                "dsv4-global-params"
-            } else {
-                "dsv4-global-params-s16"
-            }),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
-        let gu_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some(if suffix.is_empty() {
-                "dsv4-global-gu-layout"
-            } else {
-                "dsv4-global-gu-layout-s16"
-            }),
-            bind_group_layouts: &[Some(&gu0), Some(&params)],
-            immediate_size: 0,
-        });
-        let dn_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some(if suffix.is_empty() {
-                "dsv4-global-dn-layout"
-            } else {
-                "dsv4-global-dn-layout-s16"
-            }),
-            bind_group_layouts: &[Some(&dn0), Some(&params)],
-            immediate_size: 0,
-        });
-        let gp = |entry: &str| {
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some(entry),
-                layout: Some(if entry == "dsv4_global_down_q4tp" {
-                    &dn_layout
-                } else {
-                    &gu_layout
-                }),
-                module: &gm,
-                entry_point: Some(entry),
-                compilation_options: Default::default(),
-                cache: pcache.as_ref(),
-            })
-        };
-        (
-            Some(gp("dsv4_global_gate_up_q4tp")),
-            Some(gp("dsv4_global_gate_up_q2tp")),
-            Some(gp("dsv4_global_down_q4tp")),
-        )
-    };
+    let make_global =
+        |segments: usize| build_global_moe_pipelines(&device, pcache.as_ref(), segments);
     let (dsv4_global_gu, dsv4_global_gu_q2, dsv4_global_dn) = if want_bind_arrays {
         make_global(DSV4_GLOBAL_MOE_SEGMENTS)
     } else {
@@ -17156,6 +17703,74 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let attend_gpart = (big_attend && std::env::var("CMF_ATTEND_GQA").as_deref() != Ok("0"))
         .then(|| pipe_split("gqa_attend_gpart"));
     let layout_attend_gpart = attend_gpart.as_ref().map(|p| p.get_bind_group_layout(0));
+    // Per-layer-geometry attention (MiMo-V2 class). Built under an error
+    // scope: a device that rejects it keeps every other kernel, and the
+    // graphs decline only the layers that would need it.
+    let graph_x = {
+        let sc = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let m = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("cmf-attend-x"),
+            source: wgpu::ShaderSource::Wgsl(ATTEND_X_SRC.into()),
+        });
+        if let Some(e) = pollster::block_on(sc.pop()) {
+            tracing::warn!("cmf-attend-x module rejected: {e}");
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            None
+        } else {
+            let sc = device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let px = |ep: &str| {
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(ep),
+                    layout: None,
+                    module: &m,
+                    entry_point: Some(ep),
+                    compilation_options: Default::default(),
+                    cache: pcache.as_ref(),
+                })
+            };
+            let (kv_append, attend, part, merge, q82_b) = (
+                px("kv_append_x"),
+                px("gqa_attend_x"),
+                px("gqa_attend_part_x"),
+                px("gqa_attend_merge_x"),
+                px("q8_2f_matvec_b"),
+            );
+            let mut q82_short = Vec::new();
+            for rows in 1..=4 {
+                let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("q82-short"),
+                    source: wgpu::ShaderSource::Wgsl(q82_short_source(rows).into()),
+                });
+                let pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("q82-short"), layout: None, module: &module,
+                    entry_point: Some("q8_2f_matvec_b"),
+                    compilation_options: Default::default(), cache: pcache.as_ref(),
+                });
+                let layout = pipe.get_bind_group_layout(0);
+                q82_short.push((pipe, layout));
+            }
+            let gx = GraphX {
+                q82_short,
+                kv_l: kv_append.get_bind_group_layout(0),
+                attend_l: attend.get_bind_group_layout(0),
+                part_l: part.get_bind_group_layout(0),
+                merge_l: merge.get_bind_group_layout(0),
+                q82_l: q82_b.get_bind_group_layout(0),
+                kv_append,
+                attend,
+                part,
+                merge,
+                q82_b,
+            };
+            if let Some(e) = pollster::block_on(sc.pop()) {
+                tracing::warn!("cmf-attend-x pipelines rejected: {e}");
+                let _ = device.poll(wgpu::PollType::wait_indefinitely());
+                None
+            } else {
+                Some(gx)
+            }
+        }
+    };
     // Subgroup select: its own module — `enable subgroups` must never
     // reach a device without the feature.
     // CMF_MV_SG=1: the barrier-light decode matvec — the experiment
@@ -17379,6 +17994,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         attend_merge,
         attend_gpart,
         layout_attend_gpart,
+        graph_x,
         hd_cap: 256,
         big_attend,
         gdn_step,
@@ -17445,6 +18061,8 @@ fn init(dev: usize) -> Result<Ctx, String> {
         dsv4_global_gu_s16,
         dsv4_global_gu_q2_s16,
         dsv4_global_dn_s16,
+        dsv4_global_s16_capable: s16_capable,
+        dsv4_global_s16_lazy: std::sync::OnceLock::new(),
         moe_down_q4tp_b2,
         moe_down_q4tp_part,
         moe_down_q4tp_b4,
@@ -17524,6 +18142,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         moe_expw: Mutex::new(HashMap::new()),
         dsv4_global_moe: Mutex::new(HashMap::new()),
         graph_scratch: Mutex::new(GraphScratch::default()),
+        attn_batch_scratch: Mutex::new(Vec::new()),
     })
 }
 
@@ -17648,6 +18267,131 @@ fn pipeline_cache_path(info: &wgpu::AdapterInfo) -> Option<std::path::PathBuf> {
 /// Load the blob and hand it to the driver. Unsafe by wgpu's contract —
 /// the data goes straight to the driver — which the key above bounds:
 /// only this build on this driver can produce a matching file name.
+/// The segmented global MoE bank's pipeline family for one descriptor-array
+/// width (S8 or S16): gate/up (q4tp and q2tp) and down.
+fn build_global_moe_pipelines(
+    device: &wgpu::Device,
+    pcache: Option<&wgpu::PipelineCache>,
+    segments: usize,
+) -> (
+    Option<wgpu::ComputePipeline>,
+    Option<wgpu::ComputePipeline>,
+    Option<wgpu::ComputePipeline>,
+) {
+    let source = dsv4_global_moe_shader_source(segments)
+        .expect("global MoE shader geometry must be one of the supported sizes");
+    let suffix = if segments == DSV4_GLOBAL_MOE_SEGMENTS {
+        ""
+    } else {
+        "-s16"
+    };
+    let gm = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(if segments == DSV4_GLOBAL_MOE_SEGMENTS {
+            "dsv4-global-moe"
+        } else {
+            "dsv4-global-moe-s16"
+        }),
+        source: wgpu::ShaderSource::Wgsl(source.into()),
+    });
+    let storage =
+        |binding: u32, read_only: bool, count: Option<u32>| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: count.and_then(std::num::NonZeroU32::new),
+        };
+    let gu0 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some(if suffix.is_empty() {
+            "dsv4-global-gu0"
+        } else {
+            "dsv4-global-gu0-s16"
+        }),
+        entries: &[
+            storage(0, true, Some(segments as u32)),
+            storage(1, true, Some(segments as u32)),
+            storage(2, true, None),
+            storage(3, true, None),
+            storage(4, false, None),
+            // V4.1 binds route weights here before the BF16 down input;
+            // generic callers still provide their mwt buffer, ignored
+            // when the BF16 flag is clear.
+            storage(5, true, None),
+        ],
+    });
+    let dn0 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some(if suffix.is_empty() {
+            "dsv4-global-dn0"
+        } else {
+            "dsv4-global-dn0-s16"
+        }),
+        entries: &[
+            storage(0, true, Some(segments as u32)),
+            storage(1, true, None),
+            storage(2, true, None),
+            storage(3, true, None),
+            storage(4, false, None),
+        ],
+    });
+    let params = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some(if suffix.is_empty() {
+            "dsv4-global-params"
+        } else {
+            "dsv4-global-params-s16"
+        }),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+    let gu_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(if suffix.is_empty() {
+            "dsv4-global-gu-layout"
+        } else {
+            "dsv4-global-gu-layout-s16"
+        }),
+        bind_group_layouts: &[Some(&gu0), Some(&params)],
+        immediate_size: 0,
+    });
+    let dn_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(if suffix.is_empty() {
+            "dsv4-global-dn-layout"
+        } else {
+            "dsv4-global-dn-layout-s16"
+        }),
+        bind_group_layouts: &[Some(&dn0), Some(&params)],
+        immediate_size: 0,
+    });
+    let gp = |entry: &str| {
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(entry),
+            layout: Some(if entry == "dsv4_global_down_q4tp" {
+                &dn_layout
+            } else {
+                &gu_layout
+            }),
+            module: &gm,
+            entry_point: Some(entry),
+            compilation_options: Default::default(),
+            cache: pcache,
+        })
+    };
+    (
+        Some(gp("dsv4_global_gate_up_q4tp")),
+        Some(gp("dsv4_global_gate_up_q2tp")),
+        Some(gp("dsv4_global_down_q4tp")),
+    )
+}
+
 fn pipeline_cache_load(
     device: &wgpu::Device,
     info: &wgpu::AdapterInfo,
@@ -20856,6 +21600,7 @@ fn graph_layer_payload_bytes(
         }
     }
     match &layer.ffn {
+        crate::gpu::GraphFfn::AttentionOnly => {}
         crate::gpu::GraphFfn::Dense { gate, up, down } => {
             add(gate)?;
             add(up)?;
@@ -20974,6 +21719,25 @@ pub fn forward_token_graph(
         return token_graph_outcome(o1_started || state_started, false); // vec4 K/V reads; hd_cap = workgroup-storage limit
     }
     let cap = kv_capacity(cap, position.saturating_add(steps.max(1)));
+    // Layers with their own attention geometry run the ATTEND_X kernels;
+    // anything those cannot serve is declined here, before any upload.
+    for l in layers {
+        if let crate::gpu::GraphAttn::Full {
+            geom: Some(g),
+            output_gate,
+            ..
+        } = &l.attn
+        {
+            if let Some(reason) = graph_geom_problem(c, g, nh, hd) {
+                graph_decline(reason);
+                return token_graph_outcome(o1_started || state_started, false);
+            }
+            if *output_gate {
+                graph_decline("per-layer attention geometry with an output gate");
+                return token_graph_outcome(o1_started || state_started, false);
+            }
+        }
+    }
     let t_start = std::time::Instant::now();
     // A resolved matvec weight: the device-local buffer, (q8 only) its row
     // scales, and the codec kind (0=q8_row 1=q1 2=q4_block 3=q1t 4=f32 5=q4_tiled).
@@ -20994,6 +21758,10 @@ pub fn forward_token_graph(
             wk: GMat,
             wv: GMat,
             wo: GMat,
+            /// This layer's KV heads and V width (the call-wide nkv / hd
+            /// unless the layer carries its own geometry).
+            nkv: usize,
+            dv: usize,
         },
         Conv {
             inp: GMat,
@@ -21244,20 +22012,29 @@ pub fn forward_token_graph(
                 wv,
                 wo,
                 output_gate,
+                geom,
                 ..
             } => {
+                let (lnkv, ldv) = geom.map_or((nkv, hd), |g| (g.nkv, g.dv));
                 // Gated attention: wq packs q||gate per head → 2·nh·hd rows.
                 let qrows = nh * hd * (1 + *output_gate as usize);
                 let (Some(wq), Some(wk), Some(wv), Some(wo)) = (
                     resolve(wq, qrows, hidden),
-                    resolve(wk, nkv * hd, hidden),
-                    resolve(wv, nkv * hd, hidden),
-                    resolve(wo, hidden, nh * hd),
+                    resolve(wk, lnkv * hd, hidden),
+                    resolve(wv, lnkv * ldv, hidden),
+                    resolve(wo, hidden, nh * ldv),
                 ) else {
                     graph_decline("attn q/k/v/o resolve");
                     return token_graph_outcome(o1_started || state_started, false);
                 };
-                LAttn::Full { wq, wk, wv, wo }
+                LAttn::Full {
+                    wq,
+                    wk,
+                    wv,
+                    wo,
+                    nkv: lnkv,
+                    dv: ldv,
+                }
             }
             crate::gpu::GraphAttn::Gdn {
                 qkv,
@@ -21321,6 +22098,9 @@ pub fn forward_token_graph(
             }
         };
         let ffn = match &l.ffn {
+            crate::gpu::GraphFfn::AttentionOnly => {
+                return token_graph_outcome(o1_started || state_started, false);
+            }
             crate::gpu::GraphFfn::Dense { gate, up, down } => {
                 // The tensor knows its own width; the config only knows
                 // the widest. Ask the weight.
@@ -21644,8 +22424,16 @@ pub fn forward_token_graph(
         st,
         "g-qraw",
     );
-    let kb = GraphScratch::ensure(&c.device, &mut gs.kb, (nkv * hd * 4) as u64, st, "g-kb");
-    let vb = GraphScratch::ensure(&c.device, &mut gs.vb, (nkv * hd * 4) as u64, st, "g-vb");
+    // K/V projection scratch: the widest layer's (per-layer KV heads).
+    let kv_rows = lws
+        .iter()
+        .filter_map(|lw| match &lw.attn {
+            LAttn::Full { nkv, .. } => Some(*nkv * hd),
+            _ => None,
+        })
+        .fold(nkv * hd, usize::max);
+    let kb = GraphScratch::ensure(&c.device, &mut gs.kb, (kv_rows * 4) as u64, st, "g-kb");
+    let vb = GraphScratch::ensure(&c.device, &mut gs.vb, (kv_rows * 4) as u64, st, "g-vb");
     let qout = GraphScratch::ensure(&c.device, &mut gs.qout, (nh * hd * 4) as u64, st, "g-qout");
     let gout = GraphScratch::ensure(&c.device, &mut gs.gout, (nh * hd * 4) as u64, st, "g-gout");
     let attn = GraphScratch::ensure(&c.device, &mut gs.attn, (nh * hd * 4) as u64, st, "g-attn");
@@ -21741,12 +22529,46 @@ pub fn forward_token_graph(
     // GDN layers carry a persistent (ring, S) recurrent state instead.
     let mut kvbufs: Vec<Option<(wgpu::Buffer, wgpu::Buffer)>> = Vec::with_capacity(layers.len());
     let mut gdnbufs: Vec<Option<(wgpu::Buffer, wgpu::Buffer)>> = Vec::with_capacity(layers.len());
+    // Mirror rows of each per-layer-geometry layer (a ring's fixed size,
+    // or a full-context mirror's current capacity) — the stride its
+    // kernels index by.
+    let mut xcaps: HashMap<usize, usize> = HashMap::new();
     {
         let mut kvm = c.attn_kv.lock().unwrap();
         let mut gsm = c.gdn_state.lock().unwrap();
         let mut gcm = c.gdn_cursor.lock().unwrap();
         for (li, l) in layers.iter().enumerate() {
             match &l.attn {
+                crate::gpu::GraphAttn::Full {
+                    cpu_k,
+                    cpu_v,
+                    geom: Some(g),
+                    ..
+                } if o1.get(li).is_none_or(|v| v.is_none()) => {
+                    // Per-layer geometry: V rows dv wide, a ring for a
+                    // sliding layer, seeded from the host rows it lacks.
+                    let e = kv_mirror_ensure_x(
+                        c,
+                        &mut kvm,
+                        (kv_id, layer_base + li),
+                        g.nkv,
+                        hd,
+                        g.dv,
+                        cap,
+                        g.window,
+                    );
+                    if e.synced > position {
+                        graph_refused("KV mirror is ahead of token-graph position");
+                        return token_graph_outcome(true, false);
+                    }
+                    if e.synced < position && !kv_mirror_seed_x(c, e, cpu_k, cpu_v, position) {
+                        graph_refused("host KV rows missing for the device mirror seed");
+                        return token_graph_outcome(o1_started || state_started, false);
+                    }
+                    xcaps.insert(li, e.cap);
+                    kvbufs.push(Some((e.k.clone(), e.v.clone())));
+                    gdnbufs.push(None);
+                }
                 crate::gpu::GraphAttn::Full { cpu_k, cpu_v, .. } => {
                     if o1.get(li).is_some_and(|v| v.is_some()) {
                         // o1 replaces this layer's KV attention outright —
@@ -22195,6 +23017,10 @@ pub fn forward_token_graph(
     mku(&mut gs.kv_us, 16, steps);
     mku(&mut gs.at_us, 32, steps);
     mku(&mut gs.rope_us, 32, steps * layers.len());
+    if !xcaps.is_empty() {
+        mku(&mut gs.kvx_us, 32, steps * layers.len());
+        mku(&mut gs.atx_us, 48, steps * layers.len());
+    }
     for st in 0..steps {
         let p = position + st;
         c.queue.write_buffer(
@@ -22222,6 +23048,8 @@ pub fn forward_token_graph(
     let kv_us = std::mem::take(&mut gs.kv_us);
     let at_us = std::mem::take(&mut gs.at_us);
     let rope_us = std::mem::take(&mut gs.rope_us);
+    let kvx_us = std::mem::take(&mut gs.kvx_us);
+    let atx_us = std::mem::take(&mut gs.atx_us);
     // The ladder sidecar is selected from the same resolved tensor identity
     // used by the graph's prep/emat descriptors.  Keeping this in one helper
     // prevents the graph path from accidentally using a component-only or
@@ -22859,16 +23687,26 @@ pub fn forward_token_graph(
             // ── token mixing (attention or GDN) → ob ──
             match (&lw.attn, &l.attn) {
                 (
-                    LAttn::Full { wq, wk, wv, wo },
+                    LAttn::Full {
+                        wq,
+                        wk,
+                        wv,
+                        wo,
+                        nkv: lnkv,
+                        dv: ldv,
+                    },
                     crate::gpu::GraphAttn::Full {
                         q_norm,
                         k_norm,
                         late_qk_norm,
                         bias,
                         output_gate,
+                        geom,
                         ..
                     },
                 ) => {
+                    let (lnkv, ldv) = (*lnkv, *ldv);
+                    let lrd = geom.map_or(rd, |g| g.rd);
                     let o1_here = o1.get(li).and_then(|v| v.as_ref());
                     // true = the fused short-context arm already ran the output
                     // gate and the O projection inside its pass.
@@ -22885,9 +23723,9 @@ pub fn forward_token_graph(
                         0,
                         bytemuck::cast_slice(&[
                             nh as u32,
-                            nkv as u32,
+                            lnkv as u32,
                             hd as u32,
-                            rd as u32,
+                            lrd as u32,
                             position as u32,
                             flags(q_norm.is_some(), k_norm.is_some(), *late_qk_norm) | gate_flag,
                             eps.to_bits(),
@@ -22912,7 +23750,7 @@ pub fn forward_token_graph(
                     // k+v in ONE dispatch (the x2 kernel) next to q, when
                     // both are wide q4tp; otherwise the grouped pass.
                     let pkv = if group {
-                        prep2(wk, wv, &qkv_in, &kb, &vb, nkv * hd, nkv * hd, hidden)
+                        prep2(wk, wv, &qkv_in, &kb, &vb, lnkv * hd, lnkv * ldv, hidden)
                     } else {
                         None
                     };
@@ -22930,8 +23768,8 @@ pub fn forward_token_graph(
                             &mut enc,
                             &[
                                 (wq, &qkv_in, &qraw, qrows, hidden),
-                                (wk, &qkv_in, &kb, nkv * hd, hidden),
-                                (wv, &qkv_in, &vb, nkv * hd, hidden),
+                                (wk, &qkv_in, &kb, lnkv * hd, hidden),
+                                (wv, &qkv_in, &vb, lnkv * ldv, hidden),
                             ],
                         ),
                     }
@@ -22942,7 +23780,8 @@ pub fn forward_token_graph(
                             stor(bytemuck::cast_slice(bv)),
                         );
                         let axq = uniform_u32x4(c, [1.0f32.to_bits(), (nh * hd) as u32, 0, 0]);
-                        let axkv = uniform_u32x4(c, [1.0f32.to_bits(), (nkv * hd) as u32, 0, 0]);
+                        let axk = uniform_u32x4(c, [1.0f32.to_bits(), (lnkv * hd) as u32, 0, 0]);
+                        let axv = uniform_u32x4(c, [1.0f32.to_bits(), (lnkv * ldv) as u32, 0, 0]);
                         go(
                             &mut enc,
                             &c.axpy,
@@ -22952,14 +23791,14 @@ pub fn forward_token_graph(
                         go(
                             &mut enc,
                             &c.axpy,
-                            &bgc(14, li, &c.layout_axpy, &[&bkb, &kb, &axkv]),
-                            ((nkv * hd) as u32).div_ceil(256),
+                            &bgc(14, li, &c.layout_axpy, &[&bkb, &kb, &axk]),
+                            ((lnkv * hd) as u32).div_ceil(256),
                         );
                         go(
                             &mut enc,
                             &c.axpy,
-                            &bgc(15, li, &c.layout_axpy, &[&bvb, &vb, &axkv]),
-                            ((nkv * hd) as u32).div_ceil(256),
+                            &bgc(15, li, &c.layout_axpy, &[&bvb, &vb, &axv]),
+                            ((lnkv * ldv) as u32).div_ceil(256),
                         );
                     }
                     if let Some(views) = o1_here {
@@ -23092,6 +23931,134 @@ pub fn forward_token_graph(
                             flush_pass(&enc);
                             enc.copy_buffer_to_buffer(&vb, 0, &dbgq, 32, 16);
                             o1_dbg.push((li + 10_000, dbgq));
+                        }
+                    } else if let Some(g) = geom {
+                        // Per-layer geometry (MiMo-V2): this layer's KV
+                        // heads, RoPE table and rotary width, a dv-wide V
+                        // mirror (a ring for a sliding layer) and the sink
+                        // softmax — the ATTEND_X kernels. The fused rkv /
+                        // passfuse shortcuts assume the uniform contract
+                        // and are never taken here.
+                        let gx = c.graph_x.as_ref().expect("checked at admission");
+                        let (kbuf, vbuf) = kvbufs[li].as_ref().unwrap();
+                        let mcap = xcaps[&li];
+                        let slot_u = stp * layers.len() + li;
+                        let (kvx_u, atx_u) = (&kvx_us[slot_u], &atx_us[slot_u]);
+                        let n_all = position + 1;
+                        let n = g.window.map_or(n_all, |w| n_all.min(w));
+                        let first = n_all - n;
+                        let nc = mcap.div_ceil(ATTEND_X_CK);
+                        c.queue.write_buffer(
+                            kvx_u,
+                            0,
+                            bytemuck::cast_slice(&[
+                                g.nkv as u32,
+                                hd as u32,
+                                g.dv as u32,
+                                mcap as u32,
+                                position as u32,
+                                0,
+                                0,
+                                0,
+                            ]),
+                        );
+                        c.queue.write_buffer(
+                            atx_u,
+                            0,
+                            bytemuck::cast_slice(&[
+                                nh as u32,
+                                (nh / g.nkv) as u32,
+                                hd as u32,
+                                g.dv as u32,
+                                mcap as u32,
+                                n as u32,
+                                first as u32,
+                                attn_scale.to_bits(),
+                                u32::from(g.sink.is_some()),
+                                nc as u32,
+                                0,
+                                0,
+                            ]),
+                        );
+                        let invf_l = stor(bytemuck::cast_slice(g.invf));
+                        let sink_b = g
+                            .sink
+                            .map(|sk| stor(bytemuck::cast_slice(sk)))
+                            .unwrap_or_else(|| zeros(nh));
+                        let bg_rope = bg(
+                            &c.layout_attn_rope,
+                            &[&qraw, &kb, &qout, &gout, &qnw, &knw, &invf_l, &rope_u],
+                        );
+                        let bg_kv = bg(&gx.kv_l, &[&kb, &vb, kbuf, vbuf, kvx_u]);
+                        if !skip_attn {
+                            let mut pass = begin_pass(&mut enc);
+                            pass.set_pipeline(&c.attn_rope);
+                            pass.set_bind_group(0, &bg_rope, &[]);
+                            pass.dispatch_workgroups((nh + g.nkv) as u32, 1, 1);
+                            // The K/V append is the admission boundary for the
+                            // terminal outcome contract, as on the uniform arms.
+                            state_started = true;
+                            pass.set_pipeline(&gx.kv_append);
+                            pass.set_bind_group(0, &bg_kv, &[]);
+                            pass.dispatch_workgroups(((g.nkv * hd) as u32).div_ceil(256), 1, 1);
+                        }
+                        if !skip_attn && g.window.is_none() && n > ATTEND_SPLIT_MIN {
+                            // Long full-context layer: chunks across
+                            // workgroups, then a per-head merge (same pass —
+                            // dispatch order makes the partials visible).
+                            let used = n.div_ceil(ATTEND_X_CK);
+                            let xacc = GraphScratch::ensure(
+                                &c.device,
+                                &mut gs.xacc,
+                                (nh * nc * g.dv * 4) as u64,
+                                st,
+                                "g-xacc",
+                            );
+                            let xml = GraphScratch::ensure(
+                                &c.device,
+                                &mut gs.xml,
+                                (nh * nc * 8) as u64,
+                                st,
+                                "g-xml",
+                            );
+                            let bg_part = bind_pairs(
+                                c,
+                                &gx.part_l,
+                                &[
+                                    (0, &qout),
+                                    (1, kbuf),
+                                    (2, vbuf),
+                                    (4, atx_u),
+                                    (6, &xacc),
+                                    (7, &xml),
+                                ],
+                            );
+                            let bg_merge = bind_pairs(
+                                c,
+                                &gx.merge_l,
+                                &[(3, &attn), (4, atx_u), (5, &sink_b), (6, &xacc), (7, &xml)],
+                            );
+                            let mut pass = begin_pass(&mut enc);
+                            pass.set_pipeline(&gx.part);
+                            pass.set_bind_group(0, &bg_part, &[]);
+                            pass.dispatch_workgroups(nh as u32, used as u32, 1);
+                            pass.set_pipeline(&gx.merge);
+                            pass.set_bind_group(0, &bg_merge, &[]);
+                            pass.dispatch_workgroups(nh as u32, 1, 1);
+                        } else if !skip_attn {
+                            let bg_att = bind_pairs(
+                                c,
+                                &gx.attend_l,
+                                &[
+                                    (0, &qout),
+                                    (1, kbuf),
+                                    (2, vbuf),
+                                    (3, &attn),
+                                    (4, atx_u),
+                                    (5, &sink_b),
+                                ],
+                            );
+                            go(&mut enc, &gx.attend, &bg_att, nh as u32);
                         }
                     } else {
                         let (kbuf, vbuf) = kvbufs[li].as_ref().unwrap();
@@ -23344,11 +24311,11 @@ pub fn forward_token_graph(
                         );
                     }
                     if !attn_done {
-                        let Some(wo_in) = prism_input(&mut enc, &[wo], &attn, nh * hd) else {
+                        let Some(wo_in) = prism_input(&mut enc, &[wo], &attn, nh * ldv) else {
                             graph_decline("Prism O transform unavailable");
                             return token_graph_outcome(o1_started || state_started, false);
                         };
-                        emat(&mut enc, wo, &wo_in, &ob, hidden, nh * hd);
+                        emat(&mut enc, wo, &wo_in, &ob, hidden, nh * ldv);
                     }
                 }
                 (
@@ -24498,6 +25465,8 @@ pub fn forward_token_graph(
     gs.kv_us = kv_us;
     gs.at_us = at_us;
     gs.rope_us = rope_us;
+    gs.kvx_us = kvx_us;
+    gs.atx_us = atx_us;
     // ── Multi-step exit: one submit, one k×u32 readback, no logits. ──
     if multi {
         let ids_b = ids_buf.as_ref().unwrap();
@@ -24824,9 +25793,10 @@ pub fn forward_token_graph(
 /// sequence position of batch row i (contiguous causal run starting at
 /// `positions[0]`); `h` is [k·hidden] in/out.
 #[allow(clippy::too_many_arguments)]
-pub fn forward_batch_graph(
+pub fn forward_batch_graph_at(
     model: &Arc<CmfModel>,
     kv_id: u64,
+    layer_base: usize,
     layers: &[crate::gpu::GraphLayer],
     invf: &[f32],
     h: &mut [f32],
@@ -24849,6 +25819,7 @@ pub fn forward_batch_graph(
     o1: &[Option<Vec<crate::nystrom::O1DeviceView<'_>>>],
     o1_epoch: u64,
     mut spec: Option<crate::gpu::SpecTail<'_>>,
+    layers_run: Option<&mut usize>,
 ) -> crate::gpu::BatchGraphOutcome {
     let t_bfn = std::time::Instant::now();
     // Once sealed O(1) views have been admitted and uploaded, a failed batch
@@ -24875,6 +25846,12 @@ pub fn forward_batch_graph(
         bgraph_refused("k/positions mismatch");
         return batch_outcome(o1_started || state_started, false);
     }
+    if layers.iter().any(|l| matches!(l.ffn, crate::gpu::GraphFfn::AttentionOnly))
+        && (layers.len() != 1 || spec.is_some() || !matches!(layers[0].attn, crate::gpu::GraphAttn::Full { .. }))
+    {
+        bgraph_refused("attention-only graph must be a singleton Full layer without a head");
+        return batch_outcome(false, false);
+    }
     let pos0 = positions[0];
     let Some(pos_end) = pos0.checked_add(k) else {
         bgraph_refused("position range overflow");
@@ -24896,6 +25873,23 @@ pub fn forward_batch_graph(
     // upload when that live set cannot fit. Relying on the LRU here is
     // incorrect because the `GMat`s below retain evicted buffers until the
     // batch command finishes, producing a full-model transient allocation.
+    for l in layers {
+        if let crate::gpu::GraphAttn::Full {
+            geom: Some(g),
+            output_gate,
+            ..
+        } = &l.attn
+        {
+            if let Some(reason) = graph_geom_problem(c, g, nh, hd) {
+                bgraph_refused(reason);
+                return batch_outcome(o1_started || state_started, false);
+            }
+            if *output_gate {
+                bgraph_refused("per-layer attention geometry with an output gate");
+                return batch_outcome(o1_started || state_started, false);
+            }
+        }
+    }
     let Some(mut live_bytes) = graph_stack_payload_bytes(model, layers) else {
         bgraph_refused("cannot size layer payload");
         return batch_outcome(o1_started || state_started, false);
@@ -24909,9 +25903,54 @@ pub fn forward_batch_graph(
                 .unwrap_or(u64::MAX),
         );
     }
+    // Device-prefix mode (plain prefill whose caller finishes the stack on
+    // the host): the leading layers that fit, by the token graph's rule —
+    // cumulative live payload within the budget, and the lm_head the decode
+    // graph folds in reserved when the whole stack would otherwise fit — so
+    // a prefill never leaves device-only KV in a layer that decode will run
+    // on the host.
+    let prefix_ok = layers_run.is_some() && spec.is_none() && o1.iter().all(Option::is_none);
+    let mut run_n = layers.len();
     if live_bytes > graph_live_budget {
-        bgraph_refused("all-layer live set exceeds the weight budget");
-        return batch_outcome(o1_started || state_started, false);
+        if !prefix_ok {
+            bgraph_refused("all-layer live set exceeds the weight budget");
+            return batch_outcome(o1_started || state_started, false);
+        }
+        let mut acc = 0u64;
+        run_n = 0;
+        for l in layers {
+            let Some(b) = graph_layer_payload_bytes(model, l) else {
+                bgraph_refused("cannot size layer payload");
+                return batch_outcome(o1_started || state_started, false);
+            };
+            if acc.saturating_add(b) > graph_live_budget {
+                break;
+            }
+            acc += b;
+            run_n += 1;
+        }
+        if run_n == 0 {
+            bgraph_refused("one layer exceeds the weight budget");
+            return batch_outcome(o1_started || state_started, false);
+        }
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static SAID: AtomicBool = AtomicBool::new(false);
+            if !SAID.swap(true, Ordering::Relaxed) {
+                tracing::info!(
+                    "wgpu batch graph: device prefix {run_n} of {} layers (VRAM budget), \
+                     the host runs the rest of each chunk",
+                    layers.len()
+                );
+            }
+        }
+    }
+    let layers = &layers[..run_n];
+    // The O(1) views are per layer of the full stack; a prefix (only
+    // taken without any) keeps the leading ones.
+    let o1 = if o1.len() > run_n { &o1[..run_n] } else { o1 };
+    if let Some(n) = layers_run {
+        *n = run_n;
     }
     let cap = kv_capacity(cap, pos_end);
     struct GMat {
@@ -24927,6 +25966,8 @@ pub fn forward_batch_graph(
             wk: GMat,
             wv: GMat,
             wo: GMat,
+            nkv: usize,
+            dv: usize,
         },
         Gdn {
             qkv: GMat,
@@ -24949,6 +25990,7 @@ pub fn forward_batch_graph(
     /// «одна позиция за submit»: префилл 33 tok/s против 54 на декоде,
     /// то есть промпт обрабатывался медленнее, чем генерация.
     enum BFfn {
+        AttentionOnly,
         Dense {
             gate: GMat,
             up: GMat,
@@ -24976,6 +26018,9 @@ pub fn forward_batch_graph(
             gu_q2: bool,
             sigmoid: bool,
             bias: Option<wgpu::Buffer>,
+            /// A shared expert rides as the last pack entry (and slot
+            /// top_k). MiMo-V2 / LFM2-MoE have none: top_k slots only.
+            has_shared: bool,
             shared_gated: bool,
             route_scale: f32,
         },
@@ -25040,6 +26085,39 @@ pub fn forward_batch_graph(
                     affine: gw.affine,
                 })
             }
+            // q8_2f (MiMo-V2's attention, dense layer 0, lm_head): the
+            // whole tensor — int8 body and both scale planes — through the
+            // token graph's weight arena, so the two graphs share one
+            // resident copy. Word-aligned rows only (the batched kernel's
+            // contract, as the token graph's four-row kernel).
+            7 => {
+                if cols % 4 != 0 || (rows * cols) % 4 != 0 {
+                    return None;
+                }
+                let entry = model.tensors.get(gw.idx)?;
+                if *entry.shape.first()? != rows || *entry.shape.get(1)? != cols {
+                    return None;
+                }
+                let abs = model.entry_abs_offset(entry)?;
+                let plen = entry.nbytes as usize;
+                let bytes = model.primary_bytes();
+                if abs + plen > bytes.len() {
+                    return None;
+                }
+                let b = weight_buffer_l(
+                    c,
+                    (model.uid() as usize, gw.idx),
+                    &bytes[abs..abs + plen],
+                    layer_of_name(&model.tensors[gw.idx].name),
+                )?;
+                Some(GMat {
+                    buf: b,
+                    rs: None,
+                    kind: 7,
+                    prism: gw.prism,
+                    affine: gw.affine,
+                })
+            }
             // q4_tiled and q4tp: same buffer shape, the kernel differs.
             // Leaving these out is what kept every q4t/q4tp model off the
             // batched path — including its GDN projections, which is where
@@ -25065,7 +26143,8 @@ pub fn forward_batch_graph(
     // is what kept every q4tp model off the batched path.
     // 9 (the 2-bit plane) has the tile GEMM `q2tp_mm`; without it a q2tp
     // file's speculative verify declined every round and spun.
-    let gemmable = |m: &GMat| matches!(m.kind, 0 | 1 | 5 | 6 | 9);
+    let gemmable =
+        |m: &GMat| matches!(m.kind, 0 | 1 | 5 | 6 | 9) || (m.kind == 7 && c.graph_x.is_some());
     let mut lws = Vec::with_capacity(layers.len());
     let mut gdn_dims: Option<(usize, usize, usize, usize, usize, usize)> = None;
     for l in layers {
@@ -25077,18 +26156,20 @@ pub fn forward_batch_graph(
                 wo,
                 output_gate,
                 bias,
+                geom,
                 ..
             } => {
                 if bias.is_some() {
                     bgraph_refused("site:5889");
                     return batch_outcome(o1_started || state_started, false);
                 } // batched bias axpy not wired
+                let (lnkv, ldv) = geom.map_or((nkv, hd), |g| (g.nkv, g.dv));
                 let qrows = nh * hd * (1 + *output_gate as usize);
                 let (Some(wq), Some(wk), Some(wv), Some(wo)) = (
                     resolve(wq, qrows, hidden),
-                    resolve(wk, nkv * hd, hidden),
-                    resolve(wv, nkv * hd, hidden),
-                    resolve(wo, hidden, nh * hd),
+                    resolve(wk, lnkv * hd, hidden),
+                    resolve(wv, lnkv * ldv, hidden),
+                    resolve(wo, hidden, nh * ldv),
                 ) else {
                     bgraph_refused("site:5898");
                     return batch_outcome(o1_started || state_started, false);
@@ -25097,7 +26178,14 @@ pub fn forward_batch_graph(
                     bgraph_refused("attention weights not gemmable");
                     return batch_outcome(o1_started || state_started, false);
                 }
-                LAttn::Full { wq, wk, wv, wo }
+                LAttn::Full {
+                    wq,
+                    wk,
+                    wv,
+                    wo,
+                    nkv: lnkv,
+                    dv: ldv,
+                }
             }
             crate::gpu::GraphAttn::Gdn {
                 qkv,
@@ -25155,6 +26243,7 @@ pub fn forward_batch_graph(
             }
         };
         let bffn = match &l.ffn {
+            crate::gpu::GraphFfn::AttentionOnly => BFfn::AttentionOnly,
             crate::gpu::GraphFfn::Dense {
                 gate: lg,
                 up: lu,
@@ -25204,13 +26293,20 @@ pub fn forward_batch_graph(
                 shared_gated,
                 route_scale,
             } => {
-                if *top_k >= 16 || *n_exp > 256 || experts.len() != n_exp + 1 {
+                if *top_k >= 16 || *n_exp > 256 || experts.len() != n_exp + usize::from(*has_shared)
+                {
                     bgraph_refused("site:5979");
                     return batch_outcome(o1_started || state_started, false);
                 }
+                // Without a shared expert the router stands in for the gate
+                // (the kernels never read it then, as in the token graph).
                 let (Some(router), Some(sgate)) = (
                     resolve(router, *n_exp, hidden),
-                    resolve(shared_gate, 1, hidden),
+                    if *has_shared {
+                        resolve(shared_gate, 1, hidden)
+                    } else {
+                        resolve(router, *n_exp, hidden)
+                    },
                 ) else {
                     bgraph_refused("site:5985");
                     return batch_outcome(o1_started || state_started, false);
@@ -25242,6 +26338,7 @@ pub fn forward_batch_graph(
                                 usage: wgpu::BufferUsages::STORAGE,
                             })
                     }),
+                    has_shared: *has_shared,
                     shared_gated: *shared_gated,
                     route_scale: *route_scale,
                 }
@@ -25261,7 +26358,7 @@ pub fn forward_batch_graph(
         let gcm = c.gdn_cursor.lock().unwrap();
         let om = c.o1m.lock().unwrap();
         for (li, l) in layers.iter().enumerate() {
-            let key = (kv_id, li);
+            let key = (kv_id, layer_base + li);
             let o1_here = o1.get(li).is_some_and(|v| v.is_some());
             if o1_here
                 && om
@@ -25390,7 +26487,7 @@ pub fn forward_batch_graph(
         o1_started = true;
         for (li, views) in o1.iter().enumerate() {
             if let Some(views) = views {
-                if o1_ensure(c, kv_id, li, views, o1_epoch).is_none() {
+                if o1_ensure(c, kv_id, layer_base + li, views, o1_epoch).is_none() {
                     graph_refused("o1 state not portable");
                     return batch_outcome(o1_started || state_started, false);
                 }
@@ -25444,17 +26541,34 @@ pub fn forward_batch_graph(
             entries: &e,
         })
     };
-    // Buffers usable both as compute storage and copy src/dst (K-loop slicing).
-    let rwc = |n: usize| {
-        c.device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: (n.max(1) * 4) as u64,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_SRC
-                | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        })
+    // A short dynamic-tail graph used to allocate ~40 scratch buffers on
+    // every layer and token. Reuse only this restricted graph's scratch:
+    // all live lanes are overwritten before reads, no GDN/O1/FFN scratch
+    // can accidentally inherit state, and the lock spans submit/readback.
+    let pooled = k <= 4 && layers.len() == 1
+        && matches!(layers[0].ffn, crate::gpu::GraphFfn::AttentionOnly)
+        && crate::gpu::mimo_attention_scratch_enabled()
+        && std::env::var("CMF_MIMO_ATTN_POOL").as_deref() != Ok("0");
+    let scratch = std::cell::RefCell::new(pooled.then(|| c.attn_batch_scratch.lock().unwrap()));
+    let scratch_index = std::cell::Cell::new(0usize);
+    let scratch_buffer = |size: u64, usage: wgpu::BufferUsages, label: &'static str| {
+        let make = || c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label), size: size.max(4), usage, mapped_at_creation: false,
+        });
+        let mut guard = scratch.borrow_mut();
+        let Some(cache) = guard.as_mut() else { return make() };
+        let i = scratch_index.get();
+        scratch_index.set(i + 1);
+        if i == cache.len() { cache.push((usage, make())); }
+        if cache[i].0 != usage || cache[i].1.size() < size {
+            cache[i] = (usage, make());
+        }
+        cache[i].1.clone()
     };
+    // Buffers usable both as compute storage and copy src/dst (K-loop slicing).
+    let rwc = |n: usize| scratch_buffer((n.max(1) * 4) as u64,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        "attention-batch-scratch");
     let h_buf = rwc(k * hidden);
     c.queue
         .write_buffer(&h_buf, 0, bytemuck::cast_slice(&h[..k * hidden]));
@@ -25577,8 +26691,16 @@ pub fn forward_batch_graph(
     let (gnv, _gnk, gdk, gdv, _gkk, gcdim) = gdn_dims.unwrap_or((1, 1, 1, 1, 1, 1));
     // batched GEMM outputs
     let qraw_b = rwc(k * qdim);
-    let kb_b = rwc(k * nkv * hd);
-    let vb_b = rwc(k * nkv * hd);
+    // Widest layer's K/V projection (per-layer KV heads).
+    let kv_rows = lws
+        .iter()
+        .filter_map(|lw| match &lw.attn {
+            LAttn::Full { nkv, .. } => Some(*nkv * hd),
+            _ => None,
+        })
+        .fold(nkv * hd, usize::max);
+    let kb_b = rwc(k * kv_rows);
+    let vb_b = rwc(k * kv_rows);
     let attn_bb = rwc(k * nh * hd);
     let qkv_b = rwc(k * gcdim);
     let z_b = rwc(k * gnv * gdv);
@@ -25614,12 +26736,42 @@ pub fn forward_batch_graph(
     // KV mirror + GDN state (fresh; batch appends positions pos0..pos0+k).
     let mut kvbufs: Vec<Option<(wgpu::Buffer, wgpu::Buffer)>> = Vec::with_capacity(layers.len());
     let mut gdnbufs: Vec<Option<(wgpu::Buffer, wgpu::Buffer)>> = Vec::with_capacity(layers.len());
+    // Mirror rows of each per-layer-geometry layer (ring or current cap).
+    let mut xcaps: HashMap<usize, usize> = HashMap::new();
     {
         let mut kvm = c.attn_kv.lock().unwrap();
         let mut gsm = c.gdn_state.lock().unwrap();
         let mut gcm = c.gdn_cursor.lock().unwrap();
         for (li, l) in layers.iter().enumerate() {
             match &l.attn {
+                crate::gpu::GraphAttn::Full {
+                    cpu_k,
+                    cpu_v,
+                    geom: Some(g),
+                    ..
+                } if o1.get(li).is_none_or(|v| v.is_none()) => {
+                    let e = kv_mirror_ensure_x(
+                        c,
+                        &mut kvm,
+                        (kv_id, layer_base + li),
+                        g.nkv,
+                        hd,
+                        g.dv,
+                        cap,
+                        g.window,
+                    );
+                    if e.synced > pos0 {
+                        bgraph_refused("KV mirror is ahead of batch position");
+                        return batch_outcome(true, false);
+                    }
+                    if e.synced < pos0 && !kv_mirror_seed_x(c, e, cpu_k, cpu_v, pos0) {
+                        bgraph_refused("CPU KV seed missing for nonzero batch position");
+                        return batch_outcome(o1_started || state_started, false);
+                    }
+                    xcaps.insert(li, e.cap);
+                    kvbufs.push(Some((e.k.clone(), e.v.clone())));
+                    gdnbufs.push(None);
+                }
                 crate::gpu::GraphAttn::Full { cpu_k, cpu_v, .. } => {
                     if o1.get(li).is_some_and(|v| v.is_some()) {
                         // Sealed O(1) owns this layer's attention state. Do
@@ -25629,7 +26781,7 @@ pub fn forward_batch_graph(
                         gdnbufs.push(None);
                         continue;
                     }
-                    let e = kv_mirror_ensure(c, &mut kvm, (kv_id, li), nkv, hd, cap);
+                    let e = kv_mirror_ensure(c, &mut kvm, (kv_id, layer_base + li), nkv, hd, cap);
                     if e.synced > pos0 {
                         bgraph_refused("KV mirror is ahead of batch position");
                         return batch_outcome(true, false);
@@ -25672,7 +26824,7 @@ pub fn forward_batch_graph(
                     kk,
                     ..
                 } => {
-                    let key = (kv_id, li);
+                    let key = (kv_id, layer_base + li);
                     let e = gsm.entry(key).or_insert_with(|| {
                         let ring_sz = (gcdim * (_gkk.max(1).saturating_sub(1)) * 4) as u64;
                         let s_sz = (gnv * gdk * gdv * 4) as u64;
@@ -25766,6 +26918,28 @@ pub fn forward_batch_graph(
         match m.kind {
             0 => encode_q8_mm(c, enc, &m.buf, m.rs.as_ref().unwrap(), xs, y, rows, cols, k),
             5 => encode_q4_tile_mm(c, enc, &c.q4t_mm, &m.buf, xs, y, rows, cols, k),
+            // q8_2f: eight batch rows per weight read, each output the
+            // decode kernel's bit for bit (`q8_2f_matvec_b`).
+            7 => {
+                let gx = c.graph_x.as_ref().expect("gemmable checked graph_x");
+                let p_buf =
+                    uniform_u32x4(c, [(cols / 4) as u32, rows as u32, cols as u32, k as u32]);
+                let short = (k <= 4 && crate::gpu::mimo_q8_short_enabled()
+                    && std::env::var("CMF_Q82_SHORT").as_deref() != Ok("0"))
+                    .then(|| &gx.q82_short[k - 1]);
+                let (pipe, layout, width) = match short {
+                    Some((p, l)) => (p, l, k as u32),
+                    None => (&gx.q82_b, &gx.q82_l, 8),
+                };
+                let bind = bind_pairs(c, layout, &[(0, &m.buf), (1, xs), (2, y), (3, &p_buf)]);
+                let mut pass = begin_pass(enc);
+                pass.set_pipeline(pipe);
+                pass.set_bind_group(0, &bind, &[]);
+                pass.dispatch_workgroups(
+                    (rows as u32).div_ceil(4).min(MAX_WG),
+                    (k as u32).div_ceil(width), 1,
+                );
+            }
             // The 2-bit plane: the tile GEMM handles any k (the MoE prefill's
             // kernel).  Its fourth uniform word is the descriptor-aware
             // center bit, not the q4 cooperative activation scale: affine
@@ -26160,15 +27334,24 @@ pub fn forward_batch_graph(
         let pnw = stor(bytemuck::cast_slice(l.post_norm));
         match (&lw.attn, &l.attn) {
             (
-                LAttn::Full { wq, wk, wv, wo },
+                LAttn::Full {
+                    wq,
+                    wk,
+                    wv,
+                    wo,
+                    nkv: lnkv,
+                    dv: ldv,
+                },
                 crate::gpu::GraphAttn::Full {
                     q_norm,
                     k_norm,
                     late_qk_norm,
                     output_gate,
+                    geom,
                     ..
                 },
             ) => {
+                let (lnkv, ldv) = (*lnkv, *ldv);
                 let o1_here = o1.get(li).and_then(|v| v.as_ref());
                 let qnw = stor(bytemuck::cast_slice(q_norm.unwrap_or(&vec![0f32; hd])));
                 let knw = stor(bytemuck::cast_slice(k_norm.unwrap_or(&vec![0f32; hd])));
@@ -26185,8 +27368,8 @@ pub fn forward_batch_graph(
                     &n1_p,
                     &kb_b,
                     &vb_b,
-                    nkv * hd,
-                    nkv * hd,
+                    lnkv * hd,
+                    lnkv * ldv,
                     hidden,
                 );
                 if let Some(views) = o1_here {
@@ -26213,7 +27396,7 @@ pub fn forward_batch_graph(
                         sc,
                     ) = {
                         let map = c.o1m.lock().unwrap();
-                        let Some(d) = map.get(&(kv_id, li)) else {
+                        let Some(d) = map.get(&(kv_id, layer_base + li)) else {
                             graph_refused("o1 batch mirror missing after admission");
                             return batch_outcome(o1_started || state_started, false);
                         };
@@ -26321,6 +27504,155 @@ pub fn forward_batch_graph(
                             nh * hd,
                             0,
                             i * nh * hd,
+                            None,
+                        );
+                    }
+                } else if let Some(g) = geom {
+                    // Per-layer geometry (MiMo-V2): per token, this layer's
+                    // RoPE, the dv-wide append (a ring row for a sliding
+                    // layer) and the ATTEND_X attend, all in one pass.
+                    let gx = c.graph_x.as_ref().expect("checked at admission");
+                    let (kbuf, vbuf) = kvbufs[li].as_ref().unwrap();
+                    let mcap = xcaps[&li];
+                    let nc = mcap.div_ceil(ATTEND_X_CK);
+                    let invf_l = stor(bytemuck::cast_slice(g.invf));
+                    // No sink: a zero-initialized stand-in (never read —
+                    // the uniform's sink flag is off).
+                    let sink_b = match g.sink {
+                        Some(sk) => stor(bytemuck::cast_slice(sk)),
+                        None => rwc(nh),
+                    };
+                    let split_any = g.window.is_none() && pos_end > ATTEND_SPLIT_MIN;
+                    let (xacc, xml) = if split_any {
+                        (rwc(nh * nc * g.dv), rwc(nh * nc * 2))
+                    } else {
+                        (rwc(1), rwc(2))
+                    };
+                    let mut pass = begin_pass(&mut enc);
+                    for i in 0..k {
+                        let p = positions[i];
+                        // Fresh, not the content-keyed cache: a long prompt
+                        // would park one cached uniform per position there.
+                        let rope_u = unif(&[
+                            nh as u32,
+                            g.nkv as u32,
+                            hd as u32,
+                            g.rd as u32,
+                            p as u32,
+                            flags(q_norm.is_some(), k_norm.is_some(), *late_qk_norm),
+                            eps.to_bits(),
+                            i as u32,
+                        ]);
+                        let kvx_u = unif(&[
+                            g.nkv as u32,
+                            hd as u32,
+                            g.dv as u32,
+                            mcap as u32,
+                            p as u32,
+                            i as u32,
+                            0,
+                            0,
+                        ]);
+                        let n_all = p + 1;
+                        let n = g.window.map_or(n_all, |w| n_all.min(w));
+                        let atx_u = unif(&[
+                            nh as u32,
+                            (nh / g.nkv) as u32,
+                            hd as u32,
+                            g.dv as u32,
+                            mcap as u32,
+                            n as u32,
+                            (n_all - n) as u32,
+                            attn_scale.to_bits(),
+                            u32::from(g.sink.is_some()),
+                            nc as u32,
+                            0,
+                            0,
+                        ]);
+                        pass.set_pipeline(&c.attn_rope);
+                        pass.set_bind_group(
+                            0,
+                            &bg(
+                                &c.layout_attn_rope,
+                                &[
+                                    &qraw_b, &kb_b, &qout_s, &gout_s, &qnw, &knw, &invf_l, &rope_u,
+                                ],
+                            ),
+                            &[],
+                        );
+                        pass.dispatch_workgroups((nh + g.nkv) as u32, 1, 1);
+                        state_started = true;
+                        pass.set_pipeline(&gx.kv_append);
+                        pass.set_bind_group(
+                            0,
+                            &bg(&gx.kv_l, &[&kb_b, &vb_b, kbuf, vbuf, &kvx_u]),
+                            &[],
+                        );
+                        pass.dispatch_workgroups(((g.nkv * hd) as u32).div_ceil(256), 1, 1);
+                        if g.window.is_none() && n > ATTEND_SPLIT_MIN {
+                            pass.set_pipeline(&gx.part);
+                            pass.set_bind_group(
+                                0,
+                                &bind_pairs(
+                                    c,
+                                    &gx.part_l,
+                                    &[
+                                        (0, &qout_s),
+                                        (1, kbuf),
+                                        (2, vbuf),
+                                        (4, &atx_u),
+                                        (6, &xacc),
+                                        (7, &xml),
+                                    ],
+                                ),
+                                &[],
+                            );
+                            pass.dispatch_workgroups(nh as u32, n.div_ceil(ATTEND_X_CK) as u32, 1);
+                            pass.set_pipeline(&gx.merge);
+                            pass.set_bind_group(
+                                0,
+                                &bind_pairs(
+                                    c,
+                                    &gx.merge_l,
+                                    &[
+                                        (3, &attn_s),
+                                        (4, &atx_u),
+                                        (5, &sink_b),
+                                        (6, &xacc),
+                                        (7, &xml),
+                                    ],
+                                ),
+                                &[],
+                            );
+                            pass.dispatch_workgroups(nh as u32, 1, 1);
+                        } else {
+                            pass.set_pipeline(&gx.attend);
+                            pass.set_bind_group(
+                                0,
+                                &bind_pairs(
+                                    c,
+                                    &gx.attend_l,
+                                    &[
+                                        (0, &qout_s),
+                                        (1, kbuf),
+                                        (2, vbuf),
+                                        (3, &attn_s),
+                                        (4, &atx_u),
+                                        (5, &sink_b),
+                                    ],
+                                ),
+                                &[],
+                            );
+                            pass.dispatch_workgroups(nh as u32, 1, 1);
+                        }
+                        encode_blit_p(
+                            &mut pass,
+                            c,
+                            &attn_s,
+                            &attn_bb,
+                            nh * g.dv,
+                            0,
+                            i * nh * g.dv,
                             None,
                         );
                     }
@@ -26477,11 +27809,11 @@ pub fn forward_batch_graph(
                         );
                     }
                 }
-                let Some(attn_p) = prism_input_b(&mut enc, &[wo], &attn_bb, nh * hd) else {
+                let Some(attn_p) = prism_input_b(&mut enc, &[wo], &attn_bb, nh * ldv) else {
                     bgraph_refused("Prism transform unavailable for batched output projection");
                     return batch_outcome(o1_started || state_started, false);
                 };
-                ematb(&mut enc, wo, &attn_p, &ob, hidden, nh * hd);
+                ematb(&mut enc, wo, &attn_p, &ob, hidden, nh * ldv);
                 bts!(enc, 1);
             }
             (
@@ -26515,7 +27847,7 @@ pub fn forward_batch_graph(
                     let ring_sz = (cdim * kk.saturating_sub(1) * 4) as u64;
                     let s_sz = (nv * dk * dv * 4) as u64;
                     let mut m = c.gdn_snap.lock().unwrap();
-                    let e = m.entry((kv_id, li)).or_insert_with(|| {
+                    let e = m.entry((kv_id, layer_base + li)).or_insert_with(|| {
                         let b = c.device.create_buffer(&wgpu::BufferDescriptor {
                             label: Some("gdn-snap"),
                             size: (k as u64 * (ring_sz + s_sz)).max(4),
@@ -26830,6 +28162,9 @@ pub fn forward_batch_graph(
             k as u32,
         );
         match &lw.ffn {
+            // add_rmsnorm_b above has already added the attention residual
+            // into h_buf. A singleton graph must not add ob a second time.
+            BFfn::AttentionOnly => continue,
             BFfn::Dense {
                 gate,
                 up,
@@ -26872,6 +28207,7 @@ pub fn forward_batch_graph(
                 gu_q2,
                 sigmoid,
                 bias,
+                has_shared,
                 shared_gated,
                 route_scale,
             } => {
@@ -26885,7 +28221,7 @@ pub fn forward_batch_graph(
                             usage: wgpu::BufferUsages::STORAGE,
                         })
                 });
-                let slots = *top_k + 1;
+                let slots = *top_k + usize::from(*has_shared);
                 let mat16 = |rows: usize, cols: usize| -> u32 {
                     let n = if *q4tp {
                         cortiq_core::quant::expected_nbytes(
@@ -26910,8 +28246,8 @@ pub fn forward_batch_graph(
                         u32::from(*norm_topk)
                             | (u32::from(*sigmoid) << 1)
                             | (u32::from(bias.is_some()) << 2)
-                            | (1u32 << 3)
-                            | (u32::from(!*shared_gated) << 4),
+                            | (u32::from(*has_shared) << 3)
+                            | (u32::from(*has_shared && !*shared_gated) << 4),
                         ((hidden as u32) << 8) | (u32::from(sg_fold) * 4),
                         route_scale.to_bits(),
                         0,
@@ -27090,12 +28426,8 @@ pub fn forward_batch_graph(
         }
     }
     let size = (k * hidden * 4) as u64;
-    let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("bg-stage"),
-        size,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
+    let stage = scratch_buffer(size,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, "bg-stage");
     let t_enc_done = std::time::Instant::now();
     let ok = if let Some(sp) = spec.as_mut() {
         // Speculative tail: final-norm each row, one batched lm_head GEMM,
@@ -27236,14 +28568,14 @@ pub fn forward_batch_graph(
     if ok {
         let mut kvm = c.attn_kv.lock().unwrap();
         for li in 0..layers.len() {
-            if let Some(m) = kvm.get_mut(&(kv_id, li)) {
+            if let Some(m) = kvm.get_mut(&(kv_id, layer_base + li)) {
                 m.synced = pos0 + k;
             }
         }
         let next = pos0 + k;
         let mut gcm = c.gdn_cursor.lock().unwrap();
         for li in 0..layers.len() {
-            if let Some(cur) = gcm.get_mut(&(kv_id, li)) {
+            if let Some(cur) = gcm.get_mut(&(kv_id, layer_base + li)) {
                 cur.next_pos = next;
             }
         }
@@ -27251,7 +28583,7 @@ pub fn forward_batch_graph(
         let mut om = c.o1m.lock().unwrap();
         for (li, views) in o1.iter().enumerate() {
             if views.is_some() {
-                if let Some(d) = om.get_mut(&(kv_id, li)) {
+                if let Some(d) = om.get_mut(&(kv_id, layer_base + li)) {
                     d.next_pos = Some(next);
                 }
             }
@@ -27386,6 +28718,26 @@ pub fn kv_mirror_set_stored(kv_id: u64, layer: usize, stored: usize) -> bool {
     let Some(m) = mirrors.get_mut(&(kv_id, layer)) else {
         return false;
     };
+    if let Some(window) = m.ring {
+        // A ring holds the newest `cap` positions. Moving the cursor back
+        // keeps the rows below it, but those older than the pre-rewind
+        // `synced − cap` are gone for good — pin that bound first, then
+        // refuse a rewind whose window would reach past it.
+        if stored > m.synced {
+            return false;
+        }
+        // The next position (`stored`) sees rows [stored + 1 − window,
+        // stored): each must still be resident. A caller whose host holds
+        // no copy (a speculative rollback) must not lose them; a KV reuse
+        // takes the refusal as "start fresh".
+        let lo = m.resident_from();
+        if stored.saturating_add(1).saturating_sub(window) < lo {
+            return false;
+        }
+        m.lo = lo;
+        m.synced = stored;
+        return true;
+    }
     if stored > m.cap {
         return false;
     }
@@ -27425,6 +28777,12 @@ pub fn kv_mirror_read_rows(
         let mirrors = c.attn_kv.lock().unwrap();
         for &(layer, from, to) in reqs {
             let m = mirrors.get(&(kv_id, layer))?;
+            // One uniform geometry, one row per position: a per-layer
+            // mirror (narrow V, a ring) is not readable at this stride —
+            // the caller starts fresh instead of reading it wrong.
+            if m.ring.is_some() || m.dv != hd || m.hd != hd || m.nkv != nkv {
+                return None;
+            }
             if to < from || m.synced < to || m.cap < to {
                 return None;
             }
@@ -27494,6 +28852,109 @@ pub fn kv_mirror_read_rows(
     drop(data);
     stage.unmap();
     Some(out)
+}
+
+/// Rows `[from, to)` of ONE exact-attention mirror in the host cache's
+/// layout, whatever the mirror's geometry: position-major K `[n × nkv ×
+/// hd]` and V `[n × nkv × hd]` with each V head zero-padded from the
+/// mirror's `dv` to `hd` (what `LayerKvCache::append` takes for a narrow-V
+/// layer). A ring holds only its newest rows: positions below the returned
+/// `first_valid` come back as zeros and the caller decides whether its
+/// window can ever see them. None when the mirror is missing, behind `to`,
+/// or its geometry is not (nkv, hd).
+pub fn kv_mirror_pull_host(
+    kv_id: u64,
+    layer: usize,
+    from: usize,
+    to: usize,
+    nkv: usize,
+    hd: usize,
+) -> Option<(Vec<f32>, Vec<f32>, usize)> {
+    let c = ctx()?;
+    let (kb, vb, cap, dv, first_valid) = {
+        let mirrors = c.attn_kv.lock().unwrap();
+        let m = mirrors.get(&(kv_id, layer))?;
+        if to < from || m.synced < to || m.nkv != nkv || m.hd != hd {
+            return None;
+        }
+        if m.ring.is_none() && m.cap < to {
+            return None;
+        }
+        (
+            m.k.clone(),
+            m.v.clone(),
+            m.cap,
+            m.dv,
+            m.resident_from().max(from).min(to),
+        )
+    };
+    let n = to - from;
+    let mut k = vec![0.0f32; n * nkv * hd];
+    let mut v = vec![0.0f32; n * nkv * hd];
+    let live = to - first_valid;
+    if live == 0 {
+        return Some((k, v, first_valid));
+    }
+    // Staging: per head [K rows live×hd][V rows live×dv], each copied in
+    // at most two runs (a ring wraps once over `live <= cap` rows).
+    let per_head = (live * (hd + dv) * 4) as u64;
+    let total = per_head * nkv as u64;
+    let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("kv-mirror-pull-x"),
+        size: total,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("kv-mirror-pull-x"),
+        });
+    flush_pass(&enc);
+    for h in 0..nkv {
+        let hbase = h as u64 * per_head;
+        let mut p = first_valid;
+        while p < to {
+            let slot = p % cap;
+            let run = (cap - slot).min(to - p);
+            let r0 = (p - first_valid) as u64;
+            enc.copy_buffer_to_buffer(
+                &kb,
+                ((h * cap + slot) * hd * 4) as u64,
+                &stage,
+                hbase + r0 * (hd * 4) as u64,
+                (run * hd * 4) as u64,
+            );
+            enc.copy_buffer_to_buffer(
+                &vb,
+                ((h * cap + slot) * dv * 4) as u64,
+                &stage,
+                hbase + (live * hd * 4) as u64 + r0 * (dv * 4) as u64,
+                (run * dv * 4) as u64,
+            );
+            p += run;
+        }
+    }
+    submit(c, finish_enc(enc));
+    let slice = stage.slice(..total);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    c.device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
+    let data = slice.get_mapped_range().ok()?;
+    let all: &[f32] = bytemuck::cast_slice(&data);
+    for h in 0..nkv {
+        let hb = h * live * (hd + dv);
+        for r in 0..live {
+            let p = first_valid - from + r;
+            let d = (p * nkv + h) * hd;
+            let sk = hb + r * hd;
+            k[d..d + hd].copy_from_slice(&all[sk..sk + hd]);
+            let sv = hb + live * hd + r * dv;
+            v[d..d + dv].copy_from_slice(&all[sv..sv + dv]);
+        }
+    }
+    drop(data);
+    stage.unmap();
+    Some((k, v, first_valid))
 }
 
 /// GDN depthwise conv step (bring-up / parity): updates cq [cdim] and shifts
@@ -27960,6 +29421,94 @@ fn dispatch_q1(
 /// GEMM of the prefill batch: `pre` are prescaled inputs row-major [b, cols],
 /// out — row-major [b, rows]. Weights are resident in VRAM. false = CPU path.
 #[allow(clippy::too_many_arguments)]
+/// Decode-exact 1–4-row q8_2f projection, sharing each weight word across
+/// rows. Only scratch changes on failure; callers may safely use matvecs.
+pub fn q82_short_rows(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let Some(gx) = c.graph_x.as_ref() else {
+        return false;
+    };
+    if !(1..=4).contains(&b)
+        || cols % 4 != 0
+        || rows == 0
+        || xs.len() != b * cols
+        || out.len() != b * rows
+    {
+        return false;
+    }
+    let Some(e) = model.tensors.get(idx) else {
+        return false;
+    };
+    if e.dtype != cortiq_core::TensorDtype::Q8_2f || e.shape != [rows, cols] {
+        return false;
+    }
+    let Some(abs) = model.entry_abs_offset(e) else {
+        return false;
+    };
+    let Some(bytes) = model.primary_bytes().get(abs..abs + e.nbytes as usize) else {
+        return false;
+    };
+    let Some(w) = weight_buffer_l(
+        c,
+        (model.uid() as usize, idx),
+        bytes,
+        layer_of_name(&e.name),
+    ) else {
+        return false;
+    };
+    let mut scratch = c.scratch.lock().unwrap();
+    let x = Scratch::ensure(
+        &c.device,
+        &mut scratch.xs,
+        (xs.len() * 4) as u64,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        "q82-short-x",
+    );
+    let y = Scratch::ensure(
+        &c.device,
+        &mut scratch.y,
+        (out.len() * 4) as u64,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        "q82-short-y",
+    );
+    let stage = Scratch::ensure(
+        &c.device,
+        &mut scratch.stage,
+        (out.len() * 4) as u64,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "q82-short-stage",
+    );
+    c.queue.write_buffer(&x, 0, bytemuck::cast_slice(xs));
+    let params = uniform_u32x4(c, [(cols / 4) as u32, rows as u32, cols as u32, b as u32]);
+    let (pipe, layout) = if crate::gpu::mimo_q8_short_enabled() {
+        let (p, l) = &gx.q82_short[b - 1];
+        (p, l)
+    } else {
+        (&gx.q82_b, &gx.q82_l)
+    };
+    let bind = bind_pairs(c, layout, &[(0, &w), (1, &x), (2, &y), (3, &params)]);
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("q82-short-rows"),
+        });
+    {
+        let mut pass = begin_pass(&mut enc);
+        pass.set_pipeline(pipe);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups((rows as u32).div_ceil(4).min(MAX_WG), 1, 1);
+    }
+    readback(c, enc, &y, &stage, (out.len() * 4) as u64, out)
+}
+
 /// The two-field int8 GEMM with the column field handed to the device.
 ///
 /// `q8_matmat` takes an activation the caller has already multiplied by that
@@ -28021,6 +29570,29 @@ pub fn q8_matmat_2f(
     .is_some()
 }
 
+thread_local! {
+    // A model-scoped precision contract, not a global backend downgrade.
+    // MiMo's wide prefill must not round activations/weights to f16 only
+    // when the runtime probe happens to choose a cooperative GEMM: that
+    // changed its 128-token PPL from 3.647 to 3.656 at a 24-GB budget.
+    static MIMO_F32_GEMM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+pub(crate) struct MimoF32Gemm(bool, std::marker::PhantomData<std::rc::Rc<()>>);
+impl MimoF32Gemm {
+    pub(crate) fn for_tower() -> Self {
+        Self::enter("mimo_v2")
+    }
+
+    fn enter(arch: &str) -> Self {
+        let before = MIMO_F32_GEMM.get();
+        MIMO_F32_GEMM.set(before || arch == "mimo_v2");
+        Self(before, std::marker::PhantomData)
+    }
+}
+impl Drop for MimoF32Gemm {
+    fn drop(&mut self) { MIMO_F32_GEMM.set(self.0); }
+}
+
 pub fn q8_matmat(
     model: &Arc<CmfModel>,
     idx: usize,
@@ -28031,6 +29603,7 @@ pub fn q8_matmat(
     cols: usize,
     out: &mut [f32],
 ) -> bool {
+    let _precision = MimoF32Gemm::enter(&model.arch().arch_name);
     let Some(c) = ctx() else { return false };
     if cols % 4 != 0 || rows == 0 || b == 0 {
         return false;
@@ -28558,7 +30131,7 @@ fn dispatch_matmat_keep(
     // GEMM after it is the same — only the unpacker differs, and int8's is
     // one multiply. Worth its pass only when the batch amortizes it, hence
     // the same b >= 64 gate the four-bit arm uses.
-    let coop = if b >= 64 && cols % 2 == 0 && !std::env::var("CMF_Q8_COOP").is_ok_and(|v| v == "0")
+    let coop = if !MIMO_F32_GEMM.get() && b >= 64 && cols % 2 == 0 && !std::env::var("CMF_Q8_COOP").is_ok_and(|v| v == "0")
     {
         c.q4tp_mm_coop_f16
             .as_ref()
@@ -29812,7 +31385,7 @@ fn tp_matmat_impl(
     // f16 operands cannot overflow (the DiT's modulated activations run
     // past 65504 — that overflow was this kernel's NaN). 0 = no scaling,
     // so the scalar arm and every other caller keep their numerics.
-    let coop_arm = !two_bit && c.q4tp_mm_coop.is_some();
+    let coop_arm = !MIMO_F32_GEMM.get() && !two_bit && c.q4tp_mm_coop.is_some();
     if std::env::var("CMF_GPU_DEBUG").is_ok() && b >= 512 {
         use std::collections::HashSet;
         use std::sync::Mutex;
@@ -30043,6 +31616,7 @@ pub fn q4t_matmat(
     cols: usize,
     out: &mut [f32],
 ) -> bool {
+    let _precision = MimoF32Gemm::enter(&model.arch().arch_name);
     let Some(c) = ctx() else { return false };
     let _gate = c.mm_gate.lock().unwrap();
     let gpr = cols / 32;
@@ -31072,6 +32646,7 @@ fn dit_attention_inner(
     let coop_dit = c
         .dit_gemm_coop
         .as_ref()
+        .filter(|_| !MIMO_F32_GEMM.get())
         .filter(|_| std::env::var("CMF_DIT_ATTN_COOP").as_deref() != Ok("0"));
     // PV's right operand is read down columns in v's [n][hd] layout —
     // 4.76 s a step against QK's 1.65 at the same FLOPs. Transpose it
@@ -35374,7 +36949,7 @@ fn mm_pipeline(c: &Ctx, q4tp: bool, two_bit: bool) -> &wgpu::ComputePipeline {
         return &c.q2tp_mm;
     }
     if q4tp {
-        if let Some(p) = c.q4tp_mm_coop.as_ref() {
+        if !MIMO_F32_GEMM.get() && let Some(p) = c.q4tp_mm_coop.as_ref() {
             return p;
         }
         return &c.q4tp_mm;
@@ -48627,7 +50202,7 @@ fn dsv4_global_moe_pipelines(
             },
             c.dsv4_global_dn.as_ref()?,
         )),
-        DSV4_GLOBAL_MOE_SEGMENTS_S16 => Some((
+        DSV4_GLOBAL_MOE_SEGMENTS_S16 if c.dsv4_global_dn_s16.is_some() => Some((
             if gu_q2 {
                 c.dsv4_global_gu_q2_s16.as_ref()?
             } else {
@@ -48635,6 +50210,13 @@ fn dsv4_global_moe_pipelines(
             },
             c.dsv4_global_dn_s16.as_ref()?,
         )),
+        DSV4_GLOBAL_MOE_SEGMENTS_S16 => {
+            let (gu, gu2, dn) = c.dsv4_global_s16_lazy.get()?;
+            Some((
+                if gu_q2 { gu2.as_ref()? } else { gu.as_ref()? },
+                dn.as_ref()?,
+            ))
+        }
         _ => None,
     }
 }
@@ -48705,6 +50287,59 @@ pub fn dsv4_global_moe_create_for_dsv41(
     dsv4_global_moe_create_with_segments(model, requested, inter, hidden, gu_q2, segments)
 }
 
+/// The S8 bank with exactly `slots` slots (rounded down to whole segments),
+/// without the workspace carve-out: for an operator-pinned slot count, whose
+/// caller has already left its own reserve. The residency budget check still
+/// applies.
+pub fn dsv4_global_moe_create_slots(
+    model: &Arc<CmfModel>,
+    slots: usize,
+    inter: usize,
+    hidden: usize,
+    gu_q2: bool,
+) -> Option<(usize, usize)> {
+    let c = ctx()?;
+    // One segment buffer is bounded by the binding range; past S8's
+    // capacity the S16 family (built here on first need) doubles it.
+    let gu_len = cortiq_core::quant::expected_nbytes(
+        if gu_q2 {
+            cortiq_core::TensorDtype::Q2TiledP
+        } else {
+            cortiq_core::TensorDtype::Q4TiledP
+        },
+        &[inter, hidden],
+    )?;
+    let d_len =
+        cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[hidden, inter])?;
+    let range = c
+        .device
+        .limits()
+        .max_storage_buffer_binding_size
+        .min(c.device.limits().max_buffer_size);
+    let per_segment = (range / gu_len.max(d_len).max(1) as u64) as usize;
+    let mut segments = DSV4_GLOBAL_MOE_SEGMENTS;
+    if slots > per_segment.saturating_mul(DSV4_GLOBAL_MOE_SEGMENTS)
+        && c.dsv4_global_s16_capable
+        && c.dsv4_global_gu_s16.is_none()
+    {
+        let built = c.dsv4_global_s16_lazy.get_or_init(|| {
+            build_global_moe_pipelines(
+                &c.device,
+                c.pipeline_cache.as_ref(),
+                DSV4_GLOBAL_MOE_SEGMENTS_S16,
+            )
+        });
+        if built.0.is_some() && built.2.is_some() {
+            segments = DSV4_GLOBAL_MOE_SEGMENTS_S16;
+        }
+    } else if slots > per_segment.saturating_mul(DSV4_GLOBAL_MOE_SEGMENTS)
+        && c.dsv4_global_gu_s16.is_some()
+    {
+        segments = DSV4_GLOBAL_MOE_SEGMENTS_S16;
+    }
+    dsv4_global_moe_create_inner(model, slots, inter, hidden, gu_q2, segments, false)
+}
+
 fn dsv4_global_moe_create_with_segments(
     model: &Arc<CmfModel>,
     requested: usize,
@@ -48712,6 +50347,18 @@ fn dsv4_global_moe_create_with_segments(
     hidden: usize,
     gu_q2: bool,
     segments: usize,
+) -> Option<(usize, usize)> {
+    dsv4_global_moe_create_inner(model, requested, inter, hidden, gu_q2, segments, true)
+}
+
+fn dsv4_global_moe_create_inner(
+    model: &Arc<CmfModel>,
+    requested: usize,
+    inter: usize,
+    hidden: usize,
+    gu_q2: bool,
+    segments: usize,
+    carve_workspace: bool,
 ) -> Option<(usize, usize)> {
     use std::sync::atomic::Ordering;
     let c = ctx()?;
@@ -48742,7 +50389,11 @@ fn dsv4_global_moe_create_with_segments(
     // KV growth and queue staging are physical VRAM too but are not counted
     // as resident weights. Reserve 2-4 GiB before rounding the logical bank.
     let gib = 1024 * 1024 * 1024u64;
-    let workspace = (c.vram_budget / 10).clamp(2 * gib, 4 * gib);
+    let workspace = if carve_workspace {
+        (c.vram_budget / 10).clamp(2 * gib, 4 * gib)
+    } else {
+        0
+    };
     let (capacity, segment_slots) = dsv4_global_moe_capacity(
         requested,
         per,
@@ -49480,6 +51131,7 @@ pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: u
     let coop = c
         .gemm_nt_coop
         .as_ref()
+        .filter(|_| !MIMO_F32_GEMM.get())
         .filter(|_| k % 4 == 0 && m.div_ceil(64) <= 65_535 && n.div_ceil(64) <= 65_535)
         .filter(|_| c.discrete || (m <= 65_000 && n <= 65_000));
     // The scalar arm's dispatch is (m, n) workgroups — huge dims are
@@ -58252,6 +59904,150 @@ pub fn sparse_attend_for_test(
     ok
 }
 
+/// The per-layer-geometry attention kernels on their own (component test):
+/// append every position's K (`hd` wide) and V (`dv` wide) rows of
+/// `[npos × nkv × …]` through `kv_append_x` — into a ring of
+/// `kv_ring_cap(window)` rows for a windowed layer, else one row per
+/// position — then attend the last position's queries `q` (`nh × hd`)
+/// with `gqa_attend_x`, or with `gqa_attend_part_x` + `gqa_attend_merge_x`
+/// when `split`. `out` is `nh × dv`. False when the device or the module
+/// is missing.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn attend_x_for_test(
+    q: &[f32],
+    k_rows: &[f32],
+    v_rows: &[f32],
+    sink: Option<&[f32]>,
+    window: Option<usize>,
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    dv: usize,
+    scale: f32,
+    split: bool,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let Some(gx) = c.graph_x.as_ref() else {
+        return false;
+    };
+    let npos = k_rows.len() / (nkv * hd).max(1);
+    if npos == 0
+        || q.len() != nh * hd
+        || v_rows.len() != npos * nkv * dv
+        || out.len() != nh * dv
+        || sink.is_some_and(|s| s.len() != nh)
+    {
+        return false;
+    }
+    let cap = match window {
+        Some(w) => kv_ring_cap(w),
+        None => npos.next_power_of_two(),
+    };
+    let kb = storage_bytes(c, bytemuck::cast_slice(k_rows));
+    let vb = storage_bytes(c, bytemuck::cast_slice(v_rows));
+    let qb = storage_bytes(c, bytemuck::cast_slice(q));
+    let zeros = vec![0f32; nh];
+    let sb = storage_bytes(c, bytemuck::cast_slice(sink.unwrap_or(&zeros)));
+    let kc = rw_f32(c, nkv * cap * hd, true);
+    let vc = rw_f32(c, nkv * cap * dv, true);
+    let ob = rw_f32(c, nh * dv, true);
+    let nc = cap.div_ceil(ATTEND_X_CK);
+    let xacc = rw_f32(c, nh * nc * dv, false);
+    let xml = rw_f32(c, nh * nc * 2, false);
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("ax-test"),
+        });
+    let mut keep = Vec::new();
+    {
+        let mut pass = begin_pass(&mut enc);
+        for p in 0..npos {
+            let u = uniform_u32x8(
+                c,
+                [
+                    nkv as u32, hd as u32, dv as u32, cap as u32, p as u32, p as u32, 0, 0,
+                ],
+            );
+            let bgk = bind_pairs(
+                c,
+                &gx.kv_l,
+                &[(0, &kb), (1, &vb), (2, &kc), (3, &vc), (4, &u)],
+            );
+            pass.set_pipeline(&gx.kv_append);
+            pass.set_bind_group(0, &bgk, &[]);
+            pass.dispatch_workgroups(((nkv * hd) as u32).div_ceil(256), 1, 1);
+            keep.push(u);
+        }
+        let n = window.map_or(npos, |w| npos.min(w));
+        let au = c
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("ax-test-u"),
+                contents: bytemuck::cast_slice(&[
+                    nh as u32,
+                    (nh / nkv) as u32,
+                    hd as u32,
+                    dv as u32,
+                    cap as u32,
+                    n as u32,
+                    (npos - n) as u32,
+                    scale.to_bits(),
+                    u32::from(sink.is_some()),
+                    nc as u32,
+                    0,
+                    0,
+                ]),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        if split {
+            let bgp = bind_pairs(
+                c,
+                &gx.part_l,
+                &[
+                    (0, &qb),
+                    (1, &kc),
+                    (2, &vc),
+                    (4, &au),
+                    (6, &xacc),
+                    (7, &xml),
+                ],
+            );
+            let bgm = bind_pairs(
+                c,
+                &gx.merge_l,
+                &[(3, &ob), (4, &au), (5, &sb), (6, &xacc), (7, &xml)],
+            );
+            pass.set_pipeline(&gx.part);
+            pass.set_bind_group(0, &bgp, &[]);
+            pass.dispatch_workgroups(nh as u32, n.div_ceil(ATTEND_X_CK) as u32, 1);
+            pass.set_pipeline(&gx.merge);
+            pass.set_bind_group(0, &bgm, &[]);
+            pass.dispatch_workgroups(nh as u32, 1, 1);
+        } else {
+            let bga = bind_pairs(
+                c,
+                &gx.attend_l,
+                &[(0, &qb), (1, &kc), (2, &vc), (3, &ob), (4, &au), (5, &sb)],
+            );
+            pass.set_pipeline(&gx.attend);
+            pass.set_bind_group(0, &bga, &[]);
+            pass.dispatch_workgroups(nh as u32, 1, 1);
+        }
+    }
+    let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("ax-test-stage"),
+        size: (nh * dv * 4) as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let ok = readback(c, enc, &ob, &stage, (nh * dv * 4) as u64, out);
+    drop(keep);
+    ok
+}
+
 /// One hyper-connection join on the device: fold the copies (with the
 /// Sinkhorn) and expand them back around a block output computed elsewhere.
 ///
@@ -58454,5 +60250,36 @@ mod buffer_ceiling_tests {
         assert!(buffers_fit(100, &[100]));
         assert!(!buffers_fit(100, &[101]));
         assert!(buffers_fit(100, &[]));
+    }
+}
+
+#[cfg(test)]
+mod mimo_precision_scope_tests {
+    use super::*;
+    #[test]
+    fn mimo_tower_precision_restores_the_callers_contract() {
+        assert!(!MIMO_F32_GEMM.get());
+        {
+            let _tower = MimoF32Gemm::for_tower();
+            assert!(MIMO_F32_GEMM.get());
+            let _mapped_mm = MimoF32Gemm::enter("mimo_v2_mm");
+            assert!(MIMO_F32_GEMM.get());
+        }
+        assert!(!MIMO_F32_GEMM.get());
+    }
+
+    #[test]
+    fn mimo_gemm_precision_is_nested_thread_local_and_restored() {
+        assert!(!MIMO_F32_GEMM.get());
+        {
+            let _mimo = MimoF32Gemm::enter("mimo_v2");
+            assert!(MIMO_F32_GEMM.get());
+            { let _nested = MimoF32Gemm::enter("other"); assert!(MIMO_F32_GEMM.get()); }
+            std::thread::spawn(|| assert!(!MIMO_F32_GEMM.get())).join().unwrap();
+            assert!(MIMO_F32_GEMM.get());
+        }
+        assert!(!MIMO_F32_GEMM.get());
+        let _ = std::panic::catch_unwind(|| { let _mimo = MimoF32Gemm::enter("mimo_v2"); panic!("scope test"); });
+        assert!(!MIMO_F32_GEMM.get());
     }
 }

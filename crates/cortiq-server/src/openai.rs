@@ -219,6 +219,7 @@ async fn run_generation(
     state: Arc<AppState>,
     prompt_ids: Vec<u32>,
     vl_inputs: Option<dsv41_vision::PreparedVlInputs>,
+    mimo_rows: Option<Vec<f32>>,
     max_tokens: usize,
     mask: Option<TaskMask>,
     sampler_config: SamplerConfig,
@@ -252,7 +253,7 @@ async fn run_generation(
         p.set_sampler_config(sampler_config);
         match remote {
             Some(rm) => {
-                if vl_inputs.is_some() {
+                if vl_inputs.is_some() || mimo_rows.is_some() {
                     return Err(
                         "V4.1 multimodal generation is not supported with a network-split pipeline"
                             .to_string(),
@@ -289,7 +290,10 @@ async fn run_generation(
             }
             None => match vl_inputs.as_ref() {
                 Some(inputs) => p.generate_from_vl(inputs, max_tokens, mask.as_ref(), on_token),
-                None => p.generate_from_ids(&prompt_ids, max_tokens, mask.as_ref(), on_token),
+                None => match mimo_rows.as_deref() {
+                    Some(rows) => p.generate_from_embeds(&prompt_ids, rows, max_tokens, mask.as_ref(), on_token),
+                    None => p.generate_from_ids(&prompt_ids, max_tokens, mask.as_ref(), on_token),
+                },
             },
         }
     })
@@ -722,6 +726,7 @@ async fn chat_completions(
         sampler_config.suppress_tokens.extend(think_tokens);
     }
 
+    let mut mimo_rows = None;
     // Chat template → prompt ids (uses real special tokens).
     let (prompt_ids, prompt_ingress) = if let Some(source) =
         state.runtime.model().arch().deepseek_v41.as_ref()
@@ -746,6 +751,45 @@ async fn chat_completions(
             Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
         };
         (ingress.token_ids.clone(), Some(ingress))
+    } else if state.runtime.model().arch().arch_name == "mimo_v2" {
+        let messages: Vec<_> = req.messages.iter().map(message_to_json).collect();
+        let media = match cortiq_engine::mimo_ingress::has_media(&messages) {
+            Ok(v) => v,
+            Err(e) => return error_response(StatusCode::BAD_REQUEST, e),
+        };
+        let ids = if media {
+            if state.remote.is_some() || req.cortiq.as_ref().is_some_and(|c| c.class_tokens.is_some()) {
+                return error_response(StatusCode::BAD_REQUEST, "MiMo media cannot use a network split or cortiq.class_tokens");
+            }
+            // Decode and run towers before opening the SSE stream so malformed
+            // media and placeholder mismatches are HTTP 400, never silent text.
+            // The slot pins the proper replica device and bounds concurrent
+            // tower work. Its text-only fast path above never loads towers.
+            let slot = state.slots.acquire().await;
+            let tools = req.effective_tools().map(|t| t.to_vec());
+            let thinking = req.thinking();
+            let prepared = tokio::task::spawn_blocking(move || {
+                cortiq_engine::gpu::set_current_device(slot.device);
+                cortiq_engine::mimo_ingress::prepare_for_pipeline(&slot.pipe, &messages,
+                    tools.as_deref(), thinking, &Default::default())
+            }).await;
+            let prepared = match prepared {
+                Ok(Ok(p)) => p,
+                Ok(Err(e)) => return error_response(StatusCode::BAD_REQUEST, e),
+                Err(e) => {
+                    tracing::error!("MiMo media preparation failed: {e}");
+                    return error_response(StatusCode::INTERNAL_SERVER_ERROR, "MiMo media preparation failed");
+                }
+            };
+            mimo_rows = prepared.rows;
+            prepared.token_ids
+        } else {
+            match cortiq_engine::mimo_ingress::text_ids(&state.tokenizer, &messages, req.effective_tools(), req.thinking()) {
+                Ok(ids) => ids,
+                Err(e) => return error_response(StatusCode::BAD_REQUEST, e),
+            }
+        };
+        (ids, None)
     } else {
         let prompt_ids = {
             let mut msgs: Vec<serde_json::Value> = req
@@ -1040,6 +1084,7 @@ async fn chat_completions(
                 state2.clone(),
                 prompt_ids,
                 vl_inputs,
+                mimo_rows,
                 max_tokens,
                 request_mask,
                 sampler_config,
@@ -1149,6 +1194,7 @@ async fn chat_completions(
             state.clone(),
             prompt_ids,
             vl_inputs,
+            mimo_rows,
             max_tokens,
             request_mask,
             sampler_config,
@@ -1401,6 +1447,7 @@ async fn completions(
         state.clone(),
         prompt_ids,
         None,
+        None,
         req.max_tokens as usize,
         request_mask,
         sampler_config,
@@ -1444,6 +1491,20 @@ fn default_max_tokens() -> u32 {
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn mimo_content_blocks_reach_shared_ingress_without_flattening() {
+        let wire = serde_json::json!({"role":"user", "content":[
+            {"type":"text", "text":"before"},
+            {"type":"image_url", "image_url":{"url":"x.png"}},
+            {"type":"text", "text":"after"},
+            {"type":"input_audio", "input_audio":{"data":"AA==", "format":"wav"}},
+            {"type":"video", "video":{"path":"clip.y4m"}}]});
+        let msg: ChatMessage = serde_json::from_value(wire.clone()).unwrap();
+        let preserved = message_to_json(&msg);
+        assert_eq!(preserved["content"], wire["content"]);
+        assert!(cortiq_engine::mimo_ingress::has_media(&[preserved]).unwrap());
+    }
 
     #[test]
     fn sampler_options_start_from_defaults_and_validate_ranges() {

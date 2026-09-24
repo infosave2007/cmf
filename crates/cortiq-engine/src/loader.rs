@@ -976,11 +976,84 @@ impl Pipeline {
                 (Some(a), Some(b), Some(c)) => Some((a, b, c)),
                 _ => None,
             };
+            let wk = t("self_attn.k_proj.weight")?;
+            let wv = t("self_attn.v_proj.weight")?;
+            let wo = t("self_attn.o_proj.weight")?;
+            // K/V/O geometry, checked here and never at run time: a
+            // mapped matvec accepts any `out`/`x` at least as long as its
+            // rows/cols, so a V narrower than the cache's head or an
+            // o_proj wider than nh·v would otherwise run silently wrong.
+            // KV heads come from the header — per layer when the model
+            // varies them (MiMo-V2: 4 full / 8 sliding), Gemma-4 global
+            // layers carry their own (heads, width).
+            let (nkv_l, hd_l) = if is_global_layer {
+                (
+                    arch.num_global_kv_heads.unwrap_or(arch.num_kv_heads),
+                    arch.global_head_dim.unwrap_or(arch.head_dim),
+                )
+            } else {
+                (
+                    layer
+                        .and_then(|li| {
+                            arch.kv_heads_per_layer
+                                .as_ref()
+                                .and_then(|v| v.get(li).copied())
+                        })
+                        .unwrap_or(arch.num_kv_heads),
+                    arch.head_dim,
+                )
+            };
+            let vd = if is_global_layer {
+                hd_l
+            } else {
+                arch.v_head_dim.unwrap_or(hd_l)
+            };
+            let shape_err = |what: String| {
+                CmfError::Parse(format!(
+                    "{prefix}self_attn: {what} (heads {nh}, kv heads {nkv_l}, head_dim {hd_l}, \
+                     v_head_dim {vd}) — file and header disagree"
+                ))
+            };
+            if nkv_l == 0 || nh % nkv_l != 0 {
+                return Err(shape_err(format!(
+                    "{nkv_l} KV heads must be nonzero and divide {nh} Q heads"
+                )));
+            }
+            if vd == 0 || vd > hd_l {
+                return Err(shape_err(format!("v_head_dim {vd} must be in 1..={hd_l}")));
+            }
+            if wk.rows() != nkv_l * hd_l {
+                return Err(shape_err(format!(
+                    "k_proj rows={} != kv_heads*head_dim={}",
+                    wk.rows(),
+                    nkv_l * hd_l
+                )));
+            }
+            if wv.rows() != nkv_l * vd {
+                return Err(shape_err(format!(
+                    "v_proj rows={} != kv_heads*v_head_dim={}",
+                    wv.rows(),
+                    nkv_l * vd
+                )));
+            }
+            if wo.cols() != nh * vd {
+                return Err(shape_err(format!(
+                    "o_proj cols={} != heads*v_head_dim={}",
+                    wo.cols(),
+                    nh * vd
+                )));
+            }
+            if vd < hd_l && (output_gate || softplus_gate.is_some()) {
+                return Err(shape_err(
+                    "an attention output gate with V heads narrower than Q/K is not supported"
+                        .into(),
+                ));
+            }
             Ok(AttnKind::Full {
                 wq,
-                wk: t("self_attn.k_proj.weight")?,
-                wv: t("self_attn.v_proj.weight")?,
-                wo: t("self_attn.o_proj.weight")?,
+                wk,
+                wv,
+                wo,
                 q_norm: n("self_attn.q_norm.weight"),
                 k_norm: n("self_attn.k_norm.weight"),
                 output_gate,
@@ -1214,7 +1287,13 @@ impl Pipeline {
                  loading without it"
             );
         }
-        let mtp = if let Some(cfg) = arch.mtp.as_ref().filter(|_| mtp_present) {
+        // MiMo-V2 carries its own three-layer stack (sidecar or main file),
+        // loaded by `mimo_mtp::load_for` below — never this single block.
+        let mtp = if let Some(cfg) = arch
+            .mtp
+            .as_ref()
+            .filter(|_| mtp_present && arch.arch_name != "mimo_v2")
+        {
             if cfg.num_layers != 1 {
                 return Err(CmfError::Parse(format!(
                     "MTP with {} blocks not supported yet (only 1)",
@@ -1414,6 +1493,67 @@ impl Pipeline {
                 pipeline.kv_cache.layers[li] =
                     crate::kv_cache::LayerKvCache::new(arch.num_attention_heads, hd);
             }
+        }
+        // Per-layer KV geometry (MiMo-V2): KV heads per layer and V heads
+        // narrower than Q/K. The per-layer shapes were checked against the
+        // header in load_full_attn; this installs the geometry and gives
+        // every layer whose KV head count differs its own cache shape.
+        if !owns_its_layers {
+            pipeline
+                .set_attn_geometry(arch.kv_heads_per_layer.clone(), arch.v_head_dim)
+                .map_err(|e| CmfError::Parse(format!("attention geometry: {e}")))?;
+        } else if arch.kv_heads_per_layer.is_some() || arch.v_head_dim.is_some() {
+            return Err(CmfError::Parse(format!(
+                "{}: kv_heads_per_layer / v_head_dim are not supported by its own layer stack",
+                arch.arch_name
+            )));
+        }
+        // Learned attention sinks (gpt-oss / MiMo-V2 SWA layers), by tensor
+        // presence: `model.layers.N.self_attn.sinks`, one f32 logit per Q
+        // head (`attention_sink_bias` is the HF spelling, accepted too).
+        // They fold into the grouped softmax; every attention path that
+        // cannot carry them (chunk GEMM attend, O(1), the GPU graphs)
+        // refuses the layer.
+        if !owns_its_layers {
+            for li in 0..arch.num_layers {
+                let name = [
+                    format!("model.layers.{li}.self_attn.sinks"),
+                    format!("model.layers.{li}.self_attn.attention_sink_bias"),
+                ]
+                .into_iter()
+                .find(|n| model.tensor(n).is_some());
+                if let Some(name) = name {
+                    let sinks = load_f32(model, &name, ov).map_err(err)?;
+                    pipeline
+                        .set_layer_sinks(li, sinks)
+                        .map_err(|e| CmfError::Parse(format!("{name}: {e}")))?;
+                }
+            }
+        }
+        if pipeline.kv_heads_per_layer.is_some()
+            || pipeline.v_head_dim.is_some()
+            || pipeline.kv_cache.layers.iter().any(|l| l.sinks.is_some())
+        {
+            let per_token: usize = pipeline
+                .kv_cache
+                .layers
+                .iter()
+                .map(|l| 2 * l.num_kv_heads * l.head_dim * std::mem::size_of::<f32>())
+                .sum();
+            tracing::info!(
+                "attention geometry: kv heads per layer {:?}, v_head_dim {:?}, {} sink layer(s); \
+                 f32 KV {} B/token (V padded to head_dim), cap {} tokens",
+                pipeline.kv_heads_per_layer,
+                pipeline.v_head_dim,
+                pipeline
+                    .kv_cache
+                    .layers
+                    .iter()
+                    .filter(|l| l.sinks.is_some())
+                    .count(),
+                per_token,
+                pipeline.kv_cache.max_seq_len
+            );
         }
         // Per-frequency rope divisors (MiniCPM3 longrope short_factor):
         // served at the native window with the trained per-dim factors.
@@ -1939,6 +2079,9 @@ impl Pipeline {
         }
         pipeline.short_conv_cfg = short_conv_cfg;
         pipeline.mtp = mtp;
+        if arch.arch_name == "mimo_v2" {
+            pipeline.mimo_mtp = crate::pipeline::mimo_mtp::load_for(model, &arch)?;
+        }
         pipeline.install_dynamic_routing(model, false);
         // Record the load-time overlay so a later set_active_skill(None)
         // correctly reverts it (the union-diff assumes dyn_active mirrors

@@ -82,6 +82,8 @@ fn q1_gpu_micro() {
         logit_multiplier: None,
         loop_final_norm: false,
         prism_hadamard: None,
+        kv_heads_per_layer: None,
+        v_head_dim: None,
     };
     let header = CmfHeader {
         format: "cmf".into(),
@@ -299,6 +301,8 @@ fn q8_gpu_micro() {
         logit_multiplier: None,
         loop_final_norm: false,
         prism_hadamard: None,
+        kv_heads_per_layer: None,
+        v_head_dim: None,
     };
     let header = CmfHeader {
         format: "cmf".into(),
@@ -443,6 +447,8 @@ fn q8_mul_mm_micro() {
         logit_multiplier: None,
         loop_final_norm: false,
         prism_hadamard: None,
+        kv_heads_per_layer: None,
+        v_head_dim: None,
     };
     let header = CmfHeader {
         format: "cmf".into(),
@@ -646,6 +652,8 @@ fn q1_chain_and_batch_parity() {
         logit_multiplier: None,
         loop_final_norm: false,
         prism_hadamard: None,
+        kv_heads_per_layer: None,
+        v_head_dim: None,
     };
     let header = CmfHeader {
         format: "cmf".into(),

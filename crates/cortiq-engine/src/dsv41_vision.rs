@@ -10,7 +10,6 @@
 use crate::pool::Pool;
 use crate::qtensor::QTensor;
 use crate::tokenizer::Tokenizer;
-use base64::Engine as _;
 use cortiq_core::CmfModel;
 use image::imageops::{self, FilterType};
 use image::{Rgb, RgbImage};
@@ -353,56 +352,8 @@ pub fn image_token_types(n_llm_h: usize, n_llm_w: usize) -> Vec<i8> {
     types
 }
 
-/// Load bytes from raw/base64 data, Anthropic source records, data URLs,
-/// HTTP(S), or local paths.  This follows the official loader's precedence.
-pub fn load_image_bytes(record: &Value) -> Result<Vec<u8>, String> {
-    let map = record
-        .as_object()
-        .ok_or_else(|| "image record must be an object".to_string())?;
-    if let Some(data) = map.get("data") {
-        if let Some(s) = data.as_str() {
-            return base64::engine::general_purpose::STANDARD
-                .decode(s)
-                .map_err(|e| format!("invalid base64 image data: {e}"));
-        }
-    }
-    if let Some(source) = map.get("source").and_then(Value::as_object) {
-        if let Some(data) = source.get("data").and_then(Value::as_str) {
-            return base64::engine::general_purpose::STANDARD
-                .decode(data)
-                .map_err(|e| format!("invalid base64 Anthropic image data: {e}"));
-        }
-        if let Some(url) = source.get("url").and_then(Value::as_str) {
-            return load_image_bytes(&serde_json::json!({"url": url}));
-        }
-    }
-    let url = map.get("url").and_then(Value::as_str).ok_or_else(|| {
-        format!(
-            "image record has no data/source/url (keys: {:?})",
-            map.keys()
-        )
-    })?;
-    if let Some((header, payload)) = url.split_once(',').filter(|(h, _)| h.starts_with("data:")) {
-        if !header.contains(";base64") {
-            return Err(format!("unsupported data URL encoding: {header}"));
-        }
-        return base64::engine::general_purpose::STANDARD
-            .decode(payload)
-            .map_err(|e| format!("invalid data URL image: {e}"));
-    }
-    if url.starts_with("http://") || url.starts_with("https://") {
-        let response = ureq::get(url)
-            .timeout(std::time::Duration::from_secs(30))
-            .call()
-            .map_err(|e| format!("image download failed: {e}"))?;
-        let mut reader = response.into_reader();
-        let mut bytes = Vec::new();
-        std::io::Read::read_to_end(&mut reader, &mut bytes)
-            .map_err(|e| format!("image download read failed: {e}"))?;
-        return Ok(bytes);
-    }
-    std::fs::read(url).map_err(|e| format!("image path '{url}' could not be read: {e}"))
-}
+/// Moved to [`crate::media`] so every vision front end shares one fetcher.
+pub use crate::media::load_image_bytes;
 
 fn resize_fit(image: &RgbImage, width: u32, height: u32) -> RgbImage {
     let scale = (width as f64 / image.width() as f64).min(height as f64 / image.height() as f64);

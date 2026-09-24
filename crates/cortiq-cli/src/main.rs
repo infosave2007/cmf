@@ -10,6 +10,7 @@ mod http_range;
 mod imagepack;
 mod ltxcmd;
 mod ltxpack;
+mod mimo_towers;
 mod moedefrag;
 mod music;
 mod npy;
@@ -302,9 +303,11 @@ enum Commands {
         /// or a hub repo id like `Qwen/Qwen2.5-0.5B-Instruct` (downloaded)
         #[arg(long)]
         model: String,
-        /// Quantization for 2-D weights: q8 | q8_2f | q4 | q4t | q4tp | q2tp | q1 | q1p | q1s | q1t | f16 | vbit
-        #[arg(long, default_value = "q8")]
-        quant: String,
+        /// Quantization for 2-D weights: q8 | q8_2f | q4 | q4t | q4tp | q2tp | q1 | q1p | q1s | q1t | f16 | vbit | auto.
+        /// Default (or `auto`): q8, except MiMo-V2 (`mimo_v2`), which converts to
+        /// q4tp experts with a q8_2f skeleton.
+        #[arg(long)]
+        quant: Option<String>,
         /// Output .cmf path
         #[arg(long)]
         output: String,
@@ -354,6 +357,26 @@ enum Commands {
         /// Permanent exact sink keys for the --o1 hint (validated default 4)
         #[arg(long)]
         o1_sink: Option<usize>,
+        /// MiMo-V2 only: write JUST the multi-token-prediction draft layers
+        /// (model_mtp.safetensors, `num_nextn_predict_layers` of them) as the
+        /// sidecar `<stem>.mtp.cmf` beside --output — the file the runtime
+        /// loads automatically for speculative decoding. The main file is
+        /// not read or rewritten. Matrices at --quant (default q8_2f, the
+        /// skeleton policy), norms and sinks f32.
+        #[arg(long, conflicts_with = "mimo_towers")]
+        mtp_sidecar: bool,
+        /// MiMo-V2 towers: `text` (default) drops them; `mm-only` writes the
+        /// companion `<stem>.mm.cmf` (vision, audio encoder, speech
+        /// embeddings, audio tokenizer encoder — no text tensors; `auto`
+        /// quant = q4tp matrices); `multimodal` writes one file with the text
+        /// model and the towers. Needs a local checkpoint dir with
+        /// `audio_tokenizer/`.
+        #[arg(
+            long = "mimo-towers",
+            default_value = "text",
+            value_name = "text|mm-only|multimodal"
+        )]
+        mimo_towers: String,
     },
     /// Rewrite a container tightly: reclaim dead directory/header tails
     /// left by append-only skill growth (spec §9). Streams from mmap.
@@ -559,10 +582,25 @@ enum Commands {
         /// Single prompt (non-interactive)
         #[arg(short, long)]
         prompt: Option<String>,
-        /// Image path, data URL, or HTTP(S) URL for a V4.1 multimodal prompt.
+        /// Image path, data URL, or HTTP(S) URL for a V4.1 or MiMo prompt.
         /// Repeat the flag to place images after the text in prompt order.
         #[arg(long = "image")]
         images: Vec<String>,
+        /// MiMo video: local Y4M file or directory of image frames.
+        #[arg(long = "video")]
+        videos: Vec<String>,
+        /// Frame-directory sampling rate (MiMo video).
+        #[arg(long)]
+        video_fps: Option<f64>,
+        /// MiMo WAV file, data URL, or HTTP(S) URL; repeat for multiple clips.
+        #[arg(long = "audio")]
+        audios: Vec<String>,
+        /// Explicit MiMo multimodal companion (otherwise discovered beside text).
+        #[arg(long)]
+        mm: Option<std::path::PathBuf>,
+        /// Maximum pixels per MiMo image/video frame before patchification.
+        #[arg(long)]
+        image_max_pixels: Option<usize>,
         /// V4.1 reasoning budget: 1..=100 or low/high/max.
         #[arg(long, value_name = "1..100|low|high|max")]
         reasoning_effort: Option<String>,
@@ -1996,7 +2034,24 @@ async fn main() -> anyhow::Result<()> {
             o1_m,
             o1_window,
             o1_sink,
+            mtp_sidecar,
+            mimo_towers,
         } => {
+            let towers = convert::parse_mimo_towers(&mimo_towers)?;
+            if mtp_sidecar {
+                let q = match quant.as_deref() {
+                    None => "q8_2f",
+                    Some(q) if q.eq_ignore_ascii_case(convert::AUTO_QUANT) => "q8_2f",
+                    Some(q) => q,
+                };
+                let path = convert::write_mimo_mtp_sidecar(
+                    std::path::Path::new(&model),
+                    std::path::Path::new(&output),
+                    q,
+                )?;
+                println!("✓ wrote MTP sidecar {}", path.display());
+                return Ok(());
+            }
             convert::set_vbit_mean_bits(mean_bits);
             convert::set_tensor_quant_overrides(&tensor_quant)?;
             // --o1: record the runtime hint in header provenance; the
@@ -2020,14 +2075,15 @@ async fn main() -> anyhow::Result<()> {
                     }))
                 }
             };
-            convert::run_convert(
+            convert::run_convert_towers(
                 &model,
-                &quant,
+                quant.as_deref().unwrap_or(convert::AUTO_QUANT),
                 &output,
                 hf_token.as_deref(),
                 defrag.as_deref(),
                 o1_hint,
                 resume,
+                towers,
                 progress_reporter("converting"),
             )?;
             println!("✓ wrote {output}");
@@ -2138,6 +2194,11 @@ async fn main() -> anyhow::Result<()> {
             task,
             prompt,
             images,
+            videos,
+            video_fps,
+            audios,
+            mm,
+            image_max_pixels,
             reasoning_effort,
             max_tokens,
             skill,
@@ -2182,6 +2243,9 @@ async fn main() -> anyhow::Result<()> {
                 &task,
                 prompt.as_deref(),
                 &images,
+                &videos,
+                &audios,
+                &cortiq_engine::mimo_ingress::MediaOptions { companion: mm, image_max_pixels, video_fps },
                 reasoning_effort.as_deref(),
                 max_tokens,
                 skill.as_deref(),
@@ -4224,12 +4288,37 @@ fn prepare_dsv41_cli_messages(
     .map_err(|e| anyhow::anyhow!(e))
 }
 
+/// Token ids for `CMF_PROMPT_IDS`: a JSON array (`[1, 2, 3]`) or plain ids
+/// separated by commas and/or whitespace. An empty list is an error.
+fn parse_prompt_ids(text: &str) -> anyhow::Result<Vec<u32>> {
+    let body = text.trim().trim_start_matches('[').trim_end_matches(']');
+    let ids = body
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<u32>()
+                .map_err(|e| anyhow::anyhow!("CMF_PROMPT_IDS: bad token id {s:?}: {e}"))
+        })
+        .collect::<anyhow::Result<Vec<u32>>>()?;
+    anyhow::ensure!(!ids.is_empty(), "CMF_PROMPT_IDS: no token ids");
+    Ok(ids)
+}
+
+fn read_prompt_ids(path: &std::path::Path) -> anyhow::Result<Vec<u32>> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("CMF_PROMPT_IDS: cannot read {}: {e}", path.display()))?;
+    parse_prompt_ids(&text)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn cmd_run(
     model_path: &str,
     task: &str,
     prompt: Option<&str>,
     images: &[String],
+    videos: &[String],
+    audios: &[String],
+    media_options: &cortiq_engine::mimo_ingress::MediaOptions,
     reasoning_effort: Option<&str>,
     max_tokens: usize,
     skill: Option<&str>,
@@ -4355,13 +4444,23 @@ async fn cmd_run(
         None => Pipeline::from_model_with_skill(&model, sampler, skill.as_deref())?,
     };
     o1.apply(&mut pipeline);
+    // CMF_IGNORE_EOS=1: decode the full --max-tokens (backend parity runs
+    // compare a fixed number of steps; `bench --ignore-eos` is the twin).
+    if std::env::var("CMF_IGNORE_EOS").as_deref() == Ok("1") {
+        pipeline.ignore_eos = true;
+    }
     let is_dsv41 = model.arch().arch_name == "deepseek_v41";
-    if !is_dsv41 && (!images.is_empty() || reasoning_effort.is_some()) {
-        anyhow::bail!("--image and --reasoning-effort are supported only for DeepSeek-V4.1");
-    }
-    if !images.is_empty() && prompt.is_none() {
-        anyhow::bail!("--image requires --prompt so image order is unambiguous");
-    }
+    let is_mimo = model.arch().arch_name == "mimo_v2";
+    let mimo_media = is_mimo && (!images.is_empty() || !videos.is_empty() || !audios.is_empty());
+    anyhow::ensure!(is_dsv41 || reasoning_effort.is_none(), "--reasoning-effort requires DeepSeek-V4.1");
+    anyhow::ensure!(is_dsv41 || is_mimo || images.is_empty(), "--image requires DeepSeek-V4.1 or MiMo");
+    anyhow::ensure!(is_mimo || (videos.is_empty() && audios.is_empty() && media_options.companion.is_none()
+        && media_options.video_fps.is_none() && media_options.image_max_pixels.is_none()), "--video/--audio/--mm and MiMo processing options require MiMo");
+    anyhow::ensure!((images.is_empty() && videos.is_empty() && audios.is_empty()) || prompt.is_some(),
+        "media input requires --prompt so media order is unambiguous");
+    anyhow::ensure!(!mimo_media || (!raw && state.is_none() && peer.is_none() && gpus.is_none()
+        && std::env::var_os("CMF_PROMPT_IDS").is_none()),
+        "MiMo media requires a fresh local chat prompt (no --raw/--state/--peer/--gpus/CMF_PROMPT_IDS)");
     // Same rule for the CLI: the vocabulary-wide softmax runs when its
     // output is going to be shown, not on every run.
     pipeline.set_confidence(confidence || trace);
@@ -4554,7 +4653,8 @@ async fn cmd_run(
     let noninteractive_generate = prompt.is_some();
     let mut generate_and_print = |pipeline: &mut Pipeline,
                                   ids: &[u32],
-                                  vl_inputs: Option<&PreparedVlInputs>|
+                                  vl_inputs: Option<&PreparedVlInputs>,
+                                  mimo_rows: Option<&[f32]>|
      -> anyhow::Result<Option<String>> {
         use std::io::Write;
         // Stream silently when the confidence view will reprint coloured;
@@ -4587,7 +4687,7 @@ async fn cmd_run(
             })
         };
         let started = std::time::Instant::now();
-        if vl_inputs.is_some() && remote_opt.is_some() {
+        if (vl_inputs.is_some() || mimo_rows.is_some()) && remote_opt.is_some() {
             anyhow::bail!(
                 "DeepSeek-V4.1 multimodal generation is not supported with --peer; use a local pipeline"
             );
@@ -4646,7 +4746,10 @@ async fn cmd_run(
                 Some(inputs) => {
                     pipeline.generate_from_vl(inputs, max_tokens, mask.as_ref(), Some(cb))
                 }
-                None => pipeline.generate_from_ids(ids, max_tokens, mask.as_ref(), Some(cb)),
+                None => match mimo_rows {
+                    Some(rows) => pipeline.generate_from_embeds(ids, rows, max_tokens, mask.as_ref(), Some(cb)),
+                    None => pipeline.generate_from_ids(ids, max_tokens, mask.as_ref(), Some(cb)),
+                },
             },
         };
         match gen_res {
@@ -4769,10 +4872,31 @@ async fn cmd_run(
                 prepare_dsv41_cli_prompt(&model, &pipeline, p, images, no_think, reasoning_effort)
             })
             .transpose()?;
-        let ids = vl_inputs
+        let mimo_inputs = if mimo_media {
+            let mut content = vec![serde_json::json!({"type":"text", "text":p})];
+            content.extend(images.iter().map(|path| serde_json::json!({"type":"image_url", "image_url":{"url":path}})));
+            content.extend(videos.iter().map(|path| serde_json::json!({"type":"video", "video":{"path":path}})));
+            content.extend(audios.iter().map(|path| serde_json::json!({"type":"audio", "audio":{"url":path}})));
+            Some(cortiq_engine::mimo_ingress::prepare(&model, &pipeline,
+                &[serde_json::json!({"role":"user", "content":content})], None, thinking, media_options)
+                .map_err(anyhow::Error::msg)?)
+        } else { None };
+        let mut ids = vl_inputs
             .as_ref()
             .map(|inputs| inputs.token_ids.clone())
+            .or_else(|| mimo_inputs.as_ref().map(|inputs| inputs.token_ids.clone()))
             .unwrap_or_else(|| build_ids(&pipeline, &history, p));
+        // CMF_PROMPT_IDS=<file>: feed exactly these token ids (a JSON array,
+        // or ids separated by commas/whitespace) instead of the tokenized
+        // prompt — parity runs against an oracle that tokenized elsewhere.
+        if let Some(path) = std::env::var_os("CMF_PROMPT_IDS") {
+            ids = read_prompt_ids(std::path::Path::new(&path))?;
+            eprintln!(
+                "CMF_PROMPT_IDS: {} ids from {}",
+                ids.len(),
+                path.to_string_lossy()
+            );
+        }
         // CMF_PROMPT_DUMP=1: the rendered prompt as the model sees it
         // (template applied, decoded back to text) — for template audits.
         if std::env::var("CMF_PROMPT_DUMP").is_ok() {
@@ -4795,7 +4919,7 @@ async fn cmd_run(
                 .collect();
             eprintln!("head {}\ntail {}", head.join(" "), tail.join(" "));
         }
-        generate_and_print(&mut pipeline, &ids, vl_inputs.as_ref())?;
+        generate_and_print(&mut pipeline, &ids, vl_inputs.as_ref(), mimo_inputs.as_ref().and_then(|p| p.rows.as_deref()))?;
     } else {
         println!("\nType your message (Ctrl+C to exit):\n");
         let stdin = std::io::stdin();
@@ -4848,7 +4972,7 @@ async fn cmd_run(
             if use_template {
                 println!();
             }
-            match generate_and_print(&mut pipeline, &ids, vl_inputs.as_ref())? {
+            match generate_and_print(&mut pipeline, &ids, vl_inputs.as_ref(), None)? {
                 Some(reply) => history.push(("assistant".to_string(), reply)),
                 // A failed turn leaves no dangling user message.
                 None => {
@@ -6832,6 +6956,39 @@ async fn cmd_bench(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mimo_run_media_flags_parse() {
+        // Parsing the complete CLI command tree in an unoptimized build
+        // exceeds libtest's 2 MiB worker stack on both Linux and macOS.
+        // Match the CLI main-thread stack for this parser test only; keep
+        // the actual parser and every assertion (and other tests) unchanged.
+        let cli = std::thread::Builder::new()
+            .name("mimo-cli-parser".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                Cli::try_parse_from([
+                    "cortiq", "run", "text.cmf", "--prompt", "describe",
+                    "--image", "one.png", "--image", "two.png", "--video", "clip.y4m",
+                    "--video-fps", "2", "--audio", "clip.wav", "--mm", "full.mm.cmf",
+                    "--image-max-pixels", "200704",
+                ]).unwrap()
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        match cli.command {
+            Commands::Run { images, videos, audios, video_fps, mm, image_max_pixels, .. } => {
+                assert_eq!(images, ["one.png", "two.png"]);
+                assert_eq!(videos, ["clip.y4m"]);
+                assert_eq!(audios, ["clip.wav"]);
+                assert_eq!(video_fps, Some(2.0));
+                assert_eq!(mm.unwrap(), std::path::PathBuf::from("full.mm.cmf"));
+                assert_eq!(image_max_pixels, Some(200704));
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
 
     #[test]
     fn session_state_roundtrips() {
