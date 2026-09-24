@@ -10,6 +10,7 @@ mod http_range;
 mod imagepack;
 mod ltxcmd;
 mod ltxpack;
+mod mimo_towers;
 mod moedefrag;
 mod music;
 mod npy;
@@ -356,6 +357,18 @@ enum Commands {
         /// Permanent exact sink keys for the --o1 hint (validated default 4)
         #[arg(long)]
         o1_sink: Option<usize>,
+        /// MiMo-V2 towers: `text` (default) drops them; `mm-only` writes the
+        /// companion `<stem>.mm.cmf` (vision, audio encoder, speech
+        /// embeddings, audio tokenizer encoder — no text tensors; `auto`
+        /// quant = q4tp matrices); `multimodal` writes one file with the text
+        /// model and the towers. Needs a local checkpoint dir with
+        /// `audio_tokenizer/`.
+        #[arg(
+            long = "mimo-towers",
+            default_value = "text",
+            value_name = "text|mm-only|multimodal"
+        )]
+        mimo_towers: String,
     },
     /// Rewrite a container tightly: reclaim dead directory/header tails
     /// left by append-only skill growth (spec §9). Streams from mmap.
@@ -1998,7 +2011,9 @@ async fn main() -> anyhow::Result<()> {
             o1_m,
             o1_window,
             o1_sink,
+            mimo_towers,
         } => {
+            let towers = convert::parse_mimo_towers(&mimo_towers)?;
             convert::set_vbit_mean_bits(mean_bits);
             convert::set_tensor_quant_overrides(&tensor_quant)?;
             // --o1: record the runtime hint in header provenance; the
@@ -2022,7 +2037,7 @@ async fn main() -> anyhow::Result<()> {
                     }))
                 }
             };
-            convert::run_convert(
+            convert::run_convert_towers(
                 &model,
                 quant.as_deref().unwrap_or(convert::AUTO_QUANT),
                 &output,
@@ -2030,6 +2045,7 @@ async fn main() -> anyhow::Result<()> {
                 defrag.as_deref(),
                 o1_hint,
                 resume,
+                towers,
                 progress_reporter("converting"),
             )?;
             println!("✓ wrote {output}");

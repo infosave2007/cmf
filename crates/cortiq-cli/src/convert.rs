@@ -644,11 +644,11 @@ pub(crate) fn canon_name(raw: &str) -> Option<String> {
 /// carries a real vision tower.  Keep the generic `canon_name` multimodal
 /// policy unchanged (older readers intentionally drop vision); only this
 /// explicit architecture path maps the retained tower into `vis.*`.
-fn canon_name_for_arch(arch: &ModelArch, raw: &str) -> Option<String> {
+fn canon_name_for_arch(arch: &ModelArch, raw: &str, towers: MimoTowers) -> Option<String> {
     // MiMo-V2's rules (router bias, sinks, tower/MTP drops) are gated on the
     // arch so the generic canon policy of every other family is untouched.
     if arch.arch_name == MIMO_V2 {
-        return mimo_v2_canon(raw, MIMO_TOWERS);
+        return mimo_v2_canon(raw, towers);
     }
     if arch.prism_hadamard.is_none() {
         return canon_name(raw);
@@ -904,7 +904,7 @@ fn glob_match(pat: &str, name: &str) -> bool {
     pi == p.len()
 }
 
-fn tensor_quant_override(name: &str) -> Option<Quant> {
+pub(crate) fn tensor_quant_override(name: &str) -> Option<Quant> {
     let o = TENSOR_QUANT_OVERRIDES.lock().unwrap();
     o.iter().find(|(p, _)| glob_match(p, name)).map(|&(_, q)| q)
 }
@@ -2746,7 +2746,7 @@ fn consume_local_ready_source(path: &Path) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("remove consumed local-ready source {}: {e}", path.display()))
 }
 
-fn open_safetensors(path: &Path) -> anyhow::Result<SafeTensors> {
+pub(crate) fn open_safetensors(path: &Path) -> anyhow::Result<SafeTensors> {
     let file = fs::File::open(path).map_err(|e| anyhow::anyhow!("open {}: {e}", path.display()))?;
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
     if mmap.len() < 8 {
@@ -3009,24 +3009,43 @@ fn source_fp8_block(config: &serde_json::Value) -> usize {
 
 const MIMO_V2: &str = "mimo_v2";
 
-/// Which towers of a MiMo-V2 checkpoint a conversion keeps. The checkpoint
-/// ships a vision tower (`visual.*`), an audio encoder (`audio_encoder.*`)
-/// and speech embeddings (`speech_embeddings.*`) beside the text decoder.
+/// Which towers of a MiMo-V2 checkpoint a conversion keeps
+/// (`cortiq convert --mimo-towers`). The checkpoint ships a vision tower
+/// (`visual.*`), an audio encoder (`audio_encoder.*`) and speech embeddings
+/// (`speech_embeddings.*`) beside the text decoder, and the audio tokenizer
+/// in its own `audio_tokenizer/` file. Names and codecs of the kept towers:
+/// `cortiq_engine::mimo_mm` / `crate::mimo_towers`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MimoTowers {
-    /// The text decoder alone; every multimodal tower is dropped.
+pub enum MimoTowers {
+    /// `text` (default): the text decoder alone; every tower is dropped.
     TextOnly,
-    /// Keep the vision/audio/speech towers under their source names. No
-    /// runtime reads them yet, so no conversion selects this today; the
-    /// multimodal conversion switches `MIMO_TOWERS` and gives the towers
-    /// their runtime namespace.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// `mm-only`: the companion `<stem>.mm.cmf` — the towers and nothing
+    /// of the text decoder (`mimo_towers::run_convert_mimo_mm`).
+    MmOnly,
+    /// `multimodal`: one file with the text decoder AND the towers under
+    /// the companion's tensor names.
     Multimodal,
 }
 
-/// The towers every `mimo_v2` conversion keeps (text-only until the runtime
-/// has the vision and audio towers).
-const MIMO_TOWERS: MimoTowers = MimoTowers::TextOnly;
+impl MimoTowers {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::TextOnly => "text",
+            Self::MmOnly => "mm-only",
+            Self::Multimodal => "multimodal",
+        }
+    }
+}
+
+/// Parse `--mimo-towers text|mm-only|multimodal`.
+pub fn parse_mimo_towers(s: &str) -> anyhow::Result<MimoTowers> {
+    Ok(match s.trim().to_ascii_lowercase().as_str() {
+        "text" | "text-only" => MimoTowers::TextOnly,
+        "mm-only" | "mm_only" | "mm" => MimoTowers::MmOnly,
+        "multimodal" | "full" => MimoTowers::Multimodal,
+        other => anyhow::bail!("--mimo-towers '{other}': expected text, mm-only or multimodal"),
+    })
+}
 
 /// MiMo-V2 tensor names → the CMF layout, or `None` to drop the tensor.
 fn mimo_v2_canon(raw: &str, towers: MimoTowers) -> Option<String> {
@@ -3043,7 +3062,7 @@ fn mimo_v2_canon(raw: &str, towers: MimoTowers) -> Option<String> {
     {
         return match towers {
             MimoTowers::TextOnly => None,
-            MimoTowers::Multimodal => Some(raw.to_string()),
+            MimoTowers::MmOnly | MimoTowers::Multimodal => Some(raw.to_string()),
         };
     }
     // The noaux selection bias lives under the router in the checkpoint;
@@ -5049,6 +5068,7 @@ fn directory_record_estimate(source_tensors: usize, arch: &ModelArch) -> usize {
         .max(4096)
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // the CLI calls run_convert_towers
 pub fn run_convert(
     model: &str,
     quant: &str,
@@ -5068,10 +5088,30 @@ pub fn run_convert(
     run_convert_multi(model, &outputs, hf_token, defrag, o1_hint, resume, progress)
 }
 
+/// [`run_convert`] with the MiMo-V2 tower mode (`--mimo-towers`).
+#[allow(clippy::too_many_arguments)]
+pub fn run_convert_towers(
+    model: &str,
+    quant: &str,
+    output: &str,
+    hf_token: Option<&str>,
+    defrag: Option<&str>,
+    o1_hint: Option<serde_json::Value>,
+    resume: bool,
+    towers: MimoTowers,
+    progress: impl FnMut(f32),
+) -> anyhow::Result<()> {
+    let outputs = vec![(quant.to_string(), output.to_string())];
+    run_convert_multi_towers(
+        model, &outputs, hf_token, defrag, o1_hint, resume, towers, progress,
+    )
+}
+
 /// Convert one source checkpoint into one or more independently finalized
 /// CMF outputs.  All requested profiles consume each source shard in one
 /// streamed pass; the decoded values are borrowed while each profile's
 /// encoder writes its own payload.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn run_convert_multi(
     model: &str,
     outputs: &[(String, String)],
@@ -5079,9 +5119,42 @@ pub fn run_convert_multi(
     defrag: Option<&str>,
     o1_hint: Option<serde_json::Value>,
     resume: bool,
+    progress: impl FnMut(f32),
+) -> anyhow::Result<()> {
+    run_convert_multi_towers(
+        model,
+        outputs,
+        hf_token,
+        defrag,
+        o1_hint,
+        resume,
+        MimoTowers::TextOnly,
+        progress,
+    )
+}
+
+/// [`run_convert_multi`] with the MiMo-V2 tower mode. `MmOnly` writes the
+/// companion (no text tensors are read); `Multimodal` adds the towers, the
+/// audio tokenizer encoder and the config blobs to each text output.
+#[allow(clippy::too_many_arguments)]
+pub fn run_convert_multi_towers(
+    model: &str,
+    outputs: &[(String, String)],
+    hf_token: Option<&str>,
+    defrag: Option<&str>,
+    o1_hint: Option<serde_json::Value>,
+    resume: bool,
+    towers: MimoTowers,
     mut progress: impl FnMut(f32),
 ) -> anyhow::Result<()> {
     anyhow::ensure!(!outputs.is_empty(), "at least one output is required");
+    if towers == MimoTowers::MmOnly {
+        anyhow::ensure!(
+            defrag.is_none() && o1_hint.is_none() && !resume,
+            "--mimo-towers mm-only writes only the towers: --defrag, --o1 and --resume do not apply"
+        );
+        return crate::mimo_towers::run_convert_mimo_mm(model, outputs, progress);
+    }
     for (i, (_, path)) in outputs.iter().enumerate() {
         anyhow::ensure!(!path.trim().is_empty(), "output path {} is empty", i + 1);
         anyhow::ensure!(
@@ -5132,6 +5205,25 @@ pub fn run_convert_multi(
         &fs::read(dir.join("config.json")).map_err(|e| anyhow::anyhow!("read config.json: {e}"))?,
     )?;
     let mut arch = build_arch(&config)?;
+    // The multimodal towers (checked before any shard is touched: a missing
+    // audio tokenizer must not surface after a multi-hour text pass).
+    let tower_source = match towers {
+        MimoTowers::TextOnly => None,
+        MimoTowers::MmOnly => unreachable!("dispatched above"),
+        MimoTowers::Multimodal => {
+            anyhow::ensure!(
+                arch.arch_name == MIMO_V2,
+                "--mimo-towers multimodal applies to {MIMO_V2} checkpoints, not '{}'",
+                arch.arch_name
+            );
+            anyhow::ensure!(
+                stream_repo.is_none(),
+                "--mimo-towers multimodal needs a local checkpoint dir (with {}/)",
+                crate::mimo_towers::AUDIO_TOKENIZER_DIR
+            );
+            Some(crate::mimo_towers::TowerSource::open(dir)?)
+        }
+    };
     let profiles: Vec<Quant> = requested_profiles
         .iter()
         .map(|q| {
@@ -5343,6 +5435,7 @@ pub fn run_convert_multi(
     }
     let mut tensors: Vec<Vec<TensorSpec>> =
         outputs.iter().map(|_| Vec::with_capacity(total)).collect();
+    let mut tower_stats = vec![crate::mimo_towers::TowerStats::default(); outputs.len()];
     if arch.prism_hadamard.is_some() {
         let mut vision_cfg = config
             .get("vision_config")
@@ -5471,13 +5564,30 @@ pub fn run_convert_multi(
                     continue;
                 }
             }
-            let Some(name) = canon_name_for_arch(&arch, &m.name) else {
+            let Some(name) = canon_name_for_arch(&arch, &m.name, towers) else {
                 continue;
             };
             if let Some(pats) = convert_only.as_ref() {
                 if !pats.iter().any(|p| glob_match(p, &name)) {
                     continue;
                 }
+            }
+            // MiMo-V2 towers (multimodal mode only — text mode dropped them
+            // in canon): the tower codec policy, not the text profile rules.
+            if arch.arch_name == MIMO_V2
+                && cortiq_engine::mimo_mm::MimoTowerGroup::of(&name).is_some()
+            {
+                crate::mimo_towers::emit_tower(
+                    batches,
+                    profiles,
+                    active,
+                    &mut tower_stats,
+                    &name,
+                    &m.shape,
+                    &m.dtype,
+                    file.bytes(m),
+                )?;
+                continue;
             }
             // HunYuan dense ships the tied `lm_head.weight` as a second copy
             // of the embedding; the loader reads the embedding when the
@@ -6610,6 +6720,14 @@ pub fn run_convert_multi(
         }
     }
 
+    // MiMo-V2 multimodal: the audio tokenizer encoder (its own file) and
+    // the two config blobs, after the shard pass so the text outputs'
+    // resumable shard marks stay exactly the index's shards.
+    if let Some(src) = tower_source.as_ref() {
+        let active: Vec<bool> = (0..outputs.len()).map(|i| !completed[i]).collect();
+        src.emit_tail(&mut tensors, &profiles, &active, &mut tower_stats)?;
+    }
+
     // Tokenizer + chat bundle (optional but recommended).
     let tok_cfg: serde_json::Value = fs::read(dir.join("tokenizer_config.json"))
         .ok()
@@ -6768,6 +6886,13 @@ pub fn run_convert_multi(
     let header_for = |i: usize| {
         let mut p = provenance.clone();
         p["weight_quant"] = serde_json::json!(quant_name(profiles[i]));
+        if let Some(src) = tower_source.as_ref() {
+            let mut mm = src.provenance(towers.label(), &tower_stats[i]);
+            // A resumed run did not see the towers of shards finished
+            // earlier; its codec summary covers only this run's part.
+            mm["resumed_run"] = serde_json::json!(resume);
+            p["mimo_mm"] = mm;
+        }
         let header_arch = if matches!(profiles[i], Quant::Q2TiledPAffine) {
             let mut a = arch.clone();
             let prism = a
@@ -9790,7 +9915,7 @@ mod mimo_v2_tests {
     #[test]
     fn mimo_v2_canon_rules_are_arch_gated_and_switchable() {
         let arch = build_arch(&real_config()).unwrap();
-        let c = |raw: &str| canon_name_for_arch(&arch, raw);
+        let c = |raw: &str| canon_name_for_arch(&arch, raw, MimoTowers::TextOnly);
         assert_eq!(
             c("model.layers.3.mlp.gate.e_score_correction_bias").as_deref(),
             Some("model.layers.3.mlp.expert_bias")
@@ -9846,11 +9971,17 @@ mod mimo_v2_tests {
         let mut other = arch.clone();
         other.arch_name = "qwen3_moe".into();
         assert_eq!(
-            canon_name_for_arch(&other, "audio_encoder.x.weight").as_deref(),
+            canon_name_for_arch(&other, "audio_encoder.x.weight", MimoTowers::Multimodal)
+                .as_deref(),
             Some("audio_encoder.x.weight")
         );
         assert_eq!(
-            canon_name_for_arch(&other, "model.layers.3.self_attn.attention_sink_bias").as_deref(),
+            canon_name_for_arch(
+                &other,
+                "model.layers.3.self_attn.attention_sink_bias",
+                MimoTowers::TextOnly
+            )
+            .as_deref(),
             Some("model.layers.3.self_attn.attention_sink_bias")
         );
         // Dtype rules: bias and sinks exact f32, router f16.
@@ -10251,6 +10382,15 @@ mod mimo_v2_tests {
     }
 
     fn write_fixture(tag: &str) -> Fixture {
+        write_fixture_towers(tag, false)
+    }
+
+    /// The tiny text checkpoint; with `towers`, the placeholder tower
+    /// tensors are replaced by a complete tiny tower set
+    /// (`mimo_towers::tests`), the tower config keys are merged into
+    /// config.json and `audio_tokenizer/` is written. `want` stays the TEXT
+    /// tensors only.
+    fn write_fixture_towers(tag: &str, towers: bool) -> Fixture {
         let dir = std::env::temp_dir().join(format!("cortiq-mimo-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
@@ -10424,24 +10564,37 @@ mod mimo_v2_tests {
             vec![H],
             bf16_of(&[1.0; H]),
         ));
-        skel.push((
-            "visual.blocks.0.attn.qkv.weight".into(),
-            "BF16",
-            vec![8, 32],
-            half.clone(),
-        ));
-        skel.push((
-            "audio_encoder.layers.0.fc1.weight".into(),
-            "BF16",
-            vec![8, 32],
-            half.clone(),
-        ));
-        skel.push((
-            "speech_embeddings.0.weight".into(),
-            "BF16",
-            vec![8, 32],
-            half,
-        ));
+        let mut config = tiny_config();
+        if towers {
+            let (main, tok, _) = crate::mimo_towers::tests::tower_fixture_tensors();
+            skel.extend(main);
+            crate::mimo_towers::tests::write_audio_tokenizer(&dir, &tok);
+            let (tcfg, _) = crate::mimo_towers::tests::tiny_configs();
+            for (k, v) in tcfg.as_object().unwrap() {
+                if config.get(k).is_none() {
+                    config[k] = v.clone();
+                }
+            }
+        } else {
+            skel.push((
+                "visual.blocks.0.attn.qkv.weight".into(),
+                "BF16",
+                vec![8, 32],
+                half.clone(),
+            ));
+            skel.push((
+                "audio_encoder.layers.0.fc1.weight".into(),
+                "BF16",
+                vec![8, 32],
+                half.clone(),
+            ));
+            skel.push((
+                "speech_embeddings.0.weight".into(),
+                "BF16",
+                vec![8, 32],
+                half,
+            ));
+        }
 
         let shards = [
             ("model_pp0_ep0_shard0.safetensors", skel),
@@ -10459,7 +10612,7 @@ mod mimo_v2_tests {
             serde_json::json!({"weight_map": weight_map}).to_string(),
         )
         .unwrap();
-        fs::write(dir.join("config.json"), tiny_config().to_string()).unwrap();
+        fs::write(dir.join("config.json"), config.to_string()).unwrap();
         fs::write(
             dir.join("generation_config.json"),
             r#"{"bos_token_id": 0, "eos_token_id": [0, 3, 5]}"#,
@@ -10617,6 +10770,86 @@ mod mimo_v2_tests {
             vec![4 * VD, H]
         );
         assert!(auto.tensor("model.layers.0.self_attn.sinks").is_none());
+        let _ = fs::remove_dir_all(&fx.dir);
+    }
+
+    #[test]
+    fn mimo_v2_multimodal_single_file_carries_the_towers() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_convert_env();
+        set_tensor_quant_overrides(&[]).unwrap();
+        let fx = write_fixture_towers("mmfull", true);
+        let full = fx.dir.join("full.cmf");
+        let text = fx.dir.join("text.cmf");
+        run_convert_multi_towers(
+            fx.dir.to_str().unwrap(),
+            &[(AUTO_QUANT.into(), full.to_str().unwrap().into())],
+            None,
+            None,
+            None,
+            false,
+            MimoTowers::Multimodal,
+            |_| {},
+        )
+        .unwrap();
+        // The same checkpoint in text mode: no tower, blob or tokenizer tensor.
+        run_convert(
+            fx.dir.to_str().unwrap(),
+            AUTO_QUANT,
+            text.to_str().unwrap(),
+            None,
+            None,
+            None,
+            false,
+            |_| {},
+        )
+        .unwrap();
+        let text = CmfModel::open(&text).unwrap();
+        let mut text_names: Vec<&str> = text.tensors.iter().map(|t| t.name.as_str()).collect();
+        text_names.sort();
+        let mut want_text: Vec<&str> = fx.want.keys().map(|s| s.as_str()).collect();
+        want_text.sort();
+        assert_eq!(text_names, want_text);
+
+        let full = std::sync::Arc::new(CmfModel::open(&full).unwrap());
+        assert!(full.verify().is_empty(), "{:?}", full.verify());
+        assert_eq!(full.arch().arch_name, "mimo_v2");
+        let (tcfg, tat) = crate::mimo_towers::tests::tiny_configs();
+        let inv = cortiq_engine::mimo_mm::mimo_tower_inventory(&tcfg, &tat).unwrap();
+        assert_eq!(full.tensors.len(), fx.want.len() + inv.len() + 2);
+        // Text tensors: byte-identical to the text-mode file.
+        for name in &want_text {
+            let (a, b) = (full.tensor(name).unwrap(), text.tensor(name).unwrap());
+            assert_eq!((a.dtype, &a.shape), (b.dtype, &b.shape), "{name}");
+            assert_eq!(
+                full.tensor_bytes(name).unwrap(),
+                text.tensor_bytes(name).unwrap(),
+                "{name}"
+            );
+        }
+        // Towers: the tower policy (q4tp matrices, not the text skeleton's
+        // q8_2f), and the engine accepts the file as-is.
+        let mm = cortiq_engine::mimo_mm::MimoMm::from_model(&full).unwrap();
+        assert_eq!(mm.source, cortiq_engine::mimo_mm::MimoMmSource::SingleFile);
+        assert_eq!(
+            mm.dtype("visual.blocks.0.attn.qkv.weight"),
+            Some(TensorDtype::Q4TiledP)
+        );
+        assert_eq!(
+            mm.dtype("audio_tokenizer.encoder.layers.1.fc1.weight"),
+            Some(TensorDtype::Q4TiledP)
+        );
+        assert_eq!(
+            mm.dtype("audio_tokenizer.encoder.quantizer.vq.layers.2._codebook.embed"),
+            Some(TensorDtype::F32)
+        );
+        assert_eq!(
+            mm.dtype("speech_embeddings.0.weight"),
+            Some(TensorDtype::Bf16)
+        );
+        let prov = &full.header.provenance.as_ref().unwrap()["mimo_mm"];
+        assert_eq!(prov["towers"], "multimodal");
+        assert_eq!(prov["codec"]["visual"]["matrices"], "q4tp");
         let _ = fs::remove_dir_all(&fx.dir);
     }
 
