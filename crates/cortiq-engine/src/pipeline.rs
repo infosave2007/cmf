@@ -5096,6 +5096,9 @@ impl Pipeline {
             || !crate::gpu::enabled_here()
             || self.attn_softcap > 0.0
             || self.attention_heads_per_layer.is_some()
+            // The block graph caches V as wide as K and feeds o_proj
+            // nh·head_dim; a narrow-V model keeps its MTP block per-op.
+            || self.v_head_dim.is_some()
         {
             return false;
         }
