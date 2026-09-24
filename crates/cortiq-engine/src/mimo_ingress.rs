@@ -305,6 +305,22 @@ fn inject_rows(
 mod tests {
     use super::*;
     #[test]
+    fn multipart_text_does_not_gain_newlines_or_fall_back() {
+        let mut tok = Tokenizer::byte_level();
+        tok.chat_template = Some("{% for m in messages %}{% if m.content is string %}{{ m.content }}{% else %}{% for p in m.content %}{{ p.text }}{% endfor %}{% endif %}{% endfor %}".into());
+        let messages = [json!({"role":"user", "content":[
+            {"type":"text", "text":"before"}, {"type":"text", "text":"after"}]})];
+        assert_eq!(
+            text_ids(&tok, &messages, None, None).unwrap(),
+            tok.encode("beforeafter")
+        );
+        tok.chat_template = Some("{{ raise_exception('bad template') }}".into());
+        assert!(text_ids(&tok, &messages, None, None).is_err());
+        tok.chat_template = None;
+        assert!(text_ids(&tok, &messages, None, None).is_err());
+    }
+
+    #[test]
     fn multipart_order_and_aliases_are_preserved() {
         let msgs = vec![
             json!({"role":"user","content":[{"type":"text","text":"before"},

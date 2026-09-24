@@ -1493,6 +1493,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mimo_content_blocks_reach_shared_ingress_without_flattening() {
+        let wire = serde_json::json!({"role":"user", "content":[
+            {"type":"text", "text":"before"},
+            {"type":"image_url", "image_url":{"url":"x.png"}},
+            {"type":"text", "text":"after"},
+            {"type":"input_audio", "input_audio":{"data":"AA==", "format":"wav"}},
+            {"type":"video", "video":{"path":"clip.y4m"}}]});
+        let msg: ChatMessage = serde_json::from_value(wire.clone()).unwrap();
+        let preserved = message_to_json(&msg);
+        assert_eq!(preserved["content"], wire["content"]);
+        assert!(cortiq_engine::mimo_ingress::has_media(&[preserved]).unwrap());
+    }
+
+    #[test]
     fn sampler_options_start_from_defaults_and_validate_ranges() {
         let opts = |temperature, top_p, seed| SamplerOptions {
             temperature,
