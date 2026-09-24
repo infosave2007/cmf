@@ -100,6 +100,7 @@ use super::{Ctx, WeightArena};
 
 const ZMSL: &str = include_str!("zimage_msl.metal");
 
+mod cpu;
 mod vae;
 
 /// `CMF_ZI_METAL=0` turns the device path off (the caller runs the CPU).
@@ -646,7 +647,7 @@ struct Rec<'a> {
     c: &'a Ctx,
     prof: bool,
     done: Vec<(&'static str, CommandBuffer)>,
-    cur: Option<(CommandBuffer, metal::ComputeCommandEncoder, &'static str)>,
+    cur: Option<(CommandBuffer, Option<metal::ComputeCommandEncoder>, &'static str)>,
 }
 
 impl<'a> Rec<'a> {
@@ -660,7 +661,9 @@ impl<'a> Rec<'a> {
     }
     fn close(&mut self) {
         if let Some((cmd, enc, label)) = self.cur.take() {
-            enc.end_encoding();
+            if let Some(e) = enc {
+                e.end_encoding();
+            }
             cmd.commit();
             self.done.push((label, cmd));
         }
@@ -672,10 +675,30 @@ impl<'a> Rec<'a> {
         }
         if self.cur.is_none() {
             let cmd = self.c.queue.new_command_buffer().to_owned();
-            let enc = cmd.new_compute_command_encoder().to_owned();
-            self.cur = Some((cmd, enc, label));
+            self.cur = Some((cmd, None, label));
         }
-        &self.cur.as_ref().unwrap().1
+        let cur = self.cur.as_mut().unwrap();
+        if cur.1.is_none() {
+            cur.1 = Some(cur.0.new_compute_command_encoder().to_owned());
+        }
+        cur.1.as_ref().unwrap()
+    }
+    /// Signal (`signal`) or wait for `v` on the shared event, between the
+    /// encoders of the current command buffer.
+    fn event(&mut self, ev: &metal::SharedEventRef, v: u64, signal: bool) {
+        if self.cur.is_none() {
+            let cmd = self.c.queue.new_command_buffer().to_owned();
+            self.cur = Some((cmd, None, "event"));
+        }
+        let cur = self.cur.as_mut().unwrap();
+        if let Some(e) = cur.1.take() {
+            e.end_encoding();
+        }
+        if signal {
+            cur.0.encode_signal_event(ev, v);
+        } else {
+            cur.0.encode_wait_for_event(ev, v);
+        }
     }
     /// Chunk boundary (normal mode only).
     fn cut(&mut self) {
@@ -717,6 +740,34 @@ impl<'a> Rec<'a> {
     }
 }
 
+/// The process-wide event of the CPU GEMM share and its monotone counter.
+struct ZEvent(metal::SharedEvent);
+unsafe impl Send for ZEvent {}
+unsafe impl Sync for ZEvent {}
+
+fn zevent(c: &Ctx) -> &'static metal::SharedEventRef {
+    static E: OnceLock<ZEvent> = OnceLock::new();
+    &E.get_or_init(|| ZEvent(c._device.new_shared_event())).0
+}
+
+/// GPU-only event: signaled after the GPU's part of every split GEMM (the
+/// controller's "who finished first").
+fn zevent2(c: &Ctx) -> &'static metal::SharedEventRef {
+    static E: OnceLock<ZEvent> = OnceLock::new();
+    &E.get_or_init(|| ZEvent(c._device.new_shared_event())).0
+}
+
+static ZEVENT_NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static ZEVENT2_NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// The CPU jobs of one step (M8, `cpu.rs`).
+struct CpuPlan {
+    frac: f64,
+    ev: &'static metal::SharedEventRef,
+    ev2: &'static metal::SharedEventRef,
+    jobs: Vec<cpu::CpuJob>,
+}
+
 fn prof_on() -> bool {
     std::env::var("CMF_ZI_METAL_PROF").as_deref() == Ok("1")
 }
@@ -733,6 +784,7 @@ struct Enc<'r, 'a> {
     p: &'static Pipes,
     d: &'r ZDev,
     amax: Option<(&'r Buffer, usize)>,
+    cpu: Option<CpuPlan>,
 }
 
 impl Enc<'_, '_> {
@@ -771,6 +823,50 @@ impl Enc<'_, '_> {
         let p = self.p;
         let mv = mm_var(p);
         let arena = self.d.arena.clone();
+        // M8: the last output features go to the CPU (large GEMMs only)
+        let rows = t0.rows;
+        let mut rg = rows;
+        if let Some(plan) = self.cpu.as_mut() {
+            if n >= 256 && plan.frac > 0.0 {
+                let r = ((rows as f64 * (1.0 - plan.frac)) / 64.0).round() as usize * 64;
+                rg = r.clamp(64, rows);
+            }
+            if rg < rows {
+                let v = ZEVENT_NEXT.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+                let base = self.d._model.primary_bytes().as_ptr();
+                let auxp = blk.aux.contents() as *const f32;
+                let mut job = cpu::CpuJob {
+                    ready: v,
+                    done: v + 1,
+                    gdone: ZEVENT2_NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    x: x.contents() as *const u16,
+                    x_off: [0; 3],
+                    ldx,
+                    w: [std::ptr::null(); 3],
+                    rs: [std::ptr::null(); 3],
+                    nz: ts.len(),
+                    k: t0.cols,
+                    r0: rg,
+                    r1: rows,
+                    n,
+                    mul,
+                    y: y.contents() as *mut u8,
+                    y_half: half_out,
+                    y_off: [0; 3],
+                    ldy,
+                };
+                for (z, &ti) in ts.iter().enumerate() {
+                    job.x_off[z] = x_off[z] + row0 * ldx;
+                    job.y_off[z] = y_off[z] + row0 * ldy;
+                    // SAFETY: offsets inside the mapped file / the aux buffer
+                    job.w[z] = unsafe { base.add(blk.t[ti].abs) } as *const i8;
+                    job.rs[z] = unsafe { auxp.add(blk.rs[ti]) };
+                }
+                let ev = plan.ev;
+                plan.jobs.push(job);
+                self.rec.event(ev, v, true);
+            }
+        }
         let enc = self.rec.enc("gemm");
         enc.set_compute_pipeline_state(&mv.pso);
         for s in 0..3 {
@@ -782,9 +878,18 @@ impl Enc<'_, '_> {
         enc.set_buffer(7, Some(y), 0);
         set_p(enc, 8, &pm);
         enc.dispatch_thread_groups(
-            MTLSize::new(n.div_ceil(mv.bt) as u64, (t0.rows / mv.bo) as u64, ts.len() as u64),
+            MTLSize::new(n.div_ceil(mv.bt) as u64, (rg / mv.bo) as u64, ts.len() as u64),
             MTLSize::new(mv.threads, 1, 1),
         );
+        if rg < rows {
+            let (ev, ev2, v, g) = {
+                let plan = self.cpu.as_ref().unwrap();
+                let j = plan.jobs.last().unwrap();
+                (plan.ev, plan.ev2, j.done, j.gdone)
+            };
+            self.rec.event(ev2, g, true);
+            self.rec.event(ev, v, false);
+        }
     }
 
     /// Row op over rows [row0, row0 + n).
@@ -1131,8 +1236,16 @@ pub(crate) fn step(a: &mut ZStepArgs) -> bool {
     let ac = &pr.acts;
     let emb = d.emb.as_ref().unwrap();
     let fin = d.fin.as_ref().unwrap();
+    let frac = cpu::frac(&c._device.name(), pr.acts.rows);
+    let mut jobs: Vec<cpu::CpuJob> = Vec::new();
     {
-        let mut e = Enc { rec: &mut rec, p, d, amax: None };
+        let mut e = Enc {
+            rec: &mut rec,
+            p,
+            d,
+            amax: None,
+            cpu: (frac > 0.0).then(|| CpuPlan { frac, ev: zevent(c), ev2: zevent2(c), jobs: Vec::new() }),
+        };
         // embed (every item's image rows)
         {
             let pe = PEm {
@@ -1232,8 +1345,17 @@ pub(crate) fn step(a: &mut ZStepArgs) -> bool {
             set_p(enc, 5, &pf);
             enc.dispatch_thread_groups(MTLSize::new(pr.n_img as u64, 1, 1), MTLSize::new(256, 1, 1));
         }
+        if let Some(plan) = e.cpu.take() {
+            jobs = plan.jobs;
+        }
     }
-    let ok = rec.finish();
+    let mut cpu_ok = true;
+    if !jobs.is_empty() {
+        rec.close();
+        let cmds: Vec<CommandBuffer> = rec.done.iter().map(|(_, c)| c.clone()).collect();
+        cpu_ok = cpu::execute(&jobs, zevent(c), zevent2(c), ac.rows, &cmds);
+    }
+    let ok = rec.finish() && cpu_ok;
     if std::env::var("CMF_ZIMAGE_PROF").is_ok_and(|v| v != "0") && !rec.prof {
         eprintln!(
             "zimage metal step: {:.3}s wall ({} rows, {} item(s))",
@@ -1322,7 +1444,7 @@ pub(crate) fn refine_caption(
     }];
     let mut rec = Rec::new(c);
     {
-        let mut e = Enc { rec: &mut rec, p, d, amax: None };
+        let mut e = Enc { rec: &mut rec, p, d, amax: None, cpu: None };
         let nbk = d.ctx_blocks.len();
         e.rowop(&acts, 0, n, None, Some((&d.ctx_blocks[0], 0, None, &[TQ, TK, TV], p2(-d.guards.attn))));
         for bi in 0..nbk {
