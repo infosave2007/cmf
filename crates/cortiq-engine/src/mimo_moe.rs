@@ -131,21 +131,35 @@ pub struct Costs {
 
 impl Costs {
     /// RTX PRO 6000 Blackwell (96 GB, Vulkan) + EPYC 9655 in a 24-core
-    /// cgroup. See `docs` in the commit that set them for the runs.
+    /// cgroup, MiMo-V2.6-Flash q4tp (runs of 2026-09-24):
+    /// - `dyn_layer_s`: a bank-served layer measured 0.9–1.0 ms of host
+    ///   walk per layer at ~100 % hits with the generic frame (QKV submit
+    ///   0.22 ms, O 0.14 ms, frame 0.43 ms, attention core 0.06 ms); the
+    ///   dedicated bank kernels take ~0.2 ms off the frame. The device's
+    ///   own bytes are charged separately at `dev_bytes_per_s`.
+    /// - `hit_curve`: per-layer LRU hit rate after a 64-token warm-up,
+    ///   replayed from a 446-token CMF_MOE_TRACE of docs/ppl_nat.txt
+    ///   (tools/moe_lru_sim.py).
+    /// - `cpu_bytes_per_s`: q4tp/q8_2f streaming of the host walk with the
+    ///   22-thread pool.
     pub fn measured() -> Self {
         Self {
             dev_bytes_per_s: 1.2e12,
-            cpu_bytes_per_s: 90e9,
-            dyn_layer_s: 0.45e-3,
+            cpu_bytes_per_s: 60e9,
+            dyn_layer_s: 0.6e-3,
             graph_submit_s: 0.3e-3,
             cpu_layer_s: 0.1e-3,
-            fill_bytes_per_s: 10e9,
+            fill_bytes_per_s: 20e9,
             hit_curve: vec![
-                (8.0, 0.35),
-                (32.0, 0.62),
-                (64.0, 0.78),
-                (128.0, 0.9),
-                (192.0, 0.95),
+                (8.0, 0.341),
+                (16.0, 0.460),
+                (32.0, 0.603),
+                (64.0, 0.777),
+                (96.0, 0.875),
+                (128.0, 0.930),
+                (160.0, 0.959),
+                (192.0, 0.972),
+                (224.0, 0.975),
                 (256.0, 1.0),
             ],
         }
@@ -413,6 +427,9 @@ pub(crate) struct Bank {
     /// Fills queued so far (the profile's "fills").
     admitted: u64,
     max_pending: usize,
+    /// Queue bound while priming from a prompt (fills are cheap to queue;
+    /// the filler drains them during the rest of the prefill).
+    prime_queue: usize,
     min_seen: u16,
     decay_tokens: u64,
     tx: Option<std::sync::mpsc::Sender<(u32, (usize, usize, usize))>>,
@@ -477,6 +494,7 @@ impl Bank {
             pending: 0,
             admitted: 0,
             max_pending: env("CMF_MIMO_FILL_QUEUE").unwrap_or(256) as usize,
+            prime_queue: env("CMF_MIMO_PRIME_QUEUE").unwrap_or(4096) as usize,
             min_seen: env("CMF_MIMO_FETCH_MIN_SEEN").unwrap_or(2) as u16,
             decay_tokens: env("CMF_MIMO_SEEN_DECAY").unwrap_or(16).max(1),
             tx: Some(tx),
@@ -564,17 +582,9 @@ impl Bank {
         self.drain();
         let base = layer.checked_mul(self.n_experts)?;
         let mut remap = vec![NONE; self.n_experts];
-        let tok32 = (self.tok / self.decay_tokens).min(u32::MAX as u64) as u32;
         for &e in picks {
             let key = base + *(e < self.n_experts).then_some(&e)?;
-            let shift = tok32.saturating_sub(self.seen_tok[key]);
-            self.seen[key] = if shift >= 16 {
-                0
-            } else {
-                self.seen[key] >> shift
-            };
-            self.seen_tok[key] = tok32;
-            self.seen[key] = self.seen[key].saturating_add(1);
+            self.see(key, 1);
             let slot = self.slot_for[key];
             if slot < PENDING {
                 remap[e] = slot;
@@ -582,36 +592,87 @@ impl Bank {
             }
         }
         for &e in picks {
-            let key = base + e;
-            if self.slot_for[key] != NONE || self.pending >= self.max_pending {
-                continue;
-            }
-            if self.free.is_empty() && self.seen[key] < self.min_seen {
-                continue;
-            }
-            let Some(slot) = self.victim(layer) else {
+            if !self.admit(layer, e, triples[e], self.max_pending)? {
                 break;
-            };
-            let old = self.owner[slot as usize];
-            if old != NONE {
-                self.slot_for[old as usize] = NONE;
-                let ol = old as usize / self.n_experts;
-                self.occupancy[ol] = self.occupancy[ol].saturating_sub(1);
-            }
-            self.owner[slot as usize] = key as u32;
-            self.slot_for[key] = PENDING;
-            self.occupancy[layer] += 1;
-            self.pending += 1;
-            self.admitted += 1;
-            let sent = self
-                .tx
-                .as_ref()
-                .is_some_and(|tx| tx.send((slot, triples[e])).is_ok());
-            if !sent {
-                return None;
             }
         }
         Some(remap)
+    }
+
+    /// Count `n` sightings of `key`, decaying older ones by half per
+    /// `decay_tokens` tokens.
+    fn see(&mut self, key: usize, n: u16) {
+        let tok32 = (self.tok / self.decay_tokens).min(u32::MAX as u64) as u32;
+        let shift = tok32.saturating_sub(self.seen_tok[key]);
+        self.seen[key] = if shift >= 16 {
+            0
+        } else {
+            self.seen[key] >> shift
+        };
+        self.seen_tok[key] = tok32;
+        self.seen[key] = self.seen[key].saturating_add(n);
+    }
+
+    /// Queue `(layer, e)` for a fill if the policy admits it. `Some(false)`
+    /// = no victim left (stop admitting this call), `None` = the filler is
+    /// gone.
+    fn admit(
+        &mut self,
+        layer: usize,
+        e: usize,
+        triple: (usize, usize, usize),
+        queue_cap: usize,
+    ) -> Option<bool> {
+        let key = layer * self.n_experts + e;
+        if self.slot_for[key] != NONE || self.pending >= queue_cap {
+            return Some(true);
+        }
+        if self.free.is_empty() && self.seen[key] < self.min_seen {
+            return Some(true);
+        }
+        let Some(slot) = self.victim(layer) else {
+            return Some(false);
+        };
+        let old = self.owner[slot as usize];
+        if old != NONE {
+            self.slot_for[old as usize] = NONE;
+            let ol = old as usize / self.n_experts;
+            self.occupancy[ol] = self.occupancy[ol].saturating_sub(1);
+        }
+        self.owner[slot as usize] = key as u32;
+        self.slot_for[key] = PENDING;
+        self.occupancy[layer] += 1;
+        self.pending += 1;
+        self.admitted += 1;
+        self.tx
+            .as_ref()
+            .is_some_and(|tx| tx.send((slot, triple)).is_ok())
+            .then_some(true)
+    }
+
+    /// A prompt's expert usage for `layer` (the host-computed prefill):
+    /// count it as sightings and queue the most used experts, so decode
+    /// starts on a bank the prompt already warmed. The fills run in the
+    /// background; nothing waits on them.
+    fn prime(&mut self, layer: usize, counts: &[u64], triples: &[(usize, usize, usize)]) {
+        self.drain();
+        let base = layer * self.n_experts;
+        let mut used: Vec<(usize, u64)> = counts
+            .iter()
+            .enumerate()
+            .filter(|&(e, &c)| c > 0 && e < self.n_experts && e < triples.len())
+            .map(|(e, &c)| (e, c))
+            .collect();
+        used.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        for &(e, c) in &used {
+            self.see(base + e, c.min(u16::MAX as u64) as u16);
+        }
+        for &(e, _) in &used {
+            match self.admit(layer, e, triples[e], self.prime_queue) {
+                Some(true) => {}
+                _ => break,
+            }
+        }
     }
 }
 
@@ -960,6 +1021,27 @@ impl Slot {
             prof: std::env::var_os("CMF_MIMO_PROF").is_some(),
             prof_mark: (std::time::Instant::now(), stats(), device_counters()),
         }))
+    }
+
+    /// After a host-computed prefill of bank layer `li`: `before` is the
+    /// layer's selection counters (`MoeFfn::stats`) from before the chunk;
+    /// the difference is the prompt's expert usage, which primes the bank.
+    pub(crate) fn prime(&mut self, li: usize, m: &MoeFfn, before: &[u64]) {
+        #[cfg(feature = "gpu")]
+        if let Self::On(d) = self
+            && !d.failed
+            && let Some(triples) = d.ids.get(li).filter(|t| !t.is_empty())
+            && std::env::var("CMF_MIMO_PRIME").as_deref() != Ok("0")
+        {
+            let now = m.stats.borrow();
+            let counts: Vec<u64> = (0..now.len())
+                .map(|e| now[e].saturating_sub(before.get(e).copied().unwrap_or(0)))
+                .collect();
+            drop(now);
+            d.bank.lock().unwrap().prime(li, &counts, triples);
+        }
+        #[cfg(not(feature = "gpu"))]
+        let _ = (li, m, before);
     }
 
     /// Run a routed MoE layer through the bank. `None` = not served (the
