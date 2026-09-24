@@ -405,6 +405,11 @@ pub fn last_decision() -> String {
 /// is full a miss must recur (`min_seen` sightings within the decay window)
 /// and evicts the least recently used slot of a layer holding more than its
 /// floor, never a slot the current token already used.
+///
+/// The threshold follows the bank size ([`default_min_seen`]): a fill is
+/// ~13 MB of PCIe traffic queued ahead of the next frame, a cold pick is
+/// the same bytes streamed by the host in parallel with the frame, so a
+/// fill pays only for an expert that stays long enough to be reused.
 #[cfg(feature = "gpu")]
 pub(crate) struct Bank {
     pub(crate) segment_slots: usize,
@@ -435,6 +440,16 @@ pub(crate) struct Bank {
     tx: Option<std::sync::mpsc::Sender<(u32, (usize, usize, usize))>>,
     done: Arc<std::sync::Mutex<Vec<(u32, bool)>>>,
     filler: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Recurrences a miss needs before a full bank admits it. Replaying the
+/// 446-token docs/ppl_nat.txt routing trace through this policy (after a
+/// 64-token warm-up): at 142 slots/layer `1` → 96.6 % hits with 12.8
+/// fills/token, `2` → 95.9 % with 6.4; at 64 slots `2` → 79.7 % / 17.1
+/// against `1` → 77.9 % / 82.9; at 13 slots `3` → 41.8 % / 66.5 against
+/// `2` → 39.7 % / 137. Small banks churn: demand more evidence there.
+pub fn default_min_seen(slots_per_layer: usize) -> u64 {
+    if slots_per_layer >= 48 { 2 } else { 3 }
 }
 
 #[cfg(feature = "gpu")]
@@ -495,7 +510,9 @@ impl Bank {
             admitted: 0,
             max_pending: env("CMF_MIMO_FILL_QUEUE").unwrap_or(256) as usize,
             prime_queue: env("CMF_MIMO_PRIME_QUEUE").unwrap_or(4096) as usize,
-            min_seen: env("CMF_MIMO_FETCH_MIN_SEEN").unwrap_or(2) as u16,
+            min_seen: env("CMF_MIMO_FETCH_MIN_SEEN").unwrap_or(default_min_seen(
+                capacity / moe_layers.max(1),
+            )) as u16,
             decay_tokens: env("CMF_MIMO_SEEN_DECAY").unwrap_or(16).max(1),
             tx: Some(tx),
             done,
