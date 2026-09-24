@@ -444,13 +444,21 @@ pub fn generate_images(
         }
         _ => false,
     };
+    let mut on_device = pair_dev;
     if dev && (cfg_at.iter().any(|&c| !c) || (do_cfg && !pair_dev)) {
-        dit.attach_device(&mut prep, mods_all);
+        on_device |= dit.attach_device(&mut prep, mods_all);
     }
     if let Some(np) = nprep.as_mut() {
         if dev && !pair_dev {
-            dit.attach_device(np, mods_all);
+            on_device |= dit.attach_device(np, mods_all);
         }
+    }
+    if dev && !on_device {
+        // the device module says why (once); this is the consequence
+        eprintln!(
+            "zimage: the DiT runs on the CPU — expect minutes per image; \
+             CMF_ZIMAGE_PROF=1 prints the stages"
+        );
     }
     tm.prepare = t0.elapsed().as_secs_f64();
     if prof_on() {
@@ -562,6 +570,13 @@ pub fn generate_images(
         let _stage = crate::gpu::image_stage_scope();
         let vae = vae_warm.join().map_err(|_| "VAE loader panicked".to_string())??;
         for (img, lat) in latents.iter().enumerate() {
+            if lat.iter().any(|v| !v.is_finite()) {
+                return Err(format!(
+                    "image {img}: the final latent is not finite (an f16 overflow on the \
+                     device path, or a corrupt file); rerun with CMF_ZIMAGE_GPU=0 to \
+                     use the CPU DiT"
+                ));
+            }
             let rgb = vae.decode_fast(lat, lh, lw);
             let (h, w) = (p.height, p.width);
             let plane = h * w;

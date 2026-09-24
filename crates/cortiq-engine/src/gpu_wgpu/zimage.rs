@@ -220,6 +220,51 @@ fn zi_enabled() -> bool {
     std::env::var("CMF_ZI_WGPU").as_deref() != Ok("0")
 }
 
+/// Rows a single dispatch may address: the row kernels, the embed and the
+/// final layer index the grid by `workgroup_id.x` and are compiled without
+/// bounds checks, so a sequence past this limit would read and write past
+/// its buffers. Every size the models are made for is far below it (1024²
+/// with CFG is 8,448 rows); the host path takes the rest.
+const MAX_ROWS: usize = 65_535;
+
+/// Says why the device path declined, once per reason per process, so a
+/// user does not silently get the CPU DiT (minutes a step).
+fn decline(reason: &str) -> bool {
+    static SAID: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    if let Ok(mut v) = SAID.lock() {
+        if !v.iter().any(|r| r == reason) {
+            eprintln!("zimage: device path declined: {reason}; the DiT runs on the CPU");
+            v.push(reason.to_string());
+        }
+    }
+    false
+}
+
+/// Bytes the resident f16 planes of `nblk` blocks take (q/k/v/o + w1/w3/w2).
+fn plane_bytes(d: &ZDims, nblk: usize) -> u64 {
+    (nblk as u64) * 2 * (4 * (d.h as u64) * (d.h as u64) + 3 * (d.h as u64) * (d.inter as u64))
+}
+
+/// The planes of the step blocks plus the context refiner, and a fixed
+/// allowance for the activations and the resident VAE, against the
+/// adapter's budget (0 = unknown: proceed). Checked before the first
+/// allocation: wgpu's out-of-memory error would otherwise panic the thread.
+fn fits_budget(d: &ZDims, nblk_step: usize, nblk_refiner: usize) -> bool {
+    let budget = super::device_vram_budget();
+    if budget == 0 {
+        return true;
+    }
+    let need = plane_bytes(d, nblk_step + nblk_refiner) + (1u64 << 30);
+    if need > budget {
+        return decline(&format!(
+            "the f16 weight planes need about {:.1} GB and the adapter's budget is {:.1} GB",
+            need as f64 / 1e9,
+            budget as f64 / 1e9
+        ));
+    }
+    true
+}
+
 /// Build/refresh the per-(prompt, resolution) state for `a.key` (batch 1,
 /// the contract's shape). Planes are built once per model: every codec
 /// `ZBlockDev::from_model` knows is expanded to f16 (11.6 GB for Turbo).
@@ -251,6 +296,18 @@ pub(crate) fn prepare(a: &ZPrepareArgs) -> bool {
         return false;
     }
     if zctx().is_none() {
+        return false;
+    }
+    // the largest dispatch of this program: image rows and joint rows,
+    // both items of a CFG pair stacked
+    let rows = match &a.neg {
+        None => n_img_p.max(s_len),
+        Some(ng) => (2 * n_img_p).max(s_len + n_img_p + ng.n_cap_p),
+    };
+    if rows > MAX_ROWS {
+        return decline(&format!("{rows} rows exceed the device path's limit of {MAX_ROWS}"));
+    }
+    if !fits_budget(&d, a.noise_refiner.len() + a.layers.len(), 2) {
         return false;
     }
     let Ok(mut g) = ZSTATE.lock() else { return false };
@@ -358,6 +415,9 @@ pub(crate) fn preload(model: &Arc<CmfModel>, geom: &ZGeom, nr: &[ZBlockRef], lay
     }
     let Some(d) = ZDims::from_geom(geom) else { return false };
     if zctx().is_none() {
+        return false;
+    }
+    if !fits_budget(&d, nr.len() + layers.len(), cr.len()) {
         return false;
     }
     {
