@@ -67,6 +67,8 @@ fn tiny_arch() -> ModelArch {
         logit_multiplier: None,
         loop_final_norm: false,
         prism_hadamard: None,
+        kv_heads_per_layer: None,
+        v_head_dim: None,
     }
 }
 
@@ -118,6 +120,38 @@ fn bounded_writer_keeps_raw_u8_auxiliary_bytes_and_shape() {
     assert_eq!(entry.hash, hash64(&bytes));
     assert!(model.verify().is_empty());
     drop(model);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn kv_geometry_fields_survive_a_file_round_trip() {
+    let dir = std::env::temp_dir().join(format!(
+        "cmf-kv-geometry-test-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let bytes = [1u8, 2, 3, 4];
+    for (name, kv, vdim) in [
+        ("absent.cmf", None, None),
+        ("present.cmf", Some(vec![1usize, 2]), Some(3usize)),
+    ] {
+        let path = dir.join(name);
+        let mut header = tiny_header();
+        header.arch.kv_heads_per_layer = kv.clone();
+        header.arch.v_head_dim = vdim;
+        let gap = CmfStreamWriter::head_reserve_for(1, 48);
+        let mut writer = CmfStreamWriter::new(&path, gap).unwrap();
+        writer
+            .push_bounded("aux.bytes", TensorDtype::U8, &[4], &bytes, 3)
+            .unwrap();
+        writer.finish(&header, None, None).unwrap();
+
+        let model = CmfModel::open(&path).unwrap();
+        assert_eq!(model.arch().kv_heads_per_layer, kv, "{name}");
+        assert_eq!(model.arch().v_head_dim, vdim, "{name}");
+        assert!(model.verify().is_empty(), "{name}");
+    }
     std::fs::remove_dir_all(dir).unwrap();
 }
 
