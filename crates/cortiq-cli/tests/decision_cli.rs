@@ -410,6 +410,11 @@ struct MockOracle {
 }
 
 fn read_request(s: &mut TcpStream) -> Option<Vec<u8>> {
+    read_request_parts(s).map(|(_, body)| body)
+}
+
+/// One HTTP/1.1 request: (head as sent, body by `Content-Length`).
+fn read_request_parts(s: &mut TcpStream) -> Option<(String, Vec<u8>)> {
     s.set_read_timeout(Some(Duration::from_secs(10))).ok()?;
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
@@ -423,8 +428,9 @@ fn read_request(s: &mut TcpStream) -> Option<Vec<u8>> {
         }
         buf.extend_from_slice(&chunk[..n]);
     };
-    let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+    let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
     let len: usize = head
+        .to_ascii_lowercase()
         .lines()
         .find_map(|l| l.strip_prefix("content-length:"))
         .and_then(|v| v.trim().parse().ok())
@@ -437,7 +443,7 @@ fn read_request(s: &mut TcpStream) -> Option<Vec<u8>> {
         }
         body.extend_from_slice(&chunk[..n]);
     }
-    Some(body)
+    Some((head, body))
 }
 
 /// An OpenRouter chat completion answering every choice with `label` when it
@@ -1509,11 +1515,16 @@ fn keys_create_list_revoke_import_and_a_keyed_server() {
     );
 }
 
-/// Wait for the start of a minute when fewer than 15 s of this one are left
-/// (the rate window is a fixed minute).
+/// A request the mock received: (head as sent, body).
+type SeenRequest = (String, Vec<u8>);
+
 /// A mock of the old router (`cortiq-router`): every request answered with
-/// `body` (and `X-Old-Router: yes`), request bodies recorded.
-fn old_router_mock(body: Vec<u8>) -> (SocketAddr, Arc<Mutex<Vec<Vec<u8>>>>) {
+/// `body` (and `X-Old-Router: yes`), requests recorded as they came; one whose
+/// head starts with `slow.0` is answered only after `slow.1`.
+fn old_router_mock(
+    body: Vec<u8>,
+    slow: Option<(&'static str, Duration)>,
+) -> (SocketAddr, Arc<Mutex<Vec<SeenRequest>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -1521,10 +1532,15 @@ fn old_router_mock(body: Vec<u8>) -> (SocketAddr, Arc<Mutex<Vec<Vec<u8>>>>) {
     std::thread::spawn(move || {
         for conn in listener.incoming() {
             let Ok(mut s) = conn else { continue };
-            let Some(b) = read_request(&mut s) else {
+            let Some((head, b)) = read_request_parts(&mut s) else {
                 continue;
             };
-            seen2.lock().unwrap().push(b);
+            if let Some((prefix, wait)) = slow
+                && head.starts_with(prefix)
+            {
+                std::thread::sleep(wait);
+            }
+            seen2.lock().unwrap().push((head, b));
             let head = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Old-Router: yes\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
@@ -1547,7 +1563,7 @@ fn serve_shadow_of_answers_with_the_old_router_and_compares_locally() {
         "decision": {"task_label": "billing", "taxonomy_id": "topics", "confident": true}
     }))
     .unwrap();
-    let (old_addr, seen) = old_router_mock(old_body.clone());
+    let (old_addr, seen) = old_router_mock(old_body.clone(), None);
     let old_url = format!("http://{old_addr}");
 
     // A plain-http router elsewhere than loopback is refused up front.
@@ -1612,7 +1628,13 @@ fn serve_shadow_of_answers_with_the_old_router_and_compares_locally() {
     let mut got = Vec::new();
     resp.into_reader().read_to_end(&mut got).unwrap();
     assert_eq!(got, old_body, "the old router's bytes");
-    assert_eq!(seen.lock().unwrap().as_slice(), [req.clone().into_bytes()]);
+    let bodies: Vec<Vec<u8>> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, b)| b.clone())
+        .collect();
+    assert_eq!(bodies, [req.clone().into_bytes()]);
     let t0 = Instant::now();
     let stats = loop {
         let v: Value = agent
@@ -1656,6 +1678,138 @@ fn serve_shadow_of_answers_with_the_old_router_and_compares_locally() {
     assert_eq!(line["agree"], json!(choice == "billing"));
 }
 
+/// F1 item 4: with every debug target on (`RUST_LOG=debug,ureq=trace`), the
+/// client secrets a shadow server forwards to the old router — `Authorization`,
+/// `x-api-key`, `x-admin-token` — reach the old router and no log line; the
+/// deadline of a forwarded request comes from `--shadow-timeout-s`.
+#[test]
+fn serve_shadow_of_logs_no_forwarded_secret_at_debug_and_takes_its_deadline() {
+    let t = toy();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let old_body = br#"{"schema_version":"1.1","request_id":"req_old_dbg","decision":{"task_label":"billing","taxonomy_id":"topics","confident":true}}"#.to_vec();
+    // /v1/readyz is answered only after 8 s: past a 2 s deadline.
+    let (old_addr, seen) = old_router_mock(
+        old_body.clone(),
+        Some(("GET /v1/readyz", Duration::from_secs(8))),
+    );
+    let bearer = "cortiq_5ec2e75ec2e75ec2e75ec2e75ec2e75ec2e75ec2";
+    let xkey = "cortiq_a11ceb0ba11ceb0ba11ceb0ba11ceb0ba11ceb0b";
+    let fwd_admin = "forwarded-admin-token-DEBUG-SECRET-9f3e";
+    let own_admin = "own-admin-token-for-the-debug-test-5d1c";
+    let state = d.join("state");
+    let srv = Server::start(
+        &t.path,
+        &[
+            "--state",
+            s(&state),
+            "--shadow-of",
+            &format!("http://{old_addr}"),
+            "--shadow-timeout-s",
+            "2",
+        ],
+        &[
+            ("RUST_LOG", "debug,ureq=trace"),
+            ("CORTIQ_DECISION_ADMIN_TOKEN", own_admin),
+        ],
+        d,
+    );
+    let agent = ureq::AgentBuilder::new()
+        .max_idle_connections(0)
+        .timeout(Duration::from_secs(60))
+        .build();
+    let (text, _) = &t.topics.dev_rows[0];
+    let route = json!({"taxonomy_id": "topics", "input": {"text": text}}).to_string();
+    let r = agent
+        .post(&srv.url("/v1/route"))
+        .set("Content-Type", "application/json")
+        .set("Authorization", &format!("Bearer {bearer}"))
+        .set("x-api-key", xkey)
+        .send_string(&route)
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let r = agent
+        .get(&srv.url("/v1/taxonomies"))
+        .set("x-api-key", xkey)
+        .call()
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let r = agent
+        .post(&srv.url("/v1/admin/keys"))
+        .set("Content-Type", "application/json")
+        .set("x-admin-token", fwd_admin)
+        .send_string("{}")
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    // The deadline: the slow old answer gives 502 after about 2 s.
+    let t0 = Instant::now();
+    let slow = match agent.get(&srv.url("/v1/readyz")).call() {
+        Err(ureq::Error::Status(code, r)) => (code, r.into_json::<Value>().unwrap()),
+        other => panic!("expected 502, got {other:?}"),
+    };
+    let took = t0.elapsed();
+    assert_eq!(slow.0, 502, "{}", slow.1);
+    assert_eq!(slow.1["error"]["code"], "UPSTREAM_UNAVAILABLE");
+    assert!(
+        took >= Duration::from_millis(1500) && took < Duration::from_secs(7),
+        "a 2 s deadline took {took:?}"
+    );
+    // Wait for the comparison line of the route (the log is written after
+    // both sides are done).
+    let t0 = Instant::now();
+    loop {
+        let v: Value = agent
+            .get(&srv.url("/v1/admin/shadow"))
+            .set("x-admin-token", own_admin)
+            .call()
+            .unwrap()
+            .into_json()
+            .unwrap();
+        if v["lines"] == 1 {
+            break;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(60), "{v}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // The secrets did go out to the old router (so a header-printing log
+    // line would have shown them) ...
+    let heads: String = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(h, _)| h.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    for secret in [bearer, xkey, fwd_admin] {
+        assert!(heads.contains(secret), "{secret} not forwarded:\n{heads}");
+    }
+    let logs = srv.stop();
+    // ... debug logging was on ...
+    assert!(
+        logs.contains("DEBUG") && logs.contains("shadow mode: deadline of a forwarded request"),
+        "{logs}"
+    );
+    assert!(logs.contains("deadline 2 s per request"), "{logs}");
+    // ... and no byte of a secret (whole or a 12-character piece) is in stdout
+    // or stderr, nor the header names' values of ureq's request prelude.
+    for secret in [bearer, xkey, fwd_admin, own_admin] {
+        for i in 0..=secret.len() - 12 {
+            let piece = &secret[i..i + 12];
+            assert!(
+                !logs.contains(piece),
+                "'{piece}' of a secret in the logs:\n{logs}"
+            );
+        }
+    }
+    let lower = logs.to_ascii_lowercase();
+    assert!(!lower.contains("writing prelude"), "{logs}");
+    for name in ["authorization:", "x-api-key:", "x-admin-token:"] {
+        assert!(!lower.contains(name), "{name} in the logs:\n{logs}");
+    }
+}
+
+/// Wait for the start of a minute when fewer than 15 s of this one are left
+/// (the rate window is a fixed minute).
 fn fresh_minute() {
     let now = || {
         std::time::SystemTime::now()
@@ -1682,6 +1836,124 @@ fn sha256_dir(dir: &Path) -> Vec<(String, String)> {
         .collect();
     out.sort();
     out
+}
+
+/// F1 items 1 and 2: imported router keys may escalate to the oracle unless
+/// `--oracle-allowed=false`; an explicit value also reaches keys imported
+/// before, a plain re-import leaves them; accounts outside [A-Za-z0-9_.@-]
+/// import and are shown escaped in the summary.
+#[test]
+fn keys_import_oracle_allowed_flag_and_router_accounts() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let st = d.join("state");
+    let sha = |k: &str| format!("{:x}", Sha256::digest(k.as_bytes()));
+    let export = write(
+        d,
+        "api_keys.jsonl",
+        &[
+            json!({"key_hash": sha("cortiq_f1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                   "account": "client+tag@example.com", "plan": "pro"}),
+            json!({"key_hash": sha("cortiq_f1bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                   "account": "Иван\tПетров", "label": "метка".repeat(51)}),
+        ]
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n"),
+    );
+    let import = |extra: &[&str]| {
+        let mut a = vec![
+            "decision",
+            "keys",
+            "import",
+            "--state",
+            s(&st),
+            "--from",
+            s(&export),
+        ];
+        a.extend_from_slice(extra);
+        ok(&a)
+    };
+    let oracle = || -> Vec<bool> {
+        let v: Value =
+            serde_json::from_str(&std::fs::read_to_string(st.join("keys.json")).unwrap()).unwrap();
+        v["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|k| k["oracle_allowed"].as_bool().unwrap())
+            .collect()
+    };
+    let r = import(&["--oracle-allowed=false"]);
+    assert!(r.contains("2 read; 2 imported (2 active"), "{r}");
+    assert!(
+        r.contains("accounts of the new keys: client+tag@example.com, Иван\\tПетров"),
+        "{r}"
+    );
+    assert!(r.contains("oracle escalation not allowed"), "{r}");
+    assert_eq!(oracle(), [false, false]);
+    // A plain re-import does not flip them back.
+    let r = import(&[]);
+    assert!(
+        r.contains("2 unchanged") && r.contains("keys.json unchanged"),
+        "{r}"
+    );
+    assert_eq!(oracle(), [false, false]);
+    // An explicit --oracle-allowed (true) reaches the keys imported before.
+    let r = import(&["--oracle-allowed"]);
+    assert!(
+        r.contains("2 keys imported before: oracle escalation allowed"),
+        "{r}"
+    );
+    assert_eq!(oracle(), [true, true]);
+    let j = json_of(&import(&["--oracle-allowed=true", "--json"]));
+    assert_eq!(
+        (&j["keys"]["oracle_allowed"], &j["keys"]["oracle_updated"]),
+        (&json!(true), &json!(0))
+    );
+    // A fresh state: the router's default, allowed.
+    let st2 = d.join("state2");
+    let r = ok(&[
+        "decision",
+        "keys",
+        "import",
+        "--state",
+        s(&st2),
+        "--from",
+        s(&export),
+    ]);
+    assert!(
+        r.contains("new keys: oracle escalation allowed, as in cortiq-router"),
+        "{r}"
+    );
+    // The flag needs --from and a boolean.
+    fails(&[
+        "decision",
+        "keys",
+        "import",
+        "--state",
+        s(&st2),
+        "--from",
+        s(&export),
+        "--oracle-allowed=maybe",
+    ]);
+    fails(&[
+        "decision",
+        "keys",
+        "import",
+        "--state",
+        s(&st2),
+        "--usage",
+        s(&export),
+        "--oracle-allowed=false",
+    ]);
+    // `keys list` shows the key as it is; control characters escaped.
+    let list = ok(&["decision", "keys", "list", "--state", s(&st2)]);
+    assert!(
+        list.contains("Иван\\tПетров") && !list.contains("Иван\tПетров"),
+        "{list}"
+    );
 }
 
 /// Spec decision-v4 §4.15, package C2: keys of the production router (a
@@ -1817,6 +2089,10 @@ duration_days = 30
         r.contains("1 emails not stored") && r.contains("written"),
         "{r}"
     );
+    assert!(
+        r.contains("new keys: oracle escalation allowed, as in cortiq-router"),
+        "{r}"
+    );
     let r = import(&[
         "--from",
         s(&config),
@@ -1874,6 +2150,8 @@ duration_days = 30
     for k in v["keys"].as_array().unwrap() {
         let h = k["hash"].as_str().unwrap();
         assert!(h.len() == 64 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+        // Every router key escalated in the router: so it may here.
+        assert_eq!(k["oracle_allowed"], true, "{k}");
     }
 
     // A second import of both changes nothing: same bytes, same ledger.

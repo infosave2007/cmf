@@ -408,6 +408,97 @@ fn cold_start_turns_an_oracle_label_into_a_task_after_25_answers() {
     assert_eq!(d.response["cmf"]["questions"]["task"]["match"], "subset");
 }
 
+mod capture {
+    //! A thread-local tracing subscriber that keeps every event (message and
+    //! fields) as text.
+    use std::fmt::Write as _;
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Subscriber};
+
+    struct V<'a>(&'a mut String);
+    impl Visit for V<'_> {
+        fn record_debug(&mut self, f: &Field, v: &dyn std::fmt::Debug) {
+            let _ = write!(self.0, "{}={:?} ", f.name(), v);
+        }
+    }
+
+    #[derive(Clone, Default)]
+    pub struct Capture(pub Arc<Mutex<String>>);
+    impl Subscriber for Capture {
+        fn enabled(&self, _: &Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, a: &Attributes<'_>) -> Id {
+            a.record(&mut V(&mut self.0.lock().unwrap()));
+            Id::from_u64(1)
+        }
+        fn record(&self, _: &Id, r: &Record<'_>) {
+            r.record(&mut V(&mut self.0.lock().unwrap()));
+        }
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+        fn event(&self, e: &Event<'_>) {
+            let mut log = self.0.lock().unwrap();
+            let _ = write!(log, "\n[{}] ", e.metadata().level());
+            e.record(&mut V(&mut log));
+        }
+        fn enter(&self, _: &Id) {}
+        fn exit(&self, _: &Id) {}
+    }
+}
+
+/// F1 item 7 (spec §4.3: logs carry id, status, latency, account): a label
+/// taught by client feedback — here a cold start through the router API's
+/// feedback, which accepts any label — is never printed by the learning log
+/// lines; they name its hash (`label_sha`) and task index instead.
+#[test]
+fn learning_log_lines_never_print_a_feedback_label() {
+    const MARK: &str = "private-client-label-9b1e";
+    let mock = MockOracle::answering("travel");
+    let st = Stand::new(&stand_config(&mock.url()));
+    let mut p = Principal::open();
+    p.oracle_allowed = false;
+    let log = capture::Capture::default();
+    let last = tracing::subscriber::with_default(log.clone(), || {
+        let mut last = Value::Null;
+        for t in lesson() {
+            let d = st.decide_as(&topics_body(t), &p).unwrap();
+            let fb = cortiq_decision::protocol::FeedbackRequest {
+                id: d.id.clone(),
+                question: "task".into(),
+                label: MARK.into(),
+                any_label: true,
+            };
+            last = st.svc.feedback_request(&fb, &p).unwrap();
+        }
+        last
+    });
+    assert_eq!(mock.hits(), 0, "no oracle for this principal");
+    assert_eq!(last["cold_start"], true, "{last}");
+    assert_eq!(last["learning"]["outcome"], "promoted", "{last}");
+    let tag = learn::label_tag(MARK);
+    assert_eq!(tag, sha256_hex(MARK.as_bytes())[..12]);
+    let text = log.0.lock().unwrap().clone();
+    let promoted = text
+        .lines()
+        .find(|l| l.contains("promoted"))
+        .unwrap_or_else(|| panic!("no promotion line:\n{text}"));
+    assert!(
+        promoted.contains(&format!("label_sha={tag}")) && promoted.contains("task=4"),
+        "{promoted}"
+    );
+    assert!(
+        !text.contains(MARK),
+        "a feedback label in the logs:\n{text}"
+    );
+    // Error texts name a label in quotes: redacted the same way.
+    assert_eq!(
+        learn::redact_label(&format!("fit of '{MARK}': rank 0"), MARK),
+        format!("fit of label#{tag}: rank 0")
+    );
+}
+
 /// Two labels of one skill promoted one after the other in the same process
 /// (no restart, no rollback in between): a refit of `travel`, then a cold start
 /// of `cuisine` on top of it (generation 2, parent 1).

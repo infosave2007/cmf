@@ -880,9 +880,12 @@ fn attempt_inner(ctx: &LearnContext<'_>, skill: &str, label: &str) -> Result<Att
     book.adopt_served(&ch, &served_skill);
     drop(books);
     ctx.handle.promote(next);
+    // A label may come from client feedback (a cold start): the line names
+    // its hash and task index only (spec §4.3).
     tracing::info!(
         skill,
-        label,
+        task = ch.task,
+        label_sha = %label_tag(label),
         generation = g,
         kind = ch.kind.as_str(),
         "promoted"
@@ -892,6 +895,24 @@ fn attempt_inner(ctx: &LearnContext<'_>, skill: &str, label: &str) -> Result<Att
         sha256,
     };
     Ok(report)
+}
+
+/// What a log line shows of a label: the first 12 hex characters of its
+/// SHA-256 (a label may be free text of a client's feedback, spec §4.3).
+pub fn label_tag(label: &str) -> String {
+    sha256_hex(label.as_bytes())[..12].to_string()
+}
+
+/// `text` with every `'{label}'` — the form in which this crate's messages
+/// name a label — replaced by `label#{tag}` ([`label_tag`]), for log lines.
+pub fn redact_label(text: &str, label: &str) -> String {
+    if label.is_empty() {
+        return text.to_string();
+    }
+    text.replace(
+        &format!("'{label}'"),
+        &format!("label#{}", label_tag(label)),
+    )
 }
 
 // ------------------------------------------------------------------ offline

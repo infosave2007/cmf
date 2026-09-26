@@ -104,9 +104,13 @@
 //! `api.rs:207-284`; §4.15: where a path is the router's, its format wins):
 //! `{"schema_version":"1.1","request_id":"req_…","error":{"code":"<CODE>","message":"…","retriable":bool,"details":null}}`;
 //! `details` is an object only for `TAXONOMY_NOT_FOUND` (`{"taxonomy_id"}`),
-//! like the router's. The router's own codes `TAXONOMY_NOT_FOUND` (404) and
-//! `EMBEDDING_REQUIRED` (400) appear only there. With `x-cmf-extensions: 1`
-//! the error also carries the decisions surface's `metadata` object.
+//! like the router's; `retriable` is true only for 429 and 500 (router
+//! `api.rs:221-225`); the messages of the rate window, the decision quota, a
+//! key that is not valid now (expired and revoked alike) and a disabled admin
+//! API are the router's texts. The router's own codes `TAXONOMY_NOT_FOUND`
+//! (404) and `EMBEDDING_REQUIRED` (400) appear only there. With
+//! `x-cmf-extensions: 1` the error also carries the decisions surface's
+//! `metadata` object (with this server's own message when it differs).
 //!
 //! A router body the router's axum extractors would reject is answered as
 //! they answer it, as `text/plain; charset=utf-8`: 415 ``Expected request with
@@ -162,11 +166,14 @@
 //!
 //! `POST /v1/feedback` with the router's `{request_id, correct_task_label}`
 //! corrects a route decision of the caller's own account (another account's is
-//! not found — the router let any key correct any request). Any label of 1..256
-//! bytes is taken, as in the router: a label the skill does not have starts a
-//! cold start (§5.8). The response is the router's `{schema_version, accepted,
-//! message}`. A body with the decisions API's keys (`id`, `question`, `label`)
-//! and none of the router's is decisions-API feedback (§5.11).
+//! not found — the router let any key correct any request). Any label is
+//! accepted, as in the router: a label of 1..256 bytes the skill does not have
+//! starts a cold start (§5.8); an empty or longer one is answered 200 and
+//! consumes the request but teaches nothing (it names no task). The response
+//! is the router's `{schema_version, accepted, message}`. A body with the
+//! decisions API's keys (`id`, `question`, `label`) and none of the router's
+//! is decisions-API feedback (§5.11). As in the router (axum 0.7.9), bytes
+//! after a router body's first JSON value are ignored.
 //!
 //! The listings are the router's: `/v1/taxonomies` `{schema_version,
 //! taxonomies:[{taxonomy_id, taxonomy_version, model_version, labels}]}`
@@ -208,7 +215,7 @@ use cortiq_decision::config::Config;
 use cortiq_decision::container::Verify;
 use cortiq_decision::eval::{f32_json, jev_confidence};
 use cortiq_decision::generation;
-use cortiq_decision::keys::{KeyStore, now_unix};
+use cortiq_decision::keys::{AuthFailure, KeyStore, now_unix};
 use cortiq_decision::ledger::{Actions, FLUSH_EVERY, Flusher, UsageLedger, UsageRecord};
 use cortiq_decision::matching::{MatchKind, SkillMatch};
 use cortiq_decision::metering::{Rates, Usd};
@@ -264,7 +271,9 @@ pub const ROUTER_MISSING_JSON_CONTENT_TYPE: &str =
     "Expected request with `Content-Type: application/json`";
 /// The router's 413 text (axum 0.7 `FailedToBufferBody::LengthLimitError`).
 pub const ROUTER_LENGTH_LIMIT: &str = "Failed to buffer the request body: length limit exceeded";
-/// Most bytes of a router feedback label (the decisions API's option ids).
+/// Most bytes of a router feedback label that can be learned (the decisions
+/// API's option ids); a longer or empty one is accepted, as by the router,
+/// but teaches nothing.
 pub const ROUTER_MAX_LABEL_BYTES: usize = cortiq_decision::protocol::MAX_LABEL_BYTES;
 /// Instructions of the router question of a skill without a rubric.
 pub const DEFAULT_ROUTE_INSTRUCTIONS: &str =
@@ -465,15 +474,21 @@ impl HttpError {
         self
     }
 
-    /// Worth retrying unchanged: 429, 500, 502.
+    /// Worth retrying unchanged on the decisions surface: 429, 500, 502.
     pub fn retriable(&self) -> bool {
         matches!(self.status, 429 | 500 | 502)
     }
 
-    fn metadata(&self, request_id: &str) -> Value {
+    /// The router's rule: only 429 and 500 are retriable (router
+    /// `api.rs:221-225`, `ApiError::new`).
+    pub fn router_retriable(&self) -> bool {
+        matches!(self.status, 429 | 500)
+    }
+
+    fn metadata(&self, request_id: &str, retriable: bool) -> Value {
         json!({
             "reason": self.code,
-            "retriable": self.retriable(),
+            "retriable": retriable,
             "request_id": request_id,
             "details": self.details_json(),
         })
@@ -485,28 +500,64 @@ impl HttpError {
             "error": {
                 "code": self.status,
                 "message": self.message,
-                "metadata": self.metadata(request_id),
+                "metadata": self.metadata(request_id, self.retriable()),
             }
         })
     }
 
+    /// The message of the router's envelope: the router's own text where it
+    /// has one for the same condition (router `api.rs:254-267`, `:346`,
+    /// `:413-417`) — the rate window, the decision quota, a key that is not
+    /// valid now (the router does not tell an expired or revoked key from an
+    /// unknown one) and a disabled admin API — else this server's message
+    /// (a token or credit quota, which the router does not have, among others).
+    pub fn router_message(&self) -> &str {
+        let detail = |k: &str| {
+            self.details
+                .as_deref()
+                .and_then(|d| d.get(k))
+                .and_then(Value::as_str)
+        };
+        match (self.status, self.code) {
+            (429, "RATE_LIMITED") => ROUTER_RATE_LIMITED_MESSAGE,
+            (402, "QUOTA_EXCEEDED") if detail("quota") == Some("decision") => {
+                ROUTER_QUOTA_EXCEEDED_MESSAGE
+            }
+            (401, "UNAUTHORIZED")
+                if self.message == AuthFailure::Expired.to_string()
+                    || self.message == AuthFailure::Revoked.to_string() =>
+            {
+                ROUTER_INVALID_KEY_MESSAGE
+            }
+            (404, "ADMIN_DISABLED") => ROUTER_ADMIN_DISABLED_MESSAGE,
+            _ => &self.message,
+        }
+    }
+
     /// The router's error envelope (router `api.rs:270-284`): `details` is
-    /// `null` except for `TAXONOMY_NOT_FOUND` (router `api.rs:226,242`);
-    /// `extensions` adds the decisions surface's `metadata`.
+    /// `null` except for `TAXONOMY_NOT_FOUND` (router `api.rs:226,242`), the
+    /// message and `retriable` are the router's ([`HttpError::router_message`],
+    /// [`HttpError::router_retriable`]); `extensions` adds the decisions
+    /// surface's `metadata` (this server's message in `metadata.message`).
     pub fn router_body(&self, request_id: &str, extensions: bool) -> Value {
         let details = if self.code == TAXONOMY_NOT_FOUND {
             self.details_json()
         } else {
             Value::Null
         };
+        let message = self.router_message();
         let mut error = json!({
             "code": self.code,
-            "message": self.message,
-            "retriable": self.retriable(),
+            "message": message,
+            "retriable": self.router_retriable(),
             "details": details,
         });
         if extensions {
-            error["metadata"] = self.metadata(request_id);
+            let mut m = self.metadata(request_id, self.router_retriable());
+            if message != self.message {
+                m["message"] = json!(self.message);
+            }
+            error["metadata"] = m;
         }
         json!({
             "schema_version": ROUTER_SCHEMA_VERSION,
@@ -523,6 +574,16 @@ fn internal_error(what: &str, e: impl std::fmt::Display) -> HttpError {
 
 /// The router's 404 code for an unknown `taxonomy_id`.
 pub const TAXONOMY_NOT_FOUND: &str = "TAXONOMY_NOT_FOUND";
+/// The router's 429 message (`api.rs:254-260`, `ApiError::rate_limited`).
+pub const ROUTER_RATE_LIMITED_MESSAGE: &str = "per-account rate limit exceeded";
+/// The router's 402 message (`api.rs:261-267`, `ApiError::quota_exceeded`).
+pub const ROUTER_QUOTA_EXCEEDED_MESSAGE: &str = "account decision quota exhausted";
+/// The router's 401 message for a key it does not accept (`api.rs:346`: an
+/// unknown, expired or revoked key alike).
+pub const ROUTER_INVALID_KEY_MESSAGE: &str = "invalid API key";
+/// The router's 404 `ADMIN_DISABLED` message (`api.rs:413-417`).
+pub const ROUTER_ADMIN_DISABLED_MESSAGE: &str =
+    "admin API is disabled (no auth.admin_token configured)";
 
 fn taxonomy_not_found(id: &str) -> HttpError {
     HttpError::new(
@@ -807,10 +868,21 @@ async fn router_body_bytes(
     })
 }
 
-/// Deserialize a router body as the router's axum `Json` does: 400 for bad
-/// JSON syntax, 422 for a body of the wrong shape, with axum's text.
+/// Deserialize a router body as the router's axum 0.7 `Json` does: 400 for
+/// bad JSON syntax, 422 for a body of the wrong shape, with axum's text; and,
+/// as axum 0.7.9 `Json::from_bytes` (router `Cargo.lock`), whatever follows
+/// the first JSON value is ignored — axum 0.8 refuses trailing characters, so
+/// only the first value is handed to it (its errors, positions included, are
+/// the same: 0.7.9 stops at the same byte).
 fn router_json<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, HttpError> {
-    axum::Json::<T>::from_bytes(bytes)
+    let mut first =
+        serde_json::Deserializer::from_slice(bytes).into_iter::<serde::de::IgnoredAny>();
+    let value = match first.next() {
+        Some(Ok(_)) => &bytes[..first.byte_offset()],
+        // No complete first value: the whole body gives axum's error.
+        _ => bytes,
+    };
+    axum::Json::<T>::from_bytes(value)
         .map(|j| j.0)
         .map_err(|r| HttpError::plain(r.status().as_u16(), r.body_text()))
 }
@@ -1377,10 +1449,12 @@ async fn context_middleware(mut req: Request, next: Next) -> Response {
         .and_then(|v| v.to_str().ok())
         .unwrap_or(&id)
         .to_string();
+    // An account is any text the router's column holds: control characters
+    // escaped, so that a line stays one line.
     let account = resp
         .extensions()
         .get::<AccountTag>()
-        .map_or_else(|| "-".to_string(), |a| a.0.clone());
+        .map_or_else(|| "-".to_string(), |a| cortiq_decision::keys::shown(&a.0));
     tracing::info!(
         id = %shown,
         status = resp.status().as_u16(),
@@ -2454,8 +2528,12 @@ async fn batch_handler(
 /// the router's `{request_id, correct_task_label}` and is rejected as the
 /// router rejects it.
 fn is_decisions_feedback(bytes: &[u8]) -> bool {
-    match serde_json::from_slice::<Value>(bytes) {
-        Ok(Value::Object(m)) => {
+    // The first JSON value, as `router_json` reads the router's body.
+    let first = serde_json::Deserializer::from_slice(bytes)
+        .into_iter::<Value>()
+        .next();
+    match first {
+        Some(Ok(Value::Object(m))) => {
             ["id", "question", "label"]
                 .iter()
                 .any(|k| m.contains_key(*k))
@@ -2500,13 +2578,10 @@ async fn feedback_handler(
             return Ok(Reply::ok(reply).by(&account));
         }
         let fb: wire::FeedbackRequest = router_json(&bytes).map_err(|e| e.by(&account))?;
-        let label_len = fb.correct_task_label.len();
-        if label_len == 0 || label_len > ROUTER_MAX_LABEL_BYTES {
-            return Err(HttpError::invalid(format!(
-                "correct_task_label must be 1..{ROUTER_MAX_LABEL_BYTES} bytes"
-            ))
-            .by(&account));
-        }
+        // Any label is accepted, as by the router (`api.rs:1261-1299`, no
+        // length check): an empty or over-long one (not 1..256 bytes) consumes
+        // the request and is answered 200, but teaches nothing (the cascade
+        // does not store it).
         let guard = st
             .svc
             .enter()
@@ -3004,7 +3079,8 @@ pub struct ServeOptions {
     /// answered by the router at `URL`, `/v1/route` and `/v1/route:batch` are
     /// also decided locally and compared in `<state>/shadow.jsonl`.
     pub shadow_of: Option<String>,
-    /// Deadline of one request forwarded in shadow mode.
+    /// Deadline of one request forwarded in shadow mode (`--shadow-timeout-s`;
+    /// default [`cortiq_decision::shadow::UPSTREAM_TIMEOUT`], 60 s).
     pub shadow_timeout: Duration,
 }
 
@@ -3145,6 +3221,10 @@ impl DecisionServer {
                     log = %dir.shadow_log_path().display(),
                     lines = sh.lines(),
                     "shadow mode: the router API is answered by the old router"
+                );
+                tracing::debug!(
+                    deadline_s = opts.shadow_timeout.as_secs_f64(),
+                    "shadow mode: deadline of a forwarded request"
                 );
                 Some(Arc::new(sh))
             }

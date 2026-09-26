@@ -68,6 +68,25 @@ const NOT_FORWARDED_RESPONSE_HEADERS: [&str; 10] = [
     "content-length",
 ];
 
+/// Log targets whose DEBUG and TRACE lines print request headers: ureq's
+/// `writing prelude` line (ureq 2 `unit.rs`) shows every header it sends but
+/// `Authorization` and `Cookie` — the `x-api-key` and `x-admin-token` a
+/// shadow server forwards (and the oracle client's request) in clear.
+pub const SECRET_BEARING_LOG_TARGETS: [&str; 1] = ["ureq"];
+
+/// Whether a log line of `target` at `level` may carry a forwarded secret
+/// ([`SECRET_BEARING_LOG_TARGETS`] above INFO): a subscriber drops it,
+/// whatever `RUST_LOG` enables (`cortiq serve` does).
+pub fn log_may_carry_secrets(target: &str, level: &tracing::Level) -> bool {
+    *level > tracing::Level::INFO
+        && SECRET_BEARING_LOG_TARGETS.iter().any(|t| {
+            target == *t
+                || target
+                    .strip_prefix(t)
+                    .is_some_and(|rest| rest.starts_with("::"))
+        })
+}
+
 /// Lowercase hex SHA-256 of a text (the only trace of a text in the log).
 pub fn text_sha256(text: &str) -> String {
     sha256_hex(text.as_bytes())
@@ -697,6 +716,20 @@ mod tests {
             new_latency_ms: new.map(|_| 2.0),
             old_status: Some(if old.is_some() { 200 } else { 500 }),
             new_error: None,
+        }
+    }
+
+    #[test]
+    fn ureq_debug_lines_are_secret_bearing() {
+        use tracing::Level;
+        for t in ["ureq", "ureq::unit", "ureq::pool", "ureq::stream"] {
+            assert!(log_may_carry_secrets(t, &Level::DEBUG), "{t}");
+            assert!(log_may_carry_secrets(t, &Level::TRACE), "{t}");
+            assert!(!log_may_carry_secrets(t, &Level::INFO), "{t}");
+            assert!(!log_may_carry_secrets(t, &Level::WARN), "{t}");
+        }
+        for t in ["ureqx", "cortiq_server::decisions", "hyper", "rustls"] {
+            assert!(!log_may_carry_secrets(t, &Level::TRACE), "{t}");
         }
     }
 

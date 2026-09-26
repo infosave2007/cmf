@@ -417,10 +417,8 @@ impl Resp {
         assert!(self.request_id().starts_with("req_"));
         let e = &self.body["error"];
         assert!(e["message"].is_string());
-        assert_eq!(
-            e["retriable"],
-            json!(matches!(self.status, 429 | 500 | 502))
-        );
+        // The router's rule (api.rs:221-225): only 429 and 500.
+        assert_eq!(e["retriable"], json!(matches!(self.status, 429 | 500)));
         // The router's `details`: an object for TAXONOMY_NOT_FOUND, else null.
         assert_eq!(
             e["details"].is_object(),
@@ -574,6 +572,7 @@ async fn keys_missing_wrong_expired_revoked_are_401_and_open_mode_is_loopback_wi
         credit_usd: None,
         oracle_budget_usd: None,
         oracle_allowed: false,
+        router: None,
     };
     let file = KeysFile {
         version: KEYS_FILE_VERSION,
@@ -1562,6 +1561,25 @@ fn child_request_logs() {
             .get(&format!("/v1/{STATE_MARKER}-5?q={STATE_MARKER}-6"), None)
             .await;
         assert_eq!(r.status, 404);
+        // An account is any text of the router's column, a newline too: its
+        // request line stays one line (escaped).
+        let r = srv
+            .call(
+                "POST",
+                "/v1/admin/keys",
+                &[
+                    ("x-admin-token", &token),
+                    ("content-type", "application/json"),
+                ],
+                Some(br#"{"account":"log\nforged=1"}"#.to_vec()),
+            )
+            .await;
+        assert_eq!(r.status, 200, "{}", r.text);
+        let odd = r.body["key"].as_str().unwrap().to_string();
+        let r = srv
+            .post("/v1/decisions", Some(&odd), &topics_body(accepted()))
+            .await;
+        assert_eq!(r.status, 200);
         srv.close();
         (
             raw,
@@ -1598,6 +1616,11 @@ fn child_request_logs() {
             "{l}"
         );
     }
+    assert!(log.contains("account=log\\nforged=1"), "{log}");
+    assert!(
+        !log.lines().any(|l| l.starts_with("forged=1")),
+        "a forged log line:\n{log}"
+    );
     assert!(log.contains(&format!("id={ok_id}")) && log.contains("status=200"));
     assert!(log.contains("status=400"));
     assert!(

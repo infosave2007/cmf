@@ -11,7 +11,8 @@
 //! (hop-by-hop headers and the length aside; no `x-request-id` is added). Old
 //! router errors (401, 402, 404, 413, 415, 422, 429 with `Retry-After`, 5xx)
 //! pass through the same way. Only when the old router gives no answer at all
-//! (refused connection, TLS, [`UPSTREAM_TIMEOUT`], a body over 64 MiB) does
+//! (refused connection, TLS, the deadline — [`UPSTREAM_TIMEOUT`], 60 s, or
+//! `--shadow-timeout-s` — a body over 64 MiB) does
 //! the client get this server's 502 `UPSTREAM_UNAVAILABLE` in the router's
 //! envelope, like the 502 of a proxy; a request body over the old router's
 //! 8 MiB limit is answered 413 `length limit exceeded`, as it answers it.
@@ -29,6 +30,12 @@
 //!
 //! The decisions API (`/api/alpha/decisions`, `/v1/decisions`, `/v1/models`,
 //! `/v1/skills`, `/healthz`) and this server's own admin API stay local.
+//!
+//! The forwarded client secrets never reach a log line: the request line has
+//! only id, status, latency and account `-`, and `cortiq serve` drops the
+//! DEBUG/TRACE lines of the HTTP client that print request headers
+//! ([`log_may_carry_secrets`](cortiq_decision::shadow::log_may_carry_secrets))
+//! whatever `RUST_LOG` enables.
 
 use super::{
     Ctx, DecisionState, HttpError, NOVEL_LABEL, ROUTER_MAX_BATCH, Reply, Surface, admin_guard,
