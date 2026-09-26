@@ -7,6 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.8] - 2026-09-27
+
+### Added
+- Typed decisions: the new crate `cortiq-decision` and a CMF profile marked
+  by the DECISION feature bit. One file holds a native BERT encoder (the
+  bge-small-en-v1.5 base with its MLP compressed by 75 % with Cortiq NVG, a
+  WordPiece tokenizer of our own), the hashing contract and resonance skills:
+  every label is an isolated affine subspace of `[φ_P ; 0.5·φ_H]`, the answer
+  is the smallest reconstruction error, and a gate (T, θ, τ) is certified on
+  calibration rows with a Clopper–Pearson bound. It runs on the host GEMM
+  with no GPU and no new external crate; language-model commands refuse such
+  a file.
+- `cortiq decide FILE -p TEXT` (`--skill`, `--labels`, `--json`, `--round 2`)
+  and a batch mode (`--input rows.jsonl`, `--bench` with p50/p95/p99 per
+  stage). `cortiq decision init | train | add-skill | learn | info | verify |
+  materialize | rollback | keys`: train a skill from JSONL `{text, label}`,
+  add one to a file with every existing skill kept byte for byte, pre-train
+  through the oracle on unlabelled texts, check hashes and the encoder golden.
+- `cortiq serve FILE` on a decision file (127.0.0.1:8080 by default): the
+  Jev / OpenRouter decisions protocol (`POST /api/alpha/decisions`,
+  `/v1/decisions`) with a `cmf` extension (skill, oracle consent, profile,
+  explanation, rounding), skill matching (exact, subset, superset,
+  untrained), `/v1/models`, `/v1/skills`, `/v1/usage`, `/v1/feedback` and an
+  admin API; API keys stored as sha256 only, plans, minute rate windows,
+  quotas and a usage ledger. Prices are 0 by default; oracle costs pass
+  through.
+- The cortiq-router API (schema 1.1) on the same server with the router's
+  keys, types and error envelope: `/v1/route`, `/v1/route:batch`,
+  `/v1/feedback`, `/v1/taxonomies`, `/v1/usage`, `/v1/escalations`,
+  `/v1/healthz`, `/v1/readyz`, `/metrics` and the admin keys API, with
+  complexity, routing tiers, policy profiles and explanations;
+  `x-cmf-extensions: 1` adds the decision-v4 fields. `cortiq decision keys
+  import` takes the router's `api_keys` and `usage_counters` exports (or its
+  `[[api_keys]]`), so existing keys keep working; `serve --shadow-of URL`
+  answers router traffic from the old router while deciding it locally and
+  logging the agreement (`GET /v1/admin/shadow`).
+- Oracle cascade, off by default: only questions the gate rejects, or that no
+  skill covers, go to an OpenRouter model (`deepseek/deepseek-v4.1-flash` by
+  default) after the consent checks, with a budget reserved before each call,
+  stop rules, PII redaction, a semantic cache and single flight.
+  Self-learning keeps examples as vectors, refits a label after 25 new ones,
+  promotes it only if it is not worse on a holdout, re-certifies the gate and
+  checks that no other label changed; cold start for new labels, feedback,
+  and generations with rollback.
+- The published model `infosave/cortiq-decision` (304520292 bytes): skills
+  `banking77`, `clinc150` and `massive` trained on train ∪ dev, with K 32, 16
+  and 24 chosen by cross-validation. The card, `API.md` and `ORACLE.md` are
+  in `docs/decision/hf/`; `tools/decision_hf_bundle.sh` assembles the upload.
+
+### Changed
+- `publish.yml` publishes `cortiq-decision` between `cortiq-engine` and
+  `cortiq-net`, before the crates that depend on it.
+
+### Performance and limits
+- Test sets against Jev 1.13's stored answers on the same rows (BANKING77 /
+  CLINC150 / MASSIVE): all rows 93.34 / 96.18 / 86.15 % (Jev 85.58 / 96.76 /
+  85.78 %; on CLINC150 Jev is ahead, p = 0.099); certified gate 97.24 /
+  98.70 / 97.89 % correct at 90.62 / 92.11 / 54.30 % coverage; with DeepSeek
+  V4.1 Flash on the abstentions 93.96 / 97.47 / 88.00 % at $3.09 / $3.56 /
+  $8.52 per 1M decisions (Jev $183.69 / $271.61 / $110.86). The same gate
+  rejected 864 of the 1000 out-of-scope CLINC150 queries.
+- Text → decision on one Apple M4 thread: p50 3.92 / 3.79 / 3.00 ms.
+- In one pass over the test sets self-learning saved 35 of 2003 oracle calls
+  (1.75 %): a label is refitted only after 25 examples. Pre-training on
+  unlabelled dev texts was about neutral.
+- The benchmarks are public and were reused; Jev got label names and two
+  examples per label. The encoder is English, the gate is certified
+  in-domain, and speed was measured on macOS arm64 only.
+
 ## [0.7.7] - 2026-09-24
 
 ### Added
