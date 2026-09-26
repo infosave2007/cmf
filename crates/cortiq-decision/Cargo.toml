@@ -38,9 +38,12 @@ crc32fast = "1"
 # API keys from the OS RNG.
 rand_core = { version = "0.6", features = ["getrandom"] }
 bytemuck = "1"
-# Writes go to a temp file, fsync, then `persist_noclobber`: an existing
-# output is never overwritten.
-tempfile = "3"
 
+# `tempfile` is test-only (spec decision-v4 §0: "tempfile (dev)"); before this
+# crate it was only a dev-dependency of cortiq-spectra, so a runtime entry here would
+# pull it into the published cortiq-server / cortiq-cli trees. The no-clobber
+# writer (spec §3.1) uses std: a `create_new` temp file in the output's
+# directory, `sync_all`, then `std::fs::hard_link(tmp, out)` (fails with
+# AlreadyExists instead of overwriting) and removal of the temp name.
 [dev-dependencies]
 tempfile = "3"
