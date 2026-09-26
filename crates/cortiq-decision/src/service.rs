@@ -1518,8 +1518,14 @@ impl DecisionService {
     /// `POST /v1/feedback` (spec §5.11), delegated to the escalator.
     pub fn feedback(&self, body: &[u8], p: &Principal) -> Result<Value, ApiError> {
         let fb = parse_feedback(body, &self.limits)?;
+        self.feedback_request(&fb, p)
+    }
+
+    /// A parsed feedback (the router API builds its own), delegated to the
+    /// escalator.
+    pub fn feedback_request(&self, fb: &FeedbackRequest, p: &Principal) -> Result<Value, ApiError> {
         match &self.escalator {
-            Some(e) => e.feedback(&fb, p),
+            Some(e) => e.feedback(fb, p),
             None => Err(ApiError::not_found(format!(
                 "no pending decision {} / {} (learning is not enabled on this server)",
                 fb.id, fb.question

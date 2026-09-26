@@ -26,6 +26,10 @@
 //!   (9 ledger fixtures of `cortiq-decision`, sent over HTTP);
 //! * the key comes only from the environment and its bytes are in no response,
 //!   log line or state file (child process).
+//!
+//! Every request of [`Srv`] carries `x-cmf-extensions: 1`, so router-surface
+//! answers include the opt-in `cmf` diagnostics (the exact default router
+//! shapes are checked in `router_compat.rs`).
 
 use axum::body::Body;
 use axum::http::{HeaderMap, Request};
@@ -612,7 +616,9 @@ impl Srv {
         headers: &[(&str, &str)],
         body: Option<Vec<u8>>,
     ) -> Resp {
-        call(self.app.as_ref().unwrap(), method, path, headers, body).await
+        let mut h = headers.to_vec();
+        h.push(("x-cmf-extensions", "1"));
+        call(self.app.as_ref().unwrap(), method, path, &h, body).await
     }
 
     async fn post(&self, path: &str, key: Option<&str>, v: &Value) -> Resp {
@@ -1027,7 +1033,7 @@ async fn twenty_five_answers_promote_isolate_roll_back_and_survive_restarts() {
     assert_eq!(mock.hits(), hits);
     let tx = srv.get("/v1/taxonomies/topics").await;
     assert_eq!(tx.body["taxonomy_version"], "topics@1");
-    assert_eq!(tx.body["generation"], 1);
+    assert_eq!(tx.body["cmf"]["generation"], 1);
 
     // Rollback to the base over HTTP.
     let r = srv

@@ -34,29 +34,36 @@
 //! | `GET /v1/healthz`, `GET /v1/readyz`, `GET /metrics` | open |
 //! | `POST, GET /v1/admin/keys`, `DELETE /v1/admin/keys/{account}` | `x-admin-token` |
 //!
+//! Every router endpoint answers with exactly the router's keys and JSON types
+//! (`tests/router_compat.rs` checks them against router `api.rs`); the
+//! decision-v4 additions are opt-in: a request with the header
+//! `x-cmf-extensions: 1` gets them under an additive `cmf` key (see
+//! [`CMF_EXTENSIONS_HEADER`]).
+//!
 //! Administration (§5b, `x-admin-token`; 404 `ADMIN_DISABLED` when the token's
 //! environment variable is unset): `DELETE /v1/admin/keys/hash/{hash12}`,
 //! `GET /v1/admin/usage`, `GET|POST /v1/admin/oracle`, `GET /v1/admin/learning`,
 //! `GET /v1/admin/generations`, `POST /v1/admin/rollback {"generation": N}`.
 //!
-//! There is no CORS layer and no web interface of any kind: an unknown path is a
-//! JSON 404, a wrong method a JSON 405.
+//! There is no CORS layer and no web interface of any kind: on the decisions
+//! surface an unknown path is a JSON 404, a wrong method a JSON 405 (the router
+//! surface answers them as the router does, see Errors).
 //!
 //! # Every request
 //!
 //! * **`x-request-id`** on every response: the decision's `cmf-dec-…` id for a
 //!   decision, else an id minted when the request arrived (`cmf-dec-…` on the
 //!   decisions surface, `req_…` — router `ids.rs` — on the router surface and
-//!   the admin API); error bodies carry the same id.
+//!   the admin API); JSON error bodies carry the same id.
 //! * **Keys** (§4.10): `Authorization: Bearer <key>` or `x-api-key`; the open
 //!   mode (no key needed) holds only when `keys.json` has no key and
 //!   `auth.require` is false (default: false on loopback, true elsewhere). On a
 //!   keyed endpoint the rate window (429 `RATE_LIMITED`, `Retry-After`) and the
 //!   quotas (402 `QUOTA_EXCEEDED`: decisions, tokens, credit) are checked before
 //!   any work, like the router's middleware.
-//! * **Body**: `Content-Type: application/json` (else 400), at most
-//!   `limits.body_bytes` (else 413 `PAYLOAD_TOO_LARGE`, checked from
-//!   `Content-Length` before reading and while reading).
+//! * **Body**: `Content-Type: application/json` (else 400; 415 on the router
+//!   surface), at most `limits.body_bytes` (else 413 `PAYLOAD_TOO_LARGE`,
+//!   checked from `Content-Length` before reading and while reading).
 //! * **Work** runs on the blocking pool (`spawn_blocking`): authentication (it
 //!   may re-read `keys.json`), decisions, feedback (a learning attempt may run
 //!   synchronously) and every admin operation. A decision, route or feedback
@@ -73,11 +80,25 @@
 //! router's reason codes (§4.8):
 //! `{"error":{"code":<HTTP>,"message":"…","metadata":{"reason":"<CODE>","retriable":bool,"request_id":"…","details":{}}}}`.
 //!
-//! Router surface and admin API — the router's envelope (§4.15: where a path is
-//! the router's, its format wins), plus the same `metadata` object:
-//! `{"schema_version":"1.1","request_id":"…","error":{"code":"<CODE>","message":"…","retriable":bool,"details":{},"metadata":{…}}}`.
-//! The router's own codes `TAXONOMY_NOT_FOUND` (404) and `EMBEDDING_REQUIRED`
-//! (400) appear only there.
+//! Router surface and admin API — the router's envelope (router
+//! `api.rs:207-284`; §4.15: where a path is the router's, its format wins):
+//! `{"schema_version":"1.1","request_id":"req_…","error":{"code":"<CODE>","message":"…","retriable":bool,"details":null}}`;
+//! `details` is an object only for `TAXONOMY_NOT_FOUND` (`{"taxonomy_id"}`),
+//! like the router's. The router's own codes `TAXONOMY_NOT_FOUND` (404) and
+//! `EMBEDDING_REQUIRED` (400) appear only there. With `x-cmf-extensions: 1`
+//! the error also carries the decisions surface's `metadata` object.
+//!
+//! A router body the router's axum extractors would reject is answered as
+//! they answer it, as `text/plain; charset=utf-8`: 415 ``Expected request with
+//! `Content-Type: application/json` `` (a JSON media type is
+//! `application/json` or `application/*+json`), 413 `Failed to buffer the
+//! request body: length limit exceeded` (`limits.body_bytes`), 400 `Failed to
+//! parse the request body as JSON: …` and 422 `Failed to deserialize the JSON
+//! body into the target type: …` (the router's struct names), and on
+//! `/v1/escalations` 400 `Failed to deserialize query string: …`. A wrong
+//! method on a router path is an empty 405 with `Allow`, an unknown path under
+//! a router prefix an empty 404; both after the key check when the path is
+//! keyed, as the router's middleware runs first.
 //!
 //! # Router API on the decision model
 //!
@@ -85,24 +106,29 @@
 //! (else `default_skill`, else the file's only skill): a `task` choice question
 //! over the skill's active labels, with the skill's rubric (instructions and
 //! criteria, question-file order) — the Jev request the oracle and the cache
-//! see, metered like one. `options.policy_profile` is the profile of §4.7b,
-//! `allow_oracle` the consent (absent: `oracle.default_per_request`),
-//! `allow_pii_egress`, `return_explanation` and `top_k` (1..64) as in the
-//! router. The response has every field of router `api.rs:95-201`:
-//! `decision.confidence` is the calibrated `p_top` (1 for an oracle or cache
-//! answer, whose label is promoted to the top of `scores` as the router does),
-//! `raw_confidence` the winner's `1/(1+E)`, `scores[]` the candidates by score
-//! with `probability`, `score` and `reconstruction_error`, `task_id` the task's
-//! index in the skill (−1 with `__novel__` when there is no candidate),
-//! `complexity` and `routing` (only with `routing_table_id`, like the router)
-//! from §4.7b, `oracle` {consulted, model, agreement_with_router, latency_ms},
-//! `explanation` {top1_vs_top2, decision_path} with the decision paths of §4.7b,
-//! `usage` {billable_decisions: 1, oracle_calls}, `meta` {model_version =
+//! see, metered like one. The request is the router's (`api.rs:30-89`, unknown
+//! keys ignored): `options.policy_profile` (`balanced`) is the profile of
+//! §4.7b, `allow_oracle` (`true`) the consent to the oracle, `allow_pii_egress`
+//! (`false`), `return_explanation` (`false`), `top_k` (3, clamped to 1..64) and
+//! `routing_table_id` as in the router. `input.text` longer than
+//! `limits.state_bytes` is cut there at a character boundary (the router has no
+//! text limit; the encoder reads 512 tokens). The response has every field of
+//! router `api.rs:95-201` and no other: `decision.confidence` is the calibrated
+//! `p_top` (1 for an oracle or cache answer, whose label is promoted to the top
+//! of `scores` as the router does), `raw_confidence` the winner's `1/(1+E)`,
+//! `scores[]` the candidates by score with `probability`, `score` and
+//! `reconstruction_error`, `task_id` the task's index in the skill (−1 with
+//! `__novel__` when there is no candidate), `complexity` and `routing` (only
+//! with `routing_table_id`, like the router) from §4.7b, `oracle` {consulted,
+//! model, agreement_with_router, latency_ms}, `explanation` {top1_vs_top2,
+//! decision_path} with the decision paths of §4.7b, `usage`
+//! {billable_decisions: 1, oracle_calls}, `meta` {model_version =
 //! `cortiq/decision@<sha12>`, taxonomy_version = `<skill>@<n>`, latency_ms (the
 //! resonance), embedding_latency_ms (tokenizer, encoder and hash), served_by =
 //! `cortiq/<version>`}. A gate-rejected answer that is not escalated carries the
-//! router's `low_confidence` flag (so `confident` is false). An additive `cmf`
-//! object has the `cmf-dec-…` id, the action, `certified` and the gate.
+//! router's `low_confidence` flag (so `confident` is false). With
+//! `x-cmf-extensions: 1` a `cmf` object adds the `cmf-dec-…` id, the action,
+//! `certified` and the gate.
 //!
 //! `input.embedding` (bring your own) must have the signal's dimension (the
 //! encoder's plus the hashing contract's) and `embedding_model`; it is decided
@@ -116,12 +142,29 @@
 //!
 //! `POST /v1/feedback` with the router's `{request_id, correct_task_label}`
 //! corrects a route decision of the caller's own account (another account's is
-//! not found — the router let any key correct any request); the label must be
-//! one of the skill's labels at decision time (the decision's options), so a
-//! router feedback does not start a cold start — new labels come from the
-//! oracle's answers to superset questions and from decisions-API feedback on
-//! them. The response has the router's `{schema_version, accepted, message}`
-//! and the cascade's fields (`stored` tells a new example from a duplicate).
+//! not found — the router let any key correct any request). Any label of 1..256
+//! bytes is taken, as in the router: a label the skill does not have starts a
+//! cold start (§5.8). The response is the router's `{schema_version, accepted,
+//! message}`. A body with the decisions API's keys (`id`, `question`, `label`)
+//! and none of the router's is decisions-API feedback (§5.11).
+//!
+//! The listings are the router's: `/v1/taxonomies` `{schema_version,
+//! taxonomies:[{taxonomy_id, taxonomy_version, model_version, labels}]}`
+//! (`default_skill` first), `/v1/usage` `{schema_version, account:{id,
+//! billable_decisions, oracle_calls, decision_quota, rate_per_min},
+//! usage:{billable_decisions, oracle_calls, escalations, escalation_rate,
+//! cache_hits, novelty_hits, refits, promotions}}` with the caller's own
+//! numbers, `/v1/escalations` `{schema_version, summary:{total, oracle_calls,
+//! cache_hits, oracle_unavailable, labeled_examples, cache:{entries, hits,
+//! lookups}}, records:[router AuditRecord]}`, `/v1/healthz` `{"status":"ok"}`.
+//! The admin key API takes the router's `CreateKeyReq` (plus the decision-v4
+//! limits `token_quota`, `credit_usd`, `oracle_budget_usd`, `oracle_allowed`;
+//! `email` is not stored) and answers `{key, account, plan, rate_per_min,
+//! decision_quota, expires_at, created_at, persisted}`; its listing has the
+//! active keys as `{account, plan, rate_per_min, decision_quota, expires_at,
+//! expired, key_hash_prefix, usage:{decisions, oracle_calls}}`. Unlike the
+//! router, a plan must be one of `auth.plans` and an account `[A-Za-z0-9_.@-]`
+//! (400).
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -134,8 +177,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Extension, MatchedPath, Path, RawQuery, Request, State};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
+use axum::extract::{Extension, MatchedPath, Path, Request, State};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{delete, get, post};
@@ -160,7 +203,6 @@ use cortiq_decision::service::{
 use cortiq_decision::signal::Features;
 use cortiq_decision::statedir::{StateDir, StateLock};
 use futures::StreamExt;
-use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 /// Default listening host of a decision server (spec §4.2): loopback.
@@ -186,6 +228,20 @@ pub const ESCALATIONS_DEFAULT_LIMIT: usize = 100;
 pub const ESCALATIONS_MAX_LIMIT: usize = 1000;
 /// The request id header of every response.
 pub const REQUEST_ID_HEADER: &str = "x-request-id";
+/// Request header that opts a router-API call into the decision-v4 additions
+/// (`1`, `true`, `yes` or `on`): a `cmf` object in route results, listings,
+/// usage, feedback and `/v1/healthz`, revoked keys in the admin listing, and
+/// `error.metadata` in router errors. Without it every router endpoint answers
+/// with exactly the router's keys.
+pub const CMF_EXTENSIONS_HEADER: &str = "x-cmf-extensions";
+/// The router's `schema_version` 1.1 answer when its axum `Json` extractor
+/// finds no JSON media type (axum 0.7 `MissingJsonContentType`).
+pub const ROUTER_MISSING_JSON_CONTENT_TYPE: &str =
+    "Expected request with `Content-Type: application/json`";
+/// The router's 413 text (axum 0.7 `FailedToBufferBody::LengthLimitError`).
+pub const ROUTER_LENGTH_LIMIT: &str = "Failed to buffer the request body: length limit exceeded";
+/// Most bytes of a router feedback label (the decisions API's option ids).
+pub const ROUTER_MAX_LABEL_BYTES: usize = cortiq_decision::protocol::MAX_LABEL_BYTES;
 /// Instructions of the router question of a skill without a rubric.
 pub const DEFAULT_ROUTE_INSTRUCTIONS: &str =
     "Classify the input into exactly one of the task labels.";
@@ -227,6 +283,28 @@ pub enum Surface {
     Router,
 }
 
+/// Whether a router-surface path is checked by the router's key middleware
+/// (router `api.rs:325-331`: probes and the admin API are not).
+fn router_path_keyed(path: &str) -> bool {
+    !(path == "/v1/healthz"
+        || path == "/v1/readyz"
+        || path == "/metrics"
+        || path.starts_with("/v1/admin"))
+}
+
+/// `x-cmf-extensions` is set to a true value.
+fn wants_extensions(headers: &HeaderMap) -> bool {
+    headers
+        .get(CMF_EXTENSIONS_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+}
+
 /// The surface of a request path.
 pub fn surface_of(path: &str) -> Surface {
     let router = matches!(
@@ -255,6 +333,10 @@ pub fn surface_of(path: &str) -> Surface {
 struct Ctx {
     id: String,
     surface: Surface,
+    /// `x-cmf-extensions` (router surface).
+    ext: bool,
+    /// The request path (only to tell keyed router paths; never logged).
+    path: String,
 }
 
 /// The account a response was served to (for the request log).
@@ -273,6 +355,9 @@ pub struct HttpError {
     pub message: String,
     pub details: Option<Box<Map<String, Value>>>,
     pub retry_after: Option<u64>,
+    /// Answer `message` as the whole `text/plain` body (the router's axum
+    /// extractor rejections), or an empty body when `message` is empty.
+    pub plain: bool,
     account: Option<String>,
 }
 
@@ -284,6 +369,7 @@ impl From<ApiError> for HttpError {
             message: e.message,
             details: e.details,
             retry_after: e.retry_after,
+            plain: false,
             account: None,
         }
     }
@@ -297,8 +383,21 @@ impl HttpError {
             message: message.into(),
             details: None,
             retry_after: None,
+            plain: false,
             account: None,
         }
+    }
+
+    /// A router-surface answer in axum's `text/plain` form (`body` empty: no
+    /// body and no content type, like axum's own 404/405).
+    pub fn plain(status: u16, body: impl Into<String>) -> Self {
+        let code = match status {
+            413 => Reason::PayloadTooLarge.code(),
+            _ => Reason::InvalidRequest.code(),
+        };
+        let mut e = Self::new(status, code, body);
+        e.plain = true;
+        e
     }
 
     fn reason(reason: Reason, message: impl Into<String>) -> Self {
@@ -358,18 +457,28 @@ impl HttpError {
         })
     }
 
-    /// The router's error envelope (router `api.rs:270-284`) plus `metadata`.
-    pub fn router_body(&self, request_id: &str) -> Value {
+    /// The router's error envelope (router `api.rs:270-284`): `details` is
+    /// `null` except for `TAXONOMY_NOT_FOUND` (router `api.rs:226,242`);
+    /// `extensions` adds the decisions surface's `metadata`.
+    pub fn router_body(&self, request_id: &str, extensions: bool) -> Value {
+        let details = if self.code == TAXONOMY_NOT_FOUND {
+            self.details_json()
+        } else {
+            Value::Null
+        };
+        let mut error = json!({
+            "code": self.code,
+            "message": self.message,
+            "retriable": self.retriable(),
+            "details": details,
+        });
+        if extensions {
+            error["metadata"] = self.metadata(request_id);
+        }
         json!({
             "schema_version": ROUTER_SCHEMA_VERSION,
             "request_id": request_id,
-            "error": {
-                "code": self.code,
-                "message": self.message,
-                "retriable": self.retriable(),
-                "details": self.details_json(),
-                "metadata": self.metadata(request_id),
-            }
+            "error": error,
         })
     }
 }
@@ -379,11 +488,14 @@ fn internal_error(what: &str, e: impl std::fmt::Display) -> HttpError {
     HttpError::internal()
 }
 
+/// The router's 404 code for an unknown `taxonomy_id`.
+pub const TAXONOMY_NOT_FOUND: &str = "TAXONOMY_NOT_FOUND";
+
 fn taxonomy_not_found(id: &str) -> HttpError {
     HttpError::new(
         404,
-        "TAXONOMY_NOT_FOUND",
-        format!("taxonomy_id '{id}' not found"),
+        TAXONOMY_NOT_FOUND,
+        format!("taxonomy_id '{id}' not found for account"),
     )
     .with_detail("taxonomy_id", json!(id))
 }
@@ -452,12 +564,42 @@ fn json_response(
     resp
 }
 
+/// A `text/plain; charset=utf-8` answer (axum's rejection form); an empty
+/// `text` is an empty body without a content type.
+fn plain_response(
+    status: StatusCode,
+    text: String,
+    request_id: &str,
+    account: Option<String>,
+) -> Response {
+    let empty = text.is_empty();
+    let mut resp = Response::new(Body::from(text));
+    *resp.status_mut() = status;
+    let h = resp.headers_mut();
+    if !empty {
+        h.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; charset=utf-8"),
+        );
+    }
+    if let Ok(v) = HeaderValue::from_str(request_id) {
+        h.insert(HeaderName::from_static(REQUEST_ID_HEADER), v);
+    }
+    if let Some(a) = account {
+        resp.extensions_mut().insert(AccountTag(a));
+    }
+    resp
+}
+
 fn error_response(ctx: &Ctx, e: HttpError) -> Response {
+    let status = StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    if e.plain {
+        return plain_response(status, e.message, &ctx.id, e.account);
+    }
     let body = match ctx.surface {
         Surface::Decisions => e.openrouter_body(&ctx.id),
-        Surface::Router => e.router_body(&ctx.id),
+        Surface::Router => e.router_body(&ctx.id, ctx.ext),
     };
-    let status = StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     json_response(status, &body, &ctx.id, e.account, e.retry_after)
 }
 
@@ -577,6 +719,77 @@ async fn keyed_body(
     Ok((p, bytes))
 }
 
+/// A JSON media type as axum's `Json` extractor sees it: `application/json`
+/// or `application/*+json`, parameters allowed (axum `json.rs`
+/// `json_content_type`).
+fn json_media_type(headers: &HeaderMap) -> bool {
+    let Some(ct) = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    let essence = ct.split(';').next().unwrap_or("").trim();
+    let Some((ty, sub)) = essence.split_once('/') else {
+        return false;
+    };
+    let sub = sub.to_ascii_lowercase();
+    let valid = |t: &str| {
+        !t.is_empty()
+            && t.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$&-^_.+".contains(&b))
+    };
+    valid(ty)
+        && valid(&sub)
+        && ty.eq_ignore_ascii_case("application")
+        && (sub == "json" || sub.ends_with("+json"))
+}
+
+/// The router's body extraction (its axum `Json` extractor): 415 without a
+/// JSON media type, 413 over `limit`, as `text/plain`.
+async fn router_body_bytes(
+    headers: &HeaderMap,
+    body: Body,
+    limit: usize,
+) -> Result<Vec<u8>, HttpError> {
+    if !json_media_type(headers) {
+        return Err(HttpError::plain(415, ROUTER_MISSING_JSON_CONTENT_TYPE));
+    }
+    read_body(headers, body, limit).await.map_err(|e| {
+        if e.status == 413 {
+            HttpError::plain(413, ROUTER_LENGTH_LIMIT)
+        } else {
+            HttpError::plain(
+                400,
+                format!("Failed to buffer the request body: {}", e.message),
+            )
+        }
+    })
+}
+
+/// Deserialize a router body as the router's axum `Json` does: 400 for bad
+/// JSON syntax, 422 for a body of the wrong shape, with axum's text.
+fn router_json<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, HttpError> {
+    axum::Json::<T>::from_bytes(bytes)
+        .map(|j| j.0)
+        .map_err(|r| HttpError::plain(r.status().as_u16(), r.body_text()))
+}
+
+/// Keyed router body: auth and admission (the router's middleware), then its
+/// `Json` extractor.
+async fn keyed_router_body<T: serde::de::DeserializeOwned>(
+    st: &Arc<DecisionState>,
+    headers: &HeaderMap,
+    body: Body,
+) -> Result<(Principal, T), HttpError> {
+    let p = caller(st, headers).await?;
+    let bytes = router_body_bytes(headers, body, st.body_limit())
+        .await
+        .map_err(|e| e.by(&p.account))?;
+    let v = router_json(&bytes).map_err(|e| e.by(&p.account))?;
+    Ok((p, v))
+}
+
 /// Admin JSON body: guard, content type, body.
 async fn admin_body(
     st: &Arc<DecisionState>,
@@ -608,11 +821,13 @@ impl Counters {
     }
 }
 
-/// One escalated question (router `AuditRecord`, `state.rs:123-140`), with
-/// the account it belongs to (not shown).
+/// One escalated question (router `AuditRecord`, `state.rs:118-132`), with
+/// the account it belongs to (not shown) and the question id (shown under
+/// `cmf` with `x-cmf-extensions`).
 #[derive(Clone, Debug)]
 struct AuditEntry {
     account: String,
+    question: String,
     record: Value,
 }
 
@@ -777,8 +992,12 @@ impl DecisionState {
                 (consulted_or_cached || failed).then(|| self.config().oracle.model.clone());
             let latency =
                 (q.action == Action::Oracle || failed).then(|| f32_json(ms(d.timings.oracle)));
+            // The router's record carries the response's flags (`api.rs:902`):
+            // an unresolved escalation is `low_confidence` there too.
+            let flags = audit_flags(q.action, &q.flags);
             entries.push(AuditEntry {
                 account: account.to_string(),
+                question: q.id.clone(),
                 record: json!({
                     "request_id": audit_id,
                     "ts": d.created,
@@ -791,8 +1010,7 @@ impl DecisionState {
                     "oracle_latency_ms": latency,
                     "oracle_calls": calls,
                     "novelty_score": f32_json(q.local.as_ref().map_or(1.0, |l| l.decision.novelty)),
-                    "flags": q.flags,
-                    "question": q.id,
+                    "flags": flags,
                 }),
             });
         }
@@ -813,10 +1031,10 @@ impl DecisionState {
     // ---------------------------------------------------------------- JSON views
 
     /// `GET /v1/usage`: the router's shape (`api.rs:1337-1363`) with the
-    /// caller's own numbers, plus the decisions service's totals and limits.
-    fn usage_json(&self, p: &Principal) -> Value {
+    /// caller's own numbers; `extensions` adds the decisions service's totals
+    /// and limits under `cmf`.
+    fn usage_json(&self, p: &Principal, extensions: bool) -> Value {
         let t = self.svc.totals(&p.account);
-        let base = self.svc.usage_json(p);
         let escalations = t.decisions.saturating_sub(t.actions.local);
         let rate = escalations as f32 / t.decisions.max(1) as f32;
         let novelty = lock(&self.novelty_by_account)
@@ -824,23 +1042,7 @@ impl DecisionState {
             .copied()
             .unwrap_or(0);
         let (refits, promotions) = self.learning_counts();
-        let mut usage = match t.to_json() {
-            Value::Object(m) => m,
-            _ => Map::new(),
-        };
-        for (k, v) in [
-            ("billable_decisions", json!(t.decisions)),
-            ("oracle_calls", json!(t.oracle_calls)),
-            ("escalations", json!(escalations)),
-            ("escalation_rate", f32_json(rate)),
-            ("cache_hits", json!(t.cache_hits)),
-            ("novelty_hits", json!(novelty)),
-            ("refits", json!(refits)),
-            ("promotions", json!(promotions)),
-        ] {
-            usage.insert(k.to_string(), v);
-        }
-        json!({
+        let mut v = json!({
             "schema_version": ROUTER_SCHEMA_VERSION,
             "account": {
                 "id": p.account,
@@ -848,13 +1050,27 @@ impl DecisionState {
                 "oracle_calls": t.oracle_calls,
                 "decision_quota": p.decision_quota,
                 "rate_per_min": p.rate_per_min,
-                "plan": p.plan,
-                "token_quota": p.token_quota,
             },
-            "usage": Value::Object(usage),
-            "plan": p.plan,
-            "limits": base["limits"],
-        })
+            "usage": {
+                "billable_decisions": t.decisions,
+                "oracle_calls": t.oracle_calls,
+                "escalations": escalations,
+                "escalation_rate": f32_json(rate),
+                "cache_hits": t.cache_hits,
+                "novelty_hits": novelty,
+                "refits": refits,
+                "promotions": promotions,
+            },
+        });
+        if extensions {
+            let base = self.svc.usage_json(p);
+            v["cmf"] = json!({
+                "plan": base["plan"],
+                "totals": base["usage"],
+                "limits": base["limits"],
+            });
+        }
+        v
     }
 
     /// The skills in router-listing order: `default_skill` first.
@@ -996,16 +1212,22 @@ impl DecisionState {
     }
 }
 
-fn taxonomy_summary(model: &LoadedModel, s: &SkillRuntime) -> Value {
-    let g = s.gate();
-    json!({
+/// The router's `TaxonomySummary` (`api.rs:1301-1335`); `extensions` adds
+/// the generation and whether the skill's gate is certified under `cmf`.
+fn taxonomy_summary(model: &LoadedModel, s: &SkillRuntime, extensions: bool) -> Value {
+    let mut v = json!({
         "taxonomy_id": s.id(),
         "taxonomy_version": format!("{}@{}", s.id(), s.manifest().taxonomy_version),
         "model_version": model.name(),
         "labels": s.scorer().labels(),
-        "generation": model.generation(),
-        "certified": g.certified,
-    })
+    });
+    if extensions {
+        v["cmf"] = json!({
+            "generation": model.generation(),
+            "certified": s.gate().certified,
+        });
+    }
+    v
 }
 
 // ------------------------------------------------------------------ router
@@ -1029,7 +1251,7 @@ pub fn router(state: Arc<DecisionState>) -> Router {
         .route("/v1/taxonomies/{id}", get(taxonomy_handler))
         .route("/v1/usage", get(usage_handler))
         .route("/v1/escalations", get(escalations_handler))
-        .route("/v1/healthz", get(healthz_handler))
+        .route("/v1/healthz", get(router_healthz_handler))
         .route("/v1/readyz", get(readyz_handler))
         .route("/metrics", get(metrics_handler))
         // Admin (spec §5b; router `api.rs:299-304`).
@@ -1062,14 +1284,18 @@ async fn context_middleware(mut req: Request, next: Next) -> Response {
         .extensions()
         .get::<MatchedPath>()
         .map_or_else(|| "-".to_string(), |m| m.as_str().to_string());
-    let surface = surface_of(req.uri().path());
+    let path = req.uri().path().to_string();
+    let surface = surface_of(&path);
     let id = match surface {
         Surface::Decisions => new_request_id(now_unix()),
         Surface::Router => router_request_id(),
     };
+    let ext = wants_extensions(req.headers());
     req.extensions_mut().insert(Ctx {
         id: id.clone(),
         surface,
+        ext,
+        path,
     });
     let mut resp = next.run(req).await;
     let hdr = HeaderName::from_static(REQUEST_ID_HEADER);
@@ -1100,14 +1326,51 @@ async fn context_middleware(mut req: Request, next: Next) -> Response {
     resp
 }
 
-async fn not_found_handler(Extension(ctx): Extension<Ctx>) -> Response {
-    error_response(&ctx, HttpError::not_found("no such endpoint"))
+/// The router's answer to a path or method it does not route: its key
+/// middleware first on a keyed path (401/429/402), then axum's empty 404/405
+/// (axum adds `Allow` to a 405).
+async fn router_unrouted(
+    st: &Arc<DecisionState>,
+    ctx: &Ctx,
+    headers: &HeaderMap,
+    status: u16,
+) -> Response {
+    let mut account = None;
+    if router_path_keyed(&ctx.path) {
+        match caller(st, headers).await {
+            Ok(p) => account = Some(p.account),
+            Err(e) => return error_response(ctx, e),
+        }
+    }
+    let mut e = HttpError::plain(status, "");
+    e.account = account;
+    error_response(ctx, e)
 }
 
-async fn method_not_allowed_handler(Extension(ctx): Extension<Ctx>) -> Response {
-    let mut e = HttpError::invalid("method not allowed on this endpoint");
-    e.status = 405;
-    error_response(&ctx, e)
+async fn not_found_handler(
+    State(st): State<Arc<DecisionState>>,
+    Extension(ctx): Extension<Ctx>,
+    headers: HeaderMap,
+) -> Response {
+    match ctx.surface {
+        Surface::Router => router_unrouted(&st, &ctx, &headers, 404).await,
+        Surface::Decisions => error_response(&ctx, HttpError::not_found("no such endpoint")),
+    }
+}
+
+async fn method_not_allowed_handler(
+    State(st): State<Arc<DecisionState>>,
+    Extension(ctx): Extension<Ctx>,
+    headers: HeaderMap,
+) -> Response {
+    match ctx.surface {
+        Surface::Router => router_unrouted(&st, &ctx, &headers, 405).await,
+        Surface::Decisions => {
+            let mut e = HttpError::invalid("method not allowed on this endpoint");
+            e.status = 405;
+            error_response(&ctx, e)
+        }
+    }
 }
 
 // ------------------------------------------------------------------ decisions
@@ -1160,6 +1423,23 @@ async fn healthz_handler(
     respond(&ctx, Ok(Reply::ok(st.svc.healthz_json())))
 }
 
+/// `GET /v1/healthz`: the router's `{"status":"ok"}` (`api.rs:1397-1399`);
+/// `x-cmf-extensions` adds `/healthz`'s fields under `cmf`.
+async fn router_healthz_handler(
+    State(st): State<Arc<DecisionState>>,
+    Extension(ctx): Extension<Ctx>,
+) -> Response {
+    let mut v = json!({"status": "ok"});
+    if ctx.ext {
+        let mut h = st.svc.healthz_json();
+        if let Some(m) = h.as_object_mut() {
+            m.remove("status");
+        }
+        v["cmf"] = h;
+    }
+    respond(&ctx, Ok(Reply::ok(v)))
+}
+
 async fn skills_handler(
     State(st): State<Arc<DecisionState>>,
     Extension(ctx): Extension<Ctx>,
@@ -1193,63 +1473,119 @@ async fn skill_handler(
 
 // ------------------------------------------------------------------ router API: route
 
-/// `options` of a router request (router `api.rs:52-74`; unknown keys ignored).
-#[derive(Clone, Debug, Deserialize)]
-#[serde(default)]
-struct RouteOptions {
-    policy_profile: String,
-    allow_oracle: Option<bool>,
-    allow_pii_egress: bool,
-    top_k: usize,
-    return_explanation: bool,
-    routing_table_id: Option<String>,
-}
+/// The router's request types (`api.rs:30-89, 374-393, 1365-1369`) under the
+/// router's own names: serde's messages name the types, and a body the router
+/// rejects is rejected here with the same text (see [`router_json`]). Unknown
+/// keys are ignored, as in the router.
+mod wire {
+    use serde::Deserialize;
 
-impl Default for RouteOptions {
-    fn default() -> Self {
-        Self {
-            policy_profile: Profile::Balanced.as_str().to_string(),
-            allow_oracle: None,
-            allow_pii_egress: false,
-            top_k: ROUTER_DEFAULT_TOP_K,
-            return_explanation: false,
-            routing_table_id: None,
+    /// `options.policy_profile` (router `policy.rs:11-17`).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum PolicyProfile {
+        CostSaver,
+        Balanced,
+        QualityFirst,
+    }
+
+    #[derive(Debug, Deserialize)]
+    pub struct RouteRequest {
+        #[serde(default)]
+        pub taxonomy_id: Option<String>,
+        pub input: Input,
+        #[serde(default)]
+        pub options: Options,
+        #[serde(default)]
+        pub client_request_id: Option<String>,
+    }
+
+    #[derive(Clone, Debug, Deserialize)]
+    pub struct Input {
+        #[serde(default)]
+        pub text: Option<String>,
+        /// Bring-your-own signal; if present, `text` is ignored.
+        #[serde(default)]
+        pub embedding: Option<Vec<f32>>,
+        #[serde(default)]
+        pub embedding_model: Option<String>,
+    }
+
+    #[derive(Clone, Debug, Deserialize)]
+    #[serde(default)]
+    pub struct Options {
+        pub policy_profile: PolicyProfile,
+        pub allow_oracle: bool,
+        pub allow_pii_egress: bool,
+        pub top_k: usize,
+        pub return_explanation: bool,
+        pub routing_table_id: Option<String>,
+    }
+
+    /// Router `api.rs:63-74`.
+    impl Default for Options {
+        fn default() -> Self {
+            Self {
+                policy_profile: PolicyProfile::Balanced,
+                allow_oracle: true,
+                allow_pii_egress: false,
+                top_k: super::ROUTER_DEFAULT_TOP_K,
+                return_explanation: false,
+                routing_table_id: None,
+            }
         }
     }
-}
 
-/// `input` of a router request (router `api.rs:41-50`).
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default)]
-struct RouteInput {
-    text: Option<String>,
-    embedding: Option<Vec<f32>>,
-    embedding_model: Option<String>,
-}
+    #[derive(Debug, Deserialize)]
+    pub struct BatchRequest {
+        #[serde(default)]
+        pub taxonomy_id: Option<String>,
+        pub inputs: Vec<Input>,
+        #[serde(default)]
+        pub options: Options,
+    }
 
-#[derive(Debug, Deserialize)]
-struct RouteRequest {
-    #[serde(default)]
-    taxonomy_id: Option<String>,
-    input: RouteInput,
-    #[serde(default)]
-    options: RouteOptions,
-    #[serde(default)]
-    client_request_id: Option<String>,
-}
+    #[derive(Debug, Deserialize)]
+    pub struct FeedbackRequest {
+        pub request_id: String,
+        pub correct_task_label: String,
+    }
 
-#[derive(Debug, Deserialize)]
-struct BatchRequest {
-    #[serde(default)]
-    taxonomy_id: Option<String>,
-    inputs: Vec<RouteInput>,
-    #[serde(default)]
-    options: RouteOptions,
-}
+    /// `POST /v1/admin/keys` (router `api.rs:374-393`) plus the decision-v4
+    /// limits of spec §4.10.
+    #[derive(Debug, Deserialize)]
+    pub struct CreateKeyReq {
+        #[serde(default)]
+        pub plan: Option<String>,
+        /// Accepted and not stored (no personal data in `keys.json`).
+        #[serde(default)]
+        #[allow(dead_code)]
+        pub email: Option<String>,
+        #[serde(default)]
+        pub label: Option<String>,
+        #[serde(default)]
+        pub days: Option<u32>,
+        #[serde(default)]
+        pub rate_per_min: Option<u32>,
+        #[serde(default)]
+        pub decision_quota: Option<u64>,
+        #[serde(default)]
+        pub account: Option<String>,
+        #[serde(default)]
+        pub token_quota: Option<u64>,
+        #[serde(default)]
+        pub credit_usd: Option<String>,
+        #[serde(default)]
+        pub oracle_budget_usd: Option<String>,
+        #[serde(default)]
+        pub oracle_allowed: Option<bool>,
+    }
 
-fn parse_router_body<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, HttpError> {
-    let v = parse_json(bytes).map_err(HttpError::from)?;
-    serde_json::from_value(v).map_err(|e| HttpError::invalid(format!("invalid request: {e}")))
+    #[derive(Debug, Deserialize)]
+    pub struct EscalationsQuery {
+        #[serde(default)]
+        pub limit: Option<usize>,
+    }
 }
 
 /// The resolved options of a route.
@@ -1257,11 +1593,13 @@ fn parse_router_body<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, 
 struct Routing {
     skill: String,
     profile: Profile,
-    allow_oracle: Option<bool>,
+    allow_oracle: bool,
     allow_pii_egress: bool,
     top_k: usize,
     explain: bool,
     routing_table: bool,
+    /// `x-cmf-extensions`: add the `cmf` object.
+    extensions: bool,
 }
 
 impl DecisionState {
@@ -1270,7 +1608,8 @@ impl DecisionState {
     fn resolve_routing(
         &self,
         taxonomy_id: Option<&str>,
-        opts: &RouteOptions,
+        opts: &wire::Options,
+        extensions: bool,
     ) -> Result<Routing, HttpError> {
         let model = self.svc.handle().current();
         let skill = match taxonomy_id.or(self.config().default_skill.as_deref()) {
@@ -1287,17 +1626,15 @@ impl DecisionState {
                     return Err(HttpError::invalid(format!(
                         "taxonomy_id is required: this model has skills {} (or set default_skill in the configuration)",
                         ids.join(", ")
-                    ))
-                    .with_detail("taxonomies", json!(ids)));
+                    )));
                 }
             },
         };
-        let profile = Profile::parse(&opts.policy_profile).ok_or_else(|| {
-            HttpError::invalid(format!(
-                "options.policy_profile '{}' is not one of cost-saver, balanced, quality-first",
-                opts.policy_profile
-            ))
-        })?;
+        let profile = match opts.policy_profile {
+            wire::PolicyProfile::CostSaver => Profile::CostSaver,
+            wire::PolicyProfile::Balanced => Profile::Balanced,
+            wire::PolicyProfile::QualityFirst => Profile::QualityFirst,
+        };
         Ok(Routing {
             skill,
             profile,
@@ -1306,8 +1643,34 @@ impl DecisionState {
             top_k: opts.top_k.clamp(1, ROUTER_MAX_TOP_K),
             explain: opts.return_explanation,
             routing_table: opts.routing_table_id.is_some(),
+            extensions,
         })
     }
+}
+
+/// The flags of a router response (and of its audit record): an escalated
+/// question left unanswered is the router's `low_confidence`, then the
+/// question's own flags.
+fn audit_flags(action: Action, flags: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(flags.len() + 1);
+    if action == Action::Abstain {
+        out.push(FLAG_LOW_CONFIDENCE.to_string());
+    }
+    out.extend(flags.iter().cloned());
+    out
+}
+
+/// The longest prefix of `text` of at most `max` bytes that ends on a
+/// character boundary.
+fn truncate_utf8(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// The router question of a skill: `task`, choice over its active labels, with
@@ -1405,7 +1768,7 @@ impl DecisionState {
         &self,
         p: &Principal,
         r: &Routing,
-        input: &RouteInput,
+        input: &wire::Input,
         client_request_id: Option<&str>,
         request_id: &str,
     ) -> Result<Value, HttpError> {
@@ -1439,14 +1802,9 @@ impl DecisionState {
         if text.trim().is_empty() {
             return Err(embedding_required());
         }
-        let limit = self.config().limits.state_bytes;
-        if text.len() > limit {
-            return Err(HttpError::invalid(format!(
-                "input.text is {} bytes (at most {limit})",
-                text.len()
-            ))
-            .with_detail("field", json!("input.text")));
-        }
+        // The router takes a text of any length; the decision reads its first
+        // `limits.state_bytes` (whole characters).
+        let text = truncate_utf8(text, self.config().limits.state_bytes);
         let req = DecisionRequest {
             model: ModelRef::Latest,
             state: RequestState::Text(text.to_string()),
@@ -1454,7 +1812,7 @@ impl DecisionState {
             questions: vec![route_question(s)],
             cmf: CmfOptions {
                 skill: Some(r.skill.clone()),
-                oracle: r.allow_oracle,
+                oracle: Some(r.allow_oracle),
                 allow_pii_egress: r.allow_pii_egress,
                 round: None,
                 explain: r.explain,
@@ -1508,7 +1866,7 @@ impl DecisionState {
         r: &Routing,
         model: &Arc<LoadedModel>,
         s: &SkillRuntime,
-        input: &RouteInput,
+        input: &wire::Input,
         x: &[f32],
         request_id: &str,
     ) -> Result<RouteOutcome, HttpError> {
@@ -1573,7 +1931,7 @@ impl DecisionState {
         let consent = cfg.oracle.enabled
             && self.svc.escalator().is_some()
             && p.oracle_allowed
-            && r.allow_oracle.unwrap_or(cfg.oracle.default_per_request);
+            && r.allow_oracle;
         let (action, flags, path) = if accepted {
             (Action::Local, Vec::new(), "router:uncertified")
         } else if consent {
@@ -1658,6 +2016,7 @@ impl DecisionState {
             }
             self.push_audit(vec![AuditEntry {
                 account: p.account.clone(),
+                question: ROUTE_QUESTION_ID.to_string(),
                 record: json!({
                     "request_id": request_id,
                     "ts": record.ts,
@@ -1670,8 +2029,7 @@ impl DecisionState {
                     "oracle_latency_ms": Value::Null,
                     "oracle_calls": 0,
                     "novelty_score": f32_json(local.decision.novelty),
-                    "flags": flags,
-                    "question": ROUTE_QUESTION_ID,
+                    "flags": audit_flags(action, &flags),
                 }),
             }]);
         }
@@ -1806,11 +2164,7 @@ impl DecisionState {
                 local.is_none_or(LocalDecision::is_novel),
             ),
         };
-        let mut flags = Vec::with_capacity(o.flags.len() + 1);
-        if o.action == Action::Abstain {
-            flags.push(FLAG_LOW_CONFIDENCE.to_string());
-        }
-        flags.extend(o.flags.iter().cloned());
+        let flags = audit_flags(o.action, &o.flags);
         let task_id: i64 = if chosen == NOVEL_LABEL {
             -1
         } else {
@@ -1916,19 +2270,21 @@ impl DecisionState {
                 "served_by": served_by(),
             }),
         );
-        v.insert(
-            "cmf".into(),
-            json!({
-                "id": o.decision_id,
-                "action": o.action.as_str(),
-                "certified": o.certified,
-                "decision_path": o.decision_path,
-                "generation": o.generation,
-                "model_sha": o.model_sha,
-                "question": o.cmf_question,
-                "usage": o.cmf_usage,
-            }),
-        );
+        if r.extensions {
+            v.insert(
+                "cmf".into(),
+                json!({
+                    "id": o.decision_id,
+                    "action": o.action.as_str(),
+                    "certified": o.certified,
+                    "decision_path": o.decision_path,
+                    "generation": o.generation,
+                    "model_sha": o.model_sha,
+                    "question": o.cmf_question,
+                    "usage": o.cmf_usage,
+                }),
+            );
+        }
         Value::Object(v)
     }
 }
@@ -1940,12 +2296,13 @@ async fn route_handler(
     body: Body,
 ) -> Response {
     let id = ctx.id.clone();
+    let ext = ctx.ext;
     let out = async {
-        let (p, bytes) = keyed_body(&st, &headers, body).await?;
+        let (p, req): (Principal, wire::RouteRequest) =
+            keyed_router_body(&st, &headers, body).await?;
         let account = p.account.clone();
-        let req: RouteRequest = parse_router_body(&bytes).map_err(|e| e.by(&account))?;
         let routing = st
-            .resolve_routing(req.taxonomy_id.as_deref(), &req.options)
+            .resolve_routing(req.taxonomy_id.as_deref(), &req.options, ext)
             .map_err(|e| e.by(&account))?;
         let guard = st
             .svc
@@ -1976,18 +2333,20 @@ async fn batch_handler(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
+    let ext = ctx.ext;
     let out = async {
-        let (p, bytes) = keyed_body(&st, &headers, body).await?;
+        let (p, req): (Principal, wire::BatchRequest) =
+            keyed_router_body(&st, &headers, body).await?;
         let account = p.account.clone();
-        let req: BatchRequest = parse_router_body(&bytes).map_err(|e| e.by(&account))?;
+        // The router checks the taxonomy before the batch size.
+        let routing = st
+            .resolve_routing(req.taxonomy_id.as_deref(), &req.options, ext)
+            .map_err(|e| e.by(&account))?;
         if req.inputs.len() > ROUTER_MAX_BATCH {
             return Err(
                 HttpError::invalid(format!("batch exceeds {ROUTER_MAX_BATCH} inputs")).by(&account),
             );
         }
-        let routing = st
-            .resolve_routing(req.taxonomy_id.as_deref(), &req.options)
-            .map_err(|e| e.by(&account))?;
         let guard = st
             .svc
             .enter()
@@ -2018,11 +2377,21 @@ async fn batch_handler(
 
 // ------------------------------------------------------------------ feedback
 
-/// The router's feedback body (`api.rs:85-89`).
-#[derive(Debug, Deserialize)]
-struct RouterFeedback {
-    request_id: String,
-    correct_task_label: String,
+/// Whether a feedback body is the decisions API's `{id, question, label}`: an
+/// object with one of its keys and none of the router's. Anything else is
+/// the router's `{request_id, correct_task_label}` and is rejected as the
+/// router rejects it.
+fn is_decisions_feedback(bytes: &[u8]) -> bool {
+    match serde_json::from_slice::<Value>(bytes) {
+        Ok(Value::Object(m)) => {
+            ["id", "question", "label"]
+                .iter()
+                .any(|k| m.contains_key(*k))
+                && !m.contains_key("request_id")
+                && !m.contains_key("correct_task_label")
+        }
+        _ => false,
+    }
 }
 
 async fn feedback_handler(
@@ -2031,41 +2400,21 @@ async fn feedback_handler(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
+    let ext = ctx.ext;
     let out = async {
-        let (p, bytes) = keyed_body(&st, &headers, body).await?;
+        let p = caller(&st, &headers).await?;
         let account = p.account.clone();
-        let v = parse_json(&bytes).map_err(|e| HttpError::from(e).by(&account))?;
-        let router_shape = v
-            .as_object()
-            .is_some_and(|m| m.contains_key("request_id") || m.contains_key("correct_task_label"));
-        let guard = st.svc.enter().map_err(|e| HttpError::from(e).by(&account))?;
-        let s = Arc::clone(&st);
-        let reply = blocking(move || {
-            let _slot = guard;
-            if router_shape {
-                let fb: RouterFeedback = serde_json::from_value(v).map_err(|e| {
-                    HttpError::invalid(format!("invalid feedback: {e}")).by(&p.account)
-                })?;
-                let not_found = || {
-                    HttpError::not_found("request_id not found or already consumed")
-                        .by(&p.account)
-                };
-                let decision = s.linked(&fb.request_id).ok_or_else(not_found)?;
-                let jev = json!({"id": decision, "question": ROUTE_QUESTION_ID, "label": fb.correct_task_label});
-                let bytes = serde_json::to_vec(&jev).map_err(|e| internal_error("feedback", e))?;
-                let mut r = s.svc.feedback(&bytes, &p).map_err(|e| {
-                    let e = HttpError::from(e).by(&p.account);
-                    if e.status == 404 { not_found() } else { e }
-                })?;
-                s.unlink(&fb.request_id);
-                let stored = r["accepted"].clone();
-                r["schema_version"] = json!(ROUTER_SCHEMA_VERSION);
-                r["accepted"] = json!(true);
-                r["stored"] = stored;
-                r["message"] = json!(format!("feedback recorded for '{}'", fb.correct_task_label));
-                r["request_id"] = json!(fb.request_id);
-                Ok(r)
-            } else {
+        let bytes = router_body_bytes(&headers, body, st.body_limit())
+            .await
+            .map_err(|e| e.by(&account))?;
+        if is_decisions_feedback(&bytes) {
+            let guard = st
+                .svc
+                .enter()
+                .map_err(|e| HttpError::from(e).by(&account))?;
+            let s = Arc::clone(&st);
+            let reply = blocking(move || {
+                let _slot = guard;
                 let mut r = s
                     .svc
                     .feedback(&bytes, &p)
@@ -2074,7 +2423,48 @@ async fn feedback_handler(
                 r["schema_version"] = json!(ROUTER_SCHEMA_VERSION);
                 r["message"] = json!(format!("feedback recorded for '{label}'"));
                 Ok(r)
+            })
+            .await?;
+            return Ok(Reply::ok(reply).by(&account));
+        }
+        let fb: wire::FeedbackRequest = router_json(&bytes).map_err(|e| e.by(&account))?;
+        let label_len = fb.correct_task_label.len();
+        if label_len == 0 || label_len > ROUTER_MAX_LABEL_BYTES {
+            return Err(HttpError::invalid(format!(
+                "correct_task_label must be 1..{ROUTER_MAX_LABEL_BYTES} bytes"
+            ))
+            .by(&account));
+        }
+        let guard = st
+            .svc
+            .enter()
+            .map_err(|e| HttpError::from(e).by(&account))?;
+        let s = Arc::clone(&st);
+        let reply = blocking(move || {
+            let _slot = guard;
+            let not_found =
+                || HttpError::not_found("request_id not found or already consumed").by(&p.account);
+            let decision = s.linked(&fb.request_id).ok_or_else(not_found)?;
+            let req = cortiq_decision::protocol::FeedbackRequest {
+                id: decision,
+                question: ROUTE_QUESTION_ID.to_string(),
+                label: fb.correct_task_label.clone(),
+                any_label: true,
+            };
+            let r = s.svc.feedback_request(&req, &p).map_err(|e| {
+                let e = HttpError::from(e).by(&p.account);
+                if e.status == 404 { not_found() } else { e }
+            })?;
+            s.unlink(&fb.request_id);
+            let mut v = json!({
+                "schema_version": ROUTER_SCHEMA_VERSION,
+                "accepted": true,
+                "message": format!("feedback recorded for '{}'", fb.correct_task_label),
+            });
+            if ext {
+                v["cmf"] = r;
             }
+            Ok(v)
         })
         .await?;
         Ok(Reply::ok(reply).by(&account))
@@ -2096,7 +2486,7 @@ async fn taxonomies_handler(
         let list: Vec<Value> = st
             .ordered_skills(&model)
             .into_iter()
-            .map(|s| taxonomy_summary(&model, s))
+            .map(|s| taxonomy_summary(&model, s, ctx.ext))
             .collect();
         Ok(Reply::ok(json!({
             "schema_version": ROUTER_SCHEMA_VERSION,
@@ -2120,7 +2510,7 @@ async fn taxonomy_handler(
         let s = model
             .skill(&id)
             .ok_or_else(|| taxonomy_not_found(&id).by(&p.account))?;
-        Ok(Reply::ok(taxonomy_summary(&model, s)).by(&p.account))
+        Ok(Reply::ok(taxonomy_summary(&model, s, ctx.ext)).by(&p.account))
     }
     .await;
     respond(&ctx, out)
@@ -2133,37 +2523,53 @@ async fn usage_handler(
 ) -> Response {
     let out = async {
         let p = caller(&st, &headers).await?;
-        Ok(Reply::ok(st.usage_json(&p)).by(&p.account))
+        Ok(Reply::ok(st.usage_json(&p, ctx.ext)).by(&p.account))
     }
     .await;
     respond(&ctx, out)
 }
 
+/// The router's `Query<EscalationsQuery>` (axum 0.7): 400 with axum's text
+/// (axum 0.7 names no field in it; 0.8 prefixes the field, which is dropped).
+fn escalations_query(uri: &Uri) -> Result<wire::EscalationsQuery, HttpError> {
+    const PREFIX: &str = "Failed to deserialize query string: ";
+    axum::extract::Query::<wire::EscalationsQuery>::try_from_uri(uri)
+        .map(|q| q.0)
+        .map_err(|r| {
+            let text = r.body_text();
+            let text = match text.strip_prefix(PREFIX) {
+                Some(rest) => format!("{PREFIX}{}", rest.strip_prefix("limit: ").unwrap_or(rest)),
+                None => text,
+            };
+            HttpError::plain(r.status().as_u16(), text)
+        })
+}
+
 async fn escalations_handler(
     State(st): State<Arc<DecisionState>>,
     Extension(ctx): Extension<Ctx>,
-    RawQuery(query): RawQuery,
+    uri: Uri,
     headers: HeaderMap,
 ) -> Response {
     let out = async {
         let p = caller(&st, &headers).await?;
-        let mut limit = ESCALATIONS_DEFAULT_LIMIT;
-        for pair in query.as_deref().unwrap_or("").split('&') {
-            if let Some(v) = pair.strip_prefix("limit=") {
-                limit = v
-                    .parse::<usize>()
-                    .map_err(|_| {
-                        HttpError::invalid("limit must be a non-negative integer").by(&p.account)
-                    })?
-                    .clamp(1, ESCALATIONS_MAX_LIMIT);
-            }
-        }
+        let q = escalations_query(&uri).map_err(|e| e.by(&p.account))?;
+        let limit = q
+            .limit
+            .unwrap_or(ESCALATIONS_DEFAULT_LIMIT)
+            .clamp(1, ESCALATIONS_MAX_LIMIT);
         let records: Vec<Value> = lock(&st.audit)
             .iter()
             .rev()
             .filter(|e| e.account == p.account)
             .take(limit)
-            .map(|e| e.record.clone())
+            .map(|e| {
+                let mut r = e.record.clone();
+                if ctx.ext {
+                    r["cmf"] = json!({"question": e.question});
+                }
+                r
+            })
             .collect();
         let c = &st.counters;
         let (buffered, cache) = match &st.cascade {
@@ -2172,9 +2578,9 @@ async fn escalations_handler(
                 (
                     cas.buffer_len() as u64,
                     json!({
-                        "entries": l["cache"]["entries"],
-                        "hits": l["cache"]["hits"],
-                        "lookups": l["cache"]["lookups"],
+                        "entries": l["cache"]["entries"].as_u64().unwrap_or(0),
+                        "hits": l["cache"]["hits"].as_u64().unwrap_or(0),
+                        "lookups": l["cache"]["lookups"].as_u64().unwrap_or(0),
                     }),
                 )
             }
@@ -2233,14 +2639,21 @@ async fn metrics_handler(
 
 // ------------------------------------------------------------------ admin
 
-/// The router's key fields next to ours (`api.rs:492-527`).
-fn router_key_fields(v: &mut Value) {
-    let hash12 = v["hash12"].clone();
-    let expires = v["expires"].clone();
-    let created = v["created"].clone();
-    v["key_hash_prefix"] = hash12;
-    v["expires_at"] = expires;
-    v["created_at"] = created;
+/// The router's view of a key (`api.rs:514-526`).
+fn router_key_listing(listing: &Value, usage: &Value) -> Value {
+    json!({
+        "account": listing["account"],
+        "plan": listing["plan"],
+        "rate_per_min": listing["rate_per_min"],
+        "decision_quota": listing["decision_quota"],
+        "expires_at": listing["expires"],
+        "expired": listing["expired"],
+        "key_hash_prefix": listing["hash12"],
+        "usage": {
+            "decisions": usage["decisions"].as_u64().unwrap_or(0),
+            "oracle_calls": usage["oracle_calls"].as_u64().unwrap_or(0),
+        },
+    })
 }
 
 async fn admin_create_key(
@@ -2250,25 +2663,53 @@ async fn admin_create_key(
     body: Body,
 ) -> Response {
     let out = async {
-        let bytes = admin_body(&st, &headers, body).await?;
-        let mut v = parse_json(&bytes)?;
-        let Some(m) = v.as_object_mut() else {
-            return Err(HttpError::invalid("the key request must be a JSON object"));
-        };
-        // The router's `email` is accepted and not stored (no personal data in
-        // keys.json).
-        m.remove("email");
-        let body = serde_json::to_vec(&v).map_err(|e| internal_error("admin keys", e))?;
+        // The router's `Json` extractor runs before its token check.
+        let bytes = router_body_bytes(&headers, body, st.body_limit()).await?;
+        let req: wire::CreateKeyReq = router_json(&bytes)?;
+        admin_guard(&st, &headers)?;
+        let mut new = Map::new();
+        for (k, v) in [
+            ("plan", json!(req.plan)),
+            ("account", json!(req.account)),
+            ("label", json!(req.label)),
+            ("days", json!(req.days)),
+            ("rate_per_min", json!(req.rate_per_min)),
+            ("decision_quota", json!(req.decision_quota)),
+            ("token_quota", json!(req.token_quota)),
+            ("credit_usd", json!(req.credit_usd)),
+            ("oracle_budget_usd", json!(req.oracle_budget_usd)),
+            ("oracle_allowed", json!(req.oracle_allowed)),
+        ] {
+            if !v.is_null() {
+                new.insert(k.to_string(), v);
+            }
+        }
+        let body = serde_json::to_vec(&new).map_err(|e| internal_error("admin keys", e))?;
         let s = Arc::clone(&st);
-        let mut created = blocking(move || Ok(s.svc.admin_create_key(&body)?)).await?;
-        router_key_fields(&mut created);
-        created["persisted"] = json!(true);
+        let created = blocking(move || Ok(s.svc.admin_create_key(&body)?)).await?;
         tracing::info!(
             account = created["account"].as_str().unwrap_or_default(),
             plan = created["plan"].as_str().unwrap_or_default(),
             "admin: API key created"
         );
-        Ok(Reply::ok(created))
+        let mut v = json!({
+            "key": created["key"],
+            "account": created["account"],
+            "plan": created["plan"],
+            "rate_per_min": created["rate_per_min"],
+            "decision_quota": created["decision_quota"],
+            "expires_at": created["expires"],
+            "created_at": created["created"],
+            "persisted": true,
+        });
+        if ctx.ext {
+            let mut listing = created;
+            if let Some(m) = listing.as_object_mut() {
+                m.remove("key");
+            }
+            v["cmf"] = listing;
+        }
+        Ok(Reply::ok(v))
     }
     .await;
     respond(&ctx, out)
@@ -2282,11 +2723,24 @@ async fn admin_list_keys(
     let out = async {
         admin_guard(&st, &headers)?;
         let s = Arc::clone(&st);
-        let mut list = blocking(move || Ok(s.svc.admin_list_keys()?)).await?;
-        if let Some(keys) = list["keys"].as_array_mut() {
-            keys.iter_mut().for_each(router_key_fields);
-        }
-        Ok(Reply::ok(list))
+        let list = blocking(move || Ok(s.svc.admin_list_keys()?)).await?;
+        // The router's gate drops a revoked key; keys.json keeps it inactive
+        // (shown with the extensions).
+        let keys: Vec<Value> = list["keys"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter(|k| ctx.ext || k["active"].as_bool().unwrap_or(false))
+            .map(|k| {
+                let mut v = router_key_listing(k, &k["usage"]);
+                if ctx.ext {
+                    v["cmf"] = k.clone();
+                }
+                v
+            })
+            .collect();
+        Ok(Reply::ok(json!({"count": keys.len(), "keys": keys})))
     }
     .await;
     respond(&ctx, out)

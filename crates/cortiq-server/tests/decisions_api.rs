@@ -27,6 +27,11 @@
 //!   router-client and `scripts/eval.py` recipes, invariants, `top_k`,
 //!   taxonomies, batch, bring-your-own embedding, router feedback and error
 //!   envelope, escalations scoped to the caller.
+//!
+//! Every request of [`Srv`] carries `x-cmf-extensions: 1`, so router-surface
+//! answers include the opt-in `cmf` diagnostics these tests read (action,
+//! certified, gate, totals, error metadata); the exact default router shapes
+//! are checked in `router_compat.rs`.
 
 use axum::body::Body;
 use axum::http::{HeaderMap, Request};
@@ -323,7 +328,9 @@ impl Srv {
         headers: &[(&str, &str)],
         body: Option<Vec<u8>>,
     ) -> Resp {
-        call(self.app.as_ref().unwrap(), method, path, headers, body).await
+        let mut h = headers.to_vec();
+        h.push(("x-cmf-extensions", "1"));
+        call(self.app.as_ref().unwrap(), method, path, &h, body).await
     }
 
     async fn post(&self, path: &str, key: Option<&str>, v: &Value) -> Resp {
@@ -416,7 +423,14 @@ impl Resp {
             e["retriable"],
             json!(matches!(self.status, 429 | 500 | 502))
         );
-        assert!(e["details"].is_object());
+        // The router's `details`: an object for TAXONOMY_NOT_FOUND, else null.
+        assert_eq!(
+            e["details"].is_object(),
+            e["code"] == "TAXONOMY_NOT_FOUND",
+            "{}",
+            self.text
+        );
+        assert!(e["details"].is_object() || e["details"].is_null());
         assert_eq!(e["metadata"]["reason"], e["code"]);
         (self.status, e["code"].as_str().unwrap().to_string())
     }
@@ -1089,7 +1103,9 @@ async fn usage_rows_and_sums_and_usage_shows_only_the_callers_account() {
     assert_eq!(ua.status, 200, "{}", ua.text);
     assert_eq!(ua.body["schema_version"], "1.1");
     assert_eq!(ua.body["account"]["id"], "alpha");
-    let t = &ua.body["usage"];
+    assert_eq!(ua.body["usage"]["billable_decisions"], 4);
+    // The decisions service's totals are the opt-in `cmf.totals`.
+    let t = &ua.body["cmf"]["totals"];
     let sum = |k: &str| {
         mine.iter()
             .map(|r| r.body["usage"][k].as_u64().unwrap())
@@ -1097,7 +1113,6 @@ async fn usage_rows_and_sums_and_usage_shows_only_the_callers_account() {
     };
     assert_eq!(t["requests"], 2);
     assert_eq!(t["decisions"], 4);
-    assert_eq!(t["billable_decisions"], 4);
     assert_eq!(ua.body["account"]["billable_decisions"], 4);
     assert_eq!(t["input_tokens"].as_u64(), Some(sum("input_tokens")));
     assert_eq!(t["output_tokens"].as_u64(), Some(sum("output_tokens")));
@@ -1108,7 +1123,8 @@ async fn usage_rows_and_sums_and_usage_shows_only_the_callers_account() {
     assert!((t["cost_usd"].as_f64().unwrap() - cost).abs() < 1e-12);
     let ub = srv.get("/v1/usage", Some(&kb)).await;
     assert_eq!(ub.body["account"]["id"], "bravo");
-    assert_eq!(ub.body["usage"]["decisions"], 1);
+    assert_eq!(ub.body["usage"]["billable_decisions"], 1);
+    assert_eq!(ub.body["cmf"]["totals"]["decisions"], 1);
     assert!(!ua.text.contains("bravo") && !ub.text.contains("alpha"));
 
     // The ledger rows: one per request, the response's numbers, no text.
@@ -1146,7 +1162,7 @@ async fn usage_rows_and_sums_and_usage_shows_only_the_callers_account() {
     let dir = srv.close();
     let srv = Srv::open_with(cfg(), true, Some(ADMIN), dir);
     let ua2 = srv.get("/v1/usage", Some(&ka)).await;
-    assert_eq!(ua2.body["usage"]["input_tokens"], t["input_tokens"]);
+    assert_eq!(ua2.body["cmf"]["totals"]["input_tokens"], t["input_tokens"]);
 }
 
 // ------------------------------------------------------------------ admin
@@ -1181,7 +1197,7 @@ async fn admin_creates_lists_and_revokes_keys() {
     assert_eq!(r.body["rate_per_min"], 600);
     assert_eq!(r.body["decision_quota"], 1_000_000);
     assert_eq!(r.body["persisted"], true);
-    assert_eq!(r.body["key_hash_prefix"], json!(&hash_key(&raw)[..12]));
+    assert_eq!(r.body["cmf"]["hash12"], json!(&hash_key(&raw)[..12]));
     assert!(r.body.get("created_at").is_some() && r.body.get("expires_at").is_some());
     assert!(!r.text.contains("ops@acme.test"), "the email is not stored");
     let (k2, _) = srv
@@ -1204,10 +1220,11 @@ async fn admin_creates_lists_and_revokes_keys() {
         "expired",
         "key_hash_prefix",
         "usage",
-        "hash12",
-        "active",
     ] {
         assert!(first.get(f).is_some(), "listing field {f}");
+    }
+    for f in ["hash12", "active", "label", "token_quota"] {
+        assert!(first["cmf"].get(f).is_some(), "extension listing field {f}");
     }
     assert_eq!(first["usage"]["decisions"], 0);
     let keys_json = std::fs::read_to_string(srv.state_root().join("keys.json")).unwrap();
@@ -1241,10 +1258,20 @@ async fn admin_creates_lists_and_revokes_keys() {
         .admin("POST", "/v1/admin/keys", Some(&json!({"plan": "platinum"})))
         .await;
     assert_eq!(r.router_error(), (400, "INVALID_REQUEST".to_string()));
+    // Unknown fields are ignored like the router's serde; a wrong type is
+    // axum's 422 text.
     let r = srv
         .admin("POST", "/v1/admin/keys", Some(&json!({"colour": "red"})))
         .await;
-    assert_eq!(r.router_error(), (400, "INVALID_REQUEST".to_string()));
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = srv
+        .admin(
+            "POST",
+            "/v1/admin/keys",
+            Some(&json!({"rate_per_min": "fast"})),
+        )
+        .await;
+    assert_eq!(r.status, 422, "{}", r.text);
     // The other admin endpoints answer (no oracle traffic here).
     for p in [
         "/v1/admin/usage",
@@ -1322,12 +1349,15 @@ async fn models_shape_prices_healthz_readyz_metrics_and_no_cors() {
         &json!({"prompt": "0.0000005", "completion": "0.000002", "request": "0.001", "image": "0"})
     );
 
-    for path in ["/healthz", "/v1/healthz"] {
-        let h = srv.get(path, None).await;
-        assert_eq!(h.status, 200);
-        assert_eq!(h.body["status"], "ok");
-        assert_eq!(h.body["skills"], 2);
-    }
+    let h = srv.get("/healthz", None).await;
+    assert_eq!(h.status, 200);
+    assert_eq!(h.body["status"], "ok");
+    assert_eq!(h.body["skills"], 2);
+    // The router's /v1/healthz is {"status":"ok"}; the rest is opt-in.
+    let h = srv.get("/v1/healthz", None).await;
+    assert_eq!(h.status, 200);
+    assert_eq!(h.body["status"], "ok");
+    assert_eq!(h.body["cmf"]["skills"], 2);
     let r = srv.get("/v1/readyz", None).await;
     assert_eq!(r.body, json!({"status": "ready"}));
     assert!(r.request_id().starts_with("req_"));
@@ -1866,14 +1896,17 @@ async fn router_api_route_fields_invariants_and_recipes() {
             .await;
         assert_eq!(r.router_error(), (400, "EMBEDDING_REQUIRED".to_string()));
     }
+    // Bodies the router's axum extractor rejects: 422 with axum's text.
     let r = srv
         .post("/v1/route", Some(&key), &json!({"taxonomy_id": "topics"}))
         .await;
-    assert_eq!(r.router_error(), (400, "INVALID_REQUEST".to_string()));
+    assert_eq!(r.status, 422, "{}", r.text);
+    assert!(r.text.contains("missing field `input`"), "{}", r.text);
     let r = srv
         .post("/v1/route", Some(&key), &json!({"taxonomy_id": "topics", "input": {"text": "x"}, "options": {"policy_profile": "yolo"}}))
         .await;
-    assert_eq!(r.router_error(), (400, "INVALID_REQUEST".to_string()));
+    assert_eq!(r.status, 422, "{}", r.text);
+    assert!(r.text.contains("unknown variant `yolo`"), "{}", r.text);
     let r = srv.post("/v1/route", None, &req).await;
     assert_eq!(r.router_error(), (401, "UNAUTHORIZED".to_string()));
     // Unknown fields are ignored like the router's serde.
@@ -2073,7 +2106,7 @@ async fn router_batch_embeddings_and_feedback() {
         r.body["message"],
         json!(format!("feedback recorded for '{other_label}'"))
     );
-    assert_eq!(r.body["weight"], 3.0);
+    assert_eq!(r.body["cmf"]["weight"], 3.0);
     let r = srv.post("/v1/feedback", Some(&key), &fb).await;
     assert_eq!(r.router_error(), (404, "INVALID_REQUEST".to_string()));
     assert!(
@@ -2125,5 +2158,9 @@ async fn router_batch_embeddings_and_feedback() {
     let e = srv.get("/v1/escalations?limit=1", Some(&key)).await;
     assert_eq!(e.body["records"].as_array().unwrap().len(), 1);
     let e = srv.get("/v1/escalations?limit=x", Some(&key)).await;
-    assert_eq!(e.router_error(), (400, "INVALID_REQUEST".to_string()));
+    assert_eq!(e.status, 400);
+    assert_eq!(
+        e.text,
+        "Failed to deserialize query string: invalid digit found in string"
+    );
 }
