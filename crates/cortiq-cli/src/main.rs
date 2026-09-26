@@ -4,6 +4,7 @@
 mod avout;
 mod awnp;
 mod convert;
+mod decision;
 mod gguf;
 mod gptq;
 mod http_range;
@@ -246,19 +247,32 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start the inference server with web dashboard
+    /// Start the inference server with web dashboard (on a decision file:
+    /// the decisions API, see `cortiq decision`)
     Serve {
         /// Path to .cmf model file
         model: String,
         /// Port to listen on
         #[arg(short, long, default_value = "8080")]
         port: u16,
-        /// Host / interface to bind (use 127.0.0.1 for local-only)
-        #[arg(long, default_value = "0.0.0.0")]
-        host: String,
-        /// Default task mask
-        #[arg(short, long, default_value = "general")]
-        task: String,
+        /// Host / interface to bind [default: 0.0.0.0; 127.0.0.1 for a
+        /// decision file]
+        #[arg(long)]
+        host: Option<String>,
+        /// Default task mask [default: general]
+        #[arg(short, long)]
+        task: Option<String>,
+        /// Decision file only: server configuration JSON (keys, limits,
+        /// prices, oracle, cache, learning)
+        #[arg(long)]
+        decision_config: Option<String>,
+        /// Decision file only: state directory (keys, usage and oracle
+        /// ledgers, generations) [default: <MODEL>.state]
+        #[arg(long)]
+        state: Option<String>,
+        /// Decision file only: remove a state LOCK left by a dead process
+        #[arg(long)]
+        break_lock: bool,
         /// Also listen on ollama-compatible port
         #[arg(long)]
         compat_port: Option<u16>,
@@ -296,6 +310,15 @@ enum Commands {
         /// does not. The server prints which mode it took and why.
         #[arg(long, conflicts_with = "peer")]
         gpus: Option<usize>,
+    },
+    /// Decide with a decision file: one text (-p) or a JSONL batch (--input);
+    /// local only, the oracle is never called
+    Decide(decision::DecideArgs),
+    /// Decision files: build (init, train, add-skill, learn), inspect (info,
+    /// verify), generations (materialize, rollback) and API keys
+    Decision {
+        #[command(subcommand)]
+        cmd: decision::DecisionCmd,
     },
     /// Convert a Hugging Face checkpoint to .cmf — native Rust, no Python
     Convert {
@@ -1964,7 +1987,8 @@ async fn main() -> anyhow::Result<()> {
     // in front of an answer. Every other command keeps the informative
     // default. RUST_LOG overrides either way.
     let default_level = match &cli.command {
-        Commands::Run { .. } => "warn",
+        // `decide` prints its answer (and its batch totals on stderr).
+        Commands::Run { .. } | Commands::Decide(_) => "warn",
         _ => "info",
     };
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -1988,6 +2012,9 @@ async fn main() -> anyhow::Result<()> {
             port,
             host,
             task,
+            decision_config,
+            state,
+            break_lock,
             compat_port,
             o1,
             o1_m,
@@ -1999,6 +2026,27 @@ async fn main() -> anyhow::Result<()> {
             net_dtype,
             gpus,
         } => {
+            // The language-model flags a decision file refuses (spec §4.2).
+            let llm_given: Vec<&'static str> = [
+                ("--task", task.is_some()),
+                ("--compat-port", compat_port.is_some()),
+                ("--o1", o1.is_some()),
+                ("--o1-m", o1_m.is_some()),
+                ("--o1-window", o1_window.is_some()),
+                ("--o1-sink", o1_sink.is_some()),
+                ("--peer", peer.is_some()),
+                ("--peer-split", peer_split.is_some()),
+                ("--net-token", net_token.is_some()),
+                ("--gpus", gpus.is_some()),
+            ]
+            .into_iter()
+            .filter_map(|(name, given)| given.then_some(name))
+            .collect();
+            let decision_flags = decision::ServeFlags {
+                decision_config: decision_config.map(Into::into),
+                state: state.map(Into::into),
+                break_lock,
+            };
             let o1 = O1Flags {
                 spec: o1,
                 m: o1_m,
@@ -2008,9 +2056,11 @@ async fn main() -> anyhow::Result<()> {
             };
             cmd_serve(
                 &model,
-                &host,
+                host.as_deref(),
                 port,
-                &task,
+                task.as_deref(),
+                &llm_given,
+                &decision_flags,
                 compat_port,
                 &o1,
                 peer.as_deref(),
@@ -2021,6 +2071,8 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         }
+        Commands::Decide(args) => decision::run_decide(&args),
+        Commands::Decision { cmd } => decision::run_decision(&cmd),
         Commands::Convert {
             model,
             quant,
@@ -3056,9 +3108,11 @@ async fn main() -> anyhow::Result<()> {
 #[allow(clippy::too_many_arguments)]
 async fn cmd_serve(
     model_path: &str,
-    host: &str,
+    host: Option<&str>,
     port: u16,
-    default_task: &str,
+    default_task: Option<&str>,
+    llm_given: &[&'static str],
+    decision_flags: &decision::ServeFlags,
     _compat_port: Option<u16>,
     o1: &O1Flags,
     peer: Option<&str>,
@@ -3076,6 +3130,16 @@ async fn cmd_serve(
     // Load model + pipeline (real weights; fails loudly on a bad file).
     println!("  Loading model: {}", model_path);
     let model = Arc::new(CmfModel::open_sharded(model_path)?);
+    // A decision file (DECISION bit) is served by the decisions server: no
+    // Pipeline, no GPU, loopback unless --host says otherwise (spec §4.2).
+    let is_decision = decision::is_decision_model(&model);
+    decision::check_serve_flags(model_path, is_decision, llm_given, decision_flags)?;
+    let host = decision::resolve_serve_host(host, is_decision);
+    if is_decision {
+        drop(model);
+        return decision::serve(model_path, host, port, decision_flags).await;
+    }
+    let default_task = default_task.unwrap_or("general");
     let arch = model.arch();
     println!(
         "    Architecture: {} | {}L | hidden={} | FFN={}",
