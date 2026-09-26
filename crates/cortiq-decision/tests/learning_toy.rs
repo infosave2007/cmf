@@ -27,6 +27,8 @@
 
 #[path = "fixtures/oracle/support.rs"]
 mod support;
+#[path = "common/toy_dir.rs"]
+mod toy_dir;
 
 use cortiq_decision::build;
 use cortiq_decision::container::{DecisionModel, Verify};

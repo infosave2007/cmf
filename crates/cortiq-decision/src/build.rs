@@ -978,7 +978,10 @@ pub fn add_skill(input: &Path, opts: &TrainOptions, out: &Path) -> Result<BuildR
 
 /// `cortiq decision init --encoder-dir DIR -o OUT`: an encoder-only decision
 /// file from an export directory (`tools/decision_export_encoder.py`), with the
-/// φ_P of the default golden texts; re-opened and golden-checked.
+/// φ_P of the default golden texts. Like `train` and `add-skill`, the file is
+/// written to a staging path next to `out`, opened there with full
+/// verification and golden-checked, and only then published without clobber:
+/// a file that fails its golden check is never published.
 pub fn init_encoder(
     export_dir: &Path,
     out: &Path,
@@ -991,8 +994,33 @@ pub fn init_encoder(
     if let Some(t) = created_unix {
         b.set_created_unix(t);
     }
-    let report = b.write(out)?;
-    let model = DecisionModel::open(out, Verify::Full).map_err(|e| anyhow::anyhow!("{e}"))?;
-    SignalEncoder::from_model(&model)?;
-    Ok(report)
+    check_output(out)?;
+    let staging = staging_path(out);
+    // The staging name is ours from here on: removed whatever happens.
+    let _staging_guard = RemoveOnDrop(Some(staging.clone()));
+    let staged = b.write(&staging)?;
+    {
+        let model =
+            DecisionModel::open(&staging, Verify::Full).map_err(|e| anyhow::anyhow!("{e}"))?;
+        SignalEncoder::from_model(&model)
+            .with_context(|| format!("golden check of {}", out.display()))?;
+    }
+    publish(&staging, out)?;
+    let (sha, bytes) = file_sha256(out)?;
+    ensure!(
+        sha == staged.sha256 && bytes == staged.bytes,
+        "{} changed while it was published",
+        out.display()
+    );
+    let reopened = DecisionModel::open(out, Verify::Light)
+        .map_err(|e| anyhow::anyhow!("re-open {}: {e}", out.display()))?;
+    ensure!(
+        reopened.model_sha() == staged.model_sha,
+        "{} re-opens with another model_sha",
+        out.display()
+    );
+    Ok(WriteReport {
+        path: out.to_path_buf(),
+        ..staged
+    })
 }

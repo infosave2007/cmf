@@ -30,6 +30,9 @@
 //! * `decision learn` with the mock oracle: only abstentions are asked, ledger
 //!   answers are reused, the reservation ledger holds no key.
 
+#[path = "support/toy_dir.rs"]
+mod toy_dir;
+
 use cortiq_decision::config::Config;
 use cortiq_decision::container::{DecisionModel, Verify};
 use cortiq_decision::eval::Evaluator;
@@ -288,7 +291,7 @@ fn toy_encoder_dir() -> PathBuf {
 }
 
 struct Toy {
-    dir: tempfile::TempDir,
+    dir: PathBuf,
     enc: PathBuf,
     s1: PathBuf,
     path: PathBuf,
@@ -303,8 +306,8 @@ struct Toy {
 fn toy() -> &'static Toy {
     static TOY: OnceLock<Toy> = OnceLock::new();
     TOY.get_or_init(|| {
-        let dir = tempfile::tempdir().unwrap();
-        let d = dir.path();
+        let dir = toy_dir::toy_dir("toy");
+        let d = dir.as_path();
         let enc = d.join("enc.cmf");
         let init_report = json_of(&ok(&[
             "decision",
@@ -749,7 +752,7 @@ fn init_train_and_add_skill_build_the_toy_file() {
     assert_eq!(info["summary"][1]["labels"], 3);
 
     // An existing skill id is refused; an existing output is never replaced.
-    let d = t.dir.path();
+    let d = t.dir.as_path();
     let mut a: Vec<String> = ["decision", "add-skill", s(&t.path), "--skill", "topics"]
         .iter()
         .map(|x| x.to_string())

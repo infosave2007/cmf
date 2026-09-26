@@ -9,7 +9,8 @@
 //! python3 tools/decision_encoder_parity.py unicode-probe --out $PROBE
 //! CMF_GPU=0 CORTIQ_DECISION_ENCODER_DIR=$ENC CORTIQ_DECISION_HF_IDS_DIR=$IDS \
 //!   CORTIQ_DECISION_UNICODE_PROBE=$PROBE \
-//!   CORTIQ_DECISION_V3_DIR=/Users/oleg/dev/cmfpublic/artifacts/decision-v3-20260926 \
+//!   CORTIQ_DECISION_V3_DIR=$CMFPUBLIC/artifacts/decision-v3-20260926 \
+//!   CORTIQ_DECISION_TEST_ACCESS_LOG=$CMFPUBLIC/artifacts/decision-v4-20260926/test-access.log \
 //!   [CORTIQ_DECISION_ENCODER_OUT=<dir>] [CORTIQ_DECISION_THREADS=4] \
 //!   cargo test --release -p cortiq-decision --test encoder_real -- --ignored --nocapture --test-threads=1
 //! ```
@@ -521,9 +522,9 @@ fn encoder_child() {
     std::fs::write(&out, bytes).unwrap();
 }
 
-fn run_child(tag: &str, envs: &[(&str, &str)]) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("cortiq-decision-encoder-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+/// Run `encoder_child` in a child process; its output goes to `dir/{tag}.out`
+/// (`dir` is the caller's temp dir, removed when the caller's test ends).
+fn run_child(dir: &Path, tag: &str, envs: &[(&str, &str)]) -> PathBuf {
     let out = dir.join(format!("{tag}.out"));
     let _ = std::fs::remove_file(&out);
     let exe = std::env::current_exe().unwrap();
@@ -582,9 +583,14 @@ fn e5_determinism() {
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect()
     };
-    let child = read(run_child("default", &[]));
-    let child_veclib1 = read(run_child("veclib1", &[("VECLIB_MAXIMUM_THREADS", "1")]));
-    let child_noaccel = read(run_child("noaccel", &[("CMF_ACCEL", "0")]));
+    let tmp = tempfile::tempdir().unwrap();
+    let child = read(run_child(tmp.path(), "default", &[]));
+    let child_veclib1 = read(run_child(
+        tmp.path(),
+        "veclib1",
+        &[("VECLIB_MAXIMUM_THREADS", "1")],
+    ));
+    let child_noaccel = read(run_child(tmp.path(), "noaccel", &[("CMF_ACCEL", "0")]));
     let runs = compare_bits(&run1, &run2, dim);
     let threads = compare_bits(&run1, &batch, dim);
     let procs = compare_bits(&run1, &child, dim);
@@ -602,7 +608,9 @@ fn e5_determinism() {
 #[test]
 #[ignore]
 fn encoder_speed_one_thread() {
+    let tmp = tempfile::tempdir().unwrap();
     let out = run_child(
+        tmp.path(),
         "speed",
         &[
             ("CORTIQ_DECISION_CHILD_MODE", "speed"),

@@ -15,7 +15,7 @@
 //!   unset (the default selects Metal on macOS); with `CMF_GPU=0` no backend
 //!   can come up at all.
 
-use cortiq_decision::bert::{EncoderExport, GOLDEN_MAX_ABS};
+use cortiq_decision::bert::{BertModel, EncoderExport, GOLDEN_MAX_ABS};
 use cortiq_decision::container::{DecisionModel, FileBuilder, Verify};
 use cortiq_decision::manifest::{
     DEFAULT_ENCODER_GOLDEN_TEXTS, DEFAULT_MODEL_ID, DEFAULT_NAME, ENCODER_GOLDEN_COUNT,
@@ -120,6 +120,10 @@ fn toy_decision_file_passes_the_golden_check() {
     let model = DecisionModel::open(&out, Verify::Full).unwrap();
     assert_eq!(model.encoder_dim(), 32);
     assert_eq!(model.signal_dim(), 32 + 4096);
+    // Spec §2.2: the (64-byte aligned) weights are views of the file's mapping,
+    // not copies; only the token-type row is copied.
+    let bert = BertModel::from_model(&model).unwrap();
+    assert_eq!(bert.copied_weight_values(), 32);
     let (se, golden) = SignalEncoder::from_model(&model).unwrap();
     assert_eq!(golden.rows, ENCODER_GOLDEN_COUNT);
     assert_eq!(golden.bit_exact_rows, ENCODER_GOLDEN_COUNT);

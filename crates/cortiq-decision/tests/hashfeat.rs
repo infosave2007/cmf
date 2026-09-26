@@ -1,12 +1,45 @@
 //! The `cortiq-hashfeat-v1` contract (spec §1.5, §2.6): the file is the verbatim
-//! embryo copy plus one marked contract section, the 32 golden vectors are pinned,
-//! and the contract strings are the ones of `contract_v2.rs`.
+//! embryo copy (with one declared line, see [`SUBSTITUTED_LINE`]) plus one marked
+//! contract section, the 32 golden vectors are pinned, and the contract strings
+//! are the ones of `contract_v2.rs`.
+//!
+//! The embryo sources are read when `CORTIQ_DECISION_EMBRYO_SRC` names their
+//! directory, else `$CMFPUBLIC/tools/cortiq-decision-embryo/src`; the byte
+//! comparisons are skipped when neither is set or the files are absent.
 use cortiq_decision::hashfeat::{self, DIM, GOLDEN_DENSE_SHA256, GOLDEN_TEXTS};
 use sha2::{Digest, Sha256};
+use std::path::PathBuf;
 
 const SECTION_BEGIN: &str = "\n// ==== cortiq-hashfeat-v1 contract";
 const SECTION_END: &str = "// ==== end cortiq-hashfeat-v1 contract ====\n";
-const EMBRYO_DIR: &str = "/Users/oleg/dev/cmfpublic/tools/cortiq-decision-embryo/src";
+const EMBRYO_SRC_ENV: &str = "CORTIQ_DECISION_EMBRYO_SRC";
+const EMBRYO_SRC_UNDER_CMFPUBLIC: &str = "tools/cortiq-decision-embryo/src";
+/// The one line of the embryo copy the release file replaces: the embryo's
+/// `ORIGINAL_SRC_DIR` is a local absolute path, the release reads it from the
+/// build environment, so that the published crate holds no local path.
+const SUBSTITUTED_LINE: &str = "pub const ORIGINAL_SRC_DIR: &str = ";
+/// sha256 of `src/hashfeat.rs` without the contract section: the embryo file
+/// (sha256 [`hashfeat::EMBRYO_COPY_SHA256`]) with [`SUBSTITUTED_LINE`] replaced.
+const RELEASE_COPY_SHA256: &str =
+    "cf95074909fe12144b5421fa19902aaa40ab7168e631c558dc0e87275330d701";
+
+/// The embryo's source directory, when configured.
+fn embryo_dir() -> Option<PathBuf> {
+    std::env::var_os(EMBRYO_SRC_ENV)
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("CMFPUBLIC").map(|r| PathBuf::from(r).join(EMBRYO_SRC_UNDER_CMFPUBLIC))
+        })
+}
+
+/// The whole line of `text` that starts with [`SUBSTITUTED_LINE`] (it is unique).
+fn substituted_line(text: &str) -> &str {
+    let needle = format!("\n{SUBSTITUTED_LINE}");
+    assert_eq!(text.matches(&needle).count(), 1, "{SUBSTITUTED_LINE}");
+    let a = text.find(&needle).unwrap() + 1;
+    let e = a + text[a..].find('\n').unwrap() + 1;
+    &text[a..e]
+}
 
 fn sha256_hex(b: &[u8]) -> String {
     format!("{:x}", Sha256::digest(b))
@@ -26,10 +59,16 @@ fn file_is_the_embryo_copy_plus_the_contract_section() {
     let copy = without_contract_section();
     assert_eq!(
         sha256_hex(copy.as_bytes()),
-        hashfeat::EMBRYO_COPY_SHA256,
-        "hashfeat.rs outside the contract section is not the verbatim embryo file"
+        RELEASE_COPY_SHA256,
+        "hashfeat.rs outside the contract section changed"
     );
-    let embryo = std::path::Path::new(EMBRYO_DIR).join("hashfeat.rs");
+    // The substituted line holds no absolute path.
+    let ours = substituted_line(&copy);
+    assert!(!ours.contains("\"/"), "{ours}");
+    let Some(embryo) = embryo_dir().map(|d| d.join("hashfeat.rs")) else {
+        eprintln!("{EMBRYO_SRC_ENV} and CMFPUBLIC unset; byte comparison skipped");
+        return;
+    };
     if !embryo.exists() {
         eprintln!(
             "embryo source absent at {}; byte comparison skipped",
@@ -37,7 +76,13 @@ fn file_is_the_embryo_copy_plus_the_contract_section() {
         );
         return;
     }
-    assert_eq!(std::fs::read(&embryo).unwrap(), copy.as_bytes());
+    let theirs = std::fs::read_to_string(&embryo).unwrap();
+    assert_eq!(sha256_hex(theirs.as_bytes()), hashfeat::EMBRYO_COPY_SHA256);
+    assert_eq!(
+        theirs.replacen(substituted_line(&theirs), ours, 1),
+        copy,
+        "hashfeat.rs outside the contract section is not the embryo file with one line replaced"
+    );
 }
 
 #[test]
@@ -59,7 +104,10 @@ fn contract_strings_are_the_contract_v2_ones() {
     );
     assert_eq!(hashfeat::NGRAMS, [3, 4, 5]);
     assert_eq!((hashfeat::SEED, hashfeat::SIGN_BIT), (0, 33));
-    let contract = std::path::Path::new(EMBRYO_DIR).join("contract_v2.rs");
+    let Some(contract) = embryo_dir().map(|d| d.join("contract_v2.rs")) else {
+        eprintln!("{EMBRYO_SRC_ENV} and CMFPUBLIC unset; string comparison skipped");
+        return;
+    };
     if !contract.exists() {
         eprintln!(
             "contract_v2.rs absent at {}; string comparison skipped",

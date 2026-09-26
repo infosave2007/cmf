@@ -65,8 +65,9 @@
 //!
 //! * **`x-request-id`** on every response: the decision's `cmf-dec-…` id for a
 //!   decision, else an id minted when the request arrived (`cmf-dec-…` on the
-//!   decisions surface, `req_…` — router `ids.rs` — on the router surface and
-//!   the admin API); JSON error bodies carry the same id.
+//!   decisions surface, this server's own admin paths included; `req_…` —
+//!   router `ids.rs` — on the router surface); JSON error bodies carry the
+//!   same id.
 //! * **Keys** (§4.10): `Authorization: Bearer <key>` or `x-api-key`; the open
 //!   mode (no key needed) holds only when `keys.json` has no key and
 //!   `auth.require` is false (default: false on loopback, true elsewhere). On a
@@ -78,21 +79,28 @@
 //!   checked from `Content-Length` before reading and while reading).
 //! * **Work** runs on the blocking pool (`spawn_blocking`): authentication (it
 //!   may re-read `keys.json`), decisions, feedback (a learning attempt may run
-//!   synchronously) and every admin operation. A decision, route or feedback
+//!   synchronously), every admin operation and the views that read the usage
+//!   ledger or the learning state (`/v1/usage`, `/v1/escalations`, `/metrics`),
+//!   whose locks are held across `fsync`. A decision, route or feedback
 //!   request takes one of `limits.max_inflight` slots first (else 429
 //!   `OVERLOADED`, `Retry-After: 1`).
-//! * **Logs**: one line per request with the id, method, route template,
-//!   status, latency and account — never a body, a state, a raw path or query,
-//!   a key or a header value.
+//! * **Logs**: one line per request with exactly the fields of §4.3: id,
+//!   status, latency and account — never a method, a path or query, a body, a
+//!   state, a key or a header value.
 //!
 //! # Errors
 //!
 //! Decisions surface (`/api/alpha/decisions`, `/v1/decisions`, `/v1/models`,
-//! `/v1/skills*`, `/healthz`, unknown paths) — OpenRouter's shape with the
-//! router's reason codes (§4.8):
+//! `/v1/skills*`, `/healthz`, this server's own admin paths
+//! `/v1/admin/keys/hash/{hash}`, `/v1/admin/usage`, `/oracle`, `/learning`,
+//! `/generations`, `/rollback`, `/shadow`, and unknown paths) — OpenRouter's
+//! shape with the router's reason codes (§4.8):
 //! `{"error":{"code":<HTTP>,"message":"…","metadata":{"reason":"<CODE>","retriable":bool,"request_id":"…","details":{}}}}`.
+//! A path parameter axum cannot extract (`%FF`) is a JSON 400
+//! `INVALID_REQUEST` in the path's envelope on both surfaces.
 //!
-//! Router surface and admin API — the router's envelope (router
+//! Router surface (the router's own paths, `/v1/admin/keys` and
+//! `DELETE /v1/admin/keys/{account}` among them) — the router's envelope (router
 //! `api.rs:207-284`; §4.15: where a path is the router's, its format wins):
 //! `{"schema_version":"1.1","request_id":"req_…","error":{"code":"<CODE>","message":"…","retriable":bool,"details":null}}`;
 //! `details` is an object only for `TAXONOMY_NOT_FOUND` (`{"taxonomy_id"}`),
@@ -189,7 +197,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Extension, MatchedPath, Path, Request, State};
+use axum::extract::rejection::PathRejection;
+use axum::extract::{Extension, Path, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::Response;
@@ -292,9 +301,11 @@ fn ms(d: Duration) -> f32 {
 /// Which error envelope and request id a path uses (see the module notes).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Surface {
-    /// The decisions protocol: OpenRouter errors, `cmf-dec-…` ids.
+    /// The decisions protocol and this server's own admin paths: OpenRouter
+    /// errors, `cmf-dec-…` ids.
     Decisions,
-    /// The router API and the admin API: router errors, `req_…` ids.
+    /// The router API (its admin keys paths included): router errors, `req_…`
+    /// ids.
     Router,
 }
 
@@ -320,7 +331,12 @@ fn wants_extensions(headers: &HeaderMap) -> bool {
         })
 }
 
-/// The surface of a request path.
+/// The surface of a request path: the router's own paths (router
+/// `api.rs:292-307`, anything under `/v1/taxonomies/`, and `/v1/admin/keys`
+/// with at most one segment after it) are the router surface; everything else,
+/// this server's own admin paths among them (`/v1/admin/keys/hash/…`,
+/// `/v1/admin/usage`, `/oracle`, `/learning`, `/generations`, `/rollback`,
+/// `/shadow`), is the decisions surface with the errors of §4.8.
 pub fn surface_of(path: &str) -> Surface {
     let router = matches!(
         path,
@@ -333,9 +349,11 @@ pub fn surface_of(path: &str) -> Surface {
             | "/v1/healthz"
             | "/v1/readyz"
             | "/metrics"
-            | "/v1/admin"
+            | "/v1/admin/keys"
     ) || path.starts_with("/v1/taxonomies/")
-        || path.starts_with("/v1/admin/");
+        || path
+            .strip_prefix("/v1/admin/keys/")
+            .is_some_and(|rest| !rest.contains('/'));
     if router {
         Surface::Router
     } else {
@@ -513,6 +531,13 @@ fn taxonomy_not_found(id: &str) -> HttpError {
         format!("taxonomy_id '{id}' not found for account"),
     )
     .with_detail("taxonomy_id", json!(id))
+}
+
+/// A path parameter axum could not extract (e.g. `%FF`, invalid UTF-8): a JSON
+/// 400 `INVALID_REQUEST` in the envelope of the path's surface, never axum's
+/// plain-text rejection.
+fn path_rejected(r: PathRejection) -> HttpError {
+    HttpError::invalid(format!("invalid path parameter: {}", r.body_text()))
 }
 
 fn embedding_required() -> HttpError {
@@ -1322,14 +1347,10 @@ pub fn router(state: Arc<DecisionState>) -> Router {
 }
 
 /// Request id, `x-request-id` on every response, one log line per request
-/// (the route template is logged, never the raw path, a query or a body).
+/// with exactly the fields of spec §4.3: id, status, latency and account
+/// (never a method, path, query, body, header or key).
 async fn context_middleware(mut req: Request, next: Next) -> Response {
     let t0 = Instant::now();
-    let method = req.method().clone();
-    let route = req
-        .extensions()
-        .get::<MatchedPath>()
-        .map_or_else(|| "-".to_string(), |m| m.as_str().to_string());
     let path = req.uri().path().to_string();
     let surface = surface_of(&path);
     let id = match surface {
@@ -1362,8 +1383,6 @@ async fn context_middleware(mut req: Request, next: Next) -> Response {
         .map_or_else(|| "-".to_string(), |a| a.0.clone());
     tracing::info!(
         id = %shown,
-        method = %method,
-        route = %route,
         status = resp.status().as_u16(),
         latency_ms = t0.elapsed().as_secs_f64() * 1000.0,
         account = %account,
@@ -1502,11 +1521,12 @@ async fn skills_handler(
 async fn skill_handler(
     State(st): State<Arc<DecisionState>>,
     Extension(ctx): Extension<Ctx>,
-    Path(id): Path<String>,
+    id: Result<Path<String>, PathRejection>,
     headers: HeaderMap,
 ) -> Response {
     let out = async {
         let p = caller(&st, &headers).await?;
+        let Path(id) = id.map_err(|r| path_rejected(r).by(&p.account))?;
         let v = st
             .svc
             .skill_json(&id)
@@ -2553,11 +2573,12 @@ async fn taxonomies_handler(
 async fn taxonomy_handler(
     State(st): State<Arc<DecisionState>>,
     Extension(ctx): Extension<Ctx>,
-    Path(id): Path<String>,
+    id: Result<Path<String>, PathRejection>,
     headers: HeaderMap,
 ) -> Response {
     let out = async {
         let p = caller(&st, &headers).await?;
+        let Path(id) = id.map_err(|r| path_rejected(r).by(&p.account))?;
         let model = st.svc.handle().current();
         let s = model
             .skill(&id)
@@ -2568,6 +2589,9 @@ async fn taxonomy_handler(
     respond(&ctx, out)
 }
 
+/// `GET /v1/usage`. The totals come from the usage ledger, whose lock the
+/// flusher holds across `fsync`: the view is built on the blocking pool, never
+/// on a runtime worker.
 async fn usage_handler(
     State(st): State<Arc<DecisionState>>,
     Extension(ctx): Extension<Ctx>,
@@ -2575,7 +2599,9 @@ async fn usage_handler(
 ) -> Response {
     let out = async {
         let p = caller(&st, &headers).await?;
-        Ok(Reply::ok(st.usage_json(&p, ctx.ext)).by(&p.account))
+        let (s, ext, account) = (Arc::clone(&st), ctx.ext, p.account.clone());
+        let v = blocking(move || Ok(s.usage_json(&p, ext))).await?;
+        Ok(Reply::ok(v).by(&account))
     }
     .await;
     respond(&ctx, out)
@@ -2610,21 +2636,34 @@ async fn escalations_handler(
             .limit
             .unwrap_or(ESCALATIONS_DEFAULT_LIMIT)
             .clamp(1, ESCALATIONS_MAX_LIMIT);
-        let records: Vec<Value> = lock(&st.audit)
+        // The learning state's locks are held across disk writes: the view is
+        // built on the blocking pool.
+        let (s, ext, account) = (Arc::clone(&st), ctx.ext, p.account.clone());
+        let v = blocking(move || Ok(s.escalations_json(&p.account, limit, ext))).await?;
+        Ok(Reply::ok(v).by(&account))
+    }
+    .await;
+    respond(&ctx, out)
+}
+
+impl DecisionState {
+    /// `GET /v1/escalations` of `account` (see [`escalations_handler`]).
+    fn escalations_json(&self, account: &str, limit: usize, extensions: bool) -> Value {
+        let records: Vec<Value> = lock(&self.audit)
             .iter()
             .rev()
-            .filter(|e| e.account == p.account)
+            .filter(|e| e.account == account)
             .take(limit)
             .map(|e| {
                 let mut r = e.record.clone();
-                if ctx.ext {
+                if extensions {
                     r["cmf"] = json!({"question": e.question});
                 }
                 r
             })
             .collect();
-        let c = &st.counters;
-        let (buffered, cache) = match &st.cascade {
+        let c = &self.counters;
+        let (buffered, cache) = match &self.cascade {
             Some(cas) => {
                 let l = cas.learning_json();
                 (
@@ -2638,7 +2677,7 @@ async fn escalations_handler(
             }
             None => (0, json!({"entries": 0, "hits": 0, "lookups": 0})),
         };
-        Ok(Reply::ok(json!({
+        json!({
             "schema_version": ROUTER_SCHEMA_VERSION,
             "summary": {
                 "total": Counters::get(&c.escalations),
@@ -2649,11 +2688,8 @@ async fn escalations_handler(
                 "cache": cache,
             },
             "records": records,
-        }))
-        .by(&p.account))
+        })
     }
-    .await;
-    respond(&ctx, out)
 }
 
 async fn readyz_handler(
@@ -2673,11 +2709,18 @@ async fn readyz_handler(
     json_response(status, &body, &ctx.id, None, None)
 }
 
+/// `GET /metrics` (Prometheus text), built on the blocking pool like the other
+/// views of the learning state.
 async fn metrics_handler(
     State(st): State<Arc<DecisionState>>,
     Extension(ctx): Extension<Ctx>,
 ) -> Response {
-    let mut resp = Response::new(Body::from(st.metrics_text()));
+    let s = Arc::clone(&st);
+    let text = match blocking(move || Ok(s.metrics_text())).await {
+        Ok(t) => t,
+        Err(e) => return error_response(&ctx, e),
+    };
+    let mut resp = Response::new(Body::from(text));
     let h = resp.headers_mut();
     h.insert(
         header::CONTENT_TYPE,
@@ -2741,7 +2784,6 @@ async fn admin_create_key(
         let created = blocking(move || Ok(s.svc.admin_create_key(&body)?)).await?;
         tracing::info!(
             account = created["account"].as_str().unwrap_or_default(),
-            plan = created["plan"].as_str().unwrap_or_default(),
             "admin: API key created"
         );
         let mut v = json!({
@@ -2801,16 +2843,16 @@ async fn admin_list_keys(
 async fn admin_revoke_account(
     State(st): State<Arc<DecisionState>>,
     Extension(ctx): Extension<Ctx>,
-    Path(account): Path<String>,
+    account: Result<Path<String>, PathRejection>,
     headers: HeaderMap,
 ) -> Response {
     let out = async {
         admin_guard(&st, &headers)?;
+        let Path(account) = account.map_err(path_rejected)?;
         let s = Arc::clone(&st);
         let v = blocking(move || Ok(s.svc.admin_revoke_account(&account)?)).await?;
         tracing::info!(
             account = v["account"].as_str().unwrap_or_default(),
-            revoked = v["revoked"].as_u64().unwrap_or(0),
             "admin: API keys revoked"
         );
         Ok(Reply::ok(v))
@@ -2822,11 +2864,12 @@ async fn admin_revoke_account(
 async fn admin_revoke_hash(
     State(st): State<Arc<DecisionState>>,
     Extension(ctx): Extension<Ctx>,
-    Path(hash): Path<String>,
+    hash: Result<Path<String>, PathRejection>,
     headers: HeaderMap,
 ) -> Response {
     let out = async {
         admin_guard(&st, &headers)?;
+        let Path(hash) = hash.map_err(path_rejected)?;
         let s = Arc::clone(&st);
         let v = blocking(move || Ok(s.svc.admin_revoke_hash(&hash)?)).await?;
         Ok(Reply::ok(v))

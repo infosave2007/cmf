@@ -20,6 +20,9 @@
 //! production taxonomy (`data-assistant`), requests driven in-process; one test
 //! runs a loopback mock of the oracle (no network beyond 127.0.0.1).
 
+#[path = "support/toy_dir.rs"]
+mod toy_dir;
+
 use axum::body::Body;
 use axum::http::{HeaderMap, Request};
 use cortiq_decision::build::{self, TrainOptions};
@@ -366,7 +369,6 @@ fn write_jsonl(dir: &Path, name: &str, rows: &[(String, String)]) -> PathBuf {
 }
 
 struct Toy {
-    _dir: tempfile::TempDir,
     path: PathBuf,
     dev: Vec<(String, String)>,
 }
@@ -374,8 +376,8 @@ struct Toy {
 fn toy() -> &'static Toy {
     static TOY: OnceLock<Toy> = OnceLock::new();
     TOY.get_or_init(|| {
-        let dir = tempfile::tempdir().unwrap();
-        let d = dir.path();
+        let dir = toy_dir::toy_dir("toy");
+        let d = dir.as_path();
         let enc = d.join("enc.cmf");
         let encoder_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../cortiq-decision/tests/fixtures/toy/encoder");
@@ -398,11 +400,7 @@ fn toy() -> &'static Toy {
         o.created_unix = Some(EPOCH);
         let path = d.join("toy.cmf");
         build::train(&enc, &o, &path).expect("train the toy skill");
-        Toy {
-            _dir: dir,
-            path,
-            dev,
-        }
+        Toy { path, dev }
     })
 }
 

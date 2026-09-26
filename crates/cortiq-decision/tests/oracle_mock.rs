@@ -26,6 +26,8 @@
 
 #[path = "fixtures/oracle/support.rs"]
 mod support;
+#[path = "common/toy_dir.rs"]
+mod toy_dir;
 
 use cortiq_decision::config::{Config, OracleConfig};
 use cortiq_decision::learn;
@@ -968,6 +970,7 @@ fn the_key_comes_only_from_the_environment() {
             "--nocapture",
             "--test-threads=1",
         ])
+        .env(toy_dir::TOY_CHILD_ENV, "1")
         .env(KEY_ENV, TEST_KEY)
         .env("CMF_GPU", "0")
         .output()

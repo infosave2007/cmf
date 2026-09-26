@@ -134,7 +134,6 @@ pub fn write(dir: &Path, name: &str, body: &str) -> PathBuf {
 }
 
 pub struct Toy {
-    _dir: tempfile::TempDir,
     pub path: PathBuf,
     pub dev: Vec<(String, String)>,
 }
@@ -170,8 +169,8 @@ fn skill_opts(
 pub fn toy() -> &'static Toy {
     static TOY: OnceLock<Toy> = OnceLock::new();
     TOY.get_or_init(|| {
-        let dir = tempfile::tempdir().unwrap();
-        let d = dir.path();
+        let dir = crate::toy_dir::toy_dir("toy");
+        let d = dir.as_path();
         let enc = d.join("enc.cmf");
         let export = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/toy/encoder");
         build::init_encoder(&export, &enc, Some(EPOCH)).expect("init toy encoder");
@@ -181,11 +180,7 @@ pub fn toy() -> &'static Toy {
         let (o2, _) = skill_opts(d, "shop", &SHOP, 21);
         let path = d.join("toy.cmf");
         build::add_skill(&s1, &o2, &path).expect("add shop");
-        Toy {
-            _dir: dir,
-            path,
-            dev,
-        }
+        Toy { path, dev }
     })
 }
 
@@ -198,8 +193,8 @@ pub fn toy() -> &'static Toy {
 pub fn trap() -> &'static Toy {
     static TRAP: OnceLock<Toy> = OnceLock::new();
     TRAP.get_or_init(|| {
-        let dir = tempfile::tempdir().unwrap();
-        let d = dir.path();
+        let dir = crate::toy_dir::toy_dir("trap");
+        let d = dir.as_path();
         let enc = d.join("enc.cmf");
         let export = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/toy/encoder");
         build::init_encoder(&export, &enc, Some(EPOCH)).expect("init toy encoder");
@@ -227,11 +222,7 @@ pub fn trap() -> &'static Toy {
         o.created_unix = Some(EPOCH);
         let path = d.join("trap.cmf");
         build::train(&enc, &o, &path).expect("train trap");
-        Toy {
-            _dir: dir,
-            path,
-            dev,
-        }
+        Toy { path, dev }
     })
 }
 

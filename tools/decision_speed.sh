@@ -129,10 +129,17 @@ while True:
     STATE="$OUTDIR/http-state"
     [ ! -e "$STATE" ] || die "$STATE exists"
     log "cortiq serve on 127.0.0.1:$PORT (CMF_THREADS=1 VECLIB_MAXIMUM_THREADS=1)"
-    env CMF_THREADS=1 VECLIB_MAXIMUM_THREADS=1 "$CORTIQ" serve "$MODEL" --host 127.0.0.1 --port "$PORT" \
-        --state "$STATE" >"$OUTDIR/http-server.log" 2>&1 &
+    # The server gets the caller's environment without any variable whose name
+    # suggests a key or a token (as decision_jev_compat.child_env; values are
+    # never read), so no oracle key can reach it whatever its configuration.
+    SCRUB=()
+    while IFS= read -r name; do
+        SCRUB+=(-u "$name")
+    done < <(compgen -e | grep -Ei 'KEY|TOKEN|SECRET|OPENROUTER|PASSWORD' || true)
+    env ${SCRUB[@]+"${SCRUB[@]}"} CMF_THREADS=1 VECLIB_MAXIMUM_THREADS=1 "$CORTIQ" serve "$MODEL" \
+        --host 127.0.0.1 --port "$PORT" --state "$STATE" >"$OUTDIR/http-server.log" 2>&1 &
     SERVER_PID=$!
-    trap 'kill "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" 2>/dev/null || true' EXIT
+    trap 'kill "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" 2>/dev/null || true; rm -rf "$STATE"' EXIT
     for _ in $(seq 1 120); do
         if curl -sf "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then break; fi
         kill -0 "$SERVER_PID" 2>/dev/null || { tail -20 "$OUTDIR/http-server.log" >&2; die "server exited"; }

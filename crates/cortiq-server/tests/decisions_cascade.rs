@@ -31,6 +31,9 @@
 //! answers include the opt-in `cmf` diagnostics (the exact default router
 //! shapes are checked in `router_compat.rs`).
 
+#[path = "support/toy_dir.rs"]
+mod toy_dir;
+
 use axum::body::Body;
 use axum::http::{HeaderMap, Request};
 use cortiq_decision::build::{self, TrainOptions};
@@ -161,7 +164,6 @@ fn write(dir: &Path, name: &str, body: &str) -> PathBuf {
 }
 
 struct Toy {
-    _dir: tempfile::TempDir,
     path: PathBuf,
     dev: Vec<(String, String)>,
 }
@@ -195,8 +197,8 @@ fn skill_opts(
 fn toy() -> &'static Toy {
     static TOY: OnceLock<Toy> = OnceLock::new();
     TOY.get_or_init(|| {
-        let dir = tempfile::tempdir().unwrap();
-        let d = dir.path();
+        let dir = toy_dir::toy_dir("toy");
+        let d = dir.as_path();
         let enc = d.join("enc.cmf");
         let export = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../cortiq-decision/tests/fixtures/toy/encoder");
@@ -207,11 +209,7 @@ fn toy() -> &'static Toy {
         let (o2, _) = skill_opts(d, "shop", &SHOP, 21);
         let path = d.join("toy.cmf");
         build::add_skill(&s1, &o2, &path).expect("add shop");
-        Toy {
-            _dir: dir,
-            path,
-            dev,
-        }
+        Toy { path, dev }
     })
 }
 
@@ -1829,6 +1827,7 @@ fn the_oracle_key_comes_only_from_the_environment() {
             "--nocapture",
             "--test-threads=1",
         ])
+        .env(toy_dir::TOY_CHILD_ENV, "1")
         .env(KEY_ENV, TEST_KEY)
         .env("CMF_GPU", "0")
         .output()

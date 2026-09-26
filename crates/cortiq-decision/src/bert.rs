@@ -39,12 +39,13 @@ use crate::manifest::{
 use crate::unicode_tables;
 use crate::wordpiece::WordPiece;
 use anyhow::{Context, Result, bail, ensure};
-use cortiq_core::{TensorDtype, TensorSpec};
+use cortiq_core::{CmfModel, TensorDtype, TensorSpec};
 use cortiq_engine::fcd_ops::gemm_nt_host;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Largest |Δ| between the stored golden φ_P and this build's that a decision
 /// file may show before it is refused. The spec gives no tolerance; the golden
@@ -206,11 +207,81 @@ impl BertDims {
     }
 }
 
+/// One encoder weight (spec §2.2: "weights are read without copying when they
+/// are 4-byte aligned, otherwise copied"): a view of the decision file's
+/// mapping, which it keeps alive, or an owned copy (an unaligned tensor, a
+/// big-endian host, or an export directory).
+#[derive(Clone)]
+pub enum Weights {
+    Owned(Vec<f32>),
+    /// Tensor `tensor` of `file`, 4-byte aligned (checked when built).
+    Mapped {
+        file: Arc<CmfModel>,
+        tensor: usize,
+    },
+}
+
+impl Weights {
+    /// A view of tensor `tensor` of `file` when its bytes are 4-byte aligned
+    /// little-endian f32, else a copy.
+    pub fn of_tensor(file: &Arc<CmfModel>, tensor: usize) -> Self {
+        let bytes = file.entry_bytes(&file.tensors[tensor]);
+        if cfg!(target_endian = "little") && bytemuck::try_cast_slice::<u8, f32>(bytes).is_ok() {
+            Self::Mapped {
+                file: Arc::clone(file),
+                tensor,
+            }
+        } else {
+            Self::Owned(f32_from_le(bytes))
+        }
+    }
+
+    /// Whether this weight is a view of the file (no copy).
+    pub fn is_mapped(&self) -> bool {
+        matches!(self, Self::Mapped { .. })
+    }
+}
+
+impl From<Vec<f32>> for Weights {
+    fn from(v: Vec<f32>) -> Self {
+        Self::Owned(v)
+    }
+}
+
+impl std::ops::Deref for Weights {
+    type Target = [f32];
+
+    fn deref(&self) -> &[f32] {
+        match self {
+            Self::Owned(v) => v,
+            // Aligned and a multiple of 4 bytes: checked in `of_tensor`, and
+            // the mapping never moves while `file` lives.
+            Self::Mapped { file, tensor } => {
+                bytemuck::cast_slice(file.entry_bytes(&file.tensors[*tensor]))
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for Weights {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Owned(v) => write!(f, "Owned({} values)", v.len()),
+            Self::Mapped { file, tensor } => write!(
+                f,
+                "Mapped({}, {} values)",
+                file.tensors[*tensor].name,
+                self.len()
+            ),
+        }
+    }
+}
+
 /// `y = x·Wᵀ + b`, W stored `[out, in]`.
 #[derive(Clone, Debug)]
 struct Linear {
-    w: Vec<f32>,
-    b: Vec<f32>,
+    w: Weights,
+    b: Weights,
     inp: usize,
     out: usize,
 }
@@ -220,7 +291,7 @@ impl Linear {
     fn apply(&self, x: &[f32], n: usize, y: &mut [f32]) {
         gemm_nt_host(x, &self.w, y, n, self.inp, self.out, None);
         for row in y[..n * self.out].chunks_exact_mut(self.out) {
-            for (v, &b) in row.iter_mut().zip(&self.b) {
+            for (v, &b) in row.iter_mut().zip(self.b.iter()) {
                 *v += b;
             }
         }
@@ -229,8 +300,8 @@ impl Linear {
 
 #[derive(Clone, Debug)]
 struct Norm {
-    w: Vec<f32>,
-    b: Vec<f32>,
+    w: Weights,
+    b: Weights,
 }
 
 #[derive(Clone, Debug)]
@@ -245,12 +316,13 @@ struct Layer {
     ln_out: Norm,
 }
 
-/// A BERT encoder with owned f32 weights. `Send + Sync`; one forward per text.
+/// A BERT encoder over f32 weights ([`Weights`]: views of a decision file's
+/// mapping, or owned). `Send + Sync`; one forward per text.
 #[derive(Clone, Debug)]
 pub struct BertModel {
     dims: BertDims,
-    word: Vec<f32>,
-    pos: Vec<f32>,
+    word: Weights,
+    pos: Weights,
     /// The `token_type` row of the token-type table.
     type_row: Vec<f32>,
     ln_emb: Norm,
@@ -263,11 +335,11 @@ impl BertModel {
     /// shapes are the config's ([`EncoderConfig::weight_shapes`]).
     pub fn from_weights(
         config: &EncoderConfig,
-        mut get: impl FnMut(&str) -> Result<Vec<f32>>,
+        mut get: impl FnMut(&str) -> Result<Weights>,
     ) -> Result<Self> {
         let dims = BertDims::from_config(config)?;
         let shapes: BTreeMap<String, Vec<usize>> = config.weight_shapes().into_iter().collect();
-        let mut take = |name: &str| -> Result<Vec<f32>> {
+        let mut take = |name: &str| -> Result<Weights> {
             let shape = shapes
                 .get(name)
                 .ok_or_else(|| anyhow::anyhow!("'{name}' is not a weight of this config"))?;
@@ -339,10 +411,40 @@ impl BertModel {
         })
     }
 
-    /// The encoder of a decision file (weights copied out of the mmap).
+    /// The encoder of a decision file: every aligned weight is a view of the
+    /// file's mapping (spec §2.2), which the model keeps alive; an unaligned
+    /// one is copied.
     pub fn from_model(model: &DecisionModel) -> Result<Self> {
         let config = &model.representation().encoder.config;
-        Self::from_weights(config, |name| Ok(model.encoder_weight(name)?.into_owned()))
+        let file = model.base_file();
+        Self::from_weights(config, |name| {
+            let full = format!("{ENCODER_PREFIX}{name}");
+            let i = file
+                .tensor_index(&full)
+                .ok_or_else(|| anyhow::anyhow!("tensor '{full}' is missing"))?;
+            ensure!(
+                file.tensors[i].dtype == TensorDtype::F32,
+                "tensor '{full}' is not F32"
+            );
+            Ok(Weights::of_tensor(&file, i))
+        })
+    }
+
+    /// f32 values of the weights this model holds as copies (the token-type row
+    /// always; any weight that could not be mapped).
+    pub fn copied_weight_values(&self) -> usize {
+        let owned = |w: &Weights| if w.is_mapped() { 0 } else { w.len() };
+        let mut n = self.type_row.len() + owned(&self.word) + owned(&self.pos);
+        n += owned(&self.ln_emb.w) + owned(&self.ln_emb.b);
+        for l in &self.layers {
+            for lin in [&l.q, &l.k, &l.v, &l.o, &l.inter, &l.out] {
+                n += owned(&lin.w) + owned(&lin.b);
+            }
+            for nm in [&l.ln_attn, &l.ln_out] {
+                n += owned(&nm.w) + owned(&nm.b);
+            }
+        }
+        n
     }
 
     pub fn dims(&self) -> &BertDims {
@@ -882,7 +984,7 @@ impl EncoderExport {
                 .weights
                 .get(name)
                 .ok_or_else(|| anyhow::anyhow!("missing weight '{name}'"))?;
-            Ok(f32_from_le(bytes))
+            Ok(Weights::Owned(f32_from_le(bytes)))
         })?;
         Encoder::new(self.wordpiece()?, model)
     }

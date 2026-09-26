@@ -208,7 +208,7 @@ build_run() {
 build_run a "$THREADS_A"
 build_run b "$THREADS_B"
 
-for key in enc base release; do
+for key in export_encoder_json enc base release; do
     ha="$(grep "^$key=" "$WORK/run-a/logs/sha256.txt" | cut -d= -f2)"
     hb="$(grep "^$key=" "$WORK/run-b/logs/sha256.txt" | cut -d= -f2)"
     [ "$ha" = "$hb" ] || die "$key differs between the two builds: $ha (run a) vs $hb (run b)"
@@ -310,7 +310,8 @@ doc = {
         'skills': {s: report('a', f'release-{s}.json') for s in dirs},
     },
     'runs': runs,
-    'reproducible': all(runs['a']['sha256'][k] == runs['b']['sha256'][k] for k in ('enc', 'base', 'release')),
+    'reproducible': all(runs['a']['sha256'][k] == runs['b']['sha256'][k]
+                        for k in ('export_encoder_json', 'enc', 'base', 'release')),
     'verify': {'base': report('a', 'verify-base.json'), 'release': report('a', 'verify-release.json')},
 }
 dst = os.path.join(out, 'build', 'build-release.json')

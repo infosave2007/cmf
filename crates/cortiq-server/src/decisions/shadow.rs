@@ -74,7 +74,7 @@ pub const SHADOW_FORWARDED_PATHS: [&str; 12] = [
 /// How long a stopping server waits for comparisons still being decided.
 pub(super) const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The route template (for the log) of a path shadow mode forwards: the old
+/// The route template of a path shadow mode forwards: the old
 /// router's routes (anything under `/v1/taxonomies/`, which it answers
 /// itself, and one segment under `/v1/admin/keys/`); `None` for the paths that
 /// stay local, this server's own admin paths among them.
@@ -166,14 +166,15 @@ impl Drop for PendingGuard {
 
 /// Forward a router-API path to the old router (see the module notes), before
 /// any routing of this server; any other path goes on to its own routes. One
-/// log line per forwarded request, like the other requests': id, method,
-/// route template, status, latency — never a body, path, query or header.
+/// log line per forwarded request with the fields of spec §4.3, like the other
+/// requests': id, status, latency and account (`-`: the old router checks the
+/// key) — never a method, body, path, query or header.
 pub(super) async fn shadow_middleware(
     State(st): State<Arc<DecisionState>>,
     req: Request,
     next: Next,
 ) -> Response {
-    let (Some(sh), Some(route)) = (st.shadow.clone(), forwarded_route(req.uri().path())) else {
+    let (Some(sh), Some(_)) = (st.shadow.clone(), forwarded_route(req.uri().path())) else {
         return next.run(req).await;
     };
     let t0 = Instant::now();
@@ -183,14 +184,12 @@ pub(super) async fn shadow_middleware(
         ext: false,
         path: req.uri().path().to_string(),
     };
-    let method = req.method().clone();
     let resp = forward(st, sh, ctx.clone(), req).await;
     tracing::info!(
         id = %ctx.id,
-        method = %method,
-        route = route,
         status = resp.status().as_u16(),
         latency_ms = t0.elapsed().as_secs_f64() * 1000.0,
+        account = "-",
         "shadow: forwarded to the old router"
     );
     resp
@@ -526,10 +525,15 @@ pub(super) async fn admin_shadow(
 ) -> Response {
     let out = async {
         admin_guard(&st, &headers)?;
-        let v = match &st.shadow {
-            Some(sh) => stats_json(&sh.log, &sh.upstream),
-            None => Value::Null,
-        };
+        // The log's lock is held across its writes: read it on the blocking pool.
+        let s = Arc::clone(&st);
+        let v = super::blocking(move || {
+            Ok(match &s.shadow {
+                Some(sh) => stats_json(&sh.log, &sh.upstream),
+                None => Value::Null,
+            })
+        })
+        .await?;
         Ok(Reply::ok(v))
     }
     .await;

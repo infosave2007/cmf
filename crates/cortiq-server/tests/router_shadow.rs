@@ -26,6 +26,9 @@
 //!
 //! Hermetic: the toy encoder of `cortiq-decision`, loopback only.
 
+#[path = "support/toy_dir.rs"]
+mod toy_dir;
+
 use axum::body::Body;
 use axum::http::{HeaderMap, Request};
 use cortiq_decision::build::{self, TrainOptions};
@@ -162,7 +165,6 @@ fn write_jsonl(dir: &Path, name: &str, rows: &[(String, String)]) -> PathBuf {
 }
 
 struct Toy {
-    _dir: tempfile::TempDir,
     path: PathBuf,
     dev: Vec<(String, String)>,
 }
@@ -170,8 +172,8 @@ struct Toy {
 fn toy() -> &'static Toy {
     static TOY: OnceLock<Toy> = OnceLock::new();
     TOY.get_or_init(|| {
-        let dir = tempfile::tempdir().unwrap();
-        let d = dir.path();
+        let dir = toy_dir::toy_dir("toy");
+        let d = dir.as_path();
         let enc = d.join("enc.cmf");
         let encoder_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../cortiq-decision/tests/fixtures/toy/encoder");
@@ -194,11 +196,7 @@ fn toy() -> &'static Toy {
         o.created_unix = Some(EPOCH);
         let path = d.join("toy.cmf");
         build::train(&enc, &o, &path).expect("train the toy skill");
-        Toy {
-            _dir: dir,
-            path,
-            dev,
-        }
+        Toy { path, dev }
     })
 }
 
@@ -1367,11 +1365,16 @@ async fn without_the_flag_nothing_changes() {
         )
         .await;
     assert_eq!(r.status, 200);
-    // `/v1/admin/shadow` is not a route: the router's empty 404, as before.
+    // `/v1/admin/shadow` is not a route: the decisions surface's JSON 404 for an
+    // unknown path (this server's admin paths are not the router's, §4.8).
     let r = srv.admin("GET", "/v1/admin/shadow").await;
     assert_eq!(r.status, 404);
-    assert!(r.bytes.is_empty());
-    assert!(r.header("x-request-id").is_some());
+    assert_eq!(r.json["error"]["code"], 404, "{}", r.text());
+    assert_eq!(r.json["error"]["metadata"]["reason"], "INVALID_REQUEST");
+    assert_eq!(
+        r.json["error"]["metadata"]["request_id"].as_str(),
+        r.header("x-request-id")
+    );
     let r = srv.call("GET", "/v1/healthz", &[], None).await;
     assert_eq!(r.json, json!({"status": "ok"}));
     assert!(old.seen().is_empty());

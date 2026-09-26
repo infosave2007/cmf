@@ -794,6 +794,27 @@ fn add_skill_forgets_nothing() {
     no_leftovers(dir.path());
 }
 
+/// `init` writes a staging file, checks it (full verification and the encoder
+/// golden) and only then publishes: the directory holds the output alone, and
+/// the bytes do not depend on the staging name.
+#[test]
+fn init_publishes_only_the_checked_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("enc.cmf");
+    let r = build::init_encoder(&toy_export(), &out, Some(EPOCH)).expect("init");
+    assert_eq!(r.path, out);
+    assert_eq!(r.sha256, file_sha(&out));
+    let names: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec!["enc.cmf".to_string()]);
+    let again = dir.path().join("enc2.cmf");
+    let r2 = build::init_encoder(&toy_export(), &again, Some(EPOCH)).expect("init again");
+    assert_eq!((r2.sha256, r2.bytes), (r.sha256, r.bytes));
+    no_leftovers(dir.path());
+}
+
 #[test]
 fn the_output_is_never_overwritten() {
     let dir = tempfile::tempdir().unwrap();

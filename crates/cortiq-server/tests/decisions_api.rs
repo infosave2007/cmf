@@ -33,6 +33,9 @@
 //! certified, gate, totals, error metadata); the exact default router shapes
 //! are checked in `router_compat.rs`.
 
+#[path = "support/toy_dir.rs"]
+mod toy_dir;
+
 use axum::body::Body;
 use axum::http::{HeaderMap, Request};
 use cortiq_decision::build::{self, TrainOptions};
@@ -159,7 +162,6 @@ fn write(dir: &Path, name: &str, body: &str) -> PathBuf {
 }
 
 struct Toy {
-    _dir: tempfile::TempDir,
     path: PathBuf,
     dev: Vec<(String, String)>,
 }
@@ -198,8 +200,8 @@ fn toy_encoder_dir() -> PathBuf {
 fn toy() -> &'static Toy {
     static TOY: OnceLock<Toy> = OnceLock::new();
     TOY.get_or_init(|| {
-        let dir = tempfile::tempdir().unwrap();
-        let d = dir.path();
+        let dir = toy_dir::toy_dir("toy");
+        let d = dir.as_path();
         let enc = d.join("enc.cmf");
         build::init_encoder(&toy_encoder_dir(), &enc, Some(EPOCH)).expect("init toy encoder");
         let (o1, dev) = skill_opts(d, "topics", &TOPICS, 11);
@@ -208,11 +210,7 @@ fn toy() -> &'static Toy {
         let (o2, _) = skill_opts(d, "shop", &SHOP, 21);
         let path = d.join("toy.cmf");
         build::add_skill(&s1, &o2, &path).expect("add shop");
-        Toy {
-            _dir: dir,
-            path,
-            dev,
-        }
+        Toy { path, dev }
     })
 }
 
@@ -1251,8 +1249,37 @@ async fn admin_creates_lists_and_revokes_keys() {
     assert_eq!(r.status, 200, "{}", r.text);
     assert_eq!(r.body["revoked"], 1);
     assert_eq!(srv.post("/v1/decisions", Some(&k2), &b).await.status, 401);
+    // This server's own admin paths answer with the errors of §4.8
+    // (OpenRouter's shape), the router's admin keys paths with the router's.
     let r = srv.admin("DELETE", "/v1/admin/keys/hash/zz", None).await;
+    assert_eq!(r.openrouter_error(), (400, "INVALID_REQUEST".to_string()));
+    assert!(r.request_id().starts_with("cmf-dec-"));
+    // A path parameter axum cannot extract (invalid UTF-8) is a JSON 400 in
+    // the path's envelope, never axum's plain text.
+    let r = srv.admin("DELETE", "/v1/admin/keys/hash/%FF", None).await;
+    assert_eq!(r.openrouter_error(), (400, "INVALID_REQUEST".to_string()));
+    let r = srv.admin("DELETE", "/v1/admin/keys/%FF", None).await;
     assert_eq!(r.router_error(), (400, "INVALID_REQUEST".to_string()));
+    let (k3, _) = srv.key(json!({"account": "pathcheck"})).await;
+    let r = srv.get("/v1/skills/%FF", Some(&k3)).await;
+    assert_eq!(r.openrouter_error(), (400, "INVALID_REQUEST".to_string()));
+    let r = srv.get("/v1/taxonomies/%FF", Some(&k3)).await;
+    assert_eq!(r.router_error(), (400, "INVALID_REQUEST".to_string()));
+    // The key check still comes first on a keyed path.
+    let r = srv.get("/v1/skills/%FF", None).await;
+    assert_eq!(r.openrouter_error(), (401, "UNAUTHORIZED".to_string()));
+    for p in ["/v1/admin/usage", "/v1/admin/learning"] {
+        let r = srv
+            .call("GET", p, &[("x-admin-token", "wrong")], None)
+            .await;
+        assert_eq!(
+            r.openrouter_error(),
+            (401, "UNAUTHORIZED".to_string()),
+            "{p}"
+        );
+    }
+    let r = off.admin("GET", "/v1/admin/usage", None).await;
+    assert_eq!(r.openrouter_error(), (404, "ADMIN_DISABLED".to_string()));
     // Bad requests.
     let r = srv
         .admin("POST", "/v1/admin/keys", Some(&json!({"plan": "platinum"})))
@@ -1289,11 +1316,11 @@ async fn admin_creates_lists_and_revokes_keys() {
             Some(&json!({"generation": 5})),
         )
         .await;
-    assert_eq!(r.router_error(), (404, "INVALID_REQUEST".to_string()));
+    assert_eq!(r.openrouter_error(), (404, "INVALID_REQUEST".to_string()));
     let r = srv
         .admin("POST", "/v1/admin/rollback", Some(&json!({"gen": 0})))
         .await;
-    assert_eq!(r.router_error(), (400, "INVALID_REQUEST".to_string()));
+    assert_eq!(r.openrouter_error(), (400, "INVALID_REQUEST".to_string()));
 }
 
 // ------------------------------------------------------------------ service endpoints
@@ -1551,7 +1578,25 @@ fn child_request_logs() {
         assert!(line.contains("status="), "{line}");
         assert!(line.contains("latency_ms="), "{line}");
         assert!(line.contains("account=logacct"), "{line}");
-        assert!(line.contains("route=/v1/decisions"), "{line}");
+    }
+    // Spec §4.3: a request line holds only id, status, latency and account
+    // (no method, no route template, no path).
+    let request_lines: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains("message=decision request"))
+        .collect();
+    assert!(request_lines.len() >= 6, "{log}");
+    for l in &request_lines {
+        let mut keys: Vec<&str> = l
+            .split_whitespace()
+            .filter_map(|t| t.split_once('=').map(|(k, _)| k))
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["account", "id", "latency_ms", "message", "status"],
+            "{l}"
+        );
     }
     assert!(log.contains(&format!("id={ok_id}")) && log.contains("status=200"));
     assert!(log.contains("status=400"));
@@ -1578,6 +1623,7 @@ fn request_logs_carry_no_state_key_or_token() {
             "--nocapture",
             "--test-threads=1",
         ])
+        .env(toy_dir::TOY_CHILD_ENV, "1")
         .env(LOG_ADMIN_ENV, LOG_ADMIN_TOKEN)
         .env("CMF_GPU", "0")
         .output()

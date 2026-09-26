@@ -346,10 +346,33 @@ pub fn gemm_nt(
 /// used (callers pass scratch buffers sized for their largest batch); it
 /// panics if a buffer is shorter than that, because the kernels address
 /// the buffers through raw pointers.
-pub fn gemm_nt_host(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: usize, pool: Option<&Pool>) {
-    assert!(x.len() >= n * k, "gemm_nt_host: x has {} < n·k = {}", x.len(), n * k);
-    assert!(w.len() >= m * k, "gemm_nt_host: w has {} < m·k = {}", w.len(), m * k);
-    assert!(y.len() >= n * m, "gemm_nt_host: y has {} < n·m = {}", y.len(), n * m);
+pub fn gemm_nt_host(
+    x: &[f32],
+    w: &[f32],
+    y: &mut [f32],
+    n: usize,
+    k: usize,
+    m: usize,
+    pool: Option<&Pool>,
+) {
+    assert!(
+        x.len() >= n * k,
+        "gemm_nt_host: x has {} < n·k = {}",
+        x.len(),
+        n * k
+    );
+    assert!(
+        w.len() >= m * k,
+        "gemm_nt_host: w has {} < m·k = {}",
+        w.len(),
+        m * k
+    );
+    assert!(
+        y.len() >= n * m,
+        "gemm_nt_host: y has {} < n·m = {}",
+        y.len(),
+        n * m
+    );
     gemm_nt_cpu(&x[..n * k], &w[..m * k], &mut y[..n * m], n, k, m, pool)
 }
 

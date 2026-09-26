@@ -158,6 +158,11 @@ fn cases() -> Vec<Case> {
             OK,
         ),
         case(
+            "session_id of 256 characters",
+            with(base(), &["session_id"], json!("é".repeat(256))),
+            OK,
+        ),
+        case(
             "score with 2 levels",
             with(
                 base(),
@@ -521,6 +526,11 @@ fn cases() -> Vec<Case> {
             BAD,
         ),
         case(
+            "session_id of 257 characters",
+            with(base(), &["session_id"], json!("s".repeat(257))),
+            BAD,
+        ),
+        case(
             "numeric session_id",
             with(base(), &["session_id"], json!(5)),
             BAD,
@@ -570,6 +580,25 @@ fn cases() -> Vec<Case> {
             Expect::Err(413, Reason::PayloadTooLarge),
         ),
     ]
+}
+
+/// Both sides of the body limit: a body of exactly `limits.body_bytes` is
+/// parsed, one byte more is 413 (the padding sits in `trace`, which is only
+/// checked for being an object).
+#[test]
+fn body_of_exactly_the_limit_is_accepted_one_byte_more_is_413() {
+    let limits = RequestLimits::default();
+    let body = |pad: usize| -> Vec<u8> {
+        serde_json::to_vec(&with(base(), &["trace"], json!({"pad": "p".repeat(pad)}))).unwrap()
+    };
+    let pad = limits.body_bytes - body(0).len();
+    let exact = body(pad);
+    assert_eq!(exact.len(), limits.body_bytes);
+    assert!(parse_request(&exact, &limits).is_ok());
+    let over = body(pad + 1);
+    assert_eq!(over.len(), limits.body_bytes + 1);
+    let e = parse_request(&over, &limits).unwrap_err();
+    assert_eq!((e.status, e.reason), (413, Reason::PayloadTooLarge));
 }
 
 #[test]
@@ -933,6 +962,13 @@ fn nearest_hundredth(v: &Value) -> Value {
     }
 }
 
+/// Limitation (the data allows no stronger check): the fixtures hold Jev's
+/// answers only, already quantised to hundredths, and Jev's own confidence; its
+/// raw probabilities are not stored. So this feeds Jev's quantised numbers back
+/// through `round: 2` and shows the formatting and idempotence of the rounding
+/// (0 and 1 as integers, the shortest text of each hundredth) byte for byte,
+/// not the quantisation of raw probabilities (`answer::tests::
+/// round2_matches_jev_forms` covers rounding from raw values).
 #[test]
 fn round2_reproduces_the_stored_jev_answers_byte_for_byte() {
     let mut n = 0;

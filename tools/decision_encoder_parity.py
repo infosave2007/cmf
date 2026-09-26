@@ -20,6 +20,11 @@ the ignored tests in crates/cortiq-decision/tests/encoder_real.rs.
 
 The ids of the stored features come from HF `tokenizers` 0.22.2; the tool refuses
 another version unless --any-version is given.
+
+The benchmark splits are read from --artifacts-dir (default: $CMFPUBLIC/artifacts,
+where CMFPUBLIC defaults to the main checkout of this repository, which holds the
+local artifacts/) and every sealed read is logged to --access-log (default:
+ARTIFACTS/decision-v4-20260926/test-access.log).
 """
 
 import argparse
@@ -27,10 +32,27 @@ import datetime
 import hashlib
 import json
 import os
+import subprocess
 import sys
 
-ART = "/Users/oleg/dev/cmfpublic/artifacts"
-ACCESS_LOG = os.path.join(ART, "decision-v4-20260926", "test-access.log")
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def default_cmfpublic():
+    """$CMFPUBLIC, else the main checkout of this repository (a worktree's common git dir)."""
+    if os.environ.get("CMFPUBLIC"):
+        return os.environ["CMFPUBLIC"]
+    try:
+        common = subprocess.run(["git", "-C", REPO, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                                capture_output=True, text=True, check=True).stdout.strip()
+        return os.path.dirname(common)
+    except (OSError, subprocess.CalledProcessError):
+        return REPO
+
+
+# Set from the command line (main).
+ART = None
+ACCESS_LOG = None
 SOURCES = [
     ("banking77", "decision-v2-20260926/splits/banking77", ["train", "dev", "calibration", "test"]),
     ("clinc150", "decision-clinc150-20260925/data", ["train", "dev", "calibration", "test", "oos", "latency"]),
@@ -143,7 +165,15 @@ def main():
     p = sub.add_parser("unicode-probe")
     p.add_argument("--out", required=True)
     p.add_argument("--any-version", action="store_true")
+    for p in sub.choices.values():
+        p.add_argument("--artifacts-dir", default=None,
+                       help="the local artifacts/ directory (default: $CMFPUBLIC/artifacts)")
+        p.add_argument("--access-log", default=None,
+                       help="test-split access log (default: ARTIFACTS/decision-v4-20260926/test-access.log)")
     a = ap.parse_args()
+    global ART, ACCESS_LOG
+    ART = a.artifacts_dir or os.path.join(default_cmfpublic(), "artifacts")
+    ACCESS_LOG = a.access_log or os.path.join(ART, "decision-v4-20260926", "test-access.log")
     {"hf-ids": cmd_hf_ids, "unicode-probe": cmd_unicode_probe}[a.cmd](a)
 
 
