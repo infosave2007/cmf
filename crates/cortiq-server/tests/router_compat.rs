@@ -488,7 +488,12 @@ impl Srv {
     }
 
     fn open_with(cfg: Config, key: KeyLookup, admin: Option<&str>) -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        Self::open_in(cfg, key, admin, tempfile::tempdir().unwrap())
+    }
+
+    /// A server on the state directory `dir/state` as it is (keys imported
+    /// beforehand, for example).
+    fn open_in(cfg: Config, key: KeyLookup, admin: Option<&str>, dir: tempfile::TempDir) -> Self {
         let mut o = ServeOptions::new(&toy().path, cfg);
         o.state_dir = Some(dir.path().join("state"));
         o.addr = "127.0.0.1:0".parse().unwrap();
@@ -1252,6 +1257,112 @@ async fn rate_limit_is_429_and_quota_402_in_the_router_envelope() {
     assert_eq!(r.body["error"]["retriable"], false);
     // The quota gate covers every keyed endpoint (router middleware).
     let r = srv.get("/v1/usage", Some(&small)).await;
+    assert_eq!(r.router_error(), (402, "QUOTA_EXCEEDED".into()));
+}
+
+// ------------------------------------------------------------------ key import (package C2)
+
+/// Spec decision-v4 §4.15, package C2: keys imported from a synthetic MySQL
+/// `api_keys` export and a synthetic router configuration answer with their
+/// raw keys on `/v1/route` (router shape) and `/api/alpha/decisions`; an
+/// inactive and an expired key get the router's 401 on both; limits of 0
+/// are unlimited, the others hold, and imported usage counts against quotas.
+#[tokio::test]
+async fn imported_router_keys_answer_on_both_apis() {
+    use cortiq_decision::keys::{self, ImportFormat, KeyStore};
+    use cortiq_decision::ledger::UsageLedger;
+    use cortiq_decision::statedir::StateDir;
+    let dir = tempfile::tempdir().unwrap();
+    let state = StateDir::open(dir.path().join("state")).unwrap();
+    let raw = |n: u8| format!("cortiq_{}", format!("{n:x}").repeat(40));
+    let (live, off, old, slow, spent, cfgkey) = (raw(1), raw(2), raw(3), raw(4), raw(5), raw(6));
+    let export = json!([
+        {"key_hash": keys::hash_key(&live), "account": "acct_live", "plan": "pro", "active": 1,
+         "rate_per_min": 0, "decision_quota": 0},
+        {"key_hash": keys::hash_key(&off), "account": "acct_off", "active": 0},
+        {"key_hash": keys::hash_key(&old), "account": "acct_old", "expires_at": 1_000},
+        {"key_hash": keys::hash_key(&slow), "account": "acct_slow", "rate_per_min": "1"},
+        {"key_hash": keys::hash_key(&spent), "account": "acct_spent", "decision_quota": 3},
+    ])
+    .to_string();
+    let config = format!("[[api_keys]]\nkey = \"{cfgkey}\"\naccount = \"acct_cfg\"\n");
+    let store = KeyStore::open(state.keys_path(), "cortiq_").unwrap();
+    let now = now_unix();
+    for (bytes, format) in [
+        (export.as_bytes(), ImportFormat::MysqlJson),
+        (config.as_bytes(), ImportFormat::RouterToml),
+    ] {
+        let k = keys::read_router_keys(bytes, format, now).unwrap();
+        assert!(store.import_router_keys(&k, now).unwrap().written);
+        let again = store.import_router_keys(&k, now).unwrap();
+        assert_eq!((again.imported, again.written), (0, false));
+    }
+    let on_disk = std::fs::read_to_string(state.keys_path()).unwrap();
+    for k in [&live, &off, &old, &slow, &spent, &cfgkey] {
+        assert!(!on_disk.contains(k.as_str()) && on_disk.contains(&keys::hash_key(k)));
+    }
+    let ledger = UsageLedger::open(state.usage_dir()).unwrap();
+    let usage = keys::read_router_usage(
+        br#"[{"account": "acct_spent", "decisions": 3, "oracle_calls": 1}]"#,
+    )
+    .unwrap();
+    assert_eq!(
+        keys::import_router_usage(&ledger, &usage, now)
+            .unwrap()
+            .carried,
+        1
+    );
+    drop((ledger, store));
+
+    let srv = Srv::open_in(cfg(), Arc::new(|_: &str| None), Some(ADMIN), dir);
+    let mut crit = Map::new();
+    for l in LABELS {
+        crit.insert(l.to_string(), json!(format!("about {l}")));
+    }
+    let jev = json!({"model": "cortiq/decision", "state": accepted(),
+                     "questions": {"task": {"type": "choice", "instructions": "Which topic?",
+                                            "criteria": crit}}});
+    for key in [&live, &cfgkey] {
+        for _ in 0..3 {
+            let r = srv
+                .post("/v1/route", Some(key), &client_body(accepted()))
+                .await;
+            assert_eq!(r.status, 200, "{}", r.text);
+            conforms(&r.body, &route_shape());
+            let r = srv.post("/api/alpha/decisions", Some(key), &jev).await;
+            assert_eq!(r.status, 200, "{}", r.text);
+        }
+    }
+    let r = srv.get("/v1/usage", Some(&live)).await;
+    conforms(&r.body, &usage_shape());
+    assert_eq!(
+        (
+            &r.body["account"]["billable_decisions"],
+            &r.body["account"]["decision_quota"],
+            &r.body["account"]["rate_per_min"]
+        ),
+        (&json!(6), &json!(0), &json!(0)),
+        "{}",
+        r.text
+    );
+    for key in [&off, &old] {
+        let r = srv
+            .post("/v1/route", Some(key), &client_body(accepted()))
+            .await;
+        assert_eq!(r.router_error(), (401, "UNAUTHORIZED".into()));
+        let r = srv.post("/api/alpha/decisions", Some(key), &jev).await;
+        assert_eq!(r.status, 401, "{}", r.text);
+    }
+    wait_for_fresh_minute().await;
+    let r = srv
+        .post("/v1/route", Some(&slow), &client_body(accepted()))
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = srv.post("/api/alpha/decisions", Some(&slow), &jev).await;
+    assert_eq!(r.status, 429, "{}", r.text);
+    let r = srv
+        .post("/v1/route", Some(&spent), &client_body(accepted()))
+        .await;
     assert_eq!(r.router_error(), (402, "QUOTA_EXCEEDED".into()));
 }
 

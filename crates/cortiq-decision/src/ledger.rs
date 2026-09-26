@@ -511,6 +511,24 @@ impl UsageLedger {
         if due { self.snapshot() } else { self.flush() }
     }
 
+    /// Visit every record on disk in file order (queued lines are flushed
+    /// first). Reads the whole month files: for maintenance commands such as
+    /// the router usage import, not for the request path.
+    pub fn for_each_record(&self, mut f: impl FnMut(&UsageRecord)) -> Result<()> {
+        let mut g = self.inner.lock();
+        self.flush_locked(&mut g)?;
+        for name in g.offsets.keys() {
+            let path = self.dir.join(name);
+            let (lines, _, _) = read_tail(&path, 0)?;
+            for (i, line) in lines.iter().enumerate() {
+                let r = UsageRecord::from_line(line)
+                    .with_context(|| format!("{}: record {}", path.display(), i + 1))?;
+                f(&r);
+            }
+        }
+        Ok(())
+    }
+
     /// Lines queued but not yet on disk.
     pub fn pending(&self) -> usize {
         self.inner.lock().pending.len()

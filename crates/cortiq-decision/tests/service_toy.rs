@@ -1296,22 +1296,31 @@ fn keys_auth_rate_quotas_and_admin() {
         "Debug never prints the key"
     );
     // Router import: a config key (raw, hashed on import) and an expired MySQL row.
-    let imported = store
-        .import_router(
-            format!(
-                r#"{{"api_keys":[{{"key":"router-live-key","account":"legacy","rate_per_min":60}},
-                   {{"key_hash":"{}","account":"old","plan":"pro","active":"1","rate_per_min":"600","decision_quota":"1000000","expires_at":1000,"created_at":"5"}}]}}"#,
-                keys::hash_key("router-old-key")
-            )
-            .as_bytes(),
-            now,
+    let config = keys::read_router_keys(
+        b"[[api_keys]]\nkey = \"router-live-key\"\naccount = \"legacy\"\nrate_per_min = 60\n",
+        keys::ImportFormat::RouterToml,
+        now,
+    )
+    .unwrap();
+    let rows = keys::read_router_keys(
+        format!(
+            r#"[{{"key_hash":"{}","account":"old","plan":"pro","active":"1","rate_per_min":"600","decision_quota":"1000000","expires_at":1000,"created_at":"5"}}]"#,
+            keys::hash_key("router-old-key")
         )
-        .unwrap();
-    assert_eq!((imported.imported, imported.skipped), (2, 0));
-    let again = store
-        .import_router(br#"[{"key":"router-live-key","account":"legacy"}]"#, now)
-        .unwrap();
-    assert_eq!((again.imported, again.skipped), (0, 1));
+        .as_bytes(),
+        keys::ImportFormat::MysqlJson,
+        now,
+    )
+    .unwrap();
+    let imported = store.import_router_keys(&config, now).unwrap();
+    assert_eq!((imported.imported, imported.unchanged), (1, 0));
+    let imported = store.import_router_keys(&rows, now).unwrap();
+    assert_eq!((imported.imported, imported.imported_expired), (1, 1));
+    let again = store.import_router_keys(&config, now).unwrap();
+    assert_eq!(
+        (again.imported, again.unchanged, again.written),
+        (0, 1, false)
+    );
 
     let svc = service_with(Config::default(), None)
         .with_keys(store.clone())
