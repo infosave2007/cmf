@@ -810,7 +810,10 @@ impl Escalator for Cascade {
                         && p.account == principal.account
                 })
                 .ok_or_else(not_found)?;
-            if !ring[pos].options.contains(&fb.label) {
+            // The router API's feedback may name any label (a new one starts a
+            // cold start, router `api.rs:1283-1292`); the decisions API's only
+            // an option of the question.
+            if !fb.any_label && !ring[pos].options.contains(&fb.label) {
                 return Err(ApiError::invalid_field(
                     "label",
                     format!(

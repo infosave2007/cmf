@@ -900,6 +900,12 @@ pub struct FeedbackRequest {
     pub question: String,
     /// The correct label.
     pub label: String,
+    /// Accept a label that is not an option of the question (it then starts a
+    /// cold start like an oracle answer to a superset question). Never set by
+    /// [`parse_feedback`]: only the router API's `/v1/feedback`
+    /// `{request_id, correct_task_label}` sets it, as the router let any
+    /// label through (router `api.rs:1273-1292`, spec §4.15).
+    pub any_label: bool,
 }
 
 /// Parse a feedback body.
@@ -937,6 +943,7 @@ pub fn parse_feedback(body: &[u8], limits: &RequestLimits) -> Result<FeedbackReq
         id: get("id", 256)?,
         question: get("question", 4 * MAX_QUESTION_ID_CHARS)?,
         label: get("label", MAX_LABEL_BYTES)?,
+        any_label: false,
     })
 }
 
