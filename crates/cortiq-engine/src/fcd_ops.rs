@@ -334,8 +334,23 @@ pub fn gemm_nt(
 
 /// `gemm_nt` on the host, whatever the device state (the plain f32 GEMM;
 /// the device arm of `gemm_nt` is tf32-class on NVIDIA).
-pub(crate) fn gemm_nt_host(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: usize, pool: Option<&Pool>) {
-    gemm_nt_cpu(x, w, y, n, k, m, pool)
+///
+/// `y[n,m] = x[n,k] · w[m,k]ᵀ`, all row-major, `y[..n·m]` overwritten. This
+/// never initialises, probes or dispatches to a GPU backend, whatever the
+/// size: it is the entry point for callers that need f32 host arithmetic
+/// (the decision encoder). On macOS it is Accelerate `cblas_sgemm` for
+/// `n·k·m ≥ 2^18` (`CMF_ACCEL=0` turns that off); otherwise the pooled
+/// dot kernels, where `pool` only splits disjoint row blocks of `y`.
+///
+/// Only the leading `n·k`, `m·k` and `n·m` elements of `x`, `w` and `y` are
+/// used (callers pass scratch buffers sized for their largest batch); it
+/// panics if a buffer is shorter than that, because the kernels address
+/// the buffers through raw pointers.
+pub fn gemm_nt_host(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: usize, pool: Option<&Pool>) {
+    assert!(x.len() >= n * k, "gemm_nt_host: x has {} < n·k = {}", x.len(), n * k);
+    assert!(w.len() >= m * k, "gemm_nt_host: w has {} < m·k = {}", w.len(), m * k);
+    assert!(y.len() >= n * m, "gemm_nt_host: y has {} < n·m = {}", y.len(), n * m);
+    gemm_nt_cpu(&x[..n * k], &w[..m * k], &mut y[..n * m], n, k, m, pool)
 }
 
 fn gemm_nt_cpu(

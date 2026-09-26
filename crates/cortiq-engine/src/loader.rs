@@ -25,6 +25,12 @@ use cortiq_core::quant::dequant_tensor;
 use cortiq_core::{CmfError, CmfModel, LayerType, ModelArch};
 use std::sync::Arc;
 
+/// The refusal every generative entry point (`Pipeline::from_model*`, and
+/// through it run/chat/route/bench) gives a file carrying the DECISION
+/// feature bit. Such a file is served by the decision runtime instead.
+pub const DECISION_MODEL_REFUSAL: &str =
+    "this is a DECISION model; use `cortiq decide` or `cortiq serve`";
+
 /// Tensor source selector (spec §9): backbone, one skill's overlay, or
 /// a soft superposition of top-m skills (claim 14 working tensors).
 pub enum Overlay<'a> {
@@ -610,6 +616,12 @@ impl Pipeline {
     }
 
     fn skill_file_guard(model: &CmfModel) -> Result<(), CmfError> {
+        // A decision profile (encoder + resonance skills) has no language
+        // model in it at all; the generative pipeline must not try to
+        // assemble one from its tensors.
+        if model.required_features & cortiq_core::format::features::DECISION != 0 {
+            return Err(CmfError::Parse(DECISION_MODEL_REFUSAL.into()));
+        }
         // A standalone skill file carries a PARTIAL tensor set cut against
         // a base; running it would be half a network answering questions.
         if model.required_features & cortiq_core::format::features::SKILL_FILE != 0 {
@@ -627,6 +639,10 @@ impl Pipeline {
         sampler_config: SamplerConfig,
         ov: &Overlay,
     ) -> Result<Self, CmfError> {
+        // Refuse non-runnable files first, before any process-wide state
+        // (the device cache directory, the graph verdict) is touched on
+        // their behalf.
+        Self::skill_file_guard(model)?;
         // Small device caches (probe verdicts, compiled pipelines) go
         // beside the model: it is a directory the caller demonstrably
         // writes to, which `std::env::temp_dir()` is not inside an
@@ -637,7 +653,6 @@ impl Pipeline {
         // A new model gets a fresh verdict on whether the token graph can
         // be built: the refusal is remembered per model, not per process.
         crate::gpu::graph_unsupported_reset();
-        Self::skill_file_guard(model)?;
         let skill = match ov {
             Overlay::One(s) => Some(*s),
             _ => None,

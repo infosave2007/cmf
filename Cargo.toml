@@ -2,6 +2,7 @@
 members = [
     "crates/cortiq-core",
     "crates/cortiq-engine",
+    "crates/cortiq-decision",
     "crates/cortiq-net",
     "crates/cortiq-server",
     "crates/cortiq-cli",
@@ -18,7 +19,7 @@ lto = "thin"
 codegen-units = 1
 
 [workspace.package]
-version = "0.7.7"
+version = "0.7.8"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
