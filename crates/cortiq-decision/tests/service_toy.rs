@@ -768,6 +768,49 @@ fn gate_accepted_questions_never_reach_the_oracle() {
     );
 }
 
+/// `decide_local` (the shadow mode of `serve --shadow-of`) is exactly the local
+/// decision `decide` starts from, for every profile, and nothing else: no
+/// escalation, no observation, no usage.
+#[test]
+fn decide_local_is_the_local_decision_and_nothing_else() {
+    let mock = Mock::new(Mode::Answer);
+    let svc = service_with(oracle_cfg(), Some(mock.clone()));
+    let plain = service();
+    let (acc, rej) = accepted_and_rejected();
+    let (calls0, observed0) = (mock.calls(), mock.observed.load(Ordering::SeqCst));
+    for text in [&acc, &rej] {
+        for profile in ["balanced", "quality-first", "cost-saver"] {
+            let b = body(
+                json!(text),
+                json!({"task": choice(&TOPICS)}),
+                Some(json!({"profile": profile, "oracle": true})),
+            );
+            let req = cortiq_decision::protocol::parse_request(&b, &svc.limits()).unwrap();
+            let lo = svc.decide_local(&req).unwrap();
+            let d = run(&plain, &b).unwrap();
+            assert_eq!(lo.questions.len(), 1);
+            let (m, local) = &lo.questions[0];
+            assert_eq!(m, &d.questions[0].matched);
+            assert_eq!(local.as_ref(), d.questions[0].local.as_ref(), "{profile}");
+            assert_eq!(
+                local.as_ref().unwrap().accepted,
+                d.questions[0].action == Action::Local
+            );
+            assert_eq!(lo.timings.oracle, std::time::Duration::ZERO);
+            assert_eq!(lo.model, d.response["model"].as_str().unwrap());
+        }
+    }
+    // An untrained question has no local decision and is not an error.
+    let b = body(json!(rej), json!({"task": choice(&["x", "y"])}), None);
+    let req = cortiq_decision::protocol::parse_request(&b, &svc.limits()).unwrap();
+    let lo = svc.decide_local(&req).unwrap();
+    assert!(lo.questions[0].1.is_none());
+    assert_eq!(mock.calls(), calls0, "decide_local never escalates");
+    assert_eq!(mock.observed.load(Ordering::SeqCst), observed0);
+    assert_eq!(svc.totals(&Principal::open().account).decisions, 0);
+    assert_eq!(svc.inflight(), 0);
+}
+
 #[test]
 fn abstentions_escalate_only_with_consent() {
     let mock = Mock::new(Mode::Answer);

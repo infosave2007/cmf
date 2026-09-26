@@ -41,6 +41,7 @@ use cortiq_decision::protocol::{ApiError, MODEL_ID, model_name};
 use cortiq_decision::service::{
     Decided, DecisionService, LoadedModel, ModelHandle, Principal, QuestionOutcome,
 };
+use cortiq_decision::shadow::{SHADOW_LOG_FILE, upstream_base};
 use cortiq_decision::signal::SignalEncoder;
 use cortiq_decision::statedir::{StateDir, generation_name};
 use cortiq_server::decisions::{self as server, ServeOptions};
@@ -80,6 +81,8 @@ pub struct ServeFlags {
     pub state: Option<PathBuf>,
     /// `--break-lock`: remove a state `LOCK` left by a dead process (spec §4.11).
     pub break_lock: bool,
+    /// `--shadow-of URL`: shadow mode of the router API (spec §4.15).
+    pub shadow_of: Option<String>,
 }
 
 impl ServeFlags {
@@ -89,6 +92,7 @@ impl ServeFlags {
             ("--decision-config", self.decision_config.is_some()),
             ("--state", self.state.is_some()),
             ("--break-lock", self.break_lock),
+            ("--shadow-of", self.shadow_of.is_some()),
         ]
         .into_iter()
         .filter_map(|(name, set)| set.then_some(name))
@@ -110,7 +114,7 @@ pub fn check_serve_flags(
         ensure!(
             llm_given.is_empty(),
             "{} is a decision file: {} apply only to language models (a decision server takes \
-             --host, --port, --decision-config, --state and --break-lock)",
+             --host, --port, --decision-config, --state, --break-lock and --shadow-of)",
             model,
             llm_given.join(", ")
         );
@@ -145,11 +149,21 @@ pub async fn serve(model: &str, host: &str, port: u16, flags: &ServeFlags) -> Re
     opts.addr = socket_addr(host, port)?;
     opts.state_dir = flags.state.clone();
     opts.break_lock = flags.break_lock;
+    opts.shadow_of = flags.shadow_of.clone();
     println!(
         "  Decision file: decisions API on http://{} (state {})",
         opts.addr,
         opts.state_root().display()
     );
+    if let Some(url) = &opts.shadow_of {
+        // Checked before it is printed (credentials in it are refused).
+        let base = upstream_base(url)?;
+        println!(
+            "  Shadow mode: the router API is answered by {base}; /v1/route and /v1/route:batch \
+             are also decided locally (no oracle, learning or billing) and compared in {}",
+            opts.state_root().join(SHADOW_LOG_FILE).display()
+        );
+    }
     println!();
     server::serve(opts).await
 }
@@ -1500,8 +1514,17 @@ mod tests {
             decision_config: Some("cfg.json".into()),
             state: Some("st".into()),
             break_lock: true,
+            shadow_of: Some("https://router.example.com".into()),
         };
-        assert_eq!(d.given(), ["--decision-config", "--state", "--break-lock"]);
+        assert_eq!(
+            d.given(),
+            [
+                "--decision-config",
+                "--state",
+                "--break-lock",
+                "--shadow-of"
+            ]
+        );
         // Decision file: no language-model flag.
         assert!(check_serve_flags("d.cmf", true, &[], &d).is_ok());
         let e = check_serve_flags("d.cmf", true, &["--task", "--gpus"], &none).unwrap_err();
@@ -1523,6 +1546,8 @@ mod tests {
             "--state",
             "s",
             "--break-lock",
+            "--shadow-of",
+            "https://router.example.com",
         ])
         .unwrap()
         .command
@@ -1531,12 +1556,14 @@ mod tests {
                 decision_config,
                 state,
                 break_lock,
+                shadow_of,
                 task,
                 ..
             } => {
                 assert_eq!(decision_config.as_deref(), Some("c.json"));
                 assert_eq!(state.as_deref(), Some("s"));
                 assert!(break_lock);
+                assert_eq!(shadow_of.as_deref(), Some("https://router.example.com"));
                 // `--task` is optional so that its presence can be refused on
                 // a decision file (a language model still defaults to general).
                 assert_eq!(task, None);

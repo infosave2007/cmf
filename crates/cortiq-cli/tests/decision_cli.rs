@@ -24,6 +24,9 @@
 //!   mock oracle (25 answers → generation 1); then `decide --state`,
 //!   `decision verify --state`, `materialize` and `rollback` on its state;
 //! * `decision keys create|list|revoke|import` and a keyed server;
+//! * `serve --shadow-of`: the old router's answer byte for byte, one
+//!   comparison line without the text, whose local label is `decide`'s; a
+//!   plain-http non-loopback URL refused before anything is opened;
 //! * `decision learn` with the mock oracle: only abstentions are asked, ledger
 //!   answers are reused, the reservation ledger holds no key.
 
@@ -1505,6 +1508,151 @@ fn keys_create_list_revoke_import_and_a_keyed_server() {
 
 /// Wait for the start of a minute when fewer than 15 s of this one are left
 /// (the rate window is a fixed minute).
+/// A mock of the old router (`cortiq-router`): every request answered with
+/// `body` (and `X-Old-Router: yes`), request bodies recorded.
+fn old_router_mock(body: Vec<u8>) -> (SocketAddr, Arc<Mutex<Vec<Vec<u8>>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let seen2 = seen.clone();
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut s) = conn else { continue };
+            let Some(b) = read_request(&mut s) else {
+                continue;
+            };
+            seen2.lock().unwrap().push(b);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Old-Router: yes\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = s.write_all(head.as_bytes());
+            let _ = s.write_all(&body);
+        }
+    });
+    (addr, seen)
+}
+
+#[test]
+fn serve_shadow_of_answers_with_the_old_router_and_compares_locally() {
+    let t = toy();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    // Pretty-printed: bytes this server never writes.
+    let old_body = serde_json::to_vec_pretty(&json!({
+        "schema_version": "1.1", "request_id": "req_old_cli",
+        "decision": {"task_label": "billing", "taxonomy_id": "topics", "confident": true}
+    }))
+    .unwrap();
+    let (old_addr, seen) = old_router_mock(old_body.clone());
+    let old_url = format!("http://{old_addr}");
+
+    // A plain-http router elsewhere than loopback is refused up front.
+    let bad_state = d.join("bad-state");
+    let e = fails(&[
+        "serve",
+        s(&t.path),
+        "--port",
+        "9",
+        "--state",
+        s(&bad_state),
+        "--shadow-of",
+        "http://router.example.com",
+    ]);
+    assert!(e.contains("loopback"), "{e}");
+    assert!(!bad_state.exists());
+    // Credentials in the URL: refused, and echoed nowhere.
+    let o = output(
+        &[
+            "serve",
+            s(&t.path),
+            "--port",
+            "9",
+            "--state",
+            s(&bad_state),
+            "--shadow-of",
+            "https://user:secretpw@router.example.com",
+        ],
+        &[],
+    );
+    assert!(!o.status.success());
+    assert!(!show(&o).contains("secretpw"), "{}", show(&o));
+    assert!(show(&o).contains("credentials"), "{}", show(&o));
+    assert!(!bad_state.exists());
+
+    let admin = "admin-token-for-the-cli-shadow-test-0123";
+    let state = d.join("state");
+    let srv = Server::start(
+        &t.path,
+        &["--state", s(&state), "--shadow-of", &old_url],
+        &[("CORTIQ_DECISION_ADMIN_TOKEN", admin)],
+        d,
+    );
+    let (text, _) = &t.topics.dev_rows[0];
+    let req = json!({"taxonomy_id": "topics", "input": {"text": text}}).to_string();
+    let agent = ureq::AgentBuilder::new()
+        .max_idle_connections(0)
+        .timeout(Duration::from_secs(60))
+        .build();
+    let resp = agent
+        .post(&srv.url("/v1/route"))
+        .set("Content-Type", "application/json")
+        .set(
+            "Authorization",
+            "Bearer cortiq_00112233445566778899aabbccddeeff00112233",
+        )
+        .send_string(&req)
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.header("x-old-router"), Some("yes"));
+    assert!(resp.header("x-request-id").is_none());
+    let mut got = Vec::new();
+    resp.into_reader().read_to_end(&mut got).unwrap();
+    assert_eq!(got, old_body, "the old router's bytes");
+    assert_eq!(seen.lock().unwrap().as_slice(), [req.clone().into_bytes()]);
+    let t0 = Instant::now();
+    let stats = loop {
+        let v: Value = agent
+            .get(&srv.url("/v1/admin/shadow"))
+            .set("x-admin-token", admin)
+            .call()
+            .unwrap()
+            .into_json()
+            .unwrap();
+        if v["lines"] == 1 {
+            break v;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(60), "{v}");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(stats["shadow_of"], json!(old_url));
+    assert_eq!(stats["compared"], 1);
+    let logs = srv.stop();
+    assert!(logs.contains("Shadow mode:"), "{logs}");
+    assert!(!logs.contains(text.as_str()), "a text in the logs");
+    let raw = std::fs::read_to_string(state.join("shadow.jsonl")).unwrap();
+    assert!(!raw.contains(text.as_str()), "a text in the comparison log");
+    let line: Value = serde_json::from_str(raw.trim()).unwrap();
+    assert_eq!(
+        line["text_sha256"],
+        json!(format!("{:x}", Sha256::digest(text.as_bytes())))
+    );
+    assert_eq!(line["request_id_old"], "req_old_cli");
+    assert_eq!(line["taxonomy"], "topics");
+    assert_eq!(line["old_label"], "billing");
+    assert_eq!(line["old_confident"], true);
+    assert_eq!(line["old_status"], 200);
+    // The local side is the file's own decision (`cortiq decide`).
+    let dec = decide_json(&t.path, text, &["--skill", "topics"]);
+    let choice = dec["answers"]["task"]["choice"].as_str().unwrap();
+    assert_eq!(line["new_label"], choice);
+    assert_eq!(
+        line["new_confident"],
+        json!(dec["cmf"]["questions"]["task"]["action"] == "local")
+    );
+    assert_eq!(line["agree"], json!(choice == "billing"));
+}
+
 fn fresh_minute() {
     let now = || {
         std::time::SystemTime::now()

@@ -8,6 +8,7 @@
 //!   oracle.jsonl      oracle reservation ledger (cascade)
 //!   oracle.state      oracle stop reason and switches (cascade)
 //!   learn.log         cache, buffer and learning records (cascade)
+//!   shadow.jsonl      router-API shadow comparisons (`serve --shadow-of`), no texts
 //!   generations/      gNNNNNN.cmf overlay generations
 //!   CURRENT           "gNNNNNN <sha256>" of the served generation, atomic replace
 //! ```
@@ -278,6 +279,11 @@ impl StateDir {
 
     pub fn learn_log_path(&self) -> PathBuf {
         self.root.join(LEARN_LOG_FILE)
+    }
+
+    /// `shadow.jsonl` of `cortiq serve --shadow-of` ([`crate::shadow`]).
+    pub fn shadow_log_path(&self) -> PathBuf {
+        self.root.join(crate::shadow::SHADOW_LOG_FILE)
     }
 
     pub fn generations_dir(&self) -> PathBuf {

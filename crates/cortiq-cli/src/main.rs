@@ -273,6 +273,24 @@ enum Commands {
         /// Decision file only: remove a state LOCK left by a dead process
         #[arg(long)]
         break_lock: bool,
+        /// Decision file only: shadow mode for switching production traffic
+        /// from cortiq-router (router-API paths only). Every router-API
+        /// request (/v1/route, /v1/route:batch, /v1/feedback,
+        /// /v1/taxonomies, /v1/usage, /v1/escalations, /v1/healthz,
+        /// /v1/readyz, /metrics, /v1/admin/keys) is forwarded unchanged to
+        /// the old router at URL (https; http only to a loopback address),
+        /// with the client's Authorization header, and the client gets the
+        /// old router's answer byte for byte, errors included (502
+        /// UPSTREAM_UNAVAILABLE only when it gives no answer). /v1/route and
+        /// /v1/route:batch are also decided locally in parallel — no oracle,
+        /// no learning, no billing — and one line per input is appended to
+        /// <state>/shadow.jsonl: {ts, request_id_old, text_sha256 (never the
+        /// text), taxonomy, old_label, new_label, agree, old_confident,
+        /// new_confident, old_latency_ms, new_latency_ms, old_status,
+        /// new_error}. GET /v1/admin/shadow (x-admin-token) returns the
+        /// agreement overall, by confidence and per label
+        #[arg(long, value_name = "URL")]
+        shadow_of: Option<String>,
         /// Also listen on ollama-compatible port
         #[arg(long)]
         compat_port: Option<u16>,
@@ -2015,6 +2033,7 @@ async fn main() -> anyhow::Result<()> {
             decision_config,
             state,
             break_lock,
+            shadow_of,
             compat_port,
             o1,
             o1_m,
@@ -2046,6 +2065,7 @@ async fn main() -> anyhow::Result<()> {
                 decision_config: decision_config.map(Into::into),
                 state: state.map(Into::into),
                 break_lock,
+                shadow_of,
             };
             let o1 = O1Flags {
                 spec: o1,
