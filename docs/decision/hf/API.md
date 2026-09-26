@@ -12,9 +12,15 @@ Both run the same local model and the same oracle cascade ([ORACLE.md](ORACLE.md
 There is no web interface and no CORS layer. Request bodies are never logged:
 a log line holds the request id, status, latency and account.
 
-Every command and `curl` call below was run against a local server of the
-published `cortiq-decision.cmf` with cortiq 0.7.8; the HTTP status each call
-returned is written after it as `# → 200`. The examples use `curl` and `jq`.
+The command and `curl` blocks below were run in order, as written, against
+local servers of the published `cortiq-decision.cmf` with cortiq 0.7.8; the
+HTTP status each call returned is written after it as `# → 200`. Three parts
+used stand-ins or were not run: the `mysql` export of section 8.1 was not run
+(the import read a hand-written export of one test key and its counters); the
+old router of section 8.3 was a local stand-in, a `cortiq serve` of the same
+file holding that imported key at `127.0.0.1:8080`; and `cortiq decision
+learn` in section 7 called a local mock of the OpenRouter API (`base_url`
+pointed at it) instead of OpenRouter. The examples use `curl` and `jq`.
 
 1. [Start a server](#1-start-a-server)
 2. [Keys, plans and limits](#2-keys-plans-and-limits)
@@ -530,7 +536,7 @@ unset the admin API answers 404 `ADMIN_DISABLED`.
 |---|---|
 | `POST / GET /v1/admin/keys`, `DELETE /v1/admin/keys/{account}`, `DELETE /v1/admin/keys/hash/{hash12}` | create (raw key returned once), list, revoke |
 | `GET /v1/admin/usage` | usage of every account |
-| `GET /v1/admin/oracle`, `POST /v1/admin/oracle {"enabled", "budget_usd", "max_calls"}` | oracle status (spent, calls, stop reason); switch it and lower limits within the configuration |
+| `GET /v1/admin/oracle`, `POST /v1/admin/oracle {"enabled", "budget_usd", "max_calls"}` | oracle status (`configured` = `oracle.enabled` of the configuration, `enabled` = not switched off by a stop rule or the admin, `key_present`, spent, calls, stop reason); switch it and lower limits within the configuration |
 | `GET /v1/admin/learning` | buffer, cache, quarantine, attempts, promotions, recent events |
 | `GET /v1/admin/generations`, `POST /v1/admin/rollback {"generation": N}` | generations; serve generation N (0 = the base file) |
 | `GET /v1/admin/shadow` | agreement statistics in shadow mode (section 8) |
@@ -737,21 +743,35 @@ oracle and from feedback on live traffic.
 
 ### 8.3 Shadow mode, switch and rollback
 
-Run the new server next to the old router with `--shadow-of`. Every request to
-a router path is forwarded unchanged to the old router and its answer goes back
-to the client byte for byte (errors included), so clients see no change.
-`/v1/route` and `/v1/route:batch` are also decided locally (no oracle, no
-learning, no billing) and compared line by line in `<state>/shadow.jsonl`
-(labels, confidence, latency and the text's sha256, never the text).
+Run the new server next to the old router with `--shadow-of URL`. Every request
+to a router path is forwarded unchanged to the old router, with the client's
+own `Authorization` header, and its answer goes back to the client byte for
+byte (errors included), so clients see no change. `/v1/route` and
+`/v1/route:batch` are also decided locally (no oracle, no learning, no
+billing) and compared line by line in `<state>/shadow.jsonl` (labels,
+confidence, latency and the text's sha256, never the text).
+
+`--shadow-of` reaches the old router over **https**, or over plain http **only
+at a loopback address** (`127.0.0.1`, `::1`, `localhost`), because the
+clients' keys pass through it. cortiq-router itself speaks plain http, with
+TLS at nginx, so run the new server on the router's host and point it at the
+router's own port there. The admin token of section 1 must be in its
+environment as well.
 
 ```bash
+# on the router's host; the old router listens on port 8080
 cortiq serve cortiq-decision-plus.cmf --state ./router.state --port 8090 \
-  --shadow-of http://router-a:8080
+  --shadow-of http://127.0.0.1:8080
 ```
+
+A router on another machine is named by an https address in front of it
+(`--shadow-of https://router-a.internal`); `--shadow-of http://router-a:8080`
+is refused. `$ROUTER_KEY` below is the key of one of your router clients: it
+was imported in 8.1, so both the old router and the new server accept it.
 
 ```bash
 export SHADOW=http://127.0.0.1:8090
-curl -s "$SHADOW/v1/route" -H "Authorization: Bearer $KEY" \
+curl -s "$SHADOW/v1/route" -H "Authorization: Bearer $ROUTER_KEY" \
   -H 'Content-Type: application/json' \
   -d '{"input": {"text": "Write a haiku about autumn"}, "taxonomy_id": "data-assistant"}' \
   | jq .decision.task_label                                                     # → 200
@@ -759,27 +779,49 @@ curl -s "$SHADOW/v1/admin/shadow" -H "x-admin-token: $CORTIQ_DECISION_ADMIN_TOKE
   | jq '{lines, compared, agree, agreement, confident, latency_ms}'            # → 200
 ```
 
-nginx in front of the router (the upstream of the router's `deploy/nginx`):
+nginx on the same host, in place of the `upstream cortiq` block of the
+router's `deploy/nginx/nginx.conf`:
 
 ```nginx
 upstream cortiq {
     least_conn;
-    # 1. shadow: clients are answered by the old router through the new server
-    server 127.0.0.1:8090;
-    # 2. switch: the new server without --shadow-of
-    # server 127.0.0.1:8080;
-    # 3. rollback: the old router again
-    # server router-a:8080;
+    server 127.0.0.1:8090;           # the new server: in shadow mode, then after the switch
+    server 127.0.0.1:8080 backup;    # the old router: only while the new server restarts
     keepalive 64;
 }
 ```
 
-1. **Shadow**: point the upstream at the shadow server and reload nginx.
-   Clients are still answered by the old router. Watch
-   `GET /v1/admin/shadow` (overall agreement, agreement when both sides are
-   confident, per-label agreement, latency).
-2. **Switch** only when the agreement and your own spot checks are good
-   enough: start `cortiq serve` without `--shadow-of` on the same state
-   directory (keys and usage are already there) and point the upstream at it.
-3. **Rollback** is the old upstream line and an nginx reload; the old router
-   was never changed.
+With nginx on another machine, as in the router's own `deploy/nginx`
+(`server router-a:8080`), start the new server with `--host 0.0.0.0` as well
+(it listens on `127.0.0.1` by default) and write `router-a:8090` and
+`router-a:8080 backup` in the upstream; `--shadow-of` stays
+`http://127.0.0.1:8080`. One state directory serves one process, so quotas
+and usage are counted per server.
+
+**1. Shadow.** Start the shadow server, point the upstream at it as above and
+reload nginx. Clients are still answered by the old router. Watch
+`GET /v1/admin/shadow` (overall agreement, agreement when both sides are
+confident, per-label agreement, latency).
+
+**2. Switch** only when the agreement and your own spot checks are good
+enough. Stop the shadow server (Ctrl-C) and start it again on the same state
+directory and port without `--shadow-of`. Keys and usage are already there,
+and nginx sends requests to the old router (`backup`) while the new server
+loads; nginx itself needs no change.
+
+```bash
+cortiq serve cortiq-decision-plus.cmf --state ./router.state --port 8090
+```
+
+```bash
+curl -s "$SHADOW/v1/route" -H "Authorization: Bearer $ROUTER_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"input": {"text": "Translate good morning into French"}, "taxonomy_id": "data-assistant"}' \
+  | jq '{label: .decision.task_label, source: .decision.source}'                 # → 200
+curl -s "$SHADOW/v1/usage" -H "Authorization: Bearer $ROUTER_KEY" | jq .usage   # → 200
+```
+
+**3. Rollback.** Leave `server 127.0.0.1:8080;` as the only line of the
+upstream and reload nginx; the old router was never changed. Decisions the
+new server counted after the switch stay in its own usage ledger, not in the
+router's `usage_counters`.

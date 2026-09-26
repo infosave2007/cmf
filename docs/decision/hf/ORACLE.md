@@ -86,8 +86,12 @@ only; its answer teaches that skill, and a new label starts a cold start.
   or `cortiq decision rollback` serves any generation again (0 = the base
   file; the buffer is kept). `cortiq decision materialize` writes the served
   generation as one file.
-* **Offline pre-training.** `cortiq decision learn` runs the same procedure over
-  a file of unlabelled texts (see API.md, section 7).
+* **Offline pre-training.** `cortiq decision learn` asks the oracle about the
+  texts of a file of unlabelled traffic that the gate rejects, then refits
+  every label that got new examples, however few (there is no threshold of
+  25 here), checks each challenger on the holdout and re-certifies the gate
+  once at the end; if a certified gate would be lost, every promotion of the
+  skill is undone (see API.md, section 7).
 
 ## Budget and stop rules
 
@@ -177,15 +181,18 @@ cortiq serve cortiq-decision.cmf --decision-config oracle-server.json \
   --state ./oracle.state --port 8081
 ```
 
-Verify: the admin view shows the oracle enabled with the key present, and a
-question the gate rejects comes back from the oracle (on the published model,
-"can you recommend a good tattoo artist" is out of scope for `clinc150` and
-is rejected by its gate).
+Verify: the admin view must show `configured: true` (the configuration
+enables the oracle) and `key_present: true` (the key variable is set in the
+server's environment). `enabled: true` only means that no stop rule or admin
+call has switched the oracle off; it is true with the oracle off in the
+configuration as well. Then a question the gate rejects comes back from the
+oracle (on the published model, "can you recommend a good tattoo artist" is
+out of scope for `clinc150` and is rejected by its gate).
 
 ```bash
 export ORC=http://127.0.0.1:8081
 curl -s "$ORC/v1/admin/oracle" -H "x-admin-token: $CORTIQ_DECISION_ADMIN_TOKEN" \
-  | jq '{enabled, key_present, model, budget_usd, spent_usd, stop_reason}'        # → 200
+  | jq '{configured, key_present, enabled, model, budget_usd, spent_usd, stop_reason}'   # → 200
 curl -s "$ORC/v1/route" -H "Authorization: Bearer $OKEY" \
   -H 'Content-Type: application/json' \
   -d '{"input": {"text": "can you recommend a good tattoo artist"}, "taxonomy_id": "clinc150"}' \
@@ -193,6 +200,9 @@ curl -s "$ORC/v1/route" -H "Authorization: Bearer $OKEY" \
 curl -s "$ORC/v1/admin/oracle" -H "x-admin-token: $CORTIQ_DECISION_ADMIN_TOKEN" \
   | jq '{calls, spent_usd}'                                                         # → 200
 ```
+
+The statuses above were recorded with `base_url` pointed at a local mock of
+the OpenRouter API; the documentation run sent nothing to OpenRouter.
 
 `source` is `oracle` (a repeat of the same text is `cache`); `calls` and
 `spent_usd` grow. If `source` stays `router` with the flag `oracle_disabled`,
@@ -247,7 +257,7 @@ proxy; the 24 requests of MASSIVE mode A that no ledger held were sent live.
 | Oracle calls | 282 / 289 | 351 / 355 | 1335 / 1359 |
 | Oracle calls by third of the stream | 104, 80, 98 / 104, 81, 104 | 113, 100, 138 / 114, 101, 140 | 449, 415, 471 / 447, 449, 463 |
 | Cache hits (correct) | 7 (4) / 0 | 4 (4) / 0 | 10 (7) / 0 |
-| Learning attempts: promoted / rejected | 0 / 0 | 0 / 0 | 16 / 12 |
+| Learning attempts | 0 / 0 | 0 / 0 | 28 (16 promoted, 12 rejected) / 0 |
 | Answered locally (correct) | 2791 (2714) / 2791 (2714) | 4145 (4091) / 4145 (4091) | 1629 (1595) / 1615 (1581) |
 | Cascade correct | 2893 / 2894 | 4386 / 4386 | 2617 / 2617 |
 | $ per 1M decisions | $3.01 / $3.09 | $3.53 / $3.56 | $8.48 / $8.52 |
