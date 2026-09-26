@@ -30,8 +30,11 @@ use cortiq_decision::config::Config;
 use cortiq_decision::container::{self, DecisionModel, Verify, WriteReport};
 use cortiq_decision::eval::{self, EvalOptions, Evaluator, SkillScorer};
 use cortiq_decision::generation;
-use cortiq_decision::keys::{KeyStore, NewKey, now_unix};
+use cortiq_decision::keys::{
+    self as keys_mod, ImportFormat, ImportReport, KeyStore, NewKey, UsageImportReport, now_unix,
+};
 use cortiq_decision::learn::{self, OfflineOptions, OfflineReport};
+use cortiq_decision::ledger::UsageLedger;
 use cortiq_decision::manifest::{Gate, SkillManifest, TaskState};
 use cortiq_decision::oracle;
 use cortiq_decision::protocol::{ApiError, MODEL_ID, model_name};
@@ -494,6 +497,37 @@ pub struct KeyState {
     pub decision_config: Option<PathBuf>,
 }
 
+/// `cortiq decision keys import --help` (spec §4.15).
+const KEYS_IMPORT_HELP: &str = "\
+Import the API keys of cortiq-router: a JSON export of its MySQL api_keys
+table (--format mysql-json) or the [[api_keys]] of its TOML configuration
+(--format router-toml, raw keys hashed as they are read). Only sha256
+hashes are stored, the same digest the router stores, so the keys keep
+working without reissue. With --usage the router's usage_counters continue
+in the usage ledger, so quotas continue. Every input is checked before
+anything is written; the summary names no key and no hash.
+
+Exports from the router's database (JSON lines, one row per line):
+
+  mysql -N -B -r -e \"SELECT JSON_OBJECT('key_hash',key_hash,
+    'account',account,'plan',plan,'email',email,'label',label,
+    'active',active,'rate_per_min',rate_per_min,
+    'decision_quota',decision_quota,'expires_at',expires_at,
+    'created_at',created_at) FROM api_keys\" DB > api_keys.jsonl
+
+  mysql -N -B -r -e \"SELECT JSON_OBJECT('account',account,
+    'decisions',decisions,'oracle_calls',oracle_calls)
+    FROM usage_counters\" DB > usage_counters.jsonl
+
+MySQL Shell (--json, --result-format=json/array or ndjson), MySQL Workbench
+and phpMyAdmin JSON exports are read too.
+
+Idempotent: a second import of the same export writes nothing. A key already
+stored is never overwritten (import the MySQL export before the
+configuration: the router's database wins over its configuration), an active
+key the export marks inactive is revoked, nothing is re-activated or
+deleted. Limits of 0 stay unlimited; the email column is not stored.";
+
 /// `cortiq decision keys …` (spec §4.10, §4.15, §5b).
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum KeysCmd {
@@ -552,13 +586,31 @@ pub enum KeysCmd {
         #[arg(long)]
         hash: Option<String>,
     },
-    /// Import cortiq-router keys: a JSON export of its MySQL api_keys table
-    /// and/or its config's [[api_keys]] (existing keys keep working)
+    /// Import the API keys of cortiq-router: a JSON export of its MySQL
+    /// api_keys table or the [[api_keys]] of its TOML configuration; the keys
+    /// keep working without reissue (only sha256 hashes are stored). With
+    /// --usage its usage_counters continue in the usage ledger. Idempotent;
+    /// the summary names no key and no hash
+    #[command(long_about = KEYS_IMPORT_HELP)]
+    #[command(group(ArgGroup::new("what").required(true).multiple(true).args(["from", "usage"])))]
     Import {
         #[command(flatten)]
         at: KeyState,
+        /// Keys: rows of the router's api_keys table as JSON (an array,
+        /// JSON lines, MySQL Shell --json, phpMyAdmin), or its configuration
         #[arg(long)]
-        from: PathBuf,
+        from: Option<PathBuf>,
+        /// Format of --from (default: .toml = router-toml, .json/.jsonl =
+        /// mysql-json, else by the content)
+        #[arg(long, requires = "from", value_parser = ImportFormat::NAMES)]
+        format: Option<String>,
+        /// Usage: rows of the router's usage_counters table as JSON; the
+        /// ledger is written, so no server may hold the state directory
+        #[arg(long)]
+        usage: Option<PathBuf>,
+        /// Print the summary as one JSON object
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1251,26 +1303,151 @@ fn keys(cmd: &KeysCmd) -> Result<()> {
             println!("revoked {n} key(s) of {what}");
             Ok(())
         }
-        KeysCmd::Import { at, from } => {
-            let (store, _) = key_store(at)?;
-            let bytes = std::fs::read(from).with_context(|| format!("read {}", from.display()))?;
-            let r = store
-                .import_router(&bytes, now)
-                .with_context(|| format!("import {}", from.display()))?;
-            let accounts: Vec<&str> = r.accounts.iter().map(String::as_str).collect();
-            println!(
-                "imported {} key(s), skipped {} already present; accounts: {}",
-                r.imported,
-                r.skipped,
-                if accounts.is_empty() {
-                    "-".to_string()
-                } else {
-                    accounts.join(", ")
-                }
-            );
-            Ok(())
-        }
+        KeysCmd::Import {
+            at,
+            from,
+            format,
+            usage,
+            json,
+        } => keys_import(
+            at,
+            from.as_deref(),
+            format.as_deref(),
+            usage.as_deref(),
+            *json,
+            now,
+        ),
     }
+}
+
+/// `cortiq decision keys import` (spec §4.15). Every input is read and
+/// checked before anything is written; the usage ledger is written only
+/// under the state directory's LOCK.
+fn keys_import(
+    at: &KeyState,
+    from: Option<&Path>,
+    format: Option<&str>,
+    usage: Option<&Path>,
+    json: bool,
+    now: u64,
+) -> Result<()> {
+    let keys_in = from
+        .map(|p| -> Result<_> {
+            let bytes = std::fs::read(p).with_context(|| format!("read {}", p.display()))?;
+            let fmt = match format {
+                Some(f) => ImportFormat::parse(f)?,
+                None => ImportFormat::detect(p, &bytes),
+            };
+            let keys = keys_mod::read_router_keys(&bytes, fmt, now).with_context(|| {
+                format!("{} ({}): nothing was imported", p.display(), fmt.name())
+            })?;
+            Ok((p, keys))
+        })
+        .transpose()?;
+    let usage_in = usage
+        .map(|p| -> Result<_> {
+            let bytes = std::fs::read(p).with_context(|| format!("read {}", p.display()))?;
+            let rows = keys_mod::read_router_usage(&bytes).with_context(|| {
+                format!("{} (usage_counters): nothing was imported", p.display())
+            })?;
+            Ok((p, rows))
+        })
+        .transpose()?;
+    let (store, _) = key_store(at)?;
+    let dir = StateDir::open(&at.state)
+        .with_context(|| format!("state directory {}", at.state.display()))?;
+    let _lock = match &usage_in {
+        Some(_) => Some(dir.lock(false).context(
+            "importing usage writes the usage ledger: stop the server of this state directory first",
+        )?),
+        None => None,
+    };
+    let key_report = keys_in
+        .map(|(p, k)| store.import_router_keys(&k, now).map(|r| (p, r)))
+        .transpose()?;
+    let usage_report = usage_in
+        .map(|(p, rows)| -> Result<_> {
+            let ledger = UsageLedger::open(dir.usage_dir())?;
+            Ok((p, keys_mod::import_router_usage(&ledger, &rows, now)?))
+        })
+        .transpose()?;
+    if json {
+        println!(
+            "{}",
+            json!({
+                "keys": key_report.as_ref().map(|(_, r)| r.to_json()),
+                "usage": usage_report.as_ref().map(|(_, r)| r.to_json()),
+            })
+        );
+        return Ok(());
+    }
+    if let Some((p, r)) = &key_report {
+        print_key_import(p, r, store.path());
+    }
+    if let Some((p, r)) = &usage_report {
+        print_usage_import(p, r);
+    }
+    Ok(())
+}
+
+/// The human summary of a key import: counts and accounts, never a key or a hash.
+fn print_key_import(from: &Path, r: &ImportReport, keys_json: &Path) {
+    println!(
+        "keys from {} ({}): {} read; {} imported ({} active, {} inactive, {} expired), \
+         {} unchanged, {} revoked as in the export, {} kept as they are (differ from the export)",
+        from.display(),
+        r.format.map_or("-", ImportFormat::name),
+        r.read,
+        r.imported,
+        r.imported_active(),
+        r.imported_inactive,
+        r.imported_expired,
+        r.unchanged,
+        r.revoked,
+        r.kept
+    );
+    if !r.accounts.is_empty() {
+        let accounts: Vec<&str> = r.accounts.iter().map(String::as_str).collect();
+        println!("  accounts of the new keys: {}", accounts.join(", "));
+    }
+    if r.ignored_empty > 0 {
+        println!(
+            "  {} entries with an empty key ignored (the router ignores them too)",
+            r.ignored_empty
+        );
+    }
+    if r.duplicates > 0 {
+        println!(
+            "  {} repeated keys: the last entry wins, as in the router",
+            r.duplicates
+        );
+    }
+    if r.emails_not_stored > 0 {
+        println!(
+            "  {} emails not stored (keys.json keeps no email)",
+            r.emails_not_stored
+        );
+    }
+    println!(
+        "  {} {}",
+        keys_json.display(),
+        if r.written { "written" } else { "unchanged" }
+    );
+}
+
+fn print_usage_import(from: &Path, r: &UsageImportReport) {
+    println!(
+        "usage from {} (usage_counters): {} read; {} carried over (+{} decisions, +{} oracle calls), \
+         {} unchanged, {} behind an earlier import (left alone); usage ledger {}",
+        from.display(),
+        r.read,
+        r.carried,
+        r.decisions,
+        r.oracle_calls,
+        r.unchanged,
+        r.behind,
+        if r.written { "written" } else { "unchanged" }
+    );
 }
 
 // ------------------------------------------------------------------ tests
@@ -1467,6 +1644,50 @@ mod tests {
             _ => panic!("not learn"),
         }
         assert!(parse(&["cortiq", "decision", "keys", "revoke", "--state", "s"]).is_err());
+        // keys import: --from and/or --usage; --format needs --from and names a format.
+        let import = |extra: &[&str]| {
+            let mut a = vec!["cortiq", "decision", "keys", "import", "--state", "s"];
+            a.extend_from_slice(extra);
+            parse(&a)
+        };
+        assert!(import(&[]).is_err());
+        assert!(import(&["--format", "mysql-json", "--usage", "u.json"]).is_err());
+        assert!(import(&["--from", "k.json", "--format", "csv"]).is_err());
+        match import(&[
+            "--from",
+            "router.toml",
+            "--format",
+            "router-toml",
+            "--usage",
+            "u.json",
+        ])
+        .unwrap()
+        .command
+        {
+            Commands::Decision {
+                cmd:
+                    DecisionCmd::Keys {
+                        cmd:
+                            KeysCmd::Import {
+                                from,
+                                format,
+                                usage,
+                                json,
+                                ..
+                            },
+                    },
+            } => assert_eq!(
+                (from, format.as_deref(), usage, json),
+                (
+                    Some(PathBuf::from("router.toml")),
+                    Some("router-toml"),
+                    Some(PathBuf::from("u.json")),
+                    false
+                )
+            ),
+            _ => panic!("not keys import"),
+        }
+        assert!(import(&["--usage", "u.json", "--json"]).is_ok());
         assert!(
             parse(&[
                 "cortiq", "decision", "rollback", "--state", "s", "--to", "0"

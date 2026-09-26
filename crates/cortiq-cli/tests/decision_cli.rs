@@ -1419,7 +1419,7 @@ fn keys_create_list_revoke_import_and_a_keyed_server() {
         "--from",
         s(&export),
     ]);
-    assert!(r.contains("imported 1 key(s), skipped 0"), "{r}");
+    assert!(r.contains("1 read; 1 imported (1 active"), "{r}");
     let r = ok(&[
         "decision",
         "keys",
@@ -1429,7 +1429,10 @@ fn keys_create_list_revoke_import_and_a_keyed_server() {
         "--from",
         s(&export),
     ]);
-    assert!(r.contains("imported 0 key(s), skipped 1"), "{r}");
+    assert!(
+        r.contains("1 read; 0 imported") && r.contains("1 unchanged"),
+        "{r}"
+    );
 
     let list = ok(&["decision", "keys", "list", "--state", st, "--json"]);
     let v = json_of(&list);
@@ -1498,6 +1501,368 @@ fn keys_create_list_revoke_import_and_a_keyed_server() {
         table.contains("revoked") && table.contains("3 key(s)"),
         "{table}"
     );
+}
+
+/// Wait for the start of a minute when fewer than 15 s of this one are left
+/// (the rate window is a fixed minute).
+fn fresh_minute() {
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    };
+    let left = 60 - now() % 60;
+    if left < 15 {
+        std::thread::sleep(Duration::from_secs(left + 1));
+    }
+}
+
+fn sha256_dir(dir: &Path) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| {
+            let e = e.unwrap();
+            (
+                e.file_name().to_string_lossy().into_owned(),
+                sha256_file(&e.path()),
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Spec decision-v4 §4.15, package C2: keys of the production router (a
+/// synthetic MySQL `api_keys` export and a synthetic router configuration,
+/// no real data) are imported by the binary and authenticate with their raw
+/// keys on the router API and the decisions API; 0 limits are unlimited;
+/// inactive and expired keys are refused; the router's usage counters
+/// continue; a second import changes nothing; no key and no hash is printed.
+#[test]
+fn keys_import_moves_router_keys_over_without_reissue() {
+    let t = toy();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let state = d.join("state");
+    let st = s(&state);
+    // Synthetic router keys (cortiq_ + 40 hex, as the router mints them).
+    let mysql_key = "cortiq_c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2";
+    let inactive_key = "cortiq_1111111111111111111111111111111111111111";
+    let expired_key = "cortiq_2222222222222222222222222222222222222222";
+    let limited_key = "cortiq_3333333333333333333333333333333333333333";
+    let quota_key = "cortiq_4444444444444444444444444444444444444444";
+    let toml_key = "cortiq_5555555555555555555555555555555555555555";
+    let bad_key = "cortiq_6666666666666666666666666666666666666666";
+    let all = [
+        mysql_key,
+        inactive_key,
+        expired_key,
+        limited_key,
+        quota_key,
+        toml_key,
+        bad_key,
+    ];
+    let sha = |k: &str| format!("{:x}", Sha256::digest(k.as_bytes()));
+    let mut secrets: Vec<String> = Vec::new();
+    for k in all {
+        secrets.push(k.to_string());
+        secrets.push(sha(k));
+        secrets.push(sha(k).to_ascii_uppercase());
+        secrets.push(sha(k)[..12].to_string());
+    }
+    let no_secret = |what: &str, text: &str| {
+        for x in &secrets {
+            assert!(
+                !text.contains(x.as_str()),
+                "{what} shows key material:\n{text}"
+            );
+        }
+    };
+    // `mysql -e "SELECT JSON_ARRAYAGG(JSON_OBJECT(...)) FROM api_keys"` shape,
+    // numbers as numbers and as strings (phpMyAdmin), store.rs:119-130 columns.
+    let export = write(
+        d,
+        "api_keys.json",
+        &json!([
+            {"key_hash": sha(mysql_key), "account": "acct_mysql01", "plan": "pro",
+             "email": "c2@example.com", "label": "prod", "active": 1, "rate_per_min": 0,
+             "decision_quota": 0, "expires_at": null, "created_at": 1_780_000_000},
+            {"key_hash": sha(inactive_key), "account": "acct_revoked", "plan": "starter",
+             "email": "", "label": "", "active": "0", "rate_per_min": "60",
+             "decision_quota": "0", "expires_at": null, "created_at": "1780000000"},
+            {"key_hash": sha(expired_key), "account": "acct_expired", "plan": "starter",
+             "active": 1, "rate_per_min": 60, "decision_quota": 0, "expires_at": 1_000_000,
+             "created_at": 900_000},
+            {"key_hash": sha(limited_key), "account": "acct_limited", "plan": "developer",
+             "active": 1, "rate_per_min": 2, "decision_quota": 0, "expires_at": null,
+             "created_at": 1_780_000_000},
+            {"key_hash": sha(quota_key), "account": "acct_quota", "plan": "developer",
+             "active": 1, "rate_per_min": 0, "decision_quota": 5, "expires_at": null,
+             "created_at": 1_780_000_000},
+        ])
+        .to_string(),
+    );
+    let config = write(
+        d,
+        "router.toml",
+        &format!(
+            r#"# cortiq-router configuration (synthetic)
+bind = "0.0.0.0:8080"
+taxonomy_id = "topics"
+database_url = ""
+complexity_tiers = [ {{ tier = "low", max = 0.33 }}, {{ tier = "high", max = 1.0 }} ]
+
+[[api_keys]]
+key            = "{toml_key}"
+account        = "acct_toml"
+rate_per_min   = 0          # unlimited
+decision_quota = 0          # unlimited
+
+[auth]
+require = true
+[auth.plans.pro]
+rate_per_min = 600
+decision_quota = 1_000_000
+duration_days = 30
+"#
+        ),
+    );
+    let usage = write(
+        d,
+        "usage_counters.json",
+        &json!([
+            {"account": "acct_quota", "decisions": 5, "oracle_calls": 2},
+            {"account": "acct_mysql01", "decisions": "1000000", "oracle_calls": "10"},
+        ])
+        .to_string(),
+    );
+    let run = |args: &[&str]| {
+        let o = output(args, &[]);
+        let text = show(&o);
+        no_secret(&format!("cortiq {args:?}"), &text);
+        assert!(o.status.success(), "cortiq {args:?} failed\n{text}");
+        String::from_utf8(o.stdout).unwrap()
+    };
+    let import = |extra: &[&str]| {
+        let mut a = vec!["decision", "keys", "import", "--state", st];
+        a.extend_from_slice(extra);
+        run(&a)
+    };
+
+    // MySQL export (format by the .json name), then the configuration with usage.
+    let r = import(&["--from", s(&export)]);
+    assert!(
+        r.contains(
+            "(mysql-json): 5 read; 5 imported (3 active, 1 inactive, 1 expired), 0 unchanged"
+        ),
+        "{r}"
+    );
+    assert!(
+        r.contains("accounts of the new keys: acct_expired, acct_limited, acct_mysql01, acct_quota, acct_revoked"),
+        "{r}"
+    );
+    assert!(
+        r.contains("1 emails not stored") && r.contains("written"),
+        "{r}"
+    );
+    let r = import(&[
+        "--from",
+        s(&config),
+        "--format",
+        "router-toml",
+        "--usage",
+        s(&usage),
+    ]);
+    assert!(
+        r.contains("(router-toml): 1 read; 1 imported (1 active, 0 inactive, 0 expired)"),
+        "{r}"
+    );
+    assert!(
+        r.contains("2 read; 2 carried over (+1000005 decisions, +12 oracle calls)"),
+        "{r}"
+    );
+
+    // keys.json: hashes only, no raw key, no email.
+    let keys_json = state.join("keys.json");
+    let on_disk = std::fs::read_to_string(&keys_json).unwrap();
+    for k in all {
+        assert!(!on_disk.contains(k), "raw key in keys.json");
+    }
+    assert!(!on_disk.contains("example.com") && !on_disk.contains("email"));
+    let v: Value = serde_json::from_str(&on_disk).unwrap();
+    let stored: Vec<(String, String, bool, u64, u64, String)> = v["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| {
+            (
+                k["hash"].as_str().unwrap().to_string(),
+                k["account"].as_str().unwrap().to_string(),
+                k["active"].as_bool().unwrap(),
+                k["rate_per_min"].as_u64().unwrap(),
+                k["decision_quota"].as_u64().unwrap(),
+                k["plan"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    let want = |k: &str, a: &str, active: bool, rate: u64, quota: u64, plan: &str| {
+        (sha(k), a.to_string(), active, rate, quota, plan.to_string())
+    };
+    assert_eq!(
+        stored,
+        [
+            want(mysql_key, "acct_mysql01", true, 0, 0, "pro"),
+            want(inactive_key, "acct_revoked", false, 60, 0, "starter"),
+            want(expired_key, "acct_expired", true, 60, 0, "starter"),
+            want(limited_key, "acct_limited", true, 2, 0, "developer"),
+            want(quota_key, "acct_quota", true, 0, 5, "developer"),
+            want(toml_key, "acct_toml", true, 0, 0, "static"),
+        ]
+    );
+    for k in v["keys"].as_array().unwrap() {
+        let h = k["hash"].as_str().unwrap();
+        assert!(h.len() == 64 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+    }
+
+    // A second import of both changes nothing: same bytes, same ledger.
+    let keys_sha = sha256_file(&keys_json);
+    let keys_mtime = std::fs::metadata(&keys_json).unwrap().modified().unwrap();
+    let usage_files = sha256_dir(&state.join("usage"));
+    let r = import(&["--from", s(&export)]);
+    assert!(
+        r.contains("5 read; 0 imported (0 active, 0 inactive, 0 expired), 5 unchanged, 0 revoked")
+            && r.contains("keys.json unchanged"),
+        "{r}"
+    );
+    let r = import(&["--from", s(&config), "--usage", s(&usage), "--json"]);
+    let j = json_of(&r);
+    assert_eq!(
+        (
+            &j["keys"]["format"],
+            &j["keys"]["imported"],
+            &j["keys"]["unchanged"],
+            &j["keys"]["written"]
+        ),
+        (&json!("router-toml"), &json!(0), &json!(1), &json!(false)),
+        "{j}"
+    );
+    assert_eq!(
+        (
+            &j["usage"]["carried"],
+            &j["usage"]["unchanged"],
+            &j["usage"]["written"]
+        ),
+        (&json!(0), &json!(2), &json!(false)),
+        "{j}"
+    );
+    assert_eq!(sha256_file(&keys_json), keys_sha);
+    assert_eq!(
+        std::fs::metadata(&keys_json).unwrap().modified().unwrap(),
+        keys_mtime
+    );
+    assert_eq!(sha256_dir(&state.join("usage")), usage_files);
+
+    // A malformed hash refuses the whole file, naming the row, not the hash.
+    let bad = write(
+        d,
+        "bad.json",
+        &json!([
+            {"key_hash": sha(bad_key), "account": "acct_bad"},
+            {"key_hash": sha(bad_key).to_ascii_uppercase(), "account": "acct_bad2"},
+        ])
+        .to_string(),
+    );
+    let o = output(
+        &[
+            "decision",
+            "keys",
+            "import",
+            "--state",
+            st,
+            "--from",
+            s(&bad),
+        ],
+        &[],
+    );
+    let text = show(&o);
+    assert!(!o.status.success(), "{text}");
+    assert!(
+        text.contains("nothing was imported")
+            && text.contains("row 2")
+            && text.contains("lowercase hex"),
+        "{text}"
+    );
+    no_secret("a refused import", &text);
+    assert_eq!(sha256_file(&keys_json), keys_sha);
+
+    // The keys authenticate with their raw keys on both APIs.
+    let srv = Server::start(&t.path, &["--state", st], &[], d);
+    // The ledger belongs to the running server: a usage import is refused.
+    let o = output(
+        &[
+            "decision",
+            "keys",
+            "import",
+            "--state",
+            st,
+            "--usage",
+            s(&usage),
+        ],
+        &[],
+    );
+    assert!(!o.status.success(), "{}", show(&o));
+    assert!(show(&o).contains("stop the server"), "{}", show(&o));
+    let text = &t.topics.dev_rows[0].0;
+    let route = json!({"input": {"text": text}, "taxonomy_id": "topics"});
+    let decisions = topics_request(text);
+    let call = |key: &str, path: &str| {
+        let body = if path == "/v1/route" {
+            &route
+        } else {
+            &decisions
+        };
+        http("POST", &srv.url(path), Some(key), Some(body))
+    };
+    // 0 = unlimited: many requests in one minute, a million decisions used.
+    for key in [mysql_key, toml_key] {
+        for _ in 0..4 {
+            let (code, v) = call(key, "/v1/route");
+            assert_eq!(code, 200, "{v}");
+            assert_eq!(v["decision"]["taxonomy_id"], "topics", "{v}");
+            let (code, v) = call(key, "/api/alpha/decisions");
+            assert_eq!(code, 200, "{v}");
+        }
+    }
+    let (code, v) = http("GET", &srv.url("/v1/usage"), Some(mysql_key), None);
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["account"]["id"], "acct_mysql01");
+    assert_eq!(v["account"]["billable_decisions"], json!(1_000_008), "{v}");
+    assert_eq!(v["account"]["oracle_calls"], json!(10), "{v}");
+    assert_eq!(v["account"]["decision_quota"], json!(0), "{v}");
+    // A limit that is not 0 is enforced: 2 requests per minute, then 429.
+    fresh_minute();
+    assert_eq!(call(limited_key, "/v1/route").0, 200);
+    assert_eq!(call(limited_key, "/api/alpha/decisions").0, 200);
+    let (code, v) = call(limited_key, "/v1/route");
+    assert_eq!(code, 429, "{v}");
+    assert_eq!(v["error"]["code"], "RATE_LIMITED", "{v}");
+    // The router's usage continues: 5 of 5 decisions used, so 402 at once.
+    let (code, v) = call(quota_key, "/v1/route");
+    assert_eq!(code, 402, "{v}");
+    assert_eq!(v["error"]["code"], "QUOTA_EXCEEDED", "{v}");
+    assert_eq!(call(quota_key, "/api/alpha/decisions").0, 402);
+    // Inactive and expired keys are refused on both APIs.
+    for key in [inactive_key, expired_key, bad_key] {
+        for path in ["/v1/route", "/api/alpha/decisions"] {
+            let (code, v) = call(key, path);
+            assert_eq!(code, 401, "{path}: {v}");
+            no_secret("a 401 body", &v.to_string());
+        }
+    }
+    let logs = srv.stop();
+    no_secret("the server logs", &logs);
+    assert_eq!(sha256_file(&keys_json), keys_sha);
 }
 
 // ------------------------------------------------------------------ learn

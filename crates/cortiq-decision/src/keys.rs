@@ -20,11 +20,20 @@
 //! * **Rate window**: a fixed minute (`unix / 60`) per account, counting
 //!   requests; over the limit → 429 with `Retry-After` = seconds to the next
 //!   minute ([`RateLimiter`]).
+//! * **Router import** (spec §4.15, `cortiq decision keys import`): the keys of
+//!   a running cortiq-router move over without reissue — rows of its MySQL
+//!   `api_keys` table ([`ImportFormat::MysqlJson`]) or the `[[api_keys]]` of its
+//!   configuration ([`ImportFormat::RouterToml`], raw keys hashed as they are
+//!   read) — through [`read_router_keys`] (checks everything first) and
+//!   [`KeyStore::import_router_keys`] (idempotent); its `usage_counters`
+//!   continue in the usage ledger through [`read_router_usage`] and
+//!   [`import_router_usage`].
 //!
 //! Quotas and credit are checked by the service against the usage ledger
 //! before a request is processed (spec §4.10).
 
 use crate::config::PlanConfig;
+use crate::ledger::{Actions, UsageLedger, UsageRecord};
 use crate::metering::Usd;
 use crate::statedir::atomic_write;
 use anyhow::{Context, Result, bail, ensure};
@@ -32,10 +41,12 @@ use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 use subtle::ConstantTimeEq;
+
+mod toml_lite;
 
 /// Random hex characters of a minted key.
 pub const KEY_HEX_CHARS: usize = 40;
@@ -414,9 +425,18 @@ impl KeyStore {
     /// Apply `f` to the file's records (re-read under the write lock), write the
     /// result atomically and take it into memory.
     fn modify<T>(&self, f: impl FnOnce(&mut Vec<KeyRecord>) -> Result<T>) -> Result<T> {
+        self.modify_if(|keys| Ok((f(keys)?, true)))
+    }
+
+    /// [`KeyStore::modify`] that leaves the file untouched (same bytes, same
+    /// mtime) when `f` reports no change.
+    fn modify_if<T>(&self, f: impl FnOnce(&mut Vec<KeyRecord>) -> Result<(T, bool)>) -> Result<T> {
         let _w = self.write.lock();
         let mut file = read_file(&self.path)?;
-        let out = f(&mut file.keys)?;
+        let (out, changed) = f(&mut file.keys)?;
+        if !changed {
+            return Ok(out);
+        }
         let loaded = Loaded::from_file(file.clone())?;
         let mut bytes = serde_json::to_vec_pretty(&file)?;
         bytes.push(b'\n');
@@ -518,140 +538,700 @@ impl KeyStore {
         })
     }
 
-    /// Import router keys (spec §4.15): a JSON export of the router's MySQL
-    /// `api_keys` table (rows `{key_hash, account, plan, email?, label?,
-    /// active?, rate_per_min?, decision_quota?, expires_at?, created_at?}`;
-    /// numbers may be numeric strings), and/or its config's `api_keys`
-    /// entries `{key, account, rate_per_min?, decision_quota?}` (raw keys are
-    /// hashed on import). Accepted shapes: an array of rows, `{"api_keys":
-    /// [...]}`, `{"rows"|"data": [...]}`, or JSON lines. Hashes already
-    /// present are skipped. Imported keys have no token quota, no credit
-    /// limit and `oracle_allowed: false`.
-    pub fn import_router(&self, bytes: &[u8], now: u64) -> Result<ImportReport> {
-        let rows = import_rows(bytes)?;
-        let mut parsed = Vec::with_capacity(rows.len());
-        for (i, row) in rows.iter().enumerate() {
-            parsed.push(import_record(row, now).with_context(|| format!("row {}", i + 1))?);
-        }
-        self.modify(|keys| {
-            let mut report = ImportReport::default();
-            for rec in parsed {
-                if keys.iter().any(|k| k.hash == rec.hash) {
-                    report.skipped += 1;
-                } else {
-                    report.imported += 1;
-                    report.accounts.insert(rec.account.clone());
-                    keys.push(rec);
+    /// Import keys read from a cortiq-router export ([`read_router_keys`],
+    /// spec §4.15). Idempotent, never deletes and never re-activates:
+    ///
+    /// * a hash not stored yet is added with the export's account, plan,
+    ///   label, limits, expiry and `active` (inactive and expired keys are
+    ///   kept and refused at authentication, as the router refuses them);
+    /// * a stored active key the export marks inactive is revoked here too
+    ///   (a revocation in the router reaches this server on the next import);
+    /// * a stored key with the same router attributes is unchanged; one with
+    ///   other attributes is kept as it is (this server's record wins).
+    ///
+    /// `keys.json` is written only when something changed: importing the same
+    /// export again leaves the file byte for byte (and its mtime) as it was.
+    pub fn import_router_keys(&self, keys: &RouterKeys, now: u64) -> Result<ImportReport> {
+        self.modify_if(|stored| {
+            let mut r = ImportReport {
+                format: Some(keys.format),
+                read: keys.entries,
+                ignored_empty: keys.ignored_empty,
+                duplicates: keys.duplicates,
+                emails_not_stored: keys.emails,
+                ..ImportReport::default()
+            };
+            let mut at: HashMap<String, usize> = stored
+                .iter()
+                .enumerate()
+                .map(|(i, k)| (k.hash.clone(), i))
+                .collect();
+            for rec in &keys.records {
+                match at.get(&rec.hash).copied() {
+                    None => {
+                        r.imported += 1;
+                        if !rec.active {
+                            r.imported_inactive += 1;
+                        } else if rec.is_expired(now) {
+                            r.imported_expired += 1;
+                        }
+                        r.accounts.insert(rec.account.clone());
+                        at.insert(rec.hash.clone(), stored.len());
+                        stored.push(rec.clone());
+                        r.written = true;
+                    }
+                    Some(i) if stored[i].active && !rec.active => {
+                        stored[i].active = false;
+                        r.revoked += 1;
+                        r.written = true;
+                    }
+                    Some(i) if same_router_fields(&stored[i], rec) => r.unchanged += 1,
+                    Some(_) => r.kept += 1,
                 }
             }
-            Ok(report)
+            let changed = r.written;
+            Ok((r, changed))
         })
     }
 }
 
-/// What an import did.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ImportReport {
-    pub imported: usize,
-    pub skipped: usize,
-    pub accounts: std::collections::BTreeSet<String>,
+/// The attributes a router export carries (the creation time is not one of
+/// them: a configuration key has none).
+fn same_router_fields(a: &KeyRecord, b: &KeyRecord) -> bool {
+    a.account == b.account
+        && a.plan == b.plan
+        && a.label == b.label
+        && a.expires == b.expires
+        && a.active == b.active
+        && a.rate_per_min == b.rate_per_min
+        && a.decision_quota == b.decision_quota
 }
 
-fn import_rows(bytes: &[u8]) -> Result<Vec<Map<String, Value>>> {
-    let objects = |a: &[Value]| -> Result<Vec<Map<String, Value>>> {
-        a.iter()
-            .map(|v| {
-                v.as_object()
-                    .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("every key row must be a JSON object"))
-            })
-            .collect()
-    };
-    if let Ok(v) = crate::canonical::parse(bytes) {
-        return match &v {
-            Value::Array(a) => objects(a),
-            Value::Object(m) => {
-                for k in ["api_keys", "rows", "data"] {
-                    if let Some(Value::Array(a)) = m.get(k) {
-                        return objects(a);
-                    }
-                }
-                if m.contains_key("key_hash") || m.contains_key("key") {
-                    Ok(vec![m.clone()])
-                } else {
-                    bail!("expected an array of key rows or {{\"api_keys\": [...]}}")
-                }
-            }
-            _ => bail!("expected an array of key rows or {{\"api_keys\": [...]}}"),
-        };
-    }
-    let mut out = Vec::new();
-    for (i, line) in bytes.split(|&b| b == b'\n').enumerate() {
-        if line.iter().all(u8::is_ascii_whitespace) {
-            continue;
+// ------------------------------------------------------------------ router import
+
+/// Format of a cortiq-router key export (`keys import --format`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImportFormat {
+    /// Rows of the router's MySQL `api_keys` table as JSON.
+    MysqlJson,
+    /// The router's TOML configuration (its `[[api_keys]]`).
+    RouterToml,
+}
+
+impl ImportFormat {
+    pub const NAMES: [&'static str; 2] = ["mysql-json", "router-toml"];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::MysqlJson => "mysql-json",
+            Self::RouterToml => "router-toml",
         }
-        let v =
-            crate::canonical::parse(line).with_context(|| format!("line {} is not JSON", i + 1))?;
-        out.push(
-            v.as_object()
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("line {} is not a JSON object", i + 1))?,
-        );
+    }
+
+    pub fn parse(s: &str) -> Result<Self> {
+        match s {
+            "mysql-json" => Ok(Self::MysqlJson),
+            "router-toml" => Ok(Self::RouterToml),
+            _ => bail!("unknown key export format '{s}' (mysql-json | router-toml)"),
+        }
+    }
+
+    /// The format of a file given without `--format`: `.toml` is the router
+    /// configuration; `.json`, `.jsonl`, `.ndjson` a MySQL export; otherwise
+    /// JSON content is a MySQL export and anything else the configuration.
+    pub fn detect(path: &Path, bytes: &[u8]) -> Self {
+        match path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("toml") => Self::RouterToml,
+            Some("json" | "jsonl" | "ndjson") => Self::MysqlJson,
+            _ if json_documents(bytes).is_ok() => Self::MysqlJson,
+            _ => Self::RouterToml,
+        }
+    }
+}
+
+/// The columns of the router's MySQL `api_keys` table
+/// (cortiq-router `store.rs:119-130`, `ensure_api_key_columns`).
+pub const ROUTER_KEY_COLUMNS: [&str; 10] = [
+    "key_hash",
+    "account",
+    "plan",
+    "email",
+    "label",
+    "active",
+    "rate_per_min",
+    "decision_quota",
+    "expires_at",
+    "created_at",
+];
+
+/// The columns of the router's MySQL `usage_counters` table
+/// (cortiq-router `store.rs:132-136`).
+pub const ROUTER_USAGE_COLUMNS: [&str; 3] = ["account", "decisions", "oracle_calls"];
+
+/// The plan the router gives the keys of its configuration
+/// (cortiq-router `main.rs:336`).
+pub const ROUTER_STATIC_PLAN: &str = "static";
+
+/// The id of the ledger lines that carry router usage over
+/// ([`import_router_usage`]).
+pub const ROUTER_USAGE_RECORD_ID: &str = "import:cortiq-router:usage_counters";
+
+/// The model name of those lines.
+pub const ROUTER_USAGE_MODEL: &str = "cortiq-router";
+
+/// Keys read from a router export: hashed, checked, nothing written yet.
+/// Holds no raw key (a configuration's keys are hashed while it is read).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RouterKeys {
+    pub format: ImportFormat,
+    /// Rows (MySQL) or `[[api_keys]]` entries (configuration) read.
+    pub entries: usize,
+    /// One record per distinct key, in export order.
+    pub records: Vec<KeyRecord>,
+    /// Configuration entries with an empty `key` (the router skips them,
+    /// `main.rs:330`).
+    pub ignored_empty: usize,
+    /// Configuration entries that repeat an earlier key: the last one wins,
+    /// as in the router's key map.
+    pub duplicates: usize,
+    /// MySQL rows with an email: not stored (keys.json holds no email).
+    pub emails: usize,
+}
+
+/// What an import of keys did (no key and no hash in it).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ImportReport {
+    pub format: Option<ImportFormat>,
+    pub read: usize,
+    /// New keys (including the inactive and expired ones below).
+    pub imported: usize,
+    pub imported_inactive: usize,
+    pub imported_expired: usize,
+    /// Already stored with the same router attributes.
+    pub unchanged: usize,
+    /// Stored active, inactive in the export: revoked here.
+    pub revoked: usize,
+    /// Stored with other attributes: kept as they are.
+    pub kept: usize,
+    pub ignored_empty: usize,
+    pub duplicates: usize,
+    pub emails_not_stored: usize,
+    /// Accounts of the new keys.
+    pub accounts: BTreeSet<String>,
+    /// Whether keys.json was written.
+    pub written: bool,
+}
+
+impl ImportReport {
+    /// New keys that authenticate now.
+    pub fn imported_active(&self) -> usize {
+        self.imported - self.imported_inactive - self.imported_expired
+    }
+
+    pub fn to_json(&self) -> Value {
+        json!({
+            "format": self.format.map(ImportFormat::name),
+            "read": self.read,
+            "imported": self.imported,
+            "imported_active": self.imported_active(),
+            "imported_inactive": self.imported_inactive,
+            "imported_expired": self.imported_expired,
+            "unchanged": self.unchanged,
+            "revoked": self.revoked,
+            "kept": self.kept,
+            "ignored_empty": self.ignored_empty,
+            "duplicates": self.duplicates,
+            "emails_not_stored": self.emails_not_stored,
+            "accounts": self.accounts,
+            "written": self.written,
+        })
+    }
+}
+
+/// Read the keys of a cortiq-router export (spec §4.15). Every entry is
+/// checked before anything is written: one bad entry refuses the whole file.
+/// Error messages name the row or line, never a key or a hash.
+///
+/// * `mysql-json`: rows of the router's `api_keys` table (columns
+///   [`ROUTER_KEY_COLUMNS`]; a missing column takes the table's default, an
+///   unknown one is refused). `key_hash` must be 64 lowercase hex characters,
+///   the router's `sha256(raw)` (`store.rs:54-57`), so the raw keys keep
+///   working without reissue. Numbers may be JSON numbers or numeric
+///   strings; `active` is true only for 1 (the router loads `WHERE
+///   active=1`, `store.rs:322`); `rate_per_min`/`decision_quota` 0 stay 0 =
+///   unlimited (router `auth.rs:152,167`); the email is not stored. Accepted
+///   containers: an array of rows (`JSON_ARRAYAGG(JSON_OBJECT(…))`, MySQL
+///   Workbench, `mysqlsh --result-format=json/array`), JSON lines
+///   (`mysql -N -B -e "SELECT JSON_OBJECT(…) FROM api_keys"`, `mysqlsh
+///   --result-format=ndjson`), MySQL Shell `--json` documents (`{"rows":
+///   […]}`, its info and warning documents skipped), `{"api_keys"|"data":
+///   […]}`, and a phpMyAdmin JSON export (its `api_keys` table).
+/// * `router-toml`: the router's configuration; its `[[api_keys]]` entries
+///   `{key, account = "default", rate_per_min = 0, decision_quota = 0}`
+///   (router `config.rs:136-156`) become plan `static` keys without expiry
+///   created now (`main.rs:327-341`). Raw keys are hashed as they are read
+///   and never kept; an empty key is skipped and a repeated key keeps its
+///   last entry, as in the router.
+pub fn read_router_keys(bytes: &[u8], format: ImportFormat, now: u64) -> Result<RouterKeys> {
+    match format {
+        ImportFormat::MysqlJson => mysql_keys(bytes),
+        ImportFormat::RouterToml => toml_keys(bytes, now),
+    }
+}
+
+fn mysql_keys(bytes: &[u8]) -> Result<RouterKeys> {
+    let rows = export_rows(bytes, "api_keys", &ROUTER_KEY_COLUMNS)?;
+    let mut out = RouterKeys {
+        format: ImportFormat::MysqlJson,
+        entries: rows.len(),
+        records: Vec::with_capacity(rows.len()),
+        ignored_empty: 0,
+        duplicates: 0,
+        emails: 0,
+    };
+    let mut first: HashMap<String, usize> = HashMap::new();
+    for (i, row) in rows.iter().enumerate() {
+        let (rec, email) = mysql_key_record(row).with_context(|| format!("row {}", i + 1))?;
+        if let Some(j) = first.insert(rec.hash.clone(), i + 1) {
+            bail!(
+                "rows {j} and {} have the same key_hash, the primary key of the router's table: the export is broken",
+                i + 1
+            );
+        }
+        out.emails += usize::from(email);
+        out.records.push(rec);
     }
     Ok(out)
 }
 
-fn num_field(row: &Map<String, Value>, k: &str) -> Result<Option<u64>> {
-    match row.get(k) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::Number(n)) => n
-            .as_u64()
-            .map(Some)
-            .ok_or_else(|| anyhow::anyhow!("{k} must be a non-negative integer")),
-        Some(Value::String(s)) if s.trim().is_empty() => Ok(None),
-        Some(Value::String(s)) => s
-            .trim()
-            .parse()
-            .map(Some)
-            .map_err(|_| anyhow::anyhow!("{k} must be a non-negative integer")),
-        Some(_) => bail!("{k} must be a non-negative integer"),
-    }
-}
-
-fn str_field(row: &Map<String, Value>, k: &str) -> Option<String> {
-    row.get(k).and_then(Value::as_str).map(str::to_string)
-}
-
-fn import_record(row: &Map<String, Value>, now: u64) -> Result<KeyRecord> {
-    let hash = match (str_field(row, "key_hash"), str_field(row, "key")) {
-        (Some(h), _) => h.trim().to_ascii_lowercase(),
-        (None, Some(raw)) => hash_key(&raw),
-        (None, None) => bail!("a row needs key_hash (MySQL api_keys) or key (router config)"),
+fn mysql_key_record(row: &Map<String, Value>) -> Result<(KeyRecord, bool)> {
+    let hash = match row.get("key_hash") {
+        Some(Value::String(s)) => s.trim().to_string(),
+        None | Some(Value::Null) => bail!("key_hash is missing"),
+        Some(_) => bail!("key_hash must be a string"),
     };
-    let account = str_field(row, "account").unwrap_or_else(|| "default".into());
+    ensure!(
+        is_hash(&hash),
+        "key_hash is not a sha256 in lowercase hex (64 characters 0-9a-f, as the router's store.rs:54-57 writes it)"
+    );
+    let account =
+        text_field(row, "account")?.ok_or_else(|| anyhow::anyhow!("account is missing"))?;
+    let email = text_field(row, "email")?.is_some_and(|e| !e.trim().is_empty());
     let active = match row.get("active") {
         None | Some(Value::Null) => true,
         Some(Value::Bool(b)) => *b,
-        Some(_) => num_field(row, "active")?.is_none_or(|v| v != 0),
+        Some(_) => int_field(row, "active")? == Some(1),
     };
-    let rate = num_field(row, "rate_per_min")?.unwrap_or(0);
+    let rate = uint_field(row, "rate_per_min")?.unwrap_or(0);
     let rec = KeyRecord {
         hash,
         account,
-        plan: str_field(row, "plan").unwrap_or_default(),
-        label: str_field(row, "label").unwrap_or_default(),
-        created: num_field(row, "created_at")?.unwrap_or(now),
-        expires: num_field(row, "expires_at")?,
+        plan: text_field(row, "plan")?.unwrap_or_default(),
+        label: text_field(row, "label")?.unwrap_or_default(),
+        created: uint_field(row, "created_at")?.unwrap_or(0),
+        expires: uint_field(row, "expires_at")?,
         active,
-        rate_per_min: u32::try_from(rate).context("rate_per_min out of range")?,
-        decision_quota: num_field(row, "decision_quota")?.unwrap_or(0),
+        rate_per_min: u32::try_from(rate)
+            .map_err(|_| anyhow::anyhow!("rate_per_min is larger than the router's INT"))?,
+        decision_quota: uint_field(row, "decision_quota")?.unwrap_or(0),
         token_quota: 0,
         credit_usd: None,
         oracle_budget_usd: None,
         oracle_allowed: false,
     };
     rec.validate()?;
-    Ok(rec)
+    Ok((rec, email))
+}
+
+fn toml_keys(bytes: &[u8], now: u64) -> Result<RouterKeys> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| anyhow::anyhow!("the router configuration is not UTF-8 text"))?;
+    let root = toml_lite::parse(text)?;
+    let entries: Vec<&Map<String, Value>> = match root.get("api_keys") {
+        None => Vec::new(),
+        Some(Value::Array(a)) => a
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                v.as_object()
+                    .ok_or_else(|| anyhow::anyhow!("api_keys entry {} is not a table", i + 1))
+            })
+            .collect::<Result<_>>()?,
+        Some(_) => bail!("api_keys must be an array of tables ([[api_keys]])"),
+    };
+    let mut out = RouterKeys {
+        format: ImportFormat::RouterToml,
+        entries: entries.len(),
+        records: Vec::with_capacity(entries.len()),
+        ignored_empty: 0,
+        duplicates: 0,
+        emails: 0,
+    };
+    let mut at: HashMap<String, usize> = HashMap::new();
+    for (i, e) in entries.iter().enumerate() {
+        let rec = (|| -> Result<Option<KeyRecord>> {
+            let hash = match e.get("key") {
+                None => return Ok(None),
+                Some(Value::String(k)) if k.is_empty() => return Ok(None),
+                Some(Value::String(k)) => hash_key(k),
+                Some(_) => bail!("key must be a string"),
+            };
+            let account = match e.get("account") {
+                None => "default".to_string(),
+                Some(Value::String(a)) => a.clone(),
+                Some(_) => bail!("account must be a string"),
+            };
+            let rate = toml_uint(e, "rate_per_min")?;
+            let rec = KeyRecord {
+                hash,
+                account,
+                plan: ROUTER_STATIC_PLAN.to_string(),
+                label: String::new(),
+                created: now,
+                expires: None,
+                active: true,
+                rate_per_min: u32::try_from(rate)
+                    .map_err(|_| anyhow::anyhow!("rate_per_min is larger than the router's u32"))?,
+                decision_quota: toml_uint(e, "decision_quota")?,
+                token_quota: 0,
+                credit_usd: None,
+                oracle_budget_usd: None,
+                oracle_allowed: false,
+            };
+            rec.validate()?;
+            Ok(Some(rec))
+        })()
+        .with_context(|| format!("api_keys entry {}", i + 1))?;
+        let Some(rec) = rec else {
+            out.ignored_empty += 1;
+            continue;
+        };
+        match at.get(&rec.hash) {
+            Some(&j) => {
+                out.records[j] = rec;
+                out.duplicates += 1;
+            }
+            None => {
+                at.insert(rec.hash.clone(), out.records.len());
+                out.records.push(rec);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn toml_uint(e: &Map<String, Value>, k: &str) -> Result<u64> {
+    match e.get(k) {
+        None => Ok(0),
+        Some(v) => v
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("{k} must be a non-negative integer")),
+    }
+}
+
+/// Every JSON document of `bytes` (one, several concatenated, or JSON lines).
+fn json_documents(bytes: &[u8]) -> Result<Vec<Value>> {
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
+    serde_json::Deserializer::from_slice(bytes)
+        .into_iter::<Value>()
+        .map(|d| d.map_err(|e| anyhow::anyhow!("not JSON: {e}")))
+        .collect()
+}
+
+/// MySQL Shell documents that carry no rows.
+const MYSQLSH_META: [&str; 11] = [
+    "info",
+    "note",
+    "warning",
+    "warnings",
+    "warningCount",
+    "warningsCount",
+    "hasData",
+    "executionTime",
+    "affectedRowCount",
+    "affectedItemsCount",
+    "autoIncrementValue",
+];
+
+/// A column name as it may appear in a message: short identifiers only (a
+/// misplaced key must not be echoed).
+fn shown_column(k: &str) -> String {
+    let ident = !k.is_empty()
+        && k.len() <= 32
+        && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        && !k.as_bytes()[0].is_ascii_digit();
+    if ident {
+        format!("'{k}'")
+    } else {
+        "(a name that is not an identifier)".to_string()
+    }
+}
+
+/// The rows of `table` in a JSON export (see [`read_router_keys`] for the
+/// containers), every column checked against `columns`.
+fn export_rows(bytes: &[u8], table: &str, columns: &[&str]) -> Result<Vec<Map<String, Value>>> {
+    fn objects(items: &[Value], table: &str) -> Result<Vec<Map<String, Value>>> {
+        items
+            .iter()
+            .map(|v| {
+                v.as_object()
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("every row of {table} must be a JSON object"))
+            })
+            .collect()
+    }
+    let mut rows = Vec::new();
+    for (d, doc) in json_documents(bytes)?.into_iter().enumerate() {
+        let d = d + 1;
+        match doc {
+            Value::Array(items) => {
+                let phpmyadmin = items.iter().any(|v| {
+                    v.get("type")
+                        .and_then(Value::as_str)
+                        .is_some_and(|t| matches!(t, "header" | "database" | "table"))
+                });
+                if !phpmyadmin {
+                    rows.extend(objects(&items, table)?);
+                    continue;
+                }
+                let mut found = false;
+                for t in &items {
+                    if t.get("type").and_then(Value::as_str) == Some("table")
+                        && t.get("name").and_then(Value::as_str) == Some(table)
+                    {
+                        found = true;
+                        match t.get("data") {
+                            Some(Value::Array(a)) => rows.extend(objects(a, table)?),
+                            _ => bail!(
+                                "document {d}: the phpMyAdmin table {table} has no data array"
+                            ),
+                        }
+                    }
+                }
+                ensure!(
+                    found,
+                    "document {d}: the phpMyAdmin export has no table {table}"
+                );
+            }
+            Value::Object(m) => {
+                if let Some(v) = ["rows", "data", table].iter().find_map(|k| m.get(*k)) {
+                    match v {
+                        Value::Array(a) => rows.extend(objects(a, table)?),
+                        _ => bail!("document {d}: its rows are not an array"),
+                    }
+                } else if m.keys().any(|k| columns.contains(&k.as_str())) {
+                    rows.push(m);
+                } else if m.contains_key("error") {
+                    bail!("document {d} is a MySQL error, not rows of {table}");
+                } else if !m.keys().all(|k| MYSQLSH_META.contains(&k.as_str())) {
+                    bail!(
+                        "document {d} is not a row of {table} (columns {})",
+                        columns.join(", ")
+                    );
+                }
+            }
+            _ => bail!(
+                "document {d} is not a row of {table}: expected objects with the columns {}",
+                columns.join(", ")
+            ),
+        }
+    }
+    for (i, row) in rows.iter().enumerate() {
+        for k in row.keys() {
+            ensure!(
+                columns.contains(&k.as_str()),
+                "row {}: column {} is not a column of the router's {table} table ({})",
+                i + 1,
+                shown_column(k),
+                columns.join(", ")
+            );
+        }
+    }
+    Ok(rows)
+}
+
+/// A MySQL integer (JSON number or numeric string); `null`/absent = `None`.
+fn int_field(row: &Map<String, Value>, k: &str) -> Result<Option<i64>> {
+    match row.get(k) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(n)) => n
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| anyhow::anyhow!("{k} must be an integer")),
+        Some(Value::String(s)) if s.trim().is_empty() => Ok(None),
+        Some(Value::String(s)) => s
+            .trim()
+            .parse()
+            .map(Some)
+            .map_err(|_| anyhow::anyhow!("{k} must be an integer")),
+        Some(_) => bail!("{k} must be an integer"),
+    }
+}
+
+fn uint_field(row: &Map<String, Value>, k: &str) -> Result<Option<u64>> {
+    int_field(row, k)?
+        .map(|v| u64::try_from(v).map_err(|_| anyhow::anyhow!("{k} must not be negative")))
+        .transpose()
+}
+
+fn text_field(row: &Map<String, Value>, k: &str) -> Result<Option<String>> {
+    match row.get(k) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => bail!("{k} must be a string"),
+    }
+}
+
+// ------------------------------------------------------------------ router usage
+
+/// One row of the router's `usage_counters` (lifetime counters per account).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RouterUsage {
+    pub account: String,
+    pub decisions: u64,
+    pub oracle_calls: u64,
+}
+
+/// Read a JSON export of the router's MySQL `usage_counters` table (columns
+/// [`ROUTER_USAGE_COLUMNS`], the containers of [`read_router_keys`]). An
+/// account may appear once (the table's primary key).
+pub fn read_router_usage(bytes: &[u8]) -> Result<Vec<RouterUsage>> {
+    let rows = export_rows(bytes, "usage_counters", &ROUTER_USAGE_COLUMNS)?;
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut out = Vec::with_capacity(rows.len());
+    for (i, row) in rows.iter().enumerate() {
+        let u = (|| -> Result<RouterUsage> {
+            let account =
+                text_field(row, "account")?.ok_or_else(|| anyhow::anyhow!("account is missing"))?;
+            check_account(&account)?;
+            Ok(RouterUsage {
+                account,
+                decisions: uint_field(row, "decisions")?.unwrap_or(0),
+                oracle_calls: uint_field(row, "oracle_calls")?.unwrap_or(0),
+            })
+        })()
+        .with_context(|| format!("row {}", i + 1))?;
+        if let Some(j) = seen.insert(u.account.clone(), i + 1) {
+            bail!(
+                "rows {j} and {} are both account {}, the primary key of the router's table",
+                i + 1,
+                u.account
+            );
+        }
+        out.push(u);
+    }
+    Ok(out)
+}
+
+/// What an import of usage did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UsageImportReport {
+    pub read: usize,
+    /// Accounts whose counters grew since the last import: one ledger line each.
+    pub carried: usize,
+    /// Accounts already carried over up to these counters.
+    pub unchanged: usize,
+    /// Accounts whose export is below what was carried over before (an older
+    /// export): left alone.
+    pub behind: usize,
+    pub decisions: u64,
+    pub oracle_calls: u64,
+    pub accounts: BTreeSet<String>,
+    /// Whether the ledger was written.
+    pub written: bool,
+}
+
+impl UsageImportReport {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "read": self.read,
+            "carried": self.carried,
+            "unchanged": self.unchanged,
+            "behind": self.behind,
+            "decisions": self.decisions,
+            "oracle_calls": self.oracle_calls,
+            "accounts": self.accounts,
+            "written": self.written,
+        })
+    }
+}
+
+/// Carry the router's usage counters into the usage ledger so that quotas
+/// continue (spec §4.15; the router compares an account's lifetime
+/// `decisions` with `decision_quota`, `auth.rs:166-173`, as the service
+/// compares the ledger's `decisions`). Per account one line
+/// `{id: "import:cortiq-router:usage_counters", model: "cortiq-router",
+/// questions: Δdecisions, oracle_calls: Δoracle_calls, actions.local:
+/// Δdecisions}` with no tokens and no cost, where Δ is the export minus what
+/// earlier imports carried over (read back from the ledger): importing the
+/// same export again writes nothing, a newer export adds only the growth,
+/// an older one is left alone. The router does not record which decisions
+/// its oracle answered, so the carried decisions are booked as `local`.
+///
+/// The caller holds the state directory's `LOCK` (no server is running).
+pub fn import_router_usage(
+    ledger: &UsageLedger,
+    rows: &[RouterUsage],
+    now: u64,
+) -> Result<UsageImportReport> {
+    let mut done: HashMap<String, (u64, u64)> = HashMap::new();
+    ledger.for_each_record(|r| {
+        if r.id == ROUTER_USAGE_RECORD_ID {
+            let e = done.entry(r.account.clone()).or_default();
+            e.0 += r.questions;
+            e.1 += r.oracle_calls;
+        }
+    })?;
+    let mut rep = UsageImportReport {
+        read: rows.len(),
+        ..UsageImportReport::default()
+    };
+    for u in rows {
+        let (d0, o0) = done.get(&u.account).copied().unwrap_or_default();
+        if u.decisions < d0 || u.oracle_calls < o0 {
+            rep.behind += 1;
+            continue;
+        }
+        let (dd, dor) = (u.decisions - d0, u.oracle_calls - o0);
+        if dd == 0 && dor == 0 {
+            rep.unchanged += 1;
+            continue;
+        }
+        ledger.append(&UsageRecord {
+            ts: now,
+            id: ROUTER_USAGE_RECORD_ID.to_string(),
+            account: u.account.clone(),
+            key12: None,
+            model: ROUTER_USAGE_MODEL.to_string(),
+            generation: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cost_usd: 0.0,
+            cost_local_usd: 0.0,
+            cost_oracle_usd: 0.0,
+            oracle_calls: dor,
+            cache_hits: 0,
+            questions: dd,
+            actions: Actions {
+                local: dd,
+                ..Actions::default()
+            },
+        })?;
+        rep.carried += 1;
+        rep.decisions += dd;
+        rep.oracle_calls += dor;
+        rep.accounts.insert(u.account.clone());
+    }
+    if rep.carried > 0 {
+        ledger.snapshot()?;
+        rep.written = true;
+    }
+    Ok(rep)
 }
 
 // ------------------------------------------------------------------ rate window
@@ -717,5 +1297,428 @@ mod tests {
         assert!(r.check("b", 2, 150).is_ok());
         assert!(r.check("a", 2, 180).is_ok());
         assert!(r.check("a", 0, 180).is_ok());
+    }
+
+    // -------------------------------------------------------------- router import
+
+    const RAW_A: &str = "cortiq_0123456789abcdef0123456789abcdef01234567";
+    const RAW_B: &str = "cortiq_fedcba9876543210fedcba9876543210fedcba98";
+
+    fn row(raw: &str, extra: Value) -> Value {
+        let mut m = json!({"key_hash": hash_key(raw), "account": "acct_a1b2c3d4e5f6"});
+        for (k, v) in extra.as_object().unwrap() {
+            m[k] = v.clone();
+        }
+        m
+    }
+
+    fn mysql(v: &str) -> RouterKeys {
+        read_router_keys(v.as_bytes(), ImportFormat::MysqlJson, 99).unwrap()
+    }
+
+    fn refused(bytes: &str, format: ImportFormat) -> String {
+        let e = read_router_keys(bytes.as_bytes(), format, 99).unwrap_err();
+        format!("{e:#}")
+    }
+
+    #[test]
+    fn mysql_export_containers_all_read_the_same_rows() {
+        let a = row(RAW_A, json!({"plan": "pro", "rate_per_min": 600}));
+        let b = row(RAW_B, json!({"account": "beta", "active": 0}));
+        let want = mysql(&json!([a, b]).to_string());
+        assert_eq!(want.records.len(), 2);
+        let lines = format!("{a}\n\n{b}\n");
+        let mysqlsh = format!(
+            "{}\n{}",
+            json!({"warning": "Using a password on the command line interface can be insecure."}),
+            serde_json::to_string_pretty(&json!({"hasData": true, "rows": [a, b],
+                "executionTime": "0.0008 sec", "affectedRowCount": 0, "warningCount": 0,
+                "warnings": [], "info": "", "autoIncrementValue": 0}))
+            .unwrap()
+        );
+        let phpmyadmin = json!([
+            {"type": "header", "version": "5.2.1", "comment": "Export to JSON plugin for PHPMyAdmin"},
+            {"type": "database", "name": "cortiq"},
+            {"type": "table", "name": "usage_counters", "database": "cortiq", "data": [{"account": "x"}]},
+            {"type": "table", "name": "api_keys", "database": "cortiq", "data": [a, b]}
+        ]);
+        let wrapped = json!({"api_keys": [a, b]});
+        for text in [lines, mysqlsh, phpmyadmin.to_string(), wrapped.to_string()] {
+            assert_eq!(mysql(&text), want, "{text}");
+        }
+        assert_eq!(mysql("").records.len(), 0);
+        assert_eq!(mysql("[]").entries, 0);
+    }
+
+    #[test]
+    fn mysql_rows_map_like_the_router() {
+        let k = mysql(
+            &json!([
+                // phpMyAdmin style: every value a string.
+                row(
+                    RAW_A,
+                    json!({"plan": "developer", "email": "ops@example.com", "label": "ci",
+                    "active": "1", "rate_per_min": "120", "decision_quota": "100000",
+                    "expires_at": "2000000000", "created_at": "1700000000"})
+                ),
+                // Only the NOT NULL columns: the table's defaults (active 1, limits 0).
+                row(RAW_B, json!({"email": "", "expires_at": null})),
+                row("inactive", json!({"active": 0})),
+                row("tinyint-2", json!({"active": 2})),
+                row("bool", json!({"active": false})),
+                row("expired", json!({"expires_at": 1000})),
+            ])
+            .to_string(),
+        );
+        let r = &k.records;
+        assert_eq!(
+            (r[0].plan.as_str(), r[0].label.as_str(), r[0].active),
+            ("developer", "ci", true)
+        );
+        assert_eq!(
+            (
+                r[0].rate_per_min,
+                r[0].decision_quota,
+                r[0].expires,
+                r[0].created
+            ),
+            (120, 100_000, Some(2_000_000_000), 1_700_000_000)
+        );
+        assert_eq!(
+            (
+                r[1].plan.as_str(),
+                r[1].active,
+                r[1].rate_per_min,
+                r[1].decision_quota
+            ),
+            ("", true, 0, 0)
+        );
+        assert_eq!((r[1].expires, r[1].created), (None, 0));
+        assert_eq!(
+            r[2..5].iter().map(|k| k.active).collect::<Vec<_>>(),
+            [false, false, false]
+        );
+        assert!(r[5].is_expired(1000) && !r[5].is_expired(999));
+        assert!(r.iter().all(|k| !k.oracle_allowed && k.token_quota == 0));
+        assert_eq!(k.emails, 1, "one non-empty email, never stored");
+        assert!(
+            !serde_json::to_string(&k.records)
+                .unwrap()
+                .contains("example.com")
+        );
+    }
+
+    #[test]
+    fn malformed_exports_are_refused_without_echoing_a_key() {
+        let h = hash_key(RAW_A);
+        let upper = h.to_ascii_uppercase();
+        let cases: Vec<(String, &str)> = vec![
+            (
+                json!([{"key_hash": upper, "account": "a"}]).to_string(),
+                "lowercase hex",
+            ),
+            (
+                json!([{"key_hash": &h[..63], "account": "a"}]).to_string(),
+                "lowercase hex",
+            ),
+            (
+                json!([{"key_hash": format!("{}g", &h[..63]), "account": "a"}]).to_string(),
+                "lowercase hex",
+            ),
+            (json!([{"account": "a"}]).to_string(), "key_hash is missing"),
+            (
+                json!([{"key_hash": 12, "account": "a"}]).to_string(),
+                "must be a string",
+            ),
+            (json!([{"key_hash": h}]).to_string(), "account is missing"),
+            (
+                json!([{"key_hash": h, "account": "a b"}]).to_string(),
+                "account 'a b'",
+            ),
+            (
+                json!([{"key_hash": h, "account": "a", "key": RAW_A}]).to_string(),
+                "column 'key'",
+            ),
+            (
+                json!([{"key_hash": h, "account": "a", (RAW_A): 1}]).to_string(),
+                "not an identifier",
+            ),
+            (
+                json!([{"key_hash": h, "account": "a", "rate_per_min": -1}]).to_string(),
+                "negative",
+            ),
+            (
+                json!([{"key_hash": h, "account": "a", "rate_per_min": 1u64 << 32}]).to_string(),
+                "INT",
+            ),
+            (
+                json!([{"key_hash": h, "account": "a", "decision_quota": "lots"}]).to_string(),
+                "integer",
+            ),
+            (
+                json!([{"key_hash": h, "account": "a"}, {"key_hash": h, "account": "b"}])
+                    .to_string(),
+                "rows 1 and 2 have the same key_hash",
+            ),
+            (
+                json!([{"account": "a", "decisions": 3}]).to_string(),
+                "column 'decisions'",
+            ),
+            (json!({"error": "Access denied"}).to_string(), "MySQL error"),
+            (
+                json!([{"type": "header"}, {"type": "table", "name": "other", "data": []}])
+                    .to_string(),
+                "no table api_keys",
+            ),
+            (format!("[{{\"key_hash\": \"{h}\""), "not JSON"),
+        ];
+        for (text, want) in cases {
+            let e = refused(&text, ImportFormat::MysqlJson);
+            assert!(e.contains(want), "{text}: {e}");
+            for secret in [RAW_A, h.as_str(), upper.as_str(), &h[..12]] {
+                assert!(!e.contains(secret), "{e}");
+            }
+        }
+    }
+
+    #[test]
+    fn router_toml_hashes_raw_keys_like_the_router() {
+        let text = format!(
+            r#"
+bind = "0.0.0.0:8080"
+[[api_keys]]
+key = "{RAW_A}"
+account = "acme-corp"
+rate_per_min = 600
+decision_quota = 1_000_000
+plan = "ignored, as the router ignores unknown fields"
+
+[[api_keys]]
+key = ""                # the router skips an empty key
+account = "nobody"
+
+[[api_keys]]
+key = '{RAW_B}'         # defaults: account "default", unlimited
+
+[[api_keys]]
+key = "{RAW_A}"
+account = "acme-corp"
+rate_per_min = 60       # repeated: the last entry wins
+
+[auth]
+require = true
+"#
+        );
+        let k = read_router_keys(text.as_bytes(), ImportFormat::RouterToml, 1234).unwrap();
+        assert_eq!(
+            (k.entries, k.ignored_empty, k.duplicates, k.records.len()),
+            (4, 1, 1, 2)
+        );
+        let a = &k.records[0];
+        assert_eq!(a.hash, hash_key(RAW_A));
+        assert_eq!(
+            (
+                a.account.as_str(),
+                a.plan.as_str(),
+                a.rate_per_min,
+                a.decision_quota
+            ),
+            ("acme-corp", ROUTER_STATIC_PLAN, 60, 0)
+        );
+        assert_eq!((a.created, a.expires, a.active), (1234, None, true));
+        let b = &k.records[1];
+        assert_eq!(
+            (
+                b.hash.as_str(),
+                b.account.as_str(),
+                b.rate_per_min,
+                b.decision_quota
+            ),
+            (hash_key(RAW_B).as_str(), "default", 0, 0)
+        );
+        let shown = format!("{k:?}");
+        assert!(!shown.contains(RAW_A) && !shown.contains(RAW_B));
+        // An inline array reads too; no api_keys is no key.
+        let inline = format!("api_keys = [ {{ key = \"{RAW_A}\", account = \"x\" }} ]\n");
+        let k2 = read_router_keys(inline.as_bytes(), ImportFormat::RouterToml, 1).unwrap();
+        assert_eq!(k2.records[0].hash, hash_key(RAW_A));
+        let none = read_router_keys(b"bind = \"x\"\n", ImportFormat::RouterToml, 1).unwrap();
+        assert_eq!((none.entries, none.records.len()), (0, 0));
+        for (text, want) in [
+            (
+                format!("[[api_keys]]\nkey = \"{RAW_A}\"\nrate_per_min = -1\n"),
+                "api_keys entry 1: rate_per_min",
+            ),
+            (
+                format!("[[api_keys]]\nkey = \"{RAW_A}\"\nrate_per_min = 4294967296\n"),
+                "u32",
+            ),
+            (
+                format!("[[api_keys]]\nkey = \"{RAW_A}\"\ndecision_quota = \"5\"\n"),
+                "decision_quota",
+            ),
+            (
+                format!("[[api_keys]]\nkey = \"{RAW_A}\"\naccount = \"a b\"\n"),
+                "account",
+            ),
+            (format!("[[api_keys]]\nkey = {RAW_A}\n"), "TOML line 2"),
+            (format!("api_keys = \"{RAW_A}\"\n"), "array of tables"),
+        ] {
+            let e = refused(&text, ImportFormat::RouterToml);
+            assert!(e.contains(want), "{text}: {e}");
+            assert!(!e.contains(RAW_A) && !e.contains(&hash_key(RAW_A)), "{e}");
+        }
+    }
+
+    #[test]
+    fn format_detection() {
+        let p = |n: &str| PathBuf::from(n);
+        assert_eq!(
+            ImportFormat::detect(&p("router.toml"), b"[]"),
+            ImportFormat::RouterToml
+        );
+        assert_eq!(
+            ImportFormat::detect(&p("k.json"), b"x"),
+            ImportFormat::MysqlJson
+        );
+        assert_eq!(
+            ImportFormat::detect(&p("export"), b"[{\"a\":1}]"),
+            ImportFormat::MysqlJson
+        );
+        assert_eq!(
+            ImportFormat::detect(&p("export"), b"[[api_keys]]\n"),
+            ImportFormat::RouterToml
+        );
+        assert_eq!(
+            ImportFormat::parse("router-toml").unwrap(),
+            ImportFormat::RouterToml
+        );
+        assert!(ImportFormat::parse("csv").is_err());
+    }
+
+    #[test]
+    fn import_is_idempotent_revokes_and_never_reactivates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keys.json");
+        let store = KeyStore::open(&path, "cortiq_").unwrap();
+        let export = json!([
+            row(
+                RAW_A,
+                json!({"plan": "pro", "rate_per_min": 0, "decision_quota": 0})
+            ),
+            row(RAW_B, json!({"account": "beta", "active": 0})),
+            row("expired", json!({"account": "old", "expires_at": 10})),
+        ])
+        .to_string();
+        let r = store.import_router_keys(&mysql(&export), 50).unwrap();
+        assert_eq!(
+            (
+                r.imported,
+                r.imported_active(),
+                r.imported_inactive,
+                r.imported_expired,
+                r.written
+            ),
+            (3, 1, 1, 1, true)
+        );
+        assert_eq!(
+            r.accounts.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["acct_a1b2c3d4e5f6", "beta", "old"]
+        );
+        let bytes = std::fs::read(&path).unwrap();
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        assert!(!text.contains(RAW_A) && text.contains(&hash_key(RAW_A)));
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(store.authenticate(RAW_A, 50).unwrap().plan, "pro");
+        assert_eq!(store.authenticate(RAW_B, 50), Err(AuthFailure::Revoked));
+        assert_eq!(store.authenticate("expired", 50), Err(AuthFailure::Expired));
+
+        // Again: nothing changes, not even the mtime.
+        std::thread::sleep(Duration::from_millis(20));
+        let r = store.import_router_keys(&mysql(&export), 60).unwrap();
+        assert_eq!((r.imported, r.unchanged, r.written), (0, 3, false));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+
+        // The router revoked A and re-enabled B; B's limits changed.
+        let later = json!([
+            row(RAW_A, json!({"plan": "pro", "active": 0})),
+            row(
+                RAW_B,
+                json!({"account": "beta", "active": 1, "rate_per_min": 5})
+            ),
+        ])
+        .to_string();
+        let r = store.import_router_keys(&mysql(&later), 70).unwrap();
+        assert_eq!((r.revoked, r.kept, r.imported, r.written), (1, 1, 0, true));
+        assert_eq!(store.authenticate(RAW_A, 70), Err(AuthFailure::Revoked));
+        assert_eq!(store.authenticate(RAW_B, 70), Err(AuthFailure::Revoked));
+    }
+
+    #[test]
+    fn usage_import_carries_only_the_growth() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = UsageLedger::open(dir.path()).unwrap();
+        let usage = |d: u64, o: u64| {
+            read_router_usage(
+                json!([{"account": "acme", "decisions": d.to_string(), "oracle_calls": o},
+                       {"account": "beta", "decisions": 7}])
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap()
+        };
+        let r = import_router_usage(&ledger, &usage(100, 4), 1_790_000_000).unwrap();
+        assert_eq!(
+            (r.carried, r.decisions, r.oracle_calls, r.written),
+            (2, 107, 4, true)
+        );
+        let t = ledger.totals("acme");
+        assert_eq!(
+            (t.decisions, t.oracle_calls, t.actions.local),
+            (100, 4, 100)
+        );
+        assert_eq!(t.cost_usd, Usd::ZERO);
+        let snapshot = std::fs::read(dir.path().join(crate::ledger::SNAPSHOT_FILE)).unwrap();
+
+        let again = import_router_usage(&ledger, &usage(100, 4), 1_790_000_100).unwrap();
+        assert_eq!(
+            (again.carried, again.unchanged, again.written),
+            (0, 2, false)
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(crate::ledger::SNAPSHOT_FILE)).unwrap(),
+            snapshot
+        );
+        // A newer export adds its growth only; an older one is left alone.
+        let newer = import_router_usage(&ledger, &usage(130, 4), 1_790_000_200).unwrap();
+        assert_eq!(
+            (newer.carried, newer.decisions, newer.unchanged),
+            (1, 30, 1)
+        );
+        let older = import_router_usage(&ledger, &usage(90, 4), 1_790_000_300).unwrap();
+        assert_eq!((older.behind, older.carried), (1, 0));
+        drop(ledger);
+        let reopened = UsageLedger::open(dir.path()).unwrap();
+        assert_eq!(reopened.totals("acme").decisions, 130);
+        assert_eq!(reopened.totals("beta").decisions, 7);
+        for (text, want) in [
+            (
+                json!([{"account": "a", "decisions": 1}, {"account": "a"}]).to_string(),
+                "both account a",
+            ),
+            (
+                json!([{"account": "a", "key_hash": "x"}]).to_string(),
+                "column 'key_hash'",
+            ),
+            (
+                json!([{"account": "a", "decisions": -5}]).to_string(),
+                "negative",
+            ),
+            (json!([{"decisions": 5}]).to_string(), "account is missing"),
+        ] {
+            let e = format!("{:#}", read_router_usage(text.as_bytes()).unwrap_err());
+            assert!(e.contains(want), "{text}: {e}");
+        }
     }
 }
