@@ -28,10 +28,12 @@ gpu = ["cortiq-engine/gpu"]
 [dependencies]
 libc = "0.2"
 base64 = { workspace = true }
-cortiq-core = { path = "../cortiq-core", version = "0.7.7" }
-cortiq-engine = { path = "../cortiq-engine", version = "0.7.7" }
-cortiq-net = { path = "../cortiq-net", version = "0.7.7" }
-cortiq-server = { path = "../cortiq-server", version = "0.7.7" }
+cortiq-core = { path = "../cortiq-core", version = "0.7.8" }
+cortiq-engine = { path = "../cortiq-engine", version = "0.7.8" }
+cortiq-net = { path = "../cortiq-net", version = "0.7.8" }
+cortiq-server = { path = "../cortiq-server", version = "0.7.8" }
+# `cortiq decide` / `cortiq decision …` and the decision branch of serve.
+cortiq-decision = { path = "../cortiq-decision", version = "0.7.8" }
 clap = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
@@ -48,3 +50,7 @@ ureq = { version = "2", features = ["json", "tls"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 sha2 = "0.10"
 rand_core = { version = "0.6", features = ["getrandom"] }
+
+[dev-dependencies]
+# Decision CLI tests: scratch model and state directories.
+tempfile = "3"
