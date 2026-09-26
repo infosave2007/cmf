@@ -291,6 +291,13 @@ enum Commands {
         /// agreement overall, by confidence and per label
         #[arg(long, value_name = "URL")]
         shadow_of: Option<String>,
+        /// Decision file only, with --shadow-of: deadline of one request
+        /// forwarded to the old router, connect to last byte, in seconds
+        /// (default 60, nginx's proxy_read_timeout; raise it for long
+        /// batches the old router escalates input by input). An old router
+        /// that does not answer in time gives 502 UPSTREAM_UNAVAILABLE
+        #[arg(long, value_name = "SECONDS", requires = "shadow_of")]
+        shadow_timeout_s: Option<u64>,
         /// Also listen on ollama-compatible port
         #[arg(long)]
         compat_port: Option<u16>,
@@ -2011,8 +2018,14 @@ async fn main() -> anyhow::Result<()> {
     };
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| default_level.into());
-    let shutdown_filter =
-        tracing_subscriber::filter::filter_fn(|_| TRACING_LIVE.load(AtomicOrdering::Relaxed));
+    // Past the shutdown gate, and never a DEBUG/TRACE line of a target that
+    // prints forwarded request headers (ureq's request prelude: the client
+    // keys and admin token a `--shadow-of` server forwards), whatever
+    // RUST_LOG says.
+    let shutdown_filter = tracing_subscriber::filter::filter_fn(|m| {
+        TRACING_LIVE.load(AtomicOrdering::Relaxed)
+            && !cortiq_decision::shadow::log_may_carry_secrets(m.target(), m.level())
+    });
     tracing_subscriber::registry()
         .with(env_filter)
         .with(
@@ -2034,6 +2047,7 @@ async fn main() -> anyhow::Result<()> {
             state,
             break_lock,
             shadow_of,
+            shadow_timeout_s,
             compat_port,
             o1,
             o1_m,
@@ -2066,6 +2080,7 @@ async fn main() -> anyhow::Result<()> {
                 state: state.map(Into::into),
                 break_lock,
                 shadow_of,
+                shadow_timeout_s,
             };
             let o1 = O1Flags {
                 spec: o1,

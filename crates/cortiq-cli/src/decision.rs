@@ -83,6 +83,9 @@ pub struct ServeFlags {
     pub break_lock: bool,
     /// `--shadow-of URL`: shadow mode of the router API (spec §4.15).
     pub shadow_of: Option<String>,
+    /// `--shadow-timeout-s N`: deadline of one request forwarded to the old
+    /// router (default [`cortiq_decision::shadow::UPSTREAM_TIMEOUT`], 60 s).
+    pub shadow_timeout_s: Option<u64>,
 }
 
 impl ServeFlags {
@@ -93,6 +96,7 @@ impl ServeFlags {
             ("--state", self.state.is_some()),
             ("--break-lock", self.break_lock),
             ("--shadow-of", self.shadow_of.is_some()),
+            ("--shadow-timeout-s", self.shadow_timeout_s.is_some()),
         ]
         .into_iter()
         .filter_map(|(name, set)| set.then_some(name))
@@ -150,6 +154,14 @@ pub async fn serve(model: &str, host: &str, port: u16, flags: &ServeFlags) -> Re
     opts.state_dir = flags.state.clone();
     opts.break_lock = flags.break_lock;
     opts.shadow_of = flags.shadow_of.clone();
+    if let Some(t) = flags.shadow_timeout_s {
+        ensure!(
+            flags.shadow_of.is_some(),
+            "--shadow-timeout-s applies only with --shadow-of"
+        );
+        ensure!(t > 0, "--shadow-timeout-s must be at least 1 second");
+        opts.shadow_timeout = std::time::Duration::from_secs(t);
+    }
     println!(
         "  Decision file: decisions API on http://{} (state {})",
         opts.addr,
@@ -159,8 +171,10 @@ pub async fn serve(model: &str, host: &str, port: u16, flags: &ServeFlags) -> Re
         // Checked before it is printed (credentials in it are refused).
         let base = upstream_base(url)?;
         println!(
-            "  Shadow mode: the router API is answered by {base}; /v1/route and /v1/route:batch \
-             are also decided locally (no oracle, learning or billing) and compared in {}",
+            "  Shadow mode: the router API is answered by {base} (deadline {} s per request); \
+             /v1/route and /v1/route:batch are also decided locally (no oracle, learning or \
+             billing) and compared in {}",
+            opts.shadow_timeout.as_secs(),
             opts.state_root().join(SHADOW_LOG_FILE).display()
         );
     }
@@ -537,10 +551,19 @@ MySQL Shell (--json, --result-format=json/array or ndjson), MySQL Workbench
 and phpMyAdmin JSON exports are read too.
 
 Idempotent: a second import of the same export writes nothing. A key already
-stored is never overwritten (import the MySQL export before the
-configuration: the router's database wins over its configuration), an active
-key the export marks inactive is revoked, nothing is re-activated or
-deleted. Limits of 0 stay unlimited; the email column is not stored.";
+stored is never overwritten, an active key the export marks inactive is
+revoked, nothing is re-activated or deleted. A key in both the database and
+the configuration follows the router in either import order: the database
+row while it is active and unexpired, else the static key of the
+configuration. Accounts, plans and labels are taken as the router's columns
+hold them (any text up to 128, 64 and 255 characters). Limits of 0 stay
+unlimited; the email column is not stored.
+
+Oracle: imported keys may escalate to the oracle (oracle_allowed true), as
+every key could in cortiq-router; the server's oracle switch, budgets and
+stop rules still apply. --oracle-allowed=false imports them without it.
+Given explicitly (true or false), the value also reaches the keys an earlier
+import brought from the router; without it those keep theirs.";
 
 /// `cortiq decision keys …` (spec §4.10, §4.15, §5b).
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
@@ -622,6 +645,19 @@ pub enum KeysCmd {
         /// ledger is written, so no server may hold the state directory
         #[arg(long)]
         usage: Option<PathBuf>,
+        /// Whether the imported keys may escalate to the oracle (default:
+        /// true for new keys, as in cortiq-router; given explicitly, also for
+        /// keys imported before)
+        #[arg(
+            long,
+            requires = "from",
+            value_name = "BOOL",
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "true",
+            value_parser = clap::value_parser!(bool)
+        )]
+        oracle_allowed: Option<bool>,
         /// Print the summary as one JSON object
         #[arg(long)]
         json: bool,
@@ -1157,9 +1193,10 @@ fn info(path: &Path, as_json: bool) -> Result<()> {
 /// names (its integrity, every replaced tensor's sha256, the learned rows) —
 /// plus the encoder golden and a scorer per skill (what `serve` builds).
 ///
-/// `DecisionModel::verify_full` is not used: after an overlay it checks the
-/// base's task tensors against the overlay's manifests and refuses every
-/// promoted generation.
+/// The open with [`Verify::Full`] already runs every check of
+/// `DecisionModel::verify_full` (the base file against its own skill
+/// manifests, a generation's replaced skills against the overlay's), so it is
+/// not run a second time.
 fn verify(path: &Path, state: Option<&Path>, as_json: bool) -> Result<()> {
     let model = open_model(path, state, Verify::Full)?;
     let (_, golden) = SignalEncoder::from_model(&model)?;
@@ -1261,8 +1298,8 @@ fn keys(cmd: &KeysCmd) -> Result<()> {
                     "created key {} for account {} (plan {}, {} requests/min, decision quota {}, expires {}); \
                      the key is shown only now, {} keeps its sha256",
                     r.hash12(),
-                    r.account,
-                    r.plan,
+                    keys_mod::shown(&r.account),
+                    keys_mod::shown(&r.plan),
                     r.rate_per_min,
                     r.decision_quota,
                     r.expires.map_or("never".to_string(), |e| e.to_string()),
@@ -1273,7 +1310,13 @@ fn keys(cmd: &KeysCmd) -> Result<()> {
         }
         KeysCmd::List { at, json } => {
             let (store, _) = key_store(at)?;
-            let records = store.records();
+            // What each key is now (an imported router key may answer as its
+            // static configuration key, as in the router).
+            let records: Vec<keys_mod::KeyRecord> = store
+                .records()
+                .iter()
+                .map(|r| r.effective(now).into_owned())
+                .collect();
             if *json {
                 let list: Vec<Value> = records.iter().map(|r| r.listing(now)).collect();
                 println!("{}", Value::Array(list));
@@ -1294,8 +1337,8 @@ fn keys(cmd: &KeysCmd) -> Result<()> {
                 println!(
                     "{:<12}  {:<24} {:<10} {:<7} {:>8} {:>10} {:>12}  {}",
                     r.hash12(),
-                    r.account,
-                    r.plan,
+                    keys_mod::shown(&r.account),
+                    keys_mod::shown(&r.plan),
                     state,
                     r.rate_per_min,
                     r.decision_quota,
@@ -1309,7 +1352,10 @@ fn keys(cmd: &KeysCmd) -> Result<()> {
         KeysCmd::Revoke { at, account, hash } => {
             let (store, _) = key_store(at)?;
             let (n, what) = match (account, hash) {
-                (Some(a), _) => (store.revoke_account(a)?, format!("account {a}")),
+                (Some(a), _) => (
+                    store.revoke_account(a)?,
+                    format!("account {}", keys_mod::shown(a)),
+                ),
                 (None, Some(h)) => (store.revoke_hash_prefix(h)?, format!("hash {h}")),
                 (None, None) => bail!("--account or --hash is required"),
             };
@@ -1322,43 +1368,54 @@ fn keys(cmd: &KeysCmd) -> Result<()> {
             from,
             format,
             usage,
+            oracle_allowed,
             json,
         } => keys_import(
             at,
-            from.as_deref(),
-            format.as_deref(),
-            usage.as_deref(),
+            &ImportArgs {
+                from: from.as_deref(),
+                format: format.as_deref(),
+                usage: usage.as_deref(),
+                oracle_allowed: *oracle_allowed,
+            },
             *json,
             now,
         ),
     }
 }
 
+/// The inputs of `cortiq decision keys import`.
+struct ImportArgs<'a> {
+    from: Option<&'a Path>,
+    format: Option<&'a str>,
+    usage: Option<&'a Path>,
+    /// `--oracle-allowed[=BOOL]`.
+    oracle_allowed: Option<bool>,
+}
+
 /// `cortiq decision keys import` (spec §4.15). Every input is read and
 /// checked before anything is written; the usage ledger is written only
 /// under the state directory's LOCK.
-fn keys_import(
-    at: &KeyState,
-    from: Option<&Path>,
-    format: Option<&str>,
-    usage: Option<&Path>,
-    json: bool,
-    now: u64,
-) -> Result<()> {
-    let keys_in = from
+fn keys_import(at: &KeyState, args: &ImportArgs<'_>, json: bool, now: u64) -> Result<()> {
+    let keys_in = args
+        .from
         .map(|p| -> Result<_> {
             let bytes = std::fs::read(p).with_context(|| format!("read {}", p.display()))?;
-            let fmt = match format {
+            let fmt = match args.format {
                 Some(f) => ImportFormat::parse(f)?,
                 None => ImportFormat::detect(p, &bytes),
             };
-            let keys = keys_mod::read_router_keys(&bytes, fmt, now).with_context(|| {
+            let mut keys = keys_mod::read_router_keys(&bytes, fmt, now).with_context(|| {
                 format!("{} ({}): nothing was imported", p.display(), fmt.name())
             })?;
+            if let Some(v) = args.oracle_allowed {
+                keys = keys.with_oracle_allowed(v);
+            }
             Ok((p, keys))
         })
         .transpose()?;
-    let usage_in = usage
+    let usage_in = args
+        .usage
         .map(|p| -> Result<_> {
             let bytes = std::fs::read(p).with_context(|| format!("read {}", p.display()))?;
             let rows = keys_mod::read_router_usage(&bytes).with_context(|| {
@@ -1421,8 +1478,44 @@ fn print_key_import(from: &Path, r: &ImportReport, keys_json: &Path) {
         r.kept
     );
     if !r.accounts.is_empty() {
-        let accounts: Vec<&str> = r.accounts.iter().map(String::as_str).collect();
+        let accounts: Vec<String> = r.accounts.iter().map(|a| keys_mod::shown(a)).collect();
         println!("  accounts of the new keys: {}", accounts.join(", "));
+    }
+    if r.layered > 0 {
+        println!(
+            "  {} keys in both the router's database and its configuration: the database row \
+             is laid over the static key, as in the router",
+            r.layered
+        );
+    }
+    if r.static_fallback > 0 {
+        println!(
+            "  {} keys answer as their static configuration key (database row inactive or \
+             expired), as in the router",
+            r.static_fallback
+        );
+    }
+    if r.imported > 0 {
+        println!(
+            "  new keys: oracle escalation {}",
+            if r.oracle_allowed {
+                "allowed, as in cortiq-router (--oracle-allowed=false to import without it)"
+            } else {
+                "not allowed (--oracle-allowed=false)"
+            }
+        );
+    }
+    if r.oracle_updated > 0 {
+        println!(
+            "  {} keys imported before: oracle escalation {} (--oracle-allowed={})",
+            r.oracle_updated,
+            if r.oracle_allowed {
+                "allowed"
+            } else {
+                "withdrawn"
+            },
+            r.oracle_allowed
+        );
     }
     if r.ignored_empty > 0 {
         println!(
@@ -1515,6 +1608,7 @@ mod tests {
             state: Some("st".into()),
             break_lock: true,
             shadow_of: Some("https://router.example.com".into()),
+            shadow_timeout_s: Some(300),
         };
         assert_eq!(
             d.given(),
@@ -1522,7 +1616,8 @@ mod tests {
                 "--decision-config",
                 "--state",
                 "--break-lock",
-                "--shadow-of"
+                "--shadow-of",
+                "--shadow-timeout-s"
             ]
         );
         // Decision file: no language-model flag.
@@ -1548,6 +1643,8 @@ mod tests {
             "--break-lock",
             "--shadow-of",
             "https://router.example.com",
+            "--shadow-timeout-s",
+            "300",
         ])
         .unwrap()
         .command
@@ -1557,6 +1654,7 @@ mod tests {
                 state,
                 break_lock,
                 shadow_of,
+                shadow_timeout_s,
                 task,
                 ..
             } => {
@@ -1564,6 +1662,7 @@ mod tests {
                 assert_eq!(state.as_deref(), Some("s"));
                 assert!(break_lock);
                 assert_eq!(shadow_of.as_deref(), Some("https://router.example.com"));
+                assert_eq!(shadow_timeout_s, Some(300));
                 // `--task` is optional so that its presence can be refused on
                 // a decision file (a language model still defaults to general).
                 assert_eq!(task, None);

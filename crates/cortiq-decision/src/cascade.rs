@@ -49,7 +49,7 @@ use crate::learn::{self, AttemptReport, Books, LearnContext, Outcome};
 use crate::metering::Usd;
 use crate::oracle::{CallOutcome, Caller, KeyLookup, OracleClient, process_env};
 use crate::pii::{FLAG_PII_REDACTED, redact_value};
-use crate::protocol::{ApiError, FeedbackRequest, Question, QuestionKind};
+use crate::protocol::{ApiError, FeedbackRequest, MAX_LABEL_BYTES, Question, QuestionKind};
 use crate::rows::{Rows, Source};
 use crate::service::{
     AdminCommand, Escalation, EscalationResult, Escalator, ModelHandle, Observation, OracleUsage,
@@ -386,6 +386,12 @@ impl Drop for Cascade {
     }
 }
 
+/// A label a feedback can teach: 1..[`MAX_LABEL_BYTES`] bytes, as a task
+/// label of a skill manifest.
+fn learnable_label(label: &str) -> bool {
+    !label.is_empty() && label.len() <= MAX_LABEL_BYTES
+}
+
 impl Inner {
     fn base_rows(&self, model: &DecisionModel, skill: &str) -> Result<Arc<Rows>> {
         let mut b = self.bases.lock();
@@ -444,7 +450,14 @@ impl Inner {
             return;
         }
         if let Err(e) = self.run_attempt(skill, label) {
-            tracing::error!(error = %format!("{e:#}"), skill, label, "learning attempt failed");
+            // Labels may come from client feedback: the line names the
+            // label's hash only (spec §4.3), also inside the error text.
+            tracing::error!(
+                error = %learn::redact_label(&format!("{e:#}"), label),
+                skill,
+                label_sha = %learn::label_tag(label),
+                "learning attempt failed"
+            );
         }
     }
 
@@ -813,6 +826,20 @@ impl Escalator for Cascade {
             // The router API's feedback may name any label (a new one starts a
             // cold start, router `api.rs:1283-1292`); the decisions API's only
             // an option of the question.
+            if fb.any_label && !learnable_label(&fb.label) {
+                // The router accepts an empty or over-long label too (200,
+                // the request consumed); it names no task that could be
+                // learned, so nothing is stored here.
+                let entry = ring.remove(pos).ok_or_else(not_found)?;
+                inner.stats.lock().feedback += 1;
+                return Ok(json!({
+                    "id": fb.id, "question": fb.question, "skill": entry.skill,
+                    "accepted": false, "learned": false,
+                    "reason": format!(
+                        "the label must be 1..{MAX_LABEL_BYTES} bytes to be learned"
+                    ),
+                }));
+            }
             if !fb.any_label && !ring[pos].options.contains(&fb.label) {
                 return Err(ApiError::invalid_field(
                     "label",
@@ -840,7 +867,10 @@ impl Escalator for Cascade {
             h_val: entry.state.h_val.clone(),
         };
         let (added, job) = inner.add_example(ex).map_err(|e| {
-            tracing::error!(error = %format!("{e:#}"), "feedback example");
+            tracing::error!(
+                error = %learn::redact_label(&format!("{e:#}"), &fb.label),
+                "feedback example"
+            );
             ApiError::internal("the feedback could not be stored")
         })?;
         inner.stats.lock().feedback += 1;

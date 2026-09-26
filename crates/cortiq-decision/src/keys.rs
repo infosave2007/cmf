@@ -12,8 +12,15 @@
 //!   oracle_allowed}`: `expires` unix seconds or `null`; `rate_per_min`,
 //!   `decision_quota` and `token_quota` 0 = unlimited; `credit_usd` and
 //!   `oracle_budget_usd` decimal strings or `null` (no limit). A revoked key
-//!   keeps its record with `active: false`. `oracle_allowed` defaults to false:
-//!   the oracle is opt-in per key.
+//!   keeps its record with `active: false`. `oracle_allowed` defaults to false
+//!   for a key created here (the oracle is opt-in per key) and to true for a
+//!   key imported from cortiq-router, which escalated for every key.
+//! * **Account, plan, label**: any text the router's `api_keys` columns hold
+//!   — 1..128, ≤ 64 and ≤ 255 Unicode characters (`VARCHAR(128)`,
+//!   `VARCHAR(64)`, `VARCHAR(255)`, router `store.rs:119-130`), e.g.
+//!   `client+tag@example.com` or Cyrillic. On disk they are JSON strings
+//!   (escaped by serde); log lines and CLI tables show them through
+//!   [`shown`] (control characters escaped).
 //! * **`keys.json`** `{"version":1,"keys":[…]}` is replaced atomically on every
 //!   change; a server re-reads it when its mtime or size changes, checked at
 //!   most every 15 s ([`KeyStore::maybe_reload`]).
@@ -27,7 +34,10 @@
 //!   read) — through [`read_router_keys`] (checks everything first) and
 //!   [`KeyStore::import_router_keys`] (idempotent); its `usage_counters`
 //!   continue in the usage ledger through [`read_router_usage`] and
-//!   [`import_router_usage`].
+//!   [`import_router_usage`]. An imported record remembers its origin
+//!   ([`RouterOrigin`]): a key both in the database and in the configuration
+//!   follows the router's precedence — the database row while it is active
+//!   and unexpired, else the static key — whatever the import order.
 //!
 //! Quotas and credit are checked by the service against the usage ledger
 //! before a request is processed (spec §4.10).
@@ -58,6 +68,17 @@ pub const RELOAD_EVERY: Duration = Duration::from_secs(15);
 pub const DEFAULT_PLAN: &str = "starter";
 /// Characters of the hash prefix shown in listings.
 pub const HASH_PREFIX_CHARS: usize = 12;
+/// Most characters of an account: the router's `account VARCHAR(128)`.
+pub const MAX_ACCOUNT_CHARS: usize = 128;
+/// Most characters of a plan: the router's `plan VARCHAR(64)`.
+pub const MAX_PLAN_CHARS: usize = 64;
+/// Most characters of a label: the router's `label VARCHAR(255)`.
+pub const MAX_LABEL_CHARS: usize = 255;
+/// `oracle_allowed` of an imported router key without `--oracle-allowed`:
+/// the router escalated for every key (`allow_oracle` defaults to true,
+/// router `api.rs:67`), subject to its global oracle switch — here the
+/// server's `oracle.enabled`, budgets and stop rules still apply.
+pub const ROUTER_ORACLE_ALLOWED: bool = true;
 
 /// Lowercase hex sha256 of a raw key (router `store.rs:54-57`).
 pub fn hash_key(raw: &str) -> String {
@@ -115,6 +136,43 @@ pub struct KeyRecord {
     pub credit_usd: Option<String>,
     pub oracle_budget_usd: Option<String>,
     pub oracle_allowed: bool,
+    /// Origin of a key imported from cortiq-router; absent for a key of this
+    /// server (created here, or revoked here after its import).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router: Option<RouterOrigin>,
+}
+
+/// Where an imported key comes from in cortiq-router (spec §4.15).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouterOrigin {
+    /// The record's attributes are a row of the router's `api_keys` table.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub db: bool,
+    /// The key is also (or only) a static key of the router's configuration
+    /// (`[[api_keys]]`, router `main.rs:327-341`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<StaticKey>,
+}
+
+impl RouterOrigin {
+    /// `mysql`, `config` or `mysql+config` (listings).
+    pub fn name(&self) -> &'static str {
+        match (self.db, self.config.is_some()) {
+            (true, true) => "mysql+config",
+            (true, false) => "mysql",
+            _ => "config",
+        }
+    }
+}
+
+/// A static key of the router's configuration: what it authenticates as.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StaticKey {
+    pub account: String,
+    pub rate_per_min: u32,
+    pub decision_quota: u64,
 }
 
 impl KeyRecord {
@@ -142,17 +200,97 @@ impl KeyRecord {
         );
         check_account(&self.account)?;
         ensure!(
-            self.plan.len() <= 64 && self.label.len() <= 256,
-            "key plan ≤ 64 bytes, label ≤ 256 bytes"
+            self.plan.chars().count() <= MAX_PLAN_CHARS,
+            "key plan must be at most {MAX_PLAN_CHARS} characters"
         );
+        ensure!(
+            self.label.chars().count() <= MAX_LABEL_CHARS,
+            "key label must be at most {MAX_LABEL_CHARS} characters"
+        );
+        if let Some(o) = &self.router {
+            ensure!(
+                o.db || o.config.is_some(),
+                "a router origin names the database, the configuration or both"
+            );
+            if let Some(c) = &o.config {
+                check_account(&c.account)?;
+            }
+        }
         self.credit()?;
         self.oracle_budget()?;
         Ok(())
     }
 
+    /// The router's static key this record authenticates as at `now`: a key
+    /// that is also a static key of the router's configuration and whose
+    /// database row is inactive or expired. The router lays its database over
+    /// its configuration and loads only active, unexpired rows (router
+    /// `auth.rs:83-89`, `main.rs:43-60`, `store.rs:322`), so the static key
+    /// answers then.
+    pub fn static_fallback(&self, now: u64) -> Option<KeyRecord> {
+        let o = self.router.as_ref()?;
+        let s = o.config.as_ref()?;
+        if !o.db || (self.active && !self.is_expired(now)) {
+            return None;
+        }
+        Some(KeyRecord {
+            hash: self.hash.clone(),
+            account: s.account.clone(),
+            plan: ROUTER_STATIC_PLAN.to_string(),
+            label: String::new(),
+            created: self.created,
+            expires: None,
+            active: true,
+            rate_per_min: s.rate_per_min,
+            decision_quota: s.decision_quota,
+            token_quota: 0,
+            credit_usd: None,
+            oracle_budget_usd: None,
+            oracle_allowed: self.oracle_allowed,
+            router: self.router.clone(),
+        })
+    }
+
+    /// What the key is at `now`: its [`KeyRecord::static_fallback`], else
+    /// the record itself.
+    pub fn effective(&self, now: u64) -> std::borrow::Cow<'_, KeyRecord> {
+        match self.static_fallback(now) {
+            Some(s) => std::borrow::Cow::Owned(s),
+            None => std::borrow::Cow::Borrowed(self),
+        }
+    }
+
+    /// Whether a revocation here changes anything: active, or answering as
+    /// its static key.
+    fn revocable(&self) -> bool {
+        self.active
+            || self
+                .router
+                .as_ref()
+                .is_some_and(|o| o.db && o.config.is_some())
+    }
+
+    /// Revoke here: inactive, and no longer a router key (no static
+    /// fallback; a later import keeps it as this server's record and never
+    /// re-activates it).
+    fn revoke(&mut self) {
+        self.active = false;
+        self.router = None;
+    }
+
+    /// Whether `account` names this key (its own or its static key's).
+    fn has_account(&self, account: &str) -> bool {
+        self.account == account
+            || self
+                .router
+                .as_ref()
+                .and_then(|o| o.config.as_ref())
+                .is_some_and(|c| c.account == account)
+    }
+
     /// The listing entry (spec §5b: hash12, limits, usage added by the caller).
     pub fn listing(&self, now: u64) -> Value {
-        json!({
+        let mut v = json!({
             "hash12": self.hash12(),
             "account": self.account,
             "plan": self.plan,
@@ -167,20 +305,33 @@ impl KeyRecord {
             "credit_usd": self.credit_usd,
             "oracle_budget_usd": self.oracle_budget_usd,
             "oracle_allowed": self.oracle_allowed,
-        })
+        });
+        if let Some(o) = &self.router {
+            v["router_origin"] = json!(o.name());
+        }
+        v
     }
 }
 
-/// An account id: 1..128 bytes of `[A-Za-z0-9_.@-]`.
+/// An account id: 1..128 Unicode characters, any text the router's
+/// `account VARCHAR(128)` column holds (router `store.rs:122`; its admin API
+/// takes any non-blank string, `api.rs:454-457`). Control characters are
+/// kept as they are in `keys.json` (JSON-escaped) and escaped by [`shown`]
+/// wherever an account is printed or logged.
 pub fn check_account(a: &str) -> Result<()> {
+    let n = a.chars().count();
     ensure!(
-        !a.is_empty()
-            && a.len() <= 128
-            && a.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'@')),
-        "account '{a}' must be 1..128 characters of [A-Za-z0-9_.@-]"
+        (1..=MAX_ACCOUNT_CHARS).contains(&n),
+        "account '{}' must be 1..{MAX_ACCOUNT_CHARS} characters (it has {n})",
+        shown(&a.chars().take(MAX_ACCOUNT_CHARS).collect::<String>())
     );
     Ok(())
+}
+
+/// A text as a log line or a CLI table shows it: control and other
+/// non-printable characters escaped (`\n`, `\u{7}`), printable Unicode kept.
+pub fn shown(text: &str) -> String {
+    text.escape_debug().to_string()
 }
 
 /// `keys.json`.
@@ -413,6 +564,9 @@ impl KeyStore {
         let rec = found
             .map(|i| l.records[i].clone())
             .ok_or(AuthFailure::Invalid)?;
+        if let Some(s) = rec.static_fallback(now) {
+            return Ok(s);
+        }
         if !rec.active {
             return Err(AuthFailure::Revoked);
         }
@@ -480,6 +634,7 @@ impl KeyStore {
             credit_usd: new.credit_usd.clone(),
             oracle_budget_usd: new.oracle_budget_usd.clone(),
             oracle_allowed: new.oracle_allowed.unwrap_or(false),
+            router: None,
         };
         record.validate()?;
         let rec = record.clone();
@@ -494,12 +649,18 @@ impl KeyStore {
         Ok(CreatedKey { raw, record })
     }
 
-    /// Revoke every active key of an account; returns how many were revoked.
+    /// Revoke every active key of an account (its own account or, for an
+    /// imported router key, its static key's); returns how many were revoked.
+    /// A revoked router key loses its origin: no static fallback, and a later
+    /// import never re-activates it.
     pub fn revoke_account(&self, account: &str) -> Result<usize> {
         self.modify(|keys| {
             let mut n = 0;
-            for k in keys.iter_mut().filter(|k| k.account == account && k.active) {
-                k.active = false;
+            for k in keys
+                .iter_mut()
+                .filter(|k| k.has_account(account) && k.revocable())
+            {
+                k.revoke();
                 n += 1;
             }
             Ok(n)
@@ -529,8 +690,8 @@ impl KeyStore {
             }
             let mut n = 0;
             for i in hits {
-                if keys[i].active {
-                    keys[i].active = false;
+                if keys[i].revocable() {
+                    keys[i].revoke();
                     n += 1;
                 }
             }
@@ -543,11 +704,24 @@ impl KeyStore {
     ///
     /// * a hash not stored yet is added with the export's account, plan,
     ///   label, limits, expiry and `active` (inactive and expired keys are
-    ///   kept and refused at authentication, as the router refuses them);
-    /// * a stored active key the export marks inactive is revoked here too
-    ///   (a revocation in the router reaches this server on the next import);
+    ///   kept and refused at authentication, as the router refuses them) and
+    ///   its origin ([`RouterOrigin`]);
+    /// * a key in both the router's database and its configuration follows
+    ///   the router's precedence whatever the import order: the database row
+    ///   is laid over the configuration key (the record takes the row, the
+    ///   static key is kept as its [`KeyRecord::static_fallback`] for when the
+    ///   row is inactive or expired) — `layered`;
+    /// * a stored active key the export's database marks inactive is revoked
+    ///   here too (a revocation in the router reaches this server on the next
+    ///   import; a static key of the configuration still answers, as in the
+    ///   router);
     /// * a stored key with the same router attributes is unchanged; one with
-    ///   other attributes is kept as it is (this server's record wins).
+    ///   other attributes is kept as it is (this server's record wins), and so
+    ///   is a key created here or revoked here;
+    /// * `oracle_allowed`: new keys take [`RouterKeys::oracle_allowed`]
+    ///   ([`ROUTER_ORACLE_ALLOWED`] unless set); when it was set explicitly
+    ///   ([`RouterKeys::with_oracle_allowed`]) the stored keys of this export
+    ///   that came from the router take it too (`oracle_updated`).
     ///
     /// `keys.json` is written only when something changed: importing the same
     /// export again leaves the file byte for byte (and its mtime) as it was.
@@ -559,36 +733,96 @@ impl KeyStore {
                 ignored_empty: keys.ignored_empty,
                 duplicates: keys.duplicates,
                 emails_not_stored: keys.emails,
+                oracle_allowed: keys.oracle_allowed(),
                 ..ImportReport::default()
             };
+            let from_db = keys.format == ImportFormat::MysqlJson;
             let mut at: HashMap<String, usize> = stored
                 .iter()
                 .enumerate()
                 .map(|(i, k)| (k.hash.clone(), i))
                 .collect();
             for rec in &keys.records {
-                match at.get(&rec.hash).copied() {
-                    None => {
-                        r.imported += 1;
-                        if !rec.active {
-                            r.imported_inactive += 1;
-                        } else if rec.is_expired(now) {
-                            r.imported_expired += 1;
-                        }
-                        r.accounts.insert(rec.account.clone());
-                        at.insert(rec.hash.clone(), stored.len());
-                        stored.push(rec.clone());
-                        r.written = true;
+                let Some(i) = at.get(&rec.hash).copied() else {
+                    r.imported += 1;
+                    if !rec.active {
+                        r.imported_inactive += 1;
+                    } else if rec.is_expired(now) {
+                        r.imported_expired += 1;
                     }
-                    Some(i) if stored[i].active && !rec.active => {
-                        stored[i].active = false;
+                    r.accounts.insert(rec.account.clone());
+                    at.insert(rec.hash.clone(), stored.len());
+                    stored.push(rec.clone());
+                    r.written = true;
+                    continue;
+                };
+                let s = &mut stored[i];
+                let Some(origin) = s.router.clone() else {
+                    // This server's record (created or revoked here).
+                    if from_db && s.active && !rec.active {
+                        s.active = false;
                         r.revoked += 1;
                         r.written = true;
+                    } else if same_router_fields(s, rec) {
+                        r.unchanged += 1;
+                    } else {
+                        r.kept += 1;
                     }
-                    Some(i) if same_router_fields(&stored[i], rec) => r.unchanged += 1,
-                    Some(_) => r.kept += 1,
+                    continue;
+                };
+                let incoming_static = rec
+                    .router
+                    .as_ref()
+                    .and_then(|o| o.config.clone())
+                    .unwrap_or_else(|| StaticKey {
+                        account: rec.account.clone(),
+                        rate_per_min: rec.rate_per_min,
+                        decision_quota: rec.decision_quota,
+                    });
+                if from_db && !origin.db {
+                    // A configuration key: the database row goes over it.
+                    let mut row = rec.clone();
+                    row.oracle_allowed = s.oracle_allowed;
+                    row.router = Some(RouterOrigin {
+                        db: true,
+                        config: origin.config,
+                    });
+                    *s = row;
+                    r.layered += 1;
+                    r.written = true;
+                } else if !from_db && origin.config.is_none() {
+                    // A database row that is also a configuration key.
+                    s.router = Some(RouterOrigin {
+                        db: true,
+                        config: Some(incoming_static),
+                    });
+                    r.layered += 1;
+                    r.written = true;
+                } else if from_db && s.active && !rec.active {
+                    s.active = false;
+                    r.revoked += 1;
+                    r.written = true;
+                } else if (from_db && same_router_fields(s, rec))
+                    || (!from_db && origin.config.as_ref() == Some(&incoming_static))
+                {
+                    r.unchanged += 1;
+                } else {
+                    r.kept += 1;
+                }
+                if let Some(v) = keys.oracle_explicit
+                    && s.oracle_allowed != v
+                {
+                    s.oracle_allowed = v;
+                    r.oracle_updated += 1;
+                    r.written = true;
                 }
             }
+            r.static_fallback = keys
+                .records
+                .iter()
+                .filter_map(|k| at.get(&k.hash))
+                .filter(|&&i| stored[i].static_fallback(now).is_some())
+                .count();
             let changed = r.written;
             Ok((r, changed))
         })
@@ -701,6 +935,27 @@ pub struct RouterKeys {
     pub duplicates: usize,
     /// MySQL rows with an email: not stored (keys.json holds no email).
     pub emails: usize,
+    /// `oracle_allowed` given explicitly for this import (`keys import
+    /// --oracle-allowed`); `None` = [`ROUTER_ORACLE_ALLOWED`] for new keys,
+    /// stored keys unchanged.
+    pub oracle_explicit: Option<bool>,
+}
+
+impl RouterKeys {
+    /// Set `oracle_allowed` of every key of the export explicitly: new keys
+    /// take it, and so do the stored keys that came from the router.
+    pub fn with_oracle_allowed(mut self, allowed: bool) -> Self {
+        self.oracle_explicit = Some(allowed);
+        for r in &mut self.records {
+            r.oracle_allowed = allowed;
+        }
+        self
+    }
+
+    /// `oracle_allowed` of the new keys of this import.
+    pub fn oracle_allowed(&self) -> bool {
+        self.oracle_explicit.unwrap_or(ROUTER_ORACLE_ALLOWED)
+    }
 }
 
 /// What an import of keys did (no key and no hash in it).
@@ -721,6 +976,17 @@ pub struct ImportReport {
     pub ignored_empty: usize,
     pub duplicates: usize,
     pub emails_not_stored: usize,
+    /// Keys in both the router's database and its configuration, joined by
+    /// this import (the row laid over the static key, as in the router).
+    pub layered: usize,
+    /// Keys of the export that answer as their static key now (database row
+    /// inactive or expired, also a key of the configuration).
+    pub static_fallback: usize,
+    /// `oracle_allowed` of the new keys.
+    pub oracle_allowed: bool,
+    /// Stored router keys whose `oracle_allowed` an explicit
+    /// `--oracle-allowed` changed.
+    pub oracle_updated: usize,
     /// Accounts of the new keys.
     pub accounts: BTreeSet<String>,
     /// Whether keys.json was written.
@@ -747,6 +1013,10 @@ impl ImportReport {
             "ignored_empty": self.ignored_empty,
             "duplicates": self.duplicates,
             "emails_not_stored": self.emails_not_stored,
+            "layered": self.layered,
+            "static_fallback": self.static_fallback,
+            "oracle_allowed": self.oracle_allowed,
+            "oracle_updated": self.oracle_updated,
             "accounts": self.accounts,
             "written": self.written,
         })
@@ -793,6 +1063,7 @@ fn mysql_keys(bytes: &[u8]) -> Result<RouterKeys> {
         ignored_empty: 0,
         duplicates: 0,
         emails: 0,
+        oracle_explicit: None,
     };
     let mut first: HashMap<String, usize> = HashMap::new();
     for (i, row) in rows.iter().enumerate() {
@@ -842,7 +1113,11 @@ fn mysql_key_record(row: &Map<String, Value>) -> Result<(KeyRecord, bool)> {
         token_quota: 0,
         credit_usd: None,
         oracle_budget_usd: None,
-        oracle_allowed: false,
+        oracle_allowed: ROUTER_ORACLE_ALLOWED,
+        router: Some(RouterOrigin {
+            db: true,
+            config: None,
+        }),
     };
     rec.validate()?;
     Ok((rec, email))
@@ -871,6 +1146,7 @@ fn toml_keys(bytes: &[u8], now: u64) -> Result<RouterKeys> {
         ignored_empty: 0,
         duplicates: 0,
         emails: 0,
+        oracle_explicit: None,
     };
     let mut at: HashMap<String, usize> = HashMap::new();
     for (i, e) in entries.iter().enumerate() {
@@ -887,21 +1163,30 @@ fn toml_keys(bytes: &[u8], now: u64) -> Result<RouterKeys> {
                 Some(_) => bail!("account must be a string"),
             };
             let rate = toml_uint(e, "rate_per_min")?;
+            let static_key = StaticKey {
+                account,
+                rate_per_min: u32::try_from(rate)
+                    .map_err(|_| anyhow::anyhow!("rate_per_min is larger than the router's u32"))?,
+                decision_quota: toml_uint(e, "decision_quota")?,
+            };
             let rec = KeyRecord {
                 hash,
-                account,
+                account: static_key.account.clone(),
                 plan: ROUTER_STATIC_PLAN.to_string(),
                 label: String::new(),
                 created: now,
                 expires: None,
                 active: true,
-                rate_per_min: u32::try_from(rate)
-                    .map_err(|_| anyhow::anyhow!("rate_per_min is larger than the router's u32"))?,
-                decision_quota: toml_uint(e, "decision_quota")?,
+                rate_per_min: static_key.rate_per_min,
+                decision_quota: static_key.decision_quota,
                 token_quota: 0,
                 credit_usd: None,
                 oracle_budget_usd: None,
-                oracle_allowed: false,
+                oracle_allowed: ROUTER_ORACLE_ALLOWED,
+                router: Some(RouterOrigin {
+                    db: false,
+                    config: Some(static_key),
+                }),
             };
             rec.validate()?;
             Ok(Some(rec))
@@ -1399,7 +1684,13 @@ mod tests {
             [false, false, false]
         );
         assert!(r[5].is_expired(1000) && !r[5].is_expired(999));
-        assert!(r.iter().all(|k| !k.oracle_allowed && k.token_quota == 0));
+        // The router escalated for every key: imported keys may use the oracle.
+        assert!(r.iter().all(|k| k.oracle_allowed && k.token_quota == 0));
+        assert!(r.iter().all(|k| k.router
+            == Some(RouterOrigin {
+                db: true,
+                config: None
+            })));
         assert_eq!(k.emails, 1, "one non-empty email, never stored");
         assert!(
             !serde_json::to_string(&k.records)
@@ -1432,8 +1723,20 @@ mod tests {
             ),
             (json!([{"key_hash": h}]).to_string(), "account is missing"),
             (
-                json!([{"key_hash": h, "account": "a b"}]).to_string(),
-                "account 'a b'",
+                json!([{"key_hash": h, "account": ""}]).to_string(),
+                "must be 1..128 characters",
+            ),
+            (
+                json!([{"key_hash": h, "account": "я".repeat(129)}]).to_string(),
+                "must be 1..128 characters (it has 129)",
+            ),
+            (
+                json!([{"key_hash": h, "account": "a", "plan": "p".repeat(65)}]).to_string(),
+                "plan must be at most 64 characters",
+            ),
+            (
+                json!([{"key_hash": h, "account": "a", "label": "ж".repeat(256)}]).to_string(),
+                "label must be at most 255 characters",
             ),
             (
                 json!([{"key_hash": h, "account": "a", "key": RAW_A}]).to_string(),
@@ -1558,7 +1861,10 @@ require = true
                 "decision_quota",
             ),
             (
-                format!("[[api_keys]]\nkey = \"{RAW_A}\"\naccount = \"a b\"\n"),
+                format!(
+                    "[[api_keys]]\nkey = \"{RAW_A}\"\naccount = \"{}\"\n",
+                    "x".repeat(129)
+                ),
                 "account",
             ),
             (format!("[[api_keys]]\nkey = {RAW_A}\n"), "TOML line 2"),
@@ -1720,5 +2026,224 @@ require = true
             let e = format!("{:#}", read_router_usage(text.as_bytes()).unwrap_err());
             assert!(e.contains(want), "{text}: {e}");
         }
+    }
+
+    // ------------------------------------------------- F1: migration-critical fixes
+
+    /// Accounts, plans and labels as the router's columns hold them (any
+    /// Unicode text up to VARCHAR(128)/(64)/(255) characters) import, survive
+    /// keys.json and authenticate; log/CLI output escapes control characters.
+    #[test]
+    fn router_accounts_plans_and_labels_import_as_the_router_holds_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keys.json");
+        let store = KeyStore::open(&path, "cortiq_").unwrap();
+        let long_account = "Ш".repeat(MAX_ACCOUNT_CHARS);
+        let export = json!([
+            row(
+                RAW_A,
+                json!({"account": "client+tag@example.com", "plan": "enterprise"})
+            ),
+            row(
+                RAW_B,
+                json!({"account": "Иван Петров", "plan": "п".repeat(64),
+                              "label": "метка ".repeat(42) + "abc"})
+            ),
+            row("tabbed", json!({"account": "tab\there\nline"})),
+            row("long", json!({"account": long_account})),
+        ])
+        .to_string();
+        let k = mysql(&export);
+        assert_eq!(k.records[1].label.chars().count(), 255);
+        assert!(
+            k.records[1].label.len() > 256,
+            "more bytes than the old limit"
+        );
+        let r = store.import_router_keys(&k, 50).unwrap();
+        assert_eq!((r.imported, r.imported_active()), (4, 4));
+        // Re-read from disk (canonical JSON parser) and authenticate.
+        let again = KeyStore::open(&path, "cortiq_").unwrap();
+        assert_eq!(
+            again.authenticate(RAW_A, 60).unwrap().account,
+            "client+tag@example.com"
+        );
+        assert_eq!(
+            again.authenticate(RAW_B, 60).unwrap().account,
+            "Иван Петров"
+        );
+        assert_eq!(
+            again.authenticate("tabbed", 60).unwrap().account,
+            "tab\there\nline"
+        );
+        assert_eq!(
+            again.authenticate("long", 60).unwrap().account,
+            long_account
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("Иван Петров") && text.contains("tab\\there\\nline"));
+        assert_eq!(shown("tab\there\nline\u{7}"), "tab\\there\\nline\\u{7}");
+        assert_eq!(shown("Иван client+tag@x"), "Иван client+tag@x");
+        // Revocation by such an account works too.
+        assert_eq!(again.revoke_account("Иван Петров").unwrap(), 1);
+        assert_eq!(again.authenticate(RAW_B, 60), Err(AuthFailure::Revoked));
+        // The router's usage counters of such accounts import too.
+        let u = read_router_usage(
+            json!([{"account": "client+tag@example.com", "decisions": 3}])
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(u[0].account, "client+tag@example.com");
+    }
+
+    fn toml_of(entries: &[(&str, &str, u32)]) -> RouterKeys {
+        let mut t = String::from("bind = \"0.0.0.0:8080\"\n");
+        for (key, account, rate) in entries {
+            t += &format!(
+                "[[api_keys]]\nkey = \"{key}\"\naccount = \"{account}\"\nrate_per_min = {rate}\n"
+            );
+        }
+        read_router_keys(t.as_bytes(), ImportFormat::RouterToml, 40).unwrap()
+    }
+
+    /// A key both in the router's database and in its configuration follows
+    /// the router's precedence (database over static configuration) in either
+    /// import order: the same keys.json, the row while it is active and
+    /// unexpired, the static key otherwise.
+    #[test]
+    fn a_key_in_the_database_and_the_configuration_follows_the_router_in_any_order() {
+        let db = |active: u8, expires: Option<u64>| {
+            mysql(
+                &json!([
+                    row(
+                        RAW_A,
+                        json!({"account": "db-acct", "plan": "pro", "active": active,
+                                      "rate_per_min": 5, "expires_at": expires,
+                                      "created_at": 1_700_000_000u64})
+                    ),
+                    row(RAW_B, json!({"account": "db-only", "plan": "pro"})),
+                ])
+                .to_string(),
+            )
+        };
+        let cfg = || toml_of(&[(RAW_A, "cfg-acct", 7), ("static-only", "cfg-only", 0)]);
+        let records = |store: &KeyStore| {
+            let mut v = store.records();
+            v.sort_by(|a, b| a.hash.cmp(&b.hash));
+            v
+        };
+        for (active, expires) in [(1u8, None), (0, None), (1, Some(30u64))] {
+            let d1 = tempfile::tempdir().unwrap();
+            let s1 = KeyStore::open(d1.path().join("keys.json"), "cortiq_").unwrap();
+            let a = s1.import_router_keys(&db(active, expires), 50).unwrap();
+            let b = s1.import_router_keys(&cfg(), 50).unwrap();
+            assert_eq!((a.imported, b.imported, b.layered), (2, 1, 1));
+            let d2 = tempfile::tempdir().unwrap();
+            let s2 = KeyStore::open(d2.path().join("keys.json"), "cortiq_").unwrap();
+            let c = s2.import_router_keys(&cfg(), 50).unwrap();
+            let d = s2.import_router_keys(&db(active, expires), 50).unwrap();
+            assert_eq!((c.imported, d.imported, d.layered), (2, 1, 1));
+            // The same records whatever the order.
+            assert_eq!(
+                records(&s1),
+                records(&s2),
+                "active {active} expires {expires:?}"
+            );
+            let fallback = active == 0 || expires.is_some();
+            assert_eq!(d.static_fallback, usize::from(fallback));
+            for s in [&s1, &s2] {
+                let k = s.authenticate(RAW_A, 60).unwrap();
+                if fallback {
+                    // The router drops an inactive or expired row: its
+                    // configuration key answers.
+                    assert_eq!(
+                        (
+                            k.account.as_str(),
+                            k.plan.as_str(),
+                            k.rate_per_min,
+                            k.expires
+                        ),
+                        ("cfg-acct", ROUTER_STATIC_PLAN, 7, None)
+                    );
+                } else {
+                    assert_eq!(
+                        (k.account.as_str(), k.plan.as_str(), k.rate_per_min),
+                        ("db-acct", "pro", 5)
+                    );
+                }
+                assert_eq!(s.authenticate(RAW_B, 60).unwrap().account, "db-only");
+                assert_eq!(
+                    s.authenticate("static-only", 60).unwrap().account,
+                    "cfg-only"
+                );
+                // Importing both again changes nothing.
+                let x = s.import_router_keys(&db(active, expires), 70).unwrap();
+                let y = s.import_router_keys(&cfg(), 70).unwrap();
+                assert_eq!(
+                    (x.written, y.written, x.unchanged, y.unchanged),
+                    (false, false, 2, 2)
+                );
+            }
+            // The router later deactivates the row: the static key answers.
+            if !fallback {
+                let r = s1.import_router_keys(&db(0, None), 80).unwrap();
+                assert_eq!((r.revoked, r.static_fallback), (1, 1));
+                assert_eq!(s1.authenticate(RAW_A, 80).unwrap().account, "cfg-acct");
+            }
+            // Revoked here (by either account): gone for good, and a later
+            // import keeps it revoked.
+            assert_eq!(s2.revoke_account("cfg-acct").unwrap(), 1);
+            assert_eq!(s2.authenticate(RAW_A, 90), Err(AuthFailure::Revoked));
+            s2.import_router_keys(&cfg(), 90).unwrap();
+            s2.import_router_keys(&db(1, None), 90).unwrap();
+            assert_eq!(s2.authenticate(RAW_A, 90), Err(AuthFailure::Revoked));
+        }
+    }
+
+    /// Imported keys escalate to the oracle as in the router unless the
+    /// import opts out; an explicit value also reaches keys imported before,
+    /// an import without it leaves them as they are.
+    #[test]
+    fn imported_keys_may_use_the_oracle_unless_the_import_opts_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = KeyStore::open(dir.path().join("keys.json"), "cortiq_").unwrap();
+        let created = store
+            .create(
+                &NewKey {
+                    account: Some("local".into()),
+                    ..NewKey::default()
+                },
+                &crate::config::default_plans(),
+                10,
+            )
+            .unwrap();
+        assert!(
+            !created.record.oracle_allowed,
+            "a key created here is opt-in"
+        );
+        let export = || mysql(&json!([row(RAW_A, json!({})), row(RAW_B, json!({}))]).to_string());
+        let r = store
+            .import_router_keys(&export().with_oracle_allowed(false), 20)
+            .unwrap();
+        assert!(!r.oracle_allowed);
+        assert!(!store.authenticate(RAW_A, 20).unwrap().oracle_allowed);
+        // No flag: stored keys unchanged (a periodic re-import does not flip them).
+        let r = store.import_router_keys(&export(), 30).unwrap();
+        assert_eq!((r.oracle_updated, r.written), (0, false));
+        assert!(!store.authenticate(RAW_B, 30).unwrap().oracle_allowed);
+        // Explicitly allowed: every router key of the export, not the local one.
+        let r = store
+            .import_router_keys(&export().with_oracle_allowed(true), 40)
+            .unwrap();
+        assert_eq!((r.oracle_updated, r.written, r.unchanged), (2, true, 2));
+        assert!(store.authenticate(RAW_A, 40).unwrap().oracle_allowed);
+        assert!(!store.authenticate(&created.raw, 40).unwrap().oracle_allowed);
+        // A new key of a plain import may use the oracle (router default).
+        let d2 = tempfile::tempdir().unwrap();
+        let s2 = KeyStore::open(d2.path().join("keys.json"), "cortiq_").unwrap();
+        let r = s2
+            .import_router_keys(&toml_of(&[(RAW_A, "a", 0)]), 1)
+            .unwrap();
+        assert!(r.oracle_allowed && s2.authenticate(RAW_A, 1).unwrap().oracle_allowed);
     }
 }

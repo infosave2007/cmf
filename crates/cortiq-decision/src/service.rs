@@ -1589,7 +1589,9 @@ impl DecisionService {
         Ok(created.to_json(now))
     }
 
-    /// `GET /v1/admin/keys`: hash12, limits and usage of every key.
+    /// `GET /v1/admin/keys`: hash12, limits and usage of every key, as it is
+    /// now (an imported router key may answer as its static configuration key,
+    /// [`KeyRecord::effective`]).
     pub fn admin_list_keys(&self) -> Result<Value, ApiError> {
         let now = now_unix();
         let keys: Vec<Value> = self
@@ -1597,6 +1599,7 @@ impl DecisionService {
             .records()
             .iter()
             .map(|k| {
+                let k = k.effective(now);
                 let mut v = k.listing(now);
                 v["usage"] = self.totals(&k.account).to_json();
                 v

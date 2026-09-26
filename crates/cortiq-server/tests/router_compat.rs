@@ -624,9 +624,10 @@ impl Resp {
         let id = self.body["request_id"].as_str().unwrap();
         assert!(id.starts_with("req_"), "{id}");
         assert_eq!(Some(id), self.header("x-request-id"));
+        // The router's rule (api.rs:221-225): only 429 and 500 are retriable.
         assert_eq!(
             self.body["error"]["retriable"],
-            json!(matches!(self.status, 429 | 500 | 502))
+            json!(matches!(self.status, 429 | 500))
         );
         (
             self.status,
@@ -1156,6 +1157,82 @@ async fn route_rejected_bodies_are_axum_texts() {
     }
 }
 
+/// The router's axum 0.7.9 `Json::from_bytes` reads the first JSON value and
+/// ignores what follows (axum 0.8 refuses it): the same bodies are answered
+/// here, and an error inside the first value is still axum's text.
+#[tokio::test]
+async fn router_bodies_ignore_bytes_after_the_json_value_like_axum_0_7() {
+    let srv = Srv::open(cfg());
+    let route = serde_json::to_vec(&route_body(accepted())).unwrap();
+    for tail in [&b" xyz"[..], b"}", b"\n{\"input\": 5}", b"garbage\x00\xff"] {
+        let body = [route.as_slice(), tail].concat();
+        let r = srv
+            .post_raw("/v1/route", None, Some("application/json"), &body)
+            .await;
+        assert_eq!(
+            r.status,
+            200,
+            "{:?}: {}",
+            String::from_utf8_lossy(tail),
+            r.text
+        );
+        conforms(&r.body, &route_shape());
+        let batch = [
+            serde_json::to_vec(&json!({"inputs": [{"text": accepted()}]})).unwrap(),
+            tail.to_vec(),
+        ]
+        .concat();
+        let r = srv
+            .post_raw("/v1/route:batch", None, Some("application/json"), &batch)
+            .await;
+        assert_eq!(r.status, 200, "{}", r.text);
+    }
+    // The feedback body too (the request is consumed, as without the tail).
+    let r = srv.post("/v1/route", None, &route_body(accepted())).await;
+    let rid = r.body["request_id"].as_str().unwrap();
+    let fb = [
+        serde_json::to_vec(&json!({"request_id": rid, "correct_task_label": "cards"})).unwrap(),
+        b" trailing".to_vec(),
+    ]
+    .concat();
+    let r = srv
+        .post_raw("/v1/feedback", None, Some("application/json"), &fb)
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    // An error inside the first value stays axum's (same text, same position).
+    let r = srv
+        .post_raw(
+            "/v1/route",
+            None,
+            Some("application/json"),
+            b"{\"input\": 5} trailing",
+        )
+        .await;
+    assert_eq!(
+        r.plain(),
+        (
+            422,
+            "Failed to deserialize the JSON body into the target type: input: invalid type: integer `5`, expected struct Input at line 1 column 11"
+        )
+    );
+    let r = srv
+        .post_raw(
+            "/v1/route",
+            None,
+            Some("application/json"),
+            b"{\"input\": } x",
+        )
+        .await;
+    assert_eq!(r.plain().0, 400, "{}", r.text);
+    assert!(
+        r.text.starts_with(
+            "Failed to parse the request body as JSON: input: expected value at line 1 column 11"
+        ),
+        "{}",
+        r.text
+    );
+}
+
 #[tokio::test]
 async fn route_body_over_the_limit_is_413_text() {
     let mut c = cfg();
@@ -1239,6 +1316,11 @@ async fn rate_limit_is_429_and_quota_402_in_the_router_envelope() {
         .await;
     assert_eq!(r.router_error(), (429, "RATE_LIMITED".into()));
     assert_eq!(r.body["error"]["retriable"], true);
+    // The router's texts (api.rs:254-267), whatever this server's own message.
+    assert_eq!(
+        r.body["error"]["message"],
+        "per-account rate limit exceeded"
+    );
     let small = srv
         .key(json!({"account": "small", "decision_quota": 1}))
         .await;
@@ -1253,6 +1335,32 @@ async fn rate_limit_is_429_and_quota_402_in_the_router_envelope() {
         .await;
     assert_eq!(r.router_error(), (402, "QUOTA_EXCEEDED".into()));
     assert_eq!(r.body["error"]["retriable"], false);
+    assert_eq!(
+        r.body["error"]["message"],
+        "account decision quota exhausted"
+    );
+    // With the extensions the metadata keeps this server's own message.
+    let r = srv
+        .call(
+            "POST",
+            "/v1/route",
+            &[
+                ("content-type", "application/json"),
+                ("authorization", &format!("Bearer {small}")),
+                ("x-cmf-extensions", "1"),
+            ],
+            Some(serde_json::to_vec(&client_body(accepted())).unwrap()),
+        )
+        .await;
+    assert_eq!(
+        r.body["error"]["message"],
+        "account decision quota exhausted"
+    );
+    assert_eq!(
+        r.body["error"]["metadata"]["message"],
+        "decision quota exhausted"
+    );
+    assert_eq!(r.body["error"]["metadata"]["retriable"], false);
     // The quota gate covers every keyed endpoint (router middleware).
     let r = srv.get("/v1/usage", Some(&small)).await;
     assert_eq!(r.router_error(), (402, "QUOTA_EXCEEDED".into()));
@@ -1274,6 +1382,10 @@ async fn imported_router_keys_answer_on_both_apis() {
     let state = StateDir::open(dir.path().join("state")).unwrap();
     let raw = |n: u8| format!("cortiq_{}", format!("{n:x}").repeat(40));
     let (live, off, old, slow, spent, cfgkey) = (raw(1), raw(2), raw(3), raw(4), raw(5), raw(6));
+    // In both the database (inactive) and the configuration: the router
+    // serves its static key (database over configuration, inactive rows
+    // not loaded).
+    let both = raw(7);
     let export = json!([
         {"key_hash": keys::hash_key(&live), "account": "acct_live", "plan": "pro", "active": 1,
          "rate_per_min": 0, "decision_quota": 0},
@@ -1281,9 +1393,13 @@ async fn imported_router_keys_answer_on_both_apis() {
         {"key_hash": keys::hash_key(&old), "account": "acct_old", "expires_at": 1_000},
         {"key_hash": keys::hash_key(&slow), "account": "acct_slow", "rate_per_min": "1"},
         {"key_hash": keys::hash_key(&spent), "account": "acct_spent", "decision_quota": 3},
+        {"key_hash": keys::hash_key(&both), "account": "client+tag@example.com", "active": 0},
     ])
     .to_string();
-    let config = format!("[[api_keys]]\nkey = \"{cfgkey}\"\naccount = \"acct_cfg\"\n");
+    let config = format!(
+        "[[api_keys]]\nkey = \"{cfgkey}\"\naccount = \"acct_cfg\"\n\
+         [[api_keys]]\nkey = \"{both}\"\naccount = \"Статический\"\n"
+    );
     let store = KeyStore::open(state.keys_path(), "cortiq_").unwrap();
     let now = now_unix();
     for (bytes, format) in [
@@ -1295,6 +1411,8 @@ async fn imported_router_keys_answer_on_both_apis() {
         let again = store.import_router_keys(&k, now).unwrap();
         assert_eq!((again.imported, again.written), (0, false));
     }
+    // Imported keys may escalate to the oracle, as every router key could.
+    assert!(store.records().iter().all(|k| k.oracle_allowed));
     let on_disk = std::fs::read_to_string(state.keys_path()).unwrap();
     for k in [&live, &off, &old, &slow, &spent, &cfgkey] {
         assert!(!on_disk.contains(k.as_str()) && on_disk.contains(&keys::hash_key(k)));
@@ -1320,7 +1438,7 @@ async fn imported_router_keys_answer_on_both_apis() {
     let jev = json!({"model": "cortiq/decision", "state": accepted(),
                      "questions": {"task": {"type": "choice", "instructions": "Which topic?",
                                             "criteria": crit}}});
-    for key in [&live, &cfgkey] {
+    for key in [&live, &cfgkey, &both] {
         for _ in 0..3 {
             let r = srv
                 .post("/v1/route", Some(key), &client_body(accepted()))
@@ -1343,13 +1461,18 @@ async fn imported_router_keys_answer_on_both_apis() {
         "{}",
         r.text
     );
-    for key in [&off, &old] {
+    let r = srv.get("/v1/usage", Some(&both)).await;
+    assert_eq!(r.body["account"]["id"], "Статический", "{}", r.text);
+    for (key, ours) in [(&off, "API key revoked"), (&old, "API key expired")] {
         let r = srv
             .post("/v1/route", Some(key), &client_body(accepted()))
             .await;
         assert_eq!(r.router_error(), (401, "UNAUTHORIZED".into()));
+        // The router does not tell an expired or revoked key from an unknown one.
+        assert_eq!(r.body["error"]["message"], "invalid API key");
         let r = srv.post("/api/alpha/decisions", Some(key), &jev).await;
         assert_eq!(r.status, 401, "{}", r.text);
+        assert_eq!(r.body["error"]["message"], ours);
     }
     wait_for_fresh_minute().await;
     let r = srv
@@ -1362,6 +1485,69 @@ async fn imported_router_keys_answer_on_both_apis() {
         .post("/v1/route", Some(&spent), &client_body(accepted()))
         .await;
     assert_eq!(r.router_error(), (402, "QUOTA_EXCEEDED".into()));
+    assert_eq!(
+        r.body["error"]["message"],
+        "account decision quota exhausted"
+    );
+}
+
+/// F1 item 1: an imported router key escalates to the oracle as it did in
+/// the router (`allow_oracle` defaults to true there), unless the import
+/// opted out; the server's own oracle switch still decides first.
+#[tokio::test]
+async fn imported_router_keys_escalate_like_the_router_unless_opted_out() {
+    use cortiq_decision::keys::{self, ImportFormat, KeyStore};
+    use cortiq_decision::statedir::StateDir;
+    let raw = |n: u8| format!("cortiq_{}", format!("{n:x}").repeat(40));
+    let (allowed, opted_out) = (raw(10), raw(11));
+    let import = |dir: &tempfile::TempDir| {
+        let state = StateDir::open(dir.path().join("state")).unwrap();
+        let store = KeyStore::open(state.keys_path(), "cortiq_").unwrap();
+        let now = now_unix();
+        let a = format!("[[api_keys]]\nkey = \"{allowed}\"\naccount = \"router-client\"\n");
+        let k = keys::read_router_keys(a.as_bytes(), ImportFormat::RouterToml, now).unwrap();
+        assert!(store.import_router_keys(&k, now).unwrap().oracle_allowed);
+        let b =
+            json!([{"key_hash": keys::hash_key(&opted_out), "account": "no-oracle"}]).to_string();
+        let k = keys::read_router_keys(b.as_bytes(), ImportFormat::MysqlJson, now)
+            .unwrap()
+            .with_oracle_allowed(false);
+        assert!(!store.import_router_keys(&k, now).unwrap().oracle_allowed);
+    };
+    let mock = MockOracle::answering("travel");
+    let dir = tempfile::tempdir().unwrap();
+    import(&dir);
+    let srv = Srv::open_in(oracle_config(&mock.url()), oracle_key(), Some(ADMIN), dir);
+    // Opted out: the gate-rejected input stays the local, unconfident answer.
+    let r = srv
+        .post("/v1/route", Some(&opted_out), &route_body(rejected()))
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(
+        (
+            &r.body["decision"]["source"],
+            &r.body["decision"]["confident"]
+        ),
+        (&json!("router"), &json!(false))
+    );
+    assert_eq!(mock.hits(), 0);
+    // Imported with the router's default: the oracle answers.
+    let r = srv
+        .post("/v1/route", Some(&allowed), &route_body(rejected()))
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["decision"]["source"], "oracle", "{}", r.text);
+    assert_eq!(mock.hits(), 1);
+    drop(srv);
+    // The server's oracle switch off: no call, whatever the key allows.
+    let dir = tempfile::tempdir().unwrap();
+    import(&dir);
+    let off = Srv::open_in(cfg(), oracle_key(), Some(ADMIN), dir);
+    let r = off
+        .post("/v1/route", Some(&allowed), &route_body(rejected()))
+        .await;
+    assert_eq!(r.body["decision"]["source"], "router", "{}", r.text);
+    assert_eq!(mock.hits(), 1);
 }
 
 // ------------------------------------------------------------------ batch
@@ -1469,6 +1655,46 @@ async fn feedback_has_the_router_shape_and_codes() {
         .await;
     assert_eq!(fb.status, 200, "{}", fb.text);
     conforms(&fb.body, &feedback_shape());
+    // An empty or over-long label: 200 and consumed, as in the router (no
+    // length check, api.rs:1261-1299); nothing is learned from it.
+    for label in [String::new(), "l".repeat(257)] {
+        let r = srv.post("/v1/route", None, &route_body(accepted())).await;
+        let rid = r.body["request_id"].as_str().unwrap().to_string();
+        let fb = srv
+            .call(
+                "POST",
+                "/v1/feedback",
+                &[
+                    ("content-type", "application/json"),
+                    ("x-cmf-extensions", "1"),
+                ],
+                Some(
+                    serde_json::to_vec(&json!({"request_id": rid, "correct_task_label": label}))
+                        .unwrap(),
+                ),
+            )
+            .await;
+        assert_eq!(fb.status, 200, "{}", fb.text);
+        assert_eq!(fb.body["accepted"], true);
+        assert_eq!(
+            fb.body["message"],
+            format!("feedback recorded for '{label}'")
+        );
+        assert_eq!(
+            (&fb.body["cmf"]["accepted"], &fb.body["cmf"]["learned"]),
+            (&json!(false), &json!(false)),
+            "{}",
+            fb.text
+        );
+        let again = srv
+            .post(
+                "/v1/feedback",
+                None,
+                &json!({"request_id": rid, "correct_task_label": label}),
+            )
+            .await;
+        assert_eq!(again.router_error(), (404, "INVALID_REQUEST".into()));
+    }
     // The router's required fields.
     let bad = srv
         .post("/v1/feedback", None, &json!({"request_id": "req_1"}))
@@ -1642,6 +1868,10 @@ async fn admin_errors_are_the_routers() {
     let off = Srv::open_with(cfg(), Arc::new(|_: &str| None), None);
     let r = off.admin("GET", "/v1/admin/keys", None).await;
     assert_eq!(r.router_error(), (404, "ADMIN_DISABLED".into()));
+    assert_eq!(
+        r.body["error"]["message"],
+        "admin API is disabled (no auth.admin_token configured)"
+    );
     let srv = Srv::open(cfg());
     for t in [None, Some("wrong")] {
         let mut h = Vec::new();
@@ -1774,16 +2004,48 @@ async fn request_ids_are_router_ids_in_the_header_and_the_body() {
 #[tokio::test]
 async fn admin_create_refuses_unknown_plans_and_bad_accounts_in_the_router_envelope() {
     // Unlike the router (a typo'd plan minted an unlimited key), a plan must be
-    // one of auth.plans and an account [A-Za-z0-9_.@-].
+    // one of auth.plans; an account is any text of the router's VARCHAR(128).
     let srv = Srv::open(cfg());
     let r = srv
         .admin("POST", "/v1/admin/keys", Some(&json!({"plan": "platinum"})))
         .await;
     assert_eq!(r.router_error(), (400, "INVALID_REQUEST".into()));
     let r = srv
-        .admin("POST", "/v1/admin/keys", Some(&json!({"account": "a b"})))
+        .admin(
+            "POST",
+            "/v1/admin/keys",
+            Some(&json!({"account": "x".repeat(129)})),
+        )
         .await;
     assert_eq!(r.router_error(), (400, "INVALID_REQUEST".into()));
+    for account in ["client+tag@example.com", "Иван Петров", "a b"] {
+        let r = srv
+            .admin("POST", "/v1/admin/keys", Some(&json!({"account": account})))
+            .await;
+        assert_eq!(r.status, 200, "{}", r.text);
+        assert_eq!(r.body["account"], account);
+        let key = r.body["key"].as_str().unwrap().to_string();
+        let u = srv.get("/v1/usage", Some(&key)).await;
+        assert_eq!(u.body["account"]["id"], account);
+        let path = format!(
+            "/v1/admin/keys/{}",
+            account
+                .bytes()
+                .map(|b| if b.is_ascii_alphanumeric() {
+                    (b as char).to_string()
+                } else {
+                    format!("%{b:02X}")
+                })
+                .collect::<String>()
+        );
+        let d = srv.admin("DELETE", &path, None).await;
+        assert_eq!(
+            d.body,
+            json!({"account": account, "revoked": 1}),
+            "{}",
+            d.text
+        );
+    }
     // Every router plan name mints (spec §4.10 limits).
     for (plan, rate) in [
         ("starter", 60),

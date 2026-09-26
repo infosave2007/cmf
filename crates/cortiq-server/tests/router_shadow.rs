@@ -1212,7 +1212,8 @@ async fn old_router_errors_pass_through_unchanged() {
     assert_eq!(r.status, 502);
     assert_eq!(r.json["schema_version"], "1.1");
     assert_eq!(r.json["error"]["code"], "UPSTREAM_UNAVAILABLE");
-    assert_eq!(r.json["error"]["retriable"], true);
+    // The router envelope's rule: only 429 and 500 are retriable.
+    assert_eq!(r.json["error"]["retriable"], false);
     assert_eq!(r.json["request_id"].as_str(), r.header("x-request-id"));
     let l = &dead.lines(1).await[0];
     assert_eq!(l["old_status"], Value::Null);
