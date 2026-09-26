@@ -1,0 +1,1643 @@
+//! `cortiq decide`, `cortiq decision …` and `cortiq serve` on a decision file,
+//! end to end through the `cortiq` binary on the toy model (spec decision-v4
+//! §3.1, §4.1, §4.2, §5.10, §5.14, §6.1), hermetic: the oracle is an in-test
+//! mock server, no key of any real service is read or passed.
+//!
+//! The toy file is built by the CLI itself once per test binary: `decision
+//! init` of the toy encoder of `cortiq-decision`, `decision train` of skill
+//! `topics` {Weather, billing, cards, travel} from two training files, and
+//! `decision add-skill` of `shop` {billing, cards, food} — the data of the
+//! library's toy files (same generator, same seeds).
+//!
+//! * build: init/train/add-skill reports, several `--train` files, `--k`,
+//!   carve-out, zero-forgetting of `add-skill`, an existing skill id and an
+//!   existing output refused;
+//! * `decide -p`: exact, subset (`--labels`), `--json`, `--round 2`, the skill
+//!   choice rules and their errors; the answer equals the batch row;
+//! * `decide --input`: one row per text without the text, totals on stderr,
+//!   the build's dev count reproduced, `--out`, `--bench` percentiles;
+//! * `decision info`, `verify` (a corrupted copy fails);
+//! * `run` (one-shot and chat) print the DECISION guard; generic `info` and
+//!   `verify` still work;
+//! * `serve`: the language-model flags are refused; a decision file listens on
+//!   127.0.0.1 by default, answers `/healthz` and decisions, learns through the
+//!   mock oracle (25 answers → generation 1); then `decide --state`,
+//!   `decision verify --state`, `materialize` and `rollback` on its state;
+//! * `decision keys create|list|revoke|import` and a keyed server;
+//! * `decision learn` with the mock oracle: only abstentions are asked, ledger
+//!   answers are reused, the reservation ledger holds no key.
+
+use cortiq_decision::config::Config;
+use cortiq_decision::container::{DecisionModel, Verify};
+use cortiq_decision::eval::Evaluator;
+use cortiq_decision::learn;
+use cortiq_decision::oracle;
+use cortiq_decision::signal::SignalEncoder;
+use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+const EPOCH: u64 = 1_790_000_000;
+const TOPICS: [&str; 4] = ["Weather", "billing", "cards", "travel"];
+const SHOP: [&str; 3] = ["billing", "cards", "food"];
+/// The fake oracle key of the mock (never a real one).
+const TEST_KEY: &str = "sk-or-v1-TESTKEY-cortiq-cli-wp8-0123456789abcdef";
+const KEY_ENV: &str = "CMF_WP8_TEST_ORACLE_KEY";
+const ORACLE_MODEL: &str = "deepseek/deepseek-v4.1-flash";
+const GUARD: &str = "this is a DECISION model; use `cortiq decide` or `cortiq serve`";
+
+// ------------------------------------------------------------------ the binary
+
+fn cortiq() -> Command {
+    let mut c = Command::new(env!("CARGO_BIN_EXE_cortiq"));
+    c.env("CMF_GPU", "0")
+        .env("NO_COLOR", "1")
+        .env("SOURCE_DATE_EPOCH", EPOCH.to_string())
+        .env_remove("RUST_LOG")
+        .env_remove("OPENROUTER_API_KEY")
+        .env_remove("CORTIQ_DECISION_ADMIN_TOKEN")
+        .env_remove(KEY_ENV)
+        .stdin(Stdio::null());
+    c
+}
+
+fn show(o: &Output) -> String {
+    format!(
+        "status {:?}\n--- stdout\n{}\n--- stderr\n{}",
+        o.status.code(),
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    )
+}
+
+fn output(args: &[&str], envs: &[(&str, &str)]) -> Output {
+    let mut c = cortiq();
+    c.args(args);
+    for (k, v) in envs {
+        c.env(k, v);
+    }
+    c.output().expect("run cortiq")
+}
+
+/// Run and require success; returns stdout.
+fn ok(args: &[&str]) -> String {
+    ok_env(args, &[])
+}
+
+fn ok_env(args: &[&str], envs: &[(&str, &str)]) -> String {
+    let o = output(args, envs);
+    assert!(o.status.success(), "cortiq {args:?} failed\n{}", show(&o));
+    String::from_utf8(o.stdout).unwrap()
+}
+
+/// Run and require failure; returns stderr.
+fn fails(args: &[&str]) -> String {
+    let o = output(args, &[]);
+    assert!(
+        !o.status.success(),
+        "cortiq {args:?} succeeded\n{}",
+        show(&o)
+    );
+    String::from_utf8_lossy(&o.stderr).to_string()
+}
+
+fn json_of(stdout: &str) -> Value {
+    serde_json::from_str(stdout.trim()).unwrap_or_else(|e| panic!("not JSON ({e}): {stdout}"))
+}
+
+fn s(p: &Path) -> &str {
+    p.to_str().unwrap()
+}
+
+fn sha256_file(p: &Path) -> String {
+    format!("{:x}", Sha256::digest(std::fs::read(p).unwrap()))
+}
+
+// ------------------------------------------------------------------ toy data
+
+struct Lcg(u64);
+
+impl Lcg {
+    fn next(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.0 >> 33
+    }
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+}
+
+fn pool(label: &str) -> &'static [&'static str] {
+    match label {
+        "Weather" => &[
+            "rain",
+            "snow",
+            "forecast",
+            "sunny",
+            "wind",
+            "storm",
+            "cloudy",
+            "temperature",
+        ],
+        "billing" => &[
+            "invoice",
+            "charge",
+            "refund",
+            "payment",
+            "bill",
+            "fee",
+            "receipt",
+            "statement",
+        ],
+        "cards" => &[
+            "card",
+            "pin",
+            "atm",
+            "contactless",
+            "debit",
+            "credit",
+            "freeze",
+            "replace",
+        ],
+        "travel" => &[
+            "flight", "hotel", "airport", "booking", "passport", "luggage", "visa", "train",
+        ],
+        "food" => &[
+            "pizza", "salad", "bread", "cheese", "soup", "rice", "apple", "coffee",
+        ],
+        // Out of every training pool: the sub-topic the mock oracle teaches.
+        "cruise" => &[
+            "cruise", "ship", "cabin", "deck", "ocean", "port", "voyage", "sail", "yacht",
+            "harbor", "ferry", "captain",
+        ],
+        _ => unreachable!("{label}"),
+    }
+}
+
+const FILLER: [&str; 8] = [
+    "please", "help", "my", "the", "today", "need", "about", "with",
+];
+
+fn synth(labels: &[&str], per_label: usize, seed: u64, tag: &str) -> Vec<(String, String)> {
+    let mut rng = Lcg(seed);
+    let mut out = Vec::new();
+    for i in 0..per_label {
+        for label in labels {
+            let p = pool(label);
+            let mut words = Vec::new();
+            for _ in 0..2 + rng.below(3) {
+                words.push(p[rng.below(p.len())]);
+            }
+            for _ in 0..1 + rng.below(2) {
+                words.push(FILLER[rng.below(FILLER.len())]);
+            }
+            let r = rng.below(words.len());
+            words.swap(0, r);
+            out.push((format!("{} {tag}{i}", words.join(" ")), label.to_string()));
+        }
+    }
+    out
+}
+
+fn jsonl(rows: &[(String, String)]) -> String {
+    rows.iter()
+        .map(|(t, l)| json!({"text": t, "label": l}).to_string() + "\n")
+        .collect()
+}
+
+fn write(dir: &Path, name: &str, body: &str) -> PathBuf {
+    let p = dir.join(name);
+    std::fs::write(&p, body).unwrap();
+    p
+}
+
+fn question(labels: &[&str]) -> String {
+    let mut crit = Map::new();
+    for l in labels {
+        crit.insert(l.to_string(), json!(format!("The message is about {l}.")));
+    }
+    json!({"instructions": "Which topic is the message about?", "criteria": crit}).to_string()
+}
+
+/// The data files of one skill (the library toy's generator and seeds).
+struct SkillFiles {
+    train: Vec<PathBuf>,
+    calibration: PathBuf,
+    dev: PathBuf,
+    question: PathBuf,
+    dev_rows: Vec<(String, String)>,
+    n_train: usize,
+}
+
+fn skill_files(dir: &Path, id: &str, labels: &[&str], seed: u64, parts: usize) -> SkillFiles {
+    let train = synth(labels, 30, seed, &format!("{id}t"));
+    let cal = synth(labels, 80, seed + 1, &format!("{id}c"));
+    let dev = synth(labels, 12, seed + 2, &format!("{id}d"));
+    let per = train.len().div_ceil(parts);
+    let train_files = train
+        .chunks(per)
+        .enumerate()
+        .map(|(k, c)| write(dir, &format!("{id}-train{k}.jsonl"), &jsonl(c)))
+        .collect();
+    SkillFiles {
+        train: train_files,
+        calibration: write(dir, &format!("{id}-cal.jsonl"), &jsonl(&cal)),
+        dev: write(dir, &format!("{id}-dev.jsonl"), &jsonl(&dev)),
+        question: write(dir, &format!("{id}-q.json"), &question(labels)),
+        dev_rows: dev,
+        n_train: train.len(),
+    }
+}
+
+fn skill_args(f: &SkillFiles) -> Vec<String> {
+    let mut a = Vec::new();
+    for t in &f.train {
+        a.push("--train".to_string());
+        a.push(s(t).to_string());
+    }
+    for (flag, p) in [
+        ("--calibration", &f.calibration),
+        ("--dev", &f.dev),
+        ("--question", &f.question),
+    ] {
+        a.push(flag.to_string());
+        a.push(s(p).to_string());
+    }
+    a.extend(["--threads".to_string(), "2".to_string()]);
+    a
+}
+
+fn args_ref(v: &[String]) -> Vec<&str> {
+    v.iter().map(String::as_str).collect()
+}
+
+fn toy_encoder_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../cortiq-decision/tests/fixtures/toy/encoder")
+}
+
+struct Toy {
+    dir: tempfile::TempDir,
+    enc: PathBuf,
+    s1: PathBuf,
+    path: PathBuf,
+    topics: SkillFiles,
+    shop: SkillFiles,
+    init_report: Value,
+    train_report: Value,
+    add_report: Value,
+}
+
+/// The toy file, built through the CLI once per test binary.
+fn toy() -> &'static Toy {
+    static TOY: OnceLock<Toy> = OnceLock::new();
+    TOY.get_or_init(|| {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let enc = d.join("enc.cmf");
+        let init_report = json_of(&ok(&[
+            "decision",
+            "init",
+            "--encoder-dir",
+            s(&toy_encoder_dir()),
+            "-o",
+            s(&enc),
+            "--json",
+        ]));
+        let topics = skill_files(d, "topics", &TOPICS, 11, 2);
+        let s1 = d.join("s1.cmf");
+        let mut a: Vec<String> = [
+            "decision",
+            "train",
+            "--encoder",
+            s(&enc),
+            "--skill",
+            "topics",
+        ]
+        .iter()
+        .map(|x| x.to_string())
+        .collect();
+        a.extend(skill_args(&topics));
+        a.extend(["-o".into(), s(&s1).into(), "--json".into()]);
+        let train_report = json_of(&ok(&args_ref(&a)));
+        let shop = skill_files(d, "shop", &SHOP, 21, 1);
+        let path = d.join("toy.cmf");
+        let mut a: Vec<String> = ["decision", "add-skill", s(&s1), "--skill", "shop"]
+            .iter()
+            .map(|x| x.to_string())
+            .collect();
+        a.extend(skill_args(&shop));
+        a.extend(["-o".into(), s(&path).into(), "--json".into()]);
+        let add_report = json_of(&ok(&args_ref(&a)));
+        Toy {
+            dir,
+            enc,
+            s1,
+            path,
+            topics,
+            shop,
+            init_report,
+            train_report,
+            add_report,
+        }
+    })
+}
+
+fn info_json(p: &Path) -> Value {
+    json_of(&ok(&["decision", "info", s(p), "--json"]))
+}
+
+fn encoder() -> &'static SignalEncoder {
+    static ENC: OnceLock<SignalEncoder> = OnceLock::new();
+    ENC.get_or_init(|| {
+        let m = DecisionModel::open(&toy().path, Verify::Light).unwrap();
+        SignalEncoder::from_model(&m).unwrap().0
+    })
+}
+
+fn cos(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+/// `count` cruise texts, each with cos φ_P < `max_cos` to every earlier one
+/// (the library's `distinct_texts`).
+fn distinct_texts(count: usize, seed: u64, tag: &str, max_cos: f32) -> Vec<String> {
+    let p = pool("cruise");
+    let mut rng = Lcg(seed);
+    let mut out: Vec<String> = Vec::new();
+    let mut phis: Vec<Vec<f32>> = Vec::new();
+    let mut tries = 0;
+    while out.len() < count {
+        tries += 1;
+        assert!(tries < 100_000, "could not find {count} distinct texts");
+        let mut words = Vec::new();
+        for _ in 0..3 + rng.below(2) {
+            words.push(p[rng.below(p.len())]);
+        }
+        words.push(FILLER[rng.below(FILLER.len())]);
+        let t = format!("{} {tag}{}", words.join(" "), out.len());
+        let f = encoder().features(&t).phi_p;
+        if phis.iter().all(|q| cos(q, &f) < max_cos) {
+            phis.push(f);
+            out.push(t);
+        }
+    }
+    out
+}
+
+// ------------------------------------------------------------------ mock oracle
+
+struct MockOracle {
+    addr: SocketAddr,
+    hits: Arc<AtomicUsize>,
+    bodies: Arc<Mutex<Vec<Vec<u8>>>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+fn read_request(s: &mut TcpStream) -> Option<Vec<u8>> {
+    s.set_read_timeout(Some(Duration::from_secs(10))).ok()?;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let head_end = loop {
+        if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break p;
+        }
+        let n = s.read(&mut chunk).ok()?;
+        if n == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
+    let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+    let len: usize = head
+        .lines()
+        .find_map(|l| l.strip_prefix("content-length:"))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+    let mut body = buf[head_end + 4..].to_vec();
+    while body.len() < len {
+        let n = s.read(&mut chunk).ok()?;
+        if n == 0 {
+            break;
+        }
+        body.extend_from_slice(&chunk[..n]);
+    }
+    Some(body)
+}
+
+/// An OpenRouter chat completion answering every choice with `label` when it
+/// is an option (else the first option).
+fn completion_for(body: &[u8], label: &str) -> Vec<u8> {
+    let v: Value = serde_json::from_slice(body).expect("the oracle body is JSON");
+    let schema = &v["response_format"]["json_schema"]["schema"];
+    let mut verdicts = Map::new();
+    for q in schema["required"].as_array().unwrap() {
+        let qid = q.as_str().unwrap();
+        let p = &schema["properties"][qid];
+        let a = match p["type"].as_str().unwrap() {
+            "string" => {
+                let opts = p["enum"].as_array().unwrap();
+                if opts.iter().any(|o| o == label) {
+                    json!(label)
+                } else {
+                    opts[0].clone()
+                }
+            }
+            "integer" => json!(0),
+            _ => json!(true),
+        };
+        verdicts.insert(qid.to_string(), a);
+    }
+    serde_json::to_vec(&json!({
+        "id": "gen-mock", "object": "chat.completion", "model": ORACLE_MODEL, "provider": "Mock",
+        "choices": [{"index": 0, "finish_reason": "stop",
+                     "message": {"role": "assistant", "content": Value::Object(verdicts).to_string()}}],
+        "usage": {"prompt_tokens": 1200, "completion_tokens": 7, "total_tokens": 1207, "cost": 1.3e-5},
+    }))
+    .unwrap()
+}
+
+impl MockOracle {
+    fn answering(label: &'static str) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (h, b, st) = (hits.clone(), bodies.clone(), stop.clone());
+        let thread = std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                if st.load(Ordering::SeqCst) {
+                    break;
+                }
+                let Ok(mut s) = conn else { continue };
+                let (h, b) = (h.clone(), b.clone());
+                std::thread::spawn(move || {
+                    let Some(body) = read_request(&mut s) else {
+                        return;
+                    };
+                    h.fetch_add(1, Ordering::SeqCst);
+                    let reply = completion_for(&body, label);
+                    b.lock().unwrap().push(body);
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        reply.len()
+                    );
+                    let _ = s.write_all(head.as_bytes());
+                    let _ = s.write_all(&reply);
+                    let _ = s.flush();
+                });
+            }
+        });
+        Self {
+            addr,
+            hits,
+            bodies,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    fn hits(&self) -> usize {
+        self.hits.load(Ordering::SeqCst)
+    }
+
+    /// The `state` of every request received.
+    fn states(&self) -> Vec<Value> {
+        self.bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|b| {
+                let v: Value = serde_json::from_slice(b).unwrap();
+                let user: Value =
+                    serde_json::from_str(v["messages"][1]["content"].as_str().unwrap()).unwrap();
+                user["state"].clone()
+            })
+            .collect()
+    }
+}
+
+impl Drop for MockOracle {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(self.addr);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+fn oracle_config(dir: &Path, mock: &MockOracle, extra: Value) -> PathBuf {
+    let mut cfg = json!({
+        "oracle": {"enabled": true, "base_url": mock.url(), "api_key_env": KEY_ENV, "deadline_s": 5},
+    });
+    if let (Value::Object(c), Value::Object(e)) = (&mut cfg, extra) {
+        c.extend(e);
+    }
+    write(dir, "oracle-config.json", &cfg.to_string())
+}
+
+// ------------------------------------------------------------------ server
+
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+struct Server {
+    child: Child,
+    port: u16,
+    stdout: PathBuf,
+    stderr: PathBuf,
+}
+
+impl Server {
+    fn start(model: &Path, extra: &[&str], envs: &[(&str, &str)], logs: &Path) -> Self {
+        let port = free_port();
+        let stdout = logs.join(format!("serve-{port}.out"));
+        let stderr = logs.join(format!("serve-{port}.err"));
+        let mut c = cortiq();
+        c.args(["serve", s(model), "--port", &port.to_string()])
+            .args(extra)
+            .stdout(std::fs::File::create(&stdout).unwrap())
+            .stderr(std::fs::File::create(&stderr).unwrap());
+        for (k, v) in envs {
+            c.env(k, v);
+        }
+        let mut srv = Self {
+            child: c.spawn().expect("spawn cortiq serve"),
+            port,
+            stdout,
+            stderr,
+        };
+        let t0 = Instant::now();
+        loop {
+            if let Some(status) = srv.child.try_wait().unwrap() {
+                panic!("cortiq serve exited early ({status})\n{}", srv.logs());
+            }
+            if TcpStream::connect_timeout(
+                &SocketAddr::from(([127, 0, 0, 1], port)),
+                Duration::from_millis(200),
+            )
+            .is_ok()
+            {
+                break;
+            }
+            assert!(
+                t0.elapsed() < Duration::from_secs(180),
+                "cortiq serve did not listen\n{}",
+                srv.logs()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        srv
+    }
+
+    fn logs(&self) -> String {
+        format!(
+            "--- stdout\n{}\n--- stderr\n{}",
+            std::fs::read_to_string(&self.stdout).unwrap_or_default(),
+            std::fs::read_to_string(&self.stderr).unwrap_or_default()
+        )
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("http://127.0.0.1:{}{path}", self.port)
+    }
+
+    /// SIGTERM (graceful: the usage ledger is flushed) and wait.
+    fn stop(mut self) -> String {
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(self.child.id() as i32, libc::SIGTERM);
+        }
+        #[cfg(not(unix))]
+        let _ = self.child.kill();
+        let t0 = Instant::now();
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                let logs = self.logs();
+                #[cfg(unix)]
+                assert!(status.success(), "serve exit {status}\n{logs}");
+                let _ = status;
+                return logs;
+            }
+            if t0.elapsed() > Duration::from_secs(60) {
+                let _ = self.child.kill();
+                panic!("cortiq serve did not stop\n{}", self.logs());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// One HTTP request: (status, JSON body or Null).
+fn http(method: &str, url: &str, key: Option<&str>, body: Option<&Value>) -> (u16, Value) {
+    // A fresh agent without idle connections: a graceful shutdown of the
+    // server does not wait on a pooled keep-alive connection.
+    let agent = ureq::AgentBuilder::new()
+        .max_idle_connections(0)
+        .timeout(Duration::from_secs(60))
+        .build();
+    let mut req = agent.request(method, url);
+    if let Some(k) = key {
+        req = req.set("Authorization", &format!("Bearer {k}"));
+    }
+    let res = match body {
+        Some(b) => req
+            .set("Content-Type", "application/json")
+            .send_string(&b.to_string()),
+        None => req.call(),
+    };
+    let resp = match res {
+        Ok(r) => r,
+        Err(ureq::Error::Status(_, r)) => r,
+        Err(e) => panic!("{method} {url}: {e}"),
+    };
+    let status = resp.status();
+    let text = resp.into_string().unwrap();
+    (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+}
+
+fn topics_request(text: &str) -> Value {
+    let mut crit = Map::new();
+    for l in TOPICS {
+        crit.insert(l.to_string(), json!(format!("about {l}")));
+    }
+    json!({"model": "cortiq/decision", "state": text,
+           "questions": {"task": {"type": "choice", "instructions": "Which topic?", "criteria": crit}}})
+}
+
+fn decide_json(model: &Path, text: &str, extra: &[&str]) -> Value {
+    let mut a = vec!["decide", s(model), "-p", text, "--json"];
+    a.extend_from_slice(extra);
+    json_of(&ok(&a))
+}
+
+// ------------------------------------------------------------------ build
+
+#[test]
+fn init_train_and_add_skill_build_the_toy_file() {
+    let t = toy();
+    // init: an encoder-only file.
+    let i = &t.init_report;
+    assert_eq!(i["path"], s(&t.enc));
+    assert_eq!(i["sha256"], sha256_file(&t.enc));
+    assert!(i["model"].as_str().unwrap().starts_with("cortiq/decision@"));
+    let enc_info = info_json(&t.enc);
+    assert_eq!(enc_info["skills"], json!([]));
+    assert_eq!(enc_info["manifest"]["created_unix"], EPOCH);
+
+    // train: two training files read in order, the calibration file, dev.
+    let r = &t.train_report;
+    assert_eq!(r["skills"], json!(["topics"]));
+    assert_eq!(r["skill"]["id"], "topics");
+    assert_eq!(r["skill"]["labels"], 4);
+    assert_eq!(r["skill"]["K"], 16);
+    assert_eq!(r["skill"]["rows"]["train"], t.topics.n_train);
+    assert_eq!(r["skill"]["calibration_source"], "file");
+    assert_eq!(r["self_check"]["bit_exact"], true);
+    assert_eq!(r["dev"]["n"], t.topics.dev_rows.len());
+    assert_eq!(r["out"]["sha256"], sha256_file(&t.s1));
+    let topics = &info_json(&t.s1)["skills"][0];
+    let parts = topics["data"]["train"]["parts"].as_array().unwrap();
+    assert_eq!(parts.len(), 2);
+    assert_eq!(
+        parts.iter().map(|p| p["n"].as_u64().unwrap()).sum::<u64>(),
+        t.topics.n_train as u64
+    );
+
+    // add-skill: every earlier skill byte for byte (spec §3.7).
+    let a = &t.add_report;
+    assert_eq!(a["skills"], json!(["topics", "shop"]));
+    assert_eq!(a["skill"]["id"], "shop");
+    assert_eq!(a["dev"]["n"], t.shop.dev_rows.len());
+    let info = info_json(&t.path);
+    assert_eq!(info["skills"][0], *topics);
+    assert_eq!(
+        info["manifest"]["skills"][0],
+        info_json(&t.s1)["manifest"]["skills"][0]
+    );
+    assert_eq!(info["summary"][1]["id"], "shop");
+    assert_eq!(info["summary"][1]["labels"], 3);
+
+    // An existing skill id is refused; an existing output is never replaced.
+    let d = t.dir.path();
+    let mut a: Vec<String> = ["decision", "add-skill", s(&t.path), "--skill", "topics"]
+        .iter()
+        .map(|x| x.to_string())
+        .collect();
+    a.extend(skill_args(&t.topics));
+    let again = d.join("again.cmf");
+    a.extend(["-o".into(), s(&again).into()]);
+    let e = fails(&args_ref(&a));
+    assert!(e.contains("already exists"), "{e}");
+    assert!(!again.exists());
+    let before = sha256_file(&t.path);
+    let mut a: Vec<String> = [
+        "decision",
+        "train",
+        "--encoder",
+        s(&t.enc),
+        "--skill",
+        "other",
+    ]
+    .iter()
+    .map(|x| x.to_string())
+    .collect();
+    a.extend(skill_args(&t.topics));
+    a.extend(["-o".into(), s(&t.path).into()]);
+    let e = fails(&args_ref(&a));
+    assert!(e.contains("overwrite") || e.contains("exists"), "{e}");
+    assert_eq!(sha256_file(&t.path), before);
+}
+
+#[test]
+fn train_takes_several_train_files_k_and_a_carve_out() {
+    let t = toy();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let f = skill_files(d, "small", &["billing", "food", "travel"], 41, 3);
+    let out = d.join("k4.cmf");
+    let mut a: Vec<String> = [
+        "decision",
+        "train",
+        "--encoder",
+        s(&t.enc),
+        "--skill",
+        "small",
+    ]
+    .iter()
+    .map(|x| x.to_string())
+    .collect();
+    for p in &f.train {
+        a.extend(["--train".into(), s(p).into()]);
+    }
+    a.extend(
+        [
+            "--k",
+            "4",
+            "--k-source",
+            "cv.json chosen_K",
+            "--threads",
+            "1",
+            "-o",
+            s(&out),
+            "--json",
+        ]
+        .iter()
+        .map(|x| x.to_string()),
+    );
+    let r = json_of(&ok(&args_ref(&a)));
+    assert_eq!(r["skill"]["K"], 4);
+    assert!(r["skill"]["k_max"].as_u64().unwrap() <= 4);
+    // No --calibration: carved out of the training rows (every fifth row of a
+    // label in sha256 order).
+    assert_eq!(r["skill"]["calibration_source"], "carve-out");
+    let n_train = r["skill"]["rows"]["train"].as_u64().unwrap();
+    let n_cal = r["skill"]["rows"]["calibration"].as_u64().unwrap();
+    assert_eq!(n_train + n_cal, f.n_train as u64);
+    assert_eq!(n_cal, f.n_train as u64 / 5);
+    let m = &info_json(&out)["skills"][0];
+    assert_eq!(m["recipe"]["K"], 4);
+    assert_eq!(m["recipe"]["k_source"], "cv.json chosen_K");
+    assert_eq!(m["data"]["train"]["parts"].as_array().unwrap().len(), 3);
+    assert!(
+        m["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|x| x["k"].as_u64().unwrap() <= 4)
+    );
+    // The human report.
+    let out2 = d.join("k4-human.cmf");
+    let n = a.len();
+    a[n - 2] = s(&out2).into();
+    a.pop();
+    let human = ok(&args_ref(&a));
+    assert!(
+        human.contains("skill small: 3 labels (3 active), K 4"),
+        "{human}"
+    );
+    assert!(human.contains("self-check:  bit-exact"), "{human}");
+    // Same inputs, same bytes.
+    assert_eq!(sha256_file(&out), sha256_file(&out2));
+}
+
+// ------------------------------------------------------------------ decide
+
+#[test]
+fn decide_one_text_exact_subset_json_and_round() {
+    let t = toy();
+    let (text, _) = &t.topics.dev_rows[0];
+    let v = decide_json(&t.path, text, &["--skill", "topics"]);
+    assert!(v["id"].as_str().unwrap().starts_with("cmf-dec-"));
+    assert!(v["model"].as_str().unwrap().starts_with("cortiq/decision@"));
+    let ans = &v["answers"]["task"];
+    assert_eq!(ans["type"], "choice");
+    let probs = ans["probabilities"].as_object().unwrap();
+    assert_eq!(
+        probs.keys().collect::<Vec<_>>(),
+        TOPICS.iter().collect::<Vec<_>>()
+    );
+    let q = &v["cmf"]["questions"]["task"];
+    assert_eq!(
+        (q["skill"].as_str(), q["match"].as_str()),
+        (Some("topics"), Some("exact"))
+    );
+    assert!(matches!(q["action"].as_str(), Some("local" | "abstain")));
+    assert_eq!(v["cmf"]["usage"]["oracle"]["calls"], 0);
+
+    // --round 2: hundredths, as Jev.
+    let r = decide_json(&t.path, text, &["--skill", "topics", "--round", "2"]);
+    for p in r["answers"]["task"]["probabilities"]
+        .as_object()
+        .unwrap()
+        .values()
+    {
+        let x = p.as_f64().unwrap() * 100.0;
+        assert!((x - x.round()).abs() < 1e-6, "{p}");
+    }
+    assert_eq!(r["answers"]["task"]["choice"], ans["choice"]);
+
+    // --labels: a strict subset of one skill's labels, or exactly a skill.
+    let sub = decide_json(&t.path, text, &["--labels", "Weather,travel"]);
+    let q = &sub["cmf"]["questions"]["task"];
+    assert_eq!(
+        (q["skill"].as_str(), q["match"].as_str()),
+        (Some("topics"), Some("subset"))
+    );
+    assert_eq!(q["certified"], false);
+    let shop = decide_json(
+        &t.path,
+        "pizza and coffee please",
+        &["--labels", "billing,cards,food"],
+    );
+    let q = &shop["cmf"]["questions"]["task"];
+    assert_eq!(
+        (q["skill"].as_str(), q["match"].as_str()),
+        (Some("shop"), Some("exact"))
+    );
+    // Two skills have both labels: untrained, and decide never asks an oracle.
+    let e = fails(&[
+        "decide",
+        s(&t.path),
+        "-p",
+        text,
+        "--labels",
+        "billing,cards",
+    ]);
+    assert!(
+        e.contains("422") && e.contains("UNSUPPORTED_QUESTION"),
+        "{e}"
+    );
+    // The skill rules of spec §4.1.
+    let e = fails(&["decide", s(&t.path), "-p", text]);
+    assert!(e.contains("topics, shop"), "{e}");
+    let e = fails(&["decide", s(&t.path), "-p", text, "--skill", "nope"]);
+    assert!(e.contains("no skill 'nope'"), "{e}");
+    assert!(ok(&["decide", s(&t.s1), "-p", text]).contains("skill:      topics (exact match"));
+
+    // The human answer.
+    let h = ok(&["decide", s(&t.path), "-p", text, "--skill", "topics"]);
+    assert!(
+        h.starts_with(&format!(
+            "choice:     {}\n",
+            ans["choice"].as_str().unwrap()
+        )),
+        "{h}"
+    );
+    assert!(h.contains("gate:       p_top "), "{h}");
+    assert!(h.contains("model:      cortiq/decision@"), "{h}");
+
+    // A text no skill knows: the gate rejects it, the answer stays local.
+    let v = decide_json(
+        &t.path,
+        "cruise ship cabin deck please",
+        &["--skill", "topics"],
+    );
+    let q = &v["cmf"]["questions"]["task"];
+    assert_eq!(q["action"], "abstain");
+    assert!(
+        q["flags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f == "oracle_disabled"),
+        "{q}"
+    );
+    let h = ok(&[
+        "decide",
+        s(&t.path),
+        "-p",
+        "cruise ship cabin deck please",
+        "--skill",
+        "topics",
+    ]);
+    assert!(h.contains("never calls the oracle"), "{h}");
+
+    // An encoder-only file has no skill; a language model is not a decision file.
+    let e = fails(&["decide", s(&t.enc), "-p", text]);
+    assert!(e.contains("no skill"), "{e}");
+}
+
+fn rows_of(stdout: &str) -> Vec<Value> {
+    stdout
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+fn summary_of(stderr: &str) -> Value {
+    let line = stderr
+        .lines()
+        .rev()
+        .find(|l| l.starts_with("{\"summary\""))
+        .unwrap_or_else(|| panic!("no summary line: {stderr}"));
+    serde_json::from_str::<Value>(line).unwrap()["summary"].clone()
+}
+
+#[test]
+fn decide_batch_rows_summary_bench_and_single_equality() {
+    let t = toy();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let dev = &t.topics.dev;
+    let n = t.topics.dev_rows.len();
+
+    let o = output(
+        &["decide", s(&t.path), "--input", s(dev), "--skill", "topics"],
+        &[],
+    );
+    assert!(o.status.success(), "{}", show(&o));
+    let rows = rows_of(&String::from_utf8(o.stdout.clone()).unwrap());
+    assert_eq!(rows.len(), n);
+    let keys = [
+        "i",
+        "text_sha256",
+        "skill",
+        "choice",
+        "p_top",
+        "confidence",
+        "novelty",
+        "margin",
+        "accepted",
+        "certified",
+        "input_tokens",
+        "errors_top5",
+        "timings_us",
+        "correct",
+    ];
+    for (i, r) in rows.iter().enumerate() {
+        let m = r.as_object().unwrap();
+        assert_eq!(
+            m.keys().collect::<Vec<_>>(),
+            keys.iter().collect::<Vec<_>>()
+        );
+        assert_eq!(r["i"], i);
+        assert_eq!(r["skill"], "topics");
+        let (text, label) = &t.topics.dev_rows[i];
+        assert_eq!(
+            r["text_sha256"],
+            format!("{:x}", Sha256::digest(text.as_bytes()))
+        );
+        assert_eq!(r["correct"], json!(r["choice"] == json!(label)));
+        assert!(r["errors_top5"].as_object().unwrap().len() <= 5);
+    }
+    let raw = String::from_utf8_lossy(&o.stdout);
+    for (text, _) in &t.topics.dev_rows {
+        assert!(!raw.contains(text.as_str()), "a text leaked into the rows");
+    }
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(stderr.contains("skill topics (4 labels"), "{stderr}");
+    let sum = summary_of(&stderr);
+    let correct = rows.iter().filter(|r| r["correct"] == true).count();
+    let accepted = rows.iter().filter(|r| r["accepted"] == true).count();
+    assert_eq!(
+        (sum["n"].as_u64(), sum["labelled"].as_u64()),
+        (Some(n as u64), Some(n as u64))
+    );
+    assert_eq!(sum["correct"], correct);
+    assert_eq!(sum["accepted"], accepted);
+    // The build's own dev count (the same scorer) is reproduced.
+    assert_eq!(sum["correct"], t.train_report["dev"]["correct"]);
+    assert_eq!(sum["accepted"], t.train_report["dev"]["accepted"]);
+    assert!(sum.get("bench").is_none());
+
+    // --bench --out: rows in the file, percentiles of every stage.
+    let out = d.join("rows.jsonl");
+    let o = output(
+        &[
+            "decide",
+            s(&t.path),
+            "--input",
+            s(dev),
+            "--skill",
+            "topics",
+            "--bench",
+            "--out",
+            s(&out),
+        ],
+        &[],
+    );
+    assert!(o.status.success(), "{}", show(&o));
+    assert!(o.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(stderr.contains("bench (warm-up"), "{stderr}");
+    let bench = &summary_of(&stderr)["bench"];
+    assert_eq!(bench["warmup"], n.min(50));
+    for stage in ["tokenize", "encode", "hash", "resonance", "total"] {
+        for p in ["p50_us", "p95_us", "p99_us", "mean_us"] {
+            assert!(bench[stage][p].as_f64().unwrap() >= 0.0, "{stage} {p}");
+        }
+        assert!(bench[stage]["p50_us"].as_f64() <= bench[stage]["p99_us"].as_f64());
+    }
+    let bench_rows = rows_of(&std::fs::read_to_string(&out).unwrap());
+    let strip = |r: &Value| {
+        let mut r = r.clone();
+        r.as_object_mut().unwrap().remove("timings_us");
+        r
+    };
+    assert_eq!(
+        bench_rows.iter().map(strip).collect::<Vec<_>>(),
+        rows.iter().map(strip).collect::<Vec<_>>()
+    );
+    // The output is never replaced.
+    let e = fails(&[
+        "decide",
+        s(&t.path),
+        "--input",
+        s(dev),
+        "--skill",
+        "topics",
+        "--out",
+        s(&out),
+    ]);
+    assert!(e.contains("overwrite"), "{e}");
+
+    // One text through the decisions service equals its batch row.
+    for (i, (text, _)) in t.topics.dev_rows.iter().take(4).enumerate() {
+        let v = decide_json(&t.path, text, &["--skill", "topics"]);
+        let r = &rows[i];
+        let a = &v["answers"]["task"];
+        let q = &v["cmf"]["questions"]["task"];
+        assert_eq!(a["choice"], r["choice"]);
+        assert_eq!(
+            a["probabilities"][r["choice"].as_str().unwrap()],
+            r["p_top"]
+        );
+        assert_eq!(q["gate"]["p_top"], r["p_top"]);
+        assert_eq!(q["gate"]["novelty"], r["novelty"]);
+        assert_eq!(q["gate"]["margin"], r["margin"]);
+        assert_eq!(q["gate"]["accepted"], r["accepted"]);
+        assert_eq!(q["certified"], r["certified"]);
+        assert_eq!(q["errors"], r["errors_top5"]);
+    }
+}
+
+#[test]
+fn info_and_verify_describe_and_check_the_file() {
+    let t = toy();
+    let h = ok(&["decision", "info", s(&t.path)]);
+    assert!(h.contains("topics: 4 labels (4 active"), "{h}");
+    assert!(h.contains("shop: 3 labels"), "{h}");
+    assert!(h.contains("labels: Weather, billing, cards, travel"), "{h}");
+    let v = json_of(&ok(&["decision", "verify", s(&t.path), "--json"]));
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["generation"], 0);
+    assert_eq!(v["skills"], 2);
+    assert_eq!(v["golden"]["rows"], v["golden"]["bit_exact_rows"]);
+    assert!(
+        ok(&["decision", "verify", s(&t.path)])
+            .trim_end()
+            .ends_with("OK")
+    );
+
+    // A flipped byte in a tensor fails the full verification.
+    let dir = tempfile::tempdir().unwrap();
+    let bad = dir.path().join("bad.cmf");
+    let mut bytes = std::fs::read(&t.path).unwrap();
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0x40;
+    std::fs::write(&bad, &bytes).unwrap();
+    fails(&["decision", "verify", s(&bad)]);
+}
+
+#[test]
+fn run_and_chat_print_the_decision_guard_and_generic_tools_still_work() {
+    let t = toy();
+    let one_shot = fails(&["run", s(&t.path), "-p", "hello"]);
+    assert!(one_shot.contains(GUARD), "{one_shot}");
+    // No --prompt: the interactive chat (stdin closed) is refused the same way.
+    let chat = fails(&["run", s(&t.path)]);
+    assert!(chat.contains(GUARD), "{chat}");
+    // `cortiq info` and `cortiq verify` keep working on a decision file.
+    let info = ok(&["info", s(&t.path)]);
+    assert!(info.contains("cortiq-decision-ph-v1"), "{info}");
+    assert!(ok(&["verify", s(&t.path)]).contains("OK"));
+}
+
+// ------------------------------------------------------------------ serve
+
+#[test]
+fn serve_refuses_language_model_flags_on_a_decision_file() {
+    let t = toy();
+    for flags in [
+        &["--task", "general"][..],
+        &["--gpus", "2"],
+        &["--o1", "all"],
+        &["--o1-m", "8"],
+        &["--peer", "127.0.0.1:9"],
+        &["--peer-split", "3"],
+        &["--compat-port", "11434"],
+    ] {
+        let mut a = vec!["serve", s(&t.path), "--port", "9"];
+        a.extend_from_slice(flags);
+        let e = fails(&a);
+        assert!(
+            e.contains(flags[0]) && e.contains("is a decision file"),
+            "{flags:?}: {e}"
+        );
+    }
+}
+
+#[test]
+fn serve_on_loopback_learns_then_state_commands_use_its_generations() {
+    let t = toy();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let mock = MockOracle::answering("travel");
+    let cfg = oracle_config(d, &mock, json!({"learning": {"synchronous": true}}));
+    let state = d.join("state");
+    let srv = Server::start(
+        &t.path,
+        &["--decision-config", s(&cfg), "--state", s(&state)],
+        &[(KEY_ENV, TEST_KEY)],
+        d,
+    );
+    // Loopback by default (no --host), port as given.
+    let out = std::fs::read_to_string(&srv.stdout).unwrap();
+    assert!(
+        out.contains(&format!("http://127.0.0.1:{}", srv.port)),
+        "{out}"
+    );
+
+    let (code, h) = http("GET", &srv.url("/healthz"), None, None);
+    assert_eq!(code, 200, "{h}");
+    assert_eq!(
+        (h["status"].as_str(), h["generation"].as_u64()),
+        (Some("ok"), Some(0))
+    );
+    // A decision (open mode: loopback and no key).
+    let (text, _) = &t.topics.dev_rows[1];
+    let (code, v) = http(
+        "POST",
+        &srv.url("/v1/decisions"),
+        None,
+        Some(&topics_request(text)),
+    );
+    assert_eq!(code, 200, "{v}");
+    assert!(TOPICS.contains(&v["answers"]["task"]["choice"].as_str().unwrap()));
+    let base_model = v["model"].as_str().unwrap().to_string();
+
+    // 25 oracle answers of a label promote a challenger (generation 1).
+    let lesson = distinct_texts(25, 7, "q", 0.97);
+    let fresh = distinct_texts(8, 99, "z", 0.995);
+    for q in &lesson {
+        let (code, v) = http(
+            "POST",
+            &srv.url("/v1/decisions"),
+            None,
+            Some(&topics_request(q)),
+        );
+        assert_eq!(code, 200, "{v}");
+        assert_eq!(v["cmf"]["questions"]["task"]["action"], "oracle", "{v}");
+    }
+    assert_eq!(mock.hits(), 25);
+    let (_, v) = http(
+        "POST",
+        &srv.url("/v1/decisions"),
+        None,
+        Some(&topics_request(&fresh[0])),
+    );
+    assert_eq!(v["cmf"]["generation"], 1, "{v}");
+    assert_eq!(v["cmf"]["questions"]["task"]["action"], "local", "{v}");
+    assert_eq!(v["answers"]["task"]["choice"], "travel");
+    assert_eq!(mock.hits(), 25);
+    let logs = srv.stop();
+    assert!(!logs.contains(TEST_KEY));
+    assert!(
+        !std::fs::read_to_string(state.join("oracle.jsonl"))
+            .unwrap()
+            .contains(TEST_KEY)
+    );
+
+    // decide --state: the generation CURRENT names; without it, the base.
+    let fresh_text = fresh[1].as_str();
+    let served = decide_json(
+        &t.path,
+        fresh_text,
+        &["--skill", "topics", "--state", s(&state)],
+    );
+    assert_eq!(served["cmf"]["generation"], 1);
+    assert_eq!(served["cmf"]["questions"]["task"]["action"], "local");
+    assert_eq!(served["answers"]["task"]["choice"], "travel");
+    let base = decide_json(&t.path, fresh_text, &["--skill", "topics"]);
+    assert_eq!(base["cmf"]["generation"], 0);
+    assert_eq!(base["model"].as_str(), Some(base_model.as_str()));
+    assert_eq!(base["cmf"]["questions"]["task"]["action"], "abstain");
+    let e = fails(&[
+        "decide",
+        s(&t.path),
+        "-p",
+        fresh_text,
+        "--state",
+        s(&d.join("nostate")),
+    ]);
+    assert!(e.contains("does not exist"), "{e}");
+
+    // verify --state checks the overlay too.
+    let v = json_of(&ok(&[
+        "decision",
+        "verify",
+        s(&t.path),
+        "--state",
+        s(&state),
+        "--json",
+    ]));
+    assert_eq!(
+        (v["ok"].as_bool(), v["generation"].as_u64()),
+        (Some(true), Some(1))
+    );
+
+    // materialize: one self-contained file of the served model.
+    let mat = d.join("materialized.cmf");
+    let m = ok(&[
+        "decision",
+        "materialize",
+        s(&t.path),
+        "--state",
+        s(&state),
+        "-o",
+        s(&mat),
+    ]);
+    assert!(m.contains("generation 1"), "{m}");
+    let v = decide_json(&mat, fresh_text, &["--skill", "topics"]);
+    assert_eq!(v["cmf"]["questions"]["task"]["action"], "local");
+    assert_eq!(v["answers"]["task"]["choice"], "travel");
+    assert_eq!(v["answers"]["task"], served["answers"]["task"]);
+    ok(&["decision", "verify", s(&mat)]);
+    let e = fails(&[
+        "decision",
+        "materialize",
+        s(&t.path),
+        "--state",
+        s(&state),
+        "-o",
+        s(&mat),
+    ]);
+    assert!(e.contains("overwrite"), "{e}");
+
+    // rollback: 0 serves the base, 1 the generation again; unknown refused.
+    let r = ok(&[
+        "decision",
+        "rollback",
+        "--state",
+        s(&state),
+        "--to",
+        "0",
+        "--model",
+        s(&t.path),
+    ]);
+    assert!(r.starts_with("CURRENT = g000000"), "{r}");
+    assert!(r.contains("g000001"), "{r}");
+    let v = decide_json(
+        &t.path,
+        fresh_text,
+        &["--skill", "topics", "--state", s(&state)],
+    );
+    assert_eq!(v["cmf"]["generation"], 0);
+    assert_eq!(v["cmf"]["questions"]["task"]["action"], "abstain");
+    let r = ok(&["decision", "rollback", "--state", s(&state), "--to", "1"]);
+    assert!(r.contains("g000001") && r.contains("<- CURRENT"), "{r}");
+    let v = decide_json(
+        &t.path,
+        fresh_text,
+        &["--skill", "topics", "--state", s(&state)],
+    );
+    assert_eq!(v["cmf"]["generation"], 1);
+    let e = fails(&["decision", "rollback", "--state", s(&state), "--to", "7"]);
+    assert!(e.contains("does not exist"), "{e}");
+}
+
+#[test]
+fn keys_create_list_revoke_import_and_a_keyed_server() {
+    let t = toy();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let state = d.join("state");
+    let st = s(&state);
+    let created = json_of(&ok(&[
+        "decision",
+        "keys",
+        "create",
+        "--state",
+        st,
+        "--account",
+        "acme",
+        "--plan",
+        "developer",
+        "--label",
+        "ci",
+        "--json",
+    ]));
+    let acme = created["key"].as_str().unwrap().to_string();
+    assert!(
+        acme.starts_with("cortiq_") && acme.len() == "cortiq_".len() + 40,
+        "{acme}"
+    );
+    assert_eq!(
+        (
+            created["account"].as_str(),
+            created["plan"].as_str(),
+            created["rate_per_min"].as_u64()
+        ),
+        (Some("acme"), Some("developer"), Some(120))
+    );
+    // Human form: the key alone on stdout.
+    let beta = ok(&[
+        "decision",
+        "keys",
+        "create",
+        "--state",
+        st,
+        "--account",
+        "beta",
+    ])
+    .trim()
+    .to_string();
+    assert!(beta.starts_with("cortiq_"), "{beta}");
+    // A cortiq-router MySQL export: existing keys keep working.
+    let legacy = "cortiq_legacy_router_key_0123456789";
+    let export = write(
+        d,
+        "api_keys.json",
+        &json!([{"key_hash": format!("{:x}", Sha256::digest(legacy.as_bytes())), "account": "legacy",
+                 "plan": "pro", "rate_per_min": "600", "decision_quota": "1000000", "active": 1}])
+        .to_string(),
+    );
+    let r = ok(&[
+        "decision",
+        "keys",
+        "import",
+        "--state",
+        st,
+        "--from",
+        s(&export),
+    ]);
+    assert!(r.contains("imported 1 key(s), skipped 0"), "{r}");
+    let r = ok(&[
+        "decision",
+        "keys",
+        "import",
+        "--state",
+        st,
+        "--from",
+        s(&export),
+    ]);
+    assert!(r.contains("imported 0 key(s), skipped 1"), "{r}");
+
+    let list = ok(&["decision", "keys", "list", "--state", st, "--json"]);
+    let v = json_of(&list);
+    let accounts: Vec<&str> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| k["account"].as_str().unwrap())
+        .collect();
+    assert_eq!(accounts, ["acme", "beta", "legacy"]);
+    let on_disk = std::fs::read_to_string(state.join("keys.json")).unwrap();
+    for raw in [&acme, &beta] {
+        assert!(!list.contains(raw.as_str()) && !on_disk.contains(raw.as_str()));
+        assert!(on_disk.contains(&format!("{:x}", Sha256::digest(raw.as_bytes()))));
+    }
+
+    // A server on this state requires a key.
+    let srv = Server::start(&t.path, &["--state", st], &[], d);
+    let body = topics_request(&t.topics.dev_rows[0].0);
+    let (code, v) = http("POST", &srv.url("/v1/decisions"), None, Some(&body));
+    assert_eq!(code, 401, "{v}");
+    assert_eq!(v["error"]["metadata"]["reason"], "UNAUTHORIZED");
+    for key in [acme.as_str(), legacy] {
+        let (code, v) = http("POST", &srv.url("/v1/decisions"), Some(key), Some(&body));
+        assert_eq!(code, 200, "{v}");
+    }
+    let (code, _) = http("GET", &srv.url("/healthz"), None, None);
+    assert_eq!(code, 200);
+    srv.stop();
+
+    // Revoke by account and by hash prefix; nothing left to revoke is an error.
+    let r = ok(&[
+        "decision",
+        "keys",
+        "revoke",
+        "--state",
+        st,
+        "--account",
+        "acme",
+    ]);
+    assert!(r.contains("revoked 1 key(s) of account acme"), "{r}");
+    let e = fails(&[
+        "decision",
+        "keys",
+        "revoke",
+        "--state",
+        st,
+        "--account",
+        "acme",
+    ]);
+    assert!(e.contains("no active key"), "{e}");
+    let beta12 = &format!("{:x}", Sha256::digest(beta.as_bytes()))[..12];
+    ok(&[
+        "decision", "keys", "revoke", "--state", st, "--hash", beta12,
+    ]);
+    let v = json_of(&ok(&["decision", "keys", "list", "--state", st, "--json"]));
+    let active: Vec<bool> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| k["active"].as_bool().unwrap())
+        .collect();
+    assert_eq!(active, [false, false, true]);
+    let table = ok(&["decision", "keys", "list", "--state", st]);
+    assert!(
+        table.contains("revoked") && table.contains("3 key(s)"),
+        "{table}"
+    );
+}
+
+// ------------------------------------------------------------------ learn
+
+#[test]
+fn learn_asks_the_mock_oracle_only_about_abstentions() {
+    let t = toy();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let mock = MockOracle::answering("travel");
+    let cfg_path = oracle_config(d, &mock, json!({}));
+
+    // Traffic: 4 dev texts the gate accepts, 12 cruise texts it rejects, one repeat.
+    let model = DecisionModel::open(&t.path, Verify::Light).unwrap();
+    let ev = Evaluator::new(&model, "topics").unwrap();
+    let accepted: Vec<&String> = t
+        .topics
+        .dev_rows
+        .iter()
+        .map(|(x, _)| x)
+        .filter(|x| ev.scorer().accepted(&ev.decide_text(x).unwrap().decision))
+        .take(4)
+        .collect();
+    assert_eq!(accepted.len(), 4);
+    // The first 12 texts of the library's lesson (every one abstains).
+    let cruise = distinct_texts(12, 7, "q", 0.97);
+    for c in &cruise {
+        assert!(
+            !ev.scorer().accepted(&ev.decide_text(c).unwrap().decision),
+            "{c}"
+        );
+    }
+    let mut lines: Vec<Value> = accepted
+        .iter()
+        .map(|x| json!({"text": x, "label": "ignored"}))
+        .collect();
+    lines.extend(cruise.iter().map(|x| json!({"text": x})));
+    lines.push(json!({"text": cruise[0]}));
+    let traffic = write(
+        d,
+        "traffic.jsonl",
+        &lines
+            .iter()
+            .map(|l| l.to_string() + "\n")
+            .collect::<String>(),
+    );
+
+    // A driver ledger answering the first 3 cruise texts (by body sha256).
+    let cfg = Config::load(&cfg_path).unwrap();
+    let q = learn::rubric_question(&model.skill("topics").unwrap().manifest).unwrap();
+    let mut ledger = vec![json!({"record_type": "run"})];
+    for c in &cruise[..3] {
+        let b = oracle::request_body(&cfg.oracle, &[&q], &json!(c));
+        ledger.push(json!({"record_type": "oracle_call",
+                           "request_sha256": format!("{:x}", Sha256::digest(&b)),
+                           "oracle": {"choice": "travel"}}));
+    }
+    let answers = write(
+        d,
+        "answers.jsonl",
+        &ledger
+            .iter()
+            .map(|l| l.to_string() + "\n")
+            .collect::<String>(),
+    );
+
+    let out = d.join("learned.cmf");
+    let base_args = [
+        "decision",
+        "learn",
+        s(&t.path),
+        "--traffic",
+        s(&traffic),
+        "--skill",
+        "topics",
+        "--oracle-config",
+        s(&cfg_path),
+        "--answers",
+        s(&answers),
+        "--threads",
+        "2",
+    ];
+    // Live calls enabled without the key in the environment: refused up front.
+    let mut a = base_args.to_vec();
+    a.extend(["-o", s(&out)]);
+    let e = fails(&a);
+    assert!(e.contains(KEY_ENV), "{e}");
+    assert!(!out.exists() && !d.join("learned.cmf.oracle.jsonl").exists());
+    assert_eq!(mock.hits(), 0);
+
+    a.push("--json");
+    let r = json_of(&ok_env(&a, &[(KEY_ENV, TEST_KEY)]));
+    assert_eq!(
+        (r["texts"].as_u64(), r["labelled"].as_u64()),
+        (Some(17), Some(4))
+    );
+    assert_eq!(
+        (r["accepted"].as_u64(), r["abstained"].as_u64()),
+        (Some(4), Some(13))
+    );
+    assert_eq!(r["answers_reused"], 3);
+    assert_eq!(r["live_calls"], 9);
+    assert_eq!(
+        mock.hits(),
+        9,
+        "only the abstentions without a stored answer"
+    );
+    let mut asked = mock.states();
+    asked.sort_by_key(|v| v.to_string());
+    let mut expected: Vec<Value> = cruise[3..].iter().map(|c| json!(c)).collect();
+    expected.sort_by_key(|v| v.to_string());
+    assert_eq!(asked, expected);
+    assert_eq!(
+        (r["examples"].as_u64(), r["duplicates"].as_u64()),
+        (Some(12), Some(1))
+    );
+    assert_eq!(r["unanswered"], 0);
+    let mut decided: Vec<Value> = r["promoted_labels"].as_array().unwrap().clone();
+    decided.extend(r["rejected_labels"].as_array().unwrap().iter().cloned());
+    assert_eq!(decided, [json!("travel")]);
+    // The reservation ledger (default next to the output): reserved + settled
+    // per call, no key.
+    let led = std::fs::read_to_string(d.join("learned.cmf.oracle.jsonl")).unwrap();
+    assert_eq!(led.lines().count(), 18);
+    assert!(!led.contains(TEST_KEY));
+    // The output: self-contained, verified, with the learned record.
+    ok(&["decision", "verify", s(&out)]);
+    let info = info_json(&out);
+    let l = &info["skills"][0]["learned"];
+    assert_eq!(
+        (l["calls"].as_u64(), l["answers_reused"].as_u64()),
+        (Some(9), Some(3))
+    );
+    assert_eq!(l["oracle_model"], ORACLE_MODEL);
+    assert_eq!(
+        info["skills"][1],
+        info_json(&t.path)["skills"][1],
+        "shop byte for byte"
+    );
+    // An existing output is refused.
+    let e = fails(&a);
+    assert!(e.contains("overwrite"), "{e}");
+}
