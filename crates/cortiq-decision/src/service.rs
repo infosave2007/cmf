@@ -607,6 +607,19 @@ pub struct Decided {
     pub timings: RequestTimings,
 }
 
+/// A request decided locally only ([`DecisionService::decide_local`]).
+#[derive(Clone, Debug)]
+pub struct LocalOnly {
+    /// `cortiq/decision@<sha12>` of the snapshot that decided it.
+    pub model: String,
+    pub generation: u64,
+    /// Per question, in request order: its match and, for an exact or subset
+    /// match, its local decision (`accepted` under the request's profile).
+    pub questions: Vec<(SkillMatch, Option<LocalDecision>)>,
+    /// `oracle` is always zero.
+    pub timings: RequestTimings,
+}
+
 // ------------------------------------------------------------------ service
 
 /// Decrements the in-flight count when dropped.
@@ -879,25 +892,10 @@ impl DecisionService {
         let created = now_unix();
         let id = new_request_id(created);
         let model = self.handle.current();
-        if let ModelRef::Pinned(sha) = &req.model
-            && sha != model.sha12()
-        {
-            return Err(ApiError::new(
-                Reason::ModelNotFound,
-                format!(
-                    "model {MODEL_ID}@{sha} is not served (current: {})",
-                    model.name()
-                ),
-            )
-            .with_detail("current", json!(model.name())));
-        }
+        check_pinned(&model, req)?;
 
         // Matching.
-        let labels = model.skill_labels();
-        let mut matches = Vec::with_capacity(req.questions.len());
-        for q in &req.questions {
-            matches.push(match_question(&labels, q, req.cmf.skill.as_deref())?);
-        }
+        let matches = match_questions(&model, req)?;
         let consent = self.consent(req, p);
         if let Err(reason) = consent {
             let untrained: Vec<usize> = (0..matches.len())
@@ -912,38 +910,13 @@ impl DecisionService {
             }
         }
 
-        // Encoder and hash, once.
-        let (features, st) = model.encoder().features_timed(&req.state_text);
-        let x = features.signal();
-
-        // Local decisions (errors once per skill).
-        let tr = Instant::now();
-        let mut skill_errors: HashMap<usize, Vec<f32>> = HashMap::new();
-        let mut locals: Vec<Option<LocalDecision>> = Vec::with_capacity(matches.len());
-        for m in &matches {
-            if !m.kind.is_local() {
-                locals.push(None);
-                continue;
-            }
-            let sid = m.skill.as_deref().unwrap_or_default();
-            let si = model
-                .skill_index(sid)
-                .ok_or_else(|| internal(format!("matched skill '{sid}' is missing")))?;
-            if let std::collections::hash_map::Entry::Vacant(slot) = skill_errors.entry(si) {
-                slot.insert(model.skills[si].scorer.errors(&x).map_err(internal)?);
-            }
-            locals.push(Some(
-                local_decision(
-                    &model.skills[si],
-                    m,
-                    &skill_errors[&si],
-                    req.cmf.profile,
-                    req.state.is_text(),
-                )
-                .map_err(internal)?,
-            ));
-        }
-        let resonance = tr.elapsed();
+        // Encoder and hash once, local decisions.
+        let LocalStage {
+            features,
+            signal: st,
+            mut locals,
+            resonance,
+        } = local_stage(&model, req, &matches)?;
 
         // Undetermined questions.
         let pending_idx: Vec<usize> = (0..matches.len())
@@ -1140,6 +1113,36 @@ impl DecisionService {
             record,
             questions: outcomes,
             metered,
+            timings,
+        })
+    }
+
+    /// Only the local part of [`DecisionService::decide`] (the shadow mode of
+    /// `cortiq serve --shadow-of`, spec §4.15): the same matching, encoder,
+    /// resonance and gate of the request's profile, so a local question gets
+    /// exactly the decision `decide` would start from. Nothing else happens:
+    /// no escalator (no oracle, no cache, no single flight), no metering, no
+    /// usage record and no quota, no observation (no feedback ring, no learning
+    /// buffer). An untrained question has no local decision (`None`) instead of
+    /// failing the request.
+    pub fn decide_local(&self, req: &DecisionRequest) -> Result<LocalOnly, ApiError> {
+        let t0 = Instant::now();
+        let model = self.handle.current();
+        check_pinned(&model, req)?;
+        let matches = match_questions(&model, req)?;
+        let stage = local_stage(&model, req, &matches)?;
+        let timings = RequestTimings {
+            tokenize: stage.signal.tokenize,
+            encode: stage.signal.encode,
+            hash: stage.signal.hash,
+            resonance: stage.resonance,
+            oracle: Duration::ZERO,
+            total: t0.elapsed(),
+        };
+        Ok(LocalOnly {
+            model: model.name(),
+            generation: model.generation(),
+            questions: matches.into_iter().zip(stage.locals).collect(),
             timings,
         })
     }
@@ -1633,6 +1636,85 @@ impl DecisionService {
             )),
         }
     }
+}
+
+/// A pinned `cortiq/decision@<12 hex>` must name the served model (404).
+fn check_pinned(model: &LoadedModel, req: &DecisionRequest) -> Result<(), ApiError> {
+    if let ModelRef::Pinned(sha) = &req.model
+        && sha != model.sha12()
+    {
+        return Err(ApiError::new(
+            Reason::ModelNotFound,
+            format!(
+                "model {MODEL_ID}@{sha} is not served (current: {})",
+                model.name()
+            ),
+        )
+        .with_detail("current", json!(model.name())));
+    }
+    Ok(())
+}
+
+/// Every question matched to a skill of `model` (spec §4.4).
+fn match_questions(
+    model: &LoadedModel,
+    req: &DecisionRequest,
+) -> Result<Vec<SkillMatch>, ApiError> {
+    let labels = model.skill_labels();
+    req.questions
+        .iter()
+        .map(|q| match_question(&labels, q, req.cmf.skill.as_deref()))
+        .collect()
+}
+
+/// The encoder and hash of a request (once) and the local decision of each
+/// exact or subset question (the errors of a skill once per request).
+struct LocalStage {
+    features: Features,
+    signal: crate::signal::Timings,
+    locals: Vec<Option<LocalDecision>>,
+    resonance: Duration,
+}
+
+fn local_stage(
+    model: &LoadedModel,
+    req: &DecisionRequest,
+    matches: &[SkillMatch],
+) -> Result<LocalStage, ApiError> {
+    let (features, signal) = model.encoder().features_timed(&req.state_text);
+    let x = features.signal();
+    let tr = Instant::now();
+    let mut skill_errors: HashMap<usize, Vec<f32>> = HashMap::new();
+    let mut locals: Vec<Option<LocalDecision>> = Vec::with_capacity(matches.len());
+    for m in matches {
+        if !m.kind.is_local() {
+            locals.push(None);
+            continue;
+        }
+        let sid = m.skill.as_deref().unwrap_or_default();
+        let si = model
+            .skill_index(sid)
+            .ok_or_else(|| internal(format!("matched skill '{sid}' is missing")))?;
+        if let std::collections::hash_map::Entry::Vacant(slot) = skill_errors.entry(si) {
+            slot.insert(model.skills[si].scorer.errors(&x).map_err(internal)?);
+        }
+        locals.push(Some(
+            local_decision(
+                &model.skills[si],
+                m,
+                &skill_errors[&si],
+                req.cmf.profile,
+                req.state.is_text(),
+            )
+            .map_err(internal)?,
+        ));
+    }
+    Ok(LocalStage {
+        features,
+        signal,
+        locals,
+        resonance: tr.elapsed(),
+    })
 }
 
 /// The local decision of an exact or subset question over its candidates.

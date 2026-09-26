@@ -22,7 +22,7 @@
 //! - training: [`data`], [`build`], [`eval`];
 //! - protocol and service: [`protocol`], [`matching`], [`answer`],
 //!   [`metering`], [`keys`], [`ledger`], [`config`], [`statedir`],
-//!   [`service`];
+//!   [`service`], [`shadow`] (the router API's shadow mode);
 //! - the oracle cascade: [`pii`], [`oracle`], [`cache`], [`buffer`],
 //!   [`learn`], [`generation`], [`cascade`].
 
@@ -61,6 +61,7 @@ pub mod matching;
 pub mod metering;
 pub mod protocol;
 pub mod service;
+pub mod shadow;
 pub mod statedir;
 
 // Oracle cascade.

@@ -49,6 +49,18 @@
 //! surface an unknown path is a JSON 404, a wrong method a JSON 405 (the router
 //! surface answers them as the router does, see Errors).
 //!
+//! # Shadow mode (`--shadow-of URL`, spec §4.15 migration)
+//!
+//! [`ServeOptions::shadow_of`]: every request on a router-API path
+//! ([`SHADOW_FORWARDED_PATHS`]) is forwarded unchanged to the old router at
+//! `URL`, before any routing here, and its answer goes back to the client as
+//! it came (status, body bytes, headers; errors included). `POST /v1/route`
+//! and `POST /v1/route:batch` are also decided locally in parallel, without
+//! any oracle, learning or billing, and compared in `<state>/shadow.jsonl`
+//! (one line per input, never the text); `GET /v1/admin/shadow` (admin token)
+//! answers the agreement statistics. Without the flag none of this exists (not
+//! even the admin path). Details: the `shadow` submodule.
+//!
 //! # Every request
 //!
 //! * **`x-request-id`** on every response: the decision's `cmf-dec-…` id for a
@@ -204,6 +216,9 @@ use cortiq_decision::signal::Features;
 use cortiq_decision::statedir::{StateDir, StateLock};
 use futures::StreamExt;
 use serde_json::{Map, Value, json};
+
+mod shadow;
+pub use shadow::SHADOW_FORWARDED_PATHS;
 
 /// Default listening host of a decision server (spec §4.2): loopback.
 pub const DEFAULT_HOST: &str = "127.0.0.1";
@@ -842,6 +857,8 @@ pub struct DecisionState {
     /// Router request id → the decision id its feedback names.
     links: Mutex<VecDeque<(String, String)>>,
     links_cap: usize,
+    /// `--shadow-of`: the old router the router API is forwarded to.
+    shadow: Option<Arc<shadow::Shadow>>,
 }
 
 impl std::fmt::Debug for DecisionState {
@@ -849,6 +866,7 @@ impl std::fmt::Debug for DecisionState {
         f.debug_struct("DecisionState")
             .field("service", &self.svc)
             .field("cascade", &self.cascade.is_some())
+            .field("shadow", &self.shadow)
             .finish()
     }
 }
@@ -857,6 +875,14 @@ impl DecisionState {
     /// The state over a service; `cascade` is the escalator the service was
     /// opened with (its learning statistics feed `/metrics` and `/v1/usage`).
     pub fn new(svc: Arc<DecisionService>, cascade: Option<Arc<Cascade>>) -> Result<Arc<Self>> {
+        Self::with_shadow(svc, cascade, None)
+    }
+
+    fn with_shadow(
+        svc: Arc<DecisionService>,
+        cascade: Option<Arc<Cascade>>,
+        shadow: Option<Arc<shadow::Shadow>>,
+    ) -> Result<Arc<Self>> {
         let cfg = svc.config();
         let rates = cfg.rates()?;
         let links_cap = cfg.feedback.pending_cap;
@@ -869,6 +895,7 @@ impl DecisionState {
             audit: Mutex::new(VecDeque::new()),
             links: Mutex::new(VecDeque::new()),
             links_cap,
+            shadow,
         }))
     }
 
@@ -1235,7 +1262,7 @@ fn taxonomy_summary(model: &LoadedModel, s: &SkillRuntime, extensions: bool) -> 
 /// The decision router over `state` (see the module notes). It carries its
 /// own request-id and logging middleware and no CORS layer.
 pub fn router(state: Arc<DecisionState>) -> Router {
-    Router::new()
+    let mut r = Router::new()
         // Decisions protocol (spec §4.3).
         .route("/api/alpha/decisions", post(decisions_handler))
         .route("/v1/decisions", post(decisions_handler))
@@ -1268,11 +1295,30 @@ pub fn router(state: Arc<DecisionState>) -> Router {
         )
         .route("/v1/admin/learning", get(admin_learning))
         .route("/v1/admin/generations", get(admin_generations))
-        .route("/v1/admin/rollback", post(admin_rollback))
+        .route("/v1/admin/rollback", post(admin_rollback));
+    // Shadow mode (`--shadow-of`): only then is anything added, so a server
+    // without the flag is unchanged.
+    let shadow = state.shadow.is_some();
+    if shadow {
+        r = r.route("/v1/admin/shadow", get(shadow::admin_shadow));
+    }
+    let app = r
         .fallback(not_found_handler)
         .method_not_allowed_fallback(method_not_allowed_handler)
         .layer(middleware::from_fn(context_middleware))
-        .with_state(state)
+        .with_state(Arc::clone(&state));
+    if !shadow {
+        return app;
+    }
+    // The router API is forwarded before any routing happens here, so that
+    // no route of this server touches the old router's answer (axum adds
+    // `Allow` to what a route answers for a method it does not have).
+    Router::new()
+        .fallback_service(app)
+        .layer(middleware::from_fn_with_state(
+            state,
+            shadow::shadow_middleware,
+        ))
 }
 
 /// Request id, `x-request-id` on every response, one log line per request
@@ -1703,6 +1749,27 @@ pub fn route_question(s: &SkillRuntime) -> Question {
     }
 }
 
+/// The decision request of a router text input: the skill's `task`
+/// question under the request's options.
+fn route_request(r: &Routing, question: Question, text: &str) -> DecisionRequest {
+    DecisionRequest {
+        model: ModelRef::Latest,
+        state: RequestState::Text(text.to_string()),
+        state_text: text.to_string(),
+        questions: vec![question],
+        cmf: CmfOptions {
+            skill: Some(r.skill.clone()),
+            oracle: Some(r.allow_oracle),
+            allow_pii_egress: r.allow_pii_egress,
+            round: None,
+            explain: r.explain,
+            profile: r.profile,
+        },
+        user: None,
+        session_id: None,
+    }
+}
+
 /// One scored candidate of a router response.
 #[derive(Clone, Debug)]
 struct ScoreRow {
@@ -1805,22 +1872,7 @@ impl DecisionState {
         // The router takes a text of any length; the decision reads its first
         // `limits.state_bytes` (whole characters).
         let text = truncate_utf8(text, self.config().limits.state_bytes);
-        let req = DecisionRequest {
-            model: ModelRef::Latest,
-            state: RequestState::Text(text.to_string()),
-            state_text: text.to_string(),
-            questions: vec![route_question(s)],
-            cmf: CmfOptions {
-                skill: Some(r.skill.clone()),
-                oracle: Some(r.allow_oracle),
-                allow_pii_egress: r.allow_pii_egress,
-                round: None,
-                explain: r.explain,
-                profile: r.profile,
-            },
-            user: None,
-            session_id: None,
-        };
+        let req = route_request(r, route_question(s), text);
         let d = self.svc.decide(&req, p)?;
         self.note(&d, &p.account, request_id);
         self.link(request_id, &d.id);
@@ -2905,6 +2957,12 @@ pub struct ServeOptions {
     /// The admin token; `None` reads the variable named by
     /// `auth.admin_token_env` (the only production source).
     pub admin_token: Option<String>,
+    /// `--shadow-of URL`: shadow mode (spec §4.15) — the router API is
+    /// answered by the router at `URL`, `/v1/route` and `/v1/route:batch` are
+    /// also decided locally and compared in `<state>/shadow.jsonl`.
+    pub shadow_of: Option<String>,
+    /// Deadline of one request forwarded in shadow mode.
+    pub shadow_timeout: Duration,
 }
 
 impl std::fmt::Debug for ServeOptions {
@@ -2919,6 +2977,8 @@ impl std::fmt::Debug for ServeOptions {
                 "admin_token",
                 &self.admin_token.as_ref().map(|_| "<redacted>"),
             )
+            .field("shadow_of", &self.shadow_of)
+            .field("shadow_timeout", &self.shadow_timeout)
             .finish()
     }
 }
@@ -2934,6 +2994,8 @@ impl ServeOptions {
             addr: SocketAddr::from(([127, 0, 0, 1], DEFAULT_PORT)),
             cascade: CascadeOptions::default(),
             admin_token: None,
+            shadow_of: None,
+            shadow_timeout: cortiq_decision::shadow::UPSTREAM_TIMEOUT,
         }
     }
 
@@ -2970,6 +3032,12 @@ impl DecisionServer {
     pub fn open(opts: &ServeOptions) -> Result<Self> {
         let cfg = &opts.config;
         cfg.validate()?;
+        // The URL is checked before anything is opened or created.
+        let upstream = opts
+            .shadow_of
+            .as_deref()
+            .map(|u| cortiq_decision::shadow::Upstream::new(u, opts.shadow_timeout))
+            .transpose()?;
         let root = opts.state_root();
         let dir =
             StateDir::open(&root).with_context(|| format!("state directory {}", root.display()))?;
@@ -3026,7 +3094,20 @@ impl DecisionServer {
                 "open mode on a non-loopback address: anyone who can connect may decide"
             );
         }
-        let state = DecisionState::new(svc, Some(cascade))?;
+        let shadow = match upstream {
+            Some(u) => {
+                let sh = shadow::Shadow::open(u, &dir.shadow_log_path())?;
+                tracing::info!(
+                    shadow_of = %sh.upstream_base(),
+                    log = %dir.shadow_log_path().display(),
+                    lines = sh.lines(),
+                    "shadow mode: the router API is answered by the old router"
+                );
+                Some(Arc::new(sh))
+            }
+            None => None,
+        };
+        let state = DecisionState::with_shadow(svc, Some(cascade), shadow)?;
         Ok(Self {
             state,
             ledger,
@@ -3060,6 +3141,9 @@ impl DecisionServer {
             .with_graceful_shutdown(shutdown)
             .await
             .context("decision server")?;
+        if let Some(sh) = &self.state.shadow {
+            sh.drain(shadow::DRAIN_TIMEOUT).await;
+        }
         tokio::task::spawn_blocking(move || self.close())
             .await
             .context("close the decision server")?
@@ -3072,6 +3156,9 @@ impl DecisionServer {
             f.stop()?;
         }
         self.ledger.close()?;
+        if let Some(sh) = &self.state.shadow {
+            sh.sync()?;
+        }
         Ok(())
     }
 }
