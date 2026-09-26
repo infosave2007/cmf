@@ -41,8 +41,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `x-cmf-extensions: 1` adds the decision-v4 fields. `cortiq decision keys
   import` takes the router's `api_keys` and `usage_counters` exports (or its
   `[[api_keys]]`), so existing keys keep working; `serve --shadow-of URL`
-  answers router traffic from the old router while deciding it locally and
-  logging the agreement (`GET /v1/admin/shadow`).
+  (https, or plain http to a loopback address) answers router traffic from
+  the old router while deciding it locally and logging the agreement
+  (`GET /v1/admin/shadow`).
 - Oracle cascade, off by default: only questions the gate rejects, or that no
   skill covers, go to an OpenRouter model (`deepseek/deepseek-v4.1-flash` by
   default) after the consent checks, with a budget reserved before each call,
@@ -6129,7 +6130,8 @@ Initial public release.
 - **Licensing** — Apache-2.0 with an explicit patent-grant explanation
   (`LICENSE`, `NOTICE`, `PATENTS.md`).
 
-[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.7.7...HEAD
+[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.7.8...HEAD
+[0.7.8]: https://github.com/infosave2007/cmf/compare/v0.7.7...v0.7.8
 [0.7.7]: https://github.com/infosave2007/cmf/compare/v0.7.6...v0.7.7
 [0.6.9]: https://github.com/infosave2007/cmf/compare/v0.6.8...v0.6.9
 [0.6.8]: https://github.com/infosave2007/cmf/compare/v0.6.7...v0.6.8
