@@ -11,6 +11,9 @@
 //!   `trap` file);
 //! * cold start: a label only the oracle knows becomes a task after 25 answers,
 //!   and its wins are not certified;
+//! * a second label (a cold start) is promoted in the same process after a
+//!   first promotion (refit) of the skill, on top of it (generation 2, parent 1);
+//! * activating an inactive task that regresses the holdout is refused;
 //! * rollback to the base and forward, restart restores the served generation,
 //!   the cache and the buffer from `learn.log` (a cut tail is dropped); the
 //!   offline rollback of the CLI; a promotion after a rollback;
@@ -19,7 +22,8 @@
 //! * `cortiq decision learn` (library side): the oracle only for abstentions,
 //!   answers reused from ledgers by body sha256, promotions with the holdout
 //!   gate, the other skills byte for byte, learned rows in the rows blob, and
-//!   every promotion undone when the certified gate is lost.
+//!   every promotion undone when the certified gate is lost; `calls` counts
+//!   the calls sent (refusals apart); live calls without a key are refused.
 
 #[path = "fixtures/oracle/support.rs"]
 mod support;
@@ -400,6 +404,154 @@ fn cold_start_turns_an_oracle_label_into_a_task_after_25_answers() {
     // The four-label question is a subset now (not certified).
     let d = st.decide(&topics_body(&toy().dev[0].0)).unwrap();
     assert_eq!(d.response["cmf"]["questions"]["task"]["match"], "subset");
+}
+
+/// Two labels of one skill promoted one after the other in the same process
+/// (no restart, no rollback in between): a refit of `travel`, then a cold start
+/// of `cuisine` on top of it (generation 2, parent 1).
+#[test]
+fn a_second_label_is_promoted_in_the_same_process_after_a_first_promotion() {
+    let mock = MockOracle::answering("travel");
+    let st = Stand::new(&stand_config(&mock.url()));
+    let before = DecisionModel::open(&toy().path, Verify::Full).unwrap();
+    teach(&st, lesson());
+    let g1 = served(&st);
+    assert_eq!(g1.generation(), 1);
+
+    mock.set(|req| answer_reply(req, |_, opts| pick(opts, "cuisine"), 1.3e-5));
+    let mut l5 = TOPICS.to_vec();
+    l5.push("cuisine");
+    let ask = |t: &str| body(json!(t), json!({"task": choice(&l5)}), None);
+    let food = distinct_texts("food", 25, 17, "f", 0.97);
+    for t in &food {
+        let d = st.decide(&ask(t)).unwrap();
+        assert_eq!(d.questions[0].action, Action::Oracle, "{t}");
+    }
+    assert_eq!(mock.hits(), 50);
+    let l = learning(&st);
+    assert_eq!(
+        (
+            l["attempts"].as_u64(),
+            l["promotions"].as_u64(),
+            l["cold_starts"].as_u64(),
+            l["errors"].as_u64(),
+        ),
+        (Some(2), Some(2), Some(1), Some(0)),
+        "{l}"
+    );
+    assert_eq!(l["isolation_violations"], 0);
+    let rec = l["recent"].as_array().unwrap().last().unwrap();
+    assert_eq!(
+        (
+            rec["outcome"].as_str(),
+            rec["kind"].as_str(),
+            rec["generation"].as_u64()
+        ),
+        (Some("promoted"), Some("cold_start"), Some(2)),
+        "{rec}"
+    );
+
+    let now = served(&st);
+    assert_eq!(now.generation(), 2);
+    let m = now.model();
+    let om = m.overlay_manifest().unwrap();
+    assert_eq!((om.generation, om.parent), (2, 1));
+    let events: Vec<(&str, &str)> = om
+        .events
+        .iter()
+        .map(|e| (e.label.as_str(), e.kind.as_str()))
+        .collect();
+    assert_eq!(
+        events,
+        vec![("travel", "promote"), ("cuisine", "cold_start")]
+    );
+    let gpath = st.state.generation_path(2);
+    let reopened =
+        DecisionModel::open_with_overlay(&toy().path, Some(&gpath), Verify::Full).unwrap();
+    assert_eq!(reopened.model_sha(), now.model_sha());
+
+    // Generation 1 → 2 changed only the new task; the refit of generation 1 is
+    // carried unchanged; base → 2 changed task 3 and added task 4.
+    assert!(learn::isolation_violations(g1.model(), m, "topics", 4).is_empty());
+    let (a, b) = (task_table(&before), task_table(m));
+    let key = |r: &TaskRow| (r.0.clone(), r.1);
+    let changed: Vec<_> = b.iter().filter(|y| !a.contains(y)).map(key).collect();
+    assert_eq!(
+        changed,
+        vec![("topics".to_string(), 3), ("topics".to_string(), 4)]
+    );
+    assert_eq!(b.len(), a.len() + 1);
+    let sk = &m.skill("topics").unwrap().manifest;
+    assert_eq!(
+        sk.labels,
+        vec!["Weather", "billing", "cards", "travel", "cuisine"]
+    );
+    assert_eq!(
+        (sk.tasks[4].origin, sk.tasks[4].state, sk.tasks[4].n_train),
+        (TaskOrigin::ColdStart, TaskState::Active, 25)
+    );
+    let learned = m.rows_learned("topics").unwrap().unwrap();
+    assert_eq!(
+        learned.rows.iter().map(|r| r.task).collect::<Vec<_>>(),
+        [vec![3u32; 25], vec![4u32; 25]].concat()
+    );
+    assert_fit_reproduces(m, "topics", 3);
+    assert_fit_reproduces(m, "topics", 4);
+    assert_gate_from_scratch(m, "topics");
+
+    // The state on disk is the state in memory.
+    let sha = now.model_sha().to_string();
+    let st = st.restart(&stand_config(&mock.url()));
+    assert_eq!(served(&st).model_sha(), sha);
+}
+
+/// Activating an inactive data task (a label the skill already has) is gated
+/// on the holdout like a refit: `zc1` of the trap file taught with 25 travel
+/// texts takes travel's holdout rows and is refused.
+#[test]
+fn an_activation_that_regresses_the_holdout_is_refused() {
+    let mock = MockOracle::answering("zc1");
+    let st = Stand::open_on(
+        &trap().path,
+        tempfile::tempdir().unwrap(),
+        &stand_config(&mock.url()),
+        test_key_lookup(),
+    );
+    let trap_model = DecisionModel::open(&trap().path, Verify::Full).unwrap();
+    let sk = &trap_model.skill("trap").unwrap().manifest;
+    assert_eq!(
+        sk.tasks[sk.task_of("zc1").unwrap()].state,
+        TaskState::Inactive
+    );
+    // The eight-label question is a superset (zc1..zc4 are not trained): every
+    // text goes to the oracle, which answers zc1.
+    let labels = [
+        "Weather", "billing", "cards", "travel", "zc1", "zc2", "zc3", "zc4",
+    ];
+    let ask = |t: &str| body(json!(t), json!({"task": choice(&labels)}), None);
+    for t in distinct_texts("travel", 25, 41, "v", 0.97) {
+        let d = st.decide(&ask(&t)).unwrap();
+        assert_eq!(d.questions[0].action, Action::Oracle, "{t}");
+    }
+    assert_eq!(mock.hits(), 25);
+    let lj = learning(&st);
+    assert_eq!(lj["attempts"], 1, "{lj}");
+    let l = &lj["recent"][0];
+    assert_eq!(l["kind"], "activate", "{l}");
+    assert_eq!(l["outcome"], "rejected", "{l}");
+    assert_eq!(l["reason"], "holdout_regression", "{l}");
+    let h = &l["holdout"];
+    assert_eq!(
+        (h["gated"].as_bool(), h["passed"].as_bool()),
+        (Some(true), Some(false))
+    );
+    assert!(
+        h["challenger"]["macro"].as_f64().unwrap() + 1e-4
+            < h["champion"]["macro"].as_f64().unwrap()
+    );
+    assert!(st.state.generations().unwrap().is_empty());
+    assert_eq!(served(&st).generation(), 0);
+    assert_eq!(lj["rejections"], 1);
 }
 
 // ------------------------------------------------------------------ generations
@@ -833,4 +985,49 @@ fn offline_learning_without_live_calls_uses_the_ledgers_only() {
     let mut o2 = offline_opts(d, &mock, &traffic, Vec::new());
     o2.ledger = None;
     assert!(learn::learn_offline(&toy().path, &o2, test_key_lookup(), &d.join("o2.cmf")).is_err());
+    // Live calls enabled without a key in the environment: refused up front,
+    // before the ledger or the output exists.
+    let o3 = offline_opts(d, &mock, &traffic, Vec::new());
+    let e = learn::learn_offline(&toy().path, &o3, no_key_lookup(), &d.join("o3.cmf")).unwrap_err();
+    assert!(format!("{e:#}").contains(KEY_ENV), "{e:#}");
+    assert!(!d.join("o3.cmf").exists());
+    assert!(!d.join("oracle.jsonl").exists());
+    assert_eq!(mock.hits(), 0);
+}
+
+/// `live_calls` (and `learned.calls`) count the calls sent; calls the budget
+/// refuses are reported apart and their texts are unanswered.
+#[test]
+fn offline_learning_counts_only_the_calls_sent() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let cruise = distinct_texts("cruise", 5, 7, "q", 0.97);
+    let lines: Vec<Value> = cruise.iter().map(|t| json!({"text": t})).collect();
+    let traffic = write(d, "traffic.jsonl", &jsonl_of(&lines));
+    let mock = MockOracle::answering("travel");
+    let mut opts = offline_opts(d, &mock, &traffic, Vec::new());
+    opts.oracle.max_calls = 3;
+    let out = d.join("o.cmf");
+    let rep = learn::learn_offline(&toy().path, &opts, test_key_lookup(), &out).unwrap();
+    assert_eq!(mock.hits(), 3);
+    assert_eq!(
+        (
+            rep.abstained,
+            rep.live_calls,
+            rep.failed_calls,
+            rep.unanswered
+        ),
+        (5, 3, 0, 2)
+    );
+    assert_eq!(
+        rep.refused_calls,
+        std::collections::BTreeMap::from([("budget".to_string(), 2)])
+    );
+    assert_eq!(rep.to_json()["refused_calls"]["budget"], 2);
+    let m = DecisionModel::open(&out, Verify::Full).unwrap();
+    let l = m.skill("topics").unwrap().manifest.learned.clone().unwrap();
+    assert_eq!((l.calls, l.answers_reused), (3, 0));
+    // The ledger holds the 3 calls sent (reserved + settled), nothing refused.
+    let ledger = std::fs::read_to_string(d.join("oracle.jsonl")).unwrap();
+    assert_eq!(ledger.lines().count(), 6);
 }
