@@ -1,0 +1,77 @@
+{
+ "source": {
+  "request": "reports/decision-system-20260925/protocol-request.json",
+  "response": "reports/decision-system-20260925/protocol-jev-native.json",
+  "note": "request: model set to cortiq/decision and the legacy cmf block dropped; response: answers and usage as stored (model/provider as every stored Jev row)"
+ },
+ "request": {
+  "model": "cortiq/decision",
+  "state": {
+   "ticket": "I was charged twice for my subscription. Please refund the duplicate charge before Friday."
+  },
+  "questions": {
+   "team": {
+    "type": "choice",
+    "instructions": "Which team should handle the ticket?",
+    "criteria": {
+     "billing": "Charges, invoices, refunds",
+     "technical": "Software failures",
+     "account": "Login or profile changes"
+    }
+   },
+   "urgency": {
+    "type": "score",
+    "instructions": "How urgent is the ticket?",
+    "criteria": [
+     "Routine; no deadline",
+     "A requested deadline but no current outage",
+     "Critical outage or immediate danger"
+    ]
+   },
+   "refund": {
+    "type": "noul",
+    "instructions": "Does the customer explicitly ask for a refund?"
+   }
+  }
+ },
+ "jev_response": {
+  "model": "typesafe/jev-1.13-20260917",
+  "provider": "TypeSafe",
+  "answers": {
+   "refund": {
+    "noul": 0.99,
+    "type": "noul"
+   },
+   "team": {
+    "choice": "billing",
+    "confidence": 1,
+    "probabilities": {
+     "account": 0,
+     "billing": 1,
+     "technical": 0
+    },
+    "type": "choice"
+   },
+   "urgency": {
+    "confidence": 1,
+    "legend": {
+     "0": "Routine; no deadline",
+     "1": "A requested deadline but no current outage",
+     "2": "Critical outage or immediate danger"
+    },
+    "probabilities": {
+     "0": 0,
+     "1": 1,
+     "2": 0
+    },
+    "score": 1,
+    "type": "score"
+   }
+  },
+  "usage": {
+   "cost": 1.7472e-05,
+   "input_tokens": 416,
+   "output_tokens": 69
+  }
+ }
+}
