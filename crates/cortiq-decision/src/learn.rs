@@ -17,9 +17,11 @@
 //! 2. *holdout* (calibration rows flagged holdout, spec §3.2): the winner by the
 //!    argmin over every active task; the accuracy of the task and the macro
 //!    accuracy over the labels with holdout rows must satisfy `chall + 1e-4 ≥
-//!    champ` (a label without holdout rows is not checked). A refit is refused
-//!    on regression; activations and cold starts record the numbers only (spec
-//!    §5.8 names no holdout gate for them);
+//!    champ` (a label without holdout rows is not checked). A refit or an
+//!    activation (the label is already in the skill, its rows may be in the
+//!    holdout) is refused on regression; a cold start records the numbers only
+//!    (spec §5.8 names no holdout gate for a new label, as cortiq-router's
+//!    `maybe_promote_cold_task`; its own label has no holdout row);
 //! 3. *recertification* (spec §5.9): `T`, `θ`, `τ` by the build's procedure
 //!    (spec §3.6) on the skill's calibration rows; the errors of the unchanged
 //!    tasks are reused (their topologies did not change) and only the new
@@ -29,7 +31,9 @@
 //! 4. *promotion*: the generation is written and fsynced, opened with the overlay
 //!    loader, checked for *isolation* (the `mean`/`basis` sha256 and `k` of every
 //!    other task of every skill are unchanged, else the promotion is cancelled),
-//!    made `CURRENT`, and swapped into the model handle.
+//!    made `CURRENT`, and swapped into the model handle. The skill's book then
+//!    takes the manifest the new generation serves (with the writer's tensor
+//!    sha256), so the next attempt of any label of the skill builds on it.
 //!
 //! Every attempt (promoted, refused or skipped) resets the label's counter
 //! (cortiq-router `selflearn.rs:75-86`) and is logged in `learn.log`.
@@ -37,7 +41,9 @@
 //! **Offline** ([`learn_offline`], spec §5.14): every text of a traffic file is
 //! decided by the input model; accepted texts are left alone (the oracle is never
 //! asked about them); for an abstention the answer is taken from the answer
-//! ledgers by the sha256 of the request body, else from a live call. Answers
+//! ledgers by the sha256 of the request body, else from a live call (live calls
+//! enabled without a key in the environment are refused up front; `calls`
+//! counts the calls sent, refusals are reported apart). Answers
 //! become examples (dedup 0.995). After the pass every label with a new example
 //! (label order) gets a challenger with the holdout gate against the current
 //! champion; the promotions accumulate. The gate is then recertified once; a
@@ -162,7 +168,8 @@ pub struct HoldoutReport {
     pub chall_macro: Option<f64>,
     /// No regression (`chall + 1e-4 ≥ champ` for both measured metrics).
     pub passed: bool,
-    /// Whether this attempt is refused on a regression (refits only).
+    /// Whether this attempt is refused on a regression (refits and
+    /// activations; a cold start is not gated).
     pub gated: bool,
 }
 
@@ -479,7 +486,7 @@ impl SkillBook {
             rows: champ.values().map(|v| v.1).sum(),
             labels: champ.len(),
             passed: ok(champ_task, chall_task) && ok(champ_macro, chall_macro),
-            gated: ch.kind == ChangeKind::Refit,
+            gated: ch.kind != ChangeKind::ColdStart,
             champ_task,
             chall_task,
             champ_macro,
@@ -523,16 +530,33 @@ impl SkillBook {
         })
     }
 
-    /// Adopt a promoted challenger as the champion.
-    pub fn adopt(&mut self, ch: &Challenger, gate: Gate, manifest_sha: Option<String>) {
+    /// Adopt a promoted challenger as the champion of an offline pass (nothing
+    /// is served): the challenger's manifest with `gate`. Its changed task keeps
+    /// `mean_sha256`/`basis_sha256` unset (the writer fills them), so this book
+    /// must never feed an [`OverlayBuilder`]; online promotions use
+    /// [`SkillBook::adopt_served`].
+    pub fn adopt(&mut self, ch: &Challenger, gate: Gate) {
         self.manifest = ch.manifest.clone();
         self.manifest.gate = gate;
         self.temperature = self.manifest.gate.params().temperature;
         self.gen_learned = ch.gen_learned.clone();
         self.calib = Some(ch.calib.clone());
-        if let Some(s) = manifest_sha {
-            self.manifest_sha = s;
-        }
+    }
+
+    /// Adopt a promoted challenger as the champion after its generation was
+    /// published: the manifest is the one the new generation serves (the
+    /// writer's tensor sha256, the `rows.learned` record, the recertified
+    /// gate), so the next challenger of any label of the skill passes the
+    /// overlay builder's "unchanged task keeps its record" check; the rows and
+    /// the calibration columns are the challenger's (the same bits the served
+    /// model gives).
+    pub fn adopt_served(&mut self, ch: &Challenger, served: &crate::container::LoadedSkill) {
+        debug_assert_eq!(served.manifest.id, self.id);
+        self.manifest = served.manifest.clone();
+        self.manifest_sha = served.sha256.clone();
+        self.temperature = self.manifest.gate.params().temperature;
+        self.gen_learned = ch.gen_learned.clone();
+        self.calib = Some(ch.calib.clone());
     }
 }
 
@@ -846,14 +870,14 @@ fn attempt_inner(ctx: &LearnContext<'_>, skill: &str, label: &str) -> Result<Att
         }
         Err(e) => return Err(e),
     };
-    let new_sha = published
+    let served_skill = published
         .model
         .skill(skill)
-        .map(|s| s.sha256.clone())
+        .cloned()
         .ok_or_else(|| anyhow::anyhow!("the generation lost skill '{skill}'"))?;
     let sha256 = published.report.sha256.clone();
     let next = loaded.derive(published.model)?;
-    book.adopt(&ch, gate, Some(new_sha));
+    book.adopt_served(&ch, &served_skill);
     drop(books);
     ctx.handle.promote(next);
     tracing::info!(
@@ -928,7 +952,13 @@ pub struct OfflineReport {
     pub accepted: usize,
     pub abstained: usize,
     pub answers_reused: usize,
+    /// Calls sent to the oracle (answered or failed); `learned.calls`.
     pub live_calls: usize,
+    /// Sent calls that failed (HTTP error, transport, invalid answer, …).
+    pub failed_calls: usize,
+    /// Calls not sent, by reason (`budget`, `stopped`, `oracle_disabled`,
+    /// `ledger_write`); their texts are unanswered.
+    pub refused_calls: BTreeMap<String, usize>,
     pub unanswered: usize,
     pub pii_redacted: usize,
     pub examples: usize,
@@ -950,6 +980,7 @@ impl OfflineReport {
             "skill": self.skill, "traffic_sha256": self.traffic_sha256, "texts": self.texts,
             "labelled": self.labelled, "accepted": self.accepted, "abstained": self.abstained,
             "answers_reused": self.answers_reused, "live_calls": self.live_calls,
+            "failed_calls": self.failed_calls, "refused_calls": self.refused_calls,
             "unanswered": self.unanswered, "pii_redacted": self.pii_redacted,
             "examples": self.examples, "duplicates": self.duplicates,
             "labels": self.labels.iter().map(|l| json!({
@@ -1023,7 +1054,18 @@ pub fn learn_offline(
     let labelled = inputs.iter().filter(|r| r.label.is_some()).count();
     let answers = oracle::read_answer_ledgers(&opts.answers)?;
     let client = match (&opts.ledger, opts.oracle.enabled) {
-        (Some(l), true) => Some(OracleClient::open(&opts.oracle, l, None, key)?),
+        (Some(l), true) => {
+            // Refused up front (before the ledger is created): a run that was
+            // configured for live calls must not quietly learn from the
+            // ledgers alone. Only the presence of the key is checked.
+            ensure!(
+                key(&opts.oracle.api_key_env).is_some(),
+                "oracle.enabled is true but the environment variable {} holds no key: set it, \
+                 or set oracle.enabled=false to learn from the --answers ledgers only",
+                opts.oracle.api_key_env
+            );
+            Some(OracleClient::open(&opts.oracle, l, None, key)?)
+        }
         (None, true) => bail!("live oracle calls need a reservation ledger path"),
         (_, false) => None,
     };
@@ -1037,6 +1079,9 @@ pub fn learn_offline(
     let mut asked: HashMap<String, Option<String>> = HashMap::new();
     let (mut accepted, mut abstained, mut reused, mut live, mut unanswered, mut redacted) =
         (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+    let mut failed = 0usize;
+    // Calls that were not sent, by reason (`budget`, `stopped`, …).
+    let mut refusals: BTreeMap<String, usize> = BTreeMap::new();
     let (mut examples, mut duplicates) = (0usize, 0usize);
     for chunk in inputs.chunks(crate::build::ENCODE_CHUNK) {
         let texts: Vec<&str> = chunk.iter().map(|r| r.text.as_str()).collect();
@@ -1065,19 +1110,35 @@ pub fn learn_offline(
                     reused += 1;
                     Some(c.clone())
                 } else if let Some(cl) = &client {
-                    live += 1;
                     let caller = Caller {
                         request_id: &caller_id,
                         account: "decision-learn",
                         key12: None,
                         key_budget_usd: None,
                     };
+                    // A live call is one that was sent (answered or failed);
+                    // refusals (budget, stop rule, …) are counted apart.
                     match cl.call_body(&caller, &[&question], &body) {
-                        CallOutcome::Answered(a) => match a.verdicts.first() {
-                            Some(crate::answer::OracleAnswer::Choice(c)) => Some(c.clone()),
-                            _ => None,
-                        },
-                        _ => None,
+                        CallOutcome::Answered(a) => {
+                            live += 1;
+                            match a.verdicts.first() {
+                                Some(crate::answer::OracleAnswer::Choice(c)) => Some(c.clone()),
+                                _ => None,
+                            }
+                        }
+                        CallOutcome::Failed(f) if f.call_id.is_some() => {
+                            live += 1;
+                            failed += 1;
+                            None
+                        }
+                        CallOutcome::Failed(f) => {
+                            *refusals.entry(f.error).or_default() += 1;
+                            None
+                        }
+                        CallOutcome::Refused(r) => {
+                            *refusals.entry(r.flag().to_string()).or_default() += 1;
+                            None
+                        }
                     }
                 } else {
                     None
@@ -1147,7 +1208,7 @@ pub fn learn_offline(
         if h.passed {
             entry.outcome = "promoted".into();
             let gate = book.manifest.gate.clone();
-            book.adopt(&ch, gate, None);
+            book.adopt(&ch, gate);
             promoted.push(ch);
         } else {
             entry.outcome = "rejected".into();
@@ -1290,6 +1351,8 @@ pub fn learn_offline(
         abstained,
         answers_reused: reused,
         live_calls: live,
+        failed_calls: failed,
+        refused_calls: refusals,
         unanswered,
         pii_redacted: redacted,
         examples,
