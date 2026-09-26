@@ -1738,9 +1738,9 @@ mod tests {
 
     #[test]
     fn oracle_config_accepts_a_full_config_or_the_oracle_section() {
-        let dir =
-            std::env::temp_dir().join(format!("cortiq-cli-oracle-cfg-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // Removed on drop, a failed assertion included.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let full = dir.join("full.json");
         std::fs::write(
             &full,
@@ -1758,6 +1758,5 @@ mod tests {
         let bad = dir.join("bad.json");
         std::fs::write(&bad, br#"{"oracle":{"nope":1}}"#).unwrap();
         assert!(load_oracle_config(&bad).is_err());
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

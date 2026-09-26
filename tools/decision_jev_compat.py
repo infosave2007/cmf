@@ -580,6 +580,16 @@ def main():
         sys.exit(f"{a.out} exists")
     work = a.work or tempfile.mkdtemp(prefix="cortiq-jev-compat.")
     os.makedirs(work, exist_ok=True)
+    try:
+        return run_all(a, work)
+    finally:
+        # The temp dir goes whatever happens (a failure included); a --work
+        # directory is the caller's and stays.
+        if not a.work:
+            shutil.rmtree(work, ignore_errors=True)
+
+
+def run_all(a, work):
     t0 = time.time()
     doc = {"schema": "cortiq-decision-v4-jev-compat/1", "utc": utc_now(),
            "model": {"path": a.model, "sha256": sha256_file(a.model)},
@@ -605,8 +615,6 @@ def main():
     with open(tmp, "w") as f:
         json.dump(doc, f, indent=1, ensure_ascii=False)
     os.replace(tmp, a.out)
-    if not a.work:
-        shutil.rmtree(work, ignore_errors=True)
     print(json.dumps({"jev_compat": a.out, "pass": doc["pass"]}))
     return 0 if doc["pass"] else 1
 

@@ -30,6 +30,9 @@
 pub mod certify;
 pub mod eigen;
 pub mod fit;
+// A verbatim copy (spec §1.5; tests/hashfeat.rs checks it against the embryo
+// file): `cargo fmt` must not reformat it.
+#[rustfmt::skip]
 pub mod hashfeat;
 pub mod packed;
 pub mod resonance;

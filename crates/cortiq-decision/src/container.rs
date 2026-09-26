@@ -35,6 +35,16 @@
 //! names and `decision.skill.{id}.rows.learned`. Loading = base + overlay, overlay
 //! tensors first. The base's rows blob and encoder are never replaced.
 //!
+//! Deviation from the §2.2 table (declared): a full (base) file may also hold
+//! `decision.skill.{id}.rows.learned` — [`materialize`] of a generation copies
+//! every skill manifest byte for byte (the build rows blob and its record
+//! unchanged), so a skill with learned rows keeps that tensor — but only
+//! for a skill whose manifest declares the `rows_learned` record (tensor name,
+//! sha256, count); anywhere else it is an unexpected tensor
+//! ([`Refusal::ExtraTensor`]). [`DecisionModel::verify_full`] checks the base
+//! file against its own skill manifests and a generation's replaced skills
+//! against the overlay's.
+//!
 //! **Writers** ([`FileBuilder`], [`OverlayBuilder`]): a temp file in the output's
 //! directory, fsync, a strict [`Verify::Full`] open of the temp file, then a
 //! no-clobber publish (`hard_link`, which fails instead of replacing; a
@@ -66,6 +76,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 // ------------------------------------------------------------------ errors
 
@@ -183,7 +194,8 @@ pub struct VerifyReport {
 /// A decision file (and optionally a generation overlay), checked and ready to
 /// serve. Weights stay in the mmap.
 pub struct DecisionModel {
-    base: CmfModel,
+    /// Shared so that the encoder can hold views of its mapping ([`Self::base_file`]).
+    base: Arc<CmfModel>,
     overlay: Option<CmfModel>,
     manifest: DecisionManifest,
     base_model_sha: String,
@@ -641,7 +653,7 @@ impl DecisionModel {
             .map(|(i, s)| (s.manifest.id.clone(), i))
             .collect();
         let mut model = Self {
-            base: c,
+            base: Arc::new(c),
             overlay: None,
             manifest,
             base_model_sha,
@@ -713,10 +725,13 @@ impl DecisionModel {
         if !f32_view(golden).iter().all(|v| v.is_finite()) {
             return Err(Refusal::Integrity("encoder golden is not finite".into()));
         }
-        // Skills.
+        // Skills: against the base file's own manifests. After an overlay was
+        // applied `self.skills` holds the generation's manifests, whose changed
+        // tasks live in the overlay ([`Self::verify_full`] checks those).
         let dims = (self.encoder_dim(), self.hashing_dim());
-        for s in &self.skills {
-            for (name, x) in skill_tensor_expectations(&s.manifest, self.signal_dim()) {
+        for m in self.base_skill_manifests()? {
+            let m: &SkillManifest = &m;
+            for (name, x) in skill_tensor_expectations(m, self.signal_dim()) {
                 let bytes = c
                     .tensor_bytes(&name)
                     .map_err(|_| Refusal::MissingTensor(name.clone()))?;
@@ -725,20 +740,20 @@ impl DecisionModel {
                 }
                 hashed += bytes.len() as u64;
             }
-            for t in &s.manifest.tasks {
-                self.check_task_values(&s.manifest, t, c, None)?;
+            for t in &m.tasks {
+                self.check_task_values(m, t, c, None)?;
             }
             check_rows_blob(
-                &s.manifest,
-                c.tensor_bytes(&s.manifest.rows.tensor)
-                    .map_err(|_| Refusal::MissingTensor(s.manifest.rows.tensor.clone()))?,
+                m,
+                c.tensor_bytes(&m.rows.tensor)
+                    .map_err(|_| Refusal::MissingTensor(m.rows.tensor.clone()))?,
                 dims.0,
                 dims.1,
                 None,
             )?;
-            if let Some(r) = &s.manifest.rows_learned {
+            if let Some(r) = &m.rows_learned {
                 check_rows_blob(
-                    &s.manifest,
+                    m,
                     c.tensor_bytes(&r.tensor)
                         .map_err(|_| Refusal::MissingTensor(r.tensor.clone()))?,
                     dims.0,
@@ -748,6 +763,34 @@ impl DecisionModel {
             }
         }
         Ok(hashed)
+    }
+
+    /// The skill manifests of the base file itself, in skill order: a skill an
+    /// overlay replaced is read again from the base (its sha256 checked against
+    /// the base's `decision.manifest`).
+    fn base_skill_manifests(&self) -> Result<Vec<Cow<'_, SkillManifest>>, Refusal> {
+        let rid = &self.manifest.representation_id;
+        self.skills
+            .iter()
+            .map(|s| {
+                if !s.from_overlay {
+                    return Ok(Cow::Borrowed(&s.manifest));
+                }
+                let id = s.id();
+                let sref = self
+                    .manifest
+                    .skills
+                    .iter()
+                    .find(|r| r.id == id)
+                    .ok_or_else(|| {
+                        Refusal::Overlay(format!("skill '{id}' is not in the base file"))
+                    })?;
+                let name = skill_manifest_tensor(id);
+                let bytes = manifest_bytes(&self.base, &name)?;
+                check_sha(&name, bytes, &sref.manifest_sha256)?;
+                parse_skill(bytes, id, rid, self.signal_dim()).map(Cow::Owned)
+            })
+            .collect()
     }
 
     /// The topology of a task has the shapes of its record and finite values (its
@@ -930,6 +973,12 @@ impl DecisionModel {
     /// The base file.
     pub fn base(&self) -> &CmfModel {
         &self.base
+    }
+
+    /// A shared handle of the base file's mapping: the encoder keeps views of
+    /// its aligned weights (spec §2.2) without copying them.
+    pub fn base_file(&self) -> Arc<CmfModel> {
+        Arc::clone(&self.base)
     }
 
     /// The generation overlay, when one is applied.
@@ -2106,4 +2155,56 @@ fn persist_noclobber(
     );
     let model_sha = check(out, Verify::Light)?;
     Ok((sha, len, model_sha))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// A write whose post-write check of the temp file fails publishes nothing
+    /// and leaves no temp file (the `TempGuard` branch); the same write with a
+    /// passing check publishes exactly the output.
+    #[test]
+    fn a_failed_post_write_check_leaves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let header = decision_header(BASE_PROFILE, 8).unwrap();
+        let data = [0u8; 16];
+        let specs = [TensorSpecRef {
+            name: MANIFEST_TENSOR.into(),
+            dtype: TensorDtype::U8,
+            shape: vec![data.len()],
+            data: &data,
+        }];
+        let out = dir.path().join("out.cmf");
+        let checked = std::cell::Cell::new(Vec::new());
+        let err = persist_noclobber(&out, &header, &specs, |p, v| {
+            let mut seen = checked.take();
+            seen.push((p.to_path_buf(), v));
+            checked.set(seen);
+            anyhow::bail!("refused by the test")
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("fails its own checks"), "{err:#}");
+        let seen = checked.take();
+        assert_eq!(seen.len(), 1, "only the temp file was checked");
+        assert_eq!(seen[0].1, Verify::Full);
+        assert_ne!(seen[0].0, out, "the check ran on the temp file");
+        assert!(names(dir.path()).is_empty(), "{:?}", names(dir.path()));
+        // The same write with a passing check: the output and nothing else.
+        let (sha, len, model_sha) =
+            persist_noclobber(&out, &header, &specs, |_, _| Ok("m".into())).unwrap();
+        assert_eq!(names(dir.path()), vec!["out.cmf".to_string()]);
+        assert_eq!(len, std::fs::metadata(&out).unwrap().len());
+        assert_eq!(sha.len(), 64);
+        assert_eq!(model_sha, "m");
+    }
 }

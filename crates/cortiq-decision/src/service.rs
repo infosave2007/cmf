@@ -46,6 +46,13 @@
 //! `router:uncertified`, `router:uncertified_subset`, `escalate→cache`,
 //! `escalate→oracle`, `escalate→oracle_unavailable`, `escalate→disabled`};
 //! `explanation` {top1_vs_top2, decision_path} with `cmf.explain`.
+//!
+//! Deviation from §4.7b (declared): the spec lists six `decision_path` values
+//! and none of them names an exact local answer that is not certified — a JSON
+//! state, the `cost-saver` profile (θ only), a skill whose gate did not certify,
+//! or a cold-start winner. `router:certified` would claim a certification that
+//! does not exist and `router:uncertified_subset` is for subset matches, so that
+//! answer is `router:uncertified` (the closest correct name, the same prefix).
 
 use crate::answer::{self, OracleAnswer, Rounding};
 use crate::config::Config;

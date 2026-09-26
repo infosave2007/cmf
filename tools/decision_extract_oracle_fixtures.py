@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
-"""Extract the WP6 oracle body fixtures: 3 answered calls per dataset from the v4
-DeepSeek *dev* ledgers (reports/decision-v4-20260926/oracle/{ds}-dev.part*.jsonl).
+"""Extract the WP6 oracle body fixtures of
+crates/cortiq-decision/tests/fixtures/oracle/deepseek_bodies.json: 3 answered calls
+per dataset from the v4 DeepSeek *dev* ledgers
+(reports/decision-v4-20260926/oracle/{ds}-dev.part*.jsonl).
+
+    python3 tools/decision_extract_oracle_fixtures.py [--cmfpublic DIR] [--out FILE]
+
+The ledgers, the driver and the dev splits are read from --cmfpublic (default:
+$CMFPUBLIC, else the main checkout of this repository, which holds the local
+reports/ and artifacts/).
 
 For each call the dev text is looked up by its sha256 in the dev split (dev is not
 a test split: nothing is appended to test-access.log). The body is rebuilt with the
@@ -11,16 +19,23 @@ model/provider, choice) so a mock server can replay it. Per dataset: the rubric
 (question.json, criteria in file order). Selection (deterministic): among the
 answered calls in file order, the first, the middle one and the last.
 """
-import hashlib, importlib.util, json, pathlib
+import argparse, hashlib, importlib.util, json, os, pathlib, subprocess
 
-ROOT = pathlib.Path('/Users/oleg/dev/cmfpublic')
-LEDGERS = ROOT / 'reports/decision-v4-20260926/oracle'
-OUT = pathlib.Path(__file__).resolve().parent / 'deepseek_bodies.json'
-DATA = {
-    'banking77': ROOT / 'artifacts/decision-v2-20260926/splits/banking77',
-    'clinc150': ROOT / 'artifacts/decision-clinc150-20260925/data',
-    'massive': ROOT / 'artifacts/decision-massive-20260926/data',
-}
+REPO = pathlib.Path(__file__).resolve().parent.parent
+OUT = REPO / 'crates/cortiq-decision/tests/fixtures/oracle/deepseek_bodies.json'
+ROOT = LEDGERS = DATA = None
+
+
+def default_cmfpublic():
+    """$CMFPUBLIC, else the main checkout of this repository (a worktree's common git dir)."""
+    if os.environ.get('CMFPUBLIC'):
+        return pathlib.Path(os.environ['CMFPUBLIC'])
+    try:
+        common = subprocess.run(['git', '-C', str(REPO), 'rev-parse', '--path-format=absolute', '--git-common-dir'],
+                                capture_output=True, text=True, check=True).stdout.strip()
+        return pathlib.Path(common).parent
+    except (OSError, subprocess.CalledProcessError):
+        return REPO
 
 
 def sha(b):
@@ -35,6 +50,19 @@ def driver():
 
 
 def main():
+    global ROOT, LEDGERS, DATA, OUT
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument('--cmfpublic', type=pathlib.Path, default=None)
+    ap.add_argument('--out', type=pathlib.Path, default=OUT)
+    a = ap.parse_args()
+    ROOT = a.cmfpublic or default_cmfpublic()
+    OUT = a.out
+    LEDGERS = ROOT / 'reports/decision-v4-20260926/oracle'
+    DATA = {
+        'banking77': ROOT / 'artifacts/decision-v2-20260926/splits/banking77',
+        'clinc150': ROOT / 'artifacts/decision-clinc150-20260925/data',
+        'massive': ROOT / 'artifacts/decision-massive-20260926/data',
+    }
     d = driver()
     out = {'source': {'driver': 'reports/decision-v4-20260926/oracle/deepseek_oracle.py',
                       'driver_sha256': sha((LEDGERS / 'deepseek_oracle.py').read_bytes()),

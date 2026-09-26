@@ -13,9 +13,11 @@ use std::path::{Path, PathBuf};
 
 /// Environment variable naming `artifacts/decision-v3-20260926`.
 pub const V3_DIR_ENV: &str = "CORTIQ_DECISION_V3_DIR";
-/// Every open of a test split is appended here (one JSON line: utc, file, purpose).
-pub const TEST_ACCESS_LOG: &str =
-    "/Users/oleg/dev/cmfpublic/artifacts/decision-v4-20260926/test-access.log";
+/// Environment variable naming the test-split access log: every open of a
+/// test split is appended there (one JSON line: utc, file, purpose).
+pub const TEST_ACCESS_LOG_ENV: &str = "CORTIQ_DECISION_TEST_ACCESS_LOG";
+/// Without [`TEST_ACCESS_LOG_ENV`]: this file under `$CMFPUBLIC`.
+pub const TEST_ACCESS_LOG_DEFAULT: &str = "artifacts/decision-v4-20260926/test-access.log";
 /// The three shipped datasets in the spec's order.
 pub const DATASETS: [&str; 3] = ["banking77", "clinc150", "massive"];
 
@@ -60,15 +62,30 @@ pub fn utc_now() -> String {
     )
 }
 
-/// Append one access record to [`TEST_ACCESS_LOG`] (O_APPEND). Call it before
-/// opening any test split, test feature file or test ledger.
+/// The test-split access log: `$CORTIQ_DECISION_TEST_ACCESS_LOG`, else
+/// [`TEST_ACCESS_LOG_DEFAULT`] under `$CMFPUBLIC`; `None` when neither is set.
+pub fn test_access_log() -> Option<PathBuf> {
+    std::env::var_os(TEST_ACCESS_LOG_ENV)
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("CMFPUBLIC").map(|r| PathBuf::from(r).join(TEST_ACCESS_LOG_DEFAULT))
+        })
+}
+
+/// Append one access record to [`test_access_log`] (O_APPEND). Call it before
+/// opening any test split, test feature file or test ledger. Only the local
+/// `#[ignore]` gates call it: it panics when no log is configured, because a
+/// test split must never be read unlogged.
 pub fn log_test_access(file: &Path, purpose: &str) {
+    let log = test_access_log().unwrap_or_else(|| {
+        panic!("set {TEST_ACCESS_LOG_ENV} (or CMFPUBLIC) before a test split is read")
+    });
     let line = serde_json::json!({"utc": utc_now(), "file": file.display().to_string(), "purpose": purpose});
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(TEST_ACCESS_LOG)
-        .unwrap_or_else(|e| panic!("open {TEST_ACCESS_LOG}: {e}"));
+        .open(&log)
+        .unwrap_or_else(|e| panic!("open {}: {e}", log.display()));
     writeln!(f, "{line}").expect("append test-access.log");
 }
 

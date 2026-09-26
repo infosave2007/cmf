@@ -4,7 +4,7 @@
 //! files the v3 builds recorded, and it should run optimised:
 //!
 //! ```text
-//! CMF_GPU=0 CORTIQ_DECISION_V3_DIR=/Users/oleg/dev/cmfpublic/artifacts/decision-v3-20260926 \
+//! CMF_GPU=0 CORTIQ_DECISION_V3_DIR=$CMFPUBLIC/artifacts/decision-v3-20260926 \
 //!   cargo test --release -p cortiq-decision --test parity_v3 -- --ignored --nocapture
 //! ```
 //!

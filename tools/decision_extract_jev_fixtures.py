@@ -1,15 +1,35 @@
 #!/usr/bin/env python3
-"""Extract WP5 Jev-shape fixtures: the rubric and 20 stored Jev answers per dataset.
+"""Extract the WP5 Jev-shape fixtures of crates/cortiq-decision/tests/fixtures/jev:
+the rubric and 20 stored Jev answers per dataset.
+
+    python3 tools/decision_extract_jev_fixtures.py [--cmfpublic DIR] [--out DIR]
 
 Only the answer objects, usage, model and provider are copied; no text, no label,
 no text hash. Selection (deterministic): the first 10 successful result records in
 file order, then the first 10 further records whose max probability is below 1.
+The stored Jev runs are read from --cmfpublic (default: $CMFPUBLIC, else the main
+checkout of this repository, which holds the local reports/ and artifacts/); every
+read of a test-derived run is appended to its artifacts/decision-v4-20260926/
+test-access.log first.
 """
-import datetime, hashlib, json, pathlib
+import argparse, datetime, hashlib, json, os, pathlib, subprocess
 
-ROOT = pathlib.Path('/Users/oleg/dev/cmfpublic')
-OUT = pathlib.Path('/Users/oleg/dev/cmf-decision/crates/cortiq-decision/tests/fixtures/jev')
-LOG = ROOT / 'artifacts/decision-v4-20260926/test-access.log'
+REPO = pathlib.Path(__file__).resolve().parent.parent
+ROOT = None
+OUT = REPO / 'crates/cortiq-decision/tests/fixtures/jev'
+LOG = None
+
+
+def default_cmfpublic():
+    """$CMFPUBLIC, else the main checkout of this repository (a worktree's common git dir)."""
+    if os.environ.get('CMFPUBLIC'):
+        return pathlib.Path(os.environ['CMFPUBLIC'])
+    try:
+        common = subprocess.run(['git', '-C', str(REPO), 'rev-parse', '--path-format=absolute', '--git-common-dir'],
+                                capture_output=True, text=True, check=True).stdout.strip()
+        return pathlib.Path(common).parent
+    except (OSError, subprocess.CalledProcessError):
+        return REPO
 SOURCES = {
     'banking77': ('reports/decision-banking77-20260925/jev-test.jsonl', True),
     'clinc150': ('reports/decision-clinc150-20260925/jev-calibration.jsonl', False),
@@ -25,6 +45,14 @@ def log_access(path, purpose):
 
 
 def main():
+    global ROOT, OUT, LOG
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument('--cmfpublic', type=pathlib.Path, default=None)
+    ap.add_argument('--out', type=pathlib.Path, default=OUT)
+    a = ap.parse_args()
+    ROOT = a.cmfpublic or default_cmfpublic()
+    OUT = a.out
+    LOG = ROOT / 'artifacts/decision-v4-20260926/test-access.log'
     OUT.mkdir(parents=True, exist_ok=True)
     for ds, (rel, log) in SOURCES.items():
         path = ROOT / rel

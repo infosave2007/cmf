@@ -29,13 +29,21 @@ gates.json — the reproduction model (§3.8: train only, K = 16):
   as `missing`, no call is made). Jev on the same rows, Wilson intervals and exact
   McNemar tests are recorded next to every accuracy.
 * **§6.3** tools/decision_jev_compat.py, **§6.6** tools/decision_speed.sh, **§6.7** size
-  <= 300,000,000 B, the two-build sha256 equality of build/build-release.json.
+  <= SIZE_LIMIT (320,000,000 B, see below), the two-build sha256 equality of
+  build/build-release.json.
 
-Stop conditions (§6.10) halt the run and are reported, never worked around: τ ≠ v3,
-any §6.2 tolerance violated, E1 < 100 %. The part of the table that needs no test
-split (dev, calibration, T, θ, τ, odd half) is checked before any test split is
-opened, so a stop there opens no test data. Isolation violations and the oracle budget
-belong to the cascade evaluation (§5c), which spends nothing here.
+Order and stop conditions (§6.10; they halt the run and are reported, never worked
+around: τ ≠ v3, any §6.2 tolerance violated, E1 < 100 %): F1–F3 (the stored v3
+train/dev/calibration features, no test split), then the part of the §6.2 table that
+needs no test split (dev, calibration, T, θ, τ, odd half) — a stop there opens no test
+data —, then E1–E5 (whose reference ids, E2 and E4 read the test splits), then the
+test rows. A gate passes only when its cargo test exited 0 and its JSON passed.
+Isolation violations and the oracle budget belong to the cascade evaluation (§5c),
+which spends nothing here.
+
+Provenance: gates.json records the commit, whether the worktree had tracked changes,
+the untracked files under tools/ and crates/ and the sha256 of every tool of this
+chain, so the numbers can be tied to the exact scripts that produced them.
 
 gates-release.json — the published model (§3.9: train ∪ dev, K per skill from
 max-recipe/cv.json): its gate and calibration, test (all rows, certified gate), CLINC150
@@ -77,7 +85,23 @@ SPLITS = {
     "massive": os.path.join(CMFPUBLIC, "artifacts/decision-massive-20260926/data"),
 }
 DS = ("banking77", "clinc150", "massive")
-SIZE_LIMIT = 300_000_000
+# §6.7 size limit. Raised from the spec's 300,000,000 B to 320,000,000 B (decision
+# of the release, package C4): the published model (§3.9) carries the rows blob of
+# every skill — the training rows exact self-learning refits from (§5.7, §5.14) —
+# and measured 304,520,292 B (gates-release.json of 2026-09-26); the file is not
+# shrunk to fit the old number.
+SIZE_LIMIT = 320_000_000
+# E1 (§1.6): every file of the reference ids and the total number of texts.
+E1_FILES = ("banking77.train.json", "banking77.dev.json", "banking77.calibration.json", "banking77.test.json",
+            "clinc150.train.json", "clinc150.dev.json", "clinc150.calibration.json", "clinc150.test.json",
+            "clinc150.oos.json", "clinc150.latency.json",
+            "massive.train.json", "massive.dev.json", "massive.calibration.json", "massive.test.json",
+            "massive.latency.json")
+E1_TEXTS = 53396
+# The scripts of the gate chain (their sha256 goes into gates.json).
+TOOLS = ("tools/decision_gates.py", "tools/decision_speed.sh", "tools/decision_jev_compat.py",
+         "tools/decision_encoder_parity.py", "tools/decision_export_encoder.py", "tools/decision_build_release.sh",
+         "tools/mk_decision_toy.py")
 ALPHA = 0.05 / 14
 JEV_USD_PER_1M = {"banking77": 183.69, "clinc150": 271.61, "massive": 110.86}   # evaluate/cost-scale.json
 
@@ -415,9 +439,11 @@ def gates_f(work):
                   "pass": (g["temperature_ulps_vs_v3"] <= 1 and g["theta_ulps_vs_v3"] <= 2 and g["tau"] == g["tau_v3"]
                            and g["odd_half"]["accepted"] == odd_a and g["odd_half"]["correct"] == odd_c
                            and len(grid_rows) == 14 and worst <= 1e-9)}
-    res["F1"] = {"datasets": f1, "pass": all(v["pass"] for v in f1.values()) and len(f1) == 3}
-    res["F2"] = {"datasets": f2, "pass": all(v["pass"] for v in f2.values()) and len(f2) == 3}
-    res["F3"] = {"datasets": f3, "pass": all(v["pass"] for v in f3.values()) and len(f3) == 3}
+    # A gate passes only when the test run itself passed (exit 0, its own JSON verdict).
+    run_ok = p.returncode == 0 and pj["pass"] is True
+    res["F1"] = {"datasets": f1, "pass": run_ok and all(v["pass"] for v in f1.values()) and len(f1) == 3}
+    res["F2"] = {"datasets": f2, "pass": run_ok and all(v["pass"] for v in f2.values()) and len(f2) == 3}
+    res["F3"] = {"datasets": f3, "pass": run_ok and all(v["pass"] for v in f3.values()) and len(f3) == 3}
     res["resonance_dev_single_thread"] = {d["dataset"]: d.get("resonance_dev_single_thread") for d in pj["datasets"]}
     return res
 
@@ -435,15 +461,17 @@ def gates_e(work):
     run([sys.executable, os.path.join(REPO, "tools", "decision_export_encoder.py"), "--onnx",
          os.path.join(ENC_SRC, "encoder.onnx"), "--tokenizer-dir", os.path.join(ENC_SRC, "encoder_tokenizer"),
          "--out", enc], log_path=os.path.join(work, "export.log"))
+    art = ["--artifacts-dir", os.path.join(CMFPUBLIC, "artifacts"), "--access-log", ACCESS_LOG]
     run([sys.executable, os.path.join(REPO, "tools", "decision_encoder_parity.py"), "hf-ids", "--tokenizer-dir",
-         os.path.join(ENC_SRC, "encoder_tokenizer"), "--out", ids], log_path=os.path.join(work, "hf-ids.log"))
-    run([sys.executable, os.path.join(REPO, "tools", "decision_encoder_parity.py"), "unicode-probe", "--out", probe],
-        log_path=os.path.join(work, "unicode-probe.log"))
+         os.path.join(ENC_SRC, "encoder_tokenizer"), "--out", ids, *art], log_path=os.path.join(work, "hf-ids.log"))
+    run([sys.executable, os.path.join(REPO, "tools", "decision_encoder_parity.py"), "unicode-probe", "--out", probe,
+         *art], log_path=os.path.join(work, "unicode-probe.log"))
     p, secs = run(["cargo", "test", "--offline", "--release", "-p", "cortiq-decision", "--test", "encoder_real", "--",
                    "--ignored", "--nocapture", "--test-threads=1"],
                   env={"CORTIQ_DECISION_ENCODER_DIR": enc, "CORTIQ_DECISION_HF_IDS_DIR": ids,
                        "CORTIQ_DECISION_UNICODE_PROBE": probe, "CORTIQ_DECISION_V3_DIR": V3_DIR,
-                       "CORTIQ_DECISION_ENCODER_OUT": gates_out, "CORTIQ_DECISION_THREADS": "4"},
+                       "CORTIQ_DECISION_ENCODER_OUT": gates_out, "CORTIQ_DECISION_THREADS": "4",
+                       "CORTIQ_DECISION_TEST_ACCESS_LOG": ACCESS_LOG},
                   cwd=REPO, log_path=os.path.join(work, "encoder_real.log"), check=False)
     export_sha = sha256_file(os.path.join(enc, "encoder.json"))
     shutil.rmtree(enc, ignore_errors=True)   # 91 MB, only the test needed it
@@ -453,9 +481,14 @@ def gates_e(work):
            "exit_code": p.returncode, "seconds": round(secs, 1),
            "encoder_export_json_sha256": export_sha,
            "speed_one_thread": J("speed"), "unicode_exhaustive": J("unicode"), "gpu": J("gpu"), "init_file": J("init_file")}
+    run_ok = p.returncode == 0
+    e1_files = sorted(x["file"] for x in (e1 or {}).get("files") or [] if x["file"] != "stress.json")
+    e1_complete = (bool(e1) and e1_files == sorted(E1_FILES) and e1["texts"] == E1_TEXTS
+                   and all(x.get("equal") == x["n"] for x in e1["files"] if x["file"] != "stress.json"))
     res["E1"] = {"texts": e1 and e1["texts"], "equal": e1 and e1["equal"], "files": e1 and e1["files"],
                  "stress_differences": e1 and e1["stress_differences"],
-                 "pass": bool(e1) and e1["texts"] > 0 and e1["equal"] == e1["texts"]}
+                 "required_files": len(E1_FILES), "required_texts": E1_TEXTS, "complete": e1_complete,
+                 "pass": run_ok and e1_complete and e1["equal"] == e1["texts"]}
     e2, e3, e4 = {}, {}, {}
     ok2 = ok3 = ok4 = bool(e234)
     for ds in DS if e234 else ():
@@ -480,11 +513,13 @@ def gates_e(work):
                                        "correct_v3_signal": x["correct_v3_signal"], "correct_v4_signal": x["correct_v4_signal"]}
                 ok4 &= x["flips"] <= lim
     ok4 &= sorted(e4) == sorted(f"{ds}/{s}" for ds in DS for s in ("dev", "test"))
-    res["E2"] = {"splits": e2, "tolerance": "max |Δ| <= 1e-6, min cos >= 0.999999", "pass": bool(ok2) and len(e2) == 9}
-    res["E3"] = {"splits": e3, "tolerance": "max |Δ| <= 1e-7; index-set differences listed", "pass": bool(ok3) and len(e3) == 9}
-    res["E4"] = {"splits": e4, "tolerance": "flips <= ceil(0.2 %·n) on dev and test", "pass": bool(ok4)}
+    res["E2"] = {"splits": e2, "tolerance": "max |Δ| <= 1e-6, min cos >= 0.999999",
+                 "pass": run_ok and bool(ok2) and len(e2) == 9}
+    res["E3"] = {"splits": e3, "tolerance": "max |Δ| <= 1e-7; index-set differences listed",
+                 "pass": run_ok and bool(ok3) and len(e3) == 9}
+    res["E4"] = {"splits": e4, "tolerance": "flips <= ceil(0.2 %·n) on dev and test", "pass": run_ok and bool(ok4)}
     res["E5"] = dict(e5 or {})
-    res["E5"]["pass"] = bool(e5 and e5.get("pass"))
+    res["E5"]["pass"] = run_ok and bool(e5 and e5.get("pass"))
     return res
 
 
@@ -711,6 +746,11 @@ def main():
     access_before = sum(1 for _ in open(ACCESS_LOG)) if os.path.exists(ACCESS_LOG) else 0
     doc = {"schema": "cortiq-decision-v4-gates/1", "utc_start": utc_now(), "spec": "reports/decision-v4-20260926/SPEC_RU.md §6",
            "commit": git("rev-parse", "HEAD"), "worktree_clean": git("status", "--porcelain", "--untracked-files=no") == "",
+           "untracked": [l[3:] for l in (git("status", "--porcelain", "--untracked-files=all", "--", "tools", "crates") or "").splitlines()
+                         if l.startswith("?? ")],
+           "tools": {t: {"sha256": sha256_file(os.path.join(REPO, t)),
+                         "tracked": bool(git("ls-files", "--error-unmatch", t))}
+                     for t in TOOLS if os.path.exists(os.path.join(REPO, t))},
            "machine": machine(),
            "binary": {"path": cortiq, "sha256": sha256_file(cortiq),
                       "version": subprocess.run([cortiq, "--version"], capture_output=True, text=True).stdout.strip()},
@@ -732,15 +772,6 @@ def main():
         f = gates_f(work)
         gates["F1"], gates["F2"], gates["F3"] = f.pop("F1"), f.pop("F2"), f.pop("F3")
         gates["F_run"] = f
-        # --- E1–E5
-        log("E1–E5 (encoder_real)")
-        e = gates_e(work)
-        for k in ("E1", "E2", "E3", "E4", "E5"):
-            gates[k] = e.pop(k)
-        gates["E_run"] = e
-        if not gates["E1"]["pass"]:
-            doc["stop"].append(f"E1 {gates['E1']['equal']}/{gates['E1']['texts']} < 100 % (§6.10)")
-            raise Stop()
         # --- §6.2 table, part without test data
         log("§6.2: dev, calibration, gate of the reproduction model")
         info = model_info(cortiq, a.base)
@@ -759,6 +790,17 @@ def main():
         doc["datasets"] = per
         gates["table_6_2"] = {"rows": table}
         stop_on_table(table, doc)
+        # --- E1–E5: after the pre-test table, because the reference ids (E1) and
+        # E2/E4 read the test splits.
+        log("E1–E5 (encoder_real)")
+        e = gates_e(work)
+        for k in ("E1", "E2", "E3", "E4", "E5"):
+            gates[k] = e.pop(k)
+        gates["E_run"] = e
+        if not gates["E1"]["pass"]:
+            doc["stop"].append(f"E1 {gates['E1']['equal']}/{gates['E1']['texts']} < 100 %"
+                               f" or incomplete ({gates['E1']['complete']}) (§6.10)")
+            raise Stop()
         # --- test: decide --bench (speed) + HTTP
         log("§6.6 speed and the test rows (tools/decision_speed.sh)")
         sp_dir, speed = test_rows_via_speed(a.base, work, "base", not a.no_http)
@@ -870,7 +912,7 @@ def main():
     rdoc["size_6_7"] = {"bytes": rdoc["model"]["bytes"], "limit": SIZE_LIMIT, "within_limit": rdoc["model"]["bytes"] <= SIZE_LIMIT}
     rdoc["checks"] = {"certified_gate_every_skill": all(per[ds]["gate"]["certified"] for ds in DS),
                       "odd_half_lb_ge_0_95": all((per[ds]["gate"]["odd_half"]["lb"] or 0) >= 0.95 for ds in DS),
-                      "size_within_300MB": rdoc["size_6_7"]["within_limit"],
+                      "size_within_limit": rdoc["size_6_7"]["within_limit"],
                       "speed_thresholds": speed["pass"]}
     rdoc["seconds"] = round(time.time() - t1, 1)
     rdoc["utc_end"] = utc_now()

@@ -7,6 +7,7 @@
 //!   [CORTIQ_DECISION_ENCODER_CMF=enc.cmf] [CORTIQ_DECISION_BUILD_OUT=<dir>] \
 //!   [CORTIQ_DECISION_BANKING77_DIR=…/decision-v2-20260926/splits/banking77] \
 //!   [CORTIQ_DECISION_MAX_RECIPE=…/max-recipe/cv.json] [CORTIQ_DECISION_THREADS=4] \
+//!   [CMFPUBLIC=<checkout with artifacts/ and reports/>] \
 //!   cargo test --release -p cortiq-decision --test build_real -- --ignored --nocapture --test-threads=1
 //! ```
 //!
@@ -38,10 +39,11 @@ const BANKING77_ENV: &str = "CORTIQ_DECISION_BANKING77_DIR";
 const MAX_RECIPE_ENV: &str = "CORTIQ_DECISION_MAX_RECIPE";
 const THREADS_ENV: &str = "CORTIQ_DECISION_THREADS";
 
-const BANKING77_DEFAULT: &str =
-    "/Users/oleg/dev/cmfpublic/artifacts/decision-v2-20260926/splits/banking77";
-const MAX_RECIPE_DEFAULT: &str =
-    "/Users/oleg/dev/cmfpublic/reports/decision-v4-20260926/max-recipe/cv.json";
+/// The checkout that holds the local artifacts and reports; the defaults of
+/// the two paths below are relative to it.
+const CMFPUBLIC_ENV: &str = "CMFPUBLIC";
+const BANKING77_DEFAULT: &str = "artifacts/decision-v2-20260926/splits/banking77";
+const MAX_RECIPE_DEFAULT: &str = "reports/decision-v4-20260926/max-recipe/cv.json";
 
 // v3 reference (reports/decision-v3-20260926/evaluate/RESULT_RU.md, spec §6.2).
 const V3_DEV: i64 = 1396;
@@ -52,10 +54,12 @@ const V3_TAU: f64 = 0.8;
 const V3_CAL: u64 = 1388;
 const V3_ODD: (u64, u64) = (649, 635);
 
+/// The path in `name`, else `default` under `$CMFPUBLIC` when that is set.
 fn env_path(name: &str, default: Option<&str>) -> Option<PathBuf> {
-    std::env::var_os(name)
-        .map(PathBuf::from)
-        .or_else(|| default.map(PathBuf::from))
+    std::env::var_os(name).map(PathBuf::from).or_else(|| {
+        let root = std::env::var_os(CMFPUBLIC_ENV)?;
+        default.map(|d| PathBuf::from(root).join(d))
+    })
 }
 
 fn threads() -> usize {
@@ -117,7 +121,8 @@ fn encoder_cmf(dir: &Path) -> PathBuf {
 }
 
 fn banking77() -> PathBuf {
-    let d = env_path(BANKING77_ENV, Some(BANKING77_DEFAULT)).unwrap();
+    let d = env_path(BANKING77_ENV, Some(BANKING77_DEFAULT))
+        .unwrap_or_else(|| panic!("set {BANKING77_ENV} or {CMFPUBLIC_ENV}"));
     // The splits the v3 skill was certified on.
     let splits: Value =
         serde_json::from_slice(&std::fs::read(d.join("splits.json")).unwrap()).unwrap();
@@ -214,7 +219,8 @@ fn banking77_train_dev_union() {
     let out = out_dir("banking77-train-dev");
     let enc = encoder_cmf(&out.dir);
     let b = banking77();
-    let cv_path = env_path(MAX_RECIPE_ENV, Some(MAX_RECIPE_DEFAULT)).unwrap();
+    let cv_path = env_path(MAX_RECIPE_ENV, Some(MAX_RECIPE_DEFAULT))
+        .unwrap_or_else(|| panic!("set {MAX_RECIPE_ENV} or {CMFPUBLIC_ENV}"));
     let (k, k_source) = match std::fs::read(&cv_path) {
         Ok(bytes) => {
             let cv: Value = serde_json::from_slice(&bytes).unwrap();

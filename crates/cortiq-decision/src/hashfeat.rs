@@ -28,7 +28,7 @@ pub const DISTILL_RS_SHA256: &str = "a751e51a6dbae0630e9d476046c3df1eb0500dc3d60
 #[cfg_attr(not(test), allow(dead_code))]
 pub const EMBED_RS_SHA256: &str = "96ac6a89ffd1d340efb6e847ceae887199a0f6b540c8b5ef934d922d19fd9faf";
 #[cfg_attr(not(test), allow(dead_code))]
-pub const ORIGINAL_SRC_DIR: &str = "/Users/oleg/Documents/cortiq-bot/cortiq-router/src";
+pub const ORIGINAL_SRC_DIR: &str = match option_env!("CORTIQ_ROUTER_SRC") { Some(d) => d, None => "cortiq-router/src" };
 pub const ORIGINAL_FILE: &str = "cortiq-router/src/distill.rs";
 /// The constants of the verbatim `feat` (the record documents them; `parse` refuses
 /// any other values because nothing else is implemented).
@@ -152,10 +152,16 @@ pub use original::feat;
 
 // ==== cortiq-hashfeat-v1 contract (decision-v4 spec §1.5, §2.6) ====
 // Added by the release crate. Everything outside this section is byte-identical
-// to tools/cortiq-decision-embryo/src/hashfeat.rs (sha256 [`EMBRYO_COPY_SHA256`]);
-// tests/hashfeat.rs removes this section and checks that sha256. The runtime calls
-// only [`dense`] with [`DIM`]; the sparse `feat` normalises in `HashMap` order and
-// is kept only as the verbatim record of the original.
+// to tools/cortiq-decision-embryo/src/hashfeat.rs (sha256 [`EMBRYO_COPY_SHA256`])
+// except one declared line: the embryo's `ORIGINAL_SRC_DIR` is a local absolute
+// path, here it is `CORTIQ_ROUTER_SRC` at build time (else a relative path that
+// is normally absent, and the test skips the router-source checks), so that the
+// published crate holds no local path. tests/hashfeat.rs removes this section,
+// pins the sha256 of the rest and, when the embryo file is present, checks that
+// the rest is the embryo file with only that line replaced. The file is
+// `#[rustfmt::skip]` (lib.rs). The runtime calls only [`dense`] with [`DIM`];
+// the sparse `feat` normalises in `HashMap` order and is kept only as the
+// verbatim record of the original.
 
 /// Name of the hashing contract recorded in a decision file (spec §2.6).
 pub const KIND: &str = "cortiq-hashfeat-v1";
@@ -168,7 +174,8 @@ pub const DEFINITION: &str = "cortiq-router distill.rs::feat: lower = text.to_lo
 /// `HASHING_NORMALIZATION` of contract_v2.rs: the normalisation [`dense`] applies.
 pub const NORMALIZATION: &str = "l2-f32-index-order-mul-inv;zero-stays-zero";
 /// sha256 of tools/cortiq-decision-embryo/src/hashfeat.rs, the file this one copies.
-pub const EMBRYO_COPY_SHA256: &str = "b34b49dde233f807dce7a5914ac06f239be09a749f91588d2019cc8e944d0c4b";
+pub const EMBRYO_COPY_SHA256: &str =
+    "b34b49dde233f807dce7a5914ac06f239be09a749f91588d2019cc8e944d0c4b";
 
 /// The 32 golden texts of the contract (spec §2.6): English, Cyrillic, CJK, Hangul,
 /// Greek sigma, Turkish dotted İ, Devanagari, circled letters, emoji, NBSP, control
@@ -247,7 +254,10 @@ pub const GOLDEN_DENSE_SHA256: [&str; 32] = [
 
 /// Little-endian bytes of `dense(text, dim)`.
 pub fn dense_f32le(text: &str, dim: usize) -> Vec<u8> {
-    dense(text, dim).iter().flat_map(|v| v.to_le_bytes()).collect()
+    dense(text, dim)
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect()
 }
 
 /// sha256 (lowercase hex) of [`dense_f32le`].

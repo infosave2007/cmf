@@ -23,6 +23,9 @@
 //!   line, a refused corrupt line, the background flusher;
 //! * the state directory `LOCK` is exclusive; `CURRENT` round-trips.
 
+#[path = "common/toy_dir.rs"]
+mod toy_dir;
+
 use cortiq_decision::answer::OracleAnswer;
 use cortiq_decision::build::{self, TrainOptions};
 use cortiq_decision::canonical;
@@ -149,7 +152,6 @@ fn write(dir: &Path, name: &str, body: &str) -> PathBuf {
 }
 
 struct Toy {
-    _dir: tempfile::TempDir,
     path: PathBuf,
     dev: Vec<(String, String)>,
 }
@@ -183,8 +185,8 @@ fn skill_opts(
 fn toy() -> &'static Toy {
     static TOY: OnceLock<Toy> = OnceLock::new();
     TOY.get_or_init(|| {
-        let dir = tempfile::tempdir().unwrap();
-        let d = dir.path();
+        let dir = toy_dir::toy_dir("toy");
+        let d = dir.as_path();
         let enc = d.join("enc.cmf");
         let export = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/toy/encoder");
         build::init_encoder(&export, &enc, Some(EPOCH)).expect("init toy encoder");
@@ -194,11 +196,7 @@ fn toy() -> &'static Toy {
         let (o2, _) = skill_opts(d, "shop", &SHOP, 21);
         let path = d.join("toy.cmf");
         build::add_skill(&s1, &o2, &path).expect("add shop");
-        Toy {
-            _dir: dir,
-            path,
-            dev,
-        }
+        Toy { path, dev }
     })
 }
 
