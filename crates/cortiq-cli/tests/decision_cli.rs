@@ -73,7 +73,10 @@
 //!   or 1e-7 the advised figure is the refused call's and admits it;
 //!   `max_calls` 0 named as the call limit; the command line's missing-key
 //!   words; `oracle check --max-price` for a model listed only with
-//!   variable pricing.
+//!   variable pricing; an admin limit kept in `oracle.state` named with its
+//!   file and the admin request that lifts it (following it makes the
+//!   call); codes read back from `oracle.state` outside the closed set shown
+//!   as `unknown_code`; listing names cleaned with the configured key.
 
 #[path = "support/toy_dir.rs"]
 mod toy_dir;
@@ -2696,6 +2699,9 @@ struct ChatQuirk {
     delay: Option<Duration>,
     /// Echo the request's `Authorization` header into the answer.
     echo: Option<Echo>,
+    /// The provider name of the cheapest structured-output endpoint of the
+    /// public listing (`Mock` by default).
+    listing_provider: Option<String>,
 }
 
 /// The answer of the mock to one request: (status, body).
@@ -2720,7 +2726,12 @@ fn openrouter_reply(
             listing(json!([
                 endpoint("NoJson", "0.00000001", "0.00000001", false),
                 endpoint("Pricey", "0.0000002", "0.0000009", true),
-                endpoint("Mock", "0.00000003", "0.00000029", true),
+                endpoint(
+                    quirk.listing_provider.as_deref().unwrap_or("Mock"),
+                    "0.00000003",
+                    "0.00000029",
+                    true
+                ),
             ])),
         ),
         ("GET", "/api/v1/models/plain/no-json/endpoints") => (
@@ -4202,7 +4213,8 @@ fn decide_oracle_batch_respects_its_budget_cap_per_run() {
     let (got, err, sum) = run(&d.join("run3.jsonl"));
     assert_eq!(mock.chats(), 4, "the admin call limit allows no call");
     let calls_limit = format!(
-        "the admin call limit of state directory {} is reached: max_calls 4 in its oracle.state (set by a server's admin API) counts every call of the ledger, which holds 4; --oracle-max-calls cannot raise it. Lift it on a server of that directory: POST /v1/admin/oracle {{\"max_calls\":null}} (or a larger number)",
+        "the admin limit max_calls 4 in {} binds: it counts every call of the ledger, which holds 4, and --oracle-max-calls cannot raise it. Lift it on a server of state directory {}: POST /v1/admin/oracle {{\"max_calls\": null}}, or {{\"max_calls\": 5}} (at most that server's configured limit)",
+        st_file.display(),
         state.display()
     );
     assert!(
@@ -4216,15 +4228,16 @@ fn decide_oracle_batch_respects_its_budget_cap_per_run() {
     let (_, err, sum) = run(&d.join("run4.jsonl"));
     assert_eq!(mock.chats(), 4, "the admin budget holds no call");
     let budget_limit = format!(
-        "the admin budget of state directory {} cannot hold the next call: budget_usd $0.0012 in its oracle.state (set by a server's admin API) counts all the ledger's spending, $0.001 so far, and ",
-        state.display()
+        "the admin limit budget_usd $0.0012 in {} binds: it counts all the ledger's spending, $0.001 so far, and ",
+        st_file.display()
     );
     assert!(
         err.contains(&format!(
             "oracle: NOT ready — {budget_limit}every call reserves at least $"
-        )) && err.contains(
-            "; --oracle-budget cannot raise it. Lift it on a server of that directory: POST /v1/admin/oracle {\"budget_usd\":null} (or a larger number)"
-        ),
+        )) && err.contains(&format!(
+            "; --oracle-budget cannot raise it. Lift it on a server of state directory {}: POST /v1/admin/oracle {{\"budget_usd\": null}}, or {{\"budget_usd\": 0.00",
+            state.display()
+        )) && err.contains("} (at most that server's configured budget) ("),
         "{err}"
     );
     let hint = sum["oracle"]["hint"].as_str().unwrap();
@@ -6734,4 +6747,429 @@ fn budget_minimums_from_zero_admit_the_real_call_and_max_calls_zero_names_the_li
         "{v}"
     );
     assert_eq!(mock.chats(), 4, "nothing more was sent");
+}
+
+/// The `{"budget_usd": X}` figure of a hint (the admin API's JSON number).
+fn advised_admin_budget(hint: &str) -> f64 {
+    hint.split("{\"budget_usd\": ")
+        .skip(1)
+        .find_map(|t| t.split('}').next()?.parse().ok())
+        .unwrap_or_else(|| panic!("no advised budget_usd in {hint}"))
+}
+
+/// An admin limit kept in `oracle.state` (a server's `POST /v1/admin/oracle`)
+/// outlives a restart with a larger `--oracle-budget` or
+/// `--oracle-max-calls`: the startup line and every hint name it — its value
+/// and file — and the admin request that lifts it with a figure the admin API
+/// takes, never "restart with --oracle-budget"; following the advice makes
+/// the call, on a server and for `decide`.
+#[test]
+fn an_admin_limit_kept_in_oracle_state_is_named_and_its_advice_makes_the_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let mock = MockOpenRouter::start("travel", 1.3e-5);
+    let base = mock.base();
+    let key = [("OPENROUTER_API_KEY", FAKE_OPENROUTER_KEY)];
+    let texts = distinct_texts(3, 37, "adm", 0.97);
+    let state = d.join("state");
+    let file = state.join("oracle.state");
+    let admin_post = |srv: &Server, v: Value| -> Value {
+        let (code, r, _) = http_h(
+            "POST",
+            &srv.url("/v1/admin/oracle"),
+            &[("x-admin-token", ADMIN_TOKEN)],
+            Some(&v),
+        );
+        assert_eq!(code, 200, "{r}");
+        r
+    };
+    let ask = |srv: &Server, text: &str| {
+        let (code, r) = http(
+            "POST",
+            &srv.url("/v1/decisions"),
+            None,
+            Some(&topics_request(text)),
+        );
+        assert_eq!(code, 200, "{r}");
+        r
+    };
+
+    // A server's admin sets the budget to 0 (the configured one is $1.00).
+    let srv = serve_oracle(&state, &base, &[], &key, d);
+    let r = admin_post(&srv, json!({"budget_usd": 0}));
+    assert_eq!(r["status"], "budget_too_small", "{r}");
+    srv.stop();
+
+    // Restarted with --oracle-budget 5: the admin limit still binds.
+    let srv = serve_oracle(&state, &base, &["--oracle-budget", "5"], &key, d);
+    let logs = srv.logs();
+    assert!(
+        logs.contains(&format!(
+            "oracle: NOT ready — the admin limit budget_usd $0.00 in {} binds (the file keeps it across restarts, so --oracle-budget cannot lift it; the next call needs a budget of $",
+            file.display()
+        )) && logs.contains(
+            " or more (a longer question more)): raise it with POST /v1/admin/oracle {\"budget_usd\": 0.00"
+        ) && logs.contains(
+            "(at most the configured $5.00) or lift it with {\"budget_usd\": null} (deepseek/deepseek-v4.1-flash via"
+        ),
+        "{logs}"
+    );
+    assert!(
+        !logs.contains("restart with") && !logs.contains("restart the server"),
+        "{logs}"
+    );
+    let st = oracle_status(&srv);
+    assert_eq!(
+        (st["status"].as_str(), st["budget_usd"].as_f64()),
+        (Some("budget_too_small"), Some(0.0)),
+        "{st}"
+    );
+    let chats = mock.chats();
+    let r = ask(&srv, &texts[0]);
+    assert_eq!(
+        r["cmf"]["questions"]["task"]["flags"],
+        json!(["budget"]),
+        "{r}"
+    );
+    let need = oracle_status(&srv)["min_call_usd"].as_f64().unwrap();
+    let hint = r["cmf"]["hint"].as_str().unwrap().to_string();
+    assert_eq!(
+        hint,
+        format!(
+            "no oracle call fits: the admin limit budget_usd $0.00 in the server's oracle.state binds (the file keeps it across restarts, so --oracle-budget cannot lift it; the next call needs a budget of {}): raise it with POST /v1/admin/oracle {{\"budget_usd\": {}}} (at most the configured $5.00) or lift it with {{\"budget_usd\": null}}",
+            usd_fine(need),
+            &usd_ceil(need)[1..]
+        )
+    );
+    // Following it: the advised figure, and the same question is answered.
+    let advised = advised_admin_budget(&hint);
+    assert!(advised >= need && advised <= 5.0, "{hint}");
+    let r = admin_post(&srv, json!({ "budget_usd": advised }));
+    assert_eq!(r["status"], "ready", "{r}");
+    let r = ask(&srv, &texts[0]);
+    assert_eq!(r["cmf"]["questions"]["task"]["action"], "oracle", "{r}");
+    assert_eq!(mock.chats(), chats + 1);
+
+    // The admin call limit at the calls made: exhausted, named likewise.
+    let r = admin_post(&srv, json!({"max_calls": 1, "budget_usd": null}));
+    assert_eq!(r["status"], "budget_exhausted", "{r}");
+    let r = ask(&srv, &texts[1]);
+    assert_eq!(
+        r["cmf"]["hint"],
+        "the oracle budget is used up: the admin limit max_calls 1 in the server's oracle.state binds (the file keeps it across restarts, so --oracle-max-calls cannot lift it): raise it with POST /v1/admin/oracle {\"max_calls\": 2} (at most the configured 10000) or lift it with {\"max_calls\": null}",
+        "{r}"
+    );
+    let logs = srv.stop();
+    assert_no_key_in(&logs, "serve logs");
+
+    // decide on that state directory: the admin limit, its file, and how a
+    // server of the directory lifts it; --oracle-max-calls cannot.
+    let decide = || {
+        let o = decide_oracle(
+            &base,
+            &["-p", &texts[2]],
+            &["--state", s(&state), "--oracle-max-calls", "7", "--json"],
+            &key,
+        );
+        assert!(o.status.success(), "{}", show(&o));
+        json_of(&stdout_of(&o))
+    };
+    let v = decide();
+    assert_eq!(v["cmf"]["oracle"]["status"], "budget_exhausted", "{v}");
+    assert_eq!(
+        v["cmf"]["hint"],
+        format!(
+            "the admin limit max_calls 1 in {} binds: it counts every call of the ledger, which holds 1, and --oracle-max-calls cannot raise it. Lift it on a server of state directory {}: POST /v1/admin/oracle {{\"max_calls\": null}}, or {{\"max_calls\": 2}} (at most that server's configured limit)",
+            file.display(),
+            state.display()
+        ),
+        "{v}"
+    );
+    assert_eq!(mock.chats(), chats + 1, "nothing more was sent");
+    // Following it: a server of the directory (restarted with a larger
+    // --oracle-max-calls, which alone does not help) lifts it; the rerun
+    // makes the call.
+    let srv = serve_oracle(&state, &base, &["--oracle-max-calls", "50"], &key, d);
+    assert!(
+        srv.logs().contains(&format!(
+            "oracle: NOT ready — the admin limit max_calls 1 in {} binds (the file keeps it across restarts, so --oracle-max-calls cannot lift it): raise it with POST /v1/admin/oracle {{\"max_calls\": 2}} (at most the configured 50) or lift it with {{\"max_calls\": null}} (",
+            file.display()
+        )),
+        "{}",
+        srv.logs()
+    );
+    let r = admin_post(&srv, json!({"max_calls": null}));
+    assert_eq!(r["status"], "ready", "{r}");
+    srv.stop();
+    let v = decide();
+    assert_eq!(v["cmf"]["questions"]["task"]["action"], "oracle", "{v}");
+    assert_eq!(mock.chats(), chats + 2);
+    // decide with an admin budget of 0: named with the figure the ledger
+    // needs; the advice (on a server of the directory) makes the call.
+    let srv = serve_oracle(&state, &base, &[], &key, d);
+    admin_post(&srv, json!({"budget_usd": 0}));
+    srv.stop();
+    let texts2 = distinct_texts(1, 43, "adm3", 0.97);
+    let o = decide_oracle(
+        &base,
+        &["-p", &texts2[0]],
+        &["--state", s(&state), "--oracle-budget", "5", "--json"],
+        &key,
+    );
+    let v = json_of(&stdout_of(&o));
+    let hint = v["cmf"]["hint"].as_str().unwrap().to_string();
+    assert!(
+        hint.starts_with(&format!(
+            "the admin limit budget_usd $0.00 in {} binds: it counts all the ledger's spending, $0.000026 so far, and the next call reserves $",
+            file.display()
+        )) && hint.ends_with("(at most that server's configured budget)")
+            && !hint.contains("pass --oracle-budget"),
+        "{hint}"
+    );
+    let advised = advised_admin_budget(&hint);
+    let srv = serve_oracle(&state, &base, &[], &key, d);
+    let r = admin_post(&srv, json!({ "budget_usd": advised }));
+    assert_eq!(r["status"], "ready", "{r}");
+    srv.stop();
+    let o = decide_oracle(
+        &base,
+        &["-p", &texts2[0]],
+        &["--state", s(&state), "--oracle-budget", "5", "--json"],
+        &key,
+    );
+    let v = json_of(&stdout_of(&o));
+    assert_eq!(v["cmf"]["questions"]["task"]["action"], "oracle", "{v}");
+    assert_eq!(mock.chats(), chats + 3);
+}
+
+/// Codes read back from `oracle.state` (an older version's file, or one
+/// edited by hand) are shown only from the closed code set: anything else
+/// is `unknown_code` on every surface — the startup line, the admin view,
+/// `/healthz`, the decisions hint, `decide`'s hint and JSON and
+/// `--oracle-resume` — and the stop still holds.
+#[test]
+fn codes_read_back_from_oracle_state_are_shown_only_from_the_closed_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let mock = MockOpenRouter::start("travel", 1.3e-5);
+    let base = mock.base();
+    let key = [("OPENROUTER_API_KEY", FAKE_OPENROUTER_KEY)];
+    let text = distinct_texts(1, 47, "codes", 0.97).remove(0);
+    let state = d.join("state");
+    // A state directory made by a server, then its oracle.state as another
+    // version (or a hand) wrote it: an echo of the key as the codes.
+    // (One request first: SIGTERM is handled once the server serves.)
+    let srv = serve_oracle(&state, &base, &[], &key, d);
+    assert_eq!(oracle_status(&srv)["status"], "ready");
+    srv.stop();
+    let echo = format!("finish_{}", FAKE_OPENROUTER_KEY.replace('-', "_"));
+    let write_state = |stop: &str| {
+        std::fs::write(
+            state.join("oracle.state"),
+            json!({"enabled": true, "stop_reason": stop, "stopped_unix": 1,
+                   "consecutive_errors": 3, "last_error": format!("{echo}\u{1b}[2J")})
+            .to_string(),
+        )
+        .unwrap();
+    };
+    write_state(&echo);
+    let srv = serve_oracle(&state, &base, &[], &key, d);
+    assert!(
+        srv.logs()
+            .contains("oracle: NOT ready — stopped by a stop rule (unknown_code; deepseek/"),
+        "{}",
+        srv.logs()
+    );
+    let st = oracle_status(&srv);
+    assert_eq!(
+        (
+            st["status"].as_str(),
+            st["stop_reason"].as_str(),
+            st["last_error"].as_str()
+        ),
+        (
+            Some("stopped: unknown_code"),
+            Some("unknown_code"),
+            Some("unknown_code")
+        ),
+        "{st}"
+    );
+    let (_, h) = http("GET", &srv.url("/healthz"), None, None);
+    assert_eq!(h["oracle_status"], "stopped: unknown_code", "{h}");
+    let (_, r) = http(
+        "POST",
+        &srv.url("/v1/decisions"),
+        None,
+        Some(&topics_request(&text)),
+    );
+    assert_eq!(
+        r["cmf"]["questions"]["task"]["flags"],
+        json!(["stopped"]),
+        "{r}"
+    );
+    assert!(
+        r["cmf"]["hint"]
+            .as_str()
+            .unwrap()
+            .starts_with("the oracle was stopped by a stop rule (unknown_code): "),
+        "{r}"
+    );
+    for t in [st.to_string(), h.to_string(), r.to_string()] {
+        assert_no_key_in(&t, "an answer");
+    }
+    let logs = srv.stop();
+    assert_no_key_in(&logs, "serve logs");
+    // A max_errors stop names its last error only from the set, too.
+    write_state("max_errors");
+    let srv = serve_oracle(&state, &base, &[], &key, d);
+    assert!(
+        srv.logs().contains(
+            "oracle: NOT ready — stopped by a stop rule (max_errors, the last error: unknown_code; "
+        ),
+        "{}",
+        srv.logs()
+    );
+    assert_eq!(oracle_status(&srv)["last_error"], "unknown_code");
+    let logs = srv.stop();
+    assert_no_key_in(&logs, "serve logs");
+    // decide: the inherited stop in words, its JSON, then --oracle-resume.
+    write_state(&echo);
+    let o = decide_oracle(
+        &base,
+        &["-p", &text],
+        &["--state", s(&state), "--json"],
+        &key,
+    );
+    assert!(o.status.success(), "{}", show(&o));
+    let (out, err) = (stdout_of(&o), stderr_of(&o));
+    assert_no_key_in(&out, "decide stdout");
+    assert_no_key_in(&err, "decide stderr");
+    let v = json_of(&out);
+    assert_eq!(v["cmf"]["oracle"]["stop_reason"], "unknown_code", "{v}");
+    assert_eq!(v["cmf"]["oracle"]["last_error"], "unknown_code", "{v}");
+    assert!(
+        v["cmf"]["hint"].as_str().unwrap().contains(
+            "is stopped by the stop rule unknown_code: a code this version does not know was recorded (it is not shown)"
+        ),
+        "{v}"
+    );
+    let o = decide_oracle(
+        &base,
+        &["-p", &text],
+        &["--state", s(&state), "--oracle-resume"],
+        &key,
+    );
+    assert!(o.status.success(), "{}", show(&o));
+    let err = stderr_of(&o);
+    assert!(
+        err.contains("was stopped by the stop rule unknown_code: "),
+        "{err}"
+    );
+    assert_no_key_in(&err, "decide --oracle-resume stderr");
+    assert_no_key_in(&stdout_of(&o), "decide --oracle-resume stdout");
+    // Resumed: the call is made, and the state file holds no echo now.
+    assert_eq!(mock.chats(), 1, "{err}");
+    let written = std::fs::read_to_string(state.join("oracle.state")).unwrap();
+    assert_no_key_in(&written, "oracle.state");
+}
+
+/// The public listings are fetched without the key, but their names are
+/// cleaned with the configured key (the variable's value) on every surface:
+/// a provider name holding 8 bytes of it — from a proxy at the base URL that
+/// saw the key with an earlier call — is `[redacted]` in the startup line,
+/// `decide`'s start line and `oracle check`, and so is a name outside
+/// `[A-Za-z0-9 ._:/()-]`.
+#[test]
+fn listing_names_are_cleaned_with_the_configured_key_on_every_surface() {
+    let t = toy();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let mock = MockOpenRouter::start("travel", 1.3e-5);
+    let base = mock.base();
+    let piece = &HEX_OPENROUTER_KEY["sk-or-v1-".len()..][..8];
+    let key = [("OPENROUTER_API_KEY", HEX_OPENROUTER_KEY)];
+    for (name, keyed) in [
+        (format!("Mock {piece}"), true),
+        ("Mock\u{1b}[31m".to_string(), false),
+    ] {
+        mock.set_quirk(ChatQuirk {
+            listing_provider: Some(name.clone()),
+            ..ChatQuirk::default()
+        });
+        let srv = serve_oracle(&d.join(format!("s-{keyed}")), &base, &[], &key, d);
+        assert_eq!(oracle_status(&srv)["status"], "ready");
+        let logs = srv.stop();
+        assert!(
+            logs.contains(
+                "(2× the cheapest structured-output endpoint, [redacted] at $0.03/$0.29)"
+            ),
+            "{logs}"
+        );
+        assert_no_hex_key_in(logs.as_bytes(), "serve logs");
+        let o = output(&["decision", "oracle", "check", "--base-url", &base], &key);
+        let out = stdout_of(&o);
+        assert!(
+            out.contains("the cheapest is [redacted] at $0.03/$0.29 per 1M in/out"),
+            "{}",
+            show(&o)
+        );
+        let o = output(
+            &["decision", "oracle", "check", "--base-url", &base, "--json"],
+            &key,
+        );
+        let v = json_of(&stdout_of(&o));
+        assert_eq!(
+            v["model_check"]["cheapest"]["provider"], "[redacted]",
+            "{v}"
+        );
+        let rows = write(
+            d,
+            &format!("rows-{keyed}.jsonl"),
+            &format!("{}\n", json!({"text": "hello"})),
+        );
+        let o = output(
+            &[
+                "decide",
+                s(&t.path),
+                "--skill",
+                "topics",
+                "--input",
+                s(&rows),
+                "--state",
+                s(&d.join(format!("dc-{keyed}"))),
+                "--oracle",
+                ORACLE_MODEL,
+                "--oracle-base-url",
+                &base,
+            ],
+            &key,
+        );
+        assert!(o.status.success(), "{}", show(&o));
+        assert!(
+            stderr_of(&o).contains("the cheapest structured-output endpoint, [redacted] at"),
+            "{}",
+            show(&o)
+        );
+        for b in [&o.stdout, &o.stderr] {
+            assert_no_hex_key_in(b, "decide output");
+        }
+        // Without a key configured only the shape is judged: the piece is
+        // an ordinary name then, the escape still refused.
+        let o = output(&["decision", "oracle", "check", "--base-url", &base], &[]);
+        let out = stdout_of(&o);
+        if keyed {
+            assert!(out.contains(&format!("the cheapest is {name} at")), "{out}");
+        } else {
+            assert!(out.contains("the cheapest is [redacted] at"), "{out}");
+        }
+    }
+    // The listings never carried the key.
+    for (head, _) in mock.requests() {
+        if head.starts_with("GET /api/v1/models") {
+            assert!(
+                !head.to_ascii_lowercase().contains("authorization"),
+                "{head}"
+            );
+        }
+    }
 }

@@ -2244,6 +2244,117 @@ async fn keys_are_trimmed_or_refused_unsent_and_budgets_name_their_state() {
     assert_eq!(mock.hits(), hits + 2);
 }
 
+/// An admin limit kept in `oracle.state` binds after a restart with a larger
+/// configured budget or call limit: the startup line (with the file's path)
+/// and the decisions hint name it and the admin request that lifts it — a
+/// figure the admin API takes, rounded up — never "restart the server with
+/// --oracle-budget"; following the hint makes the call.
+#[tokio::test]
+async fn an_admin_limit_outlives_a_restart_and_its_hint_makes_the_call() {
+    use cortiq_decision::oracle_setup::{usd_ceil, usd_fine};
+    let mock = MockOracle::answering("travel");
+    let cfg = stand_config(&mock.url());
+    let srv = Srv::new(&cfg);
+    let s = srv
+        .admin(
+            "POST",
+            "/v1/admin/oracle",
+            Some(&json!({"budget_usd": 0.0})),
+        )
+        .await;
+    assert_eq!(s.body["status"], "budget_too_small", "{}", s.text);
+    // Restarted with a budget of $5.00: the admin limit still binds.
+    let mut five = cfg.clone();
+    five.oracle.budget_usd = 5.0;
+    let srv = srv.restart(&five);
+    assert_eq!(status(&srv).await, "budget_too_small");
+    let startup = |srv: &Srv, cfg: &Config| {
+        let st = srv.server.as_ref().unwrap().state();
+        cortiq_server::decisions::oracle_startup_line(st.cascade().unwrap(), cfg, None)
+    };
+    let file = srv.state_root().join("oracle.state");
+    let (ready, line) = startup(&srv, &five);
+    assert!(!ready);
+    assert!(
+        line.starts_with(&format!(
+            "oracle: NOT ready — the admin limit budget_usd $0.00 in {} binds (the file keeps it across restarts, so --oracle-budget cannot lift it; the next call needs a budget of $",
+            file.display()
+        )) && line.contains("(at most the configured $5.00) or lift it with {\"budget_usd\": null} (")
+            && !line.contains("restart with")
+            && !line.contains("restart the server"),
+        "{line}"
+    );
+    let hits = mock.hits();
+    let r = srv.decide(&topics_body(&rejected()[0])).await;
+    assert_eq!(r.flags(), json!(["budget"]), "{}", r.text);
+    let need = srv.admin("GET", "/v1/admin/oracle", None).await.body["min_call_usd"]
+        .as_f64()
+        .unwrap();
+    let hint = r.body["cmf"]["hint"].as_str().unwrap();
+    assert_eq!(
+        hint,
+        format!(
+            "no oracle call fits: the admin limit budget_usd $0.00 in the server's oracle.state binds (the file keeps it across restarts, so --oracle-budget cannot lift it; the next call needs a budget of {}): raise it with POST /v1/admin/oracle {{\"budget_usd\": {}}} (at most the configured $5.00) or lift it with {{\"budget_usd\": null}}",
+            usd_fine(need),
+            &usd_ceil(need)[1..]
+        )
+    );
+    assert_eq!(mock.hits(), hits, "nothing was sent");
+    // Following it: the admin API takes the figure, the call is made.
+    let x: f64 = usd_ceil(need)[1..].parse().unwrap();
+    let s = srv
+        .admin(
+            "POST",
+            "/v1/admin/oracle",
+            Some(&json!({ "budget_usd": x })),
+        )
+        .await;
+    assert_eq!(s.body["status"], "ready", "{}", s.text);
+    let r = srv.decide(&topics_body(&rejected()[0])).await;
+    assert_eq!(r.action(), "oracle", "{}", r.text);
+    assert_eq!(mock.hits(), hits + 1);
+    // The admin call limit at the calls made, then a restart with a larger
+    // configured limit: named likewise; lifting it makes the next call.
+    let s = srv
+        .admin(
+            "POST",
+            "/v1/admin/oracle",
+            Some(&json!({"max_calls": 1, "budget_usd": null})),
+        )
+        .await;
+    assert_eq!(s.body["status"], "budget_exhausted", "{}", s.text);
+    let mut more = five.clone();
+    more.oracle.max_calls = 50;
+    let srv = srv.restart(&more);
+    let (_, line) = startup(&srv, &more);
+    assert!(
+        line.starts_with(&format!(
+            "oracle: NOT ready — the admin limit max_calls 1 in {} binds (the file keeps it across restarts, so --oracle-max-calls cannot lift it): raise it with POST /v1/admin/oracle {{\"max_calls\": 2}} (at most the configured 50) or lift it with {{\"max_calls\": null}} (",
+            file.display()
+        )),
+        "{line}"
+    );
+    let r = srv.decide(&topics_body(&rejected()[1])).await;
+    assert_eq!(r.flags(), json!(["budget"]), "{}", r.text);
+    assert_eq!(
+        r.body["cmf"]["hint"],
+        "the oracle budget is used up: the admin limit max_calls 1 in the server's oracle.state binds (the file keeps it across restarts, so --oracle-max-calls cannot lift it): raise it with POST /v1/admin/oracle {\"max_calls\": 2} (at most the configured 50) or lift it with {\"max_calls\": null}",
+        "{}",
+        r.text
+    );
+    let s = srv
+        .admin(
+            "POST",
+            "/v1/admin/oracle",
+            Some(&json!({"max_calls": null})),
+        )
+        .await;
+    assert_eq!(s.body["status"], "ready", "{}", s.text);
+    let r = srv.decide(&topics_body(&rejected()[1])).await;
+    assert_eq!(r.action(), "oracle", "{}", r.text);
+    assert_eq!(mock.hits(), hits + 2);
+}
+
 /// `serve --oracle` on loopback without keys or `auth.require`: the implicit
 /// open caller reaches the oracle, but nothing it brings teaches the model —
 /// not its feedback, and not the oracle's answer to a skill's own question

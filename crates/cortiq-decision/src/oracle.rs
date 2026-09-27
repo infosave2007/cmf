@@ -65,8 +65,11 @@
 //! never sent. Transport and read errors are fixed codes
 //! ([`transport_code`], [`read_code`]), never the library's text, which may
 //! hold a request header or a URL; what the upstream answers (`provider`,
-//! `model`) is kept only cleaned ([`clean_upstream`]); every error code is
-//! a fixed word.
+//! `model`) is kept only cleaned ([`clean_upstream`]: the name itself when it
+//! is at most 64 bytes of `[A-Za-z0-9 ._:/()-]` and shows no trace of a key,
+//! else `[redacted]`); every error code is a fixed word of a closed set
+//! ([`is_known_code`]), and one read back from `oracle.state` outside it is
+//! [`UNKNOWN_CODE`].
 //!
 //! **Status** ([`OracleClient::status`], `status` of `GET /v1/admin/oracle`):
 //! `disabled` (not configured, or the admin switch is off), `no_key` (the
@@ -81,13 +84,16 @@
 //! cannot hold it; `min_call_usd` is the larger of the smallest possible
 //! call's reservation and the smallest real call the budget refused — a
 //! call refused by the coarse [`OracleClient::permission`] check too, whose
-//! body the caller then gives ([`OracleClient::note_budget_refusal`]).
+//! body the caller then gives ([`OracleClient::note_budget_refusal`]). When
+//! an admin limit of `oracle.state` is among what refuses the next call, the
+//! budget statuses carry it ([`AdminBinding`]): the file keeps it across
+//! restarts, so the hints name it and the admin request that lifts it.
 
 use crate::answer::OracleAnswer;
 use crate::canonical;
 use crate::config::{MAX_ORACLE_TOKENS, OracleConfig};
 use crate::protocol::{ApiError, Question, QuestionKind, find_duplicate_key};
-use crate::service::{OracleStatus, RefusalReason};
+use crate::service::{AdminBinding, OracleStatus, RefusalReason};
 use crate::statedir::atomic_write;
 use anyhow::{Context, Result, bail, ensure};
 use parking_lot::Mutex;
@@ -418,27 +424,111 @@ pub fn parse_response(body: &[u8], questions: &[&Question], model: &str) -> Pars
     out
 }
 
+// ------------------------------------------------------------------ codes
+
+/// What a code outside [`FIXED_CODES`] is shown as.
+pub const UNKNOWN_CODE: &str = "unknown_code";
+
+/// Every fixed error, stop and refusal code this crate writes to
+/// `oracle.state`, a ledger or a message (besides `http_NNN`, a status of
+/// three digits): the transport and read codes ([`transport_code`],
+/// [`read_code`]), the finish codes ([`finish_code`], `finish_missing`), the
+/// answer checks ([`parse_response`], [`parse_verdicts`]), the client's own
+/// (`response_too_large`, `ledger_write`, `unsettled_at_start`), the stop
+/// rules (`cost_above_reservation`, `max_errors`; `http_401..403`,
+/// `unexpected_model`), the refusal flags
+/// ([`crate::service::RefusalReason::flag`]) and [`UNKNOWN_CODE`] itself.
+pub const FIXED_CODES: &[&str] = &[
+    "transport_timeout",
+    "transport_bad_url",
+    "transport_dns",
+    "transport_insecure",
+    "transport_connect",
+    "transport_redirect",
+    "transport_bad_status",
+    "transport_bad_header",
+    "transport_io",
+    "transport_proxy",
+    "transport_http",
+    "read_timeout",
+    "read_io",
+    "finish_length",
+    "finish_content_filter",
+    "finish_tool_calls",
+    "finish_error",
+    "finish_other",
+    "finish_missing",
+    "unparsable_body",
+    "error_body",
+    "cost_missing",
+    "unexpected_model",
+    "no_choices",
+    "tool_calls",
+    "no_content",
+    "duplicate_key",
+    "invalid_json",
+    "not_an_object",
+    "question_ids_mismatch",
+    "choice_outside_contract",
+    "invalid_score",
+    "invalid_boolean",
+    "response_too_large",
+    "ledger_write",
+    "unsettled_at_start",
+    "cost_above_reservation",
+    "max_errors",
+    "no_key",
+    "bad_key",
+    "oracle_disabled",
+    "consent_off",
+    "budget",
+    "stopped",
+    UNKNOWN_CODE,
+];
+
+/// Whether `code` belongs to the closed code set: one of [`FIXED_CODES`], or
+/// `http_` and a status of three digits (`http_100` … `http_999`).
+pub fn is_known_code(code: &str) -> bool {
+    if let Some(d) = code.strip_prefix("http_") {
+        let b = d.as_bytes();
+        return b.len() == 3 && b.iter().all(u8::is_ascii_digit) && b[0] != b'0';
+    }
+    FIXED_CODES.contains(&code)
+}
+
+/// `code` when it belongs to the closed code set ([`is_known_code`]), else
+/// [`UNKNOWN_CODE`]: a code read back from `oracle.state` (an older version's
+/// file, or one edited by hand) is never shown as it is written.
+pub fn shown_code(code: &str) -> &str {
+    if is_known_code(code) {
+        code
+    } else {
+        UNKNOWN_CODE
+    }
+}
+
 // ------------------------------------------------------------------ upstream text
 
-/// Longest upstream string kept for a ledger or a message.
-pub const UPSTREAM_TEXT_MAX: usize = 128;
+/// Longest upstream name kept for a ledger or a message, in bytes.
+pub const UPSTREAM_TEXT_MAX: usize = 64;
 
-/// A string an upstream answered (a response's `provider` or `model`, a
-/// listing's provider name) as it may be written to a ledger, logged or
-/// printed: visible ASCII and spaces only (no terminal escapes), at most
-/// [`UPSTREAM_TEXT_MAX`] bytes, and `[redacted]` when it holds `Bearer`,
-/// looks like a key ([`crate::config::looks_like_key`]) or holds 8 bytes
-/// in a row of `key` — a hostile or broken proxy echoing the request's
-/// `Authorization` header. The checks see the raw string, the string kept
-/// (an echo interleaved with control or invisible characters is joined
-/// again by the filter, so it is checked after it) and its letters and
-/// digits alone (an echo interleaved with punctuation or spaces).
-pub fn clean_upstream(s: &str, key: Option<&str>) -> String {
-    const REDACTED: &str = "[redacted]";
-    let kept: String = s
-        .chars()
-        .filter(|c| c.is_ascii_graphic() || *c == ' ')
-        .collect();
+/// What an upstream name that is not kept is shown as.
+pub const REDACTED: &str = "[redacted]";
+
+/// Whether a name an upstream answered may be kept as it is: 1..=
+/// [`UPSTREAM_TEXT_MAX`] bytes of `[A-Za-z0-9 ._:/()-]` only, and none of
+/// what an echo of the request's `Authorization` header leaves: `Bearer` (in
+/// any case), a key's look ([`crate::config::looks_like_key`]: `sk-or-`
+/// anywhere or `sk-` first, in any case; `Bearer ` first; surrounding
+/// whitespace; more than 40 bytes without a `/`; 32 hexadecimal digits in a
+/// row), 8 bytes in a row of `key`, and — among its letters and digits alone
+/// (an echo interleaved with dots, dashes or spaces), lower-cased — `bearer`,
+/// `skorv` or 8 in a row of `key`'s letters and digits.
+pub fn upstream_name_ok(s: &str, key: Option<&str>) -> bool {
+    let allowed = |b: u8| b.is_ascii_alphanumeric() || b" ._:/()-".contains(&b);
+    if s.is_empty() || s.len() > UPSTREAM_TEXT_MAX || !s.bytes().all(allowed) {
+        return false;
+    }
     let alnum = |t: &str| -> Vec<u8> {
         t.bytes()
             .filter(u8::is_ascii_alphanumeric)
@@ -450,17 +540,41 @@ pub fn clean_upstream(s: &str, key: Option<&str>) -> String {
     };
     let holds =
         |hay: &[u8], words: &[&[u8]]| words.iter().any(|w| hay.windows(w.len()).any(|x| x == *w));
-    let joined = alnum(&kept);
-    let bad = [s, kept.as_str()].iter().any(|t| {
-        holds(t.to_ascii_lowercase().as_bytes(), &[b"bearer"])
-            || crate::config::looks_like_key(t.trim()).is_some()
-            || key.is_some_and(|k| windows_of(t.as_bytes(), k.as_bytes()))
-    }) || holds(&joined, &[b"bearer", b"skorv"])
+    let joined = alnum(s);
+    let bad = holds(s.to_ascii_lowercase().as_bytes(), &[b"bearer"])
+        || crate::config::looks_like_key(s).is_some()
+        || key.is_some_and(|k| windows_of(s.as_bytes(), k.as_bytes()))
+        || holds(&joined, &[b"bearer", b"skorv"])
         || key.is_some_and(|k| windows_of(&joined, &alnum(k)));
-    if bad {
-        return REDACTED.into();
+    !bad
+}
+
+/// A name an upstream answered (a response's `provider` or `model`, a
+/// listing's provider name) as it may be written to a ledger, logged or
+/// printed: the name itself when [`upstream_name_ok`] keeps it, else
+/// [`REDACTED`] — never a filtered or cut version of it (a filter would join
+/// an echo interleaved with control or invisible characters again). `key`
+/// is the key configured (the one sent, or the variable's value for a
+/// listing fetched without it).
+pub fn clean_upstream(s: &str, key: Option<&str>) -> String {
+    if upstream_name_ok(s, key) {
+        s.to_string()
+    } else {
+        REDACTED.to_string()
     }
-    kept.chars().take(UPSTREAM_TEXT_MAX).collect()
+}
+
+/// The configured key as [`clean_upstream`] compares upstream names with it:
+/// the value of variable `var` less surrounding ASCII whitespace, whatever
+/// else it holds (a key `bad_key` refuses included; bytes outside UTF-8 as
+/// U+FFFD); `None` when unset or blank. A public listing is fetched without
+/// the key, but from the configured base URL, which may be a proxy that
+/// received it with an earlier call.
+pub fn key_for_cleaning(lookup: &KeyLookup, var: &str) -> Option<String> {
+    let raw = lookup(var)?;
+    let start = raw.iter().position(|b| !is_edge_space(*b))?;
+    let end = raw.iter().rposition(|b| !is_edge_space(*b))? + 1;
+    Some(String::from_utf8_lossy(&raw[start..end]).into_owned())
 }
 
 // ------------------------------------------------------------------ key
@@ -728,10 +842,20 @@ impl OracleState {
     }
 }
 
-/// Read `oracle.state` (a missing file is the default state).
+/// Read `oracle.state` (a missing file is the default state). Its codes
+/// (`stop_reason`, `last_error`) come back only from the closed code set
+/// ([`shown_code`]: another is [`UNKNOWN_CODE`], still a stop), and a file
+/// that does not parse is named without the values it holds.
 pub fn read_state_file(path: &Path) -> Result<OracleState> {
     match std::fs::read(path) {
-        Ok(b) => serde_json::from_slice(&b).with_context(|| format!("parse {}", path.display())),
+        Ok(b) => {
+            let mut st: OracleState = serde_json::from_slice(&b)
+                .map_err(|e| anyhow::anyhow!(crate::config::redact_serde_error(&e.to_string())))
+                .with_context(|| format!("parse {}", path.display()))?;
+            st.stop_reason = st.stop_reason.map(|c| shown_code(&c).to_string());
+            st.last_error = st.last_error.map(|c| shown_code(&c).to_string());
+            Ok(st)
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(OracleState::default()),
         Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
     }
@@ -1536,7 +1660,7 @@ impl OracleClient {
             KeyState::Usable { .. } => {}
         }
         if let Some(r) = &inner.state.stop_reason {
-            return OracleStatus::Stopped(r.clone());
+            return OracleStatus::Stopped(shown_code(r).to_string());
         }
         let t = &inner.totals;
         let need = self.least_call_usd(inner);
@@ -1551,13 +1675,43 @@ impl OracleClient {
         if !calls_out && !budget_short {
             return OracleStatus::Ready;
         }
+        let admin = self.admin_binding(inner, need);
         if used {
-            return OracleStatus::BudgetExhausted;
+            return OracleStatus::BudgetExhausted { admin };
         }
         OracleStatus::BudgetTooSmall {
             min_usd: budget_short.then_some(need),
             calls_zero: calls_out,
+            admin,
         }
+    }
+
+    /// The admin limits of `oracle.state` that refuse the next call (`need`
+    /// USD reserved), whatever the configured ones say: the file keeps them
+    /// across restarts (`None`: none binds).
+    fn admin_binding(&self, inner: &Inner, need: f64) -> Option<AdminBinding> {
+        let (st, t) = (&inner.state, &inner.totals);
+        let max_calls = st.max_calls.filter(|c| t.calls >= *c);
+        let budget_usd = st.budget_usd.filter(|b| t.spent + need > *b);
+        if max_calls.is_none() && budget_usd.is_none() {
+            return None;
+        }
+        Some(AdminBinding {
+            max_calls,
+            budget_usd,
+            configured_max_calls: self.cfg.max_calls,
+            configured_budget_usd: self.cfg.budget_usd,
+            need_calls: t.calls.saturating_add(1),
+            need_usd: t.spent + need,
+            need_is_smallest: inner
+                .budget_refusal
+                .is_none_or(|r| r <= self.min_reservation_usd()),
+        })
+    }
+
+    /// `oracle.state` of this client (`None`: kept in memory).
+    pub fn state_path(&self) -> Option<&Path> {
+        self.state_path.as_deref()
     }
 
     /// The least budget a call needs: the smallest possible call's
@@ -1586,9 +1740,9 @@ impl OracleClient {
         json!({
             "status": status.label(),
             "enabled": inner.state.enabled,
-            "stop_reason": inner.state.stop_reason,
+            "stop_reason": inner.state.stop_reason.as_deref().map(shown_code),
             "stopped_unix": inner.state.stopped_unix,
-            "last_error": inner.state.last_error,
+            "last_error": inner.state.last_error.as_deref().map(shown_code),
             "key_present": key != KeyState::Missing,
             "key_ok": matches!(key, KeyState::Usable { .. }),
             "key_problem": key.problem(),
@@ -2125,7 +2279,8 @@ mod tests {
             c.status(),
             OracleStatus::BudgetTooSmall {
                 min_usd: Some(min),
-                calls_zero: false
+                calls_zero: false,
+                admin: None
             }
         );
         assert_eq!(c.status().label(), "budget_too_small");
@@ -2140,7 +2295,8 @@ mod tests {
             c0.status(),
             OracleStatus::BudgetTooSmall {
                 min_usd: None,
-                calls_zero: true
+                calls_zero: true,
+                admin: None
             }
         );
         assert_eq!(c0.status().label(), "budget_too_small");
@@ -2166,7 +2322,8 @@ mod tests {
             cb.status(),
             OracleStatus::BudgetTooSmall {
                 min_usd: Some(min),
-                calls_zero: true
+                calls_zero: true,
+                admin: None
             }
         );
         let hint = crate::service::oracle_hint(RefusalReason::Budget, &cb.status(), "K").unwrap();
@@ -2191,7 +2348,7 @@ mod tests {
         let mut one = cfg.clone();
         one.budget_usd = 1.0;
         let c1 = OracleClient::open(&one, &spent, None, key).unwrap();
-        assert_eq!(c1.status(), OracleStatus::BudgetExhausted);
+        assert_eq!(c1.status(), OracleStatus::BudgetExhausted { admin: None });
         assert_eq!(c1.status().label(), "budget_exhausted");
     }
 
@@ -2269,7 +2426,8 @@ mod tests {
             c.status(),
             OracleStatus::BudgetTooSmall {
                 min_usd: Some(real_res),
-                calls_zero: false
+                calls_zero: false,
+                admin: None
             }
         );
         assert_eq!(c.status_json()["min_call_usd"], json!(real_res));
@@ -2304,7 +2462,8 @@ mod tests {
                 c.status(),
                 OracleStatus::BudgetTooSmall {
                     min_usd: Some(real_res),
-                    calls_zero: false
+                    calls_zero: false,
+                    admin: None
                 },
                 "budget {budget}"
             );
@@ -2345,7 +2504,7 @@ mod tests {
             c.call_body(&caller, &[&real], &real_body),
             CallOutcome::Refused(RefusalReason::Budget)
         );
-        assert_eq!(c.status(), OracleStatus::BudgetExhausted);
+        assert_eq!(c.status(), OracleStatus::BudgetExhausted { admin: None });
         // A per-key budget refusal is not the server's budget being too
         // small.
         drop(c);
@@ -2371,16 +2530,41 @@ mod tests {
         // A piece of the key sent, without its prefix.
         assert_eq!(clean_upstream("prov-89abcdef", Some(key)), "[redacted]");
         assert_eq!(clean_upstream("prov-89abcde", Some(key)), "prov-89abcde");
-        // No terminal escapes, bounded.
-        assert_eq!(clean_upstream("a\u{1b}[31mb\u{7}", None), "a[31mb");
-        assert_eq!(
-            clean_upstream(&"p/".repeat(200), None).len(),
-            UPSTREAM_TEXT_MAX
-        );
+        // Only [A-Za-z0-9 ._:/()-], at most 64 bytes: anything else is
+        // [redacted] as a whole, never filtered or cut (no terminal escapes,
+        // no invisible characters, nothing a filter would join again).
+        assert_eq!(clean_upstream("a\u{1b}[31mb\u{7}", None), "[redacted]");
+        assert_eq!(clean_upstream("a[31mb", None), "[redacted]");
+        assert_eq!(clean_upstream(&"p/".repeat(200), None), "[redacted]");
+        let at_most = format!("a/{}", "z".repeat(UPSTREAM_TEXT_MAX - 2));
+        assert_eq!(clean_upstream(&at_most, None), at_most);
+        assert_eq!(clean_upstream(&format!("{at_most}z"), None), "[redacted]");
+        for bad in [
+            "",
+            "Novità AI",
+            "a,b",
+            "a\u{200b}b",
+            "tab\there",
+            "x\"y",
+            "q?s=1",
+            "a+b",
+            "#1",
+            "<b>",
+        ] {
+            assert_eq!(clean_upstream(bad, None), "[redacted]", "{bad:?}");
+        }
+        for good in [
+            "Mancer (private)",
+            "Google AI Studio",
+            "meta-llama/llama-3.1-8b-instruct:nitro",
+            "deepseek/deepseek-v4.1-flash-20260901",
+            "Alibaba Cloud Int.",
+        ] {
+            assert_eq!(clean_upstream(good, Some(key)), good);
+        }
         // An echo interleaved with control or invisible characters, or
         // with punctuation, holding a '/' (which the >40-byte rule would
-        // let pass): the filter would join it again, so the checks see the
-        // filtered text too.
+        // let pass): refused as a whole, whatever the key given.
         let full = "sk-or-v1-F00DFACE0123456789abcdef0123456789abcdef0123456789abcdefcafe";
         let auth = format!("Bearer {full}");
         let join = |sep: &str| auth.chars().map(String::from).collect::<Vec<_>>().join(sep);
@@ -2412,6 +2596,290 @@ mod tests {
             "deepseek/deepseek-v4.1-flash"
         );
         assert_eq!(clean_upstream("Novita AI", Some(full)), "Novita AI");
+        // Within the allowed characters and length: the key's own 8-byte
+        // windows, raw or among the letters and digits (dots, dashes or
+        // spaces between them), and "skorv".
+        let short = "sk-or-v1-9f8e7d6c5b4a39281706";
+        for echo in [
+            "prov 9f8e7d6c",
+            "p/9.f.8.e.7.d.6.c",
+            "p/9-f-8-e 7-d-6-c",
+            "x/S.K.O.R.V",
+        ] {
+            assert_eq!(clean_upstream(echo, Some(short)), "[redacted]", "{echo}");
+        }
+        assert_eq!(
+            clean_upstream("p/9.f.8.e.7.d.6", Some(short)),
+            "p/9.f.8.e.7.d.6"
+        );
+    }
+
+    #[test]
+    fn the_listing_cleaner_takes_the_variable_s_value_less_its_whitespace() {
+        let lookup = |raw: &'static [u8]| -> KeyLookup { Arc::new(move |_| Some(raw.to_vec())) };
+        assert_eq!(
+            key_for_cleaning(&lookup(b" sk-or-v1-abc\r\n"), "K").as_deref(),
+            Some("sk-or-v1-abc")
+        );
+        // A value bad_key refuses is still compared (it is the operator's
+        // secret), bytes outside UTF-8 as U+FFFD.
+        assert_eq!(
+            key_for_cleaning(&lookup(b"Bearer abc\xff"), "K").as_deref(),
+            Some("Bearer abc\u{fffd}")
+        );
+        assert_eq!(key_for_cleaning(&lookup(b" \t\r\n"), "K"), None);
+        let unset: KeyLookup = Arc::new(|_| None);
+        assert_eq!(key_for_cleaning(&unset, "K"), None);
+    }
+
+    #[test]
+    fn codes_come_from_a_closed_set_and_the_state_file_is_read_back_through_it() {
+        for c in FIXED_CODES {
+            assert!(is_known_code(c), "{c}");
+            assert_eq!(shown_code(c), *c);
+        }
+        for c in ["http_401", "http_402", "http_500", "http_999", "http_100"] {
+            assert!(is_known_code(c), "{c}");
+        }
+        for c in [
+            "http_",
+            "http_40",
+            "http_4011",
+            "http_099",
+            "http_4x1",
+            "finish_Bearer_sk_or_v1_abc",
+            "finish_stop",
+            "transport_sk-or-v1-abc",
+            "",
+            "MAX_ERRORS",
+            "max_errors ",
+        ] {
+            assert!(!is_known_code(c), "{c:?}");
+            assert_eq!(shown_code(c), UNKNOWN_CODE);
+        }
+        // Every code finish_code gives, and the refusal flags.
+        for r in [
+            "length",
+            "content_filter",
+            "tool_calls",
+            "function_call",
+            "error",
+            "x",
+        ] {
+            assert!(is_known_code(finish_code(r)), "{r}");
+        }
+        for r in [
+            RefusalReason::NoKey,
+            RefusalReason::BadKey,
+            RefusalReason::OracleDisabled,
+            RefusalReason::ConsentOff,
+            RefusalReason::Budget,
+            RefusalReason::Stopped,
+        ] {
+            assert!(r.flags().iter().all(|f| is_known_code(f)), "{r:?}");
+        }
+        // oracle.state as an older version (or a hand) wrote it: the codes
+        // outside the set come back as unknown_code, still a stop; the
+        // status, its JSON and a resume never show them.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oracle.state");
+        let echo = "finish_Bearer_sk_or_v1_0123456789abcdef0123456789abcdef";
+        std::fs::write(
+            &path,
+            json!({"enabled": true, "stop_reason": echo, "stopped_unix": 1,
+                   "consecutive_errors": 3, "last_error": format!("{echo}\u{1b}[2J")})
+            .to_string(),
+        )
+        .unwrap();
+        let st = read_state_file(&path).unwrap();
+        assert_eq!(st.stop_reason.as_deref(), Some(UNKNOWN_CODE));
+        assert_eq!(st.last_error.as_deref(), Some(UNKNOWN_CODE));
+        assert!(st.is_off());
+        let cfg = OracleConfig {
+            enabled: true,
+            ..OracleConfig::default()
+        };
+        let c = OracleClient::open(
+            &cfg,
+            &dir.path().join("oracle.jsonl"),
+            Some(&path),
+            key_of("sk-or-v1-abc"),
+        )
+        .unwrap();
+        assert_eq!(c.status(), OracleStatus::Stopped(UNKNOWN_CODE.into()));
+        assert_eq!(c.status().label(), "stopped: unknown_code");
+        let j = c.status_json().to_string();
+        assert!(!j.contains("0123456789") && !j.contains("Bearer"), "{j}");
+        assert_eq!(c.status_json()["stop_reason"], UNKNOWN_CODE);
+        assert_eq!(c.status_json()["last_error"], UNKNOWN_CODE);
+        drop(c);
+        let before = resume_state_file(&path).unwrap().unwrap();
+        assert_eq!(before.stop_reason.as_deref(), Some(UNKNOWN_CODE));
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(!written.contains("0123456789"), "{written}");
+        // A file that does not parse is named without the values it holds.
+        std::fs::write(&path, br#"{"enabled": "sk-or-v1-0123456789abcdef"}"#).unwrap();
+        let e = format!("{:#}", read_state_file(&path).unwrap_err());
+        assert!(
+            e.contains("oracle.state") && !e.contains("0123456789"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn an_admin_limit_that_binds_is_named_with_a_remedy_the_admin_api_takes() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = key_of("sk-or-v1-abc");
+        let path = dir.path().join("oracle.state");
+        let admin = |budget: Value, calls: Value| {
+            std::fs::write(
+                &path,
+                json!({"enabled": true, "budget_usd": budget, "max_calls": calls}).to_string(),
+            )
+            .unwrap();
+        };
+        let cfg = OracleConfig {
+            enabled: true,
+            budget_usd: 5.0,
+            ..OracleConfig::default()
+        };
+        let open = |cfg: &OracleConfig, name: &str| {
+            OracleClient::open(cfg, &dir.path().join(name), Some(&path), key.clone()).unwrap()
+        };
+        let text = |c: &OracleClient| {
+            crate::service::oracle_hint(RefusalReason::Budget, &c.status(), "K").unwrap()
+        };
+        // The admin budget 0 binds under a configured $5.00: named, with a
+        // figure rounded up and at most the configured budget, or null.
+        admin(json!(0.0), Value::Null);
+        let c = open(&cfg, "a.jsonl");
+        let min = c.min_reservation_usd();
+        let a = c.status().admin_binding().cloned().unwrap();
+        assert_eq!(
+            (a.budget_usd, a.max_calls, a.configured_budget_short()),
+            (Some(0.0), None, false)
+        );
+        assert!(a.need_is_smallest && a.need_usd == min);
+        let hint = text(&c);
+        let x = crate::oracle_setup::usd_ceil(min);
+        assert_eq!(
+            hint,
+            format!(
+                "no oracle call fits: the admin limit budget_usd $0.00 in the server's oracle.state binds (the file keeps it across restarts, so --oracle-budget cannot lift it; the next call needs a budget of {} or more (a longer question more)): raise it with POST /v1/admin/oracle {{\"budget_usd\": {}}} (at most the configured $5.00) or lift it with {{\"budget_usd\": null}}",
+                crate::oracle_setup::usd_fine(min),
+                &x[1..]
+            )
+        );
+        assert!(!hint.contains("restart the server"), "{hint}");
+        // Following it: the admin API takes the figure and the budget holds
+        // the smallest call.
+        let v: f64 = x[1..].parse().unwrap();
+        c.update(&json!({"budget_usd": v})).unwrap();
+        assert_eq!(c.status(), OracleStatus::Ready);
+        drop(c);
+        // A configured budget below the rounded figure: only null, never a
+        // figure the admin API refuses.
+        admin(json!(0.0), Value::Null);
+        let tight = OracleConfig {
+            budget_usd: min,
+            ..cfg.clone()
+        };
+        let c = open(&tight, "b.jsonl");
+        let hint = text(&c);
+        if crate::oracle_setup::usd_ceil(min)[1..]
+            .parse::<f64>()
+            .unwrap()
+            > min
+        {
+            assert!(
+                hint.contains(
+                    "lift it with POST /v1/admin/oracle {\"budget_usd\": null} (the configured"
+                ) && !hint.contains("raise it"),
+                "{hint}"
+            );
+        }
+        drop(c);
+        // Both the admin and the configured budget short: lift the admin
+        // limit and restart with the rounded-up figure.
+        let low = OracleConfig {
+            budget_usd: min / 2.0,
+            ..cfg.clone()
+        };
+        let c = open(&low, "c.jsonl");
+        let hint = text(&c);
+        assert!(
+            hint.contains("the admin limit budget_usd $0.00 in the server's oracle.state binds, and so does the configured budget")
+                && hint.ends_with(&format!(
+                    "lift the admin limit with POST /v1/admin/oracle {{\"budget_usd\": null}} and restart the server with --oracle-budget of at least {}",
+                    crate::oracle_setup::usd_ceil(min)
+                )),
+            "{hint}"
+        );
+        drop(c);
+        // The admin call limit 0 (and an admin limit above the configured
+        // one that is reached as well is still named).
+        admin(Value::Null, json!(0));
+        let c = open(&cfg, "d.jsonl");
+        assert_eq!(
+            text(&c),
+            "no oracle call fits: the admin limit max_calls 0 in the server's oracle.state binds (the file keeps it across restarts, so --oracle-max-calls cannot lift it): raise it with POST /v1/admin/oracle {\"max_calls\": 1} (at most the configured 10000) or lift it with {\"max_calls\": null}"
+        );
+        c.update(&json!({"max_calls": 1})).unwrap();
+        assert_eq!(c.status(), OracleStatus::Ready);
+        drop(c);
+        admin(Value::Null, json!(0));
+        let zero = OracleConfig {
+            max_calls: 0,
+            ..cfg.clone()
+        };
+        let c = open(&zero, "e.jsonl");
+        assert!(
+            text(&c).ends_with("lift the admin limit with POST /v1/admin/oracle {\"max_calls\": null} and restart the server with --oracle-max-calls of at least 1"),
+            "{}",
+            text(&c)
+        );
+        drop(c);
+        // Spent: exhausted, the admin budget named with what the ledger
+        // holds counted.
+        let spent = dir.path().join("spent.jsonl");
+        std::fs::write(
+            &spent,
+            [
+                json!({"status":"reserved","call_id":"a","key_id":"k","reserved_usd":0.5}),
+                json!({"status":"settled","call_id":"a","key_id":"k","reserved_usd":0.5,"cost_usd":0.01}),
+            ]
+            .iter()
+            .map(|l| format!("{l}\n"))
+            .collect::<String>(),
+        )
+        .unwrap();
+        admin(json!(0.01), Value::Null);
+        let c = OracleClient::open(&cfg, &spent, Some(&path), key.clone()).unwrap();
+        let s = c.status();
+        assert_eq!(s.label(), "budget_exhausted");
+        let a = s.admin_binding().unwrap();
+        assert!((a.need_usd - (0.01 + min)).abs() < 1e-15, "{a:?}");
+        let hint = text(&c);
+        assert!(
+            hint.starts_with("the oracle budget is used up: the admin limit budget_usd $0.01 in the server's oracle.state binds"),
+            "{hint}"
+        );
+        let x = hint.split("{\"budget_usd\": ").nth(1).unwrap();
+        let x: f64 = x[..x.find('}').unwrap()].parse().unwrap();
+        c.update(&json!({"budget_usd": x})).unwrap();
+        assert_eq!(c.status(), OracleStatus::Ready);
+        drop(c);
+        // No admin limit binds (the configured budget does): the old words.
+        admin(json!(4.0), Value::Null);
+        let c = open(
+            &OracleConfig {
+                budget_usd: 0.0,
+                ..cfg.clone()
+            },
+            "f.jsonl",
+        );
+        assert_eq!(c.status().admin_binding(), None);
+        assert!(text(&c).contains("restart the server with --oracle-budget of at least"));
     }
 
     #[test]

@@ -380,7 +380,8 @@ pub async fn serve(model: &str, host: &str, port: u16, flags: &ServeFlags) -> Re
         Some(f) => {
             let (cfg, setup) = tokio::task::spawn_blocking(move || {
                 let mut cfg = config;
-                oracle_setup::apply(&mut cfg, &f, config_sets_provider).map(|s| (cfg, s))
+                oracle_setup::apply(&mut cfg, &f, config_sets_provider, &oracle::process_env())
+                    .map(|s| (cfg, s))
             })
             .await
             .context("oracle setup")??;
@@ -1190,6 +1191,15 @@ enum Limit {
     AdminBudget(f64),
 }
 
+/// "1 call", "N calls".
+fn calls_text(n: u64) -> String {
+    if n == 1 {
+        "1 call".to_string()
+    } else {
+        format!("{n} calls")
+    }
+}
+
 /// The account `cortiq decide --oracle` records its calls under in the
 /// reservation ledger.
 pub const DECIDE_ACCOUNT: &str = "cortiq-decide";
@@ -1291,7 +1301,7 @@ impl OracleRun {
         }
         // One public GET of the model's endpoint listing (no key): the max
         // price, or the refusal of a model the oracle cannot use.
-        let setup = oracle_setup::apply(&mut cfg, flags, false)?;
+        let setup = oracle_setup::apply(&mut cfg, flags, false, &oracle::process_env())?;
         for w in &setup.warnings {
             eprintln!("warning: {w}");
         }
@@ -1396,28 +1406,35 @@ impl OracleRun {
     }
 
     /// Which limit refuses a call that reserves `next` USD (`None`: it fits).
+    /// An admin limit is named first whenever it refuses the call, whatever
+    /// the run's own limit says: `oracle.state` keeps it for every run, so no
+    /// run flag lifts it ([`Self::budget_text`] adds the run's limit when it
+    /// refuses the call as well).
     fn binding_limit(&self, next: f64) -> Option<Limit> {
         let o = self.cascade.as_ref()?.oracle();
         let (st, t, cfg) = (o.state(), o.totals(), o.config());
         // Admin limits count the whole ledger; the run's own sit on top of
         // what the ledger held at the start (`cfg` holds them so).
-        if let Some(c) = st
-            .max_calls
-            .filter(|c| *c <= cfg.max_calls && t.calls >= *c)
-        {
+        if let Some(c) = st.max_calls.filter(|c| t.calls >= *c) {
             return Some(Limit::AdminCalls(c));
         }
         if t.calls >= cfg.max_calls {
             return Some(Limit::RunCalls);
         }
         let used = t.spent + t.inflight;
-        if let Some(b) = st
-            .budget_usd
-            .filter(|b| *b <= cfg.budget_usd && used + next > *b)
-        {
+        if let Some(b) = st.budget_usd.filter(|b| used + next > *b) {
             return Some(Limit::AdminBudget(b));
         }
         (used + next > cfg.budget_usd).then_some(Limit::RunBudget)
+    }
+
+    /// Whether the run's call limit (on top of what the ledger held at the
+    /// start) is reached.
+    fn run_calls_out(&self) -> bool {
+        self.cascade.as_ref().is_some_and(|c| {
+            let o = c.oracle();
+            o.totals().calls >= o.config().max_calls
+        })
     }
 
     /// Whether the run's budget (on top of what the ledger held at the
@@ -1455,23 +1472,60 @@ impl OracleRun {
                 )
             }
         };
+        let file = self.state_root.as_ref().map_or_else(
+            || "oracle.state".to_string(),
+            |p| {
+                p.join(cortiq_decision::statedir::ORACLE_STATE_FILE)
+                    .display()
+                    .to_string()
+            },
+        );
         match self.binding_limit(next) {
-            Some(Limit::AdminCalls(c)) => format!(
-                "the admin call limit of state directory {root} is reached: max_calls {c} in its \
-                 oracle.state (set by a server's admin API) counts every call of the ledger, which \
-                 holds {}; --oracle-max-calls cannot raise it. Lift it on a server of that \
-                 directory: POST /v1/admin/oracle {{\"max_calls\":null}} (or a larger number)",
-                t.ledger_calls
-            ),
-            Some(Limit::AdminBudget(b)) => format!(
-                "the admin budget of state directory {root} cannot hold the next call: budget_usd \
-                 {} in its oracle.state (set by a server's admin API) counts all the ledger's \
-                 spending, {} so far, and {reserves}; --oracle-budget cannot raise it. Lift it on \
-                 a server of that directory: POST /v1/admin/oracle {{\"budget_usd\":null}} (or a \
-                 larger number)",
-                usd(b),
-                usd(t.ledger_spent),
-            ),
+            Some(Limit::AdminCalls(c)) => {
+                let also = if self.run_calls_out() {
+                    format!(
+                        "; the {} this run may make {} made as well: pass a larger \
+                         --oracle-max-calls too",
+                        calls_text(self.max_calls),
+                        if self.max_calls == 1 { "is" } else { "are" }
+                    )
+                } else {
+                    String::new()
+                };
+                format!(
+                    "the admin limit max_calls {c} in {file} binds: it counts every call of the \
+                     ledger, which holds {}, and --oracle-max-calls cannot raise it. Lift it on a \
+                     server of state directory {root}: POST /v1/admin/oracle {{\"max_calls\": \
+                     null}}, or {{\"max_calls\": {}}} (at most that server's configured \
+                     limit){also}",
+                    t.ledger_calls,
+                    t.ledger_calls.saturating_add(1)
+                )
+            }
+            Some(Limit::AdminBudget(b)) => {
+                let (need, run_need) = self.budget_needs(next);
+                let also = if self.run_budget_short(next) {
+                    format!(
+                        "; the oracle budget of this run ({}) cannot hold it either: pass \
+                         --oracle-budget of at least {} too",
+                        usd(self.budget),
+                        usd_ceil(run_need)
+                    )
+                } else {
+                    String::new()
+                };
+                format!(
+                    "the admin limit budget_usd {} in {file} binds: it counts all the ledger's \
+                     spending, {} so far, and {reserves}, so it needs at least {}; \
+                     --oracle-budget cannot raise it. Lift it on a server of state directory \
+                     {root}: POST /v1/admin/oracle {{\"budget_usd\": null}}, or \
+                     {{\"budget_usd\": {}}} (at most that server's configured budget){also}",
+                    usd_fine(b),
+                    usd(t.ledger_spent),
+                    usd_fine(need),
+                    &usd_ceil(need)[1..]
+                )
+            }
             Some(Limit::RunCalls) if self.max_calls == 0 && self.run_budget_short(next) => {
                 format!(
                     "--oracle-max-calls 0 allows no oracle call, and the oracle budget of this run \
@@ -1488,11 +1542,7 @@ impl OracleRun {
             Some(Limit::RunCalls) => format!(
                 "the {} this run may make {} made (--oracle-max-calls): pass a larger \
                  --oracle-max-calls",
-                if self.max_calls == 1 {
-                    "1 call".to_string()
-                } else {
-                    format!("{} calls", self.max_calls)
-                },
+                calls_text(self.max_calls),
                 if self.max_calls == 1 { "is" } else { "are" }
             ),
             Some(Limit::RunBudget) | None if t.calls == 0 => format!(
@@ -1509,6 +1559,20 @@ impl OracleRun {
                 t.calls,
                 self.max_calls,
             ),
+        }
+    }
+
+    /// The least budgets that admit a call reserving `next` USD: the admin
+    /// limit's (over the whole ledger: its spending, the reservations in
+    /// flight and `next`) and this run's (its own share of those).
+    fn budget_needs(&self, next: f64) -> (f64, f64) {
+        match &self.cascade {
+            Some(c) => {
+                let t = c.oracle().totals();
+                let need = t.spent + t.inflight + next;
+                (need, (need - self.before.spent).max(next))
+            }
+            None => (next, next),
         }
     }
 
@@ -1546,24 +1610,29 @@ impl OracleRun {
         }
         let refused = c.oracle().last_budget_refusal();
         let next = match (&s, refused) {
-            (OracleStatus::BudgetExhausted | OracleStatus::BudgetTooSmall { .. }, r) => {
+            (OracleStatus::BudgetExhausted { .. } | OracleStatus::BudgetTooSmall { .. }, r) => {
                 r.unwrap_or_else(|| self.least_reservation())
             }
             (OracleStatus::Ready, Some(r)) => r,
             _ => return s,
         };
         let spent_before = t.ledger_calls > 0 || t.ledger_spent > 0.0;
-        // The call limit binds first; the budget may be short as well.
+        // The call limit binds first; the budget may be short as well. An
+        // admin limit the client found binding is kept with the status.
+        let admin = s.admin_binding().cloned();
         let too_small = |calls_zero: bool| OracleStatus::BudgetTooSmall {
             min_usd: (!calls_zero || self.run_budget_short(next)).then_some(next),
             calls_zero,
+            admin: admin.clone(),
         };
         match self.binding_limit(next) {
             Some(Limit::RunBudget) => too_small(false),
             Some(Limit::RunCalls) => too_small(true),
             Some(Limit::AdminBudget(_)) if !spent_before => too_small(false),
             Some(Limit::AdminCalls(_)) if !spent_before => too_small(true),
-            Some(_) => OracleStatus::BudgetExhausted,
+            Some(_) => OracleStatus::BudgetExhausted {
+                admin: admin.clone(),
+            },
             None => s,
         }
     }
@@ -1726,7 +1795,7 @@ impl OracleRun {
                 "oracle: NOT ready — {}. The rows the gate rejects abstain",
                 self.key_problem().unwrap_or_default()
             ),
-            OracleStatus::BudgetExhausted | OracleStatus::BudgetTooSmall { .. } => {
+            OracleStatus::BudgetExhausted { .. } | OracleStatus::BudgetTooSmall { .. } => {
                 format!("oracle: NOT ready — {} ({what})", self.budget_text(None))
             }
             other => match self.inherited_hint() {
@@ -1797,9 +1866,12 @@ impl OracleRun {
                 OracleStatus::BudgetTooSmall { min_usd, .. } => *min_usd,
                 _ => None,
             },
-            "stop_reason": st.as_ref().and_then(|s| s.stop_reason.clone()),
+            // Codes of the closed set only (oracle.state may be an older
+            // version's, or edited by hand).
+            "stop_reason": st.as_ref().and_then(|s| s.stop_reason.as_deref().map(oracle::shown_code)),
             "last_error": st.as_ref().and_then(|s| s.last_error.clone())
-                .or_else(|| self.cascade.as_ref().and_then(|c| c.oracle().last_error())),
+                .or_else(|| self.cascade.as_ref().and_then(|c| c.oracle().last_error()))
+                .map(|e| oracle::shown_code(&e).to_string()),
             "key_env": self.key_env,
             "base_url": self.base_url,
             "budget_usd": self.budget,

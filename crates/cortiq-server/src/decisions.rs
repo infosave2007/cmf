@@ -74,8 +74,11 @@
 //! the oracle's answers to its questions (a skill's own question, as
 //! `/v1/route` asks it, included) are cached but never become examples. The
 //! server logs one startup line of the oracle ([`oracle_startup_line`]:
-//! `ready`, `NOT ready — <what to do>` or `off`; a key that had surrounding
-//! whitespace, trimmed before use, adds one warning), `GET /v1/admin/oracle`
+//! `ready`, `NOT ready — <what to do>` or `off`; an admin limit kept in
+//! `oracle.state` that refuses the next call is named with the file's path
+//! and the admin request that lifts it, since a restart flag cannot; a key
+//! that had surrounding whitespace, trimmed before use, adds one warning),
+//! `GET /v1/admin/oracle`
 //! has `status` (`ready`, `no_key`, `bad_key`, `disabled`,
 //! `budget_exhausted`, `budget_too_small`, `stopped: <reason>`; with
 //! `key_problem`, `last_error` and `min_call_usd`), `/healthz` has
@@ -3448,7 +3451,24 @@ pub fn oracle_startup_line(cascade: &Cascade, cfg: &Config, note: Option<&str>) 
                 cortiq_decision::oracle::bad_key_text(&o.api_key_env, &p)
             ),
         ),
-        OracleStatus::BudgetExhausted => (
+        // An admin limit of oracle.state binds: a restart alone cannot
+        // lift it, so the line names it, the file and the admin request.
+        OracleStatus::BudgetExhausted { admin: Some(a) }
+        | OracleStatus::BudgetTooSmall { admin: Some(a), .. } => {
+            let file = oracle
+                .state_path()
+                .map_or_else(|| "oracle.state".to_string(), |p| p.display().to_string());
+            (
+                false,
+                format!(
+                    "oracle: NOT ready — {} ({what}, {budget_text}, {} of {} calls)",
+                    a.server_text(&file),
+                    st["calls"],
+                    st["max_calls"]
+                ),
+            )
+        }
+        OracleStatus::BudgetExhausted { admin: None } => (
             false,
             format!(
                 "oracle: NOT ready — the budget is used up ({what}, {budget_text}, {} of {} calls; restart with a larger --oracle-budget or --oracle-max-calls)",
@@ -3458,6 +3478,7 @@ pub fn oracle_startup_line(cascade: &Cascade, cfg: &Config, note: Option<&str>) 
         OracleStatus::BudgetTooSmall {
             min_usd,
             calls_zero,
+            admin: None,
         } => (
             false,
             match (min_usd, calls_zero) {
@@ -3485,9 +3506,15 @@ pub fn oracle_startup_line(cascade: &Cascade, cfg: &Config, note: Option<&str>) 
             },
         ),
         OracleStatus::Stopped(r) => {
+            // Codes of the closed set only (oracle.state may be an older
+            // version's, or edited by hand).
+            let r = cortiq_decision::oracle::shown_code(&r);
             // A `max_errors` stop names the last failure's code.
             let last = match st["last_error"].as_str() {
-                Some(e) if r == "max_errors" => format!(", the last error: {e}"),
+                Some(e) if r == "max_errors" => format!(
+                    ", the last error: {}",
+                    cortiq_decision::oracle::shown_code(e)
+                ),
                 _ => String::new(),
             };
             (

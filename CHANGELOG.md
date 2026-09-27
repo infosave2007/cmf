@@ -104,19 +104,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   could hold the request's `Authorization` header; a `finish_reason` other
   than `stop` is one of `finish_length`, `finish_content_filter`,
   `finish_tool_calls`, `finish_error`, `finish_other`, never the upstream's
-  text; what an upstream answers (`provider`, `model`, listing names) is
-  kept to visible ASCII and `[redacted]` when it — also once control,
-  invisible or punctuation characters are dropped — holds `Bearer`, looks
-  like a key or holds a piece of the key sent. A command-line usage error
-  shows an argument that looks like a key only by its length (a key pasted
-  as a stray argument or as `--flag=KEY`). A key-like value (holding `sk-or-` or
-  starting with `sk-` in any case, starting with `Bearer `, with surrounding
-  whitespace, or longer than 40 bytes without a `/`; an upper-case variable
-  name is a name at any length) given as a model id or a variable's name is
-  refused whatever its prefix, only its length shown; so is a model id
-  without a `/`, a variable's name starting with a digit, a value a numeric
-  oracle flag refuses and a string a `--decision-config` gives where a
-  number belongs. `budget_too_small` names the least budget that holds a
+  text; every code shown comes from a closed set (with `http_NNN`), and a
+  `stop_reason` or `last_error` read back from `oracle.state` outside it is
+  `unknown_code` (still a stop) on every surface. A name an upstream
+  answers (a response's `provider` and `model`, a listing's provider names
+  and model ids) is kept only as it is — at most 64 bytes of
+  `[A-Za-z0-9 ._:/()-]` — and is `[redacted]` otherwise, never filtered or
+  cut; also when it holds `Bearer`, looks like a key or holds 8 bytes in a
+  row of the configured key, or its letters and digits alone hold
+  `bearer`, `skorv` or 8 in a row of the key's; the listings, fetched
+  without the key, are checked against it too (its variable's value). A
+  command-line usage error shows an argument that looks like a key only by
+  its length (a key pasted as a stray argument or as `--flag=KEY`). A value
+  looks like a key when it holds `sk-or-` anywhere or starts with `sk-`
+  (any case), starts with `Bearer ` (any case), has leading or trailing
+  whitespace, is 41 bytes or longer without a `/`, or holds 32 hexadecimal
+  digits in a row; for a variable's name, an all-`[A-Z0-9_]` value starting
+  with an upper-case letter or `_` is a name at any length unless it holds 32
+  hexadecimal digits in a row, and any other is also refused as a random
+  token at 16 bytes or more with letters and digits and no `_`. Such a
+  value given as a model id, a variable's name or a numeric oracle flag
+  (trimmed) is refused whatever its prefix, only its length shown; so is a
+  model id without a `/`, a variable's name that is not 1–128 bytes of
+  `[A-Za-z0-9_]` starting with a letter or `_`, a base URL holding `sk-or-`
+  and a string a `--decision-config` gives where a number belongs. Out of
+  scope: an upstream at the configured base URL that already received the
+  key and deliberately echoes it in its own answers (Cortiq still copies
+  none of its free text into another client's answer), and a key typed into
+  an argument that is not about the key or the oracle (a file path,
+  `--host`, a skill id). `budget_too_small` names the least budget that holds a
   call, rounded up to the micro-dollar: the smallest possible call's (one
   short question: the system prompt and schema are always sent) until the
   budget refuses a real one, then that call's reservation — also for a
@@ -125,7 +141,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused a real call with nothing spent reports `budget_too_small` instead
   of `ready` (and `budget_exhausted` once something was spent). With
   `max_calls` 0 the hint names the call limit (and the budget only when it
-  is short too).
+  is short too). An admin limit kept in `oracle.state` (`POST
+  /v1/admin/oracle` `budget_usd` / `max_calls`) that refuses the next call
+  is named — its value, the file, and the admin request that lifts it with a
+  figure rounded up that the admin API takes (at most the configured
+  budget) or `null` — by the startup line, the decisions-API hint and
+  `decide`, instead of "restart with --oracle-budget", which cannot lift it.
 - `cortiq decide FILE -p TEXT | --input ROWS --oracle MODEL`: the text is
   decided locally first, and only one the gate rejects (or whose labels no
   skill has) is sent, in one call with the server's reservation ledger,
