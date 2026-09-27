@@ -40,8 +40,10 @@
 //! max_tokens·max_price.completion)/1e6`. A call is admitted when `spent +
 //! reservations in flight + reservation ≤ budget`, `calls < max_calls` and, for a
 //! key with `oracle_budget_usd`, `spent_key + in flight_key + reservation ≤
-//! oracle_budget_usd`. The `reserved` line of `oracle.jsonl` is written and
-//! fsynced before the network is touched; after the answer one line `settled`
+//! oracle_budget_usd`, and, for a key with `credit_usd`, `reservation ≤` the
+//! credit left for the oracle ([`Caller::credit_left_usd`]). The `reserved`
+//! line of `oracle.jsonl` is written and fsynced before the network is
+//! touched; after the answer one line `settled`
 //! (the cost), `failed_billed` (a failure with a cost) or `failed_unknown_cost`
 //! (charged at the reservation). A reservation found open at start is charged in
 //! full and closed with `failed_unknown_cost` (`unsettled_at_start`).
@@ -503,6 +505,11 @@ pub struct Caller<'a> {
     pub key12: Option<&'a str>,
     /// `oracle_budget_usd` of the key.
     pub key_budget_usd: Option<f64>,
+    /// The most a call may cost (the provider's own USD) before the caller's
+    /// `credit_usd` is used up: `(credit − cost so far) / markup` with
+    /// passthrough; `None` without a credit limit or when the oracle is not
+    /// billed. A reservation that does not fit is refused (`budget`).
+    pub credit_left_usd: Option<f64>,
 }
 
 impl Caller<'_> {
@@ -713,6 +720,9 @@ impl OracleClient {
                 return Err(RefusalReason::Budget);
             }
         }
+        if caller.credit_left_usd.is_some_and(|left| res > left) {
+            return Err(RefusalReason::Budget);
+        }
         Ok(())
     }
 
@@ -739,6 +749,9 @@ impl OracleClient {
             if used >= kb {
                 return Err(RefusalReason::Budget);
             }
+        }
+        if caller.credit_left_usd.is_some_and(|left| left <= 0.0) {
+            return Err(RefusalReason::Budget);
         }
         Ok(())
     }

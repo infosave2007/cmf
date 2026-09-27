@@ -76,7 +76,7 @@ and every config inside it.
 ## Quick start
 
 ```bash
-# 1 — the runtime (Rust 1.85+; nothing else)
+# 1 — the runtime (Rust 1.88+; nothing else)
 cargo install cortiq-cli
 
 # 2 — the model

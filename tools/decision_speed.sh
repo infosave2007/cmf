@@ -29,12 +29,13 @@
 # log). Every read of a test split is appended to
 # $CMFPUBLIC/artifacts/decision-v4-20260926/test-access.log first.
 #
-# Environment: CORTIQ (default <repo>/target/release/cortiq), CMFPUBLIC
-# (/Users/oleg/dev/cmfpublic), PYTHON (python3), B/C/M (split directories).
+# Environment: CORTIQ (default <repo>/target/release/cortiq), CMFPUBLIC (the
+# directory holding artifacts/ and reports/, default the repository root),
+# PYTHON (python3), B/C/M (split directories).
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CMFPUBLIC="${CMFPUBLIC:-/Users/oleg/dev/cmfpublic}"
+CMFPUBLIC="${CMFPUBLIC:-$REPO}"
 CORTIQ="${CORTIQ:-$REPO/target/release/cortiq}"
 PYTHON="${PYTHON:-python3}"
 B="${B:-$CMFPUBLIC/artifacts/decision-v2-20260926/splits/banking77}"
@@ -43,7 +44,7 @@ M="${M:-$CMFPUBLIC/artifacts/decision-massive-20260926/data}"
 ACCESS_LOG="${ACCESS_LOG:-$CMFPUBLIC/artifacts/decision-v4-20260926/test-access.log}"
 export CMF_GPU=0
 
-usage() { sed -n '2,36p' "$0"; }
+usage() { sed -n '2,34p' "$0"; }
 [ $# -ge 2 ] || { usage >&2; exit 2; }
 MODEL="$1"; OUTDIR="$2"; shift 2
 HTTP=1

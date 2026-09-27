@@ -1415,7 +1415,30 @@ fn keys_auth_rate_quotas_and_admin() {
     assert_eq!((e.status, e.reason), (429, Reason::RateLimited));
     assert_eq!(e.retry_after, Some(60 - (t0 + 2) % 60));
     svc.admit_at(&tiny, t0 + 60).unwrap();
-    // Decision quota 2: two answered questions, then 402.
+    // Decision quota 2: a request with more questions than are left is
+    // refused before any work (nothing billed); two answered questions, then
+    // 402.
+    let e = svc
+        .decide_body(
+            &body(
+                json!("rain"),
+                json!({"a": choice(&TOPICS), "b": choice(&SHOP), "c": choice(&TOPICS)}),
+                None,
+            ),
+            &tiny,
+        )
+        .unwrap_err();
+    assert_eq!((e.status, e.reason), (402, Reason::QuotaExceeded));
+    let d = e.details.as_deref().unwrap();
+    assert_eq!(
+        (
+            d["quota"].as_str(),
+            d["used"].as_u64(),
+            d["limit"].as_u64(),
+            d["requested"].as_u64()
+        ),
+        (Some("decision"), Some(0), Some(2), Some(3))
+    );
     svc.decide_body(
         &body(
             json!("rain"),
@@ -1452,6 +1475,19 @@ fn keys_auth_rate_quotas_and_admin() {
     let mut p3 = Principal::open();
     p3.account = "credit".into();
     p3.credit_usd = Some(Usd::parse("0.002").unwrap());
+    // What an oracle call may still cost under the credit: (credit − cost so
+    // far) / markup, only when the oracle is billed.
+    assert_eq!(paid.oracle_credit_left(&p3), Some(0.002));
+    assert_eq!(paid.oracle_credit_left(&Principal::open()), None);
+    let mut marked = Config::default();
+    marked.pricing.oracle_markup = 2.0;
+    assert_eq!(
+        service_with(marked, None).oracle_credit_left(&p3),
+        Some(0.001)
+    );
+    let mut unbilled = Config::default();
+    unbilled.pricing.oracle_passthrough = false;
+    assert_eq!(service_with(unbilled, None).oracle_credit_left(&p3), None);
     for _ in 0..2 {
         paid.admit_at(&p3, t0).unwrap();
         paid.decide_body(
@@ -1462,6 +1498,7 @@ fn keys_auth_rate_quotas_and_admin() {
     }
     let e = paid.admit_at(&p3, t0).unwrap_err();
     assert_eq!(e.details.as_deref().unwrap()["quota"], "credit");
+    assert_eq!(paid.oracle_credit_left(&p3), Some(0.0));
     // In flight.
     let mut cfg = Config::default();
     cfg.limits.max_inflight = 1;

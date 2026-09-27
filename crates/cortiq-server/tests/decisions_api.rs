@@ -779,6 +779,29 @@ async fn decision_quota_token_quota_and_credit_are_402() {
         assert_eq!(t["cost_usd"].as_f64(), Some(0.001), "{a}");
     }
 
+    // Nor can one /v1/decisions request: more questions than the decision
+    // quota has left is 402 before any work, and nothing is billed.
+    let (k, _) = srv
+        .key(json!({"account": "manyq", "decision_quota": 1}))
+        .await;
+    let two = body(
+        json!(accepted()),
+        json!({"a": choice(&TOPICS), "b": choice(&SHOP)}),
+        None,
+    );
+    let r = srv.post("/v1/decisions", Some(&k), &two).await;
+    assert_eq!(r.openrouter_error(), (402, "QUOTA_EXCEEDED".to_string()));
+    let d = &r.body["error"]["metadata"]["details"];
+    assert_eq!(
+        (
+            d["used"].as_u64(),
+            d["limit"].as_u64(),
+            d["requested"].as_u64()
+        ),
+        (Some(0), Some(1), Some(2))
+    );
+    assert_eq!(srv.post("/v1/decisions", Some(&k), &b).await.status, 200);
+
     // A router batch cannot run past a quota or a credit limit: every input
     // after the first is checked against what the batch used so far (402;
     // the inputs before it are decided and billed).

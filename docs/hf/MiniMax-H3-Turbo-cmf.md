@@ -101,7 +101,7 @@ what the reference does with each. Frames come in as binary P6 PPM.
 `cortiq` is one Rust binary. Either install it —
 
 ```bash
-cargo install cortiq-cli          # needs Rust 1.85+; brings the GPU backend
+cargo install cortiq-cli          # needs Rust 1.88+; brings the GPU backend
 ```
 
 — or take a prebuilt archive from the

@@ -34,8 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   admin API; API keys stored as sha256 only (`keys.json` changed under
   `keys.json.lock` by the CLI and the server alike), cortiq-router's plans
   (keys expire after 30 days), minute rate windows, quotas and credit checked
-  before each request and before each input of a router batch, and a usage
-  ledger. The open mode reaches the oracle and teaches the model only with
+  before each request and before each input of a router batch (a
+  `/v1/decisions` request with more questions than the decision quota has
+  left is refused, and an oracle call whose reservation does not fit in the
+  credit left is not made), and a usage ledger. The open mode reaches the oracle and teaches the model only with
   `auth.require: false` set explicitly, never because of a loopback address
   alone. Prices are 0 by default; oracle costs pass through.
 - The cortiq-router API (schema 1.1) on the same server with the router's
@@ -65,7 +67,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whoever asked.
 - The published model `infosave/cortiq-decision` (304520292 bytes): skills
   `banking77`, `clinc150` and `massive` trained on train ∪ dev, with K 32, 16
-  and 24 chosen by cross-validation. The card, `API.md` and `ORACLE.md` are
+  and 24 chosen by cross-validation. It is 4520292 bytes over the
+  300000000-byte size limit of the release plan; the overrun was accepted,
+  since the file carries the train ∪ dev rows that exact self-learning
+  refits from and the cross-validated K (the reproduction build, train only
+  and K 16, is 259343088 bytes). The card, `API.md` and `ORACLE.md` are
   in `docs/decision/hf/`; `tools/decision_hf_bundle.sh` assembles the upload.
 
 ### Changed
@@ -97,6 +103,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The benchmarks are public and were reused; Jev got label names and two
   examples per label. The encoder is English, the gate is certified
   in-domain, and speed was measured on macOS arm64 only.
+- Building needs Rust 1.88 or newer: the code uses `let` chains (stable
+  since 1.88), as 0.7.7 already did; the manifests' `rust-version` still
+  says 1.85.
 
 ## [0.7.7] - 2026-09-24
 
