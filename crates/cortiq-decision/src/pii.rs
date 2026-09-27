@@ -1,14 +1,27 @@
 //! PII redaction of the state before egress (spec §5.3).
 //!
-//! A port of cortiq-router `pii.rs`: the text is split into runs of token
-//! characters (`[A-Za-z0-9@._+-]`) and runs of everything else; a token run is
-//! replaced by `[REDACTED]` when it looks like
+//! Two passes. The first is a port of cortiq-router `pii.rs`: the text is
+//! split into runs of token characters (`[A-Za-z0-9@._+-]`) and runs of
+//! everything else; a token run is replaced by `[REDACTED]` when it looks like
 //! * an e-mail address: an `@` after the first character with a `.` after it;
 //! * a secret: at least 20 bytes of `[A-Za-z0-9_-]` with a digit and a letter;
 //! * a long number: at least 9 digits and only digits, `-` and `+`.
 //!
+//! The second pass catches the numbers the router's split misses, because it
+//! splits at spaces and parentheses: digit groups joined by up to
+//! [`MAX_GROUP_GAP`] separators (space, tab, `-`, `.`, `/`, `(`, `)`) are one
+//! number, and a number of at least [`MIN_NUMBER_DIGITS`] digits in total is
+//! replaced from its first digit (a `+` or `(` just before it included) to its
+//! last — `4111 1111 1111 1111`, `+1 (555) 123-4567`, the digits of
+//! `DE89 3704 0044 0532 0130 00`. Numbers are redacted by their digit count
+//! alone (no Luhn check), so a long run of plain numbers is redacted too.
+//!
+//! This is a heuristic: names, postal addresses, numbers written in words and
+//! identifiers with letters between short digit groups are not detected.
+//!
 //! Every other byte is kept, so the shape of the text survives. Non-ASCII bytes
-//! are never token characters, so runs always end on character boundaries.
+//! are never token or separator characters, so replacements always end on
+//! character boundaries.
 //!
 //! [`redact_value`] applies [`redact`] to every string leaf of a JSON state
 //! (object keys are kept). The cascade redacts when `oracle.redact_pii` is on and
@@ -22,6 +35,12 @@ pub const REDACTED: &str = "[REDACTED]";
 /// Flag of a question whose state was redacted before it left the machine.
 pub const FLAG_PII_REDACTED: &str = "pii_redacted";
 
+/// Fewest digits of a number that is redacted.
+pub const MIN_NUMBER_DIGITS: usize = 9;
+/// Most separator bytes between two digit groups of one number (`") "`,
+/// `" - "`).
+pub const MAX_GROUP_GAP: usize = 3;
+
 /// `(redacted text, whether anything was replaced)`.
 pub fn redact(text: &str) -> (String, bool) {
     let mut out = String::with_capacity(text.len());
@@ -34,6 +53,60 @@ pub fn redact(text: &str) -> (String, bool) {
             out.push_str(token);
         }
     }
+    let (out, grouped) = redact_number_groups(&out);
+    (out, changed || grouped)
+}
+
+#[inline]
+fn is_group_separator(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'-' | b'.' | b'/' | b'(' | b')')
+}
+
+/// The second pass (see the module notes): numbers whose digit groups are
+/// joined by separators.
+fn redact_number_groups(s: &str) -> (String, bool) {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut last = 0; // end of the text already copied
+    let mut changed = false;
+    let mut i = 0;
+    while i < b.len() {
+        if !b[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        // A number starts here: its groups, and the gaps between them.
+        let mut j = i;
+        let mut digits = 0;
+        let end = loop {
+            while j < b.len() && b[j].is_ascii_digit() {
+                digits += 1;
+                j += 1;
+            }
+            let group_end = j;
+            let mut k = j;
+            while k < b.len() && k - group_end < MAX_GROUP_GAP && is_group_separator(b[k]) {
+                k += 1;
+            }
+            if k > group_end && k < b.len() && b[k].is_ascii_digit() {
+                j = k;
+                continue;
+            }
+            break group_end;
+        };
+        if digits >= MIN_NUMBER_DIGITS {
+            let mut start = i;
+            while start > last && matches!(b[start - 1], b'+' | b'(') {
+                start -= 1;
+            }
+            out.push_str(&s[last..start]);
+            out.push_str(REDACTED);
+            last = end;
+            changed = true;
+        }
+        i = end;
+    }
+    out.push_str(&s[last..]);
     (out, changed)
 }
 
@@ -138,6 +211,46 @@ mod tests {
             redact("card 4111-1111-1111-1111 ok").0,
             "card [REDACTED] ok"
         );
+    }
+
+    #[test]
+    fn masks_numbers_written_in_groups() {
+        for (t, want) in [
+            (
+                "card 4111 1111 1111 1111 phone +1 555 123 4567",
+                "card [REDACTED] phone [REDACTED]",
+            ),
+            ("call +1 (555) 123-4567 today", "call [REDACTED] today"),
+            ("tel (495) 123-45-67.", "tel [REDACTED]."),
+            (
+                "iban DE89 3704 0044 0532 0130 00 ok",
+                "iban DE[REDACTED] ok",
+            ),
+            ("acct 1234 5678 9", "acct [REDACTED]"),
+            (
+                "номер 4111 1111 1111 1111, спасибо",
+                "номер [REDACTED], спасибо",
+            ),
+            ("a/c 12/34/56/78/90", "a/c [REDACTED]"),
+        ] {
+            let (r, c) = redact(t);
+            assert!(c, "{t}");
+            assert_eq!(r, want, "{t}");
+        }
+    }
+
+    #[test]
+    fn short_groups_stay() {
+        for t in [
+            "on 2026-09-27 at 10:30",
+            "call 555 1234 later",
+            "rooms 12 and 34, floors 5 and 6",
+            "price 1,234,567 dollars",
+        ] {
+            let (r, c) = redact(t);
+            assert!(!c, "{t}");
+            assert_eq!(r, t);
+        }
     }
 
     #[test]

@@ -555,6 +555,9 @@ fn test_key() -> KeyLookup {
 /// learning synchronous; every limit at its default.
 fn stand_config(mock_url: &str) -> Config {
     let mut c = Config::default();
+    // The open mode reaches the oracle and teaches only when configured
+    // explicitly (a loopback address alone is not enough).
+    c.auth.require = Some(false);
     c.oracle.enabled = true;
     c.oracle.base_url = mock_url.to_string();
     c.oracle.api_key_env = KEY_ENV.to_string();
@@ -1095,7 +1098,7 @@ async fn a_holdout_regression_from_wrong_feedback_is_refused() {
         .admin(
             "POST",
             "/v1/admin/keys",
-            Some(&json!({"account": "owner", "rate_per_min": 0})),
+            Some(&json!({"account": "owner", "rate_per_min": 0, "learning_allowed": true})),
         )
         .await);
     let other = k(&srv

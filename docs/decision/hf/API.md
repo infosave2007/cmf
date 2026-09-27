@@ -75,8 +75,10 @@ curl -s "$CORTIQ/healthz"                                    # → 200
 ```
 
 The state directory (mode 0700) holds `LOCK`, `keys.json`, `usage/`,
-`oracle.jsonl`, `oracle.state`, `learn.log`, `generations/` and `CURRENT`. One
-server process per state directory.
+`oracle.jsonl`, `oracle.state`, `learn.log`, `generations/` and `CURRENT`
+(and in shadow mode `shadow.jsonl` with its key `shadow.key`). One server
+process per state directory; the CLI may change `keys.json` while it runs
+(both take `keys.json.lock` for each change).
 
 ## 2. Keys, plans and limits
 
@@ -87,21 +89,41 @@ server process per state directory.
   restart. Keys created through the admin API work at once.
 * **Open mode** (no key needed) holds only while `keys.json` has no key and
   `auth.require` is false; `auth.require: null` (the default) means "required
-  unless the server listens on loopback".
-* A rate window is one fixed minute per account; quotas are checked before any
-  work is done. A *decision* is one answered question.
+  unless the server listens on loopback". The open caller may reach the
+  oracle and teach the model only when the configuration says
+  `auth.require: false`: a loopback address says nothing about the client
+  (a reverse proxy on the same host forwards anyone). Behind a reverse proxy
+  set `auth.require: true`.
+* A rate window is one fixed minute per account; quotas and credit are
+  checked before any work is done, and again before every input of a
+  `/v1/route:batch` after the first (402 at the input that finds them used
+  up). A *decision* is one answered question; one `/v1/decisions` request can
+  go past a quota or the credit by its own questions (at most 32) and their
+  cost.
+* **Teaching the model** is a permission of its own, `learning_allowed`
+  (default false for every key, created or imported): the key's feedback is
+  learned (a label the skill does not have starts a cold start), and the
+  oracle's answers to its questions become training examples. Without it,
+  feedback is answered and consumed but not learned, and an oracle answer
+  teaches the skill only when the question is exactly the skill's own (its
+  rubric's instructions and criteria over all its labels, as `/v1/route`
+  asks it). The skills are shared by every account.
 
 | Plan | Requests per minute | Decision quota | Key lifetime |
 |---|---|---|---|
 | starter | 60 | none | 30 days |
-| developer | 120 | 100000 | none |
-| pro | 600 | 1000000 | none |
-| scale | 3000 | 10000000 | none |
+| developer | 120 | 100000 | 30 days |
+| pro | 600 | 1000000 | 30 days |
+| scale | 3000 | 10000000 | 30 days |
 
-`auth.plans` in the configuration replaces entries of this table by name.
-`cortiq decision keys create` also takes `--days`, `--rate-per-min`,
-`--decision-quota`, `--token-quota`, `--credit-usd`, `--oracle-budget-usd`
-and `--oracle-allowed` (0 means unlimited for the counters).
+This is cortiq-router's plan table. `auth.plans` in the configuration
+replaces entries by name (`{"rate_per_min", "decision_quota", "days"}`,
+`days: null` = no expiry); a plan it does not name is refused (400), where
+the router minted a key without limits. `cortiq decision keys create` also
+takes `--days` (0 = never expires), `--rate-per-min`, `--decision-quota`,
+`--token-quota`, `--credit-usd`, `--oracle-budget-usd`, `--oracle-allowed`
+and `--learning-allowed` (0 means unlimited for the counters); the admin
+API takes the same fields.
 
 ```bash
 cortiq decision keys list --state ./decision.state
@@ -227,14 +249,20 @@ matter to the oracle alone). With L = the option ids of a choice question:
 |---|---|---|
 | `exact` | L equals the active labels of exactly one skill | that skill's certified gate |
 | `subset` | L is a strict subset (at least 2) of one skill's labels | argmin, softmax, margin and novelty over L only; the same T, θ, τ; never certified |
-| `superset` | one skill's labels plus labels it does not know | the oracle only; its answer teaches that skill |
+| `superset` | one skill's labels plus labels it does not know | the oracle only; its answer teaches that skill only for a key with `learning_allowed` |
 | `untrained` | anything else, and every `score` / `noul` question | the oracle only; without it the request is 422 |
 
 `cmf.skill` names the skill and skips the search (an unknown id is 400). An
 answer is `certified: true` only for an exact match on a string `state`, the
 `balanced` or `quality-first` profile, a skill whose gate is certified, and a
-winning label that comes from the training data. The guarantee covers the
-answers with `action: local`; oracle and cache answers are never certified.
+winning label that comes from the training data. The bound (Clopper–Pearson
+lower bound ≥ 0.95 on the odd calibration half) covers only `certified: true`
+answers, all of them `action: local`, and only for traffic like the skill's
+calibration split; subset matches, `cost-saver`, object or array states and
+uncertified skills also answer `action: local` with `certified: false`.
+`quality-first` answers are a sub-selection of the certified acceptance set,
+for which no bound of their own was computed. Oracle and cache answers are
+never certified.
 
 An exact question is easiest to build from the skill's own rubric:
 
@@ -365,10 +393,12 @@ curl -s "$CORTIQ/api/alpha/decisions" -H 'Content-Type: application/json' \
 
 `POST /v1/feedback {"id", "question", "label"}` corrects a decision of the
 caller's own account (a decision of another account is not found). The label
-must be one of the question's options; it becomes a training example of
-weight 3, and an option the skill does not have starts a cold start
-([ORACLE.md](ORACLE.md#self-learning)). The router form of feedback
-(section 4) accepts any label.
+must be one of the question's options. For a key with `learning_allowed` it
+becomes a training example of weight 3, and an option the skill does not
+have starts a cold start ([ORACLE.md](ORACLE.md#self-learning)); for any
+other key it is consumed and answered 200 with `accepted: false` and
+`refused: "learning_not_allowed"`. The router form of feedback (section 4)
+accepts any label.
 
 ```bash
 ID=$(curl -s "$CORTIQ/api/alpha/decisions" -H "Authorization: Bearer $KEY" \
@@ -408,7 +438,7 @@ error envelope, so existing clients need no change:
 | Path | Access |
 |---|---|
 | `POST /v1/route`, `POST /v1/route:batch` (up to 1024 inputs) | key |
-| `POST /v1/feedback` `{request_id, correct_task_label}` | key |
+| `POST /v1/feedback` `{request_id, correct_task_label}` (`accepted: false` for a key without `learning_allowed`) | key |
 | `GET /v1/taxonomies`, `GET /v1/taxonomies/{id}` | key |
 | `GET /v1/usage`, `GET /v1/escalations?limit=N` | key (own account only) |
 | `GET /v1/healthz`, `GET /v1/readyz`, `GET /metrics` (Prometheus) | open |
@@ -539,7 +569,7 @@ unset the admin API answers 404 `ADMIN_DISABLED`.
 | `GET /v1/admin/oracle`, `POST /v1/admin/oracle {"enabled", "budget_usd", "max_calls"}` | oracle status (`configured` = `oracle.enabled` of the configuration, `enabled` = not switched off by a stop rule or the admin, `key_present`, spent, calls, stop reason); switch it and lower limits within the configuration |
 | `GET /v1/admin/learning` | buffer, cache, quarantine, attempts, promotions, recent events |
 | `GET /v1/admin/generations`, `POST /v1/admin/rollback {"generation": N}` | generations; serve generation N (0 = the base file) |
-| `GET /v1/admin/shadow` | agreement statistics in shadow mode (section 8) |
+| `GET /v1/admin/shadow` | agreement statistics in shadow mode, and the routed requests not compared since the start (section 8) |
 
 ```bash
 A="x-admin-token: $CORTIQ_DECISION_ADMIN_TOKEN"
@@ -590,7 +620,9 @@ unknown key is an error. The defaults:
 `state_dir: null` means `<FILE>.state` next to the model. Secrets are never
 part of the file: the admin token and the OpenRouter key are read from the
 environment variables it names. `auth.plans` may override the plan table.
-The oracle, cache and learning sections are explained in [ORACLE.md](ORACLE.md).
+`oracle.base_url` must be https, or plain http to a loopback address only (a
+local proxy). The oracle, cache and learning sections are explained in
+[ORACLE.md](ORACLE.md).
 
 ## 7. Your own model
 
@@ -730,8 +762,14 @@ cortiq decision keys import --state ./router.state --from api_keys.jsonl \
   overwrites or re-activates a stored key, and prints no key or hash.
 * Imported keys may use the oracle (`oracle_allowed: true`, as every key could
   in the router); `--oracle-allowed=false` imports them without it.
+* Imported keys do not teach the model (`learning_allowed: false`): their
+  `/v1/feedback` is answered and consumed but not learned (`accepted:
+  false`), where the router learned from every key; `--learning-allowed`
+  imports them with it. The oracle's answers to their `/v1/route` still
+  teach the skill (the route question is the skill's own).
 * `--usage` writes the usage ledger: run it while no server holds the state
-  directory.
+  directory. Importing a newer export again adds only the new keys, the
+  revocations and the growth of the counters.
 
 ### 8.2 The taxonomy
 
@@ -746,22 +784,59 @@ oracle and from feedback on live traffic.
 Run the new server next to the old router with `--shadow-of URL`. Every request
 to a router path is forwarded unchanged to the old router, with the client's
 own `Authorization` header, and its answer goes back to the client byte for
-byte (errors included), so clients see no change. `/v1/route` and
-`/v1/route:batch` are also decided locally (no oracle, no learning, no
-billing) and compared line by line in `<state>/shadow.jsonl` (labels,
-confidence, latency and the text's sha256, never the text).
+byte (errors included), so clients see no change. A `/v1/route` or
+`/v1/route:batch` that the old router answered 200 is also decided locally
+(no oracle, no learning, no billing) and compared line by line in
+`<state>/shadow.jsonl`: labels, confidence, latency and a keyed digest of the
+text (HMAC-SHA256 under a random key kept in `<state>/shadow.key`), never the
+text. An answer that is not a 200 — a missing or wrong key, a quota, an error
+— is neither decided nor written. The comparisons have 4 slots of their own,
+apart from the decisions API's `limits.max_inflight` (64 more may wait; one
+past that is dropped), and at most 256 requests are forwarded at a time;
+`GET /v1/admin/shadow` counts the requests not compared since the start
+(`skipped`).
+
+**Configuration.** The router's own settings do not come over by themselves;
+write them into a decision configuration from the router's TOML. For the
+router's `deploy/config.prod.toml`:
+
+```bash
+cat > router.json <<'EOF'
+{
+  "default_skill": "data-assistant",
+  "auth": {"admin_token_env": "CORTIQ_ADMIN_TOKEN"},
+  "complexity_tiers": [{"tier": "low", "max": 0.33}, {"tier": "medium", "max": 0.48},
+                       {"tier": "high", "max": 1.0}]
+}
+EOF
+export CORTIQ_ADMIN_TOKEN="<the router's admin token>"
+```
+
+* `default_skill` is the router's `taxonomy_id`. Router clients may leave
+  `taxonomy_id` out; with several skills in the file and no `default_skill`
+  such a request is 400. A skill id is `[a-z0-9][a-z0-9_-]{0,63}`: a router
+  `taxonomy_id` outside that pattern (the default `general.task-type`) cannot
+  be kept, and its clients have to send the new id.
+* `auth.admin_token_env` names the router's variable, so that the portal's
+  `x-admin-token` keeps working when this server answers `/v1/admin/keys`
+  after the switch (the same token also reads `/v1/admin/shadow`).
+* Copy `[complexity_weights]`, `[[complexity_tiers]]` (the default here is
+  medium ≤ 0.66), `[task_complexity]` and `[routing_tiers]` (without them no
+  response has a `routing` block) as JSON, and `[auth.plans]` if the router
+  changes them (`duration_days` is `days` here, 0 is `null`).
+* A router that escalated to an oracle: add the `oracle` section of
+  [ORACLE.md](ORACLE.md#connect-openrouter).
 
 `--shadow-of` reaches the old router over **https**, or over plain http **only
 at a loopback address** (`127.0.0.1`, `::1`, `localhost`), because the
 clients' keys pass through it. cortiq-router itself speaks plain http, with
 TLS at nginx, so run the new server on the router's host and point it at the
-router's own port there. The admin token of section 1 must be in its
-environment as well.
+router's own port there.
 
 ```bash
 # on the router's host; the old router listens on port 8080
-cortiq serve cortiq-decision-plus.cmf --state ./router.state --port 8090 \
-  --shadow-of http://127.0.0.1:8080
+cortiq serve cortiq-decision-plus.cmf --decision-config router.json \
+  --state ./router.state --port 8090 --shadow-of http://127.0.0.1:8080
 ```
 
 A router on another machine is named by an https address in front of it
@@ -775,8 +850,8 @@ curl -s "$SHADOW/v1/route" -H "Authorization: Bearer $ROUTER_KEY" \
   -H 'Content-Type: application/json' \
   -d '{"input": {"text": "Write a haiku about autumn"}, "taxonomy_id": "data-assistant"}' \
   | jq .decision.task_label                                                     # → 200
-curl -s "$SHADOW/v1/admin/shadow" -H "x-admin-token: $CORTIQ_DECISION_ADMIN_TOKEN" \
-  | jq '{lines, compared, agree, agreement, confident, latency_ms}'            # → 200
+curl -s "$SHADOW/v1/admin/shadow" -H "x-admin-token: $CORTIQ_ADMIN_TOKEN" \
+  | jq '{lines, compared, agree, agreement, confident, latency_ms, skipped}'  # → 200
 ```
 
 nginx on the same host, in place of the `upstream cortiq` block of the
@@ -804,13 +879,21 @@ reload nginx. Clients are still answered by the old router. Watch
 confident, per-label agreement, latency).
 
 **2. Switch** only when the agreement and your own spot checks are good
-enough. Stop the shadow server (Ctrl-C) and start it again on the same state
-directory and port without `--shadow-of`. Keys and usage are already there,
-and nginx sends requests to the old router (`backup`) while the new server
-loads; nginx itself needs no change.
+enough. In shadow mode `/v1/admin/keys` went to the old router: keys the
+portal minted or revoked since 8.1, and the decisions the router counted,
+are only there. Hold the portal's admin calls, stop the shadow server
+(Ctrl-C), export `api_keys` and `usage_counters` again as in 8.1 and import
+them once more (new keys are added, keys the router marks inactive are
+revoked, and only the growth of the counters is added), then start the
+server on the same state directory and port without `--shadow-of`. nginx
+sends requests to the old router (`backup`) while the new server is down;
+nginx itself needs no change.
 
 ```bash
-cortiq serve cortiq-decision-plus.cmf --state ./router.state --port 8090
+cortiq decision keys import --state ./router.state --from api_keys.jsonl \
+  --usage usage_counters.jsonl
+cortiq serve cortiq-decision-plus.cmf --decision-config router.json \
+  --state ./router.state --port 8090
 ```
 
 ```bash

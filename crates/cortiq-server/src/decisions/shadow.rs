@@ -17,14 +17,26 @@
 //! envelope, like the 502 of a proxy; a request body over the old router's
 //! 8 MiB limit is answered 413 `length limit exceeded`, as it answers it.
 //!
-//! For `POST /v1/route` and `POST /v1/route:batch` the same inputs are also
-//! decided here, while the old router answers, by
+//! At most [`SHADOW_MAX_FORWARDS`] requests are forwarded at a time (each
+//! holds a thread of the blocking pool while the old router answers); more
+//! wait for a place, with their body read.
+//!
+//! A `POST /v1/route` or `POST /v1/route:batch` **that the old router answered
+//! 200** is also decided here, after that answer, by
 //! [`DecisionService::decide_local`](cortiq_decision::service::DecisionService::decide_local):
 //! the request's taxonomy and `policy_profile`, and nothing else — no oracle
 //! and no cache, no learning (no buffer, no feedback link), no billing (no
-//! key check, rate or quota, no usage record). Each routed input becomes one
-//! line of `<state>/shadow.jsonl` ([`ShadowLine`]; no text, only its SHA-256)
-//! once both sides are done; the client's answer does not wait for the local
+//! usage record); the old router's 200 is the key check. Each of its inputs
+//! becomes one line of `<state>/shadow.jsonl` ([`ShadowLine`]; no text, only
+//! its keyed digest). An answer that is not a 200 (a missing or wrong key, a
+//! quota, an error) is neither decided nor written, so anonymous traffic
+//! costs this server no decision and no disk. The comparisons have
+//! [`SHADOW_MAX_COMPARISONS`] slots of their own, apart from the
+//! `limits.max_inflight` of the decisions API, so shadow traffic never takes
+//! a slot of the decisions API; a comparison waits for a slot while fewer
+//! than [`SHADOW_MAX_WAITING`] others wait, and is dropped beyond that. Both
+//! kinds of skipped comparisons are counted (since the start) in
+//! `skipped`. The client's answer never waits for the local
 //! decision. `GET /v1/admin/shadow` (admin token) returns the agreement
 //! statistics of the whole log, overall, by confidence and per old label.
 //!
@@ -32,8 +44,8 @@
 //! `/v1/skills`, `/healthz`) and this server's own admin API stay local.
 //!
 //! The forwarded client secrets never reach a log line: the request line has
-//! only id, status, latency and account `-`, and `cortiq serve` drops the
-//! DEBUG/TRACE lines of the HTTP client that print request headers
+//! only id, status, latency and account `-`, and `cortiq serve --shadow-of`
+//! drops the DEBUG/TRACE lines of the HTTP client that print request headers
 //! ([`log_may_carry_secrets`](cortiq_decision::shadow::log_may_carry_secrets))
 //! whatever `RUST_LOG` enables.
 
@@ -53,13 +65,21 @@ use cortiq_decision::keys::now_unix;
 use cortiq_decision::shadow::UPSTREAM_TIMEOUT;
 use cortiq_decision::shadow::{
     FORWARDED_REQUEST_HEADERS, OldAnswer, ShadowLine, ShadowLog, UPSTREAM_LENGTH_LIMIT,
-    UPSTREAM_MAX_BODY, Upstream, UpstreamError, ms, stats_json, text_sha256,
+    UPSTREAM_MAX_BODY, Upstream, UpstreamError, ms, stats_json,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
+
+/// Most requests forwarded to the old router at a time.
+pub const SHADOW_MAX_FORWARDS: usize = 256;
+/// Most local comparisons at a time.
+pub const SHADOW_MAX_COMPARISONS: usize = 4;
+/// Most comparisons waiting for a slot; one more is dropped.
+pub const SHADOW_MAX_WAITING: usize = 64;
 
 /// The router-API paths forwarded in shadow mode (router `api.rs:292-307`);
 /// `{…}` is one path segment.
@@ -114,6 +134,16 @@ pub(super) struct Shadow {
     upstream: Upstream,
     log: ShadowLog,
     pending: AtomicUsize,
+    /// Places of the requests forwarded now ([`SHADOW_MAX_FORWARDS`]).
+    forwards: Arc<Semaphore>,
+    /// Slots of the local comparisons ([`SHADOW_MAX_COMPARISONS`]).
+    comparisons: Arc<Semaphore>,
+    /// Comparisons waiting for a slot now ([`SHADOW_MAX_WAITING`]).
+    waiting: AtomicUsize,
+    /// Routed requests not compared since the start: the old answer was not
+    /// a 200 / every comparison slot was busy.
+    skipped_not_ok: AtomicU64,
+    skipped_busy: AtomicU64,
 }
 
 impl std::fmt::Debug for Shadow {
@@ -131,6 +161,19 @@ impl Shadow {
             upstream,
             log: ShadowLog::open(log)?,
             pending: AtomicUsize::new(0),
+            forwards: Arc::new(Semaphore::new(SHADOW_MAX_FORWARDS)),
+            comparisons: Arc::new(Semaphore::new(SHADOW_MAX_COMPARISONS)),
+            waiting: AtomicUsize::new(0),
+            skipped_not_ok: AtomicU64::new(0),
+            skipped_busy: AtomicU64::new(0),
+        })
+    }
+
+    /// Routed requests not compared since the start (`GET /v1/admin/shadow`).
+    fn skipped_json(&self) -> Value {
+        json!({
+            "old_status_not_200": self.skipped_not_ok.load(Ordering::Relaxed),
+            "comparisons_busy": self.skipped_busy.load(Ordering::Relaxed),
         })
     }
 
@@ -239,17 +282,17 @@ async fn forward(st: Arc<DecisionState>, sh: Arc<Shadow>, ctx: Ctx, req: Request
         (true, "/v1/route:batch") => Some(RouteKind::Batch),
         _ => None,
     };
+    // A place among the forwards in flight (the blocking pool is shared with
+    // authentication and decisions); a request past the limit waits here.
+    let Ok(place) = Arc::clone(&sh.forwards).acquire_owned().await else {
+        return error_response(&ctx, upstream_unavailable());
+    };
     let (tx, rx) = tokio::sync::oneshot::channel::<Result<Answer, UpstreamError>>();
     let guard = PendingGuard::new(&sh);
     // One task per request: the comparison is written even when the client
     // goes away before the old router answers.
     tokio::spawn(async move {
         let _guard = guard;
-        // The local decision starts first and runs while the old router answers.
-        let local = kind.map(|k| {
-            let (st, body) = (Arc::clone(&st), bytes.clone());
-            tokio::task::spawn_blocking(move || decide_shadow(&st, k, &body))
-        });
         let up = {
             let (sh, body) = (Arc::clone(&sh), bytes.clone());
             tokio::task::spawn_blocking(move || {
@@ -264,6 +307,7 @@ async fn forward(st: Arc<DecisionState>, sh: Arc<Shadow>, ctx: Ctx, req: Request
                 })
             })
         };
+        drop(place);
         let (answer, old_status, old_latency) = match up {
             Ok(r) => (
                 Ok(Answer {
@@ -281,17 +325,38 @@ async fn forward(st: Arc<DecisionState>, sh: Arc<Shadow>, ctx: Ctx, req: Request
         };
         let old_body = answer.as_ref().ok().map(|a| (a.status, a.body.clone()));
         let _ = tx.send(answer);
-        let (Some(kind), Some(local)) = (kind, local) else {
+        let Some(kind) = kind else {
             return;
         };
-        let new = local
-            .await
-            .unwrap_or_else(|_| NewSide::failed(None, "INTERNAL"));
-        // Parsing the old answer and writing the lines: the blocking pool too.
+        // Only an input the old router decided (200: its key was valid there)
+        // is compared; nothing of any other answer is decided or written.
+        let Some((200, old_bytes)) = old_body else {
+            sh.skipped_not_ok.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        let slot = match Arc::clone(&sh.comparisons).try_acquire_owned() {
+            Ok(slot) => slot,
+            Err(_) => {
+                // Wait for a slot, unless too many already wait.
+                if sh.waiting.fetch_add(1, Ordering::SeqCst) >= SHADOW_MAX_WAITING {
+                    sh.waiting.fetch_sub(1, Ordering::SeqCst);
+                    sh.skipped_busy.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                let slot = Arc::clone(&sh.comparisons).acquire_owned().await;
+                sh.waiting.fetch_sub(1, Ordering::SeqCst);
+                let Ok(slot) = slot else {
+                    return;
+                };
+                slot
+            }
+        };
+        // The local decisions, parsing the old answer and writing the lines:
+        // the blocking pool, within the comparison slot.
         let written = tokio::task::spawn_blocking(move || {
-            let old = old_body
-                .map(|(status, body)| OldAnswer::parse(status, &body, kind == RouteKind::Batch))
-                .unwrap_or_default();
+            let _slot = slot;
+            let new = decide_shadow(&st, &sh, kind, &bytes);
+            let old = OldAnswer::parse(200, &old_bytes, kind == RouteKind::Batch);
             sh.log
                 .append(&shadow_lines(ts, old_status, old_latency, &old, &new))
         })
@@ -358,7 +423,7 @@ fn upstream_unavailable() -> HttpError {
 /// The local decision of one routed input.
 #[derive(Clone, Debug, Default)]
 struct NewInput {
-    text_sha256: Option<String>,
+    text_hmac: Option<String>,
     label: Option<String>,
     confident: Option<bool>,
     error: Option<&'static str>,
@@ -389,8 +454,8 @@ impl NewSide {
 
 /// Decide the inputs of a routed request locally, as `/v1/route` would before
 /// escalating: [`DecisionService::decide_local`](cortiq_decision::service::DecisionService::decide_local)
-/// (no oracle, no learning, no billing).
-fn decide_shadow(st: &DecisionState, kind: RouteKind, body: &[u8]) -> NewSide {
+/// (no oracle, no learning, no billing), in a comparison slot of `sh`.
+fn decide_shadow(st: &DecisionState, sh: &Shadow, kind: RouteKind, body: &[u8]) -> NewSide {
     const INVALID: &str = "INVALID_REQUEST";
     let t0 = Instant::now();
     let parsed = match kind {
@@ -411,8 +476,8 @@ fn decide_shadow(st: &DecisionState, kind: RouteKind, body: &[u8]) -> NewSide {
             .iter()
             .map(|i| NewInput {
                 // A bring-your-own embedding makes the router ignore the text.
-                text_sha256: match (&i.embedding, &i.text) {
-                    (None, Some(t)) => Some(text_sha256(t)),
+                text_hmac: match (&i.embedding, &i.text) {
+                    (None, Some(t)) => Some(sh.log.text_digest(t)),
                     _ => None,
                 },
                 ..NewInput::default()
@@ -428,10 +493,6 @@ fn decide_shadow(st: &DecisionState, kind: RouteKind, body: &[u8]) -> NewSide {
         }
     };
     side.taxonomy = Some(taxonomy_id.unwrap_or_else(|| routing.skill.clone()));
-    let Ok(_slot) = st.svc.enter() else {
-        side.error = Some("OVERLOADED");
-        return side;
-    };
     let model = st.svc.handle().current();
     let Some(skill) = model.skill(&routing.skill) else {
         side.error = Some(super::TAXONOMY_NOT_FOUND);
@@ -502,7 +563,7 @@ fn shadow_lines(
                 request_id_old: o
                     .and_then(|r| r.request_id.clone())
                     .or_else(|| old.request_id.clone()),
-                text_sha256: ni.and_then(|x| x.text_sha256.clone()),
+                text_hmac: ni.and_then(|x| x.text_hmac.clone()),
                 taxonomy: o
                     .and_then(|r| r.taxonomy.clone())
                     .or_else(|| new.taxonomy.clone()),
@@ -524,7 +585,8 @@ fn shadow_lines(
 
 /// `GET /v1/admin/shadow` (admin token): the agreement statistics of
 /// `shadow.jsonl` ([`cortiq_decision::shadow::ShadowStats::to_json`]) with
-/// `shadow_of` and `log`.
+/// `shadow_of`, `log` and `skipped` (routed requests not compared since the
+/// start: `old_status_not_200`, `comparisons_busy`).
 pub(super) async fn admin_shadow(
     State(st): State<Arc<DecisionState>>,
     Extension(ctx): Extension<Ctx>,
@@ -536,7 +598,11 @@ pub(super) async fn admin_shadow(
         let s = Arc::clone(&st);
         let v = super::blocking(move || {
             Ok(match &s.shadow {
-                Some(sh) => stats_json(&sh.log, &sh.upstream),
+                Some(sh) => {
+                    let mut v = stats_json(&sh.log, &sh.upstream);
+                    v["skipped"] = sh.skipped_json();
+                    v
+                }
                 None => Value::Null,
             })
         })

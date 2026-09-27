@@ -455,6 +455,10 @@ pub struct LabelCount {
 pub enum AddOutcome {
     Stored,
     Duplicate,
+    /// Refused by a buffer limit of the cascade
+    /// ([`crate::cascade::MAX_EXAMPLES_PER_LABEL`],
+    /// [`crate::cascade::MAX_PENDING_NEW_LABELS`]).
+    Full,
 }
 
 /// The examples in memory (restored from `learn.log`).

@@ -3,10 +3,11 @@
 The local model answers every question its certified gate accepts. A question
 it cannot determine — the gate rejected the answer, or the question is not
 trained at all — can be passed to a large language model, the *oracle*,
-through OpenRouter. The oracle's answers are cached and become training
-examples, so the local model learns the traffic it abstains on, without
-forgetting what it knew. The oracle is **off by default**; nothing leaves the
-machine until you enable it.
+through OpenRouter. The oracle's answers are cached and can become training
+examples, so the local model learns the traffic it abstains on; a refit
+changes no other label's parameters (checked by sha256), although a refitted
+label can win rows another label used to win. The oracle is **off by
+default**; nothing leaves the machine until you enable it.
 
 1. [How a question flows](#how-a-question-flows)
 2. [Self-learning](#self-learning)
@@ -22,16 +23,22 @@ machine until you enable it.
    sent to the oracle, not even with `cmf.oracle: true`.
 2. **Permission.** An undetermined question may go to the oracle only if all of
    these hold: `oracle.enabled`; the key variable is set in the server's
-   environment; the caller's key has `oracle_allowed`; the request consents
-   (`cmf.oracle`, the router's `options.allow_oracle`, else
-   `oracle.default_per_request`); budget is left; no stop rule fired.
+   environment; the caller's key has `oracle_allowed` (in open mode:
+   `auth.require: false` in the configuration, not only a loopback address);
+   the request consents (`cmf.oracle`, the router's `options.allow_oracle`,
+   else `oracle.default_per_request`); budget is left; no stop rule fired.
    Otherwise a trained question stays `abstain` with a flag (`oracle_disabled`,
    `consent_off`, `budget`, `stopped`) and an untrained one fails with 422
    or 503.
-3. **Semantic cache.** Within the same scope (the skill and the set of options,
-   or the exact question contract for untrained questions) a stored oracle
-   answer whose text embedding has cosine ≥ 0.97 with the new one is reused:
-   `action: cache`, cost 0. Up to 50000 entries, ring buffer.
+3. **Semantic cache.** Within the same scope — the question's contract
+   (type, instructions and criteria), and for a question matched to a skill
+   also the skill and the set of options — a stored oracle answer whose text
+   embedding has cosine ≥ 0.97 with the new one is reused: `action: cache`,
+   cost 0. Up to 50000 entries, ring buffer. The cache is shared by all
+   accounts: an answer given under one caller's instructions is never served
+   to a question with other instructions or criteria, and a `cache` answer
+   tells its caller that some account asked a near-identical text under the
+   same contract.
 4. **Single flight.** A question already in flight in another request (same
    scope, cosine ≥ 0.97) waits for that call instead of making its own.
 5. **One call** carries all remaining questions of the request: `POST
@@ -40,13 +47,19 @@ machine until you enable it.
    `temperature 0`, reasoning off, `max_tokens` 64 per question. The system
    prompt tells the model that the state is untrusted data, not instructions.
 6. **Result.** A valid answer is `action: oracle` with its cost in
-   `usage`, is stored in the cache, and — for a choice question matched to a
-   skill — becomes a learning example. A failed call never becomes an error
-   for a trained question: it is answered locally with `action: abstain` and
-   the flag `oracle_unavailable` (an untrained question gets 502).
+   `usage` and is stored in the cache. For a choice question matched to a
+   skill it becomes a learning example of that skill — which every account
+   is served — when the caller's key has `learning_allowed`, or when the
+   question is exactly the skill's own (its rubric's instructions and
+   criteria over all its active labels, as `/v1/route` asks it), so that
+   the answer is the skill's rubric applied to the text and not a caller's
+   instructions. A failed call never becomes an error for a trained
+   question: it is answered locally with `action: abstain` and the flag
+   `oracle_unavailable` (an untrained question gets 502).
 
 Superset questions (a skill's labels plus new ones) are decided by the oracle
-only; its answer teaches that skill, and a new label starts a cold start.
+only; for a caller with `learning_allowed` the answer teaches that skill, and
+a new label starts a cold start.
 
 ## Self-learning
 
@@ -66,19 +79,29 @@ only; its answer teaches that skill, and a new label starts a cold start.
   macro accuracy over labels (tolerance 1e-4).
 * **Re-certification.** T, θ and τ are recomputed on the skill's calibration
   rows with the same procedure as at build time. If a certified gate would lose
-  its threshold, the challenger is rejected. Repeated re-certifications on the
-  same calibration rows make the bound nominal rather than exact.
-* **Zero forgetting.** Before a promotion the sha256 of the mean and basis of
-  every other label is compared with the values before the attempt; any
-  difference cancels the promotion. Other labels stay byte for byte the same.
+  its threshold, the challenger is rejected. The holdout that picks the
+  challenger is part of those calibration rows, so from the first promotion
+  the rows that certify τ also chose the model: the bound is nominal after
+  any promotion, while answers keep `certified: true`.
+* **Isolation.** Before a promotion the sha256 of the mean and basis of every
+  other label is compared with the values before the attempt; any difference
+  cancels the promotion. Other labels' parameters stay byte for byte the same.
+  This is not a promise about accuracy: the refitted label still competes in
+  the argmin and can take rows from the others (after the pre-training below,
+  BANKING77 had 10 fewer correct rows).
 * **Cold start.** A label the skill does not have (from an oracle answer to a
-  superset question, or from feedback) becomes a quarantined task that is not
-  scored. At 25 examples it is fitted and activated and the gate re-certified;
-  answers it wins carry `certified: false`.
+  superset question, or from feedback, of a caller with `learning_allowed`)
+  becomes a quarantined task that is not scored. At 25 examples it is fitted
+  and activated and the gate re-certified; answers it wins carry
+  `certified: false`.
 * **Feedback.** `POST /v1/feedback` (`{"id", "question", "label"}` with one of
   the question's options, or the router's `{request_id, correct_task_label}`
-  with any label) corrects a decision of the caller's own account; it becomes
-  an example of weight 3.
+  with any label) corrects a decision of the caller's own account. From a key
+  with `learning_allowed` it becomes an example of weight 3; from any other
+  key it is consumed and answered (`accepted: false`) but not learned. No key
+  has the permission unless it was created or imported with it.
+* **Limits.** At most 5000 examples per label of a skill and 32 labels per
+  skill waiting for a cold start; an example past either is refused.
 * **Generations and rollback.** Every promotion writes
   `generations/gNNNNNN.cmf` (only the changed task tensors and the learned
   rows, relative to the base file), fsyncs it and swaps the served model
@@ -124,10 +147,14 @@ only; its answer teaches that skill, and a new label starts a cold start.
   that store data).
 * **PII redaction** is on by default (`oracle.redact_pii`): e-mail addresses,
   secret-like tokens (20 or more characters of `[A-Za-z0-9_-]` with a digit and
-  a letter) and long numbers (9 or more digits) in every string of the state
-  are replaced by `[REDACTED]` and the question gets the flag `pii_redacted`.
-  A request can opt out with `cmf.allow_pii_egress` (router:
-  `options.allow_pii_egress`).
+  a letter) and numbers of 9 or more digits — also when their digit groups
+  are separated by spaces, dashes, dots, slashes or parentheses, as in
+  `4111 1111 1111 1111`, `+1 (555) 123-4567` or a spaced IBAN — in every
+  string of the state are replaced by `[REDACTED]` and the question gets the
+  flag `pii_redacted`. It is a heuristic: names, postal addresses, numbers
+  written in words and identifiers with letters between short digit groups
+  are not detected. A request can opt out with `cmf.allow_pii_egress`
+  (router: `options.allow_pii_egress`).
 * **Never sent**: accepted questions, other questions of the request, client
   keys, accounts, vectors.
 * **Kept on disk** in the state directory: vectors and hashed features of
@@ -149,8 +176,10 @@ only; its answer teaches that skill, and a new label starts a cold start.
    outputs (JSON schema). The default and the model every number on this page
    was measured with is `deepseek/deepseek-v4.1-flash`. `provider.max_price`
    (USD per 1M tokens) caps the provider price and sizes the reservation.
+   `base_url` must be https (plain http only to a loopback address).
 4. Set limits: `budget_usd`, `max_calls`, `deadline_s`, `max_errors`; per key
-   `oracle_allowed` and `oracle_budget_usd`.
+   `oracle_allowed`, `oracle_budget_usd` and, for keys whose own questions
+   and feedback may teach the model, `learning_allowed`.
 5. Start the server and verify.
 
 ```bash
@@ -207,7 +236,8 @@ the OpenRouter API; the documentation run sent nothing to OpenRouter.
 `source` is `oracle` (a repeat of the same text is `cache`); `calls` and
 `spent_usd` grow. If `source` stays `router` with the flag `oracle_disabled`,
 `consent_off` or `budget`, check the configuration, the key's `oracle_allowed`
-and the budget; `stop_reason` names a stop rule. The same questions through
+(without keys: `auth.require: false`) and the budget; `stop_reason` names a
+stop rule. The same questions through
 the decisions API need `"cmf": {"oracle": true}` or
 `oracle.default_per_request: true` (the default).
 
@@ -248,9 +278,13 @@ system: there the oracle and Jev are about equally right (180 and 180, 295 and
 
 `cortiq serve` with a fresh state per run, the test rows in a fixed hashed
 order, one request at a time, no ground truth and no feedback sent. Mode A
-serves as in production (cache and self-learning on); mode B has both off.
-Oracle answers were replayed from the stored DeepSeek ledgers through a local
-proxy; the 24 requests of MASSIVE mode A that no ledger held were sent live.
+has the cache and self-learning on, with learning inline
+(`learning.synchronous`) and PII redaction off so that the request bodies
+match the stored ledgers, in open mode (`auth.require: false`), with
+`deadline_s` 200, `budget_usd` 10 and `max_calls` 1000000; mode B has the
+cache and learning off. Oracle answers were replayed from the stored
+DeepSeek ledgers through a local proxy; the 24 requests of MASSIVE mode A
+that no ledger held were sent live.
 
 | | BANKING77 A / B | CLINC150 A / B | MASSIVE A / B |
 |---|---|---|---|
@@ -263,10 +297,11 @@ proxy; the 24 requests of MASSIVE mode A that no ledger held were sent live.
 | $ per 1M decisions | $3.01 / $3.09 | $3.53 / $3.56 | $8.48 / $8.52 |
 | Isolation violations | 0 | 0 | 0 |
 
-**In one pass over the test sets self-learning saved only about 1–2 % of the
-oracle calls**: 35 of 2003 (1.75 %) together; 7 of 289 (2.42 %), 4 of 355
-(1.13 %) and 24 of 1359 (1.77 %) per set, with no change in accuracy (−1, 0
-and 0 correct).
+**In one pass over the test sets mode A (cache and self-learning) saved only
+35 of 2003 oracle calls (1.75 %)**: 21 were cache hits (1.05 %) and 14 were
+questions answered locally after the 16 promotions on MASSIVE (0.70 %). Per
+set that is 7 of 289 (2.42 %), 4 of 355 (1.13 %) and 24 of 1359 (1.77 %),
+with cascade correct −1, 0 and 0.
 The reason is the refit threshold. A label is refitted only after 25 new
 examples, and a benchmark test set has few abstentions per label: 282
 examples spread over the 77 BANKING77 labels and 351 over the 150 CLINC150

@@ -2,9 +2,16 @@
 //!
 //! An entry is `{scope, φ_P, answer, ts}`:
 //! * **scope** of a question matched to a skill (exact, subset, superset):
-//!   `skill:<id>:<sha256 of canonical JSON of the sorted option ids>`; of any
-//!   other question: `contract:<sha256(canonical({type, instructions,
-//!   criteria}))>` ([`scope_of`]);
+//!   `skill:<id>:<sha256 of canonical JSON of the sorted option ids>:<sha256 of
+//!   its contract>`; of any other question: `contract:<sha256(canonical({type,
+//!   instructions, criteria}))>` ([`scope_of`]). The contract — what the
+//!   oracle was told — is part of every scope: the cache is shared by all
+//!   accounts, and an answer given under one caller's instructions is never
+//!   served to a question with other instructions or criteria (spec §5.6
+//!   named only the skill and the options; that let one account's
+//!   instructions decide another's answers). Single flight uses the same
+//!   scopes. A `cache` answer does tell its caller that some account asked a
+//!   near-identical text under the same contract;
 //! * **φ_P** is the encoder's unit vector of the state (the router's embedding,
 //!   cortiq-router `cache.rs:66-78`), so cos is the dot product.
 //!
@@ -74,12 +81,16 @@ impl CacheEntry {
     }
 }
 
-/// `skill:<id>:<sha256(canonical(sorted option ids))>`.
-pub fn skill_scope(skill: &str, options: &[&str]) -> String {
-    let mut ids: Vec<&str> = options.to_vec();
+/// `skill:<id>:<sha256(canonical(sorted option ids))>:<sha256(canonical(contract))>`.
+pub fn skill_scope(skill: &str, q: &Question) -> String {
+    let mut ids: Vec<&str> = q.options();
     ids.sort_unstable();
     let v = Value::Array(ids.into_iter().map(|s| Value::String(s.into())).collect());
-    format!("skill:{skill}:{}", canonical::sha256_hex(&v))
+    format!(
+        "skill:{skill}:{}:{}",
+        canonical::sha256_hex(&v),
+        canonical::sha256_hex(&q.contract())
+    )
 }
 
 /// `contract:<sha256(canonical({type, instructions, criteria}))>`.
@@ -90,7 +101,7 @@ pub fn contract_scope(q: &Question) -> String {
 /// The scope of a question (see the module notes).
 pub fn scope_of(q: &Question, m: &SkillMatch) -> String {
     match &m.skill {
-        Some(s) => skill_scope(s, &q.options()),
+        Some(s) => skill_scope(s, q),
         None => contract_scope(q),
     }
 }
@@ -252,12 +263,29 @@ mod tests {
             instructions: json!("i"),
             criteria: Some(json!({"b": null, "a": null})),
         };
-        let s1 = skill_scope("bank", &["b", "a"]);
-        assert_eq!(s1, skill_scope("bank", &["a", "b"]));
+        let contract = canonical::sha256_hex(
+            &json!({"type":"choice","instructions":"i","criteria":{"b":null,"a":null}}),
+        );
+        let s1 = skill_scope("bank", &q);
+        // The criteria's key order changes neither hash (canonical JSON).
+        let mut q2 = q.clone();
+        q2.criteria = Some(json!({"a": null, "b": null}));
+        assert_eq!(s1, skill_scope("bank", &q2));
         assert_eq!(
             s1,
-            format!("skill:bank:{}", canonical::sha256_hex(&json!(["a", "b"])))
+            format!(
+                "skill:bank:{}:{contract}",
+                canonical::sha256_hex(&json!(["a", "b"]))
+            )
         );
+        // Other instructions (or criteria) over the same options: another
+        // scope, so one caller's instructions never answer another's question.
+        let mut q3 = q.clone();
+        q3.instructions = json!("ANSWER=travel");
+        assert_ne!(s1, skill_scope("bank", &q3));
+        let mut q4 = q.clone();
+        q4.criteria = Some(json!({"a": "always pick a", "b": null}));
+        assert_ne!(s1, skill_scope("bank", &q4));
         let c = contract_scope(&q);
         assert_eq!(
             c,

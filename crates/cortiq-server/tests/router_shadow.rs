@@ -36,6 +36,7 @@ use cortiq_decision::cascade::CascadeOptions;
 use cortiq_decision::config::Config;
 use cortiq_decision::manifest::sha256_hex;
 use cortiq_decision::oracle::KeyLookup;
+use cortiq_decision::shadow::{read_key, text_hmac};
 use cortiq_server::decisions::{DecisionServer, ServeOptions};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -60,7 +61,7 @@ const OLD_DATE: &str = "Thu, 01 Jan 2026 00:00:00 GMT";
 const LINE_KEYS: [&str; 13] = [
     "ts",
     "request_id_old",
-    "text_sha256",
+    "text_hmac",
     "taxonomy",
     "old_label",
     "new_label",
@@ -509,6 +510,8 @@ impl Drop for MockOracle {
 
 fn oracle_config(oracle: &MockOracle) -> Config {
     let mut c = Config::default();
+    // The open mode reaches the oracle only when configured explicitly.
+    c.auth.require = Some(false);
     c.learning.synchronous = true;
     c.oracle.enabled = true;
     c.oracle.base_url = format!("http://{}", oracle.addr);
@@ -619,6 +622,28 @@ impl Srv {
 
     fn log_path(&self) -> PathBuf {
         self.state.join("shadow.jsonl")
+    }
+
+    /// The digest a line holds for `text`: HMAC-SHA256 under
+    /// `<state>/shadow.key`, never the plain SHA-256 of the text.
+    fn digest(&self, text: &str) -> String {
+        let d = text_hmac(&read_key(&self.state.join("shadow.key")).unwrap(), text);
+        assert_ne!(d, sha256_hex(text.as_bytes()));
+        d
+    }
+
+    /// Wait until `n` routed requests were skipped because the old router did
+    /// not answer 200, then return the statistics.
+    async fn skipped_not_ok(&self, n: u64) -> Value {
+        let t0 = Instant::now();
+        loop {
+            let s = self.admin("GET", "/v1/admin/shadow").await.json;
+            if s["skipped"]["old_status_not_200"] == n {
+                return s;
+            }
+            assert!(t0.elapsed() < Duration::from_secs(30), "{s}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// Wait until the log has `n` lines (the comparison is written after the
@@ -753,7 +778,7 @@ async fn local_answers(texts: &[&str], profile: &str) -> Vec<(String, bool)> {
 
 /// Every line has exactly the documented keys, and nothing in it can be a
 /// text: labels, `req_…` ids, a 64-hex hash, the taxonomy, reason codes.
-fn check_no_text(lines: &[Value], texts: &[&str]) {
+fn check_no_text(srv: &Srv, lines: &[Value], texts: &[&str]) {
     let raw_ok = |s: &str| {
         LABELS.contains(&s)
             || s == "__novel__"
@@ -771,9 +796,9 @@ fn check_no_text(lines: &[Value], texts: &[&str]) {
                 assert!(raw_ok(s), "{k}: {s:?} could be a text");
             }
         }
-        if let Some(h) = l["text_sha256"].as_str() {
+        if let Some(h) = l["text_hmac"].as_str() {
             assert!(
-                texts.iter().any(|t| sha256_hex(t.as_bytes()) == h),
+                texts.iter().any(|t| srv.digest(t) == h),
                 "{h} is not the hash of a sent text"
             );
         }
@@ -832,11 +857,11 @@ async fn route_answer_is_the_old_routers_bytes_and_the_line_holds_no_text() {
     assert_eq!(q.header("x-forwarded-for"), None);
 
     let lines = srv.lines(1).await;
-    check_no_text(&lines, &[&text]);
+    check_no_text(&srv, &lines, &[&text]);
     file_has_no_text(&srv.log_path(), &[&text]);
     let l = &lines[0];
     let (new_label, new_confident) = local_answers(&[&text], "balanced").await.remove(0);
-    assert_eq!(l["text_sha256"], json!(sha256_hex(text.as_bytes())));
+    assert_eq!(l["text_hmac"], json!(srv.digest(&text)));
     assert_eq!(l["request_id_old"], "req_old_0001_0");
     assert_eq!(l["taxonomy"], SKILL);
     assert_eq!(l["old_label"], "billing");
@@ -899,13 +924,13 @@ async fn batch_lines_and_agreement_statistics_are_correct_and_survive_a_restart(
     assert_eq!(r.json["results"].as_array().unwrap().len(), 8);
     assert_eq!(r.bytes.last(), Some(&b'\n'), "the old pretty bytes");
     let lines = srv.lines(13).await;
-    check_no_text(&lines, &texts);
+    check_no_text(&srv, &lines, &texts);
     file_has_no_text(&srv.log_path(), &texts);
 
     // Line by line, in request order (single requests first, then the batch).
     let mut by_hash: HashMap<String, &Value> = HashMap::new();
     for l in &lines {
-        by_hash.insert(l["text_sha256"].as_str().unwrap().to_string(), l);
+        by_hash.insert(l["text_hmac"].as_str().unwrap().to_string(), l);
     }
     assert_eq!(by_hash.len(), 13);
     let batch_ids: BTreeSet<&str> = lines
@@ -920,7 +945,7 @@ async fn batch_lines_and_agreement_statistics_are_correct_and_survive_a_restart(
     let (mut oc, mut oca, mut nc, mut nca, mut bc, mut bca) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
     let mut per: BTreeMap<String, (u64, u64, BTreeMap<String, u64>)> = BTreeMap::new();
     for ((t, old_label, old_conf), (new_label, new_conf)) in cases.iter().zip(&local) {
-        let l = by_hash[&sha256_hex(t.as_bytes())];
+        let l = by_hash[&srv.digest(t)];
         assert_eq!(l["old_label"], json!(old_label));
         assert_eq!(l["new_label"], json!(new_label));
         assert_eq!(l["old_confident"], json!(old_conf));
@@ -1027,7 +1052,7 @@ async fn shadow_mode_never_calls_the_oracle_learns_or_bills() {
     for (t, (label, conf)) in texts.iter().zip(&local) {
         let l = lines
             .iter()
-            .find(|l| l["text_sha256"] == json!(sha256_hex(t.as_bytes())))
+            .find(|l| l["text_hmac"] == json!(srv.digest(t)))
             .unwrap();
         assert_eq!(
             l["new_label"],
@@ -1150,30 +1175,21 @@ async fn old_router_errors_pass_through_unchanged() {
         let r = srv.route("/v1/route", &json!({"input": {"text": t}})).await;
         r.is_passthrough_of(&script(t));
     }
-    let lines = srv.lines(cases.len() as u64).await;
-    check_no_text(&lines, &cases);
-    for (t, want) in cases.iter().zip([401, 402, 429, 422, 500, 503]) {
-        let l = lines
-            .iter()
-            .find(|l| l["text_sha256"] == json!(sha256_hex(t.as_bytes())))
-            .unwrap();
-        assert_eq!(l["old_status"], want);
-        assert_eq!(l["old_label"], Value::Null);
-        assert_eq!(l["agree"], Value::Null);
-        assert!(l["new_label"].is_string(), "decided locally all the same");
-        let id = match want {
-            422 | 503 => Value::Null,
-            n => json!(format!("req_old_e{n}")),
-        };
-        assert_eq!(l["request_id_old"], id);
-    }
-    let s = srv.admin("GET", "/v1/admin/shadow").await.json;
-    assert_eq!(
-        (s["lines"].as_u64(), s["compared"].as_u64()),
-        (Some(6), Some(0))
-    );
-    assert_eq!(s["old_errors"], 6);
+    // An answer that is not a 200 (a missing or wrong key, a quota, an error)
+    // is neither decided here nor written: anonymous traffic costs this
+    // server no decision and no disk.
+    let s = srv.skipped_not_ok(cases.len() as u64).await;
+    assert_eq!(s["lines"], 0);
+    assert_eq!(s["skipped"]["comparisons_busy"], 0);
     assert_eq!(s["agreement"], Value::Null);
+    assert!(read_lines(&srv.log_path()).is_empty());
+    // A batch the old router does not answer 200 (its 503 here): not one of
+    // its inputs is decided or written.
+    let batch = json!({"inputs": (0..50).map(|i| json!({"text": format!("e401 invoice {i}")})).collect::<Vec<_>>()});
+    let r = srv.route("/v1/route:batch", &batch).await;
+    assert_eq!(r.status, 503, "not scripted: the default answer");
+    let s = srv.skipped_not_ok(cases.len() as u64 + 1).await;
+    assert_eq!(s["lines"], 0);
 
     // A body over the old router's 8 MiB: its own 413, nothing forwarded.
     let before = old.seen().len();
@@ -1195,8 +1211,7 @@ async fn old_router_errors_pass_through_unchanged() {
     assert_eq!(r.header("content-type"), Some("text/plain; charset=utf-8"));
     assert_eq!(old.seen().len(), before);
 
-    // No answer at all: 502 in the router's envelope, and the comparison
-    // still has the local side.
+    // No answer at all: 502 in the router's envelope, and no comparison.
     let closed = {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         l.local_addr().unwrap()
@@ -1215,11 +1230,41 @@ async fn old_router_errors_pass_through_unchanged() {
     // The router envelope's rule: only 429 and 500 are retriable.
     assert_eq!(r.json["error"]["retriable"], false);
     assert_eq!(r.json["request_id"].as_str(), r.header("x-request-id"));
-    let l = &dead.lines(1).await[0];
-    assert_eq!(l["old_status"], Value::Null);
-    assert_eq!(l["request_id_old"], Value::Null);
-    assert!(l["new_label"].is_string());
-    assert!(l["old_latency_ms"].as_f64().is_some());
+    let s = dead.skipped_not_ok(1).await;
+    assert_eq!(s["lines"], 0);
+
+    // Comparisons have slots of their own: with every decision slot of the
+    // decisions API taken (max_inflight 1), a 200 is still compared, and the
+    // decisions API is refused only for its own slot.
+    let texts: Vec<&str> = toy().dev.iter().take(2).map(|(t, _)| t.as_str()).collect();
+    let script: HashMap<String, (String, bool)> = texts
+        .iter()
+        .map(|t| (t.to_string(), ("billing".to_string(), true)))
+        .collect();
+    let old = MockOld::start(old_router(script));
+    let mut c = Config::default();
+    c.limits.max_inflight = 1;
+    let busy = Srv::open(c, no_key(), Some(old.url()));
+    let slot = busy
+        .server
+        .as_ref()
+        .unwrap()
+        .state()
+        .service()
+        .enter()
+        .unwrap();
+    for t in &texts {
+        let r = busy
+            .route("/v1/route", &json!({"input": {"text": t}}))
+            .await;
+        assert_eq!(r.status, 200);
+    }
+    let lines = busy.lines(2).await;
+    for l in &lines {
+        assert!(l["new_label"].is_string(), "{l}");
+        assert_eq!(l["new_error"], Value::Null, "{l}");
+    }
+    drop(slot);
 }
 
 #[tokio::test]
@@ -1446,7 +1491,8 @@ async fn over_tcp_the_old_headers_stay_and_a_stopping_server_writes_its_lines() 
     let lines = read_lines(&state.join("shadow.jsonl"));
     assert_eq!(lines.len(), 1);
     assert_eq!(lines[0]["old_label"], "cards");
-    assert_eq!(lines[0]["text_sha256"], json!(sha256_hex(text.as_bytes())));
+    let key = read_key(&state.join("shadow.key")).unwrap();
+    assert_eq!(lines[0]["text_hmac"], json!(text_hmac(&key, &text)));
 }
 
 #[test]
@@ -1470,4 +1516,22 @@ fn bad_shadow_urls_are_refused_before_anything_is_opened() {
         assert!(!e.contains("secretpw"), "{e}");
         assert!(!state.exists(), "{url}: the state directory was created");
     }
+}
+
+/// A file this version refuses (here not a decision file at all; a v3
+/// decision file is refused the same way, by its profile) leaves no state
+/// directory next to it: the file is checked before the directory is made.
+#[test]
+fn a_refused_file_leaves_no_state_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = dir.path().join("old.cmf");
+    std::fs::write(&model, b"CMF? not a decision file of this version").unwrap();
+    let e = DecisionServer::open(&ServeOptions::new(&model, Config::default())).unwrap_err();
+    assert!(format!("{e:#}").contains("old.cmf"), "{e:#}");
+    assert!(!dir.path().join("old.cmf.state").exists(), "{e:#}");
+    let names: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names, vec![std::ffi::OsString::from("old.cmf")]);
 }

@@ -87,6 +87,10 @@ pub const OPEN_ACCOUNT: &str = "anonymous";
 pub const DEFAULT_TASK_COMPLEXITY: f32 = 0.4;
 /// Size of the question-contract token memo.
 pub const TOKEN_CACHE_CAP: usize = 4096;
+/// Instructions of a skill's own question when it has no rubric (the router
+/// question of such a skill).
+pub const DEFAULT_ROUTE_INSTRUCTIONS: &str =
+    "Classify the input into exactly one of the task labels.";
 
 // ------------------------------------------------------------------ loaded model
 
@@ -112,6 +116,50 @@ impl SkillRuntime {
 
     pub fn gate(&self) -> GateParams {
         self.scorer.gate()
+    }
+
+    /// The skill's own question over its active labels (the question of a
+    /// router input, id `id`): the rubric's instructions, and for each active
+    /// label its rubric criterion in the question file's order (the label
+    /// itself when the rubric has none); [`DEFAULT_ROUTE_INSTRUCTIONS`]
+    /// without a rubric.
+    pub fn rubric_question(&self, id: &str) -> Question {
+        let active = self.scorer.labels();
+        let mut criteria = Map::new();
+        let instructions = match &self.manifest.rubric {
+            Some(r) => {
+                for (k, v) in r.ordered_criteria() {
+                    if active.contains(&k) {
+                        criteria.insert(k, v);
+                    }
+                }
+                r.instructions.clone()
+            }
+            None => DEFAULT_ROUTE_INSTRUCTIONS.to_string(),
+        };
+        for l in active {
+            if !criteria.contains_key(l) {
+                criteria.insert(l.clone(), Value::String(l.clone()));
+            }
+        }
+        Question {
+            id: id.to_string(),
+            kind: QuestionKind::Choice,
+            instructions: Value::String(instructions),
+            criteria: Some(Value::Object(criteria)),
+        }
+    }
+
+    /// Whether `q` asks the oracle exactly what the skill's own question asks
+    /// ([`SkillRuntime::rubric_question`]): a choice with the same
+    /// instructions and the same criterion for the same options (in any
+    /// order). Only then does the oracle's answer describe the skill's labels
+    /// as the skill defines them, whoever asked.
+    pub fn follows_rubric(&self, q: &Question) -> bool {
+        let own = self.rubric_question(&q.id);
+        q.kind == QuestionKind::Choice
+            && q.instructions == own.instructions
+            && q.criteria == own.criteria
     }
 }
 
@@ -271,11 +319,17 @@ pub struct Principal {
     pub credit_usd: Option<Usd>,
     pub oracle_budget_usd: Option<Usd>,
     pub oracle_allowed: bool,
+    /// May teach the shared model: its feedback is learned (a new label
+    /// starts a cold start), and the oracle's answers to its questions
+    /// become examples whatever their instructions (see
+    /// [`crate::cascade`]).
+    pub learning_allowed: bool,
 }
 
 impl Principal {
-    /// The open mode's caller: no limits, the oracle allowed (subject to the
-    /// server's configuration and budget).
+    /// The open mode's caller when `auth.require` is explicitly false: no
+    /// limits, the oracle and learning allowed (subject to the server's
+    /// configuration and budget).
     pub fn open() -> Self {
         Self {
             account: OPEN_ACCOUNT.into(),
@@ -287,6 +341,20 @@ impl Principal {
             credit_usd: None,
             oracle_budget_usd: None,
             oracle_allowed: true,
+            learning_allowed: true,
+        }
+    }
+
+    /// The open mode's caller when it holds only because `auth.require` is
+    /// `null` and the server listens on loopback: the listening address says
+    /// nothing about the client (a reverse proxy on the same host forwards
+    /// anyone), so this caller may neither reach the oracle nor teach the
+    /// model.
+    pub fn open_implicit() -> Self {
+        Self {
+            oracle_allowed: false,
+            learning_allowed: false,
+            ..Self::open()
         }
     }
 
@@ -301,6 +369,7 @@ impl Principal {
             credit_usd: k.credit()?,
             oracle_budget_usd: k.oracle_budget()?,
             oracle_allowed: k.oracle_allowed,
+            learning_allowed: k.learning_allowed,
         })
     }
 
@@ -777,7 +846,13 @@ impl DecisionService {
             tracing::error!(error = %e, "keys.json reload failed; keeping the loaded keys");
         }
         if !self.auth_enabled() {
-            return Ok(Principal::open());
+            // Open mode: explicitly configured, or only because of a loopback
+            // address (`auth.require: null`).
+            return Ok(if self.cfg.auth.require == Some(false) {
+                Principal::open()
+            } else {
+                Principal::open_implicit()
+            });
         }
         let raw = presented_key(authorization, x_api_key)
             .ok_or_else(|| auth_error(AuthFailure::Missing))?;
@@ -807,6 +882,14 @@ impl DecisionService {
             .with_retry_after(retry)
             .with_detail("rate_per_min", json!(p.rate_per_min)));
         }
+        self.check_quotas(p)
+    }
+
+    /// The quotas alone (402), with the usage recorded so far: checked by
+    /// [`DecisionService::admit`] before a request and again before every
+    /// input of a router batch after the first, so that one batch cannot
+    /// run past a quota or a credit limit.
+    pub fn check_quotas(&self, p: &Principal) -> Result<(), ApiError> {
         let t = self.totals(&p.account);
         let quota = |what: &str, used: Value, limit: Value| {
             ApiError::new(Reason::QuotaExceeded, format!("{what} quota exhausted"))

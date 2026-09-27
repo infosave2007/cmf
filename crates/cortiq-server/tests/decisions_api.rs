@@ -572,6 +572,7 @@ async fn keys_missing_wrong_expired_revoked_are_401_and_open_mode_is_loopback_wi
         credit_usd: None,
         oracle_budget_usd: None,
         oracle_allowed: false,
+        learning_allowed: false,
         router: None,
     };
     let file = KeysFile {
@@ -682,6 +683,9 @@ async fn max_inflight_overflow_is_429_overloaded_while_work_runs_on_the_blocking
     });
     let mut c2 = c;
     c2.oracle.enabled = true;
+    // Open mode with the oracle: only when auth.require is false explicitly
+    // (a loopback address alone gives no oracle to a caller without a key).
+    c2.auth.require = Some(false);
     let m = DecisionModel::open(&toy().path, Verify::Light).unwrap();
     let h = Arc::new(ModelHandle::new(LoadedModel::new(m).unwrap()));
     let esc: Arc<dyn Escalator> = hold;
@@ -774,6 +778,27 @@ async fn decision_quota_token_quota_and_credit_are_402() {
         );
         assert_eq!(t["cost_usd"].as_f64(), Some(0.001), "{a}");
     }
+
+    // A router batch cannot run past a quota or a credit limit: every input
+    // after the first is checked against what the batch used so far (402;
+    // the inputs before it are decided and billed).
+    let inputs: Vec<Value> = (0..5).map(|_| json!({"text": accepted()})).collect();
+    let batch = json!({"taxonomy_id": "topics", "inputs": inputs});
+    let (k, _) = srv
+        .key(json!({"account": "batchq", "decision_quota": 2}))
+        .await;
+    let r = srv.post("/v1/route:batch", Some(&k), &batch).await;
+    assert_eq!(r.router_error(), (402, "QUOTA_EXCEEDED".to_string()));
+    let (k, _) = srv
+        .key(json!({"account": "batchc", "credit_usd": "0.002"}))
+        .await;
+    let r = srv.post("/v1/route:batch", Some(&k), &batch).await;
+    assert_eq!(r.router_error(), (402, "QUOTA_EXCEEDED".to_string()));
+    let au = srv.admin("GET", "/v1/admin/usage", None).await;
+    let accounts = &au.body["accounts"];
+    assert_eq!(accounts["batchq"]["decisions"], 2, "{au:?}");
+    assert_eq!(accounts["batchc"]["decisions"], 2, "{au:?}");
+    assert_eq!(accounts["batchc"]["cost_usd"].as_f64(), Some(0.002));
 }
 
 // ------------------------------------------------------------------ 413, 400, 404
@@ -2035,7 +2060,10 @@ async fn router_api_route_fields_invariants_and_recipes() {
 #[tokio::test]
 async fn router_batch_embeddings_and_feedback() {
     let srv = Srv::open(cfg());
-    let (key, _) = srv.key(json!({"account": "batcher"})).await;
+    // This key may teach the model; the one of "someone-else" below may not.
+    let (key, _) = srv
+        .key(json!({"account": "batcher", "learning_allowed": true}))
+        .await;
     let texts = [
         accepted().to_string(),
         REJECTED.to_string(),
@@ -2221,6 +2249,35 @@ async fn router_batch_embeddings_and_feedback() {
     assert_eq!(r.router_error(), (404, "INVALID_REQUEST".to_string()));
     let learning = srv.admin("GET", "/v1/admin/learning", None).await;
     assert_eq!(learning.body["feedback"], 3);
+    // A key without learning_allowed: its feedback (a new label here) is
+    // answered and consumed, and teaches nothing.
+    let mine = srv
+        .post(
+            "/v1/route",
+            Some(&other),
+            &json!({"taxonomy_id": "topics", "input": {"text": accepted()}}),
+        )
+        .await;
+    let evil = json!({"request_id": mine.body["request_id"], "correct_task_label": "evil"});
+    let r = srv.post("/v1/feedback", Some(&other), &evil).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["accepted"], false);
+    assert_eq!(
+        r.body["message"],
+        "feedback for 'evil' not learned: this key may not teach the model"
+    );
+    let r = srv.post("/v1/feedback", Some(&other), &evil).await;
+    assert_eq!(
+        r.router_error(),
+        (404, "INVALID_REQUEST".to_string()),
+        "consumed"
+    );
+    let after = srv.admin("GET", "/v1/admin/learning", None).await;
+    assert_eq!(
+        after.body["buffer"]["examples"],
+        learning.body["buffer"]["examples"]
+    );
+    assert!(!after.body["buffer"].to_string().contains("evil"));
     // Escalations are the caller's own.
     let e = srv.get("/v1/escalations?limit=10", Some(&other)).await;
     assert_eq!(e.body["records"], json!([]));

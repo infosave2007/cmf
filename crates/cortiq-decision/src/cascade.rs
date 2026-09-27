@@ -16,12 +16,18 @@
 //! 4. **one call** for every leading question ([`crate::oracle`]); the state is
 //!    PII-redacted when `oracle.redact_pii` is on and the request did not set
 //!    `cmf.allow_pii_egress` (flag `pii_redacted`);
-//! 5. **success**: the answers are cached (and logged), and a choice answer of a
-//!    question matched to a skill becomes an example of the learning buffer
-//!    (source oracle); an example that brings its label to
-//!    `learning.refit_min_new` new examples starts a learning attempt
-//!    ([`crate::learn::attempt`]) — inline with `learning.synchronous`, else on
-//!    the one background worker;
+//! 5. **success**: the answers are cached (and logged; the scope holds the
+//!    question's contract, so an answer is reused only for the same
+//!    instructions and criteria), and a choice answer of a question matched
+//!    to a skill becomes an example of the learning buffer (source oracle)
+//!    when it may teach the shared skill: the caller's key has
+//!    `learning_allowed`, or the question is an exact match that asks exactly
+//!    the skill's own question ([`crate::service::SkillRuntime::follows_rubric`]
+//!    — the router's `task` question is one) so that the answer is the
+//!    skill's rubric applied to the text, not the caller's instructions; an
+//!    example that brings its label to `learning.refit_min_new` new examples
+//!    starts a learning attempt ([`crate::learn::attempt`]) — inline with
+//!    `learning.synchronous`, else on the one background worker;
 //! 6. **failure**: the question is failed (the service answers a trained one
 //!    locally with `abstain` + `oracle_unavailable`, an untrained one with 502).
 //!
@@ -29,7 +35,15 @@
 //! in a ring of `feedback.pending_cap` entries (vectors only). `POST
 //! /v1/feedback` finds the caller's own entry (another account's is not found),
 //! takes a label among the question's options and adds an example of weight 3
-//! (a label the skill does not have starts a cold start).
+//! (a label the skill does not have starts a cold start) — only for a caller
+//! whose key has `learning_allowed` (the open mode with `auth.require: false`
+//! has it); anyone else's feedback is consumed and answered, but teaches
+//! nothing (`learned: false`).
+//!
+//! **Buffer limits**: at most [`MAX_EXAMPLES_PER_LABEL`] examples of one
+//! (skill, label) and [`MAX_PENDING_NEW_LABELS`] labels per skill that are
+//! not tasks of it yet (pending cold starts); an example past either limit is
+//! refused (`full`).
 //!
 //! **Admin** (spec §5b): oracle status and switches, learning status (buffer,
 //! cache, quarantine, attempts, task hashes), generations and rollback (the
@@ -46,6 +60,7 @@ use crate::config::Config;
 use crate::container::{DecisionModel, Verify};
 use crate::generation;
 use crate::learn::{self, AttemptReport, Books, LearnContext, Outcome};
+use crate::matching::MatchKind;
 use crate::metering::Usd;
 use crate::oracle::{CallOutcome, Caller, KeyLookup, OracleClient, process_env};
 use crate::pii::{FLAG_PII_REDACTED, redact_value};
@@ -53,7 +68,7 @@ use crate::protocol::{ApiError, FeedbackRequest, MAX_LABEL_BYTES, Question, Ques
 use crate::rows::{Rows, Source};
 use crate::service::{
     AdminCommand, Escalation, EscalationResult, Escalator, ModelHandle, Observation, OracleUsage,
-    Principal, Resolution, Resolved,
+    Pending, Principal, Resolution, Resolved,
 };
 use crate::statedir::StateDir;
 use anyhow::Result;
@@ -70,6 +85,12 @@ use std::time::{Duration, Instant};
 pub const RECENT_ATTEMPTS: usize = 32;
 /// Extra wait of a single-flight follower beyond the oracle deadline.
 pub const FOLLOWER_GRACE: Duration = Duration::from_secs(5);
+/// `refused` of a feedback answer to a caller without `learning_allowed`.
+pub const LEARNING_NOT_ALLOWED: &str = "learning_not_allowed";
+/// Most examples of one (skill, label) in the learning buffer.
+pub const MAX_EXAMPLES_PER_LABEL: usize = 5_000;
+/// Most labels per skill in the buffer that are not tasks of the skill yet.
+pub const MAX_PENDING_NEW_LABELS: usize = 32;
 
 /// Options of [`Cascade::open_with`].
 #[derive(Clone)]
@@ -392,6 +413,17 @@ fn learnable_label(label: &str) -> bool {
     !label.is_empty() && label.len() <= MAX_LABEL_BYTES
 }
 
+/// Whether the oracle's answer to a pending question may become an example of
+/// the shared `skill` (see the module notes): the caller may teach, or the
+/// question is an exact match asking exactly the skill's own question.
+fn teaches(e: &Escalation<'_>, p: &Pending<'_>, skill: &str) -> bool {
+    e.principal.learning_allowed
+        || (p.matched.kind == MatchKind::Exact
+            && e.model
+                .skill(skill)
+                .is_some_and(|s| s.follows_rubric(p.question)))
+}
+
 impl Inner {
     fn base_rows(&self, model: &DecisionModel, skill: &str) -> Result<Arc<Rows>> {
         let mut b = self.bases.lock();
@@ -432,7 +464,27 @@ impl Inner {
         let stored = self.stored_phi(model.model(), &ex.skill, &ex.label)?;
         let refs: Vec<&[f32]> = stored.iter().map(Vec::as_slice).collect();
         let key = (ex.skill.clone(), ex.label.clone());
+        let is_task = |label: &str| {
+            model
+                .model()
+                .skill(&ex.skill)
+                .is_some_and(|s| s.manifest.task_of(label).is_some())
+        };
         let mut b = self.buffer.lock();
+        let held = b.examples(&ex.skill, &ex.label).len();
+        if held >= MAX_EXAMPLES_PER_LABEL {
+            return Ok((AddOutcome::Full, None));
+        }
+        if held == 0 && !is_task(&ex.label) {
+            let pending_new = b
+                .labels()
+                .iter()
+                .filter(|c| c.skill == ex.skill && !is_task(&c.label))
+                .count();
+            if pending_new >= MAX_PENDING_NEW_LABELS {
+                return Ok((AddOutcome::Full, None));
+            }
+        }
         if b.is_duplicate(&ex.skill, &ex.label, &ex.phi_p, &refs) {
             b.count_duplicate();
             return Ok((AddOutcome::Duplicate, None));
@@ -738,6 +790,7 @@ impl Escalator for Cascade {
                         let p = &e.pending[i];
                         if let (true, Some(skill), OracleAnswer::Choice(label)) =
                             (cfg.learning.enabled, &p.matched.skill, &v)
+                            && teaches(e, p, skill)
                         {
                             let ex = Example::from_features(
                                 skill,
@@ -856,6 +909,18 @@ impl Escalator for Cascade {
             .skill(&entry.skill)
             .and_then(|s| s.manifest().task_of(&fb.label))
             .is_some();
+        if !principal.learning_allowed {
+            // The entry is consumed, as a learned feedback's is; nothing is
+            // stored, so no key without the permission writes to the model
+            // every account is served.
+            inner.stats.lock().feedback += 1;
+            return Ok(json!({
+                "id": fb.id, "question": fb.question, "skill": entry.skill, "label": fb.label,
+                "accepted": false, "learned": false, "known_label": known,
+                "refused": LEARNING_NOT_ALLOWED,
+                "reason": "this key may not teach the model (learning_allowed is false)",
+            }));
+        }
         let ex = Example {
             skill: entry.skill.clone(),
             label: fb.label.clone(),
@@ -895,7 +960,8 @@ impl Escalator for Cascade {
         }
         Ok(json!({
             "id": fb.id, "question": fb.question, "skill": entry.skill, "label": fb.label,
-            "accepted": added == AddOutcome::Stored, "duplicate": added == AddOutcome::Duplicate,
+            "accepted": added == AddOutcome::Stored, "learned": added == AddOutcome::Stored,
+            "duplicate": added == AddOutcome::Duplicate, "full": added == AddOutcome::Full,
             "known_label": known, "cold_start": !known, "weight": Source::ClientFeedback.default_weight(),
             "examples": total, "new_examples": new, "refit_min_new": inner.cfg.learning.refit_min_new,
             "learning": learning,
