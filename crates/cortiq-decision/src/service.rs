@@ -20,7 +20,11 @@
 //!    key's `oracle_allowed` and `cmf.oracle` / `default_per_request`; the
 //!    escalator adds the key, budget and stop checks): `oracle` or `cache`
 //!    answers replace them; otherwise a trained question stays `abstain` with a
-//!    flag and an untrained one fails the request (422, 502 or 503);
+//!    flag and an untrained one fails the request (422, 502 or 503). A
+//!    trained question refused because the oracle is not ready (flags
+//!    `oracle_disabled`, `no_key`, `budget`, `stopped`) also gives the answer
+//!    one line `cmf.hint` saying what to do ([`oracle_hint`]; logged at most
+//!    once a minute, [`DecisionService::log_oracle_hint`]);
 //! 6. the response, the metering (spec §4.9) and one usage-ledger record are
 //!    produced; the escalator observes the decided questions (feedback ring).
 //!
@@ -401,8 +405,10 @@ pub fn presented_key<'a>(
 /// Why the oracle was not called.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RefusalReason {
-    /// `oracle.enabled` is false, no cascade, or no key in the environment.
+    /// `oracle.enabled` is false, no cascade, or the admin switch is off.
     OracleDisabled,
+    /// The environment variable `oracle.api_key_env` is unset or empty.
+    NoKey,
     /// The key has `oracle_allowed: false`, or the request withheld consent.
     ConsentOff,
     /// The reservation does not fit the budget (global, per key) or `max_calls`.
@@ -412,16 +418,104 @@ pub enum RefusalReason {
 }
 
 impl RefusalReason {
-    /// The flag of an abstained question.
+    /// The reason's own name (`no_key` for [`RefusalReason::NoKey`]).
     pub fn flag(self) -> &'static str {
         match self {
             RefusalReason::OracleDisabled => "oracle_disabled",
+            RefusalReason::NoKey => "no_key",
             RefusalReason::ConsentOff => "consent_off",
             RefusalReason::Budget => "budget",
             RefusalReason::Stopped => "stopped",
         }
     }
+
+    /// The flags of a question abstained for this reason: the reason's name,
+    /// and for a missing key also `oracle_disabled` (the oracle is off for
+    /// every request until the variable is set).
+    pub fn flags(self) -> &'static [&'static str] {
+        match self {
+            RefusalReason::NoKey => &["oracle_disabled", "no_key"],
+            RefusalReason::OracleDisabled => &["oracle_disabled"],
+            RefusalReason::ConsentOff => &["consent_off"],
+            RefusalReason::Budget => &["budget"],
+            RefusalReason::Stopped => &["stopped"],
+        }
+    }
 }
+
+/// Whether the oracle can be called now, as `GET /v1/admin/oracle` names it in
+/// `status` ([`OracleStatus::label`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OracleStatus {
+    /// Enabled, a key in the environment, not stopped, a budget left.
+    Ready,
+    /// The variable `oracle.api_key_env` is unset or empty.
+    NoKey,
+    /// Not configured (`oracle.enabled` false, no cascade), or switched off
+    /// by the admin API (`by_admin`).
+    Disabled { by_admin: bool },
+    /// The budget (global or the admin's) cannot hold even the smallest
+    /// call, or `max_calls` calls were made.
+    BudgetExhausted,
+    /// A stop rule switched it off (the reason of `oracle.state`).
+    Stopped(String),
+}
+
+impl OracleStatus {
+    /// `ready`, `no_key`, `disabled`, `budget_exhausted` or `stopped: <reason>`.
+    pub fn label(&self) -> String {
+        match self {
+            OracleStatus::Ready => "ready".into(),
+            OracleStatus::NoKey => "no_key".into(),
+            OracleStatus::Disabled { .. } => "disabled".into(),
+            OracleStatus::BudgetExhausted => "budget_exhausted".into(),
+            OracleStatus::Stopped(r) => format!("stopped: {r}"),
+        }
+    }
+
+    pub fn is_ready(&self) -> bool {
+        *self == OracleStatus::Ready
+    }
+}
+
+/// The one-line hint of a trained question that abstained because the oracle
+/// was refused for `reason` (`cmf.hint` of a decisions-API answer, and the
+/// rate-limited log line of both surfaces). `None` for a refusal the caller
+/// chose (`consent_off`). `key_env` is the variable's name, never its value.
+pub fn oracle_hint(reason: RefusalReason, status: &OracleStatus, key_env: &str) -> Option<String> {
+    Some(match (reason, status) {
+        (RefusalReason::ConsentOff, _) => return None,
+        (RefusalReason::NoKey, _) | (RefusalReason::OracleDisabled, OracleStatus::NoKey) => {
+            format!(
+                "the oracle key is not set: set {key_env} in the server's environment and restart it"
+            )
+        }
+        (RefusalReason::OracleDisabled, OracleStatus::Disabled { by_admin: true }) => {
+            "the oracle is switched off by the admin API: POST /v1/admin/oracle {\"enabled\":true} turns it on"
+                .into()
+        }
+        (RefusalReason::OracleDisabled, _) => format!(
+            "no oracle answers the questions the local model cannot decide: start the server with --oracle MODEL and set {key_env}"
+        ),
+        (RefusalReason::Budget, OracleStatus::BudgetExhausted) => {
+            "the oracle budget is used up: restart the server with a larger --oracle-budget (or --oracle-max-calls)"
+                .into()
+        }
+        (RefusalReason::Budget, _) => {
+            "the oracle budget or credit of this API key is used up".into()
+        }
+        (RefusalReason::Stopped, OracleStatus::Stopped(r)) => format!(
+            "the oracle was stopped by a stop rule ({r}): see GET /v1/admin/oracle; after the fix POST /v1/admin/oracle {{\"enabled\":true}} resumes it"
+        ),
+        (RefusalReason::Stopped, _) => {
+            "the oracle was stopped by a stop rule: see GET /v1/admin/oracle; after the fix POST /v1/admin/oracle {\"enabled\":true} resumes it"
+                .into()
+        }
+    })
+}
+
+/// At most one log line of an oracle hint per this interval.
+pub const HINT_LOG_EVERY: Duration = Duration::from_secs(60);
 
 /// Flag of a question whose oracle call failed.
 pub const FLAG_ORACLE_UNAVAILABLE: &str = "oracle_unavailable";
@@ -547,6 +641,13 @@ pub trait Escalator: Send + Sync {
 
     /// Every successful response (after it is billed). Default: nothing.
     fn observe(&self, _observation: &Observation<'_>) {}
+
+    /// The oracle's readiness (`None`: this escalator does not know; the
+    /// service then reports [`OracleStatus::Ready`] when the oracle is
+    /// configured).
+    fn oracle_status(&self) -> Option<OracleStatus> {
+        None
+    }
 }
 
 // ------------------------------------------------------------------ outcomes
@@ -727,9 +828,14 @@ pub struct DecisionService {
     memory_totals: Mutex<BTreeMap<String, Totals>>,
     limiter: RateLimiter,
     auth_required: bool,
+    /// The implicit open mode (loopback, `auth.require: null`) may use the
+    /// oracle: the operator enabled it on the command line (`serve --oracle`).
+    open_oracle: bool,
     admin_token: Option<String>,
     inflight: Arc<AtomicUsize>,
     tokens: TokenCache,
+    /// When an oracle hint was last logged ([`HINT_LOG_EVERY`]).
+    hint_logged: Mutex<Option<Instant>>,
 }
 
 impl std::fmt::Debug for DecisionService {
@@ -740,6 +846,7 @@ impl std::fmt::Debug for DecisionService {
             .field("keys", &self.keys.as_ref().map(|k| k.len()))
             .field("ledger", &self.ledger.is_some())
             .field("auth_required", &self.auth_required)
+            .field("open_oracle", &self.open_oracle)
             .field("admin", &self.admin_token.is_some())
             .finish()
     }
@@ -768,6 +875,7 @@ impl DecisionService {
             rates: cfg.rates()?,
             limits: (&cfg.limits).into(),
             auth_required: cfg.auth.required(false),
+            open_oracle: false,
             admin_token: cfg.auth.admin_token(),
             handle: model,
             escalator,
@@ -777,6 +885,7 @@ impl DecisionService {
             limiter: RateLimiter::new(),
             inflight: Arc::new(AtomicUsize::new(0)),
             tokens: TokenCache::new(TOKEN_CACHE_CAP),
+            hint_logged: Mutex::new(None),
             cfg: Arc::new(cfg),
         })
     }
@@ -784,6 +893,15 @@ impl DecisionService {
     /// Resolve `auth.require: null` for the listening address.
     pub fn with_loopback(mut self, loopback: bool) -> Self {
         self.auth_required = self.cfg.auth.required(loopback);
+        self
+    }
+
+    /// Let the open mode that holds only because of a loopback address
+    /// (`auth.require: null`) use the oracle: the operator enabled the oracle
+    /// explicitly (`cortiq serve --oracle MODEL`). It still may not teach the
+    /// model; an explicit `auth.require: false` gives both, as before.
+    pub fn with_open_oracle(mut self, allowed: bool) -> Self {
+        self.open_oracle = allowed;
         self
     }
 
@@ -829,6 +947,35 @@ impl DecisionService {
         self.escalator.as_ref()
     }
 
+    /// Whether the oracle can be called now: disabled without a cascade or
+    /// with `oracle.enabled` false, else what the cascade reports.
+    pub fn oracle_status(&self) -> OracleStatus {
+        match &self.escalator {
+            Some(e) if self.cfg.oracle.enabled => e.oracle_status().unwrap_or(OracleStatus::Ready),
+            _ => OracleStatus::Disabled { by_admin: false },
+        }
+    }
+
+    /// The hint of a trained question abstained for `reason` (see
+    /// [`oracle_hint`]); `None` without a cascade (`cortiq decide`, which
+    /// never calls the oracle) and for `consent_off`.
+    pub fn oracle_hint(&self, reason: RefusalReason) -> Option<String> {
+        self.escalator.as_ref()?;
+        oracle_hint(reason, &self.oracle_status(), &self.cfg.oracle.api_key_env)
+    }
+
+    /// Log `hint` at most once per [`HINT_LOG_EVERY`] (the router surface
+    /// carries no hint in its answers; the log is where an operator sees it).
+    pub fn log_oracle_hint(&self, hint: &str) {
+        let now = Instant::now();
+        let mut last = self.hint_logged.lock();
+        if last.is_none_or(|t| now.duration_since(t) >= HINT_LOG_EVERY) {
+            *last = Some(now);
+            drop(last);
+            tracing::warn!("a question the local model could not decide abstained: {hint}");
+        }
+    }
+
     /// Whether a key is required now (false only in open mode: no keys and
     /// auth not required).
     pub fn auth_enabled(&self) -> bool {
@@ -855,7 +1002,10 @@ impl DecisionService {
             return Ok(if self.cfg.auth.require == Some(false) {
                 Principal::open()
             } else {
-                Principal::open_implicit()
+                Principal {
+                    oracle_allowed: self.open_oracle,
+                    ..Principal::open_implicit()
+                }
             });
         }
         let raw = presented_key(authorization, x_api_key)
@@ -1173,6 +1323,17 @@ impl DecisionService {
             .cmf
             .round
             .unwrap_or_else(|| Rounding::from_config(self.cfg.response.round));
+        // A trained question refused the oracle: one hint (the first such
+        // question's reason), in `cmf.hint` and the rate-limited log.
+        let hint = (0..matches.len())
+            .filter(|&i| locals[i].is_some())
+            .find_map(|i| match resolved[i].as_ref().map(|r| &r.resolution) {
+                Some(Resolution::Refused(r)) => self.oracle_hint(*r),
+                _ => None,
+            });
+        if let Some(h) = &hint {
+            self.log_oracle_hint(h);
+        }
         let mut outcomes = Vec::with_capacity(matches.len());
         for (i, (q, m)) in req.questions.iter().zip(matches).enumerate() {
             outcomes.push(self.outcome(q, m, locals[i].take(), resolved[i].take(), rounding));
@@ -1238,7 +1399,11 @@ impl DecisionService {
             questions: outcomes.len() as u64,
             actions,
         };
-        let response = self.response_json(&id, created, &model, req, &outcomes, &metered, &timings);
+        let mut response =
+            self.response_json(&id, created, &model, req, &outcomes, &metered, &timings);
+        if let Some(h) = hint {
+            response["cmf"]["hint"] = Value::String(h);
+        }
         self.record_usage(&record)?;
         if let Some(esc) = &self.escalator {
             esc.observe(&Observation {
@@ -1344,7 +1509,7 @@ impl DecisionService {
                         "escalate→cache",
                     ),
                     Resolution::Refused(reason) => {
-                        flags.push(reason.flag().to_string());
+                        flags.extend(reason.flags().iter().map(|f| f.to_string()));
                         (
                             Action::Abstain,
                             None,
@@ -1641,6 +1806,7 @@ impl DecisionService {
             "skills": model.skills().len(),
             "inflight": self.inflight(),
             "oracle": self.escalator.is_some() && self.cfg.oracle.enabled,
+            "oracle_status": self.oracle_status().label(),
         })
     }
 
@@ -2000,6 +2166,10 @@ fn untrained_error(
             Resolution::Refused(RefusalReason::ConsentOff) => (
                 Reason::UnsupportedQuestion,
                 "the oracle is not allowed for this request or key",
+            ),
+            Resolution::Refused(RefusalReason::NoKey) => (
+                Reason::UnsupportedQuestion,
+                "the oracle key is not set in the server's environment",
             ),
             Resolution::Refused(RefusalReason::OracleDisabled)
             | Resolution::Oracle(_)

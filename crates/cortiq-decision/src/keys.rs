@@ -13,12 +13,15 @@
 //!   `rate_per_min`, `decision_quota` and `token_quota` 0 = unlimited;
 //!   `credit_usd` and `oracle_budget_usd` decimal strings or `null` (no
 //!   limit). A revoked key keeps its record with `active: false`.
-//!   `oracle_allowed` defaults to false for a key created here (the oracle is
-//!   opt-in per key) and to true for a key imported from cortiq-router, which
-//!   escalated for every key. `learning_allowed` (may this key teach the
-//!   shared model: its feedback, cold starts of new labels, the oracle's
-//!   answers to its own questions) defaults to false for every key, created
-//!   or imported; a record written before the field existed reads as false.
+//!   `oracle_allowed` defaults to false for a key created here without it
+//!   ([`NewKey`], `POST /v1/admin/keys` without the field) and to true for a
+//!   key imported from cortiq-router, which escalated for every key; `cortiq
+//!   decision keys create` passes true unless `--oracle-allowed=false` (the
+//!   server's oracle switch, budgets and stop rules apply either way).
+//!   `learning_allowed` (may this key teach the shared model: its feedback,
+//!   cold starts of new labels, the oracle's answers to its own questions)
+//!   defaults to false for every key, created or imported; a record written
+//!   before the field existed reads as false.
 //! * **Account, plan, label**: any text the router's `api_keys` columns hold
 //!   — 1..128, ≤ 64 and ≤ 255 Unicode characters (`VARCHAR(128)`,
 //!   `VARCHAR(64)`, `VARCHAR(255)`, router `store.rs:119-130`), e.g.

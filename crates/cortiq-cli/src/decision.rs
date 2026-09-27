@@ -37,6 +37,7 @@ use cortiq_decision::learn::{self, OfflineOptions, OfflineReport};
 use cortiq_decision::ledger::UsageLedger;
 use cortiq_decision::manifest::{Gate, SkillManifest, TaskState};
 use cortiq_decision::oracle;
+use cortiq_decision::oracle_setup::{self, OracleFlags, OracleSetup};
 use cortiq_decision::protocol::{ApiError, MODEL_ID, model_name};
 use cortiq_decision::service::{
     Decided, DecisionService, LoadedModel, ModelHandle, Principal, QuestionOutcome,
@@ -72,8 +73,82 @@ pub fn resolve_serve_host(host: Option<&str>, decision: bool) -> &str {
     }
 }
 
+/// `--oracle MODEL` and its companions (`cortiq serve` on a decision file):
+/// the oracle in two steps — the key in `OPENROUTER_API_KEY`, then this flag.
+/// See `cortiq_decision::oracle_setup`.
+#[derive(Args, Clone, Debug, Default, PartialEq)]
+pub struct OracleArgs {
+    /// Decision file only: let this OpenRouter model answer the questions the
+    /// local model cannot decide (e.g. deepseek/deepseek-v4.1-flash). The key
+    /// is read from OPENROUTER_API_KEY (--oracle-key-env), never from a file.
+    /// At start one public GET of the model's endpoint listing (no key sent)
+    /// checks that it supports structured outputs and sets the max price to
+    /// twice its cheapest endpoint. Overrides --decision-config
+    #[arg(long, value_name = "MODEL")]
+    pub oracle: Option<String>,
+    /// With --oracle: the most this server spends on the oracle, USD
+    /// [default: 1.0, or oracle.budget_usd of --decision-config]
+    #[arg(long, value_name = "USD", requires = "oracle")]
+    pub oracle_budget: Option<f64>,
+    /// With --oracle: the most oracle calls this server makes
+    #[arg(long, value_name = "N", requires = "oracle")]
+    pub oracle_max_calls: Option<u64>,
+    /// With --oracle: the environment variable holding the OpenRouter key
+    /// [default: OPENROUTER_API_KEY]
+    #[arg(long, value_name = "VAR", requires = "oracle")]
+    pub oracle_key_env: Option<String>,
+    /// With --oracle: the OpenRouter API base (https; plain http only to a
+    /// loopback address) [default: https://openrouter.ai/api/v1]
+    #[arg(long, value_name = "URL", requires = "oracle")]
+    pub oracle_base_url: Option<String>,
+    /// With --oracle: max price in USD per 1M prompt and completion tokens,
+    /// e.g. 0.1,0.5 [default: twice the model's cheapest structured-output
+    /// endpoint]
+    #[arg(long, value_name = "IN,OUT", requires = "oracle", value_parser = parse_max_price)]
+    pub oracle_max_price: Option<(f64, f64)>,
+    /// With --oracle: do not learn (the oracle's answers and feedback leave
+    /// the served model as it is)
+    #[arg(long, requires = "oracle")]
+    pub no_oracle_learning: bool,
+}
+
+fn parse_max_price(s: &str) -> std::result::Result<(f64, f64), String> {
+    cortiq_decision::oracle_setup::parse_max_price(s).map_err(|e| e.to_string())
+}
+
+impl OracleArgs {
+    /// The library's flags (`None` without `--oracle`).
+    pub fn flags(&self) -> Option<OracleFlags> {
+        Some(OracleFlags {
+            model: self.oracle.clone()?,
+            budget_usd: self.oracle_budget,
+            max_calls: self.oracle_max_calls,
+            key_env: self.oracle_key_env.clone(),
+            base_url: self.oracle_base_url.clone(),
+            max_price: self.oracle_max_price,
+            no_learning: self.no_oracle_learning,
+        })
+    }
+
+    /// The flags given, as spelled on the command line.
+    pub fn given(&self) -> Vec<&'static str> {
+        [
+            ("--oracle", self.oracle.is_some()),
+            ("--oracle-budget", self.oracle_budget.is_some()),
+            ("--oracle-max-calls", self.oracle_max_calls.is_some()),
+            ("--oracle-key-env", self.oracle_key_env.is_some()),
+            ("--oracle-base-url", self.oracle_base_url.is_some()),
+            ("--oracle-max-price", self.oracle_max_price.is_some()),
+            ("--no-oracle-learning", self.no_oracle_learning),
+        ]
+        .into_iter()
+        .filter_map(|(name, set)| set.then_some(name))
+        .collect()
+    }
+}
+
 /// The flags of `cortiq serve` that apply only to a decision file.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ServeFlags {
     /// `--decision-config PATH` (spec §4.13).
     pub decision_config: Option<PathBuf>,
@@ -86,12 +161,14 @@ pub struct ServeFlags {
     /// `--shadow-timeout-s N`: deadline of one request forwarded to the old
     /// router (default [`cortiq_decision::shadow::UPSTREAM_TIMEOUT`], 60 s).
     pub shadow_timeout_s: Option<u64>,
+    /// `--oracle MODEL` and its companions.
+    pub oracle: OracleArgs,
 }
 
 impl ServeFlags {
     /// The decision-only flags given, as spelled on the command line.
     pub fn given(&self) -> Vec<&'static str> {
-        [
+        let mut v: Vec<&'static str> = [
             ("--decision-config", self.decision_config.is_some()),
             ("--state", self.state.is_some()),
             ("--break-lock", self.break_lock),
@@ -100,7 +177,9 @@ impl ServeFlags {
         ]
         .into_iter()
         .filter_map(|(name, set)| set.then_some(name))
-        .collect()
+        .collect();
+        v.extend(self.oracle.given());
+        v
     }
 }
 
@@ -118,7 +197,7 @@ pub fn check_serve_flags(
         ensure!(
             llm_given.is_empty(),
             "{} is a decision file: {} apply only to language models (a decision server takes \
-             --host, --port, --decision-config, --state, --break-lock and --shadow-of)",
+             --host, --port, --decision-config, --state, --break-lock, --shadow-of and --oracle*)",
             model,
             llm_given.join(", ")
         );
@@ -145,11 +224,39 @@ fn socket_addr(host: &str, port: u16) -> Result<SocketAddr> {
 /// `cortiq serve FILE` on a decision file: the decisions server of
 /// `cortiq_server::decisions` (no `Pipeline`, no GPU) until Ctrl-C/SIGTERM.
 pub async fn serve(model: &str, host: &str, port: u16, flags: &ServeFlags) -> Result<()> {
-    let config = match &flags.decision_config {
-        Some(p) => Config::load(p)?,
-        None => Config::default(),
+    let (mut config, config_sets_provider) = match &flags.decision_config {
+        Some(p) => {
+            let cfg = Config::load(p)?;
+            // Whether the file sets `oracle.provider` (and so its max price).
+            let raw: Value = serde_json::from_slice(
+                &std::fs::read(p).with_context(|| format!("read {}", p.display()))?,
+            )
+            .with_context(|| format!("{}", p.display()))?;
+            (cfg, raw.pointer("/oracle/provider").is_some())
+        }
+        None => (Config::default(), false),
+    };
+    // `--oracle MODEL`: applied before anything is opened; a model the oracle
+    // cannot use stops here (one public GET of its endpoint listing, no key).
+    let setup = match flags.oracle.flags() {
+        Some(f) => {
+            let (cfg, setup) = tokio::task::spawn_blocking(move || {
+                let mut cfg = config;
+                oracle_setup::apply(&mut cfg, &f, config_sets_provider).map(|s| (cfg, s))
+            })
+            .await
+            .context("oracle setup")??;
+            config = cfg;
+            for w in &setup.warnings {
+                tracing::warn!("{w}");
+            }
+            Some(setup)
+        }
+        None => None,
     };
     let mut opts = ServeOptions::new(model, config);
+    opts.oracle_from_flag = setup.is_some();
+    opts.oracle_note = setup.as_ref().map(OracleSetup::price_note);
     opts.addr = socket_addr(host, port)?;
     opts.state_dir = flags.state.clone();
     opts.break_lock = flags.break_lock;
@@ -604,9 +711,19 @@ pub enum KeysCmd {
         /// Oracle spending limit of the key in USD (decimal string)
         #[arg(long)]
         oracle_budget_usd: Option<String>,
-        /// Allow this key's undetermined questions to reach the oracle
-        #[arg(long)]
-        oracle_allowed: bool,
+        /// Whether this key's undetermined questions may reach the oracle
+        /// (default: true, as imported router keys; --oracle-allowed=false
+        /// creates a key that never escalates). The server's oracle switch,
+        /// budgets and stop rules still apply
+        #[arg(
+            long,
+            value_name = "BOOL",
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "true",
+            value_parser = clap::value_parser!(bool)
+        )]
+        oracle_allowed: Option<bool>,
         /// Allow this key to teach the shared model: its feedback, cold
         /// starts of new labels, and the oracle's answers to its own
         /// questions (default: no key teaches it)
@@ -1312,7 +1429,7 @@ fn keys(cmd: &KeysCmd) -> Result<()> {
                 token_quota: *token_quota,
                 credit_usd: credit_usd.clone(),
                 oracle_budget_usd: oracle_budget_usd.clone(),
-                oracle_allowed: oracle_allowed.then_some(true),
+                oracle_allowed: Some(oracle_allowed.unwrap_or(true)),
                 learning_allowed: learning_allowed.then_some(true),
             };
             let created = store.create(&new, &cfg.auth.plans, now)?;
@@ -1322,7 +1439,7 @@ fn keys(cmd: &KeysCmd) -> Result<()> {
                 let r = &created.record;
                 println!("{}", created.raw);
                 eprintln!(
-                    "created key {} for account {} (plan {}, {} requests/min, decision quota {}, expires {}); \
+                    "created key {} for account {} (plan {}, {} requests/min, decision quota {}, expires {}, oracle {}); \
                      the key is shown only now, {} keeps its sha256",
                     r.hash12(),
                     keys_mod::shown(&r.account),
@@ -1330,6 +1447,11 @@ fn keys(cmd: &KeysCmd) -> Result<()> {
                     r.rate_per_min,
                     r.decision_quota,
                     r.expires.map_or("never".to_string(), |e| e.to_string()),
+                    if r.oracle_allowed {
+                        "allowed"
+                    } else {
+                        "not allowed"
+                    },
                     store.path().display()
                 );
             }
@@ -1666,6 +1788,12 @@ mod tests {
             break_lock: true,
             shadow_of: Some("https://router.example.com".into()),
             shadow_timeout_s: Some(300),
+            oracle: OracleArgs {
+                oracle: Some("m/x".into()),
+                oracle_budget: Some(2.0),
+                no_oracle_learning: true,
+                ..OracleArgs::default()
+            },
         };
         assert_eq!(
             d.given(),
@@ -1674,7 +1802,10 @@ mod tests {
                 "--state",
                 "--break-lock",
                 "--shadow-of",
-                "--shadow-timeout-s"
+                "--shadow-timeout-s",
+                "--oracle",
+                "--oracle-budget",
+                "--no-oracle-learning"
             ]
         );
         // Decision file: no language-model flag.
@@ -1726,6 +1857,104 @@ mod tests {
             }
             _ => panic!("not serve"),
         }
+    }
+
+    #[test]
+    fn serve_parses_the_oracle_flags_which_need_oracle() {
+        match parse(&[
+            "cortiq",
+            "serve",
+            "d.cmf",
+            "--oracle",
+            "deepseek/deepseek-v4.1-flash",
+            "--oracle-budget",
+            "5",
+            "--oracle-max-calls",
+            "100",
+            "--oracle-key-env",
+            "MY_KEY",
+            "--oracle-base-url",
+            "http://127.0.0.1:9/api/v1",
+            "--oracle-max-price",
+            "0.2,0.8",
+            "--no-oracle-learning",
+        ])
+        .unwrap()
+        .command
+        {
+            Commands::Serve { oracle, .. } => {
+                let f = oracle.flags().unwrap();
+                assert_eq!(f.model, "deepseek/deepseek-v4.1-flash");
+                assert_eq!(f.budget_usd, Some(5.0));
+                assert_eq!(f.max_calls, Some(100));
+                assert_eq!(f.key_env.as_deref(), Some("MY_KEY"));
+                assert_eq!(f.base_url.as_deref(), Some("http://127.0.0.1:9/api/v1"));
+                assert_eq!(f.max_price, Some((0.2, 0.8)));
+                assert!(f.no_learning);
+            }
+            _ => panic!("not serve"),
+        }
+        match parse(&["cortiq", "serve", "d.cmf"]).unwrap().command {
+            Commands::Serve { oracle, .. } => assert_eq!(oracle.flags(), None),
+            _ => panic!("not serve"),
+        }
+        // The companions need --oracle; a bad price pair is refused.
+        for a in [
+            &["--oracle-budget", "5"][..],
+            &["--oracle-max-calls", "1"],
+            &["--oracle-key-env", "K"],
+            &["--oracle-base-url", "http://127.0.0.1:9"],
+            &["--oracle-max-price", "1,2"],
+            &["--no-oracle-learning"],
+        ] {
+            let mut v = vec!["cortiq", "serve", "d.cmf"];
+            v.extend_from_slice(a);
+            assert!(parse(&v).is_err(), "{a:?}");
+        }
+        assert!(
+            parse(&[
+                "cortiq",
+                "serve",
+                "d.cmf",
+                "--oracle",
+                "m/x",
+                "--oracle-max-price",
+                "1"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn keys_create_allows_the_oracle_unless_opted_out() {
+        let allowed = |extra: &[&str]| {
+            let mut v = vec!["cortiq", "decision", "keys", "create", "--state", "s"];
+            v.extend_from_slice(extra);
+            match parse(&v).unwrap().command {
+                Commands::Decision {
+                    cmd:
+                        DecisionCmd::Keys {
+                            cmd: KeysCmd::Create { oracle_allowed, .. },
+                        },
+                } => oracle_allowed,
+                _ => panic!("not keys create"),
+            }
+        };
+        assert_eq!(allowed(&[]), None);
+        assert_eq!(allowed(&["--oracle-allowed"]), Some(true));
+        assert_eq!(allowed(&["--oracle-allowed=false"]), Some(false));
+        assert!(
+            parse(&[
+                "cortiq",
+                "decision",
+                "keys",
+                "create",
+                "--state",
+                "s",
+                "--oracle-allowed=x"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

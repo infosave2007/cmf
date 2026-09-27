@@ -793,12 +793,17 @@ fn consent_switches_make_no_call() {
         &stand_config(&mock.url()),
         no_key_lookup(),
     );
+    let d = st.decide(&trained(None)).unwrap();
+    assert_eq!(flags(&d, 0), vec!["oracle_disabled", "no_key"]);
     assert_eq!(
-        flags(&st.decide(&trained(None)).unwrap(), 0),
-        vec!["oracle_disabled"]
+        d.response["cmf"]["hint"],
+        format!(
+            "the oracle key is not set: set {KEY_ENV} in the server's environment and restart it"
+        )
     );
     let status = st.svc.admin(&AdminCommand::OracleStatus).unwrap();
     assert_eq!(status["key_present"], false);
+    assert_eq!(status["status"], "no_key");
 
     // The admin switch.
     let st = Stand::new(&stand_config(&mock.url()));
@@ -1020,7 +1025,7 @@ fn the_key_comes_only_from_the_environment() {
     let st = Stand::open(tempfile::tempdir().unwrap(), &cfg, process_env());
     assert_eq!(
         flags(&st.decide(&topics_body(&rejected()[0])).unwrap(), 0),
-        vec!["oracle_disabled"]
+        vec!["oracle_disabled", "no_key"]
     );
     assert_eq!(mock.hits(), 0);
     assert!(!cfg.to_value().to_string().contains(TEST_KEY));

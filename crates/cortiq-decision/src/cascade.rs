@@ -8,7 +8,7 @@
 //! 1. **permission**: the admin switch, a key in the environment, no stop
 //!    reason, a budget left (globally, calls, the key's `oracle_budget_usd`
 //!    and what its `credit_usd` has left); otherwise every question is
-//!    refused (`oracle_disabled`, `stopped`, `budget`);
+//!    refused (`oracle_disabled`, `no_key`, `stopped`, `budget`);
 //! 2. **cache** ([`crate::cache`]): a hit answers the question at no cost;
 //! 3. **single flight**: a question whose scope is in flight in another request
 //!    with cos φ_P ≥ `cache.threshold` waits for that call and reuses its answer
@@ -67,8 +67,8 @@ use crate::pii::{FLAG_PII_REDACTED, redact_value};
 use crate::protocol::{ApiError, FeedbackRequest, MAX_LABEL_BYTES, Question, QuestionKind};
 use crate::rows::{Rows, Source};
 use crate::service::{
-    AdminCommand, Escalation, EscalationResult, Escalator, ModelHandle, Observation, OracleUsage,
-    Pending, Principal, Resolution, Resolved,
+    AdminCommand, Escalation, EscalationResult, Escalator, ModelHandle, Observation, OracleStatus,
+    OracleUsage, Pending, Principal, Resolution, Resolved,
 };
 use crate::statedir::StateDir;
 use anyhow::Result;
@@ -998,6 +998,10 @@ impl Escalator for Cascade {
             }
             AdminCommand::Rollback { generation } => inner.rollback(*generation),
         }
+    }
+
+    fn oracle_status(&self) -> Option<OracleStatus> {
+        Some(self.inner.oracle.status())
     }
 
     fn observe(&self, o: &Observation<'_>) {

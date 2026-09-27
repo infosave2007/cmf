@@ -579,7 +579,18 @@ impl Srv {
     }
 
     fn open_on(base: &Path, dir: tempfile::TempDir, cfg: &Config, key: KeyLookup) -> Self {
+        Self::open_with(base, dir, cfg, key, |_| {})
+    }
+
+    fn open_with(
+        base: &Path,
+        dir: tempfile::TempDir,
+        cfg: &Config,
+        key: KeyLookup,
+        tweak: impl FnOnce(&mut ServeOptions),
+    ) -> Self {
         let mut o = ServeOptions::new(base, cfg.clone());
+        tweak(&mut o);
         o.state_dir = Some(dir.path().join("state"));
         o.cascade = CascadeOptions {
             key,
@@ -1860,14 +1871,125 @@ fn the_oracle_key_comes_only_from_the_environment() {
             process_env(),
         );
         let r = srv.decide(&topics_body(&rejected()[0])).await;
-        assert_eq!(r.flags(), json!(["oracle_disabled"]));
+        assert_eq!(r.flags(), json!(["oracle_disabled", "no_key"]));
         assert_eq!(
             srv.decide(&untrained_body()).await.error(),
             (422, "UNSUPPORTED_QUESTION".to_string())
         );
         let s = srv.admin("GET", "/v1/admin/oracle", None).await;
         assert_eq!(s.body["key_present"], false);
+        assert_eq!(s.body["status"], "no_key");
     });
     assert_eq!(mock.hits(), 0);
     assert!(!cfg.to_value().to_string().contains(TEST_KEY));
+}
+
+// ------------------------------------------------------------------ the oracle in two steps
+
+/// `status` of `GET /v1/admin/oracle`.
+async fn status(srv: &Srv) -> String {
+    let s = srv.admin("GET", "/v1/admin/oracle", None).await;
+    assert_eq!(s.status, 200, "{}", s.text);
+    s.body["status"].as_str().unwrap().to_string()
+}
+
+/// `serve --oracle` on loopback without keys or `auth.require`: the open mode
+/// may use the oracle (never teach); `status` and `cmf.hint` name every state
+/// (ready, disabled by the admin, stopped, budget); the router surface keeps
+/// its shape.
+#[tokio::test]
+async fn oracle_flag_opens_the_loopback_open_mode_and_status_and_hints_name_every_state() {
+    let mock = MockOracle::answering("travel");
+    let mut cfg = stand_config(&mock.url());
+    cfg.auth.require = None;
+    // Without --oracle: the implicit open mode may not use the oracle.
+    let srv = Srv::open_with(
+        &toy().path,
+        tempfile::tempdir().unwrap(),
+        &cfg,
+        test_key(),
+        |_| {},
+    );
+    let r = srv.decide(&topics_body(&rejected()[0])).await;
+    assert_eq!(r.flags(), json!(["consent_off"]));
+    assert!(r.body["cmf"].get("hint").is_none(), "{}", r.text);
+    assert_eq!(mock.hits(), 0);
+    drop(srv);
+
+    // With --oracle it may; its feedback still teaches nothing.
+    let srv = Srv::open_with(
+        &toy().path,
+        tempfile::tempdir().unwrap(),
+        &cfg,
+        test_key(),
+        |o| o.oracle_from_flag = true,
+    );
+    assert_eq!(status(&srv).await, "ready");
+    assert_eq!(srv.get("/healthz").await.body["oracle_status"], "ready");
+    let r = srv.decide(&topics_body(&rejected()[0])).await;
+    assert_eq!(r.action(), "oracle", "{}", r.text);
+    assert_eq!(mock.hits(), 1);
+    let id = r.body["id"].as_str().unwrap().to_string();
+    let fb = srv
+        .post(
+            "/v1/feedback",
+            None,
+            &json!({"id": id, "question": "task", "label": "cards"}),
+        )
+        .await;
+    assert_eq!(fb.status, 200, "{}", fb.text);
+    assert_eq!(fb.body["learned"], false, "{}", fb.text);
+
+    // Switched off by the admin.
+    let s = srv
+        .admin("POST", "/v1/admin/oracle", Some(&json!({"enabled": false})))
+        .await;
+    assert_eq!(s.body["status"], "disabled", "{}", s.text);
+    let r = srv.decide(&topics_body(&rejected()[1])).await;
+    assert_eq!(r.flags(), json!(["oracle_disabled"]));
+    assert!(
+        r.body["cmf"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("switched off by the admin API"),
+        "{}",
+        r.text
+    );
+    enable(&srv).await;
+    assert_eq!(status(&srv).await, "ready");
+
+    // A stop rule.
+    mock.set(|_| raw_reply(401, r#"{"error":{"message":"bad key"}}"#));
+    let r = srv.decide(&topics_body(&rejected()[2])).await;
+    assert_eq!(r.flags(), json!(["oracle_unavailable"]));
+    assert_eq!(status(&srv).await, "stopped: http_401");
+    assert_eq!(
+        srv.get("/healthz").await.body["oracle_status"],
+        "stopped: http_401"
+    );
+    let r = srv.decide(&topics_body(&rejected()[3])).await;
+    assert_eq!(r.flags(), json!(["stopped"]));
+    assert!(
+        r.body["cmf"]["hint"]
+            .as_str()
+            .unwrap()
+            .starts_with("the oracle was stopped by a stop rule (http_401)"),
+        "{}",
+        r.text
+    );
+    // The router surface: no hint in its answer, with or without extensions.
+    let route = srv
+        .post(
+            "/v1/route",
+            None,
+            &json!({"input": {"text": rejected()[4]}, "taxonomy_id": "topics"}),
+        )
+        .await;
+    assert_eq!(route.status, 200, "{}", route.text);
+    assert!(!route.text.contains("hint"), "{}", route.text);
+    let h = srv.get("/v1/healthz").await;
+    assert_eq!(h.body["cmf"]["oracle_status"], "stopped: http_401");
+    enable(&srv).await;
+    assert_eq!(status(&srv).await, "ready");
+    assert_eq!(mock.hits(), 2);
 }

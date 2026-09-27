@@ -23,8 +23,9 @@
 //! - protocol and service: [`protocol`], [`matching`], [`answer`],
 //!   [`metering`], [`keys`], [`ledger`], [`config`], [`statedir`],
 //!   [`service`], [`shadow`] (the router API's shadow mode);
-//! - the oracle cascade: [`pii`], [`oracle`], [`cache`], [`buffer`],
-//!   [`learn`], [`generation`], [`cascade`].
+//! - the oracle cascade: [`pii`], [`oracle`], [`oracle_setup`] (the
+//!   two-step `--oracle MODEL`), [`cache`], [`buffer`], [`learn`],
+//!   [`generation`], [`cascade`].
 
 // Numerics core.
 pub mod certify;
@@ -74,4 +75,5 @@ pub mod cascade;
 pub mod generation;
 pub mod learn;
 pub mod oracle;
+pub mod oracle_setup;
 pub mod pii;
