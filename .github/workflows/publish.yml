@@ -26,10 +26,13 @@ jobs:
       # releases while the tags kept moving. Nothing said so: the loop
       # exits non-zero, but a manual workflow nobody re-reads is a
       # silent failure.
-      - name: Publish (core → engine → net → server → cli → ffi)
+      # `cortiq-decision` (0.7.8) depends on core and engine, and the
+      # server and cli depend on it, so it goes right after the engine —
+      # otherwise `cargo install cortiq-cli` has nothing to resolve.
+      - name: Publish (core → engine → decision → net → server → cli → ffi)
         run: |
           set -e
-          for c in cortiq-core cortiq-engine cortiq-net cortiq-server cortiq-cli cortiq-ffi; do
+          for c in cortiq-core cortiq-engine cortiq-decision cortiq-net cortiq-server cortiq-cli cortiq-ffi; do
             echo "── publishing $c ──"
             if cargo publish -p "$c" 2>err.log; then
               echo "$c published"

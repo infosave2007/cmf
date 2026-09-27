@@ -1,0 +1,1068 @@
+//! Oracle cascade, `cascade::Cascade` implementing `Escalator` (spec §5).
+//!
+//! The service calls [`Cascade`] only for undetermined questions (the gate
+//! rejected them, or they are untrained) and only after its own consent checks
+//! (`oracle.enabled`, the key's `oracle_allowed`, `cmf.oracle` /
+//! `default_per_request`). A question the gate accepted never reaches it (spec
+//! §5.1). For one request (spec §5.2):
+//! 1. **permission**: the admin switch, a key in the environment, no stop
+//!    reason, a budget left (globally, calls, the key's `oracle_budget_usd`
+//!    and what its `credit_usd` has left); otherwise every question is
+//!    refused (`oracle_disabled`, `no_key`, `stopped`, `budget`);
+//! 2. **cache** ([`crate::cache`]): a hit answers the question at no cost;
+//! 3. **single flight**: a question whose scope is in flight in another request
+//!    with cos φ_P ≥ `cache.threshold` waits for that call and reuses its answer
+//!    (as a cache answer); the others lead;
+//! 4. **one call** for every leading question ([`crate::oracle`]); the state is
+//!    PII-redacted when `oracle.redact_pii` is on and the request did not set
+//!    `cmf.allow_pii_egress` (flag `pii_redacted`);
+//! 5. **success**: the answers are cached (and logged; the scope holds the
+//!    question's contract, so an answer is reused only for the same
+//!    instructions and criteria), and a choice answer of a question matched
+//!    to a skill becomes an example of the learning buffer (source oracle)
+//!    when it may teach the shared skill: the caller's key has
+//!    `learning_allowed`, or the question is an exact match that asks exactly
+//!    the skill's own question ([`crate::service::SkillRuntime::follows_rubric`]
+//!    — the router's `task` question is one) so that the answer is the
+//!    skill's rubric applied to the text, not the caller's instructions
+//!    (never for the implicit open mode of a loopback address, `serve
+//!    --oracle` without keys: [`Principal::implicit_open`] — its answers are
+//!    only cached); an example that brings its label to `learning.refit_min_new` new examples
+//!    starts a learning attempt ([`crate::learn::attempt`]) — inline with
+//!    `learning.synchronous`, else on the one background worker;
+//! 6. **failure**: the question is failed (the service answers a trained one
+//!    locally with `abstain` + `oracle_unavailable`, an untrained one with 502).
+//!
+//! **Feedback** (spec §5.11): every decided question matched to a skill is kept
+//! in a ring of `feedback.pending_cap` entries (vectors only). `POST
+//! /v1/feedback` finds the caller's own entry (another account's is not found),
+//! takes a label among the question's options and adds an example of weight 3
+//! (a label the skill does not have starts a cold start) — only for a caller
+//! whose key has `learning_allowed` (the open mode with `auth.require: false`
+//! has it); anyone else's feedback is consumed and answered, but teaches
+//! nothing (`learned: false`).
+//!
+//! **Buffer limits**: at most [`MAX_EXAMPLES_PER_LABEL`] examples of one
+//! (skill, label) and [`MAX_PENDING_NEW_LABELS`] labels per skill that are
+//! not tasks of it yet (pending cold starts); an example past either limit is
+//! refused (`full`).
+//!
+//! **Admin** (spec §5b): oracle status and switches, learning status (buffer,
+//! cache, quarantine, attempts, task hashes), generations and rollback (the
+//! buffer is kept, the counters restart).
+//!
+//! **State** (`--state DIR`): `oracle.jsonl`, `oracle.state`, `learn.log`,
+//! `generations/`, `CURRENT`. At start the cache and the buffer are rebuilt from
+//! `learn.log` and the budget from `oracle.jsonl`.
+
+use crate::answer::OracleAnswer;
+use crate::buffer::{AddOutcome, Example, LearnLog, LearningBuffer, LogRecord, dot};
+use crate::cache::{CacheEntry, SemanticCache, scope_of};
+use crate::config::Config;
+use crate::container::{DecisionModel, Verify};
+use crate::generation;
+use crate::learn::{self, AttemptReport, Books, LearnContext, Outcome};
+use crate::matching::MatchKind;
+use crate::metering::Usd;
+use crate::oracle::{CallOutcome, Caller, KeyLookup, OracleClient, process_env};
+use crate::pii::{FLAG_PII_REDACTED, redact_value};
+use crate::protocol::{ApiError, FeedbackRequest, MAX_LABEL_BYTES, Question, QuestionKind};
+use crate::rows::{Rows, Source};
+use crate::service::{
+    AdminCommand, Escalation, EscalationResult, Escalator, ModelHandle, Observation, OracleStatus,
+    OracleUsage, Pending, Principal, RefusalReason, Resolution, Resolved,
+};
+use crate::statedir::StateDir;
+use anyhow::Result;
+use parking_lot::{Condvar, Mutex};
+use serde_json::{Value, json};
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+/// Attempts kept for `GET /v1/admin/learning`.
+pub const RECENT_ATTEMPTS: usize = 32;
+/// Extra wait of a single-flight follower beyond the oracle deadline.
+pub const FOLLOWER_GRACE: Duration = Duration::from_secs(5);
+/// `refused` of a feedback answer to a caller without `learning_allowed`.
+pub const LEARNING_NOT_ALLOWED: &str = "learning_not_allowed";
+/// Most examples of one (skill, label) in the learning buffer.
+pub const MAX_EXAMPLES_PER_LABEL: usize = 5_000;
+/// Most labels per skill in the buffer that are not tasks of the skill yet.
+pub const MAX_PENDING_NEW_LABELS: usize = 32;
+
+/// Options of [`Cascade::open_with`].
+#[derive(Clone)]
+pub struct CascadeOptions {
+    /// Where the oracle key is read from (the process environment by default).
+    pub key: KeyLookup,
+    /// Threads of a learning attempt (0: all cores).
+    pub threads: usize,
+    /// `created_unix` of new generations (`None`: `SOURCE_DATE_EPOCH` or 0).
+    pub created_unix: Option<u64>,
+}
+
+impl Default for CascadeOptions {
+    fn default() -> Self {
+        Self {
+            key: process_env(),
+            threads: 0,
+            created_unix: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for CascadeOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CascadeOptions")
+            .field("threads", &self.threads)
+            .field("created_unix", &self.created_unix)
+            .finish()
+    }
+}
+
+// ------------------------------------------------------------------ single flight
+
+#[derive(Debug, Default)]
+struct Slot {
+    result: Mutex<Option<Resolution>>,
+    ready: Condvar,
+}
+
+impl Slot {
+    fn set(&self, r: Resolution) {
+        let mut g = self.result.lock();
+        if g.is_none() {
+            *g = Some(r);
+        }
+        self.ready.notify_all();
+    }
+
+    fn wait(&self, timeout: Duration) -> Option<Resolution> {
+        let deadline = Instant::now() + timeout;
+        let mut g = self.result.lock();
+        while g.is_none() {
+            if self.ready.wait_until(&mut g, deadline).timed_out() {
+                break;
+            }
+        }
+        g.clone()
+    }
+}
+
+#[derive(Debug)]
+struct Flight {
+    id: u64,
+    scope: String,
+    phi_p: Vec<f32>,
+    slot: Arc<Slot>,
+}
+
+/// Removes a request's flights from the registry and resolves them (failed,
+/// unless the leader resolved them first) whatever happens.
+struct FlightGuard<'a> {
+    flights: &'a Mutex<Vec<Flight>>,
+    mine: Vec<(u64, Arc<Slot>)>,
+}
+
+impl Drop for FlightGuard<'_> {
+    fn drop(&mut self) {
+        let mut fl = self.flights.lock();
+        fl.retain(|f| !self.mine.iter().any(|(id, _)| *id == f.id));
+        drop(fl);
+        for (_, s) in &self.mine {
+            s.set(Resolution::Failed("single-flight leader ended".into()));
+        }
+    }
+}
+
+// ------------------------------------------------------------------ feedback ring
+
+/// Sparse features of a decided state (shared by its questions).
+#[derive(Debug)]
+struct SparseState {
+    phi_p: Vec<f32>,
+    h_idx: Vec<u16>,
+    h_val: Vec<f32>,
+}
+
+#[derive(Debug)]
+struct PendingEntry {
+    request_id: String,
+    question: String,
+    account: String,
+    skill: String,
+    options: Vec<String>,
+    state: Arc<SparseState>,
+}
+
+// ------------------------------------------------------------------ stats
+
+#[derive(Debug, Default)]
+struct Stats {
+    attempts: u64,
+    promotions: u64,
+    rejections: u64,
+    cold_starts: u64,
+    skipped: u64,
+    errors: u64,
+    isolation_violations: u64,
+    rollbacks: u64,
+    examples: u64,
+    feedback: u64,
+    recent: VecDeque<Value>,
+}
+
+struct Inner {
+    cfg: Config,
+    handle: Arc<ModelHandle>,
+    state: StateDir,
+    oracle: OracleClient,
+    cache: Mutex<SemanticCache>,
+    buffer: Mutex<LearningBuffer>,
+    log: LearnLog,
+    books: Mutex<Books>,
+    bases: Mutex<HashMap<String, Arc<Rows>>>,
+    flights: Mutex<Vec<Flight>>,
+    next_flight: AtomicU64,
+    /// Learning jobs sent to the worker and not finished.
+    queued: AtomicUsize,
+    pending: Mutex<VecDeque<PendingEntry>>,
+    learn_lock: Mutex<()>,
+    stats: Mutex<Stats>,
+    threads: usize,
+    created_unix: Option<u64>,
+}
+
+/// The oracle cascade (see the module notes).
+pub struct Cascade {
+    inner: Arc<Inner>,
+    jobs: Mutex<Option<mpsc::Sender<(String, String)>>>,
+    worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl std::fmt::Debug for Cascade {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Cascade")
+            .field("state", &self.inner.state.root())
+            .field("oracle", &self.inner.oracle)
+            .finish()
+    }
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+impl Cascade {
+    /// The cascade over the served `handle` with its state directory (the key
+    /// from the process environment).
+    pub fn open(handle: Arc<ModelHandle>, cfg: &Config, state: StateDir) -> Result<Arc<Self>> {
+        Self::open_with(handle, cfg, state, CascadeOptions::default())
+    }
+
+    /// [`Cascade::open`] with explicit options.
+    pub fn open_with(
+        handle: Arc<ModelHandle>,
+        cfg: &Config,
+        state: StateDir,
+        opts: CascadeOptions,
+    ) -> Result<Arc<Self>> {
+        cfg.validate()?;
+        let oracle = OracleClient::open(
+            &cfg.oracle,
+            &state.oracle_ledger_path(),
+            Some(&state.oracle_state_path()),
+            opts.key,
+        )?;
+        let (log, replayed) = LearnLog::open(&state.learn_log_path())?;
+        let mut cache = SemanticCache::new(cfg.cache.threshold, cfg.cache.cap);
+        let mut buffer = LearningBuffer::new(cfg.learning.dedup);
+        for r in &replayed.records {
+            match r {
+                LogRecord::CachePut(e) => {
+                    cache.put(e.clone());
+                }
+                other => buffer.apply(other),
+            }
+        }
+        tracing::info!(
+            cache = cache.len(),
+            examples = buffer.len(),
+            dropped_bytes = replayed.dropped_bytes,
+            "cascade state restored from learn.log"
+        );
+        let inner = Arc::new(Inner {
+            cfg: cfg.clone(),
+            handle,
+            state,
+            oracle,
+            cache: Mutex::new(cache),
+            buffer: Mutex::new(buffer),
+            log,
+            books: Mutex::new(Books::default()),
+            bases: Mutex::new(HashMap::new()),
+            flights: Mutex::new(Vec::new()),
+            next_flight: AtomicU64::new(1),
+            queued: AtomicUsize::new(0),
+            pending: Mutex::new(VecDeque::new()),
+            learn_lock: Mutex::new(()),
+            stats: Mutex::new(Stats::default()),
+            threads: opts.threads,
+            created_unix: opts.created_unix,
+        });
+        let (jobs, worker) = if cfg.learning.enabled && !cfg.learning.synchronous {
+            let (tx, rx) = mpsc::channel::<(String, String)>();
+            let w = Arc::clone(&inner);
+            let h = std::thread::Builder::new()
+                .name("cortiq-decision-learn".into())
+                .spawn(move || {
+                    while let Ok((skill, label)) = rx.recv() {
+                        w.maybe_learn(&skill, &label);
+                        w.queued.fetch_sub(1, Ordering::AcqRel);
+                    }
+                })?;
+            (Some(tx), Some(h))
+        } else {
+            (None, None)
+        };
+        Ok(Arc::new(Self {
+            inner,
+            jobs: Mutex::new(jobs),
+            worker: Mutex::new(worker),
+        }))
+    }
+
+    /// The oracle client (status, ledger totals).
+    pub fn oracle(&self) -> &OracleClient {
+        &self.inner.oracle
+    }
+
+    /// Entries of the semantic cache.
+    pub fn cache_len(&self) -> usize {
+        self.inner.cache.lock().len()
+    }
+
+    /// Examples of the learning buffer.
+    pub fn buffer_len(&self) -> usize {
+        self.inner.buffer.lock().len()
+    }
+
+    /// Examples of (skill, label) kept and added since its last attempt.
+    pub fn label_counts(&self, skill: &str, label: &str) -> (usize, usize) {
+        let b = self.inner.buffer.lock();
+        (b.examples(skill, label).len(), b.new_count(skill, label))
+    }
+
+    /// Run an attempt for (skill, label) now, whatever its counter.
+    pub fn learn_now(&self, skill: &str, label: &str) -> Result<AttemptReport> {
+        self.inner.run_attempt(skill, label)
+    }
+
+    /// Wait until the background worker has no queued job (tests, shutdown).
+    pub fn wait_idle(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while self.inner.queued.load(Ordering::Acquire) > 0 {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        true
+    }
+
+    /// `GET /v1/admin/learning`.
+    pub fn learning_json(&self) -> Value {
+        self.inner.learning_json()
+    }
+
+    fn schedule(&self, jobs: Vec<(String, String)>) {
+        if jobs.is_empty() {
+            return;
+        }
+        if self.inner.cfg.learning.synchronous {
+            for (s, l) in jobs {
+                self.inner.maybe_learn(&s, &l);
+            }
+        } else if let Some(tx) = self.jobs.lock().as_ref() {
+            for j in jobs {
+                self.inner.queued.fetch_add(1, Ordering::AcqRel);
+                if tx.send(j).is_err() {
+                    self.inner.queued.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for Cascade {
+    fn drop(&mut self) {
+        self.jobs.lock().take();
+        if let Some(h) = self.worker.lock().take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// A label a feedback can teach: 1..[`MAX_LABEL_BYTES`] bytes, as a task
+/// label of a skill manifest.
+fn learnable_label(label: &str) -> bool {
+    !label.is_empty() && label.len() <= MAX_LABEL_BYTES
+}
+
+/// Whether the oracle's answer to a pending question may become an example of
+/// the shared `skill` (see the module notes): the caller may teach, or the
+/// question is an exact match asking exactly the skill's own question — except
+/// for the implicit open mode of a loopback address, which never teaches.
+fn teaches(e: &Escalation<'_>, p: &Pending<'_>, skill: &str) -> bool {
+    e.principal.learning_allowed
+        || (!e.principal.implicit_open
+            && p.matched.kind == MatchKind::Exact
+            && e.model
+                .skill(skill)
+                .is_some_and(|s| s.follows_rubric(p.question)))
+}
+
+impl Inner {
+    fn base_rows(&self, model: &DecisionModel, skill: &str) -> Result<Arc<Rows>> {
+        let mut b = self.bases.lock();
+        if let Some(r) = b.get(skill) {
+            return Ok(Arc::clone(r));
+        }
+        let r = Arc::new(model.rows(skill)?);
+        b.insert(skill.to_string(), Arc::clone(&r));
+        Ok(r)
+    }
+
+    /// φ_P of the stored rows of a label (base rows and `rows.learned`).
+    fn stored_phi(&self, model: &DecisionModel, skill: &str, label: &str) -> Result<Vec<Vec<f32>>> {
+        let Some(s) = model.skill(skill) else {
+            return Ok(Vec::new());
+        };
+        let Some(t) = s.manifest.task_of(label) else {
+            return Ok(Vec::new());
+        };
+        let t = t as u32;
+        let base = self.base_rows(model, skill)?;
+        let mut out: Vec<Vec<f32>> = base
+            .rows
+            .iter()
+            .filter(|r| r.task == t)
+            .map(|r| r.phi_p.clone())
+            .collect();
+        if let Some(l) = model.rows_learned(skill)? {
+            out.extend(l.rows.into_iter().filter(|r| r.task == t).map(|r| r.phi_p));
+        }
+        Ok(out)
+    }
+
+    /// Add an example (dedup), log it; the (skill, label) to consider for
+    /// learning when it reached the threshold.
+    fn add_example(&self, ex: Example) -> Result<(AddOutcome, Option<(String, String)>)> {
+        let model = self.handle.current();
+        let stored = self.stored_phi(model.model(), &ex.skill, &ex.label)?;
+        let refs: Vec<&[f32]> = stored.iter().map(Vec::as_slice).collect();
+        let key = (ex.skill.clone(), ex.label.clone());
+        let is_task = |label: &str| {
+            model
+                .model()
+                .skill(&ex.skill)
+                .is_some_and(|s| s.manifest.task_of(label).is_some())
+        };
+        let mut b = self.buffer.lock();
+        let held = b.examples(&ex.skill, &ex.label).len();
+        if held >= MAX_EXAMPLES_PER_LABEL {
+            return Ok((AddOutcome::Full, None));
+        }
+        if held == 0 && !is_task(&ex.label) {
+            let pending_new = b
+                .labels()
+                .iter()
+                .filter(|c| c.skill == ex.skill && !is_task(&c.label))
+                .count();
+            if pending_new >= MAX_PENDING_NEW_LABELS {
+                return Ok((AddOutcome::Full, None));
+            }
+        }
+        if b.is_duplicate(&ex.skill, &ex.label, &ex.phi_p, &refs) {
+            b.count_duplicate();
+            return Ok((AddOutcome::Duplicate, None));
+        }
+        self.log.append(&LogRecord::Example(ex.clone()))?;
+        b.insert(ex);
+        self.stats.lock().examples += 1;
+        let due = b.new_count(&key.0, &key.1) >= self.cfg.learning.refit_min_new;
+        Ok((AddOutcome::Stored, due.then_some(key)))
+    }
+
+    fn maybe_learn(&self, skill: &str, label: &str) {
+        let due = self.buffer.lock().new_count(skill, label) >= self.cfg.learning.refit_min_new;
+        if !due {
+            return;
+        }
+        if let Err(e) = self.run_attempt(skill, label) {
+            // Labels may come from client feedback: the line names the
+            // label's hash only (spec §4.3), also inside the error text.
+            tracing::error!(
+                error = %learn::redact_label(&format!("{e:#}"), label),
+                skill,
+                label_sha = %learn::label_tag(label),
+                "learning attempt failed"
+            );
+        }
+    }
+
+    fn run_attempt(&self, skill: &str, label: &str) -> Result<AttemptReport> {
+        let _g = self.learn_lock.lock();
+        let base_rows = |m: &DecisionModel, s: &str| self.base_rows(m, s);
+        let ctx = LearnContext {
+            handle: &self.handle,
+            state: &self.state,
+            buffer: &self.buffer,
+            log: &self.log,
+            books: &self.books,
+            cfg: &self.cfg.learning,
+            base_rows: &base_rows,
+            threads: self.threads,
+            created_unix: self.created_unix,
+        };
+        let r = learn::attempt(&ctx, skill, label);
+        let mut st = self.stats.lock();
+        st.attempts += 1;
+        match &r {
+            Ok(rep) => {
+                match &rep.outcome {
+                    Outcome::Promoted { .. } => {
+                        st.promotions += 1;
+                        if rep.kind == Some(learn::ChangeKind::ColdStart) {
+                            st.cold_starts += 1;
+                        }
+                    }
+                    Outcome::Rejected(_) => st.rejections += 1,
+                    Outcome::Skipped(_) => st.skipped += 1,
+                }
+                st.isolation_violations += rep.isolation_violations as u64;
+                st.recent.push_back(rep.to_json());
+            }
+            Err(e) => {
+                st.errors += 1;
+                st.recent.push_back(json!({"skill": skill, "label": label, "outcome": "error", "reason": format!("{e:#}")}));
+            }
+        }
+        while st.recent.len() > RECENT_ATTEMPTS {
+            st.recent.pop_front();
+        }
+        r
+    }
+
+    fn learning_json(&self) -> Value {
+        let model = self.handle.current();
+        let b = self.buffer.lock();
+        let labels = b.labels();
+        let mut quarantine = Vec::new();
+        let mut buffer = Vec::new();
+        for l in &labels {
+            let active = model
+                .skill(&l.skill)
+                .and_then(|s| {
+                    s.manifest()
+                        .task_of(&l.label)
+                        .map(|t| s.manifest().tasks[t].is_active())
+                })
+                .unwrap_or(false);
+            let v = json!({"skill": l.skill, "label": l.label, "examples": l.total, "new": l.new});
+            if !active {
+                quarantine.push(v.clone());
+            }
+            buffer.push(v);
+        }
+        let total = b.len();
+        let dups = b.duplicates();
+        drop(b);
+        let c = self.cache.lock();
+        let cache = json!({"entries": c.len(), "hits": c.hits(), "lookups": c.lookups(),
+                           "threshold": c.threshold(), "enabled": self.cfg.cache.enabled});
+        drop(c);
+        let mut tasks = serde_json::Map::new();
+        for s in model.skills() {
+            let m: serde_json::Map<String, Value> = s
+                .manifest()
+                .tasks
+                .iter()
+                .map(|t| {
+                    (
+                        t.label.clone(),
+                        json!({"i": t.i, "state": t.state, "origin": t.origin, "k": t.k,
+                               "n_train": t.n_train, "mean_sha256": t.mean_sha256,
+                               "basis_sha256": t.basis_sha256}),
+                    )
+                })
+                .collect();
+            tasks.insert(
+                s.id().to_string(),
+                json!({"taxonomy_version": s.manifest().taxonomy_version, "tasks": m}),
+            );
+        }
+        let st = self.stats.lock();
+        json!({
+            "enabled": self.cfg.learning.enabled,
+            "synchronous": self.cfg.learning.synchronous,
+            "cold_start": self.cfg.learning.cold_start,
+            "refit_min_new": self.cfg.learning.refit_min_new,
+            "dedup": self.cfg.learning.dedup,
+            "generation": model.generation(),
+            "model_sha": model.model_sha(),
+            "buffer": {"examples": total, "duplicates_refused": dups, "labels": buffer},
+            "quarantine": quarantine,
+            "cache": cache,
+            "pending_feedback": self.pending.lock().len(),
+            "attempts": st.attempts, "promotions": st.promotions, "rejections": st.rejections,
+            "cold_starts": st.cold_starts, "skipped": st.skipped, "errors": st.errors,
+            "isolation_violations": st.isolation_violations, "rollbacks": st.rollbacks,
+            "examples_added": st.examples, "feedback": st.feedback,
+            "recent": st.recent.iter().cloned().collect::<Vec<_>>(),
+            "skills": Value::Object(tasks),
+        })
+    }
+
+    fn rollback(&self, to: u64) -> Result<Value, ApiError> {
+        let _g = self.learn_lock.lock();
+        let current = self.handle.current();
+        let base = current.model().base_path().to_path_buf();
+        let model = generation::rollback(&self.state, &base, to, Verify::Light).map_err(|e| {
+            let msg = format!("{e:#}");
+            if msg.contains("does not exist") {
+                ApiError::not_found(msg)
+            } else {
+                ApiError::invalid(msg)
+            }
+        })?;
+        let next = current.derive(model).map_err(|e| {
+            tracing::error!(error = %e, "rollback: the model does not load");
+            ApiError::internal("the generation does not load")
+        })?;
+        let name = next.name();
+        let sha = next.model_sha().to_string();
+        self.handle.promote(next);
+        self.books.lock().invalidate();
+        self.buffer.lock().reset_all();
+        if let Err(e) = self.log.append(&LogRecord::Rollback { generation: to }) {
+            tracing::error!(error = %e, "learn.log: could not record the rollback");
+        }
+        self.stats.lock().rollbacks += 1;
+        Ok(
+            json!({"generation": to, "model": name, "model_sha": sha, "buffer_kept": true, "counters_reset": true}),
+        )
+    }
+}
+
+impl Escalator for Cascade {
+    fn escalate(&self, e: &Escalation<'_>) -> EscalationResult {
+        let inner = &self.inner;
+        let cfg = &inner.cfg;
+        let n = e.pending.len();
+        let caller = Caller {
+            request_id: e.request_id,
+            account: &e.principal.account,
+            key12: e.principal.key12.as_deref(),
+            key_budget_usd: e.principal.oracle_budget_usd.map(Usd::to_f64),
+            credit_left_usd: e.oracle_credit_usd,
+        };
+        // The state as it would leave for the oracle (PII redacted unless
+        // the request allows its egress), and whether it was redacted.
+        let egress_state = || {
+            let raw = e.request.state.to_value();
+            if cfg.oracle.redact_pii && !e.request.cmf.allow_pii_egress {
+                redact_value(&raw)
+            } else {
+                (raw, false)
+            }
+        };
+        if let Err(r) = inner.oracle.permission(&caller) {
+            if r == RefusalReason::Budget {
+                // Refused before a body was built: the status and the hints
+                // name what this request's call would reserve.
+                let qs: Vec<&Question> = e.pending.iter().map(|p| p.question).collect();
+                inner.oracle.note_budget_refusal(&qs, &egress_state().0);
+            }
+            return EscalationResult {
+                resolved: (0..n)
+                    .map(|_| Resolved::new(Resolution::Refused(r)))
+                    .collect(),
+                usage: OracleUsage::default(),
+            };
+        }
+        let phi = &e.features.phi_p;
+        let scopes: Vec<String> = e
+            .pending
+            .iter()
+            .map(|p| scope_of(p.question, p.matched))
+            .collect();
+        let mut out: Vec<Option<Resolved>> = vec![None; n];
+
+        // 2. Cache.
+        if cfg.cache.enabled {
+            let mut c = inner.cache.lock();
+            for i in 0..n {
+                if let Some((a, _)) = c.get(&scopes[i], phi) {
+                    out[i] = Some(Resolved::new(Resolution::Cache(a)));
+                }
+            }
+        }
+
+        // 3. Single flight.
+        let mut leaders = Vec::new();
+        let mut followers: Vec<(usize, Arc<Slot>)> = Vec::new();
+        let mut guard = FlightGuard {
+            flights: &inner.flights,
+            mine: Vec::new(),
+        };
+        {
+            let mut fl = inner.flights.lock();
+            for i in 0..n {
+                if out[i].is_some() {
+                    continue;
+                }
+                let found = fl.iter().find(|f| {
+                    f.scope == scopes[i]
+                        && f.phi_p.len() == phi.len()
+                        && dot(&f.phi_p, phi) >= cfg.cache.threshold
+                });
+                if let Some(f) = found {
+                    followers.push((i, Arc::clone(&f.slot)));
+                    continue;
+                }
+                // A leader that finished between the first cache lookup and
+                // this registration left its answer in the cache.
+                if cfg.cache.enabled
+                    && let Some((a, _)) = inner.cache.lock().recheck(&scopes[i], phi)
+                {
+                    out[i] = Some(Resolved::new(Resolution::Cache(a)));
+                } else {
+                    let id = inner.next_flight.fetch_add(1, Ordering::Relaxed);
+                    let slot = Arc::new(Slot::default());
+                    fl.push(Flight {
+                        id,
+                        scope: scopes[i].clone(),
+                        phi_p: phi.clone(),
+                        slot: Arc::clone(&slot),
+                    });
+                    guard.mine.push((id, slot));
+                    leaders.push(i);
+                }
+            }
+        }
+
+        // 4. One call for the leaders.
+        let mut usage = OracleUsage::default();
+        let mut learn_jobs: Vec<(String, String)> = Vec::new();
+        if !leaders.is_empty() {
+            let (state, redacted) = egress_state();
+            let qs: Vec<&Question> = leaders.iter().map(|&i| e.pending[i].question).collect();
+            let outcome = inner.oracle.call(&caller, &qs, &state);
+            let flags: Vec<String> = if redacted {
+                vec![FLAG_PII_REDACTED.to_string()]
+            } else {
+                Vec::new()
+            };
+            match outcome {
+                CallOutcome::Answered(a) => {
+                    usage = OracleUsage {
+                        calls: 1,
+                        input_tokens: a.usage.input_tokens,
+                        output_tokens: a.usage.output_tokens,
+                        cost: Usd::from_f64(a.usage.cost).unwrap_or_else(|_| {
+                            tracing::error!("oracle cost not representable");
+                            Usd::from_units(0).expect("zero")
+                        }),
+                    };
+                    let ts = now_unix();
+                    for (k, &i) in leaders.iter().enumerate() {
+                        let v = a.verdicts[k].clone();
+                        out[i] = Some(Resolved {
+                            resolution: Resolution::Oracle(v.clone()),
+                            flags: flags.clone(),
+                        });
+                        guard.mine[k].1.set(Resolution::Oracle(v.clone()));
+                        if cfg.cache.enabled {
+                            let entry = CacheEntry {
+                                scope: scopes[i].clone(),
+                                phi_p: phi.clone(),
+                                answer: v.clone(),
+                                ts,
+                            };
+                            let stored = inner.cache.lock().put(entry.clone());
+                            if stored
+                                && let Err(err) = inner.log.append(&LogRecord::CachePut(entry))
+                            {
+                                tracing::error!(error = %err, "learn.log: cache put not recorded");
+                            }
+                        }
+                        let p = &e.pending[i];
+                        if let (true, Some(skill), OracleAnswer::Choice(label)) =
+                            (cfg.learning.enabled, &p.matched.skill, &v)
+                            && teaches(e, p, skill)
+                        {
+                            let ex = Example::from_features(
+                                skill,
+                                label,
+                                Source::Oracle,
+                                e.features,
+                                ts,
+                            );
+                            match inner.add_example(ex) {
+                                Ok((_, Some(job))) => learn_jobs.push(job),
+                                Ok(_) => {}
+                                Err(err) => {
+                                    tracing::error!(error = %format!("{err:#}"), "learning buffer")
+                                }
+                            }
+                        }
+                    }
+                }
+                CallOutcome::Failed(f) => {
+                    tracing::warn!(request = e.request_id, error = %f.error, "oracle call failed");
+                    for (k, &i) in leaders.iter().enumerate() {
+                        let r = Resolution::Failed(f.error.clone());
+                        guard.mine[k].1.set(r.clone());
+                        out[i] = Some(Resolved {
+                            resolution: r,
+                            flags: flags.clone(),
+                        });
+                    }
+                }
+                CallOutcome::Refused(r) => {
+                    for (k, &i) in leaders.iter().enumerate() {
+                        guard.mine[k].1.set(Resolution::Refused(r));
+                        out[i] = Some(Resolved::new(Resolution::Refused(r)));
+                    }
+                }
+            }
+        }
+        drop(guard);
+
+        // Followers wait for their leader.
+        let wait = Duration::from_secs_f64(cfg.oracle.deadline_s) + FOLLOWER_GRACE;
+        for (i, slot) in followers {
+            let r = match slot.wait(wait) {
+                Some(Resolution::Oracle(a)) => Resolution::Cache(a),
+                Some(other) => other,
+                None => Resolution::Failed("single-flight wait timed out".into()),
+            };
+            out[i] = Some(Resolved::new(r));
+        }
+
+        self.schedule(learn_jobs);
+        EscalationResult {
+            resolved: out
+                .into_iter()
+                .map(|r| {
+                    r.unwrap_or_else(|| Resolved::new(Resolution::Failed("unresolved".into())))
+                })
+                .collect(),
+            usage,
+        }
+    }
+
+    fn feedback(&self, fb: &FeedbackRequest, principal: &Principal) -> Result<Value, ApiError> {
+        let inner = &self.inner;
+        if !inner.cfg.learning.enabled {
+            return Err(ApiError::not_found(
+                "learning is disabled on this server: feedback is not kept",
+            ));
+        }
+        let not_found = || {
+            ApiError::not_found(format!(
+                "no pending decision {} / question {} for this account",
+                fb.id, fb.question
+            ))
+        };
+        let entry = {
+            let mut ring = inner.pending.lock();
+            let pos = ring
+                .iter()
+                .position(|p| {
+                    p.request_id == fb.id
+                        && p.question == fb.question
+                        && p.account == principal.account
+                })
+                .ok_or_else(not_found)?;
+            // The router API's feedback may name any label (a new one starts a
+            // cold start, router `api.rs:1283-1292`); the decisions API's only
+            // an option of the question.
+            if fb.any_label && !learnable_label(&fb.label) {
+                // The router accepts an empty or over-long label too (200,
+                // the request consumed); it names no task that could be
+                // learned, so nothing is stored here.
+                let entry = ring.remove(pos).ok_or_else(not_found)?;
+                inner.stats.lock().feedback += 1;
+                return Ok(json!({
+                    "id": fb.id, "question": fb.question, "skill": entry.skill,
+                    "accepted": false, "learned": false,
+                    "reason": format!(
+                        "the label must be 1..{MAX_LABEL_BYTES} bytes to be learned"
+                    ),
+                }));
+            }
+            if !fb.any_label && !ring[pos].options.contains(&fb.label) {
+                return Err(ApiError::invalid_field(
+                    "label",
+                    format!(
+                        "'{}' is not an option of question {}",
+                        fb.label, fb.question
+                    ),
+                ));
+            }
+            ring.remove(pos).ok_or_else(not_found)?
+        };
+        let model = inner.handle.current();
+        let known = model
+            .skill(&entry.skill)
+            .and_then(|s| s.manifest().task_of(&fb.label))
+            .is_some();
+        if !principal.learning_allowed {
+            // The entry is consumed, as a learned feedback's is; nothing is
+            // stored, so no key without the permission writes to the model
+            // every account is served.
+            inner.stats.lock().feedback += 1;
+            return Ok(json!({
+                "id": fb.id, "question": fb.question, "skill": entry.skill, "label": fb.label,
+                "accepted": false, "learned": false, "known_label": known,
+                "refused": LEARNING_NOT_ALLOWED,
+                "reason": "this key may not teach the model (learning_allowed is false)",
+            }));
+        }
+        let ex = Example {
+            skill: entry.skill.clone(),
+            label: fb.label.clone(),
+            source: Source::ClientFeedback,
+            weight: Source::ClientFeedback.default_weight(),
+            ts: now_unix(),
+            phi_p: entry.state.phi_p.clone(),
+            h_idx: entry.state.h_idx.clone(),
+            h_val: entry.state.h_val.clone(),
+        };
+        let (added, job) = inner.add_example(ex).map_err(|e| {
+            tracing::error!(
+                error = %learn::redact_label(&format!("{e:#}"), &fb.label),
+                "feedback example"
+            );
+            ApiError::internal("the feedback could not be stored")
+        })?;
+        inner.stats.lock().feedback += 1;
+        let (total, new) = {
+            let b = inner.buffer.lock();
+            (
+                b.examples(&entry.skill, &fb.label).len(),
+                b.new_count(&entry.skill, &fb.label),
+            )
+        };
+        let mut learning = Value::Null;
+        if let Some((s, l)) = job {
+            if inner.cfg.learning.synchronous {
+                learning = match inner.run_attempt(&s, &l) {
+                    Ok(r) => r.to_json(),
+                    Err(e) => json!({"outcome": "error", "reason": format!("{e:#}")}),
+                };
+            } else {
+                self.schedule(vec![(s, l)]);
+                learning = json!({"outcome": "scheduled"});
+            }
+        }
+        Ok(json!({
+            "id": fb.id, "question": fb.question, "skill": entry.skill, "label": fb.label,
+            "accepted": added == AddOutcome::Stored, "learned": added == AddOutcome::Stored,
+            "duplicate": added == AddOutcome::Duplicate, "full": added == AddOutcome::Full,
+            "known_label": known, "cold_start": !known, "weight": Source::ClientFeedback.default_weight(),
+            "examples": total, "new_examples": new, "refit_min_new": inner.cfg.learning.refit_min_new,
+            "learning": learning,
+        }))
+    }
+
+    fn admin(&self, command: &AdminCommand) -> Result<Value, ApiError> {
+        let inner = &self.inner;
+        match command {
+            AdminCommand::OracleStatus => {
+                let mut v = inner.oracle.status_json();
+                v["configured"] = json!(inner.cfg.oracle.enabled);
+                Ok(v)
+            }
+            AdminCommand::OracleUpdate(body) => {
+                let mut v = inner.oracle.update(body)?;
+                v["configured"] = json!(inner.cfg.oracle.enabled);
+                Ok(v)
+            }
+            AdminCommand::Learning => Ok(inner.learning_json()),
+            AdminCommand::Generations => {
+                let list = generation::list(&inner.state).map_err(|e| {
+                    tracing::error!(error = %format!("{e:#}"), "generations");
+                    ApiError::internal("the generations could not be listed")
+                })?;
+                let current = inner.handle.current();
+                Ok(json!({
+                    "current": current.generation(),
+                    "model": current.name(),
+                    "base_model_sha": current.model().base_model_sha(),
+                    "generations": list.iter().map(generation::GenerationInfo::to_json).collect::<Vec<_>>(),
+                }))
+            }
+            AdminCommand::Rollback { generation } => inner.rollback(*generation),
+        }
+    }
+
+    fn oracle_status(&self) -> Option<OracleStatus> {
+        Some(self.inner.oracle.status())
+    }
+
+    fn observe(&self, o: &Observation<'_>) {
+        let inner = &self.inner;
+        if !inner.cfg.learning.enabled {
+            return;
+        }
+        let mut shared: Option<Arc<SparseState>> = None;
+        let mut new = Vec::new();
+        for q in o.questions {
+            let Some(skill) = &q.matched.skill else {
+                continue;
+            };
+            if q.kind != QuestionKind::Choice {
+                continue;
+            }
+            let Some(question) = o.request.question(&q.id) else {
+                continue;
+            };
+            let st = shared.get_or_insert_with(|| {
+                let (h_idx, h_val) = crate::rows::sparse_from_dense(&o.features.phi_h);
+                Arc::new(SparseState {
+                    phi_p: o.features.phi_p.clone(),
+                    h_idx,
+                    h_val,
+                })
+            });
+            new.push(PendingEntry {
+                request_id: o.request_id.to_string(),
+                question: q.id.clone(),
+                account: o.principal.account.clone(),
+                skill: skill.clone(),
+                options: question.options().into_iter().map(str::to_string).collect(),
+                state: Arc::clone(st),
+            });
+        }
+        if new.is_empty() {
+            return;
+        }
+        let cap = inner.cfg.feedback.pending_cap;
+        let mut ring = inner.pending.lock();
+        for p in new {
+            if ring.len() >= cap {
+                ring.pop_front();
+            }
+            ring.push_back(p);
+        }
+    }
+}

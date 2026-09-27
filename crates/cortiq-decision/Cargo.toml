@@ -1,0 +1,49 @@
+[package]
+name = "cortiq-decision"
+version.workspace = true
+edition.workspace = true
+description = "Cortiq Decision: typed decisions (choice, score, yes/no) from one CMF file — a native BERT encoder, a hashing contract and certified resonance skills, an OpenRouter-shaped decisions API and an opt-in oracle cascade."
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords = ["cmf", "classification", "decisions", "embeddings", "router"]
+categories = ["science"]
+rust-version.workspace = true
+
+# Every dependency below was already in the workspace Cargo.lock before this
+# crate existed: it adds no package to the tree (spec decision-v4 §0). No GPU
+# backend is linked in on its behalf — the encoder runs on
+# `cortiq_engine::fcd_ops::gemm_nt_host`.
+[dependencies]
+cortiq-core = { path = "../cortiq-core", version = "0.7.8" }
+cortiq-engine = { path = "../cortiq-engine", version = "0.7.8" }
+serde = { workspace = true }
+# Canonical JSON and the Jev criteria order need insertion-ordered maps.
+serde_json = { workspace = true, features = ["preserve_order"] }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# Tensor, manifest and key hashes.
+sha2 = "0.10"
+# Constant-time API key comparison.
+subtle = "2.6"
+# Oracle client (OpenRouter, rustls) — the same ureq the engine and cli use.
+ureq = { version = "2", features = ["json", "tls"] }
+# NFD for the WordPiece normalizer (strip accents).
+unicode-normalization = { workspace = true }
+parking_lot = "0.12"
+crc32fast = "1"
+# API keys from the OS RNG.
+rand_core = { version = "0.6", features = ["getrandom"] }
+bytemuck = "1"
+
+# `tempfile` is test-only (spec decision-v4 §0: "tempfile (dev)"); before this
+# crate it was only a dev-dependency of cortiq-spectra, so a runtime entry here would
+# pull it into the published cortiq-server / cortiq-cli trees. The no-clobber
+# writer (spec §3.1) uses std: a `create_new` temp file in the output's
+# directory, `sync_all`, then `std::fs::hard_link(tmp, out)` (fails with
+# AlreadyExists instead of overwriting) and removal of the temp name.
+[dev-dependencies]
+tempfile = "3"

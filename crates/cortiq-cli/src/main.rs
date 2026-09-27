@@ -4,6 +4,7 @@
 mod avout;
 mod awnp;
 mod convert;
+mod decision;
 mod gguf;
 mod gptq;
 mod http_range;
@@ -246,19 +247,62 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start the inference server with web dashboard
+    /// Start the inference server with web dashboard (on a decision file:
+    /// the decisions API, see `cortiq decision`)
     Serve {
         /// Path to .cmf model file
         model: String,
         /// Port to listen on
         #[arg(short, long, default_value = "8080")]
         port: u16,
-        /// Host / interface to bind (use 127.0.0.1 for local-only)
-        #[arg(long, default_value = "0.0.0.0")]
-        host: String,
-        /// Default task mask
-        #[arg(short, long, default_value = "general")]
-        task: String,
+        /// Host / interface to bind [default: 0.0.0.0; 127.0.0.1 for a
+        /// decision file]
+        #[arg(long)]
+        host: Option<String>,
+        /// Default task mask [default: general]
+        #[arg(short, long)]
+        task: Option<String>,
+        /// Decision file only: server configuration JSON (keys, limits,
+        /// prices, oracle, cache, learning)
+        #[arg(long)]
+        decision_config: Option<String>,
+        /// Decision file only: state directory (keys, usage and oracle
+        /// ledgers, generations) [default: <MODEL>.state]
+        #[arg(long)]
+        state: Option<String>,
+        /// Decision file only: remove a state LOCK left by a dead process
+        #[arg(long)]
+        break_lock: bool,
+        /// Decision file only: shadow mode for switching production traffic
+        /// from cortiq-router (router-API paths only). Every router-API
+        /// request (/v1/route, /v1/route:batch, /v1/feedback,
+        /// /v1/taxonomies, /v1/usage, /v1/escalations, /v1/healthz,
+        /// /v1/readyz, /metrics, /v1/admin/keys) is forwarded unchanged to
+        /// the old router at URL (https; http only to a loopback address),
+        /// with the client's Authorization header, and the client gets the
+        /// old router's answer byte for byte, errors included (502
+        /// UPSTREAM_UNAVAILABLE only when it gives no answer). A /v1/route or
+        /// /v1/route:batch the old router answered 200 is also decided
+        /// locally after that answer — no oracle, no learning, no billing,
+        /// 4 comparison slots of its own (64 more may wait; one past that
+        /// is dropped) — and one line per input is appended to
+        /// <state>/shadow.jsonl: {ts, request_id_old, text_hmac (HMAC-SHA256
+        /// under <state>/shadow.key, never the text), taxonomy, old_label,
+        /// new_label, agree, old_confident, new_confident, old_latency_ms,
+        /// new_latency_ms, old_status, new_error}; other answers are neither
+        /// decided nor written. GET /v1/admin/shadow (x-admin-token) returns
+        /// the agreement overall, by confidence and per label
+        #[arg(long, value_name = "URL")]
+        shadow_of: Option<String>,
+        /// Decision file only, with --shadow-of: deadline of one request
+        /// forwarded to the old router, connect to last byte, in seconds
+        /// (default 60, nginx's proxy_read_timeout; raise it for long
+        /// batches the old router escalates input by input). An old router
+        /// that does not answer in time gives 502 UPSTREAM_UNAVAILABLE
+        #[arg(long, value_name = "SECONDS", requires = "shadow_of")]
+        shadow_timeout_s: Option<u64>,
+        #[command(flatten)]
+        oracle: decision::OracleArgs,
         /// Also listen on ollama-compatible port
         #[arg(long)]
         compat_port: Option<u16>,
@@ -296,6 +340,17 @@ enum Commands {
         /// does not. The server prints which mode it took and why.
         #[arg(long, conflicts_with = "peer")]
         gpus: Option<usize>,
+    },
+    /// Decide with a decision file: one text (-p) or a JSONL batch (--input);
+    /// locally, and with --oracle MODEL (the key in OPENROUTER_API_KEY) an
+    /// OpenRouter model answers only what the local model cannot decide
+    Decide(decision::DecideArgs),
+    /// Decision files: build (init, train, add-skill, learn), inspect (info,
+    /// verify), generations (materialize, rollback), API keys and the oracle
+    /// check (`decision oracle check`)
+    Decision {
+        #[command(subcommand)]
+        cmd: decision::DecisionCmd,
     },
     /// Convert a Hugging Face checkpoint to .cmf — native Rust, no Python
     Convert {
@@ -1952,7 +2007,11 @@ enum SkillCmd {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    // A usage error never echoes an argument that looks like a key.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => decision::exit_on_clap_error(e),
+    };
 
     // The engine cannot depend on the CLI, but the draft's device pack wants
     // the converter's q2tp encoder to requantize its experts at upload —
@@ -1965,12 +2024,30 @@ async fn main() -> anyhow::Result<()> {
     // default. RUST_LOG overrides either way.
     let default_level = match &cli.command {
         Commands::Run { .. } => "warn",
+        // `decide` prints its answer (and its batch totals on stderr), and
+        // with --oracle its own hint: the service's is worded for a server.
+        Commands::Decide(_) => "warn,cortiq_decision::service=error",
         _ => "info",
     };
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| default_level.into());
-    let shutdown_filter =
-        tracing_subscriber::filter::filter_fn(|_| TRACING_LIVE.load(AtomicOrdering::Relaxed));
+    // Past the shutdown gate; and for `serve --shadow-of`, never a
+    // DEBUG/TRACE line of a target that prints forwarded request headers
+    // (ureq's request prelude: the client keys and admin token the shadow
+    // server forwards), whatever RUST_LOG says. Every other command keeps
+    // ureq's debug lines (downloads).
+    let forwards_secrets = matches!(
+        &cli.command,
+        Commands::Serve {
+            shadow_of: Some(_),
+            ..
+        }
+    );
+    let shutdown_filter = tracing_subscriber::filter::filter_fn(move |m| {
+        TRACING_LIVE.load(AtomicOrdering::Relaxed)
+            && !(forwards_secrets
+                && cortiq_decision::shadow::log_may_carry_secrets(m.target(), m.level()))
+    });
     tracing_subscriber::registry()
         .with(env_filter)
         .with(
@@ -1988,6 +2065,12 @@ async fn main() -> anyhow::Result<()> {
             port,
             host,
             task,
+            decision_config,
+            state,
+            break_lock,
+            shadow_of,
+            shadow_timeout_s,
+            oracle,
             compat_port,
             o1,
             o1_m,
@@ -1999,6 +2082,30 @@ async fn main() -> anyhow::Result<()> {
             net_dtype,
             gpus,
         } => {
+            // The language-model flags a decision file refuses (spec §4.2).
+            let llm_given: Vec<&'static str> = [
+                ("--task", task.is_some()),
+                ("--compat-port", compat_port.is_some()),
+                ("--o1", o1.is_some()),
+                ("--o1-m", o1_m.is_some()),
+                ("--o1-window", o1_window.is_some()),
+                ("--o1-sink", o1_sink.is_some()),
+                ("--peer", peer.is_some()),
+                ("--peer-split", peer_split.is_some()),
+                ("--net-token", net_token.is_some()),
+                ("--gpus", gpus.is_some()),
+            ]
+            .into_iter()
+            .filter_map(|(name, given)| given.then_some(name))
+            .collect();
+            let decision_flags = decision::ServeFlags {
+                decision_config: decision_config.map(Into::into),
+                state: state.map(Into::into),
+                break_lock,
+                shadow_of,
+                shadow_timeout_s,
+                oracle,
+            };
             let o1 = O1Flags {
                 spec: o1,
                 m: o1_m,
@@ -2008,9 +2115,11 @@ async fn main() -> anyhow::Result<()> {
             };
             cmd_serve(
                 &model,
-                &host,
+                host.as_deref(),
                 port,
-                &task,
+                task.as_deref(),
+                &llm_given,
+                &decision_flags,
                 compat_port,
                 &o1,
                 peer.as_deref(),
@@ -2021,6 +2130,8 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         }
+        Commands::Decide(args) => decision::run_decide(&args),
+        Commands::Decision { cmd } => decision::run_decision(&cmd),
         Commands::Convert {
             model,
             quant,
@@ -3056,9 +3167,11 @@ async fn main() -> anyhow::Result<()> {
 #[allow(clippy::too_many_arguments)]
 async fn cmd_serve(
     model_path: &str,
-    host: &str,
+    host: Option<&str>,
     port: u16,
-    default_task: &str,
+    default_task: Option<&str>,
+    llm_given: &[&'static str],
+    decision_flags: &decision::ServeFlags,
     _compat_port: Option<u16>,
     o1: &O1Flags,
     peer: Option<&str>,
@@ -3076,6 +3189,16 @@ async fn cmd_serve(
     // Load model + pipeline (real weights; fails loudly on a bad file).
     println!("  Loading model: {}", model_path);
     let model = Arc::new(CmfModel::open_sharded(model_path)?);
+    // A decision file (DECISION bit) is served by the decisions server: no
+    // Pipeline, no GPU, loopback unless --host says otherwise (spec §4.2).
+    let is_decision = decision::is_decision_model(&model);
+    decision::check_serve_flags(model_path, is_decision, llm_given, decision_flags)?;
+    let host = decision::resolve_serve_host(host, is_decision);
+    if is_decision {
+        drop(model);
+        return decision::serve(model_path, host, port, decision_flags).await;
+    }
+    let default_task = default_task.unwrap_or("general");
     let arch = model.arch();
     println!(
         "    Architecture: {} | {}L | hidden={} | FFN={}",

@@ -7,6 +7,223 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.8] - 2026-09-27
+
+### Added
+- Typed decisions: the new crate `cortiq-decision` and a CMF profile marked
+  by the DECISION feature bit. One file holds a native BERT encoder (the
+  bge-small-en-v1.5 base with its MLP compressed by 75 % with Cortiq NVG, a
+  WordPiece tokenizer of our own), the hashing contract and resonance skills:
+  every label is an isolated affine subspace of `[φ_P ; 0.5·φ_H]`, the answer
+  is the smallest reconstruction error, and a gate (T, θ, τ) is certified on
+  calibration rows with a Clopper–Pearson bound. It runs on the host GEMM
+  with no GPU and no new external crate; language-model commands refuse such
+  a file.
+- `cortiq decide FILE -p TEXT` (`--skill`, `--labels`, `--json`, `--round 2`)
+  and a batch mode (`--input rows.jsonl`, `--bench` with p50/p95/p99 per
+  stage). `cortiq decision init | train | add-skill | learn | info | verify |
+  materialize | rollback | keys`: train a skill from JSONL `{text, label}`,
+  add one to a file with every existing skill kept byte for byte, pre-train
+  through the oracle on unlabelled texts, check hashes and the encoder golden.
+- `cortiq serve FILE` on a decision file (127.0.0.1:8080 by default): the
+  request/response shape of the Jev decisions API on OpenRouter (`POST
+  /api/alpha/decisions`, `/v1/decisions`; Cortiq Decision is not listed on
+  OpenRouter) with a `cmf` extension (skill, oracle consent, profile,
+  explanation, rounding), skill matching (exact, subset, superset,
+  untrained), `/v1/models`, `/v1/skills`, `/v1/usage`, `/v1/feedback` and an
+  admin API; API keys stored as sha256 only (`keys.json` changed under
+  `keys.json.lock` by the CLI and the server alike), cortiq-router's plans
+  (keys expire after 30 days), minute rate windows, quotas and credit checked
+  before each request and before each input of a router batch (a
+  `/v1/decisions` request with more questions than the decision quota has
+  left is refused, and an oracle call whose reservation does not fit in the
+  credit left is not made), and a usage ledger. The open mode reaches the
+  oracle and teaches the model with `auth.require: false` set explicitly; a
+  loopback address alone gives neither, except that `serve --oracle MODEL`
+  lets it reach the oracle (never teach). Prices are 0 by default; oracle
+  costs pass through.
+- The cortiq-router API (schema 1.1) on the same server with the router's
+  keys, types and error envelope: `/v1/route`, `/v1/route:batch`,
+  `/v1/feedback`, `/v1/taxonomies`, `/v1/usage`, `/v1/escalations`,
+  `/v1/healthz`, `/v1/readyz`, `/metrics` and the admin keys API, with
+  complexity, routing tiers, policy profiles and explanations;
+  `x-cmf-extensions: 1` adds the decision-v4 fields. `cortiq decision keys
+  import` takes the router's `api_keys` and `usage_counters` exports (or its
+  `[[api_keys]]`), so existing keys keep working; `serve --shadow-of URL`
+  (https, or plain http to a loopback address) answers router traffic from
+  the old router, decides locally what it answered 200 (comparison slots of
+  its own, apart from `limits.max_inflight`) and logs the agreement with a
+  keyed HMAC of each text, never the text (`GET /v1/admin/shadow`).
+- Oracle cascade, off by default: only questions the gate rejects, or that no
+  skill covers, go to an OpenRouter model (`deepseek/deepseek-v4.1-flash` by
+  default, `base_url` https or loopback http) after the consent checks, with
+  a budget reserved before each call, stop rules, PII redaction (numbers
+  also in spaced or dashed groups), a semantic cache and single flight scoped
+  by the question's contract. Self-learning keeps examples as vectors, refits
+  a label after 25 new ones, promotes it only if it is not worse on a
+  holdout, re-certifies the gate and checks that no other label's parameters
+  changed; cold start for new labels, feedback, and generations with
+  rollback. Only keys with `learning_allowed` (none by default) teach the
+  shared skills by feedback or by the oracle's answers to their own
+  questions; an answer to the skill's own question (`/v1/route`) teaches
+  whoever asked with a key or in the explicit open mode, never in the
+  loopback open mode of `serve --oracle`.
+- The oracle in two steps: `export OPENROUTER_API_KEY=…` and `cortiq serve
+  FILE --oracle MODEL`. At start one public request without the key
+  (`GET …/models/MODEL/endpoints`) sets the max price to twice the model's
+  cheapest endpoint with structured outputs; a model OpenRouter does not
+  list, one without structured outputs, one with only variable prices
+  (without `--oracle-max-price`) or a given max price below every such
+  endpoint is refused with the problem named (and 2–3 cheap models that
+  fit); an unreachable listing falls back to $0.10/$0.50 per 1M with a
+  warning. Companions: `--oracle-budget` (default $1.00),
+  `--oracle-max-calls`, `--oracle-max-price IN,OUT`, `--oracle-key-env`
+  (a variable's name; a key typed there is refused and never shown),
+  `--oracle-base-url`, `--no-oracle-learning`; they override
+  `--decision-config`. One startup line says `oracle: ready — …`,
+  `oracle: NOT ready — <what to do>` or `oracle: off`; `GET
+  /v1/admin/oracle` has `status` (`ready`, `no_key`, `bad_key`, `disabled`,
+  `budget_exhausted` once something was spent, `budget_too_small` for a
+  budget that cannot hold one call, with `min_call_usd`, `stopped:
+  <reason>`, with `last_error`) and `max_price`, `/healthz` has
+  `oracle_status` (`/v1/healthz` only under `cmf` with `x-cmf-extensions:
+  1`). A trained question that abstains because the oracle is not ready gets
+  the flag `no_key` or `bad_key` (beside `oracle_disabled`) when the key is
+  missing or unusable and a one-line `cmf.hint` on the decisions API; router
+  answers keep their shape and flags, and the hint is logged instead.
+- Key hygiene, on every surface (`serve --oracle`, `decide --oracle`,
+  `decision oracle check`, `decision learn`): the key read from its variable
+  loses surrounding spaces, tabs, CR and LF (a `.env` file's) with a warning
+  that says so; a value that still holds whitespace, a control byte or a byte
+  outside ASCII, starts with `Bearer `, is a whole `.env` line (`NAME=…`)
+  or starts or ends with a quote is `bad_key`, named by position and length
+  among its raw bytes (the whitespace around it counted) and never sent.
+  Transport and read errors
+  are fixed codes (`transport_connect`, `transport_timeout`,
+  `transport_bad_header`, `read_io`, …), never a library's text, which
+  could hold the request's `Authorization` header; a `finish_reason` other
+  than `stop` is one of `finish_length`, `finish_content_filter`,
+  `finish_tool_calls`, `finish_error`, `finish_other`, never the upstream's
+  text; every code shown comes from a closed set (with `http_NNN`), and a
+  `stop_reason` or `last_error` read back from `oracle.state` outside it is
+  `unknown_code` (still a stop) on every surface. A name an upstream
+  answers (a response's `provider` and `model`, a listing's provider names
+  and model ids) is kept only as it is — at most 64 bytes of
+  `[A-Za-z0-9 ._:/()-]` — and is `[redacted]` otherwise, never filtered or
+  cut; also when it holds `Bearer`, looks like a key or holds 8 bytes in a
+  row of the configured key, or its letters and digits alone hold
+  `bearer`, `skorv` or 8 in a row of the key's; the listings, fetched
+  without the key, are checked against it too (its variable's value). A
+  command-line usage error shows an argument that looks like a key only by
+  its length (a key pasted as a stray argument or as `--flag=KEY`). A value
+  looks like a key when it holds `sk-or-` anywhere or starts with `sk-`
+  (any case), starts with `Bearer ` (any case), has leading or trailing
+  whitespace, is 41 bytes or longer without a `/`, or holds 32 hexadecimal
+  digits in a row; for a variable's name, an all-`[A-Z0-9_]` value starting
+  with an upper-case letter or `_` is a name at any length unless it holds 32
+  hexadecimal digits in a row, and any other is also refused as a random
+  token at 16 bytes or more with letters and digits and no `_`. Such a
+  value given as a model id, a variable's name or a numeric oracle flag
+  (trimmed) is refused whatever its prefix, only its length shown; so is a
+  model id without a `/`, a variable's name that is not 1–128 bytes of
+  `[A-Za-z0-9_]` starting with a letter or `_`, a base URL holding `sk-or-`
+  and a string a `--decision-config` gives where a number belongs. Out of
+  scope: an upstream at the configured base URL that already received the
+  key and deliberately echoes it in its own answers (Cortiq still copies
+  none of its free text into another client's answer), and a key typed into
+  an argument that is not about the key or the oracle (a file path,
+  `--host`, a skill id). `budget_too_small` names the least budget that holds a
+  call, rounded up to the micro-dollar: the smallest possible call's (one
+  short question: the system prompt and schema are always sent) until the
+  budget refuses a real one, then that call's reservation — also for a
+  budget below the smallest call (0 included) and for a call the coarse
+  permission check refused before a body was built; a server whose budget
+  refused a real call with nothing spent reports `budget_too_small` instead
+  of `ready` (and `budget_exhausted` once something was spent). With
+  `max_calls` 0 the hint names the call limit (and the budget only when it
+  is short too). An admin limit kept in `oracle.state` (`POST
+  /v1/admin/oracle` `budget_usd` / `max_calls`) that refuses the next call
+  is named — its value, the file, and the admin request that lifts it with a
+  figure rounded up that the admin API takes (at most the configured
+  budget) or `null` — by the startup line, the decisions-API hint and
+  `decide`, instead of "restart with --oracle-budget", which cannot lift it.
+- `cortiq decide FILE -p TEXT | --input ROWS --oracle MODEL`: the text is
+  decided locally first, and only one the gate rejects (or whose labels no
+  skill has) is sent, in one call with the server's reservation ledger,
+  stop rules, PII redaction and key handling, under the state directory's
+  `LOCK` (`<FILE>.state` or `--state DIR`); `--oracle-budget` and
+  `--oracle-max-calls` cap each run, a stop holds for later runs until
+  `--oracle-resume`, `--break-lock` removes a `LOCK` whose process is gone.
+  A batch row keeps its local columns and adds `answer` (the oracle's or
+  its cache's answer, else the local choice), `action` (`local`, `oracle`,
+  `cache`, `abstain`), `source`, `oracle_cost_usd`, `flags` and, for a
+  labelled row, `answer_correct`; `--json` of one text has the run's status,
+  spend and budget in `cmf.oracle`. Without `--oracle` nothing changes; a
+  missing key is worded for the command line (`OPENROUTER_API_KEY is not set
+  (decide --oracle reads the key from the environment)`), also when labels
+  no skill has could only be answered by the oracle. `cortiq decision
+  oracle check [--model M] [--key-env VAR] [--base-url URL] [--max-price
+  IN,OUT] [--test-call] [--json]`: the key, the account (`GET
+  /auth/key`), the model's structured-output endpoints and prices
+  (`--max-price` for a model listed only with variable pricing), and with
+  `--test-call` one tiny call and its cost; exit code 0 only when ready; the
+  key is never printed.
+- The published model `infosave/cortiq-decision` (304520292 bytes): skills
+  `banking77`, `clinc150` and `massive` trained on train ∪ dev, with K 32, 16
+  and 24 chosen by cross-validation. It is 4520292 bytes over the
+  300000000-byte size limit of the release plan; the overrun was accepted,
+  since the file carries the train ∪ dev rows that exact self-learning
+  refits from and the cross-validated K (the reproduction build, train only
+  and K 16, is 259343088 bytes). The card, `API.md` and `ORACLE.md` are
+  in `docs/decision/hf/`; `tools/decision_hf_bundle.sh` assembles the upload.
+- A *Check your setup* block in the card, `API.md` and `ORACLE.md`:
+  `cortiq decision oracle check` (free) and `--test-call` (one tiny call),
+  what to do for each oracle status (`ready`, `no_key`, `bad_key`,
+  `disabled`, `budget_too_small`, `budget_exhausted`, `stopped: <reason>`),
+  and `cortiq decide … --oracle MODEL` for one text or a batch (the columns
+  `answer`, `action`, `source`, `oracle_cost_usd`, `flags`; `--oracle-resume`
+  after a fixed stop rule, `--break-lock` after a crash). Every command in
+  these blocks was run as written against a local mock of the OpenRouter
+  API (only the base URL pointed at it, a test key); `ORACLE.md` shows the
+  recorded outputs.
+
+### Changed
+- `cortiq decision keys create` makes keys that may use the oracle
+  (`oracle_allowed: true`, as imported router keys already were);
+  `--oracle-allowed=false` opts out. Keys created through `POST
+  /v1/admin/keys` keep the router's default.
+- `publish.yml` publishes `cortiq-decision` between `cortiq-engine` and
+  `cortiq-net`, before the crates that depend on it.
+- The CMF reader refuses a file whose arch name starts with
+  `cortiq-decision-` without the DECISION feature bit (0x800), or the bit
+  without such a name; writers set the bit from the name.
+- `cortiq serve --shadow-of` drops ureq's DEBUG/TRACE log lines (they print
+  forwarded request headers) whatever `RUST_LOG` says; other commands keep
+  them.
+
+### Performance and limits
+- Test sets against Jev 1.13's stored answers on the same rows (BANKING77 /
+  CLINC150 / MASSIVE): all rows 93.34 / 96.18 / 86.15 % (Jev 85.58 / 96.76 /
+  85.78 %; on CLINC150 Jev is ahead, p = 0.099); certified gate 97.24 /
+  98.70 / 97.89 % correct at 90.62 / 92.11 / 54.30 % coverage; served with
+  DeepSeek V4.1 Flash, the cache and self-learning 93.93 / 97.47 / 88.00 % at
+  $3.01 / $3.53 / $8.48 per 1M decisions (every abstention to DeepSeek, no
+  cache: 93.96 / 97.47 / 88.00 % at $3.09 / $3.56 / $8.52; Jev $183.69 /
+  $271.61 / $110.86). The same gate rejected 864 of the 1000 out-of-scope
+  CLINC150 queries.
+- Text → decision on one Apple M4 thread: p50 3.92 / 3.79 / 3.00 ms.
+- In one pass over the test sets the cache and self-learning together saved
+  35 of 2003 oracle calls (1.75 %): 21 cache hits (1.05 %) and 14 questions
+  answered locally after 16 promotions on MASSIVE (0.70 %); a label is
+  refitted only after 25 examples. Pre-training on unlabelled dev texts was
+  about neutral.
+- The benchmarks are public and were reused; Jev got label names and two
+  examples per label. The encoder is English, the gate is certified
+  in-domain, and speed was measured on macOS arm64 only.
+- Building needs Rust 1.88 or newer: the code uses `let` chains (stable
+  since 1.88), as 0.7.7 already did; the manifests' `rust-version` still
+  says 1.85.
+
 ## [0.7.7] - 2026-09-24
 
 ### Added
@@ -6060,7 +6277,8 @@ Initial public release.
 - **Licensing** — Apache-2.0 with an explicit patent-grant explanation
   (`LICENSE`, `NOTICE`, `PATENTS.md`).
 
-[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.7.7...HEAD
+[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.7.8...HEAD
+[0.7.8]: https://github.com/infosave2007/cmf/compare/v0.7.7...v0.7.8
 [0.7.7]: https://github.com/infosave2007/cmf/compare/v0.7.6...v0.7.7
 [0.6.9]: https://github.com/infosave2007/cmf/compare/v0.6.8...v0.6.9
 [0.6.8]: https://github.com/infosave2007/cmf/compare/v0.6.7...v0.6.8

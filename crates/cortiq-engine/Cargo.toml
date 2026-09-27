@@ -13,7 +13,7 @@ categories.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-cortiq-core = { path = "../cortiq-core", version = "0.7.7" }
+cortiq-core = { path = "../cortiq-core", version = "0.7.8" }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["preserve_order"] }
 tokio = { workspace = true }
@@ -38,6 +38,12 @@ bytemuck = { version = "1", optional = true, features = ["derive"] }
 [features]
 # `--features gpu` enables the wgpu path; test on a discrete card.
 gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+
+# Imports `cortiq_engine::gpu_wgpu`, which exists only with `gpu`: without
+# this, `cargo test -p cortiq-engine` (no features) failed to build it.
+[[example]]
+name = "dsv41_expert_gpu_proof"
+required-features = ["gpu"]
 
 # GPU path (D5): Metal on Apple Silicon; unified memory + no-copy buffers.
 [target.'cfg(target_os = "macos")'.dependencies]
