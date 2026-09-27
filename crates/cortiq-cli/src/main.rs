@@ -342,10 +342,12 @@ enum Commands {
         gpus: Option<usize>,
     },
     /// Decide with a decision file: one text (-p) or a JSONL batch (--input);
-    /// local only, the oracle is never called
+    /// locally, and with --oracle MODEL (the key in OPENROUTER_API_KEY) an
+    /// OpenRouter model answers only what the local model cannot decide
     Decide(decision::DecideArgs),
     /// Decision files: build (init, train, add-skill, learn), inspect (info,
-    /// verify), generations (materialize, rollback) and API keys
+    /// verify), generations (materialize, rollback), API keys and the oracle
+    /// check (`decision oracle check`)
     Decision {
         #[command(subcommand)]
         cmd: decision::DecisionCmd,
@@ -2017,8 +2019,10 @@ async fn main() -> anyhow::Result<()> {
     // in front of an answer. Every other command keeps the informative
     // default. RUST_LOG overrides either way.
     let default_level = match &cli.command {
-        // `decide` prints its answer (and its batch totals on stderr).
-        Commands::Run { .. } | Commands::Decide(_) => "warn",
+        Commands::Run { .. } => "warn",
+        // `decide` prints its answer (and its batch totals on stderr), and
+        // with --oracle its own hint: the service's is worded for a server.
+        Commands::Decide(_) => "warn,cortiq_decision::service=error",
         _ => "info",
     };
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()

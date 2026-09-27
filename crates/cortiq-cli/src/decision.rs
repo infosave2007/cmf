@@ -15,8 +15,24 @@
 //! * `cortiq decide FILE --input rows.jsonl [--skill ID] [--out out.jsonl]
 //!   [--bench]`: one JSON object per row (never the text), totals on stderr —
 //!   the tool of the numerical gates;
+//! * `--oracle MODEL` on either (decision-v4 U2, the oracle in two steps: the
+//!   key in `OPENROUTER_API_KEY`, then this flag): the local decision first,
+//!   and only a question it cannot decide (the gate rejects it, or no skill
+//!   has the labels) goes to the OpenRouter model, through the server's own
+//!   cascade and client — the reservation before every call, the stop rules,
+//!   PII redaction by default, the key read from the environment at the call
+//!   and printed nowhere. A text the gate accepts touches no network and no
+//!   state. The reservation ledger and the answer cache are the state
+//!   directory's (`--state DIR`, else `<FILE>.state`, under its `LOCK`);
+//!   `--oracle-budget` caps what the run spends (default $1.00); a server's
+//!   switch and stop reason in `oracle.state` hold (read, never written), the
+//!   run's own stops end its calls for the run, as in `decision learn`;
+//! * `cortiq decision oracle check [--model M] [--key-env VAR] [--base-url
+//!   URL] [--test-call] [--json]`: is the oracle ready — the key, the account
+//!   (`GET /auth/key`), the model's endpoints, and with `--test-call` one tiny
+//!   structured call; exit code 0 only when ready;
 //! * `cortiq decision init | train | add-skill | learn | info | verify |
-//!   materialize | rollback | keys`;
+//!   materialize | rollback | keys | oracle check`;
 //! * `cortiq serve FILE` on a decision file: the decisions server on
 //!   127.0.0.1 unless `--host` says otherwise; the language-model flags are
 //!   refused.
@@ -26,9 +42,14 @@ use clap::{ArgGroup, Args, Subcommand};
 use cortiq_core::CmfModel;
 use cortiq_core::format::features;
 use cortiq_decision::build::{self, BuildReport, TrainOptions};
-use cortiq_decision::config::Config;
+use cortiq_decision::cascade::{Cascade, CascadeOptions};
+use cortiq_decision::config::{
+    Config, DEFAULT_ORACLE_BASE_URL, DEFAULT_ORACLE_KEY_ENV, DEFAULT_ORACLE_MODEL,
+};
 use cortiq_decision::container::{self, DecisionModel, Verify, WriteReport};
-use cortiq_decision::eval::{self, EvalOptions, Evaluator, SkillScorer};
+use cortiq_decision::eval::{
+    self, EvalInput, EvalOptions, EvalSummary, Evaluator, RowResult, SkillScorer,
+};
 use cortiq_decision::generation;
 use cortiq_decision::keys::{
     self as keys_mod, ImportFormat, ImportReport, KeyStore, NewKey, UsageImportReport, now_unix,
@@ -36,17 +57,20 @@ use cortiq_decision::keys::{
 use cortiq_decision::learn::{self, OfflineOptions, OfflineReport};
 use cortiq_decision::ledger::UsageLedger;
 use cortiq_decision::manifest::{Gate, SkillManifest, TaskState};
-use cortiq_decision::oracle;
-use cortiq_decision::oracle_setup::{self, OracleFlags, OracleSetup};
-use cortiq_decision::protocol::{ApiError, MODEL_ID, model_name};
+use cortiq_decision::oracle::{self, LedgerTotals};
+use cortiq_decision::oracle_setup::{self, CheckOptions, OracleFlags, OracleSetup, host_of, usd};
+use cortiq_decision::protocol::{self, ApiError, FeedbackRequest, MODEL_ID, model_name};
 use cortiq_decision::service::{
-    Decided, DecisionService, LoadedModel, ModelHandle, Principal, QuestionOutcome,
+    Action, AdminCommand, Decided, DecisionService, Escalation, EscalationResult, Escalator,
+    LoadedModel, ModelHandle, OracleStatus, Principal, QuestionOutcome, RefusalReason, Resolution,
+    Resolved,
 };
 use cortiq_decision::shadow::{SHADOW_LOG_FILE, upstream_base};
 use cortiq_decision::signal::SignalEncoder;
-use cortiq_decision::statedir::{StateDir, generation_name};
+use cortiq_decision::statedir::{Locked, StateDir, StateLock, generation_name};
 use cortiq_server::decisions::{self as server, ServeOptions};
 use serde_json::{Map, Value, json};
+use std::collections::BTreeMap;
 use std::io::{BufWriter, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -316,7 +340,9 @@ pub struct DecideArgs {
     #[arg(long, value_delimiter = ',', conflicts_with = "input")]
     pub labels: Vec<String>,
     /// State directory of a decision server: decide with the generation its
-    /// CURRENT names (base + overlay)
+    /// CURRENT names (base + overlay). With --oracle also where the oracle's
+    /// ledger and answer cache are kept (created when missing; default
+    /// <FILE>.state)
     #[arg(long)]
     pub state: Option<PathBuf>,
     /// Print the whole response (the decisions API shape) as one JSON line
@@ -331,6 +357,58 @@ pub struct DecideArgs {
     /// Batch mode: 50 warm-up texts, then p50/p95/p99 of every stage
     #[arg(long, conflicts_with = "prompt")]
     pub bench: bool,
+    #[command(flatten)]
+    pub oracle: DecideOracleArgs,
+}
+
+/// `--oracle MODEL` and its companions of `cortiq decide`: the oracle in two
+/// steps — the key in `OPENROUTER_API_KEY`, then this flag.
+#[derive(Args, Clone, Debug, Default, PartialEq)]
+pub struct DecideOracleArgs {
+    /// Ask this OpenRouter model what the local model cannot decide (the gate
+    /// rejects it, or no skill has the labels), e.g.
+    /// deepseek/deepseek-v4.1-flash. A text the gate accepts never reaches it.
+    /// The key is read from OPENROUTER_API_KEY (--oracle-key-env), never
+    /// printed; the text sent is PII-redacted. The oracle's ledger and answer
+    /// cache are kept in the state directory (--state DIR, else <FILE>.state)
+    #[arg(long, value_name = "MODEL")]
+    pub oracle: Option<String>,
+    /// With --oracle: the most this run spends on the oracle, USD; every call
+    /// is reserved against it before it is sent [default: 1.0]
+    #[arg(long, value_name = "USD", requires = "oracle")]
+    pub oracle_budget: Option<f64>,
+    /// With --oracle: the most oracle calls this run makes [default: 10000]
+    #[arg(long, value_name = "N", requires = "oracle")]
+    pub oracle_max_calls: Option<u64>,
+    /// With --oracle: the environment variable holding the OpenRouter key
+    /// [default: OPENROUTER_API_KEY]
+    #[arg(long, value_name = "VAR", requires = "oracle")]
+    pub oracle_key_env: Option<String>,
+    /// With --oracle: the OpenRouter API base (https; plain http only to a
+    /// loopback address) [default: https://openrouter.ai/api/v1]
+    #[arg(long, value_name = "URL", requires = "oracle")]
+    pub oracle_base_url: Option<String>,
+    /// With --oracle: max price in USD per 1M prompt and completion tokens,
+    /// e.g. 0.1,0.5 [default: twice the model's cheapest structured-output
+    /// endpoint]
+    #[arg(long, value_name = "IN,OUT", requires = "oracle", value_parser = parse_max_price)]
+    pub oracle_max_price: Option<(f64, f64)>,
+}
+
+impl DecideOracleArgs {
+    /// The library's flags (`None` without `--oracle`); `decide` never
+    /// teaches the model.
+    pub fn flags(&self) -> Option<OracleFlags> {
+        Some(OracleFlags {
+            model: self.oracle.clone()?,
+            budget_usd: self.oracle_budget,
+            max_calls: self.oracle_max_calls,
+            key_env: self.oracle_key_env.clone(),
+            base_url: self.oracle_base_url.clone(),
+            max_price: self.oracle_max_price,
+            no_learning: true,
+        })
+    }
 }
 
 /// Open a decision file, with the generation `CURRENT` of `state` names when
@@ -373,10 +451,23 @@ pub fn run_decide(a: &DecideArgs) -> Result<()> {
             out.display()
         );
     }
-    let model = open_model(&a.model, a.state.as_deref(), Verify::Light)?;
-    match &a.input {
-        Some(input) => decide_batch(&model, a, input),
-        None => decide_one(model, a),
+    let oracle = a.oracle.flags();
+    if let Some(f) = &oracle {
+        // Every oracle flag is checked before any work; the network is used
+        // only when a question needs the oracle.
+        oracle_setup::check_flags(f)?;
+    }
+    // With --oracle, --state also names where the oracle's ledger is kept
+    // and may not exist yet: until it does, the base file decides.
+    let read_state = match a.state.as_deref() {
+        Some(d) if oracle.is_some() && !d.exists() => None,
+        other => other,
+    };
+    let model = open_model(&a.model, read_state, Verify::Light)?;
+    match (&a.input, oracle) {
+        (Some(input), None) => decide_batch(&model, a, input),
+        (Some(input), Some(f)) => decide_batch_oracle(model, a, input, &f),
+        (None, oracle) => decide_one(model, a, oracle.as_ref()),
     }
 }
 
@@ -384,11 +475,25 @@ fn decide_batch(model: &DecisionModel, a: &DecideArgs, input: &Path) -> Result<(
     let skill = eval::select_skill(model, a.skill.as_deref())?;
     let ev = Evaluator::new(model, &skill)?;
     let inputs = eval::read_input(input)?;
+    let summary = run_batch(&ev, a, &inputs, |r| Ok(r.to_json()))?;
+    eprintln!("{}", summary.render());
+    eprintln!("{}", json!({ "summary": summary.to_json() }));
+    Ok(())
+}
+
+/// The rows of a batch run, on stdout or in `--out` (removed when the run
+/// fails: no partial output is left behind); `row` gives each row's JSON.
+fn run_batch(
+    ev: &Evaluator,
+    a: &DecideArgs,
+    inputs: &[EvalInput],
+    mut row: impl FnMut(&RowResult) -> Result<Value>,
+) -> Result<EvalSummary> {
     let opts = EvalOptions {
         bench: a.bench,
         warmup: if a.bench { eval::BENCH_WARMUP } else { 0 },
     };
-    let summary = match &a.out {
+    match &a.out {
         Some(path) => {
             let file = std::fs::OpenOptions::new()
                 .write(true)
@@ -397,7 +502,7 @@ fn decide_batch(model: &DecisionModel, a: &DecideArgs, input: &Path) -> Result<(
                 .with_context(|| format!("create {}", path.display()))?;
             let mut w = BufWriter::new(file);
             let run = ev
-                .run(&inputs, opts, |r| write_row(&mut w, &r.to_json()))
+                .run(inputs, opts, |r| write_row(&mut w, &row(r)?))
                 .and_then(|s| {
                     w.flush()?;
                     w.get_ref().sync_all()?;
@@ -407,18 +512,579 @@ fn decide_batch(model: &DecisionModel, a: &DecideArgs, input: &Path) -> Result<(
                 // No partial output is left behind.
                 let _ = std::fs::remove_file(path);
             }
-            run?
+            run
         }
         None => {
             let mut w = BufWriter::new(std::io::stdout().lock());
-            let s = ev.run(&inputs, opts, |r| write_row(&mut w, &r.to_json()))?;
+            let s = ev.run(inputs, opts, |r| write_row(&mut w, &row(r)?))?;
             w.flush()?;
-            s
+            Ok(s)
         }
-    };
+    }
+}
+
+/// `cortiq decide --input … --oracle MODEL`: every row is decided locally
+/// first (the row of a run without `--oracle`, byte for byte, plus `action`,
+/// `source`, `answer`, `oracle_cost_usd`, `flags` and, for a labelled row,
+/// `answer_correct`); a row the gate rejects is asked again through the
+/// oracle's service. The oracle is set up before the first row: a model it
+/// cannot use, or a state directory another process holds, stops the run
+/// before any output.
+fn decide_batch_oracle(
+    model: DecisionModel,
+    a: &DecideArgs,
+    input: &Path,
+    flags: &OracleFlags,
+) -> Result<()> {
+    let handle = Arc::new(ModelHandle::new(LoadedModel::new(model)?));
+    let current = handle.current();
+    let skill = eval::select_skill(current.model(), a.skill.as_deref())?;
+    let ev = Evaluator::new(current.model(), &skill)?;
+    let inputs = eval::read_input(input)?;
+    let run = OracleRun::open(&handle, &a.model, a.state.as_deref(), flags)?;
+    eprintln!("{}", run.start_line());
+    let principal = OracleRun::principal();
+    let mut tally = BatchTally::default();
+    let summary = run_batch(&ev, a, &inputs, |r| {
+        let input = &inputs[r.i];
+        let row = if r.accepted {
+            RowOracle::local(r)
+        } else {
+            let body = single_request(&current, a, &input.text)?;
+            let d = run
+                .svc
+                .decide_body(&serde_json::to_vec(&body)?, &principal)
+                .map_err(api_error)?;
+            RowOracle::of(&d)
+        };
+        tally.add(&row, input.label.as_deref());
+        let mut v = r.to_json();
+        row.write(&mut v, input.label.as_deref());
+        Ok(v)
+    })?;
+    let hint = run.hint(&tally.reasons());
     eprintln!("{}", summary.render());
-    eprintln!("{}", json!({ "summary": summary.to_json() }));
+    eprintln!("{}", tally.render(&run, hint.as_deref()));
+    let mut sj = summary.to_json();
+    sj["oracle"] = tally.to_json(&run, hint.as_deref());
+    eprintln!("{}", json!({ "summary": sj }));
     Ok(())
+}
+
+/// The cascade's part of one batch row.
+struct RowOracle {
+    action: Action,
+    /// The final answer: the oracle's (or its cache's), else the local choice.
+    answer: Option<String>,
+    /// `usage.cost` of this row's oracle call (0 without one).
+    cost: f64,
+    flags: Vec<String>,
+}
+
+impl RowOracle {
+    fn local(r: &RowResult) -> Self {
+        Self {
+            action: Action::Local,
+            answer: r.choice.clone(),
+            cost: 0.0,
+            flags: Vec::new(),
+        }
+    }
+
+    fn of(d: &Decided) -> Self {
+        let o = &d.questions[0];
+        let answer = match o.action {
+            Action::Oracle | Action::Cache => o.oracle.as_ref().and_then(|a| a.label()),
+            Action::Local | Action::Abstain => o.local.as_ref().and_then(|l| l.choice.as_deref()),
+        };
+        Self {
+            action: o.action,
+            answer: answer.map(str::to_string),
+            cost: d.metered.oracle.cost.to_f64(),
+            flags: o.flags.clone(),
+        }
+    }
+
+    fn write(&self, v: &mut Value, label: Option<&str>) {
+        v["action"] = json!(self.action.as_str());
+        v["source"] = json!(self.action.source());
+        v["answer"] = json!(self.answer);
+        v["oracle_cost_usd"] = json!(self.cost);
+        v["flags"] = json!(self.flags);
+        if let Some(l) = label {
+            v["answer_correct"] = json!(self.answer.as_deref() == Some(l));
+        }
+    }
+
+    /// Why an abstained row was not answered (its most specific flag).
+    fn reason(&self) -> &str {
+        if self.flags.iter().any(|f| f == "no_key") {
+            return "no_key";
+        }
+        self.flags
+            .iter()
+            .map(String::as_str)
+            .find(|f| *f != cortiq_decision::pii::FLAG_PII_REDACTED)
+            .unwrap_or("abstain")
+    }
+}
+
+/// The oracle's totals of a batch run.
+#[derive(Default)]
+struct BatchTally {
+    rows: usize,
+    /// Rows the gate rejected (asked again through the oracle).
+    rejected: usize,
+    oracle: usize,
+    cache: usize,
+    abstained: usize,
+    /// Abstained rows by reason (`budget`, `no_key`, `stopped`,
+    /// `oracle_unavailable`, …).
+    reasons: BTreeMap<String, usize>,
+    /// Σ `usage.cost` of the answered calls.
+    cost: f64,
+    labelled: usize,
+    correct: usize,
+}
+
+impl BatchTally {
+    fn add(&mut self, row: &RowOracle, label: Option<&str>) {
+        self.rows += 1;
+        match row.action {
+            Action::Local => {}
+            Action::Oracle => self.oracle += 1,
+            Action::Cache => self.cache += 1,
+            Action::Abstain => {
+                self.abstained += 1;
+                *self.reasons.entry(row.reason().to_string()).or_default() += 1;
+            }
+        }
+        if row.action != Action::Local {
+            self.rejected += 1;
+        }
+        self.cost += row.cost;
+        if let Some(l) = label {
+            self.labelled += 1;
+            self.correct += usize::from(row.answer.as_deref() == Some(l));
+        }
+    }
+
+    fn reasons(&self) -> Vec<String> {
+        self.reasons.keys().cloned().collect()
+    }
+
+    fn to_json(&self, run: &OracleRun, hint: Option<&str>) -> Value {
+        let mut v = run.json();
+        v["rows_rejected"] = json!(self.rejected);
+        v["answered_by_oracle"] = json!(self.oracle);
+        v["answered_from_cache"] = json!(self.cache);
+        v["abstained"] = json!(self.abstained);
+        v["abstained_by"] = json!(self.reasons);
+        v["cost_usd"] = json!(self.cost);
+        v["answers_labelled"] = json!(self.labelled);
+        v["answers_correct"] = json!(self.correct);
+        v["answer_accuracy"] = if self.labelled == 0 {
+            Value::Null
+        } else {
+            json!(self.correct as f64 / self.labelled as f64)
+        };
+        v["hint"] = json!(hint);
+        v
+    }
+
+    fn render(&self, run: &OracleRun, hint: Option<&str>) -> String {
+        let reasons: Vec<String> = self
+            .reasons
+            .iter()
+            .map(|(r, n)| format!("{r} {n}"))
+            .collect();
+        let (spent, calls) = run.totals();
+        let mut s = format!(
+            "oracle {} via {}: the gate rejected {} of {} rows: {} answered by the oracle, {} from its cache, {} abstained{}; {} spent in this run ({} call{}), budget {}",
+            run.model,
+            host_of(&run.base_url),
+            self.rejected,
+            self.rows,
+            self.oracle,
+            self.cache,
+            self.abstained,
+            if reasons.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", reasons.join(", "))
+            },
+            usd(spent),
+            calls,
+            if calls == 1 { "" } else { "s" },
+            usd(run.budget)
+        );
+        if let Some(l) = &run.ledger {
+            s.push_str(&format!("; ledger {}", l.display()));
+        }
+        if self.labelled > 0 {
+            s.push_str(&format!(
+                "\nanswers (local + oracle): correct {}/{} = {:.2}%",
+                self.correct,
+                self.labelled,
+                100.0 * self.correct as f64 / self.labelled as f64
+            ));
+        }
+        if let Some(h) = hint {
+            s.push_str(&format!("\nhint: {h}"));
+        }
+        s
+    }
+}
+
+/// The oracle of `decide --oracle` without its key: every undetermined
+/// question is refused with `no_key`, as a server without the key refuses
+/// it — no network, no state directory.
+struct NoKeyOracle;
+
+impl Escalator for NoKeyOracle {
+    fn escalate(&self, e: &Escalation<'_>) -> EscalationResult {
+        EscalationResult {
+            resolved: e
+                .pending
+                .iter()
+                .map(|_| Resolved::new(Resolution::Refused(RefusalReason::NoKey)))
+                .collect(),
+            usage: Default::default(),
+        }
+    }
+
+    fn feedback(&self, _: &FeedbackRequest, _: &Principal) -> Result<Value, ApiError> {
+        Err(ApiError::not_found("`cortiq decide` keeps no feedback"))
+    }
+
+    fn admin(&self, _: &AdminCommand) -> Result<Value, ApiError> {
+        Err(ApiError::not_found("`cortiq decide` has no admin API"))
+    }
+
+    fn oracle_status(&self) -> Option<OracleStatus> {
+        Some(OracleStatus::NoKey)
+    }
+}
+
+/// The account `cortiq decide --oracle` records its calls under in the
+/// reservation ledger.
+pub const DECIDE_ACCOUNT: &str = "cortiq-decide";
+
+/// The oracle of one `cortiq decide --oracle` run: the server's cascade and
+/// client over the state directory (`--state DIR`, else `<FILE>.state`,
+/// under its `LOCK` for the run), with the budget and call limit of this run
+/// on top of what its ledger already holds; learning is off. Without the key,
+/// [`NoKeyOracle`] (no network, no state).
+struct OracleRun {
+    svc: DecisionService,
+    cascade: Option<Arc<Cascade>>,
+    model: String,
+    key_env: String,
+    base_url: String,
+    /// What this run may spend, USD.
+    budget: f64,
+    /// Calls this run may make.
+    max_calls: u64,
+    /// The ledger when the run started.
+    before: LedgerTotals,
+    ledger: Option<PathBuf>,
+    /// Where the max price came from.
+    price_note: Option<String>,
+    /// The state directory (`None` without the key).
+    state_root: Option<PathBuf>,
+    /// A server's switch or stop reason found in `oracle.state` at the start
+    /// (it holds for the run): "switched off …" or "stopped by a stop rule …".
+    inherited: Option<String>,
+    /// Released last, after the cascade has written its last line.
+    _lock: Option<StateLock>,
+}
+
+impl OracleRun {
+    fn open(
+        handle: &Arc<ModelHandle>,
+        model_path: &Path,
+        state: Option<&Path>,
+        flags: &OracleFlags,
+    ) -> Result<Self> {
+        let mut cfg = Config::default();
+        // `decide` never teaches the model: the oracle's answers are cached,
+        // not learned.
+        cfg.learning.enabled = false;
+        let key_env = flags
+            .key_env
+            .clone()
+            .unwrap_or_else(|| DEFAULT_ORACLE_KEY_ENV.to_string());
+        if (oracle::process_env())(&key_env).is_none() {
+            oracle_setup::prepare(&mut cfg, flags, false)?;
+            let esc: Arc<dyn Escalator> = Arc::new(NoKeyOracle);
+            return Ok(Self {
+                svc: DecisionService::open(Arc::clone(handle), cfg.clone(), Some(esc))?,
+                cascade: None,
+                model: flags.model.clone(),
+                key_env,
+                base_url: cfg.oracle.base_url.clone(),
+                budget: cfg.oracle.budget_usd,
+                max_calls: cfg.oracle.max_calls,
+                before: LedgerTotals::default(),
+                ledger: None,
+                price_note: None,
+                state_root: None,
+                inherited: None,
+                _lock: None,
+            });
+        }
+        // One public GET of the model's endpoint listing (no key): the max
+        // price, or the refusal of a model the oracle cannot use.
+        let setup = oracle_setup::apply(&mut cfg, flags, false)?;
+        for w in &setup.warnings {
+            eprintln!("warning: {w}");
+        }
+        let root = state
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| StateDir::default_for(model_path));
+        let dir = StateDir::open(&root).with_context(|| {
+            format!(
+                "state directory {} (where `cortiq decide --oracle` keeps the oracle's ledger;                  --state DIR puts it elsewhere)",
+                root.display()
+            )
+        })?;
+        let lock = dir
+            .lock(false)
+            .map_err(|e| match e.downcast_ref::<Locked>() {
+                Some(l) => anyhow::anyhow!(
+                    "state directory {} is held by pid {} (a running `cortiq serve`?): one process \
+                 per state directory keeps the oracle's budget exact. Ask that server (POST \
+                 /v1/decisions), stop it, or give this run a directory of its own with --state DIR",
+                    l.dir,
+                    l.pid
+                ),
+                None => e,
+            })?;
+        let ledger = dir.oracle_ledger_path();
+        let before = oracle::ledger_totals(&ledger)?;
+        let (budget, max_calls) = (cfg.oracle.budget_usd, cfg.oracle.max_calls);
+        // The run's budget and calls come on top of what the ledger holds.
+        cfg.oracle.budget_usd = before.spent + budget;
+        cfg.oracle.max_calls = before.calls.saturating_add(max_calls);
+        let cascade = Cascade::open_run(Arc::clone(handle), &cfg, dir, CascadeOptions::default())?;
+        // A server's switch and stop reason hold (read, never written).
+        let st = cascade.oracle().state();
+        let inherited = if !st.enabled {
+            Some("switched off by a server's admin API".to_string())
+        } else {
+            st.stop_reason
+                .map(|r| format!("stopped by a stop rule ({r})"))
+        };
+        let esc: Arc<dyn Escalator> = cascade.clone();
+        Ok(Self {
+            svc: DecisionService::open(Arc::clone(handle), cfg.clone(), Some(esc))?,
+            cascade: Some(cascade),
+            model: flags.model.clone(),
+            key_env,
+            base_url: cfg.oracle.base_url.clone(),
+            budget,
+            max_calls,
+            before,
+            ledger: Some(ledger),
+            price_note: Some(setup.price_note()),
+            state_root: Some(root),
+            inherited,
+            _lock: Some(lock),
+        })
+    }
+
+    /// What to do about a server's switch or stop found at the start.
+    fn inherited_hint(&self) -> Option<String> {
+        let why = self.inherited.as_ref()?;
+        let root = self.state_root.as_ref()?;
+        Some(format!(
+            "the oracle of state directory {} was {why} before this run (its oracle.state, kept by a server): after the fix, POST /v1/admin/oracle {{\"enabled\":true}} on a server of that directory (or removing {}) resumes it; --state DIR gives this run a directory of its own",
+            root.display(),
+            root.join(cortiq_decision::statedir::ORACLE_STATE_FILE)
+                .display()
+        ))
+    }
+
+    /// Who asks: the operator of this command line (the oracle allowed, no
+    /// teaching).
+    fn principal() -> Principal {
+        Principal {
+            account: DECIDE_ACCOUNT.into(),
+            plan: "cli".into(),
+            learning_allowed: false,
+            ..Principal::open()
+        }
+    }
+
+    fn status(&self) -> OracleStatus {
+        self.svc.oracle_status()
+    }
+
+    /// USD charged and calls made in this run (the ledger's own counting).
+    fn totals(&self) -> (f64, u64) {
+        match &self.cascade {
+            Some(c) => {
+                let t = c.oracle().totals();
+                (
+                    (t.spent - self.before.spent).max(0.0),
+                    t.calls.saturating_sub(self.before.calls),
+                )
+            }
+            None => (0.0, 0),
+        }
+    }
+
+    fn max_price(&self) -> Option<(f64, f64)> {
+        self.cascade.as_ref().map(|c| c.oracle().max_price())
+    }
+
+    /// `cortiq decision oracle check` with this run's settings.
+    fn check_command(&self, test_call: bool) -> String {
+        let mut s = "cortiq decision oracle check".to_string();
+        if self.model != DEFAULT_ORACLE_MODEL {
+            s.push_str(&format!(" --model {}", self.model));
+        }
+        if self.key_env != DEFAULT_ORACLE_KEY_ENV {
+            s.push_str(&format!(" --key-env {}", self.key_env));
+        }
+        if self.base_url != DEFAULT_ORACLE_BASE_URL {
+            s.push_str(&format!(" --base-url {}", self.base_url));
+        }
+        if test_call {
+            s.push_str(" --test-call");
+        }
+        s
+    }
+
+    /// The first line of a batch run (stderr), never the key.
+    fn start_line(&self) -> String {
+        let what = format!("{} via {}", self.model, host_of(&self.base_url));
+        match self.status() {
+            OracleStatus::Ready => {
+                let (p, c) = self.max_price().unwrap_or_default();
+                format!(
+                    "oracle: ready — {what}, budget {} for this run, max price in/out {}/{} per 1M ({}); ledger {}",
+                    usd(self.budget),
+                    usd(p),
+                    usd(c),
+                    self.price_note.as_deref().unwrap_or("-"),
+                    self.ledger
+                        .as_ref()
+                        .map_or("-".into(), |l| l.display().to_string())
+                )
+            }
+            OracleStatus::NoKey => format!(
+                "oracle: NOT ready — {k} is not set (export {k}=<your OpenRouter key>; `{}` tests it): the rows the gate rejects abstain",
+                self.check_command(false),
+                k = self.key_env
+            ),
+            OracleStatus::BudgetExhausted => format!(
+                "oracle: NOT ready — the budget of this run ({}, {} calls) cannot hold one call of {what}: pass a larger --oracle-budget or --oracle-max-calls",
+                usd(self.budget),
+                self.max_calls
+            ),
+            other => match self.inherited_hint() {
+                Some(h) => format!("oracle: NOT ready — {h}"),
+                None => format!("oracle: NOT ready — {} ({what})", other.label()),
+            },
+        }
+    }
+
+    /// What to do about the refusals behind `flags` (never the key).
+    fn hint(&self, flags: &[String]) -> Option<String> {
+        let has = |f: &str| flags.iter().any(|x| x == f);
+        if has("no_key") {
+            return Some(format!(
+                "the oracle key is not set: export {k}=<your OpenRouter key> (create one at {}) and run again; `{}` tests the setup",
+                oracle_setup::KEYS_PAGE,
+                self.check_command(false),
+                k = self.key_env
+            ));
+        }
+        if has("stopped") || has("oracle_disabled") {
+            if let Some(h) = self.inherited_hint() {
+                return Some(h);
+            }
+        }
+        let (spent, calls) = self.totals();
+        if has("budget") && calls == 0 {
+            let least = self
+                .cascade
+                .as_ref()
+                .map_or(0.0, |c| c.oracle().min_reservation_usd());
+            return Some(if self.max_calls == 0 {
+                "--oracle-max-calls 0 allows no oracle call: pass a larger --oracle-max-calls"
+                    .to_string()
+            } else {
+                format!(
+                    "the oracle budget of this run ({}) cannot hold one call (every call reserves at least {} before it is sent): pass a larger --oracle-budget",
+                    usd(self.budget),
+                    usd(least)
+                )
+            });
+        }
+        if has("budget") {
+            return Some(format!(
+                "the oracle budget of this run is used up ({} of {} spent, {} of {} calls): pass a larger --oracle-budget or --oracle-max-calls",
+                usd(spent),
+                usd(self.budget),
+                calls,
+                self.max_calls
+            ));
+        }
+        if has("stopped") {
+            let reason = self
+                .cascade
+                .as_ref()
+                .and_then(|c| c.oracle().state().stop_reason)
+                .unwrap_or_else(|| "?".into());
+            return Some(format!(
+                "a stop rule stopped the oracle in this run ({reason}); `{}` shows what is wrong",
+                self.check_command(true)
+            ));
+        }
+        if has(cortiq_decision::service::FLAG_ORACLE_UNAVAILABLE) {
+            return Some(format!(
+                "the oracle call failed (its error code is in the warning above); `{}` tests the setup",
+                self.check_command(true)
+            ));
+        }
+        None
+    }
+
+    /// `cmf.oracle` of `--json` (never the key).
+    fn json(&self) -> Value {
+        let (spent, calls) = self.totals();
+        json!({
+            "model": self.model,
+            "asked": true,
+            "status": self.status().label(),
+            "key_env": self.key_env,
+            "base_url": self.base_url,
+            "budget_usd": self.budget,
+            "spent_usd": spent,
+            "calls": calls,
+            "max_calls": self.max_calls,
+            "max_price": self.max_price().map(|(p, c)| json!({"prompt": p, "completion": c})),
+            "ledger": self.ledger.as_ref().map(|l| l.display().to_string()),
+        })
+    }
+
+    /// The `oracle:` line of the human output (`None` without the key).
+    fn line(&self) -> Option<String> {
+        let ledger = self.ledger.as_ref()?;
+        let (spent, calls) = self.totals();
+        Some(format!(
+            "{} via {}: {} spent in this run ({} call{}), budget {}; ledger {}",
+            self.model,
+            host_of(&self.base_url),
+            usd(spent),
+            calls,
+            if calls == 1 { "" } else { "s" },
+            usd(self.budget),
+            ledger.display()
+        ))
+    }
 }
 
 fn write_row(w: &mut impl Write, v: &Value) -> Result<()> {
@@ -481,21 +1147,82 @@ fn single_request(model: &LoadedModel, a: &DecideArgs, text: &str) -> Result<Val
     Ok(body)
 }
 
-fn decide_one(model: DecisionModel, a: &DecideArgs) -> Result<()> {
+fn decide_one(model: DecisionModel, a: &DecideArgs, oracle: Option<&OracleFlags>) -> Result<()> {
     let text = a.prompt.as_deref().expect("clap: -p or --input");
     let handle = Arc::new(ModelHandle::new(LoadedModel::new(model)?));
-    let body = single_request(&handle.current(), a, text)?;
-    // No escalator and the oracle disabled: `cortiq decide` never calls it.
-    let svc = DecisionService::open(Arc::clone(&handle), Config::default(), None)?;
-    let decided = svc
-        .decide_body(&serde_json::to_vec(&body)?, &Principal::open())
+    let body = serde_json::to_vec(&single_request(&handle.current(), a, text)?)?;
+    // No escalator: this service never calls the oracle.
+    let local = DecisionService::open(Arc::clone(&handle), Config::default(), None)?;
+    let Some(flags) = oracle else {
+        let decided = local
+            .decide_body(&body, &Principal::open())
+            .map_err(api_error)?;
+        return print_decided(&decided, a.json, None);
+    };
+    let req = protocol::parse_request(&body, &local.limits()).map_err(api_error)?;
+    let undetermined = local
+        .decide_local(&req)
+        .map_err(api_error)?
+        .questions
+        .iter()
+        .any(|(_, l)| l.as_ref().is_none_or(|l| !l.accepted));
+    if !undetermined {
+        // The gate accepted every question: the oracle is not asked (no
+        // network, no state directory).
+        let mut decided = local.decide(&req, &Principal::open()).map_err(api_error)?;
+        decided.response["cmf"]["oracle"] = json!({"model": flags.model, "asked": false});
+        let view = OracleView {
+            model: flags.model.clone(),
+            line: None,
+            hint: None,
+        };
+        return print_decided(&decided, a.json, Some(&view));
+    }
+    let run = OracleRun::open(&handle, &a.model, a.state.as_deref(), flags)?;
+    let mut decided = run
+        .svc
+        .decide(&req, &OracleRun::principal())
         .map_err(api_error)?;
-    if a.json {
-        println!("{}", decided.response);
+    let flags_seen: Vec<String> = decided
+        .questions
+        .iter()
+        .flat_map(|q| q.flags.iter().cloned())
+        .collect();
+    // The command line's own hint (the service words its hint for a server).
+    let hint = run.hint(&flags_seen);
+    let cmf = &mut decided.response["cmf"];
+    match &hint {
+        Some(h) => cmf["hint"] = json!(h),
+        None => {
+            if let Some(m) = cmf.as_object_mut() {
+                m.remove("hint");
+            }
+        }
+    }
+    cmf["oracle"] = run.json();
+    let view = OracleView {
+        model: flags.model.clone(),
+        line: run.line(),
+        hint,
+    };
+    print_decided(&decided, a.json, Some(&view))
+}
+
+fn print_decided(d: &Decided, as_json: bool, oracle: Option<&OracleView>) -> Result<()> {
+    if as_json {
+        println!("{}", d.response);
     } else {
-        print!("{}", render_decided(&decided));
+        print!("{}", render_decided(d, oracle));
     }
     Ok(())
+}
+
+/// What the human output of `decide --oracle` says about the oracle.
+struct OracleView {
+    model: String,
+    /// The run's spend, budget and ledger (`None`: not asked, or no key).
+    line: Option<String>,
+    hint: Option<String>,
 }
 
 fn num(v: &Value) -> String {
@@ -506,11 +1233,20 @@ fn num(v: &Value) -> String {
 }
 
 /// Human-readable lines of a decided `cortiq decide -p`.
-fn render_decided(d: &Decided) -> String {
+fn render_decided(d: &Decided, oracle: Option<&OracleView>) -> String {
     let r = &d.response;
+    let cost = d.metered.oracle.cost.to_f64();
     let mut s = String::new();
     for o in &d.questions {
-        s.push_str(&render_question(o));
+        s.push_str(&render_question(o, cost, oracle));
+    }
+    if let Some(v) = oracle {
+        if let Some(l) = &v.line {
+            s.push_str(&format!("oracle:     {l}\n"));
+        }
+        if let Some(h) = &v.hint {
+            s.push_str(&format!("hint:       {h}\n"));
+        }
     }
     s.push_str(&format!(
         "model:      {} (generation {}), {} input tokens, {} µs\n",
@@ -522,27 +1258,50 @@ fn render_decided(d: &Decided) -> String {
     s
 }
 
-fn render_question(o: &QuestionOutcome) -> String {
-    let mut s = String::new();
-    let Some(l) = &o.local else {
-        // Only exact and subset questions reach the output without an oracle.
-        return format!("{}: {} ({})\n", o.id, o.action.as_str(), o.answer);
+fn render_question(o: &QuestionOutcome, cost: f64, oracle: Option<&OracleView>) -> String {
+    let flags = if o.flags.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", o.flags.join(", "))
     };
+    let answered = match (o.action, o.oracle.as_ref().and_then(|a| a.label()), oracle) {
+        (Action::Oracle, Some(c), Some(v)) => {
+            Some(format!("{c} (from oracle {}, {})", v.model, usd(cost)))
+        }
+        (Action::Cache, Some(c), Some(v)) => Some(format!(
+            "{c} (from the cache of oracle {}: its answer to a similar text, $0.00)",
+            v.model
+        )),
+        _ => None,
+    };
+    let Some(l) = &o.local else {
+        // No skill decides these labels: only the oracle can answer.
+        return match answered {
+            Some(c) => format!(
+                "choice:     {c}\naction:     {} (no skill has these labels){flags}\n",
+                o.action.as_str()
+            ),
+            None => format!("{}: {} ({})\n", o.id, o.action.as_str(), o.answer),
+        };
+    };
+    let mut s = String::new();
     s.push_str(&format!(
         "choice:     {}\n",
-        l.choice.as_deref().unwrap_or("-")
+        answered.unwrap_or_else(|| l.choice.as_deref().unwrap_or("-").to_string())
     ));
-    let why = if o.action.as_str() == "local" {
-        "accepted by the gate".to_string()
-    } else {
-        format!(
-            "the gate rejected it; `cortiq decide` never calls the oracle{}",
-            if o.flags.is_empty() {
-                String::new()
-            } else {
-                format!(" [{}]", o.flags.join(", "))
-            }
-        )
+    let why = match (o.action, oracle) {
+        (Action::Local, None) => "accepted by the gate".to_string(),
+        (Action::Local, Some(_)) => "accepted by the gate; the oracle is not asked".to_string(),
+        (Action::Oracle | Action::Cache, _) => format!(
+            "the gate rejected the local choice {}{flags}",
+            l.choice.as_deref().unwrap_or("-")
+        ),
+        (Action::Abstain, None) => format!(
+            "the gate rejected it; without --oracle MODEL `cortiq decide` does not ask the oracle{flags}"
+        ),
+        (Action::Abstain, Some(_)) => {
+            format!("the gate rejected it and the oracle did not answer{flags}")
+        }
     };
     s.push_str(&format!(
         "action:     {} ({why}), certified {}\n",
@@ -917,6 +1676,58 @@ pub enum DecisionCmd {
         #[command(subcommand)]
         cmd: KeysCmd,
     },
+    /// The OpenRouter oracle: `oracle check` tells whether it is ready
+    Oracle {
+        #[command(subcommand)]
+        cmd: OracleCmd,
+    },
+}
+
+/// `cortiq decision oracle …`.
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum OracleCmd {
+    /// Is the oracle ready? (a) the key is in its variable; (b) GET
+    /// /auth/key accepts it (free; the key's credit limit and usage); (c) the
+    /// model is listed with structured outputs (free, no key; its cheapest
+    /// price); (d) with --test-call, one tiny structured call and its cost.
+    /// Exit code 0 only when ready. The key is never printed
+    Check {
+        /// OpenRouter model id
+        #[arg(long, value_name = "MODEL", default_value = DEFAULT_ORACLE_MODEL)]
+        model: String,
+        /// The environment variable holding the OpenRouter key
+        #[arg(long, value_name = "VAR", default_value = DEFAULT_ORACLE_KEY_ENV)]
+        key_env: String,
+        /// OpenRouter API base (https; plain http only to a loopback address)
+        #[arg(long, value_name = "URL", default_value = DEFAULT_ORACLE_BASE_URL)]
+        base_url: String,
+        /// Also make one tiny structured call (a two-option choice,
+        /// max_tokens 16: a small fraction of a cent) and report its cost;
+        /// made only when the other checks pass
+        #[arg(long)]
+        test_call: bool,
+        /// Print the report as one JSON line
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// `cortiq decision oracle check`: the report on stdout, exit code 0 only
+/// when ready.
+fn oracle_check(opts: &CheckOptions, as_json: bool) -> Result<()> {
+    let report = oracle_setup::check(opts, &oracle::process_env())?;
+    if as_json {
+        println!("{}", report.to_json());
+    } else {
+        print!("{}", report.render());
+    }
+    let n = report.problems().len();
+    ensure!(
+        n == 0,
+        "the oracle is not ready ({n} problem{})",
+        if n == 1 { "" } else { "s" }
+    );
+    Ok(())
 }
 
 /// `cortiq decision …`.
@@ -1027,6 +1838,24 @@ pub fn run_decision(cmd: &DecisionCmd) -> Result<()> {
             Ok(())
         }
         DecisionCmd::Keys { cmd } => keys(cmd),
+        DecisionCmd::Oracle {
+            cmd:
+                OracleCmd::Check {
+                    model,
+                    key_env,
+                    base_url,
+                    test_call,
+                    json,
+                },
+        } => oracle_check(
+            &CheckOptions {
+                model: model.clone(),
+                key_env: key_env.clone(),
+                base_url: base_url.clone(),
+                test_call: *test_call,
+            },
+            *json,
+        ),
     }
 }
 
@@ -1996,6 +2825,106 @@ mod tests {
                 "cortiq", "decide", "d.cmf", "--input", "r", "--labels", "a,b"
             ])
             .is_err()
+        );
+    }
+
+    #[test]
+    fn decide_parses_the_oracle_flags_which_need_oracle() {
+        match parse(&[
+            "cortiq",
+            "decide",
+            "d.cmf",
+            "--input",
+            "r.jsonl",
+            "--oracle",
+            "deepseek/deepseek-v4.1-flash",
+            "--oracle-budget",
+            "0.5",
+            "--oracle-max-calls",
+            "20",
+            "--oracle-key-env",
+            "MY_KEY",
+            "--oracle-base-url",
+            "http://127.0.0.1:9/api/v1",
+            "--oracle-max-price",
+            "0.2,0.8",
+            "--state",
+            "st",
+        ])
+        .unwrap()
+        .command
+        {
+            Commands::Decide(a) => {
+                let f = a.oracle.flags().unwrap();
+                assert_eq!(f.model, "deepseek/deepseek-v4.1-flash");
+                assert_eq!((f.budget_usd, f.max_calls), (Some(0.5), Some(20)));
+                assert_eq!(f.key_env.as_deref(), Some("MY_KEY"));
+                assert_eq!(f.base_url.as_deref(), Some("http://127.0.0.1:9/api/v1"));
+                assert_eq!(f.max_price, Some((0.2, 0.8)));
+                assert!(f.no_learning, "decide never teaches");
+                assert_eq!(a.state.as_deref(), Some(Path::new("st")));
+            }
+            _ => panic!("not decide"),
+        }
+        match parse(&["cortiq", "decide", "d.cmf", "-p", "x"])
+            .unwrap()
+            .command
+        {
+            Commands::Decide(a) => assert_eq!(a.oracle.flags(), None),
+            _ => panic!("not decide"),
+        }
+        for extra in [
+            &["--oracle-budget", "1"][..],
+            &["--oracle-max-calls", "1"],
+            &["--oracle-key-env", "K"],
+            &["--oracle-base-url", "http://127.0.0.1:9"],
+            &["--oracle-max-price", "1,2"],
+        ] {
+            let mut v = vec!["cortiq", "decide", "d.cmf", "-p", "x"];
+            v.extend_from_slice(extra);
+            assert!(parse(&v).is_err(), "{extra:?}");
+        }
+        // decision oracle check: defaults, and every flag.
+        match parse(&["cortiq", "decision", "oracle", "check"])
+            .unwrap()
+            .command
+        {
+            Commands::Decision {
+                cmd:
+                    DecisionCmd::Oracle {
+                        cmd:
+                            OracleCmd::Check {
+                                model,
+                                key_env,
+                                base_url,
+                                test_call,
+                                json,
+                            },
+                    },
+            } => {
+                assert_eq!(model, DEFAULT_ORACLE_MODEL);
+                assert_eq!(key_env, "OPENROUTER_API_KEY");
+                assert_eq!(base_url, "https://openrouter.ai/api/v1");
+                assert!(!test_call && !json);
+            }
+            _ => panic!("not oracle check"),
+        }
+        assert!(
+            parse(&[
+                "cortiq",
+                "decision",
+                "oracle",
+                "check",
+                "--model",
+                "a/b",
+                "--key-env",
+                "K",
+                "--base-url",
+                "http://127.0.0.1:9",
+                "--test-call",
+                "--json"
+            ])
+            .is_ok()
         );
     }
 

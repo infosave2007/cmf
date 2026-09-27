@@ -42,12 +42,25 @@
 //! name (an OpenRouter key pasted by mistake) is refused without being shown;
 //! so is an `--oracle` model id that looks like a key (`sk-…`), which is
 //! also never sent in a listing URL.
+//!
+//! `cortiq decide --oracle MODEL` takes the same flags ([`check_flags`] before
+//! any work, [`apply`] only when a question needs the oracle).
+//!
+//! `cortiq decision oracle check` ([`check`], [`CheckReport`]): (a) the key
+//! is in its variable; (b) `GET {base_url}/auth/key` with it (free) — valid,
+//! and the key's credit limit and usage when reported (its `label`, a masked
+//! form of the key, is never read); (c) the model's public endpoint listing
+//! (free, no key) — listed, structured outputs, the cheapest price; (d) with
+//! `--test-call` only, one tiny structured call ([`test_call`]: a two-option
+//! choice, `max_tokens` 16, through the oracle client and its reservation)
+//! and its cost. Ready only when every check passed.
 
 use crate::config::Config;
-use crate::oracle::{max_tokens, reservation_usd};
+use crate::oracle::{KeyLookup, max_tokens, reservation_usd};
 use anyhow::{Result, bail, ensure};
 use serde_json::{Map, Value, json};
 use std::io::Read;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Deadline of one listing request.
@@ -108,10 +121,15 @@ pub fn parse_max_price(s: &str) -> Result<(f64, f64)> {
 /// control character, no empty, `.` or `..` path segment, and not a key
 /// (`sk-…`; refused without being shown, and never put in a URL).
 fn check_model_id(model: &str) -> Result<()> {
+    check_model_id_as(model, "--oracle", "--oracle-key-env")
+}
+
+/// [`check_model_id`] with the flags' names as the command spells them.
+fn check_model_id_as(model: &str, flag: &str, key_env_flag: &str) -> Result<()> {
     ensure!(
         !model.starts_with("sk-"),
-        "--oracle takes an OpenRouter model id such as deepseek/deepseek-v4.1-flash, not the \
-         key: put the key in OPENROUTER_API_KEY (or the variable --oracle-key-env names); the \
+        "{flag} takes an OpenRouter model id such as deepseek/deepseek-v4.1-flash, not the \
+         key: put the key in OPENROUTER_API_KEY (or the variable {key_env_flag} names); the \
          given value ({} bytes) is not shown",
         model.len()
     );
@@ -120,7 +138,7 @@ fn check_model_id(model: &str) -> Result<()> {
             && model.len() <= 256
             && !model.chars().any(|c| c.is_whitespace() || c.is_control())
             && model.split('/').all(|seg| !matches!(seg, "" | "." | "..")),
-        "--oracle expects an OpenRouter model id such as deepseek/deepseek-v4.1-flash, got '{}'",
+        "{flag} expects an OpenRouter model id such as deepseek/deepseek-v4.1-flash, got '{}'",
         model.escape_debug()
     );
     Ok(())
@@ -245,13 +263,19 @@ pub struct ListedModel {
     pub completion: f64,
 }
 
-/// One GET without a key: `(status, body)` or a transport error.
-fn get(url: &str, cap: u64) -> std::result::Result<(u16, Vec<u8>), String> {
+/// One GET: `(status, body)` or a transport error. `key` is sent as
+/// `Authorization: Bearer` only when given (ureq's debug log redacts it); the
+/// listings are fetched without one.
+fn get(url: &str, cap: u64, key: Option<&str>) -> std::result::Result<(u16, Vec<u8>), String> {
     let agent = ureq::AgentBuilder::new()
         .timeout(PROBE_TIMEOUT)
         .redirects(0)
         .build();
-    let resp = match agent.get(url).set("Accept", "application/json").call() {
+    let mut req = agent.get(url).set("Accept", "application/json");
+    if let Some(k) = key {
+        req = req.set("Authorization", &format!("Bearer {k}"));
+    }
+    let resp = match req.call() {
         Ok(r) => r,
         Err(ureq::Error::Status(_, r)) => r,
         Err(ureq::Error::Transport(t)) => return Err(t.to_string()),
@@ -307,7 +331,7 @@ pub fn parse_endpoints(body: &[u8]) -> Option<Vec<Endpoint>> {
 /// `GET {base_url}/models/{model}/endpoints`, without a key.
 pub fn probe_endpoints(base_url: &str, model: &str) -> EndpointsProbe {
     let url = endpoints_url(base_url, model);
-    match get(&url, MAX_ENDPOINTS_BYTES) {
+    match get(&url, MAX_ENDPOINTS_BYTES, None) {
         Err(why) => EndpointsProbe::Unreachable(why),
         Ok((status @ (400 | 404), _)) => {
             EndpointsProbe::NotFound(format!("{url} answered HTTP {status}"))
@@ -358,7 +382,7 @@ pub fn parse_models(body: &[u8]) -> Option<Vec<ListedModel>> {
 /// `GET {base_url}/models`, without a key: the models with structured outputs.
 pub fn list_models(base_url: &str) -> std::result::Result<Vec<ListedModel>, String> {
     let url = models_url(base_url);
-    match get(&url, MAX_MODELS_BYTES)? {
+    match get(&url, MAX_MODELS_BYTES, None)? {
         (200, body) => parse_models(&body).ok_or_else(|| format!("{url}: not a model listing")),
         (status, _) => Err(format!("{url} answered HTTP {status}")),
     }
@@ -492,48 +516,74 @@ fn set_max_price(cfg: &mut Config, (prompt, completion): (f64, f64)) {
         .insert("max_price".into(), Value::Object(mp));
 }
 
-/// The refusal of a model the oracle cannot use, with suggestions.
-fn refuse(cfg: &Config, model: &str, problem: &str) -> anyhow::Error {
-    let base = &cfg.oracle.base_url;
-    let mtq = cfg.oracle.max_tokens_per_question;
-    let tail = match list_models(base) {
-        Ok(models) => {
-            let best = cheapest_models(&models, model, mtq, SUGGESTIONS);
-            if best.is_empty() {
-                " No model of the listing supports structured outputs.".to_string()
-            } else {
-                let names: Vec<String> = best
-                    .iter()
-                    .map(|m| {
-                        format!(
-                            "{} ({}/{} per 1M in/out)",
-                            m.id,
-                            usd(m.prompt),
-                            usd(m.completion)
-                        )
-                    })
-                    .collect();
-                format!(
-                    " Cheap models with structured outputs: {}. Start with --oracle {}",
-                    names.join(", "),
-                    best[0].id
-                )
-            }
-        }
-        Err(why) => format!(" (the model listing could not be fetched for suggestions: {why})"),
-    };
-    anyhow::anyhow!("--oracle {model}: {problem}.{tail}")
+/// Up to [`SUGGESTIONS`] of the cheapest structured-output models of the
+/// public model listing of `base_url` other than `model` (one GET, no key).
+pub fn suggest_models(
+    base_url: &str,
+    model: &str,
+    mtq: u32,
+) -> std::result::Result<Vec<ListedModel>, String> {
+    list_models(base_url).map(|models| cheapest_models(&models, model, mtq, SUGGESTIONS))
 }
 
-/// Apply `flags` to `cfg` (see the module notes) and check the model against
-/// the endpoint listing of `cfg.oracle.base_url` (one GET, no key; one more
-/// for suggestions when the model is refused). `config_sets_max_price`: the
-/// `--decision-config` file sets `oracle.provider` itself.
-pub fn apply(
+/// The sentence that follows a refused model: the suggestions, or why there
+/// are none.
+fn suggestions_tail(suggested: &std::result::Result<Vec<ListedModel>, String>) -> String {
+    match suggested {
+        Ok(best) if best.is_empty() => {
+            " No model of the listing supports structured outputs.".to_string()
+        }
+        Ok(best) => {
+            let names: Vec<String> = best
+                .iter()
+                .map(|m| {
+                    format!(
+                        "{} ({}/{} per 1M in/out)",
+                        m.id,
+                        usd(m.prompt),
+                        usd(m.completion)
+                    )
+                })
+                .collect();
+            format!(
+                " Cheap models with structured outputs: {}. Start with --oracle {}",
+                names.join(", "),
+                best[0].id
+            )
+        }
+        Err(why) => format!(" (the model listing could not be fetched for suggestions: {why})"),
+    }
+}
+
+/// The refusal of a model the oracle cannot use, with suggestions.
+fn refuse(cfg: &Config, model: &str, problem: &str) -> anyhow::Error {
+    let suggested = suggest_models(
+        &cfg.oracle.base_url,
+        model,
+        cfg.oracle.max_tokens_per_question,
+    );
+    anyhow::anyhow!(
+        "--oracle {model}: {problem}.{}",
+        suggestions_tail(&suggested)
+    )
+}
+
+/// Check `flags` without touching the network: the model id, the budget, the
+/// key variable's name (never echoed), the base URL (https, or plain http to
+/// a loopback address) and the max price. `cortiq decide --oracle` runs it
+/// before any work, the listing is fetched only when a question needs the
+/// oracle.
+pub fn check_flags(flags: &OracleFlags) -> Result<()> {
+    prepare(&mut Config::default(), flags, false).map(|_| ())
+}
+
+/// Everything [`apply`] does before the network: the flags into `cfg`, then
+/// the validation. `Some` names where a fixed max price came from.
+pub fn prepare(
     cfg: &mut Config,
     flags: &OracleFlags,
     config_sets_max_price: bool,
-) -> Result<OracleSetup> {
+) -> Result<Option<PriceSource>> {
     check_model_id(&flags.model)?;
     let o = &mut cfg.oracle;
     o.enabled = true;
@@ -575,6 +625,19 @@ pub fn apply(
     // The URL (https, or http to loopback) and the variable name are checked
     // before the listing is fetched.
     cfg.validate()?;
+    Ok(fixed)
+}
+
+/// Apply `flags` to `cfg` (see the module notes) and check the model against
+/// the endpoint listing of `cfg.oracle.base_url` (one GET, no key; one more
+/// for suggestions when the model is refused). `config_sets_max_price`: the
+/// `--decision-config` file sets `oracle.provider` itself.
+pub fn apply(
+    cfg: &mut Config,
+    flags: &OracleFlags,
+    config_sets_max_price: bool,
+) -> Result<OracleSetup> {
+    let fixed = prepare(cfg, flags, config_sets_max_price)?;
     let model = flags.model.clone();
     let mtq = cfg.oracle.max_tokens_per_question;
     let probe = probe_endpoints(&cfg.oracle.base_url, &model);
@@ -692,6 +755,662 @@ pub fn apply(
         probe,
         warnings,
     })
+}
+
+// ------------------------------------------------------------------ oracle check
+
+/// Largest `GET /auth/key` answer read.
+const MAX_KEY_BYTES: u64 = 64 << 10;
+/// `max_tokens` of the test call of `cortiq decision oracle check --test-call`.
+pub const TEST_CALL_MAX_TOKENS: u32 = 16;
+/// The most the test call may reserve, USD (a few thousand times its cost).
+pub const TEST_CALL_BUDGET_USD: f64 = 0.01;
+/// The state of the test call: a two-option choice.
+pub const TEST_CALL_STATE: &str = "Hello there, how are you today?";
+/// Where OpenRouter keys are created (for messages).
+pub const KEYS_PAGE: &str = "https://openrouter.ai/keys";
+
+/// `{base_url}/auth/key`.
+pub fn auth_key_url(base_url: &str) -> String {
+    format!("{}/auth/key", base_url.trim_end_matches('/'))
+}
+
+/// What `GET {base_url}/auth/key` reports about a key (amounts in USD).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct KeyInfo {
+    /// `limit`: the key's credit limit (`None`: no limit, or not reported).
+    pub limit: Option<f64>,
+    /// `usage`: spent through the key.
+    pub usage: Option<f64>,
+    /// `limit_remaining` (`None` without a limit).
+    pub limit_remaining: Option<f64>,
+    /// `is_free_tier`.
+    pub free_tier: Option<bool>,
+}
+
+impl KeyInfo {
+    /// The key's limit is used up: OpenRouter refuses its paid calls.
+    pub fn out_of_credit(&self) -> bool {
+        self.limit_remaining.is_some_and(|r| r <= 0.0)
+            || matches!((self.limit, self.usage), (Some(l), Some(u)) if u >= l)
+    }
+
+    pub fn to_json(&self) -> Value {
+        json!({
+            "limit_usd": self.limit,
+            "usage_usd": self.usage,
+            "limit_remaining_usd": self.limit_remaining,
+            "free_tier": self.free_tier,
+        })
+    }
+}
+
+/// A key-description body (`data`: `limit`, `usage`, `limit_remaining`,
+/// `is_free_tier`); `None` when the body does not have that shape. Its
+/// `label`, a masked form of the key, is never read.
+pub fn parse_key_info(body: &[u8]) -> Option<KeyInfo> {
+    let v: Value = serde_json::from_slice(body).ok()?;
+    let d = v.get("data")?.as_object()?;
+    let num = |k: &str| d.get(k).and_then(Value::as_f64).filter(|x| x.is_finite());
+    Some(KeyInfo {
+        limit: num("limit"),
+        usage: num("usage"),
+        limit_remaining: num("limit_remaining"),
+        free_tier: d.get("is_free_tier").and_then(Value::as_bool),
+    })
+}
+
+/// What `GET {base_url}/auth/key` (free) said about a key.
+#[derive(Clone, Debug, PartialEq)]
+pub enum KeyProbe {
+    /// HTTP 200: a valid key.
+    Valid(KeyInfo),
+    /// HTTP 401 or 403: not a valid key.
+    Refused(u16),
+    /// No usable answer (transport, another status, shape).
+    Unreachable(String),
+}
+
+/// `GET {base_url}/auth/key` with `key` (never part of a message: an answer
+/// is reduced to its status and the amounts above).
+pub fn probe_key(base_url: &str, key: &str) -> KeyProbe {
+    let url = auth_key_url(base_url);
+    match get(&url, MAX_KEY_BYTES, Some(key)) {
+        Err(why) => KeyProbe::Unreachable(why),
+        Ok((200, body)) => parse_key_info(&body).map_or_else(
+            || KeyProbe::Unreachable(format!("{url}: not a key description")),
+            KeyProbe::Valid,
+        ),
+        Ok((status @ (401 | 403), _)) => KeyProbe::Refused(status),
+        Ok((status, _)) => KeyProbe::Unreachable(format!("{url} answered HTTP {status}")),
+    }
+}
+
+/// Whether a model can be the oracle, from its public endpoint listing.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelCheck {
+    pub probe: EndpointsProbe,
+    /// The cheapest endpoint with structured outputs.
+    pub cheapest: Option<Endpoint>,
+    /// What is wrong: a code (`unknown_model`, `no_structured_outputs`,
+    /// `variable_price`, `listing_unreachable`) and a message.
+    pub problem: Option<(&'static str, String)>,
+    /// Cheap models with structured outputs (only when the model cannot be
+    /// used), or why the model listing could not be fetched.
+    pub suggestions: Option<std::result::Result<Vec<ListedModel>, String>>,
+}
+
+/// Check `model` against the endpoint listing of `base_url` (one GET, no
+/// key; one more for suggestions when it cannot be used).
+pub fn check_model(base_url: &str, model: &str, mtq: u32) -> ModelCheck {
+    let probe = probe_endpoints(base_url, model);
+    let no_json = |n: usize| {
+        (
+            "no_structured_outputs",
+            format!(
+                "none of its {n} endpoints supports structured outputs (response_format with a \
+                 JSON schema), which the oracle needs for typed verdicts"
+            ),
+        )
+    };
+    let (cheapest, problem) = match &probe {
+        EndpointsProbe::Found(eps) => match cheapest_structured(eps, mtq) {
+            Some(best) => (Some(best.clone()), None),
+            None => (None, Some(no_json(eps.len()))),
+        },
+        EndpointsProbe::NotFound(why) => (
+            None,
+            Some((
+                "unknown_model",
+                format!("{} does not list this model ({why})", host_of(base_url)),
+            )),
+        ),
+        EndpointsProbe::VariablePrice { structured: false } => (
+            None,
+            Some((
+                "no_structured_outputs",
+                "none of its endpoints supports structured outputs (response_format with a JSON \
+                 schema), which the oracle needs for typed verdicts"
+                    .to_string(),
+            )),
+        ),
+        EndpointsProbe::VariablePrice { structured: true } => (
+            None,
+            Some((
+                "variable_price",
+                format!(
+                    "{} lists it only with variable pricing: --oracle needs --oracle-max-price \
+                     IN,OUT for it (or use a concrete model)",
+                    host_of(base_url)
+                ),
+            )),
+        ),
+        EndpointsProbe::Unreachable(why) => (
+            None,
+            Some((
+                "listing_unreachable",
+                format!("the endpoint listing could not be fetched ({why})"),
+            )),
+        ),
+    };
+    let suggestions = match &problem {
+        Some((code, _)) if *code != "listing_unreachable" => {
+            Some(suggest_models(base_url, model, mtq))
+        }
+        _ => None,
+    };
+    ModelCheck {
+        probe,
+        cheapest,
+        problem,
+        suggestions,
+    }
+}
+
+/// The test call of `oracle check --test-call`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TestCall {
+    /// The oracle answered with one of the two options.
+    pub answered: bool,
+    pub choice: Option<String>,
+    /// `usage.cost` (also of a billed failure).
+    pub cost_usd: Option<f64>,
+    pub reserved_usd: f64,
+    pub provider: Option<String>,
+    pub latency_ms: Option<f64>,
+    /// A short error code (`http_402`, `transport_io`, `invalid_json`, a
+    /// refusal such as `budget`), never content.
+    pub error: Option<String>,
+}
+
+impl TestCall {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "ok": self.answered,
+            "choice": self.choice,
+            "cost_usd": self.cost_usd,
+            "reserved_usd": self.reserved_usd,
+            "provider": self.provider,
+            "latency_ms": self.latency_ms,
+            "error": self.error,
+        })
+    }
+}
+
+/// A temporary reservation ledger for the test call (removed after it).
+fn temp_ledger() -> Result<std::path::PathBuf> {
+    use rand_core::{OsRng, RngCore};
+    let mut b = [0u8; 8];
+    OsRng
+        .try_fill_bytes(&mut b)
+        .map_err(|e| anyhow::anyhow!("OS random number generator: {e}"))?;
+    let tag: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    Ok(std::env::temp_dir().join(format!(
+        "cortiq-oracle-check-{}-{tag}.jsonl",
+        std::process::id()
+    )))
+}
+
+/// One tiny structured call through [`crate::oracle::OracleClient`] (the
+/// reservation, the response checks): a two-option choice about
+/// [`TEST_CALL_STATE`] with `max_tokens` [`TEST_CALL_MAX_TOKENS`], admitted
+/// only when its reservation fits [`TEST_CALL_BUDGET_USD`]. `oracle` gives the
+/// model, the base URL, the key variable and the max price. The ledger is a
+/// temporary file, removed after the call.
+pub fn test_call(oracle: &crate::config::OracleConfig, key: KeyLookup) -> Result<TestCall> {
+    use crate::oracle::{CallOutcome, Caller, OracleClient};
+    use crate::protocol::{Question, QuestionKind};
+    let mut cfg = oracle.clone();
+    cfg.enabled = true;
+    cfg.max_tokens_per_question = TEST_CALL_MAX_TOKENS;
+    cfg.budget_usd = TEST_CALL_BUDGET_USD;
+    cfg.max_calls = 1;
+    cfg.max_errors = 1;
+    let q = Question {
+        id: "greeting".into(),
+        kind: QuestionKind::Choice,
+        instructions: json!("Is the text a greeting?"),
+        criteria: Some(json!({
+            "yes": "The text greets someone.",
+            "no": "The text does not greet anyone.",
+        })),
+    };
+    let ledger = temp_ledger()?;
+    let outcome = (|| -> Result<CallOutcome> {
+        let client = OracleClient::open(&cfg, &ledger, None, key)?;
+        let caller = Caller {
+            request_id: "oracle-check",
+            account: "oracle-check",
+            key12: None,
+            key_budget_usd: None,
+            credit_left_usd: None,
+        };
+        Ok(client.call(&caller, &[&q], &json!(TEST_CALL_STATE)))
+    })();
+    let _ = std::fs::remove_file(&ledger);
+    let body = crate::oracle::request_body(&cfg, &[&q], &json!(TEST_CALL_STATE));
+    let reserved_usd = reservation_usd(
+        body.len(),
+        max_tokens(cfg.max_tokens_per_question, 1),
+        cfg.max_price()?,
+    );
+    Ok(match outcome? {
+        CallOutcome::Answered(a) => TestCall {
+            answered: true,
+            choice: a
+                .verdicts
+                .first()
+                .and_then(|v| v.label())
+                .map(str::to_string),
+            cost_usd: Some(a.usage.cost),
+            reserved_usd: a.reserved_usd,
+            provider: a.provider,
+            latency_ms: Some(a.latency.as_secs_f64() * 1e3),
+            error: None,
+        },
+        CallOutcome::Failed(f) => TestCall {
+            answered: false,
+            choice: None,
+            cost_usd: f.billed.map(|u| u.cost),
+            reserved_usd,
+            provider: None,
+            latency_ms: None,
+            error: Some(f.error),
+        },
+        CallOutcome::Refused(r) => TestCall {
+            answered: false,
+            choice: None,
+            cost_usd: None,
+            reserved_usd,
+            provider: None,
+            latency_ms: None,
+            error: Some(r.flag().to_string()),
+        },
+    })
+}
+
+/// What `cortiq decision oracle check` checks.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CheckOptions {
+    pub model: String,
+    /// The NAME of the variable holding the key.
+    pub key_env: String,
+    pub base_url: String,
+    /// Make one tiny structured call ([`test_call`]).
+    pub test_call: bool,
+}
+
+/// The answer of `cortiq decision oracle check` (never a key).
+#[derive(Clone, Debug, PartialEq)]
+pub struct CheckReport {
+    pub options: CheckOptions,
+    /// (a) the variable holds a key.
+    pub key_present: bool,
+    /// (b) `GET /auth/key` (`None`: not checked, no key).
+    pub account: Option<KeyProbe>,
+    /// (c) `GET /models/{model}/endpoints`.
+    pub model: ModelCheck,
+    /// The max price `--oracle` would set: twice the cheapest endpoint's.
+    pub max_price: Option<(f64, f64)>,
+    /// (d) with `--test-call`: the call, or why it was not made.
+    pub test_call: Option<std::result::Result<TestCall, String>>,
+}
+
+/// One failed check: (check, code, message).
+pub type Problem = (&'static str, &'static str, String);
+
+impl CheckReport {
+    /// What is not ready, in check order (empty: ready).
+    pub fn problems(&self) -> Vec<Problem> {
+        let o = &self.options;
+        let mut v: Vec<Problem> = Vec::new();
+        if !self.key_present {
+            v.push((
+                "key",
+                "no_key",
+                format!(
+                    "{} is not set: export {}=<your OpenRouter key> (create one at {KEYS_PAGE})",
+                    o.key_env, o.key_env
+                ),
+            ));
+        }
+        match &self.account {
+            Some(KeyProbe::Refused(status)) => v.push((
+                "account",
+                "key_refused",
+                format!(
+                    "OpenRouter refused the key (HTTP {status}): {} does not hold a valid key \
+                     (create one at {KEYS_PAGE})",
+                    o.key_env
+                ),
+            )),
+            Some(KeyProbe::Unreachable(why)) => v.push((
+                "account",
+                "account_unreachable",
+                format!("the key could not be checked: {why}"),
+            )),
+            Some(KeyProbe::Valid(info)) if info.out_of_credit() => v.push((
+                "account",
+                "no_credit",
+                format!(
+                    "the key has no credit left ({}): raise its limit or add credits on openrouter.ai",
+                    credit_text(info)
+                ),
+            )),
+            _ => {}
+        }
+        if let Some((code, msg)) = &self.model.problem {
+            v.push(("model", code, msg.clone()));
+        }
+        if let Some(Ok(t)) = &self.test_call
+            && !t.answered
+        {
+            v.push((
+                "test_call",
+                "test_call_failed",
+                format!(
+                    "the test call failed ({})",
+                    t.error.as_deref().unwrap_or("no answer")
+                ),
+            ));
+        }
+        v
+    }
+
+    /// Every check passed (and the test call answered, when asked).
+    pub fn ready(&self) -> bool {
+        self.problems().is_empty()
+    }
+
+    /// The flags that give `--oracle` this check's settings.
+    pub fn oracle_flags(&self) -> String {
+        let o = &self.options;
+        let mut s = format!("--oracle {}", o.model);
+        if o.key_env != crate::config::DEFAULT_ORACLE_KEY_ENV {
+            s.push_str(&format!(" --oracle-key-env {}", o.key_env));
+        }
+        if o.base_url != crate::config::DEFAULT_ORACLE_BASE_URL {
+            s.push_str(&format!(" --oracle-base-url {}", o.base_url));
+        }
+        s
+    }
+
+    pub fn to_json(&self) -> Value {
+        let o = &self.options;
+        let account = match &self.account {
+            None => json!({"checked": false, "ok": false}),
+            Some(KeyProbe::Valid(info)) => {
+                let mut v = info.to_json();
+                v["checked"] = json!(true);
+                v["ok"] = json!(!info.out_of_credit());
+                v["status"] = json!(200);
+                v
+            }
+            Some(KeyProbe::Refused(s)) => json!({"checked": true, "ok": false, "status": s}),
+            Some(KeyProbe::Unreachable(why)) => {
+                json!({"checked": true, "ok": false, "error": why})
+            }
+        };
+        let m = &self.model;
+        let (endpoints, structured) = match &m.probe {
+            EndpointsProbe::Found(eps) => (
+                json!(eps.len()),
+                json!(eps.iter().filter(|e| e.structured).count()),
+            ),
+            _ => (Value::Null, Value::Null),
+        };
+        let found = match &m.probe {
+            EndpointsProbe::Found(_) | EndpointsProbe::VariablePrice { .. } => json!(true),
+            EndpointsProbe::NotFound(_) => json!(false),
+            EndpointsProbe::Unreachable(_) => Value::Null,
+        };
+        let suggestions = match &m.suggestions {
+            Some(Ok(list)) => json!(
+                list.iter()
+                    .map(|s| json!({"id": s.id, "prompt": s.prompt, "completion": s.completion}))
+                    .collect::<Vec<_>>()
+            ),
+            _ => json!([]),
+        };
+        let test_call = match &self.test_call {
+            None => Value::Null,
+            Some(Ok(t)) => t.to_json(),
+            Some(Err(why)) => json!({"ok": false, "made": false, "reason": why}),
+        };
+        let problems: Vec<Value> = self
+            .problems()
+            .into_iter()
+            .map(|(check, code, message)| json!({"check": check, "code": code, "message": message}))
+            .collect();
+        json!({
+            "ready": problems.is_empty(),
+            "model": o.model,
+            "base_url": o.base_url,
+            "key_env": o.key_env,
+            "key": {"present": self.key_present, "ok": self.key_present},
+            "account": account,
+            "model_check": {
+                "ok": m.problem.is_none(),
+                "found": found,
+                "endpoints": endpoints,
+                "structured_endpoints": structured,
+                "cheapest": m.cheapest.as_ref().map(|e| json!({
+                    "provider": e.provider, "prompt": e.prompt, "completion": e.completion,
+                })),
+                "max_price": self.max_price.map(|(p, c)| json!({"prompt": p, "completion": c})),
+                "suggestions": suggestions,
+            },
+            "test_call": test_call,
+            "problems": problems,
+        })
+    }
+
+    /// The human-readable report (never a key).
+    pub fn render(&self) -> String {
+        let o = &self.options;
+        let problems = self.problems();
+        let failed = |check: &str| problems.iter().find(|p| p.0 == check);
+        let mut s = format!("Oracle check: {} via {}\n", o.model, host_of(&o.base_url));
+        let line = |s: &mut String, ok: Option<bool>, what: &str, text: &str| {
+            let mark = match ok {
+                Some(true) => "✓",
+                Some(false) => "✗",
+                None => "–",
+            };
+            s.push_str(&format!("  {mark} {what:<10} {text}\n"));
+        };
+        match failed("key") {
+            Some(p) => line(&mut s, Some(false), "key", &p.2),
+            None => line(&mut s, Some(true), "key", &format!("{} is set", o.key_env)),
+        }
+        match (&self.account, failed("account")) {
+            (None, _) => line(&mut s, None, "account", "not checked (no key)"),
+            (_, Some(p)) => line(&mut s, Some(false), "account", &p.2),
+            (Some(KeyProbe::Valid(info)), None) => line(
+                &mut s,
+                Some(true),
+                "account",
+                &format!("the key is valid ({})", credit_text(info)),
+            ),
+            (Some(_), None) => {}
+        }
+        match failed("model") {
+            Some(p) => {
+                let tail = self
+                    .model
+                    .suggestions
+                    .as_ref()
+                    .map(suggestions_tail)
+                    .unwrap_or_default();
+                line(&mut s, Some(false), "model", &format!("{}.{tail}", p.2));
+            }
+            None => {
+                let (n, js) = match &self.model.probe {
+                    EndpointsProbe::Found(eps) => {
+                        (eps.len(), eps.iter().filter(|e| e.structured).count())
+                    }
+                    _ => (0, 0),
+                };
+                let best = self.model.cheapest.as_ref();
+                let text = match (best, self.max_price) {
+                    (Some(e), Some((p, c))) => format!(
+                        "{n} endpoints, {js} with structured outputs; the cheapest is {} at \
+                         {}/{} per 1M in/out, so --oracle sets the max price to {}/{}",
+                        e.provider,
+                        usd(e.prompt),
+                        usd(e.completion),
+                        usd(p),
+                        usd(c)
+                    ),
+                    _ => format!("{n} endpoints, {js} with structured outputs"),
+                };
+                line(&mut s, Some(true), "model", &text);
+            }
+        }
+        match &self.test_call {
+            None => line(
+                &mut s,
+                None,
+                "test call",
+                "not made (--test-call makes one tiny structured call, a small fraction of a cent)",
+            ),
+            Some(Err(why)) => line(&mut s, None, "test call", &format!("not made: {why}")),
+            Some(Ok(t)) if t.answered => line(
+                &mut s,
+                Some(true),
+                "test call",
+                &format!(
+                    "answered '{}' for {} (reserved {}{}{})",
+                    t.choice.as_deref().unwrap_or("?"),
+                    t.cost_usd.map_or("?".to_string(), usd),
+                    usd(t.reserved_usd),
+                    t.provider
+                        .as_deref()
+                        .map(|p| format!(", provider {p}"))
+                        .unwrap_or_default(),
+                    t.latency_ms
+                        .map(|ms| format!(", {ms:.0} ms"))
+                        .unwrap_or_default()
+                ),
+            ),
+            Some(Ok(t)) => line(
+                &mut s,
+                Some(false),
+                "test call",
+                &format!(
+                    "failed: {}{}",
+                    t.error.as_deref().unwrap_or("no answer"),
+                    t.cost_usd
+                        .map(|c| format!(" (billed {})", usd(c)))
+                        .unwrap_or_default()
+                ),
+            ),
+        }
+        if problems.is_empty() {
+            let flags = self.oracle_flags();
+            s.push_str(&format!(
+                "ready: cortiq serve FILE {flags}   (or: cortiq decide FILE -p TEXT {flags})\n"
+            ));
+        } else {
+            s.push_str(&format!(
+                "NOT ready: {} problem{} (✗ above)\n",
+                problems.len(),
+                if problems.len() == 1 { "" } else { "s" }
+            ));
+        }
+        s
+    }
+}
+
+/// `credit limit $10.00, $1.25 used, $8.75 left` (or what the key reports).
+fn credit_text(info: &KeyInfo) -> String {
+    let used = info.usage.map(|u| format!("{} used", usd(u)));
+    let mut parts = Vec::new();
+    match info.limit {
+        Some(l) => parts.push(format!("credit limit {}", usd(l))),
+        None => parts.push("no credit limit on the key".to_string()),
+    }
+    parts.extend(used);
+    if let Some(r) = info.limit_remaining {
+        parts.push(format!("{} left", usd(r.max(0.0))));
+    }
+    if info.free_tier == Some(true) {
+        parts.push("free tier".to_string());
+    }
+    parts.join(", ")
+}
+
+/// `cortiq decision oracle check` (see [`CheckReport`]): (a) the key in the
+/// variable, (b) `GET {base}/auth/key` with it (free), (c) the model's
+/// public endpoint listing (free, no key), (d) with `test_call` one tiny
+/// structured call — made only when (a)–(c) passed. The flags are checked
+/// before the network (a key typed as the model or the variable's name is
+/// refused without being shown); the key is read from `key` and never kept
+/// in the report.
+pub fn check(opts: &CheckOptions, key: &KeyLookup) -> Result<CheckReport> {
+    check_model_id_as(&opts.model, "--model", "--key-env")?;
+    ensure!(
+        crate::config::is_env_name(&opts.key_env),
+        "--key-env takes the NAME of the variable that holds the key (e.g. OPENROUTER_API_KEY), \
+         not the key itself; the given value ({} bytes) is not shown",
+        opts.key_env.len()
+    );
+    let mut cfg = Config::default();
+    cfg.oracle.model = opts.model.clone();
+    cfg.oracle.api_key_env = opts.key_env.clone();
+    cfg.oracle.base_url = opts.base_url.clone();
+    cfg.validate()?;
+    let base = &opts.base_url;
+    let mtq = cfg.oracle.max_tokens_per_question;
+    let (key_present, account) = match key(&opts.key_env) {
+        Some(k) => (true, Some(probe_key(base, &k))),
+        None => (false, None),
+    };
+    let model = check_model(base, &opts.model, mtq);
+    let max_price = model
+        .cheapest
+        .as_ref()
+        .map(|e| (e.prompt * PRICE_HEADROOM, e.completion * PRICE_HEADROOM));
+    let mut report = CheckReport {
+        options: opts.clone(),
+        key_present,
+        account,
+        model,
+        max_price,
+        test_call: None,
+    };
+    if opts.test_call {
+        let blocked = report.problems();
+        report.test_call = Some(match (blocked.first(), report.max_price) {
+            (Some((check, _, _)), _) => Err(format!("the {check} check failed")),
+            (None, None) => Err("no max price".into()),
+            (None, Some(mp)) => {
+                set_max_price(&mut cfg, mp);
+                Ok(test_call(&cfg.oracle, Arc::clone(key))?)
+            }
+        });
+    }
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -1022,6 +1741,164 @@ mod tests {
         assert!(parse_max_price("0.1").is_err());
         assert!(parse_max_price("-1,2").is_err());
         assert!(parse_max_price("x,2").is_err());
+    }
+
+    fn key_description() -> String {
+        json!({"data": {"label": "sk-or-v1-abc...xyz", "limit": 10, "usage": 1.25,
+                        "limit_remaining": 8.75, "is_free_tier": false}})
+        .to_string()
+    }
+
+    fn check_opts(model: &str, base: &str) -> CheckOptions {
+        CheckOptions {
+            model: model.into(),
+            key_env: "UNIT_OR_KEY".into(),
+            base_url: base.into(),
+            test_call: false,
+        }
+    }
+
+    #[test]
+    fn check_reports_the_key_the_account_and_the_model() {
+        let m = mock(vec![
+            ("/api/v1/auth/key", 200, key_description()),
+            (
+                "/api/v1/models/a/b/endpoints",
+                200,
+                endpoints(json!([
+                    ep("Plain", "0.00000001", "0.00000001", false),
+                    ep("Cheap", "0.000000035", "0.00000029", true),
+                ])),
+            ),
+            (
+                "/api/v1/models/a/plain/endpoints",
+                200,
+                endpoints(json!([ep("P", "0.0000001", "0.0000001", false)])),
+            ),
+            ("/api/v1/models", 200, models()),
+        ]);
+        let secret = "sk-or-v1-unit-check-0011223344556677";
+        let key: KeyLookup = Arc::new(move |n| (n == "UNIT_OR_KEY").then(|| secret.to_string()));
+        let r = check(&check_opts("a/b", &m.base), &key).unwrap();
+        assert!(r.ready(), "{:?}", r.problems());
+        assert_eq!(r.max_price, Some((0.07, 0.58)));
+        assert_eq!(
+            r.account,
+            Some(KeyProbe::Valid(KeyInfo {
+                limit: Some(10.0),
+                usage: Some(1.25),
+                limit_remaining: Some(8.75),
+                free_tier: Some(false),
+            }))
+        );
+        let text = r.render();
+        assert!(
+            text.contains(
+                "✓ account    the key is valid (credit limit $10.00, $1.25 used, $8.75 left)"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "ready: cortiq serve FILE --oracle a/b --oracle-key-env UNIT_OR_KEY --oracle-base-url {}",
+                m.base
+            )),
+            "{text}"
+        );
+        let j = r.to_json().to_string();
+        for t in [&text, &j] {
+            assert!(!t.contains(secret) && !t.contains("sk-or-v1-abc"), "{t}");
+        }
+        // The key went to /auth/key only, as a bearer; the listing had none.
+        let heads = m.heads.lock().unwrap().clone();
+        for h in &heads {
+            let bearer = h.contains(&format!("Bearer {secret}"));
+            assert_eq!(bearer, h.starts_with("GET /api/v1/auth/key "), "{h}");
+        }
+
+        // No key: the account is not checked, the model still is.
+        let none: KeyLookup = Arc::new(|_| None);
+        let r = check(&check_opts("a/b", &m.base), &none).unwrap();
+        let p = r.problems();
+        assert_eq!((p.len(), p[0].0, p[0].1), (1, "key", "no_key"));
+        assert!(r.account.is_none() && r.model.problem.is_none());
+        assert!(r.render().contains("– account    not checked (no key)"));
+        // --test-call is not made when a check failed.
+        let mut o = check_opts("a/b", &m.base);
+        o.test_call = true;
+        let r = check(&o, &none).unwrap();
+        assert_eq!(r.test_call, Some(Err("the key check failed".into())));
+        // An unknown model and one without structured outputs, with suggestions.
+        let r = check(&check_opts("a/nope", &m.base), &key).unwrap();
+        let (code, msg) = r.model.problem.clone().unwrap();
+        assert_eq!(code, "unknown_model");
+        assert!(msg.contains("HTTP 404"), "{msg}");
+        assert!(
+            r.render()
+                .contains("Cheap models with structured outputs: x/cheap"),
+            "{}",
+            r.render()
+        );
+        let r = check(&check_opts("a/plain", &m.base), &key).unwrap();
+        assert_eq!(r.model.problem.as_ref().unwrap().0, "no_structured_outputs");
+        assert_eq!(r.to_json()["model_check"]["structured_endpoints"], 0);
+    }
+
+    #[test]
+    fn check_refuses_keys_in_flags_and_reads_refused_or_empty_accounts() {
+        let refused = mock(vec![(
+            "/api/v1/auth/key",
+            401,
+            "{\"error\":{\"code\":401}}".into(),
+        )]);
+        assert_eq!(probe_key(&refused.base, "k"), KeyProbe::Refused(401));
+        let broke = mock(vec![(
+            "/api/v1/auth/key",
+            200,
+            json!({"data": {"limit": 5, "usage": 5.0, "limit_remaining": 0}}).to_string(),
+        )]);
+        let KeyProbe::Valid(info) = probe_key(&broke.base, "k") else {
+            panic!("valid")
+        };
+        assert!(info.out_of_credit());
+        let unlimited = parse_key_info(br#"{"data":{"limit":null,"usage":0.5}}"#).unwrap();
+        assert!(!unlimited.out_of_credit());
+        assert_eq!(
+            credit_text(&unlimited),
+            "no credit limit on the key, $0.50 used"
+        );
+        assert!(matches!(
+            probe_key(&mock(vec![]).base, "k"),
+            KeyProbe::Unreachable(_)
+        ));
+        // A key typed as the model or the variable's name: refused, not shown,
+        // nothing sent.
+        let m = mock(vec![]);
+        let key = "sk-or-v1-00112233445566778899aabbccddeeff";
+        let none: KeyLookup = Arc::new(|_| None);
+        let e = check(&check_opts(key, &m.base), &none)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("--model takes an OpenRouter model id"), "{e}");
+        let mut o = check_opts("a/b", &m.base);
+        o.key_env = key.into();
+        let e2 = check(&o, &none).unwrap_err().to_string();
+        assert!(e2.contains("--key-env takes the NAME"), "{e2}");
+        for e in [&e, &e2] {
+            assert!(!e.contains("00112233"), "{e}");
+        }
+        assert!(m.heads.lock().unwrap().is_empty(), "no request was made");
+        // Plain http to a non-loopback address is refused before the network.
+        let e = check(&check_opts("a/b", "http://10.0.0.5:8080/v1"), &none)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("loopback"), "{e}");
+        // check_flags: the same checks as apply, without the network.
+        let mut f = flags(key, &m.base);
+        assert!(check_flags(&f).is_err());
+        f.model = "a/b".into();
+        assert!(check_flags(&f).is_ok());
+        assert!(m.heads.lock().unwrap().is_empty(), "no request was made");
     }
 
     #[test]

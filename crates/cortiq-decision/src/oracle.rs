@@ -499,6 +499,14 @@ fn replay_ledger(path: &Path) -> Result<(LedgerTotals, Vec<OpenReservation>, u64
     Ok((totals, unclosed, cut))
 }
 
+/// The totals of a reservation ledger as [`OracleClient::open`] replays it
+/// (a reservation still open counts in full), without changing the file: a
+/// missing file has none. `cortiq decide --oracle` starts its per-run budget
+/// from them.
+pub fn ledger_totals(path: &Path) -> Result<LedgerTotals> {
+    replay_ledger(path).map(|(totals, _, _)| totals)
+}
+
 // ------------------------------------------------------------------ client
 
 /// Who pays for a call.
@@ -618,6 +626,21 @@ impl OracleClient {
         state: Option<&Path>,
         key: KeyLookup,
     ) -> Result<Self> {
+        Self::open_with(cfg, ledger, state, state.is_some(), key)
+    }
+
+    /// [`OracleClient::open`] where `persist` decides whether the stop state
+    /// is written back to `state`: with `false` the file (a server's switch
+    /// and stop reason) is read and holds, but nothing is ever written to it
+    /// — a command-line run's own stops live in memory (`cortiq decide
+    /// --oracle`).
+    pub fn open_with(
+        cfg: &OracleConfig,
+        ledger: &Path,
+        state: Option<&Path>,
+        persist: bool,
+        key: KeyLookup,
+    ) -> Result<Self> {
         let max_price = cfg.max_price()?;
         ensure!(
             cfg.deadline_s.is_finite() && cfg.deadline_s > 0.0,
@@ -667,7 +690,7 @@ impl OracleClient {
             key,
             agent,
             ledger_path: ledger.to_path_buf(),
-            state_path: state.map(Path::to_path_buf),
+            state_path: state.filter(|_| persist).map(Path::to_path_buf),
             inner: Mutex::new(Inner {
                 ledger: file,
                 totals,
@@ -1354,5 +1377,14 @@ mod tests {
         assert!(open2.is_empty());
         assert_eq!(cut2, 0);
         assert_eq!(t2.spent, t.spent);
+        // The read-only totals agree and change nothing; no file, no totals.
+        let bytes = std::fs::read(&p).unwrap();
+        let lt = ledger_totals(&p).unwrap();
+        assert_eq!((lt.spent, lt.calls), (t2.spent, t2.calls));
+        assert_eq!(std::fs::read(&p).unwrap(), bytes);
+        assert_eq!(
+            ledger_totals(&dir.path().join("none.jsonl")).unwrap(),
+            LedgerTotals::default()
+        );
     }
 }
