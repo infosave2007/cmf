@@ -902,6 +902,24 @@ async fn payload_too_large_bad_requests_and_unknown_models() {
             .unwrap()
             .contains("duplicate key 'a'")
     );
+    // A truncated body: "not valid JSON" once.
+    let cut = br#"{"model":"cortiq/decision","state":"x","questions":{"t":{"type":"choice","instructions":"i","#;
+    let r = srv
+        .call(
+            "POST",
+            "/api/alpha/decisions",
+            &[("content-type", "application/json")],
+            Some(cut.to_vec()),
+        )
+        .await;
+    assert_eq!(r.openrouter_error(), (400, "INVALID_REQUEST".to_string()));
+    assert_eq!(
+        r.body["error"]["message"],
+        format!(
+            "the body is not valid JSON: expected a string key at byte {}",
+            cut.len()
+        )
+    );
     // Content type.
     let r = srv
         .call(

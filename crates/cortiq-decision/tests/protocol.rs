@@ -714,6 +714,32 @@ fn duplicate_key_error_names_the_field() {
 }
 
 #[test]
+fn malformed_json_is_named_once() {
+    // A body cut after a comma (a request truncated in transit).
+    let body = r#"{"model":"cortiq/decision","state":"s","questions":{"t":{"type":"choice","instructions":"i","#;
+    let e = parse_request(body.as_bytes(), &RequestLimits::default()).unwrap_err();
+    assert_eq!((e.status, e.reason), (400, Reason::InvalidRequest));
+    assert_eq!(
+        e.message,
+        format!(
+            "the body is not valid JSON: expected a string key at byte {}",
+            body.len()
+        )
+    );
+    let e = parse_request(b"{\"a\":1} x", &RequestLimits::default()).unwrap_err();
+    assert_eq!(
+        e.message,
+        "the body is not valid JSON: trailing characters at byte 8"
+    );
+    let e = parse_request(b"\"\xff\"", &RequestLimits::default()).unwrap_err();
+    assert!(
+        e.message.starts_with("the body is not UTF-8 JSON: "),
+        "{}",
+        e.message
+    );
+}
+
+#[test]
 fn error_envelope_has_the_openrouter_shape() {
     let e = ApiError::new(Reason::RateLimited, "slow down")
         .with_retry_after(12)
