@@ -37,7 +37,7 @@ use cortiq_decision::oracle::{self, process_env};
 use cortiq_decision::protocol::{
     ModelRule, Question, QuestionKind, parse_request, validate_decisions_response, wire_questions,
 };
-use cortiq_decision::service::{Action, AdminCommand, Principal};
+use cortiq_decision::service::{Action, AdminCommand, OracleStatus, Principal};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -621,9 +621,12 @@ fn max_errors_in_a_row_stop_the_oracle() {
         flags(&st.decide(&topics_body(&r[2])).unwrap(), 0),
         vec!["oracle_unavailable"]
     );
+    // One failure after a success does not stop; the count of failures in
+    // a row is kept in oracle.state (it survives a restart).
     assert_eq!(
         st.oracle_state(),
-        Value::Null,
+        json!({"enabled": true, "stop_reason": null, "stopped_unix": null,
+               "budget_usd": null, "max_calls": null, "consecutive_errors": 1}),
         "one failure after a success does not stop"
     );
     assert_eq!(
@@ -642,6 +645,86 @@ fn max_errors_in_a_row_stop_the_oracle() {
         .filter(|l| l["status"] == "failed_unknown_cost")
         .count();
     assert_eq!(failed, 3);
+}
+
+#[test]
+fn failures_in_a_row_count_across_restarts_and_a_resume_clears_them() {
+    // Every call fails (HTTP 500, no cost): with max_errors 2, one failure
+    // before a restart and one after stop the oracle — the count is kept in
+    // oracle.state, as `cortiq decide -p` runs (one call each) need.
+    let mock = MockOracle::start(|_| raw_reply(500, r#"{"error":{"message":"upstream"}}"#));
+    let mut cfg = stand_config(&mock.url());
+    cfg.oracle.max_errors = 2;
+    let st = Stand::new(&cfg);
+    let r = rejected();
+    assert_eq!(
+        flags(&st.decide(&topics_body(&r[0])).unwrap(), 0),
+        vec!["oracle_unavailable"]
+    );
+    assert_eq!(
+        st.cascade.oracle().last_error().as_deref(),
+        Some("http_500")
+    );
+    assert_eq!(st.oracle_state()["consecutive_errors"], 1);
+    assert_eq!(st.oracle_state()["stop_reason"], Value::Null);
+    // A failed call with no reported cost is charged its reservation, and
+    // counted as such.
+    let t = st.cascade.oracle().totals();
+    assert!(
+        t.unknown_cost > 0.0 && (t.unknown_cost - t.spent).abs() < 1e-15,
+        "{t:?}"
+    );
+    let st = st.restart(&cfg);
+    assert_eq!(st.cascade.oracle().totals().unknown_cost, t.unknown_cost);
+    assert_eq!(st.cascade.oracle().last_error(), None, "in memory only");
+    assert_eq!(
+        flags(&st.decide(&topics_body(&r[1])).unwrap(), 0),
+        vec!["oracle_unavailable"]
+    );
+    assert_eq!(st.oracle_state()["stop_reason"], "max_errors");
+    assert_eq!(
+        flags(&st.decide(&topics_body(&r[2])).unwrap(), 0),
+        vec!["stopped"]
+    );
+    assert_eq!(mock.hits(), 2);
+    // Resumed on disk (the command line's --oracle-resume, no server
+    // running): the stop and the count are cleared, the admin limits kept.
+    let path = st.state.oracle_state_path();
+    let st = {
+        let Stand {
+            dir,
+            svc,
+            cascade,
+            handle,
+            state,
+            ..
+        } = st;
+        drop((svc, cascade, handle, state));
+        let mut state: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        state["budget_usd"] = json!(0.5);
+        std::fs::write(&path, state.to_string()).unwrap();
+        let before = oracle::resume_state_file(&path)
+            .unwrap()
+            .expect("it was stopped");
+        assert_eq!(before.stop_reason.as_deref(), Some("max_errors"));
+        assert_eq!(before.consecutive_errors, 2);
+        let after: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            after,
+            json!({"enabled": true, "stop_reason": null, "stopped_unix": null,
+                   "budget_usd": 0.5, "max_calls": null})
+        );
+        // Nothing left to resume: nothing written.
+        assert_eq!(oracle::resume_state_file(&path).unwrap(), None);
+        Stand::open(dir, &cfg, test_key_lookup())
+    };
+    assert_eq!(st.cascade.oracle().status(), OracleStatus::Ready);
+    assert_eq!(
+        flags(&st.decide(&topics_body(&r[3])).unwrap(), 0),
+        vec!["oracle_unavailable"]
+    );
+    assert_eq!(mock.hits(), 3);
+    assert_eq!(st.oracle_state()["consecutive_errors"], 1);
 }
 
 // ------------------------------------------------------------------ bad answers

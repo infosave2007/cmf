@@ -53,14 +53,41 @@ impl StateLock {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// A detached way to remove this lock from elsewhere (a signal handler
+    /// that ends the process, which runs no destructors): it removes the file
+    /// only while it still holds this lock's content.
+    pub fn release_handle(&self) -> LockRelease {
+        LockRelease {
+            path: self.path.clone(),
+            content: self.content.clone(),
+        }
+    }
 }
 
 impl Drop for StateLock {
     fn drop(&mut self) {
-        // A lock broken and retaken by another process is not ours to remove.
-        if fs::read_to_string(&self.path).is_ok_and(|c| c == self.content) {
-            let _ = fs::remove_file(&self.path);
+        LockRelease {
+            path: std::mem::take(&mut self.path),
+            content: std::mem::take(&mut self.content),
         }
+        .release();
+    }
+}
+
+/// See [`StateLock::release_handle`].
+#[derive(Clone, Debug)]
+pub struct LockRelease {
+    path: PathBuf,
+    content: String,
+}
+
+impl LockRelease {
+    /// Remove the lock file if it is still this lock (a lock broken and
+    /// retaken by another process is not ours to remove); `true` when removed.
+    pub fn release(&self) -> bool {
+        fs::read_to_string(&self.path).is_ok_and(|c| c == self.content)
+            && fs::remove_file(&self.path).is_ok()
     }
 }
 

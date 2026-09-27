@@ -1373,9 +1373,12 @@ async fn budget_max_calls_and_stop_rules_over_http() {
         srv.decide(&topics_body(&r[2])).await.flags(),
         json!(["oracle_unavailable"])
     );
+    // One failure after a success does not stop; the count of failures in
+    // a row is kept in oracle.state (it survives a restart).
     assert_eq!(
         srv.oracle_state(),
-        Value::Null,
+        json!({"enabled": true, "stop_reason": null, "stopped_unix": null,
+               "budget_usd": null, "max_calls": null, "consecutive_errors": 1}),
         "one failure after a success does not stop"
     );
     assert_eq!(

@@ -142,9 +142,11 @@ a new label starts a cold start.
   finite `usage.cost` ≥ 0, `finish_reason: stop`, exactly the asked question
   ids with the schema's types. A 200 that carries only an `error` is a failure.
 * **Stop rules** switch the oracle off (reason in `oracle.state`) until
-  `POST /v1/admin/oracle {"enabled": true}`: HTTP 401, 402 or 403 from
-  OpenRouter; a returned model that is not the configured one; a cost above the
-  reservation; `max_errors` failures in a row.
+  `POST /v1/admin/oracle {"enabled": true}` (or `cortiq decide … --oracle
+  --oracle-resume` on a state directory no server holds): HTTP 401, 402 or
+  403 from OpenRouter; a returned model that is not the configured one; a
+  cost above the reservation; `max_errors` failures in a row (counted across
+  restarts and `cortiq decide` runs).
 * `GET /v1/admin/oracle` shows spent, reserved, remaining, calls, failures and
   the stop reason; `POST /v1/admin/oracle` can switch the oracle and lower
   `budget_usd` / `max_calls` within the configured values.

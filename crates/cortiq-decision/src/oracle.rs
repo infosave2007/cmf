@@ -49,9 +49,11 @@
 //! full and closed with `failed_unknown_cost` (`unsettled_at_start`).
 //!
 //! **Stop rules** (the oracle stays off until `POST /v1/admin/oracle
-//! {"enabled":true}`; the reason is kept in `oracle.state`): HTTP 401/402/403,
-//! `unexpected_model`, a cost above the reservation (the answer itself is kept)
-//! and `max_errors` failed calls in a row.
+//! {"enabled":true}`, or `cortiq decide --oracle-resume`; the reason is kept in
+//! `oracle.state`): HTTP 401/402/403, `unexpected_model`, a cost above the
+//! reservation (the answer itself is kept) and `max_errors` failed calls in a
+//! row — counted across restarts and command-line runs, since the count is
+//! kept in `oracle.state` too while it is not zero.
 //!
 //! **Status** ([`OracleClient::status`], `status` of `GET /v1/admin/oracle`):
 //! `disabled` (not configured, or the admin switch is off), `no_key` (the
@@ -360,7 +362,8 @@ pub fn process_env() -> KeyLookup {
 
 // ------------------------------------------------------------------ state file
 
-/// `oracle.state`: the runtime switch, the stop reason and the admin limits.
+/// `oracle.state`: the runtime switch, the stop reason, the admin limits and
+/// the failed calls in a row.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct OracleState {
@@ -373,6 +376,14 @@ pub struct OracleState {
     pub budget_usd: Option<f64>,
     /// Admin call limit, at most `oracle.max_calls`.
     pub max_calls: Option<u64>,
+    /// Failed calls in a row (the `max_errors` rule), kept across restarts
+    /// and command-line runs; written only while not zero.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub consecutive_errors: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 impl Default for OracleState {
@@ -383,8 +394,48 @@ impl Default for OracleState {
             stopped_unix: None,
             budget_usd: None,
             max_calls: None,
+            consecutive_errors: 0,
         }
     }
+}
+
+impl OracleState {
+    /// Whether a stop rule or the admin switch keeps the oracle off.
+    pub fn is_off(&self) -> bool {
+        !self.enabled || self.stop_reason.is_some()
+    }
+}
+
+/// Read `oracle.state` (a missing file is the default state).
+pub fn read_state_file(path: &Path) -> Result<OracleState> {
+    match std::fs::read(path) {
+        Ok(b) => serde_json::from_slice(&b).with_context(|| format!("parse {}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(OracleState::default()),
+        Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+/// Switch the oracle of `oracle.state` on again, as `POST /v1/admin/oracle
+/// {"enabled":true}` does on a running server: the admin switch on, the stop
+/// reason and the failed calls in a row cleared, the admin limits kept. The
+/// caller holds the state directory's `LOCK` (no server runs on it). `Some`:
+/// the state before, when the oracle was off (stopped or switched off);
+/// nothing is written when there is nothing to clear.
+pub fn resume_state_file(path: &Path) -> Result<Option<OracleState>> {
+    let before = read_state_file(path)?;
+    if !before.is_off() && before.consecutive_errors == 0 {
+        return Ok(None);
+    }
+    let after = OracleState {
+        enabled: true,
+        stop_reason: None,
+        stopped_unix: None,
+        consecutive_errors: 0,
+        ..before.clone()
+    };
+    let bytes = serde_json::to_vec_pretty(&after).expect("the oracle state serialises");
+    atomic_write(path, &bytes).with_context(|| format!("write {}", path.display()))?;
+    Ok(before.is_off().then_some(before))
 }
 
 // ------------------------------------------------------------------ ledger
@@ -400,6 +451,10 @@ pub const LEDGER_FAILED_UNKNOWN: &str = "failed_unknown_cost";
 pub struct LedgerTotals {
     /// Charged: costs of settled and billed calls, reservations of the others.
     pub spent: f64,
+    /// Of `spent`: the reservations charged in full for failed calls that
+    /// reported no cost (`failed_unknown_cost`; OpenRouter may have billed
+    /// less, or nothing, as for a refused key).
+    pub unknown_cost: f64,
     /// Reservations of calls in flight.
     pub inflight: f64,
     /// Reservations made (every attempted call).
@@ -475,6 +530,9 @@ fn replay_ledger(path: &Path) -> Result<(LedgerTotals, Vec<OpenReservation>, u64
                 })?;
                 open.remove(&id);
                 totals.spent += charged;
+                if st == LEDGER_FAILED_UNKNOWN {
+                    totals.unknown_cost += charged;
+                }
                 *totals.per_key.entry(key).or_insert(0.0) += charged;
                 if st == LEDGER_SETTLED {
                     totals.settled += 1;
@@ -492,6 +550,7 @@ fn replay_ledger(path: &Path) -> Result<(LedgerTotals, Vec<OpenReservation>, u64
     let mut unclosed = Vec::new();
     for (id, (r, key)) in open {
         totals.spent += r;
+        totals.unknown_cost += r;
         *totals.per_key.entry(key.clone()).or_insert(0.0) += r;
         totals.failed += 1;
         unclosed.push((id, r, key));
@@ -573,7 +632,8 @@ struct Inner {
     ledger: File,
     totals: LedgerTotals,
     state: OracleState,
-    consecutive_errors: u32,
+    /// The error code of the last failed call of this process.
+    last_error: Option<String>,
 }
 
 /// The OpenRouter client with its ledger and stop state.
@@ -584,6 +644,9 @@ pub struct OracleClient {
     agent: ureq::Agent,
     ledger_path: PathBuf,
     state_path: Option<PathBuf>,
+    /// A fired stop rule is logged at WARN (else at DEBUG: the caller reports
+    /// it itself, as `cortiq decision oracle check`).
+    warn_on_stop: bool,
     inner: Mutex<Inner>,
 }
 
@@ -626,21 +689,6 @@ impl OracleClient {
         state: Option<&Path>,
         key: KeyLookup,
     ) -> Result<Self> {
-        Self::open_with(cfg, ledger, state, state.is_some(), key)
-    }
-
-    /// [`OracleClient::open`] where `persist` decides whether the stop state
-    /// is written back to `state`: with `false` the file (a server's switch
-    /// and stop reason) is read and holds, but nothing is ever written to it
-    /// — a command-line run's own stops live in memory (`cortiq decide
-    /// --oracle`).
-    pub fn open_with(
-        cfg: &OracleConfig,
-        ledger: &Path,
-        state: Option<&Path>,
-        persist: bool,
-        key: KeyLookup,
-    ) -> Result<Self> {
         let max_price = cfg.max_price()?;
         ensure!(
             cfg.deadline_s.is_finite() && cfg.deadline_s > 0.0,
@@ -671,13 +719,7 @@ impl OracleClient {
             .with_context(|| format!("write {}", ledger.display()))?;
         }
         let state_value = match state {
-            Some(p) => match std::fs::read(p) {
-                Ok(b) => {
-                    serde_json::from_slice(&b).with_context(|| format!("parse {}", p.display()))?
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => OracleState::default(),
-                Err(e) => return Err(e).with_context(|| format!("read {}", p.display())),
-            },
+            Some(p) => read_state_file(p)?,
             None => OracleState::default(),
         };
         let agent = ureq::AgentBuilder::new()
@@ -690,14 +732,28 @@ impl OracleClient {
             key,
             agent,
             ledger_path: ledger.to_path_buf(),
-            state_path: state.filter(|_| persist).map(Path::to_path_buf),
+            state_path: state.map(Path::to_path_buf),
+            warn_on_stop: true,
             inner: Mutex::new(Inner {
                 ledger: file,
                 totals,
                 state: state_value,
-                consecutive_errors: 0,
+                last_error: None,
             }),
         })
+    }
+
+    /// Log a fired stop rule at DEBUG instead of WARN: the caller reports it
+    /// (`cortiq decision oracle check --test-call`).
+    pub fn quiet_stops(mut self) -> Self {
+        self.warn_on_stop = false;
+        self
+    }
+
+    /// The error code of the last failed call of this process (`http_401`,
+    /// `transport_io`, `invalid_json`, …), never content.
+    pub fn last_error(&self) -> Option<String> {
+        self.inner.lock().last_error.clone()
     }
 
     pub fn config(&self) -> &OracleConfig {
@@ -785,6 +841,8 @@ impl OracleClient {
         Ok(())
     }
 
+    /// Write `oracle.state` (a no-op offline). Called with the client's lock
+    /// held, so that concurrent writes land in the order of the changes.
     fn persist_state(&self, st: &OracleState) {
         if let Some(p) = &self.state_path {
             let bytes = serde_json::to_vec_pretty(st).expect("the oracle state serialises");
@@ -946,6 +1004,9 @@ impl OracleClient {
             let t = &mut inner.totals;
             t.inflight = (t.inflight - res).max(0.0);
             t.spent += charged;
+            if status == LEDGER_FAILED_UNKNOWN {
+                t.unknown_cost += charged;
+            }
             let k = t.per_key.entry(key_id.to_string()).or_insert(0.0);
             *k = (*k - res).max(0.0) + charged;
             if status == LEDGER_SETTLED {
@@ -955,13 +1016,15 @@ impl OracleClient {
             }
         }
         let mut stop = stop;
-        if matches!(outcome, CallOutcome::Failed(_)) {
-            inner.consecutive_errors += 1;
-            if inner.consecutive_errors >= self.cfg.max_errors {
+        let errors_before = inner.state.consecutive_errors;
+        if let CallOutcome::Failed(f) = outcome {
+            inner.last_error = Some(f.error.clone());
+            inner.state.consecutive_errors = errors_before.saturating_add(1);
+            if inner.state.consecutive_errors >= self.cfg.max_errors {
                 stop = stop.or_else(|| Some("max_errors".into()));
             }
         } else {
-            inner.consecutive_errors = 0;
+            inner.state.consecutive_errors = 0;
         }
         if usage.is_some_and(|u| u.cost > res) {
             stop = stop.or_else(|| Some("cost_above_reservation".into()));
@@ -979,15 +1042,21 @@ impl OracleClient {
         if let Err(e) = write_line(&mut inner.ledger, &line) {
             tracing::error!(error = %e, "oracle ledger settle write failed");
         }
+        let mut changed = inner.state.consecutive_errors != errors_before;
         if let Some(reason) = stop
             && inner.state.stop_reason.is_none()
         {
-            tracing::warn!(reason = %reason, call = %call_id, "oracle stopped by a stop rule");
+            if self.warn_on_stop {
+                tracing::warn!(reason = %reason, call = %call_id, "oracle stopped by a stop rule");
+            } else {
+                tracing::debug!(reason = %reason, call = %call_id, "oracle stopped by a stop rule");
+            }
             inner.state.stop_reason = Some(reason);
             inner.state.stopped_unix = Some(now_unix());
-            let st = inner.state.clone();
-            drop(inner);
-            self.persist_state(&st);
+            changed = true;
+        }
+        if changed {
+            self.persist_state(&inner.state);
         }
     }
 
@@ -1090,7 +1159,7 @@ impl OracleClient {
             "max_calls_limit": self.cfg.max_calls,
             "settled": t.settled,
             "failed": t.failed,
-            "consecutive_errors": inner.consecutive_errors,
+            "consecutive_errors": inner.state.consecutive_errors,
             "max_errors": self.cfg.max_errors,
             "deadline_s": self.cfg.deadline_s,
             "redact_pii": self.cfg.redact_pii,
@@ -1166,12 +1235,14 @@ impl OracleClient {
         }
         {
             let mut inner = self.inner.lock();
-            if st.enabled && st.stop_reason.is_none() {
-                inner.consecutive_errors = 0;
-            }
-            inner.state = st.clone();
+            st.consecutive_errors = if st.enabled && st.stop_reason.is_none() {
+                0
+            } else {
+                inner.state.consecutive_errors
+            };
+            inner.state = st;
+            self.persist_state(&inner.state);
         }
-        self.persist_state(&st);
         Ok(self.status_json())
     }
 
