@@ -33,9 +33,14 @@
 //!   inherited as ignored, as SIGHUP under `nohup`, stays ignored), and
 //!   `--break-lock` removes one left by a process that is gone;
 //! * `cortiq decision oracle check [--model M] [--key-env VAR] [--base-url
-//!   URL] [--test-call] [--json]`: is the oracle ready — the key, the account
-//!   (`GET /auth/key`), the model's endpoints, and with `--test-call` one tiny
-//!   structured call; exit code 0 only when ready;
+//!   URL] [--max-price IN,OUT] [--test-call] [--json]`: is the oracle ready —
+//!   the key, the account (`GET /auth/key`), the model's endpoints, and with
+//!   `--test-call` one tiny structured call; exit code 0 only when ready;
+//! * the key, on every oracle surface: read from its variable less
+//!   surrounding whitespace (a warning says so), `bad_key` when what is left
+//!   is not a key (never sent); a missing one is worded for the command line
+//!   (`OPENROUTER_API_KEY is not set (decide --oracle reads the key from the
+//!   environment)`), also when labels no skill has leave only the oracle;
 //! * `cortiq decision init | train | add-skill | learn | info | verify |
 //!   materialize | rollback | keys | oracle check`;
 //! * `cortiq serve FILE` on a decision file: the decisions server on
@@ -537,8 +542,8 @@ fn resume_oracle(root: &Path, flags: &OracleFlags, break_lock: bool) -> Result<(
                 .last_error
                 .as_deref()
                 .map(|e| format!(
-                    " (the last: {})",
-                    oracle_setup::explain_oracle_error(e, key_env, &flags.model)
+                    " ({})",
+                    oracle_setup::explain_last_error(e, key_env, &flags.model)
                 ))
                 .unwrap_or_default(),
             limits()
@@ -920,8 +925,10 @@ impl RowOracle {
 
     /// Why an abstained row was not answered (its most specific flag).
     fn reason(&self) -> &str {
-        if self.flags.iter().any(|f| f == "no_key") {
-            return "no_key";
+        for key in ["no_key", "bad_key"] {
+            if self.flags.iter().any(|f| f == key) {
+                return key;
+            }
         }
         self.flags
             .iter()
@@ -940,7 +947,7 @@ struct BatchTally {
     oracle: usize,
     cache: usize,
     abstained: usize,
-    /// Abstained rows by reason (`budget`, `no_key`, `stopped`,
+    /// Abstained rows by reason (`budget`, `no_key`, `bad_key`, `stopped`,
     /// `oracle_unavailable`, …).
     reasons: BTreeMap<String, usize>,
     /// Σ `usage.cost` of the answered calls.
@@ -1031,18 +1038,23 @@ impl BatchTally {
     }
 }
 
-/// The oracle of `decide --oracle` without its key: every undetermined
-/// question is refused with `no_key`, as a server without the key refuses
-/// it — no network, no state directory.
-struct NoKeyOracle;
+/// The oracle of `decide --oracle` without a usable key: every undetermined
+/// question is refused with `no_key` (the variable is unset) or `bad_key`
+/// (it holds something that is not a key), as a server refuses it — no
+/// network, no state directory.
+struct KeylessOracle {
+    /// `NoKey` or `BadKey`.
+    reason: RefusalReason,
+    status: OracleStatus,
+}
 
-impl Escalator for NoKeyOracle {
+impl Escalator for KeylessOracle {
     fn escalate(&self, e: &Escalation<'_>) -> EscalationResult {
         EscalationResult {
             resolved: e
                 .pending
                 .iter()
-                .map(|_| Resolved::new(Resolution::Refused(RefusalReason::NoKey)))
+                .map(|_| Resolved::new(Resolution::Refused(self.reason)))
                 .collect(),
             usage: Default::default(),
         }
@@ -1057,7 +1069,7 @@ impl Escalator for NoKeyOracle {
     }
 
     fn oracle_status(&self) -> Option<OracleStatus> {
-        Some(OracleStatus::NoKey)
+        Some(self.status.clone())
     }
 }
 
@@ -1100,8 +1112,8 @@ struct RunTotals {
 /// under its `LOCK` for the run), with the budget and call limit of this run
 /// on top of what its ledger already holds; learning is off. The stop rules
 /// hold as on a server: a stop is written to `oracle.state` and keeps the
-/// oracle off for later runs until `--oracle-resume`. Without the key,
-/// [`NoKeyOracle`] (no network, no state).
+/// oracle off for later runs until `--oracle-resume`. Without a usable key,
+/// [`KeylessOracle`] (no network, no state).
 struct OracleRun {
     svc: DecisionService,
     cascade: Option<Arc<Cascade>>,
@@ -1143,9 +1155,19 @@ impl OracleRun {
             .key_env
             .clone()
             .unwrap_or_else(|| DEFAULT_ORACLE_KEY_ENV.to_string());
-        if (oracle::process_env())(&key_env).is_none() {
+        let keyless = match oracle::read_key(&oracle::process_env(), &key_env).0 {
+            oracle::KeyState::Missing => Some((RefusalReason::NoKey, OracleStatus::NoKey)),
+            oracle::KeyState::Bad(p) => Some((RefusalReason::BadKey, OracleStatus::BadKey(p))),
+            oracle::KeyState::Usable { trimmed } => {
+                if trimmed > 0 {
+                    eprintln!("warning: {}", oracle::trimmed_warning(&key_env, trimmed));
+                }
+                None
+            }
+        };
+        if let Some((reason, status)) = keyless {
             oracle_setup::prepare(&mut cfg, flags, false)?;
-            let esc: Arc<dyn Escalator> = Arc::new(NoKeyOracle);
+            let esc: Arc<dyn Escalator> = Arc::new(KeylessOracle { reason, status });
             return Ok(Self {
                 svc: DecisionService::open(Arc::clone(handle), cfg.clone(), Some(esc))?,
                 cascade: None,
@@ -1338,9 +1360,10 @@ impl OracleRun {
                 if self.max_calls == 1 { "" } else { "s" }
             ),
             Some(Limit::RunBudget) | None if t.calls == 0 => format!(
-                "the oracle budget of this run ({}) cannot hold one call ({reserves} before it is \
-                 sent): pass a larger --oracle-budget",
+                "the oracle budget of this run ({}) is too small to hold one call ({reserves} \
+                 before it is sent): pass --oracle-budget of at least {}",
                 usd(self.budget),
+                usd(next),
             ),
             Some(Limit::RunBudget) | None => format!(
                 "the oracle budget of this run is used up ({} of {} spent, {} of {} calls; \
@@ -1371,8 +1394,94 @@ impl OracleRun {
         }
     }
 
+    /// The oracle's status for this run: the client's, except that a budget
+    /// that refused the run's first call (nothing spent or reserved in this
+    /// run, or in the ledger for an admin limit) is `budget_too_small`, with
+    /// the reservation that did not fit — `budget_exhausted` is kept for a
+    /// budget something was spent from.
     fn status(&self) -> OracleStatus {
-        self.svc.oracle_status()
+        let s = self.svc.oracle_status();
+        let Some(c) = &self.cascade else {
+            return s;
+        };
+        let t = self.totals();
+        if t.calls > 0 {
+            return s;
+        }
+        let refused = c.oracle().last_budget_refusal();
+        let next = match (&s, refused) {
+            (OracleStatus::BudgetExhausted | OracleStatus::BudgetTooSmall { .. }, r) => {
+                r.unwrap_or_else(|| self.least_reservation())
+            }
+            (OracleStatus::Ready, Some(r)) => r,
+            _ => return s,
+        };
+        let spent_before = t.ledger_calls > 0 || t.ledger_spent > 0.0;
+        match self.binding_limit(next) {
+            Some(Limit::RunBudget | Limit::RunCalls) => {
+                OracleStatus::BudgetTooSmall { min_usd: next }
+            }
+            Some(Limit::AdminBudget(_) | Limit::AdminCalls(_)) if !spent_before => {
+                OracleStatus::BudgetTooSmall { min_usd: next }
+            }
+            Some(_) => OracleStatus::BudgetExhausted,
+            None => s,
+        }
+    }
+
+    /// Why a missing or unusable key keeps the oracle off, in the command
+    /// line's words, and what to do (`None`: the key is usable). Never a
+    /// byte of the key.
+    fn key_problem(&self) -> Option<String> {
+        let k = &self.key_env;
+        match self.svc.oracle_status() {
+            OracleStatus::NoKey => Some(format!(
+                "{k} is not set (decide --oracle reads the key from the environment): export \
+                 {k}=<your OpenRouter key> (create one at {}) and run again; `{}` tests it",
+                oracle_setup::KEYS_PAGE,
+                self.check_command(false),
+            )),
+            OracleStatus::BadKey(p) => Some(format!(
+                "{} (decide --oracle reads the key from the environment; nothing was sent with \
+                 it): fix the variable and run again; `{}` tests it",
+                oracle::bad_key_text(k, &p),
+                self.check_command(false),
+            )),
+            _ => None,
+        }
+    }
+
+    /// The error of `decide -p` whose labels no skill has when the oracle
+    /// could not answer them, in the command line's words (the service's
+    /// are a server's).
+    fn untrained_error(&self, e: ApiError, labels: &[String]) -> anyhow::Error {
+        let untrained = e
+            .details
+            .as_ref()
+            .is_some_and(|d| d.contains_key("questions"));
+        if !untrained {
+            return api_error(e);
+        }
+        let why = self.key_problem().or_else(|| {
+            let flag = match e.reason {
+                protocol::Reason::OracleBudgetExhausted => "budget",
+                protocol::Reason::OracleDisabled => "stopped",
+                protocol::Reason::OracleUnavailable => {
+                    cortiq_decision::service::FLAG_ORACLE_UNAVAILABLE
+                }
+                _ => return None,
+            };
+            self.hint(&[flag.to_string()])
+        });
+        let what = if labels.is_empty() {
+            "no skill decides this question".to_string()
+        } else {
+            format!("no skill has the labels {}", labels.join(", "))
+        };
+        match why {
+            Some(w) => anyhow::anyhow!("{what}, so only the oracle can answer, and {w}"),
+            None => api_error(e),
+        }
     }
 
     /// Money and calls of this run (the ledger's own counting) and of the
@@ -1474,12 +1583,11 @@ impl OracleRun {
                         .unwrap_or_default()
                 )
             }
-            OracleStatus::NoKey => format!(
-                "oracle: NOT ready — {k} is not set (export {k}=<your OpenRouter key>; `{}` tests it): the rows the gate rejects abstain",
-                self.check_command(false),
-                k = self.key_env
+            OracleStatus::NoKey | OracleStatus::BadKey(_) => format!(
+                "oracle: NOT ready — {}. The rows the gate rejects abstain",
+                self.key_problem().unwrap_or_default()
             ),
-            OracleStatus::BudgetExhausted => {
+            OracleStatus::BudgetExhausted | OracleStatus::BudgetTooSmall { .. } => {
                 format!("oracle: NOT ready — {} ({what})", self.budget_text(None))
             }
             other => match self.inherited_hint() {
@@ -1493,13 +1601,8 @@ impl OracleRun {
     /// fired in this run (never the key).
     fn hint(&self, flags: &[String]) -> Option<String> {
         let has = |f: &str| flags.iter().any(|x| x == f);
-        if has("no_key") {
-            return Some(format!(
-                "the oracle key is not set: export {k}=<your OpenRouter key> (create one at {}) and run again; `{}` tests the setup",
-                oracle_setup::KEYS_PAGE,
-                self.check_command(false),
-                k = self.key_env
-            ));
+        if has("no_key") || has("bad_key") {
+            return self.key_problem();
         }
         if has("stopped") || has("oracle_disabled") {
             if let Some(h) = self.inherited_hint() {
@@ -1541,10 +1644,23 @@ impl OracleRun {
     /// `cmf.oracle` of `--json` (never the key).
     fn json(&self) -> Value {
         let t = self.totals();
+        let st = self.cascade.as_ref().map(|c| c.oracle().state());
+        let status = self.status();
         json!({
             "model": self.model,
             "asked": true,
-            "status": self.status().label(),
+            "status": status.label(),
+            "key_problem": match &status {
+                OracleStatus::BadKey(p) => Some(p.as_str()),
+                _ => None,
+            },
+            "min_call_usd": match &status {
+                OracleStatus::BudgetTooSmall { min_usd } => Some(*min_usd),
+                _ => None,
+            },
+            "stop_reason": st.as_ref().and_then(|s| s.stop_reason.clone()),
+            "last_error": st.as_ref().and_then(|s| s.last_error.clone())
+                .or_else(|| self.cascade.as_ref().and_then(|c| c.oracle().last_error())),
             "key_env": self.key_env,
             "base_url": self.base_url,
             "budget_usd": self.budget,
@@ -1672,10 +1788,10 @@ fn decide_one(model: DecisionModel, a: &DecideArgs, oracle: Option<&OracleFlags>
         flags,
         a.oracle.break_lock,
     )?;
-    let mut decided = run
-        .svc
-        .decide(&req, &OracleRun::principal())
-        .map_err(api_error)?;
+    let mut decided = match run.svc.decide(&req, &OracleRun::principal()) {
+        Ok(d) => d,
+        Err(e) => return Err(run.untrained_error(e, &a.labels)),
+    };
     let flags_seen: Vec<String> = decided
         .questions
         .iter()
@@ -2177,7 +2293,7 @@ pub enum DecisionCmd {
 }
 
 /// `cortiq decision oracle …`.
-#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+#[derive(Subcommand, Debug, Clone, PartialEq)]
 pub enum OracleCmd {
     /// Is the oracle ready? (a) the key is in its variable; (b) GET
     /// /auth/key accepts it (free; the key's credit limit and usage); (c) the
@@ -2199,6 +2315,13 @@ pub enum OracleCmd {
         /// made only when the other checks pass
         #[arg(long)]
         test_call: bool,
+        /// Max price in USD per 1M prompt and completion tokens, e.g. 1,4:
+        /// what --oracle-max-price would give --oracle. Needed for a model
+        /// listed only with variable pricing (e.g. openrouter/auto); for
+        /// another, some structured-output endpoint must fit it [default:
+        /// twice the model's cheapest structured-output endpoint]
+        #[arg(long, value_name = "IN,OUT", value_parser = parse_max_price)]
+        max_price: Option<(f64, f64)>,
         /// Print the report as one JSON line
         #[arg(long)]
         json: bool,
@@ -2209,6 +2332,13 @@ pub enum OracleCmd {
 /// when ready.
 fn oracle_check(opts: &CheckOptions, as_json: bool) -> Result<()> {
     let report = oracle_setup::check(opts, &oracle::process_env())?;
+    let trimmed = report.key.trimmed();
+    if trimmed > 0 {
+        eprintln!(
+            "warning: {}",
+            oracle::trimmed_warning(&opts.key_env, trimmed)
+        );
+    }
     if as_json {
         println!("{}", report.to_json());
     } else {
@@ -2338,6 +2468,7 @@ pub fn run_decision(cmd: &DecisionCmd) -> Result<()> {
                     key_env,
                     base_url,
                     test_call,
+                    max_price,
                     json,
                 },
         } => oracle_check(
@@ -2346,6 +2477,7 @@ pub fn run_decision(cmd: &DecisionCmd) -> Result<()> {
                 key_env: key_env.clone(),
                 base_url: base_url.clone(),
                 test_call: *test_call,
+                max_price: *max_price,
             },
             *json,
         ),
@@ -3396,6 +3528,7 @@ mod tests {
                                 key_env,
                                 base_url,
                                 test_call,
+                                max_price,
                                 json,
                             },
                     },
@@ -3404,26 +3537,38 @@ mod tests {
                 assert_eq!(key_env, "OPENROUTER_API_KEY");
                 assert_eq!(base_url, "https://openrouter.ai/api/v1");
                 assert!(!test_call && !json);
+                assert_eq!(max_price, None);
             }
             _ => panic!("not oracle check"),
         }
-        assert!(
-            parse(&[
-                "cortiq",
-                "decision",
-                "oracle",
-                "check",
-                "--model",
-                "a/b",
-                "--key-env",
-                "K",
-                "--base-url",
-                "http://127.0.0.1:9",
-                "--test-call",
-                "--json"
-            ])
-            .is_ok()
-        );
+        match parse(&[
+            "cortiq",
+            "decision",
+            "oracle",
+            "check",
+            "--model",
+            "a/b",
+            "--key-env",
+            "K",
+            "--base-url",
+            "http://127.0.0.1:9",
+            "--test-call",
+            "--max-price",
+            "1,4",
+            "--json",
+        ])
+        .unwrap()
+        .command
+        {
+            Commands::Decision {
+                cmd:
+                    DecisionCmd::Oracle {
+                        cmd: OracleCmd::Check { max_price, .. },
+                    },
+            } => assert_eq!(max_price, Some((1.0, 4.0))),
+            _ => panic!("not oracle check"),
+        }
+        assert!(parse(&["cortiq", "decision", "oracle", "check", "--max-price", "1"]).is_err());
     }
 
     #[test]

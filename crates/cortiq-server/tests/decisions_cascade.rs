@@ -1387,6 +1387,14 @@ async fn budget_max_calls_and_stop_rules_over_http() {
         json!(["oracle_unavailable"])
     );
     assert_eq!(srv.oracle_state()["stop_reason"], "max_errors");
+    // The admin view names the last failure's code.
+    let st = srv.admin("GET", "/v1/admin/oracle", None).await;
+    assert_eq!(
+        (st.body["status"].as_str(), st.body["last_error"].as_str()),
+        (Some("stopped: max_errors"), Some("http_500")),
+        "{}",
+        st.text
+    );
     assert_eq!(
         srv.decide(&topics_body(&r[4])).await.flags(),
         json!(["stopped"])
@@ -2021,6 +2029,176 @@ async fn oracle_flag_opens_the_loopback_open_mode_and_status_and_hints_name_ever
     enable(&srv).await;
     assert_eq!(status(&srv).await, "ready");
     assert_eq!(mock.hits(), 2);
+}
+
+/// A key read with surrounding whitespace is trimmed and works; one that is
+/// still not a key (a NUL, CR LF, whitespace or a byte outside ASCII inside
+/// it, `Bearer `, quotes) is `bad_key`: never sent, named by position in the
+/// status and the hint, never echoed in an answer, a status or a state file.
+/// A budget that cannot hold one call is `budget_too_small` (with the
+/// minimum), one that was spent `budget_exhausted`.
+#[tokio::test]
+async fn keys_are_trimmed_or_refused_unsent_and_budgets_name_their_state() {
+    let mock = MockOracle::answering("travel");
+    let lookup = |raw: String| -> KeyLookup {
+        Arc::new(move |name: &str| (name == KEY_ENV).then(|| raw.clone()))
+    };
+    let no_key_bytes = |text: &str, what: &str| {
+        for needle in [TEST_KEY, "TESTKEY-wp7", "0123456789abcdef"] {
+            assert!(!text.contains(needle), "{what} holds key bytes\n{text}");
+        }
+    };
+    // Surrounding whitespace (a .env file's CR LF): trimmed, the key alone
+    // is sent.
+    let srv = Srv::open_on(
+        &toy().path,
+        tempfile::tempdir().unwrap(),
+        &stand_config(&mock.url()),
+        lookup(format!(" {TEST_KEY}\r\n")),
+    );
+    let s = srv.admin("GET", "/v1/admin/oracle", None).await;
+    assert_eq!(
+        (s.body["status"].as_str(), s.body["key_trimmed"].as_bool()),
+        (Some("ready"), Some(true)),
+        "{}",
+        s.text
+    );
+    let r = srv.decide(&topics_body(&rejected()[0])).await;
+    assert_eq!(r.action(), "oracle", "{}", r.text);
+    assert_eq!(
+        mock.requests()[0].header("authorization"),
+        Some(format!("Bearer {TEST_KEY}").as_str())
+    );
+    drop(srv);
+
+    let hits = mock.hits();
+    let bad = [
+        (format!("{TEST_KEY}\0"), "a control character at byte"),
+        (
+            format!("{}\r\n{}", &TEST_KEY[..12], &TEST_KEY[12..]),
+            "a control character at byte 13",
+        ),
+        (
+            format!("{} {}", &TEST_KEY[..12], &TEST_KEY[12..]),
+            "whitespace inside it at byte 13",
+        ),
+        (
+            format!("{}\t{}", &TEST_KEY[..12], &TEST_KEY[12..]),
+            "whitespace inside it at byte 13",
+        ),
+        (format!("{TEST_KEY}é"), "a byte outside ASCII"),
+        (format!("{TEST_KEY}\u{fffd}"), "a byte outside ASCII"),
+        (format!("Bearer {TEST_KEY}"), "it starts with 'Bearer '"),
+        (format!("\"{TEST_KEY}\""), "it starts or ends with a quote"),
+    ];
+    for (raw, problem) in bad {
+        let srv = Srv::open_on(
+            &toy().path,
+            tempfile::tempdir().unwrap(),
+            &stand_config(&mock.url()),
+            lookup(raw.clone()),
+        );
+        let s = srv.admin("GET", "/v1/admin/oracle", None).await;
+        assert_eq!(s.body["status"], "bad_key", "{raw:?}: {}", s.text);
+        assert_eq!(
+            (s.body["key_present"].as_bool(), s.body["key_ok"].as_bool()),
+            (Some(true), Some(false))
+        );
+        assert!(
+            s.body["key_problem"].as_str().unwrap().contains(problem),
+            "{raw:?}: {}",
+            s.text
+        );
+        no_key_bytes(&s.text, "GET /v1/admin/oracle");
+        let h = srv.get("/healthz").await;
+        assert_eq!(h.body["oracle_status"], "bad_key", "{}", h.text);
+        let r = srv.decide(&topics_body(&rejected()[1])).await;
+        assert_eq!(r.action(), "abstain", "{}", r.text);
+        assert_eq!(r.flags(), json!(["oracle_disabled", "bad_key"]));
+        let hint = r.body["cmf"]["hint"].as_str().unwrap();
+        assert!(
+            hint.starts_with("the oracle key is not usable (")
+                && hint.contains(problem)
+                && hint.ends_with(&format!(
+                    "): fix {KEY_ENV} in the server's environment and restart it"
+                )),
+            "{hint}"
+        );
+        no_key_bytes(&r.text, "a decision");
+        let e = srv.decide(&untrained_body()).await;
+        assert_eq!(e.error(), (422, "UNSUPPORTED_QUESTION".to_string()));
+        assert_eq!(
+            e.body["error"]["metadata"]["details"]["questions"]["u"]["oracle"],
+            "the oracle key in the server's environment is not usable"
+        );
+        no_key_bytes(&e.text, "an untrained error");
+        // The router surface keeps its flag vocabulary.
+        let route = srv
+            .post(
+                "/v1/route",
+                None,
+                &json!({"input": {"text": rejected()[2]}, "taxonomy_id": "topics"}),
+            )
+            .await;
+        assert_eq!(route.status, 200, "{}", route.text);
+        assert_eq!(
+            route.body["decision"]["flags"],
+            json!(["low_confidence", "oracle_disabled"]),
+            "{}",
+            route.text
+        );
+        for f in files_under(&srv.state_root()) {
+            let b = std::fs::read(&f).unwrap();
+            assert!(
+                !b.windows(16).any(|w| w == b"0123456789abcdef"),
+                "{} holds key bytes",
+                f.display()
+            );
+        }
+    }
+    assert_eq!(mock.hits(), hits, "a bad key was sent");
+
+    // A budget below one call's reservation, nothing spent: too small, with
+    // the minimum; the hint says so.
+    let mut cfg = stand_config(&mock.url());
+    cfg.oracle.budget_usd = 1e-7;
+    let srv = Srv::new(&cfg);
+    let s = srv.admin("GET", "/v1/admin/oracle", None).await;
+    assert_eq!(s.body["status"], "budget_too_small", "{}", s.text);
+    assert!(
+        s.body["min_call_usd"].as_f64().unwrap() > 1e-7,
+        "{}",
+        s.text
+    );
+    let r = srv.decide(&topics_body(&rejected()[3])).await;
+    assert_eq!(r.flags(), json!(["budget"]));
+    let hint = r.body["cmf"]["hint"].as_str().unwrap();
+    assert!(
+        hint.starts_with("the oracle budget cannot hold one call (each reserves at least $"),
+        "{hint}"
+    );
+    drop(srv);
+    // Spent: exhausted.
+    let mut cfg = stand_config(&mock.url());
+    cfg.oracle.max_calls = 1;
+    let srv = Srv::new(&cfg);
+    assert_eq!(status(&srv).await, "ready");
+    assert_eq!(
+        srv.decide(&topics_body(&rejected()[3])).await.action(),
+        "oracle"
+    );
+    assert_eq!(status(&srv).await, "budget_exhausted");
+    let r = srv.decide(&topics_body(&rejected()[4])).await;
+    assert_eq!(r.flags(), json!(["budget"]));
+    assert!(
+        r.body["cmf"]["hint"]
+            .as_str()
+            .unwrap()
+            .starts_with("the oracle budget is used up"),
+        "{}",
+        r.text
+    );
+    assert_eq!(mock.hits(), hits + 1);
 }
 
 /// `serve --oracle` on loopback without keys or `auth.require`: the implicit

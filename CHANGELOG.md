@@ -82,13 +82,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--oracle-base-url`, `--no-oracle-learning`; they override
   `--decision-config`. One startup line says `oracle: ready — …`,
   `oracle: NOT ready — <what to do>` or `oracle: off`; `GET
-  /v1/admin/oracle` has `status` (`ready`, `no_key`, `disabled`,
-  `budget_exhausted`, `stopped: <reason>`) and `max_price`, `/healthz`
-  has `oracle_status` (`/v1/healthz` only under `cmf` with
-  `x-cmf-extensions: 1`). A trained question that abstains because the
-  oracle is not ready gets the flag `no_key` (beside `oracle_disabled`) when
-  the key is missing and a one-line `cmf.hint` on the decisions API; router
+  /v1/admin/oracle` has `status` (`ready`, `no_key`, `bad_key`, `disabled`,
+  `budget_exhausted` once something was spent, `budget_too_small` for a
+  budget that cannot hold one call, with `min_call_usd`, `stopped:
+  <reason>`, with `last_error`) and `max_price`, `/healthz` has
+  `oracle_status` (`/v1/healthz` only under `cmf` with `x-cmf-extensions:
+  1`). A trained question that abstains because the oracle is not ready gets
+  the flag `no_key` or `bad_key` (beside `oracle_disabled`) when the key is
+  missing or unusable and a one-line `cmf.hint` on the decisions API; router
   answers keep their shape and flags, and the hint is logged instead.
+- Key hygiene, on every surface (`serve --oracle`, `decide --oracle`,
+  `decision oracle check`, `decision learn`): the key read from its variable
+  loses surrounding spaces, tabs, CR and LF (a `.env` file's) with a warning
+  that says so; a value that still holds whitespace, a control byte or a byte
+  outside ASCII, starts with `Bearer ` or is quoted is `bad_key`, named by
+  position and length and never sent. Transport and read errors are fixed
+  codes (`transport_connect`, `transport_timeout`, `transport_bad_header`,
+  `read_io`, …), never a library's text, which could hold the request's
+  `Authorization` header. A key-like value (holding `sk-or-`, starting with
+  `Bearer `, with surrounding whitespace, or longer than 40 bytes without a
+  `/`) given as a model id or a variable's name is refused whatever its
+  prefix, only its length shown.
 - `cortiq decide FILE -p TEXT | --input ROWS --oracle MODEL`: the text is
   decided locally first, and only one the gate rejects (or whose labels no
   skill has) is sent, in one call with the server's reservation ledger,
@@ -96,11 +110,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `LOCK` (`<FILE>.state` or `--state DIR`); `--oracle-budget` and
   `--oracle-max-calls` cap each run, a stop holds for later runs until
   `--oracle-resume`, `--break-lock` removes a `LOCK` whose process is gone.
-  Without `--oracle` nothing changes. `cortiq decision oracle check
-  [--model M] [--key-env VAR] [--base-url URL] [--test-call] [--json]`:
-  the key, the account (`GET /auth/key`), the model's structured-output
-  endpoints and prices, and with `--test-call` one tiny call and its cost;
-  exit code 0 only when ready; the key is never printed.
+  Without `--oracle` nothing changes; a missing key is worded for the
+  command line (`OPENROUTER_API_KEY is not set (decide --oracle reads the key
+  from the environment)`), also when labels no skill has could only be
+  answered by the oracle. `cortiq decision oracle check [--model M]
+  [--key-env VAR] [--base-url URL] [--max-price IN,OUT] [--test-call]
+  [--json]`: the key, the account (`GET /auth/key`), the model's
+  structured-output endpoints and prices (`--max-price` for a model listed
+  only with variable pricing), and with `--test-call` one tiny call and its
+  cost; exit code 0 only when ready; the key is never printed.
 - The published model `infosave/cortiq-decision` (304520292 bytes): skills
   `banking77`, `clinc150` and `massive` trained on train ∪ dev, with K 32, 16
   and 24 chosen by cross-validation. It is 4520292 bytes over the

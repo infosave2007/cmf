@@ -34,6 +34,7 @@ says first whether it is ready — [Connect OpenRouter](#connect-openrouter)).
    `oracle.default_per_request`); budget is left; no stop rule fired.
    Otherwise a trained question stays `abstain` with a flag (`oracle_disabled`,
    `no_key` beside `oracle_disabled` when the key variable is not set,
+   `bad_key` beside it when the variable holds something that is not a key,
    `consent_off`, `budget`, `stopped`) and, on the decisions API, a one-line
    `cmf.hint` that says what to do (the router API keeps its answer and its
    flags as they were — a missing key is `oracle_disabled` there — and the
@@ -226,7 +227,7 @@ overrides `--decision-config`):
 | `--oracle-budget USD` | 1.0 | the most this server spends on the oracle |
 | `--oracle-max-calls N` | 10000 | the most oracle calls |
 | `--oracle-max-price IN,OUT` | 2× the cheapest structured-output endpoint | max price, USD per 1M prompt / completion tokens |
-| `--oracle-key-env VAR` | `OPENROUTER_API_KEY` | the NAME of the variable that holds the key (the key itself is refused and never shown) |
+| `--oracle-key-env VAR` | `OPENROUTER_API_KEY` | the NAME of the variable that holds the key (a value that looks like a key — holding `sk-or-`, starting with `Bearer `, with surrounding whitespace, or longer than 40 bytes without a `/` — is refused and never shown; so is such a value given as `--oracle MODEL`) |
 | `--oracle-base-url URL` | `https://openrouter.ai/api/v1` | https; plain http only to a loopback address (a local proxy or a test mock) |
 | `--no-oracle-learning` | off | answers are cached but the served model never changes |
 
@@ -240,21 +241,38 @@ curl -s http://127.0.0.1:8080/v1/admin/oracle -H "x-admin-token: $CORTIQ_DECISIO
 ```
 
 `status` is one of `ready`, `no_key` (the variable is unset or empty),
-`disabled` (not configured, or switched off by `POST /v1/admin/oracle`),
-`budget_exhausted` (the budget or `max_calls` is used up; restart with a
-larger `--oracle-budget` / `--oracle-max-calls`, or lift lower admin limits
-with `POST /v1/admin/oracle {"budget_usd": null, "max_calls": null}`) or
-`stopped: <reason>` (a stop rule; `POST /v1/admin/oracle {"enabled": true}`
-resumes after the fix). On the router API, `/v1/healthz` carries it as
-`cmf.oracle_status` only with `x-cmf-extensions: 1`, so the router's own
-shape stays exact.
+`bad_key` (the variable holds something that is not a key — see below;
+`key_problem` says what, by position and length), `disabled` (not
+configured, or switched off by `POST /v1/admin/oracle`),
+`budget_exhausted` (something was spent and the budget or `max_calls` is
+used up; restart with a larger `--oracle-budget` / `--oracle-max-calls`, or
+lift lower admin limits with `POST /v1/admin/oracle {"budget_usd": null,
+"max_calls": null}`), `budget_too_small` (nothing spent, and the budget
+cannot hold even one call: `min_call_usd` is the least a call reserves; or
+`max_calls` is 0) or `stopped: <reason>` (a stop rule; `last_error` names
+the code of the last failed call, which `max_errors` counts; `POST
+/v1/admin/oracle {"enabled": true}` resumes after the fix). On the router
+API, `/v1/healthz` carries the status as `cmf.oracle_status` only with
+`x-cmf-extensions: 1`, so the router's own shape stays exact.
+
+The key is read as it is in the variable, less surrounding spaces, tabs, CR
+and LF (a `.env` file's line ending): the server, `decide` and `oracle
+check` warn `the key had surrounding whitespace, trimmed` and go on. A value
+that still holds whitespace, a control byte or a byte outside ASCII, that
+starts with `Bearer ` (the request adds it) or is wrapped in quotes is
+`bad_key`: it is never sent, and the message names only the position and
+the length of the problem. No message, log line (at any `RUST_LOG`
+level), status, ledger or state file ever holds a byte of the key: a failed
+request is a fixed code such as `transport_connect`, `transport_timeout` or
+`transport_bad_header`.
 
 ### From the command line: check, then decide
 
 `cortiq decision oracle check` tells whether the oracle is ready before
 anything is started or spent. It reads the same flags as `--oracle`
 (`--model`, default `deepseek/deepseek-v4.1-flash`; `--key-env`;
-`--base-url`):
+`--base-url`; `--max-price IN,OUT`, which a model listed only with variable
+pricing such as `openrouter/auto` needs, as `--oracle-max-price` does):
 
 ```bash
 cortiq decision oracle check               # free: the key, the account, the model
@@ -270,8 +288,9 @@ Oracle check: deepseek/deepseek-v4.1-flash via openrouter.ai
 ready: cortiq serve FILE --oracle deepseek/deepseek-v4.1-flash   (or: cortiq decide FILE -p TEXT --oracle deepseek/deepseek-v4.1-flash)
 ```
 
-Each line is one check: **key** — the variable is set (only its presence
-is shown, never the key); **account** — `GET /auth/key` accepts the key
+Each line is one check: **key** — the variable holds a usable key (only its
+presence is shown, never the key; surrounding whitespace trimmed is said,
+anything else wrong is `bad_key`); **account** — `GET /auth/key` accepts the key
 (free) and shows its credit limit and usage; **model** — OpenRouter's
 public endpoint listing (free, no key) has the model with structured
 outputs, and its cheapest price; **test call** — with `--test-call` only,
@@ -280,9 +299,10 @@ with its answer and cost. `✓` passed, `✗` failed (the line says why and
 what to do, and for a model it names 2–3 cheap ones that fit), `–` not
 checked. The exit code is 0 only when every check passed (and the test
 call answered, when asked); `--json` gives the same as one object with
-`ready` and `problems[]` (`no_key`, `key_refused`, `no_credit`,
+`ready` and `problems[]` (`no_key`, `bad_key`, `key_refused`, `no_credit`,
 `account_unreachable`, `unknown_model`, `no_structured_outputs`,
-`variable_price`, `listing_unreachable`, `test_call_failed`).
+`variable_price`, `max_price_too_low`, `listing_unreachable`,
+`test_call_failed`).
 
 `cortiq decide` takes the same `--oracle MODEL` (and the `--oracle-*`
 flags of the table above) for one text or a batch. The text is decided
@@ -301,10 +321,20 @@ cortiq decide cortiq-decision.cmf --skill banking77 --input rows.jsonl --out res
 * `--json` (one text) carries `action` and `source` in
   `cmf.questions.<id>`, the call's cost in `cmf.usage.oracle` and the run's
   spend and budget in `cmf.oracle`; batch rows keep their local columns and
-  add `action`, `source`, `oracle_cost_usd` and `flags`, with the oracle's
-  totals and a `hint` in the summary on stderr.
+  add `action`, `source`, `answer` (the final answer: the oracle's or its
+  cache's, else the local choice), `oracle_cost_usd`, `flags` and, for a
+  labelled row, `answer_correct`, with the oracle's totals and a `hint` in
+  the summary on stderr.
+* **Without a usable key** a rejected text abstains with `no_key` (or
+  `bad_key`) and the hint `OPENROUTER_API_KEY is not set (decide --oracle
+  reads the key from the environment): export …`; nothing is sent and no
+  state directory is made. Labels no skill has can only be answered by the
+  oracle, so there the same words end the run with an error.
 * `--oracle-budget USD` (default $1.00) and `--oracle-max-calls N` cap each
-  run; the rows past the cap abstain with the flag `budget`. Without
+  run; the rows past the cap abstain with the flag `budget`. A budget that
+  cannot hold the run's first call is `budget_too_small` (the hint names
+  the least `--oracle-budget` that holds it); one the run spent is
+  `budget_exhausted`. Without
   `--oracle`, `decide` never calls the oracle.
 * **State.** The reservation ledger, the answer cache and `oracle.state`
   live in the state directory, `<FILE>.state` next to the file (or

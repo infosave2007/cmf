@@ -25,7 +25,8 @@
 //! one total deadline (`deadline_s`, the ureq request timeout, which also bounds
 //! reading the body), no redirects, no retries, at most 2 MiB of response.
 //! The key is read from the environment variable `oracle.api_key_env` at the
-//! moment of the call ([`KeyLookup`]); it is never stored, logged or written.
+//! moment of the call ([`KeyLookup`], checked by [`read_key`]); it is never
+//! stored, logged or written.
 //!
 //! **Parse** ([`parse_response`], `deepseek_oracle.call` `:114-164`): status 200;
 //! a body that is only an `error` is a failure; no finite `usage.cost ≥ 0` is a
@@ -55,11 +56,22 @@
 //! row — counted across restarts and command-line runs, since the count is
 //! kept in `oracle.state` too while it is not zero.
 //!
+//! **Key** ([`read_key`]): the value of the variable without surrounding
+//! ASCII whitespace (spaces, tabs, CR, LF — a `.env` file's; the surfaces
+//! warn that it was trimmed); a value that still holds whitespace, a control
+//! byte or a byte outside ASCII, starts with `Bearer ` or is quoted is
+//! `bad_key` and never sent. Transport and read errors are fixed codes
+//! ([`transport_code`], [`read_code`]), never the library's text, which may
+//! hold a request header or a URL.
+//!
 //! **Status** ([`OracleClient::status`], `status` of `GET /v1/admin/oracle`):
 //! `disabled` (not configured, or the admin switch is off), `no_key` (the
-//! variable is unset or empty), `stopped: <reason>`, `budget_exhausted` (the
-//! budget left cannot hold the smallest call, or `max_calls` calls were made)
-//! or `ready` — the order of the permission checks.
+//! variable is unset or empty), `bad_key` (set, but not usable as a key),
+//! `stopped: <reason>`, `budget_exhausted` (something was spent or reserved
+//! and the budget left cannot hold the smallest call, or `max_calls` calls
+//! were made), `budget_too_small` (nothing spent, and the budget cannot hold
+//! even the smallest call — `min_call_usd` — or `max_calls` is 0) or
+//! `ready` — the order of the permission checks.
 
 use crate::answer::OracleAnswer;
 use crate::canonical;
@@ -352,12 +364,185 @@ pub fn parse_response(body: &[u8], questions: &[&Question], model: &str) -> Pars
 
 /// Reads a variable of the environment by name (the oracle key). The server uses
 /// [`process_env`]; tests pass a lookup over a map so that no process-wide
-/// environment is mutated.
+/// environment is mutated. The raw value is checked by [`read_key`] before
+/// any use.
 pub type KeyLookup = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
-/// The process environment (a set, non-empty variable).
+/// The process environment (a set, non-empty variable). A value that is not
+/// UTF-8 comes back with its invalid bytes replaced (U+FFFD), so that
+/// [`read_key`] names it `bad_key` instead of calling it unset.
 pub fn process_env() -> KeyLookup {
-    Arc::new(|name| std::env::var(name).ok().filter(|v| !v.is_empty()))
+    Arc::new(|name| {
+        std::env::var_os(name)
+            .map(|v| v.to_string_lossy().into_owned())
+            .filter(|v| !v.is_empty())
+    })
+}
+
+/// What the key variable holds, as far as a message may tell (lengths and
+/// positions, never a byte of the key).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KeyState {
+    /// Unset or empty (`no_key`).
+    Missing,
+    /// Usable; `trimmed`: the bytes of surrounding whitespace (spaces, tabs,
+    /// CR, LF — common in `.env` files) removed before use (0: none).
+    Usable { trimmed: usize },
+    /// Not usable as a bearer key (`bad_key`): what is wrong.
+    Bad(String),
+}
+
+impl KeyState {
+    /// `missing`, `ok` or `bad`.
+    pub fn label(&self) -> &'static str {
+        match self {
+            KeyState::Missing => "missing",
+            KeyState::Usable { .. } => "ok",
+            KeyState::Bad(_) => "bad",
+        }
+    }
+
+    /// The problem of a bad key (`None` otherwise).
+    pub fn problem(&self) -> Option<&str> {
+        match self {
+            KeyState::Bad(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// Bytes of surrounding whitespace trimmed from a usable key.
+    pub fn trimmed(&self) -> usize {
+        match self {
+            KeyState::Usable { trimmed } => *trimmed,
+            _ => 0,
+        }
+    }
+}
+
+/// Whitespace around a key that is trimmed before use.
+fn is_edge_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\r' | b'\n')
+}
+
+/// Check a raw value of the key variable: the state, and the key itself
+/// (without surrounding ASCII whitespace) only when it is usable. A key is
+/// refused (`bad_key`) when what is left after the trim is empty, starts
+/// with `Bearer ` (the request adds it), holds whitespace, a control byte or
+/// a byte outside ASCII (an HTTP header takes visible ASCII only), or starts
+/// or ends with a quote (a `.env` value copied with its quotes). The
+/// problem names positions and lengths only.
+pub fn check_key(raw: Option<&str>) -> (KeyState, Option<String>) {
+    let Some(raw) = raw.filter(|r| !r.is_empty()) else {
+        return (KeyState::Missing, None);
+    };
+    let bytes = raw.as_bytes();
+    let Some(start) = bytes.iter().position(|b| !is_edge_space(*b)) else {
+        return (
+            KeyState::Bad(format!("it holds only whitespace ({} bytes)", bytes.len())),
+            None,
+        );
+    };
+    let end = bytes
+        .iter()
+        .rposition(|b| !is_edge_space(*b))
+        .map_or(bytes.len(), |p| p + 1);
+    // The edges are ASCII, so both ends are character boundaries.
+    let key = &raw[start..end];
+    let kb = key.as_bytes();
+    let n = kb.len();
+    let bad = |problem: String| (KeyState::Bad(problem), None);
+    if n >= 7 && kb[..7].eq_ignore_ascii_case(b"bearer ") {
+        return bad(format!(
+            "it starts with 'Bearer ' ({n} bytes): put only the key in the variable, the request adds 'Bearer '"
+        ));
+    }
+    for (i, &b) in kb.iter().enumerate() {
+        let at = format!("at byte {} of {n}", i + 1);
+        if b == b' ' || b == b'\t' {
+            return bad(format!("whitespace inside it {at} (a key has none)"));
+        }
+        if b < 0x20 || b == 0x7f {
+            return bad(format!("a control character {at}"));
+        }
+        if b >= 0x80 {
+            return bad(format!(
+                "a byte outside ASCII {at} (an HTTP header takes visible ASCII only)"
+            ));
+        }
+    }
+    if matches!(kb[0], b'"' | b'\'') || matches!(kb[n - 1], b'"' | b'\'') {
+        return bad(format!(
+            "it starts or ends with a quote ({n} bytes): remove the quotes around the key"
+        ));
+    }
+    (
+        KeyState::Usable {
+            trimmed: bytes.len() - n,
+        },
+        Some(key.to_string()),
+    )
+}
+
+/// Read the key of variable `var` through `lookup` and check it
+/// ([`check_key`]).
+pub fn read_key(lookup: &KeyLookup, var: &str) -> (KeyState, Option<String>) {
+    let raw = lookup(var);
+    check_key(raw.as_deref())
+}
+
+/// The warning for a key that had surrounding whitespace (never the key).
+pub fn trimmed_warning(var: &str, trimmed: usize) -> String {
+    format!(
+        "oracle: the key had surrounding whitespace, trimmed ({trimmed} byte{} of spaces, tabs, CR or LF around the key in {var}; the key itself is never shown)",
+        if trimmed == 1 { "" } else { "s" }
+    )
+}
+
+/// "the key in VAR is not usable: PROBLEM" (never the key).
+pub fn bad_key_text(var: &str, problem: &str) -> String {
+    format!("the key in {var} is not usable: {problem}")
+}
+
+// ------------------------------------------------------------------ errors
+
+/// The fixed code of a transport error (`transport_connect`,
+/// `transport_timeout`, `transport_bad_header`, …). The library's own text
+/// is never used: it may hold a request header (a malformed
+/// `Authorization` value, the key) or a URL.
+pub fn transport_code(t: &ureq::Transport) -> &'static str {
+    use ureq::ErrorKind as K;
+    let timed_out = std::error::Error::source(t)
+        .and_then(|s| s.downcast_ref::<std::io::Error>())
+        .is_some_and(|e| {
+            matches!(
+                e.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            )
+        });
+    if timed_out {
+        return "transport_timeout";
+    }
+    match t.kind() {
+        K::InvalidUrl | K::UnknownScheme => "transport_bad_url",
+        K::Dns => "transport_dns",
+        K::InsecureRequestHttpsOnly => "transport_insecure",
+        K::ConnectionFailed => "transport_connect",
+        K::TooManyRedirects => "transport_redirect",
+        K::BadStatus => "transport_bad_status",
+        K::BadHeader => "transport_bad_header",
+        K::Io => "transport_io",
+        K::InvalidProxyUrl | K::ProxyConnect | K::ProxyUnauthorized => "transport_proxy",
+        K::HTTP => "transport_http",
+    }
+}
+
+/// The fixed code of an error while reading a response body
+/// (`read_timeout`, `read_io`), never its text.
+pub fn read_code(e: &std::io::Error) -> &'static str {
+    match e.kind() {
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => "read_timeout",
+        _ => "read_io",
+    }
 }
 
 // ------------------------------------------------------------------ state file
@@ -795,9 +980,14 @@ impl OracleClient {
         &self.cfg
     }
 
-    /// Whether the environment holds the key (only its presence).
+    /// Whether the environment holds a key, usable or not (only its presence).
     pub fn key_present(&self) -> bool {
-        (self.key)(&self.cfg.api_key_env).is_some()
+        self.key_state() != KeyState::Missing
+    }
+
+    /// What the key variable holds ([`check_key`]; never the key).
+    pub fn key_state(&self) -> KeyState {
+        read_key(&self.key, &self.cfg.api_key_env).0
     }
 
     /// The ledger totals now.
@@ -853,8 +1043,10 @@ impl OracleClient {
         if !inner.state.enabled {
             return Err(RefusalReason::OracleDisabled);
         }
-        if !self.key_present() {
-            return Err(RefusalReason::NoKey);
+        match self.key_state() {
+            KeyState::Missing => return Err(RefusalReason::NoKey),
+            KeyState::Bad(_) => return Err(RefusalReason::BadKey),
+            KeyState::Usable { .. } => {}
         }
         if inner.state.stop_reason.is_some() {
             return Err(RefusalReason::Stopped);
@@ -900,8 +1092,12 @@ impl OracleClient {
         questions: &[&Question],
         body: &[u8],
     ) -> CallOutcome {
-        let Some(key) = (self.key)(&self.cfg.api_key_env) else {
-            return CallOutcome::Refused(RefusalReason::NoKey);
+        // The key without surrounding whitespace; a malformed one is never
+        // sent (nor put in a header whose error would echo it).
+        let key = match read_key(&self.key, &self.cfg.api_key_env) {
+            (_, Some(key)) => key,
+            (KeyState::Missing, None) => return CallOutcome::Refused(RefusalReason::NoKey),
+            (_, None) => return CallOutcome::Refused(RefusalReason::BadKey),
         };
         let mt = max_tokens(self.cfg.max_tokens_per_question, questions.len());
         let res = reservation_usd(body.len(), mt, self.max_price);
@@ -1091,10 +1287,12 @@ impl OracleClient {
         if let Some(reason) = stop
             && inner.state.stop_reason.is_none()
         {
+            // The last failure's code (never content) names what failed.
+            let last = inner.state.last_error.as_deref().unwrap_or("-");
             if self.warn_on_stop {
-                tracing::warn!(reason = %reason, call = %call_id, "oracle stopped by a stop rule");
+                tracing::warn!(reason = %reason, last_error = %last, call = %call_id, "oracle stopped by a stop rule");
             } else {
-                tracing::debug!(reason = %reason, call = %call_id, "oracle stopped by a stop rule");
+                tracing::debug!(reason = %reason, last_error = %last, call = %call_id, "oracle stopped by a stop rule");
             }
             inner.state.stop_reason = Some(reason);
             inner.state.stopped_unix = Some(now_unix());
@@ -1117,12 +1315,12 @@ impl OracleClient {
             .set("Authorization", &format!("Bearer {key}"))
             .set("Content-Type", "application/json")
             .set("X-Title", &self.cfg.title);
+        // Only fixed codes leave here: a library error's text may hold the
+        // request's headers (the key) or its URL.
         let resp = match req.send_bytes(body) {
             Ok(r) => r,
             Err(ureq::Error::Status(_, r)) => r,
-            Err(ureq::Error::Transport(t)) => {
-                return Err(format!("transport_{:?}", t.kind()).to_ascii_lowercase());
-            }
+            Err(ureq::Error::Transport(t)) => return Err(transport_code(&t).to_string()),
         };
         let status = resp.status();
         let mut buf = Vec::new();
@@ -1132,7 +1330,7 @@ impl OracleClient {
             .read_to_end(&mut buf)
         {
             Ok(_) => Ok((status, buf)),
-            Err(e) => Err(format!("read_{:?}", e.kind()).to_ascii_lowercase()),
+            Err(e) => Err(read_code(&e).to_string()),
         }
     }
 
@@ -1158,24 +1356,33 @@ impl OracleClient {
         if !inner.state.enabled {
             return OracleStatus::Disabled { by_admin: true };
         }
-        if !self.key_present() {
-            return OracleStatus::NoKey;
+        match self.key_state() {
+            KeyState::Missing => return OracleStatus::NoKey,
+            KeyState::Bad(p) => return OracleStatus::BadKey(p),
+            KeyState::Usable { .. } => {}
         }
         if let Some(r) = &inner.state.stop_reason {
             return OracleStatus::Stopped(r.clone());
         }
         let t = &inner.totals;
-        if t.calls >= self.max_calls(&inner.state)
-            || self.budget(&inner.state) - t.spent < self.min_reservation_usd()
-        {
-            return OracleStatus::BudgetExhausted;
+        let min = self.min_reservation_usd();
+        if t.calls >= self.max_calls(&inner.state) || self.budget(&inner.state) - t.spent < min {
+            // Used up only when something was spent or reserved; a budget
+            // (or call limit) that could never hold one call is too small.
+            let used = t.calls > 0 || t.spent > 0.0 || t.inflight > 0.0;
+            return if used {
+                OracleStatus::BudgetExhausted
+            } else {
+                OracleStatus::BudgetTooSmall { min_usd: min }
+            };
         }
         OracleStatus::Ready
     }
 
     /// Whether a call can be made now, in the order of the permission checks:
-    /// configured and switched on, a key in the environment, not stopped, a
-    /// budget that holds at least the smallest call and calls left.
+    /// configured and switched on, a usable key in the environment, not
+    /// stopped, a budget that holds at least the smallest call and calls
+    /// left.
     pub fn status(&self) -> OracleStatus {
         self.status_of(&self.inner.lock())
     }
@@ -1185,12 +1392,17 @@ impl OracleClient {
         let inner = self.inner.lock();
         let t = &inner.totals;
         let budget = self.budget(&inner.state);
+        let key = self.key_state();
         json!({
             "status": self.status_of(&inner).label(),
             "enabled": inner.state.enabled,
             "stop_reason": inner.state.stop_reason,
             "stopped_unix": inner.state.stopped_unix,
-            "key_present": self.key_present(),
+            "last_error": inner.state.last_error,
+            "key_present": key != KeyState::Missing,
+            "key_ok": matches!(key, KeyState::Usable { .. }),
+            "key_problem": key.problem(),
+            "key_trimmed": key.trimmed() > 0,
             "key_env": self.cfg.api_key_env,
             "model": self.cfg.model,
             "base_url": self.cfg.base_url,
@@ -1209,6 +1421,7 @@ impl OracleClient {
             "deadline_s": self.cfg.deadline_s,
             "redact_pii": self.cfg.redact_pii,
             "max_price": {"prompt": self.max_price.0, "completion": self.max_price.1},
+            "min_call_usd": self.min_reservation_usd(),
         })
     }
 
@@ -1469,6 +1682,239 @@ mod tests {
         fin["choices"][0]["finish_reason"] = json!("length");
         let p = parse_response(&serde_json::to_vec(&fin).unwrap(), &qs, m);
         assert_eq!(p.verdicts, Err("finish_length".into()));
+    }
+
+    /// A fake key with a distinctive middle ("F00DFACE…") that must never
+    /// appear in a message.
+    const K: &str = "sk-or-v1-F00DFACE0123456789abcdef0123456789abcdef0123456789abcdefcafe";
+
+    fn assert_no_key(text: &str) {
+        for needle in [K, "F00DFACE", "0123456789abcdef", "cafe"] {
+            assert!(!text.contains(needle), "key bytes in: {text}");
+        }
+    }
+
+    #[test]
+    fn keys_are_trimmed_or_refused_by_position_never_echoed() {
+        // Surrounding whitespace of a .env file: trimmed, usable.
+        for (raw, trimmed) in [
+            (format!("{K}\r"), 1),
+            (format!("{K}\n"), 1),
+            (format!("{K}\r\n"), 2),
+            (format!("  {K}  "), 4),
+            (format!("\t{K}\t"), 2),
+            (K.to_string(), 0),
+        ] {
+            let (st, key) = check_key(Some(&raw));
+            assert_eq!(st, KeyState::Usable { trimmed }, "{raw:?}");
+            assert_eq!(key.as_deref(), Some(K));
+        }
+        assert_eq!(check_key(None), (KeyState::Missing, None));
+        assert_eq!(check_key(Some("")), (KeyState::Missing, None));
+        // A long key (400 bytes) is a key.
+        let long = format!("{K}{}", "a".repeat(400 - K.len()));
+        assert_eq!(long.len(), 400);
+        assert!(matches!(check_key(Some(&long)).0, KeyState::Usable { .. }));
+        // Still not a key after the trim: bad_key, the problem by position.
+        let n = K.len();
+        let cases: Vec<(String, String)> = vec![
+            (
+                format!("{K}\0"),
+                format!("a control character at byte {} of {}", n + 1, n + 1),
+            ),
+            (
+                format!("sk-or\0{}", &K[5..]),
+                "a control character at byte 6 of".into(),
+            ),
+            (
+                format!("{}\r\n{}", &K[..20], &K[20..]),
+                "a control character at byte 21".into(),
+            ),
+            (
+                format!("{}é{}", &K[..10], &K[10..]),
+                "a byte outside ASCII at byte 11".into(),
+            ),
+            (
+                format!("{K}\u{fffd}"),
+                format!("a byte outside ASCII at byte {}", n + 1),
+            ),
+            (format!("Bearer {K}"), "it starts with 'Bearer '".into()),
+            (format!("bearer {K}\n"), "it starts with 'Bearer '".into()),
+            (
+                format!("{} {}", &K[..30], &K[30..]),
+                "whitespace inside it at byte 31".into(),
+            ),
+            (
+                format!("{}\t{}", &K[..30], &K[30..]),
+                "whitespace inside it at byte 31".into(),
+            ),
+            (format!("\"{K}\""), "it starts or ends with a quote".into()),
+            (format!("'{K}'\n"), "it starts or ends with a quote".into()),
+            (
+                " \r\n\t".to_string(),
+                "it holds only whitespace (4 bytes)".into(),
+            ),
+        ];
+        for (raw, want) in cases {
+            let (st, key) = check_key(Some(&raw));
+            assert!(key.is_none(), "{raw:?}");
+            let p = st.problem().unwrap_or_default().to_string();
+            assert!(p.contains(&want), "{raw:?}: {p}");
+            assert_no_key(&p);
+            assert_no_key(&bad_key_text("OPENROUTER_API_KEY", &p));
+        }
+        let w = trimmed_warning("OPENROUTER_API_KEY", 2);
+        assert_no_key(&w);
+        assert!(
+            w.contains("the key had surrounding whitespace, trimmed"),
+            "{w}"
+        );
+    }
+
+    #[test]
+    fn transport_errors_are_fixed_codes_without_the_header() {
+        // A key with CR LF inside: ureq refuses the header, and its error
+        // text holds the header line — the code must not.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let agent = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(5))
+            .build();
+        let url = format!("http://127.0.0.1:{port}/x");
+        let bad = agent
+            .get(&url)
+            .set("Authorization", &format!("Bearer {K}\r\n"))
+            .call()
+            .unwrap_err();
+        let ureq::Error::Transport(t) = bad else {
+            panic!("a transport error")
+        };
+        assert!(
+            t.to_string().contains("F00DFACE"),
+            "ureq's own text echoes the header"
+        );
+        assert_eq!(transport_code(&t), "transport_bad_header");
+        // A closed port: the connection fails.
+        let refused = agent.get(&url).call().unwrap_err();
+        let ureq::Error::Transport(t) = refused else {
+            panic!("a transport error")
+        };
+        assert_eq!(transport_code(&t), "transport_connect");
+        assert_eq!(
+            read_code(&std::io::Error::from(std::io::ErrorKind::TimedOut)),
+            "read_timeout"
+        );
+        assert_eq!(
+            read_code(&std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+            "read_io"
+        );
+    }
+
+    fn test_caller() -> Caller<'static> {
+        Caller {
+            request_id: "r",
+            account: "a",
+            key12: None,
+            key_budget_usd: None,
+            credit_left_usd: None,
+        }
+    }
+
+    fn key_of(raw: &'static str) -> KeyLookup {
+        Arc::new(move |_| Some(raw.to_string()))
+    }
+
+    #[test]
+    fn a_client_never_sends_a_bad_key_and_names_its_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("oracle.jsonl");
+        // A closed port: a usable key is sent and fails to connect.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let cfg = OracleConfig {
+            enabled: true,
+            base_url: format!("http://127.0.0.1:{port}/api/v1"),
+            ..OracleConfig::default()
+        };
+        let question = q("t", QuestionKind::Choice, json!({"a": null, "b": null}));
+        let caller = test_caller();
+        let c = OracleClient::open(&cfg, &p, None, key_of("Bearer sk-or-v1-x")).unwrap();
+        assert_eq!(
+            c.call(&caller, &[&question], &json!("hi")),
+            CallOutcome::Refused(RefusalReason::BadKey)
+        );
+        assert!(matches!(c.status(), OracleStatus::BadKey(_)));
+        assert_eq!(c.status().label(), "bad_key");
+        assert_eq!(c.permission(&caller), Err(RefusalReason::BadKey));
+        let j = c.status_json();
+        assert_eq!(
+            (
+                j["status"].as_str(),
+                j["key_present"].as_bool(),
+                j["key_ok"].as_bool()
+            ),
+            (Some("bad_key"), Some(true), Some(false)),
+            "{j}"
+        );
+        assert!(j["key_problem"].as_str().unwrap().contains("Bearer"), "{j}");
+        assert_eq!(c.totals().calls, 0, "nothing reserved, nothing sent");
+        drop(c);
+        // A trimmed key is used (the call is sent and fails to connect).
+        let c = OracleClient::open(&cfg, &p, None, key_of("sk-or-v1-abc\r\n")).unwrap();
+        assert_eq!(c.status(), OracleStatus::Ready);
+        assert_eq!(c.key_state(), KeyState::Usable { trimmed: 2 });
+        assert_eq!(c.status_json()["key_trimmed"], true);
+        match c.call(&caller, &[&question], &json!("hi")) {
+            CallOutcome::Failed(f) => assert_eq!(f.error, "transport_connect", "{f:?}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(c.totals().calls, 1);
+        assert_eq!(c.last_error().as_deref(), Some("transport_connect"));
+    }
+
+    #[test]
+    fn a_budget_below_one_call_is_too_small_not_exhausted() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = key_of("sk-or-v1-abc");
+        let cfg = OracleConfig {
+            enabled: true,
+            budget_usd: 1e-6,
+            ..OracleConfig::default()
+        };
+        let c = OracleClient::open(&cfg, &dir.path().join("a.jsonl"), None, key.clone()).unwrap();
+        let min = c.min_reservation_usd();
+        assert!(min > 1e-6);
+        assert_eq!(c.status(), OracleStatus::BudgetTooSmall { min_usd: min });
+        assert_eq!(c.status().label(), "budget_too_small");
+        assert_eq!(c.status_json()["min_call_usd"], json!(min));
+        // max_calls 0 with nothing done: too small as well.
+        let mut none = cfg.clone();
+        none.budget_usd = 1.0;
+        none.max_calls = 0;
+        let c0 = OracleClient::open(&none, &dir.path().join("b.jsonl"), None, key.clone()).unwrap();
+        assert_eq!(c0.status().label(), "budget_too_small");
+        // Something spent, and the rest cannot hold a call: exhausted.
+        let lines = [
+            json!({"status":"reserved","call_id":"a","key_id":"k","reserved_usd":0.5}),
+            json!({"status":"settled","call_id":"a","key_id":"k","reserved_usd":0.5,"cost_usd":0.999_999_9}),
+        ];
+        let spent = dir.path().join("spent.jsonl");
+        std::fs::write(
+            &spent,
+            lines.iter().map(|l| format!("{l}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let mut one = cfg.clone();
+        one.budget_usd = 1.0;
+        let c1 = OracleClient::open(&one, &spent, None, key).unwrap();
+        assert_eq!(c1.status(), OracleStatus::BudgetExhausted);
+        assert_eq!(c1.status().label(), "budget_exhausted");
     }
 
     #[test]

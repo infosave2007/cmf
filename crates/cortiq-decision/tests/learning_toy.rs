@@ -1145,6 +1145,30 @@ fn offline_learning_asks_only_about_abstentions_and_reuses_ledger_answers() {
     }
     // An existing output is refused; a second run gives the same bytes.
     assert!(learn::learn_offline(&toy().path, &opts, test_key_lookup(), &out).is_err());
+    // A value of the key variable that is not a key (CR LF inside it) is
+    // refused up front: named by position, never shown, never sent.
+    let mock3 = MockOracle::answering("travel");
+    let d3 = tempfile::tempdir().unwrap();
+    let opts3 = offline_opts(d3.path(), &mock3, &traffic, vec![]);
+    let bad: oracle::KeyLookup = Arc::new(|name: &str| {
+        (name == KEY_ENV).then(|| format!("{}\r\n{}", &TEST_KEY[..10], &TEST_KEY[10..]))
+    });
+    let e = format!(
+        "{:#}",
+        learn::learn_offline(&toy().path, &opts3, bad, &d3.path().join("o.cmf")).unwrap_err()
+    );
+    assert!(
+        e.contains(&format!(
+            "the key in {KEY_ENV} is not usable: a control character at byte 11"
+        )),
+        "{e}"
+    );
+    assert!(
+        !e.contains(&TEST_KEY[10..]) && !e.contains("0123456789abcdef"),
+        "{e}"
+    );
+    assert_eq!(mock3.hits(), 0);
+    assert!(!d3.path().join("oracle.jsonl").exists());
     let mock2 = MockOracle::answering("travel");
     let d2 = tempfile::tempdir().unwrap();
     let opts2 = offline_opts(d2.path(), &mock2, &traffic, vec![answers]);

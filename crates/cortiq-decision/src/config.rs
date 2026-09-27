@@ -484,9 +484,45 @@ pub fn is_env_name(name: &str) -> bool {
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
+/// Longest value without `/` that may be a model id or a variable name;
+/// a longer one is taken for a key.
+pub const KEY_LIKE_MIN_LEN: usize = 41;
+
+/// Why a value given where a model id or a variable's name belongs looks
+/// like a key (`None`: it does not), whatever its prefix: it holds
+/// `sk-or-` or starts with `sk-`, starts with `Bearer `, has leading or
+/// trailing whitespace, or is longer than 40 bytes without a `/`. Such a
+/// value is refused without being shown (only its length is).
+pub fn looks_like_key(value: &str) -> Option<&'static str> {
+    let b = value.as_bytes();
+    if value.contains("sk-or-") || value.starts_with("sk-") {
+        return Some("it holds an OpenRouter key prefix (sk-)");
+    }
+    if b.len() >= 7 && b[..7].eq_ignore_ascii_case(b"bearer ") {
+        return Some("it starts with 'Bearer '");
+    }
+    if b.first().is_some_and(u8::is_ascii_whitespace)
+        || b.last().is_some_and(u8::is_ascii_whitespace)
+    {
+        return Some("it has leading or trailing whitespace");
+    }
+    if b.len() >= KEY_LIKE_MIN_LEN && !value.contains('/') {
+        return Some("it is longer than 40 bytes without a '/'");
+    }
+    None
+}
+
 /// The value is never echoed: a secret pasted where its variable's name
 /// belongs would otherwise land in the error and every captured log.
 fn check_env_name(what: &str, name: &str) -> Result<()> {
+    if let Some(why) = looks_like_key(name) {
+        bail!(
+            "{what} must be the NAME of an environment variable (e.g. OPENROUTER_API_KEY), not \
+             the secret it holds: the given value looks like a key ({why}); it ({} bytes) is not \
+             shown",
+            name.len()
+        );
+    }
     ensure!(
         is_env_name(name),
         "{what} must be the NAME of an environment variable ([A-Za-z0-9_], 1..128 bytes), not \
@@ -607,6 +643,13 @@ impl Config {
             !o.model.is_empty() && o.model.len() <= 256,
             "oracle.model must be 1..256 bytes"
         );
+        if let Some(why) = looks_like_key(&o.model) {
+            bail!(
+                "oracle.model must be an OpenRouter model id such as {DEFAULT_ORACLE_MODEL}, not \
+                 the key: the given value looks like a key ({why}); it ({} bytes) is not shown",
+                o.model.len()
+            );
+        }
         o.max_price()?;
         if o.provider.contains_key("data_collection") {
             bail!("set data_collection at oracle.data_collection, not inside oracle.provider");
@@ -729,6 +772,49 @@ mod tests {
         assert!(Config::from_json(br#"{"auth":{"require":true,"key_prefix":"sk-"}}"#).is_ok());
         assert!(Config::from_json(br#"{"auth":{"admin_token_env":"A B"}}"#).is_err());
         assert!(Config::from_json(br#"[]"#).is_err());
+    }
+
+    #[test]
+    fn key_like_values_are_recognised_whatever_their_prefix() {
+        let hex64 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        for v in [
+            "sk-or-v1-abc",
+            "xx-sk-or-v1-abc",
+            "sk-proj-abc",
+            "Bearer abc",
+            "bearer abc",
+            " OPENROUTER_API_KEY",
+            "OPENROUTER_API_KEY\n",
+            hex64,
+            "A_VERY_LONG_VARIABLE_NAME_THAT_IS_OVER_40_BYTES",
+        ] {
+            assert!(looks_like_key(v).is_some(), "{v:?}");
+        }
+        for v in [
+            "OPENROUTER_API_KEY",
+            "deepseek/deepseek-v4.1-flash",
+            "openrouter/auto",
+            "a/0123456789abcdef0123456789abcdef0123456789abcdef",
+            "MY_KEY",
+        ] {
+            assert!(looks_like_key(v).is_none(), "{v:?}");
+        }
+        // Neither a variable's name nor a model id that looks like a key is
+        // shown by the configuration's refusal.
+        let mut c = Config::default();
+        c.oracle.api_key_env = hex64.into();
+        let e = format!("{:#}", c.validate().unwrap_err());
+        assert!(
+            !e.contains("0123456789abcdef") && e.contains("looks like a key"),
+            "{e}"
+        );
+        let mut c = Config::default();
+        c.oracle.model = hex64.into();
+        let e = format!("{:#}", c.validate().unwrap_err());
+        assert!(
+            !e.contains("0123456789abcdef") && e.contains("(64 bytes) is not shown"),
+            "{e}"
+        );
     }
 
     #[test]
