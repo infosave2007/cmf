@@ -115,7 +115,7 @@ call).
 ## Quick start
 
 ```bash
-cargo install cortiq-cli --version 0.7.8
+cargo install cortiq-cli --version 0.7.9
 hf download infosave/cortiq-decision cortiq-decision.cmf --local-dir .
 cortiq decide cortiq-decision.cmf --skill banking77 -p "I still have not received my new card"
 ```

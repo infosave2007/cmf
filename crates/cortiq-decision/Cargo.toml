@@ -17,8 +17,8 @@ rust-version.workspace = true
 # backend is linked in on its behalf — the encoder runs on
 # `cortiq_engine::fcd_ops::gemm_nt_host`.
 [dependencies]
-cortiq-core = { path = "../cortiq-core", version = "0.7.8" }
-cortiq-engine = { path = "../cortiq-engine", version = "0.7.8" }
+cortiq-core = { path = "../cortiq-core", version = "0.7.9" }
+cortiq-engine = { path = "../cortiq-engine", version = "0.7.9" }
 serde = { workspace = true }
 # Canonical JSON and the Jev criteria order need insertion-ordered maps.
 serde_json = { workspace = true, features = ["preserve_order"] }

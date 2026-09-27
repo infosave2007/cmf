@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.9] - 2026-09-27
+
 ### Fixed
 - Decision server: a `LOCK` left in the state directory by a server that
   was killed (SIGKILL after a stop timeout, an out-of-memory kill, a crash
@@ -6311,7 +6313,8 @@ Initial public release.
 - **Licensing** — Apache-2.0 with an explicit patent-grant explanation
   (`LICENSE`, `NOTICE`, `PATENTS.md`).
 
-[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.7.8...HEAD
+[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.7.9...HEAD
+[0.7.9]: https://github.com/infosave2007/cmf/compare/v0.7.8...v0.7.9
 [0.7.8]: https://github.com/infosave2007/cmf/compare/v0.7.7...v0.7.8
 [0.7.7]: https://github.com/infosave2007/cmf/compare/v0.7.6...v0.7.7
 [0.6.9]: https://github.com/infosave2007/cmf/compare/v0.6.8...v0.6.9
