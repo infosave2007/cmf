@@ -1879,6 +1879,31 @@ fn the_oracle_key_comes_only_from_the_environment() {
         let s = srv.admin("GET", "/v1/admin/oracle", None).await;
         assert_eq!(s.body["key_present"], false);
         assert_eq!(s.body["status"], "no_key");
+        // The router surface keeps its flag vocabulary: a missing key is
+        // `oracle_disabled` there, in the answer and in the audit records.
+        let rr = srv
+            .post(
+                "/v1/route",
+                None,
+                &json!({"taxonomy_id": "topics", "input": {"text": rejected()[1]}}),
+            )
+            .await;
+        assert_eq!(
+            rr.body["decision"]["flags"],
+            json!(["low_confidence", "oracle_disabled"]),
+            "{}",
+            rr.text
+        );
+        let e = srv.get("/v1/escalations").await;
+        let rec = e.body["records"].as_array().unwrap();
+        assert_eq!(rec.len(), 2, "{}", e.text);
+        for r in rec {
+            assert_eq!(
+                r["flags"],
+                json!(["low_confidence", "oracle_disabled"]),
+                "{r}"
+            );
+        }
     });
     assert_eq!(mock.hits(), 0);
     assert!(!cfg.to_value().to_string().contains(TEST_KEY));
@@ -1992,4 +2017,56 @@ async fn oracle_flag_opens_the_loopback_open_mode_and_status_and_hints_name_ever
     enable(&srv).await;
     assert_eq!(status(&srv).await, "ready");
     assert_eq!(mock.hits(), 2);
+}
+
+/// `serve --oracle` on loopback without keys or `auth.require`: the implicit
+/// open caller reaches the oracle, but nothing it brings teaches the model —
+/// not its feedback, and not the oracle's answer to a skill's own question
+/// (`/v1/route`), which teaches for any identified caller: the answer is
+/// cached, the learning buffer stays empty. An explicit `auth.require: false`
+/// keeps teaching as before.
+#[tokio::test]
+async fn the_implicit_open_mode_with_the_oracle_never_teaches() {
+    let route = |text: &str| json!({"input": {"text": text}, "taxonomy_id": "topics"});
+    let mock = MockOracle::answering("travel");
+    let mut cfg = stand_config(&mock.url());
+    cfg.auth.require = None;
+    let srv = Srv::open_with(
+        &toy().path,
+        tempfile::tempdir().unwrap(),
+        &cfg,
+        test_key(),
+        |o| o.oracle_from_flag = true,
+    );
+    for text in &rejected()[..3] {
+        let r = srv.post("/v1/route", None, &route(text)).await;
+        assert_eq!(r.status, 200, "{}", r.text);
+        assert_eq!(r.body["decision"]["source"], "oracle", "{}", r.text);
+    }
+    // A repeat is a cache answer: the oracle's answer was kept.
+    let again = srv.post("/v1/route", None, &route(&rejected()[0])).await;
+    assert_eq!(again.body["decision"]["source"], "cache", "{}", again.text);
+    assert_eq!(mock.hits(), 3);
+    let l = srv.learning().await;
+    assert_eq!(l["examples_added"], 0, "{l}");
+    assert_eq!(l["buffer"]["examples"], 0, "{l}");
+    assert_eq!(l["attempts"], 0, "{l}");
+    drop(srv);
+
+    // The explicit open mode (auth.require: false): the same route call
+    // teaches the skill, as R1 defined it.
+    let mut cfg = stand_config(&mock.url());
+    cfg.auth.require = Some(false);
+    let srv = Srv::open_with(
+        &toy().path,
+        tempfile::tempdir().unwrap(),
+        &cfg,
+        test_key(),
+        |o| o.oracle_from_flag = true,
+    );
+    let r = srv.post("/v1/route", None, &route(&rejected()[5])).await;
+    assert_eq!(r.body["decision"]["source"], "oracle", "{}", r.text);
+    let l = srv.learning().await;
+    assert_eq!(l["examples_added"], 1, "{l}");
+    assert_eq!(l["buffer"]["examples"], 1, "{l}");
 }

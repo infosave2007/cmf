@@ -24,7 +24,8 @@
 //!    trained question refused because the oracle is not ready (flags
 //!    `oracle_disabled`, `no_key`, `budget`, `stopped`) also gives the answer
 //!    one line `cmf.hint` saying what to do ([`oracle_hint`]; logged at most
-//!    once a minute, [`DecisionService::log_oracle_hint`]);
+//!    once a minute per hint, once per process at INFO on a server without
+//!    an oracle, [`DecisionService::log_oracle_hint`]);
 //! 6. the response, the metering (spec §4.9) and one usage-ledger record are
 //!    produced; the escalator observes the decided questions (feedback ring).
 //!
@@ -78,7 +79,7 @@ use parking_lot::{Mutex, RwLock};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// Router quality-first margin threshold (router `policy.rs:54-59`).
@@ -328,6 +329,11 @@ pub struct Principal {
     /// become examples whatever their instructions (see
     /// [`crate::cascade`]).
     pub learning_allowed: bool,
+    /// The implicit open mode ([`Principal::open_implicit`]): nobody is
+    /// identified, so nothing this caller brings teaches the shared model —
+    /// not even an oracle answer to a skill's own question, which teaches
+    /// for any other caller. Such answers are still cached.
+    pub implicit_open: bool,
 }
 
 impl Principal {
@@ -346,6 +352,7 @@ impl Principal {
             oracle_budget_usd: None,
             oracle_allowed: true,
             learning_allowed: true,
+            implicit_open: false,
         }
     }
 
@@ -353,11 +360,13 @@ impl Principal {
     /// `null` and the server listens on loopback: the listening address says
     /// nothing about the client (a reverse proxy on the same host forwards
     /// anyone), so this caller may neither reach the oracle nor teach the
-    /// model.
+    /// model. `serve --oracle` lets it reach the oracle
+    /// ([`DecisionService::with_open_oracle`]); it never teaches.
     pub fn open_implicit() -> Self {
         Self {
             oracle_allowed: false,
             learning_allowed: false,
+            implicit_open: true,
             ..Self::open()
         }
     }
@@ -374,6 +383,7 @@ impl Principal {
             oracle_budget_usd: k.oracle_budget()?,
             oracle_allowed: k.oracle_allowed,
             learning_allowed: k.learning_allowed,
+            implicit_open: false,
         })
     }
 
@@ -514,8 +524,10 @@ pub fn oracle_hint(reason: RefusalReason, status: &OracleStatus, key_env: &str) 
     })
 }
 
-/// At most one log line of an oracle hint per this interval.
+/// At most one log line of the same oracle hint per this interval.
 pub const HINT_LOG_EVERY: Duration = Duration::from_secs(60);
+/// Hint texts remembered before stale ones are dropped.
+const HINT_KINDS_KEPT: usize = 32;
 
 /// Flag of a question whose oracle call failed.
 pub const FLAG_ORACLE_UNAVAILABLE: &str = "oracle_unavailable";
@@ -834,8 +846,10 @@ pub struct DecisionService {
     admin_token: Option<String>,
     inflight: Arc<AtomicUsize>,
     tokens: TokenCache,
-    /// When an oracle hint was last logged ([`HINT_LOG_EVERY`]).
-    hint_logged: Mutex<Option<Instant>>,
+    /// When each oracle hint was last logged ([`HINT_LOG_EVERY`], per hint).
+    hint_logged: Mutex<HashMap<String, Instant>>,
+    /// The hint of a server without an oracle was logged (once per process).
+    off_hint_logged: AtomicBool,
 }
 
 impl std::fmt::Debug for DecisionService {
@@ -885,7 +899,8 @@ impl DecisionService {
             limiter: RateLimiter::new(),
             inflight: Arc::new(AtomicUsize::new(0)),
             tokens: TokenCache::new(TOKEN_CACHE_CAP),
-            hint_logged: Mutex::new(None),
+            hint_logged: Mutex::new(HashMap::new()),
+            off_hint_logged: AtomicBool::new(false),
             cfg: Arc::new(cfg),
         })
     }
@@ -899,7 +914,10 @@ impl DecisionService {
     /// Let the open mode that holds only because of a loopback address
     /// (`auth.require: null`) use the oracle: the operator enabled the oracle
     /// explicitly (`cortiq serve --oracle MODEL`). It still may not teach the
-    /// model; an explicit `auth.require: false` gives both, as before.
+    /// model: its feedback is not learned and the oracle's answers to its
+    /// questions — a skill's own question, as `/v1/route` asks it, included —
+    /// are cached but never become examples ([`Principal::implicit_open`]);
+    /// an explicit `auth.require: false` gives both, as before.
     pub fn with_open_oracle(mut self, allowed: bool) -> Self {
         self.open_oracle = allowed;
         self
@@ -964,16 +982,40 @@ impl DecisionService {
         oracle_hint(reason, &self.oracle_status(), &self.cfg.oracle.api_key_env)
     }
 
-    /// Log `hint` at most once per [`HINT_LOG_EVERY`] (the router surface
-    /// carries no hint in its answers; the log is where an operator sees it).
+    /// Log `hint` (the router surface carries no hint in its answers; the
+    /// log is where an operator sees it). A server run without an oracle
+    /// (`oracle.enabled` false: the operator's choice) logs it once per
+    /// process at INFO; otherwise each distinct hint is a WARN at most once
+    /// per [`HINT_LOG_EVERY`], so one kind never hides another.
     pub fn log_oracle_hint(&self, hint: &str) {
+        if self.escalator.is_none() || !self.cfg.oracle.enabled {
+            if !self.off_hint_logged.swap(true, Ordering::Relaxed) {
+                tracing::info!(
+                    "a question the local model could not decide abstained: {hint} (logged once)"
+                );
+            }
+            return;
+        }
         let now = Instant::now();
         let mut last = self.hint_logged.lock();
-        if last.is_none_or(|t| now.duration_since(t) >= HINT_LOG_EVERY) {
-            *last = Some(now);
-            drop(last);
-            tracing::warn!("a question the local model could not decide abstained: {hint}");
+        if last
+            .get(hint)
+            .is_some_and(|t| now.duration_since(*t) < HINT_LOG_EVERY)
+        {
+            return;
         }
+        // A handful of hint texts exist (a stop reason names one of a few
+        // rules); stale entries go before the map could grow, and it never
+        // holds more than HINT_KINDS_KEPT.
+        if last.len() >= HINT_KINDS_KEPT {
+            last.retain(|_, t| now.duration_since(*t) < HINT_LOG_EVERY);
+            if last.len() >= HINT_KINDS_KEPT {
+                last.clear();
+            }
+        }
+        last.insert(hint.to_string(), now);
+        drop(last);
+        tracing::warn!("a question the local model could not decide abstained: {hint}");
     }
 
     /// Whether a key is required now (false only in open mode: no keys and

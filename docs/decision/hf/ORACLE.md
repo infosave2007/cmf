@@ -7,7 +7,9 @@ through OpenRouter. The oracle's answers are cached and can become training
 examples, so the local model learns the traffic it abstains on; a refit
 changes no other label's parameters (checked by sha256), although a refitted
 label can win rows another label used to win. The oracle is **off by
-default**; nothing leaves the machine until you enable it.
+default**; nothing leaves the machine until you enable it — in two steps:
+the key in `OPENROUTER_API_KEY`, then `cortiq serve FILE --oracle MODEL`
+([Connect OpenRouter](#connect-openrouter)).
 
 1. [How a question flows](#how-a-question-flows)
 2. [Self-learning](#self-learning)
@@ -22,14 +24,19 @@ default**; nothing leaves the machine until you enable it.
    the gate accepts, the answer is `action: local`. Such a question is never
    sent to the oracle, not even with `cmf.oracle: true`.
 2. **Permission.** An undetermined question may go to the oracle only if all of
-   these hold: `oracle.enabled`; the key variable is set in the server's
-   environment; the caller's key has `oracle_allowed` (in open mode:
-   `auth.require: false` in the configuration, not only a loopback address);
-   the request consents (`cmf.oracle`, the router's `options.allow_oracle`,
-   else `oracle.default_per_request`); budget is left; no stop rule fired.
+   these hold: `oracle.enabled` (or `serve --oracle MODEL`); the key variable
+   is set in the server's environment; the caller's key has `oracle_allowed`
+   (in open mode, without keys: `auth.require: false` in the configuration,
+   or `serve --oracle` on a loopback address — see
+   [Who may use it](#who-may-use-it-and-who-teaches)); the request consents
+   (`cmf.oracle`, the router's `options.allow_oracle`, else
+   `oracle.default_per_request`); budget is left; no stop rule fired.
    Otherwise a trained question stays `abstain` with a flag (`oracle_disabled`,
-   `consent_off`, `budget`, `stopped`) and an untrained one fails with 422
-   or 503.
+   `no_key` beside `oracle_disabled` when the key variable is not set,
+   `consent_off`, `budget`, `stopped`) and, on the decisions API, a one-line
+   `cmf.hint` that says what to do (the router API keeps its answer and its
+   flags as they were — a missing key is `oracle_disabled` there — and the
+   server logs the hint); an untrained question fails with 422 or 503.
 3. **Semantic cache.** Within the same scope — the question's contract
    (type, instructions and criteria), and for a question matched to a skill
    also the skill and the set of options — a stored oracle answer whose text
@@ -53,7 +60,9 @@ default**; nothing leaves the machine until you enable it.
    question is exactly the skill's own (its rubric's instructions and
    criteria over all its active labels, as `/v1/route` asks it), so that
    the answer is the skill's rubric applied to the text and not a caller's
-   instructions. A failed call never becomes an error for a trained
+   instructions. The one exception is the open mode of `serve --oracle` on a
+   loopback address without keys: nobody is identified there, so its
+   answers are cached but never learned. A failed call never becomes an error for a trained
    question: it is answered locally with `action: abstain` and the flag
    `oracle_unavailable` (an untrained question gets 502).
 
@@ -170,19 +179,107 @@ a new label starts a cold start.
 
 ## Connect OpenRouter
 
-1. Create an account at [openrouter.ai](https://openrouter.ai), add credit, and
-   under *Settings → Keys* create a key with a credit limit of its own.
-2. Put the key in the environment of the server process.
-3. Configure the oracle: `enabled: true` and a `model` from
+Create an account at [openrouter.ai](https://openrouter.ai), add credit, and
+under *Settings → Keys* create a key with a credit limit of its own. Then:
+
+```bash
+export OPENROUTER_API_KEY="<your OpenRouter key>"                     # step 1
+cortiq serve cortiq-decision.cmf --oracle deepseek/deepseek-v4.1-flash  # step 2
+```
+
+That is the whole setup. The model is any
+[openrouter.ai/models](https://openrouter.ai/models) id with structured
+outputs (JSON schema); `deepseek/deepseek-v4.1-flash` is the one every
+number on this page was measured with. At start the server:
+
+* makes **one public request** without the key, `GET
+  https://openrouter.ai/api/v1/models/<MODEL>/endpoints`, and sets the max
+  price (which caps the provider price and sizes every reservation) to
+  twice the prompt and completion prices of the model's cheapest endpoint
+  with structured outputs;
+* **refuses to start** with a message that names the problem — and 2–3
+  cheap models that fit — when OpenRouter does not list the model, when
+  none of its endpoints supports structured outputs, or when it has only
+  variable prices (as `openrouter/auto`: give `--oracle-max-price` or pick a
+  concrete model); it also refuses a given max price below every
+  structured-output endpoint, since OpenRouter would refuse every call;
+* falls back to a max price of $0.10/$0.50 per 1M in/out, with a warning,
+  when the listing cannot be fetched;
+* logs one line about the oracle, never the key:
+
+```text
+oracle: ready — deepseek/deepseek-v4.1-flash via openrouter.ai, budget $1.00, max price in/out $0.06/$0.58 per 1M (2× the cheapest structured-output endpoint, … at $0.03/$0.29)
+oracle: NOT ready — OPENROUTER_API_KEY is not set (set it to your OpenRouter key and restart; …)
+```
+
+Everything else keeps its safe default: a budget of $1.00, provider
+routing `{sort: price, require_parameters: true, allow_fallbacks: true}`,
+PII redaction on, the stop rules, and the oracle only for questions the
+local model cannot decide. Optional companions of `--oracle` (each
+overrides `--decision-config`):
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--oracle-budget USD` | 1.0 | the most this server spends on the oracle |
+| `--oracle-max-calls N` | 10000 | the most oracle calls |
+| `--oracle-max-price IN,OUT` | 2× the cheapest structured-output endpoint | max price, USD per 1M prompt / completion tokens |
+| `--oracle-key-env VAR` | `OPENROUTER_API_KEY` | the NAME of the variable that holds the key (the key itself is refused and never shown) |
+| `--oracle-base-url URL` | `https://openrouter.ai/api/v1` | https; plain http only to a loopback address (a local proxy or a test mock) |
+| `--no-oracle-learning` | off | answers are cached but the served model never changes |
+
+Check it — `/healthz` needs no token, the admin view needs
+`CORTIQ_DECISION_ADMIN_TOKEN` in the server's environment:
+
+```bash
+curl -s http://127.0.0.1:8080/healthz | jq -r .oracle_status                  # → ready
+curl -s http://127.0.0.1:8080/v1/admin/oracle -H "x-admin-token: $CORTIQ_DECISION_ADMIN_TOKEN" \
+  | jq '{status, model, max_price, budget_usd, spent_usd, calls}'
+```
+
+`status` is one of `ready`, `no_key` (the variable is unset or empty),
+`disabled` (not configured, or switched off by `POST /v1/admin/oracle`),
+`budget_exhausted` (the budget or `max_calls` is used up; restart with a
+larger `--oracle-budget` / `--oracle-max-calls`) or `stopped: <reason>` (a
+stop rule; `POST /v1/admin/oracle {"enabled": true}` resumes after the fix).
+On the router API, `/v1/healthz` carries it as `cmf.oracle_status` only with
+`x-cmf-extensions: 1`, so the router's own shape stays exact.
+
+### Who may use it, and who teaches
+
+* **No keys, loopback address** (the default `127.0.0.1:8080`): with
+  `--oracle`, callers without a key may use the oracle within its budget —
+  the operator enabled it on the command line — but never teach the model:
+  their feedback is not learned and the oracle's answers to them are cached,
+  not learned. A reverse proxy on the same host forwards anyone to a
+  loopback address, so behind one set `auth.require: true` and use keys.
+* **No keys, `auth.require: false`** in `--decision-config`: the explicit
+  open mode, which may use the oracle and teach.
+* **No keys, another address**: keys are required (`auth.require: null`
+  means "required unless loopback").
+* **Keys**: `cortiq decision keys create` makes keys that may use the oracle
+  (`oracle_allowed: true`, like imported router keys); `--oracle-allowed=false`
+  makes one that never escalates, and `--oracle-budget-usd` caps one key's
+  oracle spending. Teaching the shared skills is a separate permission,
+  `--learning-allowed` (off by default). Keys made through `POST
+  /v1/admin/keys` keep the router's default (`oracle_allowed` only when the
+  body says so).
+
+### With a configuration file
+
+For every oracle setting — deadline, error limit, provider options,
+`data_collection: "deny"`, per-request consent — use `--decision-config`
+(the `--oracle*` flags, when given, override its values):
+
+1. Configure the oracle: `enabled: true` and a `model` from
    [openrouter.ai/models](https://openrouter.ai/models) that supports structured
-   outputs (JSON schema). The default and the model every number on this page
-   was measured with is `deepseek/deepseek-v4.1-flash`. `provider.max_price`
-   (USD per 1M tokens) caps the provider price and sizes the reservation.
-   `base_url` must be https (plain http only to a loopback address).
-4. Set limits: `budget_usd`, `max_calls`, `deadline_s`, `max_errors`; per key
+   outputs (JSON schema). `provider.max_price` (USD per 1M tokens) caps the
+   provider price and sizes the reservation. `base_url` must be https (plain
+   http only to a loopback address).
+2. Set limits: `budget_usd`, `max_calls`, `deadline_s`, `max_errors`; per key
    `oracle_allowed`, `oracle_budget_usd` and, for keys whose own questions
    and feedback may teach the model, `learning_allowed`.
-5. Start the server and verify.
+3. Put the key in the environment of the server process, start the server
+   and verify.
 
 ```bash
 export OPENROUTER_API_KEY="<your OpenRouter key>"
@@ -212,18 +309,18 @@ cortiq serve cortiq-decision.cmf --decision-config oracle-server.json \
   --state ./oracle.state --port 8081
 ```
 
-Verify: the admin view must show `configured: true` (the configuration
-enables the oracle) and `key_present: true` (the key variable is set in the
-server's environment). `enabled: true` only means that no stop rule or admin
-call has switched the oracle off; it is true with the oracle off in the
-configuration as well. Then a question the gate rejects comes back from the
+Verify: the admin view must show `status: "ready"` (`configured: true`: the
+configuration enables the oracle; `key_present: true`: the key variable is
+set in the server's environment). `enabled: true` only means that no stop
+rule or admin call has switched the oracle off; it is true with the oracle
+off in the configuration as well. Then a question the gate rejects comes back from the
 oracle (on the published model, "can you recommend a good tattoo artist" is
 out of scope for `clinc150` and is rejected by its gate).
 
 ```bash
 export ORC=http://127.0.0.1:8081
 curl -s "$ORC/v1/admin/oracle" -H "x-admin-token: $CORTIQ_DECISION_ADMIN_TOKEN" \
-  | jq '{configured, key_present, enabled, model, budget_usd, spent_usd, stop_reason}'   # → 200
+  | jq '{status, configured, key_present, enabled, model, budget_usd, spent_usd, stop_reason}'   # → 200
 curl -s "$ORC/v1/route" -H "Authorization: Bearer $OKEY" \
   -H 'Content-Type: application/json' \
   -d '{"input": {"text": "can you recommend a good tattoo artist"}, "taxonomy_id": "clinc150"}' \
@@ -237,9 +334,10 @@ the OpenRouter API; the documentation run sent nothing to OpenRouter.
 
 `source` is `oracle` (a repeat of the same text is `cache`); `calls` and
 `spent_usd` grow. If `source` stays `router` with the flag `oracle_disabled`,
-`consent_off` or `budget`, check the configuration, the key's `oracle_allowed`
-(without keys: `auth.require: false`) and the budget; `stop_reason` names a
-stop rule. The same questions through
+`consent_off` or `budget`, check `status`, the key's `oracle_allowed`
+(without keys: `auth.require: false`, or `--oracle` on a loopback address)
+and the budget; `stop_reason` names a stop rule, and the decisions API's
+`cmf.hint` says what to do. The same questions through
 the decisions API need `"cmf": {"oracle": true}` or
 `oracle.default_per_request: true` (the default).
 

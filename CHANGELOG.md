@@ -37,9 +37,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before each request and before each input of a router batch (a
   `/v1/decisions` request with more questions than the decision quota has
   left is refused, and an oracle call whose reservation does not fit in the
-  credit left is not made), and a usage ledger. The open mode reaches the oracle and teaches the model only with
-  `auth.require: false` set explicitly, never because of a loopback address
-  alone. Prices are 0 by default; oracle costs pass through.
+  credit left is not made), and a usage ledger. The open mode reaches the
+  oracle and teaches the model with `auth.require: false` set explicitly; a
+  loopback address alone gives neither, except that `serve --oracle MODEL`
+  lets it reach the oracle (never teach). Prices are 0 by default; oracle
+  costs pass through.
 - The cortiq-router API (schema 1.1) on the same server with the router's
   keys, types and error envelope: `/v1/route`, `/v1/route:batch`,
   `/v1/feedback`, `/v1/taxonomies`, `/v1/usage`, `/v1/escalations`,
@@ -64,7 +66,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rollback. Only keys with `learning_allowed` (none by default) teach the
   shared skills by feedback or by the oracle's answers to their own
   questions; an answer to the skill's own question (`/v1/route`) teaches
-  whoever asked.
+  whoever asked with a key or in the explicit open mode, never in the
+  loopback open mode of `serve --oracle`.
+- The oracle in two steps: `export OPENROUTER_API_KEY=…` and `cortiq serve
+  FILE --oracle MODEL`. At start one public request without the key
+  (`GET …/models/MODEL/endpoints`) sets the max price to twice the model's
+  cheapest endpoint with structured outputs; a model OpenRouter does not
+  list, one without structured outputs, one with only variable prices
+  (without `--oracle-max-price`) or a given max price below every such
+  endpoint is refused with the problem named (and 2–3 cheap models that
+  fit); an unreachable listing falls back to $0.10/$0.50 per 1M with a
+  warning. Companions: `--oracle-budget` (default $1.00),
+  `--oracle-max-calls`, `--oracle-max-price IN,OUT`, `--oracle-key-env`
+  (a variable's name; a key typed there is refused and never shown),
+  `--oracle-base-url`, `--no-oracle-learning`; they override
+  `--decision-config`. One startup line says `oracle: ready — …`,
+  `oracle: NOT ready — <what to do>` or `oracle: off`; `GET
+  /v1/admin/oracle` has `status` (`ready`, `no_key`, `disabled`,
+  `budget_exhausted`, `stopped: <reason>`) and `max_price`, `/healthz`
+  has `oracle_status` (`/v1/healthz` only under `cmf` with
+  `x-cmf-extensions: 1`). A trained question that abstains because the
+  oracle is not ready gets the flag `no_key` (beside `oracle_disabled`) when
+  the key is missing and a one-line `cmf.hint` on the decisions API; router
+  answers keep their shape and flags, and the hint is logged instead.
 - The published model `infosave/cortiq-decision` (304520292 bytes): skills
   `banking77`, `clinc150` and `massive` trained on train ∪ dev, with K 32, 16
   and 24 chosen by cross-validation. It is 4520292 bytes over the
@@ -75,6 +99,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in `docs/decision/hf/`; `tools/decision_hf_bundle.sh` assembles the upload.
 
 ### Changed
+- `cortiq decision keys create` makes keys that may use the oracle
+  (`oracle_allowed: true`, as imported router keys already were);
+  `--oracle-allowed=false` opts out. Keys created through `POST
+  /v1/admin/keys` keep the router's default.
 - `publish.yml` publishes `cortiq-decision` between `cortiq-engine` and
   `cortiq-net`, before the crates that depend on it.
 - The CMF reader refuses a file whose arch name starts with

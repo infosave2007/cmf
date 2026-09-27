@@ -1517,12 +1517,18 @@ fn keys_auth_rate_quotas_and_admin() {
     assert!(anyone.is_open());
     // Open only because the address is loopback (auth.require null): a
     // reverse proxy may forward anyone, so no oracle and no teaching.
-    assert!(!anyone.oracle_allowed && !anyone.learning_allowed);
+    assert!(!anyone.oracle_allowed && !anyone.learning_allowed && anyone.implicit_open);
+    // `serve --oracle` lets it reach the oracle; it still never teaches.
+    let open = service_with(Config::default(), None)
+        .with_loopback(true)
+        .with_open_oracle(true);
+    let anyone = open.authenticate(None, None).unwrap();
+    assert!(anyone.oracle_allowed && !anyone.learning_allowed && anyone.implicit_open);
     let mut explicit = Config::default();
     explicit.auth.require = Some(false);
     let open = service_with(explicit.clone(), None).with_loopback(true);
     let p = open.authenticate(None, None).unwrap();
-    assert!(p.is_open() && p.oracle_allowed && p.learning_allowed);
+    assert!(p.is_open() && p.oracle_allowed && p.learning_allowed && !p.implicit_open);
     let open = service_with(explicit, None).with_loopback(false);
     assert!(open.authenticate(None, None).unwrap().oracle_allowed);
     let closed = service_with(Config::default(), None).with_loopback(false);
