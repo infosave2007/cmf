@@ -271,6 +271,8 @@ enum Commands {
         #[arg(long)]
         state: Option<String>,
         /// Decision file only: remove a state LOCK left by a dead process
+        /// where the state directory's filesystem has no advisory locks
+        /// (elsewhere such a LOCK is taken over without it)
         #[arg(long)]
         break_lock: bool,
         /// Decision file only: shadow mode for switching production traffic

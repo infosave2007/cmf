@@ -902,6 +902,24 @@ async fn payload_too_large_bad_requests_and_unknown_models() {
             .unwrap()
             .contains("duplicate key 'a'")
     );
+    // A truncated body: "not valid JSON" once.
+    let cut = br#"{"model":"cortiq/decision","state":"x","questions":{"t":{"type":"choice","instructions":"i","#;
+    let r = srv
+        .call(
+            "POST",
+            "/api/alpha/decisions",
+            &[("content-type", "application/json")],
+            Some(cut.to_vec()),
+        )
+        .await;
+    assert_eq!(r.openrouter_error(), (400, "INVALID_REQUEST".to_string()));
+    assert_eq!(
+        r.body["error"]["message"],
+        format!(
+            "the body is not valid JSON: expected a string key at byte {}",
+            cut.len()
+        )
+    );
     // Content type.
     let r = srv
         .call(
@@ -1748,6 +1766,72 @@ async fn serves_on_a_loopback_socket_and_shuts_down_gracefully() {
     assert_eq!(ledger_lines(&dir.path().join("state")).len(), 1);
     assert!(!dir.path().join("state/LOCK").exists());
     DecisionServer::open(&o).unwrap().close().unwrap();
+}
+
+/// An answer before the body is read (401 after the headers alone) while the
+/// client still sends the body, as nginx sends a buffered one: the server
+/// reads and drops the rest instead of resetting the connection, so every
+/// write succeeds and the client gets the JSON 401. Before, the unread body
+/// made the kernel reset the connection; nginx failed its write with EPIPE
+/// and answered 502. The body comes at once (unread when the server closes)
+/// and after a pause (arriving after the close).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_early_401_reads_the_rest_of_the_body_instead_of_resetting() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = cfg();
+    c.auth.require = Some(true);
+    let mut o = ServeOptions::new(&toy().path, c);
+    o.state_dir = Some(dir.path().join("state"));
+    o.cascade = CascadeOptions {
+        key: no_key(),
+        threads: 2,
+        created_unix: Some(EPOCH),
+    };
+    let server = DecisionServer::open(&o).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(server.run(listener, async {
+        let _ = rx.await;
+    }));
+    // A JSON body of exactly the limit (trailing whitespace).
+    let mut body = serde_json::to_vec(&topics_body(accepted())).unwrap();
+    body.resize(o.config.limits.body_bytes, b' ');
+    for pause_ms in [0, 300] {
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let head = format!(
+            "POST /api/alpha/decisions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        s.write_all(head.as_bytes()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(pause_ms)).await;
+        for chunk in body.chunks(64 * 1024) {
+            s.write_all(chunk).await.unwrap_or_else(|e| {
+                panic!("pause {pause_ms} ms: the connection was reset under the body: {e}")
+            });
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        s.shutdown().await.unwrap();
+        let mut resp = Vec::new();
+        s.read_to_end(&mut resp)
+            .await
+            .unwrap_or_else(|e| panic!("pause {pause_ms} ms: no answer, a reset: {e}"));
+        let text = String::from_utf8_lossy(&resp);
+        assert!(text.starts_with("HTTP/1.1 401"), "{text}");
+        let (_, json_text) = text.split_once("\r\n\r\n").unwrap();
+        let v: Value = serde_json::from_str(json_text).unwrap();
+        assert_eq!(
+            (
+                v["error"]["code"].as_u64(),
+                v["error"]["metadata"]["reason"].as_str()
+            ),
+            (Some(401), Some("UNAUTHORIZED")),
+            "{text}"
+        );
+    }
+    tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
 }
 
 // ------------------------------------------------------------------ router API (spec §4.15)

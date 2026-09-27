@@ -49,8 +49,9 @@
 //!   reservation, 401, 402: written to `oracle.state`, no call until
 //!   `--oracle-resume`), each worded without the log; a failed call counts
 //!   toward `max_errors` across runs; an interrupted run (SIGTERM, SIGINT)
-//!   releases the `LOCK`, a stale one is named and `--break-lock` removes it,
-//!   never one of a running process;
+//!   releases the `LOCK`, a stale one (its process killed) is taken over and
+//!   named, and one a running process holds is never broken, `--break-lock`
+//!   included;
 //! * `decision oracle check`: ready, no key, a refused key (401), an unknown
 //!   model, a model without structured outputs, a test call billed above its
 //!   reservation, refused with 402 or answered by another model — each with
@@ -1242,6 +1243,80 @@ fn run_and_chat_print_the_decision_guard_and_generic_tools_still_work() {
 }
 
 // ------------------------------------------------------------------ serve
+
+/// `cortiq serve` that must refuse to start: its output, or a failure when it
+/// is still running after a minute (it took the state directory).
+fn serve_refused(args: &[&str]) -> Output {
+    let mut child = cortiq()
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let t0 = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if t0.elapsed() > Duration::from_secs(60) {
+            let _ = child.kill();
+            panic!("cortiq serve started where it had to be refused");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    child.wait_with_output().unwrap()
+}
+
+/// A server killed without its shutdown (SIGKILL after a stop timeout, an
+/// out-of-memory kill) leaves its `LOCK` behind, and the next server on the
+/// directory takes it over and serves. Before, the leftover `LOCK` refused
+/// every restart for good: in a container the server is always pid 1, so a
+/// restart policy looped on "locked by pid 1". A server while another holds
+/// the directory is refused with the holder's pid, `--break-lock` included.
+#[test]
+fn serve_takes_over_the_lock_of_a_killed_server_and_refuses_a_running_one() {
+    let t = toy();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let state = d.join("state");
+    let lock = state.join("LOCK");
+    let mut srv = Server::start(&t.path, &["--state", s(&state)], &[], d);
+    let pid = srv.child.id();
+    let held = std::fs::read_to_string(&lock).unwrap();
+    assert!(held.starts_with(&format!("{pid} ")), "{held}");
+    let port = free_port().to_string();
+    for extra in [&[][..], &["--break-lock"][..]] {
+        let mut a = vec!["serve", s(&t.path), "--port", &port, "--state", s(&state)];
+        a.extend_from_slice(extra);
+        let o = serve_refused(&a);
+        assert!(
+            !o.status.success()
+                && stderr_of(&o).contains(&format!(
+                    "state directory {} is locked by pid {pid} ({}), a running process that holds it",
+                    state.display(),
+                    lock.display()
+                )),
+            "{}",
+            show(&o)
+        );
+        assert_eq!(std::fs::read_to_string(&lock).unwrap(), held);
+    }
+    // SIGKILL: no handler runs, the LOCK stays behind.
+    srv.child.kill().unwrap();
+    srv.child.wait().unwrap();
+    assert_eq!(std::fs::read_to_string(&lock).unwrap(), held);
+    let srv = Server::start(&t.path, &["--state", s(&state)], &[], d);
+    let (code, h) = http("GET", &srv.url("/healthz"), None, None);
+    assert_eq!(code, 200, "{h}");
+    let now = std::fs::read_to_string(&lock).unwrap();
+    assert!(now.starts_with(&format!("{} ", srv.child.id())), "{now}");
+    let logs = srv.stop();
+    assert!(
+        logs.contains(&format!(
+            "took over the LOCK of state directory {} left by pid {pid}, which ended without releasing it",
+            state.display()
+        )),
+        "{logs}"
+    );
+    assert!(!lock.exists(), "a graceful stop removes the LOCK");
+}
 
 #[test]
 fn serve_refuses_language_model_flags_on_a_decision_file() {
@@ -2531,8 +2606,11 @@ const KEY_LABEL: &str = "sk-or-v1-FAK...cmf";
 /// A second valid key of the mock, of OpenRouter's real shape (64 hex
 /// digits): an echo the letters and digits of which are kept (the old
 /// `finish_<letters and digits>` code) holds 8 of its bytes in a row.
-const HEX_OPENROUTER_KEY: &str =
-    concat!("sk-or-v1-", "4dd32cb05ecdedcd9551a7e0f3b86c21", "d49e7a05bc3f168e2d90a4c7b5e13f68"); // an obviously fake test key, split so secret scanners do not flag it
+const HEX_OPENROUTER_KEY: &str = concat!(
+    "sk-or-v1-",
+    "4dd32cb05ecdedcd9551a7e0f3b86c21",
+    "d49e7a05bc3f168e2d90a4c7b5e13f68"
+); // an obviously fake test key, split so secret scanners do not flag it
 
 /// The key of a request head, when it is one the mock accepts.
 fn valid_bearer(head: &str) -> bool {
@@ -4774,91 +4852,58 @@ fn decide_oracle_releases_its_lock_when_interrupted_and_names_a_stale_one() {
     let ledger = std::fs::read_to_string(state.join("oracle.jsonl")).unwrap();
     assert_eq!(ledger.matches("unsettled_at_start").count(), 2, "{ledger}");
 
-    // 2. A LOCK left by a process that is gone: named, with --break-lock.
+    // 2. A LOCK left by a process that is gone (killed: no handler ran) is
+    // taken over by the next run, without --break-lock, and named.
     let mut gone = Command::new("true").spawn().unwrap();
     let dead = gone.id();
     gone.wait().unwrap();
     std::fs::write(&lock, format!("{dead} 0123abcd\n")).unwrap();
     let o = decide_oracle(&base, &["-p", &texts[5]], &["--state", s(&state)], &key);
-    assert!(!o.status.success(), "{}", show(&o));
-    assert!(
-        stderr_of(&o).contains(&format!(
-            "has a LOCK left by pid {dead}, which is no longer running (an interrupted run): pass --break-lock to remove it"
-        )),
-        "{}",
-        show(&o)
-    );
-    let o = decide_oracle(
-        &base,
-        &["-p", &texts[5]],
-        &["--state", s(&state), "--break-lock"],
-        &key,
-    );
     assert!(o.status.success(), "{}", show(&o));
     assert!(
         stderr_of(&o).contains(&format!(
-            "left by pid {dead}, which is not running (--break-lock)"
+            "took over the LOCK of state directory {} left by pid {dead}, which ended without releasing it",
+            state.display()
         )),
         "{}",
         show(&o)
     );
     assert!(!lock.exists());
 
-    // 3. The LOCK of a running process (this test) is never broken.
+    // 3. The LOCK of a running process (this test holds its flock) is never
+    // broken, --break-lock included.
+    use std::os::unix::io::AsRawFd;
     let mine = format!("{} 0123abcd\n", std::process::id());
     std::fs::write(&lock, &mine).unwrap();
-    let o = decide_oracle(
-        &base,
-        &["-p", &texts[5]],
-        &["--state", s(&state), "--break-lock"],
-        &key,
-    );
-    assert!(!o.status.success(), "{}", show(&o));
-    assert!(
-        stderr_of(&o).contains(&format!(
-            "belongs to pid {}, which is running",
-            std::process::id()
-        )),
-        "{}",
-        show(&o)
-    );
-    // A pid reused by an unrelated process after a crash: the way out.
-    assert!(
-        stderr_of(&o).contains(&format!(
-            "If pid {} is not a cortiq process (a LOCK left by a crash whose pid was reused), no cortiq process uses the directory: remove {} by hand",
-            std::process::id(),
-            lock.display()
-        )),
-        "{}",
-        show(&o)
-    );
-    assert_eq!(std::fs::read_to_string(&lock).unwrap(), mine);
-    let o = decide_oracle(&base, &["-p", &texts[5]], &["--state", s(&state)], &key);
-    assert!(
-        !o.status.success()
-            && stderr_of(&o).contains("is held by pid")
-            && stderr_of(&o).contains("--break-lock")
-            && stderr_of(&o).contains(&format!("remove {} by hand", lock.display())),
-        "{}",
-        show(&o)
-    );
-    // An empty LOCK (a process may be writing it right now) is not broken.
+    let holder = std::fs::File::open(&lock).unwrap();
+    // SAFETY: flock(2) on the descriptor `holder` owns.
+    let r = unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(r, 0);
+    for extra in [
+        vec!["--state", s(&state)],
+        vec!["--state", s(&state), "--break-lock"],
+    ] {
+        let o = decide_oracle(&base, &["-p", &texts[5]], &extra, &key);
+        assert!(
+            !o.status.success()
+                && stderr_of(&o).contains(&format!(
+                    "state directory {} is held by pid {} (a running `cortiq serve`, or another `cortiq decide --oracle`)",
+                    state.display(),
+                    std::process::id()
+                ))
+                && stderr_of(&o).contains("--state DIR"),
+            "{}",
+            show(&o)
+        );
+        assert_eq!(std::fs::read_to_string(&lock).unwrap(), mine);
+    }
+    // Its holder gone (the descriptor closed), the same LOCK is stale; an
+    // empty one as well.
+    drop(holder);
     std::fs::write(&lock, "").unwrap();
-    let o = decide_oracle(
-        &base,
-        &["-p", &texts[5]],
-        &["--state", s(&state), "--break-lock"],
-        &key,
-    );
-    assert!(
-        !o.status.success()
-            && stderr_of(&o)
-                .contains("is empty — a process may be taking it right now; it is not removed"),
-        "{}",
-        show(&o)
-    );
-    assert!(lock.exists());
-    std::fs::remove_file(&lock).unwrap();
+    let o = decide_oracle(&base, &["-p", &texts[5]], &["--state", s(&state)], &key);
+    assert!(o.status.success(), "{}", show(&o));
+    assert!(!lock.exists());
     // --break-lock needs --oracle.
     let e = fails(&["decide", s(&toy().path), "-p", "x", "--break-lock"]);
     assert!(e.contains("--oracle"), "{e}");
