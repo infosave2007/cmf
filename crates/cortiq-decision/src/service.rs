@@ -419,6 +419,9 @@ pub enum RefusalReason {
     OracleDisabled,
     /// The environment variable `oracle.api_key_env` is unset or empty.
     NoKey,
+    /// The variable holds a value that is not usable as a key (see
+    /// [`crate::oracle::check_key`]); it is never sent.
+    BadKey,
     /// The key has `oracle_allowed: false`, or the request withheld consent.
     ConsentOff,
     /// The reservation does not fit the budget (global, per key) or `max_calls`.
@@ -433,6 +436,7 @@ impl RefusalReason {
         match self {
             RefusalReason::OracleDisabled => "oracle_disabled",
             RefusalReason::NoKey => "no_key",
+            RefusalReason::BadKey => "bad_key",
             RefusalReason::ConsentOff => "consent_off",
             RefusalReason::Budget => "budget",
             RefusalReason::Stopped => "stopped",
@@ -440,11 +444,12 @@ impl RefusalReason {
     }
 
     /// The flags of a question abstained for this reason: the reason's name,
-    /// and for a missing key also `oracle_disabled` (the oracle is off for
-    /// every request until the variable is set).
+    /// and for a missing or unusable key also `oracle_disabled` (the oracle
+    /// is off for every request until the variable is fixed).
     pub fn flags(self) -> &'static [&'static str] {
         match self {
             RefusalReason::NoKey => &["oracle_disabled", "no_key"],
+            RefusalReason::BadKey => &["oracle_disabled", "bad_key"],
             RefusalReason::OracleDisabled => &["oracle_disabled"],
             RefusalReason::ConsentOff => &["consent_off"],
             RefusalReason::Budget => &["budget"],
@@ -455,30 +460,40 @@ impl RefusalReason {
 
 /// Whether the oracle can be called now, as `GET /v1/admin/oracle` names it in
 /// `status` ([`OracleStatus::label`]).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum OracleStatus {
     /// Enabled, a key in the environment, not stopped, a budget left.
     Ready,
     /// The variable `oracle.api_key_env` is unset or empty.
     NoKey,
+    /// The variable holds a value that is not usable as a key: what is wrong
+    /// (lengths and positions, never the key).
+    BadKey(String),
     /// Not configured (`oracle.enabled` false, no cascade), or switched off
     /// by the admin API (`by_admin`).
     Disabled { by_admin: bool },
-    /// The budget (global or the admin's) cannot hold even the smallest
-    /// call, or `max_calls` calls were made.
+    /// Something was spent or reserved, and the budget (global or the
+    /// admin's) cannot hold even the smallest call, or `max_calls` calls
+    /// were made.
     BudgetExhausted,
+    /// Nothing was spent, and the budget cannot hold even one call (at least
+    /// `min_usd`, the smallest call's reservation), or `max_calls` is 0.
+    BudgetTooSmall { min_usd: f64 },
     /// A stop rule switched it off (the reason of `oracle.state`).
     Stopped(String),
 }
 
 impl OracleStatus {
-    /// `ready`, `no_key`, `disabled`, `budget_exhausted` or `stopped: <reason>`.
+    /// `ready`, `no_key`, `bad_key`, `disabled`, `budget_exhausted`,
+    /// `budget_too_small` or `stopped: <reason>`.
     pub fn label(&self) -> String {
         match self {
             OracleStatus::Ready => "ready".into(),
             OracleStatus::NoKey => "no_key".into(),
+            OracleStatus::BadKey(_) => "bad_key".into(),
             OracleStatus::Disabled { .. } => "disabled".into(),
             OracleStatus::BudgetExhausted => "budget_exhausted".into(),
+            OracleStatus::BudgetTooSmall { .. } => "budget_too_small".into(),
             OracleStatus::Stopped(r) => format!("stopped: {r}"),
         }
     }
@@ -500,6 +515,15 @@ pub fn oracle_hint(reason: RefusalReason, status: &OracleStatus, key_env: &str) 
                 "the oracle key is not set: set {key_env} in the server's environment and restart it"
             )
         }
+        (RefusalReason::BadKey | RefusalReason::OracleDisabled, OracleStatus::BadKey(p)) => {
+            format!(
+                "the oracle key is not usable ({}): fix {key_env} in the server's environment and restart it",
+                p
+            )
+        }
+        (RefusalReason::BadKey, _) => format!(
+            "the oracle key is not usable: fix {key_env} in the server's environment and restart it"
+        ),
         (RefusalReason::OracleDisabled, OracleStatus::Disabled { by_admin: true }) => {
             "the oracle is switched off by the admin API: POST /v1/admin/oracle {\"enabled\":true} turns it on"
                 .into()
@@ -511,8 +535,13 @@ pub fn oracle_hint(reason: RefusalReason, status: &OracleStatus, key_env: &str) 
             "the oracle budget is used up: restart the server with a larger --oracle-budget (or --oracle-max-calls)"
                 .into()
         }
+        (RefusalReason::Budget, OracleStatus::BudgetTooSmall { min_usd }) => format!(
+            "the oracle budget cannot hold one call (each reserves at least {} before it is sent): restart the server with a larger --oracle-budget (and --oracle-max-calls of at least 1)",
+            crate::oracle_setup::usd(*min_usd)
+        ),
         (RefusalReason::Budget, _) => {
-            "the oracle budget or credit of this API key is used up".into()
+            "the oracle budget left (the server's, or this API key's oracle budget or credit) cannot hold this call's reservation: see GET /v1/admin/oracle"
+                .into()
         }
         (RefusalReason::Stopped, OracleStatus::Stopped(r)) => format!(
             "the oracle was stopped by a stop rule ({r}): see GET /v1/admin/oracle; after the fix POST /v1/admin/oracle {{\"enabled\":true}} resumes it"
@@ -2200,7 +2229,7 @@ fn untrained_error(
             Resolution::Failed(_) => (Reason::OracleUnavailable, "the oracle call failed"),
             Resolution::Refused(RefusalReason::Budget) => (
                 Reason::OracleBudgetExhausted,
-                "the oracle budget is exhausted",
+                "the oracle budget left cannot hold the call",
             ),
             Resolution::Refused(RefusalReason::Stopped) => {
                 (Reason::OracleDisabled, "the oracle is stopped")
@@ -2212,6 +2241,10 @@ fn untrained_error(
             Resolution::Refused(RefusalReason::NoKey) => (
                 Reason::UnsupportedQuestion,
                 "the oracle key is not set in the server's environment",
+            ),
+            Resolution::Refused(RefusalReason::BadKey) => (
+                Reason::UnsupportedQuestion,
+                "the oracle key in the server's environment is not usable",
             ),
             Resolution::Refused(RefusalReason::OracleDisabled)
             | Resolution::Oracle(_)
@@ -2239,7 +2272,7 @@ fn untrained_error(
             "the oracle failed for questions the local model cannot answer"
         }
         Reason::OracleBudgetExhausted => {
-            "the oracle budget is exhausted and the local model cannot answer these questions"
+            "the oracle budget left cannot hold the call and the local model cannot answer these questions"
         }
         Reason::OracleDisabled => {
             "the oracle is stopped and the local model cannot answer these questions"

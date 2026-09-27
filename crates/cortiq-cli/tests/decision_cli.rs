@@ -56,7 +56,17 @@
 //!   reservation, refused with 402 or answered by another model — each with
 //!   its code and exit code 1; `--test-call` makes exactly one call; a key
 //!   typed as a flag is refused, never shown or sent; no key bytes in any
-//!   output.
+//!   output;
+//! * key hygiene: fuzzed values of `OPENROUTER_API_KEY` (surrounding CR, LF,
+//!   spaces, tabs; CR LF, a space, a tab or a byte outside ASCII inside;
+//!   `Bearer `; quotes; 400 bytes) through `oracle check`, `decide --oracle`
+//!   and `serve --oracle` at `RUST_LOG=trace`: trimmed keys work with a
+//!   warning, the others are `bad_key` and never sent, and no key byte is in
+//!   any output, log, state file or ledger; key-like values of any prefix
+//!   in `--oracle`, `--oracle-key-env`, `--model`, `--key-env` are refused
+//!   unshown; `budget_too_small` against `budget_exhausted`; the command
+//!   line's missing-key words; `oracle check --max-price` for a model
+//!   listed only with variable pricing.
 
 #[path = "support/toy_dir.rs"]
 mod toy_dir;
@@ -610,6 +620,17 @@ struct Server {
 
 impl Server {
     fn start(model: &Path, extra: &[&str], envs: &[(&str, &str)], logs: &Path) -> Self {
+        Self::start_os(model, extra, envs, &[], logs)
+    }
+
+    /// [`Server::start`] with variables whose values need not be UTF-8.
+    fn start_os(
+        model: &Path,
+        extra: &[&str],
+        envs: &[(&str, &str)],
+        os_envs: &[(&str, &std::ffi::OsStr)],
+        logs: &Path,
+    ) -> Self {
         let port = free_port();
         let stdout = logs.join(format!("serve-{port}.out"));
         let stderr = logs.join(format!("serve-{port}.err"));
@@ -619,6 +640,9 @@ impl Server {
             .stdout(std::fs::File::create(&stdout).unwrap())
             .stderr(std::fs::File::create(&stderr).unwrap());
         for (k, v) in envs {
+            c.env(k, v);
+        }
+        for (k, v) in os_envs {
             c.env(k, v);
         }
         let mut srv = Self {
@@ -2568,6 +2592,10 @@ fn openrouter_reply(
             200,
             listing(json!([endpoint("Plain", "0.0000001", "0.0000001", false)])),
         ),
+        // Listed only with variable pricing (OpenRouter's -1).
+        ("GET", "/api/v1/models/openrouter/auto/endpoints") => {
+            (200, listing(json!([endpoint("Auto", "-1", "-1", true)])))
+        }
         ("GET", "/api/v1/models") => (
             200,
             json!({"data": [
@@ -3738,7 +3766,7 @@ fn decide_oracle_asks_only_what_the_gate_rejects_and_hides_the_key() {
     assert_eq!(q["flags"], json!(["oracle_disabled", "no_key"]));
     assert!(
         v["cmf"]["hint"].as_str().unwrap().starts_with(
-            "the oracle key is not set: export OPENROUTER_API_KEY=<your OpenRouter key>"
+            "OPENROUTER_API_KEY is not set (decide --oracle reads the key from the environment): export OPENROUTER_API_KEY=<your OpenRouter key>"
         ),
         "{v}"
     );
@@ -3746,7 +3774,7 @@ fn decide_oracle_asks_only_what_the_gate_rejects_and_hides_the_key() {
     let o = decide_oracle(&base, &["-p", &texts[2]], &["--state", s(&state2)], &[]);
     assert!(o.status.success(), "{}", show(&o));
     assert!(
-        stdout_of(&o).contains("hint:       the oracle key is not set: export OPENROUTER_API_KEY="),
+        stdout_of(&o).contains("hint:       OPENROUTER_API_KEY is not set (decide --oracle reads the key from the environment): export OPENROUTER_API_KEY="),
         "{}",
         show(&o)
     );
@@ -4421,7 +4449,7 @@ fn decide_oracle_stop_rules_hold_across_runs_until_resumed() {
     assert_eq!(mock.chats(), 6);
     assert!(
         stdout_of(&o).contains(&format!(
-            "hint:       a stop rule stopped the oracle in this run: too many oracle calls failed in a row (oracle.max_errors); the last: OpenRouter answered HTTP 503 (http_503) (stop rule max_errors). It stays off for state directory {} until resumed",
+            "hint:       a stop rule stopped the oracle in this run: too many oracle calls failed in a row (oracle.max_errors); the last error: http_503 — OpenRouter answered HTTP 503 (stop rule max_errors). It stays off for state directory {} until resumed",
             st_m.display()
         )),
         "{}",
@@ -4437,7 +4465,7 @@ fn decide_oracle_stop_rules_hold_across_runs_until_resumed() {
     assert_eq!(mock.chats(), 6, "stopped: no call");
     let out = stdout_of(&o);
     assert!(
-        out.contains("is stopped by the stop rule max_errors: too many oracle calls failed in a row (oracle.max_errors); the last: OpenRouter answered HTTP 503 (http_503) (recorded in its oracle.state")
+        out.contains("is stopped by the stop rule max_errors: too many oracle calls failed in a row (oracle.max_errors); the last error: http_503 — OpenRouter answered HTTP 503 (recorded in its oracle.state")
             && !out.contains("a directory of its own"),
         "{}",
         show(&o)
@@ -4455,7 +4483,7 @@ fn decide_oracle_stop_rules_hold_across_runs_until_resumed() {
     assert!(o.status.success(), "{}", show(&o));
     assert!(
         stderr_of(&o).contains(&format!(
-            "oracle: the oracle of state directory {} was not stopped; cleared its 1 failed call in a row (the last: OpenRouter answered HTTP 500 (http_500)) (they count toward oracle.max_errors)",
+            "oracle: the oracle of state directory {} was not stopped; cleared its 1 failed call in a row (the last error: http_500 — OpenRouter answered HTTP 500) (they count toward oracle.max_errors)",
             st_e.display()
         )) && !stderr_of(&o).contains("nothing to resume"),
         "{}",
@@ -5033,4 +5061,721 @@ fn decision_oracle_check_reports_each_failure_mode_and_the_test_call() {
         "{}",
         show(&o)
     );
+}
+
+// ------------------------------------------------------------------ key hygiene (K1)
+
+/// What a fuzzed value of `OPENROUTER_API_KEY` should give.
+#[derive(Clone, Debug)]
+enum KeyFuzz {
+    /// Usable after `n` bytes of surrounding whitespace are trimmed.
+    Trimmed(usize),
+    /// `bad_key`, the problem naming this.
+    Bad(&'static str),
+    /// Usable, but not the mock's key (OpenRouter refuses it: 401).
+    Refused,
+}
+
+/// The fuzzed values of the key variable: surrounding CR, LF, spaces and
+/// tabs; CR LF, a space, a tab, a byte outside ASCII (UTF-8 and not) inside
+/// it; `Bearer `; quotes; 400 bytes. (A NUL cannot be put in a process
+/// environment: the library and in-process server tests cover it.)
+fn fuzzed_keys() -> Vec<(std::ffi::OsString, KeyFuzz)> {
+    use std::os::unix::ffi::OsStringExt;
+    let k = FAKE_OPENROUTER_KEY;
+    let (a, b) = k.split_at(20);
+    let long = {
+        let mut s = "sk-or-v1-LONG400-".to_string();
+        while s.len() < 400 {
+            s.push_str("0123456789abcdef");
+        }
+        s.truncate(400);
+        s
+    };
+    let mut non_utf8 = k.as_bytes().to_vec();
+    non_utf8.push(0xff);
+    let v = |s: String| std::ffi::OsString::from(s);
+    vec![
+        (v(format!("{k}\r")), KeyFuzz::Trimmed(1)),
+        (v(format!("{k}\n")), KeyFuzz::Trimmed(1)),
+        (v(format!("{k}\r\n")), KeyFuzz::Trimmed(2)),
+        (v(format!("  {k}  ")), KeyFuzz::Trimmed(4)),
+        (v(format!("\t{k}\t")), KeyFuzz::Trimmed(2)),
+        (
+            v(format!("{a}\r\n{b}")),
+            KeyFuzz::Bad("a control character at byte 21"),
+        ),
+        (
+            v(format!("{a} {b}")),
+            KeyFuzz::Bad("whitespace inside it at byte 21"),
+        ),
+        (
+            v(format!("{a}\t{b}")),
+            KeyFuzz::Bad("whitespace inside it at byte 21"),
+        ),
+        (
+            v(format!("{k}é")),
+            KeyFuzz::Bad("a byte outside ASCII at byte"),
+        ),
+        (
+            std::ffi::OsString::from_vec(non_utf8),
+            KeyFuzz::Bad("a byte outside ASCII at byte"),
+        ),
+        (
+            v(format!("Bearer {k}")),
+            KeyFuzz::Bad("it starts with 'Bearer '"),
+        ),
+        (
+            v(format!("\"{k}\"")),
+            KeyFuzz::Bad("it starts or ends with a quote"),
+        ),
+        (
+            v(format!("'{k}'")),
+            KeyFuzz::Bad("it starts or ends with a quote"),
+        ),
+        (v(long), KeyFuzz::Refused),
+    ]
+}
+
+/// `cortiq ARGS` with `OPENROUTER_API_KEY` set to `key` (any bytes) and
+/// `RUST_LOG=trace`.
+fn output_with_key(args: &[&str], key: &std::ffi::OsStr) -> Output {
+    let mut c = cortiq();
+    c.args(args)
+        .env("OPENROUTER_API_KEY", key)
+        .env("RUST_LOG", "trace");
+    c.output().expect("run cortiq")
+}
+
+/// No key bytes in `text`: the fake key and the 400-byte one (whose middle
+/// is `0123456789abcdef` as the fake key's is).
+fn assert_no_fuzzed_key_in(text: &str, what: &str) {
+    assert_no_key_in(text, what);
+    for needle in ["FAKE-two-steps", "LONG400"] {
+        assert!(
+            !text.contains(needle),
+            "{what} holds key bytes ({needle})\n{text}"
+        );
+    }
+}
+
+fn assert_no_fuzzed_key_under(dir: &Path) {
+    for needle in ["0123456789abcdef", "FAKE-two-steps", "LONG400"] {
+        assert_no_bytes_of(needle, dir);
+    }
+}
+
+/// Requests of the mock that carried an `Authorization` header.
+fn authorized(mock: &MockOpenRouter) -> usize {
+    mock.requests()
+        .iter()
+        .filter(|(h, _)| h.to_ascii_lowercase().contains("authorization:"))
+        .count()
+}
+
+#[test]
+fn fuzzed_oracle_keys_are_trimmed_or_refused_and_never_echoed_by_any_surface() {
+    let t = toy();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let mock = MockOpenRouter::start("travel", 1.3e-5);
+    let base = mock.base();
+    let text = distinct_texts(1, 21, "kf", 0.97).remove(0);
+    for (i, (key, want)) in fuzzed_keys().into_iter().enumerate() {
+        let case = format!("key #{i} {want:?}");
+        let key = key.as_os_str();
+
+        // 1. oracle check (text, then --json), RUST_LOG=trace.
+        let sent = authorized(&mock);
+        let o = output_with_key(&["decision", "oracle", "check", "--base-url", &base], key);
+        let all = show(&o);
+        assert_no_fuzzed_key_in(&all, &case);
+        let out = stdout_of(&o);
+        match &want {
+            KeyFuzz::Trimmed(n) => {
+                assert!(o.status.success(), "{case}\n{all}");
+                assert!(
+                    out.contains(&format!(
+                        "  ✓ key        OPENROUTER_API_KEY is set (the key had surrounding whitespace, trimmed: {n} byte"
+                    )),
+                    "{case}\n{all}"
+                );
+                assert!(
+                    stderr_of(&o)
+                        .contains("warning: oracle: the key had surrounding whitespace, trimmed"),
+                    "{case}\n{all}"
+                );
+                assert_eq!(authorized(&mock), sent + 1, "{case}: /auth/key once");
+            }
+            KeyFuzz::Bad(problem) => {
+                assert_eq!(o.status.code(), Some(1), "{case}\n{all}");
+                assert!(
+                    out.contains(&format!(
+                        "  ✗ key        the key in OPENROUTER_API_KEY is not usable: {problem}"
+                    )),
+                    "{case}\n{all}"
+                );
+                assert!(
+                    out.contains("  – account    not checked (the key is not usable)"),
+                    "{case}\n{all}"
+                );
+                assert_eq!(authorized(&mock), sent, "{case}: a bad key was sent");
+            }
+            KeyFuzz::Refused => {
+                assert_eq!(o.status.code(), Some(1), "{case}\n{all}");
+                assert!(
+                    out.contains("OpenRouter refused the key (HTTP 401)"),
+                    "{all}"
+                );
+            }
+        }
+        let o = output_with_key(
+            &["decision", "oracle", "check", "--base-url", &base, "--json"],
+            key,
+        );
+        assert_no_fuzzed_key_in(&show(&o), &case);
+        let v = json_of(&stdout_of(&o));
+        let (state, code) = match &want {
+            KeyFuzz::Trimmed(_) => ("ok", None),
+            KeyFuzz::Bad(_) => ("bad", Some("bad_key")),
+            KeyFuzz::Refused => ("ok", Some("key_refused")),
+        };
+        assert_eq!(v["key"]["state"], state, "{case}: {v}");
+        assert_eq!(v["problems"][0]["code"].as_str(), code, "{case}: {v}");
+        assert_eq!(
+            v["key"]["trimmed"],
+            matches!(want, KeyFuzz::Trimmed(_)),
+            "{v}"
+        );
+
+        // 2. decide -p on a gate-rejected text, --json, RUST_LOG=trace.
+        let state = d.join(format!("decide-{i}"));
+        let chats = mock.chats();
+        let o = output_with_key(
+            &[
+                "decide",
+                s(&t.path),
+                "-p",
+                &text,
+                "--skill",
+                "topics",
+                "--oracle",
+                ORACLE_MODEL,
+                "--oracle-base-url",
+                &base,
+                "--state",
+                s(&state),
+                "--json",
+            ],
+            key,
+        );
+        let all = show(&o);
+        assert!(o.status.success(), "{case}\n{all}");
+        assert_no_fuzzed_key_in(&all, &case);
+        // RUST_LOG=trace is in effect (the client's request lines).
+        assert!(
+            matches!(want, KeyFuzz::Bad(_)) || stderr_of(&o).contains("DEBUG"),
+            "{case}\n{all}"
+        );
+        let v = json_of(&stdout_of(&o));
+        let q = &v["cmf"]["questions"]["task"];
+        match &want {
+            KeyFuzz::Trimmed(_) => {
+                assert_eq!(q["action"], "oracle", "{case}: {v}");
+                assert_eq!(v["cmf"]["oracle"]["status"], "ready", "{v}");
+                assert!(
+                    stderr_of(&o)
+                        .contains("warning: oracle: the key had surrounding whitespace, trimmed"),
+                    "{case}\n{all}"
+                );
+                assert_eq!(mock.chats(), chats + 1);
+            }
+            KeyFuzz::Bad(problem) => {
+                assert_eq!(q["action"], "abstain", "{case}: {v}");
+                assert_eq!(q["flags"], json!(["oracle_disabled", "bad_key"]), "{v}");
+                assert_eq!(v["cmf"]["oracle"]["status"], "bad_key", "{v}");
+                assert!(
+                    v["cmf"]["oracle"]["key_problem"]
+                        .as_str()
+                        .unwrap()
+                        .contains(problem),
+                    "{v}"
+                );
+                let hint = v["cmf"]["hint"].as_str().unwrap();
+                assert!(
+                    hint.starts_with(&format!(
+                        "the key in OPENROUTER_API_KEY is not usable: {problem}"
+                    )) && hint.contains("(decide --oracle reads the key from the environment"),
+                    "{case}: {hint}"
+                );
+                assert_eq!(mock.chats(), chats, "{case}: a bad key was sent");
+                assert!(!state.exists(), "{case}: a state directory was made");
+            }
+            KeyFuzz::Refused => {
+                assert_eq!(q["flags"], json!(["oracle_unavailable"]), "{case}: {v}");
+                assert_eq!(v["cmf"]["oracle"]["status"], "stopped: http_401", "{v}");
+                assert_eq!(mock.chats(), chats + 1);
+            }
+        }
+        if state.exists() {
+            assert_no_fuzzed_key_under(&state);
+        }
+
+        // 3. serve --oracle, RUST_LOG=trace: the startup lines, the admin
+        // view, one decision; then the logs and the state.
+        let sstate = d.join(format!("serve-{i}"));
+        let chats = mock.chats();
+        let srv = Server::start_os(
+            &t.path,
+            &[
+                "--state",
+                s(&sstate),
+                "--oracle",
+                ORACLE_MODEL,
+                "--oracle-base-url",
+                &base,
+            ],
+            &[
+                ("CORTIQ_DECISION_ADMIN_TOKEN", ADMIN_TOKEN),
+                ("RUST_LOG", "trace"),
+            ],
+            &[("OPENROUTER_API_KEY", key)],
+            d,
+        );
+        let st = oracle_status(&srv);
+        assert_no_fuzzed_key_in(&st.to_string(), &case);
+        let (code, r) = http(
+            "POST",
+            &srv.url("/v1/decisions"),
+            None,
+            Some(&topics_request(&text)),
+        );
+        assert_eq!(code, 200, "{case}: {r}");
+        assert_no_fuzzed_key_in(&r.to_string(), &case);
+        let q = &r["cmf"]["questions"]["task"];
+        match &want {
+            KeyFuzz::Trimmed(_) => {
+                assert_eq!(st["status"], "ready", "{case}: {st}");
+                assert_eq!(st["key_trimmed"], true, "{st}");
+                assert_eq!(q["action"], "oracle", "{case}: {r}");
+                assert_eq!(mock.chats(), chats + 1);
+            }
+            KeyFuzz::Bad(problem) => {
+                assert_eq!(st["status"], "bad_key", "{case}: {st}");
+                assert!(
+                    st["key_problem"].as_str().unwrap().contains(problem),
+                    "{st}"
+                );
+                assert_eq!(q["flags"], json!(["oracle_disabled", "bad_key"]), "{r}");
+                assert!(
+                    r["cmf"]["hint"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("the oracle key is not usable ("),
+                    "{r}"
+                );
+                assert_eq!(mock.chats(), chats, "{case}: a bad key was sent");
+            }
+            KeyFuzz::Refused => {
+                assert_eq!(st["status"], "ready", "{case}: {st}");
+                assert_eq!(q["flags"], json!(["oracle_unavailable"]), "{case}: {r}");
+                assert_eq!(mock.chats(), chats + 1);
+            }
+        }
+        let logs = srv.stop();
+        assert!(logs.contains("DEBUG"), "RUST_LOG=trace is in effect");
+        assert_no_fuzzed_key_in(&logs, &case);
+        match &want {
+            KeyFuzz::Trimmed(_) => assert!(
+                logs.contains("oracle: ready")
+                    && logs.contains("oracle: the key had surrounding whitespace, trimmed"),
+                "{case}\n{logs}"
+            ),
+            KeyFuzz::Bad(problem) => assert!(
+                logs.contains(&format!(
+                    "oracle: NOT ready — the key in OPENROUTER_API_KEY is not usable: {problem}"
+                )),
+                "{case}\n{logs}"
+            ),
+            KeyFuzz::Refused => {}
+        }
+        assert_no_fuzzed_key_under(&sstate);
+    }
+    // --test-call with a trimmed key: one call, answered.
+    let chats = mock.chats();
+    let o = output_with_key(
+        &[
+            "decision",
+            "oracle",
+            "check",
+            "--base-url",
+            &base,
+            "--test-call",
+        ],
+        std::ffi::OsStr::new(&format!("{FAKE_OPENROUTER_KEY}\r\n")),
+    );
+    assert!(o.status.success(), "{}", show(&o));
+    assert_no_fuzzed_key_in(&show(&o), "--test-call with a trimmed key");
+    assert!(
+        stdout_of(&o).contains("  ✓ test call  answered 'yes'"),
+        "{}",
+        show(&o)
+    );
+    assert_eq!(mock.chats(), chats + 1);
+}
+
+#[test]
+fn key_like_values_are_refused_unshown_and_unsent_by_every_flag() {
+    let t = toy();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let mock = MockOpenRouter::start("travel", 1.3e-5);
+    let base = mock.base();
+    let key = [("OPENROUTER_API_KEY", FAKE_OPENROUTER_KEY)];
+    let port = free_port().to_string();
+    let state = d.join("state");
+    let values = [
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "xx-sk-or-v1-0123456789abcdef",
+        "Bearer 0123456789abcdef",
+        " 0123456789abcdef",
+        "0123456789abcdef\t",
+        FAKE_OPENROUTER_KEY,
+    ];
+    for v in values {
+        let runs: Vec<Vec<&str>> = vec![
+            vec![
+                "serve",
+                s(&t.path),
+                "--port",
+                &port,
+                "--state",
+                s(&state),
+                "--oracle",
+                v,
+                "--oracle-base-url",
+                &base,
+            ],
+            vec![
+                "serve",
+                s(&t.path),
+                "--port",
+                &port,
+                "--state",
+                s(&state),
+                "--oracle",
+                ORACLE_MODEL,
+                "--oracle-key-env",
+                v,
+                "--oracle-base-url",
+                &base,
+            ],
+            vec![
+                "decide",
+                s(&t.path),
+                "-p",
+                "hello",
+                "--oracle",
+                v,
+                "--oracle-base-url",
+                &base,
+            ],
+            vec![
+                "decide",
+                s(&t.path),
+                "-p",
+                "hello",
+                "--oracle",
+                ORACLE_MODEL,
+                "--oracle-key-env",
+                v,
+                "--oracle-base-url",
+                &base,
+            ],
+            vec![
+                "decision",
+                "oracle",
+                "check",
+                "--base-url",
+                &base,
+                "--model",
+                v,
+            ],
+            vec![
+                "decision",
+                "oracle",
+                "check",
+                "--base-url",
+                &base,
+                "--key-env",
+                v,
+            ],
+        ];
+        for a in runs {
+            let o = output(&a, &key);
+            let all = show(&o);
+            assert!(!o.status.success(), "{a:?}\n{all}");
+            assert!(
+                stderr_of(&o).contains(&format!("({} bytes) is not shown", v.len())),
+                "{a:?}\n{all}"
+            );
+            assert!(stderr_of(&o).contains("looks like a key"), "{a:?}\n{all}");
+            assert_no_key_in(&all, "a key-like flag value");
+            assert!(!all.contains("Bearer 0123"), "{all}");
+        }
+    }
+    assert!(mock.requests().is_empty(), "nothing was sent");
+    assert!(!state.exists(), "nothing was opened");
+}
+
+#[test]
+fn budgets_too_small_and_used_up_and_the_command_line_key_messages() {
+    let t = toy();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let mock = MockOpenRouter::start("travel", 1.3e-5);
+    let base = mock.base();
+    let key = [("OPENROUTER_API_KEY", FAKE_OPENROUTER_KEY)];
+    let texts = distinct_texts(3, 23, "bs", 0.97);
+
+    // serve: a budget below one call's reservation is too small, with the
+    // minimum; nothing spent, so not "exhausted".
+    let srv = serve_oracle(
+        &d.join("s-small"),
+        &base,
+        &["--oracle-budget", "0.0000001"],
+        &key,
+        d,
+    );
+    let logs = srv.logs();
+    assert!(
+        logs.contains(&format!(
+            "oracle: NOT ready — the budget is too small: budget $1.00e-7 cannot hold one call, which reserves at least $0.000283 at the max price in/out $0.06/$0.58 per 1M ({ORACLE_MODEL} via {}; restart with --oracle-budget of at least $0.000283)",
+            mock.addr
+        )),
+        "{logs}"
+    );
+    let st = oracle_status(&srv);
+    assert_eq!(st["status"], "budget_too_small", "{st}");
+    assert!(
+        (st["min_call_usd"].as_f64().unwrap() - 0.00028288).abs() < 1e-12,
+        "{st}"
+    );
+    let (_, h, _) = http_h("GET", &srv.url("/healthz"), &[], None);
+    assert_eq!(h["oracle_status"], "budget_too_small");
+    let (_, r) = http(
+        "POST",
+        &srv.url("/v1/decisions"),
+        None,
+        Some(&topics_request(&texts[0])),
+    );
+    assert_eq!(
+        r["cmf"]["questions"]["task"]["flags"],
+        json!(["budget"]),
+        "{r}"
+    );
+    assert!(
+        r["cmf"]["hint"].as_str().unwrap().starts_with(
+            "the oracle budget cannot hold one call (each reserves at least $0.000283"
+        ),
+        "{r}"
+    );
+    srv.stop();
+    assert_eq!(mock.chats(), 0);
+
+    // decide -p: the run's budget too small, and max-calls 0.
+    let o = decide_oracle(
+        &base,
+        &["-p", &texts[0]],
+        &[
+            "--state",
+            s(&d.join("d-small")),
+            "--oracle-budget",
+            "0.0000001",
+            "--json",
+        ],
+        &key,
+    );
+    assert!(o.status.success(), "{}", show(&o));
+    let v = json_of(&stdout_of(&o));
+    let or = &v["cmf"]["oracle"];
+    assert_eq!(or["status"], "budget_too_small", "{v}");
+    assert!(or["min_call_usd"].as_f64().unwrap() > 0.0003, "{v}");
+    let hint = v["cmf"]["hint"].as_str().unwrap();
+    assert!(
+        hint.starts_with("the oracle budget of this run ($1.00e-7) is too small to hold one call (the next call reserves $0.")
+            && hint.contains("pass --oracle-budget of at least $0."),
+        "{hint}"
+    );
+    let o = decide_oracle(
+        &base,
+        &["-p", &texts[0]],
+        &[
+            "--state",
+            s(&d.join("d-zero")),
+            "--oracle-max-calls",
+            "0",
+            "--json",
+        ],
+        &key,
+    );
+    assert!(o.status.success(), "{}", show(&o));
+    let v = json_of(&stdout_of(&o));
+    assert_eq!(v["cmf"]["oracle"]["status"], "budget_too_small", "{v}");
+    assert_eq!(
+        v["cmf"]["hint"],
+        "--oracle-max-calls 0 allows no oracle call: pass a larger --oracle-max-calls"
+    );
+    assert_eq!(mock.chats(), 0);
+    // A batch that spends its one call: used up, not too small.
+    let input = write(
+        d,
+        "two.jsonl",
+        &texts[1..]
+            .iter()
+            .map(|x| json!({"text": x}).to_string() + "\n")
+            .collect::<String>(),
+    );
+    let o = decide_oracle(
+        &base,
+        &["--input", s(&input)],
+        &["--state", s(&d.join("d-used")), "--oracle-max-calls", "1"],
+        &key,
+    );
+    assert!(o.status.success(), "{}", show(&o));
+    let sum = summary_of(&stderr_of(&o));
+    assert_eq!(sum["oracle"]["status"], "budget_exhausted", "{sum}");
+    assert_eq!(sum["oracle"]["answered_by_oracle"], 1, "{sum}");
+    assert_eq!(mock.chats(), 1);
+
+    // decide --labels no skill has, without the key: the command line's
+    // words, not a server's; with a bad key, its problem.
+    let labels_state = d.join("labels");
+    let labels = |envs: &[(&str, &str)], extra: &[&str]| {
+        let mut a = vec![
+            "decide",
+            s(&t.path),
+            "-p",
+            &texts[0],
+            "--labels",
+            "positive,negative",
+            "--oracle",
+            ORACLE_MODEL,
+            "--oracle-base-url",
+            &base,
+            "--state",
+            s(&labels_state),
+        ];
+        a.extend_from_slice(extra);
+        output(&a, envs)
+    };
+    let o = labels(&[], &[]);
+    assert!(!o.status.success(), "{}", show(&o));
+    let err = stderr_of(&o);
+    assert!(
+        err.contains(
+            "no skill has the labels positive, negative, so only the oracle can answer, and OPENROUTER_API_KEY is not set (decide --oracle reads the key from the environment): export OPENROUTER_API_KEY=<your OpenRouter key>"
+        ) && !err.contains("server"),
+        "{}",
+        show(&o)
+    );
+    let o = labels(&[], &["--oracle-key-env", "MY_OR_KEY"]);
+    assert!(
+        stderr_of(&o)
+            .contains("MY_OR_KEY is not set (decide --oracle reads the key from the environment)"),
+        "{}",
+        show(&o)
+    );
+    let o = labels(
+        &[(
+            "OPENROUTER_API_KEY",
+            &format!("Bearer {FAKE_OPENROUTER_KEY}"),
+        )],
+        &[],
+    );
+    assert!(!o.status.success(), "{}", show(&o));
+    assert!(
+        stderr_of(&o).contains(
+            "no skill has the labels positive, negative, so only the oracle can answer, and the key in OPENROUTER_API_KEY is not usable: it starts with 'Bearer '"
+        ),
+        "{}",
+        show(&o)
+    );
+    assert_no_key_in(&show(&o), "decide --labels with a bad key");
+    assert_eq!(mock.chats(), 1, "nothing was sent");
+    assert!(!labels_state.exists());
+    // The batch start line words a missing key the same way.
+    let o = decide_oracle(&base, &["--input", s(&input)], &[], &[]);
+    assert!(
+        stderr_of(&o).contains("oracle: NOT ready — OPENROUTER_API_KEY is not set (decide --oracle reads the key from the environment)"),
+        "{}",
+        show(&o)
+    );
+
+    // oracle check --max-price: a model listed only with variable pricing
+    // needs it; given, the check is ready and names the flag for --oracle.
+    let check = |extra: &[&str]| {
+        let mut a = vec![
+            "decision",
+            "oracle",
+            "check",
+            "--base-url",
+            &base,
+            "--model",
+            "openrouter/auto",
+        ];
+        a.extend_from_slice(extra);
+        output(&a, &key)
+    };
+    let o = check(&["--json"]);
+    assert_eq!(o.status.code(), Some(1), "{}", show(&o));
+    let v = json_of(&stdout_of(&o));
+    assert_eq!(v["problems"][0]["code"], "variable_price", "{v}");
+    assert!(
+        v["problems"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--max-price IN,OUT"),
+        "{v}"
+    );
+    let o = check(&["--max-price", "1,4", "--test-call"]);
+    assert!(o.status.success(), "{}", show(&o));
+    let out = stdout_of(&o);
+    assert!(
+        out.contains("  ✓ model      listed only with variable pricing; the max price in/out $1.00/$4.00 per 1M of --max-price")
+            && out.contains("  ✓ test call  answered 'yes'")
+            && out.contains(&format!(
+                "ready: cortiq serve FILE --oracle openrouter/auto --oracle-base-url {base} --oracle-max-price 1,4"
+            )),
+        "{out}"
+    );
+    assert_eq!(mock.chats(), 2);
+    let sent: Value = mock
+        .requests()
+        .iter()
+        .rev()
+        .find(|(h, _)| h.starts_with("POST "))
+        .map(|(_, b)| serde_json::from_slice(b).unwrap())
+        .unwrap();
+    assert_eq!(
+        sent["provider"]["max_price"],
+        json!({"prompt": 1.0, "completion": 4.0})
+    );
+    // Below every structured-output endpoint of a priced model: refused.
+    let o = output(
+        &[
+            "decision",
+            "oracle",
+            "check",
+            "--base-url",
+            &base,
+            "--max-price",
+            "0.01,0.01",
+            "--json",
+        ],
+        &key,
+    );
+    assert_eq!(o.status.code(), Some(1), "{}", show(&o));
+    let v = json_of(&stdout_of(&o));
+    assert_eq!(v["problems"][0]["code"], "max_price_too_low", "{v}");
 }

@@ -1078,13 +1078,23 @@ pub fn learn_offline(
         (Some(l), true) => {
             // Refused up front (before the ledger is created): a run that was
             // configured for live calls must not quietly learn from the
-            // ledgers alone. Only the presence of the key is checked.
-            ensure!(
-                key(&opts.oracle.api_key_env).is_some(),
-                "oracle.enabled is true but the environment variable {} holds no key: set it, \
-                 or set oracle.enabled=false to learn from the --answers ledgers only",
-                opts.oracle.api_key_env
-            );
+            // ledgers alone. The key is checked, never shown.
+            let var = &opts.oracle.api_key_env;
+            match oracle::read_key(&key, var).0 {
+                oracle::KeyState::Missing => bail!(
+                    "oracle.enabled is true but the environment variable {var} holds no key: set \
+                     it, or set oracle.enabled=false to learn from the --answers ledgers only"
+                ),
+                oracle::KeyState::Bad(p) => bail!(
+                    "oracle.enabled is true but {}: fix the variable, or set oracle.enabled=false \
+                     to learn from the --answers ledgers only",
+                    oracle::bad_key_text(var, &p)
+                ),
+                oracle::KeyState::Usable { trimmed } if trimmed > 0 => {
+                    tracing::warn!("{}", oracle::trimmed_warning(var, trimmed));
+                }
+                oracle::KeyState::Usable { .. } => {}
+            }
             Some(OracleClient::open(&opts.oracle, l, None, key)?)
         }
         (None, true) => bail!("live oracle calls need a reservation ledger path"),

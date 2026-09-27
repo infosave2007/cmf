@@ -74,16 +74,21 @@
 //! the oracle's answers to its questions (a skill's own question, as
 //! `/v1/route` asks it, included) are cached but never become examples. The
 //! server logs one startup line of the oracle ([`oracle_startup_line`]:
-//! `ready`, `NOT ready — <what to do>` or `off`), `GET /v1/admin/oracle` has
-//! `status` (`ready`, `no_key`, `disabled`, `budget_exhausted`, `stopped:
-//! <reason>`), `/healthz` has `oracle_status` (on `/v1/healthz` only under
-//! `cmf`, with `x-cmf-extensions`), and a trained question that abstains
-//! because the oracle is not ready carries the reason's flags
-//! (`oracle_disabled`, `no_key`, `budget`, `stopped`) and, on the decisions
-//! surface, one line `cmf.hint`; router answers keep their shapes and their flag vocabulary (a
-//! missing key is `oracle_disabled` there, without `no_key`; the hint is
-//! logged: each distinct hint at most once a minute, once per process at
-//! INFO on a server without an oracle).
+//! `ready`, `NOT ready — <what to do>` or `off`; a key that had surrounding
+//! whitespace, trimmed before use, adds one warning), `GET /v1/admin/oracle`
+//! has `status` (`ready`, `no_key`, `bad_key`, `disabled`,
+//! `budget_exhausted`, `budget_too_small`, `stopped: <reason>`; with
+//! `key_problem`, `last_error` and `min_call_usd`), `/healthz` has
+//! `oracle_status` (on `/v1/healthz` only under `cmf`, with
+//! `x-cmf-extensions`), and a trained question that abstains because the
+//! oracle is not ready carries the reason's flags (`oracle_disabled`,
+//! `no_key`, `bad_key`, `budget`, `stopped`) and, on the decisions surface,
+//! one line `cmf.hint`; router answers keep their shapes and their flag
+//! vocabulary (a missing or unusable key is `oracle_disabled` there, without
+//! `no_key` or `bad_key`; the hint is logged: each distinct hint at most once
+//! a minute, once per process at INFO on a server without an oracle). No
+//! line, status or hint ever holds a byte of the key: a malformed key is
+//! never sent, and transport errors are fixed codes.
 //!
 //! # Every request
 //!
@@ -1826,9 +1831,10 @@ impl DecisionState {
 
 /// The flags of a router response (and of its audit record): an escalated
 /// question left unanswered is the router's `low_confidence`, then the
-/// question's own flags — without `no_key`, which only the decisions surface
-/// names (a missing oracle key is `oracle_disabled` there too, as before the
-/// flag existed), so the router vocabulary stays what it was.
+/// question's own flags — without `no_key` and `bad_key`, which only the
+/// decisions surface names (a missing or unusable oracle key is
+/// `oracle_disabled` there too, as before the flags existed), so the router
+/// vocabulary stays what it was.
 fn audit_flags(action: Action, flags: &[String]) -> Vec<String> {
     let mut out = Vec::with_capacity(flags.len() + 1);
     if action == Action::Abstain {
@@ -1837,7 +1843,10 @@ fn audit_flags(action: Action, flags: &[String]) -> Vec<String> {
     out.extend(
         flags
             .iter()
-            .filter(|f| f.as_str() != RefusalReason::NoKey.flag())
+            .filter(|f| {
+                f.as_str() != RefusalReason::NoKey.flag()
+                    && f.as_str() != RefusalReason::BadKey.flag()
+            })
             .cloned(),
     );
     out
@@ -3298,6 +3307,15 @@ impl DecisionServer {
         } else {
             tracing::warn!("{line}");
         }
+        // A key read with surrounding whitespace (a `.env` file's CR, LF) is
+        // trimmed before every call; said once (never the key).
+        let trimmed = cascade.oracle().key_state().trimmed();
+        if cfg.oracle.enabled && trimmed > 0 {
+            tracing::warn!(
+                "{}",
+                cortiq_decision::oracle::trimmed_warning(&cfg.oracle.api_key_env, trimmed)
+            );
+        }
         let shadow = match upstream {
             Some(u) => {
                 let sh = shadow::Shadow::open(u, &dir.shadow_log_path())?;
@@ -3423,6 +3441,13 @@ pub fn oracle_startup_line(cascade: &Cascade, cfg: &Config, note: Option<&str>) 
                 o.api_key_env
             ),
         ),
+        OracleStatus::BadKey(p) => (
+            false,
+            format!(
+                "oracle: NOT ready — {} (fix the variable and restart; nothing is sent with it; {what}, {budget_text})",
+                cortiq_decision::oracle::bad_key_text(&o.api_key_env, &p)
+            ),
+        ),
         OracleStatus::BudgetExhausted => (
             false,
             format!(
@@ -3430,12 +3455,36 @@ pub fn oracle_startup_line(cascade: &Cascade, cfg: &Config, note: Option<&str>) 
                 st["calls"], st["max_calls"]
             ),
         ),
-        OracleStatus::Stopped(r) => (
+        OracleStatus::BudgetTooSmall { min_usd } => (
             false,
-            format!(
-                "oracle: NOT ready — stopped by a stop rule ({r}; {what}); after the fix POST /v1/admin/oracle {{\"enabled\":true}} resumes it"
-            ),
+            if st["max_calls"].as_u64() == Some(0) {
+                format!(
+                    "oracle: NOT ready — max_calls 0 allows no call ({what}; restart with --oracle-max-calls of at least 1)"
+                )
+            } else {
+                let (p, c) = oracle.max_price();
+                format!(
+                    "oracle: NOT ready — the budget is too small: {budget_text} cannot hold one call, which reserves at least {} at the max price in/out {}/{} per 1M ({what}; restart with --oracle-budget of at least {})",
+                    usd(min_usd),
+                    usd(p),
+                    usd(c),
+                    usd(min_usd)
+                )
+            },
         ),
+        OracleStatus::Stopped(r) => {
+            // A `max_errors` stop names the last failure's code.
+            let last = match st["last_error"].as_str() {
+                Some(e) if r == "max_errors" => format!(", the last error: {e}"),
+                _ => String::new(),
+            };
+            (
+                false,
+                format!(
+                    "oracle: NOT ready — stopped by a stop rule ({r}{last}; {what}); after the fix POST /v1/admin/oracle {{\"enabled\":true}} resumes it"
+                ),
+            )
+        }
     }
 }
 

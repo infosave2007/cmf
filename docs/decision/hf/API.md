@@ -321,7 +321,7 @@ curl -s "$CORTIQ/v1/skills/banking77" -H "Authorization: Bearer $KEY" \
 | `source`, `skill`, `match`, `certified` | where the answer came from; section 3.2 |
 | `gate` | `accepted`, `p_top` and `tau`, `novelty` and `theta`, `is_novel`, `margin`, `profile` |
 | `errors` | reconstruction errors of the 5 best labels (all of them with `cmf.explain`) |
-| `flags` | e.g. `oracle_disabled`, `no_key` (with `oracle_disabled`: the key variable is not set), `consent_off`, `budget`, `stopped`, `oracle_unavailable`, `pii_redacted` |
+| `flags` | e.g. `oracle_disabled`, `no_key` (with `oracle_disabled`: the key variable is not set), `bad_key` (with `oracle_disabled`: it holds something that is not a key), `consent_off`, `budget`, `stopped`, `oracle_unavailable`, `pii_redacted` |
 | `confident` | the answer can be used as is (gate accepted and not novel, or a valid oracle answer) |
 | `complexity` | `{score, tier, factors: {base, ambiguity, novelty, margin, length}}`, the cortiq-router formula |
 | `routing` | `{target, reason}` when `routing_tiers` maps the tier |
@@ -329,7 +329,7 @@ curl -s "$CORTIQ/v1/skills/banking77" -H "Authorization: Bearer $KEY" \
 | `explanation` | with `cmf.explain`: `{top1_vs_top2, decision_path}` |
 
 When a trained question abstains because the oracle is not ready (flags
-`oracle_disabled`, `no_key`, `budget` or `stopped`, not `consent_off`), the
+`oracle_disabled`, `no_key`, `bad_key`, `budget` or `stopped`, not `consent_off`), the
 answer also has `cmf.hint`, one line that says what to do, e.g. `"the oracle
 key is not set: set OPENROUTER_API_KEY in the server's environment and
 restart it"` or `"no oracle answers the questions the local model cannot
@@ -445,7 +445,7 @@ curl -s "$CORTIQ/v1/feedback" -H "Authorization: Bearer $KEY" \
 | `GET /v1/models` | open | the model in the shape of an OpenRouter provider listing (`id`, `pricing` as USD-per-token strings, `context_length` 512, `max_output_length` 255) plus `cmf.skills` with each gate |
 | `GET /v1/skills`, `GET /v1/skills/{id}` | key | labels, gate, rubric (`instructions`, `criteria`) |
 | `GET /v1/usage` | key | the caller's account (router format; `x-cmf-extensions: 1` adds token and cost totals) |
-| `GET /healthz` | open | status, model, generation, skills, `oracle` (on/off) and `oracle_status` (`ready`, `no_key`, `disabled`, `budget_exhausted`, `stopped: <reason>`; section 5) |
+| `GET /healthz` | open | status, model, generation, skills, `oracle` (on/off) and `oracle_status` (`ready`, `no_key`, `bad_key`, `disabled`, `budget_exhausted`, `budget_too_small`, `stopped: <reason>`; section 5) |
 
 `/v1/models` only has the listing's shape; Cortiq Decision is not listed on
 OpenRouter.
@@ -492,7 +492,8 @@ error envelope, so existing clients need no change:
   router's keys only.
 * The router's flags keep their vocabulary: an escalation the oracle does
   not answer is `low_confidence` plus `oracle_disabled` (also when the key
-  variable is not set — `no_key` appears only on the decisions API),
+  variable is not set or not a key — `no_key` and `bad_key` appear only on
+  the decisions API),
   `consent_off`, `budget`, `stopped` or `oracle_unavailable`, in the answer
   and in `/v1/escalations`; the hint of the decisions API is only logged.
 
@@ -601,7 +602,7 @@ unset the admin API answers 404 `ADMIN_DISABLED`.
 |---|---|
 | `POST / GET /v1/admin/keys`, `DELETE /v1/admin/keys/{account}`, `DELETE /v1/admin/keys/hash/{hash12}` | create (raw key returned once), list, revoke |
 | `GET /v1/admin/usage` | usage of every account |
-| `GET /v1/admin/oracle`, `POST /v1/admin/oracle {"enabled", "budget_usd", "max_calls"}` | oracle status: `status` (`ready`; `no_key` — the key variable is unset or empty; `disabled` — not configured or switched off by the admin; `budget_exhausted`; `stopped: <reason>` — a stop rule), `configured` = `oracle.enabled` of the configuration, `enabled` = not switched off by a stop rule or the admin, `key_present`, `key_env` (the variable's name, never its value), `model`, `max_price`, spent, calls, stop reason; switch it and lower limits within the configuration |
+| `GET /v1/admin/oracle`, `POST /v1/admin/oracle {"enabled", "budget_usd", "max_calls"}` | oracle status: `status` (`ready`; `no_key` — the key variable is unset or empty; `bad_key` — it holds something that is not a key, never sent; `disabled` — not configured or switched off by the admin; `budget_exhausted` — something was spent and the budget or `max_calls` is used up; `budget_too_small` — nothing spent, and the budget cannot hold one call, `min_call_usd`; `stopped: <reason>` — a stop rule), `configured` = `oracle.enabled` of the configuration, `enabled` = not switched off by a stop rule or the admin, `key_present`, `key_ok`, `key_problem` (by position and length, never a byte of the key), `key_trimmed` (surrounding whitespace was trimmed), `key_env` (the variable's name, never its value), `model`, `max_price`, `min_call_usd`, spent, calls, stop reason, `last_error` (the code of the last failed call); switch it and lower limits within the configuration |
 | `GET /v1/admin/learning` | buffer, cache, quarantine, attempts, promotions, recent events |
 | `GET /v1/admin/generations`, `POST /v1/admin/rollback {"generation": N}` | generations; serve generation N (0 = the base file) |
 | `GET /v1/admin/shadow` | agreement statistics in shadow mode, and the routed requests not compared since the start (section 8) |
