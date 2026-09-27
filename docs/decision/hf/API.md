@@ -68,7 +68,8 @@ cortiq serve cortiq-decision.cmf --decision-config decision.json \
 
 A decision server listens on `127.0.0.1:8080` unless `--host` / `--port` say
 otherwise. Other `cortiq serve` flags for decision files: `--break-lock`
-(remove a stale `LOCK` of a dead process), `--shadow-of URL` and
+(only where the state directory's filesystem has no advisory locks: remove a
+stale `LOCK` of a dead process), `--shadow-of URL` and
 `--shadow-timeout-s N` ([section 8](#8-migrating-from-cortiq-router)), and
 `--oracle MODEL` with its companions `--oracle-budget`, `--oracle-max-calls`,
 `--oracle-max-price`, `--oracle-key-env`, `--oracle-base-url` and
@@ -86,7 +87,15 @@ The state directory (mode 0700) holds `LOCK`, `keys.json`, `usage/`,
 `oracle.jsonl`, `oracle.state`, `learn.log`, `generations/` and `CURRENT`
 (and in shadow mode `shadow.jsonl` with its key `shadow.key`). One server
 process per state directory; the CLI may change `keys.json` while it runs
-(both take `keys.json.lock` for each change).
+(both take `keys.json.lock` for each change). The server holds an advisory
+lock (`flock`) on `LOCK` while it runs, and the file names its pid; the
+lock ends with the process however it ends, so a `LOCK` left by a server
+that was killed (SIGKILL after a stop timeout, an out-of-memory kill, a
+crash of the host) is taken over by the next start, with a warning naming
+that pid: a restart policy such as `restart: unless-stopped` needs no
+`--break-lock`, also in a container where the server is always pid 1. The
+lock of a running process is never broken. Versions up to 0.7.8 do not hold
+the lock: do not run one on the same directory at the same time.
 
 <a id="check-your-setup"></a>**Check your setup.** Whether the oracle is
 ready can be checked before a server with `--oracle MODEL` is started or
@@ -131,7 +140,7 @@ jq -c '{answer, action, source, oracle_cost_usd, flags}' results.jsonl
 Each batch row adds `answer`, `action` (`local`, `oracle`, `cache` or
 `abstain`), `source`, `oracle_cost_usd` and `flags` to the local columns;
 `--oracle-resume` turns the oracle on again after a stop rule is fixed, and
-`--break-lock` removes a `LOCK` a crashed run left
+a `LOCK` a killed run left is taken over by the next one
 ([ORACLE.md](ORACLE.md#one-text-or-a-batch)).
 
 ## 2. Keys, plans and limits
@@ -233,7 +242,10 @@ The response of `POST /v1/admin/keys` is the only place the raw key appears.
 
 Any other key at the top level or inside `cmf`, or a key repeated inside any
 object, is 400. The body is at most 1 MiB (413) and must be
-`Content-Type: application/json`.
+`Content-Type: application/json` (parameters such as `charset` allowed):
+any other content type, or none, is 400 `INVALID_REQUEST` on this API (the
+router paths of [section 4](#4-cortiq-router-api-schema-11) answer it with
+415, as the router does).
 
 ```bash
 curl -s "$CORTIQ/api/alpha/decisions" \
@@ -432,7 +444,7 @@ with cortiq-router's codes.
 
 | HTTP | reason | When |
 |---|---|---|
-| 400 | `INVALID_REQUEST` | schema, limits, duplicate or unknown keys |
+| 400 | `INVALID_REQUEST` | schema, limits, duplicate or unknown keys, malformed JSON, a content type other than `application/json` |
 | 401 | `UNAUTHORIZED` | key missing, wrong, expired or revoked |
 | 402 | `QUOTA_EXCEEDED` | decision or token quota, credit |
 | 404 | `MODEL_NOT_FOUND`, `INVALID_REQUEST`, `ADMIN_DISABLED` | unknown model; feedback target not found; admin token not configured |
@@ -492,7 +504,8 @@ curl -s "$CORTIQ/v1/feedback" -H "Authorization: Bearer $KEY" \
 | Path | Access | Returns |
 |---|---|---|
 | `GET /v1/models` | open | the model in the shape of an OpenRouter provider listing (`id`, `pricing` as USD-per-token strings, `context_length` 512, `max_output_length` 255) plus `cmf.skills` with each gate |
-| `GET /v1/skills`, `GET /v1/skills/{id}` | key | labels, gate, rubric (`instructions`, `criteria`) |
+| `GET /v1/skills` | key | every skill: `id`, `taxonomy_version`, `labels`, `certified`, `tau`, `theta`, `temperature` and `has_rubric` (whether it has a rubric; the rubric itself is per skill) |
+| `GET /v1/skills/{id}` | key | the same plus `tasks`, the whole `gate` and `rubric` (`instructions`, `criteria`; `null` without one) |
 | `GET /v1/usage` | key | the caller's account (router format; `x-cmf-extensions: 1` adds token and cost totals) |
 | `GET /healthz` | open | status, model, generation, skills, `oracle` (on/off) and `oracle_status` (`ready`, `no_key`, `bad_key`, `disabled`, `budget_exhausted`, `budget_too_small`, `stopped: <reason>`; section 5) |
 
