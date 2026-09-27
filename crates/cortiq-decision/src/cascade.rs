@@ -273,11 +273,39 @@ impl Cascade {
         state: StateDir,
         opts: CascadeOptions,
     ) -> Result<Arc<Self>> {
+        Self::open_impl(handle, cfg, state, opts, true)
+    }
+
+    /// The cascade of one command-line run (`cortiq decide --oracle`): the
+    /// reservation ledger (`oracle.jsonl`) and the answer cache (`learn.log`)
+    /// are the state directory's, as a server's. `oracle.state` (the switch
+    /// and stop reason a server keeps) is read and holds — a server's stopped
+    /// or switched-off oracle stays so — but is never written: the run's own
+    /// stop rules end its calls for the run, as in `cortiq decision learn`.
+    /// The caller holds the directory's `LOCK` and sets `learning.enabled` as
+    /// it wants.
+    pub fn open_run(
+        handle: Arc<ModelHandle>,
+        cfg: &Config,
+        state: StateDir,
+        opts: CascadeOptions,
+    ) -> Result<Arc<Self>> {
+        Self::open_impl(handle, cfg, state, opts, false)
+    }
+
+    fn open_impl(
+        handle: Arc<ModelHandle>,
+        cfg: &Config,
+        state: StateDir,
+        opts: CascadeOptions,
+        persist_oracle_state: bool,
+    ) -> Result<Arc<Self>> {
         cfg.validate()?;
-        let oracle = OracleClient::open(
+        let oracle = OracleClient::open_with(
             &cfg.oracle,
             &state.oracle_ledger_path(),
             Some(&state.oracle_state_path()),
+            persist_oracle_state,
             opts.key,
         )?;
         let (log, replayed) = LearnLog::open(&state.learn_log_path())?;
