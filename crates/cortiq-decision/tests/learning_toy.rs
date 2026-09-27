@@ -550,8 +550,12 @@ fn cold_start_turns_an_oracle_label_into_a_task_after_25_answers() {
 }
 
 mod capture {
-    //! A thread-local tracing subscriber that keeps every event (message and
-    //! fields) as text.
+    //! A tracing subscriber that keeps every event (message and fields) as
+    //! text, installed once as the global default of this test binary. A
+    //! thread-local `with_default` is not enough: with tests running in
+    //! parallel, another thread can register a callsite while no subscriber is
+    //! set, and tracing then skips that callsite's events (seen with 4 test
+    //! threads on the CI runners).
     use std::fmt::Write as _;
     use std::sync::{Arc, Mutex};
     use tracing::field::{Field, Visit};
@@ -587,6 +591,18 @@ mod capture {
         fn enter(&self, _: &Id) {}
         fn exit(&self, _: &Id) {}
     }
+
+    /// The binary-wide capture, installed on first use.
+    pub fn global() -> &'static Capture {
+        static CAPTURE: std::sync::OnceLock<Capture> = std::sync::OnceLock::new();
+        CAPTURE.get_or_init(|| {
+            let c = Capture::default();
+            tracing::subscriber::set_global_default(c.clone())
+                .expect("no other global subscriber in this test binary");
+            tracing::callsite::rebuild_interest_cache();
+            c
+        })
+    }
 }
 
 /// F1 item 7 (spec §4.3: logs carry id, status, latency, account): a label
@@ -600,30 +616,29 @@ fn learning_log_lines_never_print_a_feedback_label() {
     let st = Stand::new(&stand_config(&mock.url()));
     let mut p = Principal::open();
     p.oracle_allowed = false;
-    let log = capture::Capture::default();
-    let last = tracing::subscriber::with_default(log.clone(), || {
-        let mut last = Value::Null;
-        for t in lesson() {
-            let d = st.decide_as(&topics_body(t), &p).unwrap();
-            let fb = cortiq_decision::protocol::FeedbackRequest {
-                id: d.id.clone(),
-                question: "task".into(),
-                label: MARK.into(),
-                any_label: true,
-            };
-            last = st.svc.feedback_request(&fb, &p).unwrap();
-        }
-        last
-    });
+    let log = capture::global();
+    let mut last = Value::Null;
+    for t in lesson() {
+        let d = st.decide_as(&topics_body(t), &p).unwrap();
+        let fb = cortiq_decision::protocol::FeedbackRequest {
+            id: d.id.clone(),
+            question: "task".into(),
+            label: MARK.into(),
+            any_label: true,
+        };
+        last = st.svc.feedback_request(&fb, &p).unwrap();
+    }
     assert_eq!(mock.hits(), 0, "no oracle for this principal");
     assert_eq!(last["cold_start"], true, "{last}");
     assert_eq!(last["learning"]["outcome"], "promoted", "{last}");
     let tag = learn::label_tag(MARK);
     assert_eq!(tag, sha256_hex(MARK.as_bytes())[..12]);
+    // The capture is shared by the tests running in parallel: find this test's
+    // promotion by the label's tag; the whole log is checked for the label.
     let text = log.0.lock().unwrap().clone();
     let promoted = text
         .lines()
-        .find(|l| l.contains("promoted"))
+        .find(|l| l.contains("promoted") && l.contains(&format!("label_sha={tag}")))
         .unwrap_or_else(|| panic!("no promotion line:\n{text}"));
     assert!(
         promoted.contains(&format!("label_sha={tag}")) && promoted.contains("task=4"),
