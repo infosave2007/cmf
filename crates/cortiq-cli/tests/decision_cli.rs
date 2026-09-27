@@ -44,12 +44,19 @@
 //!   from the cache; labels no skill has go to the oracle; without the key
 //!   `no_key` and the command line's hint; a server holding the state
 //!   directory is named; batch rows keep their local columns, the per-run
-//!   `--oracle-budget` caps the calls, a 401 stops the run's calls; nothing
-//!   is learned;
+//!   `--oracle-budget` caps the calls; nothing is learned. The stop rules
+//!   hold across runs as on a server (another model, a cost above the
+//!   reservation, 401, 402: written to `oracle.state`, no call until
+//!   `--oracle-resume`), each worded without the log; a failed call counts
+//!   toward `max_errors` across runs; an interrupted run (SIGTERM, SIGINT)
+//!   releases the `LOCK`, a stale one is named and `--break-lock` removes it,
+//!   never one of a running process;
 //! * `decision oracle check`: ready, no key, a refused key (401), an unknown
-//!   model, a model without structured outputs — each with its code and exit
-//!   code 1; `--test-call` makes exactly one call; a key typed as a flag is
-//!   refused, never shown or sent; no key bytes in any output.
+//!   model, a model without structured outputs, a test call billed above its
+//!   reservation, refused with 402 or answered by another model — each with
+//!   its code and exit code 1; `--test-call` makes exactly one call; a key
+//!   typed as a flag is refused, never shown or sent; no key bytes in any
+//!   output.
 
 #[path = "support/toy_dir.rs"]
 mod toy_dir;
@@ -2495,6 +2502,8 @@ type Request = (String, Vec<u8>);
 struct MockOpenRouter {
     addr: SocketAddr,
     chats: Arc<AtomicUsize>,
+    /// How `/chat/completions` misbehaves (nothing by default).
+    quirk: Arc<Mutex<ChatQuirk>>,
     /// (head, body) of every request, in arrival order.
     requests: Arc<Mutex<Vec<Request>>>,
     stop: Arc<AtomicBool>,
@@ -2517,8 +2526,27 @@ fn endpoint(provider: &str, prompt: &str, completion: &str, structured: bool) ->
            "supported_parameters": params, "status": 0})
 }
 
+/// How the mock's `/chat/completions` misbehaves.
+#[derive(Clone, Debug, Default)]
+struct ChatQuirk {
+    /// Answer as this model, not the one asked (the stop `unexpected_model`).
+    model: Option<&'static str>,
+    /// Refuse every call with this status (402: no credits).
+    status: Option<u16>,
+    /// Bill this, not the mock's cost (above the reservation: a stop).
+    cost: Option<f64>,
+    /// Wait this long before answering.
+    delay: Option<Duration>,
+}
+
 /// The answer of the mock to one request: (status, body).
-fn openrouter_reply(head: &str, body: &[u8], label: &str, cost: f64) -> (u16, Vec<u8>) {
+fn openrouter_reply(
+    head: &str,
+    body: &[u8],
+    label: &str,
+    cost: f64,
+    quirk: &ChatQuirk,
+) -> (u16, Vec<u8>) {
     let mut words = head.split(' ');
     let method = words.next().unwrap_or("");
     let path = words.next().unwrap_or("");
@@ -2587,11 +2615,15 @@ fn openrouter_reply(head: &str, body: &[u8], label: &str, cost: f64) -> (u16, Ve
                 br#"{"error":{"message":"User not found.","code":401}}"#.to_vec(),
             )
         }
+        ("POST", "/api/v1/chat/completions") if quirk.status.is_some() => (
+            quirk.status.unwrap(),
+            br#"{"error":{"message":"Insufficient credits","code":402}}"#.to_vec(),
+        ),
         ("POST", "/api/v1/chat/completions") => {
             let mut v: Value = serde_json::from_slice(&completion_for(body, label)).unwrap();
             let req: Value = serde_json::from_slice(body).unwrap();
-            v["model"] = req["model"].clone();
-            v["usage"]["cost"] = json!(cost);
+            v["model"] = quirk.model.map_or_else(|| req["model"].clone(), |m| json!(m));
+            v["usage"]["cost"] = json!(quirk.cost.unwrap_or(cost));
             (200, serde_json::to_vec(&v).unwrap())
         }
         _ => (
@@ -2606,24 +2638,29 @@ impl MockOpenRouter {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let chats = Arc::new(AtomicUsize::new(0));
+        let quirk = Arc::new(Mutex::new(ChatQuirk::default()));
         let requests = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
-        let (c, r, st) = (chats.clone(), requests.clone(), stop.clone());
+        let (c, q, r, st) = (chats.clone(), quirk.clone(), requests.clone(), stop.clone());
         let thread = std::thread::spawn(move || {
             for conn in listener.incoming() {
                 if st.load(Ordering::SeqCst) {
                     break;
                 }
                 let Ok(mut s) = conn else { continue };
-                let (c, r) = (c.clone(), r.clone());
+                let (c, q, r) = (c.clone(), q.clone(), r.clone());
                 std::thread::spawn(move || {
                     let Some((head, body)) = read_request_parts(&mut s) else {
                         return;
                     };
+                    let quirk = q.lock().unwrap().clone();
                     if head.starts_with("POST /api/v1/chat/completions ") {
                         c.fetch_add(1, Ordering::SeqCst);
+                        if let Some(d) = quirk.delay {
+                            std::thread::sleep(d);
+                        }
                     }
-                    let (status, reply) = openrouter_reply(&head, &body, label, cost);
+                    let (status, reply) = openrouter_reply(&head, &body, label, cost, &quirk);
                     r.lock().unwrap().push((head, body));
                     let head = format!(
                         "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -2638,10 +2675,16 @@ impl MockOpenRouter {
         Self {
             addr,
             chats,
+            quirk,
             requests,
             stop,
             thread: Some(thread),
         }
+    }
+
+    /// Make `/chat/completions` misbehave from now on.
+    fn set_quirk(&self, q: ChatQuirk) {
+        *self.quirk.lock().unwrap() = q;
     }
 
     /// `--oracle-base-url` of this mock.
@@ -3540,7 +3583,7 @@ fn decide_oracle_asks_only_what_the_gate_rejects_and_hides_the_key() {
     assert!(out.contains("[pii_redacted]"), "{out}");
     assert!(
         out.contains(&format!(
-            "oracle:     {ORACLE_MODEL} via {}: $0.000013 spent in this run (1 call), budget $1.00; ledger {}",
+            "oracle:     {ORACLE_MODEL} via {}: $0.000013 spent in this run (1 call), budget $1.00; ledger {}: $0.000013 over 1 call in all",
             mock.addr,
             state.join("oracle.jsonl").display()
         )),
@@ -3604,6 +3647,13 @@ fn decide_oracle_asks_only_what_the_gate_rejects_and_hides_the_key() {
     assert_eq!(or["budget_usd"], 1.0);
     assert_eq!(or["spent_usd"], 1.3e-5);
     assert_eq!(or["calls"], 1);
+    // The ledger's total: this call and the first one.
+    assert_eq!(or["ledger_calls"], 2);
+    assert!(
+        (or["ledger_spent_usd"].as_f64().unwrap() - 2.6e-5).abs() < 1e-15,
+        "{or}"
+    );
+    assert_eq!(or["unknown_cost_usd"], 0.0);
     assert_eq!(or["key_env"], "OPENROUTER_API_KEY");
     assert_eq!(or["max_price"], json!({"prompt": 0.06, "completion": 0.58}));
     assert_eq!(
@@ -3643,7 +3693,7 @@ fn decide_oracle_asks_only_what_the_gate_rejects_and_hides_the_key() {
     assert_eq!(mock.chats(), 3);
 
     // The state: one reservation and one settlement per call, no key, no
-    // LOCK left, and no oracle.state (a run's stop state lives in memory).
+    // LOCK left, and no oracle.state (no stop rule fired, no call failed).
     let ledger = std::fs::read_to_string(state.join("oracle.jsonl")).unwrap();
     assert_eq!(ledger.lines().count(), 2 * mock.chats());
     assert!(ledger.contains("\"account\":\"cortiq-decide\""), "{ledger}");
@@ -3722,8 +3772,8 @@ fn decide_oracle_asks_only_what_the_gate_rejects_and_hides_the_key() {
     assert!(e.contains("--oracle"), "{e}");
     assert_eq!(mock.requests().len(), before, "nothing was sent");
 
-    // 8. A server's stop reason in oracle.state holds for the run (read,
-    // never written): no call, and the hint says how to resume.
+    // 8. A stop reason in oracle.state (a server's, or an earlier run's)
+    // holds: no call, the file unchanged, and the hint says how to resume.
     let stopped = d.join("stopped");
     std::fs::create_dir_all(&stopped).unwrap();
     let st_file = stopped.join("oracle.state");
@@ -3743,14 +3793,51 @@ fn decide_oracle_asks_only_what_the_gate_rejects_and_hides_the_key() {
         json!(["stopped"]),
         "{v}"
     );
+    let hint = v["cmf"]["hint"].as_str().unwrap();
     assert!(
-        v["cmf"]["hint"].as_str().unwrap().contains(
-            "was stopped by a stop rule (unexpected_model) before this run (its oracle.state, kept by a server)"
-        ),
+        hint.contains(&format!(
+            "the oracle of state directory {} is stopped by the stop rule unexpected_model: OpenRouter answered with a model other than {ORACLE_MODEL} (recorded in its oracle.state by an earlier run or a server). It stays off until resumed: after the fix (`cortiq decision oracle check --base-url {base} --test-call` shows what OpenRouter answers) run again with --oracle-resume",
+            stopped.display()
+        )),
         "{v}"
     );
     assert_eq!(mock.chats(), chats);
     assert_eq!(std::fs::read_to_string(&st_file).unwrap(), st_body);
+    // --oracle-resume switches it on again (as the admin API of a server),
+    // and the call is made.
+    let o = decide_oracle(
+        &base,
+        &["-p", &texts[2]],
+        &["--state", s(&stopped), "--oracle-resume"],
+        &key,
+    );
+    assert!(o.status.success(), "{}", show(&o));
+    assert!(
+        stderr_of(&o).contains(&format!(
+            "oracle: resumed — the oracle of state directory {} was stopped by the stop rule unexpected_model: OpenRouter answered with a model other than {ORACLE_MODEL}; it may be called again",
+            stopped.display()
+        )),
+        "{}",
+        show(&o)
+    );
+    assert!(stdout_of(&o).contains("(from oracle"), "{}", show(&o));
+    assert_eq!(mock.chats(), chats + 1);
+    let resumed: Value = serde_json::from_str(&std::fs::read_to_string(&st_file).unwrap()).unwrap();
+    assert_eq!(resumed["stop_reason"], Value::Null);
+    assert_eq!(resumed["enabled"], true);
+    // Nothing to resume: said, nothing changed.
+    let o = decide_oracle(
+        &base,
+        &["-p", &texts[2]],
+        &["--state", s(&stopped), "--oracle-resume"],
+        &key,
+    );
+    assert!(o.status.success(), "{}", show(&o));
+    assert!(
+        stderr_of(&o).contains("oracle: nothing to resume — the oracle of state directory"),
+        "{}",
+        show(&o)
+    );
 
     // 9. A running server holds the state directory: one process per state
     // directory keeps the budget exact; the error says what to do.
@@ -3763,7 +3850,7 @@ fn decide_oracle_asks_only_what_the_gate_rejects_and_hides_the_key() {
         show(&o)
     );
     srv.stop();
-    assert_eq!(mock.chats(), 3);
+    assert_eq!(mock.chats(), chats + 1);
 }
 
 #[test]
@@ -3925,13 +4012,18 @@ fn decide_oracle_batch_respects_its_budget_cap_per_run() {
     );
     assert_no_bytes_of(FAKE_OPENROUTER_KEY, &state);
 
-    // A stop rule holds for the run: the provider refuses the key (HTTP
-    // 401) at the first call, and no other row is sent.
+    // A stop rule holds as on a server: the provider refuses the key (HTTP
+    // 401) at the first call, no other row is sent, and the stop is kept in
+    // oracle.state for the next runs until --oracle-resume.
+    let s401 = d.join("s401");
     let o = decide_oracle(
         &base,
         &["--input", s(&input)],
-        &["--state", s(&d.join("s401"))],
-        &[("OPENROUTER_API_KEY", WRONG_OPENROUTER_KEY)],
+        &["--state", s(&s401)],
+        &[
+            ("OPENROUTER_API_KEY", WRONG_OPENROUTER_KEY),
+            ("RUST_LOG", "error"),
+        ],
     );
     assert!(o.status.success(), "{}", show(&o));
     assert_no_key_in(&show(&o), "a run stopped by a 401");
@@ -3948,15 +4040,68 @@ fn decide_oracle_batch_respects_its_budget_cap_per_run() {
         "{sum}"
     );
     assert_eq!(sum["oracle"]["status"], "stopped: http_401");
+    // Worded without the log (RUST_LOG=error hides the warnings).
     assert!(
-        sum["oracle"]["hint"]
-            .as_str()
-            .unwrap()
-            .starts_with("a stop rule stopped the oracle in this run (http_401); `cortiq decision oracle check --base-url"),
+        sum["oracle"]["hint"].as_str().unwrap().starts_with(&format!(
+            "a stop rule stopped the oracle in this run: OpenRouter refused the key in OPENROUTER_API_KEY (HTTP 401) (stop rule http_401). It stays off for state directory {} until resumed: fix the key (`cortiq decision oracle check --base-url {base}` tests it), then run again with --oracle-resume",
+            s401.display()
+        )),
         "{sum}"
     );
-    // The stop lives for the run: nothing is written for the next one.
-    assert!(!d.join("s401").join("oracle.state").exists());
+    // The refused call reported no cost: its reservation is charged, and
+    // named as likely not billed.
+    let unknown = sum["oracle"]["unknown_cost_usd"].as_f64().unwrap();
+    assert!(
+        unknown > 0.0 && unknown == sum["oracle"]["spent_usd"].as_f64().unwrap(),
+        "{sum}"
+    );
+    assert!(
+        stderr_of(&o).contains(
+            "of it is the reservation of failed calls that reported no cost, likely not billed"
+        ),
+        "{}",
+        show(&o)
+    );
+    let st401: Value =
+        serde_json::from_str(&std::fs::read_to_string(s401.join("oracle.state")).unwrap()).unwrap();
+    assert_eq!(st401["stop_reason"], "http_401");
+    // The next run, with the right key: still stopped, no call, and the
+    // start line says how to resume.
+    let o = decide_oracle(&base, &["--input", s(&input)], &["--state", s(&s401)], &key);
+    assert!(o.status.success(), "{}", show(&o));
+    assert_eq!(mock.chats(), 5, "a kept stop: no call");
+    assert!(
+        stderr_of(&o).contains(&format!(
+            "oracle: NOT ready — the oracle of state directory {} is stopped by the stop rule http_401: OpenRouter refused the key in OPENROUTER_API_KEY (HTTP 401) (recorded in its oracle.state by an earlier run or a server). It stays off until resumed: fix the key",
+            s401.display()
+        )),
+        "{}",
+        show(&o)
+    );
+    let sum = summary_of(&stderr_of(&o));
+    assert_eq!(
+        sum["oracle"]["abstained_by"],
+        json!({"stopped": 5}),
+        "{sum}"
+    );
+    // Resumed after the fix: the rows are asked again (five new calls; the
+    // budget of the run holds them all).
+    let o = decide_oracle(
+        &base,
+        &["--input", s(&input)],
+        &["--state", s(&s401), "--oracle-resume"],
+        &key,
+    );
+    assert!(o.status.success(), "{}", show(&o));
+    assert!(
+        stderr_of(&o).contains("oracle: resumed — the oracle of state directory"),
+        "{}",
+        show(&o)
+    );
+    assert_eq!(mock.chats(), 10);
+    let sum = summary_of(&stderr_of(&o));
+    assert_eq!(sum["oracle"]["answered_by_oracle"], 5, "{sum}");
+    assert_eq!(sum["oracle"]["ledger_calls"], 6, "{sum}");
 
     // Without the key: every rejected row abstains with no_key; no request.
     let before = mock.requests().len();
@@ -3978,6 +4123,378 @@ fn decide_oracle_batch_respects_its_budget_cap_per_run() {
     assert_eq!(got[4]["flags"], json!(["oracle_disabled", "no_key"]));
     assert_eq!(mock.requests().len(), before);
     assert!(!d.join("s2").exists());
+}
+
+#[test]
+fn decide_oracle_stop_rules_hold_across_runs_until_resumed() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let mock = MockOpenRouter::start("travel", 1.3e-5);
+    let base = mock.base();
+    let key = [("OPENROUTER_API_KEY", FAKE_OPENROUTER_KEY)];
+    let texts = distinct_texts(6, 13, "sr", 0.97);
+    let state_of = |st: &Path| -> Value {
+        serde_json::from_str(&std::fs::read_to_string(st.join("oracle.state")).unwrap()).unwrap()
+    };
+
+    // 1. The provider answers as another model: the call is refused
+    // (unexpected_model), the stop is written to oracle.state, and the
+    // hint says what happened and how to resume.
+    mock.set_quirk(ChatQuirk {
+        model: Some("other/model"),
+        ..Default::default()
+    });
+    let st_a = d.join("a");
+    let o = decide_oracle(&base, &["-p", &texts[0]], &["--state", s(&st_a)], &key);
+    assert!(o.status.success(), "{}", show(&o));
+    assert_eq!(mock.chats(), 1);
+    let out = stdout_of(&o);
+    assert!(
+        out.contains(&format!(
+            "hint:       a stop rule stopped the oracle in this run: OpenRouter answered with a model other than {ORACLE_MODEL} (stop rule unexpected_model). It stays off for state directory {} until resumed: after the fix (`cortiq decision oracle check --base-url {base} --test-call` shows what OpenRouter answers) run again with --oracle-resume",
+            st_a.display()
+        )),
+        "{}",
+        show(&o)
+    );
+    assert_eq!(state_of(&st_a)["stop_reason"], "unexpected_model");
+    // 2. The next run on the same directory: no call, whatever the text.
+    let o = decide_oracle(
+        &base,
+        &["-p", &texts[1]],
+        &["--state", s(&st_a), "--json"],
+        &key,
+    );
+    assert!(o.status.success(), "{}", show(&o));
+    assert_eq!(mock.chats(), 1, "a kept stop prevents the call");
+    let v = json_of(&stdout_of(&o));
+    assert_eq!(
+        v["cmf"]["questions"]["task"]["flags"],
+        json!(["stopped"]),
+        "{v}"
+    );
+    assert_eq!(v["cmf"]["oracle"]["status"], "stopped: unexpected_model");
+    assert!(
+        v["cmf"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("is stopped by the stop rule unexpected_model"),
+        "{v}"
+    );
+    // 3. After the fix, --oracle-resume: the call is made again.
+    mock.set_quirk(ChatQuirk::default());
+    let o = decide_oracle(
+        &base,
+        &["-p", &texts[1]],
+        &["--state", s(&st_a), "--oracle-resume"],
+        &key,
+    );
+    assert!(o.status.success(), "{}", show(&o));
+    assert!(
+        stdout_of(&o).contains(&format!(
+            "choice:     travel (from oracle {ORACLE_MODEL}, $0.000013)"
+        )),
+        "{}",
+        show(&o)
+    );
+    assert_eq!(mock.chats(), 2);
+    assert_eq!(state_of(&st_a)["stop_reason"], Value::Null);
+
+    // 4. Billed above the reservation: the answer is kept, the stop is
+    // written and explained (also in --json), and the next run makes no call.
+    mock.set_quirk(ChatQuirk {
+        cost: Some(1.0),
+        ..Default::default()
+    });
+    let st_b = d.join("b");
+    let o = decide_oracle(
+        &base,
+        &["-p", &texts[2]],
+        &["--state", s(&st_b), "--json"],
+        &key,
+    );
+    assert!(o.status.success(), "{}", show(&o));
+    let v = json_of(&stdout_of(&o));
+    assert_eq!(v["answers"]["task"]["choice"], "travel", "{v}");
+    assert_eq!(
+        v["cmf"]["oracle"]["status"],
+        "stopped: cost_above_reservation"
+    );
+    assert!(
+        v["cmf"]["hint"].as_str().unwrap().starts_with(
+            "a stop rule stopped the oracle in this run: the provider billed a call more than was reserved for it"
+        ),
+        "{v}"
+    );
+    assert_eq!(state_of(&st_b)["stop_reason"], "cost_above_reservation");
+    let o = decide_oracle(&base, &["-p", &texts[3]], &["--state", s(&st_b)], &key);
+    assert!(o.status.success(), "{}", show(&o));
+    assert_eq!(mock.chats(), 3, "one billed call, then none");
+    assert!(stdout_of(&o).contains("[stopped]"), "{}", show(&o));
+
+    // 5. No credits (HTTP 402), with the warnings hidden: the hint names it,
+    // and the reservation charged for the unbilled call is named as such.
+    mock.set_quirk(ChatQuirk {
+        status: Some(402),
+        ..Default::default()
+    });
+    let st_c = d.join("c");
+    let o = decide_oracle(
+        &base,
+        &["-p", &texts[4]],
+        &["--state", s(&st_c)],
+        &[
+            ("OPENROUTER_API_KEY", FAKE_OPENROUTER_KEY),
+            ("RUST_LOG", "error"),
+        ],
+    );
+    assert!(o.status.success(), "{}", show(&o));
+    let out = stdout_of(&o);
+    assert!(
+        out.contains("hint:       a stop rule stopped the oracle in this run: OpenRouter answered HTTP 402: the key in OPENROUTER_API_KEY has no credits left"),
+        "{}",
+        show(&o)
+    );
+    assert!(
+        out.contains("has no credits left (add credits at https://openrouter.ai/settings/credits, or raise the key's own limit) (stop rule http_402). It stays off for state directory")
+            && out.contains("until resumed: add credits, then run again with --oracle-resume"),
+        "{out}"
+    );
+    assert!(
+        out.contains("spent in this run (1 call; $")
+            && out.contains(
+                "of it is the reservation of failed calls that reported no cost, likely not billed)"
+            ),
+        "{out}"
+    );
+    assert_eq!(state_of(&st_c)["stop_reason"], "http_402");
+    let o = decide_oracle(&base, &["-p", &texts[5]], &["--state", s(&st_c)], &key);
+    assert!(o.status.success(), "{}", show(&o));
+    assert_eq!(mock.chats(), 4);
+
+    // 6. A failure that is not a stop (HTTP 500): worded without the log,
+    // and counted in oracle.state toward max_errors (across runs).
+    mock.set_quirk(ChatQuirk {
+        status: Some(500),
+        ..Default::default()
+    });
+    let st_e = d.join("e");
+    let o = decide_oracle(
+        &base,
+        &["-p", &texts[5]],
+        &["--state", s(&st_e)],
+        &[
+            ("OPENROUTER_API_KEY", FAKE_OPENROUTER_KEY),
+            ("RUST_LOG", "error"),
+        ],
+    );
+    assert!(o.status.success(), "{}", show(&o));
+    assert!(
+        stdout_of(&o).contains(&format!(
+            "hint:       the oracle call failed: OpenRouter answered HTTP 500 (http_500); `cortiq decision oracle check --base-url {base} --test-call` tests the setup"
+        )),
+        "{}",
+        show(&o)
+    );
+    let st = state_of(&st_e);
+    assert_eq!(
+        (st["stop_reason"].clone(), st["consecutive_errors"].clone()),
+        (Value::Null, json!(1))
+    );
+    assert_eq!(mock.chats(), 5);
+    mock.set_quirk(ChatQuirk::default());
+
+    // 7. A wrong key (HTTP 401) with the warnings hidden.
+    let st_f = d.join("f");
+    let o = decide_oracle(
+        &base,
+        &["-p", &texts[5]],
+        &["--state", s(&st_f)],
+        &[
+            ("OPENROUTER_API_KEY", WRONG_OPENROUTER_KEY),
+            ("RUST_LOG", "error"),
+        ],
+    );
+    assert!(o.status.success(), "{}", show(&o));
+    assert!(
+        stdout_of(&o).contains(&format!(
+            "a stop rule stopped the oracle in this run: OpenRouter refused the key in OPENROUTER_API_KEY (HTTP 401) (stop rule http_401). It stays off for state directory {} until resumed: fix the key (`cortiq decision oracle check --base-url {base}` tests it), then run again with --oracle-resume",
+            st_f.display()
+        )),
+        "{}",
+        show(&o)
+    );
+    assert_no_key_in(&show(&o), "a refused key");
+    for st in [&st_a, &st_b, &st_c, &st_e, &st_f] {
+        assert_no_bytes_of(FAKE_OPENROUTER_KEY, st);
+        assert_no_bytes_of(WRONG_OPENROUTER_KEY, st);
+        assert!(!st.join("LOCK").exists());
+    }
+
+    // A plain-http base URL off loopback is refused by its flag's name; a
+    // state directory that cannot be made is named on one line.
+    let o = decide_oracle("http://10.0.0.5:8080/api/v1", &["-p", &texts[0]], &[], &key);
+    assert!(
+        !o.status.success()
+            && stderr_of(&o).contains("--oracle-base-url: plain http only to a loopback address"),
+        "{}",
+        show(&o)
+    );
+    let o = decide_oracle(
+        &base,
+        &["-p", &texts[0]],
+        &["--state", "/dev/null/st"],
+        &key,
+    );
+    assert!(!o.status.success(), "{}", show(&o));
+    assert!(
+        stderr_of(&o).contains(
+            "(where `cortiq decide --oracle` keeps the oracle's ledger; --state DIR puts it elsewhere)"
+        ),
+        "{}",
+        show(&o)
+    );
+}
+
+/// Send `sig` to process `pid`.
+fn send_signal(pid: u32, sig: libc::c_int) {
+    // SAFETY: plain kill(2) on a child of this test.
+    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, sig) }, 0);
+}
+
+#[test]
+fn decide_oracle_releases_its_lock_when_interrupted_and_names_a_stale_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let mock = MockOpenRouter::start("travel", 1.3e-5);
+    let base = mock.base();
+    let key = [("OPENROUTER_API_KEY", FAKE_OPENROUTER_KEY)];
+    let texts = distinct_texts(6, 17, "lk", 0.97);
+    let state = d.join("state");
+    let lock = state.join("LOCK");
+
+    // 1. Interrupted while a call is in flight (SIGTERM on a batch, SIGINT
+    // on one text): the LOCK is released, the exit code says which signal.
+    mock.set_quirk(ChatQuirk {
+        delay: Some(Duration::from_secs(20)),
+        ..Default::default()
+    });
+    let input = write(
+        d,
+        "rows.jsonl",
+        &texts[..3]
+            .iter()
+            .map(|x| json!({"text": x}).to_string() + "\n")
+            .collect::<String>(),
+    );
+    let toy_path = s(&toy().path).to_string();
+    for (sig, code, args) in [
+        (libc::SIGTERM, 143, vec!["--input", s(&input)]),
+        (libc::SIGINT, 130, vec!["-p", texts[3].as_str()]),
+    ] {
+        let chats = mock.chats();
+        let mut a = vec!["decide", toy_path.as_str()];
+        a.extend(args);
+        a.extend([
+            "--skill",
+            "topics",
+            "--oracle",
+            ORACLE_MODEL,
+            "--oracle-base-url",
+            &base,
+            "--state",
+            s(&state),
+        ]);
+        let mut c = cortiq();
+        c.args(&a)
+            .env("OPENROUTER_API_KEY", FAKE_OPENROUTER_KEY)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = c.spawn().unwrap();
+        let t0 = Instant::now();
+        while mock.chats() == chats {
+            assert!(t0.elapsed() < Duration::from_secs(60), "no call was made");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(lock.exists(), "the run holds the LOCK during its call");
+        send_signal(child.id(), sig);
+        let o = child.wait_with_output().unwrap();
+        assert_eq!(o.status.code(), Some(code), "{}", show(&o));
+        assert!(!lock.exists(), "the LOCK is released\n{}", show(&o));
+        assert!(
+            stderr_of(&o).contains("the state directory's LOCK is released"),
+            "{}",
+            show(&o)
+        );
+        assert_no_key_in(&show(&o), "an interrupted run");
+    }
+    mock.set_quirk(ChatQuirk::default());
+    // The next run works; the reservations left open are charged in full.
+    let o = decide_oracle(&base, &["-p", &texts[4]], &["--state", s(&state)], &key);
+    assert!(o.status.success(), "{}", show(&o));
+    let ledger = std::fs::read_to_string(state.join("oracle.jsonl")).unwrap();
+    assert_eq!(ledger.matches("unsettled_at_start").count(), 2, "{ledger}");
+
+    // 2. A LOCK left by a process that is gone: named, with --break-lock.
+    let mut gone = Command::new("true").spawn().unwrap();
+    let dead = gone.id();
+    gone.wait().unwrap();
+    std::fs::write(&lock, format!("{dead} 0123abcd\n")).unwrap();
+    let o = decide_oracle(&base, &["-p", &texts[5]], &["--state", s(&state)], &key);
+    assert!(!o.status.success(), "{}", show(&o));
+    assert!(
+        stderr_of(&o).contains(&format!(
+            "has a LOCK left by pid {dead}, which is no longer running (an interrupted run): pass --break-lock to remove it"
+        )),
+        "{}",
+        show(&o)
+    );
+    let o = decide_oracle(
+        &base,
+        &["-p", &texts[5]],
+        &["--state", s(&state), "--break-lock"],
+        &key,
+    );
+    assert!(o.status.success(), "{}", show(&o));
+    assert!(
+        stderr_of(&o).contains(&format!(
+            "left by pid {dead}, which is not running (--break-lock)"
+        )),
+        "{}",
+        show(&o)
+    );
+    assert!(!lock.exists());
+
+    // 3. The LOCK of a running process (this test) is never broken.
+    let mine = format!("{} 0123abcd\n", std::process::id());
+    std::fs::write(&lock, &mine).unwrap();
+    let o = decide_oracle(
+        &base,
+        &["-p", &texts[5]],
+        &["--state", s(&state), "--break-lock"],
+        &key,
+    );
+    assert!(!o.status.success(), "{}", show(&o));
+    assert!(
+        stderr_of(&o).contains(&format!(
+            "belongs to pid {}, which is running",
+            std::process::id()
+        )),
+        "{}",
+        show(&o)
+    );
+    assert_eq!(std::fs::read_to_string(&lock).unwrap(), mine);
+    let o = decide_oracle(&base, &["-p", &texts[5]], &["--state", s(&state)], &key);
+    assert!(
+        !o.status.success()
+            && stderr_of(&o).contains("is held by pid")
+            && stderr_of(&o).contains("--break-lock"),
+        "{}",
+        show(&o)
+    );
+    // --break-lock needs --oracle.
+    let e = fails(&["decide", s(&toy().path), "-p", "x", "--break-lock"]);
+    assert!(e.contains("--oracle"), "{e}");
 }
 
 #[test]
@@ -4148,6 +4665,58 @@ fn decision_oracle_check_reports_each_failure_mode_and_the_test_call() {
     );
     assert_eq!(mock.chats(), 2);
 
+    // A test call that trips a stop rule fails the check even when it
+    // answered: a server stops its oracle at such a call. The report words
+    // it; no stop-rule warning on stderr.
+    for (quirk, code, text) in [
+        (
+            ChatQuirk {
+                cost: Some(1.0),
+                ..Default::default()
+            },
+            "cost_above_reservation",
+            "  ✗ test call  answered 'yes', but OpenRouter billed $1.00 for it, more than the $0.000",
+        ),
+        (
+            ChatQuirk {
+                status: Some(402),
+                ..Default::default()
+            },
+            "http_402",
+            "  ✗ test call  failed with the stop rule http_402: OpenRouter answered HTTP 402: the key in OPENROUTER_API_KEY has no credits left (add credits at https://openrouter.ai/settings/credits",
+        ),
+        (
+            ChatQuirk {
+                model: Some("other/model"),
+                ..Default::default()
+            },
+            "unexpected_model",
+            "  ✗ test call  failed with the stop rule unexpected_model, billed $0.000013: OpenRouter answered with a model other than deepseek/deepseek-v4.1-flash (a server stops its oracle at such a call)",
+        ),
+    ] {
+        mock.set_quirk(quirk);
+        let chats = mock.chats();
+        let o = check(&["--test-call"], &key);
+        assert_eq!(o.status.code(), Some(1), "{}", show(&o));
+        assert_eq!(mock.chats(), chats + 1, "exactly one call");
+        let out = stdout_of(&o);
+        assert!(out.contains(text), "{text}\n{}", show(&o));
+        assert!(
+            out.contains("NOT ready: 1 problem (✗ above)"),
+            "{}",
+            show(&o)
+        );
+        assert!(!stderr_of(&o).contains("stop rule"), "{}", show(&o));
+        let o = check(&["--test-call", "--json"], &key);
+        assert_eq!(o.status.code(), Some(1), "{}", show(&o));
+        let v = json_of(&stdout_of(&o));
+        assert_eq!(v["ready"], false, "{v}");
+        assert_eq!(v["test_call"]["ok"], false, "{v}");
+        assert_eq!(v["test_call"]["stop_reason"], code, "{v}");
+        assert_eq!(v["problems"][0]["code"], "test_call_failed", "{v}");
+    }
+    mock.set_quirk(ChatQuirk::default());
+
     // A key typed as the model or the variable's name is refused, never shown
     // and never sent.
     let before = mock.requests().len();
@@ -4172,7 +4741,8 @@ fn decision_oracle_check_reports_each_failure_mode_and_the_test_call() {
         &key,
     );
     assert!(
-        !o.status.success() && stderr_of(&o).contains("loopback"),
+        !o.status.success()
+            && stderr_of(&o).contains("--base-url: plain http only to a loopback address"),
         "{}",
         show(&o)
     );

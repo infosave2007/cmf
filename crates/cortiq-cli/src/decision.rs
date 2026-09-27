@@ -24,9 +24,13 @@
 //!   and printed nowhere. A text the gate accepts touches no network and no
 //!   state. The reservation ledger and the answer cache are the state
 //!   directory's (`--state DIR`, else `<FILE>.state`, under its `LOCK`);
-//!   `--oracle-budget` caps what the run spends (default $1.00); a server's
-//!   switch and stop reason in `oracle.state` hold (read, never written), the
-//!   run's own stops end its calls for the run, as in `decision learn`;
+//!   `--oracle-budget` caps what the run spends (default $1.00). The stop
+//!   rules hold as on a server: a stop (a refused key, no credit, another
+//!   model, a cost above the reservation, `max_errors` failures in a row —
+//!   counted across runs) is written to `oracle.state` and keeps the oracle
+//!   off for every later run on that directory until `--oracle-resume`; an
+//!   interrupted run releases the `LOCK` (SIGINT, SIGTERM, SIGHUP), and
+//!   `--break-lock` removes one left by a process that is gone;
 //! * `cortiq decision oracle check [--model M] [--key-env VAR] [--base-url
 //!   URL] [--test-call] [--json]`: is the oracle ready — the key, the account
 //!   (`GET /auth/key`), the model's endpoints, and with `--test-call` one tiny
@@ -42,7 +46,7 @@ use clap::{ArgGroup, Args, Subcommand};
 use cortiq_core::CmfModel;
 use cortiq_core::format::features;
 use cortiq_decision::build::{self, BuildReport, TrainOptions};
-use cortiq_decision::cascade::{Cascade, CascadeOptions};
+use cortiq_decision::cascade::Cascade;
 use cortiq_decision::config::{
     Config, DEFAULT_ORACLE_BASE_URL, DEFAULT_ORACLE_KEY_ENV, DEFAULT_ORACLE_MODEL,
 };
@@ -57,7 +61,7 @@ use cortiq_decision::keys::{
 use cortiq_decision::learn::{self, OfflineOptions, OfflineReport};
 use cortiq_decision::ledger::UsageLedger;
 use cortiq_decision::manifest::{Gate, SkillManifest, TaskState};
-use cortiq_decision::oracle::{self, LedgerTotals};
+use cortiq_decision::oracle::{self, LedgerTotals, OracleState};
 use cortiq_decision::oracle_setup::{self, CheckOptions, OracleFlags, OracleSetup, host_of, usd};
 use cortiq_decision::protocol::{self, ApiError, FeedbackRequest, MODEL_ID, model_name};
 use cortiq_decision::service::{
@@ -393,6 +397,18 @@ pub struct DecideOracleArgs {
     /// endpoint]
     #[arg(long, value_name = "IN,OUT", requires = "oracle", value_parser = parse_max_price)]
     pub oracle_max_price: Option<(f64, f64)>,
+    /// With --oracle: switch the oracle of the state directory on again after
+    /// the fix of what stopped it — a stop rule (a refused key, no credit,
+    /// another model, a cost above the reservation, failures in a row) keeps
+    /// it off for every later run until then. As POST /v1/admin/oracle
+    /// {"enabled":true} on a server of that directory
+    #[arg(long, requires = "oracle")]
+    pub oracle_resume: bool,
+    /// With --oracle: remove the state directory's LOCK left by a process
+    /// that is no longer running (an interrupted run); the LOCK of a running
+    /// process is never removed
+    #[arg(long, requires = "oracle")]
+    pub break_lock: bool,
 }
 
 impl DecideOracleArgs {
@@ -464,11 +480,176 @@ pub fn run_decide(a: &DecideArgs) -> Result<()> {
         other => other,
     };
     let model = open_model(&a.model, read_state, Verify::Light)?;
+    if let Some(f) = oracle.as_ref().filter(|_| a.oracle.oracle_resume) {
+        let root = a
+            .state
+            .clone()
+            .unwrap_or_else(|| StateDir::default_for(&a.model));
+        resume_oracle(&root, f, a.oracle.break_lock)?;
+    }
     match (&a.input, oracle) {
         (Some(input), None) => decide_batch(&model, a, input),
         (Some(input), Some(f)) => decide_batch_oracle(model, a, input, &f),
         (None, oracle) => decide_one(model, a, oracle.as_ref()),
     }
+}
+
+/// `--oracle-resume`: the oracle of the state directory switched on again
+/// (its stop cleared) under the directory's `LOCK`, before the run.
+fn resume_oracle(root: &Path, flags: &OracleFlags, break_lock: bool) -> Result<()> {
+    let file = root.join(cortiq_decision::statedir::ORACLE_STATE_FILE);
+    if !file.exists() {
+        eprintln!(
+            "oracle: nothing to resume — {} has no oracle.state (the oracle was never stopped there)",
+            root.display()
+        );
+        return Ok(());
+    }
+    let dir = StateDir::open(root)?;
+    let _lock = take_lock(&dir, break_lock)?;
+    let key_env = flags.key_env.as_deref().unwrap_or(DEFAULT_ORACLE_KEY_ENV);
+    match oracle::resume_state_file(&dir.oracle_state_path())? {
+        Some(before) => eprintln!(
+            "oracle: resumed — the oracle of state directory {} was {}; it may be called again",
+            root.display(),
+            off_text(&before, key_env, &flags.model)
+        ),
+        None => eprintln!(
+            "oracle: nothing to resume — the oracle of state directory {} is not stopped",
+            root.display()
+        ),
+    }
+    Ok(())
+}
+
+/// Why `oracle.state` keeps the oracle off, in words.
+fn off_text(st: &OracleState, key_env: &str, model: &str) -> String {
+    match &st.stop_reason {
+        Some(r) => format!(
+            "stopped by the stop rule {r}: {}",
+            oracle_setup::explain_oracle_error(r, key_env, model)
+        ),
+        None => "switched off by a server's admin API".to_string(),
+    }
+}
+
+/// Whether process `pid` runs on this host (`None`: cannot tell).
+#[cfg(unix)]
+fn pid_running(pid: &str) -> Option<bool> {
+    let pid: libc::pid_t = pid.parse().ok().filter(|p| *p > 0)?;
+    // SAFETY: signal 0 sends nothing; it only checks that the process exists.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return Some(true);
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => Some(false),
+        Some(libc::EPERM) => Some(true),
+        _ => None,
+    }
+}
+
+#[cfg(not(unix))]
+fn pid_running(_pid: &str) -> Option<bool> {
+    None
+}
+
+/// The pid in the state directory's `LOCK`, if there is one.
+fn lock_holder(dir: &StateDir) -> Option<String> {
+    let text = std::fs::read_to_string(dir.lock_path()).ok()?;
+    Some(
+        text.split_whitespace()
+            .next()
+            .unwrap_or("unknown")
+            .to_string(),
+    )
+}
+
+/// The state directory's `LOCK` for `cortiq decide --oracle`: one process per
+/// directory keeps the oracle's budget exact. `--break-lock` removes a lock
+/// whose process is gone, never one of a running process; a refusal says
+/// which case it is and what to do.
+fn take_lock(dir: &StateDir, break_lock: bool) -> Result<StateLock> {
+    let holder = if break_lock { lock_holder(dir) } else { None };
+    if let Some(pid) = &holder
+        && pid_running(pid) == Some(true)
+    {
+        bail!(
+            "--break-lock: the LOCK of state directory {} belongs to pid {pid}, which is running \
+             (a `cortiq serve`, or another `cortiq decide --oracle`); it is not removed. Stop that \
+             process, or give this run a directory of its own with --state DIR",
+            dir.root().display()
+        );
+    }
+    match dir.lock(break_lock) {
+        Ok(lock) => {
+            if let Some(pid) = holder {
+                eprintln!(
+                    "warning: removed the LOCK of state directory {} left by pid {pid}, which is not running (--break-lock)",
+                    dir.root().display()
+                );
+            }
+            Ok(lock)
+        }
+        Err(e) => Err(match e.downcast_ref::<Locked>() {
+            Some(l) => match pid_running(&l.pid) {
+                Some(false) => anyhow::anyhow!(
+                    "state directory {} has a LOCK left by pid {}, which is no longer running (an \
+                     interrupted run): pass --break-lock to remove it, or give this run a directory \
+                     of its own with --state DIR",
+                    l.dir,
+                    l.pid
+                ),
+                _ => anyhow::anyhow!(
+                    "state directory {} is held by pid {} (a running `cortiq serve`, or another \
+                     `cortiq decide --oracle`): one process per state directory keeps the oracle's \
+                     budget exact. Ask that server (POST /v1/decisions), wait for that run, or give \
+                     this run a directory of its own with --state DIR. A LOCK left by a process that \
+                     is gone is removed with --break-lock",
+                    l.dir,
+                    l.pid
+                ),
+            },
+            None => e,
+        }),
+    }
+}
+
+/// On SIGINT, SIGTERM or SIGHUP while `cortiq decide --oracle` holds the
+/// state directory's `LOCK`: remove it and exit (130, 143, 129), so the next
+/// run finds the directory free. The ledger needs nothing: a call in flight
+/// has its reservation line, charged in full when the ledger is next opened.
+fn release_lock_on_signal(lock: &StateLock) {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let _in_runtime = rt.enter();
+        let (Ok(mut int), Ok(mut term), Ok(mut hup)) = (
+            signal(SignalKind::interrupt()),
+            signal(SignalKind::terminate()),
+            signal(SignalKind::hangup()),
+        ) else {
+            return;
+        };
+        let release = lock.release_handle();
+        rt.spawn(async move {
+            let (name, code) = tokio::select! {
+                _ = int.recv() => ("SIGINT", 130),
+                _ = term.recv() => ("SIGTERM", 143),
+                _ = hup.recv() => ("SIGHUP", 129),
+            };
+            if release.release() {
+                eprintln!(
+                    "\ninterrupted ({name}): the state directory's LOCK is released; a call in flight is charged its full reservation"
+                );
+            }
+            std::process::exit(code);
+        });
+    }
+    #[cfg(not(unix))]
+    let _ = lock;
 }
 
 fn decide_batch(model: &DecisionModel, a: &DecideArgs, input: &Path) -> Result<()> {
@@ -541,7 +722,13 @@ fn decide_batch_oracle(
     let skill = eval::select_skill(current.model(), a.skill.as_deref())?;
     let ev = Evaluator::new(current.model(), &skill)?;
     let inputs = eval::read_input(input)?;
-    let run = OracleRun::open(&handle, &a.model, a.state.as_deref(), flags)?;
+    let run = OracleRun::open(
+        &handle,
+        &a.model,
+        a.state.as_deref(),
+        flags,
+        a.oracle.break_lock,
+    )?;
     eprintln!("{}", run.start_line());
     let principal = OracleRun::principal();
     let mut tally = BatchTally::default();
@@ -698,9 +885,8 @@ impl BatchTally {
             .iter()
             .map(|(r, n)| format!("{r} {n}"))
             .collect();
-        let (spent, calls) = run.totals();
         let mut s = format!(
-            "oracle {} via {}: the gate rejected {} of {} rows: {} answered by the oracle, {} from its cache, {} abstained{}; {} spent in this run ({} call{}), budget {}",
+            "oracle {} via {}: the gate rejected {} of {} rows: {} answered by the oracle, {} from its cache, {} abstained{}; {}",
             run.model,
             host_of(&run.base_url),
             self.rejected,
@@ -713,14 +899,8 @@ impl BatchTally {
             } else {
                 format!(" ({})", reasons.join(", "))
             },
-            usd(spent),
-            calls,
-            if calls == 1 { "" } else { "s" },
-            usd(run.budget)
+            run.spend_text()
         );
-        if let Some(l) = &run.ledger {
-            s.push_str(&format!("; ledger {}", l.display()));
-        }
         if self.labelled > 0 {
             s.push_str(&format!(
                 "\nanswers (local + oracle): correct {}/{} = {:.2}%",
@@ -770,10 +950,26 @@ impl Escalator for NoKeyOracle {
 /// reservation ledger.
 pub const DECIDE_ACCOUNT: &str = "cortiq-decide";
 
+/// Money and calls of one run and of its ledger.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct RunTotals {
+    /// Charged in this run (USD) …
+    spent: f64,
+    /// … of which the full reservations of failed calls that reported no
+    /// cost (OpenRouter may not have billed them, as for a refused key).
+    unknown_cost: f64,
+    calls: u64,
+    /// Everything the ledger holds (earlier runs included).
+    ledger_spent: f64,
+    ledger_calls: u64,
+}
+
 /// The oracle of one `cortiq decide --oracle` run: the server's cascade and
 /// client over the state directory (`--state DIR`, else `<FILE>.state`,
 /// under its `LOCK` for the run), with the budget and call limit of this run
-/// on top of what its ledger already holds; learning is off. Without the key,
+/// on top of what its ledger already holds; learning is off. The stop rules
+/// hold as on a server: a stop is written to `oracle.state` and keeps the
+/// oracle off for later runs until `--oracle-resume`. Without the key,
 /// [`NoKeyOracle`] (no network, no state).
 struct OracleRun {
     svc: DecisionService,
@@ -792,9 +988,10 @@ struct OracleRun {
     price_note: Option<String>,
     /// The state directory (`None` without the key).
     state_root: Option<PathBuf>,
-    /// A server's switch or stop reason found in `oracle.state` at the start
-    /// (it holds for the run): "switched off …" or "stopped by a stop rule …".
-    inherited: Option<String>,
+    /// `oracle.state` at the start when it kept the oracle off (a stop of an
+    /// earlier run or a server, or a server's admin switch): it holds for the
+    /// run.
+    inherited: Option<OracleState>,
     /// Released last, after the cascade has written its last line.
     _lock: Option<StateLock>,
 }
@@ -805,6 +1002,7 @@ impl OracleRun {
         model_path: &Path,
         state: Option<&Path>,
         flags: &OracleFlags,
+        break_lock: bool,
     ) -> Result<Self> {
         let mut cfg = Config::default();
         // `decide` never teaches the model: the oracle's answers are cached,
@@ -844,37 +1042,24 @@ impl OracleRun {
             .unwrap_or_else(|| StateDir::default_for(model_path));
         let dir = StateDir::open(&root).with_context(|| {
             format!(
-                "state directory {} (where `cortiq decide --oracle` keeps the oracle's ledger;                  --state DIR puts it elsewhere)",
+                "state directory {} (where `cortiq decide --oracle` keeps the oracle's ledger; \
+                 --state DIR puts it elsewhere)",
                 root.display()
             )
         })?;
-        let lock = dir
-            .lock(false)
-            .map_err(|e| match e.downcast_ref::<Locked>() {
-                Some(l) => anyhow::anyhow!(
-                    "state directory {} is held by pid {} (a running `cortiq serve`?): one process \
-                 per state directory keeps the oracle's budget exact. Ask that server (POST \
-                 /v1/decisions), stop it, or give this run a directory of its own with --state DIR",
-                    l.dir,
-                    l.pid
-                ),
-                None => e,
-            })?;
+        let lock = take_lock(&dir, break_lock)?;
+        release_lock_on_signal(&lock);
         let ledger = dir.oracle_ledger_path();
         let before = oracle::ledger_totals(&ledger)?;
         let (budget, max_calls) = (cfg.oracle.budget_usd, cfg.oracle.max_calls);
         // The run's budget and calls come on top of what the ledger holds.
         cfg.oracle.budget_usd = before.spent + budget;
         cfg.oracle.max_calls = before.calls.saturating_add(max_calls);
-        let cascade = Cascade::open_run(Arc::clone(handle), &cfg, dir, CascadeOptions::default())?;
-        // A server's switch and stop reason hold (read, never written).
+        // The server's cascade and client, `oracle.state` included: a stop of
+        // this run is written there and holds for later runs, as on a server.
+        let cascade = Cascade::open(Arc::clone(handle), &cfg, dir)?;
         let st = cascade.oracle().state();
-        let inherited = if !st.enabled {
-            Some("switched off by a server's admin API".to_string())
-        } else {
-            st.stop_reason
-                .map(|r| format!("stopped by a stop rule ({r})"))
-        };
+        let inherited = st.is_off().then_some(st);
         let esc: Arc<dyn Escalator> = cascade.clone();
         Ok(Self {
             svc: DecisionService::open(Arc::clone(handle), cfg.clone(), Some(esc))?,
@@ -893,16 +1078,52 @@ impl OracleRun {
         })
     }
 
-    /// What to do about a server's switch or stop found at the start.
+    fn explain(&self, code: &str) -> String {
+        oracle_setup::explain_oracle_error(code, &self.key_env, &self.model)
+    }
+
+    /// "fix …, then " before `run again with --oracle-resume`.
+    fn fix_first(&self, reason: Option<&str>) -> String {
+        match reason {
+            Some("http_401" | "http_403") => format!(
+                "fix the key (`{}` tests it), then ",
+                self.check_command(false)
+            ),
+            Some("http_402") => "add credits, then ".to_string(),
+            Some(_) => format!(
+                "after the fix (`{}` shows what OpenRouter answers) ",
+                self.check_command(true)
+            ),
+            None => String::new(),
+        }
+    }
+
+    /// How the oracle of this run's state directory is switched on again.
+    fn resume_text(&self, reason: Option<&str>) -> String {
+        format!(
+            "{}run again with --oracle-resume (a server of that directory: POST /v1/admin/oracle {{\"enabled\":true}})",
+            self.fix_first(reason)
+        )
+    }
+
+    /// What to do about a stop or switch-off found at the start.
     fn inherited_hint(&self) -> Option<String> {
-        let why = self.inherited.as_ref()?;
+        let st = self.inherited.as_ref()?;
         let root = self.state_root.as_ref()?;
         Some(format!(
-            "the oracle of state directory {} was {why} before this run (its oracle.state, kept by a server): after the fix, POST /v1/admin/oracle {{\"enabled\":true}} on a server of that directory (or removing {}) resumes it; --state DIR gives this run a directory of its own",
+            "the oracle of state directory {} is {} (recorded in its oracle.state by an earlier run or a server). It stays off until resumed: {}; --state DIR gives this run a directory of its own",
             root.display(),
-            root.join(cortiq_decision::statedir::ORACLE_STATE_FILE)
-                .display()
+            off_text(st, &self.key_env, &self.model),
+            self.resume_text(st.stop_reason.as_deref())
         ))
+    }
+
+    /// The stop rule that fired in this run (it is in `oracle.state` now).
+    fn new_stop(&self) -> Option<String> {
+        if self.inherited.is_some() {
+            return None;
+        }
+        self.cascade.as_ref()?.oracle().state().stop_reason
     }
 
     /// Who asks: the operator of this command line (the oracle allowed, no
@@ -920,18 +1141,54 @@ impl OracleRun {
         self.svc.oracle_status()
     }
 
-    /// USD charged and calls made in this run (the ledger's own counting).
-    fn totals(&self) -> (f64, u64) {
+    /// Money and calls of this run (the ledger's own counting) and of the
+    /// whole ledger.
+    fn totals(&self) -> RunTotals {
         match &self.cascade {
             Some(c) => {
                 let t = c.oracle().totals();
-                (
-                    (t.spent - self.before.spent).max(0.0),
-                    t.calls.saturating_sub(self.before.calls),
-                )
+                RunTotals {
+                    spent: (t.spent - self.before.spent).max(0.0),
+                    unknown_cost: (t.unknown_cost - self.before.unknown_cost).max(0.0),
+                    calls: t.calls.saturating_sub(self.before.calls),
+                    ledger_spent: t.spent,
+                    ledger_calls: t.calls,
+                }
             }
-            None => (0.0, 0),
+            None => RunTotals::default(),
         }
+    }
+
+    /// "$X spent in this run (N calls), budget $B; ledger PATH: $T over M
+    /// calls in all" (a reservation charged for a failed call with no
+    /// reported cost is named as such).
+    fn spend_text(&self) -> String {
+        let t = self.totals();
+        let unknown = if t.unknown_cost > 0.0 {
+            format!(
+                "; {} of it is the reservation of failed calls that reported no cost, likely not billed",
+                usd(t.unknown_cost)
+            )
+        } else {
+            String::new()
+        };
+        let mut s = format!(
+            "{} spent in this run ({} call{}{unknown}), budget {}",
+            usd(t.spent),
+            t.calls,
+            if t.calls == 1 { "" } else { "s" },
+            usd(self.budget)
+        );
+        if let Some(l) = &self.ledger {
+            s.push_str(&format!(
+                "; ledger {}: {} over {} call{} in all",
+                l.display(),
+                usd(t.ledger_spent),
+                t.ledger_calls,
+                if t.ledger_calls == 1 { "" } else { "s" }
+            ));
+        }
+        s
     }
 
     fn max_price(&self) -> Option<(f64, f64)> {
@@ -990,7 +1247,8 @@ impl OracleRun {
         }
     }
 
-    /// What to do about the refusals behind `flags` (never the key).
+    /// What to do about the refusals behind `flags` and a stop rule that
+    /// fired in this run (never the key).
     fn hint(&self, flags: &[String]) -> Option<String> {
         let has = |f: &str| flags.iter().any(|x| x == f);
         if has("no_key") {
@@ -1006,8 +1264,20 @@ impl OracleRun {
                 return Some(h);
             }
         }
-        let (spent, calls) = self.totals();
-        if has("budget") && calls == 0 {
+        // A stop of this run: also after an answered call (a cost above its
+        // reservation keeps the answer).
+        if let Some(r) = self.new_stop() {
+            return Some(format!(
+                "a stop rule stopped the oracle in this run: {} (stop rule {r}). It stays off for state directory {} until resumed: {}",
+                self.explain(&r),
+                self.state_root
+                    .as_ref()
+                    .map_or("-".into(), |p| p.display().to_string()),
+                self.resume_text(Some(&r))
+            ));
+        }
+        let t = self.totals();
+        if has("budget") && t.calls == 0 {
             let least = self
                 .cascade
                 .as_ref()
@@ -1026,26 +1296,20 @@ impl OracleRun {
         if has("budget") {
             return Some(format!(
                 "the oracle budget of this run is used up ({} of {} spent, {} of {} calls): pass a larger --oracle-budget or --oracle-max-calls",
-                usd(spent),
+                usd(t.spent),
                 usd(self.budget),
-                calls,
+                t.calls,
                 self.max_calls
             ));
         }
-        if has("stopped") {
-            let reason = self
+        if has(cortiq_decision::service::FLAG_ORACLE_UNAVAILABLE) {
+            let why = self
                 .cascade
                 .as_ref()
-                .and_then(|c| c.oracle().state().stop_reason)
-                .unwrap_or_else(|| "?".into());
+                .and_then(|c| c.oracle().last_error())
+                .map_or_else(|| "no error code".to_string(), |c| self.explain(&c));
             return Some(format!(
-                "a stop rule stopped the oracle in this run ({reason}); `{}` shows what is wrong",
-                self.check_command(true)
-            ));
-        }
-        if has(cortiq_decision::service::FLAG_ORACLE_UNAVAILABLE) {
-            return Some(format!(
-                "the oracle call failed (its error code is in the warning above); `{}` tests the setup",
+                "the oracle call failed: {why}; `{}` tests the setup",
                 self.check_command(true)
             ));
         }
@@ -1054,7 +1318,7 @@ impl OracleRun {
 
     /// `cmf.oracle` of `--json` (never the key).
     fn json(&self) -> Value {
-        let (spent, calls) = self.totals();
+        let t = self.totals();
         json!({
             "model": self.model,
             "asked": true,
@@ -1062,27 +1326,25 @@ impl OracleRun {
             "key_env": self.key_env,
             "base_url": self.base_url,
             "budget_usd": self.budget,
-            "spent_usd": spent,
-            "calls": calls,
+            "spent_usd": t.spent,
+            "unknown_cost_usd": t.unknown_cost,
+            "calls": t.calls,
             "max_calls": self.max_calls,
             "max_price": self.max_price().map(|(p, c)| json!({"prompt": p, "completion": c})),
             "ledger": self.ledger.as_ref().map(|l| l.display().to_string()),
+            "ledger_spent_usd": self.ledger.as_ref().map(|_| t.ledger_spent),
+            "ledger_calls": self.ledger.as_ref().map(|_| t.ledger_calls),
         })
     }
 
     /// The `oracle:` line of the human output (`None` without the key).
     fn line(&self) -> Option<String> {
-        let ledger = self.ledger.as_ref()?;
-        let (spent, calls) = self.totals();
+        self.ledger.as_ref()?;
         Some(format!(
-            "{} via {}: {} spent in this run ({} call{}), budget {}; ledger {}",
+            "{} via {}: {}",
             self.model,
             host_of(&self.base_url),
-            usd(spent),
-            calls,
-            if calls == 1 { "" } else { "s" },
-            usd(self.budget),
-            ledger.display()
+            self.spend_text()
         ))
     }
 }
@@ -1178,7 +1440,13 @@ fn decide_one(model: DecisionModel, a: &DecideArgs, oracle: Option<&OracleFlags>
         };
         return print_decided(&decided, a.json, Some(&view));
     }
-    let run = OracleRun::open(&handle, &a.model, a.state.as_deref(), flags)?;
+    let run = OracleRun::open(
+        &handle,
+        &a.model,
+        a.state.as_deref(),
+        flags,
+        a.oracle.break_lock,
+    )?;
     let mut decided = run
         .svc
         .decide(&req, &OracleRun::principal())
@@ -2848,6 +3116,8 @@ mod tests {
             "http://127.0.0.1:9/api/v1",
             "--oracle-max-price",
             "0.2,0.8",
+            "--oracle-resume",
+            "--break-lock",
             "--state",
             "st",
         ])
@@ -2855,6 +3125,7 @@ mod tests {
         .command
         {
             Commands::Decide(a) => {
+                assert!(a.oracle.oracle_resume && a.oracle.break_lock);
                 let f = a.oracle.flags().unwrap();
                 assert_eq!(f.model, "deepseek/deepseek-v4.1-flash");
                 assert_eq!((f.budget_usd, f.max_calls), (Some(0.5), Some(20)));
@@ -2879,6 +3150,8 @@ mod tests {
             &["--oracle-key-env", "K"],
             &["--oracle-base-url", "http://127.0.0.1:9"],
             &["--oracle-max-price", "1,2"],
+            &["--oracle-resume"],
+            &["--break-lock"],
         ] {
             let mut v = vec!["cortiq", "decide", "d.cmf", "-p", "x"];
             v.extend_from_slice(extra);

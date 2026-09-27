@@ -53,7 +53,11 @@
 //! (free, no key) — listed, structured outputs, the cheapest price; (d) with
 //! `--test-call` only, one tiny structured call ([`test_call`]: a two-option
 //! choice, `max_tokens` 16, through the oracle client and its reservation)
-//! and its cost. Ready only when every check passed.
+//! and its cost. Ready only when every check passed — a test call that
+//! answered but tripped a stop rule (a cost above its reservation, another
+//! model) is a failure, since a server would stop its oracle at that call.
+//! [`explain_oracle_error`] words a stop reason or a failed call's error code
+//! for both commands.
 
 use crate::config::Config;
 use crate::oracle::{KeyLookup, max_tokens, reservation_usd};
@@ -609,6 +613,8 @@ pub fn prepare(
         o.api_key_env = k.clone();
     }
     if let Some(u) = &flags.base_url {
+        // Named by its flag, not by the configuration field it sets.
+        crate::config::check_oracle_base_url("--oracle-base-url", u)?;
         o.base_url = u.clone();
     }
     if flags.no_learning {
@@ -769,6 +775,37 @@ pub const TEST_CALL_BUDGET_USD: f64 = 0.01;
 pub const TEST_CALL_STATE: &str = "Hello there, how are you today?";
 /// Where OpenRouter keys are created (for messages).
 pub const KEYS_PAGE: &str = "https://openrouter.ai/keys";
+/// Where OpenRouter credits are added (for messages).
+pub const CREDITS_PAGE: &str = "https://openrouter.ai/settings/credits";
+
+/// A stop reason of [`crate::oracle`] (`http_401`, `unexpected_model`,
+/// `cost_above_reservation`, `max_errors`, …) or the error code of a failed
+/// call, in words; `key_env` names the key's variable (never the key),
+/// `model` the oracle model.
+pub fn explain_oracle_error(code: &str, key_env: &str, model: &str) -> String {
+    let status = code.strip_prefix("http_").unwrap_or("");
+    match code {
+        "http_401" | "http_403" => {
+            format!("OpenRouter refused the key in {key_env} (HTTP {status})")
+        }
+        "http_402" => format!(
+            "OpenRouter answered HTTP 402: the key in {key_env} has no credits left (add credits at \
+             {CREDITS_PAGE}, or raise the key's own limit)"
+        ),
+        "unexpected_model" => format!("OpenRouter answered with a model other than {model}"),
+        "cost_above_reservation" => "the provider billed a call more than was reserved for it \
+             (the reservation assumes the max price in/out; --oracle-max-price IN,OUT sets it)"
+            .to_string(),
+        "max_errors" => "too many oracle calls failed in a row (oracle.max_errors)".to_string(),
+        "http_429" => "OpenRouter rate-limited the call (HTTP 429)".to_string(),
+        c if c.starts_with("transport_") || c.starts_with("read_") => format!(
+            "the request did not complete ({c}: the network, a firewall, or the deadline \
+             oracle.deadline_s)"
+        ),
+        c if !status.is_empty() => format!("OpenRouter answered HTTP {status} ({c})"),
+        c => format!("the answer was not usable ({c})"),
+    }
+}
 
 /// `{base_url}/auth/key`.
 pub fn auth_key_url(base_url: &str) -> String {
@@ -941,18 +978,59 @@ pub struct TestCall {
     /// A short error code (`http_402`, `transport_io`, `invalid_json`, a
     /// refusal such as `budget`), never content.
     pub error: Option<String>,
+    /// The stop rule the call tripped (`cost_above_reservation`,
+    /// `unexpected_model`, `http_401`, …): a server would stop its oracle at
+    /// such a call, so the check fails even when the call answered.
+    pub stop: Option<String>,
 }
 
 impl TestCall {
+    /// Answered and tripped no stop rule.
+    pub fn ok(&self) -> bool {
+        self.answered && self.stop.is_none()
+    }
+
     pub fn to_json(&self) -> Value {
         json!({
-            "ok": self.answered,
+            "ok": self.ok(),
+            "answered": self.answered,
             "choice": self.choice,
             "cost_usd": self.cost_usd,
             "reserved_usd": self.reserved_usd,
             "provider": self.provider,
             "latency_ms": self.latency_ms,
             "error": self.error,
+            "stop_reason": self.stop,
+        })
+    }
+
+    /// What went wrong, in words (`None`: ok).
+    fn problem(&self, key_env: &str, model: &str) -> Option<String> {
+        if self.ok() {
+            return None;
+        }
+        let why = |code: &str| explain_oracle_error(code, key_env, model);
+        let billed = match (self.answered, self.cost_usd) {
+            (false, Some(c)) => format!(", billed {}", usd(c)),
+            _ => String::new(),
+        };
+        Some(match (&self.stop, &self.error) {
+            (Some(stop), _) if stop == "cost_above_reservation" && self.answered => format!(
+                "answered '{}', but OpenRouter billed {} for it, more than the {} reserved at \
+                 the max price: a server stops its oracle at such a call (stop rule \
+                 cost_above_reservation). Give a higher --oracle-max-price IN,OUT, or pick \
+                 another model",
+                self.choice.as_deref().unwrap_or("?"),
+                self.cost_usd.map_or("?".to_string(), usd),
+                usd(self.reserved_usd)
+            ),
+            (Some(stop), _) => format!(
+                "failed with the stop rule {stop}{billed}: {} (a server stops its oracle at \
+                 such a call)",
+                why(stop)
+            ),
+            (None, Some(code)) => format!("failed ({code}{billed}): {}", why(code)),
+            (None, None) => "no answer".to_string(),
         })
     }
 }
@@ -996,8 +1074,9 @@ pub fn test_call(oracle: &crate::config::OracleConfig, key: KeyLookup) -> Result
         })),
     };
     let ledger = temp_ledger()?;
-    let outcome = (|| -> Result<CallOutcome> {
-        let client = OracleClient::open(&cfg, &ledger, None, key)?;
+    let outcome = (|| -> Result<(CallOutcome, Option<String>)> {
+        // The report says what a fired stop rule means: no WARN line.
+        let client = OracleClient::open(&cfg, &ledger, None, key)?.quiet_stops();
         let caller = Caller {
             request_id: "oracle-check",
             account: "oracle-check",
@@ -1005,7 +1084,11 @@ pub fn test_call(oracle: &crate::config::OracleConfig, key: KeyLookup) -> Result
             key_budget_usd: None,
             credit_left_usd: None,
         };
-        Ok(client.call(&caller, &[&q], &json!(TEST_CALL_STATE)))
+        let outcome = client.call(&caller, &[&q], &json!(TEST_CALL_STATE));
+        // `max_errors` is 1 here, so any failure stops the client: only the
+        // rules a server would apply to this call count.
+        let stop = client.state().stop_reason.filter(|r| r != "max_errors");
+        Ok((outcome, stop))
     })();
     let _ = std::fs::remove_file(&ledger);
     let body = crate::oracle::request_body(&cfg, &[&q], &json!(TEST_CALL_STATE));
@@ -1014,7 +1097,8 @@ pub fn test_call(oracle: &crate::config::OracleConfig, key: KeyLookup) -> Result
         max_tokens(cfg.max_tokens_per_question, 1),
         cfg.max_price()?,
     );
-    Ok(match outcome? {
+    let (outcome, stop) = outcome?;
+    Ok(match outcome {
         CallOutcome::Answered(a) => TestCall {
             answered: true,
             choice: a
@@ -1027,6 +1111,7 @@ pub fn test_call(oracle: &crate::config::OracleConfig, key: KeyLookup) -> Result
             provider: a.provider,
             latency_ms: Some(a.latency.as_secs_f64() * 1e3),
             error: None,
+            stop,
         },
         CallOutcome::Failed(f) => TestCall {
             answered: false,
@@ -1036,6 +1121,7 @@ pub fn test_call(oracle: &crate::config::OracleConfig, key: KeyLookup) -> Result
             provider: None,
             latency_ms: None,
             error: Some(f.error),
+            stop,
         },
         CallOutcome::Refused(r) => TestCall {
             answered: false,
@@ -1045,6 +1131,7 @@ pub fn test_call(oracle: &crate::config::OracleConfig, key: KeyLookup) -> Result
             provider: None,
             latency_ms: None,
             error: Some(r.flag().to_string()),
+            stop,
         },
     })
 }
@@ -1123,16 +1210,9 @@ impl CheckReport {
             v.push(("model", code, msg.clone()));
         }
         if let Some(Ok(t)) = &self.test_call
-            && !t.answered
+            && let Some(why) = t.problem(&o.key_env, &o.model)
         {
-            v.push((
-                "test_call",
-                "test_call_failed",
-                format!(
-                    "the test call failed ({})",
-                    t.error.as_deref().unwrap_or("no answer")
-                ),
-            ));
+            v.push(("test_call", "test_call_failed", why));
         }
         v
     }
@@ -1295,7 +1375,7 @@ impl CheckReport {
                 "not made (--test-call makes one tiny structured call, a small fraction of a cent)",
             ),
             Some(Err(why)) => line(&mut s, None, "test call", &format!("not made: {why}")),
-            Some(Ok(t)) if t.answered => line(
+            Some(Ok(t)) if t.ok() => line(
                 &mut s,
                 Some(true),
                 "test call",
@@ -1313,18 +1393,10 @@ impl CheckReport {
                         .unwrap_or_default()
                 ),
             ),
-            Some(Ok(t)) => line(
-                &mut s,
-                Some(false),
-                "test call",
-                &format!(
-                    "failed: {}{}",
-                    t.error.as_deref().unwrap_or("no answer"),
-                    t.cost_usd
-                        .map(|c| format!(" (billed {})", usd(c)))
-                        .unwrap_or_default()
-                ),
-            ),
+            Some(Ok(_)) => {
+                let why = failed("test_call").map_or("failed", |p| p.2.as_str());
+                line(&mut s, Some(false), "test call", why);
+            }
         }
         if problems.is_empty() {
             let flags = self.oracle_flags();
@@ -1375,6 +1447,7 @@ pub fn check(opts: &CheckOptions, key: &KeyLookup) -> Result<CheckReport> {
          not the key itself; the given value ({} bytes) is not shown",
         opts.key_env.len()
     );
+    crate::config::check_oracle_base_url("--base-url", &opts.base_url)?;
     let mut cfg = Config::default();
     cfg.oracle.model = opts.model.clone();
     cfg.oracle.api_key_env = opts.key_env.clone();

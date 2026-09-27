@@ -445,19 +445,20 @@ pub fn default_tiers() -> Vec<ComplexityTier> {
 /// `oracle.base_url`: https, or plain http to a loopback host only (a local
 /// proxy or mock) — the OpenRouter key (`Authorization`) and the questions
 /// travel in every request, as the client keys of `--shadow-of` do. No
-/// credentials, query or fragment.
-fn check_oracle_base_url(url: &str) -> Result<()> {
+/// credentials, query or fragment. `what` names the setting in the message:
+/// `oracle.base_url`, or the flag that gave it (`--oracle-base-url`).
+pub fn check_oracle_base_url(what: &str, url: &str) -> Result<()> {
     let Some((scheme, rest)) = url.split_once("://") else {
-        bail!("oracle.base_url must be an https URL");
+        bail!("{what} must be an https URL");
     };
     ensure!(
         !rest.contains(['?', '#']),
-        "oracle.base_url takes no query or fragment"
+        "{what} takes no query or fragment"
     );
     let authority = rest.split('/').next().unwrap_or_default();
     ensure!(
         !authority.is_empty() && !authority.contains('@'),
-        "oracle.base_url must name a host, without credentials"
+        "{what} must name a host, without credentials"
     );
     match scheme {
         "https" => Ok(()),
@@ -468,11 +469,11 @@ fn check_oracle_base_url(url: &str) -> Result<()> {
             };
             ensure!(
                 crate::shadow::is_loopback_host(host),
-                "oracle.base_url: plain http only to a loopback address (the OpenRouter key and the questions travel in every request); use https"
+                "{what}: plain http only to a loopback address (the OpenRouter key and the questions travel in every request); use https"
             );
             Ok(())
         }
-        _ => bail!("oracle.base_url must be an https URL"),
+        _ => bail!("{what} must be an https URL"),
     }
 }
 
@@ -600,7 +601,7 @@ impl Config {
         }
         // oracle
         let o = &self.oracle;
-        check_oracle_base_url(&o.base_url)?;
+        check_oracle_base_url("oracle.base_url", &o.base_url)?;
         check_env_name("oracle.api_key_env", &o.api_key_env)?;
         ensure!(
             !o.model.is_empty() && o.model.len() <= 256,
