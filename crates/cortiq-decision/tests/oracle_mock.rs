@@ -626,7 +626,8 @@ fn max_errors_in_a_row_stop_the_oracle() {
     assert_eq!(
         st.oracle_state(),
         json!({"enabled": true, "stop_reason": null, "stopped_unix": null,
-               "budget_usd": null, "max_calls": null, "consecutive_errors": 1}),
+               "budget_usd": null, "max_calls": null, "consecutive_errors": 1,
+               "last_error": "http_500"}),
         "one failure after a success does not stop"
     );
     assert_eq!(
@@ -667,15 +668,21 @@ fn failures_in_a_row_count_across_restarts_and_a_resume_clears_them() {
     );
     assert_eq!(st.oracle_state()["consecutive_errors"], 1);
     assert_eq!(st.oracle_state()["stop_reason"], Value::Null);
+    // The failure's code is kept with the count (a max_errors stop names it
+    // after a restart).
+    assert_eq!(st.oracle_state()["last_error"], "http_500");
     // A failed call with no reported cost is charged its reservation, and
-    // counted as such.
+    // counted as such; an HTTP 500 is not a refusal OpenRouter likely did
+    // not bill (as 401, 402, 403 and 429 are).
     let t = st.cascade.oracle().totals();
     assert!(
         t.unknown_cost > 0.0 && (t.unknown_cost - t.spent).abs() < 1e-15,
         "{t:?}"
     );
+    assert_eq!(t.refused_cost, 0.0, "{t:?}");
     let st = st.restart(&cfg);
     assert_eq!(st.cascade.oracle().totals().unknown_cost, t.unknown_cost);
+    assert_eq!(st.cascade.oracle().totals().refused_cost, 0.0);
     assert_eq!(st.cascade.oracle().last_error(), None, "in memory only");
     assert_eq!(
         flags(&st.decide(&topics_body(&r[1])).unwrap(), 0),
@@ -708,6 +715,7 @@ fn failures_in_a_row_count_across_restarts_and_a_resume_clears_them() {
             .expect("it was stopped");
         assert_eq!(before.stop_reason.as_deref(), Some("max_errors"));
         assert_eq!(before.consecutive_errors, 2);
+        assert_eq!(before.last_error.as_deref(), Some("http_500"));
         let after: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(
             after,
@@ -725,6 +733,21 @@ fn failures_in_a_row_count_across_restarts_and_a_resume_clears_them() {
     );
     assert_eq!(mock.hits(), 3);
     assert_eq!(st.oracle_state()["consecutive_errors"], 1);
+    // Only a count to clear (not stopped): it is cleared and reported as
+    // such, not as "nothing to resume".
+    let before = oracle::resume_state_file(&path)
+        .unwrap()
+        .expect("a count was cleared");
+    assert!(!before.is_off());
+    assert_eq!(
+        (before.consecutive_errors, before.last_error.as_deref()),
+        (1, Some("http_500"))
+    );
+    let after: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        (after.get("consecutive_errors"), after.get("last_error")),
+        (None, None)
+    );
 }
 
 // ------------------------------------------------------------------ bad answers

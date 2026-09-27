@@ -288,6 +288,42 @@ impl StateDir {
         bail!("could not take {} after breaking it", path.display())
     }
 
+    /// Take the `LOCK` in place of the stale one the caller checked, whose
+    /// content was `stale`: that lock is removed only while the file still
+    /// holds `stale`, so a lock another process took meanwhile (two runs
+    /// breaking the same stale lock at once) is never removed — this call
+    /// then fails with [`Locked`] for it. The file is moved aside by an atomic
+    /// rename before its content is compared; a lock that is not the stale
+    /// one is put back without replacing a newer one.
+    pub fn lock_replacing(&self, stale: &str) -> Result<StateLock> {
+        let path = self.lock_path();
+        let aside = self.root.join(format!("{LOCK_FILE}.breaking-{}", nonce()?));
+        match fs::rename(&path, &aside) {
+            Ok(()) => {
+                let moved = fs::read_to_string(&aside).unwrap_or_default();
+                if moved != stale {
+                    // Not ours to break: back where it was (never over a lock
+                    // taken in between), then the plain attempt names it.
+                    let back = fs::hard_link(&aside, &path).is_ok()
+                        || create_new_private(&path)
+                            .and_then(|mut f| f.write_all(moved.as_bytes()).and(f.sync_all()))
+                            .is_ok();
+                    if !back {
+                        tracing::warn!(
+                            lock = %path.display(),
+                            "could not put back a LOCK moved aside while breaking a stale one"
+                        );
+                    }
+                }
+                fs::remove_file(&aside).with_context(|| format!("remove {}", aside.display()))?;
+                sync_dir(&self.root)?;
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("move aside {}", path.display())),
+        }
+        self.lock(false)
+    }
+
     pub fn lock_path(&self) -> PathBuf {
         self.root.join(LOCK_FILE)
     }

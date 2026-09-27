@@ -29,7 +29,8 @@
 //!   model, a cost above the reservation, `max_errors` failures in a row —
 //!   counted across runs) is written to `oracle.state` and keeps the oracle
 //!   off for every later run on that directory until `--oracle-resume`; an
-//!   interrupted run releases the `LOCK` (SIGINT, SIGTERM, SIGHUP), and
+//!   interrupted run releases the `LOCK` (SIGINT, SIGTERM, SIGHUP; a signal
+//!   inherited as ignored, as SIGHUP under `nohup`, stays ignored), and
 //!   `--break-lock` removes one left by a process that is gone;
 //! * `cortiq decision oracle check [--model M] [--key-env VAR] [--base-url
 //!   URL] [--test-call] [--json]`: is the oracle ready — the key, the account
@@ -508,26 +509,79 @@ fn resume_oracle(root: &Path, flags: &OracleFlags, break_lock: bool) -> Result<(
     let dir = StateDir::open(root)?;
     let _lock = take_lock(&dir, break_lock)?;
     let key_env = flags.key_env.as_deref().unwrap_or(DEFAULT_ORACLE_KEY_ENV);
-    match oracle::resume_state_file(&dir.oracle_state_path())? {
-        Some(before) => eprintln!(
-            "oracle: resumed — the oracle of state directory {} was {}; it may be called again",
+    let path = dir.oracle_state_path();
+    let limits = || {
+        oracle::read_state_file(&path)
+            .ok()
+            .and_then(|st| admin_limits_text(&st))
+            .map(|t| format!("; {t}"))
+            .unwrap_or_default()
+    };
+    match oracle::resume_state_file(&path)? {
+        Some(before) if before.is_off() => eprintln!(
+            "oracle: resumed — the oracle of state directory {} was {}; it may be called again{}",
             root.display(),
-            off_text(&before, key_env, &flags.model)
+            off_text(&before, key_env, &flags.model),
+            limits()
+        ),
+        Some(before) => eprintln!(
+            "oracle: the oracle of state directory {} was not stopped; cleared its {} failed call{} in a row{} (they count toward oracle.max_errors){}",
+            root.display(),
+            before.consecutive_errors,
+            if before.consecutive_errors == 1 {
+                ""
+            } else {
+                "s"
+            },
+            before
+                .last_error
+                .as_deref()
+                .map(|e| format!(
+                    " (the last: {})",
+                    oracle_setup::explain_oracle_error(e, key_env, &flags.model)
+                ))
+                .unwrap_or_default(),
+            limits()
         ),
         None => eprintln!(
-            "oracle: nothing to resume — the oracle of state directory {} is not stopped",
-            root.display()
+            "oracle: nothing to resume — the oracle of state directory {} is not stopped{}",
+            root.display(),
+            limits()
         ),
     }
     Ok(())
 }
+
+/// The admin limits of `oracle.state` in words (`None` without any): they
+/// count the whole ledger, earlier runs included, and only a server's admin
+/// API changes them.
+fn admin_limits_text(st: &OracleState) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(b) = st.budget_usd {
+        parts.push(format!("budget {}", usd(b)));
+    }
+    if let Some(c) = st.max_calls {
+        parts.push(format!("{c} call{}", if c == 1 { "" } else { "s" }));
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "admin limits kept in its oracle.state: {} over the whole ledger (set by a server's POST /v1/admin/oracle; {} there lifts them)",
+        parts.join(", "),
+        ADMIN_LIFT
+    ))
+}
+
+/// The admin request that lifts both admin limits of `oracle.state`.
+const ADMIN_LIFT: &str = r#"{"budget_usd":null,"max_calls":null}"#;
 
 /// Why `oracle.state` keeps the oracle off, in words.
 fn off_text(st: &OracleState, key_env: &str, model: &str) -> String {
     match &st.stop_reason {
         Some(r) => format!(
             "stopped by the stop rule {r}: {}",
-            oracle_setup::explain_oracle_error(r, key_env, model)
+            oracle_setup::explain_stop(r, st.last_error.as_deref(), key_env, model)
         ),
         None => "switched off by a server's admin API".to_string(),
     }
@@ -553,34 +607,61 @@ fn pid_running(_pid: &str) -> Option<bool> {
     None
 }
 
-/// The pid in the state directory's `LOCK`, if there is one.
-fn lock_holder(dir: &StateDir) -> Option<String> {
-    let text = std::fs::read_to_string(dir.lock_path()).ok()?;
-    Some(
-        text.split_whitespace()
-            .next()
-            .unwrap_or("unknown")
-            .to_string(),
+/// The pid of a `LOCK`'s content (`pid nonce`).
+fn lock_pid(content: &str) -> String {
+    content
+        .split_whitespace()
+        .next()
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+/// "If pid N is not a cortiq process …, remove LOCK by hand".
+fn remove_by_hand(dir: &StateDir, pid: &str) -> String {
+    format!(
+        "If pid {pid} is not a cortiq process (a LOCK left by a crash whose pid was reused), no \
+         cortiq process uses the directory: remove {} by hand",
+        dir.lock_path().display()
     )
 }
 
 /// The state directory's `LOCK` for `cortiq decide --oracle`: one process per
 /// directory keeps the oracle's budget exact. `--break-lock` removes a lock
-/// whose process is gone, never one of a running process; a refusal says
-/// which case it is and what to do.
+/// whose process is gone — only the one it checked, so two runs breaking the
+/// same stale lock never both proceed — and never one of a running process;
+/// a refusal says which case it is and what to do.
 fn take_lock(dir: &StateDir, break_lock: bool) -> Result<StateLock> {
-    let holder = if break_lock { lock_holder(dir) } else { None };
+    let stale = if break_lock {
+        std::fs::read_to_string(dir.lock_path()).ok()
+    } else {
+        None
+    };
+    let holder = stale.as_deref().map(lock_pid);
     if let Some(pid) = &holder
         && pid_running(pid) == Some(true)
     {
         bail!(
             "--break-lock: the LOCK of state directory {} belongs to pid {pid}, which is running \
              (a `cortiq serve`, or another `cortiq decide --oracle`); it is not removed. Stop that \
-             process, or give this run a directory of its own with --state DIR",
-            dir.root().display()
+             process, or give this run a directory of its own with --state DIR. {}",
+            dir.root().display(),
+            remove_by_hand(dir, pid)
         );
     }
-    match dir.lock(break_lock) {
+    if stale.as_deref().is_some_and(|c| c.trim().is_empty()) {
+        bail!(
+            "--break-lock: the LOCK of state directory {} is empty — a process may be taking it \
+             right now; it is not removed. If no cortiq process uses the directory, remove {} by \
+             hand",
+            dir.root().display(),
+            dir.lock_path().display()
+        );
+    }
+    let taken = match &stale {
+        Some(content) => dir.lock_replacing(content),
+        None => dir.lock(false),
+    };
+    match taken {
         Ok(lock) => {
             if let Some(pid) = holder {
                 eprintln!(
@@ -604,9 +685,10 @@ fn take_lock(dir: &StateDir, break_lock: bool) -> Result<StateLock> {
                      `cortiq decide --oracle`): one process per state directory keeps the oracle's \
                      budget exact. Ask that server (POST /v1/decisions), wait for that run, or give \
                      this run a directory of its own with --state DIR. A LOCK left by a process that \
-                     is gone is removed with --break-lock",
+                     is gone is removed with --break-lock. {}",
                     l.dir,
-                    l.pid
+                    l.pid,
+                    remove_by_hand(dir, &l.pid)
                 ),
             },
             None => e,
@@ -614,31 +696,64 @@ fn take_lock(dir: &StateDir, break_lock: bool) -> Result<StateLock> {
     }
 }
 
+/// Whether `sig` is ignored (`SIG_IGN`) in this process: inherited from
+/// `nohup` (SIGHUP) or from a non-interactive shell's background job
+/// (SIGINT). Such a signal must stay ignored.
+#[cfg(unix)]
+fn signal_ignored(sig: libc::c_int) -> bool {
+    // SAFETY: with a null new action, sigaction(2) only reads the current
+    // disposition into `old`, a zeroed plain-data struct.
+    unsafe {
+        let mut old: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(sig, std::ptr::null(), &mut old) == 0 && old.sa_sigaction == libc::SIG_IGN
+    }
+}
+
 /// On SIGINT, SIGTERM or SIGHUP while `cortiq decide --oracle` holds the
 /// state directory's `LOCK`: remove it and exit (130, 143, 129), so the next
-/// run finds the directory free. The ledger needs nothing: a call in flight
-/// has its reservation line, charged in full when the ledger is next opened.
+/// run finds the directory free. A signal the process inherited as ignored
+/// (`nohup`, a background job of a script) stays ignored and is not listened
+/// to: the run goes on, as without this handler. The ledger needs nothing: a
+/// call in flight has its reservation line, charged in full when the ledger
+/// is next opened.
 fn release_lock_on_signal(lock: &StateLock) {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{SignalKind, signal};
+        use tokio::signal::unix::{Signal, SignalKind, signal};
         let Ok(rt) = tokio::runtime::Handle::try_current() else {
             return;
         };
         let _in_runtime = rt.enter();
-        let (Ok(mut int), Ok(mut term), Ok(mut hup)) = (
-            signal(SignalKind::interrupt()),
-            signal(SignalKind::terminate()),
-            signal(SignalKind::hangup()),
-        ) else {
-            return;
+        // Checked before any registration: tokio's handler replaces the
+        // disposition for the rest of the process.
+        let listen = |kind: SignalKind, sig: libc::c_int| {
+            if signal_ignored(sig) {
+                None
+            } else {
+                signal(kind).ok()
+            }
         };
+        let mut int = listen(SignalKind::interrupt(), libc::SIGINT);
+        let mut term = listen(SignalKind::terminate(), libc::SIGTERM);
+        let mut hup = listen(SignalKind::hangup(), libc::SIGHUP);
+        if int.is_none() && term.is_none() && hup.is_none() {
+            return;
+        }
+        /// Resolves when `s` delivers; never for a signal not listened to.
+        async fn arrived(s: &mut Option<Signal>) {
+            if let Some(s) = s
+                && s.recv().await.is_some()
+            {
+                return;
+            }
+            std::future::pending::<()>().await
+        }
         let release = lock.release_handle();
         rt.spawn(async move {
             let (name, code) = tokio::select! {
-                _ = int.recv() => ("SIGINT", 130),
-                _ = term.recv() => ("SIGTERM", 143),
-                _ = hup.recv() => ("SIGHUP", 129),
+                () = arrived(&mut int) => ("SIGINT", 130),
+                () = arrived(&mut term) => ("SIGTERM", 143),
+                () = arrived(&mut hup) => ("SIGHUP", 129),
             };
             if release.release() {
                 eprintln!(
@@ -946,6 +1061,19 @@ impl Escalator for NoKeyOracle {
     }
 }
 
+/// The limit that refuses an oracle call for the budget.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Limit {
+    /// `--oracle-max-calls` of this run.
+    RunCalls,
+    /// `--oracle-budget` of this run.
+    RunBudget,
+    /// `max_calls` of `oracle.state` (a server's admin API), over the ledger.
+    AdminCalls(u64),
+    /// `budget_usd` of `oracle.state`, over the ledger.
+    AdminBudget(f64),
+}
+
 /// The account `cortiq decide --oracle` records its calls under in the
 /// reservation ledger.
 pub const DECIDE_ACCOUNT: &str = "cortiq-decide";
@@ -956,8 +1084,11 @@ struct RunTotals {
     /// Charged in this run (USD) …
     spent: f64,
     /// … of which the full reservations of failed calls that reported no
-    /// cost (OpenRouter may not have billed them, as for a refused key).
+    /// cost (OpenRouter may not have billed them, as for a refused key) …
     unknown_cost: f64,
+    /// … of which those of calls OpenRouter refused (401, 402, 403, 429):
+    /// likely not billed.
+    refused_cost: f64,
     calls: u64,
     /// Everything the ledger holds (earlier runs included).
     ledger_spent: f64,
@@ -1111,19 +1242,122 @@ impl OracleRun {
         let st = self.inherited.as_ref()?;
         let root = self.state_root.as_ref()?;
         Some(format!(
-            "the oracle of state directory {} is {} (recorded in its oracle.state by an earlier run or a server). It stays off until resumed: {}; --state DIR gives this run a directory of its own",
+            "the oracle of state directory {} is {} (recorded in its oracle.state by an earlier run or a server). It stays off until resumed: {}",
             root.display(),
             off_text(st, &self.key_env, &self.model),
             self.resume_text(st.stop_reason.as_deref())
         ))
     }
 
-    /// The stop rule that fired in this run (it is in `oracle.state` now).
-    fn new_stop(&self) -> Option<String> {
+    /// The stop rule that fired in this run (it is in `oracle.state` now),
+    /// in words.
+    fn new_stop(&self) -> Option<(String, String)> {
         if self.inherited.is_some() {
             return None;
         }
-        self.cascade.as_ref()?.oracle().state().stop_reason
+        let st = self.cascade.as_ref()?.oracle().state();
+        let r = st.stop_reason?;
+        let words =
+            oracle_setup::explain_stop(&r, st.last_error.as_deref(), &self.key_env, &self.model);
+        Some((r, words))
+    }
+
+    /// The admin limits of this run's `oracle.state`, in words.
+    fn admin_limits(&self) -> Option<String> {
+        admin_limits_text(&self.cascade.as_ref()?.oracle().state())
+    }
+
+    /// Which limit refuses a call that reserves `next` USD (`None`: it fits).
+    fn binding_limit(&self, next: f64) -> Option<Limit> {
+        let o = self.cascade.as_ref()?.oracle();
+        let (st, t, cfg) = (o.state(), o.totals(), o.config());
+        // Admin limits count the whole ledger; the run's own sit on top of
+        // what the ledger held at the start (`cfg` holds them so).
+        if let Some(c) = st
+            .max_calls
+            .filter(|c| *c <= cfg.max_calls && t.calls >= *c)
+        {
+            return Some(Limit::AdminCalls(c));
+        }
+        if t.calls >= cfg.max_calls {
+            return Some(Limit::RunCalls);
+        }
+        let used = t.spent + t.inflight;
+        if let Some(b) = st
+            .budget_usd
+            .filter(|b| *b <= cfg.budget_usd && used + next > *b)
+        {
+            return Some(Limit::AdminBudget(b));
+        }
+        (used + next > cfg.budget_usd).then_some(Limit::RunBudget)
+    }
+
+    /// What refuses the oracle's calls for the budget, and what to do about
+    /// it; `next` is the reservation that did not fit (or the smallest one).
+    fn budget_text(&self, next: Option<f64>) -> String {
+        let root = self
+            .state_root
+            .as_ref()
+            .map_or("-".into(), |p| p.display().to_string());
+        let t = self.totals();
+        let (next, reserves) = match next {
+            Some(r) => (r, format!("the next call reserves {}", usd(r))),
+            None => {
+                let least = self.least_reservation();
+                (
+                    least,
+                    format!("every call reserves at least {}", usd(least)),
+                )
+            }
+        };
+        match self.binding_limit(next) {
+            Some(Limit::AdminCalls(c)) => format!(
+                "the admin call limit of state directory {root} is reached: max_calls {c} in its \
+                 oracle.state (set by a server's admin API) counts every call of the ledger, which \
+                 holds {}; --oracle-max-calls cannot raise it. Lift it on a server of that \
+                 directory: POST /v1/admin/oracle {{\"max_calls\":null}} (or a larger number)",
+                t.ledger_calls
+            ),
+            Some(Limit::AdminBudget(b)) => format!(
+                "the admin budget of state directory {root} cannot hold the next call: budget_usd \
+                 {} in its oracle.state (set by a server's admin API) counts all the ledger's \
+                 spending, {} so far, and {reserves}; --oracle-budget cannot raise it. Lift it on \
+                 a server of that directory: POST /v1/admin/oracle {{\"budget_usd\":null}} (or a \
+                 larger number)",
+                usd(b),
+                usd(t.ledger_spent),
+            ),
+            Some(Limit::RunCalls) if self.max_calls == 0 => {
+                "--oracle-max-calls 0 allows no oracle call: pass a larger --oracle-max-calls"
+                    .to_string()
+            }
+            Some(Limit::RunCalls) => format!(
+                "the {} call{} this run may make are made (--oracle-max-calls): pass a larger \
+                 --oracle-max-calls",
+                self.max_calls,
+                if self.max_calls == 1 { "" } else { "s" }
+            ),
+            Some(Limit::RunBudget) | None if t.calls == 0 => format!(
+                "the oracle budget of this run ({}) cannot hold one call ({reserves} before it is \
+                 sent): pass a larger --oracle-budget",
+                usd(self.budget),
+            ),
+            Some(Limit::RunBudget) | None => format!(
+                "the oracle budget of this run is used up ({} of {} spent, {} of {} calls; \
+                 {reserves}, which does not fit): pass a larger --oracle-budget",
+                usd(t.spent),
+                usd(self.budget),
+                t.calls,
+                self.max_calls,
+            ),
+        }
+    }
+
+    /// The smallest reservation of one call (USD).
+    fn least_reservation(&self) -> f64 {
+        self.cascade
+            .as_ref()
+            .map_or(0.0, |c| c.oracle().min_reservation_usd())
     }
 
     /// Who asks: the operator of this command line (the oracle allowed, no
@@ -1150,6 +1384,7 @@ impl OracleRun {
                 RunTotals {
                     spent: (t.spent - self.before.spent).max(0.0),
                     unknown_cost: (t.unknown_cost - self.before.unknown_cost).max(0.0),
+                    refused_cost: (t.refused_cost - self.before.refused_cost).max(0.0),
                     calls: t.calls.saturating_sub(self.before.calls),
                     ledger_spent: t.spent,
                     ledger_calls: t.calls,
@@ -1164,14 +1399,20 @@ impl OracleRun {
     /// reported cost is named as such).
     fn spend_text(&self) -> String {
         let t = self.totals();
-        let unknown = if t.unknown_cost > 0.0 {
-            format!(
-                "; {} of it is the reservation of failed calls that reported no cost, likely not billed",
-                usd(t.unknown_cost)
-            )
-        } else {
-            String::new()
-        };
+        let mut unknown = String::new();
+        if t.refused_cost > 0.0 {
+            unknown.push_str(&format!(
+                "; {} of it is the reservation of calls OpenRouter refused (HTTP 401, 402, 403 or 429) without a cost, likely not billed",
+                usd(t.refused_cost)
+            ));
+        }
+        let other = t.unknown_cost - t.refused_cost;
+        if other > 1e-12 {
+            unknown.push_str(&format!(
+                "; {} of it is the reservation of failed calls that reported no cost (a timeout, a lost connection, an interrupted run, a bad answer), which OpenRouter may have billed",
+                usd(other)
+            ));
+        }
         let mut s = format!(
             "{} spent in this run ({} call{}{unknown}), budget {}",
             usd(t.spent),
@@ -1220,14 +1461,17 @@ impl OracleRun {
             OracleStatus::Ready => {
                 let (p, c) = self.max_price().unwrap_or_default();
                 format!(
-                    "oracle: ready — {what}, budget {} for this run, max price in/out {}/{} per 1M ({}); ledger {}",
+                    "oracle: ready — {what}, budget {} for this run, max price in/out {}/{} per 1M ({}); ledger {}{}",
                     usd(self.budget),
                     usd(p),
                     usd(c),
                     self.price_note.as_deref().unwrap_or("-"),
                     self.ledger
                         .as_ref()
-                        .map_or("-".into(), |l| l.display().to_string())
+                        .map_or("-".into(), |l| l.display().to_string()),
+                    self.admin_limits()
+                        .map(|a| format!("; {a}"))
+                        .unwrap_or_default()
                 )
             }
             OracleStatus::NoKey => format!(
@@ -1235,11 +1479,9 @@ impl OracleRun {
                 self.check_command(false),
                 k = self.key_env
             ),
-            OracleStatus::BudgetExhausted => format!(
-                "oracle: NOT ready — the budget of this run ({}, {} calls) cannot hold one call of {what}: pass a larger --oracle-budget or --oracle-max-calls",
-                usd(self.budget),
-                self.max_calls
-            ),
+            OracleStatus::BudgetExhausted => {
+                format!("oracle: NOT ready — {} ({what})", self.budget_text(None))
+            }
             other => match self.inherited_hint() {
                 Some(h) => format!("oracle: NOT ready — {h}"),
                 None => format!("oracle: NOT ready — {} ({what})", other.label()),
@@ -1266,41 +1508,21 @@ impl OracleRun {
         }
         // A stop of this run: also after an answered call (a cost above its
         // reservation keeps the answer).
-        if let Some(r) = self.new_stop() {
+        if let Some((r, words)) = self.new_stop() {
             return Some(format!(
-                "a stop rule stopped the oracle in this run: {} (stop rule {r}). It stays off for state directory {} until resumed: {}",
-                self.explain(&r),
+                "a stop rule stopped the oracle in this run: {words} (stop rule {r}). It stays off for state directory {} until resumed: {}",
                 self.state_root
                     .as_ref()
                     .map_or("-".into(), |p| p.display().to_string()),
                 self.resume_text(Some(&r))
             ));
         }
-        let t = self.totals();
-        if has("budget") && t.calls == 0 {
-            let least = self
+        if has("budget") {
+            let next = self
                 .cascade
                 .as_ref()
-                .map_or(0.0, |c| c.oracle().min_reservation_usd());
-            return Some(if self.max_calls == 0 {
-                "--oracle-max-calls 0 allows no oracle call: pass a larger --oracle-max-calls"
-                    .to_string()
-            } else {
-                format!(
-                    "the oracle budget of this run ({}) cannot hold one call (every call reserves at least {} before it is sent): pass a larger --oracle-budget",
-                    usd(self.budget),
-                    usd(least)
-                )
-            });
-        }
-        if has("budget") {
-            return Some(format!(
-                "the oracle budget of this run is used up ({} of {} spent, {} of {} calls): pass a larger --oracle-budget or --oracle-max-calls",
-                usd(t.spent),
-                usd(self.budget),
-                t.calls,
-                self.max_calls
-            ));
+                .and_then(|c| c.oracle().last_budget_refusal());
+            return Some(self.budget_text(next));
         }
         if has(cortiq_decision::service::FLAG_ORACLE_UNAVAILABLE) {
             let why = self
@@ -1328,6 +1550,9 @@ impl OracleRun {
             "budget_usd": self.budget,
             "spent_usd": t.spent,
             "unknown_cost_usd": t.unknown_cost,
+            "refused_cost_usd": t.refused_cost,
+            "admin_budget_usd": self.cascade.as_ref().and_then(|c| c.oracle().state().budget_usd),
+            "admin_max_calls": self.cascade.as_ref().and_then(|c| c.oracle().state().max_calls),
             "calls": t.calls,
             "max_calls": self.max_calls,
             "max_price": self.max_price().map(|(p, c)| json!({"prompt": p, "completion": c})),

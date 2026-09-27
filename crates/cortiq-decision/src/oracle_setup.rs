@@ -57,7 +57,8 @@
 //! answered but tripped a stop rule (a cost above its reservation, another
 //! model) is a failure, since a server would stop its oracle at that call.
 //! [`explain_oracle_error`] words a stop reason or a failed call's error code
-//! for both commands.
+//! for both commands; [`explain_stop`] adds the last failure to a
+//! `max_errors` stop.
 
 use crate::config::Config;
 use crate::oracle::{KeyLookup, max_tokens, reservation_usd};
@@ -804,6 +805,21 @@ pub fn explain_oracle_error(code: &str, key_env: &str, model: &str) -> String {
         ),
         c if !status.is_empty() => format!("OpenRouter answered HTTP {status} ({c})"),
         c => format!("the answer was not usable ({c})"),
+    }
+}
+
+/// A stop reason in words, as [`explain_oracle_error`], with the last failed
+/// call's error for `max_errors` (`last_error` of `oracle.state`): "too many
+/// oracle calls failed in a row (oracle.max_errors); the last: OpenRouter
+/// answered HTTP 500 (http_500)".
+pub fn explain_stop(code: &str, last_error: Option<&str>, key_env: &str, model: &str) -> String {
+    let words = explain_oracle_error(code, key_env, model);
+    match last_error {
+        Some(last) if code == "max_errors" => format!(
+            "{words}; the last: {}",
+            explain_oracle_error(last, key_env, model)
+        ),
+        _ => words,
     }
 }
 

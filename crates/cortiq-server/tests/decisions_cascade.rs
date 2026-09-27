@@ -1378,7 +1378,8 @@ async fn budget_max_calls_and_stop_rules_over_http() {
     assert_eq!(
         srv.oracle_state(),
         json!({"enabled": true, "stop_reason": null, "stopped_unix": null,
-               "budget_usd": null, "max_calls": null, "consecutive_errors": 1}),
+               "budget_usd": null, "max_calls": null, "consecutive_errors": 1,
+               "last_error": "http_500"}),
         "one failure after a success does not stop"
     );
     assert_eq!(

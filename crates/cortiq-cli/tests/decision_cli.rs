@@ -3654,6 +3654,14 @@ fn decide_oracle_asks_only_what_the_gate_rejects_and_hides_the_key() {
         "{or}"
     );
     assert_eq!(or["unknown_cost_usd"], 0.0);
+    assert_eq!(or["refused_cost_usd"], 0.0);
+    assert_eq!(
+        (
+            or["admin_budget_usd"].clone(),
+            or["admin_max_calls"].clone()
+        ),
+        (Value::Null, Value::Null)
+    );
     assert_eq!(or["key_env"], "OPENROUTER_API_KEY");
     assert_eq!(or["max_price"], json!({"prompt": 0.06, "completion": 0.58}));
     assert_eq!(
@@ -3972,10 +3980,12 @@ fn decide_oracle_batch_respects_its_budget_cap_per_run() {
     assert_eq!(o["budget_usd"], 0.0008);
     let spent = o["spent_usd"].as_f64().unwrap();
     assert!((spent - 0.0005).abs() < 1e-12 && spent <= 0.0008, "{o}");
+    // The hint names the reservation that did not fit.
+    let hint = o["hint"].as_str().unwrap();
     assert!(
-        o["hint"].as_str().unwrap().starts_with(
-            "the oracle budget of this run is used up ($0.0005 of $0.0008 spent, 2 of 10000 calls)"
-        ),
+        hint.starts_with(
+            "the oracle budget of this run is used up ($0.0005 of $0.0008 spent, 2 of 10000 calls; the next call reserves $0.0003"
+        ) && hint.ends_with(", which does not fit): pass a larger --oracle-budget"),
         "{o}"
     );
     assert!(err.contains("the gate rejected 5 of 9 rows: 2 answered by the oracle, 0 from its cache, 3 abstained (budget 3)"), "{err}");
@@ -4011,6 +4021,80 @@ fn decide_oracle_batch_respects_its_budget_cap_per_run() {
         "one reservation and one settlement per call"
     );
     assert_no_bytes_of(FAKE_OPENROUTER_KEY, &state);
+
+    // Admin limits in oracle.state (a server's POST /v1/admin/oracle, kept
+    // by --oracle-resume) count the whole ledger — 4 calls, $0.001 now —
+    // and no run flag raises them: the start line and the hint name the
+    // binding one and how to lift it.
+    let st_file = state.join("oracle.state");
+    let admin = |budget: Value, calls: Value| {
+        std::fs::write(
+            &st_file,
+            json!({"enabled": true, "stop_reason": null, "stopped_unix": null,
+                   "budget_usd": budget, "max_calls": calls})
+            .to_string(),
+        )
+        .unwrap();
+    };
+    admin(Value::Null, json!(4));
+    let (got, err, sum) = run(&d.join("run3.jsonl"));
+    assert_eq!(mock.chats(), 4, "the admin call limit allows no call");
+    let calls_limit = format!(
+        "the admin call limit of state directory {} is reached: max_calls 4 in its oracle.state (set by a server's admin API) counts every call of the ledger, which holds 4; --oracle-max-calls cannot raise it. Lift it on a server of that directory: POST /v1/admin/oracle {{\"max_calls\":null}} (or a larger number)",
+        state.display()
+    );
+    assert!(
+        err.contains(&format!("oracle: NOT ready — {calls_limit}")),
+        "{err}"
+    );
+    assert_eq!(sum["oracle"]["hint"], calls_limit.as_str(), "{sum}");
+    assert_eq!(got[8]["flags"], json!(["budget"]), "{}", got[8]);
+    assert_eq!(sum["oracle"]["admin_max_calls"], 4, "{sum}");
+    admin(json!(0.0012), Value::Null);
+    let (_, err, sum) = run(&d.join("run4.jsonl"));
+    assert_eq!(mock.chats(), 4, "the admin budget holds no call");
+    let budget_limit = format!(
+        "the admin budget of state directory {} cannot hold the next call: budget_usd $0.0012 in its oracle.state (set by a server's admin API) counts all the ledger's spending, $0.001 so far, and ",
+        state.display()
+    );
+    assert!(
+        err.contains(&format!(
+            "oracle: NOT ready — {budget_limit}every call reserves at least $"
+        )) && err.contains(
+            "; --oracle-budget cannot raise it. Lift it on a server of that directory: POST /v1/admin/oracle {\"budget_usd\":null} (or a larger number)"
+        ),
+        "{err}"
+    );
+    let hint = sum["oracle"]["hint"].as_str().unwrap();
+    assert!(
+        hint.starts_with(&format!("{budget_limit}the next call reserves $0.0003")),
+        "{sum}"
+    );
+    // Room for calls: the ready line shows the admin limits too (rows the
+    // gate accepts only: no call).
+    admin(json!(0.5), json!(100));
+    let accepted = write(
+        d,
+        "accepted.jsonl",
+        &rows[..4]
+            .iter()
+            .map(|r| r.to_string() + "\n")
+            .collect::<String>(),
+    );
+    let o = decide_oracle(
+        &base,
+        &["--input", s(&accepted)],
+        &["--state", s(&state)],
+        &key,
+    );
+    assert!(o.status.success(), "{}", show(&o));
+    assert_eq!(mock.chats(), 4);
+    let err = stderr_of(&o);
+    assert!(
+        err.contains("; admin limits kept in its oracle.state: budget $0.50, 100 calls over the whole ledger (set by a server's POST /v1/admin/oracle; {\"budget_usd\":null,\"max_calls\":null} there lifts them)"),
+        "{err}"
+    );
+    std::fs::remove_file(&st_file).unwrap();
 
     // A stop rule holds as on a server: the provider refuses the key (HTTP
     // 401) at the first call, no other row is sent, and the stop is kept in
@@ -4049,16 +4133,17 @@ fn decide_oracle_batch_respects_its_budget_cap_per_run() {
         "{sum}"
     );
     // The refused call reported no cost: its reservation is charged, and
-    // named as likely not billed.
+    // named as likely not billed (OpenRouter refused it: HTTP 401).
     let unknown = sum["oracle"]["unknown_cost_usd"].as_f64().unwrap();
     assert!(
         unknown > 0.0 && unknown == sum["oracle"]["spent_usd"].as_f64().unwrap(),
         "{sum}"
     );
+    assert_eq!(sum["oracle"]["refused_cost_usd"].as_f64(), Some(unknown));
     assert!(
         stderr_of(&o).contains(
-            "of it is the reservation of failed calls that reported no cost, likely not billed"
-        ),
+            "of it is the reservation of calls OpenRouter refused (HTTP 401, 402, 403 or 429) without a cost, likely not billed"
+        ) && !stderr_of(&o).contains("may have billed"),
         "{}",
         show(&o)
     );
@@ -4263,7 +4348,7 @@ fn decide_oracle_stop_rules_hold_across_runs_until_resumed() {
     assert!(
         out.contains("spent in this run (1 call; $")
             && out.contains(
-                "of it is the reservation of failed calls that reported no cost, likely not billed)"
+                "of it is the reservation of calls OpenRouter refused (HTTP 401, 402, 403 or 429) without a cost, likely not billed)"
             ),
         "{out}"
     );
@@ -4301,8 +4386,87 @@ fn decide_oracle_stop_rules_hold_across_runs_until_resumed() {
         (st["stop_reason"].clone(), st["consecutive_errors"].clone()),
         (Value::Null, json!(1))
     );
+    assert_eq!(st["last_error"], "http_500");
     assert_eq!(mock.chats(), 5);
+    // Its reservation is charged, and since OpenRouter did not refuse the
+    // call (as with 401/402/403/429), it may have been billed.
+    assert!(
+        stdout_of(&o).contains(
+            "of it is the reservation of failed calls that reported no cost (a timeout, a lost connection, an interrupted run, a bad answer), which OpenRouter may have billed"
+        ) && !stdout_of(&o).contains("likely not billed"),
+        "{}",
+        show(&o)
+    );
+
+    // 6b. max_errors failures in a row (the count is kept in oracle.state:
+    // here one short of the default 30): the stop names the last failure,
+    // in this run and in a later one.
+    let st_m = d.join("m");
+    std::fs::create_dir_all(&st_m).unwrap();
+    std::fs::write(
+        st_m.join("oracle.state"),
+        r#"{"enabled":true,"stop_reason":null,"stopped_unix":null,"budget_usd":null,"max_calls":null,"consecutive_errors":29,"last_error":"http_500"}"#,
+    )
+    .unwrap();
+    mock.set_quirk(ChatQuirk {
+        status: Some(503),
+        ..Default::default()
+    });
+    let quiet = [
+        ("OPENROUTER_API_KEY", FAKE_OPENROUTER_KEY),
+        ("RUST_LOG", "error"),
+    ];
+    let o = decide_oracle(&base, &["-p", &texts[5]], &["--state", s(&st_m)], &quiet);
+    assert!(o.status.success(), "{}", show(&o));
+    assert_eq!(mock.chats(), 6);
+    assert!(
+        stdout_of(&o).contains(&format!(
+            "hint:       a stop rule stopped the oracle in this run: too many oracle calls failed in a row (oracle.max_errors); the last: OpenRouter answered HTTP 503 (http_503) (stop rule max_errors). It stays off for state directory {} until resumed",
+            st_m.display()
+        )),
+        "{}",
+        show(&o)
+    );
+    let st = state_of(&st_m);
+    assert_eq!(
+        (st["stop_reason"].clone(), st["last_error"].clone()),
+        (json!("max_errors"), json!("http_503"))
+    );
+    let o = decide_oracle(&base, &["-p", &texts[5]], &["--state", s(&st_m)], &quiet);
+    assert!(o.status.success(), "{}", show(&o));
+    assert_eq!(mock.chats(), 6, "stopped: no call");
+    let out = stdout_of(&o);
+    assert!(
+        out.contains("is stopped by the stop rule max_errors: too many oracle calls failed in a row (oracle.max_errors); the last: OpenRouter answered HTTP 503 (http_503) (recorded in its oracle.state")
+            && !out.contains("a directory of its own"),
+        "{}",
+        show(&o)
+    );
     mock.set_quirk(ChatQuirk::default());
+
+    // 6c. --oracle-resume on a directory that is not stopped but counts a
+    // failure in a row: the count is cleared and said so.
+    let o = decide_oracle(
+        &base,
+        &["-p", &texts[5]],
+        &["--state", s(&st_e), "--oracle-resume"],
+        &key,
+    );
+    assert!(o.status.success(), "{}", show(&o));
+    assert!(
+        stderr_of(&o).contains(&format!(
+            "oracle: the oracle of state directory {} was not stopped; cleared its 1 failed call in a row (the last: OpenRouter answered HTTP 500 (http_500)) (they count toward oracle.max_errors)",
+            st_e.display()
+        )) && !stderr_of(&o).contains("nothing to resume"),
+        "{}",
+        show(&o)
+    );
+    assert!(stdout_of(&o).contains("(from oracle"), "{}", show(&o));
+    let st = state_of(&st_e);
+    assert_eq!(
+        (st.get("consecutive_errors"), st.get("last_error")),
+        (None, None)
+    );
 
     // 7. A wrong key (HTTP 401) with the warnings hidden.
     let st_f = d.join("f");
@@ -4325,7 +4489,7 @@ fn decide_oracle_stop_rules_hold_across_runs_until_resumed() {
         show(&o)
     );
     assert_no_key_in(&show(&o), "a refused key");
-    for st in [&st_a, &st_b, &st_c, &st_e, &st_f] {
+    for st in [&st_a, &st_b, &st_c, &st_e, &st_f, &st_m] {
         assert_no_bytes_of(FAKE_OPENROUTER_KEY, st);
         assert_no_bytes_of(WRONG_OPENROUTER_KEY, st);
         assert!(!st.join("LOCK").exists());
@@ -4483,18 +4647,141 @@ fn decide_oracle_releases_its_lock_when_interrupted_and_names_a_stale_one() {
         "{}",
         show(&o)
     );
+    // A pid reused by an unrelated process after a crash: the way out.
+    assert!(
+        stderr_of(&o).contains(&format!(
+            "If pid {} is not a cortiq process (a LOCK left by a crash whose pid was reused), no cortiq process uses the directory: remove {} by hand",
+            std::process::id(),
+            lock.display()
+        )),
+        "{}",
+        show(&o)
+    );
     assert_eq!(std::fs::read_to_string(&lock).unwrap(), mine);
     let o = decide_oracle(&base, &["-p", &texts[5]], &["--state", s(&state)], &key);
     assert!(
         !o.status.success()
             && stderr_of(&o).contains("is held by pid")
-            && stderr_of(&o).contains("--break-lock"),
+            && stderr_of(&o).contains("--break-lock")
+            && stderr_of(&o).contains(&format!("remove {} by hand", lock.display())),
         "{}",
         show(&o)
     );
+    // An empty LOCK (a process may be writing it right now) is not broken.
+    std::fs::write(&lock, "").unwrap();
+    let o = decide_oracle(
+        &base,
+        &["-p", &texts[5]],
+        &["--state", s(&state), "--break-lock"],
+        &key,
+    );
+    assert!(
+        !o.status.success()
+            && stderr_of(&o)
+                .contains("is empty — a process may be taking it right now; it is not removed"),
+        "{}",
+        show(&o)
+    );
+    assert!(lock.exists());
+    std::fs::remove_file(&lock).unwrap();
     // --break-lock needs --oracle.
     let e = fails(&["decide", s(&toy().path), "-p", "x", "--break-lock"]);
     assert!(e.contains("--oracle"), "{e}");
+}
+
+#[test]
+fn decide_oracle_leaves_a_signal_it_inherited_as_ignored_ignored() {
+    use std::os::unix::process::CommandExt;
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let mock = MockOpenRouter::start("travel", 1.3e-5);
+    let base = mock.base();
+    let texts = distinct_texts(3, 23, "hup", 0.97);
+    let state = d.join("state");
+    let lock = state.join("LOCK");
+    mock.set_quirk(ChatQuirk {
+        delay: Some(Duration::from_secs(2)),
+        ..Default::default()
+    });
+    let one_row = write(
+        d,
+        "one.jsonl",
+        &(json!({"text": texts[1]}).to_string() + "\n"),
+    );
+    let toy_path = s(&toy().path).to_string();
+    // (signal, ignored at exec as `nohup` or a script's `cmd &` do, args,
+    // expected exit code): an ignored signal leaves the run going to its
+    // answer; one that is not ignored still releases the LOCK (129).
+    for (sig, ignored, args, code) in [
+        (libc::SIGHUP, true, vec!["-p", texts[0].as_str()], 0),
+        (libc::SIGINT, true, vec!["--input", s(&one_row)], 0),
+        (libc::SIGHUP, false, vec!["-p", texts[2].as_str()], 129),
+    ] {
+        let chats = mock.chats();
+        let mut a = vec!["decide", toy_path.as_str()];
+        a.extend(args.iter().copied());
+        a.extend([
+            "--skill",
+            "topics",
+            "--oracle",
+            ORACLE_MODEL,
+            "--oracle-base-url",
+            &base,
+            "--state",
+            s(&state),
+        ]);
+        let mut c = cortiq();
+        c.args(&a)
+            .env("OPENROUTER_API_KEY", FAKE_OPENROUTER_KEY)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if ignored {
+            // SAFETY: signal(2) between fork and exec, async-signal-safe.
+            unsafe {
+                c.pre_exec(move || {
+                    libc::signal(sig, libc::SIG_IGN);
+                    Ok(())
+                });
+            }
+        }
+        let child = c.spawn().unwrap();
+        let t0 = Instant::now();
+        while mock.chats() == chats {
+            assert!(t0.elapsed() < Duration::from_secs(60), "no call was made");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(lock.exists(), "the run holds the LOCK during its call");
+        send_signal(child.id(), sig);
+        let o = child.wait_with_output().unwrap();
+        assert_eq!(
+            o.status.code(),
+            Some(code),
+            "{sig} ignored={ignored}\n{}",
+            show(&o)
+        );
+        assert!(!lock.exists(), "the LOCK is released\n{}", show(&o));
+        if code == 0 {
+            assert!(
+                !stderr_of(&o).contains("interrupted"),
+                "an ignored signal is not an interruption\n{}",
+                show(&o)
+            );
+            let answered = if args[0] == "-p" {
+                stdout_of(&o).contains(&format!("choice:     travel (from oracle {ORACLE_MODEL}"))
+            } else {
+                rows_of(&stdout_of(&o))[0]["source"] == "oracle"
+            };
+            assert!(answered, "{}", show(&o));
+        } else {
+            assert!(
+                stderr_of(&o)
+                    .contains("interrupted (SIGHUP): the state directory's LOCK is released"),
+                "{}",
+                show(&o)
+            );
+        }
+        assert_no_key_in(&show(&o), "a signalled run");
+    }
 }
 
 #[test]
