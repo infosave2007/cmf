@@ -14,13 +14,16 @@ a log line holds the request id, status, latency and account.
 
 The command and `curl` blocks below were run in order, as written, against
 local servers of the published `cortiq-decision.cmf` with cortiq 0.7.8; the
-HTTP status each call returned is written after it as `# → 200`. Three parts
+HTTP status each call returned is written after it as `# → 200`. Four parts
 used stand-ins or were not run: the `mysql` export of section 8.1 was not run
 (the import read a hand-written export of one test key and its counters); the
 old router of section 8.3 was a local stand-in, a `cortiq serve` of the same
-file holding that imported key at `127.0.0.1:8080`; and `cortiq decision
+file holding that imported key at `127.0.0.1:8080`; `cortiq decision
 learn` in section 7 called a local mock of the OpenRouter API (`base_url`
-pointed at it) instead of OpenRouter. The examples use `curl` and `jq`.
+pointed at it) instead of OpenRouter; and so did the oracle commands of
+[Check your setup](#check-your-setup) in section 1 (`--base-url`, for
+`decide` `--oracle-base-url`, pointed at the mock, with a test key). The
+examples use `curl` and `jq`.
 
 1. [Start a server](#1-start-a-server)
 2. [Keys, plans and limits](#2-keys-plans-and-limits)
@@ -84,6 +87,52 @@ The state directory (mode 0700) holds `LOCK`, `keys.json`, `usage/`,
 (and in shadow mode `shadow.jsonl` with its key `shadow.key`). One server
 process per state directory; the CLI may change `keys.json` while it runs
 (both take `keys.json.lock` for each change).
+
+<a id="check-your-setup"></a>**Check your setup.** Whether the oracle is
+ready can be checked before a server with `--oracle MODEL` is started or
+anything is spent:
+
+```bash
+cortiq decision oracle check               # free: the key, the account, the model
+cortiq decision oracle check --test-call   # and one tiny structured call, a small fraction of a cent
+```
+
+Each check prints ✓ or ✗ with what to do; the exit code is 0 only when the
+oracle is ready (`--json`: `ready` and `problems[]`). A server reports its
+oracle as `oracle_status` of `GET /healthz` and `status` of `GET
+/v1/admin/oracle` ([section 5](#5-administration)), `cortiq decide …
+--json` as `cmf.oracle.status`:
+
+| Status | What to do |
+|---|---|
+| `ready` | nothing: what the gate rejects goes to the oracle |
+| `no_key` | `export OPENROUTER_API_KEY=…` where the server (then restart it) or `decide` runs |
+| `bad_key` | fix the variable as the message says (a quote, `Bearer `, a `NAME=…` line, whitespace or a non-ASCII byte in it); nothing was sent |
+| `disabled` | start the server with `--oracle MODEL`; if the admin switched it off, `POST /v1/admin/oracle {"enabled": true}` |
+| `budget_too_small` | `--oracle-budget` of at least the figure the message names (and `--oracle-max-calls` of 1 or more) |
+| `budget_exhausted` | a larger `--oracle-budget` or `--oracle-max-calls` (a server counts its whole ledger; each `decide` run has its own budget) |
+| `stopped: <reason>` | fix the cause (`http_401` / `http_403` the key was refused, `http_402` no credit, …), then `POST /v1/admin/oracle {"enabled": true}`, or one `decide` run with `--oracle-resume` |
+
+An admin limit kept in `oracle.state` is lifted by the `POST
+/v1/admin/oracle` the message names, not by a restart. One text or a batch
+from the command line (only what the gate rejects is sent; the ledger and
+the cache are in `<FILE>.state`, or `--state DIR`):
+
+```bash
+cortiq decide cortiq-decision.cmf --skill banking77 -p "the exchange rate you gave me looks wrong" \
+  --oracle deepseek/deepseek-v4.1-flash
+printf '%s\n' '{"text": "I still have not received my new card", "label": "card_arrival"}' \
+  '{"text": "can I pay my rent with a virtual card"}' > rows.jsonl
+cortiq decide cortiq-decision.cmf --skill banking77 --input rows.jsonl --out results.jsonl \
+  --oracle deepseek/deepseek-v4.1-flash --oracle-budget 0.05
+jq -c '{answer, action, source, oracle_cost_usd, flags}' results.jsonl
+```
+
+Each batch row adds `answer`, `action` (`local`, `oracle`, `cache` or
+`abstain`), `source`, `oracle_cost_usd` and `flags` to the local columns;
+`--oracle-resume` turns the oracle on again after a stop rule is fixed, and
+`--break-lock` removes a `LOCK` a crashed run left
+([ORACLE.md](ORACLE.md#one-text-or-a-batch)).
 
 ## 2. Keys, plans and limits
 
