@@ -115,7 +115,7 @@ call).
 ## Quick start
 
 ```bash
-cargo install cortiq-cli --version 0.7.8
+cargo install cortiq-cli --version 0.7.9
 hf download infosave/cortiq-decision cortiq-decision.cmf --local-dir .
 cortiq decide cortiq-decision.cmf --skill banking77 -p "I still have not received my new card"
 ```
@@ -177,7 +177,7 @@ cortiq decide cortiq-decision.cmf --skill banking77 --input rows.jsonl --out res
 `results.jsonl` adds `answer`, `action` (`local`, `oracle`, `cache` or
 `abstain`), `source`, `oracle_cost_usd` and `flags` to the local columns.
 `--oracle-resume` turns the oracle on again after a stop rule is fixed, and
-`--break-lock` removes a `LOCK` a crashed run left
+a `LOCK` a killed run left is taken over by the next one
 ([ORACLE.md](ORACLE.md#check-your-setup)).
 
 ## Limits

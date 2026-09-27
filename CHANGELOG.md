@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.9] - 2026-09-27
+
+### Fixed
+- Decision server: a `LOCK` left in the state directory by a server that
+  was killed (SIGKILL after a stop timeout, an out-of-memory kill, a crash
+  of the host) no longer refuses every restart. In a container the server
+  is always pid 1, so `restart: unless-stopped` looped on "state directory
+  … is locked by pid 1". The server (and every CLI command that takes the
+  `LOCK`: `decide --oracle`, `decision keys import --usage`, `decision
+  rollback`) now holds an advisory `flock(2)` on `LOCK` for as long as it
+  runs, with `pid nonce` still in the file to name the holder; the kernel
+  ends the lock with the process, so a `LOCK` no process holds is taken
+  over, with a warning naming the pid it was left by. The lock of a running
+  process is never broken, `--break-lock` included; `--break-lock` now
+  matters only where the filesystem has no advisory locks (Windows, some
+  network mounts), where the file alone keeps the 0.7.8 behaviour. Versions
+  up to 0.7.8 only create the file: do not run one on the same state
+  directory as a newer one at the same time.
+- Decision server: an answer given before the request body was read (401
+  or 429 after the headers alone, 413 from `Content-Length`, a wrong
+  content type, a JSON 404 or 405) closed the connection with the body
+  unread, and the kernel reset it; nginx, still sending a buffered body,
+  failed its write with EPIPE and answered 502 instead of the JSON error.
+  Connections now close lingering: the rest of the body is read and dropped
+  (at most `limits.body_bytes`, 5 s between reads, 30 s in all) before the
+  socket is closed.
+- Decisions API: malformed JSON is 400 with "the body is not valid JSON:
+  expected a string key at byte 97" (the prefix was said twice).
+
+### Documentation
+- `docs/decision/hf/API.md`: a content type other than `application/json`
+  is 400 `INVALID_REQUEST` on the decisions API (415 on the router paths);
+  `GET /v1/skills` lists `has_rubric` and `GET /v1/skills/{id}` gives the
+  rubric; the `LOCK` taken over after a kill (also in `ORACLE.md` and the
+  model card).
+
 ## [0.7.8] - 2026-09-27
 
 ### Added
@@ -6277,7 +6313,8 @@ Initial public release.
 - **Licensing** — Apache-2.0 with an explicit patent-grant explanation
   (`LICENSE`, `NOTICE`, `PATENTS.md`).
 
-[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.7.8...HEAD
+[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.7.9...HEAD
+[0.7.9]: https://github.com/infosave2007/cmf/compare/v0.7.8...v0.7.9
 [0.7.8]: https://github.com/infosave2007/cmf/compare/v0.7.7...v0.7.8
 [0.7.7]: https://github.com/infosave2007/cmf/compare/v0.7.6...v0.7.7
 [0.6.9]: https://github.com/infosave2007/cmf/compare/v0.6.8...v0.6.9

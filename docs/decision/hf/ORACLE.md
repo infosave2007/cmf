@@ -504,20 +504,21 @@ oracle: resumed — the oracle of state directory cortiq-decision.cmf.state was 
 
 **After an interrupted run** (Ctrl-C, SIGTERM, a closed terminal) the
 `LOCK` is released; a signal the run inherited as ignored (`nohup`, a
-background job of a script) stays ignored. A `LOCK` left by a crash is
-named with its pid (`state directory cortiq-decision.cmf.state has a LOCK
-left by pid 42341, which is no longer running (an interrupted run): pass
---break-lock to remove it, or give this run a directory of its own with
---state DIR`); `--break-lock` removes it only when that process is gone:
-
-```bash
-cortiq decide cortiq-decision.cmf --skill banking77 -p "thanks for your help" --oracle deepseek/deepseek-v4.1-flash --break-lock
-```
+background job of a script) stays ignored. A run that was killed (SIGKILL,
+out of memory, a crash) leaves its `LOCK` file but not its lock (an advisory
+`flock` that the kernel ends with the process), and the next run takes it
+over with a warning naming that pid:
 
 ```text
-warning: removed the LOCK of state directory cortiq-decision.cmf.state left by pid 42341, which is not running (--break-lock)
-…
+… WARN cortiq_decision::statedir: took over the LOCK of state directory cortiq-decision.cmf.state left by pid 42341, which ended without releasing it (killed, out of memory or a crash) lock=cortiq-decision.cmf.state/LOCK
 ```
+
+The `LOCK` of a running process is never taken, `--break-lock` included:
+the run stops with `state directory cortiq-decision.cmf.state is held by
+pid 42341 (a running cortiq serve, or another cortiq decide --oracle): …`
+and what to do. `--break-lock` matters only where the directory's
+filesystem has no advisory locks (Windows, some network mounts): there a
+`LOCK` left by a crash stays until `--break-lock` removes it.
 
 ### Who may use it, and who teaches
 
