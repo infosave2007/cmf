@@ -56,13 +56,15 @@
 //! row — counted across restarts and command-line runs, since the count is
 //! kept in `oracle.state` too while it is not zero.
 //!
-//! **Key** ([`read_key`]): the value of the variable without surrounding
-//! ASCII whitespace (spaces, tabs, CR, LF — a `.env` file's; the surfaces
-//! warn that it was trimmed); a value that still holds whitespace, a control
-//! byte or a byte outside ASCII, starts with `Bearer ` or is quoted is
-//! `bad_key` and never sent. Transport and read errors are fixed codes
-//! ([`transport_code`], [`read_code`]), never the library's text, which may
-//! hold a request header or a URL.
+//! **Key** ([`read_key`]): the raw bytes of the variable without
+//! surrounding ASCII whitespace (spaces, tabs, CR, LF — a `.env` file's; the
+//! surfaces warn that it was trimmed); a value that still holds whitespace,
+//! a control byte or a byte outside ASCII, starts with `Bearer ` or starts
+//! or ends with a quote is `bad_key` and never sent. Transport and read
+//! errors are fixed codes ([`transport_code`], [`read_code`]), never the
+//! library's text, which may hold a request header or a URL; what the
+//! upstream answers (`provider`, `model`) is kept only cleaned
+//! ([`clean_upstream`]).
 //!
 //! **Status** ([`OracleClient::status`], `status` of `GET /v1/admin/oracle`):
 //! `disabled` (not configured, or the admin switch is off), `no_key` (the
@@ -70,8 +72,11 @@
 //! `stopped: <reason>`, `budget_exhausted` (something was spent or reserved
 //! and the budget left cannot hold the smallest call, or `max_calls` calls
 //! were made), `budget_too_small` (nothing spent, and the budget cannot hold
-//! even the smallest call — `min_call_usd` — or `max_calls` is 0) or
-//! `ready` — the order of the permission checks.
+//! even the smallest possible call — one question of the shortest shape,
+//! [`smallest_body_len`] — or `max_calls` is 0, or it refused a real call
+//! while nothing was spent: `min_call_usd` is then that call's reservation)
+//! or `ready` — the order of the permission checks. A budget that refused a
+//! real call is not `ready` while what is left cannot hold it.
 
 use crate::answer::OracleAnswer;
 use crate::canonical;
@@ -176,6 +181,40 @@ pub fn request_value(cfg: &OracleConfig, questions: &[&Question], state: &Value)
 /// The canonical body bytes (spec §5.3).
 pub fn request_body(cfg: &OracleConfig, questions: &[&Question], state: &Value) -> Vec<u8> {
     canonical::to_vec(&request_value(cfg, questions, state))
+}
+
+/// The length of the smallest body a call can have: one question of the
+/// shortest valid shape (id `a`, empty instructions, the fewest options or
+/// levels with empty descriptions) about a one-byte state. The system
+/// prompt, the model, the provider preferences and the schema are in every
+/// body, so a real call's is never shorter.
+pub fn smallest_body_len(cfg: &OracleConfig) -> usize {
+    use crate::protocol::{MIN_CHOICE_OPTIONS, MIN_SCORE_LEVELS};
+    let options: Map<String, Value> = (0..MIN_CHOICE_OPTIONS)
+        .map(|i| (char::from(b'a' + (i % 26) as u8).to_string(), Value::Null))
+        .collect();
+    let shapes = [
+        (QuestionKind::Choice, Some(Value::Object(options))),
+        (
+            QuestionKind::Score,
+            Some(Value::Array(vec![json!(""); MIN_SCORE_LEVELS])),
+        ),
+        (QuestionKind::Noul, None),
+    ];
+    let state = json!("x");
+    shapes
+        .into_iter()
+        .map(|(kind, criteria)| {
+            let q = Question {
+                id: "a".into(),
+                kind,
+                instructions: json!(""),
+                criteria,
+            };
+            request_body(cfg, &[&q], &state).len()
+        })
+        .min()
+        .unwrap_or(0)
 }
 
 /// `((body_len + 4096)·prompt + max_tokens·completion)/1e6` USD, `prompt` and
@@ -360,22 +399,61 @@ pub fn parse_response(body: &[u8], questions: &[&Question], model: &str) -> Pars
     out
 }
 
+// ------------------------------------------------------------------ upstream text
+
+/// Longest upstream string kept for a ledger or a message.
+pub const UPSTREAM_TEXT_MAX: usize = 128;
+
+/// A string an upstream answered (a response's `provider` or `model`, a
+/// listing's provider name) as it may be written to a ledger, logged or
+/// printed: visible ASCII and spaces only (no terminal escapes), at most
+/// [`UPSTREAM_TEXT_MAX`] bytes, and `[redacted]` when it holds `Bearer`,
+/// looks like a key ([`crate::config::looks_like_key`]) or holds 8 bytes
+/// in a row of `key` — a hostile or broken proxy echoing the request's
+/// `Authorization` header.
+pub fn clean_upstream(s: &str, key: Option<&str>) -> String {
+    const REDACTED: &str = "[redacted]";
+    let lower = s.to_ascii_lowercase();
+    if lower.contains("bearer") || crate::config::looks_like_key(s.trim()).is_some() {
+        return REDACTED.into();
+    }
+    if let Some(k) = key {
+        let kb = k.as_bytes();
+        let sb = s.as_bytes();
+        if kb.len() >= 8 && kb.windows(8).any(|w| sb.windows(8).any(|x| x == w)) {
+            return REDACTED.into();
+        }
+    }
+    s.chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .take(UPSTREAM_TEXT_MAX)
+        .collect()
+}
+
 // ------------------------------------------------------------------ key
 
-/// Reads a variable of the environment by name (the oracle key). The server uses
-/// [`process_env`]; tests pass a lookup over a map so that no process-wide
-/// environment is mutated. The raw value is checked by [`read_key`] before
-/// any use.
-pub type KeyLookup = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+/// Reads a variable of the environment by name (the oracle key), its raw
+/// bytes. The server uses [`process_env`]; tests pass a lookup over a map
+/// ([`key_lookup`]) so that no process-wide environment is mutated. The raw
+/// value is checked by [`read_key`] before any use.
+pub type KeyLookup = Arc<dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync>;
 
-/// The process environment (a set, non-empty variable). A value that is not
-/// UTF-8 comes back with its invalid bytes replaced (U+FFFD), so that
-/// [`read_key`] names it `bad_key` instead of calling it unset.
+/// A [`KeyLookup`] over a function that gives text.
+pub fn key_lookup(f: impl Fn(&str) -> Option<String> + Send + Sync + 'static) -> KeyLookup {
+    Arc::new(move |name| f(name).map(String::into_bytes))
+}
+
+/// The process environment (a set, non-empty variable), its bytes as they
+/// are (on Unix; elsewhere decoded lossily), so that [`read_key`] names a
+/// value that is not UTF-8 `bad_key`, by its real positions and length.
 pub fn process_env() -> KeyLookup {
     Arc::new(|name| {
-        std::env::var_os(name)
-            .map(|v| v.to_string_lossy().into_owned())
-            .filter(|v| !v.is_empty())
+        let v = std::env::var_os(name)?;
+        #[cfg(unix)]
+        let bytes = std::os::unix::ffi::OsStringExt::into_vec(v);
+        #[cfg(not(unix))]
+        let bytes = v.to_string_lossy().into_owned().into_bytes();
+        (!bytes.is_empty()).then_some(bytes)
     })
 }
 
@@ -432,10 +510,15 @@ fn is_edge_space(b: u8) -> bool {
 /// or ends with a quote (a `.env` value copied with its quotes). The
 /// problem names positions and lengths only.
 pub fn check_key(raw: Option<&str>) -> (KeyState, Option<String>) {
-    let Some(raw) = raw.filter(|r| !r.is_empty()) else {
+    check_key_bytes(raw.map(str::as_bytes))
+}
+
+/// [`check_key`] of raw bytes (a value that is not UTF-8 is `bad_key`, its
+/// first byte outside ASCII named by its position among the raw bytes).
+pub fn check_key_bytes(raw: Option<&[u8]>) -> (KeyState, Option<String>) {
+    let Some(bytes) = raw.filter(|r| !r.is_empty()) else {
         return (KeyState::Missing, None);
     };
-    let bytes = raw.as_bytes();
     let Some(start) = bytes.iter().position(|b| !is_edge_space(*b)) else {
         return (
             KeyState::Bad(format!("it holds only whitespace ({} bytes)", bytes.len())),
@@ -446,9 +529,7 @@ pub fn check_key(raw: Option<&str>) -> (KeyState, Option<String>) {
         .iter()
         .rposition(|b| !is_edge_space(*b))
         .map_or(bytes.len(), |p| p + 1);
-    // The edges are ASCII, so both ends are character boundaries.
-    let key = &raw[start..end];
-    let kb = key.as_bytes();
+    let kb = &bytes[start..end];
     let n = kb.len();
     let bad = |problem: String| (KeyState::Bad(problem), None);
     if n >= 7 && kb[..7].eq_ignore_ascii_case(b"bearer ") {
@@ -475,11 +556,13 @@ pub fn check_key(raw: Option<&str>) -> (KeyState, Option<String>) {
             "it starts or ends with a quote ({n} bytes): remove the quotes around the key"
         ));
     }
+    // Visible ASCII only here, so the bytes are text.
+    let key = String::from_utf8(kb.to_vec()).expect("a checked key is ASCII");
     (
         KeyState::Usable {
             trimmed: bytes.len() - n,
         },
-        Some(key.to_string()),
+        Some(key),
     )
 }
 
@@ -487,7 +570,7 @@ pub fn check_key(raw: Option<&str>) -> (KeyState, Option<String>) {
 /// ([`check_key`]).
 pub fn read_key(lookup: &KeyLookup, var: &str) -> (KeyState, Option<String>) {
     let raw = lookup(var);
-    check_key(raw.as_deref())
+    check_key_bytes(raw.as_deref())
 }
 
 /// The warning for a key that had surrounding whitespace (never the key).
@@ -847,12 +930,19 @@ struct Inner {
     last_error: Option<String>,
     /// The reservation of the last call the budget refused (USD).
     last_budget_refusal: Option<f64>,
+    /// The smallest reservation the budget itself refused (not a key's
+    /// budget or credit, not the call limit): while what is left cannot hold
+    /// it, the status is `budget_too_small` (nothing used) or
+    /// `budget_exhausted`, never `ready`.
+    budget_refusal: Option<f64>,
 }
 
 /// The OpenRouter client with its ledger and stop state.
 pub struct OracleClient {
     cfg: OracleConfig,
     max_price: (f64, f64),
+    /// [`smallest_body_len`] of `cfg`.
+    min_body_len: usize,
     key: KeyLookup,
     agent: ureq::Agent,
     ledger_path: PathBuf,
@@ -942,6 +1032,7 @@ impl OracleClient {
         Ok(Self {
             cfg: cfg.clone(),
             max_price,
+            min_body_len: smallest_body_len(cfg),
             key,
             agent,
             ledger_path: ledger.to_path_buf(),
@@ -953,6 +1044,7 @@ impl OracleClient {
                 state: state_value,
                 last_error: None,
                 last_budget_refusal: None,
+                budget_refusal: None,
             }),
         })
     }
@@ -1108,6 +1200,15 @@ impl OracleClient {
             if let Err(r) = self.admit(&inner, caller, res) {
                 if r == RefusalReason::Budget {
                     inner.last_budget_refusal = Some(res);
+                    // The budget itself (not a key's budget or credit, not
+                    // the call limit) could not hold this call.
+                    let t = &inner.totals;
+                    if t.calls < self.max_calls(&inner.state)
+                        && t.spent + t.inflight + res > self.budget(&inner.state)
+                    {
+                        inner.budget_refusal =
+                            Some(inner.budget_refusal.map_or(res, |m| m.min(res)));
+                    }
                 }
                 return CallOutcome::Refused(r);
             }
@@ -1134,7 +1235,6 @@ impl OracleClient {
 
         let t0 = Instant::now();
         let http = self.post(&key, body);
-        drop(key);
         let latency = t0.elapsed();
 
         let (outcome, stop) = match http {
@@ -1166,7 +1266,11 @@ impl OracleClient {
                 None,
             ),
             Ok((_, bytes)) => {
-                let p = parse_response(&bytes, questions, &self.cfg.model);
+                let mut p = parse_response(&bytes, questions, &self.cfg.model);
+                // What the upstream says goes to the ledger and messages
+                // only cleaned (never a byte of the key it was sent).
+                p.model = p.model.map(|m| clean_upstream(&m, Some(&key)));
+                p.provider = p.provider.map(|m| clean_upstream(&m, Some(&key)));
                 let stop = p.unexpected_model.then(|| "unexpected_model".to_string());
                 match (p.verdicts, p.usage) {
                     (Ok(verdicts), Some(usage)) => (
@@ -1194,6 +1298,7 @@ impl OracleClient {
                 }
             }
         };
+        drop(key);
         self.settle(caller, &call_id, &key_id, res, latency, &outcome, stop);
         outcome
     }
@@ -1334,11 +1439,12 @@ impl OracleClient {
         }
     }
 
-    /// The reservation of the smallest possible call (an empty body, one
-    /// question): a budget with less left can admit no call.
+    /// The reservation of the smallest possible call (one question of the
+    /// shortest shape, [`smallest_body_len`]): a budget with less left can
+    /// admit no call. A real call's body is longer and reserves more.
     pub fn min_reservation_usd(&self) -> f64 {
         reservation_usd(
-            0,
+            self.min_body_len,
             max_tokens(self.cfg.max_tokens_per_question, 1),
             self.max_price,
         )
@@ -1366,14 +1472,27 @@ impl OracleClient {
         }
         let t = &inner.totals;
         let min = self.min_reservation_usd();
-        if t.calls >= self.max_calls(&inner.state) || self.budget(&inner.state) - t.spent < min {
-            // Used up only when something was spent or reserved; a budget
-            // (or call limit) that could never hold one call is too small.
-            let used = t.calls > 0 || t.spent > 0.0 || t.inflight > 0.0;
+        let budget = self.budget(&inner.state);
+        // Used up only when something was spent or reserved; a budget (or
+        // call limit) that could never hold one call is too small.
+        let used = t.calls > 0 || t.spent > 0.0 || t.inflight > 0.0;
+        if t.calls >= self.max_calls(&inner.state) || budget - t.spent < min {
             return if used {
                 OracleStatus::BudgetExhausted
             } else {
                 OracleStatus::BudgetTooSmall { min_usd: min }
+            };
+        }
+        // The budget holds the smallest possible call but refused a real one,
+        // and what is left still cannot hold it: not ready (calls in flight
+        // aside, which only delay a call).
+        if let Some(r) = inner.budget_refusal
+            && t.spent + r > budget
+        {
+            return if used {
+                OracleStatus::BudgetExhausted
+            } else {
+                OracleStatus::BudgetTooSmall { min_usd: r }
             };
         }
         OracleStatus::Ready
@@ -1393,8 +1512,9 @@ impl OracleClient {
         let t = &inner.totals;
         let budget = self.budget(&inner.state);
         let key = self.key_state();
+        let status = self.status_of(&inner);
         json!({
-            "status": self.status_of(&inner).label(),
+            "status": status.label(),
             "enabled": inner.state.enabled,
             "stop_reason": inner.state.stop_reason,
             "stopped_unix": inner.state.stopped_unix,
@@ -1421,7 +1541,13 @@ impl OracleClient {
             "deadline_s": self.cfg.deadline_s,
             "redact_pii": self.cfg.redact_pii,
             "max_price": {"prompt": self.max_price.0, "completion": self.max_price.1},
-            "min_call_usd": self.min_reservation_usd(),
+            // The least budget a call needs: what a budget too small lacks
+            // (the smallest refused call's reservation, when one was
+            // refused), else the smallest possible call's.
+            "min_call_usd": match status {
+                OracleStatus::BudgetTooSmall { min_usd } => min_usd,
+                _ => self.min_reservation_usd(),
+            },
         })
     }
 
@@ -1824,7 +1950,7 @@ mod tests {
     }
 
     fn key_of(raw: &'static str) -> KeyLookup {
-        Arc::new(move |_| Some(raw.to_string()))
+        key_lookup(move |_| Some(raw.to_string()))
     }
 
     #[test]
@@ -1915,6 +2041,151 @@ mod tests {
         let c1 = OracleClient::open(&one, &spent, None, key).unwrap();
         assert_eq!(c1.status(), OracleStatus::BudgetExhausted);
         assert_eq!(c1.status().label(), "budget_exhausted");
+    }
+
+    #[test]
+    fn the_smallest_call_is_a_real_body_and_a_refused_call_makes_the_budget_too_small() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = key_of("sk-or-v1-abc");
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let base = OracleConfig {
+            enabled: true,
+            base_url: format!("http://127.0.0.1:{port}/api/v1"),
+            ..OracleConfig::default()
+        };
+        // The smallest body carries the system prompt, the model, the
+        // provider and the schema: never a 0-byte body.
+        let smallest = smallest_body_len(&base);
+        let tiny = Question {
+            id: "a".into(),
+            kind: QuestionKind::Choice,
+            instructions: json!(""),
+            criteria: Some(json!({"a": null, "b": null})),
+        };
+        let tiny_body = request_body(&base, &[&tiny], &json!("x"));
+        assert!(smallest > SYSTEM_CHOICE.len() && smallest <= tiny_body.len());
+        let real = q(
+            "t",
+            QuestionKind::Choice,
+            json!({"alpha": "A", "beta": "B"}),
+        );
+        let real_body = request_body(&base, &[&real], &json!("a longer state text"));
+        assert!(real_body.len() > tiny_body.len());
+        let mt = max_tokens(base.max_tokens_per_question, 1);
+        let c = OracleClient::open(&base, &dir.path().join("x.jsonl"), None, key.clone()).unwrap();
+        let price = c.max_price();
+        assert_eq!(
+            c.min_reservation_usd(),
+            reservation_usd(smallest, mt, price)
+        );
+        drop(c);
+        let caller = test_caller();
+
+        // A budget of exactly the smallest reservation: ready, and the
+        // smallest question is sent (here it fails to connect, but it was
+        // admitted and reserved).
+        let tiny_res = reservation_usd(tiny_body.len(), mt, price);
+        let mut exact = base.clone();
+        exact.budget_usd = tiny_res;
+        let c = OracleClient::open(&exact, &dir.path().join("a.jsonl"), None, key.clone()).unwrap();
+        assert_eq!(c.status(), OracleStatus::Ready);
+        match c.call_body(&caller, &[&tiny], &tiny_body) {
+            CallOutcome::Failed(f) => assert_eq!(f.error, "transport_connect", "{f:?}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(c.totals().calls, 1);
+        drop(c);
+
+        // A budget that holds the smallest call but not a longer one:
+        // ready until that call is refused, then too small for it (never
+        // "ready" while every call is refused), with its reservation.
+        let real_res = reservation_usd(real_body.len(), mt, price);
+        let mut between = base.clone();
+        between.budget_usd = (tiny_res + real_res) / 2.0;
+        let c =
+            OracleClient::open(&between, &dir.path().join("b.jsonl"), None, key.clone()).unwrap();
+        assert_eq!(c.status(), OracleStatus::Ready);
+        assert_eq!(
+            c.call_body(&caller, &[&real], &real_body),
+            CallOutcome::Refused(RefusalReason::Budget)
+        );
+        assert_eq!(
+            c.status(),
+            OracleStatus::BudgetTooSmall { min_usd: real_res }
+        );
+        assert_eq!(c.status_json()["min_call_usd"], json!(real_res));
+        assert_eq!(c.status_json()["status"], "budget_too_small");
+        assert_eq!(c.totals().calls, 0, "nothing reserved");
+        drop(c);
+        // Something spent, and what is left holds the smallest call but
+        // refused a real one: exhausted, not ready.
+        let mut spent = base.clone();
+        spent.budget_usd = tiny_res + (tiny_res + real_res) / 2.0;
+        let c = OracleClient::open(&spent, &dir.path().join("d.jsonl"), None, key.clone()).unwrap();
+        assert!(matches!(
+            c.call_body(&caller, &[&tiny], &tiny_body),
+            CallOutcome::Failed(_)
+        ));
+        assert_eq!(c.status(), OracleStatus::Ready);
+        assert_eq!(
+            c.call_body(&caller, &[&real], &real_body),
+            CallOutcome::Refused(RefusalReason::Budget)
+        );
+        assert_eq!(c.status(), OracleStatus::BudgetExhausted);
+        // A per-key budget refusal is not the server's budget being too
+        // small.
+        drop(c);
+        let c = OracleClient::open(&base, &dir.path().join("c.jsonl"), None, key).unwrap();
+        let keyed = Caller {
+            key_budget_usd: Some(tiny_res / 2.0),
+            ..test_caller()
+        };
+        assert_eq!(
+            c.call_body(&keyed, &[&real], &real_body),
+            CallOutcome::Refused(RefusalReason::Budget)
+        );
+        assert_eq!(c.status(), OracleStatus::Ready);
+    }
+
+    #[test]
+    fn upstream_text_is_cleaned_before_a_ledger_or_a_message() {
+        let key = "sk-or-v1-0123456789abcdef";
+        assert_eq!(clean_upstream("DeepInfra", Some(key)), "DeepInfra");
+        assert_eq!(clean_upstream("Bearer sk-or-v1-0123", None), "[redacted]");
+        assert_eq!(clean_upstream("x bearer y", None), "[redacted]");
+        assert_eq!(clean_upstream("SK-OR-V1-ABC", None), "[redacted]");
+        // A piece of the key sent, without its prefix.
+        assert_eq!(clean_upstream("prov-89abcdef", Some(key)), "[redacted]");
+        assert_eq!(clean_upstream("prov-89abcde", Some(key)), "prov-89abcde");
+        // No terminal escapes, bounded.
+        assert_eq!(clean_upstream("a\u{1b}[31mb\u{7}", None), "a[31mb");
+        assert_eq!(
+            clean_upstream(&"p/".repeat(200), None).len(),
+            UPSTREAM_TEXT_MAX
+        );
+    }
+
+    #[test]
+    fn a_key_that_is_not_utf8_is_named_by_its_raw_bytes() {
+        let mut raw = b"sk-or-v1-abc".to_vec();
+        raw.push(0xff);
+        let (st, key) = check_key_bytes(Some(&raw));
+        assert_eq!(key, None);
+        assert_eq!(
+            st.problem(),
+            Some("a byte outside ASCII at byte 13 of 13 (an HTTP header takes visible ASCII only)")
+        );
+        raw.extend_from_slice(&[0xfe, 0xff]);
+        let (st, _) = check_key_bytes(Some(&raw));
+        assert!(st.problem().unwrap().contains("at byte 13 of 15"), "{st:?}");
+        // Surrounding whitespace is trimmed from the raw bytes too.
+        let (st, key) = check_key_bytes(Some(b"\r\nsk-or-v1-abc\r\n"));
+        assert_eq!(st, KeyState::Usable { trimmed: 4 });
+        assert_eq!(key.as_deref(), Some("sk-or-v1-abc"));
     }
 
     #[test]

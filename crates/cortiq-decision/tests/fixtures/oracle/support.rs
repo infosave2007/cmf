@@ -523,7 +523,9 @@ pub fn raw_reply(status: u16, body: &str) -> MockReply {
 // ------------------------------------------------------------------ stand
 
 pub fn test_key_lookup() -> KeyLookup {
-    Arc::new(|name: &str| (name == KEY_ENV).then(|| TEST_KEY.to_string()))
+    cortiq_decision::oracle::key_lookup(|name: &str| {
+        (name == KEY_ENV).then(|| TEST_KEY.to_string())
+    })
 }
 
 pub fn no_key_lookup() -> KeyLookup {

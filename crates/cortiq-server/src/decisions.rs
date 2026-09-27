@@ -3395,7 +3395,7 @@ impl DecisionServer {
 /// in/out $0.07/$0.58 per 1M` or `oracle: NOT ready — OPENROUTER_API_KEY is
 /// not set …`.
 pub fn oracle_startup_line(cascade: &Cascade, cfg: &Config, note: Option<&str>) -> (bool, String) {
-    use cortiq_decision::oracle_setup::{host_of, usd};
+    use cortiq_decision::oracle_setup::{host_of, usd, usd_ceil, usd_fine};
     use cortiq_decision::service::OracleStatus;
     let oracle = cascade.oracle();
     let o = &cfg.oracle;
@@ -3464,11 +3464,11 @@ pub fn oracle_startup_line(cascade: &Cascade, cfg: &Config, note: Option<&str>) 
             } else {
                 let (p, c) = oracle.max_price();
                 format!(
-                    "oracle: NOT ready — the budget is too small: {budget_text} cannot hold one call, which reserves at least {} at the max price in/out {}/{} per 1M ({what}; restart with --oracle-budget of at least {})",
-                    usd(min_usd),
+                    "oracle: NOT ready — the budget is too small: {budget_text} cannot hold one call; the smallest possible one (one short question) reserves {} at the max price in/out {}/{} per 1M, a longer one more ({what}; restart with --oracle-budget of at least {}, more for longer questions)",
+                    usd_fine(min_usd),
                     usd(p),
                     usd(c),
-                    usd(min_usd)
+                    usd_ceil(min_usd)
                 )
             },
         ),

@@ -521,7 +521,9 @@ fn oracle_config(oracle: &MockOracle) -> Config {
 }
 
 fn oracle_key() -> KeyLookup {
-    Arc::new(|name: &str| (name == ORACLE_KEY_ENV).then(|| "sk-test-not-a-real-key".to_string()))
+    cortiq_decision::oracle::key_lookup(|name: &str| {
+        (name == ORACLE_KEY_ENV).then(|| "sk-test-not-a-real-key".to_string())
+    })
 }
 
 fn no_key() -> KeyLookup {

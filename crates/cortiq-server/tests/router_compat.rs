@@ -784,7 +784,9 @@ fn oracle_config(url: &str) -> Config {
 }
 
 fn oracle_key() -> KeyLookup {
-    Arc::new(|name: &str| (name == ORACLE_KEY_ENV).then(|| "sk-test-not-a-real-key".to_string()))
+    cortiq_decision::oracle::key_lookup(|name: &str| {
+        (name == ORACLE_KEY_ENV).then(|| "sk-test-not-a-real-key".to_string())
+    })
 }
 
 // ------------------------------------------------------------------ /v1/route: success shapes

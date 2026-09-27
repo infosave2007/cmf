@@ -1150,7 +1150,7 @@ fn offline_learning_asks_only_about_abstentions_and_reuses_ledger_answers() {
     let mock3 = MockOracle::answering("travel");
     let d3 = tempfile::tempdir().unwrap();
     let opts3 = offline_opts(d3.path(), &mock3, &traffic, vec![]);
-    let bad: oracle::KeyLookup = Arc::new(|name: &str| {
+    let bad: oracle::KeyLookup = oracle::key_lookup(|name: &str| {
         (name == KEY_ENV).then(|| format!("{}\r\n{}", &TEST_KEY[..10], &TEST_KEY[10..]))
     });
     let e = format!(

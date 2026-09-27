@@ -95,14 +95,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `decision oracle check`, `decision learn`): the key read from its variable
   loses surrounding spaces, tabs, CR and LF (a `.env` file's) with a warning
   that says so; a value that still holds whitespace, a control byte or a byte
-  outside ASCII, starts with `Bearer ` or is quoted is `bad_key`, named by
-  position and length and never sent. Transport and read errors are fixed
-  codes (`transport_connect`, `transport_timeout`, `transport_bad_header`,
-  `read_io`, …), never a library's text, which could hold the request's
-  `Authorization` header. A key-like value (holding `sk-or-`, starting with
-  `Bearer `, with surrounding whitespace, or longer than 40 bytes without a
-  `/`) given as a model id or a variable's name is refused whatever its
-  prefix, only its length shown.
+  outside ASCII, starts with `Bearer ` or starts or ends with a quote is
+  `bad_key`, named by position and length among its raw bytes and never
+  sent. Transport and read errors are fixed codes (`transport_connect`,
+  `transport_timeout`, `transport_bad_header`, `read_io`, …), never a
+  library's text, which could hold the request's `Authorization` header;
+  what an upstream answers (`provider`, `model`, listing names) is kept to
+  visible ASCII and `[redacted]` when it holds `Bearer`, looks like a key or
+  holds a piece of the key sent. A key-like value (holding `sk-or-` or
+  starting with `sk-` in any case, starting with `Bearer `, with surrounding
+  whitespace, or longer than 40 bytes without a `/`; an upper-case variable
+  name is a name at any length) given as a model id or a variable's name is
+  refused whatever its prefix, only its length shown; so is a model id
+  without a `/`, a variable's name starting with a digit, a value a numeric
+  oracle flag refuses and a string a `--decision-config` gives where a
+  number belongs. `budget_too_small` names the least budget that holds a
+  call, rounded up to the micro-dollar; a server whose budget holds the
+  smallest possible call (one short question: the system prompt and schema
+  are always sent) but refused a real one with nothing spent reports
+  `budget_too_small` with that call's reservation instead of `ready` (and
+  `budget_exhausted` once something was spent).
 - `cortiq decide FILE -p TEXT | --input ROWS --oracle MODEL`: the text is
   decided locally first, and only one the gate rejects (or whose labels no
   skill has) is sent, in one call with the server's reservation ledger,
