@@ -45,8 +45,10 @@
 # initialised (CMF_GPU=0) and there is no network access.
 #
 # Environment (defaults):
-#   CMFPUBLIC   /Users/oleg/dev/cmfpublic
-#   ENC_SRC     /Users/oleg/Documents/cortiq-bot/cortiq-router/registry_bake
+#   CMFPUBLIC   the directory holding artifacts/ and reports/ (default: the
+#               repository root)
+#   ENC_SRC     required, no default: the directory with encoder.onnx and
+#               encoder_tokenizer/ (cortiq-router's registry_bake)
 #   B, C, M     the BANKING77 / CLINC150 / MASSIVE split directories of spec §3.8
 #   CV          $CMFPUBLIC/reports/decision-v4-20260926/max-recipe/cv.json (K = 16
 #               for every skill when it is missing; recorded in build-release.json)
@@ -56,8 +58,8 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CMFPUBLIC="${CMFPUBLIC:-/Users/oleg/dev/cmfpublic}"
-ENC_SRC="${ENC_SRC:-/Users/oleg/Documents/cortiq-bot/cortiq-router/registry_bake}"
+CMFPUBLIC="${CMFPUBLIC:-$REPO}"
+ENC_SRC="${ENC_SRC:-}"
 B="${B:-$CMFPUBLIC/artifacts/decision-v2-20260926/splits/banking77}"
 C="${C:-$CMFPUBLIC/artifacts/decision-clinc150-20260925/data}"
 M="${M:-$CMFPUBLIC/artifacts/decision-massive-20260926/data}"
@@ -81,7 +83,7 @@ while [ $# -gt 0 ]; do
         --skip-cargo) SKIP_CARGO=1; shift ;;
         --threads-a) THREADS_A="$2"; shift 2 ;;
         --threads-b) THREADS_B="$2"; shift 2 ;;
-        -h|--help) sed -n '2,62p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,57p' "$0"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -100,6 +102,7 @@ die() { log "ERROR: $*"; exit 1; }
 sha256() { shasum -a 256 "$1" | awk '{print $1}'; }
 now() { "$PYTHON" -c 'import time; print(f"{time.time():.3f}")'; }
 
+[ -n "$ENC_SRC" ] || die "set ENC_SRC to the directory with encoder.onnx and encoder_tokenizer/ (no default)"
 for f in "$ENC_SRC/encoder.onnx" "$ENC_SRC/encoder_tokenizer/tokenizer.json" "$ENC_SRC/encoder_tokenizer/vocab.txt"; do
     [ -f "$f" ] || die "missing encoder source $f"
 done

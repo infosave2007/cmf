@@ -121,8 +121,10 @@ a new label starts a cold start.
 * **Reservation first.** Before each call the server reserves
   `((body bytes + 4096) · max_price.prompt + max_tokens · max_price.completion) / 1e6`
   USD. The call is made only if spent + reservations in flight + this
-  reservation ≤ `budget_usd`, calls < `max_calls`, and for the caller's key
-  spent + reservation ≤ its `oracle_budget_usd`.
+  reservation ≤ `budget_usd`, calls < `max_calls`, for the caller's key
+  spent + reservation ≤ its `oracle_budget_usd`, and, for a key with
+  `credit_usd` when the oracle is billed (`oracle_passthrough`), reservation
+  × `oracle_markup` ≤ the credit left.
 * **Ledger.** `oracle.jsonl` gets a `reserved` line, fsynced, before the
   request leaves; after the answer a `settled`, `failed_billed` or
   `failed_unknown_cost` line with the cost, tokens and latency. At start any

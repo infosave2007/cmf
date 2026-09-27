@@ -495,6 +495,10 @@ pub struct Escalation<'a> {
     pub request: &'a DecisionRequest,
     pub features: &'a Features,
     pub pending: Vec<Pending<'a>>,
+    /// The most the oracle may cost this request (the provider's own USD)
+    /// before the caller's `credit_usd` is used up (see
+    /// [`DecisionService::oracle_credit_left`]); `None`: no such limit.
+    pub oracle_credit_usd: Option<f64>,
 }
 
 /// Admin operations served by the escalator (spec §5b).
@@ -919,6 +923,54 @@ impl DecisionService {
         Ok(())
     }
 
+    /// Room for `questions` more decisions under the decision quota (402):
+    /// a request with more questions than the quota has left is refused
+    /// before any work, so one `/v1/decisions` request cannot run past it.
+    /// With the quota used up the error is [`DecisionService::check_quotas`]'s.
+    pub fn check_decision_room(&self, p: &Principal, questions: usize) -> Result<(), ApiError> {
+        if p.decision_quota == 0 {
+            return Ok(());
+        }
+        let used = self.totals(&p.account).decisions;
+        let asked = questions as u64;
+        if used >= p.decision_quota {
+            return self.check_quotas(p);
+        }
+        if used.saturating_add(asked) > p.decision_quota {
+            let left = p.decision_quota - used;
+            return Err(ApiError::new(
+                Reason::QuotaExceeded,
+                format!(
+                    "decision quota exceeded: the request has {asked} questions and {left} decisions are left"
+                ),
+            )
+            .with_detail("quota", json!("decision"))
+            .with_detail("used", json!(used))
+            .with_detail("limit", json!(p.decision_quota))
+            .with_detail("requested", json!(asked)));
+        }
+        Ok(())
+    }
+
+    /// The most the oracle may cost a request of `p` (the provider's own USD)
+    /// before `p`'s `credit_usd` is used up: `(credit − cost so far) / markup`
+    /// with passthrough. `None` without a credit limit, or when the oracle is
+    /// not billed (no passthrough, or a zero markup). The cascade refuses a
+    /// call whose reservation does not fit (`budget`); the request's own local
+    /// prices can still take it past the credit by one request.
+    pub fn oracle_credit_left(&self, p: &Principal) -> Option<f64> {
+        let credit = p.credit_usd?;
+        if !self.rates.oracle_passthrough {
+            return None;
+        }
+        let markup = self.rates.oracle_markup.to_f64();
+        if markup <= 0.0 {
+            return None;
+        }
+        let used = self.totals(&p.account).cost_usd.to_f64();
+        Some((credit.to_f64() - used).max(0.0) / markup)
+    }
+
     /// Take an in-flight slot (`max_inflight`, else 429 `OVERLOADED`).
     pub fn enter(&self) -> Result<InflightGuard, ApiError> {
         let max = self.cfg.limits.max_inflight;
@@ -983,6 +1035,7 @@ impl DecisionService {
         let id = new_request_id(created);
         let model = self.handle.current();
         check_pinned(&model, req)?;
+        self.check_decision_room(p, req.questions.len())?;
 
         // Matching.
         let matches = match_questions(&model, req)?;
@@ -1034,6 +1087,7 @@ impl DecisionService {
                         request: req,
                         features: &features,
                         pending,
+                        oracle_credit_usd: self.oracle_credit_left(p),
                     };
                     let result = esc.escalate(&e);
                     oracle_usage = result.usage;

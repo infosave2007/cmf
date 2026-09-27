@@ -6,9 +6,9 @@
 //! `default_per_request`). A question the gate accepted never reaches it (spec
 //! §5.1). For one request (spec §5.2):
 //! 1. **permission**: the admin switch, a key in the environment, no stop
-//!    reason, a budget left (globally, calls, the key's `oracle_budget_usd`);
-//!    otherwise every question is refused (`oracle_disabled`, `stopped`,
-//!    `budget`);
+//!    reason, a budget left (globally, calls, the key's `oracle_budget_usd`
+//!    and what its `credit_usd` has left); otherwise every question is
+//!    refused (`oracle_disabled`, `stopped`, `budget`);
 //! 2. **cache** ([`crate::cache`]): a hit answers the question at no cost;
 //! 3. **single flight**: a question whose scope is in flight in another request
 //!    with cos φ_P ≥ `cache.threshold` waits for that call and reuses its answer
@@ -667,6 +667,7 @@ impl Escalator for Cascade {
             account: &e.principal.account,
             key12: e.principal.key12.as_deref(),
             key_budget_usd: e.principal.oracle_budget_usd.map(Usd::to_f64),
+            credit_left_usd: e.oracle_credit_usd,
         };
         if let Err(r) = inner.oracle.permission(&caller) {
             return EscalationResult {

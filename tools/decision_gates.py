@@ -6,8 +6,10 @@
         [--out-dir DIR] [--work DIR] [--cortiq BIN] [--no-release] [--no-http]
 
 Defaults: BASE = $ART/cortiq-decision-base.cmf, RELEASE = $ART/release/cortiq-decision.cmf,
-DIR = $ART, with ART = /Users/oleg/dev/cmfpublic/artifacts/decision-v4-20260926. Nothing
-touches the network: the oracle answers come from the stored ledgers only.
+DIR = $ART, with ART = $CMFPUBLIC/artifacts/decision-v4-20260926 (CMFPUBLIC: the
+directory holding artifacts/ and reports/, default the repository root). ENC_SRC (the
+directory with encoder.onnx and encoder_tokenizer/, required for E1–E5) has no default.
+Nothing touches the network: the oracle answers come from the stored ledgers only.
 
 gates.json — the reproduction model (§3.8: train only, K = 16):
 
@@ -70,15 +72,15 @@ import time
 
 import numpy as np
 
-CMFPUBLIC = os.environ.get("CMFPUBLIC", "/Users/oleg/dev/cmfpublic")
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CMFPUBLIC = os.environ.get("CMFPUBLIC") or REPO
 ART = os.path.join(CMFPUBLIC, "artifacts", "decision-v4-20260926")
 ACCESS_LOG = os.path.join(ART, "test-access.log")
 V3_DIR = os.path.join(CMFPUBLIC, "artifacts", "decision-v3-20260926")
 V3_EVAL = os.path.join(CMFPUBLIC, "reports", "decision-v3-20260926", "evaluate", "batch")
 ORACLE_DIR = os.path.join(CMFPUBLIC, "reports", "decision-v4-20260926", "oracle")
 CV_JSON = os.path.join(CMFPUBLIC, "reports", "decision-v4-20260926", "max-recipe", "cv.json")
-ENC_SRC = os.environ.get("ENC_SRC", "/Users/oleg/Documents/cortiq-bot/cortiq-router/registry_bake")
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ENC_SRC = os.environ.get("ENC_SRC") or None
 SPLITS = {
     "banking77": os.path.join(CMFPUBLIC, "artifacts/decision-v2-20260926/splits/banking77"),
     "clinc150": os.path.join(CMFPUBLIC, "artifacts/decision-clinc150-20260925/data"),
@@ -739,6 +741,9 @@ def main():
     ap.add_argument("--no-release", action="store_true")
     ap.add_argument("--no-http", action="store_true")
     a = ap.parse_args()
+    if not ENC_SRC:
+        sys.exit("decision_gates: set ENC_SRC to the directory with encoder.onnx and encoder_tokenizer/ "
+                 "(the encoder source of gates E1–E5)")
     work = a.work or os.path.join(a.out_dir, "gates-work")
     os.makedirs(work, exist_ok=True)
     cortiq = a.cortiq

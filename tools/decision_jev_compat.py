@@ -14,7 +14,8 @@ Per dataset (BANKING77 3080, CLINC150 4500, MASSIVE 2974 test rows):
   equal the row's `request_sha256` (100 %).
 * **Sent to the local server.** One replacement `"model": "typesafe/jev-1.13"` ->
   `"model": "cortiq/decision"`, POST /api/alpha/decisions to `cortiq serve MODEL`
-  (127.0.0.1, fresh state directory, open mode, oracle disabled), one keep-alive
+  (127.0.0.1, fresh state directory, open mode by `auth.require: null` on
+  loopback, oracle disabled), one keep-alive
   connection, in ledger order. Required on 100 % of the rows: HTTP 200; the
   response passes the port of `openrouter_bench.validate_oracle_response`
   (`:155-199`, the validator Jev's answers passed; only the model pattern is
@@ -37,8 +38,10 @@ file carries the 0.7.x-era names `"model": "cortiq/decision-v1"` and
 * Oracle disabled (the server above): 422 `UNSUPPORTED_QUESTION` with a reason
   for each of the three questions.
 * Oracle enabled against a local mock of OpenRouter (a thread in this process,
-  a dummy key in a dedicated environment variable; nothing leaves the machine):
-  200, one oracle call, all three answers valid (choice in the options, score an
+  a dummy key in a dedicated environment variable; nothing leaves the machine),
+  on a second server in explicit open mode (`auth.require: false`: since 0.7.8
+  the open caller of a loopback server with `auth.require: null` may not reach
+  the oracle): 200, one oracle call, all three answers valid (choice in the options, score an
   integer level with its legend, noul 0/1), and the body the mock received is
   canonical JSON with the schema of the three questions.
 
@@ -68,9 +71,10 @@ import time
 
 import numpy as np
 
-CMFPUBLIC = os.environ.get("CMFPUBLIC", "/Users/oleg/dev/cmfpublic")
-ACCESS_LOG = os.path.join(CMFPUBLIC, "artifacts", "decision-v4-20260926", "test-access.log")
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# The directory holding artifacts/ and reports/ (default: the repository root).
+CMFPUBLIC = os.environ.get("CMFPUBLIC") or REPO
+ACCESS_LOG = os.path.join(CMFPUBLIC, "artifacts", "decision-v4-20260926", "test-access.log")
 DATASETS = {
     "banking77": {
         "split_dir": os.path.join(CMFPUBLIC, "artifacts/decision-v2-20260926/splits/banking77"),
@@ -533,7 +537,10 @@ def run_multitype(srv_disabled, cortiq, model, workdir):
     mock = MockOracle()
     srv = None
     try:
-        cfg = {"oracle": {"enabled": True, "base_url": f"http://127.0.0.1:{mock.port}", "api_key_env": MOCK_KEY_ENV,
+        # Explicit open mode: with auth.require null (loopback) the open caller
+        # may neither reach the oracle nor teach (Principal::open_implicit).
+        cfg = {"auth": {"require": False},
+               "oracle": {"enabled": True, "base_url": f"http://127.0.0.1:{mock.port}", "api_key_env": MOCK_KEY_ENV,
                           "model": ORACLE_MODEL, "budget_usd": 0.01, "max_calls": 5},
                "learning": {"enabled": False}}
         srv = Server(cortiq, model, workdir, "mock-oracle", config=cfg, extra_env={MOCK_KEY_ENV: MOCK_KEY})

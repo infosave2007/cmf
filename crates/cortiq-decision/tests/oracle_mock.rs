@@ -477,6 +477,34 @@ fn max_calls_and_the_key_budget_limit_calls() {
     assert_eq!(settled["account"], "acme");
 }
 
+#[test]
+fn the_callers_credit_limits_oracle_calls() {
+    // A reservation that does not fit in what the key's `credit_usd` has
+    // left makes no call (`budget`), as one past `oracle_budget_usd`.
+    let mock = MockOracle::answering("travel");
+    let st = Stand::new(&stand_config(&mock.url()));
+    let mut p = Principal::open();
+    p.account = "credit".into();
+    p.key12 = Some("0123456789ab".into());
+    p.credit_usd = Some(Usd::parse("0.0001").unwrap());
+    let d = st.decide_as(&topics_body(&rejected()[3]), &p).unwrap();
+    assert_eq!(flags(&d, 0), vec!["budget"]);
+    assert_eq!(mock.hits(), 0);
+    assert!(st.ledger().is_empty(), "no reservation was written");
+    p.credit_usd = Some(Usd::parse("1").unwrap());
+    let d = st.decide_as(&topics_body(&rejected()[3]), &p).unwrap();
+    assert_eq!(d.questions[0].action, Action::Oracle);
+    assert_eq!(mock.hits(), 1);
+    // An oracle the client does not pay for is not limited by the credit.
+    let mut cfg = stand_config(&mock.url());
+    cfg.pricing.oracle_passthrough = false;
+    let st = Stand::new(&cfg);
+    p.credit_usd = Some(Usd::parse("0.0001").unwrap());
+    let d = st.decide_as(&topics_body(&rejected()[4]), &p).unwrap();
+    assert_eq!(d.questions[0].action, Action::Oracle);
+    assert_eq!(mock.hits(), 2);
+}
+
 // ------------------------------------------------------------------ stop rules
 
 fn enable(st: &Stand) {

@@ -97,9 +97,15 @@ process per state directory; the CLI may change `keys.json` while it runs
 * A rate window is one fixed minute per account; quotas and credit are
   checked before any work is done, and again before every input of a
   `/v1/route:batch` after the first (402 at the input that finds them used
-  up). A *decision* is one answered question; one `/v1/decisions` request can
-  go past a quota or the credit by its own questions (at most 32) and their
-  cost.
+  up). A *decision* is one answered question: a `/v1/decisions` request
+  with more questions than the decision quota has left is refused (402,
+  `requested` in the details) before any work. An oracle call is made only
+  when its reserved worst-case cost (times `oracle_markup`) fits in the
+  credit left; otherwise the questions get the `budget` flag, as past the
+  key's `oracle_budget_usd`. The token quota and the local prices are
+  checked before the request only, so one request can still go past them
+  by its own tokens and price; parallel requests of one account are each
+  checked against the usage recorded before them.
 * **Teaching the model** is a permission of its own, `learning_allowed`
   (default false for every key, created or imported): the key's feedback is
   learned (a label the skill does not have starts a cold start), and the
@@ -632,11 +638,40 @@ labels are kept (conflicts are reported). A label with a single training row
 is kept inactive.
 
 ```bash
-# the router's datasets_dir layout: one directory per label, *.txt lines
-for d in datasets/*/; do
-  label=$(basename "$d")
-  cat "$d"*.txt | jq -Rc --arg l "$label" 'select(length > 0) | {text: ., label: $l}'
-done > train.jsonl
+# the router's datasets_dir layout, read as its read_label_prompts does: one
+# directory per label, every file in it, one text per line (trimmed, blank
+# lines skipped); in a .jsonl file the line's "text" (else "prompt") string,
+# else the line itself; a file that is not UTF-8 is skipped
+python3 - datasets > train.jsonl <<'PY'
+import json, os, sys
+root = sys.argv[1]
+for label in sorted(os.listdir(root)):
+    d = os.path.join(root, label)
+    if not os.path.isdir(d):
+        continue
+    for name in sorted(os.listdir(d)):
+        p = os.path.join(d, name)
+        if not os.path.isfile(p):
+            continue
+        try:
+            lines = open(p, encoding="utf-8").read().split("\n")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for line in lines:
+            text = line.strip()
+            if not text:
+                continue
+            if name.endswith(".jsonl"):
+                try:
+                    v = json.loads(text)
+                except ValueError:
+                    v = None
+                if isinstance(v, dict):
+                    t = v["text"] if "text" in v else v.get("prompt")
+                    if isinstance(t, str):
+                        text = t
+            print(json.dumps({"text": text, "label": label}, ensure_ascii=False))
+PY
 cat > question.json <<'EOF'
 {
   "instructions": "Classify the task type of the user request.",

@@ -1136,6 +1136,7 @@ pub fn learn_offline(
                         account: "decision-learn",
                         key12: None,
                         key_budget_usd: None,
+                        credit_left_usd: None,
                     };
                     // A live call is one that was sent (answered or failed);
                     // refusals (budget, stop rule, …) are counted apart.
