@@ -112,16 +112,40 @@ pub struct OracleFlags {
     pub no_learning: bool,
 }
 
-/// `IN,OUT`: two finite non-negative numbers, USD per 1M tokens.
+/// Refuse a value given to a numeric flag that looks like a key
+/// ([`crate::config::looks_like_key`], its surrounding whitespace aside),
+/// without showing it: only its length.
+pub fn refuse_key_in_number(s: &str) -> Result<()> {
+    if let Some(why) = crate::config::looks_like_key(s.trim()) {
+        bail!(
+            "a number is expected here, not the key: put the key in its environment variable \
+             (OPENROUTER_API_KEY by default). The given value looks like a key ({why}); it ({} \
+             bytes) is not shown",
+            s.len()
+        );
+    }
+    Ok(())
+}
+
+/// `IN,OUT`: two finite non-negative numbers, USD per 1M tokens. An error
+/// never holds the value (a key pasted here would land in the terminal and
+/// every captured log), only lengths.
 pub fn parse_max_price(s: &str) -> Result<(f64, f64)> {
+    refuse_key_in_number(s)?;
     let Some((a, b)) = s.split_once(',') else {
-        bail!("expected IN,OUT (USD per 1M prompt and completion tokens), e.g. 0.1,0.5");
+        bail!(
+            "expected IN,OUT (USD per 1M prompt and completion tokens), e.g. 0.1,0.5; the given \
+             value ({} bytes) has no comma",
+            s.len()
+        );
     };
     let num = |x: &str, what: &str| -> Result<f64> {
-        let v: f64 = x
-            .trim()
-            .parse()
-            .map_err(|_| anyhow::anyhow!("{what} price '{}' is not a number", x.trim()))?;
+        let v: f64 = x.trim().parse().map_err(|_| {
+            anyhow::anyhow!(
+                "{what} price ({} bytes) is not a number; expected IN,OUT, e.g. 0.1,0.5",
+                x.trim().len()
+            )
+        })?;
         ensure!(
             v.is_finite() && v >= 0.0,
             "{what} price must be finite and non-negative"
@@ -132,9 +156,10 @@ pub fn parse_max_price(s: &str) -> Result<(f64, f64)> {
 }
 
 /// A model id usable in a listing URL: 1..256 bytes, no whitespace or
-/// control character, no empty, `.` or `..` path segment, and not a key
-/// (whatever its prefix, [`crate::config::looks_like_key`]: refused without
-/// being shown, and never put in a URL).
+/// control character, `author/slug` (a `/`, no empty, `.` or `..` path
+/// segment), and not a key (whatever its prefix,
+/// [`crate::config::looks_like_key`]). A value refused is never shown (only
+/// its length) and never put in a URL.
 fn check_model_id(model: &str) -> Result<()> {
     check_model_id_as(model, "--oracle", "--oracle-key-env")
 }
@@ -149,14 +174,26 @@ fn check_model_id_as(model: &str, flag: &str, key_env_flag: &str) -> Result<()> 
             model.len()
         );
     }
-    ensure!(
-        !model.is_empty()
-            && model.len() <= 256
-            && !model.chars().any(|c| c.is_whitespace() || c.is_control())
-            && model.split('/').all(|seg| !matches!(seg, "" | "." | "..")),
-        "{flag} expects an OpenRouter model id such as deepseek/deepseek-v4.1-flash, got '{}'",
-        model.escape_debug()
-    );
+    // Never echoed either: a secret without a key's usual shape would
+    // otherwise land in the error (and, accepted, in a listing URL).
+    let why = if model.is_empty() || model.len() > 256 {
+        Some("it is not 1..256 bytes")
+    } else if model.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        Some("it holds whitespace or a control character")
+    } else if !model.contains('/') {
+        Some("it has no '/' (an OpenRouter model id is author/slug)")
+    } else if model.split('/').any(|seg| matches!(seg, "" | "." | "..")) {
+        Some("it has an empty, '.' or '..' segment")
+    } else {
+        None
+    };
+    if let Some(why) = why {
+        bail!(
+            "{flag} expects an OpenRouter model id such as deepseek/deepseek-v4.1-flash: {why}; \
+             the given value ({} bytes) is not shown",
+            model.len()
+        );
+    }
     Ok(())
 }
 
@@ -164,7 +201,7 @@ fn check_model_id_as(model: &str, flag: &str, key_env_flag: &str) -> Result<()> 
 /// `[A-Za-z0-9_]`, and not a key ([`crate::config::looks_like_key`]); the
 /// value is never shown, only its length.
 fn check_key_env_name(name: &str, flag: &str) -> Result<()> {
-    let why = crate::config::looks_like_key(name)
+    let why = crate::config::name_looks_like_key(name)
         .map(|w| format!(": the given value looks like a key ({w})"))
         .unwrap_or_default();
     ensure!(
@@ -219,6 +256,38 @@ pub fn usd(x: f64) -> String {
         return format!("${x}");
     }
     let mut s = format!("{x:.6}");
+    while s.ends_with('0') && s.split_once('.').is_some_and(|(_, d)| d.len() > 2) {
+        s.pop();
+    }
+    if s == "0.00" && x > 0.0 {
+        s = format!("{x:.2e}");
+    }
+    format!("${s}")
+}
+
+/// A minimum given as advice for a flag ("pass --oracle-budget of at least
+/// …"): `x` rounded UP to the micro-dollar, so that passing the printed value
+/// admits what needs `x` ([`usd`] rounds to nearest, which may print less).
+pub fn usd_ceil(x: f64) -> String {
+    if !x.is_finite() || x <= 0.0 {
+        return usd(x);
+    }
+    let mut m = (x * 1e6).ceil();
+    // `m / 1e6` is the value the printed decimal parses back to.
+    if m / 1e6 < x {
+        m += 1.0;
+    }
+    usd(m / 1e6)
+}
+
+/// An amount stated (not advised) with up to eight decimals, so that a
+/// reservation such as $0.00178924 is not shown rounded to the budget
+/// that could not hold it.
+pub fn usd_fine(x: f64) -> String {
+    if !x.is_finite() {
+        return format!("${x}");
+    }
+    let mut s = format!("{x:.8}");
     while s.ends_with('0') && s.split_once('.').is_some_and(|(_, d)| d.len() > 2) {
         s.pop();
     }
@@ -358,7 +427,7 @@ fn parse_listing(body: &[u8]) -> Option<(Vec<Endpoint>, Vec<bool>)> {
             .find_map(|k| e.get(*k).and_then(Value::as_str))
             .unwrap_or("unnamed");
         priced.push(Endpoint {
-            provider: name.chars().filter(|c| !c.is_control()).take(80).collect(),
+            provider: crate::oracle::clean_upstream(name, None),
             prompt,
             completion,
             structured,
@@ -407,6 +476,9 @@ pub fn parse_models(body: &[u8]) -> Option<Vec<ListedModel>> {
                 if id.ends_with(":free")
                     || id.len() > 256
                     || id.chars().any(|c| c.is_whitespace() || c.is_control())
+                    || !id.bytes().all(|b| b.is_ascii_graphic())
+                    || id.to_ascii_lowercase().contains("bearer")
+                    || crate::config::looks_like_key(id).is_some()
                     || !supports_structured(m.get("supported_parameters"))
                 {
                     return None;
@@ -1155,7 +1227,11 @@ impl TestCall {
                  such a call)",
                 why(stop)
             ),
-            (None, Some(code)) => format!("failed ({code}{billed}): {}", why(code)),
+            // The code is named once, in the parentheses.
+            (None, Some(code)) => format!(
+                "failed ({code}{billed}): {}",
+                error_words(code, key_env, model)
+            ),
             (None, None) => "no answer".to_string(),
         })
     }
@@ -1974,6 +2050,17 @@ mod tests {
         assert!(e.contains("OpenRouter model id"), "{e}");
         let e = bad(flags("a/../b", "http://127.0.0.1:9/v1"));
         assert!(e.contains("OpenRouter model id"), "{e}");
+        // A value without '/' (a short secret of no known shape, a hex
+        // string) is not a model id, and is never shown.
+        for v in ["97b727bdfe44e04718e4047763da731a", "SECRETVALUE1234"] {
+            let e = bad(flags(v, "http://127.0.0.1:9/v1"));
+            assert!(e.contains("has no '/'") && !e.contains(&v[..8]), "{e}");
+        }
+        let e = bad(flags("SK-OR-V1-ABCDEF0123", "http://127.0.0.1:9/v1"));
+        assert!(
+            e.contains("looks like a key") && !e.contains("ABCDEF"),
+            "{e}"
+        );
         // A key typed where the variable's name belongs is refused and never
         // shown; so is a key given as the model (and it is not fetched).
         let key = "sk-or-v1-00112233445566778899aabbccddeeff";
@@ -2002,6 +2089,17 @@ mod tests {
         assert!(parse_max_price("0.1").is_err());
         assert!(parse_max_price("-1,2").is_err());
         assert!(parse_max_price("x,2").is_err());
+        // Never echoed: a key pasted here is refused by its length only.
+        for v in [
+            "sk-or-v1-0123456789abcdef",
+            "0.1,sk-or-v1-0123456789abcdef",
+            "notanumber-secret,0.5",
+            "0.1 secretvalue",
+        ] {
+            let e = format!("{:#}", parse_max_price(v).unwrap_err());
+            assert!(!e.contains("0123456789") && !e.contains("secret"), "{e}");
+            assert!(e.contains("bytes"), "{e}");
+        }
     }
 
     fn key_description() -> String {
@@ -2040,7 +2138,8 @@ mod tests {
             ("/api/v1/models", 200, models()),
         ]);
         let secret = "sk-or-v1-unit-check-0011223344556677";
-        let key: KeyLookup = Arc::new(move |n| (n == "UNIT_OR_KEY").then(|| secret.to_string()));
+        let key: KeyLookup =
+            crate::oracle::key_lookup(move |n| (n == "UNIT_OR_KEY").then(|| secret.to_string()));
         let r = check(&check_opts("a/b", &m.base), &key).unwrap();
         assert!(r.ready(), "{:?}", r.problems());
         assert_eq!(r.max_price, Some((0.07, 0.58)));
@@ -2181,7 +2280,7 @@ mod tests {
         ]);
         let secret = "sk-or-v1-unit-TRIM-0011223344556677";
         let lookup = |raw: String| -> KeyLookup {
-            Arc::new(move |n| (n == "UNIT_OR_KEY").then(|| raw.clone()))
+            crate::oracle::key_lookup(move |n| (n == "UNIT_OR_KEY").then(|| raw.clone()))
         };
         // Surrounding whitespace (a .env file's CR LF): trimmed, the account
         // checked with the key alone, and the report says so.
@@ -2341,6 +2440,19 @@ mod tests {
 
     #[test]
     fn helpers_format_and_encode() {
+        // Advice rounds up (the printed figure holds the amount), a
+        // statement shows more digits.
+        assert_eq!(usd(0.00178924), "$0.001789");
+        assert_eq!(usd_ceil(0.00178924), "$0.00179");
+        assert_eq!(usd_fine(0.00178924), "$0.00178924");
+        assert_eq!(usd_ceil(0.001789), "$0.001789");
+        assert_eq!(usd_ceil(1.0), "$1.00");
+        assert_eq!(usd_ceil(1e-9), "$0.000001");
+        for x in [0.00178924, 0.00034288, 0.000283, 1.3e-5, 0.1 + 0.2, 7.0e-6] {
+            let printed: f64 = usd_ceil(x)[1..].parse().unwrap();
+            assert!(printed >= x, "{x} -> {printed}");
+            assert!(printed - x < 1.000_001e-6, "{x} -> {printed}");
+        }
         assert_eq!(usd(0.07), "$0.07");
         assert_eq!(usd(0.055), "$0.055");
         assert_eq!(usd(5.0), "$5.00");

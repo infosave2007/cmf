@@ -68,7 +68,9 @@ use cortiq_decision::learn::{self, OfflineOptions, OfflineReport};
 use cortiq_decision::ledger::UsageLedger;
 use cortiq_decision::manifest::{Gate, SkillManifest, TaskState};
 use cortiq_decision::oracle::{self, LedgerTotals, OracleState};
-use cortiq_decision::oracle_setup::{self, CheckOptions, OracleFlags, OracleSetup, host_of, usd};
+use cortiq_decision::oracle_setup::{
+    self, CheckOptions, OracleFlags, OracleSetup, host_of, usd, usd_ceil, usd_fine,
+};
 use cortiq_decision::protocol::{self, ApiError, FeedbackRequest, MODEL_ID, model_name};
 use cortiq_decision::service::{
     Action, AdminCommand, Decided, DecisionService, Escalation, EscalationResult, Escalator,
@@ -122,10 +124,10 @@ pub struct OracleArgs {
     pub oracle: Option<String>,
     /// With --oracle: the most this server spends on the oracle, USD
     /// [default: 1.0, or oracle.budget_usd of --decision-config]
-    #[arg(long, value_name = "USD", requires = "oracle")]
+    #[arg(long, value_name = "USD", requires = "oracle", value_parser = Quiet(parse_budget))]
     pub oracle_budget: Option<f64>,
     /// With --oracle: the most oracle calls this server makes
-    #[arg(long, value_name = "N", requires = "oracle")]
+    #[arg(long, value_name = "N", requires = "oracle", value_parser = Quiet(parse_calls))]
     pub oracle_max_calls: Option<u64>,
     /// With --oracle: the environment variable holding the OpenRouter key
     /// [default: OPENROUTER_API_KEY]
@@ -138,7 +140,7 @@ pub struct OracleArgs {
     /// With --oracle: max price in USD per 1M prompt and completion tokens,
     /// e.g. 0.1,0.5 [default: twice the model's cheapest structured-output
     /// endpoint]
-    #[arg(long, value_name = "IN,OUT", requires = "oracle", value_parser = parse_max_price)]
+    #[arg(long, value_name = "IN,OUT", requires = "oracle", value_parser = Quiet(parse_max_price))]
     pub oracle_max_price: Option<(f64, f64)>,
     /// With --oracle: do not learn (the oracle's answers and feedback leave
     /// the served model as it is)
@@ -146,8 +148,59 @@ pub struct OracleArgs {
     pub no_oracle_learning: bool,
 }
 
+/// A value parser that never prints the value it refuses: clap's own
+/// "invalid value '…'" would echo a key pasted into a numeric flag. The
+/// error names the flag, the value's length and why.
+#[derive(Clone)]
+pub struct Quiet<T>(fn(&str) -> std::result::Result<T, String>);
+
+impl<T: Clone + Send + Sync + 'static> clap::builder::TypedValueParser for Quiet<T> {
+    type Value = T;
+
+    fn parse_ref(
+        &self,
+        cmd: &clap::Command,
+        arg: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> std::result::Result<T, clap::Error> {
+        let why = match value.to_str() {
+            Some(s) => match (self.0)(s) {
+                Ok(v) => return Ok(v),
+                Err(e) => e,
+            },
+            None => "it is not UTF-8".to_string(),
+        };
+        let flag = arg.map_or_else(|| "a flag".to_string(), |a| format!("'{a}'"));
+        Err(clap::Error::raw(
+            clap::error::ErrorKind::ValueValidation,
+            format!(
+                "invalid value for {flag} ({} bytes, not shown): {why}\n",
+                value.len()
+            ),
+        )
+        .with_cmd(cmd))
+    }
+}
+
 fn parse_max_price(s: &str) -> std::result::Result<(f64, f64), String> {
-    cortiq_decision::oracle_setup::parse_max_price(s).map_err(|e| e.to_string())
+    oracle_setup::parse_max_price(s).map_err(|e| e.to_string())
+}
+
+/// `--oracle-budget USD`: a finite non-negative number (never echoed).
+fn parse_budget(s: &str) -> std::result::Result<f64, String> {
+    oracle_setup::refuse_key_in_number(s).map_err(|e| e.to_string())?;
+    match s.trim().parse::<f64>() {
+        Ok(v) if v.is_finite() && v >= 0.0 => Ok(v),
+        _ => Err("expected a non-negative number of USD, e.g. 0.5".into()),
+    }
+}
+
+/// `--oracle-max-calls N`: a non-negative integer (never echoed).
+fn parse_calls(s: &str) -> std::result::Result<u64, String> {
+    oracle_setup::refuse_key_in_number(s).map_err(|e| e.to_string())?;
+    s.trim()
+        .parse::<u64>()
+        .map_err(|_| "expected a non-negative integer, e.g. 100".into())
 }
 
 impl OracleArgs {
@@ -385,10 +438,10 @@ pub struct DecideOracleArgs {
     pub oracle: Option<String>,
     /// With --oracle: the most this run spends on the oracle, USD; every call
     /// is reserved against it before it is sent [default: 1.0]
-    #[arg(long, value_name = "USD", requires = "oracle")]
+    #[arg(long, value_name = "USD", requires = "oracle", value_parser = Quiet(parse_budget))]
     pub oracle_budget: Option<f64>,
     /// With --oracle: the most oracle calls this run makes [default: 10000]
-    #[arg(long, value_name = "N", requires = "oracle")]
+    #[arg(long, value_name = "N", requires = "oracle", value_parser = Quiet(parse_calls))]
     pub oracle_max_calls: Option<u64>,
     /// With --oracle: the environment variable holding the OpenRouter key
     /// [default: OPENROUTER_API_KEY]
@@ -401,7 +454,7 @@ pub struct DecideOracleArgs {
     /// With --oracle: max price in USD per 1M prompt and completion tokens,
     /// e.g. 0.1,0.5 [default: twice the model's cheapest structured-output
     /// endpoint]
-    #[arg(long, value_name = "IN,OUT", requires = "oracle", value_parser = parse_max_price)]
+    #[arg(long, value_name = "IN,OUT", requires = "oracle", value_parser = Quiet(parse_max_price))]
     pub oracle_max_price: Option<(f64, f64)>,
     /// With --oracle: switch the oracle of the state directory on again after
     /// the fix of what stopped it — a stop rule (a refused key, no credit,
@@ -1169,7 +1222,8 @@ impl OracleRun {
             oracle_setup::prepare(&mut cfg, flags, false)?;
             let esc: Arc<dyn Escalator> = Arc::new(KeylessOracle { reason, status });
             return Ok(Self {
-                svc: DecisionService::open(Arc::clone(handle), cfg.clone(), Some(esc))?,
+                svc: DecisionService::open(Arc::clone(handle), cfg.clone(), Some(esc))?
+                    .without_hint_log(),
                 cascade: None,
                 model: flags.model.clone(),
                 key_env,
@@ -1215,7 +1269,8 @@ impl OracleRun {
         let inherited = st.is_off().then_some(st);
         let esc: Arc<dyn Escalator> = cascade.clone();
         Ok(Self {
-            svc: DecisionService::open(Arc::clone(handle), cfg.clone(), Some(esc))?,
+            svc: DecisionService::open(Arc::clone(handle), cfg.clone(), Some(esc))?
+                .without_hint_log(),
             cascade: Some(cascade),
             model: flags.model.clone(),
             key_env,
@@ -1323,12 +1378,12 @@ impl OracleRun {
             .map_or("-".into(), |p| p.display().to_string());
         let t = self.totals();
         let (next, reserves) = match next {
-            Some(r) => (r, format!("the next call reserves {}", usd(r))),
+            Some(r) => (r, format!("the next call reserves {}", usd_fine(r))),
             None => {
                 let least = self.least_reservation();
                 (
                     least,
-                    format!("every call reserves at least {}", usd(least)),
+                    format!("every call reserves at least {}", usd_fine(least)),
                 )
             }
         };
@@ -1354,16 +1409,20 @@ impl OracleRun {
                     .to_string()
             }
             Some(Limit::RunCalls) => format!(
-                "the {} call{} this run may make are made (--oracle-max-calls): pass a larger \
+                "the {} this run may make {} made (--oracle-max-calls): pass a larger \
                  --oracle-max-calls",
-                self.max_calls,
-                if self.max_calls == 1 { "" } else { "s" }
+                if self.max_calls == 1 {
+                    "1 call".to_string()
+                } else {
+                    format!("{} calls", self.max_calls)
+                },
+                if self.max_calls == 1 { "is" } else { "are" }
             ),
             Some(Limit::RunBudget) | None if t.calls == 0 => format!(
                 "the oracle budget of this run ({}) is too small to hold one call ({reserves} \
                  before it is sent): pass --oracle-budget of at least {}",
                 usd(self.budget),
-                usd(next),
+                usd_ceil(next),
             ),
             Some(Limit::RunBudget) | None => format!(
                 "the oracle budget of this run is used up ({} of {} spent, {} of {} calls; \
@@ -2320,7 +2379,7 @@ pub enum OracleCmd {
         /// listed only with variable pricing (e.g. openrouter/auto); for
         /// another, some structured-output endpoint must fit it [default:
         /// twice the model's cheapest structured-output endpoint]
-        #[arg(long, value_name = "IN,OUT", value_parser = parse_max_price)]
+        #[arg(long, value_name = "IN,OUT", value_parser = Quiet(parse_max_price))]
         max_price: Option<(f64, f64)>,
         /// Print the report as one JSON line
         #[arg(long)]

@@ -472,12 +472,14 @@ pub enum OracleStatus {
     /// Not configured (`oracle.enabled` false, no cascade), or switched off
     /// by the admin API (`by_admin`).
     Disabled { by_admin: bool },
-    /// Something was spent or reserved, and the budget (global or the
-    /// admin's) cannot hold even the smallest call, or `max_calls` calls
-    /// were made.
+    /// Something was spent or reserved, and what is left of the budget
+    /// (global or the admin's) cannot hold even the smallest possible call,
+    /// or a call it refused, or `max_calls` calls were made.
     BudgetExhausted,
-    /// Nothing was spent, and the budget cannot hold even one call (at least
-    /// `min_usd`, the smallest call's reservation), or `max_calls` is 0.
+    /// Nothing was spent, and the budget cannot hold even one call, or
+    /// `max_calls` is 0. `min_usd`: the least budget a call needs — the
+    /// smallest possible call's reservation, or, once the budget refused a
+    /// real (longer) call with nothing spent, the smallest such refusal's.
     BudgetTooSmall { min_usd: f64 },
     /// A stop rule switched it off (the reason of `oracle.state`).
     Stopped(String),
@@ -536,8 +538,9 @@ pub fn oracle_hint(reason: RefusalReason, status: &OracleStatus, key_env: &str) 
                 .into()
         }
         (RefusalReason::Budget, OracleStatus::BudgetTooSmall { min_usd }) => format!(
-            "the oracle budget cannot hold one call (each reserves at least {} before it is sent): restart the server with a larger --oracle-budget (and --oracle-max-calls of at least 1)",
-            crate::oracle_setup::usd(*min_usd)
+            "the oracle budget cannot hold one call (it needs {} reserved before it is sent): restart the server with --oracle-budget of at least {} (and --oracle-max-calls of at least 1)",
+            crate::oracle_setup::usd_fine(*min_usd),
+            crate::oracle_setup::usd_ceil(*min_usd)
         ),
         (RefusalReason::Budget, _) => {
             "the oracle budget left (the server's, or this API key's oracle budget or credit) cannot hold this call's reservation: see GET /v1/admin/oracle"
@@ -879,6 +882,9 @@ pub struct DecisionService {
     hint_logged: Mutex<HashMap<String, Instant>>,
     /// The hint of a server without an oracle was logged (once per process).
     off_hint_logged: AtomicBool,
+    /// Hints are logged ([`DecisionService::without_hint_log`]: not, for a
+    /// command line that words its own).
+    log_hints: bool,
 }
 
 impl std::fmt::Debug for DecisionService {
@@ -930,8 +936,18 @@ impl DecisionService {
             tokens: TokenCache::new(TOKEN_CACHE_CAP),
             hint_logged: Mutex::new(HashMap::new()),
             off_hint_logged: AtomicBool::new(false),
+            log_hints: true,
             cfg: Arc::new(cfg),
         })
+    }
+
+    /// Never log the oracle hints (`cmf.hint` is kept): `cortiq decide`
+    /// prints its own, worded for the command line, and a server's words
+    /// ("set … in the server's environment and restart it") would appear
+    /// above them whatever RUST_LOG says.
+    pub fn without_hint_log(mut self) -> Self {
+        self.log_hints = false;
+        self
     }
 
     /// Resolve `auth.require: null` for the listening address.
@@ -1017,6 +1033,9 @@ impl DecisionService {
     /// process at INFO; otherwise each distinct hint is a WARN at most once
     /// per [`HINT_LOG_EVERY`], so one kind never hides another.
     pub fn log_oracle_hint(&self, hint: &str) {
+        if !self.log_hints {
+            return;
+        }
         if self.escalator.is_none() || !self.cfg.oracle.enabled {
             if !self.off_hint_logged.swap(true, Ordering::Relaxed) {
                 tracing::info!(

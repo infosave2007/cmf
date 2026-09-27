@@ -448,6 +448,13 @@ pub fn default_tiers() -> Vec<ComplexityTier> {
 /// credentials, query or fragment. `what` names the setting in the message:
 /// `oracle.base_url`, or the flag that gave it (`--oracle-base-url`).
 pub fn check_oracle_base_url(what: &str, url: &str) -> Result<()> {
+    // The base URL is printed in status lines and messages: never a key.
+    ensure!(
+        !url.to_ascii_lowercase().contains("sk-or-"),
+        "{what} holds an OpenRouter key prefix (sk-or-): the key goes in its environment \
+         variable, never in a URL; the given value ({} bytes) is not shown",
+        url.len()
+    );
     let Some((scheme, rest)) = url.split_once("://") else {
         bail!("{what} must be an https URL");
     };
@@ -477,11 +484,15 @@ pub fn check_oracle_base_url(what: &str, url: &str) -> Result<()> {
     }
 }
 
-/// A valid environment variable name: 1..128 bytes of `[A-Za-z0-9_]`.
+/// A valid environment variable name: 1..128 bytes of `[A-Za-z0-9_]`
+/// starting with a letter or `_` (as a shell takes it: a hex secret starting
+/// with a digit is not a name).
 pub fn is_env_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 128
-        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    let b = name.as_bytes();
+    !b.is_empty()
+        && b.len() <= 128
+        && (b[0].is_ascii_alphabetic() || b[0] == b'_')
+        && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_')
 }
 
 /// Longest value without `/` that may be a model id or a variable name;
@@ -490,12 +501,13 @@ pub const KEY_LIKE_MIN_LEN: usize = 41;
 
 /// Why a value given where a model id or a variable's name belongs looks
 /// like a key (`None`: it does not), whatever its prefix: it holds
-/// `sk-or-` or starts with `sk-`, starts with `Bearer `, has leading or
-/// trailing whitespace, or is longer than 40 bytes without a `/`. Such a
-/// value is refused without being shown (only its length is).
+/// `sk-or-` or starts with `sk-` (in any case), starts with `Bearer `, has
+/// leading or trailing whitespace, or is longer than 40 bytes without a `/`.
+/// Such a value is refused without being shown (only its length is).
 pub fn looks_like_key(value: &str) -> Option<&'static str> {
     let b = value.as_bytes();
-    if value.contains("sk-or-") || value.starts_with("sk-") {
+    let lower = value.to_ascii_lowercase();
+    if lower.contains("sk-or-") || lower.starts_with("sk-") {
         return Some("it holds an OpenRouter key prefix (sk-)");
     }
     if b.len() >= 7 && b[..7].eq_ignore_ascii_case(b"bearer ") {
@@ -512,10 +524,73 @@ pub fn looks_like_key(value: &str) -> Option<&'static str> {
     None
 }
 
+/// [`looks_like_key`] for a value given as a variable's NAME: an all
+/// `[A-Z0-9_]` value starting with a letter or `_` is a name, whatever its
+/// length (`MY_COMPANY_PRODUCTION_OPENROUTER_API_KEY_V2`); another is judged
+/// as any value.
+pub fn name_looks_like_key(name: &str) -> Option<&'static str> {
+    let b = name.as_bytes();
+    let upper_name = b
+        .first()
+        .is_some_and(|c| c.is_ascii_uppercase() || *c == b'_')
+        && b.iter()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == b'_');
+    if upper_name {
+        return None;
+    }
+    looks_like_key(name)
+}
+
+/// A serde error of the configuration without the values it quotes: a key
+/// pasted into a field (`"budget_usd": "sk-or-…"`) would otherwise be echoed
+/// (`invalid type: string "sk-or-…"`). A quoted string becomes its length;
+/// a backquoted name (a field serde expected or did not know) is kept only
+/// when it is a plain identifier that does not look like a key.
+pub fn redact_serde_error(msg: &str) -> String {
+    let mut out = String::with_capacity(msg.len());
+    let mut chars = msg.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                let mut n = 0usize;
+                let mut escaped = false;
+                for d in chars.by_ref() {
+                    if escaped {
+                        escaped = false;
+                    } else if d == '\\' {
+                        escaped = true;
+                    } else if d == '"' {
+                        break;
+                    }
+                    n += d.len_utf8();
+                }
+                out.push_str(&format!("({n} bytes, not shown)"));
+            }
+            '`' => {
+                let name: String = chars.by_ref().take_while(|d| *d != '`').collect();
+                let plain = name.len() <= 64
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+                    && looks_like_key(&name).is_none();
+                if plain {
+                    out.push('`');
+                    out.push_str(&name);
+                    out.push('`');
+                } else {
+                    out.push_str(&format!("({} bytes, not shown)", name.len()));
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// The value is never echoed: a secret pasted where its variable's name
 /// belongs would otherwise land in the error and every captured log.
 fn check_env_name(what: &str, name: &str) -> Result<()> {
-    if let Some(why) = looks_like_key(name) {
+    if let Some(why) = name_looks_like_key(name) {
         bail!(
             "{what} must be the NAME of an environment variable (e.g. OPENROUTER_API_KEY), not \
              the secret it holds: the given value looks like a key ({why}); it ({} bytes) is not \
@@ -525,8 +600,9 @@ fn check_env_name(what: &str, name: &str) -> Result<()> {
     }
     ensure!(
         is_env_name(name),
-        "{what} must be the NAME of an environment variable ([A-Za-z0-9_], 1..128 bytes), not \
-         the secret it holds; the given value ({} bytes) is not shown",
+        "{what} must be the NAME of an environment variable ([A-Za-z0-9_] starting with a \
+         letter or _, 1..128 bytes), not the secret it holds; the given value ({} bytes) is not \
+         shown",
         name.len()
     );
     Ok(())
@@ -547,7 +623,9 @@ impl Config {
     pub fn from_json(bytes: &[u8]) -> Result<Self> {
         let v = canonical::parse(bytes).context("decision config is not valid JSON")?;
         ensure!(v.is_object(), "decision config must be a JSON object");
-        let cfg: Self = serde_json::from_value(v).context("decision config")?;
+        let cfg: Self = serde_json::from_value(v).map_err(|e| {
+            anyhow::anyhow!("decision config: {}", redact_serde_error(&e.to_string()))
+        })?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -787,9 +865,53 @@ mod tests {
             "OPENROUTER_API_KEY\n",
             hex64,
             "A_VERY_LONG_VARIABLE_NAME_THAT_IS_OVER_40_BYTES",
+            "SK-OR-V1-ABC",
+            "Sk-Or-v1-abc",
+            "SK-PROJ-ABC",
         ] {
             assert!(looks_like_key(v).is_some(), "{v:?}");
         }
+        // As a variable's name: an upper-case identifier of any length is a
+        // name; a hex secret starting with a digit is neither a name nor
+        // accepted.
+        assert_eq!(
+            name_looks_like_key("MY_COMPANY_PRODUCTION_OPENROUTER_API_KEY_V2"),
+            None
+        );
+        assert!(is_env_name("MY_COMPANY_PRODUCTION_OPENROUTER_API_KEY_V2"));
+        assert!(name_looks_like_key(hex64).is_some());
+        assert!(name_looks_like_key("sk-or-v1-abc").is_some());
+        assert!(!is_env_name("97b727bdfe44e04718e4047763da731a"));
+        assert!(!is_env_name("1KEY"));
+        assert!(is_env_name("_KEY") && is_env_name("my_key"));
+        let mut long_name = Config::default();
+        long_name.oracle.api_key_env = "MY_COMPANY_PRODUCTION_OPENROUTER_API_KEY_V2".into();
+        long_name.validate().unwrap();
+        let mut hex_name = Config::default();
+        hex_name.oracle.api_key_env = "97b727bdfe44e04718e4047763da731a".into();
+        let e = format!("{:#}", hex_name.validate().unwrap_err());
+        assert!(!e.contains("97b727bd") && e.contains("32 bytes"), "{e}");
+        // A key in a numeric field of a configuration is not echoed by the
+        // type error.
+        let e = format!(
+            "{:#}",
+            Config::from_json(br#"{"oracle":{"budget_usd":"sk-or-v1-0123456789abcdef"}}"#)
+                .unwrap_err()
+        );
+        assert!(
+            !e.contains("0123456789abcdef") && e.contains("not shown"),
+            "{e}"
+        );
+        let e = format!(
+            "{:#}",
+            Config::from_json(br#"{"oracle":{"sk-or-v1-0123456789abcdef":1}}"#).unwrap_err()
+        );
+        assert!(!e.contains("0123456789abcdef"), "{e}");
+        let e = format!(
+            "{:#}",
+            Config::from_json(br#"{"oracle":{"bud_usd":1}}"#).unwrap_err()
+        );
+        assert!(e.contains("unknown field `bud_usd`"), "{e}");
         for v in [
             "OPENROUTER_API_KEY",
             "deepseek/deepseek-v4.1-flash",
@@ -799,6 +921,12 @@ mod tests {
         ] {
             assert!(looks_like_key(v).is_none(), "{v:?}");
         }
+        let e = format!(
+            "{:#}",
+            check_oracle_base_url("--oracle-base-url", "https://h/SK-OR-V1-0123456789/api")
+                .unwrap_err()
+        );
+        assert!(!e.contains("0123456789") && e.contains("not shown"), "{e}");
         // Neither a variable's name nor a model id that looks like a key is
         // shown by the configuration's refusal.
         let mut c = Config::default();

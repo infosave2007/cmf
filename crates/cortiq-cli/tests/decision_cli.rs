@@ -76,6 +76,7 @@ use cortiq_decision::container::{DecisionModel, Verify};
 use cortiq_decision::eval::Evaluator;
 use cortiq_decision::learn;
 use cortiq_decision::oracle;
+use cortiq_decision::oracle_setup::{usd_ceil, usd_fine};
 use cortiq_decision::signal::SignalEncoder;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -5084,14 +5085,7 @@ fn fuzzed_keys() -> Vec<(std::ffi::OsString, KeyFuzz)> {
     use std::os::unix::ffi::OsStringExt;
     let k = FAKE_OPENROUTER_KEY;
     let (a, b) = k.split_at(20);
-    let long = {
-        let mut s = "sk-or-v1-LONG400-".to_string();
-        while s.len() < 400 {
-            s.push_str("0123456789abcdef");
-        }
-        s.truncate(400);
-        s
-    };
+    let long = long_fuzzed_key();
     let mut non_utf8 = k.as_bytes().to_vec();
     non_utf8.push(0xff);
     let v = |s: String| std::ffi::OsString::from(s);
@@ -5119,7 +5113,10 @@ fn fuzzed_keys() -> Vec<(std::ffi::OsString, KeyFuzz)> {
         ),
         (
             std::ffi::OsString::from_vec(non_utf8),
-            KeyFuzz::Bad("a byte outside ASCII at byte"),
+            // Named by the raw bytes (not a lossy decoding's).
+            KeyFuzz::Bad(Box::leak(
+                format!("a byte outside ASCII at byte {0} of {0}", k.len() + 1).into_boxed_str(),
+            )),
         ),
         (
             v(format!("Bearer {k}")),
@@ -5137,6 +5134,44 @@ fn fuzzed_keys() -> Vec<(std::ffi::OsString, KeyFuzz)> {
     ]
 }
 
+/// The 400-byte key of the fuzz (not the mock's: refused with 401).
+fn long_fuzzed_key() -> String {
+    let mut s = "sk-or-v1-LONG400-".to_string();
+    while s.len() < 400 {
+        s.push_str("0123456789abcdef");
+    }
+    s.truncate(400);
+    s
+}
+
+/// Every 8-byte window of the secret parts (after `sk-or-v1-`) of the
+/// fuzzed keys: a message that echoes any piece of a key — the prefix
+/// before a bad byte too — is caught, not only a few fixed needles.
+fn fuzzed_key_windows() -> &'static std::collections::HashSet<[u8; 8]> {
+    static W: OnceLock<std::collections::HashSet<[u8; 8]>> = OnceLock::new();
+    W.get_or_init(|| {
+        let long = long_fuzzed_key();
+        [FAKE_OPENROUTER_KEY, long.as_str()]
+            .iter()
+            .flat_map(|k| {
+                k.as_bytes()["sk-or-v1-".len()..]
+                    .windows(8)
+                    .map(|w| <[u8; 8]>::try_from(w).unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    })
+}
+
+/// The first 8-byte window of a fuzzed key's secret in `bytes`, if any.
+fn fuzzed_key_window_in(bytes: &[u8]) -> Option<String> {
+    let w = fuzzed_key_windows();
+    bytes
+        .windows(8)
+        .find(|x| w.contains(*x))
+        .map(|x| String::from_utf8_lossy(x).into_owned())
+}
+
 /// `cortiq ARGS` with `OPENROUTER_API_KEY` set to `key` (any bytes) and
 /// `RUST_LOG=trace`.
 fn output_with_key(args: &[&str], key: &std::ffi::OsStr) -> Output {
@@ -5147,21 +5182,21 @@ fn output_with_key(args: &[&str], key: &std::ffi::OsStr) -> Output {
     c.output().expect("run cortiq")
 }
 
-/// No key bytes in `text`: the fake key and the 400-byte one (whose middle
-/// is `0123456789abcdef` as the fake key's is).
+/// No key bytes in `text`: no 8 bytes in a row of a fuzzed key's secret
+/// ([`fuzzed_key_windows`]), and none of the other test keys.
 fn assert_no_fuzzed_key_in(text: &str, what: &str) {
     assert_no_key_in(text, what);
-    for needle in ["FAKE-two-steps", "LONG400"] {
-        assert!(
-            !text.contains(needle),
-            "{what} holds key bytes ({needle})\n{text}"
-        );
+    if let Some(w) = fuzzed_key_window_in(text.as_bytes()) {
+        panic!("{what} holds key bytes ({w})\n{text}");
     }
 }
 
 fn assert_no_fuzzed_key_under(dir: &Path) {
-    for needle in ["0123456789abcdef", "FAKE-two-steps", "LONG400"] {
-        assert_no_bytes_of(needle, dir);
+    for f in files_under(dir) {
+        let b = std::fs::read(&f).unwrap();
+        if let Some(w) = fuzzed_key_window_in(&b) {
+            panic!("{} holds key bytes ({w})", f.display());
+        }
     }
 }
 
@@ -5525,6 +5560,196 @@ fn key_like_values_are_refused_unshown_and_unsent_by_every_flag() {
         }
     }
     assert!(mock.requests().is_empty(), "nothing was sent");
+    // Upper case, and values of no key's shape: a hex secret is not a model
+    // id (no '/') nor a variable's name (it starts with a digit); refused,
+    // only the length shown.
+    for (v, model_why, name_why) in [
+        (
+            "SK-OR-V1-ABCDEF0123",
+            "looks like a key",
+            "looks like a key",
+        ),
+        (
+            "97b727bdfe44e04718e4047763da731a",
+            "has no '/'",
+            "not the key itself",
+        ),
+    ] {
+        let secret = &v[9..17];
+        for (a, why) in [
+            (
+                vec![
+                    "decision",
+                    "oracle",
+                    "check",
+                    "--base-url",
+                    &base,
+                    "--model",
+                    v,
+                ],
+                model_why,
+            ),
+            (
+                vec![
+                    "decision",
+                    "oracle",
+                    "check",
+                    "--base-url",
+                    &base,
+                    "--key-env",
+                    v,
+                ],
+                name_why,
+            ),
+            (
+                vec![
+                    "decide",
+                    s(&t.path),
+                    "-p",
+                    "hello",
+                    "--oracle",
+                    v,
+                    "--oracle-base-url",
+                    &base,
+                ],
+                model_why,
+            ),
+            (
+                vec![
+                    "decide",
+                    s(&t.path),
+                    "-p",
+                    "hello",
+                    "--oracle",
+                    ORACLE_MODEL,
+                    "--oracle-key-env",
+                    v,
+                    "--oracle-base-url",
+                    &base,
+                ],
+                name_why,
+            ),
+        ] {
+            let o = output(&a, &key);
+            let all = show(&o);
+            assert!(!o.status.success(), "{a:?}\n{all}");
+            assert!(
+                stderr_of(&o).contains(why)
+                    && stderr_of(&o).contains(&format!("{} bytes", v.len()))
+                    && !all.contains(secret),
+                "{a:?}\n{all}"
+            );
+        }
+    }
+    // A key pasted into a numeric flag: refused by clap without the value
+    // (only the flag, its length and why), on every command.
+    let k = FAKE_OPENROUTER_KEY;
+    let mut numeric: Vec<Vec<&str>> = Vec::new();
+    for flag in [
+        "--oracle-budget",
+        "--oracle-max-calls",
+        "--oracle-max-price",
+    ] {
+        numeric.push(vec![
+            "serve",
+            s(&t.path),
+            "--port",
+            &port,
+            "--state",
+            s(&state),
+            "--oracle",
+            ORACLE_MODEL,
+            flag,
+            k,
+        ]);
+        numeric.push(vec![
+            "decide",
+            s(&t.path),
+            "-p",
+            "hello",
+            "--oracle",
+            ORACLE_MODEL,
+            flag,
+            k,
+        ]);
+    }
+    numeric.push(vec!["decision", "oracle", "check", "--max-price", k]);
+    numeric.push(vec![
+        "decision",
+        "oracle",
+        "check",
+        "--max-price",
+        "0.1,notanumber-FAKE-two-steps",
+    ]);
+    numeric.push(vec![
+        "decide",
+        s(&t.path),
+        "-p",
+        "hello",
+        "--oracle",
+        ORACLE_MODEL,
+        "--oracle-budget",
+        "FAKE-two-steps",
+    ]);
+    for a in numeric {
+        let o = output(&a, &key);
+        let all = show(&o);
+        assert!(!o.status.success(), "{a:?}\n{all}");
+        assert!(stderr_of(&o).contains("bytes, not shown"), "{a:?}\n{all}");
+        assert_no_key_in(&all, "a key in a numeric flag");
+        assert!(!all.contains("FAKE-two"), "{a:?}\n{all}");
+    }
+    // …and into a number of --decision-config: the type error names the
+    // field's type, not the value.
+    let cfg = write(
+        d,
+        "keycfg.json",
+        &json!({"oracle": {"budget_usd": FAKE_OPENROUTER_KEY}}).to_string(),
+    );
+    let o = output(
+        &[
+            "serve",
+            s(&t.path),
+            "--port",
+            &port,
+            "--state",
+            s(&state),
+            "--decision-config",
+            s(&cfg),
+        ],
+        &key,
+    );
+    let all = show(&o);
+    assert!(!o.status.success(), "{all}");
+    assert!(all.contains("not shown"), "{all}");
+    assert_no_key_in(&all, "a key in a number of the configuration");
+    assert!(!all.contains("FAKE-two"), "{all}");
+    // A long upper-case variable name is a name, not a key.
+    let o = output(
+        &[
+            "decision",
+            "oracle",
+            "check",
+            "--base-url",
+            &base,
+            "--key-env",
+            "MY_COMPANY_PRODUCTION_OPENROUTER_API_KEY_V2",
+        ],
+        &[(
+            "MY_COMPANY_PRODUCTION_OPENROUTER_API_KEY_V2",
+            FAKE_OPENROUTER_KEY,
+        )],
+    );
+    assert!(o.status.success(), "{}", show(&o));
+    assert!(
+        stdout_of(&o).contains("  ✓ key        MY_COMPANY_PRODUCTION_OPENROUTER_API_KEY_V2 is set"),
+        "{}",
+        show(&o)
+    );
+    assert!(
+        mock.requests().iter().all(|(h, _)| !h.starts_with("POST ")),
+        "no call was made"
+    );
     assert!(!state.exists(), "nothing was opened");
 }
 
@@ -5548,18 +5773,20 @@ fn budgets_too_small_and_used_up_and_the_command_line_key_messages() {
         d,
     );
     let logs = srv.logs();
-    assert!(
-        logs.contains(&format!(
-            "oracle: NOT ready — the budget is too small: budget $1.00e-7 cannot hold one call, which reserves at least $0.000283 at the max price in/out $0.06/$0.58 per 1M ({ORACLE_MODEL} via {}; restart with --oracle-budget of at least $0.000283)",
-            mock.addr
-        )),
-        "{logs}"
-    );
     let st = oracle_status(&srv);
     assert_eq!(st["status"], "budget_too_small", "{st}");
+    // The smallest possible call carries the system prompt and the schema:
+    // some 900 bytes of body (the 0-byte one reserved $0.00028288).
+    let min = st["min_call_usd"].as_f64().unwrap();
+    assert!(min > 0.00028288 + 800.0 * 0.06e-6, "{st}");
     assert!(
-        (st["min_call_usd"].as_f64().unwrap() - 0.00028288).abs() < 1e-12,
-        "{st}"
+        logs.contains(&format!(
+            "oracle: NOT ready — the budget is too small: budget $1.00e-7 cannot hold one call; the smallest possible one (one short question) reserves {} at the max price in/out $0.06/$0.58 per 1M, a longer one more ({ORACLE_MODEL} via {}; restart with --oracle-budget of at least {}, more for longer questions)",
+            usd_fine(min),
+            mock.addr,
+            usd_ceil(min)
+        )),
+        "{logs}"
     );
     let (_, h, _) = http_h("GET", &srv.url("/healthz"), &[], None);
     assert_eq!(h["oracle_status"], "budget_too_small");
@@ -5575,13 +5802,85 @@ fn budgets_too_small_and_used_up_and_the_command_line_key_messages() {
         "{r}"
     );
     assert!(
-        r["cmf"]["hint"].as_str().unwrap().starts_with(
-            "the oracle budget cannot hold one call (each reserves at least $0.000283"
-        ),
+        r["cmf"]["hint"]
+            .as_str()
+            .unwrap()
+            .starts_with("the oracle budget cannot hold one call (it needs $0.000"),
         "{r}"
     );
     srv.stop();
     assert_eq!(mock.chats(), 0);
+
+    // Restarted with exactly the advertised minimum: ready (it holds the
+    // smallest possible call). A real question reserves more: refused, and
+    // from then on the status is budget_too_small with that call's
+    // reservation (never "ready" while every call is refused), whose
+    // rounded-up figure the hint gives; restarted with it, the call is made.
+    let advised = logs
+        .split("restart with --oracle-budget of at least $")
+        .nth(1)
+        .and_then(|r| r.split(',').next())
+        .unwrap()
+        .to_string();
+    let srv = serve_oracle(
+        &d.join("s-floor"),
+        &base,
+        &["--oracle-budget", &advised],
+        &key,
+        d,
+    );
+    assert!(srv.logs().contains("oracle: ready — "), "{}", srv.logs());
+    assert_eq!(oracle_status(&srv)["status"], "ready");
+    let (_, r) = http(
+        "POST",
+        &srv.url("/v1/decisions"),
+        None,
+        Some(&topics_request(&texts[0])),
+    );
+    assert_eq!(
+        r["cmf"]["questions"]["task"]["flags"],
+        json!(["budget"]),
+        "{r}"
+    );
+    let st = oracle_status(&srv);
+    assert_eq!(st["status"], "budget_too_small", "{st}");
+    let need = st["min_call_usd"].as_f64().unwrap();
+    assert!(need > advised.parse::<f64>().unwrap(), "{st}");
+    let hint = r["cmf"]["hint"].as_str().unwrap().to_string();
+    assert_eq!(
+        hint,
+        format!(
+            "the oracle budget cannot hold one call (it needs {} reserved before it is sent): restart the server with --oracle-budget of at least {} (and --oracle-max-calls of at least 1)",
+            usd_fine(need),
+            usd_ceil(need)
+        )
+    );
+    let (_, h, _) = http_h("GET", &srv.url("/healthz"), &[], None);
+    assert_eq!(h["oracle_status"], "budget_too_small");
+    srv.stop();
+    assert_eq!(mock.chats(), 0);
+    let advised = hint
+        .split("--oracle-budget of at least $")
+        .nth(1)
+        .and_then(|r| r.split(' ').next())
+        .unwrap()
+        .to_string();
+    let srv = serve_oracle(
+        &d.join("s-real"),
+        &base,
+        &["--oracle-budget", &advised],
+        &key,
+        d,
+    );
+    let (_, r) = http(
+        "POST",
+        &srv.url("/v1/decisions"),
+        None,
+        Some(&topics_request(&texts[0])),
+    );
+    assert_eq!(r["cmf"]["questions"]["task"]["action"], "oracle", "{r}");
+    srv.stop();
+    assert_eq!(mock.chats(), 1);
 
     // decide -p: the run's budget too small, and max-calls 0.
     let o = decide_oracle(
@@ -5600,13 +5899,39 @@ fn budgets_too_small_and_used_up_and_the_command_line_key_messages() {
     let v = json_of(&stdout_of(&o));
     let or = &v["cmf"]["oracle"];
     assert_eq!(or["status"], "budget_too_small", "{v}");
-    assert!(or["min_call_usd"].as_f64().unwrap() > 0.0003, "{v}");
+    let need = or["min_call_usd"].as_f64().unwrap();
+    assert!(need > 0.0003, "{v}");
     let hint = v["cmf"]["hint"].as_str().unwrap();
-    assert!(
-        hint.starts_with("the oracle budget of this run ($1.00e-7) is too small to hold one call (the next call reserves $0.")
-            && hint.contains("pass --oracle-budget of at least $0."),
-        "{hint}"
+    assert_eq!(
+        hint,
+        format!(
+            "the oracle budget of this run ($1.00e-7) is too small to hold one call (the next call reserves {} before it is sent): pass --oracle-budget of at least {}",
+            usd_fine(need),
+            usd_ceil(need)
+        )
     );
+    // The printed minimum suffices: rerun with exactly it, the call is
+    // made. (Rounded to nearest, it could be below the reservation and be
+    // refused again with the same advice.)
+    let advised = hint.rsplit("at least $").next().unwrap().to_string();
+    assert!(advised.parse::<f64>().unwrap() >= need, "{hint}");
+    let o = decide_oracle(
+        &base,
+        &["-p", &texts[0]],
+        &[
+            "--state",
+            s(&d.join("d-advised")),
+            "--oracle-budget",
+            &advised,
+            "--json",
+        ],
+        &key,
+    );
+    assert!(o.status.success(), "{}", show(&o));
+    let v = json_of(&stdout_of(&o));
+    assert_eq!(v["cmf"]["questions"]["task"]["action"], "oracle", "{v}");
+    assert_eq!(v["cmf"]["oracle"]["status"], "ready", "{v}");
+    assert_eq!(mock.chats(), 2);
     let o = decide_oracle(
         &base,
         &["-p", &texts[0]],
@@ -5626,7 +5951,7 @@ fn budgets_too_small_and_used_up_and_the_command_line_key_messages() {
         v["cmf"]["hint"],
         "--oracle-max-calls 0 allows no oracle call: pass a larger --oracle-max-calls"
     );
-    assert_eq!(mock.chats(), 0);
+    assert_eq!(mock.chats(), 2, "max-calls 0 sent nothing");
     // A batch that spends its one call: used up, not too small.
     let input = write(
         d,
@@ -5646,7 +5971,7 @@ fn budgets_too_small_and_used_up_and_the_command_line_key_messages() {
     let sum = summary_of(&stderr_of(&o));
     assert_eq!(sum["oracle"]["status"], "budget_exhausted", "{sum}");
     assert_eq!(sum["oracle"]["answered_by_oracle"], 1, "{sum}");
-    assert_eq!(mock.chats(), 1);
+    assert_eq!(mock.chats(), 3);
 
     // decide --labels no skill has, without the key: the command line's
     // words, not a server's; with a bad key, its problem.
@@ -5702,8 +6027,25 @@ fn budgets_too_small_and_used_up_and_the_command_line_key_messages() {
         show(&o)
     );
     assert_no_key_in(&show(&o), "decide --labels with a bad key");
-    assert_eq!(mock.chats(), 1, "nothing was sent");
+    assert_eq!(mock.chats(), 3, "nothing was sent");
     assert!(!labels_state.exists());
+    // Whatever RUST_LOG says, only the command line's words: the service's
+    // server-worded hint is never logged by decide.
+    for level in ["warn", "info", "trace"] {
+        let o = labels(&[("RUST_LOG", level)], &[]);
+        let o2 = decide_oracle(&base, &["-p", &texts[0]], &[], &[("RUST_LOG", level)]);
+        for o in [&o, &o2] {
+            let all = show(o);
+            assert!(
+                all.contains(
+                    "OPENROUTER_API_KEY is not set (decide --oracle reads the key from the environment)"
+                ) && !all.contains("server's environment")
+                    && !all.contains("restart it"),
+                "RUST_LOG={level}\n{}",
+                show(o)
+            );
+        }
+    }
     // The batch start line words a missing key the same way.
     let o = decide_oracle(&base, &["--input", s(&input)], &[], &[]);
     assert!(
@@ -5749,7 +6091,7 @@ fn budgets_too_small_and_used_up_and_the_command_line_key_messages() {
             )),
         "{out}"
     );
-    assert_eq!(mock.chats(), 2);
+    assert_eq!(mock.chats(), 4);
     let sent: Value = mock
         .requests()
         .iter()

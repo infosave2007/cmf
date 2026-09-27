@@ -548,7 +548,9 @@ fn raw_reply(status: u16, body: &str) -> MockReply {
 // ------------------------------------------------------------------ server + HTTP
 
 fn test_key() -> KeyLookup {
-    Arc::new(|name: &str| (name == KEY_ENV).then(|| TEST_KEY.to_string()))
+    cortiq_decision::oracle::key_lookup(|name: &str| {
+        (name == KEY_ENV).then(|| TEST_KEY.to_string())
+    })
 }
 
 /// The oracle configuration of a stand: the mock, the test key's variable,
@@ -2041,7 +2043,9 @@ async fn oracle_flag_opens_the_loopback_open_mode_and_status_and_hints_name_ever
 async fn keys_are_trimmed_or_refused_unsent_and_budgets_name_their_state() {
     let mock = MockOracle::answering("travel");
     let lookup = |raw: String| -> KeyLookup {
-        Arc::new(move |name: &str| (name == KEY_ENV).then(|| raw.clone()))
+        cortiq_decision::oracle::key_lookup(move |name: &str| {
+            (name == KEY_ENV).then(|| raw.clone())
+        })
     };
     let no_key_bytes = |text: &str, what: &str| {
         for needle in [TEST_KEY, "TESTKEY-wp7", "0123456789abcdef"] {
@@ -2174,8 +2178,47 @@ async fn keys_are_trimmed_or_refused_unsent_and_budgets_name_their_state() {
     assert_eq!(r.flags(), json!(["budget"]));
     let hint = r.body["cmf"]["hint"].as_str().unwrap();
     assert!(
-        hint.starts_with("the oracle budget cannot hold one call (each reserves at least $"),
+        hint.starts_with("the oracle budget cannot hold one call (it needs $"),
         "{hint}"
+    );
+    let floor = s.body["min_call_usd"].as_f64().unwrap();
+    drop(srv);
+    // The advertised minimum (rounded up to the micro-dollar, as printed):
+    // ready, since it holds the smallest possible call; a real question
+    // reserves more, is refused, and the status becomes budget_too_small
+    // with that call's reservation instead of staying "ready".
+    let printed = |x: f64| -> f64 {
+        cortiq_decision::oracle_setup::usd_ceil(x)[1..]
+            .parse()
+            .unwrap()
+    };
+    let mut cfg = stand_config(&mock.url());
+    cfg.oracle.budget_usd = printed(floor);
+    let srv = Srv::new(&cfg);
+    assert_eq!(status(&srv).await, "ready");
+    let r = srv.decide(&topics_body(&rejected()[3])).await;
+    assert_eq!(r.flags(), json!(["budget"]));
+    let s = srv.admin("GET", "/v1/admin/oracle", None).await;
+    assert_eq!(s.body["status"], "budget_too_small", "{}", s.text);
+    let need = s.body["min_call_usd"].as_f64().unwrap();
+    assert!(need > printed(floor), "{}", s.text);
+    let hint = r.body["cmf"]["hint"].as_str().unwrap();
+    assert!(
+        hint.contains(&format!(
+            "restart the server with --oracle-budget of at least {}",
+            cortiq_decision::oracle_setup::usd_ceil(need)
+        )),
+        "{hint}"
+    );
+    drop(srv);
+    assert_eq!(mock.hits(), hits, "nothing was sent");
+    // Restarted with that figure: the call is made (one hit).
+    let mut cfg = stand_config(&mock.url());
+    cfg.oracle.budget_usd = printed(need);
+    let srv = Srv::new(&cfg);
+    assert_eq!(
+        srv.decide(&topics_body(&rejected()[3])).await.action(),
+        "oracle"
     );
     drop(srv);
     // Spent: exhausted.
@@ -2198,7 +2241,7 @@ async fn keys_are_trimmed_or_refused_unsent_and_budgets_name_their_state() {
         "{}",
         r.text
     );
-    assert_eq!(mock.hits(), hits + 1);
+    assert_eq!(mock.hits(), hits + 2);
 }
 
 /// `serve --oracle` on loopback without keys or `auth.require`: the implicit
