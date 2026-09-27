@@ -115,7 +115,11 @@
 //!   `DecisionService::oracle_credit_left`).
 //! * **Body**: `Content-Type: application/json` (else 400; 415 on the router
 //!   surface), at most `limits.body_bytes` (else 413 `PAYLOAD_TOO_LARGE`,
-//!   checked from `Content-Length` before reading and while reading).
+//!   checked from `Content-Length` before reading and while reading). A
+//!   connection answered before its body was read (401, 413, …) closes
+//!   lingering: the rest of the body is read and dropped (at most
+//!   `limits.body_bytes`, for a bounded time) so that a proxy still sending
+//!   it gets the answer instead of a reset (the `linger` submodule).
 //! * **Work** runs on the blocking pool (`spawn_blocking`): authentication (it
 //!   may re-read `keys.json`), decisions, feedback (a learning attempt may run
 //!   synchronously), every admin operation and the views that read the usage
@@ -276,6 +280,7 @@ use cortiq_decision::statedir::{StateDir, StateLock};
 use futures::StreamExt;
 use serde_json::{Map, Value, json};
 
+mod linger;
 mod shadow;
 pub use shadow::SHADOW_FORWARDED_PATHS;
 
@@ -3368,6 +3373,7 @@ impl DecisionServer {
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> Result<()> {
         let app = self.router();
+        let listener = linger::Listener::new(listener, self.state.body_limit());
         axum::serve(listener, app)
             .with_graceful_shutdown(shutdown)
             .await
