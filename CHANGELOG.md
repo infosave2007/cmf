@@ -154,15 +154,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `LOCK` (`<FILE>.state` or `--state DIR`); `--oracle-budget` and
   `--oracle-max-calls` cap each run, a stop holds for later runs until
   `--oracle-resume`, `--break-lock` removes a `LOCK` whose process is gone.
-  Without `--oracle` nothing changes; a missing key is worded for the
-  command line (`OPENROUTER_API_KEY is not set (decide --oracle reads the key
-  from the environment)`), also when labels no skill has could only be
-  answered by the oracle. `cortiq decision oracle check [--model M]
-  [--key-env VAR] [--base-url URL] [--max-price IN,OUT] [--test-call]
-  [--json]`: the key, the account (`GET /auth/key`), the model's
-  structured-output endpoints and prices (`--max-price` for a model listed
-  only with variable pricing), and with `--test-call` one tiny call and its
-  cost; exit code 0 only when ready; the key is never printed.
+  A batch row keeps its local columns and adds `answer` (the oracle's or
+  its cache's answer, else the local choice), `action` (`local`, `oracle`,
+  `cache`, `abstain`), `source`, `oracle_cost_usd`, `flags` and, for a
+  labelled row, `answer_correct`; `--json` of one text has the run's status,
+  spend and budget in `cmf.oracle`. Without `--oracle` nothing changes; a
+  missing key is worded for the command line (`OPENROUTER_API_KEY is not set
+  (decide --oracle reads the key from the environment)`), also when labels
+  no skill has could only be answered by the oracle. `cortiq decision
+  oracle check [--model M] [--key-env VAR] [--base-url URL] [--max-price
+  IN,OUT] [--test-call] [--json]`: the key, the account (`GET
+  /auth/key`), the model's structured-output endpoints and prices
+  (`--max-price` for a model listed only with variable pricing), and with
+  `--test-call` one tiny call and its cost; exit code 0 only when ready; the
+  key is never printed.
 - The published model `infosave/cortiq-decision` (304520292 bytes): skills
   `banking77`, `clinc150` and `massive` trained on train ∪ dev, with K 32, 16
   and 24 chosen by cross-validation. It is 4520292 bytes over the
@@ -171,6 +176,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refits from and the cross-validated K (the reproduction build, train only
   and K 16, is 259343088 bytes). The card, `API.md` and `ORACLE.md` are
   in `docs/decision/hf/`; `tools/decision_hf_bundle.sh` assembles the upload.
+- A *Check your setup* block in the card, `API.md` and `ORACLE.md`:
+  `cortiq decision oracle check` (free) and `--test-call` (one tiny call),
+  what to do for each oracle status (`ready`, `no_key`, `bad_key`,
+  `disabled`, `budget_too_small`, `budget_exhausted`, `stopped: <reason>`),
+  and `cortiq decide … --oracle MODEL` for one text or a batch (the columns
+  `answer`, `action`, `source`, `oracle_cost_usd`, `flags`; `--oracle-resume`
+  after a fixed stop rule, `--break-lock` after a crash). Every command in
+  these blocks was run as written against a local mock of the OpenRouter
+  API (only the base URL pointed at it, a test key); `ORACLE.md` shows the
+  recorded outputs.
 
 ### Changed
 - `cortiq decision keys create` makes keys that may use the oracle

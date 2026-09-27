@@ -10,13 +10,15 @@ label can win rows another label used to win. The oracle is **off by
 default**; nothing leaves the machine until you enable it — in two steps:
 the key in `OPENROUTER_API_KEY`, then `cortiq serve FILE --oracle MODEL`
 (or `cortiq decide FILE … --oracle MODEL`; `cortiq decision oracle check`
-says first whether it is ready — [Connect OpenRouter](#connect-openrouter)).
+says first whether it is ready — [Check your setup](#check-your-setup)).
 
 1. [How a question flows](#how-a-question-flows)
 2. [Self-learning](#self-learning)
 3. [Budget and stop rules](#budget-and-stop-rules)
 4. [What leaves the machine](#what-leaves-the-machine)
-5. [Connect OpenRouter](#connect-openrouter)
+5. [Connect OpenRouter](#connect-openrouter) —
+   [check your setup](#check-your-setup),
+   [one text or a batch](#one-text-or-a-batch)
 6. [Measured effect](#measured-effect)
 
 ## How a question flows
@@ -339,7 +341,7 @@ copies none of its free text into another client's answer, and every code
 it shows comes from a closed set. So is a key typed into an argument that
 is not about the key or the oracle (a file path, `--host`, a skill id).
 
-### From the command line: check, then decide
+### Check your setup
 
 `cortiq decision oracle check` tells whether the oracle is ready before
 anything is started or spent. It reads the same flags as `--oracle`
@@ -356,8 +358,8 @@ cortiq decision oracle check --test-call   # and one tiny structured call (a 2-o
 Oracle check: deepseek/deepseek-v4.1-flash via openrouter.ai
   ✓ key        OPENROUTER_API_KEY is set
   ✓ account    the key is valid (credit limit $10.00, $1.25 used, $8.75 left)
-  ✓ model      … endpoints, … with structured outputs; the cheapest is … at …/… per 1M in/out, so --oracle sets the max price to …/…
-  – test call  not made (--test-call makes one tiny structured call, a small fraction of a cent)
+  ✓ model      3 endpoints, 2 with structured outputs; the cheapest is MockProvider at $0.03/$0.29 per 1M in/out, so --oracle sets the max price to $0.06/$0.58
+  ✓ test call  answered 'yes' for $0.00001 (reserved $0.000317, provider MockProvider, 0 ms)
 ready: cortiq serve FILE --oracle deepseek/deepseek-v4.1-flash   (or: cortiq decide FILE -p TEXT --oracle deepseek/deepseek-v4.1-flash)
 ```
 
@@ -377,6 +379,36 @@ call answered, when asked); `--json` gives the same as one object with
 `variable_price`, `max_price_too_low`, `listing_unreachable`,
 `test_call_failed`).
 
+The commands of this section and the next were run as written against a
+local mock of the OpenRouter API with a test key: `--base-url` (for `serve`
+and `decide`, `--oracle-base-url`) pointed at the mock, so the outputs here
+show `openrouter.ai`, and no `--oracle-base-url`, where the run showed the
+mock's address. Endpoints, provider, prices, credit, costs and the oracle's
+answers are the mock's; nothing was sent to OpenRouter.
+
+**Statuses.** A server reports its oracle in the startup line (`oracle:
+ready — …`, `oracle: NOT ready — <what to do>`, `oracle: off — …`), in `GET
+/healthz` (`oracle_status`) and in `GET /v1/admin/oracle` (`status`);
+`cortiq decide … --oracle MODEL` in the start line of a batch, in its
+`hint` and in `cmf.oracle.status` of `--json`. Each message says what to do;
+in short:
+
+```bash
+curl -s http://127.0.0.1:8080/healthz | jq -r .oracle_status     # the server of step 2 → ready
+```
+
+| Status | Means | What to do |
+|---|---|---|
+| `ready` | questions the gate rejects go to the oracle | nothing |
+| `no_key` | the key variable (`OPENROUTER_API_KEY`, or `--oracle-key-env`) is unset or empty | `export OPENROUTER_API_KEY=…` where the server (then restart it) or `decide` runs |
+| `bad_key` | the variable holds something that is not a key; nothing was sent | fix it as the message says — it names the problem (a quote, `Bearer `, a whole `NAME=…` line, whitespace, a control or non-ASCII byte) by position and length, never the key — then restart the server or run `decide` again |
+| `disabled` | the server has no oracle (no `--oracle MODEL`, or `oracle.enabled` false), or the admin switched it off | start the server with `--oracle MODEL`; after the admin's switch, `POST /v1/admin/oracle {"enabled": true}` |
+| `budget_too_small` | nothing spent, and the budget cannot hold one call (`min_call_usd`), or `max_calls` is 0 | `--oracle-budget` of at least the figure the message names (and `--oracle-max-calls` of 1 or more); for an admin limit in `oracle.state`, the `POST /v1/admin/oracle` the message names |
+| `budget_exhausted` | the budget or `max_calls` is used up | a server: restart with a larger `--oracle-budget` / `--oracle-max-calls` (the budget counts the state directory's whole ledger, across restarts); `decide`: each run has its own budget, pass a larger `--oracle-budget`; for an admin limit, the `POST` the message names |
+| `stopped: <reason>` | a stop rule: `http_401` or `http_403` (the key was refused), `http_402` (no credit), `unexpected_model`, `cost_above_reservation`, `max_errors` (failures in a row; `last_error` names the last one) | fix the cause (`cortiq decision oracle check` tests the key, the credit and the model), then `POST /v1/admin/oracle {"enabled": true}` on a server, or one `decide` run with `--oracle-resume` |
+
+### One text or a batch
+
 `cortiq decide` takes the same `--oracle MODEL` (and the `--oracle-*`
 flags of the table above) for one text or a batch. The text is decided
 locally first; only when the gate rejects it — or no skill has the asked
@@ -385,21 +417,49 @@ redaction and key handling as a server. A text the gate accepts sends
 nothing.
 
 ```bash
-cortiq decide cortiq-decision.cmf --skill banking77 -p "TEXT" --oracle deepseek/deepseek-v4.1-flash
-# choice:     … (from oracle deepseek/deepseek-v4.1-flash, $0.00002)   — or the local result
-cortiq decide cortiq-decision.cmf --skill banking77 --input rows.jsonl --out results.jsonl \
-  --oracle deepseek/deepseek-v4.1-flash --oracle-budget 0.05
+cortiq decide cortiq-decision.cmf --skill banking77 -p "the exchange rate you gave me looks wrong" \
+  --oracle deepseek/deepseek-v4.1-flash
 ```
 
-* `--json` (one text) carries `action` and `source` in
-  `cmf.questions.<id>`, the call's cost in `cmf.usage.oracle` and the run's
-  spend and budget in `cmf.oracle`; batch rows keep their local columns and
-  add `action`, `source`, `answer` (the final answer: the oracle's or its
-  cache's for `action` `oracle` / `cache`, else the local choice — for an
-  `abstain` row that is the local model's choice the gate rejected, so read
-  `action` before trusting `answer`), `oracle_cost_usd`, `flags` and, for a
-  labelled row, `answer_correct` (`answer` equals the label), with the
-  oracle's totals and a `hint` in the summary on stderr.
+```text
+choice:     card_payment_wrong_exchange_rate (from oracle deepseek/deepseek-v4.1-flash, $0.00014)
+action:     oracle (the gate rejected the local choice card_payment_wrong_exchange_rate), certified false
+skill:      banking77 (exact match, 77 candidates)
+gate:       p_top 0.5678609 (tau 0.7), novelty 0.84277564 (theta 0.804234), margin 0.0045858026, confidence 0.56217486
+errors:     card_payment_wrong_exchange_rate 0.19301137, wrong_exchange_rate_for_cash_withdrawal 0.19957425, exchange_rate 0.35151693, wrong_amount_of_cash_received 0.43852428, extra_charge_on_statement 0.48889443
+oracle:     deepseek/deepseek-v4.1-flash via openrouter.ai: $0.00014 spent in this run (1 call), budget $1.00; ledger cortiq-decision.cmf.state/oracle.jsonl: $0.00014 over 1 call in all
+model:      cortiq/decision@386b6e43fd35 (generation 0), 3489 input tokens, 15828 µs
+```
+
+A batch reads one `{"text", "label"?}` object per line and writes one JSON
+row per input, never the text:
+
+```bash
+printf '%s\n' '{"text": "I still have not received my new card", "label": "card_arrival"}' \
+  '{"text": "can I pay my rent with a virtual card"}' > rows.jsonl
+cortiq decide cortiq-decision.cmf --skill banking77 --input rows.jsonl --out results.jsonl \
+  --oracle deepseek/deepseek-v4.1-flash --oracle-budget 0.05
+jq -c '{answer, action, source, oracle_cost_usd, flags}' results.jsonl
+```
+
+```text
+{"answer":"card_arrival","action":"local","source":"local","oracle_cost_usd":0.0,"flags":[]}
+{"answer":"get_disposable_virtual_card","action":"oracle","source":"oracle","oracle_cost_usd":0.0001397,"flags":[]}
+```
+
+* **Columns.** A batch row keeps the columns of a run without `--oracle`
+  (`choice`, `p_top`, `accepted`, …) and adds `answer` — the final answer:
+  the oracle's or its cache's for `action` `oracle` / `cache`, else the
+  local choice (for an `abstain` row that is the local model's choice the
+  gate rejected, so read `action` before trusting `answer`) — `action`
+  (`local`, `oracle`, `cache` or `abstain`), `source`, `oracle_cost_usd`
+  (this row's call; 0 for a local or cached answer), `flags`
+  (`pii_redacted`, or why a row abstained: `budget`, `no_key`, `bad_key`,
+  `stopped`, `oracle_unavailable`, …) and, for a labelled row, `answer_correct`
+  (`answer` equals the label). The oracle's totals and a `hint` are in the
+  summary on stderr. For one text, `--json` carries `action` and `source`
+  in `cmf.questions.task`, the call's cost in `cmf.usage.oracle` and the
+  run's status, spend and budget in `cmf.oracle`.
 * **Without a usable key** a rejected text abstains with `no_key` (or
   `bad_key`) and the hint `OPENROUTER_API_KEY is not set (decide --oracle
   reads the key from the environment): export …`; nothing is sent and no
@@ -425,15 +485,39 @@ cortiq decide cortiq-decision.cmf --skill banking77 --input rows.jsonl --out res
   figure the ledger needs, and how a server of that directory lifts it
   (`POST /v1/admin/oracle {"budget_usd": null}`, or that figure rounded up
   when it is within the server's configured budget).
-* **After a stop rule** (a refused key, no credit, another model, a cost
-  above the reservation, `max_errors` failures in a row) the oracle of that
-  directory stays off for every later run; after the fix, add
-  `--oracle-resume` once, as `POST /v1/admin/oracle {"enabled": true}` does.
-* **After an interrupted run** (Ctrl-C, SIGTERM, a closed terminal) the
-  `LOCK` is released; a signal the run inherited as ignored (`nohup`, a
-  background job of a script) stays ignored. A `LOCK` left by a crash is
-  named with its pid: `--break-lock` removes it only when that process is
-  gone.
+
+**After a stop rule** (a refused key, no credit, another model, a cost
+above the reservation, `max_errors` failures in a row) the oracle of that
+directory stays off for every later run: a rejected text abstains with the
+flag `stopped` and a hint that names the rule. After the fix, add
+`--oracle-resume` once, as `POST /v1/admin/oracle {"enabled": true}` does
+(here after an `http_402`, credit added):
+
+```bash
+cortiq decide cortiq-decision.cmf --skill banking77 -p "hello there" --oracle deepseek/deepseek-v4.1-flash --oracle-resume
+```
+
+```text
+oracle: resumed — the oracle of state directory cortiq-decision.cmf.state was stopped by the stop rule http_402: OpenRouter answered HTTP 402: the key in OPENROUTER_API_KEY has no credits left (add credits at https://openrouter.ai/settings/credits, or raise the key's own limit); it may be called again
+…
+```
+
+**After an interrupted run** (Ctrl-C, SIGTERM, a closed terminal) the
+`LOCK` is released; a signal the run inherited as ignored (`nohup`, a
+background job of a script) stays ignored. A `LOCK` left by a crash is
+named with its pid (`state directory cortiq-decision.cmf.state has a LOCK
+left by pid 42341, which is no longer running (an interrupted run): pass
+--break-lock to remove it, or give this run a directory of its own with
+--state DIR`); `--break-lock` removes it only when that process is gone:
+
+```bash
+cortiq decide cortiq-decision.cmf --skill banking77 -p "thanks for your help" --oracle deepseek/deepseek-v4.1-flash --break-lock
+```
+
+```text
+warning: removed the LOCK of state directory cortiq-decision.cmf.state left by pid 42341, which is not running (--break-lock)
+…
+```
 
 ### Who may use it, and who teaches
 
