@@ -3125,7 +3125,9 @@ pub struct ServeOptions {
     pub config: Config,
     /// `--state DIR`; else `config.state_dir`, else `<FILE>.state`.
     pub state_dir: Option<PathBuf>,
-    /// `--break-lock`: remove a `LOCK` left by a dead process.
+    /// `--break-lock`: remove a `LOCK` left by a dead process where the
+    /// filesystem has no advisory locks (elsewhere a `LOCK` no process holds
+    /// is taken over without it, see [`StateDir::lock`]).
     pub break_lock: bool,
     /// Listening address (default `127.0.0.1:8080`). Whether it is loopback
     /// decides `auth.require: null`.

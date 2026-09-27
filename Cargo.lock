@@ -572,6 +572,7 @@ dependencies = [
  "cortiq-core",
  "cortiq-engine",
  "crc32fast",
+ "libc",
  "parking_lot",
  "rand_core 0.6.4",
  "serde",
