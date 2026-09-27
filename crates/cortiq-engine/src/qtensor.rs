@@ -1956,9 +1956,12 @@ impl QTensor {
                     // (e.g. a simulator) — verdicts are per-process, so
                     // without the bail the whole render crawls behind
                     // someone else's queue.
+                    // Row-exact batches stay on the host: the device GEMM
+                    // is an f32 dequant-sgemm, not the host matvec's sum.
                     if b >= 32
                         && b * rows * cols >= 128_000_000
                         && cols % 32 == 0
+                        && !row_exact()
                         && !crate::gpu::mm_killed()
                         && crate::gpu::enabled_here()
                     {
@@ -5967,6 +5970,10 @@ fn q2tp_matmat_mode(
 /// The pre-vectorised shape, kept for A/B (`CMF_Q4TP_V1=1`): the
 /// horizontal add lands once per group per column instead of once per
 /// row. Same weights, same activations — only the reduction differs.
+/// It is also the row-exact batch kernel: per group and column it forms
+/// `int dot as f32 * scale` and adds it to a scalar running sum, which is
+/// `dot_q4tp_row_sdot` step for step (Rust never contracts to an fma),
+/// so each column is bit-identical to that column's matvec.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon,dotprod")]
 unsafe fn dot_q4tp_row_1x4_sdot_v1(
@@ -6021,6 +6028,11 @@ unsafe fn dot_q4tp_row_1x4_sdot_v1(
 /// against the per-column one, on ARM the two reduction shapes.
 #[allow(dead_code)]
 static Q4TP_ALT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Tests that store `Q4TP_ALT` hold this, so one test's kernel pick does
+/// not leak into another's bit-exact comparison running in parallel.
+#[cfg(test)]
+static Q4TP_ALT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Blocking pays on x86 only with 512-bit VNNI. With AVX2 alone, four
 /// columns sharing an unpack still measured slower than the per-column
@@ -6407,6 +6419,10 @@ unsafe fn dot_q4tp_row_1x4_sdot(
 /// Fused q4tp matmat — the same three arms `q4t_matmat` has. Shipping only
 /// the scalar one made Nanbeige-3B decode at 1.2 tok/s against q4t's 5.9:
 /// the format was fine, the missing arms were the whole regression.
+///
+/// Under `row_exact()` every cell is summed in `q4tp_matvec`'s order on
+/// every architecture; the mode is read once, so one call never mixes
+/// the two contracts when a concurrent scope opens or closes mid-call.
 fn q4tp_matmat(
     bytes: &[u8],
     xs_all: &[f32],
@@ -6416,13 +6432,32 @@ fn q4tp_matmat(
     out: &mut [f32],
     pool: Option<&Pool>,
 ) {
+    q4tp_matmat_with(bytes, xs_all, b, rows, cols, out, pool, row_exact())
+}
+
+/// `q4tp_matmat` with the row-exact mode passed in rather than read from
+/// the shared counter: `exact` = each cell equals its token's matvec bit
+/// for bit, otherwise the fast blocked / AMX arms are free to reorder.
+#[allow(clippy::too_many_arguments)]
+fn q4tp_matmat_with(
+    bytes: &[u8],
+    xs_all: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+    pool: Option<&Pool>,
+    exact: bool,
+) {
     debug_assert_eq!(out.len(), b * rows);
     let gpr = cols / GROUP_SIZE;
     let v = Q4tpView::new(bytes, rows, cols);
 
     // Wide batches ride the AMX through a dequant-tile sgemm, as in q4t.
+    // An f32 GEMM over dequantized weights is not the matvec's int8 sum,
+    // so a row-exact batch never takes it.
     #[cfg(target_os = "macos")]
-    if b >= 8 && rows * cols >= 500_000 && accel_gemm_enabled() {
+    if !exact && b >= 8 && rows * cols >= 500_000 && accel_gemm_enabled() {
         dequant_matmat_accel(
             &|r, dst| {
                 let mut sc = [0f32; 32];
@@ -6460,6 +6495,12 @@ fn q4tp_matmat(
             .map(|bi| split_act(&xs_all[bi * cols..(bi + 1) * cols]))
             .collect();
         let acts = &acts;
+        // ARM stays blocked under `exact` too: the 1x4 kernel then runs in
+        // its v1 shape, whose per-group `int dot as f32 * scale` and scalar
+        // running sum are exactly `dot_q4tp_row_sdot`'s, so the tile is
+        // still unpacked once for four columns and each column equals its
+        // matvec. The tuned shape (fma into lane partials, one horizontal
+        // add per row) is 1-16 ulp off the matvec and is kept for `!exact`.
         #[cfg(target_arch = "aarch64")]
         let blocked_ok = sdot_enabled() && blocked_enabled();
         // x86 gets the same blocking: one tile unpack spent on four
@@ -6469,9 +6510,12 @@ fn q4tp_matmat(
         // for ARM's dotprod and is hard-wired false everywhere else, so
         // asking it here left the whole blocked path unreachable on x86.
         #[cfg(target_arch = "x86_64")]
-        let blocked_ok = q4tp_blocked_x86() && !row_exact();
+        let blocked_ok = q4tp_blocked_x86() && !exact;
         #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-        let blocked_ok = false;
+        let blocked_ok = {
+            let _ = exact;
+            false
+        };
         // Columns are swept in panels that fit L2. Without this a
         // row-pair walks every activation in the batch — 4.8 MB at
         // 512x512 — and does it again for the next pair, so the whole
@@ -6615,7 +6659,7 @@ fn q4tp_matmat(
                                 acts[abase + bi + 3].xq.as_slice(),
                             ];
                             let d = unsafe {
-                                if q4tp_v1() {
+                                if exact || q4tp_v1() {
                                     dot_q4tp_row_1x4_sdot_v1(v.nib, r, gpr, xs, &sc)
                                 } else {
                                     dot_q4tp_row_1x4_sdot(v.nib, r, gpr, xs, &sc)
@@ -9533,8 +9577,10 @@ pub(crate) fn float_activations_scope<R>(f: impl FnOnce() -> R) -> R {
 /// `q4tp_matmat`) compute every (weight row, token) cell with the
 /// single-token kernel instead of the blocked 2×4 / 1×4 / 1×8 tiles, so a
 /// token's result does not depend on the batch it rides in and equals its
-/// matvec. The MiMo speculative verify holds it (`row_exact_scope`) — its
-/// accepted rows must be the rows plain decode would have produced.
+/// matvec. On ARM `q4tp_matmat` keeps its 1×4 tile but in the matvec's
+/// reduction order, and no q4tp batch takes the AMX or device GEMM. The
+/// MiMo speculative verify holds it (`row_exact_scope`) — its accepted
+/// rows must be the rows plain decode would have produced.
 // Shared with pool workers, so overlapping requests must keep the mode
 // enabled until the LAST scope leaves. Saving/restoring a global bool is
 // incorrect when two threads enter and leave in a non-LIFO order.
@@ -12541,6 +12587,124 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The row-exact fix must not touch the fast path. Outside the scope
+    /// `q4tp_matmat` has to produce exactly what it did before, and on ARM
+    /// "before" is spelled out below: the tuned 1x4 SDOT tile for every
+    /// four columns and the single-row kernel for the tail. Inside the
+    /// scope every column equals its token's matvec. `q4tp_matmat_with`
+    /// takes the mode as an argument, so a concurrent test holding the
+    /// shared scope cannot flip it under this one.
+    #[test]
+    fn q4tp_matmat_fast_path_unchanged_outside_row_exact() {
+        use crate::pool::Pool;
+        use std::sync::atomic::Ordering::Relaxed;
+        let _alt = Q4TP_ALT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // The tuned ARM shape, which is also what an unset switch picks
+        // unless CMF_Q4TP_V1 is exported.
+        Q4TP_ALT.store(2, Relaxed);
+        let pool = Pool::new(3);
+        // Under 500k cells, so macOS keeps the matmat off the AMX; the
+        // second shape runs across pool workers (rows >= 256) with 32
+        // groups of accumulation and a tail after two 1x4 tiles.
+        for &(rows, cols, b) in &[(64usize, 256usize, 7usize), (320, 1024, 9)] {
+            let bytes = synth_q4tp(rows, cols);
+            let mut xs: Vec<f32> = (0..b * cols)
+                .map(|i| ((i * 29 + 11) % 83) as f32 / 83.0 - 0.5)
+                .collect();
+            xs[3] = 7.5; // an activation outlier on token 0
+            let run = |exact: bool| {
+                let mut out = vec![0f32; b * rows];
+                q4tp_matmat_with(&bytes, &xs, b, rows, cols, &mut out, Some(&pool), exact);
+                out
+            };
+            let (fast, exact) = (run(false), run(true));
+            #[cfg(not(target_arch = "aarch64"))]
+            let _ = fast;
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            let mut matvecs = vec![0f32; b * rows];
+            for (bi, o) in matvecs.chunks_mut(rows).enumerate() {
+                q4tp_matvec(
+                    &bytes,
+                    &xs[bi * cols..(bi + 1) * cols],
+                    rows,
+                    cols,
+                    o,
+                    Some(&pool),
+                );
+            }
+            assert!(matvecs.iter().any(|v| *v != 0.0));
+            assert_eq!(
+                bits(&exact),
+                bits(&matvecs),
+                "{rows}x{cols} b={b}: row-exact matmat must equal per-token matvecs"
+            );
+            #[cfg(target_arch = "aarch64")]
+            {
+                // The pre-fix ARM loop, cell for cell.
+                let gpr = cols / GROUP_SIZE;
+                let v = Q4tpView::new(&bytes, rows, cols);
+                let mut old = vec![0f32; b * rows];
+                let mut sc = vec![0f32; gpr];
+                let a8w8 = a8w8_enabled();
+                let blocked = sdot_enabled() && blocked_enabled();
+                let acts: Vec<SplitAct> = (0..b)
+                    .map(|bi| split_act(&xs[bi * cols..(bi + 1) * cols]))
+                    .collect();
+                for r in 0..rows {
+                    v.scales_into(r, gpr, &mut sc);
+                    if !a8w8 {
+                        for bi in 0..b {
+                            let x = &xs[bi * cols..(bi + 1) * cols];
+                            old[bi * rows + r] = q4tp_row_exact(v.nib, r, gpr, x, &sc);
+                        }
+                        continue;
+                    }
+                    let finish = |d: f32, act: &SplitAct| {
+                        let mut acc = d * act.sx;
+                        for &(j, xv) in &act.outliers {
+                            let (w, s) = q4tp_outlier(v.nib, r, gpr, j, &sc);
+                            acc += w * s * xv;
+                        }
+                        acc
+                    };
+                    let mut bi = 0usize;
+                    while blocked && bi + 4 <= b {
+                        let xs4 = [
+                            acts[bi].xq.as_slice(),
+                            acts[bi + 1].xq.as_slice(),
+                            acts[bi + 2].xq.as_slice(),
+                            acts[bi + 3].xq.as_slice(),
+                        ];
+                        let d = unsafe { dot_q4tp_row_1x4_sdot(v.nib, r, gpr, xs4, &sc) };
+                        for k in 0..4 {
+                            old[(bi + k) * rows + r] = finish(d[k], &acts[bi + k]);
+                        }
+                        bi += 4;
+                    }
+                    for (bi, act) in acts.iter().enumerate().skip(bi) {
+                        let d = dot_q4tp_row_i8(v.nib, r, gpr, &act.xq, &sc);
+                        old[bi * rows + r] = finish(d, act);
+                    }
+                }
+                assert_eq!(
+                    bits(&fast),
+                    bits(&old),
+                    "{rows}x{cols} b={b}: the fast path changed outside row_exact"
+                );
+                // And it is still the fast tile that runs: its lane-parallel
+                // fma sum rounds differently from the matvec somewhere.
+                if blocked {
+                    assert_ne!(
+                        bits(&fast),
+                        bits(&matvecs),
+                        "{rows}x{cols} b={b}: the tuned tile no longer runs outside row_exact"
+                    );
+                }
+            }
+        }
+        Q4TP_ALT.store(0, Relaxed);
+    }
+
     #[test]
     fn row_exact_scopes_survive_overlap_nesting_and_unwind() {
         use std::sync::{Barrier, atomic::{AtomicUsize, Ordering}};
@@ -13114,6 +13278,9 @@ mod gemm_bench {
     #[test]
     #[ignore]
     fn q4tp_matmat_throughput() {
+        let _alt = super::Q4TP_ALT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // 296 is a prompt-encode batch; the image DiT runs 2085 at
         // 512x512, where the activation panel stops fitting L2 and the
         // loop's shape starts to matter more than its instructions.
@@ -13191,6 +13358,9 @@ mod gemm_bench {
     #[test]
     fn q4tp_matmat_blocked_matches_scalar() {
         use std::sync::atomic::Ordering::Relaxed;
+        let _alt = super::Q4TP_ALT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // The last shape carries the image DiT's column count — 2304, so
         // 72 groups of accumulation, which is where a reordered sum can
         // actually drift — and runs through the thread pool, since the
@@ -13293,6 +13463,84 @@ mod gemm_bench {
                 "{rows}x{cols} b={b}: error against f64 too large — blocked \
                  {e_blocked:.3e}, per-column {e_scalar:.3e}, scale {scale:.3e}"
             );
+        }
+    }
+
+    /// What the row-exact contract costs a speculative-verify panel on the
+    /// host: the same batch through the fast arms, through the row-exact
+    /// arms, and as one matvec per token (the other way to be exact).
+    /// Arms alternate inside one process and keep their best time.
+    /// `CMF_GPU=0 cargo test -p cortiq-engine --release q4tp_matmat_row_exact_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn q4tp_matmat_row_exact_cost() {
+        let _alt = super::Q4TP_ALT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let pool = crate::pool::Pool::from_env();
+        let reps: usize = std::env::var("CMF_BENCH_REPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30);
+        for &(rows, cols) in &[(2048usize, 4096usize), (4096, 2048), (4096, 4096)] {
+            let total = cortiq_core::quant::expected_nbytes(
+                cortiq_core::TensorDtype::Q4TiledP,
+                &[rows, cols],
+            )
+            .unwrap();
+            let (params_off, _, _) = cortiq_core::quant::q4tp_sections(rows, cols);
+            let mut bytes: Vec<u8> = (0..total).map(|i| (i * 37 % 251) as u8).collect();
+            let lo = cortiq_core::quant::f32_to_f16(-4.0);
+            let step = cortiq_core::quant::f32_to_f16(0.1);
+            for r in 0..rows {
+                let o = params_off + r * 4;
+                bytes[o..o + 2].copy_from_slice(&lo.to_le_bytes());
+                bytes[o + 2..o + 4].copy_from_slice(&step.to_le_bytes());
+            }
+            for &b in &[2usize, 4, 5, 8] {
+                let xs: Vec<f32> = (0..b * cols)
+                    .map(|i| ((i % 97) as f32 - 48.0) / 48.0)
+                    .collect();
+                let mut out = vec![0f32; b * rows];
+                let mut best = [f64::MAX; 3];
+                for _ in 0..reps {
+                    for (k, best_k) in best.iter_mut().enumerate() {
+                        let t = std::time::Instant::now();
+                        match k {
+                            0 | 1 => super::q4tp_matmat_with(
+                                &bytes,
+                                &xs,
+                                b,
+                                rows,
+                                cols,
+                                &mut out,
+                                pool.as_deref(),
+                                k == 1,
+                            ),
+                            _ => {
+                                for (bi, o) in out.chunks_mut(rows).enumerate() {
+                                    super::q4tp_matvec(
+                                        &bytes,
+                                        &xs[bi * cols..(bi + 1) * cols],
+                                        rows,
+                                        cols,
+                                        o,
+                                        pool.as_deref(),
+                                    );
+                                }
+                            }
+                        }
+                        *best_k = best_k.min(t.elapsed().as_secs_f64());
+                    }
+                }
+                println!(
+                    "q4tp {rows}x{cols} b={b}: fast {:.3} ms, row-exact {:.3} ms, \
+                     {b} matvecs {:.3} ms",
+                    best[0] * 1e3,
+                    best[1] * 1e3,
+                    best[2] * 1e3
+                );
+            }
         }
     }
 
