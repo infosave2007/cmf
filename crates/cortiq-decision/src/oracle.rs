@@ -52,12 +52,18 @@
 //! {"enabled":true}`; the reason is kept in `oracle.state`): HTTP 401/402/403,
 //! `unexpected_model`, a cost above the reservation (the answer itself is kept)
 //! and `max_errors` failed calls in a row.
+//!
+//! **Status** ([`OracleClient::status`], `status` of `GET /v1/admin/oracle`):
+//! `disabled` (not configured, or the admin switch is off), `no_key` (the
+//! variable is unset or empty), `stopped: <reason>`, `budget_exhausted` (the
+//! budget left cannot hold the smallest call, or `max_calls` calls were made)
+//! or `ready` — the order of the permission checks.
 
 use crate::answer::OracleAnswer;
 use crate::canonical;
 use crate::config::{MAX_ORACLE_TOKENS, OracleConfig};
 use crate::protocol::{ApiError, Question, QuestionKind, find_duplicate_key};
-use crate::service::RefusalReason;
+use crate::service::{OracleStatus, RefusalReason};
 use crate::statedir::atomic_write;
 use anyhow::{Context, Result, bail, ensure};
 use parking_lot::Mutex;
@@ -734,7 +740,7 @@ impl OracleClient {
             return Err(RefusalReason::OracleDisabled);
         }
         if !self.key_present() {
-            return Err(RefusalReason::OracleDisabled);
+            return Err(RefusalReason::NoKey);
         }
         if inner.state.stop_reason.is_some() {
             return Err(RefusalReason::Stopped);
@@ -779,7 +785,7 @@ impl OracleClient {
         body: &[u8],
     ) -> CallOutcome {
         let Some(key) = (self.key)(&self.cfg.api_key_env) else {
-            return CallOutcome::Refused(RefusalReason::OracleDisabled);
+            return CallOutcome::Refused(RefusalReason::NoKey);
         };
         let mt = max_tokens(self.cfg.max_tokens_per_question, questions.len());
         let res = reservation_usd(body.len(), mt, self.max_price);
@@ -993,12 +999,57 @@ impl OracleClient {
         }
     }
 
+    /// The reservation of the smallest possible call (an empty body, one
+    /// question): a budget with less left can admit no call.
+    pub fn min_reservation_usd(&self) -> f64 {
+        reservation_usd(
+            0,
+            max_tokens(self.cfg.max_tokens_per_question, 1),
+            self.max_price,
+        )
+    }
+
+    /// `max_price` {prompt, completion} in USD per 1M tokens.
+    pub fn max_price(&self) -> (f64, f64) {
+        self.max_price
+    }
+
+    fn status_of(&self, inner: &Inner) -> OracleStatus {
+        if !self.cfg.enabled {
+            return OracleStatus::Disabled { by_admin: false };
+        }
+        if !inner.state.enabled {
+            return OracleStatus::Disabled { by_admin: true };
+        }
+        if !self.key_present() {
+            return OracleStatus::NoKey;
+        }
+        if let Some(r) = &inner.state.stop_reason {
+            return OracleStatus::Stopped(r.clone());
+        }
+        let t = &inner.totals;
+        if t.calls >= self.max_calls(&inner.state)
+            || self.budget(&inner.state) - t.spent < self.min_reservation_usd()
+        {
+            return OracleStatus::BudgetExhausted;
+        }
+        OracleStatus::Ready
+    }
+
+    /// Whether a call can be made now, in the order of the permission checks:
+    /// configured and switched on, a key in the environment, not stopped, a
+    /// budget that holds at least the smallest call and calls left.
+    pub fn status(&self) -> OracleStatus {
+        self.status_of(&self.inner.lock())
+    }
+
     /// `GET /v1/admin/oracle` (no secret, only whether the key is present).
     pub fn status_json(&self) -> Value {
         let inner = self.inner.lock();
         let t = &inner.totals;
         let budget = self.budget(&inner.state);
         json!({
+            "status": self.status_of(&inner).label(),
             "enabled": inner.state.enabled,
             "stop_reason": inner.state.stop_reason,
             "stopped_unix": inner.state.stopped_unix,
@@ -1020,6 +1071,7 @@ impl OracleClient {
             "max_errors": self.cfg.max_errors,
             "deadline_s": self.cfg.deadline_s,
             "redact_pii": self.cfg.redact_pii,
+            "max_price": {"prompt": self.max_price.0, "completion": self.max_price.1},
         })
     }
 

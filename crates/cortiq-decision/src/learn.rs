@@ -978,7 +978,7 @@ pub struct OfflineReport {
     /// Sent calls that failed (HTTP error, transport, invalid answer, …).
     pub failed_calls: usize,
     /// Calls not sent, by reason (`budget`, `stopped`, `oracle_disabled`,
-    /// `ledger_write`); their texts are unanswered.
+    /// `no_key`, `ledger_write`); their texts are unanswered.
     pub refused_calls: BTreeMap<String, usize>,
     pub unanswered: usize,
     pub pii_redacted: usize,

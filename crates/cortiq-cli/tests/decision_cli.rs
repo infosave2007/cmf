@@ -28,7 +28,16 @@
 //!   comparison line without the text, whose local label is `decide`'s; a
 //!   plain-http non-loopback URL refused before anything is opened;
 //! * `decision learn` with the mock oracle: only abstentions are asked, ledger
-//!   answers are reused, the reservation ledger holds no key.
+//!   answers are reused, the reservation ledger holds no key;
+//! * the oracle in two steps (`serve --oracle MODEL` with `OPENROUTER_API_KEY`)
+//!   against a loopback OpenRouter (endpoint and model listings, chat
+//!   completions): ready with twice the cheapest structured-output price,
+//!   only gate-rejected questions reach it, PII redacted, the key in no log
+//!   (`RUST_LOG=debug`), output or state file; `no_key` with a startup line
+//!   and a hint; unknown and unstructured models refused with cheap
+//!   suggestions; an unreachable listing falls back; `--oracle-max-price`;
+//!   `budget_exhausted` by calls and by dollars; `keys create` allows the
+//!   oracle unless `--oracle-allowed=false`.
 
 #[path = "support/toy_dir.rs"]
 mod toy_dir;
@@ -2447,4 +2456,746 @@ fn learn_asks_the_mock_oracle_only_about_abstentions() {
     // An existing output is refused.
     let e = fails(&a);
     assert!(e.contains("overwrite"), "{e}");
+}
+
+// ------------------------------------------------------------------ the oracle in two steps
+
+/// Admin token of the two-step oracle servers.
+const ADMIN_TOKEN: &str = "admin-token-for-oracle-two-steps-0123456789";
+/// A fake OpenRouter key in the default variable of a child process (the
+/// real environment is never read: `cortiq()` removes the variable).
+const FAKE_OPENROUTER_KEY: &str = "sk-or-v1-FAKE-two-steps-u1-0123456789abcdef-cmf";
+
+/// One request a mock received: (head as sent, body).
+type Request = (String, Vec<u8>);
+
+/// A loopback OpenRouter: the public endpoint listing of three models, the
+/// public model listing and `/chat/completions` (every choice answered with
+/// `label` when it is an option, at `cost` USD, as the model asked).
+struct MockOpenRouter {
+    addr: SocketAddr,
+    chats: Arc<AtomicUsize>,
+    /// (head, body) of every request, in arrival order.
+    requests: Arc<Mutex<Vec<Request>>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+fn endpoint(provider: &str, prompt: &str, completion: &str, structured: bool) -> Value {
+    let params = if structured {
+        json!([
+            "max_tokens",
+            "temperature",
+            "response_format",
+            "structured_outputs"
+        ])
+    } else {
+        json!(["max_tokens", "temperature"])
+    };
+    json!({"name": format!("{provider} | model"), "provider_name": provider,
+           "pricing": {"prompt": prompt, "completion": completion, "request": "0", "image": "0"},
+           "supported_parameters": params, "status": 0})
+}
+
+/// The answer of the mock to one request: (status, body).
+fn openrouter_reply(head: &str, body: &[u8], label: &str, cost: f64) -> (u16, Vec<u8>) {
+    let mut words = head.split(' ');
+    let method = words.next().unwrap_or("");
+    let path = words.next().unwrap_or("");
+    let listing = |eps: Value| {
+        json!({"data": {"id": "m", "name": "m", "endpoints": eps}})
+            .to_string()
+            .into_bytes()
+    };
+    match (method, path) {
+        ("GET", "/api/v1/models/deepseek/deepseek-v4.1-flash/endpoints") => (
+            200,
+            listing(json!([
+                endpoint("NoJson", "0.00000001", "0.00000001", false),
+                endpoint("Pricey", "0.0000002", "0.0000009", true),
+                endpoint("Mock", "0.00000003", "0.00000029", true),
+            ])),
+        ),
+        ("GET", "/api/v1/models/plain/no-json/endpoints") => (
+            200,
+            listing(json!([endpoint("Plain", "0.0000001", "0.0000001", false)])),
+        ),
+        ("GET", "/api/v1/models") => (
+            200,
+            json!({"data": [
+                {"id": "deepseek/deepseek-v4.1-flash", "pricing": {"prompt": "0.00000003", "completion": "0.00000029"},
+                 "supported_parameters": ["structured_outputs", "response_format"]},
+                {"id": "cheap/typed-mini", "pricing": {"prompt": "0.00000002", "completion": "0.0000001"},
+                 "supported_parameters": ["structured_outputs"]},
+                {"id": "big/typed-pro", "pricing": {"prompt": "0.000003", "completion": "0.000015"},
+                 "supported_parameters": ["structured_outputs"]},
+                {"id": "plain/no-json", "pricing": {"prompt": "0.0000001", "completion": "0.0000001"},
+                 "supported_parameters": ["tools"]},
+                {"id": "cheap/typed-mini:free", "pricing": {"prompt": "0", "completion": "0"},
+                 "supported_parameters": ["structured_outputs"]}
+            ]})
+            .to_string()
+            .into_bytes(),
+        ),
+        ("POST", "/api/v1/chat/completions") => {
+            let mut v: Value = serde_json::from_slice(&completion_for(body, label)).unwrap();
+            let req: Value = serde_json::from_slice(body).unwrap();
+            v["model"] = req["model"].clone();
+            v["usage"]["cost"] = json!(cost);
+            (200, serde_json::to_vec(&v).unwrap())
+        }
+        _ => (
+            404,
+            br#"{"error":{"code":404,"message":"Not Found"}}"#.to_vec(),
+        ),
+    }
+}
+
+impl MockOpenRouter {
+    fn start(label: &'static str, cost: f64) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let chats = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (c, r, st) = (chats.clone(), requests.clone(), stop.clone());
+        let thread = std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                if st.load(Ordering::SeqCst) {
+                    break;
+                }
+                let Ok(mut s) = conn else { continue };
+                let (c, r) = (c.clone(), r.clone());
+                std::thread::spawn(move || {
+                    let Some((head, body)) = read_request_parts(&mut s) else {
+                        return;
+                    };
+                    if head.starts_with("POST /api/v1/chat/completions ") {
+                        c.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let (status, reply) = openrouter_reply(&head, &body, label, cost);
+                    r.lock().unwrap().push((head, body));
+                    let head = format!(
+                        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        reply.len()
+                    );
+                    let _ = s.write_all(head.as_bytes());
+                    let _ = s.write_all(&reply);
+                    let _ = s.flush();
+                });
+            }
+        });
+        Self {
+            addr,
+            chats,
+            requests,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    /// `--oracle-base-url` of this mock.
+    fn base(&self) -> String {
+        format!("http://{}/api/v1", self.addr)
+    }
+
+    fn chats(&self) -> usize {
+        self.chats.load(Ordering::SeqCst)
+    }
+
+    fn requests(&self) -> Vec<Request> {
+        self.requests.lock().unwrap().clone()
+    }
+
+    /// The `state` of every chat request.
+    fn states(&self) -> Vec<Value> {
+        self.requests()
+            .iter()
+            .filter(|(h, _)| h.starts_with("POST "))
+            .map(|(_, b)| {
+                let v: Value = serde_json::from_slice(b).unwrap();
+                let user: Value =
+                    serde_json::from_str(v["messages"][1]["content"].as_str().unwrap()).unwrap();
+                user["state"].clone()
+            })
+            .collect()
+    }
+}
+
+impl Drop for MockOpenRouter {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(self.addr);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// One HTTP request with extra headers: (status, JSON body or Null, text).
+fn http_h(
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: Option<&Value>,
+) -> (u16, Value, String) {
+    let agent = ureq::AgentBuilder::new()
+        .max_idle_connections(0)
+        .timeout(Duration::from_secs(60))
+        .build();
+    let mut req = agent.request(method, url);
+    for (k, v) in headers {
+        req = req.set(k, v);
+    }
+    let res = match body {
+        Some(b) => req
+            .set("Content-Type", "application/json")
+            .send_string(&b.to_string()),
+        None => req.call(),
+    };
+    let resp = match res {
+        Ok(r) => r,
+        Err(ureq::Error::Status(_, r)) => r,
+        Err(e) => panic!("{method} {url}: {e}"),
+    };
+    let status = resp.status();
+    let text = resp.into_string().unwrap();
+    (
+        status,
+        serde_json::from_str(&text).unwrap_or(Value::Null),
+        text,
+    )
+}
+
+fn oracle_status(srv: &Server) -> Value {
+    let (code, v, _) = http_h(
+        "GET",
+        &srv.url("/v1/admin/oracle"),
+        &[("x-admin-token", ADMIN_TOKEN)],
+        None,
+    );
+    assert_eq!(code, 200, "{v}");
+    v
+}
+
+/// `cortiq serve TOY --state STATE --oracle deepseek/… --oracle-base-url MOCK
+/// <extra>` with the admin token and `envs`.
+fn serve_oracle(
+    state: &Path,
+    base: &str,
+    extra: &[&str],
+    envs: &[(&str, &str)],
+    logs: &Path,
+) -> Server {
+    let mut a = vec![
+        "--state",
+        s(state),
+        "--oracle",
+        ORACLE_MODEL,
+        "--oracle-base-url",
+        base,
+    ];
+    a.extend_from_slice(extra);
+    let mut e = vec![("CORTIQ_DECISION_ADMIN_TOKEN", ADMIN_TOKEN)];
+    e.extend_from_slice(envs);
+    Server::start(&toy().path, &a, &e, logs)
+}
+
+/// Every file under `dir`, recursively.
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+fn assert_no_bytes_of(needle: &str, dir: &Path) {
+    for f in files_under(dir) {
+        let b = std::fs::read(&f).unwrap();
+        assert!(
+            !b.windows(needle.len()).any(|w| w == needle.as_bytes()),
+            "{} holds the key",
+            f.display()
+        );
+    }
+}
+
+#[test]
+fn serve_oracle_in_two_steps_is_ready_asks_only_undetermined_questions_and_hides_the_key() {
+    let t = toy();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let mock = MockOpenRouter::start("travel", 1.3e-5);
+    let state = d.join("state");
+    // Step 1: the key in OPENROUTER_API_KEY; step 2: --oracle MODEL. Loopback,
+    // no keys, no --decision-config: the open mode may use the oracle.
+    let srv = serve_oracle(
+        &state,
+        &mock.base(),
+        &["--oracle-budget", "5"],
+        &[
+            ("OPENROUTER_API_KEY", FAKE_OPENROUTER_KEY),
+            ("RUST_LOG", "debug"),
+        ],
+        d,
+    );
+    let logs = srv.logs();
+    let line = format!(
+        "oracle: ready — {ORACLE_MODEL} via {}, budget $5.00, max price in/out $0.06/$0.58 per 1M \
+         (2× the cheapest structured-output endpoint, Mock at $0.03/$0.29)",
+        mock.addr
+    );
+    assert!(logs.contains(&line), "{logs}");
+    assert_eq!(logs.matches("oracle: ready").count(), 1, "{logs}");
+    // The listing was fetched once, without a key.
+    let gets: Vec<String> = mock
+        .requests()
+        .into_iter()
+        .map(|(h, _)| h)
+        .filter(|h| h.starts_with("GET "))
+        .collect();
+    assert_eq!(gets.len(), 1, "{gets:?}");
+    assert!(gets[0].starts_with(&format!("GET /api/v1/models/{ORACLE_MODEL}/endpoints ")));
+    assert!(!gets[0].to_ascii_lowercase().contains("authorization"));
+
+    let st = oracle_status(&srv);
+    assert_eq!(st["status"], "ready", "{st}");
+    assert_eq!(st["key_env"], "OPENROUTER_API_KEY");
+    assert_eq!(st["key_present"], true);
+    assert_eq!(st["budget_usd"], 5.0);
+    assert_eq!(st["max_price"], json!({"prompt": 0.06, "completion": 0.58}));
+    assert_eq!(st["redact_pii"], true);
+    assert!(!st.to_string().contains(FAKE_OPENROUTER_KEY));
+    let (_, h, _) = http_h("GET", &srv.url("/healthz"), &[], None);
+    assert_eq!(h["oracle_status"], "ready", "{h}");
+    // The router's /v1/healthz keeps its shape; the status only under cmf.
+    let (_, h, _) = http_h("GET", &srv.url("/v1/healthz"), &[], None);
+    assert_eq!(h, json!({"status": "ok"}));
+    let (_, h, _) = http_h(
+        "GET",
+        &srv.url("/v1/healthz"),
+        &[("x-cmf-extensions", "1")],
+        None,
+    );
+    assert_eq!(h["cmf"]["oracle_status"], "ready", "{h}");
+
+    // Gate-accepted questions never reach the oracle.
+    let mut local = 0;
+    for (text, _) in t.topics.dev_rows.iter().take(8) {
+        let before = mock.chats();
+        let (code, v) = http(
+            "POST",
+            &srv.url("/v1/decisions"),
+            None,
+            Some(&topics_request(text)),
+        );
+        assert_eq!(code, 200, "{v}");
+        if v["cmf"]["questions"]["task"]["action"] == "local" {
+            local += 1;
+            assert_eq!(
+                mock.chats(),
+                before,
+                "a gate-accepted question reached the oracle"
+            );
+        }
+    }
+    assert!(local > 0, "no dev text was accepted by the gate");
+    let before = mock.chats();
+    // A gate-rejected question goes to the oracle, its state PII-redacted.
+    let texts = distinct_texts(2, 7, "u1", 0.97);
+    let (code, v) = http(
+        "POST",
+        &srv.url("/v1/decisions"),
+        None,
+        Some(&topics_request(&format!(
+            "{} write to jane.roe@example.com",
+            texts[0]
+        ))),
+    );
+    assert_eq!(code, 200, "{v}");
+    let q = &v["cmf"]["questions"]["task"];
+    assert_eq!(q["action"], "oracle", "{v}");
+    assert!(
+        q["flags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f == "pii_redacted"),
+        "{q}"
+    );
+    assert_eq!(v["answers"]["task"]["choice"], "travel");
+    assert!(v["cmf"].get("hint").is_none(), "{v}");
+    assert!(!v.to_string().contains(FAKE_OPENROUTER_KEY));
+    assert_eq!(mock.chats(), before + 1);
+    let sent = mock.states();
+    let last = sent.last().unwrap().to_string();
+    assert!(
+        !last.contains("jane.roe@example.com") && last.contains("[REDACTED]"),
+        "{last}"
+    );
+    // The key went to the oracle only, in its Authorization header.
+    let posts: Vec<Request> = mock
+        .requests()
+        .into_iter()
+        .filter(|(h, _)| h.starts_with("POST "))
+        .collect();
+    assert!(
+        posts[0]
+            .0
+            .contains(&format!("Bearer {FAKE_OPENROUTER_KEY}"))
+    );
+
+    let logs = srv.stop();
+    assert!(logs.contains("DEBUG"), "RUST_LOG=debug is in effect");
+    assert!(!logs.contains(FAKE_OPENROUTER_KEY), "the key in the logs");
+    assert_no_bytes_of(FAKE_OPENROUTER_KEY, &state);
+    let ledger = std::fs::read_to_string(state.join("oracle.jsonl")).unwrap();
+    assert_eq!(
+        ledger.lines().count(),
+        2 * mock.chats(),
+        "one reservation and one settlement per call"
+    );
+}
+
+#[test]
+fn serve_oracle_without_the_key_is_not_ready_and_says_what_to_do() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let mock = MockOpenRouter::start("travel", 1.3e-5);
+    let state = d.join("state");
+    let srv = serve_oracle(&state, &mock.base(), &[], &[], d);
+    let logs = srv.logs();
+    assert!(
+        logs.contains("oracle: NOT ready — OPENROUTER_API_KEY is not set (set it to your OpenRouter key and restart;"),
+        "{logs}"
+    );
+    let st = oracle_status(&srv);
+    assert_eq!(st["status"], "no_key", "{st}");
+    assert_eq!(st["key_present"], false);
+    let (_, h, _) = http_h("GET", &srv.url("/healthz"), &[], None);
+    assert_eq!(h["oracle_status"], "no_key");
+    // A trained question the gate rejects abstains with the reason and a hint.
+    let texts = distinct_texts(2, 7, "nk", 0.97);
+    let (code, v) = http(
+        "POST",
+        &srv.url("/v1/decisions"),
+        None,
+        Some(&topics_request(&texts[0])),
+    );
+    assert_eq!(code, 200, "{v}");
+    let q = &v["cmf"]["questions"]["task"];
+    assert_eq!(q["action"], "abstain", "{v}");
+    let flags: Vec<&str> = q["flags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f.as_str().unwrap())
+        .collect();
+    assert!(
+        flags.contains(&"oracle_disabled") && flags.contains(&"no_key"),
+        "{flags:?}"
+    );
+    assert_eq!(
+        v["cmf"]["hint"],
+        "the oracle key is not set: set OPENROUTER_API_KEY in the server's environment and restart it"
+    );
+    // The router surface keeps its shape: the hint is only logged.
+    let (code, r, text) = http_h(
+        "POST",
+        &srv.url("/v1/route"),
+        &[],
+        Some(&json!({"input": {"text": texts[1]}, "taxonomy_id": "topics"})),
+    );
+    assert_eq!(code, 200, "{r}");
+    assert!(r.get("cmf").is_none() && !text.contains("hint"), "{text}");
+    assert_eq!(mock.chats(), 0);
+    let logs = srv.stop();
+    assert_eq!(
+        logs.matches(
+            "a question the local model could not decide abstained: the oracle key is not set"
+        )
+        .count(),
+        1,
+        "the hint is logged once a minute\n{logs}"
+    );
+}
+
+#[test]
+fn serve_oracle_refuses_a_model_it_cannot_use_and_names_cheap_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let mock = MockOpenRouter::start("travel", 1.3e-5);
+    let state = d.join("state");
+    let base = mock.base();
+    for (model, problem) in [
+        ("nope/unknown", "127.0.0.1"),
+        (
+            "plain/no-json",
+            "none of its 1 endpoints supports structured outputs",
+        ),
+    ] {
+        let e = fails(&[
+            "serve",
+            s(&toy().path),
+            "--port",
+            "9",
+            "--state",
+            s(&state),
+            "--oracle",
+            model,
+            "--oracle-base-url",
+            &base,
+        ]);
+        assert!(e.contains(&format!("--oracle {model}: {problem}")), "{e}");
+        if model == "nope/unknown" {
+            assert!(
+                e.contains(&format!(
+                    "does not list this model ({base}/models/nope/unknown/endpoints answered HTTP 404)"
+                )),
+                "{e}"
+            );
+        }
+        assert!(
+            e.contains(
+                "Cheap models with structured outputs: cheap/typed-mini ($0.02/$0.10 per 1M in/out), \
+                 deepseek/deepseek-v4.1-flash ($0.03/$0.29 per 1M in/out), big/typed-pro"
+            ),
+            "{e}"
+        );
+        assert!(e.contains("Start with --oracle cheap/typed-mini"), "{e}");
+        assert!(!e.contains(":free"), "{e}");
+    }
+    assert!(!state.exists(), "a refused start leaves no state behind");
+    assert_eq!(mock.chats(), 0);
+    // Plain http to a non-loopback base is refused before any request.
+    let e = fails(&[
+        "serve",
+        s(&toy().path),
+        "--port",
+        "9",
+        "--oracle",
+        ORACLE_MODEL,
+        "--oracle-base-url",
+        "http://10.0.0.5:8080/api/v1",
+    ]);
+    assert!(e.contains("loopback"), "{e}");
+    // The companions need --oracle.
+    let e = fails(&["serve", s(&toy().path), "--oracle-budget", "5"]);
+    assert!(e.contains("--oracle"), "{e}");
+}
+
+#[test]
+fn serve_oracle_falls_back_when_the_listing_is_unreachable_and_max_price_overrides() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    // A closed loopback port: no listing.
+    let closed = format!("http://127.0.0.1:{}/api/v1", free_port());
+    let srv = serve_oracle(
+        &d.join("a"),
+        &closed,
+        &[],
+        &[("OPENROUTER_API_KEY", FAKE_OPENROUTER_KEY)],
+        d,
+    );
+    let logs = srv.logs();
+    assert!(
+        logs.contains(&format!(
+            "oracle: the endpoint listing of {ORACLE_MODEL} could not be fetched"
+        )) && logs.contains("the max price in/out falls back to $0.10/$0.50 per 1M"),
+        "{logs}"
+    );
+    assert!(
+        logs.contains("max price in/out $0.10/$0.50 per 1M (the default: the endpoint listing could not be fetched)"),
+        "{logs}"
+    );
+    let st = oracle_status(&srv);
+    assert_eq!(st["max_price"], json!({"prompt": 0.1, "completion": 0.5}));
+    assert_eq!(st["status"], "ready");
+    let logs = srv.stop();
+    assert!(!logs.contains(FAKE_OPENROUTER_KEY));
+
+    // --oracle-max-price wins over the listing.
+    let mock = MockOpenRouter::start("travel", 1.3e-5);
+    let srv = serve_oracle(
+        &d.join("b"),
+        &mock.base(),
+        &["--oracle-max-price", "0.2,0.8"],
+        &[("OPENROUTER_API_KEY", FAKE_OPENROUTER_KEY)],
+        d,
+    );
+    assert!(
+        srv.logs()
+            .contains("max price in/out $0.20/$0.80 per 1M (--oracle-max-price)"),
+        "{}",
+        srv.logs()
+    );
+    let st = oracle_status(&srv);
+    assert_eq!(st["max_price"], json!({"prompt": 0.2, "completion": 0.8}));
+    srv.stop();
+}
+
+#[test]
+fn serve_oracle_budget_exhaustion_is_a_status_and_a_hint() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let texts = distinct_texts(3, 7, "bx", 0.97);
+    // Calls: one allowed.
+    let mock = MockOpenRouter::start("travel", 1.3e-5);
+    let srv = serve_oracle(
+        &d.join("calls"),
+        &mock.base(),
+        &["--oracle-max-calls", "1"],
+        &[("OPENROUTER_API_KEY", FAKE_OPENROUTER_KEY)],
+        d,
+    );
+    let ask = |srv: &Server, text: &str| {
+        let (code, v) = http(
+            "POST",
+            &srv.url("/v1/decisions"),
+            None,
+            Some(&topics_request(text)),
+        );
+        assert_eq!(code, 200, "{v}");
+        v
+    };
+    assert_eq!(oracle_status(&srv)["status"], "ready");
+    let v = ask(&srv, &texts[0]);
+    assert_eq!(v["cmf"]["questions"]["task"]["action"], "oracle", "{v}");
+    assert_eq!(oracle_status(&srv)["status"], "budget_exhausted");
+    let v = ask(&srv, &texts[1]);
+    let q = &v["cmf"]["questions"]["task"];
+    assert_eq!(q["action"], "abstain", "{v}");
+    assert!(
+        q["flags"].as_array().unwrap().iter().any(|f| f == "budget"),
+        "{q}"
+    );
+    assert!(
+        v["cmf"]["hint"]
+            .as_str()
+            .unwrap()
+            .starts_with("the oracle budget is used up"),
+        "{v}"
+    );
+    assert_eq!(mock.chats(), 1);
+    srv.stop();
+
+    // Dollars: $0.0005 holds one reservation; a call that costs $0.00025
+    // leaves less than the smallest one.
+    let mock = MockOpenRouter::start("travel", 0.00025);
+    let state = d.join("usd");
+    let srv = serve_oracle(
+        &state,
+        &mock.base(),
+        &["--oracle-budget", "0.0005"],
+        &[("OPENROUTER_API_KEY", FAKE_OPENROUTER_KEY)],
+        d,
+    );
+    assert_eq!(oracle_status(&srv)["status"], "ready");
+    let v = ask(&srv, &texts[2]);
+    assert_eq!(v["cmf"]["questions"]["task"]["action"], "oracle", "{v}");
+    let st = oracle_status(&srv);
+    assert_eq!(st["status"], "budget_exhausted", "{st}");
+    srv.stop();
+    // A restart on the same state starts NOT ready, and says why.
+    let srv = serve_oracle(
+        &state,
+        &mock.base(),
+        &["--oracle-budget", "0.0005"],
+        &[("OPENROUTER_API_KEY", FAKE_OPENROUTER_KEY)],
+        d,
+    );
+    assert!(
+        srv.logs()
+            .contains("oracle: NOT ready — the budget is used up"),
+        "{}",
+        srv.logs()
+    );
+    srv.stop();
+    assert_eq!(mock.chats(), 1);
+}
+
+#[test]
+fn keys_created_here_may_use_the_oracle_unless_opted_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let state = d.join("state");
+    let st = s(&state);
+    let yes = json_of(&ok(&[
+        "decision",
+        "keys",
+        "create",
+        "--state",
+        st,
+        "--account",
+        "yes",
+        "--json",
+    ]));
+    assert_eq!(yes["oracle_allowed"], true, "{yes}");
+    let no = json_of(&ok(&[
+        "decision",
+        "keys",
+        "create",
+        "--state",
+        st,
+        "--account",
+        "no",
+        "--oracle-allowed=false",
+        "--json",
+    ]));
+    assert_eq!(no["oracle_allowed"], false, "{no}");
+    let mock = MockOpenRouter::start("travel", 1.3e-5);
+    let srv = serve_oracle(
+        &state,
+        &mock.base(),
+        &[],
+        &[("OPENROUTER_API_KEY", FAKE_OPENROUTER_KEY)],
+        d,
+    );
+    let texts = distinct_texts(2, 7, "ky", 0.97);
+    let (code, v) = http(
+        "POST",
+        &srv.url("/v1/decisions"),
+        Some(yes["key"].as_str().unwrap()),
+        Some(&topics_request(&texts[0])),
+    );
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["cmf"]["questions"]["task"]["action"], "oracle", "{v}");
+    let (code, v) = http(
+        "POST",
+        &srv.url("/v1/decisions"),
+        Some(no["key"].as_str().unwrap()),
+        Some(&topics_request(&texts[1])),
+    );
+    assert_eq!(code, 200, "{v}");
+    let q = &v["cmf"]["questions"]["task"];
+    assert_eq!(q["action"], "abstain", "{v}");
+    assert!(
+        q["flags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f == "consent_off"),
+        "{q}"
+    );
+    // The caller's own choice: no hint.
+    assert!(v["cmf"].get("hint").is_none(), "{v}");
+    // Without a key the keyed server refuses.
+    let (code, _) = http(
+        "POST",
+        &srv.url("/v1/decisions"),
+        None,
+        Some(&topics_request(&texts[1])),
+    );
+    assert_eq!(code, 401);
+    srv.stop();
+    assert_eq!(mock.chats(), 1);
 }

@@ -301,6 +301,8 @@ enum Commands {
         /// that does not answer in time gives 502 UPSTREAM_UNAVAILABLE
         #[arg(long, value_name = "SECONDS", requires = "shadow_of")]
         shadow_timeout_s: Option<u64>,
+        #[command(flatten)]
+        oracle: decision::OracleArgs,
         /// Also listen on ollama-compatible port
         #[arg(long)]
         compat_port: Option<u16>,
@@ -2060,6 +2062,7 @@ async fn main() -> anyhow::Result<()> {
             break_lock,
             shadow_of,
             shadow_timeout_s,
+            oracle,
             compat_port,
             o1,
             o1_m,
@@ -2093,6 +2096,7 @@ async fn main() -> anyhow::Result<()> {
                 break_lock,
                 shadow_of,
                 shadow_timeout_s,
+                oracle,
             };
             let o1 = O1Flags {
                 spec: o1,

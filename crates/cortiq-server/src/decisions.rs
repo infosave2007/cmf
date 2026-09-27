@@ -63,6 +63,24 @@
 //! Without the flag none of this exists (not even the admin path). Details:
 //! the `shadow` submodule.
 //!
+//! # The oracle in two steps (`--oracle MODEL`)
+//!
+//! `cortiq serve FILE --oracle MODEL` with the key in `OPENROUTER_API_KEY`
+//! turns the oracle on; the command line applies it to the configuration
+//! ([`cortiq_decision::oracle_setup`]: budget, max price from the public
+//! endpoint listing, …) and sets [`ServeOptions::oracle_from_flag`], which
+//! lets the open mode of a loopback address (no keys, `auth.require: null`)
+//! use the oracle — never teach the model. The server logs one startup line
+//! of the oracle ([`oracle_startup_line`]: `ready`, `NOT ready — <what to
+//! do>` or `off`), `GET /v1/admin/oracle` has `status` (`ready`, `no_key`,
+//! `disabled`, `budget_exhausted`, `stopped: <reason>`), `/healthz` has
+//! `oracle_status` (on `/v1/healthz` only under `cmf`, with
+//! `x-cmf-extensions`), and a trained question that abstains because the
+//! oracle is not ready carries the reason's flags (`oracle_disabled`,
+//! `no_key`, `budget`, `stopped`) and, on the decisions surface, one line
+//! `cmf.hint`; router answers keep their shapes (the hint is logged, at most
+//! once a minute).
+//!
 //! # Every request
 //!
 //! * **`x-request-id`** on every response: the decision's `cmf-dec-…` id for a
@@ -239,7 +257,7 @@ use cortiq_decision::protocol::{
 use cortiq_decision::service::{
     Action, AdminCommand, Decided, DecisionService, Escalator, LoadedModel, LocalDecision,
     ModelHandle, Observation, Principal, QUALITY_FIRST_MARGIN, QUALITY_FIRST_NOVELTY,
-    QuestionOutcome, SkillRuntime, estimate_complexity,
+    QuestionOutcome, RefusalReason, SkillRuntime, estimate_complexity,
 };
 use cortiq_decision::signal::Features;
 use cortiq_decision::statedir::{StateDir, StateLock};
@@ -2079,6 +2097,10 @@ impl DecisionState {
             )
         } else {
             let why = if !cfg.oracle.enabled || self.svc.escalator().is_none() {
+                // The router's answer has no hint: the log has it.
+                if let Some(h) = self.svc.oracle_hint(RefusalReason::OracleDisabled) {
+                    self.svc.log_oracle_hint(&h);
+                }
                 "oracle_disabled"
             } else {
                 "consent_off"
@@ -3098,6 +3120,14 @@ pub struct ServeOptions {
     /// Deadline of one request forwarded in shadow mode (`--shadow-timeout-s`;
     /// default [`cortiq_decision::shadow::UPSTREAM_TIMEOUT`], 60 s).
     pub shadow_timeout: Duration,
+    /// `--oracle MODEL` was given: the operator enabled the oracle on the
+    /// command line, so the open mode of a loopback address without
+    /// `auth.require` may use it ([`DecisionService::with_open_oracle`]; it
+    /// still may not teach the model).
+    pub oracle_from_flag: bool,
+    /// Where the oracle's max price came from (`--oracle`), for the startup
+    /// line.
+    pub oracle_note: Option<String>,
 }
 
 impl std::fmt::Debug for ServeOptions {
@@ -3114,6 +3144,8 @@ impl std::fmt::Debug for ServeOptions {
             )
             .field("shadow_of", &self.shadow_of)
             .field("shadow_timeout", &self.shadow_timeout)
+            .field("oracle_from_flag", &self.oracle_from_flag)
+            .field("oracle_note", &self.oracle_note)
             .finish()
     }
 }
@@ -3131,6 +3163,8 @@ impl ServeOptions {
             admin_token: None,
             shadow_of: None,
             shadow_timeout: cortiq_decision::shadow::UPSTREAM_TIMEOUT,
+            oracle_from_flag: false,
+            oracle_note: None,
         }
     }
 
@@ -3210,6 +3244,7 @@ impl DecisionServer {
         let loopback = opts.addr.ip().is_loopback();
         let mut svc = DecisionService::open(Arc::clone(&handle), cfg.clone(), Some(esc))?
             .with_loopback(loopback)
+            .with_open_oracle(opts.oracle_from_flag && loopback)
             .with_keys(Arc::clone(&keys))
             .with_ledger(Arc::clone(&ledger));
         if let Some(t) = &opts.admin_token {
@@ -3235,9 +3270,21 @@ impl DecisionServer {
             );
         }
         if !svc.auth_enabled() && cfg.auth.require.is_none() {
-            tracing::warn!(
-                "open mode only because the address is loopback (auth.require: null): callers without a key may not reach the oracle or teach the model; set auth.require to false to allow it, or to true behind a reverse proxy"
-            );
+            if opts.oracle_from_flag {
+                tracing::warn!(
+                    "open mode only because the address is loopback (auth.require: null): callers without a key may use the oracle (--oracle, within its budget) but may not teach the model; set auth.require to true behind a reverse proxy"
+                );
+            } else {
+                tracing::warn!(
+                    "open mode only because the address is loopback (auth.require: null): callers without a key may not reach the oracle or teach the model; set auth.require to false to allow it, or to true behind a reverse proxy"
+                );
+            }
+        }
+        let (ready, line) = oracle_startup_line(&cascade, cfg, opts.oracle_note.as_deref());
+        if ready {
+            tracing::info!("{line}");
+        } else {
+            tracing::warn!("{line}");
         }
         let shadow = match upstream {
             Some(u) => {
@@ -3309,6 +3356,74 @@ impl DecisionServer {
             sh.sync()?;
         }
         Ok(())
+    }
+}
+
+/// The one startup line of the oracle (never the key, only its variable's
+/// name): `(ready or deliberately off, line)`, e.g. `oracle: ready —
+/// deepseek/deepseek-v4.1-flash via openrouter.ai, budget $5.00, max price
+/// in/out $0.07/$0.58 per 1M` or `oracle: NOT ready — OPENROUTER_API_KEY is
+/// not set …`.
+pub fn oracle_startup_line(cascade: &Cascade, cfg: &Config, note: Option<&str>) -> (bool, String) {
+    use cortiq_decision::oracle_setup::{host_of, usd};
+    use cortiq_decision::service::OracleStatus;
+    let oracle = cascade.oracle();
+    let o = &cfg.oracle;
+    let st = oracle.status_json();
+    let f = |k: &str| st[k].as_f64().unwrap_or(0.0);
+    let (budget, spent) = (f("budget_usd"), f("spent_usd"));
+    let what = format!("{} via {}", o.model, host_of(&o.base_url));
+    let budget_text = if spent > 0.0 {
+        format!("budget {} ({} spent)", usd(budget), usd(spent))
+    } else {
+        format!("budget {}", usd(budget))
+    };
+    match oracle.status() {
+        OracleStatus::Ready => {
+            let (p, c) = oracle.max_price();
+            let note = note.map(|n| format!(" ({n})")).unwrap_or_default();
+            (
+                true,
+                format!(
+                    "oracle: ready — {what}, {budget_text}, max price in/out {}/{} per 1M{note}",
+                    usd(p),
+                    usd(c)
+                ),
+            )
+        }
+        OracleStatus::Disabled { by_admin: false } => (
+            true,
+            format!(
+                "oracle: off — questions the local model cannot decide abstain (start the server with --oracle MODEL and set {})",
+                o.api_key_env
+            ),
+        ),
+        OracleStatus::Disabled { by_admin: true } => (
+            false,
+            format!(
+                "oracle: NOT ready — switched off by the admin API ({what}; POST /v1/admin/oracle {{\"enabled\":true}} turns it on)"
+            ),
+        ),
+        OracleStatus::NoKey => (
+            false,
+            format!(
+                "oracle: NOT ready — {} is not set (set it to your OpenRouter key and restart; {what}, {budget_text})",
+                o.api_key_env
+            ),
+        ),
+        OracleStatus::BudgetExhausted => (
+            false,
+            format!(
+                "oracle: NOT ready — the budget is used up ({what}, {budget_text}, {} of {} calls; restart with a larger --oracle-budget or --oracle-max-calls)",
+                st["calls"], st["max_calls"]
+            ),
+        ),
+        OracleStatus::Stopped(r) => (
+            false,
+            format!(
+                "oracle: NOT ready — stopped by a stop rule ({r}; {what}); after the fix POST /v1/admin/oracle {{\"enabled\":true}} resumes it"
+            ),
+        ),
     }
 }
 
