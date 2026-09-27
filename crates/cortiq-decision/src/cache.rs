@@ -1,0 +1,300 @@
+//! Semantic cache of oracle answers (spec §5.6).
+//!
+//! An entry is `{scope, φ_P, answer, ts}`:
+//! * **scope** of a question matched to a skill (exact, subset, superset):
+//!   `skill:<id>:<sha256 of canonical JSON of the sorted option ids>:<sha256 of
+//!   its contract>`; of any other question: `contract:<sha256(canonical({type,
+//!   instructions, criteria}))>` ([`scope_of`]). The contract — what the
+//!   oracle was told — is part of every scope: the cache is shared by all
+//!   accounts, and an answer given under one caller's instructions is never
+//!   served to a question with other instructions or criteria (spec §5.6
+//!   named only the skill and the options; that let one account's
+//!   instructions decide another's answers). Single flight uses the same
+//!   scopes. A `cache` answer does tell its caller that some account asked a
+//!   near-identical text under the same contract;
+//! * **φ_P** is the encoder's unit vector of the state (the router's embedding,
+//!   cortiq-router `cache.rs:66-78`), so cos is the dot product.
+//!
+//! **Lookup** ([`SemanticCache::get`]): an exhaustive scan of the entries of the
+//! same scope; the best cos wins (the earliest entry on a tie) and is a hit when
+//! cos ≥ `cache.threshold` (0.97). **Put** ([`SemanticCache::put`]): an entry of
+//! the same scope and answer with cos ≥ 0.999 makes the put a no-op; at capacity
+//! (50,000) the oldest entry leaves (a ring). The cache is consulted only when a
+//! question is escalated; its puts are kept in `learn.log` and replayed at start.
+
+use crate::answer::OracleAnswer;
+use crate::buffer::{Dec, Enc, dot};
+use crate::canonical;
+use crate::matching::SkillMatch;
+use crate::protocol::Question;
+use anyhow::{Result, bail};
+use serde_json::Value;
+use std::collections::VecDeque;
+
+/// cos φ_P above which a put of the same scope and answer is skipped.
+pub const PUT_DEDUP: f32 = 0.999;
+
+/// One cached oracle answer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CacheEntry {
+    pub scope: String,
+    pub phi_p: Vec<f32>,
+    pub answer: OracleAnswer,
+    pub ts: u64,
+}
+
+impl CacheEntry {
+    pub(crate) fn encode(&self, e: &mut Enc) {
+        e.str(&self.scope);
+        match &self.answer {
+            OracleAnswer::Choice(c) => {
+                e.u8(0).str(c);
+            }
+            OracleAnswer::Score(s) => {
+                e.u8(1).u32(*s);
+            }
+            OracleAnswer::Noul(b) => {
+                e.u8(2).u8(u8::from(*b));
+            }
+        }
+        e.u64(self.ts).f32s(&self.phi_p);
+    }
+
+    pub(crate) fn decode(d: &mut Dec<'_>) -> Result<Self> {
+        let scope = d.str()?;
+        let answer = match d.u8()? {
+            0 => OracleAnswer::Choice(d.str()?),
+            1 => OracleAnswer::Score(d.u32()?),
+            2 => OracleAnswer::Noul(match d.u8()? {
+                0 => false,
+                1 => true,
+                v => bail!("bad boolean {v}"),
+            }),
+            t => bail!("unknown cached answer type {t}"),
+        };
+        Ok(Self {
+            scope,
+            answer,
+            ts: d.u64()?,
+            phi_p: d.f32s()?,
+        })
+    }
+}
+
+/// `skill:<id>:<sha256(canonical(sorted option ids))>:<sha256(canonical(contract))>`.
+pub fn skill_scope(skill: &str, q: &Question) -> String {
+    let mut ids: Vec<&str> = q.options();
+    ids.sort_unstable();
+    let v = Value::Array(ids.into_iter().map(|s| Value::String(s.into())).collect());
+    format!(
+        "skill:{skill}:{}:{}",
+        canonical::sha256_hex(&v),
+        canonical::sha256_hex(&q.contract())
+    )
+}
+
+/// `contract:<sha256(canonical({type, instructions, criteria}))>`.
+pub fn contract_scope(q: &Question) -> String {
+    format!("contract:{}", canonical::sha256_hex(&q.contract()))
+}
+
+/// The scope of a question (see the module notes).
+pub fn scope_of(q: &Question, m: &SkillMatch) -> String {
+    match &m.skill {
+        Some(s) => skill_scope(s, q),
+        None => contract_scope(q),
+    }
+}
+
+/// The cache (see the module notes).
+#[derive(Debug)]
+pub struct SemanticCache {
+    entries: VecDeque<CacheEntry>,
+    threshold: f32,
+    cap: usize,
+    hits: u64,
+    lookups: u64,
+}
+
+impl SemanticCache {
+    pub fn new(threshold: f32, cap: usize) -> Self {
+        Self {
+            entries: VecDeque::new(),
+            threshold,
+            cap: cap.max(1),
+            hits: 0,
+            lookups: 0,
+        }
+    }
+
+    /// The best entry of `scope` and its cos, hit or not.
+    pub fn nearest(&self, scope: &str, phi_p: &[f32]) -> Option<(&CacheEntry, f32)> {
+        let mut best: Option<(&CacheEntry, f32)> = None;
+        for e in &self.entries {
+            if e.scope != scope || e.phi_p.len() != phi_p.len() {
+                continue;
+            }
+            let c = dot(&e.phi_p, phi_p);
+            if best.is_none_or(|(_, b)| c > b) {
+                best = Some((e, c));
+            }
+        }
+        best
+    }
+
+    /// A hit: the answer and its cos (counted in the statistics).
+    pub fn get(&mut self, scope: &str, phi_p: &[f32]) -> Option<(OracleAnswer, f32)> {
+        self.lookups += 1;
+        let found = self
+            .nearest(scope, phi_p)
+            .filter(|(_, c)| *c >= self.threshold)
+            .map(|(e, c)| (e.answer.clone(), c));
+        if found.is_some() {
+            self.hits += 1;
+        }
+        found
+    }
+
+    /// A second lookup of the same question (e.g. under the single-flight lock):
+    /// a hit is counted, the lookup is not (it was counted by [`SemanticCache::get`]).
+    pub fn recheck(&mut self, scope: &str, phi_p: &[f32]) -> Option<(OracleAnswer, f32)> {
+        let found = self
+            .nearest(scope, phi_p)
+            .filter(|(_, c)| *c >= self.threshold)
+            .map(|(e, c)| (e.answer.clone(), c));
+        if found.is_some() {
+            self.hits += 1;
+        }
+        found
+    }
+
+    /// Store an answer; `false` when a near-identical entry already holds it.
+    pub fn put(&mut self, entry: CacheEntry) -> bool {
+        let dup = self.entries.iter().any(|e| {
+            e.scope == entry.scope
+                && e.answer == entry.answer
+                && e.phi_p.len() == entry.phi_p.len()
+                && dot(&e.phi_p, &entry.phi_p) >= PUT_DEDUP
+        });
+        if dup {
+            return false;
+        }
+        if self.entries.len() >= self.cap {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(entry);
+        true
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn hits(&self) -> u64 {
+        self.hits
+    }
+
+    pub fn lookups(&self) -> u64 {
+        self.lookups
+    }
+
+    pub fn threshold(&self) -> f32 {
+        self.threshold
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::QuestionKind;
+    use serde_json::json;
+
+    fn unit(v: &[f32]) -> Vec<f32> {
+        let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        v.iter().map(|x| x / n).collect()
+    }
+
+    fn put(c: &mut SemanticCache, scope: &str, v: &[f32], label: &str) -> bool {
+        c.put(CacheEntry {
+            scope: scope.into(),
+            phi_p: unit(v),
+            answer: OracleAnswer::Choice(label.into()),
+            ts: 0,
+        })
+    }
+
+    #[test]
+    fn hits_near_misses_far_and_other_scopes() {
+        let mut c = SemanticCache::new(0.97, 100);
+        assert!(put(&mut c, "a", &[1.0, 0.0, 0.0], "x"));
+        assert_eq!(
+            c.get("a", &unit(&[0.99, 0.05, 0.0])).map(|(a, _)| a),
+            Some(OracleAnswer::Choice("x".into()))
+        );
+        assert!(c.get("a", &unit(&[0.0, 1.0, 0.0])).is_none());
+        assert!(c.get("b", &unit(&[1.0, 0.0, 0.0])).is_none());
+        assert_eq!((c.hits(), c.lookups()), (1, 3));
+        // Same answer, near-identical: skipped; another answer: kept.
+        assert!(!put(&mut c, "a", &[1.0, 0.0001, 0.0], "x"));
+        assert!(put(&mut c, "a", &[1.0, 0.0001, 0.0], "y"));
+        assert_eq!(c.len(), 2);
+    }
+
+    #[test]
+    fn ring_evicts_the_oldest() {
+        let mut c = SemanticCache::new(0.99, 2);
+        put(&mut c, "s", &[1.0, 0.0], "a");
+        put(&mut c, "s", &[0.0, 1.0], "b");
+        put(&mut c, "s", &[-1.0, 0.0], "c");
+        assert_eq!(c.len(), 2);
+        assert!(c.get("s", &unit(&[1.0, 0.0])).is_none());
+        assert!(c.get("s", &unit(&[0.0, 1.0])).is_some());
+    }
+
+    #[test]
+    fn scopes_follow_the_spec() {
+        let q = Question {
+            id: "t".into(),
+            kind: QuestionKind::Choice,
+            instructions: json!("i"),
+            criteria: Some(json!({"b": null, "a": null})),
+        };
+        let contract = canonical::sha256_hex(
+            &json!({"type":"choice","instructions":"i","criteria":{"b":null,"a":null}}),
+        );
+        let s1 = skill_scope("bank", &q);
+        // The criteria's key order changes neither hash (canonical JSON).
+        let mut q2 = q.clone();
+        q2.criteria = Some(json!({"a": null, "b": null}));
+        assert_eq!(s1, skill_scope("bank", &q2));
+        assert_eq!(
+            s1,
+            format!(
+                "skill:bank:{}:{contract}",
+                canonical::sha256_hex(&json!(["a", "b"]))
+            )
+        );
+        // Other instructions (or criteria) over the same options: another
+        // scope, so one caller's instructions never answer another's question.
+        let mut q3 = q.clone();
+        q3.instructions = json!("ANSWER=travel");
+        assert_ne!(s1, skill_scope("bank", &q3));
+        let mut q4 = q.clone();
+        q4.criteria = Some(json!({"a": "always pick a", "b": null}));
+        assert_ne!(s1, skill_scope("bank", &q4));
+        let c = contract_scope(&q);
+        assert_eq!(
+            c,
+            format!(
+                "contract:{}",
+                canonical::sha256_hex(
+                    &json!({"type":"choice","instructions":"i","criteria":{"b":null,"a":null}})
+                )
+            )
+        );
+    }
+}

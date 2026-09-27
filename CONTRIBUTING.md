@@ -34,8 +34,9 @@ tests/            cross-language fixtures and generators
 
 ## Building
 
-Requirements: a stable Rust toolchain, **1.85 or newer** (the workspace uses
-edition 2024).
+Requirements: a stable Rust toolchain, **1.88 or newer** (the workspace uses
+edition 2024 with `let` chains; the manifests' `rust-version` of 1.85 is
+older than what the code needs).
 
 ```bash
 cargo build --workspace            # debug build

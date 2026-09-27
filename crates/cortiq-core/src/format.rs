@@ -75,6 +75,15 @@ pub mod features {
     /// Prism matrices.  This is deliberately separate from the transform bit
     /// so readers cannot infer the correction from arch_name alone.
     pub const PRISM_AFFINE: u32 = 1 << 8;
+    /// Non-generative decision profile (`cortiq-decision`): an encoder,
+    /// a hashing contract and resonance skills, described by the
+    /// `decision.manifest` tensor. It is executed by the decision runtime
+    /// (`cortiq decide`, `cortiq serve`), never by the language-model
+    /// pipeline. Derived by every writer from the arch name prefix
+    /// [`super::DECISION_ARCH_PREFIX`]; a reader refuses a file whose bit
+    /// and prefix disagree. Bits 9 and 10 stay unassigned here: other
+    /// lines of development use them, and this reader refuses them.
+    pub const DECISION: u32 = 1 << 11;
 
     /// Features this reader implements today.
     pub const SUPPORTED: u32 = TENSOR_DIR
@@ -83,7 +92,19 @@ pub mod features {
         | LOOP_MASKS
         | SKILL_FILE
         | PRISM_HADAMARD
-        | PRISM_AFFINE;
+        | PRISM_AFFINE
+        | DECISION;
+}
+
+/// Arch-name prefix of every decision profile (`cortiq-decision-ph-v1`,
+/// `cortiq-decision-overlay-v1`, …). The [`features::DECISION`] bit and
+/// this prefix travel together: writers derive the bit from the name,
+/// readers refuse a file where they disagree.
+pub const DECISION_ARCH_PREFIX: &str = "cortiq-decision-";
+
+/// Is `arch_name` a decision profile (see [`DECISION_ARCH_PREFIX`])?
+pub fn is_decision_profile(arch_name: &str) -> bool {
+    arch_name.starts_with(DECISION_ARCH_PREFIX)
 }
 
 fn validate_prism_affine_targets(
@@ -519,6 +540,16 @@ impl CmfModel {
         // Header JSON
         let header: CmfHeader = serde_json::from_slice(section(env.header.0, env.header.1))
             .map_err(|e| CmfError::Parse(format!("header JSON: {e}")))?;
+        // A decision profile and its feature bit travel together: the bit
+        // keeps generative readers away from the file, the prefix is what
+        // the decision runtime keys on. Either one alone is a file that
+        // some reader would misread.
+        let decision_bit = env.required_features & features::DECISION != 0;
+        if decision_bit != is_decision_profile(&header.arch.arch_name) {
+            return Err(CmfError::Parse(
+                "decision profile and DECISION feature bit disagree".into(),
+            ));
+        }
         let prism_bit = env.required_features & features::PRISM_HADAMARD != 0;
         let affine_bit = env.required_features & features::PRISM_AFFINE != 0;
         let has_prism = header.arch.prism_hadamard.is_some();
@@ -1361,6 +1392,11 @@ impl CmfModel {
         if header.skills.iter().any(|s| s.base_dir_hash.is_some()) {
             required_features |= features::SKILL_FILE;
         }
+        // A decision profile is not a language model: the bit makes every
+        // generative reader refuse it (older ones by the unknown bit).
+        if is_decision_profile(&header.arch.arch_name) {
+            required_features |= features::DECISION;
+        }
 
         // Section offsets.
         let header_off = ENVELOPE_LEN as u64;
@@ -1875,6 +1911,11 @@ impl CmfStreamWriter {
             .any(|t| matches!(t.dtype, TensorDtype::Q8_2f | TensorDtype::Vbit))
         {
             required_features |= features::QUANT_2F;
+        }
+        // Same derivation as `write_ref`: the reader refuses a decision
+        // profile without its bit, so the streamed path must set it too.
+        if is_decision_profile(&header.arch.arch_name) {
+            required_features |= features::DECISION;
         }
 
         let header_off = ENVELOPE_LEN as u64;

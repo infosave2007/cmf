@@ -1,0 +1,406 @@
+{
+ "checks": {
+  "reference": "numpy float64 forward (decision_export_encoder.forward_f64)"
+ },
+ "config": {
+  "activation": "gelu_erf",
+  "head_dim": 8,
+  "heads": 4,
+  "hidden": 32,
+  "intermediate": 48,
+  "layers": 2,
+  "ln_eps": 1e-12,
+  "max_position": 24,
+  "token_type": 0,
+  "type_vocab": 2,
+  "vocab": 142
+ },
+ "format": "cortiq-decision-encoder-export/1",
+ "kind": "bert-wordpiece-v1",
+ "source": {
+  "name": "toy BERT (tools/mk_decision_toy.py, random weights, no ONNX source)",
+  "onnx_sha256": "83d1bcee9fe89aa9de0ea56e6cc38377577824c742c9b67a391fe3210150b068",
+  "tokenizer_json_sha256": "2f79d3cf59095b0132edcdafe9b91917868b00e726523ca67292cf7c128e2c8d",
+  "vocab_sha256": "6fdcdc6d05bcdfc80f34e990dfe51706ac2a74865283f9c367eb73c460c37602"
+ },
+ "tensors": [
+  {
+   "dtype": "float32",
+   "file": "embeddings.word_embeddings.weight.npy",
+   "name": "embeddings.word_embeddings.weight",
+   "sha256": "9319ba81c69d79a379673f4599c2465e8bd69aba3f57e1c63992ea7397834ec1",
+   "shape": [
+    142,
+    32
+   ]
+  },
+  {
+   "dtype": "float32",
+   "file": "embeddings.position_embeddings.weight.npy",
+   "name": "embeddings.position_embeddings.weight",
+   "sha256": "9ac79d44b862bc9dc362282ae98ec1bd68405fe4003c0eb37e82f3a391db06b7",
+   "shape": [
+    24,
+    32
+   ]
+  },
+  {
+   "dtype": "float32",
+   "file": "embeddings.token_type_embeddings.weight.npy",
+   "name": "embeddings.token_type_embeddings.weight",
+   "sha256": "da1ac9fd76339aaba1b78ac6b76f94386ef2f0d282c8b3defd286659213621d2",
+   "shape": [
+    2,
+    32
+   ]
+  },
+  {
+   "dtype": "float32",
+   "file": "embeddings.LayerNorm.weight.npy",
+   "name": "embeddings.LayerNorm.weight",
+   "sha256": "1a84795fa755c4b703cf167fe0db45da3cc20295335e2606964d874db96a1f27",
+   "shape": [
+    32
+   ]
+  },
+  {
+   "dtype": "float32",
+   "file": "embeddings.LayerNorm.bias.npy",
+   "name": "embeddings.LayerNorm.bias",
+   "sha256": "dfadd977ae24a99132790a74366359f3051845a71536baafda163bba673361f1",
+   "shape": [
+    32
+   ]
+  },
+  {
+   "dtype": "float32",
+   "file": "layer.0.attention.self.query.weight.npy",
+   "name": "layer.0.attention.self.query.weight",
+   "sha256": "f27a523c91ba7be4bd4b5ae31fc4f07c2aa4ef6f29121a1e384d96d23114280b",
+   "shape": [
+    32,
+    32
+   ]
+  },
+  {
+   "dtype": "float32",
+   "file": "layer.0.attention.self.query.bias.npy",
+   "name": "layer.0.attention.self.query.bias",
+   "sha256": "87b861ce29f190ffae7eb6d5f89ecc580e5fb7cd2dd1ce84875ddcbad743223b",
+   "shape": [
+    32
+   ]
+  },
+  {
+   "dtype": "float32",
+   "file": "layer.0.attention.self.key.weight.npy",
+   "name": "layer.0.attention.self.key.weight",
+   "sha256": "8b0fc2895196f506ab14bc95ea5d17f36865456d5047051b98650c03ad81337f",
+   "shape": [
+    32,
+    32
+   ]
+  },
+  {
+   "dtype": "float32",
+   "file": "layer.0.attention.self.key.bias.npy",
+   "name": "layer.0.attention.self.key.bias",
+   "sha256": "cf0fc66506a6e10baac20f944162f997dd3b8969af4d9089435cf1c6b0352ddf",
+   "shape": [
+    32
+   ]
+  },
+  {
+   "dtype": "float32",
+   "file": "layer.0.attention.self.value.weight.npy",
+   "name": "layer.0.attention.self.value.weight",
+   "sha256": "2969a1a38e9ecac0e3831c13e1cd0906e74afcb36ce5100c3547f0b559171115",
+   "shape": [
+    32,
+    32
+   ]
+  },
+  {
+   "dtype": "float32",
+   "file": "layer.0.attention.self.value.bias.npy",
+   "name": "layer.0.attention.self.value.bias",
+   "sha256": "493a8bc6ffc422a5acfb25df7a2ab48372d1e5895c7ae3edc32fece811b24182",
+   "shape": [
+    32
+   ]
+  },
+  {
+   "dtype": "float32",
+   "file": "layer.0.attention.output.dense.weight.npy",
+   "name": "layer.0.attention.output.dense.weight",
+   "sha256": "c999f6eaae29d82c391306b1794b8320cd1aa9335ece4dabf86547af20906006",
+   "shape": [
+    32,
+    32
+   ]
+  },
+  {
+   "dtype": "float32",
+   "file": "layer.0.attention.output.dense.bias.npy",
+   "name": "layer.0.attention.output.dense.bias",
+   "sha256": "134a58582600041d2ce1f514bdea4bd6bed1dfadb873c54441fb64785961a1be",
+   "shape": [
+    32
+   ]
+  },
+  {
+   "dtype": "float32",
+   "file": "layer.0.attention.output.LayerNorm.weight.npy",
+   "name": "layer.0.attention.output.LayerNorm.weight",
+   "sha256": "c3d5e0fd7326854456f0ac70986c8364e19b0d65474399e5d46a9e95acfcec09",
+   "shape": [
+    32
+   ]
+  },
+  {
+   "dtype": "float32",
+   "file": "layer.0.attention.output.LayerNorm.bias.npy",
+   "name": "layer.0.attention.output.LayerNorm.bias",
+   "sha256": "340ef3af55407756b1d4c3ae04a42ef1c11d8163031c7dc12a3bf6132d5b0b6c",
+   "shape": [
+    32
+   ]
+  },
+  {
+   "dtype": "float32",
+   "file": "layer.0.intermediate.dense.weight.npy",
+   "name": "layer.0.intermediate.dense.weight",
+   "sha256": "e7f2635e86aae170dbec004f2dd7fb7a22011ade8e01b58b64d185b82697d3fe",
+   "shape": [
+    48,
+    32
+   ]
+  },
+  {
+   "dtype": "float32",
+   "file": "layer.0.intermediate.dense.bias.npy",
+   "name": "layer.0.intermediate.dense.bias",
+   "sha256": "9b0b15d2dd18c0b7546ab79a040e13a1d6203ad9572565667144f26eca642b3a",
+   "shape": [
+    48
+   ]
+  },
+  {
+   "dtype": "float32",
+   "file": "layer.0.output.dense.weight.npy",
+   "name": "layer.0.output.dense.weight",
+   "sha256": "2c4554cb51f36f8c0ff642f451e3d263dec870e79c439c10916754c163e1bc0d",
+   "shape": [
+    32,
+    48
+   ]
+  },
+  {
+   "dtype": "float32",
+   "file": "layer.0.output.dense.bias.npy",
+   "name": "layer.0.output.dense.bias",
+   "sha256": "fcd1dce2a4bf54e583895a55d652788e5d7c2d09bd75891891e25a8b4c68a7d2",
+   "shape": [
+    32
+   ]
+  },
+  {
+   "dtype": "float32",
+   "file": "layer.0.output.LayerNorm.weight.npy",
+   "name": "layer.0.output.LayerNorm.weight",
+   "sha256": "5766f1040716159d4ce2217203042d8f549dcd0d9f3d6cd5abcc450915645952",
+   "shape": [
+    32
+   ]
+  },
+  {
+   "dtype": "float32",
+   "file": "layer.0.output.LayerNorm.bias.npy",
+   "name": "layer.0.output.LayerNorm.bias",
+   "sha256": "e998815540d12f86d92b5688f5c88dc4d076926d76f224d0f31e67df6b9ef3d5",
+   "shape": [
+    32
+   ]
+  },
+  {
+   "dtype": "float32",
+   "file": "layer.1.attention.self.query.weight.npy",
+   "name": "layer.1.attention.self.query.weight",
+   "sha256": "f72adab3509199da30778ab23c315166a2fb7bdbf06d2309c53348d8984b5b27",
+   "shape": [
+    32,
+    32
+   ]
+  },
+  {
+   "dtype": "float32",
+   "file": "layer.1.attention.self.query.bias.npy",
+   "name": "layer.1.attention.self.query.bias",
+   "sha256": "1b7a21f386c7e8279a1ff9565f51236eae68cc8bc505037c17cbc932bef1d3ec",
+   "shape": [
+    32
+   ]
+  },
+  {
+   "dtype": "float32",
+   "file": "layer.1.attention.self.key.weight.npy",
+   "name": "layer.1.attention.self.key.weight",
+   "sha256": "acf7664e6184b18f0324e909f292a56c350ea7aea396056c0e518a84567eea16",
+   "shape": [
+    32,
+    32
+   ]
+  },
+  {
+   "dtype": "float32",
+   "file": "layer.1.attention.self.key.bias.npy",
+   "name": "layer.1.attention.self.key.bias",
+   "sha256": "a58a1f388c98669271b5212c61086b56d64e89fa9878d49b6becbddd5f94d2b8",
+   "shape": [
+    32
+   ]
+  },
+  {
+   "dtype": "float32",
+   "file": "layer.1.attention.self.value.weight.npy",
+   "name": "layer.1.attention.self.value.weight",
+   "sha256": "f0f433bb88dc422392e0aa41ccfafab8cf1e70ced6835c19494ca7a6a54daccd",
+   "shape": [
+    32,
+    32
+   ]
+  },
+  {
+   "dtype": "float32",
+   "file": "layer.1.attention.self.value.bias.npy",
+   "name": "layer.1.attention.self.value.bias",
+   "sha256": "36ce26d19e4be1711c6bfab069d471392708f3f3fbe0f19d8a800fbb0ce62c1e",
+   "shape": [
+    32
+   ]
+  },
+  {
+   "dtype": "float32",
+   "file": "layer.1.attention.output.dense.weight.npy",
+   "name": "layer.1.attention.output.dense.weight",
+   "sha256": "c163a9f30c0b83ee3ca3f99d54297a7f018d3ac7556e6ee58661f7e63a7715f5",
+   "shape": [
+    32,
+    32
+   ]
+  },
+  {
+   "dtype": "float32",
+   "file": "layer.1.attention.output.dense.bias.npy",
+   "name": "layer.1.attention.output.dense.bias",
+   "sha256": "89560d51259e5f4e6aa7b14eab3b8f3579488c3653dd641e24fd06e36bfa8bc5",
+   "shape": [
+    32
+   ]
+  },
+  {
+   "dtype": "float32",
+   "file": "layer.1.attention.output.LayerNorm.weight.npy",
+   "name": "layer.1.attention.output.LayerNorm.weight",
+   "sha256": "1d2be3a6e5c510808305840ae8057068cc517d74ebe3269c91688fa830463969",
+   "shape": [
+    32
+   ]
+  },
+  {
+   "dtype": "float32",
+   "file": "layer.1.attention.output.LayerNorm.bias.npy",
+   "name": "layer.1.attention.output.LayerNorm.bias",
+   "sha256": "3b7324a2938329b2d7f2be1138baa6f28cbab9f46f6acf3d700969ba9d5a2363",
+   "shape": [
+    32
+   ]
+  },
+  {
+   "dtype": "float32",
+   "file": "layer.1.intermediate.dense.weight.npy",
+   "name": "layer.1.intermediate.dense.weight",
+   "sha256": "91b1c103eb9ec9d644b7da8be9c514da4522a07dfde5baf4386760f8e99908b0",
+   "shape": [
+    48,
+    32
+   ]
+  },
+  {
+   "dtype": "float32",
+   "file": "layer.1.intermediate.dense.bias.npy",
+   "name": "layer.1.intermediate.dense.bias",
+   "sha256": "2764da67028808c8de929097880e6d0a99254d8f10d63f467918a4d42cd1a858",
+   "shape": [
+    48
+   ]
+  },
+  {
+   "dtype": "float32",
+   "file": "layer.1.output.dense.weight.npy",
+   "name": "layer.1.output.dense.weight",
+   "sha256": "86f3d22f1b63b22dad9fe9b8e85dc530083a615112198cca909304761d3d2164",
+   "shape": [
+    32,
+    48
+   ]
+  },
+  {
+   "dtype": "float32",
+   "file": "layer.1.output.dense.bias.npy",
+   "name": "layer.1.output.dense.bias",
+   "sha256": "8dc35f33a93d6c350d3926dd3d25125c58fce0aefbeac25dfc81476ca457c5c3",
+   "shape": [
+    32
+   ]
+  },
+  {
+   "dtype": "float32",
+   "file": "layer.1.output.LayerNorm.weight.npy",
+   "name": "layer.1.output.LayerNorm.weight",
+   "sha256": "52feb5927707bafeeec0d3404aeb2ead72eceb0c4109de41258d93c502f5d57b",
+   "shape": [
+    32
+   ]
+  },
+  {
+   "dtype": "float32",
+   "file": "layer.1.output.LayerNorm.bias.npy",
+   "name": "layer.1.output.LayerNorm.bias",
+   "sha256": "33c7efb7c583ee57e46115a5f5b50a51285d6dc0121f1d7b81c8aef85727ee15",
+   "shape": [
+    32
+   ]
+  }
+ ],
+ "tokenizer": {
+  "file": "tokenizer.json",
+  "ids": {
+   "cls": 2,
+   "mask": 4,
+   "pad": 0,
+   "sep": 3,
+   "unk": 1
+  },
+  "max_input_chars_per_word": 100,
+  "max_length": 20,
+  "normalizer": {
+   "clean_text": true,
+   "handle_chinese_chars": true,
+   "lowercase": true,
+   "strip_accents": null
+  },
+  "pre_tokenizer": "bert",
+  "prefix": "##",
+  "template": "[CLS] $A [SEP]",
+  "truncation_direction": "right",
+  "unk": "[UNK]",
+  "vocab_file": "vocab.txt"
+ },
+ "tools": {
+  "numpy": "1.26.4",
+  "script": "tools/mk_decision_toy.py",
+  "seed": 20260926,
+  "tokenizers": "0.22.2"
+ }
+}
