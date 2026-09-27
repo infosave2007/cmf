@@ -9,12 +9,16 @@
 //!   digest in constant time (`subtle`), without an early exit.
 //! * **Record** `{hash, account, plan, label, created, expires, active,
 //!   rate_per_min, decision_quota, token_quota, credit_usd, oracle_budget_usd,
-//!   oracle_allowed}`: `expires` unix seconds or `null`; `rate_per_min`,
-//!   `decision_quota` and `token_quota` 0 = unlimited; `credit_usd` and
-//!   `oracle_budget_usd` decimal strings or `null` (no limit). A revoked key
-//!   keeps its record with `active: false`. `oracle_allowed` defaults to false
-//!   for a key created here (the oracle is opt-in per key) and to true for a
-//!   key imported from cortiq-router, which escalated for every key.
+//!   oracle_allowed, learning_allowed}`: `expires` unix seconds or `null`;
+//!   `rate_per_min`, `decision_quota` and `token_quota` 0 = unlimited;
+//!   `credit_usd` and `oracle_budget_usd` decimal strings or `null` (no
+//!   limit). A revoked key keeps its record with `active: false`.
+//!   `oracle_allowed` defaults to false for a key created here (the oracle is
+//!   opt-in per key) and to true for a key imported from cortiq-router, which
+//!   escalated for every key. `learning_allowed` (may this key teach the
+//!   shared model: its feedback, cold starts of new labels, the oracle's
+//!   answers to its own questions) defaults to false for every key, created
+//!   or imported; a record written before the field existed reads as false.
 //! * **Account, plan, label**: any text the router's `api_keys` columns hold
 //!   — 1..128, ≤ 64 and ≤ 255 Unicode characters (`VARCHAR(128)`,
 //!   `VARCHAR(64)`, `VARCHAR(255)`, router `store.rs:119-130`), e.g.
@@ -23,7 +27,12 @@
 //!   [`shown`] (control characters escaped).
 //! * **`keys.json`** `{"version":1,"keys":[…]}` is replaced atomically on every
 //!   change; a server re-reads it when its mtime or size changes, checked at
-//!   most every 15 s ([`KeyStore::maybe_reload`]).
+//!   most every 15 s ([`KeyStore::maybe_reload`]). Every change re-reads the
+//!   file and writes it under `keys.json.lock` (created with `O_EXCL`, mode
+//!   0600, removed after the write; one left by a dead process for more than
+//!   [`KEYS_LOCK_STALE`] is removed), so the CLI and a running server never
+//!   write back a file the other changed in between (a revocation stays
+//!   revoked).
 //! * **Rate window**: a fixed minute (`unix / 60`) per account, counting
 //!   requests; over the limit → 429 with `Retry-After` = seconds to the next
 //!   minute ([`RateLimiter`]).
@@ -79,6 +88,14 @@ pub const MAX_LABEL_CHARS: usize = 255;
 /// router `api.rs:67`), subject to its global oracle switch — here the
 /// server's `oracle.enabled`, budgets and stop rules still apply.
 pub const ROUTER_ORACLE_ALLOWED: bool = true;
+/// `learning_allowed` of an imported router key without
+/// `--learning-allowed`: no key teaches the shared model unless the operator
+/// says so (the router let every key do it through `/v1/feedback`).
+pub const ROUTER_LEARNING_ALLOWED: bool = false;
+/// A lock file older than this is left over by a dead process and is removed.
+pub const KEYS_LOCK_STALE: Duration = Duration::from_secs(30);
+/// How long a change of `keys.json` waits for another process's lock.
+pub const KEYS_LOCK_WAIT: Duration = Duration::from_secs(10);
 
 /// Lowercase hex sha256 of a raw key (router `store.rs:54-57`).
 pub fn hash_key(raw: &str) -> String {
@@ -136,6 +153,9 @@ pub struct KeyRecord {
     pub credit_usd: Option<String>,
     pub oracle_budget_usd: Option<String>,
     pub oracle_allowed: bool,
+    /// The key may teach the shared model (see the module notes).
+    #[serde(default)]
+    pub learning_allowed: bool,
     /// Origin of a key imported from cortiq-router; absent for a key of this
     /// server (created here, or revoked here after its import).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -247,6 +267,7 @@ impl KeyRecord {
             credit_usd: None,
             oracle_budget_usd: None,
             oracle_allowed: self.oracle_allowed,
+            learning_allowed: self.learning_allowed,
             router: self.router.clone(),
         })
     }
@@ -305,6 +326,7 @@ impl KeyRecord {
             "credit_usd": self.credit_usd,
             "oracle_budget_usd": self.oracle_budget_usd,
             "oracle_allowed": self.oracle_allowed,
+            "learning_allowed": self.learning_allowed,
         });
         if let Some(o) = &self.router {
             v["router_origin"] = json!(o.name());
@@ -368,6 +390,8 @@ pub struct NewKey {
     pub oracle_budget_usd: Option<String>,
     #[serde(default)]
     pub oracle_allowed: Option<bool>,
+    #[serde(default)]
+    pub learning_allowed: Option<bool>,
 }
 
 /// A created key: the raw key (shown once) and its record.
@@ -454,6 +478,60 @@ pub struct KeyStore {
     reload: Mutex<ReloadState>,
     /// Serialises read-modify-write of the file within this process.
     write: Mutex<()>,
+}
+
+/// `keys.json.lock`, held for one read-modify-write of `keys.json` by any
+/// process (see the module notes); removed when dropped.
+#[derive(Debug)]
+struct KeysFileLock {
+    path: PathBuf,
+}
+
+impl KeysFileLock {
+    fn acquire(path: PathBuf) -> Result<Self> {
+        let t0 = Instant::now();
+        loop {
+            let mut o = std::fs::OpenOptions::new();
+            o.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                o.mode(0o600);
+            }
+            match o.open(&path) {
+                Ok(mut f) => {
+                    use std::io::Write;
+                    // The owner, for whoever finds the file.
+                    let _ = writeln!(f, "{}", std::process::id());
+                    return Ok(Self { path });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let stale = std::fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|age| age > KEYS_LOCK_STALE);
+                    if stale {
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                    ensure!(
+                        t0.elapsed() < KEYS_LOCK_WAIT,
+                        "{} is held by another process (a key change in progress); try again",
+                        path.display()
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => return Err(e).with_context(|| format!("create {}", path.display())),
+            }
+        }
+    }
+}
+
+impl Drop for KeysFileLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 fn file_stamp(path: &Path) -> Option<(SystemTime, u64)> {
@@ -583,9 +661,13 @@ impl KeyStore {
     }
 
     /// [`KeyStore::modify`] that leaves the file untouched (same bytes, same
-    /// mtime) when `f` reports no change.
+    /// mtime) when `f` reports no change. The file is read and written under
+    /// `keys.json.lock` (other processes) and the store's mutex (this one).
     fn modify_if<T>(&self, f: impl FnOnce(&mut Vec<KeyRecord>) -> Result<(T, bool)>) -> Result<T> {
         let _w = self.write.lock();
+        let mut lock_path = self.path.clone().into_os_string();
+        lock_path.push(".lock");
+        let _file_lock = KeysFileLock::acquire(PathBuf::from(lock_path))?;
         let mut file = read_file(&self.path)?;
         let (out, changed) = f(&mut file.keys)?;
         if !changed {
@@ -634,6 +716,7 @@ impl KeyStore {
             credit_usd: new.credit_usd.clone(),
             oracle_budget_usd: new.oracle_budget_usd.clone(),
             oracle_allowed: new.oracle_allowed.unwrap_or(false),
+            learning_allowed: new.learning_allowed.unwrap_or(false),
             router: None,
         };
         record.validate()?;
@@ -721,7 +804,9 @@ impl KeyStore {
     /// * `oracle_allowed`: new keys take [`RouterKeys::oracle_allowed`]
     ///   ([`ROUTER_ORACLE_ALLOWED`] unless set); when it was set explicitly
     ///   ([`RouterKeys::with_oracle_allowed`]) the stored keys of this export
-    ///   that came from the router take it too (`oracle_updated`).
+    ///   that came from the router take it too (`oracle_updated`);
+    /// * `learning_allowed` the same way ([`RouterKeys::learning_allowed`],
+    ///   [`ROUTER_LEARNING_ALLOWED`] unless set, `learning_updated`).
     ///
     /// `keys.json` is written only when something changed: importing the same
     /// export again leaves the file byte for byte (and its mtime) as it was.
@@ -734,6 +819,7 @@ impl KeyStore {
                 duplicates: keys.duplicates,
                 emails_not_stored: keys.emails,
                 oracle_allowed: keys.oracle_allowed(),
+                learning_allowed: keys.learning_allowed(),
                 ..ImportReport::default()
             };
             let from_db = keys.format == ImportFormat::MysqlJson;
@@ -783,6 +869,7 @@ impl KeyStore {
                     // A configuration key: the database row goes over it.
                     let mut row = rec.clone();
                     row.oracle_allowed = s.oracle_allowed;
+                    row.learning_allowed = s.learning_allowed;
                     row.router = Some(RouterOrigin {
                         db: true,
                         config: origin.config,
@@ -814,6 +901,13 @@ impl KeyStore {
                 {
                     s.oracle_allowed = v;
                     r.oracle_updated += 1;
+                    r.written = true;
+                }
+                if let Some(v) = keys.learning_explicit
+                    && s.learning_allowed != v
+                {
+                    s.learning_allowed = v;
+                    r.learning_updated += 1;
                     r.written = true;
                 }
             }
@@ -939,6 +1033,10 @@ pub struct RouterKeys {
     /// --oracle-allowed`); `None` = [`ROUTER_ORACLE_ALLOWED`] for new keys,
     /// stored keys unchanged.
     pub oracle_explicit: Option<bool>,
+    /// `learning_allowed` given explicitly (`keys import
+    /// --learning-allowed`); `None` = [`ROUTER_LEARNING_ALLOWED`] for new
+    /// keys, stored keys unchanged.
+    pub learning_explicit: Option<bool>,
 }
 
 impl RouterKeys {
@@ -955,6 +1053,21 @@ impl RouterKeys {
     /// `oracle_allowed` of the new keys of this import.
     pub fn oracle_allowed(&self) -> bool {
         self.oracle_explicit.unwrap_or(ROUTER_ORACLE_ALLOWED)
+    }
+
+    /// Set `learning_allowed` of every key of the export explicitly: new
+    /// keys take it, and so do the stored keys that came from the router.
+    pub fn with_learning_allowed(mut self, allowed: bool) -> Self {
+        self.learning_explicit = Some(allowed);
+        for r in &mut self.records {
+            r.learning_allowed = allowed;
+        }
+        self
+    }
+
+    /// `learning_allowed` of the new keys of this import.
+    pub fn learning_allowed(&self) -> bool {
+        self.learning_explicit.unwrap_or(ROUTER_LEARNING_ALLOWED)
     }
 }
 
@@ -984,6 +1097,11 @@ pub struct ImportReport {
     pub static_fallback: usize,
     /// `oracle_allowed` of the new keys.
     pub oracle_allowed: bool,
+    /// `learning_allowed` of the new keys.
+    pub learning_allowed: bool,
+    /// Stored router keys whose `learning_allowed` an explicit
+    /// `--learning-allowed` changed.
+    pub learning_updated: usize,
     /// Stored router keys whose `oracle_allowed` an explicit
     /// `--oracle-allowed` changed.
     pub oracle_updated: usize,
@@ -1017,6 +1135,8 @@ impl ImportReport {
             "static_fallback": self.static_fallback,
             "oracle_allowed": self.oracle_allowed,
             "oracle_updated": self.oracle_updated,
+            "learning_allowed": self.learning_allowed,
+            "learning_updated": self.learning_updated,
             "accounts": self.accounts,
             "written": self.written,
         })
@@ -1064,6 +1184,7 @@ fn mysql_keys(bytes: &[u8]) -> Result<RouterKeys> {
         duplicates: 0,
         emails: 0,
         oracle_explicit: None,
+        learning_explicit: None,
     };
     let mut first: HashMap<String, usize> = HashMap::new();
     for (i, row) in rows.iter().enumerate() {
@@ -1114,6 +1235,7 @@ fn mysql_key_record(row: &Map<String, Value>) -> Result<(KeyRecord, bool)> {
         credit_usd: None,
         oracle_budget_usd: None,
         oracle_allowed: ROUTER_ORACLE_ALLOWED,
+        learning_allowed: ROUTER_LEARNING_ALLOWED,
         router: Some(RouterOrigin {
             db: true,
             config: None,
@@ -1147,6 +1269,7 @@ fn toml_keys(bytes: &[u8], now: u64) -> Result<RouterKeys> {
         duplicates: 0,
         emails: 0,
         oracle_explicit: None,
+        learning_explicit: None,
     };
     let mut at: HashMap<String, usize> = HashMap::new();
     for (i, e) in entries.iter().enumerate() {
@@ -1183,6 +1306,7 @@ fn toml_keys(bytes: &[u8], now: u64) -> Result<RouterKeys> {
                 credit_usd: None,
                 oracle_budget_usd: None,
                 oracle_allowed: ROUTER_ORACLE_ALLOWED,
+                learning_allowed: ROUTER_LEARNING_ALLOWED,
                 router: Some(RouterOrigin {
                     db: false,
                     config: Some(static_key),
@@ -2245,5 +2369,91 @@ require = true
             .import_router_keys(&toml_of(&[(RAW_A, "a", 0)]), 1)
             .unwrap();
         assert!(r.oracle_allowed && s2.authenticate(RAW_A, 1).unwrap().oracle_allowed);
+    }
+
+    /// Imported keys do not teach the model unless the import says so; an
+    /// explicit value also reaches keys imported before; a record written
+    /// before the field existed reads as false.
+    #[test]
+    fn imported_keys_teach_only_when_the_import_allows_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keys.json");
+        let store = KeyStore::open(&path, "cortiq_").unwrap();
+        let export = || mysql(&json!([row(RAW_A, json!({})), row(RAW_B, json!({}))]).to_string());
+        let r = store.import_router_keys(&export(), 10).unwrap();
+        assert!(!r.learning_allowed && r.imported == 2);
+        assert!(!store.authenticate(RAW_A, 10).unwrap().learning_allowed);
+        let r = store
+            .import_router_keys(&export().with_learning_allowed(true), 20)
+            .unwrap();
+        assert_eq!((r.learning_updated, r.written), (2, true));
+        assert!(store.authenticate(RAW_B, 20).unwrap().learning_allowed);
+        let r = store.import_router_keys(&export(), 30).unwrap();
+        assert_eq!((r.learning_updated, r.written), (0, false));
+        assert!(store.authenticate(RAW_A, 30).unwrap().learning_allowed);
+        // An older keys.json without the field: false.
+        let mut v: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for k in v["keys"].as_array_mut().unwrap() {
+            k.as_object_mut().unwrap().remove("learning_allowed");
+        }
+        std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+        let old = KeyStore::open(&path, "cortiq_").unwrap();
+        assert!(!old.authenticate(RAW_A, 40).unwrap().learning_allowed);
+    }
+
+    /// keys.json changes are serialised across processes by keys.json.lock:
+    /// a change waits for a lock another process holds, a lock left by a dead
+    /// process is removed, and the lock is gone after every change.
+    #[test]
+    fn key_changes_take_the_cross_process_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keys.json");
+        let lock = dir.path().join("keys.json.lock");
+        let store = KeyStore::open(&path, "cortiq_").unwrap();
+        let plans = crate::config::default_plans();
+        store.create(&NewKey::default(), &plans, 1).unwrap();
+        assert!(!lock.exists(), "released after the change");
+        // Held by "another process" for a moment: the change waits for it.
+        std::fs::write(&lock, "999999\n").unwrap();
+        let holder = {
+            let lock = lock.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                std::fs::remove_file(&lock).unwrap();
+            })
+        };
+        let t0 = Instant::now();
+        store.create(&NewKey::default(), &plans, 2).unwrap();
+        assert!(
+            t0.elapsed() >= Duration::from_millis(250),
+            "{:?}",
+            t0.elapsed()
+        );
+        holder.join().unwrap();
+        assert_eq!(store.len(), 2);
+        // Left by a dead process long ago: removed, the change goes through.
+        let f = std::fs::File::create(&lock).unwrap();
+        f.set_modified(SystemTime::now() - KEYS_LOCK_STALE - Duration::from_secs(5))
+            .unwrap();
+        drop(f);
+        let t0 = Instant::now();
+        store.revoke_account(&store.records()[0].account).unwrap();
+        assert!(t0.elapsed() < Duration::from_secs(2));
+        assert!(!lock.exists());
+        // A revocation by one store survives a change by another opened
+        // before it (the CLI and a running server).
+        let other = KeyStore::open(&path, "cortiq_").unwrap();
+        let victim = store.records()[1].account.clone();
+        store.revoke_account(&victim).unwrap();
+        other.create(&NewKey::default(), &plans, 3).unwrap();
+        let reread = KeyStore::open(&path, "cortiq_").unwrap();
+        assert!(
+            reread
+                .records()
+                .iter()
+                .filter(|k| k.account == victim)
+                .all(|k| !k.active)
+        );
+        assert_eq!(reread.len(), 3);
     }
 }

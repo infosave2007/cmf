@@ -3,19 +3,21 @@
 //! client of the old router.
 //!
 //! `cortiq serve FILE --shadow-of URL` answers every router-API request with
-//! the answer of the router at `URL` ([`Upstream`]), byte for byte, and for
-//! `/v1/route` and `/v1/route:batch` also decides the same inputs locally
-//! ([`crate::service::DecisionService::decide_local`]: no oracle, no cache, no
-//! learning, no billing). Each routed input becomes one [`ShadowLine`] of
-//! `<state>/shadow.jsonl` ([`ShadowLog`]); [`ShadowStats`] are the agreement
-//! statistics of the whole file, replayed when the log is opened and kept up to
-//! date by every append (`GET /v1/admin/shadow`).
+//! the answer of the router at `URL` ([`Upstream`]), byte for byte, and for a
+//! `/v1/route` or `/v1/route:batch` the old router answered 200 also decides
+//! the same inputs locally ([`crate::service::DecisionService::decide_local`]:
+//! no oracle, no cache, no learning, no billing). Each such input becomes one
+//! [`ShadowLine`] of `<state>/shadow.jsonl` ([`ShadowLog`]); [`ShadowStats`]
+//! are the agreement statistics of the whole file, replayed when the log is
+//! opened and kept up to date by every append (`GET /v1/admin/shadow`).
 //!
-//! A line never holds a text: `text_sha256` is the lowercase hex SHA-256 of
-//! the input's UTF-8 bytes; the rest are labels, flags, latencies, the old
-//! router's HTTP status and reason codes.
+//! A line never holds a text: `text_hmac` is the lowercase hex HMAC-SHA256 of
+//! the input's UTF-8 bytes under a random 32-byte key kept in
+//! `<state>/shadow.key` (mode 0600, created with the log) — without the key a
+//! guessed text, or a low-entropy field of a known template, cannot be
+//! confirmed from the log ([`text_hmac`]); the rest are labels, flags,
+//! latencies, the old router's HTTP status and reason codes.
 
-use crate::manifest::sha256_hex;
 use anyhow::{Context, Result, bail, ensure};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -29,6 +31,8 @@ use std::time::{Duration, Instant};
 
 /// File name of the comparison log in the state directory.
 pub const SHADOW_LOG_FILE: &str = "shadow.jsonl";
+/// File name of the key of the log's text digests (next to the log).
+pub const SHADOW_KEY_FILE: &str = "shadow.key";
 /// Most bytes of a request body forwarded to the old router: its own limit
 /// (`cortiq-router` `main.rs:441`, `RequestBodyLimitLayer::new(8 * 1024 * 1024)`).
 pub const UPSTREAM_MAX_BODY: usize = 8 * 1024 * 1024;
@@ -76,7 +80,7 @@ pub const SECRET_BEARING_LOG_TARGETS: [&str; 1] = ["ureq"];
 
 /// Whether a log line of `target` at `level` may carry a forwarded secret
 /// ([`SECRET_BEARING_LOG_TARGETS`] above INFO): a subscriber drops it,
-/// whatever `RUST_LOG` enables (`cortiq serve` does).
+/// whatever `RUST_LOG` enables (`cortiq serve --shadow-of` does).
 pub fn log_may_carry_secrets(target: &str, level: &tracing::Level) -> bool {
     *level > tracing::Level::INFO
         && SECRET_BEARING_LOG_TARGETS.iter().any(|t| {
@@ -87,9 +91,83 @@ pub fn log_may_carry_secrets(target: &str, level: &tracing::Level) -> bool {
         })
 }
 
-/// Lowercase hex SHA-256 of a text (the only trace of a text in the log).
-pub fn text_sha256(text: &str) -> String {
-    sha256_hex(text.as_bytes())
+/// HMAC-SHA256 (RFC 2104) of `msg` under `key`.
+pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    const BLOCK: usize = 64;
+    let mut k = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        k[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0x36u8; BLOCK];
+    let mut opad = [0x5cu8; BLOCK];
+    for i in 0..BLOCK {
+        ipad[i] ^= k[i];
+        opad[i] ^= k[i];
+    }
+    let inner = Sha256::new()
+        .chain_update(ipad)
+        .chain_update(msg)
+        .finalize();
+    Sha256::new()
+        .chain_update(opad)
+        .chain_update(inner)
+        .finalize()
+        .into()
+}
+
+/// Lowercase hex HMAC-SHA256 of a text under the log's key (the only trace
+/// of a text in the log).
+pub fn text_hmac(key: &[u8; 32], text: &str) -> String {
+    hmac_sha256(key, text.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The key at `path` (64 lowercase hex characters and a newline).
+pub fn read_key(path: &Path) -> Result<[u8; 32]> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let hex = text.trim();
+    ensure!(
+        hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()),
+        "{} is not a 32-byte hex key",
+        path.display()
+    );
+    let mut key = [0u8; 32];
+    for (i, b) in key.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).expect("checked hex");
+    }
+    Ok(key)
+}
+
+/// The key at `path`, created (32 bytes of the OS RNG, mode 0600, `O_EXCL`)
+/// when there is none.
+pub fn load_or_create_key(path: &Path) -> Result<[u8; 32]> {
+    if path.exists() {
+        return read_key(path);
+    }
+    let hex = crate::keys::random_hex(32)?;
+    let mut o = OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    match o.open(path) {
+        Ok(mut f) => {
+            f.write_all(format!("{hex}\n").as_bytes())
+                .and_then(|()| f.sync_all())
+                .with_context(|| format!("write {}", path.display()))?;
+        }
+        // Another process created it first: use that one.
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e).with_context(|| format!("create {}", path.display())),
+    }
+    read_key(path)
 }
 
 // ------------------------------------------------------------------ log line
@@ -102,9 +180,10 @@ pub struct ShadowLine {
     /// `request_id` of the old router's answer: of the result in a batch, of
     /// the error envelope when it failed; null when it gave none.
     pub request_id_old: Option<String>,
-    /// SHA-256 hex of `input.text`; null without a text or for a
-    /// bring-your-own embedding (whose text the router ignores).
-    pub text_sha256: Option<String>,
+    /// HMAC-SHA256 hex of `input.text` under `shadow.key` ([`text_hmac`]);
+    /// null without a text or for a bring-your-own embedding (whose text the
+    /// router ignores).
+    pub text_hmac: Option<String>,
     /// `decision.taxonomy_id` of the old answer, else the request's
     /// `taxonomy_id`, else the skill decided locally.
     pub taxonomy: Option<String>,
@@ -129,8 +208,8 @@ pub struct ShadowLine {
     /// HTTP status of the old router's answer; null when it did not answer.
     pub old_status: Option<u16>,
     /// Reason code of a missing local decision (`INVALID_REQUEST`,
-    /// `TAXONOMY_NOT_FOUND`, `EMBEDDING_REQUIRED`, `EMBEDDING_INPUT`,
-    /// `OVERLOADED`, …), else null.
+    /// `TAXONOMY_NOT_FOUND`, `EMBEDDING_REQUIRED`, `EMBEDDING_INPUT`, …), else
+    /// null.
     pub new_error: Option<String>,
 }
 
@@ -164,7 +243,8 @@ pub struct ShadowStats {
     /// Lines with both labels, and those that agree.
     pub compared: u64,
     pub agree: u64,
-    /// Lines whose old answer was not a 200 (or never came).
+    /// Lines whose old answer was not a 200 (or never came): only in a log
+    /// written before comparisons were limited to 200 answers.
     pub old_errors: u64,
     /// Lines without an old label / without a local label.
     pub old_missing: u64,
@@ -311,9 +391,10 @@ struct LogInner {
 }
 
 /// `shadow.jsonl`: append-only (mode 0600), one [`ShadowLine`] per line, and
-/// the statistics of every line in it.
+/// the statistics of every line in it; the key of its text digests.
 pub struct ShadowLog {
     path: PathBuf,
+    key: [u8; 32],
     inner: Mutex<LogInner>,
 }
 
@@ -339,10 +420,12 @@ fn open_append(path: &Path) -> Result<File> {
 }
 
 impl ShadowLog {
-    /// Open (create) the log and replay the lines already in it into the
-    /// statistics. A last line torn by a crash is counted as malformed and
-    /// closed with a newline, so the next line starts clean.
+    /// Open (create) the log and its key ([`SHADOW_KEY_FILE`] in the same
+    /// directory) and replay the lines already in it into the statistics. A
+    /// last line torn by a crash is counted as malformed and closed with a
+    /// newline, so the next line starts clean.
     pub fn open(path: &Path) -> Result<Self> {
+        let key = load_or_create_key(&path.with_file_name(SHADOW_KEY_FILE))?;
         let mut stats = ShadowStats::default();
         let mut torn = false;
         match File::open(path) {
@@ -378,12 +461,18 @@ impl ShadowLog {
         }
         Ok(Self {
             path: path.to_path_buf(),
+            key,
             inner: Mutex::new(LogInner { file, stats }),
         })
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The digest of a text in this log's lines ([`text_hmac`]).
+    pub fn text_digest(&self, text: &str) -> String {
+        text_hmac(&self.key, text)
     }
 
     /// Append lines (one write) and add them to the statistics.
@@ -506,7 +595,9 @@ fn url_host(authority: &str) -> Result<&str> {
     Ok(host)
 }
 
-fn is_loopback_host(host: &str) -> bool {
+/// `localhost` or a loopback IP (the rule of plain-http URLs here and of
+/// `oracle.base_url`).
+pub(crate) fn is_loopback_host(host: &str) -> bool {
     host.eq_ignore_ascii_case("localhost")
         || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
@@ -702,7 +793,7 @@ mod tests {
         ShadowLine {
             ts: 1_790_000_000,
             request_id_old: Some("req_1".into()),
-            text_sha256: Some(text_sha256("x")),
+            text_hmac: Some(text_hmac(&[7u8; 32], "x")),
             taxonomy: Some("t".into()),
             old_label: old.map(str::to_string),
             new_label: new.map(str::to_string),
@@ -717,6 +808,46 @@ mod tests {
             old_status: Some(if old.is_some() { 200 } else { 500 }),
             new_error: None,
         }
+    }
+
+    #[test]
+    fn hmac_matches_rfc_4231_and_the_key_file_is_private() {
+        // RFC 4231 test case 1 and 2.
+        let hex = |b: [u8; 32]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        assert_eq!(
+            hex(hmac_sha256(&[0x0b; 20], b"Hi There")),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+        assert_eq!(
+            hex(hmac_sha256(b"Jefe", b"what do ya want for nothing?")),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        // A key longer than the block is hashed first (test case 6).
+        assert_eq!(
+            hex(hmac_sha256(
+                &[0xaa; 131],
+                b"Test Using Larger Than Block-Size Key - Hash Key First"
+            )),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let log = ShadowLog::open(&dir.path().join(SHADOW_LOG_FILE)).unwrap();
+        let key_path = dir.path().join(SHADOW_KEY_FILE);
+        let key = read_key(&key_path).unwrap();
+        assert_ne!(key, [0u8; 32]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&key_path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let d = log.text_digest("my card 4111");
+        assert_eq!(d, text_hmac(&key, "my card 4111"));
+        assert_ne!(d, crate::manifest::sha256_hex(b"my card 4111"));
+        // Reopened: the same key.
+        drop(log);
+        let again = ShadowLog::open(&dir.path().join(SHADOW_LOG_FILE)).unwrap();
+        assert_eq!(again.text_digest("my card 4111"), d);
     }
 
     #[test]

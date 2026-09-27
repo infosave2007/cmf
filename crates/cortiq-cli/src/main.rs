@@ -281,14 +281,17 @@ enum Commands {
         /// the old router at URL (https; http only to a loopback address),
         /// with the client's Authorization header, and the client gets the
         /// old router's answer byte for byte, errors included (502
-        /// UPSTREAM_UNAVAILABLE only when it gives no answer). /v1/route and
-        /// /v1/route:batch are also decided locally in parallel — no oracle,
-        /// no learning, no billing — and one line per input is appended to
-        /// <state>/shadow.jsonl: {ts, request_id_old, text_sha256 (never the
-        /// text), taxonomy, old_label, new_label, agree, old_confident,
-        /// new_confident, old_latency_ms, new_latency_ms, old_status,
-        /// new_error}. GET /v1/admin/shadow (x-admin-token) returns the
-        /// agreement overall, by confidence and per label
+        /// UPSTREAM_UNAVAILABLE only when it gives no answer). A /v1/route or
+        /// /v1/route:batch the old router answered 200 is also decided
+        /// locally after that answer — no oracle, no learning, no billing,
+        /// 4 comparison slots of its own (64 more may wait; one past that
+        /// is dropped) — and one line per input is appended to
+        /// <state>/shadow.jsonl: {ts, request_id_old, text_hmac (HMAC-SHA256
+        /// under <state>/shadow.key, never the text), taxonomy, old_label,
+        /// new_label, agree, old_confident, new_confident, old_latency_ms,
+        /// new_latency_ms, old_status, new_error}; other answers are neither
+        /// decided nor written. GET /v1/admin/shadow (x-admin-token) returns
+        /// the agreement overall, by confidence and per label
         #[arg(long, value_name = "URL")]
         shadow_of: Option<String>,
         /// Decision file only, with --shadow-of: deadline of one request
@@ -2018,13 +2021,22 @@ async fn main() -> anyhow::Result<()> {
     };
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| default_level.into());
-    // Past the shutdown gate, and never a DEBUG/TRACE line of a target that
-    // prints forwarded request headers (ureq's request prelude: the client
-    // keys and admin token a `--shadow-of` server forwards), whatever
-    // RUST_LOG says.
-    let shutdown_filter = tracing_subscriber::filter::filter_fn(|m| {
+    // Past the shutdown gate; and for `serve --shadow-of`, never a
+    // DEBUG/TRACE line of a target that prints forwarded request headers
+    // (ureq's request prelude: the client keys and admin token the shadow
+    // server forwards), whatever RUST_LOG says. Every other command keeps
+    // ureq's debug lines (downloads).
+    let forwards_secrets = matches!(
+        &cli.command,
+        Commands::Serve {
+            shadow_of: Some(_),
+            ..
+        }
+    );
+    let shutdown_filter = tracing_subscriber::filter::filter_fn(move |m| {
         TRACING_LIVE.load(AtomicOrdering::Relaxed)
-            && !cortiq_decision::shadow::log_may_carry_secrets(m.target(), m.level())
+            && !(forwards_secrets
+                && cortiq_decision::shadow::log_may_carry_secrets(m.target(), m.level()))
     });
     tracing_subscriber::registry()
         .with(env_filter)

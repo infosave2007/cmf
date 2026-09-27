@@ -155,21 +155,27 @@ pub struct PlanConfig {
     pub days: Option<u32>,
 }
 
-/// The plan table of spec §4.10: starter 60/min, no quota, 30 days; developer
-/// 120/min, 100k; pro 600/min, 1M; scale 3000/min, 10M (no expiry).
+/// The plan table of cortiq-router (`config.rs:198-236`, spec §4.10): starter
+/// 60/min, no quota; developer 120/min, 100k; pro 600/min, 1M; scale
+/// 3000/min, 10M — keys of every plan expire after 30 days, as the router's
+/// `duration_days = 30` (a portal that mints keys through `POST
+/// /v1/admin/keys` gets the same expiry after the switch).
 pub fn default_plans() -> BTreeMap<String, PlanConfig> {
-    let plan = |rate_per_min, decision_quota, days| PlanConfig {
+    let plan = |rate_per_min, decision_quota| PlanConfig {
         rate_per_min,
         decision_quota,
-        days,
+        days: Some(DEFAULT_PLAN_DAYS),
     };
     BTreeMap::from([
-        ("starter".to_string(), plan(60, 0, Some(30))),
-        ("developer".to_string(), plan(120, 100_000, None)),
-        ("pro".to_string(), plan(600, 1_000_000, None)),
-        ("scale".to_string(), plan(3000, 10_000_000, None)),
+        ("starter".to_string(), plan(60, 0)),
+        ("developer".to_string(), plan(120, 100_000)),
+        ("pro".to_string(), plan(600, 1_000_000)),
+        ("scale".to_string(), plan(3000, 10_000_000)),
     ])
 }
+
+/// Key lifetime of every default plan (router `duration_days = 30`).
+pub const DEFAULT_PLAN_DAYS: u32 = 30;
 
 /// Request limits (spec §4.4, §4.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -436,6 +442,40 @@ pub fn default_tiers() -> Vec<ComplexityTier> {
         .collect()
 }
 
+/// `oracle.base_url`: https, or plain http to a loopback host only (a local
+/// proxy or mock) — the OpenRouter key (`Authorization`) and the questions
+/// travel in every request, as the client keys of `--shadow-of` do. No
+/// credentials, query or fragment.
+fn check_oracle_base_url(url: &str) -> Result<()> {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        bail!("oracle.base_url must be an https URL");
+    };
+    ensure!(
+        !rest.contains(['?', '#']),
+        "oracle.base_url takes no query or fragment"
+    );
+    let authority = rest.split('/').next().unwrap_or_default();
+    ensure!(
+        !authority.is_empty() && !authority.contains('@'),
+        "oracle.base_url must name a host, without credentials"
+    );
+    match scheme {
+        "https" => Ok(()),
+        "http" => {
+            let host = match authority.strip_prefix('[') {
+                Some(v6) => v6.split(']').next().unwrap_or_default(),
+                None => authority.rsplit_once(':').map_or(authority, |(h, _)| h),
+            };
+            ensure!(
+                crate::shadow::is_loopback_host(host),
+                "oracle.base_url: plain http only to a loopback address (the OpenRouter key and the questions travel in every request); use https"
+            );
+            Ok(())
+        }
+        _ => bail!("oracle.base_url must be an https URL"),
+    }
+}
+
 fn check_env_name(what: &str, name: &str) -> Result<()> {
     ensure!(
         !name.is_empty()
@@ -551,10 +591,7 @@ impl Config {
         }
         // oracle
         let o = &self.oracle;
-        ensure!(
-            o.base_url.starts_with("https://") || o.base_url.starts_with("http://"),
-            "oracle.base_url must be an http(s) URL"
-        );
+        check_oracle_base_url(&o.base_url)?;
         check_env_name("oracle.api_key_env", &o.api_key_env)?;
         ensure!(
             !o.model.is_empty() && o.model.len() <= 256,
@@ -658,7 +695,10 @@ mod tests {
         assert!(!c.oracle.enabled);
         assert_eq!(c.cache.threshold, 0.97);
         assert_eq!(c.learning.refit_min_new, 25);
-        assert_eq!(c.auth.plans["starter"].days, Some(30));
+        // The router's plans: every key expires after 30 days.
+        for p in ["starter", "developer", "pro", "scale"] {
+            assert_eq!(c.auth.plans[p].days, Some(30), "{p}");
+        }
         assert_eq!(c.auth.plans["scale"].decision_quota, 10_000_000);
         assert!(c.auth.required(false));
         assert!(!c.auth.required(true));
@@ -679,6 +719,35 @@ mod tests {
         assert!(Config::from_json(br#"{"auth":{"require":true,"key_prefix":"sk-"}}"#).is_ok());
         assert!(Config::from_json(br#"{"auth":{"admin_token_env":"A B"}}"#).is_err());
         assert!(Config::from_json(br#"[]"#).is_err());
+    }
+
+    #[test]
+    fn oracle_base_url_is_https_or_loopback_http() {
+        let with = |u: &str| {
+            let mut c = Config::default();
+            c.oracle.base_url = u.to_string();
+            c.validate()
+        };
+        for ok in [
+            "https://openrouter.ai/api/v1",
+            "https://proxy.internal:8443/v1",
+            "http://127.0.0.1:9199/api/v1",
+            "http://localhost:8080",
+            "http://[::1]:9000/v1",
+        ] {
+            assert!(with(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://openrouter.ai/api/v1",
+            "http://10.0.0.5:8080/v1",
+            "http://[2001:db8::1]:80/v1",
+            "https://user:pw@openrouter.ai/api/v1",
+            "https://openrouter.ai/api/v1?x=1",
+            "ftp://openrouter.ai",
+            "openrouter.ai/api/v1",
+        ] {
+            assert!(with(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

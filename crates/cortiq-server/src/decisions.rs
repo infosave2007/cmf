@@ -54,12 +54,14 @@
 //! [`ServeOptions::shadow_of`]: every request on a router-API path
 //! ([`SHADOW_FORWARDED_PATHS`]) is forwarded unchanged to the old router at
 //! `URL`, before any routing here, and its answer goes back to the client as
-//! it came (status, body bytes, headers; errors included). `POST /v1/route`
-//! and `POST /v1/route:batch` are also decided locally in parallel, without
-//! any oracle, learning or billing, and compared in `<state>/shadow.jsonl`
-//! (one line per input, never the text); `GET /v1/admin/shadow` (admin token)
-//! answers the agreement statistics. Without the flag none of this exists (not
-//! even the admin path). Details: the `shadow` submodule.
+//! it came (status, body bytes, headers; errors included). A `POST /v1/route`
+//! or `POST /v1/route:batch` the old router answered 200 is also decided
+//! locally, after that answer, without any oracle, learning or billing and
+//! within a few comparison slots of its own, and compared in
+//! `<state>/shadow.jsonl` (one line per input, never the text);
+//! `GET /v1/admin/shadow` (admin token) answers the agreement statistics.
+//! Without the flag none of this exists (not even the admin path). Details:
+//! the `shadow` submodule.
 //!
 //! # Every request
 //!
@@ -70,10 +72,14 @@
 //!   same id.
 //! * **Keys** (§4.10): `Authorization: Bearer <key>` or `x-api-key`; the open
 //!   mode (no key needed) holds only when `keys.json` has no key and
-//!   `auth.require` is false (default: false on loopback, true elsewhere). On a
+//!   `auth.require` is false (default: false on loopback, true elsewhere). The
+//!   open caller may reach the oracle and teach the model only when
+//!   `auth.require` is false in the configuration: a loopback address alone
+//!   says nothing about the client (a reverse proxy on the same host). On a
 //!   keyed endpoint the rate window (429 `RATE_LIMITED`, `Retry-After`) and the
 //!   quotas (402 `QUOTA_EXCEEDED`: decisions, tokens, credit) are checked before
-//!   any work, like the router's middleware.
+//!   any work, like the router's middleware, and again before every input of a
+//!   batch after the first.
 //! * **Body**: `Content-Type: application/json` (else 400; 415 on the router
 //!   surface), at most `limits.body_bytes` (else 413 `PAYLOAD_TOO_LARGE`,
 //!   checked from `Content-Length` before reading and while reading).
@@ -162,14 +168,17 @@
 //!
 //! `POST /v1/route:batch` decides up to 1024 inputs in order and fails as a whole
 //! on the first failing input, like the router (the inputs before it are
-//! decided and billed).
+//! decided and billed); a quota or credit used up by the batch's own inputs
+//! fails it with 402 at the next input.
 //!
 //! `POST /v1/feedback` with the router's `{request_id, correct_task_label}`
 //! corrects a route decision of the caller's own account (another account's is
 //! not found — the router let any key correct any request). Any label is
 //! accepted, as in the router: a label of 1..256 bytes the skill does not have
 //! starts a cold start (§5.8); an empty or longer one is answered 200 and
-//! consumes the request but teaches nothing (it names no task). The response
+//! consumes the request but teaches nothing (it names no task). Only a key
+//! with `learning_allowed` teaches the model; anyone else's feedback is
+//! answered 200 with `accepted: false` and consumes the request. The response
 //! is the router's `{schema_version, accepted, message}`. A body with the
 //! decisions API's keys (`id`, `question`, `label`) and none of the router's
 //! is decisions-API feedback (§5.11). As in the router (axum 0.7.9), bytes
@@ -185,13 +194,14 @@
 //! cache_hits, oracle_unavailable, labeled_examples, cache:{entries, hits,
 //! lookups}}, records:[router AuditRecord]}`, `/v1/healthz` `{"status":"ok"}`.
 //! The admin key API takes the router's `CreateKeyReq` (plus the decision-v4
-//! limits `token_quota`, `credit_usd`, `oracle_budget_usd`, `oracle_allowed`;
-//! `email` is not stored) and answers `{key, account, plan, rate_per_min,
-//! decision_quota, expires_at, created_at, persisted}`; its listing has the
-//! active keys as `{account, plan, rate_per_min, decision_quota, expires_at,
-//! expired, key_hash_prefix, usage:{decisions, oracle_calls}}`. Unlike the
-//! router, a plan must be one of `auth.plans` and an account `[A-Za-z0-9_.@-]`
-//! (400).
+//! limits `token_quota`, `credit_usd`, `oracle_budget_usd`, `oracle_allowed`,
+//! `learning_allowed`; `email` is not stored) and answers `{key, account,
+//! plan, rate_per_min, decision_quota, expires_at, created_at, persisted}`;
+//! its listing has the active keys as `{account, plan, rate_per_min,
+//! decision_quota, expires_at, expired, key_hash_prefix, usage:{decisions,
+//! oracle_calls}}`. An account is any text of 1..128 characters, as in the
+//! router; unlike the router (which mints a key without limits for a plan it
+//! does not know), a plan must be one of `auth.plans` (400).
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -276,8 +286,7 @@ pub const ROUTER_LENGTH_LIMIT: &str = "Failed to buffer the request body: length
 /// but teaches nothing.
 pub const ROUTER_MAX_LABEL_BYTES: usize = cortiq_decision::protocol::MAX_LABEL_BYTES;
 /// Instructions of the router question of a skill without a rubric.
-pub const DEFAULT_ROUTE_INSTRUCTIONS: &str =
-    "Classify the input into exactly one of the task labels.";
+pub const DEFAULT_ROUTE_INSTRUCTIONS: &str = cortiq_decision::service::DEFAULT_ROUTE_INSTRUCTIONS;
 
 const FLAG_LOW_CONFIDENCE: &str = "low_confidence";
 const FLAG_ORACLE_UNAVAILABLE: &str = "oracle_unavailable";
@@ -1719,6 +1728,8 @@ mod wire {
         pub oracle_budget_usd: Option<String>,
         #[serde(default)]
         pub oracle_allowed: Option<bool>,
+        #[serde(default)]
+        pub learning_allowed: Option<bool>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -1817,30 +1828,7 @@ fn truncate_utf8(text: &str, max: usize) -> &str {
 /// the rubric's instructions and descriptions (question-file order, then any
 /// active label the rubric does not describe, in task order).
 pub fn route_question(s: &SkillRuntime) -> Question {
-    let active = s.scorer().labels();
-    let mut criteria = Map::new();
-    let instructions = match &s.manifest().rubric {
-        Some(r) => {
-            for (k, v) in r.ordered_criteria() {
-                if active.contains(&k) {
-                    criteria.insert(k, v);
-                }
-            }
-            r.instructions.clone()
-        }
-        None => DEFAULT_ROUTE_INSTRUCTIONS.to_string(),
-    };
-    for l in active {
-        if !criteria.contains_key(l) {
-            criteria.insert(l.clone(), Value::String(l.clone()));
-        }
-    }
-    Question {
-        id: ROUTE_QUESTION_ID.to_string(),
-        kind: QuestionKind::Choice,
-        instructions: Value::String(instructions),
-        criteria: Some(Value::Object(criteria)),
-    }
+    s.rubric_question(ROUTE_QUESTION_ID)
 }
 
 /// The decision request of a router text input: the skill's `task`
@@ -2501,7 +2489,15 @@ async fn batch_handler(
         let results = blocking(move || {
             let _slot = guard;
             let mut out = Vec::with_capacity(req.inputs.len());
-            for input in &req.inputs {
+            for (i, input) in req.inputs.iter().enumerate() {
+                // The quotas and the credit were checked before the request;
+                // every later input is checked again against what the batch
+                // has used so far (a failing input fails the batch).
+                if i > 0 {
+                    s.svc
+                        .check_quotas(&p)
+                        .map_err(|e| HttpError::from(e).by(&p.account))?;
+                }
                 let id = router_request_id();
                 out.push(
                     s.route_one(&p, &routing, input, None, &id)
@@ -2544,6 +2540,20 @@ fn is_decisions_feedback(bytes: &[u8]) -> bool {
     }
 }
 
+/// A feedback answer of a key without `learning_allowed` (nothing learned).
+fn learning_refused(r: &Value) -> bool {
+    r["refused"] == json!(cortiq_decision::cascade::LEARNING_NOT_ALLOWED)
+}
+
+/// The router's `message` of a feedback answer.
+fn feedback_message(r: &Value, label: &str) -> String {
+    if learning_refused(r) {
+        format!("feedback for '{label}' not learned: this key may not teach the model")
+    } else {
+        format!("feedback recorded for '{label}'")
+    }
+}
+
 async fn feedback_handler(
     State(st): State<Arc<DecisionState>>,
     Extension(ctx): Extension<Ctx>,
@@ -2571,7 +2581,7 @@ async fn feedback_handler(
                     .map_err(|e| HttpError::from(e).by(&p.account))?;
                 let label = r["label"].as_str().unwrap_or_default().to_string();
                 r["schema_version"] = json!(ROUTER_SCHEMA_VERSION);
-                r["message"] = json!(format!("feedback recorded for '{label}'"));
+                r["message"] = json!(feedback_message(&r, &label));
                 Ok(r)
             })
             .await?;
@@ -2605,8 +2615,10 @@ async fn feedback_handler(
             s.unlink(&fb.request_id);
             let mut v = json!({
                 "schema_version": ROUTER_SCHEMA_VERSION,
-                "accepted": true,
-                "message": format!("feedback recorded for '{}'", fb.correct_task_label),
+                // False only when the key may not teach the model; an empty or
+                // over-long label is `accepted` as by the router.
+                "accepted": !learning_refused(&r),
+                "message": feedback_message(&r, &fb.correct_task_label),
             });
             if ext {
                 v["cmf"] = r;
@@ -2849,6 +2861,7 @@ async fn admin_create_key(
             ("credit_usd", json!(req.credit_usd)),
             ("oracle_budget_usd", json!(req.oracle_budget_usd)),
             ("oracle_allowed", json!(req.oracle_allowed)),
+            ("learning_allowed", json!(req.learning_allowed)),
         ] {
             if !v.is_null() {
                 new.insert(k.to_string(), v);
@@ -3157,6 +3170,11 @@ impl DecisionServer {
             .as_deref()
             .map(|u| cortiq_decision::shadow::Upstream::new(u, opts.shadow_timeout))
             .transpose()?;
+        // The file is checked (envelope, profile, manifests) before the state
+        // directory is created: a file this version refuses leaves nothing
+        // behind next to it.
+        cortiq_decision::container::DecisionModel::open(&opts.model, Verify::Light)
+            .with_context(|| format!("open {}", opts.model.display()))?;
         let root = opts.state_root();
         let dir =
             StateDir::open(&root).with_context(|| format!("state directory {}", root.display()))?;
@@ -3211,6 +3229,11 @@ impl DecisionServer {
         if !svc.auth_enabled() && !loopback {
             tracing::warn!(
                 "open mode on a non-loopback address: anyone who can connect may decide"
+            );
+        }
+        if !svc.auth_enabled() && cfg.auth.require.is_none() {
+            tracing::warn!(
+                "open mode only because the address is loopback (auth.require: null): callers without a key may not reach the oracle or teach the model; set auth.require to false to allow it, or to true behind a reverse proxy"
             );
         }
         let shadow = match upstream {

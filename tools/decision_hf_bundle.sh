@@ -19,6 +19,13 @@
 # The model is only read. The script checks the copy against the expected
 # sha256, writes SHA256SUMS, re-verifies it and refuses to finish unless the
 # directory holds exactly the five files.
+#
+# Upload: the repository still holds the v3 files (cortiq-decision-core.cmf,
+# specialists/, *.policy.json, evidence/, source/, figures/, …), which 0.7.8
+# refuses and SHA256SUMS does not cover. The upload replaces the whole
+# repository, so that exactly these five files are left:
+#   hf upload infosave/cortiq-decision OUT_DIR . --delete "*"
+# then check the file list, sizes and sha256 through the tree API, not the log.
 set -euo pipefail
 
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -50,7 +57,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --model) [ $# -ge 2 ] || die "--model needs a path"; MODEL=$2; shift 2 ;;
         --sha256) [ $# -ge 2 ] || die "--sha256 needs a value"; EXPECT_SHA=$2; shift 2 ;;
-        -h|--help) sed -n '2,21p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
         -*) die "unknown option $1" ;;
         *) [ -z "$OUT" ] || die "one output directory only"; OUT=$1; shift ;;
     esac
@@ -92,3 +99,4 @@ n=$(ls -A | wc -l | tr -d ' ')
 [ "$n" = 5 ] || die "expected 5 files in $OUT, found $n"
 echo "bundle: $(pwd) (5 files)"
 cat SHA256SUMS
+echo "upload replaces the repository (v3 files are removed): hf upload infosave/cortiq-decision $(pwd) . --delete \"*\""

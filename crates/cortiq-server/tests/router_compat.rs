@@ -470,6 +470,9 @@ fn signal(text: &str) -> Vec<f32> {
 
 fn cfg() -> Config {
     let mut c = Config::default();
+    // The router's own default (`[auth] require = false`): open until the
+    // first key, and the open caller may reach the oracle and teach.
+    c.auth.require = Some(false);
     c.learning.synchronous = true;
     c
 }

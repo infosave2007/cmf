@@ -1306,8 +1306,10 @@ fn keys_auth_rate_quotas_and_admin() {
         .unwrap();
     assert_eq!(dev.record.rate_per_min, 120);
     assert_eq!(dev.record.decision_quota, 100_000);
-    assert_eq!(dev.record.expires, None);
+    // Every plan's keys expire after 30 days, as the router's.
+    assert_eq!(dev.record.expires, Some(now + 30 * 86_400));
     assert!(!dev.record.oracle_allowed);
+    assert!(!dev.record.learning_allowed);
     let starter = store.create(&NewKey::default(), &plans, now).unwrap();
     assert_eq!(starter.record.plan, "starter");
     assert_eq!(starter.record.expires, Some(now + 30 * 86_400));
@@ -1474,7 +1476,18 @@ fn keys_auth_rate_quotas_and_admin() {
     assert!(busy.enter().is_ok());
     // Open mode only without keys and without require.
     let open = service_with(Config::default(), None).with_loopback(true);
-    assert!(open.authenticate(None, None).unwrap().is_open());
+    let anyone = open.authenticate(None, None).unwrap();
+    assert!(anyone.is_open());
+    // Open only because the address is loopback (auth.require null): a
+    // reverse proxy may forward anyone, so no oracle and no teaching.
+    assert!(!anyone.oracle_allowed && !anyone.learning_allowed);
+    let mut explicit = Config::default();
+    explicit.auth.require = Some(false);
+    let open = service_with(explicit.clone(), None).with_loopback(true);
+    let p = open.authenticate(None, None).unwrap();
+    assert!(p.is_open() && p.oracle_allowed && p.learning_allowed);
+    let open = service_with(explicit, None).with_loopback(false);
+    assert!(open.authenticate(None, None).unwrap().oracle_allowed);
     let closed = service_with(Config::default(), None).with_loopback(false);
     assert_eq!(closed.authenticate(None, None).unwrap_err().status, 401);
     let keyed = service_with(Config::default(), None)

@@ -248,6 +248,147 @@ fn twenty_five_oracle_answers_promote_and_the_next_similar_request_is_local() {
     assert_eq!(st.cascade.label_counts("topics", "travel"), (25, 0));
 }
 
+/// A body whose `task` question is the skill's own (its rubric), as the
+/// router's `/v1/route` asks it.
+fn own_body(st: &Stand, text: &str) -> Vec<u8> {
+    let q = served(st).skill("topics").unwrap().rubric_question("task");
+    body(
+        json!(text),
+        json!({"task": {"type": "choice", "instructions": q.instructions, "criteria": q.criteria}}),
+        None,
+    )
+}
+
+#[test]
+fn only_a_caller_that_may_teach_changes_the_shared_skill() {
+    let mock = MockOracle::answering("travel");
+    let st = Stand::new(&stand_config(&mock.url()));
+    let mut guest = Principal::open();
+    guest.account = "guest".into();
+    guest.key12 = Some("0123456789ab".into());
+    guest.learning_allowed = false;
+    let texts = &lesson()[..5];
+    // Its own instructions over the skill's labels: answered, never learned.
+    for t in texts {
+        let d = st.decide_as(&topics_body(t), &guest).unwrap();
+        assert_eq!(d.questions[0].action, Action::Oracle);
+    }
+    assert_eq!(st.cascade.label_counts("topics", "travel"), (0, 0));
+    // The same texts under the skill's own question: another contract, so
+    // the guest's cached answers are not served; the rubric's answers teach.
+    for t in texts {
+        let d = st.decide_as(&own_body(&st, t), &guest).unwrap();
+        assert_eq!(
+            d.questions[0].action,
+            Action::Oracle,
+            "not the guest's cache entry"
+        );
+    }
+    assert_eq!(mock.hits(), 10);
+    assert_eq!(st.cascade.label_counts("topics", "travel"), (5, 5));
+    // The guest's own contract again: its cache entry, still nothing learned.
+    let d = st.decide_as(&topics_body(&texts[0]), &guest).unwrap();
+    assert_eq!(d.questions[0].action, Action::Cache);
+    assert_eq!(st.cascade.label_counts("topics", "travel"), (5, 5));
+
+    // A superset question naming a new label: the oracle picks it; no cold
+    // start from the guest, one from a caller that may teach.
+    let pwned = MockOracle::answering("pwned");
+    let st2 = Stand::new(&stand_config(&pwned.url()));
+    let superset = |t: &str| {
+        body(
+            json!(t),
+            json!({"task": choice(&["Weather", "billing", "cards", "travel", "pwned"])}),
+            None,
+        )
+    };
+    let d = st2.decide_as(&superset(&texts[1]), &guest).unwrap();
+    assert_eq!(d.questions[0].action, Action::Oracle);
+    assert_eq!(st2.cascade.label_counts("topics", "pwned"), (0, 0));
+    st2.decide(&superset(&texts[2])).unwrap();
+    assert_eq!(st2.cascade.label_counts("topics", "pwned"), (1, 1));
+
+    // Feedback: the guest's is consumed and answered, but teaches nothing.
+    let fb =
+        |id: &str, label: &str| format!(r#"{{"id":"{id}","question":"task","label":"{label}"}}"#);
+    let d = st.decide_as(&topics_body(&texts[3]), &guest).unwrap();
+    let r = st
+        .svc
+        .feedback(fb(&d.id, "cards").as_bytes(), &guest)
+        .unwrap();
+    assert_eq!(
+        (
+            r["accepted"].as_bool(),
+            r["learned"].as_bool(),
+            r["refused"].as_str()
+        ),
+        (Some(false), Some(false), Some("learning_not_allowed"))
+    );
+    assert_eq!(st.cascade.label_counts("topics", "cards"), (0, 0));
+    assert_eq!(
+        st.svc
+            .feedback(fb(&d.id, "cards").as_bytes(), &guest)
+            .unwrap_err()
+            .status,
+        404,
+        "consumed"
+    );
+    let mut trusted = guest.clone();
+    trusted.learning_allowed = true;
+    let d = st.decide_as(&topics_body(&texts[4]), &trusted).unwrap();
+    let r = st
+        .svc
+        .feedback(fb(&d.id, "cards").as_bytes(), &trusted)
+        .unwrap();
+    assert_eq!(r["accepted"], true);
+    assert_eq!(r["learned"], true);
+    assert_eq!(st.cascade.label_counts("topics", "cards"), (1, 1));
+}
+
+/// Labels a skill does not have yet are capped per skill: past
+/// `MAX_PENDING_NEW_LABELS` a feedback naming one more is refused (`full`).
+#[test]
+fn pending_new_labels_are_capped_per_skill() {
+    use cortiq_decision::cascade::MAX_PENDING_NEW_LABELS;
+    use cortiq_decision::protocol::FeedbackRequest;
+    let mock = MockOracle::answering("travel");
+    let mut cfg = stand_config(&mock.url());
+    cfg.oracle.enabled = false;
+    let st = Stand::new(&cfg);
+    let open = Principal::open();
+    let text = &lesson()[0];
+    let feed = |label: String| {
+        let d = st.decide(&topics_body(text)).unwrap();
+        let fb = FeedbackRequest {
+            id: d.id.clone(),
+            question: "task".into(),
+            label,
+            any_label: true,
+        };
+        st.svc.feedback_request(&fb, &open).unwrap()
+    };
+    for i in 0..MAX_PENDING_NEW_LABELS {
+        let r = feed(format!("new-{i}"));
+        assert_eq!(
+            (r["accepted"].as_bool(), r["full"].as_bool()),
+            (Some(true), Some(false)),
+            "{r}"
+        );
+    }
+    let r = feed("one-too-many".into());
+    assert_eq!(
+        (r["accepted"].as_bool(), r["full"].as_bool()),
+        (Some(false), Some(true)),
+        "{r}"
+    );
+    assert_eq!(st.cascade.label_counts("topics", "one-too-many"), (0, 0));
+    // A label the skill has, and a pending one, still take examples.
+    let r = feed("cards".into());
+    assert_eq!(r["accepted"], true, "{r}");
+    let r = feed("new-0".into());
+    assert_eq!(r["full"], false, "{r}");
+}
+
 #[test]
 fn a_holdout_regression_refuses_the_challenger() {
     let mock = MockOracle::answering("travel");

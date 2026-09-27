@@ -4,11 +4,13 @@
 //! <state>/            mode 0700
 //!   LOCK              pid and a random nonce; created with O_EXCL (one serving process)
 //!   keys.json         API key records (sha256 of the key only), atomic replace
+//!   keys.json.lock    held (O_EXCL) by any process while it changes keys.json
 //!   usage/            YYYY-MM.jsonl usage ledger + totals.json snapshot
 //!   oracle.jsonl      oracle reservation ledger (cascade)
 //!   oracle.state      oracle stop reason and switches (cascade)
 //!   learn.log         cache, buffer and learning records (cascade)
 //!   shadow.jsonl      router-API shadow comparisons (`serve --shadow-of`), no texts
+//!   shadow.key        random HMAC key of the text digests in shadow.jsonl (0600)
 //!   generations/      gNNNNNN.cmf overlay generations
 //!   CURRENT           "gNNNNNN <sha256>" of the served generation, atomic replace
 //! ```
@@ -18,7 +20,9 @@
 //! directory fails with the holder's pid until the lock is dropped;
 //! `--break-lock` ([`StateDir::lock`] with `break_lock`) removes a lock left by
 //! a dead process. Key management from the CLI writes `keys.json` atomically
-//! without the lock; a server picks the new file up by its mtime
+//! without the `LOCK`, under `keys.json.lock` like the server's own key
+//! changes (neither writes back a file the other changed in between); a
+//! server picks the new file up by its mtime
 //! ([`crate::keys::KeyStore::maybe_reload`]).
 //!
 //! [`atomic_write`]: temp file in the same directory (`create_new`, mode 0600),

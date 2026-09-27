@@ -1178,7 +1178,7 @@ pub fn learn_offline(
             };
             match buffer.add(ex, &stored) {
                 AddOutcome::Stored => examples += 1,
-                AddOutcome::Duplicate => duplicates += 1,
+                AddOutcome::Duplicate | AddOutcome::Full => duplicates += 1,
             }
         }
     }

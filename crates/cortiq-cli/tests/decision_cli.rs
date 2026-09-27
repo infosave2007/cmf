@@ -1203,7 +1203,13 @@ fn serve_on_loopback_learns_then_state_commands_use_its_generations() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
     let mock = MockOracle::answering("travel");
-    let cfg = oracle_config(d, &mock, json!({"learning": {"synchronous": true}}));
+    // Open mode with the oracle and learning: `auth.require` false explicitly
+    // (the loopback address alone gives a caller without a key neither).
+    let cfg = oracle_config(
+        d,
+        &mock,
+        json!({"learning": {"synchronous": true}, "auth": {"require": false}}),
+    );
     let state = d.join("state");
     let srv = Server::start(
         &t.path,
@@ -1658,8 +1664,15 @@ fn serve_shadow_of_answers_with_the_old_router_and_compares_locally() {
     let raw = std::fs::read_to_string(state.join("shadow.jsonl")).unwrap();
     assert!(!raw.contains(text.as_str()), "a text in the comparison log");
     let line: Value = serde_json::from_str(raw.trim()).unwrap();
+    // The digest is keyed (HMAC-SHA256 under <state>/shadow.key), not the
+    // text's plain SHA-256.
+    let key = cortiq_decision::shadow::read_key(&state.join("shadow.key")).unwrap();
     assert_eq!(
-        line["text_sha256"],
+        line["text_hmac"],
+        json!(cortiq_decision::shadow::text_hmac(&key, text))
+    );
+    assert_ne!(
+        line["text_hmac"],
         json!(format!("{:x}", Sha256::digest(text.as_bytes())))
     );
     assert_eq!(line["request_id_old"], "req_old_cli");

@@ -25,9 +25,11 @@ label with the smallest reconstruction error, with a calibrated confidence, a
 novelty score and a gate certified on held-out calibration rows, so the model
 abstains instead of guessing. Three skills are included: `banking77` (77
 labels), `clinc150` (150) and `massive` (60, MASSIVE en-US). It serves the
-Jev / OpenRouter decisions protocol and the cortiq-router API, and it can
-escalate the questions it abstains on to an LLM through OpenRouter, whose
-answers teach the model without forgetting.
+request/response shape of the Jev decisions API on OpenRouter (Cortiq
+Decision itself is not listed on OpenRouter) and the cortiq-router API, and
+it can escalate the questions it abstains on to an LLM through OpenRouter,
+whose answers can teach the model without changing any other label's
+parameters (checked by sha256).
 
 ## Results on the test sets
 
@@ -39,22 +41,25 @@ two-sided test on the paired rows (on the gate rows: the answered rows only).
 |---|---|---|---|---|---|
 | BANKING77 | CMF, all rows | 2875 / 3080 | 93.34 % [92.41, 94.17] | 2636 / 3080 (85.58 %) | 9.72e-33 |
 | | CMF, certified gate (answered 2791 / 3080, coverage 90.62 %) | 2714 / 2791 | 97.24 % [96.57, 97.79] | 2456 / 2791 (88.00 %) | 1.63e-56 |
-| | CMF + DeepSeek V4.1 Flash on abstentions (289 calls) | 2894 / 3080 | 93.96 % [93.06, 94.75] | 2636 / 3080 (85.58 %) | 8.2e-49 |
+| | CMF + DeepSeek V4.1 Flash, cascade with self-learning (282 calls) | 2893 / 3080 | 93.93 % [93.03, 94.72] | 2636 / 3080 (85.58 %) | 3.23e-48 |
 | CLINC150 | CMF, all rows | 4328 / 4500 | 96.18 % [95.58, 96.70] | 4354 / 4500 (96.76 %) | 0.099 |
 | | CMF, certified gate (answered 4145 / 4500, coverage 92.11 %) | 4091 / 4145 | 98.70 % [98.30, 99.00] | 4055 / 4145 (97.83 %) | 0.000769 |
-| | CMF + DeepSeek V4.1 Flash on abstentions (355 calls) | 4386 / 4500 | 97.47 % [96.97, 97.89] | 4354 / 4500 (96.76 %) | 0.0117 |
+| | CMF + DeepSeek V4.1 Flash, cascade with self-learning (351 calls) | 4386 / 4500 | 97.47 % [96.97, 97.89] | 4354 / 4500 (96.76 %) | 0.0117 |
 | MASSIVE | CMF, all rows | 2562 / 2974 | 86.15 % [84.86, 87.34] | 2551 / 2974 (85.78 %) | 0.607 |
 | | CMF, certified gate (answered 1615 / 2974, coverage 54.30 %) | 1581 / 1615 | 97.89 % [97.07, 98.49] | 1530 / 1615 (94.74 %) | 4.29e-13 |
-| | CMF + DeepSeek V4.1 Flash on abstentions (1359 calls) | 2617 / 2974 | 88.00 % [86.78, 89.12] | 2551 / 2974 (85.78 %) | 8.37e-06 |
+| | CMF + DeepSeek V4.1 Flash, cascade with self-learning (1335 calls) | 2617 / 2974 | 88.00 % [86.78, 89.12] | 2551 / 2974 (85.78 %) | 7.57e-06 |
 
 * On CLINC150 all rows Jev is 0.58 points higher; the difference is not
   significant (p = 0.099). On MASSIVE all rows the two are level (p = 0.607).
-* The cascade row is static: the certified gate answers what it accepts, and
-  every abstention is answered by `deepseek/deepseek-v4.1-flash` through
-  OpenRouter with Jev's rubric (temperature 0, reasoning off; stored answers,
-  none missing). Served with self-learning on, in one pass over the same rows,
-  the cascade got 2893, 4386 and 2617 right with 282, 351 and 1335 oracle
-  calls ([ORACLE.md](ORACLE.md#measured-effect)).
+* The cascade row is `cortiq serve` with the cache and self-learning on, in
+  one pass over the test rows (no ground truth, no feedback): the certified
+  gate answers what it accepts, and the rest is answered by
+  `deepseek/deepseek-v4.1-flash` through OpenRouter with Jev's rubric
+  (temperature 0, reasoning off; stored answers replayed, 24 MASSIVE calls
+  live) or by the semantic cache (21 hits). The static cascade — every abstention answered, no cache, no
+  learning — got 2894, 4386 and 2617 right with 289, 355 and 1359 calls
+  (McNemar p against Jev 8.2e-49, 0.0117 and 8.37e-06), one more right on
+  BANKING77 than the served cascade ([ORACLE.md](ORACLE.md#measured-effect)).
 
 **Speed.** Text → decision (tokenize, encode, hash, resonance) on one thread of
 an Apple M4, `cortiq decide --bench` over every test row: p50 / p95 =
@@ -65,10 +70,11 @@ an Apple M4, `cortiq decide --bench` over every test row: p50 / p95 =
 they are not hardware-normalized.
 
 **$ per 1M decisions.** CMF alone: $0 in API fees (hardware and electricity
-not counted). CMF + DeepSeek on abstentions: $3.09 (BANKING77), $3.56
-(CLINC150), $8.52 (MASSIVE) — the stored OpenRouter cost of the abstention
-calls divided by all test rows. Jev 1.13: $183.69, $271.61, $110.86 (mean
-stored cost per call).
+not counted). CMF + DeepSeek, the served cascade with self-learning: $3.01
+(BANKING77), $3.53 (CLINC150), $8.48 (MASSIVE); the static cascade $3.09,
+$3.56 and $8.52 — the stored OpenRouter cost of the oracle calls divided by
+all test rows. Jev 1.13: $183.69, $271.61, $110.86 (mean stored cost per
+call).
 
 ## What you get that Jev does not
 
@@ -91,13 +97,17 @@ stored cost per call).
   skill covers) can go to an LLM through OpenRouter, under a budget with stop
   rules; paraphrases of an answered question (cosine ≥ 0.97) are served from
   a semantic cache at no cost.
-* **Self-learning without forgetting.** Oracle answers and client feedback
-  become examples; a label is refitted after 25 new examples, kept only if it
-  is at least as good on a holdout, and the gate is re-certified. Every other
-  label stays byte for byte the same (0 isolation violations in the measured
-  runs). Each promotion is a generation you can roll back.
+* **Self-learning with isolated labels.** Oracle answers and the feedback of
+  keys allowed to teach become examples; a label is refitted after 25 new
+  examples, kept only if it is at least as good on a holdout, and the gate is
+  re-certified. Every other label's parameters stay byte for byte the same
+  (0 isolation violations in the measured runs), though a refitted label can
+  win rows others used to win. Each promotion is a generation you can roll
+  back.
 * **On-premises and private.** One file, CPU only, no Python, runs offline.
-  With the oracle on, PII is redacted by default before a question leaves.
+  With the oracle on, e-mail addresses, secret-like tokens and long numbers
+  are redacted by default before a question leaves (a heuristic, see
+  [ORACLE.md](ORACLE.md#what-leaves-the-machine)).
 * **Drop-in for cortiq-router clients.** The same server answers the
   cortiq-router API (schema 1.1), imports its API keys (sha256) and can run in
   shadow mode next to the old router before the switch.
@@ -138,8 +148,9 @@ self-learning and the OpenRouter setup.
   vocabulary); texts are read up to 512 tokens.
 * The gate is certified in-domain, for traffic like the skill's calibration
   split; shifted traffic can break the guarantee, and coverage can be low
-  (54.30 % on MASSIVE). Re-certification after self-learning reuses the same
-  calibration rows, so after many promotions the bound is nominal.
+  (54.30 % on MASSIVE). Self-learning picks each challenger on a holdout that
+  is part of the calibration rows the gate is then re-certified on, so the
+  bound is nominal after any promotion.
 * Every speed number was measured on macOS arm64 (Apple M4, 24 GB), one
   thread; other platforms were not measured.
 * The cascade numbers use stored DeepSeek V4.1 Flash answers; a provider can

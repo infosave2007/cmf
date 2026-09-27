@@ -563,7 +563,13 @@ Oracle: imported keys may escalate to the oracle (oracle_allowed true), as
 every key could in cortiq-router; the server's oracle switch, budgets and
 stop rules still apply. --oracle-allowed=false imports them without it.
 Given explicitly (true or false), the value also reaches the keys an earlier
-import brought from the router; without it those keep theirs.";
+import brought from the router; without it those keep theirs.
+
+Learning: imported keys do not teach the shared model (learning_allowed
+false): their /v1/feedback is answered and consumed but not learned, and the
+oracle's answers teach it only for the skill's own question (the router's
+route question is one). --learning-allowed gives them the router's
+behaviour; given explicitly, the value also reaches keys imported before.";
 
 /// `cortiq decision keys …` (spec §4.10, §4.15, §5b).
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
@@ -601,6 +607,11 @@ pub enum KeysCmd {
         /// Allow this key's undetermined questions to reach the oracle
         #[arg(long)]
         oracle_allowed: bool,
+        /// Allow this key to teach the shared model: its feedback, cold
+        /// starts of new labels, and the oracle's answers to its own
+        /// questions (default: no key teaches it)
+        #[arg(long)]
+        learning_allowed: bool,
         /// Print the created key as one JSON line
         #[arg(long)]
         json: bool,
@@ -658,6 +669,20 @@ pub enum KeysCmd {
             value_parser = clap::value_parser!(bool)
         )]
         oracle_allowed: Option<bool>,
+        /// Whether the imported keys may teach the shared model (feedback,
+        /// new labels, the oracle's answers to their own questions; default:
+        /// false for new keys; given explicitly, also for keys imported
+        /// before)
+        #[arg(
+            long,
+            requires = "from",
+            value_name = "BOOL",
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "true",
+            value_parser = clap::value_parser!(bool)
+        )]
+        learning_allowed: Option<bool>,
         /// Print the summary as one JSON object
         #[arg(long)]
         json: bool,
@@ -1273,6 +1298,7 @@ fn keys(cmd: &KeysCmd) -> Result<()> {
             credit_usd,
             oracle_budget_usd,
             oracle_allowed,
+            learning_allowed,
             json,
         } => {
             let (store, cfg) = key_store(at)?;
@@ -1287,6 +1313,7 @@ fn keys(cmd: &KeysCmd) -> Result<()> {
                 credit_usd: credit_usd.clone(),
                 oracle_budget_usd: oracle_budget_usd.clone(),
                 oracle_allowed: oracle_allowed.then_some(true),
+                learning_allowed: learning_allowed.then_some(true),
             };
             let created = store.create(&new, &cfg.auth.plans, now)?;
             if *json {
@@ -1323,8 +1350,8 @@ fn keys(cmd: &KeysCmd) -> Result<()> {
                 return Ok(());
             }
             println!(
-                "{:<12}  {:<24} {:<10} {:<7} {:>8} {:>10} {:>12}  oracle",
-                "hash12", "account", "plan", "state", "rate/min", "quota", "expires"
+                "{:<12}  {:<24} {:<10} {:<7} {:>8} {:>10} {:>12}  {:<8} learning",
+                "hash12", "account", "plan", "state", "rate/min", "quota", "expires", "oracle"
             );
             for r in &records {
                 let state = if !r.active {
@@ -1335,7 +1362,7 @@ fn keys(cmd: &KeysCmd) -> Result<()> {
                     "active"
                 };
                 println!(
-                    "{:<12}  {:<24} {:<10} {:<7} {:>8} {:>10} {:>12}  {}",
+                    "{:<12}  {:<24} {:<10} {:<7} {:>8} {:>10} {:>12}  {:<8} {}",
                     r.hash12(),
                     keys_mod::shown(&r.account),
                     keys_mod::shown(&r.plan),
@@ -1343,7 +1370,8 @@ fn keys(cmd: &KeysCmd) -> Result<()> {
                     r.rate_per_min,
                     r.decision_quota,
                     r.expires.map_or("never".to_string(), |e| e.to_string()),
-                    if r.oracle_allowed { "allowed" } else { "no" }
+                    if r.oracle_allowed { "allowed" } else { "no" },
+                    if r.learning_allowed { "allowed" } else { "no" }
                 );
             }
             println!("{} key(s) in {}", records.len(), store.path().display());
@@ -1369,6 +1397,7 @@ fn keys(cmd: &KeysCmd) -> Result<()> {
             format,
             usage,
             oracle_allowed,
+            learning_allowed,
             json,
         } => keys_import(
             at,
@@ -1377,6 +1406,7 @@ fn keys(cmd: &KeysCmd) -> Result<()> {
                 format: format.as_deref(),
                 usage: usage.as_deref(),
                 oracle_allowed: *oracle_allowed,
+                learning_allowed: *learning_allowed,
             },
             *json,
             now,
@@ -1391,6 +1421,8 @@ struct ImportArgs<'a> {
     usage: Option<&'a Path>,
     /// `--oracle-allowed[=BOOL]`.
     oracle_allowed: Option<bool>,
+    /// `--learning-allowed[=BOOL]`.
+    learning_allowed: Option<bool>,
 }
 
 /// `cortiq decision keys import` (spec §4.15). Every input is read and
@@ -1410,6 +1442,9 @@ fn keys_import(at: &KeyState, args: &ImportArgs<'_>, json: bool, now: u64) -> Re
             })?;
             if let Some(v) = args.oracle_allowed {
                 keys = keys.with_oracle_allowed(v);
+            }
+            if let Some(v) = args.learning_allowed {
+                keys = keys.with_learning_allowed(v);
             }
             Ok((p, keys))
         })
@@ -1515,6 +1550,28 @@ fn print_key_import(from: &Path, r: &ImportReport, keys_json: &Path) {
                 "withdrawn"
             },
             r.oracle_allowed
+        );
+    }
+    if r.imported > 0 {
+        println!(
+            "  new keys: teaching the model {}",
+            if r.learning_allowed {
+                "allowed (--learning-allowed)"
+            } else {
+                "not allowed: their feedback is answered but not learned (--learning-allowed to allow it)"
+            }
+        );
+    }
+    if r.learning_updated > 0 {
+        println!(
+            "  {} keys imported before: teaching the model {} (--learning-allowed={})",
+            r.learning_updated,
+            if r.learning_allowed {
+                "allowed"
+            } else {
+                "withdrawn"
+            },
+            r.learning_allowed
         );
     }
     if r.ignored_empty > 0 {

@@ -26,13 +26,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   add one to a file with every existing skill kept byte for byte, pre-train
   through the oracle on unlabelled texts, check hashes and the encoder golden.
 - `cortiq serve FILE` on a decision file (127.0.0.1:8080 by default): the
-  Jev / OpenRouter decisions protocol (`POST /api/alpha/decisions`,
-  `/v1/decisions`) with a `cmf` extension (skill, oracle consent, profile,
+  request/response shape of the Jev decisions API on OpenRouter (`POST
+  /api/alpha/decisions`, `/v1/decisions`; Cortiq Decision is not listed on
+  OpenRouter) with a `cmf` extension (skill, oracle consent, profile,
   explanation, rounding), skill matching (exact, subset, superset,
   untrained), `/v1/models`, `/v1/skills`, `/v1/usage`, `/v1/feedback` and an
-  admin API; API keys stored as sha256 only, plans, minute rate windows,
-  quotas and a usage ledger. Prices are 0 by default; oracle costs pass
-  through.
+  admin API; API keys stored as sha256 only (`keys.json` changed under
+  `keys.json.lock` by the CLI and the server alike), cortiq-router's plans
+  (keys expire after 30 days), minute rate windows, quotas and credit checked
+  before each request and before each input of a router batch, and a usage
+  ledger. The open mode reaches the oracle and teaches the model only with
+  `auth.require: false` set explicitly, never because of a loopback address
+  alone. Prices are 0 by default; oracle costs pass through.
 - The cortiq-router API (schema 1.1) on the same server with the router's
   keys, types and error envelope: `/v1/route`, `/v1/route:batch`,
   `/v1/feedback`, `/v1/taxonomies`, `/v1/usage`, `/v1/escalations`,
@@ -42,16 +47,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   import` takes the router's `api_keys` and `usage_counters` exports (or its
   `[[api_keys]]`), so existing keys keep working; `serve --shadow-of URL`
   (https, or plain http to a loopback address) answers router traffic from
-  the old router while deciding it locally and logging the agreement
-  (`GET /v1/admin/shadow`).
+  the old router, decides locally what it answered 200 (comparison slots of
+  its own, apart from `limits.max_inflight`) and logs the agreement with a
+  keyed HMAC of each text, never the text (`GET /v1/admin/shadow`).
 - Oracle cascade, off by default: only questions the gate rejects, or that no
   skill covers, go to an OpenRouter model (`deepseek/deepseek-v4.1-flash` by
-  default) after the consent checks, with a budget reserved before each call,
-  stop rules, PII redaction, a semantic cache and single flight.
-  Self-learning keeps examples as vectors, refits a label after 25 new ones,
-  promotes it only if it is not worse on a holdout, re-certifies the gate and
-  checks that no other label changed; cold start for new labels, feedback,
-  and generations with rollback.
+  default, `base_url` https or loopback http) after the consent checks, with
+  a budget reserved before each call, stop rules, PII redaction (numbers
+  also in spaced or dashed groups), a semantic cache and single flight scoped
+  by the question's contract. Self-learning keeps examples as vectors, refits
+  a label after 25 new ones, promotes it only if it is not worse on a
+  holdout, re-certifies the gate and checks that no other label's parameters
+  changed; cold start for new labels, feedback, and generations with
+  rollback. Only keys with `learning_allowed` (none by default) teach the
+  shared skills by feedback or by the oracle's answers to their own
+  questions; an answer to the skill's own question (`/v1/route`) teaches
+  whoever asked.
 - The published model `infosave/cortiq-decision` (304520292 bytes): skills
   `banking77`, `clinc150` and `massive` trained on train ∪ dev, with K 32, 16
   and 24 chosen by cross-validation. The card, `API.md` and `ORACLE.md` are
@@ -60,19 +71,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - `publish.yml` publishes `cortiq-decision` between `cortiq-engine` and
   `cortiq-net`, before the crates that depend on it.
+- The CMF reader refuses a file whose arch name starts with
+  `cortiq-decision-` without the DECISION feature bit (0x800), or the bit
+  without such a name; writers set the bit from the name.
+- `cortiq serve --shadow-of` drops ureq's DEBUG/TRACE log lines (they print
+  forwarded request headers) whatever `RUST_LOG` says; other commands keep
+  them.
 
 ### Performance and limits
 - Test sets against Jev 1.13's stored answers on the same rows (BANKING77 /
   CLINC150 / MASSIVE): all rows 93.34 / 96.18 / 86.15 % (Jev 85.58 / 96.76 /
   85.78 %; on CLINC150 Jev is ahead, p = 0.099); certified gate 97.24 /
-  98.70 / 97.89 % correct at 90.62 / 92.11 / 54.30 % coverage; with DeepSeek
-  V4.1 Flash on the abstentions 93.96 / 97.47 / 88.00 % at $3.09 / $3.56 /
-  $8.52 per 1M decisions (Jev $183.69 / $271.61 / $110.86). The same gate
-  rejected 864 of the 1000 out-of-scope CLINC150 queries.
+  98.70 / 97.89 % correct at 90.62 / 92.11 / 54.30 % coverage; served with
+  DeepSeek V4.1 Flash, the cache and self-learning 93.93 / 97.47 / 88.00 % at
+  $3.01 / $3.53 / $8.48 per 1M decisions (every abstention to DeepSeek, no
+  cache: 93.96 / 97.47 / 88.00 % at $3.09 / $3.56 / $8.52; Jev $183.69 /
+  $271.61 / $110.86). The same gate rejected 864 of the 1000 out-of-scope
+  CLINC150 queries.
 - Text → decision on one Apple M4 thread: p50 3.92 / 3.79 / 3.00 ms.
-- In one pass over the test sets self-learning saved 35 of 2003 oracle calls
-  (1.75 %): a label is refitted only after 25 examples. Pre-training on
-  unlabelled dev texts was about neutral.
+- In one pass over the test sets the cache and self-learning together saved
+  35 of 2003 oracle calls (1.75 %): 21 cache hits (1.05 %) and 14 questions
+  answered locally after 16 promotions on MASSIVE (0.70 %); a label is
+  refitted only after 25 examples. Pre-training on unlabelled dev texts was
+  about neutral.
 - The benchmarks are public and were reused; Jev got label names and two
   examples per label. The encoder is English, the gate is certified
   in-domain, and speed was measured on macOS arm64 only.
