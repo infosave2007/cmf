@@ -30,8 +30,10 @@
 //!   counted across runs) is written to `oracle.state` and keeps the oracle
 //!   off for every later run on that directory until `--oracle-resume`; an
 //!   interrupted run releases the `LOCK` (SIGINT, SIGTERM, SIGHUP; a signal
-//!   inherited as ignored, as SIGHUP under `nohup`, stays ignored), and
-//!   `--break-lock` removes one left by a process that is gone;
+//!   inherited as ignored, as SIGHUP under `nohup`, stays ignored), and one
+//!   left by a process that is gone (killed, crashed) is taken over by the
+//!   next run (`--break-lock` only where the filesystem has no advisory
+//!   locks);
 //! * `cortiq decision oracle check [--model M] [--key-env VAR] [--base-url
 //!   URL] [--max-price IN,OUT] [--test-call] [--json]`: is the oracle ready —
 //!   the key, the account (`GET /auth/key`), the model's endpoints, and with
@@ -292,7 +294,9 @@ pub struct ServeFlags {
     pub decision_config: Option<PathBuf>,
     /// `--state DIR` (spec §4.14; default `<FILE>.state` or `state_dir`).
     pub state: Option<PathBuf>,
-    /// `--break-lock`: remove a state `LOCK` left by a dead process (spec §4.11).
+    /// `--break-lock`: remove a state `LOCK` left by a dead process where the
+    /// filesystem has no advisory locks (elsewhere such a `LOCK` is taken over
+    /// without it; spec §4.11).
     pub break_lock: bool,
     /// `--shadow-of URL`: shadow mode of the router API (spec §4.15).
     pub shadow_of: Option<String>,
@@ -515,9 +519,10 @@ pub struct DecideOracleArgs {
     /// {"enabled":true} on a server of that directory
     #[arg(long, requires = "oracle")]
     pub oracle_resume: bool,
-    /// With --oracle: remove the state directory's LOCK left by a process
-    /// that is no longer running (an interrupted run); the LOCK of a running
-    /// process is never removed
+    /// With --oracle, where the state directory's filesystem has no advisory
+    /// locks: remove its LOCK left by a process that is no longer running (an
+    /// interrupted run). Elsewhere such a LOCK is taken over without it; the
+    /// LOCK of a running process is never removed
     #[arg(long, requires = "oracle")]
     pub break_lock: bool,
 }
@@ -697,113 +702,35 @@ fn off_text(st: &OracleState, key_env: &str, model: &str) -> String {
     }
 }
 
-/// Whether process `pid` runs on this host (`None`: cannot tell).
-#[cfg(unix)]
-fn pid_running(pid: &str) -> Option<bool> {
-    let pid: libc::pid_t = pid.parse().ok().filter(|p| *p > 0)?;
-    // SAFETY: signal 0 sends nothing; it only checks that the process exists.
-    if unsafe { libc::kill(pid, 0) } == 0 {
-        return Some(true);
-    }
-    match std::io::Error::last_os_error().raw_os_error() {
-        Some(libc::ESRCH) => Some(false),
-        Some(libc::EPERM) => Some(true),
-        _ => None,
-    }
-}
-
-#[cfg(not(unix))]
-fn pid_running(_pid: &str) -> Option<bool> {
-    None
-}
-
-/// The pid of a `LOCK`'s content (`pid nonce`).
-fn lock_pid(content: &str) -> String {
-    content
-        .split_whitespace()
-        .next()
-        .unwrap_or("unknown")
-        .to_string()
-}
-
-/// "If pid N is not a cortiq process …, remove LOCK by hand".
-fn remove_by_hand(dir: &StateDir, pid: &str) -> String {
-    format!(
-        "If pid {pid} is not a cortiq process (a LOCK left by a crash whose pid was reused), no \
-         cortiq process uses the directory: remove {} by hand",
-        dir.lock_path().display()
-    )
-}
-
 /// The state directory's `LOCK` for `cortiq decide --oracle`: one process per
-/// directory keeps the oracle's budget exact. `--break-lock` removes a lock
-/// whose process is gone — only the one it checked, so two runs breaking the
-/// same stale lock never both proceed — and never one of a running process;
-/// a refusal says which case it is and what to do.
+/// directory keeps the oracle's budget exact. A `LOCK` whose process is gone
+/// (an interrupted or killed run, a crashed server) is taken over with a
+/// warning; the lock of a running process is never broken. Where the
+/// filesystem has no advisory locks the file alone says the directory is
+/// taken, and `--break-lock` removes it — only the lock it found, so two runs
+/// breaking the same stale lock never both proceed.
 fn take_lock(dir: &StateDir, break_lock: bool) -> Result<StateLock> {
-    let stale = if break_lock {
-        std::fs::read_to_string(dir.lock_path()).ok()
-    } else {
-        None
-    };
-    let holder = stale.as_deref().map(lock_pid);
-    if let Some(pid) = &holder
-        && pid_running(pid) == Some(true)
-    {
-        bail!(
-            "--break-lock: the LOCK of state directory {} belongs to pid {pid}, which is running \
-             (a `cortiq serve`, or another `cortiq decide --oracle`); it is not removed. Stop that \
-             process, or give this run a directory of its own with --state DIR. {}",
-            dir.root().display(),
-            remove_by_hand(dir, pid)
-        );
-    }
-    if stale.as_deref().is_some_and(|c| c.trim().is_empty()) {
-        bail!(
-            "--break-lock: the LOCK of state directory {} is empty — a process may be taking it \
-             right now; it is not removed. If no cortiq process uses the directory, remove {} by \
-             hand",
-            dir.root().display(),
-            dir.lock_path().display()
-        );
-    }
-    let taken = match &stale {
-        Some(content) => dir.lock_replacing(content),
-        None => dir.lock(false),
-    };
-    match taken {
-        Ok(lock) => {
-            if let Some(pid) = holder {
-                eprintln!(
-                    "warning: removed the LOCK of state directory {} left by pid {pid}, which is not running (--break-lock)",
-                    dir.root().display()
-                );
-            }
-            Ok(lock)
-        }
-        Err(e) => Err(match e.downcast_ref::<Locked>() {
-            Some(l) => match pid_running(&l.pid) {
-                Some(false) => anyhow::anyhow!(
-                    "state directory {} has a LOCK left by pid {}, which is no longer running (an \
-                     interrupted run): pass --break-lock to remove it, or give this run a directory \
-                     of its own with --state DIR",
-                    l.dir,
-                    l.pid
-                ),
-                _ => anyhow::anyhow!(
-                    "state directory {} is held by pid {} (a running `cortiq serve`, or another \
-                     `cortiq decide --oracle`): one process per state directory keeps the oracle's \
-                     budget exact. Ask that server (POST /v1/decisions), wait for that run, or give \
-                     this run a directory of its own with --state DIR. A LOCK left by a process that \
-                     is gone is removed with --break-lock. {}",
-                    l.dir,
-                    l.pid,
-                    remove_by_hand(dir, &l.pid)
-                ),
-            },
+    dir.lock(break_lock)
+        .map_err(|e| match e.downcast_ref::<Locked>() {
+            Some(l) if l.held => anyhow::anyhow!(
+                "state directory {} is held by pid {} (a running `cortiq serve`, or another \
+                 `cortiq decide --oracle`): one process per state directory keeps the oracle's \
+                 budget exact. Ask that server (POST /v1/decisions), wait for that run, or give \
+                 this run a directory of its own with --state DIR",
+                l.dir,
+                l.pid
+            ),
+            Some(l) => anyhow::anyhow!(
+                "state directory {} has a LOCK of pid {} ({}), and its filesystem has no advisory \
+                 locks, so a LOCK left by an interrupted run stays there: if that process is \
+                 gone, pass --break-lock to remove it; else wait for it, or give this run a \
+                 directory of its own with --state DIR",
+                l.dir,
+                l.pid,
+                l.lock
+            ),
             None => e,
-        }),
-    }
+        })
 }
 
 /// Whether `sig` is ignored (`SIG_IGN`) in this process: inherited from

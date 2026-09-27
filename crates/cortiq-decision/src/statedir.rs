@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! <state>/            mode 0700
-//!   LOCK              pid and a random nonce; created with O_EXCL (one serving process)
+//!   LOCK              pid and a random nonce; flock(2)-held by the one serving process
 //!   keys.json         API key records (sha256 of the key only), atomic replace
 //!   keys.json.lock    held (O_EXCL) by any process while it changes keys.json
 //!   usage/            YYYY-MM.jsonl usage ledger + totals.json snapshot
@@ -16,10 +16,21 @@
 //! ```
 //!
 //! [`StateDir::open`] only creates the layout; a serving process also takes the
-//! [`StateLock`] ([`StateDir::lock`]). A second lock attempt on the same
-//! directory fails with the holder's pid until the lock is dropped;
+//! [`StateLock`] ([`StateDir::lock`]): an advisory `flock(2)` on `LOCK`, held
+//! for the life of the guard, with `pid nonce` in the file to name the holder.
+//! The kernel drops a flock when its process ends, however it ends (SIGKILL
+//! after a stop timeout, an out-of-memory kill, a crash of the host), so a
+//! `LOCK` no process holds is stale: the next lock attempt takes it over and
+//! warns with the pid it was left by. No pid check is involved (in a
+//! container the server is always pid 1, so a pid could never tell). A second
+//! lock attempt fails with the holder's pid while the holder runs; a held lock
+//! is never broken. Where the filesystem has no advisory locks (Windows, some
+//! network mounts) the file alone (`O_EXCL`) says the directory is taken, and
 //! `--break-lock` ([`StateDir::lock`] with `break_lock`) removes a lock left by
-//! a dead process. Key management from the CLI writes `keys.json` atomically
+//! a dead process. Versions up to 0.7.8 only create the file: one of them
+//! refuses a directory while a newer process holds it, but a newer process
+//! takes over from a running old one: do not run the two on one directory at
+//! the same time. Key management from the CLI writes `keys.json` atomically
 //! without the `LOCK`, under `keys.json.lock` like the server's own key
 //! changes (neither writes back a file the other changed in between); a
 //! server picks the new file up by its mtime
@@ -30,10 +41,13 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Read, Write};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 pub const LOCK_FILE: &str = "LOCK";
+/// Lock attempts before giving up on a `LOCK` that keeps being removed and
+/// created again under this process.
+const LOCK_ATTEMPTS: usize = 8;
 pub const KEYS_FILE: &str = "keys.json";
 pub const USAGE_DIR: &str = "usage";
 pub const ORACLE_LEDGER_FILE: &str = "oracle.jsonl";
@@ -42,11 +56,16 @@ pub const LEARN_LOG_FILE: &str = "learn.log";
 pub const GENERATIONS_DIR: &str = "generations";
 pub const CURRENT_FILE: &str = "CURRENT";
 
-/// A held state directory lock: removed on drop (only while it is still ours).
+/// A held state directory lock: the `flock` on `LOCK` lasts as long as this
+/// guard, and at most as long as the process; the file is removed on drop
+/// (only while it is still ours).
 #[derive(Debug)]
 pub struct StateLock {
     path: PathBuf,
     content: String,
+    /// The open `LOCK`, whose flock is the lock: closed only after the file
+    /// is removed (fields drop after [`Drop::drop`]).
+    _file: File,
 }
 
 impl StateLock {
@@ -92,14 +111,107 @@ impl LockRelease {
 }
 
 /// Why the lock could not be taken.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error(
-    "state directory {dir} is locked by pid {pid} ({lock}); one process per state directory — stop it, or remove a stale lock with --break-lock"
-)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Locked {
     pub dir: String,
     pub lock: String,
     pub pid: String,
+    /// A running process holds the lock's flock: it is never broken. `false`
+    /// where the filesystem has no advisory locks and the file alone says the
+    /// directory is taken (`--break-lock` removes it there).
+    pub held: bool,
+}
+
+impl std::fmt::Display for Locked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self { dir, lock, pid, .. } = self;
+        if self.held {
+            write!(
+                f,
+                "state directory {dir} is locked by pid {pid} ({lock}), a running process that holds it; one process per state directory — stop that process first (a held lock is never broken, --break-lock included)"
+            )
+        } else {
+            write!(
+                f,
+                "state directory {dir} is locked by pid {pid} ({lock}); one process per state directory — stop it, or remove a stale lock with --break-lock (the directory's filesystem has no advisory locks, so a lock left by a crash stays until then)"
+            )
+        }
+    }
+}
+
+impl std::error::Error for Locked {}
+
+/// What a lock attempt may remove where the filesystem has no advisory locks
+/// and the `LOCK` file alone says the directory is taken.
+#[derive(Clone, Copy, Debug)]
+enum Break<'a> {
+    No,
+    /// `--break-lock`: the lock found there.
+    Found,
+    /// The stale lock the caller checked (its content).
+    Checked(&'a str),
+}
+
+/// Take an exclusive `flock(2)` on `file` without waiting: `Ok(true)` taken,
+/// `Ok(false)` another open `LOCK` holds it, `Err` when the filesystem (or
+/// the platform) has no advisory locks.
+#[cfg(unix)]
+fn try_flock(file: &File) -> std::io::Result<bool> {
+    use std::os::unix::io::AsRawFd;
+    loop {
+        // SAFETY: flock(2) on a descriptor `file` owns; it only changes the
+        // lock of that open file description.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(true);
+        }
+        let e = std::io::Error::last_os_error();
+        match e.raw_os_error() {
+            Some(c) if c == libc::EWOULDBLOCK || c == libc::EAGAIN => return Ok(false),
+            Some(libc::EINTR) => {}
+            _ => return Err(e),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn try_flock(_file: &File) -> std::io::Result<bool> {
+    Err(std::io::Error::from(ErrorKind::Unsupported))
+}
+
+/// Whether `path` still names the file `file` has open: a `LOCK` removed (its
+/// holder released it) or replaced between the open and the flock is a lock
+/// no other process sees.
+#[cfg(unix)]
+fn still_named(path: &Path, file: &File) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let open = file.metadata()?;
+    match fs::metadata(path) {
+        Ok(m) => Ok(m.dev() == open.dev() && m.ino() == open.ino()),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(not(unix))]
+fn still_named(_path: &Path, _file: &File) -> std::io::Result<bool> {
+    Ok(true)
+}
+
+/// Replace the whole content of the open `LOCK` with `content`, durably.
+fn write_lock(file: &mut File, content: &str) -> std::io::Result<()> {
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(content.as_bytes())?;
+    file.sync_all()
+}
+
+/// The pid of a `LOCK`'s content (`pid nonce`), `unknown` when empty.
+fn holder_pid(content: &str) -> String {
+    content
+        .split_whitespace()
+        .next()
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 /// The served generation named by `CURRENT`.
@@ -247,55 +359,139 @@ impl StateDir {
         &self.root
     }
 
-    /// Take the exclusive `LOCK` (O_EXCL, content `pid nonce`). With
-    /// `break_lock` an existing lock is removed first (its holder is reported
-    /// by the caller as broken).
+    /// Take the exclusive `LOCK`: its `flock`, content `pid nonce`. A `LOCK`
+    /// no process holds (its process ended without removing it) is taken over
+    /// with a warning naming the pid it was left by; one a running process
+    /// holds fails with [`Locked`] (`held`), whatever `break_lock` says. Where
+    /// the filesystem has no advisory locks the file is created with `O_EXCL`
+    /// and an existing one fails with [`Locked`] (not `held`), unless
+    /// `break_lock` removes it first (only while it still holds what was
+    /// found, see [`StateDir::lock_replacing`]).
     pub fn lock(&self, break_lock: bool) -> Result<StateLock> {
-        let path = self.lock_path();
-        let content = format!("{} {}\n", std::process::id(), nonce()?);
-        for attempt in 0..2 {
-            match create_new_private(&path) {
-                Ok(mut f) => {
-                    f.write_all(content.as_bytes())
-                        .and_then(|()| f.sync_all())
-                        .with_context(|| format!("write {}", path.display()))?;
-                    sync_dir(&self.root)?;
-                    return Ok(StateLock { path, content });
-                }
-                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-                    if break_lock && attempt == 0 {
-                        fs::remove_file(&path)
-                            .with_context(|| format!("remove {}", path.display()))?;
-                        continue;
-                    }
-                    let mut holder = String::new();
-                    let _ = File::open(&path).and_then(|mut f| f.read_to_string(&mut holder));
-                    let pid = holder
-                        .split_whitespace()
-                        .next()
-                        .unwrap_or("unknown")
-                        .to_string();
-                    return Err(Locked {
-                        dir: self.root.display().to_string(),
-                        lock: path.display().to_string(),
-                        pid,
-                    }
-                    .into());
-                }
-                Err(e) => return Err(e).with_context(|| format!("create {}", path.display())),
-            }
-        }
-        bail!("could not take {} after breaking it", path.display())
+        let b = if break_lock { Break::Found } else { Break::No };
+        self.take(b, try_flock)
     }
 
-    /// Take the `LOCK` in place of the stale one the caller checked, whose
-    /// content was `stale`: that lock is removed only while the file still
-    /// holds `stale`, so a lock another process took meanwhile (two runs
-    /// breaking the same stale lock at once) is never removed — this call
-    /// then fails with [`Locked`] for it. The file is moved aside by an atomic
-    /// rename before its content is compared; a lock that is not the stale
-    /// one is put back without replacing a newer one.
+    /// [`StateDir::lock`] in place of the stale lock the caller checked, whose
+    /// content was `stale`. With advisory locks this is `lock(false)`: a lock
+    /// no process holds is stale whatever it says. Without them the file is
+    /// removed only while it still holds `stale`, so a lock another process
+    /// took meanwhile (two runs breaking the same stale lock at once) is never
+    /// removed — this call then fails with [`Locked`] for it.
     pub fn lock_replacing(&self, stale: &str) -> Result<StateLock> {
+        self.take(Break::Checked(stale), try_flock)
+    }
+
+    /// [`StateDir::lock`] with the flock primitive given (tests stand in for
+    /// a filesystem without advisory locks).
+    fn take(&self, brk: Break<'_>, flock: fn(&File) -> std::io::Result<bool>) -> Result<StateLock> {
+        let path = self.lock_path();
+        let content = format!("{} {}\n", std::process::id(), nonce()?);
+        let mut broken = false;
+        for _ in 0..LOCK_ATTEMPTS {
+            let (mut file, created) = match create_new_private(&path) {
+                Ok(f) => (f, true),
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                    match OpenOptions::new().read(true).write(true).open(&path) {
+                        Ok(f) => (f, false),
+                        // Removed in between (its holder released it): again.
+                        Err(e) if e.kind() == ErrorKind::NotFound => continue,
+                        Err(e) => {
+                            return Err(e).with_context(|| format!("open {}", path.display()));
+                        }
+                    }
+                }
+                Err(e) => return Err(e).with_context(|| format!("create {}", path.display())),
+            };
+            match flock(&file) {
+                Ok(true) => {
+                    if !still_named(&path, &file)
+                        .with_context(|| format!("stat {}", path.display()))?
+                    {
+                        continue;
+                    }
+                    let mut left = String::new();
+                    if !created {
+                        let _ = file.read_to_string(&mut left);
+                    }
+                    write_lock(&mut file, &content)
+                        .with_context(|| format!("write {}", path.display()))?;
+                    sync_dir(&self.root)?;
+                    if !left.trim().is_empty() {
+                        tracing::warn!(
+                            lock = %path.display(),
+                            "took over the LOCK of state directory {} left by pid {}, which ended without releasing it (killed, out of memory or a crash)",
+                            self.root.display(),
+                            holder_pid(&left)
+                        );
+                    }
+                    return Ok(StateLock {
+                        path,
+                        content,
+                        _file: file,
+                    });
+                }
+                Ok(false) => return Err(self.locked(true).into()),
+                Err(no_locks) => {
+                    // No advisory locks here: the file alone (O_EXCL) says
+                    // the directory is taken.
+                    if created {
+                        write_lock(&mut file, &content)
+                            .with_context(|| format!("write {}", path.display()))?;
+                        sync_dir(&self.root)?;
+                        if cfg!(unix) {
+                            tracing::warn!(
+                                lock = %path.display(),
+                                "no advisory lock on the LOCK of state directory {} ({no_locks}): a LOCK left by a crash stays until --break-lock removes it",
+                                self.root.display()
+                            );
+                        }
+                        return Ok(StateLock {
+                            path,
+                            content,
+                            _file: file,
+                        });
+                    }
+                    drop(file);
+                    let stale = match brk {
+                        Break::No => None,
+                        Break::Found => Some(fs::read_to_string(&path).unwrap_or_default()),
+                        Break::Checked(s) => Some(s.to_string()),
+                    };
+                    match stale {
+                        Some(stale) if !broken => {
+                            broken = true;
+                            self.remove_if_still(&stale)?;
+                        }
+                        _ => return Err(self.locked(false).into()),
+                    }
+                }
+            }
+        }
+        bail!(
+            "could not take {}: it was removed and created again {LOCK_ATTEMPTS} times while this process tried",
+            path.display()
+        )
+    }
+
+    /// [`Locked`] with the pid the `LOCK` names now.
+    fn locked(&self, held: bool) -> Locked {
+        let path = self.lock_path();
+        let mut holder = String::new();
+        let _ = File::open(&path).and_then(|mut f| f.read_to_string(&mut holder));
+        Locked {
+            dir: self.root.display().to_string(),
+            lock: path.display().to_string(),
+            pid: holder_pid(&holder),
+            held,
+        }
+    }
+
+    /// Remove the `LOCK` only while it holds `stale` (a filesystem without
+    /// advisory locks). The file is moved aside by an atomic rename before
+    /// its content is compared; a lock that is not the stale one is put back
+    /// without replacing a newer one.
+    fn remove_if_still(&self, stale: &str) -> Result<()> {
         let path = self.lock_path();
         let aside = self.root.join(format!("{LOCK_FILE}.breaking-{}", nonce()?));
         match fs::rename(&path, &aside) {
@@ -321,7 +517,7 @@ impl StateDir {
             Err(e) if e.kind() == ErrorKind::NotFound => {}
             Err(e) => return Err(e).with_context(|| format!("move aside {}", path.display())),
         }
-        self.lock(false)
+        Ok(())
     }
 
     pub fn lock_path(&self) -> PathBuf {
@@ -445,5 +641,64 @@ mod tests {
         assert_eq!(parse_generation_name("g00007"), None);
         assert_eq!(parse_generation_name("g0000007"), None);
         assert_eq!(parse_generation_name("x000007"), None);
+    }
+
+    /// A filesystem without advisory locks.
+    fn no_flock(_: &File) -> std::io::Result<bool> {
+        Err(std::io::Error::from(ErrorKind::Unsupported))
+    }
+
+    #[test]
+    fn without_advisory_locks_the_file_alone_is_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = StateDir::open(dir.path().join("st")).unwrap();
+        let aside = || {
+            fs::read_dir(s.root())
+                .unwrap()
+                .filter(|e| {
+                    e.as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("LOCK.")
+                })
+                .count()
+        };
+        let l1 = s.take(Break::No, no_flock).unwrap();
+        let held = fs::read_to_string(s.lock_path()).unwrap();
+        let e = s.take(Break::No, no_flock).unwrap_err();
+        let l = e.downcast_ref::<Locked>().unwrap();
+        assert!(!l.held && l.pid == std::process::id().to_string(), "{l:?}");
+        assert!(format!("{e:#}").contains("--break-lock"), "{e:#}");
+        // Breaking only the lock that was checked: a stale content that is no
+        // longer the file's leaves the lock in place and fails with its holder.
+        let e = s
+            .take(Break::Checked("99999999 0123abcd\n"), no_flock)
+            .unwrap_err();
+        assert!(e.downcast_ref::<Locked>().is_some(), "{e:#}");
+        assert_eq!(fs::read_to_string(s.lock_path()).unwrap(), held);
+        assert_eq!(aside(), 0, "nothing is left aside");
+        // --break-lock takes it over; the old guard does not remove the new lock.
+        let l2 = s.take(Break::Found, no_flock).unwrap();
+        drop(l1);
+        assert!(
+            s.lock_path().exists(),
+            "the broken guard removed the new lock"
+        );
+        assert!(s.take(Break::No, no_flock).is_err());
+        drop(l2);
+        assert!(!s.lock_path().exists());
+        // The checked stale lock is replaced.
+        fs::write(s.lock_path(), "99999999 0123abcd\n").unwrap();
+        let l3 = s
+            .take(Break::Checked("99999999 0123abcd\n"), no_flock)
+            .unwrap();
+        assert_ne!(
+            fs::read_to_string(s.lock_path()).unwrap(),
+            "99999999 0123abcd\n"
+        );
+        drop(l3);
+        assert!(!s.lock_path().exists());
+        assert_eq!(aside(), 0, "nothing is left aside");
     }
 }

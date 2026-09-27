@@ -21,7 +21,8 @@
 //!   guard;
 //! * usage ledger: append, replay, snapshot + tail, month files, a cut partial
 //!   line, a refused corrupt line, the background flusher;
-//! * the state directory `LOCK` is exclusive; `CURRENT` round-trips.
+//! * the state directory `LOCK` is exclusive while held, a stale one is taken
+//!   over; `CURRENT` round-trips.
 
 #[path = "common/toy_dir.rs"]
 mod toy_dir;
@@ -45,7 +46,7 @@ use cortiq_decision::service::{
     LoadedModel, ModelHandle, Observation, OracleUsage, Principal, RefusalReason, Resolution,
     Resolved,
 };
-use cortiq_decision::statedir::{Current, StateDir};
+use cortiq_decision::statedir::{Current, Locked, StateDir};
 use serde_json::{Map, Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1837,38 +1838,51 @@ fn state_lock_is_exclusive() {
         assert_eq!(mode, 0o700);
     }
     assert!(s.usage_dir().is_dir() && s.generations_dir().is_dir());
+    let me = std::process::id().to_string();
     let lock = s.lock(false).unwrap();
+    let held = std::fs::read_to_string(s.lock_path()).unwrap();
+    assert!(held.starts_with(&format!("{me} ")), "{held}");
     let e = s.lock(false).unwrap_err();
     let msg = format!("{e:#}");
     assert!(
-        msg.contains(&std::process::id().to_string()) && msg.contains("--break-lock"),
+        msg.contains(&me) && msg.contains("a running process that holds it"),
         "{msg}"
     );
-    // Another handle on the same directory is refused too.
+    assert!(e.downcast_ref::<Locked>().is_some_and(|l| l.held), "{msg}");
+    // Another handle on the same directory is refused too (the flock belongs
+    // to the open LOCK, not to the process), and a held lock is never
+    // broken: not by --break-lock, not as a checked stale one.
     let s2 = StateDir::open(s.root()).unwrap();
     assert!(s2.lock(false).is_err());
+    assert!(s2.lock(true).is_err());
+    assert!(s2.lock_replacing(&held).is_err());
+    assert_eq!(std::fs::read_to_string(s.lock_path()).unwrap(), held);
     drop(lock);
     assert!(!s.lock_path().exists());
-    let l2 = s2.lock(false).unwrap();
-    // --break-lock takes it over; the old guard does not remove the new lock.
-    let l3 = s.lock(true).unwrap();
-    drop(l2);
-    assert!(
-        s.lock_path().exists(),
-        "the broken guard must not remove the new lock"
-    );
-    assert!(s.lock(false).is_err());
-    // Breaking only the lock that was checked: a stale content that is no
-    // longer the file's (another run broke it and took the lock first)
-    // leaves the new lock in place and fails with its holder.
-    let held = std::fs::read_to_string(s.lock_path()).unwrap();
-    let e = s.lock_replacing("99999999 0123abcd\n").unwrap_err();
-    assert!(
-        e.downcast_ref::<cortiq_decision::statedir::Locked>()
-            .is_some(),
-        "{e:#}"
-    );
-    assert_eq!(std::fs::read_to_string(s.lock_path()).unwrap(), held);
+    // A LOCK no process holds is stale whatever it says, and is taken over:
+    // pid 1 (the server of a container restarted after a SIGKILL — pid 1
+    // again, so no pid check could tell), this very pid, an empty file.
+    for stale in [
+        "1 0123abcd\n".to_string(),
+        format!("{me} 0123abcd\n"),
+        String::new(),
+    ] {
+        std::fs::write(s.lock_path(), &stale).unwrap();
+        let l = s.lock(false).unwrap();
+        let now = std::fs::read_to_string(s.lock_path()).unwrap();
+        assert!(now != stale && now.starts_with(&format!("{me} ")), "{now}");
+        assert!(s2.lock(false).is_err(), "taken over and held");
+        drop(l);
+        assert!(!s.lock_path().exists());
+    }
+    // lock_replacing: the stale lock is taken whatever content was checked;
+    // with no lock at all, it is taken.
+    std::fs::write(s.lock_path(), "99999999 0123abcd\n").unwrap();
+    let l4 = s.lock_replacing("another content\n").unwrap();
+    drop(l4);
+    let l5 = s.lock_replacing("99999999 0123abcd\n").unwrap();
+    drop(l5);
+    assert!(!s.lock_path().exists());
     assert_eq!(
         std::fs::read_dir(s.root())
             .unwrap()
@@ -1882,19 +1896,6 @@ fn state_lock_is_exclusive() {
         0,
         "nothing is left aside"
     );
-    drop(l3);
-    assert!(!s.lock_path().exists());
-    // The checked stale lock is replaced; with no lock at all, it is taken.
-    std::fs::write(s.lock_path(), "99999999 0123abcd\n").unwrap();
-    let l4 = s.lock_replacing("99999999 0123abcd\n").unwrap();
-    assert_ne!(
-        std::fs::read_to_string(s.lock_path()).unwrap(),
-        "99999999 0123abcd\n"
-    );
-    drop(l4);
-    let l5 = s.lock_replacing("99999999 0123abcd\n").unwrap();
-    drop(l5);
-    assert!(!s.lock_path().exists());
     // CURRENT and generations.
     assert_eq!(s.read_current().unwrap(), None);
     let c = Current {
