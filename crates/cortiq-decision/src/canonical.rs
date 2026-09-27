@@ -98,7 +98,8 @@ pub const MAX_DEPTH: usize = 128;
 /// Parse JSON text (RFC 8259, UTF-8) into a [`Value`] with correctly rounded
 /// floats (see the module notes). Integers that fit `u64`/`i64` stay integers,
 /// `-0` is the integer 0, a duplicate key keeps its last value, trailing
-/// non-whitespace is an error.
+/// non-whitespace is an error. An error reads `not valid JSON: <what> at byte
+/// N` (or `not UTF-8 JSON: …`), for a caller to name the input before it.
 pub fn parse(bytes: &[u8]) -> anyhow::Result<Value> {
     let text = std::str::from_utf8(bytes).map_err(|e| anyhow::anyhow!("not UTF-8 JSON: {e}"))?;
     let mut p = Parser {

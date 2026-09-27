@@ -949,8 +949,9 @@ pub fn parse_feedback(body: &[u8], limits: &RequestLimits) -> Result<FeedbackReq
 
 /// Parse JSON (correctly rounded floats) and refuse a duplicate object key.
 pub fn parse_json(body: &[u8]) -> Result<Value, ApiError> {
-    let v = canonical::parse(body)
-        .map_err(|e| ApiError::invalid(format!("the body is not valid JSON: {e}")))?;
+    // The parser's error already says what is wrong ("not valid JSON: … at
+    // byte N", "not UTF-8 JSON: …"): named as the body's, said once.
+    let v = canonical::parse(body).map_err(|e| ApiError::invalid(format!("the body is {e}")))?;
     if let Some((path, key)) = find_duplicate_key(body) {
         let at = if path.is_empty() {
             "the top-level object".to_string()
