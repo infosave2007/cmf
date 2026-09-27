@@ -23,7 +23,9 @@
 //!    flag and an untrained one fails the request (422, 502 or 503). A
 //!    trained question refused because the oracle is not ready (flags
 //!    `oracle_disabled`, `no_key`, `budget`, `stopped`) also gives the answer
-//!    one line `cmf.hint` saying what to do ([`oracle_hint`]; logged at most
+//!    one line `cmf.hint` saying what to do ([`oracle_hint`]: an admin limit
+//!    of `oracle.state` that binds is named with the admin request that
+//!    lifts it, [`AdminBinding::server_text`]; logged at most
 //!    once a minute per hint, once per process at INFO on a server without
 //!    an oracle, [`DecisionService::log_oracle_hint`]);
 //! 6. the response, the metering (spec §4.9) and one usage-ledger record are
@@ -474,20 +476,151 @@ pub enum OracleStatus {
     Disabled { by_admin: bool },
     /// Something was spent or reserved, and what is left of the budget
     /// (global or the admin's) cannot hold even the smallest possible call,
-    /// or a call it refused, or `max_calls` calls were made.
-    BudgetExhausted,
+    /// or a call it refused, or `max_calls` calls were made. `admin`: an
+    /// admin limit of `oracle.state` is among what refuses the next call.
+    BudgetExhausted { admin: Option<AdminBinding> },
     /// Nothing was spent, and the budget cannot hold even one call, or
     /// `max_calls` is 0. `min_usd` (`Some` only when the budget is short):
     /// the least budget a call needs — the smallest possible call's
     /// reservation, or, once the budget refused a real (longer) call, the
     /// smallest such refusal's. `calls_zero`: `max_calls` is 0 (no call is
-    /// allowed whatever the budget).
+    /// allowed whatever the budget). `admin`: an admin limit of
+    /// `oracle.state` is among what refuses the call.
     BudgetTooSmall {
         min_usd: Option<f64>,
         calls_zero: bool,
+        admin: Option<AdminBinding>,
     },
-    /// A stop rule switched it off (the reason of `oracle.state`).
+    /// A stop rule switched it off (the reason of `oracle.state`, a code of
+    /// the closed set: [`crate::oracle::shown_code`]).
     Stopped(String),
+}
+
+/// An admin limit of `oracle.state` (`budget_usd` or `max_calls`, set by
+/// `POST /v1/admin/oracle`) that refuses the oracle's next call. The file
+/// keeps it across restarts, so a larger `--oracle-budget` or
+/// `--oracle-max-calls` alone cannot lift it; the admin API takes values up
+/// to the configured limits ([`AdminBinding::server_text`] words both).
+#[derive(Clone, Debug, PartialEq)]
+pub struct AdminBinding {
+    /// `max_calls` of `oracle.state`, when the calls made reach it.
+    pub max_calls: Option<u64>,
+    /// `budget_usd` of `oracle.state` (USD), when it cannot hold the next
+    /// call.
+    pub budget_usd: Option<f64>,
+    /// The configured call limit (`--oracle-max-calls`, `oracle.max_calls`).
+    pub configured_max_calls: u64,
+    /// The configured budget (`--oracle-budget`, `oracle.budget_usd`), USD.
+    pub configured_budget_usd: f64,
+    /// The least call limit that admits the next call: the calls made + 1.
+    pub need_calls: u64,
+    /// The least budget that admits the next call (USD): what was spent and
+    /// the call's reservation.
+    pub need_usd: f64,
+    /// `need_usd` counts the smallest possible call (no real one was
+    /// refused yet): a longer question needs more.
+    pub need_is_smallest: bool,
+}
+
+/// `x` rounded up to the micro-dollar as a JSON number for the admin API
+/// (`0.00179`), [`crate::oracle_setup::usd_ceil`] without its `$`.
+fn usd_ceil_number(x: f64) -> String {
+    let s = crate::oracle_setup::usd_ceil(x);
+    s.strip_prefix('$').unwrap_or(&s).to_string()
+}
+
+impl AdminBinding {
+    /// The configured call limit is reached too.
+    pub fn configured_calls_out(&self) -> bool {
+        self.need_calls > self.configured_max_calls
+    }
+
+    /// The configured budget cannot hold the next call either.
+    pub fn configured_budget_short(&self) -> bool {
+        self.need_usd > self.configured_budget_usd
+    }
+
+    /// What refuses the next call and how a server's operator lifts it, for
+    /// the decisions-API hint and the startup line (`file`: where
+    /// `oracle.state` is, in words or as a path): the admin limit named with
+    /// its value, a figure the admin API accepts (a budget rounded up to the
+    /// micro-dollar, at most the configured one) or `null`, and the restart
+    /// flag only where a configured limit binds as well.
+    pub fn server_text(&self, file: &str) -> String {
+        use crate::oracle_setup::{usd_ceil, usd_fine};
+        let mut parts = Vec::new();
+        let (need_calls, conf_calls) = (self.need_calls, self.configured_max_calls);
+        match self.max_calls {
+            Some(c) if self.configured_calls_out() => parts.push(format!(
+                "the admin limit max_calls {c} in {file} binds, and so does the configured call \
+                 limit {conf_calls} (--oracle-max-calls): lift the admin limit with POST \
+                 /v1/admin/oracle {{\"max_calls\": null}} and restart the server with \
+                 --oracle-max-calls of at least {need_calls}"
+            )),
+            Some(c) => parts.push(format!(
+                "the admin limit max_calls {c} in {file} binds (the file keeps it across \
+                 restarts, so --oracle-max-calls cannot lift it): raise it with POST \
+                 /v1/admin/oracle {{\"max_calls\": {need_calls}}} (at most the configured \
+                 {conf_calls}) or lift it with {{\"max_calls\": null}}"
+            )),
+            None if self.configured_calls_out() => parts.push(format!(
+                "the call limit {conf_calls} (--oracle-max-calls) is reached: restart the server \
+                 with --oracle-max-calls of at least {need_calls}"
+            )),
+            None => {}
+        }
+        let needs = format!(
+            "the next call needs a budget of {}{}",
+            usd_fine(self.need_usd),
+            if self.need_is_smallest {
+                " or more (a longer question more)"
+            } else {
+                ""
+            }
+        );
+        let conf = usd_fine(self.configured_budget_usd);
+        match self.budget_usd {
+            Some(b) if self.configured_budget_short() => parts.push(format!(
+                "the admin limit budget_usd {} in {file} binds, and so does the configured budget \
+                 {conf} (--oracle-budget); {needs}: lift the admin limit with POST \
+                 /v1/admin/oracle {{\"budget_usd\": null}} and restart the server with \
+                 --oracle-budget of at least {}",
+                usd_fine(b),
+                usd_ceil(self.need_usd)
+            )),
+            Some(b) => {
+                // Never a figure the admin API refuses (above the
+                // configured budget).
+                let x = usd_ceil_number(self.need_usd);
+                let raise = if x
+                    .parse::<f64>()
+                    .is_ok_and(|v| v <= self.configured_budget_usd)
+                {
+                    format!(
+                        "raise it with POST /v1/admin/oracle {{\"budget_usd\": {x}}} (at most \
+                         the configured {conf}) or lift it with {{\"budget_usd\": null}}"
+                    )
+                } else {
+                    format!(
+                        "lift it with POST /v1/admin/oracle {{\"budget_usd\": null}} (the \
+                         configured {conf} then applies)"
+                    )
+                };
+                parts.push(format!(
+                    "the admin limit budget_usd {} in {file} binds (the file keeps it across \
+                     restarts, so --oracle-budget cannot lift it; {needs}): {raise}",
+                    usd_fine(b)
+                ));
+            }
+            None if self.configured_budget_short() => parts.push(format!(
+                "the budget {conf} (--oracle-budget) cannot hold the next call ({needs}): restart \
+                 the server with --oracle-budget of at least {}",
+                usd_ceil(self.need_usd)
+            )),
+            None => {}
+        }
+        parts.join("; ")
+    }
 }
 
 impl OracleStatus {
@@ -499,16 +632,29 @@ impl OracleStatus {
             OracleStatus::NoKey => "no_key".into(),
             OracleStatus::BadKey(_) => "bad_key".into(),
             OracleStatus::Disabled { .. } => "disabled".into(),
-            OracleStatus::BudgetExhausted => "budget_exhausted".into(),
+            OracleStatus::BudgetExhausted { .. } => "budget_exhausted".into(),
             OracleStatus::BudgetTooSmall { .. } => "budget_too_small".into(),
-            OracleStatus::Stopped(r) => format!("stopped: {r}"),
+            OracleStatus::Stopped(r) => format!("stopped: {}", crate::oracle::shown_code(r)),
         }
     }
 
     pub fn is_ready(&self) -> bool {
         *self == OracleStatus::Ready
     }
+
+    /// The admin limit among what refuses the next call (`None`: none).
+    pub fn admin_binding(&self) -> Option<&AdminBinding> {
+        match self {
+            OracleStatus::BudgetExhausted { admin }
+            | OracleStatus::BudgetTooSmall { admin, .. } => admin.as_ref(),
+            _ => None,
+        }
+    }
 }
+
+/// How the hint of a decisions-API answer names `oracle.state` (a client
+/// is not shown the server's paths; the startup line gives the path).
+pub const ADMIN_STATE_FILE_WORDS: &str = "the server's oracle.state";
 
 /// The one-line hint of a trained question that abstained because the oracle
 /// was refused for `reason` (`cmf.hint` of a decisions-API answer, and the
@@ -538,7 +684,17 @@ pub fn oracle_hint(reason: RefusalReason, status: &OracleStatus, key_env: &str) 
         (RefusalReason::OracleDisabled, _) => format!(
             "no oracle answers the questions the local model cannot decide: start the server with --oracle MODEL and set {key_env}"
         ),
-        (RefusalReason::Budget, OracleStatus::BudgetExhausted) => {
+        // An admin limit of `oracle.state` binds: a restart alone cannot lift
+        // it, so the hint names it and the admin request that does.
+        (RefusalReason::Budget, OracleStatus::BudgetExhausted { admin: Some(a) }) => format!(
+            "the oracle budget is used up: {}",
+            a.server_text(ADMIN_STATE_FILE_WORDS)
+        ),
+        (RefusalReason::Budget, OracleStatus::BudgetTooSmall { admin: Some(a), .. }) => format!(
+            "no oracle call fits: {}",
+            a.server_text(ADMIN_STATE_FILE_WORDS)
+        ),
+        (RefusalReason::Budget, OracleStatus::BudgetExhausted { admin: None }) => {
             "the oracle budget is used up: restart the server with a larger --oracle-budget (or --oracle-max-calls)"
                 .into()
         }
@@ -547,6 +703,7 @@ pub fn oracle_hint(reason: RefusalReason, status: &OracleStatus, key_env: &str) 
             OracleStatus::BudgetTooSmall {
                 min_usd,
                 calls_zero,
+                admin: None,
             },
         ) => {
             use crate::oracle_setup::{usd_ceil, usd_fine};
@@ -572,7 +729,8 @@ pub fn oracle_hint(reason: RefusalReason, status: &OracleStatus, key_env: &str) 
                 .into()
         }
         (RefusalReason::Stopped, OracleStatus::Stopped(r)) => format!(
-            "the oracle was stopped by a stop rule ({r}): see GET /v1/admin/oracle; after the fix POST /v1/admin/oracle {{\"enabled\":true}} resumes it"
+            "the oracle was stopped by a stop rule ({}): see GET /v1/admin/oracle; after the fix POST /v1/admin/oracle {{\"enabled\":true}} resumes it",
+            crate::oracle::shown_code(r)
         ),
         (RefusalReason::Stopped, _) => {
             "the oracle was stopped by a stop rule: see GET /v1/admin/oracle; after the fix POST /v1/admin/oracle {\"enabled\":true} resumes it"

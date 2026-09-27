@@ -37,16 +37,42 @@
 //! and a given max price below every structured-output endpoint (OpenRouter
 //! would refuse every call).
 //!
-//! What is typed where a secret must not be never comes back in a message:
-//! `--oracle-key-env` takes the variable's name, and a value that is not a
-//! name (an OpenRouter key pasted by mistake) is refused without being shown;
-//! so is an `--oracle` model id or a variable's name that looks like a key
-//! whatever its prefix ([`crate::config::looks_like_key`]: it holds
-//! `sk-or-`, starts with `Bearer `, has surrounding whitespace or is longer
-//! than 40 bytes without a `/`), which is also never sent in a listing URL.
-//! Only its length is shown. A request that fails is a fixed code
+//! What is typed where a secret must not be never comes back in a message,
+//! only its length (and why), and is never put in a listing URL. The
+//! key-like test ([`crate::config::looks_like_key`]) is, in this order: the
+//! value holds `sk-or-` anywhere or starts with `sk-` (ASCII letters in any
+//! case); it starts with `Bearer ` (any case, a space after the word); it
+//! has leading or trailing ASCII whitespace; it is 41 bytes or longer
+//! without a `/`; it holds 32 or more hexadecimal digits in a row. It
+//! applies as it is to an `--oracle` (and `check --model`) model id, which
+//! must also be 1..256 bytes with no whitespace or control character and be
+//! `author/slug` (a `/`, no empty, `.` or `..` segment); to the value of a
+//! numeric flag (`--oracle-budget`, `--oracle-max-calls`,
+//! `--oracle-max-price`, `check --max-price`) with its surrounding
+//! whitespace trimmed; and to every command-line argument, and the value of
+//! a `--flag=VALUE`, that a usage error would quote. A variable's name
+//! (`--oracle-key-env`, `check --key-env`;
+//! [`crate::config::name_looks_like_key`]) that is all `[A-Z0-9_]` and starts
+//! with an upper-case letter or `_` is a name at any length unless it holds
+//! 32 hexadecimal digits in a row; another is judged by the key-like test
+//! and, besides, taken for a random token when it is 16 bytes or longer with
+//! letters and digits and no `_`; what passes must still be 1..128 bytes of
+//! `[A-Za-z0-9_]` starting with a letter or `_`. A base URL holding `sk-or-`
+//! in any case is refused unshown. A request that fails is a fixed code
 //! ([`crate::oracle::transport_code`]), never the HTTP library's text, which
-//! may hold the `Authorization` header.
+//! may hold the `Authorization` header; a name a listing answers (a
+//! provider, a suggested model id) is kept only through
+//! [`crate::oracle::clean_upstream`] with the configured key (the value of
+//! its variable, [`crate::oracle::key_for_cleaning`]; a listing is fetched
+//! without it), and a suggested model id must be one `--oracle` takes too.
+//!
+//! Out of scope: an upstream at the configured base URL (OpenRouter, or the
+//! operator's proxy) that already received the key and deliberately echoes
+//! it, or pieces of it, in its own answers holds the key already — our code
+//! still copies no upstream free text into another client's answer, and
+//! every code it shows comes from a closed set. So is a key the operator
+//! types into an argument that is not about the key or the oracle (a file
+//! path, `--host`, a skill id).
 //!
 //! `cortiq decide --oracle MODEL` takes the same flags ([`check_flags`] before
 //! any work, [`apply`] only when a question needs the oracle).
@@ -404,8 +430,10 @@ fn get(url: &str, cap: u64, key: Option<&str>) -> std::result::Result<(u16, Vec<
 
 /// An endpoint-listing body (`data.endpoints`): the endpoints with a fixed
 /// price, and for each one without it whether it supports structured
-/// outputs. `None` when the body does not have that shape.
-fn parse_listing(body: &[u8]) -> Option<(Vec<Endpoint>, Vec<bool>)> {
+/// outputs. `None` when the body does not have that shape. Provider names
+/// are kept only through [`crate::oracle::clean_upstream`] with `key`, the
+/// configured key ([`crate::oracle::key_for_cleaning`]).
+fn parse_listing(body: &[u8], key: Option<&str>) -> Option<(Vec<Endpoint>, Vec<bool>)> {
     let v: Value = serde_json::from_slice(body).ok()?;
     let eps = v.get("data")?.get("endpoints")?.as_array()?;
     let mut priced = Vec::new();
@@ -423,7 +451,7 @@ fn parse_listing(body: &[u8]) -> Option<(Vec<Endpoint>, Vec<bool>)> {
             .find_map(|k| e.get(*k).and_then(Value::as_str))
             .unwrap_or("unnamed");
         priced.push(Endpoint {
-            provider: crate::oracle::clean_upstream(name, None),
+            provider: crate::oracle::clean_upstream(name, key),
             prompt,
             completion,
             structured,
@@ -433,20 +461,23 @@ fn parse_listing(body: &[u8]) -> Option<(Vec<Endpoint>, Vec<bool>)> {
 }
 
 /// The endpoints with a fixed price of an endpoint-listing body
-/// (`data.endpoints`), `None` when the body does not have that shape.
-pub fn parse_endpoints(body: &[u8]) -> Option<Vec<Endpoint>> {
-    parse_listing(body).map(|(priced, _)| priced)
+/// (`data.endpoints`), `None` when the body does not have that shape;
+/// provider names cleaned with the configured `key`.
+pub fn parse_endpoints(body: &[u8], key: Option<&str>) -> Option<Vec<Endpoint>> {
+    parse_listing(body, key).map(|(priced, _)| priced)
 }
 
-/// `GET {base_url}/models/{model}/endpoints`, without a key.
-pub fn probe_endpoints(base_url: &str, model: &str) -> EndpointsProbe {
+/// `GET {base_url}/models/{model}/endpoints`, without a key; `key` (the
+/// configured one, [`crate::oracle::key_for_cleaning`]) only cleans the
+/// provider names it answers.
+pub fn probe_endpoints(base_url: &str, model: &str, key: Option<&str>) -> EndpointsProbe {
     let url = endpoints_url(base_url, model);
     match get(&url, MAX_ENDPOINTS_BYTES, None) {
         Err(why) => EndpointsProbe::Unreachable(why),
         Ok((status @ (400 | 404), _)) => {
             EndpointsProbe::NotFound(format!("{url} answered HTTP {status}"))
         }
-        Ok((200, body)) => match parse_listing(&body) {
+        Ok((200, body)) => match parse_listing(&body, key) {
             Some((eps, unpriced)) if eps.is_empty() && unpriced.is_empty() => {
                 EndpointsProbe::NotFound(format!("{url} lists no endpoint"))
             }
@@ -461,8 +492,11 @@ pub fn probe_endpoints(base_url: &str, model: &str) -> EndpointsProbe {
 }
 
 /// The models of a model-listing body (`data[]`) that support structured
-/// outputs, have a positive price and are not a `:free` variant.
-pub fn parse_models(body: &[u8]) -> Option<Vec<ListedModel>> {
+/// outputs, have a positive price and are not a `:free` variant. A model id
+/// is suggested only as it is: one `--oracle` would refuse, or that
+/// [`crate::oracle::upstream_name_ok`] (with the configured `key`) would not
+/// keep, is dropped.
+pub fn parse_models(body: &[u8], key: Option<&str>) -> Option<Vec<ListedModel>> {
     let v: Value = serde_json::from_slice(body).ok()?;
     let data = v.get("data")?.as_array()?;
     Some(
@@ -470,11 +504,8 @@ pub fn parse_models(body: &[u8]) -> Option<Vec<ListedModel>> {
             .filter_map(|m| {
                 let id = m.get("id")?.as_str()?;
                 if id.ends_with(":free")
-                    || id.len() > 256
-                    || id.chars().any(|c| c.is_whitespace() || c.is_control())
-                    || !id.bytes().all(|b| b.is_ascii_graphic())
-                    || id.to_ascii_lowercase().contains("bearer")
-                    || crate::config::looks_like_key(id).is_some()
+                    || !crate::oracle::upstream_name_ok(id, key)
+                    || check_model_id(id).is_err()
                     || !supports_structured(m.get("supported_parameters"))
                 {
                     return None;
@@ -492,11 +523,17 @@ pub fn parse_models(body: &[u8]) -> Option<Vec<ListedModel>> {
     )
 }
 
-/// `GET {base_url}/models`, without a key: the models with structured outputs.
-pub fn list_models(base_url: &str) -> std::result::Result<Vec<ListedModel>, String> {
+/// `GET {base_url}/models`, without a key: the models with structured
+/// outputs (ids checked with the configured `key`, [`parse_models`]).
+pub fn list_models(
+    base_url: &str,
+    key: Option<&str>,
+) -> std::result::Result<Vec<ListedModel>, String> {
     let url = models_url(base_url);
     match get(&url, MAX_MODELS_BYTES, None)? {
-        (200, body) => parse_models(&body).ok_or_else(|| format!("{url}: not a model listing")),
+        (200, body) => {
+            parse_models(&body, key).ok_or_else(|| format!("{url}: not a model listing"))
+        }
         (status, _) => Err(format!("{url} answered HTTP {status}")),
     }
 }
@@ -630,13 +667,15 @@ fn set_max_price(cfg: &mut Config, (prompt, completion): (f64, f64)) {
 }
 
 /// Up to [`SUGGESTIONS`] of the cheapest structured-output models of the
-/// public model listing of `base_url` other than `model` (one GET, no key).
+/// public model listing of `base_url` other than `model` (one GET, no key;
+/// `key`, the configured one, checks the ids).
 pub fn suggest_models(
     base_url: &str,
     model: &str,
     mtq: u32,
+    key: Option<&str>,
 ) -> std::result::Result<Vec<ListedModel>, String> {
-    list_models(base_url).map(|models| cheapest_models(&models, model, mtq, SUGGESTIONS))
+    list_models(base_url, key).map(|models| cheapest_models(&models, model, mtq, SUGGESTIONS))
 }
 
 /// The sentence that follows a refused model: the suggestions, or why there
@@ -669,11 +708,12 @@ fn suggestions_tail(suggested: &std::result::Result<Vec<ListedModel>, String>) -
 }
 
 /// The refusal of a model the oracle cannot use, with suggestions.
-fn refuse(cfg: &Config, model: &str, problem: &str) -> anyhow::Error {
+fn refuse(cfg: &Config, model: &str, problem: &str, key: Option<&str>) -> anyhow::Error {
     let suggested = suggest_models(
         &cfg.oracle.base_url,
         model,
         cfg.oracle.max_tokens_per_question,
+        key,
     );
     anyhow::anyhow!(
         "--oracle {model}: {problem}.{}",
@@ -741,16 +781,21 @@ pub fn prepare(
 /// Apply `flags` to `cfg` (see the module notes) and check the model against
 /// the endpoint listing of `cfg.oracle.base_url` (one GET, no key; one more
 /// for suggestions when the model is refused). `config_sets_max_price`: the
-/// `--decision-config` file sets `oracle.provider` itself.
+/// `--decision-config` file sets `oracle.provider` itself. `key` reads the
+/// configured key's variable only to clean what the listings answer
+/// ([`crate::oracle::key_for_cleaning`]); nothing is sent with it.
 pub fn apply(
     cfg: &mut Config,
     flags: &OracleFlags,
     config_sets_max_price: bool,
+    key: &KeyLookup,
 ) -> Result<OracleSetup> {
     let fixed = prepare(cfg, flags, config_sets_max_price)?;
     let model = flags.model.clone();
     let mtq = cfg.oracle.max_tokens_per_question;
-    let probe = probe_endpoints(&cfg.oracle.base_url, &model);
+    let clean_key = crate::oracle::key_for_cleaning(key, &cfg.oracle.api_key_env);
+    let clean_key = clean_key.as_deref();
+    let probe = probe_endpoints(&cfg.oracle.base_url, &model, clean_key);
     let mut warnings = Vec::new();
     let source = match (&probe, fixed) {
         (EndpointsProbe::NotFound(why), _) => {
@@ -761,6 +806,7 @@ pub fn apply(
                     "{} does not list this model ({why})",
                     host_of(&cfg.oracle.base_url)
                 ),
+                clean_key,
             ));
         }
         (EndpointsProbe::Found(eps), fixed) => {
@@ -772,6 +818,7 @@ pub fn apply(
                         "none of its {} endpoints supports structured outputs (response_format with a JSON schema), which the oracle needs for typed verdicts",
                         eps.len()
                     ),
+                    clean_key,
                 ));
             };
             match fixed {
@@ -818,6 +865,7 @@ pub fn apply(
                 cfg,
                 &model,
                 "none of its endpoints supports structured outputs (response_format with a JSON schema), which the oracle needs for typed verdicts",
+                clean_key,
             ));
         }
         (EndpointsProbe::VariablePrice { structured: true }, None) => {
@@ -828,6 +876,7 @@ pub fn apply(
                     "{} lists it with no endpoint of a fixed price (variable pricing, so the max price cannot be taken from the listing; give it with --oracle-max-price IN,OUT, or use a concrete model)",
                     host_of(&cfg.oracle.base_url)
                 ),
+                clean_key,
             ));
         }
         (EndpointsProbe::VariablePrice { structured: true }, Some(fixed)) => {
@@ -885,8 +934,10 @@ pub const CREDITS_PAGE: &str = "https://openrouter.ai/settings/credits";
 /// A stop reason of [`crate::oracle`] (`http_401`, `unexpected_model`,
 /// `cost_above_reservation`, `max_errors`, …) or the error code of a failed
 /// call, in words (without the code itself); `key_env` names the key's
-/// variable (never the key), `model` the oracle model.
+/// variable (never the key), `model` the oracle model. A code outside the
+/// closed set ([`crate::oracle::shown_code`]) is worded as `unknown_code`.
 fn error_words(code: &str, key_env: &str, model: &str) -> String {
+    let code = crate::oracle::shown_code(code);
     let status = code.strip_prefix("http_").unwrap_or("");
     match code {
         "http_401" | "http_403" => {
@@ -902,6 +953,9 @@ fn error_words(code: &str, key_env: &str, model: &str) -> String {
             .to_string(),
         "max_errors" => "too many oracle calls failed in a row (oracle.max_errors)".to_string(),
         "http_429" => "OpenRouter rate-limited the call (HTTP 429)".to_string(),
+        crate::oracle::UNKNOWN_CODE => "a code this version does not know was recorded (it is \
+             not shown)"
+            .to_string(),
         c if c.starts_with("transport_") || c.starts_with("read_") => "the request did not \
              complete (the network, a firewall, or the deadline oracle.deadline_s)"
             .to_string(),
@@ -914,8 +968,11 @@ fn error_words(code: &str, key_env: &str, model: &str) -> String {
 /// `cost_above_reservation`, `max_errors`, …) or the error code of a failed
 /// call, in words; `key_env` names the key's variable (never the key),
 /// `model` the oracle model. A code the words do not name (a transport
-/// error, an HTTP status, a bad answer) is given in parentheses.
+/// error, an HTTP status, a bad answer) is given in parentheses, and only
+/// from the closed code set ([`crate::oracle::shown_code`]; another is
+/// `unknown_code`).
 pub fn explain_oracle_error(code: &str, key_env: &str, model: &str) -> String {
+    let code = crate::oracle::shown_code(code);
     let status = code.strip_prefix("http_").unwrap_or("");
     let words = error_words(code, key_env, model);
     match code {
@@ -925,7 +982,8 @@ pub fn explain_oracle_error(code: &str, key_env: &str, model: &str) -> String {
         | "http_429"
         | "unexpected_model"
         | "cost_above_reservation"
-        | "max_errors" => words,
+        | "max_errors"
+        | crate::oracle::UNKNOWN_CODE => words,
         c if c.starts_with("transport_") || c.starts_with("read_") => format!(
             "the request did not complete ({c}: the network, a firewall, or the deadline \
              oracle.deadline_s)"
@@ -936,8 +994,9 @@ pub fn explain_oracle_error(code: &str, key_env: &str, model: &str) -> String {
 }
 
 /// "the last error: CODE — WORDS": the failed call behind a `max_errors`
-/// stop (or failures in a row), its code named.
+/// stop (or failures in a row), its code named (from the closed set).
 pub fn explain_last_error(code: &str, key_env: &str, model: &str) -> String {
+    let code = crate::oracle::shown_code(code);
     format!(
         "the last error: {code} — {}",
         error_words(code, key_env, model)
@@ -1059,8 +1118,9 @@ pub fn check_model(
     model: &str,
     mtq: u32,
     max_price: Option<(f64, f64)>,
+    key: Option<&str>,
 ) -> ModelCheck {
-    let probe = probe_endpoints(base_url, model);
+    let probe = probe_endpoints(base_url, model, key);
     let no_json = |n: usize| {
         (
             "no_structured_outputs",
@@ -1140,7 +1200,7 @@ pub fn check_model(
     };
     let suggestions = match &problem {
         Some((code, _)) if !matches!(*code, "listing_unreachable" | "max_price_too_low") => {
-            Some(suggest_models(base_url, model, mtq))
+            Some(suggest_models(base_url, model, mtq, key))
         }
         _ => None,
     };
@@ -1285,7 +1345,11 @@ pub fn test_call(oracle: &crate::config::OracleConfig, key: KeyLookup) -> Result
         let outcome = client.call(&caller, &[&q], &json!(TEST_CALL_STATE));
         // `max_errors` is 1 here, so any failure stops the client: only the
         // rules a server would apply to this call count.
-        let stop = client.state().stop_reason.filter(|r| r != "max_errors");
+        let stop = client
+            .state()
+            .stop_reason
+            .filter(|r| r != "max_errors")
+            .map(|r| crate::oracle::shown_code(&r).to_string());
         Ok((outcome, stop))
     })();
     let _ = std::fs::remove_file(&ledger);
@@ -1318,7 +1382,7 @@ pub fn test_call(oracle: &crate::config::OracleConfig, key: KeyLookup) -> Result
             reserved_usd,
             provider: None,
             latency_ms: None,
-            error: Some(f.error),
+            error: Some(crate::oracle::shown_code(&f.error).to_string()),
             stop,
         },
         CallOutcome::Refused(r) => TestCall {
@@ -1717,7 +1781,8 @@ pub fn check(opts: &CheckOptions, key: &KeyLookup) -> Result<CheckReport> {
     let mtq = cfg.oracle.max_tokens_per_question;
     let (key_state, usable) = crate::oracle::read_key(key, &opts.key_env);
     let account = usable.map(|k| probe_key(base, &k));
-    let model = check_model(base, &opts.model, mtq, opts.max_price);
+    let clean_key = crate::oracle::key_for_cleaning(key, &opts.key_env);
+    let model = check_model(base, &opts.model, mtq, opts.max_price, clean_key.as_deref());
     let max_price = opts.max_price.or_else(|| {
         model
             .cheapest
@@ -1825,6 +1890,11 @@ mod tests {
         .to_string()
     }
 
+    /// No key in any variable (the listings' names are cleaned without one).
+    fn no_key() -> KeyLookup {
+        Arc::new(|_| None)
+    }
+
     fn flags(model: &str, base: &str) -> OracleFlags {
         OracleFlags {
             model: model.into(),
@@ -1849,7 +1919,7 @@ mod tests {
         f.budget_usd = Some(5.0);
         f.max_calls = Some(7);
         f.no_learning = true;
-        let s = apply(&mut cfg, &f, false).unwrap();
+        let s = apply(&mut cfg, &f, false, &no_key()).unwrap();
         assert_eq!(s.max_price, (0.07, 0.58));
         assert_eq!(cfg.oracle.max_price().unwrap(), (0.07, 0.58));
         assert!(matches!(&s.source, PriceSource::Listing { provider, .. } if provider == "Cheap"));
@@ -1882,9 +1952,14 @@ mod tests {
             ),
             ("/api/v1/models", 200, models()),
         ]);
-        let e = apply(&mut Config::default(), &flags("a/nope", &m.base), false)
-            .unwrap_err()
-            .to_string();
+        let e = apply(
+            &mut Config::default(),
+            &flags("a/nope", &m.base),
+            false,
+            &no_key(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             e.contains("--oracle a/nope") && e.contains("HTTP 404"),
             "{e}"
@@ -1899,9 +1974,14 @@ mod tests {
             !e.contains("pricey") && !e.contains(":free") && !e.contains("auto"),
             "{e}"
         );
-        let e = apply(&mut Config::default(), &flags("a/plain", &m.base), false)
-            .unwrap_err()
-            .to_string();
+        let e = apply(
+            &mut Config::default(),
+            &flags("a/plain", &m.base),
+            false,
+            &no_key(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             e.contains("none of its 1 endpoints supports structured outputs"),
             "{e}"
@@ -1909,9 +1989,14 @@ mod tests {
         assert!(e.contains("Start with --oracle x/cheap"), "{e}");
         // No model listing: the refusal still names the problem.
         let bare = mock(vec![]);
-        let e = apply(&mut Config::default(), &flags("a/nope", &bare.base), false)
-            .unwrap_err()
-            .to_string();
+        let e = apply(
+            &mut Config::default(),
+            &flags("a/nope", &bare.base),
+            false,
+            &no_key(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(e.contains("could not be fetched for suggestions"), "{e}");
     }
 
@@ -1925,7 +2010,7 @@ mod tests {
             .port();
         let base = format!("http://127.0.0.1:{port}/api/v1");
         let mut cfg = Config::default();
-        let s = apply(&mut cfg, &flags("a/b", &base), false).unwrap();
+        let s = apply(&mut cfg, &flags("a/b", &base), false, &no_key()).unwrap();
         assert_eq!(s.max_price, FALLBACK_MAX_PRICE);
         assert_eq!(s.source, PriceSource::Fallback);
         assert!(
@@ -1943,11 +2028,11 @@ mod tests {
         let mut cfg = Config::default();
         let mut f = flags("a/b", &m.base);
         f.max_price = Some((0.3, 0.9));
-        let s = apply(&mut cfg, &f, false).unwrap();
+        let s = apply(&mut cfg, &f, false, &no_key()).unwrap();
         assert_eq!((s.max_price, &s.source), ((0.3, 0.9), &PriceSource::Flag));
         assert!(s.warnings.is_empty());
         f.max_price = Some((0.01, 0.01));
-        let e = apply(&mut Config::default(), &f, false)
+        let e = apply(&mut Config::default(), &f, false, &no_key())
             .unwrap_err()
             .to_string();
         assert!(
@@ -1961,7 +2046,7 @@ mod tests {
             br#"{"oracle":{"provider":{"max_price":{"prompt":0.01,"completion":0.01}}}}"#,
         )
         .unwrap();
-        let e = apply(&mut low, &flags("a/b", &m.base), true)
+        let e = apply(&mut low, &flags("a/b", &m.base), true, &no_key())
             .unwrap_err()
             .to_string();
         assert!(
@@ -1973,7 +2058,7 @@ mod tests {
             br#"{"oracle":{"provider":{"sort":"price","max_price":{"prompt":0.2,"completion":0.8}}}}"#,
         )
         .unwrap();
-        let s = apply(&mut cfg, &flags("a/b", &m.base), true).unwrap();
+        let s = apply(&mut cfg, &flags("a/b", &m.base), true, &no_key()).unwrap();
         assert_eq!((s.max_price, &s.source), ((0.2, 0.8), &PriceSource::Config));
     }
 
@@ -1991,6 +2076,7 @@ mod tests {
             &mut Config::default(),
             &flags("openrouter/auto", &m.base),
             false,
+            &no_key(),
         )
         .unwrap_err()
         .to_string();
@@ -2005,7 +2091,7 @@ mod tests {
         let mut f = flags("openrouter/auto", &m.base);
         f.max_price = Some((0.2, 0.8));
         let mut cfg = Config::default();
-        let s = apply(&mut cfg, &f, false).unwrap();
+        let s = apply(&mut cfg, &f, false, &no_key()).unwrap();
         assert_eq!((s.max_price, &s.source), ((0.2, 0.8), &PriceSource::Flag));
         assert!(
             s.warnings[0].contains("only variable-price endpoints")
@@ -2016,14 +2102,19 @@ mod tests {
         // Variable pricing without structured outputs is refused either way.
         let mut f = flags("v/plain", &m.base);
         f.max_price = Some((0.2, 0.8));
-        let e = apply(&mut Config::default(), &f, false)
+        let e = apply(&mut Config::default(), &f, false, &no_key())
             .unwrap_err()
             .to_string();
         assert!(e.contains("supports structured outputs"), "{e}");
         // An empty listing: not listed.
-        let e = apply(&mut Config::default(), &flags("v/none", &m.base), false)
-            .unwrap_err()
-            .to_string();
+        let e = apply(
+            &mut Config::default(),
+            &flags("v/none", &m.base),
+            false,
+            &no_key(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             e.contains("does not list this model") && e.contains("lists no endpoint)"),
             "{e}"
@@ -2036,7 +2127,7 @@ mod tests {
     #[test]
     fn flags_are_checked_before_the_network() {
         let bad = |f: OracleFlags| {
-            apply(&mut Config::default(), &f, false)
+            apply(&mut Config::default(), &f, false, &no_key())
                 .unwrap_err()
                 .to_string()
         };
@@ -2439,6 +2530,157 @@ mod tests {
         assert_eq!(
             explain_oracle_error("http_500", "K", "m/x"),
             "OpenRouter answered HTTP 500 (http_500)"
+        );
+    }
+
+    #[test]
+    fn listing_names_are_kept_only_as_allowed_and_checked_against_the_configured_key() {
+        let secret = "sk-or-v1-9f8e7d6c5b4a39281706aabbccddeeff00112233";
+        let key: KeyLookup = crate::oracle::key_lookup(move |n| {
+            (n == "UNIT_OR_KEY" || n == "OPENROUTER_API_KEY").then(|| format!(" {secret}\n"))
+        });
+        let names = [
+            // A piece of the configured key (a proxy that saw it with a call).
+            ("P 9f8e7d6c", "0.00000001", true),
+            // Interleaved with dots: among the letters and digits.
+            ("q/5.b.4.a.3.9.2.8", "0.00000002", true),
+            // Outside the allowed characters, or longer than 64 bytes.
+            ("Nov!ta", "0.00000003", true),
+            ("Ok (EU)", "0.00000004", true),
+            ("Long", "0.00000005", true),
+        ];
+        let long = format!("L/{}", "z".repeat(63));
+        let eps: Vec<Value> = names
+            .iter()
+            .map(|(n, p, st)| {
+                let n = if *n == "Long" { long.as_str() } else { n };
+                ep(n, p, "0.0000001", *st)
+            })
+            .collect();
+        let listing = endpoints(Value::Array(eps));
+        let got: Vec<String> = parse_endpoints(listing.as_bytes(), Some(secret))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.provider)
+            .collect();
+        assert_eq!(
+            got,
+            [
+                "[redacted]",
+                "[redacted]",
+                "[redacted]",
+                "Ok (EU)",
+                "[redacted]"
+            ]
+        );
+        // Without the key only the shapes are refused.
+        let got: Vec<String> = parse_endpoints(listing.as_bytes(), None)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.provider)
+            .collect();
+        assert_eq!(
+            got,
+            [
+                "P 9f8e7d6c",
+                "q/5.b.4.a.3.9.2.8",
+                "[redacted]",
+                "Ok (EU)",
+                "[redacted]"
+            ]
+        );
+        // apply and check read the configured variable for it: the cheapest
+        // provider (an echo of the key) is [redacted] in every message.
+        let m = mock(vec![
+            (
+                "/api/v1/models/a/b/endpoints",
+                200,
+                endpoints(json!([ep("P 9f8e7d6c", "0.000000035", "0.00000029", true)])),
+            ),
+            ("/api/v1/auth/key", 200, key_description()),
+            ("/api/v1/models/a/nope/endpoints", 404, "{}".into()),
+            (
+                "/api/v1/models",
+                200,
+                json!({"data": [
+                    {"id": "x/9f8e7d6c-mini", "pricing": {"prompt": "0.00000001", "completion": "0.00000001"}, "supported_parameters": ["structured_outputs"]},
+                    {"id": "x/a b", "pricing": {"prompt": "0.00000001", "completion": "0.00000001"}, "supported_parameters": ["structured_outputs"]},
+                    {"id": "noslash", "pricing": {"prompt": "0.00000001", "completion": "0.00000001"}, "supported_parameters": ["structured_outputs"]},
+                    {"id": format!("x/{}", "y".repeat(70)), "pricing": {"prompt": "0.00000001", "completion": "0.00000001"}, "supported_parameters": ["structured_outputs"]},
+                    {"id": "x/fine", "pricing": {"prompt": "0.00000002", "completion": "0.00000002"}, "supported_parameters": ["structured_outputs"]}
+                ]})
+                .to_string(),
+            ),
+        ]);
+        let mut cfg = Config::default();
+        let s = apply(&mut cfg, &flags("a/b", &m.base), false, &key).unwrap();
+        assert!(
+            matches!(&s.source, PriceSource::Listing { provider, .. } if provider == "[redacted]"),
+            "{:?}",
+            s.source
+        );
+        assert!(s.price_note().contains("[redacted] at $0.035/$0.29"));
+        let e = apply(
+            &mut Config::default(),
+            &flags("a/nope", &m.base),
+            false,
+            &key,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("Cheap models with structured outputs: x/fine (") && !e.contains("9f8e7d6c"),
+            "{e}"
+        );
+        let mut o = check_opts("a/b", &m.base);
+        o.key_env = "UNIT_OR_KEY".into();
+        let r = check(&o, &key).unwrap();
+        assert_eq!(r.model.cheapest.as_ref().unwrap().provider, "[redacted]");
+        for t in [r.render(), r.to_json().to_string()] {
+            assert!(!t.contains("9f8e7d6c"), "{t}");
+        }
+        let r = check(&check_opts("a/nope", &m.base), &key).unwrap();
+        let ids: Vec<String> = r
+            .model
+            .suggestions
+            .clone()
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(ids, ["x/fine"]);
+        // The listings were fetched without it.
+        for h in m.heads.lock().unwrap().iter() {
+            assert!(
+                !h.contains("9f8e7d6c") || h.starts_with("GET /api/v1/auth/key "),
+                "{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn codes_outside_the_closed_set_are_worded_as_unknown_code() {
+        let echo = "finish_Bearer_sk_or_v1_0123456789abcdef";
+        for text in [
+            explain_oracle_error(echo, "K", "m/x"),
+            explain_last_error(echo, "K", "m/x"),
+            explain_stop("max_errors", Some(echo), "K", "m/x"),
+            explain_stop(echo, None, "K", "m/x"),
+            explain_oracle_error("http_4011", "K", "m/x"),
+        ] {
+            assert!(
+                !text.contains("0123456789") && !text.contains("4011"),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            explain_last_error(echo, "K", "m/x"),
+            "the last error: unknown_code — a code this version does not know was recorded (it is not shown)"
+        );
+        assert_eq!(
+            explain_oracle_error("finish_length", "K", "m/x"),
+            "the answer was not usable (finish_length)"
         );
     }
 
