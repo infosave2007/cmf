@@ -79,7 +79,10 @@
 //!   keyed endpoint the rate window (429 `RATE_LIMITED`, `Retry-After`) and the
 //!   quotas (402 `QUOTA_EXCEEDED`: decisions, tokens, credit) are checked before
 //!   any work, like the router's middleware, and again before every input of a
-//!   batch after the first.
+//!   batch after the first; a `/v1/decisions` request with more questions than
+//!   the decision quota has left is refused, and an oracle call must fit in
+//!   the credit left (`DecisionService::check_decision_room`,
+//!   `DecisionService::oracle_credit_left`).
 //! * **Body**: `Content-Type: application/json` (else 400; 415 on the router
 //!   surface), at most `limits.body_bytes` (else 413 `PAYLOAD_TOO_LARGE`,
 //!   checked from `Content-Length` before reading and while reading).
