@@ -70,7 +70,7 @@ use crate::protocol::{ApiError, FeedbackRequest, MAX_LABEL_BYTES, Question, Ques
 use crate::rows::{Rows, Source};
 use crate::service::{
     AdminCommand, Escalation, EscalationResult, Escalator, ModelHandle, Observation, OracleStatus,
-    OracleUsage, Pending, Principal, Resolution, Resolved,
+    OracleUsage, Pending, Principal, RefusalReason, Resolution, Resolved,
 };
 use crate::statedir::StateDir;
 use anyhow::Result;
@@ -673,7 +673,23 @@ impl Escalator for Cascade {
             key_budget_usd: e.principal.oracle_budget_usd.map(Usd::to_f64),
             credit_left_usd: e.oracle_credit_usd,
         };
+        // The state as it would leave for the oracle (PII redacted unless
+        // the request allows its egress), and whether it was redacted.
+        let egress_state = || {
+            let raw = e.request.state.to_value();
+            if cfg.oracle.redact_pii && !e.request.cmf.allow_pii_egress {
+                redact_value(&raw)
+            } else {
+                (raw, false)
+            }
+        };
         if let Err(r) = inner.oracle.permission(&caller) {
+            if r == RefusalReason::Budget {
+                // Refused before a body was built: the status and the hints
+                // name what this request's call would reserve.
+                let qs: Vec<&Question> = e.pending.iter().map(|p| p.question).collect();
+                inner.oracle.note_budget_refusal(&qs, &egress_state().0);
+            }
             return EscalationResult {
                 resolved: (0..n)
                     .map(|_| Resolved::new(Resolution::Refused(r)))
@@ -746,12 +762,7 @@ impl Escalator for Cascade {
         let mut usage = OracleUsage::default();
         let mut learn_jobs: Vec<(String, String)> = Vec::new();
         if !leaders.is_empty() {
-            let raw = e.request.state.to_value();
-            let (state, redacted) = if cfg.oracle.redact_pii && !e.request.cmf.allow_pii_egress {
-                redact_value(&raw)
-            } else {
-                (raw, false)
-            };
+            let (state, redacted) = egress_state();
             let qs: Vec<&Question> = leaders.iter().map(|&i| e.pending[i].question).collect();
             let outcome = inner.oracle.call(&caller, &qs, &state);
             let flags: Vec<String> = if redacted {

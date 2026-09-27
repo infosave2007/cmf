@@ -129,22 +129,18 @@ pub fn refuse_key_in_number(s: &str) -> Result<()> {
 
 /// `IN,OUT`: two finite non-negative numbers, USD per 1M tokens. An error
 /// never holds the value (a key pasted here would land in the terminal and
-/// every captured log), only lengths.
+/// every captured log); the flag's parser states its length.
 pub fn parse_max_price(s: &str) -> Result<(f64, f64)> {
     refuse_key_in_number(s)?;
     let Some((a, b)) = s.split_once(',') else {
         bail!(
             "expected IN,OUT (USD per 1M prompt and completion tokens), e.g. 0.1,0.5; the given \
-             value ({} bytes) has no comma",
-            s.len()
+             value has no comma"
         );
     };
     let num = |x: &str, what: &str| -> Result<f64> {
         let v: f64 = x.trim().parse().map_err(|_| {
-            anyhow::anyhow!(
-                "{what} price ({} bytes) is not a number; expected IN,OUT, e.g. 0.1,0.5",
-                x.trim().len()
-            )
+            anyhow::anyhow!("{what} price is not a number; expected IN,OUT, e.g. 0.1,0.5")
         })?;
         ensure!(
             v.is_finite() && v >= 0.0,
@@ -2050,11 +2046,17 @@ mod tests {
         assert!(e.contains("OpenRouter model id"), "{e}");
         let e = bad(flags("a/../b", "http://127.0.0.1:9/v1"));
         assert!(e.contains("OpenRouter model id"), "{e}");
-        // A value without '/' (a short secret of no known shape, a hex
-        // string) is not a model id, and is never shown.
-        for v in ["97b727bdfe44e04718e4047763da731a", "SECRETVALUE1234"] {
+        // A value without '/' (a short secret of no known shape) or with 32
+        // hexadecimal digits in a row is not a model id, and is never shown.
+        for (v, why) in [
+            (
+                "97b727bdfe44e04718e4047763da731a",
+                "32 or more hexadecimal digits",
+            ),
+            ("SECRETVALUE1234", "has no '/'"),
+        ] {
             let e = bad(flags(v, "http://127.0.0.1:9/v1"));
-            assert!(e.contains("has no '/'") && !e.contains(&v[..8]), "{e}");
+            assert!(e.contains(why) && !e.contains(&v[..8]), "{e}");
         }
         let e = bad(flags("SK-OR-V1-ABCDEF0123", "http://127.0.0.1:9/v1"));
         assert!(
@@ -2098,7 +2100,9 @@ mod tests {
         ] {
             let e = format!("{:#}", parse_max_price(v).unwrap_err());
             assert!(!e.contains("0123456789") && !e.contains("secret"), "{e}");
-            assert!(e.contains("bytes"), "{e}");
+            // A key-like value names its length; the others leave it to the
+            // flag's parser (stated once).
+            assert_eq!(e.contains("bytes"), v.contains("sk-or-"), "{e}");
         }
     }
 

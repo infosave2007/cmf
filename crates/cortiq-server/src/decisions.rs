@@ -3455,21 +3455,33 @@ pub fn oracle_startup_line(cascade: &Cascade, cfg: &Config, note: Option<&str>) 
                 st["calls"], st["max_calls"]
             ),
         ),
-        OracleStatus::BudgetTooSmall { min_usd } => (
+        OracleStatus::BudgetTooSmall {
+            min_usd,
+            calls_zero,
+        } => (
             false,
-            if st["max_calls"].as_u64() == Some(0) {
-                format!(
+            match (min_usd, calls_zero) {
+                (None, _) => format!(
                     "oracle: NOT ready — max_calls 0 allows no call ({what}; restart with --oracle-max-calls of at least 1)"
-                )
-            } else {
-                let (p, c) = oracle.max_price();
-                format!(
-                    "oracle: NOT ready — the budget is too small: {budget_text} cannot hold one call; the smallest possible one (one short question) reserves {} at the max price in/out {}/{} per 1M, a longer one more ({what}; restart with --oracle-budget of at least {}, more for longer questions)",
-                    usd_fine(min_usd),
-                    usd(p),
-                    usd(c),
-                    usd_ceil(min_usd)
-                )
+                ),
+                (Some(min_usd), calls_zero) => {
+                    let (p, c) = oracle.max_price();
+                    let (calls, restart) = if calls_zero {
+                        (
+                            "max_calls 0 allows no call, and ",
+                            "--oracle-max-calls of at least 1 and ",
+                        )
+                    } else {
+                        ("", "")
+                    };
+                    format!(
+                        "oracle: NOT ready — {calls}the budget is too small: {budget_text} cannot hold one call; the smallest possible one (one short question) reserves {} at the max price in/out {}/{} per 1M, a longer one more ({what}; restart with {restart}--oracle-budget of at least {}, more for longer questions)",
+                        usd_fine(min_usd),
+                        usd(p),
+                        usd(c),
+                        usd_ceil(min_usd)
+                    )
+                }
             },
         ),
         OracleStatus::Stopped(r) => {

@@ -95,14 +95,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `decision oracle check`, `decision learn`): the key read from its variable
   loses surrounding spaces, tabs, CR and LF (a `.env` file's) with a warning
   that says so; a value that still holds whitespace, a control byte or a byte
-  outside ASCII, starts with `Bearer ` or starts or ends with a quote is
-  `bad_key`, named by position and length among its raw bytes and never
-  sent. Transport and read errors are fixed codes (`transport_connect`,
-  `transport_timeout`, `transport_bad_header`, `read_io`, …), never a
-  library's text, which could hold the request's `Authorization` header;
-  what an upstream answers (`provider`, `model`, listing names) is kept to
-  visible ASCII and `[redacted]` when it holds `Bearer`, looks like a key or
-  holds a piece of the key sent. A key-like value (holding `sk-or-` or
+  outside ASCII, starts with `Bearer `, is a whole `.env` line (`NAME=…`)
+  or starts or ends with a quote is `bad_key`, named by position and length
+  among its raw bytes (the whitespace around it counted) and never sent.
+  Transport and read errors
+  are fixed codes (`transport_connect`, `transport_timeout`,
+  `transport_bad_header`, `read_io`, …), never a library's text, which
+  could hold the request's `Authorization` header; a `finish_reason` other
+  than `stop` is one of `finish_length`, `finish_content_filter`,
+  `finish_tool_calls`, `finish_error`, `finish_other`, never the upstream's
+  text; what an upstream answers (`provider`, `model`, listing names) is
+  kept to visible ASCII and `[redacted]` when it — also once control,
+  invisible or punctuation characters are dropped — holds `Bearer`, looks
+  like a key or holds a piece of the key sent. A command-line usage error
+  shows an argument that looks like a key only by its length (a key pasted
+  as a stray argument or as `--flag=KEY`). A key-like value (holding `sk-or-` or
   starting with `sk-` in any case, starting with `Bearer `, with surrounding
   whitespace, or longer than 40 bytes without a `/`; an upper-case variable
   name is a name at any length) given as a model id or a variable's name is
@@ -110,11 +117,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without a `/`, a variable's name starting with a digit, a value a numeric
   oracle flag refuses and a string a `--decision-config` gives where a
   number belongs. `budget_too_small` names the least budget that holds a
-  call, rounded up to the micro-dollar; a server whose budget holds the
-  smallest possible call (one short question: the system prompt and schema
-  are always sent) but refused a real one with nothing spent reports
-  `budget_too_small` with that call's reservation instead of `ready` (and
-  `budget_exhausted` once something was spent).
+  call, rounded up to the micro-dollar: the smallest possible call's (one
+  short question: the system prompt and schema are always sent) until the
+  budget refuses a real one, then that call's reservation — also for a
+  budget below the smallest call (0 included) and for a call the coarse
+  permission check refused before a body was built; a server whose budget
+  refused a real call with nothing spent reports `budget_too_small` instead
+  of `ready` (and `budget_exhausted` once something was spent). With
+  `max_calls` 0 the hint names the call limit (and the budget only when it
+  is short too).
 - `cortiq decide FILE -p TEXT | --input ROWS --oracle MODEL`: the text is
   decided locally first, and only one the gate rejects (or whose labels no
   skill has) is sent, in one call with the server's reservation ledger,
