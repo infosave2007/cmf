@@ -477,10 +477,15 @@ pub enum OracleStatus {
     /// or a call it refused, or `max_calls` calls were made.
     BudgetExhausted,
     /// Nothing was spent, and the budget cannot hold even one call, or
-    /// `max_calls` is 0. `min_usd`: the least budget a call needs — the
-    /// smallest possible call's reservation, or, once the budget refused a
-    /// real (longer) call with nothing spent, the smallest such refusal's.
-    BudgetTooSmall { min_usd: f64 },
+    /// `max_calls` is 0. `min_usd` (`Some` only when the budget is short):
+    /// the least budget a call needs — the smallest possible call's
+    /// reservation, or, once the budget refused a real (longer) call, the
+    /// smallest such refusal's. `calls_zero`: `max_calls` is 0 (no call is
+    /// allowed whatever the budget).
+    BudgetTooSmall {
+        min_usd: Option<f64>,
+        calls_zero: bool,
+    },
     /// A stop rule switched it off (the reason of `oracle.state`).
     Stopped(String),
 }
@@ -537,11 +542,31 @@ pub fn oracle_hint(reason: RefusalReason, status: &OracleStatus, key_env: &str) 
             "the oracle budget is used up: restart the server with a larger --oracle-budget (or --oracle-max-calls)"
                 .into()
         }
-        (RefusalReason::Budget, OracleStatus::BudgetTooSmall { min_usd }) => format!(
-            "the oracle budget cannot hold one call (it needs {} reserved before it is sent): restart the server with --oracle-budget of at least {} (and --oracle-max-calls of at least 1)",
-            crate::oracle_setup::usd_fine(*min_usd),
-            crate::oracle_setup::usd_ceil(*min_usd)
-        ),
+        (
+            RefusalReason::Budget,
+            OracleStatus::BudgetTooSmall {
+                min_usd,
+                calls_zero,
+            },
+        ) => {
+            use crate::oracle_setup::{usd_ceil, usd_fine};
+            match (min_usd, calls_zero) {
+                (Some(m), false) => format!(
+                    "the oracle budget cannot hold one call (it needs {} reserved before it is sent): restart the server with --oracle-budget of at least {}",
+                    usd_fine(*m),
+                    usd_ceil(*m)
+                ),
+                (Some(m), true) => format!(
+                    "max_calls 0 allows no oracle call, and the budget cannot hold one call (it needs {} reserved before it is sent): restart the server with --oracle-max-calls of at least 1 and --oracle-budget of at least {}",
+                    usd_fine(*m),
+                    usd_ceil(*m)
+                ),
+                (None, _) => {
+                    "max_calls 0 allows no oracle call: restart the server with --oracle-max-calls of at least 1"
+                        .into()
+                }
+            }
+        }
         (RefusalReason::Budget, _) => {
             "the oracle budget left (the server's, or this API key's oracle budget or credit) cannot hold this call's reservation: see GET /v1/admin/oracle"
                 .into()
@@ -1862,9 +1887,9 @@ impl DecisionService {
     /// `GET /v1/skills/{id}` (404 for an unknown skill).
     pub fn skill_json(&self, id: &str) -> Result<Value, ApiError> {
         let model = self.handle.current();
-        let s = model
-            .skill(id)
-            .ok_or_else(|| ApiError::not_found(format!("no skill '{id}'")))?;
+        let s = model.skill(id).ok_or_else(|| {
+            ApiError::not_found(format!("no skill {}", crate::config::quote_unless_key(id)))
+        })?;
         let mut v = skill_summary(s);
         let tasks: Vec<Value> = s
             .manifest

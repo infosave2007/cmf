@@ -208,9 +208,12 @@ fn placeholder_gate() -> GateParams {
 impl SkillBook {
     /// The book of `skill` of `model`; `base` reuses decoded base rows.
     pub fn from_model(model: &DecisionModel, skill: &str, base: Option<Arc<Rows>>) -> Result<Self> {
-        let s = model
-            .skill(skill)
-            .ok_or_else(|| anyhow::anyhow!("no skill '{skill}' in this model"))?;
+        let s = model.skill(skill).ok_or_else(|| {
+            anyhow::anyhow!(
+                "no skill {} in this model",
+                crate::config::quote_unless_key(skill)
+            )
+        })?;
         let base = match base {
             Some(b) => b,
             None => Arc::new(model.rows(skill)?),
@@ -621,7 +624,7 @@ impl Books {
     ) -> Result<&mut SkillBook> {
         let sha = model
             .skill(skill)
-            .ok_or_else(|| anyhow::anyhow!("no skill '{skill}'"))?
+            .ok_or_else(|| anyhow::anyhow!("no skill {}", crate::config::quote_unless_key(skill)))?
             .sha256
             .clone();
         let valid = self.books.get(skill).is_some_and(|b| b.manifest_sha == sha);

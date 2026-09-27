@@ -256,10 +256,14 @@ lift lower admin limits with `POST /v1/admin/oracle {"budget_usd": null,
 "max_calls": null}`), `budget_too_small` (nothing spent, and the budget
 cannot hold even one call, or `max_calls` is 0: `min_call_usd` is the least
 budget a call needs — the smallest possible call's reservation, one short
-question; once the budget refused a real, longer call with nothing spent,
-that call's reservation, so the status is `budget_too_small` then, not
-`ready`; the startup line and the hint round it up to the micro-dollar, so
-passing the printed figure admits that call) or `stopped: <reason>` (a stop rule; `last_error` names
+question, until the budget refuses a real, longer call; from then on the
+larger of the two, that call's reservation, whether the budget was below
+even the smallest call (0 included) or only below that one, so the status
+is `budget_too_small` then, not `ready`; the hint of the refused request
+names it rounded up to the micro-dollar, so passing that figure admits the
+call; the startup line, before any request, can only give the smallest
+call's, "more for longer questions"; with `max_calls` 0 the hint names the
+call limit, and the budget too only when it is short as well) or `stopped: <reason>` (a stop rule; `last_error` names
 the code of the last failed call, which `max_errors` counts; `POST
 /v1/admin/oracle {"enabled": true}` resumes after the fix). On the router
 API, `/v1/healthz` carries the status as `cmf.oracle_status` only with
@@ -269,16 +273,24 @@ The key is read as it is in the variable, less surrounding spaces, tabs, CR
 and LF (a `.env` file's line ending): the server, `decide` and `oracle
 check` warn `the key had surrounding whitespace, trimmed` and go on. A value
 that still holds whitespace, a control byte or a byte outside ASCII, that
-starts with `Bearer ` (the request adds it) or starts or ends with a quote
-is `bad_key`: it is never sent, and the message names only the position
-(among the variable's raw bytes) and the length of the problem. No message,
-log line (at any `RUST_LOG` level), status, ledger or state file ever holds
-a byte of the key: a failed request is a fixed code such as
-`transport_connect`, `transport_timeout` or `transport_bad_header`, and what
-an upstream answers (a response's `provider` and `model`, a listing's
-provider names) is kept to visible ASCII, cut to 128 bytes, and written or
-printed as `[redacted]` when it holds `Bearer`, looks like a key or holds a
-piece of the key the request carried.
+starts with `Bearer ` (the request adds it), that is a whole `.env` line
+(`NAME=…`) or starts or ends with a quote is `bad_key`: it is never sent, and the message names only the position
+and the length of the problem, both counted among the variable's raw bytes
+(the whitespace around the key included, as an editor shows the `.env`
+line). No message, log line (at any `RUST_LOG` level), status, ledger or
+state file ever holds a byte of the key: a failed request is a fixed code
+such as `transport_connect`, `transport_timeout` or
+`transport_bad_header`; an answer that did not finish is `finish_length`,
+`finish_content_filter`, `finish_tool_calls`, `finish_error` or
+`finish_other`, never the upstream's `finish_reason` text; and what an
+upstream answers (a response's `provider` and `model`, a listing's provider
+names) is kept to visible ASCII, cut to 128 bytes, and written or printed
+as `[redacted]` when it — as sent, as kept, or its letters and digits alone
+(an echo interleaved with control, invisible or punctuation characters) —
+holds `Bearer`, looks like a key or holds a piece of the key the request
+carried. A key pasted where the command line takes no value (`cortiq
+decision oracle check sk-or-…`, `--test-call=sk-or-…`) is shown in the
+usage error only by its length.
 
 ### From the command line: check, then decide
 
@@ -348,10 +360,12 @@ cortiq decide cortiq-decision.cmf --skill banking77 --input rows.jsonl --out res
   oracle, so there the same words end the run with an error.
 * `--oracle-budget USD` (default $1.00) and `--oracle-max-calls N` cap each
   run; the rows past the cap abstain with the flag `budget`. A budget that
-  cannot hold the run's first call is `budget_too_small` (the hint names
-  the least `--oracle-budget` that holds it, rounded up to the
-  micro-dollar: rerun with that figure and the call is made); one the run
-  spent is `budget_exhausted`. Without
+  cannot hold the run's first call — 0 included — is `budget_too_small`
+  (the hint names that call's reservation and the least `--oracle-budget`
+  that holds it, rounded up to the micro-dollar: rerun with that figure and
+  the call is made; a batch's start line, before any row, gives the
+  smallest call's, "more for longer questions"); one the run spent is
+  `budget_exhausted`. Without
   `--oracle`, `decide` never calls the oracle.
 * **State.** The reservation ledger, the answer cache and `oracle.state`
   live in the state directory, `<FILE>.state` next to the file (or

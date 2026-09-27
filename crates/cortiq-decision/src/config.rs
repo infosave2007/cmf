@@ -499,10 +499,23 @@ pub fn is_env_name(name: &str) -> bool {
 /// a longer one is taken for a key.
 pub const KEY_LIKE_MIN_LEN: usize = 41;
 
+/// Hexadecimal digits in a row from which a value is taken for a secret
+/// (an OpenRouter key holds 64; no model id or variable name holds 32).
+pub const HEX_RUN_MIN: usize = 32;
+
+/// The longest run of hexadecimal digits in `b`.
+fn longest_hex_run(b: &[u8]) -> usize {
+    b.split(|c| !c.is_ascii_hexdigit())
+        .map(<[u8]>::len)
+        .max()
+        .unwrap_or(0)
+}
+
 /// Why a value given where a model id or a variable's name belongs looks
 /// like a key (`None`: it does not), whatever its prefix: it holds
 /// `sk-or-` or starts with `sk-` (in any case), starts with `Bearer `, has
-/// leading or trailing whitespace, or is longer than 40 bytes without a `/`.
+/// leading or trailing whitespace, is longer than 40 bytes without a `/`,
+/// or holds 32 hexadecimal digits in a row (a secret after a `/`).
 /// Such a value is refused without being shown (only its length is).
 pub fn looks_like_key(value: &str) -> Option<&'static str> {
     let b = value.as_bytes();
@@ -521,13 +534,18 @@ pub fn looks_like_key(value: &str) -> Option<&'static str> {
     if b.len() >= KEY_LIKE_MIN_LEN && !value.contains('/') {
         return Some("it is longer than 40 bytes without a '/'");
     }
+    if longest_hex_run(b) >= HEX_RUN_MIN {
+        return Some("it holds 32 or more hexadecimal digits in a row");
+    }
     None
 }
 
 /// [`looks_like_key`] for a value given as a variable's NAME: an all
 /// `[A-Z0-9_]` value starting with a letter or `_` is a name, whatever its
-/// length (`MY_COMPANY_PRODUCTION_OPENROUTER_API_KEY_V2`); another is judged
-/// as any value.
+/// length (`MY_COMPANY_PRODUCTION_OPENROUTER_API_KEY_V2`), unless it holds
+/// 32 hexadecimal digits in a row; another is judged as any value, and one
+/// of 16 bytes or more with letters and digits but no `_` is taken for a
+/// random token (a key of another shape), not a name.
 pub fn name_looks_like_key(name: &str) -> Option<&'static str> {
     let b = name.as_bytes();
     let upper_name = b
@@ -536,9 +554,29 @@ pub fn name_looks_like_key(name: &str) -> Option<&'static str> {
         && b.iter()
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == b'_');
     if upper_name {
-        return None;
+        return (longest_hex_run(b) >= HEX_RUN_MIN)
+            .then_some("it holds 32 or more hexadecimal digits in a row");
     }
-    looks_like_key(name)
+    if let Some(why) = looks_like_key(name) {
+        return Some(why);
+    }
+    let token = b.len() >= 16
+        && !b.contains(&b'_')
+        && b.iter().any(u8::is_ascii_digit)
+        && b.iter().any(u8::is_ascii_alphabetic);
+    token.then_some(
+        "letters and digits without '_', 16 bytes or more: a random token, not a variable's name",
+    )
+}
+
+/// A value a user gave, for a message: `'value'`, or `(N bytes, not shown)`
+/// when it looks like a key ([`looks_like_key`]).
+pub fn quote_unless_key(value: &str) -> String {
+    if looks_like_key(value).is_some() {
+        format!("({} bytes, not shown)", value.len())
+    } else {
+        format!("'{value}'")
+    }
 }
 
 /// A serde error of the configuration without the values it quotes: a key
@@ -881,6 +919,18 @@ mod tests {
         assert!(is_env_name("MY_COMPANY_PRODUCTION_OPENROUTER_API_KEY_V2"));
         assert!(name_looks_like_key(hex64).is_some());
         assert!(name_looks_like_key("sk-or-v1-abc").is_some());
+        // A secret of another shape: 32 hex digits (as a name, in upper
+        // case too, or after a '/' of a model id), a random token.
+        let hex32 = "a1b2c3d4e5f60718293a4b5c6d7e8f9b";
+        assert!(name_looks_like_key(hex32).is_some());
+        assert!(name_looks_like_key(&hex32.to_ascii_uppercase()).is_some());
+        assert!(looks_like_key(&format!("x/y{hex32}")).is_some());
+        assert!(name_looks_like_key("abcDEF123ghiJKL4").is_some());
+        for ok in ["my_key", "openrouter_key_2", "KEY2025", "MyOpenRouterKey"] {
+            assert_eq!(name_looks_like_key(ok), None, "{ok}");
+        }
+        assert_eq!(quote_unless_key("banking77"), "'banking77'");
+        assert_eq!(quote_unless_key("sk-or-v1-abc"), "(12 bytes, not shown)");
         assert!(!is_env_name("97b727bdfe44e04718e4047763da731a"));
         assert!(!is_env_name("1KEY"));
         assert!(is_env_name("_KEY") && is_env_name("my_key"));
@@ -916,11 +966,13 @@ mod tests {
             "OPENROUTER_API_KEY",
             "deepseek/deepseek-v4.1-flash",
             "openrouter/auto",
-            "a/0123456789abcdef0123456789abcdef0123456789abcdef",
+            "a/some-very-long-model-slug-with-many-words-v2",
             "MY_KEY",
         ] {
             assert!(looks_like_key(v).is_none(), "{v:?}");
         }
+        // 32 hexadecimal digits in a row are a secret, '/' or not.
+        assert!(looks_like_key("a/0123456789abcdef0123456789abcdef0123456789abcdef").is_some());
         let e = format!(
             "{:#}",
             check_oracle_base_url("--oracle-base-url", "https://h/SK-OR-V1-0123456789/api")

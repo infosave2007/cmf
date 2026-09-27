@@ -2007,7 +2007,11 @@ enum SkillCmd {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    // A usage error never echoes an argument that looks like a key.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => decision::exit_on_clap_error(e),
+    };
 
     // The engine cannot depend on the CLI, but the draft's device pack wants
     // the converter's q2tp encoder to requantize its experts at upload —

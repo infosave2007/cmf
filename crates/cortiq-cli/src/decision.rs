@@ -186,6 +186,57 @@ fn parse_max_price(s: &str) -> std::result::Result<(f64, f64), String> {
     oracle_setup::parse_max_price(s).map_err(|e| e.to_string())
 }
 
+/// The arguments of `args` (the program's name aside) that look like a key
+/// ([`cortiq_decision::config::looks_like_key`]): a whole argument, or the
+/// value of `--flag=VALUE`. Longest first.
+pub fn key_like_args(args: &[std::ffi::OsString]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for a in args.iter().skip(1) {
+        let a = a.to_string_lossy();
+        let mut candidates = vec![a.to_string()];
+        if a.starts_with('-')
+            && let Some((_, v)) = a.split_once('=')
+        {
+            candidates.push(v.to_string());
+        }
+        for c in candidates {
+            if !c.is_empty()
+                && cortiq_decision::config::looks_like_key(&c).is_some()
+                && !out.contains(&c)
+            {
+                out.push(c);
+            }
+        }
+    }
+    out.sort_by_key(|c| std::cmp::Reverse(c.len()));
+    out
+}
+
+/// `text` with every argument of `secrets` replaced by its length.
+pub fn redact_args(text: &str, secrets: &[String]) -> String {
+    let mut t = text.to_string();
+    for s in secrets {
+        t = t.replace(s.as_str(), &format!("({} bytes, not shown)", s.len()));
+    }
+    t
+}
+
+/// Report a command-line error of clap and exit. clap's own messages quote
+/// what they refuse (`unexpected argument '…' found`, `unexpected value '…'
+/// for '--flag' found`): a key pasted as a stray argument would land in the
+/// terminal and in every captured log. When an argument looks like a key,
+/// the message shows it only by its length (uncoloured); otherwise clap
+/// reports as usual.
+pub fn exit_on_clap_error(e: clap::Error) -> ! {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let secrets = key_like_args(&args);
+    if secrets.is_empty() || !e.use_stderr() {
+        e.exit();
+    }
+    eprint!("{}", redact_args(&e.to_string(), &secrets));
+    std::process::exit(e.exit_code());
+}
+
 /// `--oracle-budget USD`: a finite non-negative number (never echoed).
 fn parse_budget(s: &str) -> std::result::Result<f64, String> {
     oracle_setup::refuse_key_in_number(s).map_err(|e| e.to_string())?;
@@ -1369,6 +1420,16 @@ impl OracleRun {
         (used + next > cfg.budget_usd).then_some(Limit::RunBudget)
     }
 
+    /// Whether the run's budget (on top of what the ledger held at the
+    /// start) cannot hold a call reserving `next`.
+    fn run_budget_short(&self, next: f64) -> bool {
+        self.cascade.as_ref().is_some_and(|c| {
+            let o = c.oracle();
+            let t = o.totals();
+            t.spent + t.inflight + next > o.config().budget_usd
+        })
+    }
+
     /// What refuses the oracle's calls for the budget, and what to do about
     /// it; `next` is the reservation that did not fit (or the smallest one).
     fn budget_text(&self, next: Option<f64>) -> String {
@@ -1377,6 +1438,13 @@ impl OracleRun {
             .as_ref()
             .map_or("-".into(), |p| p.display().to_string());
         let t = self.totals();
+        // Without a refused call the figure is the smallest possible call's:
+        // a lower bound.
+        let more = if next.is_none() {
+            ", more for longer questions"
+        } else {
+            ""
+        };
         let (next, reserves) = match next {
             Some(r) => (r, format!("the next call reserves {}", usd_fine(r))),
             None => {
@@ -1404,6 +1472,15 @@ impl OracleRun {
                 usd(b),
                 usd(t.ledger_spent),
             ),
+            Some(Limit::RunCalls) if self.max_calls == 0 && self.run_budget_short(next) => {
+                format!(
+                    "--oracle-max-calls 0 allows no oracle call, and the oracle budget of this run \
+                     ({}) cannot hold one ({reserves} before it is sent): pass --oracle-max-calls \
+                     of at least 1 and --oracle-budget of at least {}{more}",
+                    usd(self.budget),
+                    usd_ceil(next),
+                )
+            }
             Some(Limit::RunCalls) if self.max_calls == 0 => {
                 "--oracle-max-calls 0 allows no oracle call: pass a larger --oracle-max-calls"
                     .to_string()
@@ -1420,7 +1497,7 @@ impl OracleRun {
             ),
             Some(Limit::RunBudget) | None if t.calls == 0 => format!(
                 "the oracle budget of this run ({}) is too small to hold one call ({reserves} \
-                 before it is sent): pass --oracle-budget of at least {}",
+                 before it is sent): pass --oracle-budget of at least {}{more}",
                 usd(self.budget),
                 usd_ceil(next),
             ),
@@ -1476,13 +1553,16 @@ impl OracleRun {
             _ => return s,
         };
         let spent_before = t.ledger_calls > 0 || t.ledger_spent > 0.0;
+        // The call limit binds first; the budget may be short as well.
+        let too_small = |calls_zero: bool| OracleStatus::BudgetTooSmall {
+            min_usd: (!calls_zero || self.run_budget_short(next)).then_some(next),
+            calls_zero,
+        };
         match self.binding_limit(next) {
-            Some(Limit::RunBudget | Limit::RunCalls) => {
-                OracleStatus::BudgetTooSmall { min_usd: next }
-            }
-            Some(Limit::AdminBudget(_) | Limit::AdminCalls(_)) if !spent_before => {
-                OracleStatus::BudgetTooSmall { min_usd: next }
-            }
+            Some(Limit::RunBudget) => too_small(false),
+            Some(Limit::RunCalls) => too_small(true),
+            Some(Limit::AdminBudget(_)) if !spent_before => too_small(false),
+            Some(Limit::AdminCalls(_)) if !spent_before => too_small(true),
             Some(_) => OracleStatus::BudgetExhausted,
             None => s,
         }
@@ -1714,7 +1794,7 @@ impl OracleRun {
                 _ => None,
             },
             "min_call_usd": match &status {
-                OracleStatus::BudgetTooSmall { min_usd } => Some(*min_usd),
+                OracleStatus::BudgetTooSmall { min_usd, .. } => *min_usd,
                 _ => None,
             },
             "stop_reason": st.as_ref().and_then(|s| s.stop_reason.clone()),

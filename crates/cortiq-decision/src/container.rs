@@ -1104,8 +1104,12 @@ impl DecisionModel {
     }
 
     fn skill_or_err(&self, id: &str) -> Result<&LoadedSkill> {
-        self.skill(id)
-            .ok_or_else(|| anyhow::anyhow!("no skill '{id}' in this model"))
+        self.skill(id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "no skill {} in this model",
+                crate::config::quote_unless_key(id)
+            )
+        })
     }
 
     fn task_record(&self, skill: &str, i: usize) -> Result<&TaskRecord> {

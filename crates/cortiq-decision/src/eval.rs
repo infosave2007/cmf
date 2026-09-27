@@ -229,9 +229,12 @@ impl SkillScorer {
 
     /// The scorer of a skill of a loaded file (base + overlay).
     pub fn from_model(model: &DecisionModel, id: &str) -> Result<Self> {
-        let skill = model
-            .skill(id)
-            .ok_or_else(|| anyhow::anyhow!("no skill '{id}' in this file"))?;
+        let skill = model.skill(id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "no skill {} in this file",
+                crate::config::quote_unless_key(id)
+            )
+        })?;
         let m = &skill.manifest;
         let mut held: Vec<Option<TopologyRef<'_>>> = Vec::new();
         for (i, t) in m.tasks.iter().enumerate() {
@@ -442,7 +445,8 @@ pub fn select_skill(model: &DecisionModel, skill: Option<&str>) -> Result<String
         Some(id) => {
             ensure!(
                 ids.contains(&id),
-                "no skill '{id}' in this file (skills: {})",
+                "no skill {} in this file (skills: {})",
+                crate::config::quote_unless_key(id),
                 ids.join(", ")
             );
             Ok(id.to_string())

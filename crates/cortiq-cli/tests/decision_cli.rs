@@ -64,9 +64,16 @@
 //!   warning, the others are `bad_key` and never sent, and no key byte is in
 //!   any output, log, state file or ledger; key-like values of any prefix
 //!   in `--oracle`, `--oracle-key-env`, `--model`, `--key-env` are refused
-//!   unshown; `budget_too_small` against `budget_exhausted`; the command
-//!   line's missing-key words; `oracle check --max-price` for a model
-//!   listed only with variable pricing.
+//!   unshown, and so is a key pasted as a stray argument in a usage error;
+//!   a hostile upstream echoing the `Authorization` header (in
+//!   `finish_reason`, `provider` or `model` interleaved with control,
+//!   invisible or punctuation characters, an error body, a 500, the
+//!   content) leaks no byte of it through any surface;
+//!   `budget_too_small` against `budget_exhausted`, and from a budget of 0
+//!   or 1e-7 the advised figure is the refused call's and admits it;
+//!   `max_calls` 0 named as the call limit; the command line's missing-key
+//!   words; `oracle check --max-price` for a model listed only with
+//!   variable pricing.
 
 #[path = "support/toy_dir.rs"]
 mod toy_dir;
@@ -2518,6 +2525,131 @@ const FAKE_OPENROUTER_KEY: &str = "sk-or-v1-FAKE-two-steps-u1-0123456789abcdef-c
 /// OpenRouter's masked form of the fake key in `GET /auth/key` (`label`).
 const KEY_LABEL: &str = "sk-or-v1-FAK...cmf";
 
+/// A second valid key of the mock, of OpenRouter's real shape (64 hex
+/// digits): an echo the letters and digits of which are kept (the old
+/// `finish_<letters and digits>` code) holds 8 of its bytes in a row.
+const HEX_OPENROUTER_KEY: &str =
+    concat!("sk-or-v1-", "4dd32cb05ecdedcd9551a7e0f3b86c21", "d49e7a05bc3f168e2d90a4c7b5e13f68"); // an obviously fake test key, split so secret scanners do not flag it
+
+/// The key of a request head, when it is one the mock accepts.
+fn valid_bearer(head: &str) -> bool {
+    [FAKE_OPENROUTER_KEY, HEX_OPENROUTER_KEY].iter().any(|k| {
+        head.contains(&format!("Bearer {k}\r\n")) || head.ends_with(&format!("Bearer {k}"))
+    })
+}
+
+/// The `Authorization` header value of a request head ("" without one).
+fn authorization_of(head: &str) -> String {
+    head.split("\r\n")
+        .find_map(|l| {
+            let (name, value) = l.split_once(':')?;
+            name.eq_ignore_ascii_case("authorization")
+                .then(|| value.trim().to_string())
+        })
+        .unwrap_or_default()
+}
+
+/// How a hostile (or broken) upstream echoes the request's `Authorization`
+/// header into its answer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Echo {
+    /// `finish_reason` is the header.
+    FinishReason,
+    /// `finish_reason` is the header's letters, digits and '_' only.
+    FinishAlnum,
+    /// `provider` is `x/` and the header with U+0001 between its characters.
+    ProviderCtrl,
+    /// `provider` is `x/` and the header with U+200B between its characters.
+    ProviderZeroWidth,
+    /// `model` is the configured id, U+0001 and the header with U+0001
+    /// between its characters (it still starts with the configured id).
+    ModelCtrl,
+    /// `provider` is the header with '.' between its characters.
+    ProviderDotted,
+    /// HTTP 200 whose body is only `{"error": {"message": header}}`.
+    ErrorBody,
+    /// HTTP 500 with the header in the body.
+    Status500,
+    /// `content` gives the header as every verdict.
+    Content,
+}
+
+impl Echo {
+    const ALL: [Echo; 9] = [
+        Echo::FinishReason,
+        Echo::FinishAlnum,
+        Echo::ProviderCtrl,
+        Echo::ProviderZeroWidth,
+        Echo::ModelCtrl,
+        Echo::ProviderDotted,
+        Echo::ErrorBody,
+        Echo::Status500,
+        Echo::Content,
+    ];
+
+    /// The error code of a call answered so (`None`: answered).
+    fn error(self) -> Option<&'static str> {
+        match self {
+            Echo::FinishReason | Echo::FinishAlnum => Some("finish_other"),
+            Echo::ErrorBody => Some("error_body"),
+            Echo::Status500 => Some("http_500"),
+            Echo::Content => Some("choice_outside_contract"),
+            Echo::ProviderCtrl
+            | Echo::ProviderZeroWidth
+            | Echo::ModelCtrl
+            | Echo::ProviderDotted => None,
+        }
+    }
+}
+
+/// The mock's answer to a chat call echoing `auth` as `echo` says.
+fn echo_reply(echo: Echo, auth: &str, mut v: Value) -> (u16, Vec<u8>) {
+    let join = |sep: &str| auth.chars().map(String::from).collect::<Vec<_>>().join(sep);
+    match echo {
+        Echo::FinishReason => v["choices"][0]["finish_reason"] = json!(auth),
+        Echo::FinishAlnum => {
+            v["choices"][0]["finish_reason"] = json!(
+                auth.chars()
+                    .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect::<String>()
+            )
+        }
+        Echo::ProviderCtrl => v["provider"] = json!(format!("x/{}", join("\u{1}"))),
+        Echo::ProviderZeroWidth => v["provider"] = json!(format!("x/{}", join("\u{200b}"))),
+        Echo::ModelCtrl => v["model"] = json!(format!("{ORACLE_MODEL}\u{1}{}", join("\u{1}"))),
+        Echo::ProviderDotted => v["provider"] = json!(join(".")),
+        Echo::ErrorBody => {
+            return (
+                200,
+                json!({"error": {"code": 502, "message": format!("upstream said {auth}")}})
+                    .to_string()
+                    .into_bytes(),
+            );
+        }
+        Echo::Status500 => {
+            return (
+                500,
+                json!({"error": {"code": 500, "message": format!("boom {auth}")}})
+                    .to_string()
+                    .into_bytes(),
+            );
+        }
+        Echo::Content => {
+            let content: Value =
+                serde_json::from_str(v["choices"][0]["message"]["content"].as_str().unwrap())
+                    .unwrap();
+            let echoed: Map<String, Value> = content
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(|k| (k.clone(), json!(auth)))
+                .collect();
+            v["choices"][0]["message"]["content"] = json!(Value::Object(echoed).to_string());
+        }
+    }
+    (200, serde_json::to_vec(&v).unwrap())
+}
+
 /// One request a mock received: (head as sent, body).
 type Request = (String, Vec<u8>);
 
@@ -2562,6 +2694,8 @@ struct ChatQuirk {
     cost: Option<f64>,
     /// Wait this long before answering.
     delay: Option<Duration>,
+    /// Echo the request's `Authorization` header into the answer.
+    echo: Option<Echo>,
 }
 
 /// The answer of the mock to one request: (status, body).
@@ -2617,9 +2751,7 @@ fn openrouter_reply(
         // The key's description: valid only for the fake key (its `label`
         // is a masked form of it, which must never be printed).
         ("GET", "/api/v1/auth/key") => {
-            if head.contains(&format!("Bearer {FAKE_OPENROUTER_KEY}\r\n"))
-                || head.ends_with(&format!("Bearer {FAKE_OPENROUTER_KEY}"))
-            {
+            if valid_bearer(head) {
                 (
                     200,
                     json!({"data": {"label": KEY_LABEL, "limit": 10.0, "usage": 1.25,
@@ -2636,9 +2768,7 @@ fn openrouter_reply(
             }
         }
         // Any other key is refused, as OpenRouter refuses an invalid one.
-        ("POST", "/api/v1/chat/completions")
-            if !head.contains(&format!("Bearer {FAKE_OPENROUTER_KEY}")) =>
-        {
+        ("POST", "/api/v1/chat/completions") if !valid_bearer(head) => {
             (
                 401,
                 br#"{"error":{"message":"User not found.","code":401}}"#.to_vec(),
@@ -2653,7 +2783,10 @@ fn openrouter_reply(
             let req: Value = serde_json::from_slice(body).unwrap();
             v["model"] = quirk.model.map_or_else(|| req["model"].clone(), |m| json!(m));
             v["usage"]["cost"] = json!(quirk.cost.unwrap_or(cost));
-            (200, serde_json::to_vec(&v).unwrap())
+            match quirk.echo {
+                Some(echo) => echo_reply(echo, &authorization_of(head), v),
+                None => (200, serde_json::to_vec(&v).unwrap()),
+            }
         }
         _ => (
             404,
@@ -5104,6 +5237,14 @@ fn fuzzed_keys() -> Vec<(std::ffi::OsString, KeyFuzz)> {
             KeyFuzz::Bad("whitespace inside it at byte 21"),
         ),
         (
+            // Positions and length among the raw bytes, the whitespace
+            // around the key counted.
+            v(format!(" \t{a}\u{1}{b}\n")),
+            KeyFuzz::Bad(Box::leak(
+                format!("a control character at byte 23 of {}", k.len() + 4).into_boxed_str(),
+            )),
+        ),
+        (
             v(format!("{a}\t{b}")),
             KeyFuzz::Bad("whitespace inside it at byte 21"),
         ),
@@ -5560,9 +5701,9 @@ fn key_like_values_are_refused_unshown_and_unsent_by_every_flag() {
         }
     }
     assert!(mock.requests().is_empty(), "nothing was sent");
-    // Upper case, and values of no key's shape: a hex secret is not a model
-    // id (no '/') nor a variable's name (it starts with a digit); refused,
-    // only the length shown.
+    // Upper case, and values of no key's shape: a hex secret (32 hex digits
+    // in a row) is neither a model id nor a variable's name; refused, only
+    // the length shown.
     for (v, model_why, name_why) in [
         (
             "SK-OR-V1-ABCDEF0123",
@@ -5571,7 +5712,7 @@ fn key_like_values_are_refused_unshown_and_unsent_by_every_flag() {
         ),
         (
             "97b727bdfe44e04718e4047763da731a",
-            "has no '/'",
+            "looks like a key (it holds 32 or more hexadecimal digits in a row)",
             "not the key itself",
         ),
     ] {
@@ -5850,7 +5991,7 @@ fn budgets_too_small_and_used_up_and_the_command_line_key_messages() {
     assert_eq!(
         hint,
         format!(
-            "the oracle budget cannot hold one call (it needs {} reserved before it is sent): restart the server with --oracle-budget of at least {} (and --oracle-max-calls of at least 1)",
+            "the oracle budget cannot hold one call (it needs {} reserved before it is sent): restart the server with --oracle-budget of at least {}",
             usd_fine(need),
             usd_ceil(need)
         )
@@ -6120,4 +6261,477 @@ fn budgets_too_small_and_used_up_and_the_command_line_key_messages() {
     assert_eq!(o.status.code(), Some(1), "{}", show(&o));
     let v = json_of(&stdout_of(&o));
     assert_eq!(v["problems"][0]["code"], "max_price_too_low", "{v}");
+}
+
+/// The first 8-byte window of [`HEX_OPENROUTER_KEY`]'s secret in `bytes`.
+fn hex_key_window_in(bytes: &[u8]) -> Option<String> {
+    let secret = &HEX_OPENROUTER_KEY.as_bytes()["sk-or-v1-".len()..];
+    bytes
+        .windows(8)
+        .find(|w| secret.windows(8).any(|x| x == *w))
+        .map(|w| String::from_utf8_lossy(w).into_owned())
+}
+
+fn assert_no_hex_key_in(bytes: &[u8], what: &str) {
+    if let Some(w) = hex_key_window_in(bytes) {
+        panic!(
+            "{what} holds key bytes ({w})\n{}",
+            String::from_utf8_lossy(bytes)
+        );
+    }
+}
+
+#[test]
+fn a_hostile_upstream_echoing_the_key_leaks_no_byte_of_it_anywhere() {
+    let t = toy();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let mock = MockOpenRouter::start("travel", 1.3e-5);
+    let base = mock.base();
+    let key = std::ffi::OsStr::new(HEX_OPENROUTER_KEY);
+    let text = distinct_texts(1, 31, "echo", 0.97).remove(0);
+    let rows = write(d, "rows.jsonl", &format!("{}\n", json!({ "text": text })));
+    let save = |name: String, o: &Output| {
+        std::fs::write(d.join(format!("{name}.out")), &o.stdout).unwrap();
+        std::fs::write(d.join(format!("{name}.err")), &o.stderr).unwrap();
+        assert_no_hex_key_in(&o.stdout, &format!("{name} stdout"));
+        assert_no_hex_key_in(&o.stderr, &format!("{name} stderr"));
+    };
+    for echo in Echo::ALL {
+        let case = format!("{echo:?}");
+        mock.set_quirk(ChatQuirk {
+            echo: Some(echo),
+            ..ChatQuirk::default()
+        });
+        let want = echo.error();
+        let chats = mock.chats();
+
+        // 1. oracle check --test-call (text, then --json), RUST_LOG=trace.
+        let o = output_with_key(
+            &[
+                "decision",
+                "oracle",
+                "check",
+                "--base-url",
+                &base,
+                "--test-call",
+            ],
+            key,
+        );
+        save(format!("{case}-check"), &o);
+        let out = stdout_of(&o);
+        match want {
+            None => {
+                assert!(o.status.success(), "{case}\n{}", show(&o));
+                assert!(
+                    out.contains("  ✓ test call  answered 'yes'"),
+                    "{case}\n{out}"
+                );
+            }
+            Some(code) => {
+                assert_eq!(o.status.code(), Some(1), "{case}\n{}", show(&o));
+                assert!(
+                    out.contains(&format!("  ✗ test call  failed ({code}")),
+                    "{case}\n{out}"
+                );
+            }
+        }
+        let o = output_with_key(
+            &[
+                "decision",
+                "oracle",
+                "check",
+                "--base-url",
+                &base,
+                "--test-call",
+                "--json",
+            ],
+            key,
+        );
+        save(format!("{case}-checkj"), &o);
+        let v = json_of(&stdout_of(&o));
+        assert_eq!(v["test_call"]["error"].as_str(), want, "{case}: {v}");
+        if matches!(
+            echo,
+            Echo::ProviderCtrl | Echo::ProviderZeroWidth | Echo::ProviderDotted
+        ) {
+            assert_eq!(v["test_call"]["provider"], "[redacted]", "{case}: {v}");
+        }
+
+        // 2. decide -p (--json, then the human output) and a batch row.
+        let st = d.join(format!("{case}-decide"));
+        let decide = |extra: &[&str]| {
+            let mut a = vec![
+                "decide",
+                s(&t.path),
+                "--skill",
+                "topics",
+                "--oracle",
+                ORACLE_MODEL,
+                "--oracle-base-url",
+                &base,
+            ];
+            a.extend_from_slice(extra);
+            output_with_key(&a, key)
+        };
+        let o = decide(&["-p", &text, "--state", s(&st), "--json"]);
+        save(format!("{case}-decide"), &o);
+        assert!(o.status.success(), "{case}\n{}", show(&o));
+        let v = json_of(&stdout_of(&o));
+        let q = &v["cmf"]["questions"]["task"];
+        match want {
+            None => assert_eq!(q["action"], "oracle", "{case}: {v}"),
+            Some(code) => {
+                assert_eq!(q["flags"], json!(["oracle_unavailable"]), "{case}: {v}");
+                assert_eq!(v["cmf"]["oracle"]["last_error"], code, "{case}: {v}");
+            }
+        }
+        let o = decide(&["-p", &text, "--state", s(&d.join(format!("{case}-human")))]);
+        save(format!("{case}-human"), &o);
+        let o = decide(&[
+            "--input",
+            s(&rows),
+            "--out",
+            s(&d.join(format!("{case}-batch.jsonl"))),
+            "--state",
+            s(&d.join(format!("{case}-batch"))),
+        ]);
+        save(format!("{case}-batch"), &o);
+        assert!(o.status.success(), "{case}\n{}", show(&o));
+
+        // 3. serve --oracle, RUST_LOG=trace: one decision, the admin view,
+        // the logs and the state.
+        let srv = Server::start_os(
+            &t.path,
+            &[
+                "--state",
+                s(&d.join(format!("{case}-serve"))),
+                "--oracle",
+                ORACLE_MODEL,
+                "--oracle-base-url",
+                &base,
+            ],
+            &[
+                ("CORTIQ_DECISION_ADMIN_TOKEN", ADMIN_TOKEN),
+                ("RUST_LOG", "trace"),
+            ],
+            &[("OPENROUTER_API_KEY", key)],
+            d,
+        );
+        let (code, r) = http(
+            "POST",
+            &srv.url("/v1/decisions"),
+            None,
+            Some(&topics_request(&text)),
+        );
+        assert_eq!(code, 200, "{case}: {r}");
+        assert_no_hex_key_in(r.to_string().as_bytes(), &format!("{case} answer"));
+        let adm = oracle_status(&srv);
+        assert_no_hex_key_in(adm.to_string().as_bytes(), &format!("{case} admin"));
+        match want {
+            None => assert_eq!(r["cmf"]["questions"]["task"]["action"], "oracle", "{r}"),
+            Some(code) => {
+                assert_eq!(
+                    r["cmf"]["questions"]["task"]["flags"],
+                    json!(["oracle_unavailable"]),
+                    "{case}: {r}"
+                );
+                assert_eq!(adm["last_error"], code, "{case}: {adm}");
+            }
+        }
+        let logs = srv.stop();
+        assert!(logs.contains("DEBUG"), "RUST_LOG=trace is in effect");
+        assert_no_hex_key_in(logs.as_bytes(), &format!("{case} serve logs"));
+        // Every call reached the mock: check, decide ×3, serve.
+        assert_eq!(mock.chats(), chats + 6, "{case}");
+    }
+    // Everything written: outputs, logs, ledgers, states, batch rows.
+    for f in files_under(d) {
+        assert_no_hex_key_in(&std::fs::read(&f).unwrap(), &f.display().to_string());
+    }
+    // The ledgers name the provider and model of an echo only redacted.
+    let ledger = std::fs::read_to_string(d.join("ProviderCtrl-serve/oracle.jsonl")).unwrap();
+    assert!(ledger.contains(r#""provider":"[redacted]""#), "{ledger}");
+    let ledger = std::fs::read_to_string(d.join("ModelCtrl-serve/oracle.jsonl")).unwrap();
+    assert!(ledger.contains(r#""model":"[redacted]""#), "{ledger}");
+}
+
+#[test]
+fn a_key_pasted_as_a_stray_argument_is_shown_only_by_its_length() {
+    let t = toy();
+    let dir = tempfile::tempdir().unwrap();
+    let st = dir.path().join("state");
+    let k = HEX_OPENROUTER_KEY;
+    let n = k.len();
+    let file = s(&t.path);
+    let cases: Vec<Vec<String>> = vec![
+        vec!["decision".into(), "oracle".into(), "check".into(), k.into()],
+        vec![
+            "decision".into(),
+            "oracle".into(),
+            "check".into(),
+            format!("--test-call={k}"),
+        ],
+        vec![
+            "serve".into(),
+            file.into(),
+            "--state".into(),
+            s(&st).into(),
+            "--oracle".into(),
+            ORACLE_MODEL.into(),
+            k.into(),
+        ],
+        vec![
+            "serve".into(),
+            file.into(),
+            "--state".into(),
+            s(&st).into(),
+            "--oracle".into(),
+            ORACLE_MODEL.into(),
+            format!("--no-oracle-learning={k}"),
+        ],
+        vec![
+            "decide".into(),
+            file.into(),
+            "-p".into(),
+            "hello there".into(),
+            "--oracle".into(),
+            ORACLE_MODEL.into(),
+            k.into(),
+        ],
+        vec![
+            "decide".into(),
+            file.into(),
+            "-p".into(),
+            "hello there".into(),
+            format!("--json={k}"),
+        ],
+        vec![k.into()],
+        // A key with its .env line ending, and another prefix.
+        vec![
+            "decision".into(),
+            "oracle".into(),
+            "check".into(),
+            format!("{k}\r\n"),
+        ],
+        vec![
+            "decision".into(),
+            "oracle".into(),
+            "check".into(),
+            k["sk-or-v1-".len()..].to_string(),
+        ],
+    ];
+    for args in cases {
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let o = output(&refs, &[]);
+        let all = show(&o);
+        assert_eq!(o.status.code(), Some(2), "{args:?}\n{all}");
+        assert_no_hex_key_in(all.as_bytes(), &format!("{args:?}"));
+        assert!(all.contains("bytes, not shown)"), "{args:?}\n{all}");
+        if refs.contains(&k) {
+            assert!(all.contains(&format!("({n} bytes, not shown)")), "{all}");
+        }
+    }
+    assert!(!st.exists(), "nothing was started");
+    // An ordinary usage error is clap's own, unchanged.
+    let o = output(&["decision", "oracle", "check", "stray"], &[]);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(stderr_of(&o).contains("'stray'"), "{}", show(&o));
+}
+
+#[test]
+fn budget_minimums_from_zero_admit_the_real_call_and_max_calls_zero_names_the_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let mock = MockOpenRouter::start("travel", 1.3e-5);
+    let base = mock.base();
+    let key = [("OPENROUTER_API_KEY", FAKE_OPENROUTER_KEY)];
+    let text = distinct_texts(1, 29, "bz", 0.97).remove(0);
+    let decide = |state: &str, budget: &str| {
+        let o = decide_oracle(
+            &base,
+            &["-p", &text],
+            &[
+                "--state",
+                s(&d.join(state)),
+                "--oracle-budget",
+                budget,
+                "--json",
+            ],
+            &key,
+        );
+        assert!(o.status.success(), "{}", show(&o));
+        json_of(&stdout_of(&o))
+    };
+
+    // A budget below even the smallest possible call (0, 1e-7): the refused
+    // request's hint and min_call_usd name that request's reservation (not
+    // the smallest call's), and that figure makes the call.
+    for (i, budget) in ["0", "0.0000001"].into_iter().enumerate() {
+        let srv = serve_oracle(
+            &d.join(format!("s{i}")),
+            &base,
+            &["--oracle-budget", budget],
+            &key,
+            d,
+        );
+        let st = oracle_status(&srv);
+        assert_eq!(st["status"], "budget_too_small", "{st}");
+        let smallest = st["min_call_usd"].as_f64().unwrap();
+        let (_, r) = http(
+            "POST",
+            &srv.url("/v1/decisions"),
+            None,
+            Some(&topics_request(&text)),
+        );
+        assert_eq!(
+            r["cmf"]["questions"]["task"]["flags"],
+            json!(["budget"]),
+            "{r}"
+        );
+        let st = oracle_status(&srv);
+        assert_eq!(st["status"], "budget_too_small", "{st}");
+        let need = st["min_call_usd"].as_f64().unwrap();
+        assert!(need > smallest, "budget {budget}: {st}");
+        let hint = r["cmf"]["hint"].as_str().unwrap().to_string();
+        assert_eq!(
+            hint,
+            format!(
+                "the oracle budget cannot hold one call (it needs {} reserved before it is sent): restart the server with --oracle-budget of at least {}",
+                usd_fine(need),
+                usd_ceil(need)
+            )
+        );
+        srv.stop();
+        let advised = hint.rsplit("at least $").next().unwrap().to_string();
+        let chats = mock.chats();
+        let srv = serve_oracle(
+            &d.join(format!("s{i}-fixed")),
+            &base,
+            &["--oracle-budget", &advised],
+            &key,
+            d,
+        );
+        let (_, r) = http(
+            "POST",
+            &srv.url("/v1/decisions"),
+            None,
+            Some(&topics_request(&text)),
+        );
+        assert_eq!(r["cmf"]["questions"]["task"]["action"], "oracle", "{r}");
+        srv.stop();
+        assert_eq!(mock.chats(), chats + 1);
+
+        // decide -p: the same, with the command line's words.
+        // (decide's question is the skill's own, so its body and
+        // reservation differ from the server request's.)
+        let v = decide(&format!("d{i}"), budget);
+        let or = &v["cmf"]["oracle"];
+        assert_eq!(or["status"], "budget_too_small", "{v}");
+        let need = or["min_call_usd"].as_f64().unwrap();
+        assert!(need > smallest, "budget {budget}: {v}");
+        let hint = v["cmf"]["hint"].as_str().unwrap();
+        assert!(
+            hint.ends_with(&format!(
+                "is too small to hold one call (the next call reserves {} before it is sent): pass --oracle-budget of at least {}",
+                usd_fine(need),
+                usd_ceil(need)
+            )),
+            "{hint}"
+        );
+        let advised = hint.rsplit("at least $").next().unwrap().to_string();
+        let v = decide(&format!("d{i}-fixed"), &advised);
+        assert_eq!(v["cmf"]["questions"]["task"]["action"], "oracle", "{v}");
+        assert_eq!(v["cmf"]["oracle"]["status"], "ready", "{v}");
+        assert_eq!(mock.chats(), chats + 2);
+    }
+
+    // max_calls 0 with a budget that holds the call: the call limit is
+    // named, not the budget.
+    let srv = serve_oracle(
+        &d.join("calls0"),
+        &base,
+        &["--oracle-max-calls", "0"],
+        &key,
+        d,
+    );
+    assert!(
+        srv.logs()
+            .contains("oracle: NOT ready — max_calls 0 allows no call ("),
+        "{}",
+        srv.logs()
+    );
+    assert_eq!(oracle_status(&srv)["status"], "budget_too_small");
+    let (_, r) = http(
+        "POST",
+        &srv.url("/v1/decisions"),
+        None,
+        Some(&topics_request(&text)),
+    );
+    assert_eq!(
+        r["cmf"]["hint"],
+        "max_calls 0 allows no oracle call: restart the server with --oracle-max-calls of at least 1",
+        "{r}"
+    );
+    srv.stop();
+    // Both 0: both named, the budget with the refused call's figure.
+    let srv = serve_oracle(
+        &d.join("both0"),
+        &base,
+        &["--oracle-max-calls", "0", "--oracle-budget", "0"],
+        &key,
+        d,
+    );
+    assert!(
+        srv.logs().contains(
+            "oracle: NOT ready — max_calls 0 allows no call, and the budget is too small: budget $0.00 cannot hold one call"
+        ),
+        "{}",
+        srv.logs()
+    );
+    let (_, r) = http(
+        "POST",
+        &srv.url("/v1/decisions"),
+        None,
+        Some(&topics_request(&text)),
+    );
+    let need = oracle_status(&srv)["min_call_usd"].as_f64().unwrap();
+    assert_eq!(
+        r["cmf"]["hint"],
+        format!(
+            "max_calls 0 allows no oracle call, and the budget cannot hold one call (it needs {} reserved before it is sent): restart the server with --oracle-max-calls of at least 1 and --oracle-budget of at least {}",
+            usd_fine(need),
+            usd_ceil(need)
+        ),
+        "{r}"
+    );
+    srv.stop();
+    // decide: the same two cases.
+    let o = decide_oracle(
+        &base,
+        &["-p", &text],
+        &[
+            "--state",
+            s(&d.join("dboth0")),
+            "--oracle-max-calls",
+            "0",
+            "--oracle-budget",
+            "0",
+            "--json",
+        ],
+        &key,
+    );
+    let v = json_of(&stdout_of(&o));
+    assert_eq!(v["cmf"]["oracle"]["status"], "budget_too_small", "{v}");
+    let need = v["cmf"]["oracle"]["min_call_usd"].as_f64().unwrap();
+    assert_eq!(
+        v["cmf"]["hint"],
+        format!(
+            "--oracle-max-calls 0 allows no oracle call, and the oracle budget of this run ($0.00) cannot hold one (the next call reserves {} before it is sent): pass --oracle-max-calls of at least 1 and --oracle-budget of at least {}",
+            usd_fine(need),
+            usd_ceil(need)
+        ),
+        "{v}"
+    );
+    assert_eq!(mock.chats(), 4, "nothing more was sent");
 }

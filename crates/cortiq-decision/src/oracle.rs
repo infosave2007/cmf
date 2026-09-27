@@ -32,7 +32,8 @@
 //! a body that is only an `error` is a failure; no finite `usage.cost ≥ 0` is a
 //! failure charged at the reservation; a `model` that does not start with the
 //! configured id is a failure and the stop `unexpected_model`; `finish_reason`
-//! must be `stop`; `content` must be a JSON object with exactly the asked
+//! must be `stop` (another is a failure of a fixed code, [`finish_code`], never
+//! the upstream's text); `content` must be a JSON object with exactly the asked
 //! question ids, no duplicate key, and each value of its schema type (a choice
 //! among the options, a score level `0..n`, a boolean). Invalid content is a
 //! failure that was paid for.
@@ -59,12 +60,13 @@
 //! **Key** ([`read_key`]): the raw bytes of the variable without
 //! surrounding ASCII whitespace (spaces, tabs, CR, LF — a `.env` file's; the
 //! surfaces warn that it was trimmed); a value that still holds whitespace,
-//! a control byte or a byte outside ASCII, starts with `Bearer ` or starts
-//! or ends with a quote is `bad_key` and never sent. Transport and read
-//! errors are fixed codes ([`transport_code`], [`read_code`]), never the
-//! library's text, which may hold a request header or a URL; what the
-//! upstream answers (`provider`, `model`) is kept only cleaned
-//! ([`clean_upstream`]).
+//! a control byte or a byte outside ASCII, starts with `Bearer `, is a whole
+//! `.env` line (`NAME=…`) or starts or ends with a quote is `bad_key` and
+//! never sent. Transport and read errors are fixed codes
+//! ([`transport_code`], [`read_code`]), never the library's text, which may
+//! hold a request header or a URL; what the upstream answers (`provider`,
+//! `model`) is kept only cleaned ([`clean_upstream`]); every error code is
+//! a fixed word.
 //!
 //! **Status** ([`OracleClient::status`], `status` of `GET /v1/admin/oracle`):
 //! `disabled` (not configured, or the admin switch is off), `no_key` (the
@@ -74,9 +76,12 @@
 //! were made), `budget_too_small` (nothing spent, and the budget cannot hold
 //! even the smallest possible call — one question of the shortest shape,
 //! [`smallest_body_len`] — or `max_calls` is 0, or it refused a real call
-//! while nothing was spent: `min_call_usd` is then that call's reservation)
-//! or `ready` — the order of the permission checks. A budget that refused a
-//! real call is not `ready` while what is left cannot hold it.
+//! while nothing was spent) or `ready` — the order of the permission checks.
+//! A budget that refused a real call is not `ready` while what is left
+//! cannot hold it; `min_call_usd` is the larger of the smallest possible
+//! call's reservation and the smallest real call the budget refused — a
+//! call refused by the coarse [`OracleClient::permission`] check too, whose
+//! body the caller then gives ([`OracleClient::note_budget_refusal`]).
 
 use crate::answer::OracleAnswer;
 use crate::canonical;
@@ -320,6 +325,21 @@ pub fn parse_verdicts(
     Ok(out)
 }
 
+/// The error code of a `finish_reason` other than `stop`, from a closed set:
+/// `finish_length`, `finish_content_filter`, `finish_tool_calls`,
+/// `finish_error` or `finish_other`. The upstream's text is never part of a
+/// code (a code reaches logs, ledgers and messages, and a hostile or broken
+/// proxy may echo the request's `Authorization` header there).
+pub fn finish_code(reason: &str) -> &'static str {
+    match reason {
+        "length" => "finish_length",
+        "content_filter" => "finish_content_filter",
+        "tool_calls" | "function_call" => "finish_tool_calls",
+        "error" => "finish_error",
+        _ => "finish_other",
+    }
+}
+
 /// Parse a 200 body (see the module notes).
 pub fn parse_response(body: &[u8], questions: &[&Question], model: &str) -> ParsedResponse {
     let mut out = ParsedResponse {
@@ -364,19 +384,18 @@ pub fn parse_response(body: &[u8], questions: &[&Question], model: &str) -> Pars
         out.verdicts = Err("no_choices".into());
         return out;
     };
-    match choice.get("finish_reason").and_then(Value::as_str) {
-        Some("stop") => {}
-        Some(other) => {
-            let r: String = other
-                .chars()
-                .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-                .take(32)
-                .collect();
-            out.verdicts = Err(format!("finish_{r}"));
+    match choice.get("finish_reason") {
+        Some(Value::String(r)) if r == "stop" => {}
+        Some(Value::String(r)) => {
+            out.verdicts = Err(finish_code(r).into());
             return out;
         }
-        None => {
+        Some(Value::Null) | None => {
             out.verdicts = Err("finish_missing".into());
+            return out;
+        }
+        Some(_) => {
+            out.verdicts = Err("finish_other".into());
             return out;
         }
     }
@@ -410,24 +429,38 @@ pub const UPSTREAM_TEXT_MAX: usize = 128;
 /// [`UPSTREAM_TEXT_MAX`] bytes, and `[redacted]` when it holds `Bearer`,
 /// looks like a key ([`crate::config::looks_like_key`]) or holds 8 bytes
 /// in a row of `key` — a hostile or broken proxy echoing the request's
-/// `Authorization` header.
+/// `Authorization` header. The checks see the raw string, the string kept
+/// (an echo interleaved with control or invisible characters is joined
+/// again by the filter, so it is checked after it) and its letters and
+/// digits alone (an echo interleaved with punctuation or spaces).
 pub fn clean_upstream(s: &str, key: Option<&str>) -> String {
     const REDACTED: &str = "[redacted]";
-    let lower = s.to_ascii_lowercase();
-    if lower.contains("bearer") || crate::config::looks_like_key(s.trim()).is_some() {
+    let kept: String = s
+        .chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .collect();
+    let alnum = |t: &str| -> Vec<u8> {
+        t.bytes()
+            .filter(u8::is_ascii_alphanumeric)
+            .map(|b| b.to_ascii_lowercase())
+            .collect()
+    };
+    let windows_of = |hay: &[u8], needle: &[u8]| {
+        needle.len() >= 8 && needle.windows(8).any(|w| hay.windows(8).any(|x| x == w))
+    };
+    let holds =
+        |hay: &[u8], words: &[&[u8]]| words.iter().any(|w| hay.windows(w.len()).any(|x| x == *w));
+    let joined = alnum(&kept);
+    let bad = [s, kept.as_str()].iter().any(|t| {
+        holds(t.to_ascii_lowercase().as_bytes(), &[b"bearer"])
+            || crate::config::looks_like_key(t.trim()).is_some()
+            || key.is_some_and(|k| windows_of(t.as_bytes(), k.as_bytes()))
+    }) || holds(&joined, &[b"bearer", b"skorv"])
+        || key.is_some_and(|k| windows_of(&joined, &alnum(k)));
+    if bad {
         return REDACTED.into();
     }
-    if let Some(k) = key {
-        let kb = k.as_bytes();
-        let sb = s.as_bytes();
-        if kb.len() >= 8 && kb.windows(8).any(|w| sb.windows(8).any(|x| x == w)) {
-            return REDACTED.into();
-        }
-    }
-    s.chars()
-        .filter(|c| c.is_ascii_graphic() || *c == ' ')
-        .take(UPSTREAM_TEXT_MAX)
-        .collect()
+    kept.chars().take(UPSTREAM_TEXT_MAX).collect()
 }
 
 // ------------------------------------------------------------------ key
@@ -505,10 +538,12 @@ fn is_edge_space(b: u8) -> bool {
 /// Check a raw value of the key variable: the state, and the key itself
 /// (without surrounding ASCII whitespace) only when it is usable. A key is
 /// refused (`bad_key`) when what is left after the trim is empty, starts
-/// with `Bearer ` (the request adds it), holds whitespace, a control byte or
-/// a byte outside ASCII (an HTTP header takes visible ASCII only), or starts
-/// or ends with a quote (a `.env` value copied with its quotes). The
-/// problem names positions and lengths only.
+/// with `Bearer ` (the request adds it), is a whole `.env` line (`NAME=…`),
+/// holds whitespace, a control byte or a byte outside ASCII (an HTTP header
+/// takes visible ASCII only), or starts or ends with a quote (a `.env` value
+/// copied with its quotes). The problem names positions and lengths only,
+/// those of the variable's raw bytes (the whitespace around the key
+/// counted).
 pub fn check_key(raw: Option<&str>) -> (KeyState, Option<String>) {
     check_key_bytes(raw.map(str::as_bytes))
 }
@@ -531,14 +566,27 @@ pub fn check_key_bytes(raw: Option<&[u8]>) -> (KeyState, Option<String>) {
         .map_or(bytes.len(), |p| p + 1);
     let kb = &bytes[start..end];
     let n = kb.len();
+    // Positions and lengths are those of the variable's raw bytes (what
+    // an editor shows of the `.env` line), the whitespace trimmed around
+    // the key included.
+    let raw_len = bytes.len();
     let bad = |problem: String| (KeyState::Bad(problem), None);
-    if n >= 7 && kb[..7].eq_ignore_ascii_case(b"bearer ") {
+    if n >= 7 && kb[..6].eq_ignore_ascii_case(b"bearer") && matches!(kb[6], b' ' | b'\t') {
         return bad(format!(
-            "it starts with 'Bearer ' ({n} bytes): put only the key in the variable, the request adds 'Bearer '"
+            "it starts with 'Bearer ' ({raw_len} bytes): put only the key in the variable, the request adds 'Bearer '"
+        ));
+    }
+    // A whole `.env` line (`NAME=value`) in the variable: a key holds no '='.
+    if let Some(eq) = kb.iter().position(|b| *b == b'=')
+        && eq > 0
+        && std::str::from_utf8(&kb[..eq]).is_ok_and(crate::config::is_env_name)
+    {
+        return bad(format!(
+            "it looks like a whole .env line, a name and '=' before the value ({raw_len} bytes): put only the key in the variable"
         ));
     }
     for (i, &b) in kb.iter().enumerate() {
-        let at = format!("at byte {} of {n}", i + 1);
+        let at = format!("at byte {} of {raw_len}", start + i + 1);
         if b == b' ' || b == b'\t' {
             return bad(format!("whitespace inside it {at} (a key has none)"));
         }
@@ -553,7 +601,7 @@ pub fn check_key_bytes(raw: Option<&[u8]>) -> (KeyState, Option<String>) {
     }
     if matches!(kb[0], b'"' | b'\'') || matches!(kb[n - 1], b'"' | b'\'') {
         return bad(format!(
-            "it starts or ends with a quote ({n} bytes): remove the quotes around the key"
+            "it starts or ends with a quote ({raw_len} bytes): remove the quotes around the key"
         ));
     }
     // Visible ASCII only here, so the bytes are text.
@@ -930,10 +978,10 @@ struct Inner {
     last_error: Option<String>,
     /// The reservation of the last call the budget refused (USD).
     last_budget_refusal: Option<f64>,
-    /// The smallest reservation the budget itself refused (not a key's
-    /// budget or credit, not the call limit): while what is left cannot hold
-    /// it, the status is `budget_too_small` (nothing used) or
-    /// `budget_exhausted`, never `ready`.
+    /// The smallest reservation the budget itself could not hold (not a
+    /// key's budget or credit): while what is left cannot hold it, the
+    /// status is `budget_too_small` (nothing used) or `budget_exhausted`,
+    /// never `ready`.
     budget_refusal: Option<f64>,
 }
 
@@ -1199,16 +1247,7 @@ impl OracleClient {
             let mut inner = self.inner.lock();
             if let Err(r) = self.admit(&inner, caller, res) {
                 if r == RefusalReason::Budget {
-                    inner.last_budget_refusal = Some(res);
-                    // The budget itself (not a key's budget or credit, not
-                    // the call limit) could not hold this call.
-                    let t = &inner.totals;
-                    if t.calls < self.max_calls(&inner.state)
-                        && t.spent + t.inflight + res > self.budget(&inner.state)
-                    {
-                        inner.budget_refusal =
-                            Some(inner.budget_refusal.map_or(res, |m| m.min(res)));
-                    }
+                    self.record_budget_refusal(&mut inner, res);
                 }
                 return CallOutcome::Refused(r);
             }
@@ -1301,6 +1340,35 @@ impl OracleClient {
         drop(key);
         self.settle(caller, &call_id, &key_id, res, latency, &outcome, stop);
         outcome
+    }
+
+    /// Remember a call refused for the budget: its reservation
+    /// ([`OracleClient::last_budget_refusal`]), and, when the budget itself
+    /// (not a key's budget or credit) could not hold it — whether or not the
+    /// call limit refused it first — the smallest such reservation, which
+    /// the status then names.
+    fn record_budget_refusal(&self, inner: &mut Inner, res: f64) {
+        inner.last_budget_refusal = Some(res);
+        let t = &inner.totals;
+        if t.spent + t.inflight + res > self.budget(&inner.state) {
+            inner.budget_refusal = Some(inner.budget_refusal.map_or(res, |m| m.min(res)));
+        }
+    }
+
+    /// The coarse [`OracleClient::permission`] refused for the budget before
+    /// a body was built: record the reservation the call for `questions`
+    /// about `state` (as it would be sent) would have made, so that the
+    /// status and the hints name a budget that admits it — not only the
+    /// smallest possible call's, which a real call exceeds.
+    pub fn note_budget_refusal(&self, questions: &[&Question], state: &Value) {
+        if questions.is_empty() {
+            return;
+        }
+        let body = request_body(&self.cfg, questions, state);
+        let mt = max_tokens(self.cfg.max_tokens_per_question, questions.len());
+        let res = reservation_usd(body.len(), mt, self.max_price);
+        let mut inner = self.inner.lock();
+        self.record_budget_refusal(&mut inner, res);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1471,31 +1539,33 @@ impl OracleClient {
             return OracleStatus::Stopped(r.clone());
         }
         let t = &inner.totals;
-        let min = self.min_reservation_usd();
-        let budget = self.budget(&inner.state);
+        let need = self.least_call_usd(inner);
         // Used up only when something was spent or reserved; a budget (or
-        // call limit) that could never hold one call is too small.
+        // call limit) that could never hold one call is too small. What is
+        // left must hold the smallest possible call, and a real (longer)
+        // call the budget refused (calls in flight aside, which only delay
+        // a call): a budget that refuses every call is never ready.
         let used = t.calls > 0 || t.spent > 0.0 || t.inflight > 0.0;
-        if t.calls >= self.max_calls(&inner.state) || budget - t.spent < min {
-            return if used {
-                OracleStatus::BudgetExhausted
-            } else {
-                OracleStatus::BudgetTooSmall { min_usd: min }
-            };
+        let calls_out = t.calls >= self.max_calls(&inner.state);
+        let budget_short = t.spent + need > self.budget(&inner.state);
+        if !calls_out && !budget_short {
+            return OracleStatus::Ready;
         }
-        // The budget holds the smallest possible call but refused a real one,
-        // and what is left still cannot hold it: not ready (calls in flight
-        // aside, which only delay a call).
-        if let Some(r) = inner.budget_refusal
-            && t.spent + r > budget
-        {
-            return if used {
-                OracleStatus::BudgetExhausted
-            } else {
-                OracleStatus::BudgetTooSmall { min_usd: r }
-            };
+        if used {
+            return OracleStatus::BudgetExhausted;
         }
-        OracleStatus::Ready
+        OracleStatus::BudgetTooSmall {
+            min_usd: budget_short.then_some(need),
+            calls_zero: calls_out,
+        }
+    }
+
+    /// The least budget a call needs: the smallest possible call's
+    /// reservation, or the reservation of a real (longer) call the budget
+    /// itself refused, whichever is larger — a figure that admits that call.
+    fn least_call_usd(&self, inner: &Inner) -> f64 {
+        let min = self.min_reservation_usd();
+        inner.budget_refusal.map_or(min, |r| r.max(min))
     }
 
     /// Whether a call can be made now, in the order of the permission checks:
@@ -1541,13 +1611,9 @@ impl OracleClient {
             "deadline_s": self.cfg.deadline_s,
             "redact_pii": self.cfg.redact_pii,
             "max_price": {"prompt": self.max_price.0, "completion": self.max_price.1},
-            // The least budget a call needs: what a budget too small lacks
-            // (the smallest refused call's reservation, when one was
-            // refused), else the smallest possible call's.
-            "min_call_usd": match status {
-                OracleStatus::BudgetTooSmall { min_usd } => min_usd,
-                _ => self.min_reservation_usd(),
-            },
+            // The least budget a call needs: the smallest possible call's
+            // reservation, or a real call's the budget refused (larger).
+            "min_call_usd": self.least_call_usd(&inner),
         })
     }
 
@@ -1808,6 +1874,22 @@ mod tests {
         fin["choices"][0]["finish_reason"] = json!("length");
         let p = parse_response(&serde_json::to_vec(&fin).unwrap(), &qs, m);
         assert_eq!(p.verdicts, Err("finish_length".into()));
+        // Any other finish_reason is a code of a closed set, never the
+        // upstream's text (a proxy may echo the Authorization header there).
+        for (reason, code) in [
+            (json!("content_filter"), "finish_content_filter"),
+            (json!("tool_calls"), "finish_tool_calls"),
+            (json!("error"), "finish_error"),
+            (json!(format!("Bearer {K}")), "finish_other"),
+            (json!("Bearer_sk_or_v1_F00DFACE0123"), "finish_other"),
+            (json!(7), "finish_other"),
+            (json!({"k": K}), "finish_other"),
+            (Value::Null, "finish_missing"),
+        ] {
+            fin["choices"][0]["finish_reason"] = reason;
+            let p = parse_response(&serde_json::to_vec(&fin).unwrap(), &qs, m);
+            assert_eq!(p.verdicts, Err(code.to_string()));
+        }
     }
 
     /// A fake key with a distinctive middle ("F00DFACE…") that must never
@@ -1865,6 +1947,15 @@ mod tests {
                 format!("a byte outside ASCII at byte {}", n + 1),
             ),
             (format!("Bearer {K}"), "it starts with 'Bearer '".into()),
+            (format!("Bearer\t{K}"), "it starts with 'Bearer '".into()),
+            (
+                format!("OPENROUTER_API_KEY={K}"),
+                "it looks like a whole .env line".into(),
+            ),
+            (
+                format!("export OPENROUTER_API_KEY={K}"),
+                "whitespace inside it at byte 7".into(),
+            ),
             (format!("bearer {K}\n"), "it starts with 'Bearer '".into()),
             (
                 format!("{} {}", &K[..30], &K[30..]),
@@ -1879,6 +1970,20 @@ mod tests {
             (
                 " \r\n\t".to_string(),
                 "it holds only whitespace (4 bytes)".into(),
+            ),
+            // Positions and lengths among the variable's raw bytes, the
+            // whitespace trimmed around the key counted.
+            (
+                format!("  {}\u{1}{}\n", &K[..20], &K[20..]),
+                format!("a control character at byte 23 of {}", n + 4),
+            ),
+            (
+                format!("\t{}é{}", &K[..10], &K[10..]),
+                format!("a byte outside ASCII at byte 12 of {}", n + 3),
+            ),
+            (
+                format!(" Bearer {K}"),
+                format!("it starts with 'Bearer ' ({} bytes)", n + 8),
             ),
         ];
         for (raw, want) in cases {
@@ -2016,15 +2121,62 @@ mod tests {
         let c = OracleClient::open(&cfg, &dir.path().join("a.jsonl"), None, key.clone()).unwrap();
         let min = c.min_reservation_usd();
         assert!(min > 1e-6);
-        assert_eq!(c.status(), OracleStatus::BudgetTooSmall { min_usd: min });
+        assert_eq!(
+            c.status(),
+            OracleStatus::BudgetTooSmall {
+                min_usd: Some(min),
+                calls_zero: false
+            }
+        );
         assert_eq!(c.status().label(), "budget_too_small");
         assert_eq!(c.status_json()["min_call_usd"], json!(min));
-        // max_calls 0 with nothing done: too small as well.
+        // max_calls 0 with nothing done: too small as well — the call
+        // limit, not the budget, which holds a call.
         let mut none = cfg.clone();
         none.budget_usd = 1.0;
         none.max_calls = 0;
         let c0 = OracleClient::open(&none, &dir.path().join("b.jsonl"), None, key.clone()).unwrap();
+        assert_eq!(
+            c0.status(),
+            OracleStatus::BudgetTooSmall {
+                min_usd: None,
+                calls_zero: true
+            }
+        );
         assert_eq!(c0.status().label(), "budget_too_small");
+        let hint = crate::service::oracle_hint(RefusalReason::Budget, &c0.status(), "K").unwrap();
+        assert_eq!(
+            hint,
+            "max_calls 0 allows no oracle call: restart the server with --oracle-max-calls of at least 1"
+        );
+        let hint = crate::service::oracle_hint(RefusalReason::Budget, &c.status(), "K").unwrap();
+        assert!(
+            hint.starts_with("the oracle budget cannot hold one call (it needs $")
+                && hint.ends_with(&format!(
+                    "restart the server with --oracle-budget of at least {}",
+                    crate::oracle_setup::usd_ceil(min)
+                )),
+            "{hint}"
+        );
+        // Both: the call limit and the budget.
+        let mut both = none.clone();
+        both.budget_usd = 0.0;
+        let cb = OracleClient::open(&both, &dir.path().join("e.jsonl"), None, key.clone()).unwrap();
+        assert_eq!(
+            cb.status(),
+            OracleStatus::BudgetTooSmall {
+                min_usd: Some(min),
+                calls_zero: true
+            }
+        );
+        let hint = crate::service::oracle_hint(RefusalReason::Budget, &cb.status(), "K").unwrap();
+        assert!(
+            hint.starts_with(
+                "max_calls 0 allows no oracle call, and the budget cannot hold one call"
+            ) && hint
+                .contains("--oracle-max-calls of at least 1 and --oracle-budget of at least $"),
+            "{hint}"
+        );
         // Something spent, and the rest cannot hold a call: exhausted.
         let lines = [
             json!({"status":"reserved","call_id":"a","key_id":"k","reserved_usd":0.5}),
@@ -2115,12 +2267,70 @@ mod tests {
         );
         assert_eq!(
             c.status(),
-            OracleStatus::BudgetTooSmall { min_usd: real_res }
+            OracleStatus::BudgetTooSmall {
+                min_usd: Some(real_res),
+                calls_zero: false
+            }
         );
         assert_eq!(c.status_json()["min_call_usd"], json!(real_res));
         assert_eq!(c.status_json()["status"], "budget_too_small");
         assert_eq!(c.totals().calls, 0, "nothing reserved");
         drop(c);
+
+        // A budget below even the smallest call (0, 1e-7): once a real call
+        // was refused, the least budget named is that call's reservation,
+        // not the smallest possible call's — whether the call reached the
+        // reservation check or the coarse permission refused it first (its
+        // caller then gives the body, note_budget_refusal).
+        for (i, budget) in [0.0, 1e-7].into_iter().enumerate() {
+            let mut low = base.clone();
+            low.budget_usd = budget;
+            let ledger = dir.path().join(format!("low{i}.jsonl"));
+            let c = OracleClient::open(&low, &ledger, None, key.clone()).unwrap();
+            let min = c.min_reservation_usd();
+            assert_eq!(c.status_json()["min_call_usd"], json!(min));
+            match c.permission(&caller) {
+                Err(RefusalReason::Budget) => {
+                    c.note_budget_refusal(&[&real], &json!("a longer state text"));
+                }
+                Ok(()) => assert_eq!(
+                    c.call_body(&caller, &[&real], &real_body),
+                    CallOutcome::Refused(RefusalReason::Budget)
+                ),
+                Err(other) => panic!("{other:?}"),
+            }
+            assert_eq!(c.last_budget_refusal(), Some(real_res), "budget {budget}");
+            assert_eq!(
+                c.status(),
+                OracleStatus::BudgetTooSmall {
+                    min_usd: Some(real_res),
+                    calls_zero: false
+                },
+                "budget {budget}"
+            );
+            assert_eq!(c.status_json()["min_call_usd"], json!(real_res));
+            let hint =
+                crate::service::oracle_hint(RefusalReason::Budget, &c.status(), "K").unwrap();
+            let advised: f64 = hint.rsplit("at least $").next().unwrap().parse().unwrap();
+            assert!(advised >= real_res, "{hint}");
+            drop(c);
+            // Restarted with the advised figure: the call is admitted.
+            let mut fixed = base.clone();
+            fixed.budget_usd = advised;
+            let c = OracleClient::open(
+                &fixed,
+                &dir.path().join(format!("fix{i}.jsonl")),
+                None,
+                key.clone(),
+            )
+            .unwrap();
+            assert_eq!(c.status(), OracleStatus::Ready);
+            assert_eq!(c.permission(&caller), Ok(()));
+            match c.call_body(&caller, &[&real], &real_body) {
+                CallOutcome::Failed(f) => assert_eq!(f.error, "transport_connect", "{f:?}"),
+                other => panic!("admitted and sent: {other:?}"),
+            }
+        }
         // Something spent, and what is left holds the smallest call but
         // refused a real one: exhausted, not ready.
         let mut spent = base.clone();
@@ -2167,6 +2377,41 @@ mod tests {
             clean_upstream(&"p/".repeat(200), None).len(),
             UPSTREAM_TEXT_MAX
         );
+        // An echo interleaved with control or invisible characters, or
+        // with punctuation, holding a '/' (which the >40-byte rule would
+        // let pass): the filter would join it again, so the checks see the
+        // filtered text too.
+        let full = "sk-or-v1-F00DFACE0123456789abcdef0123456789abcdef0123456789abcdefcafe";
+        let auth = format!("Bearer {full}");
+        let join = |sep: &str| auth.chars().map(String::from).collect::<Vec<_>>().join(sep);
+        for echo in [
+            format!("x/{}", join("\u{1}")),
+            format!("x/{}", join("\u{200b}")),
+            format!("deepseek/deepseek-v4.1-flash\u{1}{}", join("\u{1}")),
+            format!("x/{}", join(".")),
+            format!("x/{}", join(" ")),
+        ] {
+            for key in [None, Some(full)] {
+                let c = clean_upstream(&echo, key);
+                assert_eq!(c, "[redacted]", "{echo:?}");
+            }
+        }
+        // Without the prefix or the word Bearer: the key's own windows.
+        let bare = format!(
+            "x/{}",
+            full["sk-or-v1-".len()..]
+                .chars()
+                .map(String::from)
+                .collect::<Vec<_>>()
+                .join("\u{1}")
+        );
+        assert_eq!(clean_upstream(&bare, Some(full)), "[redacted]");
+        // Ordinary names are kept.
+        assert_eq!(
+            clean_upstream("deepseek/deepseek-v4.1-flash", Some(full)),
+            "deepseek/deepseek-v4.1-flash"
+        );
+        assert_eq!(clean_upstream("Novita AI", Some(full)), "Novita AI");
     }
 
     #[test]
