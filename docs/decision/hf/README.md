@@ -134,7 +134,12 @@ model:      cortiq/decision@386b6e43fd35 (generation 0), 3489 input tokens, 4335
 `cortiq serve cortiq-decision.cmf` starts the HTTP server: see
 [API.md](API.md) for both protocols, keys, your own skills and the migration
 from cortiq-router, and [ORACLE.md](ORACLE.md) for the oracle cascade,
-self-learning and the OpenRouter setup.
+self-learning and the OpenRouter setup. The oracle takes two steps:
+
+```bash
+export OPENROUTER_API_KEY="<your OpenRouter key>"
+cortiq serve cortiq-decision.cmf --oracle deepseek/deepseek-v4.1-flash
+```
 
 ## Limits
 

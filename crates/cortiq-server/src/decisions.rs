@@ -70,16 +70,20 @@
 //! ([`cortiq_decision::oracle_setup`]: budget, max price from the public
 //! endpoint listing, …) and sets [`ServeOptions::oracle_from_flag`], which
 //! lets the open mode of a loopback address (no keys, `auth.require: null`)
-//! use the oracle — never teach the model. The server logs one startup line
-//! of the oracle ([`oracle_startup_line`]: `ready`, `NOT ready — <what to
-//! do>` or `off`), `GET /v1/admin/oracle` has `status` (`ready`, `no_key`,
-//! `disabled`, `budget_exhausted`, `stopped: <reason>`), `/healthz` has
-//! `oracle_status` (on `/v1/healthz` only under `cmf`, with
-//! `x-cmf-extensions`), and a trained question that abstains because the
-//! oracle is not ready carries the reason's flags (`oracle_disabled`,
-//! `no_key`, `budget`, `stopped`) and, on the decisions surface, one line
-//! `cmf.hint`; router answers keep their shapes (the hint is logged, at most
-//! once a minute).
+//! use the oracle — never teach the model: its feedback is not learned, and
+//! the oracle's answers to its questions (a skill's own question, as
+//! `/v1/route` asks it, included) are cached but never become examples. The
+//! server logs one startup line of the oracle ([`oracle_startup_line`]:
+//! `ready`, `NOT ready — <what to do>` or `off`), `GET /v1/admin/oracle` has
+//! `status` (`ready`, `no_key`, `disabled`, `budget_exhausted`, `stopped:
+//! <reason>`), `/healthz` has `oracle_status` (on `/v1/healthz` only under
+//! `cmf`, with `x-cmf-extensions`), and a trained question that abstains
+//! because the oracle is not ready carries the reason's flags
+//! (`oracle_disabled`, `no_key`, `budget`, `stopped`) and, on the decisions
+//! surface, one line `cmf.hint`; router answers keep their shapes and their flag vocabulary (a
+//! missing key is `oracle_disabled` there, without `no_key`; the hint is
+//! logged: each distinct hint at most once a minute, once per process at
+//! INFO on a server without an oracle).
 //!
 //! # Every request
 //!
@@ -1822,13 +1826,20 @@ impl DecisionState {
 
 /// The flags of a router response (and of its audit record): an escalated
 /// question left unanswered is the router's `low_confidence`, then the
-/// question's own flags.
+/// question's own flags — without `no_key`, which only the decisions surface
+/// names (a missing oracle key is `oracle_disabled` there too, as before the
+/// flag existed), so the router vocabulary stays what it was.
 fn audit_flags(action: Action, flags: &[String]) -> Vec<String> {
     let mut out = Vec::with_capacity(flags.len() + 1);
     if action == Action::Abstain {
         out.push(FLAG_LOW_CONFIDENCE.to_string());
     }
-    out.extend(flags.iter().cloned());
+    out.extend(
+        flags
+            .iter()
+            .filter(|f| f.as_str() != RefusalReason::NoKey.flag())
+            .cloned(),
+    );
     out
 }
 
@@ -3123,7 +3134,8 @@ pub struct ServeOptions {
     /// `--oracle MODEL` was given: the operator enabled the oracle on the
     /// command line, so the open mode of a loopback address without
     /// `auth.require` may use it ([`DecisionService::with_open_oracle`]; it
-    /// still may not teach the model).
+    /// still never teaches the model, not even through the oracle's answers
+    /// to a skill's own question).
     pub oracle_from_flag: bool,
     /// Where the oracle's max price came from (`--oracle`), for the startup
     /// line.
@@ -3272,7 +3284,7 @@ impl DecisionServer {
         if !svc.auth_enabled() && cfg.auth.require.is_none() {
             if opts.oracle_from_flag {
                 tracing::warn!(
-                    "open mode only because the address is loopback (auth.require: null): callers without a key may use the oracle (--oracle, within its budget) but may not teach the model; set auth.require to true behind a reverse proxy"
+                    "open mode only because the address is loopback (auth.require: null): callers without a key may use the oracle (--oracle, within its budget) but never teach the model (its answers to them are cached, not learned; their feedback is not learned); set auth.require to true behind a reverse proxy"
                 );
             } else {
                 tracing::warn!(

@@ -66,7 +66,12 @@ cortiq serve cortiq-decision.cmf --decision-config decision.json \
 A decision server listens on `127.0.0.1:8080` unless `--host` / `--port` say
 otherwise. Other `cortiq serve` flags for decision files: `--break-lock`
 (remove a stale `LOCK` of a dead process), `--shadow-of URL` and
-`--shadow-timeout-s N` ([section 8](#8-migrating-from-cortiq-router)).
+`--shadow-timeout-s N` ([section 8](#8-migrating-from-cortiq-router)), and
+`--oracle MODEL` with its companions `--oracle-budget`, `--oracle-max-calls`,
+`--oracle-max-price`, `--oracle-key-env`, `--oracle-base-url` and
+`--no-oracle-learning`: the oracle in two steps, the OpenRouter key in
+`OPENROUTER_API_KEY` and then this flag
+([ORACLE.md](ORACLE.md#connect-openrouter)).
 Language-model flags (`--task`, `--gpus`, …) are refused for a decision file.
 
 ```bash
@@ -90,9 +95,13 @@ process per state directory; the CLI may change `keys.json` while it runs
 * **Open mode** (no key needed) holds only while `keys.json` has no key and
   `auth.require` is false; `auth.require: null` (the default) means "required
   unless the server listens on loopback". The open caller may reach the
-  oracle and teach the model only when the configuration says
-  `auth.require: false`: a loopback address says nothing about the client
-  (a reverse proxy on the same host forwards anyone). Behind a reverse proxy
+  oracle and teach the model when the configuration says
+  `auth.require: false`. On a loopback address without that setting it may
+  reach the oracle only when the server was started with `--oracle MODEL`
+  (the operator enabled it explicitly), and it never teaches the model: a
+  loopback address says nothing about the client (a reverse proxy on the
+  same host forwards anyone), so its feedback is not learned and the
+  oracle's answers to it are cached, not learned. Behind a reverse proxy
   set `auth.require: true`.
 * A rate window is one fixed minute per account; quotas and credit are
   checked before any work is done, and again before every input of a
@@ -129,7 +138,12 @@ the router minted a key without limits. `cortiq decision keys create` also
 takes `--days` (0 = never expires), `--rate-per-min`, `--decision-quota`,
 `--token-quota`, `--credit-usd`, `--oracle-budget-usd`, `--oracle-allowed`
 and `--learning-allowed` (0 means unlimited for the counters); the admin
-API takes the same fields.
+API takes the same fields. A key created with the CLI may use the oracle
+(`oracle_allowed: true`, like an imported router key) unless it is created
+with `--oracle-allowed=false`; the server's oracle switch, budget, the key's
+`--oracle-budget-usd` and the stop rules still apply. A key created through
+`POST /v1/admin/keys` has `oracle_allowed` only when the body sets it, as
+in the router.
 
 ```bash
 cortiq decision keys list --state ./decision.state
@@ -307,12 +321,21 @@ curl -s "$CORTIQ/v1/skills/banking77" -H "Authorization: Bearer $KEY" \
 | `source`, `skill`, `match`, `certified` | where the answer came from; section 3.2 |
 | `gate` | `accepted`, `p_top` and `tau`, `novelty` and `theta`, `is_novel`, `margin`, `profile` |
 | `errors` | reconstruction errors of the 5 best labels (all of them with `cmf.explain`) |
-| `flags` | e.g. `oracle_disabled`, `consent_off`, `budget`, `stopped`, `oracle_unavailable`, `pii_redacted` |
+| `flags` | e.g. `oracle_disabled`, `no_key` (with `oracle_disabled`: the key variable is not set), `consent_off`, `budget`, `stopped`, `oracle_unavailable`, `pii_redacted` |
 | `confident` | the answer can be used as is (gate accepted and not novel, or a valid oracle answer) |
 | `complexity` | `{score, tier, factors: {base, ambiguity, novelty, margin, length}}`, the cortiq-router formula |
 | `routing` | `{target, reason}` when `routing_tiers` maps the tier |
 | `decision_path` | `router:certified`, `router:uncertified`, `router:uncertified_subset`, `escalate→cache`, `escalate→oracle`, `escalate→oracle_unavailable`, `escalate→disabled` |
 | `explanation` | with `cmf.explain`: `{top1_vs_top2, decision_path}` |
+
+When a trained question abstains because the oracle is not ready (flags
+`oracle_disabled`, `no_key`, `budget` or `stopped`, not `consent_off`), the
+answer also has `cmf.hint`, one line that says what to do, e.g. `"the oracle
+key is not set: set OPENROUTER_API_KEY in the server's environment and
+restart it"` or `"no oracle answers the questions the local model cannot
+decide: start the server with --oracle MODEL and set OPENROUTER_API_KEY"`.
+The router API (section 4) has no hint; the server logs it (each hint at most
+once a minute; once, at INFO, on a server started without an oracle).
 
 Complexity: `score = Σ weight·factor` with base = `task_complexity[label]`
 (default 0.4), ambiguity = 1 − p_top, novelty, margin = 1 − clamp(8·margin, 0, 1),
@@ -422,7 +445,7 @@ curl -s "$CORTIQ/v1/feedback" -H "Authorization: Bearer $KEY" \
 | `GET /v1/models` | open | the model in the shape of an OpenRouter provider listing (`id`, `pricing` as USD-per-token strings, `context_length` 512, `max_output_length` 255) plus `cmf.skills` with each gate |
 | `GET /v1/skills`, `GET /v1/skills/{id}` | key | labels, gate, rubric (`instructions`, `criteria`) |
 | `GET /v1/usage` | key | the caller's account (router format; `x-cmf-extensions: 1` adds token and cost totals) |
-| `GET /healthz` | open | status, model, generation, skills, oracle on/off |
+| `GET /healthz` | open | status, model, generation, skills, `oracle` (on/off) and `oracle_status` (`ready`, `no_key`, `disabled`, `budget_exhausted`, `stopped: <reason>`; section 5) |
 
 `/v1/models` only has the listing's shape; Cortiq Decision is not listed on
 OpenRouter.
@@ -464,8 +487,14 @@ error envelope, so existing clients need no change:
 * `input.embedding` (bring your own vector) must have the signal's dimension
   (4480) and `embedding_model`; it is decided locally only.
 * The header `x-cmf-extensions: 1` adds a `cmf` object (the `cmf-dec-…` id,
-  action, `certified`, gate) to results, listings and errors. Without it the
-  responses have the router's keys only.
+  action, `certified`, gate) to results, listings and errors, and
+  `cmf.oracle_status` to `/v1/healthz`. Without it the responses have the
+  router's keys only.
+* The router's flags keep their vocabulary: an escalation the oracle does
+  not answer is `low_confidence` plus `oracle_disabled` (also when the key
+  variable is not set — `no_key` appears only on the decisions API),
+  `consent_off`, `budget`, `stopped` or `oracle_unavailable`, in the answer
+  and in `/v1/escalations`; the hint of the decisions API is only logged.
 
 ```bash
 curl -s "$CORTIQ/v1/route" -H "Authorization: Bearer $KEY" \
@@ -572,7 +601,7 @@ unset the admin API answers 404 `ADMIN_DISABLED`.
 |---|---|
 | `POST / GET /v1/admin/keys`, `DELETE /v1/admin/keys/{account}`, `DELETE /v1/admin/keys/hash/{hash12}` | create (raw key returned once), list, revoke |
 | `GET /v1/admin/usage` | usage of every account |
-| `GET /v1/admin/oracle`, `POST /v1/admin/oracle {"enabled", "budget_usd", "max_calls"}` | oracle status (`configured` = `oracle.enabled` of the configuration, `enabled` = not switched off by a stop rule or the admin, `key_present`, spent, calls, stop reason); switch it and lower limits within the configuration |
+| `GET /v1/admin/oracle`, `POST /v1/admin/oracle {"enabled", "budget_usd", "max_calls"}` | oracle status: `status` (`ready`; `no_key` — the key variable is unset or empty; `disabled` — not configured or switched off by the admin; `budget_exhausted`; `stopped: <reason>` — a stop rule), `configured` = `oracle.enabled` of the configuration, `enabled` = not switched off by a stop rule or the admin, `key_present`, `key_env` (the variable's name, never its value), `model`, `max_price`, spent, calls, stop reason; switch it and lower limits within the configuration |
 | `GET /v1/admin/learning` | buffer, cache, quarantine, attempts, promotions, recent events |
 | `GET /v1/admin/generations`, `POST /v1/admin/rollback {"generation": N}` | generations; serve generation N (0 = the base file) |
 | `GET /v1/admin/shadow` | agreement statistics in shadow mode, and the routed requests not compared since the start (section 8) |
@@ -580,7 +609,7 @@ unset the admin API answers 404 `ADMIN_DISABLED`.
 ```bash
 A="x-admin-token: $CORTIQ_DECISION_ADMIN_TOKEN"
 curl -s "$CORTIQ/v1/admin/usage" -H "$A" | jq 'keys'                          # → 200
-curl -s "$CORTIQ/v1/admin/oracle" -H "$A" | jq '{enabled, configured, key_present, budget_usd, spent_usd}'   # → 200
+curl -s "$CORTIQ/v1/admin/oracle" -H "$A" | jq '{status, enabled, configured, key_present, budget_usd, spent_usd}'   # → 200
 curl -s "$CORTIQ/v1/admin/learning" -H "$A" | jq '{generation, buffer: .buffer.examples, promotions}'       # → 200
 curl -s "$CORTIQ/v1/admin/generations" -H "$A" | jq '{current, model}'        # → 200
 curl -s "$CORTIQ/v1/admin/rollback" -H "$A" -H 'Content-Type: application/json' \
@@ -628,7 +657,10 @@ part of the file: the admin token and the OpenRouter key are read from the
 environment variables it names. `auth.plans` may override the plan table.
 `oracle.base_url` must be https, or plain http to a loopback address only (a
 local proxy). The oracle, cache and learning sections are explained in
-[ORACLE.md](ORACLE.md).
+[ORACLE.md](ORACLE.md). `cortiq serve --oracle MODEL` and its companions
+override the `oracle` section (and `--no-oracle-learning` sets
+`learning.enabled` false); a file that sets `oracle.provider` keeps its
+`max_price` unless `--oracle-max-price` is given.
 
 ## 7. Your own model
 

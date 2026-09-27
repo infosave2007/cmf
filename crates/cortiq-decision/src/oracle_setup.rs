@@ -31,7 +31,17 @@
 //! A model the listing does not know (HTTP 400/404, or no endpoint) or whose
 //! endpoints all lack structured outputs is refused before anything is
 //! opened, with up to [`SUGGESTIONS`] of the cheapest models of the public
-//! `GET {base_url}/models` listing that support structured outputs.
+//! `GET {base_url}/models` listing that support structured outputs. So is a
+//! model listed only with variable pricing (`-1`, e.g. `openrouter/auto`)
+//! unless the max price is given (`--oracle-max-price` or the configuration),
+//! and a given max price below every structured-output endpoint (OpenRouter
+//! would refuse every call).
+//!
+//! What is typed where a secret must not be never comes back in a message:
+//! `--oracle-key-env` takes the variable's name, and a value that is not a
+//! name (an OpenRouter key pasted by mistake) is refused without being shown;
+//! so is an `--oracle` model id that looks like a key (`sk-…`), which is
+//! also never sent in a listing URL.
 
 use crate::config::Config;
 use crate::oracle::{max_tokens, reservation_usd};
@@ -95,8 +105,16 @@ pub fn parse_max_price(s: &str) -> Result<(f64, f64)> {
 }
 
 /// A model id usable in a listing URL: 1..256 bytes, no whitespace or
-/// control character, no empty, `.` or `..` path segment.
+/// control character, no empty, `.` or `..` path segment, and not a key
+/// (`sk-…`; refused without being shown, and never put in a URL).
 fn check_model_id(model: &str) -> Result<()> {
+    ensure!(
+        !model.starts_with("sk-"),
+        "--oracle takes an OpenRouter model id such as deepseek/deepseek-v4.1-flash, not the \
+         key: put the key in OPENROUTER_API_KEY (or the variable --oracle-key-env names); the \
+         given value ({} bytes) is not shown",
+        model.len()
+    );
     ensure!(
         !model.is_empty()
             && model.len() <= 256
@@ -209,6 +227,10 @@ pub enum EndpointsProbe {
     Found(Vec<Endpoint>),
     /// The listing does not know the model (why, for the message).
     NotFound(String),
+    /// The model is listed, but no endpoint has a fixed price (OpenRouter's
+    /// `-1` of variable pricing, e.g. `openrouter/auto`); `structured`: one of
+    /// them supports structured outputs.
+    VariablePrice { structured: bool },
     /// No usable answer (transport, status, shape): the model is not checked.
     Unreachable(String),
 }
@@ -246,28 +268,40 @@ fn get(url: &str, cap: u64) -> std::result::Result<(u16, Vec<u8>), String> {
     Ok((status, buf))
 }
 
-/// The endpoints of an endpoint-listing body (`data.endpoints`), `None` when
-/// the body does not have that shape.
-pub fn parse_endpoints(body: &[u8]) -> Option<Vec<Endpoint>> {
+/// An endpoint-listing body (`data.endpoints`): the endpoints with a fixed
+/// price, and for each one without it whether it supports structured
+/// outputs. `None` when the body does not have that shape.
+fn parse_listing(body: &[u8]) -> Option<(Vec<Endpoint>, Vec<bool>)> {
     let v: Value = serde_json::from_slice(body).ok()?;
     let eps = v.get("data")?.get("endpoints")?.as_array()?;
-    Some(
-        eps.iter()
-            .filter_map(|e| {
-                let pricing = e.get("pricing")?;
-                let name = ["provider_name", "name", "tag"]
-                    .iter()
-                    .find_map(|k| e.get(*k).and_then(Value::as_str))
-                    .unwrap_or("unnamed");
-                Some(Endpoint {
-                    provider: name.chars().filter(|c| !c.is_control()).take(80).collect(),
-                    prompt: per_million(pricing.get("prompt"))?,
-                    completion: per_million(pricing.get("completion"))?,
-                    structured: supports_structured(e.get("supported_parameters")),
-                })
-            })
-            .collect(),
-    )
+    let mut priced = Vec::new();
+    let mut unpriced = Vec::new();
+    for e in eps {
+        let structured = supports_structured(e.get("supported_parameters"));
+        let pricing = e.get("pricing");
+        let price = |k: &str| per_million(pricing.and_then(|p| p.get(k)));
+        let (Some(prompt), Some(completion)) = (price("prompt"), price("completion")) else {
+            unpriced.push(structured);
+            continue;
+        };
+        let name = ["provider_name", "name", "tag"]
+            .iter()
+            .find_map(|k| e.get(*k).and_then(Value::as_str))
+            .unwrap_or("unnamed");
+        priced.push(Endpoint {
+            provider: name.chars().filter(|c| !c.is_control()).take(80).collect(),
+            prompt,
+            completion,
+            structured,
+        });
+    }
+    Some((priced, unpriced))
+}
+
+/// The endpoints with a fixed price of an endpoint-listing body
+/// (`data.endpoints`), `None` when the body does not have that shape.
+pub fn parse_endpoints(body: &[u8]) -> Option<Vec<Endpoint>> {
+    parse_listing(body).map(|(priced, _)| priced)
 }
 
 /// `GET {base_url}/models/{model}/endpoints`, without a key.
@@ -278,11 +312,14 @@ pub fn probe_endpoints(base_url: &str, model: &str) -> EndpointsProbe {
         Ok((status @ (400 | 404), _)) => {
             EndpointsProbe::NotFound(format!("{url} answered HTTP {status}"))
         }
-        Ok((200, body)) => match parse_endpoints(&body) {
-            Some(eps) if eps.is_empty() => {
-                EndpointsProbe::NotFound(format!("{url} lists no endpoint with a price"))
+        Ok((200, body)) => match parse_listing(&body) {
+            Some((eps, unpriced)) if eps.is_empty() && unpriced.is_empty() => {
+                EndpointsProbe::NotFound(format!("{url} lists no endpoint"))
             }
-            Some(eps) => EndpointsProbe::Found(eps),
+            Some((eps, unpriced)) if eps.is_empty() => EndpointsProbe::VariablePrice {
+                structured: unpriced.contains(&true),
+            },
+            Some((eps, _)) => EndpointsProbe::Found(eps),
             None => EndpointsProbe::Unreachable(format!("{url}: not an endpoint listing")),
         },
         Ok((status, _)) => EndpointsProbe::Unreachable(format!("{url} answered HTTP {status}")),
@@ -425,6 +462,27 @@ impl OracleSetup {
     }
 }
 
+/// Where a given max price came from, for messages.
+fn price_origin(source: &PriceSource) -> &'static str {
+    match source {
+        PriceSource::Flag => "--oracle-max-price",
+        PriceSource::Config => "oracle.provider.max_price of --decision-config",
+        PriceSource::Listing { .. } => "the endpoint listing",
+        PriceSource::Fallback => "the default",
+    }
+}
+
+/// A price for a suggested `--oracle-max-price`: rounded up to 4 decimals.
+fn round_up(x: f64) -> String {
+    // The epsilon keeps 0.07 (0.0700000…01 in binary) from becoming 0.0701.
+    let v = (x * 1e4 - 1e-6).ceil() / 1e4;
+    let mut s = format!("{v:.4}");
+    while s.ends_with('0') && !s.ends_with(".0") {
+        s.pop();
+    }
+    s
+}
+
 fn set_max_price(cfg: &mut Config, (prompt, completion): (f64, f64)) {
     let mut mp = Map::new();
     mp.insert("prompt".into(), json!(prompt));
@@ -491,6 +549,13 @@ pub fn apply(
         o.max_calls = n;
     }
     if let Some(k) = &flags.key_env {
+        // Never echoed: a key pasted here by mistake must not reach a log.
+        ensure!(
+            crate::config::is_env_name(k),
+            "--oracle-key-env takes the NAME of the variable that holds the key (e.g. \
+             OPENROUTER_API_KEY), not the key itself; the given value ({} bytes) is not shown",
+            k.len()
+        );
         o.api_key_env = k.clone();
     }
     if let Some(u) = &flags.base_url {
@@ -556,19 +621,51 @@ pub fn apply(
                     let fits = eps
                         .iter()
                         .any(|e| e.structured && e.prompt <= p && e.completion <= c);
-                    if !fits {
-                        warnings.push(format!(
-                            "oracle: no structured-output endpoint of {model} is within the max price in/out {}/{} per 1M (the cheapest, {}, costs {}/{}): OpenRouter will refuse the calls",
-                            usd(p),
-                            usd(c),
-                            best.provider,
-                            usd(best.prompt),
-                            usd(best.completion)
-                        ));
-                    }
+                    ensure!(
+                        fits,
+                        "--oracle {model}: no structured-output endpoint is within the max price \
+                         in/out {}/{} per 1M of {} (the cheapest, {}, costs {}/{}), so OpenRouter \
+                         would refuse every call. Raise it (e.g. --oracle-max-price {},{}) or leave \
+                         it out to use {PRICE_HEADROOM}× the cheapest endpoint",
+                        usd(p),
+                        usd(c),
+                        price_origin(&fixed),
+                        best.provider,
+                        usd(best.prompt),
+                        usd(best.completion),
+                        round_up(best.prompt * PRICE_HEADROOM),
+                        round_up(best.completion * PRICE_HEADROOM),
+                    );
                     fixed
                 }
             }
+        }
+        (EndpointsProbe::VariablePrice { structured: false }, _) => {
+            return Err(refuse(
+                cfg,
+                &model,
+                "none of its endpoints supports structured outputs (response_format with a JSON schema), which the oracle needs for typed verdicts",
+            ));
+        }
+        (EndpointsProbe::VariablePrice { structured: true }, None) => {
+            return Err(refuse(
+                cfg,
+                &model,
+                &format!(
+                    "{} lists it with no endpoint of a fixed price (variable pricing, so the max price cannot be taken from the listing; give it with --oracle-max-price IN,OUT, or use a concrete model)",
+                    host_of(&cfg.oracle.base_url)
+                ),
+            ));
+        }
+        (EndpointsProbe::VariablePrice { structured: true }, Some(fixed)) => {
+            let (p, c) = cfg.oracle.max_price()?;
+            warnings.push(format!(
+                "oracle: {model} has only variable-price endpoints: the max price in/out {}/{} per 1M of {} is not checked against the listing; it caps every call's reservation, and a call that costs more than its reservation stops the oracle",
+                usd(p),
+                usd(c),
+                price_origin(&fixed)
+            ));
+            fixed
         }
         (EndpointsProbe::Unreachable(why), None) => {
             set_max_price(cfg, FALLBACK_MAX_PRICE);
@@ -785,7 +882,7 @@ mod tests {
             s.warnings
         );
         // --oracle-max-price wins over the listing; a price below every
-        // endpoint is warned about.
+        // structured-output endpoint is refused (every call would be).
         let m = mock(vec![(
             "/api/v1/models/a/b/endpoints",
             200,
@@ -798,11 +895,26 @@ mod tests {
         assert_eq!((s.max_price, &s.source), ((0.3, 0.9), &PriceSource::Flag));
         assert!(s.warnings.is_empty());
         f.max_price = Some((0.01, 0.01));
-        let s = apply(&mut Config::default(), &f, false).unwrap();
+        let e = apply(&mut Config::default(), &f, false)
+            .unwrap_err()
+            .to_string();
         assert!(
-            s.warnings[0].contains("OpenRouter will refuse the calls"),
-            "{:?}",
-            s.warnings
+            e.contains(
+                "no structured-output endpoint is within the max price in/out $0.01/$0.01 per 1M of --oracle-max-price (the cheapest, E, costs $0.10/$0.40)"
+            ) && e.contains("--oracle-max-price 0.2,0.8"),
+            "{e}"
+        );
+        // The same from the configuration file names it.
+        let mut low = Config::from_json(
+            br#"{"oracle":{"provider":{"max_price":{"prompt":0.01,"completion":0.01}}}}"#,
+        )
+        .unwrap();
+        let e = apply(&mut low, &flags("a/b", &m.base), true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("of oracle.provider.max_price of --decision-config"),
+            "{e}"
         );
         // A configuration that sets the provider keeps its max price.
         let mut cfg = Config::from_json(
@@ -811,6 +923,62 @@ mod tests {
         .unwrap();
         let s = apply(&mut cfg, &flags("a/b", &m.base), true).unwrap();
         assert_eq!((s.max_price, &s.source), ((0.2, 0.8), &PriceSource::Config));
+    }
+
+    #[test]
+    fn variable_pricing_needs_a_given_max_price() {
+        let auto = |structured: bool| endpoints(json!([ep("Auto", "-1", "-1", structured)]));
+        let m = mock(vec![
+            ("/api/v1/models/openrouter/auto/endpoints", 200, auto(true)),
+            ("/api/v1/models/v/plain/endpoints", 200, auto(false)),
+            ("/api/v1/models/v/none/endpoints", 200, endpoints(json!([]))),
+            ("/api/v1/models", 200, models()),
+        ]);
+        // Listed, but no fixed price: refused, and the message says so.
+        let e = apply(
+            &mut Config::default(),
+            &flags("openrouter/auto", &m.base),
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("lists it with no endpoint of a fixed price (variable pricing")
+                && e.contains("--oracle-max-price IN,OUT")
+                && !e.contains("does not list"),
+            "{e}"
+        );
+        assert!(e.contains("Start with --oracle x/cheap"), "{e}");
+        // With a given max price it starts, with a warning.
+        let mut f = flags("openrouter/auto", &m.base);
+        f.max_price = Some((0.2, 0.8));
+        let mut cfg = Config::default();
+        let s = apply(&mut cfg, &f, false).unwrap();
+        assert_eq!((s.max_price, &s.source), ((0.2, 0.8), &PriceSource::Flag));
+        assert!(
+            s.warnings[0].contains("only variable-price endpoints")
+                && s.warnings[0].contains("$0.20/$0.80"),
+            "{:?}",
+            s.warnings
+        );
+        // Variable pricing without structured outputs is refused either way.
+        let mut f = flags("v/plain", &m.base);
+        f.max_price = Some((0.2, 0.8));
+        let e = apply(&mut Config::default(), &f, false)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("supports structured outputs"), "{e}");
+        // An empty listing: not listed.
+        let e = apply(&mut Config::default(), &flags("v/none", &m.base), false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("does not list this model") && e.contains("lists no endpoint)"),
+            "{e}"
+        );
+        assert_eq!(round_up(0.035 * 2.0), "0.07");
+        assert_eq!(round_up(0.29 * 2.0), "0.58");
+        assert_eq!(round_up(0.00001), "0.0001");
     }
 
     #[test]
@@ -826,9 +994,27 @@ mod tests {
         assert!(e.contains("OpenRouter model id"), "{e}");
         let e = bad(flags("a/../b", "http://127.0.0.1:9/v1"));
         assert!(e.contains("OpenRouter model id"), "{e}");
-        let mut f = flags("a/b", "http://127.0.0.1:9/v1");
-        f.key_env = Some("NOT A NAME".into());
-        assert!(bad(f).contains("oracle.api_key_env"));
+        // A key typed where the variable's name belongs is refused and never
+        // shown; so is a key given as the model (and it is not fetched).
+        let key = "sk-or-v1-00112233445566778899aabbccddeeff";
+        for v in ["NOT A NAME", key] {
+            let mut f = flags("a/b", "http://127.0.0.1:9/v1");
+            f.key_env = Some(v.into());
+            let e = bad(f);
+            assert!(
+                e.contains("--oracle-key-env takes the NAME of the variable that holds the key"),
+                "{e}"
+            );
+            assert!(!e.contains(v) && !e.contains("00112233"), "{e}");
+        }
+        let m = mock(vec![]);
+        let e = bad(flags(key, &m.base));
+        assert!(
+            e.contains("not the key: put the key in OPENROUTER_API_KEY"),
+            "{e}"
+        );
+        assert!(!e.contains("00112233"), "{e}");
+        assert!(m.heads.lock().unwrap().is_empty(), "no request was made");
         let mut f = flags("a/b", "http://127.0.0.1:9/v1");
         f.budget_usd = Some(f64::NAN);
         assert!(bad(f).contains("--oracle-budget"));

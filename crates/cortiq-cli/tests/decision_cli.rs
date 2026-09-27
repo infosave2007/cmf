@@ -2842,6 +2842,27 @@ fn serve_oracle_in_two_steps_is_ready_asks_only_undetermined_questions_and_hides
         !last.contains("jane.roe@example.com") && last.contains("[REDACTED]"),
         "{last}"
     );
+    // The skill's own question (/v1/route) from the anonymous loopback caller
+    // reaches the oracle too; the answer is cached but teaches nothing.
+    let (code, r, _) = http_h(
+        "POST",
+        &srv.url("/v1/route"),
+        &[],
+        Some(&json!({"input": {"text": texts[1]}, "taxonomy_id": "topics"})),
+    );
+    assert_eq!(code, 200, "{r}");
+    assert_eq!(r["decision"]["source"], "oracle", "{r}");
+    assert_eq!(mock.chats(), before + 2);
+    let (code, l, _) = http_h(
+        "GET",
+        &srv.url("/v1/admin/learning"),
+        &[("x-admin-token", ADMIN_TOKEN)],
+        None,
+    );
+    assert_eq!(code, 200, "{l}");
+    assert_eq!(l["examples_added"], 0, "{l}");
+    assert_eq!(l["buffer"]["examples"], 0, "{l}");
+    assert_eq!(l["cache"]["entries"], 2, "{l}");
     // The key went to the oracle only, in its Authorization header.
     let posts: Vec<Request> = mock
         .requests()
@@ -2917,6 +2938,12 @@ fn serve_oracle_without_the_key_is_not_ready_and_says_what_to_do() {
     );
     assert_eq!(code, 200, "{r}");
     assert!(r.get("cmf").is_none() && !text.contains("hint"), "{text}");
+    // ... and its flag vocabulary: no `no_key` there.
+    assert_eq!(
+        r["decision"]["flags"],
+        json!(["low_confidence", "oracle_disabled"]),
+        "{r}"
+    );
     assert_eq!(mock.chats(), 0);
     let logs = srv.stop();
     assert_eq!(
@@ -2991,6 +3018,60 @@ fn serve_oracle_refuses_a_model_it_cannot_use_and_names_cheap_ones() {
     // The companions need --oracle.
     let e = fails(&["serve", s(&toy().path), "--oracle-budget", "5"]);
     assert!(e.contains("--oracle"), "{e}");
+    // A key typed where the variable's name or the model belongs is refused,
+    // never shown and never sent (not even in a listing URL); a mistyped
+    // `--oracle-key KEY` does not echo it either.
+    let before = mock.requests().len();
+    let joined = format!("--oracle-key-env={FAKE_OPENROUTER_KEY}");
+    for a in [
+        &[
+            "--oracle",
+            ORACLE_MODEL,
+            "--oracle-key-env",
+            FAKE_OPENROUTER_KEY,
+        ][..],
+        &["--oracle", ORACLE_MODEL, joined.as_str()],
+        &["--oracle", FAKE_OPENROUTER_KEY],
+        &[
+            "--oracle",
+            ORACLE_MODEL,
+            "--oracle-key",
+            FAKE_OPENROUTER_KEY,
+        ],
+    ] {
+        let mut v = vec![
+            "serve",
+            s(&toy().path),
+            "--port",
+            "9",
+            "--state",
+            s(&state),
+            "--oracle-base-url",
+            &base,
+        ];
+        v.extend_from_slice(a);
+        let e = fails(&v);
+        assert!(
+            !e.contains(FAKE_OPENROUTER_KEY) && !e.contains("0123456789abcdef"),
+            "{a:?}: {e}"
+        );
+    }
+    let e = fails(&[
+        "serve",
+        s(&toy().path),
+        "--port",
+        "9",
+        "--oracle",
+        ORACLE_MODEL,
+        "--oracle-key-env",
+        FAKE_OPENROUTER_KEY,
+    ]);
+    assert!(
+        e.contains("--oracle-key-env takes the NAME of the variable that holds the key (e.g. OPENROUTER_API_KEY), not the key itself"),
+        "{e}"
+    );
+    assert_eq!(mock.requests().len(), before, "nothing was sent");
+    assert!(!state.exists(), "a refused start leaves no state behind");
 }
 
 #[test]
@@ -3047,7 +3128,7 @@ fn serve_oracle_falls_back_when_the_listing_is_unreachable_and_max_price_overrid
 fn serve_oracle_budget_exhaustion_is_a_status_and_a_hint() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
-    let texts = distinct_texts(3, 7, "bx", 0.97);
+    let texts = distinct_texts(4, 7, "bx", 0.97);
     // Calls: one allowed.
     let mock = MockOpenRouter::start("travel", 1.3e-5);
     let srv = serve_oracle(
@@ -3086,7 +3167,32 @@ fn serve_oracle_budget_exhaustion_is_a_status_and_a_hint() {
         "{v}"
     );
     assert_eq!(mock.chats(), 1);
-    srv.stop();
+    // Another kind of hint within the minute is logged too (each distinct
+    // hint has its own window).
+    let (code, v, _) = http_h(
+        "POST",
+        &srv.url("/v1/admin/oracle"),
+        &[("x-admin-token", ADMIN_TOKEN)],
+        Some(&json!({"enabled": false})),
+    );
+    assert_eq!(code, 200, "{v}");
+    let v = ask(&srv, &texts[3]);
+    assert!(
+        v["cmf"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("switched off by the admin API"),
+        "{v}"
+    );
+    let logs = srv.stop();
+    for hint in [
+        "abstained: the oracle budget is used up",
+        "abstained: the oracle is switched off by the admin API",
+    ] {
+        let lines: Vec<&str> = logs.lines().filter(|l| l.contains(hint)).collect();
+        assert_eq!(lines.len(), 1, "{hint}\n{logs}");
+        assert!(lines[0].contains("WARN"), "{}", lines[0]);
+    }
 
     // Dollars: $0.0005 holds one reservation; a call that costs $0.00025
     // leaves less than the smallest one.
@@ -3121,6 +3227,63 @@ fn serve_oracle_budget_exhaustion_is_a_status_and_a_hint() {
     );
     srv.stop();
     assert_eq!(mock.chats(), 1);
+}
+
+/// A server run without an oracle (the operator's choice) says so once at
+/// start and logs the hint of an abstaining question once, at INFO — not a
+/// warning a minute.
+#[test]
+fn serve_without_an_oracle_logs_its_hint_once_at_info() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let srv = Server::start(
+        &toy().path,
+        &["--state", s(&d.join("state"))],
+        &[("CORTIQ_DECISION_ADMIN_TOKEN", ADMIN_TOKEN)],
+        d,
+    );
+    let texts = distinct_texts(3, 7, "off", 0.97);
+    for t in &texts[..2] {
+        let (code, v) = http(
+            "POST",
+            &srv.url("/v1/decisions"),
+            None,
+            Some(&topics_request(t)),
+        );
+        assert_eq!(code, 200, "{v}");
+        assert_eq!(v["cmf"]["questions"]["task"]["action"], "abstain", "{v}");
+        assert!(
+            v["cmf"]["hint"]
+                .as_str()
+                .unwrap()
+                .contains("start the server with --oracle MODEL and set OPENROUTER_API_KEY"),
+            "{v}"
+        );
+    }
+    let (code, r, _) = http_h(
+        "POST",
+        &srv.url("/v1/route"),
+        &[],
+        Some(&json!({"input": {"text": texts[2]}, "taxonomy_id": "topics"})),
+    );
+    assert_eq!(code, 200, "{r}");
+    assert_eq!(
+        r["decision"]["flags"],
+        json!(["low_confidence", "oracle_disabled"]),
+        "{r}"
+    );
+    let logs = srv.stop();
+    assert!(logs.contains("oracle: off"), "{logs}");
+    let lines: Vec<&str> = logs
+        .lines()
+        .filter(|l| l.contains("could not decide abstained"))
+        .collect();
+    assert_eq!(lines.len(), 1, "{logs}");
+    assert!(
+        lines[0].contains("INFO") && !lines[0].contains("WARN"),
+        "{}",
+        lines[0]
+    );
 }
 
 #[test]

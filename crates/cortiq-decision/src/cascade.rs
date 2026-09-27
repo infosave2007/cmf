@@ -24,8 +24,10 @@
 //!    `learning_allowed`, or the question is an exact match that asks exactly
 //!    the skill's own question ([`crate::service::SkillRuntime::follows_rubric`]
 //!    — the router's `task` question is one) so that the answer is the
-//!    skill's rubric applied to the text, not the caller's instructions; an
-//!    example that brings its label to `learning.refit_min_new` new examples
+//!    skill's rubric applied to the text, not the caller's instructions
+//!    (never for the implicit open mode of a loopback address, `serve
+//!    --oracle` without keys: [`Principal::implicit_open`] — its answers are
+//!    only cached); an example that brings its label to `learning.refit_min_new` new examples
 //!    starts a learning attempt ([`crate::learn::attempt`]) — inline with
 //!    `learning.synchronous`, else on the one background worker;
 //! 6. **failure**: the question is failed (the service answers a trained one
@@ -415,10 +417,12 @@ fn learnable_label(label: &str) -> bool {
 
 /// Whether the oracle's answer to a pending question may become an example of
 /// the shared `skill` (see the module notes): the caller may teach, or the
-/// question is an exact match asking exactly the skill's own question.
+/// question is an exact match asking exactly the skill's own question — except
+/// for the implicit open mode of a loopback address, which never teaches.
 fn teaches(e: &Escalation<'_>, p: &Pending<'_>, skill: &str) -> bool {
     e.principal.learning_allowed
-        || (p.matched.kind == MatchKind::Exact
+        || (!e.principal.implicit_open
+            && p.matched.kind == MatchKind::Exact
             && e.model
                 .skill(skill)
                 .is_some_and(|s| s.follows_rubric(p.question)))

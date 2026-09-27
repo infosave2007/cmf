@@ -476,12 +476,21 @@ fn check_oracle_base_url(url: &str) -> Result<()> {
     }
 }
 
+/// A valid environment variable name: 1..128 bytes of `[A-Za-z0-9_]`.
+pub fn is_env_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// The value is never echoed: a secret pasted where its variable's name
+/// belongs would otherwise land in the error and every captured log.
 fn check_env_name(what: &str, name: &str) -> Result<()> {
     ensure!(
-        !name.is_empty()
-            && name.len() <= 128
-            && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
-        "{what} must be an environment variable name ([A-Za-z0-9_], 1..128), got '{name}'"
+        is_env_name(name),
+        "{what} must be the NAME of an environment variable ([A-Za-z0-9_], 1..128 bytes), not \
+         the secret it holds; the given value ({} bytes) is not shown",
+        name.len()
     );
     Ok(())
 }
@@ -719,6 +728,27 @@ mod tests {
         assert!(Config::from_json(br#"{"auth":{"require":true,"key_prefix":"sk-"}}"#).is_ok());
         assert!(Config::from_json(br#"{"auth":{"admin_token_env":"A B"}}"#).is_err());
         assert!(Config::from_json(br#"[]"#).is_err());
+    }
+
+    #[test]
+    fn a_secret_given_as_a_variable_name_is_never_echoed() {
+        let secret = "sk-or-v1-0123456789abcdef0123456789abcdef";
+        let mut c = Config::default();
+        c.oracle.api_key_env = secret.into();
+        let e = format!("{:#}", c.validate().unwrap_err());
+        assert!(
+            !e.contains(secret) && !e.contains("0123456789abcdef"),
+            "{e}"
+        );
+        assert!(e.contains("oracle.api_key_env must be the NAME"), "{e}");
+        assert!(
+            e.contains(&format!("({} bytes) is not shown", secret.len())),
+            "{e}"
+        );
+        let mut c = Config::default();
+        c.auth.admin_token_env = "hunter2 hunter2".into();
+        let e = format!("{:#}", c.validate().unwrap_err());
+        assert!(!e.contains("hunter2"), "{e}");
     }
 
     #[test]
