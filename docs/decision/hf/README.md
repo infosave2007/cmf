@@ -141,6 +141,11 @@ export OPENROUTER_API_KEY="<your OpenRouter key>"
 cortiq serve cortiq-decision.cmf --oracle deepseek/deepseek-v4.1-flash
 ```
 
+`cortiq decision oracle check` tells first whether the key, the account and
+the model are ready; `cortiq decide … --oracle MODEL` asks the oracle from
+the command line, one text or a batch
+([ORACLE.md](ORACLE.md#from-the-command-line-check-then-decide)).
+
 ## Limits
 
 * The benchmarks are public and were reused; their test splits had been read

@@ -89,6 +89,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   oracle is not ready gets the flag `no_key` (beside `oracle_disabled`) when
   the key is missing and a one-line `cmf.hint` on the decisions API; router
   answers keep their shape and flags, and the hint is logged instead.
+- `cortiq decide FILE -p TEXT | --input ROWS --oracle MODEL`: the text is
+  decided locally first, and only one the gate rejects (or whose labels no
+  skill has) is sent, in one call with the server's reservation ledger,
+  stop rules, PII redaction and key handling, under the state directory's
+  `LOCK` (`<FILE>.state` or `--state DIR`); `--oracle-budget` and
+  `--oracle-max-calls` cap each run, a stop holds for later runs until
+  `--oracle-resume`, `--break-lock` removes a `LOCK` whose process is gone.
+  Without `--oracle` nothing changes. `cortiq decision oracle check
+  [--model M] [--key-env VAR] [--base-url URL] [--test-call] [--json]`:
+  the key, the account (`GET /auth/key`), the model's structured-output
+  endpoints and prices, and with `--test-call` one tiny call and its cost;
+  exit code 0 only when ready; the key is never printed.
 - The published model `infosave/cortiq-decision` (304520292 bytes): skills
   `banking77`, `clinc150` and `massive` trained on train ∪ dev, with K 32, 16
   and 24 chosen by cross-validation. It is 4520292 bytes over the

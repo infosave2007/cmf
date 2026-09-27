@@ -1858,7 +1858,42 @@ fn state_lock_is_exclusive() {
         "the broken guard must not remove the new lock"
     );
     assert!(s.lock(false).is_err());
+    // Breaking only the lock that was checked: a stale content that is no
+    // longer the file's (another run broke it and took the lock first)
+    // leaves the new lock in place and fails with its holder.
+    let held = std::fs::read_to_string(s.lock_path()).unwrap();
+    let e = s.lock_replacing("99999999 0123abcd\n").unwrap_err();
+    assert!(
+        e.downcast_ref::<cortiq_decision::statedir::Locked>()
+            .is_some(),
+        "{e:#}"
+    );
+    assert_eq!(std::fs::read_to_string(s.lock_path()).unwrap(), held);
+    assert_eq!(
+        std::fs::read_dir(s.root())
+            .unwrap()
+            .filter(|e| e
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("LOCK."))
+            .count(),
+        0,
+        "nothing is left aside"
+    );
     drop(l3);
+    assert!(!s.lock_path().exists());
+    // The checked stale lock is replaced; with no lock at all, it is taken.
+    std::fs::write(s.lock_path(), "99999999 0123abcd\n").unwrap();
+    let l4 = s.lock_replacing("99999999 0123abcd\n").unwrap();
+    assert_ne!(
+        std::fs::read_to_string(s.lock_path()).unwrap(),
+        "99999999 0123abcd\n"
+    );
+    drop(l4);
+    let l5 = s.lock_replacing("99999999 0123abcd\n").unwrap();
+    drop(l5);
     assert!(!s.lock_path().exists());
     // CURRENT and generations.
     assert_eq!(s.read_current().unwrap(), None);

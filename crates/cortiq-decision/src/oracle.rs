@@ -380,6 +380,11 @@ pub struct OracleState {
     /// and command-line runs; written only while not zero.
     #[serde(skip_serializing_if = "is_zero")]
     pub consecutive_errors: u32,
+    /// The error code of the last of those failed calls (`http_500`,
+    /// `transport_timeout`, …; never content), so that a `max_errors` stop
+    /// can say what failed after a restart; written only while set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -395,6 +400,7 @@ impl Default for OracleState {
             budget_usd: None,
             max_calls: None,
             consecutive_errors: 0,
+            last_error: None,
         }
     }
 }
@@ -419,11 +425,12 @@ pub fn read_state_file(path: &Path) -> Result<OracleState> {
 /// {"enabled":true}` does on a running server: the admin switch on, the stop
 /// reason and the failed calls in a row cleared, the admin limits kept. The
 /// caller holds the state directory's `LOCK` (no server runs on it). `Some`:
-/// the state before, when the oracle was off (stopped or switched off);
-/// nothing is written when there is nothing to clear.
+/// the state before, when something was cleared (the oracle was off —
+/// stopped or switched off — or failed calls in a row were counted); nothing
+/// is written when there is nothing to clear.
 pub fn resume_state_file(path: &Path) -> Result<Option<OracleState>> {
     let before = read_state_file(path)?;
-    if !before.is_off() && before.consecutive_errors == 0 {
+    if !before.is_off() && before.consecutive_errors == 0 && before.last_error.is_none() {
         return Ok(None);
     }
     let after = OracleState {
@@ -431,14 +438,21 @@ pub fn resume_state_file(path: &Path) -> Result<Option<OracleState>> {
         stop_reason: None,
         stopped_unix: None,
         consecutive_errors: 0,
+        last_error: None,
         ..before.clone()
     };
     let bytes = serde_json::to_vec_pretty(&after).expect("the oracle state serialises");
     atomic_write(path, &bytes).with_context(|| format!("write {}", path.display()))?;
-    Ok(before.is_off().then_some(before))
+    Ok(Some(before))
 }
 
 // ------------------------------------------------------------------ ledger
+
+/// Whether OpenRouter likely did not bill a failed call that reported no
+/// cost: it refused it (HTTP 401, 402, 403 or 429) before any model ran.
+pub fn likely_unbilled(http_status: Option<u16>) -> bool {
+    matches!(http_status, Some(401 | 402 | 403 | 429))
+}
 
 /// Status of a line of `oracle.jsonl`.
 pub const LEDGER_RESERVED: &str = "reserved";
@@ -455,6 +469,11 @@ pub struct LedgerTotals {
     /// reported no cost (`failed_unknown_cost`; OpenRouter may have billed
     /// less, or nothing, as for a refused key).
     pub unknown_cost: f64,
+    /// Of `unknown_cost`: those of calls OpenRouter refused with HTTP 401,
+    /// 402, 403 or 429 ([`likely_unbilled`]), which it likely did not bill.
+    /// The rest (a timeout, a lost connection, a run interrupted with its
+    /// call in flight, another failure) may have been billed.
+    pub refused_cost: f64,
     /// Reservations of calls in flight.
     pub inflight: f64,
     /// Reservations made (every attempted call).
@@ -532,6 +551,13 @@ fn replay_ledger(path: &Path) -> Result<(LedgerTotals, Vec<OpenReservation>, u64
                 totals.spent += charged;
                 if st == LEDGER_FAILED_UNKNOWN {
                     totals.unknown_cost += charged;
+                    let http = v
+                        .get("http_status")
+                        .and_then(Value::as_u64)
+                        .and_then(|c| u16::try_from(c).ok());
+                    if likely_unbilled(http) {
+                        totals.refused_cost += charged;
+                    }
                 }
                 *totals.per_key.entry(key).or_insert(0.0) += charged;
                 if st == LEDGER_SETTLED {
@@ -634,6 +660,8 @@ struct Inner {
     state: OracleState,
     /// The error code of the last failed call of this process.
     last_error: Option<String>,
+    /// The reservation of the last call the budget refused (USD).
+    last_budget_refusal: Option<f64>,
 }
 
 /// The OpenRouter client with its ledger and stop state.
@@ -739,6 +767,7 @@ impl OracleClient {
                 totals,
                 state: state_value,
                 last_error: None,
+                last_budget_refusal: None,
             }),
         })
     }
@@ -754,6 +783,12 @@ impl OracleClient {
     /// `transport_io`, `invalid_json`, …), never content.
     pub fn last_error(&self) -> Option<String> {
         self.inner.lock().last_error.clone()
+    }
+
+    /// The reservation (USD) of the last call of this process refused for the
+    /// budget: what did not fit.
+    pub fn last_budget_refusal(&self) -> Option<f64> {
+        self.inner.lock().last_budget_refusal
     }
 
     pub fn config(&self) -> &OracleConfig {
@@ -875,6 +910,9 @@ impl OracleClient {
         {
             let mut inner = self.inner.lock();
             if let Err(r) = self.admit(&inner, caller, res) {
+                if r == RefusalReason::Budget {
+                    inner.last_budget_refusal = Some(res);
+                }
                 return CallOutcome::Refused(r);
             }
             let line = json!({
@@ -1006,6 +1044,9 @@ impl OracleClient {
             t.spent += charged;
             if status == LEDGER_FAILED_UNKNOWN {
                 t.unknown_cost += charged;
+                if likely_unbilled(http_status) {
+                    t.refused_cost += charged;
+                }
             }
             let k = t.per_key.entry(key_id.to_string()).or_insert(0.0);
             *k = (*k - res).max(0.0) + charged;
@@ -1017,14 +1058,17 @@ impl OracleClient {
         }
         let mut stop = stop;
         let errors_before = inner.state.consecutive_errors;
+        let last_before = inner.state.last_error.clone();
         if let CallOutcome::Failed(f) = outcome {
             inner.last_error = Some(f.error.clone());
+            inner.state.last_error = Some(f.error.clone());
             inner.state.consecutive_errors = errors_before.saturating_add(1);
             if inner.state.consecutive_errors >= self.cfg.max_errors {
                 stop = stop.or_else(|| Some("max_errors".into()));
             }
         } else {
             inner.state.consecutive_errors = 0;
+            inner.state.last_error = None;
         }
         if usage.is_some_and(|u| u.cost > res) {
             stop = stop.or_else(|| Some("cost_above_reservation".into()));
@@ -1042,7 +1086,8 @@ impl OracleClient {
         if let Err(e) = write_line(&mut inner.ledger, &line) {
             tracing::error!(error = %e, "oracle ledger settle write failed");
         }
-        let mut changed = inner.state.consecutive_errors != errors_before;
+        let mut changed = inner.state.consecutive_errors != errors_before
+            || inner.state.last_error != last_before;
         if let Some(reason) = stop
             && inner.state.stop_reason.is_none()
         {
@@ -1235,10 +1280,16 @@ impl OracleClient {
         }
         {
             let mut inner = self.inner.lock();
-            st.consecutive_errors = if st.enabled && st.stop_reason.is_none() {
+            let resumed = st.enabled && st.stop_reason.is_none();
+            st.consecutive_errors = if resumed {
                 0
             } else {
                 inner.state.consecutive_errors
+            };
+            st.last_error = if resumed {
+                None
+            } else {
+                inner.state.last_error.clone()
             };
             inner.state = st;
             self.persist_state(&inner.state);
