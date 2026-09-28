@@ -63,6 +63,7 @@ fn arch() -> ModelArch {
         prism_hadamard: None,
         kv_heads_per_layer: None,
         v_head_dim: None,
+        anchor_core: None,
     }
 }
 
@@ -90,6 +91,10 @@ fn non_prism_embedding_is_not_an_inverse_matrix() {
         shard: None,
         calibration: None,
         routing: None,
+        genome: None,
+        lineage: Vec::new(),
+        router: None,
+        segments: Vec::new(),
     };
     CmfModel::write(&path, &header, &tensors, None, None).unwrap();
     let model = CmfModel::open(&path).unwrap();

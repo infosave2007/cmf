@@ -27,7 +27,9 @@ use cortiq_core::quant::{GROUP_SIZE, dequant_tensor};
 use cortiq_core::types::TensorDtype;
 use std::sync::Arc;
 
-use crate::convert::{Quant, encode_q2tp, encode_q4tp, parse_quant, q2tp_expert_gate_or_up};
+use crate::convert::{
+    Quant, encode_q2tp, encode_q4tp, encode_q8_row, parse_quant, q2tp_expert_gate_or_up,
+};
 
 enum Mode {
     /// Whole-file scale re-expression, lossless in the 4-bit grid.
@@ -37,6 +39,9 @@ enum Mode {
     /// tiny routing/gate tensors and 1-D tensors stay as they are — the
     /// Embryo trainer's f32 export is the source this exists for.
     QuantizeQ4tp,
+    /// Explicit, experimental Embryo tied vocabulary profile. The trunk and
+    /// hierarchical cluster head remain untouched; quality needs a new gate.
+    EmbryoQ8Head,
     /// Draft-only expert inputs to the 2-bit grid.
     DraftQ2tp,
     /// The draft's whole expert bodies — inputs AND the down plane. Still
@@ -47,15 +52,36 @@ enum Mode {
     DraftQ2tpFull,
 }
 
+/// Tensors of the Embryo-O1 operators (`docs/EMBRYO_BOUNDED_ANCHOR.md`,
+/// plan §2.5) that never leave f32 whatever their shape: the anchor's
+/// trained sinks, the GDN `a`/`b` projections and far-field landmarks.
+pub fn embryo_keep_f32(name: &str) -> bool {
+    name.contains("in_proj_a")
+        || name.contains("in_proj_b")
+        || name.contains("sink_")
+        || name.contains("landmarks_")
+}
+
 /// Which dtypes this mode recodes, and into what.
 fn target_dtype(mode: &Mode, name: &str, src: TensorDtype, shape: &[usize]) -> Option<TensorDtype> {
     let two_d = shape.len() == 2 && shape[1] % GROUP_SIZE == 0;
     match mode {
+        Mode::EmbryoQ8Head
+            if two_d && name == "model.embed_tokens.weight" && src == TensorDtype::F32 =>
+        {
+            Some(TensorDtype::Q8Row)
+        }
         // q4tp reads the same 4-bit grid as q4_tiled/q4_block, so recoding
         // either is lossless in the grid and only re-expresses the scale.
         Mode::FullQ4tp if two_d && matches!(src, TensorDtype::Q4Tiled | TensorDtype::Q4Block) => {
             Some(TensorDtype::Q4TiledP)
         }
+        // Embryo-O1 operator tensors that must stay f32 by NAME, not by
+        // shape: the bounded anchor's trained sinks (`sink_k`/`sink_v`,
+        // 3-D today, but the guarantee must not rest on that), the GDN
+        // mixer's decay/write-strength projections (`in_proj_a`/`in_proj_b`,
+        // nv rows — below the 64-row floor today, likewise not a contract)
+        // and any trained far-field landmarks.
         Mode::QuantizeQ4tp
             if two_d
                 && shape[0] >= 64
@@ -69,7 +95,8 @@ fn target_dtype(mode: &Mode, name: &str, src: TensorDtype, shape: &[usize]) -> O
                 // tables (a nudged codeword changes codes) and the speech
                 // embeddings are gathers, not matmuls.
                 && !name.contains("._codebook.")
-                && !name.starts_with("speech_embeddings.") =>
+                && !name.starts_with("speech_embeddings.")
+                && !embryo_keep_f32(name) =>
         {
             Some(TensorDtype::Q4TiledP)
         }
@@ -107,7 +134,9 @@ pub fn cmd_requant(
     quant: &str,
     in_place: bool,
 ) -> anyhow::Result<()> {
-    let mode = if quant == "q4tp-quantize" {
+    let mode = if quant == "embryo-q8-head" {
+        Mode::EmbryoQ8Head
+    } else if quant == "q4tp-quantize" {
         Mode::QuantizeQ4tp
     } else if quant == "q2tp-draft" {
         Mode::DraftQ2tp
@@ -133,6 +162,34 @@ pub fn cmd_requant(
     }
 
     let model = Arc::new(CmfModel::open_sharded(model_path)?);
+    crate::knowledge::refuse_genome_rewrite(&model, "requant")?;
+
+    if matches!(mode, Mode::EmbryoQ8Head) {
+        anyhow::ensure!(
+            !in_place,
+            "embryo-q8-head is experimental: in-place rewriting is forbidden"
+        );
+        anyhow::ensure!(
+            !std::path::Path::new(output.unwrap()).exists(),
+            "embryo-q8-head requires a new output path"
+        );
+        anyhow::ensure!(
+            model.header.arch.arch_name == "cortiq_embryo"
+                && model.header.arch.tie_word_embeddings
+                && model.header.skills.is_empty()
+                && model.tensor("lm_head.weight").is_none(),
+            "embryo-q8-head requires a bare Embryo with a tied vocabulary and no separate lm_head"
+        );
+        let e = model
+            .tensor("model.embed_tokens.weight")
+            .context("missing Embryo tied embedding")?;
+        anyhow::ensure!(
+            e.shape == [model.header.arch.vocab_size, model.header.arch.hidden_size]
+                && e.shape.iter().all(|&n| n > 0)
+                && target_dtype(&mode, &e.name, e.dtype, &e.shape).is_some(),
+            "embryo-q8-head requires an original F32 [vocab, hidden] embedding, hidden divisible by 32"
+        );
+    }
 
     let recode =
         |entry: &cortiq_core::format::TensorEntry, dt: TensorDtype| -> anyhow::Result<Vec<u8>> {
@@ -142,6 +199,10 @@ pub fn cmd_requant(
                 .map_err(anyhow::Error::msg)
                 .with_context(|| format!("dequantizing '{}'", entry.name))?;
             Ok(match dt {
+                TensorDtype::Q8Row => {
+                    anyhow::ensure!(buf.iter().all(|v| v.is_finite()), "non-finite embedding");
+                    encode_q8_row(&buf, rows, cols)
+                }
                 TensorDtype::Q2TiledP => encode_q2tp(&buf, rows, cols),
                 _ => encode_q4tp(&buf, rows, cols),
             })
@@ -245,6 +306,126 @@ pub fn cmd_requant(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embryo_q8_head_is_explicit_and_preserves_other_tensors() {
+        let dir = std::env::temp_dir().join(format!("cmf-embryo-q8-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("input.cmf");
+        let output = dir.join("output.cmf");
+        let absent = dir.join("refused.cmf");
+        // Owned test outputs only, so a previously interrupted test is safe.
+        for p in [&output, &absent] {
+            if p.exists() {
+                std::fs::remove_file(p).unwrap();
+            }
+        }
+        let header: cortiq_core::CmfHeader = serde_json::from_value(serde_json::json!({
+            "format": "cmf", "version": cortiq_core::CMF_VERSION,
+            "arch": {"arch_name": "cortiq_embryo", "hidden_size": 32,
+                "intermediate_size": 64, "num_layers": 1, "num_attention_heads": 1,
+                "num_kv_heads": 1, "head_dim": 32, "vocab_size": 64,
+                "layer_types": ["FullAttention"], "tie_word_embeddings": true,
+                "rms_norm_eps": 1e-6, "max_position_embeddings": 64},
+            "quant_type": "F32"
+        }))
+        .unwrap();
+        let weights: Vec<f32> = (0..64 * 32).map(|i| (i as f32 * 0.17).sin()).collect();
+        let raw: Vec<u8> = weights.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let specs = vec![
+            TensorSpec {
+                name: "model.embed_tokens.weight".into(),
+                dtype: TensorDtype::F32,
+                shape: vec![64, 32],
+                data: raw.clone(),
+            },
+            TensorSpec {
+                name: "lm_head.clusters.weight".into(),
+                dtype: TensorDtype::F32,
+                shape: vec![64, 32],
+                data: raw.clone(),
+            },
+        ];
+        CmfModel::write(input.to_str().unwrap(), &header, &specs, None, None).unwrap();
+        let before = std::fs::read(&input).unwrap();
+        assert!(cmd_requant(input.to_str().unwrap(), None, "embryo-q8-head", true).is_err());
+        assert_eq!(std::fs::read(&input).unwrap(), before);
+        cmd_requant(
+            input.to_str().unwrap(),
+            Some(output.to_str().unwrap()),
+            "embryo-q8-head",
+            false,
+        )
+        .unwrap();
+        let result = CmfModel::open(output.to_str().unwrap()).unwrap();
+        assert!(result.verify().is_empty());
+        let embedding = result.tensor("model.embed_tokens.weight").unwrap();
+        assert_eq!(embedding.dtype, TensorDtype::Q8Row);
+        let mut decoded = vec![0.0; weights.len()];
+        dequant_tensor(embedding, result.entry_bytes(embedding), &mut decoded).unwrap();
+        assert!(
+            decoded
+                .iter()
+                .zip(&weights)
+                .all(|(a, b)| (a - b).abs() < 0.005)
+        );
+        let cluster = result.tensor("lm_head.clusters.weight").unwrap();
+        assert_eq!(cluster.dtype, TensorDtype::F32);
+        assert_eq!(result.entry_bytes(cluster), raw.as_slice());
+        // Requantizing an already quantized vocabulary is not allowed.
+        assert!(
+            cmd_requant(
+                output.to_str().unwrap(),
+                Some(absent.to_str().unwrap()),
+                "embryo-q8-head",
+                false
+            )
+            .is_err()
+        );
+        assert!(!absent.exists());
+        // Refuse overwrites even when a caller asks for the same input path.
+        assert!(
+            cmd_requant(
+                input.to_str().unwrap(),
+                Some(input.to_str().unwrap()),
+                "embryo-q8-head",
+                false
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&input).unwrap(), before);
+        drop(result);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn embryo_q8_head_does_not_change_default_policy() {
+        for name in [
+            "lm_head.weight",
+            "lm_head.clusters.weight",
+            "model.layers.0.mlp.gate.weight",
+        ] {
+            assert!(target_dtype(&Mode::EmbryoQ8Head, name, TensorDtype::F32, &[64, 32]).is_none());
+        }
+        assert!(
+            target_dtype(
+                &Mode::QuantizeQ4tp,
+                "model.embed_tokens.weight",
+                TensorDtype::F32,
+                &[64, 32]
+            )
+            .is_none()
+        );
+        assert!(
+            target_dtype(
+                &Mode::EmbryoQ8Head,
+                "model.embed_tokens.weight",
+                TensorDtype::F16,
+                &[64, 32]
+            )
+            .is_none()
+        );
+    }
 
     /// End-to-end through the real command: a mini CMF with a draft expert,
     /// a trunk expert and a draft down-projection — only the draft's w1

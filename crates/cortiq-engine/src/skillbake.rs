@@ -36,6 +36,13 @@ pub struct BakeHyper {
     pub lr_b: f64,
     pub tau: f32,
     pub fcd_layers: usize,
+    /// Independent fixed-length records per optimizer step.  The loss is
+    /// normalized over all focused targets in the batch.
+    pub batch: usize,
+    /// Focused records per cached final-FFN optimizer step.  This is separate
+    /// from `batch` because Phase A stores every layer's activations while a
+    /// one-layer FCD cache stores only two hidden vectors per record.
+    pub fcd_batch: usize,
     pub seed: u64,
     /// Target sparsity (0..1). When >0, the best checkpoint must have
     /// at least this fraction of neurons pruned; if none qualifies the
@@ -44,6 +51,32 @@ pub struct BakeHyper {
     /// L1 aggression multiplier: scales both l1_init and l1_step.
     /// >1.0 = harder pruning push, <1.0 = softer.
     pub l1_mult: f64,
+    /// Effective unlooped mask logit at step zero. The per-visit value is
+    /// solved so that the product over loop visits equals sigmoid(init).
+    /// 2.0 preserves the native recipe; 4.0 reproduces the older DTG-MA
+    /// trading notebooks' near-identity start.
+    pub mask_init: f32,
+    /// Penalize softplus(logit), whose derivative is sigmoid(logit), instead
+    /// of penalizing sigmoid(logit) itself. This reproduces the older DTG-MA
+    /// recipe and avoids an extra (1-sigmoid) attenuation near an open gate.
+    pub softplus_l1: bool,
+    /// Select Phase-A checkpoints by held-out hard balanced accuracy when
+    /// focused class tokens are configured. Otherwise held-out PPL remains
+    /// the checkpoint metric.
+    pub checkpoint_accuracy: bool,
+    /// Optional strict lower bound for a focused checkpoint's raw accuracy.
+    /// A checkpoint is eligible only when its measured accuracy is greater
+    /// than this value. This lets callers impose a natural-distribution
+    /// majority guard instead of selecting from a balanced holdout.
+    pub checkpoint_min_accuracy: Option<f64>,
+    /// Optional strict lower bound for focused balanced accuracy. Combined
+    /// with `checkpoint_min_accuracy`, this prevents a majority-only mask
+    /// from becoming the shipped specialist.
+    pub checkpoint_min_balanced_accuracy: Option<f64>,
+    /// When a joint accuracy guard is configured, rank eligible checkpoints
+    /// by raw accuracy first, then balanced accuracy and PPL. The historical
+    /// balanced-first selector remains the default for compatibility.
+    pub checkpoint_raw_priority: bool,
     /// Round each layer's kept-neuron count UP to a multiple of this
     /// (0/1 = off). 32 keeps the defragged FFN on grouped codecs
     /// (in % 32 == 0) and SIMD kernels off their scalar tails.
@@ -76,9 +109,17 @@ impl Default for BakeHyper {
             lr_b: 1e-5,
             tau: 0.5,
             fcd_layers: 4,
+            batch: 1,
+            fcd_batch: 128,
             seed: 0,
             target_sparsity: 0.0,
             l1_mult: 1.0,
+            mask_init: 2.0,
+            softplus_l1: false,
+            checkpoint_accuracy: false,
+            checkpoint_min_accuracy: None,
+            checkpoint_min_balanced_accuracy: None,
+            checkpoint_raw_priority: false,
             align: 32,
             uniform_inter: false,
             focus_tokens: Vec::new(),
@@ -97,7 +138,26 @@ pub struct BakeReport {
     pub overlaid: f64,
     pub pruned_ratio: f64,
     pub kept_per_layer: Vec<usize>,
+    /// Hard focused-label accuracy, present when focus tokens were supplied.
+    pub backbone_accuracy: Option<f64>,
+    pub masked_accuracy: Option<f64>,
+    pub overlaid_accuracy: Option<f64>,
+    /// Macro recall over focused labels. Unlike raw accuracy this cannot be
+    /// improved by collapsing to the majority UP/DOWN class.
+    pub backbone_balanced_accuracy: Option<f64>,
+    pub masked_balanced_accuracy: Option<f64>,
+    pub overlaid_balanced_accuracy: Option<f64>,
+    pub selected_step: usize,
     pub sec: f64,
+}
+
+pub struct BakeCheckpoint {
+    pub step: usize,
+    pub l1: f64,
+    pub ppl: f64,
+    pub sparsity: f64,
+    pub accuracy: Option<f64>,
+    pub balanced_accuracy: Option<f64>,
 }
 
 /// The trained artifacts: everything the defrag writer needs, f32.
@@ -120,6 +180,10 @@ pub struct BakeArtifacts {
     /// planner ranks and orders neurons by these, not by raw
     /// activation mass.
     pub logits: Vec<Vec<f32>>,
+    /// Phase-A logits after the last requested optimization step, before
+    /// restoring the selected hard-validation checkpoint.
+    pub final_logits: Vec<Vec<f32>>,
+    pub checkpoints: Vec<BakeCheckpoint>,
 }
 
 const CLIP: f64 = 1.0;
@@ -187,10 +251,14 @@ impl Adam {
 /// 4.187 to 278.4 at step 30; and a start pushed to identity, which
 /// cannot learn because the update carries σ'(m) = σ(1−σ), worth 5e-4
 /// at σ = 0.9995 against 0.105 at 2.0.
-pub fn mask_init_logit(loops: usize) -> f32 {
-    let base = 1.0f32 / (1.0 + (-2.0f32).exp());
+pub fn mask_init_logit_for(loops: usize, effective_logit: f32) -> f32 {
+    let base = 1.0f32 / (1.0 + (-effective_logit).exp());
     let per_visit = base.powf(1.0 / loops.max(1) as f32);
     (per_visit / (1.0 - per_visit)).ln()
+}
+
+pub fn mask_init_logit(loops: usize) -> f32 {
+    mask_init_logit_for(loops, 2.0)
 }
 
 /// Learning-rate scale for the mask step, given the loop depth.
@@ -204,6 +272,11 @@ pub fn mask_step_scale(loops: usize) -> f64 {
 
 fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
+}
+
+fn sparsity_grad(logit: f32, softplus_l1: bool) -> f64 {
+    let s = sigmoid(logit) as f64;
+    if softplus_l1 { s } else { s * (1.0 - s) }
 }
 
 fn is_scored_target(
@@ -235,6 +308,90 @@ struct Pass<'a> {
     focus_tokens: &'a [u32],
     /// Empty means no right-context constraint on focused targets.
     focus_follow_tokens: &'a [u32],
+}
+
+#[derive(Clone, Debug, Default)]
+struct FocusStats {
+    total: usize,
+    correct: usize,
+    class_total: Vec<usize>,
+    class_correct: Vec<usize>,
+}
+
+impl FocusStats {
+    fn new(classes: usize) -> Self {
+        Self {
+            class_total: vec![0; classes],
+            class_correct: vec![0; classes],
+            ..Self::default()
+        }
+    }
+
+    fn accuracy(&self) -> Option<f64> {
+        (self.total > 0).then(|| self.correct as f64 / self.total as f64)
+    }
+
+    fn balanced_accuracy(&self) -> Option<f64> {
+        let recalls: Vec<f64> = self
+            .class_total
+            .iter()
+            .zip(&self.class_correct)
+            .filter_map(|(&n, &ok)| (n > 0).then(|| ok as f64 / n as f64))
+            .collect();
+        (!recalls.is_empty()).then(|| recalls.iter().sum::<f64>() / recalls.len() as f64)
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.total += other.total;
+        self.correct += other.correct;
+        if self.class_total.len() < other.class_total.len() {
+            self.class_total.resize(other.class_total.len(), 0);
+            self.class_correct.resize(other.class_correct.len(), 0);
+        }
+        for (dst, src) in self.class_total.iter_mut().zip(&other.class_total) {
+            *dst += src;
+        }
+        for (dst, src) in self.class_correct.iter_mut().zip(&other.class_correct) {
+            *dst += src;
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct HeldScore {
+    ppl: f64,
+    accuracy: Option<f64>,
+    balanced_accuracy: Option<f64>,
+}
+
+/// Frozen boundary immediately before one trainable final FFN.  This is not
+/// an adapter or a donor checkpoint: both vectors are extracted directly from
+/// the opened CMF, kept in RAM, and discarded when the native bake ends.
+#[derive(Default)]
+struct FocusedFcdCache {
+    h1: Vec<f32>,
+    n2: Vec<f32>,
+    targets: Vec<usize>,
+}
+
+impl FocusedFcdCache {
+    fn len(&self) -> usize {
+        self.targets.len()
+    }
+
+    fn append(&mut self, mut other: Self) {
+        self.h1.append(&mut other.h1);
+        self.n2.append(&mut other.n2);
+        self.targets.append(&mut other.targets);
+    }
+}
+
+fn gather_rows(values: &[f32], rows: &[usize], width: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(rows.len() * width);
+    for &row in rows {
+        out.extend_from_slice(&values[row * width..(row + 1) * width]);
+    }
+    out
 }
 
 impl Pass<'_> {
@@ -275,6 +432,80 @@ impl Pass<'_> {
         }
     }
 
+    /// Extract the exact frozen boundary of the final FFN for focused answer
+    /// positions.  Only the ordinary one-pass/final-layer case is cacheable:
+    /// looped stacks revisit the same FFN after its own changed output and
+    /// correctly fall back to the full Phase-B path.
+    fn cache_final_ffn_batch(&self, ids: &[u32], batch: usize) -> Result<FocusedFcdCache, String> {
+        let fm = self.fm;
+        if fm.loops.max(1) != 1 || fm.layers.is_empty() || self.focus_tokens.is_empty() {
+            return Err("focused final-FFN cache needs a one-pass stack and focus tokens".into());
+        }
+        if ids.len() % batch.max(1) != 0 {
+            return Err("focused final-FFN cache received a ragged batch".into());
+        }
+        let t = ids.len() / batch.max(1);
+        let hsz = fm.hidden;
+        let last = fm.layers.len() - 1;
+        let mut sources = Vec::new();
+        let mut targets = Vec::new();
+        for bi in 0..batch {
+            let base = bi * t;
+            for target_index in base + 1..base + t {
+                if !is_scored_target(
+                    ids,
+                    target_index,
+                    base + t,
+                    self.focus_tokens,
+                    self.focus_follow_tokens,
+                ) {
+                    continue;
+                }
+                sources.push(target_index - 1);
+                targets.push(
+                    self.focus_tokens
+                        .iter()
+                        .position(|&id| id == ids[target_index])
+                        .expect("focused target belongs to focus_tokens"),
+                );
+            }
+        }
+        if sources.is_empty() {
+            return Ok(FocusedFcdCache::default());
+        }
+
+        let mut hidden = vec![0f32; ids.len() * hsz];
+        for (row, &id) in ids.iter().enumerate() {
+            hidden[row * hsz..(row + 1) * hsz]
+                .copy_from_slice(&fm.embed[id as usize * hsz..(id as usize + 1) * hsz]);
+        }
+        for layer in 0..=last {
+            let gate = self.gates(layer);
+            let mats = fm.mats(layer)?;
+            let weights = self.wts(layer, &mats);
+            let (next, acts) = fm.layer_forward_scaled(
+                layer,
+                &hidden,
+                batch,
+                t,
+                &weights,
+                false,
+                layer == last,
+                Some(&gate),
+            );
+            if layer == last {
+                let acts = acts.expect("last FFN boundary requested");
+                return Ok(FocusedFcdCache {
+                    h1: gather_rows(&acts.h1, &sources, hsz),
+                    n2: gather_rows(&acts.n2, &sources, hsz),
+                    targets,
+                });
+            }
+            hidden = next;
+        }
+        unreachable!("non-empty stack has a final layer")
+    }
+
     /// Teacher-forced NLL over one chunk; when `grad` is set, backprop
     /// through the FFN chain into the mask grads (and FFN grads for
     /// Phase-B layers).
@@ -306,12 +537,22 @@ impl Pass<'_> {
             &mut [Option<(Vec<f64>, Vec<f64>, Vec<f64>)>],
         )>,
     ) -> (f64, usize) {
+        self.chunk_batch_scored(ids, b, grad, None)
+    }
+
+    fn chunk_batch_scored(
+        &self,
+        ids: &[u32],
+        b: usize,
+        grad: Option<(
+            &mut [Vec<f64>],
+            &mut [Option<(Vec<f64>, Vec<f64>, Vec<f64>)>],
+        )>,
+        mut focus_stats: Option<&mut FocusStats>,
+    ) -> (f64, usize) {
         let fm = self.fm;
         let hsz = fm.hidden;
         debug_assert!(ids.len() % b.max(1) == 0, "ragged batch");
-        // Training differentiates one chunk at a time — the recipe's
-        // gradient accumulation is per-chunk by design.
-        debug_assert!(grad.is_none() || b == 1, "grads are per-chunk");
         let t = ids.len() / b.max(1);
         let n = b * t;
         let nl = fm.layers.len();
@@ -394,39 +635,28 @@ impl Pass<'_> {
         if scored == 0 {
             return (0.0, 0);
         }
-        for bi in 0..b {
-            let base = bi * t;
-            let mut p0 = 0usize;
-            while p0 < t - 1 {
-                let pc = POS_CHUNK.min(t - 1 - p0);
-                let mut logits = vec![0f32; pc * vocab];
-                ops::gemm_nt(
-                    &hn[(base + p0) * hsz..(base + p0 + pc) * hsz],
-                    lm,
-                    &mut logits,
-                    pc,
-                    hsz,
-                    vocab,
-                    pool,
-                );
-                for r in 0..pc {
-                    let target_index = base + p0 + r + 1;
-                    let target_id = ids[target_index];
-                    let row = &mut logits[r * vocab..(r + 1) * vocab];
-                    if !is_scored_target(
-                        ids,
-                        target_index,
-                        base + t,
-                        self.focus_tokens,
-                        self.focus_follow_tokens,
-                    ) {
-                        if grad.is_some() {
-                            row.fill(0.0);
-                        }
-                        continue;
-                    }
-                    let target = target_id as usize;
-                    if self.focus_tokens.is_empty() {
+        if self.focus_tokens.is_empty() {
+            // Ordinary language-model mode still needs the complete
+            // vocabulary distribution at every target position.
+            for bi in 0..b {
+                let base = bi * t;
+                let mut p0 = 0usize;
+                while p0 < t - 1 {
+                    let pc = POS_CHUNK.min(t - 1 - p0);
+                    let mut logits = vec![0f32; pc * vocab];
+                    ops::gemm_nt(
+                        &hn[(base + p0) * hsz..(base + p0 + pc) * hsz],
+                        lm,
+                        &mut logits,
+                        pc,
+                        hsz,
+                        vocab,
+                        pool,
+                    );
+                    for r in 0..pc {
+                        let target_index = base + p0 + r + 1;
+                        let target = ids[target_index] as usize;
+                        let row = &mut logits[r * vocab..(r + 1) * vocab];
                         let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
                         let mut sum = 0f64;
                         for v in row.iter() {
@@ -441,51 +671,95 @@ impl Pass<'_> {
                             }
                             row[target] -= inv_n as f32;
                         }
-                    } else {
-                        // A supervised classifier needs competition BETWEEN
-                        // its labels. Full-vocabulary CE merely teaches both
-                        // UP and DOWN to outrank unrelated words and can lower
-                        // PPL while greedy decoding stays one constant class.
-                        // Restrict the normalizer and gradient to the declared
-                        // one-token labels: this is exact binary/multiclass CE.
-                        let mx = self
-                            .focus_tokens
+                    }
+                    if grad.is_some() {
+                        ops::gemm_dx(
+                            &logits,
+                            lm,
+                            &mut dh_n[(base + p0) * hsz..(base + p0 + pc) * hsz],
+                            pc,
+                            hsz,
+                            vocab,
+                            pool,
+                        );
+                    }
+                    p0 += pc;
+                }
+            }
+        } else {
+            // Exact classifier mode. Only the declared label rows can enter
+            // either the normalizer or its gradient, so multiplying every
+            // hidden by the full ~250k-row LM head is pure wasted work. It
+            // made a two-label archaeology run spend more time in the head
+            // than in mask Adam and limited experiments to a tiny fraction
+            // of the updates used by the original notebooks.
+            let inv_n = 1.0 / scored as f64;
+            for bi in 0..b {
+                let base = bi * t;
+                for target_index in base + 1..base + t {
+                    if !is_scored_target(
+                        ids,
+                        target_index,
+                        base + t,
+                        self.focus_tokens,
+                        self.focus_follow_tokens,
+                    ) {
+                        continue;
+                    }
+                    let target_class = self
+                        .focus_tokens
+                        .iter()
+                        .position(|&id| id == ids[target_index])
+                        .expect("focused target belongs to focus_tokens");
+                    let source = target_index - 1;
+                    let hidden = &hn[source * hsz..(source + 1) * hsz];
+                    let class_logits: Vec<f32> = self
+                        .focus_tokens
+                        .iter()
+                        .map(|&id| {
+                            let row = &lm[id as usize * hsz..(id as usize + 1) * hsz];
+                            hidden.iter().zip(row).map(|(&x, &w)| x * w).sum()
+                        })
+                        .collect();
+                    let mx = class_logits
+                        .iter()
+                        .copied()
+                        .fold(f32::NEG_INFINITY, f32::max) as f64;
+                    let probs: Vec<f64> = class_logits
+                        .iter()
+                        .map(|&value| ((value as f64) - mx).exp())
+                        .collect();
+                    let sum: f64 = probs.iter().sum();
+                    nll += mx + sum.ln() - class_logits[target_class] as f64;
+                    if let Some(stats) = focus_stats.as_deref_mut() {
+                        let predicted_class = class_logits
                             .iter()
-                            .map(|&id| row[id as usize])
-                            .fold(f32::NEG_INFINITY, f32::max)
-                            as f64;
-                        let probs: Vec<(usize, f64)> = self
-                            .focus_tokens
-                            .iter()
-                            .map(|&id| {
-                                let index = id as usize;
-                                (index, ((row[index] as f64) - mx).exp())
-                            })
-                            .collect();
-                        let sum: f64 = probs.iter().map(|(_, value)| value).sum();
-                        nll += mx + sum.ln() - row[target] as f64;
-                        if grad.is_some() {
-                            let inv_n = 1.0 / scored as f64;
-                            row.fill(0.0);
-                            for (index, value) in probs {
-                                row[index] = (value / sum * inv_n) as f32;
+                            .enumerate()
+                            .max_by(|(_, left), (_, right)| left.total_cmp(right))
+                            .map(|(index, _)| index)
+                            .expect("focus_tokens is non-empty");
+                        stats.total += 1;
+                        stats.class_total[target_class] += 1;
+                        if predicted_class == target_class {
+                            stats.correct += 1;
+                            stats.class_correct[target_class] += 1;
+                        }
+                    }
+                    if grad.is_some() {
+                        let dh = &mut dh_n[source * hsz..(source + 1) * hsz];
+                        for (class, (&id, probability)) in
+                            self.focus_tokens.iter().zip(probs).enumerate()
+                        {
+                            let coefficient = (probability / sum
+                                - usize::from(class == target_class) as f64)
+                                * inv_n;
+                            let row = &lm[id as usize * hsz..(id as usize + 1) * hsz];
+                            for (value, &weight) in dh.iter_mut().zip(row) {
+                                *value += (coefficient * weight as f64) as f32;
                             }
-                            row[target] -= inv_n as f32;
                         }
                     }
                 }
-                if grad.is_some() {
-                    ops::gemm_dx(
-                        &logits,
-                        lm,
-                        &mut dh_n[(base + p0) * hsz..(base + p0 + pc) * hsz],
-                        pc,
-                        hsz,
-                        vocab,
-                        pool,
-                    );
-                }
-                p0 += pc;
             }
         }
         let Some((dmask, dffn)) = grad else {
@@ -509,18 +783,18 @@ impl Pass<'_> {
             let mats_hold = fm.mats(li).expect("layer mats");
             let wts = self.wts(li, &mats_hold);
             // h2 = h1 + act2 @ downᵀ  →  dact2 = dh @ down.
-            let mut dact2 = vec![0f32; t * inter];
-            ops::gemm_dx(&dh, wts.down, &mut dact2, t, inter, hsz, fm.pool.as_deref());
+            let mut dact2 = vec![0f32; n * inter];
+            ops::gemm_dx(&dh, wts.down, &mut dact2, n, inter, hsz, fm.pool.as_deref());
             if let Some((_, _, dd)) = dffn[li].as_mut() {
                 // dW_down += dhᵀ · act2 (act2 = act·g).
                 let mut act2 = a.act.clone();
-                for r in 0..t {
+                for r in 0..n {
                     for (x, &gv) in act2[r * inter..(r + 1) * inter].iter_mut().zip(g) {
                         *x *= gv;
                     }
                 }
                 let mut dw = vec![0f32; hsz * inter];
-                ops::gemm_dw(&dh, &act2, &mut dw, t, inter, hsz, fm.pool.as_deref());
+                ops::gemm_dw(&dh, &act2, &mut dw, n, inter, hsz, fm.pool.as_deref());
                 for (o, &x) in dd.iter_mut().zip(&dw) {
                     *o += x as f64;
                 }
@@ -530,7 +804,7 @@ impl Pass<'_> {
             // exactly its own visit's gradient, no cross-visit sum.
             {
                 let dm = &mut dmask[vl];
-                for r in 0..t {
+                for r in 0..n {
                     let da = &dact2[r * inter..(r + 1) * inter];
                     let aa = &a.act[r * inter..(r + 1) * inter];
                     for j in 0..inter {
@@ -544,9 +818,9 @@ impl Pass<'_> {
                 }
             }
             // dact = dact2 · g;  silu·mul backward.
-            let mut dg_pre = vec![0f32; t * inter];
-            let mut du_pre = vec![0f32; t * inter];
-            for r in 0..t {
+            let mut dg_pre = vec![0f32; n * inter];
+            let mut du_pre = vec![0f32; n * inter];
+            for r in 0..n {
                 for j in 0..inter {
                     let i = r * inter + j;
                     let da = dact2[i] * g[j];
@@ -557,31 +831,31 @@ impl Pass<'_> {
             }
             // dn2 = dg_pre @ gate + du_pre @ up — one fused submit when
             // the frozen concat exists; the trained-copy path keeps two.
-            let mut dn2 = vec![0f32; t * hsz];
+            let mut dn2 = vec![0f32; n * hsz];
             if let Some(gu) = wts.gu {
-                let mut dgu = vec![0f32; t * 2 * inter];
-                for r in 0..t {
+                let mut dgu = vec![0f32; n * 2 * inter];
+                for r in 0..n {
                     let row = &mut dgu[r * 2 * inter..(r + 1) * 2 * inter];
                     row[..inter].copy_from_slice(&dg_pre[r * inter..(r + 1) * inter]);
                     row[inter..].copy_from_slice(&du_pre[r * inter..(r + 1) * inter]);
                 }
-                ops::gemm_dx(&dgu, gu, &mut dn2, t, hsz, 2 * inter, fm.pool.as_deref());
+                ops::gemm_dx(&dgu, gu, &mut dn2, n, hsz, 2 * inter, fm.pool.as_deref());
             } else {
                 ops::gemm_dx(
                     &dg_pre,
                     wts.gate,
                     &mut dn2,
-                    t,
+                    n,
                     hsz,
                     inter,
                     fm.pool.as_deref(),
                 );
-                let mut dn2b = vec![0f32; t * hsz];
+                let mut dn2b = vec![0f32; n * hsz];
                 ops::gemm_dx(
                     &du_pre,
                     wts.up,
                     &mut dn2b,
-                    t,
+                    n,
                     hsz,
                     inter,
                     fm.pool.as_deref(),
@@ -592,12 +866,12 @@ impl Pass<'_> {
             }
             if let Some((dgw, duw, _)) = dffn[li].as_mut() {
                 let mut dw = vec![0f32; inter * hsz];
-                ops::gemm_dw(&dg_pre, &a.n2, &mut dw, t, hsz, inter, fm.pool.as_deref());
+                ops::gemm_dw(&dg_pre, &a.n2, &mut dw, n, hsz, inter, fm.pool.as_deref());
                 for (o, &x) in dgw.iter_mut().zip(&dw) {
                     *o += x as f64;
                 }
                 dw.fill(0.0);
-                ops::gemm_dw(&du_pre, &a.n2, &mut dw, t, hsz, inter, fm.pool.as_deref());
+                ops::gemm_dw(&du_pre, &a.n2, &mut dw, n, hsz, inter, fm.pool.as_deref());
                 for (o, &x) in duw.iter_mut().zip(&dw) {
                     *o += x as f64;
                 }
@@ -616,26 +890,279 @@ impl Pass<'_> {
 
 /// Held-out PPL with the hard mask (and Phase-B weights when present).
 fn held_ppl(pass: &Pass, held: &[Vec<u32>]) -> f64 {
-    // One batched pass over the whole held set: same arithmetic, one
-    // GEMM per weight instead of one per chunk. On the 4 B looped model
-    // the sequential version spent 12× the submits for identical math.
+    held_score(pass, held).ppl
+}
+
+fn held_score(pass: &Pass, held: &[Vec<u32>]) -> HeldScore {
+    // Bounded batched passes over the held set: equal-length records share
+    // one GEMM per weight, while the cap keeps activation/GPU scratch memory
+    // predictable for a full validation sweep. Aggregation is exact because
+    // NLL and focused-class counts are additive across groups.
     if held.is_empty() {
-        return f64::NAN;
-    }
-    let t = held[0].len();
-    if held.iter().all(|c| c.len() == t) {
-        let flat: Vec<u32> = held.iter().flatten().copied().collect();
-        let (l, k) = pass.chunk_batch(&flat, held.len(), None);
-        return (l / k.max(1) as f64).exp();
+        return HeldScore {
+            ppl: f64::NAN,
+            accuracy: None,
+            balanced_accuracy: None,
+        };
     }
     let mut nll = 0f64;
     let mut n = 0usize;
-    for c in held {
-        let (l, k) = pass.chunk(c, None);
-        nll += l;
-        n += k;
+    let mut stats = FocusStats::new(pass.focus_tokens.len());
+    const GROUP: usize = 32;
+    for group in held.chunks(GROUP) {
+        let t = group[0].len();
+        if group.iter().all(|c| c.len() == t) {
+            let flat: Vec<u32> = group.iter().flatten().copied().collect();
+            let mut part = FocusStats::new(pass.focus_tokens.len());
+            let (l, k) = pass.chunk_batch_scored(&flat, group.len(), None, Some(&mut part));
+            nll += l;
+            n += k;
+            stats.merge(&part);
+        } else {
+            for c in group {
+                let mut part = FocusStats::new(pass.focus_tokens.len());
+                let (l, k) = pass.chunk_batch_scored(c, 1, None, Some(&mut part));
+                nll += l;
+                n += k;
+                stats.merge(&part);
+            }
+        }
     }
-    (nll / n.max(1) as f64).exp()
+    HeldScore {
+        ppl: (nll / n.max(1) as f64).exp(),
+        accuracy: stats.accuracy(),
+        balanced_accuracy: stats.balanced_accuracy(),
+    }
+}
+
+fn calibration_batch(
+    calib: &[Vec<u32>],
+    step: usize,
+    requested: usize,
+) -> Result<(Vec<u32>, usize), String> {
+    let batch = requested.max(1).min(calib.len());
+    let width = calib[0].len();
+    let mut flat = Vec::with_capacity(batch * width);
+    for offset in 0..batch {
+        let record = &calib[(step * batch + offset) % calib.len()];
+        if record.len() != width {
+            return Err(format!(
+                "skill bake: --batch needs equal-length records ({} != {width})",
+                record.len()
+            ));
+        }
+        flat.extend_from_slice(record);
+    }
+    Ok((flat, batch))
+}
+
+fn build_focused_fcd_cache(
+    pass: &Pass<'_>,
+    records: &[Vec<u32>],
+    extraction_batch: usize,
+) -> Result<FocusedFcdCache, String> {
+    let mut cache = FocusedFcdCache::default();
+    for group in records.chunks(extraction_batch.max(1)) {
+        let width = group[0].len();
+        if group.iter().any(|record| record.len() != width) {
+            return Err("focused final-FFN cache needs equal-length records".into());
+        }
+        let flat: Vec<u32> = group.iter().flatten().copied().collect();
+        cache.append(pass.cache_final_ffn_batch(&flat, group.len())?);
+    }
+    Ok(cache)
+}
+
+/// Exact final-FFN focused loss, optionally with gradients for the three full
+/// FCD projections.  The upstream representation came from the same CMF and
+/// mask in `build_focused_fcd_cache`; no external checkpoint format is used.
+fn cached_fcd_run(
+    fm: &FcdModel,
+    cache: &FocusedFcdCache,
+    indices: &[usize],
+    weights: (&[f32], &[f32], &[f32]),
+    gate: &[f32],
+    focus_tokens: &[u32],
+    want_grad: bool,
+) -> (HeldScore, Option<(Vec<f64>, Vec<f64>, Vec<f64>)>) {
+    let (gate_w, up_w, down_w) = weights;
+    let rows = indices.len();
+    let hidden = fm.hidden;
+    let inter = gate.len();
+    if rows == 0 {
+        return (
+            HeldScore {
+                ppl: f64::NAN,
+                accuracy: None,
+                balanced_accuracy: None,
+            },
+            None,
+        );
+    }
+    let h1 = gather_rows(&cache.h1, indices, hidden);
+    let n2 = gather_rows(&cache.n2, indices, hidden);
+    let mut gate_pre = vec![0f32; rows * inter];
+    let mut up_pre = vec![0f32; rows * inter];
+    ops::gemm_nt(
+        &n2,
+        gate_w,
+        &mut gate_pre,
+        rows,
+        hidden,
+        inter,
+        fm.pool.as_deref(),
+    );
+    ops::gemm_nt(
+        &n2,
+        up_w,
+        &mut up_pre,
+        rows,
+        hidden,
+        inter,
+        fm.pool.as_deref(),
+    );
+    let mut act = vec![0f32; rows * inter];
+    for row in 0..rows {
+        for column in 0..inter {
+            let at = row * inter + column;
+            act[at] = ops::silu(gate_pre[at]) * up_pre[at] * gate[column];
+        }
+    }
+    let mut ffn = vec![0f32; rows * hidden];
+    ops::gemm_nt(
+        &act,
+        down_w,
+        &mut ffn,
+        rows,
+        inter,
+        hidden,
+        fm.pool.as_deref(),
+    );
+    let mut h2 = h1;
+    for (value, &delta) in h2.iter_mut().zip(&ffn) {
+        *value += delta;
+    }
+    let mut normed = vec![0f32; rows * hidden];
+    let mut inv = vec![0f32; rows];
+    ops::rmsnorm_fwd(&h2, &fm.final_norm, fm.eps, fm.gemma, &mut normed, &mut inv);
+
+    let lm: &[f32] = fm.lm_head.as_deref().unwrap_or(&fm.embed);
+    let mut stats = FocusStats::new(focus_tokens.len());
+    let mut nll = 0f64;
+    let mut dh_normed = want_grad.then(|| vec![0f32; rows * hidden]);
+    for (local_row, &cache_row) in indices.iter().enumerate() {
+        let target = cache.targets[cache_row];
+        let state = &normed[local_row * hidden..(local_row + 1) * hidden];
+        let logits: Vec<f32> = focus_tokens
+            .iter()
+            .map(|&id| {
+                state
+                    .iter()
+                    .zip(&lm[id as usize * hidden..(id as usize + 1) * hidden])
+                    .map(|(&left, &right)| left * right)
+                    .sum()
+            })
+            .collect();
+        let mx = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+        let exps: Vec<f64> = logits
+            .iter()
+            .map(|&value| ((value as f64) - mx).exp())
+            .collect();
+        let sum: f64 = exps.iter().sum();
+        nll += mx + sum.ln() - logits[target] as f64;
+        let predicted = logits
+            .iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| left.total_cmp(right))
+            .map(|(class, _)| class)
+            .expect("focused classes are non-empty");
+        stats.total += 1;
+        stats.class_total[target] += 1;
+        if predicted == target {
+            stats.correct += 1;
+            stats.class_correct[target] += 1;
+        }
+        if let Some(gradient) = dh_normed.as_mut() {
+            let row = &mut gradient[local_row * hidden..(local_row + 1) * hidden];
+            for (class, (&id, probability)) in focus_tokens.iter().zip(exps).enumerate() {
+                let coefficient =
+                    (probability / sum - usize::from(class == target) as f64) / rows as f64;
+                let head = &lm[id as usize * hidden..(id as usize + 1) * hidden];
+                for (value, &weight) in row.iter_mut().zip(head) {
+                    *value += (coefficient * weight as f64) as f32;
+                }
+            }
+        }
+    }
+    let score = HeldScore {
+        ppl: (nll / rows as f64).exp(),
+        accuracy: stats.accuracy(),
+        balanced_accuracy: stats.balanced_accuracy(),
+    };
+    let Some(dh_normed) = dh_normed else {
+        return (score, None);
+    };
+
+    let mut dh = vec![0f32; rows * hidden];
+    ops::rmsnorm_bwd(
+        &h2,
+        &fm.final_norm,
+        &inv,
+        &dh_normed,
+        fm.gemma,
+        &mut dh,
+        None,
+    );
+    let mut dact = vec![0f32; rows * inter];
+    ops::gemm_dx(
+        &dh,
+        down_w,
+        &mut dact,
+        rows,
+        inter,
+        hidden,
+        fm.pool.as_deref(),
+    );
+    let mut dg_pre = vec![0f32; rows * inter];
+    let mut du_pre = vec![0f32; rows * inter];
+    for row in 0..rows {
+        for column in 0..inter {
+            let at = row * inter + column;
+            let da = dact[at] * gate[column];
+            dg_pre[at] = da * up_pre[at] * ops::silu_bwd(gate_pre[at]);
+            du_pre[at] = da * ops::silu(gate_pre[at]);
+        }
+    }
+    let mut dg = vec![0f32; inter * hidden];
+    let mut du = vec![0f32; inter * hidden];
+    let mut dd = vec![0f32; hidden * inter];
+    ops::gemm_dw(
+        &dg_pre,
+        &n2,
+        &mut dg,
+        rows,
+        hidden,
+        inter,
+        fm.pool.as_deref(),
+    );
+    ops::gemm_dw(
+        &du_pre,
+        &n2,
+        &mut du,
+        rows,
+        hidden,
+        inter,
+        fm.pool.as_deref(),
+    );
+    ops::gemm_dw(&dh, &act, &mut dd, rows, inter, hidden, fm.pool.as_deref());
+    (
+        score,
+        Some((
+            dg.into_iter().map(f64::from).collect(),
+            du.into_iter().map(f64::from).collect(),
+            dd.into_iter().map(f64::from).collect(),
+        )),
+    )
 }
 
 /// Score a WRITTEN specialist through the replica's own math (f32
@@ -720,9 +1247,6 @@ pub fn skill_bake(
     let fm = FcdModel::from_cmf(model, &o1_off, false)?;
     let nl = fm.layers.len();
     let inter = fm.layers.iter().map(|l| l.inter).max().unwrap_or(0);
-    if fm.layers.iter().any(|l| l.inter != inter) {
-        return Err("skill bake: non-uniform FFN widths".into());
-    }
     let held: Vec<Vec<u32>> = chunks[..held_n.min(chunks.len())].to_vec();
     let calib: Vec<Vec<u32>> = chunks[held_n.min(chunks.len())..].to_vec();
     if calib.len() < 12 {
@@ -730,6 +1254,68 @@ pub fn skill_bake(
             "skill bake: corpus too small ({} calib chunks)",
             calib.len()
         ));
+    }
+    // Analysis-only callers can request a native, batched focused score over
+    // a validation corpus without training or writing a specialist.  The
+    // scoring path already handles per-layer FFN widths; the optimizer and
+    // defragment writer below still require one common width, so return the
+    // identity checkpoint before that training-only constraint is applied.
+    if hy.steps_a == 0 && hy.steps_b == 0 && hy.fcd_layers == 0 {
+        let logits: Vec<Vec<f32>> = fm
+            .layers
+            .iter()
+            .map(|layer| vec![100.0; layer.inter])
+            .collect();
+        let ffn = vec![None; nl];
+        let pass = Pass {
+            fm: &fm,
+            tau: hy.tau,
+            logits: &logits,
+            hard: true,
+            ffn: &ffn,
+            focus_tokens: &hy.focus_tokens,
+            focus_follow_tokens: &hy.focus_follow_tokens,
+        };
+        let score = held_score(&pass, &held);
+        let keep: Vec<Vec<bool>> = fm
+            .layers
+            .iter()
+            .map(|layer| vec![true; layer.inter])
+            .collect();
+        let loops = fm.loops.max(1);
+        let keep_visits = (0..loops).flat_map(|_| keep.iter().cloned()).collect();
+        let report = BakeReport {
+            backbone: score.ppl,
+            masked: score.ppl,
+            overlaid: score.ppl,
+            pruned_ratio: 0.0,
+            kept_per_layer: keep.iter().map(Vec::len).collect(),
+            backbone_accuracy: score.accuracy,
+            masked_accuracy: score.accuracy,
+            overlaid_accuracy: score.accuracy,
+            backbone_balanced_accuracy: score.balanced_accuracy,
+            masked_balanced_accuracy: score.balanced_accuracy,
+            overlaid_balanced_accuracy: score.balanced_accuracy,
+            selected_step: 0,
+            sec: t0.elapsed().as_secs_f64(),
+        };
+        let arts = BakeArtifacts {
+            keep,
+            keep_visits,
+            down: vec![Vec::new(); nl],
+            gate_up: vec![None; nl],
+            fcd_layers: Vec::new(),
+            logits: logits.clone(),
+            final_logits: logits,
+            checkpoints: Vec::new(),
+        };
+        return Ok((report, arts));
+    }
+    if fm.layers.iter().any(|l| l.inter != inter) {
+        return Err("skill bake: non-uniform FFN widths".into());
+    }
+    if hy.batch == 0 {
+        return Err("skill bake: batch must be positive".into());
     }
     let fcd: Vec<usize> = (nl.saturating_sub(hy.fcd_layers)..nl).collect();
     let _rng = SplitMix64::new(hy.seed);
@@ -762,7 +1348,7 @@ pub fn skill_bake(
     // 0.9385 so the compounded factor is again 0.881, with σ' = 0.058
     // rather than 0.0005.
     let loops = fm.loops.max(1);
-    let m0 = mask_init_logit(loops);
+    let m0 = mask_init_logit_for(loops, hy.mask_init);
     // One mask row per VIRTUAL layer: nl × loops. Unlooped: vn == nl.
     let vn = nl * loops;
     let mut logits: Vec<Vec<f32>> = vec![vec![m0; inter]; vn];
@@ -780,8 +1366,16 @@ pub fn skill_bake(
         focus_tokens: &hy.focus_tokens,
         focus_follow_tokens: &hy.focus_follow_tokens,
     };
-    let backbone = held_ppl(&base_pass, &held);
-    log(&format!("baseline (full): {backbone:.3}"));
+    let backbone_score = held_score(&base_pass, &held);
+    let backbone = backbone_score.ppl;
+    log(&format!(
+        "baseline (full): {backbone:.3}{}",
+        backbone_score
+            .accuracy
+            .zip(backbone_score.balanced_accuracy)
+            .map(|(a, b)| format!(" | acc {:.2}% bal {:.2}%", a * 100.0, b * 100.0))
+            .unwrap_or_default()
+    ));
 
     // ── Phase A: mask training ──
     let mut adam_a = Adam::new(&vec![inter; vn], hy.lr_a);
@@ -789,8 +1383,13 @@ pub fn skill_bake(
     let l1_step_eff = hy.l1_step * hy.l1_mult;
     // best = (ppl, logits_snapshot, sparsity)
     let mut best: (f64, Option<Vec<Vec<f32>>>, f64) = (f64::MAX, None, 0.0);
+    let mut best_accuracy = f64::NEG_INFINITY;
+    let mut best_balanced = f64::NEG_INFINITY;
+    let mut best_step = 0usize;
+    let mut checkpoints = Vec::new();
     // Track the highest-sparsity checkpoint as fallback.
     let mut max_sp: (f64, Option<Vec<Vec<f32>>>, f64) = (f64::MAX, None, 0.0);
+    let mut max_sp_step = 0usize;
     let mut prev_alive: Option<Vec<Vec<bool>>> = None;
     // In-process phase timers: this loop was estimated three different
     // ways and every estimate came out under a fifth of the measured
@@ -807,7 +1406,7 @@ pub fn skill_bake(
     crate::gpu::bake_precision_strict(true);
     for step in 0..hy.steps_a {
         let t_step = std::time::Instant::now();
-        let chunk = &calib[step % calib.len()];
+        let (batch_ids, batch) = calibration_batch(&calib, step, hy.batch)?;
         let mut dmask: Vec<Vec<f64>> = vec![vec![0.0; inter]; vn];
         let mut dffn: Vec<Option<(Vec<f64>, Vec<f64>, Vec<f64>)>> = vec![None; nl];
         let pass = Pass {
@@ -819,13 +1418,14 @@ pub fn skill_bake(
             focus_tokens: &hy.focus_tokens,
             focus_follow_tokens: &hy.focus_follow_tokens,
         };
-        let _ = pass.chunk(chunk, Some((&mut dmask, &mut dffn)));
+        let _ = pass.chunk_batch(&batch_ids, batch, Some((&mut dmask, &mut dffn)));
         // Fold σ'(m) into the mask grads + add the L1 term.
         let l1_per = l1 / (inter as f64 * nl as f64);
         for li in 0..vn {
             for j in 0..inter {
                 let s = sigmoid(logits[li][j]) as f64;
-                dmask[li][j] = dmask[li][j] * s * (1.0 - s) + l1_per * s * (1.0 - s);
+                let sparse_grad = sparsity_grad(logits[li][j], hy.softplus_l1);
+                dmask[li][j] = dmask[li][j] * s * (1.0 - s) + l1_per * sparse_grad;
             }
         }
         // One gradient per VISIT, one step per token. A Looped
@@ -857,7 +1457,8 @@ pub fn skill_bake(
                 focus_follow_tokens: &hy.focus_follow_tokens,
             };
             crate::gpu::bake_precision_strict(false);
-            let hp = held_ppl(&pass, &held);
+            let hs = held_score(&pass, &held);
+            let hp = hs.ppl;
             crate::gpu::bake_precision_strict(true);
             // Name the neurons that crossed τ since the last eval. At
             // 0.01% pruned = ~24 neurons for a 135 held-PPL, WHICH 24 is
@@ -896,19 +1497,64 @@ pub fn skill_bake(
             // Track highest-sparsity checkpoint.
             if sp > max_sp.2 {
                 max_sp = (hp, Some(logits.clone()), sp);
+                max_sp_step = step + 1;
             }
-            // Best checkpoint selection: respect target_sparsity.
-            if hy.target_sparsity > 0.0 {
-                if sp >= hy.target_sparsity && hp < best.0 {
+            checkpoints.push(BakeCheckpoint {
+                step: step + 1,
+                l1,
+                ppl: hp,
+                sparsity: sp,
+                accuracy: hs.accuracy,
+                balanced_accuracy: hs.balanced_accuracy,
+            });
+            // Best checkpoint selection: respect target_sparsity and any
+            // caller-declared natural-distribution quality guards. The
+            // guards are strict (`>`, not `>=`) so a majority baseline cannot
+            // sneak through on an exactly tied checkpoint.
+            let eligible_sparsity = hy.target_sparsity <= 0.0 || sp >= hy.target_sparsity;
+            let eligible_accuracy = hy
+                .checkpoint_min_accuracy
+                .map_or(true, |min| hs.accuracy.is_some_and(|value| value > min));
+            let eligible_balanced = hy.checkpoint_min_balanced_accuracy.map_or(true, |min| {
+                hs.balanced_accuracy.is_some_and(|value| value > min)
+            });
+            let eligible = eligible_sparsity && eligible_accuracy && eligible_balanced;
+            if eligible && hy.checkpoint_raw_priority && !hy.focus_tokens.is_empty() {
+                let acc = hs.accuracy.unwrap_or(f64::NEG_INFINITY);
+                let bal = hs.balanced_accuracy.unwrap_or(f64::NEG_INFINITY);
+                if acc > best_accuracy
+                    || (acc == best_accuracy && bal > best_balanced)
+                    || (acc == best_accuracy && bal == best_balanced && hp < best.0)
+                {
+                    best_balanced = bal;
+                    best_accuracy = acc;
                     best = (hp, Some(logits.clone()), sp);
+                    best_step = step + 1;
                 }
-            } else if hp < best.0 {
+            } else if eligible && hy.checkpoint_accuracy && !hy.focus_tokens.is_empty() {
+                let acc = hs.accuracy.unwrap_or(f64::NEG_INFINITY);
+                let bal = hs.balanced_accuracy.unwrap_or(f64::NEG_INFINITY);
+                if bal > best_balanced
+                    || (bal == best_balanced && acc > best_accuracy)
+                    || (bal == best_balanced && acc == best_accuracy && hp < best.0)
+                {
+                    best_balanced = bal;
+                    best_accuracy = acc;
+                    best = (hp, Some(logits.clone()), sp);
+                    best_step = step + 1;
+                }
+            } else if eligible && hp < best.0 {
                 best = (hp, Some(logits.clone()), sp);
+                best_step = step + 1;
             }
             log(&format!(
-                "  [A] step {}: L1={l1:.3} pruned={:.2}% hard-PPL={hp:.3} (bottom {}@{:.2}%) [fwd+bwd {:.1}s, adam {:.2}s per step]",
+                "  [A] step {}: L1={l1:.3} pruned={:.2}% hard-PPL={hp:.3}{} (bottom {}@{:.2}%) [fwd+bwd {:.1}s, adam {:.2}s per step]",
                 step + 1,
                 sp * 100.0,
+                hs.accuracy
+                    .zip(hs.balanced_accuracy)
+                    .map(|(a, b)| format!(" acc={:.2}% bal={:.2}%", a * 100.0, b * 100.0))
+                    .unwrap_or_default(),
                 if best.0 == f64::MAX {
                     "—".to_string()
                 } else {
@@ -924,6 +1570,13 @@ pub fn skill_bake(
     // to the highest-sparsity checkpoint.
     // Phase A is over — phase B and every eval after run on the fast arms.
     crate::gpu::bake_precision_strict(false);
+    if (hy.checkpoint_min_accuracy.is_some() || hy.checkpoint_min_balanced_accuracy.is_some())
+        && best.1.is_none()
+    {
+        return Err(
+            "skill bake: no Phase-A checkpoint met the configured focused accuracy guards".into(),
+        );
+    }
     if hy.target_sparsity > 0.0 && best.1.is_none() {
         log(&format!(
             "[A] target sparsity {:.0}% not reached; using max-sparsity checkpoint ({:.0}%)",
@@ -931,6 +1584,7 @@ pub fn skill_bake(
             max_sp.2 * 100.0
         ));
         best = max_sp;
+        best_step = max_sp_step;
     }
     // Phase totals, printed unconditionally — a 5-step measurement run
     // must report even though no eval fired.
@@ -950,6 +1604,7 @@ pub fn skill_bake(
         ));
         log(&format!("[prof] gemm shapes:\n{}", prof::shape_report(6)));
     }
+    let final_logits = logits.clone();
     if let Some(b) = best.1.take() {
         logits = b;
     }
@@ -962,7 +1617,17 @@ pub fn skill_bake(
         focus_tokens: &hy.focus_tokens,
         focus_follow_tokens: &hy.focus_follow_tokens,
     };
-    let masked = held_ppl(&pass, &held);
+    // With no mask-training steps the hard mask is still exactly all-open,
+    // so rescoring the same validation batch is pure duplicate work.  This
+    // matters for focused 512-token records where one gate can take minutes
+    // on a laptop, and keeps short FCD sweeps practical without changing a
+    // single number.
+    let masked_score = if hy.steps_a == 0 {
+        backbone_score.clone()
+    } else {
+        held_score(&pass, &held)
+    };
+    let masked = masked_score.ppl;
     log(&format!(
         "[A] {:.0}s: masked-PPL {masked:.3}",
         t0.elapsed().as_secs_f64()
@@ -991,18 +1656,14 @@ pub fn skill_bake(
     // The mask-only model is a real checkpoint too. If every FCD eval is
     // worse, restore `None` overlays rather than accidentally writing the
     // final (rejected) training step while reporting the mask-only PPL.
-    let mut best_b: (f64, Option<Vec<Option<(Vec<f32>, Vec<f32>, Vec<f32>)>>>) =
-        (masked, Some(vec![None; nl]));
-    for step in 0..hy.steps_b {
-        let chunk = &calib[step % calib.len()];
-        let mut dmask: Vec<Vec<f64>> = vec![vec![0.0; inter]; vn];
-        let mut dffn: Vec<Option<(Vec<f64>, Vec<f64>, Vec<f64>)>> = (0..nl)
-            .map(|li| {
-                ffn[li]
-                    .as_ref()
-                    .map(|(g, u, d)| (vec![0.0; g.len()], vec![0.0; u.len()], vec![0.0; d.len()]))
-            })
-            .collect();
+    let mut best_b: (
+        HeldScore,
+        Option<Vec<Option<(Vec<f32>, Vec<f32>, Vec<f32>)>>>,
+    ) = (masked_score.clone(), Some(vec![None; nl]));
+    let cached_phase_b =
+        hy.steps_b > 0 && fcd.len() == 1 && loops == 1 && !hy.focus_tokens.is_empty();
+    if cached_phase_b {
+        let last = fcd[0];
         let pass = Pass {
             fm: &fm,
             tau: hy.tau,
@@ -1012,31 +1673,129 @@ pub fn skill_bake(
             focus_tokens: &hy.focus_tokens,
             focus_follow_tokens: &hy.focus_follow_tokens,
         };
-        let _ = pass.chunk(chunk, Some((&mut dmask, &mut dffn)));
-        // Cosine LR.
-        let lr_scale = 0.5 * (1.0 + (std::f64::consts::PI * step as f64 / hy.steps_b as f64).cos());
-        let first_fcd = fcd[0];
-        let mut params: Vec<&mut [f32]> = Vec::new();
-        let mut grads: Vec<Vec<f64>> = Vec::new();
-        for (off, slot) in ffn[first_fcd..].iter_mut().enumerate() {
-            let li = first_fcd + off;
-            let Some((g, u, d)) = slot.as_mut() else {
-                continue;
-            };
-            let (dg, du, dd) = dffn[li].take().unwrap();
-            params.push(g.as_mut_slice());
-            grads.push(dg);
-            params.push(u.as_mut_slice());
-            grads.push(du);
-            params.push(d.as_mut_slice());
-            grads.push(dd);
+        log(&format!(
+            "[B-cache] extracting native CMF boundaries: {} train + {} held records",
+            calib.len(),
+            held.len()
+        ));
+        let train_cache = build_focused_fcd_cache(&pass, &calib, 32)?;
+        let held_cache = build_focused_fcd_cache(&pass, &held, 32)?;
+        if train_cache.len() < 12 || held_cache.len() == 0 {
+            return Err(format!(
+                "focused final-FFN cache is too small: {} train, {} held answers",
+                train_cache.len(),
+                held_cache.len()
+            ));
         }
-        // Same visit normalisation as Phase A: dffn accumulates every
-        // visit of a physical layer, and an FFN update perturbs BOTH
-        // passes of the loop, so per-step damage is `loops` times what
-        // lr_b was tuned for on ordinary stacks.
-        adam_b.step(&mut params, &grads, lr_scale * mask_step_scale(loops));
-        if (step + 1) % hy.eval_every == 0 {
+        let gate = pass.gates(last);
+        let held_indices: Vec<usize> = (0..held_cache.len()).collect();
+        let (initial_cached, _) = {
+            let (g, u, d) = ffn[last].as_ref().expect("cached FCD master");
+            cached_fcd_run(
+                &fm,
+                &held_cache,
+                &held_indices,
+                (g, u, d),
+                &gate,
+                &hy.focus_tokens,
+                false,
+            )
+        };
+        log(&format!(
+            "[B-cache] ready: {} train / {} held | parity PPL {:.3} vs full {:.3}{}",
+            train_cache.len(),
+            held_cache.len(),
+            initial_cached.ppl,
+            masked_score.ppl,
+            initial_cached
+                .accuracy
+                .map(|value| format!(" | acc {:.2}%", value * 100.0))
+                .unwrap_or_default()
+        ));
+        if (initial_cached.ppl - masked_score.ppl).abs() > 5e-3
+            || initial_cached.accuracy != masked_score.accuracy
+        {
+            return Err(format!(
+                "focused final-FFN cache parity failed: PPL {:.6} vs {:.6}, accuracy {:?} vs {:?}",
+                initial_cached.ppl,
+                masked_score.ppl,
+                initial_cached.accuracy,
+                masked_score.accuracy
+            ));
+        }
+        for step in 0..hy.steps_b {
+            let count = hy.fcd_batch.min(train_cache.len());
+            let indices: Vec<usize> = (0..count)
+                .map(|offset| (step * count + offset) % train_cache.len())
+                .collect();
+            let (_, gradients) = {
+                let (g, u, d) = ffn[last].as_ref().expect("cached FCD master");
+                cached_fcd_run(
+                    &fm,
+                    &train_cache,
+                    &indices,
+                    (g, u, d),
+                    &gate,
+                    &hy.focus_tokens,
+                    true,
+                )
+            };
+            let (dg, du, dd) = gradients.expect("cached FCD requested gradients");
+            let lr_scale =
+                0.5 * (1.0 + (std::f64::consts::PI * step as f64 / hy.steps_b as f64).cos());
+            let (g, u, d) = ffn[last].as_mut().expect("cached FCD master");
+            let mut params = vec![g.as_mut_slice(), u.as_mut_slice(), d.as_mut_slice()];
+            let grads = vec![dg, du, dd];
+            adam_b.step(&mut params, &grads, lr_scale);
+            if (step + 1) % hy.eval_every == 0 {
+                let cur = {
+                    let (g, u, d) = ffn[last].as_ref().expect("cached FCD master");
+                    cached_fcd_run(
+                        &fm,
+                        &held_cache,
+                        &held_indices,
+                        (g, u, d),
+                        &gate,
+                        &hy.focus_tokens,
+                        false,
+                    )
+                    .0
+                };
+                let cur_bal = cur.balanced_accuracy.unwrap_or(f64::NEG_INFINITY);
+                let best_bal = best_b.0.balanced_accuracy.unwrap_or(f64::NEG_INFINITY);
+                let cur_acc = cur.accuracy.unwrap_or(f64::NEG_INFINITY);
+                let best_acc = best_b.0.accuracy.unwrap_or(f64::NEG_INFINITY);
+                let better = if hy.checkpoint_accuracy {
+                    cur_bal > best_bal
+                        || (cur_bal == best_bal && cur_acc > best_acc)
+                        || (cur_bal == best_bal && cur_acc == best_acc && cur.ppl < best_b.0.ppl)
+                } else {
+                    cur.ppl < best_b.0.ppl
+                };
+                if better {
+                    best_b = (cur.clone(), Some(ffn.clone()));
+                }
+                log(&format!(
+                    "  [B-cache] step {}: held-PPL {:.3} acc={:.2}% bal={:.2}% (best {:.3})",
+                    step + 1,
+                    cur.ppl,
+                    cur_acc * 100.0,
+                    cur_bal * 100.0,
+                    best_b.0.ppl
+                ));
+            }
+        }
+    } else {
+        for step in 0..hy.steps_b {
+            let (batch_ids, batch) = calibration_batch(&calib, step, hy.batch)?;
+            let mut dmask: Vec<Vec<f64>> = vec![vec![0.0; inter]; vn];
+            let mut dffn: Vec<Option<(Vec<f64>, Vec<f64>, Vec<f64>)>> = (0..nl)
+                .map(|li| {
+                    ffn[li].as_ref().map(|(g, u, d)| {
+                        (vec![0.0; g.len()], vec![0.0; u.len()], vec![0.0; d.len()])
+                    })
+                })
+                .collect();
             let pass = Pass {
                 fm: &fm,
                 tau: hy.tau,
@@ -1046,19 +1805,72 @@ pub fn skill_bake(
                 focus_tokens: &hy.focus_tokens,
                 focus_follow_tokens: &hy.focus_follow_tokens,
             };
-            let cur = held_ppl(&pass, &held);
-            if cur < best_b.0 {
-                best_b = (cur, Some(ffn.clone()));
+            let _ = pass.chunk_batch(&batch_ids, batch, Some((&mut dmask, &mut dffn)));
+            // Cosine LR.
+            let lr_scale =
+                0.5 * (1.0 + (std::f64::consts::PI * step as f64 / hy.steps_b as f64).cos());
+            let first_fcd = fcd[0];
+            let mut params: Vec<&mut [f32]> = Vec::new();
+            let mut grads: Vec<Vec<f64>> = Vec::new();
+            for (off, slot) in ffn[first_fcd..].iter_mut().enumerate() {
+                let li = first_fcd + off;
+                let Some((g, u, d)) = slot.as_mut() else {
+                    continue;
+                };
+                let (dg, du, dd) = dffn[li].take().unwrap();
+                params.push(g.as_mut_slice());
+                grads.push(dg);
+                params.push(u.as_mut_slice());
+                grads.push(du);
+                params.push(d.as_mut_slice());
+                grads.push(dd);
             }
-            log(&format!(
-                "  [B] step {}: held-PPL {cur:.3} (best {:.3})",
-                step + 1,
-                best_b.0
-            ));
+            // Same visit normalisation as Phase A: dffn accumulates every
+            // visit of a physical layer, and an FFN update perturbs BOTH
+            // passes of the loop, so per-step damage is `loops` times what
+            // lr_b was tuned for on ordinary stacks.
+            adam_b.step(&mut params, &grads, lr_scale * mask_step_scale(loops));
+            if (step + 1) % hy.eval_every == 0 {
+                let pass = Pass {
+                    fm: &fm,
+                    tau: hy.tau,
+                    logits: &logits,
+                    hard: true,
+                    ffn: &ffn,
+                    focus_tokens: &hy.focus_tokens,
+                    focus_follow_tokens: &hy.focus_follow_tokens,
+                };
+                let cur = held_score(&pass, &held);
+                let better = if hy.checkpoint_accuracy && !hy.focus_tokens.is_empty() {
+                    let cur_bal = cur.balanced_accuracy.unwrap_or(f64::NEG_INFINITY);
+                    let best_bal = best_b.0.balanced_accuracy.unwrap_or(f64::NEG_INFINITY);
+                    let cur_acc = cur.accuracy.unwrap_or(f64::NEG_INFINITY);
+                    let best_acc = best_b.0.accuracy.unwrap_or(f64::NEG_INFINITY);
+                    cur_bal > best_bal
+                        || (cur_bal == best_bal && cur_acc > best_acc)
+                        || (cur_bal == best_bal && cur_acc == best_acc && cur.ppl < best_b.0.ppl)
+                } else {
+                    cur.ppl < best_b.0.ppl
+                };
+                if better {
+                    best_b = (cur.clone(), Some(ffn.clone()));
+                }
+                log(&format!(
+                    "  [B] step {}: held-PPL {:.3}{} (best {:.3})",
+                    step + 1,
+                    cur.ppl,
+                    cur.accuracy
+                        .zip(cur.balanced_accuracy)
+                        .map(|(a, b)| format!(" acc={:.2}% bal={:.2}%", a * 100.0, b * 100.0))
+                        .unwrap_or_default(),
+                    best_b.0.ppl
+                ));
+            }
         }
     }
     ffn = best_b.1.take().expect("phase-B always has a checkpoint");
-    let overlaid = best_b.0;
+    let overlaid_score = best_b.0;
+    let overlaid = overlaid_score.ppl;
 
     // ── Export artifacts ──
     // Per-visit keep flags are the mask that ships; the PHYSICAL keep is
@@ -1121,6 +1933,13 @@ pub fn skill_bake(
         overlaid,
         pruned_ratio: 1.0 - total as f64 / (vn * inter) as f64,
         kept_per_layer,
+        backbone_accuracy: backbone_score.accuracy,
+        masked_accuracy: masked_score.accuracy,
+        overlaid_accuracy: overlaid_score.accuracy,
+        backbone_balanced_accuracy: backbone_score.balanced_accuracy,
+        masked_balanced_accuracy: masked_score.balanced_accuracy,
+        overlaid_balanced_accuracy: overlaid_score.balanced_accuracy,
+        selected_step: best_step,
         sec: t0.elapsed().as_secs_f64(),
     };
     let arts = BakeArtifacts {
@@ -1130,6 +1949,8 @@ pub fn skill_bake(
         gate_up,
         fcd_layers: fcd,
         logits: logits.clone(),
+        final_logits,
+        checkpoints,
     };
     Ok((report, arts))
 }
@@ -1198,6 +2019,74 @@ mod tests {
         assert!(!is_scored_target(&ids, 1, ids.len(), &focus, &follow));
         assert!(!is_scored_target(&ids, 3, ids.len(), &focus, &follow));
         assert!(is_scored_target(&ids, 5, ids.len(), &focus, &follow));
+    }
+
+    #[test]
+    fn configurable_mask_init_preserves_effective_gate_across_loops() {
+        for effective_logit in [2.0, 4.0] {
+            let target = sigmoid(effective_logit);
+            for loops in [1usize, 2, 4] {
+                let per_visit = sigmoid(mask_init_logit_for(loops, effective_logit));
+                assert!((per_visit.powi(loops as i32) - target).abs() < 2e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn softplus_penalty_keeps_a_gradient_near_an_open_gate() {
+        let gate_penalty = sparsity_grad(4.0, false);
+        let softplus_penalty = sparsity_grad(4.0, true);
+        assert!(softplus_penalty > gate_penalty * 50.0);
+        assert!((softplus_penalty - sigmoid(4.0) as f64).abs() < 1e-7);
+    }
+
+    #[test]
+    fn balanced_accuracy_exposes_majority_class_collapse() {
+        let stats = FocusStats {
+            total: 100,
+            correct: 90,
+            class_total: vec![90, 10],
+            class_correct: vec![90, 0],
+        };
+        assert_eq!(stats.accuracy(), Some(0.9));
+        assert_eq!(stats.balanced_accuracy(), Some(0.5));
+    }
+
+    #[test]
+    fn grouped_focus_stats_merge_is_additive() {
+        let mut all = FocusStats {
+            total: 3,
+            correct: 2,
+            class_total: vec![2, 1],
+            class_correct: vec![1, 1],
+        };
+        let second = FocusStats {
+            total: 4,
+            correct: 3,
+            class_total: vec![1, 3],
+            class_correct: vec![1, 2],
+        };
+        all.merge(&second);
+        assert_eq!(all.total, 7);
+        assert_eq!(all.correct, 5);
+        assert_eq!(all.class_total, vec![3, 4]);
+        assert_eq!(all.class_correct, vec![2, 3]);
+        assert_eq!(all.accuracy(), Some(5.0 / 7.0));
+        assert_eq!(all.balanced_accuracy(), Some((2.0 / 3.0 + 3.0 / 4.0) / 2.0));
+    }
+
+    #[test]
+    fn calibration_batches_keep_records_independent_and_wrap_deterministically() {
+        let records = vec![vec![1, 2], vec![3, 4], vec![5, 6]];
+        assert_eq!(
+            calibration_batch(&records, 0, 2).unwrap(),
+            (vec![1, 2, 3, 4], 2)
+        );
+        assert_eq!(
+            calibration_batch(&records, 1, 2).unwrap(),
+            (vec![5, 6, 1, 2], 2)
+        );
+        assert!(calibration_batch(&[vec![1, 2], vec![3]], 0, 2).is_err());
     }
 
     /// align=32 rounds each layer UP by resurrecting the largest

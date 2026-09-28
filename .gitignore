@@ -14,3 +14,6 @@ docs/PERFORMANCE_ROADMAP.ru.md
 tmp/
 /*.log
 /*.out
+
+# Local decision-service credentials, review data and durable state
+/var/decision-service/

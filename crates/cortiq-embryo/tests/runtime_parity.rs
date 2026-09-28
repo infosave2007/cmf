@@ -1,19 +1,55 @@
 //! The genome exported to .cmf and run by the RUNTIME (CPU pipeline:
 //! vmf_phase mixer with κ, GQA anchor, resonance-routed experts + shared,
 //! hierarchical head) must produce the trainer's log-probabilities.
-#![cfg(target_os = "macos")]
+#![cfg(any(target_os = "macos", feature = "vulkan"))]
 
-use cortiq_embryo::model::{EmbryoCfg, EmbryoGpu, Layout, init_params};
+use cortiq_embryo::model::{EmbryoCfg, EmbryoGpu, Layout, Mixer, init_params};
 use cortiq_embryo::ops::lcg_vec;
 use cortiq_embryo::train::Checkpoint;
 
 #[test]
 fn runtime_matches_trainer_logprobs() {
+    let mut cfg = EmbryoCfg::tiny();
+    cfg.experts = 4;
+    run_runtime_matches_trainer_logprobs(cfg);
+}
+
+/// The new operator tag is a mixed-layer contract: selected hybrids use the
+/// normalized in-place update while the other hybrids and the anchor retain
+/// their established paths.  Keep this beside the legacy test so an export
+/// cannot accidentally route every layer through one operator.
+#[test]
+fn runtime_matches_mixed_phase_delta_trainer_logprobs() {
+    let mut cfg = EmbryoCfg::tiny();
+    cfg.experts = 4;
+    cfg.layers = 8;
+    cfg.anchor_every = 8;
+    cfg.phase_delta_layers = Some(vec![3, 6]);
+    run_runtime_matches_trainer_logprobs(cfg);
+}
+
+/// The GDN mixer exported as `linear_core.kind = "gated_delta_net"` +
+/// `linear_attn.*` tensors must reproduce the trainer's log-probs through
+/// the runtime's CPU `gdn_step` (the plan's trainer ⇔ runtime gate).
+#[test]
+fn runtime_matches_gdn_mixer_trainer_logprobs() {
+    let mut cfg = EmbryoCfg::tiny();
+    cfg.experts = 4;
+    cfg.mixer = Mixer::Gdn;
+    cfg.gdn_heads = 2;
+    cfg.gdn_dk = 32;
+    cfg.gdn_dv = 32;
+    cfg.anchor_window = 16;
+    cfg.anchor_sink = 2;
+    run_runtime_matches_trainer_logprobs(cfg);
+}
+
+fn run_runtime_matches_trainer_logprobs(cfg: EmbryoCfg) {
     let Some(_) = cortiq_embryo::metal::ctx() else {
         return;
     };
-    let mut cfg = EmbryoCfg::tiny();
-    cfg.experts = 4;
+    // the CPU pipeline is the reference operator here
+    unsafe { std::env::set_var("CMF_GPU", "0") };
     let (b, t) = (1usize, 64usize);
     let lay = Layout::new(&cfg);
     let p0 = init_params(&cfg, &lay, 5);
@@ -78,45 +114,59 @@ fn runtime_matches_trainer_logprobs() {
         v: None,
         extras,
     };
-    let dir = std::env::temp_dir().join(format!("embryo_parity_{}", std::process::id()));
+    // one directory per test invocation (the tests run in parallel)
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "embryo_parity_{}_{}_{}",
+        std::process::id(),
+        cfg.layers,
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("tiny.cmf");
-    cortiq_embryo::export::export(&ck, tok_json.as_bytes(), &path).expect("export");
-    // runtime
-    let model = std::sync::Arc::new(cortiq_core::format::CmfModel::open(&path).expect("open cmf"));
-    let mut pipe = cortiq_engine::pipeline::Pipeline::from_model(
-        &model,
-        cortiq_engine::sampler::SamplerConfig::default(),
-    )
-    .expect("pipeline");
-    let mut worst = 0.0f32;
-    for pos in [0usize, 1, 5, 17, 40, 63] {
-        let want = logprobs(&xf[pos * h..(pos + 1) * h]);
-        let got = pipe.prefill_next_logits(&tokens[..=pos], None);
-        assert_eq!(got.len(), v);
-        let d = want
-            .iter()
-            .zip(&got)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-        eprintln!(
-            "pos {pos}: max|Δ logprob| = {d:.3e}  (argmax trainer {} runtime {})",
-            want.iter()
-                .enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-                .unwrap()
-                .0,
-            got.iter()
-                .enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-                .unwrap()
-                .0
+    for (profile, dtype, tolerance) in [
+        ("f32", cortiq_core::TensorDtype::F32, 2e-3f32),
+        ("f16", cortiq_core::TensorDtype::F16, 1e-3f32),
+    ] {
+        let path = dir.join(format!("tiny-{profile}.cmf"));
+        cortiq_embryo::export::export_with_dtype(&ck, tok_json.as_bytes(), &path, dtype)
+            .expect("export");
+        // runtime
+        let model =
+            std::sync::Arc::new(cortiq_core::format::CmfModel::open(&path).expect("open cmf"));
+        let mut pipe = cortiq_engine::pipeline::Pipeline::from_model(
+            &model,
+            cortiq_engine::sampler::SamplerConfig::default(),
+        )
+        .expect("pipeline");
+        let mut worst = 0.0f32;
+        for pos in [0usize, 1, 5, 17, 40, 63] {
+            let want = logprobs(&xf[pos * h..(pos + 1) * h]);
+            let got = pipe.prefill_next_logits(&tokens[..=pos], None);
+            assert_eq!(got.len(), v);
+            let d = want
+                .iter()
+                .zip(&got)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            eprintln!(
+                "{profile} pos {pos}: max|Δ logprob| = {d:.3e}  (argmax trainer {} runtime {})",
+                want.iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                    .unwrap()
+                    .0,
+                got.iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                    .unwrap()
+                    .0
+            );
+            worst = worst.max(d);
+        }
+        assert!(
+            worst < tolerance,
+            "{profile} runtime vs trainer log-probs differ: max {worst}"
         );
-        worst = worst.max(d);
     }
     let _ = std::fs::remove_dir_all(&dir);
-    assert!(
-        worst < 2e-3,
-        "runtime vs trainer log-probs differ: max {worst}"
-    );
 }

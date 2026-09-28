@@ -262,6 +262,23 @@ pub(crate) fn build_ffn_at(
             "{prefix}: router present but no expert tensors"
         )));
     }
+    // Growth records (`kind = "expert_append"`, spec §9.5.1): the experts
+    // the records append to THIS layer, mounted behind the trunk experts
+    // in header order. `arch.moe.num_experts` stays E0; the trunk count
+    // is `e0`, the tail `experts[e0..]` is described by `grown`.
+    let e0 = experts.len();
+    let grown_loads = if resonance_moe {
+        mount_growth(model, &prefix, ov, &load_dense)?
+    } else {
+        Vec::new()
+    };
+    let mut grown_desc: Vec<(Vec<f32>, Vec<f32>, f32, f32)> = Vec::new();
+    let mut grown: Vec<crate::pipeline::GrownExpert> = Vec::new();
+    for g in grown_loads {
+        experts.push(g.ffn);
+        grown_desc.push((g.mu, g.u, g.bias, g.shell));
+        grown.push(g.meta);
+    }
     let shared = if model
         .tensor(&format!("{prefix}mlp.shared_expert.gate_proj.weight"))
         .is_some()
@@ -339,12 +356,21 @@ pub(crate) fn build_ffn_at(
     let per_expert = model
         .tensor(&format!("{prefix}mlp.experts.0.desc.mu"))
         .is_some();
+    if !per_expert && !grown.is_empty() {
+        return Err(CmfError::Parse(format!(
+            "{prefix}: expert_append records need per-expert descriptors \
+             (mlp.experts.0.desc.mu); the stacked mlp.desc.* form cannot be grown"
+        )));
+    }
     let resonance = if per_expert {
-        let ne_d = experts.len();
+        // Trunk descriptors first (E0 rows), then the grown rows behind
+        // them: `shell` is +inf on the trunk, the record's finite
+        // `desc.shell` on a grown expert.
+        let ne_d = e0;
         let hidden = arch.hidden_size;
-        let mut mu = Vec::with_capacity(ne_d * hidden);
+        let mut mu = Vec::with_capacity(experts.len() * hidden);
         let mut u = Vec::new();
-        let mut bias = Vec::with_capacity(ne_d);
+        let mut bias = Vec::with_capacity(experts.len());
         let mut k = 0usize;
         for e in 0..ne_d {
             let m = load_f32(model, &format!("{prefix}mlp.experts.{e}.desc.mu"), ov)
@@ -379,7 +405,27 @@ pub(crate) fn build_ffn_at(
                 0.0
             });
         }
-        Some(crate::pipeline::Resonance { mu, u, k, bias })
+        let mut shell = vec![f32::INFINITY; ne_d];
+        for (gm, gu, gb, gs) in &grown_desc {
+            if gm.len() != hidden || gu.len() != k * hidden {
+                return Err(CmfError::Parse(format!(
+                    "{prefix}: grown expert descriptor {}×{} != trunk {hidden}×{k}",
+                    gm.len(),
+                    gu.len() / hidden.max(1)
+                )));
+            }
+            mu.extend_from_slice(gm);
+            u.extend_from_slice(gu);
+            bias.push(*gb);
+            shell.push(*gs);
+        }
+        Some(crate::pipeline::Resonance {
+            mu,
+            u,
+            k,
+            bias,
+            shell,
+        })
     } else if model.tensor(&format!("{prefix}mlp.desc.mu")).is_some() {
         let mu = load_f32(model, &format!("{prefix}mlp.desc.mu"), ov).map_err(CmfError::Parse)?;
         let ne_d = experts.len();
@@ -404,11 +450,18 @@ pub(crate) fn build_ffn_at(
         } else {
             vec![0.0; ne_d]
         };
-        Some(crate::pipeline::Resonance { mu, u, k, bias })
+        Some(crate::pipeline::Resonance {
+            mu,
+            u,
+            k,
+            bias,
+            shell: Vec::new(),
+        })
     } else {
         None
     };
     let moe = MoeFfn {
+        grown,
         router,
         experts,
         top_k,
@@ -444,6 +497,187 @@ pub(crate) fn build_ffn_at(
         })));
     }
     Ok(FfnKind::Moe(moe))
+}
+
+// ───────────────────────── growth records ─────────────────────────
+
+/// Which `expert_append` records the loader mounts (`CMF_GROWTH`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GrowthMode {
+    /// Records with `status == "active"` (the default).
+    Active,
+    /// Every record that is not retired (`CMF_GROWTH=all`: quarantine
+    /// and stale_regate too — the gate measurement of a fresh record).
+    All,
+    /// None (`CMF_GROWTH=off`: the plain genome, F0's forward).
+    Off,
+}
+
+impl GrowthMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::All => "all",
+            Self::Off => "off",
+        }
+    }
+
+    /// Does this mode mount a record of `status`?
+    pub fn admits(self, status: Option<&str>) -> bool {
+        match self {
+            Self::Off => false,
+            Self::Active => status == Some("active"),
+            Self::All => status != Some("retired"),
+        }
+    }
+}
+
+/// `CMF_GROWTH` = `active` (unset) | `all` | `off`.
+pub fn growth_mode() -> GrowthMode {
+    match std::env::var("CMF_GROWTH")
+        .ok()
+        .as_deref()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("off") | Some("0") | Some("none") => GrowthMode::Off,
+        Some("all") => GrowthMode::All,
+        _ => GrowthMode::Active,
+    }
+}
+
+/// The `expert_append` records the current [`growth_mode`] mounts, with
+/// their positions in `header.skills` (the chain rule of the format is
+/// evaluated at that position).
+pub fn mounted_growth_records(
+    header: &cortiq_core::CmfHeader,
+) -> Vec<(usize, &cortiq_core::SkillRecord)> {
+    let mode = growth_mode();
+    header
+        .skills
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| {
+            s.kind.as_deref() == Some(cortiq_core::knowledge::skill_kind::EXPERT_APPEND)
+                && mode.admits(s.status.as_deref())
+        })
+        .collect()
+}
+
+/// One grown expert as the loader read it from a record.
+struct GrownLoad {
+    ffn: DenseFfn,
+    mu: Vec<f32>,
+    u: Vec<f32>,
+    bias: f32,
+    shell: f32,
+    meta: crate::pipeline::GrownExpert,
+}
+
+/// The layer index of a `model.layers.{l}.` prefix (None for the MTP
+/// block and other prefixes — no growth record addresses those).
+fn layer_of_prefix(prefix: &str) -> Option<usize> {
+    prefix
+        .strip_prefix("model.layers.")?
+        .strip_suffix('.')?
+        .parse()
+        .ok()
+}
+
+/// The grown experts of the mounted `expert_append` records that grow the
+/// layer `prefix` addresses, in header order, each read from the record's
+/// own tensors (`skill.{id}.model.layers.{l}.mlp.experts.{e}.*`, the
+/// names the format's layout plan gives for the record's position). One
+/// log line per mounted record and layer.
+fn mount_growth(
+    model: &Arc<CmfModel>,
+    prefix: &str,
+    ov: &Overlay,
+    load_dense: &dyn Fn(&str) -> Result<DenseFfn, CmfError>,
+) -> Result<Vec<GrownLoad>, CmfError> {
+    use cortiq_core::knowledge::expert_leaf;
+    let Some(layer) = layer_of_prefix(prefix) else {
+        return Ok(Vec::new());
+    };
+    let records = mounted_growth_records(&model.header);
+    let mut out = Vec::new();
+    for (at, rec) in records {
+        if !rec.layers.contains(&layer) {
+            continue;
+        }
+        let plan = cortiq_core::expert_append_layout(&model.header, &model.tensors, at, rec)
+            .map_err(|e| CmfError::Parse(format!("{prefix}: growth record '{}': {e}", rec.id)))?;
+        let mut by_expert: std::collections::BTreeMap<usize, Vec<&cortiq_core::ExpertTensorSpec>> =
+            Default::default();
+        for p in plan.iter().filter(|p| p.layer == layer) {
+            by_expert.entry(p.expert).or_default().push(p);
+        }
+        let first = out.len();
+        for (e, leaves) in &by_expert {
+            let name = |leaf: &str| -> Result<String, CmfError> {
+                leaves
+                    .iter()
+                    .find(|p| p.leaf == leaf)
+                    .map(|p| p.name.clone())
+                    .ok_or_else(|| {
+                        CmfError::Parse(format!(
+                            "{prefix}: growth record '{}' expert {e}: layout has no '{leaf}'",
+                            rec.id
+                        ))
+                    })
+            };
+            let ffn = load_dense(&format!("skill.{}.{prefix}mlp.experts.{e}.", rec.id))?;
+            let mu = load_f32(model, &name(expert_leaf::MU)?, ov).map_err(CmfError::Parse)?;
+            let u = if leaves.iter().any(|p| p.leaf == expert_leaf::U) {
+                load_f32(model, &name(expert_leaf::U)?, ov).map_err(CmfError::Parse)?
+            } else {
+                Vec::new()
+            };
+            let scalar = |leaf: &str| -> Result<f32, CmfError> {
+                load_f32(model, &name(leaf)?, ov)
+                    .map_err(CmfError::Parse)?
+                    .first()
+                    .copied()
+                    .ok_or_else(|| {
+                        CmfError::Parse(format!(
+                            "{prefix}: growth record '{}' expert {e}: empty '{leaf}'",
+                            rec.id
+                        ))
+                    })
+            };
+            let bias = scalar(expert_leaf::BIAS)?;
+            let shell = scalar(expert_leaf::SHELL)?;
+            if !shell.is_finite() {
+                return Err(CmfError::Parse(format!(
+                    "{prefix}: growth record '{}' expert {e}: desc.shell {shell} is not finite",
+                    rec.id
+                )));
+            }
+            out.push(GrownLoad {
+                ffn,
+                mu,
+                u,
+                bias,
+                shell,
+                meta: crate::pipeline::GrownExpert {
+                    record: rec.id.clone(),
+                    record_index: at,
+                    layer,
+                    expert: *e,
+                },
+            });
+        }
+        let declared: Vec<usize> = by_expert.keys().copied().collect();
+        tracing::info!(
+            "growth: layer {layer}: mounted expert_append '{}' (status {}) — {} experts, declared {:?}, shells {:?}",
+            rec.id,
+            rec.status.as_deref().unwrap_or("?"),
+            by_expert.len(),
+            declared,
+            out[first..].iter().map(|g| g.shell).collect::<Vec<_>>()
+        );
+    }
+    Ok(out)
 }
 
 /// Task mask over routed experts: DTG-MA applied to MoE.
@@ -650,9 +884,11 @@ impl Pipeline {
         if let Some(dir) = model.path.parent() {
             crate::gpu::set_cache_dir(dir.to_path_buf());
         }
-        // A new model gets a fresh verdict on whether the token graph can
-        // be built: the refusal is remembered per model, not per process.
-        crate::gpu::graph_unsupported_reset();
+        // The token-graph refusal verdict lives in each pipeline
+        // (`Pipeline::graph_refused`): a new pipeline starts clean and
+        // loading one — a skill lane mid-traffic — never touches the
+        // verdict of the others (R4/NF-2; this used to reset a
+        // process-wide flag under running slots).
         let skill = match ov {
             Overlay::One(s) => Some(*s),
             _ => None,
@@ -732,6 +968,15 @@ impl Pipeline {
         let mut tokenizer = if let Some(vocab_bytes) = &model.vocab {
             Tokenizer::from_bytes(vocab_bytes)
                 .map_err(|e| CmfError::Parse(format!("embedded tokenizer: {e}")))?
+        } else if let Some(g) = &model.header.genome {
+            // A genome binds its tokenizer (the trunk hash covers the VOCAB
+            // section): whatever tokenizer.json lies beside the file is not
+            // part of it (NF-5; core refuses such a file at open as well).
+            return Err(CmfError::Parse(format!(
+                "genome '{}' carries no embedded tokenizer (VOCAB) — a sidecar tokenizer.json \
+                 is not part of the genome; refusing",
+                g.id
+            )));
         } else {
             let sidecar = model.path.with_file_name("tokenizer.json");
             if sidecar.exists() {
@@ -789,6 +1034,23 @@ impl Pipeline {
             .any(|t| matches!(t, LayerType::LinearAttention));
         let mut vmf_cfg = None;
         let mut gdn_cfg = None;
+        // `Some` means this file uses the versioned Phase-Delta operator;
+        // the sorted indices are threaded into each layer's weights below.
+        // Legacy kinds must not carry selector metadata: accepting and
+        // ignoring it would recreate the original silent semantic break.
+        let mut phase_delta_layers: Option<Vec<usize>> = None;
+        if !has_linear
+            && arch
+                .linear_core
+                .as_ref()
+                .is_some_and(|lc| lc.phase_delta_layers.is_some())
+        {
+            return Err(CmfError::Parse(
+                "phase_delta_layers is only valid with LinearAttention and \
+                 vmf_phase_delta_v1"
+                    .into(),
+            ));
+        }
         if has_linear {
             let lc = arch.linear_core.as_ref().ok_or_else(|| {
                 CmfError::Parse(
@@ -802,6 +1064,12 @@ impl Pipeline {
             };
             match lc.kind.as_str() {
                 "vmf_phase" => {
+                    if lc.phase_delta_layers.is_some() {
+                        return Err(CmfError::Parse(
+                            "legacy vmf_phase cannot carry phase_delta_layers; use vmf_phase_delta_v1"
+                                .into(),
+                        ));
+                    }
                     vmf_cfg = Some(VmfPhaseCfg {
                         num_heads: lc.num_heads,
                         nphase: need(lc.nphase, "linear_core.nphase")?,
@@ -815,7 +1083,73 @@ impl Pipeline {
                             .unwrap_or(0.0),
                     });
                 }
+                "vmf_phase_delta_v1" => {
+                    let mut selected = lc.phase_delta_layers.clone().ok_or_else(|| {
+                        CmfError::Parse(
+                            "vmf_phase_delta_v1 requires a non-empty phase_delta_layers selector"
+                                .into(),
+                        )
+                    })?;
+                    if selected.is_empty() {
+                        return Err(CmfError::Parse(
+                            "vmf_phase_delta_v1 phase_delta_layers is empty".into(),
+                        ));
+                    }
+                    if arch.layer_types.len() != arch.num_layers {
+                        return Err(CmfError::Parse(format!(
+                            "phase_delta layer schedule has {} entries, expected {}",
+                            arch.layer_types.len(),
+                            arch.num_layers
+                        )));
+                    }
+                    selected.sort_unstable();
+                    for pair in selected.windows(2) {
+                        if pair[0] == pair[1] {
+                            return Err(CmfError::Parse(format!(
+                                "phase_delta_layers contains duplicate layer {}",
+                                pair[0]
+                            )));
+                        }
+                    }
+                    for &li in &selected {
+                        if li >= arch.num_layers {
+                            return Err(CmfError::Parse(format!(
+                                "phase_delta layer {li} out of range for {} layers",
+                                arch.num_layers
+                            )));
+                        }
+                        if !matches!(arch.layer_types[li], LayerType::LinearAttention) {
+                            return Err(CmfError::Parse(format!(
+                                "phase_delta layer {li} is not a LinearAttention layer"
+                            )));
+                        }
+                    }
+                    let nphase = need(lc.nphase, "linear_core.nphase")?;
+                    if lc.num_heads == 0 || nphase == 0 || lc.value_head_dim == 0 {
+                        return Err(CmfError::Parse(
+                            "vmf_phase_delta_v1 requires positive heads, nphase, and value_head_dim"
+                                .into(),
+                        ));
+                    }
+                    phase_delta_layers = Some(selected);
+                    vmf_cfg = Some(VmfPhaseCfg {
+                        num_heads: lc.num_heads,
+                        nphase,
+                        value_head_dim: lc.value_head_dim,
+                        hidden_size: arch.hidden_size,
+                        // Phase-Delta's normalized features are a closed
+                        // operator contract. CMF_PHASE_MASS is a legacy
+                        // tuning knob and is intentionally ignored by the
+                        // phase_delta branch in linear_core.
+                        phase_mass: 0.0,
+                    });
+                }
                 "gated_delta_net" => {
+                    if lc.phase_delta_layers.is_some() {
+                        return Err(CmfError::Parse(
+                            "gated_delta_net cannot carry phase_delta_layers".into(),
+                        ));
+                    }
                     gdn_cfg = Some(GdnCfg {
                         num_v_heads: lc.num_heads,
                         num_k_heads: need(arch.linear_num_key_heads, "linear_num_key_heads")?,
@@ -830,7 +1164,7 @@ impl Pipeline {
                 other => {
                     return Err(CmfError::Parse(format!(
                         "unknown linear core '{other}' (this runtime executes: \
-                         gated_delta_net, vmf_phase)"
+                         gated_delta_net, vmf_phase, vmf_phase_delta_v1)"
                     )));
                 }
             }
@@ -1077,7 +1411,7 @@ impl Pipeline {
             })
         };
 
-        let load_linear_attn = |prefix: &str| -> Result<AttnKind, CmfError> {
+        let load_linear_attn = |prefix: &str, li: usize| -> Result<AttnKind, CmfError> {
             if gdn_cfg.is_some() {
                 // Faithful vendor operator: tensor names 1:1 with the source.
                 let t = |suffix: &str| {
@@ -1131,14 +1465,99 @@ impl Pipeline {
             } else {
                 None
             };
+            let thq = t("thq.weight")?;
+            let thk = t("thk.weight")?;
+            let v_proj = t("v_proj.weight")?;
+            let out_proj = t("out_proj.weight")?;
+            let phase_delta = phase_delta_layers
+                .as_ref()
+                .is_some_and(|layers| layers.binary_search(&li).is_ok());
+            if phase_delta {
+                let cfg = vmf_cfg.ok_or_else(|| {
+                    CmfError::Parse("phase_delta layer has no VMF geometry".into())
+                })?;
+                let expect = |name: &str, got: (usize, usize), want: (usize, usize)| {
+                    if got != want {
+                        Err(CmfError::Parse(format!(
+                            "phase_delta {name} geometry [{}, {}] != [{}, {}]",
+                            got.0, got.1, want.0, want.1
+                        )))
+                    } else {
+                        Ok(())
+                    }
+                };
+                expect(
+                    "thq",
+                    (thq.rows(), thq.cols()),
+                    (cfg.num_heads * cfg.nphase, cfg.hidden_size),
+                )?;
+                expect(
+                    "thk",
+                    (thk.rows(), thk.cols()),
+                    (cfg.num_heads * cfg.nphase, cfg.hidden_size),
+                )?;
+                expect(
+                    "v_proj",
+                    (v_proj.rows(), v_proj.cols()),
+                    (cfg.num_heads * cfg.value_head_dim, cfg.hidden_size),
+                )?;
+                expect(
+                    "out_proj",
+                    (out_proj.rows(), out_proj.cols()),
+                    (cfg.hidden_size, cfg.num_heads * cfg.value_head_dim),
+                )?;
+                if a_log.len() != cfg.num_heads * 2 * cfg.nphase {
+                    return Err(CmfError::Parse(format!(
+                        "phase_delta A_log length {} != {}",
+                        a_log.len(),
+                        cfg.num_heads * 2 * cfg.nphase
+                    )));
+                }
+                if let Some((kw, kb)) = &k_gate {
+                    expect(
+                        "k_gate",
+                        (kw.rows(), kw.cols()),
+                        (cfg.num_heads, cfg.hidden_size),
+                    )?;
+                    if kb.len() != cfg.num_heads {
+                        return Err(CmfError::Parse(format!(
+                            "phase_delta k_gate.bias length {} != {}",
+                            kb.len(),
+                            cfg.num_heads
+                        )));
+                    }
+                }
+                if let Some(c) = &conv {
+                    let n = model
+                        .tensor(&format!("{prefix}vmf_attn.conv1d.weight"))
+                        .ok_or_else(|| {
+                            CmfError::Parse(
+                                "phase_delta conv tensor disappeared during load".into(),
+                            )
+                        })?;
+                    if n.shape.len() != 3
+                        || n.shape[0] != cfg.hidden_size
+                        || n.shape[1] != 1
+                        || n.shape[2] < 2
+                        || c.len() != n.shape.iter().product::<usize>()
+                    {
+                        return Err(CmfError::Parse(format!(
+                            "phase_delta conv geometry {:?} / {} bytes is incompatible",
+                            n.shape,
+                            c.len()
+                        )));
+                    }
+                }
+            }
             Ok(AttnKind::Linear(VmfPhaseWeights {
-                thq: t("thq.weight")?,
+                thq,
                 conv,
-                thk: t("thk.weight")?,
-                v_proj: t("v_proj.weight")?,
-                out_proj: t("out_proj.weight")?,
+                thk,
+                v_proj,
+                out_proj,
                 decay: a_log.iter().map(|&a| (-(a as f64).exp()).exp()).collect(),
                 k_gate,
+                phase_delta,
             }))
         };
 
@@ -1202,6 +1621,84 @@ impl Pipeline {
             })))
         };
 
+        // Natively bounded anchor (Embryo-O1 `swa_sink_v1`): the plain
+        // q/k/v/o projections plus the TRAINED sink vectors
+        // `self_attn.sink_k/sink_v.weight [kvh, S, hd]` (f32, weights —
+        // not positions). The operator carries no qk-norm, gate or bias:
+        // their presence is a contract violation, not something to
+        // silently execute differently from the trainer.
+        let load_bounded_attn = |prefix: &str, li: usize| -> Result<AttnKind, CmfError> {
+            let ac = arch.anchor_core.as_ref().ok_or_else(|| {
+                CmfError::Parse(format!(
+                    "layer {li} is BoundedAttention but the header carries no anchor_core"
+                ))
+            })?;
+            let t = |suffix: &str| load_matrix(model, &format!("{prefix}{suffix}"), force_f32, ov);
+            let (nkv, hd, nh) = (arch.num_kv_heads, arch.head_dim, arch.num_attention_heads);
+            for extra in [
+                "self_attn.q_norm.weight",
+                "self_attn.k_norm.weight",
+                "self_attn.g_proj.weight",
+                "self_attn.q_proj.bias",
+                "self_attn.k_proj.bias",
+                "self_attn.v_proj.bias",
+            ] {
+                if model.tensor(&format!("{prefix}{extra}")).is_some() {
+                    return Err(CmfError::Parse(format!(
+                        "{prefix}{extra}: the bounded anchor operator carries no qk-norm, \
+                         gate or bias (docs/EMBRYO_BOUNDED_ANCHOR.md §1)"
+                    )));
+                }
+            }
+            let sink = |name: &str| -> Result<Vec<f32>, CmfError> {
+                let full = format!("{prefix}self_attn.{name}.weight");
+                let e = model.tensor(&full).ok_or_else(|| {
+                    CmfError::MissingTensor(format!(
+                        "{full} (a bounded anchor needs its trained sinks)"
+                    ))
+                })?;
+                if e.shape.len() != 3
+                    || e.shape[0] != nkv
+                    || e.shape[1] != ac.sink
+                    || e.shape[2] != hd
+                {
+                    return Err(CmfError::Parse(format!(
+                        "{full}: shape {:?} != [{nkv}, {}, {hd}] (num_kv_heads, anchor_core.sink, head_dim)",
+                        e.shape, ac.sink
+                    )));
+                }
+                load_f32(model, &full, ov).map_err(err)
+            };
+            let wq = t("self_attn.q_proj.weight")?;
+            let wk = t("self_attn.k_proj.weight")?;
+            let wv = t("self_attn.v_proj.weight")?;
+            let wo = t("self_attn.o_proj.weight")?;
+            let expect = |name: &str, got: (usize, usize), want: (usize, usize)| {
+                if got != want {
+                    Err(CmfError::Parse(format!(
+                        "{prefix}self_attn.{name}.weight is {}x{}, expected {}x{}",
+                        got.0, got.1, want.0, want.1
+                    )))
+                } else {
+                    Ok(())
+                }
+            };
+            expect("q_proj", (wq.rows(), wq.cols()), (nh * hd, arch.hidden_size))?;
+            expect("k_proj", (wk.rows(), wk.cols()), (nkv * hd, arch.hidden_size))?;
+            expect("v_proj", (wv.rows(), wv.cols()), (nkv * hd, arch.hidden_size))?;
+            expect("o_proj", (wo.rows(), wo.cols()), (arch.hidden_size, nh * hd))?;
+            Ok(AttnKind::Bounded(Box::new(crate::bounded::BoundedWeights {
+                wq,
+                wk,
+                wv,
+                wo,
+                sink_k: sink("sink_k")?,
+                sink_v: sink("sink_v")?,
+                sink: ac.sink,
+                window: ac.window,
+            })))
+        };
+
         fn anyhow_like(ok: bool) -> Result<(), ()> {
             if ok { Ok(()) } else { Err(()) }
         }
@@ -1218,9 +1715,10 @@ impl Pipeline {
         for li in 0..(if owns_its_layers { 0 } else { arch.num_layers }) {
             let prefix = format!("model.layers.{li}.");
             let attn = match arch.layer_types.get(li) {
-                Some(LayerType::LinearAttention) => load_linear_attn(&prefix)?,
+                Some(LayerType::LinearAttention) => load_linear_attn(&prefix, li)?,
                 Some(LayerType::Kda) => load_kda(&prefix)?,
                 Some(LayerType::ShortConv) => load_short_conv(&prefix)?,
+                Some(LayerType::BoundedAttention) => load_bounded_attn(&prefix, li)?,
                 _ => load_full_attn(&prefix, Some(li))?,
             };
             // Gemma-2/3 sandwich: `pre_feedforward_layernorm` present →
@@ -1581,6 +2079,11 @@ impl Pipeline {
                 }
             }
             pipeline.inv_freq = std::sync::Arc::new(f);
+        }
+        if let Some(selected) = &phase_delta_layers {
+            for &li in selected {
+                pipeline.kv_cache.layers[li].set_linear_wire_allowed(false);
+            }
         }
         pipeline.attn_v_norm = arch.attn_v_norm;
         pipeline.qk_norm_after_rope = arch.qk_norm_after_rope;
@@ -2113,11 +2616,66 @@ impl Pipeline {
         if let Some(c) = &model.header.calibration {
             pipeline.set_calib_temp(c.temperature);
         }
+        // Versioned state wire: every layer carries the operator identity
+        // so a peer holding another operator is refused, not guessed at.
+        let identity = arch
+            .linear_core_identity()
+            .and_then(|v| serde_json::to_vec(&v).ok())
+            .map(|b| cortiq_core::hash64(&b))
+            .unwrap_or(0);
+        pipeline.install_wire_identity(identity);
+        // Natively bounded anchor: the file's operator, installed from the
+        // header (rings sized once, not per prompt). The file governs —
+        // a post-hoc O(1) knob on such a file is an error, not a warning.
+        if let Some(ac) = &arch.anchor_core {
+            pipeline.install_bounded(ac).map_err(CmfError::Parse)?;
+            let why = pipeline.o1_refusal().unwrap_or_default();
+            let mut knobs: Vec<String> = std::env::vars()
+                .filter(|(k, v)| {
+                    (k == "CMF_O1" && !(v == "off" || v == "0")) || k.starts_with("CMF_O1_")
+                })
+                .map(|(k, _)| k)
+                .collect();
+            knobs.sort();
+            if !knobs.is_empty() {
+                return Err(CmfError::Parse(format!("{why} (set: {})", knobs.join(", "))));
+            }
+            if model
+                .header
+                .provenance
+                .as_ref()
+                .and_then(|p| p.get("o1_attn"))
+                .is_some()
+            {
+                return Err(CmfError::Parse(format!(
+                    "{why} (the header carries a provenance.o1_attn hint)"
+                )));
+            }
+            return Ok(pipeline);
+        }
         // O(1) Nyström attention (runtime-level, no format change):
         // env CMF_O1 decides; unset falls through to the converter hint
         // in header.provenance.o1_attn (`cortiq convert --o1`), and
         // CMF_O1=off force-disables even the hint. CLI flags override
         // later via set_o1().
+        // A genome's attention operator is its arch (hashed into the
+        // trunk); a provenance hint is not part of the genome and must not
+        // switch the backbone to Nyström (NF-6 — core refuses the hint on
+        // a GENOME file at open; this keeps the loader fail-closed too).
+        let genome_hint = model.header.genome.is_some()
+            && model
+                .header
+                .provenance
+                .as_ref()
+                .and_then(|p| p.get("o1_attn"))
+                .is_some();
+        if genome_hint {
+            return Err(CmfError::Parse(
+                "genome file with a provenance.o1_attn hint: the trunk's attention operator is \
+                 set by the genome's arch only — refusing"
+                    .into(),
+            ));
+        }
         let o1 = match crate::nystrom::o1_from_env() {
             crate::nystrom::O1Env::Off => None,
             crate::nystrom::O1Env::On(cfg) => Some(cfg),
@@ -2150,6 +2708,12 @@ impl Pipeline {
         self.dyn_force_f32 = force_f32;
         let mut per_skill = Vec::with_capacity(model.header.skills.len());
         for sk in &model.header.skills {
+            // A lookup record replaces nothing: its tensors are the key →
+            // card table (u64/u32/u8), never weights. No lane, no switch.
+            if sk.kind.as_deref() == Some(cortiq_core::knowledge::skill_kind::LOOKUP) {
+                per_skill.push(None);
+                continue;
+            }
             let mut ffn_layers = std::collections::BTreeSet::new();
             let mut non_ffn = false;
             let prefix = format!("skill.{}.", sk.id);
@@ -2185,13 +2749,15 @@ impl Pipeline {
     /// layers with the new overlay — tensor-source indirection made
     /// dynamic. Cheap: Mapped tensors are re-resolved mmap pointers.
     /// Result is bit-identical to loading the pipeline with that skill.
+    ///
+    /// Asking for the skill that is already active is a true no-op: the
+    /// weights do not change, so the sequence state (KV, rings, recurrent
+    /// state, the prefix-reuse key) stays — clearing it here used to wipe
+    /// a live conversation on every idempotent call. A real change
+    /// rebuilds the touched FFNs first (all or nothing: on an error the
+    /// old overlay and state are untouched), then invalidates every state
+    /// the old weights produced, including `kv_prefix`.
     pub fn set_active_skill(&mut self, idx: Option<usize>) -> Result<(), CmfError> {
-        // Overlay swap changes weights → every cached K/V is stale.
-        // The wgpu graph owns a parallel recurrent/KV mirror keyed by the
-        // pipeline id.  Overlay swaps are sequence boundaries too; the shared
-        // reset clears it before the next token so dynamic routing cannot
-        // read state produced with the prior skill.
-        self.reset_session();
         if self.dyn_active == idx {
             return Ok(());
         }
@@ -2223,11 +2789,103 @@ impl Pipeline {
             None => Overlay::None,
         };
         let arch = model.arch();
+        let mut rebuilt = Vec::with_capacity(union.len());
         for li in union {
-            self.weights.layers[li].ffn =
-                build_layer_ffn(&model, arch, li, self.dyn_force_f32, &ov)?;
+            rebuilt.push((
+                li,
+                build_layer_ffn(&model, arch, li, self.dyn_force_f32, &ov)?,
+            ));
         }
+        for (li, ffn) in rebuilt {
+            self.weights.layers[li].ffn = ffn;
+        }
+        // Overlay swap changed weights → every cached state is stale.
+        self.invalidate_for_weight_change();
         self.dyn_active = idx;
         Ok(())
     }
+}
+
+/// Fixed per-sequence state a file declares, from its header alone (no
+/// weights loaded): bytes of bounded-anchor rings, bytes of recurrent
+/// vectors (S + conv rings), and how many layers still hold a growing
+/// per-position KV. A strictly-O(1) file has `growing_layers == 0`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PerSequenceState {
+    pub bounded_bytes: usize,
+    pub recurrent_bytes: usize,
+    pub growing_layers: usize,
+}
+
+pub fn per_sequence_state_bytes(model: &CmfModel) -> Result<PerSequenceState, String> {
+    let arch = model.arch();
+    let f = std::mem::size_of::<f32>();
+    let mut st = PerSequenceState::default();
+    let need = |v: Option<usize>, name: &str| {
+        v.ok_or_else(|| format!("linear core needs arch.{name}"))
+    };
+    for li in 0..arch.num_layers {
+        match arch.layer_types.get(li) {
+            Some(LayerType::BoundedAttention) => {
+                let ac = arch
+                    .anchor_core
+                    .as_ref()
+                    .ok_or("BoundedAttention layer without anchor_core")?;
+                st.bounded_bytes += ac.ring_state_elems(arch.num_kv_heads, arch.head_dim) * f;
+            }
+            Some(LayerType::LinearAttention) => {
+                let lc = arch
+                    .linear_core
+                    .as_ref()
+                    .ok_or("LinearAttention layer without linear_core")?;
+                let elems = match lc.kind.as_str() {
+                    "gated_delta_net" => GdnCfg {
+                        num_v_heads: lc.num_heads,
+                        num_k_heads: need(arch.linear_num_key_heads, "linear_num_key_heads")?,
+                        key_head_dim: need(arch.linear_key_head_dim, "linear_key_head_dim")?,
+                        value_head_dim: lc.value_head_dim,
+                        conv_kernel: need(arch.linear_conv_kernel_dim, "linear_conv_kernel_dim")?,
+                        hidden_size: arch.hidden_size,
+                        rms_eps: arch.rms_norm_eps,
+                        output_gate_sigmoid: false,
+                    }
+                    .state_len(),
+                    _ => {
+                        let nphase = need(lc.nphase, "linear_core.nphase")?;
+                        let mut n = lc.num_heads * 2 * nphase * lc.value_head_dim;
+                        if let Some(c) = model.tensor(&format!("model.layers.{li}.vmf_attn.conv1d.weight")) {
+                            if c.shape.len() == 3 && c.shape[2] >= 2 {
+                                n += (c.shape[2] - 1) * arch.hidden_size;
+                            }
+                        }
+                        n
+                    }
+                };
+                st.recurrent_bytes += elems * f;
+            }
+            Some(LayerType::ShortConv) => {
+                let k = need(arch.linear_conv_kernel_dim, "linear_conv_kernel_dim")?;
+                st.recurrent_bytes += ShortConvCfg {
+                    hidden_size: arch.hidden_size,
+                    kernel: k,
+                }
+                .state_len()
+                    * f;
+            }
+            Some(LayerType::Kda) => {
+                st.recurrent_bytes += crate::linear_core::KdaCfg {
+                    num_heads: need(arch.linear_num_key_heads, "linear_num_key_heads")?,
+                    head_k_dim: need(arch.linear_key_head_dim, "linear_key_head_dim")?,
+                    head_v_dim: need(arch.linear_value_head_dim, "linear_value_head_dim")?,
+                    conv_kernel: need(arch.linear_conv_kernel_dim, "linear_conv_kernel_dim")?,
+                    hidden_size: arch.hidden_size,
+                    rms_eps: arch.rms_norm_eps,
+                }
+                .state_len()
+                    * f;
+            }
+            _ => st.growing_layers += 1,
+        }
+    }
+    Ok(st)
 }

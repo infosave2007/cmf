@@ -105,7 +105,6 @@ pub fn mtp_step(
     let mut losses = Vec::new();
     for kk in 0..st.k {
         let shifted = shifted_targets(tokens, gpu.b, gpu.t, kk + 1);
-        let valid = shifted.iter().filter(|&&x| x != u32::MAX).count().max(1);
         unsafe {
             std::ptr::copy_nonoverlapping(shifted.as_ptr(), st.tgt.buf.contents() as *mut u32, m)
         };
@@ -220,8 +219,9 @@ pub fn mtp_step(
             );
         }
         cmd.commit();
-        // read_loss divides by m; rescale to valid positions
-        losses.push(gpu.read_loss() * m as f32 / valid as f32);
+        // The shared head now normalises CE by valid targets, including the
+        // shifted-target mask used by MTP.  Do not rescale a second time.
+        losses.push(gpu.read_loss());
     }
     losses
 }

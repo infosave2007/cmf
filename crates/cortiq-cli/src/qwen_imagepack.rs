@@ -405,6 +405,10 @@ pub(crate) fn pack(root: &str, component: &str, quant: &str, output: &str) -> an
             shard: None,
             calibration: None,
             routing: None,
+            genome: None,
+            lineage: Vec::new(),
+            router: None,
+            segments: Vec::new(),
         };
         writer.finish(&header, None, None)?;
         Ok(())
@@ -971,6 +975,10 @@ mod tests {
             shard: None,
             calibration: None,
             routing: None,
+            genome: None,
+            lineage: Vec::new(),
+            router: None,
+            segments: Vec::new(),
         }
     }
 

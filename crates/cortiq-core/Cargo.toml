@@ -20,6 +20,8 @@ memmap2 = { workspace = true }
 bytemuck = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# NFC in `knowledge::normalize_key` (lookup-record keys, cmf-key-v1).
+unicode-normalization = { workspace = true }
 
 # posix_fadvise for `CmfModel::evict_ranges` — releasing the page cache
 # behind expert uploads; madvise alone only trims the mapping's RSS.

@@ -77,6 +77,7 @@ pub fn run_quantize_gptq(
 
     eprintln!("loading {input} …");
     let model = Arc::new(CmfModel::open_sharded(input)?);
+    crate::knowledge::refuse_genome_rewrite(&model, "quantize gptq")?;
     let mut pipe = Pipeline::from_model(&model, SamplerConfig::default())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     pipe.set_confidence(false);

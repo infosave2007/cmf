@@ -57,6 +57,7 @@ fn blocked_vs_per_row() {
         moe: None,
         qwen4_exp: None,
         deepseek_v41: None,
+        anchor_core: None,
         linear_core: None,
         head_clusters: None,
         max_position_embeddings: 8,
@@ -103,6 +104,10 @@ fn blocked_vs_per_row() {
         shard: None,
         calibration: None,
         routing: None,
+        genome: None,
+        lineage: Vec::new(),
+        router: None,
+        segments: Vec::new(),
     };
     let spec = TensorSpec {
         name: "w".into(),
@@ -207,6 +212,7 @@ fn q1_blocked_vs_per_row() {
         moe: None,
         qwen4_exp: None,
         deepseek_v41: None,
+        anchor_core: None,
         linear_core: None,
         head_clusters: None,
         max_position_embeddings: 8,
@@ -253,6 +259,10 @@ fn q1_blocked_vs_per_row() {
         shard: None,
         calibration: None,
         routing: None,
+        genome: None,
+        lineage: Vec::new(),
+        router: None,
+        segments: Vec::new(),
     };
     let spec = TensorSpec {
         name: "w".into(),
@@ -356,6 +366,7 @@ fn q4b_blocked_vs_per_row() {
         moe: None,
         qwen4_exp: None,
         deepseek_v41: None,
+        anchor_core: None,
         linear_core: None,
         head_clusters: None,
         max_position_embeddings: 8,
@@ -402,6 +413,10 @@ fn q4b_blocked_vs_per_row() {
         shard: None,
         calibration: None,
         routing: None,
+        genome: None,
+        lineage: Vec::new(),
+        router: None,
+        segments: Vec::new(),
     };
     let spec = TensorSpec {
         name: "w".into(),
@@ -513,6 +528,7 @@ fn q4t_blocked_vs_per_row() {
         moe: None,
         qwen4_exp: None,
         deepseek_v41: None,
+        anchor_core: None,
         linear_core: None,
         head_clusters: None,
         max_position_embeddings: 8,
@@ -559,6 +575,10 @@ fn q4t_blocked_vs_per_row() {
         shard: None,
         calibration: None,
         routing: None,
+        genome: None,
+        lineage: Vec::new(),
+        router: None,
+        segments: Vec::new(),
     };
     let spec = TensorSpec {
         name: "w".into(),
@@ -662,6 +682,7 @@ fn q4t_silu_mul_fused_matches_composed() {
         moe: None,
         qwen4_exp: None,
         deepseek_v41: None,
+        anchor_core: None,
         linear_core: None,
         head_clusters: None,
         max_position_embeddings: 8,
@@ -708,6 +729,10 @@ fn q4t_silu_mul_fused_matches_composed() {
         shard: None,
         calibration: None,
         routing: None,
+        genome: None,
+        lineage: Vec::new(),
+        router: None,
+        segments: Vec::new(),
     };
     let specs = [
         TensorSpec {

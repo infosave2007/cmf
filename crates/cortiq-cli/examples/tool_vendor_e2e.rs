@@ -34,6 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         min_p: 0.0,
         seed: Some(1),
         suppress_tokens: Vec::new(),
+        penalty_window: 0,
     };
     let mut p = Pipeline::from_model(&m, cfg)?;
     let mut tok = Tokenizer::from_file(&a[1])?;

@@ -51,6 +51,7 @@ fn q1_gpu_micro() {
         moe: None,
         qwen4_exp: None,
         deepseek_v41: None,
+        anchor_core: None,
         linear_core: None,
         head_clusters: None,
         max_position_embeddings: 8,
@@ -97,6 +98,10 @@ fn q1_gpu_micro() {
         shard: None,
         calibration: None,
         routing: None,
+        genome: None,
+        lineage: Vec::new(),
+        router: None,
+        segments: Vec::new(),
     };
     let spec = TensorSpec {
         name: "w".into(),
@@ -270,6 +275,7 @@ fn q8_gpu_micro() {
         moe: None,
         qwen4_exp: None,
         deepseek_v41: None,
+        anchor_core: None,
         linear_core: None,
         head_clusters: None,
         max_position_embeddings: 8,
@@ -316,6 +322,10 @@ fn q8_gpu_micro() {
         shard: None,
         calibration: None,
         routing: None,
+        genome: None,
+        lineage: Vec::new(),
+        router: None,
+        segments: Vec::new(),
     };
     let spec = TensorSpec {
         name: "w".into(),
@@ -416,6 +426,7 @@ fn q8_mul_mm_micro() {
         moe: None,
         qwen4_exp: None,
         deepseek_v41: None,
+        anchor_core: None,
         linear_core: None,
         head_clusters: None,
         max_position_embeddings: 8,
@@ -462,6 +473,10 @@ fn q8_mul_mm_micro() {
         shard: None,
         calibration: None,
         routing: None,
+        genome: None,
+        lineage: Vec::new(),
+        router: None,
+        segments: Vec::new(),
     };
     let spec = TensorSpec {
         name: "w".into(),
@@ -621,6 +636,7 @@ fn q1_chain_and_batch_parity() {
         moe: None,
         qwen4_exp: None,
         deepseek_v41: None,
+        anchor_core: None,
         linear_core: None,
         head_clusters: None,
         max_position_embeddings: 8,
@@ -667,6 +683,10 @@ fn q1_chain_and_batch_parity() {
         shard: None,
         calibration: None,
         routing: None,
+        genome: None,
+        lineage: Vec::new(),
+        router: None,
+        segments: Vec::new(),
     };
     let specs = vec![
         TensorSpec {

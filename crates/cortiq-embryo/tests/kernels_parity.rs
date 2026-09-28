@@ -361,6 +361,8 @@ fn hybrid_k_chunk_scan_matches_cpu_oracle() {
             kv: &gkv,
             states: &gstates,
             out: &gout,
+            phase_chunk: None,
+            phase_partial: None,
         };
         let gdout = GBuf::from_slice(c, &dout);
         let (gdst, gdkv, gdphq, gdphk) = (
@@ -418,6 +420,776 @@ fn hybrid_k_chunk_scan_matches_cpu_oracle() {
                 "hybrid_k {name}: rel err {e:e} (nph={nph} dv={dv})"
             );
         }
+    }
+}
+
+#[test]
+fn phase_delta_metal_matches_f64_oracle_and_repeats() {
+    use cortiq_embryo::metal::{HkGrads, HkWork, hk_pow_table};
+    use cortiq_embryo::ops::{HkDims, hk_decay_grid, phase_delta_ref_bwd, phase_delta_ref_fwd};
+    let Some(c) = ctx() else { return };
+    let d = HkDims {
+        b: 1,
+        t: 65,
+        nh: 2,
+        nph: 3,
+        dv: 4,
+    };
+    let rows = d.b * d.t;
+    let thq: Vec<f32> = lcg_vec(101, rows * d.nh * d.nph)
+        .iter()
+        .map(|x| x * 2.0)
+        .collect();
+    let thk: Vec<f32> = lcg_vec(102, rows * d.nh * d.nph)
+        .iter()
+        .map(|x| x * 2.0)
+        .collect();
+    let v = lcg_vec(103, rows * d.nh * d.dv);
+    let kappa: Vec<f32> = lcg_vec(104, rows * d.nh)
+        .iter()
+        .map(|x| 0.25 + 0.5 * (x + 1.0) / 2.0)
+        .collect();
+    let dout = lcg_vec(105, rows * d.nh * d.dv);
+    let decay = hk_decay_grid(d.nh, d.nph, 8.0, 128.0);
+    let to64 = |x: &[f32]| x.iter().map(|v| *v as f64).collect::<Vec<_>>();
+    let want_o = phase_delta_ref_fwd(
+        &d,
+        &to64(&thq),
+        &to64(&thk),
+        &to64(&v),
+        &to64(&kappa),
+        &to64(&decay),
+    );
+    let (want_q, want_k, want_v, want_kap) = phase_delta_ref_bwd(
+        &d,
+        &to64(&thq),
+        &to64(&thk),
+        &to64(&v),
+        &to64(&kappa),
+        &to64(&decay),
+        &to64(&dout),
+    );
+    let z = |n| GBuf::zeros(c, n);
+    let (gthq, gthk, gv, gkap) = (
+        GBuf::from_slice(c, &thq),
+        GBuf::from_slice(c, &thk),
+        GBuf::from_slice(c, &v),
+        GBuf::from_slice(c, &kappa),
+    );
+    let (gphq, gphk) = (z(rows * d.nh * 2 * d.nph), z(rows * d.nh * 2 * d.nph));
+    let gkv = z(rows * d.nh * d.dv);
+    let gout = z(rows * d.nh * d.dv);
+    let nst = d.b * d.nh * (d.t.div_ceil(64) + 1) * 2 * d.nph * d.dv;
+    let states = z(nst);
+    let gchunk = z(d.b * d.nh * 65 * 2 * d.nph * d.dv);
+    let gpartial = z(d.b * d.nh * d.dv.div_ceil(32) * d.t * (1 + 2 * d.nph));
+    let gpow = GBuf::from_slice(c, &hk_pow_table(&decay, d.nh, d.nph));
+    let w = HkWork {
+        thq: &gthq,
+        thk: &gthk,
+        v: &gv,
+        kappa: &gkap,
+        pow: &gpow,
+        pow_off: 0,
+        phq: &gphq,
+        phk: &gphk,
+        kv: &gkv,
+        states: &states,
+        out: &gout,
+        phase_chunk: Some(&gchunk),
+        phase_partial: Some(&gpartial),
+    };
+    let (gdst, gdkv, gdphq, gdphk) = (
+        z(nst),
+        z(rows * d.nh * d.dv),
+        z(rows * d.nh * 2 * d.nph),
+        z(rows * d.nh * 2 * d.nph),
+    );
+    let (gdthq, gdthk, gdv, gdkap) = (
+        z(rows * d.nh * d.nph),
+        z(rows * d.nh * d.nph),
+        z(rows * d.nh * d.dv),
+        z(rows * d.nh),
+    );
+    let gdout = GBuf::from_slice(c, &dout);
+    let gr = HkGrads {
+        dout: &gdout,
+        dstates: &gdst,
+        dkv: &gdkv,
+        dphq: &gdphq,
+        dphk: &gdphk,
+        dthq: &gdthq,
+        dthk: &gdthk,
+        dv: &gdv,
+        dkappa: &gdkap,
+    };
+    let cmd = Cmd::new(c);
+    cmd.phase_delta_forward(&d, &w);
+    cmd.phase_delta_backward(&d, &w, &gr);
+    cmd.commit();
+    let first_o = gout.to_vec();
+    let first_q = gdthq.to_vec();
+    let first_k = gdthk.to_vec();
+    let first_v = gdv.to_vec();
+    let first_kap = gdkap.to_vec();
+    let cmd = Cmd::new(c);
+    cmd.phase_delta_forward(&d, &w);
+    cmd.phase_delta_backward(&d, &w, &gr);
+    cmd.commit();
+    assert_eq!(
+        gout.to_vec(),
+        first_o,
+        "Phase-Delta forward is not deterministic"
+    );
+    assert_eq!(
+        gdthq.to_vec(),
+        first_q,
+        "Phase-Delta q gradient is not deterministic"
+    );
+    assert_eq!(
+        gdthk.to_vec(),
+        first_k,
+        "Phase-Delta k gradient is not deterministic"
+    );
+    assert_eq!(
+        gdv.to_vec(),
+        first_v,
+        "Phase-Delta v gradient is not deterministic"
+    );
+    assert_eq!(
+        gdkap.to_vec(),
+        first_kap,
+        "Phase-Delta gate gradient is not deterministic"
+    );
+    let rel = |got: &[f32], want: &[f64]| -> f64 {
+        let scale = want.iter().fold(0.0f64, |m, x| m.max(x.abs())).max(1e-9);
+        got.iter()
+            .zip(want)
+            .map(|(a, b)| (*a as f64 - b).abs())
+            .fold(0.0, f64::max)
+            / scale
+    };
+    eprintln!(
+        "phase delta rel: o {:.3e}, q {:.3e}, k {:.3e}, v {:.3e}, kap {:.3e}",
+        rel(&gout.to_vec(), &want_o),
+        rel(&gdthq.to_vec(), &want_q),
+        rel(&gdthk.to_vec(), &want_k),
+        rel(&gdv.to_vec(), &want_v),
+        rel(&gdkap.to_vec(), &want_kap)
+    );
+    assert!(rel(&gout.to_vec(), &want_o) < 2e-4, "forward parity");
+    assert!(rel(&gdthq.to_vec(), &want_q) < 2e-3, "q gradient parity");
+    assert!(rel(&gdthk.to_vec(), &want_k) < 2e-3, "k gradient parity");
+    assert!(rel(&gdv.to_vec(), &want_v) < 2e-4, "v gradient parity");
+    assert!(
+        rel(&gdkap.to_vec(), &want_kap) < 2e-3,
+        "kappa gradient parity"
+    );
+}
+
+#[test]
+fn phase_delta_chunked_backward_production_geometry_linear_work() {
+    use cortiq_embryo::metal::{HkGrads, HkWork, hk_pow_table};
+    use cortiq_embryo::ops::{
+        HkDims, hk_decay_grid, phase_delta_ref_bwd, phase_delta_ref_bwd_state, phase_delta_ref_fwd,
+        phase_delta_step,
+    };
+    let Some(c) = ctx() else { return };
+    // Production geometry with a non-multiple-of-64 tail exercises chunk
+    // entry recovery, reverse carry, and the bounded one-grid dispatch.
+    let d = HkDims {
+        b: 2,
+        t: 129,
+        nh: 8,
+        nph: 32,
+        dv: 128,
+    };
+    let rows = d.b * d.t;
+    let p2 = d.p2();
+    let thq = lcg_vec(301, rows * d.nh * d.nph);
+    let thk = lcg_vec(302, rows * d.nh * d.nph);
+    let v = lcg_vec(303, rows * d.nh * d.dv);
+    let kappa: Vec<f32> = lcg_vec(304, rows * d.nh)
+        .iter()
+        .map(|x| 0.15 + 0.7 * (x + 1.0) / 2.0)
+        .collect();
+    let dout = lcg_vec(305, rows * d.nh * d.dv);
+    let decay = hk_decay_grid(d.nh, d.nph, 8.0, 2048.0);
+    let to64 = |x: &[f32]| x.iter().map(|v| *v as f64).collect::<Vec<_>>();
+    let want_o = phase_delta_ref_fwd(
+        &d,
+        &to64(&thq),
+        &to64(&thk),
+        &to64(&v),
+        &to64(&kappa),
+        &to64(&decay),
+    );
+    let (want_q, want_k, want_v, want_kap) = phase_delta_ref_bwd(
+        &d,
+        &to64(&thq),
+        &to64(&thk),
+        &to64(&v),
+        &to64(&kappa),
+        &to64(&decay),
+        &to64(&dout),
+    );
+    let z = |n| GBuf::zeros(c, n);
+    let (gthq, gthk, gv, gkap) = (
+        GBuf::from_slice(c, &thq),
+        GBuf::from_slice(c, &thk),
+        GBuf::from_slice(c, &v),
+        GBuf::from_slice(c, &kappa),
+    );
+    let (gphq, gphk) = (z(rows * d.nh * p2), z(rows * d.nh * p2));
+    let gkv = z(rows * d.nh * d.dv);
+    let gout = z(rows * d.nh * d.dv);
+    let nchunks = d.t.div_ceil(64);
+    let nst = d.b * d.nh * (nchunks + 1) * p2 * d.dv;
+    let states = z(nst);
+    let gchunk = z(d.b * d.nh * 65 * p2 * d.dv);
+    let gpartial = z(d.b * d.nh * d.dv.div_ceil(32) * d.t * (1 + 2 * d.nph));
+    // The activation scratch is fixed at 65 states regardless of T; the
+    // production boundary table is only (ceil(T/64)+1) states.
+    assert_eq!(gchunk.len, d.b * d.nh * 65 * p2 * d.dv);
+    assert_eq!(states.len, d.b * d.nh * (nchunks + 1) * p2 * d.dv);
+    let gpow = GBuf::from_slice(c, &hk_pow_table(&decay, d.nh, d.nph));
+    let w = HkWork {
+        thq: &gthq,
+        thk: &gthk,
+        v: &gv,
+        kappa: &gkap,
+        pow: &gpow,
+        pow_off: 0,
+        phq: &gphq,
+        phk: &gphk,
+        kv: &gkv,
+        states: &states,
+        out: &gout,
+        phase_chunk: Some(&gchunk),
+        phase_partial: Some(&gpartial),
+    };
+    let (gdst, gdkv, gdphq, gdphk) = (
+        z(nst),
+        z(rows * d.nh * d.dv),
+        z(rows * d.nh * p2),
+        z(rows * d.nh * p2),
+    );
+    let (gdthq, gdthk, gdv, gdkap) = (
+        z(rows * d.nh * d.nph),
+        z(rows * d.nh * d.nph),
+        z(rows * d.nh * d.dv),
+        z(rows * d.nh),
+    );
+    let gdout = GBuf::from_slice(c, &dout);
+    let gr = HkGrads {
+        dout: &gdout,
+        dstates: &gdst,
+        dkv: &gdkv,
+        dphq: &gdphq,
+        dphk: &gdphk,
+        dthq: &gdthq,
+        dthk: &gdthk,
+        dv: &gdv,
+        dkappa: &gdkap,
+    };
+    let cmd = Cmd::new(c);
+    cmd.phase_delta_forward(&d, &w);
+    cmd.phase_delta_backward(&d, &w, &gr);
+    cmd.commit();
+    let rel = |got: &[f32], want: &[f64]| -> f64 {
+        let scale = want.iter().fold(0.0f64, |m, x| m.max(x.abs())).max(1e-9);
+        got.iter()
+            .zip(want)
+            .map(|(a, b)| (*a as f64 - b).abs())
+            .fold(0.0, f64::max)
+            / scale
+    };
+    eprintln!(
+        "phase delta production rel: o {:.3e}, q {:.3e}, k {:.3e}, v {:.3e}, kap {:.3e}",
+        rel(&gout.to_vec(), &want_o),
+        rel(&gdthq.to_vec(), &want_q),
+        rel(&gdthk.to_vec(), &want_k),
+        rel(&gdv.to_vec(), &want_v),
+        rel(&gdkap.to_vec(), &want_kap)
+    );
+    assert!(
+        rel(&gout.to_vec(), &want_o) < 3e-4,
+        "production forward parity"
+    );
+    assert!(
+        rel(&gdthq.to_vec(), &want_q) < 4e-3,
+        "production q gradient parity"
+    );
+    assert!(
+        rel(&gdthk.to_vec(), &want_k) < 4e-3,
+        "production k gradient parity"
+    );
+    assert!(
+        rel(&gdv.to_vec(), &want_v) < 4e-4,
+        "production v gradient parity"
+    );
+    assert!(
+        rel(&gdkap.to_vec(), &want_kap) < 4e-3,
+        "production kappa gradient parity"
+    );
+    let first = (
+        gout.to_vec(),
+        gdthq.to_vec(),
+        gdthk.to_vec(),
+        gdv.to_vec(),
+        gdkap.to_vec(),
+    );
+    let cmd = Cmd::new(c);
+    cmd.phase_delta_forward(&d, &w);
+    cmd.phase_delta_backward(&d, &w, &gr);
+    cmd.commit();
+    assert_eq!(
+        gout.to_vec(),
+        first.0,
+        "production forward is not deterministic"
+    );
+    assert_eq!(
+        gdthq.to_vec(),
+        first.1,
+        "production q gradient is not deterministic"
+    );
+    assert_eq!(
+        gdthk.to_vec(),
+        first.2,
+        "production k gradient is not deterministic"
+    );
+    assert_eq!(
+        gdv.to_vec(),
+        first.3,
+        "production v gradient is not deterministic"
+    );
+    assert_eq!(
+        gdkap.to_vec(),
+        first.4,
+        "production gate gradient is not deterministic"
+    );
+
+    // A nonzero entry state is supported by the non-reset forward dispatch.
+    // Compare that path against the one-token f64 continuation oracle.
+    let init = lcg_vec(306, d.nh * p2 * d.dv);
+    states.fill(0.0);
+    for bh in 0..d.b * d.nh {
+        let dst = &mut states.as_mut_slice()[bh * (nchunks + 1) * p2 * d.dv..];
+        dst[..p2 * d.dv]
+            .copy_from_slice(&init[(bh % d.nh) * p2 * d.dv..(bh % d.nh + 1) * p2 * d.dv]);
+    }
+    let mut want_nonzero = vec![0.0f64; rows * d.nh * d.dv];
+    for b in 0..d.b {
+        for h in 0..d.nh {
+            let mut s = init[h * p2 * d.dv..(h + 1) * p2 * d.dv]
+                .iter()
+                .map(|x| *x as f64)
+                .collect::<Vec<_>>();
+            for t in 0..d.t {
+                let row = b * d.t + t;
+                let q0 = row * d.nh * d.nph + h * d.nph;
+                let v0 = row * d.nh * d.dv + h * d.dv;
+                let o = phase_delta_step(
+                    &mut s,
+                    &to64(&thq[q0..q0 + d.nph]),
+                    &to64(&thk[q0..q0 + d.nph]),
+                    &to64(&v[v0..v0 + d.dv]),
+                    kappa[row * d.nh + h] as f64,
+                    &to64(&decay[h * p2..(h + 1) * p2]),
+                );
+                want_nonzero[row * d.nh * d.dv + h * d.dv..row * d.nh * d.dv + (h + 1) * d.dv]
+                    .copy_from_slice(&o);
+            }
+        }
+    }
+    let cmd = Cmd::new(c);
+    cmd.phase_delta_forward(&d, &w);
+    cmd.commit();
+    assert!(
+        rel(&gout.to_vec(), &want_nonzero) < 3e-4,
+        "nonzero entry-state forward parity"
+    );
+
+    // The reverse must also propagate a nonzero incoming state into boundary
+    // zero.  Compare Metal's dS0 against the independent f64 reverse oracle,
+    // not merely against the zero-state parameter gradients above.
+    let mut init_full = Vec::with_capacity(d.b * d.nh * p2 * d.dv);
+    for _ in 0..d.b {
+        init_full.extend_from_slice(&init);
+    }
+    let init64 = init_full.iter().map(|x| *x as f64).collect::<Vec<_>>();
+    let (_q0, _k0, _v0, _kap0, want_dstate0) = phase_delta_ref_bwd_state(
+        &d,
+        &to64(&thq),
+        &to64(&thk),
+        &to64(&v),
+        &to64(&kappa),
+        &to64(&decay),
+        &to64(&dout),
+        &init64,
+    );
+    let cmd = Cmd::new(c);
+    cmd.phase_delta_forward(&d, &w);
+    cmd.phase_delta_backward(&d, &w, &gr);
+    cmd.commit();
+    let got_dstate0 = gdst.to_vec();
+    let dstate0_len = d.p2() * d.dv;
+    let want_dstate0_first = &want_dstate0[..dstate0_len];
+    let got_dstate0_first = &got_dstate0[..dstate0_len];
+    let state_scale = want_dstate0_first
+        .iter()
+        .fold(0.0f64, |m, x| m.max(x.abs()))
+        .max(1e-9);
+    let state_rel = got_dstate0_first
+        .iter()
+        .zip(want_dstate0_first)
+        .map(|(a, b)| (*a as f64 - b).abs())
+        .fold(0.0, f64::max)
+        / state_scale;
+    eprintln!("phase delta nonzero dS0 rel: {state_rel:.3e}");
+    assert!(state_rel < 5e-4, "nonzero entry-state backward parity");
+}
+
+#[test]
+fn selected_mode_six_unselected_legacy_hk_bit_identity() {
+    use cortiq_embryo::metal::{HkGrads, HkWork, hk_pow_table};
+    use cortiq_embryo::ops::{HkDims, hk_decay_grid};
+    let Some(c) = ctx() else { return };
+    // A selected-layer model still allocates shared Phase-Delta scratch, but
+    // every unselected hybrid must take the literal legacy path.  Running the
+    // legacy kernels with and without those optional buffers is a direct
+    // output/gradient bit-identity witness for each of the six layers.
+    let d = HkDims {
+        b: 1,
+        t: 64,
+        nh: 2,
+        nph: 3,
+        dv: 4,
+    };
+    let rows = d.b * d.t;
+    let p2 = d.p2();
+    let thq = lcg_vec(1201, rows * d.nh * d.nph);
+    let thk = lcg_vec(1202, rows * d.nh * d.nph);
+    let v = lcg_vec(1203, rows * d.nh * d.dv);
+    let kap: Vec<f32> = lcg_vec(1204, rows * d.nh)
+        .iter()
+        .map(|x| 0.2 + 0.6 * (x + 1.0) / 2.0)
+        .collect();
+    let dout = lcg_vec(1205, rows * d.nh * d.dv);
+    let pow = GBuf::from_slice(
+        c,
+        &hk_pow_table(&hk_decay_grid(d.nh, d.nph, 4.0, 32.0), d.nh, d.nph),
+    );
+    let run = |with_optional_scratch: bool| {
+        let gthq = GBuf::from_slice(c, &thq);
+        let gthk = GBuf::from_slice(c, &thk);
+        let gv = GBuf::from_slice(c, &v);
+        let gkap = GBuf::from_slice(c, &kap);
+        let phq = GBuf::zeros(c, rows * d.nh * p2);
+        let phk = GBuf::zeros(c, rows * d.nh * p2);
+        let kv = GBuf::zeros(c, rows * d.nh * d.dv);
+        let out = GBuf::zeros(c, rows * d.nh * d.dv);
+        let states = GBuf::zeros(c, d.b * d.nh * (d.t / 64 + 1) * p2 * d.dv);
+        let chunk = GBuf::zeros(c, d.b * d.nh * 65 * p2 * d.dv);
+        let partial = GBuf::zeros(c, d.b * d.nh * d.dv.div_ceil(32) * d.t * (1 + 2 * d.nph));
+        let w = HkWork {
+            thq: &gthq,
+            thk: &gthk,
+            v: &gv,
+            kappa: &gkap,
+            pow: &pow,
+            pow_off: 0,
+            phq: &phq,
+            phk: &phk,
+            kv: &kv,
+            states: &states,
+            out: &out,
+            phase_chunk: with_optional_scratch.then_some(&chunk),
+            phase_partial: with_optional_scratch.then_some(&partial),
+        };
+        let cmd = Cmd::new(c);
+        cmd.hk_forward(&d, &w);
+        cmd.commit();
+        let gdout = GBuf::from_slice(c, &dout);
+        let gdstates = GBuf::zeros(c, states.len);
+        let gdkv = GBuf::zeros(c, rows * d.nh * d.dv);
+        let gdphq = GBuf::zeros(c, rows * d.nh * p2);
+        let gdphk = GBuf::zeros(c, rows * d.nh * p2);
+        let gdthq = GBuf::zeros(c, rows * d.nh * d.nph);
+        let gdthk = GBuf::zeros(c, rows * d.nh * d.nph);
+        let gdv = GBuf::zeros(c, rows * d.nh * d.dv);
+        let gdkap = GBuf::zeros(c, rows * d.nh);
+        let gr = HkGrads {
+            dout: &gdout,
+            dstates: &gdstates,
+            dkv: &gdkv,
+            dphq: &gdphq,
+            dphk: &gdphk,
+            dthq: &gdthq,
+            dthk: &gdthk,
+            dv: &gdv,
+            dkappa: &gdkap,
+        };
+        let cmd = Cmd::new(c);
+        cmd.hk_backward(&d, &w, &gr, 0.0);
+        cmd.commit();
+        (
+            out.to_vec(),
+            states.to_vec(),
+            phq.to_vec(),
+            phk.to_vec(),
+            kv.to_vec(),
+            gdthq.to_vec(),
+            gdthk.to_vec(),
+            gdv.to_vec(),
+            gdkap.to_vec(),
+        )
+    };
+    let legacy = run(false);
+    let selected_mode_legacy = run(true);
+    for layer in [0usize, 1, 2, 4, 5, 6] {
+        assert_eq!(
+            legacy, selected_mode_legacy,
+            "legacy witness drift at layer {layer}"
+        );
+    }
+}
+
+#[test]
+fn phase_delta_b8_t1024_kernel_timing_smoke() {
+    use cortiq_embryo::metal::{HkGrads, HkWork, hk_pow_table};
+    use cortiq_embryo::ops::{HkDims, hk_decay_grid};
+    let Some(c) = ctx() else { return };
+    // Direct operator smoke only (no model birth/training): production
+    // geometry, one Phase-Delta forward+backward command per repetition.
+    let d = HkDims {
+        b: 8,
+        t: 1024,
+        nh: 8,
+        nph: 32,
+        dv: 128,
+    };
+    let rows = d.b * d.t;
+    let p2 = d.p2();
+    let thq = lcg_vec(901, rows * d.nh * d.nph);
+    let thk = lcg_vec(902, rows * d.nh * d.nph);
+    let v = lcg_vec(903, rows * d.nh * d.dv);
+    let kap: Vec<f32> = lcg_vec(904, rows * d.nh)
+        .iter()
+        .map(|x| 0.25 + 0.5 * (x + 1.0) / 2.0)
+        .collect();
+    let dout = lcg_vec(905, rows * d.nh * d.dv);
+    let decay = hk_decay_grid(d.nh, d.nph, 8.0, 2048.0);
+    let z = |n: usize| GBuf::zeros(c, n);
+    let (gthq, gthk, gv, gkap) = (
+        GBuf::from_slice(c, &thq),
+        GBuf::from_slice(c, &thk),
+        GBuf::from_slice(c, &v),
+        GBuf::from_slice(c, &kap),
+    );
+    let (gphq, gphk, gkv, gout) = (
+        z(rows * d.nh * p2),
+        z(rows * d.nh * p2),
+        z(rows * d.nh * d.dv),
+        z(rows * d.nh * d.dv),
+    );
+    let nchunks = d.t.div_ceil(64);
+    let states = z(d.b * d.nh * (nchunks + 1) * p2 * d.dv);
+    let gchunk = z(d.b * d.nh * 65 * p2 * d.dv);
+    let gpartial = z(d.b * d.nh * d.dv.div_ceil(32) * d.t * (1 + 2 * d.nph));
+    let gpow = GBuf::from_slice(c, &hk_pow_table(&decay, d.nh, d.nph));
+    let w = HkWork {
+        thq: &gthq,
+        thk: &gthk,
+        v: &gv,
+        kappa: &gkap,
+        pow: &gpow,
+        pow_off: 0,
+        phq: &gphq,
+        phk: &gphk,
+        kv: &gkv,
+        states: &states,
+        out: &gout,
+        phase_chunk: Some(&gchunk),
+        phase_partial: Some(&gpartial),
+    };
+    let (gdst, gdkv, gdphq, gdphk) = (
+        z(states.len),
+        z(rows * d.nh * d.dv),
+        z(rows * d.nh * p2),
+        z(rows * d.nh * p2),
+    );
+    let (gdthq, gdthk, gdv, gdkap) = (
+        z(rows * d.nh * d.nph),
+        z(rows * d.nh * d.nph),
+        z(rows * d.nh * d.dv),
+        z(rows * d.nh),
+    );
+    let gdout = GBuf::from_slice(c, &dout);
+    let gr = HkGrads {
+        dout: &gdout,
+        dstates: &gdst,
+        dkv: &gdkv,
+        dphq: &gdphq,
+        dphk: &gdphk,
+        dthq: &gdthq,
+        dthk: &gdthk,
+        dv: &gdv,
+        dkappa: &gdkap,
+    };
+    let mut timings = Vec::new();
+    let mut forward_timings = Vec::new();
+    let mut backward_timings = Vec::new();
+    let mut fold_timings = Vec::new();
+    let mut combined_timings = Vec::new();
+    // One warmup plus three measured direct B8/T1024 samples.
+    for _ in 0..4 {
+        let cmd = Cmd::new(c);
+        cmd.phase_delta_forward_reset(&d, &w);
+        let forward = cmd.commit();
+        forward_timings.push(forward);
+        let cmd = Cmd::new(c);
+        cmd.phase_delta_backward_blocks(&d, &w, &gr);
+        let backward = cmd.commit();
+        backward_timings.push(backward);
+        let cmd = Cmd::new(c);
+        cmd.phase_delta_fold(&d, &w, &gr);
+        let fold = cmd.commit();
+        fold_timings.push(fold);
+        timings.push(forward + backward + fold);
+        let cmd = Cmd::new(c);
+        cmd.phase_delta_forward_reset(&d, &w);
+        cmd.phase_delta_backward(&d, &w, &gr);
+        combined_timings.push(cmd.commit());
+    }
+    assert!(gout.to_vec().iter().all(|x| x.is_finite()));
+    eprintln!(
+        "phase_delta B=8 T=1024 dispatch_groups={} lanes={} scratch={} bytes partial_scratch={} bytes timings_ms={timings:?} combined_ms={combined_timings:?} forward_ms={forward_timings:?} backward_blocks_ms={backward_timings:?} fold_ms={fold_timings:?}",
+        d.b * d.nh * d.dv.div_ceil(32),
+        d.dv,
+        gchunk.len * std::mem::size_of::<f32>(),
+        gpartial.len * std::mem::size_of::<f32>(),
+    );
+}
+
+#[test]
+fn phase_delta_metal_boundary_lengths_parity() {
+    use cortiq_embryo::metal::{HkGrads, HkWork, hk_pow_table};
+    use cortiq_embryo::ops::{HkDims, hk_decay_grid, phase_delta_ref_bwd, phase_delta_ref_fwd};
+    let Some(c) = ctx() else { return };
+    // Exact tail/boundary lengths that historically expose chunk carry bugs.
+    for &t in &[1usize, 63, 64, 65, 129] {
+        let d = HkDims {
+            b: 1,
+            t,
+            nh: 2,
+            nph: 3,
+            dv: 4,
+        };
+        let rows = d.b * d.t;
+        let p2 = d.p2();
+        let thq = lcg_vec(920 + t as u64, rows * d.nh * d.nph);
+        let thk = lcg_vec(930 + t as u64, rows * d.nh * d.nph);
+        let v = lcg_vec(940 + t as u64, rows * d.nh * d.dv);
+        let kap: Vec<f32> = lcg_vec(950 + t as u64, rows * d.nh)
+            .iter()
+            .map(|x| 0.2 + 0.6 * (x + 1.0) / 2.0)
+            .collect();
+        let dout = lcg_vec(960 + t as u64, rows * d.nh * d.dv);
+        let decay = hk_decay_grid(d.nh, d.nph, 8.0, 256.0);
+        let to64 = |x: &[f32]| x.iter().map(|v| *v as f64).collect::<Vec<_>>();
+        let want_o = phase_delta_ref_fwd(
+            &d,
+            &to64(&thq),
+            &to64(&thk),
+            &to64(&v),
+            &to64(&kap),
+            &to64(&decay),
+        );
+        let (want_q, want_k, want_v, want_kap) = phase_delta_ref_bwd(
+            &d,
+            &to64(&thq),
+            &to64(&thk),
+            &to64(&v),
+            &to64(&kap),
+            &to64(&decay),
+            &to64(&dout),
+        );
+        let z = |n: usize| GBuf::zeros(c, n);
+        let (gthq, gthk, gv, gkap) = (
+            GBuf::from_slice(c, &thq),
+            GBuf::from_slice(c, &thk),
+            GBuf::from_slice(c, &v),
+            GBuf::from_slice(c, &kap),
+        );
+        let (gphq, gphk, gkv, gout) = (
+            z(rows * d.nh * p2),
+            z(rows * d.nh * p2),
+            z(rows * d.nh * d.dv),
+            z(rows * d.nh * d.dv),
+        );
+        let nchunks = d.t.div_ceil(64);
+        let states = z(d.b * d.nh * (nchunks + 1) * p2 * d.dv);
+        let gchunk = z(d.b * d.nh * 65 * p2 * d.dv);
+        let gpartial = z(d.b * d.nh * d.dv.div_ceil(32) * d.t * (1 + 2 * d.nph));
+        let gpow = GBuf::from_slice(c, &hk_pow_table(&decay, d.nh, d.nph));
+        let w = HkWork {
+            thq: &gthq,
+            thk: &gthk,
+            v: &gv,
+            kappa: &gkap,
+            pow: &gpow,
+            pow_off: 0,
+            phq: &gphq,
+            phk: &gphk,
+            kv: &gkv,
+            states: &states,
+            out: &gout,
+            phase_chunk: Some(&gchunk),
+            phase_partial: Some(&gpartial),
+        };
+        let (gdst, gdkv, gdphq, gdphk) = (
+            z(states.len),
+            z(rows * d.nh * d.dv),
+            z(rows * d.nh * p2),
+            z(rows * d.nh * p2),
+        );
+        let (gdthq, gdthk, gdv, gdkap) = (
+            z(rows * d.nh * d.nph),
+            z(rows * d.nh * d.nph),
+            z(rows * d.nh * d.dv),
+            z(rows * d.nh),
+        );
+        let gdout = GBuf::from_slice(c, &dout);
+        let gr = HkGrads {
+            dout: &gdout,
+            dstates: &gdst,
+            dkv: &gdkv,
+            dphq: &gdphq,
+            dphk: &gdphk,
+            dthq: &gdthq,
+            dthk: &gdthk,
+            dv: &gdv,
+            dkappa: &gdkap,
+        };
+        let cmd = Cmd::new(c);
+        cmd.phase_delta_forward(&d, &w);
+        cmd.phase_delta_backward(&d, &w, &gr);
+        cmd.commit();
+        let rel = |got: &[f32], want: &[f64]| -> f64 {
+            let scale = want.iter().fold(0.0f64, |m, x| m.max(x.abs())).max(1e-9);
+            got.iter()
+                .zip(want)
+                .map(|(a, b)| (*a as f64 - b).abs())
+                .fold(0.0, f64::max)
+                / scale
+        };
+        assert!(rel(&gout.to_vec(), &want_o) < 5e-4, "T={t} forward");
+        assert!(rel(&gdthq.to_vec(), &want_q) < 5e-3, "T={t} q");
+        assert!(rel(&gdthk.to_vec(), &want_k) < 5e-3, "T={t} k");
+        assert!(rel(&gdv.to_vec(), &want_v) < 5e-4, "T={t} v");
+        assert!(rel(&gdkap.to_vec(), &want_kap) < 5e-3, "T={t} gate");
+        eprintln!("phase delta boundary T={t}: parity ok; chunks={nchunks}");
     }
 }
 
@@ -575,6 +1347,8 @@ fn hybrid_k_gemm_formulation_matches_oracle_and_simt() {
             kv: &gkv,
             states: &gstates,
             out: &gout,
+            phase_chunk: None,
+            phase_partial: None,
         };
         let gdout = GBuf::from_slice(c, &dout);
         let (gdst, gdkv, gdphq, gdphk) = (
