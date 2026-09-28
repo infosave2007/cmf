@@ -20,6 +20,13 @@ use anyhow::{Result, ensure};
 pub const LANES: usize = 8;
 type Lane = [f32; LANES];
 
+#[cfg(target_os = "macos")]
+#[path = "packed_metal.rs"]
+pub(crate) mod metal_backend;
+#[cfg(feature = "vulkan")]
+#[path = "packed_vulkan.rs"]
+pub(crate) mod vulkan_backend;
+
 struct Block {
     /// `[dim]` lanes of the means.
     mean: Vec<Lane>,
@@ -33,6 +40,10 @@ struct Block {
 /// The topologies of a skill, interleaved for scoring. Immutable after
 /// construction (`Sync`): concurrent callers pass their own scratch residual.
 pub struct Packed {
+    #[cfg(target_os = "macos")]
+    pub(crate) metal: Option<parking_lot::Mutex<metal_backend::MetalScorer>>,
+    #[cfg(feature = "vulkan")]
+    pub(crate) vulkan: Option<parking_lot::Mutex<vulkan_backend::VulkanScorer>>,
     blocks: Vec<Block>,
     dim: usize,
     tasks: usize,
@@ -75,11 +86,70 @@ impl Packed {
             });
         }
         Ok(Self {
+            #[cfg(target_os = "macos")]
+            metal: None,
+            #[cfg(feature = "vulkan")]
+            vulkan: None,
             blocks,
             dim,
             tasks: tasks.len(),
             ranks: tasks.iter().map(|t| t.rank()).collect(),
         })
+    }
+
+    /// Opt-in FP32 Metal reductions; CPU remains bit-exact with the reference.
+    #[allow(unused_mut)]
+    pub fn with_device(mut self, device: crate::bert::EncoderDevice) -> Result<Self> {
+        #[cfg(target_os = "macos")]
+        {
+            self.metal = match device {
+                crate::bert::EncoderDevice::Cpu | crate::bert::EncoderDevice::Vulkan => None,
+                crate::bert::EncoderDevice::Metal if self.tasks > 0 => Some(
+                    parking_lot::Mutex::new(metal_backend::MetalScorer::new(&self)?),
+                ),
+                crate::bert::EncoderDevice::Metal => None,
+            };
+        }
+        #[cfg(not(target_os = "macos"))]
+        ensure!(
+            device != crate::bert::EncoderDevice::Metal,
+            "decision Metal requires macOS on Apple Silicon"
+        );
+        #[cfg(feature = "vulkan")]
+        {
+            self.vulkan = if device == crate::bert::EncoderDevice::Vulkan && self.tasks > 0 {
+                Some(parking_lot::Mutex::new(vulkan_backend::VulkanScorer::new(
+                    &self,
+                )?))
+            } else {
+                None
+            };
+        }
+        #[cfg(not(feature = "vulkan"))]
+        ensure!(
+            device != crate::bert::EncoderDevice::Vulkan,
+            "rebuild cortiq-decision with --features vulkan"
+        );
+        Ok(self)
+    }
+    /// Actual completed GPU commands, used by acceptance benchmarks.
+    pub fn metal_submissions(&self) -> u64 {
+        #[cfg(target_os = "macos")]
+        if let Some(m) = &self.metal {
+            return m.lock().submissions();
+        }
+        0
+    }
+
+    pub fn vulkan_submissions(&self) -> u64 {
+        #[cfg(feature = "vulkan")]
+        if let Some(v) = &self.vulkan {
+            return v.lock().submissions();
+        }
+        0
+    }
+    pub fn gpu_submissions(&self) -> u64 {
+        self.metal_submissions() + self.vulkan_submissions()
     }
 
     /// Number of topologies (the length of every error vector).
@@ -99,6 +169,16 @@ impl Packed {
 
     /// A scratch residual for [`Packed::errors_with`].
     pub fn scratch(&self) -> Vec<[f32; LANES]> {
+        // GPU residuals are resident on the device; do not zero a CPU buffer
+        // on every standalone scoring call only to discard it immediately.
+        #[cfg(target_os = "macos")]
+        if self.metal.is_some() {
+            return Vec::new();
+        }
+        #[cfg(feature = "vulkan")]
+        if self.vulkan.is_some() {
+            return Vec::new();
+        }
         vec![[0.0; LANES]; self.dim]
     }
 
@@ -132,6 +212,14 @@ impl Packed {
             return Ok(());
         }
         check_input(x, self.dim)?;
+        #[cfg(target_os = "macos")]
+        if let Some(metal) = &self.metal {
+            return metal.lock().errors(x, out);
+        }
+        #[cfg(feature = "vulkan")]
+        if let Some(v) = &self.vulkan {
+            return v.lock().errors(x, out);
+        }
         scratch.resize(self.dim, [0.0; LANES]);
         let r = &mut scratch[..self.dim];
         for (bi, b) in self.blocks.iter().enumerate() {

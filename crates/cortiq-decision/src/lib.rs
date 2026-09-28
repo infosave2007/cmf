@@ -8,9 +8,12 @@
 //! threshold and confidence threshold. The generative pipeline refuses
 //! these files; they are served by `cortiq decide` and `cortiq serve`.
 //!
-//! The encoder runs on the host f32 GEMM
-//! (`cortiq_engine::fcd_ops::gemm_nt_host`); no GPU backend is initialised
-//! on behalf of anything in this crate.
+//! CPU is the unchanged, bit-exact default. Opt in with
+//! `CORTIQ_DECISION_DEVICE=metal` on Apple Silicon or `vulkan` (feature `vulkan`):
+//! resident FP32 encoder, pooling and sequential reconstruction run on the GPU.
+//! Tokenization, hashing and gates stay on the CPU;
+//! the same encoder golden tolerance applies, and GPU errors never silently
+//! fall back to CPU.
 //!
 //! Modules, in dependency order:
 //! - numerics: [`hashfeat`], [`resonance`], [`packed`], [`eigen`], [`fit`],
@@ -77,3 +80,6 @@ pub mod learn;
 pub mod oracle;
 pub mod oracle_setup;
 pub mod pii;
+
+#[cfg(feature = "vulkan")]
+mod gpu_vulkan;

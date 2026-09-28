@@ -11,6 +11,19 @@ framework runtime.
 [![docs.rs](https://img.shields.io/docsrs/cortiq-core)](https://docs.rs/cortiq-core)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
+
+## Decisions on Metal and Vulkan
+
+**Cortiq 0.8.0:** one CMF file with trainable skills, local decisions by
+reconstruction error — no token generation. CPU by default; select a GPU with
+`CORTIQ_DECISION_DEVICE=metal` or `vulkan`. The standard crates.io installation
+includes GPU support (Rust 1.88+).
+
+![Full local CPU / GPU path; each comparison uses the same host](docs/decision/hf/figures/gpu.svg)
+
+[Quick start, custom skills and API](docs/decision/hf/README.md) ·
+[Measurements and limits](docs/decision/hf/GPU.md)
+
 ## Status
 
 CMF v2 is the current on-disk format. Readers validate the envelope, section
@@ -26,7 +39,7 @@ see the focused guides for the test setup behind each claim.
 Install the CLI and convert a small public checkpoint:
 
 ```sh
-cargo install cortiq-cli
+cargo install cortiq-cli --locked
 cortiq convert --model Qwen/Qwen3-0.6B --quant q8 --output qwen.cmf
 cortiq run qwen.cmf --prompt "What is the capital of France?" --greedy --no-think
 ```

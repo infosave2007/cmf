@@ -1,0 +1,146 @@
+{
+  "schema": "cortiq-model-card-comparison/1",
+  "model_file_sha256": "ed9b8ec2bbfe9e9fd30f14a5eaf82314f38bc7e7510a39772baa2de3801d79b1",
+  "model_bytes": 304520292,
+  "runtime": "cortiq 0.7.8",
+  "oracle_in_hybrid_benchmark": "deepseek/deepseek-v4.1-flash",
+  "benchmarks": [
+    {
+      "id": "banking77",
+      "name": "BANKING77",
+      "n": 3080,
+      "labels": 77,
+      "local_correct": 2875,
+      "local_accuracy_pct": 93.34,
+      "jev_correct": 2636,
+      "jev_accuracy_pct": 85.58,
+      "local_wilson95_pct": [
+        92.41,
+        94.17
+      ],
+      "jev_wilson95_pct": [
+        84.3,
+        86.78
+      ],
+      "mcnemar_p": 9.72e-33,
+      "accepted": 2791,
+      "accepted_correct": 2714,
+      "accepted_accuracy_pct": 97.24,
+      "coverage_pct": 90.62,
+      "local_p50_ms": 3.92,
+      "local_p95_ms": 5.27,
+      "cortiq_https_p50_ms": 78.4,
+      "cortiq_https_p95_ms": 141.6,
+      "jev_http_p50_ms": 348.33,
+      "jev_http_p95_ms": 426.03,
+      "jev_latency_n": 3080,
+      "jev_latency_concurrency": 4,
+      "hybrid_correct": 2893,
+      "hybrid_accuracy_pct": 93.93,
+      "hybrid_oracle_calls": 282,
+      "hybrid_api_usd_per_million": 3.01,
+      "jev_api_usd_per_million": 183.69
+    },
+    {
+      "id": "clinc150",
+      "name": "CLINC150",
+      "n": 4500,
+      "labels": 150,
+      "local_correct": 4328,
+      "local_accuracy_pct": 96.18,
+      "jev_correct": 4354,
+      "jev_accuracy_pct": 96.76,
+      "local_wilson95_pct": [
+        95.58,
+        96.7
+      ],
+      "jev_wilson95_pct": [
+        96.2,
+        97.23
+      ],
+      "mcnemar_p": 0.099,
+      "accepted": 4145,
+      "accepted_correct": 4091,
+      "accepted_accuracy_pct": 98.7,
+      "coverage_pct": 92.11,
+      "local_p50_ms": 3.79,
+      "local_p95_ms": 4.57,
+      "cortiq_https_p50_ms": 78.5,
+      "cortiq_https_p95_ms": 134.6,
+      "jev_http_p50_ms": 391.51,
+      "jev_http_p95_ms": 528.49,
+      "jev_latency_n": 200,
+      "jev_latency_concurrency": 1,
+      "hybrid_correct": 4386,
+      "hybrid_accuracy_pct": 97.47,
+      "hybrid_oracle_calls": 351,
+      "hybrid_api_usd_per_million": 3.53,
+      "jev_api_usd_per_million": 271.61
+    },
+    {
+      "id": "massive",
+      "name": "MASSIVE",
+      "n": 2974,
+      "labels": 60,
+      "local_correct": 2562,
+      "local_accuracy_pct": 86.15,
+      "jev_correct": 2551,
+      "jev_accuracy_pct": 85.78,
+      "local_wilson95_pct": [
+        84.86,
+        87.34
+      ],
+      "jev_wilson95_pct": [
+        84.48,
+        86.99
+      ],
+      "mcnemar_p": 0.607,
+      "accepted": 1615,
+      "accepted_correct": 1581,
+      "accepted_accuracy_pct": 97.89,
+      "coverage_pct": 54.3,
+      "local_p50_ms": 3.0,
+      "local_p95_ms": 3.58,
+      "cortiq_https_p50_ms": 70.4,
+      "cortiq_https_p95_ms": 117.9,
+      "jev_http_p50_ms": 346.37,
+      "jev_http_p95_ms": 492.93,
+      "jev_latency_n": 200,
+      "jev_latency_concurrency": 1,
+      "hybrid_correct": 2617,
+      "hybrid_accuracy_pct": 88.0,
+      "hybrid_oracle_calls": 1335,
+      "hybrid_api_usd_per_million": 8.48,
+      "jev_api_usd_per_million": 110.86
+    }
+  ],
+  "notes": [
+    "Local accuracy is top-1 over every test row before abstention; gate accuracy and coverage are separate.",
+    "Local CPU latency: full text to decision, Apple M4, one CPU thread, 50 warmups, all test rows.",
+    "Cortiq HTTPS latency: same client Mac to deployed server, sequential, no oracle, all test rows.",
+    "Jev latency includes network; BANKING77 uses four workers, CLINC150 and MASSIVE serial samples of 200.",
+    "Different hardware and concurrency: this is not a hardware-normalized throughput comparison.",
+    "Hybrid costs: served cache/learning run with stored DeepSeek answers replayed and 24 live MASSIVE calls; not a timing run.",
+    "Per-million fees extrapolate recorded costs, excluding hardware, electricity and operations.",
+    "Reused public benchmarks, unequal supervision: CMF train+dev vs two examples per label for Jev.",
+    "Current model uses BAAI bge-small-en-v1.5 compressed by Cortiq NVG, not the separate Embryo experiment."
+  ],
+  "sources": [
+    {
+      "path_in_project": "artifacts/decision-v4-20260926/gates-release.json",
+      "sha256": "47d3039559e0f87dee0c6dae9adc3bbd63acc52b05d4859f2de82cf7a0a9ba03"
+    },
+    {
+      "path_in_project": "reports/decision-v4-20260926/live/live.json",
+      "sha256": "c8769af100e3138291675ab3eed20caa3ecaa780b6b81f4cecbde96dc29f87f5"
+    },
+    {
+      "path_in_project": "reports/decision-v4-20260926/article/stored.json",
+      "sha256": "4d6918a2d98f16c8b4cdda7759fef98e6343f091fa7723e8ea938d9fb696db47"
+    },
+    {
+      "path_in_project": "reports/decision-v4-20260926/eval/stream-final.json",
+      "sha256": "0bb19de37cee315a5a5ad4563abcf2944a80c49ef05984554a4fc31012702f50"
+    }
+  ]
+}

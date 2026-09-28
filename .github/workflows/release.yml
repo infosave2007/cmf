@@ -90,13 +90,13 @@ jobs:
         # 1.9 tok/s because Linux/Windows builds carried no GPU backend
         # at all. macOS keeps native Metal as the default; wgpu there
         # remains opt-in via CMF_GPU=wgpu.
-        run: cargo build --release -p cortiq-cli --features gpu --target ${{ matrix.target }}
+        run: cargo build --locked --release -p cortiq-cli --features gpu --target ${{ matrix.target }}
       - name: Build FFI library (android)
         if: matrix.target == 'aarch64-linux-android'
         # libcortiq_ffi.so for APK embedding (see crates/cortiq-ffi).
         # --features gpu: Vulkan via wgpu so Mali/Adreno are reachable
         # from the app; the probe keeps CPU where the GPU loses.
-        run: cargo build --release -p cortiq-ffi --features gpu --target ${{ matrix.target }}
+        run: cargo build --locked --release -p cortiq-ffi --features gpu --target ${{ matrix.target }}
       - name: Verify 16 KB page alignment (android)
         if: matrix.target == 'aarch64-linux-android'
         run: |
@@ -208,7 +208,7 @@ jobs:
           # Android 15+ (16 KB kernel pages) rejects 4 KB-aligned .so.
           echo "RUSTFLAGS=-C link-arg=-Wl,-z,max-page-size=16384" >> "$GITHUB_ENV"
       - name: Build FFI library
-        run: cargo build --release -p cortiq-ffi ${{ matrix.features && format('--features {0}', matrix.features) || '' }} --target ${{ matrix.target }}
+        run: cargo build --locked --release -p cortiq-ffi ${{ matrix.features && format('--features {0}', matrix.features) || '' }} --target ${{ matrix.target }}
       - name: Verify 16 KB page alignment (android)
         if: contains(matrix.target, 'android')
         run: |

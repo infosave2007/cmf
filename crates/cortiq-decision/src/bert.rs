@@ -15,12 +15,13 @@
 //! 5. `v / (‖v‖ + 1e-12)`, then `v · (1/‖v‖)` when ‖v‖ > 1e-12 (the router's
 //!    second L2), ‖v‖ = sqrt of the sequential f32 sum of squares.
 //!
-//! Every product with a weight matrix (and the two attention products) is
+//! In the default CPU backend, every weight/attention product is
 //! [`gemm_nt_host`] with no pool: the host f32 GEMM (Accelerate on macOS,
 //! the engine's dot kernels elsewhere). It never initialises, probes or
 //! dispatches to a GPU backend — unlike `gemm_nt`, which sends
 //! `n·k·m ≥ 2^22` to wgpu (tf32-class on NVIDIA), i.e. every text of 29 or
-//! more tokens here. LayerNorm accumulates in f64 and writes f32. GELU is
+//! more tokens here. The separate opt-in Metal/Vulkan graphs uses resident FP32
+//! buffers, not that per-operation dispatch. LayerNorm accumulates in f64 and writes f32. GELU is
 //! `((x·(erf(x/√2) + 1))·0.5` in f32 with the Numerical Recipes `erf`
 //! (in f64) copied from `cortiq-engine/src/qwen3vis.rs`.
 //!
@@ -46,6 +47,32 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+#[cfg(target_os = "macos")]
+#[path = "bert_metal.rs"]
+mod metal_backend;
+#[cfg(feature = "vulkan")]
+#[path = "bert_vulkan.rs"]
+mod vulkan_backend;
+
+/// Explicit opt-in: model bytes, golden tolerance and CPU default are unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EncoderDevice {
+    Cpu,
+    Metal,
+    Vulkan,
+}
+impl EncoderDevice {
+    pub fn from_env() -> Result<Self> {
+        match std::env::var("CORTIQ_DECISION_DEVICE") {
+            Err(std::env::VarError::NotPresent) => Ok(Self::Cpu),
+            Ok(v) if v == "cpu" => Ok(Self::Cpu),
+            Ok(v) if v == "metal" => Ok(Self::Metal),
+            Ok(v) if v == "vulkan" => Ok(Self::Vulkan),
+            _ => bail!("CORTIQ_DECISION_DEVICE must be cpu, metal or vulkan"),
+        }
+    }
+}
 
 /// Largest |Δ| between the stored golden φ_P and this build's that a decision
 /// file may show before it is refused. The spec gives no tolerance; the golden
@@ -560,11 +587,18 @@ pub struct GoldenReport {
     pub max_abs: f32,
 }
 
+/// Embedding and ordered per-skill reconstruction errors.
+pub(crate) type EmbeddingAndErrors = (Vec<f32>, Vec<Vec<f32>>);
+
 /// Tokenizer + BERT: text → φ_P.
 #[derive(Clone, Debug)]
 pub struct Encoder {
     tokenizer: WordPiece,
     model: BertModel,
+    #[cfg(target_os = "macos")]
+    metal: Option<Arc<parking_lot::Mutex<metal_backend::MetalEncoder>>>,
+    #[cfg(feature = "vulkan")]
+    vulkan: Option<Arc<parking_lot::Mutex<vulkan_backend::VulkanEncoder>>>,
     /// The record's `tables` differs from this build's (a warning).
     warnings: Vec<String>,
 }
@@ -586,6 +620,10 @@ impl Encoder {
         Ok(Self {
             tokenizer,
             model,
+            #[cfg(target_os = "macos")]
+            metal: None,
+            #[cfg(feature = "vulkan")]
+            vulkan: None,
             warnings: Vec::new(),
         })
     }
@@ -608,7 +646,73 @@ impl Encoder {
                 unicode_tables::SOURCE
             ));
         }
-        Ok(enc)
+        enc.with_device(EncoderDevice::from_env()?)
+    }
+
+    /// Select an execution device; GPU initialization errors never fall back to CPU.
+    #[allow(unused_mut)]
+    pub fn with_device(mut self, device: EncoderDevice) -> Result<Self> {
+        #[cfg(target_os = "macos")]
+        {
+            self.metal = match device {
+                EncoderDevice::Cpu | EncoderDevice::Vulkan => None,
+                EncoderDevice::Metal => Some(Arc::new(parking_lot::Mutex::new(
+                    metal_backend::MetalEncoder::new(&self.model)?,
+                ))),
+            };
+        }
+        #[cfg(not(target_os = "macos"))]
+        ensure!(
+            device != EncoderDevice::Metal,
+            "decision Metal requires macOS on Apple Silicon"
+        );
+        #[cfg(feature = "vulkan")]
+        {
+            self.vulkan = match device {
+                EncoderDevice::Vulkan => Some(Arc::new(parking_lot::Mutex::new(
+                    vulkan_backend::VulkanEncoder::new(&self.model)?,
+                ))),
+                _ => None,
+            };
+        }
+        #[cfg(not(feature = "vulkan"))]
+        ensure!(
+            device != EncoderDevice::Vulkan,
+            "rebuild cortiq-decision with --features vulkan"
+        );
+        Ok(self)
+    }
+
+    pub fn device_name(&self) -> String {
+        #[cfg(target_os = "macos")]
+        if let Some(metal) = &self.metal {
+            return format!("metal: {}", metal.lock().device_name());
+        }
+        #[cfg(feature = "vulkan")]
+        if let Some(v) = &self.vulkan {
+            return format!("vulkan: {}", v.lock().device_name());
+        }
+        "cpu".into()
+    }
+
+    /// Completed GPU command buffers, not an inference from environment flags.
+    pub fn metal_submissions(&self) -> u64 {
+        #[cfg(target_os = "macos")]
+        if let Some(metal) = &self.metal {
+            return metal.lock().submissions();
+        }
+        0
+    }
+
+    pub fn vulkan_submissions(&self) -> u64 {
+        #[cfg(feature = "vulkan")]
+        if let Some(v) = &self.vulkan {
+            return v.lock().submissions();
+        }
+        0
+    }
+    pub fn gpu_submissions(&self) -> u64 {
+        self.metal_submissions() + self.vulkan_submissions()
     }
 
     pub fn tokenizer(&self) -> &WordPiece {
@@ -635,7 +739,45 @@ impl Encoder {
 
     /// φ_P of token ids.
     pub fn embed_ids(&self, ids: &[u32]) -> Vec<f32> {
-        self.model.embed_ids(ids)
+        self.try_embed_ids(ids).expect("decision encoder failed")
+    }
+
+    /// Fallible device execution, used by the request and golden-check paths.
+    pub fn try_embed_ids(&self, ids: &[u32]) -> Result<Vec<f32>> {
+        #[cfg(target_os = "macos")]
+        if let Some(metal) = &self.metal {
+            return metal.lock().embed_ids(ids);
+        }
+        #[cfg(feature = "vulkan")]
+        if let Some(v) = &self.vulkan {
+            return v.lock().embed_ids(ids);
+        }
+        Ok(self.model.embed_ids(ids))
+    }
+
+    /// Joint device path. None means explicitly mixed CPU/GPU backends, not
+    /// a swallowed GPU failure. Empty skills require no reconstruction dispatch.
+    pub(crate) fn try_embed_and_score(
+        &self,
+        ids: &[u32],
+        hash: &[f32],
+        packed: &[&crate::packed::Packed],
+    ) -> Result<Option<EmbeddingAndErrors>> {
+        #[cfg(target_os = "macos")]
+        if let Some(metal) = &self.metal {
+            if packed.iter().all(|p| p.tasks() == 0 || p.metal.is_some()) {
+                return metal.lock().embed_and_score(ids, hash, packed).map(Some);
+            }
+        }
+        #[cfg(feature = "vulkan")]
+        if let Some(v) = &self.vulkan {
+            if packed.iter().all(|p| p.tasks() == 0 || p.vulkan.is_some()) {
+                return v.lock().embed_and_score(ids, hash, packed).map(Some);
+            }
+        }
+        #[cfg(all(not(target_os = "macos"), not(feature = "vulkan")))]
+        let _ = (ids, hash, packed);
+        Ok(None)
     }
 
     /// φ_P of a text.
@@ -668,7 +810,7 @@ impl Encoder {
             max_abs: 0.0,
         };
         for (i, t) in texts.iter().enumerate() {
-            let v = self.encode(t.as_ref());
+            let v = self.try_embed_ids(&self.tokenize(t.as_ref()))?;
             let s = &stored[i * dim..(i + 1) * dim];
             if v.iter().zip(s).all(|(a, b)| a.to_bits() == b.to_bits()) {
                 rep.bit_exact_rows += 1;

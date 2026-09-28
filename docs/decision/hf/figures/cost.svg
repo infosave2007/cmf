@@ -1,0 +1,227 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"
+  "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg xmlns:xlink="http://www.w3.org/1999/xlink" width="864pt" height="378pt" viewBox="0 0 864 378" xmlns="http://www.w3.org/2000/svg" version="1.1">
+ <metadata>
+  <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+   <cc:Work>
+    <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage"/>
+    <dc:date>2026-09-27T21:33:33.055455</dc:date>
+    <dc:format>image/svg+xml</dc:format>
+    <dc:creator>
+     <cc:Agent>
+      <dc:title>Matplotlib v3.9.4, https://matplotlib.org/</dc:title>
+     </cc:Agent>
+    </dc:creator>
+   </cc:Work>
+  </rdf:RDF>
+ </metadata>
+ <defs>
+  <style type="text/css">*{stroke-linejoin: round; stroke-linecap: butt}</style>
+ </defs>
+ <g id="figure_1">
+  <g id="patch_1">
+   <path d="M 0 378
+L 864 378
+L 864 0
+L 0 0
+z
+" style="fill: #fafbfd"/>
+  </g>
+  <g id="axes_1">
+   <g id="patch_2">
+    <path d="M 177.12 306.18
+L 803.52 306.18
+L 803.52 113.4
+L 177.12 113.4
+z
+" style="fill: #fafbfd"/>
+   </g>
+   <g id="matplotlib.axis_1">
+    <g id="xtick_1">
+     <g id="line2d_1">
+      <path d="M 177.12 306.18
+L 177.12 113.4
+" clip-path="url(#pe56fa2966b)" style="fill: none; stroke: #dde5eb; stroke-width: 0.8; stroke-linecap: square"/>
+     </g>
+     <g id="line2d_2"/>
+     <g id="text_1">
+      <text style="fill: #586977; font: 12px 'DejaVu Sans'; text-anchor: middle" x="177.12" y="325.298125" transform="rotate(-0 177.12 325.298125)">0</text>
+     </g>
+    </g>
+    <g id="xtick_2">
+     <g id="line2d_3">
+      <path d="M 323.9325 306.18
+L 323.9325 113.4
+" clip-path="url(#pe56fa2966b)" style="fill: none; stroke: #dde5eb; stroke-width: 0.8; stroke-linecap: square"/>
+     </g>
+     <g id="line2d_4"/>
+     <g id="text_2">
+      <text style="fill: #586977; font: 12px 'DejaVu Sans'; text-anchor: middle" x="323.9325" y="325.298125" transform="rotate(-0 323.9325 325.298125)">75</text>
+     </g>
+    </g>
+    <g id="xtick_3">
+     <g id="line2d_5">
+      <path d="M 470.745 306.18
+L 470.745 113.4
+" clip-path="url(#pe56fa2966b)" style="fill: none; stroke: #dde5eb; stroke-width: 0.8; stroke-linecap: square"/>
+     </g>
+     <g id="line2d_6"/>
+     <g id="text_3">
+      <text style="fill: #586977; font: 12px 'DejaVu Sans'; text-anchor: middle" x="470.745" y="325.298125" transform="rotate(-0 470.745 325.298125)">150</text>
+     </g>
+    </g>
+    <g id="xtick_4">
+     <g id="line2d_7">
+      <path d="M 617.5575 306.18
+L 617.5575 113.4
+" clip-path="url(#pe56fa2966b)" style="fill: none; stroke: #dde5eb; stroke-width: 0.8; stroke-linecap: square"/>
+     </g>
+     <g id="line2d_8"/>
+     <g id="text_4">
+      <text style="fill: #586977; font: 12px 'DejaVu Sans'; text-anchor: middle" x="617.5575" y="325.298125" transform="rotate(-0 617.5575 325.298125)">225</text>
+     </g>
+    </g>
+    <g id="xtick_5">
+     <g id="line2d_9">
+      <path d="M 764.37 306.18
+L 764.37 113.4
+" clip-path="url(#pe56fa2966b)" style="fill: none; stroke: #dde5eb; stroke-width: 0.8; stroke-linecap: square"/>
+     </g>
+     <g id="line2d_10"/>
+     <g id="text_5">
+      <text style="fill: #586977; font: 12px 'DejaVu Sans'; text-anchor: middle" x="764.37" y="325.298125" transform="rotate(-0 764.37 325.298125)">300</text>
+     </g>
+    </g>
+   </g>
+   <g id="matplotlib.axis_2">
+    <g id="ytick_1">
+     <g id="line2d_11"/>
+     <g id="text_6">
+      <text style="fill: #586977; font: 700 12px 'DejaVu Sans'; text-anchor: end" x="167.12" y="145.345636" transform="rotate(-0 167.12 145.345636)">BANKING77</text>
+     </g>
+    </g>
+    <g id="ytick_2">
+     <g id="line2d_12"/>
+     <g id="text_7">
+      <text style="fill: #586977; font: 700 12px 'DejaVu Sans'; text-anchor: end" x="167.12" y="215.15455" transform="rotate(-0 167.12 215.15455)">CLINC150</text>
+     </g>
+    </g>
+    <g id="ytick_3">
+     <g id="line2d_13"/>
+     <g id="text_8">
+      <text style="fill: #586977; font: 700 12px 'DejaVu Sans'; text-anchor: end" x="167.12" y="284.963464" transform="rotate(-0 167.12 284.963464)">MASSIVE</text>
+     </g>
+    </g>
+   </g>
+   <g id="patch_3">
+    <path d="M 177.12 122.797354
+L 183.012075 122.797354
+L 183.012075 138.370111
+L 177.12 138.370111
+z
+" clip-path="url(#pe56fa2966b)" style="fill: #8462b3"/>
+   </g>
+   <g id="text_9">
+    <text style="fill: #8462b3; font: 700 12px 'DejaVu Sans'; text-anchor: start" x="190.528875" y="133.894983" transform="rotate(-0 190.528875 133.894983)">$3.01</text>
+   </g>
+   <g id="patch_4">
+    <path d="M 177.12 143.203036
+L 536.693175 143.203036
+L 536.693175 158.775794
+L 177.12 158.775794
+z
+" clip-path="url(#pe56fa2966b)" style="fill: #64748b"/>
+   </g>
+   <g id="text_10">
+    <text style="fill: #64748b; font: 700 12px 'DejaVu Sans'; text-anchor: start" x="544.209975" y="154.300665" transform="rotate(-0 544.209975 154.300665)">$183.69</text>
+   </g>
+   <g id="patch_5">
+    <path d="M 177.12 192.606267
+L 184.029975 192.606267
+L 184.029975 208.179025
+L 177.12 208.179025
+z
+" clip-path="url(#pe56fa2966b)" style="fill: #8462b3"/>
+   </g>
+   <g id="text_11">
+    <text style="fill: #8462b3; font: 700 12px 'DejaVu Sans'; text-anchor: start" x="191.546775" y="203.703896" transform="rotate(-0 191.546775 203.703896)">$3.53</text>
+   </g>
+   <g id="patch_6">
+    <path d="M 177.12 213.01195
+L 708.796575 213.01195
+L 708.796575 228.584708
+L 177.12 228.584708
+z
+" clip-path="url(#pe56fa2966b)" style="fill: #64748b"/>
+   </g>
+   <g id="text_12">
+    <text style="fill: #64748b; font: 700 12px 'DejaVu Sans'; text-anchor: start" x="716.313375" y="224.109579" transform="rotate(-0 716.313375 224.109579)">$271.61</text>
+   </g>
+   <g id="patch_7">
+    <path d="M 177.12 262.415181
+L 193.7196 262.415181
+L 193.7196 277.987939
+L 177.12 277.987939
+z
+" clip-path="url(#pe56fa2966b)" style="fill: #8462b3"/>
+   </g>
+   <g id="text_13">
+    <text style="fill: #8462b3; font: 700 12px 'DejaVu Sans'; text-anchor: start" x="201.2364" y="273.51281" transform="rotate(-0 201.2364 273.51281)">$8.48</text>
+   </g>
+   <g id="patch_8">
+    <path d="M 177.12 282.820864
+L 394.12845 282.820864
+L 394.12845 298.393621
+L 177.12 298.393621
+z
+" clip-path="url(#pe56fa2966b)" style="fill: #64748b"/>
+   </g>
+   <g id="text_14">
+    <text style="fill: #64748b; font: 700 12px 'DejaVu Sans'; text-anchor: start" x="401.64525" y="293.918492" transform="rotate(-0 401.64525 293.918492)">$110.86</text>
+   </g>
+  </g>
+  <g id="text_15">
+   <text style="fill: #142b36; font: 700 24px 'DejaVu Sans'; text-anchor: start" x="47.52" y="31.752" transform="rotate(-0 47.52 31.752)">Use paid calls only for the hard cases</text>
+  </g>
+  <g id="text_16">
+   <text style="fill: #586977; font: 12.5px 'DejaVu Sans'; text-anchor: start" x="47.52" y="55.944" transform="rotate(-0 47.52 55.944)">Recorded API fees, extrapolated to 1 million decisions (USD)  ·  Lower is better</text>
+  </g>
+  <g id="text_17">
+   <text style="fill: #586977; font: 10.5px 'DejaVu Sans'" transform="translate(47.52 346.983738)">Oracle in this benchmark: DeepSeek V4.1 Flash; cache and learning enabled.</text>
+   <text style="fill: #586977; font: 10.5px 'DejaVu Sans'" transform="translate(47.52 361.134949)">Local-only Cortiq: $0 in API fees. Hardware, electricity and operations are not included.</text>
+  </g>
+  <g id="text_18">
+   <text style="fill: #087f6e; font: 700 11px 'DejaVu Sans'; text-anchor: end" x="812.16" y="30.24" transform="rotate(-0 812.16 30.24)">CORTIQ</text>
+  </g>
+  <g id="legend_1">
+   <g id="patch_9">
+    <path d="M 54 90.226125
+L 67.2 90.226125
+L 67.2 81.826125
+L 54 81.826125
+z
+" style="fill: #8462b3"/>
+   </g>
+   <g id="text_19">
+    <text style="font: 12px 'DejaVu Sans'; text-anchor: start" x="76.8" y="90.226125" transform="rotate(-0 76.8 90.226125)">Cortiq + optional oracle</text>
+   </g>
+   <g id="patch_10">
+    <path d="M 244.186875 90.226125
+L 257.386875 90.226125
+L 257.386875 81.826125
+L 244.186875 81.826125
+z
+" style="fill: #64748b"/>
+   </g>
+   <g id="text_20">
+    <text style="font: 12px 'DejaVu Sans'; text-anchor: start" x="266.986875" y="90.226125" transform="rotate(-0 266.986875 90.226125)">Jev 1.13 · API</text>
+   </g>
+  </g>
+ </g>
+ <defs>
+  <clipPath id="pe56fa2966b">
+   <rect x="177.12" y="113.4" width="626.4" height="192.78"/>
+  </clipPath>
+ </defs>
+</svg>

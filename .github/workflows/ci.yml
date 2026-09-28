@@ -29,9 +29,9 @@ jobs:
         run: rustup toolchain install stable --profile minimal --no-self-update
       - uses: Swatinem/rust-cache@v2
       - name: Build
-        run: cargo build --workspace --verbose
+        run: cargo build --locked --workspace --verbose
       - name: Test
-        run: cargo test --workspace --verbose
+        run: cargo test --locked --workspace --verbose
 
   clippy:
     name: clippy
@@ -43,4 +43,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # Fails only on clippy's deny-by-default (correctness) lints;
       # style warnings are advisory and do not fail the run.
-      - run: cargo clippy --workspace --all-targets
+      - run: cargo clippy --locked --workspace --all-targets
+
+  msrv:
+    name: CLI MSRV (Rust 1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked -p cortiq-cli
