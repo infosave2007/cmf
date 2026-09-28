@@ -7,11 +7,19 @@ language:
 tags:
   - cmf
   - cortiq
+  - jev
+  - decision-making
+  - structured-output
+  - tool-selection
+  - semantic-routing
+  - on-device
+  - metal
+  - vulkan
   - intent-classification
   - resonance-routing
 ---
 
-# Cortiq Decision
+# CMF Decision
 
 ### Decisions in milliseconds. One portable CMF file.
 
@@ -36,7 +44,7 @@ Run the same command again to update. Download the model and make your first dec
 
 ```bash
 curl -fL -o cortiq-decision.cmf \
-  https://huggingface.co/infosave/cortiq-decision/resolve/main/cortiq-decision.cmf
+  https://huggingface.co/infosave/cmf-decision/resolve/main/cortiq-decision.cmf
 cortiq decide cortiq-decision.cmf --skill banking77 -p "I still have not received my new card"
 ```
 
