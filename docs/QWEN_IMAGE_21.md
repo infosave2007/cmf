@@ -12,7 +12,10 @@ cortiq imagine qwen-image-2.1.cmf --image photo.png --prompt "Change the backgro
 ```
 
 The file carries the recipe (1024×1024, 40 steps, no CFG). PNG output keeps the
-alpha channel; JPEG/PPM are composited over white.
+alpha channel; JPEG/PPM are composited over white. The ready container is
+[infosave/Image-2.1-cmf](https://huggingface.co/infosave/Image-2.1-cmf)
+(`qwen-image-2.1.cmf`, 12.7 GB, sha256 `b94309e4…`; the same bytes pack on
+aarch64 and x86_64).
 
 | option | meaning |
 |---|---|
@@ -86,7 +89,16 @@ latent to 67 dB PSNR against the reference image.
   stages its tile, q8 int8 staged times its column field). Device vs host: v₀ 5e-4.
   Mac mini M4 (10-core GPU, 24 GB): a step is 5.3–5.9 s at 512² and 25–29 s at 1024²
   (GEMM 91 % at ≈ 2.9 TF/s = 83 % of the half MMA peak, attention the rest).
+- **Vulkan** (`gpu_wgpu/qi21.rs`, `gpu_wgpu/qi21_vae.rs`): f16 weight planes built
+  once per model (q4tp and q8 alike, 1.3 s), tensor-core GEMMs, the masked prefix
+  flash, a resident VAE decoder. Device vs host: v₀ 2–5e-4. RTX PRO 4000 Blackwell:
+  a step 0.24 s at 512², 1.04 s at 1024², 5.9 s at 2048²; 1024²/40 steps in 48 s,
+  peak VRAM 17.5 GB. `CMF_QI21_WGPU=0`, `CMF_QI21_VAE_CHAIN=0` turn the paths off.
 - **CPU**: the reference path (`CMF_QI21_GPU=0`).
+
+A condition image makes the prompt ~1k tokens longer (one vision slot per 32×32
+pixels); the Qwen3-VL encoder and its vision tower run on the host, about a minute
+for a 1024² image on a 28-core machine.
 
 Knobs: `CMF_QI21_GPU=0` (host DiT), `CMF_QI21_METAL=0`, `CMF_QI21_METAL_PROF=1`,
 `CMF_QI21_AMAX=1`, `CMF_QI21_PROF=1` (stage times), `CMF_QI21_TRACE=<dir>`,
