@@ -283,7 +283,7 @@ fn decline(reason: &str) -> bool {
 }
 
 /// Bytes the resident f16 planes of `nblk` blocks take (q/k/v/o + w1/w3/w2).
-fn plane_bytes(d: &ZDims, nblk: usize) -> u64 {
+pub(super) fn plane_bytes(d: &ZDims, nblk: usize) -> u64 {
     (nblk as u64) * 2 * (4 * (d.h as u64) * (d.h as u64) + 3 * (d.h as u64) * (d.inter as u64))
 }
 
@@ -719,7 +719,7 @@ static ZP: OnceLock<ZPipes> = OnceLock::new();
 /// cooperative matrices with the 16×16×16 f16→f32 shape (the parent's
 /// init checked the shape before raising `COOP_OK`), f16 in shaders, and
 /// 32-wide subgroups (the epilogues index lanes as `tid − 32·sg`).
-fn zctx() -> Option<&'static Ctx> {
+pub(super) fn zctx() -> Option<&'static Ctx> {
     let c = super::ctx()?;
     if !super::coop_matrix_active() {
         return None;
@@ -746,7 +746,7 @@ fn zctx() -> Option<&'static Ctx> {
 /// chain binds is padded so the kernels stay in range by construction (M to
 /// the tile + one flash block, N and K to the tile). `CMF_ZI_CHECKED=1`
 /// builds them checked, for debugging an out-of-range suspicion.
-fn pipeline(c: &Ctx, key: &str, src: &str, entry: &str) -> Option<Arc<wgpu::ComputePipeline>> {
+pub(super) fn pipeline(c: &Ctx, key: &str, src: &str, entry: &str) -> Option<Arc<wgpu::ComputePipeline>> {
     let zp = ZP.get_or_init(|| ZPipes {
         pipes: Mutex::new(HashMap::new()),
     });
@@ -811,6 +811,18 @@ pub enum Epi {
     /// Plane rows interleaved in 16-row panels (gate, up, gate, up …):
     /// writes `silu(gate)·up` as f16, output width N/2.
     SwiGlu,
+    /// `SwiGlu` whose gate and up accumulators are first multiplied by
+    /// the f32 in the uniform's last word (`MmP._p`): the activation
+    /// carried a power-of-two range guard the nonlinearity must not see
+    /// (Qwen-Image-2.1's FFN input, `gpu_wgpu/qi21.rs`).
+    SwiGluIn,
+}
+
+impl Epi {
+    /// Either SwiGLU epilogue (interleaved gate/up plane, output N/2).
+    pub fn is_swiglu(self) -> bool {
+        matches!(self, Epi::SwiGlu | Epi::SwiGluIn)
+    }
 }
 
 /// Tile geometry of one `zi_mm` pipeline. `bm × bn` output tile per
@@ -864,7 +876,7 @@ impl MmCfg {
             && tn * self.wn == self.bn
             && (self.bm * vpr) % nt == 0
             && (self.bn * vpr) % nt == 0
-            && (self.epi != Epi::SwiGlu || (tn / 16) % 2 == 0)
+            && (!self.epi.is_swiglu() || (tn / 16) % 2 == 0)
             && (self.conv == 0 || (!self.direct && self.stages == 1 && !self.acc16_probe && nt % vpr == 0))
             && (self.acc16 == 0 || (!self.direct && self.stages == 1 && !self.acc16_probe && self.conv == 0))
             && (self.acc16 == 0 || self.flush_slots().0 + self.flush_slots().1 > 0)
@@ -908,7 +920,7 @@ impl MmCfg {
         let sc = match self.epi {
             Epi::F32 => 0,
             Epi::F16 => nw * 256 * 4,
-            Epi::SwiGlu => nw * 512 * 4,
+            Epi::SwiGlu | Epi::SwiGluIn => nw * 512 * 4,
         };
         stage + sc
     }
@@ -1008,7 +1020,7 @@ pub fn mm_src(g: MmCfg) -> String {
         Epi::F16 => {
             let _ = writeln!(s, "var<workgroup> sc: array<f32, {}>;", nw * 256);
         }
-        Epi::SwiGlu => {
+        Epi::SwiGlu | Epi::SwiGluIn => {
             let _ = writeln!(s, "var<workgroup> sc: array<f32, {}>;", nw * 512);
         }
     }
@@ -1204,8 +1216,14 @@ pub fn mm_src(g: MmCfg) -> String {
                 }
             }
         }
-        Epi::SwiGlu => {
+        Epi::SwiGlu | Epi::SwiGluIn => {
             // Fragment pair (gate j=2q, up j=2q+1) → 16 output columns.
+            // SwiGluIn: both accumulators times `pin` first (the input's
+            // range guard undone before the nonlinearity).
+            let gin = if g.epi == Epi::SwiGluIn { " * pin" } else { "" };
+            if g.epi == Epi::SwiGluIn {
+                let _ = writeln!(s, "  let pin = bitcast<f32>(p._p);");
+            }
             let _ = writeln!(s, "  let ocol = (p.ocol + n0 + wx * {tn}u) / 2u;");
             let _ = writeln!(s, "  let lane = tid - sg * 32u;");
             let _ = writeln!(s, "  let sb0 = sg * 512u;");
@@ -1216,7 +1234,7 @@ pub fn mm_src(g: MmCfg) -> String {
                     let _ = writeln!(s, "  coopStoreT(c{i}_{}, &sc[sb0 + 256u], 16u);", 2 * q + 1);
                     let _ = writeln!(s, "  workgroupBarrier();");
                     let _ = writeln!(s, "  {{ var hv: array<f32, 8>;");
-                    let _ = writeln!(s, "    for (var e = 0u; e < 8u; e = e + 1u) {{ let gg = sc[eb + e]; hv[e] = gg / (1.0 + exp(-gg)) * sc[eb + 256u + e] * p.oscale; }}");
+                    let _ = writeln!(s, "    for (var e = 0u; e < 8u; e = e + 1u) {{ let gg = sc[eb + e]{gin}; hv[e] = gg / (1.0 + exp(-gg)) * sc[eb + 256u + e]{gin} * p.oscale; }}");
                     let _ = writeln!(s, "    outp[((orow + {}u + er) * ldo + ocol + {}u + ec) / 8u] = vec4<u32>(pack2x16float(vec2<f32>(hv[0], hv[1])), pack2x16float(vec2<f32>(hv[2], hv[3])), pack2x16float(vec2<f32>(hv[4], hv[5])), pack2x16float(vec2<f32>(hv[6], hv[7]))); }}", i * 16, q * 16);
                     let _ = writeln!(s, "  workgroupBarrier();");
                 }
@@ -1336,7 +1354,7 @@ fn mm_loop_2stage(
     let _ = writeln!(s, "  }}");
 }
 
-fn mm_pipe(c: &Ctx, g: MmCfg) -> Option<Arc<wgpu::ComputePipeline>> {
+pub(super) fn mm_pipe(c: &Ctx, g: MmCfg) -> Option<Arc<wgpu::ComputePipeline>> {
     if !g.valid() || g.shared_bytes() > c.device.limits().max_compute_workgroup_storage_size {
         return None;
     }
@@ -1375,10 +1393,10 @@ fn mm_uniform(c: &Ctx, a: &MmArgs) -> wgpu::Buffer {
 }
 
 /// One prebuilt GEMM dispatch.
-struct MmCall {
-    pipe: Arc<wgpu::ComputePipeline>,
-    bg: wgpu::BindGroup,
-    grid: (u32, u32),
+pub(super) struct MmCall {
+    pub(super) pipe: Arc<wgpu::ComputePipeline>,
+    pub(super) bg: wgpu::BindGroup,
+    pub(super) grid: (u32, u32),
 }
 
 fn mm_call(
@@ -1412,7 +1430,7 @@ fn mm_call(
 }
 
 impl MmCall {
-    fn record(&self, pass: &mut wgpu::ComputePass) {
+    pub(super) fn record(&self, pass: &mut wgpu::ComputePass) {
         pass.set_pipeline(&self.pipe);
         pass.set_bind_group(0, &self.bg, &[]);
         pass.dispatch_workgroups(self.grid.0, self.grid.1, 1);
@@ -1464,7 +1482,7 @@ fn flash_vt() -> bool {
 
 /// Lazy-rescale threshold in log2 units (P ≤ 2^thr in f16). `CMF_ZI_FLASH_THR`
 /// overrides (0 = rescale whenever the max grows: the exact-classic path).
-fn flash_thr() -> String {
+pub(super) fn flash_thr() -> String {
     let v: f32 = std::env::var("CMF_ZI_FLASH_THR").ok().and_then(|v| v.parse().ok()).unwrap_or(8.0);
     format!("{:.1}", v.clamp(0.0, 14.0))
 }
@@ -1799,7 +1817,7 @@ fn zi_rowop(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_ind
 }
 "#;
 
-const QKROPE_SRC: &str = r#"
+pub(super) const QKROPE_SRC: &str = r#"
 struct QP { ld: u32, nh: u32, eps: f32, _p: u32 };
 @group(0) @binding(0) var<storage, read_write> qkv: array<u32>;
 @group(0) @binding(1) var<storage, read> wq: array<f32>;
@@ -1841,7 +1859,7 @@ fn zi_qkrope(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_in
 }
 "#;
 
-const EMBED_SRC: &str = r#"
+pub(super) const EMBED_SRC: &str = r#"
 struct EP { h: u32, n_img: u32, seg: u32, pd: u32 };
 @group(0) @binding(0) var<storage, read> tok: array<f32>;
 @group(0) @binding(1) var<storage, read> w: array<f32>;
@@ -1867,7 +1885,7 @@ fn zi_embed(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_ind
 }
 "#;
 
-const FINAL_SRC: &str = r#"
+pub(super) const FINAL_SRC: &str = r#"
 struct FP { h: u32, pd: u32, eps: f32, n_img: u32, seg: u32, _a: u32, _b: u32, _c: u32 };
 @group(0) @binding(0) var<storage, read> x: array<f32>;
 @group(0) @binding(1) var<storage, read> fsc: array<f32>;
@@ -1996,7 +2014,7 @@ fn zi_amax(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocat
 /// Probe sites recorded per block when `CMF_ZI_AMAX=1` (block-major slots).
 pub const AMAX_SITES: [&str; 8] = ["attn_in", "qkv", "attn_out", "o_proj", "ffn_in", "ffn_hid", "w2_out", "x"];
 
-fn amax_call(c: &Ctx, src: &wgpu::Buffer, words: usize, is_f32: bool, dst: &wgpu::Buffer, slot: u32) -> Option<Call> {
+pub(super) fn amax_call(c: &Ctx, src: &wgpu::Buffer, words: usize, is_f32: bool, dst: &wgpu::Buffer, slot: u32) -> Option<Call> {
     let pipe = pipeline(c, "zi_amax", AMAX_SRC, "zi_amax")?;
     let u = ubuf(c, &[words as u32, slot, is_f32 as u32, 0]);
     let b = bg(c, &pipe, &[src, dst, &u]);
@@ -2036,7 +2054,7 @@ fn peak_src(acc16: bool) -> String {
 // Small host helpers.
 // ════════════════════════════════════════════════════════════════════
 
-fn sbuf(c: &Ctx, bytes: u64, label: &str) -> wgpu::Buffer {
+pub(super) fn sbuf(c: &Ctx, bytes: u64, label: &str) -> wgpu::Buffer {
     c.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
         size: bytes.max(16).next_multiple_of(16),
@@ -2047,13 +2065,13 @@ fn sbuf(c: &Ctx, bytes: u64, label: &str) -> wgpu::Buffer {
     })
 }
 
-fn sbuf_init(c: &Ctx, data: &[u8], label: &str) -> wgpu::Buffer {
+pub(super) fn sbuf_init(c: &Ctx, data: &[u8], label: &str) -> wgpu::Buffer {
     let b = sbuf(c, data.len() as u64, label);
     c.queue.write_buffer(&b, 0, data);
     b
 }
 
-fn ubuf(c: &Ctx, words: &[u32]) -> wgpu::Buffer {
+pub(super) fn ubuf(c: &Ctx, words: &[u32]) -> wgpu::Buffer {
     c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("zi_u"),
         contents: bytemuck::cast_slice(words),
@@ -2061,7 +2079,7 @@ fn ubuf(c: &Ctx, words: &[u32]) -> wgpu::Buffer {
     })
 }
 
-fn bg(c: &Ctx, pipe: &wgpu::ComputePipeline, bufs: &[&wgpu::Buffer]) -> wgpu::BindGroup {
+pub(super) fn bg(c: &Ctx, pipe: &wgpu::ComputePipeline, bufs: &[&wgpu::Buffer]) -> wgpu::BindGroup {
     let entries: Vec<_> = bufs
         .iter()
         .enumerate()
@@ -2074,12 +2092,12 @@ fn bg(c: &Ctx, pipe: &wgpu::ComputePipeline, bufs: &[&wgpu::Buffer]) -> wgpu::Bi
     })
 }
 
-fn wait(c: &Ctx) {
+pub(super) fn wait(c: &Ctx) {
     let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
 }
 
 /// Read a device buffer back (blocking).
-fn read_bytes(c: &Ctx, src: &wgpu::Buffer, bytes: u64) -> Option<Vec<u8>> {
+pub(super) fn read_bytes(c: &Ctx, src: &wgpu::Buffer, bytes: u64) -> Option<Vec<u8>> {
     let st = c.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("zi_rb"),
         size: bytes.next_multiple_of(4),
@@ -2251,7 +2269,7 @@ pub mod bench {
         a.resize(mp * k, 0);
         let ab = sbuf_init(c, bytemuck::cast_slice(&a), "act");
         let wb = sbuf_init(c, bytemuck::cast_slice(plane), "plane");
-        let ncol = if cfg.epi == Epi::SwiGlu { n / 2 } else { n };
+        let ncol = if cfg.epi.is_swiglu() { n / 2 } else { n };
         let ob = sbuf(c, (mp * ncol * 4) as u64, "out");
         let args = MmArgs { m: m as u32, n: n as u32, k: k as u32, ldo: ncol as u32, ocol: 0, arow: 0, oscale: 1.0, conv: [0; 3] };
         let call = mm_call(c, cfg, &args, &wb, &ab, &ob)?;
@@ -2279,7 +2297,7 @@ pub mod bench {
         fill(c, &ab, (mp * k / 2) as u64, 7, 1.0, false)?;
         let wb = sbuf(c, (n * k * 2) as u64, "plane");
         fill(c, &wb, (n * k / 2) as u64, 9, 0.02, false)?;
-        let ncol = if cfg.epi == Epi::SwiGlu { n / 2 } else { n };
+        let ncol = if cfg.epi.is_swiglu() { n / 2 } else { n };
         let ob = sbuf(c, (mp * ncol * 4) as u64, "out");
         let args = MmArgs { m: m as u32, n: n as u32, k: k as u32, ldo: ncol as u32, ocol: 0, arow: 0, oscale: 1.0, conv: [0; 3] };
         let call = mm_call(c, cfg, &args, &wb, &ab, &ob)?;
@@ -2337,14 +2355,14 @@ pub mod bench {
 }
 
 /// One prebuilt dispatch of any of the small kernels.
-struct Call {
-    pipe: Arc<wgpu::ComputePipeline>,
-    bg: wgpu::BindGroup,
-    grid: (u32, u32, u32),
+pub(super) struct Call {
+    pub(super) pipe: Arc<wgpu::ComputePipeline>,
+    pub(super) bg: wgpu::BindGroup,
+    pub(super) grid: (u32, u32, u32),
 }
 
 impl Call {
-    fn record(&self, pass: &mut wgpu::ComputePass) {
+    pub(super) fn record(&self, pass: &mut wgpu::ComputePass) {
         pass.set_pipeline(&self.pipe);
         pass.set_bind_group(0, &self.bg, &[]);
         pass.dispatch_workgroups(self.grid.0, self.grid.1, self.grid.2);
@@ -3061,10 +3079,10 @@ impl ZCalls {
     pub fn is_empty(&self) -> bool {
         self.list.is_empty()
     }
-    fn push_mm(&mut self, cl: Class, m: MmCall) {
+    pub(super) fn push_mm(&mut self, cl: Class, m: MmCall) {
         self.list.push((cl, Rec::Mm(m)));
     }
-    fn push(&mut self, cl: Class, k: Call) {
+    pub(super) fn push(&mut self, cl: Class, k: Call) {
         self.list.push((cl, Rec::K(k)));
     }
     pub fn extend(&mut self, o: ZCalls) {
@@ -3800,7 +3818,7 @@ fn vae_gn_apply(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_work
 }
 "#;
 
-const VAE_COMBINE_SRC: &str = r#"
+pub(super) const VAE_COMBINE_SRC: &str = r#"
 struct CP { n: u32, c: u32, mode: u32, _a: u32 };
 @group(0) @binding(0) var<storage, read_write> xo: array<f32>;
 @group(0) @binding(1) var<storage, read> h: array<f32>;
@@ -3821,7 +3839,7 @@ fn vae_combine(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workg
 }
 "#;
 
-const VAE_CAST_SRC: &str = r#"
+pub(super) const VAE_CAST_SRC: &str = r#"
 enable f16;
 struct KP { m: u32, mp: u32, c: u32, hasb: u32 };
 @group(0) @binding(0) var<storage, read> x: array<vec4<f32>>;
@@ -3843,7 +3861,7 @@ fn vae_cast(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgrou
 }
 "#;
 
-const VAE_SOFTMAX_SRC: &str = r#"
+pub(super) const VAE_SOFTMAX_SRC: &str = r#"
 enable f16;
 struct SP { ld: u32, nv: u32, _a: u32, _b: u32 };
 @group(0) @binding(0) var<storage, read> sc: array<f32>;
