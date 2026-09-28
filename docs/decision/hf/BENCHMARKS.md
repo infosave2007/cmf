@@ -61,7 +61,6 @@ The hybrid run replayed recorded oracle answers, with 24 additional live MASSIVE
 File SHA-256: `ed9b8ec2bbfe9e9fd30f14a5eaf82314f38bc7e7510a39772baa2de3801d79b1`.
 
 - Cortiq engine and CMF: Apache-2.0, [source](https://github.com/infosave2007/cmf).
-- Modified text-encoder component: MIT notices retained separately in [Component notices](NOTICES.md).
 - BANKING77: PolyAI, CC-BY-4.0. CLINC150: Larson et al., CC-BY-3.0. MASSIVE en-US: Amazon, CC-BY-4.0.
 - Resonance Routing — US Patent Application 19/452,440.
 
