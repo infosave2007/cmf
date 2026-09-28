@@ -26,6 +26,10 @@
 //!
 //! Hermetic: the toy encoder of `cortiq-decision`, loopback only.
 
+// Workspace feature unification enables Decision Vulkan through the CLI.
+// Its wgpu resource graph needs more auto-trait depth in spawned test futures.
+#![recursion_limit = "256"]
+
 #[path = "support/toy_dir.rs"]
 mod toy_dir;
 
