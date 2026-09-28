@@ -3818,7 +3818,7 @@ fn vae_gn_apply(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_work
 }
 "#;
 
-const VAE_COMBINE_SRC: &str = r#"
+pub(super) const VAE_COMBINE_SRC: &str = r#"
 struct CP { n: u32, c: u32, mode: u32, _a: u32 };
 @group(0) @binding(0) var<storage, read_write> xo: array<f32>;
 @group(0) @binding(1) var<storage, read> h: array<f32>;
@@ -3839,7 +3839,7 @@ fn vae_combine(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workg
 }
 "#;
 
-const VAE_CAST_SRC: &str = r#"
+pub(super) const VAE_CAST_SRC: &str = r#"
 enable f16;
 struct KP { m: u32, mp: u32, c: u32, hasb: u32 };
 @group(0) @binding(0) var<storage, read> x: array<vec4<f32>>;
@@ -3861,7 +3861,7 @@ fn vae_cast(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgrou
 }
 "#;
 
-const VAE_SOFTMAX_SRC: &str = r#"
+pub(super) const VAE_SOFTMAX_SRC: &str = r#"
 enable f16;
 struct SP { ld: u32, nv: u32, _a: u32, _b: u32 };
 @group(0) @binding(0) var<storage, read> sc: array<f32>;

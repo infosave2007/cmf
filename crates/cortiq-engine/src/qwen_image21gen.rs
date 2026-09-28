@@ -28,7 +28,10 @@
 //! instead of the text encoder, text-to-image only);
 //! `CMF_QI21_TRACE=<dir>` (`v_i`, `lat_i` per step);
 //! `CMF_QI21_DUMP=<dir>` (the prompt's encoder features, text rows);
-//! `CMF_QI21_LATENT_IN=<raw f32 tokens>` (decode this latent instead).
+//! `CMF_QI21_LATENT_IN=<raw f32 tokens>` (decode this latent instead);
+//! `CMF_QI21_FORCE=<dir>` (teacher forcing: step i ≥ 1 starts from
+//! `<dir>/lat_i.f32` when it exists — the per-step error of one denoiser
+//! call, without the trajectory's accumulation).
 
 use crate::qwen_image21::{Qi21Dit, Qi21Layout, Seg, ARCH_NAME};
 use crate::qwen_image21_vae::Qi21Vae;
@@ -552,11 +555,21 @@ pub fn generate_images(
     let t_models: Vec<f32> = sig[..p.steps].iter().map(|&s| (s * 1000.0) / 1000.0).collect();
     let mods: Vec<_> = t_models.iter().map(|&t| dit.mods(t)).collect();
     let trace = std::env::var("CMF_QI21_TRACE").ok();
+    let force = std::env::var("CMF_QI21_FORCE").ok();
     let c = dit.cfg.in_channels;
     let mut latents = Vec::with_capacity(p.num_images);
     for img in 0..p.num_images {
         let mut lat = gauss(n * c, p.seed.wrapping_add(img as u64))?;
         for i in 0..p.steps {
+            if let Some(dir) = force.as_deref().filter(|_| i > 0) {
+                let path = Path::new(dir).join(format!("lat_{i}.f32"));
+                if path.exists() {
+                    lat = read_f32(&path)?;
+                    if lat.len() != n * c {
+                        return Err(format!("{}: {} floats, the latent needs {}", path.display(), lat.len(), n * c));
+                    }
+                }
+            }
             let ts = Instant::now();
             let mut v = dit.step(&prefix, &lat, &mods[i], (&rope.0, &rope.1))?;
             if let Some(np) = &nprefix {
