@@ -12,7 +12,9 @@
 //!   once per prompt or step on the host); norms are f32.
 //! - `te.*`   Qwen3-VL-8B's language model, all 36 layers, no final norm
 //!   (the pipeline reads the last layer before it); projections at
-//!   `--te-quant` (default q4tp), `embed_tokens` q8_row, norms f32.
+//!   `--te-quant` (default q8 = q8_2f: q4tp moves the last hidden state 40 %
+//!   against fp32, q8_2f 11 %), `embed_tokens` q8_row, norms f32; `--te-keep` names the
+//!   projections kept at the source bf16.
 //! - `vis.*`  the Qwen3-VL vision tower + mergers (for condition images),
 //!   projections at `--vis-quant` (default q8_2f). `--no-vision` omits it
 //!   (text-to-image only).
@@ -32,7 +34,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub(crate) const DEFAULT_DIT_CODEC: &str = "q4tp";
-pub(crate) const DEFAULT_TE_CODEC: &str = "q4tp";
+pub(crate) const DEFAULT_TE_CODEC: &str = "q8";
 pub(crate) const DEFAULT_VIS_CODEC: &str = "q8";
 pub(crate) const DEFAULT_VAE_CODEC: &str = "f16";
 
@@ -43,7 +45,8 @@ pub(crate) struct PackOpts {
     pub vae: Codec,
     /// DiT projections kept at q8_2f (see the module docs).
     pub dit_keep: Vec<String>,
-    /// Text-encoder projections kept at q8_2f (`layers.N.<suffix>` or a suffix).
+    /// Text-encoder projections kept at the source bf16 (`layers.N` = a
+    /// whole layer, `layers.N.<suffix>`, or a bare suffix for every layer).
     pub te_keep: Vec<String>,
     pub vision: bool,
     pub source_sha: bool,
@@ -210,7 +213,7 @@ pub(crate) fn pack(root: &Path, out: &str, o: &PackOpts) -> anyhow::Result<()> {
                     }
                 } else if t.shape.len() == 2 && n.ends_with("_proj.weight") {
                     if o.te_keep.iter().any(|k| te_keep_match(n, k)) {
-                        q8
+                        Codec::Raw
                     } else {
                         o.te
                     }
@@ -392,7 +395,7 @@ pub(crate) fn pack(root: &Path, out: &str, o: &PackOpts) -> anyhow::Result<()> {
                 "dit_codec": zp::codec_name(o.dit),
                 "dit_keep_q8_2f": o.dit_keep,
                 "te_codec": zp::codec_name(o.te),
-                "te_keep_q8_2f": o.te_keep,
+                "te_keep_bf16": o.te_keep,
                 "vis_codec": zp::codec_name(o.vis),
                 "vae_codec": zp::codec_name(o.vae),
                 "defaults": defaults,

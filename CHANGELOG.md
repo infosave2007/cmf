@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Qwen-Image-2.1 (`cortiq imagine`, `docs/QWEN_IMAGE_21.md`): text-to-image with
+  native transparency (RGBA PNG) and generation from condition images
+  (`--image`, repeatable), from one container packed by `cortiq imagine-pack
+  <diffusers dir>` (DiT q4tp, Qwen3-VL-8B text encoder and vision tower q8_2f,
+  VAE f16; `--dit-keep`, `--te-keep`, `--vis-quant`, `--vae-quant`,
+  `--no-vision`). The prompt prefix (text and condition images) is encoded once
+  and its keys/values are reused by every denoising step. Semantics match the
+  diffusers fp32 reference exactly on a bf16 container (v₀ < 1e-5).
+- Metal denoiser for Qwen-Image-2.1: one resident chain per step, q4tp and q8
+  weights read in place from the mapping, a masked prefix pass for the
+  block-causal prompt (M4: 5.3–5.9 s a step at 512², 25–29 s at 1024²).
+
 ## [0.8.1] - 2026-09-28
 
 ### Breaking (CMF format)

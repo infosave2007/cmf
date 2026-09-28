@@ -1659,8 +1659,11 @@ enum Commands {
     /// recipe stored in the file — Turbo: 1024x1024, 8 steps, guidance 0;
     /// Z-Image (base): 1024x1024, 28 steps, guidance 4 with CFG — so
     /// `cortiq imagine z-image-turbo.cmf --prompt "…"` needs no other flag.
-    /// Qwen takes a transformer.cmf plus text_encoder.cmf and vae.cmf beside it;
-    /// pass --image once per reference. Metal/Vulkan/DX12 are selected when available.
+    /// Qwen-Image-2.1 (one .cmf from `imagine-pack`): 1024x1024, 40 steps, no
+    /// CFG by default; PNG output keeps the alpha channel (ask for transparency
+    /// in the prompt); --image adds condition images.
+    /// Qwen Image Edit takes a transformer.cmf plus text_encoder.cmf and vae.cmf
+    /// beside it; pass --image once per reference. Metal/Vulkan/DX12 are selected when available.
     Imagine {
         /// Model: a Z-Image/Lumina/Qwen .cmf, or a Lumina/Qwen root directory
         model_dir: String,
@@ -1705,7 +1708,7 @@ enum Commands {
         /// injects a raw f32 [1,16,H/8,W/8] latent instead)
         #[arg(long, default_value_t = 42)]
         seed: u64,
-        /// Reference image for Qwen Image Edit; repeat for multiple images
+        /// Condition/reference image (Qwen-Image-2.1, Qwen Image Edit); repeat for multiple images
         #[arg(long = "image")]
         images: Vec<String>,
         /// Qwen2.5-VL CMF (default: text_encoder.cmf beside the transformer)
@@ -1721,7 +1724,8 @@ enum Commands {
         /// Optional Qwen Image FlowMatch Euler scheduler JSON
         #[arg(long)]
         scheduler: Option<String>,
-        /// Qwen Image reference area as side squared; 1024 is the official profile
+        /// Qwen Image reference area as side squared (Qwen-Image-2.1: condition
+        /// images and the default output size); 1024 is the official profile
         #[arg(long, default_value_t = 1024)]
         reference_size: usize,
         /// Output image path (Z-Image/Qwen: PNG/JPEG/PPM by extension, Z-Image
@@ -1729,7 +1733,8 @@ enum Commands {
         #[arg(long)]
         out: Option<String>,
     },
-    /// Pack a Diffusers source into CMF. A Z-Image / Z-Image-Turbo pipeline
+    /// Pack a Diffusers source into CMF. A Qwen-Image-2.1 directory
+    /// (QwenImage21Pipeline) or a Z-Image / Z-Image-Turbo pipeline
     /// directory (model_index.json = ZImagePipeline) becomes ONE ready-to-run
     /// file (DiT + Qwen3 text encoder + VAE + tokenizer + the model's default
     /// recipe) and a <out>.sha256; otherwise the default packs Lumina into one
@@ -1745,21 +1750,22 @@ enum Commands {
         bundle: bool,
         /// Diffusers root directory, or a pinned HF resolve base URL for Qwen
         root: String,
-        /// Projection codec (Z-Image DiT: q8 (=q8_2f, default)/q4tp/f16/bf16/raw;
+        /// Projection codec (Qwen-Image-2.1 DiT: q4tp (default)/q8/raw; Z-Image DiT: q8 (=q8_2f, default)/q4tp/f16/bf16/raw;
         /// Qwen: q4tp/q4t/q8_2f/f16; Lumina: q4t (default)/q8)
         #[arg(long)]
         quant: Option<String>,
-        /// Z-Image text-encoder projection codec: q8 (=q8_2f, default)/q4tp/
-        /// f16/bf16/raw (embed_tokens stays q8_row unless raw/bf16/f16)
+        /// Z-Image / Qwen-Image-2.1 text-encoder projection codec: q8 (=q8_2f,
+        /// default)/q4tp/f16/bf16/raw (embed_tokens stays q8_row unless raw/bf16/f16)
         #[arg(long)]
         te_quant: Option<String>,
         /// Z-Image `te.embed_tokens` codec (default q8_row with a quantized
         /// --te-quant; raw/bf16/f16/f32 keep it 16/32-bit)
         #[arg(long)]
         te_embed_quant: Option<String>,
-        /// Z-Image text-encoder projections kept at the source precision
+        /// Z-Image / Qwen-Image-2.1 text-encoder projections kept at the source precision
         /// (comma list: `layers.N.mlp.down_proj` or a suffix like `down_proj`;
-        /// default `layers.6.mlp.down_proj`, the massive-activation writer;
+        /// Z-Image default `layers.6.mlp.down_proj`, the massive-activation writer;
+        /// Qwen-Image-2.1 default none; a whole `layers.N` also works there;
         /// `none` keeps nothing)
         #[arg(long, value_delimiter = ',')]
         te_keep: Vec<String>,
