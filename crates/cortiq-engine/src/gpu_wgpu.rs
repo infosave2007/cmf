@@ -19144,6 +19144,39 @@ fn vulkan_vram_total(_adapter: &wgpu::Adapter) -> Option<u64> {
     None
 }
 
+/// Adapters in the engine's preference order — the order `cortiq gpu`
+/// lists, `CMF_GPU_ADAPTER=<n>` and the multi-GPU device index count in,
+/// and whose first entry a plain run takes. Real GPUs before software
+/// rasterisers, native backends before GL, discrete before integrated,
+/// cards with tensor cores (cooperative matrix) first, then more VRAM,
+/// then f16. The sort is stable, so equal cards keep the driver's order.
+/// Before this, device 0 was simply the driver's first adapter: on a box
+/// with an RTX PRO 4000 and a GTX 1660 the 1660 (no tensor cores, 6 GB)
+/// took every run unless CMF_GPU_ADAPTER pinned the other card.
+pub(crate) fn ranked_adapters(instance: &wgpu::Instance, backends: wgpu::Backends) -> Vec<wgpu::Adapter> {
+    let mut all = pollster::block_on(instance.enumerate_adapters(backends));
+    all.sort_by_cached_key(|a| {
+        let i = a.get_info();
+        let f = a.features();
+        let ty = match i.device_type {
+            wgpu::DeviceType::DiscreteGpu => 0u8,
+            wgpu::DeviceType::IntegratedGpu => 1,
+            wgpu::DeviceType::VirtualGpu => 2,
+            wgpu::DeviceType::Other => 3,
+            wgpu::DeviceType::Cpu => 4,
+        };
+        (
+            i.device_type == wgpu::DeviceType::Cpu,
+            i.backend == wgpu::Backend::Gl,
+            ty,
+            !f.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX),
+            std::cmp::Reverse(vulkan_vram_total(a).unwrap_or(0)),
+            !f.contains(wgpu::Features::SHADER_F16),
+        )
+    });
+    all
+}
+
 fn init(dev: usize) -> Result<Ctx, String> {
     // Backend selection is automatic (wgpu picks the platform's best:
     // DX12 on Windows, Vulkan on Linux, Metal on macOS), but the
@@ -19167,7 +19200,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let want_env = std::env::var("CMF_GPU_ADAPTER").ok();
     let by_index = (dev != 0 || want_env.is_none()).then_some(dev);
     let adapter = if by_index.is_some() || want_env.is_some() {
-        let mut all = pollster::block_on(instance.enumerate_adapters(backends));
+        let mut all = ranked_adapters(&instance, backends);
         let pick = by_index.filter(|&i| i < all.len()).or_else(|| {
             let want = want_env.as_deref().unwrap_or_default();
             want.parse::<usize>()
@@ -63960,9 +63993,12 @@ pub fn adapter_report() -> Vec<String> {
         display: None,
     });
     // The [N] prefix is the CMF_GPU_ADAPTER index — the pin that lets a
-    // second process take a second card (`run --gpus N`).
+    // second process take a second card (`run --gpus N`) — in the ranked
+    // order init counts in; [0] is what a plain run takes.
+    let ranked = ranked_adapters(&instance, backends_from_env());
+    let first = ranked.first().map(|a| a.get_info().name);
     let mut out: Vec<String> =
-        pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()))
+        ranked
             .iter()
             .enumerate()
             .map(|(n, a)| {
@@ -63981,14 +64017,9 @@ pub fn adapter_report() -> Vec<String> {
     if out.is_empty() {
         out.push("адаптеров не найдено".into());
     }
-    match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
-        force_fallback_adapter: false,
-        compatible_surface: None,
-        apply_limit_buckets: false,
-    })) {
-        Ok(a) => out.push(format!("выбран: {}", a.get_info().name)),
-        Err(e) => out.push(format!("выбрать не удалось: {e}")),
+    match first {
+        Some(name) => out.push(format!("выбран: {name}")),
+        None => out.push("выбрать не удалось".into()),
     }
     out
 }
