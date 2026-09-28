@@ -34,7 +34,7 @@ jobs:
           set -e
           for c in cortiq-core cortiq-engine cortiq-decision cortiq-net cortiq-server cortiq-cli cortiq-ffi; do
             echo "── publishing $c ──"
-            if cargo publish -p "$c" 2>err.log; then
+            if cargo publish --locked -p "$c" 2>err.log; then
               echo "$c published"
             elif grep -qiE "already (exists|uploaded)|crate version .* is already" err.log; then
               echo "$c: version already on crates.io — skipping"

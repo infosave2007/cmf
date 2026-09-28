@@ -1,0 +1,2807 @@
+{
+  "schema": "cortiq-decision-gpu-evidence/1",
+  "created_utc": "2026-09-28T05:26:36.972640+00:00",
+  "model_sha256": "ed9b8ec2bbfe9e9fd30f14a5eaf82314f38bc7e7510a39772baa2de3801d79b1",
+  "oracle_calls": 0,
+  "model_bytes_changed": false,
+  "precision": "FP32; no FP16/TF32; unchanged 1e-5 embedding tolerance",
+  "gpu_release_status": "Validated development build; GPU decision backend is not in the currently published crates.io package.",
+  "tests": [
+    {
+      "backend": "metal",
+      "mode": "paired",
+      "run": 1,
+      "source_sha256": "8b5d7b02728504308e209b21928965322a2dd1de30c2c37f8a774f8081a9924b",
+      "schema": "cortiq-decision-metal-comparison/2",
+      "model_sha": "386b6e43fd35d5aa9e9710529dfdf30aa868df98ab4434d8e45dae9829898f85",
+      "skill": "banking77",
+      "n": 3080,
+      "dataset_sha256": "649607fa7b124293c80b455d2effe5e41da713e1836ee936073fe34ab9dc6fba",
+      "device": "metal: Apple M4",
+      "warmup": 50,
+      "order": "paired serial; CPU-first/GPU-first alternates per row; same process, model, scorer and texts; no oracle",
+      "golden_max_abs": {
+        "cpu": 0.0,
+        "metal": 1.1920928955078125e-07
+      },
+      "max_embedding_abs": 1.6391277313232422e-07,
+      "max_reconstruction_error_abs": 1.1742115020751953e-05,
+      "max_reconstruction_error_scaled": 6.425947049137903e-06,
+      "winner_changes": 0,
+      "gate_changes": 0,
+      "hash_changes": 0,
+      "different_rows": [],
+      "correct": {
+        "cpu": 2875,
+        "metal": 2875
+      },
+      "accepted": {
+        "cpu": 2791,
+        "metal": 2791
+      },
+      "metal_command_buffers": 3080,
+      "cpu_command_buffers": 0,
+      "metal_resonance_dispatches": 3080,
+      "ms": {
+        "cpu_total": {
+          "p50": 3.458792,
+          "p95": 4.6185,
+          "p99": 6.479583
+        },
+        "metal_total": {
+          "p50": 2.5725409999999997,
+          "p95": 4.429583,
+          "p99": 7.538375
+        },
+        "cpu_encoder": {
+          "p50": 2.071917,
+          "p95": 3.203542,
+          "p99": 5.040916
+        },
+        "metal_split_encoder": {
+          "p50": 0.0,
+          "p95": 0.0,
+          "p99": 0.0
+        },
+        "cpu_resonance": {
+          "p50": 1.350666,
+          "p95": 1.4649159999999999,
+          "p99": 1.538958
+        },
+        "metal_ranking_cpu": {
+          "p50": 0.006333,
+          "p95": 0.010209,
+          "p99": 0.019042000000000003
+        },
+        "metal_joint_pipeline": {
+          "p50": 2.554542,
+          "p95": 4.40325,
+          "p99": 7.522084
+        }
+      },
+      "by_tokens": [
+        {
+          "tokens": "1-8",
+          "n": 230,
+          "cpu_ms": {
+            "p50": 3.093625,
+            "p95": 3.267084,
+            "p99": 3.378875
+          },
+          "gpu_ms": {
+            "p50": 2.420125,
+            "p95": 3.592583,
+            "p99": 5.5611250000000005
+          }
+        },
+        {
+          "tokens": "9-16",
+          "n": 2084,
+          "cpu_ms": {
+            "p50": 3.398666,
+            "p95": 3.682708,
+            "p99": 3.81625
+          },
+          "gpu_ms": {
+            "p50": 2.523584,
+            "p95": 3.9925409999999997,
+            "p99": 6.467167
+          }
+        },
+        {
+          "tokens": "17-32",
+          "n": 632,
+          "cpu_ms": {
+            "p50": 3.750125,
+            "p95": 4.5125,
+            "p99": 4.7405
+          },
+          "gpu_ms": {
+            "p50": 2.7897920000000003,
+            "p95": 4.739041,
+            "p99": 8.428542
+          }
+        },
+        {
+          "tokens": "33-64",
+          "n": 129,
+          "cpu_ms": {
+            "p50": 5.745417,
+            "p95": 7.550709,
+            "p99": 8.154875
+          },
+          "gpu_ms": {
+            "p50": 3.735917,
+            "p95": 6.810416,
+            "p99": 9.454334
+          }
+        },
+        {
+          "tokens": "65+",
+          "n": 5,
+          "cpu_ms": {
+            "p50": 10.160499999999999,
+            "p95": 11.220374999999999,
+            "p99": 11.220374999999999
+          },
+          "gpu_ms": {
+            "p50": 5.704416,
+            "p95": 15.93725,
+            "p99": 15.93725
+          }
+        }
+      ],
+      "gpu_scope": "One command buffer: embedding lookup, transformer layers, row-order pooling and FP32 L2, reconstruction errors; tokenization, hashing and ranking/gates on CPU. Joint GPU time is not split into fictitious encoder/resonance wall times."
+    },
+    {
+      "backend": "metal",
+      "mode": "paired",
+      "run": 2,
+      "source_sha256": "17972babb78332434ae98acddc9ceb5b3635aa60811fa9863ad636a0bae95015",
+      "schema": "cortiq-decision-metal-comparison/2",
+      "model_sha": "386b6e43fd35d5aa9e9710529dfdf30aa868df98ab4434d8e45dae9829898f85",
+      "skill": "banking77",
+      "n": 3080,
+      "dataset_sha256": "649607fa7b124293c80b455d2effe5e41da713e1836ee936073fe34ab9dc6fba",
+      "device": "metal: Apple M4",
+      "warmup": 50,
+      "order": "paired serial; CPU-first/GPU-first alternates per row; same process, model, scorer and texts; no oracle",
+      "golden_max_abs": {
+        "cpu": 0.0,
+        "metal": 1.1920928955078125e-07
+      },
+      "max_embedding_abs": 1.6391277313232422e-07,
+      "max_reconstruction_error_abs": 1.1742115020751953e-05,
+      "max_reconstruction_error_scaled": 6.425947049137903e-06,
+      "winner_changes": 0,
+      "gate_changes": 0,
+      "hash_changes": 0,
+      "different_rows": [],
+      "correct": {
+        "cpu": 2875,
+        "metal": 2875
+      },
+      "accepted": {
+        "cpu": 2791,
+        "metal": 2791
+      },
+      "metal_command_buffers": 3080,
+      "cpu_command_buffers": 0,
+      "metal_resonance_dispatches": 3080,
+      "ms": {
+        "cpu_total": {
+          "p50": 3.4517089999999997,
+          "p95": 4.600292,
+          "p99": 6.439208
+        },
+        "metal_total": {
+          "p50": 2.583042,
+          "p95": 3.750917,
+          "p99": 6.0215
+        },
+        "cpu_encoder": {
+          "p50": 2.066834,
+          "p95": 3.2210419999999997,
+          "p99": 5.067708
+        },
+        "metal_split_encoder": {
+          "p50": 0.0,
+          "p95": 0.0,
+          "p99": 0.0
+        },
+        "cpu_resonance": {
+          "p50": 1.3495409999999999,
+          "p95": 1.467708,
+          "p99": 1.539374
+        },
+        "metal_ranking_cpu": {
+          "p50": 0.006416,
+          "p95": 0.015667,
+          "p99": 0.01925
+        },
+        "metal_joint_pipeline": {
+          "p50": 2.563375,
+          "p95": 3.721,
+          "p99": 6.00075
+        }
+      },
+      "by_tokens": [
+        {
+          "tokens": "1-8",
+          "n": 230,
+          "cpu_ms": {
+            "p50": 3.1007919999999998,
+            "p95": 3.277709,
+            "p99": 3.465416
+          },
+          "gpu_ms": {
+            "p50": 2.448209,
+            "p95": 3.439,
+            "p99": 4.4012080000000005
+          }
+        },
+        {
+          "tokens": "9-16",
+          "n": 2084,
+          "cpu_ms": {
+            "p50": 3.3943749999999997,
+            "p95": 3.7052080000000003,
+            "p99": 3.836292
+          },
+          "gpu_ms": {
+            "p50": 2.548833,
+            "p95": 3.523375,
+            "p99": 5.749334
+          }
+        },
+        {
+          "tokens": "17-32",
+          "n": 632,
+          "cpu_ms": {
+            "p50": 3.763,
+            "p95": 4.530416,
+            "p99": 4.754292
+          },
+          "gpu_ms": {
+            "p50": 2.768875,
+            "p95": 3.757083,
+            "p99": 6.398375000000001
+          }
+        },
+        {
+          "tokens": "33-64",
+          "n": 129,
+          "cpu_ms": {
+            "p50": 5.747959000000001,
+            "p95": 7.2992919999999994,
+            "p99": 8.021875
+          },
+          "gpu_ms": {
+            "p50": 3.626416,
+            "p95": 4.8097080000000005,
+            "p99": 5.3585
+          }
+        },
+        {
+          "tokens": "65+",
+          "n": 5,
+          "cpu_ms": {
+            "p50": 10.039708,
+            "p95": 11.134333,
+            "p99": 11.134333
+          },
+          "gpu_ms": {
+            "p50": 5.726041,
+            "p95": 6.274583,
+            "p99": 6.274583
+          }
+        }
+      ],
+      "gpu_scope": "One command buffer: embedding lookup, transformer layers, row-order pooling and FP32 L2, reconstruction errors; tokenization, hashing and ranking/gates on CPU. Joint GPU time is not split into fictitious encoder/resonance wall times."
+    },
+    {
+      "backend": "metal",
+      "mode": "paired",
+      "run": 1,
+      "source_sha256": "fc7a10ec0068a37b983f205d3eecfa4efe3460a4cb66301cc60f1735ca7864ce",
+      "schema": "cortiq-decision-metal-comparison/2",
+      "model_sha": "386b6e43fd35d5aa9e9710529dfdf30aa868df98ab4434d8e45dae9829898f85",
+      "skill": "clinc150",
+      "n": 4500,
+      "dataset_sha256": "2bf61b64ef682646a8f942e636ee73aad240f04dbd50c8db2a413b44a8b64871",
+      "device": "metal: Apple M4",
+      "warmup": 50,
+      "order": "paired serial; CPU-first/GPU-first alternates per row; same process, model, scorer and texts; no oracle",
+      "golden_max_abs": {
+        "cpu": 0.0,
+        "metal": 1.1920928955078125e-07
+      },
+      "max_embedding_abs": 1.6391277313232422e-07,
+      "max_reconstruction_error_abs": 1.621246337890625e-05,
+      "max_reconstruction_error_scaled": 7.066538728395244e-06,
+      "winner_changes": 0,
+      "gate_changes": 0,
+      "hash_changes": 0,
+      "different_rows": [],
+      "correct": {
+        "cpu": 4328,
+        "metal": 4328
+      },
+      "accepted": {
+        "cpu": 4145,
+        "metal": 4145
+      },
+      "metal_command_buffers": 4500,
+      "cpu_command_buffers": 0,
+      "metal_resonance_dispatches": 4500,
+      "ms": {
+        "cpu_total": {
+          "p50": 3.267958,
+          "p95": 3.6562919999999997,
+          "p99": 3.939334
+        },
+        "metal_total": {
+          "p50": 2.515084,
+          "p95": 3.380667,
+          "p99": 4.091292
+        },
+        "cpu_encoder": {
+          "p50": 1.924042,
+          "p95": 2.301792,
+          "p99": 2.5448329999999997
+        },
+        "metal_split_encoder": {
+          "p50": 0.0,
+          "p95": 0.0,
+          "p99": 0.0
+        },
+        "cpu_resonance": {
+          "p50": 1.313542,
+          "p95": 1.432668,
+          "p99": 1.493917
+        },
+        "metal_ranking_cpu": {
+          "p50": 0.01225,
+          "p95": 0.022333000000000002,
+          "p99": 0.026250000000000002
+        },
+        "metal_joint_pipeline": {
+          "p50": 2.492792,
+          "p95": 3.3617920000000003,
+          "p99": 4.070749999999999
+        }
+      },
+      "by_tokens": [
+        {
+          "tokens": "1-8",
+          "n": 1122,
+          "cpu_ms": {
+            "p50": 3.035875,
+            "p95": 3.2303330000000003,
+            "p99": 3.267417
+          },
+          "gpu_ms": {
+            "p50": 2.480708,
+            "p95": 3.425959,
+            "p99": 4.00425
+          }
+        },
+        {
+          "tokens": "9-16",
+          "n": 3076,
+          "cpu_ms": {
+            "p50": 3.316917,
+            "p95": 3.6136660000000003,
+            "p99": 3.753667
+          },
+          "gpu_ms": {
+            "p50": 2.5173330000000003,
+            "p95": 3.2338340000000003,
+            "p99": 4.145417
+          }
+        },
+        {
+          "tokens": "17-32",
+          "n": 302,
+          "cpu_ms": {
+            "p50": 3.617875,
+            "p95": 4.072334000000001,
+            "p99": 4.338167
+          },
+          "gpu_ms": {
+            "p50": 2.7420410000000004,
+            "p95": 3.61625,
+            "p99": 3.951833
+          }
+        }
+      ],
+      "gpu_scope": "One command buffer: embedding lookup, transformer layers, row-order pooling and FP32 L2, reconstruction errors; tokenization, hashing and ranking/gates on CPU. Joint GPU time is not split into fictitious encoder/resonance wall times."
+    },
+    {
+      "backend": "metal",
+      "mode": "paired",
+      "run": 2,
+      "source_sha256": "681627e6ba06747e7e277329fe47e0ea4264899ddc57359d95062159f8885101",
+      "schema": "cortiq-decision-metal-comparison/2",
+      "model_sha": "386b6e43fd35d5aa9e9710529dfdf30aa868df98ab4434d8e45dae9829898f85",
+      "skill": "clinc150",
+      "n": 4500,
+      "dataset_sha256": "2bf61b64ef682646a8f942e636ee73aad240f04dbd50c8db2a413b44a8b64871",
+      "device": "metal: Apple M4",
+      "warmup": 50,
+      "order": "paired serial; CPU-first/GPU-first alternates per row; same process, model, scorer and texts; no oracle",
+      "golden_max_abs": {
+        "cpu": 0.0,
+        "metal": 1.1920928955078125e-07
+      },
+      "max_embedding_abs": 1.6391277313232422e-07,
+      "max_reconstruction_error_abs": 1.621246337890625e-05,
+      "max_reconstruction_error_scaled": 7.066538728395244e-06,
+      "winner_changes": 0,
+      "gate_changes": 0,
+      "hash_changes": 0,
+      "different_rows": [],
+      "correct": {
+        "cpu": 4328,
+        "metal": 4328
+      },
+      "accepted": {
+        "cpu": 4145,
+        "metal": 4145
+      },
+      "metal_command_buffers": 4500,
+      "cpu_command_buffers": 0,
+      "metal_resonance_dispatches": 4500,
+      "ms": {
+        "cpu_total": {
+          "p50": 3.262333,
+          "p95": 3.689833,
+          "p99": 4.154291
+        },
+        "metal_total": {
+          "p50": 2.554791,
+          "p95": 3.5370000000000004,
+          "p99": 6.369834
+        },
+        "cpu_encoder": {
+          "p50": 1.922083,
+          "p95": 2.319333,
+          "p99": 2.65525
+        },
+        "metal_split_encoder": {
+          "p50": 0.0,
+          "p95": 0.0,
+          "p99": 0.0
+        },
+        "cpu_resonance": {
+          "p50": 1.312,
+          "p95": 1.4382080000000002,
+          "p99": 1.594958
+        },
+        "metal_ranking_cpu": {
+          "p50": 0.012209,
+          "p95": 0.022541,
+          "p99": 0.025791
+        },
+        "metal_joint_pipeline": {
+          "p50": 2.532959,
+          "p95": 3.5140000000000002,
+          "p99": 6.349708
+        }
+      },
+      "by_tokens": [
+        {
+          "tokens": "1-8",
+          "n": 1122,
+          "cpu_ms": {
+            "p50": 3.0227090000000003,
+            "p95": 3.213959,
+            "p99": 3.4175
+          },
+          "gpu_ms": {
+            "p50": 2.498291,
+            "p95": 3.451,
+            "p99": 4.900708
+          }
+        },
+        {
+          "tokens": "9-16",
+          "n": 3076,
+          "cpu_ms": {
+            "p50": 3.307833,
+            "p95": 3.652208,
+            "p99": 4.212333
+          },
+          "gpu_ms": {
+            "p50": 2.574583,
+            "p95": 3.5756669999999997,
+            "p99": 6.6290000000000004
+          }
+        },
+        {
+          "tokens": "17-32",
+          "n": 302,
+          "cpu_ms": {
+            "p50": 3.616209,
+            "p95": 4.066125,
+            "p99": 4.446791999999999
+          },
+          "gpu_ms": {
+            "p50": 2.780833,
+            "p95": 3.815208,
+            "p99": 6.182792
+          }
+        }
+      ],
+      "gpu_scope": "One command buffer: embedding lookup, transformer layers, row-order pooling and FP32 L2, reconstruction errors; tokenization, hashing and ranking/gates on CPU. Joint GPU time is not split into fictitious encoder/resonance wall times."
+    },
+    {
+      "backend": "metal",
+      "mode": "paired",
+      "run": 1,
+      "source_sha256": "fba875dad32c2f41d1bb7ec4270de68a3d1d012c09a86f8f2e8ff115f97161ad",
+      "schema": "cortiq-decision-metal-comparison/2",
+      "model_sha": "386b6e43fd35d5aa9e9710529dfdf30aa868df98ab4434d8e45dae9829898f85",
+      "skill": "massive",
+      "n": 2974,
+      "dataset_sha256": "5517f3de57d9ec9f73885dbd01b26a55a5cd806b9e7ff10c8873f5998e72dbd3",
+      "device": "metal: Apple M4",
+      "warmup": 50,
+      "order": "paired serial; CPU-first/GPU-first alternates per row; same process, model, scorer and texts; no oracle",
+      "golden_max_abs": {
+        "cpu": 0.0,
+        "metal": 1.1920928955078125e-07
+      },
+      "max_embedding_abs": 1.7881393432617188e-07,
+      "max_reconstruction_error_abs": 2.0384788513183594e-05,
+      "max_reconstruction_error_scaled": 8.684849490236957e-06,
+      "winner_changes": 0,
+      "gate_changes": 0,
+      "hash_changes": 0,
+      "different_rows": [],
+      "correct": {
+        "cpu": 2562,
+        "metal": 2562
+      },
+      "accepted": {
+        "cpu": 1615,
+        "metal": 1615
+      },
+      "metal_command_buffers": 2974,
+      "cpu_command_buffers": 0,
+      "metal_resonance_dispatches": 2974,
+      "ms": {
+        "cpu_total": {
+          "p50": 2.660333,
+          "p95": 3.0798330000000003,
+          "p99": 3.3184590000000003
+        },
+        "metal_total": {
+          "p50": 2.281333,
+          "p95": 3.068542,
+          "p99": 3.3704579999999997
+        },
+        "cpu_encoder": {
+          "p50": 1.8122500000000001,
+          "p95": 2.230708,
+          "p99": 2.445875
+        },
+        "metal_split_encoder": {
+          "p50": 0.0,
+          "p95": 0.0,
+          "p99": 0.0
+        },
+        "cpu_resonance": {
+          "p50": 0.816874,
+          "p95": 0.8975,
+          "p99": 0.923208
+        },
+        "metal_ranking_cpu": {
+          "p50": 0.005667,
+          "p95": 0.016125,
+          "p99": 0.018917
+        },
+        "metal_joint_pipeline": {
+          "p50": 2.265208,
+          "p95": 3.047834,
+          "p99": 3.353167
+        }
+      },
+      "by_tokens": [
+        {
+          "tokens": "1-8",
+          "n": 1368,
+          "cpu_ms": {
+            "p50": 2.500333,
+            "p95": 2.691542,
+            "p99": 2.740958
+          },
+          "gpu_ms": {
+            "p50": 2.241958,
+            "p95": 2.847834,
+            "p99": 3.29425
+          }
+        },
+        {
+          "tokens": "9-16",
+          "n": 1487,
+          "cpu_ms": {
+            "p50": 2.7821249999999997,
+            "p95": 3.0707500000000003,
+            "p99": 3.2034580000000004
+          },
+          "gpu_ms": {
+            "p50": 2.320292,
+            "p95": 3.112666,
+            "p99": 3.3556250000000003
+          }
+        },
+        {
+          "tokens": "17-32",
+          "n": 117,
+          "cpu_ms": {
+            "p50": 3.137833,
+            "p95": 3.7797080000000003,
+            "p99": 4.111084
+          },
+          "gpu_ms": {
+            "p50": 2.556792,
+            "p95": 3.4589999999999996,
+            "p99": 3.741084
+          }
+        },
+        {
+          "tokens": "33-64",
+          "n": 2,
+          "cpu_ms": {
+            "p50": 7.734584,
+            "p95": 7.734584,
+            "p99": 7.734584
+          },
+          "gpu_ms": {
+            "p50": 4.539750000000001,
+            "p95": 4.539750000000001,
+            "p99": 4.539750000000001
+          }
+        }
+      ],
+      "gpu_scope": "One command buffer: embedding lookup, transformer layers, row-order pooling and FP32 L2, reconstruction errors; tokenization, hashing and ranking/gates on CPU. Joint GPU time is not split into fictitious encoder/resonance wall times."
+    },
+    {
+      "backend": "metal",
+      "mode": "paired",
+      "run": 2,
+      "source_sha256": "05265e40e4b03cf628040b026cd4cec81ae2cc9119f5267c361e88cac7937dd7",
+      "schema": "cortiq-decision-metal-comparison/2",
+      "model_sha": "386b6e43fd35d5aa9e9710529dfdf30aa868df98ab4434d8e45dae9829898f85",
+      "skill": "massive",
+      "n": 2974,
+      "dataset_sha256": "5517f3de57d9ec9f73885dbd01b26a55a5cd806b9e7ff10c8873f5998e72dbd3",
+      "device": "metal: Apple M4",
+      "warmup": 50,
+      "order": "paired serial; CPU-first/GPU-first alternates per row; same process, model, scorer and texts; no oracle",
+      "golden_max_abs": {
+        "cpu": 0.0,
+        "metal": 1.1920928955078125e-07
+      },
+      "max_embedding_abs": 1.7881393432617188e-07,
+      "max_reconstruction_error_abs": 2.0384788513183594e-05,
+      "max_reconstruction_error_scaled": 8.684849490236957e-06,
+      "winner_changes": 0,
+      "gate_changes": 0,
+      "hash_changes": 0,
+      "different_rows": [],
+      "correct": {
+        "cpu": 2562,
+        "metal": 2562
+      },
+      "accepted": {
+        "cpu": 1615,
+        "metal": 1615
+      },
+      "metal_command_buffers": 2974,
+      "cpu_command_buffers": 0,
+      "metal_resonance_dispatches": 2974,
+      "ms": {
+        "cpu_total": {
+          "p50": 2.684167,
+          "p95": 3.127583,
+          "p99": 3.5339579999999997
+        },
+        "metal_total": {
+          "p50": 2.3083750000000003,
+          "p95": 3.864667,
+          "p99": 7.1722920000000006
+        },
+        "cpu_encoder": {
+          "p50": 1.8290419999999998,
+          "p95": 2.255833,
+          "p99": 2.546667
+        },
+        "metal_split_encoder": {
+          "p50": 0.0,
+          "p95": 0.0,
+          "p99": 0.0
+        },
+        "cpu_resonance": {
+          "p50": 0.822208,
+          "p95": 0.911333,
+          "p99": 1.023625
+        },
+        "metal_ranking_cpu": {
+          "p50": 0.005542,
+          "p95": 0.015958,
+          "p99": 0.019292
+        },
+        "metal_joint_pipeline": {
+          "p50": 2.291833,
+          "p95": 3.8492919999999997,
+          "p99": 7.164042
+        }
+      },
+      "by_tokens": [
+        {
+          "tokens": "1-8",
+          "n": 1368,
+          "cpu_ms": {
+            "p50": 2.521625,
+            "p95": 2.758834,
+            "p99": 3.1563749999999997
+          },
+          "gpu_ms": {
+            "p50": 2.2763750000000003,
+            "p95": 3.9769999999999994,
+            "p99": 7.167666
+          }
+        },
+        {
+          "tokens": "9-16",
+          "n": 1487,
+          "cpu_ms": {
+            "p50": 2.797,
+            "p95": 3.109041,
+            "p99": 3.3707089999999997
+          },
+          "gpu_ms": {
+            "p50": 2.336875,
+            "p95": 3.387958,
+            "p99": 7.853667
+          }
+        },
+        {
+          "tokens": "17-32",
+          "n": 117,
+          "cpu_ms": {
+            "p50": 3.1375,
+            "p95": 3.769041,
+            "p99": 3.985417
+          },
+          "gpu_ms": {
+            "p50": 2.574042,
+            "p95": 3.8526670000000003,
+            "p99": 6.3545
+          }
+        },
+        {
+          "tokens": "33-64",
+          "n": 2,
+          "cpu_ms": {
+            "p50": 7.529083,
+            "p95": 7.529083,
+            "p99": 7.529083
+          },
+          "gpu_ms": {
+            "p50": 4.361125,
+            "p95": 4.361125,
+            "p99": 4.361125
+          }
+        }
+      ],
+      "gpu_scope": "One command buffer: embedding lookup, transformer layers, row-order pooling and FP32 L2, reconstruction errors; tokenization, hashing and ranking/gates on CPU. Joint GPU time is not split into fictitious encoder/resonance wall times."
+    },
+    {
+      "backend": "metal",
+      "mode": "separate",
+      "run": 1,
+      "source_sha256": "508fade6a9d905b58ecd96c29f259775c9fc5c1e66faab9fca39bbd5a2149a6b",
+      "schema": "cortiq-decision-metal-comparison/2",
+      "model_sha": "386b6e43fd35d5aa9e9710529dfdf30aa868df98ab4434d8e45dae9829898f85",
+      "skill": "banking77",
+      "n": 3080,
+      "dataset_sha256": "649607fa7b124293c80b455d2effe5e41da713e1836ee936073fe34ab9dc6fba",
+      "device": "metal: Apple M4",
+      "warmup": 50,
+      "order": "separate serial phases: all CPU references, 50 additional GPU warmups, all GPU rows. Same process/model/texts and parity checks; no inserted CPU inference between GPU requests; no oracle.",
+      "golden_max_abs": {
+        "cpu": 0.0,
+        "metal": 1.1920928955078125e-07
+      },
+      "max_embedding_abs": 1.6391277313232422e-07,
+      "max_reconstruction_error_abs": 1.1742115020751953e-05,
+      "max_reconstruction_error_scaled": 6.425947049137903e-06,
+      "winner_changes": 0,
+      "gate_changes": 0,
+      "hash_changes": 0,
+      "different_rows": [],
+      "correct": {
+        "cpu": 2875,
+        "metal": 2875
+      },
+      "accepted": {
+        "cpu": 2791,
+        "metal": 2791
+      },
+      "metal_command_buffers": 3080,
+      "cpu_command_buffers": 0,
+      "metal_resonance_dispatches": 3080,
+      "ms": {
+        "cpu_total": {
+          "p50": 3.426791,
+          "p95": 4.608875,
+          "p99": 6.514125
+        },
+        "metal_total": {
+          "p50": 2.082292,
+          "p95": 3.145417,
+          "p99": 3.803208
+        },
+        "cpu_encoder": {
+          "p50": 2.053667,
+          "p95": 3.216875,
+          "p99": 5.132416
+        },
+        "metal_split_encoder": {
+          "p50": 0.0,
+          "p95": 0.0,
+          "p99": 0.0
+        },
+        "cpu_resonance": {
+          "p50": 1.3502919999999998,
+          "p95": 1.425459,
+          "p99": 1.4637499999999999
+        },
+        "metal_ranking_cpu": {
+          "p50": 0.006167000000000001,
+          "p95": 0.007875,
+          "p99": 0.008541
+        },
+        "metal_joint_pipeline": {
+          "p50": 2.054458,
+          "p95": 3.111166,
+          "p99": 3.762542
+        }
+      },
+      "by_tokens": [
+        {
+          "tokens": "1-8",
+          "n": 230,
+          "cpu_ms": {
+            "p50": 3.0661669999999996,
+            "p95": 3.2113329999999998,
+            "p99": 3.249959
+          },
+          "gpu_ms": {
+            "p50": 1.9797500000000001,
+            "p95": 2.824375,
+            "p99": 2.939917
+          }
+        },
+        {
+          "tokens": "9-16",
+          "n": 2084,
+          "cpu_ms": {
+            "p50": 3.3712500000000003,
+            "p95": 3.651292,
+            "p99": 3.739666
+          },
+          "gpu_ms": {
+            "p50": 2.05275,
+            "p95": 2.918917,
+            "p99": 3.126792
+          }
+        },
+        {
+          "tokens": "17-32",
+          "n": 632,
+          "cpu_ms": {
+            "p50": 3.7390000000000003,
+            "p95": 4.504708,
+            "p99": 4.871083
+          },
+          "gpu_ms": {
+            "p50": 2.3177499999999998,
+            "p95": 3.191875,
+            "p99": 3.535459
+          }
+        },
+        {
+          "tokens": "33-64",
+          "n": 129,
+          "cpu_ms": {
+            "p50": 5.708208,
+            "p95": 7.52575,
+            "p99": 7.977583
+          },
+          "gpu_ms": {
+            "p50": 3.325958,
+            "p95": 4.169416,
+            "p99": 4.547917
+          }
+        },
+        {
+          "tokens": "65+",
+          "n": 5,
+          "cpu_ms": {
+            "p50": 10.176041,
+            "p95": 10.944333,
+            "p99": 10.944333
+          },
+          "gpu_ms": {
+            "p50": 4.924333000000001,
+            "p95": 6.196083,
+            "p99": 6.196083
+          }
+        }
+      ],
+      "gpu_scope": "One command buffer: embedding lookup, transformer layers, row-order pooling and FP32 L2, reconstruction errors; tokenization, hashing and ranking/gates on CPU. Joint GPU time is not split into fictitious encoder/resonance wall times."
+    },
+    {
+      "backend": "metal",
+      "mode": "separate",
+      "run": 2,
+      "source_sha256": "77dd75120ca679112906d122f26f7abf15666dd3d0b9d0fe5c7134f79ee457d3",
+      "schema": "cortiq-decision-metal-comparison/2",
+      "model_sha": "386b6e43fd35d5aa9e9710529dfdf30aa868df98ab4434d8e45dae9829898f85",
+      "skill": "banking77",
+      "n": 3080,
+      "dataset_sha256": "649607fa7b124293c80b455d2effe5e41da713e1836ee936073fe34ab9dc6fba",
+      "device": "metal: Apple M4",
+      "warmup": 50,
+      "order": "separate serial phases: all CPU references, 50 additional GPU warmups, all GPU rows. Same process/model/texts and parity checks; no inserted CPU inference between GPU requests; no oracle.",
+      "golden_max_abs": {
+        "cpu": 0.0,
+        "metal": 1.1920928955078125e-07
+      },
+      "max_embedding_abs": 1.6391277313232422e-07,
+      "max_reconstruction_error_abs": 1.1742115020751953e-05,
+      "max_reconstruction_error_scaled": 6.425947049137903e-06,
+      "winner_changes": 0,
+      "gate_changes": 0,
+      "hash_changes": 0,
+      "different_rows": [],
+      "correct": {
+        "cpu": 2875,
+        "metal": 2875
+      },
+      "accepted": {
+        "cpu": 2791,
+        "metal": 2791
+      },
+      "metal_command_buffers": 3080,
+      "cpu_command_buffers": 0,
+      "metal_resonance_dispatches": 3080,
+      "ms": {
+        "cpu_total": {
+          "p50": 3.42625,
+          "p95": 4.570374999999999,
+          "p99": 6.416209
+        },
+        "metal_total": {
+          "p50": 2.0866249999999997,
+          "p95": 3.125875,
+          "p99": 3.751917
+        },
+        "cpu_encoder": {
+          "p50": 2.0503750000000003,
+          "p95": 3.180292,
+          "p99": 5.027209
+        },
+        "metal_split_encoder": {
+          "p50": 0.0,
+          "p95": 0.0,
+          "p99": 0.0
+        },
+        "cpu_resonance": {
+          "p50": 1.349958,
+          "p95": 1.421834,
+          "p99": 1.4535
+        },
+        "metal_ranking_cpu": {
+          "p50": 0.006292,
+          "p95": 0.008,
+          "p99": 0.008624999999999999
+        },
+        "metal_joint_pipeline": {
+          "p50": 2.061583,
+          "p95": 3.097584,
+          "p99": 3.718375
+        }
+      },
+      "by_tokens": [
+        {
+          "tokens": "1-8",
+          "n": 230,
+          "cpu_ms": {
+            "p50": 3.058416,
+            "p95": 3.202792,
+            "p99": 3.234083
+          },
+          "gpu_ms": {
+            "p50": 1.978125,
+            "p95": 2.8625,
+            "p99": 3.101292
+          }
+        },
+        {
+          "tokens": "9-16",
+          "n": 2084,
+          "cpu_ms": {
+            "p50": 3.364125,
+            "p95": 3.64475,
+            "p99": 3.7355829999999997
+          },
+          "gpu_ms": {
+            "p50": 2.059875,
+            "p95": 2.921125,
+            "p99": 3.14525
+          }
+        },
+        {
+          "tokens": "17-32",
+          "n": 632,
+          "cpu_ms": {
+            "p50": 3.732167,
+            "p95": 4.517417,
+            "p99": 4.661958
+          },
+          "gpu_ms": {
+            "p50": 2.3240000000000003,
+            "p95": 3.290917,
+            "p99": 3.5608329999999997
+          }
+        },
+        {
+          "tokens": "33-64",
+          "n": 129,
+          "cpu_ms": {
+            "p50": 5.674583,
+            "p95": 7.4869580000000004,
+            "p99": 8.160708
+          },
+          "gpu_ms": {
+            "p50": 3.256042,
+            "p95": 4.225541,
+            "p99": 4.588667
+          }
+        },
+        {
+          "tokens": "65+",
+          "n": 5,
+          "cpu_ms": {
+            "p50": 10.207834,
+            "p95": 11.088707999999999,
+            "p99": 11.088707999999999
+          },
+          "gpu_ms": {
+            "p50": 5.067416,
+            "p95": 6.178833,
+            "p99": 6.178833
+          }
+        }
+      ],
+      "gpu_scope": "One command buffer: embedding lookup, transformer layers, row-order pooling and FP32 L2, reconstruction errors; tokenization, hashing and ranking/gates on CPU. Joint GPU time is not split into fictitious encoder/resonance wall times."
+    },
+    {
+      "backend": "metal",
+      "mode": "separate",
+      "run": 1,
+      "source_sha256": "be41b7ac8fcd001f24a2f96e98481d1a8e79d548ca77d3c37e58781df31a7d2e",
+      "schema": "cortiq-decision-metal-comparison/2",
+      "model_sha": "386b6e43fd35d5aa9e9710529dfdf30aa868df98ab4434d8e45dae9829898f85",
+      "skill": "clinc150",
+      "n": 4500,
+      "dataset_sha256": "2bf61b64ef682646a8f942e636ee73aad240f04dbd50c8db2a413b44a8b64871",
+      "device": "metal: Apple M4",
+      "warmup": 50,
+      "order": "separate serial phases: all CPU references, 50 additional GPU warmups, all GPU rows. Same process/model/texts and parity checks; no inserted CPU inference between GPU requests; no oracle.",
+      "golden_max_abs": {
+        "cpu": 0.0,
+        "metal": 1.1920928955078125e-07
+      },
+      "max_embedding_abs": 1.6391277313232422e-07,
+      "max_reconstruction_error_abs": 1.621246337890625e-05,
+      "max_reconstruction_error_scaled": 7.066538728395244e-06,
+      "winner_changes": 0,
+      "gate_changes": 0,
+      "hash_changes": 0,
+      "different_rows": [],
+      "correct": {
+        "cpu": 4328,
+        "metal": 4328
+      },
+      "accepted": {
+        "cpu": 4145,
+        "metal": 4145
+      },
+      "metal_command_buffers": 4500,
+      "cpu_command_buffers": 0,
+      "metal_resonance_dispatches": 4500,
+      "ms": {
+        "cpu_total": {
+          "p50": 3.2464999999999997,
+          "p95": 3.627459,
+          "p99": 3.8617920000000003
+        },
+        "metal_total": {
+          "p50": 2.060625,
+          "p95": 2.932292,
+          "p99": 3.153084
+        },
+        "cpu_encoder": {
+          "p50": 1.9132909999999999,
+          "p95": 2.273292,
+          "p99": 2.485417
+        },
+        "metal_split_encoder": {
+          "p50": 0.0,
+          "p95": 0.0,
+          "p99": 0.0
+        },
+        "cpu_resonance": {
+          "p50": 1.313833,
+          "p95": 1.392667,
+          "p99": 1.432625
+        },
+        "metal_ranking_cpu": {
+          "p50": 0.011833,
+          "p95": 0.014959,
+          "p99": 0.015666
+        },
+        "metal_joint_pipeline": {
+          "p50": 2.0349169999999996,
+          "p95": 2.903167,
+          "p99": 3.123041
+        }
+      },
+      "by_tokens": [
+        {
+          "tokens": "1-8",
+          "n": 1122,
+          "cpu_ms": {
+            "p50": 3.014959,
+            "p95": 3.1492080000000002,
+            "p99": 3.220209
+          },
+          "gpu_ms": {
+            "p50": 2.003458,
+            "p95": 2.833,
+            "p99": 2.982958
+          }
+        },
+        {
+          "tokens": "9-16",
+          "n": 3076,
+          "cpu_ms": {
+            "p50": 3.292125,
+            "p95": 3.584625,
+            "p99": 3.674208
+          },
+          "gpu_ms": {
+            "p50": 2.071125,
+            "p95": 2.93775,
+            "p99": 3.148125
+          }
+        },
+        {
+          "tokens": "17-32",
+          "n": 302,
+          "cpu_ms": {
+            "p50": 3.615583,
+            "p95": 4.034333,
+            "p99": 4.19475
+          },
+          "gpu_ms": {
+            "p50": 2.321459,
+            "p95": 3.160875,
+            "p99": 3.412791
+          }
+        }
+      ],
+      "gpu_scope": "One command buffer: embedding lookup, transformer layers, row-order pooling and FP32 L2, reconstruction errors; tokenization, hashing and ranking/gates on CPU. Joint GPU time is not split into fictitious encoder/resonance wall times."
+    },
+    {
+      "backend": "metal",
+      "mode": "separate",
+      "run": 2,
+      "source_sha256": "243c6f11d09dce45245c73a99386f3c86c9c3532a86963d25ca6255d9d380b9d",
+      "schema": "cortiq-decision-metal-comparison/2",
+      "model_sha": "386b6e43fd35d5aa9e9710529dfdf30aa868df98ab4434d8e45dae9829898f85",
+      "skill": "clinc150",
+      "n": 4500,
+      "dataset_sha256": "2bf61b64ef682646a8f942e636ee73aad240f04dbd50c8db2a413b44a8b64871",
+      "device": "metal: Apple M4",
+      "warmup": 50,
+      "order": "separate serial phases: all CPU references, 50 additional GPU warmups, all GPU rows. Same process/model/texts and parity checks; no inserted CPU inference between GPU requests; no oracle.",
+      "golden_max_abs": {
+        "cpu": 0.0,
+        "metal": 1.1920928955078125e-07
+      },
+      "max_embedding_abs": 1.6391277313232422e-07,
+      "max_reconstruction_error_abs": 1.621246337890625e-05,
+      "max_reconstruction_error_scaled": 7.066538728395244e-06,
+      "winner_changes": 0,
+      "gate_changes": 0,
+      "hash_changes": 0,
+      "different_rows": [],
+      "correct": {
+        "cpu": 4328,
+        "metal": 4328
+      },
+      "accepted": {
+        "cpu": 4145,
+        "metal": 4145
+      },
+      "metal_command_buffers": 4500,
+      "cpu_command_buffers": 0,
+      "metal_resonance_dispatches": 4500,
+      "ms": {
+        "cpu_total": {
+          "p50": 3.241291,
+          "p95": 3.6175420000000003,
+          "p99": 3.849542
+        },
+        "metal_total": {
+          "p50": 2.1338749999999997,
+          "p95": 4.1122499999999995,
+          "p99": 5.328208
+        },
+        "cpu_encoder": {
+          "p50": 1.910292,
+          "p95": 2.270959,
+          "p99": 2.518958
+        },
+        "metal_split_encoder": {
+          "p50": 0.0,
+          "p95": 0.0,
+          "p99": 0.0
+        },
+        "cpu_resonance": {
+          "p50": 1.314292,
+          "p95": 1.387333,
+          "p99": 1.422625
+        },
+        "metal_ranking_cpu": {
+          "p50": 0.011958,
+          "p95": 0.017041,
+          "p99": 0.019833
+        },
+        "metal_joint_pipeline": {
+          "p50": 2.104209,
+          "p95": 4.0625,
+          "p99": 5.26075
+        }
+      },
+      "by_tokens": [
+        {
+          "tokens": "1-8",
+          "n": 1122,
+          "cpu_ms": {
+            "p50": 3.017375,
+            "p95": 3.155667,
+            "p99": 3.195166
+          },
+          "gpu_ms": {
+            "p50": 2.039625,
+            "p95": 3.83825,
+            "p99": 5.165209
+          }
+        },
+        {
+          "tokens": "9-16",
+          "n": 3076,
+          "cpu_ms": {
+            "p50": 3.2857089999999998,
+            "p95": 3.5790420000000003,
+            "p99": 3.672209
+          },
+          "gpu_ms": {
+            "p50": 2.132625,
+            "p95": 4.120041,
+            "p99": 5.41925
+          }
+        },
+        {
+          "tokens": "17-32",
+          "n": 302,
+          "cpu_ms": {
+            "p50": 3.606833,
+            "p95": 4.023,
+            "p99": 4.379667
+          },
+          "gpu_ms": {
+            "p50": 2.3708750000000003,
+            "p95": 4.5940829999999995,
+            "p99": 6.212083
+          }
+        }
+      ],
+      "gpu_scope": "One command buffer: embedding lookup, transformer layers, row-order pooling and FP32 L2, reconstruction errors; tokenization, hashing and ranking/gates on CPU. Joint GPU time is not split into fictitious encoder/resonance wall times."
+    },
+    {
+      "backend": "metal",
+      "mode": "separate",
+      "run": 1,
+      "source_sha256": "35fb0c3d2645926355cc1f76c42f5d972fecc1f611639eb4b90727b9f1f72ecc",
+      "schema": "cortiq-decision-metal-comparison/2",
+      "model_sha": "386b6e43fd35d5aa9e9710529dfdf30aa868df98ab4434d8e45dae9829898f85",
+      "skill": "massive",
+      "n": 2974,
+      "dataset_sha256": "5517f3de57d9ec9f73885dbd01b26a55a5cd806b9e7ff10c8873f5998e72dbd3",
+      "device": "metal: Apple M4",
+      "warmup": 50,
+      "order": "separate serial phases: all CPU references, 50 additional GPU warmups, all GPU rows. Same process/model/texts and parity checks; no inserted CPU inference between GPU requests; no oracle.",
+      "golden_max_abs": {
+        "cpu": 0.0,
+        "metal": 1.1920928955078125e-07
+      },
+      "max_embedding_abs": 1.7881393432617188e-07,
+      "max_reconstruction_error_abs": 2.0384788513183594e-05,
+      "max_reconstruction_error_scaled": 8.684849490236957e-06,
+      "winner_changes": 0,
+      "gate_changes": 0,
+      "hash_changes": 0,
+      "different_rows": [],
+      "correct": {
+        "cpu": 2562,
+        "metal": 2562
+      },
+      "accepted": {
+        "cpu": 1615,
+        "metal": 1615
+      },
+      "metal_command_buffers": 2974,
+      "cpu_command_buffers": 0,
+      "metal_resonance_dispatches": 2974,
+      "ms": {
+        "cpu_total": {
+          "p50": 2.633041,
+          "p95": 3.0664580000000004,
+          "p99": 3.293333
+        },
+        "metal_total": {
+          "p50": 1.809375,
+          "p95": 2.696959,
+          "p99": 2.923583
+        },
+        "cpu_encoder": {
+          "p50": 1.795,
+          "p95": 2.2252919999999996,
+          "p99": 2.460125
+        },
+        "metal_split_encoder": {
+          "p50": 0.0,
+          "p95": 0.0,
+          "p99": 0.0
+        },
+        "cpu_resonance": {
+          "p50": 0.816125,
+          "p95": 0.8720000000000001,
+          "p99": 0.910791
+        },
+        "metal_ranking_cpu": {
+          "p50": 0.005332999999999999,
+          "p95": 0.00675,
+          "p99": 0.007084
+        },
+        "metal_joint_pipeline": {
+          "p50": 1.786291,
+          "p95": 2.6687909999999997,
+          "p99": 2.8969579999999997
+        }
+      },
+      "by_tokens": [
+        {
+          "tokens": "1-8",
+          "n": 1368,
+          "cpu_ms": {
+            "p50": 2.482125,
+            "p95": 2.622125,
+            "p99": 2.686292
+          },
+          "gpu_ms": {
+            "p50": 1.771291,
+            "p95": 2.626583,
+            "p99": 2.81875
+          }
+        },
+        {
+          "tokens": "9-16",
+          "n": 1487,
+          "cpu_ms": {
+            "p50": 2.753584,
+            "p95": 3.064,
+            "p99": 3.174083
+          },
+          "gpu_ms": {
+            "p50": 1.845625,
+            "p95": 2.712209,
+            "p99": 2.9455839999999998
+          }
+        },
+        {
+          "tokens": "17-32",
+          "n": 117,
+          "cpu_ms": {
+            "p50": 3.114834,
+            "p95": 3.8297499999999998,
+            "p99": 4.0048330000000005
+          },
+          "gpu_ms": {
+            "p50": 2.079334,
+            "p95": 2.985791,
+            "p99": 3.344291
+          }
+        },
+        {
+          "tokens": "33-64",
+          "n": 2,
+          "cpu_ms": {
+            "p50": 7.607125,
+            "p95": 7.607125,
+            "p99": 7.607125
+          },
+          "gpu_ms": {
+            "p50": 3.9274169999999997,
+            "p95": 3.9274169999999997,
+            "p99": 3.9274169999999997
+          }
+        }
+      ],
+      "gpu_scope": "One command buffer: embedding lookup, transformer layers, row-order pooling and FP32 L2, reconstruction errors; tokenization, hashing and ranking/gates on CPU. Joint GPU time is not split into fictitious encoder/resonance wall times."
+    },
+    {
+      "backend": "metal",
+      "mode": "separate",
+      "run": 2,
+      "source_sha256": "d49be65a3e5f4ee0c1165ce6c6d7829e4d6eff7af4ec2719097e7e19c1464767",
+      "schema": "cortiq-decision-metal-comparison/2",
+      "model_sha": "386b6e43fd35d5aa9e9710529dfdf30aa868df98ab4434d8e45dae9829898f85",
+      "skill": "massive",
+      "n": 2974,
+      "dataset_sha256": "5517f3de57d9ec9f73885dbd01b26a55a5cd806b9e7ff10c8873f5998e72dbd3",
+      "device": "metal: Apple M4",
+      "warmup": 50,
+      "order": "separate serial phases: all CPU references, 50 additional GPU warmups, all GPU rows. Same process/model/texts and parity checks; no inserted CPU inference between GPU requests; no oracle.",
+      "golden_max_abs": {
+        "cpu": 0.0,
+        "metal": 1.1920928955078125e-07
+      },
+      "max_embedding_abs": 1.7881393432617188e-07,
+      "max_reconstruction_error_abs": 2.0384788513183594e-05,
+      "max_reconstruction_error_scaled": 8.684849490236957e-06,
+      "winner_changes": 0,
+      "gate_changes": 0,
+      "hash_changes": 0,
+      "different_rows": [],
+      "correct": {
+        "cpu": 2562,
+        "metal": 2562
+      },
+      "accepted": {
+        "cpu": 1615,
+        "metal": 1615
+      },
+      "metal_command_buffers": 2974,
+      "cpu_command_buffers": 0,
+      "metal_resonance_dispatches": 2974,
+      "ms": {
+        "cpu_total": {
+          "p50": 2.636959,
+          "p95": 3.060417,
+          "p99": 3.2911669999999997
+        },
+        "metal_total": {
+          "p50": 3.2125830000000004,
+          "p95": 5.442749999999999,
+          "p99": 5.974334000000001
+        },
+        "cpu_encoder": {
+          "p50": 1.7979580000000002,
+          "p95": 2.215167,
+          "p99": 2.4351659999999997
+        },
+        "metal_split_encoder": {
+          "p50": 0.0,
+          "p95": 0.0,
+          "p99": 0.0
+        },
+        "cpu_resonance": {
+          "p50": 0.820249,
+          "p95": 0.877958,
+          "p99": 0.925708
+        },
+        "metal_ranking_cpu": {
+          "p50": 0.006334,
+          "p95": 0.009082999999999999,
+          "p99": 0.010458
+        },
+        "metal_joint_pipeline": {
+          "p50": 3.169042,
+          "p95": 5.399167,
+          "p99": 5.931625
+        }
+      },
+      "by_tokens": [
+        {
+          "tokens": "1-8",
+          "n": 1368,
+          "cpu_ms": {
+            "p50": 2.4871659999999998,
+            "p95": 2.633291,
+            "p99": 2.705
+          },
+          "gpu_ms": {
+            "p50": 2.913458,
+            "p95": 5.177166000000001,
+            "p99": 5.509708000000001
+          }
+        },
+        {
+          "tokens": "9-16",
+          "n": 1487,
+          "cpu_ms": {
+            "p50": 2.763167,
+            "p95": 3.060709,
+            "p99": 3.167125
+          },
+          "gpu_ms": {
+            "p50": 3.3691250000000004,
+            "p95": 5.669917,
+            "p99": 5.914667000000001
+          }
+        },
+        {
+          "tokens": "17-32",
+          "n": 117,
+          "cpu_ms": {
+            "p50": 3.1175,
+            "p95": 3.743042,
+            "p99": 3.994167
+          },
+          "gpu_ms": {
+            "p50": 4.251916,
+            "p95": 6.402959,
+            "p99": 7.223292
+          }
+        },
+        {
+          "tokens": "33-64",
+          "n": 2,
+          "cpu_ms": {
+            "p50": 7.465333,
+            "p95": 7.465333,
+            "p99": 7.465333
+          },
+          "gpu_ms": {
+            "p50": 6.928792,
+            "p95": 6.928792,
+            "p99": 6.928792
+          }
+        }
+      ],
+      "gpu_scope": "One command buffer: embedding lookup, transformer layers, row-order pooling and FP32 L2, reconstruction errors; tokenization, hashing and ranking/gates on CPU. Joint GPU time is not split into fictitious encoder/resonance wall times."
+    },
+    {
+      "backend": "vulkan",
+      "mode": "separate",
+      "run": 1,
+      "source_sha256": "f785183f2c6e75116dec3510313a2fe2220d6e4f839ec5f53f50455081b1e974",
+      "schema": "cortiq-decision-vulkan-comparison/2",
+      "model_sha": "386b6e43fd35d5aa9e9710529dfdf30aa868df98ab4434d8e45dae9829898f85",
+      "skill": "banking77",
+      "n": 3080,
+      "dataset_sha256": "649607fa7b124293c80b455d2effe5e41da713e1836ee936073fe34ab9dc6fba",
+      "device": "vulkan: NVIDIA RTX PRO 4000 Blackwell",
+      "warmup": 50,
+      "order": "separate serial phases: all CPU references, 50 additional GPU warmups, all GPU rows. Same process/model/texts and parity checks; no inserted CPU inference between GPU requests; no oracle.",
+      "golden_max_abs": {
+        "cpu": 1.1920928955078125e-07,
+        "vulkan": 1.341104507446289e-07
+      },
+      "max_embedding_abs": 1.4901161193847656e-07,
+      "max_reconstruction_error_abs": 1.1682510375976562e-05,
+      "max_reconstruction_error_scaled": 6.459768428612733e-06,
+      "winner_changes": 0,
+      "gate_changes": 0,
+      "hash_changes": 0,
+      "different_rows": [],
+      "correct": {
+        "cpu": 2875,
+        "vulkan": 2875
+      },
+      "accepted": {
+        "cpu": 2791,
+        "vulkan": 2791
+      },
+      "vulkan_command_buffers": 3080,
+      "cpu_command_buffers": 0,
+      "vulkan_resonance_dispatches": 3080,
+      "ms": {
+        "cpu_total": {
+          "p50": 24.300031999999998,
+          "p95": 47.229065,
+          "p99": 72.325288
+        },
+        "vulkan_total": {
+          "p50": 1.243007,
+          "p95": 1.779005,
+          "p99": 2.225192
+        },
+        "cpu_encoder": {
+          "p50": 17.429967,
+          "p95": 40.324829,
+          "p99": 65.381701
+        },
+        "vulkan_split_encoder": {
+          "p50": 0.0,
+          "p95": 0.0,
+          "p99": 0.0
+        },
+        "cpu_resonance": {
+          "p50": 6.8515440000000005,
+          "p95": 6.980182,
+          "p99": 7.111081
+        },
+        "vulkan_ranking_cpu": {
+          "p50": 0.005383,
+          "p95": 0.022862,
+          "p99": 0.026559
+        },
+        "vulkan_joint_pipeline": {
+          "p50": 1.205752,
+          "p95": 1.714144,
+          "p99": 2.136114
+        }
+      },
+      "by_tokens": [
+        {
+          "tokens": "1-8",
+          "n": 230,
+          "cpu_ms": {
+            "p50": 17.484273,
+            "p95": 18.781585,
+            "p99": 19.075535000000002
+          },
+          "gpu_ms": {
+            "p50": 1.036284,
+            "p95": 1.187726,
+            "p99": 1.273517
+          }
+        },
+        {
+          "tokens": "9-16",
+          "n": 2084,
+          "cpu_ms": {
+            "p50": 23.02284,
+            "p95": 27.872968,
+            "p99": 28.654959
+          },
+          "gpu_ms": {
+            "p50": 1.216743,
+            "p95": 1.3710110000000002,
+            "p99": 1.451524
+          }
+        },
+        {
+          "tokens": "17-32",
+          "n": 632,
+          "cpu_ms": {
+            "p50": 33.219012,
+            "p95": 45.601294,
+            "p99": 50.627319
+          },
+          "gpu_ms": {
+            "p50": 1.453273,
+            "p95": 1.7577289999999999,
+            "p99": 1.838818
+          }
+        },
+        {
+          "tokens": "33-64",
+          "n": 129,
+          "cpu_ms": {
+            "p50": 60.365970999999995,
+            "p95": 83.40327,
+            "p99": 89.708682
+          },
+          "gpu_ms": {
+            "p50": 2.007216,
+            "p95": 2.5339579999999997,
+            "p99": 2.688999
+          }
+        },
+        {
+          "tokens": "65+",
+          "n": 5,
+          "cpu_ms": {
+            "p50": 111.20082000000001,
+            "p95": 113.755177,
+            "p99": 113.755177
+          },
+          "gpu_ms": {
+            "p50": 3.074434,
+            "p95": 3.303453,
+            "p99": 3.303453
+          }
+        }
+      ],
+      "gpu_scope": "One command buffer: embedding lookup, transformer layers, row-order pooling and FP32 L2, reconstruction errors; tokenization, hashing and ranking/gates on CPU. Joint GPU time is not split into fictitious encoder/resonance wall times."
+    },
+    {
+      "backend": "vulkan",
+      "mode": "separate",
+      "run": 2,
+      "source_sha256": "94a0c4678f95e2adf44c79ceb2c35d34eb45630dbc0fb87ca9f8ae48a860007f",
+      "schema": "cortiq-decision-vulkan-comparison/2",
+      "model_sha": "386b6e43fd35d5aa9e9710529dfdf30aa868df98ab4434d8e45dae9829898f85",
+      "skill": "banking77",
+      "n": 3080,
+      "dataset_sha256": "649607fa7b124293c80b455d2effe5e41da713e1836ee936073fe34ab9dc6fba",
+      "device": "vulkan: NVIDIA RTX PRO 4000 Blackwell",
+      "warmup": 50,
+      "order": "separate serial phases: all CPU references, 50 additional GPU warmups, all GPU rows. Same process/model/texts and parity checks; no inserted CPU inference between GPU requests; no oracle.",
+      "golden_max_abs": {
+        "cpu": 1.1920928955078125e-07,
+        "vulkan": 1.341104507446289e-07
+      },
+      "max_embedding_abs": 1.4901161193847656e-07,
+      "max_reconstruction_error_abs": 1.1682510375976562e-05,
+      "max_reconstruction_error_scaled": 6.459768428612733e-06,
+      "winner_changes": 0,
+      "gate_changes": 0,
+      "hash_changes": 0,
+      "different_rows": [],
+      "correct": {
+        "cpu": 2875,
+        "vulkan": 2875
+      },
+      "accepted": {
+        "cpu": 2791,
+        "vulkan": 2791
+      },
+      "vulkan_command_buffers": 3080,
+      "cpu_command_buffers": 0,
+      "vulkan_resonance_dispatches": 3080,
+      "ms": {
+        "cpu_total": {
+          "p50": 24.053228,
+          "p95": 47.818072,
+          "p99": 71.431764
+        },
+        "vulkan_total": {
+          "p50": 1.2399229999999999,
+          "p95": 1.772518,
+          "p99": 2.296392
+        },
+        "cpu_encoder": {
+          "p50": 17.044211999999998,
+          "p95": 40.826451,
+          "p99": 64.435344
+        },
+        "vulkan_split_encoder": {
+          "p50": 0.0,
+          "p95": 0.0,
+          "p99": 0.0
+        },
+        "cpu_resonance": {
+          "p50": 6.954758,
+          "p95": 7.078664,
+          "p99": 7.189576
+        },
+        "vulkan_ranking_cpu": {
+          "p50": 0.005202,
+          "p95": 0.014052,
+          "p99": 0.025805
+        },
+        "vulkan_joint_pipeline": {
+          "p50": 1.203881,
+          "p95": 1.717145,
+          "p99": 2.198691
+        }
+      },
+      "by_tokens": [
+        {
+          "tokens": "1-8",
+          "n": 230,
+          "cpu_ms": {
+            "p50": 17.640131,
+            "p95": 18.821365999999998,
+            "p99": 18.949503999999997
+          },
+          "gpu_ms": {
+            "p50": 1.051358,
+            "p95": 1.200305,
+            "p99": 1.249962
+          }
+        },
+        {
+          "tokens": "9-16",
+          "n": 2084,
+          "cpu_ms": {
+            "p50": 23.347106999999998,
+            "p95": 28.079639999999998,
+            "p99": 28.775907
+          },
+          "gpu_ms": {
+            "p50": 1.214836,
+            "p95": 1.369686,
+            "p99": 1.4417259999999998
+          }
+        },
+        {
+          "tokens": "17-32",
+          "n": 632,
+          "cpu_ms": {
+            "p50": 33.129235,
+            "p95": 46.115206,
+            "p99": 50.701332
+          },
+          "gpu_ms": {
+            "p50": 1.454658,
+            "p95": 1.7448590000000002,
+            "p99": 1.828859
+          }
+        },
+        {
+          "tokens": "33-64",
+          "n": 129,
+          "cpu_ms": {
+            "p50": 58.644467,
+            "p95": 85.296793,
+            "p99": 93.428545
+          },
+          "gpu_ms": {
+            "p50": 1.9888150000000002,
+            "p95": 2.478187,
+            "p99": 2.61321
+          }
+        },
+        {
+          "tokens": "65+",
+          "n": 5,
+          "cpu_ms": {
+            "p50": 104.71356800000001,
+            "p95": 128.376401,
+            "p99": 128.376401
+          },
+          "gpu_ms": {
+            "p50": 3.02045,
+            "p95": 3.336854,
+            "p99": 3.336854
+          }
+        }
+      ],
+      "gpu_scope": "One command buffer: embedding lookup, transformer layers, row-order pooling and FP32 L2, reconstruction errors; tokenization, hashing and ranking/gates on CPU. Joint GPU time is not split into fictitious encoder/resonance wall times."
+    },
+    {
+      "backend": "vulkan",
+      "mode": "separate",
+      "run": 1,
+      "source_sha256": "ec20b3839eb265c842fe880f9347de9ba34793a625b509fcd6490dff8b6aa8a8",
+      "schema": "cortiq-decision-vulkan-comparison/2",
+      "model_sha": "386b6e43fd35d5aa9e9710529dfdf30aa868df98ab4434d8e45dae9829898f85",
+      "skill": "clinc150",
+      "n": 4500,
+      "dataset_sha256": "2bf61b64ef682646a8f942e636ee73aad240f04dbd50c8db2a413b44a8b64871",
+      "device": "vulkan: NVIDIA RTX PRO 4000 Blackwell",
+      "warmup": 50,
+      "order": "separate serial phases: all CPU references, 50 additional GPU warmups, all GPU rows. Same process/model/texts and parity checks; no inserted CPU inference between GPU requests; no oracle.",
+      "golden_max_abs": {
+        "cpu": 1.1920928955078125e-07,
+        "vulkan": 1.341104507446289e-07
+      },
+      "max_embedding_abs": 1.6391277313232422e-07,
+      "max_reconstruction_error_abs": 1.6450881958007812e-05,
+      "max_reconstruction_error_scaled": 7.17045804776717e-06,
+      "winner_changes": 0,
+      "gate_changes": 0,
+      "hash_changes": 0,
+      "different_rows": [],
+      "correct": {
+        "cpu": 4328,
+        "vulkan": 4328
+      },
+      "accepted": {
+        "cpu": 4145,
+        "vulkan": 4145
+      },
+      "vulkan_command_buffers": 4500,
+      "cpu_command_buffers": 0,
+      "vulkan_resonance_dispatches": 4500,
+      "ms": {
+        "cpu_total": {
+          "p50": 21.070990000000002,
+          "p95": 28.693944,
+          "p99": 35.540867
+        },
+        "vulkan_total": {
+          "p50": 1.183739,
+          "p95": 1.4106889999999999,
+          "p99": 1.555227
+        },
+        "cpu_encoder": {
+          "p50": 14.319863999999999,
+          "p95": 21.939096000000003,
+          "p99": 28.740892
+        },
+        "vulkan_split_encoder": {
+          "p50": 0.0,
+          "p95": 0.0,
+          "p99": 0.0
+        },
+        "cpu_resonance": {
+          "p50": 6.732084,
+          "p95": 6.846308,
+          "p99": 6.971
+        },
+        "vulkan_ranking_cpu": {
+          "p50": 0.010095000000000002,
+          "p95": 0.026825,
+          "p99": 0.037598999999999994
+        },
+        "vulkan_joint_pipeline": {
+          "p50": 1.142588,
+          "p95": 1.3502889999999999,
+          "p99": 1.4805000000000001
+        }
+      },
+      "by_tokens": [
+        {
+          "tokens": "1-8",
+          "n": 1122,
+          "cpu_ms": {
+            "p50": 17.321112,
+            "p95": 18.650374,
+            "p99": 18.874518
+          },
+          "gpu_ms": {
+            "p50": 1.0571860000000002,
+            "p95": 1.184428,
+            "p99": 1.2439479999999998
+          }
+        },
+        {
+          "tokens": "9-16",
+          "n": 3076,
+          "cpu_ms": {
+            "p50": 21.709161,
+            "p95": 27.078848999999998,
+            "p99": 28.25304
+          },
+          "gpu_ms": {
+            "p50": 1.205003,
+            "p95": 1.356696,
+            "p99": 1.442542
+          }
+        },
+        {
+          "tokens": "17-32",
+          "n": 302,
+          "cpu_ms": {
+            "p50": 30.710203,
+            "p95": 38.634969,
+            "p99": 44.367315
+          },
+          "gpu_ms": {
+            "p50": 1.428216,
+            "p95": 1.618438,
+            "p99": 1.7441170000000001
+          }
+        }
+      ],
+      "gpu_scope": "One command buffer: embedding lookup, transformer layers, row-order pooling and FP32 L2, reconstruction errors; tokenization, hashing and ranking/gates on CPU. Joint GPU time is not split into fictitious encoder/resonance wall times."
+    },
+    {
+      "backend": "vulkan",
+      "mode": "separate",
+      "run": 2,
+      "source_sha256": "133a985c0a007cd45d8fcc23333d2edc319a721bd8d1b7048986e61768f9a87d",
+      "schema": "cortiq-decision-vulkan-comparison/2",
+      "model_sha": "386b6e43fd35d5aa9e9710529dfdf30aa868df98ab4434d8e45dae9829898f85",
+      "skill": "clinc150",
+      "n": 4500,
+      "dataset_sha256": "2bf61b64ef682646a8f942e636ee73aad240f04dbd50c8db2a413b44a8b64871",
+      "device": "vulkan: NVIDIA RTX PRO 4000 Blackwell",
+      "warmup": 50,
+      "order": "separate serial phases: all CPU references, 50 additional GPU warmups, all GPU rows. Same process/model/texts and parity checks; no inserted CPU inference between GPU requests; no oracle.",
+      "golden_max_abs": {
+        "cpu": 1.1920928955078125e-07,
+        "vulkan": 1.341104507446289e-07
+      },
+      "max_embedding_abs": 1.6391277313232422e-07,
+      "max_reconstruction_error_abs": 1.6450881958007812e-05,
+      "max_reconstruction_error_scaled": 7.17045804776717e-06,
+      "winner_changes": 0,
+      "gate_changes": 0,
+      "hash_changes": 0,
+      "different_rows": [],
+      "correct": {
+        "cpu": 4328,
+        "vulkan": 4328
+      },
+      "accepted": {
+        "cpu": 4145,
+        "vulkan": 4145
+      },
+      "vulkan_command_buffers": 4500,
+      "cpu_command_buffers": 0,
+      "vulkan_resonance_dispatches": 4500,
+      "ms": {
+        "cpu_total": {
+          "p50": 21.108217,
+          "p95": 30.122833,
+          "p99": 35.055634000000005
+        },
+        "vulkan_total": {
+          "p50": 1.20068,
+          "p95": 1.428602,
+          "p99": 1.585988
+        },
+        "cpu_encoder": {
+          "p50": 14.355258,
+          "p95": 23.349382,
+          "p99": 28.311857
+        },
+        "vulkan_split_encoder": {
+          "p50": 0.0,
+          "p95": 0.0,
+          "p99": 0.0
+        },
+        "cpu_resonance": {
+          "p50": 6.738755,
+          "p95": 6.857221,
+          "p99": 6.979973
+        },
+        "vulkan_ranking_cpu": {
+          "p50": 0.016079999999999997,
+          "p95": 0.027441999999999998,
+          "p99": 0.037886
+        },
+        "vulkan_joint_pipeline": {
+          "p50": 1.1596270000000002,
+          "p95": 1.369136,
+          "p99": 1.508872
+        }
+      },
+      "by_tokens": [
+        {
+          "tokens": "1-8",
+          "n": 1122,
+          "cpu_ms": {
+            "p50": 17.345407,
+            "p95": 18.718383000000003,
+            "p99": 18.832627000000002
+          },
+          "gpu_ms": {
+            "p50": 1.06457,
+            "p95": 1.2041160000000002,
+            "p99": 1.2711560000000002
+          }
+        },
+        {
+          "tokens": "9-16",
+          "n": 3076,
+          "cpu_ms": {
+            "p50": 21.634235,
+            "p95": 27.603956999999998,
+            "p99": 28.299501000000003
+          },
+          "gpu_ms": {
+            "p50": 1.221998,
+            "p95": 1.374075,
+            "p99": 1.44901
+          }
+        },
+        {
+          "tokens": "17-32",
+          "n": 302,
+          "cpu_ms": {
+            "p50": 31.161271,
+            "p95": 38.58855,
+            "p99": 42.460954
+          },
+          "gpu_ms": {
+            "p50": 1.44708,
+            "p95": 1.641224,
+            "p99": 1.728692
+          }
+        }
+      ],
+      "gpu_scope": "One command buffer: embedding lookup, transformer layers, row-order pooling and FP32 L2, reconstruction errors; tokenization, hashing and ranking/gates on CPU. Joint GPU time is not split into fictitious encoder/resonance wall times."
+    },
+    {
+      "backend": "vulkan",
+      "mode": "separate",
+      "run": 1,
+      "source_sha256": "f3c2a40a056decc6b55db1f7b24b6db8c210a238ed9a0e36ba198a40b58cd138",
+      "schema": "cortiq-decision-vulkan-comparison/2",
+      "model_sha": "386b6e43fd35d5aa9e9710529dfdf30aa868df98ab4434d8e45dae9829898f85",
+      "skill": "massive",
+      "n": 2974,
+      "dataset_sha256": "5517f3de57d9ec9f73885dbd01b26a55a5cd806b9e7ff10c8873f5998e72dbd3",
+      "device": "vulkan: NVIDIA RTX PRO 4000 Blackwell",
+      "warmup": 50,
+      "order": "separate serial phases: all CPU references, 50 additional GPU warmups, all GPU rows. Same process/model/texts and parity checks; no inserted CPU inference between GPU requests; no oracle.",
+      "golden_max_abs": {
+        "cpu": 1.1920928955078125e-07,
+        "vulkan": 1.341104507446289e-07
+      },
+      "max_embedding_abs": 1.4901161193847656e-07,
+      "max_reconstruction_error_abs": 2.0503997802734375e-05,
+      "max_reconstruction_error_scaled": 8.735638402868062e-06,
+      "winner_changes": 0,
+      "gate_changes": 0,
+      "hash_changes": 0,
+      "different_rows": [],
+      "correct": {
+        "cpu": 2562,
+        "vulkan": 2562
+      },
+      "accepted": {
+        "cpu": 1615,
+        "vulkan": 1615
+      },
+      "vulkan_command_buffers": 2974,
+      "cpu_command_buffers": 0,
+      "vulkan_resonance_dispatches": 2974,
+      "ms": {
+        "cpu_total": {
+          "p50": 16.259952000000002,
+          "p95": 25.118388,
+          "p99": 31.614088
+        },
+        "vulkan_total": {
+          "p50": 1.1542169999999998,
+          "p95": 1.373807,
+          "p99": 1.563799
+        },
+        "cpu_encoder": {
+          "p50": 12.123259000000001,
+          "p95": 21.019095,
+          "p99": 27.428562
+        },
+        "vulkan_split_encoder": {
+          "p50": 0.0,
+          "p95": 0.0,
+          "p99": 0.0
+        },
+        "cpu_resonance": {
+          "p50": 4.093815,
+          "p95": 4.180759,
+          "p99": 4.279031
+        },
+        "vulkan_ranking_cpu": {
+          "p50": 0.010161,
+          "p95": 0.011192,
+          "p99": 0.025403000000000002
+        },
+        "vulkan_joint_pipeline": {
+          "p50": 1.116078,
+          "p95": 1.32156,
+          "p99": 1.492097
+        }
+      },
+      "by_tokens": [
+        {
+          "tokens": "1-8",
+          "n": 1368,
+          "cpu_ms": {
+            "p50": 13.768594,
+            "p95": 15.994110999999998,
+            "p99": 16.164708
+          },
+          "gpu_ms": {
+            "p50": 1.060067,
+            "p95": 1.202129,
+            "p99": 1.256436
+          }
+        },
+        {
+          "tokens": "9-16",
+          "n": 1487,
+          "cpu_ms": {
+            "p50": 18.553100999999998,
+            "p95": 23.654970000000002,
+            "p99": 25.654531000000002
+          },
+          "gpu_ms": {
+            "p50": 1.2158609999999999,
+            "p95": 1.363216,
+            "p99": 1.435772
+          }
+        },
+        {
+          "tokens": "17-32",
+          "n": 117,
+          "cpu_ms": {
+            "p50": 28.220928,
+            "p95": 40.57731,
+            "p99": 42.695208
+          },
+          "gpu_ms": {
+            "p50": 1.448512,
+            "p95": 1.744253,
+            "p99": 1.797189
+          }
+        },
+        {
+          "tokens": "33-64",
+          "n": 2,
+          "cpu_ms": {
+            "p50": 92.568872,
+            "p95": 92.568872,
+            "p99": 92.568872
+          },
+          "gpu_ms": {
+            "p50": 2.741677,
+            "p95": 2.741677,
+            "p99": 2.741677
+          }
+        }
+      ],
+      "gpu_scope": "One command buffer: embedding lookup, transformer layers, row-order pooling and FP32 L2, reconstruction errors; tokenization, hashing and ranking/gates on CPU. Joint GPU time is not split into fictitious encoder/resonance wall times."
+    },
+    {
+      "backend": "vulkan",
+      "mode": "separate",
+      "run": 2,
+      "source_sha256": "08cc059ac15ca13c03b88491852f551b6dfe4e0641e7c0f113e1843d8da2d03e",
+      "schema": "cortiq-decision-vulkan-comparison/2",
+      "model_sha": "386b6e43fd35d5aa9e9710529dfdf30aa868df98ab4434d8e45dae9829898f85",
+      "skill": "massive",
+      "n": 2974,
+      "dataset_sha256": "5517f3de57d9ec9f73885dbd01b26a55a5cd806b9e7ff10c8873f5998e72dbd3",
+      "device": "vulkan: NVIDIA RTX PRO 4000 Blackwell",
+      "warmup": 50,
+      "order": "separate serial phases: all CPU references, 50 additional GPU warmups, all GPU rows. Same process/model/texts and parity checks; no inserted CPU inference between GPU requests; no oracle.",
+      "golden_max_abs": {
+        "cpu": 1.1920928955078125e-07,
+        "vulkan": 1.341104507446289e-07
+      },
+      "max_embedding_abs": 1.4901161193847656e-07,
+      "max_reconstruction_error_abs": 2.0503997802734375e-05,
+      "max_reconstruction_error_scaled": 8.735638402868062e-06,
+      "winner_changes": 0,
+      "gate_changes": 0,
+      "hash_changes": 0,
+      "different_rows": [],
+      "correct": {
+        "cpu": 2562,
+        "vulkan": 2562
+      },
+      "accepted": {
+        "cpu": 1615,
+        "vulkan": 1615
+      },
+      "vulkan_command_buffers": 2974,
+      "cpu_command_buffers": 0,
+      "vulkan_resonance_dispatches": 2974,
+      "ms": {
+        "cpu_total": {
+          "p50": 16.226368,
+          "p95": 25.084632,
+          "p99": 31.197762
+        },
+        "vulkan_total": {
+          "p50": 1.104685,
+          "p95": 1.333802,
+          "p99": 1.501266
+        },
+        "cpu_encoder": {
+          "p50": 12.084242999999999,
+          "p95": 20.98241,
+          "p99": 27.027615
+        },
+        "vulkan_split_encoder": {
+          "p50": 0.0,
+          "p95": 0.0,
+          "p99": 0.0
+        },
+        "cpu_resonance": {
+          "p50": 4.08907,
+          "p95": 4.173007999999999,
+          "p99": 4.284597000000001
+        },
+        "vulkan_ranking_cpu": {
+          "p50": 0.004288,
+          "p95": 0.010778000000000001,
+          "p99": 0.02296
+        },
+        "vulkan_joint_pipeline": {
+          "p50": 1.070387,
+          "p95": 1.281504,
+          "p99": 1.449374
+        }
+      },
+      "by_tokens": [
+        {
+          "tokens": "1-8",
+          "n": 1368,
+          "cpu_ms": {
+            "p50": 13.77318,
+            "p95": 15.957989999999999,
+            "p99": 16.201877
+          },
+          "gpu_ms": {
+            "p50": 1.0107110000000001,
+            "p95": 1.145669,
+            "p99": 1.198661
+          }
+        },
+        {
+          "tokens": "9-16",
+          "n": 1487,
+          "cpu_ms": {
+            "p50": 18.513498,
+            "p95": 24.04242,
+            "p99": 25.511760000000002
+          },
+          "gpu_ms": {
+            "p50": 1.168246,
+            "p95": 1.323223,
+            "p99": 1.401163
+          }
+        },
+        {
+          "tokens": "17-32",
+          "n": 117,
+          "cpu_ms": {
+            "p50": 28.784033,
+            "p95": 38.288958,
+            "p99": 46.601112
+          },
+          "gpu_ms": {
+            "p50": 1.387599,
+            "p95": 1.630614,
+            "p99": 1.743193
+          }
+        },
+        {
+          "tokens": "33-64",
+          "n": 2,
+          "cpu_ms": {
+            "p50": 83.40803600000001,
+            "p95": 83.40803600000001,
+            "p99": 83.40803600000001
+          },
+          "gpu_ms": {
+            "p50": 2.7668329999999997,
+            "p95": 2.7668329999999997,
+            "p99": 2.7668329999999997
+          }
+        }
+      ],
+      "gpu_scope": "One command buffer: embedding lookup, transformer layers, row-order pooling and FP32 L2, reconstruction errors; tokenization, hashing and ranking/gates on CPU. Joint GPU time is not split into fictitious encoder/resonance wall times."
+    }
+  ],
+  "vulkan_final_alternating_diagnostic": [
+    {
+      "schema": "cortiq-decision-vulkan-comparison/2",
+      "model_sha": "386b6e43fd35d5aa9e9710529dfdf30aa868df98ab4434d8e45dae9829898f85",
+      "skill": "banking77",
+      "n": 400,
+      "dataset_sha256": "9b521ef5a55ec3065e70bccd2b30fa12e5b999406008f44338ef91ddbbaf1764",
+      "device": "vulkan: NVIDIA RTX PRO 4000 Blackwell",
+      "warmup": 50,
+      "mode": "paired",
+      "order": "paired serial; CPU-first/GPU-first alternates per row; same process, model, scorer and texts; no oracle",
+      "golden_max_abs": {
+        "cpu": 1.1920928955078125e-07,
+        "vulkan": 1.341104507446289e-07
+      },
+      "max_embedding_abs": 1.341104507446289e-07,
+      "max_reconstruction_error_abs": 7.748603820800781e-06,
+      "max_reconstruction_error_scaled": 4.2701681195467245e-06,
+      "winner_changes": 0,
+      "gate_changes": 0,
+      "hash_changes": 0,
+      "different_rows": [],
+      "correct": {
+        "cpu": 378,
+        "vulkan": 378
+      },
+      "accepted": {
+        "cpu": 368,
+        "vulkan": 368
+      },
+      "vulkan_command_buffers": 400,
+      "cpu_command_buffers": 0,
+      "vulkan_resonance_dispatches": 400,
+      "ms": {
+        "cpu_total": {
+          "p50": 25.294016,
+          "p95": 50.685048,
+          "p99": 71.975504
+        },
+        "vulkan_total": {
+          "p50": 8.570200999999999,
+          "p95": 9.157026,
+          "p99": 10.475235
+        },
+        "cpu_encoder": {
+          "p50": 18.249418,
+          "p95": 43.703988,
+          "p99": 64.88609600000001
+        },
+        "vulkan_split_encoder": {
+          "p50": 0.0,
+          "p95": 0.0,
+          "p99": 0.0
+        },
+        "cpu_resonance": {
+          "p50": 7.033309,
+          "p95": 7.121943000000001,
+          "p99": 7.204884
+        },
+        "vulkan_ranking_cpu": {
+          "p50": 0.005862,
+          "p95": 0.014029000000000002,
+          "p99": 0.022748
+        },
+        "vulkan_joint_pipeline": {
+          "p50": 8.532857,
+          "p95": 9.114592,
+          "p99": 10.426771
+        }
+      },
+      "by_tokens": [
+        {
+          "tokens": "1-8",
+          "n": 33,
+          "cpu_ms": {
+            "p50": 18.183600000000002,
+            "p95": 19.627952,
+            "p99": 19.660096
+          },
+          "gpu_ms": {
+            "p50": 8.504406000000001,
+            "p95": 9.157026,
+            "p99": 10.475235
+          }
+        },
+        {
+          "tokens": "9-16",
+          "n": 254,
+          "cpu_ms": {
+            "p50": 23.578274,
+            "p95": 27.982298999999998,
+            "p99": 28.295987
+          },
+          "gpu_ms": {
+            "p50": 8.541694000000001,
+            "p95": 8.830613,
+            "p99": 10.490369
+          }
+        },
+        {
+          "tokens": "17-32",
+          "n": 97,
+          "cpu_ms": {
+            "p50": 32.586508,
+            "p95": 50.685048,
+            "p99": 52.140518
+          },
+          "gpu_ms": {
+            "p50": 8.737691,
+            "p95": 9.156465,
+            "p99": 10.988516
+          }
+        },
+        {
+          "tokens": "33-64",
+          "n": 15,
+          "cpu_ms": {
+            "p50": 59.938963,
+            "p95": 86.883251,
+            "p99": 86.883251
+          },
+          "gpu_ms": {
+            "p50": 9.268764000000001,
+            "p95": 9.999656000000002,
+            "p99": 9.999656000000002
+          }
+        },
+        {
+          "tokens": "65+",
+          "n": 1,
+          "cpu_ms": {
+            "p50": 96.077608,
+            "p95": 96.077608,
+            "p99": 96.077608
+          },
+          "gpu_ms": {
+            "p50": 2.9224379999999996,
+            "p95": 2.9224379999999996,
+            "p99": 2.9224379999999996
+          }
+        }
+      ],
+      "gpu_scope": "One command buffer: embedding lookup, transformer layers, row-order pooling and FP32 L2, reconstruction errors; tokenization, hashing and ranking/gates on CPU. Joint GPU time is not split into fictitious encoder/resonance wall times."
+    },
+    {
+      "schema": "cortiq-decision-vulkan-comparison/2",
+      "model_sha": "386b6e43fd35d5aa9e9710529dfdf30aa868df98ab4434d8e45dae9829898f85",
+      "skill": "clinc150",
+      "n": 400,
+      "dataset_sha256": "94ca69865b628e19e0b6c220e6749197888bdc7cb648cd1f72a20305bc13d9e5",
+      "device": "vulkan: NVIDIA RTX PRO 4000 Blackwell",
+      "warmup": 50,
+      "mode": "paired",
+      "order": "paired serial; CPU-first/GPU-first alternates per row; same process, model, scorer and texts; no oracle",
+      "golden_max_abs": {
+        "cpu": 1.1920928955078125e-07,
+        "vulkan": 1.341104507446289e-07
+      },
+      "max_embedding_abs": 1.4901161193847656e-07,
+      "max_reconstruction_error_abs": 1.3113021850585938e-05,
+      "max_reconstruction_error_scaled": 6.0342304095684085e-06,
+      "winner_changes": 0,
+      "gate_changes": 0,
+      "hash_changes": 0,
+      "different_rows": [],
+      "correct": {
+        "cpu": 385,
+        "vulkan": 385
+      },
+      "accepted": {
+        "cpu": 371,
+        "vulkan": 371
+      },
+      "vulkan_command_buffers": 400,
+      "cpu_command_buffers": 0,
+      "vulkan_resonance_dispatches": 400,
+      "ms": {
+        "cpu_total": {
+          "p50": 21.496622,
+          "p95": 30.177698,
+          "p99": 35.863288
+        },
+        "vulkan_total": {
+          "p50": 5.015118,
+          "p95": 8.837807,
+          "p99": 9.597926
+        },
+        "cpu_encoder": {
+          "p50": 14.484449999999999,
+          "p95": 23.357059,
+          "p99": 28.846717
+        },
+        "vulkan_split_encoder": {
+          "p50": 0.0,
+          "p95": 0.0,
+          "p99": 0.0
+        },
+        "cpu_resonance": {
+          "p50": 6.933250999999999,
+          "p95": 7.025986,
+          "p99": 7.164185
+        },
+        "vulkan_ranking_cpu": {
+          "p50": 0.010098999999999999,
+          "p95": 0.025981999999999998,
+          "p99": 0.031384
+        },
+        "vulkan_joint_pipeline": {
+          "p50": 4.972818,
+          "p95": 8.779129,
+          "p99": 9.560920000000001
+        }
+      },
+      "by_tokens": [
+        {
+          "tokens": "1-8",
+          "n": 110,
+          "cpu_ms": {
+            "p50": 17.64624,
+            "p95": 19.207981999999998,
+            "p99": 19.309098
+          },
+          "gpu_ms": {
+            "p50": 4.989846,
+            "p95": 8.768485,
+            "p99": 10.341634
+          }
+        },
+        {
+          "tokens": "9-16",
+          "n": 257,
+          "cpu_ms": {
+            "p50": 22.010488000000002,
+            "p95": 27.188233999999998,
+            "p99": 28.56827
+          },
+          "gpu_ms": {
+            "p50": 5.015118,
+            "p95": 8.818614,
+            "p99": 9.548928
+          }
+        },
+        {
+          "tokens": "17-32",
+          "n": 33,
+          "cpu_ms": {
+            "p50": 30.596008,
+            "p95": 40.529081000000005,
+            "p99": 40.800326999999996
+          },
+          "gpu_ms": {
+            "p50": 5.370083999999999,
+            "p95": 8.975268999999999,
+            "p99": 8.983433000000002
+          }
+        }
+      ],
+      "gpu_scope": "One command buffer: embedding lookup, transformer layers, row-order pooling and FP32 L2, reconstruction errors; tokenization, hashing and ranking/gates on CPU. Joint GPU time is not split into fictitious encoder/resonance wall times."
+    },
+    {
+      "schema": "cortiq-decision-vulkan-comparison/2",
+      "model_sha": "386b6e43fd35d5aa9e9710529dfdf30aa868df98ab4434d8e45dae9829898f85",
+      "skill": "massive",
+      "n": 400,
+      "dataset_sha256": "1662fff070a896417bec73752f8b90e40085f174b38fdfa4690ee472fe1b86d3",
+      "device": "vulkan: NVIDIA RTX PRO 4000 Blackwell",
+      "warmup": 50,
+      "mode": "paired",
+      "order": "paired serial; CPU-first/GPU-first alternates per row; same process, model, scorer and texts; no oracle",
+      "golden_max_abs": {
+        "cpu": 1.1920928955078125e-07,
+        "vulkan": 1.341104507446289e-07
+      },
+      "max_embedding_abs": 1.1920928955078125e-07,
+      "max_reconstruction_error_abs": 1.6808509826660156e-05,
+      "max_reconstruction_error_scaled": 7.22503500583116e-06,
+      "winner_changes": 0,
+      "gate_changes": 0,
+      "hash_changes": 0,
+      "different_rows": [],
+      "correct": {
+        "cpu": 341,
+        "vulkan": 341
+      },
+      "accepted": {
+        "cpu": 208,
+        "vulkan": 208
+      },
+      "vulkan_command_buffers": 400,
+      "cpu_command_buffers": 0,
+      "vulkan_resonance_dispatches": 400,
+      "ms": {
+        "cpu_total": {
+          "p50": 16.558957999999997,
+          "p95": 24.45713,
+          "p99": 30.835259
+        },
+        "vulkan_total": {
+          "p50": 3.3972960000000003,
+          "p95": 7.495115,
+          "p99": 7.610043
+        },
+        "cpu_encoder": {
+          "p50": 12.411912000000001,
+          "p95": 20.365925,
+          "p99": 26.537292
+        },
+        "vulkan_split_encoder": {
+          "p50": 0.0,
+          "p95": 0.0,
+          "p99": 0.0
+        },
+        "cpu_resonance": {
+          "p50": 4.108808000000001,
+          "p95": 4.267616,
+          "p99": 4.309318
+        },
+        "vulkan_ranking_cpu": {
+          "p50": 0.0046099999999999995,
+          "p95": 0.011302,
+          "p99": 0.023187
+        },
+        "vulkan_joint_pipeline": {
+          "p50": 3.3793870000000004,
+          "p95": 7.45397,
+          "p99": 7.584391
+        }
+      },
+      "by_tokens": [
+        {
+          "tokens": "1-8",
+          "n": 178,
+          "cpu_ms": {
+            "p50": 14.953128,
+            "p95": 16.197547999999998,
+            "p99": 16.479971
+          },
+          "gpu_ms": {
+            "p50": 3.356858,
+            "p95": 7.449042,
+            "p99": 8.81558
+          }
+        },
+        {
+          "tokens": "9-16",
+          "n": 210,
+          "cpu_ms": {
+            "p50": 18.80779,
+            "p95": 24.283237,
+            "p99": 26.044375000000002
+          },
+          "gpu_ms": {
+            "p50": 3.452348,
+            "p95": 7.5117780000000005,
+            "p99": 7.610043
+          }
+        },
+        {
+          "tokens": "17-32",
+          "n": 11,
+          "cpu_ms": {
+            "p50": 28.205081,
+            "p95": 33.755212,
+            "p99": 33.755212
+          },
+          "gpu_ms": {
+            "p50": 3.871171,
+            "p95": 7.600968,
+            "p99": 7.600968
+          }
+        },
+        {
+          "tokens": "33-64",
+          "n": 1,
+          "cpu_ms": {
+            "p50": 48.965486000000006,
+            "p95": 48.965486000000006,
+            "p99": 48.965486000000006
+          },
+          "gpu_ms": {
+            "p50": 1.903141,
+            "p95": 1.903141,
+            "p99": 1.903141
+          }
+        }
+      ],
+      "gpu_scope": "One command buffer: embedding lookup, transformer layers, row-order pooling and FP32 L2, reconstruction errors; tokenization, hashing and ranking/gates on CPU. Joint GPU time is not split into fictitious encoder/resonance wall times."
+    }
+  ],
+  "http": {
+    "apple_m4": {
+      "cpu": {
+        "requests": 11,
+        "rss_after_requests_MiB": 478.46875,
+        "temporary_server_stopped": true
+      },
+      "metal": {
+        "requests": 11,
+        "rss_after_requests_MiB": 808.09375,
+        "temporary_server_stopped": true
+      }
+    },
+    "xeon_rtx": {
+      "cpu": {
+        "requests": 11,
+        "rss_after_requests_MiB": 437.578125,
+        "temporary_server_stopped": true
+      },
+      "vulkan": {
+        "requests": 11,
+        "rss_after_requests_MiB": 694.8125,
+        "temporary_server_stopped": true
+      }
+    }
+  },
+  "vulkan_process_vram_snapshot_MiB": 522,
+  "artifact_sha256": {
+    "cortiq-linux-x86_64-vulkan": "005881d968e99a5444f92d7835e5aff8d93926cb570ec1ced9c7c3c2d8b31781",
+    "cortiq-macos-arm64": "02aed7010feb10706a9238050487050b144afe1ff2090e4bc496301e784b2ff7"
+  }
+}

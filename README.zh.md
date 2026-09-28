@@ -10,6 +10,18 @@ CMF 是可审计的模型容器：一个文件可以保存权重、分词器、�
 [![docs.rs](https://img.shields.io/docsrs/cortiq-core)](https://docs.rs/cortiq-core)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
+
+## Metal 与 Vulkan 决策加速
+
+**Cortiq 0.8.0：** 一个 CMF 文件封装可训练技能，通过重建误差在本地做出决策，
+无需生成 token。默认使用 CPU；通过 `CORTIQ_DECISION_DEVICE=metal` 或 `vulkan`
+选择 GPU。crates.io 默认安装已包含 GPU 支持（需要 Rust 1.88+）。
+
+![Full local CPU / GPU path; each comparison uses the same host](docs/decision/hf/figures/gpu.svg)
+
+[快速入门、自定义技能与 API（英语）](docs/decision/hf/README.md) ·
+[测试结果与限制（英语）](docs/decision/hf/GPU.md)
+
 ## 状态
 
 CMF v2 是当前磁盘格式。读取器会检查信封、区段边界、张量元数据和哈希；不兼容
@@ -23,7 +35,7 @@ CMF v2 是当前磁盘格式。读取器会检查信封、区段边界、张量�
 安装 CLI，并转换一个小型公开检查点：
 
 ```sh
-cargo install cortiq-cli
+cargo install cortiq-cli --locked
 cortiq convert --model Qwen/Qwen3-0.6B --quant q8 --output qwen.cmf
 cortiq run qwen.cmf --prompt "法国的首都是哪里？" --greedy --no-think
 ```
