@@ -38,13 +38,47 @@
 //! Range guards (the Metal module's sites and defaults): the attention
 //! input ×2⁻², the qkv panel ×2⁻⁴ (the qk-norm is scale-free, v carries it),
 //! the attention output ×2⁻⁴, the FFN input ×2⁻², the SwiGLU hidden ×2⁻⁸;
-//! each consumer multiplies its factor back in an f32 epilogue.
+//! each consumer multiplies its factor back in an f32 epilogue. Stored
+//! maxima (`CMF_QI21_AMAX`, 256², prefill and steps): attention input 7.0,
+//! qkv 13, attention output 3.7, FFN input 3.1, hidden 19 — three orders of
+//! magnitude below the f16 limit at every site.
+//!
+//! # Measured
+//!
+//! RTX PRO 4000 Blackwell (24 GB, NVIDIA 595.91, Vulkan; pure-MMA ceiling
+//! 153.5 TF f16 → f32), in-process timers, prefix = 18 text rows:
+//! - one denoiser call: 512² (1024 rows) 0.234 s, 1024² (4096) 1.036 s,
+//!   2048² (16384) 5.87 s. Per class at 1024²: qkv 198 ms (66 TF), flash
+//!   153 (57 TF), O 57 (77 TF), gate/up 397 (66 TF), down 179 (74 TF), row
+//!   kernels 37, embed/final 13. At 2048² the flash is 2.39 of 5.94 s.
+//!   (`zimage_gemmbench mm` on this card: the 128×128 tile stays the best
+//!   for the f16/f32 epilogues, 65–76 TF; see `w13_cfg`, `flash_cfg`.)
+//! - prefill: 18 rows 0.08 s; 4118 rows (text + a 1024² condition image,
+//!   block-causal) 1.15 s, and a 1024² step against that prefix 1.18 s.
+//! - planes, 32 blocks: q8_2f 1.0 s (streamed), q4tp 1.3–1.5 s, bf16 46 s
+//!   (converted on the host).
+//! - whole `imagine` at 1024², 40 steps, `qwen-image-2.1.cmf` (DiT q4tp,
+//!   text encoder q8_2f): 47.5 s = text encoder 2.0 (6.4 cold) + prefill
+//!   1.3 + steps 41.6 + VAE 1.9 (`qi21_vae.rs`); CFG doubles the step
+//!   (512²: 0.484 s for the pair).
+//!
+//! Parity, v rel. error against the host path (`CMF_QI21_GPU=0`) on the
+//! same container and noise: v_0 3.2e-4 (q8) / 4.7e-4 (q4tp; 5.4e-4 on the
+//! final `qwen-image-2.1.cmf`) at 256² with the oracle inputs, 3.2e-4 /
+//! 2.4e-4 at 512² (seed 7); after 20 steps the
+//! final latent is 4.1e-4 / 7.5e-4 (256²) and 2.2e-3 / 2.4e-3 (512²) away.
+//! Teacher-forced (`CMF_QI21_FORCE`), every single call is 2–7e-4 away. The
+//! bf16 container against the fp32 diffusers oracle: v_0 3.8e-4.
+//!
+//! The stand's default adapter is a GTX 1660 (no 16×16 f16 cooperative
+//! matrices): the path declines there; `CMF_GPU_ADAPTER=1` picks the card.
 //!
 //! Knobs: `CMF_QI21_WGPU=0` (device path off), `CMF_QI21_WGPU_PROF=1`
 //! (per-class device time after every step: each class alone, 3 reps),
 //! `CMF_QI21_AMAX=1` (largest |value| at each f16 site per pass),
-//! `CMF_QI21_FLASH=nw,bc` (flash tile), `CMF_QI21_{ATTN,QKV,AO,FFN,HID}_SHIFT`
-//! (the guards), and the Z-Image GEMM knobs (`CMF_ZI_TILE`).
+//! `CMF_QI21_FLASH=nw,bc` (flash tile), `CMF_QI21_TILE_W13=bm,bn,bk,wm,wn`
+//! (the gate/up tile), `CMF_QI21_{ATTN,QKV,AO,FFN,HID}_SHIFT` (the guards),
+//! and the Z-Image GEMM knob `CMF_ZI_TILE` (the other sites).
 
 use crate::gpu::{Qi21Geom, Qi21PrefillArgs, ZBlockRef};
 use cortiq_core::CmfModel;
@@ -59,11 +93,11 @@ fn enabled() -> bool {
 
 fn decline(reason: &str) -> bool {
     static SAID: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    if let Ok(mut v) = SAID.lock() {
-        if !v.iter().any(|r| r == reason) {
-            eprintln!("qwen-image-2.1: wgpu device path declined: {reason}");
-            v.push(reason.to_string());
-        }
+    if let Ok(mut v) = SAID.lock()
+        && !v.iter().any(|r| r == reason)
+    {
+        eprintln!("qwen-image-2.1: wgpu device path declined: {reason}");
+        v.push(reason.to_string());
     }
     false
 }
@@ -534,10 +568,10 @@ impl Dev {
 static STATE: Mutex<Option<Dev>> = Mutex::new(None);
 
 fn geom_ok(g: &Qi21Geom) -> Result<(), String> {
-    if g.hd != 128 || g.nh * g.hd != g.hidden || g.hidden % 128 != 0 || g.hidden > 4096 {
+    if g.hd != 128 || g.nh * g.hd != g.hidden || !g.hidden.is_multiple_of(128) || g.hidden > 4096 {
         return Err(format!("geometry {g:?} (the kernels need hd 128, hidden % 128 == 0, ≤ 4096)"));
     }
-    if g.inter % 64 != 0 || g.in_ch != 64 {
+    if !g.inter.is_multiple_of(64) || g.in_ch != 64 {
         return Err(format!("geometry {g:?} (inter % 64, 64 latent channels)"));
     }
     Ok(())
@@ -569,7 +603,7 @@ fn mods_dev(mods: &[f32], h: usize) -> Vec<f32> {
 /// `zi_mm` with the uniform's last word set (`Epi::SwiGluIn`'s input
 /// multiplier; 0 for the other epilogues, as `zimage.rs` writes it).
 fn mm(c: &Ctx, g: MmCfg, a: &MmArgs, extra: u32, plane: &wgpu::Buffer, act: &wgpu::Buffer, out: &wgpu::Buffer) -> Option<MmCall> {
-    if a.n % g.bn != 0 || a.k % g.bk != 0 {
+    if !a.n.is_multiple_of(g.bn) || !a.k.is_multiple_of(g.bk) {
         return None;
     }
     let pipe = zi::mm_pipe(c, g)?;
@@ -950,14 +984,14 @@ pub(crate) fn prefill(a: &Qi21PrefillArgs) -> bool {
         }
     };
     let budget = super::device_vram_budget();
-    if budget > 0 && need(&*st) + super::resident_bytes() > budget {
+    if budget > 0 && need(&st) + super::resident_bytes() > budget {
         // The text encoder's resident weights (this container) are done.
         super::release_idle_model_buffers(a.model.uid());
         let held = super::resident_bytes();
-        if need(&*st) + held > budget {
+        if need(&st) + held > budget {
             return decline(&format!(
                 "the denoiser needs about {:.1} GB on the device (+{:.1} GB held by other weights) and the adapter's budget is {:.1} GB",
-                need(&*st) as f64 / 1e9,
+                need(&st) as f64 / 1e9,
                 held as f64 / 1e9,
                 budget as f64 / 1e9
             ));
@@ -1110,10 +1144,10 @@ fn class_times(c: &Ctx, p: &Prog) {
 
 /// Drop one program (a prompt is done).
 pub(crate) fn release_key(key: u64) {
-    if let Ok(mut st) = STATE.lock() {
-        if let Some(d) = st.as_mut() {
-            d.progs.retain(|q| q.key != key);
-        }
+    if let Ok(mut st) = STATE.lock()
+        && let Some(d) = st.as_mut()
+    {
+        d.progs.retain(|q| q.key != key);
     }
 }
 
