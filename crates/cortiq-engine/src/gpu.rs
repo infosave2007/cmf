@@ -3877,6 +3877,89 @@ impl ImageStageGuard {
 // padded lengths n_img_p = ceil32(n_img) and n_cap_p = ceil32(L).
 // ════════════════════════════════════════════════════════════════════
 
+// ───────────────────── Qwen-Image-2.1 device contract ─────────────────────
+
+/// Geometry of the Qwen-Image-2.1 denoiser.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Qi21Geom {
+    pub hidden: usize,
+    pub nh: usize,
+    pub hd: usize,
+    pub inter: usize,
+    pub in_ch: usize,
+    pub eps: f32,
+}
+
+/// One block's weights: tensor indices of `to_q, to_k, to_v, to_out.0,
+/// gate_layer, proj (up), out (down)` and the per-head q/k norm weights.
+pub struct Qi21BlockRef<'a> {
+    pub w: [usize; 7],
+    pub norm_q: &'a [f32],
+    pub norm_k: &'a [f32],
+}
+
+/// Everything the device needs to build a program and run its prefix.
+pub struct Qi21PrefillArgs<'a> {
+    pub model: &'a Arc<CmfModel>,
+    pub geom: Qi21Geom,
+    pub blocks: &'a [Qi21BlockRef<'a>],
+    /// `img_in` [hidden, 64] and `proj_out` [64, hidden], f32.
+    pub img_in: &'a [f32],
+    pub proj_out: &'a [f32],
+    pub key: u64,
+    /// Prefix rows after `txt_in` / `img_in`, `[lp, hidden]`.
+    pub x: &'a [f32],
+    pub lp: usize,
+    /// RoPE cos/sin of the prefix rows and of the target rows, `[rows, 64]`.
+    pub rope_p: (&'a [f32], &'a [f32]),
+    pub rope_t: (&'a [f32], &'a [f32]),
+    /// Keys each prefix row sees (a leading run; non-decreasing).
+    pub vis: &'a [u32],
+    /// The t = 0 modulation `[s1|g1|s2|g2]`.
+    pub mods0: &'a [f32],
+    /// Target rows.
+    pub n: usize,
+}
+
+/// Build the program `a.key` and run its prefix on the device.
+#[allow(unused_variables)]
+pub fn qi21_prefill(a: &Qi21PrefillArgs) -> bool {
+    match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::qi21::prefill(a),
+        _ => false,
+    }
+}
+
+/// One denoiser call of program `key`: `xtok [n, 64]` → `out [n, 64]`.
+#[allow(unused_variables)]
+pub fn qi21_step(key: u64, xtok: &[f32], mods: &[f32], fs: &[f32], out: &mut [f32]) -> bool {
+    match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::qi21::step(key, xtok, mods, fs, out),
+        _ => false,
+    }
+}
+
+/// Drop program `key`.
+#[allow(unused_variables)]
+pub fn qi21_release_key(key: u64) {
+    match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::qi21::release_key(key),
+        _ => {}
+    }
+}
+
+/// Drop the denoiser's device state.
+pub fn qi21_release() {
+    match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::qi21::release(),
+        _ => {}
+    }
+}
+
 /// One Z-Image transformer block's device inputs (noise refiner, context
 /// refiner or main layer — all share this shape). Weights are tensor
 /// indices into `model.tensors` (diffusers names under `dit.`); the codec
