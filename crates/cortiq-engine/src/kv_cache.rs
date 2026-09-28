@@ -109,6 +109,10 @@ pub struct LayerKvCache {
     pub linear_state: Vec<f32>,
     /// Tentative lane-2 state during speculative verify.
     pub linear_scratch: Vec<f32>,
+    /// The legacy cache wire has no operator tag. Delta operators therefore
+    /// bind this layer to a fail-closed boundary until a versioned wire
+    /// schema can carry the linear-core identity.
+    linear_wire_allowed: bool,
     /// O(1) Nyström override (None = plain cache attention).
     pub o1: Option<O1State>,
     /// A deferred seal failure is terminal for the current request. The
@@ -125,7 +129,46 @@ pub struct LayerKvCache {
     /// "nothing". These are WEIGHTS, not sequence state — `clear()` and
     /// the wire import keep them. None = an ordinary softmax.
     pub sinks: Option<Vec<f32>>,
+    /// Natively bounded anchor (`swa_sink_v1`): a fixed-size ring
+    /// installed from the header at load, never per prompt. A layer that
+    /// carries it stores NOTHING per position (`k`/`v` stay empty).
+    pub bounded: Option<crate::bounded::BoundedState>,
+    /// Which state record this layer exchanges on the wire (v2).
+    pub wire_kind: WireKind,
+    /// This layer's index in the stack (the wire header names it).
+    pub wire_layer: u32,
+    /// hash64 of the model's operator identity
+    /// (`ModelArch::linear_core_identity` JSON); 0 = no operator record.
+    pub wire_identity: u64,
 }
+
+/// State-record kind of the versioned cache wire (`export_wire` v2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum WireKind {
+    /// Per-position K/V (+ importance) — the legacy body.
+    Full = 0,
+    /// Recurrent state vector (S + conv ring), f32.
+    Linear = 1,
+    /// Bounded anchor: insert counter + ring K/V.
+    Bounded = 2,
+}
+
+impl WireKind {
+    fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(WireKind::Full),
+            1 => Some(WireKind::Linear),
+            2 => Some(WireKind::Bounded),
+            _ => None,
+        }
+    }
+}
+
+/// Magic of the versioned state wire.
+pub const WIRE_MAGIC: &[u8; 4] = b"CMFS";
+/// Current wire version.
+pub const WIRE_VERSION: u32 = 2;
 
 impl LayerKvCache {
     pub fn new(num_kv_heads: usize, head_dim: usize) -> Self {
@@ -146,10 +189,88 @@ impl LayerKvCache {
             head_dim,
             linear_state: Vec::new(),
             linear_scratch: Vec::new(),
+            linear_wire_allowed: true,
             o1: None,
             o1_error: None,
             o1_transitioned: false,
+            bounded: None,
+            wire_kind: WireKind::Full,
+            wire_layer: 0,
+            wire_identity: 0,
         }
+    }
+
+    // ── Natively bounded anchor (swa_sink_v1) ──
+
+    /// Give this layer its fixed-size ring (`[kvh][window][hd]` K and V).
+    /// Called once at load from the header; the record is zeroed on
+    /// `clear()` and never reallocated.
+    pub fn install_bounded(&mut self, window: usize) {
+        self.bounded = Some(crate::bounded::BoundedState::new(
+            self.num_kv_heads,
+            self.head_dim,
+            window,
+        ));
+        self.wire_kind = WireKind::Bounded;
+    }
+
+    /// One position of the bounded operator: insert the raw `k, v`
+    /// (`[kvh][hd]`) into slot `t mod W`, then attend every Q head of
+    /// `q` (`[nh][hd]`, raw) over sinks ∪ window into `out` (`[nh][hd]`).
+    /// Nothing is appended per position.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bounded_step(
+        &mut self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        w: &crate::bounded::BoundedWeights,
+        rope: &crate::bounded::BoundedRope,
+        scale: f32,
+        num_heads: usize,
+        out: &mut [f32],
+    ) {
+        let st = self
+            .bounded
+            .as_mut()
+            .expect("bounded_step on a layer without an installed ring");
+        st.insert(k, v);
+        st.attend(q, num_heads, &w.sink_k, &w.sink_v, w.sink, rope, scale, out);
+        // Honest context depth for the memory/seq report — nothing is
+        // stored per position.
+        self.seq_len += 1;
+    }
+
+    /// Bytes of the bounded ring (0 on other layers).
+    pub fn bounded_state_bytes(&self) -> usize {
+        self.bounded.as_ref().map(|b| b.state_bytes()).unwrap_or(0)
+    }
+
+    /// Bit-for-bit copy of the ring for speculation (None on other layers).
+    pub fn bounded_snapshot(&self) -> Option<crate::bounded::BoundedSnapshot> {
+        self.bounded.as_ref().map(|b| b.snapshot())
+    }
+
+    /// Restore a ring snapshot taken on this layer; `seq_len` follows the
+    /// restored insert counter.
+    pub fn bounded_restore(&mut self, s: &crate::bounded::BoundedSnapshot) {
+        if let Some(b) = self.bounded.as_mut() {
+            b.restore(s);
+            self.seq_len = b.seen;
+        }
+    }
+
+    /// Bind this layer to the legacy cache-wire policy. Delta layers must
+    /// refuse untagged state exchange rather than risk a plausible additive
+    /// interpretation on the peer.
+    pub fn set_linear_wire_allowed(&mut self, allowed: bool) {
+        self.linear_wire_allowed = allowed;
+    }
+
+    /// Discard tentative recurrent state after a speculative rejection or
+    /// any other path that abandons the lane-2 result.
+    pub fn discard_linear_scratch(&mut self) {
+        self.linear_scratch.clear();
     }
 
     /// Per-KV-head stored keys `[seq_len × head_dim]` (GPU token graph sync).
@@ -1103,7 +1224,20 @@ impl LayerKvCache {
 
     /// Roll back the last `n_drop` positions (speculative-decode reject).
     pub fn truncate_last(&mut self, n_drop: usize) {
+        self.discard_linear_scratch();
         let d = n_drop.min(self.seq_len);
+        if let Some(b) = self.bounded.as_mut() {
+            // The ring rolls back through its undo rows; nothing is
+            // stored per position, so there is nothing else to drop.
+            let rolled = b.rollback(d);
+            if rolled < d {
+                tracing::warn!(
+                    "bounded anchor: rollback of {d} exceeds the undo depth ({rolled} restored)"
+                );
+            }
+            self.seq_len = b.seen;
+            return;
+        }
         for h in 0..self.num_kv_heads {
             let keep = self.k[h].len().saturating_sub(d * self.head_dim);
             self.k[h].truncate(keep);
@@ -1160,24 +1294,36 @@ impl LayerKvCache {
         }
         self.imp.clear();
         self.linear_state.clear();
-        self.linear_scratch.clear();
+        self.discard_linear_scratch();
         // Fresh conversation → the pipeline re-arms collection if the
         // layer is o1-flagged (landmarks are per-prompt, never reused).
         self.o1 = None;
         self.o1_error = None;
         self.o1_transitioned = false;
+        // The bounded ring is zeroed in place: its size is a property of
+        // the file, not of the conversation.
+        if let Some(b) = self.bounded.as_mut() {
+            b.clear();
+        }
         self.seq_len = 0;
     }
 
-    /// Memory usage in bytes.
-    /// Serialize this layer's state for the wire: `f16` halves it and is
-    /// the caller's explicit choice, exactly like the hidden-state wire.
+    /// Serialize this layer's state for the wire (versioned, v2): a
+    /// fixed header `{magic "CMFS", version, operator identity hash64,
+    /// layer, kind, f16 flag, position}` followed by one record whose
+    /// shape the kind fixes — per-position K/V (+ importance) for a full
+    /// layer, the recurrent vector for a linear layer, the insert counter
+    /// + ring K/V for a bounded anchor. `f16` halves the K/V payloads and
+    /// is the caller's explicit choice, exactly like the hidden-state
+    /// wire; recurrent vectors stay f32 whatever the wire dtype (they are
+    /// the ONLY state a linear layer has — rounding them rounds the whole
+    /// history).
     ///
     /// REFUSES rather than travelling half-complete. A cache carrying
-    /// frozen columns, accumulated importance, a Nyström overlay or q8
-    /// storage holds state this format does not describe, and shipping
-    /// the rest would land a plausible-looking cache that answers
-    /// differently — the failure mode this whole format exists to avoid.
+    /// frozen columns, a Nyström overlay or q8 storage holds state this
+    /// format does not describe, and shipping the rest would land a
+    /// plausible-looking cache that answers differently — the failure
+    /// mode this whole format exists to avoid.
     pub fn export_wire(&self, f16: bool) -> Result<Vec<u8>, String> {
         if !matches!(self.mode, KvMode::F32) {
             return Err("kv export: only the F32 cache is described by this                         format (CMF_KV=q8 stores int8 rows and per-row scales)"
@@ -1199,16 +1345,14 @@ impl LayerKvCache {
         }
         let mut out = Vec::with_capacity(self.memory_bytes() / if f16 { 2 } else { 1 } + 64);
         let u = |v: u32, o: &mut Vec<u8>| o.extend_from_slice(&v.to_le_bytes());
-        u(u8::from(f16) as u32, &mut out);
-        u(self.seq_len as u32, &mut out);
-        u(self.num_kv_heads as u32, &mut out);
-        u(self.head_dim as u32, &mut out);
-        u(self.linear_state.len() as u32, &mut out);
-        // Attention importance is ordinary state: every attention call
-        // accumulates it and eviction reads it. Leaving it behind would
-        // hand the far side a cache that forgets the RIGHT positions
-        // later — a divergence that shows up only under pressure.
-        u(self.imp.len() as u32, &mut out);
+        out.extend_from_slice(WIRE_MAGIC);
+        u(WIRE_VERSION, &mut out);
+        out.extend_from_slice(&self.wire_identity.to_le_bytes());
+        u(self.wire_layer, &mut out);
+        out.push(self.wire_kind as u8);
+        out.push(u8::from(f16));
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&(self.seq_len as u64).to_le_bytes());
         let push = |xs: &[f32], o: &mut Vec<u8>| {
             if f16 {
                 for &x in xs {
@@ -1220,9 +1364,58 @@ impl LayerKvCache {
                 }
             }
         };
-        // The recurrent state stays f32 whatever the wire dtype: it
-        // is one small vector per layer and it is the ONLY state a linear
-        // layer has — rounding it rounds the whole history.
+        match self.wire_kind {
+            WireKind::Full => self.export_full_body(f16, &mut out),
+            WireKind::Linear => {
+                u(self.num_kv_heads as u32, &mut out);
+                u(self.head_dim as u32, &mut out);
+                u(self.linear_state.len() as u32, &mut out);
+                for &x in &self.linear_state {
+                    out.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+            WireKind::Bounded => {
+                let b = self
+                    .bounded
+                    .as_ref()
+                    .ok_or("kv export: bounded wire kind without an installed ring")?;
+                u(self.num_kv_heads as u32, &mut out);
+                u(self.head_dim as u32, &mut out);
+                u(b.window as u32, &mut out);
+                u(b.len() as u32, &mut out);
+                u(b.head() as u32, &mut out);
+                push(&b.ring_k, &mut out);
+                push(&b.ring_v, &mut out);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The per-position record (the whole legacy wire): f16 flag,
+    /// seq_len, geometry, recurrent vector, importance, per-head K/V.
+    fn export_full_body(&self, f16: bool, out: &mut Vec<u8>) {
+        let u = |v: u32, o: &mut Vec<u8>| o.extend_from_slice(&v.to_le_bytes());
+        u(u8::from(f16) as u32, out);
+        u(self.seq_len as u32, out);
+        u(self.num_kv_heads as u32, out);
+        u(self.head_dim as u32, out);
+        u(self.linear_state.len() as u32, out);
+        // Attention importance is ordinary state: every attention call
+        // accumulates it and eviction reads it. Leaving it behind would
+        // hand the far side a cache that forgets the RIGHT positions
+        // later — a divergence that shows up only under pressure.
+        u(self.imp.len() as u32, out);
+        let push = |xs: &[f32], o: &mut Vec<u8>| {
+            if f16 {
+                for &x in xs {
+                    o.extend_from_slice(&cortiq_core::quant::f32_to_f16(x).to_le_bytes());
+                }
+            } else {
+                for &x in xs {
+                    o.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+        };
         for &x in &self.linear_state {
             out.extend_from_slice(&x.to_le_bytes());
         }
@@ -1230,17 +1423,212 @@ impl LayerKvCache {
             out.extend_from_slice(&x.to_le_bytes());
         }
         for h in 0..self.num_kv_heads {
-            u(self.k[h].len() as u32, &mut out);
-            push(&self.k[h], &mut out);
-            u(self.v[h].len() as u32, &mut out);
-            push(&self.v[h], &mut out);
+            u(self.k[h].len() as u32, out);
+            push(&self.k[h], out);
+            u(self.v[h].len() as u32, out);
+            push(&self.v[h], out);
         }
-        Ok(out)
     }
 
     /// Install a peer's state over this layer. The geometry must match the
-    /// model both sides hold — it is checked, not assumed.
+    /// model both sides hold — it is checked, not assumed. Accepts the
+    /// versioned wire (magic "CMFS") and, for full/linear layers, the old
+    /// unversioned per-position body.
     pub fn import_wire(&mut self, buf: &[u8]) -> Result<(), String> {
+        if buf.len() >= 4 && &buf[..4] == WIRE_MAGIC {
+            return self.import_wire_v2(buf);
+        }
+        // Legacy (unversioned) wire: no operator tag travels with it.
+        if !self.linear_wire_allowed {
+            return Err(
+                "kv import: Delta linear state cannot use the unversioned cache wire; refusing until the wire carries operator identity".into(),
+            );
+        }
+        if self.bounded.is_some() {
+            return Err(
+                "kv import: a bounded anchor takes only the versioned wire (v2) — the \
+                 unversioned body has no ring record"
+                    .into(),
+            );
+        }
+        let n = self.import_full_body(buf)?;
+        if n != buf.len() {
+            return Err(format!(
+                "kv import: {} trailing byte(s) after the record",
+                buf.len() - n
+            ));
+        }
+        Ok(())
+    }
+
+    fn import_wire_v2(&mut self, buf: &[u8]) -> Result<(), String> {
+        let need = |n: usize, o: usize| -> Result<(), String> {
+            if o + n > buf.len() {
+                Err("kv import: truncated header".into())
+            } else {
+                Ok(())
+            }
+        };
+        need(28, 0)?;
+        let version = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+        if version != WIRE_VERSION {
+            return Err(format!(
+                "kv import: wire version {version}, this runtime speaks {WIRE_VERSION}"
+            ));
+        }
+        let identity = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+        let layer = u32::from_le_bytes(buf[16..20].try_into().unwrap());
+        let kind = WireKind::from_u8(buf[20])
+            .ok_or_else(|| format!("kv import: unknown state kind {}", buf[20]))?;
+        let f16 = buf[21] != 0;
+        let position = u64::from_le_bytes(buf[24..32].try_into().unwrap()) as usize;
+        if identity != self.wire_identity {
+            return Err(format!(
+                "kv import: peer operator identity {identity:016x} != mine {:016x} — \
+                 the two sides do not hold the same operator",
+                self.wire_identity
+            ));
+        }
+        if layer != self.wire_layer {
+            return Err(format!(
+                "kv import: record is for layer {layer}, this is layer {}",
+                self.wire_layer
+            ));
+        }
+        if kind != self.wire_kind {
+            return Err(format!(
+                "kv import: record kind {kind:?} does not match this layer's {:?}",
+                self.wire_kind
+            ));
+        }
+        let mut o = 32usize;
+        let u32_at = |o: &mut usize| -> Result<u32, String> {
+            if *o + 4 > buf.len() {
+                return Err("kv import: truncated record".into());
+            }
+            let v = u32::from_le_bytes(buf[*o..*o + 4].try_into().unwrap());
+            *o += 4;
+            Ok(v)
+        };
+        let need_payload = |n: usize, o: usize| -> Result<(), String> {
+            if o + n > buf.len() {
+                Err("kv import: truncated payload".into())
+            } else {
+                Ok(())
+            }
+        };
+        match kind {
+            WireKind::Full => {
+                let n = self.import_full_body(&buf[o..])?;
+                o += n;
+                if self.seq_len != position {
+                    return Err(format!(
+                        "kv import: header position {position} != record seq_len {}",
+                        self.seq_len
+                    ));
+                }
+            }
+            WireKind::Linear => {
+                let heads = u32_at(&mut o)? as usize;
+                let hd = u32_at(&mut o)? as usize;
+                if heads != self.num_kv_heads || hd != self.head_dim {
+                    return Err(format!(
+                        "kv import: peer sent {heads}×{hd} per position, this layer is {}×{}",
+                        self.num_kv_heads, self.head_dim
+                    ));
+                }
+                let lin = u32_at(&mut o)? as usize;
+                need_payload(lin * 4, o)?;
+                self.linear_state = (0..lin)
+                    .map(|i| f32::from_le_bytes(buf[o + i * 4..o + i * 4 + 4].try_into().unwrap()))
+                    .collect();
+                o += lin * 4;
+                self.reset_per_position_storage();
+                self.seq_len = position;
+            }
+            WireKind::Bounded => {
+                let heads = u32_at(&mut o)? as usize;
+                let hd = u32_at(&mut o)? as usize;
+                let window = u32_at(&mut o)? as usize;
+                let len = u32_at(&mut o)? as usize;
+                let head = u32_at(&mut o)? as usize;
+                let b = self
+                    .bounded
+                    .as_mut()
+                    .ok_or("kv import: bounded record for a layer without a ring")?;
+                if heads != b.num_kv_heads || hd != b.head_dim || window != b.window {
+                    return Err(format!(
+                        "kv import: bounded record {heads}×{window}×{hd} does not fit this \
+                         layer's ring {}×{}×{}",
+                        b.num_kv_heads, b.window, b.head_dim
+                    ));
+                }
+                if len != position.min(window) || head != position % window {
+                    return Err(format!(
+                        "kv import: bounded record len/head {len}/{head} inconsistent with \
+                         position {position} (window {window})"
+                    ));
+                }
+                let n = b.ring_k.len();
+                let w = if f16 { 2 } else { 4 };
+                need_payload(2 * n * w, o)?;
+                let read = |o: usize, dst: &mut [f32]| {
+                    for (i, d) in dst.iter_mut().enumerate() {
+                        let at = o + i * w;
+                        *d = if f16 {
+                            cortiq_core::quant::f16_to_f32(u16::from_le_bytes(
+                                buf[at..at + 2].try_into().unwrap(),
+                            ))
+                        } else {
+                            f32::from_le_bytes(buf[at..at + 4].try_into().unwrap())
+                        };
+                    }
+                };
+                read(o, &mut b.ring_k);
+                o += n * w;
+                read(o, &mut b.ring_v);
+                o += n * w;
+                b.seen = position;
+                // The undo rows describe inserts this side never made.
+                let snap = b.snapshot();
+                b.restore(&snap);
+                self.linear_state = Vec::new();
+                self.reset_per_position_storage();
+                self.seq_len = position;
+            }
+        }
+        if o != buf.len() {
+            return Err(format!(
+                "kv import: {} trailing byte(s) after the record",
+                buf.len() - o
+            ));
+        }
+        Ok(())
+    }
+
+    /// Empty every per-position store (keeps the recurrent vector and
+    /// the bounded ring untouched).
+    fn reset_per_position_storage(&mut self) {
+        let heads = self.num_kv_heads;
+        self.mode = KvMode::F32;
+        self.k = vec![Vec::new(); heads];
+        self.v = vec![Vec::new(); heads];
+        self.kq = vec![Vec::new(); heads];
+        self.ks = vec![Vec::new(); heads];
+        self.vq = vec![Vec::new(); heads];
+        self.vs = vec![Vec::new(); heads];
+        self.kcol = vec![Vec::new(); heads];
+        self.vcol = vec![Vec::new(); heads];
+        self.imp = Vec::new();
+        self.discard_linear_scratch();
+        self.o1 = None;
+        self.o1_error = None;
+        self.o1_transitioned = false;
+    }
+
+    /// Parse the per-position record (legacy wire body); returns the
+    /// bytes consumed.
+    fn import_full_body(&mut self, buf: &[u8]) -> Result<usize, String> {
         let mut o = 0usize;
         let u32_at = |o: &mut usize| -> Result<u32, String> {
             if *o + 4 > buf.len() {
@@ -1302,21 +1690,12 @@ impl LayerKvCache {
                 if which == 0 { k.push(xs) } else { v.push(xs) }
             }
         }
-        self.mode = KvMode::F32;
+        self.reset_per_position_storage();
         self.k = k;
         self.v = v;
-        self.kq = vec![Vec::new(); heads];
-        self.ks = vec![Vec::new(); heads];
-        self.vq = vec![Vec::new(); heads];
-        self.vs = vec![Vec::new(); heads];
-        self.kcol = vec![Vec::new(); heads];
-        self.vcol = vec![Vec::new(); heads];
         self.imp = imp;
-        self.o1 = None;
-        self.o1_error = None;
-        self.o1_transitioned = false;
         self.seq_len = seq_len;
-        Ok(())
+        Ok(o)
     }
 
     pub fn memory_bytes(&self) -> usize {
@@ -1337,6 +1716,9 @@ impl LayerKvCache {
             // O(1) Nyström state (window + sinks + skeleton) — same
             // discipline: constant in context, but real memory.
             + self.o1_memory_bytes()
+            // Natively bounded anchor: the ring is the whole state of the
+            // layer, fixed by the header.
+            + self.bounded_state_bytes()
     }
 
     /// Drop oldest positions, keeping the last `keep_last`.
@@ -1347,8 +1729,9 @@ impl LayerKvCache {
         // rows.  A sealed layer stores nothing per position — the Nyström
         // state IS the eviction policy; resetting seq_len here would lie
         // about the context depth.  Both states therefore bypass ordinary
-        // eviction until the transition or explicit reset completes.
-        if self.o1.is_some() || self.seq_len <= keep_last {
+        // eviction until the transition or explicit reset completes.  A
+        // bounded anchor likewise: the ring evicts itself every token.
+        if self.o1.is_some() || self.bounded.is_some() || self.seq_len <= keep_last {
             return;
         }
         let drop = self.seq_len - keep_last;
@@ -1378,9 +1761,10 @@ impl LayerKvCache {
     /// with the positions carrying the highest accumulated attention
     /// mass (vmfcore: PPL 8.342 vs 8.687 for recency-only, full 8.295).
     fn evict_born(&mut self, keep_last: usize, sink: usize, recent: usize) {
-        if self.o1.is_some() {
+        if self.o1.is_some() || self.bounded.is_some() {
             // See evict(): collecting must retain the exact prefix as well as
-            // sealed O(1) state must retain its own bounded representation.
+            // sealed O(1) state must retain its own bounded representation;
+            // a bounded anchor's ring is its own eviction.
             return;
         }
         let stored = self.imp.len();
@@ -1473,7 +1857,11 @@ impl KvCache {
         max_seq_len: usize,
     ) -> Self {
         let layers = (0..num_layers)
-            .map(|_| LayerKvCache::new(num_kv_heads, head_dim))
+            .map(|li| {
+                let mut l = LayerKvCache::new(num_kv_heads, head_dim);
+                l.wire_layer = li as u32;
+                l
+            })
             .collect();
         Self {
             layers,
@@ -1492,13 +1880,47 @@ impl KvCache {
         self.layers.iter().map(|l| l.memory_bytes()).sum()
     }
 
+    /// Bytes owned by linear-core recurrent state (including the tentative
+    /// speculative scratch).  This is reported separately from attention KV
+    /// so a serving slot's O(1) capacity can be compared with its context
+    /// cache without guessing from model geometry.
+    pub fn recurrent_state_bytes(&self) -> usize {
+        let floats: usize = self
+            .layers
+            .iter()
+            .map(|l| l.linear_state.len() + l.linear_scratch.len())
+            .sum();
+        floats * std::mem::size_of::<f32>()
+    }
+
+    /// Attention KV (or sealed O(1) attention state) bytes, excluding the
+    /// linear recurrent vectors returned by [`recurrent_state_bytes`].
+    pub fn attention_state_bytes(&self) -> usize {
+        self.total_memory_bytes()
+            .saturating_sub(self.recurrent_state_bytes())
+    }
+
     /// Current sequence length (max across layers — dead layers may lag).
     pub fn seq_len(&self) -> usize {
         self.layers.iter().map(|l| l.seq_len).max().unwrap_or(0)
     }
 
+    /// Bytes owned by bounded-anchor rings (constant in context).
+    pub fn bounded_state_bytes(&self) -> usize {
+        self.layers.iter().map(|l| l.bounded_state_bytes()).sum()
+    }
+
+    /// True when some layer with PER-POSITION storage reached the cap.
+    /// Bounded anchors hold nothing per position and never need it: a
+    /// model whose every layer is O(1) has no eviction cliff at all.
     pub fn needs_eviction(&self) -> bool {
-        self.seq_len() >= self.max_seq_len
+        self.layers
+            .iter()
+            .filter(|l| l.bounded.is_none())
+            .map(|l| l.seq_len)
+            .max()
+            .unwrap_or(0)
+            >= self.max_seq_len
     }
 
     /// Evict down to `keep_last` positions according to the policy.
@@ -1524,6 +1946,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn memory_breakdown_separates_recurrent_and_attention_state() {
+        let mut cache = KvCache::new(1, 1, 4, 16);
+        cache.layers[0].linear_state = vec![0.0; 8];
+        cache.layers[0].linear_scratch = vec![0.0; 4];
+        cache.layers[0].append(&[0.0; 4], &[1.0; 4], &[true]);
+        let recurrent = cache.recurrent_state_bytes();
+        assert_eq!(recurrent, 12 * std::mem::size_of::<f32>());
+        assert_eq!(
+            cache.attention_state_bytes() + recurrent,
+            cache.total_memory_bytes()
+        );
+        assert!(cache.attention_state_bytes() > 0);
+    }
+
+    #[test]
     fn wire_round_trip_reproduces_attention() {
         // The state has to arrive as state, not as something that looks
         // like it: the oracle is what the layer ANSWERS, not what it
@@ -1544,7 +1981,12 @@ mod tests {
 
         let bytes = a.export_wire(false).expect("f32 cache exports");
         let mut b = LayerKvCache::new(heads, hd);
+        b.linear_scratch = vec![9.0; 3];
         b.import_wire(&bytes).expect("import");
+        assert!(
+            b.linear_scratch.is_empty(),
+            "import must discard tentative state"
+        );
 
         assert_eq!(b.seq_len, a.seq_len);
         assert_eq!(b.linear_state, a.linear_state);
@@ -1564,6 +2006,66 @@ mod tests {
         c.mode = KvMode::Q8 { k: true, v: true };
         let err = c.export_wire(false).unwrap_err();
         assert!(err.contains("F32"), "{err}");
+    }
+
+    #[test]
+    fn wire_refuses_unversioned_delta_state() {
+        // The versioned wire carries the operator identity, so a delta
+        // layer exports; only the OLD unversioned body is refused.
+        let mut c = LayerKvCache::new(1, 4);
+        c.set_linear_wire_allowed(false);
+        let bytes = c.export_wire(false).expect("v2 export carries identity");
+        assert_eq!(&bytes[..4], WIRE_MAGIC);
+        let err = c.import_wire(&[0, 0, 0, 0]).unwrap_err();
+        assert!(err.contains("operator identity"), "{err}");
+    }
+
+    #[test]
+    fn wire_v2_round_trips_linear_and_bounded_records() {
+        // Linear record: the recurrent vector travels f32 whatever the
+        // wire dtype and the per-position stores come back empty.
+        let mut a = LayerKvCache::new(1, 4);
+        a.wire_kind = WireKind::Linear;
+        a.wire_identity = 0xC0FFEE;
+        a.linear_state = vec![0.5, -0.25, 1.0, 3.5];
+        a.seq_len = 9;
+        let bytes = a.export_wire(true).unwrap();
+        let mut b = LayerKvCache::new(1, 4);
+        b.wire_kind = WireKind::Linear;
+        b.wire_identity = 0xC0FFEE;
+        b.import_wire(&bytes).unwrap();
+        assert_eq!(b.linear_state, a.linear_state);
+        assert_eq!(b.seq_len, 9);
+        // Identity mismatch is a refusal, not a warning.
+        let mut c = LayerKvCache::new(1, 4);
+        c.wire_kind = WireKind::Linear;
+        let err = c.import_wire(&bytes).unwrap_err();
+        assert!(err.contains("operator identity"), "{err}");
+
+        // Bounded record, f32 and f16 rings.
+        let (kvh, hd, w) = (2, 4, 8);
+        let mut a = LayerKvCache::new(kvh, hd);
+        a.install_bounded(w);
+        let k: Vec<f32> = (0..kvh * hd).map(|i| i as f32 * 0.125).collect();
+        for p in 0..11 {
+            a.bounded.as_mut().unwrap().insert(&k, &k);
+            a.seq_len = p + 1;
+        }
+        for f16 in [false, true] {
+            let bytes = a.export_wire(f16).unwrap();
+            let mut b = LayerKvCache::new(kvh, hd);
+            b.install_bounded(w);
+            b.import_wire(&bytes).unwrap();
+            let (ra, rb) = (a.bounded.as_ref().unwrap(), b.bounded.as_ref().unwrap());
+            assert_eq!(rb.seen, 11);
+            assert_eq!(b.seq_len, 11);
+            // 0.125 multiples are exact in f16, so both dtypes round-trip bit for bit.
+            assert!(ra.same_state(rb), "f16={f16}");
+            // A ring of another width refuses the record.
+            let mut c = LayerKvCache::new(kvh, hd);
+            c.install_bounded(w * 2);
+            assert!(c.import_wire(&bytes).is_err());
+        }
     }
 
     #[test]

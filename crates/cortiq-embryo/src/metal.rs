@@ -32,6 +32,19 @@ pub struct Ctx {
     axpby: ComputePipelineState,
     adamw: ComputePipelineState,
     sumsq: ComputePipelineState,
+    dot_accum: ComputePipelineState,
+    gdn_fwd: ComputePipelineState,
+    gdn_bwd: ComputePipelineState,
+    /// Parallel 64-thread-group GDN scan used by the training path.  The
+    /// serial kernels above remain the deterministic oracle/fallback.
+    gdn_fwd_par: ComputePipelineState,
+    gdn_bwd_par: ComputePipelineState,
+    /// GDN mixer token scan (checkpoint + replay, multi-head).
+    gdn_scan_fwd: ComputePipelineState,
+    gdn_scan_bwd: ComputePipelineState,
+    gdn_scan_fold: ComputePipelineState,
+    silu_fwd: ComputePipelineState,
+    silu_bwd: ComputePipelineState,
     rms_fwd: ComputePipelineState,
     rms_bwd_dx: ComputePipelineState,
     rms_dw: ComputePipelineState,
@@ -43,6 +56,7 @@ pub struct Ctx {
     embed_gather: ComputePipelineState,
     softmax_ce: ComputePipelineState,
     hk_phi: ComputePipelineState,
+    phase_delta_phi: ComputePipelineState,
     hk_dtheta: ComputePipelineState,
     hk_kv: ComputePipelineState,
     hk_dkv_split: ComputePipelineState,
@@ -57,20 +71,31 @@ pub struct Ctx {
     sigmoid_bwd: ComputePipelineState,
     embed_scatter_add: ComputePipelineState,
     copy: ComputePipelineState,
+    block_copy: ComputePipelineState,
+    slice_cols: ComputePipelineState,
+    pad_cols: ComputePipelineState,
     kappa_fwd: ComputePipelineState,
     kappa_bwd: ComputePipelineState,
     hk_scale: ComputePipelineState,
     hk_unscale: ComputePipelineState,
     hk_states_par: ComputePipelineState,
     hk_dstates_par: ComputePipelineState,
+    phase_delta_fwd: ComputePipelineState,
+    phase_delta_bwd: ComputePipelineState,
+    phase_delta_fold: ComputePipelineState,
     gather_rows: ComputePipelineState,
     scatter_add_rows: ComputePipelineState,
     softmax_ce_idx: ComputePipelineState,
     group_sum: ComputePipelineState,
+    sink_grad_accum: ComputePipelineState,
     route: ComputePipelineState,
+    route_smooth_k4: ComputePipelineState,
+    route_top2: ComputePipelineState,
     route_group: ComputePipelineState,
     moe_gather: ComputePipelineState,
+    moe_gather_weighted: ComputePipelineState,
     moe_scatter_add: ComputePipelineState,
+    moe_scatter_add_weighted: ComputePipelineState,
     moe_stats: ComputePipelineState,
     moe_update: ComputePipelineState,
     moe_indirect: ComputePipelineState,
@@ -152,6 +177,16 @@ fn init() -> Result<Ctx, String> {
         axpby: pso("axpby_f32")?,
         adamw: pso("adamw_f32")?,
         sumsq: pso("sumsq_f32")?,
+        dot_accum: pso("dot_accum_f32")?,
+        gdn_fwd: pso("gdn_fwd_f32")?,
+        gdn_bwd: pso("gdn_bwd_f32")?,
+        gdn_fwd_par: pso("gdn_fwd_par_f32")?,
+        gdn_bwd_par: pso("gdn_bwd_par_f32")?,
+        gdn_scan_fwd: pso("gdn_scan_fwd_f32")?,
+        gdn_scan_bwd: pso("gdn_scan_bwd_f32")?,
+        gdn_scan_fold: pso("gdn_scan_fold_f32")?,
+        silu_fwd: pso("silu_fwd_f32")?,
+        silu_bwd: pso("silu_bwd_f32")?,
         rms_fwd: pso("rmsnorm_fwd_f32")?,
         rms_bwd_dx: pso("rmsnorm_bwd_dx_f32")?,
         rms_dw: pso("rmsnorm_dw_f32")?,
@@ -163,6 +198,7 @@ fn init() -> Result<Ctx, String> {
         embed_gather: pso("embed_gather_f32")?,
         softmax_ce: pso("softmax_ce_f32")?,
         hk_phi: pso("hk_phi_f32")?,
+        phase_delta_phi: pso("phase_delta_phi_f32")?,
         hk_dtheta: pso("hk_dtheta_f32")?,
         hk_kv: pso("hk_kv_f32")?,
         hk_dkv_split: pso("hk_dkv_split_f32")?,
@@ -177,20 +213,31 @@ fn init() -> Result<Ctx, String> {
         sigmoid_bwd: pso("sigmoid_bwd_f32")?,
         embed_scatter_add: pso("embed_scatter_add_f32")?,
         copy: pso("copy_f32")?,
+        block_copy: pso("block_copy_f32")?,
+        slice_cols: pso("slice_cols_f32")?,
+        pad_cols: pso("pad_cols_f32")?,
         kappa_fwd: pso("kappa_fwd_f32")?,
         kappa_bwd: pso("kappa_bwd_f32")?,
         hk_scale: pso("hk_scale_f32")?,
         hk_unscale: pso("hk_unscale_f32")?,
         hk_states_par: pso("hk_states_fwd_par_f32")?,
         hk_dstates_par: pso("hk_dstates_bwd_par_f32")?,
+        phase_delta_fwd: pso("phase_delta_fwd_f32")?,
+        phase_delta_bwd: pso("phase_delta_bwd_f32")?,
+        phase_delta_fold: pso("phase_delta_fold_f32")?,
         gather_rows: pso("gather_rows_f32")?,
         scatter_add_rows: pso("scatter_add_rows_f32")?,
         softmax_ce_idx: pso("softmax_ce_idx_f32")?,
         group_sum: pso("group_sum_heads_f32")?,
+        sink_grad_accum: pso("sink_grad_accum_f32")?,
         route: pso("route_f32")?,
+        route_smooth_k4: pso("route_smooth_k4_f32")?,
+        route_top2: pso("route_top2_f32")?,
         route_group: pso("route_group_f32")?,
         moe_gather: pso("moe_gather_f32")?,
+        moe_gather_weighted: pso("moe_gather_weighted_f32")?,
         moe_scatter_add: pso("moe_scatter_add_f32")?,
+        moe_scatter_add_weighted: pso("moe_scatter_add_weighted_f32")?,
         moe_stats: pso("moe_stats_f32")?,
         moe_update: pso("moe_update_f32")?,
         moe_indirect: pso("moe_indirect_args_f32")?,
@@ -249,6 +296,9 @@ impl GBuf {
     pub fn as_slice(&self) -> &[f32] {
         unsafe { std::slice::from_raw_parts(self.buf.contents() as *const f32, self.len) }
     }
+    pub fn as_u32_slice(&self) -> &[u32] {
+        unsafe { std::slice::from_raw_parts(self.buf.contents() as *const u32, self.len) }
+    }
     /// Host view for writes. Only valid while no command buffer touching
     /// this buffer is in flight — the caller sequences that.
     #[allow(clippy::mut_from_ref)]
@@ -269,19 +319,46 @@ impl GBuf {
     }
 }
 
+/// Argument block of the GDN scan kernels (`GdnScanArgs` in shaders.metal).
+#[repr(C)]
+#[allow(dead_code)]
+struct GdnScanArgsRepr {
+    b: u32,
+    t: u32,
+    nv: u32,
+    dk: u32,
+    dv: u32,
+    c_dim: u32,
+    ab_ld: u32,
+    flags: u32,
+}
+
 /// One command buffer's worth of encoded work. `commit()` submits and
 /// waits; kernels encoded in one Cmd run in order (one compute encoder).
 pub struct Cmd<'a> {
     c: &'a Ctx,
     cb: metal::CommandBuffer,
     enc: metal::ComputeCommandEncoder,
+    /// hybrid_k forward scans encoded while set start from checkpoint slot 0
+    /// (state carried across windows) instead of S = 0.
+    hk_carry: std::cell::Cell<bool>,
 }
 
 impl<'a> Cmd<'a> {
+    /// Select the carried-state start for the hybrid_k forward scans encoded
+    /// after this call (see `HkArgs.carry`).
+    pub fn set_hk_carry(&self, on: bool) {
+        self.hk_carry.set(on);
+    }
     pub fn new(c: &'a Ctx) -> Cmd<'a> {
         let cb = c.queue.new_command_buffer().to_owned();
         let enc = cb.new_compute_command_encoder().to_owned();
-        Cmd { c, cb, enc }
+        Cmd {
+            c,
+            cb,
+            enc,
+            hk_carry: std::cell::Cell::new(false),
+        }
     }
 
     /// C[M,N] = alpha·op(A)·op(B) + beta·C. Leading dimensions are the
@@ -820,6 +897,7 @@ impl<'a> Cmd<'a> {
             nh: u32,
             nph: u32,
             dv: u32,
+            carry: u32,
         }
         let a = Args {
             b: d.b as u32,
@@ -827,6 +905,7 @@ impl<'a> Cmd<'a> {
             nh: d.nh as u32,
             nph: d.nph as u32,
             dv: d.dv as u32,
+            carry: self.hk_carry.get() as u32,
         };
         self.enc.set_bytes(
             idx,
@@ -883,6 +962,124 @@ impl<'a> Cmd<'a> {
             MTLSize::new((d.b * d.nh * nchunks) as u64, 1, 1),
             MTLSize::new(d.dv.max(128) as u64, 1, 1),
         );
+    }
+
+    /// Forward of the parameter-neutral in-place Phase-Delta recurrence.
+    /// The dedicated kernel keeps the legacy HK path untouched when the
+    /// feature discriminator is false.  State checkpoints remain chunk
+    /// boundaries; the kernel writes the post-write output.
+    pub fn phase_delta_forward(&self, d: &HkDims, w: &HkWork<'_>) {
+        phase_delta_check(d, w);
+        let e = &self.enc;
+        let rows = d.b * d.t;
+        for (th, ph) in [(w.thq, w.phq), (w.thk, w.phk)] {
+            e.set_compute_pipeline_state(&self.c.phase_delta_phi);
+            e.set_buffer(0, Some(&th.buf), 0);
+            e.set_buffer(1, Some(&ph.buf), 0);
+            self.hk_args(2, d);
+            self.grid1(rows * d.nh * d.nph, 256);
+        }
+        e.set_compute_pipeline_state(&self.c.phase_delta_fwd);
+        e.set_buffer(0, Some(&w.phq.buf), 0);
+        e.set_buffer(1, Some(&w.phk.buf), 0);
+        e.set_buffer(2, Some(&w.v.buf), 0);
+        e.set_buffer(3, Some(&w.kappa.buf), 0);
+        e.set_buffer(4, Some(&w.pow.buf), (w.pow_off * 4) as u64);
+        e.set_buffer(5, Some(&w.states.buf), 0);
+        e.set_buffer(6, Some(&w.out.buf), 0);
+        self.hk_args(7, d);
+        // Each state column is independent; 32-thread groups keep the
+        // private feature-column state resident without overprovisioning a
+        // 256-thread group. Dispatch explicit value blocks so tail lanes can
+        // participate in the SIMD group without crossing (B,H) owners.
+        let nblocks = d.dv.div_ceil(32);
+        e.dispatch_thread_groups(
+            MTLSize::new((d.b * d.nh * nblocks) as u64, 1, 1),
+            MTLSize::new(32, 1, 1),
+        );
+    }
+
+    /// Full-batch training/evaluation wrapper: reset every recurrent
+    /// checkpoint before invoking the continuation-capable scan above.
+    pub fn phase_delta_forward_reset(&self, d: &HkDims, w: &HkWork<'_>) {
+        self.axpby(0.0, w.states, 0.0, w.states, w.states.len);
+        self.phase_delta_forward(d, w);
+    }
+
+    /// Exact reverse recurrence. One 32-lane SIMD group owns each value block
+    /// of one `(batch,head)` pair; each lane carries its value-column adjoint
+    /// and writes deterministic block partials. A separate fixed-order fold
+    /// combines blocks into the final angle and gate gradients.
+    pub fn phase_delta_backward(&self, d: &HkDims, w: &HkWork<'_>, g: &HkGrads<'_>) {
+        self.phase_delta_backward_blocks(d, w, g);
+        self.phase_delta_fold(d, w, g);
+    }
+
+    pub fn phase_delta_backward_blocks(&self, d: &HkDims, w: &HkWork<'_>, g: &HkGrads<'_>) {
+        phase_delta_check(d, w);
+        let rows = d.b * d.t;
+        let chunk = w
+            .phase_chunk
+            .expect("Phase-Delta backward requires bounded chunk scratch");
+        let partial = w
+            .phase_partial
+            .expect("Phase-Delta backward requires block partial scratch");
+        let chunk_len = d.b * d.nh * 65 * 2 * d.nph * d.dv;
+        let nblocks = d.dv.div_ceil(32);
+        let partial_len = d.b * d.nh * nblocks * d.t * (1 + 2 * d.nph);
+        assert!(chunk.len >= chunk_len);
+        assert!(partial.len >= partial_len);
+        assert!(g.dout.len >= rows * d.nh * d.dv);
+        self.phase_delta_zero_grads(d, w, g);
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.phase_delta_bwd);
+        e.set_buffer(0, Some(&w.thq.buf), 0);
+        e.set_buffer(1, Some(&w.thk.buf), 0);
+        e.set_buffer(2, Some(&w.phq.buf), 0);
+        e.set_buffer(3, Some(&w.phk.buf), 0);
+        e.set_buffer(4, Some(&w.v.buf), 0);
+        e.set_buffer(5, Some(&w.kappa.buf), 0);
+        e.set_buffer(6, Some(&w.pow.buf), (w.pow_off * 4) as u64);
+        e.set_buffer(7, Some(&g.dout.buf), 0);
+        e.set_buffer(8, Some(&g.dthq.buf), 0);
+        e.set_buffer(9, Some(&g.dthk.buf), 0);
+        e.set_buffer(10, Some(&g.dv.buf), 0);
+        e.set_buffer(11, Some(&g.dkappa.buf), 0);
+        e.set_buffer(12, Some(&w.states.buf), 0);
+        e.set_buffer(13, Some(&g.dstates.buf), 0);
+        e.set_buffer(14, Some(&chunk.buf), 0);
+        e.set_buffer(15, Some(&partial.buf), 0);
+        self.hk_args(16, d);
+        e.dispatch_thread_groups(
+            MTLSize::new((d.b * d.nh * nblocks) as u64, 1, 1),
+            MTLSize::new(32, 1, 1),
+        );
+    }
+
+    pub fn phase_delta_zero_grads(&self, d: &HkDims, w: &HkWork<'_>, g: &HkGrads<'_>) {
+        let rows = d.b * d.t;
+        self.axpby(0.0, g.dthq, 0.0, g.dthq, rows * d.nh * d.nph);
+        self.axpby(0.0, g.dthk, 0.0, g.dthk, rows * d.nh * d.nph);
+        self.axpby(0.0, g.dv, 0.0, g.dv, rows * d.nh * d.dv);
+        self.axpby(0.0, g.dkappa, 0.0, g.dkappa, rows * d.nh);
+        self.axpby(0.0, g.dstates, 0.0, g.dstates, w.states.len);
+    }
+
+    pub fn phase_delta_fold(&self, d: &HkDims, w: &HkWork<'_>, g: &HkGrads<'_>) {
+        phase_delta_check(d, w);
+        let partial = w
+            .phase_partial
+            .expect("Phase-Delta fold requires block partial scratch");
+        let nblocks = d.dv.div_ceil(32);
+        assert!(partial.len >= d.b * d.nh * nblocks * d.t * (1 + 2 * d.nph));
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.phase_delta_fold);
+        e.set_buffer(0, Some(&partial.buf), 0);
+        e.set_buffer(1, Some(&g.dthq.buf), 0);
+        e.set_buffer(2, Some(&g.dthk.buf), 0);
+        e.set_buffer(3, Some(&g.dkappa.buf), 0);
+        self.hk_args(4, d);
+        self.grid1(d.b * d.t * d.nh, 256);
     }
 
     /// Backward of one hybrid_k mixer layer given dout [B·T, nh·dv].
@@ -967,6 +1164,25 @@ impl<'a> Cmd<'a> {
         base: f32,
         inverse: bool,
     ) {
+        self.rope_at(x, x_off, rows, t, nheads, hd, base, inverse, 0)
+    }
+
+    /// `rope` with the positions shifted by `pos0` (position = row % t + pos0):
+    /// the carried-anchor layout rotates the window at pos0 = carry_pad and
+    /// the carried keys at 0..carry_pad, keeping every relative angle exact.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_at(
+        &self,
+        x: &GBuf,
+        x_off: usize,
+        rows: usize,
+        t: usize,
+        nheads: usize,
+        hd: usize,
+        base: f32,
+        inverse: bool,
+        pos0: usize,
+    ) {
         assert!(hd % 2 == 0 && x.len >= x_off + rows * nheads * hd);
         #[repr(C)]
         struct Args {
@@ -975,8 +1191,10 @@ impl<'a> Cmd<'a> {
             hd: u32,
             base: f32,
             sign: f32,
+            pos0: u32,
         }
         let a = Args {
+            pos0: pos0 as u32,
             t: t as u32,
             nheads: nheads as u32,
             hd: hd as u32,
@@ -996,23 +1214,12 @@ impl<'a> Cmd<'a> {
 
     /// Causal row softmax in place on an [t,t] block at `off` (row stride t).
     pub fn causal_softmax(&self, s: &GBuf, off: usize, t: usize) {
-        assert!(s.len >= off + t * t);
-        let e = &self.enc;
-        e.set_compute_pipeline_state(&self.c.causal_softmax);
-        e.set_buffer(0, Some(&s.buf), (off * 4) as u64);
-        self.set_u32(1, t as u32);
-        e.dispatch_thread_groups(MTLSize::new(t as u64, 1, 1), MTLSize::new(256, 1, 1));
+        self.causal_softmax_blocks(s, off, t, 1)
     }
 
     /// dS = P ⊙ (dP − rowsum(P⊙dP)) in place on dP ([t,t] blocks at offsets).
     pub fn softmax_bwd(&self, p: &GBuf, p_off: usize, dp: &GBuf, dp_off: usize, t: usize) {
-        assert!(p.len >= p_off + t * t && dp.len >= dp_off + t * t);
-        let e = &self.enc;
-        e.set_compute_pipeline_state(&self.c.softmax_bwd);
-        e.set_buffer(0, Some(&p.buf), (p_off * 4) as u64);
-        e.set_buffer(1, Some(&dp.buf), (dp_off * 4) as u64);
-        self.set_u32(2, t as u32);
-        e.dispatch_thread_groups(MTLSize::new(t as u64, 1, 1), MTLSize::new(256, 1, 1));
+        self.softmax_bwd_blocks(p, p_off, dp, dp_off, t, 1)
     }
 
     /// y = σ(x + bias) over n.
@@ -1063,6 +1270,54 @@ impl<'a> Cmd<'a> {
         );
     }
 
+    /// Strided block copy with an optional per-row mask (state carry-over):
+    /// `dst[dst_off + blk·dst_stride ..+len] = src[src_off + blk·src_stride ..+len]`
+    /// for `blk < nblk`, or zeros where `mask[blk / mask_div] == 0`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn block_copy(
+        &self,
+        src: &GBuf,
+        src_off: usize,
+        src_stride: usize,
+        dst: &GBuf,
+        dst_off: usize,
+        dst_stride: usize,
+        nblk: usize,
+        len: usize,
+        mask: Option<(&GBuf, usize)>,
+    ) {
+        assert!(src.len >= src_off + (nblk - 1) * src_stride + len);
+        assert!(dst.len >= dst_off + (nblk - 1) * dst_stride + len);
+        #[repr(C)]
+        struct Args {
+            nblk: u32,
+            len: u32,
+            src_off: u32,
+            src_stride: u32,
+            dst_off: u32,
+            dst_stride: u32,
+            mask_div: u32,
+            use_mask: u32,
+        }
+        let a = Args {
+            nblk: nblk as u32,
+            len: len as u32,
+            src_off: src_off as u32,
+            src_stride: src_stride as u32,
+            dst_off: dst_off as u32,
+            dst_stride: dst_stride as u32,
+            mask_div: mask.map_or(1, |m| m.1.max(1)) as u32,
+            use_mask: mask.is_some() as u32,
+        };
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.block_copy);
+        e.set_buffer(0, Some(&src.buf), 0);
+        e.set_buffer(1, Some(&dst.buf), 0);
+        e.set_buffer(2, Some(&mask.map_or(src, |m| m.0).buf), 0);
+        e.set_bytes(3, std::mem::size_of::<Args>() as u64, &a as *const Args as *const c_void);
+        self.grid1(nblk * len, 256);
+    }
+
     /// dst[dst_off..+n] = src[src_off..+n].
     pub fn copy(&self, src: &GBuf, src_off: usize, dst: &GBuf, dst_off: usize, n: usize) {
         assert!(src.len >= src_off + n && dst.len >= dst_off + n);
@@ -1072,6 +1327,515 @@ impl<'a> Cmd<'a> {
         e.set_buffer(1, Some(&dst.buf), (dst_off * 4) as u64);
         self.set_u32(2, n as u32);
         self.grid1(n, 256);
+    }
+
+    /// Copy the first `cols` columns from row-major `[rows, src_cols]` into a
+    /// compact `[rows, cols]` destination.  Used to keep the q/k projections
+    /// GEMM-tile aligned while feeding the 32-phase correction recurrence.
+    pub fn slice_cols(&self, src: &GBuf, dst: &GBuf, rows: usize, src_cols: usize, cols: usize) {
+        assert!(src.len >= rows * src_cols && dst.len >= rows * cols);
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.slice_cols);
+        e.set_buffer(0, Some(&src.buf), 0);
+        e.set_buffer(1, Some(&dst.buf), 0);
+        self.set_u32x4(2, [rows as u32, src_cols as u32, cols as u32, 0]);
+        e.dispatch_thread_groups(
+            MTLSize::new((rows * cols) as u64, 1, 1),
+            MTLSize::new(1, 1, 1),
+        );
+    }
+
+    /// Pad a compact row-major matrix with zero columns (source and
+    /// destination may be distinct buffers).  This bridges 32-wide phase
+    /// gradients to the 64-wide GEMM tile contract.
+    pub fn pad_cols(&self, src: &GBuf, dst: &GBuf, rows: usize, src_cols: usize, cols: usize) {
+        assert!(src.len >= rows * src_cols && dst.len >= rows * cols && cols >= src_cols);
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.pad_cols);
+        e.set_buffer(0, Some(&src.buf), 0);
+        e.set_buffer(1, Some(&dst.buf), 0);
+        self.set_u32x4(2, [rows as u32, src_cols as u32, cols as u32, 0]);
+        e.dispatch_thread_groups(
+            MTLSize::new((rows * cols) as u64, 1, 1),
+            MTLSize::new(1, 1, 1),
+        );
+    }
+
+    /// Accumulate the elementwise dot product `a·b` into `dst[dst_off]`.
+    /// A single GPU thread performs the deterministic reduction; this is used
+    /// only for the seven scalar GDN residual-gain gradients and keeps the
+    /// whole backward graph on the command buffer.
+    pub fn dot_accum(&self, a: &GBuf, b: &GBuf, dst: &GBuf, dst_off: usize, n: usize) {
+        assert!(a.len >= n && b.len >= n && dst.len > dst_off);
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.dot_accum);
+        e.set_buffer(0, Some(&a.buf), 0);
+        e.set_buffer(1, Some(&b.buf), 0);
+        e.set_buffer(2, Some(&dst.buf), (dst_off * 4) as u64);
+        self.set_u32(3, n as u32);
+        e.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
+    }
+
+    /// Exact ordinary one-head GDN forward recurrence.  The projection GEMMs
+    /// produce raw q/k/v/z and the padded a/b controls; this kernel applies
+    /// causal depthwise convolution, q/k normalization, gated decay/update,
+    /// and output RMSNorm while retaining the recurrent state trace.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_forward(
+        &self,
+        qraw: &GBuf,
+        kraw: &GBuf,
+        vraw: &GBuf,
+        zraw: &GBuf,
+        ab: &GBuf,
+        p: &GBuf,
+        conv_off: usize,
+        norm_off: usize,
+        alog_off: usize,
+        dt_off: usize,
+        qcv: &GBuf,
+        kcv: &GBuf,
+        vcv: &GBuf,
+        beta: &GBuf,
+        raw_o: &GBuf,
+        inv: &GBuf,
+        out: &GBuf,
+        states: &GBuf,
+        b: usize,
+        t: usize,
+        eps: f32,
+    ) {
+        assert!(qraw.len >= b * t * 64 && kraw.len >= b * t * 64 && vraw.len >= b * t * 64);
+        assert!(zraw.len >= b * t * 64 && ab.len >= b * t * 64);
+        #[repr(C)]
+        struct Args {
+            b: u32,
+            t: u32,
+            eps: f32,
+            _pad: u32,
+        }
+        let args = Args {
+            b: b as u32,
+            t: t as u32,
+            eps,
+            _pad: 0,
+        };
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.gdn_fwd);
+        for (i, x) in [qraw, kraw, vraw, zraw, ab].iter().enumerate() {
+            e.set_buffer(i as u64, Some(&x.buf), 0);
+        }
+        e.set_buffer(5, Some(&p.buf), (conv_off * 4) as u64);
+        e.set_buffer(6, Some(&p.buf), (norm_off * 4) as u64);
+        e.set_buffer(7, Some(&p.buf), (alog_off * 4) as u64);
+        e.set_buffer(8, Some(&p.buf), (dt_off * 4) as u64);
+        for (i, x) in [qcv, kcv, vcv, beta, raw_o, inv, out, states]
+            .iter()
+            .enumerate()
+        {
+            e.set_buffer((9 + i) as u64, Some(&x.buf), 0);
+        }
+        e.set_bytes(
+            17,
+            std::mem::size_of::<Args>() as u64,
+            &args as *const Args as *const c_void,
+        );
+        e.dispatch_thread_groups(MTLSize::new(b as u64, 1, 1), MTLSize::new(1, 1, 1));
+    }
+
+    /// Parallel exact ordinary GDN forward.  One 64-thread threadgroup owns
+    /// each batch sequence; time remains a causal loop with barriers while
+    /// channels, state rows, and output reductions run concurrently.  The
+    /// serial [`gdn_forward`] method is intentionally retained as the oracle
+    /// and can be selected by callers that need the fallback path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_forward_parallel(
+        &self,
+        qraw: &GBuf,
+        kraw: &GBuf,
+        vraw: &GBuf,
+        zraw: &GBuf,
+        ab: &GBuf,
+        p: &GBuf,
+        conv_off: usize,
+        norm_off: usize,
+        alog_off: usize,
+        dt_off: usize,
+        qcv: &GBuf,
+        kcv: &GBuf,
+        vcv: &GBuf,
+        beta: &GBuf,
+        raw_o: &GBuf,
+        inv: &GBuf,
+        out: &GBuf,
+        states: &GBuf,
+        b: usize,
+        t: usize,
+        eps: f32,
+    ) {
+        assert!(qraw.len >= b * t * 64 && kraw.len >= b * t * 64 && vraw.len >= b * t * 64);
+        assert!(zraw.len >= b * t * 64 && ab.len >= b * t * 64);
+        #[repr(C)]
+        struct Args {
+            b: u32,
+            t: u32,
+            eps: f32,
+            _pad: u32,
+        }
+        let args = Args {
+            b: b as u32,
+            t: t as u32,
+            eps,
+            _pad: 0,
+        };
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.gdn_fwd_par);
+        for (i, x) in [qraw, kraw, vraw, zraw, ab].iter().enumerate() {
+            e.set_buffer(i as u64, Some(&x.buf), 0);
+        }
+        e.set_buffer(5, Some(&p.buf), (conv_off * 4) as u64);
+        e.set_buffer(6, Some(&p.buf), (norm_off * 4) as u64);
+        e.set_buffer(7, Some(&p.buf), (alog_off * 4) as u64);
+        e.set_buffer(8, Some(&p.buf), (dt_off * 4) as u64);
+        for (i, x) in [qcv, kcv, vcv, beta, raw_o, inv, out, states]
+            .iter()
+            .enumerate()
+        {
+            e.set_buffer((9 + i) as u64, Some(&x.buf), 0);
+        }
+        e.set_bytes(
+            17,
+            std::mem::size_of::<Args>() as u64,
+            &args as *const Args as *const c_void,
+        );
+        e.dispatch_thread_groups(MTLSize::new(b as u64, 1, 1), MTLSize::new(64, 1, 1));
+    }
+
+    /// Exact ordinary GDN backward (reverse causal scan).  Input gradients
+    /// are written per token; convolution, norm, A_log and dt_bias gradients
+    /// are accumulated directly into the flat gradient arena.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_backward(
+        &self,
+        qraw: &GBuf,
+        kraw: &GBuf,
+        vraw: &GBuf,
+        qcv: &GBuf,
+        kcv: &GBuf,
+        vcv: &GBuf,
+        ab: &GBuf,
+        beta: &GBuf,
+        raw_o: &GBuf,
+        inv: &GBuf,
+        norm: &GBuf,
+        states: &GBuf,
+        dnorm: &GBuf,
+        dz: &GBuf,
+        dq: &GBuf,
+        dk: &GBuf,
+        dv: &GBuf,
+        dab: &GBuf,
+        p: &GBuf,
+        conv_off: usize,
+        norm_off: usize,
+        alog_off: usize,
+        dt_off: usize,
+        g: &GBuf,
+        gconv_off: usize,
+        gnorm_off: usize,
+        galog_off: usize,
+        gdt_off: usize,
+        b: usize,
+        t: usize,
+    ) {
+        #[repr(C)]
+        struct Args {
+            b: u32,
+            t: u32,
+            _pad0: u32,
+            _pad1: u32,
+        }
+        let args = Args {
+            b: b as u32,
+            t: t as u32,
+            _pad0: 0,
+            _pad1: 0,
+        };
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.gdn_bwd);
+        for (i, x) in [
+            qraw, kraw, vraw, qcv, kcv, vcv, ab, beta, raw_o, inv, norm, states, dnorm, dz, dq, dk,
+            dv, dab,
+        ]
+        .iter()
+        .enumerate()
+        {
+            e.set_buffer(i as u64, Some(&x.buf), 0);
+        }
+        e.set_buffer(10, Some(&p.buf), (norm_off * 4) as u64);
+        e.set_buffer(18, Some(&p.buf), (conv_off * 4) as u64);
+        e.set_buffer(19, Some(&p.buf), (alog_off * 4) as u64);
+        e.set_buffer(20, Some(&p.buf), (dt_off * 4) as u64);
+        e.set_buffer(21, Some(&g.buf), (gconv_off * 4) as u64);
+        e.set_buffer(22, Some(&g.buf), (gnorm_off * 4) as u64);
+        e.set_buffer(23, Some(&g.buf), (galog_off * 4) as u64);
+        e.set_buffer(24, Some(&g.buf), (gdt_off * 4) as u64);
+        e.set_bytes(
+            25,
+            std::mem::size_of::<Args>() as u64,
+            &args as *const Args as *const c_void,
+        );
+        e.dispatch_thread_groups(MTLSize::new(b as u64, 1, 1), MTLSize::new(1, 1, 1));
+    }
+
+    /// Parallel exact ordinary GDN reverse scan.  This mirrors
+    /// [`gdn_backward`] but maps one 64-thread group to each sequence; the
+    /// serial implementation remains available as a reference/fallback.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_backward_parallel(
+        &self,
+        qraw: &GBuf,
+        kraw: &GBuf,
+        vraw: &GBuf,
+        qcv: &GBuf,
+        kcv: &GBuf,
+        vcv: &GBuf,
+        ab: &GBuf,
+        beta: &GBuf,
+        raw_o: &GBuf,
+        inv: &GBuf,
+        norm: &GBuf,
+        states: &GBuf,
+        dnorm: &GBuf,
+        dz: &GBuf,
+        dq: &GBuf,
+        dk: &GBuf,
+        dv: &GBuf,
+        dab: &GBuf,
+        p: &GBuf,
+        conv_off: usize,
+        norm_off: usize,
+        alog_off: usize,
+        dt_off: usize,
+        g: &GBuf,
+        gconv_off: usize,
+        gnorm_off: usize,
+        galog_off: usize,
+        gdt_off: usize,
+        b: usize,
+        t: usize,
+    ) {
+        #[repr(C)]
+        struct Args {
+            b: u32,
+            t: u32,
+            _pad0: u32,
+            _pad1: u32,
+        }
+        let args = Args {
+            b: b as u32,
+            t: t as u32,
+            _pad0: 0,
+            _pad1: 0,
+        };
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.gdn_bwd_par);
+        for (i, x) in [
+            qraw, kraw, vraw, qcv, kcv, vcv, ab, beta, raw_o, inv, norm, states, dnorm, dz, dq, dk,
+            dv, dab,
+        ]
+        .iter()
+        .enumerate()
+        {
+            e.set_buffer(i as u64, Some(&x.buf), 0);
+        }
+        e.set_buffer(18, Some(&p.buf), (conv_off * 4) as u64);
+        e.set_buffer(19, Some(&p.buf), (alog_off * 4) as u64);
+        e.set_buffer(20, Some(&p.buf), (dt_off * 4) as u64);
+        // The parallel shader keeps norm at binding 10 (the same binding as
+        // the serial shader) and reads controls from the offsets below.
+        e.set_buffer(10, Some(&p.buf), (norm_off * 4) as u64);
+        e.set_buffer(21, Some(&g.buf), (gconv_off * 4) as u64);
+        e.set_buffer(22, Some(&g.buf), (gnorm_off * 4) as u64);
+        e.set_buffer(23, Some(&g.buf), (galog_off * 4) as u64);
+        e.set_buffer(24, Some(&g.buf), (gdt_off * 4) as u64);
+        e.set_bytes(
+            25,
+            std::mem::size_of::<Args>() as u64,
+            &args as *const Args as *const c_void,
+        );
+        e.dispatch_thread_groups(MTLSize::new(b as u64, 1, 1), MTLSize::new(64, 1, 1));
+    }
+
+    /// y = SiLU(x) over n.
+    pub fn silu_fwd(&self, x: &GBuf, y: &GBuf, n: usize) {
+        assert!(x.len >= n && y.len >= n);
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.silu_fwd);
+        e.set_buffer(0, Some(&x.buf), 0);
+        e.set_buffer(1, Some(&y.buf), 0);
+        self.set_u32(2, n as u32);
+        self.grid1(n, 256);
+    }
+
+    /// dx = dy·SiLU'(x) over n (x = the pre-activation).
+    pub fn silu_bwd(&self, x: &GBuf, dy: &GBuf, dx: &GBuf, n: usize) {
+        assert!(x.len >= n && dy.len >= n && dx.len >= n);
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.silu_bwd);
+        e.set_buffer(0, Some(&x.buf), 0);
+        e.set_buffer(1, Some(&dy.buf), 0);
+        e.set_buffer(2, Some(&dx.buf), 0);
+        self.set_u32(3, n as u32);
+        self.grid1(n, 256);
+    }
+
+    fn gdn_scan_check(d: &GdnScanDims) {
+        assert!(d.dk >= 4 && d.dk <= 128 && d.dv >= 4 && d.dv <= 128, "gdn scan: dk/dv ≤ 128");
+        assert!(d.c_dim >= 2 * d.nv * d.dk + d.nv * d.dv, "gdn scan: c_dim too small");
+        assert!(d.ab_ld >= d.nv, "gdn scan: ab_ld < nv");
+    }
+
+    /// GDN mixer scan forward (see `gdn_scan_fwd_f32`): `qkv_cv` [M, c_dim]
+    /// post-conv/SiLU channels, `a_pre`/`b_pre` [M, ab_ld], A_log / dt_bias
+    /// at `alog_off` / `dt_off` inside `p`; writes `raw_o` [M, nv·dv], the
+    /// chunk checkpoints `states` [B·nv, T/64+1, dk, dv] (slot 0 = S_0: read
+    /// from there when `s0_from_ckpt`, zero — and zeroed — otherwise) and
+    /// leaves the final state in `live` [B·nv, dk, dv]. `beta_one` pins
+    /// β ≡ 1 (the S7 control arm).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_scan_fwd(
+        &self,
+        d: &GdnScanDims,
+        qkv_cv: &GBuf,
+        a_pre: &GBuf,
+        b_pre: &GBuf,
+        p: &GBuf,
+        alog_off: usize,
+        dt_off: usize,
+        raw_o: &GBuf,
+        states: &GBuf,
+        live: &GBuf,
+        s0_from_ckpt: bool,
+        beta_one: bool,
+    ) {
+        Self::gdn_scan_check(d);
+        let rows = d.rows();
+        assert!(qkv_cv.len >= rows * d.c_dim && a_pre.len >= rows * d.ab_ld && b_pre.len >= rows * d.ab_ld);
+        assert!(raw_o.len >= rows * d.nv * d.dv && p.len >= alog_off + d.nv && p.len >= dt_off + d.nv);
+        assert!(states.len >= d.b * d.nv * (d.nch() + 1) * d.state() && live.len >= d.b * d.nv * d.state());
+        let args = GdnScanArgsRepr {
+            b: d.b as u32,
+            t: d.t as u32,
+            nv: d.nv as u32,
+            dk: d.dk as u32,
+            dv: d.dv as u32,
+            c_dim: d.c_dim as u32,
+            ab_ld: d.ab_ld as u32,
+            flags: s0_from_ckpt as u32 | ((beta_one as u32) << 1),
+        };
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.gdn_scan_fwd);
+        e.set_buffer(0, Some(&qkv_cv.buf), 0);
+        e.set_buffer(1, Some(&a_pre.buf), 0);
+        e.set_buffer(2, Some(&b_pre.buf), 0);
+        e.set_buffer(3, Some(&p.buf), (alog_off * 4) as u64);
+        e.set_buffer(4, Some(&p.buf), (dt_off * 4) as u64);
+        e.set_buffer(5, Some(&raw_o.buf), 0);
+        e.set_buffer(6, Some(&states.buf), 0);
+        e.set_buffer(7, Some(&live.buf), 0);
+        e.set_bytes(
+            8,
+            std::mem::size_of::<GdnScanArgsRepr>() as u64,
+            &args as *const GdnScanArgsRepr as *const c_void,
+        );
+        e.dispatch_thread_groups(
+            MTLSize::new((d.b * d.nv) as u64, 1, 1),
+            MTLSize::new(128, 1, 1),
+        );
+    }
+
+    /// GDN mixer scan backward (see `gdn_scan_bwd_f32`): `doo` [M, nv·dv]
+    /// is d raw_o; replays chunks into `chunk` [B·nv, 65, dk, dv]; the
+    /// running adjoint lives in `dlive` (taken as dS_T when `ds_init`, zero
+    /// otherwise; dS_0 is left there). Writes `dcv` [M, c_dim], the head
+    /// columns of `da`/`db` [M, ab_ld] and per-(b, head) `part` [B·nv, 2]
+    /// (dA_log, d dt_bias) for `gdn_scan_fold`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_scan_bwd(
+        &self,
+        d: &GdnScanDims,
+        qkv_cv: &GBuf,
+        a_pre: &GBuf,
+        b_pre: &GBuf,
+        p: &GBuf,
+        alog_off: usize,
+        dt_off: usize,
+        states: &GBuf,
+        doo: &GBuf,
+        chunk: &GBuf,
+        dlive: &GBuf,
+        ds_init: bool,
+        beta_one: bool,
+        dcv: &GBuf,
+        da: &GBuf,
+        db: &GBuf,
+        part: &GBuf,
+    ) {
+        Self::gdn_scan_check(d);
+        let rows = d.rows();
+        assert!(qkv_cv.len >= rows * d.c_dim && dcv.len >= rows * d.c_dim);
+        assert!(a_pre.len >= rows * d.ab_ld && b_pre.len >= rows * d.ab_ld && da.len >= rows * d.ab_ld && db.len >= rows * d.ab_ld);
+        assert!(doo.len >= rows * d.nv * d.dv && part.len >= d.b * d.nv * 2);
+        assert!(states.len >= d.b * d.nv * (d.nch() + 1) * d.state());
+        assert!(chunk.len >= d.b * d.nv * 65 * d.state() && dlive.len >= d.b * d.nv * d.state());
+        let args = GdnScanArgsRepr {
+            b: d.b as u32,
+            t: d.t as u32,
+            nv: d.nv as u32,
+            dk: d.dk as u32,
+            dv: d.dv as u32,
+            c_dim: d.c_dim as u32,
+            ab_ld: d.ab_ld as u32,
+            flags: ds_init as u32 | ((beta_one as u32) << 1),
+        };
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.gdn_scan_bwd);
+        e.set_buffer(0, Some(&qkv_cv.buf), 0);
+        e.set_buffer(1, Some(&a_pre.buf), 0);
+        e.set_buffer(2, Some(&b_pre.buf), 0);
+        e.set_buffer(3, Some(&p.buf), (alog_off * 4) as u64);
+        e.set_buffer(4, Some(&p.buf), (dt_off * 4) as u64);
+        e.set_buffer(5, Some(&states.buf), 0);
+        e.set_buffer(6, Some(&doo.buf), 0);
+        e.set_buffer(7, Some(&chunk.buf), 0);
+        e.set_buffer(8, Some(&dlive.buf), 0);
+        e.set_buffer(9, Some(&dcv.buf), 0);
+        e.set_buffer(10, Some(&da.buf), 0);
+        e.set_buffer(11, Some(&db.buf), 0);
+        e.set_buffer(12, Some(&part.buf), 0);
+        e.set_bytes(
+            13,
+            std::mem::size_of::<GdnScanArgsRepr>() as u64,
+            &args as *const GdnScanArgsRepr as *const c_void,
+        );
+        e.dispatch_thread_groups(
+            MTLSize::new((d.b * d.nv) as u64, 1, 1),
+            MTLSize::new(128, 1, 1),
+        );
+    }
+
+    /// g[galog_off + h] += Σ_b part[(b·nv+h)·2]; g[gdt_off + h] += Σ_b part[..+1].
+    pub fn gdn_scan_fold(&self, part: &GBuf, b: usize, nv: usize, g: &GBuf, galog_off: usize, gdt_off: usize) {
+        assert!(part.len >= b * nv * 2 && g.len >= galog_off + nv && g.len >= gdt_off + nv);
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.gdn_scan_fold);
+        e.set_buffer(0, Some(&part.buf), 0);
+        e.set_buffer(1, Some(&g.buf), (galog_off * 4) as u64);
+        e.set_buffer(2, Some(&g.buf), (gdt_off * 4) as u64);
+        let bn = [b as u32, nv as u32];
+        e.set_bytes(3, 8, bn.as_ptr() as *const c_void);
+        self.grid1(nv, 64);
     }
 
     /// Embedding gather with a table offset (the tied table lives inside
@@ -1137,13 +1901,37 @@ impl<'a> Cmd<'a> {
         h: usize,
         k: usize,
     ) {
+        self.conv1d_fwd_hist(x, w, w_off, y, None, b, t, h, k)
+    }
+
+    /// `conv1d_fwd_at` with an optional carried history `hist` [b, k−1, h]
+    /// (the last k−1 inputs of the previous window per sequence) in place
+    /// of the zero left pad.
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv1d_fwd_hist(
+        &self,
+        x: &GBuf,
+        w: &GBuf,
+        w_off: usize,
+        y: &GBuf,
+        hist: Option<&GBuf>,
+        b: usize,
+        t: usize,
+        h: usize,
+        k: usize,
+    ) {
         assert!(x.len >= b * t * h && y.len >= b * t * h && w.len >= w_off + h * k);
+        if let Some(hh) = hist {
+            assert!(hh.len >= b * (k - 1) * h);
+        }
         let e = &self.enc;
         e.set_compute_pipeline_state(&self.c.conv_fwd);
         e.set_buffer(0, Some(&x.buf), 0);
         e.set_buffer(1, Some(&w.buf), (w_off * 4) as u64);
         e.set_buffer(2, Some(&y.buf), 0);
         self.set_u32x4(3, [b as u32, t as u32, h as u32, k as u32]);
+        e.set_buffer(4, Some(&hist.unwrap_or(x).buf), 0);
+        self.set_u32(5, hist.is_some() as u32);
         let n = (b * t * h) as u64;
         e.dispatch_thread_groups(MTLSize::new(n.div_ceil(128), 1, 1), MTLSize::new(128, 1, 1));
     }
@@ -1165,6 +1953,27 @@ impl<'a> Cmd<'a> {
         h: usize,
         k: usize,
     ) {
+        self.conv1d_bwd_hist(x, w, w_off, dy, dx, dw, dw_off, None, b, t, h, k)
+    }
+
+    /// `conv1d_bwd_at` with the carried history of the forward (only dW
+    /// reads it; the history itself gets no gradient — detached).
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv1d_bwd_hist(
+        &self,
+        x: &GBuf,
+        w: &GBuf,
+        w_off: usize,
+        dy: &GBuf,
+        dx: &GBuf,
+        dw: &GBuf,
+        dw_off: usize,
+        hist: Option<&GBuf>,
+        b: usize,
+        t: usize,
+        h: usize,
+        k: usize,
+    ) {
         assert!(x.len >= b * t * h && dy.len >= b * t * h && dx.len >= b * t * h);
         assert!(w.len >= w_off + h * k && dw.len >= dw_off + h * k);
         let e = &self.enc;
@@ -1180,6 +1989,8 @@ impl<'a> Cmd<'a> {
         e.set_buffer(1, Some(&dy.buf), 0);
         e.set_buffer(2, Some(&dw.buf), (dw_off * 4) as u64);
         self.set_u32x4(3, [b as u32, t as u32, h as u32, k as u32]);
+        e.set_buffer(4, Some(&hist.unwrap_or(x).buf), 0);
+        self.set_u32(5, hist.is_some() as u32);
         let hk = (h * k) as u64;
         e.dispatch_thread_groups(
             MTLSize::new(hk.div_ceil(128), 1, 1),
@@ -1834,11 +2645,82 @@ impl<'a> Cmd<'a> {
 
     /// Causal row softmax in place on `blocks` consecutive [t,t] blocks at `off`.
     pub fn causal_softmax_blocks(&self, s: &GBuf, off: usize, t: usize, blocks: usize) {
-        assert!(s.len >= off + blocks * t * t);
+        self.banded_softmax_blocks(s, off, t, t, 0, 0, 0, blocks)
+    }
+
+    /// Band + sink softmax in place over `blocks` consecutive `[t, ld]`
+    /// blocks (row stride `ld = sink_pad + t`): row `r` keeps the sink
+    /// columns `0..sink`, zeroes the pad columns `sink..sink_pad`, and in
+    /// the causal block (column `sink_pad + j`) keeps `j ≤ r` with
+    /// `r − j < window` (`window = 0`: the plain causal triangle). With
+    /// `(ld, sink, sink_pad, window) = (t, 0, 0, 0)` this is bit-for-bit
+    /// the legacy causal row softmax.
+    #[allow(clippy::too_many_arguments)]
+    pub fn banded_softmax_blocks(
+        &self,
+        s: &GBuf,
+        off: usize,
+        t: usize,
+        ld: usize,
+        sink: usize,
+        sink_pad: usize,
+        window: usize,
+        blocks: usize,
+    ) {
+        self.banded_softmax_carry(s, off, t, ld, sink, sink_pad, window, blocks, 0, 1, None)
+    }
+
+    /// `banded_softmax_blocks` over rows `[sink_pad + carry_pad + t]` wide:
+    /// columns `[sink_pad, sink_pad + carry_pad)` hold the scores against
+    /// the previous window's last `carry_pad` keys (state carried across
+    /// windows); they are inside the band for a sequence only when its entry
+    /// of `cmask` (u32 per sequence, `bps` blocks per sequence) is set.
+    #[allow(clippy::too_many_arguments)]
+    pub fn banded_softmax_carry(
+        &self,
+        s: &GBuf,
+        off: usize,
+        t: usize,
+        ld: usize,
+        sink: usize,
+        sink_pad: usize,
+        window: usize,
+        blocks: usize,
+        carry_pad: usize,
+        bps: usize,
+        cmask: Option<&GBuf>,
+    ) {
+        assert!(ld == sink_pad + carry_pad + t && sink <= sink_pad);
+        assert!(s.len >= off + blocks * t * ld);
+        assert!(carry_pad == 0 || cmask.is_some_and(|m| m.len * bps >= blocks));
+        #[repr(C)]
+        struct Args {
+            t: u32,
+            ld: u32,
+            sink: u32,
+            sink_pad: u32,
+            window: u32,
+            carry_pad: u32,
+            bps: u32,
+        }
+        let a = Args {
+            t: t as u32,
+            ld: ld as u32,
+            sink: sink as u32,
+            sink_pad: sink_pad as u32,
+            window: window as u32,
+            carry_pad: carry_pad as u32,
+            bps: bps.max(1) as u32,
+        };
         let e = &self.enc;
         e.set_compute_pipeline_state(&self.c.causal_softmax);
         e.set_buffer(0, Some(&s.buf), (off * 4) as u64);
-        self.set_u32(1, t as u32);
+        e.set_bytes(
+            1,
+            std::mem::size_of::<Args>() as u64,
+            &a as *const Args as *const c_void,
+        );
+        e.set_buffer(2, Some(&cmask.unwrap_or(s).buf), 0);
         e.dispatch_thread_groups(
             MTLSize::new(t as u64, blocks as u64, 1),
             MTLSize::new(256, 1, 1),
@@ -1855,16 +2737,87 @@ impl<'a> Cmd<'a> {
         t: usize,
         blocks: usize,
     ) {
-        assert!(p.len >= p_off + blocks * t * t && dp.len >= dp_off + blocks * t * t);
+        self.softmax_bwd_blocks_ld(p, p_off, dp, dp_off, t, t, blocks)
+    }
+
+    /// `softmax_bwd_blocks` over `[t, ld]` blocks (row stride `ld`): the
+    /// row sum runs over all `ld` columns; P = 0 off the band ⇒ dS = 0 there.
+    #[allow(clippy::too_many_arguments)]
+    pub fn softmax_bwd_blocks_ld(
+        &self,
+        p: &GBuf,
+        p_off: usize,
+        dp: &GBuf,
+        dp_off: usize,
+        t: usize,
+        ld: usize,
+        blocks: usize,
+    ) {
+        assert!(ld >= t);
+        assert!(p.len >= p_off + blocks * t * ld && dp.len >= dp_off + blocks * t * ld);
         let e = &self.enc;
         e.set_compute_pipeline_state(&self.c.softmax_bwd);
         e.set_buffer(0, Some(&p.buf), (p_off * 4) as u64);
         e.set_buffer(1, Some(&dp.buf), (dp_off * 4) as u64);
-        self.set_u32(2, t as u32);
+        self.set_u32x4(2, [t as u32, ld as u32, 0, 0]);
         e.dispatch_thread_groups(
             MTLSize::new(t as u64, blocks as u64, 1),
             MTLSize::new(256, 1, 1),
         );
+    }
+
+    /// Bounded-anchor sink gradient: fold the per-(sequence, head) partial
+    /// tiles `src[nb][qh][SINK_PAD][hd]` into the arena gradient at
+    /// `dst_off` (`[kvh][sink][hd]`): `dst[off + (g·S + s)·hd + d] += alpha ·
+    /// Σ_{b<nb} Σ_{j<group} src[((b·qh + g·group + j)·SINK_PAD + s)·hd + d]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sink_grad_accum(
+        &self,
+        src: &GBuf,
+        dst: &GBuf,
+        dst_off: usize,
+        nb: usize,
+        kvh: usize,
+        group: usize,
+        sink: usize,
+        hd: usize,
+        alpha: f32,
+    ) {
+        let n = kvh * sink * hd;
+        assert!(
+            src.len >= nb * kvh * group * crate::model::SINK_PAD * hd && dst.len >= dst_off + n
+        );
+        #[repr(C)]
+        struct Args {
+            n: u32,
+            sink: u32,
+            hd: u32,
+            group: u32,
+            pad: u32,
+            alpha: f32,
+            nb: u32,
+            qh: u32,
+        }
+        let a = Args {
+            n: n as u32,
+            sink: sink as u32,
+            hd: hd as u32,
+            group: group as u32,
+            pad: crate::model::SINK_PAD as u32,
+            alpha,
+            nb: nb as u32,
+            qh: (kvh * group) as u32,
+        };
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.sink_grad_accum);
+        e.set_buffer(0, Some(&src.buf), 0);
+        e.set_buffer(1, Some(&dst.buf), (dst_off * 4) as u64);
+        e.set_bytes(
+            2,
+            std::mem::size_of::<Args>() as u64,
+            &a as *const Args as *const c_void,
+        );
+        self.grid1(n, 256);
     }
 
     /// dst[b·T+t][g·hd+d] = Σ_j src[b][g·group+j][t][d] (head-major → row-major GQA reduce).
@@ -1965,6 +2918,158 @@ impl<'a> Cmd<'a> {
         e.dispatch_thread_groups(MTLSize::new(r.rows as u64, 1, 1), MTLSize::new(64, 1, 1));
     }
 
+    /// Causal-k4 routing: smooth each expert's reconstruction cost with the
+    /// current and up to three previous rows in the same sequence, then apply
+    /// the usual bias-adjusted argmin.  `res` remains the winning *raw*
+    /// current-row resonance for diagnostics and descriptor balancing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn route_smooth_k4(
+        &self,
+        r: &RouteDims,
+        seq: usize,
+        x: &GBuf,
+        mu: &GBuf,
+        mu_off: usize,
+        u: &GBuf,
+        u_off: usize,
+        bias: &GBuf,
+        bias_off: usize,
+        assign: &GBuf,
+        res: &GBuf,
+    ) {
+        assert!(
+            seq > 0 && r.rows % seq == 0,
+            "route smoothing requires rows divisible by seq"
+        );
+        assert!(r.e <= 64 && x.len >= r.rows * r.h && assign.len >= r.rows && res.len >= r.rows);
+        assert!(
+            mu.len >= mu_off + r.e * r.h
+                && bias.len >= bias_off + r.e
+                && u.len >= u_off + r.e * r.k * r.h
+        );
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.route_smooth_k4);
+        e.set_buffer(0, Some(&x.buf), 0);
+        e.set_buffer(1, Some(&mu.buf), (mu_off * 4) as u64);
+        e.set_buffer(2, Some(&u.buf), (u_off * 4) as u64);
+        e.set_buffer(3, Some(&bias.buf), (bias_off * 4) as u64);
+        e.set_buffer(4, Some(&assign.buf), 0);
+        e.set_buffer(5, Some(&res.buf), 0);
+        #[repr(C)]
+        struct Args {
+            rows: u32,
+            h: u32,
+            e: u32,
+            k: u32,
+            cap: u32,
+            seq: u32,
+        }
+        let a = Args {
+            rows: r.rows as u32,
+            h: r.h as u32,
+            e: r.e as u32,
+            k: r.k as u32,
+            cap: r.cap as u32,
+            seq: seq as u32,
+        };
+        e.set_bytes(
+            6,
+            std::mem::size_of::<Args>() as u64,
+            &a as *const Args as *const c_void,
+        );
+        e.dispatch_thread_groups(MTLSize::new(r.rows as u64, 1, 1), MTLSize::new(64, 1, 1));
+    }
+
+    /// Conditional top-2 resonance routing scaffold.  The custom resonance
+    /// score remains the sole source of decisions; the kernel writes the
+    /// deterministic top-1 and runner-up plus a 50/50 runner weight only for
+    /// rows whose adjusted score margin is below `threshold`.  `seq` enables
+    /// the same causal-k4 score window as [`route_smooth_k4`] (`seq=0` uses
+    /// raw, position-local scores).  The model FFN does not dispatch this
+    /// path yet because its routed-expert backward needs a second bounded
+    /// activation/gradient stream; callers must treat this as a parity and
+    /// telemetry primitive, not as train-time support.
+    #[allow(clippy::too_many_arguments)]
+    pub fn route_top2(
+        &self,
+        r: &RouteDims,
+        seq: usize,
+        x: &GBuf,
+        mu: &GBuf,
+        mu_off: usize,
+        u: &GBuf,
+        u_off: usize,
+        bias: &GBuf,
+        bias_off: usize,
+        threshold: f32,
+        assign: &GBuf,
+        runner_up: &GBuf,
+        margin: &GBuf,
+        runner_weight: &GBuf,
+        res: &GBuf,
+        fallback_count: &GBuf,
+    ) {
+        assert!(r.e > 0 && r.e <= 64);
+        assert!(seq == 0 || r.rows % seq == 0, "top2 seq must divide rows");
+        assert!(
+            x.len >= r.rows * r.h
+                && assign.len >= r.rows
+                && runner_up.len >= r.rows
+                && margin.len >= r.rows
+                && runner_weight.len >= r.rows
+                && res.len >= r.rows
+                && fallback_count.len >= 1
+        );
+        assert!(
+            mu.len >= mu_off + r.e * r.h
+                && bias.len >= bias_off + r.e
+                && u.len >= u_off + r.e * r.k * r.h
+        );
+        // The counter is per dispatch (not persistent model state).
+        fallback_count.as_mut_slice()[0] = 0.0;
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.route_top2);
+        e.set_buffer(0, Some(&x.buf), 0);
+        e.set_buffer(1, Some(&mu.buf), (mu_off * 4) as u64);
+        e.set_buffer(2, Some(&u.buf), (u_off * 4) as u64);
+        e.set_buffer(3, Some(&bias.buf), (bias_off * 4) as u64);
+        e.set_buffer(4, Some(&assign.buf), 0);
+        e.set_buffer(5, Some(&runner_up.buf), 0);
+        e.set_buffer(6, Some(&margin.buf), 0);
+        e.set_buffer(7, Some(&runner_weight.buf), 0);
+        e.set_buffer(8, Some(&res.buf), 0);
+        e.set_buffer(9, Some(&fallback_count.buf), 0);
+        #[repr(C)]
+        struct Args {
+            rows: u32,
+            h: u32,
+            e: u32,
+            k: u32,
+            cap: u32,
+            seq: u32,
+            threshold: f32,
+        }
+        let a = Args {
+            rows: r.rows as u32,
+            h: r.h as u32,
+            e: r.e as u32,
+            k: r.k as u32,
+            cap: r.cap as u32,
+            seq: seq as u32,
+            threshold: if threshold.is_finite() && threshold > 0.0 {
+                threshold
+            } else {
+                0.0
+            },
+        };
+        e.set_bytes(
+            10,
+            std::mem::size_of::<Args>() as u64,
+            &a as *const Args as *const c_void,
+        );
+        e.dispatch_thread_groups(MTLSize::new(r.rows as u64, 1, 1), MTLSize::new(64, 1, 1));
+    }
+
     /// slot[row] = rank within its expert; count[e].
     pub fn route_group(
         &self,
@@ -2002,6 +3107,64 @@ impl<'a> Cmd<'a> {
         );
     }
 
+    /// Weighted variant used by the conditional top-2 stream. `complement`
+    /// selects `1 - weight[row]` (the primary stream); otherwise the runner
+    /// weight is used directly. The legacy top-1 path never dispatches this
+    /// kernel.
+    pub fn moe_gather_weighted(
+        &self,
+        r: &RouteDims,
+        x: &GBuf,
+        assign: &GBuf,
+        slot: &GBuf,
+        weight: &GBuf,
+        hg: &GBuf,
+        complement: bool,
+    ) {
+        assert!(
+            hg.len >= r.e * r.cap * r.h
+                && x.len >= r.rows * r.h
+                && assign.len >= r.rows
+                && slot.len >= r.rows
+                && weight.len >= r.rows
+        );
+        self.axpby(0.0, hg, 0.0, hg, r.e * r.cap * r.h);
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.moe_gather_weighted);
+        e.set_buffer(0, Some(&x.buf), 0);
+        e.set_buffer(1, Some(&assign.buf), 0);
+        e.set_buffer(2, Some(&slot.buf), 0);
+        e.set_buffer(3, Some(&weight.buf), 0);
+        e.set_buffer(4, Some(&hg.buf), 0);
+        #[repr(C)]
+        struct Args {
+            rows: u32,
+            h: u32,
+            e: u32,
+            k: u32,
+            cap: u32,
+            complement: u32,
+        }
+        let a = Args {
+            rows: r.rows as u32,
+            h: r.h as u32,
+            e: r.e as u32,
+            k: r.k as u32,
+            cap: r.cap as u32,
+            complement: complement as u32,
+        };
+        e.set_bytes(
+            5,
+            std::mem::size_of::<Args>() as u64,
+            &a as *const Args as *const c_void,
+        );
+        let tgx = 64u64.min(r.h as u64).max(1);
+        e.dispatch_thread_groups(
+            MTLSize::new((r.h as u64).div_ceil(tgx), r.rows as u64, 1),
+            MTLSize::new(tgx, 1, 1),
+        );
+    }
+
     /// out[row] += yh[e][slot] (slot < cap).
     pub fn moe_scatter_add(
         &self,
@@ -2019,6 +3182,62 @@ impl<'a> Cmd<'a> {
         e.set_buffer(2, Some(&slot.buf), 0);
         e.set_buffer(3, Some(&yh.buf), 0);
         self.route_args(4, r);
+        let tgx = 64u64.min(r.h as u64).max(1);
+        e.dispatch_thread_groups(
+            MTLSize::new((r.h as u64).div_ceil(tgx), r.rows as u64, 1),
+            MTLSize::new(tgx, 1, 1),
+        );
+    }
+
+    /// Weighted routed-expert scatter. `weight[row]` is multiplied into the
+    /// expert residual before adding it to `out`; this is only used by the
+    /// enabled top-2 path, preserving the exact legacy kernel otherwise.
+    pub fn moe_scatter_add_weighted(
+        &self,
+        r: &RouteDims,
+        out: &GBuf,
+        assign: &GBuf,
+        slot: &GBuf,
+        weight: &GBuf,
+        yh: &GBuf,
+        complement: bool,
+    ) {
+        assert!(
+            yh.len >= r.e * r.cap * r.h
+                && out.len >= r.rows * r.h
+                && assign.len >= r.rows
+                && slot.len >= r.rows
+                && weight.len >= r.rows
+        );
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.moe_scatter_add_weighted);
+        e.set_buffer(0, Some(&out.buf), 0);
+        e.set_buffer(1, Some(&assign.buf), 0);
+        e.set_buffer(2, Some(&slot.buf), 0);
+        e.set_buffer(3, Some(&weight.buf), 0);
+        e.set_buffer(4, Some(&yh.buf), 0);
+        #[repr(C)]
+        struct Args {
+            rows: u32,
+            h: u32,
+            e: u32,
+            k: u32,
+            cap: u32,
+            complement: u32,
+        }
+        let a = Args {
+            rows: r.rows as u32,
+            h: r.h as u32,
+            e: r.e as u32,
+            k: r.k as u32,
+            cap: r.cap as u32,
+            complement: complement as u32,
+        };
+        e.set_bytes(
+            5,
+            std::mem::size_of::<Args>() as u64,
+            &a as *const Args as *const c_void,
+        );
         let tgx = 64u64.min(r.h as u64).max(1);
         e.dispatch_thread_groups(
             MTLSize::new((r.h as u64).div_ceil(tgx), r.rows as u64, 1),
@@ -2063,6 +3282,7 @@ impl<'a> Cmd<'a> {
         alpha: f32,
         eta: f32,
         frozen_below: usize,
+        bias_frozen_from: usize,
     ) {
         #[repr(C)]
         struct Args {
@@ -2072,6 +3292,10 @@ impl<'a> Cmd<'a> {
             alpha: f32,
             eta: f32,
             frozen_below: u32,
+            /// experts `e >= bias_frozen_from` keep their balancing bias
+            bias_frozen_from: u32,
+            /// the μ mean divides by the slots `moe_stats` summed: min(count, cap)
+            cap: u32,
         }
         let a = Args {
             rows: r.rows as u32,
@@ -2080,6 +3304,8 @@ impl<'a> Cmd<'a> {
             alpha,
             eta,
             frozen_below: frozen_below as u32,
+            bias_frozen_from: bias_frozen_from.min(u32::MAX as usize) as u32,
+            cap: r.cap as u32,
         };
         let e = &self.enc;
         e.set_compute_pipeline_state(&self.c.moe_update);
@@ -2371,7 +3597,7 @@ fn gpu_ms(cmd: &metal::CommandBufferRef) -> f64 {
     }
 }
 
-pub use crate::ops::HkDims;
+pub use crate::ops::{GdnScanDims, HkDims};
 
 /// Buffers of one hybrid_k layer's forward (inputs + scratch + output).
 pub struct HkWork<'a> {
@@ -2387,6 +3613,12 @@ pub struct HkWork<'a> {
     pub kv: &'a GBuf,
     pub states: &'a GBuf,
     pub out: &'a GBuf,
+    /// One shared `[B, nh, 65, 2*nphase, dv]` activation scratch used by the
+    /// Phase-Delta reverse chunk scan.  Legacy HK kernels ignore this field.
+    pub phase_chunk: Option<&'a GBuf>,
+    /// Conditional `[B, nh, nblocks, T, 1+2*nphase]` f32 block partials emitted
+    /// by the split-SIMD Phase-Delta reverse and folded in fixed block order.
+    pub phase_partial: Option<&'a GBuf>,
 }
 
 /// Buffers of one hybrid_k layer's backward.
@@ -2423,6 +3655,29 @@ fn hk_check(d: &HkDims, w: &HkWork<'_>) {
     assert!(w.phq.len >= rows * d.nh * 2 * d.nph && w.phk.len >= rows * d.nh * 2 * d.nph);
     assert!(w.pow.len >= w.pow_off + d.nh * 65 * 2 * d.nph);
     assert!(w.states.len >= d.b * d.nh * (d.t / 64 + 1) * 2 * d.nph * d.dv);
+}
+
+fn phase_delta_check(d: &HkDims, w: &HkWork<'_>) {
+    assert!(
+        d.nph <= 32 && d.dv <= 128,
+        "phase_delta kernels: nph ≤ 32, dv ≤ 128"
+    );
+    let rows = d.b * d.t;
+    let p2 = 2 * d.nph;
+    assert!(w.thq.len >= rows * d.nh * d.nph && w.thk.len >= rows * d.nh * d.nph);
+    assert!(w.v.len >= rows * d.nh * d.dv && w.out.len >= rows * d.nh * d.dv);
+    assert!(w.kappa.len >= rows * d.nh);
+    assert!(w.phq.len >= rows * d.nh * p2 && w.phk.len >= rows * d.nh * p2);
+    assert!(w.pow.len >= w.pow_off + d.nh * 65 * p2);
+    assert!(w.states.len >= d.b * d.nh * (d.t.div_ceil(64) + 1) * p2 * d.dv);
+    if let Some(partial) = w.phase_partial {
+        let nblocks = d.dv.div_ceil(32);
+        let need = d.b * d.nh * nblocks * d.t * (1 + 2 * d.nph);
+        assert!(
+            partial.len >= need,
+            "phase_delta block partial scratch too small"
+        );
+    }
 }
 
 /// γ_{h,f}^δ for δ = 0..=64, laid out [nh][65][p2] — the kernels' `pow`.

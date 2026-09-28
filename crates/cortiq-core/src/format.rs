@@ -6,16 +6,26 @@
 //! [0x00]  magic "CMF\x01" | version u32 = 2 | flags u32 | required_features u32
 //! [0x10]  header_off/len | dir_off/len | data_off/len   (u64 LE each)
 //! [0x40]  masks_off/len  | vocab_off/len | index_off/len
-//! [0x70]  16 reserved bytes (zero)
+//! [0x70]  header_hash u64 | dir_hash u64   (hash64; 0 = absent, §8.1)
 //! [0x80]  header JSON → tensor directory → weight blob (4096-aligned,
 //!         tensors 64-aligned) → masks → vocab → sparse index
 //! ```
+//!
+//! That order is what a fresh write produces; readers address every
+//! section ONLY through the envelope. A tail append (§9.3,
+//! [`CmfModel::append_skill`]) extends the data section over the old
+//! masks/vocab/index and republishes header + directory after it.
 //!
 //! The tensor directory is the ONLY source of truth for the weight blob
 //! layout — there is no computable layout, by design (v1 bug class #1).
 //! Every validation failure is a hard error: no silent fallbacks.
 
 use crate::hash::hash64;
+pub use crate::knowledge::{
+    ExpertAppend, GenomeInfo, GenomeParent, LineageEvent, LookupInfo, PhiSpec, RouterPolicy, Segment,
+    SkillBound, SkillOverride, StateEffect, expert_append_state_effect, ffn_replace_state_effect,
+    trunk_hash,
+};
 use crate::mask::{MaskCatalog, TaskMask, decode_masks_section, encode_masks_section};
 use crate::quant::expected_nbytes;
 use crate::types::{ModelArch, QuantType, TensorDtype};
@@ -24,6 +34,9 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+
+mod append;
+pub use append::{AppendReport, LegacyBitsMigration, PendingAppend};
 
 pub const CMF_MAGIC: [u8; 4] = *b"CMF\x01";
 pub const CMF_VERSION: u32 = 2;
@@ -75,15 +88,43 @@ pub mod features {
     /// Prism matrices.  This is deliberately separate from the transform bit
     /// so readers cannot infer the correction from arch_name alone.
     pub const PRISM_AFFINE: u32 = 1 << 8;
+    /// Some skill record is v2 (`kind` set): every v2 record is validated
+    /// against its genome binding and the directory; an unknown or
+    /// reserved `kind` is refused. Derived from content.
+    pub const SKILLS_V2: u32 = 1 << 9;
+    /// The file declares a router policy v2 (`header.router`): only that
+    /// `backbone_gated` policy may auto-route — a reader that would fall
+    /// back to argmin-over-skills must refuse. Derived from content.
+    pub const ROUTER_V2: u32 = 1 << 10;
     /// Non-generative decision profile (`cortiq-decision`): an encoder,
     /// a hashing contract and resonance skills, described by the
     /// `decision.manifest` tensor. It is executed by the decision runtime
     /// (`cortiq decide`, `cortiq serve`), never by the language-model
     /// pipeline. Derived by every writer from the arch name prefix
     /// [`super::DECISION_ARCH_PREFIX`]; a reader refuses a file whose bit
-    /// and prefix disagree. Bits 9 and 10 stay unassigned here: other
-    /// lines of development use them, and this reader refuses them.
+    /// and prefix disagree.
     pub const DECISION: u32 = 1 << 11;
+    /// The file carries a natively BOUNDED attention operator
+    /// (`LayerType::BoundedAttention` + `arch.anchor_core`): every layer's
+    /// state is a fixed-size record and the reader MUST execute the anchor
+    /// as ring + trained sinks — never as a masked full-attention layer over
+    /// a growing KV. Readers that predate the bit refuse the file loudly;
+    /// readers that know it must not let `CMF_O1_*` / `--o1` override the
+    /// operator the file declares.
+    ///
+    /// Numbered `1 << 12` since 0.8.1. Unreleased embryo-o1 builds wrote
+    /// it as `1 << 7`, which every released reader knows as
+    /// [`PRISM_HADAMARD`]; such a file is refused (bit ⇔ metadata) and must
+    /// be re-exported.
+    pub const BOUNDED_STATE: u32 = 1 << 12;
+    /// The file carries a FROZEN GENOME (`header.genome`): the reader
+    /// recomputes `trunk_hash` from the directory, arch, vocab and
+    /// tokenizer bundle and refuses the file on mismatch — the trunk cannot
+    /// change without a new genome. Derived from content by every writer.
+    ///
+    /// Numbered `1 << 13` since 0.8.1 (unreleased embryo-o1 builds: `1 << 8`,
+    /// which released readers know as [`PRISM_AFFINE`]).
+    pub const GENOME: u32 = 1 << 13;
 
     /// Features this reader implements today.
     pub const SUPPORTED: u32 = TENSOR_DIR
@@ -93,7 +134,11 @@ pub mod features {
         | SKILL_FILE
         | PRISM_HADAMARD
         | PRISM_AFFINE
-        | DECISION;
+        | SKILLS_V2
+        | ROUTER_V2
+        | DECISION
+        | BOUNDED_STATE
+        | GENOME;
 }
 
 /// Arch-name prefix of every decision profile (`cortiq-decision-ph-v1`,
@@ -105,6 +150,92 @@ pub const DECISION_ARCH_PREFIX: &str = "cortiq-decision-";
 /// Is `arch_name` a decision profile (see [`DECISION_ARCH_PREFIX`])?
 pub fn is_decision_profile(arch_name: &str) -> bool {
     arch_name.starts_with(DECISION_ARCH_PREFIX)
+}
+
+/// The Prism bits a header demands: `PRISM_HADAMARD` with the
+/// `prism_hadamard` record, `PRISM_AFFINE` with its `affine` descriptor.
+fn prism_bits(arch: &ModelArch) -> u32 {
+    let mut f = 0;
+    if let Some(prism) = arch.prism_hadamard.as_ref() {
+        f |= features::PRISM_HADAMARD;
+        if prism.affine.is_some() {
+            f |= features::PRISM_AFFINE;
+        }
+    }
+    f
+}
+
+/// Extra words for a Prism bit/metadata mismatch on a file that carries an
+/// Embryo record: an unreleased embryo-o1 build wrote `BOUNDED_STATE` and
+/// `GENOME` on bits 7/8, which are the Prism bits of every released reader.
+fn legacy_embryo_bits_hint(header: &CmfHeader) -> &'static str {
+    if header.arch.anchor_core.is_some() || header.genome.is_some() {
+        " (this file carries anchor_core/genome: it was written by a pre-0.8.1 embryo-o1 \
+         build that numbered BOUNDED_STATE/GENOME as bits 7/8 — they are 12/13 now. \
+         Migrate it in place with `cortiq migrate-embryo-bits <file>`: it moves only those two \
+         envelope bits, which neither header_hash/dir_hash nor trunk_hash cover, and keeps \
+         every appended record. Do NOT re-export a file with appended records or a lineage — \
+         a re-export drops them. A detached .sig signs the whole file: re-sign after migrating)"
+    } else {
+        ""
+    }
+}
+
+/// The bits a pre-0.8.1 embryo-o1 build wrote for `BOUNDED_STATE` and
+/// `GENOME` (now [`features::BOUNDED_STATE`] / [`features::GENOME`]). They
+/// collide with the released `PRISM_HADAMARD` / `PRISM_AFFINE`.
+pub mod legacy_embryo_bits {
+    pub const BOUNDED_STATE: u32 = 1 << 7;
+    pub const GENOME: u32 = 1 << 8;
+    pub const BOTH: u32 = BOUNDED_STATE | GENOME;
+}
+
+/// The envelope `required_features` and the raw header JSON of a CMF
+/// file, read with no feature gate and no validation — for tooling that
+/// must recognise a file every reader refuses (overwrite guards, the
+/// legacy-bit migration). `Ok(None)`: not a CMF file (too short or wrong
+/// magic).
+pub fn peek_header(path: impl AsRef<Path>) -> Result<Option<(u32, serde_json::Value)>, CmfError> {
+    use std::io::Read;
+    let path = path.as_ref();
+    let mut f = File::open(path)?;
+    let len = f.metadata()?.len();
+    if len < ENVELOPE_LEN as u64 {
+        return Ok(None);
+    }
+    let mut head = [0u8; ENVELOPE_LEN];
+    f.read_exact(&mut head)?;
+    if head[0..4] != CMF_MAGIC {
+        return Ok(None);
+    }
+    let u64le = |o: usize| u64::from_le_bytes(head[o..o + 8].try_into().unwrap());
+    let required = u32::from_le_bytes(head[12..16].try_into().unwrap());
+    let (off, n) = (u64le(0x10), u64le(0x18));
+    if n == 0 || n > (1 << 30) || off.checked_add(n).is_none_or(|end| end > len) {
+        return Err(CmfError::Bounds(format!(
+            "{}: header section [{off}, +{n}) lies outside the file ({len} bytes)",
+            path.display()
+        )));
+    }
+    let mut buf = vec![0u8; n as usize];
+    f.seek(SeekFrom::Start(off))?;
+    f.read_exact(&mut buf)?;
+    let v = serde_json::from_slice(&buf)
+        .map_err(|e| CmfError::Parse(format!("{}: header JSON: {e}", path.display())))?;
+    Ok(Some((required, v)))
+}
+
+/// Does a raw header carry a frozen genome, a lineage journal or appended
+/// data segments? Keyed on CONTENT, not on the envelope bit: a pre-0.8.1
+/// embryo-o1 file carries `GENOME` on bit 8, and a file with appended
+/// segments loses them on any rewrite.
+pub fn header_json_is_genome(header: &serde_json::Value) -> bool {
+    let present = |k: &str| {
+        header
+            .get(k)
+            .is_some_and(|x| !x.is_null() && x.as_array().is_none_or(|a| !a.is_empty()))
+    };
+    present("genome") || present("lineage") || present("segments")
 }
 
 fn validate_prism_affine_targets(
@@ -189,6 +320,21 @@ pub struct CmfHeader {
     /// Additive; absent = raw recon-argmin with a fixed E threshold.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing: Option<RoutingCalibration>,
+    /// Frozen genome (bit `GENOME`, spec §9.2): identity + trunk hash of
+    /// the backbone every v2 skill binds to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub genome: Option<GenomeInfo>,
+    /// Append-only journal of the genome's life (spec §9.2).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lineage: Vec<LineageEvent>,
+    /// Router policy v2 (bit `ROUTER_V2`, spec §9.4): per-request
+    /// backbone-gated routing with the backbone as the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router: Option<RouterPolicy>,
+    /// Data-range ownership after tail appends (spec §9.3). Layout
+    /// metadata: a full rewrite clears it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub segments: Vec<Segment>,
 }
 
 /// Router calibration (see `SelectionDescriptor`): the recipe of the
@@ -229,7 +375,8 @@ pub struct ShardInfo {
 /// E = ‖(φ−mean) − B·Bᵀ(φ−mean)‖² / ‖φ−mean‖²; pick argmin over skills.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SelectionDescriptor {
-    /// "mse" (normalized reconstruction error) — the only metric today.
+    /// "mse" (normalized reconstruction error over raw φ) or "mse_unit"
+    /// (φ unit-normalized first — the only metric router v2 accepts).
     pub metric: String,
     /// Backbone layer whose mean-pooled hidden is φ(x).
     pub phi_layer: usize,
@@ -254,7 +401,7 @@ pub struct SelectionDescriptor {
 }
 
 /// One skill of the swarm (spec §9; Patent 15 per-skill record).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SkillRecord {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -289,6 +436,48 @@ pub struct SkillRecord {
     /// Free-form provenance: corpus, steps, recipe, who baked it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<serde_json::Value>,
+
+    // ── v2 record keys (features::SKILLS_V2, spec §9.5) ──
+    /// Record kind: "ffn_replace" and "expert_append" (implemented).
+    /// Reserved and refused until implemented: "anchor_sinks", "mask_only",
+    /// "fcd_vector". `None` = a v1 record (unchanged semantics).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// `expert_append` parameters (spec §9.5.1): `count` new experts in
+    /// each of `layers`, their descriptor `rank` and the `shell_quantile`
+    /// the trainer used. Required for that kind, refused on any other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub experts: Option<ExpertAppend>,
+    /// `lookup` parameters (spec §9.5.2): the explicit key → card table
+    /// under `skill.{id}.lookup.*` — entries, keys, key normalisation,
+    /// languages, fields. Required for that kind, refused on any other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lookup: Option<LookupInfo>,
+    /// Base tensors this record replaces, with the hash of the base entry
+    /// it was trained against. Exactly one per `skill.{id}.X` tensor.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub overrides: Vec<SkillOverride>,
+    /// The genome (id, generation, f32-master trunk hash) the record is
+    /// bound to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound: Option<SkillBound>,
+    /// What switching this skill does to the sequence state (computed by
+    /// the writer from `arch.layer_types`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_effect: Option<StateEffect>,
+    /// "quarantine" | "active" | "stale_regate" | "retired".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Measured gate; auto-routing requires `gate.status == "measured"`
+    /// and `status == "active"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<serde_json::Value>,
+    /// Prompt template the skill was trained under (e.g. "cmf-im-v1").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_contract: Option<String>,
+    /// `{trigger, dataset_sha256[], recipe, …}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<serde_json::Value>,
 }
 
 /// Hex-encoded hash64 per optional section (u64 as JSON number would
@@ -432,6 +621,12 @@ pub struct CmfModel {
     /// Shards 2..N (spec §10): (backing, data_off) per extra file;
     /// `TensorEntry.shard` 0 = this file, i>0 = extra_shards[i-1].
     extra_shards: Vec<(Backing, u64)>,
+    /// Trunk hash verified at open (GENOME files), from the raw header.
+    trunk: Option<u64>,
+    /// hash64 of the raw mask / sparse-index sections (execution-relevant
+    /// parts of the trunk outside the directory; see
+    /// [`crate::knowledge::trunk_hash_exec`]).
+    exec: crate::knowledge::ExecHashes,
 }
 
 impl std::fmt::Debug for CmfModel {
@@ -561,14 +756,16 @@ impl CmfModel {
             .is_some();
         if prism_bit != has_prism {
             return Err(CmfError::Parse(format!(
-                "required_features PRISM_HADAMARD={} disagrees with prism_hadamard metadata={has_prism}",
-                prism_bit
+                "required_features PRISM_HADAMARD={} disagrees with prism_hadamard metadata={has_prism}{}",
+                prism_bit,
+                legacy_embryo_bits_hint(&header)
             )));
         }
         if affine_bit != has_affine {
             return Err(CmfError::Parse(format!(
-                "required_features PRISM_AFFINE={} disagrees with affine metadata={has_affine}",
-                affine_bit
+                "required_features PRISM_AFFINE={} disagrees with affine metadata={has_affine}{}",
+                affine_bit,
+                legacy_embryo_bits_hint(&header)
             )));
         }
         if let Some(prism) = header.arch.prism_hadamard.as_ref() {
@@ -579,6 +776,24 @@ impl CmfModel {
                 ));
             }
         }
+        header
+            .arch
+            .validate_operator_metadata()
+            .map_err(CmfError::Parse)?;
+        // The bounded-anchor operator and its feature bit travel together:
+        // a file that declares the operator without the bit would run as
+        // full-KV on a reader that ignores unknown header fields, and a bit
+        // without the record has nothing to execute.
+        let bounded_declared = header.arch.anchor_core.is_some();
+        let bounded_bit = env.required_features & features::BOUNDED_STATE != 0;
+        if bounded_declared != bounded_bit {
+            return Err(CmfError::Parse(format!(
+                "anchor_core record ({}) and BOUNDED_STATE feature bit ({}) disagree",
+                if bounded_declared { "present" } else { "absent" },
+                if bounded_bit { "set" } else { "clear" }
+            )));
+        }
+
         // Tensor directory
         let tensors = Self::decode_directory(section(env.dir.0, env.dir.1))?;
         validate_prism_affine_targets(&header.arch, &tensors)?;
@@ -666,6 +881,77 @@ impl CmfModel {
             vec![]
         };
 
+        // Knowledge contract (§9.2–§9.5): GENOME / SKILLS_V2 / ROUTER_V2
+        // bits ⇔ content both ways, the trunk hash recomputed from the
+        // directory and the header JSON AS WRITTEN (an arch field this
+        // reader's struct does not know is still covered), every v2 skill
+        // record and the router policy. A file without the bits and without
+        // v2 content passes untouched.
+        // The mask catalog and sparse index are part of how the trunk
+        // executes (run/serve apply the catalog's fallback mask to every
+        // request): a genome's hash covers their raw bytes.
+        let exec = if header.genome.is_some() {
+            crate::knowledge::ExecHashes::of(
+                (env.masks.1 > 0).then(|| section(env.masks.0, env.masks.1)),
+                (env.index.1 > 0).then(|| section(env.index.0, env.index.1)),
+            )
+        } else {
+            crate::knowledge::ExecHashes::default()
+        };
+        let trunk = if header.genome.is_some() {
+            let raw: serde_json::Value =
+                serde_json::from_slice(section(env.header.0, env.header.1))
+                    .map_err(|e| CmfError::Parse(format!("header JSON: {e}")))?;
+            let null = serde_json::Value::Null;
+            Some(crate::knowledge::trunk_hash_json_exec(
+                raw.get("arch").unwrap_or(&null),
+                raw.get("tokenizer_config").unwrap_or(&null),
+                &tensors,
+                vocab.as_deref(),
+                exec,
+            ))
+        } else {
+            None
+        };
+        crate::knowledge::validate_knowledge(
+            &header,
+            &tensors,
+            vocab.as_deref(),
+            env.required_features,
+            Some(env.data.1),
+            trunk,
+            exec,
+        )?;
+        // A lookup policy this reader does not know (a newer writer's) is
+        // read as router_and_key by the runtime — the file stays readable.
+        for (id, p) in crate::knowledge::unknown_lookup_policies(&header) {
+            tracing::warn!(
+                "skill '{id}': lookup.policy '{p}' is unknown to this reader (knows {}) — read as \
+                 {}",
+                crate::knowledge::lookup_policy::ALL.join(" | "),
+                crate::knowledge::lookup_policy::DEFAULT
+            );
+        }
+        // expert_append descriptor values (bias 0, finite shell): a few
+        // 4-byte reads from the mapped payloads.
+        crate::knowledge::validate_expert_append_values(&header, &tensors, |t| {
+            let start = (env.data.0 + t.off) as usize;
+            bytes
+                .get(start..start + t.nbytes as usize)
+                .and_then(crate::knowledge::f32_le_head)
+        })?;
+        // lookup tables (sorted unique key hashes, entries in range,
+        // monotone offsets, UTF-8 blob, object-shaped slots): one pass
+        // over the mapped payloads of each lookup record — the slots are
+        // NOT parsed here (the runtime reads a card lazily; the writers
+        // parsed every slot before committing it).
+        crate::knowledge::validate_lookup_values(&header, &tensors, false, |t| {
+            let start = (env.data.0 + t.off) as usize;
+            bytes
+                .get(start..start + t.nbytes as usize)
+                .map(std::borrow::Cow::Borrowed)
+        })?;
+
         tracing::info!(
             "Opened CMF v2: {} | {} tensors | {} masks | vocab {} | {:.1} MB",
             header.arch.arch_name,
@@ -690,6 +976,8 @@ impl CmfModel {
             data_off: env.data.0,
             envelope: env,
             extra_shards: Vec::new(),
+            trunk,
+            exec,
         })
     }
 
@@ -722,6 +1010,12 @@ impl CmfModel {
         for no in 2..=info.count {
             let sib = path.with_file_name(format!("{stem}-{:05}-of-{:05}.cmf", no, info.count));
             let sh = Self::open(&sib)?;
+            if sh.header.arch.linear_core_identity() != first.header.arch.linear_core_identity() {
+                return Err(CmfError::Parse(format!(
+                    "{}: linear-core identity differs from shard 1",
+                    sib.display()
+                )));
+            }
             match &sh.header.shard {
                 Some(si) if si.no == no && si.count == info.count => {}
                 other => {
@@ -779,10 +1073,7 @@ impl CmfModel {
         }
         let _flags = u32le(8); // reserved
         let required_features = u32le(12);
-        let unknown = required_features & !features::SUPPORTED;
-        if unknown != 0 {
-            return Err(CmfError::UnsupportedFeature(unknown));
-        }
+        check_required_features(required_features, features::SUPPORTED)?;
 
         let env = Envelope {
             required_features,
@@ -933,13 +1224,76 @@ impl CmfModel {
     /// Tensor-source indirection (spec §9, Patent 15 fig3/302): the
     /// skill's replacement is read IN PLACE OF the backbone tensor —
     /// either/or, never combined. None skill → backbone directly.
+    ///
+    /// For a v2 skill record, a name listed in its `overrides` whose
+    /// `skill.{id}.X` tensor is missing resolves to `None` (logged) — never
+    /// silently to the backbone tensor. [`Self::try_resolve_tensor`] returns
+    /// the reason.
     pub fn resolve_tensor(&self, name: &str, skill: Option<&str>) -> Option<&TensorEntry> {
-        if let Some(sid) = skill {
-            if let Some(t) = self.tensor(&format!("skill.{sid}.{name}")) {
-                return Some(t);
+        match self.try_resolve_tensor(name, skill) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!("{e}");
+                None
             }
         }
-        self.tensor(name)
+    }
+
+    /// [`Self::resolve_tensor`] with the no-silent-fallback case as an
+    /// error: `Ok(None)` = no such tensor at all, `Err` = a v2 skill
+    /// declares an override for `name` but carries no replacement.
+    pub fn try_resolve_tensor(
+        &self,
+        name: &str,
+        skill: Option<&str>,
+    ) -> Result<Option<&TensorEntry>, CmfError> {
+        if let Some(sid) = skill {
+            if let Some(t) = self.tensor(&format!("skill.{sid}.{name}")) {
+                return Ok(Some(t));
+            }
+            let declared = self
+                .header
+                .skills
+                .iter()
+                .find(|s| s.id == sid)
+                .is_some_and(|s| s.kind.is_some() && s.overrides.iter().any(|o| o.name == name));
+            if declared {
+                return Err(CmfError::MissingTensor(format!(
+                    "skill.{sid}.{name} (v2 skill '{sid}' overrides '{name}'; \
+                     no fallback to the backbone tensor)"
+                )));
+            }
+        }
+        Ok(self.tensor(name))
+    }
+
+    /// hash64 of the trunk as this file encodes it ([`trunk_hash`]): every
+    /// directory entry outside `skill.`/`route.`, the arch, the vocab, the
+    /// tokenizer bundle and — when present — the mask catalog and sparse
+    /// index ([`crate::knowledge::trunk_hash_exec`]). Equals
+    /// `header.genome.trunk_hash` for any GENOME file that opened.
+    pub fn trunk_hash(&self) -> u64 {
+        self.trunk.unwrap_or_else(|| {
+            crate::knowledge::trunk_hash_exec(
+                &self.header,
+                &self.tensors,
+                self.vocab.as_deref(),
+                self.exec_hashes(),
+            )
+        })
+    }
+
+    /// hash64 of this file's raw mask / sparse-index sections (computed at
+    /// open for GENOME files, on demand otherwise).
+    pub fn exec_hashes(&self) -> crate::knowledge::ExecHashes {
+        if self.header.genome.is_some() {
+            return self.exec;
+        }
+        let bytes = self.backing.bytes();
+        let sec = |(off, len): (u64, u64)| -> Option<&[u8]> {
+            (len > 0).then(|| bytes.get(off as usize..(off + len) as usize))?
+        };
+        crate::knowledge::ExecHashes::of(sec(self.envelope.masks), sec(self.envelope.index))
     }
 
     /// The per-skill delta index view (claim 2): directory entries of
@@ -1131,6 +1485,17 @@ impl CmfModel {
         let mut head = vec![0u8; ENVELOPE_LEN];
         f.read_exact(&mut head)?;
         let env = Self::parse_envelope(&head, file_len)?;
+        // By content too: a pre-0.8.1 embryo-o1 file carries GENOME on bit 8.
+        let genome_by_content = peek_header(path)?
+            .is_some_and(|(_, header)| header.get("genome").is_some_and(|g| !g.is_null()));
+        if env.required_features & features::GENOME != 0 || genome_by_content {
+            return Err(CmfError::Parse(format!(
+                "recode: {path} carries a frozen genome (GENOME bit) — rewriting its \
+                 payloads in place would change the trunk without a new genome. A requant \
+                 must write a new file that rewrites genome.trunk_hash/encoding and records \
+                 a `requant` lineage event"
+            )));
+        }
 
         let mut dir = vec![0u8; env.dir.1 as usize];
         f.seek(SeekFrom::Start(env.dir.0))?;
@@ -1288,6 +1653,11 @@ impl CmfModel {
                 ));
             }
         }
+        header
+            .arch
+            .validate_operator_metadata()
+            .map_err(CmfError::Parse)?;
+
         // Directory + data layout.
         let mut entries = Vec::with_capacity(tensors.len());
         let mut data_cursor = 0u64;
@@ -1359,44 +1729,39 @@ impl CmfModel {
                 index: hex(index_bytes.as_deref()),
             });
         }
+        // A full rewrite lays every tensor out afresh: it is a compaction,
+        // and the tail-append segment table no longer describes the file.
+        header.segments.clear();
+        // Genome: fill an empty trunk hash from this content, refuse a
+        // stale one (the trunk changed without a new genome). The mask
+        // catalog / sparse index are part of the trunk's execution.
+        let exec = crate::knowledge::ExecHashes::of(masks_bytes.as_deref(), index_bytes.as_deref());
+        crate::knowledge::seal_genome(&mut header, &entries, vocab, exec)?;
+
+        let required_features = derive_required_features(&header, &entries, masks_bytes.is_some());
+        // The writer refuses what open() would refuse — before a byte hits
+        // the disk.
+        crate::knowledge::validate_knowledge(
+            &header,
+            &entries,
+            vocab,
+            required_features,
+            Some(data_len),
+            None,
+            exec,
+        )?;
+        crate::knowledge::check_lookup_policies(&header)?;
+        // entries[i] is tensors[i]: the payload of an entry by position.
+        crate::knowledge::validate_expert_append_values(&header, &entries, |e| {
+            let i = entries.iter().position(|x| std::ptr::eq(x, e))?;
+            crate::knowledge::f32_le_head(tensors[i].data)
+        })?;
+        crate::knowledge::validate_lookup_values(&header, &entries, true, |e| {
+            let i = entries.iter().position(|x| std::ptr::eq(x, e))?;
+            Some(std::borrow::Cow::Borrowed(tensors[i].data))
+        })?;
         let header_json =
             serde_json::to_vec(&header).map_err(|e| CmfError::Parse(format!("header: {e}")))?;
-
-        let mut required_features = features::TENSOR_DIR;
-        if header.arch.prism_hadamard.is_some() {
-            required_features |= features::PRISM_HADAMARD;
-        }
-        if header
-            .arch
-            .prism_hadamard
-            .as_ref()
-            .and_then(|p| p.affine.as_ref())
-            .is_some()
-        {
-            required_features |= features::PRISM_AFFINE;
-        }
-        if masks_bytes.is_some() {
-            required_features |= features::BINARY_MASKS;
-            if header.arch.num_loops > 1 {
-                required_features |= features::LOOP_MASKS;
-            }
-        }
-        if entries
-            .iter()
-            .any(|t| matches!(t.dtype, TensorDtype::Q8_2f | TensorDtype::Vbit))
-        {
-            required_features |= features::QUANT_2F;
-        }
-        // A skill record bound to a base directory makes this file a
-        // standalone skill, and the bit keeps every reader honest about it.
-        if header.skills.iter().any(|s| s.base_dir_hash.is_some()) {
-            required_features |= features::SKILL_FILE;
-        }
-        // A decision profile is not a language model: the bit makes every
-        // generative reader refuse it (older ones by the unknown bit).
-        if is_decision_profile(&header.arch.arch_name) {
-            required_features |= features::DECISION;
-        }
 
         // Section offsets.
         let header_off = ENVELOPE_LEN as u64;
@@ -1500,6 +1865,57 @@ fn align_to(x: u64, a: u64) -> u64 {
     x.div_ceil(a) * a
 }
 
+/// Refuse `required` bits outside `supported` — the envelope gate every
+/// reader applies before touching a section (`UnsupportedFeature`). Public
+/// so tooling can ask what a reader with an older `SUPPORTED` would do.
+pub fn check_required_features(required: u32, supported: u32) -> Result<(), CmfError> {
+    let unknown = required & !supported;
+    if unknown != 0 {
+        return Err(CmfError::UnsupportedFeature(unknown));
+    }
+    Ok(())
+}
+
+/// The `required_features` a header + directory demand — the ONE place
+/// the writers (`write_ref`, the streaming `finish`, the tail append)
+/// derive the bits from content, so no bit is ever set by hand and none is
+/// silently lost on a rewrite.
+pub fn derive_required_features(
+    header: &CmfHeader,
+    entries: &[TensorEntry],
+    masks_present: bool,
+) -> u32 {
+    let mut f = features::TENSOR_DIR | prism_bits(&header.arch);
+    // A decision profile is not a language model: the bit makes every
+    // generative reader refuse it (older ones by the unknown bit).
+    if is_decision_profile(&header.arch.arch_name) {
+        f |= features::DECISION;
+    }
+    if masks_present {
+        f |= features::BINARY_MASKS;
+        if header.arch.num_loops > 1 {
+            f |= features::LOOP_MASKS;
+        }
+    }
+    if entries
+        .iter()
+        .any(|t| matches!(t.dtype, TensorDtype::Q8_2f | TensorDtype::Vbit))
+    {
+        f |= features::QUANT_2F;
+    }
+    // A skill record bound to a base directory makes this file a
+    // standalone skill, and the bit keeps every reader honest about it.
+    if header.skills.iter().any(|s| s.base_dir_hash.is_some()) {
+        f |= features::SKILL_FILE;
+    }
+    // A declared bounded anchor is an operator every reader must execute
+    // exactly; the bit makes readers that cannot refuse.
+    if header.arch.anchor_core.is_some() {
+        f |= features::BOUNDED_STATE;
+    }
+    f | crate::knowledge::knowledge_bits(header)
+}
+
 fn zeros(n: usize) -> Vec<u8> {
     vec![0u8; n]
 }
@@ -1579,7 +1995,15 @@ impl CmfStreamWriter {
     pub fn new(path: impl AsRef<Path>, gap: u64) -> Result<Self, CmfError> {
         let path = path.as_ref().to_path_buf();
         let data_off = align_to(gap.max(ENVELOPE_LEN as u64 + 1), DATA_ALIGNMENT);
-        let mut file = BufWriter::new(File::create(&path)?);
+        // Read + write: `finish` reads a few descriptor values back from
+        // the payloads already on disk (expert_append records).
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)?;
+        let mut file = BufWriter::new(file);
         file.write_all(&zeros(data_off as usize))?;
         Ok(Self {
             file,
@@ -1883,40 +2307,48 @@ impl CmfStreamWriter {
                 index: hex(index_bytes.as_deref()),
             });
         }
+        // Same contract as the ordinary writer: the bounded anchor and its
+        // bit travel together (open() refuses a file where they disagree),
+        // and the knowledge bits are derived from content, never set by hand.
+        header
+            .arch
+            .validate_operator_metadata()
+            .map_err(CmfError::Parse)?;
+        header.segments.clear();
+        let exec = crate::knowledge::ExecHashes::of(masks_bytes.as_deref(), index_bytes.as_deref());
+        crate::knowledge::seal_genome(&mut header, &self.entries, vocab, exec)?;
+        let required_features =
+            derive_required_features(&header, &self.entries, masks_bytes.is_some());
+        crate::knowledge::validate_knowledge(
+            &header,
+            &self.entries,
+            vocab,
+            required_features,
+            Some(data_len),
+            None,
+            exec,
+        )?;
+        crate::knowledge::check_lookup_policies(&header)?;
+        // The payloads are already on disk: read the descriptor values back.
+        {
+            use std::io::Read;
+            let (file, data_off) = (self.file.get_mut(), self.data_off);
+            crate::knowledge::validate_expert_append_values(&header, &self.entries, |e| {
+                let mut b = [0u8; 4];
+                file.seek(SeekFrom::Start(data_off + e.off)).ok()?;
+                file.read_exact(&mut b).ok()?;
+                Some(f32::from_le_bytes(b))
+            })?;
+            // Lookup tables are small next to the weights: read them back.
+            crate::knowledge::validate_lookup_values(&header, &self.entries, true, |e| {
+                let mut b = vec![0u8; e.nbytes as usize];
+                file.seek(SeekFrom::Start(data_off + e.off)).ok()?;
+                file.read_exact(&mut b).ok()?;
+                Some(std::borrow::Cow::Owned(b))
+            })?;
+        }
         let header_json =
             serde_json::to_vec(&header).map_err(|e| CmfError::Parse(format!("header: {e}")))?;
-
-        let mut required_features = features::TENSOR_DIR;
-        if header.arch.prism_hadamard.is_some() {
-            required_features |= features::PRISM_HADAMARD;
-        }
-        if header
-            .arch
-            .prism_hadamard
-            .as_ref()
-            .and_then(|p| p.affine.as_ref())
-            .is_some()
-        {
-            required_features |= features::PRISM_AFFINE;
-        }
-        if masks_bytes.is_some() {
-            required_features |= features::BINARY_MASKS;
-            if header.arch.num_loops > 1 {
-                required_features |= features::LOOP_MASKS;
-            }
-        }
-        if self
-            .entries
-            .iter()
-            .any(|t| matches!(t.dtype, TensorDtype::Q8_2f | TensorDtype::Vbit))
-        {
-            required_features |= features::QUANT_2F;
-        }
-        // Same derivation as `write_ref`: the reader refuses a decision
-        // profile without its bit, so the streamed path must set it too.
-        if is_decision_profile(&header.arch.arch_name) {
-            required_features |= features::DECISION;
-        }
 
         let header_off = ENVELOPE_LEN as u64;
         let dir_off = header_off + header_json.len() as u64;

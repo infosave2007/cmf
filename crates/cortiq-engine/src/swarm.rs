@@ -25,6 +25,9 @@ pub struct RoutableSkill {
     mean: Vec<f32>,
     basis: Vec<f32>,
     rank: usize,
+    /// `metric == "mse_unit"`: φ is unit-normalized before the residual
+    /// (the Embryo trainer's descriptors); `"mse"` uses φ as is.
+    unit: bool,
 }
 
 fn decode_f16(b64: &str) -> Option<Vec<f32>> {
@@ -44,9 +47,11 @@ impl RoutableSkill {
         sel: &SelectionDescriptor,
         hidden: usize,
     ) -> Option<Self> {
-        if sel.metric != "mse" {
-            return None;
-        }
+        let unit = match sel.metric.as_str() {
+            "mse" => false,
+            "mse_unit" => true,
+            _ => return None,
+        };
         let mean = decode_f16(&sel.mean)?;
         let basis = decode_f16(&sel.basis)?;
         if mean.len() != hidden || basis.len() != sel.rank * hidden {
@@ -59,19 +64,31 @@ impl RoutableSkill {
             mean,
             basis,
             rank: sel.rank,
+            unit,
         })
     }
 
     /// Normalized reconstruction error E = ‖r − BBᵀr‖²/‖φ‖²,
-    /// r = φ − mean (identical math to router::route).
+    /// r = φ − mean (identical math to router::route); for `mse_unit`
+    /// φ is unit-normalized first (then ‖φ‖² = 1).
     pub fn error(&self, phi: &[f32]) -> f32 {
         let hidden = self.mean.len();
         if phi.len() != hidden {
             return f32::INFINITY;
         }
-        let r: Vec<f32> = phi.iter().zip(&self.mean).map(|(p, m)| p - m).collect();
+        let norm2: f32 = phi.iter().map(|v| v * v).sum();
+        let scale = if self.unit && norm2 > 0.0 {
+            1.0 / norm2.sqrt()
+        } else {
+            1.0
+        };
+        let r: Vec<f32> = phi
+            .iter()
+            .zip(&self.mean)
+            .map(|(p, m)| p * scale - m)
+            .collect();
         let rr: f32 = r.iter().map(|v| v * v).sum();
-        let pp: f32 = phi.iter().map(|v| v * v).sum();
+        let pp: f32 = norm2 * scale * scale;
         let mut proj = 0f32;
         for k in 0..self.rank {
             let row = &self.basis[k * hidden..(k + 1) * hidden];
@@ -256,7 +273,54 @@ pub fn decide(
 
 #[cfg(test)]
 mod tests {
-    use super::decide;
+    use super::{RoutableSkill, decide};
+    use base64::Engine as _;
+
+    fn f16_b64(v: &[f32]) -> String {
+        let bytes: Vec<u8> = v
+            .iter()
+            .flat_map(|x| cortiq_core::quant::f32_to_f16(*x).to_le_bytes())
+            .collect();
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    /// The Embryo trainer writes `mse_unit` descriptors: the dynamic router
+    /// must accept them (they used to drop out silently) and measure E on
+    /// the unit-normalized φ — scale-invariant, unlike `mse`.
+    #[test]
+    fn mse_unit_descriptors_are_routable_and_scale_invariant() {
+        let hidden = 4;
+        let mut mean = vec![0.0f32; hidden];
+        mean[0] = 1.0;
+        let mut basis = vec![0.0f32; hidden];
+        basis[1] = 1.0;
+        let sel = |metric: &str| cortiq_core::SelectionDescriptor {
+            metric: metric.into(),
+            phi_layer: 2,
+            mean: f16_b64(&mean),
+            basis: f16_b64(&basis),
+            rank: 1,
+            err_mean: None,
+            err_std: None,
+            holdout: None,
+            holdout_n: None,
+        };
+        let unit = RoutableSkill::from_descriptor(0, "u".into(), &sel("mse_unit"), hidden)
+            .expect("mse_unit accepted");
+        let raw = RoutableSkill::from_descriptor(1, "r".into(), &sel("mse"), hidden)
+            .expect("mse accepted");
+        assert!(RoutableSkill::from_descriptor(2, "x".into(), &sel("cosine"), hidden).is_none());
+        // φ along the mean at any scale: zero error under mse_unit.
+        for s in [0.5f32, 1.0, 7.0] {
+            let phi = vec![s, 0.0, 0.0, 0.0];
+            assert!(unit.error(&phi) < 1e-6, "scale {s}: {}", unit.error(&phi));
+        }
+        // mse on an unnormalized φ is scale-dependent.
+        assert!(raw.error(&[7.0, 0.0, 0.0, 0.0]) > 0.5);
+        // The basis direction is projected out; the orthogonal one is not.
+        assert!(unit.error(&[3.0, 1.0, 0.0, 0.0]) < 0.01);
+        assert!(unit.error(&[0.0, 0.0, 1.0, 0.0]) > 0.9);
+    }
 
     #[test]
     fn hysteresis_barrier_suppresses_thrashing() {

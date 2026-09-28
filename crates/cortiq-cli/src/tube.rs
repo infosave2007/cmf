@@ -51,6 +51,7 @@ struct LayerPlan {
 
 pub fn cmd_tube_bake(model_path: &str, plan_path: &str, output: &str) -> anyhow::Result<()> {
     let model = Arc::new(CmfModel::open_sharded(model_path)?);
+    crate::knowledge::refuse_genome_rewrite(&model, "tube-bake")?;
     let arch = model.arch().clone();
     let (nl, hidden, inter) = (arch.num_layers, arch.hidden_size, arch.intermediate_size);
     let plan: Value = serde_json::from_str(
@@ -369,6 +370,7 @@ pub fn cmd_tube_bake(model_path: &str, plan_path: &str, output: &str) -> anyhow:
 /// of its FFN.
 pub fn cmd_ffn_transpose(model_path: &str, output: &str) -> anyhow::Result<()> {
     let model = Arc::new(CmfModel::open_sharded(model_path)?);
+    crate::knowledge::refuse_genome_rewrite(&model, "ffn-transpose")?;
     let arch = model.arch().clone();
     let (nl, hidden, inter) = (arch.num_layers, arch.hidden_size, arch.intermediate_size);
     let mut tensors: Vec<TensorSpec> = model

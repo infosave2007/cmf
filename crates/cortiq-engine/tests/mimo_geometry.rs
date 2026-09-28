@@ -80,6 +80,7 @@ fn arch(kv_heads_per_layer: Option<Vec<usize>>, v_head_dim: Option<usize>) -> Mo
         prism_hadamard: None,
         kv_heads_per_layer,
         v_head_dim,
+        anchor_core: None,
     }
 }
 
@@ -156,6 +157,10 @@ fn write_model(
         shard: None,
         calibration: None,
         routing: None,
+        genome: None,
+        lineage: Vec::new(),
+        router: None,
+        segments: Vec::new(),
     };
     CmfModel::write(&path, &header, tensors, None, None).unwrap();
     (dir, Arc::new(CmfModel::open(&path).unwrap()))

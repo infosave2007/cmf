@@ -3,12 +3,17 @@
 
 mod avout;
 mod awnp;
+mod choice;
 mod convert;
 mod decision;
+mod dialog;
 mod gguf;
 mod gptq;
+mod growth;
 mod http_range;
 mod imagepack;
+mod knowledge;
+mod lookup;
 mod ltxcmd;
 mod ltxpack;
 mod mimo_towers;
@@ -16,10 +21,12 @@ mod moedefrag;
 mod music;
 mod npy;
 mod qwen_imagepack;
+mod recall;
 mod requant;
 mod sign;
 mod skill;
 mod tube;
+mod utility;
 mod videopack;
 mod zimagepack;
 
@@ -168,6 +175,7 @@ impl SessionState {
 /// Bundled `--o1*` CLI flags for run/serve/bench. `spec = None` keeps
 /// whatever env CMF_O1 / the file's converter hint resolved at load;
 /// an explicit spec (including `off`) replaces it.
+#[derive(Clone)]
 struct O1Flags {
     spec: Option<String>,
     m: Option<usize>,
@@ -195,13 +203,18 @@ impl O1Flags {
         }))
     }
 
-    fn apply(&self, pipeline: &mut Pipeline) {
+    /// Apply the flags; a natively bounded file refuses any `--o1`
+    /// (the anchor is the file's operator, not a runtime knob).
+    fn apply(&self, pipeline: &mut Pipeline) -> anyhow::Result<()> {
         if let Some(spec) = self.spec.as_deref() {
-            let rect = self.rect().unwrap_or(None);
-            pipeline.set_o1(cortiq_engine::nystrom::O1Cfg::from_spec(
-                spec, self.m, self.w, self.sink, rect,
-            ));
+            let rect = self.rect()?;
+            pipeline
+                .try_set_o1(cortiq_engine::nystrom::O1Cfg::from_spec(
+                    spec, self.m, self.w, self.sink, rect,
+                ))
+                .map_err(|e| anyhow::anyhow!(e))?;
         }
+        Ok(())
     }
 }
 
@@ -342,6 +355,16 @@ enum Commands {
         /// does not. The server prints which mode it took and why.
         #[arg(long, conflicts_with = "peer")]
         gpus: Option<usize>,
+        /// Router v2: also score quarantined skills in the per-request
+        /// decision (gate measurement; debug)
+        #[arg(long)]
+        route_include_quarantine: bool,
+        /// A request routed to a `lookup` record: answer (the table's text
+        /// is the assistant message; default) | context (the card is
+        /// prepended to the message and the backbone generates) | off
+        /// (the table is ignored). Default: CMF_LOOKUP_MODE.
+        #[arg(long)]
+        lookup_mode: Option<String>,
     },
     /// Decide with a decision file: one text (-p) or a JSONL batch (--input);
     /// locally, and with --oracle MODEL (the key in OPENROUTER_API_KEY) an
@@ -475,7 +498,7 @@ enum Commands {
         /// Output .cmf path (omit with --in-place)
         #[arg(long)]
         output: Option<String>,
-        /// Target layout: q4tp (re-express q4 scales), q4tp-quantize (REAL quantization of a float container: 2-D weights → q4tp), or q2tp-draft (MTP draft expert inputs)
+        /// Target layout: q4tp (re-express scales), q4tp-quantize (float weights → q4tp), q2tp-draft (MTP inputs), or embryo-q8-head (experimental tied Embryo vocabulary only; new output required)
         #[arg(long, default_value = "q4tp")]
         quant: String,
         /// Rewrite tensors inside the source file itself — for disks that
@@ -713,6 +736,16 @@ enum Commands {
         /// via CMF_ROUTE_EON/EOFF/MARGIN/PERIOD.
         #[arg(long)]
         route_dynamic: bool,
+        /// Router v2: also score quarantined skills in the automatic
+        /// decision (gate measurement; debug)
+        #[arg(long)]
+        route_include_quarantine: bool,
+        /// A prompt routed to a `lookup` record: answer (the table's text
+        /// is printed, nothing is generated; default) | context (the card
+        /// is prepended to the prompt and the backbone generates) | off
+        /// (the table is ignored). Default: CMF_LOOKUP_MODE.
+        #[arg(long)]
+        lookup_mode: Option<String>,
         /// After generation, reprint the answer with each token coloured
         /// by the model's confidence (softmax probability): green = sure, red =
         /// guessing. The honest house — the model shows where it's unsure.
@@ -1034,6 +1067,433 @@ enum Commands {
         #[arg(long)]
         o1_prefill: Option<usize>,
     },
+    /// Synthetic recall probe (MQAR / NIAH-lite) through the RUNTIME: K
+    /// random key→value token pairs, D filler tokens, one key — does the
+    /// model put its value first? Accuracy per distance, per model file.
+    /// Runs on whatever the environment selects (CMF_GPU=0 → CPU;
+    /// CMF_GPU=wgpu CMF_GPU_PROBE=0 CMF_GPU_WGPU_GRAPH=1
+    /// CMF_EMBRYO_RESIDENT=parallel → the resident Embryo graph).
+    ProbeRecall {
+        /// One or more .cmf files
+        #[arg(required = true)]
+        models: Vec<String>,
+        /// Key→value pairs per trial
+        #[arg(long, default_value = "4")]
+        pairs: usize,
+        /// Filler lengths between the pairs and the query
+        #[arg(long, default_value = "256,1024,4096,16384")]
+        distances: String,
+        /// Trials per distance
+        #[arg(long, default_value = "32")]
+        trials: usize,
+        #[arg(long, default_value = "1")]
+        seed: u64,
+        /// random (fresh ids per position) | repeat (one id repeated)
+        #[arg(long, default_value = "random")]
+        filler: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Utility gate (S10) through the runtime under the corrected
+    /// cmf-im-v1 chat contract: greedy answers to a frozen prompt set
+    /// (default: the audit's 11 utility prompts), per prompt exact /
+    /// keyword hit, loop metrics (distinct 5-grams in the last 128
+    /// tokens, longest period ≤ 16 run), first-token top-5, TTFT, tok/s.
+    ProbeUtility {
+        /// One or more .cmf files
+        #[arg(required = true)]
+        models: Vec<String>,
+        /// TSV prompt file: LABEL<TAB>EXPECTED[|ALT]<TAB>PROMPT (# comments)
+        #[arg(long)]
+        prompts: Option<String>,
+        /// JSONL prompt file: {"lang","prompt","expect":[keywords],"src"} per line
+        #[arg(long)]
+        prompts_jsonl: Option<String>,
+        #[arg(long, default_value = "128")]
+        max_tokens: usize,
+        /// Repetition penalty (1.0 = pure greedy)
+        #[arg(long, default_value = "1.0")]
+        rep_penalty: f32,
+        /// Prepend the tokenizer's BOS (the contract has none)
+        #[arg(long)]
+        bos: bool,
+        #[arg(long)]
+        json: bool,
+        /// Pipeline per prompt: auto (router-v2 decision) | backbone | <skill id>.
+        /// Default: auto for a file with a router policy (ROUTER_V2), the
+        /// plain pipeline (no routing) otherwise.
+        #[arg(long)]
+        route: Option<String>,
+        /// Also score quarantined v2 skills (gate measurement; debug)
+        #[arg(long)]
+        include_quarantine: bool,
+        /// A prompt routed to a `lookup` record: answer (the table's text
+        /// is the answer, nothing is generated; default) | context (the
+        /// card is prepended and the backbone generates) | off. Default:
+        /// CMF_LOOKUP_MODE. Per row: `route.lookup_hit`, `lookup_key`, `field`.
+        #[arg(long)]
+        lookup_mode: Option<String>,
+    },
+    /// Conversation memory of a `lookup` record (spec §9.5.2) on scripted
+    /// dialogs of USER turns, every turn decided exactly as serve's lookup
+    /// pre-pass decides a chat: the φ router on the turn itself (prompt
+    /// contract against the tokenizer's chat frame), the key from the most
+    /// recent of the last 6 user turns that holds one (`lookup_turn` =
+    /// turns back), the key_first policy on the turn's own strong key.
+    /// Per turn: target, decided_by, hit, lookup_turn, entry and its Latin
+    /// binomial vs expect_src, field, answer. Summary: first-turn and
+    /// follow-up hit rates, follow-up correct-entry rate, per_lang by the
+    /// script of EACH turn (= per_turn_lang; per_dialog_lang by the
+    /// dialog's language), mean lookup_turn, the first 20 misses. answer
+    /// mode generates nothing; context mode generates ≤ 32 greedy tokens
+    /// on serve's transcript. --route auto on a file without a router
+    /// policy warns: serve never routes such a file.
+    ProbeDialog {
+        /// .cmf file
+        model: String,
+        /// JSONL: {"src": "<latin>", "turns": ["…", …], "expect_src": "<latin>" |
+        /// ["<latin>" | null per turn]} per line; optional "lang", "id"
+        #[arg(long)]
+        dialogs_jsonl: String,
+        /// auto (router-v2 decision; the default on a ROUTER_V2 file) | backbone | <skill id>
+        #[arg(long)]
+        route: Option<String>,
+        /// answer (default) | context | off. Default: CMF_LOOKUP_MODE
+        #[arg(long)]
+        lookup_mode: Option<String>,
+        /// Also route to quarantined v2 skills (gate measurement; debug)
+        #[arg(long)]
+        include_quarantine: bool,
+        /// Tokens generated per turn in context mode (capped at 32)
+        #[arg(long, default_value = "32")]
+        max_tokens: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Forced-choice fact probe for small models whose free generation is
+    /// too weak for keyword matching: every prompt rendered as cmf-im-v1
+    /// (as probe-utility), then log P(candidate | prefix) for every
+    /// candidate string (sum of token log-probs; --norm mean = per-token
+    /// mean) off ONE prefix forward per prompt — the candidates form a
+    /// token trie and the host KV state is rolled back between siblings.
+    /// Prediction = argmax; correct iff it equals expect[0]
+    /// (case-insensitive). Candidates: the distinct expect[0] of the file
+    /// or --candidates-jsonl. Reports top-1 / top-5 accuracy against the
+    /// majority-class and chance baselines, mean log-prob of the correct
+    /// vs the best wrong candidate, per-lang and per-row. Runs per-op on
+    /// the host route; CMF_GPU / CMF_GROWTH / CMF_GROWTH_SHELL from the
+    /// environment, as probe-utility.
+    ProbeChoice {
+        /// .cmf file
+        model: String,
+        /// JSONL prompt set: {"lang","prompt","expect":[answer, …],"src"} per line
+        #[arg(long)]
+        prompts_jsonl: String,
+        /// Candidate strings, one {"text": …} per line (default: the
+        /// distinct expect[0] values of the prompt set)
+        #[arg(long)]
+        candidates_jsonl: Option<String>,
+        /// sum (log P of the whole candidate) | mean (per token)
+        #[arg(long, default_value = "sum")]
+        norm: String,
+        /// shared (one prefix forward, KV rollback between candidates) |
+        /// full (a fresh forward of prefix + candidate per candidate: the
+        /// slow cross-check of the shared walk)
+        #[arg(long, default_value = "shared")]
+        scorer: String,
+        /// Prepend the tokenizer's BOS (the contract has none)
+        #[arg(long)]
+        bos: bool,
+        /// Cloze mode: score the prompt as a raw text prefix (no chat frame);
+        /// candidates get a leading space. Routing still decides on the prompt.
+        #[arg(long)]
+        raw: bool,
+        /// Pipeline per prompt: auto (router-v2 decision) | backbone | <skill id>.
+        /// Default: auto for a file with a router policy (ROUTER_V2), the
+        /// plain pipeline (no routing) otherwise.
+        #[arg(long)]
+        route: Option<String>,
+        /// Also score quarantined v2 skills (gate measurement; debug)
+        #[arg(long)]
+        include_quarantine: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Router-v2 gate G3: the per-request decision on every prompt of a
+    /// JSONL set against the expected target; accept / recall rate, the
+    /// exact Clopper–Pearson 95 % upper bound of the error rate, per-src and
+    /// per-lang breakdown, input sha256. On a file with a key_first lookup
+    /// record the decision is serve's: the φ router, then the key_first
+    /// step (a strong key takes a backbone decision) — a key_first take
+    /// counts as an accept of the record (decided_by_counts); the summary
+    /// says key_first_step: true, the gate skill-gate needs to activate a
+    /// key_first record.
+    RouteEval {
+        /// .cmf file
+        model: String,
+        /// JSONL prompt set: {"prompt", "lang"?, "src"?} per line
+        #[arg(long)]
+        prompts_jsonl: String,
+        /// Expected target of every prompt: backbone | <skill id>
+        #[arg(long)]
+        expect: String,
+        /// Also score quarantined v2 skills (gate measurement)
+        #[arg(long)]
+        include_quarantine: bool,
+        /// Measure the φ router alone, without the key_first step (a
+        /// diagnostic: such a summary is not a gate for a key_first record)
+        #[arg(long)]
+        router_only: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Gate G2 data: every prompt rendered as cmf-im-v1 (as probe-utility),
+    /// greedy --tokens tokens, and the logits of the last prompt position
+    /// and of every generated position written as records
+    /// {index u32, route u8, n_positions u32, vocab u32, f32[n_positions·vocab]}
+    /// (LE; route 0 = backbone, 1+i = header.skills[i]).
+    DumpLogits {
+        /// .cmf file
+        model: String,
+        /// JSONL prompt set: {"prompt", …} per line
+        #[arg(long)]
+        prompts_jsonl: String,
+        /// Greedy tokens per prompt
+        #[arg(long, default_value = "64")]
+        tokens: usize,
+        /// auto | backbone | <skill id> (default: auto with a router
+        /// policy, no routing otherwise)
+        #[arg(long)]
+        route: Option<String>,
+        /// Also score quarantined v2 skills (gate measurement)
+        #[arg(long)]
+        include_quarantine: bool,
+        /// Output file (the sidecar `<out>.meta.json` records the path,
+        /// growth and shell modes for `logits-compare`)
+        #[arg(long)]
+        out: String,
+        /// Forward path: per-op (every lane on the host route — what
+        /// `growth-eval` measures; the default) | auto (the engine's own
+        /// choice: the resident graph where the backend has one). Both
+        /// dumps of a comparison and its `--only-indices` set must share it.
+        #[arg(long)]
+        path: Option<String>,
+        /// A prompt routed to a `lookup` record: answer (the record carries
+        /// the backbone's logits on the plain prompt under the skill's
+        /// route code; default) | context (the backbone on the
+        /// card-prepended prompt) | off. Default: CMF_LOOKUP_MODE.
+        #[arg(long)]
+        lookup_mode: Option<String>,
+    },
+    /// Compare two `dump-logits` files record by record (by index): matched,
+    /// bit-identical, max|Δ|, per route of B; G2 = every backbone record of
+    /// B (the candidate) bit-identical to A's. JSON on stdout.
+    LogitsCompare {
+        /// Reference dump (F0)
+        a: String,
+        /// Candidate dump (F1)
+        b: String,
+        /// Compare only these record indices: a JSON array, or the object
+        /// `growth-eval --indices-out` writes (its no-hit set — G2 for a
+        /// growth file: every listed record bit-identical to F0's)
+        #[arg(long)]
+        only_indices: Option<String>,
+    },
+    /// Set a v2 skill's measured gate and status by a header-only tail
+    /// append (the payloads and the trunk are not touched), with a lineage
+    /// event.
+    SkillGate {
+        /// .cmf file (updated in place, append-only)
+        model: String,
+        /// Skill id
+        #[arg(long)]
+        id: String,
+        /// Gate JSON file: the route-eval summary of a non-vacuous run
+        /// (auto-routing needs "status": "measured"; route-eval writes it)
+        #[arg(long)]
+        gate: String,
+        /// active | quarantine | retired
+        #[arg(long)]
+        status: String,
+        /// Commit --status active even when the gate is not measured (the
+        /// record then stays NOT auto-routable; debugging only)
+        #[arg(long)]
+        allow_unmeasured: bool,
+    },
+    /// Gate G1: F1 is an append-only successor of F0 — equal trunk hash,
+    /// every F0 directory entry unchanged, bytes [128, len(F0)) equal.
+    GenomeVerify {
+        /// The genome before the append
+        f0: String,
+        /// The file after it
+        f1: String,
+    },
+    /// Build a `lookup` record (spec §9.5.2): an explicit key → card
+    /// table (`skill.{id}.lookup.*`) appended to a COPY of the sealed
+    /// genome, status quarantine, origin {user_corpus, dataset sha256,
+    /// counts, dropped duplicates}. Keys are normalised (cmf-key-v2) and
+    /// hashed; a key repeated inside an entry is dropped, a key two
+    /// entries share goes by --on-duplicate (default: refuse), a key
+    /// longer than the runtime's 4-word n-gram window is dropped as
+    /// unreachable — all reported. JSON report on stdout.
+    LookupBuild {
+        /// The sealed genome (F0); never modified
+        base: String,
+        /// entries.jsonl: {"keys": [...], "<lang>": {"card": "...",
+        /// "fields": {"family": "...", ...}}, ...} per line
+        #[arg(long)]
+        entries: String,
+        /// Record id (skill.{id}.lookup.*)
+        #[arg(long)]
+        id: String,
+        /// Output file: a copy of the base plus the record (must differ
+        /// from the base; overwritten)
+        #[arg(long)]
+        out: String,
+        /// Slot languages in order, e.g. ru,en (default: every language
+        /// the entries carry, sorted by name)
+        #[arg(long)]
+        langs: Option<String>,
+        /// Record name (default: the id)
+        #[arg(long)]
+        name: Option<String>,
+        /// A key two entries share: first | last (the entry in file order
+        /// that keeps it) | error (refuse the build — the default)
+        #[arg(long, default_value = "error")]
+        on_duplicate: String,
+        /// Stop list: one key per line (# comments), left out of the table
+        /// (generic words such as plant / растения / species)
+        #[arg(long)]
+        drop_keys: Option<String>,
+        /// A prompt set (JSONL {"prompt"} or one per line) the built table
+        /// is probed with through the runtime's key extraction: keys hit
+        /// by more than --suspicious-share of the prompts are reported
+        #[arg(long)]
+        probe_prompts: Option<String>,
+        /// Share of --probe-prompts above which a key is suspicious
+        #[arg(long, default_value = "0.02")]
+        suspicious_share: f64,
+        /// A large GENERAL prompt set (JSONL {"prompt"} or one per line,
+        /// e.g. the user turns of a chat corpus) the built table is probed
+        /// with through the runtime's STRONG-key extraction: every strong
+        /// key it hits is a general phrase that key_first would answer
+        /// from the table (general_probe in the report)
+        #[arg(long)]
+        general_prompts: Option<String>,
+        /// Write the keys the general probe hit (every stored spelling
+        /// behind a hit), one per line, as a stop list for --drop-keys
+        #[arg(long)]
+        general_stop_out: Option<String>,
+        /// Routing policy written to lookup.policy: router_and_key (the φ
+        /// router decides; the default when omitted) | key_first (a strong
+        /// key — ≥ 2 real words of ≥ 3 letters, no digits — takes a
+        /// request the router sent to the backbone; one-word keys still
+        /// need the router). Probe key_first with --general-prompts.
+        #[arg(long)]
+        policy: Option<String>,
+    },
+    /// Switch the routing policy of an existing `lookup` record (spec
+    /// §9.5.2) by one header-only tail append with a lineage event — no
+    /// rebuild; the table, the trunk and the router's calibration stay.
+    /// router_and_key: the φ router decides, the key is looked up in what
+    /// it sent. key_first: a STRONG key in the message (≥ 2 real words of
+    /// ≥ 3 letters, no digits — an exact or stem n-gram, a Latin group in
+    /// parentheses or capitalised) sends the request to the table even
+    /// when the router
+    /// picked the backbone; one-word keys still need the router. An ACTIVE
+    /// record switched to key_first goes to stale_regate unless its gate
+    /// already covers key_first (or --keep-gate). JSON report on stdout.
+    LookupPolicy {
+        /// .cmf file with the lookup record (updated in place, append-only)
+        model: String,
+        /// Lookup record id
+        #[arg(long)]
+        id: String,
+        /// router_and_key | key_first
+        #[arg(long)]
+        policy: String,
+        /// Switching an ACTIVE record to key_first sets it stale_regate
+        /// (its gate was measured without the key_first step: re-gate with
+        /// route-eval + skill-gate); --keep-gate keeps it active anyway
+        #[arg(long)]
+        keep_gate: bool,
+    },
+    /// Fit the request router (policy v2 backbone_gated, spec §9.4) for
+    /// one v2 skill with the RUNTIME's φ (probe_phi_span over the
+    /// canonical cmf-im-v1 span at --phi-layer, unit norm — what
+    /// route_request scores): the skill's and the backbone's descriptors
+    /// (mean + top-rank PCA rows, error statistics, the last 20 % of each
+    /// prompt set held out), then header.router, header.routing
+    /// (calibrate_v2 over every class of the file) and the record's
+    /// selection by ONE header-only tail append. Prints the calibration
+    /// summary (JSON on stdout): in-scope recall on the skill held-out,
+    /// false-accept on the general held-out, θ, T.
+    RouteFit {
+        /// .cmf file with the skill record (updated in place, append-only)
+        model: String,
+        /// Skill id
+        #[arg(long)]
+        id: String,
+        /// In-scope prompts: JSONL {"prompt"} / {"text"} / strings, or one
+        /// prompt per line
+        #[arg(long)]
+        skill_prompts: String,
+        /// General prompts (the backbone class), same formats
+        #[arg(long)]
+        general_prompts: String,
+        /// φ = hidden after this layer (default: the file's router.phi.layer)
+        #[arg(long)]
+        phi_layer: Option<usize>,
+        /// PCA rank of both descriptors (clamped to train − 1)
+        #[arg(long, default_value = "16")]
+        rank: usize,
+        /// At most this many prompts per set, in file order (0 = all)
+        #[arg(long, default_value = "4000")]
+        max: usize,
+        /// router.margin: a skill must beat the backbone by this much in
+        /// unit error (default: the current router's, else 0.05)
+        #[arg(long)]
+        margin: Option<f32>,
+        /// Target in-scope false-positive rate of the novelty flag (θ)
+        #[arg(long, default_value = "0.05")]
+        target_fpr: f32,
+    },
+    /// Growth records (`expert_append`): every prompt rendered as cmf-im-v1
+    /// (as dump-logits), prefill + --max-tokens greedy steps, the MoE
+    /// routing counters before/after → grown-expert wins per layer; per
+    /// prompt hit = any grown win; hit rate, n, Clopper–Pearson 95 % upper
+    /// bound, per-layer / per-record / per-src / per-lang breakdown.
+    /// --indices-out writes the no-hit indices for
+    /// `logits-compare --only-indices` (G2). Runs per-op (the counters
+    /// live on the host route).
+    GrowthEval {
+        /// .cmf file with expert_append records (F1)
+        model: String,
+        /// JSONL prompt set: {"prompt", "lang"?, "src"?} per line
+        #[arg(long)]
+        prompts_jsonl: String,
+        /// Greedy tokens per prompt (a dump-logits --tokens N record needs N)
+        #[arg(long, default_value = "32")]
+        max_tokens: usize,
+        #[arg(long)]
+        json: bool,
+        /// Write the no-hit record indices (JSON) here
+        #[arg(long)]
+        indices_out: Option<String>,
+        /// Apply the growth shell: on | off | both (default: CMF_GROWTH_SHELL)
+        #[arg(long)]
+        shell: Option<String>,
+        /// Records to mount: active | all | off (default: CMF_GROWTH; a
+        /// quarantined record needs `all`)
+        #[arg(long)]
+        growth: Option<String>,
+        /// Forward path: per-op only (the counters live on the host route;
+        /// the graph exports none) — the same flag as `dump-logits --path`,
+        /// recorded in --indices-out; `logits-compare --only-indices`
+        /// refuses dumps of another path
+        #[arg(long)]
+        path: Option<String>,
+    },
     /// Tell the model's life story: origin, body, skills, integrity —
     /// the file's verifiable autobiography from its own header.
     Story {
@@ -1059,6 +1519,13 @@ enum Commands {
         /// How many candidate first tokens to show
         #[arg(long, default_value = "8")]
         top: usize,
+        /// Pin the route instead of deciding it: a skill id, or `none` for
+        /// the backbone
+        #[arg(long)]
+        skill: Option<String>,
+        /// Also score quarantined v2 skills (gate measurement; debug)
+        #[arg(long)]
+        route_include_quarantine: bool,
     },
     /// Measure confidence calibration (B1): is the model's softmax
     /// confidence a true property (80% ⇒ right 80%), or does it need a
@@ -1090,6 +1557,19 @@ enum Commands {
     Verify {
         /// Path to .cmf model file
         model: String,
+    },
+    /// Migrate Embryo files written before 0.8.1 IN PLACE: move the
+    /// BOUNDED_STATE/GENOME bits from 7/8 (today's PRISM_HADAMARD/PRISM_AFFINE)
+    /// to 12/13. Only envelope bytes 12..16 change, so appended records and
+    /// the lineage survive (a re-export would drop them); a detached .sig
+    /// must be renewed with `cortiq sign` afterwards
+    MigrateEmbryoBits {
+        /// .cmf files to migrate (files without the old bits are left alone)
+        #[arg(required = true)]
+        files: Vec<String>,
+        /// Report what would change, write nothing
+        #[arg(long)]
+        dry_run: bool,
     },
     /// FCD polish for O(1)-converted models: train the converted
     /// layers' LN gains + FFN against the exact-attention teacher
@@ -1898,6 +2378,11 @@ enum SkillCmd {
         /// Max tokens for the quality gate
         #[arg(long, default_value = "1024")]
         quality_tokens: usize,
+        /// Optional binary decision threshold to carry in the skill record.
+        /// The runtime applies this positive-class probability threshold
+        /// automatically when the skill is the loaded artifact.
+        #[arg(long)]
+        decision_threshold: Option<f32>,
         /// Skip donor tensors whose relative change vs the backbone is
         /// below this (0 = keep everything): neurons the fine-tune
         /// never touched are not stored, the skill shrinks to its real
@@ -1981,6 +2466,14 @@ enum SkillCmd {
         /// are what cost, chunks only feed them.
         #[arg(long, default_value = "112")]
         calib_chunks: usize,
+        /// Independent fixed-length records per optimizer step. The focused
+        /// loss is averaged across the batch; 1 preserves the original recipe.
+        #[arg(long, default_value = "1")]
+        batch: usize,
+        /// Records per optimizer step in the native focused final-FFN cache.
+        /// It does not multiply full-backbone activation memory.
+        #[arg(long, default_value = "128")]
+        fcd_batch: usize,
         /// Comma-separated single-token labels to score/train on while
         /// still forwarding the full chunk as context (for example
         /// DOWN,UP). Empty means ordinary all-token LM loss.
@@ -1994,6 +2487,41 @@ enum SkillCmd {
         /// <1.0 = softer (scales the L1 penalty schedule)
         #[arg(long, default_value = "1.0")]
         l1_aggression: f64,
+        /// Initial L1 coefficient before the first evaluation window.
+        #[arg(long, default_value = "0.01")]
+        l1_init: f64,
+        /// L1 coefficient increment after each evaluation window.
+        #[arg(long, default_value = "0.005")]
+        l1_step: f64,
+        /// Hard-mask sigmoid threshold used for evaluation and defrag.
+        #[arg(long, default_value = "0.5")]
+        tau: f32,
+        /// Effective mask logit at step zero. 2.0 is the current native
+        /// recipe; 4.0 reproduces the older DTG-MA trading notebooks'
+        /// near-identity initialization.
+        #[arg(long, default_value = "2.0")]
+        mask_init: f32,
+        /// Reproduce the older DTG-MA sparsity penalty softplus(logit),
+        /// whose gradient stays useful near an open gate.
+        #[arg(long)]
+        softplus_l1: bool,
+        /// With --focus-tokens, checkpoint by hard held-out balanced
+        /// accuracy (then raw accuracy/PPL) instead of PPL alone.
+        #[arg(long)]
+        checkpoint_accuracy: bool,
+        /// Optional strict minimum raw accuracy for a focused checkpoint.
+        /// The checkpoint must exceed this value on the held corpus.
+        #[arg(long)]
+        checkpoint_min_accuracy: Option<f64>,
+        /// Optional strict minimum balanced accuracy for a focused
+        /// checkpoint. Combine with --checkpoint-min-accuracy to guard
+        /// against majority-only specialists.
+        #[arg(long)]
+        checkpoint_min_balanced_accuracy: Option<f64>,
+        /// Rank checkpoints meeting the configured guards by raw accuracy
+        /// first, then balanced accuracy and PPL.
+        #[arg(long)]
+        checkpoint_raw_priority: bool,
         /// Round each layer's kept-neuron count up to a multiple of
         /// this (keeps grouped codecs + SIMD kernels on the fast
         /// path; 1 = off)
@@ -2004,6 +2532,19 @@ enum SkillCmd {
         /// on uneven layers
         #[arg(long)]
         uniform_inter: bool,
+        /// Write the complete continuous logits and hard keep indices as
+        /// JSON so archaeology runs can be compared neuron by neuron.
+        #[arg(long)]
+        archaeology_report: Option<String>,
+        /// Run mask/FCD archaeology and write its report, but stop before
+        /// building a specialist CMF. Useful for parameter sweeps.
+        #[arg(long)]
+        analysis_only: bool,
+        /// Skip the expensive all-token real-runtime PPL gate after the
+        /// specialist is written. Intended for controlled research runs;
+        /// final artifacts should still be evaluated through the runtime.
+        #[arg(long)]
+        skip_runtime_gate: bool,
     },
 }
 
@@ -2083,6 +2624,8 @@ async fn main() -> anyhow::Result<()> {
             net_token,
             net_dtype,
             gpus,
+            route_include_quarantine,
+            lookup_mode,
         } => {
             // The language-model flags a decision file refuses (spec §4.2).
             let llm_given: Vec<&'static str> = [
@@ -2096,6 +2639,8 @@ async fn main() -> anyhow::Result<()> {
                 ("--peer-split", peer_split.is_some()),
                 ("--net-token", net_token.is_some()),
                 ("--gpus", gpus.is_some()),
+                ("--route-include-quarantine", route_include_quarantine),
+                ("--lookup-mode", lookup_mode.is_some()),
             ]
             .into_iter()
             .filter_map(|(name, given)| given.then_some(name))
@@ -2129,6 +2674,8 @@ async fn main() -> anyhow::Result<()> {
                 net_token.as_deref(),
                 &net_dtype,
                 gpus,
+                route_include_quarantine,
+                lookup_mode.as_deref(),
             )
             .await
         }
@@ -2327,6 +2874,7 @@ async fn main() -> anyhow::Result<()> {
             no_think,
             blend,
             route_dynamic,
+            route_include_quarantine,
             confidence,
             trace,
             trace_json,
@@ -2343,6 +2891,7 @@ async fn main() -> anyhow::Result<()> {
             peer_run_ahead,
             peer_prefill,
             gpus,
+            lookup_mode,
         } => {
             let o1 = O1Flags {
                 spec: o1,
@@ -2374,6 +2923,7 @@ async fn main() -> anyhow::Result<()> {
                 no_think,
                 blend.as_deref(),
                 route_dynamic,
+                route_include_quarantine,
                 confidence,
                 trace,
                 trace_json,
@@ -2387,6 +2937,7 @@ async fn main() -> anyhow::Result<()> {
                 peer_run_ahead,
                 peer_prefill,
                 gpus,
+                lookup_mode.as_deref(),
             )
             .await
         }
@@ -2458,6 +3009,214 @@ async fn main() -> anyhow::Result<()> {
             skill,
         } => cmd_freeze(&model, &prompt, &out, skill.as_deref()),
         Commands::Route { model, prompt } => cmd_route(&model, &prompt),
+        Commands::ProbeUtility {
+            models,
+            prompts,
+            prompts_jsonl,
+            max_tokens,
+            rep_penalty,
+            bos,
+            json,
+            route,
+            include_quarantine,
+            lookup_mode,
+        } => utility::cmd_probe_utility(utility::UtilityArgs {
+            models: &models,
+            prompts,
+            prompts_jsonl,
+            max_tokens: max_tokens.max(1),
+            rep_penalty,
+            bos,
+            json,
+            route,
+            include_quarantine,
+            lookup_mode,
+        }),
+        Commands::ProbeDialog {
+            model,
+            dialogs_jsonl,
+            route,
+            lookup_mode,
+            include_quarantine,
+            max_tokens,
+            json,
+        } => dialog::cmd_probe_dialog(dialog::DialogArgs {
+            model: &model,
+            dialogs_jsonl: &dialogs_jsonl,
+            route,
+            lookup_mode,
+            include_quarantine,
+            max_tokens,
+            json,
+        }),
+        Commands::ProbeChoice {
+            model,
+            prompts_jsonl,
+            candidates_jsonl,
+            norm,
+            scorer,
+            bos,
+            raw,
+            route,
+            include_quarantine,
+            json,
+        } => choice::cmd_probe_choice(choice::ChoiceArgs {
+            model: &model,
+            prompts_jsonl: &prompts_jsonl,
+            candidates_jsonl: candidates_jsonl.as_deref(),
+            norm: &norm,
+            scorer: &scorer,
+            bos,
+            raw,
+            route: route.as_deref(),
+            include_quarantine,
+            json,
+        }),
+        Commands::RouteEval {
+            model,
+            prompts_jsonl,
+            expect,
+            include_quarantine,
+            router_only,
+            json,
+        } => knowledge::cmd_route_eval(knowledge::RouteEvalArgs {
+            model: &model,
+            prompts_jsonl: &prompts_jsonl,
+            expect: &expect,
+            include_quarantine,
+            router_only,
+            json,
+        }),
+        Commands::DumpLogits {
+            model,
+            prompts_jsonl,
+            tokens,
+            route,
+            include_quarantine,
+            out,
+            path,
+            lookup_mode,
+        } => knowledge::cmd_dump_logits(knowledge::DumpArgs {
+            model: &model,
+            prompts_jsonl: &prompts_jsonl,
+            tokens,
+            route: route.as_deref(),
+            include_quarantine,
+            out: &out,
+            path: path.as_deref(),
+            lookup_mode: lookup_mode.as_deref(),
+        }),
+        Commands::LogitsCompare { a, b, only_indices } => {
+            knowledge::cmd_logits_compare(&a, &b, only_indices.as_deref())
+        }
+        Commands::SkillGate {
+            model,
+            id,
+            gate,
+            status,
+            allow_unmeasured,
+        } => knowledge::cmd_skill_gate(&model, &id, &gate, &status, allow_unmeasured),
+        Commands::GenomeVerify { f0, f1 } => knowledge::cmd_genome_verify(&f0, &f1),
+        Commands::LookupBuild {
+            base,
+            entries,
+            id,
+            out,
+            langs,
+            name,
+            on_duplicate,
+            drop_keys,
+            probe_prompts,
+            suspicious_share,
+            general_prompts,
+            general_stop_out,
+            policy,
+        } => lookup::cmd_lookup_build(lookup::LookupBuildArgs {
+            base: &base,
+            entries: &entries,
+            id: &id,
+            out: &out,
+            langs: langs.as_deref(),
+            name: name.as_deref(),
+            on_duplicate: &on_duplicate,
+            drop_keys: drop_keys.as_deref(),
+            probe_prompts: probe_prompts.as_deref(),
+            suspicious_share,
+            general_prompts: general_prompts.as_deref(),
+            general_stop_out: general_stop_out.as_deref(),
+            policy: policy.as_deref(),
+        }),
+        Commands::LookupPolicy {
+            model,
+            id,
+            policy,
+            keep_gate,
+        } => lookup::cmd_lookup_policy(&model, &id, &policy, keep_gate),
+        Commands::RouteFit {
+            model,
+            id,
+            skill_prompts,
+            general_prompts,
+            phi_layer,
+            rank,
+            max,
+            margin,
+            target_fpr,
+        } => lookup::cmd_route_fit(lookup::RouteFitArgs {
+            model: &model,
+            id: &id,
+            skill_prompts: &skill_prompts,
+            general_prompts: &general_prompts,
+            phi_layer,
+            rank,
+            max,
+            margin,
+            target_fpr,
+        }),
+        Commands::GrowthEval {
+            model,
+            prompts_jsonl,
+            max_tokens,
+            json,
+            indices_out,
+            shell,
+            growth,
+            path,
+        } => growth::cmd_growth_eval(growth::GrowthEvalArgs {
+            model: &model,
+            prompts_jsonl: &prompts_jsonl,
+            max_tokens,
+            json,
+            indices_out: indices_out.as_deref(),
+            shell: shell.as_deref(),
+            growth: growth.as_deref(),
+            path: path.as_deref(),
+        }),
+        Commands::ProbeRecall {
+            models,
+            pairs,
+            distances,
+            trials,
+            seed,
+            filler,
+            json,
+        } => {
+            let distances: Vec<usize> = distances
+                .split(',')
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.trim().parse::<usize>())
+                .collect::<Result<_, _>>()
+                .map_err(|e| anyhow::anyhow!("--distances: {e}"))?;
+            recall::cmd_probe_recall(recall::RecallArgs {
+                models: &models,
+                pairs,
+                distances,
+                trials,
+                seed,
+                filler,
+                json,
+            })
+        }
         Commands::Ppl {
             model,
             file,
@@ -2927,7 +3686,19 @@ async fn main() -> anyhow::Result<()> {
             &out,
             frames_dir.as_deref(),
         ),
-        Commands::Explain { model, prompt, top } => cmd_explain(&model, &prompt, top),
+        Commands::Explain {
+            model,
+            prompt,
+            top,
+            skill,
+            route_include_quarantine,
+        } => cmd_explain(
+            &model,
+            &prompt,
+            top,
+            skill.as_deref(),
+            route_include_quarantine,
+        ),
         Commands::Calibrate {
             model,
             file,
@@ -2996,6 +3767,7 @@ async fn main() -> anyhow::Result<()> {
                 rank,
                 quality,
                 quality_tokens,
+                decision_threshold,
                 min_delta,
                 skill_quant,
                 mean_bits,
@@ -3014,6 +3786,7 @@ async fn main() -> anyhow::Result<()> {
                 rank,
                 quality.as_deref(),
                 quality_tokens,
+                decision_threshold,
                 min_delta,
                 skill_quant.as_deref(),
                 mean_bits,
@@ -3049,11 +3822,25 @@ async fn main() -> anyhow::Result<()> {
                 chunk,
                 held,
                 calib_chunks,
+                batch,
+                fcd_batch,
                 focus_tokens,
                 target_sparsity,
                 l1_aggression,
+                l1_init,
+                l1_step,
+                tau,
+                mask_init,
+                softplus_l1,
+                checkpoint_accuracy,
+                checkpoint_min_accuracy,
+                checkpoint_min_balanced_accuracy,
+                checkpoint_raw_priority,
                 ffn_align,
                 uniform_inter,
+                archaeology_report,
+                analysis_only,
+                skip_runtime_gate,
             } => skill::run_skill_bake(
                 &model,
                 &files,
@@ -3068,11 +3855,25 @@ async fn main() -> anyhow::Result<()> {
                 chunk,
                 held,
                 calib_chunks,
+                batch,
+                fcd_batch,
                 focus_tokens.as_deref(),
                 target_sparsity,
                 l1_aggression,
+                l1_init,
+                l1_step,
+                tau,
+                mask_init,
+                softplus_l1,
+                checkpoint_accuracy,
+                checkpoint_min_accuracy,
+                checkpoint_min_balanced_accuracy,
+                checkpoint_raw_priority,
                 ffn_align,
                 uniform_inter,
+                archaeology_report.as_deref(),
+                analysis_only,
+                skip_runtime_gate,
             ),
         },
         Commands::Gpu => {
@@ -3108,6 +3909,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Commands::Verify { model } => cmd_verify(&model).await,
+        Commands::MigrateEmbryoBits { files, dry_run } => cmd_migrate_embryo_bits(&files, dry_run),
         Commands::Sign { model, key } => sign::cmd_sign(&model, &key),
         Commands::Fcd {
             model,
@@ -3181,6 +3983,8 @@ async fn cmd_serve(
     net_token: Option<&str>,
     net_dtype: &str,
     replicas: Option<usize>,
+    route_include_quarantine: bool,
+    lookup_mode: Option<&str>,
 ) -> anyhow::Result<()> {
     println!();
     println!("  ╔═══════════════════════════════════════╗");
@@ -3200,6 +4004,8 @@ async fn cmd_serve(
         drop(model);
         return decision::serve(model_path, host, port, decision_flags).await;
     }
+    let lookup_mode =
+        cortiq_engine::lookup::LookupMode::resolve(lookup_mode).map_err(anyhow::Error::msg)?;
     let default_task = default_task.unwrap_or("general");
     let arch = model.arch();
     println!(
@@ -3244,7 +4050,9 @@ async fn cmd_serve(
         // honest answer is the layer split, not a refusal and not N
         // copies that thrash: say which mode you are in and why.
         let budget = cortiq_engine::gpu::vram_budget();
-        let weights = model.primary_bytes().len() as u64;
+        // A genome file budgets its trunk only (skill tensors replace trunk
+        // tensors inside their lane — NF-7); other files the whole mapping.
+        let weights = cortiq_engine::gpu::placement_weight_bytes(&model);
         if budget != u64::MAX && weights > budget {
             slots = 1;
             devices.clear();
@@ -3298,7 +4106,7 @@ async fn cmd_serve(
             cortiq_engine::gpu::set_current_device(*d);
         }
         let mut pipeline = Pipeline::from_model(&model, SamplerConfig::default())?;
-        o1.apply(&mut pipeline);
+        o1.apply(&mut pipeline)?;
         if let Some(devs) = &split_devices {
             pipeline
                 .set_gpu_plan(Some(devs))
@@ -3354,6 +4162,65 @@ async fn cmd_serve(
         remote = Some(std::sync::Arc::new(std::sync::Mutex::new(rs)));
     }
 
+    // Router policy v2: every request is decided on its last user message
+    // (backbone-gated); the slots above are the backbone lane, each routed
+    // skill gets its own lane on first use. φ runs on a separate backbone
+    // pipeline so no slot's conversation state is reset by routing.
+    let routing = if !cortiq_engine::router::is_router_v2(&model) {
+        None
+    } else if remote.is_some() {
+        println!(
+            "    Router v2: OFF under --peer (the worker holds the backbone span) — every \
+             request runs the backbone"
+        );
+        None
+    } else {
+        let probe = Pipeline::from_model(&model, SamplerConfig::default())?;
+        // The router was fitted with φ on one backend; φ here runs on
+        // this process's — a different numerical class shifts E and the
+        // measured gate does not transfer.
+        knowledge::warn_phi_backend(&model, "serve");
+        let lane_model = model.clone();
+        let lane_o1 = o1.clone();
+        let lane_split = split_devices.clone();
+        let factory: cortiq_server::route::LaneFactory = Box::new(move |id: &str| {
+            let mut p =
+                Pipeline::from_model_with_skill(&lane_model, SamplerConfig::default(), Some(id))
+                    .map_err(|e| e.to_string())?;
+            lane_o1.apply(&mut p).map_err(|e| e.to_string())?;
+            if let Some(devs) = &lane_split {
+                p.set_gpu_plan(Some(devs))?;
+            }
+            Ok(p)
+        });
+        let r = cortiq_server::SkillRouter::new(
+            model.clone(),
+            probe,
+            factory,
+            route_include_quarantine,
+        )
+        .with_lookup_mode(lookup_mode);
+        println!(
+            "    Router v2: backbone_gated per request · routable skills {:?}{} · a skill lane \
+             loads on its first request",
+            r.routable_skills(),
+            if route_include_quarantine {
+                " (quarantine included — debug)"
+            } else {
+                ""
+            }
+        );
+        if r.has_lookups() {
+            println!(
+                "    Lookup records: {:?} · mode {} (the table answers / the backbone runs with \
+                 the card / ignored; --lookup-mode, CMF_LOOKUP_MODE)",
+                r.lookup_ids(),
+                lookup_mode.label()
+            );
+        }
+        Some(Arc::new(r))
+    };
+
     // Create runtime
     let runtime = CortiqRuntime::new(model.clone());
     if runtime.masks().get(default_task).is_some() {
@@ -3369,6 +4236,7 @@ async fn cmd_serve(
             cortiq_server::PipelinePool::with_devices(pipelines, devices)
         },
         remote,
+        routing,
     });
 
     // Build router
@@ -3671,6 +4539,13 @@ fn cmd_ppl(
         }
         None => Pipeline::from_model_with_skill(&model, SamplerConfig::default(), skill)?,
     };
+    // A natively bounded file scores through its own operator; the
+    // post-hoc O(1) kernel does not apply to it.
+    if o1.cfg()?.is_some() {
+        if let Some(why) = pipeline.o1_refusal() {
+            anyhow::bail!("{why}");
+        }
+    }
     // Windowed scoring keeps the RAW token stream: the val_ppl yardstick
     // slices windows out of the middle of the corpus, where a prepended
     // BOS would be a token the reference never scored.
@@ -3823,12 +4698,26 @@ fn ppl_windows(
             report_o1_ppl(nll_o1, nll_ex, cnt, prefill, wlen);
         }
         None => println!(
-            "PPL = {:.3} (exact attention)",
-            (nll_ex / cnt.max(1) as f64).exp()
+            "PPL = {:.3} ({})",
+            (nll_ex / cnt.max(1) as f64).exp(),
+            ppl_operator_label(pipeline)
         ),
     }
     dump_moe_stats(pipeline)?;
     Ok(())
+}
+
+/// What the exact-scoring line ran through: the file's natively bounded
+/// anchor when it has one (there is no growing KV to be "exact" over),
+/// else the full-KV attention.
+fn ppl_operator_label(pipeline: &Pipeline) -> String {
+    match pipeline.anchor_core.as_ref() {
+        Some(ac) => format!(
+            "bounded operator {} W={} S={}",
+            ac.kind, ac.window, ac.sink
+        ),
+        None => "exact attention".to_string(),
+    }
 }
 
 /// B-field of claim 12: expert-routing mass of this run →
@@ -3921,6 +4810,17 @@ fn dump_moe_stats(pipeline: &Pipeline) -> anyhow::Result<()> {
 fn cmd_route(model_path: &str, prompt: &str) -> anyhow::Result<()> {
     let model = Arc::new(CmfModel::open_sharded(model_path)?);
     let mut pipeline = Pipeline::from_model(&model, SamplerConfig::default())?;
+    if cortiq_engine::router::is_router_v2(&model) {
+        let d = cortiq_engine::router::route_request(&model, &mut pipeline, prompt);
+        for s in &d.routing.scores {
+            println!(
+                "  {:<20} E = {:.4}  err = {:.3e}  p = {:.3}",
+                s.id, s.error, s.raw_error, s.probability
+            );
+        }
+        println!("{}", d.describe());
+        return Ok(());
+    }
     let ids = pipeline.tokenizer.encode(prompt);
     let tau = std::env::var("CMF_OOD_TAU")
         .ok()
@@ -3968,7 +4868,15 @@ fn cmd_route(model_path: &str, prompt: &str) -> anyhow::Result<()> {
 /// selection (with E) and the first-token distribution the routed model
 /// would emit, plus its softmax confidence. Everything shown is a
 /// quantity already computed by the runtime — no synthesis.
-fn cmd_explain(model_path: &str, prompt: &str, top: usize) -> anyhow::Result<()> {
+fn cmd_explain(
+    model_path: &str,
+    prompt: &str,
+    top: usize,
+    pin: Option<&str>,
+    include_quarantine: bool,
+) -> anyhow::Result<()> {
+    use cortiq_core::knowledge::BACKBONE_CLASS_ID as BACKBONE;
+    use cortiq_engine::router::{RouteDecision, RouteTarget};
     let model = Arc::new(CmfModel::open_sharded(model_path)?);
     let mut probe = Pipeline::from_model(&model, SamplerConfig::default())?;
     let ids = probe.tokenizer.encode(prompt);
@@ -3978,42 +4886,102 @@ fn cmd_explain(model_path: &str, prompt: &str, top: usize) -> anyhow::Result<()>
     println!("\n\x1b[1m🔍 explain: {model_path}\x1b[0m");
     println!("Prompt: {prompt:?}  ({} tokens)", ids.len());
 
-    // ── Routing: which skill recon-argmin would pick ──
-    let routes = cortiq_engine::router::route(&model, &mut probe, &ids);
-    let winner: Option<String> = if routes.is_empty() {
-        println!("\nSwarm: none (flat model) — no routing needed, the backbone answers.");
-        None
+    // ── Routing: the per-request decision (router v2: backbone-gated;
+    //    legacy: recon-argmin, a novel input runs the backbone) ──
+    let v2 = cortiq_engine::router::is_router_v2(&model);
+    let decision = match pin {
+        Some("none") | Some("backbone") => {
+            RouteDecision::forced(RouteTarget::Backbone, "pinned: --skill none")
+        }
+        Some(id) => {
+            if !model.header.skills.iter().any(|s| s.id == id) {
+                anyhow::bail!("--skill {id}: no such skill in {model_path}");
+            }
+            RouteDecision::forced(
+                RouteTarget::Skill(id.to_string()),
+                format!("pinned: --skill {id}"),
+            )
+        }
+        None => cortiq_engine::router::route_request_with(
+            &model,
+            &mut probe,
+            prompt,
+            cortiq_engine::router::RouteOptions { include_quarantine },
+        ),
+    };
+    // explain shows the first token of the RAW prompt; a cmf-im-v1 skill
+    // is shown on the rendered turn it would really run on (PHI-1).
+    let (decision, render_contract) = cortiq_engine::router::enforce_prompt_contract(
+        &model.header,
+        decision,
+        cortiq_engine::router::PromptFrame::Raw,
+        true,
+    );
+    let ids = if render_contract {
+        probe
+            .tokenizer
+            .encode(&cortiq_engine::router::render_cmf_im_v1(prompt))
     } else {
-        println!(
-            "\n\x1b[1mRouting (recon-argmin, E=‖r−BBᵀr‖²/‖φ‖², lower = more coherent):\x1b[0m"
-        );
+        ids
+    };
+    if v2 || pin.is_some() || !decision.routing.scores.is_empty() {
+        eprintln!("{}", decision.describe());
+    }
+    let routes = &decision.routing.scores;
+    if routes.is_empty() {
+        if pin.is_some() || v2 {
+            println!(
+                "\nRouting: {} — {}",
+                decision.target_label(),
+                decision.reason
+            );
+        } else {
+            println!("\nSwarm: none (flat model) — no routing needed, the backbone answers.");
+        }
+    } else {
+        if v2 {
+            println!(
+                "\n\x1b[1mRouting (router v2, backbone-gated; E = unit recon error of φ over the \
+                 user text, lower = closer):\x1b[0m"
+            );
+        } else {
+            println!(
+                "\n\x1b[1mRouting (recon-argmin, E=‖r−BBᵀr‖²/‖φ‖², lower = more coherent):\x1b[0m"
+            );
+        }
         let emax = routes
             .iter()
             .map(|r| r.error)
             .fold(0.0f32, f32::max)
             .max(1e-6);
-        for (i, r) in routes.iter().enumerate() {
+        let chosen = decision.skill().unwrap_or(BACKBONE);
+        for r in routes.iter() {
             // Bar: shorter = lower E = more coherent (inverse scale).
             let fill = ((1.0 - r.error / emax) * 20.0).round() as usize;
             let bar = "█".repeat(fill);
-            let mark = if i == 0 {
+            let mark = if r.id == chosen {
                 "  \x1b[1m← chosen\x1b[0m"
             } else {
                 ""
             };
             println!("  {:<12} E = {:.4}  {}{}", r.id, r.error, bar, mark);
         }
-        Some(routes[0].id.clone())
-    };
+        println!(
+            "Decision: {} — {}",
+            decision.target_label(),
+            decision.reason
+        );
+    }
+    let winner: Option<String> = decision.skill().map(str::to_string);
 
     // ── First token: distribution and confidence (softmax probability) ──
     // Apply the chosen skill to show EXACTLY the routed answer.
     let mut pipeline = match &winner {
         Some(id) => Pipeline::from_model_with_skill(&model, SamplerConfig::default(), Some(id))?,
-        // Flat files do not need a second Pipeline: `probe` already holds
-        // the same backbone and tokenizer, and keeping two GPU-backed
-        // pipelines alive made wgpu teardown/resource reuse racy in this
-        // introspection-only command.
+        // The backbone: the probe pipeline itself (plain, no overlay). No
+        // second Pipeline: `probe` already holds the same backbone and
+        // tokenizer, and keeping two GPU-backed pipelines alive made wgpu
+        // teardown/resource reuse racy in this introspection-only command.
         None => probe,
     };
     let logits = pipeline.prefill_next_logits(&ids, None);
@@ -4323,6 +5291,29 @@ fn chat_mode(has_template: bool, raw: bool, resuming: bool) -> bool {
     has_template && !raw && !resuming
 }
 
+/// The frame `run` generates a prompt in ([`chat_mode`] decides): the
+/// file's chat template — cmf-im-v1 when it spells the `<|im_start|>` /
+/// `<|im_end|>` frame, another template otherwise — or a raw completion.
+fn run_prompt_frame(
+    model: &CmfModel,
+    raw: bool,
+    resuming: bool,
+) -> cortiq_engine::router::PromptFrame {
+    use cortiq_engine::router::PromptFrame;
+    let tpl = model
+        .header
+        .tokenizer_config
+        .as_ref()
+        .and_then(|t| t.chat_template.as_deref());
+    if !chat_mode(tpl.is_some(), raw, resuming) {
+        return PromptFrame::Raw;
+    }
+    match tpl {
+        Some(t) if t.contains("<|im_start|>") && t.contains("<|im_end|>") => PromptFrame::CmfImV1,
+        _ => PromptFrame::Other,
+    }
+}
+
 /// Build the exact V4.1 harmony prompt and image records for the CLI. The
 /// `run --prompt ... --image ...` path uses the same tagged text and image
 /// block normalization as the OpenAI endpoint.
@@ -4459,6 +5450,7 @@ async fn cmd_run(
     no_think: bool,
     blend: Option<&str>,
     route_dynamic: bool,
+    route_include_quarantine: bool,
     confidence: bool,
     trace: bool,
     trace_json: bool,
@@ -4472,7 +5464,10 @@ async fn cmd_run(
     peer_run_ahead: u32,
     peer_prefill: bool,
     gpus: Option<usize>,
+    lookup_mode: Option<&str>,
 ) -> anyhow::Result<()> {
+    use cortiq_engine::lookup::{LookupMode, LookupOutcome, LookupTable, LookupTables};
+    let lookup_mode = LookupMode::resolve(lookup_mode).map_err(anyhow::Error::msg)?;
     println!("Loading model: {}", model_path);
     let model = Arc::new(CmfModel::open_sharded(model_path)?);
     let mut skill = skill.map(str::to_string);
@@ -4512,19 +5507,163 @@ async fn cmd_run(
     // specialist with no flag at all. `--skill <id>` pins one,
     // `--skill none` forces the backbone, `--blend`/`--route-dynamic`
     // take their own paths.
-    let routable = model.header.skills.iter().any(|s| s.selection.is_some());
+    //
+    // A file with router policy v2 (ROUTER_V2) routes per REQUEST with
+    // the backbone-gated decision: the backbone is the default, a skill
+    // runs only when the calibrated decision says so, and the decision
+    // goes to stderr. The backbone runs the plain pipeline (no overlay).
+    let v2 = cortiq_engine::router::is_router_v2(&model);
+    let mut route_dynamic = route_dynamic;
+    if route_dynamic && v2 {
+        eprintln!(
+            "route-dynamic: {model_path} declares router policy v2 (granularity \"request\") — \
+             per-token switching is off; the request-level decision applies"
+        );
+        route_dynamic = false;
+    }
+    let routable = v2 || model.header.skills.iter().any(|s| s.selection.is_some());
     if skill.is_none() && blend.is_none() && !route_dynamic && routable && prompt.is_some() {
         skill = Some("auto".to_string());
     }
+    if v2 && skill.is_none() && blend.is_none() && prompt.is_none() {
+        eprintln!(
+            "route: backbone | interactive session on a router-v2 file (pass --skill <id> to pin \
+             a skill)"
+        );
+    }
     if matches!(skill.as_deref(), Some("none") | Some("backbone")) {
+        if v2 {
+            eprintln!("route: backbone | pinned: --skill none");
+        }
         skill = None;
     }
+    // The frame `run` generates with (the file's template, or a raw
+    // completion) against the chosen skill's prompt_contract — one engine
+    // check for run/explain/serve (PHI-1). A cmf-im-v1 skill on a raw
+    // prompt runs on the rendered turn (the frame it was trained and gated
+    // under); with a raw frozen `--state` prefix it cannot, and the
+    // backbone runs.
+    let frame = run_prompt_frame(&model, raw, state.is_some());
+    let can_render = state.is_none();
+    let mut render_contract = false;
+    let mut decision: Option<cortiq_engine::router::RouteDecision> = None;
+    // A pinned lookup record in an interactive session: the table is
+    // consulted per turn (see the loop below); the backbone pipeline runs.
+    let mut lookup_pinned: Option<LookupTable> = None;
+    // The router's own decision (not a pinned skill): a `key_first` lookup
+    // record may take it on a strong key of the prompt.
+    let mut key_first_gate: Option<cortiq_engine::lookup::KeyFirstGate> = None;
     if skill.as_deref() == Some("auto") {
         let mut probe = Pipeline::from_model(&model, SamplerConfig::default())?;
-        let ids = probe.tokenizer.encode(prompt.unwrap_or(""));
-        let routes = cortiq_engine::router::route(&model, &mut probe, &ids);
-        skill = routes.first().map(|r| r.id.clone());
-        println!("routed to skill: {}", skill.as_deref().unwrap_or("<none>"));
+        let route_opts = cortiq_engine::router::RouteOptions {
+            include_quarantine: route_include_quarantine,
+        };
+        key_first_gate = Some(
+            cortiq_engine::lookup::KeyFirstGate::new(route_opts, frame).can_render(can_render),
+        );
+        let d = cortiq_engine::router::route_request_with(
+            &model,
+            &mut probe,
+            prompt.unwrap_or(""),
+            route_opts,
+        );
+        let (d, render) =
+            cortiq_engine::router::enforce_prompt_contract(&model.header, d, frame, can_render);
+        render_contract = render;
+        skill = d.skill().map(str::to_string);
+        if !v2 {
+            match skill.as_deref() {
+                Some(id) => println!("routed to skill: {id}"),
+                None => println!("routed to skill: <none> — {}", d.reason),
+            }
+        }
+        decision = Some(d);
+    } else if let Some(id) = skill.clone() {
+        if v2 && !model.header.skills.iter().any(|s| s.id == id) {
+            anyhow::bail!("--skill {id}: no such skill in {model_path}");
+        }
+        // A pinned skill obeys its prompt contract too.
+        let pinned = cortiq_engine::router::RouteDecision::forced(
+            cortiq_engine::router::RouteTarget::Skill(id.clone()),
+            format!("pinned: --skill {id}"),
+        );
+        let (d, render) = cortiq_engine::router::enforce_prompt_contract(
+            &model.header,
+            pinned,
+            frame,
+            can_render,
+        );
+        if d.skill().is_none() {
+            anyhow::bail!("--skill {id}: {}", d.reason);
+        }
+        render_contract = render;
+        if prompt.is_none() && LookupTable::is_lookup(&model, &id) {
+            if v2 {
+                eprintln!("{}", d.describe());
+            }
+            eprintln!(
+                "lookup: {id} | pinned in an interactive session — every turn is looked up \
+                 (mode {}); the backbone pipeline runs",
+                lookup_mode.label()
+            );
+            lookup_pinned = Some(LookupTable::open(&model, &id).map_err(anyhow::Error::msg)?);
+            skill = None;
+            render_contract = false;
+        } else {
+            decision = Some(d);
+        }
+    }
+    // The lookup step (spec §9.5.2): a decision for a `lookup` record has
+    // no lane. `answer` — the table's text is the answer and nothing is
+    // generated; `context` — the backbone generates with the card
+    // prepended; `off` or no key in the prompt — the backbone runs the
+    // plain prompt, unchanged.
+    let mut lookup_context: Option<String> = None;
+    if let Some(d) = decision.take() {
+        let tables = LookupTables::new(model.clone());
+        let (d, outcome) = cortiq_engine::lookup::resolve_lookup_gated(
+            &tables,
+            d,
+            key_first_gate,
+            &[prompt.unwrap_or("")],
+            lookup_mode,
+        )
+        .map_err(anyhow::Error::msg)?;
+        if v2 {
+            eprintln!("{}", d.describe());
+        }
+        if let Some(line) = outcome.describe() {
+            eprintln!("{line}");
+        }
+        match outcome {
+            LookupOutcome::NotLookup => {}
+            LookupOutcome::Off { .. } | LookupOutcome::Miss { .. } => {
+                skill = None;
+                render_contract = false;
+            }
+            LookupOutcome::Answer(a) => {
+                if let Some(p) = prompt {
+                    println!("\nPrompt: {p}\n");
+                }
+                println!("{}", a.text);
+                println!(
+                    "\n[lookup '{}': key {:?} → entry {}, {}, field {}, decided by {}; answered \
+                     from the table, nothing generated]",
+                    a.id,
+                    a.key.key,
+                    a.key.entry,
+                    a.lang,
+                    a.field.as_deref().unwrap_or("— (whole card)"),
+                    a.decided_by.label()
+                );
+                return Ok(());
+            }
+            LookupOutcome::Context(a) => {
+                lookup_context = Some(a.card);
+                skill = None;
+                render_contract = false;
+            }
+        }
     }
     let mut sampler = SamplerConfig::default();
     if greedy {
@@ -4568,7 +5707,7 @@ async fn cmd_run(
         }
         None => Pipeline::from_model_with_skill(&model, sampler, skill.as_deref())?,
     };
-    o1.apply(&mut pipeline);
+    o1.apply(&mut pipeline)?;
     // CMF_IGNORE_EOS=1: decode the full --max-tokens (backend parity runs
     // compare a fixed number of steps; `bench --ignore-eos` is the twin).
     if std::env::var("CMF_IGNORE_EOS").as_deref() == Ok("1") {
@@ -4962,7 +6101,14 @@ async fn cmd_run(
         // An empty prompt stays empty: generate_from_ids answers it with
         // "empty prompt: nothing to generate from" as it does today. The
         // template would otherwise render its boilerplate and generate.
-        if use_template && !text.is_empty() {
+        if render_contract && !text.is_empty() {
+            // The routed skill's contract (cmf-im-v1) on a raw prompt: the
+            // skill continues the frame it was trained and gated under —
+            // exactly the rendering dump-logits / probe-utility measure.
+            pipeline
+                .tokenizer
+                .encode(&cortiq_engine::router::render_cmf_im_v1(text))
+        } else if use_template && !text.is_empty() {
             pipeline
                 .tokenizer
                 .apply_chat_template_opts(history, thinking)
@@ -4991,6 +6137,16 @@ async fn cmd_run(
 
     if let Some(p) = prompt {
         println!("\nPrompt: {p}\n");
+        // `context` lookup mode: the backbone generates from the message
+        // with the reference card prepended.
+        let p_text = match &lookup_context {
+            Some(card) => {
+                eprintln!("lookup: the reference card is prepended to the prompt (mode context)");
+                cortiq_engine::lookup::context_prompt(card, p)
+            }
+            None => p.to_string(),
+        };
+        let p = p_text.as_str();
         let history = vec![("user".to_string(), p.to_string())];
         let vl_inputs = is_dsv41
             .then(|| {
@@ -5062,6 +6218,28 @@ async fn cmd_run(
             if text.is_empty() {
                 continue;
             }
+            // A pinned lookup record: the turn is looked up first. `answer`
+            // — the table's text is the reply, nothing is generated;
+            // `context` — the backbone gets the card prepended; no key —
+            // the plain turn runs.
+            let mut turn_text = text.to_string();
+            if let Some(t) = &lookup_pinned {
+                match t.answer(text).map_err(anyhow::Error::msg)? {
+                    Some(a) if lookup_mode == LookupMode::Answer => {
+                        eprintln!("{}", a.describe());
+                        println!("{}\n", a.text);
+                        history.push(("user".to_string(), text.to_string()));
+                        history.push(("assistant".to_string(), a.text));
+                        continue;
+                    }
+                    Some(a) if lookup_mode == LookupMode::Context => {
+                        eprintln!("{}", a.describe());
+                        turn_text = cortiq_engine::lookup::context_prompt(&a.card, text);
+                    }
+                    _ => {}
+                }
+            }
+            let text = turn_text.as_str();
             history.push(("user".to_string(), text.to_string()));
             let mut vl_inputs = is_dsv41
                 .then(|| build_dsv41_inputs(&pipeline, &history))
@@ -5327,6 +6505,7 @@ fn cmd_patch_tensor(
     // (directory index, dtype, payload)
     let mut patches: Vec<(usize, TensorDtype, Vec<u8>)> = Vec::new();
     let model = CmfModel::open_sharded(model_path)?;
+    knowledge::refuse_genome_rewrite(&model, "patch-tensor")?;
     for spec in sets {
         let (name, path) = spec
             .split_once('=')
@@ -5444,7 +6623,8 @@ async fn cmd_info(model_path: &str, tensors: Option<&str>) -> anyhow::Result<()>
     let full = count(cortiq_core::LayerType::FullAttention);
     let sliding = count(cortiq_core::LayerType::SlidingAttention);
     let conv = count(cortiq_core::LayerType::ShortConv);
-    let linear = arch.num_layers - full - sliding - conv;
+    let bounded = count(cortiq_core::LayerType::BoundedAttention);
+    let linear = arch.num_layers - full - sliding - conv - bounded;
     println!("Model: {}", model_path);
     println!("  Format:      CMF v{}", model.header.version);
     println!("  Arch:        {}", arch.arch_name);
@@ -5454,6 +6634,9 @@ async fn cmd_info(model_path: &str, tensors: Option<&str>) -> anyhow::Result<()>
     }
     if conv > 0 {
         mix.push_str(&format!(" / {conv} conv"));
+    }
+    if bounded > 0 {
+        mix.push_str(&format!(" / {bounded} bounded"));
     }
     if linear > 0 {
         mix.push_str(&format!(" / {linear} linear"));
@@ -5508,6 +6691,47 @@ async fn cmd_info(model_path: &str, tensors: Option<&str>) -> anyhow::Result<()>
         }
     );
     println!("  Sparse idx:  {} entries", model.sparse_index.len());
+    // The bounded anchor is an operator record, not a hint: print it as
+    // the file states it, and the per-sequence state it fixes.
+    if let Some(ac) = &arch.anchor_core {
+        println!(
+            "  Anchor:      {} window={} sink={} rope={} sink_scores={} train_windows={:?} far={}",
+            ac.kind,
+            ac.window,
+            ac.sink,
+            ac.rope,
+            ac.sink_scores,
+            ac.train_windows,
+            ac.far
+                .as_ref()
+                .map(|f| format!("{{m={}, rect={}}}", f.m, f.rect))
+                .unwrap_or_else(|| "null".into())
+        );
+        println!(
+            "               ring per layer: {} B ({} kv_heads x {} x {} f32, K+V)",
+            ac.ring_state_elems(arch.num_kv_heads, arch.head_dim) * 4,
+            arch.num_kv_heads,
+            ac.window,
+            arch.head_dim
+        );
+    }
+    match cortiq_engine::loader::per_sequence_state_bytes(&model) {
+        Ok(st) => {
+            let fixed = st.bounded_bytes + st.recurrent_bytes;
+            if st.growing_layers == 0 {
+                println!(
+                    "  State/seq:   {fixed} B fixed ({} B bounded rings + {} B recurrent) — O(1) in context",
+                    st.bounded_bytes, st.recurrent_bytes
+                );
+            } else {
+                println!(
+                    "  State/seq:   {fixed} B fixed ({} B bounded rings + {} B recurrent) + {} layer(s) of per-position KV",
+                    st.bounded_bytes, st.recurrent_bytes, st.growing_layers
+                );
+            }
+        }
+        Err(e) => println!("  State/seq:   ? ({e})"),
+    }
 
     Ok(())
 }
@@ -6148,6 +7372,15 @@ fn cmd_diff(a_path: &str, b_path: &str) -> anyhow::Result<()> {
         ba.vocab_size.to_string(),
     );
     row(
+        "linear_core",
+        aa.linear_core_identity()
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "none".into()),
+        ba.linear_core_identity()
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "none".into()),
+    );
+    row(
         "quant",
         format!("{:?}", a.header.quant_type),
         format!("{:?}", b.header.quant_type),
@@ -6281,6 +7514,46 @@ fn cmd_diff(a_path: &str, b_path: &str) -> anyhow::Result<()> {
         println!(".");
     }
     println!("{sect}");
+    Ok(())
+}
+
+/// `cortiq migrate-embryo-bits`: move the pre-0.8.1 Embryo bits 7/8 to
+/// 12/13 in place (see `CmfModel::migrate_legacy_embryo_bits`), then prove
+/// the result opens. Every file is reported; the command fails if any file
+/// failed.
+fn cmd_migrate_embryo_bits(files: &[String], dry_run: bool) -> anyhow::Result<()> {
+    use cortiq_core::format::LegacyBitsMigration;
+    let mut failed = 0usize;
+    for path in files {
+        match cortiq_core::CmfModel::migrate_legacy_embryo_bits(path, dry_run) {
+            Ok(LegacyBitsMigration::NotCmf) => {
+                println!("{path}: not a CMF file — skipped");
+            }
+            Ok(LegacyBitsMigration::NothingToDo { required_features }) => {
+                println!("{path}: no pre-0.8.1 Embryo bits (required_features {required_features:#x}) — unchanged");
+            }
+            Ok(LegacyBitsMigration::Migrated { from, to }) if dry_run => {
+                println!("{path}: would move required_features {from:#x} -> {to:#x}");
+            }
+            Ok(LegacyBitsMigration::Migrated { from, to }) => {
+                println!("{path}: required_features {from:#x} -> {to:#x}");
+                if let Err(e) = cortiq_core::CmfModel::open(path) {
+                    failed += 1;
+                    eprintln!(
+                        "{path}: bits moved, but the file still does not open under this reader: {e}"
+                    );
+                }
+                if std::path::Path::new(&format!("{path}.sig")).exists() {
+                    println!("{path}: its detached .sig signed the old bytes — re-sign with `cortiq sign`");
+                }
+            }
+            Err(e) => {
+                failed += 1;
+                eprintln!("{path}: {e}");
+            }
+        }
+    }
+    anyhow::ensure!(failed == 0, "{failed} of {} file(s) failed", files.len());
     Ok(())
 }
 
@@ -6534,7 +7807,7 @@ async fn cmd_bench(
             println!("  Core timing: sampler/confidence excluded (llama-bench contract)");
         }
     }
-    o1.apply(&mut pipeline);
+    o1.apply(&mut pipeline)?;
     if let Some(n) = gpus {
         let have = cortiq_engine::gpu::device_count();
         if n < 2 {
@@ -6785,8 +8058,11 @@ async fn cmd_bench(
 
     // Pair-fusion micro-bench: the memory-traffic win MTP verify rides
     // on. Skipped under o1 — forward_pair appends into the (sealed,
-    // emptied) cache, so its numbers would be meaningless there.
-    let (singles_ms, pair_ms) = if pipeline.o1_active() {
+    // emptied) cache, so its numbers would be meaningless there — and on
+    // a bounded-native file, whose sequence the resident graph may own:
+    // the CPU pair walk would reset the device sequence and measure a
+    // path the file never decodes on.
+    let (singles_ms, pair_ms) = if pipeline.o1_active() || pipeline.bounded_native() {
         (0.0, 0.0)
     } else {
         pipeline.measure_pair_fusion(8)
@@ -6949,6 +8225,11 @@ async fn cmd_bench(
         .iter()
         .map(|l| l.o1_memory_bytes())
         .sum();
+    // Bounded-anchor rings (host) and what the resident device graph
+    // actually allocated for this sequence: both are the O(1) claim as
+    // numbers, read from live state, never derived from geometry.
+    let bounded_mem = pipeline.kv_cache.bounded_state_bytes();
+    let device_state = pipeline.device_state_bytes();
     if json {
         // llama-bench-compatible spirit: one flat JSON object, raw
         // numbers only — joinable without parsing human text.
@@ -7004,6 +8285,16 @@ async fn cmd_bench(
             "mtp_accepted": result.mtp_accepted,
             "finish_reason": result.finish_reason,
         });
+        // Bounded-anchor / resident-device telemetry (kept outside the
+        // macro: `json!` hits its recursion limit past ~40 keys).
+        let mut obj = obj;
+        obj["bounded_state_bytes"] = serde_json::json!(bounded_mem);
+        obj["bounded_native"] = serde_json::json!(pipeline.bounded_native());
+        obj["device_state_bytes"] = serde_json::json!(device_state.map(|(s, _)| s));
+        obj["device_kv_bytes"] = serde_json::json!(device_state.map(|(_, k)| k));
+        // Positions the bounded reuse record holds (the host cache's
+        // seq_len stays 0 when the resident graph owns the sequence).
+        obj["consumed_prefix_len"] = serde_json::json!(pipeline.kv_prefix.len());
         println!("{}", serde_json::to_string_pretty(&obj)?);
         cortiq_engine::prism::perf_report();
         cortiq_engine::linear_core::perf_report();
@@ -7051,7 +8342,21 @@ async fn cmd_bench(
             singles_ms / pair_ms.max(1e-9)
         );
     }
-    if nystrom_mem > 0 {
+    if let Some((st, kv)) = device_state {
+        println!(
+            "  Device:  resident state {} B + KV/ring {} B (constant in context)",
+            st, kv
+        );
+    }
+    if bounded_mem > 0 {
+        println!(
+            "  Memory:  KV+state {:.1} MB (bounded rings {} B + recurrent {} B, no per-position KV) at seq_len {}",
+            total_mem as f64 / 1e6,
+            bounded_mem,
+            pipeline.kv_cache.recurrent_state_bytes(),
+            pipeline.kv_cache.seq_len()
+        );
+    } else if nystrom_mem > 0 {
         println!(
             "  Memory:  KV+state {:.1} MB (exact KV {:.1} MB + nystrom state {:.1} MB) at seq_len {}",
             total_mem as f64 / 1e6,

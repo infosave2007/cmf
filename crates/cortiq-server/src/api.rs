@@ -22,7 +22,26 @@ pub fn routes() -> Router<Arc<AppState>> {
 
 async fn get_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let status = state.runtime.status().await;
+    let slot_memory = state.slots.slot_memory_bytes().await;
+    #[cfg(target_os = "macos")]
+    let metal_submits =
+        cortiq_engine::gpu_metal::METAL_SUBMITS.load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(target_os = "macos"))]
+    let metal_submits = 0u64;
     let mut value = serde_json::to_value(status).unwrap_or_default();
+    value["serve_slots"] = serde_json::json!(slot_memory.len());
+    value["slot_attention_kv_bytes"] =
+        serde_json::json!(slot_memory.iter().map(|(kv, _)| *kv).collect::<Vec<_>>());
+    value["slot_recurrent_state_bytes"] = serde_json::json!(
+        slot_memory
+            .iter()
+            .map(|(_, recurrent)| *recurrent)
+            .collect::<Vec<_>>()
+    );
+    value["metal_submits"] = serde_json::json!(metal_submits);
+    value["weight_bytes_dispatched"] =
+        serde_json::json!(cortiq_engine::gpu::weight_bytes_dispatched());
+    value["weight_bytes_by_stage"] = serde_json::json!(cortiq_engine::gpu::weight_bytes_by());
     if let Some(source) = state.runtime.model().arch().deepseek_v41.as_ref() {
         let vision = cortiq_engine::dsv41_vision::VisionConfig::from_source(source).ok();
         value["capabilities"] = serde_json::json!({

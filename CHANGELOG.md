@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-09-28
+
+### Breaking (CMF format)
+- `required_features` renumbering for the Embryo bits: `BOUNDED_STATE` is now
+  bit 12 and `GENOME` bit 13. Unreleased embryo-o1 builds wrote them on bits 7/8,
+  which every released reader (0.6.9+) uses for `PRISM_HADAMARD`/`PRISM_AFFINE`;
+  the released bits keep their meaning. A 0.8.1 reader refuses such a file as a
+  Prism bit/metadata mismatch, and the message names the renumbering.
+  `cortiq migrate-embryo-bits <file…>` (`--dry-run` to preview) moves the two
+  bits in place: only envelope bytes 12..16 change, so appended records,
+  segments and the lineage survive (a re-export drops them). Re-sign a file with
+  a detached `.sig` afterwards. Bit 14 and above stay unassigned.
+- New derived bits `SKILLS_V2` (9) and `ROUTER_V2` (10): a 0.8.0 reader refuses
+  files that carry v2 skill records or a v2 routing policy. Files without them
+  read as before. `open()` now also validates `linear_core.kind` and
+  `phase_delta_layers`. See `docs/CMF_V2_SPEC.ru.md` §1.1 (EN/ZH specs updated).
+
+### Added
+- Embryo-O1 runtime: the `BoundedAttention` layer type with `arch.anchor_core`
+  (swa_sink_v1 bounded anchor: ring + trained sink vectors, fixed-size
+  per-layer state), the GDN mixer path, state wire v2 (`CMFS`), `KvPrefix`,
+  chunked prefill, and resident graph kinds for bounded and GDN layers.
+- CMF format v2 knowledge (`cortiq_core::knowledge`): frozen genome block with
+  `trunk_hash`, `lineage` and data `segments`; `SkillRecord` v2 fields (`kind`,
+  `bound`, `overrides`, `state_effect`, `status`, `gate`, `prompt_contract`,
+  `origin`, `experts`, `lookup`); true tail append (`append_skill`) and
+  header-only updates (`update_header_append`); routing policy v2 (`PhiSpec`);
+  `validate_knowledge` at open.
+- Skill-record kind `expert_append` (spec §9.5.1): new MoE experts appended over
+  a frozen resonance-routed genome, per-layer expert indices computed by the
+  reader, full open/writer validation, `GenomeInfo.moe_experts`,
+  `SkillRecord.experts`. Resonance shells in the engine.
+- Lookup records: explicit reference memory under the resonance router
+  (engine `LookupTable`, `cortiq lookup-build`, `route-fit`, `lookup-policy`,
+  key-first mode).
+- Router v2 (`backbone_gated`, `calibrate_v2`, request routing) and tools:
+  `route-eval`, `skill-gate`, `genome-verify`, `dump-logits`, `logits-compare`,
+  `growth-eval`, `probe-choice` (incl. `--raw`), `probe-dialog`, `probe-recall`,
+  `probe-utility --route/--lookup-mode`.
+- `cortiq serve`: lookup prepass and routing lanes.
+- `cortiq-embryo` trainer: `vulkan-train`, `vulkan-sft`, `grow`/`reshell`,
+  skill-bake v2, `export --genome-id`. CI checks the `vulkan` feature.
+
+### Fixed
+- Thread-pool job descriptor is a seqlock (no torn reads under contention).
+- `cortiq-embryo export` refuses to overwrite a genome file by content
+  (`genome`/`lineage`/`segments` in the header), not only by the bit, so a
+  pre-0.8.1 genome file cannot be truncated by a re-export.
+
 ## [0.8.0] - 2026-09-28
 
 ### Added
