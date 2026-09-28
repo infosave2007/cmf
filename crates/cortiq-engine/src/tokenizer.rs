@@ -253,6 +253,55 @@ pub(crate) fn strip_generation_tags(tpl: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(out)
 }
 
+/// Close a template's generation-time `<think>` marker for direct answers.
+///
+/// GLM-5's template ends in `<|assistant|><think>` and controls the reasoning
+/// budget with `reasoning_effort`; unlike Qwen templates it does not inspect
+/// `enable_thinking`.  The marker must be closed after rendering without
+/// splitting the complete `<|assistant|>` special token.  Keep this helper
+/// shared by pair- and JSON-shaped chat rendering so both APIs use identical
+/// token sequences.
+fn close_direct_think(rendered: String, enable_thinking: Option<bool>) -> String {
+    if enable_thinking != Some(false) || rendered.contains("</think>") {
+        return rendered;
+    }
+    if let Some(pos) = rendered.rfind("<|assistant|>") {
+        let marker_end = pos + "<|assistant|>".len();
+        let after = &rendered[marker_end..];
+        let mut out = String::with_capacity(rendered.len() + 24);
+        out.push_str(&rendered[..marker_end]);
+        if let Some(rest) = after.strip_prefix("<think>") {
+            out.push_str("<think></think>\n\n");
+            out.push_str(rest);
+        } else {
+            out.push_str(after);
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str("<think>\n\n</think>\n\n");
+        }
+        return out;
+    }
+    // Templates without the angle-bracket assistant marker use a
+    // line-oriented role prefix.  Keep that marker intact and append the
+    // empty think block after its newline.
+    if let Some(pos) = rendered.rfind("\nassistant") {
+        let mut insert_at = pos + 1 + "assistant".len();
+        if let Some(idx) = rendered[insert_at..].find('\n') {
+            insert_at += idx + 1;
+        }
+        let mut out = String::with_capacity(rendered.len() + 24);
+        out.push_str(&rendered[..insert_at]);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str("<think>\n\n</think>\n\n");
+        out.push_str(&rendered[insert_at..]);
+        return out;
+    }
+    rendered
+}
+
 impl Tokenizer {
     /// Load tokenizer from HuggingFace tokenizer.json file.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, TokenizerError> {
@@ -562,6 +611,17 @@ impl Tokenizer {
                 }
             }
         }
+        ids
+    }
+
+    /// Encode text as PLAIN text: the whole input is one added-token-free
+    /// segment (NFC → split → byte-map → BPE), so a literal `<|im_end|>`
+    /// in it stays bytes instead of becoming the special id. This is the
+    /// trainer's `Bpe::encode` (user text, never the template frame) —
+    /// router v2 tokenizes the user message with it (spec §9.4).
+    pub fn encode_plain(&self, text: &str) -> Vec<u32> {
+        let mut ids = Vec::new();
+        self.encode_segment_at(text, true, &mut ids);
         ids
     }
 
@@ -1027,6 +1087,11 @@ impl Tokenizer {
         let rendered = match (tools_v, enable_thinking) {
             (Some(ts), Some(v)) => tpl.render(minijinja::context! {
                 messages => msgs, tools => ts, add_generation_prompt => true, enable_thinking => v,
+                // GLM-5's template controls its reasoning budget with
+                // `reasoning_effort` rather than `enable_thinking`.  A direct
+                // answer therefore needs the low budget when thinking is
+                // disabled; otherwise the template defaults to `max`.
+                reasoning_effort => if !v { Some("low") } else { None::<&str> },
                 tool_call_format => "json",
             })?,
             (Some(ts), None) => tpl.render(minijinja::context! {
@@ -1035,6 +1100,8 @@ impl Tokenizer {
             })?,
             (None, Some(v)) => tpl.render(minijinja::context! {
                 messages => msgs, add_generation_prompt => true, enable_thinking => v,
+                // See the tool-bearing branch above.
+                reasoning_effort => if !v { Some("low") } else { None::<&str> },
                 tool_call_format => "json",
             })?,
             (None, None) => tpl.render(minijinja::context! {
@@ -1042,7 +1109,7 @@ impl Tokenizer {
                 tool_call_format => "json",
             })?,
         };
-        Ok(rendered)
+        Ok(close_direct_think(rendered, enable_thinking))
     }
 
     pub fn apply_chat_template_opts(
@@ -1116,32 +1183,16 @@ impl Tokenizer {
                 messages => msgs,
                 add_generation_prompt => true,
                 enable_thinking => v,
+                // GLM-5 uses this variable (not `enable_thinking`) to select
+                // its reasoning budget and defaults to max when omitted.
+                reasoning_effort => if !v { Some("low") } else { None::<&str> },
             })?,
             None => env.get_template("chat")?.render(minijinja::context! {
                 messages => msgs,
                 add_generation_prompt => true,
             })?,
         };
-        // Templates that ignore `enable_thinking` (e.g. Nanbeige/Qwen-legacy)
-        // always emit a generation prompt. When thinking is explicitly disabled,
-        // prefill an empty <think>…</think> block so the model answers directly.
-        if enable_thinking == Some(false) && !rendered.contains("</think>") {
-            if let Some(pos) = rendered.rfind("assistant") {
-                let mut insert_at = pos + "assistant".len();
-                if let Some(idx) = rendered[insert_at..].find('\n') {
-                    insert_at += idx + 1;
-                }
-                let mut out = String::with_capacity(rendered.len() + 24);
-                out.push_str(&rendered[..insert_at]);
-                if !out.ends_with('\n') {
-                    out.push('\n');
-                }
-                out.push_str("<think>\n\n</think>\n\n");
-                out.push_str(&rendered[insert_at..]);
-                return Ok(out);
-            }
-        }
-        Ok(rendered)
+        Ok(close_direct_think(rendered, enable_thinking))
     }
 
     /// Hardcoded Qwen ChatML (pre-§6.1 files).
@@ -1350,6 +1401,43 @@ mod tests {
             direct,
             "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think></think>"
         );
+    }
+
+    /// GLM-5's generation suffix is `<|assistant|><think>`.  The direct-answer
+    /// path must close that marker without splitting the `<|assistant|>` token
+    /// (a bare `rfind("assistant")` inserts bytes in the middle of the marker).
+    #[test]
+    fn glm_direct_template_keeps_assistant_special_token_intact() {
+        let mut tok = Tokenizer::byte_level();
+        tok.chat_template = Some(
+            "[gMASK]<sop>{%- set effort = reasoning_effort if reasoning_effort is defined and reasoning_effort in ['low', 'high'] else 'max' -%}<|system|>Reasoning Effort: {{ effort | capitalize }}{%- for m in messages -%}<|user|>{{ m.content }}{%- endfor -%}<|assistant|><think>"
+                .to_string(),
+        );
+        let messages = vec![("user".to_string(), "2+2?".to_string())];
+        let rendered = tok
+            .render_chat_opts(&messages, Some(false))
+            .expect("render GLM direct prompt");
+        assert!(rendered.contains("Reasoning Effort: Low"));
+        assert!(rendered.contains("<|assistant|><think></think>"));
+        assert!(!rendered.contains("<|assistant\n"));
+
+        // Leaving thinking enabled must preserve GLM's template default
+        // (`max`) rather than serializing our direct-answer hint.
+        let thinking = tok
+            .render_chat_opts(&messages, Some(true))
+            .expect("render GLM thinking prompt");
+        assert!(thinking.contains("Reasoning Effort: Max"));
+
+        let json_messages = vec![serde_json::json!({
+            "role": "user",
+            "content": "2+2?"
+        })];
+        let rendered_json = tok
+            .render_chat_json(&json_messages, None, Some(false))
+            .expect("render GLM JSON direct prompt");
+        assert!(rendered_json.contains("Reasoning Effort: Low"));
+        assert!(rendered_json.contains("<|assistant|><think></think>"));
+        assert!(!rendered_json.contains("<|assistant\n"));
     }
 
     /// A Sequence of Splits applies ALL of them, in order. Reading only the

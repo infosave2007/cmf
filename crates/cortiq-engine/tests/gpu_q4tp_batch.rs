@@ -161,6 +161,10 @@ fn one_shape(rows: usize, cols: usize, two_bit: bool) {
         shard: None,
         calibration: None,
         routing: None,
+        genome: None,
+        lineage: Vec::new(),
+        router: None,
+        segments: Vec::new(),
     };
     CmfModel::write(
         &path,

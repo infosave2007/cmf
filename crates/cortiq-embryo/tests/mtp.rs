@@ -36,9 +36,10 @@ fn mtp_head_gradients_match_finite_differences() {
         .iter()
         .map(|&x| x as u32)
         .collect();
-    let valid = (t - 2) * b; // head 1 (t+2): positions with a target
-    // analytic gradient (lr 0 → params untouched, grads left in gp/gw)
-    let l = mtp_step(&mut gpu, &mut st, &toks, 0.0, true)[0] * valid as f32 / m as f32;
+    // The shared head reports and differentiates CE as a mean over valid
+    // shifted targets; prompt/padding rows are not diluted by B*T.
+    // Analytic gradient (lr 0 → params untouched, grads left in gp/gw).
+    let l = mtp_step(&mut gpu, &mut st, &toks, 0.0, true)[0];
     let gp = st.gp.to_vec();
     let gw = st.gw.to_vec();
     let p0 = st.p.to_vec();
@@ -73,8 +74,7 @@ fn mtp_head_gradients_match_finite_differences() {
             } else {
                 st.w.write_from(&pp)
             }
-            let lp =
-                mtp_step(&mut gpu, &mut st, &toks, 0.0, false)[0] as f64 * valid as f64 / m as f64;
+            let lp = mtp_step(&mut gpu, &mut st, &toks, 0.0, false)[0] as f64;
             for i in 0..pp.len() {
                 pp[i] = (base[i] as f64 - eps * delta[i]) as f32;
             }
@@ -83,8 +83,7 @@ fn mtp_head_gradients_match_finite_differences() {
             } else {
                 st.w.write_from(&pp)
             }
-            let lm =
-                mtp_step(&mut gpu, &mut st, &toks, 0.0, false)[0] as f64 * valid as f64 / m as f64;
+            let lm = mtp_step(&mut gpu, &mut st, &toks, 0.0, false)[0] as f64;
             if is_p {
                 st.p.write_from(base)
             } else {

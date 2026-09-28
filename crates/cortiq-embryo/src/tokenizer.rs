@@ -283,6 +283,40 @@ impl Bpe {
         }
     }
 
+    /// Encode text in which the special tokens (`<|im_start|>`, …) may
+    /// appear literally: each special string becomes its id, the text
+    /// between them is [`Bpe::encode`]d (the HF added-token split). Used
+    /// for the chat-template frame, never for user text.
+    pub fn encode_with_specials(
+        &self,
+        text: &str,
+        cache: &mut HashMap<String, Vec<u32>>,
+        out: &mut Vec<u32>,
+    ) {
+        let mut rest = text;
+        while !rest.is_empty() {
+            // earliest special occurrence (longest name on a tie)
+            let hit = self
+                .specials
+                .iter()
+                .filter_map(|(s, id)| rest.find(s.as_str()).map(|at| (at, s.len(), *id)))
+                .min_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+            match hit {
+                Some((at, len, id)) => {
+                    if at > 0 {
+                        self.encode(&rest[..at], cache, out);
+                    }
+                    out.push(id);
+                    rest = &rest[at + len..];
+                }
+                None => {
+                    self.encode(rest, cache, out);
+                    break;
+                }
+            }
+        }
+    }
+
     /// Decode ids to text (byte-level inverse; specials emitted raw).
     pub fn decode(&self, ids: &[u32]) -> String {
         let (_, dec) = bytes_to_unicode();
@@ -353,8 +387,14 @@ impl Bpe {
 
     /// Load our own tokenizer.json back (vocab + merges + specials).
     pub fn load(path: &Path) -> anyhow::Result<Bpe> {
-        let s = std::fs::read_to_string(path)?;
-        let j: serde_json::Value = serde_json::from_str(&s)?;
+        let s = std::fs::read(path)?;
+        Self::from_json(&s)
+    }
+
+    /// [`Bpe::load`] from the tokenizer.json bytes (e.g. the VOCAB section
+    /// of an exported .cmf).
+    pub fn from_json(bytes: &[u8]) -> anyhow::Result<Bpe> {
+        let j: serde_json::Value = serde_json::from_slice(bytes)?;
         let vocab_j = j["model"]["vocab"]
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("no vocab"))?;

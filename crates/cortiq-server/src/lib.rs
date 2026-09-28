@@ -9,8 +9,11 @@ pub mod dashboard;
 pub mod decisions;
 pub mod ood;
 pub mod openai;
+pub mod route;
 pub mod streaming;
 pub mod tool_calls;
+
+pub use route::SkillRouter;
 
 use axum::extract::State;
 use axum::{Json, Router, routing::get};
@@ -82,6 +85,22 @@ impl PipelinePool {
         self.slots.len()
     }
 
+    /// Snapshot each lane's cache and recurrent-state allocation.  The
+    /// locks are intentionally taken only for diagnostics; generation keeps
+    /// its lane lock for the full request, so a snapshot waits for in-flight
+    /// work and cannot observe a half-updated state.
+    pub async fn slot_memory_bytes(&self) -> Vec<(usize, usize)> {
+        let mut out = Vec::with_capacity(self.slots.len());
+        for slot in &self.slots {
+            let pipe = slot.lock().await;
+            out.push((
+                pipe.kv_cache.attention_state_bytes(),
+                pipe.kv_cache.recurrent_state_bytes(),
+            ));
+        }
+        out
+    }
+
     /// Wait for a free slot and check it out. With `permits == slots`,
     /// holding a permit guarantees the try_lock scan finds a free slot.
     pub async fn acquire(&self) -> SlotGuard {
@@ -120,6 +139,10 @@ pub struct AppState {
     /// never contended (the slot semaphore already serializes) but keeps
     /// the type honest.
     pub remote: Option<Arc<std::sync::Mutex<cortiq_net::RemoteSegment>>>,
+    /// Router v2 (`header.router`): per-request backbone-gated routing on
+    /// the last user message, one lazily loaded lane per routed skill;
+    /// `slots` is the backbone lane. `None` = every request runs `slots`.
+    pub routing: Option<Arc<SkillRouter>>,
 }
 
 /// Liveness probe — returns 200 as soon as the server is accepting

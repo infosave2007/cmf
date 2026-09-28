@@ -78,6 +78,32 @@ blob（对齐到 4096）** → 掩码 → 词表 → 稀疏索引。读取器必
 | 4   | `HOT_PACKS`    | 保留：物化的稠密切片 |
 | 5   | `LOOP_MASKS`   | 掩码行按访问（VISIT）存储（物理层 × 循环数，按遍历优先）——循环 Transformer 的每一遍携带独立掩码（§5.1） |
 | 6   | `SKILL_FILE`   | 该文件是独立技能文件：针对特定基座裁出的部分张量集，由 `SkillRecord.base_dir_hash` 绑定（§9.1）。不可运行——用 `cortiq skill apply` 附加 |
+| 7   | `PRISM_HADAMARD` | Prism/Bonsai 矩阵位于带符号 FWHT 基中，并附带激活边界约定（`arch.prism_hadamard`，`arch_name = prism_hadamard_qwen35`）。位 ⇔ 记录双向一致：二者不一致时读取器拒绝该文件 |
+| 8   | `PRISM_AFFINE` | 对所列 Prism 矩阵的显式 q2tp 仿射修正 `(c − 1.0)·s`（`prism_hadamard.affine`）。单独设位，使修正永远不能仅从 `arch_name` 推断；位 ⇔ 描述符双向一致 |
+| 9   | `SKILLS_V2`    | 注册表中含 v2 技能记录（`skills[i].kind`，§9.5）：每条记录都对照其绑定的基因组和目录进行检查；未知或保留的 `kind` 被拒绝 |
+| 10  | `ROUTER_V2`    | 文件声明 v2 路由策略（`header.router`，§9.4）：只有已声明的 `backbone_gated` 策略可以自动路由，默认执行主干。会回退到按技能 argmin 的读取器必须拒绝 |
+| 11  | `DECISION`     | 非生成式决策档案（`cortiq-decision`：编码器、哈希约定、共振技能；元数据位于张量 `decision.manifest`）。由决策运行时执行（`cortiq decide`、`cortiq serve`），绝不由语言流水线执行。写入器根据 `arch_name` 前缀 `cortiq-decision-` 推导该位；位与前缀不一致时读取器拒绝 |
+| 12  | `BOUNDED_STATE` | 文件携带原生有界注意力算子（`LayerType::BoundedAttention` + `arch.anchor_core`）：每层状态是由头部推导出的固定大小记录。读取器必须以环形缓冲 + 训练得到的 sink 向量执行锚点，不得用增长 KV 上的掩码替代；`CMF_O1_*`/`--o1` 不适用。当且仅当存在 `anchor_core` 记录时置位；不一致时拒绝 |
+| 13  | `GENOME`       | 文件携带冻结基因组（`header.genome`，§9.2）：读取器根据目录、`arch`、词表、`tokenizer_config` 以及掩码/索引区段重新计算 `trunk_hash`，不一致即拒绝——主干不能在没有新基因组的情况下改变 |
+
+位 7–13 **由写入器根据内容推导**（`CmfModel::write`、`write_ref`、流式
+`CmfStreamWriter::finish` 和尾部追加都使用 `derive_required_features`），
+从不手工设置；`open()` 双向检查“位 ⇔ 内容”。早于某一位的读取器拒绝此类文件
+（fail-closed）；不含新位的文件照旧读取。`python/cmf_reader.py` 认识位 0–8：
+拒绝位 9–13，接受 Prism 位 7–8（它本身不应用 FWHT 基和仿射修正——它是参考
+张量读取器，不是执行器）。
+
+**位 12–13 的编号（自 0.8.1 起）。** 未发布的 embryo-o1 构建曾把
+`BOUNDED_STATE` 和 `GENOME` 写在位 7 和 8——正是已发布读取器（0.6.9+）用于
+`PRISM_HADAMARD`/`PRISM_AFFINE` 的位。已发布的位保持原义；Embryo 位移到 12 和
+13，位 9–11 不变。0.8.1+ 读取器会把此类构建写出的文件当作 Prism 位与元数据不一致
+而拒绝（错误信息会指明重新编号）。用 `cortiq migrate-embryo-bits <file…>`
+原地迁移（`--dry-run` 仅预览）：按内容判断（位 7 ⇔ `arch.anchor_core`，位 8 ⇔
+`genome`；带 `arch.prism_hadamard` 的文件不动），获取与追加相同的 `flock`，只改
+信封字节 12..16——`header_hash`/`dir_hash` 和 `trunk_hash` 都不覆盖它们，因此追加
+的记录、区段和 `lineage` 都会保留。从检查点重新导出会丢失它们。独立签名
+`<file>.sig` 对整个文件求哈希：迁移后需重新签名（`cortiq sign`）。位 14 及以上
+未分配，作为未知位拒绝。
 
 未知的**头部 JSON** 字段被忽略（增量式演进）；
 破坏性变更只通过特性位或 `version` 递增来引入。

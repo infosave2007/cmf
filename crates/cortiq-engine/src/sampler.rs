@@ -103,6 +103,38 @@ pub struct SamplerConfig {
     /// Token IDs to suppress (force logit to -inf).
     #[serde(default)]
     pub suppress_tokens: Vec<u32>,
+    /// How many of the most recent ids the repetition / presence
+    /// penalties look at. 0 = the whole sequence (the historical
+    /// behaviour). A natively bounded model (Embryo-O1 anchor) never
+    /// scans unbounded history: the pipeline substitutes
+    /// [`BOUNDED_PENALTY_WINDOW`] there when this is 0.
+    #[serde(default)]
+    pub penalty_window: usize,
+}
+
+/// Penalty window a bounded-state model falls back to when
+/// `penalty_window == 0` (`CMF_PENALTY_WINDOW` overrides).
+pub const BOUNDED_PENALTY_WINDOW: usize = 128;
+
+impl SamplerConfig {
+    /// The slice of `past` the penalties may scan: the last
+    /// `penalty_window` ids, or all of them when the window is 0 and the
+    /// model is not bounded-native.
+    pub fn penalty_past<'a>(&self, past: &'a [u32], bounded_native: bool) -> &'a [u32] {
+        let mut w = self.penalty_window;
+        if w == 0 && bounded_native {
+            w = std::env::var("CMF_PENALTY_WINDOW")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&v| v > 0)
+                .unwrap_or(BOUNDED_PENALTY_WINDOW);
+        }
+        if w == 0 {
+            past
+        } else {
+            &past[past.len().saturating_sub(w)..]
+        }
+    }
 }
 
 impl Default for SamplerConfig {
@@ -116,6 +148,7 @@ impl Default for SamplerConfig {
             min_p: 0.05,
             seed: None,
             suppress_tokens: Vec::new(),
+            penalty_window: 0,
         }
     }
 }

@@ -110,6 +110,11 @@ fn tensor_hashes(path: &Path) -> anyhow::Result<std::collections::HashMap<String
 }
 
 pub fn run(a: SleepArgs) -> anyhow::Result<()> {
+    // The night rewrites the served file whole (legacy v1 append), rewrites
+    // `header.routing` with a v1-only calibration and, on growth, replaces
+    // the trunk: never on a file with a frozen genome / router v2 / v2
+    // records (those change only by tail append; growth = a new genome).
+    crate::skill::refuse_knowledge_path(&a.cmf, "the sleep daemon")?;
     let ck: Checkpoint = load_checkpoint(&a.ckpt)?;
     let bpe = Bpe::load(&a.tokenizer)?;
     let eot = bpe.special_id(EOT).unwrap_or(0) as u16;
@@ -382,6 +387,7 @@ fn try_growth(
     should_stop: &dyn Fn() -> bool,
 ) -> anyhow::Result<Option<(f32, f32)>> {
     use crate::growth::{GrowArgs, grow_experts, train_new_experts};
+    crate::skill::refuse_knowledge_path(&a.cmf, "sleep growth")?;
     let arch = a.ood_dir.join("archive");
     let mut texts = Vec::new();
     if let Ok(rd) = std::fs::read_dir(&arch) {
@@ -419,6 +425,7 @@ fn try_growth(
         seq: a.seq,
         eval_every: 30,
         seed: now(),
+        held_batches: 0,
     };
     let (trained, l0, l1) = train_new_experts(&grown, &corpus, &ga, should_stop)?;
     let imp = (l0 - l1) / l0.max(1e-6);
@@ -430,6 +437,9 @@ fn try_growth(
     if imp < a.gate {
         return Ok(None);
     }
+    // the served file may have been replaced while the experts trained:
+    // growth never overwrites a genome file (a grown trunk is a new genome)
+    crate::skill::refuse_knowledge_path(&a.cmf, "sleep growth")?;
     // commit: checkpoint (old kept as a generation backup) + served file
     let generation = std::fs::read_dir(a.ckpt.parent().unwrap_or(Path::new(".")))?
         .flatten()

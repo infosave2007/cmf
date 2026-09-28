@@ -80,6 +80,37 @@ no "read as best we can").
 | 4   | `HOT_PACKS`    | reserved: materialized dense slices |
 | 5   | `LOOP_MASKS`   | mask rows are per VISIT (physical layers × loops, pass-major) — a Looped Transformer's two passes carry independent masks (§5.1) |
 | 6   | `SKILL_FILE`   | the file is a STANDALONE SKILL: a partial tensor set cut against a specific base, bound by `SkillRecord.base_dir_hash` (§9.1). Not runnable — attach with `cortiq skill apply` |
+| 7   | `PRISM_HADAMARD` | Prism/Bonsai matrices in the signed FWHT basis plus the activation-boundary contract (`arch.prism_hadamard`, `arch_name = prism_hadamard_qwen35`). Bit ⇔ record both ways: a reader refuses a file where they disagree |
+| 8   | `PRISM_AFFINE` | explicit q2tp affine correction `(c − 1.0)·s` for the listed Prism matrices (`prism_hadamard.affine`). A separate bit so the correction can never be inferred from `arch_name` alone; bit ⇔ descriptor both ways |
+| 9   | `SKILLS_V2`    | the registry holds a v2 skill record (`skills[i].kind`, §9.5): each is checked against the genome it is bound to and against the directory; an unknown or reserved `kind` is refused |
+| 10  | `ROUTER_V2`    | the file declares a v2 routing policy (`header.router`, §9.4): ONLY a declared `backbone_gated` policy may route automatically, the trunk runs by default. A reader that would fall back to argmin over skills must refuse |
+| 11  | `DECISION`     | a non-generative decision profile (`cortiq-decision`: encoder, hashing contract, resonance skills; metadata in the `decision.manifest` tensor). Executed by the decision runtime (`cortiq decide`, `cortiq serve`), NEVER by the language pipeline. The writer derives the bit from the `cortiq-decision-` `arch_name` prefix; a reader refuses a file where bit and prefix disagree |
+| 12  | `BOUNDED_STATE` | the file carries a NATIVELY BOUNDED attention operator (`LayerType::BoundedAttention` + `arch.anchor_core`): every layer's state is a fixed-size record derived from the header. A reader MUST execute the anchor as a ring + trained sink vectors and may not substitute a mask over a growing KV; `CMF_O1_*`/`--o1` do not apply. Set iff the `anchor_core` record is present; refused where they disagree |
+| 13  | `GENOME`       | the file carries a FROZEN GENOME (`header.genome`, §9.2): the reader recomputes `trunk_hash` over the directory, `arch`, vocab, `tokenizer_config` and the mask/index sections and refuses the file on a mismatch — the trunk cannot change without a new genome |
+
+Bits 7–13 are **derived by the writer from content** (`CmfModel::write`,
+`write_ref`, the streaming `CmfStreamWriter::finish` and the tail append all
+use `derive_required_features`) and are never set by hand; `open()` checks
+"bit ⇔ content" both ways. A reader that predates a bit refuses such files
+(fail-closed); files without the new bits read as before.
+`python/cmf_reader.py` knows bits 0–8: it refuses bits 9–13 and accepts the
+Prism bits 7–8 (it does not apply the FWHT basis or the affine correction
+itself — it is a reference tensor reader, not an executor).
+
+**Numbering of bits 12–13 (since 0.8.1).** Unreleased embryo-o1 builds wrote
+`BOUNDED_STATE` and `GENOME` on bits 7 and 8 — the bits that released readers
+(0.6.9+) use for `PRISM_HADAMARD`/`PRISM_AFFINE`. The released bits kept their
+meaning; the Embryo bits moved to 12 and 13, bits 9–11 are unchanged. A 0.8.1+
+reader refuses a file written by such a build as a Prism bit/metadata mismatch
+(the message names the renumbering). Migrate it IN PLACE with
+`cortiq migrate-embryo-bits <file…>` (`--dry-run` to preview): it decides by
+content (bit 7 ⇔ `arch.anchor_core`, bit 8 ⇔ `genome`; a file with
+`arch.prism_hadamard` is left alone), takes the append `flock` and changes only
+envelope bytes 12..16, which neither `header_hash`/`dir_hash` nor `trunk_hash`
+cover — appended records, segments and the lineage survive. A re-export from the
+checkpoint DROPS them. A detached `<file>.sig` hashes the whole file: re-sign
+after migrating (`cortiq sign`). Bit 14 and above are unassigned and refused as
+unknown.
 
 Unknown **header-JSON** fields are ignored (additive evolution);
 breaking changes go only through feature bits or a `version` bump.

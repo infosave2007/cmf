@@ -95,6 +95,14 @@ pub enum TensorDtype {
     /// LSB-first). Code c ∈ 0..4 → (c − 1.5)·s. 2-D, cols % 32 == 0.
     /// Built for MoE experts in the Escha-W2 size class.
     Q2TiledP = 16,
+    /// Raw little-endian `u32` words (spec §9.5.2: a lookup record's
+    /// `keys.entry` table): `n × 4` bytes, no quantisation, never loaded
+    /// as a matrix. Like `U8 = 6` (raw bytes, `n × 1`), a fixed-size
+    /// payload that `expected_nbytes` checks and no kernel decodes.
+    U32 = 17,
+    /// Raw little-endian `u64` words (spec §9.5.2: a lookup record's
+    /// `keys.hash` and `entries.off` tables): `n × 8` bytes, raw.
+    U64 = 18,
 }
 
 impl TensorDtype {
@@ -117,8 +125,17 @@ impl TensorDtype {
             14 => Self::Q1T,
             15 => Self::Q4TiledP,
             16 => Self::Q2TiledP,
+            17 => Self::U32,
+            18 => Self::U64,
             _ => return None,
         })
+    }
+
+    /// Raw integer / byte tensors (`u8`, `u32`, `u64`): fixed-size
+    /// little-endian payloads that carry tables, not weights — no
+    /// quantisation, never decoded into f32 (`is_supported` is false).
+    pub fn is_raw(self) -> bool {
+        matches!(self, Self::U8 | Self::U32 | Self::U64)
     }
 
     pub fn id(self) -> u8 {
@@ -144,6 +161,8 @@ impl TensorDtype {
             Self::Q1T => "q1t",
             Self::Q4TiledP => "q4tp",
             Self::Q2TiledP => "q2tp",
+            Self::U32 => "u32",
+            Self::U64 => "u64",
         }
     }
 
@@ -220,6 +239,17 @@ pub enum LayerType {
     /// convolution, and a sigmoid-gated output RMSNorm. Geometry rides
     /// the `linear_*` fields; state = 3 conv rings + S[h·dk·dv].
     Kda,
+    /// Natively BOUNDED softmax attention (Embryo-O1 anchor): a trained
+    /// operator whose state is a fixed-size record derived from the
+    /// header — `anchor_core.window` exact keys in a ring plus
+    /// `anchor_core.sink` TRAINED sink key/value vectors (weights, not
+    /// positions) — identical in prefill, decode and across turns. It is
+    /// NOT a masked full-attention layer: a reader must never run it over
+    /// a growing KV. The variant is deliberately new (rather than
+    /// `SlidingAttention` + a flag) so a reader that predates it fails
+    /// to parse the header instead of executing the wrong operator.
+    /// `arch.anchor_core` is mandatory whenever this variant appears.
+    BoundedAttention,
 }
 
 /// Multi-token-prediction head carried by the file (DeepSeek/Qwen-MTP
@@ -493,6 +523,12 @@ pub struct ModelArch {
     /// or not folded yet)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linear_core: Option<LinearCoreConfig>,
+    /// Bounded-anchor operator record — mandatory iff some layer is
+    /// `BoundedAttention` (see `AnchorCoreConfig`). The field itself is
+    /// additive; the breaking semantics ride the enum variant and the
+    /// `BOUNDED_STATE` feature bit, so an older reader refuses the file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_core: Option<AnchorCoreConfig>,
     /// Cortiq Embryo hierarchical head: the vocabulary is C clusters ×
     /// (vocab/C) tokens (token v → cluster v / (vocab/C)); log p(v) =
     /// log softmax_c(h·Cᵀ)[c(v)] + log softmax_{s∈c(v)}(h·E_c(v)ᵀ)[v] with the
@@ -756,19 +792,320 @@ fn is_one_usize(v: &usize) -> bool {
 /// Linear-core selector: the runtime picks the linear-attention
 /// operator by `kind` (descriptor-driven ops). "gated_delta_net" =
 /// faithful vendor operator carried 1:1 (default for GDN models);
-/// "vmf_phase" = canonical core folded at convert time (+offline heal).
+/// "vmf_phase" = the legacy additive phase core folded at convert time;
+/// "vmf_phase_delta_v1" = the normalized in-place Phase-Delta recurrence.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LinearCoreConfig {
-    /// "gated_delta_net" | "vmf_phase"
+    /// "gated_delta_net" | "vmf_phase" | "vmf_phase_delta_v1"
     pub kind: String,
     pub num_heads: usize,
     /// Phases per head (vmf_phase only)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nphase: Option<usize>,
     pub value_head_dim: usize,
+    /// Zero-based linear-layer indices that use the Phase-Delta v1 write law.
+    /// Required and non-empty for `vmf_phase_delta_v1`; absent for legacy
+    /// cores.  Keeping this in the operator record is important: an older
+    /// reader must reject the new kind instead of ignoring a selector and
+    /// silently executing additive VMF.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase_delta_layers: Option<Vec<usize>>,
+}
+
+/// Bounded-anchor operator record (`arch.anchor_core`), mandatory for every
+/// `LayerType::BoundedAttention` layer and forbidden without one. It is the
+/// operator's identity, not a hint: the runtime executes exactly this
+/// geometry, `CMF_O1_*` / `--o1` cannot override it, and the per-layer
+/// state is `2·num_kv_heads·window·head_dim` f32 (ring K/V) — a constant
+/// the file fixes, so "memory does not grow with context" is a property
+/// the reader can check, not a promise.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AnchorCoreConfig {
+    /// "swa_sink_v1": exact window of the last `window` keys with
+    /// relative RoPE inside the window + `sink` trained NoPE sink vectors
+    /// (`self_attn.sink_k.weight` / `self_attn.sink_v.weight`,
+    /// `[num_kv_heads, sink, head_dim]`), one joint softmax.
+    pub kind: String,
+    /// Exact-window width in keys (ring capacity). Serving window; the
+    /// trainer may sample from `train_windows` per step.
+    pub window: usize,
+    /// Number of trained sink key/value vectors per KV head.
+    pub sink: usize,
+    /// "relative_in_window": the ring stores UNROTATED keys and the query
+    /// is rotated by its distance Δ∈[0,window) at attend time — no absolute
+    /// position anywhere in the operator.
+    pub rope: String,
+    /// "nope": sink scores use raw q·k̂ˢ (no rotation).
+    pub sink_scores: String,
+    /// Window widths the operator was trained with (SWAX-style stochastic
+    /// window); informational for readers, normative for the trainer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub train_windows: Vec<usize>,
+    /// Optional far field (landmark skeleton). `None` = the operator is
+    /// exactly sink ∪ window. Declared but not implemented by this reader
+    /// yet: validation accepts only `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub far: Option<FarFieldConfig>,
+}
+
+/// Far-field (landmark) extension of `swa_sink_v1`. Reserved: the record
+/// is validated so files can declare it, but no runtime executes it yet.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FarFieldConfig {
+    /// Landmark count per head (4..=32).
+    pub m: usize,
+    /// "aggregate" | "fm" (see engine `nystrom::O1Rect`).
+    pub rect: String,
+}
+
+impl AnchorCoreConfig {
+    /// Kinds this reader executes.
+    pub const KINDS: &'static [&'static str] = &["swa_sink_v1"];
+    /// Hard ceiling on `sink + window`: the shared scratch of the GPU
+    /// bounded-attend kernels holds 160 score lanes.
+    pub const MAX_SINK_PLUS_WINDOW: usize = 160;
+
+    /// f32 elements of ring state per layer for the given KV geometry
+    /// (keys + values; sink vectors are weights, not state).
+    pub fn ring_state_elems(&self, num_kv_heads: usize, head_dim: usize) -> usize {
+        2 * num_kv_heads * self.window * head_dim
+    }
 }
 
 impl ModelArch {
+    /// Every operator record the header carries, validated together. CMF
+    /// open/write call this; consumers that copy or compare headers should
+    /// too.
+    pub fn validate_operator_metadata(&self) -> Result<(), String> {
+        self.validate_linear_core_metadata()?;
+        self.validate_anchor_core_metadata()
+    }
+
+    /// Validate the bounded-anchor contract (`arch.anchor_core` against
+    /// `layer_types`) without touching tensor payloads.
+    pub fn validate_anchor_core_metadata(&self) -> Result<(), String> {
+        let bounded: Vec<usize> = self
+            .layer_types
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| matches!(t, LayerType::BoundedAttention))
+            .map(|(i, _)| i)
+            .collect();
+        let Some(ac) = self.anchor_core.as_ref() else {
+            if let Some(&li) = bounded.first() {
+                return Err(format!(
+                    "layer {li} is BoundedAttention but the header carries no anchor_core record"
+                ));
+            }
+            return Ok(());
+        };
+        if bounded.is_empty() {
+            return Err(
+                "anchor_core is present but no layer is BoundedAttention (the record is an operator, not a hint)"
+                    .into(),
+            );
+        }
+        if !AnchorCoreConfig::KINDS.contains(&ac.kind.as_str()) {
+            return Err(format!(
+                "unknown anchor core '{}' (this runtime executes: {})",
+                ac.kind,
+                AnchorCoreConfig::KINDS.join(", ")
+            ));
+        }
+        if ac.window == 0 {
+            return Err("anchor_core.window must be >= 1".into());
+        }
+        if ac.sink + ac.window > AnchorCoreConfig::MAX_SINK_PLUS_WINDOW {
+            return Err(format!(
+                "anchor_core sink + window = {} exceeds the kernel ceiling {}",
+                ac.sink + ac.window,
+                AnchorCoreConfig::MAX_SINK_PLUS_WINDOW
+            ));
+        }
+        if ac.rope != "relative_in_window" {
+            return Err(format!(
+                "anchor_core.rope '{}' is not executable (expected relative_in_window)",
+                ac.rope
+            ));
+        }
+        if ac.sink_scores != "nope" {
+            return Err(format!(
+                "anchor_core.sink_scores '{}' is not executable (expected nope)",
+                ac.sink_scores
+            ));
+        }
+        if let Some(w) = ac.train_windows.iter().find(|&&w| w == 0 || w > ac.window) {
+            return Err(format!(
+                "anchor_core.train_windows entry {w} is outside 1..={}",
+                ac.window
+            ));
+        }
+        if let Some(far) = ac.far.as_ref() {
+            if !(4..=32).contains(&far.m) {
+                return Err(format!("anchor_core.far.m = {} outside 4..=32", far.m));
+            }
+            if far.rect != "aggregate" && far.rect != "fm" {
+                return Err(format!("anchor_core.far.rect '{}' unknown", far.rect));
+            }
+            return Err(
+                "anchor_core.far is declared but no runtime executes a far field yet".into(),
+            );
+        }
+        if self.layer_types.len() != self.num_layers {
+            return Err(format!(
+                "layer schedule has {} entries, expected {}",
+                self.layer_types.len(),
+                self.num_layers
+            ));
+        }
+        Ok(())
+    }
+
+    /// Stable identity of the bounded-anchor operator (None when the
+    /// header carries none).
+    pub fn anchor_core_identity(&self) -> Option<serde_json::Value> {
+        let ac = self.anchor_core.as_ref()?;
+        Some(serde_json::json!({
+            "kind": ac.kind,
+            "window": ac.window,
+            "sink": ac.sink,
+            "rope": ac.rope,
+            "sink_scores": ac.sink_scores,
+            "far": ac.far.as_ref().map(|f| serde_json::json!({"m": f.m, "rect": f.rect})),
+            "num_kv_heads": self.num_kv_heads,
+            "head_dim": self.head_dim,
+        }))
+    }
+
+    /// Validate the serialized linear-core contract without looking at any
+    /// tensor payloads. This is shared by CMF open/write and consumers that
+    /// copy or compare a model header.
+    pub fn validate_linear_core_metadata(&self) -> Result<(), String> {
+        let Some(lc) = self.linear_core.as_ref() else {
+            return Ok(());
+        };
+        let has_linear = self
+            .layer_types
+            .iter()
+            .any(|t| matches!(t, LayerType::LinearAttention));
+        let selector = lc.phase_delta_layers.as_ref();
+        match lc.kind.as_str() {
+            "vmf_phase" => {
+                if selector.is_some() {
+                    return Err(
+                        "legacy vmf_phase cannot carry phase_delta_layers; use vmf_phase_delta_v1"
+                            .into(),
+                    );
+                }
+                if has_linear
+                    && (lc.num_heads == 0 || lc.nphase.unwrap_or(0) == 0 || lc.value_head_dim == 0)
+                {
+                    return Err(
+                        "vmf_phase requires positive heads, nphase, and value_head_dim".into(),
+                    );
+                }
+            }
+            "vmf_phase_delta_v1" => {
+                let Some(selected) = selector else {
+                    return Err(
+                        "vmf_phase_delta_v1 requires a non-empty phase_delta_layers selector"
+                            .into(),
+                    );
+                };
+                if selected.is_empty() {
+                    return Err("vmf_phase_delta_v1 phase_delta_layers is empty".into());
+                }
+                if self.layer_types.len() != self.num_layers {
+                    return Err(format!(
+                        "phase_delta layer schedule has {} entries, expected {}",
+                        self.layer_types.len(),
+                        self.num_layers
+                    ));
+                }
+                let mut canonical = selected.clone();
+                canonical.sort_unstable();
+                if let Some(pair) = canonical.windows(2).find(|pair| pair[0] == pair[1]) {
+                    let duplicate = pair[0];
+                    return Err(format!(
+                        "phase_delta_layers contains duplicate layer {duplicate}"
+                    ));
+                }
+                for &li in selected {
+                    if li >= self.num_layers {
+                        return Err(format!(
+                            "phase_delta layer {li} out of range for {} layers",
+                            self.num_layers
+                        ));
+                    }
+                    if !matches!(self.layer_types[li], LayerType::LinearAttention) {
+                        return Err(format!(
+                            "phase_delta layer {li} is not a LinearAttention layer"
+                        ));
+                    }
+                }
+                if lc.num_heads == 0 || lc.nphase.unwrap_or(0) == 0 || lc.value_head_dim == 0 {
+                    return Err(
+                        "vmf_phase_delta_v1 requires positive heads, nphase, and value_head_dim"
+                            .into(),
+                    );
+                }
+            }
+            "gated_delta_net" => {
+                if selector.is_some() {
+                    return Err("gated_delta_net cannot carry phase_delta_layers".into());
+                }
+            }
+            other => {
+                return Err(format!(
+                    "unknown linear core '{other}' (this runtime executes: gated_delta_net, vmf_phase, vmf_phase_delta_v1)"
+                ));
+            }
+        }
+        if !has_linear && selector.is_some() {
+            return Err(
+                "phase_delta_layers is only valid with LinearAttention and vmf_phase_delta_v1"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Stable semantic identity for the executable linear operator. The
+    /// selector is normalized for comparison; callers should validate first.
+    pub fn linear_core_identity(&self) -> Option<serde_json::Value> {
+        let Some(lc) = self.linear_core.as_ref() else {
+            // No linear core: the identity is the bounded anchor alone (or
+            // None for a plain full-attention file, as before).
+            return self.anchor_core_identity().map(|anchor| {
+                serde_json::json!({
+                    "layer_types": self.layer_types,
+                    "anchor_core": anchor,
+                })
+            });
+        };
+        let mut selected = lc.phase_delta_layers.clone();
+        if let Some(indices) = selected.as_mut() {
+            indices.sort_unstable();
+        }
+        Some(serde_json::json!({
+            "kind": lc.kind,
+            "num_heads": lc.num_heads,
+            "nphase": lc.nphase,
+            "value_head_dim": lc.value_head_dim,
+            "phase_delta_layers": selected,
+            "linear_num_key_heads": self.linear_num_key_heads,
+            "linear_num_value_heads": self.linear_num_value_heads,
+            "linear_key_head_dim": self.linear_key_head_dim,
+            "linear_value_head_dim": self.linear_value_head_dim,
+            "linear_conv_kernel_dim": self.linear_conv_kernel_dim,
+            "layer_types": self.layer_types,
+            // The bounded anchor is part of the executable operator set:
+            // a skill baked against a full-KV anchor must not bind to a
+            // file whose anchor is ring+sink (or vice versa).
+            "anchor_core": self.anchor_core_identity(),
+        }))
+    }
+
     /// Bytes per FFN bitfield row (one layer).
     pub fn ffn_mask_bytes(&self) -> usize {
         self.intermediate_size.div_ceil(8)

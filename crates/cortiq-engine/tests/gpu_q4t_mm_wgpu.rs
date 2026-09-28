@@ -55,6 +55,10 @@ fn wgpu_q4t_matmat_matches_dequant_reference() {
         shard: None,
         calibration: None,
         routing: None,
+        genome: None,
+        lineage: Vec::new(),
+        router: None,
+        segments: Vec::new(),
     };
     let spec = TensorSpec {
         name: "w".into(),

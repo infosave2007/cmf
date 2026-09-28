@@ -556,6 +556,10 @@ pub fn expected_nbytes(dtype: TensorDtype, shape: &[usize]) -> Option<usize> {
     match dtype {
         TensorDtype::F32 => n.checked_mul(4),
         TensorDtype::F16 | TensorDtype::Bf16 => n.checked_mul(2),
+        // Raw tables (spec §9.5.2): one, four or eight bytes per element.
+        TensorDtype::U8 => Some(n),
+        TensorDtype::U32 => n.checked_mul(4),
+        TensorDtype::U64 => n.checked_mul(8),
         TensorDtype::Q8Row => {
             let out = *shape.first()?;
             n.checked_add(out.checked_mul(2)?)
@@ -625,6 +629,9 @@ fn has_fixed_payload_size(dtype: TensorDtype) -> bool {
             | TensorDtype::Q2TiledP
             | TensorDtype::Q1
             | TensorDtype::Q8_2f
+            | TensorDtype::U8
+            | TensorDtype::U32
+            | TensorDtype::U64
     )
 }
 
@@ -861,6 +868,8 @@ pub fn bytes_per_weight(dtype: TensorDtype) -> f32 {
         TensorDtype::Q1S => 0.3125,
         TensorDtype::Q1T => 0.281_25, // 9 bytes per 32 weights (base-3 packed)
         TensorDtype::U8 => 1.0,
+        TensorDtype::U32 => 4.0,
+        TensorDtype::U64 => 8.0,
     }
 }
 

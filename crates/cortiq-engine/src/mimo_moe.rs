@@ -1880,6 +1880,10 @@ mod bank_tests {
             shard: None,
             calibration: None,
             routing: None,
+            genome: None,
+            lineage: Vec::new(),
+            router: None,
+            segments: Vec::new(),
         };
         let dir = std::env::temp_dir().join(format!("cmf-mimo-bank-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

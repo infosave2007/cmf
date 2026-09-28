@@ -936,12 +936,14 @@ fn arch_from_md(md: &BTreeMap<String, Val>, tensors: &[GgufTensor]) -> anyhow::R
         moe,
         qwen4_exp: None,
         deepseek_v41: None,
+        anchor_core: None,
         linear_core: if is_q35 {
             Some(cortiq_core::types::LinearCoreConfig {
                 kind: "gated_delta_net".into(),
                 num_heads: ssm_vheads.unwrap_or(0),
                 nphase: None,
                 value_head_dim: ssm_state.unwrap_or(0),
+                phase_delta_layers: None,
             })
         } else {
             None
@@ -1331,6 +1333,7 @@ fn qwen_image_arch(geometry: &QwenImageGeometry) -> ModelArch {
         moe: None,
         qwen4_exp: None,
         deepseek_v41: None,
+        anchor_core: None,
         linear_core: None,
         head_clusters: None,
         max_position_embeddings: 0,
@@ -1641,6 +1644,10 @@ fn run_import_qwen_image_with_reader<'a>(
             shard: None,
             calibration: None,
             routing: None,
+            genome: None,
+            lineage: Vec::new(),
+            router: None,
+            segments: Vec::new(),
         };
         writer
             .finish(&header, None, None)
@@ -2010,6 +2017,10 @@ pub fn run_import_gguf(
         shard: None,
         calibration: None,
         routing: None,
+        genome: None,
+        lineage: Vec::new(),
+        router: None,
+        segments: Vec::new(),
     };
     CmfModel::write(output, &header, &tensors, None, vocab.as_deref())
         .map_err(|e| anyhow::anyhow!("write {output}: {e}"))?;

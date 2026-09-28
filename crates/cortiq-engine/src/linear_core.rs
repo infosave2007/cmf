@@ -9,13 +9,18 @@
 //!   validated `gated_delta_net` (vmfcore/rust/src/forward.rs) against
 //!   the numpy/torch oracle (vmfcore/gdn_layer.py).
 //!
-//! * `vmf_phase` — the canonical core: token carries a phase θ; kernel
+//! * `vmf_phase` — the legacy additive core: token carries a phase θ; kernel
 //!   φ(θ) = [cos θ; sin θ] gives a linear factorization; the recurrent
 //!   state S[head][p2, dv] uses decay exp(−exp(A_log)).
 //!   Noise-robust and simpler than vendor recurrences. Exotic operators
 //!   are folded onto it at CONVERT time (`--linear-core vmf_phase`) and
 //!   quality is restored by the offline heal — the research track and
 //!   the production mechanism for Patent-15 skills (mask→heal→compress).
+//!
+//! * `vmf_phase_delta_v1` — the operator-tagged normalized in-place
+//!   Phase-Delta variant: decay first, read the old value under k, write the
+//!   gated residual, then read under q. It shares all VMF tensors/state but
+//!   is selected per layer by the CMF linear-core record.
 //!
 //! Both cores implement the same contract: `*_forward` (one position,
 //! advances the state) and `*_pair` (fused two positions; lane 1
@@ -25,6 +30,7 @@
 
 use crate::pool::Pool;
 use crate::qtensor::QTensor;
+use cortiq_core::TensorDtype;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -65,6 +71,11 @@ pub struct VmfPhaseWeights {
     /// knee ×2–6 earlier, restores correlated-noise robustness, LM
     /// crossover vs softmax at SEQ 512 (experiments/lc_final_merged.json).
     pub k_gate: Option<(QTensor, Vec<f32>)>,
+    /// Select the normalized in-place Phase-Delta recurrence. This bit is
+    /// derived from the versioned CMF selector and is never inferred from
+    /// tensor presence, so legacy `vmf_phase` files retain their exact
+    /// additive semantics.
+    pub phase_delta: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -90,6 +101,102 @@ impl VmfPhaseCfg {
     }
 }
 
+/// One normalized in-place Phase-Delta step.  The state is feature-major
+/// `[2*nphase, value_head_dim]`; `state` may carry a convolution ring after
+/// that prefix, so this helper only touches the recurrent matrix.  Keeping
+/// the decay/read/write/read ordering literal is what gives beta=1 and
+/// q=k the exact-overwrite witness from the trainer contract.
+fn phase_delta_step_f32(
+    thq: &[f32],
+    thk: &[f32],
+    v: &[f32],
+    decay: &[f64],
+    kap: Option<&[f32]>,
+    cfg: &VmfPhaseCfg,
+    state: &mut [f32],
+    out: &mut [f32],
+) {
+    let (nh, nph, dv) = (cfg.num_heads, cfg.nphase, cfg.value_head_dim);
+    let p2 = 2 * nph;
+    let scale = 1.0f64 / (nph as f64).sqrt();
+    debug_assert_eq!(thq.len(), nh * nph);
+    debug_assert_eq!(thk.len(), nh * nph);
+    debug_assert_eq!(v.len(), nh * dv);
+    debug_assert_eq!(decay.len(), nh * p2);
+    debug_assert!(state.len() >= nh * p2 * dv);
+    debug_assert!(out.len() >= nh * dv);
+
+    // Reuse one head's workspace. The old-value reduction must finish before
+    // any cell is overwritten, but neither it nor the phase features needs a
+    // fresh allocation per head.
+    let mut r = vec![0.0f64; dv];
+    let mut key = vec![0.0f64; p2];
+    for h in 0..nh {
+        let s = &mut state[h * p2 * dv..(h + 1) * p2 * dv];
+        let thk_h = &thk[h * nph..(h + 1) * nph];
+        let thq_h = &thq[h * nph..(h + 1) * nph];
+        let vt = &v[h * dv..(h + 1) * dv];
+        let ot = &mut out[h * dv..(h + 1) * dv];
+        let dec = &decay[h * p2..(h + 1) * p2];
+        let beta = kap.map_or(1.0f64, |k| k[h] as f64);
+
+        // P = D_gamma S_prev; r = k^T P.  P is kept as f64 only for this
+        // token's arithmetic, while the recurrent cells remain f32 exactly
+        // like the established runtime VMF path.
+        r.fill(0.0);
+        for f in 0..p2 {
+            let kf = if f < nph {
+                scale * (thk_h[f] as f64).cos()
+            } else {
+                scale * (thk_h[f - nph] as f64).sin()
+            };
+            key[f] = kf;
+            let row = &s[f * dv..(f + 1) * dv];
+            for d in 0..dv {
+                r[d] += kf * (dec[f] * row[d] as f64);
+            }
+        }
+
+        // S = P + beta*k*(v-r), then o = q^T S (post-write).
+        // On ARM fuse the write and read of each row: no third state sweep.
+        // On x86 keep separate loops: mixing f64 updates and f32 reductions
+        // prevents vectorization and regressed the measured Xeon kernel.
+        // Both paths avoid reevaluating the key's transcendental functions.
+        // Crucially read the rounded f32 cell, NOT its f64 precursor. Keep
+        // feature accumulation order and the f32 add exactly as before.
+        for f in 0..p2 {
+            let kf = key[f];
+            #[cfg(target_arch = "aarch64")]
+            let qf = if f < nph {
+                scale * (thq_h[f] as f64).cos()
+            } else {
+                scale * (thq_h[f - nph] as f64).sin()
+            };
+            let row = &mut s[f * dv..(f + 1) * dv];
+            for d in 0..dv {
+                let p = dec[f] * row[d] as f64;
+                row[d] = (p + beta * kf * (vt[d] as f64 - r[d])) as f32;
+                #[cfg(target_arch = "aarch64")]
+                {
+                    ot[d] += (qf * row[d] as f64) as f32;
+                }
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        for f in 0..p2 {
+            let qf = if f < nph {
+                scale * (thq_h[f] as f64).cos()
+            } else {
+                scale * (thq_h[f - nph] as f64).sin()
+            };
+            let row = &s[f * dv..(f + 1) * dv];
+            for d in 0..dv {
+                ot[d] += (qf * row[d] as f64) as f32;
+            }
+        }
+    }
+}
+
 /// One recurrent step for one head-set given projected phases/values.
 /// `state` is S[nh][p2, dv] stored f32 (per-element math in f64 — the
 /// storage halves, each step's arithmetic keeps the old precision).
@@ -102,8 +209,13 @@ fn phase_step(
     cfg: &VmfPhaseCfg,
     state: &mut [f32],
     out: &mut [f32],
+    phase_delta: bool,
 ) {
     let (nh, nph, dv) = (cfg.num_heads, cfg.nphase, cfg.value_head_dim);
+    if phase_delta {
+        phase_delta_step_f32(thq, thk, v, decay, kap, cfg, state, out);
+        return;
+    }
     // Phase-mass correction: θ_eff = θ/(1+mass). mass=0 → factor 1 → no-op.
     let mscale = 1.0f64 / (1.0 + cfg.phase_mass as f64);
     let p2 = 2 * nph;
@@ -223,7 +335,17 @@ pub fn vmf_phase_forward(
 
     let kap = kappa_of(x, w, nh, pool);
     let mut o = vec![0.0f32; nh * dv];
-    phase_step(&thq, &thk, &v, &w.decay, kap.as_deref(), cfg, state, &mut o);
+    phase_step(
+        &thq,
+        &thk,
+        &v,
+        &w.decay,
+        kap.as_deref(),
+        cfg,
+        state,
+        &mut o,
+        w.phase_delta,
+    );
 
     let mut out = vec![0.0f32; cfg.hidden_size];
     w.out_proj.matvec(&o, &mut out, pool);
@@ -282,6 +404,7 @@ pub fn vmf_phase_pair(
         cfg,
         state,
         &mut o1,
+        w.phase_delta,
     );
 
     // Lane 2 runs on a copy — tentative until the draft is verified.
@@ -298,6 +421,7 @@ pub fn vmf_phase_pair(
         cfg,
         scratch,
         &mut o2,
+        w.phase_delta,
     );
     // The scratch copy above re-took state's ring (advanced only through
     // x1); commit x2's advance so an accepted draft leaves a correct ring.
@@ -1293,18 +1417,47 @@ pub fn kda_forward(
     let mut xv = vec![0.0f32; vd];
     let mut fl = vec![0.0f32; w.f_a.rows()];
     let mut b = vec![0.0f32; nh];
-    QTensor::matvec_many(
-        [&w.q_proj, &w.k_proj, &w.v_proj, &w.f_a],
-        x,
-        [
-            xq.as_mut_slice(),
-            xk.as_mut_slice(),
-            xv.as_mut_slice(),
-            fl.as_mut_slice(),
-        ],
-        pool,
-    );
-    w.b_proj.matvec(x, &mut b, pool);
+    // KDA's beta projection uses the same hidden input as q/k/v/f_a.  When
+    // it shares their Q4TP layout, include it in the virtual row space so
+    // the projection group pays one pool dispatch, not five.  The explicit
+    // fallback keeps mixed-dtype checkpoints on their established kernels.
+    let q4_group = [&w.q_proj, &w.k_proj, &w.v_proj, &w.f_a, &w.b_proj];
+    let q4_uniform = q4_group.iter().all(|t| {
+        matches!(
+            t,
+            QTensor::Mapped {
+                dtype: TensorDtype::Q4TiledP,
+                ..
+            }
+        )
+    });
+    if q4_uniform {
+        QTensor::matvec_many(
+            q4_group,
+            x,
+            [
+                xq.as_mut_slice(),
+                xk.as_mut_slice(),
+                xv.as_mut_slice(),
+                fl.as_mut_slice(),
+                b.as_mut_slice(),
+            ],
+            pool,
+        );
+    } else {
+        QTensor::matvec_many(
+            [&w.q_proj, &w.k_proj, &w.v_proj, &w.f_a],
+            x,
+            [
+                xq.as_mut_slice(),
+                xk.as_mut_slice(),
+                xv.as_mut_slice(),
+                fl.as_mut_slice(),
+            ],
+            pool,
+        );
+        w.b_proj.matvec(x, &mut b, pool);
+    }
     let mut f = vec![0.0f32; kd];
     w.f_b.matvec(&fl, &mut f, pool);
     let gate_out = kda_gate_out(w, x, vd, pool);
@@ -1643,6 +1796,7 @@ mod tests {
                 .collect(),
             conv: None,
             k_gate: None,
+            phase_delta: false,
         };
         (w, cfg)
     }
@@ -1657,6 +1811,183 @@ mod tests {
         // Same input, evolved state → different output.
         assert!(o1.iter().zip(&o2).any(|(a, b)| (a - b).abs() > 1e-6));
         assert_eq!(state.len(), cfg.state_len());
+    }
+
+    #[test]
+    fn phase_delta_matches_independent_token_oracle_and_ignores_phase_mass() {
+        // One head, two phase angles, one value channel.  The projections are
+        // intentionally simple so this test computes the token oracle without
+        // calling any implementation helper: q=[x0,x1], k=[x1,x0], v=x0,
+        // and the first output row is qᵀS.
+        let cfg = VmfPhaseCfg {
+            num_heads: 1,
+            nphase: 2,
+            value_head_dim: 1,
+            hidden_size: 2,
+            // A nonzero legacy knob must not alter a v1 operator.
+            phase_mass: 17.0,
+        };
+        let w = VmfPhaseWeights {
+            thq: QTensor::from_f32(vec![1.0, 0.0, 0.0, 1.0], 2, 2),
+            thk: QTensor::from_f32(vec![0.0, 1.0, 1.0, 0.0], 2, 2),
+            v_proj: QTensor::from_f32(vec![1.0, 0.0], 1, 2),
+            out_proj: QTensor::from_f32(vec![1.0, 0.0], 2, 1),
+            decay: vec![0.9, 0.8, 0.7, 0.6],
+            conv: None,
+            k_gate: None, // beta=1
+            phase_delta: true,
+        };
+        let xs = [[0.3f32, 0.7f32], [-0.2, 0.4], [0.8, -0.6]];
+        let c = 1.0f64 / 2.0f64.sqrt();
+        let mut oracle_state = [0.0f64; 4];
+        let mut state = Vec::new();
+        for x in xs {
+            let q = [
+                c * (x[0] as f64).cos(),
+                c * (x[1] as f64).cos(),
+                c * (x[0] as f64).sin(),
+                c * (x[1] as f64).sin(),
+            ];
+            let k = [
+                c * (x[1] as f64).cos(),
+                c * (x[0] as f64).cos(),
+                c * (x[1] as f64).sin(),
+                c * (x[0] as f64).sin(),
+            ];
+            let value = x[0] as f64;
+            let mut read = 0.0;
+            for f in 0..4 {
+                oracle_state[f] *= w.decay[f];
+                read += k[f] * oracle_state[f];
+            }
+            for f in 0..4 {
+                oracle_state[f] += k[f] * (value - read);
+            }
+            let want: f32 = q
+                .iter()
+                .zip(oracle_state)
+                .map(|(qf, sf)| (qf * sf) as f32)
+                .sum();
+            let got = vmf_phase_forward(&x, &w, &cfg, &mut state, None);
+            assert!(
+                (got[0] - want).abs() < 2e-6,
+                "oracle {want} vs runtime {}",
+                got[0]
+            );
+            assert!(got[1].abs() < 2e-7);
+        }
+        assert_eq!(state.len(), cfg.state_len());
+        for (got, want) in state.iter().zip(oracle_state) {
+            assert!((*got as f64 - want).abs() < 2e-6);
+        }
+    }
+
+    #[test]
+    fn phase_delta_fused_readout_is_bit_exact_over_long_continuation() {
+        // Independent three-pass reference, with nonzero state/output and a
+        // sentinel convolution tail. Exercise odd widths and the real shape.
+        for (nh, nph, dv) in [(1, 1, 1), (3, 5, 7), (8, 32, 128)] {
+            let cfg = VmfPhaseCfg {
+                num_heads: nh,
+                nphase: nph,
+                value_head_dim: dv,
+                hidden_size: nh * dv,
+                phase_mass: 19.0,
+            };
+            let p2 = 2 * nph;
+            let scale = 1.0f64 / (nph as f64).sqrt();
+            let mut state: Vec<f32> = (0..cfg.state_len() + 11)
+                .map(|i| (i as f32 * 0.37).sin())
+                .collect();
+            let mut reference = state.clone();
+            let tail = state[cfg.state_len()..].to_vec();
+            let decay: Vec<f64> = (0..nh * p2).map(|i| [0.0, 0.8, 0.99, 1.0][i % 4]).collect();
+            for step in 0..128 {
+                let q: Vec<f32> = (0..nh * nph)
+                    .map(|i| ((i + step * 3) as f32 * 0.13).sin() * 4.0)
+                    .collect();
+                let k: Vec<f32> = (0..nh * nph)
+                    .map(|i| ((i + step * 7) as f32 * 0.29).cos() * 4.0)
+                    .collect();
+                let v: Vec<f32> = (0..nh * dv)
+                    .map(|i| ((i + step) as f32 * 0.43).sin())
+                    .collect();
+                let gates: Vec<f32> = (0..nh).map(|h| [0.0, 0.3, 1.0][(step + h) % 3]).collect();
+                let kap = (step % 4 != 0).then_some(gates.as_slice());
+                let mut out = vec![0.125f32; nh * dv];
+                let mut want = out.clone();
+                for h in 0..nh {
+                    let feature = |theta: &[f32], f: usize| {
+                        let angle = theta[h * nph + f % nph] as f64;
+                        scale * if f < nph { angle.cos() } else { angle.sin() }
+                    };
+                    let beta = kap.map_or(1.0f64, |g| g[h] as f64);
+                    let mut read = vec![0.0f64; dv];
+                    for f in 0..p2 {
+                        for d in 0..dv {
+                            let at = (h * p2 + f) * dv + d;
+                            read[d] += feature(&k, f) * (decay[h * p2 + f] * reference[at] as f64);
+                        }
+                    }
+                    for f in 0..p2 {
+                        for d in 0..dv {
+                            let at = (h * p2 + f) * dv + d;
+                            reference[at] = (decay[h * p2 + f] * reference[at] as f64
+                                + beta * feature(&k, f) * (v[h * dv + d] as f64 - read[d]))
+                                as f32;
+                        }
+                    }
+                    for f in 0..p2 {
+                        for d in 0..dv {
+                            want[h * dv + d] +=
+                                (feature(&q, f) * reference[(h * p2 + f) * dv + d] as f64) as f32;
+                        }
+                    }
+                }
+                phase_delta_step_f32(&q, &k, &v, &decay, kap, &cfg, &mut state, &mut out);
+                assert_eq!(out, want, "shape {nh}/{nph}/{dv}, step {step}");
+                assert_eq!(state, reference, "state at step {step}");
+                assert_eq!(&state[cfg.state_len()..], tail);
+            }
+        }
+    }
+
+    #[test]
+    fn phase_delta_pair_reset_and_legacy_paths_are_distinct() {
+        let (mut delta, mut cfg) = tiny();
+        delta.phase_delta = true;
+        // The phase normalization is observable for nphase=3, while the
+        // legacy core remains unchanged and still uses raw cos/sin features.
+        let x1: Vec<f32> = (0..8).map(|i| (i as f32 * 0.2).cos()).collect();
+        let x2: Vec<f32> = (0..8).map(|i| (i as f32 * 0.5).sin()).collect();
+        let mut seq_state = Vec::new();
+        let d1 = vmf_phase_forward(&x1, &delta, &cfg, &mut seq_state, None);
+        let d2 = vmf_phase_forward(&x2, &delta, &cfg, &mut seq_state, None);
+
+        let mut pair_state = Vec::new();
+        let mut scratch = Vec::new();
+        let (p1, p2) = vmf_phase_pair(&x1, &x2, &delta, &cfg, &mut pair_state, &mut scratch, None);
+        assert_eq!(d1, p1);
+        assert_eq!(d2, p2);
+        std::mem::swap(&mut pair_state, &mut scratch);
+        assert_eq!(seq_state, pair_state);
+
+        // Empty state is the runtime reset contract; it reproduces the first
+        // token exactly and does not inherit the previous sequence.
+        let mut reset = seq_state;
+        reset.clear();
+        let after_reset = vmf_phase_forward(&x1, &delta, &cfg, &mut reset, None);
+        assert_eq!(after_reset, d1);
+
+        cfg.phase_mass = 0.0;
+        let mut legacy = delta;
+        legacy.phase_delta = false;
+        let mut legacy_state = Vec::new();
+        let old = vmf_phase_forward(&x1, &legacy, &cfg, &mut legacy_state, None);
+        assert!(
+            old.iter().zip(&d1).any(|(a, b)| (a - b).abs() > 1e-5),
+            "legacy additive and normalized Phase-Delta paths must differ"
+        );
     }
 
     /// Phase-mass correction: mass=0 is bit-identical to the unscaled kernel; mass>0

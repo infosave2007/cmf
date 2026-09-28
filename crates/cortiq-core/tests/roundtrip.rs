@@ -7,8 +7,9 @@ use cortiq_core::format::{
 use cortiq_core::mask::zero_tail_bits;
 use cortiq_core::quant::{GROUP_SIZE, dequant_q4_block, dequant_q8_row, f16_to_f32, f32_to_f16};
 use cortiq_core::{
-    CMF_VERSION, CmfError, CmfHeader, CmfModel, LayerType, MaskCatalog, MaskPriority, ModelArch,
-    NormStyle, Quality, QuantType, TaskMask, TensorDtype, TensorSpec, hash64,
+    CMF_VERSION, CmfError, CmfHeader, CmfModel, LayerType, LinearCoreConfig, MaskCatalog,
+    MaskPriority, ModelArch, NormStyle, Quality, QuantType, TaskMask, TensorDtype, TensorSpec,
+    hash64,
 };
 
 // ───────────────────────── helpers ─────────────────────────
@@ -36,6 +37,7 @@ fn tiny_arch() -> ModelArch {
         moe: None,
         qwen4_exp: None,
         deepseek_v41: None,
+        anchor_core: None,
         linear_core: None,
         head_clusters: None,
         max_position_embeddings: 64,
@@ -82,6 +84,10 @@ fn tiny_header() -> CmfHeader {
         shard: None,
         calibration: None,
         routing: None,
+        genome: None,
+        lineage: Vec::new(),
+        router: None,
+        segments: Vec::new(),
         arch: tiny_arch(),
         quant_type: QuantType::F32,
         provenance: None,
@@ -89,11 +95,202 @@ fn tiny_header() -> CmfHeader {
 }
 
 #[test]
+fn linear_core_metadata_is_validated_and_identity_is_canonical() {
+    let mut arch = tiny_arch();
+    arch.layer_types = vec![LayerType::LinearAttention; 2];
+    arch.linear_core = Some(LinearCoreConfig {
+        kind: "vmf_phase_delta_v1".into(),
+        num_heads: 2,
+        nphase: Some(2),
+        value_head_dim: 4,
+        phase_delta_layers: Some(vec![1, 0]),
+    });
+    arch.linear_num_key_heads = Some(2);
+    arch.linear_num_value_heads = Some(2);
+    arch.linear_key_head_dim = Some(2);
+    arch.linear_value_head_dim = Some(4);
+    arch.linear_conv_kernel_dim = Some(2);
+    arch.validate_linear_core_metadata().unwrap();
+    assert_eq!(
+        arch.linear_core_identity().unwrap()["phase_delta_layers"],
+        serde_json::json!([0, 1])
+    );
+
+    arch.linear_core.as_mut().unwrap().phase_delta_layers = Some(vec![0, 0]);
+    assert!(arch.validate_linear_core_metadata().is_err());
+    arch.linear_core.as_mut().unwrap().phase_delta_layers = Some(vec![0]);
+    arch.layer_types[0] = LayerType::FullAttention;
+    assert!(arch.validate_linear_core_metadata().is_err());
+
+    arch.linear_core = Some(LinearCoreConfig {
+        kind: "vmf_phase".into(),
+        num_heads: 2,
+        nphase: Some(2),
+        value_head_dim: 4,
+        phase_delta_layers: Some(vec![1]),
+    });
+    assert!(arch.validate_linear_core_metadata().is_err());
+}
+
+/// The bounded anchor is an operator record, not a hint: it must be
+/// present exactly when a layer is `BoundedAttention`, every field must
+/// be executable, its identity is part of the skill-binding identity, and
+/// the file carries the `BOUNDED_STATE` bit so a reader that predates it
+/// refuses instead of running a growing KV.
+#[test]
+fn bounded_anchor_contract_validates_and_travels_with_its_feature_bit() {
+    use cortiq_core::format::features;
+    use cortiq_core::{AnchorCoreConfig, FarFieldConfig};
+
+    let good = || AnchorCoreConfig {
+        kind: "swa_sink_v1".into(),
+        window: 128,
+        sink: 4,
+        rope: "relative_in_window".into(),
+        sink_scores: "nope".into(),
+        train_windows: vec![64, 128],
+        far: None,
+    };
+
+    // A BoundedAttention layer without the record, and the record
+    // without a BoundedAttention layer, are both refused.
+    let mut arch = tiny_arch();
+    arch.layer_types = vec![LayerType::FullAttention, LayerType::BoundedAttention];
+    assert!(arch.validate_operator_metadata().is_err());
+    let mut lone = tiny_arch();
+    lone.anchor_core = Some(good());
+    assert!(lone.validate_operator_metadata().is_err());
+
+    arch.anchor_core = Some(good());
+    arch.validate_operator_metadata().unwrap();
+    let id = arch.linear_core_identity().expect("anchor alone is an identity");
+    assert_eq!(id["anchor_core"]["window"], serde_json::json!(128));
+    assert!(tiny_arch().linear_core_identity().is_none(), "plain files keep None");
+
+    // Every executable-contract field is checked.
+    let cases: Vec<(&str, Box<dyn Fn(&mut AnchorCoreConfig)>)> = vec![
+        ("kind", Box::new(|a| a.kind = "nystrom_v9".into())),
+        ("window 0", Box::new(|a| a.window = 0)),
+        ("sink+window 161", Box::new(|a| a.window = 157)),
+        ("rope", Box::new(|a| a.rope = "absolute".into())),
+        ("sink_scores", Box::new(|a| a.sink_scores = "rope".into())),
+        ("train_windows 0", Box::new(|a| a.train_windows = vec![0])),
+        ("train_windows > window", Box::new(|a| a.train_windows = vec![256])),
+        (
+            "far m=64",
+            Box::new(|a| {
+                a.far = Some(FarFieldConfig {
+                    m: 64,
+                    rect: "aggregate".into(),
+                })
+            }),
+        ),
+        (
+            "far not executed",
+            Box::new(|a| {
+                a.far = Some(FarFieldConfig {
+                    m: 16,
+                    rect: "aggregate".into(),
+                })
+            }),
+        ),
+    ];
+    for (name, mutate) in cases {
+        let mut bad = arch.clone();
+        mutate(bad.anchor_core.as_mut().unwrap());
+        assert!(
+            bad.validate_operator_metadata().is_err(),
+            "negative case '{name}' was accepted"
+        );
+    }
+    let mut short = arch.clone();
+    short.layer_types.pop();
+    assert!(short.validate_operator_metadata().is_err(), "schedule length");
+
+    // An older reader cannot even parse the variant — the loud-refusal
+    // mechanism the operator relies on (a renamed variant stands in for
+    // "a variant this reader does not know").
+    assert!(serde_json::from_str::<LayerType>("\"BoundedAttention\"").is_ok());
+    assert!(serde_json::from_str::<LayerType>("\"BoundedAttentionV9\"").is_err());
+
+    // Written file: BOUNDED_STATE (1 << 12) set, round-trips, and the
+    // bit/record pair is enforced in both directions on open.
+    let dir = tempdir();
+    let path = dir.join("bounded.cmf");
+    let mut header = tiny_header();
+    header.arch = arch.clone();
+    let embed: Vec<f32> = (0..arch.vocab_size * arch.hidden_size)
+        .map(|i| (i as f32 * 0.11).sin())
+        .collect();
+    let tensors = vec![TensorSpec {
+        name: "model.embed_tokens.weight".into(),
+        dtype: TensorDtype::F32,
+        shape: vec![arch.vocab_size, arch.hidden_size],
+        data: embed.iter().flat_map(|v| v.to_le_bytes()).collect(),
+    }];
+    CmfModel::write(&path, &header, &tensors, None, None).unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    let required = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+    assert_eq!(features::BOUNDED_STATE, 1 << 12);
+    assert_ne!(required & features::BOUNDED_STATE, 0, "BOUNDED_STATE bit not set");
+    assert_eq!(
+        required & (features::PRISM_HADAMARD | features::PRISM_AFFINE),
+        0,
+        "a bounded file is not a Prism file"
+    );
+    // The released 0.8.0 reader (bits 0–2, 5–8, 11: Prism + decision, no
+    // Embryo bits) refuses the file on the unknown bit instead of reading
+    // it as a Prism file.
+    const V080_SUPPORTED: u32 = 0x09e7;
+    match cortiq_core::format::check_required_features(required, V080_SUPPORTED) {
+        Err(CmfError::UnsupportedFeature(u)) => assert_eq!(u, features::BOUNDED_STATE),
+        other => panic!("a 0.8.0 reader must refuse BOUNDED_STATE, got {other:?}"),
+    }
+    let model = CmfModel::open(&path).unwrap();
+    assert_eq!(model.arch().anchor_core, Some(good()));
+    assert_eq!(model.arch().layer_types[1], LayerType::BoundedAttention);
+    assert!(model.verify().is_empty());
+
+    // Record present, bit cleared → refuse (would run as full-KV on a
+    // reader that ignores unknown header fields).
+    let mut cleared = bytes.clone();
+    cleared[12..16].copy_from_slice(&(required & !features::BOUNDED_STATE).to_le_bytes());
+    let p2 = dir.join("bounded-nobit.cmf");
+    std::fs::write(&p2, &cleared).unwrap();
+    assert!(matches!(CmfModel::open(&p2), Err(CmfError::Parse(_))));
+
+    // Pre-0.8.1 numbering (BOUNDED_STATE on bit 7 = PRISM_HADAMARD today)
+    // → refused as a Prism mismatch, with the renumbering named.
+    let mut legacy = bytes.clone();
+    let old_bits = (required & !features::BOUNDED_STATE) | (1 << 7);
+    legacy[12..16].copy_from_slice(&old_bits.to_le_bytes());
+    let p_legacy = dir.join("bounded-legacy-bit7.cmf");
+    std::fs::write(&p_legacy, &legacy).unwrap();
+    match CmfModel::open(&p_legacy) {
+        Err(CmfError::Parse(msg)) => assert!(msg.contains("pre-0.8.1"), "{msg}"),
+        other => panic!("legacy bit 7 file: expected a Parse refusal, got {other:?}"),
+    }
+    // …and the in-place migration moves bit 7 back to BOUNDED_STATE.
+    assert_eq!(
+        CmfModel::migrate_legacy_embryo_bits(&p_legacy, false).unwrap(),
+        cortiq_core::format::LegacyBitsMigration::Migrated { from: old_bits, to: required }
+    );
+    assert_eq!(std::fs::read(&p_legacy).unwrap(), bytes);
+    assert_eq!(CmfModel::open(&p_legacy).unwrap().arch().anchor_core, Some(good()));
+
+    // Bit set on a plain file (no record) → refuse.
+    let p3 = dir.join("plain-bit.cmf");
+    write_tiny_file(&p3);
+    let mut plain = std::fs::read(&p3).unwrap();
+    let r = u32::from_le_bytes(plain[12..16].try_into().unwrap());
+    plain[12..16].copy_from_slice(&(r | features::BOUNDED_STATE).to_le_bytes());
+    std::fs::write(&p3, &plain).unwrap();
+    assert!(matches!(CmfModel::open(&p3), Err(CmfError::Parse(_))));
+}
+
+#[test]
 fn bounded_writer_keeps_raw_u8_auxiliary_bytes_and_shape() {
-    let dir = std::env::temp_dir().join(format!(
-        "cmf-bounded-raw-test-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("cmf-bounded-raw-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("raw.cmf");
     let bytes: Vec<u8> = (0..14).map(|i| (i * 17) as u8).collect();
@@ -111,9 +308,7 @@ fn bounded_writer_keeps_raw_u8_auxiliary_bytes_and_shape() {
     writer.finish(&tiny_header(), None, None).unwrap();
 
     let model = CmfModel::open(&path).unwrap();
-    let entry = model
-        .tensor("model.layers.1.engram.embed.scale")
-        .unwrap();
+    let entry = model.tensor("model.layers.1.engram.embed.scale").unwrap();
     assert_eq!(entry.dtype, TensorDtype::U8);
     assert_eq!(entry.shape, vec![2, 7]);
     assert_eq!(model.tensor_bytes(&entry.name).unwrap(), bytes.as_slice());
@@ -159,10 +354,8 @@ fn kv_geometry_fields_survive_a_file_round_trip() {
 fn checkpoint_mark_orders_payload_and_manifest_before_resume() {
     use std::io::{Read, Seek, SeekFrom};
 
-    let dir = std::env::temp_dir().join(format!(
-        "cmf-checkpoint-order-test-{}",
-        std::process::id()
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("cmf-checkpoint-order-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("checkpoint.cmf");
@@ -561,17 +754,23 @@ fn open_rejects_garbage_and_corruption() {
         Err(CmfError::UnsupportedVersion(1))
     ));
 
-    // Unknown required feature bit (bits 7 and 8 are assigned to Prism).
-    let path = dir.join("f.cmf");
-    write_tiny_file(&path);
-    let mut bytes = std::fs::read(&path).unwrap();
-    let unknown_feature = 1u32 << 9;
-    bytes[12..16].copy_from_slice(&unknown_feature.to_le_bytes());
-    std::fs::write(&path, &bytes).unwrap();
-    assert!(matches!(
-        CmfModel::open(&path),
-        Err(CmfError::UnsupportedFeature(f)) if f == unknown_feature
-    ));
+    // Unknown required feature bits are refused before any section is
+    // read: 1 << 14 is the first unassigned bit (7–8 Prism, 9–10 skills /
+    // router v2, 11 decision, 12–13 bounded state / genome), 1 << 31 the
+    // far end of the word.
+    for unknown_feature in [1u32 << 14, 1u32 << 31] {
+        assert_eq!(cortiq_core::format::features::SUPPORTED & unknown_feature, 0);
+        let path = dir.join("f.cmf");
+        write_tiny_file(&path);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let required = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+        bytes[12..16].copy_from_slice(&(required | unknown_feature).to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(matches!(
+            CmfModel::open(&path),
+            Err(CmfError::UnsupportedFeature(f)) if f == unknown_feature
+        ));
+    }
 
     // A hostile directory count must return an error, never overflow/panic.
     let path = dir.join("dir-overflow.cmf");

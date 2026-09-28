@@ -249,6 +249,10 @@ pub fn cmd_imagine_pack(root: &str, quant: &str, out: &str) -> anyhow::Result<()
         shard: None,
         calibration: None,
         routing: None,
+        genome: None,
+        lineage: Vec::new(),
+        router: None,
+        segments: Vec::new(),
     };
     let vocab = std::fs::read(root.join("tokenizer").join("tokenizer.json"))
         .with_context(|| "tokenizer/tokenizer.json")?;

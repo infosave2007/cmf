@@ -35,6 +35,10 @@ pub struct StreamChunk {
     /// `include_usage` shape) — clients get exact numbers, not estimates.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<StreamUsage>,
+    /// Router-v2 decision of the request (`{target, novelty, e_base,
+    /// e_skill, reason}`), carried by the usage chunk.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x_cortiq_route: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -148,6 +152,7 @@ pub fn tool_calls_chunk(
             finish_reason: None,
         }],
         usage: None,
+        x_cortiq_route: None,
     }
 }
 
@@ -167,6 +172,7 @@ pub fn token_chunk(id: &str, model: &str, token: &str, created: u64) -> StreamCh
             finish_reason: None,
         }],
         usage: None,
+        x_cortiq_route: None,
     }
 }
 
@@ -190,6 +196,7 @@ pub fn usage_chunk(
             completion_tokens,
             total_tokens: prompt_tokens + completion_tokens,
         }),
+        x_cortiq_route: None,
     }
 }
 
@@ -210,5 +217,6 @@ pub fn finish_chunk(id: &str, model: &str, reason: &str, created: u64) -> Stream
             finish_reason: Some(reason.to_string()),
         }],
         usage: None,
+        x_cortiq_route: None,
     }
 }
