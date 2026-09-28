@@ -29,7 +29,9 @@
 //! `CMF_QI21_TRACE=<dir>` (`v_i`, `lat_i` per step);
 //! `CMF_QI21_DUMP=<dir>` (the prompt's encoder features, text rows; with
 //! `CMF_QI21_TE_ONLY=1` the run stops there);
-//! `CMF_QI21_LATENT_IN=<raw f32 tokens>` (decode this latent instead).
+//! `CMF_QI21_LATENT_IN=<raw f32 tokens>` (decode this latent instead);
+//! `CMF_QI21_COND_LAT=<raw f32 [h·w, 64]>` (the condition latent instead of
+//! the VAE encoder; one image).
 
 use crate::qwen_image21::{Qi21Dit, Qi21Layout, Seg, ARCH_NAME};
 use crate::qwen_image21_vae::Qi21Vae;
@@ -390,7 +392,9 @@ fn encode_prompt(
     Ok(Encoded { text: feats, segs })
 }
 
-/// Oracle prompt embeddings (text-to-image parity only).
+/// Oracle prompt embeddings (parity only): `prompt_embeds.f32` over all
+/// rows after the system message, `image_pad_mask.f32` marking the vision
+/// slots (one condition image, its pixel size in `meta.cond_wh`).
 fn embeds_from_dir(dir: &Path) -> Result<Encoded, String> {
     let meta: serde_json::Value = serde_json::from_slice(
         &std::fs::read(dir.join("meta.json")).map_err(|e| format!("{}: {e}", dir.display()))?,
@@ -398,11 +402,36 @@ fn embeds_from_dir(dir: &Path) -> Result<Encoded, String> {
     .map_err(|e| e.to_string())?;
     let shape = meta["prompt_embeds"].as_array().ok_or("meta: prompt_embeds")?;
     let rows = shape[0].as_u64().unwrap_or(0) as usize;
-    let text = read_f32(&dir.join("prompt_embeds.f32"))?;
-    Ok(Encoded {
-        text,
-        segs: vec![Seg::Text(rows)],
-    })
+    let all = read_f32(&dir.join("prompt_embeds.f32"))?;
+    let hs = all.len() / rows.max(1);
+    let mask = read_f32(&dir.join("image_pad_mask.f32")).unwrap_or_else(|_| vec![0.0; rows]);
+    let (cw, ch) = match meta["cond_wh"].as_array() {
+        Some(a) if a.len() == 2 => (a[0].as_u64().unwrap_or(0) as usize, a[1].as_u64().unwrap_or(0) as usize),
+        _ => (0, 0),
+    };
+    let mut text = Vec::new();
+    let mut segs = Vec::new();
+    let (mut run, mut i) = (0usize, 0usize);
+    while i < rows {
+        if mask[i] > 0.5 {
+            if run > 0 {
+                segs.push(Seg::Text(run));
+                run = 0;
+            }
+            segs.push(Seg::Image(ch / 16, cw / 16));
+            while i < rows && mask[i] > 0.5 {
+                i += 1;
+            }
+        } else {
+            text.extend_from_slice(&all[i * hs..(i + 1) * hs]);
+            run += 1;
+            i += 1;
+        }
+    }
+    if run > 0 {
+        segs.push(Seg::Text(run));
+    }
+    Ok(Encoded { text, segs })
 }
 
 /// Generate `p.num_images` images. `progress(image, step, steps)` after
@@ -454,7 +483,7 @@ pub fn generate_images(
     let (pos, neg) = {
         let _stage = crate::gpu::image_stage_scope();
         let pos = match std::env::var("CMF_QI21_EMBEDS") {
-            Ok(dir) if conds.is_empty() => embeds_from_dir(Path::new(&dir))?,
+            Ok(dir) => embeds_from_dir(Path::new(&dir))?,
             _ => encode_prompt(&model, &tok, &d.system_prompt, prompt, &conds)?,
         };
         let neg = if do_cfg {
@@ -482,6 +511,8 @@ pub fn generate_images(
     let t0 = Instant::now();
     let cond_tokens: Vec<Vec<f32>> = if conds.is_empty() {
         Vec::new()
+    } else if let Ok(path) = std::env::var("CMF_QI21_COND_LAT") {
+        vec![read_f32(Path::new(&path))?]
     } else {
         let _stage = crate::gpu::image_stage_scope();
         let vae = Qi21Vae::from_cmf(&model, true, false)?;
@@ -495,6 +526,11 @@ pub fn generate_images(
             .collect::<Result<_, String>>()?
     };
     tm.vae_encode = t0.elapsed().as_secs_f64();
+    if let Ok(dir) = std::env::var("CMF_QI21_DUMP") {
+        for (i, c) in cond_tokens.iter().enumerate() {
+            write_f32(&dir, &format!("cond_lat_{i}"), c)?;
+        }
+    }
 
     // ── DiT ──
     let t0 = Instant::now();

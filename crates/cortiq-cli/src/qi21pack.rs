@@ -391,7 +391,9 @@ pub(crate) fn pack(root: &Path, out: &str, o: &PackOpts) -> anyhow::Result<()> {
                 "components": {"te": "qwen3-vl-8b language model (36 layers, pre-norm output)",
                                "vis": if o.vision { "qwen3-vl vision tower + deepstack mergers" } else { "omitted" },
                                "dit": "QwenImage21Transformer2DModel", "vae": "AutoencoderKLQwenImage21 (2-D)"},
-                "packed_from": root.display().to_string(),
+                // the directory name only: a local path does not belong in a
+                // published file, and the same source must give the same bytes
+                "packed_from": root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
                 "dit_codec": zp::codec_name(o.dit),
                 "dit_keep_q8_2f": o.dit_keep,
                 "te_codec": zp::codec_name(o.te),
