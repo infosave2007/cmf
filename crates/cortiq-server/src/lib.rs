@@ -1,5 +1,9 @@
 //! Cortiq Server — OpenAI-compatible API + web management dashboard.
 
+// Decision Vulkan adds a deep wgpu auto-trait graph to spawned server futures.
+// This also covers the library's own async integration-style tests.
+#![recursion_limit = "256"]
+
 pub mod api;
 pub mod dashboard;
 pub mod decisions;
