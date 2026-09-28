@@ -253,7 +253,14 @@ impl SkillScorer {
                 })
             })
             .collect();
-        Self::new(id, &m.tasks, &views, m.gate.params(), model.signal_dim())
+        Self::new(id, &m.tasks, &views, m.gate.params(), model.signal_dim())?
+            .with_device(crate::bert::EncoderDevice::from_env()?)
+    }
+
+    /// Select the reconstruction backend without changing topology parameters.
+    pub fn with_device(mut self, device: crate::bert::EncoderDevice) -> Result<Self> {
+        self.packed = self.packed.with_device(device)?;
+        Ok(self)
     }
 
     pub fn id(&self) -> &str {
@@ -470,19 +477,23 @@ pub fn select_skill(model: &DecisionModel, skill: Option<&str>) -> Result<String
 pub struct StageTimings {
     pub tokenize: Duration,
     pub encode: Duration,
+    /// Joint GPU encoder + reconstruction, excluding CPU ranking.
+    pub gpu: Duration,
     pub hash: Duration,
     pub resonance: Duration,
     pub total: Duration,
 }
 
 impl StageTimings {
-    pub const STAGES: [&'static str; 5] = ["tokenize", "encode", "hash", "resonance", "total"];
+    pub const STAGES: [&'static str; 6] =
+        ["tokenize", "encode", "hash", "gpu", "resonance", "total"];
 
     pub fn get(&self, stage: &str) -> Duration {
         match stage {
             "tokenize" => self.tokenize,
             "encode" => self.encode,
             "hash" => self.hash,
+            "gpu" => self.gpu,
             "resonance" => self.resonance,
             _ => self.total,
         }
@@ -491,10 +502,14 @@ impl StageTimings {
     /// Whole microseconds per stage.
     pub fn to_json(&self) -> Value {
         let us = |d: Duration| d.as_micros() as u64;
-        json!({
+        let mut value = json!({
             "tokenize": us(self.tokenize), "encode": us(self.encode), "hash": us(self.hash),
             "resonance": us(self.resonance), "total": us(self.total),
-        })
+        });
+        if !self.gpu.is_zero() {
+            value["gpu"] = json!(us(self.gpu));
+        }
+        value
     }
 }
 
@@ -776,7 +791,8 @@ impl Evaluator {
     /// Encode and decide one text, with the stage timings.
     pub fn decide_text(&self, text: &str) -> Result<TextDecision> {
         let t0 = Instant::now();
-        let (features, t) = self.encoder.features_timed(text);
+        let mut scored = self.encoder.score_timed(text, &[self.scorer.packed()])?;
+        let t = scored.timings;
         let tokenizer = self.encoder.encoder().tokenizer();
         let input_tokens = if t.tokens < tokenizer.max_length() {
             t.tokens.saturating_sub(2)
@@ -784,8 +800,8 @@ impl Evaluator {
             tokenizer.encode_pieces(text).len()
         };
         let tr = Instant::now();
-        let x = features.signal();
-        let (errors, decision) = self.scorer.decide(&x)?;
+        let errors = scored.errors.remove(0);
+        let decision = self.scorer.decide_errors(&errors)?;
         let end = Instant::now();
         Ok(TextDecision {
             errors,
@@ -796,7 +812,8 @@ impl Evaluator {
                 tokenize: t.tokenize,
                 encode: t.encode,
                 hash: t.hash,
-                resonance: end - tr,
+                gpu: t.gpu,
+                resonance: scored.resonance + (end - tr),
                 total: end - t0,
             },
         })
@@ -900,6 +917,7 @@ impl Evaluator {
                 StageTimings::STAGES
                     .iter()
                     .zip(&stage_us)
+                    .filter(|(name, values)| **name != "gpu" || values.iter().any(|&v| v > 0.0))
                     .map(|(n, v)| (n.to_string(), Percentiles::of(v)))
                     .collect(),
             ));
