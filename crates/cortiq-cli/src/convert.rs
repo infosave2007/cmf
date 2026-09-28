@@ -18,8 +18,8 @@
 use crate::npy;
 use cortiq_core::format::{CMF_VERSION, CmfHeader, TensorSpec, TokenizerBundle};
 use cortiq_core::quant::{
-    Q2TP_CHUNK, Q2TP_LMAX, Q4TP_LMAX, Q4TP_NIB, bf16_to_f32, f16_to_f32, f32_to_f16, q2tp_ladder,
-    q4tp_code_stride, q4tp_ladder, q4tp_put_code,
+    Q2TP_CHUNK, Q2TP_LMAX, Q4TP_LMAX, Q4TP_NIB, bf16_to_f32, f16_to_f32, f32_to_f16,
+    q4tp_code_stride, q4tp_put_code,
 };
 use cortiq_core::types::{
     LayerType, LinearCoreConfig, ModelArch, MoeConfig, NormStyle, PrismAffineConfig,
@@ -1338,7 +1338,7 @@ pub(crate) fn encode_q2tp(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8
                 let tile = &row[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
                 let absmax = tile.iter().fold(0f32, |m, v| m.max(v.abs()));
                 dead[g] = absmax == 0.0;
-                lg[g] = f16_scale(absmax / 1.5).log2();
+                lg[g] = det_log2(f16_scale(absmax / 1.5));
                 if !dead[g] {
                     lo = lo.min(lg[g]);
                     hi = hi.max(lg[g]);
@@ -1367,7 +1367,7 @@ pub(crate) fn encode_q2tp(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8
                 }
                 params[0..2].copy_from_slice(&lo_h.to_le_bytes());
                 params[2..4].copy_from_slice(&st_h.to_le_bytes());
-                q2tp_ladder(params, 0)
+                det_q2tp_ladder(params, 0)
             };
             let mut tab = ladder_for(hi, params_row);
             if search && hi > lo_r {
@@ -1483,6 +1483,92 @@ pub(crate) fn encode_q2tp(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8
     chunks
 }
 
+/// `log2` for the ladder encoders in plain f64 IEEE arithmetic. The
+/// platform libm (macOS vs glibc) disagrees in the last bit on some inputs,
+/// which flips near-tie rung choices: the same source packed to different
+/// q4tp bytes on aarch64 and x86_64. Basic IEEE operations are correctly
+/// rounded everywhere and Rust never contracts them, so this is the same on
+/// every machine. Accurate to well under an f32 ulp.
+pub(crate) fn det_log2(x: f32) -> f32 {
+    if x.is_nan() || x < 0.0 {
+        return f32::NAN;
+    }
+    if x == 0.0 {
+        return f32::NEG_INFINITY;
+    }
+    if x.is_infinite() {
+        return f32::INFINITY;
+    }
+    // x = m · 2^e with m in [1, 2) (subnormals normalised through f64)
+    let d = x as f64;
+    let bits = d.to_bits();
+    let e = ((bits >> 52) & 0x7ff) as i64 - 1023;
+    let m = f64::from_bits((bits & ((1u64 << 52) - 1)) | (1023u64 << 52));
+    // ln m = 2·atanh(t), t = (m − 1)/(m + 1) ∈ [0, 1/3)
+    let t = (m - 1.0) / (m + 1.0);
+    let t2 = t * t;
+    let mut term = t;
+    let mut sum = 0.0f64;
+    let mut k = 1.0f64;
+    for _ in 0..24 {
+        sum += term / k;
+        term *= t2;
+        k += 2.0;
+    }
+    let ln_m = 2.0 * sum;
+    (e as f64 + ln_m * std::f64::consts::LOG2_E) as f32
+}
+
+/// `exp2` for the ladder encoders, same reasoning as [`det_log2`].
+pub(crate) fn det_exp2(y: f32) -> f32 {
+    if y.is_nan() {
+        return f32::NAN;
+    }
+    if y > 128.0 {
+        return f32::INFINITY;
+    }
+    if y < -160.0 {
+        return 0.0;
+    }
+    let yd = y as f64;
+    let n = yd.floor();
+    let f = yd - n; // [0, 1)
+    // 2^f = e^(f·ln 2), Taylor to f64 precision (|z| < 0.7)
+    let z = f * std::f64::consts::LN_2;
+    let mut term = 1.0f64;
+    let mut sum = 1.0f64;
+    for k in 1..=24 {
+        term *= z / k as f64;
+        sum += term;
+    }
+    // exact scaling by 2^n (n in [-160, 128], within the f64 normal range)
+    let scale = f64::from_bits(((n as i64 + 1023) as u64) << 52);
+    (sum * scale) as f32
+}
+
+/// `q4tp_ladder` with [`det_exp2`]: the rung table the encoders choose codes
+/// against (the runtime keeps the core ladder; the two differ by at most an
+/// ulp, which only matters to the encoder's near-tie choices).
+fn det_q4tp_ladder(params: &[u8], r: usize) -> [f32; 32] {
+    let lo = f16_to_f32(u16::from_le_bytes([params[r * 4], params[r * 4 + 1]]));
+    let st = f16_to_f32(u16::from_le_bytes([params[r * 4 + 2], params[r * 4 + 3]]));
+    let ratio = det_exp2(st);
+    let mut t = [0f32; 32];
+    t[0] = det_exp2(lo);
+    for c in 1..32 {
+        t[c] = t[c - 1] * ratio;
+    }
+    t
+}
+
+/// `q2tp_ladder` over [`det_q4tp_ladder`] (rung 0 = the exact zero).
+fn det_q2tp_ladder(params: &[u8], r: usize) -> [f32; 32] {
+    let base = det_q4tp_ladder(params, r);
+    let mut t = [0f32; 32];
+    t[1..32].copy_from_slice(&base[..31]);
+    t
+}
+
 pub(crate) fn encode_q4tp(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8> {
     debug_assert_eq!(vals.len(), out_dim * in_dim);
     debug_assert_eq!(in_dim % GROUP_SIZE, 0);
@@ -1511,7 +1597,7 @@ pub(crate) fn encode_q4tp(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8
                 // it out of the row's range — otherwise `f16_scale`'s tiny floor
                 // stretches the ladder and coarsens every live tile in the row.
                 dead[g] = absmax == 0.0;
-                lg[g] = f16_scale(absmax / 7.0).log2();
+                lg[g] = det_log2(f16_scale(absmax / 7.0));
                 if !dead[g] {
                     lo = lo.min(lg[g]);
                     hi = hi.max(lg[g]);
@@ -1539,7 +1625,7 @@ pub(crate) fn encode_q4tp(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8
             params_row[2..4].copy_from_slice(&st_h.to_le_bytes());
 
             let st = f16_to_f32(st_h);
-            let tab = q4tp_ladder(params_row, 0);
+            let tab = det_q4tp_ladder(params_row, 0);
             let crow = &mut *codes_row;
             for g in 0..gpr {
                 let nominal = if dead[g] || st <= 0.0 {
@@ -2524,7 +2610,7 @@ fn encode_mlx_q2tp_affine(
                     return;
                 }
                 source_scales[g] = s;
-                let lg = s.log2();
+                let lg = det_log2(s);
                 lo = lo.min(lg);
                 hi = hi.max(lg);
             }
@@ -2540,13 +2626,13 @@ fn encode_mlx_q2tp_affine(
             }
             params_row[..2].copy_from_slice(&lo_h.to_le_bytes());
             params_row[2..].copy_from_slice(&st_h.to_le_bytes());
-            let tab = q2tp_ladder(params_row, 0);
+            let tab = det_q2tp_ladder(params_row, 0);
             let st = f16_to_f32(st_h);
             for g in 0..gpr {
                 // Rung zero is reserved for an exact zero group in dtype16;
                 // source ternary scales are positive, so use 1..=31.
                 let c = if st > 0.0 {
-                    1 + ((source_scales[g].log2() - lo_r) / st)
+                    1 + ((det_log2(source_scales[g]) - lo_r) / st)
                         .round_ties_even()
                         .clamp(0.0, Q2TP_LMAX as f32) as usize
                 } else {
@@ -7314,6 +7400,31 @@ pub(crate) fn q2tp_expert_gate_or_up(name: &str) -> bool {
 pub(crate) mod tests {
     use super::*;
     use cortiq_core::format::CmfModel;
+
+    #[test]
+    fn deterministic_log2_exp2_track_std_to_an_ulp() {
+        let ulp = |a: f32, b: f32| (a.to_bits() as i64 - b.to_bits() as i64).abs();
+        let mut x = 1.0e-9f32;
+        while x < 1.0e9 {
+            assert!(ulp(det_log2(x), x.log2()) <= 1 || (det_log2(x) - x.log2()).abs() < 1e-7, "log2({x})");
+            x *= 1.37;
+        }
+        let mut y = -40.0f32;
+        while y < 40.0 {
+            assert!(ulp(det_exp2(y), y.exp2()) <= 1, "exp2({y})");
+            y += 0.173;
+        }
+        // exact on integers and on the special values
+        assert_eq!(det_exp2(-3.0), 0.125);
+        assert_eq!(det_log2(8.0), 3.0);
+        assert_eq!(det_log2(0.0), f32::NEG_INFINITY);
+        // the core ladder and the encoder's agree to an ulp per rung
+        let params = [0x00u8, 0xbc, 0x66, 0x2e]; // lo = −1.0, step ≈ 0.1
+        let (a, b) = (det_q4tp_ladder(&params, 0), cortiq_core::quant::q4tp_ladder(&params, 0));
+        for c in 0..32 {
+            assert!(ulp(a[c], b[c]) <= 2, "rung {c}: {} vs {}", a[c], b[c]);
+        }
+    }
 
     #[test]
     fn hf_thread_env_is_bounded_and_keeps_legacy_default() {
