@@ -19,6 +19,14 @@
 //!   144 → 192, 4 → 64: zero weights, zero γ), and a GEMM whose padded
 //!   output width is not a multiple of 128 uses a 128×64 tile.
 //!
+//! Measured (RTX PRO 4000 Blackwell): the 1024² decode 0.49–0.64 s plus
+//! 0.26–0.47 s for the weights (f16 planes, once per model) against 43 s
+//! for the per-conv path; 256² 0.11 s. u8 PSNR against the per-conv path
+//! 67.4 dB at 1024²; against the fp32 diffusers decoder at 256² 66.0 dB
+//! (the per-conv path: 69.1 dB). The 1024² activations take 5.5 GB; at
+//! 2048² one of them (5.4 GB) exceeds the 2 GB binding limit and the chain
+//! declines (the per-conv path runs).
+//!
 //! Knob: `CMF_QI21_VAE_CHAIN=0` (the per-conv path).
 
 use crate::gpu::{Qi21VaeConvRef, Qi21VaeDecodeArgs, Qi21VaeResRef};
@@ -33,11 +41,11 @@ fn enabled() -> bool {
 
 fn decline(reason: &str) -> bool {
     static SAID: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    if let Ok(mut v) = SAID.lock() {
-        if !v.iter().any(|r| r == reason) {
-            eprintln!("qwen-image-2.1: resident VAE decoder declined: {reason}; the per-conv path runs");
-            v.push(reason.to_string());
-        }
+    if let Ok(mut v) = SAID.lock()
+        && !v.iter().any(|r| r == reason)
+    {
+        eprintln!("qwen-image-2.1: resident VAE decoder declined: {reason}; the per-conv path runs");
+        v.push(reason.to_string());
     }
     false
 }
@@ -325,7 +333,7 @@ fn grid1(n: usize) -> (u32, u32, u32) {
 #[allow(clippy::too_many_arguments)]
 fn mmc(c: &Ctx, g: MmCfg, w: [u32; 12], plane: &wgpu::Buffer, act: &wgpu::Buffer, out: &wgpu::Buffer, out_off: Option<(u64, u64)>) -> Option<MmCall> {
     let (m, n, k) = (w[0], w[1], w[2]);
-    if n % g.bn != 0 || k % g.bk != 0 {
+    if !n.is_multiple_of(g.bn) || !k.is_multiple_of(g.bk) {
         return None;
     }
     let pipe = zi::mm_pipe(c, g)?;
@@ -345,7 +353,7 @@ fn mmc(c: &Ctx, g: MmCfg, w: [u32; 12], plane: &wgpu::Buffer, act: &wgpu::Buffer
 /// The GEMM tile of a conv writing `cout_p` channels (128×128 when it
 /// divides, else 128×64).
 fn tile(cout_p: usize, conv: u32, epi: Epi) -> MmCfg {
-    let bn = if cout_p % 128 == 0 { 128 } else { 64 };
+    let bn = if cout_p.is_multiple_of(128) { 128 } else { 64 };
     MmCfg { conv, ..MmCfg::new(128, bn, 32, 2, 2, epi) }
 }
 
@@ -456,7 +464,7 @@ fn attention(r: &mut Rec, v: &QVae, b: &Bufs, m: usize) -> Option<()> {
     let cc = v.ac;
     let cp = cpad(cc);
     let mp = mp_of(m);
-    if cp != cc || cc % 128 != 0 {
+    if cp != cc || !cc.is_multiple_of(128) {
         return None;
     }
     r.rmsn(&b.x, None, &v.ag, cc, cp, m, false, &b.xn)?;
@@ -628,7 +636,7 @@ pub(crate) fn decode(a: &Qi21VaeDecodeArgs, z: &[f32], h0: usize, w0: usize, out
                 let (m2, mp2) = (hh * ww, mp_of(hh * ww));
                 r.combine(&bufs.x, &bufs.h, &cv.bias, None, 2, mp2 * ch, ch)?;
                 let factor = ft * 4;
-                if (u.out_dim * factor) % u.in_dim != 0 {
+                if !(u.out_dim * factor).is_multiple_of(u.in_dim) {
                     return None;
                 }
                 let repeats = u.out_dim * factor / u.in_dim;
