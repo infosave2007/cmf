@@ -12,6 +12,7 @@ fn max_err(a: &[f32], b: &[f32]) -> f32 {
 }
 
 #[test]
+#[ignore = "requires an Apple Silicon Metal device"]
 fn gdn_parallel_matches_serial_and_repeats() {
     let Some(c) = ctx() else { return };
     const B: usize = 2;
@@ -124,9 +125,7 @@ fn gdn_parallel_matches_serial_and_repeats() {
     assert!(max_err(&v0.to_vec(), &v1.to_vec()) == 0.0);
     assert!(max_err(&b0.to_vec(), &b1.to_vec()) == 0.0);
     assert!(max_err(&r0.to_vec(), &r1.to_vec()) < 1e-5);
-    // Serial vs parallel lane: equal up to f32 rounding (a paravirtual Metal
-    // device does not promise bit-identical results across dispatch shapes).
-    assert!(max_err(&i0.to_vec(), &i1.to_vec()) < 1e-5);
+    assert!(max_err(&i0.to_vec(), &i1.to_vec()) == 0.0);
     assert!(max_err(&o0.to_vec(), &o1.to_vec()) < 5e-5);
     assert!(max_err(&s0.to_vec(), &s1.to_vec()) < 5e-6);
     assert!(max_err(&r1.to_vec(), &r2.to_vec()) < 5e-6);
