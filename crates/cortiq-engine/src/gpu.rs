@@ -3927,6 +3927,9 @@ pub fn qi21_prefill(a: &Qi21PrefillArgs) -> bool {
     match backend() {
         #[cfg(target_os = "macos")]
         Backend::Metal => crate::gpu_metal::qi21::prefill(a),
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::qi21::prefill(a),
+        #[allow(unreachable_patterns)]
         _ => false,
     }
 }
@@ -3937,27 +3940,33 @@ pub fn qi21_step(key: u64, xtok: &[f32], mods: &[f32], fs: &[f32], out: &mut [f3
     match backend() {
         #[cfg(target_os = "macos")]
         Backend::Metal => crate::gpu_metal::qi21::step(key, xtok, mods, fs, out),
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::qi21::step(key, xtok, mods, fs, out),
+        #[allow(unreachable_patterns)]
         _ => false,
     }
 }
 
-/// Drop program `key`.
+/// Drop program `key`. The wgpu module is released directly (module-local
+/// state only), so a release never brings a device up.
 #[allow(unused_variables)]
 pub fn qi21_release_key(key: u64) {
-    match backend() {
-        #[cfg(target_os = "macos")]
-        Backend::Metal => crate::gpu_metal::qi21::release_key(key),
-        _ => {}
+    #[cfg(target_os = "macos")]
+    if matches!(backend(), Backend::Metal) {
+        crate::gpu_metal::qi21::release_key(key);
     }
+    #[cfg(feature = "gpu")]
+    crate::gpu_wgpu::qi21::release_key(key);
 }
 
-/// Drop the denoiser's device state.
+/// Drop the denoiser's device state (see `qi21_release_key`).
 pub fn qi21_release() {
-    match backend() {
-        #[cfg(target_os = "macos")]
-        Backend::Metal => crate::gpu_metal::qi21::release(),
-        _ => {}
+    #[cfg(target_os = "macos")]
+    if matches!(backend(), Backend::Metal) {
+        crate::gpu_metal::qi21::release();
     }
+    #[cfg(feature = "gpu")]
+    crate::gpu_wgpu::qi21::release();
 }
 
 /// One Z-Image transformer block's device inputs (noise refiner, context
