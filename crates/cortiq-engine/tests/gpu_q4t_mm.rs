@@ -66,6 +66,10 @@ fn gpu_q4t_matmat_matches_dequant_reference() {
         shard: None,
         calibration: None,
         routing: None,
+        genome: None,
+        lineage: Vec::new(),
+        router: None,
+        segments: Vec::new(),
     };
     let spec = TensorSpec {
         name: "w".into(),
@@ -198,6 +202,10 @@ fn gpu_q4t_ffn_matches_dequant_reference() {
         shard: None,
         calibration: None,
         routing: None,
+        genome: None,
+        lineage: Vec::new(),
+        router: None,
+        segments: Vec::new(),
     };
     let spec = |name: &str, rows: usize, cols: usize, data: &[u8]| TensorSpec {
         name: name.into(),

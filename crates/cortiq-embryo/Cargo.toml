@@ -18,8 +18,8 @@ name = "cortiq-embryo"
 path = "src/main.rs"
 
 [dependencies]
-cortiq-core = { path = "../cortiq-core", version = "0.8.0" }
-cortiq-engine = { path = "../cortiq-engine", version = "0.8.0", default-features = false }
+cortiq-core = { path = "../cortiq-core", version = "0.8.1" }
+cortiq-engine = { path = "../cortiq-engine", version = "0.8.1", default-features = false }
 anyhow = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
@@ -27,6 +27,8 @@ serde_json = { workspace = true }
 fancy-regex = { workspace = true }
 base64 = { workspace = true }
 flate2 = "1"
+# sha256 of every input a skill record was baked from (origin.dataset_sha256)
+sha2 = "0.10"
 # Corpus readers for the birth data (FineWeb parquet, C4 json.gz). Optional:
 # the trainer itself needs neither.
 parquet = { version = "59", default-features = false, features = ["snap", "zstd", "brotli", "flate2-rust_backend", "lz4"], optional = true }
@@ -34,6 +36,23 @@ parquet = { version = "59", default-features = false, features = ["snap", "zstd"
 [features]
 default = []
 data = ["dep:parquet"]
+# Native NVIDIA/AMD/Intel training backend.  This is deliberately opt-in so
+# the portable CPU/reference/export build remains dependency-free; on Linux
+# wgpu is forced to Vulkan by the backend probe.
+vulkan = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+
+[dependencies.wgpu]
+version = "30"
+optional = true
+
+[dependencies.pollster]
+version = "0.4"
+optional = true
+
+[dependencies.bytemuck]
+version = "1"
+optional = true
+features = ["derive"]
 
 # The training kernels are Metal (Apple Silicon: unified memory, simdgroup
 # matrices). Everything else in the crate — the model, the CPU reference

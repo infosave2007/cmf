@@ -14,22 +14,35 @@
 
 #[cfg(target_os = "macos")]
 pub mod bench;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", feature = "vulkan"))]
 pub mod cli;
 pub mod corpus;
 pub mod data;
 pub mod export;
-#[cfg(target_os = "macos")]
+#[cfg(all(feature = "vulkan", not(target_os = "macos")))]
+pub mod gdn_wy;
+#[cfg(any(target_os = "macos", feature = "vulkan"))]
 pub mod growth;
 #[cfg(target_os = "macos")]
 pub mod metal;
+#[cfg(all(feature = "vulkan", not(target_os = "macos")))]
+#[path = "vulkan.rs"]
+pub mod metal;
+// Compile the Vulkan implementation on macOS when the opt-in feature is
+// selected as well.  The public backend remains Metal on Apple platforms,
+// but keeping this private validation module in the build catches WGSL/Rust
+// seam drift before the Linux/NVIDIA job.
 pub mod model;
 #[cfg(target_os = "macos")]
 pub mod mtp;
 pub mod ops;
-#[cfg(target_os = "macos")]
+pub mod sft;
+#[cfg(any(target_os = "macos", feature = "vulkan"))]
 pub mod skill;
 #[cfg(target_os = "macos")]
 pub mod sleep;
 pub mod tokenizer;
 pub mod train;
+#[cfg(all(feature = "vulkan", target_os = "macos"))]
+#[path = "vulkan.rs"]
+mod vulkan_validation;

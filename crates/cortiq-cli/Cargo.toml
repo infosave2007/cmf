@@ -30,12 +30,12 @@ gpu = ["cortiq-engine/gpu", "decision-vulkan"]
 [dependencies]
 libc = "0.2"
 base64 = { workspace = true }
-cortiq-core = { path = "../cortiq-core", version = "0.8.0" }
-cortiq-engine = { path = "../cortiq-engine", version = "0.8.0" }
-cortiq-net = { path = "../cortiq-net", version = "0.8.0" }
-cortiq-server = { path = "../cortiq-server", version = "0.8.0" }
+cortiq-core = { path = "../cortiq-core", version = "0.8.1" }
+cortiq-engine = { path = "../cortiq-engine", version = "0.8.1" }
+cortiq-net = { path = "../cortiq-net", version = "0.8.1" }
+cortiq-server = { path = "../cortiq-server", version = "0.8.1" }
 # `cortiq decide` / `cortiq decision …` and the decision branch of serve.
-cortiq-decision = { path = "../cortiq-decision", version = "0.8.0" }
+cortiq-decision = { path = "../cortiq-decision", version = "0.8.1" }
 clap = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
@@ -56,3 +56,6 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 [dev-dependencies]
 # Decision CLI tests: scratch model and state directories.
 tempfile = "3"
+# Router v2 parity (R7): the runtime tokenizes a user message exactly as
+# the trainer's BPE does (`Bpe::encode`, no special-token matching).
+cortiq-embryo = { path = "../cortiq-embryo" }

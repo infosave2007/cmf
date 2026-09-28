@@ -73,3 +73,31 @@ pub fn record_if_ood(
     }
     best
 }
+
+/// Router-v2 twin of [`record_if_ood`]: the decision was already made on
+/// the dedicated probe pipeline (no second φ prefill, no reset of the
+/// generation slot's state); a NOVEL request goes to the buffer.
+pub fn record_decision(
+    d: &cortiq_engine::router::RouteDecision,
+    prompt_ids: &[u32],
+    prompt_text: &str,
+) {
+    let Some(dir) = ood_dir() else { return };
+    if !d.routing.is_novel {
+        return;
+    }
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("buffer.jsonl"))
+    {
+        let mut rec = d.summary_json();
+        rec["ts"] = serde_json::json!(unix_now());
+        rec["nearest"] = serde_json::json!(d.nearest_skill());
+        rec["calibrated"] = serde_json::json!(d.routing.calibrated);
+        rec["tokens"] = serde_json::json!(prompt_ids.len());
+        rec["text"] = serde_json::json!(prompt_text);
+        let _ = writeln!(f, "{}", rec);
+    }
+}

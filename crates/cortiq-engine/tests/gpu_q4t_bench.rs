@@ -59,6 +59,10 @@ fn bench_q4t_matmat_ffn_shape() {
         shard: None,
         calibration: None,
         routing: None,
+        genome: None,
+        lineage: Vec::new(),
+        router: None,
+        segments: Vec::new(),
     };
     let spec = TensorSpec {
         name: "w".into(),

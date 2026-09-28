@@ -132,6 +132,9 @@ pub struct Pipeline {
     /// but not yet forwarded). Lets the next generate call prefill only
     /// the suffix when a chat app resends the whole history.
     pub kv_history: Vec<u32>,
+    /// Owner tag of `kv_history`: the resident device graph held that
+    /// sequence (true) or the host did. Reuse continues only on the owner.
+    pub kv_history_device: bool,
     /// KDA geometry (Kimi Linear / Kimi-K3) — shared by every Kda layer.
     pub kda_cfg: Option<crate::linear_core::KdaCfg>,
     /// Gemma-3n stack (AltUp/LAuReL/PLE/KV-sharing): its own forward —
@@ -329,6 +332,15 @@ pub struct Pipeline {
     /// Logits the graph produced for the token just forwarded (taken by
     /// the decode loop; None = compute on the CPU path).
     graph_logits: Option<Vec<f32>>,
+    /// Packed Embryo graph model, built lazily on the first eligible
+    /// resident call so other architectures pay no packing cost.
+    embryo_graph: Option<std::sync::Arc<crate::gpu::EmbryoGraphModel>>,
+    /// This pipeline's token graph refused for a STRUCTURAL reason (its
+    /// own weights / layer kinds): not retried. Per pipeline, never
+    /// process-wide: a skill lane whose pack does not build must not flip
+    /// the backbone slot mid-sequence onto the host path (and a new lane
+    /// must not clear the backbone's verdict) — R4/NF-2.
+    graph_refused: std::sync::atomic::AtomicBool,
     /// Token embeddings are multiplied by this at input (Gemma: √hidden).
     pub embed_multiplier: f32,
     /// Attention score scale (1/√head_dim unless the arch overrides —
@@ -340,6 +352,22 @@ pub struct Pipeline {
     /// Explicit local/global schedule for architectures that cannot be
     /// represented by Gemma's every-Nth-global convention.
     pub sliding_layers: Option<Vec<bool>>,
+    /// Natively bounded anchor record (`arch.anchor_core`): the file's
+    /// operator, installed once at load. `Some` = the model is
+    /// bounded-native — `--o1`/`CMF_O1*` are refused, prefix reuse and
+    /// the penalty window are bounded, and no anchor layer stores
+    /// anything per position.
+    pub anchor_core: Option<cortiq_core::AnchorCoreConfig>,
+    /// The `[W][rd/2]` relative-rotation table every bounded layer shares
+    /// (built from `inv_freq` once the RoPE setup is final).
+    bounded_rope: Option<std::sync::Arc<crate::bounded::BoundedRope>>,
+    /// Bounded prefix-reuse key (length + rolling hash + tail) of a
+    /// bounded-native model; `kv_history` stays empty there so nothing
+    /// in the pipeline grows with the dialogue.
+    pub kv_prefix: KvPrefix,
+    /// Prompt positions the last `generate*` call actually forwarded
+    /// (prefix reuse subtracts what the cache already held).
+    pub last_prefill_tokens: usize,
     /// RoPE table of the sliding (local) layers, when they use their
     /// own base frequency (Gemma-3: 10k local vs 1M global).
     pub inv_freq_local: Option<std::sync::Arc<Vec<f32>>>,
@@ -384,6 +412,16 @@ impl Drop for Pipeline {
         // the async replay writes into `kv_cache` Vecs about to be freed
         let _ = crate::gpu_metal::wait_replay();
         crate::gpu::kv_mirror_drop(self.graph_kv_id);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+impl Drop for Pipeline {
+    fn drop(&mut self) {
+        // The wgpu resident Embryo graph owns recurrent/KV buffers keyed by
+        // this pipeline's sequence id.  Release that sequence image when a
+        // pooled pipeline is dropped; model weights stay cached for reuse.
+        crate::gpu::graph_kv_reset(self.graph_kv_id);
     }
 }
 
@@ -599,6 +637,26 @@ pub struct MoeFfn {
     /// bias_e − ‖(x−μ_e) − U_eᵀU_e(x−μ_e)‖², argmax = the expert whose
     /// descriptor reconstructs the input best. `router` is a placeholder.
     pub resonance: Option<Resonance>,
+    /// Growth records (`kind = "expert_append"`, spec §9.5.1) mounted
+    /// behind the trunk experts, one entry per grown expert IN THE ORDER
+    /// they sit in `experts` (the tail `experts[experts.len() - grown.len()..]`).
+    /// The trunk keeps `experts.len() - grown.len()` experts. Empty on a
+    /// gated MoE, on a file without records and under `CMF_GROWTH=off`.
+    pub grown: Vec<GrownExpert>,
+}
+
+/// One grown expert of an `expert_append` record as the loader mounted it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrownExpert {
+    /// The record's skill id.
+    pub record: String,
+    /// Position of the record in `header.skills`.
+    pub record_index: usize,
+    pub layer: usize,
+    /// The index the tensor name declares (`experts.{e}` — the chain rule
+    /// of the format); the executed position may be smaller when an
+    /// earlier record of the layer is not mounted.
+    pub expert: usize,
 }
 
 /// Per-expert resonance descriptors of one MoE layer (`mlp.desc.*`).
@@ -610,13 +668,78 @@ pub struct Resonance {
     pub k: usize,
     /// [E] selection bias (loss-free balancing, trained online)
     pub bias: Vec<f32>,
+    /// [E] reconstruction-error shell: an expert whose error
+    /// `‖(x−μ)⊥U‖² = d² − proj` exceeds its shell scores `−∞` (it never
+    /// wins). `+inf` = no shell — every trunk expert; a grown expert
+    /// (`expert_append`) carries the finite `desc.shell` its record stores.
+    /// Empty = no shell anywhere (legacy constructors).
+    pub shell: Vec<f32>,
+}
+
+/// `CMF_GROWTH_SHELL` state: 0 = not yet read from the environment, 1 = on,
+/// 2 = off. Process-wide, like the environment it mirrors.
+static GROWTH_SHELL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Is the growth shell applied (`Resonance::scores` −∞ rule, the resident
+/// graph's packed shell)? `CMF_GROWTH_SHELL=off` disables it for
+/// measurement; [`set_growth_shell`] overrides the environment in-process
+/// (`growth-eval --shell`). Default: on.
+pub fn growth_shell_enabled() -> bool {
+    use std::sync::atomic::Ordering;
+    match GROWTH_SHELL.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let off = std::env::var("CMF_GROWTH_SHELL")
+                .map(|v| v.eq_ignore_ascii_case("off") || v == "0")
+                .unwrap_or(false);
+            GROWTH_SHELL.store(if off { 2 } else { 1 }, Ordering::Relaxed);
+            !off
+        }
+    }
+}
+
+/// Switch the growth shell on/off for this process (`None` = re-read
+/// `CMF_GROWTH_SHELL` on the next query). A pipeline packed into the
+/// resident graph BEFORE the switch keeps the shell it was packed with —
+/// build a new pipeline after switching.
+pub fn set_growth_shell(on: Option<bool>) {
+    GROWTH_SHELL.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 impl Resonance {
-    /// Routing scores for one input row (higher = better).
+    /// Does any expert carry a finite shell (a mounted growth record)?
+    pub fn has_shell(&self) -> bool {
+        self.shell.iter().any(|s| s.is_finite())
+    }
+
+    /// The shell the runtime applies right now: the stored one, or all
+    /// `+inf` when the shell is switched off (`CMF_GROWTH_SHELL=off`).
+    pub fn effective_shell(&self, ne: usize) -> Vec<f32> {
+        let mut out = vec![f32::INFINITY; ne];
+        if growth_shell_enabled() {
+            for (o, s) in out.iter_mut().zip(&self.shell) {
+                *o = *s;
+            }
+        }
+        out
+    }
+
+    /// Routing scores for one input row (higher = better). A grown
+    /// expert whose reconstruction error lies outside its shell gets
+    /// `−∞` (unless the shell is switched off); trunk rows are the exact
+    /// bit pattern they were before growth.
     pub fn scores(&self, x: &[f32], out: &mut [f32]) {
         let h = x.len();
         let ne = out.len();
+        let shell_on = growth_shell_enabled() && !self.shell.is_empty();
         for e in 0..ne {
             let mu = &self.mu[e * h..(e + 1) * h];
             let mut d2 = 0.0f32;
@@ -633,7 +756,11 @@ impl Resonance {
                 }
                 proj += p * p;
             }
-            out[e] = self.bias.get(e).copied().unwrap_or(0.0) - (d2 - proj);
+            let err = d2 - proj;
+            out[e] = self.bias.get(e).copied().unwrap_or(0.0) - err;
+            if shell_on && err > self.shell.get(e).copied().unwrap_or(f32::INFINITY) {
+                out[e] = f32::NEG_INFINITY;
+            }
         }
     }
 }
@@ -676,6 +803,11 @@ pub enum AttnKind {
     /// delta rule, separate q/k/v short convs, sigmoid-gated output norm.
     /// State lives in the layer's `linear_state` (no KV cache).
     Kda(Box<crate::linear_core::KdaWeights>),
+    /// Natively bounded softmax anchor `swa_sink_v1` (Embryo-O1): ring of
+    /// the last W raw keys with relative RoPE + trained NoPE sinks, one
+    /// softmax. State is the fixed-size ring in `LayerKvCache::bounded`;
+    /// nothing is stored per position (see `crate::bounded`).
+    Bounded(Box<crate::bounded::BoundedWeights>),
 }
 
 /// DeepSeek-V2 MLA projections (see `AttnKind::Mla`).
@@ -947,6 +1079,110 @@ impl SpecMon {
             return true;
         }
         self.metal && n >= 2 && t0.elapsed().as_secs_f64() * 1e3 >= SPEC_PLAIN_MIN_MS
+    }
+}
+
+/// Ids of the consumed prefix the bounded reuse key remembers literally
+/// (the rest is covered by the rolling hash).
+pub const KV_PREFIX_TAIL: usize = 128;
+
+/// Bounded prefix-reuse key: how many ids the cache holds, a rolling
+/// hash of ALL of them and the last [`KV_PREFIX_TAIL`] ids literally.
+/// Answers "does this prompt strictly extend what is cached" exactly
+/// (hash over the whole consumed prefix + literal tail) without keeping
+/// the dialogue — the record is a fixed size whatever the session length.
+#[derive(Debug, Clone, Default)]
+pub struct KvPrefix {
+    len: usize,
+    hash: u64,
+    tail: Vec<u32>,
+    /// Owner of the state this key describes: the resident device graph
+    /// (true) or the host. A turn continues the prefix only on its owner
+    /// (R4: a host continuation of a device sequence reads an empty host
+    /// state; a device continuation of a host sequence has no image).
+    device: bool,
+}
+
+impl KvPrefix {
+    #[inline]
+    fn fold(mut h: u64, ids: &[u32]) -> u64 {
+        for &id in ids {
+            h ^= id as u64;
+            h = h.wrapping_mul(0x100000001b3);
+            h ^= h >> 29;
+        }
+        h
+    }
+
+    pub fn clear(&mut self) {
+        self.len = 0;
+        self.hash = 0xcbf29ce484222325;
+        self.tail.clear();
+        self.device = false;
+    }
+
+    /// Was the prefix built on the resident device graph?
+    pub fn on_device(&self) -> bool {
+        self.device
+    }
+
+    /// Tag the owner of the recorded prefix.
+    pub fn set_on_device(&mut self, device: bool) {
+        self.device = device;
+    }
+
+    /// Ids the cache holds (the forwarded prefix).
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Literal tail currently kept (≤ `KV_PREFIX_TAIL`).
+    pub fn tail_len(&self) -> usize {
+        self.tail.len()
+    }
+
+    /// Replace the key with `ids` (a fresh sequence).
+    pub fn set(&mut self, ids: &[u32]) {
+        self.clear();
+        self.extend(ids);
+    }
+
+    /// Append `more` to the consumed prefix (an extension-only turn).
+    pub fn extend(&mut self, more: &[u32]) {
+        if self.len == 0 && self.hash == 0 {
+            self.hash = 0xcbf29ce484222325;
+        }
+        self.hash = Self::fold(self.hash, more);
+        self.len += more.len();
+        if more.len() >= KV_PREFIX_TAIL {
+            self.tail.clear();
+            self.tail.extend_from_slice(&more[more.len() - KV_PREFIX_TAIL..]);
+        } else {
+            let drop = (self.tail.len() + more.len()).saturating_sub(KV_PREFIX_TAIL);
+            self.tail.drain(..drop);
+            self.tail.extend_from_slice(more);
+        }
+    }
+
+    /// Cached positions when `ids` strictly extends the consumed prefix,
+    /// 0 otherwise. The tail is compared literally first (cheap), then
+    /// the hash over the whole prefix must agree.
+    pub fn extension(&self, ids: &[u32]) -> usize {
+        if self.len == 0 || ids.len() <= self.len {
+            return 0;
+        }
+        let t = self.tail.len();
+        if ids[self.len - t..self.len] != self.tail[..] {
+            return 0;
+        }
+        if Self::fold(0xcbf29ce484222325, &ids[..self.len]) != self.hash {
+            return 0;
+        }
+        self.len
     }
 }
 
@@ -1288,7 +1524,10 @@ impl Pipeline {
         #[cfg(target_os = "macos")]
         let _ = crate::gpu_metal::wait_replay();
         self.kv_cache.clear();
-        self.kv_history.clear();
+        // Both reuse keys (the legacy `kv_history` and the bounded
+        // `kv_prefix`) describe the state being dropped here.
+        self.clear_history();
+        self.graph_logits = None;
         if let Some(b) = &mut self.dsv41 {
             b.3.clear();
         }
@@ -1662,7 +1901,7 @@ impl Pipeline {
         };
         crate::gpu::wgpu_graph_on(crate::gpu::GraphPhase::Prefill)
             && crate::gpu::enabled_here()
-            && !crate::gpu::graph_unsupported()
+            && !self.graph_refused()
             && (forced || self.graph_attn_decline_reason().is_some())
             && self.wgpu_graph_attn_decline().is_none()
             && self.attn_softcap == 0.0
@@ -1686,6 +1925,16 @@ impl Pipeline {
         let graph_on = crate::gpu::wgpu_graph_on(crate::gpu::GraphPhase::Prefill);
         if !graph_on || !crate::gpu::enabled_here() {
             return false;
+        }
+        // Embryo's phase state is device-owned by the resident graph during
+        // prefill; the batched CPU path would leave decode seeing a zeroed
+        // device recurrence.  Route the prompt position-by-position too.
+        if self.embryo_resident_eligible() {
+            // The resident graph owns the phase state and anchor KV on the
+            // device.  A prefill-only graph would leave decode on the host
+            // with no way to import that state, so keep the whole sequence
+            // on one owner (or use the ordinary CPU prefill/decode pair).
+            return crate::gpu::wgpu_graph_on(crate::gpu::GraphPhase::Decode);
         }
         // The descriptor-aware Prism graph now carries both the FWHT/affine
         // transforms and resident GDN state, so it is also the exact prefill
@@ -2689,6 +2938,7 @@ impl Pipeline {
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             graph_failed: std::sync::atomic::AtomicBool::new(false),
             kv_history: Vec::new(),
+            kv_history_device: false,
             short_conv_cfg: None,
             mtp: None,
             mimo_mtp: None,
@@ -2732,6 +2982,10 @@ impl Pipeline {
             attn_scale: 1.0 / (head_dim as f32).sqrt(),
             swa: None,
             sliding_layers: None,
+            anchor_core: None,
+            bounded_rope: None,
+            kv_prefix: KvPrefix::default(),
+            last_prefill_tokens: 0,
             inv_freq_local: None,
             rotary_dim_local: None,
             rope_scale: 1.0,
@@ -2746,6 +3000,8 @@ impl Pipeline {
             graph_want_logits: false,
             graph_head_required: false,
             graph_logits: None,
+            embryo_graph: None,
+            graph_refused: std::sync::atomic::AtomicBool::new(false),
             graph_kv_id: {
                 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -2765,16 +3021,51 @@ impl Pipeline {
     /// the O(1) state. Teacher-forced scoring (`ppl_ids`) intentionally
     /// stays exact.
     pub fn set_o1(&mut self, cfg: Option<crate::nystrom::O1Cfg>) {
+        if let Err(e) = self.try_set_o1(cfg) {
+            tracing::error!("{e}");
+        }
+    }
+
+    /// True when the file carries a native bounded anchor
+    /// (`arch.anchor_core`): its state is a fixed record the header
+    /// fixes, and the post-hoc O(1) override is meaningless on it.
+    pub fn bounded_native(&self) -> bool {
+        self.anchor_core.is_some()
+    }
+
+    /// Bytes the resident device graph holds for this pipeline's sequence:
+    /// `(recurrent state, anchor KV/ring)`; None on the host path.
+    pub fn device_state_bytes(&self) -> Option<(u64, u64)> {
+        crate::gpu::embryo_device_state_bytes(self.graph_kv_id)
+    }
+
+    /// Why an O(1) override is refused on this pipeline, if it is.
+    pub fn o1_refusal(&self) -> Option<String> {
+        self.anchor_core.as_ref().map(|ac| {
+            format!(
+                "--o1 / CMF_O1 refused: the anchor is native bounded \
+                 (anchor_core kind={} window={} sink={}); the file's operator \
+                 is executed as-is and no post-hoc Nyström overlay applies",
+                ac.kind, ac.window, ac.sink
+            )
+        })
+    }
+
+    /// `set_o1` that reports the refusal instead of logging it.
+    pub fn try_set_o1(&mut self, cfg: Option<crate::nystrom::O1Cfg>) -> Result<(), String> {
         if let Some(c) = &cfg {
+            if let Some(why) = self.o1_refusal() {
+                self.o1_flags = Vec::new();
+                self.o1_cfg = None;
+                return Err(why);
+            }
             if crate::nystrom::o1_deferred_boundary(c.w, c.sink).is_none() {
-                tracing::error!(
-                    "o1 disabled: w + sink + slack + 1 overflows usize (w={}, sink={})",
-                    c.w,
-                    c.sink
-                );
                 self.o1_flags.clear();
                 self.o1_cfg = None;
-                return;
+                return Err(format!(
+                    "o1 disabled: w + sink + slack + 1 overflows usize (w={}, sink={})",
+                    c.w, c.sink
+                ));
             }
         }
         self.o1_flags = match &cfg {
@@ -2813,6 +3104,200 @@ impl Pipeline {
             );
         }
         self.o1_cfg = cfg;
+        Ok(())
+    }
+
+    /// Install the file's bounded anchor: one fixed-size ring per
+    /// `AttnKind::Bounded` layer (from the header, not per prompt) and
+    /// the shared relative-rotation table. Must run after the RoPE setup
+    /// (`set_rotary`, YaRN) so the table is built from the final
+    /// `inv_freq`.
+    pub fn install_bounded(
+        &mut self,
+        cfg: &cortiq_core::AnchorCoreConfig,
+    ) -> Result<(), String> {
+        if !cortiq_core::AnchorCoreConfig::KINDS.contains(&cfg.kind.as_str()) {
+            return Err(format!(
+                "anchor_core kind '{}' is not executable by this runtime",
+                cfg.kind
+            ));
+        }
+        if cfg.window == 0 {
+            return Err("anchor_core.window must be >= 1".into());
+        }
+        let mut n = 0usize;
+        for li in 0..self.num_layers {
+            let pl = self.phys_layer(li);
+            if let AttnKind::Bounded(w) = &self.weights.layers[pl].attn {
+                if w.window != cfg.window || w.sink != cfg.sink {
+                    return Err(format!(
+                        "layer {li}: bounded weights (window {} sink {}) disagree with \
+                         anchor_core (window {} sink {})",
+                        w.window, w.sink, cfg.window, cfg.sink
+                    ));
+                }
+                self.kv_cache.layers[li].install_bounded(cfg.window);
+                n += 1;
+            }
+        }
+        if n == 0 {
+            return Err("anchor_core is present but no layer executes it".into());
+        }
+        let rope = crate::bounded::BoundedRope::new(cfg.window, &self.inv_freq, self.rope_scale);
+        self.bounded_rope = Some(std::sync::Arc::new(rope));
+        self.anchor_core = Some(cfg.clone());
+        self.embryo_graph = None;
+        tracing::info!(
+            "bounded anchor {}: {n} layer(s), window {} sink {} — {} B of ring per layer",
+            cfg.kind,
+            cfg.window,
+            cfg.sink,
+            self.kv_cache.layers.iter().map(|l| l.bounded_state_bytes()).max().unwrap_or(0)
+        );
+        Ok(())
+    }
+
+    /// Tag every layer's cache with its wire record kind and the model's
+    /// operator identity (hash64 of `linear_core_identity` JSON) so the
+    /// versioned state wire refuses a peer holding another operator.
+    pub fn install_wire_identity(&mut self, identity: u64) {
+        for li in 0..self.kv_cache.layers.len() {
+            let pl = self.phys_layer(li);
+            let kind = match self.weights.layers.get(pl).map(|l| &l.attn) {
+                Some(AttnKind::Bounded(_)) => crate::kv_cache::WireKind::Bounded,
+                Some(AttnKind::Linear(_))
+                | Some(AttnKind::LinearGdn(_))
+                | Some(AttnKind::ShortConv(_))
+                | Some(AttnKind::Kda(_)) => crate::kv_cache::WireKind::Linear,
+                _ => crate::kv_cache::WireKind::Full,
+            };
+            let l = &mut self.kv_cache.layers[li];
+            l.wire_kind = kind;
+            l.wire_identity = identity;
+            // A per-layer geometry (`set_attn_geometry`, Gemma's global
+            // heads) rebuilds a layer cache with index 0: re-tag it.
+            l.wire_layer = li as u32;
+        }
+    }
+
+    /// Forget the reuse keys (legacy `kv_history` and the bounded prefix).
+    pub fn clear_history(&mut self) {
+        self.kv_history.clear();
+        self.kv_history_device = false;
+        self.kv_prefix.clear();
+    }
+
+    /// Did THIS pipeline's token graph refuse for a structural reason?
+    /// (Per pipeline: another lane's refusal, or a new pipeline of the
+    /// same model, never changes it.)
+    pub fn graph_refused(&self) -> bool {
+        self.graph_refused
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Remember a structural refusal of this pipeline's token graph.
+    pub fn mark_graph_refused(&self) {
+        if !self
+            .graph_refused
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            tracing::info!(
+                "token graph: unsupported for this pipeline (seq {}) — not retrying",
+                self.graph_kv_id
+            );
+        }
+    }
+
+    /// Position the resident Embryo graph holds for this pipeline's
+    /// sequence (`Some(next position)`), `None` when the device holds no
+    /// image of it (host-owned sequence, or none started).
+    pub fn device_sequence_position(&self) -> Option<usize> {
+        crate::gpu::embryo_device_next_position(self.graph_kv_id)
+    }
+
+    /// Is the sequence this pipeline's reuse key describes owned by the
+    /// device path it would take now? A prefix recorded on the resident
+    /// graph continues only there (at exactly `n`), a host prefix only on
+    /// the host; any mismatch means the next turn re-prefills from zero.
+    fn prefix_owner_matches(&self, n: usize, recorded_on_device: bool) -> bool {
+        let dev = self.device_sequence_position();
+        if recorded_on_device {
+            dev == Some(n) && self.embryo_resident_wanted()
+        } else {
+            dev.is_none()
+        }
+    }
+
+    /// The weights under the sequence changed (a real skill switch): every
+    /// cached state was computed by other weights. Clear the host KV /
+    /// ring / recurrent state AND the reuse keys — a surviving `kv_prefix`
+    /// would let the next turn "extend" a prefix the new weights never
+    /// saw — drop the packed resident graph (it holds the old FFN
+    /// tensors; the next build packs the live ones under a fresh id) and
+    /// reset its device sequence.
+    pub(crate) fn invalidate_for_weight_change(&mut self) {
+        self.clear_sequence_state();
+        self.embryo_graph = None;
+    }
+
+    /// Prompt positions the cache already holds when `input_ids`
+    /// strictly EXTENDS the consumed prefix (0 otherwise). Bounded-native
+    /// models answer from the fixed-size `kv_prefix` record; everything
+    /// else from the legacy `kv_history` vector (which the network split
+    /// also reads and writes).
+    fn cached_prefix_len(&self, input_ids: &[u32]) -> usize {
+        let (n, on_device) = if self.bounded_native() {
+            (self.kv_prefix.extension(input_ids), self.kv_prefix.on_device())
+        } else {
+            let h = &self.kv_history;
+            if !h.is_empty() && h.len() < input_ids.len() && input_ids[..h.len()] == h[..] {
+                (h.len(), self.kv_history_device)
+            } else {
+                (0, false)
+            }
+        };
+        // The owner tag: the state the key describes must live where this
+        // turn will continue it (R4) — else a fresh sequence.
+        if n > 0 && !self.prefix_owner_matches(n, on_device) {
+            tracing::warn!(
+                "kv-reuse refused: the cached prefix ({n} positions) was built on the {} path, \
+                 the device now holds {:?} — re-prefilling from zero",
+                if on_device { "resident device" } else { "host" },
+                self.device_sequence_position()
+            );
+            return 0;
+        }
+        n
+    }
+
+    /// Public view of the prefix-reuse decision for `input_ids` (positions
+    /// the next `generate*` would take from the cache; 0 = fresh sequence).
+    pub fn reusable_prefix_len(&self, input_ids: &[u32]) -> usize {
+        self.cached_prefix_len(input_ids)
+    }
+
+    /// Record the forwarded prefix as the next turn's reuse key. A
+    /// bounded-native model extends the rolling record (`reused` = the
+    /// positions this turn found cached); others keep the literal vector.
+    /// Either way the key carries its OWNER: the resident device graph
+    /// (it holds an image of this sequence) or the host.
+    fn record_consumed_prefix(&mut self, consumed: &[u32], reused: usize) {
+        let on_device = self.device_sequence_position().is_some();
+        if self.bounded_native() {
+            let keep = reused > 0 && reused == self.kv_prefix.len() && reused <= consumed.len();
+            let prev_device = self.kv_prefix.on_device();
+            self.kv_history.clear();
+            self.kv_history_device = false;
+            if keep && prev_device == on_device {
+                self.kv_prefix.extend(&consumed[reused..]);
+            } else {
+                self.kv_prefix.set(consumed);
+            }
+            self.kv_prefix.set_on_device(on_device);
+        } else {
+            self.kv_history = consumed.to_vec();
+            self.kv_history_device = on_device;
+        }
     }
 
     /// True when at least one layer runs the O(1) kernel.
@@ -3072,6 +3557,10 @@ impl Pipeline {
     pub fn set_rotary(&mut self, rotary_dim: usize, base: f32) {
         self.rotary_dim = rotary_dim.min(self.head_dim);
         self.inv_freq = std::sync::Arc::new(attention::rope_inv_freq(self.rotary_dim, base));
+        // The packed resident graph owns its own inverse-frequency plane;
+        // changing RoPE after it was built must not leave a stale device
+        // model behind the exact host configuration.
+        self.embryo_graph = None;
     }
 
     fn attn_cfg(&self, position: usize) -> QwenAttnCfg<'_> {
@@ -3241,6 +3730,8 @@ impl Pipeline {
         task_mask: Option<&TaskMask>,
         mut on_token: Option<TokenCallback>,
     ) -> Result<GenerateResult, String> {
+        #[cfg(target_os = "macos")]
+        crate::gpu_metal::set_io_namespace(self.graph_kv_id);
         if std::env::var("CMF_TRACE_H").is_ok() {
             eprintln!("input_ids: {input_ids:?}");
         }
@@ -3267,7 +3758,6 @@ impl Pipeline {
         // the fresh-sequence path. CMF_KV_REUSE=0 disables.
         let mut reuse_from = {
             let on = !std::env::var("CMF_KV_REUSE").is_ok_and(|v| v == "0");
-            let h = &self.kv_history;
             if on
                 && prompt_rows.is_none()
                 && task_mask.is_none()
@@ -3275,11 +3765,8 @@ impl Pipeline {
                 && !(self.mimo_mtp.is_some() && self.speculative)
                 && self.o1_cfg.is_none()
                 && self.dsv41.is_none()
-                && !h.is_empty()
-                && h.len() < input_ids.len()
-                && input_ids[..h.len()] == h[..]
             {
-                h.len()
+                self.cached_prefix_len(input_ids)
             } else {
                 0
             }
@@ -3289,6 +3776,8 @@ impl Pipeline {
         if reuse_from > 0 && !self.prepare_kv_reuse(reuse_from) {
             reuse_from = 0;
         }
+        self.last_prefill_tokens = input_ids.len() - reuse_from;
+        let bounded_native = self.bounded_native();
         if reuse_from == 0 {
             // Fresh sequence — the cache holds absolute positions.
             self.clear_sequence_state();
@@ -3567,10 +4056,17 @@ impl Pipeline {
         } else {
             None
         };
+        let mut reuse_from = reuse_from;
         if let Some(r) = &mut router {
             r.reset(); // active=backbone, matching a fresh overlay
             self.dyn_phi_seen = 0; // fresh φ EMA per generation
-            let _ = self.set_active_skill(None);
+            if self.dyn_active.is_some() {
+                // A real switch back to the backbone invalidates the
+                // cache the reuse key was computed against.
+                let _ = self.set_active_skill(None);
+                reuse_from = 0;
+                self.last_prefill_tokens = input_ids.len();
+            }
         }
 
         let mut all_ids = input_ids.to_vec();
@@ -4216,6 +4712,23 @@ impl Pipeline {
                 }
             }
         }
+        // Resident Embryo graph: the prompt in chunks of one submit each
+        // instead of one whole-graph submit per position; the last chunk
+        // carries the logits exactly as the per-position walk would.
+        if graph_prefill
+            && task_mask.is_none()
+            && mtp.is_none()
+            && !dyn_prefill
+            && pos == 0
+            && input_ids.len() > 1
+            && !self.cancel.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            if let Some(lg) = self.embryo_prefill_chunked(input_ids, 0) {
+                self.graph_logits = Some(lg);
+                hidden = vec![0.0; self.hidden_size];
+                pos = input_ids.len();
+            }
+        }
         while pos < input_ids.len() && !self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
             self.graph_want_logits = fuse_lm && pos + 1 == input_ids.len();
             hidden = self.forward_layers(&self.embed_single(input_ids[pos]), pos, task_mask);
@@ -4462,7 +4975,7 @@ impl Pipeline {
                     sampler::sample_with_scratch_pool(
                         &logits,
                         &self.sampler_config,
-                        &all_ids,
+                        self.sampler_config.penalty_past(&all_ids, bounded_native),
                         &mut self.rng,
                         &mut self.sampler_scratch,
                         self.pool.as_deref(),
@@ -4762,7 +5275,7 @@ impl Pipeline {
                     let t_after = sampler::sample_with_scratch_pool(
                         &logits1,
                         &self.sampler_config,
-                        &all_ids,
+                        self.sampler_config.penalty_past(&all_ids, bounded_native),
                         &mut self.rng,
                         &mut self.sampler_scratch,
                         self.pool.as_deref(),
@@ -5002,6 +5515,10 @@ impl Pipeline {
         }
 
         let cancelled = finish_reason == "cancelled";
+        // A generation during which the router switched weights holds no
+        // state any single overlay would produce (each switch cleared the
+        // cache mid-sequence), so it leaves no reuse key behind either.
+        let dyn_switched = router.as_ref().is_some_and(|r| !r.switches.is_empty());
         if mimo_spec {
             if let Some(st) = self.mimo_mtp.as_ref() {
                 let line = st.stats.line();
@@ -5020,12 +5537,18 @@ impl Pipeline {
         let forwarded = input_ids.len() + output_ids.len().saturating_sub(1);
         // A MiMo speculative round that stopped on an accepted draft (EOS,
         // cancel) leaves verify rows past the committed stream in the cache:
-        // never offer that cache for reuse.
-        if cancelled || mimo_spec || prompt_rows.is_some() {
-            self.kv_history.clear();
+        // never offer that cache for reuse. Neither does a router that
+        // switched weights mid-sequence (no single overlay produced it).
+        let consumed = std::mem::take(&mut all_ids);
+        if dyn_switched {
+            self.clear_sequence_state();
+        } else if cancelled || mimo_spec || prompt_rows.is_some() {
+            self.clear_history();
         } else {
-            self.kv_history = all_ids[..forwarded.min(all_ids.len())].to_vec();
+            self.record_consumed_prefix(&consumed[..forwarded.min(consumed.len())], reuse_from);
         }
+        all_ids = consumed;
+        let output_ids = &all_ids[input_ids.len()..];
         confidence.truncate(output_ids.len()); // guard against any overshoot
         traces.truncate(output_ids.len());
         Ok(GenerateResult {
@@ -5207,7 +5730,10 @@ impl Pipeline {
                     .map(|(q, k, v)| (q.as_slice(), k.as_slice(), v.as_slice()));
                 attention::qwen_attention(&self.ws.n1, wq, wk, wv, wo, &mut m.kv, &cfg)
             }
-            AttnKind::Linear(_) | AttnKind::LinearGdn(_) | AttnKind::ShortConv(_) => {
+            AttnKind::Linear(_)
+            | AttnKind::LinearGdn(_)
+            | AttnKind::ShortConv(_)
+            | AttnKind::Bounded(_) => {
                 unreachable!("MTP block is full attention")
             }
         };
@@ -6945,6 +7471,36 @@ impl Pipeline {
             let (a1, a2) = match &lw.attn {
                 AttnKind::Mla(_) => unreachable!("MLA has no MTP/pair path"),
                 AttnKind::Kda(_) => unreachable!("KDA has no MTP/pair path"),
+                AttnKind::Bounded(w) => {
+                    // Two sequential positions of the bounded operator
+                    // (the ring's causal order is the pair's order).
+                    let rope = self
+                        .bounded_rope
+                        .clone()
+                        .expect("bounded layer without an installed rotation table");
+                    let cfg = crate::bounded::BoundedAttnCfg {
+                        num_heads: self.num_heads,
+                        num_kv_heads: self.num_kv_heads,
+                        head_dim: self.head_dim,
+                        hidden_size: hs,
+                        scale: self.attn_scale,
+                        rope: &rope,
+                        pool: pool.as_deref(),
+                    };
+                    let a1 = crate::bounded::bounded_attention(
+                        &self.ws.n1,
+                        w,
+                        &mut self.kv_cache.layers[li],
+                        &cfg,
+                    );
+                    let a2 = crate::bounded::bounded_attention(
+                        &self.ws.n2,
+                        w,
+                        &mut self.kv_cache.layers[li],
+                        &cfg,
+                    );
+                    (a1, a2)
+                }
                 AttnKind::Linear(w) => {
                     let cfg = self.vmf_cfg.expect("linear layer without vmf_cfg");
                     let layer = &mut self.kv_cache.layers[li];
@@ -7170,6 +7726,8 @@ impl Pipeline {
         ids: &[u32],
         task_mask: Option<&TaskMask>,
     ) -> Result<Vec<f32>, String> {
+        #[cfg(target_os = "macos")]
+        crate::gpu_metal::set_io_namespace(self.graph_kv_id);
         if ids.is_empty() {
             return Err("empty id sequence".to_string());
         }
@@ -7243,10 +7801,29 @@ impl Pipeline {
                 pos += 2;
             }
         }
+        // Resident Embryo graph: the prompt in chunks of one submit each
+        // (the same device state and logits as the per-position walk).
+        if task_mask.is_none() && pos == 0 && ids.len() > 1 {
+            if let Some(lg) = self.embryo_prefill_chunked(ids, 0) {
+                self.graph_logits = Some(lg);
+                hidden = vec![0.0; self.hidden_size];
+                pos = ids.len();
+            }
+        }
         while pos < ids.len() {
             hidden = self.forward_layers(&self.embed_single(ids[pos]), pos, task_mask);
             self.check_forward_graph("forward_ids", pos)?;
             pos += 1;
+        }
+        if let Some(logits) = self.graph_logits.take() {
+            // Resident stacks already applied final norm and their head in
+            // the same submit; do not run a second norm/head over the zero
+            // hidden sentinel returned by forward_layers_span.
+            if let Err(err) = self.o1_seal_checked() {
+                self.clear_sequence_state();
+                return Err(err);
+            }
+            return Ok(logits);
         }
         // Harness contract: after forward_ids the cache is decode-ready —
         // under o1 that means sealed (bench measures the seal as part of
@@ -7498,11 +8075,15 @@ impl Pipeline {
                 let hs = self.hidden_size;
                 let rows = self.weights.lm_head.rows();
                 let mut pos = 0usize;
+                let state_trace = std::env::var("CMF_STATE_TRACE").is_ok();
                 while pos < n {
                     let end = (pos + CHUNK).min(n);
                     let bsz = end - pos;
                     let hb = self.prefill_rows(&ids[pos..end], pos, task_mask)?;
                     self.nll_check_graph("batched prefill", pos)?;
+                    if state_trace && end % 256 == 0 {
+                        self.trace_recurrent_state(end);
+                    }
                     let mut k0 = 0usize;
                     while k0 < bsz {
                         let k1 = (k0 + LM_SUB).min(bsz);
@@ -7695,6 +8276,63 @@ impl Pipeline {
         }
         attention::recycle_buf(&mut logits);
         tok_nll
+    }
+
+    /// `CMF_STATE_TRACE`: per-layer magnitude of the recurrent record at
+    /// position `pos` — the whole `linear_state` (vmf: S then the conv
+    /// ring; GDN: conv ring then S), its recurrent S part alone, the
+    /// bounded ring, and the last per-position KV row count.  The tool
+    /// that separated the ~4k perplexity cliff of the 500-step exports
+    /// (a state that keeps climbing past the trained window) from a
+    /// runtime boundary; one line per layer, `STATE pos=… layer=…`.
+    fn trace_recurrent_state(&self, pos: usize) {
+        let stats = |v: &[f32]| -> (f64, f64) {
+            if v.is_empty() {
+                return (0.0, 0.0);
+            }
+            let (mut ss, mut mx) = (0f64, 0f64);
+            for &x in v {
+                ss += (x as f64) * (x as f64);
+                mx = mx.max((x as f64).abs());
+            }
+            ((ss / v.len() as f64).sqrt(), mx)
+        };
+        for (li, l) in self.kv_cache.layers.iter().enumerate() {
+            let lw = &self.weights.layers[self.phys_layer(li)];
+            let (kind, s_len) = match &lw.attn {
+                AttnKind::Linear(_) => (
+                    "vmf",
+                    self.vmf_cfg.map(|c| c.state_len()).unwrap_or(0),
+                ),
+                AttnKind::LinearGdn(_) => (
+                    "gdn",
+                    self.gdn_cfg.map(|c| c.state_len()).unwrap_or(0),
+                ),
+                AttnKind::Bounded(_) => ("bounded", 0),
+                AttnKind::Full { .. } => ("full", 0),
+                _ => ("other", 0),
+            };
+            let (rms, max) = stats(&l.linear_state);
+            let s_part = if kind == "vmf" {
+                &l.linear_state[..s_len.min(l.linear_state.len())]
+            } else if kind == "gdn" {
+                let ring = l.linear_state.len().saturating_sub(s_len).min(l.linear_state.len());
+                &l.linear_state[ring..]
+            } else {
+                &l.linear_state[..0]
+            };
+            let (s_rms, s_max) = stats(s_part);
+            let (ring_rms, ring_len) = match &l.bounded {
+                Some(b) => (stats(&b.ring_k).0, b.ring_k.len()),
+                None => (0.0, 0),
+            };
+            eprintln!(
+                "STATE pos={pos} layer={li} kind={kind} state_len={} rms={rms:.5} max={max:.4} \
+                 S_rms={s_rms:.5} S_max={s_max:.4} ring_k_rms={ring_rms:.5} ring_len={ring_len} kv_rows={}",
+                l.linear_state.len(),
+                l.seq_len
+            );
+        }
     }
 
     /// Teacher-forced NLL of the CONVERTED model: the O(1) Nyström path
@@ -7929,16 +8567,20 @@ impl Pipeline {
         for pos in 0..n {
             let emb = self.embed_single(ids[pos]);
             let hidden = self.forward_layers(&emb, pos, None);
-            let normed = inference::rms_norm(
-                &hidden,
-                &self.weights.final_norm,
-                self.rms_eps,
-                self.norm_style,
-            );
-            // lm_head_forward applies the final-logit softcap itself —
-            // capping again here double-squashed gemma-class logits
-            // (tanh∘tanh) and reported a flattered ppl.
-            let logits = self.lm_head_forward(&normed);
+            let logits = if let Some(logits) = self.graph_logits.take() {
+                logits
+            } else {
+                let normed = inference::rms_norm(
+                    &hidden,
+                    &self.weights.final_norm,
+                    self.rms_eps,
+                    self.norm_style,
+                );
+                // lm_head_forward applies the final-logit softcap itself —
+                // capping again here double-squashed gemma-class logits
+                // (tanh∘tanh) and reported a flattered ppl.
+                self.lm_head_forward(&normed)
+            };
             let target = ids[pos + 1] as usize;
             let (mut amax, mut mval) = (0usize, f32::NEG_INFINITY);
             for (i, &v) in logits.iter().enumerate() {
@@ -8061,6 +8703,75 @@ impl Pipeline {
         }
         self.clear_sequence_state();
         acc
+    }
+
+    /// Router-v2 φ probe (spec §9.4, `phi.pool = "span_mean"`): the hidden
+    /// AFTER `layer` — the same per-position walk and the same quantity as
+    /// [`Self::probe_phi`] — averaged over the positions in `span` only
+    /// (the user text between the template's prefix and suffix ids), NOT
+    /// unit-normalized (the decision normalizes). The walk stops at
+    /// `span.end`: causality makes the later positions irrelevant, so the
+    /// result is bit-identical to probing `ids[..span.end]`. An empty span
+    /// gives the zero vector, which the decision treats as degenerate.
+    ///
+    /// Every sequence state is reset before and after — the host KV/ring/
+    /// recurrent state, the reuse keys (`kv_history`, `kv_prefix`) and the
+    /// device graph's sequence — so run it on a pipeline that does not
+    /// also serve a conversation (its prefix reuse would be lost).
+    pub fn probe_phi_span(
+        &mut self,
+        ids: &[u32],
+        layer: usize,
+        span: std::ops::Range<usize>,
+    ) -> Vec<f32> {
+        #[cfg(target_os = "macos")]
+        crate::gpu_metal::set_io_namespace(self.graph_kv_id);
+        let end = span.end.min(ids.len());
+        let start = span.start.min(end);
+        let reset = |p: &mut Self| p.clear_sequence_state();
+        reset(self);
+        let mut acc = vec![0f32; self.hidden_size];
+        for (pos, &id) in ids[..end].iter().enumerate() {
+            let h = self.forward_layers_upto(&self.embed_single(id), pos, None, Some(layer));
+            if pos >= start {
+                for (a, v) in acc.iter_mut().zip(&h) {
+                    *a += v;
+                }
+            }
+        }
+        let n = end - start;
+        if n > 0 {
+            let n = n as f32;
+            for a in acc.iter_mut() {
+                *a /= n;
+            }
+        }
+        reset(self);
+        acc
+    }
+
+    /// One decode step of the current sequence: forward `token` at
+    /// `position` (the cache holds positions `[0, position)`, e.g. after
+    /// [`Self::forward_ids`]) and return the next-token logits — the same
+    /// forward and head the generation loop runs (resident-graph logits
+    /// when the graph ran, final norm + lm_head otherwise). The logit-dump
+    /// tools drive greedy decoding with it so every position is observable.
+    pub fn decode_step_logits(&mut self, token: u32, position: usize) -> Vec<f32> {
+        #[cfg(target_os = "macos")]
+        crate::gpu_metal::set_io_namespace(self.graph_kv_id);
+        self.graph_logits = None;
+        let hidden = self.forward_layers(&self.embed_single(token), position, None);
+        if let Some(logits) = self.graph_logits.take() {
+            return logits;
+        }
+        inference::rms_norm_into(
+            &hidden,
+            &self.weights.final_norm,
+            self.rms_eps,
+            self.norm_style,
+            &mut self.ws.n1,
+        );
+        self.lm_head_forward(&self.ws.n1)
     }
 
     /// Layer-major batched prefill (prefill-GEMM): full-attention —
@@ -8494,6 +9205,56 @@ impl Pipeline {
                         *dst += a;
                     }
                 }
+                AttnKind::Bounded(w) => {
+                    // Chunk-GEMM projections, the bounded operator per
+                    // position over ring + chunk — never a growing KV.
+                    let mut normed = vec![0.0f32; b * hs];
+                    for bi in 0..b {
+                        inference::rms_norm_into(
+                            &h[bi * hs..(bi + 1) * hs],
+                            &lw.input_norm,
+                            eps,
+                            norm_style,
+                            &mut normed[bi * hs..(bi + 1) * hs],
+                        );
+                    }
+                    let rope = self
+                        .bounded_rope
+                        .clone()
+                        .expect("bounded layer without an installed rotation table");
+                    let cfg = crate::bounded::BoundedAttnCfg {
+                        num_heads: self.num_heads,
+                        num_kv_heads: self.num_kv_heads,
+                        head_dim: self.head_dim,
+                        hidden_size: hs,
+                        scale: self.attn_scale,
+                        rope: &rope,
+                        pool: pool.as_deref(),
+                    };
+                    let mut attn = crate::bounded::bounded_attention_batch(
+                        &normed,
+                        b,
+                        w,
+                        &mut self.kv_cache.layers[li],
+                        &cfg,
+                    );
+                    if let Some(wn) = &lw.attn_out_norm {
+                        for bi in 0..b {
+                            inference::rms_norm_into(
+                                &attn[bi * hs..(bi + 1) * hs],
+                                wn,
+                                eps,
+                                norm_style,
+                                &mut normed[bi * hs..(bi + 1) * hs],
+                            );
+                        }
+                        attn.copy_from_slice(&normed);
+                    }
+                    for (dst, &a) in h.iter_mut().zip(&attn) {
+                        *dst += a;
+                    }
+                    attention::recycle_buf(&mut attn);
+                }
                 AttnKind::Linear(w) => {
                     for bi in 0..b {
                         let normed = inference::rms_norm(
@@ -8676,7 +9437,10 @@ impl Pipeline {
         // DeepSeek-V4's hash layers route by TOKEN ID, so the id has to
         // reach the forward. It rides in slot 0 (the forward re-reads the
         // real embedding itself from the table).
-        if self.dsv4.is_some() || self.dsv41.is_some() || self.qwen4_exp.is_some() {
+        if self.dsv4.is_some()
+            || self.dsv41.is_some()
+            || self.qwen4_exp.is_some()
+        {
             let mut v = vec![0.0f32; self.hidden_size.max(1)];
             v[0] = id as f32;
             return v;
@@ -9803,7 +10567,7 @@ impl Pipeline {
             return None;
         }
         let graph_on = crate::gpu::wgpu_graph_on(crate::gpu::GraphPhase::Decode);
-        if !graph_on || crate::gpu::graph_unsupported() {
+        if !graph_on || self.graph_refused() {
             // Same memo as the decode site: this path builds the very
             // same graph, so a model it cannot build for must not be
             // walked again here either. Missing this guard was worth
@@ -9982,6 +10746,7 @@ impl Pipeline {
                     AttnKind::Kda(_) => "Kda".into(),
                     AttnKind::Linear(_) => "Linear".into(),
                     AttnKind::ShortConv(_) => "ShortConv".into(),
+                    AttnKind::Bounded(_) => "Bounded".into(),
                 };
                 let fk = match &lw.ffn {
                     FfnKind::Dense(_) => "Dense",
@@ -10608,10 +11373,23 @@ impl Pipeline {
             return MetalRowsRun::Failed;
         }
         spec_stamp("v.wait");
+        // Seed the GDN recurrent records the rows graph reads — GDN layers
+        // ONLY (the record the CPU path would allocate anyway).  Sizing
+        // every layer here planted a zero GDN-sized record on a bounded
+        // anchor of a natively bounded file this path then refused, and
+        // that record counted as recurrent state on macOS.
         let want = self.gdn_cfg.map(|c| c.state_len()).unwrap_or(0);
-        for l in &mut self.kv_cache.layers {
-            if l.linear_state.len() != want && want > 0 {
-                l.linear_state = vec![0f32; want];
+        if want > 0 {
+            let phys = self.physical_layers.max(1);
+            for (li, l) in self.kv_cache.layers.iter_mut().enumerate() {
+                let is_gdn = self
+                    .weights
+                    .layers
+                    .get(li % phys)
+                    .is_some_and(|lw| matches!(lw.attn, AttnKind::LinearGdn(_)));
+                if is_gdn && l.linear_state.len() != want {
+                    l.linear_state = vec![0f32; want];
+                }
             }
         }
         let Some((plan, model, gcfg)) = self.metal_rows_plan() else {
@@ -12705,6 +13483,736 @@ impl Pipeline {
     /// arch escape hatches (the pub `forward_span` refuses those archs
     /// first) and the whole-token graph — the plain per-layer loop is
     /// the canonical executor for a partial stack.
+    fn embryo_qtensor_f32(t: &QTensor) -> Vec<f32> {
+        if let Some(x) = t.as_f32() {
+            return x.to_vec();
+        }
+        let mut out = vec![0.0; t.rows() * t.cols()];
+        for r in 0..t.rows() {
+            t.row_f32(r, &mut out[r * t.cols()..(r + 1) * t.cols()]);
+        }
+        out
+    }
+
+    fn embryo_resident_eligible(&self) -> bool {
+        // One mixer family per file: vmf_phase (kind 0/1) or
+        // gated_delta_net (kind 4); the anchors are full (2) or bounded (3).
+        if (self.vmf_cfg.is_none() && self.gdn_cfg.is_none())
+            || self.num_layers != self.physical_layers
+            || self.loop_final_norm
+            || self.weights.layers.len() != self.num_layers
+            || self.head_clusters.is_none()
+            || self.final_softcap.is_some()
+            || self.logit_multiplier.is_some()
+            || self.attn_softcap != 0.0
+            || self.mtp.is_some()
+            || self.g3n.is_some()
+            || self.dsv4.is_some()
+            || self.dsv41.is_some()
+            || self.qwen4_exp.is_some()
+            // Dynamic routing swaps FFN weights mid-sequence under the
+            // packed graph; a blend has no single overlay. A STATIC skill
+            // (`from_model_with_skill`) is fine: the pack reads the live
+            // `weights.layers[*].ffn`, i.e. the skill's tensors, and a
+            // later `set_active_skill` change drops the pack
+            // (`invalidate_for_weight_change`).
+            || self.dyn_router.is_some()
+            || self.dyn_phi_layer.is_some()
+            || self.dyn_blend_loaded
+            || self.o1_cfg.is_some()
+            || self.swa.is_some()
+            || self.sliding_layers.is_some()
+            || self.global_attn.is_some()
+            || self.attention_heads_per_layer.is_some()
+            || self.attn_v_norm
+            || self
+                .kv_cache
+                .layers
+                .iter()
+                .any(|l| l.mode != crate::kv_cache::KvMode::F32)
+            || self.rope_scale != 1.0
+            || self.rope_scale_local != 1.0
+            || self.attn_scale != 1.0 / (self.head_dim as f32).sqrt()
+            || self.hidden_size == 0
+            || self.hidden_size > 1024
+            || self.intermediate_size > 1024
+            || self.num_heads == 0
+            || self.num_kv_heads == 0
+            || self.num_heads % self.num_kv_heads != 0
+            || self.num_heads.saturating_mul(self.head_dim) > 1024
+            || self.num_kv_heads.saturating_mul(self.head_dim) > 1024
+            || self.vocab_size == 0
+            || self.kv_cache.max_seq_len == 0
+            || self.rotary_dim == 0
+            || self.rotary_dim > self.head_dim
+            || self.rotary_dim % 2 != 0
+            || self.inv_freq.len() < self.rotary_dim / 2
+        {
+            return false;
+        }
+        // The resident shader is deliberately an f32 profile.  Dequantizing
+        // a Q4/Q8 tensor into the packed buffer would silently change the
+        // operator relative to the CPU quantized path, so quantized CMFs
+        // retain the exact ordinary executor instead of claiming parity.
+        // Measured consequence (RTX PRO 4000, S4 bounded export requantized
+        // with `cortiq requant --quant q4tp-quantize`): `eligible=false`,
+        // the generic wgpu whole-token graph refuses too, and the per-op
+        // path decodes at ~73 tok/s against ~200 tok/s on the CPU q4tp
+        // path — a q4tp Embryo-O1 file is a CPU artifact today; the
+        // resident graph serves the f32 export.
+        if self.weights.lm_head.as_f32().is_none()
+            || self.weights.embed_tokens.as_f32().is_none()
+            || self.weights.lm_head.rows() < self.vocab_size
+            || self.weights.lm_head.cols() != self.hidden_size
+            || self.weights.embed_tokens.rows() < self.vocab_size
+            || self.weights.embed_tokens.cols() != self.hidden_size
+            || self.weights.final_norm.len() != self.hidden_size
+        {
+            return false;
+        }
+        if let Some(cfg) = self.vmf_cfg {
+            if cfg.num_heads.saturating_mul(cfg.nphase) > 1024
+                || cfg.num_heads.saturating_mul(cfg.nphase.saturating_add(1)) > 1024
+                || cfg.num_heads.saturating_mul(cfg.value_head_dim) > 1024
+                || cfg.state_len() == 0
+            {
+                return false;
+            }
+        }
+        if let Some(g) = self.gdn_cfg {
+            // The resident GDN kernels (gpu_wgpu.rs `embryo_core_gdn_*`):
+            // fused projection ≤ 2048 rows, nv·dv ≤ 1024, dk ≤ 128 lanes,
+            // dv ≤ 256 lanes in vec4 rows, SiLU output gate (the Embryo
+            // export), same rms eps as the stack.
+            if g.num_v_heads == 0
+                || g.num_k_heads == 0
+                || g.num_v_heads % g.num_k_heads != 0
+                || g.key_head_dim == 0
+                || g.key_head_dim > 128
+                || g.value_head_dim == 0
+                || g.value_head_dim > 256
+                || g.value_head_dim % 4 != 0
+                || g.conv_kernel == 0
+                || g.num_v_heads > 512
+                || g.num_v_heads.saturating_mul(g.value_head_dim) > 1024
+                || g.conv_dim() > 2048
+                || g.conv_dim() % 4 != 0
+                || g.hidden_size != self.hidden_size
+                || g.output_gate_sigmoid
+                || g.rms_eps != self.rms_eps
+                || g.state_len() == 0
+            {
+                return false;
+            }
+        }
+        let mut full_seen = false;
+        for lw in &self.weights.layers {
+            if lw.attn_out_norm.is_some() || lw.ffn_out_norm.is_some() || lw.layer_scale.is_some() {
+                return false;
+            }
+            match &lw.attn {
+                AttnKind::LinearGdn(w) => {
+                    let Some(g) = self.gdn_cfg else {
+                        return false;
+                    };
+                    let (nv, dv, kk) = (g.num_v_heads, g.value_head_dim, g.conv_kernel);
+                    if w.in_proj_qkv.rows() != g.conv_dim()
+                        || w.in_proj_qkv.cols() != self.hidden_size
+                        || w.in_proj_qkv.as_f32().is_none()
+                        || w.in_proj_z.rows() != nv * dv
+                        || w.in_proj_z.cols() != self.hidden_size
+                        || w.in_proj_z.as_f32().is_none()
+                        || w.in_proj_a.rows() != nv
+                        || w.in_proj_a.cols() != self.hidden_size
+                        || w.in_proj_a.as_f32().is_none()
+                        || w.in_proj_b.rows() != nv
+                        || w.in_proj_b.cols() != self.hidden_size
+                        || w.in_proj_b.as_f32().is_none()
+                        || w.conv1d.len() != g.conv_dim() * kk
+                        || w.a_log.len() != nv
+                        || w.dt_bias.len() != nv
+                        || w.norm.len() != dv
+                        || w.out_proj.rows() != self.hidden_size
+                        || w.out_proj.cols() != nv * dv
+                        || w.out_proj.as_f32().is_none()
+                    {
+                        return false;
+                    }
+                }
+                AttnKind::Linear(w) => {
+                    let Some(cfg) = self.vmf_cfg else {
+                        return false;
+                    };
+                    if w.thq.rows() != cfg.num_heads * cfg.nphase
+                        || w.thq.cols() != self.hidden_size
+                        || w.thq.as_f32().is_none()
+                        || w.thk.rows() != cfg.num_heads * cfg.nphase
+                        || w.thk.cols() != self.hidden_size
+                        || w.thk.as_f32().is_none()
+                        || w.v_proj.rows() != cfg.num_heads * cfg.value_head_dim
+                        || w.v_proj.cols() != self.hidden_size
+                        || w.v_proj.as_f32().is_none()
+                        || w.out_proj.rows() != self.hidden_size
+                        || w.out_proj.cols() != cfg.num_heads * cfg.value_head_dim
+                        || w.out_proj.as_f32().is_none()
+                        || w.decay.len() != cfg.num_heads * 2 * cfg.nphase
+                    {
+                        return false;
+                    }
+                    if let Some((kg, kb)) = &w.k_gate {
+                        if kg.rows() != cfg.num_heads
+                            || kg.cols() != self.hidden_size
+                            || kg.as_f32().is_none()
+                            || kb.len() != cfg.num_heads
+                        {
+                            return false;
+                        }
+                    }
+                    if let Some(conv) = &w.conv {
+                        if conv.len() % self.hidden_size != 0 || conv.len() / self.hidden_size < 2 {
+                            return false;
+                        }
+                    }
+                }
+                AttnKind::Full {
+                    wq,
+                    wk,
+                    wv,
+                    wo,
+                    q_norm,
+                    k_norm,
+                    output_gate,
+                    softplus_gate,
+                    bias,
+                } => {
+                    if full_seen
+                        || q_norm.is_some()
+                        || k_norm.is_some()
+                        || *output_gate
+                        || softplus_gate.is_some()
+                        || bias.is_some()
+                        || wq.as_f32().is_none()
+                        || wk.as_f32().is_none()
+                        || wv.as_f32().is_none()
+                        || wo.as_f32().is_none()
+                        || wq.rows() != self.num_heads * self.head_dim
+                        || wk.rows() != self.num_kv_heads * self.head_dim
+                        || wv.rows() != self.num_kv_heads * self.head_dim
+                        || wq.cols() != self.hidden_size
+                        || wk.cols() != self.hidden_size
+                        || wv.cols() != self.hidden_size
+                        || wo.rows() != self.hidden_size
+                        || wo.cols() != self.num_heads * self.head_dim
+                    {
+                        return false;
+                    }
+                    full_seen = true;
+                }
+                AttnKind::Bounded(w) => {
+                    // The resident bounded attend scores S + W lanes in one
+                    // 256-lane chunk; the format caps S + W at 160.
+                    let Some(ac) = self.anchor_core.as_ref() else {
+                        return false;
+                    };
+                    if self.bounded_rope.is_none()
+                        || w.window != ac.window
+                        || w.sink != ac.sink
+                        || w.window == 0
+                        || w.window + w.sink > 256
+                        || w.sink_k.len() != self.num_kv_heads * w.sink * self.head_dim
+                        || w.sink_v.len() != self.num_kv_heads * w.sink * self.head_dim
+                        || w.wq.as_f32().is_none()
+                        || w.wk.as_f32().is_none()
+                        || w.wv.as_f32().is_none()
+                        || w.wo.as_f32().is_none()
+                        || w.wq.rows() != self.num_heads * self.head_dim
+                        || w.wk.rows() != self.num_kv_heads * self.head_dim
+                        || w.wv.rows() != self.num_kv_heads * self.head_dim
+                        || w.wq.cols() != self.hidden_size
+                        || w.wk.cols() != self.hidden_size
+                        || w.wv.cols() != self.hidden_size
+                        || w.wo.rows() != self.hidden_size
+                        || w.wo.cols() != self.num_heads * self.head_dim
+                    {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+            match &lw.ffn {
+                FfnKind::Dense(d) => {
+                    if d.act != Act::Silu
+                        || !d.segs.is_empty()
+                        || d.gate_proj.as_f32().is_none()
+                        || d.up_proj.as_f32().is_none()
+                        || d.down_proj.as_f32().is_none()
+                        || d.gate_proj.rows() != self.intermediate_size
+                        || d.gate_proj.cols() != self.hidden_size
+                        || d.up_proj.rows() != self.intermediate_size
+                        || d.up_proj.cols() != self.hidden_size
+                        || d.down_proj.rows() != self.hidden_size
+                        || d.down_proj.cols() != self.intermediate_size
+                    {
+                        return false;
+                    }
+                }
+                FfnKind::Moe(m) => {
+                    if m.resonance.is_none()
+                        || m.top_k != 1
+                        || m.router_sigmoid
+                        || !m.norm_topk_prob
+                        || m.expert_bias.is_some()
+                        || m.routed_scaling != 1.0
+                        || m.route_tau.is_some()
+                        || m.shared.is_none()
+                        || m.mask.is_some()
+                        || m.per_expert_scale.is_some()
+                        || m.router_input_norm
+                        || m.experts.is_empty()
+                        || m.experts.len() > 8
+                    {
+                        return false;
+                    }
+                    let r = m.resonance.as_ref().unwrap();
+                    if r.mu.len() != m.experts.len() * self.hidden_size
+                        || r.bias.len() != m.experts.len()
+                        || r.u.len() != m.experts.len() * r.k * self.hidden_size
+                        || r.k > 128
+                    {
+                        return false;
+                    }
+                    let Some((shared, gate)) = &m.shared else {
+                        return false;
+                    };
+                    if gate.is_some() || shared.act != Act::Silu || !shared.segs.is_empty() {
+                        return false;
+                    }
+                    if shared.gate_proj.as_f32().is_none()
+                        || shared.up_proj.as_f32().is_none()
+                        || shared.down_proj.as_f32().is_none()
+                        || shared.gate_proj.rows() != self.intermediate_size
+                        || shared.gate_proj.cols() != self.hidden_size
+                        || shared.up_proj.rows() != self.intermediate_size
+                        || shared.up_proj.cols() != self.hidden_size
+                        || shared.down_proj.rows() != self.hidden_size
+                        || shared.down_proj.cols() != self.intermediate_size
+                    {
+                        return false;
+                    }
+                    for e in &m.experts {
+                        if e.act != Act::Silu
+                            || !e.segs.is_empty()
+                            || e.gate_proj.as_f32().is_none()
+                            || e.up_proj.as_f32().is_none()
+                            || e.down_proj.as_f32().is_none()
+                            || e.gate_proj.rows() != self.intermediate_size
+                            || e.gate_proj.cols() != self.hidden_size
+                            || e.up_proj.rows() != self.intermediate_size
+                            || e.up_proj.cols() != self.hidden_size
+                            || e.down_proj.rows() != self.hidden_size
+                            || e.down_proj.cols() != self.intermediate_size
+                        {
+                            return false;
+                        }
+                    }
+                }
+                FfnKind::DenseMoe(_) => return false,
+            }
+            if lw.input_norm.len() != self.hidden_size || lw.post_norm.len() != self.hidden_size {
+                return false;
+            }
+        }
+        if full_seen && self.anchor_core.is_some() {
+            return false;
+        }
+        full_seen || self.num_layers > 0
+    }
+
+    /// The resident Embryo graph is the owner of this pipeline's forward:
+    /// the same gate `forward_layers_span` applies before handing a token
+    /// to `forward_embryo_graph` (both graph phases on, the explicit
+    /// opt-in, a wgpu device, no earlier refusal, an eligible stack).
+    fn embryo_resident_wanted(&self) -> bool {
+        crate::gpu::wgpu_graph_on(crate::gpu::GraphPhase::Decode)
+            && crate::gpu::wgpu_graph_on(crate::gpu::GraphPhase::Prefill)
+            && matches!(
+                std::env::var("CMF_EMBRYO_RESIDENT").as_deref(),
+                Ok("1") | Ok("parallel")
+            )
+            && crate::gpu::enabled_here()
+            && !self.graph_refused()
+            && self.embryo_resident_eligible()
+    }
+
+    /// Chunked prefill on the resident graph: `ids` from `start` in
+    /// chunks of `EMBRYO_CHUNK_MAX`, one submit each, projections/FFN as
+    /// chunk GEMMs and the recurrent layers walked in time on the device.
+    /// Returns the last position's logits when the whole span ran there.
+    /// `None` = refused before any device work (the per-position path
+    /// takes the span).  `CMF_EMBRYO_CHUNK=0` keeps the per-position
+    /// prefill (A/B and the parity reference).
+    fn embryo_prefill_chunked(&mut self, ids: &[u32], start: usize) -> Option<Vec<f32>> {
+        if ids.len() < 2
+            || std::env::var("CMF_EMBRYO_CHUNK").as_deref() == Ok("0")
+            || !self.embryo_resident_wanted()
+        {
+            return None;
+        }
+        let model = self.ensure_embryo_graph()?;
+        let cmax = std::env::var("CMF_EMBRYO_CHUNK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v >= 1)
+            .unwrap_or(crate::gpu::EMBRYO_CHUNK_MAX)
+            .min(crate::gpu::EMBRYO_CHUNK_MAX);
+        let hs = self.hidden_size;
+        let n = ids.len();
+        let mut pos = start;
+        let mut last = None;
+        let mut rows = Vec::with_capacity(cmax * hs);
+        while pos < n {
+            let end = (pos + cmax).min(n);
+            rows.clear();
+            for &id in &ids[pos..end] {
+                rows.extend_from_slice(&self.embed_single(id));
+            }
+            let mut lg = Vec::new();
+            if !crate::gpu::forward_embryo_graph_chunk(
+                &model,
+                self.graph_kv_id,
+                &rows,
+                pos,
+                end - pos,
+                &mut lg,
+            ) {
+                if pos == start {
+                    if std::env::var("CMF_EMBRYO_DBG").as_deref() == Ok("1") {
+                        eprintln!("embryo-dbg: chunk prefill refused at position {pos}");
+                    }
+                    return None;
+                }
+                // The device sequence advanced through the earlier chunks;
+                // a host continuation would mix two owners of the state.
+                // Fail this sequence alone, leaving no stale state or key.
+                self.kv_cache.clear();
+                self.clear_history();
+                crate::gpu::graph_kv_reset(self.graph_kv_id);
+                panic!(
+                    "resident Embryo chunk prefill refused at position {pos}; refusing an in-flight host fallback"
+                );
+            }
+            last = Some(lg);
+            pos = end;
+        }
+        if std::env::var("CMF_EMBRYO_DBG").as_deref() == Ok("1") {
+            eprintln!(
+                "embryo-dbg: chunk prefill {} ids from {start} in {} submits (chunk {cmax})",
+                n - start,
+                (n - start).div_ceil(cmax)
+            );
+        }
+        last
+    }
+
+    fn ensure_embryo_graph(&mut self) -> Option<std::sync::Arc<crate::gpu::EmbryoGraphModel>> {
+        if self.embryo_graph.is_none() && self.embryo_resident_eligible() {
+            const UMAX: u32 = u32::MAX;
+            const HEADER: usize = crate::gpu::EMBRYO_META_HEADER;
+            const REC: usize = 64;
+            struct Pack {
+                data: Vec<f32>,
+            }
+            impl Pack {
+                fn put(&mut self, x: &[f32]) -> u32 {
+                    if x.is_empty() {
+                        return u32::MAX;
+                    }
+                    let off = self.data.len();
+                    self.data.extend_from_slice(x);
+                    off as u32
+                }
+            }
+            // The mixer family of the file: vmf_phase geometry fills the
+            // phase header words, gated_delta_net fills words 24..29.  A
+            // file has exactly one linear core, so at most one is live.
+            let vmf = self.vmf_cfg;
+            let gdn = self.gdn_cfg;
+            let mut pack = Pack { data: Vec::new() };
+            let mut meta = vec![0u32; HEADER];
+            meta[0] = self.hidden_size as u32;
+            meta[1] = self.intermediate_size as u32;
+            meta[2] = self.vocab_size as u32;
+            meta[3] = self.num_layers as u32;
+            meta[4] = vmf.map(|c| c.num_heads).unwrap_or(0) as u32;
+            meta[5] = vmf.map(|c| c.nphase).unwrap_or(0) as u32;
+            meta[6] = vmf.map(|c| c.value_head_dim).unwrap_or(0) as u32;
+            if let Some(g) = gdn {
+                meta[24] = g.num_v_heads as u32;
+                meta[25] = g.num_k_heads as u32;
+                meta[26] = g.key_head_dim as u32;
+                meta[27] = g.value_head_dim as u32;
+                meta[28] = g.conv_kernel as u32;
+                meta[29] = g.conv_dim() as u32;
+            }
+            meta[7] = self.num_heads as u32;
+            meta[8] = self.num_kv_heads as u32;
+            meta[9] = self.head_dim as u32;
+            meta[10] = self.kv_cache.max_seq_len as u32;
+            let clusters = self.head_clusters.as_ref().unwrap();
+            let cluster_count = clusters.len() / self.hidden_size;
+            if clusters.len() % self.hidden_size != 0
+                || cluster_count == 0
+                || cluster_count > 1024
+                || self.vocab_size % cluster_count != 0
+                || self.weights.lm_head.rows() < self.vocab_size
+                || self.weights.final_norm.len() != self.hidden_size
+            {
+                return None;
+            }
+            meta[11] = cluster_count as u32;
+            meta[12] = (self.vocab_size / cluster_count) as u32;
+            meta[13] = vmf.map(|c| c.state_len()).unwrap_or(0) as u32;
+            meta[16] = self.rotary_dim as u32;
+            meta[17] = matches!(self.norm_style, NormStyle::Gemma) as u32;
+            meta[19] = (self.rms_eps as f32).to_bits();
+            let max_conv = self
+                .weights
+                .layers
+                .iter()
+                .filter_map(|lw| match &lw.attn {
+                    AttnKind::Linear(w) => w.conv.as_ref().map(|v| v.len() / self.hidden_size),
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(1);
+            // One state slot per recurrent layer: the phase state plus its
+            // hidden-wide conv ring, or the GDN record `[conv ring | S]`
+            // (`GdnCfg::state_len`).  A file carries one mixer family, so
+            // the stride is exactly that family's record and the device
+            // state buffer equals the header's recurrent bytes.
+            let phase_stride = vmf
+                .map(|c| c.state_len() + max_conv.saturating_sub(1) * self.hidden_size)
+                .unwrap_or(0);
+            let gdn_stride = gdn.map(|g| g.state_len()).unwrap_or(0);
+            let state_stride = phase_stride.max(gdn_stride);
+            // Bounded genome: the KV plane of an anchor is its ring
+            // `[kvh][W][hd]` K + V, and only anchors own one.  Legacy full
+            // anchors keep the `max_seq` planes indexed by layer.
+            let bounded = self.anchor_core.clone();
+            let (anchor_window, anchor_sink) = bounded
+                .as_ref()
+                .map(|ac| (ac.window, ac.sink))
+                .unwrap_or((0, 0));
+            let kv_stride = if bounded.is_some() {
+                2usize
+                    .saturating_mul(self.num_kv_heads)
+                    .saturating_mul(anchor_window)
+                    .saturating_mul(self.head_dim)
+            } else {
+                2usize
+                    .saturating_mul(self.num_kv_heads)
+                    .saturating_mul(self.kv_cache.max_seq_len)
+                    .saturating_mul(self.head_dim)
+            };
+            meta[14] = state_stride as u32;
+            meta[15] = kv_stride as u32;
+            meta[18] = anchor_window as u32;
+            meta[20] = anchor_sink as u32;
+            meta[21] = match &self.bounded_rope {
+                Some(rope) => {
+                    // [W][half] cos then [W][half] sin, one contiguous table.
+                    let off = pack.put(&rope.cos);
+                    let _ = pack.put(&rope.sin);
+                    off
+                }
+                None => UMAX,
+            };
+            let mut full_seen = false;
+            let mut bounded_seen = 0usize;
+            // Recurrent state slots belong to mixer layers only (phase or
+            // GDN): an anchor owns a ring, not a state stride, so the
+            // device state buffer is exactly the header's recurrent bytes.
+            let mut phase_seen = 0usize;
+            let mut gdn_seen = 0usize;
+            for (li, lw) in self.weights.layers.iter().enumerate() {
+                let base = meta.len();
+                meta.resize(base + REC, UMAX);
+                meta[base] = match &lw.attn {
+                    AttnKind::Linear(w) if w.phase_delta => 1,
+                    AttnKind::Linear(_) => 0,
+                    AttnKind::Full { .. } => 2,
+                    AttnKind::Bounded(_) => 3,
+                    AttnKind::LinearGdn(_) => 4,
+                    _ => UMAX,
+                };
+                meta[base + 1] = pack.put(&lw.input_norm);
+                meta[base + 2] = pack.put(&lw.post_norm);
+                meta[base + 25] = match &lw.attn {
+                    AttnKind::Linear(_) => {
+                        let off = ((phase_seen + gdn_seen) * state_stride) as u32;
+                        phase_seen += 1;
+                        off
+                    }
+                    AttnKind::LinearGdn(_) => {
+                        let off = ((phase_seen + gdn_seen) * state_stride) as u32;
+                        gdn_seen += 1;
+                        off
+                    }
+                    _ => UMAX,
+                };
+                match &lw.attn {
+                    AttnKind::LinearGdn(w) => {
+                        // Layer record words 56..63 + 29, as the resident
+                        // kernels read them (gpu_wgpu.rs `embryo_core_gdn_*`).
+                        meta[base + 56] = pack.put(&Self::embryo_qtensor_f32(&w.in_proj_qkv));
+                        meta[base + 57] = pack.put(&Self::embryo_qtensor_f32(&w.in_proj_z));
+                        meta[base + 58] = pack.put(&Self::embryo_qtensor_f32(&w.in_proj_a));
+                        meta[base + 59] = pack.put(&Self::embryo_qtensor_f32(&w.in_proj_b));
+                        meta[base + 60] = pack.put(&w.conv1d);
+                        meta[base + 61] = pack.put(&w.a_log);
+                        meta[base + 62] = pack.put(&w.dt_bias);
+                        meta[base + 63] = pack.put(&w.norm);
+                        meta[base + 29] = pack.put(&Self::embryo_qtensor_f32(&w.out_proj));
+                        meta[base + 24] = 0;
+                    }
+                    AttnKind::Linear(w) => {
+                        meta[base + 3] = pack.put(&Self::embryo_qtensor_f32(&w.thq));
+                        meta[base + 4] = pack.put(&Self::embryo_qtensor_f32(&w.thk));
+                        meta[base + 5] = pack.put(&Self::embryo_qtensor_f32(&w.v_proj));
+                        meta[base + 6] = pack.put(&Self::embryo_qtensor_f32(&w.out_proj));
+                        let decay: Vec<f32> = w.decay.iter().map(|&x| x as f32).collect();
+                        meta[base + 7] = pack.put(&decay);
+                        if let Some((kg, kb)) = &w.k_gate {
+                            meta[base + 8] = pack.put(&Self::embryo_qtensor_f32(kg));
+                            meta[base + 9] = pack.put(kb);
+                        }
+                        if let Some(conv) = &w.conv {
+                            meta[base + 10] = pack.put(conv);
+                            meta[base + 24] = (conv.len() / self.hidden_size) as u32;
+                        } else {
+                            meta[base + 24] = 0;
+                        }
+                    }
+                    AttnKind::Full { wq, wk, wv, wo, .. } => {
+                        full_seen = true;
+                        meta[base + 11] = pack.put(&Self::embryo_qtensor_f32(wq));
+                        meta[base + 12] = pack.put(&Self::embryo_qtensor_f32(wk));
+                        meta[base + 13] = pack.put(&Self::embryo_qtensor_f32(wv));
+                        meta[base + 14] = pack.put(&Self::embryo_qtensor_f32(wo));
+                        meta[base + 26] = (li * kv_stride) as u32;
+                    }
+                    AttnKind::Bounded(w) => {
+                        meta[base + 11] = pack.put(&Self::embryo_qtensor_f32(&w.wq));
+                        meta[base + 12] = pack.put(&Self::embryo_qtensor_f32(&w.wk));
+                        meta[base + 13] = pack.put(&Self::embryo_qtensor_f32(&w.wv));
+                        meta[base + 14] = pack.put(&Self::embryo_qtensor_f32(&w.wo));
+                        // Ring slot of this anchor (anchors only, packed).
+                        meta[base + 26] = (bounded_seen * kv_stride) as u32;
+                        meta[base + 27] = pack.put(&w.sink_k);
+                        meta[base + 28] = pack.put(&w.sink_v);
+                        bounded_seen += 1;
+                    }
+                    _ => return None,
+                }
+                match &lw.ffn {
+                    FfnKind::Dense(d) => {
+                        meta[base + 15] = 0;
+                        meta[base + 16] = 0;
+                        meta[base + 21] = pack.put(&Self::embryo_qtensor_f32(&d.gate_proj));
+                        meta[base + 22] = pack.put(&Self::embryo_qtensor_f32(&d.up_proj));
+                        meta[base + 23] = pack.put(&Self::embryo_qtensor_f32(&d.down_proj));
+                    }
+                    FfnKind::Moe(m) => {
+                        let r = m.resonance.as_ref().unwrap();
+                        let (shared, _) = m.shared.as_ref().unwrap();
+                        meta[base + 15] = 1;
+                        meta[base + 16] = m.experts.len() as u32;
+                        meta[base + 17] = pack.put(&r.mu);
+                        meta[base + 18] = pack.put(&r.u);
+                        meta[base + 19] = pack.put(&r.bias);
+                        meta[base + 20] = r.k as u32;
+                        // Word 30: the growth shell as the runtime applies
+                        // it now (`+inf` on trunk rows, the stored finite
+                        // shell on grown rows, all `+inf` under
+                        // `CMF_GROWTH_SHELL=off`), followed by one `−∞`
+                        // sentinel at index E the kernel writes as the
+                        // score of an expert outside its shell — WGSL has
+                        // no infinity literal, so the value travels as
+                        // data (`embryo_core_route_finalize`).
+                        let mut shell = r.effective_shell(m.experts.len());
+                        shell.push(f32::NEG_INFINITY);
+                        meta[base + 30] = pack.put(&shell);
+                        meta[base + 21] = pack.put(&Self::embryo_qtensor_f32(&shared.gate_proj));
+                        meta[base + 22] = pack.put(&Self::embryo_qtensor_f32(&shared.up_proj));
+                        meta[base + 23] = pack.put(&Self::embryo_qtensor_f32(&shared.down_proj));
+                        for (e, ex) in m.experts.iter().enumerate() {
+                            meta[base + 32 + e * 3] =
+                                pack.put(&Self::embryo_qtensor_f32(&ex.gate_proj));
+                            meta[base + 33 + e * 3] =
+                                pack.put(&Self::embryo_qtensor_f32(&ex.up_proj));
+                            meta[base + 34 + e * 3] =
+                                pack.put(&Self::embryo_qtensor_f32(&ex.down_proj));
+                        }
+                    }
+                    FfnKind::DenseMoe(_) => return None,
+                }
+            }
+            if !full_seen && self.num_layers == 0 {
+                return None;
+            }
+            let id = {
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            };
+            let model = crate::gpu::EmbryoGraphModel {
+                id,
+                hidden: self.hidden_size,
+                intermediate: self.intermediate_size,
+                vocab: self.vocab_size,
+                layers: self.num_layers,
+                phase_heads: vmf.map(|c| c.num_heads).unwrap_or(0),
+                nphase: vmf.map(|c| c.nphase).unwrap_or(0),
+                phase_dv: vmf.map(|c| c.value_head_dim).unwrap_or(0),
+                anchor_q_heads: self.num_heads,
+                anchor_kv_heads: self.num_kv_heads,
+                anchor_head_dim: self.head_dim,
+                rotary_dim: self.rotary_dim,
+                max_seq: self.kv_cache.max_seq_len,
+                cluster_count,
+                cluster_size: self.vocab_size / cluster_count,
+                phase_state_len: vmf.map(|c| c.state_len()).unwrap_or(0),
+                state_stride,
+                kv_stride,
+                norm_gemma: matches!(self.norm_style, NormStyle::Gemma),
+                phase_mass: vmf.map(|c| c.phase_mass).unwrap_or(0.0),
+                weights: pack.data,
+                meta,
+                lm_head: Self::embryo_qtensor_f32(&self.weights.lm_head),
+                clusters: clusters.as_ref().clone(),
+                final_norm: self.weights.final_norm.clone(),
+                inv_freq: self.inv_freq.as_ref().clone(),
+                bounded: bounded.is_some(),
+                kv_layers: if bounded.is_some() {
+                    bounded_seen
+                } else {
+                    self.num_layers
+                },
+                state_layers: phase_seen + gdn_seen,
+                anchor_window,
+                anchor_sink,
+                phase_layers: phase_seen,
+                gdn_layers: gdn_seen,
+                gdn_heads: gdn.map(|g| g.num_v_heads).unwrap_or(0),
+                gdn_k_heads: gdn.map(|g| g.num_k_heads).unwrap_or(0),
+                gdn_dk: gdn.map(|g| g.key_head_dim).unwrap_or(0),
+                gdn_dv: gdn.map(|g| g.value_head_dim).unwrap_or(0),
+                gdn_kk: gdn.map(|g| g.conv_kernel).unwrap_or(0),
+            };
+            self.embryo_graph = Some(std::sync::Arc::new(model));
+        }
+        self.embryo_graph.clone()
+    }
+
     fn forward_layers_span(
         &mut self,
         hidden: &[f32],
@@ -12810,6 +14318,85 @@ impl Pipeline {
                 self.pool.as_deref(),
             );
         }
+        // Cortiq Embryo owns a separate resident graph: phase recurrent
+        // state, resonance routing, the GQA anchor KV and hierarchical head
+        // all execute in one Vulkan submit. It is limited to a complete
+        // unmasked stack; spans and task masks retain the exact host path.
+        // `CMF_EMBRYO_DBG=1` names the gate that keeps a token off the
+        // resident graph — every refusal below is otherwise silent.
+        if from == 0
+            && upto.is_none()
+            && task_mask.is_none()
+            && self.anchor_core.is_some()
+            && std::env::var("CMF_EMBRYO_DBG").as_deref() == Ok("1")
+        {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                eprintln!(
+                    "embryo-dbg: graph_on decode={} prefill={} resident_env={:?} enabled_here={} \
+                     unsupported={} eligible={}",
+                    crate::gpu::wgpu_graph_on(crate::gpu::GraphPhase::Decode),
+                    crate::gpu::wgpu_graph_on(crate::gpu::GraphPhase::Prefill),
+                    std::env::var("CMF_EMBRYO_RESIDENT").ok(),
+                    crate::gpu::enabled_here(),
+                    self.graph_refused(),
+                    self.embryo_resident_eligible(),
+                );
+            });
+        }
+        if from == 0
+            && upto.is_none()
+            && task_mask.is_none()
+            // Embryo's recurrent/KV state has no host import path.  Do not
+            // seed it for a prefill-only graph and then silently decode from
+            // an empty CPU cache; both phases must select the resident owner.
+            && crate::gpu::wgpu_graph_on(crate::gpu::GraphPhase::Decode)
+            && crate::gpu::wgpu_graph_on(crate::gpu::GraphPhase::Prefill)
+            // This whole-token Embryo path remains explicitly opt-in.
+            // `CMF_GPU_WGPU_GRAPH=1` still enables the mature generic graph,
+            // but must not silently select this model-specific resident path.
+            && matches!(
+                std::env::var("CMF_EMBRYO_RESIDENT").as_deref(),
+                Ok("1") | Ok("parallel")
+            )
+            && crate::gpu::enabled_here()
+            && !self.graph_refused()
+            // Sequence owner: past position zero the device continues only
+            // a sequence it holds. A host-owned sequence (the graph refused
+            // at its start, or its prefix was prefilled on the host) keeps
+            // the host path to its end — never a device attempt at p > 0
+            // over an empty device image.
+            && (position == 0 || self.device_sequence_position().is_some())
+            && self.embryo_resident_eligible()
+            && let Some(model) = self.ensure_embryo_graph()
+        {
+            let mut lg = Vec::new();
+            if crate::gpu::forward_embryo_graph(&model, self.graph_kv_id, hidden, position, &mut lg)
+            {
+                self.graph_logits = Some(lg);
+                return vec![0.0; self.hidden_size];
+            }
+            if std::env::var("CMF_EMBRYO_DBG").as_deref() == Ok("1") {
+                eprintln!("embryo-dbg: forward_embryo_graph refused at position {position}");
+            }
+            // The refusal is THIS pipeline's: falling through once is safe
+            // at position zero (the host owns the sequence from here),
+            // while a refusal at a later position of a device-owned
+            // sequence would mix a host KV/state path with a partial
+            // device sequence.
+            self.mark_graph_refused();
+            if position != 0 {
+                // Fail this sequence alone and leave nothing stale behind:
+                // no reuse key, no host or device state for the next
+                // request on this slot to "extend".
+                self.kv_cache.clear();
+                self.clear_history();
+                crate::gpu::graph_kv_reset(self.graph_kv_id);
+                panic!(
+                    "resident Embryo graph refused at position {position}; refusing an in-flight host fallback"
+                );
+            }
+        }
         let mut h = hidden.to_vec();
         // MiMo-V2 expert placement: decided before the graph or the per-op
         // arena can claim the budget the expert bank needs.
@@ -12856,7 +14443,7 @@ impl Pipeline {
             && upto.is_none()
             && task_mask.is_none()
             && from == 0
-            && !crate::gpu::graph_unsupported();
+            && !self.graph_refused();
         let mut tail_start = 0usize;
         if race_eligible && crate::gpu::graph_race_use_graph(graph_trusted) {
             let t_graph = std::time::Instant::now();
@@ -12885,7 +14472,7 @@ impl Pipeline {
             // remember it instead of walking every layer again next
             // token.
             if declined && !self.o1_active() && self.attn_softcap == 0.0 {
-                crate::gpu::graph_mark_unsupported();
+                self.mark_graph_refused();
             }
             graph_note(built.is_some(), gl, self.num_layers);
             if let Some(hh) = built {
@@ -13164,6 +14751,29 @@ impl Pipeline {
                         &cfg,
                         &mut self.kv_cache.layers[li].linear_state,
                         self.pool.as_deref(),
+                    )
+                }
+                AttnKind::Bounded(w) => {
+                    // Natively bounded anchor: insert into the ring, attend
+                    // over sinks ∪ window. No position, nothing appended.
+                    let rope = self
+                        .bounded_rope
+                        .clone()
+                        .expect("bounded layer without an installed rotation table");
+                    let cfg = crate::bounded::BoundedAttnCfg {
+                        num_heads: self.num_heads,
+                        num_kv_heads: self.num_kv_heads,
+                        head_dim: self.head_dim,
+                        hidden_size: hs,
+                        scale: self.attn_scale,
+                        rope: &rope,
+                        pool: pool.as_deref(),
+                    };
+                    crate::bounded::bounded_attention(
+                        &self.ws.n1,
+                        w,
+                        &mut self.kv_cache.layers[li],
+                        &cfg,
                     )
                 }
                 AttnKind::Full {
@@ -13585,6 +15195,12 @@ impl Pipeline {
             .iter()
             .enumerate()
             .filter_map(|(i, sk)| {
+                // A v2 record routes only through the request-level
+                // backbone-gated decision (its status and gate are
+                // checked there), never per token.
+                if sk.is_v2() {
+                    return None;
+                }
                 let ok = matches!(self.dyn_skill_layers.get(i), Some(Some(_)));
                 let sel = sk.selection.as_ref()?;
                 (ok).then(|| (i, sk.id.clone(), sel.phi_layer))
@@ -13606,6 +15222,35 @@ impl Pipeline {
         let Some(model) = self.model.clone() else {
             return 0;
         };
+        // Router policy v2 (spec §9.4) routes per REQUEST: the backbone is
+        // the default and only the backbone-gated decision may pick a
+        // skill. A per-token switch would bypass that gate (and change
+        // the O(1) state mid-sequence), so the hysteresis router never
+        // runs on such a file; the caller keeps the request-level
+        // decision.
+        if let Some(r) = &model.header.router {
+            tracing::warn!(
+                "dynamic routing disabled: this file declares router policy '{}' with \
+                 granularity \"{}\" — the request-level decision applies instead",
+                r.policy,
+                r.granularity
+            );
+            return 0;
+        }
+        // Format-v2 skill records (bit SKILLS_V2) without a router policy:
+        // their status/gate contract ("auto-routing requires active +
+        // measured") lives in the backbone-gated decision only — the
+        // hysteresis router would switch into a quarantined record
+        // (fail-open). Refuse the whole file, not just its v2 records.
+        if model.required_features & cortiq_core::format::features::SKILLS_V2 != 0
+            || model.header.skills.iter().any(|s| s.is_v2())
+        {
+            tracing::warn!(
+                "dynamic routing disabled: this file carries format-v2 skill records \
+                 (SKILLS_V2) — they route per request through a router policy only"
+            );
+            return 0;
+        }
         // A blend materialized f32 working tensors into the layers; there
         // is no single skill index to revert from → refuse (honest).
         if self.dyn_blend_loaded {
@@ -13725,6 +15370,8 @@ impl Pipeline {
     /// for `cortiq explain`). Clears and repopulates the KV cache; leaves
     /// the active overlay untouched.
     pub fn prefill_next_logits(&mut self, ids: &[u32], task_mask: Option<&TaskMask>) -> Vec<f32> {
+        #[cfg(target_os = "macos")]
+        crate::gpu_metal::set_io_namespace(self.graph_kv_id);
         self.clear_sequence_state();
         // This helper is used by the pooled classification endpoint, where
         // every request is a fresh sequence. The shared reset also clears the
@@ -13740,6 +15387,11 @@ impl Pipeline {
         }
         if let Err(err) = self.o1_seal_checked() {
             self.o1_fail(err);
+        }
+        // Stacks that own their head (V4, V4.1, Qwen3.8-Flash-Next, GLM-5)
+        // return a zero hidden and hand the logits out of band.
+        if let Some(logits) = self.graph_logits.take() {
+            return logits;
         }
         inference::rms_norm_into(
             &hidden,
@@ -15886,24 +17538,33 @@ impl SendMut {
 /// scale 1 → bit-identical to the historical path. LFM2-MoE /
 /// DeepSeek-V3 `noaux_tc`: per-expert sigmoid scores, an optional
 /// selection bias (top-k CHOICE only; weights stay unbiased), a 1e-6 renorm
-/// floor and a routed scale.
+/// floor and a routed scale. Architectures whose reference uses a different
+/// sigmoid denominator floor (for example GLM-5's `1e-20`) call
+/// [`moe_route_with_eps`] directly; the historical generic path remains
+/// unchanged.
 pub(crate) fn moe_route(
     logits: &[f32],
     m: &MoeFfn,
     allowed: Option<&[bool]>,
 ) -> (Vec<usize>, Vec<f32>, f32) {
+    moe_route_with_eps(logits, m, allowed, 1e-6)
+}
+
+/// Router implementation with an explicit sigmoid renormalization floor.
+///
+/// GLM-5.3's source computes `sum(selected_scores) + 1e-20`; using the
+/// generic 1e-6 floor there is not a harmless tolerance difference when all
+/// logits are very negative: it collapses the routed branch toward zero
+/// instead of normalizing the selected experts. Keeping the epsilon parameter
+/// here avoids changing the established Qwen/LFM2 contract while allowing
+/// each architecture to preserve its own numerical semantics.
+pub(crate) fn moe_route_with_eps(
+    logits: &[f32],
+    m: &MoeFfn,
+    allowed: Option<&[bool]>,
+    sigmoid_denom_eps: f32,
+) -> (Vec<usize>, Vec<f32>, f32) {
     let ne = logits.len();
-    let p: Vec<f32> = if m.router_sigmoid {
-        logits.iter().map(|&l| 1.0 / (1.0 + (-l).exp())).collect()
-    } else {
-        let mx = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let mut e: Vec<f32> = logits.iter().map(|&l| (l - mx).exp()).collect();
-        let s: f32 = e.iter().sum();
-        for v in &mut e {
-            *v /= s;
-        }
-        e
-    };
     // Expert restriction: the static env mask (CMF_MOE_MASK) AND the
     // active task mask's expert fields (spec §5) both narrow the
     // candidate set; selection happens over the admitted experts only.
@@ -15912,6 +17573,55 @@ pub(crate) fn moe_route(
     let admit = |e: usize| {
         m.mask.as_ref().is_none_or(|mk| mk[e])
             && allowed.is_none_or(|a| a.get(e).copied().unwrap_or(false))
+    };
+    // The resonance router (spec §9.5.1) selects by the RAW score: the
+    // trainer (`resonance_winner`) and the resident graph
+    // (`embryo_core_route_pick`) take the first maximum of the scores
+    // and run the winner with weight 1.0. Selecting through the softmax
+    // instead is not the same decision: `exp(l − max)` rounds two scores
+    // closer than 2^-25 (possible below |score| 0.25) to the same 1.0, and
+    // the lower index would take a token whose score is strictly smaller
+    // — the trainer's trace and the graph would disagree with this path.
+    // `−∞` (outside the shell) never wins; with no finite admitted expert
+    // the generic path below degrades to uniform. The winner's
+    // probability is 1.0 by construction (a one-hot `p`), so its
+    // renormalized weight is `routed_scaling` on both norm_topk settings.
+    if m.resonance.is_some() && m.top_k == 1 {
+        let mut best: Option<usize> = None;
+        for e in (0..ne).filter(|&e| admit(e)) {
+            let l = logits[e];
+            if l == f32::NEG_INFINITY || l.is_nan() {
+                continue;
+            }
+            if best.is_none_or(|b| l > logits[b]) {
+                best = Some(e);
+            }
+        }
+        if let Some(b) = best {
+            let mut p = vec![0.0f32; ne];
+            p[b] = 1.0;
+            return (vec![b], p, 1.0 / m.routed_scaling);
+        }
+    }
+    // A `−∞` logit (a grown expert outside its shell, `Resonance::scores`)
+    // takes probability 0 on both paths: sigmoid(−∞) = 0, exp(−∞ − max) = 0
+    // — top-1 is the best FINITE expert, its renormalized weight exactly
+    // 1.0. Every expert at −∞ cannot happen (trunk experts have no shell);
+    // should it, the softmax would be NaN, so it degrades to uniform.
+    let p: Vec<f32> = if m.router_sigmoid {
+        logits.iter().map(|&l| 1.0 / (1.0 + (-l).exp())).collect()
+    } else {
+        let mx = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        if mx == f32::NEG_INFINITY {
+            vec![1.0 / ne.max(1) as f32; ne]
+        } else {
+            let mut e: Vec<f32> = logits.iter().map(|&l| (l - mx).exp()).collect();
+            let s: f32 = e.iter().sum();
+            for v in &mut e {
+                *v /= s;
+            }
+            e
+        }
     };
     let mut idx: Vec<usize> = (0..ne).filter(|&e| admit(e)).collect();
     // Descending by selection score, lower index wins ties (torch.topk).
@@ -15945,9 +17655,14 @@ pub(crate) fn moe_route(
     }
     let wsum: f32 = if m.norm_topk_prob {
         let s: f32 = idx.iter().map(|&e| p[e]).sum();
-        // LFM2 floors the denom (matches HF `+ 1e-6`); the softmax path's
-        // probs already sum near 1, so it stays exactly as before.
-        (if m.router_sigmoid { s + 1e-6 } else { s }) / m.routed_scaling
+        // Sigmoid routers use their architecture's reference floor; the
+        // softmax path's probs already sum near 1, so it stays exactly as
+        // before.
+        (if m.router_sigmoid {
+            s + sigmoid_denom_eps
+        } else {
+            s
+        }) / m.routed_scaling
     } else {
         1.0 / m.routed_scaling
     };
@@ -16419,7 +18134,7 @@ fn moe_ffn_cpu(
 /// and the pad is sliced off before O. Attention importance is not
 /// accumulated for MLA yet (no eviction interplay).
 #[allow(clippy::too_many_arguments)]
-fn mla_attention(
+pub(crate) fn mla_attention(
     w: &MlaWeights,
     normed: &[f32],
     cache: &mut crate::kv_cache::LayerKvCache,
@@ -17249,6 +18964,7 @@ mod tests {
             per_expert_scale: None,
             router_input_norm: false,
             resonance: None,
+            grown: Vec::new(),
         };
         let actual = moe_ffn_cpu(&moe, &x, &[0], &[0.0], 1.0, None);
         for (actual, expected) in actual.iter().zip(expected) {
@@ -17310,6 +19026,7 @@ mod tests {
                         per_expert_scale: None,
                         router_input_norm: false,
                         resonance: None,
+                        grown: Vec::new(),
                     })
                 },
                 attn: AttnKind::Full {
@@ -18189,5 +19906,282 @@ mod tests {
                 .all(|(a, b)| (a - b).abs() < 1e-9)
         );
         assert_eq!(p.kv_cache.seq_len(), ids.len());
+    }
+
+    #[test]
+    fn sigmoid_router_floor_is_explicit_per_architecture() {
+        // GLM-5's noaux_tc reference uses +1e-20 while the generic
+        // LFM2-compatible path uses +1e-6.  At low (but representable)
+        // sigmoid scores, silently sharing the latter changes expert weights
+        // by orders of magnitude and can make a routed layer look coherent
+        // while discarding its expert contribution.
+        let zero = || DenseFfn {
+            gate_proj: QTensor::from_f32(vec![0.0; 4], 2, 2),
+            up_proj: QTensor::from_f32(vec![0.0; 4], 2, 2),
+            down_proj: QTensor::from_f32(vec![0.0; 4], 2, 2),
+            act: Act::Silu,
+            down_t: None,
+            segs: Vec::new(),
+        };
+        let m = MoeFfn {
+            router: QTensor::from_f32(vec![0.0; 4], 2, 2),
+            experts: vec![zero(), zero()],
+            top_k: 1,
+            norm_topk_prob: true,
+            router_sigmoid: true,
+            expert_bias: None,
+            routed_scaling: 2.5,
+            route_tau: None,
+            shared: None,
+            stats: std::cell::RefCell::new(Vec::new()),
+            act_sq: std::cell::RefCell::new(Vec::new()),
+            act_rows: std::cell::RefCell::new(Vec::new()),
+            mask: None,
+            per_expert_scale: None,
+            router_input_norm: false,
+            resonance: None,
+            grown: Vec::new(),
+        };
+        let logits = [-20.0f32, -20.0];
+        let (_, p, glm_wsum) = moe_route_with_eps(&logits, &m, None, 1e-20);
+        let (_, _, generic_wsum) = moe_route(&logits, &m, None);
+        let expected = (p[0] + 1e-20) / m.routed_scaling;
+        assert!((glm_wsum - expected).abs() < 1e-15);
+        assert!(generic_wsum > glm_wsum * 100.0);
+    }
+
+    #[test]
+    fn resonance_scores_match_formula_and_stable_tie() {
+        let r = Resonance {
+            // Three descriptors, hidden=2, one projection row each.
+            mu: vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0],
+            u: vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            k: 1,
+            bias: vec![1.5, 0.5, 0.0],
+            shell: Vec::new(),
+        };
+        let x = [1.0f32, 1.0];
+        let mut got = vec![0.0; 3];
+        r.scores(&x, &mut got);
+        // Expert 0 and 1 are an exact score tie; the CPU top-1 contract uses
+        // the lower index.  The values also check d² - (U·d)², not just tie
+        // ordering.
+        assert!((got[0] - 0.5).abs() < 1e-6);
+        assert!((got[1] - 0.5).abs() < 1e-6);
+        assert!(got[2].abs() < 1e-6);
+        let best = got
+            .iter()
+            .enumerate()
+            .max_by(|(ia, a), (ib, b)| a.partial_cmp(b).unwrap().then(ib.cmp(ia)))
+            .map(|(i, _)| i);
+        assert_eq!(best, Some(0));
+        assert!(got.iter().all(|v| v.is_finite()));
+    }
+
+    /// The growth shell (spec §2): a grown expert whose reconstruction
+    /// error lies outside its shell scores −∞, one inside keeps the exact
+    /// resonance score, trunk rows (`+inf` shell) are bit-identical to the
+    /// shell-less computation; the process-wide switch disables it.
+    #[test]
+    fn resonance_shell_masks_outside_keeps_inside_and_trunk_bits() {
+        // hidden = 2, rank 1. Experts 0/1 = trunk (shell +inf); 2 and 3 =
+        // grown, the same descriptor (μ = (0, 1), u = (1, 1)) with shells
+        // 6.0 and 0.25. At x' = (3, 0): d = (3, −1), d² = 10, proj =
+        // (3 − 1)² = 4, err = 6 exactly — on the boundary of expert 2's
+        // shell (kept: the rule is strict `>`), outside expert 3's.
+        let plain = Resonance {
+            mu: vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0],
+            u: vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+            k: 1,
+            bias: vec![1.5, 0.5, 0.0, 0.0],
+            shell: Vec::new(),
+        };
+        let shelled = Resonance {
+            mu: plain.mu.clone(),
+            u: plain.u.clone(),
+            k: 1,
+            bias: plain.bias.clone(),
+            shell: vec![f32::INFINITY, f32::INFINITY, 6.0, 0.25],
+        };
+        assert!(!plain.has_shell());
+        assert!(shelled.has_shell());
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let (mut a, mut b) = (vec![0.0; 4], vec![0.0; 4]);
+        set_growth_shell(Some(true));
+        assert!(growth_shell_enabled());
+        // x = (1, 1): the grown experts reconstruct it exactly (err 0):
+        // inside both shells, every row the shell-less bits.
+        let x = [1.0f32, 1.0];
+        plain.scores(&x, &mut a);
+        shelled.scores(&x, &mut b);
+        assert_eq!(bits(&a), bits(&b), "inside every shell: unchanged");
+        assert!(a[2] == 0.0 && a[3] == 0.0);
+        // x' = (3, 0): expert 3 → −∞, expert 2 (err == shell) and the
+        // trunk rows keep their exact bits.
+        let xo = [3.0f32, 0.0];
+        plain.scores(&xo, &mut a);
+        shelled.scores(&xo, &mut b);
+        assert_eq!(a[2], -6.0);
+        assert_eq!(a[3], -6.0);
+        assert_eq!(bits(&a[..3]), bits(&b[..3]), "trunk rows + the boundary row");
+        assert_eq!(b[3], f32::NEG_INFINITY, "outside the shell: −∞");
+        assert_eq!(shelled.effective_shell(4), shelled.shell);
+        // The switch (`CMF_GROWTH_SHELL=off` / `growth-eval --shell off`):
+        // all +inf, the shell-less bits everywhere.
+        set_growth_shell(Some(false));
+        assert!(!growth_shell_enabled());
+        assert_eq!(shelled.effective_shell(4), vec![f32::INFINITY; 4]);
+        shelled.scores(&xo, &mut b);
+        assert_eq!(bits(&a), bits(&b));
+        set_growth_shell(None);
+        // A shell vector shorter than the expert count masks nothing
+        // beyond it (a legacy layer whose tail has no shell).
+        let short = Resonance {
+            shell: vec![f32::INFINITY, f32::INFINITY],
+            ..shelled
+        };
+        set_growth_shell(Some(true));
+        short.scores(&xo, &mut b);
+        assert_eq!(bits(&a), bits(&b));
+        set_growth_shell(None);
+    }
+
+    /// `moe_route` with −∞ logits (a grown expert outside its shell):
+    /// top-1 is the best finite expert with weight exactly 1.0 on both
+    /// the softmax and the sigmoid path; all −∞ degrades to uniform.
+    #[test]
+    fn moe_route_neg_inf_logits_pick_the_best_finite_expert_with_weight_one() {
+        let zero = || DenseFfn {
+            gate_proj: QTensor::from_f32(vec![0.0; 4], 2, 2),
+            up_proj: QTensor::from_f32(vec![0.0; 4], 2, 2),
+            down_proj: QTensor::from_f32(vec![0.0; 4], 2, 2),
+            act: Act::Silu,
+            down_t: None,
+            segs: Vec::new(),
+        };
+        let moe = |sigmoid: bool| MoeFfn {
+            router: QTensor::from_f32(vec![0.0; 8], 4, 2),
+            experts: vec![zero(), zero(), zero(), zero()],
+            top_k: 1,
+            norm_topk_prob: true,
+            router_sigmoid: sigmoid,
+            expert_bias: None,
+            routed_scaling: 1.0,
+            route_tau: None,
+            shared: None,
+            stats: std::cell::RefCell::new(Vec::new()),
+            act_sq: std::cell::RefCell::new(Vec::new()),
+            act_rows: std::cell::RefCell::new(Vec::new()),
+            mask: None,
+            per_expert_scale: None,
+            router_input_norm: false,
+            resonance: None,
+            grown: Vec::new(),
+        };
+        let logits = [-1.0f32, f32::NEG_INFINITY, -0.5, f32::NEG_INFINITY];
+        for sigmoid in [false, true] {
+            let m = moe(sigmoid);
+            let (idx, p, wsum) = moe_route(&logits, &m, None);
+            assert_eq!(idx, vec![2], "sigmoid {sigmoid}");
+            assert_eq!(p[1], 0.0);
+            assert_eq!(p[3], 0.0);
+            assert!(p[2] > p[0] && p[0] > 0.0);
+            assert!(p.iter().all(|v| v.is_finite()));
+            let w = p[2] / wsum;
+            if sigmoid {
+                // The sigmoid renorm keeps its reference floor (+1e-6).
+                assert!((w - 1.0).abs() < 1e-5, "sigmoid: weight {w}");
+            } else {
+                assert_eq!(w, 1.0, "softmax: the renormalized top-1 weight is exactly 1");
+            }
+            // Masked experts stay masked even when they are the only ones
+            // "admitted" by an allow-list that covers everything.
+            let (idx, _, _) = moe_route(&logits, &m, Some(&[true, true, true, true]));
+            assert_eq!(idx, vec![2]);
+        }
+        // A finite expert always beats −∞ whatever the bias / order.
+        let m = moe(false);
+        let (idx, _, _) = moe_route(&[f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY, -9.0], &m, None);
+        assert_eq!(idx, vec![3]);
+        // Every expert at −∞ (cannot happen on a grown file — trunk rows
+        // have no shell): uniform, finite, lowest index.
+        let (idx, p, wsum) = moe_route(&[f32::NEG_INFINITY; 4], &m, None);
+        assert_eq!(idx, vec![0]);
+        assert!(p.iter().all(|&v| v == 0.25));
+        assert!(wsum.is_finite() && wsum > 0.0);
+    }
+
+    /// The resonance router (top-1) selects by the raw score as the
+    /// trainer and the graph do — not by softmax probabilities, where two
+    /// scores closer than 2^-25 collapse to the same `exp(l − max) = 1.0`
+    /// and the LOWER index wins a token whose score is strictly smaller.
+    #[test]
+    fn resonance_route_picks_the_raw_argmax_not_the_softmax_tie() {
+        let zero = || DenseFfn {
+            gate_proj: QTensor::from_f32(vec![0.0; 4], 2, 2),
+            up_proj: QTensor::from_f32(vec![0.0; 4], 2, 2),
+            down_proj: QTensor::from_f32(vec![0.0; 4], 2, 2),
+            act: Act::Silu,
+            down_t: None,
+            segs: Vec::new(),
+        };
+        let moe = |resonant: bool, norm_topk: bool| MoeFfn {
+            router: QTensor::from_f32(vec![0.0; 6], 3, 2),
+            experts: vec![zero(), zero(), zero()],
+            top_k: 1,
+            norm_topk_prob: norm_topk,
+            router_sigmoid: false,
+            expert_bias: None,
+            routed_scaling: 1.0,
+            route_tau: None,
+            shared: None,
+            stats: std::cell::RefCell::new(Vec::new()),
+            act_sq: std::cell::RefCell::new(Vec::new()),
+            act_rows: std::cell::RefCell::new(Vec::new()),
+            mask: None,
+            per_expert_scale: None,
+            router_input_norm: false,
+            resonance: resonant.then(|| Resonance {
+                mu: vec![0.0; 6],
+                u: Vec::new(),
+                k: 0,
+                bias: vec![0.0; 3],
+                shell: Vec::new(),
+            }),
+            grown: Vec::new(),
+        };
+        // lo = −0.1, hi = the next f32 towards zero: hi − lo = 2^-27 <
+        // 2^-25, so exp(lo − hi) rounds to exactly 1.0 — a softmax tie.
+        let lo = -0.1f32;
+        let hi = f32::from_bits(lo.to_bits() - 1);
+        assert!(hi > lo && hi - lo < 2f32.powi(-25));
+        assert_eq!((lo - hi).exp(), 1.0, "the tie this test is about");
+        // The gated MoE (softmax) path: the tie hands the token to index 0.
+        let (idx, _, _) = moe_route(&[lo, hi], &moe(false, true), None);
+        assert_eq!(idx, vec![0], "softmax tie → lower index (the gated contract)");
+        // The resonance path: the strictly larger raw score wins, weight
+        // exactly 1.0 with and without norm_topk.
+        for norm in [true, false] {
+            let m = moe(true, norm);
+            let (idx, p, wsum) = moe_route(&[lo, hi, f32::NEG_INFINITY], &m, None);
+            assert_eq!(idx, vec![1], "norm_topk {norm}");
+            assert_eq!(p, vec![0.0, 1.0, 0.0]);
+            assert_eq!(p[1] / wsum, 1.0);
+            // An exact tie: the first maximum (as `resonance_winner` and
+            // `embryo_core_route_pick`).
+            let (idx, _, _) = moe_route(&[hi, hi, lo], &m, None);
+            assert_eq!(idx, vec![0]);
+            // `−∞` never wins; the admitted set is honoured.
+            let (idx, _, _) = moe_route(&[f32::NEG_INFINITY, lo, hi], &m, None);
+            assert_eq!(idx, vec![2]);
+            let (idx, p, wsum) = moe_route(&[lo, hi, hi], &m, Some(&[true, false, false]));
+            assert_eq!(idx, vec![0]);
+            assert_eq!(p[0] / wsum, 1.0);
+            // Every admitted expert at −∞: the generic path's uniform
+            // fallback (lowest index, finite weights).
+            let (idx, p, wsum) = moe_route(&[f32::NEG_INFINITY; 3], &m, None);
+            assert_eq!(idx, vec![0]);
+            assert!(p.iter().all(|v| v.is_finite()) && wsum.is_finite() && wsum > 0.0);
+        }
     }
 }

@@ -17716,6 +17716,7 @@ mod tests {
             moe: None,
             qwen4_exp: None,
             deepseek_v41: None,
+            anchor_core: None,
             linear_core: None,
             head_clusters: None,
             max_position_embeddings: 8,
@@ -17762,6 +17763,10 @@ mod tests {
             shard: None,
             calibration: None,
             routing: None,
+            genome: None,
+            lineage: Vec::new(),
+            router: None,
+            segments: Vec::new(),
         };
         let spec = TensorSpec {
             name: "lm_head.weight".into(),
@@ -17850,6 +17855,7 @@ mod tests {
             moe: None,
             qwen4_exp: None,
             deepseek_v41: None,
+            anchor_core: None,
             linear_core: None,
             head_clusters: None,
             max_position_embeddings: 8,
@@ -17896,6 +17902,10 @@ mod tests {
             shard: None,
             calibration: None,
             routing: None,
+            genome: None,
+            lineage: Vec::new(),
+            router: None,
+            segments: Vec::new(),
         };
         let spec = TensorSpec {
             name: "w".into(),
@@ -18013,6 +18023,7 @@ mod tests {
             moe: None,
             qwen4_exp: None,
             deepseek_v41: None,
+            anchor_core: None,
             linear_core: None,
             head_clusters: None,
             max_position_embeddings: 8,
@@ -18059,6 +18070,10 @@ mod tests {
             shard: None,
             calibration: None,
             routing: None,
+            genome: None,
+            lineage: Vec::new(),
+            router: None,
+            segments: Vec::new(),
         };
         let spec = TensorSpec {
             name: "lm_head.weight".into(),

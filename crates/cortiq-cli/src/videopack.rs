@@ -2051,6 +2051,10 @@ pub fn cmd_animate_pack(args: PackArgs<'_>) -> anyhow::Result<()> {
         shard: None,
         calibration: None,
         routing: None,
+        genome: None,
+        lineage: Vec::new(),
+        router: None,
+        segments: Vec::new(),
     };
     CmfModel::write_ref(args.out, &header, &refs, None, vocab.as_deref())
         .map_err(|e| anyhow!("write {}: {e}", args.out))?;

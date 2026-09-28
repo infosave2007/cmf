@@ -66,6 +66,7 @@ fn tiny_arch() -> ModelArch {
         moe: None,
         qwen4_exp: None,
         deepseek_v41: None,
+        anchor_core: None,
         linear_core: None,
         head_clusters: None,
         max_position_embeddings: 4096,
@@ -271,6 +272,7 @@ fn write_tiny_model_variant(
             num_heads: G_NV,
             nphase: None,
             value_head_dim: G_DV,
+            phase_delta_layers: None,
         });
         arch.linear_num_key_heads = Some(G_NK);
         arch.linear_num_value_heads = Some(G_NV);
@@ -289,6 +291,10 @@ fn write_tiny_model_variant(
         shard: None,
         calibration: None,
         routing: None,
+        genome: None,
+        lineage: Vec::new(),
+        router: None,
+        segments: Vec::new(),
     };
     let path = dir.join(format!("{name}.cmf"));
     CmfModel::write(&path, &header, &specs, None, None).expect("write tiny model");

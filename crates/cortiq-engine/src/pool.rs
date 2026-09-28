@@ -6,13 +6,14 @@
 //! bit-identical to the serial path (each row's dot product is computed
 //! the same way).
 //!
-//! Dispatch is a single shared job slot + atomic epoch (roadmap §3 P0):
-//! the caller publishes one pointer, bumps the epoch and JOINS THE WORK
-//! as the extra worker instead of blocking on a latch. The previous
-//! design allocated an `Arc<Latch>` and pushed a message into every
-//! worker's mpsc channel for every matvec (~200 dispatches/token) —
-//! with decode-grade matvecs that synchronization was its own budget.
-//! Workers spin for `CMF_POOL_SPIN` iterations before parking.
+//! Dispatch is one shared job descriptor + a per-worker ticket (roadmap
+//! §3 P0): the caller writes the descriptor, hands a ticket to each
+//! worker it invites and JOINS THE WORK as the extra worker instead of
+//! blocking on a latch. The previous design allocated an `Arc<Latch>`
+//! and pushed a message into every worker's mpsc channel for every
+//! matvec (~200 dispatches/token) — with decode-grade matvecs that
+//! synchronization was its own budget. Workers spin for
+//! `CMF_POOL_SPIN` iterations before parking.
 //! Default 4000: at ~39 dispatches/token, park-immediately pays the
 //! unpark syscall on every worker for every dispatch — measured on an
 //! M4 (interleaved A/B, current epoch dispatch + parked-flag design):
@@ -27,7 +28,6 @@
 //! `CMF_THREADS` env: 0/1 = serial, N = worker count
 //! (default: available_parallelism − 1, capped at 8).
 
-use std::cell::UnsafeCell;
 use std::sync::Arc;
 #[cfg(any(target_os = "android", target_os = "linux"))]
 use std::sync::Mutex;
@@ -44,38 +44,85 @@ pub static FORCED_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::A
 /// pool's per-instance registration barrier; empty elsewhere.
 pub static WORKER_TIDS: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
 
-/// A `*const dyn Fn` that may cross a thread boundary. Safety is
-/// provided by `Pool::run`: the caller blocks until every worker has
-/// finished, so the borrow outlives all uses.
-#[derive(Clone, Copy)]
-struct TaskPtr(*const (dyn Fn(usize, usize) + Sync));
-unsafe impl Send for TaskPtr {}
+/// Keeps a word that one thread writes and others poll off everybody
+/// else's cache line (128 bytes: Apple silicon lines, and the adjacent-
+/// line prefetcher pair on x86).
+#[repr(align(128))]
+struct Padded<T>(T);
+
+/// One worker's mailbox, alone on its line: the worker polls it, only the
+/// caller writes `ticket`, only the worker writes `parked`.
+#[repr(align(128))]
+struct Slot {
+    /// Jobs handed to this worker so far. The caller bumps it (Release,
+    /// after the descriptor) once per job the worker is invited to; the
+    /// worker runs exactly one job per bump. The caller issues the next
+    /// bump only after this worker's `remaining` decrement for the
+    /// previous one, so the worker can never miss or double a ticket.
+    ticket: AtomicUsize,
+    /// "I am parked" — lets the caller skip the unpark syscall for a
+    /// worker that is still spinning.
+    parked: AtomicBool,
+}
 
 struct Inner {
-    /// Bumped once per published job; workers watch it.
+    /// Bumped once per published job, invited or not. Spinning workers
+    /// read it ONLY to re-arm their spin budget (the pool is busy, the
+    /// next job is microseconds away); it never makes a worker run
+    /// anything or read the descriptor.
     epoch: AtomicUsize,
-    /// Workers still running the current job (excludes the caller).
-    remaining: AtomicUsize,
-    /// The published job: closure pointer + total participant count.
-    /// Written by the caller BEFORE the epoch bump, read by workers
-    /// AFTER they observe the new epoch (acquire/release pairing).
-    /// (task, worker count, publisher's GPU device, worker limit). The
-    /// device rides along because a dispatch begun on card 1 must not
-    /// finish on card 0: worker threads have their own thread-locals,
-    /// and the engine resolves its wgpu context through one. The limit
-    /// is how many workers PARTICIPATE: a job with eight grains has no
-    /// use for three hundred workers — the unpark syscalls and the
-    /// remaining-drain would BE the job (measured: 361 pool dispatches
-    /// per DeepSeek-V4 token, and CMF_THREADS=64 vs 380 was 1.3 vs 2.4
-    /// tok/s with no other change). Workers at or past the limit skip
-    /// the job entirely and never touch `remaining`.
-    slot: UnsafeCell<Option<(TaskPtr, usize, usize, usize)>>,
+    /// The published job: closure (fat-pointer halves), participant
+    /// count, publisher's GPU device. The device rides along because a
+    /// dispatch begun on card 1 must not finish on card 0: worker threads
+    /// have their own thread-locals, and the engine resolves its wgpu
+    /// context through one.
+    ///
+    /// Only workers holding a ticket for the current job read these
+    /// words, and the caller rewrites them only after `remaining` hit 0,
+    /// i.e. after every ticket holder has finished — so a read never
+    /// races a write and there is no torn descriptor to detect.
+    ///
+    /// History, because both earlier protocols failed: (1) one slot read
+    /// by EVERY worker on the epoch bump. A worker not invited to job k
+    /// is not waited for, so it could be preempted between seeing epoch k
+    /// and reading the slot, by which time the slot held job k+1 — it ran
+    /// k+1, decremented `remaining`, then saw epoch k+1 as new and ran it
+    /// AGAIN: `remaining` wrapped to `usize::MAX` and the caller spun
+    /// forever (the 47-minute `cortiq ppl` on the S4 bounded export,
+    /// whose 384-row Embryo matrices make every dispatch a limited one).
+    /// (2) The same words under a seqlock with the epoch inside: correct
+    /// on x86, but no release fence followed the writer's opening
+    /// increment, so the memory model did not order it before the word
+    /// stores (weakly ordered ARM may show a reader new words under an
+    /// old even count), and every limited dispatch still woke every
+    /// spinning worker to read the descriptor and skip it. With more
+    /// spinners than CPUs (the straggler test's 4× pool on a 2–4-CPU CI
+    /// runner) they held the CPUs while the one invited worker waited
+    /// for a time slice: ~10 ms per dispatch, 20 k jobs in ~230 s. A
+    /// worker now learns it is invited from its own ticket and nothing
+    /// else.
+    desc_data: AtomicUsize,
+    desc_vtable: AtomicUsize,
+    desc_n: AtomicUsize,
+    desc_dev: AtomicUsize,
+    /// Ticket holders still running the current job (excludes the
+    /// caller). Its own line: the caller polls it while workers
+    /// decrement.
+    remaining: Padded<AtomicUsize>,
+    /// One mailbox per worker, same order as `Pool::threads`.
+    slots: Box<[Slot]>,
     shutdown: AtomicBool,
     /// Spin iterations before a worker parks (0 = park immediately).
     spin_budget: AtomicUsize,
-    /// Per-worker "I am parked" flags — lets the caller skip the unpark
-    /// syscall for workers that are still spinning.
-    parked: Box<[AtomicBool]>,
+    /// More threads (workers + caller) than CPUs this process may run
+    /// on. Spinning cannot help then: a spinner occupies the CPU the
+    /// thread that has the work needs, and the job waits for the
+    /// scheduler's time slice. So in this mode a worker's spin budget is
+    /// re-armed only by its own tickets (an idle worker parks instead of
+    /// spinning through other workers' jobs), and every spinner — worker
+    /// or waiting caller — yields the CPU between short spin bursts.
+    /// The default size (available_parallelism − 1 workers) never is.
+    oversubscribed: bool,
     /// Per-pool registration state. `WORKER_TIDS` is a process-wide
     /// snapshot for ADPF and cannot be a construction barrier: another
     /// pool may clear and republish that snapshot concurrently.
@@ -84,11 +131,6 @@ struct Inner {
     #[cfg(any(target_os = "android", target_os = "linux"))]
     worker_tids: Mutex<Vec<i32>>,
 }
-
-// SAFETY: `slot` is only written while no job is in flight (run()
-// returns after `remaining` hits 0) and only read after the epoch
-// publication that follows the write.
-unsafe impl Sync for Inner {}
 
 /// Process-wide dispatch counter (roadmap §3 P0 «измерения»): one tick
 /// per published job. `bench --json` reports dispatches/token from it.
@@ -140,13 +182,27 @@ impl Pool {
 
     /// Explicit spin budget (tests pin it without touching the env).
     pub fn with_spin(n_workers: usize, spin_budget: usize) -> Self {
+        // Affinity- and cgroup-quota-aware on Linux; read once — the NUMA
+        // bind never narrows the mask below the pool's thread count.
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
         let inner = Arc::new(Inner {
             epoch: AtomicUsize::new(0),
-            remaining: AtomicUsize::new(0),
-            slot: UnsafeCell::new(None),
+            desc_data: AtomicUsize::new(0),
+            desc_vtable: AtomicUsize::new(0),
+            desc_n: AtomicUsize::new(0),
+            desc_dev: AtomicUsize::new(0),
+            remaining: Padded(AtomicUsize::new(0)),
+            slots: (0..n_workers)
+                .map(|_| Slot {
+                    ticket: AtomicUsize::new(0),
+                    parked: AtomicBool::new(false),
+                })
+                .collect(),
             shutdown: AtomicBool::new(false),
             spin_budget: AtomicUsize::new(spin_budget),
-            parked: (0..n_workers).map(|_| AtomicBool::new(false)).collect(),
+            oversubscribed: n_workers + 1 > cpus,
             #[cfg(any(target_os = "android", target_os = "linux"))]
             registered: AtomicUsize::new(0),
             #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -389,6 +445,65 @@ impl Pool {
         self.inner.spin_budget.store(spins, Ordering::Relaxed);
     }
 
+    /// One job: write the descriptor, hand a ticket to workers `0..nw`,
+    /// run the caller's share as participant `nw` of `nw + 1`, and return
+    /// once every ticket holder has finished. Only one job is ever in
+    /// flight (this drains `remaining` before it returns), so the caller
+    /// is the single writer of the descriptor, `remaining` and every
+    /// `ticket`; workers without a ticket never touch any of them.
+    fn dispatch(&self, f: &(dyn Fn(usize, usize) + Sync), nw: usize) {
+        let inner = &*self.inner;
+        let n = nw + 1;
+        let ptr: *const (dyn Fn(usize, usize) + Sync) = f;
+        // SAFETY: a fat pointer is exactly two words on every supported
+        // target; the halves are only ever reassembled by `worker_loop`.
+        let raw: [usize; 2] = unsafe { std::mem::transmute(ptr) };
+        inner.desc_data.store(raw[0], Ordering::Relaxed);
+        inner.desc_vtable.store(raw[1], Ordering::Relaxed);
+        inner.desc_n.store(n, Ordering::Relaxed);
+        inner
+            .desc_dev
+            .store(crate::gpu::current_device(), Ordering::Relaxed);
+        inner.remaining.0.store(nw, Ordering::Relaxed);
+        let e = inner.epoch.load(Ordering::Relaxed);
+        inner.epoch.store(e.wrapping_add(1), Ordering::Relaxed);
+        // Release: a worker that sees its new ticket (Acquire) sees the
+        // descriptor and `remaining` written above.
+        let slots = &inner.slots[..nw];
+        for slot in slots {
+            let t = slot.ticket.load(Ordering::Relaxed).wrapping_add(1);
+            slot.ticket.store(t, Ordering::Release);
+        }
+        // Pairs with the fence a worker issues between raising `parked`
+        // and re-reading its ticket: either that worker sees the ticket
+        // or we see its flag and unpark it — no lost wakeup. One fence
+        // for all the tickets instead of a SeqCst store per worker.
+        std::sync::atomic::fence(Ordering::SeqCst);
+        for (slot, t) in slots.iter().zip(&self.threads) {
+            if slot.parked.load(Ordering::Relaxed) {
+                t.unpark();
+            }
+        }
+
+        // The caller's share — the barrier costs nothing while there is
+        // real work to do.
+        f(nw, n);
+
+        // Wait for the stragglers (bounded by one worker's chunk). When
+        // the pool has more threads than CPUs, a ticket holder may be
+        // waiting for THIS core: yield it early instead of spinning.
+        let spin_limit = if inner.oversubscribed { 64 } else { 10_000 };
+        let mut spins = 0usize;
+        while inner.remaining.0.load(Ordering::Acquire) != 0 {
+            spins += 1;
+            if spins < spin_limit {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
+        }
+    }
+
     /// Run `f(row_start, row_end)` over `0..rows`, self-balancing.
     ///
     /// One dispatch, but workers pull row-ranges from a shared cursor
@@ -412,44 +527,25 @@ impl Pool {
         });
     }
 
-    /// `run`, waking at most `max_workers` workers. Same grain, same
-    /// row split, bit-identical results — only the number of threads
-    /// woken changes, so an 8-grain job stops paying 380 unparks. Only
-    /// cursor-style closures (which ignore their (idx, n) arguments)
-    /// come through here: the caller identifies itself as `limit`,
-    /// which under a cap is NOT `n_workers()`.
+    /// `run`, with at most `max_workers` workers PARTICIPATING. Same
+    /// grain, same row split, bit-identical results — only the number of
+    /// threads handed the job changes: a job with eight grains has no use
+    /// for three hundred workers, the unpark syscalls and the
+    /// remaining-drain would BE the job (measured: 361 pool dispatches
+    /// per DeepSeek-V4 token, and CMF_THREADS=64 vs 380 was 1.3 vs 2.4
+    /// tok/s with no other change). Only cursor-style closures (which
+    /// ignore their (idx, n) arguments) come through here: the caller
+    /// identifies itself as the capped count, which is NOT `n_workers()`.
     fn run_limited(&self, max_workers: usize, f: &(dyn Fn(usize, usize) + Sync)) {
-        #[cfg(target_os = "linux")]
-        numa::adopt_caller();
         let nw = self.threads.len().min(max_workers);
         if nw == self.threads.len() {
             return self.run(f);
         }
+        #[cfg(target_os = "linux")]
+        numa::adopt_caller();
         DISPATCHES.fetch_add(1, Ordering::Relaxed);
-        let ptr: *const (dyn Fn(usize, usize) + Sync) = f;
-        let ptr: *const (dyn Fn(usize, usize) + Sync + 'static) =
-            unsafe { std::mem::transmute(ptr) };
-        let dev = crate::gpu::current_device();
-        // SAFETY: same contract as `run` — no job in flight, and the
-        // wait below outlives every borrow of `f`.
-        unsafe { *self.inner.slot.get() = Some((TaskPtr(ptr), nw + 1, dev, nw)) };
-        self.inner.remaining.store(nw, Ordering::Relaxed);
-        self.inner.epoch.fetch_add(1, Ordering::SeqCst);
-        for (i, t) in self.threads.iter().enumerate().take(nw) {
-            if self.inner.parked[i].load(Ordering::SeqCst) {
-                t.unpark();
-            }
-        }
-        f(nw, nw + 1);
-        let mut spins = 0usize;
-        while self.inner.remaining.load(Ordering::Acquire) != 0 {
-            spins += 1;
-            if spins < 10_000 {
-                std::hint::spin_loop();
-            } else {
-                std::thread::yield_now();
-            }
-        }
+        // Workers `nw..` get no ticket: they neither run nor wait.
+        self.dispatch(f, nw);
     }
 
     /// Multi-matrix job: one dispatch serves SEVERAL row spaces
@@ -495,39 +591,7 @@ impl Pool {
         #[cfg(target_os = "linux")]
         numa::adopt_caller();
         DISPATCHES.fetch_add(1, Ordering::Relaxed);
-        let nw = self.threads.len();
-        let n = nw + 1; // caller participates
-        // SAFETY: the wait loop below blocks until every worker is done,
-        // so extending the borrow to 'static never outlives the call.
-        let ptr: *const (dyn Fn(usize, usize) + Sync) = f;
-        let ptr: *const (dyn Fn(usize, usize) + Sync + 'static) =
-            unsafe { std::mem::transmute(ptr) };
-        // SAFETY: no job in flight (previous run() drained `remaining`),
-        // so the slot is not being read.
-        let dev = crate::gpu::current_device();
-        unsafe { *self.inner.slot.get() = Some((TaskPtr(ptr), n, dev, nw)) };
-        self.inner.remaining.store(nw, Ordering::Relaxed);
-        self.inner.epoch.fetch_add(1, Ordering::SeqCst);
-        for (i, t) in self.threads.iter().enumerate() {
-            if self.inner.parked[i].load(Ordering::SeqCst) {
-                t.unpark();
-            }
-        }
-
-        // The caller's share — the barrier costs nothing while there is
-        // real work to do.
-        f(nw, n);
-
-        // Wait for the stragglers (bounded by one worker's chunk).
-        let mut spins = 0usize;
-        while self.inner.remaining.load(Ordering::Acquire) != 0 {
-            spins += 1;
-            if spins < 10_000 {
-                std::hint::spin_loop();
-            } else {
-                std::thread::yield_now();
-            }
-        }
+        self.dispatch(f, self.threads.len());
     }
 }
 
@@ -907,56 +971,73 @@ fn worker_loop(inner: &Inner, idx: usize) {
         libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0);
     }
 
-    // The pool is created at epoch 0; baseline MUST be 0, not a fresh
-    // epoch read — if the caller publishes a job before the OS actually
-    // starts this thread, reading the live epoch would adopt that job's
-    // epoch as "already seen", skip it, and deadlock the caller's wait.
+    let slot = &inner.slots[idx];
+    // Baselines are the construction values (0), never a fresh read: if
+    // the caller hands out a ticket before the OS actually starts this
+    // thread, adopting the live value as "already seen" would skip that
+    // job and deadlock the caller's wait.
     let mut seen = 0usize;
+    let mut seen_epoch = 0usize;
     loop {
-        // Wait for a new epoch: spin first (decode publishes the next
-        // matvec within microseconds), park only when idle for real.
+        // Wait for a ticket: spin first (decode publishes the next matvec
+        // within microseconds), park only when idle for real.
         let mut spins = 0usize;
         loop {
-            let e = inner.epoch.load(Ordering::Acquire);
-            if e != seen {
-                seen = e;
+            let t = slot.ticket.load(Ordering::Acquire);
+            if t != seen {
+                seen = t;
                 break;
             }
             if inner.shutdown.load(Ordering::Relaxed) {
                 return;
             }
+            if !inner.oversubscribed {
+                // Any job — even one this worker sits out — means the
+                // pool is busy: stay hot for the next one.
+                let e = inner.epoch.load(Ordering::Relaxed);
+                if e != seen_epoch {
+                    seen_epoch = e;
+                    spins = 0;
+                }
+            }
             if spins < inner.spin_budget.load(Ordering::Relaxed) {
                 spins += 1;
-                std::hint::spin_loop();
+                if inner.oversubscribed && spins.is_multiple_of(64) {
+                    std::thread::yield_now();
+                } else {
+                    std::hint::spin_loop();
+                }
             } else {
-                inner.parked[idx].store(true, Ordering::SeqCst);
-                // Re-check under SeqCst: the caller bumps the epoch
-                // BEFORE reading `parked`, so either it sees our flag
-                // (and unparks) or we see its epoch here — a missed
-                // wakeup is impossible. Spurious unparks just loop.
-                if inner.epoch.load(Ordering::SeqCst) == seen
+                slot.parked.store(true, Ordering::Relaxed);
+                // Pairs with the caller's fence between writing tickets
+                // and reading `parked`: either it sees our flag (and
+                // unparks) or we see its ticket here — a missed wakeup is
+                // impossible. Spurious unparks just loop.
+                std::sync::atomic::fence(Ordering::SeqCst);
+                if slot.ticket.load(Ordering::Relaxed) == seen
                     && !inner.shutdown.load(Ordering::Relaxed)
                 {
                     std::thread::park();
                 }
-                inner.parked[idx].store(false, Ordering::SeqCst);
+                slot.parked.store(false, Ordering::Relaxed);
             }
         }
-        // SAFETY: the slot was written before the epoch bump we just
-        // observed (release/acquire), and stays valid until `remaining`
-        // drops to zero — which happens only after `f` returns below.
-        let (task, n, dev, limit) =
-            unsafe { (*inner.slot.get()).expect("job published with epoch") };
-        if idx >= limit {
-            // Not invited: a bounded dispatch (run_rows with few grains)
-            // counted only `limit` workers into `remaining`. Executing —
-            // or decrementing — here would corrupt the barrier.
-            continue;
-        }
-        let f = unsafe { &*task.0 };
+        // The ticket's Acquire made the descriptor visible, and the caller
+        // cannot rewrite it before our decrement below: it waits for
+        // `remaining`, which counts this ticket.
+        let data = inner.desc_data.load(Ordering::Relaxed);
+        let vtable = inner.desc_vtable.load(Ordering::Relaxed);
+        let n = inner.desc_n.load(Ordering::Relaxed);
+        let dev = inner.desc_dev.load(Ordering::Relaxed);
+        // SAFETY: the two words are the fat pointer `dispatch` split, and
+        // the caller of this job is blocked on our decrement below, so the
+        // closure it borrows is alive for the whole call.
+        let task: *const (dyn Fn(usize, usize) + Sync + 'static) =
+            unsafe { std::mem::transmute([data, vtable]) };
+        let f = unsafe { &*task };
         crate::gpu::set_current_device(dev);
         f(idx, n);
-        inner.remaining.fetch_sub(1, Ordering::AcqRel);
+        inner.remaining.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -976,21 +1057,42 @@ pub fn matvec_rows(pool: Option<&Pool>, w: &[f32], x: &[f32], out: &mut [f32]) {
         sum
     };
 
-    match pool {
-        Some(pool) if out_dim >= 256 => {
-            let out_addr = SendMut(out.as_mut_ptr());
-            let run_range = move |start: usize, end: usize| {
-                for o in start..end {
-                    unsafe { *out_addr.at(o) = row_dot(o) };
-                }
-            };
-            pool.run_rows(out_dim, &run_range);
-        }
-        _ => {
-            for (o, dst) in out.iter_mut().enumerate() {
-                *dst = row_dot(o);
+    let out_addr = SendMut(out.as_mut_ptr());
+    let run_range = move |start: usize, end: usize| {
+        let mut o = start;
+        // Four independent reduction chains hide add latency and reuse x.
+        // Each row still sums j=0..in_dim in exactly the scalar order: no
+        // horizontal SIMD reduction, FMA, or quantization approximation.
+        while end - o >= 4 {
+            let base = o * in_dim;
+            let w0 = &w[base..base + in_dim];
+            let w1 = &w[base + in_dim..base + 2 * in_dim];
+            let w2 = &w[base + 2 * in_dim..base + 3 * in_dim];
+            let w3 = &w[base + 3 * in_dim..base + 4 * in_dim];
+            let (mut a, mut b, mut c, mut d) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+            for j in 0..in_dim {
+                let v = x[j];
+                a += w0[j] * v;
+                b += w1[j] * v;
+                c += w2[j] * v;
+                d += w3[j] * v;
             }
+            // run_rows assigns disjoint ranges within 0..out_dim.
+            unsafe {
+                *out_addr.at(o) = a;
+                *out_addr.at(o + 1) = b;
+                *out_addr.at(o + 2) = c;
+                *out_addr.at(o + 3) = d;
+            }
+            o += 4;
         }
+        for o in o..end {
+            unsafe { *out_addr.at(o) = row_dot(o) };
+        }
+    };
+    match pool {
+        Some(pool) if out_dim >= 256 => pool.run_rows(out_dim, &run_range),
+        _ => run_range(0, out_dim),
     }
 }
 
@@ -1095,6 +1197,153 @@ impl SendMut {
 
 #[cfg(test)]
 mod tests {
+    /// A worker NOT invited to a limited job is not waited for; if it is
+    /// preempted around the moment the job is published, the caller may
+    /// already be on the next job. The first protocol then ran that next
+    /// job twice and wrapped `remaining` — the caller spun forever.
+    /// Oversubscribe the machine with spinning workers, hammer limited
+    /// dispatches, and count every closure entry: each job must run
+    /// exactly (limit + 1) times, and the loop must finish (a watchdog
+    /// turns a hang into a failure). On a 2–4-CPU box the second protocol
+    /// ran ~100 dispatches/s here (every spinner woke for every job and
+    /// held the CPUs the invited worker needed) and hit the watchdog at
+    /// half the jobs — slow, not wrong, but a pool that needs a time
+    /// slice per dispatch is broken too.
+    #[test]
+    fn uninvited_straggler_never_runs_a_job_twice_or_wraps_the_barrier() {
+        use std::sync::atomic::AtomicUsize;
+        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let workers = (cores * 4).clamp(8, 64);
+        let pool = Arc::new(Pool::with_spin(workers, 1_000_000));
+        let entries = Arc::new(AtomicUsize::new(0));
+        let expected = Arc::new(AtomicUsize::new(0));
+        let progress = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new(AtomicBool::new(false));
+        let iters = 20_000usize;
+        let p = pool.clone();
+        let (en, ex, pr, dn) = (
+            entries.clone(),
+            expected.clone(),
+            progress.clone(),
+            done.clone(),
+        );
+        let driver = std::thread::spawn(move || {
+            for i in 0..iters {
+                pr.store(i, Ordering::Relaxed);
+                // Few grains → `run_limited` with limit < workers: most
+                // workers are uninvited.  Alternate with a full `run`.
+                let limit = 1 + i % 3;
+                let f = |_w: usize, _n: usize| {
+                    en.fetch_add(1, Ordering::Relaxed);
+                };
+                p.run_limited(limit, &f);
+                ex.fetch_add(limit.min(p.n_workers()) + 1, Ordering::Relaxed);
+                if i % 97 == 0 {
+                    p.run(&f);
+                    ex.fetch_add(p.n_workers() + 1, Ordering::Relaxed);
+                }
+            }
+            dn.store(true, Ordering::SeqCst);
+        });
+        let t0 = std::time::Instant::now();
+        while !done.load(Ordering::SeqCst) {
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(120),
+                "pool dispatch loop did not finish: at iteration {} of {}, entries {} \
+                 expected {} (the difference is the job in flight), remaining {}",
+                progress.load(Ordering::Relaxed),
+                iters,
+                entries.load(Ordering::Relaxed),
+                expected.load(Ordering::Relaxed),
+                pool.inner.remaining.0.load(Ordering::Relaxed)
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        driver.join().unwrap();
+        // A late straggler could still be inside its (single) job; one
+        // more full barrier drains it.
+        pool.run(&|_w, _n| {});
+        assert_eq!(
+            entries.load(Ordering::Relaxed),
+            expected.load(Ordering::Relaxed),
+            "some job ran a closure more or fewer times than its participants"
+        );
+    }
+
+    /// Participation is decided by the ticket alone: a limited job hands
+    /// one ticket to each of workers `0..limit` and to nobody else, a full
+    /// `run` one to every worker. Spin 0 also drives the park/unpark path.
+    #[test]
+    fn limited_dispatch_hands_tickets_only_to_invited_workers() {
+        let pool = Pool::with_spin(6, 0);
+        let hits: Vec<AtomicUsize> = (0..7).map(|_| AtomicUsize::new(0)).collect();
+        let bad = AtomicUsize::new(0);
+        // No panics inside the job: a worker that dies never decrements.
+        let f = |w: usize, n: usize| match hits.get(w) {
+            Some(h) if w < n && (n == 3 || n == 7) => {
+                h.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {
+                bad.fetch_add(1, Ordering::Relaxed);
+            }
+        };
+        let tickets = |p: &Pool| -> Vec<usize> {
+            p.inner
+                .slots
+                .iter()
+                .map(|s| s.ticket.load(Ordering::Acquire))
+                .collect()
+        };
+        pool.run_limited(2, &f);
+        assert_eq!(tickets(&pool), [1, 1, 0, 0, 0, 0]);
+        pool.run(&f);
+        assert_eq!(tickets(&pool), [2, 2, 1, 1, 1, 1]);
+        assert_eq!(
+            bad.load(Ordering::Relaxed),
+            0,
+            "participant index or count off"
+        );
+        let hits: Vec<usize> = hits.iter().map(|h| h.load(Ordering::Relaxed)).collect();
+        // Index 2 is the caller of the limited job and worker 2 of the run.
+        assert_eq!(hits, [2, 2, 2, 1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn f32_four_row_matvec_matches_scalar_bits_and_preserves_tail() {
+        let pool = super::Pool::new(3);
+        for rows in [0, 1, 3, 4, 7, 255, 256, 259, 1024] {
+            for cols in [0, 1, 3, 32, 65, 384] {
+                let w: Vec<f32> = (0..rows * cols)
+                    .map(|i| (i as f32 * 0.173).sin() * [1e-3, 1.0, 1e3][i % 3])
+                    .collect();
+                let x: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.41).cos()).collect();
+                let want: Vec<u32> = (0..rows)
+                    .map(|r| {
+                        let mut sum = 0.0f32;
+                        for j in 0..cols {
+                            sum += w[r * cols + j] * x[j];
+                        }
+                        sum.to_bits()
+                    })
+                    .collect();
+                for workers in [None, Some(&pool)] {
+                    let mut out = vec![17.0f32; rows + 5];
+                    super::matvec_rows(workers, &w, &x, &mut out[..rows]);
+                    let bits: Vec<u32> = out[..rows].iter().map(|v| v.to_bits()).collect();
+                    assert_eq!(bits, want, "shape {rows}x{cols}");
+                    assert_eq!(&out[rows..], &[17.0; 5]);
+                }
+                // A short output is an intentional public matvec contract.
+                let mut prefix = vec![0.0f32; rows / 2];
+                super::matvec_rows(None, &w, &x, &mut prefix);
+                assert_eq!(
+                    prefix.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    want[..rows / 2]
+                );
+            }
+        }
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn numa_cpulist_parses_ranges_and_singles() {

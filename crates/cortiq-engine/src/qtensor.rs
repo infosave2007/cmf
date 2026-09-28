@@ -17,6 +17,7 @@ use cortiq_core::quant::{
     q4tp_code, q4tp_ladder, q4tp_sections,
 };
 use cortiq_core::{CmfModel, TensorDtype};
+use std::cell::UnsafeCell;
 use std::sync::Arc;
 
 pub enum QTensor {
@@ -1153,7 +1154,11 @@ impl QTensor {
             // NOTE: `out.len()` DRIVES this arm — it computes that many rows,
             // and `x.len()` is the stride. A short `out` is legitimate here,
             // which is why the check below lives in the Mapped arm only.
-            Self::F32 { data, .. } => matvec_rows(pool, data, x, out),
+            Self::F32 { data, .. } => {
+                if !crate::f32_backend::matvec(data, x, out) {
+                    matvec_rows(pool, data, x, out);
+                }
+            }
             Self::Mapped {
                 model,
                 idx,
@@ -1781,6 +1786,9 @@ impl QTensor {
         }
         match self {
             Self::F32 { data, .. } => {
+                if crate::f32_backend::matmat(data, xs_all, b, rows, cols, out) {
+                    return;
+                }
                 let out_addr = SendMut(out.as_mut_ptr());
                 let run = |start: usize, end: usize| {
                     for o in start..end {
@@ -2429,6 +2437,12 @@ impl QTensor {
             )
         });
         let uniform_f32 = ts.iter().all(|t| matches!(t, Self::F32 { .. }));
+        if uniform_f32 && crate::f32_backend::active() {
+            for (t, o) in ts.iter().zip(outs.iter_mut()) {
+                t.matvec(x, o, pool);
+            }
+            return;
+        }
         let uniform_q4 = ts.iter().all(|t| {
             matches!(
                 t,
@@ -2509,11 +2523,9 @@ impl QTensor {
             // sequential calls this replaces.
             let cols = ts[0].cols();
             let gpr = cols / GROUP_SIZE;
-            let views: Vec<Q4tpView> = ts
-                .iter()
-                .map(|t| Q4tpView::new(t.quant_bytes(), t.rows(), cols))
-                .collect();
-            let rows_of: Vec<usize> = ts.iter().map(|t| t.rows()).collect();
+            let views: [Q4tpView; N] =
+                std::array::from_fn(|i| Q4tpView::new(ts[i].quant_bytes(), ts[i].rows(), cols));
+            let rows_of: [usize; N] = std::array::from_fn(|i| ts[i].rows());
             let outs_addr: [SendMut; N] = std::array::from_fn(|i| SendMut(outs[i].as_mut_ptr()));
             // flat index -> (which tensor, which of its rows)
             let locate = |flat: usize| -> (usize, usize) {
@@ -2531,31 +2543,33 @@ impl QTensor {
                 let act = split_act(x);
                 let act = &act;
                 let run = |start: usize, end: usize| {
-                    let mut sc = vec![0f32; gpr];
-                    for flat in start..end {
-                        let (t, r) = locate(flat);
-                        let v = &views[t];
-                        v.scales_into(r, gpr, &mut sc);
-                        let mut acc = dot_q4tp_row_i8(v.nib, r, gpr, &act.xq, &sc) * act.sx;
-                        for &(j, xv) in &act.outliers {
-                            let (w, s) = q4tp_outlier(v.nib, r, gpr, j, &sc);
-                            acc += w * s * xv;
+                    with_krow(gpr, |sc| {
+                        for flat in start..end {
+                            let (t, r) = locate(flat);
+                            let v = &views[t];
+                            v.scales_into(r, gpr, sc);
+                            let mut acc = dot_q4tp_row_i8(v.nib, r, gpr, &act.xq, sc) * act.sx;
+                            for &(j, xv) in &act.outliers {
+                                let (w, s) = q4tp_outlier(v.nib, r, gpr, j, sc);
+                                acc += w * s * xv;
+                            }
+                            // SAFETY: one worker owns each (tensor, row) pair.
+                            unsafe { *outs_addr[t].at(r) = acc };
                         }
-                        // SAFETY: one worker owns each (tensor, row) pair.
-                        unsafe { *outs_addr[t].at(r) = acc };
-                    }
+                    });
                 };
                 pool.run_rows(total_rows, &run);
             } else {
                 let run = |start: usize, end: usize| {
-                    let mut sc = vec![0f32; gpr];
-                    for flat in start..end {
-                        let (t, r) = locate(flat);
-                        let v = &views[t];
-                        v.scales_into(r, gpr, &mut sc);
-                        // SAFETY: one worker owns each (tensor, row) pair.
-                        unsafe { *outs_addr[t].at(r) = q4tp_row_exact(v.nib, r, gpr, x, &sc) };
-                    }
+                    with_krow(gpr, |sc| {
+                        for flat in start..end {
+                            let (t, r) = locate(flat);
+                            let v = &views[t];
+                            v.scales_into(r, gpr, sc);
+                            // SAFETY: one worker owns each (tensor, row) pair.
+                            unsafe { *outs_addr[t].at(r) = q4tp_row_exact(v.nib, r, gpr, x, sc) };
+                        }
+                    });
                 };
                 pool.run_rows(total_rows, &run);
             }
@@ -3143,9 +3157,8 @@ impl QTensor {
                             ]));
                             uv += ((un as i32 - 8) as f32) * usc * xv;
                         }
-                        let silu_g = gv / (1.0 + (-gv).exp());
                         // SAFETY: disjoint row ranges per worker.
-                        unsafe { *out_addr.at(r) = silu_g * uv };
+                        unsafe { *out_addr.at(r) = silu_mul_limited(gv, uv, limit) };
                     }
                 };
                 dispatch_rows(pool, inter, &run);
@@ -3177,9 +3190,8 @@ impl QTensor {
                             let (w, s) = q4t_outlier(u_bytes, r, gpr, j);
                             uv += w * s * xv;
                         }
-                        let silu_g = gv / (1.0 + (-gv).exp());
                         // SAFETY: disjoint row ranges per worker.
-                        unsafe { *out_addr.at(r) = silu_g * uv };
+                        unsafe { *out_addr.at(r) = silu_mul_limited(gv, uv, limit) };
                     }
                 };
                 dispatch_rows(pool, inter, &run);
@@ -3202,22 +3214,24 @@ impl QTensor {
                 let gv_view = Q4tpView::new(gate.quant_bytes(), inter, cols);
                 let uv_view = Q4tpView::new(up.quant_bytes(), inter, cols);
                 let run = |start: usize, end: usize| {
-                    let (mut gsc, mut usc) = (vec![0f32; gpr], vec![0f32; gpr]);
-                    for r in start..end {
-                        gv_view.scales_into(r, gpr, &mut gsc);
-                        uv_view.scales_into(r, gpr, &mut usc);
-                        let mut gv = dot_q4tp_row_i8(gv_view.nib, r, gpr, &act.xq, &gsc) * act.sx;
-                        let mut uv = dot_q4tp_row_i8(uv_view.nib, r, gpr, &act.xq, &usc) * act.sx;
-                        for &(j, xv) in &act.outliers {
-                            let (w, s) = q4tp_outlier(gv_view.nib, r, gpr, j, &gsc);
-                            gv += w * s * xv;
-                            let (w, s) = q4tp_outlier(uv_view.nib, r, gpr, j, &usc);
-                            uv += w * s * xv;
+                    with_krows(gpr, |gsc, usc| {
+                        for r in start..end {
+                            gv_view.scales_into(r, gpr, gsc);
+                            uv_view.scales_into(r, gpr, usc);
+                            let mut gv =
+                                dot_q4tp_row_i8(gv_view.nib, r, gpr, &act.xq, gsc) * act.sx;
+                            let mut uv =
+                                dot_q4tp_row_i8(uv_view.nib, r, gpr, &act.xq, usc) * act.sx;
+                            for &(j, xv) in &act.outliers {
+                                let (w, s) = q4tp_outlier(gv_view.nib, r, gpr, j, gsc);
+                                gv += w * s * xv;
+                                let (w, s) = q4tp_outlier(uv_view.nib, r, gpr, j, usc);
+                                uv += w * s * xv;
+                            }
+                            // SAFETY: disjoint row ranges per worker.
+                            unsafe { *out_addr.at(r) = silu_mul_limited(gv, uv, limit) };
                         }
-                        let silu_g = gv / (1.0 + (-gv).exp());
-                        // SAFETY: disjoint row ranges per worker.
-                        unsafe { *out_addr.at(r) = silu_g * uv };
-                    }
+                    });
                 };
                 dispatch_rows(pool, inter, &run);
                 true
@@ -3252,9 +3266,8 @@ impl QTensor {
                             let (w, s) = q1_outlier(u_bytes, r, gpr, j);
                             uv += w * s * xv;
                         }
-                        let silu_g = gv / (1.0 + (-gv).exp());
                         // SAFETY: disjoint row ranges per worker.
-                        unsafe { *out_addr.at(r) = silu_g * uv };
+                        unsafe { *out_addr.at(r) = silu_mul_limited(gv, uv, limit) };
                     }
                 };
                 dispatch_rows(pool, inter, &run);
@@ -3280,24 +3293,24 @@ impl QTensor {
                 let gsum = q1_group_sums(&act.xq, gpr);
                 let gsum = &gsum;
                 let run = move |start: usize, end: usize| {
-                    let (mut gsc, mut usc) = (vec![0f32; gpr], vec![0f32; gpr]);
-                    for r in start..end {
-                        gv_view.scales_into(r, gpr, &mut gsc);
-                        uv_view.scales_into(r, gpr, &mut usc);
-                        let mut gv =
-                            dot_q2tp_row_i8(gv_view.nib, r, gpr, &act.xq, gsum, &gsc) * act.sx;
-                        let mut uv =
-                            dot_q2tp_row_i8(uv_view.nib, r, gpr, &act.xq, gsum, &usc) * act.sx;
-                        for &(j, xv) in &act.outliers {
-                            let (w, s) = q2tp_outlier(gv_view.nib, r, gpr, j, &gsc);
-                            gv += w * s * xv;
-                            let (w, s) = q2tp_outlier(uv_view.nib, r, gpr, j, &usc);
-                            uv += w * s * xv;
+                    with_krows(gpr, |gsc, usc| {
+                        for r in start..end {
+                            gv_view.scales_into(r, gpr, gsc);
+                            uv_view.scales_into(r, gpr, usc);
+                            let mut gv =
+                                dot_q2tp_row_i8(gv_view.nib, r, gpr, &act.xq, gsum, gsc) * act.sx;
+                            let mut uv =
+                                dot_q2tp_row_i8(uv_view.nib, r, gpr, &act.xq, gsum, usc) * act.sx;
+                            for &(j, xv) in &act.outliers {
+                                let (w, s) = q2tp_outlier(gv_view.nib, r, gpr, j, gsc);
+                                gv += w * s * xv;
+                                let (w, s) = q2tp_outlier(uv_view.nib, r, gpr, j, usc);
+                                uv += w * s * xv;
+                            }
+                            // SAFETY: disjoint row ranges per worker.
+                            unsafe { *out_addr.at(r) = silu_mul_limited(gv, uv, limit) };
                         }
-                        let silu_g = gv / (1.0 + (-gv).exp());
-                        // SAFETY: disjoint row ranges per worker.
-                        unsafe { *out_addr.at(r) = silu_g * uv };
-                    }
+                    });
                 };
                 dispatch_rows(pool, inter, &run);
                 true
@@ -3325,9 +3338,8 @@ impl QTensor {
                     for r in start..end {
                         let gv = q8_row_dot(&g_bytes[r * cols..(r + 1) * cols], act) * g_rs[r];
                         let uv = q8_row_dot(&u_bytes[r * cols..(r + 1) * cols], act) * u_rs[r];
-                        let silu_g = gv / (1.0 + (-gv).exp());
                         // SAFETY: disjoint row ranges per worker.
-                        unsafe { *out_addr.at(r) = silu_g * uv };
+                        unsafe { *out_addr.at(r) = silu_mul_limited(gv, uv, limit) };
                     }
                 };
                 dispatch_rows(pool, inter, &run);
@@ -3360,9 +3372,8 @@ impl QTensor {
                         }
                         gv += q1t_row_outlier_correction(g_bytes, r, g_rp, g_ent, g_ov, x_ref);
                         uv += q1t_row_outlier_correction(u_bytes, r, u_rp, u_ent, u_ov, x_ref);
-                        let silu_g = gv / (1.0 + (-gv).exp());
                         // SAFETY: disjoint row ranges per worker.
-                        unsafe { *out_addr.at(r) = silu_g * uv };
+                        unsafe { *out_addr.at(r) = silu_mul_limited(gv, uv, limit) };
                     }
                 };
                 dispatch_rows(pool, inter, &run);
@@ -3392,10 +3403,28 @@ impl QTensor {
         outs: &mut [Vec<f32>],
         pool: Option<&Pool>,
     ) -> bool {
+        Self::moe_gate_up_many_limited(pairs, x, outs, 0.0, pool)
+    }
+
+    /// Batched gate/up/SiLU with the optional GLM clamp.  The public legacy
+    /// helper above keeps its historical unclamped semantics; callers that
+    /// implement a reference with a positive SwiGLU limit use this variant.
+    pub fn moe_gate_up_many_limited(
+        pairs: &[(&QTensor, &QTensor)],
+        x: &[f32],
+        outs: &mut [Vec<f32>],
+        limit: f32,
+        pool: Option<&Pool>,
+    ) -> bool {
         if pairs.is_empty() || pairs.len() != outs.len() {
             return false;
         }
         if !a8w8_enabled() {
+            if limit > 0.0 {
+                // The exact-row fallback applies no SwiGLU clamp; the
+                // caller's per-expert path carries it instead.
+                return false;
+            }
             let groups = vec![vec![0]; pairs.len()];
             return Self::moe_gate_up_rows(pairs, &groups, x, outs, pool);
         }
@@ -3446,43 +3475,43 @@ impl QTensor {
         let ptrs: Vec<SendMut> = outs.iter_mut().map(|o| SendMut(o.as_mut_ptr())).collect();
         let (views, ptrs) = (&views, &ptrs);
         let run = |start: usize, end: usize| {
-            let (mut gsc, mut usc) = (vec![0f32; gpr], vec![0f32; gpr]);
-            for flat in start..end {
-                let (e, r) = (flat / inter, flat % inter);
-                let gv_view = &views[e * 2];
-                let uv_view = &views[e * 2 + 1];
-                gv_view.scales_into(r, gpr, &mut gsc);
-                uv_view.scales_into(r, gpr, &mut usc);
-                let (mut gv, mut uv) = if q2 {
-                    (
-                        dot_q2tp_row_i8(gv_view.nib, r, gpr, &act.xq, gsum, &gsc) * act.sx,
-                        dot_q2tp_row_i8(uv_view.nib, r, gpr, &act.xq, gsum, &usc) * act.sx,
-                    )
-                } else {
-                    (
-                        dot_q4tp_row_i8(gv_view.nib, r, gpr, &act.xq, &gsc) * act.sx,
-                        dot_q4tp_row_i8(uv_view.nib, r, gpr, &act.xq, &usc) * act.sx,
-                    )
-                };
-                for &(j, xv) in &act.outliers {
-                    let (og, ou) = if q2 {
+            with_krows(gpr, |gsc, usc| {
+                for flat in start..end {
+                    let (e, r) = (flat / inter, flat % inter);
+                    let gv_view = &views[e * 2];
+                    let uv_view = &views[e * 2 + 1];
+                    gv_view.scales_into(r, gpr, gsc);
+                    uv_view.scales_into(r, gpr, usc);
+                    let (mut gv, mut uv) = if q2 {
                         (
-                            q2tp_outlier(gv_view.nib, r, gpr, j, &gsc),
-                            q2tp_outlier(uv_view.nib, r, gpr, j, &usc),
+                            dot_q2tp_row_i8(gv_view.nib, r, gpr, &act.xq, gsum, gsc) * act.sx,
+                            dot_q2tp_row_i8(uv_view.nib, r, gpr, &act.xq, gsum, usc) * act.sx,
                         )
                     } else {
                         (
-                            q4tp_outlier(gv_view.nib, r, gpr, j, &gsc),
-                            q4tp_outlier(uv_view.nib, r, gpr, j, &usc),
+                            dot_q4tp_row_i8(gv_view.nib, r, gpr, &act.xq, gsc) * act.sx,
+                            dot_q4tp_row_i8(uv_view.nib, r, gpr, &act.xq, usc) * act.sx,
                         )
                     };
-                    gv += og.0 * og.1 * xv;
-                    uv += ou.0 * ou.1 * xv;
+                    for &(j, xv) in &act.outliers {
+                        let (og, ou) = if q2 {
+                            (
+                                q2tp_outlier(gv_view.nib, r, gpr, j, gsc),
+                                q2tp_outlier(uv_view.nib, r, gpr, j, usc),
+                            )
+                        } else {
+                            (
+                                q4tp_outlier(gv_view.nib, r, gpr, j, gsc),
+                                q4tp_outlier(uv_view.nib, r, gpr, j, usc),
+                            )
+                        };
+                        gv += og.0 * og.1 * xv;
+                        uv += ou.0 * ou.1 * xv;
+                    }
+                    // SAFETY: one worker owns each (expert, row) pair.
+                    unsafe { *ptrs[e].at(r) = silu_mul_limited(gv, uv, limit) };
                 }
-                let silu_g = gv / (1.0 + (-gv).exp());
-                // SAFETY: one worker owns each (expert, row) pair.
-                unsafe { *ptrs[e].at(r) = silu_g * uv };
-            }
+            });
         };
         dispatch_rows(pool, pairs.len() * inter, &run);
         true
@@ -3553,22 +3582,23 @@ impl QTensor {
         let out_addr = SendMut(out.as_mut_ptr());
         let (views, acts, weights) = (&views, &acts, &weights);
         let run = |start: usize, end: usize| {
-            let mut sc = vec![0f32; gpr];
-            for r in start..end {
-                let mut acc = 0f32;
-                for (e, v) in views.iter().enumerate() {
-                    v.scales_into(r, gpr, &mut sc);
-                    let a = &acts[e];
-                    let mut d = dot_q4tp_row_i8(v.nib, r, gpr, &a.xq, &sc) * a.sx;
-                    for &(j, xv) in &a.outliers {
-                        let (w, s) = q4tp_outlier(v.nib, r, gpr, j, &sc);
-                        d += w * s * xv;
+            with_krow(gpr, |sc| {
+                for r in start..end {
+                    let mut acc = 0f32;
+                    for (e, v) in views.iter().enumerate() {
+                        v.scales_into(r, gpr, sc);
+                        let a = &acts[e];
+                        let mut d = dot_q4tp_row_i8(v.nib, r, gpr, &a.xq, sc) * a.sx;
+                        for &(j, xv) in &a.outliers {
+                            let (w, s) = q4tp_outlier(v.nib, r, gpr, j, sc);
+                            d += w * s * xv;
+                        }
+                        acc += weights[e] * d;
                     }
-                    acc += weights[e] * d;
+                    // SAFETY: disjoint row ranges per worker.
+                    unsafe { *out_addr.at(r) = acc };
                 }
-                // SAFETY: disjoint row ranges per worker.
-                unsafe { *out_addr.at(r) = acc };
-            }
+            });
         };
         dispatch_rows(pool, rows, &run);
         true
@@ -5599,6 +5629,13 @@ unsafe fn q2tp_code_dot_avx2(ch: &[u8], x: &[i8]) -> i32 {
     _mm_cvtsi128_si32(_mm_hadd_epi32(sum64, sum64))
 }
 
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn q2tp_avx2_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::arch::is_x86_feature_detected!("avx2"))
+}
+
 /// Integer dot of one q2tp row against pre-quantized activations:
 /// Σ_g s_g · (Σ c·xq − 1.5·Σ xq). The half-integer grid (c − 1.5)
 /// becomes exact integer math through the group sums — the same trick
@@ -5619,7 +5656,11 @@ fn dot_q2tp_row_i8(
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     let mut codes = [0i8; GROUP_SIZE];
     #[cfg(target_arch = "x86_64")]
-    let avx2 = std::arch::is_x86_feature_detected!("avx2");
+    // Cache the process-wide AVX2 decision; probing it for every 32-weight
+    // group adds a branch to the hottest Q2TP row loop while retaining the
+    // established table-load AVX2 arithmetic (and without coupling this path
+    // to the separate FMA-gated A8W8 switch).
+    let avx2 = q2tp_avx2_enabled();
     for gi in 0..gpr {
         let ch = &chunks[base + gi * Q2TP_CHUNK..base + (gi + 1) * Q2TP_CHUNK];
         let xg = &xq[gi * GROUP_SIZE..(gi + 1) * GROUP_SIZE];
@@ -10324,7 +10365,13 @@ thread_local! {
     /// `vec![0f32; gpr]` inside the closure is one allocation per worker per
     /// dispatch — on the release checkpoint about six thousand a token, a
     /// quarter of everything the benchmark counts.
-    static KROW: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    static KROW: UnsafeCell<Vec<f32>> = const { UnsafeCell::new(Vec::new()) };
+    /// Two scratch rows for a gate/up pair.  Q2TP and Q4TP fused SwiGLU
+    /// decode each projection's ladder independently, but both ladders have
+    /// the same lifetime; retaining them per worker removes two heap trips
+    /// from every dispatched expert pair.
+    static KROWS: UnsafeCell<[Vec<f32>; 2]> =
+        const { UnsafeCell::new([Vec::new(), Vec::new()]) };
 }
 
 /// Borrow `n` floats of the calling worker's scratch. Nothing inside a
@@ -10332,7 +10379,9 @@ thread_local! {
 #[inline]
 fn with_krow<R>(n: usize, f: impl FnOnce(&mut [f32]) -> R) -> R {
     KROW.with(|s| {
-        let mut b = s.borrow_mut();
+        // SAFETY: `KROW` is thread-local and this function does not recurse;
+        // each worker has exclusive access to its own scratch row.
+        let b = unsafe { &mut *s.get() };
         if b.len() < n {
             b.resize(n, 0.0);
         }
@@ -10363,6 +10412,31 @@ fn q8_round(t: f32) -> i8 {
         i
     };
     r as i8
+}
+
+#[inline]
+fn with_krows<R>(n: usize, f: impl FnOnce(&mut [f32], &mut [f32]) -> R) -> R {
+    KROWS.with(|s| {
+        // SAFETY: KROWS is thread-local and no kernel body recursively calls
+        // this helper; each participant owns its two vectors exclusively.
+        let b = unsafe { &mut *s.get() };
+        for row in b.iter_mut() {
+            if row.len() < n {
+                row.resize(n, 0.0);
+            }
+        }
+        let (a, b) = b.split_at_mut(1);
+        f(&mut a[0][..n], &mut b[0][..n])
+    })
+}
+
+#[inline]
+fn silu_mul_limited(mut gate: f32, mut up: f32, limit: f32) -> f32 {
+    if limit > 0.0 {
+        up = up.clamp(-limit, limit);
+        gate = gate.min(limit);
+    }
+    gate / (1.0 + (-gate).exp()) * up
 }
 
 fn split_act(x: &[f32]) -> SplitAct {
@@ -11351,26 +11425,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn q2tp_affine_fuses_half_scale_correction_without_changing_raw_decode() {
-        let (rows, cols) = (1usize, GROUP_SIZE);
-        let mut bytes = vec![0u8; Q2TP_CHUNK + 4 + 1];
-        // Repeating symbols 0,1,2,0 at unit scale.  q2tp's raw B is
-        // (c-1.5), while the affine Prism operator is (c-1.0).
-        bytes[..Q2TP_CHUNK].fill(0x24); // codes 0,1,2,0 in LSB-first order
-        bytes[Q2TP_CHUNK..Q2TP_CHUNK + 2].copy_from_slice(&0u16.to_le_bytes());
-        bytes[Q2TP_CHUNK + 2..Q2TP_CHUNK + 4].copy_from_slice(&0u16.to_le_bytes());
-        bytes[Q2TP_CHUNK + 4] = 1; // dtype16 rung 1 = 1.0
-        let x = vec![1.0f32; cols];
-        let mut raw = vec![0.0f32; rows];
-        let mut affine = vec![0.0f32; rows];
-        q2tp_matvec_for_test(&bytes, &x, rows, cols, &mut raw);
-        q2tp_affine_matvec_for_test(&bytes, &x, rows, cols, &mut affine);
-        assert_eq!(raw, vec![-24.0]);
-        assert_eq!(affine, vec![-8.0]);
-        assert!((affine[0] - (raw[0] + 0.5 * cols as f32)).abs() < 1e-6);
-    }
-
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn q2tp_avx2_dot_matches_scalar_for_random_patterns() {
@@ -11407,6 +11461,26 @@ mod tests {
             let got = unsafe { q2tp_code_dot_avx2(&ch, &x) };
             assert_eq!(got, reference, "packed q2 lane mismatch");
         }
+    }
+
+    #[test]
+    fn q2tp_affine_fuses_half_scale_correction_without_changing_raw_decode() {
+        let (rows, cols) = (1usize, GROUP_SIZE);
+        let mut bytes = vec![0u8; Q2TP_CHUNK + 4 + 1];
+        // Repeating symbols 0,1,2,0 at unit scale.  q2tp's raw B is
+        // (c-1.5), while the affine Prism operator is (c-1.0).
+        bytes[..Q2TP_CHUNK].fill(0x24); // codes 0,1,2,0 in LSB-first order
+        bytes[Q2TP_CHUNK..Q2TP_CHUNK + 2].copy_from_slice(&0u16.to_le_bytes());
+        bytes[Q2TP_CHUNK + 2..Q2TP_CHUNK + 4].copy_from_slice(&0u16.to_le_bytes());
+        bytes[Q2TP_CHUNK + 4] = 1; // dtype16 rung 1 = 1.0
+        let x = vec![1.0f32; cols];
+        let mut raw = vec![0.0f32; rows];
+        let mut affine = vec![0.0f32; rows];
+        q2tp_matvec_for_test(&bytes, &x, rows, cols, &mut raw);
+        q2tp_affine_matvec_for_test(&bytes, &x, rows, cols, &mut affine);
+        assert_eq!(raw, vec![-24.0]);
+        assert_eq!(affine, vec![-8.0]);
+        assert!((affine[0] - (raw[0] + 0.5 * cols as f32)).abs() < 1e-6);
     }
 
     #[test]
@@ -12326,6 +12400,10 @@ mod tests {
             shard: None,
             calibration: None,
             routing: None,
+            genome: None,
+            lineage: Vec::new(),
+            router: None,
+            segments: Vec::new(),
         };
         let specs = [
             TensorSpec {
@@ -12406,6 +12484,10 @@ mod tests {
             shard: None,
             calibration: None,
             routing: None,
+            genome: None,
+            lineage: Vec::new(),
+            router: None,
+            segments: Vec::new(),
         };
         let mut specs = Vec::new();
         for e in 0..ne {

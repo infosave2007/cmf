@@ -28,6 +28,2224 @@ pub mod mimo_bank;
 /// rows — we use grid-stride in the shader).
 const MAX_WG: u32 = 65_535;
 
+/// Resident Embryo token graph.  The model is intentionally f32-only: the
+/// working Embryo checkpoints are exported in f32 and the graph's contract is
+/// exact operator coverage (phase/conv, resonance MoE, one GQA anchor, and
+/// hierarchical head), not a quantized approximation.  The opt-in
+/// `parallel` variant uses `EMBRYO_CORE_SRC` for row/head-parallel
+/// projections, recurrence, anchor, and the vocabulary/head tail. Four
+/// 1024-f32 workgroup planes are enough for the current genome (hidden 384,
+/// intermediate 768, phase output 1024) and stay within the Vulkan minimum
+/// 16 KiB workgroup-storage limit.
+
+/// Row/head-parallel vocabulary tail for the resident Embryo graph.  The
+/// ordered layer body is in `EMBRYO_CORE_SRC`; this module consumes its
+/// published normalized head input and splits vocabulary rows/hierarchy into
+/// independent workgroups in the same command submission.
+const EMBRYO_PARALLEL_SRC: &str = r#"
+struct Params {
+    position: u32,
+    max_seq: u32,
+    vocab: u32,
+    flags: u32,
+    eps: f32,
+    phase_mass: f32,
+    _p0: u32,
+    _p1: u32,
+};
+
+@group(0) @binding(0) var<storage, read> weights: array<f32>;
+@group(0) @binding(1) var<storage, read> md: array<u32>;
+@group(0) @binding(2) var<storage, read> embed: array<f32>;
+@group(0) @binding(3) var<storage, read> clusters: array<f32>;
+@group(0) @binding(4) var<storage, read> final_norm: array<f32>;
+@group(0) @binding(5) var<storage, read> inv_freq: array<f32>;
+@group(0) @binding(6) var<storage, read_write> hbuf: array<f32>;
+@group(0) @binding(7) var<storage, read_write> state: array<f32>;
+@group(0) @binding(8) var<storage, read_write> kv: array<f32>;
+@group(0) @binding(9) var<storage, read_write> logits: array<f32>;
+@group(0) @binding(10) var<uniform> p: Params;
+@group(0) @binding(11) var<storage, read_write> scratch: array<f32>;
+
+var<workgroup> cluster_values: array<f32, 1024>;
+var<workgroup> cluster_tmp: array<f32, 1024>;
+
+// Each invocation owns one vocabulary row.  The serial inner product keeps
+// the CPU/GPU row arithmetic order while exposing tens of thousands of rows
+// to independent workgroups.
+@compute @workgroup_size(256)
+fn embryo_logits_raw(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let v = gid.x;
+    let hidden = md[0u];
+    if (v >= p.vocab) { return; }
+    var z = 0.0;
+    var j = 0u;
+    loop {
+        if (j >= hidden) { break; }
+        z = z + embed[v * hidden + j] * hbuf[j];
+        j = j + 1u;
+    }
+    logits[v] = z;
+}
+
+// Compute the cluster router log-softmax.  One workgroup is enough because
+// the model contract caps the hierarchy at 1024 clusters; each cluster dot
+// remains a lane-parallel row operation and the final reduction preserves the
+// old serial order in lane zero.
+@compute @workgroup_size(1024)
+fn embryo_clusters_global(@builtin(local_invocation_index) lid: u32) {
+    let hidden = md[0u];
+    let nc = md[11u];
+    if (lid < nc) {
+        var z = 0.0;
+        var j = 0u;
+        loop {
+            if (j >= hidden) { break; }
+            z = z + clusters[lid * hidden + j] * hbuf[j];
+            j = j + 1u;
+        }
+        cluster_values[lid] = z;
+    }
+    workgroupBarrier();
+    if (lid == 0u && nc > 0u) {
+        var mx = -3.402823e+38;
+        var j = 0u;
+        loop {
+            if (j >= nc) { break; }
+            mx = max(mx, cluster_values[j]);
+            j = j + 1u;
+        }
+        var se = 0.0;
+        j = 0u;
+        loop {
+            if (j >= nc) { break; }
+            se = se + exp(cluster_values[j] - mx);
+            j = j + 1u;
+        }
+        let lse = mx + log(se);
+        // Keep the hierarchy scratch after the raw vocabulary plane.  The
+        // final cluster's rows are part of the ordinary logits tensor, so
+        // placing scratch in its tail would overwrite raw values before the
+        // local log-sum-exp pass reads them.
+        let base = p.vocab;
+        j = 0u;
+        loop {
+            if (j >= nc) { break; }
+            logits[base + j] = cluster_values[j] - lse;
+            j = j + 1u;
+        }
+    }
+}
+
+// One workgroup per cluster computes the local vocabulary log-sum-exp.  The
+// lane-zero loop is intentionally ordered like the original network shader;
+// row parallelism is in the 128+ vocabulary workgroups, while this tiny
+// hierarchy step stays bit-stable and avoids an extra partials buffer.
+@compute @workgroup_size(1024)
+fn embryo_clusters_local(@builtin(local_invocation_index) lid: u32,
+                         @builtin(workgroup_id) wid: vec3<u32>) {
+    let nc = md[11u];
+    let cs = md[12u];
+    let cl = wid.x;
+    if (cl >= nc) { return; }
+    if (lid == 0u) {
+        let start = cl * cs;
+        var mx = -3.402823e+38;
+        var j = 0u;
+        loop {
+            if (j >= cs) { break; }
+            mx = max(mx, logits[start + j]);
+            j = j + 1u;
+        }
+        var se = 0.0;
+        j = 0u;
+        loop {
+            if (j >= cs) { break; }
+            se = se + exp(logits[start + j] - mx);
+            j = j + 1u;
+        }
+        logits[p.vocab + nc + cl] = mx + log(se);
+    }
+}
+
+// Apply both hierarchy corrections.  The raw vocabulary plane and the two
+// correction planes are disjoint, so every row reuses the multi-workgroup
+// result without a hidden recompute or an aliasing race in the final cluster.
+@compute @workgroup_size(256)
+fn embryo_logits_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let v = gid.x;
+    let nc = md[11u];
+    let cs = md[12u];
+    if (v >= p.vocab || nc == 0u || cs == 0u) { return; }
+    var z = logits[v];
+    let cl = v / cs;
+    z = z + logits[p.vocab + cl] - logits[p.vocab + nc + cl];
+    logits[v] = z;
+}
+"#;
+
+/// Row/head-parallel resident Embryo body. Each projection/output row is an
+/// independent workgroup invocation, each phase/anchor head is a workgroup
+/// (with value/head chunks when a dimension exceeds 256), and only the small
+/// RMS/router reductions remain single-workgroup.  Dispatches stay in one
+/// command encoder/submit and reuse the persistent state/KV/scratch buffers.
+const EMBRYO_CORE_SRC: &str = r#"
+struct Params {
+    position: u32,
+    max_seq: u32,
+    vocab: u32,
+    flags: u32,
+    eps: f32,
+    phase_mass: f32,
+    layer: u32,
+    // Positions in this submit: 1 on the token path, n ≤ CMAX for the
+    // chunked prefill (`position` is then the chunk's first position).
+    chunk: u32,
+};
+
+@group(0) @binding(0) var<storage, read> weights: array<f32>;
+@group(0) @binding(1) var<storage, read> md: array<u32>;
+@group(0) @binding(2) var<storage, read> embed: array<f32>;
+@group(0) @binding(3) var<storage, read> clusters: array<f32>;
+@group(0) @binding(4) var<storage, read> final_norm: array<f32>;
+@group(0) @binding(5) var<storage, read> inv_freq: array<f32>;
+@group(0) @binding(6) var<storage, read_write> hbuf: array<f32>;
+@group(0) @binding(7) var<storage, read_write> state: array<f32>;
+@group(0) @binding(8) var<storage, read_write> kv: array<f32>;
+@group(0) @binding(9) var<storage, read_write> logits: array<f32>;
+@group(0) @binding(10) var<uniform> p: Params;
+@group(0) @binding(11) var<storage, read_write> scratch: array<f32>;
+// The recurrent state again as vec4 (same-slot rule, as `gd_S4` in the
+// per-op GDN module): a GDN state row is dv-contiguous, so a lane's four
+// columns are ONE 16-byte access.  Only the GDN step entry point uses it.
+@group(0) @binding(7) var<storage, read_write> state4: array<vec4<f32>>;
+
+const UMAX: u32 = 0xffffffffu;
+// Header words: [0] hidden [1] inter [2] vocab [3] layers [4] phase heads
+// [5] nphase [6] phase dv [7] q heads [8] kv heads [9] head_dim [10] max_seq
+// [11] clusters [12] cluster size [13] phase state len [14] state stride
+// [15] kv stride [16] rotary dim [17] gemma [18] window [19] eps [20] sink
+// [21] rope table; GDN mixer geometry (layer kind 4): [24] nv [25] nk
+// [26] dk [27] dv [28] conv kk [29] c_dim = 2·nk·dk + nv·dv.
+const HEADER: u32 = 32u;
+const REC: u32 = 64u;
+const S_NORM: u32 = 0u;
+const S_X: u32 = 1024u;
+const S_Q: u32 = 2048u;
+const S_K: u32 = 3072u;
+const S_V: u32 = 4096u;
+const S_GATE: u32 = 5120u;
+const S_G: u32 = S_GATE;
+const S_ATT: u32 = 6144u;
+const S_OUT: u32 = 7168u;
+const S_UP: u32 = 8192u;
+const S_TMP: u32 = 9216u;
+const S_SEL: u32 = 13312u;
+// The two feature planes occupy the otherwise-unused temporary window.  A
+// feature is generated once per head and consumed by all value lanes; the
+// route planes start after the selector and are deliberately separate from
+// the fixed per-layer activation slots above.
+const S_PHASE_K: u32 = S_TMP;
+const S_PHASE_Q: u32 = S_TMP + 2048u;
+const S_ROUTE: u32 = 13568u;
+const S_ROUTE_PART: u32 = 14336u;
+const S_ROUTE_REDUCED: u32 = 32768u;
+// GatedDeltaNet mixer (layer kind 4) activation image.  The raw fused
+// q/k/v projection and its conv output (c_dim ≤ 2048 each) take the
+// temporary window the phase features use on a phase layer; z, a, b and
+// the per-head output reuse the fixed per-layer slots (nv·dv ≤ 1024,
+// nv ≤ 512).  Everything is consumed before the router planes are
+// written, so nothing here overlaps a live value.
+const S_GDN_QKV: u32 = S_TMP;
+const S_GDN_CQ: u32 = S_TMP + 2048u;
+const S_GDN_Z: u32 = S_Q;
+const S_GDN_A: u32 = S_GATE;
+const S_GDN_B: u32 = S_GATE + 512u;
+const S_GDN_O: u32 = S_ATT;
+
+// Small resident projections use the same 64-lane reduction geometry as the
+// proven f32_matvec kernel.  The old 256-lane tree was four times wider than
+// the 384/768-column Embryo rows and left most lanes paying barriers for no
+// useful work.
+var<workgroup> red0: array<f32, 64>;
+var<workgroup> red1: array<f32, 64>;
+var<workgroup> red2: array<f32, 64>;
+var<workgroup> red3: array<f32, 64>;
+var<workgroup> norm_red: array<f32, 1024>;
+var<workgroup> anchor_sc: array<f32, 256>;
+var<workgroup> anchor_red: array<f32, 256>;
+var<workgroup> route_pick_score: array<f32, 64>;
+var<workgroup> route_pick_idx: array<u32, 64>;
+// 128-lane quad reductions of the GDN step (dk ≤ 128 lanes own key rows).
+var<workgroup> gdn_r0: array<f32, 128>;
+var<workgroup> gdn_r1: array<f32, 128>;
+var<workgroup> gdn_r2: array<f32, 128>;
+var<workgroup> gdn_r3: array<f32, 128>;
+
+fn rb() -> u32 { return HEADER + p.layer * REC; }
+fn silu(x: f32) -> f32 { return x / (1.0 + exp(-x)); }
+fn norm_mul(x: f32, w: f32) -> f32 {
+    if ((p.flags & 1u) != 0u) { return x * (1.0 + w); }
+    return x * w;
+}
+fn dot_s(off: u32, row: u32, n: u32, base: u32) -> f32 {
+    var z = 0.0;
+    var j = 0u;
+    loop {
+        if (j >= n) { break; }
+        z = z + weights[off + row * n + j] * scratch[base + j];
+        j = j + 1u;
+    }
+    return z;
+}
+
+fn reduce_four(lid: u32) {
+    workgroupBarrier();
+    var step = 32u;
+    loop {
+        if (step == 0u) { break; }
+        if (lid < step) {
+            red0[lid] = red0[lid] + red0[lid + step];
+            red1[lid] = red1[lid] + red1[lid + step];
+            red2[lid] = red2[lid] + red2[lid + step];
+            red3[lid] = red3[lid] + red3[lid + step];
+        }
+        workgroupBarrier();
+        if (step == 1u) { break; }
+        step = step >> 1u;
+    }
+}
+
+// The reduction order deliberately matches the compatibility shader: all
+// lanes write one square, then a fixed 1024->1 tree.  This keeps numerical
+// differences in the split path at the same ~1e-5 level as the old graph.
+fn norm_to(lid: u32, out_base: u32, weights_base: u32) {
+    let hidden = md[0u];
+    var z = 0.0;
+    if (lid < hidden) { z = hbuf[lid] * hbuf[lid]; }
+    norm_red[lid] = z;
+    workgroupBarrier();
+    var step = 512u;
+    loop {
+        if (step == 0u) { break; }
+        if (lid < step) {
+            norm_red[lid] = norm_red[lid] + norm_red[lid + step];
+        }
+        workgroupBarrier();
+        if (step == 1u) { break; }
+        step = step >> 1u;
+    }
+    if (lid < hidden) {
+        let inv = inverseSqrt(norm_red[0] / f32(hidden) + p.eps);
+        scratch[out_base + lid] = norm_mul(hbuf[lid] * inv, weights[weights_base + lid]);
+    }
+    workgroupBarrier();
+}
+
+fn final_norm_to(lid: u32) {
+    let hidden = md[0u];
+    var z = 0.0;
+    if (lid < hidden) { z = hbuf[lid] * hbuf[lid]; }
+    norm_red[lid] = z;
+    workgroupBarrier();
+    var step = 512u;
+    loop {
+        if (step == 0u) { break; }
+        if (lid < step) {
+            norm_red[lid] = norm_red[lid] + norm_red[lid + step];
+        }
+        workgroupBarrier();
+        if (step == 1u) { break; }
+        step = step >> 1u;
+    }
+    if (lid < hidden) {
+        let inv = inverseSqrt(norm_red[0] / f32(hidden) + p.eps);
+        scratch[S_NORM + lid] = norm_mul(hbuf[lid] * inv, final_norm[lid]);
+    }
+    workgroupBarrier();
+}
+
+@compute @workgroup_size(1024)
+fn embryo_core_norm(@builtin(local_invocation_index) lid: u32) {
+    norm_to(lid, S_NORM, md[rb() + 1u]);
+}
+
+@compute @workgroup_size(1024)
+fn embryo_core_post_norm(@builtin(local_invocation_index) lid: u32) {
+    norm_to(lid, S_NORM, md[rb() + 2u]);
+}
+
+// Causal convolution is independent per hidden coordinate.  The state ring
+// shift is therefore safe to split across hidden rows and needs no global
+// reduction; the following projection dispatch observes it at the pass
+// boundary.
+@compute @workgroup_size(256)
+fn embryo_core_conv(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let lid = gid.x;
+    let hidden = md[0u];
+    if (lid >= hidden) { return; }
+    let r = rb();
+    let kind = md[r];
+    let conv_k = md[r + 24u];
+    if (kind < 2u && conv_k > 1u) {
+        let state_off = md[r + 25u];
+        let phase_len = md[13u];
+        let off = md[r + 10u];
+        var z = weights[off + lid * conv_k + conv_k - 1u] * scratch[S_NORM + lid];
+        var j = 0u;
+        loop {
+            if (j + 1u >= conv_k) { break; }
+            z = z + weights[off + lid * conv_k + j] *
+                state[state_off + phase_len + j * hidden + lid];
+            j = j + 1u;
+        }
+        var k = 0u;
+        loop {
+            if (k + 1u >= conv_k - 1u) { break; }
+            state[state_off + phase_len + k * hidden + lid] =
+                state[state_off + phase_len + (k + 1u) * hidden + lid];
+            k = k + 1u;
+        }
+        state[state_off + phase_len + (conv_k - 2u) * hidden + lid] = scratch[S_NORM + lid];
+        scratch[S_X + lid] = z;
+    } else {
+        scratch[S_X + lid] = scratch[S_NORM + lid];
+    }
+}
+
+@compute @workgroup_size(64)
+fn embryo_core_project_phase(@builtin(local_invocation_index) lid: u32,
+                             @builtin(workgroup_id) wid: vec3<u32>) {
+    let row = wid.x;
+    let r = rb();
+    let ph = md[4u];
+    let nph = md[5u];
+    let pdv = md[6u];
+    let qrows = ph * nph;
+    let vrows = ph * pdv;
+    var qz = 0.0;
+    var kz = 0.0;
+    var vz = 0.0;
+    var gz = 0.0;
+    var j = lid;
+    loop {
+        if (j >= md[0u]) { break; }
+        if (row < qrows) {
+            qz = qz + weights[md[r + 3u] + row * md[0u] + j] * scratch[S_X + j];
+            kz = kz + weights[md[r + 4u] + row * md[0u] + j] * scratch[S_X + j];
+        }
+        if (row < vrows) {
+            vz = vz + weights[md[r + 5u] + row * md[0u] + j] * scratch[S_X + j];
+        }
+        if (row < ph && md[r + 8u] != UMAX) {
+            gz = gz + weights[md[r + 8u] + row * md[0u] + j] * scratch[S_X + j];
+        }
+        j = j + 64u;
+    }
+    red0[lid] = qz;
+    red1[lid] = kz;
+    red2[lid] = vz;
+    red3[lid] = gz;
+    reduce_four(lid);
+    if (lid == 0u && row < qrows) {
+        scratch[S_Q + row] = red0[0];
+        scratch[S_K + row] = red1[0];
+    }
+    if (lid == 0u && row < vrows) { scratch[S_V + row] = red2[0]; }
+    if (lid == 0u && row < ph) {
+        var gate = 1.0;
+        if (md[r + 8u] != UMAX) {
+            gate = 1.0 / (1.0 + exp(-(red3[0] + weights[md[r + 9u] + row])));
+        }
+        scratch[S_GATE + row] = gate;
+    }
+}
+
+@compute @workgroup_size(64)
+fn embryo_core_project_anchor(@builtin(local_invocation_index) lid: u32,
+                              @builtin(workgroup_id) wid: vec3<u32>) {
+    let row = wid.x;
+    let r = rb();
+    let qrows = md[7u] * md[9u];
+    let krows = md[8u] * md[9u];
+    var qz = 0.0;
+    var kz = 0.0;
+    var vz = 0.0;
+    var j = lid;
+    loop {
+        if (j >= md[0u]) { break; }
+        if (row < qrows) { qz = qz + weights[md[r + 11u] + row * md[0u] + j] * scratch[S_NORM + j]; }
+        if (row < krows) {
+            kz = kz + weights[md[r + 12u] + row * md[0u] + j] * scratch[S_NORM + j];
+            vz = vz + weights[md[r + 13u] + row * md[0u] + j] * scratch[S_NORM + j];
+        }
+        j = j + 64u;
+    }
+    red0[lid] = qz;
+    red1[lid] = kz;
+    red2[lid] = vz;
+    red3[lid] = 0.0;
+    reduce_four(lid);
+    if (lid == 0u && row < qrows) { scratch[S_Q + row] = red0[0]; }
+    if (lid == 0u && row < krows) {
+        scratch[S_K + row] = red1[0];
+        scratch[S_V + row] = red2[0];
+    }
+}
+
+@compute @workgroup_size(256)
+fn embryo_core_rope(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let half = md[16u] / 2u;
+    if (half == 0u) { return; }
+    let qheads = md[7u];
+    let kvheads = md[8u];
+    let hd = md[9u];
+    let qpairs = qheads * half;
+    let kpairs = kvheads * half;
+    let x = gid.x;
+    if (x < qpairs) {
+        let h = x / half;
+        let j = x % half;
+        let ang = f32(p.position) * inv_freq[j];
+        let co = cos(ang);
+        let si = sin(ang);
+        let o = S_Q + h * hd + j;
+        let x0 = scratch[o];
+        let x1 = scratch[o + half];
+        scratch[o] = x0 * co - x1 * si;
+        scratch[o + half] = x0 * si + x1 * co;
+    }
+    if (x < kpairs) {
+        let h = x / half;
+        let j = x % half;
+        let ang = f32(p.position) * inv_freq[j];
+        let co = cos(ang);
+        let si = sin(ang);
+        let o = S_K + h * hd + j;
+        let x0 = scratch[o];
+        let x1 = scratch[o + half];
+        scratch[o] = x0 * co - x1 * si;
+        scratch[o + half] = x0 * si + x1 * co;
+    }
+}
+
+// Phase q/k features are shared by every value lane.  The old recurrence
+// evaluated the same sin/cos pair once for every value dimension, making the
+// phase kernel pay a 128x duplicate transcendental cost.  This standalone
+// head grid writes the existing resident scratch image, so the following
+// value-parallel recurrence stays formula-identical for both operator tags.
+@compute @workgroup_size(64)
+fn embryo_core_phase_features(@builtin(local_invocation_index) lid: u32,
+                              @builtin(workgroup_id) wid: vec3<u32>) {
+    let hh = wid.x;
+    let ph = md[4u];
+    let nph = md[5u];
+    if (hh >= ph) { return; }
+    let r = rb();
+    let kind = md[r];
+    let mass = 1.0 / (1.0 + p.phase_mass);
+    var f = lid;
+    loop {
+        if (f >= nph) { break; }
+        if (kind == 1u) {
+            scratch[S_PHASE_K + hh * nph + f] =
+                cos(scratch[S_K + hh * nph + f]);
+            scratch[S_PHASE_Q + hh * nph + f] =
+                cos(scratch[S_Q + hh * nph + f]);
+            scratch[S_PHASE_K + 1024u + hh * nph + f] =
+                sin(scratch[S_K + hh * nph + f]);
+            scratch[S_PHASE_Q + 1024u + hh * nph + f] =
+                sin(scratch[S_Q + hh * nph + f]);
+        } else {
+            scratch[S_PHASE_K + hh * nph + f] =
+                cos(scratch[S_K + hh * nph + f] * mass);
+            scratch[S_PHASE_Q + hh * nph + f] =
+                cos(scratch[S_Q + hh * nph + f] * mass);
+            scratch[S_PHASE_K + 1024u + hh * nph + f] =
+                sin(scratch[S_K + hh * nph + f] * mass);
+            scratch[S_PHASE_Q + 1024u + hh * nph + f] =
+                sin(scratch[S_Q + hh * nph + f] * mass);
+        }
+        f = f + 64u;
+    }
+}
+
+fn phase_feature(base: u32, head: u32, feature: u32) -> f32 {
+    let nph = md[5u];
+    if (feature < nph) {
+        return scratch[base + head * nph + feature];
+    }
+    return scratch[base + 1024u + head * nph + feature - nph];
+}
+
+// One workgroup owns a phase head; lanes own values.  A second grid chunk is
+// used for pdv > 256, so the recurrence is genuinely multi-workgroup in both
+// head and value dimensions rather than a single serial token kernel.
+@compute @workgroup_size(256)
+fn embryo_core_phase(@builtin(local_invocation_id) lidv: vec3<u32>,
+                     @builtin(workgroup_id) wid: vec3<u32>) {
+    let ph = md[4u];
+    let pdv = md[6u];
+    let chunks = (pdv + 255u) / 256u;
+    let linear = wid.x;
+    let hh = linear / chunks;
+    let dd = (linear % chunks) * 256u + lidv.x;
+    if (hh >= ph || dd >= pdv) { return; }
+    let r = rb();
+    let nph = md[5u];
+    let p2 = 2u * nph;
+    let scale = inverseSqrt(f32(nph));
+    let state_off = md[r + 25u];
+    let kind = md[r];
+    var out = 0.0;
+    if (kind == 1u) {
+        var rr = 0.0;
+        var f = 0u;
+        loop {
+            if (f >= p2) { break; }
+            let feat = phase_feature(S_PHASE_K, hh, f);
+            let kf = scale * feat;
+            rr = rr + kf * weights[md[r + 7u] + hh * p2 + f] *
+                state[state_off + hh * p2 * pdv + f * pdv + dd];
+            f = f + 1u;
+        }
+        f = 0u;
+        loop {
+            if (f >= p2) { break; }
+            let fk = phase_feature(S_PHASE_K, hh, f);
+            let fq = phase_feature(S_PHASE_Q, hh, f);
+            let kf = scale * fk;
+            let dec = weights[md[r + 7u] + hh * p2 + f];
+            let so = state_off + hh * p2 * pdv + f * pdv + dd;
+            let cell = dec * state[so] + scratch[S_GATE + hh] * kf *
+                (scratch[S_V + hh * pdv + dd] - rr);
+            state[so] = cell;
+            out = out + fq * scale * cell;
+            f = f + 1u;
+        }
+    } else {
+        var f = 0u;
+        loop {
+            if (f >= p2) { break; }
+            let fk = phase_feature(S_PHASE_K, hh, f);
+            let fq = phase_feature(S_PHASE_Q, hh, f);
+            let so = state_off + hh * p2 * pdv + f * pdv + dd;
+            let cell = weights[md[r + 7u] + hh * p2 + f] * state[so] +
+                fk * scratch[S_GATE + hh] * scratch[S_V + hh * pdv + dd];
+            state[so] = cell;
+            out = out + fq * cell;
+            f = f + 1u;
+        }
+    }
+    scratch[S_ATT + hh * pdv + dd] = out;
+}
+
+@compute @workgroup_size(64)
+fn embryo_core_output_phase(@builtin(local_invocation_index) lid: u32,
+                            @builtin(workgroup_id) wid: vec3<u32>) {
+    let row = wid.x;
+    let hidden = md[0u];
+    var z = 0.0;
+    var j = lid;
+    loop {
+        if (j >= md[4u] * md[6u]) { break; }
+        if (row < hidden) {
+            z = z + weights[md[rb() + 6u] + row * md[4u] * md[6u] + j] * scratch[S_ATT + j];
+        }
+        j = j + 64u;
+    }
+    red0[lid] = z;
+    red1[lid] = 0.0;
+    red2[lid] = 0.0;
+    red3[lid] = 0.0;
+    reduce_four(lid);
+    if (lid == 0u && row < hidden) { scratch[S_OUT + row] = red0[0]; }
+}
+
+@compute @workgroup_size(256)
+fn embryo_core_anchor_append(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let row = gid.x;
+    let r = rb();
+    let n = md[8u] * md[9u];
+    if (row >= n) { return; }
+    let base = md[r + 26u] + p.position * n;
+    kv[base + row] = scratch[S_K + row];
+    kv[md[r + 26u] + p.max_seq * n + p.position * n + row] = scratch[S_V + row];
+}
+
+@compute @workgroup_size(256)
+fn embryo_core_anchor_attend(@builtin(local_invocation_id) lidv: vec3<u32>,
+                             @builtin(workgroup_id) wid: vec3<u32>) {
+    let qheads = md[7u];
+    let hd = md[9u];
+    // Keep one workgroup per head whenever possible.  For wider heads, a
+    // second output chunk is still allowed, but each chunk now shares one
+    // score pass instead of recomputing q·k once per output dimension.
+    let out_chunks = (hd + 255u) / 256u;
+    let hq = wid.x / out_chunks;
+    let dd = (wid.x % out_chunks) * 256u + lidv.x;
+    if (hq >= qheads) { return; }
+    let r = rb();
+    let kvheads = md[8u];
+    let kh = hq / (qheads / kvheads);
+    let n = p.position + 1u;
+    let scale = inverseSqrt(f32(hd));
+    let kvbase = md[r + 26u];
+    var m = -3.402823e+38;
+    var l = 0.0;
+    var acc = 0.0;
+    var c0 = 0u;
+    loop {
+        if (c0 >= n) { break; }
+        let cn = min(256u, n - c0);
+        var sc = -3.402823e+38;
+        if (lidv.x < cn) {
+            let krow = kvbase + (c0 + lidv.x) * kvheads * hd + kh * hd;
+            var dot = 0.0;
+            var j = 0u;
+            loop {
+                if (j >= hd) { break; }
+                dot = dot + scratch[S_Q + hq * hd + j] * kv[krow + j];
+                j = j + 1u;
+            }
+            sc = dot * scale;
+        }
+        anchor_sc[lidv.x] = sc;
+        anchor_red[lidv.x] = sc;
+        workgroupBarrier();
+        var stride = 128u;
+        loop {
+            if (stride == 0u) { break; }
+            if (lidv.x < stride) {
+                anchor_red[lidv.x] = max(anchor_red[lidv.x], anchor_red[lidv.x + stride]);
+            }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        let cm = anchor_red[0];
+        workgroupBarrier();
+        let mp = max(m, cm);
+        let old_scale = exp(m - mp);
+        let w = select(0.0, exp(anchor_sc[lidv.x] - mp), lidv.x < cn);
+        anchor_sc[lidv.x] = w;
+        anchor_red[lidv.x] = w;
+        workgroupBarrier();
+        stride = 128u;
+        loop {
+            if (stride == 0u) { break; }
+            if (lidv.x < stride) {
+                anchor_red[lidv.x] = anchor_red[lidv.x] + anchor_red[lidv.x + stride];
+            }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        l = l * old_scale + anchor_red[0];
+        workgroupBarrier();
+        if (dd < hd) {
+            acc = acc * old_scale;
+            var t = 0u;
+            loop {
+                if (t >= cn) { break; }
+                let vrow = kvbase + p.max_seq * kvheads * hd +
+                    (c0 + t) * kvheads * hd + kh * hd;
+                acc = acc + anchor_sc[t] * kv[vrow + dd];
+                t = t + 1u;
+            }
+        }
+        m = mp;
+        c0 = c0 + 256u;
+        workgroupBarrier();
+    }
+    if (dd < hd) {
+        scratch[S_ATT + hq * hd + dd] = acc / max(l, 1e-20);
+    }
+}
+
+@compute @workgroup_size(64)
+fn embryo_core_output_anchor(@builtin(local_invocation_index) lid: u32,
+                             @builtin(workgroup_id) wid: vec3<u32>) {
+    let row = wid.x;
+    let hidden = md[0u];
+    var z = 0.0;
+    var j = lid;
+    loop {
+        if (j >= md[7u] * md[9u]) { break; }
+        if (row < hidden) {
+            z = z + weights[md[rb() + 14u] + row * md[7u] * md[9u] + j] * scratch[S_ATT + j];
+        }
+        j = j + 64u;
+    }
+    red0[lid] = z;
+    red1[lid] = 0.0;
+    red2[lid] = 0.0;
+    red3[lid] = 0.0;
+    reduce_four(lid);
+    if (lid == 0u && row < hidden) { scratch[S_OUT + row] = red0[0]; }
+}
+
+// ── GatedDeltaNet mixer (layer kind 4) ─────────────────────────────────
+// The same operator the CPU executes in linear_core::gdn_step, in the
+// resident layout: the per-layer state slot is [conv ring (kk−1)·c_dim |
+// S nv·dk·dv] exactly as GdnCfg::state_len packs it on the host.  Layer
+// record: md[r+56] in_proj_qkv, [57] in_proj_z, [58] in_proj_a,
+// [59] in_proj_b, [60] conv taps [c][kk], [61] A_log, [62] dt_bias,
+// [63] norm, [29] out_proj; md[r+25] is the state slot.  The math is the
+// per-op gdn_conv / gdn_step_par / gdn_step_norm chain, so the resident
+// numbers sit in the same GPU tie class as the generic graph.
+fn gdn_softplus(x: f32) -> f32 {
+    if (x > 20.0) { return x; }
+    return log(1.0 + exp(x));
+}
+
+fn gdn_reduce4(t: u32) {
+    workgroupBarrier();
+    var stride = 64u;
+    loop {
+        if (stride == 0u) { break; }
+        if (t < stride) {
+            gdn_r0[t] = gdn_r0[t] + gdn_r0[t + stride];
+            gdn_r1[t] = gdn_r1[t] + gdn_r1[t + stride];
+            gdn_r2[t] = gdn_r2[t] + gdn_r2[t + stride];
+            gdn_r3[t] = gdn_r3[t] + gdn_r3[t + stride];
+        }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+}
+
+// Fused q/k/v, z, a, b projections of the normed token: one 64-lane
+// workgroup per output row, all four planes in one reduction (the row
+// index is shared; narrower planes simply stop contributing).
+@compute @workgroup_size(64)
+fn embryo_core_gdn_project(@builtin(local_invocation_index) lid: u32,
+                           @builtin(workgroup_id) wid: vec3<u32>) {
+    let row = wid.x;
+    let r = rb();
+    let hidden = md[0u];
+    let nv = md[24u];
+    let vd = nv * md[27u];
+    let cdim = md[29u];
+    var qz = 0.0;
+    var zz = 0.0;
+    var az = 0.0;
+    var bz = 0.0;
+    var j = lid;
+    loop {
+        if (j >= hidden) { break; }
+        let x = scratch[S_NORM + j];
+        if (row < cdim) { qz = qz + weights[md[r + 56u] + row * hidden + j] * x; }
+        if (row < vd) { zz = zz + weights[md[r + 57u] + row * hidden + j] * x; }
+        if (row < nv) {
+            az = az + weights[md[r + 58u] + row * hidden + j] * x;
+            bz = bz + weights[md[r + 59u] + row * hidden + j] * x;
+        }
+        j = j + 64u;
+    }
+    red0[lid] = qz;
+    red1[lid] = zz;
+    red2[lid] = az;
+    red3[lid] = bz;
+    reduce_four(lid);
+    if (lid == 0u) {
+        if (row < cdim) { scratch[S_GDN_QKV + row] = red0[0]; }
+        if (row < vd) { scratch[S_GDN_Z + row] = red1[0]; }
+        if (row < nv) {
+            scratch[S_GDN_A + row] = red2[0];
+            scratch[S_GDN_B + row] = red3[0];
+        }
+    }
+}
+
+// Depthwise causal conv + SiLU over [ring…, current], then the ring
+// shift (drop oldest, append the raw current).  Channels are
+// independent, so no reduction and no barrier.
+@compute @workgroup_size(256)
+fn embryo_core_gdn_conv(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let c = gid.x;
+    let cdim = md[29u];
+    if (c >= cdim) { return; }
+    let r = rb();
+    let kk = md[28u];
+    let taps = md[r + 60u] + c * kk;
+    let ring = md[r + 25u];
+    let x = scratch[S_GDN_QKV + c];
+    var acc = x * weights[taps + kk - 1u];
+    var j = 0u;
+    loop {
+        if (j + 1u >= kk) { break; }
+        acc = acc + state[ring + j * cdim + c] * weights[taps + j];
+        j = j + 1u;
+    }
+    scratch[S_GDN_CQ + c] = acc / (1.0 + exp(-acc));
+    j = 0u;
+    loop {
+        if (j + 2u >= kk) { break; }
+        state[ring + j * cdim + c] = state[ring + (j + 1u) * cdim + c];
+        j = j + 1u;
+    }
+    if (kk > 1u) { state[ring + (kk - 2u) * cdim + c] = x; }
+}
+
+// Delta-rule state step: one 128-lane workgroup per (head, vec4 column
+// group); lanes own key rows (dk ≤ 128).  kv = kfᵀS_old, then
+// S ← g·S + kf ⊗ β(v − g·kv), o = qfᵀS — the two dk reductions are
+// 128-lane trees, four columns riding together.  Raw o lands in
+// S_GDN_O; the norm kernel gates it in place.
+@compute @workgroup_size(128)
+fn embryo_core_gdn_step(@builtin(local_invocation_index) t: u32,
+                        @builtin(workgroup_id) wid: vec3<u32>) {
+    let nv = md[24u];
+    let nk = md[25u];
+    let dk = md[26u];
+    let dv = md[27u];
+    let kk = md[28u];
+    let cdim = md[29u];
+    let dv4 = dv >> 2u;
+    let h = wid.x / dv4;
+    let dj4 = wid.x % dv4;
+    if (h >= nv) { return; }
+    let r = rb();
+    let rep = nv / nk;
+    let ko = h / rep;
+    let kd = nk * dk;
+    let qs = S_GDN_CQ + ko * dk;
+    let ks = S_GDN_CQ + kd + ko * dk;
+    let cq_q = select(0.0, scratch[qs + t], t < dk);
+    let cq_k = select(0.0, scratch[ks + t], t < dk);
+    gdn_r0[t] = cq_q * cq_q;
+    gdn_r1[t] = cq_k * cq_k;
+    gdn_r2[t] = 0.0;
+    gdn_r3[t] = 0.0;
+    gdn_reduce4(t);
+    let nq = gdn_r0[0];
+    let nkn = gdn_r1[0];
+    workgroupBarrier();
+    let invq = 1.0 / (sqrt(nq + 1e-6) * sqrt(f32(dk)));
+    let invk = 1.0 / sqrt(nkn + 1e-6);
+    let g = exp(-exp(weights[md[r + 61u] + h]) *
+        gdn_softplus(scratch[S_GDN_A + h] + weights[md[r + 62u] + h]));
+    let beta = 1.0 / (1.0 + exp(-scratch[S_GDN_B + h]));
+    let vto = S_GDN_CQ + 2u * kd + h * dv + dj4 * 4u;
+    let vt = vec4<f32>(scratch[vto], scratch[vto + 1u], scratch[vto + 2u], scratch[vto + 3u]);
+    let kf_t = cq_k * invk;
+    let qf_t = cq_q * invq;
+    let s4base = (md[r + 25u] + (kk - 1u) * cdim + h * dk * dv) >> 2u;
+    var kv4 = vec4<f32>(0.0);
+    if (t < dk) { kv4 = state4[s4base + t * dv4 + dj4] * kf_t; }
+    gdn_r0[t] = kv4.x;
+    gdn_r1[t] = kv4.y;
+    gdn_r2[t] = kv4.z;
+    gdn_r3[t] = kv4.w;
+    gdn_reduce4(t);
+    let kv = vec4<f32>(gdn_r0[0], gdn_r1[0], gdn_r2[0], gdn_r3[0]);
+    workgroupBarrier();
+    let delta = (vt - g * kv) * beta;
+    var contrib = vec4<f32>(0.0);
+    if (t < dk) {
+        let idx = s4base + t * dv4 + dj4;
+        let cell = g * state4[idx] + kf_t * delta;
+        state4[idx] = cell;
+        contrib = qf_t * cell;
+    }
+    gdn_r0[t] = contrib.x;
+    gdn_r1[t] = contrib.y;
+    gdn_r2[t] = contrib.z;
+    gdn_r3[t] = contrib.w;
+    gdn_reduce4(t);
+    if (t == 0u) {
+        let o = S_GDN_O + h * dv + dj4 * 4u;
+        scratch[o] = gdn_r0[0];
+        scratch[o + 1u] = gdn_r1[0];
+        scratch[o + 2u] = gdn_r2[0];
+        scratch[o + 3u] = gdn_r3[0];
+    }
+}
+
+// Gated RMSNorm per head, in place over the raw o: x̂ · norm · silu(z).
+@compute @workgroup_size(256)
+fn embryo_core_gdn_norm(@builtin(local_invocation_index) t: u32,
+                        @builtin(workgroup_id) wid: vec3<u32>) {
+    let h = wid.x;
+    let nv = md[24u];
+    let dv = md[27u];
+    if (h >= nv) { return; }
+    let r = rb();
+    let o = S_GDN_O + h * dv;
+    var z = 0.0;
+    if (t < dv) { z = scratch[o + t] * scratch[o + t]; }
+    anchor_red[t] = z;
+    workgroupBarrier();
+    var stride = 128u;
+    loop {
+        if (stride == 0u) { break; }
+        if (t < stride) { anchor_red[t] = anchor_red[t] + anchor_red[t + stride]; }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    let inv = 1.0 / sqrt(anchor_red[0] / f32(dv) + p.eps);
+    workgroupBarrier();
+    if (t < dv) {
+        let zz = scratch[S_GDN_Z + h * dv + t];
+        scratch[o + t] = scratch[o + t] * inv * weights[md[r + 63u] + t] *
+            (zz / (1.0 + exp(-zz)));
+    }
+}
+
+@compute @workgroup_size(64)
+fn embryo_core_gdn_output(@builtin(local_invocation_index) lid: u32,
+                          @builtin(workgroup_id) wid: vec3<u32>) {
+    let row = wid.x;
+    let hidden = md[0u];
+    let vd = md[24u] * md[27u];
+    var z = 0.0;
+    var j = lid;
+    loop {
+        if (j >= vd) { break; }
+        if (row < hidden) {
+            z = z + weights[md[rb() + 29u] + row * vd + j] * scratch[S_GDN_O + j];
+        }
+        j = j + 64u;
+    }
+    red0[lid] = z;
+    red1[lid] = 0.0;
+    red2[lid] = 0.0;
+    red3[lid] = 0.0;
+    reduce_four(lid);
+    if (lid == 0u && row < hidden) { scratch[S_OUT + row] = red0[0]; }
+}
+
+@compute @workgroup_size(256)
+fn embryo_core_residual(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x < md[0u]) { hbuf[gid.x] = hbuf[gid.x] + scratch[S_OUT + gid.x]; }
+}
+
+fn route_reduce_one(lid: u32) -> f32 {
+    workgroupBarrier();
+    var step = 32u;
+    loop {
+        if (step == 0u) { break; }
+        if (lid < step) {
+            red0[lid] = red0[lid] + red0[lid + step];
+        }
+        workgroupBarrier();
+        if (step == 1u) { break; }
+        step = step >> 1u;
+    }
+    return red0[0];
+}
+
+// One coalesced 64-lane grid covers one (expert, residual/projection row,
+// hidden chunk).  This replaces the old four-lane WG, whose each lane walked
+// all 384 hidden values and every rank row serially.  The fixed partial image
+// keeps the subsequent reductions ordered and resident.
+@compute @workgroup_size(64)
+fn embryo_core_route_part(@builtin(local_invocation_index) lid: u32,
+                          @builtin(workgroup_id) wid: vec3<u32>) {
+    let r = rb();
+    let ne = md[r + 16u];
+    let hidden = md[0u];
+    let rank = md[r + 20u];
+    let chunks = (hidden + 63u) / 64u;
+    let comps = rank + 1u;
+    let linear = wid.x;
+    let chunk = linear % chunks;
+    let component = (linear / chunks) % comps;
+    let expert = linear / (chunks * comps);
+    var z = 0.0;
+    let j = chunk * 64u + lid;
+    if (expert < ne && j < hidden) {
+        let mu = weights[md[r + 17u] + expert * hidden + j];
+        let dx = scratch[S_NORM + j] - mu;
+        if (component == 0u) {
+            z = dx * dx;
+        } else {
+            z = dx * weights[
+                md[r + 18u] + (expert * rank + component - 1u) * hidden + j
+            ];
+        }
+    }
+    red0[lid] = z;
+    let total = route_reduce_one(lid);
+    if (expert < ne) {
+        let ec = expert * comps + component;
+        scratch[S_ROUTE_PART + ec * chunks + chunk] = total;
+    }
+}
+
+// Reduce each (expert, residual/U-row) chunk list to one resident scalar.
+// A separate grid means no workgroup needs to wait on another expert or row,
+// while the fixed tree keeps the operation deterministic.
+@compute @workgroup_size(64)
+fn embryo_core_route_reduce(@builtin(local_invocation_index) lid: u32,
+                            @builtin(workgroup_id) wid: vec3<u32>) {
+    let r = rb();
+    let ne = md[r + 16u];
+    let hidden = md[0u];
+    let rank = md[r + 20u];
+    let chunks = (hidden + 63u) / 64u;
+    let comps = rank + 1u;
+    let ec = wid.x;
+    let total_ec = ne * comps;
+    var z = 0.0;
+    if (ec < total_ec) {
+        var chunk = lid;
+        loop {
+            if (chunk >= chunks) { break; }
+            z = z + scratch[S_ROUTE_PART + ec * chunks + chunk];
+            chunk = chunk + 64u;
+        }
+    }
+    red0[lid] = z;
+    let total = route_reduce_one(lid);
+    if (lid == 0u && ec < total_ec) {
+        scratch[S_ROUTE_REDUCED + ec] = total;
+    }
+}
+
+// Fold each expert's d² and U-row projection norms.  The expensive hidden
+// dimension is already reduced; only rank (<=128 under the resident contract)
+// remains, and all experts run concurrently.
+@compute @workgroup_size(64)
+fn embryo_core_route_finalize(@builtin(local_invocation_index) lid: u32,
+                              @builtin(workgroup_id) wid: vec3<u32>) {
+    let r = rb();
+    let ne = md[r + 16u];
+    let rank = md[r + 20u];
+    let expert = wid.x;
+    var z = 0.0;
+    if (expert < ne) {
+        var component = lid;
+        loop {
+            if (component >= rank) { break; }
+            let ec = expert * (rank + 1u) + component + 1u;
+            let proj = scratch[S_ROUTE_REDUCED + ec];
+            z = z + proj * proj;
+            component = component + 64u;
+        }
+    }
+    red0[lid] = z;
+    let proj_norm = route_reduce_one(lid);
+    if (lid == 0u && expert < ne) {
+        let d2 = scratch[S_ROUTE_REDUCED + expert * (rank + 1u)];
+        // Growth shell (record word 30: E shells then one −∞ sentinel):
+        // an expert whose reconstruction error exceeds its shell scores
+        // −∞ exactly as the host `Resonance::scores` does; trunk rows
+        // carry +inf and are never masked.
+        let err = d2 - proj_norm;
+        var score = weights[md[r + 19u] + expert] - err;
+        let so = md[r + 30u];
+        if (so != 0xffffffffu && err > weights[so + expert]) {
+            score = weights[so + ne];
+        }
+        scratch[S_ROUTE + expert] = score;
+    }
+}
+
+// Deterministic top-1 reduction: score wins, and the lower expert id wins an
+// exact tie just like the CPU loop.  The old selector was one serial lane;
+// this keeps the contract while avoiding a hidden single-lane dependency.
+@compute @workgroup_size(64)
+fn embryo_core_route_pick(@builtin(local_invocation_index) lid: u32) {
+    let ne = md[rb() + 16u];
+    route_pick_score[lid] = select(-3.402823e+38, scratch[S_ROUTE + lid], lid < ne);
+    route_pick_idx[lid] = lid;
+    workgroupBarrier();
+    var step = 32u;
+    loop {
+        if (step == 0u) { break; }
+        if (lid < step) {
+            let other_score = route_pick_score[lid + step];
+            let other_idx = route_pick_idx[lid + step];
+            let ours = route_pick_score[lid];
+            let ours_idx = route_pick_idx[lid];
+            if (other_score > ours ||
+                (other_score == ours && other_idx < ours_idx)) {
+                route_pick_score[lid] = other_score;
+                route_pick_idx[lid] = other_idx;
+            }
+        }
+        workgroupBarrier();
+        if (step == 1u) { break; }
+        step = step >> 1u;
+    }
+    if (lid == 0u) { scratch[S_SEL] = f32(route_pick_idx[0]); }
+}
+
+fn ffn_proj(row: u32, lid: u32, expert: bool) {
+    let r = rb();
+    let hidden = md[0u];
+    let inter = md[1u];
+    var go = md[r + 21u];
+    var uo = md[r + 22u];
+    if (expert) {
+        let selected = u32(scratch[S_SEL]);
+        go = md[r + 32u + selected * 3u];
+        uo = md[r + 33u + selected * 3u];
+    }
+    var gz = 0.0;
+    var uz = 0.0;
+    var j = lid;
+    loop {
+        if (j >= hidden) { break; }
+        if (row < inter) {
+            gz = gz + weights[go + row * hidden + j] * scratch[S_NORM + j];
+            uz = uz + weights[uo + row * hidden + j] * scratch[S_NORM + j];
+        }
+        j = j + 64u;
+    }
+    red0[lid] = gz;
+    red1[lid] = uz;
+    red2[lid] = 0.0;
+    red3[lid] = 0.0;
+    reduce_four(lid);
+    if (lid == 0u && row < inter) {
+        scratch[S_G + row] = red0[0];
+        scratch[S_UP + row] = red1[0];
+    }
+}
+
+@compute @workgroup_size(64)
+fn embryo_core_ffn_dense_proj(@builtin(local_invocation_index) lid: u32,
+                              @builtin(workgroup_id) wid: vec3<u32>) { ffn_proj(wid.x, lid, false); }
+@compute @workgroup_size(64)
+fn embryo_core_ffn_expert_proj(@builtin(local_invocation_index) lid: u32,
+                               @builtin(workgroup_id) wid: vec3<u32>) { ffn_proj(wid.x, lid, true); }
+@compute @workgroup_size(64)
+fn embryo_core_ffn_shared_proj(@builtin(local_invocation_index) lid: u32,
+                               @builtin(workgroup_id) wid: vec3<u32>) { ffn_proj(wid.x, lid, false); }
+
+@compute @workgroup_size(256)
+fn embryo_core_ffn_act(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x < md[1u]) { scratch[S_G + gid.x] = silu(scratch[S_G + gid.x]) * scratch[S_UP + gid.x]; }
+}
+
+fn ffn_down(row: u32, lid: u32, expert: bool) {
+    let hidden = md[0u];
+    let r = rb();
+    var off = md[r + 23u];
+    if (expert) {
+        let selected = u32(scratch[S_SEL]);
+        off = md[r + 34u + selected * 3u];
+    }
+    var z = 0.0;
+    var j = lid;
+    loop {
+        if (j >= md[1u]) { break; }
+        if (row < hidden) { z = z + weights[off + row * md[1u] + j] * scratch[S_G + j]; }
+        j = j + 64u;
+    }
+    red0[lid] = z;
+    red1[lid] = 0.0;
+    red2[lid] = 0.0;
+    red3[lid] = 0.0;
+    reduce_four(lid);
+    if (lid == 0u && row < hidden) { scratch[S_OUT + row] = red0[0]; }
+}
+@compute @workgroup_size(64)
+fn embryo_core_ffn_dense_down(@builtin(local_invocation_index) lid: u32,
+                              @builtin(workgroup_id) wid: vec3<u32>) { ffn_down(wid.x, lid, false); }
+@compute @workgroup_size(64)
+fn embryo_core_ffn_expert_down(@builtin(local_invocation_index) lid: u32,
+                               @builtin(workgroup_id) wid: vec3<u32>) { ffn_down(wid.x, lid, true); }
+@compute @workgroup_size(64)
+fn embryo_core_ffn_shared_down(@builtin(local_invocation_index) lid: u32,
+                               @builtin(workgroup_id) wid: vec3<u32>) { ffn_down(wid.x, lid, false); }
+
+@compute @workgroup_size(1024)
+fn embryo_core_final_norm(@builtin(local_invocation_index) lid: u32) {
+    final_norm_to(lid);
+}
+
+@compute @workgroup_size(256)
+fn embryo_core_publish(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x < md[0u]) { hbuf[gid.x] = scratch[S_NORM + gid.x]; }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Chunked prefill: the same layer body over n ≤ CMAX positions of one
+// contiguous span in ONE submit.  Projections, FFN and the router are
+// chunk GEMMs whose per-output reduction order is exactly the token
+// path's (lane-strided partials + the 64→1 tree); the recurrent mixers
+// (GDN, vmf_phase) and the bounded anchor walk the chunk in time order
+// inside their kernels with the per-token arithmetic unchanged — so the
+// chunked prefill reproduces the token-by-token graph's state and
+// logits.  Per-position planes live in the chunk window of `scratch`
+// (row stride 1024 / 2048 / …, CMAX rows); `hbuf` holds the n residual
+// rows (stride hidden).  Only the last position reaches the head.
+// Nothing here grows with the context: a position's anchor scores go
+// against ring ∪ chunk (≤ S + W keys) and the ring is rewritten after
+// the chunk, the recurrent state is updated in place.
+const CMAX: u32 = 64u;
+const CB: u32 = 40960u;
+const CP_X: u32 = CB;
+const CP_Q: u32 = CP_X + CMAX * 1024u;
+const CP_K: u32 = CP_Q + CMAX * 1024u;
+const CP_V: u32 = CP_K + CMAX * 1024u;
+const CP_GATE: u32 = CP_V + CMAX * 1024u;
+const CP_ATT: u32 = CP_GATE + CMAX * 1024u;
+const CP_OUT: u32 = CP_ATT + CMAX * 1024u;
+const CP_G: u32 = CP_OUT + CMAX * 1024u;
+const CP_UP: u32 = CP_G + CMAX * 1024u;
+const CP_CX: u32 = CP_UP + CMAX * 1024u;
+const CP_BIG0: u32 = CP_CX + CMAX * 1024u;
+const CP_BIG1: u32 = CP_BIG0 + CMAX * 2048u;
+const CP_ROUTE: u32 = CP_BIG1 + CMAX * 2048u;
+const CP_RRED: u32 = CP_ROUTE + CMAX * 16512u;
+const CP_RSCORE: u32 = CP_RRED + CMAX * 1032u;
+const CP_SEL: u32 = CP_RSCORE + CMAX * 8u;
+const CP_LIST: u32 = CP_SEL + CMAX;
+const CP_COUNT: u32 = CP_LIST + 8u * CMAX;
+
+var<workgroup> cg_red: array<f32, 1024>;
+
+// RMSNorm of residual row t into CP_X[t] — the token path's `norm_to`
+// tree, one workgroup per position.
+fn c_norm_row(lid: u32, t: u32, wbase: u32) {
+    let hidden = md[0u];
+    var z = 0.0;
+    if (lid < hidden) { let v = hbuf[t * hidden + lid]; z = v * v; }
+    norm_red[lid] = z;
+    workgroupBarrier();
+    var step = 512u;
+    loop {
+        if (step == 0u) { break; }
+        if (lid < step) {
+            norm_red[lid] = norm_red[lid] + norm_red[lid + step];
+        }
+        workgroupBarrier();
+        if (step == 1u) { break; }
+        step = step >> 1u;
+    }
+    if (lid < hidden) {
+        let inv = inverseSqrt(norm_red[0] / f32(hidden) + p.eps);
+        scratch[CP_X + t * 1024u + lid] =
+            norm_mul(hbuf[t * hidden + lid] * inv, weights[wbase + lid]);
+    }
+    workgroupBarrier();
+}
+
+@compute @workgroup_size(1024)
+fn embryo_chunk_norm(@builtin(local_invocation_index) lid: u32,
+                     @builtin(workgroup_id) wid: vec3<u32>) {
+    if (wid.x < p.chunk) { c_norm_row(lid, wid.x, md[rb() + 1u]); }
+}
+
+@compute @workgroup_size(1024)
+fn embryo_chunk_post_norm(@builtin(local_invocation_index) lid: u32,
+                          @builtin(workgroup_id) wid: vec3<u32>) {
+    if (wid.x < p.chunk) { c_norm_row(lid, wid.x, md[rb() + 2u]); }
+}
+
+// Final norm of the LAST chunk row into S_NORM; the token path's
+// `publish` then moves it to hbuf row 0 for the head.
+@compute @workgroup_size(1024)
+fn embryo_chunk_final_norm(@builtin(local_invocation_index) lid: u32) {
+    let hidden = md[0u];
+    let t = p.chunk - 1u;
+    var z = 0.0;
+    if (lid < hidden) { let v = hbuf[t * hidden + lid]; z = v * v; }
+    norm_red[lid] = z;
+    workgroupBarrier();
+    var step = 512u;
+    loop {
+        if (step == 0u) { break; }
+        if (lid < step) {
+            norm_red[lid] = norm_red[lid] + norm_red[lid + step];
+        }
+        workgroupBarrier();
+        if (step == 1u) { break; }
+        step = step >> 1u;
+    }
+    if (lid < hidden) {
+        let inv = inverseSqrt(norm_red[0] / f32(hidden) + p.eps);
+        scratch[S_NORM + lid] = norm_mul(hbuf[t * hidden + lid] * inv, final_norm[lid]);
+    }
+}
+
+// Chunk GEMM: one 64-lane workgroup per (output row, block of 16
+// positions).  Lane l accumulates j ≡ l (mod 64) in increasing j for
+// each position, then the 64→1 tree — bit-for-bit the token path's
+// per-row projection.  `map` (≠ UMAX) is a position list of `ntok`
+// entries (the expert's tokens); `bias` (≠ UMAX) applies the κ-gate
+// epilogue `sigmoid(v + bias[row])`.
+fn cg(woff: u32, rows: u32, cols: u32, xoff: u32, xs: u32, yoff: u32, ys: u32,
+      ntok: u32, map: u32, bias: u32, lid: u32, wid: vec3<u32>) {
+    let row = wid.x;
+    let t0 = wid.y * 16u;
+    var acc: array<f32, 16>;
+    var toks: array<u32, 16>;
+    var i = 0u;
+    loop {
+        if (i >= 16u) { break; }
+        acc[i] = 0.0;
+        var tok = t0 + i;
+        if (map != UMAX && tok < ntok) { tok = u32(scratch[map + tok]); }
+        toks[i] = tok;
+        i = i + 1u;
+    }
+    let live = min(16u, ntok - min(ntok, t0));
+    if (row < rows) {
+        var j = lid;
+        loop {
+            if (j >= cols) { break; }
+            let w = weights[woff + row * cols + j];
+            i = 0u;
+            loop {
+                if (i >= live) { break; }
+                acc[i] = acc[i] + w * scratch[xoff + toks[i] * xs + j];
+                i = i + 1u;
+            }
+            j = j + 64u;
+        }
+    }
+    i = 0u;
+    loop {
+        if (i >= 16u) { break; }
+        cg_red[i * 64u + lid] = acc[i];
+        i = i + 1u;
+    }
+    workgroupBarrier();
+    var step = 32u;
+    loop {
+        if (step == 0u) { break; }
+        if (lid < step) {
+            i = 0u;
+            loop {
+                if (i >= 16u) { break; }
+                cg_red[i * 64u + lid] = cg_red[i * 64u + lid] + cg_red[i * 64u + lid + step];
+                i = i + 1u;
+            }
+        }
+        workgroupBarrier();
+        if (step == 1u) { break; }
+        step = step >> 1u;
+    }
+    if (lid < live && row < rows) {
+        var v = cg_red[lid * 64u];
+        if (bias != UMAX) { v = 1.0 / (1.0 + exp(-(v + weights[bias + row]))); }
+        scratch[yoff + toks[lid] * ys + row] = v;
+    }
+}
+
+// ── GDN mixer over the chunk ──
+@compute @workgroup_size(64)
+fn embryo_chunk_gdn_qkv(@builtin(local_invocation_index) lid: u32,
+                        @builtin(workgroup_id) wid: vec3<u32>) {
+    cg(md[rb() + 56u], md[29u], md[0u], CP_X, 1024u, CP_BIG0, 2048u, p.chunk, UMAX, UMAX, lid, wid);
+}
+@compute @workgroup_size(64)
+fn embryo_chunk_gdn_z(@builtin(local_invocation_index) lid: u32,
+                      @builtin(workgroup_id) wid: vec3<u32>) {
+    cg(md[rb() + 57u], md[24u] * md[27u], md[0u], CP_X, 1024u, CP_Q, 1024u, p.chunk, UMAX, UMAX, lid, wid);
+}
+@compute @workgroup_size(64)
+fn embryo_chunk_gdn_a(@builtin(local_invocation_index) lid: u32,
+                      @builtin(workgroup_id) wid: vec3<u32>) {
+    cg(md[rb() + 58u], md[24u], md[0u], CP_X, 1024u, CP_K, 1024u, p.chunk, UMAX, UMAX, lid, wid);
+}
+@compute @workgroup_size(64)
+fn embryo_chunk_gdn_b(@builtin(local_invocation_index) lid: u32,
+                      @builtin(workgroup_id) wid: vec3<u32>) {
+    cg(md[rb() + 59u], md[24u], md[0u], CP_X, 1024u, CP_K + 512u, 1024u, p.chunk, UMAX, UMAX, lid, wid);
+}
+@compute @workgroup_size(64)
+fn embryo_chunk_gdn_out(@builtin(local_invocation_index) lid: u32,
+                        @builtin(workgroup_id) wid: vec3<u32>) {
+    cg(md[rb() + 29u], md[0u], md[24u] * md[27u], CP_ATT, 1024u, CP_OUT, 1024u, p.chunk, UMAX, UMAX, lid, wid);
+}
+
+// Depthwise conv + SiLU and the ring shift, position by position per
+// channel (the same order as the token kernel, n times).
+@compute @workgroup_size(256)
+fn embryo_chunk_gdn_conv(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let c = gid.x;
+    let cdim = md[29u];
+    if (c >= cdim) { return; }
+    let r = rb();
+    let kk = md[28u];
+    let taps = md[r + 60u] + c * kk;
+    let ring = md[r + 25u];
+    var t = 0u;
+    loop {
+        if (t >= p.chunk) { break; }
+        let x = scratch[CP_BIG0 + t * 2048u + c];
+        var acc = x * weights[taps + kk - 1u];
+        var j = 0u;
+        loop {
+            if (j + 1u >= kk) { break; }
+            acc = acc + state[ring + j * cdim + c] * weights[taps + j];
+            j = j + 1u;
+        }
+        scratch[CP_BIG1 + t * 2048u + c] = acc / (1.0 + exp(-acc));
+        j = 0u;
+        loop {
+            if (j + 2u >= kk) { break; }
+            state[ring + j * cdim + c] = state[ring + (j + 1u) * cdim + c];
+            j = j + 1u;
+        }
+        if (kk > 1u) { state[ring + (kk - 2u) * cdim + c] = x; }
+        t = t + 1u;
+    }
+}
+
+// Delta-rule step over the chunk: one workgroup per (head, vec4 column
+// group), positions in order, the token kernel's body per position.
+@compute @workgroup_size(128)
+fn embryo_chunk_gdn_step(@builtin(local_invocation_index) t: u32,
+                         @builtin(workgroup_id) wid: vec3<u32>) {
+    let nv = md[24u];
+    let nk = md[25u];
+    let dk = md[26u];
+    let dv = md[27u];
+    let kk = md[28u];
+    let cdim = md[29u];
+    let dv4 = dv >> 2u;
+    let h = wid.x / dv4;
+    let dj4 = wid.x % dv4;
+    if (h >= nv) { return; }
+    let r = rb();
+    let rep = nv / nk;
+    let ko = h / rep;
+    let kd = nk * dk;
+    let s4base = (md[r + 25u] + (kk - 1u) * cdim + h * dk * dv) >> 2u;
+    let alog = weights[md[r + 61u] + h];
+    let dtb = weights[md[r + 62u] + h];
+    var pos = 0u;
+    loop {
+        if (pos >= p.chunk) { break; }
+        let cq = CP_BIG1 + pos * 2048u;
+        let qs = cq + ko * dk;
+        let ks = cq + kd + ko * dk;
+        let cq_q = select(0.0, scratch[qs + t], t < dk);
+        let cq_k = select(0.0, scratch[ks + t], t < dk);
+        gdn_r0[t] = cq_q * cq_q;
+        gdn_r1[t] = cq_k * cq_k;
+        gdn_r2[t] = 0.0;
+        gdn_r3[t] = 0.0;
+        gdn_reduce4(t);
+        let nq = gdn_r0[0];
+        let nkn = gdn_r1[0];
+        workgroupBarrier();
+        let invq = 1.0 / (sqrt(nq + 1e-6) * sqrt(f32(dk)));
+        let invk = 1.0 / sqrt(nkn + 1e-6);
+        let g = exp(-exp(alog) * gdn_softplus(scratch[CP_K + pos * 1024u + h] + dtb));
+        let beta = 1.0 / (1.0 + exp(-scratch[CP_K + pos * 1024u + 512u + h]));
+        let vto = cq + 2u * kd + h * dv + dj4 * 4u;
+        let vt = vec4<f32>(scratch[vto], scratch[vto + 1u], scratch[vto + 2u], scratch[vto + 3u]);
+        let kf_t = cq_k * invk;
+        let qf_t = cq_q * invq;
+        var kv4 = vec4<f32>(0.0);
+        if (t < dk) { kv4 = state4[s4base + t * dv4 + dj4] * kf_t; }
+        gdn_r0[t] = kv4.x;
+        gdn_r1[t] = kv4.y;
+        gdn_r2[t] = kv4.z;
+        gdn_r3[t] = kv4.w;
+        gdn_reduce4(t);
+        let kv = vec4<f32>(gdn_r0[0], gdn_r1[0], gdn_r2[0], gdn_r3[0]);
+        workgroupBarrier();
+        let delta = (vt - g * kv) * beta;
+        var contrib = vec4<f32>(0.0);
+        if (t < dk) {
+            let idx = s4base + t * dv4 + dj4;
+            let cell = g * state4[idx] + kf_t * delta;
+            state4[idx] = cell;
+            contrib = qf_t * cell;
+        }
+        gdn_r0[t] = contrib.x;
+        gdn_r1[t] = contrib.y;
+        gdn_r2[t] = contrib.z;
+        gdn_r3[t] = contrib.w;
+        gdn_reduce4(t);
+        if (t == 0u) {
+            let o = CP_ATT + pos * 1024u + h * dv + dj4 * 4u;
+            scratch[o] = gdn_r0[0];
+            scratch[o + 1u] = gdn_r1[0];
+            scratch[o + 2u] = gdn_r2[0];
+            scratch[o + 3u] = gdn_r3[0];
+        }
+        workgroupBarrier();
+        pos = pos + 1u;
+    }
+}
+
+@compute @workgroup_size(256)
+fn embryo_chunk_gdn_norm(@builtin(local_invocation_index) t: u32,
+                         @builtin(workgroup_id) wid: vec3<u32>) {
+    let nv = md[24u];
+    let dv = md[27u];
+    let pos = wid.x / nv;
+    let h = wid.x % nv;
+    if (pos >= p.chunk) { return; }
+    let r = rb();
+    let o = CP_ATT + pos * 1024u + h * dv;
+    var z = 0.0;
+    if (t < dv) { z = scratch[o + t] * scratch[o + t]; }
+    anchor_red[t] = z;
+    workgroupBarrier();
+    var stride = 128u;
+    loop {
+        if (stride == 0u) { break; }
+        if (t < stride) { anchor_red[t] = anchor_red[t] + anchor_red[t + stride]; }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    let inv = 1.0 / sqrt(anchor_red[0] / f32(dv) + p.eps);
+    workgroupBarrier();
+    if (t < dv) {
+        let zz = scratch[CP_Q + pos * 1024u + h * dv + t];
+        scratch[o + t] = scratch[o + t] * inv * weights[md[r + 63u] + t] *
+            (zz / (1.0 + exp(-zz)));
+    }
+}
+
+// ── vmf_phase mixer over the chunk ──
+// Hidden-wide short conv, positions in order per channel (the token
+// kernel's ring walk n times); a layer without conv copies the row.
+@compute @workgroup_size(256)
+fn embryo_chunk_phase_conv(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let lid = gid.x;
+    let hidden = md[0u];
+    if (lid >= hidden) { return; }
+    let r = rb();
+    let conv_k = md[r + 24u];
+    let has_conv = md[r] < 2u && conv_k > 1u;
+    let state_off = md[r + 25u];
+    let phase_len = md[13u];
+    let off = md[r + 10u];
+    var t = 0u;
+    loop {
+        if (t >= p.chunk) { break; }
+        let x = scratch[CP_X + t * 1024u + lid];
+        if (has_conv) {
+            var z = weights[off + lid * conv_k + conv_k - 1u] * x;
+            var j = 0u;
+            loop {
+                if (j + 1u >= conv_k) { break; }
+                z = z + weights[off + lid * conv_k + j] *
+                    state[state_off + phase_len + j * hidden + lid];
+                j = j + 1u;
+            }
+            var k = 0u;
+            loop {
+                if (k + 1u >= conv_k - 1u) { break; }
+                state[state_off + phase_len + k * hidden + lid] =
+                    state[state_off + phase_len + (k + 1u) * hidden + lid];
+                k = k + 1u;
+            }
+            state[state_off + phase_len + (conv_k - 2u) * hidden + lid] = x;
+            scratch[CP_CX + t * 1024u + lid] = z;
+        } else {
+            scratch[CP_CX + t * 1024u + lid] = x;
+        }
+        t = t + 1u;
+    }
+}
+
+@compute @workgroup_size(64)
+fn embryo_chunk_phase_thq(@builtin(local_invocation_index) lid: u32,
+                          @builtin(workgroup_id) wid: vec3<u32>) {
+    cg(md[rb() + 3u], md[4u] * md[5u], md[0u], CP_CX, 1024u, CP_Q, 1024u, p.chunk, UMAX, UMAX, lid, wid);
+}
+@compute @workgroup_size(64)
+fn embryo_chunk_phase_thk(@builtin(local_invocation_index) lid: u32,
+                          @builtin(workgroup_id) wid: vec3<u32>) {
+    cg(md[rb() + 4u], md[4u] * md[5u], md[0u], CP_CX, 1024u, CP_K, 1024u, p.chunk, UMAX, UMAX, lid, wid);
+}
+@compute @workgroup_size(64)
+fn embryo_chunk_phase_v(@builtin(local_invocation_index) lid: u32,
+                        @builtin(workgroup_id) wid: vec3<u32>) {
+    cg(md[rb() + 5u], md[4u] * md[6u], md[0u], CP_CX, 1024u, CP_V, 1024u, p.chunk, UMAX, UMAX, lid, wid);
+}
+@compute @workgroup_size(64)
+fn embryo_chunk_phase_kgate(@builtin(local_invocation_index) lid: u32,
+                            @builtin(workgroup_id) wid: vec3<u32>) {
+    let r = rb();
+    cg(md[r + 8u], md[4u], md[0u], CP_CX, 1024u, CP_GATE, 1024u, p.chunk, UMAX, md[r + 9u], lid, wid);
+}
+@compute @workgroup_size(64)
+fn embryo_chunk_phase_out(@builtin(local_invocation_index) lid: u32,
+                          @builtin(workgroup_id) wid: vec3<u32>) {
+    cg(md[rb() + 6u], md[0u], md[4u] * md[6u], CP_ATT, 1024u, CP_OUT, 1024u, p.chunk, UMAX, UMAX, lid, wid);
+}
+
+// Phase features per (position, head): cos/sin planes of k (CP_BIG0)
+// and q (CP_BIG1), row stride 2048 (cos at +0, sin at +1024).
+@compute @workgroup_size(64)
+fn embryo_chunk_phase_features(@builtin(local_invocation_index) lid: u32,
+                               @builtin(workgroup_id) wid: vec3<u32>) {
+    let ph = md[4u];
+    let nph = md[5u];
+    let t = wid.x / ph;
+    let hh = wid.x % ph;
+    if (t >= p.chunk) { return; }
+    let r = rb();
+    let kind = md[r];
+    let mass = 1.0 / (1.0 + p.phase_mass);
+    let kb = CP_K + t * 1024u + hh * nph;
+    let qb = CP_Q + t * 1024u + hh * nph;
+    let fk = CP_BIG0 + t * 2048u + hh * nph;
+    let fq = CP_BIG1 + t * 2048u + hh * nph;
+    var f = lid;
+    loop {
+        if (f >= nph) { break; }
+        if (kind == 1u) {
+            scratch[fk + f] = cos(scratch[kb + f]);
+            scratch[fq + f] = cos(scratch[qb + f]);
+            scratch[fk + 1024u + f] = sin(scratch[kb + f]);
+            scratch[fq + 1024u + f] = sin(scratch[qb + f]);
+        } else {
+            scratch[fk + f] = cos(scratch[kb + f] * mass);
+            scratch[fq + f] = cos(scratch[qb + f] * mass);
+            scratch[fk + 1024u + f] = sin(scratch[kb + f] * mass);
+            scratch[fq + 1024u + f] = sin(scratch[qb + f] * mass);
+        }
+        f = f + 64u;
+    }
+}
+
+fn cphase_feature(base: u32, t: u32, head: u32, feature: u32) -> f32 {
+    let nph = md[5u];
+    if (feature < nph) {
+        return scratch[base + t * 2048u + head * nph + feature];
+    }
+    return scratch[base + t * 2048u + 1024u + head * nph + feature - nph];
+}
+
+// Phase recurrence over the chunk: one workgroup per (head, value
+// chunk), positions in order, the token kernel's cell update.
+@compute @workgroup_size(256)
+fn embryo_chunk_phase(@builtin(local_invocation_id) lidv: vec3<u32>,
+                      @builtin(workgroup_id) wid: vec3<u32>) {
+    let ph = md[4u];
+    let pdv = md[6u];
+    let chunks = (pdv + 255u) / 256u;
+    let linear = wid.x;
+    let hh = linear / chunks;
+    let dd = (linear % chunks) * 256u + lidv.x;
+    if (hh >= ph || dd >= pdv) { return; }
+    let r = rb();
+    let nph = md[5u];
+    let p2 = 2u * nph;
+    let scale = inverseSqrt(f32(nph));
+    let state_off = md[r + 25u];
+    let kind = md[r];
+    let has_gate = md[r + 8u] != UMAX;
+    var t = 0u;
+    loop {
+        if (t >= p.chunk) { break; }
+        var gate = 1.0;
+        if (has_gate) { gate = scratch[CP_GATE + t * 1024u + hh]; }
+        let v = scratch[CP_V + t * 1024u + hh * pdv + dd];
+        var out = 0.0;
+        if (kind == 1u) {
+            var rr = 0.0;
+            var f = 0u;
+            loop {
+                if (f >= p2) { break; }
+                let feat = cphase_feature(CP_BIG0, t, hh, f);
+                let kf = scale * feat;
+                rr = rr + kf * weights[md[r + 7u] + hh * p2 + f] *
+                    state[state_off + hh * p2 * pdv + f * pdv + dd];
+                f = f + 1u;
+            }
+            f = 0u;
+            loop {
+                if (f >= p2) { break; }
+                let fk = cphase_feature(CP_BIG0, t, hh, f);
+                let fq = cphase_feature(CP_BIG1, t, hh, f);
+                let kf = scale * fk;
+                let dec = weights[md[r + 7u] + hh * p2 + f];
+                let so = state_off + hh * p2 * pdv + f * pdv + dd;
+                let cell = dec * state[so] + gate * kf * (v - rr);
+                state[so] = cell;
+                out = out + fq * scale * cell;
+                f = f + 1u;
+            }
+        } else {
+            var f = 0u;
+            loop {
+                if (f >= p2) { break; }
+                let fk = cphase_feature(CP_BIG0, t, hh, f);
+                let fq = cphase_feature(CP_BIG1, t, hh, f);
+                let so = state_off + hh * p2 * pdv + f * pdv + dd;
+                let cell = weights[md[r + 7u] + hh * p2 + f] * state[so] + fk * gate * v;
+                state[so] = cell;
+                out = out + fq * cell;
+                f = f + 1u;
+            }
+        }
+        scratch[CP_ATT + t * 1024u + hh * pdv + dd] = out;
+        t = t + 1u;
+    }
+}
+
+// ── bounded anchor over the chunk ──
+@compute @workgroup_size(64)
+fn embryo_chunk_anchor_q(@builtin(local_invocation_index) lid: u32,
+                         @builtin(workgroup_id) wid: vec3<u32>) {
+    cg(md[rb() + 11u], md[7u] * md[9u], md[0u], CP_X, 1024u, CP_Q, 1024u, p.chunk, UMAX, UMAX, lid, wid);
+}
+@compute @workgroup_size(64)
+fn embryo_chunk_anchor_k(@builtin(local_invocation_index) lid: u32,
+                         @builtin(workgroup_id) wid: vec3<u32>) {
+    cg(md[rb() + 12u], md[8u] * md[9u], md[0u], CP_X, 1024u, CP_K, 1024u, p.chunk, UMAX, UMAX, lid, wid);
+}
+@compute @workgroup_size(64)
+fn embryo_chunk_anchor_v(@builtin(local_invocation_index) lid: u32,
+                         @builtin(workgroup_id) wid: vec3<u32>) {
+    cg(md[rb() + 13u], md[8u] * md[9u], md[0u], CP_X, 1024u, CP_V, 1024u, p.chunk, UMAX, UMAX, lid, wid);
+}
+@compute @workgroup_size(64)
+fn embryo_chunk_anchor_o(@builtin(local_invocation_index) lid: u32,
+                         @builtin(workgroup_id) wid: vec3<u32>) {
+    cg(md[rb() + 14u], md[0u], md[7u] * md[9u], CP_ATT, 1024u, CP_OUT, 1024u, p.chunk, UMAX, UMAX, lid, wid);
+}
+
+// Band attention of position P = position + t against sinks ∪ the last
+// min(P+1, W) keys: keys j ≥ position come from the chunk planes, older
+// ones from the ring (untouched until `embryo_chunk_bounded_append`).
+// Score/softmax/accumulate order is the token kernel's.
+@compute @workgroup_size(256)
+fn embryo_chunk_bounded_attend(@builtin(local_invocation_id) lidv: vec3<u32>,
+                               @builtin(workgroup_id) wid: vec3<u32>) {
+    let qheads = md[7u];
+    let hd = md[9u];
+    let out_chunks = (hd + 255u) / 256u;
+    let per_pos = qheads * out_chunks;
+    let tpos = wid.x / per_pos;
+    let rem = wid.x % per_pos;
+    let hq = rem / out_chunks;
+    let dd = (rem % out_chunks) * 256u + lidv.x;
+    if (tpos >= p.chunk) { return; }
+    let r = rb();
+    let kvheads = md[8u];
+    let kh = hq / (qheads / kvheads);
+    let w = md[18u];
+    let sink = md[20u];
+    let half = md[16u] / 2u;
+    let tab = md[21u];
+    let pp = p.position + tpos;
+    let m = min(pp + 1u, w);
+    let n = sink + m;
+    let scale = inverseSqrt(f32(hd));
+    let base = md[r + 26u];
+    let ring = kvheads * w * hd;
+    let sk = md[r + 27u];
+    let sv = md[r + 28u];
+    let t = lidv.x;
+    let qb = CP_Q + tpos * 1024u + hq * hd;
+    var sc = -3.402823e+38;
+    if (t < n) {
+        var dot = 0.0;
+        if (t < sink) {
+            let krow = sk + (kh * sink + t) * hd;
+            var j = 0u;
+            loop {
+                if (j >= hd) { break; }
+                dot = dot + scratch[qb + j] * weights[krow + j];
+                j = j + 1u;
+            }
+        } else {
+            let delta = t - sink;
+            let jpos = pp - delta;
+            var krow = 0u;
+            var from_chunk = false;
+            if (jpos >= p.position) {
+                krow = CP_K + (jpos - p.position) * 1024u + kh * hd;
+                from_chunk = true;
+            } else {
+                krow = base + (kh * w + (jpos % w)) * hd;
+            }
+            var i = 0u;
+            loop {
+                if (i >= half) { break; }
+                let co = weights[tab + delta * half + i];
+                let si = weights[tab + w * half + delta * half + i];
+                let q0 = scratch[qb + i];
+                let q1 = scratch[qb + i + half];
+                var k0 = 0.0;
+                var k1 = 0.0;
+                if (from_chunk) {
+                    k0 = scratch[krow + i];
+                    k1 = scratch[krow + i + half];
+                } else {
+                    k0 = kv[krow + i];
+                    k1 = kv[krow + i + half];
+                }
+                dot = dot + (q0 * co - q1 * si) * k0 + (q0 * si + q1 * co) * k1;
+                i = i + 1u;
+            }
+            var j = 2u * half;
+            loop {
+                if (j >= hd) { break; }
+                var kj = 0.0;
+                if (from_chunk) { kj = scratch[krow + j]; } else { kj = kv[krow + j]; }
+                dot = dot + scratch[qb + j] * kj;
+                j = j + 1u;
+            }
+        }
+        sc = dot * scale;
+    }
+    anchor_sc[t] = sc;
+    anchor_red[t] = sc;
+    workgroupBarrier();
+    var stride = 128u;
+    loop {
+        if (stride == 0u) { break; }
+        if (t < stride) {
+            anchor_red[t] = max(anchor_red[t], anchor_red[t + stride]);
+        }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    let mx = anchor_red[0];
+    workgroupBarrier();
+    let wgt = select(0.0, exp(sc - mx), t < n);
+    anchor_sc[t] = wgt;
+    anchor_red[t] = wgt;
+    workgroupBarrier();
+    stride = 128u;
+    loop {
+        if (stride == 0u) { break; }
+        if (t < stride) {
+            anchor_red[t] = anchor_red[t] + anchor_red[t + stride];
+        }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    let l = anchor_red[0];
+    workgroupBarrier();
+    if (dd < hd) {
+        var acc = 0.0;
+        var u = 0u;
+        loop {
+            if (u >= n) { break; }
+            if (u < sink) {
+                acc = acc + anchor_sc[u] * weights[sv + (kh * sink + u) * hd + dd];
+            } else {
+                let jpos = pp - (u - sink);
+                if (jpos >= p.position) {
+                    acc = acc + anchor_sc[u] * scratch[CP_V + (jpos - p.position) * 1024u + kh * hd + dd];
+                } else {
+                    acc = acc + anchor_sc[u] * kv[base + ring + (kh * w + (jpos % w)) * hd + dd];
+                }
+            }
+            u = u + 1u;
+        }
+        scratch[CP_ATT + tpos * 1024u + hq * hd + dd] = acc / max(l, 1e-20);
+    }
+}
+
+// After every position of the chunk attended: the last min(n, W)
+// positions land in their ring slots (position mod W).
+@compute @workgroup_size(256)
+fn embryo_chunk_bounded_append(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let r = rb();
+    let kvheads = md[8u];
+    let hd = md[9u];
+    let w = md[18u];
+    let nrow = kvheads * hd;
+    let nw = min(p.chunk, w);
+    if (w == 0u || gid.x >= nw * nrow) { return; }
+    let i = gid.x / nrow;
+    let row = gid.x % nrow;
+    let t = p.chunk - nw + i;
+    let kh = row / hd;
+    let j = row % hd;
+    let slot = (p.position + t) % w;
+    let base = md[r + 26u];
+    let ring = kvheads * w * hd;
+    let o = base + (kh * w + slot) * hd + j;
+    kv[o] = scratch[CP_K + t * 1024u + row];
+    kv[o + ring] = scratch[CP_V + t * 1024u + row];
+}
+
+// Token-path (n = 1) twins of the bounded anchor's projection and
+// output stages, addressed to the chunk planes' row 0: the natively
+// bounded anchor (kind 3) runs `embryo_chunk_bounded_attend` /
+// `embryo_chunk_bounded_append` in BOTH the per-token graph and the
+// chunked prefill, so the two paths share one compiled attend (a
+// separate per-token attend differed from the chunk one by the
+// compiler's FMA fusion of the rotated-query dot product — 1e-5 on the
+// logits, invisible at Δ = 0 where cos = 1, sin = 0).
+@compute @workgroup_size(64)
+fn embryo_core_project_anchor_cp(@builtin(local_invocation_index) lid: u32,
+                                 @builtin(workgroup_id) wid: vec3<u32>) {
+    let row = wid.x;
+    let r = rb();
+    let qrows = md[7u] * md[9u];
+    let krows = md[8u] * md[9u];
+    var qz = 0.0;
+    var kz = 0.0;
+    var vz = 0.0;
+    var j = lid;
+    loop {
+        if (j >= md[0u]) { break; }
+        if (row < qrows) { qz = qz + weights[md[r + 11u] + row * md[0u] + j] * scratch[S_NORM + j]; }
+        if (row < krows) {
+            kz = kz + weights[md[r + 12u] + row * md[0u] + j] * scratch[S_NORM + j];
+            vz = vz + weights[md[r + 13u] + row * md[0u] + j] * scratch[S_NORM + j];
+        }
+        j = j + 64u;
+    }
+    red0[lid] = qz;
+    red1[lid] = kz;
+    red2[lid] = vz;
+    red3[lid] = 0.0;
+    reduce_four(lid);
+    if (lid == 0u && row < qrows) { scratch[CP_Q + row] = red0[0]; }
+    if (lid == 0u && row < krows) {
+        scratch[CP_K + row] = red1[0];
+        scratch[CP_V + row] = red2[0];
+    }
+}
+
+@compute @workgroup_size(64)
+fn embryo_core_output_anchor_cp(@builtin(local_invocation_index) lid: u32,
+                                @builtin(workgroup_id) wid: vec3<u32>) {
+    let row = wid.x;
+    let hidden = md[0u];
+    var z = 0.0;
+    var j = lid;
+    loop {
+        if (j >= md[7u] * md[9u]) { break; }
+        if (row < hidden) {
+            z = z + weights[md[rb() + 14u] + row * md[7u] * md[9u] + j] * scratch[CP_ATT + j];
+        }
+        j = j + 64u;
+    }
+    red0[lid] = z;
+    red1[lid] = 0.0;
+    red2[lid] = 0.0;
+    red3[lid] = 0.0;
+    reduce_four(lid);
+    if (lid == 0u && row < hidden) { scratch[S_OUT + row] = red0[0]; }
+}
+
+// ── residual, FFN, router over the chunk ──
+@compute @workgroup_size(256)
+fn embryo_chunk_residual(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let hidden = md[0u];
+    let t = gid.x / hidden;
+    let j = gid.x % hidden;
+    if (t < p.chunk) {
+        hbuf[t * hidden + j] = hbuf[t * hidden + j] + scratch[CP_OUT + t * 1024u + j];
+    }
+}
+
+@compute @workgroup_size(64)
+fn embryo_chunk_ffn_gate(@builtin(local_invocation_index) lid: u32,
+                         @builtin(workgroup_id) wid: vec3<u32>) {
+    cg(md[rb() + 21u], md[1u], md[0u], CP_X, 1024u, CP_G, 1024u, p.chunk, UMAX, UMAX, lid, wid);
+}
+@compute @workgroup_size(64)
+fn embryo_chunk_ffn_up(@builtin(local_invocation_index) lid: u32,
+                       @builtin(workgroup_id) wid: vec3<u32>) {
+    cg(md[rb() + 22u], md[1u], md[0u], CP_X, 1024u, CP_UP, 1024u, p.chunk, UMAX, UMAX, lid, wid);
+}
+@compute @workgroup_size(64)
+fn embryo_chunk_ffn_down(@builtin(local_invocation_index) lid: u32,
+                         @builtin(workgroup_id) wid: vec3<u32>) {
+    cg(md[rb() + 23u], md[0u], md[1u], CP_G, 1024u, CP_OUT, 1024u, p.chunk, UMAX, UMAX, lid, wid);
+}
+
+@compute @workgroup_size(256)
+fn embryo_chunk_ffn_act(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let inter = md[1u];
+    let t = gid.x / inter;
+    let i = gid.x % inter;
+    if (t < p.chunk) {
+        let o = CP_G + t * 1024u + i;
+        scratch[o] = silu(scratch[o]) * scratch[CP_UP + t * 1024u + i];
+    }
+}
+
+// Expert GEMMs: workgroup z = expert, rows = its tokens (the compacted
+// list), so each expert's weights stream once per chunk.
+@compute @workgroup_size(64)
+fn embryo_chunk_expert_gate(@builtin(local_invocation_index) lid: u32,
+                            @builtin(workgroup_id) wid: vec3<u32>) {
+    let e = wid.z;
+    cg(md[rb() + 32u + e * 3u], md[1u], md[0u], CP_X, 1024u, CP_G, 1024u,
+       u32(scratch[CP_COUNT + e]), CP_LIST + e * CMAX, UMAX, lid, wid);
+}
+@compute @workgroup_size(64)
+fn embryo_chunk_expert_up(@builtin(local_invocation_index) lid: u32,
+                          @builtin(workgroup_id) wid: vec3<u32>) {
+    let e = wid.z;
+    cg(md[rb() + 33u + e * 3u], md[1u], md[0u], CP_X, 1024u, CP_UP, 1024u,
+       u32(scratch[CP_COUNT + e]), CP_LIST + e * CMAX, UMAX, lid, wid);
+}
+@compute @workgroup_size(64)
+fn embryo_chunk_expert_down(@builtin(local_invocation_index) lid: u32,
+                            @builtin(workgroup_id) wid: vec3<u32>) {
+    let e = wid.z;
+    cg(md[rb() + 34u + e * 3u], md[0u], md[1u], CP_G, 1024u, CP_OUT, 1024u,
+       u32(scratch[CP_COUNT + e]), CP_LIST + e * CMAX, UMAX, lid, wid);
+}
+
+// Resonance router per position: the token path's three stages
+// (chunked partials, per-(expert, component) reduce, finalize) and the
+// deterministic top-1 pick, then a compaction into per-expert lists.
+@compute @workgroup_size(64)
+fn embryo_chunk_route_part(@builtin(local_invocation_index) lid: u32,
+                           @builtin(workgroup_id) wid: vec3<u32>) {
+    let r = rb();
+    let ne = md[r + 16u];
+    let hidden = md[0u];
+    let rank = md[r + 20u];
+    let chunks = (hidden + 63u) / 64u;
+    let comps = rank + 1u;
+    let per_pos = ne * comps * chunks;
+    let t = wid.x / per_pos;
+    let linear = wid.x % per_pos;
+    let chunk = linear % chunks;
+    let component = (linear / chunks) % comps;
+    let expert = linear / (chunks * comps);
+    var z = 0.0;
+    let j = chunk * 64u + lid;
+    if (t < p.chunk && expert < ne && j < hidden) {
+        let mu = weights[md[r + 17u] + expert * hidden + j];
+        let dx = scratch[CP_X + t * 1024u + j] - mu;
+        if (component == 0u) {
+            z = dx * dx;
+        } else {
+            z = dx * weights[
+                md[r + 18u] + (expert * rank + component - 1u) * hidden + j
+            ];
+        }
+    }
+    red0[lid] = z;
+    let total = route_reduce_one(lid);
+    if (t < p.chunk && expert < ne) {
+        let ec = expert * comps + component;
+        scratch[CP_ROUTE + t * 16512u + ec * chunks + chunk] = total;
+    }
+}
+
+@compute @workgroup_size(64)
+fn embryo_chunk_route_reduce(@builtin(local_invocation_index) lid: u32,
+                             @builtin(workgroup_id) wid: vec3<u32>) {
+    let r = rb();
+    let ne = md[r + 16u];
+    let hidden = md[0u];
+    let rank = md[r + 20u];
+    let chunks = (hidden + 63u) / 64u;
+    let comps = rank + 1u;
+    let total_ec = ne * comps;
+    let t = wid.x / total_ec;
+    let ec = wid.x % total_ec;
+    var z = 0.0;
+    if (t < p.chunk) {
+        var chunk = lid;
+        loop {
+            if (chunk >= chunks) { break; }
+            z = z + scratch[CP_ROUTE + t * 16512u + ec * chunks + chunk];
+            chunk = chunk + 64u;
+        }
+    }
+    red0[lid] = z;
+    let total = route_reduce_one(lid);
+    if (lid == 0u && t < p.chunk) {
+        scratch[CP_RRED + t * 1032u + ec] = total;
+    }
+}
+
+@compute @workgroup_size(64)
+fn embryo_chunk_route_finalize(@builtin(local_invocation_index) lid: u32,
+                               @builtin(workgroup_id) wid: vec3<u32>) {
+    let r = rb();
+    let ne = md[r + 16u];
+    let rank = md[r + 20u];
+    let t = wid.x / ne;
+    let expert = wid.x % ne;
+    var z = 0.0;
+    if (t < p.chunk) {
+        var component = lid;
+        loop {
+            if (component >= rank) { break; }
+            let ec = expert * (rank + 1u) + component + 1u;
+            let proj = scratch[CP_RRED + t * 1032u + ec];
+            z = z + proj * proj;
+            component = component + 64u;
+        }
+    }
+    red0[lid] = z;
+    let proj_norm = route_reduce_one(lid);
+    if (lid == 0u && t < p.chunk) {
+        let d2 = scratch[CP_RRED + t * 1032u + expert * (rank + 1u)];
+        // Growth shell — the token path's rule (`embryo_core_route_finalize`).
+        let err = d2 - proj_norm;
+        var score = weights[md[r + 19u] + expert] - err;
+        let so = md[r + 30u];
+        if (so != 0xffffffffu && err > weights[so + expert]) {
+            score = weights[so + ne];
+        }
+        scratch[CP_RSCORE + t * 8u + expert] = score;
+    }
+}
+
+@compute @workgroup_size(64)
+fn embryo_chunk_route_pick(@builtin(local_invocation_index) lid: u32,
+                           @builtin(workgroup_id) wid: vec3<u32>) {
+    let ne = md[rb() + 16u];
+    let t = wid.x;
+    var sc = -3.402823e+38;
+    if (t < p.chunk && lid < ne) { sc = scratch[CP_RSCORE + t * 8u + lid]; }
+    route_pick_score[lid] = sc;
+    route_pick_idx[lid] = lid;
+    workgroupBarrier();
+    var step = 32u;
+    loop {
+        if (step == 0u) { break; }
+        if (lid < step) {
+            let other_score = route_pick_score[lid + step];
+            let other_idx = route_pick_idx[lid + step];
+            let ours = route_pick_score[lid];
+            let ours_idx = route_pick_idx[lid];
+            if (other_score > ours ||
+                (other_score == ours && other_idx < ours_idx)) {
+                route_pick_score[lid] = other_score;
+                route_pick_idx[lid] = other_idx;
+            }
+        }
+        workgroupBarrier();
+        if (step == 1u) { break; }
+        step = step >> 1u;
+    }
+    if (lid == 0u && t < p.chunk) { scratch[CP_SEL + t] = f32(route_pick_idx[0]); }
+}
+
+// One lane walks the n picks in order into per-expert position lists.
+@compute @workgroup_size(64)
+fn embryo_chunk_route_compact(@builtin(local_invocation_index) lid: u32) {
+    if (lid != 0u) { return; }
+    var counts: array<u32, 8>;
+    var e = 0u;
+    loop {
+        if (e >= 8u) { break; }
+        counts[e] = 0u;
+        e = e + 1u;
+    }
+    var t = 0u;
+    loop {
+        if (t >= p.chunk) { break; }
+        let sel = u32(scratch[CP_SEL + t]);
+        if (sel < 8u) {
+            scratch[CP_LIST + sel * CMAX + counts[sel]] = f32(t);
+            counts[sel] = counts[sel] + 1u;
+        }
+        t = t + 1u;
+    }
+    e = 0u;
+    loop {
+        if (e >= 8u) { break; }
+        scratch[CP_COUNT + e] = f32(counts[e]);
+        e = e + 1u;
+    }
+}
+"#;
+
 /// Subgroup-accelerated MoE select: the top-k rounds ride subgroupMax /
 /// subgroupMin (barrier-free within a subgroup) — two barriers per slot
 /// against the tree version's eight. Lives in its OWN module: `enable
@@ -16005,6 +18223,148 @@ struct Ctx {
     attn_batch_scratch: Mutex<Vec<(wgpu::BufferUsages, wgpu::Buffer)>>,
 }
 
+struct EmbryoDeviceModel {
+    weights: wgpu::Buffer,
+    meta: wgpu::Buffer,
+    // Binding 2 is the LM-head plane.  Embryo checkpoints tie it to the
+    // embedding table, but retaining a separate packed field keeps the
+    // runtime honest for a future untied export.
+    lm_head: wgpu::Buffer,
+    clusters: wgpu::Buffer,
+    final_norm: wgpu::Buffer,
+    inv_freq: wgpu::Buffer,
+}
+
+struct EmbryoDeviceSequence {
+    state: wgpu::Buffer,
+    kv: wgpu::Buffer,
+    hidden: wgpu::Buffer,
+    logits: wgpu::Buffer,
+    /// Persistent per-layer scratch for the row/head-parallel body. Retaining
+    /// it with the sequence avoids per-token allocation churn in the split
+    /// graph.
+    scratch: wgpu::Buffer,
+    params: wgpu::Buffer,
+    stage: wgpu::Buffer,
+    /// The resource handles are immutable after allocation.  Retaining this
+    /// bind group removes one driver allocation per token; reset drops the
+    /// whole sequence and therefore also drops this handle.
+    bind: Option<wgpu::BindGroup>,
+    /// A distinct immutable binding for each layer carries its layer index in
+    /// the uniform.  The command encoder can therefore dispatch all ordered
+    /// layer stages in one submit without queue-writing one selector buffer
+    /// between passes (which would collapse to the final value).
+    layer_params: Vec<wgpu::Buffer>,
+    layer_binds: Vec<wgpu::BindGroup>,
+    stage_bytes: u64,
+    initialized: bool,
+    next_position: usize,
+}
+
+struct EmbryoParallelPipelines {
+    raw: wgpu::ComputePipeline,
+    clusters_global: wgpu::ComputePipeline,
+    clusters_local: wgpu::ComputePipeline,
+    apply: wgpu::ComputePipeline,
+}
+
+struct EmbryoCorePipelines {
+    norm: wgpu::ComputePipeline,
+    post_norm: wgpu::ComputePipeline,
+    conv: wgpu::ComputePipeline,
+    project_phase: wgpu::ComputePipeline,
+    project_anchor: wgpu::ComputePipeline,
+    rope: wgpu::ComputePipeline,
+    phase_features: wgpu::ComputePipeline,
+    phase: wgpu::ComputePipeline,
+    output_phase: wgpu::ComputePipeline,
+    anchor_append: wgpu::ComputePipeline,
+    anchor_attend: wgpu::ComputePipeline,
+    project_anchor_cp: wgpu::ComputePipeline,
+    output_anchor_cp: wgpu::ComputePipeline,
+    output_anchor: wgpu::ComputePipeline,
+    gdn_project: wgpu::ComputePipeline,
+    gdn_conv: wgpu::ComputePipeline,
+    gdn_step: wgpu::ComputePipeline,
+    gdn_norm: wgpu::ComputePipeline,
+    gdn_output: wgpu::ComputePipeline,
+    residual: wgpu::ComputePipeline,
+    route_part: wgpu::ComputePipeline,
+    route_reduce: wgpu::ComputePipeline,
+    route_finalize: wgpu::ComputePipeline,
+    route_pick: wgpu::ComputePipeline,
+    ffn_dense_proj: wgpu::ComputePipeline,
+    ffn_expert_proj: wgpu::ComputePipeline,
+    ffn_shared_proj: wgpu::ComputePipeline,
+    ffn_act: wgpu::ComputePipeline,
+    ffn_dense_down: wgpu::ComputePipeline,
+    ffn_expert_down: wgpu::ComputePipeline,
+    ffn_shared_down: wgpu::ComputePipeline,
+    final_norm: wgpu::ComputePipeline,
+    publish: wgpu::ComputePipeline,
+    chunk: EmbryoChunkPipelines,
+}
+
+/// The chunked-prefill entry points of `EMBRYO_CORE_SRC` (same module,
+/// same bind group): n ≤ `EMBRYO_CHUNK_MAX` positions per submit.
+struct EmbryoChunkPipelines {
+    norm: wgpu::ComputePipeline,
+    post_norm: wgpu::ComputePipeline,
+    final_norm: wgpu::ComputePipeline,
+    residual: wgpu::ComputePipeline,
+    gdn_qkv: wgpu::ComputePipeline,
+    gdn_z: wgpu::ComputePipeline,
+    gdn_a: wgpu::ComputePipeline,
+    gdn_b: wgpu::ComputePipeline,
+    gdn_conv: wgpu::ComputePipeline,
+    gdn_step: wgpu::ComputePipeline,
+    gdn_norm: wgpu::ComputePipeline,
+    gdn_out: wgpu::ComputePipeline,
+    phase_conv: wgpu::ComputePipeline,
+    phase_thq: wgpu::ComputePipeline,
+    phase_thk: wgpu::ComputePipeline,
+    phase_v: wgpu::ComputePipeline,
+    phase_kgate: wgpu::ComputePipeline,
+    phase_features: wgpu::ComputePipeline,
+    phase: wgpu::ComputePipeline,
+    phase_out: wgpu::ComputePipeline,
+    anchor_q: wgpu::ComputePipeline,
+    anchor_k: wgpu::ComputePipeline,
+    anchor_v: wgpu::ComputePipeline,
+    anchor_o: wgpu::ComputePipeline,
+    bounded_attend: wgpu::ComputePipeline,
+    bounded_append: wgpu::ComputePipeline,
+    ffn_gate: wgpu::ComputePipeline,
+    ffn_up: wgpu::ComputePipeline,
+    ffn_down: wgpu::ComputePipeline,
+    ffn_act: wgpu::ComputePipeline,
+    expert_gate: wgpu::ComputePipeline,
+    expert_up: wgpu::ComputePipeline,
+    expert_down: wgpu::ComputePipeline,
+    route_part: wgpu::ComputePipeline,
+    route_reduce: wgpu::ComputePipeline,
+    route_finalize: wgpu::ComputePipeline,
+    route_pick: wgpu::ComputePipeline,
+    route_compact: wgpu::ComputePipeline,
+}
+
+/// Scratch words of one resident sequence: the token image (40960) plus
+/// the chunk window laid out as the `CP_*` constants of the shader.
+fn embryo_scratch_words() -> usize {
+    let c = crate::gpu::EMBRYO_CHUNK_MAX;
+    40_960 + c * 1024 * 10 + c * 2048 * 2 + c * 16_512 + c * 1032 + c * 8 + c + 8 * c + 8
+}
+
+struct EmbryoRuntime {
+    layout: wgpu::BindGroupLayout,
+    parallel: Option<EmbryoParallelPipelines>,
+    core: Option<EmbryoCorePipelines>,
+    models: HashMap<u64, EmbryoDeviceModel>,
+    sequences: HashMap<(u64, u64), EmbryoDeviceSequence>,
+}
+
+static EMBRYO_RUNTIME: OnceLock<Mutex<Option<EmbryoRuntime>>> = OnceLock::new();
+
 struct Dsv4GlobalMoeBufs {
     gate: Vec<wgpu::Buffer>,
     up: Vec<wgpu::Buffer>,
@@ -16640,6 +19000,9 @@ pub fn resident_bytes() -> u64 {
 fn graph_live_weight_budget(c: &Ctx, model: &Arc<CmfModel>) -> u64 {
     let (mut total, mut q8) = (0u64, 0u64);
     for e in &model.tensors {
+        if !crate::gpu::counts_as_placement_weight(model, &e.name) {
+            continue; // a skill lane holds its tensors INSTEAD of the trunk ones
+        }
         total = total.saturating_add(e.nbytes);
         if e.dtype == cortiq_core::TensorDtype::Q8_2f {
             q8 = q8.saturating_add(e.nbytes);
@@ -16681,6 +19044,11 @@ pub fn automatic_layer_prefix(
     let mut layer_bytes = vec![0u64; physical_layers];
     let mut outside = 0u64;
     for e in &model.tensors {
+        if !crate::gpu::counts_as_placement_weight(model, &e.name) {
+            // skill.{id}.model.layers.N.* is not trunk weight of layer N:
+            // F1's backbone gets F0's prefix (NF-7).
+            continue;
+        }
         let li = layer_of_name(&e.name);
         if li != u16::MAX && (li as usize) < physical_layers {
             layer_bytes[li as usize] = layer_bytes[li as usize].saturating_add(e.nbytes);
@@ -28686,6 +31054,1383 @@ pub fn gdn_spec_restore(kv_id: u64, slot: usize, base_pos: usize, expected_layer
     true
 }
 
+fn embryo_buffer_f32(
+    c: &Ctx,
+    data: &[f32],
+    label: &'static str,
+    usage: wgpu::BufferUsages,
+) -> wgpu::Buffer {
+    let bytes: &[f32] = if data.is_empty() { &[0.0] } else { data };
+    c.device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: bytemuck::cast_slice(bytes),
+            usage,
+        })
+}
+
+fn embryo_buffer_u32(
+    c: &Ctx,
+    data: &[u32],
+    label: &'static str,
+    usage: wgpu::BufferUsages,
+) -> wgpu::Buffer {
+    let words: &[u32] = if data.is_empty() { &[0] } else { data };
+    c.device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: bytemuck::cast_slice(words),
+            usage,
+        })
+}
+
+fn embryo_runtime_init(c: &Ctx) -> bool {
+    let limits = c.device.limits();
+    if limits.max_compute_invocations_per_workgroup < 1024
+        || limits.max_compute_workgroup_storage_size < 4 * 1024 * 1024 / 256
+    {
+        return false;
+    }
+    let slot = EMBRYO_RUNTIME.get_or_init(|| Mutex::new(None));
+    let mut guard = slot.lock().unwrap();
+    if guard.is_some() {
+        return true;
+    }
+    let storage_ro = wgpu::BindingType::Buffer {
+        ty: wgpu::BufferBindingType::Storage { read_only: true },
+        has_dynamic_offset: false,
+        min_binding_size: None,
+    };
+    let storage_rw = wgpu::BindingType::Buffer {
+        ty: wgpu::BufferBindingType::Storage { read_only: false },
+        has_dynamic_offset: false,
+        min_binding_size: None,
+    };
+    let uniform = wgpu::BindingType::Buffer {
+        ty: wgpu::BufferBindingType::Uniform,
+        has_dynamic_offset: false,
+        min_binding_size: None,
+    };
+    let mut entries = Vec::with_capacity(12);
+    for binding in 0..6u32 {
+        entries.push(wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: storage_ro,
+            count: None,
+        });
+    }
+    for binding in 6..10u32 {
+        entries.push(wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: storage_rw,
+            count: None,
+        });
+    }
+    entries.push(wgpu::BindGroupLayoutEntry {
+        binding: 10,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: uniform,
+        count: None,
+    });
+    entries.push(wgpu::BindGroupLayoutEntry {
+        binding: 11,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: storage_rw,
+        count: None,
+    });
+    let layout = c
+        .device
+        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("embryo-resident-layout"),
+            entries: &entries,
+        });
+    let pl = c
+        .device
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("embryo-resident-pipeline-layout"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+    // `1` is the historical resident setting. It now aliases the accepted
+    // row/head-parallel implementation; an unset value still leaves the
+    // ordinary host path untouched.
+    let requested_parallel = matches!(
+        std::env::var("CMF_EMBRYO_RESIDENT").as_deref(),
+        Ok("parallel") | Ok("1")
+    );
+    let parallel = if requested_parallel {
+        let parallel_scope = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let module = c.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("embryo-resident-parallel"),
+            source: wgpu::ShaderSource::Wgsl(EMBRYO_PARALLEL_SRC.into()),
+        });
+        let make = |entry: &'static str| {
+            c.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(entry),
+                    layout: Some(&pl),
+                    module: &module,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    cache: None,
+                })
+        };
+        let out = EmbryoParallelPipelines {
+            raw: make("embryo_logits_raw"),
+            clusters_global: make("embryo_clusters_global"),
+            clusters_local: make("embryo_clusters_local"),
+            apply: make("embryo_logits_apply"),
+        };
+        if let Some(e) = pollster::block_on(parallel_scope.pop()) {
+            tracing::warn!("embryo parallel shader rejected: {e}");
+            None
+        } else {
+            Some(out)
+        }
+    } else {
+        None
+    };
+    let core = if requested_parallel {
+        let core_scope = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let module = c.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("embryo-resident-core"),
+            source: wgpu::ShaderSource::Wgsl(EMBRYO_CORE_SRC.into()),
+        });
+        let make = |entry: &'static str| {
+            c.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(entry),
+                    layout: Some(&pl),
+                    module: &module,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    cache: None,
+                })
+        };
+        let out = EmbryoCorePipelines {
+            norm: make("embryo_core_norm"),
+            post_norm: make("embryo_core_post_norm"),
+            conv: make("embryo_core_conv"),
+            project_phase: make("embryo_core_project_phase"),
+            project_anchor: make("embryo_core_project_anchor"),
+            rope: make("embryo_core_rope"),
+            phase_features: make("embryo_core_phase_features"),
+            phase: make("embryo_core_phase"),
+            output_phase: make("embryo_core_output_phase"),
+            anchor_append: make("embryo_core_anchor_append"),
+            anchor_attend: make("embryo_core_anchor_attend"),
+            project_anchor_cp: make("embryo_core_project_anchor_cp"),
+            output_anchor_cp: make("embryo_core_output_anchor_cp"),
+            output_anchor: make("embryo_core_output_anchor"),
+            gdn_project: make("embryo_core_gdn_project"),
+            gdn_conv: make("embryo_core_gdn_conv"),
+            gdn_step: make("embryo_core_gdn_step"),
+            gdn_norm: make("embryo_core_gdn_norm"),
+            gdn_output: make("embryo_core_gdn_output"),
+            residual: make("embryo_core_residual"),
+            route_part: make("embryo_core_route_part"),
+            route_reduce: make("embryo_core_route_reduce"),
+            route_finalize: make("embryo_core_route_finalize"),
+            route_pick: make("embryo_core_route_pick"),
+            ffn_dense_proj: make("embryo_core_ffn_dense_proj"),
+            ffn_expert_proj: make("embryo_core_ffn_expert_proj"),
+            ffn_shared_proj: make("embryo_core_ffn_shared_proj"),
+            ffn_act: make("embryo_core_ffn_act"),
+            ffn_dense_down: make("embryo_core_ffn_dense_down"),
+            ffn_expert_down: make("embryo_core_ffn_expert_down"),
+            ffn_shared_down: make("embryo_core_ffn_shared_down"),
+            final_norm: make("embryo_core_final_norm"),
+            publish: make("embryo_core_publish"),
+            chunk: EmbryoChunkPipelines {
+                norm: make("embryo_chunk_norm"),
+                post_norm: make("embryo_chunk_post_norm"),
+                final_norm: make("embryo_chunk_final_norm"),
+                residual: make("embryo_chunk_residual"),
+                gdn_qkv: make("embryo_chunk_gdn_qkv"),
+                gdn_z: make("embryo_chunk_gdn_z"),
+                gdn_a: make("embryo_chunk_gdn_a"),
+                gdn_b: make("embryo_chunk_gdn_b"),
+                gdn_conv: make("embryo_chunk_gdn_conv"),
+                gdn_step: make("embryo_chunk_gdn_step"),
+                gdn_norm: make("embryo_chunk_gdn_norm"),
+                gdn_out: make("embryo_chunk_gdn_out"),
+                phase_conv: make("embryo_chunk_phase_conv"),
+                phase_thq: make("embryo_chunk_phase_thq"),
+                phase_thk: make("embryo_chunk_phase_thk"),
+                phase_v: make("embryo_chunk_phase_v"),
+                phase_kgate: make("embryo_chunk_phase_kgate"),
+                phase_features: make("embryo_chunk_phase_features"),
+                phase: make("embryo_chunk_phase"),
+                phase_out: make("embryo_chunk_phase_out"),
+                anchor_q: make("embryo_chunk_anchor_q"),
+                anchor_k: make("embryo_chunk_anchor_k"),
+                anchor_v: make("embryo_chunk_anchor_v"),
+                anchor_o: make("embryo_chunk_anchor_o"),
+                bounded_attend: make("embryo_chunk_bounded_attend"),
+                bounded_append: make("embryo_chunk_bounded_append"),
+                ffn_gate: make("embryo_chunk_ffn_gate"),
+                ffn_up: make("embryo_chunk_ffn_up"),
+                ffn_down: make("embryo_chunk_ffn_down"),
+                ffn_act: make("embryo_chunk_ffn_act"),
+                expert_gate: make("embryo_chunk_expert_gate"),
+                expert_up: make("embryo_chunk_expert_up"),
+                expert_down: make("embryo_chunk_expert_down"),
+                route_part: make("embryo_chunk_route_part"),
+                route_reduce: make("embryo_chunk_route_reduce"),
+                route_finalize: make("embryo_chunk_route_finalize"),
+                route_pick: make("embryo_chunk_route_pick"),
+                route_compact: make("embryo_chunk_route_compact"),
+            },
+        };
+        if let Some(e) = pollster::block_on(core_scope.pop()) {
+            tracing::warn!("embryo resident core shader rejected: {e}");
+            None
+        } else {
+            Some(out)
+        }
+    } else {
+        None
+    };
+    *guard = Some(EmbryoRuntime {
+        layout,
+        parallel,
+        core,
+        models: HashMap::new(),
+        sequences: HashMap::new(),
+    });
+    true
+}
+
+fn embryo_core_pass(
+    enc: &mut wgpu::CommandEncoder,
+    pipeline: &wgpu::ComputePipeline,
+    layer_bind: &wgpu::BindGroup,
+    groups: u32,
+    label: &'static str,
+) {
+    let mut pass = begin_pass_with(enc, Some(label), None);
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, layer_bind, &[]);
+    pass.dispatch_workgroups(groups.max(1), 1, 1);
+}
+
+/// Three-dimensional dispatch of one chunk stage (rows × position blocks
+/// × experts).
+fn embryo_chunk_pass(
+    enc: &mut wgpu::CommandEncoder,
+    pipeline: &wgpu::ComputePipeline,
+    layer_bind: &wgpu::BindGroup,
+    x: u32,
+    y: u32,
+    z: u32,
+    label: &'static str,
+) {
+    // Diagnostics: `CMF_EMBRYO_CHUNK_FLUSH=1` ends the merged pass before
+    // every chunk stage, so a within-pass ordering hazard between stages
+    // would show up as a change of the chunked-vs-stepwise difference.
+    static FLUSH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *FLUSH.get_or_init(|| std::env::var("CMF_EMBRYO_CHUNK_FLUSH").as_deref() == Ok("1")) {
+        flush_pass(enc);
+    }
+    let mut pass = begin_pass_with(enc, Some(label), None);
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, layer_bind, &[]);
+    pass.dispatch_workgroups(x.max(1), y.max(1), z.max(1));
+}
+
+/// Encode the chunked prefill of `n` positions: every layer's stages over
+/// the chunk planes (see the `embryo_chunk_*` entry points).  Returns
+/// false on a layer kind the chunk kernels do not cover (pre-checked by
+/// the caller, so nothing is submitted).
+fn embryo_encode_chunk(
+    enc: &mut wgpu::CommandEncoder,
+    core: &EmbryoCorePipelines,
+    model: &crate::gpu::EmbryoGraphModel,
+    layer_binds: &[wgpu::BindGroup],
+    n: u32,
+) -> bool {
+    let ck = &core.chunk;
+    let hidden = model.hidden as u32;
+    let inter = model.intermediate as u32;
+    let tb = n.div_ceil(16);
+    let hidden_groups = hidden.div_ceil(256);
+    let rows_all = (n * hidden).div_ceil(256);
+    let act_all = (n * inter).div_ceil(256);
+    for li in 0..model.layers {
+        let r = crate::gpu::EMBRYO_META_HEADER + li * 64;
+        let kind = model.meta.get(r).copied().unwrap_or(u32::MAX);
+        let lb = &layer_binds[li];
+        embryo_chunk_pass(enc, &ck.norm, lb, n, 1, 1, "embryo-chunk-norm");
+        match kind {
+            4 => {
+                let nv = model.gdn_heads as u32;
+                let dv = model.gdn_dv as u32;
+                let cdim = model.gdn_c_dim() as u32;
+                embryo_chunk_pass(enc, &ck.gdn_qkv, lb, cdim, tb, 1, "embryo-chunk-gdn-qkv");
+                embryo_chunk_pass(enc, &ck.gdn_z, lb, nv * dv, tb, 1, "embryo-chunk-gdn-z");
+                embryo_chunk_pass(enc, &ck.gdn_a, lb, nv, tb, 1, "embryo-chunk-gdn-a");
+                embryo_chunk_pass(enc, &ck.gdn_b, lb, nv, tb, 1, "embryo-chunk-gdn-b");
+                embryo_chunk_pass(enc, &ck.gdn_conv, lb, cdim.div_ceil(256), 1, 1, "embryo-chunk-gdn-conv");
+                embryo_chunk_pass(enc, &ck.gdn_step, lb, nv * (dv / 4), 1, 1, "embryo-chunk-gdn-step");
+                embryo_chunk_pass(enc, &ck.gdn_norm, lb, n * nv, 1, 1, "embryo-chunk-gdn-norm");
+                embryo_chunk_pass(enc, &ck.gdn_out, lb, hidden, tb, 1, "embryo-chunk-gdn-out");
+            }
+            0 | 1 => {
+                let ph = model.phase_heads as u32;
+                let nph = model.nphase as u32;
+                let pdv = model.phase_dv as u32;
+                embryo_chunk_pass(enc, &ck.phase_conv, lb, hidden_groups, 1, 1, "embryo-chunk-phase-conv");
+                embryo_chunk_pass(enc, &ck.phase_thq, lb, ph * nph, tb, 1, "embryo-chunk-phase-thq");
+                embryo_chunk_pass(enc, &ck.phase_thk, lb, ph * nph, tb, 1, "embryo-chunk-phase-thk");
+                embryo_chunk_pass(enc, &ck.phase_v, lb, ph * pdv, tb, 1, "embryo-chunk-phase-v");
+                if model.meta.get(r + 8).copied().unwrap_or(u32::MAX) != u32::MAX {
+                    embryo_chunk_pass(enc, &ck.phase_kgate, lb, ph, tb, 1, "embryo-chunk-phase-kgate");
+                }
+                embryo_chunk_pass(enc, &ck.phase_features, lb, n * ph, 1, 1, "embryo-chunk-phase-features");
+                embryo_chunk_pass(enc, &ck.phase, lb, ph * pdv.div_ceil(256), 1, 1, "embryo-chunk-phase-recur");
+                embryo_chunk_pass(enc, &ck.phase_out, lb, hidden, tb, 1, "embryo-chunk-phase-out");
+            }
+            3 => {
+                let qrows = (model.anchor_q_heads * model.anchor_head_dim) as u32;
+                let krows = (model.anchor_kv_heads * model.anchor_head_dim) as u32;
+                let att_chunks = (model.anchor_head_dim as u32).div_ceil(256);
+                let w = (model.anchor_window as u32).max(1);
+                embryo_chunk_pass(enc, &ck.anchor_q, lb, qrows, tb, 1, "embryo-chunk-anchor-q");
+                embryo_chunk_pass(enc, &ck.anchor_k, lb, krows, tb, 1, "embryo-chunk-anchor-k");
+                embryo_chunk_pass(enc, &ck.anchor_v, lb, krows, tb, 1, "embryo-chunk-anchor-v");
+                embryo_chunk_pass(
+                    enc,
+                    &ck.bounded_attend,
+                    lb,
+                    n * (model.anchor_q_heads as u32) * att_chunks,
+                    1,
+                    1,
+                    "embryo-chunk-bounded-attend",
+                );
+                embryo_chunk_pass(
+                    enc,
+                    &ck.bounded_append,
+                    lb,
+                    (n.min(w) * krows).div_ceil(256),
+                    1,
+                    1,
+                    "embryo-chunk-bounded-ring",
+                );
+                embryo_chunk_pass(enc, &ck.anchor_o, lb, hidden, tb, 1, "embryo-chunk-anchor-o");
+            }
+            _ => return false,
+        }
+        embryo_chunk_pass(enc, &ck.residual, lb, rows_all, 1, 1, "embryo-chunk-attn-residual");
+        embryo_chunk_pass(enc, &ck.post_norm, lb, n, 1, 1, "embryo-chunk-post-norm");
+        let ffn_kind = model.meta.get(r + 15).copied().unwrap_or(u32::MAX);
+        if ffn_kind == 0 {
+            embryo_chunk_pass(enc, &ck.ffn_gate, lb, inter, tb, 1, "embryo-chunk-ffn-gate");
+            embryo_chunk_pass(enc, &ck.ffn_up, lb, inter, tb, 1, "embryo-chunk-ffn-up");
+            embryo_chunk_pass(enc, &ck.ffn_act, lb, act_all, 1, 1, "embryo-chunk-ffn-act");
+            embryo_chunk_pass(enc, &ck.ffn_down, lb, hidden, tb, 1, "embryo-chunk-ffn-down");
+            embryo_chunk_pass(enc, &ck.residual, lb, rows_all, 1, 1, "embryo-chunk-ffn-residual");
+        } else if ffn_kind == 1 {
+            let ne = model.meta.get(r + 16).copied().unwrap_or(0);
+            let rank = model.meta.get(r + 20).copied().unwrap_or(0);
+            let chunks = hidden.div_ceil(64);
+            let comps = rank.saturating_add(1);
+            embryo_chunk_pass(
+                enc,
+                &ck.route_part,
+                lb,
+                n.saturating_mul(ne).saturating_mul(comps).saturating_mul(chunks),
+                1,
+                1,
+                "embryo-chunk-route-part",
+            );
+            embryo_chunk_pass(enc, &ck.route_reduce, lb, n.saturating_mul(ne).saturating_mul(comps), 1, 1, "embryo-chunk-route-reduce");
+            embryo_chunk_pass(enc, &ck.route_finalize, lb, n.saturating_mul(ne), 1, 1, "embryo-chunk-route-finalize");
+            embryo_chunk_pass(enc, &ck.route_pick, lb, n, 1, 1, "embryo-chunk-route-pick");
+            embryo_chunk_pass(enc, &ck.route_compact, lb, 1, 1, 1, "embryo-chunk-route-compact");
+            embryo_chunk_pass(enc, &ck.expert_gate, lb, inter, tb, ne, "embryo-chunk-expert-gate");
+            embryo_chunk_pass(enc, &ck.expert_up, lb, inter, tb, ne, "embryo-chunk-expert-up");
+            embryo_chunk_pass(enc, &ck.ffn_act, lb, act_all, 1, 1, "embryo-chunk-expert-act");
+            embryo_chunk_pass(enc, &ck.expert_down, lb, hidden, tb, ne, "embryo-chunk-expert-down");
+            embryo_chunk_pass(enc, &ck.residual, lb, rows_all, 1, 1, "embryo-chunk-expert-residual");
+            embryo_chunk_pass(enc, &ck.ffn_gate, lb, inter, tb, 1, "embryo-chunk-shared-gate");
+            embryo_chunk_pass(enc, &ck.ffn_up, lb, inter, tb, 1, "embryo-chunk-shared-up");
+            embryo_chunk_pass(enc, &ck.ffn_act, lb, act_all, 1, 1, "embryo-chunk-shared-act");
+            embryo_chunk_pass(enc, &ck.ffn_down, lb, hidden, tb, 1, "embryo-chunk-shared-down");
+            embryo_chunk_pass(enc, &ck.residual, lb, rows_all, 1, 1, "embryo-chunk-shared-residual");
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+/// Run one resident Embryo token.  The only host/device round trip is the
+/// final vocabulary logit row; all layer weights, recurrent phase state and
+/// anchor KV stay in device-local buffers between calls.
+pub fn forward_embryo_graph(
+    model: &Arc<crate::gpu::EmbryoGraphModel>,
+    kv_id: u64,
+    hidden: &[f32],
+    position: usize,
+    logits: &mut Vec<f32>,
+) -> bool {
+    forward_embryo_graph_rows(model, kv_id, hidden, 1, position, logits)
+}
+
+/// Run `n` contiguous positions (`rows` = n × hidden embeddings starting
+/// at `position`) through the resident graph in ONE submit — the chunked
+/// prefill.  Logits are the last position's.  Refuses (before any device
+/// work) a legacy full-anchor genome, `n > EMBRYO_CHUNK_MAX`, or a span
+/// detached from the device sequence.
+pub fn forward_embryo_graph_chunk(
+    model: &Arc<crate::gpu::EmbryoGraphModel>,
+    kv_id: u64,
+    rows: &[f32],
+    position: usize,
+    n: usize,
+    logits: &mut Vec<f32>,
+) -> bool {
+    forward_embryo_graph_rows(model, kv_id, rows, n, position, logits)
+}
+
+fn forward_embryo_graph_rows(
+    model: &Arc<crate::gpu::EmbryoGraphModel>,
+    kv_id: u64,
+    hidden: &[f32],
+    n: usize,
+    position: usize,
+    logits: &mut Vec<f32>,
+) -> bool {
+    let dbg = std::env::var("CMF_EMBRYO_DBG").as_deref() == Ok("1");
+    if n == 0 || n > crate::gpu::EMBRYO_CHUNK_MAX || hidden.len() != n * model.hidden {
+        if dbg {
+            eprintln!("embryo-dbg: chunk of {n} rows refused (rows {})", hidden.len());
+        }
+        return false;
+    }
+    // The chunk kernels cover the mixers (phase 0/1, GDN 4), the bounded
+    // anchor (3) and both FFN kinds; the legacy full anchor keeps the
+    // per-position path.  `CMF_EMBRYO_CHUNK_FORCE=1` runs the chunk
+    // encoder even for n = 1 (diagnostics: kernel-level parity of the two
+    // encoders without any chunk-specific logic in play).
+    let chunked = n > 1 || std::env::var("CMF_EMBRYO_CHUNK_FORCE").as_deref() == Ok("1");
+    if chunked {
+        for li in 0..model.layers {
+            let r = crate::gpu::EMBRYO_META_HEADER + li * 64;
+            let kind = model.meta.get(r).copied().unwrap_or(u32::MAX);
+            let ffn = model.meta.get(r + 15).copied().unwrap_or(u32::MAX);
+            if !matches!(kind, 0 | 1 | 3 | 4) || ffn > 1 {
+                if dbg {
+                    eprintln!("embryo-dbg: chunk prefill refused: layer {li} kind {kind} ffn {ffn}");
+                }
+                return false;
+            }
+        }
+    }
+    let Some(c) = ctx() else {
+        if dbg {
+            eprintln!("embryo-dbg: no wgpu context (CMF_GPU={:?})", std::env::var("CMF_GPU").ok());
+        }
+        return false;
+    };
+    // The resident graph has a single readback, so a short opt-in profiler
+    // can separate the device timestamped dispatch from host encode and the
+    // submit/map/copy wait.  Keep this off the normal path: resolving a query
+    // and mapping its staging buffer would otherwise add a second fence.
+    // The chunk encoder carries no timestamp pairs.
+    let profile = n == 1 && std::env::var("CMF_EMBRYO_PROFILE").as_deref() == Ok("1");
+    let t_token = std::time::Instant::now();
+    // Mixer geometry is checked only for the mixer kinds the graph holds:
+    // a GDN genome has no phase heads, a phase genome no GDN heads.
+    let phase_bad = model.phase_layers > 0
+        && (model.phase_heads == 0
+            || model.nphase == 0
+            || model.phase_dv == 0
+            || model.phase_heads.saturating_mul(model.phase_dv) > 1024
+            || model.phase_heads.saturating_mul(model.nphase) > 1024);
+    // The GDN kernels: c_dim ≤ 2048 (two scratch planes), nv·dv ≤ 1024,
+    // dk ≤ 128 lanes, dv ≤ 256 lanes and a multiple of 4 (vec4 state rows).
+    let gdn_bad = model.gdn_layers > 0
+        && (model.gdn_heads == 0
+            || model.gdn_k_heads == 0
+            || model.gdn_heads % model.gdn_k_heads != 0
+            || model.gdn_dk == 0
+            || model.gdn_dk > 128
+            || model.gdn_dv == 0
+            || model.gdn_dv > 256
+            || model.gdn_dv % 4 != 0
+            || model.gdn_kk == 0
+            || model.gdn_heads > 512
+            || model.gdn_heads.saturating_mul(model.gdn_dv) > 1024
+            || model.gdn_c_dim() > 2048
+            || model.gdn_c_dim() % 4 != 0);
+    if hidden.len() != n * model.hidden
+        || model.hidden == 0
+        || model.hidden > 1024
+        || model.intermediate == 0
+        || model.intermediate > 1024
+        || model.layers == 0
+        || phase_bad
+        || gdn_bad
+        || model.phase_layers + model.gdn_layers + model.kv_layers < model.layers
+        || model.anchor_q_heads == 0
+        || model.anchor_kv_heads == 0
+        || model.anchor_q_heads % model.anchor_kv_heads != 0
+        || model.anchor_q_heads.saturating_mul(model.anchor_head_dim) > 1024
+        || model.anchor_kv_heads.saturating_mul(model.anchor_head_dim) > 1024
+        || model.vocab == 0
+        || model.max_seq == 0
+        || model.cluster_count == 0
+        || model.cluster_size == 0
+        // The legacy anchor writes KV rows by absolute position; a bounded
+        // anchor writes slot `position mod W` and has no cap at all.
+        || (!model.bounded && position >= model.max_seq)
+    {
+        if dbg {
+            eprintln!("embryo-dbg: model geometry refused (position {position}, max_seq {})", model.max_seq);
+        }
+        return false;
+    }
+    if !embryo_runtime_init(c) {
+        if dbg {
+            let l = c.device.limits();
+            eprintln!(
+                "embryo-dbg: runtime init refused (invocations/wg {}, wg storage {})",
+                l.max_compute_invocations_per_workgroup, l.max_compute_workgroup_storage_size
+            );
+        }
+        return false;
+    }
+    let slot = EMBRYO_RUNTIME.get().unwrap();
+    let mut guard = slot.lock().unwrap();
+    let Some(rt) = guard.as_mut() else {
+        return false;
+    };
+    // `1` remains a compatibility alias for the accepted parallel graph;
+    // unset/other values keep the ordinary host path unchanged.
+    let wants_parallel = matches!(
+        std::env::var("CMF_EMBRYO_RESIDENT").as_deref(),
+        Ok("parallel") | Ok("1")
+    );
+    if !wants_parallel {
+        if dbg {
+            eprintln!("embryo-dbg: CMF_EMBRYO_RESIDENT not parallel/1");
+        }
+        return false;
+    }
+    // Never silently downgrade an explicitly requested resident run if its
+    // optional pipelines failed validation. The caller can retain the
+    // ordinary host path only before a sequence has started.
+    if wants_parallel && rt.parallel.is_none() {
+        if dbg {
+            eprintln!("embryo-dbg: parallel head pipelines rejected (see RUST_LOG=warn)");
+        }
+        return false;
+    }
+    if wants_parallel && rt.core.is_none() {
+        if dbg {
+            eprintln!("embryo-dbg: core shader rejected (see RUST_LOG=warn)");
+        }
+        return false;
+    }
+    if wants_parallel && model.vocab < model.cluster_count.saturating_mul(2) {
+        if dbg {
+            eprintln!("embryo-dbg: vocab {} < 2·clusters {}", model.vocab, model.cluster_count);
+        }
+        return false;
+    }
+    let use_parallel = model.vocab >= model.cluster_count.saturating_mul(2);
+    // The parallel head keeps raw logits plus two hierarchy correction planes
+    // in one resident storage buffer. Validate the byte arithmetic before
+    // allocating it; the readback remains exactly `vocab` rows.
+    let logits_words = match model
+        .vocab
+        .checked_add(model.cluster_count.checked_mul(2).unwrap_or(usize::MAX))
+    {
+        Some(n) => n,
+        None => return false,
+    };
+    let logits_storage_bytes = match (logits_words.max(1) as u64).checked_mul(4) {
+        Some(n) => n,
+        None => return false,
+    };
+    let dm = rt
+        .models
+        .entry(model.id)
+        .or_insert_with(|| EmbryoDeviceModel {
+            weights: embryo_buffer_f32(
+                c,
+                &model.weights,
+                "embryo-weights",
+                wgpu::BufferUsages::STORAGE,
+            ),
+            meta: embryo_buffer_u32(c, &model.meta, "embryo-meta", wgpu::BufferUsages::STORAGE),
+            lm_head: embryo_buffer_f32(
+                c,
+                &model.lm_head,
+                "embryo-lm-head",
+                wgpu::BufferUsages::STORAGE,
+            ),
+            clusters: embryo_buffer_f32(
+                c,
+                &model.clusters,
+                "embryo-clusters",
+                wgpu::BufferUsages::STORAGE,
+            ),
+            final_norm: embryo_buffer_f32(
+                c,
+                &model.final_norm,
+                "embryo-final-norm",
+                wgpu::BufferUsages::STORAGE,
+            ),
+            inv_freq: embryo_buffer_f32(
+                c,
+                &model.inv_freq,
+                "embryo-inv-freq",
+                wgpu::BufferUsages::STORAGE,
+            ),
+        });
+    let key = (model.id, kv_id);
+    let seq = rt.sequences.entry(key).or_insert_with(|| {
+        let state_bytes = (model.state_layers * model.state_stride).max(1) as u64 * 4;
+        // Bounded genome: `kv_layers` anchors × one ring each (264 KiB for
+        // the Embryo-0 geometry) instead of layers × max_seq planes.
+        let kv_bytes = (model.kv_layers * model.kv_stride).max(1) as u64 * 4;
+        let stage_bytes = (model.vocab.max(1) * 4) as u64;
+        let state = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("embryo-state"),
+            size: state_bytes,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let kv = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("embryo-kv"),
+            size: kv_bytes,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let hidden_buf = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("embryo-hidden"),
+            // n ≤ EMBRYO_CHUNK_MAX residual rows for the chunked prefill;
+            // the token path uses row 0.
+            size: (model.hidden * crate::gpu::EMBRYO_CHUNK_MAX * 4).max(4) as u64,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let scratch = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("embryo-core-scratch"),
+            // Phase feature planes and the coalesced resonance-router partial
+            // reductions are resident here, followed by the chunk window
+            // of the batched prefill.  The fixed image is shared by every
+            // ordered layer stage, so this is a one-time allocation per
+            // sequence rather than a per-token scratch churn.  Scratch is
+            // not sequence state: the telemetry reports `state` and `kv`.
+            size: (embryo_scratch_words() * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let logits_buf = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("embryo-logits"),
+            // Keep raw logits plus the two hierarchy correction planes in a
+            // single resident buffer for the row-parallel head.
+            size: logits_storage_bytes.max(stage_bytes).max(4),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let params = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("embryo-params"),
+            size: 32,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("embryo-logit-stage"),
+            size: stage_bytes.max(4),
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        EmbryoDeviceSequence {
+            state,
+            kv,
+            hidden: hidden_buf,
+            logits: logits_buf,
+            scratch,
+            params,
+            stage,
+            bind: None,
+            layer_params: Vec::new(),
+            layer_binds: Vec::new(),
+            stage_bytes,
+            initialized: false,
+            next_position: 0,
+        }
+    });
+    // The resident recurrence/KV image is only valid for a contiguous
+    // sequence beginning at position zero.  Refuse a detached span rather
+    // than silently attending to zero-filled cache rows or replaying a stale
+    // device state beside the exact host path.
+    if position != 0 && (!seq.initialized || position != seq.next_position) {
+        if dbg {
+            eprintln!(
+                "embryo-dbg: detached position {position} (initialized {}, next {})",
+                seq.initialized, seq.next_position
+            );
+        }
+        seq.initialized = false;
+        seq.next_position = 0;
+        return false;
+    }
+    logits.resize(model.vocab, 0.0);
+    c.queue
+        .write_buffer(&seq.hidden, 0, bytemuck::cast_slice(hidden));
+    let params = [
+        position as u32,
+        model.max_seq as u32,
+        model.vocab as u32,
+        (if model.norm_gemma { 1 } else { 0 }) | if use_parallel { 2 } else { 0 },
+        model.meta.get(19).copied().unwrap_or(0),
+        model.phase_mass.to_bits(),
+        0,
+        n as u32,
+    ];
+    c.queue
+        .write_buffer(&seq.params, 0, bytemuck::cast_slice(&params));
+    let fresh = !seq.initialized || position == 0;
+    let t_encode = std::time::Instant::now();
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("embryo-resident-token"),
+        });
+    // The split body still has ordered dispatches, but no host-visible pass
+    // boundary is required between them.  Merge them into one compute pass
+    // so the optimization does not trade the old single-workgroup bottleneck
+    // for dozens of driver pass submissions; timestamp/copy boundaries flush
+    // this guard explicitly below.
+    let _merge_guard = PassMergeGuard::new(&enc);
+    if fresh {
+        enc.clear_buffer(&seq.state, 0, None);
+        enc.clear_buffer(&seq.kv, 0, None);
+    }
+    if seq.bind.is_none() {
+        seq.bind = Some(c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("embryo-resident-bind"),
+            layout: &rt.layout,
+            entries: &[
+                bind_buf(0, &dm.weights),
+                bind_buf(1, &dm.meta),
+                bind_buf(2, &dm.lm_head),
+                bind_buf(3, &dm.clusters),
+                bind_buf(4, &dm.final_norm),
+                bind_buf(5, &dm.inv_freq),
+                bind_buf(6, &seq.hidden),
+                bind_buf(7, &seq.state),
+                bind_buf(8, &seq.kv),
+                bind_buf(9, &seq.logits),
+                bind_buf(10, &seq.params),
+                bind_buf(11, &seq.scratch),
+            ],
+        }));
+    }
+    if use_parallel && seq.layer_binds.len() != model.layers {
+        let mut layer_params = Vec::with_capacity(model.layers);
+        let mut layer_binds = Vec::with_capacity(model.layers);
+        for _li in 0..model.layers {
+            let layer_param = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("embryo-layer-params"),
+                size: 32,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let layer_bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("embryo-core-bind"),
+                layout: &rt.layout,
+                entries: &[
+                    bind_buf(0, &dm.weights),
+                    bind_buf(1, &dm.meta),
+                    bind_buf(2, &dm.lm_head),
+                    bind_buf(3, &dm.clusters),
+                    bind_buf(4, &dm.final_norm),
+                    bind_buf(5, &dm.inv_freq),
+                    bind_buf(6, &seq.hidden),
+                    bind_buf(7, &seq.state),
+                    bind_buf(8, &seq.kv),
+                    bind_buf(9, &seq.logits),
+                    bind_buf(10, &layer_param),
+                    bind_buf(11, &seq.scratch),
+                ],
+            });
+            layer_params.push(layer_param);
+            layer_binds.push(layer_bind);
+        }
+        seq.layer_params = layer_params;
+        seq.layer_binds = layer_binds;
+    }
+    if use_parallel {
+        let layer_flags = if model.norm_gemma { 1u32 } else { 0 };
+        debug_assert_eq!(seq.layer_params.len(), model.layers);
+        debug_assert_eq!(seq.layer_binds.len(), model.layers);
+        for (li, layer_param) in seq.layer_params.iter().enumerate() {
+            let lp = [
+                position as u32,
+                model.max_seq as u32,
+                model.vocab as u32,
+                layer_flags,
+                model.meta.get(19).copied().unwrap_or(0),
+                model.phase_mass.to_bits(),
+                li as u32,
+                n as u32,
+            ];
+            c.queue
+                .write_buffer(layer_param, 0, bytemuck::cast_slice(&lp));
+        }
+    }
+    let bind = seq.bind.as_ref().unwrap();
+    // The resident graph has several dependent passes; profile them without
+    // adding a second query readback to every token when profiling is off.
+    let parallel_timestamped = profile
+        .then(|| c.ts_query.as_ref())
+        .flatten();
+    // Reserve timestamp pairs for the two narrow residual costs called out
+    // by the resident-performance decision: phase recurrence and the MoE
+    // router (including its deterministic top-1 pick).  Anchor attention is
+    // kept as a third pair so the per-stage profile remains additive.  The
+    // slot map is derived from metadata once and reused by encoding and
+    // readback; normal, non-profiled execution pays only this tiny walk.
+    let mut phase_slots = vec![None; model.layers];
+    let mut anchor_slots = vec![None; model.layers];
+    let mut route_slots = vec![None; model.layers];
+    let mut profile_next_slot = 1u32;
+    if parallel_timestamped.is_some() {
+        for li in 0..model.layers {
+            let r = crate::gpu::EMBRYO_META_HEADER.saturating_add(li.saturating_mul(64));
+            let kind = model.meta.get(r).copied().unwrap_or(u32::MAX);
+            // The GDN recurrence shares the "phase" profile pair: it is
+            // the mixer's state step, whichever operator the file names.
+            if kind < 2 || kind == 4 {
+                phase_slots[li] = Some((profile_next_slot, profile_next_slot + 1));
+                profile_next_slot = profile_next_slot.saturating_add(2);
+            } else if kind == 2 || kind == 3 {
+                anchor_slots[li] = Some((profile_next_slot, profile_next_slot + 1));
+                profile_next_slot = profile_next_slot.saturating_add(2);
+            }
+            let ffn_kind = model.meta.get(r + 15).copied().unwrap_or(u32::MAX);
+            if ffn_kind == 1 {
+                route_slots[li] = Some((profile_next_slot, profile_next_slot + 1));
+                profile_next_slot = profile_next_slot.saturating_add(2);
+            }
+        }
+    }
+    let body_end_slot = profile_next_slot;
+    let tail_end_slot = body_end_slot.saturating_add(1);
+    if use_parallel {
+        // Every layer stage is an ordered compute pass in this single command
+        // encoder.  The explicit pass boundaries provide device ordering for
+        // scratch/state/KV writes while retaining one submit and one logits
+        // readback for the whole token.
+        let core = rt.core.as_ref().unwrap();
+        if let Some((qs, _, _)) = parallel_timestamped {
+            flush_pass(&enc);
+            enc.write_timestamp(qs, 0);
+        }
+        // Timestamp the expensive anchor-attention stages independently from
+        // the rest of the resident body.  There can be multiple anchor
+        // layers, so reserve two query slots per layer (begin/end) after the
+        // body-start slot.  The fixed 256-slot query set has ample room for
+        // every supported Embryo graph.
+        let hidden_groups = (model.hidden as u32).div_ceil(256);
+        let inter_groups = (model.intermediate as u32).div_ceil(256);
+        // Projection/down kernels assign one 256-lane workgroup to one
+        // matrix row; elementwise kernels retain the usual lane grid.
+        let hidden_rows = (model.hidden as u32).max(1);
+        let inter_rows = (model.intermediate as u32).max(1);
+        let max_projection = |a: u32, b: u32| a.max(b).max(1);
+        if chunked {
+            if !embryo_encode_chunk(&mut enc, core, model, &seq.layer_binds, n as u32) {
+                return false;
+            }
+        }
+        for li in 0..model.layers {
+            if chunked {
+                break;
+            }
+            let r = crate::gpu::EMBRYO_META_HEADER + li * 64;
+            let kind = *model.meta.get(r).unwrap_or(&u32::MAX);
+            let layer_bind = &seq.layer_binds[li];
+            embryo_core_pass(&mut enc, &core.norm, layer_bind, 1, "embryo-core-norm");
+            // The hidden-wide short conv belongs to the phase mixer; a GDN
+            // layer convolves its own projection inside the mixer chain.
+            if kind != 4 {
+                embryo_core_pass(&mut enc, &core.conv, layer_bind, hidden_groups, "embryo-core-conv");
+            }
+            if kind == 4 {
+                // GDN mixer: fused projections, depthwise conv + ring
+                // shift, the delta-rule step over (head, vec4 column)
+                // workgroups, gated RMSNorm, out projection.  Per-token
+                // cost is a constant of the geometry, never of the position.
+                let nv = model.gdn_heads as u32;
+                let dv = model.gdn_dv as u32;
+                let cdim = model.gdn_c_dim() as u32;
+                embryo_core_pass(&mut enc,
+                    &core.gdn_project,
+                    layer_bind,
+                    max_projection(cdim.max(nv * dv), nv),
+                    "embryo-core-gdn-project",
+                );
+                embryo_core_pass(&mut enc,
+                    &core.gdn_conv,
+                    layer_bind,
+                    cdim.div_ceil(256),
+                    "embryo-core-gdn-conv",
+                );
+                if let Some((qs, _, _)) = parallel_timestamped {
+                    if let Some((begin, _)) = phase_slots[li] {
+                        flush_pass(&enc);
+                        enc.write_timestamp(qs, begin);
+                    }
+                }
+                embryo_core_pass(&mut enc,
+                    &core.gdn_step,
+                    layer_bind,
+                    nv.saturating_mul(dv / 4),
+                    "embryo-core-gdn-step",
+                );
+                if let Some((qs, _, _)) = parallel_timestamped {
+                    if let Some((_, end)) = phase_slots[li] {
+                        flush_pass(&enc);
+                        enc.write_timestamp(qs, end);
+                    }
+                }
+                embryo_core_pass(&mut enc, &core.gdn_norm, layer_bind, nv, "embryo-core-gdn-norm");
+                embryo_core_pass(&mut enc,
+                    &core.gdn_output,
+                    layer_bind,
+                    hidden_rows,
+                    "embryo-core-gdn-output",
+                );
+            } else if kind < 2 {
+                let ph = model.phase_heads as u32;
+                let nph = model.nphase as u32;
+                let pdv = model.phase_dv as u32;
+                let qrows = ph * nph;
+                let vrows = ph * pdv;
+                embryo_core_pass(&mut enc,
+                    &core.project_phase,
+                    layer_bind,
+                    max_projection(vrows.max(qrows), ph),
+                    "embryo-core-phase-project",
+                );
+                let phase_chunks = pdv.div_ceil(256);
+                if let Some((qs, _, _)) = parallel_timestamped {
+                    if let Some((begin, _)) = phase_slots[li] {
+                        flush_pass(&enc);
+                        enc.write_timestamp(qs, begin);
+                    }
+                }
+                embryo_core_pass(
+                    &mut enc,
+                    &core.phase_features,
+                    layer_bind,
+                    ph.max(1),
+                    "embryo-core-phase-features",
+                );
+                embryo_core_pass(
+                    &mut enc,
+                    &core.phase,
+                    layer_bind,
+                    ph.saturating_mul(phase_chunks),
+                    "embryo-core-phase-recur",
+                );
+                if let Some((qs, _, _)) = parallel_timestamped {
+                    if let Some((_, end)) = phase_slots[li] {
+                        flush_pass(&enc);
+                        enc.write_timestamp(qs, end);
+                    }
+                }
+                embryo_core_pass(&mut enc,
+                    &core.output_phase,
+                    layer_bind,
+                    hidden_rows,
+                    "embryo-core-phase-output",
+                );
+            } else if kind == 2 {
+                let qrows = (model.anchor_q_heads * model.anchor_head_dim) as u32;
+                let krows = (model.anchor_kv_heads * model.anchor_head_dim) as u32;
+                let nrows = krows.max(qrows);
+                embryo_core_pass(&mut enc,
+                    &core.project_anchor,
+                    layer_bind,
+                    max_projection(nrows, 0),
+                    "embryo-core-anchor-project",
+                );
+                let rope_pairs = (model.anchor_q_heads.max(model.anchor_kv_heads)
+                    * (model.rotary_dim / 2)) as u32;
+                embryo_core_pass(&mut enc,
+                    &core.rope,
+                    layer_bind,
+                    rope_pairs.div_ceil(256),
+                    "embryo-core-anchor-rope",
+                );
+                embryo_core_pass(&mut enc,
+                    &core.anchor_append,
+                    layer_bind,
+                    krows.div_ceil(256),
+                    "embryo-core-anchor-kv",
+                );
+                let att_chunks = (model.anchor_head_dim as u32).div_ceil(256);
+                if let Some((qs, _, _)) = parallel_timestamped {
+                    if let Some((begin, _)) = anchor_slots[li] {
+                        flush_pass(&enc);
+                        enc.write_timestamp(qs, begin);
+                    }
+                }
+                embryo_core_pass(&mut enc,
+                    &core.anchor_attend,
+                    layer_bind,
+                    (model.anchor_q_heads as u32).saturating_mul(att_chunks),
+                    "embryo-core-anchor-attend",
+                );
+                if let Some((qs, _, _)) = parallel_timestamped {
+                    if let Some((_, end)) = anchor_slots[li] {
+                        flush_pass(&enc);
+                        enc.write_timestamp(qs, end);
+                    }
+                }
+                embryo_core_pass(&mut enc,
+                    &core.output_anchor,
+                    layer_bind,
+                    hidden_rows,
+                    "embryo-core-anchor-output",
+                );
+            } else if kind == 3 {
+                // Bounded anchor: raw q/k/v (no rope pass) into the chunk
+                // planes' row 0, one bounded attend over sinks ∪ window
+                // (the SAME kernel the chunked prefill runs, so decode and
+                // prefill share one compiled attend), ring append at slot
+                // position mod W, O projection.  Per-token cost is a
+                // constant of the file (S + W lanes), whatever the position.
+                let qrows = (model.anchor_q_heads * model.anchor_head_dim) as u32;
+                let krows = (model.anchor_kv_heads * model.anchor_head_dim) as u32;
+                let nrows = krows.max(qrows);
+                embryo_core_pass(&mut enc,
+                    &core.project_anchor_cp,
+                    layer_bind,
+                    max_projection(nrows, 0),
+                    "embryo-core-anchor-project",
+                );
+                let att_chunks = (model.anchor_head_dim as u32).div_ceil(256);
+                if let Some((qs, _, _)) = parallel_timestamped {
+                    if let Some((begin, _)) = anchor_slots[li] {
+                        flush_pass(&enc);
+                        enc.write_timestamp(qs, begin);
+                    }
+                }
+                embryo_core_pass(&mut enc,
+                    &core.chunk.bounded_attend,
+                    layer_bind,
+                    (model.anchor_q_heads as u32).saturating_mul(att_chunks),
+                    "embryo-core-bounded-attend",
+                );
+                if let Some((qs, _, _)) = parallel_timestamped {
+                    if let Some((_, end)) = anchor_slots[li] {
+                        flush_pass(&enc);
+                        enc.write_timestamp(qs, end);
+                    }
+                }
+                embryo_core_pass(&mut enc,
+                    &core.chunk.bounded_append,
+                    layer_bind,
+                    krows.div_ceil(256),
+                    "embryo-core-bounded-ring",
+                );
+                embryo_core_pass(&mut enc,
+                    &core.output_anchor_cp,
+                    layer_bind,
+                    hidden_rows,
+                    "embryo-core-anchor-output",
+                );
+            } else {
+                return false;
+            }
+            embryo_core_pass(&mut enc,
+                &core.residual,
+                layer_bind,
+                hidden_groups,
+                "embryo-core-attn-residual",
+            );
+            embryo_core_pass(&mut enc,
+                &core.post_norm,
+                layer_bind,
+                1,
+                "embryo-core-post-attn-norm",
+            );
+            let ffn_kind = *model.meta.get(r + 15).unwrap_or(&u32::MAX);
+            if ffn_kind == 0 {
+                embryo_core_pass(&mut enc,
+                    &core.ffn_dense_proj,
+                    layer_bind,
+                    inter_rows,
+                    "embryo-core-ffn-project",
+                );
+                embryo_core_pass(&mut enc,
+                    &core.ffn_act,
+                    layer_bind,
+                    inter_groups,
+                    "embryo-core-ffn-act",
+                );
+                embryo_core_pass(&mut enc,
+                    &core.ffn_dense_down,
+                    layer_bind,
+                    hidden_rows,
+                    "embryo-core-ffn-down",
+                );
+                embryo_core_pass(&mut enc,
+                    &core.residual,
+                    layer_bind,
+                    hidden_groups,
+                    "embryo-core-ffn-residual",
+                );
+            } else if ffn_kind == 1 {
+                if let Some((qs, _, _)) = parallel_timestamped {
+                    if let Some((begin, _)) = route_slots[li] {
+                        flush_pass(&enc);
+                        enc.write_timestamp(qs, begin);
+                    }
+                }
+                let route_experts = model.meta.get(r + 16).copied().unwrap_or(0);
+                let route_rank = model.meta.get(r + 20).copied().unwrap_or(0);
+                let route_chunks = (model.hidden as u32).div_ceil(64);
+                let route_components = route_rank.saturating_add(1);
+                embryo_core_pass(
+                    &mut enc,
+                    &core.route_part,
+                    layer_bind,
+                    route_experts
+                        .saturating_mul(route_components)
+                        .saturating_mul(route_chunks),
+                    "embryo-core-route-part",
+                );
+                embryo_core_pass(
+                    &mut enc,
+                    &core.route_reduce,
+                    layer_bind,
+                    route_experts.saturating_mul(route_components),
+                    "embryo-core-route-reduce",
+                );
+                embryo_core_pass(
+                    &mut enc,
+                    &core.route_finalize,
+                    layer_bind,
+                    route_experts,
+                    "embryo-core-route-finalize",
+                );
+                embryo_core_pass(&mut enc, &core.route_pick, layer_bind, 1, "embryo-core-route-pick");
+                if let Some((qs, _, _)) = parallel_timestamped {
+                    if let Some((_, end)) = route_slots[li] {
+                        flush_pass(&enc);
+                        enc.write_timestamp(qs, end);
+                    }
+                }
+                embryo_core_pass(&mut enc,
+                    &core.ffn_expert_proj,
+                    layer_bind,
+                    inter_rows,
+                    "embryo-core-expert-project",
+                );
+                embryo_core_pass(&mut enc,
+                    &core.ffn_act,
+                    layer_bind,
+                    inter_groups,
+                    "embryo-core-expert-act",
+                );
+                embryo_core_pass(&mut enc,
+                    &core.ffn_expert_down,
+                    layer_bind,
+                    hidden_rows,
+                    "embryo-core-expert-down",
+                );
+                embryo_core_pass(&mut enc,
+                    &core.residual,
+                    layer_bind,
+                    hidden_groups,
+                    "embryo-core-expert-residual",
+                );
+                embryo_core_pass(&mut enc,
+                    &core.ffn_shared_proj,
+                    layer_bind,
+                    inter_rows,
+                    "embryo-core-shared-project",
+                );
+                embryo_core_pass(&mut enc,
+                    &core.ffn_act,
+                    layer_bind,
+                    inter_groups,
+                    "embryo-core-shared-act",
+                );
+                embryo_core_pass(&mut enc,
+                    &core.ffn_shared_down,
+                    layer_bind,
+                    hidden_rows,
+                    "embryo-core-shared-down",
+                );
+                embryo_core_pass(&mut enc,
+                    &core.residual,
+                    layer_bind,
+                    hidden_groups,
+                    "embryo-core-shared-residual",
+                );
+            } else {
+                return false;
+            }
+        }
+        // The final norm uses the token's last residual stream; publish it to
+        // hbuf for the row-parallel vocabulary/head tail below.
+        let last_bind = &seq.layer_binds[model.layers - 1];
+        if chunked {
+            embryo_core_pass(&mut enc, &core.chunk.final_norm, last_bind, 1, "embryo-chunk-final-norm");
+        } else {
+            embryo_core_pass(&mut enc, &core.final_norm, last_bind, 1, "embryo-core-final-norm");
+        }
+        embryo_core_pass(&mut enc,
+            &core.publish,
+            last_bind,
+            hidden_groups,
+            "embryo-core-publish",
+        );
+        if let Some((qs, _, _)) = parallel_timestamped {
+            flush_pass(&enc);
+            enc.write_timestamp(qs, body_end_slot);
+        }
+        let pp = rt.parallel.as_ref().unwrap();
+        let groups = (model.vocab as u32).div_ceil(256);
+        let clusters = model.cluster_count as u32;
+        for (pipeline, gx, label) in [
+            (&pp.raw, groups, "embryo-resident-logits"),
+            (&pp.clusters_global, 1, "embryo-resident-clusters-global"),
+            (
+                &pp.clusters_local,
+                clusters,
+                "embryo-resident-clusters-local",
+            ),
+            (&pp.apply, groups, "embryo-resident-logits-apply"),
+        ] {
+            let mut pass = begin_pass_with(&mut enc, Some(label), None);
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, bind, &[]);
+            pass.dispatch_workgroups(gx, 1, 1);
+        }
+        if let Some((qs, resolve, tstage)) = parallel_timestamped {
+            flush_pass(&enc);
+            enc.write_timestamp(qs, tail_end_slot);
+            flush_pass(&enc);
+            enc.resolve_query_set(qs, 0..(tail_end_slot + 1), resolve, 0);
+            flush_pass(&enc);
+            enc.copy_buffer_to_buffer(
+                resolve,
+                0,
+                tstage,
+                0,
+                (tail_end_slot as u64 + 1) * 8,
+            );
+        }
+    }
+    let t_encoded = std::time::Instant::now();
+    let t_readback = std::time::Instant::now();
+    if !readback(c, enc, &seq.logits, &seq.stage, seq.stage_bytes, logits) {
+        // The submit may have advanced the resident recurrence before a
+        // mapping/fence failure.  Mark the sequence cold so the next attempt
+        // clears both state and KV instead of mixing a partial device token
+        // with the host fallback.
+        seq.initialized = false;
+        seq.next_position = 0;
+        return false;
+    }
+    let t_done = std::time::Instant::now();
+    if profile {
+        let parallel_stages = parallel_timestamped.and_then(|(_, _, tstage)| {
+            // Repeat the cheap metadata walk used by the encoder so the
+            // dynamic query range matches the exact number of anchor layers.
+            let bytes = (tail_end_slot as u64 + 1) * 8;
+            let (tx, rx) = std::sync::mpsc::channel();
+            tstage.map_async(wgpu::MapMode::Read, ..bytes, move |r| {
+                let _ = tx.send(r);
+            });
+            let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+            if !rx.recv().map(|r| r.is_ok()).unwrap_or(false) {
+                return None;
+            }
+            let raw = tstage.get_mapped_range(..bytes).ok()?;
+            let t: &[u64] = bytemuck::cast_slice(&raw);
+            if t.len() <= tail_end_slot as usize {
+                drop(raw);
+                tstage.unmap();
+                return None;
+            }
+            let body_ticks = t[body_end_slot as usize].saturating_sub(t[0]);
+            let pair_ticks = |pairs: &[Option<(u32, u32)>]| {
+                pairs.iter().flatten().fold(0u64, |sum, (begin, end)| {
+                    sum.saturating_add(
+                        t[*end as usize].saturating_sub(t[*begin as usize]),
+                    )
+                })
+            };
+            let phase_ticks = pair_ticks(&phase_slots);
+            let route_ticks = pair_ticks(&route_slots);
+            let attn_ticks = pair_ticks(&anchor_slots);
+            let rest_ticks = body_ticks
+                .saturating_sub(attn_ticks)
+                .saturating_sub(phase_ticks)
+                .saturating_sub(route_ticks);
+            let tail_ticks = t[tail_end_slot as usize]
+                .saturating_sub(t[body_end_slot as usize]);
+            let body = body_ticks as f64 * c.ts_period as f64 / 1.0e6;
+            let phase = phase_ticks as f64 * c.ts_period as f64 / 1.0e6;
+            let route = route_ticks as f64 * c.ts_period as f64 / 1.0e6;
+            let attn = attn_ticks as f64 * c.ts_period as f64 / 1.0e6;
+            let rest = rest_ticks as f64 * c.ts_period as f64 / 1.0e6;
+            let tail = tail_ticks as f64 * c.ts_period as f64 / 1.0e6;
+            drop(raw);
+            tstage.unmap();
+            let phase_pairs = phase_slots.iter().flatten().count();
+            let route_pairs = route_slots.iter().flatten().count();
+            let attn_pairs = anchor_slots.iter().flatten().count();
+            Some((body, phase, route, attn, rest, tail, phase_pairs, route_pairs, attn_pairs))
+        });
+        if let Some((body, phase, route, attn, rest, tail, phase_pairs, route_pairs, attn_pairs)) = parallel_stages {
+            eprintln!(
+                "embryo-profile: setup={:.3}ms encode={:.3}ms submit+map+copy={:.3}ms total={:.3}ms gpu-core={body:.3}ms gpu-phase={phase:.3}ms gpu-route={route:.3}ms gpu-attn={attn:.3}ms gpu-rest={rest:.3}ms gpu-tail={tail:.3}ms phase-pairs={phase_pairs} route-pairs={route_pairs} attn-pairs={attn_pairs}",
+                t_encode.duration_since(t_token).as_secs_f64() * 1e3,
+                t_encoded.duration_since(t_encode).as_secs_f64() * 1e3,
+                t_done.duration_since(t_readback).as_secs_f64() * 1e3,
+                t_done.duration_since(t_token).as_secs_f64() * 1e3,
+            );
+        }
+    }
+    seq.initialized = true;
+    seq.next_position = position.saturating_add(n);
+    static ANNOUNCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !ANNOUNCED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "embryo resident graph: active adapter={} layers={} hidden={} vocab={} state={} kv={}",
+            c.adapter_info.name,
+            model.layers,
+            model.hidden,
+            model.vocab,
+            model.state_layers * model.state_stride,
+            model.kv_layers * model.kv_stride
+        );
+    }
+    true
+}
+
 /// Drop the device K/V mirror for a pipeline (called on cache clear).
 pub fn kv_mirror_reset(kv_id: u64) {
     if let Some(c) = ctx() {
@@ -28955,6 +32700,44 @@ pub fn kv_mirror_pull_host(
     drop(data);
     stage.unmap();
     Some((k, v, first_valid))
+}
+
+/// `(state bytes, KV/ring bytes)` the resident graph holds for `kv_id`
+/// (None = no device sequence).  Read from the live buffers, not from a
+/// formula, so the number is what the device actually allocated.
+pub fn embryo_device_state_bytes(kv_id: u64) -> Option<(u64, u64)> {
+    let slot = EMBRYO_RUNTIME.get()?;
+    let guard = slot.lock().ok()?;
+    let rt = guard.as_ref()?;
+    rt.sequences
+        .iter()
+        .find(|((_, id), _)| *id == kv_id)
+        .map(|(_, seq)| (seq.state.size(), seq.kv.size()))
+}
+
+/// Next position of the resident Embryo sequence `kv_id` (`None` = no
+/// initialized device image: the host owns that sequence).
+pub fn embryo_device_next_position(kv_id: u64) -> Option<usize> {
+    let slot = EMBRYO_RUNTIME.get()?;
+    let guard = slot.lock().ok()?;
+    let rt = guard.as_ref()?;
+    rt.sequences
+        .iter()
+        .find(|((_, id), _)| *id == kv_id)
+        .and_then(|(_, seq)| seq.initialized.then_some(seq.next_position))
+}
+
+/// Drop resident Embryo state for a sequence.  Model buffers remain cached so
+/// a pooled server slot can start another request without re-uploading 200 MB
+/// of f32 weights.
+pub fn embryo_graph_reset(kv_id: u64) {
+    if let Some(slot) = EMBRYO_RUNTIME.get() {
+        if let Ok(mut guard) = slot.lock() {
+            if let Some(rt) = guard.as_mut() {
+                rt.sequences.retain(|(_, id), _| *id != kv_id);
+            }
+        }
+    }
 }
 
 /// GDN depthwise conv step (bring-up / parity): updates cq [cdim] and shifts

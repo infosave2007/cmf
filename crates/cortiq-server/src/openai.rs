@@ -16,7 +16,9 @@ use cortiq_core::TaskMask;
 use cortiq_engine::SamplerConfig;
 use cortiq_engine::dsv41_encoding::{self, EncodeOptions, ReasoningEffort, ThinkingMode};
 use cortiq_engine::dsv41_vision::{self, VisionConfig};
+use cortiq_engine::lookup::{LookupAnswer, LookupMode, LookupOutcome};
 use cortiq_engine::pipeline::GenerateResult;
+use cortiq_engine::router::{PromptFrame, RouteDecision};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -189,6 +191,35 @@ struct ClassTokenClassification {
     scores: Vec<ClassTokenScore>,
 }
 
+/// Read a binary decision policy carried by the loaded CMF skill record.
+/// A model with several skills is only unambiguous when every declared
+/// threshold agrees; otherwise the endpoint keeps its historical argmax.
+fn model_decision_threshold(state: &AppState) -> Option<f32> {
+    let mut thresholds = state
+        .runtime
+        .model()
+        .header
+        .skills
+        .iter()
+        .filter_map(|skill| {
+            skill
+                .quality
+                .as_ref()
+                .and_then(|quality| quality.get("decision_threshold"))
+                .and_then(serde_json::Value::as_f64)
+                .map(|value| value as f32)
+        });
+    let first = thresholds.next()?;
+    if !first.is_finite() || !(0.0..=1.0).contains(&first) {
+        return None;
+    }
+    if thresholds.all(|value| value.is_finite() && (0.0..=1.0).contains(&value) && value == first) {
+        Some(first)
+    } else {
+        None
+    }
+}
+
 #[derive(Serialize)]
 struct ApiError {
     error: ApiErrorBody,
@@ -213,8 +244,233 @@ fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
         .into_response()
 }
 
+/// The router-v2 decision of a request and the lane that runs it
+/// (`None` lane = the backbone slots). Without a router policy, or without
+/// a text to route on, nothing is decided.
+async fn route_request(
+    state: &Arc<AppState>,
+    route_text: Option<(String, PromptFrame)>,
+    pre: Option<RouteDecision>,
+) -> Result<(Option<RouteDecision>, Option<Arc<crate::PipelinePool>>), Response> {
+    let Some(router) = state.routing.clone() else {
+        return Ok((None, None));
+    };
+    let decided_here = pre.is_none();
+    let outcome = match (pre, route_text) {
+        // Decided by the lookup pre-pass (before the prompt was rendered):
+        // only the lane is looked up here.
+        (Some(d), _) => {
+            tokio::task::spawn_blocking(move || {
+                let lane = router.lane(&d.target);
+                (d, lane)
+            })
+            .await
+        }
+        (None, Some((text, frame))) => {
+            tokio::task::spawn_blocking(move || {
+                // The decision, then the chosen skill's prompt contract
+                // against the frame this request generates in (PHI-1/PHI-2).
+                let d = router.decide_framed(&text, frame);
+                let lane = router.lane(&d.target);
+                (d, lane)
+            })
+            .await
+        }
+        (None, None) => return Ok((None, None)),
+    };
+    match outcome {
+        Ok((d, Ok(lane))) => {
+            if decided_here {
+                tracing::info!("{}", d.describe());
+            }
+            Ok((Some(d), lane))
+        }
+        Ok((d, Err(e))) => {
+            tracing::error!("{} — lane failed: {e}", d.describe());
+            Err(error_response(StatusCode::INTERNAL_SERVER_ERROR, e))
+        }
+        Err(join_err) => {
+            tracing::error!("routing task panicked: {join_err}");
+            Err(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "routing failed",
+            ))
+        }
+    }
+}
+
+/// The lookup mode the server runs under (`serve --lookup-mode`,
+/// `CMF_LOOKUP_MODE`; `answer` without a router).
+fn lookup_mode_of(state: &AppState) -> LookupMode {
+    state
+        .routing
+        .as_ref()
+        .map(|r| r.lookup_mode())
+        .unwrap_or_default()
+}
+
+/// `x_cortiq_route`: the decision's summary, plus the lookup fields
+/// (`lookup_hit`, `lookup_key`, `field`, `lookup_lang`, `lookup_mode`)
+/// when the request took the lookup pre-pass.
+fn route_json(
+    decision: Option<&RouteDecision>,
+    lookup: Option<&LookupOutcome>,
+    mode: LookupMode,
+) -> Option<serde_json::Value> {
+    let mut v = decision?.summary_json();
+    if let Some(o) = lookup {
+        o.annotate(&mut v, mode);
+    }
+    Some(v)
+}
+
+/// The lookup pre-pass of a routed request (spec §9.5.2): when the file
+/// carries a `lookup` record, the decision is made HERE — before the
+/// prompt is rendered — so that a hit can answer from the table (`answer`)
+/// or prepend the card to the last user message (`context`). The
+/// decision (φ) is made on `route_text` — the last user message; the key
+/// is searched in it first and then in `earlier` — the previous user
+/// turns, most recent first (the chat endpoint passes up to
+/// `lookup::MEMORY_TURNS - 1`; `/v1/completions` none): a chat that named
+/// the plant two turns ago still answers about it (`lookup_turn`). `None`
+/// = nothing to pre-decide: no router, no text to route on, no lookup
+/// record, or a V4.1 file (which never routes) — the decision then
+/// happens in [`run_generation`] as before.
+async fn lookup_prepass(
+    state: &Arc<AppState>,
+    route_text: Option<&(String, PromptFrame)>,
+    earlier: &[String],
+) -> Result<Option<(RouteDecision, LookupOutcome)>, Response> {
+    let (Some(router), Some((text, frame))) = (state.routing.clone(), route_text) else {
+        return Ok(None);
+    };
+    if !router.has_lookups() || state.runtime.model().arch().deepseek_v41.is_some() {
+        return Ok(None);
+    }
+    let (text, frame) = (text.clone(), *frame);
+    let earlier: Vec<String> = earlier.to_vec();
+    match tokio::task::spawn_blocking(move || {
+        let turns: Vec<&str> = std::iter::once(text.as_str())
+            .chain(earlier.iter().map(String::as_str))
+            .collect();
+        router.decide_lookup_turns(&turns, frame)
+    })
+    .await
+    {
+        Ok(Ok((d, o))) => {
+            tracing::info!("{}", d.describe());
+            if let Some(line) = o.describe() {
+                tracing::info!("{line}");
+            }
+            Ok(Some((d, o)))
+        }
+        Ok(Err(e)) => {
+            tracing::error!("lookup: {e}");
+            Err(error_response(StatusCode::INTERNAL_SERVER_ERROR, e))
+        }
+        Err(join_err) => {
+            tracing::error!("routing task panicked: {join_err}");
+            Err(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "routing failed",
+            ))
+        }
+    }
+}
+
+/// `context` mode: the reference card goes in front of the LAST user
+/// message (the one the request was routed on).
+fn prepend_card_to_last_user(messages: &mut [ChatMessage], card: &str) {
+    if let Some(m) = messages.iter_mut().rev().find(|m| m.role == "user") {
+        let text = m.content.as_ref().map(MessageContent::text).unwrap_or_default();
+        m.content = Some(MessageContent::Text(cortiq_engine::lookup::context_prompt(
+            card, &text,
+        )));
+    }
+}
+
+/// `answer` mode: the table's text is the assistant message — nothing is
+/// generated. Streams as the four-chunk SSE shape (role, content, usage
+/// with `x_cortiq_route`, finish) when the client asked to stream.
+async fn lookup_answer_response(
+    req: &ChatCompletionsRequest,
+    request_id: String,
+    created: u64,
+    route: Option<serde_json::Value>,
+    answer: &LookupAnswer,
+    prompt_tokens: u32,
+) -> Response {
+    if req.stream {
+        let (tx, stream) = ChatStream::new(8);
+        let _ = tx
+            .send(streaming::StreamChunk {
+                id: request_id.clone(),
+                object: "chat.completion.chunk".to_string(),
+                created,
+                model: req.model.clone(),
+                choices: vec![streaming::StreamChoice {
+                    index: 0,
+                    delta: streaming::StreamDelta {
+                        role: Some("assistant".to_string()),
+                        content: None,
+                        tool_calls: None,
+                    },
+                    finish_reason: None,
+                }],
+                usage: None,
+                x_cortiq_route: None,
+            })
+            .await;
+        let _ = tx
+            .send(streaming::token_chunk(&request_id, &req.model, &answer.text, created))
+            .await;
+        let mut usage = streaming::usage_chunk(&request_id, &req.model, created, prompt_tokens, 0);
+        usage.x_cortiq_route = route;
+        let _ = tx.send(usage).await;
+        let _ = tx
+            .send(streaming::finish_chunk(&request_id, &req.model, "stop", created))
+            .await;
+        drop(tx);
+        return stream.into_sse().into_response();
+    }
+    Json(ChatCompletionsResponse {
+        id: request_id,
+        object: "chat.completion".to_string(),
+        created,
+        model: req.model.clone(),
+        choices: vec![ChatChoice {
+            index: 0,
+            message: ChatMessage {
+                role: "assistant".to_string(),
+                content: Some(answer.text.clone().into()),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+                response_format: None,
+                task: None,
+                wo_eos: None,
+            },
+            finish_reason: "stop".to_string(),
+        }],
+        usage: Usage {
+            prompt_tokens,
+            completion_tokens: 0,
+            total_tokens: prompt_tokens,
+        },
+        cortiq: None,
+        x_cortiq_route: route,
+    })
+    .into_response()
+}
+
 /// Run one generation on the shared pipeline (blocking thread).
-/// Returns the result plus wall-clock milliseconds.
+/// Returns the result, wall-clock milliseconds and the router-v2 decision
+/// (`route_text` = the text a router-v2 file routes on: the last user
+/// message; `pre_decision` = the decision the lookup pre-pass already
+/// made, when the file carries a lookup record). Multimodal requests
+/// (V4.1 image prompts, MiMo media rows) never route.
+#[allow(clippy::too_many_arguments)]
 async fn run_generation(
     state: Arc<AppState>,
     prompt_ids: Vec<u32>,
@@ -224,22 +480,49 @@ async fn run_generation(
     mask: Option<TaskMask>,
     sampler_config: SamplerConfig,
     on_token: Option<cortiq_engine::TokenCallback>,
-) -> Result<(GenerateResult, f64), Response> {
+    route_text: Option<(String, PromptFrame)>,
+    pre_decision: Option<RouteDecision>,
+) -> Result<(GenerateResult, f64, Option<RouteDecision>), Response> {
     let started = std::time::Instant::now();
     // The organism's day side: idle marker + OOD buffer (CMF_OOD_DIR).
     crate::ood::touch_last_request();
     let ood_on = crate::ood::ood_dir().is_some();
     let ood_state = state.clone();
 
+    // Router v2: decide on the dedicated probe pipeline, then run on the
+    // chosen lane (a skill lane is a pool of pipelines loaded with the
+    // skill; the backbone lane is `slots`). No slot ever switches skills.
+    let (route_text, pre_decision) = if vl_inputs.is_none() && mimo_rows.is_none() {
+        (route_text, pre_decision)
+    } else {
+        (None, None)
+    };
+    let (decision, lane) = route_request(&state, route_text, pre_decision).await?;
+    let ood_decision = decision.clone();
+
     // Check a pipeline slot out for this generation: up to
     // `slots` requests decode concurrently, the rest queue here.
-    let mut slot = state.slots.acquire().await;
-    let remote = state.remote.clone();
+    let mut slot = match &lane {
+        Some(pool) => pool.acquire().await,
+        None => state.slots.acquire().await,
+    };
+    let remote = if lane.is_some() {
+        None
+    } else {
+        state.remote.clone()
+    };
     let outcome = tokio::task::spawn_blocking(move || {
         if ood_on {
             let text = ood_state.tokenizer.decode(&prompt_ids);
-            let p = &mut *slot.pipe;
-            crate::ood::record_if_ood(ood_state.runtime.model(), p, &prompt_ids, &text);
+            match &ood_decision {
+                // Decided already: no second φ prefill on this slot.
+                Some(d) => crate::ood::record_decision(d, &prompt_ids, &text),
+                None if ood_state.routing.is_some() => {}
+                None => {
+                    let p = &mut *slot.pipe;
+                    crate::ood::record_if_ood(ood_state.runtime.model(), p, &prompt_ids, &text);
+                }
+            }
         }
         // Replica mode: the compute happens HERE, on a blocking-pool
         // thread that never saw the pin `acquire` set on the async
@@ -301,7 +584,7 @@ async fn run_generation(
 
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
     match outcome {
-        Ok(Ok(result)) => Ok((result, elapsed_ms)),
+        Ok(Ok(result)) => Ok((result, elapsed_ms, decision)),
         Ok(Err(e)) => Err(error_response(StatusCode::BAD_REQUEST, e)),
         Err(join_err) => {
             tracing::error!("generation task panicked: {join_err}");
@@ -321,6 +604,7 @@ async fn run_classification(
     prompt_ids: Vec<u32>,
     mask: Option<TaskMask>,
     labels: Vec<(String, u32)>,
+    decision_threshold: Option<f32>,
 ) -> Result<(ClassTokenClassification, f64), Response> {
     if state.remote.is_some() {
         return Err(error_response(
@@ -336,20 +620,40 @@ async fn run_classification(
         let selected: Vec<f32> = labels.iter().map(|(_, id)| logits[*id as usize]).collect();
         let max = selected.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let denom: f32 = selected.iter().map(|value| (*value - max).exp()).sum();
+        let probabilities: Vec<f32> = selected
+            .iter()
+            .map(|logit| (*logit - max).exp() / denom)
+            .collect();
+        let chosen_index = if let Some(threshold) = decision_threshold.filter(|_| labels.len() == 2)
+        {
+            if probabilities[1] >= threshold { 1 } else { 0 }
+        } else {
+            probabilities
+                .iter()
+                .enumerate()
+                .max_by(|(_, left), (_, right)| left.total_cmp(right))
+                .map(|(index, _)| index)
+                .unwrap_or(0)
+        };
+        let chosen_label = labels[chosen_index].0.clone();
+        let chosen_confidence = probabilities[chosen_index];
         let mut scores: Vec<ClassTokenScore> = labels
             .into_iter()
             .zip(selected)
-            .map(|((token, token_id), logit)| ClassTokenScore {
-                token,
-                token_id,
-                logit,
-                probability: (logit - max).exp() / denom,
-            })
+            .zip(probabilities)
+            .map(
+                |(((token, token_id), logit), probability)| ClassTokenScore {
+                    token,
+                    token_id,
+                    logit,
+                    probability,
+                },
+            )
             .collect();
         scores.sort_by(|left, right| right.probability.total_cmp(&left.probability));
         ClassTokenClassification {
-            label: scores[0].token.clone(),
-            confidence: scores[0].probability,
+            label: chosen_label,
+            confidence: chosen_confidence,
             scores,
         }
     })
@@ -680,6 +984,10 @@ struct ChatCompletionsResponse {
     usage: Usage,
     #[serde(skip_serializing_if = "Option::is_none")]
     cortiq: Option<CortiqResponseMeta>,
+    /// Router-v2 decision (`{target, novelty, e_base, e_skill, reason}`);
+    /// present only when the file declares a router policy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    x_cortiq_route: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -724,6 +1032,60 @@ async fn chat_completions(
     if req.thinking() == Some(false) {
         let think_tokens = state.tokenizer.encode("<think>");
         sampler_config.suppress_tokens.extend(think_tokens);
+    }
+
+    // Router v2 routes a chat on its LAST user message; the lane generates
+    // in the tokenizer's chat frame (its template, or the ChatML fallback).
+    // The earlier user turns (up to MEMORY_TURNS in all) feed only the
+    // lookup pre-pass's conversation memory.
+    let chat_frame = cortiq_engine::router::chat_frame(&state.tokenizer);
+    let user_turns: Vec<String> = match state.routing.as_ref() {
+        Some(_) => crate::route::recent_user_texts(
+            req.messages.iter().map(|m| {
+                (
+                    m.role.as_str(),
+                    m.content
+                        .as_ref()
+                        .map(MessageContent::text)
+                        .unwrap_or_default(),
+                )
+            }),
+            cortiq_engine::lookup::MEMORY_TURNS,
+        ),
+        None => Vec::new(),
+    };
+    let route_text = user_turns.first().map(|t| (t.clone(), chat_frame));
+    let request_id = format!("cmf-{}", uuid::Uuid::new_v4());
+    let created = chrono::Utc::now().timestamp() as u64;
+    // The lookup pre-pass (spec §9.5.2): on a file with a lookup record the
+    // decision is made BEFORE the prompt is rendered. A hit answers from
+    // the table (`answer`) or prepends the card to the last user message
+    // (`context`); no key, `off`, or another target — the request goes on
+    // as decided and nothing else changes.
+    let lookup_mode = lookup_mode_of(&state);
+    let mut req = req;
+    let mut pre_decision: Option<RouteDecision> = None;
+    let mut lookup_outcome: Option<LookupOutcome> = None;
+    match lookup_prepass(&state, route_text.as_ref(), user_turns.get(1..).unwrap_or(&[])).await {
+        Err(resp) => return resp,
+        Ok(None) => {}
+        Ok(Some((d, outcome))) => {
+            match &outcome {
+                LookupOutcome::Answer(a) => {
+                    let prompt_tokens = route_text
+                        .as_ref()
+                        .map(|(t, _)| state.tokenizer.encode(t).len() as u32)
+                        .unwrap_or(0);
+                    let route = route_json(Some(&d), Some(&outcome), lookup_mode);
+                    return lookup_answer_response(&req, request_id, created, route, a, prompt_tokens)
+                        .await;
+                }
+                LookupOutcome::Context(a) => prepend_card_to_last_user(&mut req.messages, &a.card),
+                _ => {}
+            }
+            pre_decision = Some(d);
+            lookup_outcome = Some(outcome);
+        }
     }
 
     let mut mimo_rows = None;
@@ -894,8 +1256,6 @@ async fn chat_completions(
     });
     let dsv41 = vl_inputs.is_some();
 
-    let request_id = format!("cmf-{}", uuid::Uuid::new_v4());
-    let created = chrono::Utc::now().timestamp() as u64;
     let max_tokens = req.max_tokens as usize;
     let dsv41_thinking = dsv41
         && req.thinking() != Some(false)
@@ -939,11 +1299,18 @@ async fn chat_completions(
             labels.push((token, ids[0]));
         }
         let prompt_tokens = prompt_ids.len() as u32;
-        let (classification, elapsed_ms) =
-            match run_classification(state.clone(), prompt_ids, request_mask, labels).await {
-                Ok(result) => result,
-                Err(response) => return response,
-            };
+        let (classification, elapsed_ms) = match run_classification(
+            state.clone(),
+            prompt_ids,
+            request_mask,
+            labels,
+            model_decision_threshold(&state),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(response) => return response,
+        };
         let status = state.runtime.status().await;
         let task_mask = state.runtime.masks().get(&task_used);
         return Json(ChatCompletionsResponse {
@@ -981,6 +1348,7 @@ async fn chat_completions(
                 tokens_per_second: prompt_tokens as f64 / (elapsed_ms / 1000.0).max(1e-9),
                 classification: Some(classification),
             }),
+            x_cortiq_route: None,
         })
         .into_response();
     }
@@ -1018,6 +1386,7 @@ async fn chat_completions(
                         finish_reason: None,
                     }],
                     usage: None,
+                    x_cortiq_route: None,
                 })
                 .await;
 
@@ -1089,11 +1458,13 @@ async fn chat_completions(
                 request_mask,
                 sampler_config,
                 Some(callback),
+                route_text,
+                pre_decision,
             )
             .await;
 
             match outcome {
-                Ok((result, elapsed_ms)) => {
+                Ok((result, elapsed_ms, decision)) => {
                     // End-of-generation flush of the think filter, by the
                     // filter's own rules: a buffer that never opened a
                     // <think> block IS the answer; a closed block ships
@@ -1167,15 +1538,16 @@ async fn chat_completions(
                         "tool_calls".to_string()
                     };
                     // exact counts ahead of the finish chunk (OpenAI include_usage shape)
-                    let _ = tx
-                        .send(streaming::usage_chunk(
-                            &id,
-                            &model,
-                            created,
-                            result.prompt_tokens as u32,
-                            result.tokens_generated as u32,
-                        ))
-                        .await;
+                    let mut usage = streaming::usage_chunk(
+                        &id,
+                        &model,
+                        created,
+                        result.prompt_tokens as u32,
+                        result.tokens_generated as u32,
+                    );
+                    usage.x_cortiq_route =
+                        route_json(decision.as_ref(), lookup_outcome.as_ref(), lookup_mode);
+                    let _ = tx.send(usage).await;
                     let _ = tx
                         .send(streaming::finish_chunk(&id, &model, &finish, created))
                         .await;
@@ -1190,7 +1562,7 @@ async fn chat_completions(
 
         stream.into_sse().into_response()
     } else {
-        let (result, elapsed_ms) = match run_generation(
+        let (result, elapsed_ms, decision) = match run_generation(
             state.clone(),
             prompt_ids,
             vl_inputs,
@@ -1199,6 +1571,8 @@ async fn chat_completions(
             request_mask,
             sampler_config,
             None,
+            route_text,
+            pre_decision,
         )
         .await
         {
@@ -1282,6 +1656,7 @@ async fn chat_completions(
                 total_tokens: (result.prompt_tokens + result.tokens_generated) as u32,
             },
             cortiq: cortiq_meta,
+            x_cortiq_route: route_json(decision.as_ref(), lookup_outcome.as_ref(), lookup_mode),
         })
         .into_response()
     }
@@ -1417,6 +1792,8 @@ struct CompletionsResponse {
     model: String,
     choices: Vec<CompletionChoice>,
     usage: Usage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    x_cortiq_route: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -1430,8 +1807,6 @@ async fn completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CompletionsRequest>,
 ) -> Response {
-    let prompt_ids = state.tokenizer.encode(&req.prompt);
-
     let sampler_config = match request_sampler(SamplerOptions {
         temperature: req.temperature,
         repetition_penalty: req.repetition_penalty,
@@ -1442,8 +1817,69 @@ async fn completions(
         Err(response) => return response,
     };
     let (_, request_mask) = state.runtime.active_selection().await;
+    // Router v2 on /v1/completions: only a prompt that is exactly one
+    // cmf-im-v1 user turn routes (on that turn's text; the lane generates
+    // from the very same prompt, whose frame is the skill's contract).
+    // Raw text or a client-rendered transcript runs the backbone — no φ
+    // over a whole history on every turn, no skill outside its contract
+    // (R5/PHI-2).
+    let route_text = state.routing.as_ref().and_then(|_| {
+        crate::route::completions_route_text(&req.prompt).map(|q| (q, PromptFrame::CmfImV1))
+    });
+    let not_routed = (state.routing.is_some() && route_text.is_none()).then(|| {
+        RouteDecision::forced(
+            cortiq_engine::router::RouteTarget::Backbone,
+            crate::route::COMPLETIONS_NO_USER_TURN,
+        )
+    });
+    // The lookup pre-pass (see chat_completions): a hit answers from the
+    // table, or the user turn is re-rendered with the card prepended.
+    let lookup_mode = lookup_mode_of(&state);
+    let mut prompt = req.prompt.clone();
+    let mut pre_decision: Option<RouteDecision> = None;
+    let mut lookup_outcome: Option<LookupOutcome> = None;
+    match lookup_prepass(&state, route_text.as_ref(), &[]).await {
+        Err(resp) => return resp,
+        Ok(None) => {}
+        Ok(Some((d, outcome))) => {
+            match &outcome {
+                LookupOutcome::Answer(a) => {
+                    let prompt_tokens = state.tokenizer.encode(&req.prompt).len() as u32;
+                    return Json(CompletionsResponse {
+                        id: format!("cmf-{}", uuid::Uuid::new_v4()),
+                        object: "text_completion".to_string(),
+                        created: chrono::Utc::now().timestamp() as u64,
+                        model: req.model,
+                        choices: vec![CompletionChoice {
+                            text: a.text.clone(),
+                            index: 0,
+                            finish_reason: "stop".to_string(),
+                        }],
+                        usage: Usage {
+                            prompt_tokens,
+                            completion_tokens: 0,
+                            total_tokens: prompt_tokens,
+                        },
+                        x_cortiq_route: route_json(Some(&d), Some(&outcome), lookup_mode),
+                    })
+                    .into_response();
+                }
+                LookupOutcome::Context(a) => {
+                    if let Some((q, _)) = &route_text {
+                        prompt = cortiq_engine::router::render_cmf_im_v1(
+                            &cortiq_engine::lookup::context_prompt(&a.card, q),
+                        );
+                    }
+                }
+                _ => {}
+            }
+            pre_decision = Some(d);
+            lookup_outcome = Some(outcome);
+        }
+    }
+    let prompt_ids = state.tokenizer.encode(&prompt);
 
-    let (result, elapsed_ms) = match run_generation(
+    let (result, elapsed_ms, decision) = match run_generation(
         state.clone(),
         prompt_ids,
         None,
@@ -1452,12 +1888,18 @@ async fn completions(
         request_mask,
         sampler_config,
         None,
+        route_text,
+        pre_decision,
     )
     .await
     {
         Ok(r) => r,
         Err(resp) => return resp,
     };
+    if let Some(d) = &not_routed {
+        tracing::info!("{}", d.describe());
+    }
+    let decision = decision.or(not_routed);
 
     state
         .runtime
@@ -1479,6 +1921,7 @@ async fn completions(
             completion_tokens: result.tokens_generated as u32,
             total_tokens: (result.prompt_tokens + result.tokens_generated) as u32,
         },
+        x_cortiq_route: route_json(decision.as_ref(), lookup_outcome.as_ref(), lookup_mode),
     })
     .into_response()
 }

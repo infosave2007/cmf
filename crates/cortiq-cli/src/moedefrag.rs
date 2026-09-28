@@ -43,6 +43,7 @@ fn router_layer(name: &str) -> Option<usize> {
 /// (write_ref), so a 19 GB file compacts without RAM spikes.
 pub fn cmd_compact(model_path: &str, output: &str) -> anyhow::Result<()> {
     let model = Arc::new(CmfModel::open_sharded(model_path)?);
+    crate::knowledge::refuse_genome_rewrite(&model, "compact")?;
     let specs: Vec<TensorSpecRef> = model
         .tensors
         .iter()
@@ -85,6 +86,7 @@ pub fn cmd_moe_mask(
         bail!("--cover must be in (0, 1]");
     }
     let model = Arc::new(CmfModel::open_sharded(model_path)?);
+    crate::knowledge::refuse_genome_rewrite(&model, "moe-mask")?;
     let arch = model.arch().clone();
     let Some(moe) = arch.moe.as_ref() else {
         bail!("{model_path}: not a MoE model (no arch.moe block)");
@@ -191,6 +193,7 @@ pub fn cmd_moe_defrag(
         bail!("--cover must be in (0, 1]");
     }
     let model = Arc::new(CmfModel::open_sharded(model_path)?);
+    crate::knowledge::refuse_genome_rewrite(&model, "moe-defrag")?;
     // Stats: an explicit CMF_MOE_STATS dump, or — for re-defragging an
     // already-cut specialist tighter — the routing counts embedded in
     // the source file's provenance by a previous moe-defrag.

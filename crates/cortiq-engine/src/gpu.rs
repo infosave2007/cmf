@@ -15,6 +15,155 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
+/// Packed, f32-only Embryo model consumed by the resident Vulkan graph.
+///
+/// This is deliberately a separate representation from `CmfModel`: the
+/// Embryo graph owns one contiguous device copy and never dereferences the
+/// mmap or asks the ordinary per-op residency path for a tensor.  `meta`
+/// contains byte-free element offsets into `weights`; `UINT_MAX` marks an
+/// absent optional matrix.  The builder lives in `pipeline.rs`, where the
+/// architecture-specific weight types are visible.
+pub struct EmbryoGraphModel {
+    pub id: u64,
+    pub hidden: usize,
+    pub intermediate: usize,
+    pub vocab: usize,
+    pub layers: usize,
+    pub phase_heads: usize,
+    pub nphase: usize,
+    pub phase_dv: usize,
+    pub anchor_q_heads: usize,
+    pub anchor_kv_heads: usize,
+    pub anchor_head_dim: usize,
+    pub rotary_dim: usize,
+    pub max_seq: usize,
+    pub cluster_count: usize,
+    pub cluster_size: usize,
+    pub phase_state_len: usize,
+    pub state_stride: usize,
+    pub kv_stride: usize,
+    pub norm_gemma: bool,
+    pub phase_mass: f32,
+    pub weights: Vec<f32>,
+    pub meta: Vec<u32>,
+    pub lm_head: Vec<f32>,
+    pub clusters: Vec<f32>,
+    pub final_norm: Vec<f32>,
+    pub inv_freq: Vec<f32>,
+    /// Natively bounded anchors (`swa_sink_v1`): every anchor layer owns a
+    /// ring of `anchor_window` raw keys/values instead of a `max_seq` KV
+    /// plane, so `kv_stride` is the ring size, `kv_layers` counts the
+    /// anchors, and no position cap applies (the operator has none).
+    pub bounded: bool,
+    /// Layers that own a KV/ring slot of `kv_stride` f32 (all layers for
+    /// the legacy full anchor — offsets are `layer·kv_stride` — or the
+    /// bounded anchors only).
+    pub kv_layers: usize,
+    /// Recurrent (phase or GDN) layers — the state buffer holds one
+    /// `state_stride` per such layer; anchors own none.
+    pub state_layers: usize,
+    pub anchor_window: usize,
+    pub anchor_sink: usize,
+    /// vmf_phase mixer layers (kind 0/1) in the stack.
+    pub phase_layers: usize,
+    /// GatedDeltaNet mixer layers (kind 4) in the stack; their geometry
+    /// is `gdn_heads` (nv), `gdn_k_heads` (nk), `gdn_dk`, `gdn_dv`,
+    /// `gdn_kk` (conv taps) — header words 24..29 of `meta`.
+    pub gdn_layers: usize,
+    pub gdn_heads: usize,
+    pub gdn_k_heads: usize,
+    pub gdn_dk: usize,
+    pub gdn_dv: usize,
+    pub gdn_kk: usize,
+}
+
+impl EmbryoGraphModel {
+    /// Fused q/k/v projection width of the GDN mixer (`2·nk·dk + nv·dv`).
+    pub fn gdn_c_dim(&self) -> usize {
+        2 * self.gdn_k_heads * self.gdn_dk + self.gdn_heads * self.gdn_dv
+    }
+}
+
+/// Words in the resident graph's `meta` header before the per-layer
+/// records (64 words each). Shared by the host packer and the encoder.
+pub const EMBRYO_META_HEADER: usize = 32;
+
+/// Positions one chunked-prefill submit of the resident Embryo graph
+/// covers (the shader's `CMAX`; the chunk window of the scratch buffer is
+/// sized by it).
+pub const EMBRYO_CHUNK_MAX: usize = 64;
+
+/// `n` contiguous prompt positions (`rows` = n × hidden embeddings from
+/// `position`) through the resident Embryo graph in one submit; logits of
+/// the last position. False = refused before any device work (the caller
+/// keeps the per-position path), or the sequence went cold.
+pub fn forward_embryo_graph_chunk(
+    model: &Arc<EmbryoGraphModel>,
+    kv_id: u64,
+    rows: &[f32],
+    position: usize,
+    n: usize,
+    logits: &mut Vec<f32>,
+) -> bool {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::forward_embryo_graph_chunk(model, kv_id, rows, position, n, logits);
+    }
+    let _ = (model, kv_id, rows, position, n, logits);
+    false
+}
+
+/// Bytes the resident Embryo graph holds on the device for a sequence:
+/// `(recurrent state, anchor KV/ring)`. None when the sequence has no
+/// device image (host path, or not started yet). This is the measured
+/// long-context claim of the resident path — a bounded genome reports
+/// the same two numbers at every context depth.
+pub fn embryo_device_state_bytes(kv_id: u64) -> Option<(u64, u64)> {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::embryo_device_state_bytes(kv_id);
+    }
+    let _ = kv_id;
+    None
+}
+
+/// Does this directory entry count as WEIGHT in the device placement
+/// heuristics (layer prefix, live-weight budget, `serve` replicas vs
+/// split)? On a genome file only the trunk does: skill tensors replace
+/// trunk tensors of the same shape inside their own lane, so counting
+/// them would give the backbone of F1 another GPU prefix than F0's
+/// (NF-7). Other files keep the historical whole-directory count.
+pub fn counts_as_placement_weight(model: &CmfModel, name: &str) -> bool {
+    model.header.genome.is_none() || cortiq_core::knowledge::is_trunk_tensor(name)
+}
+
+/// Weight bytes the placement heuristics budget for `model`: the trunk's
+/// payload on a genome file ([`counts_as_placement_weight`]), the whole
+/// mapped file otherwise (the historical measure).
+pub fn placement_weight_bytes(model: &CmfModel) -> u64 {
+    if model.header.genome.is_none() {
+        return model.primary_bytes().len() as u64;
+    }
+    model
+        .tensors
+        .iter()
+        .filter(|t| counts_as_placement_weight(model, &t.name))
+        .map(|t| t.nbytes)
+        .sum()
+}
+
+/// Next position of the resident Embryo sequence `kv_id` (`Some(n)` = the
+/// device holds positions `0..n` of it), `None` when the device holds no
+/// initialized image of that sequence — the host owns it (or none began).
+pub fn embryo_device_next_position(kv_id: u64) -> Option<usize> {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::embryo_device_next_position(kv_id);
+    }
+    let _ = kv_id;
+    None
+}
+
 thread_local! {
     /// Index of the current forward layer (−1 = outside a numbered layer:
     /// lm_head/embed — always allowed). The pipeline sets it before
@@ -1662,6 +1811,25 @@ pub fn forward_token_graph(
     }
 }
 
+/// Whole-token resident graph for the Embryo working model.  Unlike the
+/// generic graph this path accepts a packed f32 model and keeps both phase
+/// recurrent state and the anchor KV cache on the device.  `false` is an
+/// honest capability refusal; callers must retain the CPU executor.
+pub fn forward_embryo_graph(
+    model: &Arc<EmbryoGraphModel>,
+    kv_id: u64,
+    hidden: &[f32],
+    position: usize,
+    logits: &mut Vec<f32>,
+) -> bool {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::forward_embryo_graph(model, kv_id, hidden, position, logits);
+    }
+    let _ = (model, kv_id, hidden, position, logits);
+    false
+}
+
 /// Speculative-verify tail for the batched graph: fold final-norm + lm_head
 /// over every batch position and read all k logit rows back; the batch also
 /// snapshots the GDN state per position for `gdn_spec_restore`.
@@ -1908,6 +2076,7 @@ pub fn graph_kv_reset(_kv_id: u64) {
     #[cfg(feature = "gpu")]
     if backend() == Backend::Wgpu {
         crate::gpu_wgpu::kv_mirror_reset(_kv_id);
+        crate::gpu_wgpu::embryo_graph_reset(_kv_id);
     }
 }
 
@@ -3241,36 +3410,24 @@ static GRAPH_N: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
 /// Steady per-token samples per arm before the race decides.
 const GRAPH_RACE_SAMPLES: u32 = 4;
 
+// A graph that cannot be built for THIS model will never build: the
+// refusal is a property of the weights, not of the moment. Retrying it
+// per token is not free — the builder walks every layer and asks each
+// tensor for a graph view before giving up at layer 0 — and on an
+// Adreno 642L that retry cost 3x: forcing the graph on a model it
+// refuses measured 0.3 tok/s against 0.905 for the per-op path it falls
+// back to. Remembered once, the fallback runs at its own speed.
+//
+// The verdict is kept PER PIPELINE (`Pipeline::graph_refused` /
+// `mark_graph_refused`), not in a process-wide flag: several pipelines
+// of one file share a process in `serve` (backbone slots + skill lanes
+// loaded mid-traffic), and a refusal in one lane — or the reset a new
+// lane used to issue — must not move another lane's running sequence
+// between the device and the host (R4/NF-2). Callers must NOT report
+// transient refusals (an unsealed o1 state during prefill, a softcap).
+
 /// Called at every generation start (fresh KV). Applies a pending
 /// verdict and picks this generation's arm while racing.
-/// A graph that cannot be built for THIS model will never build: the
-/// refusal is a property of the weights, not of the moment. Retrying it
-/// per token is not free — the builder walks every layer and asks each
-/// tensor for a graph view before giving up at layer 0 — and on an
-/// Adreno 642L that retry cost 3x: forcing the graph on a model it
-/// refuses measured 0.3 tok/s against 0.905 for the per-op path it falls
-/// back to. Remembered once, the fallback runs at its own speed.
-static GRAPH_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
-
-/// The builder refused for a STRUCTURAL reason — an unsupported weight
-/// or layer kind. Callers must NOT report the transient refusals (an
-/// unsealed o1 state during prefill, a softcap): those clear on their
-/// own and marking them would disable the graph for good.
-pub fn graph_mark_unsupported() {
-    if !GRAPH_UNSUPPORTED.swap(true, Ordering::Relaxed) {
-        tracing::info!("wgpu token graph: unsupported for this model — not retrying");
-    }
-}
-
-pub fn graph_unsupported() -> bool {
-    GRAPH_UNSUPPORTED.load(Ordering::Relaxed)
-}
-
-/// A different model in the same process starts with a clean slate.
-pub fn graph_unsupported_reset() {
-    GRAPH_UNSUPPORTED.store(false, Ordering::Relaxed);
-}
-
 pub fn graph_race_begin_generation() {
     // One generation has now compiled whatever this model needs; keep it
     // for the next process. Once per run: the blob does not grow after

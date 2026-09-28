@@ -3708,6 +3708,10 @@ pub fn write_mimo_mtp_sidecar(
         shard: None,
         calibration: None,
         routing: None,
+        genome: None,
+        lineage: Vec::new(),
+        router: None,
+        segments: Vec::new(),
     };
     if let Some(dir) = out.parent() {
         if !dir.as_os_str().is_empty() {
@@ -3896,6 +3900,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
             num_heads: lnv.unwrap_or(0),
             nphase: None,
             value_head_dim: lvd.unwrap_or(0),
+            phase_delta_layers: None,
         })
     } else {
         None
@@ -4450,6 +4455,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         // sub-configs and quantization policy. V4.1 runtime initialization
         // consumes this verbatim for multimodal and Engram geometry.
         deepseek_v41: is_dsv41.then(|| config.clone()),
+        anchor_core: None,
         linear_core,
         head_clusters: None,
         max_position_embeddings: max_pos,
@@ -7230,6 +7236,10 @@ pub fn run_convert_multi_towers(
             shard: None,
             calibration: None,
             routing: None,
+            genome: None,
+            lineage: Vec::new(),
+            router: None,
+            segments: Vec::new(),
         }
     };
 

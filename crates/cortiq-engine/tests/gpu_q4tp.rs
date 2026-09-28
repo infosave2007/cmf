@@ -95,6 +95,10 @@ fn tiny_model(
         shard: None,
         calibration: None,
         routing: None,
+        genome: None,
+        lineage: Vec::new(),
+        router: None,
+        segments: Vec::new(),
     };
     let spec = TensorSpec {
         name: "w".into(),
@@ -333,6 +337,10 @@ fn two_tensor_model(
         shard: None,
         calibration: None,
         routing: None,
+        genome: None,
+        lineage: Vec::new(),
+        router: None,
+        segments: Vec::new(),
     };
     let t = |name: &str, data: &[u8]| TensorSpec {
         name: name.into(),

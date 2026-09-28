@@ -100,6 +100,7 @@ pub fn cmd_awnp(
         bail!("--drop must be in [0, 0.9)");
     }
     let model = Arc::new(CmfModel::open_sharded(model_path)?);
+    crate::knowledge::refuse_genome_rewrite(&model, "awnp")?;
 
     // Group expert tensors by layer: only gate/up read the residual stream on
     // their input side, so only those two get projected. down_proj's input is
