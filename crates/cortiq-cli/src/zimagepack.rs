@@ -70,7 +70,7 @@ pub(crate) fn parse_codec(s: &str) -> anyhow::Result<Codec> {
     })
 }
 
-fn codec_name(c: Codec) -> String {
+pub(crate) fn codec_name(c: Codec) -> String {
     match c {
         Codec::Raw => "raw".into(),
         Codec::F32 => "f32".into(),
@@ -80,15 +80,15 @@ fn codec_name(c: Codec) -> String {
     }
 }
 
-struct StTensor {
-    name: String,
-    dtype: String,
-    shape: Vec<usize>,
-    range: std::ops::Range<usize>,
+pub(crate) struct StTensor {
+    pub(crate) name: String,
+    pub(crate) dtype: String,
+    pub(crate) shape: Vec<usize>,
+    pub(crate) range: std::ops::Range<usize>,
 }
 
 /// Parse one safetensors header (local file) → tensors in file order.
-fn st_header(path: &Path) -> anyhow::Result<(Vec<StTensor>, usize)> {
+pub(crate) fn st_header(path: &Path) -> anyhow::Result<(Vec<StTensor>, usize)> {
     let mut f = std::fs::File::open(path).with_context(|| path.display().to_string())?;
     let size = f.metadata()?.len() as usize;
     let mut pre = [0u8; 8];
@@ -137,7 +137,7 @@ fn st_header(path: &Path) -> anyhow::Result<(Vec<StTensor>, usize)> {
     Ok((out, size))
 }
 
-fn shard_files(dir: &Path, index: &str, single: &str) -> anyhow::Result<Vec<PathBuf>> {
+pub(crate) fn shard_files(dir: &Path, index: &str, single: &str) -> anyhow::Result<Vec<PathBuf>> {
     let ip = dir.join(index);
     if ip.exists() {
         let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&ip)?)?;
@@ -155,7 +155,7 @@ fn shard_files(dir: &Path, index: &str, single: &str) -> anyhow::Result<Vec<Path
     }
 }
 
-fn sha256_file(path: &Path) -> anyhow::Result<String> {
+pub(crate) fn sha256_file(path: &Path) -> anyhow::Result<String> {
     let mut f = std::fs::File::open(path)?;
     let mut h = sha2::Sha256::new();
     let mut buf = vec![0u8; 16 << 20];
@@ -174,7 +174,7 @@ fn f32_bytes(v: &[f32]) -> Vec<u8> {
 }
 
 /// Encode one source tensor to (dtype, bytes) under `codec`.
-fn encode(t: &StTensor, raw: &[u8], codec: Codec) -> anyhow::Result<(TensorDtype, Vec<u8>)> {
+pub(crate) fn encode(t: &StTensor, raw: &[u8], codec: Codec) -> anyhow::Result<(TensorDtype, Vec<u8>)> {
     let src_dtype = match t.dtype.as_str() {
         "F32" => TensorDtype::F32,
         "F16" => TensorDtype::F16,
