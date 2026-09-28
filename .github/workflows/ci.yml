@@ -31,7 +31,7 @@ jobs:
       - name: Build
         run: cargo build --locked --workspace --verbose
       - name: Test
-        run: cargo test --locked --workspace --verbose
+        run: cargo test --locked --workspace --no-fail-fast --verbose
 
   clippy:
     name: clippy

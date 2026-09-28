@@ -248,6 +248,7 @@ fn subspace_update_keeps_training_sane() {
 }
 
 #[test]
+#[ignore = "requires an Apple Silicon Metal device"]
 fn phase_delta_layer3_full_model_train_step_benchmark() {
     // This is intentionally a direct model smoke (no corpus/teacher birth):
     // control and candidate are allocated, measured, and dropped
@@ -365,6 +366,7 @@ fn selected_layer_scan_matches_all_layer_scan_on_single_hybrid() {
 }
 
 #[test]
+#[ignore = "requires an Apple Silicon Metal device"]
 fn phase_delta_disabled_model_is_bit_identical_and_keeps_dummy_scratch() {
     let Some(_) = ctx() else { return };
     let cfg = EmbryoCfg::tiny();
