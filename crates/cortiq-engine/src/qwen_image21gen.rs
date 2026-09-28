@@ -32,6 +32,7 @@
 //! `CMF_QI21_LATENT_IN=<raw f32 tokens>` (decode this latent instead);
 //! `CMF_QI21_COND_LAT=<raw f32 [h·w, 64]>` (the condition latent instead of
 //! the VAE encoder; one image);
+//! `CMF_QI21_TE_DEV=all|q,k,…` (text-encoder projections on the device GEMM);
 //! `CMF_QI21_FORCE=<dir>` (teacher forcing: step i ≥ 1 starts from
 //! `<dir>/lat_i.f32` when it exists — the per-step error of one denoiser
 //! call, without the trajectory's accumulation).
@@ -315,7 +316,12 @@ fn encode_prompt(
         .first()
         .ok_or("tokenizer has no <|image_pad|>")?;
     let drop = drop_idx(tok, system);
-    let enc = crate::qwen3te::Qwen3Encoder::from_cmf(model)?;
+    let mut enc = crate::qwen3te::Qwen3Encoder::from_cmf(model)?;
+    // `CMF_QI21_TE_DEV=all|q,k,…`: those projections through the device GEMM
+    if let Ok(spec) = std::env::var("CMF_QI21_TE_DEV") {
+        enc.set_device_ops(&spec);
+    }
+    let t_enc = Instant::now();
     let hs = enc.out_hidden();
     let hidden = if conds.is_empty() {
         enc.encode(&ids)
@@ -344,7 +350,11 @@ fn encode_prompt(
                 }
             }
             let (patches, gh, gw) = crate::qwen3vis::preprocess(&rgb, c.h, c.w, 16, 2, 2);
+            let tv = Instant::now();
             let (merged, ds) = vis.forward(&patches, gh, gw);
+            if prof_on() {
+                eprintln!("qi21: vision tower {}x{} patches {:.2}s", gh, gw, tv.elapsed().as_secs_f64());
+            }
             let n = gh * gw / 4;
             spans.push(crate::qwen3te::ImageSpan {
                 start: out_ids.len(),
@@ -363,8 +373,16 @@ fn encode_prompt(
             }
         }
         ids = out_ids;
-        enc.encode_with_images(&ids, &spans, &embeds, &deep)
+        let tl = Instant::now();
+        let h = enc.encode_with_images(&ids, &spans, &embeds, &deep);
+        if prof_on() {
+            eprintln!("qi21: language model {} tokens {:.2}s", ids.len(), tl.elapsed().as_secs_f64());
+        }
+        h
     };
+    if prof_on() {
+        eprintln!("qi21: prompt encode {} tokens {:.2}s", ids.len(), t_enc.elapsed().as_secs_f64());
+    }
     if ids.len() <= drop {
         return Err("the prompt encodes to nothing past the system message".into());
     }
