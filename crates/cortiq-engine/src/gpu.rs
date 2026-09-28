@@ -3959,14 +3959,80 @@ pub fn qi21_release_key(key: u64) {
     crate::gpu_wgpu::qi21::release_key(key);
 }
 
-/// Drop the denoiser's device state (see `qi21_release_key`).
+/// Drop the denoiser's device state (see `qi21_release_key`), and the
+/// resident VAE decoder's weights.
 pub fn qi21_release() {
     #[cfg(target_os = "macos")]
     if matches!(backend(), Backend::Metal) {
         crate::gpu_metal::qi21::release();
     }
     #[cfg(feature = "gpu")]
-    crate::gpu_wgpu::qi21::release();
+    {
+        crate::gpu_wgpu::qi21::release();
+        crate::gpu_wgpu::qi21_vae::release();
+    }
+}
+
+/// One conv of the Qwen-Image-2.1 VAE decoder: host f32 weights
+/// `[co][ci][k][k]` and bias `[co]` (k = 1 or 3, stride 1, same padding).
+#[derive(Clone, Copy)]
+pub struct Qi21VaeConvRef<'a> {
+    pub w: &'a [f32],
+    pub b: &'a [f32],
+    pub ci: usize,
+    pub co: usize,
+    pub k: usize,
+}
+
+/// A residual block: `conv2(φ(conv1(φ(x)))) + x` (through the 1×1
+/// shortcut when ci ≠ co), φ = RMS_norm over channels (x/‖x‖·√C·γ), SiLU.
+pub struct Qi21VaeResRef<'a> {
+    pub g1: &'a [f32],
+    pub c1: Qi21VaeConvRef<'a>,
+    pub g2: &'a [f32],
+    pub c2: Qi21VaeConvRef<'a>,
+    pub shortcut: Option<Qi21VaeConvRef<'a>>,
+}
+
+/// An up block: its resnets, then (all but the last block) nearest-2× +
+/// the 3×3 conv, plus the DupUp shortcut of the block's input (`in_dim` →
+/// `out_dim` channels, temporal factor `ft`).
+pub struct Qi21VaeUpRef<'a> {
+    pub resnets: Vec<Qi21VaeResRef<'a>>,
+    pub up: Option<(Qi21VaeConvRef<'a>, usize)>,
+    pub in_dim: usize,
+    pub out_dim: usize,
+}
+
+/// The Qwen-Image-2.1 VAE decoder (`qwen_image21_vae.rs`) for a resident
+/// device decode.
+pub struct Qi21VaeDecodeArgs<'a> {
+    /// Identity of the weights: a backend caches its planes by it.
+    pub key: u64,
+    pub post_quant: Qi21VaeConvRef<'a>,
+    pub conv_in: Qi21VaeConvRef<'a>,
+    pub mid_res: [Qi21VaeResRef<'a>; 2],
+    /// The mid attention: RMS_norm γ, `to_qkv` (1×1, 3c outputs: q, k, v),
+    /// `proj` (1×1); single head, residual.
+    pub attn_gamma: &'a [f32],
+    pub attn_qkv: Qi21VaeConvRef<'a>,
+    pub attn_proj: Qi21VaeConvRef<'a>,
+    pub ups: Vec<Qi21VaeUpRef<'a>>,
+    pub norm_out: &'a [f32],
+    pub conv_out: Qi21VaeConvRef<'a>,
+}
+
+/// Resident VAE decode: `z` = raw latent planes `[z_dim, h·w]` → `out`
+/// `[out_channels, 16h·16w]` (before the clamp). `false` = not handled,
+/// `out` untouched: the per-conv path runs.
+#[allow(unused_variables)]
+pub fn qi21_vae_decode(a: &Qi21VaeDecodeArgs, z: &[f32], h: usize, w: usize, out: &mut [f32]) -> bool {
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::qi21_vae::decode(a, z, h, w, out),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
 }
 
 /// One Z-Image transformer block's device inputs (noise refiner, context

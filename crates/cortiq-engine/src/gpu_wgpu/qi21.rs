@@ -196,6 +196,9 @@ fn qi_kvcopy(@builtin(global_invocation_id) gid: vec3<u32>) {
 "#;
 
 /// The flash tile (`nw` subgroups × 16 queries, `bc` keys per block).
+/// Per-step flash time on the RTX PRO 4000 at 1024² (4096 queries, 4114
+/// keys, 32 layers): 8×16 149 ms, 4×32 165, 16×16 184, 8×32 185, 4×16
+/// (Z-Image's tile) 213, 2×16 284; at 512² 8×16 is also the fastest.
 /// `CMF_QI21_FLASH=nw,bc` overrides.
 fn flash_cfg() -> FlashCfg {
     if let Ok(s) = std::env::var("CMF_QI21_FLASH") {
@@ -204,7 +207,7 @@ fn flash_cfg() -> FlashCfg {
             return FlashCfg { nw: v[0], bc: v[1] };
         }
     }
-    FlashCfg { nw: 4, bc: 16 }
+    FlashCfg { nw: 8, bc: 16 }
 }
 
 fn flash_key(f: FlashCfg) -> String {
@@ -592,6 +595,23 @@ fn margs(m: usize, n: usize, k: usize, ldo: usize, oscale: f32) -> MmArgs {
     }
 }
 
+/// The gate/up GEMM tile: 256×128×32 with 4×2 subgroups (`zimage_gemmbench
+/// mm` on the RTX PRO 4000, SwiGLU epilogue: 60 TF at M 4224 against 54
+/// for the 128×128 default; the other sites keep the default, 65–76 TF).
+/// `CMF_QI21_TILE_W13=bm,bn,bk,wm,wn` overrides.
+fn w13_cfg() -> MmCfg {
+    if let Ok(s) = std::env::var("CMF_QI21_TILE_W13") {
+        let v: Vec<u32> = s.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+        if v.len() == 5 {
+            let c = MmCfg::new(v[0], v[1], v[2], v[3], v[4], Epi::SwiGluIn);
+            if c.valid() {
+                return c;
+            }
+        }
+    }
+    MmCfg::new(256, 128, 32, 4, 2, Epi::SwiGluIn)
+}
+
 const ROW_GATE: u32 = 1;
 const ROW_NORM: u32 = 2;
 
@@ -632,7 +652,7 @@ fn blocks(c: &Ctx, d: &Dev, a: &Acts, s: &Pass, calls: &mut ZCalls) -> Option<()
     let gd = d.guards;
     let (h, inter, nh) = (g.hidden, g.inter, g.nh);
     let n = s.rows;
-    let t = (zi::default_cfg(Epi::F16), zi::default_cfg(Epi::F32), zi::default_cfg(Epi::SwiGluIn));
+    let t = (zi::default_cfg(Epi::F16), zi::default_cfg(Epi::F32), w13_cfg());
     let fc = flash_cfg();
     if flash_shared(fc) > c.device.limits().max_compute_workgroup_storage_size {
         return None;
@@ -1007,6 +1027,12 @@ pub(crate) fn prefill(a: &Qi21PrefillArgs) -> bool {
     let Some(prog) = build_prog(c, d_ref, a, acts, pkv) else {
         return decline("the step program could not be built");
     };
+    // the chain's pipelines were compiled at first use: keep them for the
+    // next process (once per process)
+    static FLUSHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !FLUSHED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        super::pipeline_cache_flush();
+    }
     if prof_on() {
         eprintln!(
             "qi21 wgpu: prefill {lp} rows {:.3}s, step program {:.3}s ({} dispatches)",

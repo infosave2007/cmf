@@ -17,10 +17,12 @@
 //! - the mid block is resnet → single-head attention → resnet;
 //! - decode clamps to [−1, 1].
 //!
-//! Tensors live channel-first, `[C, H·W]`. Same-padding convolutions go
-//! through the device (`gpu::vae_conv2d`, `gpu::vae_upsample_conv`) when
-//! one is up; everything else, and every conv without a device, runs the
-//! host GEMM.
+//! Tensors live channel-first, `[C, H·W]`. The decoder runs resident on
+//! the device when a backend implements `gpu::qi21_vae_decode` (wgpu:
+//! `gpu_wgpu/qi21_vae.rs`; `CMF_QI21_VAE_CHAIN=0` turns it off). Otherwise
+//! same-padding convolutions go through the device (`gpu::vae_conv2d`,
+//! `gpu::vae_upsample_conv`) when one is up; everything else, and every
+//! conv without a device, runs the host GEMM.
 
 use crate::pool::Pool;
 use cortiq_core::CmfModel;
@@ -532,6 +534,28 @@ pub struct Qi21Vae {
     enc: Option<Encoder>,
     post_quant: Option<Conv>,
     pool: Option<Arc<Pool>>,
+    /// The container's identity (the device decoder caches its weights by it).
+    uid: u64,
+}
+
+fn conv_ref(c: &Conv) -> crate::gpu::Qi21VaeConvRef<'_> {
+    crate::gpu::Qi21VaeConvRef {
+        w: &c.w,
+        b: &c.b,
+        ci: c.ci,
+        co: c.co,
+        k: c.k,
+    }
+}
+
+fn res_ref(r: &Resnet) -> crate::gpu::Qi21VaeResRef<'_> {
+    crate::gpu::Qi21VaeResRef {
+        g1: &r.g1,
+        c1: conv_ref(&r.c1),
+        g2: &r.g2,
+        c2: conv_ref(&r.c2),
+        shortcut: r.shortcut.as_ref().map(conv_ref),
+    }
 }
 
 impl Qi21Vae {
@@ -626,6 +650,7 @@ impl Qi21Vae {
             enc,
             post_quant,
             pool: Pool::from_env(),
+            uid: m.uid(),
         })
     }
 
@@ -665,6 +690,12 @@ impl Qi21Vae {
         if z.len() != self.cfg.z_dim * h * w {
             return Err("VAE decode: latent size mismatch".into());
         }
+        if let Some(mut img) = self.decode_device(dec, z, h, w) {
+            for v in img.iter_mut() {
+                *v = v.clamp(-1.0, 1.0);
+            }
+            return Ok(img);
+        }
         let x = self.post_quant.as_ref().unwrap().same(z, h, w, pool);
         let mut x = dec.conv_in.same(&x, h, w, pool);
         x = dec.mid.forward(&x, h, w, pool);
@@ -691,6 +722,38 @@ impl Qi21Vae {
             *v = v.clamp(-1.0, 1.0);
         }
         Ok(img)
+    }
+
+    /// The whole decoder resident on the device (`gpu::qi21_vae_decode`):
+    /// `None` = the per-conv path runs. `CMF_QI21_VAE_CHAIN=0` turns it off.
+    fn decode_device(&self, dec: &Decoder, z: &[f32], h: usize, w: usize) -> Option<Vec<f32>> {
+        if std::env::var("CMF_QI21_VAE_CHAIN").as_deref() == Ok("0") || !gpu_ok() {
+            return None;
+        }
+        let args = crate::gpu::Qi21VaeDecodeArgs {
+            key: self.uid,
+            post_quant: conv_ref(self.post_quant.as_ref()?),
+            conv_in: conv_ref(&dec.conv_in),
+            mid_res: [res_ref(&dec.mid.r0), res_ref(&dec.mid.r1)],
+            attn_gamma: &dec.mid.attn.gamma,
+            attn_qkv: conv_ref(&dec.mid.attn.qkv),
+            attn_proj: conv_ref(&dec.mid.attn.proj),
+            ups: dec
+                .ups
+                .iter()
+                .map(|u| crate::gpu::Qi21VaeUpRef {
+                    resnets: u.resnets.iter().map(res_ref).collect(),
+                    up: u.up.as_ref().map(|(c, ft)| (conv_ref(c), *ft)),
+                    in_dim: u.in_dim,
+                    out_dim: u.out_dim,
+                })
+                .collect(),
+            norm_out: &dec.norm_out,
+            conv_out: conv_ref(&dec.conv_out),
+        };
+        let s = self.cfg.scale();
+        let mut out = vec![0f32; dec.conv_out.co * h * s * w * s];
+        crate::gpu::qi21_vae_decode(&args, z, h, w, &mut out).then_some(out)
     }
 
     /// Image `[in_channels, H, W]` in [−1, 1] (H, W multiples of the
