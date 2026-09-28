@@ -917,7 +917,7 @@ enum Commands {
         /// Path to .cmf model file
         model: String,
         /// List directory entries whose name starts with this prefix
-        /// (name, dtype, shape, bytes), with a per-prefix total.
+        /// (name, dtype, shape, bytes, hash64 of the bytes), with a per-prefix total.
         #[arg(long)]
         tensors: Option<String>,
     },
@@ -6697,7 +6697,7 @@ async fn cmd_info(model_path: &str, tensors: Option<&str>) -> anyhow::Result<()>
         let mut total = 0u64;
         let mut n = 0usize;
         for e in model.tensors.iter().filter(|e| e.name.starts_with(prefix)) {
-            println!("{}\t{:?}\t{:?}\t{}", e.name, e.dtype, e.shape, e.nbytes);
+            println!("{}\t{:?}\t{:?}\t{}\t{:016x}", e.name, e.dtype, e.shape, e.nbytes, e.hash);
             total += e.nbytes;
             n += 1;
         }
