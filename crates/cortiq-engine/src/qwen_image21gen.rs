@@ -26,7 +26,9 @@
 //! `CMF_INIT_LATENT=<raw f32 [h·w, 64] tokens>` (oracle noise);
 //! `CMF_QI21_EMBEDS=<dir>` (oracle `prompt_embeds.f32` + `meta.json`
 //! instead of the text encoder, text-to-image only);
-//! `CMF_QI21_TRACE=<dir>` (`v_i`, `lat_i` per step).
+//! `CMF_QI21_TRACE=<dir>` (`v_i`, `lat_i` per step);
+//! `CMF_QI21_DUMP=<dir>` (the prompt's encoder features, text rows);
+//! `CMF_QI21_LATENT_IN=<raw f32 tokens>` (decode this latent instead).
 
 use crate::qwen_image21::{Qi21Dit, Qi21Layout, Seg, ARCH_NAME};
 use crate::qwen_image21_vae::Qi21Vae;
@@ -466,6 +468,9 @@ pub fn generate_images(
         (pos, neg)
     };
     tm.text_encode = t0.elapsed().as_secs_f64();
+    if let Ok(dir) = std::env::var("CMF_QI21_DUMP") {
+        write_f32(&dir, "prompt_embeds", &pos.text)?;
+    }
 
     // ── condition latents ──
     let t0 = Instant::now();
@@ -592,6 +597,17 @@ pub fn generate_images(
             if lat.iter().any(|v| !v.is_finite()) {
                 return Err(format!("image {img}: the final latent is not finite"));
             }
+            let lat_in;
+            let lat = match std::env::var("CMF_QI21_LATENT_IN") {
+                Ok(path) => {
+                    lat_in = read_f32(Path::new(&path))?;
+                    if lat_in.len() != lat.len() {
+                        return Err(format!("{path}: {} floats, the latent needs {}", lat_in.len(), lat.len()));
+                    }
+                    &lat_in
+                }
+                Err(_) => lat,
+            };
             let z = vae.denormalize_tokens(lat, n);
             let px = vae.decode(&z, lh, lw)?;
             let ch = vae.cfg.out_channels;
