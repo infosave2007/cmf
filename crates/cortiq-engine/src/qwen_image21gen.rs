@@ -27,7 +27,8 @@
 //! `CMF_QI21_EMBEDS=<dir>` (oracle `prompt_embeds.f32` + `meta.json`
 //! instead of the text encoder, text-to-image only);
 //! `CMF_QI21_TRACE=<dir>` (`v_i`, `lat_i` per step);
-//! `CMF_QI21_DUMP=<dir>` (the prompt's encoder features, text rows);
+//! `CMF_QI21_DUMP=<dir>` (the prompt's encoder features, text rows; with
+//! `CMF_QI21_TE_ONLY=1` the run stops there);
 //! `CMF_QI21_LATENT_IN=<raw f32 tokens>` (decode this latent instead).
 
 use crate::qwen_image21::{Qi21Dit, Qi21Layout, Seg, ARCH_NAME};
@@ -127,9 +128,11 @@ pub struct Qi21Image {
 }
 
 impl Qi21Image {
-    /// Whether any pixel is not fully opaque.
+    /// Whether the image is meaningfully transparent: more than 1 % of the
+    /// pixels below alpha 250 (an opaque generation lands at 253–255).
     pub fn has_alpha(&self) -> bool {
-        self.rgba.chunks_exact(4).any(|p| p[3] != 255)
+        let n = self.rgba.len() / 4;
+        self.rgba.chunks_exact(4).filter(|p| p[3] < 250).count() * 100 > n
     }
 
     /// PNG keeps the alpha channel; JPEG and PPM are composited over white.
@@ -470,6 +473,9 @@ pub fn generate_images(
     tm.text_encode = t0.elapsed().as_secs_f64();
     if let Ok(dir) = std::env::var("CMF_QI21_DUMP") {
         write_f32(&dir, "prompt_embeds", &pos.text)?;
+        if std::env::var("CMF_QI21_TE_ONLY").as_deref() == Ok("1") {
+            return Ok((Vec::new(), tm));
+        }
     }
 
     // ── condition latents ──
