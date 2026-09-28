@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="660" viewBox="0 0 1200 660">
+<rect width="1200" height="660" fill="#f5f7fb"/>
+<g font-family="Arial, sans-serif" fill="#14243a">
+<text x="48" y="53" font-size="29" font-weight="700">One CMF. Two GPU backends.</text>
+<text x="48" y="86" font-size="17" fill="#526277">Full text → decision · FP32 · unchanged winners and abstentions</text>
+<rect x="48" y="117" width="536" height="427" rx="16" fill="white"/>
+<text x="72" y="153" font-size="22" font-weight="700">Apple M4 · Metal</text>
+<text x="72" y="183" font-size="16" fill="#526277">Alternating CPU/GPU requests</text>
+<text x="72" y="218" font-size="16" font-weight="700">BANKING77</text>
+<rect x="72" y="230" width="270.8" height="18" rx="4" fill="#9cabbc"/>
+<text x="352.8" y="245" font-size="15">CPU 3.46 ms</text>
+<rect x="72" y="257" width="202.0" height="18" rx="4" fill="#087e8b"/>
+<text x="284.0" y="272" font-size="15">Metal 2.58 ms</text>
+<text x="72" y="322" font-size="16" font-weight="700">CLINC150</text>
+<rect x="72" y="334" width="255.9" height="18" rx="4" fill="#9cabbc"/>
+<text x="337.9" y="349" font-size="15">CPU 3.27 ms</text>
+<rect x="72" y="361" width="198.6" height="18" rx="4" fill="#087e8b"/>
+<text x="280.6" y="376" font-size="15">Metal 2.53 ms</text>
+<text x="72" y="426" font-size="16" font-weight="700">MASSIVE</text>
+<rect x="72" y="438" width="209.4" height="18" rx="4" fill="#9cabbc"/>
+<text x="291.4" y="453" font-size="15">CPU 2.67 ms</text>
+<rect x="72" y="465" width="179.8" height="18" rx="4" fill="#087e8b"/>
+<text x="261.8" y="480" font-size="15">Metal 2.29 ms</text>
+<text x="72" y="521" font-size="15" fill="#526277">p50 averaged over 2 full runs · independent scale</text>
+<rect x="616" y="117" width="536" height="427" rx="16" fill="white"/>
+<text x="640" y="153" font-size="22" font-weight="700">RTX PRO 4000 · Vulkan</text>
+<text x="640" y="183" font-size="16" fill="#526277">Separate CPU/GPU serial streams</text>
+<text x="640" y="218" font-size="16" font-weight="700">BANKING77</text>
+<rect x="640" y="230" width="269.7" height="18" rx="4" fill="#9cabbc"/>
+<text x="919.7" y="245" font-size="15">CPU 24.18 ms</text>
+<rect x="640" y="257" width="13.8" height="18" rx="4" fill="#087e8b"/>
+<text x="663.8" y="272" font-size="15">Vulkan 1.24 ms</text>
+<text x="640" y="322" font-size="16" font-weight="700">CLINC150</text>
+<rect x="640" y="334" width="235.2" height="18" rx="4" fill="#9cabbc"/>
+<text x="885.2" y="349" font-size="15">CPU 21.09 ms</text>
+<rect x="640" y="361" width="13.3" height="18" rx="4" fill="#087e8b"/>
+<text x="663.3" y="376" font-size="15">Vulkan 1.19 ms</text>
+<text x="640" y="426" font-size="16" font-weight="700">MASSIVE</text>
+<rect x="640" y="438" width="181.2" height="18" rx="4" fill="#9cabbc"/>
+<text x="831.2" y="453" font-size="15">CPU 16.24 ms</text>
+<rect x="640" y="465" width="12.6" height="18" rx="4" fill="#087e8b"/>
+<text x="662.6" y="480" font-size="15">Vulkan 1.13 ms</text>
+<text x="640" y="521" font-size="15" fill="#526277">p50 averaged over 2 full runs · independent scale</text>
+<text x="48" y="581" font-size="17" fill="#526277">10,554 texts per run · 50 warmups · no oracle · same CPU/GPU model on each host</text>
+<text x="48" y="614" font-size="16" fill="#526277">RTX idle-memory clocks raise sparse-request latency. Metal tail spikes remain. See GPU.md.</text>
+</g></svg>

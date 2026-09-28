@@ -19,9 +19,9 @@ lto = "thin"
 codegen-units = 1
 
 [workspace.package]
-version = "0.7.9"
+version = "0.8.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "Apache-2.0"
 authors = ["Oleg Kirichenko <urevich55@gmail.com>"]
 repository = "https://github.com/infosave2007/cmf"

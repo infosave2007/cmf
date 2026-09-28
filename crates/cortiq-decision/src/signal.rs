@@ -112,6 +112,8 @@ pub struct Timings {
     pub tokenize: Duration,
     /// BERT forward, pooling and both L2 steps.
     pub encode: Duration,
+    /// Joint GPU encoder + reconstruction wall time (zero on split paths).
+    pub gpu: Duration,
     /// φ_H.
     pub hash: Duration,
     /// Tokens of the text, `[CLS]` and `[SEP]` included.
@@ -178,22 +180,80 @@ impl SignalEncoder {
 
     /// [`SignalEncoder::features`] with the time of each stage.
     pub fn features_timed(&self, text: &str) -> (Features, Timings) {
+        self.try_features_timed(text)
+            .expect("decision encoder failed")
+    }
+
+    /// Device failures propagate to the API instead of silently falling back.
+    pub fn try_features_timed(&self, text: &str) -> Result<(Features, Timings)> {
         let t0 = Instant::now();
         let ids = self.encoder.tokenize(text);
         let t1 = Instant::now();
-        let phi_p = self.encoder.embed_ids(&ids);
+        let phi_p = self.encoder.try_embed_ids(&ids)?;
         let t2 = Instant::now();
         let phi_h = phi_h(text);
         let t3 = Instant::now();
-        (
+        Ok((
             Features { phi_p, phi_h },
             Timings {
                 tokenize: t1 - t0,
                 encode: t2 - t1,
+                gpu: Duration::ZERO,
                 hash: t3 - t2,
                 tokens: ids.len(),
             },
-        )
+        ))
+    }
+
+    /// Production text-to-errors path: one GPU submission for encoder and all
+    /// requested Metal skills, or the unchanged split path for CPU/mixed devices.
+    /// `packed` must contain unique scorers (the service deduplicates skills).
+    pub fn score_timed(
+        &self,
+        text: &str,
+        packed: &[&crate::packed::Packed],
+    ) -> Result<ScoredSignal> {
+        ensure!(
+            packed
+                .iter()
+                .all(|p| p.tasks() == 0 || p.dim() == self.dim()),
+            "scorer/signal dimension mismatch"
+        );
+        let t0 = Instant::now();
+        let ids = self.encoder.tokenize(text);
+        let t1 = Instant::now();
+        let phi_h = phi_h(text);
+        let t2 = Instant::now();
+        let mut timings = Timings {
+            tokenize: t1 - t0,
+            hash: t2 - t1,
+            tokens: ids.len(),
+            ..Timings::default()
+        };
+        if let Some((phi_p, errors)) = self.encoder.try_embed_and_score(&ids, &phi_h, packed)? {
+            timings.gpu = t2.elapsed();
+            return Ok(ScoredSignal {
+                features: Features { phi_p, phi_h },
+                timings,
+                errors,
+                resonance: Duration::ZERO,
+            });
+        }
+        let phi_p = self.encoder.try_embed_ids(&ids)?;
+        timings.encode = t2.elapsed();
+        let features = Features { phi_p, phi_h };
+        let tr = Instant::now();
+        let x = features.signal();
+        let errors = packed
+            .iter()
+            .map(|p| p.errors(&x))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(ScoredSignal {
+            features,
+            timings,
+            errors,
+            resonance: tr.elapsed(),
+        })
     }
 
     /// `x = [φ_P ; 0.5·φ_H]` of a text.
@@ -260,6 +320,15 @@ impl SignalEncoder {
         }
         out
     }
+}
+
+/// Features and errors from the same execution; timings never double-count a
+/// fused GPU pass as separate encoder and reconstruction measurements.
+pub struct ScoredSignal {
+    pub features: Features,
+    pub timings: Timings,
+    pub errors: Vec<Vec<f32>>,
+    pub resonance: Duration,
 }
 
 #[cfg(test)]

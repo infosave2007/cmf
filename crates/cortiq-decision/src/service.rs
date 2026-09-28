@@ -974,6 +974,8 @@ pub struct QuestionOutcome {
 pub struct RequestTimings {
     pub tokenize: Duration,
     pub encode: Duration,
+    /// Combined Metal encoder/reconstruction wall time; zero for split execution.
+    pub gpu: Duration,
     pub hash: Duration,
     pub resonance: Duration,
     pub oracle: Duration,
@@ -983,10 +985,14 @@ pub struct RequestTimings {
 impl RequestTimings {
     pub fn to_json(&self) -> Value {
         let us = |d: Duration| d.as_micros() as u64;
-        json!({
+        let mut value = json!({
             "tokenize": us(self.tokenize), "encode": us(self.encode), "hash": us(self.hash),
             "resonance": us(self.resonance), "oracle": us(self.oracle), "total": us(self.total),
-        })
+        });
+        if !self.gpu.is_zero() {
+            value["gpu"] = json!(us(self.gpu));
+        }
+        value
     }
 }
 
@@ -1641,6 +1647,7 @@ impl DecisionService {
         let timings = RequestTimings {
             tokenize: st.tokenize,
             encode: st.encode,
+            gpu: st.gpu,
             hash: st.hash,
             resonance,
             oracle: oracle_time,
@@ -1716,6 +1723,7 @@ impl DecisionService {
         let timings = RequestTimings {
             tokenize: stage.signal.tokenize,
             encode: stage.signal.encode,
+            gpu: stage.signal.gpu,
             hash: stage.signal.hash,
             resonance: stage.resonance,
             oracle: Duration::ZERO,
@@ -2078,6 +2086,11 @@ impl DecisionService {
             "generation": model.generation(),
             "skills": model.skills().len(),
             "inflight": self.inflight(),
+            "encoder_device": model.encoder().encoder().device_name(),
+            "metal_encoder_submissions": model.encoder().encoder().metal_submissions(),
+            "metal_resonance_submissions": model.skills().iter().map(|s| s.scorer().packed().metal_submissions()).sum::<u64>(),
+            "vulkan_encoder_submissions": model.encoder().encoder().vulkan_submissions(),
+            "vulkan_resonance_submissions": model.skills().iter().map(|s| s.scorer().packed().vulkan_submissions()).sum::<u64>(),
             "oracle": self.escalator.is_some() && self.cfg.oracle.enabled,
             "oracle_status": self.oracle_status().label(),
         })
@@ -2267,10 +2280,28 @@ fn local_stage(
     req: &DecisionRequest,
     matches: &[SkillMatch],
 ) -> Result<LocalStage, ApiError> {
-    let (features, signal) = model.encoder().features_timed(&req.state_text);
-    let x = features.signal();
+    let mut indices = Vec::new();
+    for m in matches.iter().filter(|m| m.kind.is_local()) {
+        let sid = m.skill.as_deref().unwrap_or_default();
+        let si = model
+            .skill_index(sid)
+            .ok_or_else(|| internal(format!("matched skill '{sid}' is missing")))?;
+        if !indices.contains(&si) {
+            indices.push(si);
+        }
+    }
+    let packed: Vec<_> = indices
+        .iter()
+        .map(|&i| model.skills[i].scorer.packed())
+        .collect();
+    let scored = model
+        .encoder()
+        .score_timed(&req.state_text, &packed)
+        .map_err(internal)?;
+    let features = scored.features;
+    let signal = scored.timings;
     let tr = Instant::now();
-    let mut skill_errors: HashMap<usize, Vec<f32>> = HashMap::new();
+    let skill_errors: HashMap<usize, Vec<f32>> = indices.into_iter().zip(scored.errors).collect();
     let mut locals: Vec<Option<LocalDecision>> = Vec::with_capacity(matches.len());
     for m in matches {
         if !m.kind.is_local() {
@@ -2281,9 +2312,6 @@ fn local_stage(
         let si = model
             .skill_index(sid)
             .ok_or_else(|| internal(format!("matched skill '{sid}' is missing")))?;
-        if let std::collections::hash_map::Entry::Vacant(slot) = skill_errors.entry(si) {
-            slot.insert(model.skills[si].scorer.errors(&x).map_err(internal)?);
-        }
         locals.push(Some(
             local_decision(
                 &model.skills[si],
@@ -2299,7 +2327,7 @@ fn local_stage(
         features,
         signal,
         locals,
-        resonance: tr.elapsed(),
+        resonance: scored.resonance + tr.elapsed(),
     })
 }
 

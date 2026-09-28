@@ -2,6 +2,7 @@
 name = "cortiq-ffi"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "C ABI for embedding the CMF runtime in native apps (Android/iOS/desktop)"
@@ -15,8 +16,8 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 gpu = ["cortiq-engine/gpu"]
 
 [dependencies]
-cortiq-core = { path = "../cortiq-core", version = "0.7.9" }
-cortiq-engine = { path = "../cortiq-engine", version = "0.7.9" }
-cortiq-net = { path = "../cortiq-net", version = "0.7.9" }
+cortiq-core = { path = "../cortiq-core", version = "0.8.0" }
+cortiq-engine = { path = "../cortiq-engine", version = "0.8.0" }
+cortiq-net = { path = "../cortiq-net", version = "0.8.0" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

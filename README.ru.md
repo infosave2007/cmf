@@ -11,6 +11,19 @@ ML-фреймворка.
 [![docs.rs](https://img.shields.io/docsrs/cortiq-core)](https://docs.rs/cortiq-core)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
+
+## Решения на Metal и Vulkan
+
+**Cortiq 0.8.0:** один CMF-файл с навыками, локальные решения по ошибке
+реконструкции — без генерации токенов. CPU по умолчанию; GPU включается через
+`CORTIQ_DECISION_DEVICE=metal` или `vulkan`. Обычная установка из crates.io
+включает GPU-поддержку (Rust 1.88+).
+
+![Полный локальный путь CPU / GPU; сравнения внутри одного стенда](docs/decision/hf/figures/gpu.svg)
+
+[Запуск, свои навыки и API](docs/decision/hf/README_RU.md) ·
+[Замеры и ограничения](docs/decision/hf/GPU.md)
+
 ## Состояние
 
 CMF v2 — текущий формат на диске. Читатели проверяют конверт, границы секций,
@@ -26,7 +39,7 @@ CMF v2 — текущий формат на диске. Читатели про�
 Установите CLI и сконвертируйте небольшой открытый чекпоинт:
 
 ```sh
-cargo install cortiq-cli
+cargo install cortiq-cli --locked
 cortiq convert --model Qwen/Qwen3-0.6B --quant q8 --output qwen.cmf
 cortiq run qwen.cmf --prompt "Столица Франции?" --greedy --no-think
 ```

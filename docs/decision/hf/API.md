@@ -66,6 +66,27 @@ cortiq serve cortiq-decision.cmf --decision-config decision.json \
   --state ./decision.state --port 8080
 ```
 
+### CPU, Metal or Vulkan
+
+From Cortiq 0.8.0, the default crates.io CLI includes GPU decision support.
+Set the device **before starting the process**:
+
+```bash
+# Apple Silicon
+CORTIQ_DECISION_DEVICE=metal cortiq serve cortiq-decision.cmf \
+  --state ./decision.state --port 8080
+
+# A hardware Vulkan device and driver
+CORTIQ_DECISION_DEVICE=vulkan cortiq serve cortiq-decision.cmf \
+  --state ./decision.state --port 8080
+```
+
+Use only one server per state directory. CPU remains the default. On multi-GPU
+hosts set `CORTIQ_DECISION_VULKAN_ADAPTER` to a unique part of the adapter name.
+`GET /healthz` identifies the encoder device and counts completed GPU submissions.
+The decisions endpoints and `/v1/route` use the same accelerated path; a device
+error is reported, not silently sent to CPU. [Measurements and limits](GPU.md).
+
 A decision server listens on `127.0.0.1:8080` unless `--host` / `--port` say
 otherwise. Other `cortiq serve` flags for decision files: `--break-lock`
 (only where the state directory's filesystem has no advisory locks: remove a

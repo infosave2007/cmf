@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-28
+
+### Added
+- Native Metal and Vulkan acceleration for CMF decisions: resident FP32 weights,
+  one joint encoder + reconstruction submission, explicit device selection via
+  `CORTIQ_DECISION_DEVICE`. CLI, decisions API and compatible router share the
+  same path. GPU errors are reported instead of silently falling back to CPU.
+- Vulkan decisions are included in the default `cortiq-cli` installation and
+  release binaries. CPU remains the default runtime; existing CMF files, skills,
+  calibration and CPU response fields remain compatible.
+- Hardware parity tests for concurrent requests, unaligned dimensions, long and
+  Unicode input, non-orthogonal bases and multiple skills; reproducible local
+  CPU/GPU benchmark with paired and separate-stream protocols.
+
+### Performance
+- Apple M4: paired-request median 2.28–2.58 ms across three datasets, 14–26%
+  below the same-host CPU baseline. Some tail latencies regress under desktop load.
+- RTX PRO 4000 Blackwell: continuous-stream median 1.10–1.24 ms, 14–20× faster
+  than the native CPU path on the same Xeon server. Sparse requests are slower
+  as the GPU downclocks; the two schedules are reported separately.
+- Winners and abstentions unchanged on all 10,554 test examples in every full
+  run. No retraining, reduced precision or oracle used in these GPU measurements.
+
+### Build and documentation
+- Minimum supported Rust is 1.88, matching the dependency floor. CI checks it;
+  workspace and release builds use the committed lockfile.
+- Updated English/Russian model cards, primary GPU chart, Cargo installation,
+  device selection, resource snapshots and reproducible benchmark evidence.
+  See `docs/decision/hf/GPU.md`; existing Jev quality/cost results are unchanged.
+
 ## [0.7.9] - 2026-09-27
 
 ### Fixed

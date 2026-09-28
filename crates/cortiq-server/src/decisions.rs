@@ -192,7 +192,10 @@
 //! {billable_decisions: 1, oracle_calls}, `meta` {model_version =
 //! `cortiq/decision@<sha12>`, taxonomy_version = `<skill>@<n>`, latency_ms (the
 //! resonance), embedding_latency_ms (tokenizer, encoder and hash), served_by =
-//! `cortiq/<version>`}. A gate-rejected answer that is not escalated carries the
+//! `cortiq/<version>`}. On joint Metal execution, `latency_ms` includes the
+//! combined encoder/reconstruction pass (also `gpu_pipeline_latency_ms`);
+//! `embedding_latency_ms` is CPU tokenization/hashing only, with no double count.
+//! A gate-rejected answer that is not escalated carries the
 //! router's `low_confidence` flag (so `confident` is false). With
 //! `x-cmf-extensions: 1` a `cmf` object adds the `cmf-dec-…` id, the action,
 //! `certified` and the gate.
@@ -1924,6 +1927,7 @@ struct RouteOutcome {
     oracle_calls: u64,
     oracle_time: Duration,
     embed_time: Duration,
+    gpu_time: Duration,
     route_time: Duration,
     model_name: String,
     model_sha: String,
@@ -2028,7 +2032,8 @@ impl DecisionState {
             oracle_calls: d.metered.oracle.calls,
             oracle_time: d.timings.oracle,
             embed_time: d.timings.tokenize + d.timings.encode + d.timings.hash,
-            route_time: d.timings.resonance,
+            gpu_time: d.timings.gpu,
+            route_time: d.timings.resonance + d.timings.gpu,
             model_name: d.response["model"].as_str().unwrap_or_default().to_string(),
             model_sha: d.response["cmf"]["model_sha"]
                 .as_str()
@@ -2291,6 +2296,7 @@ impl DecisionState {
             oracle_calls: 0,
             oracle_time: Duration::ZERO,
             embed_time: Duration::ZERO,
+            gpu_time: Duration::ZERO,
             route_time,
             model_name: model.name(),
             model_sha: model.model_sha().to_string(),
@@ -2457,6 +2463,12 @@ impl DecisionState {
                 "served_by": served_by(),
             }),
         );
+        // A fused pass cannot honestly be reported as two independent stage
+        // latencies. Charge it once to routing; expose its scope explicitly.
+        if !o.gpu_time.is_zero() {
+            v.get_mut("meta").expect("meta was inserted")["gpu_pipeline_latency_ms"] =
+                f32_json(ms(o.gpu_time));
+        }
         if r.extensions {
             v.insert(
                 "cmf".into(),
