@@ -51,7 +51,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   skill-bake v2, `export --genome-id`. CI checks the `vulkan` feature.
 
 ### Fixed
-- Thread-pool job descriptor is a seqlock (no torn reads under contention).
+- CPU worker pool: per-worker job tickets replace the shared descriptor, so an
+  uninvited worker never reads or runs another dispatch (0.8.0 could run a job
+  twice under mixed full/limited dispatches: SIGSEGV or a hang), and an
+  oversubscribed pool (more workers than available CPUs) parks idle workers
+  instead of spinning (a dispatch no longer costs whole scheduler quanta).
 - `cortiq-embryo export` refuses to overwrite a genome file by content
   (`genome`/`lineage`/`segments` in the header), not only by the bit, so a
   pre-0.8.1 genome file cannot be truncated by a re-export.
