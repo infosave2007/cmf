@@ -1,4 +1,4 @@
-# Cortiq Decision
+# CMF Decision
 
 ### Решение за миллисекунды. Вся модель — в одном CMF-файле.
 
@@ -23,7 +23,7 @@ cargo install cortiq-cli --locked
 
 ```bash
 curl -fL -o cortiq-decision.cmf \
-  https://huggingface.co/infosave/cortiq-decision/resolve/main/cortiq-decision.cmf
+  https://huggingface.co/infosave/cmf-decision/resolve/main/cortiq-decision.cmf
 cortiq decide cortiq-decision.cmf --skill banking77 -p "I still have not received my new card"
 ```
 
