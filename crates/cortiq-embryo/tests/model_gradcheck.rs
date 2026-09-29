@@ -327,6 +327,7 @@ fn phase_delta_layer3_full_model_train_step_benchmark() {
 }
 
 #[test]
+#[ignore = "requires an Apple Silicon Metal device"]
 fn selected_layer_scan_matches_all_layer_scan_on_single_hybrid() {
     // Tiny's two-layer cadence has one hybrid (layer 0) and one anchor.  The
     // selected and historical all-layer modes therefore dispatch the exact
