@@ -57,10 +57,15 @@
 //!   block-causal) 1.15 s, and a 1024² step against that prefix 1.18 s.
 //! - planes, 32 blocks: q8_2f 1.0 s (streamed), q4tp 1.3–1.5 s, bf16 46 s
 //!   (converted on the host).
-//! - whole `imagine` at 1024², 40 steps, `qwen-image-2.1.cmf` (DiT q4tp,
-//!   text encoder q8_2f): 47.5 s = text encoder 2.0 (6.4 cold) + prefill
-//!   1.3 + steps 41.6 + VAE 1.9 (`qi21_vae.rs`); CFG doubles the step
-//!   (512²: 0.484 s for the pair).
+//! - whole `imagine`, 40 steps, `qwen-image-2.1.cmf` (DiT q4tp, text
+//!   encoder q8_2f), default settings: 1024² 47.5 s = text encoder 2.0
+//!   (6.4 cold) + prefill 1.3 + steps 41.6 + VAE 1.9 (`qi21_vae.rs`);
+//!   2048² 246 s = 2.0 + 1.3 + steps 238.3 (6.0 s each) + VAE 3.2. CFG
+//!   doubles the step (512²: 0.484 s for the pair). With a condition
+//!   image (4118-row prefix) a 2048² step is 6.56 s.
+//! - every binding stays under the 2 GB limit up to 2048² (the largest,
+//!   the gate/up hidden at 2048², is 406 MB); past 65 535 target rows
+//!   (4096²) the path declines.
 //!
 //! Parity, v rel. error against the host path (`CMF_QI21_GPU=0`) on the
 //! same container and noise: v_0 3.2e-4 (q8) / 4.7e-4 (q4tp; 5.4e-4 on the
