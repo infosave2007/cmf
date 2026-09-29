@@ -92,8 +92,10 @@ latent to 67 dB PSNR against the reference image.
 - **Vulkan** (`gpu_wgpu/qi21.rs`, `gpu_wgpu/qi21_vae.rs`): f16 weight planes built
   once per model (q4tp and q8 alike, 1.3 s), tensor-core GEMMs, the masked prefix
   flash, a resident VAE decoder. Device vs host: v₀ 2–5e-4. RTX PRO 4000 Blackwell:
-  a step 0.24 s at 512², 1.04 s at 1024², 5.9 s at 2048²; 1024²/40 steps in 48 s,
-  peak VRAM 17.5 GB. `CMF_QI21_WGPU=0`, `CMF_QI21_VAE_CHAIN=0` turn the paths off.
+  a step 0.24 s at 512², 1.04 s at 1024², 6.0 s at 2048²; 1024²/40 steps in 48 s,
+  2048² in 246 s, peak VRAM 17.5 GB at 1024². Frames whose VAE activations pass the
+  2 GB binding limit decode in horizontal bands with exact halos (bit-identical to a
+  whole-frame decode; 2048² 1.8 s, 4096² 8.3 s). `CMF_QI21_WGPU=0`, `CMF_QI21_VAE_CHAIN=0` turn the paths off.
 - **CPU**: the reference path (`CMF_QI21_GPU=0`).
 
 A condition image makes the prompt ~1k tokens longer (one vision slot per 32×32

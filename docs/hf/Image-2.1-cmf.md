@@ -77,6 +77,7 @@ RTX PRO 4000 Blackwell (24 GB), Vulkan, one image per process, default settings 
 |---|---|---:|---:|---:|---:|
 | text-to-image | 512×512 | 15 s | 9.6 s (0.24 s a step) | 2.4 s | 1.4 s |
 | text-to-image | 1024×1024 | 48 s | 41.6 s (1.04 s a step) | 2.2 s | 1.8 s |
+| text-to-image | 2048×2048 | 246 s | 238 s (6.0 s a step) | 2.0 s | 3.2 s |
 | one 1024² condition image | 1024×1024 | 122 s | 47 s (1.18 s a step) | 60 s | 1.7 s |
 
 Peak VRAM 17.5 GB at 1024² (24 GB cards). With several GPUs the engine takes the one with tensor cores and the most memory; `CMF_GPU_ADAPTER=<n>` (see `cortiq gpu`) pins another.
@@ -95,7 +96,7 @@ About 9 GB of memory. The GEMMs run at ≈ 83 % of the M4 GPU's matrix peak, so 
 
 | option | meaning |
 |---|---|
-| `--width`, `--height` | multiples of 32 (default 1024×1024; with `--image`, the last image's aspect) |
+| `--width`, `--height` | multiples of 32 (default 1024×1024, up to 2048² and beyond on 24 GB; with `--image`, the last image's aspect) |
 | `--steps`, `--seed`, `--num-images N` | image i uses seed + i |
 | `--image PATH` | condition image, repeatable |
 | `--reference-size S` | condition images are resized to S² area (default 1024) |
@@ -143,10 +144,10 @@ cortiq imagine qwen-image-2.1.cmf --image photo.png --prompt "Замени фо�
 
 **Скорость** (один процесс на картинку, настройки по умолчанию, 40 шагов):
 
-| устройство | 512² | 1024² | 1024² с картинкой-условием |
-|---|---:|---:|---:|
-| RTX PRO 4000 Blackwell, Vulkan | 15 с | 48 с (шаг 1.04 с) | 122 с (энкодер 60 с) |
-| Mac mini M4 24 ГБ, Metal | 3.9 мин | 20 мин (шаг 30 с) | — |
+| устройство | 512² | 1024² | 2048² | 1024² с картинкой-условием |
+|---|---:|---:|---:|---:|
+| RTX PRO 4000 Blackwell, Vulkan | 15 с | 48 с (шаг 1.04 с) | 246 с (шаг 6.0 с) | 122 с (энкодер 60 с) |
+| Mac mini M4 24 ГБ, Metal | 3.9 мин | 20 мин (шаг 30 с) | — | — |
 
 Пик видеопамяти 17.5 ГБ (карты на 24 ГБ); из нескольких GPU берётся карта с тензорными ядрами и большей памятью,
 `CMF_GPU_ADAPTER=<n>` выбирает другую. На Mac около 9 ГБ памяти, GEMM идут на ≈ 83 % матричного пика M4;
@@ -180,10 +181,10 @@ cortiq imagine qwen-image-2.1.cmf --prompt "雨夜里写着 \"CORTIQ\" 的霓虹
 
 **性能**（每进程一张图，默认设置，40 步）：
 
-| 设备 | 512² | 1024² | 1024² 带条件图 |
-|---|---:|---:|---:|
-| RTX PRO 4000 Blackwell，Vulkan | 15 s | 48 s（每步 1.04 s） | 122 s（编码 60 s） |
-| Mac mini M4 24 GB，Metal | 3.9 分钟 | 20 分钟（每步 30 s） | — |
+| 设备 | 512² | 1024² | 2048² | 1024² 带条件图 |
+|---|---:|---:|---:|---:|
+| RTX PRO 4000 Blackwell，Vulkan | 15 s | 48 s（每步 1.04 s） | 246 s（每步 6.0 s） | 122 s（编码 60 s） |
+| Mac mini M4 24 GB，Metal | 3.9 分钟 | 20 分钟（每步 30 s） | — | — |
 
 显存峰值 17.5 GB（24 GB 显卡）；多卡时自动选择带张量核心、显存最大的卡，`CMF_GPU_ADAPTER=<n>` 可指定。Mac 约占 9 GB 内存，`--steps 20` 可减半耗时。
 
