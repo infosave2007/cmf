@@ -23,8 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in place from the mapping, a masked prefix pass for the block-causal prompt
   (Mac mini M4: 5.5 s a step at 512², 30 s at 1024²).
 - Qwen-Image-2.1 on Vulkan: f16 weight planes, tensor-core GEMMs, masked prefix
-  flash attention and a resident VAE decoder (RTX PRO 4000: 1024² in 48 s, a
-  step 1.04 s, the VAE 0.5 s instead of 43 s).
+  flash attention and a resident VAE decoder that decodes large frames in exact
+  bands (RTX PRO 4000: 1024² in 48 s, a step 1.04 s, the VAE 0.5 s instead of
+  43 s; 2048² in 246 s). The per-conv wgpu VAE arms decline past the binding
+  limit instead of failing validation.
 - `cortiq info --tensors` prints each tensor's hash64, so two files can be
   compared tensor by tensor.
 
