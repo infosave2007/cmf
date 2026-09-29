@@ -1,15 +1,16 @@
 //! Qwen-Image-2.1 VAE decoder on wgpu, resident (the `gpu::qi21_vae_decode`
-//! contract): the whole decoder in one submission — one latent upload, one
-//! `[4][H·W]` readback — instead of `gpu::vae_conv2d` per conv with the
-//! activations crossing the bus and the RMS norms on the host.
+//! contract): the whole decoder on the device — one latent upload, one
+//! submission per band, one `[4][H·W]` readback — instead of
+//! `gpu::vae_conv2d` per conv with the activations crossing the bus and
+//! the RMS norms on the host.
 //!
 //! The Z-Image resident VAE's recipe (`zimage.rs`, "Resident Flux-VAE
 //! decoder"): NHWC activations, every 3×3 conv an implicit GEMM on `zi_mm`
 //! (`MmCfg::conv`; the nearest-2× upsample folded into the A-tile gather),
 //! 1×1 convs as plain GEMMs, f16 conv inputs with f32 accumulation and an
 //! f32 residual stream, the mid attention as QKᵀ → softmax → P·V over
-//! query chunks. Its combine / cast / softmax kernels are reused as they
-//! are. What differs here:
+//! query chunks. Its combine and softmax kernels are reused as they are.
+//! What differs here:
 //! - `qv_rmsn`: the Wan `RMS_norm` (x/max(‖x‖₂, 1e-12)·√C·γ per pixel over
 //!   the channels) with the conv bias added on read and an optional SiLU,
 //!   → the next conv's f16 input;
@@ -17,17 +18,36 @@
 //!   onto the 2× grid) added into the upsampled stream;
 //! - channels are padded to multiples of 64 (1152, 576, 288 → 320,
 //!   144 → 192, 4 → 64: zero weights, zero γ), and a GEMM whose padded
-//!   output width is not a multiple of 128 uses a 128×64 tile.
+//!   output width is not a multiple of 128 uses a 128×64 tile;
+//! - the two f16 casts of the raw residual stream carry a range guard
+//!   (see `guard`);
+//! - large frames run in horizontal bands (see "bands" below): the leading
+//!   up blocks run on the whole frame while every tensor fits a binding,
+//!   the rest band by band with exact halos, so a banded decode is bit for
+//!   bit the whole-frame one (1024², forced with `CMF_QI21_VAE_BAND_ROWS`
+//!   at 94–512 kept rows from blocks 0–3: max |Δ| = 0 in all five cases).
 //!
-//! Measured (RTX PRO 4000 Blackwell): the 1024² decode 0.49–0.64 s plus
-//! 0.26–0.47 s for the weights (f16 planes, once per model) against 43 s
-//! for the per-conv path; 256² 0.11 s. u8 PSNR against the per-conv path
-//! 67.4 dB at 1024²; against the fp32 diffusers decoder at 256² 66.0 dB
-//! (the per-conv path: 69.1 dB). The 1024² activations take 5.5 GB; at
-//! 2048² one of them (5.4 GB) exceeds the 2 GB binding limit and the chain
-//! declines (the per-conv path runs).
+//! Measured (RTX PRO 4000 Blackwell, 2 GB binding limit), decode only;
+//! the weights (f16 planes, once per model) take 0.26–0.47 s more:
 //!
-//! Knob: `CMF_QI21_VAE_CHAIN=0` (the per-conv path).
+//! | frame      | layout                                   | decode  |
+//! |------------|------------------------------------------|---------|
+//! | 256²       | whole                                    | 0.11 s  |
+//! | 1024²      | whole (4.8 GB of activations)            | 0.49–0.61 s |
+//! | 2048²      | 2 blocks whole + 3 bands of 683 rows     | 1.84 s  |
+//! | 1536×2752  | 2 blocks whole + 3 bands of 512 rows     | 1.87 s  |
+//! | 4096²      | 1 block whole + 11 bands of 373 rows     | 8.3 s   |
+//!
+//! The per-conv path took 43 s at 1024² and could not run 2048² at all on
+//! the device (a 2.4 GB tensor against the 2 GB binding). u8 PSNR against
+//! the per-conv path: 66.9 dB on a real 1024² latent, 61.2 dB on a random
+//! one; against the fp32 diffusers decoder at 256² 66.0 dB (per-conv 69.1).
+//!
+//! Knobs: `CMF_QI21_VAE_CHAIN=0` (the per-conv path),
+//! `CMF_QI21_VAE_BAND_ROWS=k` (force bands of ≤ k kept output rows),
+//! `CMF_QI21_VAE_BAND_FROM=s` (band from up block s on; forced bands
+//! default to 1), `CMF_QI21_VAE_SHIFT` (the stream guard, log2),
+//! `CMF_QI21_VAE_DUMP=<file>` (the raw f32 `[4][H·W]` output).
 
 use crate::gpu::{Qi21VaeConvRef, Qi21VaeDecodeArgs, Qi21VaeResRef};
 use std::sync::Mutex;
@@ -52,6 +72,17 @@ fn decline(reason: &str) -> bool {
 
 fn prof_on() -> bool {
     std::env::var("CMF_QI21_PROF").is_ok_and(|v| v != "0")
+}
+
+/// The range guard of the f16 casts of the raw residual stream (the 1×1
+/// shortcut's and the upsample conv's inputs): stored ×2⁻ᵍ, the conv's
+/// f32 epilogue multiplies 2ᵍ back. Stream maxima (host decoder): 120 on
+/// a real 1024² latent, 1.5e5 (block 4) on a random N(mean, std) one —
+/// past the f16 range, which turned 68 % of that image into NaN unguarded.
+/// Every other f16 site is RMS-normalised. `CMF_QI21_VAE_SHIFT` (default 8).
+fn guard() -> f32 {
+    let g = std::env::var("CMF_QI21_VAE_SHIFT").ok().and_then(|v| v.parse::<i32>().ok()).unwrap_or(8).clamp(0, 14);
+    (2.0f32).powi(g)
 }
 
 /// Channel padding of every NHWC tensor (the GEMM's N tile 64 / K slice 32).
@@ -115,6 +146,30 @@ fn qv_rmsn(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_inde
 }
 "#;
 
+/// f32 `[m][c]` (+ bias) × `scale` → f16 `[mp][c]`, rows ≥ m zeroed.
+const CAST_SRC: &str = r#"
+enable f16;
+struct KP { m: u32, mp: u32, c: u32, hasb: u32, scale: f32, _a: u32, _b: u32, _c: u32 };
+@group(0) @binding(0) var<storage, read> x: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> outp: array<vec2<u32>>;
+@group(0) @binding(3) var<uniform> p: KP;
+@compute @workgroup_size(256)
+fn qv_cast(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+  let c4 = p.c / 4u;
+  let idx = gid.y * (nwg.x * 256u) + gid.x;
+  if (idx >= p.mp * c4) { return; }
+  if (idx / c4 >= p.m) { outp[idx] = vec2<u32>(0u, 0u); return; }
+  var v = x[idx];
+  if (p.hasb != 0u) {
+    let ch = (idx % c4) * 4u;
+    v = v + vec4<f32>(b[ch], b[ch + 1u], b[ch + 2u], b[ch + 3u]);
+  }
+  v = v * p.scale;
+  outp[idx] = vec2<u32>(pack2x16float(v.xy), pack2x16float(v.zw));
+}
+"#;
+
 /// DupUp3D on the first chunk, added into the upsampled stream:
 /// `x[2y+sy, 2x+sx, o] += src[y, x, (o·factor + (ft−1)·4 + 2·sy + sx) / repeats]`.
 const DUPUP_SRC: &str = r#"
@@ -137,9 +192,10 @@ fn qv_dupup(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgrou
 }
 "#;
 
-/// NHWC `[m][ld]` (first `nch` channels) + bias → NCHW `[nch][m]`.
+/// NHWC `[rows][ld]` (first `nch` channels) + bias → NCHW `[nch][tot]`:
+/// the `n` pixels from band pixel `src0` land at frame pixel `dst0`.
 const OUT_SRC: &str = r#"
-struct OP { m: u32, ld: u32, nch: u32, _b: u32 };
+struct OP { n: u32, ld: u32, nch: u32, src0: u32, dst0: u32, tot: u32, _a: u32, _b: u32 };
 @group(0) @binding(0) var<storage, read> y: array<f32>;
 @group(0) @binding(1) var<storage, read> b: array<f32>;
 @group(0) @binding(2) var<storage, read_write> outp: array<f32>;
@@ -147,9 +203,9 @@ struct OP { m: u32, ld: u32, nch: u32, _b: u32 };
 @compute @workgroup_size(256)
 fn qv_out(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
   let i = gid.y * (nwg.x * 256u) + gid.x;
-  if (i >= p.m) { return; }
+  if (i >= p.n) { return; }
   for (var ch = 0u; ch < p.nch; ch = ch + 1u) {
-    outp[ch * p.m + i] = y[i * p.ld + ch] + b[ch];
+    outp[ch * p.tot + p.dst0 + i] = y[(p.src0 + i) * p.ld + ch] + b[ch];
   }
 }
 "#;
@@ -328,24 +384,30 @@ fn grid1(n: usize) -> (u32, u32, u32) {
     (wgs.min(65535), wgs.div_ceil(65535), 1)
 }
 
+
+/// A binding: the whole buffer, or `(offset, size)` bytes of it.
+type Bind<'a> = (&'a wgpu::Buffer, Option<(u64, u64)>);
+
+fn entry<'a>(i: u32, b: &Bind<'a>) -> wgpu::BindGroupEntry<'a> {
+    match b.1 {
+        Some((off, size)) => super::bind_buf_off(i, b.0, off, size),
+        None => super::bind_buf(i, b.0),
+    }
+}
+
 /// A `zi_mm` dispatch with the full 12-word uniform (the conv variants
 /// read `cw, ch, cin` from the last words).
-#[allow(clippy::too_many_arguments)]
-fn mmc(c: &Ctx, g: MmCfg, w: [u32; 12], plane: &wgpu::Buffer, act: &wgpu::Buffer, out: &wgpu::Buffer, out_off: Option<(u64, u64)>) -> Option<MmCall> {
+fn mmc(c: &Ctx, g: MmCfg, w: [u32; 12], plane: &wgpu::Buffer, act: Bind, out: Bind) -> Option<MmCall> {
     let (m, n, k) = (w[0], w[1], w[2]);
     if !n.is_multiple_of(g.bn) || !k.is_multiple_of(g.bk) {
         return None;
     }
     let pipe = zi::mm_pipe(c, g)?;
     let u = zi::ubuf(c, &w);
-    let ob = match out_off {
-        Some((off, size)) => super::bind_buf_off(2, out, off, size),
-        None => super::bind_buf(2, out),
-    };
     let bg = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("qv_mm"),
         layout: &pipe.get_bind_group_layout(0),
-        entries: &[super::bind_buf(0, plane), super::bind_buf(1, act), ob, super::bind_buf(3, &u)],
+        entries: &[super::bind_buf(0, plane), entry(1, &act), entry(2, &out), super::bind_buf(3, &u)],
     });
     Some(MmCall { pipe, bg, grid: (n / g.bn, m.div_ceil(g.bm)) })
 }
@@ -361,34 +423,55 @@ struct Rec<'a> {
     c: &'a Ctx,
     calls: ZCalls,
     zero: &'a wgpu::Buffer,
+    /// the device's storage-offset alignment
+    align: u64,
 }
 
-/// The activation buffers of one decode (NHWC, `mp_of` rows).
-struct Bufs {
-    x: wgpu::Buffer,
-    h: wgpu::Buffer,
-    s: wgpu::Buffer,
-    xn: wgpu::Buffer,
-    cp: wgpu::Buffer,
+/// The activation buffers a pass works in (NHWC, `mp_of` rows; `x` the
+/// f32 residual stream, `h`/`s` f32 conv outputs, `xn` the f16 conv input,
+/// `cp` the up block's saved input).
+struct Bufs<'b> {
+    x: &'b wgpu::Buffer,
+    h: &'b wgpu::Buffer,
+    s: &'b wgpu::Buffer,
+    xn: &'b wgpu::Buffer,
+    cp: &'b wgpu::Buffer,
 }
 
 impl Rec<'_> {
-    fn k(&mut self, key: &str, src: &str, entry: &str, bufs: &[&wgpu::Buffer], grid: (u32, u32, u32)) -> Option<()> {
-        let pipe = zi::pipeline(self.c, key, src, entry)?;
-        let b = zi::bg(self.c, &pipe, bufs);
-        self.calls.push(Class::Io, Call { pipe, bg: b, grid });
+    fn k(&mut self, key: &str, src: &str, entry_point: &str, bufs: &[Bind], grid: (u32, u32, u32)) -> Option<()> {
+        let pipe = zi::pipeline(self.c, key, src, entry_point)?;
+        if bufs.iter().any(|b| b.1.is_some_and(|(off, _)| off % self.align != 0)) {
+            return None;
+        }
+        let entries: Vec<wgpu::BindGroupEntry> = bufs.iter().enumerate().map(|(i, b)| entry(i as u32, b)).collect();
+        let bg = self.c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("qv"),
+            layout: &pipe.get_bind_group_layout(0),
+            entries: &entries,
+        });
+        self.calls.push(Class::Io, Call { pipe, bg, grid });
         Some(())
     }
 
     /// conv of the f16 NHWC image `act` (`h × w` output; `up` = the input
     /// is at half size) → raw (bias-free) f32 `[mp][cout_p]`.
-    fn conv(&mut self, cv: &QConv, act: &wgpu::Buffer, h: usize, w: usize, up: bool, out: &wgpu::Buffer) -> Option<()> {
+    fn conv(&mut self, cv: &QConv, act: Bind, h: usize, w: usize, up: bool, out: &wgpu::Buffer) -> Option<()> {
+        self.conv_s(cv, act, h, w, up, out, 1.0)
+    }
+
+    /// `conv` with the f32 epilogue times `oscale`.
+    #[allow(clippy::too_many_arguments)]
+    fn conv_s(&mut self, cv: &QConv, act: Bind, h: usize, w: usize, up: bool, out: &wgpu::Buffer, oscale: f32) -> Option<()> {
         let conv = match (cv.k, up) {
             (3, false) => 1,
             (3, true) => 2,
             (1, false) => 0,
             _ => return None,
         };
+        if act.1.is_some_and(|(off, _)| off % self.align != 0) {
+            return None;
+        }
         let m = (h * w) as u32;
         let words = [
             m,
@@ -397,14 +480,14 @@ impl Rec<'_> {
             cv.cout_p as u32,
             0,
             0,
-            1f32.to_bits(),
+            oscale.to_bits(),
             0,
             w as u32,
             h as u32,
             cv.cin_p as u32,
             0,
         ];
-        let mc = mmc(self.c, tile(cv.cout_p, conv, Epi::F32), words, &cv.plane, act, out, None)?;
+        let mc = mmc(self.c, tile(cv.cout_p, conv, Epi::F32), words, &cv.plane, act, (out, None))?;
         self.calls.push_mm(Class::Io, mc);
         Some(())
     }
@@ -416,23 +499,38 @@ impl Rec<'_> {
         let flags = bias.is_some() as u32 | if silu { 2 } else { 0 };
         let u = zi::ubuf(self.c, &[m as u32, mp as u32, cp as u32, c_real as u32, flags, 0, 0, 0]);
         let z = self.zero;
-        self.k("qv_rmsn", RMSN_SRC, "qv_rmsn", &[x, bias.unwrap_or(z), g, out, &u], ((mp as u32).min(65535), (mp as u32).div_ceil(65535), 1))
+        self.k(
+            "qv_rmsn",
+            RMSN_SRC,
+            "qv_rmsn",
+            &[(x, None), (bias.unwrap_or(z), None), (g, None), (out, None), (&u, None)],
+            ((mp as u32).min(65535), (mp as u32).div_ceil(65535), 1),
+        )
     }
 
     /// mode 0: x += h + hb; mode 1: x = s + sb + h + hb; mode 2: x = h + hb.
     #[allow(clippy::too_many_arguments)]
-    fn combine(&mut self, x: &wgpu::Buffer, h: &wgpu::Buffer, hb: &wgpu::Buffer, s: Option<(&wgpu::Buffer, &wgpu::Buffer)>, mode: u32, n: usize, ch: usize) -> Option<()> {
+    fn combine(&mut self, x: &wgpu::Buffer, h: Bind, hb: &wgpu::Buffer, s: Option<(&wgpu::Buffer, &wgpu::Buffer)>, mode: u32, n: usize, ch: usize) -> Option<()> {
         let u = zi::ubuf(self.c, &[n as u32, ch as u32, mode, 0]);
         let z = self.zero;
         let (sb, sbb) = s.unwrap_or((z, z));
-        self.k("zv_combine", zi::VAE_COMBINE_SRC, "vae_combine", &[x, h, hb, sb, sbb, &u], grid1(n))
+        self.k(
+            "zv_combine",
+            zi::VAE_COMBINE_SRC,
+            "vae_combine",
+            &[(x, None), h, (hb, None), (sb, None), (sbb, None), (&u, None)],
+            grid1(n),
+        )
     }
 
-    fn cast(&mut self, x: &wgpu::Buffer, b: Option<&wgpu::Buffer>, m: usize, ch: usize, out: &wgpu::Buffer) -> Option<()> {
+    /// f32 → f16 conv input, times `scale` (a power of two: the raw
+    /// stream's range guard, undone in the consuming conv's epilogue).
+    #[allow(clippy::too_many_arguments)]
+    fn cast(&mut self, x: &wgpu::Buffer, b: Option<&wgpu::Buffer>, m: usize, ch: usize, out: &wgpu::Buffer, scale: f32) -> Option<()> {
         let mp = mp_of(m);
-        let u = zi::ubuf(self.c, &[m as u32, mp as u32, ch as u32, b.is_some() as u32]);
+        let u = zi::ubuf(self.c, &[m as u32, mp as u32, ch as u32, b.is_some() as u32, scale.to_bits(), 0, 0, 0]);
         let z = self.zero;
-        self.k("zv_cast", zi::VAE_CAST_SRC, "vae_cast", &[x, b.unwrap_or(z), out, &u], grid1(mp * ch / 4))
+        self.k("qv_cast", CAST_SRC, "qv_cast", &[(x, None), (b.unwrap_or(z), None), (out, None), (&u, None)], grid1(mp * ch / 4))
     }
 
     /// One resnet on `x` `[h·w][cin_p]` → `x` `[h·w][cout_p]`.
@@ -442,17 +540,18 @@ impl Rec<'_> {
         if r.c1.cin_p != cin_p {
             return None;
         }
-        self.rmsn(&b.x, None, &r.g1, r.cin, cin_p, m, true, &b.xn)?;
-        self.conv(&r.c1, &b.xn, h, w, false, &b.h)?;
-        self.rmsn(&b.h, Some(&r.c1.bias), &r.g2, r.c1.cout, r.c1.cout_p, m, true, &b.xn)?;
-        self.conv(&r.c2, &b.xn, h, w, false, &b.h)?;
+        self.rmsn(b.x, None, &r.g1, r.cin, cin_p, m, true, b.xn)?;
+        self.conv(&r.c1, (b.xn, None), h, w, false, b.h)?;
+        self.rmsn(b.h, Some(&r.c1.bias), &r.g2, r.c1.cout, r.c1.cout_p, m, true, b.xn)?;
+        self.conv(&r.c2, (b.xn, None), h, w, false, b.h)?;
         match &r.sc {
             Some(sc) => {
-                self.cast(&b.x, None, m, cin_p, &b.xn)?;
-                self.conv(sc, &b.xn, h, w, false, &b.s)?;
-                self.combine(&b.x, &b.h, &r.c2.bias, Some((&b.s, &sc.bias)), 1, mp * cout_p, cout_p)?;
+                let g = guard();
+                self.cast(b.x, None, m, cin_p, b.xn, 1.0 / g)?;
+                self.conv_s(sc, (b.xn, None), h, w, false, b.s, g)?;
+                self.combine(b.x, (b.h, None), &r.c2.bias, Some((b.s, &sc.bias)), 1, mp * cout_p, cout_p)?;
             }
-            None => self.combine(&b.x, &b.h, &r.c2.bias, None, 0, mp * cout_p, cout_p)?,
+            None => self.combine(b.x, (b.h, None), &r.c2.bias, None, 0, mp * cout_p, cout_p)?,
         }
         Some(cout_p)
     }
@@ -467,18 +566,18 @@ fn attention(r: &mut Rec, v: &QVae, b: &Bufs, m: usize) -> Option<()> {
     if cp != cc || !cc.is_multiple_of(128) {
         return None;
     }
-    r.rmsn(&b.x, None, &v.ag, cc, cp, m, false, &b.xn)?;
+    r.rmsn(b.x, None, &v.ag, cc, cp, m, false, b.xn)?;
     let q16 = zi::sbuf(c, (mp * cc * 2) as u64, "qv_q");
     let k16 = zi::sbuf(c, (mp * cc * 2) as u64, "qv_k");
     let vt16 = zi::sbuf(c, (cc * mp * 2) as u64, "qv_vt");
     let o32 = zi::sbuf(c, (mp * cc * 4) as u64, "qv_o");
-    r.conv(&v.aq, &b.xn, m, 1, false, &b.h)?;
-    r.cast(&b.h, Some(&v.aq.bias), m, cc, &q16)?;
-    r.conv(&v.ak, &b.xn, m, 1, false, &b.h)?;
-    r.cast(&b.h, Some(&v.ak.bias), m, cc, &k16)?;
+    r.conv(&v.aq, (b.xn, None), m, 1, false, b.h)?;
+    r.cast(b.h, Some(&v.aq.bias), m, cc, &q16, 1.0)?;
+    r.conv(&v.ak, (b.xn, None), m, 1, false, b.h)?;
+    r.cast(b.h, Some(&v.ak.bias), m, cc, &k16, 1.0)?;
     // Vᵀ [c][mp] = Wv · xnᵀ (the bias is added after P·V: P's rows sum to 1)
     let w = [cc as u32, mp as u32, cc as u32, mp as u32, 0, 0, 1f32.to_bits(), 0, 0, 0, 0, 0];
-    let mc = mmc(c, zi::default_cfg(Epi::F16), w, &b.xn, &v.av.plane, &vt16, None)?;
+    let mc = mmc(c, zi::default_cfg(Epi::F16), w, b.xn, (&v.av.plane, None), (&vt16, None))?;
     r.calls.push_mm(Class::Io, mc);
     // query chunks: S [rows][mp] f32 ≤ 128 MB
     let rows = ((32usize << 20) / mp).clamp(128, mp) / 128 * 128;
@@ -489,43 +588,265 @@ fn attention(r: &mut Rec, v: &QVae, b: &Bufs, m: usize) -> Option<()> {
     while q0 < mp {
         let rq = rows.min(mp - q0);
         let w = [rq as u32, mp as u32, cc as u32, mp as u32, 0, q0 as u32, scale.to_bits(), 0, 0, 0, 0, 0];
-        let mc = mmc(c, zi::default_cfg(Epi::F32), w, &k16, &q16, &sc, None)?;
+        let mc = mmc(c, zi::default_cfg(Epi::F32), w, &k16, (&q16, None), (&sc, None))?;
         r.calls.push_mm(Class::Io, mc);
         let u = zi::ubuf(c, &[mp as u32, m as u32, 0, 0]);
-        r.k("zv_softmax", zi::VAE_SOFTMAX_SRC, "vae_softmax", &[&sc, &pr, &u], ((rq as u32).min(65535), (rq as u32).div_ceil(65535), 1))?;
+        r.k(
+            "zv_softmax",
+            zi::VAE_SOFTMAX_SRC,
+            "vae_softmax",
+            &[(&sc, None), (&pr, None), (&u, None)],
+            ((rq as u32).min(65535), (rq as u32).div_ceil(65535), 1),
+        )?;
         let w = [rq as u32, cc as u32, mp as u32, cc as u32, 0, 0, 1f32.to_bits(), 0, 0, 0, 0, 0];
-        let mc = mmc(c, zi::default_cfg(Epi::F32), w, &vt16, &pr, &o32, Some(((q0 * cc * 4) as u64, (rq * cc * 4) as u64)))?;
+        let mc = mmc(c, zi::default_cfg(Epi::F32), w, &vt16, (&pr, None), (&o32, Some(((q0 * cc * 4) as u64, (rq * cc * 4) as u64))))?;
         r.calls.push_mm(Class::Io, mc);
         q0 += rq;
     }
-    r.cast(&o32, Some(&v.av.bias), m, cc, &b.xn)?;
-    r.conv(&v.ap, &b.xn, m, 1, false, &b.h)?;
-    r.combine(&b.x, &b.h, &v.ap.bias, None, 0, mp * cc, cc)
+    r.cast(&o32, Some(&v.av.bias), m, cc, b.xn, 1.0)?;
+    r.conv(&v.ap, (b.xn, None), m, 1, false, b.h)?;
+    r.combine(b.x, (b.h, None), &v.ap.bias, None, 0, mp * cc, cc)
 }
 
-/// Largest NHWC element counts of one decode: (x/h/xn, shortcut s, the
-/// up block's saved input).
-fn sizes(v: &QVae, h0: usize, w0: usize) -> (usize, usize, usize) {
-    let mut big = mp_of(h0 * w0) * v.conv_in.cout_p.max(v.pq.cout_p).max(cpad(v.ac));
-    let (mut sc, mut cp) = (0usize, 0usize);
-    let (mut h, mut w) = (h0, w0);
+// ───────────────────────────── bands ─────────────────────────────
+//
+// Everything after the mid block is spatially local: per-pixel RMS norms,
+// 3×3 / 1×1 convs, nearest-2× upsampling, the DupUp shortcut. So the
+// high-resolution stages can run in horizontal bands. The leading up
+// blocks run on the whole frame while their tensors fit a binding; from
+// block S on every band starts from the saved whole-frame stream with a
+// halo, and each stage is fed only the rows the next one needs: walking
+// back from a band's kept output rows, a 3×3 conv needs one more row on
+// each side, an upsample halves the range (rounded outward). Rows next to
+// a band edge are wrong (the conv sees zero padding there) but never
+// reach a kept row; at the frame's own top and bottom the band edge IS
+// the frame edge, so the zero padding is the real one. Every output
+// pixel is computed by the same kernels on the same inputs as in the
+// whole-frame decode, so the kept rows are bit-for-bit the same.
+
+/// Rows `[lo, hi)` of one resolution level of the frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Rows {
+    lo: usize,
+    hi: usize,
+}
+
+impl Rows {
+    fn n(&self) -> usize {
+        self.hi - self.lo
+    }
+}
+
+fn grow(r: Rows, k: usize, h: usize) -> Rows {
+    Rows {
+        lo: r.lo.saturating_sub(k),
+        hi: (r.hi + k).min(h),
+    }
+}
+
+fn half(r: Rows) -> Rows {
+    Rows {
+        lo: r.lo / 2,
+        hi: r.hi.div_ceil(2),
+    }
+}
+
+/// The level of every up block and of the output.
+fn levels(v: &QVae) -> (Vec<usize>, usize) {
+    let mut l = 0;
+    let mut out = Vec::with_capacity(v.ups.len());
     for u in &v.ups {
-        let mp = mp_of(h * w);
-        cp = cp.max(mp * cpad(u.in_dim));
+        out.push(l);
+        l += u.up.is_some() as usize;
+    }
+    (out, l)
+}
+
+/// One band: the rows of the saved stream it starts from (the input
+/// level of block S), the rows each up block feeds to its upsample, the
+/// kept output rows.
+#[derive(Clone, Debug)]
+struct Band {
+    input: Rows,
+    feed: Vec<Rows>,
+    keep: Rows,
+}
+
+/// Walk back from the kept output rows through blocks `s..`.
+fn plan_band(v: &QVae, s: usize, keep: Rows, hs: &[usize]) -> Band {
+    let (lvl, lf) = levels(v);
+    let mut e = grow(keep, v.conv_out.k / 2, hs[lf]);
+    let mut feed = vec![Rows { lo: 0, hi: 0 }; v.ups.len()];
+    for i in (s..v.ups.len()).rev() {
+        let u = &v.ups[i];
+        if let Some((cv, _)) = &u.up {
+            // the up conv needs its (upsampled) input one row wider; the
+            // upsample reads half the rows
+            let a = half(grow(e, cv.k / 2, hs[lvl[i] + 1]));
+            feed[i] = a;
+            e = a;
+        }
+        let convs: usize = u.res.iter().map(|r| r.c1.k / 2 + r.c2.k / 2).sum();
+        e = grow(e, convs, hs[lvl[i]]);
+    }
+    Band { input: e, feed, keep }
+}
+
+/// Largest element counts one pass needs: (x/h/xn, shortcut s, saved input cp).
+#[derive(Clone, Copy, Default)]
+struct Need {
+    big: usize,
+    sc: usize,
+    cp: usize,
+}
+
+impl Need {
+    fn max(self, o: Need) -> Need {
+        Need {
+            big: self.big.max(o.big),
+            sc: self.sc.max(o.sc),
+            cp: self.cp.max(o.cp),
+        }
+    }
+    fn fits(&self, lim: usize) -> bool {
+        self.big.max(self.sc).max(self.cp) * 4 <= lim
+    }
+}
+
+/// What blocks `blocks` (and the output stage, when `fin`) need, starting
+/// from `cur` rows at the first block's level; `feed(i, cur)` = the rows
+/// block i feeds to its upsample.
+fn need_blocks(v: &QVae, blocks: std::ops::Range<usize>, mut cur: Rows, w0: usize, feed: &dyn Fn(usize, Rows) -> Rows, fin: bool) -> Need {
+    let (lvl, lf) = levels(v);
+    let mut n = Need::default();
+    for i in blocks {
+        let u = &v.ups[i];
+        let w = w0 << lvl[i];
+        let mp = mp_of(cur.n() * w);
+        if u.up.is_some() {
+            n.cp = n.cp.max(mp * cpad(u.in_dim));
+        }
         for r in &u.res {
-            big = big.max(mp * r.c1.cin_p.max(r.c2.cout_p));
+            n.big = n.big.max(mp * r.c1.cin_p.max(r.c2.cout_p));
             if r.sc.is_some() {
-                sc = sc.max(mp * r.c2.cout_p);
+                n.sc = n.sc.max(mp * r.c2.cout_p);
             }
         }
         if let Some((cv, _)) = &u.up {
-            h *= 2;
-            w *= 2;
-            big = big.max(mp_of(h * w) * cv.cout_p);
+            let f = feed(i, cur);
+            cur = Rows { lo: 2 * f.lo, hi: 2 * f.hi };
+            n.big = n.big.max(mp_of(cur.n() * 2 * w) * cv.cout_p);
         }
     }
-    big = big.max(mp_of(h * w) * v.conv_out.cout_p.max(v.conv_out.cin_p));
-    (big, sc.max(1), cp.max(1))
+    if fin {
+        let w = w0 << lf;
+        n.big = n.big.max(mp_of(cur.n() * w) * v.conv_out.cout_p.max(v.conv_out.cin_p));
+    }
+    n
+}
+
+/// Run up blocks `blocks` on `b` whose `x` holds rows `cur` of the first
+/// block's level (buffer row 0 = `cur.lo`); `feed(i, cur)` = the rows block
+/// i feeds to its upsample (⊂ `cur`). Returns the rows `x` then holds and
+/// their channel padding.
+#[allow(clippy::too_many_arguments)]
+fn run_blocks(
+    r: &mut Rec,
+    v: &QVae,
+    b: &Bufs,
+    blocks: std::ops::Range<usize>,
+    mut cur: Rows,
+    w0: usize,
+    mut ch: usize,
+    feed: &dyn Fn(usize, Rows) -> Rows,
+) -> Option<(Rows, usize)> {
+    let (lvl, _) = levels(v);
+    for i in blocks {
+        let u = &v.ups[i];
+        let w = w0 << lvl[i];
+        let hh = cur.n();
+        let (m, mp) = (hh * w, mp_of(hh * w));
+        if u.up.is_some() {
+            if ch != cpad(u.in_dim) {
+                return None;
+            }
+            // save the block's input for the DupUp shortcut
+            r.combine(b.cp, (b.x, None), r.zero, None, 2, mp * ch, ch)?;
+        }
+        let cin = ch;
+        for rs in &u.res {
+            ch = r.resnet(b, rs, hh, w, ch)?;
+        }
+        if let Some((cv, ft)) = &u.up {
+            if cv.cin_p != ch || cv.cout != u.out_dim {
+                return None;
+            }
+            let f = feed(i, cur);
+            if f.lo < cur.lo || f.hi > cur.hi || f.n() == 0 {
+                return None;
+            }
+            let skip = (f.lo - cur.lo) as u64;
+            let g = guard();
+            r.cast(b.x, None, m, ch, b.xn, 1.0 / g)?;
+            let row16 = (w * ch * 2) as u64;
+            let (h2, w2) = (2 * f.n(), 2 * w);
+            r.conv_s(cv, (b.xn, Some((skip * row16, f.n() as u64 * row16))), h2, w2, true, b.h, g)?;
+            ch = cv.cout_p;
+            r.combine(b.x, (b.h, None), &cv.bias, None, 2, mp_of(h2 * w2) * ch, ch)?;
+            let factor = ft * 4;
+            if !(u.out_dim * factor).is_multiple_of(u.in_dim) {
+                return None;
+            }
+            let repeats = u.out_dim * factor / u.in_dim;
+            let uu = zi::ubuf(
+                r.c,
+                &[f.n() as u32, w as u32, cin as u32, u.out_dim as u32, ch as u32, factor as u32, repeats as u32, *ft as u32],
+            );
+            let row32 = (w * cin * 4) as u64;
+            r.k(
+                "qv_dupup",
+                DUPUP_SRC,
+                "qv_dupup",
+                &[(b.cp, Some((skip * row32, f.n() as u64 * row32))), (b.x, None), (&uu, None)],
+                grid1(h2 * w2 * u.out_dim),
+            )?;
+            cur = Rows { lo: 2 * f.lo, hi: 2 * f.hi };
+        }
+    }
+    Some((cur, ch))
+}
+
+/// norm_out + SiLU → conv_out on `x` (rows `cur` of the output level) →
+/// the kept rows into the frame output `ob` `[nch][hf·wf]`.
+#[allow(clippy::too_many_arguments)]
+fn output_rows(r: &mut Rec, v: &QVae, b: &Bufs, cur: Rows, w: usize, ch: usize, keep: Rows, ob: &wgpu::Buffer, tot: usize, nch: usize) -> Option<()> {
+    if v.conv_out.cin_p != ch || cpad(v.no_c) != ch || keep.lo < cur.lo || keep.hi > cur.hi {
+        return None;
+    }
+    let m = cur.n() * w;
+    r.rmsn(b.x, None, &v.no, v.no_c, ch, m, true, b.xn)?;
+    r.conv(&v.conv_out, (b.xn, None), cur.n(), w, false, b.h)?;
+    let n = keep.n() * w;
+    let u = zi::ubuf(
+        r.c,
+        &[n as u32, v.conv_out.cout_p as u32, nch as u32, ((keep.lo - cur.lo) * w) as u32, (keep.lo * w) as u32, tot as u32, 0, 0],
+    );
+    r.k("qv_out", OUT_SRC, "qv_out", &[(b.h, None), (&v.conv_out.bias, None), (ob, None), (&u, None)], grid1(n))
+}
+
+fn env_usize(k: &str) -> Option<usize> {
+    std::env::var(k).ok().and_then(|v| v.trim().parse().ok())
+}
+
+/// Record, submit and wait for one list under a validation scope.
+fn run_list(c: &Ctx, calls: &ZCalls) -> bool {
+    let vs = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let ran = calls.run().is_some();
+    if let Some(e) = pollster::block_on(vs.pop()) {
+        eprintln!("qwen-image-2.1 vae chain: {e}");
+        return false;
+    }
+    ran
 }
 
 /// Resident decode; see the module doc. `false` = declined, `out` untouched.
@@ -555,39 +876,90 @@ pub(crate) fn decode(a: &Qi21VaeDecodeArgs, z: &[f32], h0: usize, w0: usize, out
     }
     let v = g.as_ref().unwrap();
     let t1 = std::time::Instant::now();
-    let (big, scn, cpn) = sizes(v, h0, w0);
-    let lim = c.device.limits();
-    let maxb = lim.max_storage_buffer_binding_size.min(lim.max_buffer_size);
-    if (big * 4) as u64 > maxb {
-        return decline(&format!(
-            "a {} MB activation exceeds the {} MB binding limit at {hf}×{wf}",
-            (big * 4) >> 20,
-            maxb >> 20
-        ));
+    let nb = v.ups.len();
+    let (_, lf) = levels(v);
+    let hs: Vec<usize> = (0..=lf).map(|l| h0 << l).collect();
+    let lim_dev = c.device.limits();
+    let lim = lim_dev.max_storage_buffer_binding_size.min(lim_dev.max_buffer_size) as usize;
+    let full = |l: usize| Rows { lo: 0, hi: hs[l] };
+    let whole = |_: usize, cur: Rows| cur;
+    // the head (conv_in, mid block, attention) at the latent resolution
+    let head = Need {
+        big: mp_of(h0 * w0) * v.conv_in.cout_p.max(v.pq.cout_p).max(cpad(v.ac)),
+        ..Default::default()
+    };
+    // S = how many up blocks run on the whole frame
+    let forced = env_usize("CMF_QI21_VAE_BAND_ROWS").filter(|&k| k > 0);
+    let auto_s = (0..=nb)
+        .rev()
+        .find(|&s| head.max(need_blocks(v, 0..s, full(0), w0, &whole, s == nb)).fits(lim));
+    let Some(auto_s) = auto_s else {
+        return decline(&format!("the latent-resolution tensors exceed the {} MB binding limit", lim >> 20));
+    };
+    let s = match (forced, env_usize("CMF_QI21_VAE_BAND_FROM")) {
+        (_, Some(f)) => f.min(auto_s),
+        (Some(_), None) => auto_s.min(1),
+        (None, None) => auto_s,
+    };
+    let need_whole = head.max(need_blocks(v, 0..s, full(0), w0, &whole, s == nb));
+    // bands: the fewest (equal) bands whose tensors fit a binding
+    let hfin = hs[lf];
+    let plan = |nbands: usize| -> Vec<Band> {
+        let k = hfin.div_ceil(nbands.max(1));
+        (0..hfin.div_ceil(k))
+            .map(|j| plan_band(v, s, Rows { lo: j * k, hi: ((j + 1) * k).min(hfin) }, &hs))
+            .collect()
+    };
+    let band_need = |bands: &[Band]| -> Need {
+        bands.iter().fold(Need::default(), |acc, bd| {
+            let f = |i: usize, _: Rows| bd.feed[i];
+            acc.max(need_blocks(v, s..nb, bd.input, w0, &f, true))
+        })
+    };
+    let mut bands: Vec<Band> = Vec::new();
+    let mut need_band = Need::default();
+    if s < nb {
+        let mut nbands = forced.map_or(1, |k| hfin.div_ceil(k));
+        loop {
+            bands = plan(nbands);
+            need_band = band_need(&bands);
+            if need_band.fits(lim) || forced.is_some() {
+                break;
+            }
+            if hfin / nbands <= 16 {
+                return decline(&format!("no band of {hf}×{wf} fits the {} MB binding limit", lim >> 20));
+            }
+            nbands += 1;
+        }
+        if !need_band.fits(lim) {
+            return decline(&format!("CMF_QI21_VAE_BAND_ROWS bands exceed the {} MB binding limit", lim >> 20));
+        }
     }
+    let all = need_whole.max(need_band);
+    let band_x = if s < nb { need_band.big } else { 0 };
+    let bytes = (all.big * (4 + 2) + need_whole.big * 4 + band_x * 4 + all.sc * 4 + all.cp * 4 + nch * hf * wf * 4) as u64;
     let budget = super::device_vram_budget();
-    let need = (big * (4 + 4 + 2) + scn * 4 + cpn * 4) as u64;
-    if budget > 0 && need + super::resident_bytes() > budget {
-        return decline(&format!("the activations need {:.1} GB", need as f64 / 1e9));
+    if budget > 0 && bytes + super::resident_bytes() > budget {
+        return decline(&format!("the activations need {:.1} GB", bytes as f64 / 1e9));
     }
     let sc = c.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-    let bufs = Bufs {
-        x: zi::sbuf(c, (big * 4) as u64, "qv_x"),
-        h: zi::sbuf(c, (big * 4) as u64, "qv_h"),
-        s: zi::sbuf(c, (scn * 4) as u64, "qv_s"),
-        xn: zi::sbuf(c, (big * 2) as u64, "qv_xn"),
-        cp: zi::sbuf(c, (cpn * 4) as u64, "qv_cp"),
-    };
+    let xw = zi::sbuf(c, (need_whole.big * 4) as u64, "qv_x");
+    let xb = zi::sbuf(c, (band_x.max(1) * 4) as u64, "qv_xb");
+    let h = zi::sbuf(c, (all.big * 4) as u64, "qv_h");
+    let sbuf = zi::sbuf(c, (all.sc.max(1) * 4) as u64, "qv_s");
+    let xn = zi::sbuf(c, (all.big * 2) as u64, "qv_xn");
+    let cp = zi::sbuf(c, (all.cp.max(1) * 4) as u64, "qv_cp");
+    let ob = zi::sbuf(c, (nch * hf * wf * 4) as u64, "qv_out");
     if pollster::block_on(sc.pop()).is_some() {
         return decline("the activations did not fit");
     }
-    let mut r = Rec {
-        c,
-        calls: ZCalls::default(),
-        zero: &v.zero,
-    };
-    let recorded = (|| -> Option<wgpu::Buffer> {
-        // the latent: NHWC f16 [mp0][cpad(z)]
+    let wbufs = Bufs { x: &xw, h: &h, s: &sbuf, xn: &xn, cp: &cp };
+    let bbufs = Bufs { x: &xb, h: &h, s: &sbuf, xn: &xn, cp: &cp };
+    let align = lim_dev.min_storage_buffer_offset_alignment as u64;
+    let mut dispatches = 0usize;
+    // the whole-frame part: head + blocks 0..s (+ the output when s = nb)
+    let mut r = Rec { c, calls: ZCalls::default(), zero: &v.zero, align };
+    let whole_part = (|| -> Option<(Rows, usize)> {
         let (m0, mp0) = (h0 * w0, mp_of(h0 * w0));
         let zp = v.pq.cin_p;
         let mut zin = vec![0u16; mp0 * zp];
@@ -597,83 +969,73 @@ pub(crate) fn decode(a: &Qi21VaeDecodeArgs, z: &[f32], h0: usize, w0: usize, out
             }
         }
         let zbuf = zi::sbuf_init(c, bytemuck::cast_slice(&zin), "qv_z");
-        r.conv(&v.pq, &zbuf, m0, 1, false, &bufs.h)?;
-        r.cast(&bufs.h, Some(&v.pq.bias), m0, v.pq.cout_p, &bufs.xn)?;
+        let b = &wbufs;
+        r.conv(&v.pq, (&zbuf, None), m0, 1, false, b.h)?;
+        r.cast(b.h, Some(&v.pq.bias), m0, v.pq.cout_p, b.xn, 1.0)?;
         if v.conv_in.cin_p != v.pq.cout_p {
             return None;
         }
-        r.conv(&v.conv_in, &bufs.xn, h0, w0, false, &bufs.h)?;
+        r.conv(&v.conv_in, (b.xn, None), h0, w0, false, b.h)?;
         let mut ch = v.conv_in.cout_p;
-        r.combine(&bufs.x, &bufs.h, &v.conv_in.bias, None, 2, mp0 * ch, ch)?;
-        ch = r.resnet(&bufs, &v.mid[0], h0, w0, ch)?;
+        r.combine(b.x, (b.h, None), &v.conv_in.bias, None, 2, mp0 * ch, ch)?;
+        ch = r.resnet(b, &v.mid[0], h0, w0, ch)?;
         if ch != cpad(v.ac) {
             return None;
         }
-        attention(&mut r, v, &bufs, m0)?;
-        ch = r.resnet(&bufs, &v.mid[1], h0, w0, ch)?;
-        let (mut hh, mut ww) = (h0, w0);
-        for u in &v.ups {
-            let (m, mp) = (hh * ww, mp_of(hh * ww));
-            if u.up.is_some() {
-                if ch != cpad(u.in_dim) {
-                    return None;
-                }
-                // save the block's input for the DupUp shortcut
-                r.combine(&bufs.cp, &bufs.x, &v.zero, None, 2, mp * ch, ch)?;
-            }
-            for rs in &u.res {
-                ch = r.resnet(&bufs, rs, hh, ww, ch)?;
-            }
-            if let Some((cv, ft)) = &u.up {
-                if cv.cin_p != ch || cv.cout != u.out_dim {
-                    return None;
-                }
-                r.cast(&bufs.x, None, m, ch, &bufs.xn)?;
-                hh *= 2;
-                ww *= 2;
-                r.conv(cv, &bufs.xn, hh, ww, true, &bufs.h)?;
-                ch = cv.cout_p;
-                let (m2, mp2) = (hh * ww, mp_of(hh * ww));
-                r.combine(&bufs.x, &bufs.h, &cv.bias, None, 2, mp2 * ch, ch)?;
-                let factor = ft * 4;
-                if !(u.out_dim * factor).is_multiple_of(u.in_dim) {
-                    return None;
-                }
-                let repeats = u.out_dim * factor / u.in_dim;
-                let uu = zi::ubuf(
-                    c,
-                    &[(hh / 2) as u32, (ww / 2) as u32, cpad(u.in_dim) as u32, u.out_dim as u32, ch as u32, factor as u32, repeats as u32, *ft as u32],
-                );
-                r.k("qv_dupup", DUPUP_SRC, "qv_dupup", &[&bufs.cp, &bufs.x, &uu], grid1(m2 * u.out_dim))?;
-            }
+        attention(&mut r, v, b, m0)?;
+        ch = r.resnet(b, &v.mid[1], h0, w0, ch)?;
+        let (cur, ch) = run_blocks(&mut r, v, b, 0..s, full(0), w0, ch, &whole)?;
+        if s == nb {
+            output_rows(&mut r, v, b, cur, w0 << lf, ch, full(lf), &ob, hf * wf, nch)?;
         }
-        let m = hh * ww;
-        if v.conv_out.cin_p != ch || cpad(v.no_c) != ch {
-            return None;
-        }
-        r.rmsn(&bufs.x, None, &v.no, v.no_c, ch, m, true, &bufs.xn)?;
-        r.conv(&v.conv_out, &bufs.xn, hh, ww, false, &bufs.h)?;
-        let ob = zi::sbuf(c, (nch * m * 4) as u64, "qv_out");
-        let u = zi::ubuf(c, &[m as u32, v.conv_out.cout_p as u32, nch as u32, 0]);
-        r.k("qv_out", OUT_SRC, "qv_out", &[&bufs.h, &v.conv_out.bias, &ob, &u], grid1(m))?;
-        Some(ob)
+        Some((cur, ch))
     })();
-    let Some(ob) = recorded else {
+    let Some((cur_s, ch_s)) = whole_part else {
         return decline("the chain could not be recorded for this decoder");
     };
-    let vs = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
-    let ran = r.calls.run().is_some();
-    if let Some(e) = pollster::block_on(vs.pop()) {
-        eprintln!("qwen-image-2.1 vae chain: {e}");
+    dispatches += r.calls.len();
+    if !run_list(c, &r.calls) {
         return decline("a decode command buffer failed");
     }
-    if !ran {
-        return false;
+    // the bands: blocks s..nb from the saved stream in `xw`
+    for bd in &bands {
+        let mut r = Rec { c, calls: ZCalls::default(), zero: &v.zero, align };
+        let ls = levels(v).0[s];
+        let w = w0 << ls;
+        let recorded = (|| -> Option<()> {
+            if cur_s != full(ls) || bd.input.hi > cur_s.hi {
+                return None;
+            }
+            let row32 = (w * ch_s * 4) as u64;
+            let n = bd.input.n() * w * ch_s;
+            r.combine(
+                &xb,
+                (&xw, Some((bd.input.lo as u64 * row32, bd.input.n() as u64 * row32))),
+                &v.zero,
+                None,
+                2,
+                n,
+                ch_s,
+            )?;
+            let f = |i: usize, _: Rows| bd.feed[i];
+            let (cur, ch) = run_blocks(&mut r, v, &bbufs, s..nb, bd.input, w0, ch_s, &f)?;
+            output_rows(&mut r, v, &bbufs, cur, w0 << lf, ch, bd.keep, &ob, hf * wf, nch)
+        })();
+        if recorded.is_none() {
+            return decline("a band could not be recorded (offset alignment or shapes)");
+        }
+        dispatches += r.calls.len();
+        if !run_list(c, &r.calls) {
+            return decline("a decode command buffer failed");
+        }
     }
     let Some(raw) = zi::read_bytes(c, &ob, (nch * hf * wf * 4) as u64) else {
         return decline("the decode readback failed");
     };
     out.copy_from_slice(bytemuck::cast_slice(&raw));
+    if let Ok(path) = std::env::var("CMF_QI21_VAE_DUMP") {
+        let _ = std::fs::write(&path, &raw);
+    }
     // the chain's pipelines were compiled at first use: keep them for the
     // next process (once per process)
     static FLUSHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -681,11 +1043,15 @@ pub(crate) fn decode(a: &Qi21VaeDecodeArgs, z: &[f32], h0: usize, w0: usize, out
         super::pipeline_cache_flush();
     }
     if prof_on() {
+        let bandinfo = if bands.is_empty() {
+            "whole frame".to_string()
+        } else {
+            format!("{} blocks whole, then {} bands of {} rows", s, bands.len(), bands[0].keep.n())
+        };
         eprintln!(
-            "qi21 vae chain: {hf}×{wf} decode {:.2}s ({} dispatches, {:.1} GB activations)",
+            "qi21 vae chain: {hf}×{wf} decode {:.2}s ({bandinfo}; {dispatches} dispatches, {:.1} GB activations)",
             t1.elapsed().as_secs_f64(),
-            r.calls.len(),
-            need as f64 / 1e9
+            bytes as f64 / 1e9
         );
     }
     true
@@ -695,5 +1061,25 @@ pub(crate) fn decode(a: &Qi21VaeDecodeArgs, z: &[f32], h0: usize, w0: usize, out
 pub(crate) fn release() {
     if let Ok(mut g) = VSTATE.lock() {
         *g = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn band_rows_walk_back_through_the_stages() {
+        // one 3×3 conv at the output, one up block (two 3×3 resnet convs,
+        // then 2× + a 3×3 conv): keep rows [100, 164) of 256
+        let k = Rows { lo: 100, hi: 164 };
+        let e = grow(k, 1, 256); // conv_out
+        let e = grow(e, 0, 256); // a final block without resnets
+        let a = half(grow(e, 1, 256)); // the up conv, then the upsample
+        assert_eq!(a, Rows { lo: 49, hi: 83 });
+        let input = grow(a, 2, 128);
+        assert_eq!(input, Rows { lo: 47, hi: 85 });
+        // at the frame edges the band stops at the edge
+        assert_eq!(grow(Rows { lo: 0, hi: 10 }, 3, 12), Rows { lo: 0, hi: 12 });
     }
 }

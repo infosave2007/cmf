@@ -800,6 +800,67 @@ impl Qi21Vae {
 mod tests {
     use super::*;
 
+    /// The decoder on a large random latent (the device path when one is
+    /// up): `CMF_QI21_VAE_TEST=<container>`, `CMF_QI21_VAE_TEST_HW=<h>x<w>`
+    /// latent tokens (default 256x256 = a 4096² image). Prints the time.
+    #[test]
+    #[ignore]
+    fn large_decode() {
+        let Ok(path) = std::env::var("CMF_QI21_VAE_TEST") else { return };
+        let (h, w) = std::env::var("CMF_QI21_VAE_TEST_HW")
+            .ok()
+            .and_then(|v| v.split_once('x').and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?))))
+            .unwrap_or((256usize, 256usize));
+        let model = Arc::new(CmfModel::open(std::path::Path::new(&path)).expect("open"));
+        let vae = Qi21Vae::from_cmf(&model, false, true).expect("vae");
+        let z_dim = vae.cfg.z_dim;
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut gauss = || {
+            let mut s = 0f32;
+            for _ in 0..4 {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s += (state >> 40) as f32 / (1u64 << 24) as f32 - 0.5;
+            }
+            s * 1.732
+        };
+        // `CMF_QI21_VAE_TEST_LAT=<normalised tokens [h·w, z] f32>` = a real
+        // latent (a `CMF_QI21_TRACE` lat_N) instead of a random one
+        let z = match std::env::var("CMF_QI21_VAE_TEST_LAT") {
+            Ok(p) => {
+                let b = std::fs::read(&p).expect("latent");
+                let tok: Vec<f32> = b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
+                assert_eq!(tok.len(), z_dim * h * w, "latent size");
+                vae.denormalize_tokens(&tok, h * w)
+            }
+            Err(_) => {
+                let mut z = vec![0f32; z_dim * h * w];
+                for c in 0..z_dim {
+                    for v in z[c * h * w..(c + 1) * h * w].iter_mut() {
+                        *v = gauss() * vae.cfg.latents_std[c] + vae.cfg.latents_mean[c];
+                    }
+                }
+                z
+            }
+        };
+        for round in 0..2 {
+            let t = std::time::Instant::now();
+            let img = vae.decode(&z, h, w).expect("decode");
+            let bad = img.iter().filter(|v| !v.is_finite()).count();
+            let sat = img.iter().filter(|v| v.abs() >= 1.0).count();
+            eprintln!(
+                "{}×{} decode (round {round}): {:.2}s, non-finite {bad}, saturated {sat} of {}",
+                16 * h,
+                16 * w,
+                t.elapsed().as_secs_f64(),
+                img.len()
+            );
+            if let Ok(dump) = std::env::var("CMF_QI21_VAE_TEST_DUMP") {
+                let _ = std::fs::write(dump, img.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+            }
+            assert_eq!(bad, 0);
+        }
+    }
+
     #[test]
     fn dup_up_keeps_the_last_temporal_slot() {
         // cin 2 → cout 2, ft 2: factor 8, repeats 8 → every output reads
