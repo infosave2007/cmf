@@ -3,6 +3,7 @@ license: other
 license_name: qwen-research
 license_link: LICENSE
 base_model: Qwen/Qwen-Image-2.1
+base_model_relation: quantized
 pipeline_tag: text-to-image
 tags:
   - cmf
