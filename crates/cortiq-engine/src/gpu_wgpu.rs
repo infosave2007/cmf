@@ -56108,7 +56108,16 @@ fn vae_conv_impl(
     if w.len() != oc * ick2 || x.len() != ic * h * w_img || out.len() != oc * oh * ow {
         return false;
     }
-    if oc as u32 > 65_000 || (oh * ow) as u32 > 65_000 * 64 {
+    if oc > 65_000 || oh * ow > 65_000 * 64 {
+        return false;
+    }
+    // Every buffer is bound whole: one past the binding (or buffer) limit
+    // is a validation error, fatal under wgpu's default handler — at
+    // 2048² the Qwen-Image-2.1 VAE's 576-channel stage is a 2.4 GB tensor
+    // against a 2 GB binding. Decline instead; the host conv runs.
+    let lim = c.device.limits();
+    let max_bytes = lim.max_storage_buffer_binding_size.min(lim.max_buffer_size);
+    if [w.len(), bias.len(), x.len(), out.len()].iter().any(|&n| (n as u64) * 4 > max_bytes) {
         return false;
     }
     let cache = |data: &[f32], label: &'static str| -> wgpu::Buffer {
