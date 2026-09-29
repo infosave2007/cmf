@@ -43,6 +43,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the per-pair loop and its exact numbers.
 
 ### Fixed
+- Tail appends retry a held file lock for up to 2 s before reporting another
+  writer: a child forked by another thread keeps the previous append's lock
+  until it execs, which failed back-to-back appends in parallel test runs.
 - Vulkan device selection: a plain run took the driver's first adapter, so on a
   box with an RTX PRO 4000 and a GTX 1660 every model ran on the 1660. Adapters
   are now ranked (native backend, discrete, tensor cores, VRAM, f16); `cortiq gpu`
