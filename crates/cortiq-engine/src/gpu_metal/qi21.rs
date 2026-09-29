@@ -867,6 +867,34 @@ pub(crate) fn prefill(a: &Qi21PrefillArgs) -> bool {
     }
     let d = st.0.as_mut().unwrap();
     let rows = a.lp.max(a.n);
+    // Every buffer must fit one MTLBuffer (newBufferWithLength answers nil
+    // past maxBufferLength — 13.6 GB on a 24 GB M4, less on smaller Macs):
+    // many or large condition images grow the prefix cache without bound.
+    {
+        let alloc = rows.div_ceil(128) * 128 + 128;
+        let largest = [
+            d.blocks.len() * a.lp * 2 * h * 2, // prefix K/V
+            2 * alloc * g.inter * 4,           // gate|up
+            alloc * g.inter * 2,               // SwiGLU hidden
+            alloc * 3 * h * 2,                 // qkv panel
+            alloc * h * 4,                     // x / y
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+        let total = d.blocks.len() * a.lp * 2 * h * 2 + alloc * (2 * g.inter * 4 + g.inter * 2 + 3 * h * 2 + 2 * h * 4 + 2 * h * 2);
+        let max_len = c._device.max_buffer_length() as usize;
+        let budget = c._device.recommended_max_working_set_size() as usize;
+        if largest > max_len || total > budget {
+            return decline(&format!(
+                "the program needs a {:.1} GB buffer ({:.1} GB in all) — past this device's {:.1} GB buffer / {:.1} GB working-set limit",
+                largest as f64 / 1e9,
+                total as f64 / 1e9,
+                max_len as f64 / 1e9,
+                budget as f64 / 1e9
+            ));
+        }
+    }
     let prog = Prog {
         key: a.key,
         lp: a.lp,

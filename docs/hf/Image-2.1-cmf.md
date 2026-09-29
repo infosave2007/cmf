@@ -41,7 +41,7 @@ transparency (RGBA), and generation from condition images. Built with Qwen.
 
 ```bash
 cargo install cortiq-cli          # 0.8.2 or later; prebuilt binaries: github.com/infosave2007/cmf/releases
-hf download infosave/Image-2.1-cmf qwen-image-2.1.cmf --local-dir .
+hf download infosave/Image-2.1-cmf qwen-image-2.1.cmf qwen-image-2.1.cmf.sha256 --local-dir .
 cortiq imagine qwen-image-2.1.cmf --prompt "A neon shop sign that reads \"CORTIQ\", rainy night, reflections on wet pavement"
 ```
 
@@ -74,7 +74,7 @@ to 1e-5.
 
 RTX PRO 4000 Blackwell (24 GB), Vulkan, one image per process, default settings (40 steps):
 
-| task | size | time to image | DiT steps | prompt encode | VAE |
+| task | size | time to image | DiT steps | prompt encode | VAE (load + decode) |
 |---|---|---:|---:|---:|---:|
 | text-to-image | 512×512 | 15 s | 9.6 s (0.24 s a step) | 2.4 s | 1.4 s |
 | text-to-image | 1024×1024 | 48 s | 41.6 s (1.04 s a step) | 2.2 s | 1.8 s |
@@ -85,10 +85,10 @@ Peak VRAM 17.5 GB at 1024² (24 GB cards). With several GPUs the engine takes th
 
 Mac mini M4 (10-core GPU, 24 GB), Metal:
 
-| task | size | time to image | DiT steps | VAE |
+| task | size | time to image | DiT steps | VAE (load + decode) |
 |---|---|---:|---:|---:|
 | text-to-image | 512×512 | 3.9 min | 5.5 s a step | 7.6 s |
-| text-to-image | 1024×1024 | 20 min | 30 s a step | 34 s |
+| text-to-image | 1024×1024 | 20 min | 25–30 s a step | 34 s |
 
 About 9 GB of memory. The GEMMs run at ≈ 83 % of the M4 GPU's matrix peak, so the time is the model's arithmetic;
 `--steps 20` halves it. Measured with cortiq 0.8.2.
@@ -116,7 +116,7 @@ Commercial use needs a separate license from the Qwen team. Built with Qwen.
 ## Verify
 
 ```bash
-sha256sum -c qwen-image-2.1.cmf.sha256
+sha256sum -c qwen-image-2.1.cmf.sha256    # macOS: shasum -a 256 -c
 cortiq info qwen-image-2.1.cmf
 ```
 
@@ -132,7 +132,7 @@ vision-башней и RGBA-VAE вместе, рецепт генерации з
 
 ```bash
 cargo install cortiq-cli          # 0.8.2 или новее; готовые бинарники: github.com/infosave2007/cmf/releases
-hf download infosave/Image-2.1-cmf qwen-image-2.1.cmf --local-dir .
+hf download infosave/Image-2.1-cmf qwen-image-2.1.cmf qwen-image-2.1.cmf.sha256 --local-dir .
 cortiq imagine qwen-image-2.1.cmf --prompt "Лиса сидит в свежем снегу, золотой час, фотореализм"
 cortiq imagine qwen-image-2.1.cmf --image photo.png --prompt "Замени фон на закат на пляже"
 ```
@@ -148,7 +148,7 @@ cortiq imagine qwen-image-2.1.cmf --image photo.png --prompt "Замени фо�
 | устройство | 512² | 1024² | 2048² | 1024² с картинкой-условием |
 |---|---:|---:|---:|---:|
 | RTX PRO 4000 Blackwell, Vulkan | 15 с | 48 с (шаг 1.04 с) | 246 с (шаг 6.0 с) | 122 с (энкодер 60 с) |
-| Mac mini M4 24 ГБ, Metal | 3.9 мин | 20 мин (шаг 30 с) | — | — |
+| Mac mini M4 24 ГБ, Metal | 3.9 мин | 20 мин (шаг 25–30 с) | — | — |
 
 Пик видеопамяти 17.5 ГБ (карты на 24 ГБ); из нескольких GPU берётся карта с тензорными ядрами и большей памятью,
 `CMF_GPU_ADAPTER=<n>` выбирает другую. На Mac около 9 ГБ памяти, GEMM идут на ≈ 83 % матричного пика M4;
@@ -172,7 +172,7 @@ Metal，NVIDIA 走 Vulkan，任何机器都有 CPU 后备路径。支持文生�
 
 ```bash
 cargo install cortiq-cli          # 0.8.2 或更新
-hf download infosave/Image-2.1-cmf qwen-image-2.1.cmf --local-dir .
+hf download infosave/Image-2.1-cmf qwen-image-2.1.cmf qwen-image-2.1.cmf.sha256 --local-dir .
 cortiq imagine qwen-image-2.1.cmf --prompt "雨夜里写着 \"CORTIQ\" 的霓虹招牌，湿润路面上的倒影"
 ```
 
@@ -185,7 +185,7 @@ cortiq imagine qwen-image-2.1.cmf --prompt "雨夜里写着 \"CORTIQ\" 的霓虹
 | 设备 | 512² | 1024² | 2048² | 1024² 带条件图 |
 |---|---:|---:|---:|---:|
 | RTX PRO 4000 Blackwell，Vulkan | 15 s | 48 s（每步 1.04 s） | 246 s（每步 6.0 s） | 122 s（编码 60 s） |
-| Mac mini M4 24 GB，Metal | 3.9 分钟 | 20 分钟（每步 30 s） | — | — |
+| Mac mini M4 24 GB，Metal | 3.9 分钟 | 20 分钟（每步 25–30 s） | — | — |
 
 显存峰值 17.5 GB（24 GB 显卡）；多卡时自动选择带张量核心、显存最大的卡，`CMF_GPU_ADAPTER=<n>` 可指定。Mac 约占 9 GB 内存，`--steps 20` 可减半耗时。
 

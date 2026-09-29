@@ -21,11 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is [infosave/Image-2.1-cmf](https://huggingface.co/infosave/Image-2.1-cmf).
 - Qwen-Image-2.1 on Metal: one resident chain per step, q4tp and q8 weights read
   in place from the mapping, a masked prefix pass for the block-causal prompt
-  (Mac mini M4: 5.5 s a step at 512², 30 s at 1024²).
+  (Mac mini M4: 5.5 s a step at 512², 25–30 s at 1024²).
 - Qwen-Image-2.1 on Vulkan: f16 weight planes, tensor-core GEMMs, masked prefix
   flash attention and a resident VAE decoder that decodes large frames in exact
-  bands (RTX PRO 4000: 1024² in 48 s, a step 1.04 s, the VAE 0.5 s instead of
-  43 s; 2048² in 246 s). The per-conv wgpu VAE arms decline past the binding
+  bands (RTX PRO 4000: 1024² in 48 s, a step 1.04 s, the VAE decode 0.5 s
+  instead of 43 s; 2048² in 246 s). The per-conv wgpu VAE arms decline past the binding
   limit instead of failing validation.
 - `cortiq info --tensors` prints each tensor's hash64, so two files can be
   compared tensor by tensor.
@@ -34,10 +34,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The q4tp/q2tp encoders use deterministic `log2`/`exp2`: the same source packs
   to the same bytes on aarch64 and x86_64 (the platform libm differed in the last
   bit and flipped near-tie scale choices in about half of the tensors).
-- `imagine-pack` records only the source directory's name, not its local path.
-- Qwen3-VL text encoder: from 256 tokens (prompts with images) the attention runs
-  as per-head GEMMs (36 → 29 s for 1064 tokens on a 28-core host); shorter
-  prompts keep the exact per-pair loop.
+- The Qwen-Image-2.1 packer records only the source directory's name in the
+  provenance, not its local path (the Z-Image and Lumina packers are unchanged).
+- Qwen3 prompt encoder (`qwen3te`, shared by Qwen-Image-2.1, Z-Image and
+  MiniMax-H3): prompts of 256 tokens or more, with or without images, compute
+  attention as per-head GEMMs (36 → 29 s for 1064 tokens on a 28-core host);
+  their features differ from 0.8.1 at f32 rounding level. Shorter prompts keep
+  the per-pair loop and its exact numbers.
 
 ### Fixed
 - Vulkan device selection: a plain run took the driver's first adapter, so on a

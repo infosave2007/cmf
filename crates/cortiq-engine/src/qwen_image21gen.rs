@@ -280,7 +280,30 @@ fn load_cond(path: &Path, output_resolution: usize) -> Result<Cond, String> {
     let (iw, ih) = (img.width() as f64, img.height() as f64);
     let area = (output_resolution * output_resolution) as f64;
     let (w, h) = calculate_dimensions(area, iw / ih);
-    let img = image::imageops::resize(&img, w as u32, h as u32, FilterType::Lanczos3);
+    // PIL resizes RGBA in premultiplied form (RGBa) so fully transparent
+    // pixels do not bleed their colour into the edges; same here, and a
+    // same-size "resize" stays a plain copy as it is in PIL
+    let img = if (img.width() as usize, img.height() as usize) == (w, h) {
+        img
+    } else {
+        let mut pm = img;
+        for p in pm.pixels_mut() {
+            let a = p.0[3] as u32;
+            for c in 0..3 {
+                p.0[c] = ((p.0[c] as u32 * a + 127) / 255) as u8;
+            }
+        }
+        let mut r = image::imageops::resize(&pm, w as u32, h as u32, FilterType::Lanczos3);
+        for p in r.pixels_mut() {
+            let a = p.0[3] as u32;
+            if a != 0 && a != 255 {
+                for c in 0..3 {
+                    p.0[c] = ((255 * p.0[c] as u32) / a).min(255) as u8;
+                }
+            }
+        }
+        r
+    };
     let plane = w * h;
     let mut rgba = vec![0f32; 4 * plane];
     for (i, p) in img.pixels().enumerate() {
@@ -315,6 +338,14 @@ fn encode_prompt(
         .encode("<|image_pad|>")
         .first()
         .ok_or("tokenizer has no <|image_pad|>")?;
+    let slots = ids.iter().filter(|&&t| t == pad_id).count();
+    if slots != conds.len() {
+        return Err(format!(
+            "the prompt has {slots} <|image_pad|> slot(s) for {} condition image(s) — \
+             the prompt text must not contain vision tokens",
+            conds.len()
+        ));
+    }
     let drop = drop_idx(tok, system);
     let mut enc = crate::qwen3te::Qwen3Encoder::from_cmf(model)?;
     // `CMF_QI21_TE_DEV=all|q,k,…`: those projections through the device GEMM
@@ -484,8 +515,12 @@ pub fn generate_images(
         .iter()
         .map(|path| load_cond(path, p.output_resolution))
         .collect::<Result<Vec<_>, _>>()?;
+    // diffusers: height = height or output_resolution (a condition image
+    // sets its own aspect at that area); the container's default size is
+    // the same 1024 unless --reference-size moves it
     let (dh, dw) = match conds.last() {
         Some(c) => (c.h, c.w),
+        None if p.output_resolution != d.output_resolution => (p.output_resolution, p.output_resolution),
         None => (d.height, d.width),
     };
     let height = p.height.unwrap_or(dh) / 32 * 32;
@@ -591,7 +626,6 @@ pub fn generate_images(
         }
         None => None,
     };
-    let rope = dit.target_rope(&layout);
     tm.prefill = t0.elapsed().as_secs_f64();
     if prof_on() {
         eprintln!(
@@ -631,9 +665,9 @@ pub fn generate_images(
                 }
             }
             let ts = Instant::now();
-            let mut v = dit.step(&prefix, &lat, &mods[i], (&rope.0, &rope.1))?;
+            let mut v = dit.step(&prefix, &lat, &mods[i])?;
             if let Some(np) = &nprefix {
-                let nv = dit.step(np, &lat, &mods[i], (&rope.0, &rope.1))?;
+                let nv = dit.step(np, &lat, &mods[i])?;
                 for (pv, &q) in v.iter_mut().zip(&nv) {
                     *pv = q + p.cfg * (*pv - q);
                 }

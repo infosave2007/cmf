@@ -242,6 +242,10 @@ pub struct Qi21Prefix {
     pub v: Vec<Vec<f32>>,
     /// The device program holding this prefix (`gpu::qi21_*`).
     pub device_key: Option<u64>,
+    /// cos/sin of the target rows for THIS prefix's layout: the target's
+    /// frame position follows its own prefix, so a positive and a negative
+    /// prompt of different lengths rotate their targets differently.
+    pub rope_t: (Vec<f32>, Vec<f32>),
 }
 
 impl Drop for Qi21Prefix {
@@ -789,6 +793,7 @@ impl Qi21Dit {
                     k: Vec::new(),
                     v: Vec::new(),
                     device_key: Some(key),
+                    rope_t: self.target_rope(layout),
                 });
             }
         }
@@ -805,6 +810,7 @@ impl Qi21Dit {
             k: ks,
             v: vs,
             device_key: None,
+            rope_t: self.target_rope(layout),
         })
     }
 
@@ -865,13 +871,7 @@ impl Qi21Dit {
 
     /// One denoiser call: the device program when the prefix lives there,
     /// else the host path.
-    pub fn step(
-        &self,
-        prefix: &Qi21Prefix,
-        tok: &[f32],
-        mods: &Qi21Mods,
-        rope: (&[f32], &[f32]),
-    ) -> Result<Vec<f32>, String> {
+    pub fn step(&self, prefix: &Qi21Prefix, tok: &[f32], mods: &Qi21Mods) -> Result<Vec<f32>, String> {
         match prefix.device_key {
             Some(key) => {
                 let n = prefix.layout.target().len();
@@ -883,7 +883,7 @@ impl Qi21Dit {
                     Err("the device denoiser step failed; rerun with CMF_QI21_GPU=0 for the host path".into())
                 }
             }
-            None => Ok(self.step_cpu(prefix, tok, mods, rope)),
+            None => Ok(self.step_cpu(prefix, tok, mods)),
         }
     }
 
@@ -894,14 +894,10 @@ impl Qi21Dit {
     }
 
     /// One denoiser call on the host: latent tokens `[n, in_channels]` →
-    /// velocity `[n, out_channels]`, attending to the cached prefix.
-    pub fn step_cpu(
-        &self,
-        prefix: &Qi21Prefix,
-        tok: &[f32],
-        mods: &Qi21Mods,
-        rope: (&[f32], &[f32]),
-    ) -> Vec<f32> {
+    /// velocity `[n, out_channels]`, attending to the cached prefix (the
+    /// target rows rotate by the prefix's own `rope_t`).
+    pub fn step_cpu(&self, prefix: &Qi21Prefix, tok: &[f32], mods: &Qi21Mods) -> Vec<f32> {
+        let rope = (&prefix.rope_t.0[..], &prefix.rope_t.1[..]);
         let n = prefix.layout.target().len();
         let lp = prefix.len();
         let hs = self.cfg.dim;

@@ -75,8 +75,10 @@
 //! Teacher-forced (`CMF_QI21_FORCE`), every single call is 2–7e-4 away. The
 //! bf16 container against the fp32 diffusers oracle: v_0 3.8e-4.
 //!
-//! The stand's default adapter is a GTX 1660 (no 16×16 f16 cooperative
-//! matrices): the path declines there; `CMF_GPU_ADAPTER=1` picks the card.
+//! The path needs 16×16 f16 cooperative matrices. On the stand (an RTX PRO
+//! 4000 and a GTX 1660) adapter ranking (`ranked_adapters`) makes the PRO
+//! 4000 the default; pinning the 1660 (`CMF_GPU_ADAPTER=1`, see `cortiq gpu`)
+//! makes this path decline to the host.
 //!
 //! Knobs: `CMF_QI21_WGPU=0` (device path off), `CMF_QI21_WGPU_PROF=1`
 //! (per-class device time after every step: each class alone, 3 reps),
