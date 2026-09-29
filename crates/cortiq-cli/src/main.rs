@@ -1682,7 +1682,9 @@ enum Commands {
         steps: Option<usize>,
         /// Classifier-free guidance scale. Z-Image: 0 disables CFG (one DiT
         /// forward per step; the Turbo default), > 0 runs pos + g·(pos − neg)
-        /// (base default 4). Lumina/Qwen: default 4, ≤1 disables CFG.
+        /// (base default 4). Lumina / Qwen Image Edit: default 4, ≤1 disables
+        /// CFG. Qwen-Image-2.1: default 1 (off); true CFG needs --cfg > 1 AND
+        /// --negative-prompt.
         #[arg(long, visible_alias = "guidance")]
         cfg: Option<f32>,
         /// Z-Image CFG renormalization: clip ‖pred‖ to C·‖pos‖ (the whole
@@ -1718,7 +1720,9 @@ enum Commands {
         #[arg(long)]
         vae: Option<String>,
         /// Negative prompt. Z-Image: used when guidance > 0 (default "", the
-        /// diffusers default). Qwen Image: default a space, enabling true CFG.
+        /// diffusers default). Qwen Image Edit: default a space, enabling true
+        /// CFG. Qwen-Image-2.1: no default; CFG runs only when this is given
+        /// and --cfg > 1.
         #[arg(long)]
         negative_prompt: Option<String>,
         /// Optional Qwen Image FlowMatch Euler scheduler JSON

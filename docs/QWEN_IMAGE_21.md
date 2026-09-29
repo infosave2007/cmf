@@ -41,7 +41,7 @@ cortiq imagine-pack Qwen-Image-2.1 --out qwen-image-2.1.cmf
 | `vae.*` | `AutoencoderKLQwenImage21` decoder + encoder | f16 (`--vae-quant`); the temporal convs are not packed |
 | `qi21.config_json`, `qi21.scheduler_json` | defaults, scheduler | |
 
-Size: 12.7 GB (DiT 3.6 GB, text encoder and vision tower 7.5 GB, VAE 0.66 GB).
+Size: 12.75 GB (DiT 3.90 GB, text encoder 7.58 GB, vision tower 0.59 GB, VAE 0.66 GB).
 
 ## Semantics
 
@@ -87,7 +87,8 @@ latent to 67 dB PSNR against the reference image.
 - **Metal** (`gpu_metal/qi21.rs`): the prefix and every step run as one resident chain;
   weights are read in place from the file mapping (q4tp dequantized to half while the GEMM
   stages its tile, q8 int8 staged times its column field). Device vs host: v₀ 5e-4.
-  Mac mini M4 (10-core GPU, 24 GB): a step is 5.3–5.9 s at 512² and 25–29 s at 1024²
+  Mac mini M4 (10-core GPU, 24 GB): a step is 5.3–5.9 s at 512² and 25–30 s at 1024²
+  (it rises as the machine heats over a run; 1024²/40 steps take 20 min)
   (GEMM 91 % at ≈ 2.9 TF/s = 83 % of the half MMA peak, attention the rest).
 - **Vulkan** (`gpu_wgpu/qi21.rs`, `gpu_wgpu/qi21_vae.rs`): f16 weight planes built
   once per model (q4tp and q8 alike, 1.3 s), tensor-core GEMMs, the masked prefix
@@ -96,13 +97,16 @@ latent to 67 dB PSNR against the reference image.
   2048² in 246 s, peak VRAM 17.5 GB at 1024². Frames whose VAE activations pass the
   2 GB binding limit decode in horizontal bands with exact halos (bit-identical to a
   whole-frame decode; 2048² 1.8 s, 4096² 8.3 s). `CMF_QI21_WGPU=0`, `CMF_QI21_VAE_CHAIN=0` turn the paths off.
-- **CPU**: the reference path (`CMF_QI21_GPU=0`).
+- **CPU**: the reference DiT path (`CMF_QI21_GPU=0`); `CMF_QI21_VAE_GPU=0` keeps the
+  VAE on the host too, and `CMF_GPU=0` runs everything on the host.
+  (`CMF_QI21_VAE_CHAIN=0` only drops the resident wgpu VAE for the per-conv
+  device convolutions.)
 
 A condition image makes the prompt ~1k tokens longer (one vision slot per 32×32
 pixels); the Qwen3-VL encoder and its vision tower run on the host, about a minute
 for a 1024² image on a 28-core machine.
 
-Knobs: `CMF_QI21_GPU=0` (host DiT), `CMF_QI21_METAL=0`, `CMF_QI21_METAL_PROF=1`,
+Knobs: `CMF_QI21_GPU=0` (host DiT), `CMF_QI21_VAE_GPU=0` (host VAE), `CMF_QI21_METAL=0`, `CMF_QI21_METAL_PROF=1`,
 `CMF_QI21_AMAX=1`, `CMF_QI21_PROF=1` (stage times), `CMF_QI21_TRACE=<dir>`,
 `CMF_INIT_LATENT=<f32 [h·w,64]>`, `CMF_QI21_EMBEDS=<dir>`, `CMF_QI21_DUMP=<dir>`,
 `CMF_QI21_LATENT_IN=<f32>`.
