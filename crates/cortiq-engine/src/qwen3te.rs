@@ -45,6 +45,12 @@ struct Layer {
     down: Proj,
 }
 
+/// From this many tokens the attention runs as per-head GEMMs
+/// ([`Qwen3Encoder::attention_gemm`]); below it, the exact per-pair loop.
+/// (The projections stay on `matmat`: a dequantize-and-host-GEMM arm
+/// measured 29 → 55 s for 1064 tokens on a 28-core AVX2 host.)
+const GEMM_ATTN_MIN: usize = 256;
+
 pub struct Qwen3Encoder {
     embed: QTensor,
     layers: Vec<Layer>,
@@ -429,6 +435,72 @@ impl Qwen3Encoder {
         }
     }
 
+    /// Causal attention of a long sequence as two GEMMs per head
+    /// (`Q·Kᵀ`, masked row softmax, `P·V`) on the host GEMM — an
+    /// image-conditioned prompt is ~1–4k tokens, where the per-pair dot
+    /// loop above costs tens of seconds. Short prompts keep the loop (and
+    /// its exact numbers).
+    fn attention_gemm(&self, q_all: &[f32], k_all: &[f32], v_all: &[f32], n: usize, attn: &mut [f32]) {
+        use crate::zimage::host_gemm;
+        let (nh, nkv, hd) = (self.nh, self.nkv, self.hd);
+        let hpk = nh / nkv;
+        let pool = self.pool.as_deref();
+        let scale = 1.0 / (hd as f32).sqrt();
+        let mut qh = vec![0f32; n * hd];
+        let mut kh = vec![0f32; n * hd];
+        let mut vt = vec![0f32; hd * n];
+        let mut scores = vec![0f32; n * n];
+        let mut oh = vec![0f32; n * hd];
+        let mut kv_cur = usize::MAX;
+        for hh in 0..nh {
+            let kv = hh / hpk;
+            for p in 0..n {
+                for d in 0..hd {
+                    qh[p * hd + d] = q_all[(p * nh + hh) * hd + d] * scale;
+                }
+            }
+            if kv != kv_cur {
+                kv_cur = kv;
+                for p in 0..n {
+                    kh[p * hd..(p + 1) * hd].copy_from_slice(&k_all[(p * nkv + kv) * hd..(p * nkv + kv + 1) * hd]);
+                    for d in 0..hd {
+                        vt[d * n + p] = v_all[(p * nkv + kv) * hd + d];
+                    }
+                }
+            }
+            host_gemm::gemm_nt(&qh, &kh, &mut scores, n, hd, n, pool);
+            {
+                let sp = SendPtr(scores.as_mut_ptr());
+                let soft = |lo: usize, hi: usize| {
+                    for r in lo..hi {
+                        // SAFETY: workers own disjoint score rows.
+                        let row = unsafe { sp.row(r * n, n) };
+                        let (live, dead) = row.split_at_mut(r + 1);
+                        let mx = live.iter().cloned().fold(f32::MIN, f32::max);
+                        let mut den = 0f32;
+                        for x in live.iter_mut() {
+                            *x = (*x - mx).exp();
+                            den += *x;
+                        }
+                        let inv = 1.0 / den;
+                        for x in live.iter_mut() {
+                            *x *= inv;
+                        }
+                        dead.fill(0.0);
+                    }
+                };
+                match pool {
+                    Some(pl) => pl.run_rows(n, &soft),
+                    None => soft(0, n),
+                }
+            }
+            host_gemm::gemm_nt(&scores, &vt, &mut oh, n, n, hd, pool);
+            for p in 0..n {
+                attn[(p * nh + hh) * hd..(p * nh + hh + 1) * hd].copy_from_slice(&oh[p * hd..(p + 1) * hd]);
+            }
+        }
+    }
+
     /// Causal full-sequence forward. Returns `[n, hidden]` — the
     /// residual stream leaving the last layer, normed only if the
     /// config says the checkpoint has a final norm (H3's does not).
@@ -563,9 +635,13 @@ impl Qwen3Encoder {
                     }
                 }
             };
-            match pool {
-                Some(pl) => pl.run_rows(nh, &heads),
-                None => heads(0, nh),
+            if n >= GEMM_ATTN_MIN {
+                self.attention_gemm(&q_all, &k_all, &v_all, n, &mut attn);
+            } else {
+                match pool {
+                    Some(pl) => pl.run_rows(nh, &heads),
+                    None => heads(0, nh),
+                }
             }
 
             tap(format!("layer{li}_q"), &q_all);

@@ -92,17 +92,35 @@ fn write_envelope(file: &mut File, env: &[u8; ENVELOPE_LEN]) -> Result<(), CmfEr
 }
 
 /// One writer at a time (advisory `flock`, released when the handle drops).
+///
+/// A held lock is retried for up to 2 s before it counts as another writer:
+/// a flock lives on the open file description, so a child a sibling thread
+/// forks between our previous append's close and this open keeps a copy of
+/// the description (and the lock) until its exec closes it. A parallel test
+/// harness spawning the CLI hit exactly that on macOS ("another writer holds
+/// the append lock" right after our own append). A real concurrent writer
+/// still gets the error.
 fn lock_exclusive(file: &File, path: &Path) -> Result<(), CmfError> {
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
-        // SAFETY: plain fd + flags; advisory lock on an open handle.
-        let r = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if r != 0 {
-            return Err(CmfError::Parse(format!(
-                "{}: another writer holds the append lock",
-                path.display()
-            )));
+        const TRIES: u32 = 50;
+        for attempt in 0..TRIES {
+            // SAFETY: plain fd + flags; advisory lock on an open handle.
+            let r = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if r == 0 {
+                break;
+            }
+            let err = std::io::Error::last_os_error();
+            let busy = err.raw_os_error() == Some(libc::EWOULDBLOCK);
+            if !busy || attempt + 1 == TRIES {
+                return Err(CmfError::Parse(format!(
+                    "{}: another writer holds the append lock{}",
+                    path.display(),
+                    if busy { String::new() } else { format!(" ({err})") }
+                )));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(40));
         }
     }
     #[cfg(not(unix))]

@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-09-29
+
+### Added
+- Qwen-Image-2.1 (`cortiq imagine`, `docs/QWEN_IMAGE_21.md`): text-to-image with
+  native transparency (RGBA PNG) and generation from condition images
+  (`--image`, repeatable), from one container packed by `cortiq imagine-pack
+  <diffusers dir>` (DiT q4tp, Qwen3-VL-8B text encoder and vision tower q8_2f,
+  VAE f16; `--dit-keep`, `--te-keep`, `--vis-quant`, `--vae-quant`,
+  `--no-vision`). The prompt prefix (text and condition images) is encoded once
+  and its keys/values are reused by every denoising step. With bf16 weights the
+  engine matches the diffusers fp32 reference to 1e-5; the published container
+  is [infosave/Image-2.1-cmf](https://huggingface.co/infosave/Image-2.1-cmf).
+- Qwen-Image-2.1 on Metal: one resident chain per step, q4tp and q8 weights read
+  in place from the mapping, a masked prefix pass for the block-causal prompt
+  (Mac mini M4: 5.5 s a step at 512², 25–30 s at 1024²).
+- Qwen-Image-2.1 on Vulkan: f16 weight planes, tensor-core GEMMs, masked prefix
+  flash attention and a resident VAE decoder that decodes large frames in exact
+  bands (RTX PRO 4000: 1024² in 48 s, a step 1.04 s, the VAE decode 0.5 s
+  instead of 43 s; 2048² in 246 s). The per-conv wgpu VAE arms decline past the binding
+  limit instead of failing validation.
+- `cortiq info --tensors` prints each tensor's hash64, so two files can be
+  compared tensor by tensor.
+
+### Changed
+- The q4tp/q2tp encoders use deterministic `log2`/`exp2`: the same source packs
+  to the same bytes on aarch64 and x86_64 (the platform libm differed in the last
+  bit and flipped near-tie scale choices in about half of the tensors).
+- The Qwen-Image-2.1 packer records only the source directory's name in the
+  provenance, not its local path (the Z-Image and Lumina packers are unchanged).
+- Qwen3 prompt encoder (`qwen3te`, shared by Qwen-Image-2.1, Z-Image and
+  MiniMax-H3): prompts of 256 tokens or more, with or without images, compute
+  attention as per-head GEMMs (36 → 29 s for 1064 tokens on a 28-core host);
+  their features differ from 0.8.1 at f32 rounding level. Shorter prompts keep
+  the per-pair loop and its exact numbers.
+
+### Fixed
+- Tail appends retry a held file lock for up to 2 s before reporting another
+  writer: a child forked by another thread keeps the previous append's lock
+  until it execs, which failed back-to-back appends in parallel test runs.
+- Vulkan device selection: a plain run took the driver's first adapter, so on a
+  box with an RTX PRO 4000 and a GTX 1660 every model ran on the 1660. Adapters
+  are now ranked (native backend, discrete, tensor cores, VRAM, f16); `cortiq gpu`
+  lists that order, `CMF_GPU_ADAPTER=<n>` counts in it.
+
 ## [0.8.1] - 2026-09-28
 
 ### Breaking (CMF format)

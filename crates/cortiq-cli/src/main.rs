@@ -29,6 +29,7 @@ mod tube;
 mod utility;
 mod videopack;
 mod zimagepack;
+mod qi21pack;
 
 use clap::{Parser, Subcommand};
 use cortiq_core::CmfModel;
@@ -916,7 +917,7 @@ enum Commands {
         /// Path to .cmf model file
         model: String,
         /// List directory entries whose name starts with this prefix
-        /// (name, dtype, shape, bytes), with a per-prefix total.
+        /// (name, dtype, shape, bytes, hash64 of the bytes), with a per-prefix total.
         #[arg(long)]
         tensors: Option<String>,
     },
@@ -1658,8 +1659,11 @@ enum Commands {
     /// recipe stored in the file — Turbo: 1024x1024, 8 steps, guidance 0;
     /// Z-Image (base): 1024x1024, 28 steps, guidance 4 with CFG — so
     /// `cortiq imagine z-image-turbo.cmf --prompt "…"` needs no other flag.
-    /// Qwen takes a transformer.cmf plus text_encoder.cmf and vae.cmf beside it;
-    /// pass --image once per reference. Metal/Vulkan/DX12 are selected when available.
+    /// Qwen-Image-2.1 (one .cmf from `imagine-pack`): 1024x1024, 40 steps, no
+    /// CFG by default; PNG output keeps the alpha channel (ask for transparency
+    /// in the prompt); --image adds condition images.
+    /// Qwen Image Edit takes a transformer.cmf plus text_encoder.cmf and vae.cmf
+    /// beside it; pass --image once per reference. Metal/Vulkan/DX12 are selected when available.
     Imagine {
         /// Model: a Z-Image/Lumina/Qwen .cmf, or a Lumina/Qwen root directory
         model_dir: String,
@@ -1678,7 +1682,9 @@ enum Commands {
         steps: Option<usize>,
         /// Classifier-free guidance scale. Z-Image: 0 disables CFG (one DiT
         /// forward per step; the Turbo default), > 0 runs pos + g·(pos − neg)
-        /// (base default 4). Lumina/Qwen: default 4, ≤1 disables CFG.
+        /// (base default 4). Lumina / Qwen Image Edit: default 4, ≤1 disables
+        /// CFG. Qwen-Image-2.1: default 1 (off); true CFG needs --cfg > 1 AND
+        /// --negative-prompt.
         #[arg(long, visible_alias = "guidance")]
         cfg: Option<f32>,
         /// Z-Image CFG renormalization: clip ‖pred‖ to C·‖pos‖ (the whole
@@ -1704,7 +1710,7 @@ enum Commands {
         /// injects a raw f32 [1,16,H/8,W/8] latent instead)
         #[arg(long, default_value_t = 42)]
         seed: u64,
-        /// Reference image for Qwen Image Edit; repeat for multiple images
+        /// Condition/reference image (Qwen-Image-2.1, Qwen Image Edit); repeat for multiple images
         #[arg(long = "image")]
         images: Vec<String>,
         /// Qwen2.5-VL CMF (default: text_encoder.cmf beside the transformer)
@@ -1714,13 +1720,16 @@ enum Commands {
         #[arg(long)]
         vae: Option<String>,
         /// Negative prompt. Z-Image: used when guidance > 0 (default "", the
-        /// diffusers default). Qwen Image: default a space, enabling true CFG.
+        /// diffusers default). Qwen Image Edit: default a space, enabling true
+        /// CFG. Qwen-Image-2.1: no default; CFG runs only when this is given
+        /// and --cfg > 1.
         #[arg(long)]
         negative_prompt: Option<String>,
         /// Optional Qwen Image FlowMatch Euler scheduler JSON
         #[arg(long)]
         scheduler: Option<String>,
-        /// Qwen Image reference area as side squared; 1024 is the official profile
+        /// Qwen Image reference area as side squared (Qwen-Image-2.1: condition
+        /// images and the default output size); 1024 is the official profile
         #[arg(long, default_value_t = 1024)]
         reference_size: usize,
         /// Output image path (Z-Image/Qwen: PNG/JPEG/PPM by extension, Z-Image
@@ -1728,7 +1737,8 @@ enum Commands {
         #[arg(long)]
         out: Option<String>,
     },
-    /// Pack a Diffusers source into CMF. A Z-Image / Z-Image-Turbo pipeline
+    /// Pack a Diffusers source into CMF. A Qwen-Image-2.1 directory
+    /// (QwenImage21Pipeline) or a Z-Image / Z-Image-Turbo pipeline
     /// directory (model_index.json = ZImagePipeline) becomes ONE ready-to-run
     /// file (DiT + Qwen3 text encoder + VAE + tokenizer + the model's default
     /// recipe) and a <out>.sha256; otherwise the default packs Lumina into one
@@ -1744,21 +1754,22 @@ enum Commands {
         bundle: bool,
         /// Diffusers root directory, or a pinned HF resolve base URL for Qwen
         root: String,
-        /// Projection codec (Z-Image DiT: q8 (=q8_2f, default)/q4tp/f16/bf16/raw;
+        /// Projection codec (Qwen-Image-2.1 DiT: q4tp (default)/q8/raw; Z-Image DiT: q8 (=q8_2f, default)/q4tp/f16/bf16/raw;
         /// Qwen: q4tp/q4t/q8_2f/f16; Lumina: q4t (default)/q8)
         #[arg(long)]
         quant: Option<String>,
-        /// Z-Image text-encoder projection codec: q8 (=q8_2f, default)/q4tp/
-        /// f16/bf16/raw (embed_tokens stays q8_row unless raw/bf16/f16)
+        /// Z-Image / Qwen-Image-2.1 text-encoder projection codec: q8 (=q8_2f,
+        /// default)/q4tp/f16/bf16/raw (embed_tokens stays q8_row unless raw/bf16/f16)
         #[arg(long)]
         te_quant: Option<String>,
         /// Z-Image `te.embed_tokens` codec (default q8_row with a quantized
         /// --te-quant; raw/bf16/f16/f32 keep it 16/32-bit)
         #[arg(long)]
         te_embed_quant: Option<String>,
-        /// Z-Image text-encoder projections kept at the source precision
+        /// Z-Image / Qwen-Image-2.1 text-encoder projections kept at the source precision
         /// (comma list: `layers.N.mlp.down_proj` or a suffix like `down_proj`;
-        /// default `layers.6.mlp.down_proj`, the massive-activation writer;
+        /// Z-Image default `layers.6.mlp.down_proj`, the massive-activation writer;
+        /// Qwen-Image-2.1 default none; a whole `layers.N` also works there;
         /// `none` keeps nothing)
         #[arg(long, value_delimiter = ',')]
         te_keep: Vec<String>,
@@ -1769,9 +1780,23 @@ enum Commands {
         /// Z-Image dev: pack only the first N main DiT layers (kernel tests)
         #[arg(long)]
         dit_layers: Option<usize>,
-        /// Z-Image: skip hashing the source shards into the provenance
+        /// Z-Image / Qwen-Image-2.1: skip hashing the source shards into the provenance
         #[arg(long, default_value_t = false)]
         no_source_sha: bool,
+        /// Qwen-Image-2.1 vision-tower projection codec (default q8 = q8_2f)
+        #[arg(long)]
+        vis_quant: Option<String>,
+        /// Qwen-Image-2.1 VAE weight codec (default f16; f32/bf16/raw)
+        #[arg(long)]
+        vae_quant: Option<String>,
+        /// Qwen-Image-2.1 DiT projections kept at q8_2f over the --quant
+        /// base (comma list: `blocks.N`, a kind `to_q`/`to_k`/`to_v`/
+        /// `to_out`/`gate_layer`/`proj`/`out`, or `blocks.N.<kind>`)
+        #[arg(long, value_delimiter = ',')]
+        dit_keep: Vec<String>,
+        /// Qwen-Image-2.1: leave out the vision tower (text-to-image only)
+        #[arg(long, default_value_t = false)]
+        no_vision: bool,
         /// Output .cmf path
         #[arg(long)]
         out: String,
@@ -3306,10 +3331,42 @@ async fn main() -> anyhow::Result<()> {
             reference_size,
             out,
         } => {
-            let zimage = std::path::Path::new(&model_dir).is_file()
-                && CmfModel::open(&model_dir)
-                    .map(|m| m.header.arch.arch_name == cortiq_engine::zimagegen::ARCH_NAME)
-                    .unwrap_or(false);
+            let arch = if std::path::Path::new(&model_dir).is_file() {
+                CmfModel::open(&model_dir)
+                    .map(|m| m.header.arch.arch_name.clone())
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let zimage = arch == cortiq_engine::zimagegen::ARCH_NAME;
+            if arch == cortiq_engine::qwen_image21::ARCH_NAME {
+                anyhow::ensure!(
+                    text_encoder.is_none()
+                        && vae.is_none()
+                        && scheduler.is_none()
+                        && cfg_normalization.is_none()
+                        && cfg_truncation.is_none()
+                        && shift.is_none()
+                        && max_sequence_length.is_none(),
+                    "--text-encoder/--vae/--scheduler/--cfg-normalization/--cfg-truncation/--shift/--max-sequence-length do not apply to Qwen-Image-2.1"
+                );
+                return cmd_qi21(
+                    &model_dir,
+                    &prompt,
+                    Qi21Cli {
+                        height,
+                        width,
+                        steps,
+                        cfg,
+                        num_images,
+                        seed,
+                        images,
+                        negative_prompt,
+                        reference_size,
+                        out,
+                    },
+                );
+            }
             if zimage {
                 anyhow::ensure!(
                     images.is_empty()
@@ -3373,11 +3430,47 @@ async fn main() -> anyhow::Result<()> {
             variant,
             dit_layers,
             no_source_sha,
+            vis_quant,
+            vae_quant,
+            dit_keep,
+            no_vision,
             out,
             component,
             bundle,
         } => {
             let zroot = std::path::Path::new(&root);
+            if !bundle && component.is_none() && qi21pack::is_qi21_root(zroot) {
+                anyhow::ensure!(
+                    te_embed_quant.is_none() && variant.is_none() && dit_layers.is_none(),
+                    "--te-embed-quant/--variant/--dit-layers are Z-Image options"
+                );
+                return qi21pack::pack(
+                    zroot,
+                    &out,
+                    &qi21pack::PackOpts {
+                        dit: zimagepack::parse_codec(
+                            quant.as_deref().unwrap_or(qi21pack::DEFAULT_DIT_CODEC),
+                        )?,
+                        te: zimagepack::parse_codec(
+                            te_quant.as_deref().unwrap_or(qi21pack::DEFAULT_TE_CODEC),
+                        )?,
+                        vis: zimagepack::parse_codec(
+                            vis_quant.as_deref().unwrap_or(qi21pack::DEFAULT_VIS_CODEC),
+                        )?,
+                        vae: zimagepack::parse_codec(
+                            vae_quant.as_deref().unwrap_or(qi21pack::DEFAULT_VAE_CODEC),
+                        )?,
+                        dit_keep: qi21pack::parse_keep(&dit_keep),
+                        te_keep: qi21pack::parse_keep(&te_keep),
+                        vision: !no_vision,
+                        source_sha: !no_source_sha,
+                    },
+                );
+            }
+            anyhow::ensure!(
+                vis_quant.is_none() && vae_quant.is_none() && dit_keep.is_empty() && !no_vision,
+                "--vis-quant/--vae-quant/--dit-keep/--no-vision are Qwen-Image-2.1 options"
+            );
             if bundle {
                 anyhow::ensure!(
                     component.is_none(),
@@ -6608,7 +6701,7 @@ async fn cmd_info(model_path: &str, tensors: Option<&str>) -> anyhow::Result<()>
         let mut total = 0u64;
         let mut n = 0usize;
         for e in model.tensors.iter().filter(|e| e.name.starts_with(prefix)) {
-            println!("{}\t{:?}\t{:?}\t{}", e.name, e.dtype, e.shape, e.nbytes);
+            println!("{}\t{:?}\t{:?}\t{}\t{:016x}", e.name, e.dtype, e.shape, e.nbytes, e.hash);
             total += e.nbytes;
             n += 1;
         }
@@ -6778,6 +6871,93 @@ fn qwen_component_paths(
             path.is_file().then_some(path)
         }),
     }
+}
+
+/// `cortiq imagine` options that apply to a Qwen-Image-2.1 container.
+struct Qi21Cli {
+    height: Option<usize>,
+    width: Option<usize>,
+    steps: Option<usize>,
+    cfg: Option<f32>,
+    num_images: usize,
+    seed: u64,
+    images: Vec<String>,
+    negative_prompt: Option<String>,
+    reference_size: usize,
+    out: Option<String>,
+}
+
+/// Qwen-Image-2.1: text-to-image (RGBA) or generation from condition images
+/// (`--image`, repeatable); unset options come from the container.
+fn cmd_qi21(model: &str, prompt: &str, o: Qi21Cli) -> anyhow::Result<()> {
+    use cortiq_engine::qwen_image21gen::{generate_images, Qi21Defaults, Qi21Params};
+    let d = Qi21Defaults::of(&CmfModel::open(model)?);
+    let mut p = Qi21Params::from_defaults(&d);
+    p.height = o.height;
+    p.width = o.width;
+    p.steps = o.steps.unwrap_or(d.steps);
+    p.cfg = o.cfg.unwrap_or(d.cfg);
+    p.seed = o.seed;
+    p.num_images = o.num_images.max(1);
+    p.images = o.images.iter().map(std::path::PathBuf::from).collect();
+    p.output_resolution = o.reference_size;
+    p.negative_prompt = o.negative_prompt;
+    anyhow::ensure!(p.steps >= 2, "--steps must be at least 2");
+    if p.cfg > 1.0 && p.negative_prompt.is_none() {
+        eprintln!("note: --cfg > 1 needs --negative-prompt (Qwen-Image-2.1 samples without guidance by default)");
+    }
+    let out = o.out.unwrap_or_else(|| "out.png".into());
+    let path = std::path::Path::new(&out);
+    let names: Vec<std::path::PathBuf> = if p.num_images == 1 {
+        vec![path.to_path_buf()]
+    } else {
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("out");
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("png");
+        (0..p.num_images)
+            .map(|i| path.with_file_name(format!("{stem}_{i}.{ext}")))
+            .collect()
+    };
+    eprintln!(
+        "qwen-image-2.1: {} steps, cfg {}, seed {}, {} condition image(s), {} image(s)",
+        p.steps,
+        p.cfg,
+        p.seed,
+        p.images.len(),
+        p.num_images
+    );
+    let t0 = std::time::Instant::now();
+    let (imgs, tm) = generate_images(std::path::Path::new(model), prompt, &p, |img, i, n| {
+        eprintln!(
+            "image {}/{}: step {i}/{n} ({:.1}s)",
+            img + 1,
+            p.num_images,
+            t0.elapsed().as_secs_f64()
+        );
+    })
+    .map_err(anyhow::Error::msg)?;
+    for (img, name) in imgs.iter().zip(&names) {
+        img.save(name).map_err(anyhow::Error::msg)?;
+        println!(
+            "{}: {}x{}, seed {}{}",
+            name.display(),
+            img.width,
+            img.height,
+            img.seed,
+            if img.has_alpha() { ", with transparency" } else { "" }
+        );
+    }
+    println!(
+        "{} image(s), {} steps in {:.1}s (text {:.1}s, dit load {:.1}s, prefill {:.1}s, median step {:.2}s, vae {:.1}s)",
+        imgs.len(),
+        p.steps,
+        tm.total,
+        tm.text_encode,
+        tm.dit_load,
+        tm.prefill,
+        tm.median_step(),
+        tm.vae
+    );
+    Ok(())
 }
 
 /// `cortiq imagine` options that apply to a Z-Image container.
