@@ -25,6 +25,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 #[doc(hidden)]
 pub mod zimage;
 
+// Qwen-Image-2.1 denoiser — child module, `gpu_metal/qi21.rs`.
+#[doc(hidden)]
+pub mod qi21;
+
 // Native Metal scratch buffers are process-wide (the command queue and
 // `Ctx::io_bufs` are shared by all pipelines).  A buffer is safe to reuse
 // only after the owning pipeline's command buffer has completed; two server

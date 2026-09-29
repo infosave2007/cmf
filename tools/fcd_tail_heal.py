@@ -38,7 +38,7 @@ def cmf_tensor_list(cortiq, cmf, prefix):
     for ln in out.splitlines():
         if ln.startswith("#") or not ln.strip():
             continue
-        name, dtype, shape, nbytes = ln.split("\t")
+        name, dtype, shape = ln.split("\t")[:3]  # name, dtype, shape, bytes, hash64
         res.append((name, dtype, json.loads(shape)))
     return res
 
