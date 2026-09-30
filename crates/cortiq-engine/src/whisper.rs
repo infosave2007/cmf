@@ -627,12 +627,11 @@ pub fn transcribe(
     if mono.is_empty() {
         return Err("audio file contains no samples".into());
     }
-    let nworkers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(8)
-        .saturating_sub(1);
-    let pool = Pool::new(nworkers);
+    // Match the shared engine policy instead of hard-capping Whisper at
+    // eight total threads. This honors CMF_THREADS and uses the machine's
+    // available CPU parallelism on large-core hosts; the math and operation
+    // order stay unchanged, so this is a scheduling-only optimization.
+    let pool = Pool::from_env();
     let profile = std::env::var_os("CMF_WHISPER_PROFILE").is_some();
     let trim_encoder = std::env::var("CMF_WHISPER_TRIM_ENCODER")
         .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
@@ -662,15 +661,15 @@ pub fn transcribe(
         let feat = log_mel(&padded, mel_frames);
         let mel_time = t0.elapsed();
         let t0 = Instant::now();
-        let (enc, n) = net.encode(&feat, mel_frames, encoder_limit, Some(&pool))?;
+        let (enc, n) = net.encode(&feat, mel_frames, encoder_limit, pool.as_deref())?;
         let encode_time = t0.elapsed();
         let t0 = Instant::now();
-        net.prep_cross(&enc, n, Some(&pool));
+        net.prep_cross(&enc, n, pool.as_deref());
         let cross_time = t0.elapsed();
         let t0 = Instant::now();
         let mut logits = Vec::new();
         for (i, &id) in prefix.iter().enumerate() {
-            logits = net.decode_step(id, i, n, Some(&pool))?;
+            logits = net.decode_step(id, i, n, pool.as_deref())?;
         }
         let mut output = Vec::new();
         let token_limit = max_new_tokens.min(net.max_target.saturating_sub(prefix.len()));
@@ -699,7 +698,7 @@ pub fn transcribe(
             }
             output.push(next);
             if generated + 1 < max_new_tokens {
-                logits = net.decode_step(next, prefix.len() + generated, n, Some(&pool))?;
+                logits = net.decode_step(next, prefix.len() + generated, n, pool.as_deref())?;
             }
         }
         let text = tok.decode(&output).trim().to_owned();
