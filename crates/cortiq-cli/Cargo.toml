@@ -30,12 +30,12 @@ gpu = ["cortiq-engine/gpu", "decision-vulkan"]
 [dependencies]
 libc = "0.2"
 base64 = { workspace = true }
-cortiq-core = { path = "../cortiq-core", version = "0.8.3" }
-cortiq-engine = { path = "../cortiq-engine", version = "0.8.3" }
-cortiq-net = { path = "../cortiq-net", version = "0.8.3" }
-cortiq-server = { path = "../cortiq-server", version = "0.8.3" }
+cortiq-core = { path = "../cortiq-core", version = "0.8.4" }
+cortiq-engine = { path = "../cortiq-engine", version = "0.8.4" }
+cortiq-net = { path = "../cortiq-net", version = "0.8.4" }
+cortiq-server = { path = "../cortiq-server", version = "0.8.4" }
 # `cortiq decide` / `cortiq decision …` and the decision branch of serve.
-cortiq-decision = { path = "../cortiq-decision", version = "0.8.3" }
+cortiq-decision = { path = "../cortiq-decision", version = "0.8.4" }
 clap = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }

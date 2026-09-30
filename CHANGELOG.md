@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.4] - 2026-09-30
+
+### Performance
+- Whisper CPU and GPU inference now use the shared Cortiq worker-pool policy
+  instead of a Whisper-specific eight-thread cap, and honor `CMF_THREADS`.
+  On one 10.435-second LibriSpeech sample (Xeon E5-2690 v4, RTX PRO 4000),
+  7→27 workers reduced CLI wall time from 31.02→24.30 s (Turbo Q4T CPU),
+  33.72→25.82 s (Turbo Q4TP CPU), 16.08→12.80 s (Turbo Q4T Vulkan), and
+  13.27→11.93 s (Turbo Q4TP Vulkan). Single-sample timing, not a WER or
+  corpus benchmark.
+
 ## [0.8.3] - 2026-09-30
 
 ### Added
