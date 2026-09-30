@@ -106,6 +106,26 @@ CLI также предоставляет `info`, `bench`, `ppl`, `serve`, `skil
 `moe-defrag`, `requant`, `compact`, `sign`, `imagine`, `animate` и `ltx-video`.
 Команда `cortiq <команда> --help` показывает флаги и ограничения.
 
+### Транскрибация Whisper
+
+Cortiq преобразует 128-бинные чекпоинты Whisper из Hugging Face (в том числе
+large-v3 и large-v3-turbo) в CMF, а затем транскрибирует WAV без Python:
+
+```sh
+cortiq convert --model openai/whisper-large-v3-turbo --quant q4tp \
+  --output whisper-large-v3-turbo-q4tp.cmf
+cortiq verify whisper-large-v3-turbo-q4tp.cmf
+cortiq transcribe whisper-large-v3-turbo-q4tp.cmf interview.wav --language ru
+```
+
+Смешанный профиль q4tp оставляет внимание и общую матрицу токенов/выхода
+декодера в q8_2f, FFN-матрицы — в q4tp, позиционные embeddings — в f16.
+Это не гарантия паритета или качества: перед внедрением измерьте WER на своих
+языках и аудио. WAV PCM/float сводится к mono 16 кГц. При наличии используется
+Metal/wgpu; `CMF_GPU=0` принудительно включает CPU. По умолчанию сохраняется
+полный контекст 30 секунд; экспериментальный `CMF_WHISPER_TRIM_ENCODER=1`
+может повлиять на качество распознавания.
+
 ## Что хранит файл CMF
 
 - Фиксированный 128-байтовый конверт, адресующий все секции.

@@ -25,6 +25,7 @@ mod recall;
 mod requant;
 mod sign;
 mod skill;
+mod transcribe;
 mod tube;
 mod utility;
 mod videopack;
@@ -458,6 +459,22 @@ enum Commands {
             value_name = "text|mm-only|multimodal"
         )]
         mimo_towers: String,
+    },
+    /// Transcribe audio with a Whisper CMF checkpoint (WAV, PCM or float).
+    Transcribe {
+        /// Path to a Whisper .cmf model
+        model: String,
+        /// Path to input WAV audio
+        audio: String,
+        /// Whisper language code, e.g. en, ru, de (default: en)
+        #[arg(long, default_value = "en")]
+        language: String,
+        /// transcribe | translate
+        #[arg(long, default_value = "transcribe")]
+        task: String,
+        /// Maximum generated text tokens per 30-second segment
+        #[arg(long, default_value_t = 440)]
+        max_new_tokens: usize,
     },
     /// Rewrite a container tightly: reclaim dead directory/header tails
     /// left by append-only skill growth (spec §9). Streams from mmap.
@@ -2772,6 +2789,18 @@ async fn main() -> anyhow::Result<()> {
                 progress_reporter("converting"),
             )?;
             println!("✓ wrote {output}");
+            Ok(())
+        }
+        Commands::Transcribe {
+            model,
+            audio,
+            language,
+            task,
+            max_new_tokens,
+        } => {
+            let model = Arc::new(CmfModel::open(&model)?);
+            let text = transcribe::run(&model, &audio, &language, &task, max_new_tokens)?;
+            println!("{text}");
             Ok(())
         }
         Commands::Compact { model, output } => moedefrag::cmd_compact(&model, &output),

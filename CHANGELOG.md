@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.3] - 2026-09-30
+
+### Added
+- Native Whisper large-v3/large-v3-turbo CMF conversion and `cortiq transcribe`
+  for WAV PCM/float on CPU, Metal and wgpu. The mixed q4tp profile keeps
+  attention and the shared decoder token/output matrix in q8_2f while using
+  q4tp for feed-forward weights. WER must be measured on target audio before
+  deployment; this release does not bundle Whisper weights.
+
 ## [0.8.2] - 2026-09-29
 
 ### Added

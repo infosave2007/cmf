@@ -19,7 +19,7 @@ lto = "thin"
 codegen-units = 1
 
 [workspace.package]
-version = "0.8.2"
+version = "0.8.3"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -54,6 +54,8 @@ unicode-normalization = "0.1"
 # the renderer silently fell back to a toolless prompt.
 minijinja = { version = "2", features = ["loop_controls", "json", "preserve_order"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }
+# CPU STFT for Whisper log-mel features.
+rustfft = "6"
 base64 = "0.22"
 # CLI
 clap = { version = "4", features = ["derive"] }

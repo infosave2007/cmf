@@ -650,6 +650,11 @@ fn canon_name_for_arch(arch: &ModelArch, raw: &str, towers: MimoTowers) -> Optio
     if arch.arch_name == MIMO_V2 {
         return mimo_v2_canon(raw, towers);
     }
+    if arch.arch_name.eq_ignore_ascii_case("whisper")
+        && (raw.starts_with("model.encoder.") || raw.starts_with("model.decoder."))
+    {
+        return Some(raw.to_string());
+    }
     if arch.prism_hadamard.is_none() {
         return canon_name(raw);
     }
@@ -762,8 +767,10 @@ pub(crate) fn keeps_float(name: &str) -> bool {
 }
 
 fn force_f16(name: &str) -> bool {
-    // MiMo speech embeddings: 20 gather tables summed per frame, not matmuls.
-    name.starts_with("speech_embeddings.")
+    name.ends_with("model.encoder.embed_positions.weight")
+        || name.ends_with("model.decoder.embed_positions.weight")
+        // MiMo speech embeddings: 20 gather tables summed per frame, not matmuls.
+        || name.starts_with("speech_embeddings.")
         || name.ends_with("linear_attn.in_proj_a.weight")
         || name.ends_with("linear_attn.in_proj_b.weight")
         // KDA (Kimi): decay/β/gate low-rank stages and conv taps are tiny
@@ -810,6 +817,17 @@ fn force_f16(name: &str) -> bool {
 fn quant_for_tensor(arch: &ModelArch, name: &str, base: Quant) -> Quant {
     if !matches!(base, Quant::Q4TiledP | Quant::Q2TiledP) {
         return base;
+    }
+    // Whisper's attention scores determine token/audio alignment, and its
+    // shared decoder embedding is also the output classifier. Keep those
+    // planes at Q8 while quantizing the larger feed-forward matrices to q4tp.
+    if arch.arch_name.eq_ignore_ascii_case("whisper") {
+        let attention = (name.starts_with("model.encoder.layers.") && name.contains(".self_attn."))
+            || (name.starts_with("model.decoder.layers.")
+                && (name.contains(".self_attn.") || name.contains(".encoder_attn.")));
+        if attention || name == "model.decoder.embed_tokens.weight" {
+            return Quant::Q8_2f;
+        }
     }
     let vocabulary_edges = name == "model.embed_tokens.weight" || name == "lm_head.weight";
     // Granite 4.2's 100k-token input/output tables are a quality-sensitive
@@ -3849,6 +3867,39 @@ fn parse_convert_only(spec: &str) -> anyhow::Result<Vec<String>> {
 
 /// Build ModelArch from a HF config.json (dense transformer families).
 fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
+    // Whisper is encoder/decoder, so use its encoder dimensions for the
+    // generic inspection fields and retain the full original config below.
+    if config.get("model_type").and_then(|v| v.as_str()) == Some("whisper") {
+        let get = |key: &str| {
+            cfg_usize(config, key).ok_or_else(|| anyhow::anyhow!("whisper config: missing {key}"))
+        };
+        let hidden = get("d_model")?;
+        let enc_heads = get("encoder_attention_heads")?;
+        anyhow::ensure!(
+            hidden > 0 && enc_heads > 0 && hidden % enc_heads == 0,
+            "whisper config: d_model must be divisible by encoder_attention_heads"
+        );
+        anyhow::ensure!(
+            get("num_mel_bins")? == 128,
+            "whisper: only the 128-bin feature extractor is supported"
+        );
+        let synthetic = serde_json::json!({
+            "model_type": "llama",
+            "hidden_size": hidden,
+            "intermediate_size": get("encoder_ffn_dim")?,
+            "num_attention_heads": enc_heads,
+            "num_key_value_heads": enc_heads,
+            "num_hidden_layers": get("encoder_layers")?,
+            "vocab_size": get("vocab_size")?,
+            "max_position_embeddings": get("max_source_positions")?.checked_mul(2).unwrap_or(3000),
+            "tie_word_embeddings": true,
+        });
+        let mut arch = build_arch(&synthetic)?;
+        arch.arch_name = "whisper".into();
+        arch.max_position_embeddings = get("max_source_positions")?;
+        arch.hidden_act = "gelu".into();
+        return Ok(arch);
+    }
     // Vision/multimodal configs nest the text model under "text_config".
     let tc = config.get("text_config").unwrap_or(config);
     let model_type = config
@@ -7223,6 +7274,24 @@ pub fn run_convert_multi_towers(
             "weight_quant": requested_quant,
         }),
     };
+    let provenance = if arch.arch_name == "whisper" {
+        let mut p = provenance;
+        p["whisper_config"] = config.clone();
+        if !gen_cfg.is_null() {
+            p["whisper_generation_config"] = gen_cfg.clone();
+        }
+        p["task"] = serde_json::json!("automatic-speech-recognition");
+        if let Some(repo) = config
+            .get("_name_or_path")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.starts_with('/') && s.split('/').count() == 2)
+        {
+            p["source_model"] = serde_json::json!(repo);
+        }
+        p
+    } else {
+        provenance
+    };
     let provenance = match o1_hint {
         Some(h) => {
             let mut p = provenance;
@@ -7400,6 +7469,55 @@ pub(crate) fn q2tp_expert_gate_or_up(name: &str) -> bool {
 pub(crate) mod tests {
     use super::*;
     use cortiq_core::format::CmfModel;
+
+    #[test]
+    fn whisper_config_and_native_tensor_names_are_supported() {
+        let cfg = serde_json::json!({
+            "model_type": "whisper", "d_model": 64,
+            "encoder_layers": 2, "encoder_attention_heads": 4,
+            "encoder_ffn_dim": 128, "decoder_layers": 1,
+            "decoder_attention_heads": 4, "decoder_ffn_dim": 128,
+            "vocab_size": 51866, "num_mel_bins": 128,
+            "max_source_positions": 1500, "max_target_positions": 448,
+            "layer_norm_eps": 0.00001
+        });
+        let arch = build_arch(&cfg).unwrap();
+        assert_eq!(arch.arch_name, "whisper");
+        assert_eq!(arch.hidden_size, 64);
+        assert_eq!(arch.num_layers, 2);
+        assert_eq!(arch.num_attention_heads, 4);
+        assert_eq!(arch.vocab_size, 51866);
+        assert_eq!(arch.max_position_embeddings, 1500);
+        assert_eq!(arch.hidden_act, "gelu");
+        for name in [
+            "model.encoder.layers.0.self_attn.q_proj.weight",
+            "model.encoder.layers.0.self_attn.out_proj.weight",
+            "model.decoder.embed_tokens.weight",
+        ] {
+            assert_eq!(canon_name_for_arch(&arch, name, MimoTowers::TextOnly).as_deref(), Some(name));
+        }
+    }
+
+    #[test]
+    fn whisper_q4tp_keeps_attention_and_output_embedding_at_q8() {
+        let cfg = serde_json::json!({
+            "model_type": "whisper", "d_model": 1280,
+            "encoder_layers": 32, "encoder_attention_heads": 20,
+            "encoder_ffn_dim": 5120, "decoder_layers": 32,
+            "decoder_attention_heads": 20, "decoder_ffn_dim": 5120,
+            "vocab_size": 51866, "num_mel_bins": 128,
+            "max_source_positions": 1500, "max_target_positions": 448,
+            "layer_norm_eps": 0.00001
+        });
+        let arch = build_arch(&cfg).unwrap();
+        let q4tp = Quant::Q4TiledP;
+        assert_eq!(profile_quant(&arch, q4tp, "model.encoder.layers.0.self_attn.q_proj.weight"), Quant::Q8_2f);
+        assert_eq!(profile_quant(&arch, q4tp, "model.decoder.layers.0.encoder_attn.v_proj.weight"), Quant::Q8_2f);
+        assert_eq!(profile_quant(&arch, q4tp, "model.decoder.embed_tokens.weight"), Quant::Q8_2f);
+        assert_eq!(profile_quant(&arch, q4tp, "model.encoder.layers.0.fc1.weight"), Quant::Q4TiledP);
+        assert!(force_f16("model.encoder.embed_positions.weight"));
+        assert!(force_f16("model.decoder.embed_positions.weight"));
+    }
 
     #[test]
     fn deterministic_log2_exp2_track_std_to_an_ulp() {
