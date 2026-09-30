@@ -73,6 +73,8 @@ pub mod tokenizer;
 pub mod vae;
 pub mod vae3d;
 pub mod videogen;
+/// Native Whisper encoder/decoder inference over CMF checkpoints.
+pub mod whisper;
 pub mod zimage;
 pub mod zimagegen;
 /// The native Vulkan lane — an accelerator behind a capability probe,
