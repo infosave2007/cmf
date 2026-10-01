@@ -260,6 +260,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{delete, get, post};
+use chrono::{DateTime, Utc};
 use cortiq_decision::cascade::{Cascade, CascadeOptions};
 use cortiq_decision::config::Config;
 use cortiq_decision::container::Verify;
@@ -271,7 +272,7 @@ use cortiq_decision::matching::{MatchKind, SkillMatch};
 use cortiq_decision::metering::{Rates, Usd};
 use cortiq_decision::protocol::{
     ApiError, CmfOptions, DecisionRequest, ModelRef, Profile, Question, QuestionKind, Reason,
-    State as RequestState, new_request_id, parse_json,
+    SYSTEMONE_MODEL_ALIASES, SYSTEMONE_MODEL_ID, State as RequestState, new_request_id, parse_json,
 };
 use cortiq_decision::service::{
     Action, AdminCommand, Decided, DecisionService, Escalator, LoadedModel, LocalDecision,
@@ -363,6 +364,10 @@ pub enum Surface {
     /// The decisions protocol and this server's own admin paths: OpenRouter
     /// errors, `cmf-dec-…` ids.
     Decisions,
+    /// TypeSafe/Jev System One compatibility route.  Its success and error
+    /// envelopes are intentionally kept separate from the native/OpenRouter
+    /// decisions surface.
+    SystemOne,
     /// The router API (its admin keys paths included): router errors, `req_…`
     /// ids.
     Router,
@@ -397,6 +402,9 @@ fn wants_extensions(headers: &HeaderMap) -> bool {
 /// `/v1/admin/usage`, `/oracle`, `/learning`, `/generations`, `/rollback`,
 /// `/shadow`), is the decisions surface with the errors of §4.8.
 pub fn surface_of(path: &str) -> Surface {
+    if path == "/v1/systemone" {
+        return Surface::SystemOne;
+    }
     let router = matches!(
         path,
         "/v1/route"
@@ -551,6 +559,28 @@ impl HttpError {
                 "code": self.status,
                 "message": self.message,
                 "metadata": self.metadata(request_id, self.retriable()),
+            }
+        })
+    }
+
+    /// Error envelope accepted by the TypeSafe SDK.  It deliberately names
+    /// Cortiq's own reason in `code`, while the `type` gives clients the
+    /// standard retry/auth/schema class they expect.
+    pub fn systemone_body(&self, request_id: &str) -> Value {
+        let kind = match self.status {
+            401 | 403 => "authentication_error",
+            404 => "not_found_error",
+            409 | 422 => "invalid_request_error",
+            429 => "rate_limit_error",
+            500..=599 => "api_error",
+            _ => "invalid_request_error",
+        };
+        json!({
+            "error": {
+                "type": kind,
+                "message": self.message,
+                "code": self.code,
+                "request_id": request_id,
             }
         })
     }
@@ -749,6 +779,7 @@ fn error_response(ctx: &Ctx, e: HttpError) -> Response {
     }
     let body = match ctx.surface {
         Surface::Decisions => e.openrouter_body(&ctx.id),
+        Surface::SystemOne => e.systemone_body(&ctx.id),
         Surface::Router => e.router_body(&ctx.id, ctx.ext),
     };
     json_response(status, &body, &ctx.id, e.account, e.retry_after)
@@ -1006,6 +1037,9 @@ pub struct DecisionState {
     links_cap: usize,
     /// `--shadow-of`: the old router the router API is forwarded to.
     shadow: Option<Arc<shadow::Shadow>>,
+    /// `cortiq serve --jev-compatible`: expose the TypeSafe/Jev System One
+    /// adapter and switch `/v1/models` to its discovery document.
+    jev_compatible: bool,
 }
 
 impl std::fmt::Debug for DecisionState {
@@ -1014,6 +1048,7 @@ impl std::fmt::Debug for DecisionState {
             .field("service", &self.svc)
             .field("cascade", &self.cascade.is_some())
             .field("shadow", &self.shadow)
+            .field("jev_compatible", &self.jev_compatible)
             .finish()
     }
 }
@@ -1022,13 +1057,14 @@ impl DecisionState {
     /// The state over a service; `cascade` is the escalator the service was
     /// opened with (its learning statistics feed `/metrics` and `/v1/usage`).
     pub fn new(svc: Arc<DecisionService>, cascade: Option<Arc<Cascade>>) -> Result<Arc<Self>> {
-        Self::with_shadow(svc, cascade, None)
+        Self::with_shadow(svc, cascade, None, false)
     }
 
     fn with_shadow(
         svc: Arc<DecisionService>,
         cascade: Option<Arc<Cascade>>,
         shadow: Option<Arc<shadow::Shadow>>,
+        jev_compatible: bool,
     ) -> Result<Arc<Self>> {
         let cfg = svc.config();
         let rates = cfg.rates()?;
@@ -1043,6 +1079,7 @@ impl DecisionState {
             links: Mutex::new(VecDeque::new()),
             links_cap,
             shadow,
+            jev_compatible,
         }))
     }
 
@@ -1443,6 +1480,13 @@ pub fn router(state: Arc<DecisionState>) -> Router {
         .route("/v1/admin/learning", get(admin_learning))
         .route("/v1/admin/generations", get(admin_generations))
         .route("/v1/admin/rollback", post(admin_rollback));
+    // System One shares the same authentication, local resonance and oracle
+    // cascade, but deliberately has its own request and discovery contract.
+    // Keep it opt-in: `/v1/models` has a different, TypeSafe-shaped response
+    // while the adapter is enabled.
+    if state.jev_compatible {
+        r = r.route("/v1/systemone", post(systemone_handler));
+    }
     // Shadow mode (`--shadow-of`): only then is anything added, so a server
     // without the flag is unchanged.
     let shadow = state.shadow.is_some();
@@ -1476,7 +1520,7 @@ async fn context_middleware(mut req: Request, next: Next) -> Response {
     let path = req.uri().path().to_string();
     let surface = surface_of(&path);
     let id = match surface {
-        Surface::Decisions => new_request_id(now_unix()),
+        Surface::Decisions | Surface::SystemOne => new_request_id(now_unix()),
         Surface::Router => router_request_id(),
     };
     let ext = wants_extensions(req.headers());
@@ -1543,7 +1587,9 @@ async fn not_found_handler(
 ) -> Response {
     match ctx.surface {
         Surface::Router => router_unrouted(&st, &ctx, &headers, 404).await,
-        Surface::Decisions => error_response(&ctx, HttpError::not_found("no such endpoint")),
+        Surface::Decisions | Surface::SystemOne => {
+            error_response(&ctx, HttpError::not_found("no such endpoint"))
+        }
     }
 }
 
@@ -1554,7 +1600,7 @@ async fn method_not_allowed_handler(
 ) -> Response {
     match ctx.surface {
         Surface::Router => router_unrouted(&st, &ctx, &headers, 405).await,
-        Surface::Decisions => {
+        Surface::Decisions | Surface::SystemOne => {
             let mut e = HttpError::invalid("method not allowed on this endpoint");
             e.status = 405;
             error_response(&ctx, e)
@@ -1571,6 +1617,18 @@ async fn decisions_handler(
     body: Body,
 ) -> Response {
     let out = decide_http(&st, &headers, body).await;
+    respond(&ctx, out)
+}
+
+/// TypeSafe/Jev System One compatibility endpoint.  It is a wire adapter, not
+/// an identity shim: the returned `model` is always `cmf-decision-<version>`.
+async fn systemone_handler(
+    State(st): State<Arc<DecisionState>>,
+    Extension(ctx): Extension<Ctx>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let out = systemone_http(&st, &headers, body).await;
     respond(&ctx, out)
 }
 
@@ -1598,10 +1656,109 @@ async fn decide_http(st: &Arc<DecisionState>, headers: &HeaderMap, body: Body) -
     })
 }
 
+async fn systemone_http(st: &Arc<DecisionState>, headers: &HeaderMap, body: Body) -> Handled {
+    let (p, bytes) = keyed_body(st, headers, body).await?;
+    let account = p.account.clone();
+    let guard = st
+        .svc
+        .enter()
+        .map_err(|e| HttpError::from(e).by(&account))?;
+    let s = Arc::clone(st);
+    let decided = blocking(move || {
+        let _slot = guard;
+        s.svc
+            .decide_systemone_body(&bytes, &p)
+            .map_err(|e| HttpError::from(e).by(&p.account))
+    })
+    .await?;
+    st.note(&decided, &account, &decided.id);
+    Ok(Reply {
+        status: StatusCode::OK,
+        body: systemone_response(&decided),
+        id: Some(decided.id),
+        account: Some(account),
+    })
+}
+
+/// Deliberately compact System One success response.  It contains only the
+/// documented wire fields: CMF diagnostics, billing and provider metadata
+/// remain on the native `/v1/decisions` surface.  The token figures are the
+/// same metered request figures as the native response, including the compact
+/// answer representation counted as output.
+fn systemone_response(decided: &Decided) -> Value {
+    let input_tokens = decided.response["usage"]["input_tokens"]
+        .as_u64()
+        .unwrap_or(0);
+    let output_tokens = decided.response["usage"]["output_tokens"]
+        .as_u64()
+        .unwrap_or(0);
+    json!({
+        "model": SYSTEMONE_MODEL_ID,
+        "answers": decided.response["answers"].clone(),
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+        },
+    })
+}
+
+/// TypeSafe's discovery schema requires a YYYY-MM-DD `release_date`.  The
+/// CMF model's immutable manifest timestamp is the closest honest release
+/// date for a local file; fall back only for malformed legacy metadata.
+fn systemone_models_json(st: &DecisionState) -> Value {
+    let created = st.svc.models_json()["data"][0]["created"]
+        .as_i64()
+        .unwrap_or(0);
+    let release_date = DateTime::<Utc>::from_timestamp(created, 0)
+        .map(|when| when.format("%F").to_string())
+        .unwrap_or_else(|| "1970-01-01".to_string());
+    let canonical_description =
+        "Cortiq CMF resonance decision model. This is the response identity, not a Jev model.";
+    let alias_description = format!(
+        "Cortiq CMF transport alias for {SYSTEMONE_MODEL_ID}; accepts System One requests but responds as the CMF model, not Jev."
+    );
+    let mut models = vec![json!({
+        "name": SYSTEMONE_MODEL_ID,
+        "description": canonical_description,
+        "release_date": release_date,
+    })];
+    for alias in SYSTEMONE_MODEL_ALIASES {
+        models.push(json!({
+            "name": alias,
+            "description": alias_description,
+            "release_date": release_date,
+        }));
+    }
+    // `ModelRule::Jev` also accepts dated 1.13 selectors.  Discovery exposes
+    // the stable stem; a caller using a dated selector is migrated the same
+    // way but the local answer still identifies the CMF model.
+    models.push(json!({
+        "name": "typesafe/jev-1.13",
+        "description": alias_description,
+        "release_date": release_date,
+    }));
+    json!({"models": models})
+}
+
 async fn models_handler(
     State(st): State<Arc<DecisionState>>,
     Extension(ctx): Extension<Ctx>,
+    headers: HeaderMap,
 ) -> Response {
+    if st.jev_compatible {
+        let out = async {
+            let p = caller(&st, &headers).await?;
+            Ok(Reply::ok(systemone_models_json(&st)).by(&p.account))
+        }
+        .await;
+        // `/v1/models` is a native/OpenRouter path normally.  Once the
+        // opt-in adapter changes its success document, give its failures the
+        // same System One envelope too (not an OpenRouter surprise to a
+        // discovery client).
+        let mut systemone_ctx = ctx;
+        systemone_ctx.surface = Surface::SystemOne;
+        return respond(&systemone_ctx, out);
+    }
     respond(&ctx, Ok(Reply::ok(st.svc.models_json())))
 }
 
@@ -3171,6 +3328,10 @@ pub struct ServeOptions {
     /// Where the oracle's max price came from (`--oracle`), for the startup
     /// line.
     pub oracle_note: Option<String>,
+    /// Expose the TypeSafe/Jev System One HTTP adapter.  This is opt-in
+    /// because it intentionally makes `/v1/models` use TypeSafe discovery
+    /// rather than the native OpenRouter listing.
+    pub jev_compatible: bool,
 }
 
 impl std::fmt::Debug for ServeOptions {
@@ -3189,6 +3350,7 @@ impl std::fmt::Debug for ServeOptions {
             .field("shadow_timeout", &self.shadow_timeout)
             .field("oracle_from_flag", &self.oracle_from_flag)
             .field("oracle_note", &self.oracle_note)
+            .field("jev_compatible", &self.jev_compatible)
             .finish()
     }
 }
@@ -3208,6 +3370,7 @@ impl ServeOptions {
             shadow_timeout: cortiq_decision::shadow::UPSTREAM_TIMEOUT,
             oracle_from_flag: false,
             oracle_note: None,
+            jev_compatible: false,
         }
     }
 
@@ -3355,7 +3518,7 @@ impl DecisionServer {
             }
             None => None,
         };
-        let state = DecisionState::with_shadow(svc, Some(cascade), shadow)?;
+        let state = DecisionState::with_shadow(svc, Some(cascade), shadow, opts.jev_compatible)?;
         Ok(Self {
             state,
             ledger,

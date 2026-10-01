@@ -1,14 +1,16 @@
 # Cortiq Decision — API
 
-`cortiq serve cortiq-decision.cmf` starts one HTTP server that speaks two
-protocols at the same time:
+`cortiq serve cortiq-decision.cmf` starts one HTTP server with two native
+protocols and an opt-in request adapter:
 
-* the **decisions protocol** of Jev / OpenRouter (`POST /api/alpha/decisions`),
-  with an optional `cmf` extension;
+* the **Cortiq decisions protocol** in a Jev / OpenRouter-shaped form
+  (`POST /api/alpha/decisions`), with an optional `cmf` extension;
 * the **cortiq-router API**, schema `1.1` (`POST /v1/route` and the rest), so
-  that existing router clients switch by changing the backend address only.
+  that existing router clients switch by changing the backend address only;
+* when `--jev-compatible` is set, the TypeSafe System One request endpoint
+  (`POST /v1/systemone`). Its response identity remains a local CMF model.
 
-Both run the same local model and the same oracle cascade ([ORACLE.md](ORACLE.md)).
+All use the same local model and the same oracle cascade ([ORACLE.md](ORACLE.md)).
 There is no web interface and no CORS layer. Request bodies are never logged:
 a log line holds the request id, status, latency and account.
 
@@ -28,6 +30,7 @@ examples use `curl` and `jq`.
 1. [Start a server](#1-start-a-server)
 2. [Keys, plans and limits](#2-keys-plans-and-limits)
 3. [Decisions API (Jev / OpenRouter protocol)](#3-decisions-api-jev--openrouter-protocol)
+3a. [System One request adapter (Jev-compatible)](#3a-system-one-request-adapter-jev-compatible)
 4. [cortiq-router API (schema 1.1)](#4-cortiq-router-api-schema-11)
 5. [Administration](#5-administration)
 6. [Configuration reference](#6-configuration-reference)
@@ -96,7 +99,8 @@ stale `LOCK` of a dead process), `--shadow-of URL` and
 `--oracle-max-price`, `--oracle-key-env`, `--oracle-base-url` and
 `--no-oracle-learning`: the oracle in two steps, the OpenRouter key in
 `OPENROUTER_API_KEY` and then this flag
-([ORACLE.md](ORACLE.md#connect-openrouter)).
+([ORACLE.md](ORACLE.md#connect-openrouter)). Add `--jev-compatible` to expose
+the separate System One adapter in [section 3a](#3a-system-one-request-adapter-jev-compatible).
 Language-model flags (`--task`, `--gpus`, …) are refused for a decision file.
 
 ```bash
@@ -541,6 +545,37 @@ curl -s "$CORTIQ/v1/skills" -H "Authorization: Bearer $KEY" \
 curl -s "$CORTIQ/v1/usage" -H "Authorization: Bearer $KEY" -H 'x-cmf-extensions: 1' \
   | jq '{account, totals: .cmf.totals}'                                                     # → 200
 ```
+
+## 3a. System One request adapter (Jev-compatible)
+
+Enable the adapter explicitly; native endpoints remain unchanged:
+
+```bash
+cortiq serve cortiq-decision.cmf --state ./decision.state \
+  --jev-compatible --port 8080
+```
+
+`POST /v1/systemone` accepts the TypeSafe System One request shape and uses the
+same local skills, gate, key policy, limits and optional oracle. `model` may be
+omitted; `jev-latest`, `jev-preview`, `jev-1.13.0`, and the
+`typesafe/jev-1.13` selector series are accepted as **transport aliases**.
+Responses always identify the served CMF implementation as
+`cmf-decision-0.8.5`, not as Jev. `state` may be a string, object, array or
+`null`; question `instructions` may be omitted or `null`.
+
+```bash
+curl -s "$CORTIQ/v1/systemone" \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"state":"I still have not received my new card",
+       "questions":{"intent":{"type":"choice",
+       "criteria":{"card_arrival":null,"card_delivery_estimate":null}}}}'
+```
+
+A successful reply contains `{model, answers, usage}` with the same request
+metering as the native endpoint. In adapter mode, `GET /v1/models` returns the
+System One `models` discovery array, including the canonical CMF model and its
+transport aliases. The adapter is wire-format compatibility only: it does not
+load, return or claim Jev weights, identity or affiliation.
 
 ## 4. cortiq-router API (schema 1.1)
 
