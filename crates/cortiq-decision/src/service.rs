@@ -1457,6 +1457,22 @@ impl DecisionService {
         self.decide(&req, p)
     }
 
+    /// Parse and decide a TypeSafe/Jev System One request.  The adapter has a
+    /// slightly more permissive wire contract than the native/OpenRouter
+    /// endpoint (for example the SDK may omit `model`), but malformed System
+    /// One bodies are schema errors (422) rather than a change to the native
+    /// endpoint's established 400 contract.
+    pub fn decide_systemone_body(&self, body: &[u8], p: &Principal) -> Result<Decided, ApiError> {
+        let req =
+            crate::protocol::parse_systemone_request(body, &self.limits).map_err(|mut e| {
+                if e.reason == crate::protocol::Reason::InvalidRequest {
+                    e.status = 422;
+                }
+                e
+            })?;
+        self.decide(&req, p)
+    }
+
     /// Decide a request (see the module notes).
     pub fn decide(&self, req: &DecisionRequest, p: &Principal) -> Result<Decided, ApiError> {
         let t0 = Instant::now();

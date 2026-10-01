@@ -73,7 +73,9 @@ use cortiq_decision::oracle::{self, LedgerTotals, OracleState};
 use cortiq_decision::oracle_setup::{
     self, CheckOptions, OracleFlags, OracleSetup, host_of, usd, usd_ceil, usd_fine,
 };
-use cortiq_decision::protocol::{self, ApiError, FeedbackRequest, MODEL_ID, model_name};
+use cortiq_decision::protocol::{
+    self, ApiError, FeedbackRequest, MODEL_ID, SYSTEMONE_MODEL_ID, model_name,
+};
 use cortiq_decision::service::{
     Action, AdminCommand, Decided, DecisionService, Escalation, EscalationResult, Escalator,
     LoadedModel, ModelHandle, OracleStatus, Principal, QuestionOutcome, RefusalReason, Resolution,
@@ -298,6 +300,9 @@ pub struct ServeFlags {
     /// filesystem has no advisory locks (elsewhere such a `LOCK` is taken over
     /// without it; spec §4.11).
     pub break_lock: bool,
+    /// `--jev-compatible`: expose TypeSafe/Jev System One request handling at
+    /// `POST /v1/systemone` (the response identifies the local CMF model).
+    pub jev_compatible: bool,
     /// `--shadow-of URL`: shadow mode of the router API (spec §4.15).
     pub shadow_of: Option<String>,
     /// `--shadow-timeout-s N`: deadline of one request forwarded to the old
@@ -314,6 +319,7 @@ impl ServeFlags {
             ("--decision-config", self.decision_config.is_some()),
             ("--state", self.state.is_some()),
             ("--break-lock", self.break_lock),
+            ("--jev-compatible", self.jev_compatible),
             ("--shadow-of", self.shadow_of.is_some()),
             ("--shadow-timeout-s", self.shadow_timeout_s.is_some()),
         ]
@@ -339,7 +345,7 @@ pub fn check_serve_flags(
         ensure!(
             llm_given.is_empty(),
             "{} is a decision file: {} apply only to language models (a decision server takes \
-             --host, --port, --decision-config, --state, --break-lock, --shadow-of and --oracle*)",
+             --host, --port, --decision-config, --state, --break-lock, --jev-compatible, --shadow-of and --oracle*)",
             model,
             llm_given.join(", ")
         );
@@ -403,6 +409,7 @@ pub async fn serve(model: &str, host: &str, port: u16, flags: &ServeFlags) -> Re
     opts.addr = socket_addr(host, port)?;
     opts.state_dir = flags.state.clone();
     opts.break_lock = flags.break_lock;
+    opts.jev_compatible = flags.jev_compatible;
     opts.shadow_of = flags.shadow_of.clone();
     if let Some(t) = flags.shadow_timeout_s {
         ensure!(
@@ -417,6 +424,12 @@ pub async fn serve(model: &str, host: &str, port: u16, flags: &ServeFlags) -> Re
         opts.addr,
         opts.state_root().display()
     );
+    if opts.jev_compatible {
+        println!(
+            "  Jev-compatible API: POST http://{}/v1/systemone (responds as {})",
+            opts.addr, SYSTEMONE_MODEL_ID
+        );
+    }
     if let Some(url) = &opts.shadow_of {
         // Checked before it is printed (credentials in it are refused).
         let base = upstream_base(url)?;
@@ -3378,6 +3391,7 @@ mod tests {
             decision_config: Some("cfg.json".into()),
             state: Some("st".into()),
             break_lock: true,
+            jev_compatible: true,
             shadow_of: Some("https://router.example.com".into()),
             shadow_timeout_s: Some(300),
             oracle: OracleArgs {
@@ -3393,6 +3407,7 @@ mod tests {
                 "--decision-config",
                 "--state",
                 "--break-lock",
+                "--jev-compatible",
                 "--shadow-of",
                 "--shadow-timeout-s",
                 "--oracle",
@@ -3408,6 +3423,12 @@ mod tests {
         assert!(check_serve_flags("m.cmf", false, &["--task"], &none).is_ok());
         let e = check_serve_flags("m.cmf", false, &[], &d).unwrap_err();
         assert!(e.to_string().contains("--decision-config"), "{e}");
+        let adapter = ServeFlags {
+            jev_compatible: true,
+            ..ServeFlags::default()
+        };
+        let e = check_serve_flags("m.cmf", false, &[], &adapter).unwrap_err();
+        assert!(e.to_string().contains("--jev-compatible"), "{e}");
     }
 
     #[test]
@@ -3421,6 +3442,7 @@ mod tests {
             "--state",
             "s",
             "--break-lock",
+            "--jev-compatible",
             "--shadow-of",
             "https://router.example.com",
             "--shadow-timeout-s",
@@ -3433,6 +3455,7 @@ mod tests {
                 decision_config,
                 state,
                 break_lock,
+                jev_compatible,
                 shadow_of,
                 shadow_timeout_s,
                 task,
@@ -3441,6 +3464,7 @@ mod tests {
                 assert_eq!(decision_config.as_deref(), Some("c.json"));
                 assert_eq!(state.as_deref(), Some("s"));
                 assert!(break_lock);
+                assert!(jev_compatible);
                 assert_eq!(shadow_of.as_deref(), Some("https://router.example.com"));
                 assert_eq!(shadow_timeout_s, Some(300));
                 // `--task` is optional so that its presence can be refused on
