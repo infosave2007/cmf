@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.5] - 2026-10-01
+
+### Added
+- `cortiq serve <decision.cmf> --jev-compatible` exposes the opt-in TypeSafe
+  System One request adapter at `POST /v1/systemone`. It accepts the System One
+  default `jev-latest` and the historical `typesafe/jev-1.13` request aliases,
+  and returns the local `cmf-decision-0.8.5` identity. This is wire-format
+  compatibility only: Cortiq does not load, claim to be, or return Jev weights.
+- In adapter mode, `GET /v1/models` returns System One model discovery data; the
+  native decisions and router endpoints keep their existing contracts.
+
+
 ## [0.8.4] - 2026-09-30
 
 ### Performance

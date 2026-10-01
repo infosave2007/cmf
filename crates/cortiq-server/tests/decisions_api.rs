@@ -48,8 +48,7 @@ use cortiq_decision::config::Config;
 use cortiq_decision::container::{DecisionModel, Verify};
 use cortiq_decision::keys::{KEYS_FILE_VERSION, KeyRecord, KeysFile, hash_key, now_unix};
 use cortiq_decision::oracle::KeyLookup;
-use cortiq_decision::protocol::ApiError;
-use cortiq_decision::protocol::FeedbackRequest;
+use cortiq_decision::protocol::{ApiError, FeedbackRequest, SYSTEMONE_MODEL_ID};
 use cortiq_decision::service::{
     Action, AdminCommand, DecisionService, Escalation, EscalationResult, Escalator, LoadedModel,
     ModelHandle, Principal, RefusalReason, Resolution, Resolved,
@@ -246,6 +245,26 @@ fn topics_body(text: &str) -> Value {
     body(json!(text), json!({"task": choice(&TOPICS)}), None)
 }
 
+/// A System One request.  Unlike [`topics_body`], this deliberately leaves
+/// `model` and `instructions` optional to exercise the adapter's migration
+/// conveniences without loosening Cortiq's native protocol.
+fn systemone_topics_body(state: Value, model: Option<&str>, instructions: Option<Value>) -> Value {
+    let mut task = choice(&TOPICS);
+    match instructions {
+        Some(instructions) => task["instructions"] = instructions,
+        None => {
+            task.as_object_mut()
+                .expect("question is an object")
+                .remove("instructions");
+        }
+    }
+    let mut v = json!({"state": state, "questions": {"task": task}});
+    if let Some(model) = model {
+        v["model"] = json!(model);
+    }
+    v
+}
+
 /// A dev text the `topics` gate accepts (found with the service directly).
 fn accepted() -> &'static str {
     static A: OnceLock<String> = OnceLock::new();
@@ -292,7 +311,23 @@ impl Srv {
         Self::open_with(cfg, true, Some(ADMIN), tempfile::tempdir().unwrap())
     }
 
+    /// Open the opt-in TypeSafe/Jev System One adapter.  The regular test
+    /// server must remain native-only, so adapter tests use this explicitly.
+    fn open_systemone(cfg: Config) -> Self {
+        Self::open_with_systemone(cfg, true, Some(ADMIN), tempfile::tempdir().unwrap(), true)
+    }
+
     fn open_with(cfg: Config, loopback: bool, admin: Option<&str>, dir: tempfile::TempDir) -> Self {
+        Self::open_with_systemone(cfg, loopback, admin, dir, false)
+    }
+
+    fn open_with_systemone(
+        cfg: Config,
+        loopback: bool,
+        admin: Option<&str>,
+        dir: tempfile::TempDir,
+        jev_compatible: bool,
+    ) -> Self {
         let mut o = ServeOptions::new(&toy().path, cfg);
         o.state_dir = Some(dir.path().join("state"));
         o.addr = if loopback {
@@ -306,6 +341,7 @@ impl Srv {
             created_unix: Some(EPOCH),
         };
         o.admin_token = admin.map(str::to_string);
+        o.jev_compatible = jev_compatible;
         let server = DecisionServer::open(&o).expect("open the decision server");
         let app = server.router();
         Self {
@@ -981,6 +1017,93 @@ async fn payload_too_large_bad_requests_and_unknown_models() {
     let r = srv.get("/v1/decisions", None).await;
     assert_eq!(r.status, 405);
     assert_eq!(r.body["error"]["code"], 405);
+}
+
+// ------------------------------------------------------------------ TypeSafe/Jev System One adapter
+
+#[tokio::test]
+async fn systemone_endpoint_is_unavailable_without_the_opt_in_flag() {
+    let srv = Srv::open(cfg());
+    let r = srv
+        .post(
+            "/v1/systemone",
+            None,
+            &systemone_topics_body(Value::Null, None, None),
+        )
+        .await;
+    assert_eq!(r.status, 404, "{}", r.text);
+    assert_eq!(r.request_id(), r.body["error"]["request_id"]);
+    assert_eq!(r.body["error"]["type"], "not_found_error");
+    assert_eq!(r.body["error"]["code"], "INVALID_REQUEST");
+}
+
+#[tokio::test]
+async fn systemone_adapter_accepts_sdk_shape_and_reports_cmf_identity() {
+    let srv = Srv::open_systemone(cfg());
+
+    // This adapter accepts omitted model, null state and omitted instructions
+    // as migration conveniences; those extensions do not loosen the native
+    // `/v1/decisions` parser, which is covered above.
+    let omitted = systemone_topics_body(Value::Null, None, None);
+    let r = srv.post("/v1/systemone", None, &omitted).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert!(r.request_id().starts_with("cmf-dec-"));
+    assert_eq!(r.body["model"], SYSTEMONE_MODEL_ID);
+    assert_eq!(r.body.as_object().unwrap().len(), 3, "{}", r.text);
+    assert_eq!(r.body["answers"]["task"]["type"], "choice");
+    assert!(r.body["usage"]["input_tokens"].as_u64().unwrap() > 0);
+    assert!(r.body["usage"]["output_tokens"].as_u64().is_some());
+    assert!(r.body.get("id").is_none());
+    assert!(r.body.get("cmf").is_none());
+    assert!(r.body.get("provider").is_none());
+
+    // `jev-latest` is an input alias only.  A response always identifies the
+    // locally served CMF model, never an upstream Jev model.
+    let alias = systemone_topics_body(
+        json!(accepted()),
+        Some("jev-latest"),
+        Some(json!("Which topic is this?")),
+    );
+    let aliased = srv.post("/v1/systemone", None, &alias).await;
+    assert_eq!(aliased.status, 200, "{}", aliased.text);
+    assert_eq!(aliased.body["model"], SYSTEMONE_MODEL_ID);
+    assert_eq!(aliased.body["answers"]["task"]["type"], "choice");
+
+    // In adapter mode the discovery document has the System One shape, not
+    // the native OpenRouter-shaped `data` list.
+    let models = srv.get("/v1/models", None).await;
+    assert_eq!(models.status, 200, "{}", models.text);
+    assert!(models.request_id().starts_with("cmf-dec-"));
+    assert!(models.body.get("data").is_none());
+    assert_eq!(models.body.as_object().unwrap().len(), 1, "{}", models.text);
+    let listed = &models.body["models"];
+    let canonical = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == SYSTEMONE_MODEL_ID)
+        .expect("canonical CMF model in System One discovery");
+    assert!(canonical["description"].as_str().unwrap().contains("CMF"));
+    assert!(canonical["release_date"].as_str().is_some());
+
+    // System One reports malformed input in its own documented envelope:
+    // schema failures are 422 rather than changing the native API's 400.
+    let malformed = json!({
+        "state": null,
+        "questions": {
+            "task": {
+                "type": "choice",
+                "criteria": {"only": "one option is not a choice"}
+            }
+        }
+    });
+    let bad = srv.post("/v1/systemone", None, &malformed).await;
+    assert_eq!(bad.status, 422, "{}", bad.text);
+    assert_eq!(bad.request_id(), bad.body["error"]["request_id"]);
+    assert_eq!(bad.body["error"]["type"], "invalid_request_error");
+    assert_eq!(bad.body["error"]["code"], "INVALID_REQUEST");
+    assert!(bad.body["error"]["message"].is_string());
+    assert!(bad.body["error"].get("metadata").is_none());
 }
 
 // ------------------------------------------------------------------ OpenRouter fields, matching
