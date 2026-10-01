@@ -18,7 +18,8 @@ use cortiq_decision::answer::{self, Rounding};
 use cortiq_decision::canonical;
 use cortiq_decision::protocol::{
     self, ApiError, CmfOptions, ModelRef, ModelRule, Profile, QuestionKind, Reason, RequestLimits,
-    State, parse_feedback, parse_request, validate_decisions_response,
+    SYSTEMONE_MODEL_ALIASES, SYSTEMONE_MODEL_ID, State, parse_feedback, parse_request,
+    parse_systemone_request, validate_decisions_response,
 };
 use serde_json::{Map, Value, json};
 use std::path::PathBuf;
@@ -700,6 +701,75 @@ fn parsed_fields_keep_order_and_values() {
         questions: 1,
     };
     let e = parse_request(&serde_json::to_vec(&base()).unwrap(), &tight).unwrap_err();
+    assert_eq!((e.status, e.reason), (400, Reason::InvalidRequest));
+}
+
+#[test]
+fn systemone_parser_keeps_the_native_boundary_strict() {
+    let limits = RequestLimits::default();
+    // This is the smallest useful System One body: the adapter accepts an
+    // omitted transport model, null state and omitted instructions, while the
+    // native decisions surface intentionally does not.
+    let body = json!({
+        "state": null,
+        "questions": {"is_billing": {"type": "noul"}},
+    });
+    let bytes = serde_json::to_vec(&body).unwrap();
+    let r = parse_systemone_request(&bytes, &limits).unwrap();
+    assert_eq!(r.model, ModelRef::Latest);
+    assert_eq!(r.state, State::Json(Value::Null));
+    assert_eq!(r.state_text, "null");
+    assert_eq!(r.questions[0].instructions, Value::Null);
+    let native = parse_request(&bytes, &limits).unwrap_err();
+    assert_eq!(
+        (native.status, native.reason),
+        (400, Reason::InvalidRequest)
+    );
+
+    // Every documented adapter alias maps to the locally served CMF model;
+    // callers never get an answer that claims to be Jev.
+    for model in SYSTEMONE_MODEL_ALIASES
+        .iter()
+        .copied()
+        .chain(["typesafe/jev-1.13", SYSTEMONE_MODEL_ID])
+    {
+        let r = parse_systemone_request(
+            &serde_json::to_vec(&json!({
+                "model": model,
+                "state": "refund request",
+                "questions": {"task": {"type": "noul", "instructions": null}},
+            }))
+            .unwrap(),
+            &limits,
+        )
+        .unwrap();
+        assert_eq!(r.model, ModelRef::Latest, "{model}");
+    }
+
+    let e = parse_systemone_request(
+        &serde_json::to_vec(&json!({
+            "model": "typesafe/jev-2",
+            "state": "refund request",
+            "questions": {"task": {"type": "noul"}},
+        }))
+        .unwrap(),
+        &limits,
+    )
+    .unwrap_err();
+    assert_eq!((e.status, e.reason), (404, Reason::ModelNotFound));
+
+    // Score legends remain the official non-null array contract even at the
+    // compatibility boundary.
+    let e = parse_systemone_request(
+        &serde_json::to_vec(&json!({
+            "model": "jev-latest",
+            "state": "refund request",
+            "questions": {"urgency": {"type": "score", "criteria": ["low", null]}},
+        }))
+        .unwrap(),
+        &limits,
+    )
+    .unwrap_err();
     assert_eq!((e.status, e.reason), (400, Reason::InvalidRequest));
 }
 

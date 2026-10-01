@@ -30,7 +30,7 @@ oracle for unfamiliar cases, then use its answers to grow your local skills.
 
 **Local decisions · Custom skills · Optional oracle**
 
-[Quick start](#quick-start) · [Your own skill](#add-your-own-skill) · [Oracle](ORACLE.md#connect-openrouter) · [API](API.md) · [Benchmarks](BENCHMARKS.md) · [На русском](README_RU.md)
+[Quick start](#quick-start) · [Jev-compatible requests](#jev-compatible-requests) · [Your own skill](#add-your-own-skill) · [Oracle](ORACLE.md#connect-openrouter) · [API](API.md) · [Benchmarks](BENCHMARKS.md) · [На русском](README_RU.md)
 
 ## Quick start
 
@@ -69,6 +69,19 @@ CORTIQ_DECISION_DEVICE=vulkan cortiq decide cortiq-decision.cmf \
 
 On multi-GPU hosts, also set `CORTIQ_DECISION_VULKAN_ADAPTER` to a unique part
 of the GPU name. The same variables work with `cortiq serve`. [GPU guide →](GPU.md)
+
+### Jev-compatible requests
+
+For a TypeSafe System One client, opt in to the separate adapter:
+
+```bash
+cortiq serve cortiq-decision.cmf --jev-compatible --port 8080
+```
+
+Send its requests to `/v1/systemone`. The default `jev-latest` and historical
+Jev selectors are input aliases only; every response names the local
+`cmf-decision-0.8.5` model. The adapter does not load or claim to be Jev.
+[Endpoint details →](API.md#3a-system-one-request-adapter-jev-compatible)
 
 ## Measured results
 

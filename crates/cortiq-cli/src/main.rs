@@ -290,6 +290,11 @@ enum Commands {
         /// (elsewhere such a LOCK is taken over without it)
         #[arg(long)]
         break_lock: bool,
+        /// Decision file only: expose the TypeSafe/Jev System One request
+        /// adapter at POST /v1/systemone. The response always identifies the
+        /// local CMF model, never Jev.
+        #[arg(long)]
+        jev_compatible: bool,
         /// Decision file only: shadow mode for switching production traffic
         /// from cortiq-router (router-API paths only). Every router-API
         /// request (/v1/route, /v1/route:batch, /v1/feedback,
@@ -2653,6 +2658,7 @@ async fn main() -> anyhow::Result<()> {
             decision_config,
             state,
             break_lock,
+            jev_compatible,
             shadow_of,
             shadow_timeout_s,
             oracle,
@@ -2691,6 +2697,7 @@ async fn main() -> anyhow::Result<()> {
                 decision_config: decision_config.map(Into::into),
                 state: state.map(Into::into),
                 break_lock,
+                jev_compatible,
                 shadow_of,
                 shadow_timeout_s,
                 oracle,

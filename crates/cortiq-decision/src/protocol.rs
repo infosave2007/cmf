@@ -1,4 +1,4 @@
-//! Decisions request and response protocol, Jev/OpenRouter shape (spec §4.4,
+//! Decisions request and response protocol, OpenRouter shape (spec §4.4,
 //! §4.7, §4.8).
 //!
 //! **Request** `{model, state, questions}` plus OpenRouter's optional
@@ -45,6 +45,18 @@ use serde_json::{Map, Value, json};
 
 /// The public model id (spec §4.4).
 pub const MODEL_ID: &str = "cortiq/decision";
+/// The model identity returned by the TypeSafe/Jev System One compatibility
+/// endpoint.  It is deliberately a Cortiq name: accepting a Jev wire request
+/// must never make a CMF server claim to be the Jev model.
+pub const SYSTEMONE_MODEL_ID: &str = concat!("cmf-decision-", env!("CARGO_PKG_VERSION"));
+/// The default model name used by the official TypeSafe SDK.  It is accepted
+/// only by [`parse_systemone_request`], where it means "use this server's
+/// current CMF decision model".
+pub const SYSTEMONE_MODEL_ALIAS: &str = "jev-latest";
+/// Additional System One transport aliases accepted only by
+/// [`parse_systemone_request`].  They are useful when migrating an existing
+/// TypeSafe client, but never appear as the identity in a response.
+pub const SYSTEMONE_MODEL_ALIASES: &[&str] = &[SYSTEMONE_MODEL_ALIAS, "jev-preview", "jev-1.13.0"];
 /// `provider` of every response.
 pub const PROVIDER: &str = "Cortiq";
 /// Hex characters of the model sha in a pinned model id.
@@ -508,7 +520,17 @@ fn check_description(field: &str, v: &Value, allow_null: bool) -> Result<(), Api
     Ok(())
 }
 
-fn parse_question(id: &str, v: &Value) -> Result<Question, ApiError> {
+/// The two HTTP request dialects deliberately differ at their boundary.  The
+/// native/OpenRouter surface stays strict and versioned; the System One
+/// adapter accepts the SDK's optional/null fields without loosening that
+/// existing contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RequestDialect {
+    Cortiq,
+    SystemOne,
+}
+
+fn parse_question(id: &str, v: &Value, dialect: RequestDialect) -> Result<Question, ApiError> {
     let base = format!("questions.{id}");
     let Value::Object(q) = v else {
         return Err(ApiError::invalid_field(
@@ -540,6 +562,11 @@ fn parse_question(id: &str, v: &Value) -> Result<Question, ApiError> {
     };
     let instructions = match q.get("instructions") {
         Some(v @ (Value::String(_) | Value::Object(_) | Value::Array(_))) => v.clone(),
+        // The official TypeSafe SDK permits `noul()` and its siblings without
+        // instructions.  Keep the null in the contract (rather than silently
+        // inventing prose) so an optional oracle sees exactly what the caller
+        // sent.
+        None | Some(Value::Null) if dialect == RequestDialect::SystemOne => Value::Null,
         Some(other) => {
             return Err(ApiError::invalid_field(
                 &format!("{base}.instructions"),
@@ -607,6 +634,8 @@ fn parse_question(id: &str, v: &Value) -> Result<Question, ApiError> {
                 ));
             }
             for (i, v) in a.iter().enumerate() {
+                // TypeSafe score criteria deliberately do not permit null
+                // entries; preserve that wire invariant on the adapter too.
                 check_description(&format!("{cfield}[{i}]"), v, false)?;
             }
             Some(Value::Array(a.clone()))
@@ -780,8 +809,52 @@ pub fn parse_model(v: Option<&Value>) -> Result<ModelRef, ApiError> {
     .with_detail("model", Value::String(m.clone())))
 }
 
+/// Parse the model selector at the TypeSafe/Jev System One adapter boundary.
+///
+/// `jev-latest` is the documented TypeSafe alias.  The other aliases and
+/// historical `typesafe/jev-1.13` selectors are accepted for migration too,
+/// but only as routing aliases.  The response is always
+/// [`SYSTEMONE_MODEL_ID`], making the actual CMF implementation explicit.
+fn parse_systemone_model(v: Option<&Value>) -> Result<ModelRef, ApiError> {
+    let Some(v) = v else {
+        return Ok(ModelRef::Latest);
+    };
+    let Value::String(name) = v else {
+        return Err(ApiError::invalid_field("model", "model must be a string"));
+    };
+    if SYSTEMONE_MODEL_ALIASES.contains(&name.as_str())
+        || name == SYSTEMONE_MODEL_ID
+        || ModelRule::Jev.matches(name)
+    {
+        return Ok(ModelRef::Latest);
+    }
+    parse_model(Some(v))
+}
+
 /// Parse and validate a decisions request (see the module notes).
 pub fn parse_request(body: &[u8], limits: &RequestLimits) -> Result<DecisionRequest, ApiError> {
+    parse_request_dialect(body, limits, RequestDialect::Cortiq)
+}
+
+/// Parse the TypeSafe/Jev System One request shape used by
+/// `cortiq serve --jev-compatible`.
+///
+/// This is intentionally a separate entry point.  It accepts System One
+/// transport aliases plus omitted model, null state and null instructions for
+/// migration convenience, while [`parse_request`] retains the stricter,
+/// documented Cortiq / OpenRouter surface.
+pub fn parse_systemone_request(
+    body: &[u8],
+    limits: &RequestLimits,
+) -> Result<DecisionRequest, ApiError> {
+    parse_request_dialect(body, limits, RequestDialect::SystemOne)
+}
+
+fn parse_request_dialect(
+    body: &[u8],
+    limits: &RequestLimits,
+    dialect: RequestDialect,
+) -> Result<DecisionRequest, ApiError> {
     if body.len() > limits.body_bytes {
         return Err(ApiError::new(
             Reason::PayloadTooLarge,
@@ -808,7 +881,10 @@ pub fn parse_request(body: &[u8], limits: &RequestLimits) -> Result<DecisionRequ
             ));
         }
     }
-    let model = parse_model(top.get("model"))?;
+    let model = match dialect {
+        RequestDialect::Cortiq => parse_model(top.get("model"))?,
+        RequestDialect::SystemOne => parse_systemone_model(top.get("model"))?,
+    };
     // OpenRouter's optional fields: accepted, checked for shape, ignored.
     for k in ["provider", "trace"] {
         match top.get(k) {
@@ -823,14 +899,35 @@ pub fn parse_request(body: &[u8], limits: &RequestLimits) -> Result<DecisionRequ
     }
     let user = opt_string(&top, "user", MAX_OPENROUTER_STRING_CHARS)?;
     let session_id = opt_string(&top, "session_id", MAX_OPENROUTER_STRING_CHARS)?;
-    let state = match top.get("state") {
-        Some(Value::String(s)) if !s.is_empty() => State::Text(s.clone()),
-        Some(v @ Value::Object(m)) if !m.is_empty() => State::Json(v.clone()),
-        Some(v @ Value::Array(a)) if !a.is_empty() => State::Json(v.clone()),
-        Some(Value::String(_) | Value::Object(_) | Value::Array(_)) => {
+    let state = match (dialect, top.get("state")) {
+        (RequestDialect::SystemOne, Some(Value::String(s))) => State::Text(s.clone()),
+        (
+            RequestDialect::SystemOne,
+            Some(v @ (Value::Object(_) | Value::Array(_) | Value::Null)),
+        ) => State::Json(v.clone()),
+        (RequestDialect::SystemOne, Some(other)) => {
+            return Err(ApiError::invalid_field(
+                "state",
+                format!(
+                    "state must be a string, object, array or null, not {}",
+                    type_name(other)
+                ),
+            ));
+        }
+        (RequestDialect::SystemOne, None) => {
+            return Err(ApiError::invalid_field("state", "state is required"));
+        }
+        (RequestDialect::Cortiq, Some(Value::String(s))) if !s.is_empty() => State::Text(s.clone()),
+        (RequestDialect::Cortiq, Some(v @ Value::Object(m))) if !m.is_empty() => {
+            State::Json(v.clone())
+        }
+        (RequestDialect::Cortiq, Some(v @ Value::Array(a))) if !a.is_empty() => {
+            State::Json(v.clone())
+        }
+        (RequestDialect::Cortiq, Some(Value::String(_) | Value::Object(_) | Value::Array(_))) => {
             return Err(ApiError::invalid_field("state", "state must not be empty"));
         }
-        Some(other) => {
+        (RequestDialect::Cortiq, Some(other)) => {
             return Err(ApiError::invalid_field(
                 "state",
                 format!(
@@ -839,7 +936,9 @@ pub fn parse_request(body: &[u8], limits: &RequestLimits) -> Result<DecisionRequ
                 ),
             ));
         }
-        None => return Err(ApiError::invalid_field("state", "state is required")),
+        (RequestDialect::Cortiq, None) => {
+            return Err(ApiError::invalid_field("state", "state is required"));
+        }
     };
     let state_text = state.text();
     if state_text.len() > limits.state_bytes {
@@ -877,7 +976,7 @@ pub fn parse_request(body: &[u8], limits: &RequestLimits) -> Result<DecisionRequ
                 format!("question ids are 1..{MAX_QUESTION_ID_CHARS} characters"),
             ));
         }
-        questions.push(parse_question(id, q)?);
+        questions.push(parse_question(id, q, dialect)?);
     }
     let cmf = parse_cmf(top.get("cmf"))?;
     Ok(DecisionRequest {
