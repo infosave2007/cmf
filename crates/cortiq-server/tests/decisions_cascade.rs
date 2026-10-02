@@ -2650,6 +2650,18 @@ async fn an_untrained_contract_becomes_an_auto_skill_and_answers_locally() {
         json!(["cruise", "food", "travel"])
     );
     assert_eq!(l["skills"][&id]["taxonomy_version"], 2);
+    // `examples` per label = R per label as the attempt saw it: every taught
+    // text is a served learned row AND still in the buffer, counted once
+    // (the sum is the attempt's `rows.total`, not buffer + served).
+    let per_label = l["auto_skills"][0]["examples"].as_object().unwrap();
+    assert_eq!(per_label.len(), 3);
+    let total: u64 = per_label.values().map(|v| v.as_u64().unwrap()).sum();
+    assert_eq!(total, rec["auto"]["rows"]["total"].as_u64().unwrap());
+    assert_eq!(total as usize, taught);
+    for b in l["buffer"]["labels"].as_array().unwrap() {
+        assert_eq!(b["skill"], id);
+        assert_eq!(per_label[b["label"].as_str().unwrap()], b["examples"]);
+    }
     eprintln!(
         "auto_start after {taught} texts ({calls} oracle calls): {}",
         rec["auto"]
@@ -3085,16 +3097,124 @@ async fn rollback_restart_materialize_and_verify_with_an_auto_skill() {
     );
     drop(loaded);
     // Served from the materialised file: the contract is exact and local.
-    let srv = Srv::open_on(&out, tempfile::tempdir().unwrap(), &cfg, test_key());
+    // The state directory is fresh (a materialised base refuses the old
+    // CURRENT), so learn.log has no contract record: the registry is seeded
+    // from the served auto-skill (its labels and rubric) and the skill keeps
+    // learning — an abstention's oracle answer and a feedback are stored and
+    // an attempt reaches `auto_refit`; before this seeding every example
+    // was refused (`full`) and the skill was frozen at its materialised state.
+    let mut cfg_m = cfg.clone();
+    cfg_m.learning.refit_min_new = 3;
+    let srv = Srv::open_on(&out, tempfile::tempdir().unwrap(), &cfg_m, test_key());
     let r = ask(&srv, &q, &served_local).await;
     assert!(local(&r), "{}", r.text);
     assert_eq!(r.q("task")["certified"], false);
     assert_eq!(srv.get("/healthz").await.body["auto_skills"], 1);
+    let l = srv.learning().await;
+    assert_eq!(l["auto_contracts"], 1, "seeded from the served model: {l}");
+    assert_eq!(l["auto_skills"][0]["id"], id);
+    assert_eq!(l["auto_skills"][0]["labels"], json!(labels));
     assert_eq!(
-        srv.learning().await["auto_contracts"],
-        0,
-        "a fresh state directory"
+        l["auto_skills"][0]["served"]["active"],
+        json!(["cruise", "food", "travel"])
     );
+    assert_eq!(l["buffer"]["examples"], 0);
+    let base_gen = l["generation"].as_u64().unwrap();
+    let served_rows: u64 = l["auto_skills"][0]["examples"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|v| v.as_u64().unwrap())
+        .sum();
+    assert!(served_rows >= 71, "{l}");
+    // The learn.log of the fresh state directory holds the seeded record.
+    let (log, replayed) =
+        cortiq_decision::buffer::LearnLog::open(&srv.state_root().join("learn.log")).unwrap();
+    drop(log);
+    assert!(matches!(
+        replayed.records.as_slice(),
+        [cortiq_decision::buffer::LogRecord::Contract(c)] if c.skill == id && c.ids == labels
+    ));
+    // Feedback on a local answer is learned; abstentions teach through the
+    // oracle; the third example triggers an `auto_refit` on the materialised
+    // base.
+    let fb = json!({"id": r.body["id"], "question": "task", "label": "food"});
+    let f = srv.post("/v1/feedback", None, &fb).await;
+    assert_eq!(f.status, 200, "{}", f.text);
+    assert_eq!(
+        (f.body["learned"].as_bool(), f.body["full"].as_bool()),
+        (Some(true), Some(false)),
+        "{}",
+        f.text
+    );
+    let mut seen = Vec::new();
+    let hits = mock.hits();
+    let mut taught = 1;
+    for t in texts_apart("cruise", 12, 131, "mc", 0.995, &mut seen) {
+        let r = ask(&srv, &q, &t).await;
+        assert_eq!(r.q("task")["skill"], id, "{}", r.text);
+        if r.action() == "oracle" {
+            assert_eq!(r.body["answers"]["task"]["choice"], "cruise");
+            taught += 1;
+        } else if r.action() == "local" {
+            let fb = json!({"id": r.body["id"], "question": "task", "label": "cruise"});
+            let f = srv.post("/v1/feedback", None, &fb).await;
+            assert_eq!(f.body["learned"], true, "{}", f.text);
+            taught += 1;
+        }
+        if srv.learning().await["attempts"].as_u64().unwrap() >= 1 {
+            break;
+        }
+    }
+    let l = srv.learning().await;
+    assert_eq!(l["examples_added"].as_u64().unwrap(), taught, "{l}");
+    assert!(mock.hits() > hits, "no cruise text escalated");
+    assert_eq!(l["attempts"], 1, "{l}");
+    let rec = latest(&l);
+    assert_eq!(rec["kind"], "auto_refit", "{rec}");
+    assert_eq!(rec["outcome"], "promoted", "{rec}");
+    assert_eq!(l["generation"].as_u64().unwrap(), base_gen + 1);
+    let per_label: u64 = l["auto_skills"][0]["examples"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|v| v.as_u64().unwrap())
+        .sum();
+    assert_eq!(per_label, served_rows + taught, "R counted once: {l}");
+    assert_eq!(
+        srv.get(&format!("/v1/skills/{id}")).await.body["examples"],
+        per_label
+    );
+
+    // learn.log lost, generations kept: the served auto-skill is registered
+    // again at open and keeps learning.
+    let (dir_m, _) = srv.close();
+    std::fs::remove_file(dir_m.path().join("state/learn.log")).unwrap();
+    let srv = Srv::open_on(&out, dir_m, &cfg_m, test_key());
+    let l = srv.learning().await;
+    assert_eq!(l["generation"].as_u64().unwrap(), base_gen + 1, "{l}");
+    assert_eq!(l["auto_contracts"], 1, "{l}");
+    assert_eq!(l["buffer"]["examples"], 0);
+    let r = ask(&srv, &q, &served_local).await;
+    assert!(local(&r), "{}", r.text);
+    // New food texts (`served_local` entered the refit's rows through its
+    // feedback above: a duplicate now): an abstention teaches through the
+    // oracle, a local answer through its feedback.
+    for t in distinct_texts("food", 8, 141, "lf", 0.995) {
+        let r = ask(&srv, &q, &t).await;
+        assert_eq!(r.q("task")["skill"], id, "{}", r.text);
+        if local(&r) {
+            let fb = json!({"id": r.body["id"], "question": "task", "label": "food"});
+            let f = srv.post("/v1/feedback", None, &fb).await;
+            assert_eq!(f.body["learned"], true, "{}", f.text);
+            break;
+        }
+    }
+    assert!(
+        srv.learning().await["examples_added"].as_u64().unwrap() >= 1,
+        "the served auto-skill learns again without its learn.log"
+    );
+    drop(srv);
     // The offline rollback of the CLI on the closed state directory.
     let cur = cortiq_decision::generation::rollback_state(&state, 0, Some(&base)).unwrap();
     assert_eq!(cur.generation, 0);

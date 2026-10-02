@@ -56,9 +56,13 @@
 //! becomes an example of the auto-skill `auto-<sha12 of the sorted ids>`
 //! ([`crate::manifest::auto_skill_id`]). The contract is registered once,
 //! under the buffer lock, as a [`LogRecord::Contract`] written before its
-//! first example; a contract with fewer than 2 or more than
-//! `learning.auto_max_labels` ids, or past `learning.auto_max_skills`
-//! contracts, is answered by the oracle and not recorded (`auto_skipped`).
+//! first example; the served model is the registry's second source: an
+//! auto-skill it carries without a record (a materialised file on a fresh
+//! state directory, a lost `learn.log`) is registered from its manifest at
+//! open and after a rollback, so it keeps learning. A contract with fewer
+//! than 2 or more than `learning.auto_max_labels` ids, or past
+//! `learning.auto_max_skills` contracts, is answered by the oracle and not
+//! recorded (`auto_skipped`).
 //! The labels of an auto-skill are closed: an example whose label is not one
 //! of the contract's ids is refused (`full`), so a superset request or a
 //! router feedback can never grow it; the pending-labels cap does not apply
@@ -340,10 +344,12 @@ impl Cascade {
                 "learn.log: examples of auto-skills without a contract record were dropped"
             );
         }
+        let seeded = seed_contracts(&handle.current(), &mut contracts, &log)?;
         tracing::info!(
             cache = cache.len(),
             examples = buffer.len(),
             contracts = contracts.len(),
+            seeded,
             dropped_bytes = replayed.dropped_bytes,
             "cascade state restored from learn.log"
         );
@@ -512,6 +518,48 @@ fn auto_contract(cfg: &Config, e: &Escalation<'_>, p: &Pending<'_>) -> Option<Co
     ))
 }
 
+/// Register the contracts of the served auto-skills the registry lacks, read
+/// back from their manifests ([`Contract::of_manifest`]), each appended to
+/// `learn.log` as a [`LogRecord::Contract`]; how many were seeded. The served
+/// model is the registry's second source: a materialised file served on a
+/// fresh state directory (ORACLE.md recommends it with many contracts), or
+/// generations kept after `learn.log` was lost, carry auto-skills no record
+/// describes — without a contract the skill is matched and served but every
+/// example of it is refused and every attempt skipped. Runs at open, after
+/// the replay (A4 holds: no example of such a skill is in the log, orphans
+/// were dropped), and after a rollback (which may bring a skill forward).
+fn seed_contracts(
+    model: &crate::service::LoadedModel,
+    reg: &mut ContractRegistry,
+    log: &LearnLog,
+) -> Result<usize> {
+    let created = model.model().manifest().created_unix;
+    let mut seeded = 0;
+    for s in model.skills() {
+        let m = s.manifest();
+        if !m.is_auto() || reg.contains(s.id()) {
+            continue;
+        }
+        let Some(c) = Contract::of_manifest(m, created) else {
+            tracing::warn!(
+                skill = s.id(),
+                "a served auto-skill's id is not the hash of its labels: not learned"
+            );
+            continue;
+        };
+        log.append(&LogRecord::Contract(c.clone()))?;
+        reg.insert(c);
+        seeded += 1;
+    }
+    if seeded > 0 {
+        tracing::info!(
+            seeded,
+            "contracts of served auto-skills without a learn.log record registered"
+        );
+    }
+    Ok(seeded)
+}
+
 impl Inner {
     fn base_rows(&self, model: &DecisionModel, skill: &str) -> Result<Arc<Rows>> {
         let mut b = self.bases.lock();
@@ -583,8 +631,16 @@ impl Inner {
                 reg.insert(c.clone());
             }
             // Closed label set: a label outside the contract (a superset
-            // request, a router feedback) is refused (DESIGN A5).
-            let allowed = reg.get(&ex.skill).is_some_and(|c| c.has_label(&ex.label));
+            // request, a router feedback) is refused (DESIGN A5). A served
+            // auto-skill the registry lacks (seeded at open and rollback;
+            // this is the fallback) has the same closed set: its task table.
+            let allowed = match reg.get(&ex.skill) {
+                Some(c) => c.has_label(&ex.label),
+                None => model
+                    .model()
+                    .skill(&ex.skill)
+                    .is_some_and(|s| s.manifest.is_auto() && is_task(&ex.label)),
+            };
             if !allowed {
                 return Ok((AddOutcome::Full, None));
             }
@@ -727,24 +783,28 @@ impl Inner {
         }
         let total = b.len();
         let dups = b.duplicates();
-        // Every contract learned so far: its labels, the examples per label
-        // (served learned rows + buffer), what the served model has of it.
+        // Every contract learned so far: its labels, the rows per label an
+        // attempt would see (the served learned rows of the label plus the
+        // pending examples not among them — the buffer keeps every example
+        // after a promotion, so buffer + served would count them twice), what
+        // the served model has of it.
         let auto_skills: Vec<Value> = self
             .contracts
             .lock()
             .iter()
             .map(|c| {
                 let served = model.skill(&c.skill);
-                let mut examples = serde_json::Map::new();
-                let served_n = |label: &str| -> u64 {
-                    served
-                        .and_then(|s| s.manifest().task_of(label))
-                        .map_or(0, |t| served.map_or(0, |s| s.manifest().tasks[t].n_train))
-                };
-                for l in &c.ids {
-                    let n = b.examples(&c.skill, l).len() as u64 + served_n(l);
-                    examples.insert(l.clone(), json!(n));
-                }
+                let per_label = learn::auto_rows_per_label(model.model(), &b, c).unwrap_or_else(|e| {
+                    tracing::error!(error = %format!("{e:#}"), skill = c.skill, "auto-skill rows");
+                    c.ids
+                        .iter()
+                        .map(|l| (l.clone(), b.examples(&c.skill, l).len()))
+                        .collect()
+                });
+                let examples: serde_json::Map<String, Value> = per_label
+                    .into_iter()
+                    .map(|(l, n)| (l, json!(n)))
+                    .collect();
                 // Active labels in task order (the listing's order).
                 let active: Vec<&str> = served.map_or_else(Vec::new, |s| {
                     s.manifest()
@@ -841,7 +901,18 @@ impl Inner {
         // The base rows of a skill born in a generation (an auto-skill) vanish
         // with it; a later generation may bring the id back with other rows.
         self.bases.lock().clear();
-        self.buffer.lock().reset_all();
+        {
+            // A generation rolled forward may carry an auto-skill whose
+            // contract record is not in learn.log (lost with it): register it
+            // from the manifest, under the buffer lock as `add_example` does
+            // (the record precedes any example of it, DESIGN A4).
+            let mut b = self.buffer.lock();
+            let mut reg = self.contracts.lock();
+            if let Err(e) = seed_contracts(&self.handle.current(), &mut reg, &self.log) {
+                tracing::error!(error = %format!("{e:#}"), "rollback: contracts of served auto-skills not recorded");
+            }
+            b.reset_all();
+        }
         if let Err(e) = self.log.append(&LogRecord::Rollback { generation: to }) {
             tracing::error!(error = %e, "learn.log: could not record the rollback");
         }
