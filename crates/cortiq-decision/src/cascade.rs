@@ -650,6 +650,9 @@ impl Inner {
         let sha = next.model_sha().to_string();
         self.handle.promote(next);
         self.books.lock().invalidate();
+        // The base rows of a skill born in a generation (an auto-skill) vanish
+        // with it; a later generation may bring the id back with other rows.
+        self.bases.lock().clear();
         self.buffer.lock().reset_all();
         if let Err(e) = self.log.append(&LogRecord::Rollback { generation: to }) {
             tracing::error!(error = %e, "learn.log: could not record the rollback");
