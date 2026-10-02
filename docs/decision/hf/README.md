@@ -100,6 +100,11 @@ local CMF model as `cmf-decision-0.8.5` — this adapter does not serve or claim
 to be Jev. `GET /v1/models` supplies the matching System One discovery shape
 when the flag is enabled. [Request and response details →](API.md#3a-system-one-request-adapter-jev-compatible)
 
+From 0.8.6 a question whose options no skill was trained on is learned from the
+oracle's answers into an *auto-skill* and then answered locally in milliseconds;
+labels the oracle rarely picks stay quarantined and keep teaching.
+[How auto-skills learn →](ORACLE.md#auto-skills)
+
 ## Measured results
 
 ### Quality: the model alone vs Jev 1.13
