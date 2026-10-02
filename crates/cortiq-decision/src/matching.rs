@@ -17,6 +17,15 @@
 //!
 //! Only option ids are compared; instructions and criteria descriptions matter
 //! to the oracle alone.
+//!
+//! **Auto-skills** (0.8.6, DESIGN D8/A6). The labels of an auto-skill that are
+//! not active yet (quarantined, too few examples) still count as *known*: a
+//! question whose ids are all known to it is exact or subset over its ACTIVE
+//! labels (a quarantined option gets probability 0; a text of such a label is
+//! expected to abstain on novelty and keeps teaching it). For a data skill
+//! known = active, so nothing changes for it. When exactly one data skill and
+//! any number of auto-skills hit the best kind, the data skill wins (no
+//! ambiguity); several data skills, or auto-skills alone, stay ambiguous.
 
 use crate::protocol::{ApiError, Question, QuestionKind};
 use serde_json::json;
@@ -28,6 +37,23 @@ pub struct SkillLabels<'a> {
     pub id: &'a str,
     /// Active labels in candidate (task) order.
     pub active: &'a [String],
+    /// Every label the skill has, active or not (an auto-skill's whole
+    /// contract); the active ones for a data skill.
+    pub known: &'a [String],
+    /// An auto-skill (loses a tie against a data skill).
+    pub auto: bool,
+}
+
+impl<'a> SkillLabels<'a> {
+    /// A data skill: known = active.
+    pub fn data(id: &'a str, active: &'a [String]) -> Self {
+        Self {
+            id,
+            active,
+            known: active,
+            auto: false,
+        }
+    }
 }
 
 /// How a question relates to the skills.
@@ -69,6 +95,9 @@ pub struct SkillMatch {
     pub unknown: Vec<String>,
     /// Untrained: why (for the 422 details).
     pub reason: Option<String>,
+    /// Untrained because several skills fit (the structural form of the
+    /// reason: such a contract is not learned into an auto-skill, DESIGN A9).
+    pub ambiguous: bool,
 }
 
 impl SkillMatch {
@@ -79,11 +108,19 @@ impl SkillMatch {
             candidates: Vec::new(),
             unknown: Vec::new(),
             reason: Some(reason.into()),
+            ambiguous: false,
         }
+    }
+
+    /// Learnable into an auto-skill: untrained because no skill fits (not
+    /// ambiguous, not a forced mismatch — the caller checks `cmf.skill`).
+    pub fn is_foreign(&self) -> bool {
+        self.kind == MatchKind::Untrained && self.skill.is_none() && !self.ambiguous
     }
 }
 
-/// Relation of L to one skill.
+/// Relation of L to one skill: the candidates are the active labels in L,
+/// "known" covers the quarantined labels of an auto-skill too.
 fn relate(options: &[&str], set: &HashSet<&str>, s: &SkillLabels<'_>) -> Option<SkillMatch> {
     if s.active.is_empty() {
         return None;
@@ -95,11 +132,13 @@ fn relate(options: &[&str], set: &HashSet<&str>, s: &SkillLabels<'_>) -> Option<
         .filter(|(_, l)| set.contains(l.as_str()))
         .map(|(i, _)| i)
         .collect();
-    let all_known = inside.len() == options.len();
+    let known: HashSet<&str> = s.known.iter().map(String::as_str).collect();
+    let all_known = options.iter().all(|o| known.contains(o));
     let covers = inside.len() == s.active.len();
     let kind = match (all_known, covers) {
         (true, true) => MatchKind::Exact,
-        (true, false) if options.len() >= 2 => MatchKind::Subset,
+        // Known but none active (every option quarantined): not decidable.
+        (true, false) if options.len() >= 2 && !inside.is_empty() => MatchKind::Subset,
         (false, true) => MatchKind::Superset,
         _ => return None,
     };
@@ -119,28 +158,36 @@ fn relate(options: &[&str], set: &HashSet<&str>, s: &SkillLabels<'_>) -> Option<
         candidates: if kind.is_local() { inside } else { Vec::new() },
         unknown,
         reason: None,
+        ambiguous: false,
     })
 }
 
 /// Match option ids against the skills (rules 2–5, see the module notes).
 pub fn match_labels(skills: &[SkillLabels<'_>], options: &[&str]) -> SkillMatch {
     let set: HashSet<&str> = options.iter().copied().collect();
-    let found: Vec<SkillMatch> = skills
+    let found: Vec<(SkillMatch, bool)> = skills
         .iter()
-        .filter_map(|s| relate(options, &set, s))
+        .filter_map(|s| relate(options, &set, s).map(|m| (m, s.auto)))
         .collect();
     for kind in [MatchKind::Exact, MatchKind::Subset, MatchKind::Superset] {
-        let hits: Vec<&SkillMatch> = found.iter().filter(|m| m.kind == kind).collect();
+        let hits: Vec<&(SkillMatch, bool)> = found.iter().filter(|m| m.0.kind == kind).collect();
         match hits.as_slice() {
             [] => continue,
-            [one] => return (*one).clone(),
+            [one] => return one.0.clone(),
             many => {
-                let ids: Vec<&str> = many.iter().filter_map(|m| m.skill.as_deref()).collect();
-                return SkillMatch::untrained(format!(
+                // One data skill among auto-skills wins the tie (DESIGN D8).
+                let data: Vec<&SkillMatch> = many.iter().filter(|m| !m.1).map(|m| &m.0).collect();
+                if let [one] = data.as_slice() {
+                    return (*one).clone();
+                }
+                let ids: Vec<&str> = many.iter().filter_map(|m| m.0.skill.as_deref()).collect();
+                let mut m = SkillMatch::untrained(format!(
                     "ambiguous: the options are an {} match of skills {}; name one with cmf.skill",
                     kind.as_str(),
                     ids.join(", ")
                 ));
+                m.ambiguous = true;
+                return m;
             }
         }
     }
@@ -215,16 +262,7 @@ mod tests {
     fn exact_subset_superset_untrained() {
         let a = labels(&["a", "b", "c"]);
         let d = labels(&["d", "e"]);
-        let skills = [
-            SkillLabels {
-                id: "s1",
-                active: &a,
-            },
-            SkillLabels {
-                id: "s2",
-                active: &d,
-            },
-        ];
+        let skills = [SkillLabels::data("s1", &a), SkillLabels::data("s2", &d)];
         let m = match_labels(&skills, &["c", "a", "b"]);
         assert_eq!(m.kind, MatchKind::Exact);
         assert_eq!(m.skill.as_deref(), Some("s1"));
@@ -250,21 +288,99 @@ mod tests {
     fn ambiguity_is_untrained() {
         let a = labels(&["a", "b", "c"]);
         let b = labels(&["a", "b", "d"]);
-        let skills = [
-            SkillLabels {
-                id: "s1",
-                active: &a,
-            },
-            SkillLabels {
-                id: "s2",
-                active: &b,
-            },
-        ];
+        let skills = [SkillLabels::data("s1", &a), SkillLabels::data("s2", &b)];
         let m = match_labels(&skills, &["a", "b"]);
         assert_eq!(m.kind, MatchKind::Untrained);
+        assert!(m.ambiguous && !m.is_foreign());
         assert!(m.reason.unwrap().contains("ambiguous"));
+        assert!(match_labels(&skills, &["x", "y"]).is_foreign());
         // An exact match wins over a subset of another skill.
         let m = match_labels(&skills, &["a", "b", "c"]);
         assert_eq!((m.kind, m.skill.as_deref()), (MatchKind::Exact, Some("s1")));
+    }
+
+    #[test]
+    fn an_auto_skill_relates_over_its_known_labels_and_decides_over_the_active_ones() {
+        let active = labels(&["food", "travel"]);
+        let known = labels(&["cruise", "food", "travel"]);
+        let auto = SkillLabels {
+            id: "auto-1",
+            active: &active,
+            known: &known,
+            auto: true,
+        };
+        // The whole contract: exact over the two active candidates.
+        let m = match_labels(&[auto], &["food", "travel", "cruise"]);
+        assert_eq!(
+            (m.kind, m.skill.as_deref()),
+            (MatchKind::Exact, Some("auto-1"))
+        );
+        assert_eq!(m.candidates, vec![0, 1]);
+        // Two known ids, one active: a subset over that candidate.
+        let m = match_labels(&[auto], &["cruise", "travel"]);
+        assert_eq!((m.kind, m.candidates.clone()), (MatchKind::Subset, vec![1]));
+        // Only quarantined ids: not decidable, foreign (a new contract).
+        let other = labels(&["cruise", "ship"]);
+        let ship = labels(&["ship"]);
+        let a2 = SkillLabels {
+            id: "auto-2",
+            active: &ship,
+            known: &other,
+            auto: true,
+        };
+        assert!(match_labels(&[auto], &["cruise", "food"]).kind == MatchKind::Subset);
+        let known3 = labels(&["cruise", "food", "travel", "zoo"]);
+        let a3 = SkillLabels {
+            id: "auto-3",
+            active: &active,
+            known: &known3,
+            auto: true,
+        };
+        assert!(match_labels(&[a3], &["cruise", "zoo"]).is_foreign());
+        // An unknown id with every active one: superset, the quarantined ids unknown too.
+        let m = match_labels(&[auto], &["food", "travel", "cruise", "x"]);
+        assert_eq!(m.kind, MatchKind::Superset);
+        assert_eq!(m.unknown, vec!["cruise", "x"]);
+        // A fully quarantined auto-skill is invisible.
+        let none = SkillLabels {
+            id: "auto-0",
+            active: &[],
+            known: &known,
+            auto: true,
+        };
+        assert!(match_labels(&[none, a2], &["food", "travel", "cruise"]).is_foreign());
+    }
+
+    #[test]
+    fn a_data_skill_wins_a_tie_against_auto_skills_only() {
+        let a = labels(&["a", "b", "c"]);
+        let data = SkillLabels::data("s1", &a);
+        let auto1 = SkillLabels {
+            id: "auto-1",
+            active: &a,
+            known: &a,
+            auto: true,
+        };
+        let auto2 = SkillLabels {
+            id: "auto-2",
+            active: &a,
+            known: &a,
+            auto: true,
+        };
+        let m = match_labels(&[auto1, data, auto2], &["a", "b", "c"]);
+        assert_eq!((m.kind, m.skill.as_deref()), (MatchKind::Exact, Some("s1")));
+        let m = match_labels(&[auto1, data], &["a", "b"]);
+        assert_eq!(
+            (m.kind, m.skill.as_deref()),
+            (MatchKind::Subset, Some("s1"))
+        );
+        // Auto-skills alone: ambiguous, and not learnable.
+        let m = match_labels(&[auto1, auto2], &["a", "b", "c"]);
+        assert!(m.kind == MatchKind::Untrained && m.ambiguous && !m.is_foreign());
+        // Two data skills: ambiguous as before, whatever the auto-skills.
+        let data2 = SkillLabels::data("s2", &a);
+        let m = match_labels(&[data, auto1, data2], &["a", "b", "c"]);
+        assert!(m.ambiguous);
+        assert!(m.reason.unwrap().contains("s1, auto-1, s2"));
     }
 }
