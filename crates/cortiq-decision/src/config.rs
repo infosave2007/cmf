@@ -13,7 +13,10 @@
 //!   "model":"deepseek/deepseek-v4.1-flash","provider":{"sort":"price","require_parameters":true,"allow_fallbacks":true,"max_price":{"prompt":0.1,"completion":0.5}},
 //!   "max_tokens_per_question":64,"deadline_s":30,"budget_usd":1.0,"max_calls":10000,"max_errors":30,"redact_pii":true,"title":"cortiq-decision","data_collection":null},
 //!  "cache":{"enabled":true,"threshold":0.97,"cap":50000},
-//!  "learning":{"enabled":true,"refit_min_new":25,"dedup":0.995,"cold_start":true,"synchronous":false},
+//!  "learning":{"enabled":true,"refit_min_new":25,"dedup":0.995,"cold_start":true,"synchronous":false,
+//!   "auto_skills":true,"auto_min_rows":10,"auto_k":8,"auto_tau":0.9,"auto_min_agreement":0.8,
+//!   "auto_min_coverage":0.8,"auto_max_skills":256,"auto_max_labels":64,"auto_max_examples_per_label":1000,
+//!   "auto_temperature_min":0.02,"auto_explore_every":8},
 //!  "feedback":{"pending_cap":50000}}
 //! ```
 //!
@@ -360,7 +363,8 @@ impl Default for CacheConfig {
     }
 }
 
-/// Self-learning (spec §5.7).
+/// Self-learning (spec §5.7) and auto-skills (0.8.6: an untrained choice
+/// contract learned from oracle answers, `auto_*`).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LearningConfig {
@@ -370,6 +374,43 @@ pub struct LearningConfig {
     pub dedup: f32,
     pub cold_start: bool,
     pub synchronous: bool,
+    /// Learn untrained choice contracts into auto-skills.
+    pub auto_skills: bool,
+    /// Fit rows (outside the calibration subset) a label of an auto-skill
+    /// needs to be active.
+    pub auto_min_rows: usize,
+    /// `K` of an auto-skill's topologies.
+    pub auto_k: u64,
+    /// Confidence floor of a local answer of an auto-skill (`p_top ≥ auto_tau`,
+    /// `balanced` and `quality-first`; its gate's τ is 0 while uncertified).
+    pub auto_tau: f32,
+    /// Macro agreement with the oracle on the calibration subset an auto-skill
+    /// needs to be activated.
+    pub auto_min_agreement: f32,
+    /// Share of a contract's examples the active labels must hold at the
+    /// activation (so that the quarantined labels are genuinely rare).
+    pub auto_min_coverage: f32,
+    /// Contracts learned at most.
+    pub auto_max_skills: usize,
+    /// Option ids a learned contract may have at most.
+    pub auto_max_labels: usize,
+    /// Examples kept per label of an auto-skill (below the buffer's own cap:
+    /// every generation re-carries every auto-skill's rows).
+    pub auto_max_examples_per_label: usize,
+    /// Floor of an auto-skill's gate temperature after each certification
+    /// (`T = max(fitted T, auto_temperature_min)`, DESIGN A15): a clean
+    /// calibration subset drives the fitted `T` to its lower bound, where
+    /// `p_top ≡ 1` and the `auto_tau` floor never bites. 0 keeps the fitted
+    /// `T`.
+    pub auto_temperature_min: f32,
+    /// Exploration while a label of an auto-skill is quarantined (DESIGN A16):
+    /// a locally accepted answer is escalated to the oracle anyway when
+    /// `u64le(sha256(φ_P f32le)[..8]) % auto_explore_every == 0` (8: one text
+    /// in eight; the oracle's answer is returned and learned, so a rare label
+    /// collects examples at that share of its traffic — on the stand one in
+    /// four kept 36 % of the traffic at the oracle while a label the oracle
+    /// itself names inconsistently never activated). 0 turns it off.
+    pub auto_explore_every: u64,
 }
 
 impl Default for LearningConfig {
@@ -380,6 +421,17 @@ impl Default for LearningConfig {
             dedup: 0.995,
             cold_start: true,
             synchronous: false,
+            auto_skills: true,
+            auto_min_rows: 10,
+            auto_k: 8,
+            auto_tau: 0.90,
+            auto_min_agreement: 0.80,
+            auto_min_coverage: 0.80,
+            auto_max_skills: 256,
+            auto_max_labels: 64,
+            auto_max_examples_per_label: 1000,
+            auto_temperature_min: 0.02,
+            auto_explore_every: 8,
         }
     }
 }
@@ -801,6 +853,38 @@ impl Config {
             "learning.refit_min_new must be positive"
         );
         check_unit("learning.dedup", self.learning.dedup, true)?;
+        let l = &self.learning;
+        ensure!(
+            l.auto_min_rows >= crate::fit::MIN_ROWS_ACTIVE,
+            "learning.auto_min_rows must be at least {}",
+            crate::fit::MIN_ROWS_ACTIVE
+        );
+        ensure!(l.auto_k >= 1, "learning.auto_k must be positive");
+        check_unit("learning.auto_tau", l.auto_tau, false)?;
+        check_unit("learning.auto_min_agreement", l.auto_min_agreement, false)?;
+        check_unit("learning.auto_min_coverage", l.auto_min_coverage, false)?;
+        ensure!(
+            l.auto_max_skills >= 1,
+            "learning.auto_max_skills must be positive"
+        );
+        ensure!(
+            (crate::protocol::MIN_CHOICE_OPTIONS..=crate::protocol::MAX_CHOICE_OPTIONS)
+                .contains(&l.auto_max_labels),
+            "learning.auto_max_labels must be in {}..={}",
+            crate::protocol::MIN_CHOICE_OPTIONS,
+            crate::protocol::MAX_CHOICE_OPTIONS
+        );
+        ensure!(
+            l.auto_max_examples_per_label >= 1,
+            "learning.auto_max_examples_per_label must be positive"
+        );
+        // Any positive f32-exact `T` is a valid gate (`Gate::validate`); the
+        // floor is bounded by 1 only so that a typo cannot flatten the softmax.
+        check_unit(
+            "learning.auto_temperature_min",
+            l.auto_temperature_min,
+            false,
+        )?;
         ensure!(
             self.feedback.pending_cap >= 1,
             "feedback.pending_cap must be positive"
@@ -872,6 +956,48 @@ mod tests {
         assert!(c.auth.required(false));
         assert!(!c.auth.required(true));
         assert!(c.rates().unwrap().is_free());
+    }
+
+    #[test]
+    fn auto_skill_knobs_default_and_validate() {
+        let c = Config::default();
+        let l = &c.learning;
+        assert!(l.auto_skills);
+        assert_eq!((l.auto_min_rows, l.auto_k), (10, 8));
+        assert_eq!(
+            (l.auto_tau, l.auto_min_agreement, l.auto_min_coverage),
+            (0.90, 0.80, 0.80)
+        );
+        assert_eq!((l.auto_max_skills, l.auto_max_labels), (256, 64));
+        assert_eq!(l.auto_max_examples_per_label, 1000);
+        assert_eq!((l.auto_temperature_min, l.auto_explore_every), (0.02, 8));
+        let ok = |j: &str| Config::from_json(format!(r#"{{"learning":{{{j}}}}}"#).as_bytes());
+        assert!(ok(r#""auto_skills":false,"auto_min_rows":2,"auto_k":1,"auto_tau":0,"auto_max_labels":255"#).is_ok());
+        // 0 = no floor / exploration off; the floor may reach 1.
+        assert!(ok(r#""auto_temperature_min":0,"auto_explore_every":0"#).is_ok());
+        assert!(ok(r#""auto_temperature_min":1"#).is_ok());
+        for (j, what) in [
+            (r#""auto_min_rows":1"#, "auto_min_rows"),
+            (r#""auto_k":0"#, "auto_k"),
+            (r#""auto_tau":1.5"#, "auto_tau"),
+            (r#""auto_min_agreement":-0.1"#, "auto_min_agreement"),
+            (r#""auto_min_coverage":2"#, "auto_min_coverage"),
+            (r#""auto_max_skills":0"#, "auto_max_skills"),
+            (r#""auto_max_labels":1"#, "auto_max_labels"),
+            (r#""auto_max_labels":256"#, "auto_max_labels"),
+            (
+                r#""auto_max_examples_per_label":0"#,
+                "auto_max_examples_per_label",
+            ),
+            (r#""auto_temperature_min":-0.01"#, "auto_temperature_min"),
+            (r#""auto_temperature_min":1.5"#, "auto_temperature_min"),
+            // A u64: serde names the value, not the key.
+            (r#""auto_explore_every":-1"#, "invalid value"),
+            (r#""auto_unknown":1"#, "unknown field"),
+        ] {
+            let e = ok(j).unwrap_err().to_string();
+            assert!(e.contains(what), "{j}: {e}");
+        }
     }
 
     #[test]

@@ -136,6 +136,16 @@ jobs:
           $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
           # Write an explicit LF so the checksum is portable to shasum/sha256sum.
           [System.IO.File]::WriteAllText("$zip.sha256", "$hash  $zip`n", [System.Text.Encoding]::ASCII)
+      # A build_only run keeps its archives as workflow artifacts (a stand can
+      # test a branch build before the release exists).
+      - name: Keep the archive as an artifact (build_only)
+        if: ${{ inputs.build_only }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: cortiq-${{ matrix.target }}
+          path: |
+            cortiq-${{ matrix.target }}.*
+          if-no-files-found: error
       - name: Attach to release (unix)
         if: ${{ runner.os != 'Windows' && !inputs.build_only }}
         uses: softprops/action-gh-release@v2

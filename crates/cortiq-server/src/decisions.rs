@@ -1953,7 +1953,9 @@ struct Routing {
 
 impl DecisionState {
     /// The skill of a router request: `taxonomy_id`, else `default_skill`, else
-    /// the file's only skill.
+    /// the file's only data skill (auto-skills, learned at runtime, do not
+    /// take the implicit taxonomy away from a single-skill file; they are
+    /// routed by `taxonomy_id`).
     fn resolve_routing(
         &self,
         taxonomy_id: Option<&str>,
@@ -1968,10 +1970,16 @@ impl DecisionState {
                 }
                 id.to_string()
             }
-            None => match model.skills() {
+            None => match model
+                .skills()
+                .iter()
+                .filter(|s| !s.manifest().is_auto())
+                .collect::<Vec<_>>()
+                .as_slice()
+            {
                 [one] => one.id().to_string(),
-                many => {
-                    let ids: Vec<&str> = many.iter().map(SkillRuntime::id).collect();
+                _ => {
+                    let ids: Vec<&str> = model.skills().iter().map(SkillRuntime::id).collect();
                     return Err(HttpError::invalid(format!(
                         "taxonomy_id is required: this model has skills {} (or set default_skill in the configuration)",
                         ids.join(", ")
@@ -2266,6 +2274,8 @@ impl DecisionState {
             choice: choice.clone(),
             gate_accepted,
             accepted,
+            // `/v1/route` never explores (DESIGN A16 is the decisions API's).
+            explore: false,
             certified: false,
             gate,
             profile: r.profile,
@@ -2393,6 +2403,7 @@ impl DecisionState {
                 candidates: (0..local.labels.len()).collect(),
                 unknown: Vec::new(),
                 reason: None,
+                ambiguous: false,
             },
             action,
             local: Some(local.clone()),

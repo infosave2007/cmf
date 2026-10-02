@@ -93,7 +93,7 @@ impl<'a> TaskView<'a> {
         let d = self.mean.len();
         ensure!(d > 0, "topology dimension must be positive");
         ensure!(
-            self.basis.len() % d == 0,
+            self.basis.len().is_multiple_of(d),
             "basis length {} is not a multiple of the dimension {d}",
             self.basis.len()
         );
@@ -148,7 +148,7 @@ pub fn check_input(x: &[f32], dim: usize) -> Result<()> {
 pub fn reference_error(x: &[f32], mean: &[f32], basis: &[f32]) -> f32 {
     let d = mean.len();
     debug_assert_eq!(x.len(), d);
-    debug_assert!(d == 0 || basis.len() % d == 0);
+    debug_assert!(d == 0 || basis.len().is_multiple_of(d));
     let mut r: Vec<f32> = x.iter().zip(mean).map(|(a, b)| a - b).collect();
     if d > 0 {
         for b in basis.chunks_exact(d) {

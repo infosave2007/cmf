@@ -28,6 +28,12 @@
 //!    lifts it, [`AdminBinding::server_text`]; logged at most
 //!    once a minute per hint, once per process at INFO on a server without
 //!    an oracle, [`DecisionService::log_oracle_hint`]);
+//!    Exception (DESIGN A16, the only one to the hard rule of spec §5.1): a
+//!    gate-accepted question of an auto-skill that still has a quarantined
+//!    label is escalated too when the text's hash says so (one in
+//!    `learning.auto_explore_every`, [`LocalDecision::explore`]); the
+//!    oracle's answer replaces the local one with the flag `explore` and
+//!    teaches, a refused or failed call leaves the local answer;
 //! 6. the response, the metering (spec §4.9) and one usage-ledger record are
 //!    produced; the escalator observes the decided questions (feedback ring).
 //!
@@ -62,6 +68,7 @@
 //! answer is `router:uncertified` (the closest correct name, the same prefix).
 
 use crate::answer::{self, OracleAnswer, Rounding};
+use crate::certify;
 use crate::config::Config;
 use crate::container::DecisionModel;
 use crate::eval::{SkillScorer, TOP_ERRORS, f32_json, jev_confidence};
@@ -129,20 +136,24 @@ impl SkillRuntime {
     /// router input, id `id`): the rubric's instructions, and for each active
     /// label its rubric criterion in the question file's order (the label
     /// itself when the rubric has none); [`DEFAULT_ROUTE_INSTRUCTIONS`]
-    /// without a rubric.
+    /// without a rubric. An auto-skill's question is its whole contract
+    /// (every criterion, the quarantined labels included): only that
+    /// question is matched to it (DESIGN A18), and a quarantined option gets
+    /// probability 0.
     pub fn rubric_question(&self, id: &str) -> Question {
         let active = self.scorer.labels();
+        let auto = self.manifest.is_auto();
         let mut criteria = Map::new();
         let instructions = match &self.manifest.rubric {
             Some(r) => {
                 for (k, v) in r.ordered_criteria() {
-                    if active.contains(&k) {
+                    if auto || active.contains(&k) {
                         criteria.insert(k, v);
                     }
                 }
                 r.instructions.clone()
             }
-            None => DEFAULT_ROUTE_INSTRUCTIONS.to_string(),
+            None => Value::String(DEFAULT_ROUTE_INSTRUCTIONS.to_string()),
         };
         for l in active {
             if !criteria.contains_key(l) {
@@ -152,7 +163,7 @@ impl SkillRuntime {
         Question {
             id: id.to_string(),
             kind: QuestionKind::Choice,
-            instructions: Value::String(instructions),
+            instructions,
             criteria: Some(Value::Object(criteria)),
         }
     }
@@ -202,6 +213,9 @@ impl LoadedModel {
         );
         let mut skills = Vec::with_capacity(model.skills().len());
         for s in model.skills() {
+            // A skill with no active task (an auto-skill whose labels are all
+            // quarantined) gets an empty scorer: listed by `/v1/skills`, no
+            // active labels for the matcher (`relate` skips it).
             skills.push(SkillRuntime {
                 scorer: SkillScorer::from_model(&model, s.id())
                     .with_context(|| format!("skill '{}'", s.id()))?,
@@ -270,15 +284,32 @@ impl LoadedModel {
         self.model.representation_id()
     }
 
-    /// The active labels of every skill (the matcher's view).
+    /// The labels of every skill as the matcher sees them: the active ones
+    /// (candidates) and, for an auto-skill, its whole contract as known and
+    /// its contract sha (`data.train.sha256`, the hash of its rubric — the
+    /// loader checks it), the only thing it is matched by (DESIGN A18).
     pub fn skill_labels(&self) -> Vec<SkillLabels<'_>> {
         self.skills
             .iter()
-            .map(|s| SkillLabels {
-                id: s.id(),
-                active: s.scorer.labels(),
+            .map(|s| {
+                let active = s.scorer.labels();
+                if s.manifest.is_auto() {
+                    SkillLabels::auto(
+                        s.id(),
+                        active,
+                        &s.manifest.labels,
+                        &s.manifest.data.train.sha256,
+                    )
+                } else {
+                    SkillLabels::data(s.id(), active)
+                }
             })
             .collect()
+    }
+
+    /// Served auto-skills.
+    pub fn auto_skills(&self) -> usize {
+        self.skills.iter().filter(|s| s.manifest.is_auto()).count()
     }
 }
 
@@ -746,6 +777,9 @@ const HINT_KINDS_KEPT: usize = 32;
 
 /// Flag of a question whose oracle call failed.
 pub const FLAG_ORACLE_UNAVAILABLE: &str = "oracle_unavailable";
+/// Flag of a gate-accepted question of an auto-skill answered by the oracle
+/// for exploration (DESIGN A16, [`LocalDecision::explore`]).
+pub const FLAG_EXPLORE: &str = "explore";
 
 /// What happened to one undetermined question.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -801,7 +835,8 @@ pub struct Pending<'a> {
     pub index: usize,
     pub question: &'a Question,
     pub matched: &'a SkillMatch,
-    /// The rejected local decision of a trained question.
+    /// The rejected local decision of a trained question (or the accepted
+    /// one of an explored question, [`LocalDecision::explore`]).
     pub local: Option<&'a LocalDecision>,
 }
 
@@ -926,6 +961,13 @@ pub struct LocalDecision {
     pub gate_accepted: bool,
     /// Accepted under the request's profile.
     pub accepted: bool,
+    /// Accepted, and escalated anyway (DESIGN A16): an auto-skill with a
+    /// quarantined label explores one text in `learning.auto_explore_every`
+    /// (by a hash of φ_P), so a rare label the gate confidently misnames
+    /// still collects the oracle's examples. The one exception to the hard
+    /// rule of spec §5.1; the oracle's answer is served (`action: oracle` /
+    /// `cache`, flag `explore`), a refused or failed call leaves this answer.
+    pub explore: bool,
     pub certified: bool,
     pub gate: GateParams,
     pub profile: Profile,
@@ -1498,17 +1540,31 @@ impl DecisionService {
             }
         }
 
-        // Encoder and hash once, local decisions.
+        // Encoder and hash once, local decisions. Exploration (DESIGN A16)
+        // only where its oracle answer can be learned: the oracle consented
+        // and present, learning and auto-skills on, a key that teaches
+        // auto-skills (`teaches`, DESIGN A7); otherwise the draw is off.
+        let learning = &self.cfg.learning;
+        let explore_every = if consent.is_ok()
+            && self.escalator.is_some()
+            && learning.enabled
+            && learning.auto_skills
+            && p.learning_allowed
+        {
+            learning.auto_explore_every
+        } else {
+            0
+        };
         let LocalStage {
             features,
             signal: st,
             mut locals,
             resonance,
-        } = local_stage(&model, req, &matches)?;
+        } = local_stage(&model, req, &matches, learning.auto_tau, explore_every)?;
 
-        // Undetermined questions.
+        // Undetermined questions, and the explored ones.
         let pending_idx: Vec<usize> = (0..matches.len())
-            .filter(|&i| locals[i].as_ref().is_none_or(|l| !l.accepted))
+            .filter(|&i| locals[i].as_ref().is_none_or(|l| !l.accepted || l.explore))
             .collect();
         let mut resolved: Vec<Option<Resolved>> = vec![None; matches.len()];
         let mut oracle_usage = OracleUsage::default();
@@ -1621,7 +1677,7 @@ impl DecisionService {
         // A trained question refused the oracle: one hint (the first such
         // question's reason), in `cmf.hint` and the rate-limited log.
         let hint = (0..matches.len())
-            .filter(|&i| locals[i].is_some())
+            .filter(|&i| locals[i].as_ref().is_some_and(|l| !l.explore))
             .find_map(|i| match resolved[i].as_ref().map(|r| &r.resolution) {
                 Some(Resolution::Refused(r)) => self.oracle_hint(*r),
                 _ => None,
@@ -1735,7 +1791,7 @@ impl DecisionService {
         let model = self.handle.current();
         check_pinned(&model, req)?;
         let matches = match_questions(&model, req)?;
-        let stage = local_stage(&model, req, &matches)?;
+        let stage = local_stage(&model, req, &matches, self.cfg.learning.auto_tau, 0)?;
         let timings = RequestTimings {
             tokenize: stage.signal.tokenize,
             encode: stage.signal.encode,
@@ -1777,6 +1833,22 @@ impl DecisionService {
         rounding: Rounding,
     ) -> QuestionOutcome {
         let mut flags = Vec::new();
+        let explore = local.as_ref().is_some_and(|l| l.explore);
+        // An explored question keeps its accepted local answer when the
+        // oracle refused or failed (exploration is best effort, never an
+        // abstention); an oracle or cache answer replaces it, flagged.
+        let resolved = match resolved {
+            Some(r)
+                if explore
+                    && !matches!(r.resolution, Resolution::Oracle(_) | Resolution::Cache(_)) =>
+            {
+                None
+            }
+            other => other,
+        };
+        if explore && resolved.is_some() {
+            flags.push(FLAG_EXPLORE.to_string());
+        }
         let (action, oracle, answer, decision_path) = match (&local, resolved) {
             (Some(l), None) => (
                 Action::Local,
@@ -2101,6 +2173,7 @@ impl DecisionService {
             "model_sha": model.model_sha(),
             "generation": model.generation(),
             "skills": model.skills().len(),
+            "auto_skills": model.auto_skills(),
             "inflight": self.inflight(),
             "encoder_device": model.encoder().encoder().device_name(),
             "metal_encoder_submissions": model.encoder().encoder().metal_submissions(),
@@ -2295,6 +2368,8 @@ fn local_stage(
     model: &LoadedModel,
     req: &DecisionRequest,
     matches: &[SkillMatch],
+    auto_tau: f32,
+    explore_every: u64,
 ) -> Result<LocalStage, ApiError> {
     let mut indices = Vec::new();
     for m in matches.iter().filter(|m| m.kind.is_local()) {
@@ -2317,6 +2392,9 @@ fn local_stage(
     let features = scored.features;
     let signal = scored.timings;
     let tr = Instant::now();
+    // Exploration is a property of the text (one hash per request, DESIGN
+    // A16); which questions it reaches is decided per auto-skill below.
+    let explore = certify::auto_explores(&features.phi_p, explore_every);
     let skill_errors: HashMap<usize, Vec<f32>> = indices.into_iter().zip(scored.errors).collect();
     let mut locals: Vec<Option<LocalDecision>> = Vec::with_capacity(matches.len());
     for m in matches {
@@ -2335,6 +2413,8 @@ fn local_stage(
                 &skill_errors[&si],
                 req.cmf.profile,
                 req.state.is_text(),
+                auto_tau,
+                explore,
             )
             .map_err(internal)?,
         ));
@@ -2348,12 +2428,23 @@ fn local_stage(
 }
 
 /// The local decision of an exact or subset question over its candidates.
+/// `auto_tau` is the confidence floor of an auto-skill (`learning.auto_tau`,
+/// DESIGN D5/A8): its gate's τ stays 0 while uncertified, so `balanced` and
+/// `quality-first` additionally require `p_top ≥ auto_tau` (`cost-saver` is
+/// θ-only by spec §4.7b); an abstention escalates and teaches as any other.
+/// `explore` is the text's exploration draw (DESIGN A16): an accepted answer
+/// of an auto-skill with a quarantined label is then escalated anyway, under
+/// every profile (the draw is about learning the rare label, not about the
+/// gate); a data skill, or an auto-skill whose labels are all active, never
+/// explores.
 fn local_decision(
     s: &SkillRuntime,
     m: &SkillMatch,
     all_errors: &[f32],
     profile: Profile,
     state_is_text: bool,
+    auto_tau: f32,
+    explore: bool,
 ) -> Result<LocalDecision> {
     let scorer = &s.scorer;
     let gate = scorer.gate();
@@ -2378,15 +2469,21 @@ fn local_decision(
     };
     let decision = decide_errors(&errors, &stats, gate.temperature)?;
     let gate_accepted = decision.accepted(gate.tau, gate.novelty_theta);
+    let floor = !s.manifest.is_auto() || decision.p_top >= auto_tau;
     let accepted = match profile {
-        Profile::Balanced => gate_accepted,
+        Profile::Balanced => gate_accepted && floor,
         Profile::QualityFirst => {
             gate_accepted
+                && floor
                 && decision.margin >= QUALITY_FIRST_MARGIN
                 && decision.novelty <= gate.novelty_theta.min(QUALITY_FIRST_NOVELTY)
         }
         Profile::CostSaver => decision.winner.is_some() && !decision.is_novel(gate.novelty_theta),
     };
+    let explore = accepted
+        && explore
+        && s.manifest.is_auto()
+        && s.manifest.tasks.iter().any(|t| !t.is_active());
     let winner_from_data = decision.winner.is_some_and(|w| {
         let c = if exact { w } else { m.candidates[w] };
         scorer.origins()[c] == TaskOrigin::Data
@@ -2412,6 +2509,7 @@ fn local_decision(
         confidence,
         gate_accepted,
         accepted,
+        explore,
         certified,
         gate,
         profile,
@@ -2528,17 +2626,31 @@ fn untrained_error(
     ApiError::new(worst, message).with_detail("questions", Value::Object(details))
 }
 
+/// `GET /v1/skills` entry (keys append-only: clients index the listing by
+/// position). `auto`, `active_labels`, `quarantined_labels` and `examples`
+/// (learned rows) are 0.8.6 additions, present for every skill.
 fn skill_summary(s: &SkillRuntime) -> Value {
     let g = s.gate();
+    let m = &s.manifest;
+    let quarantined: Vec<&str> = m
+        .tasks
+        .iter()
+        .filter(|t| !t.is_active())
+        .map(|t| t.label.as_str())
+        .collect();
     json!({
         "id": s.id(),
-        "taxonomy_version": s.manifest.taxonomy_version,
+        "taxonomy_version": m.taxonomy_version,
         "labels": s.scorer.labels(),
         "certified": g.certified,
         "tau": f32_json(g.tau),
         "theta": f32_json(g.novelty_theta),
         "temperature": f32_json(g.temperature),
-        "has_rubric": s.manifest.rubric.is_some(),
+        "has_rubric": m.rubric.is_some(),
+        "auto": m.is_auto(),
+        "active_labels": s.scorer.labels().len(),
+        "quarantined_labels": quarantined,
+        "examples": m.rows_learned.as_ref().map_or(0, |r| r.n),
     })
 }
 

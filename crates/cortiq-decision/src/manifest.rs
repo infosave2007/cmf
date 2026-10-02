@@ -109,6 +109,17 @@ pub const HOLDOUT_RULE: &str = "per label, calibration rows in sha256 order, ind
 /// Calibration source values.
 pub const CALIBRATION_FROM_FILE: &str = "file";
 pub const CALIBRATION_CARVE_OUT: &str = "carve-out";
+/// Calibration source of an auto-skill: its calibration subset is recomputed
+/// from the learned rows at every attempt ([`crate::certify::HALVES_RULE_AUTO`]),
+/// never stored (0.8.6).
+pub const CALIBRATION_LEARNED: &str = "learned";
+
+/// Reserved id prefix of an auto-skill: a choice contract learned from oracle
+/// answers (0.8.6). A user skill never gets this prefix
+/// ([`crate::container::FileBuilder::add_skill`], the offline builder).
+pub const AUTO_SKILL_PREFIX: &str = "auto-";
+/// Hex characters of the contract sha256 in an auto-skill id.
+pub const AUTO_SKILL_ID_HEX: usize = 12;
 
 /// Eight encoder golden texts a builder may use (the file records its own list).
 pub const DEFAULT_ENCODER_GOLDEN_TEXTS: [&str; ENCODER_GOLDEN_COUNT] = [
@@ -156,6 +167,55 @@ pub fn valid_skill_id(id: &str) -> bool {
         && b[1..]
             .iter()
             .all(|&c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_' || c == b'-')
+}
+
+/// Does `id` carry the reserved auto-skill prefix?
+pub fn is_auto_skill_id(id: &str) -> bool {
+    id.starts_with(AUTO_SKILL_PREFIX)
+}
+
+/// The option ids of a choice contract in their canonical form: sorted
+/// bytewise, duplicates dropped — the labels of an auto-skill (the cache
+/// scope hashes the same array; the auto-skill key hashes the whole contract,
+/// [`contract_sha256`]).
+pub fn contract_ids(ids: &[&str]) -> Vec<String> {
+    let set: BTreeSet<&str> = ids.iter().copied().collect();
+    set.into_iter().map(str::to_string).collect()
+}
+
+/// The canonical form of a choice contract (DESIGN A18.1):
+/// `{"type":"choice","instructions":…,"criteria":{…}}` — the instructions as
+/// sent (a string, an object, an array or `null`: the System One dialect
+/// sends none), the criteria object with its keys sorted bytewise and every
+/// description kept (`null` too). Two requests that differ only in the order
+/// of their criteria are one contract; any difference in the instructions or
+/// in a description is another contract.
+pub fn contract_value(instructions: &Value, criteria: &Map<String, Value>) -> Value {
+    let sorted: BTreeSet<&String> = criteria.keys().collect();
+    let mut c = Map::new();
+    for k in sorted {
+        c.insert(k.clone(), criteria[k].clone());
+    }
+    let mut m = Map::new();
+    m.insert("type".into(), Value::String("choice".into()));
+    m.insert("instructions".into(), instructions.clone());
+    m.insert("criteria".into(), Value::Object(c));
+    Value::Object(m)
+}
+
+/// sha256 of a choice contract: the canonical JSON (keys sorted at every
+/// level) of [`contract_value`].
+pub fn contract_sha256(instructions: &Value, criteria: &Map<String, Value>) -> String {
+    canonical::sha256_hex(&contract_value(instructions, criteria))
+}
+
+/// The id of the auto-skill of a choice contract: `auto-` + the first 12 hex
+/// characters of [`contract_sha256`]. A valid skill id.
+pub fn auto_skill_id(instructions: &Value, criteria: &Map<String, Value>) -> String {
+    format!(
+        "{AUTO_SKILL_PREFIX}{}",
+        &contract_sha256(instructions, criteria)[..AUTO_SKILL_ID_HEX]
+    )
 }
 
 /// Is `label` a label (1..=256 bytes)?
@@ -739,30 +799,30 @@ pub fn check_hashing(stored: &Value) -> std::result::Result<Vec<String>, String>
         if a.map(canonical::to_string) == b.map(canonical::to_string) {
             continue;
         }
-        if k == "golden" {
-            if let (Some(Value::Array(ga)), Some(Value::Array(gb))) = (a, b) {
-                if ga.len() != gb.len() {
-                    return Err(format!(
-                        "{} golden texts in the file, {} in this build",
-                        ga.len(),
-                        gb.len()
-                    ));
+        if k == "golden"
+            && let (Some(Value::Array(ga)), Some(Value::Array(gb))) = (a, b)
+        {
+            if ga.len() != gb.len() {
+                return Err(format!(
+                    "{} golden texts in the file, {} in this build",
+                    ga.len(),
+                    gb.len()
+                ));
+            }
+            for (i, (x, y)) in ga.iter().zip(gb).enumerate() {
+                if x.get("text") != y.get("text") {
+                    return Err(format!("golden[{i}] text differs"));
                 }
-                for (i, (x, y)) in ga.iter().zip(gb).enumerate() {
-                    if x.get("text") != y.get("text") {
-                        return Err(format!("golden[{i}] text differs"));
-                    }
-                    if x != y {
-                        return Err(format!(
-                            "golden[{i}] dense sha256 differs (file {}, this build {})",
-                            x.get("dense_f32le_sha256")
-                                .and_then(Value::as_str)
-                                .unwrap_or("?"),
-                            y.get("dense_f32le_sha256")
-                                .and_then(Value::as_str)
-                                .unwrap_or("?")
-                        ));
-                    }
+                if x != y {
+                    return Err(format!(
+                        "golden[{i}] dense sha256 differs (file {}, this build {})",
+                        x.get("dense_f32le_sha256")
+                            .and_then(Value::as_str)
+                            .unwrap_or("?"),
+                        y.get("dense_f32le_sha256")
+                            .and_then(Value::as_str)
+                            .unwrap_or("?")
+                    ));
                 }
             }
         }
@@ -1086,6 +1146,50 @@ impl Gate {
         }
     }
 
+    /// The gate of a skill that was never certified: `T = 1`, `θ = 1`, `τ = 0`,
+    /// no evidence (the value `build`/`learn` score with before a certification,
+    /// as a manifest record). It passes [`Gate::validate`]; an auto-skill whose
+    /// tasks are all quarantined carries it.
+    pub fn placeholder() -> Self {
+        let zero_grid = || {
+            certify::THRESHOLDS
+                .iter()
+                .map(|&t| GridEntry {
+                    t,
+                    accepted: 0,
+                    correct: 0,
+                    lb: 0.0,
+                    novelty_rejected: 0,
+                })
+                .collect()
+        };
+        Self {
+            temperature: 1.0,
+            novelty_theta: 1.0,
+            tau: 0.0,
+            certified: false,
+            rule: GateRule::standard(),
+            evidence: Evidence {
+                even: EvenEvidence {
+                    n: 0,
+                    n_t: 0,
+                    nll: 0.0,
+                    log_t: 0.0,
+                    nfev: 0,
+                    status: 0,
+                },
+                odd: OddEvidence {
+                    n: 0,
+                    accepted: 0,
+                    correct: 0,
+                    grid: zero_grid(),
+                    grid_theta_off: zero_grid(),
+                },
+                calibration: CalibrationEvidence { n: 0, correct: 0 },
+            },
+        }
+    }
+
     /// The f32 values the runtime uses.
     pub fn params(&self) -> GateParams {
         GateParams {
@@ -1166,7 +1270,10 @@ impl Gate {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rubric {
-    pub instructions: String,
+    /// A string for a skill built from a question file; an auto-skill keeps
+    /// the first request's instructions verbatim (any JSON value, `null` when
+    /// the request sent none), so its contract sha is reproduced from here.
+    pub instructions: Value,
     pub criteria: Map<String, Value>,
     /// Key order of the question file when it is not the sorted order (canonical
     /// JSON sorts keys; the oracle's schema enum follows this order).
@@ -1176,7 +1283,7 @@ pub struct Rubric {
 
 impl Rubric {
     /// A rubric from criteria in their file order.
-    pub fn new(instructions: impl Into<String>, criteria: Map<String, Value>) -> Self {
+    pub fn new(instructions: impl Into<Value>, criteria: Map<String, Value>) -> Self {
         let keys: Vec<String> = criteria.keys().cloned().collect();
         let sorted = keys.windows(2).all(|w| w[0] < w[1]);
         Self {
@@ -1184,6 +1291,18 @@ impl Rubric {
             criteria,
             criteria_order: if sorted { Vec::new() } else { keys },
         }
+    }
+
+    /// The contract sha of the rubric as a choice contract
+    /// ([`contract_sha256`]): instructions and criteria verbatim, the key
+    /// order ignored.
+    pub fn contract_sha256(&self) -> String {
+        contract_sha256(&self.instructions, &self.criteria)
+    }
+
+    /// The auto-skill id of the rubric's contract ([`auto_skill_id`]).
+    pub fn auto_skill_id(&self) -> String {
+        auto_skill_id(&self.instructions, &self.criteria)
     }
 
     /// Criteria keys in the question file's order.
@@ -1310,8 +1429,82 @@ impl SkillManifest {
         self.labels.iter().position(|l| l == label)
     }
 
+    /// An auto-skill: a choice contract learned from oracle answers (0.8.6).
+    /// Derived, never stored: the reserved id prefix and no build rows
+    /// (`data.train.n == 0`; every row lives in `rows.learned`). [`Self::validate`]
+    /// refuses the prefix on a skill with build rows, so the two agree.
+    pub fn is_auto(&self) -> bool {
+        is_auto_skill_id(&self.id) && self.data.train.n == 0
+    }
+
+    /// The manifest of a new auto-skill before any fit: the contract is its
+    /// rubric (DESIGN A18: instructions + criteria, the first request's
+    /// verbatim), every criteria key a quarantined cold-start task (no
+    /// topology, `k 0`) in sorted order, the placeholder gate, an empty data
+    /// record whose sha256 is the contract's ([`Rubric::contract_sha256`])
+    /// and the `learned` calibration source. `representation_id` and the rows
+    /// records are filled by the writer
+    /// ([`crate::container::OverlayBuilder::add_skill`]). The learner then
+    /// replaces the tasks it fits and the gate it certifies.
+    pub fn auto_skeleton(rubric: &Rubric, k_max: u64) -> Self {
+        let ids: Vec<&str> = rubric.criteria.keys().map(String::as_str).collect();
+        let labels = contract_ids(&ids);
+        let tasks = labels
+            .iter()
+            .enumerate()
+            .map(|(i, label)| TaskRecord {
+                i: i as u64,
+                label: label.clone(),
+                state: TaskState::Quarantined,
+                origin: TaskOrigin::ColdStart,
+                k: 0,
+                n_train: 0,
+                err_mean: 0.0,
+                err_std: 0.0,
+                mean_sha256: None,
+                basis_sha256: None,
+            })
+            .collect();
+        let sha = rubric.contract_sha256();
+        Self {
+            schema: SKILL_SCHEMA.into(),
+            id: rubric.auto_skill_id(),
+            taxonomy_version: 1,
+            representation_id: String::new(),
+            recipe: Recipe::standard(k_max),
+            labels,
+            tasks,
+            gate: Gate::placeholder(),
+            rubric: Some(rubric.clone()),
+            data: DataRecord {
+                train: TrainRecord {
+                    n: 0,
+                    sha256: sha.clone(),
+                    parts: Vec::new(),
+                },
+                calibration: CalibrationRecord {
+                    n: 0,
+                    sha256: sha,
+                    source: CALIBRATION_LEARNED.into(),
+                },
+                dev: None,
+                halves_rule: certify::HALVES_RULE_AUTO.into(),
+                holdout_rule: HOLDOUT_RULE.into(),
+            },
+            rows: RowsRecord::default(),
+            rows_learned: None,
+            learned: None,
+        }
+    }
+
     /// Check the manifest on its own: schema, identities, recipe, the task table,
     /// gate, rubric, data and rows records. `signal_dim` bounds `K`.
+    ///
+    /// An auto-skill ([`Self::is_auto`]) relaxes exactly the data checks a skill
+    /// without build rows cannot meet — calibration source `learned`,
+    /// `halves_rule` [`certify::HALVES_RULE_AUTO`] — and adds its own: every task
+    /// `cold_start`, labels in the contract's sorted order, no calibration rows,
+    /// no dev file, no learned rows in the (empty) build blob.
     pub fn validate(&self, representation_id: &str, signal_dim: usize) -> Result<()> {
         ensure!(
             self.schema == SKILL_SCHEMA,
@@ -1319,6 +1512,19 @@ impl SkillManifest {
             self.schema
         );
         ensure!(valid_skill_id(&self.id), "invalid skill id '{}'", self.id);
+        // The prefix is reserved: with build rows it is a user skill in disguise
+        // and the derived `is_auto()` would disagree with the id. This is a
+        // deliberate load-time break for a pre-0.8.6 file whose user skill was
+        // built under the prefix (0.8.5 accepted any valid id): the id is the
+        // discriminator the learner and the server rely on (contract keys,
+        // isolation, who teaches), so such a file is rebuilt under another id
+        // rather than read leniently (CHANGELOG, Compatibility).
+        ensure!(
+            !is_auto_skill_id(&self.id) || self.data.train.n == 0,
+            "the '{AUTO_SKILL_PREFIX}' id prefix is reserved for auto-skills (no build rows); \
+             a user skill built under it is rebuilt under another id"
+        );
+        let auto = self.is_auto();
         ensure!(self.taxonomy_version >= 1, "taxonomy_version starts at 1");
         ensure!(
             self.representation_id == representation_id,
@@ -1352,6 +1558,9 @@ impl SkillManifest {
             }
             match t.origin {
                 TaskOrigin::Data => {
+                    if auto {
+                        return Err(at("an auto-skill's tasks are all cold_start"));
+                    }
                     if cold {
                         return Err(at("data tasks precede cold-start tasks"));
                     }
@@ -1360,7 +1569,18 @@ impl SkillManifest {
                     }
                     last_data = Some(l);
                 }
-                TaskOrigin::ColdStart => cold = true,
+                TaskOrigin::ColdStart => {
+                    cold = true;
+                    // The contract's sorted order (so the data-task ordering
+                    // rules hold for an auto-skill, D4); `last_data` doubles as
+                    // the previous label here since no data task precedes.
+                    if auto {
+                        if last_data.is_some_and(|p| p.as_bytes() >= l.as_bytes()) {
+                            return Err(at("an auto-skill's labels are sorted bytewise"));
+                        }
+                        last_data = Some(l);
+                    }
+                }
             }
             if t.k > self.recipe.k_max {
                 return Err(at("k exceeds the recipe K"));
@@ -1397,10 +1617,11 @@ impl SkillManifest {
         }
         self.gate.validate()?;
         if let Some(r) = &self.rubric {
-            ensure!(
-                r.instructions.len() <= 1 << 20,
-                "rubric instructions too long"
-            );
+            let instructions_len = match &r.instructions {
+                Value::String(s) => s.len(),
+                other => canonical::to_string(other).len(),
+            };
+            ensure!(instructions_len <= 1 << 20, "rubric instructions too long");
             for k in r.criteria.keys() {
                 ensure!(
                     seen.contains(k.as_str()),
@@ -1432,19 +1653,54 @@ impl SkillManifest {
             ensure!(n == d.train.n, "data.train parts do not add up to n");
         }
         check_sha("data.calibration.sha256", &d.calibration.sha256)?;
-        ensure!(
-            d.calibration.source == CALIBRATION_FROM_FILE
-                || d.calibration.source == CALIBRATION_CARVE_OUT,
-            "calibration source must be file or carve-out"
-        );
+        if auto {
+            ensure!(
+                d.calibration.source == CALIBRATION_LEARNED,
+                "an auto-skill's calibration source is {CALIBRATION_LEARNED}"
+            );
+            ensure!(
+                d.calibration.n == 0 && d.train.parts.is_empty() && d.dev.is_none(),
+                "an auto-skill has no calibration rows, input parts or dev file"
+            );
+            ensure!(
+                d.halves_rule == certify::HALVES_RULE_AUTO,
+                "an auto-skill's halves_rule is the learned-rows rule"
+            );
+            ensure!(
+                self.rows.n_learned == 0,
+                "an auto-skill keeps every row in rows.learned (its build blob is empty)"
+            );
+            // The contract is the rubric (DESIGN A18): every label described,
+            // the id and the data sha256 reproduced from it.
+            let r = self.rubric.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("an auto-skill carries its contract as its rubric")
+            })?;
+            ensure!(
+                r.criteria.len() == self.labels.len(),
+                "an auto-skill's rubric describes every label of its contract"
+            );
+            let sha = r.contract_sha256();
+            ensure!(
+                self.id == r.auto_skill_id()
+                    && d.train.sha256 == sha
+                    && d.calibration.sha256 == sha,
+                "an auto-skill's id and data sha256 are the hash of its contract (rubric)"
+            );
+        } else {
+            ensure!(
+                d.calibration.source == CALIBRATION_FROM_FILE
+                    || d.calibration.source == CALIBRATION_CARVE_OUT,
+                "calibration source must be file or carve-out"
+            );
+            ensure!(
+                d.halves_rule == certify::HALVES_RULE,
+                "unsupported halves_rule"
+            );
+        }
         if let Some(dev) = &d.dev {
             check_sha("data.dev.sha256", &dev.sha256)?;
             ensure!(dev.correct <= dev.n, "dev correct exceeds n");
         }
-        ensure!(
-            d.halves_rule == certify::HALVES_RULE,
-            "unsupported halves_rule"
-        );
         ensure!(d.holdout_rule == HOLDOUT_RULE, "unsupported holdout_rule");
         ensure!(
             self.rows.tensor == rows_tensor(&self.id),
@@ -1572,4 +1828,179 @@ pub fn parse_manifest_bytes<T: for<'de> Deserialize<'de>>(
     let v = canonical::parse_canonical(bytes).map_err(|e| anyhow::anyhow!("{what}: {e}"))?;
     let t = from_value(what, &v)?;
     Ok((t, v))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RID: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+    fn criteria(pairs: &[(&str, Value)]) -> Map<String, Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    /// The contract key hashes the canonical `{type, instructions, criteria}`
+    /// (DESIGN A18.1): the criteria order does not matter; the instructions,
+    /// every description (`null` included) and the id set do.
+    #[test]
+    fn auto_skill_id_is_the_contract_not_the_id_set() {
+        let d = |l: &str| Value::String(format!("about {l}"));
+        let abc = criteria(&[
+            ("travel", d("travel")),
+            ("food", d("food")),
+            ("cruise", d("cruise")),
+        ]);
+        let cba = criteria(&[
+            ("cruise", d("cruise")),
+            ("food", d("food")),
+            ("travel", d("travel")),
+        ]);
+        let which = Value::String("Which topic?".into());
+        let a = auto_skill_id(&which, &abc);
+        assert_eq!(a, auto_skill_id(&which, &cba));
+        assert!(valid_skill_id(&a) && is_auto_skill_id(&a));
+        assert_eq!(a.len(), AUTO_SKILL_PREFIX.len() + AUTO_SKILL_ID_HEX);
+        assert_eq!(
+            contract_sha256(&which, &abc),
+            canonical::sha256_hex(&serde_json::json!({
+                "type": "choice",
+                "instructions": "Which topic?",
+                "criteria": {"cruise": "about cruise", "food": "about food", "travel": "about travel"},
+            }))
+        );
+        // Other instructions, a changed description, a dropped or an added id,
+        // a null description: each another contract.
+        assert_ne!(
+            a,
+            auto_skill_id(&Value::String("Is it urgent?".into()), &abc)
+        );
+        let mut changed = abc.clone();
+        changed.insert("food".into(), Value::String("meals".into()));
+        assert_ne!(a, auto_skill_id(&which, &changed));
+        let mut null = abc.clone();
+        null.insert("food".into(), Value::Null);
+        assert_ne!(a, auto_skill_id(&which, &null));
+        let mut fewer = abc.clone();
+        fewer.remove("cruise");
+        assert_ne!(a, auto_skill_id(&which, &fewer));
+        let mut more = abc.clone();
+        more.insert("x".into(), Value::Null);
+        assert_ne!(a, auto_skill_id(&which, &more));
+        // Null and absent instructions (the System One dialect) are one
+        // contract; the string "null" is another.
+        assert_eq!(
+            auto_skill_id(&Value::Null, &abc),
+            Rubric::new(Value::Null, abc.clone()).auto_skill_id()
+        );
+        assert_ne!(
+            auto_skill_id(&Value::Null, &abc),
+            auto_skill_id(&Value::String("null".into()), &abc)
+        );
+        // The rubric reproduces the id whatever its key order.
+        assert_eq!(Rubric::new(which.clone(), cba).auto_skill_id(), a);
+        assert_eq!(contract_ids(&["b", "a", "b"]), ["a", "b"]);
+    }
+
+    fn skeleton() -> SkillManifest {
+        let mut criteria = Map::new();
+        criteria.insert("food".into(), Value::Null);
+        criteria.insert("cruise".into(), Value::String("a cruise".into()));
+        let mut m = SkillManifest::auto_skeleton(&Rubric::new("Pick.", criteria), 8);
+        m.representation_id = RID.into();
+        m.rows = RowsRecord {
+            tensor: rows_tensor(&m.id),
+            layout: rows::LAYOUT.into(),
+            n_train: 0,
+            n_calibration: 0,
+            n_learned: 0,
+            sha256: sha256_hex(b"empty"),
+        };
+        m
+    }
+
+    /// `is_auto` is derived; the skeleton validates; the relaxations are
+    /// confined to auto-skills and the auto invariants are enforced.
+    #[test]
+    fn auto_skeleton_validates_and_the_relaxations_are_scoped() {
+        let m = skeleton();
+        assert!(m.is_auto());
+        assert_eq!(m.labels, ["cruise", "food"]);
+        assert!(m.tasks.iter().all(|t| {
+            t.state == TaskState::Quarantined && t.origin == TaskOrigin::ColdStart && t.k == 0
+        }));
+        assert_eq!(m.data.calibration.source, CALIBRATION_LEARNED);
+        let r = m.rubric.as_ref().unwrap();
+        assert_eq!(m.data.train.sha256, r.contract_sha256());
+        assert_eq!(m.data.calibration.sha256, r.contract_sha256());
+        assert_eq!(m.id, r.auto_skill_id());
+        assert_eq!(r.order(), ["food", "cruise"], "the request's order is kept");
+        m.validate(RID, 4104).unwrap();
+        assert!(Gate::placeholder().validate().is_ok());
+
+        let refused = |f: &dyn Fn(&mut SkillManifest), what: &str| {
+            let mut m = skeleton();
+            f(&mut m);
+            let e = m.validate(RID, 4104).unwrap_err().to_string();
+            assert!(e.contains(what), "{e}");
+        };
+        // The prefix with build rows is a user skill in disguise.
+        refused(&|m| m.data.train.n = 1, "reserved");
+        // A user skill does not get the relaxations.
+        refused(
+            &|m| {
+                m.id = "user".into();
+                m.rows.tensor = rows_tensor("user");
+            },
+            "file or carve-out",
+        );
+        refused(&|m| m.tasks[0].origin = TaskOrigin::Data, "all cold_start");
+        refused(
+            &|m| {
+                m.labels.swap(0, 1);
+                m.tasks.swap(0, 1);
+                m.tasks[0].i = 0;
+                m.tasks[1].i = 1;
+            },
+            "sorted bytewise",
+        );
+        refused(&|m| m.data.calibration.n = 1, "no calibration rows");
+        refused(
+            &|m| m.data.calibration.source = CALIBRATION_CARVE_OUT.into(),
+            "calibration source is learned",
+        );
+        refused(
+            &|m| m.data.halves_rule = certify::HALVES_RULE.into(),
+            "learned-rows rule",
+        );
+        refused(&|m| m.rows.n_learned = 1, "rows.learned");
+        // The contract is the rubric (A18): a changed description, other
+        // instructions or a missing criterion no longer hash to the id.
+        refused(&|m| m.rubric = None, "contract as its rubric");
+        refused(
+            &|m| {
+                let r = m.rubric.as_mut().unwrap();
+                r.criteria.remove("food");
+                r.criteria_order.clear();
+            },
+            "describes every label",
+        );
+        refused(
+            &|m| {
+                m.rubric
+                    .as_mut()
+                    .unwrap()
+                    .criteria
+                    .insert("food".into(), Value::String("meals".into()));
+            },
+            "hash of its contract",
+        );
+        refused(
+            &|m| m.rubric.as_mut().unwrap().instructions = Value::Null,
+            "hash of its contract",
+        );
+    }
 }

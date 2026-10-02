@@ -111,6 +111,14 @@ impl TrainOptions {
             "invalid skill id '{}' (expected [a-z0-9][a-z0-9_-]{{0,63}})",
             self.skill
         );
+        // A built skill has build rows, so it can never be an auto-skill; the
+        // prefix would only mislead `is_auto()` readers (and validate refuses it).
+        ensure!(
+            !manifest::is_auto_skill_id(&self.skill),
+            "skill id '{}': the '{}' prefix is reserved for auto-skills learned by the server",
+            self.skill,
+            manifest::AUTO_SKILL_PREFIX
+        );
         ensure!(
             !self.train.is_empty(),
             "at least one --train file is needed"
