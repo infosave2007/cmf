@@ -2274,6 +2274,8 @@ impl DecisionState {
             choice: choice.clone(),
             gate_accepted,
             accepted,
+            // `/v1/route` never explores (DESIGN A16 is the decisions API's).
+            explore: false,
             certified: false,
             gate,
             profile: r.profile,

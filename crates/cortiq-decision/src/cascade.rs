@@ -68,7 +68,13 @@
 //! router feedback can never grow it; the pending-labels cap does not apply
 //! to it, `learning.auto_max_examples_per_label` replaces the per-label cap.
 //! The trigger is the same counter; the attempt is [`crate::learn`]'s
-//! whole-skill one.
+//! whole-skill one. While a label stays quarantined the service *explores*
+//! (DESIGN A16, [`crate::service::LocalDecision::explore`]): one accepted
+//! text in `learning.auto_explore_every` of the contract arrives here as a
+//! pending question like an abstention, is answered by the oracle and
+//! learned under `teaches` — the one gate-accepted question that reaches
+//! the oracle, so a label the gate confidently misnames still collects its
+//! examples.
 //!
 //! **Admin** (spec §5b): oracle status and switches, learning status (buffer,
 //! cache, quarantine, attempts, task hashes), generations and rollback (the

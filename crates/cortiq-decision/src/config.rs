@@ -15,7 +15,8 @@
 //!  "cache":{"enabled":true,"threshold":0.97,"cap":50000},
 //!  "learning":{"enabled":true,"refit_min_new":25,"dedup":0.995,"cold_start":true,"synchronous":false,
 //!   "auto_skills":true,"auto_min_rows":10,"auto_k":8,"auto_tau":0.9,"auto_min_agreement":0.8,
-//!   "auto_min_coverage":0.8,"auto_max_skills":256,"auto_max_labels":64,"auto_max_examples_per_label":1000},
+//!   "auto_min_coverage":0.8,"auto_max_skills":256,"auto_max_labels":64,"auto_max_examples_per_label":1000,
+//!   "auto_temperature_min":0.02,"auto_explore_every":4},
 //!  "feedback":{"pending_cap":50000}}
 //! ```
 //!
@@ -396,6 +397,18 @@ pub struct LearningConfig {
     /// Examples kept per label of an auto-skill (below the buffer's own cap:
     /// every generation re-carries every auto-skill's rows).
     pub auto_max_examples_per_label: usize,
+    /// Floor of an auto-skill's gate temperature after each certification
+    /// (`T = max(fitted T, auto_temperature_min)`, DESIGN A15): a clean
+    /// calibration subset drives the fitted `T` to its lower bound, where
+    /// `p_top ≡ 1` and the `auto_tau` floor never bites. 0 keeps the fitted
+    /// `T`.
+    pub auto_temperature_min: f32,
+    /// Exploration while a label of an auto-skill is quarantined (DESIGN A16):
+    /// a locally accepted answer is escalated to the oracle anyway when
+    /// `u64le(sha256(φ_P f32le)[..8]) % auto_explore_every == 0` (4: one text
+    /// in four; the oracle's answer is returned and learned, so a rare label
+    /// collects examples at that share of its traffic). 0 turns it off.
+    pub auto_explore_every: u64,
 }
 
 impl Default for LearningConfig {
@@ -415,6 +428,8 @@ impl Default for LearningConfig {
             auto_max_skills: 256,
             auto_max_labels: 64,
             auto_max_examples_per_label: 1000,
+            auto_temperature_min: 0.02,
+            auto_explore_every: 4,
         }
     }
 }
@@ -861,6 +876,13 @@ impl Config {
             l.auto_max_examples_per_label >= 1,
             "learning.auto_max_examples_per_label must be positive"
         );
+        // Any positive f32-exact `T` is a valid gate (`Gate::validate`); the
+        // floor is bounded by 1 only so that a typo cannot flatten the softmax.
+        check_unit(
+            "learning.auto_temperature_min",
+            l.auto_temperature_min,
+            false,
+        )?;
         ensure!(
             self.feedback.pending_cap >= 1,
             "feedback.pending_cap must be positive"
@@ -946,8 +968,12 @@ mod tests {
         );
         assert_eq!((l.auto_max_skills, l.auto_max_labels), (256, 64));
         assert_eq!(l.auto_max_examples_per_label, 1000);
+        assert_eq!((l.auto_temperature_min, l.auto_explore_every), (0.02, 4));
         let ok = |j: &str| Config::from_json(format!(r#"{{"learning":{{{j}}}}}"#).as_bytes());
         assert!(ok(r#""auto_skills":false,"auto_min_rows":2,"auto_k":1,"auto_tau":0,"auto_max_labels":255"#).is_ok());
+        // 0 = no floor / exploration off; the floor may reach 1.
+        assert!(ok(r#""auto_temperature_min":0,"auto_explore_every":0"#).is_ok());
+        assert!(ok(r#""auto_temperature_min":1"#).is_ok());
         for (j, what) in [
             (r#""auto_min_rows":1"#, "auto_min_rows"),
             (r#""auto_k":0"#, "auto_k"),
@@ -961,6 +987,10 @@ mod tests {
                 r#""auto_max_examples_per_label":0"#,
                 "auto_max_examples_per_label",
             ),
+            (r#""auto_temperature_min":-0.01"#, "auto_temperature_min"),
+            (r#""auto_temperature_min":1.5"#, "auto_temperature_min"),
+            // A u64: serde names the value, not the key.
+            (r#""auto_explore_every":-1"#, "invalid value"),
             (r#""auto_unknown":1"#, "unknown field"),
         ] {
             let e = ok(j).unwrap_err().to_string();
