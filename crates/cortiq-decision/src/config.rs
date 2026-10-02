@@ -16,7 +16,7 @@
 //!  "learning":{"enabled":true,"refit_min_new":25,"dedup":0.995,"cold_start":true,"synchronous":false,
 //!   "auto_skills":true,"auto_min_rows":10,"auto_k":8,"auto_tau":0.9,"auto_min_agreement":0.8,
 //!   "auto_min_coverage":0.8,"auto_max_skills":256,"auto_max_labels":64,"auto_max_examples_per_label":1000,
-//!   "auto_temperature_min":0.02,"auto_explore_every":4},
+//!   "auto_temperature_min":0.02,"auto_explore_every":8},
 //!  "feedback":{"pending_cap":50000}}
 //! ```
 //!
@@ -405,9 +405,11 @@ pub struct LearningConfig {
     pub auto_temperature_min: f32,
     /// Exploration while a label of an auto-skill is quarantined (DESIGN A16):
     /// a locally accepted answer is escalated to the oracle anyway when
-    /// `u64le(sha256(φ_P f32le)[..8]) % auto_explore_every == 0` (4: one text
-    /// in four; the oracle's answer is returned and learned, so a rare label
-    /// collects examples at that share of its traffic). 0 turns it off.
+    /// `u64le(sha256(φ_P f32le)[..8]) % auto_explore_every == 0` (8: one text
+    /// in eight; the oracle's answer is returned and learned, so a rare label
+    /// collects examples at that share of its traffic — on the stand one in
+    /// four kept 36 % of the traffic at the oracle while a label the oracle
+    /// itself names inconsistently never activated). 0 turns it off.
     pub auto_explore_every: u64,
 }
 
@@ -429,7 +431,7 @@ impl Default for LearningConfig {
             auto_max_labels: 64,
             auto_max_examples_per_label: 1000,
             auto_temperature_min: 0.02,
-            auto_explore_every: 4,
+            auto_explore_every: 8,
         }
     }
 }
@@ -968,7 +970,7 @@ mod tests {
         );
         assert_eq!((l.auto_max_skills, l.auto_max_labels), (256, 64));
         assert_eq!(l.auto_max_examples_per_label, 1000);
-        assert_eq!((l.auto_temperature_min, l.auto_explore_every), (0.02, 4));
+        assert_eq!((l.auto_temperature_min, l.auto_explore_every), (0.02, 8));
         let ok = |j: &str| Config::from_json(format!(r#"{{"learning":{{{j}}}}}"#).as_bytes());
         assert!(ok(r#""auto_skills":false,"auto_min_rows":2,"auto_k":1,"auto_tau":0,"auto_max_labels":255"#).is_ok());
         // 0 = no floor / exploration off; the floor may reach 1.

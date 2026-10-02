@@ -193,7 +193,7 @@ goes to the oracle on every new text and, until 0.8.5, was never learned. Since
   label's texts as a neighbour with full confidence (measured on a stand: all
   21 texts of a quarantined label answered locally as another label at
   `p_top` 1), so without it the label could never learn. One text in
-  `learning.auto_explore_every` (4; `u64le(sha256(φ_P))` modulo it is 0, a
+  `learning.auto_explore_every` (8; `u64le(sha256(φ_P))` modulo it is 0, a
   property of the text, never of the order; 0 turns it off) is escalated
   although accepted: the oracle's answer is served (`action: oracle` /
   `cache`, the flag `explore`, the `gate` block still reports `accepted:
