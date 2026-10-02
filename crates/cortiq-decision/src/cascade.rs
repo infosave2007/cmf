@@ -53,8 +53,11 @@
 //! teaches an auto-skill, before and after its activation — the rubric rule
 //! of `teaches` does not apply to `auto-` ids, since the stored rubric is the
 //! contract itself) and `learning.auto_skills` is on, the oracle's answer
-//! becomes an example of the auto-skill `auto-<sha12 of the sorted ids>`
-//! ([`crate::manifest::auto_skill_id`]). The contract is registered once,
+//! becomes an example of the auto-skill `auto-<sha12 of the contract>` — the
+//! contract being the question's instructions and criteria with their
+//! descriptions, not its id set (DESIGN A18, [`crate::manifest::auto_skill_id`]),
+//! so the same ids under other instructions, or with a changed description,
+//! are another contract. The contract is registered once,
 //! under the buffer lock, as a [`LogRecord::Contract`] written before its
 //! first example; the served model is the registry's second source: an
 //! auto-skill it carries without a record (a materialised file on a fresh
@@ -512,14 +515,13 @@ fn auto_contract(cfg: &Config, e: &Escalation<'_>, p: &Pending<'_>) -> Option<Co
     {
         return None;
     }
-    let ids = p.question.options();
-    if ids.len() < 2 || ids.len() > cfg.learning.auto_max_labels {
+    let criteria = p.question.criteria.as_ref()?.as_object()?;
+    if criteria.len() < 2 || criteria.len() > cfg.learning.auto_max_labels {
         return None;
     }
     Some(Contract::new(
-        &ids,
         &p.question.instructions,
-        p.question.criteria.as_ref().unwrap_or(&Value::Null),
+        criteria,
         now_unix(),
     ))
 }
@@ -549,7 +551,7 @@ fn seed_contracts(
         let Some(c) = Contract::of_manifest(m, created) else {
             tracing::warn!(
                 skill = s.id(),
-                "a served auto-skill's id is not the hash of its labels: not learned"
+                "a served auto-skill's id is not the hash of its rubric: not learned"
             );
             continue;
         };

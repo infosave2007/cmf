@@ -255,12 +255,15 @@ impl Example {
 
 // ------------------------------------------------------------------ contracts
 
-/// A choice contract learned into an auto-skill, as first seen (DESIGN D1).
+/// A choice contract learned into an auto-skill, as first seen (DESIGN D1,
+/// A18): the first request's instructions and criteria verbatim, whose
+/// contract sha ([`manifest::contract_sha256`]) keys the skill.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Contract {
-    /// The auto-skill id, [`manifest::auto_skill_id`] of `ids`.
+    /// The auto-skill id, [`manifest::auto_skill_id`] of the instructions
+    /// and criteria.
     pub skill: String,
-    /// The option ids in the first request's order.
+    /// The option ids (the criteria keys) in the first request's order.
     pub ids: Vec<String>,
     /// The first request's `instructions` (string, object, array or null).
     pub instructions: Value,
@@ -270,23 +273,24 @@ pub struct Contract {
 }
 
 impl Contract {
-    /// The contract of a choice question with `ids` as its options.
-    pub fn new(ids: &[&str], instructions: &Value, criteria: &Value, created_unix: u64) -> Self {
+    /// The contract of a choice question: its instructions and its criteria
+    /// object (the ids in the request's order).
+    pub fn new(instructions: &Value, criteria: &Map<String, Value>, created_unix: u64) -> Self {
         Self {
-            skill: manifest::auto_skill_id(ids),
-            ids: ids.iter().map(|s| s.to_string()).collect(),
+            skill: manifest::auto_skill_id(instructions, criteria),
+            ids: criteria.keys().cloned().collect(),
             instructions: instructions.clone(),
-            criteria: criteria.clone(),
+            criteria: Value::Object(criteria.clone()),
             created_unix,
         }
     }
 
     /// The contract of a served auto-skill, read back from its manifest: the
-    /// ids in the rubric's order (the first request's — the rubric was built
-    /// from the contract), the rubric's instructions and criteria; `None`
-    /// for a skill that is not an auto-skill or whose id is not the hash of
-    /// its labels. `learn.log` is the registry's source (DESIGN D1), but a
-    /// materialised file served on a fresh state directory, or a state
+    /// rubric's instructions and criteria verbatim, the ids in the rubric's
+    /// order (the first request's — the rubric was built from the contract);
+    /// `None` for a skill that is not an auto-skill or whose id is not the
+    /// hash of its rubric. `learn.log` is the registry's source (DESIGN D1),
+    /// but a materialised file served on a fresh state directory, or a state
     /// directory whose `learn.log` was lost, carries an auto-skill with no
     /// contract record; without this the skill is served and matched but
     /// never learns again (every example refused as `full`, every attempt
@@ -295,23 +299,8 @@ impl Contract {
         if !m.is_auto() {
             return None;
         }
-        let labels: Vec<&str> = m.labels.iter().map(String::as_str).collect();
-        let (ids, instructions, criteria): (Vec<&str>, Value, Value) = match &m.rubric {
-            // The rubric's criteria keys are labels (validated); when they
-            // are all the labels, their order is the first request's.
-            Some(r) if r.criteria.len() == m.labels.len() => (
-                r.order(),
-                Value::String(r.instructions.clone()),
-                Value::Object(r.criteria.clone()),
-            ),
-            Some(r) => (
-                labels,
-                Value::String(r.instructions.clone()),
-                Value::Object(r.criteria.clone()),
-            ),
-            None => (labels, Value::Null, Value::Null),
-        };
-        let c = Self::new(&ids, &instructions, &criteria, created_unix);
+        let r = m.rubric.as_ref()?;
+        let c = Self::new(&r.instructions, &r.ordered_criteria(), created_unix);
         (c.skill == m.id).then_some(c)
     }
 
@@ -321,16 +310,11 @@ impl Contract {
         self.ids.iter().any(|i| i == label)
     }
 
-    /// The auto-skill's rubric: the instructions as sent when they are a
-    /// string, else their canonical JSON text (`Rubric.instructions` is a
-    /// string); the criteria as sent (DESIGN D4).
+    /// The auto-skill's rubric: the instructions and the criteria verbatim
+    /// (DESIGN D4, A18.3), the criteria in the ids' (request) order whatever
+    /// the map's order after a replay (the record stores the canonical,
+    /// key-sorted text). Its contract sha is this contract's.
     pub fn rubric(&self) -> Rubric {
-        let instructions = match &self.instructions {
-            Value::String(s) => s.clone(),
-            other => canonical::to_string(other),
-        };
-        // Criteria in the ids' (request) order whatever the map's order after
-        // a replay (the record stores the canonical, key-sorted text).
         let criteria: Map<String, Value> = self
             .ids
             .iter()
@@ -341,7 +325,7 @@ impl Contract {
                 )
             })
             .collect();
-        Rubric::new(instructions, criteria)
+        Rubric::new(self.instructions.clone(), criteria)
     }
 
     fn encode(&self, e: &mut Enc) {
@@ -365,10 +349,16 @@ impl Contract {
         let ids = (0..n).map(|_| d.str()).collect::<Result<Vec<_>>>()?;
         let instructions = canonical::parse(d.str()?.as_bytes())?;
         let criteria = canonical::parse(d.str()?.as_bytes())?;
-        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let object = criteria
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("contract record: the criteria are not an object"))?;
         ensure!(
-            skill == manifest::auto_skill_id(&refs),
-            "contract record: the skill id does not match its option ids"
+            ids.len() == object.len() && ids.iter().all(|i| object.contains_key(i)),
+            "contract record: the option ids are not the criteria keys"
+        );
+        ensure!(
+            skill == manifest::auto_skill_id(&instructions, object),
+            "contract record: the skill id does not match its contract"
         );
         Ok(Self {
             skill,
@@ -862,36 +852,61 @@ mod tests {
         assert_eq!(rep.records.len(), 3);
     }
 
+    fn object(v: Value) -> Map<String, Value> {
+        v.as_object().unwrap().clone()
+    }
+
     #[test]
     fn a_contract_registry_is_rebuilt_from_the_log_first_seen_wins() {
         let a = Contract::new(
-            &["x", "y"],
             &serde_json::json!("Which?"),
-            &serde_json::json!({"x": "ex", "y": "why"}),
+            &object(serde_json::json!({"x": "ex", "y": "why"})),
             1,
         );
-        let a2 = Contract::new(&["y", "x"], &serde_json::json!("Other"), &a.criteria, 2);
+        // The same contract, the criteria in another order: one key (A18.1).
+        let a2 = Contract::new(
+            &serde_json::json!("Which?"),
+            &object(serde_json::json!({"y": "why", "x": "ex"})),
+            2,
+        );
         assert_eq!(a.skill, a2.skill);
+        assert_eq!(a2.ids, ["y", "x"]);
+        // Other instructions over the same ids: another contract.
+        let b = Contract::new(
+            &serde_json::json!("Other"),
+            &object(serde_json::json!({"x": "ex", "y": "why"})),
+            2,
+        );
+        assert_ne!(a.skill, b.skill);
         assert!(a.has_label("y") && !a.has_label("z"));
         let r = a.rubric();
         assert_eq!(r.instructions, "Which?");
         assert_eq!(r.order(), ["x", "y"]);
-        // Non-string instructions become canonical JSON text; null criteria stay.
+        assert_eq!(r.auto_skill_id(), a.skill);
+        // Non-string and null instructions and null criteria are kept
+        // verbatim; the rubric reproduces the sha (A18.3).
         let o = Contract::new(
-            &["q", "p"],
             &serde_json::json!({"b": 1, "a": [true]}),
-            &serde_json::json!({"q": null, "p": {"d": "x"}}),
+            &object(serde_json::json!({"q": null, "p": {"d": "x"}})),
             3,
         );
         let r = o.rubric();
-        assert_eq!(r.instructions, r#"{"a":[true],"b":1}"#);
+        assert_eq!(r.instructions, serde_json::json!({"a": [true], "b": 1}));
         assert_eq!(r.criteria["q"], Value::Null);
         assert_eq!(r.order(), ["q", "p"]);
-        // Ids may hold any byte (the key hashes a JSON array, not a join).
+        assert_eq!(r.auto_skill_id(), o.skill);
+        let none = Contract::new(
+            &Value::Null,
+            &object(serde_json::json!({"q": null, "p": {"d": "x"}})),
+            3,
+        );
+        assert_ne!(none.skill, o.skill);
+        assert_eq!(none.rubric().auto_skill_id(), none.skill);
+        assert_eq!(none.rubric().instructions, Value::Null);
+        // Ids may hold any byte (the key hashes canonical JSON, not a join).
         let odd = Contract::new(
-            &["b", "a\nc"],
             &serde_json::json!({"k": [1, null]}),
-            &serde_json::json!({"b": "B", "a\nc": null}),
+            &object(serde_json::json!({"b": "B", "a\nc": null})),
             11,
         );
         let frame = LogRecord::Contract(odd.clone()).frame();

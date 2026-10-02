@@ -1875,7 +1875,7 @@ fn single_request(model: &LoadedModel, a: &DecideArgs, text: &str) -> Result<Val
             criteria.insert(l.clone(), described.get(l).cloned().unwrap_or(Value::Null));
         }
         let instructions = rubric.map_or_else(
-            || server::DEFAULT_ROUTE_INSTRUCTIONS.to_string(),
+            || Value::String(server::DEFAULT_ROUTE_INSTRUCTIONS.to_string()),
             |r| r.instructions,
         );
         (

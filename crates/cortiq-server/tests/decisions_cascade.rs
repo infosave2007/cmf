@@ -28,9 +28,12 @@
 //!   log line or state file (child process);
 //! * auto-skills (0.8.6): an untrained 3-label contract is learned from a
 //!   keyword-consistent mock into `auto-…`, activated at the trigger
-//!   (`auto_start`), answered locally (`exact`, `certified: false`), its
-//!   subset `subset`, a variant sharing two ids another contract, an
-//!   ambiguous one not learned, two runs byte-identical; a random oracle is
+//!   (`auto_start`), answered locally (`exact`, `certified: false`), a
+//!   2-of-3 subset and a variant sharing two ids other contracts, an
+//!   ambiguous one not learned, two runs byte-identical; the same ids under
+//!   two instructions are two auto-skills, each answering its own contract;
+//!   positional ids whose descriptions change per request never learn and
+//!   `auto_max_skills` bounds them (`auto_skipped`); a random oracle is
 //!   rejected (`auto_agreement`) and a consistent contract promoted; a refit
 //!   (`auto_refit`) promoted and a regressing one rejected; rollback, restart,
 //!   materialize, verify and `decide --labels`; the limits (`auto_max_labels`,
@@ -2529,9 +2532,18 @@ fn lessons_of(labels: &[(&'static str, u64, &str)], n: usize) -> Vec<(&'static s
         .collect()
 }
 
-/// The id of the auto-skill of a contract.
+/// The id of the auto-skill of the contract `q` (its instructions and
+/// criteria with the descriptions, DESIGN A18).
+fn auto_id_of(q: &Value) -> String {
+    cortiq_decision::manifest::auto_skill_id(
+        &q["instructions"],
+        q["criteria"].as_object().expect("a choice question"),
+    )
+}
+
+/// The id of the auto-skill of the contract [`choice`] builds over `labels`.
 fn auto_id(labels: &[&str]) -> String {
-    cortiq_decision::manifest::auto_skill_id(labels)
+    auto_id_of(&choice(labels))
 }
 
 /// Decide `text` under the contract `q` (question id `task`).
@@ -2547,6 +2559,16 @@ async fn ask(srv: &Srv, q: &Value, text: &str) -> Resp {
 /// label in turn) until the first promotion; the answers must be the oracle's
 /// (or the cache's) and name the lesson's label. Returns the texts decided.
 async fn teach_contract(srv: &Srv, q: &Value, lessons: &[(&str, Vec<String>)]) -> usize {
+    teach_until(srv, q, lessons, 1).await
+}
+
+/// [`teach_contract`] until the server counts `promotions` promotions.
+async fn teach_until(
+    srv: &Srv,
+    q: &Value,
+    lessons: &[(&str, Vec<String>)],
+    promotions: u64,
+) -> usize {
     let longest = lessons.iter().map(|l| l.1.len()).max().unwrap_or(0);
     let mut n = 0;
     for i in 0..longest {
@@ -2560,7 +2582,7 @@ async fn teach_contract(srv: &Srv, q: &Value, lessons: &[(&str, Vec<String>)]) -
                 r.text
             );
             assert_eq!(r.body["answers"]["task"]["choice"], *label, "{}", r.text);
-            if srv.learning().await["promotions"].as_u64().unwrap_or(0) >= 1 {
+            if srv.learning().await["promotions"].as_u64().unwrap_or(0) >= promotions {
                 return n;
             }
         }
@@ -2739,17 +2761,23 @@ async fn an_untrained_contract_becomes_an_auto_skill_and_answers_locally() {
     }
     assert_eq!(mock.hits() - hits, escalated);
     eprintln!("fresh texts: {local} local, {escalated} escalated");
-    // A subset of the contract.
-    let r = ask(&srv, &choice(&["food", "travel"]), &lessons[0].1[0]).await;
-    assert_eq!(r.q("task")["match"], "subset");
-    assert_eq!(r.q("task")["skill"], id);
+    // A 2-of-3 subset of the ids is a different contract (DESIGN A18): not
+    // served by the auto-skill, untrained, learned separately.
+    let subset = ["food", "travel"];
+    let r = ask(&srv, &choice(&subset), &lessons[0].1[0]).await;
+    assert_eq!(r.q("task")["match"], "untrained", "{}", r.text);
+    assert_eq!(r.q("task")["skill"], Value::Null);
+    assert_eq!(r.action(), "oracle");
+    let sid = auto_id(&subset);
+    assert_ne!(sid, id);
+    assert_eq!(srv.learning().await["auto_contracts"], 2);
     // A variant sharing two ids: another contract, another auto-skill.
     let variant = ["food", "travel", "Weather", "cards"];
     let r = ask(&srv, &choice(&variant), &lessons[1].1[0]).await;
     assert_eq!(r.q("task")["match"], "untrained");
     assert_eq!(r.action(), "oracle");
     let l = srv.learning().await;
-    assert_eq!(l["auto_contracts"], 2);
+    assert_eq!(l["auto_contracts"], 3);
     assert_ne!(auto_id(&variant), id);
     let ids: Vec<&str> = l["auto_skills"]
         .as_array()
@@ -2758,9 +2786,33 @@ async fn an_untrained_contract_becomes_an_auto_skill_and_answers_locally() {
         .map(|a| a["id"].as_str().unwrap())
         .collect();
     let vid = auto_id(&variant);
-    let mut want = vec![id.as_str(), vid.as_str()];
+    let mut want = vec![id.as_str(), sid.as_str(), vid.as_str()];
     want.sort_unstable();
     assert_eq!(ids, want, "contracts listed by id");
+    // The same ids under other instructions, or with another description:
+    // other contracts too (the id set is not the key).
+    let mut other = q.clone();
+    other["instructions"] = json!("Is it urgent?");
+    let r = ask(&srv, &other, &lessons[2].1[0]).await;
+    assert_eq!(r.q("task")["match"], "untrained", "{}", r.text);
+    assert_eq!(r.action(), "oracle");
+    let mut described = q.clone();
+    described["criteria"]["food"] = json!("meals and drinks");
+    let r = ask(&srv, &described, &lessons[2].1[1]).await;
+    assert_eq!(r.q("task")["match"], "untrained", "{}", r.text);
+    assert_eq!(srv.learning().await["auto_contracts"], 5);
+    // The criteria in another order: the same contract, served.
+    let mut reordered = Map::new();
+    for l in ["cruise", "travel", "food"] {
+        reordered.insert(l.to_string(), q["criteria"][l].clone());
+    }
+    let mut same = q.clone();
+    same["criteria"] = Value::Object(reordered);
+    assert_eq!(auto_id_of(&same), id);
+    let r = ask(&srv, &same, &lessons[2].1[2]).await;
+    assert_eq!(r.q("task")["match"], "exact", "{}", r.text);
+    assert_eq!(r.q("task")["skill"], id);
+    assert_eq!(srv.learning().await["auto_contracts"], 5);
     // An ambiguous contract (a subset of two data skills) is not learned.
     let r = ask(&srv, &choice(&["billing", "cards"]), &lessons[0].1[1]).await;
     assert_eq!(r.q("task")["match"], "untrained");
@@ -2770,7 +2822,7 @@ async fn an_untrained_contract_becomes_an_auto_skill_and_answers_locally() {
             .unwrap()
             .contains("ambiguous")
     );
-    assert_eq!(srv.learning().await["auto_contracts"], 2);
+    assert_eq!(srv.learning().await["auto_contracts"], 5);
 
     // Determinism: the same lesson on a second server writes the same bytes.
     let sha1 =
@@ -3083,19 +3135,21 @@ async fn rollback_restart_materialize_and_verify_with_an_auto_skill() {
     assert_eq!(full.rows(&id).unwrap().rows.len(), 0);
     assert!(full.rows_learned(&id).unwrap().unwrap().rows.len() >= 71);
     let loaded = cortiq_decision::service::LoadedModel::new(full).unwrap();
-    assert_eq!(
+    // Labels alone never name an auto-skill (its contract is the rubric,
+    // DESIGN A18): `decide --labels` needs `--skill`, whose rubric then
+    // supplies the contract (`route_question`), an exact match.
+    assert!(
         cortiq_decision::matching::skill_for_labels(
             &loaded.skill_labels(),
             &["cruise", "food", "travel"]
         )
-        .unwrap(),
-        id
+        .is_err()
     );
-    assert_eq!(
-        cortiq_decision::matching::skill_for_labels(&loaded.skill_labels(), &["food", "travel"])
-            .unwrap(),
-        id
-    );
+    let own = cortiq_server::decisions::route_question(loaded.skill(&id).unwrap());
+    let m =
+        cortiq_decision::matching::match_question(&loaded.skill_labels(), &own, Some(&id)).unwrap();
+    assert_eq!(m.kind, cortiq_decision::matching::MatchKind::Exact);
+    assert_eq!(m.skill.as_deref(), Some(id.as_str()));
     // The file alone needs `--skill` for an unnamed decision (two data skills).
     assert!(cortiq_decision::eval::select_skill(loaded.model(), None).is_err());
     assert_eq!(
@@ -3374,6 +3428,194 @@ async fn auto_skill_limits_and_who_teaches() {
         .await;
     assert_eq!(r.status, 200, "{}", r.text);
     assert_eq!(r.body["decision"]["task_label"], "food");
+}
+
+/// The instructions of the `task` question of a mock request (the system
+/// message ends with the canonical `{"questions": …}` line).
+fn asked_instructions(req: &MockRequest) -> String {
+    let v = req.json();
+    let system = v["messages"][0]["content"].as_str().unwrap();
+    let qs: Value = serde_json::from_str(system.rsplit('\n').next().unwrap()).unwrap();
+    qs["questions"]["task"]["instructions"]
+        .as_str()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// A `{yes, no}` contract under `instructions` (the same descriptions).
+fn yes_no(instructions: &str) -> Value {
+    json!({"type": "choice", "instructions": instructions,
+           "criteria": {"yes": "it is", "no": "it is not"}})
+}
+
+/// The same ids `{yes, no}` under two instructions are two contracts, two
+/// auto-skills (DESIGN A18): each answers its own question locally and never
+/// the other's — one text gets `yes` under one and `no` under the other.
+#[tokio::test]
+async fn the_same_ids_under_two_instructions_are_two_auto_skills() {
+    const FOOD: &str = "Is it about food?";
+    const TRAVEL: &str = "Is it about travel?";
+    // The oracle reads the question: yes when the text has a word of the
+    // topic the instructions ask about.
+    let mock = MockOracle::start(|req| {
+        let text = req.state().as_str().unwrap_or("").to_string();
+        let topic = if asked_instructions(req) == FOOD {
+            "food"
+        } else {
+            "travel"
+        };
+        answer_reply(
+            req,
+            move |_, _| {
+                let words: Vec<&str> = text.split(' ').collect();
+                json!(if pool(topic).iter().any(|w| words.contains(w)) {
+                    "yes"
+                } else {
+                    "no"
+                })
+            },
+            1e-5,
+        )
+    });
+    let cfg = stand_config(&mock.url());
+    let srv = Srv::new(&cfg);
+    let (food_q, travel_q) = (yes_no(FOOD), yes_no(TRAVEL));
+    let (fid, tid) = (auto_id_of(&food_q), auto_id_of(&travel_q));
+    assert_ne!(fid, tid);
+    // Food texts are `yes` and travel texts `no` under the food question.
+    let mut seen = Vec::new();
+    let food_lessons = vec![
+        ("yes", texts_apart("food", 25, 141, "sf", 0.97, &mut seen)),
+        ("no", texts_apart("travel", 25, 143, "sv", 0.97, &mut seen)),
+    ];
+    let n = teach_contract(&srv, &food_q, &food_lessons).await;
+    let l = srv.learning().await;
+    assert_eq!(l["generation"], 1, "{l}");
+    assert_eq!(latest(&l)["skill"], fid);
+    assert_eq!(l["auto_contracts"], 1);
+    eprintln!("food question active after {n} texts");
+    // The travel question: another contract, untrained, the oracle's answer
+    // (no under the travel question for a food text), learned separately.
+    let fresh_food = distinct_texts("food", 4, 151, "yf", 0.995);
+    let r = ask(&srv, &travel_q, &fresh_food[0]).await;
+    assert_eq!(r.q("task")["match"], "untrained", "{}", r.text);
+    assert_eq!(r.q("task")["skill"], Value::Null);
+    assert_eq!(r.action(), "oracle");
+    assert_eq!(r.body["answers"]["task"]["choice"], "no");
+    assert_eq!(srv.learning().await["auto_contracts"], 2);
+    let travel_lessons = vec![
+        ("yes", texts_apart("travel", 25, 161, "tv", 0.97, &mut seen)),
+        ("no", texts_apart("food", 25, 163, "tf", 0.97, &mut seen)),
+    ];
+    let n = teach_until(&srv, &travel_q, &travel_lessons, 2).await;
+    let l = srv.learning().await;
+    assert_eq!(l["generation"], 2, "{l}");
+    assert_eq!(latest(&l)["skill"], tid);
+    eprintln!("travel question active after {n} texts");
+    assert_eq!(srv.get("/healthz").await.body["auto_skills"], 2);
+    // Each question is answered by its own skill, whatever the text: a food
+    // text is yes under the food question and no under the travel one.
+    let mut local = 0;
+    for t in fresh_food
+        .iter()
+        .chain(&distinct_texts("travel", 4, 153, "yv", 0.995))
+    {
+        let food = pool("food").iter().any(|w| t.split(' ').any(|x| x == *w));
+        let r = ask(&srv, &food_q, t).await;
+        assert_eq!(r.q("task")["skill"], fid, "{}", r.text);
+        assert_eq!(r.q("task")["match"], "exact");
+        assert_eq!(
+            r.body["answers"]["task"]["choice"],
+            if food { "yes" } else { "no" },
+            "{}",
+            r.text
+        );
+        local += usize::from(r.action() == "local");
+        let r = ask(&srv, &travel_q, t).await;
+        assert_eq!(r.q("task")["skill"], tid, "{}", r.text);
+        assert_eq!(r.q("task")["match"], "exact");
+        assert_eq!(
+            r.body["answers"]["task"]["choice"],
+            if food { "no" } else { "yes" },
+            "{}",
+            r.text
+        );
+        local += usize::from(r.action() == "local");
+    }
+    assert!(local >= 2, "no local answer of either auto-skill");
+    let s = srv.get("/v1/skills").await.body;
+    let autos: Vec<&str> = s["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|k| k["auto"] == true)
+        .map(|k| k["id"].as_str().unwrap())
+        .collect();
+    let mut want = vec![fid.as_str(), tid.as_str()];
+    want.sort_unstable();
+    assert_eq!(autos, want);
+    let one = srv.get(&format!("/v1/skills/{tid}")).await.body;
+    assert_eq!(one["rubric"]["instructions"], TRAVEL);
+    assert_eq!(one["rubric"]["criteria"]["yes"], "it is");
+}
+
+/// A multiple-choice question with positional ids `{A, B, C, D}` whose
+/// descriptions change with every request (every benchmark): every request
+/// is its own contract, so nothing is ever learned as one skill — no attempt
+/// runs — and `auto_max_skills` bounds the registry: past the cap the oracle
+/// answers, `auto_skipped` counts and the first contracts stay (no eviction).
+#[tokio::test]
+async fn positional_ids_with_changing_descriptions_never_learn_and_are_bounded() {
+    let positional = |i: usize| {
+        json!({"type": "choice", "instructions": "Pick the correct answer.",
+               "criteria": {"A": format!("answer {i}a"), "B": format!("answer {i}b"),
+                            "C": format!("answer {i}c"), "D": format!("answer {i}d")}})
+    };
+    let mock = keyword_mock();
+    let mut cfg = stand_config(&mock.url());
+    cfg.learning.auto_max_skills = 3;
+    let srv = Srv::new(&cfg);
+    let texts = distinct_texts("cruise", 6, 171, "pq", 0.97);
+    let mut ids = Vec::new();
+    for (i, t) in texts.iter().enumerate().take(5) {
+        let q = positional(i);
+        let id = auto_id_of(&q);
+        assert!(!ids.contains(&id), "every request is its own contract");
+        ids.push(id);
+        let r = ask(&srv, &q, t).await;
+        assert_eq!(r.q("task")["match"], "untrained", "{}", r.text);
+        assert_eq!(r.action(), "oracle");
+        let l = srv.learning().await;
+        assert_eq!(l["auto_contracts"], (i + 1).min(3) as u64, "{l}");
+        assert_eq!(l["auto_skipped"], i.saturating_sub(2) as u64, "{l}");
+        assert_eq!(l["examples_added"], (i + 1).min(3) as u64, "{l}");
+        assert_eq!(l["attempts"], 0, "{l}");
+    }
+    let l = srv.learning().await;
+    let listed: Vec<&str> = l["auto_skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["id"].as_str().unwrap())
+        .collect();
+    let mut first = ids[..3].to_vec();
+    first.sort_unstable();
+    assert_eq!(listed, first, "the first contracts stay: {l}");
+    assert_eq!(mock.hits(), 5);
+    // The same question again (its descriptions unchanged) is the same
+    // contract: a second example, no new contract, no skip.
+    let r = ask(&srv, &positional(1), &texts[5]).await;
+    assert_eq!(r.action(), "oracle");
+    let l = srv.learning().await;
+    assert_eq!(
+        (
+            l["auto_contracts"].as_u64(),
+            l["auto_skipped"].as_u64(),
+            l["examples_added"].as_u64()
+        ),
+        (Some(3), Some(2), Some(4)),
+        "{l}"
+    );
 }
 
 #[tokio::test]
@@ -3729,26 +3971,34 @@ async fn a_rare_label_stays_quarantined_and_keeps_teaching() {
         (f.body["learned"].as_bool(), f.body["known_label"].as_bool()),
         (Some(true), Some(true))
     );
-    // A superset request over the auto-skill is answered by the oracle; its
-    // label outside the contract is refused by the closed label set.
+    // A request with one more id is another contract (DESIGN A18): never a
+    // superset of the auto-skill, answered by the oracle and learned on its
+    // own — the first skill's label set stays closed.
     let sup = choice(&["food", "travel", "cruise", "Weather"]);
+    let sup_id = auto_id_of(&sup);
     let weather = distinct_texts("Weather", 1, 5, "w", 0.97).remove(0);
     let r = ask(&srv, &sup, &weather).await;
-    assert_eq!(r.q("task")["match"], "superset", "{}", r.text);
-    assert_eq!(r.q("task")["unknown_options"], json!(["cruise", "Weather"]));
+    assert_eq!(r.q("task")["match"], "untrained", "{}", r.text);
+    assert_eq!(r.q("task")["skill"], Value::Null);
     assert_eq!(r.action(), "oracle");
     assert_eq!(r.body["answers"]["task"]["choice"], "Weather");
     let l2 = srv.learning().await;
     assert_eq!(
+        l2["auto_contracts"].as_u64().unwrap(),
+        l["auto_contracts"].as_u64().unwrap() + 1,
+        "{l2}"
+    );
+    assert_eq!(
         l2["examples_added"].as_u64().unwrap(),
-        l["examples_added"].as_u64().unwrap() + 1,
-        "the feedback only: {l2}"
+        l["examples_added"].as_u64().unwrap() + 2,
+        "the feedback and the new contract's example: {l2}"
     );
-    assert!(
-        !l2["buffer"]["labels"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|c| c["label"] == "Weather")
-    );
+    let weather_of: Vec<&str> = l2["buffer"]["labels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["label"] == "Weather")
+        .map(|c| c["skill"].as_str().unwrap())
+        .collect();
+    assert_eq!(weather_of, [sup_id.as_str()], "{l2}");
 }

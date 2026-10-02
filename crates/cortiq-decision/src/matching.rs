@@ -15,17 +15,23 @@
 //!    (ambiguous: name one with `cmf.skill`), score and noul questions, a
 //!    skill without active tasks.
 //!
-//! Only option ids are compared; instructions and criteria descriptions matter
-//! to the oracle alone.
+//! For a data skill only option ids are compared; instructions and criteria
+//! descriptions matter to the oracle alone.
 //!
-//! **Auto-skills** (0.8.6, DESIGN D8/A6). The labels of an auto-skill that are
-//! not active yet (quarantined, too few examples) still count as *known*: a
-//! question whose ids are all known to it is exact or subset over its ACTIVE
-//! labels (a quarantined option gets probability 0; a text of such a label is
-//! expected to abstain on novelty and keeps teaching it). For a data skill
-//! known = active, so nothing changes for it. When exactly one data skill and
-//! any number of auto-skills hit the best kind, the data skill wins (no
-//! ambiguity); several data skills, or auto-skills alone, stay ambiguous.
+//! **Auto-skills** (0.8.6, DESIGN A18/A6). An auto-skill is one exact
+//! contract — the sha256 of `{type, instructions, criteria}` with the
+//! descriptions ([`crate::manifest::contract_sha256`]) — and is matched by
+//! that sha alone: a choice question whose contract sha equals the skill's is
+//! **exact** over the skill's ACTIVE labels; subset and superset relations are
+//! never computed against an auto-skill (a client that drops or adds a label,
+//! changes a description or the instructions has another contract, learned
+//! separately), so two clients using the same ids under different questions
+//! never share a skill. The labels of an auto-skill that are not active yet
+//! (quarantined, too few examples) count as *known* within the exact match: a
+//! quarantined option gets probability 0, and a text of such a label is
+//! expected to abstain on novelty and keep teaching it. When exactly one data
+//! skill and any number of auto-skills hit the best kind, the data skill wins
+//! (no ambiguity); several data skills, or auto-skills alone, stay ambiguous.
 
 use crate::protocol::{ApiError, Question, QuestionKind};
 use serde_json::json;
@@ -40,19 +46,35 @@ pub struct SkillLabels<'a> {
     /// Every label the skill has, active or not (an auto-skill's whole
     /// contract); the active ones for a data skill.
     pub known: &'a [String],
-    /// An auto-skill (loses a tie against a data skill).
-    pub auto: bool,
+    /// An auto-skill: its contract sha (the question's must equal it; it
+    /// loses a tie against a data skill). `None` for a data skill.
+    pub contract: Option<&'a str>,
 }
 
 impl<'a> SkillLabels<'a> {
-    /// A data skill: known = active.
+    /// A data skill: known = active, matched by its ids.
     pub fn data(id: &'a str, active: &'a [String]) -> Self {
         Self {
             id,
             active,
             known: active,
-            auto: false,
+            contract: None,
         }
+    }
+
+    /// An auto-skill (DESIGN A18): matched only by `contract`, decided over
+    /// `active`, every label of `known` a known one.
+    pub fn auto(id: &'a str, active: &'a [String], known: &'a [String], contract: &'a str) -> Self {
+        Self {
+            id,
+            active,
+            known,
+            contract: Some(contract),
+        }
+    }
+
+    pub fn is_auto(&self) -> bool {
+        self.contract.is_some()
     }
 }
 
@@ -119,9 +141,16 @@ impl SkillMatch {
     }
 }
 
-/// Relation of L to one skill: the candidates are the active labels in L,
-/// "known" covers the quarantined labels of an auto-skill too.
-fn relate(options: &[&str], set: &HashSet<&str>, s: &SkillLabels<'_>) -> Option<SkillMatch> {
+/// Relation of L to one skill: the candidates are the active labels in L.
+/// An auto-skill relates only to its own contract (`contract` is the
+/// question's sha), as exact over its active labels — the quarantined ones
+/// are known within it (DESIGN A18/A6) — or not at all.
+fn relate(
+    options: &[&str],
+    set: &HashSet<&str>,
+    contract: Option<&str>,
+    s: &SkillLabels<'_>,
+) -> Option<SkillMatch> {
     if s.active.is_empty() {
         return None;
     }
@@ -132,15 +161,24 @@ fn relate(options: &[&str], set: &HashSet<&str>, s: &SkillLabels<'_>) -> Option<
         .filter(|(_, l)| set.contains(l.as_str()))
         .map(|(i, _)| i)
         .collect();
-    let known: HashSet<&str> = s.known.iter().map(String::as_str).collect();
-    let all_known = options.iter().all(|o| known.contains(o));
-    let covers = inside.len() == s.active.len();
-    let kind = match (all_known, covers) {
-        (true, true) => MatchKind::Exact,
-        // Known but none active (every option quarantined): not decidable.
-        (true, false) if options.len() >= 2 && !inside.is_empty() => MatchKind::Subset,
-        (false, true) => MatchKind::Superset,
-        _ => return None,
+    let kind = if let Some(own) = s.contract {
+        // Equal shas mean equal criteria keys: L is the whole contract, the
+        // active labels are all inside it.
+        if contract != Some(own) {
+            return None;
+        }
+        debug_assert!(inside.len() == s.active.len());
+        MatchKind::Exact
+    } else {
+        let known: HashSet<&str> = s.known.iter().map(String::as_str).collect();
+        let all_known = options.iter().all(|o| known.contains(o));
+        let covers = inside.len() == s.active.len();
+        match (all_known, covers) {
+            (true, true) => MatchKind::Exact,
+            (true, false) if options.len() >= 2 && !inside.is_empty() => MatchKind::Subset,
+            (false, true) => MatchKind::Superset,
+            _ => return None,
+        }
     };
     let unknown = if kind == MatchKind::Superset {
         let active: HashSet<&str> = s.active.iter().map(String::as_str).collect();
@@ -162,12 +200,19 @@ fn relate(options: &[&str], set: &HashSet<&str>, s: &SkillLabels<'_>) -> Option<
     })
 }
 
-/// Match option ids against the skills (rules 2–5, see the module notes).
-pub fn match_labels(skills: &[SkillLabels<'_>], options: &[&str]) -> SkillMatch {
+/// Match option ids against the skills (rules 2–5, see the module notes);
+/// `contract` is the question's contract sha, the only thing an auto-skill
+/// is matched by (without it, `cortiq decide --labels`, auto-skills are
+/// invisible).
+pub fn match_labels(
+    skills: &[SkillLabels<'_>],
+    options: &[&str],
+    contract: Option<&str>,
+) -> SkillMatch {
     let set: HashSet<&str> = options.iter().copied().collect();
     let found: Vec<(SkillMatch, bool)> = skills
         .iter()
-        .filter_map(|s| relate(options, &set, s).map(|m| (m, s.auto)))
+        .filter_map(|s| relate(options, &set, contract, s).map(|m| (m, s.is_auto())))
         .collect();
     for kind in [MatchKind::Exact, MatchKind::Subset, MatchKind::Superset] {
         let hits: Vec<&(SkillMatch, bool)> = found.iter().filter(|m| m.0.kind == kind).collect();
@@ -221,21 +266,30 @@ pub fn match_question(
         )));
     }
     let options = q.options();
-    let m = match_labels(&pool, &options);
+    let contract = q.contract_sha256();
+    let m = match_labels(&pool, &options, contract.as_deref());
     if m.kind == MatchKind::Untrained
         && let Some(id) = forced
     {
-        return Ok(SkillMatch::untrained(format!(
-            "the options do not match skill '{id}' (neither its labels, a subset nor a superset of them)"
-        )));
+        return Ok(SkillMatch::untrained(if pool[0].is_auto() {
+            format!(
+                "the question is not the contract of auto-skill '{id}' (its instructions and criteria)"
+            )
+        } else {
+            format!(
+                "the options do not match skill '{id}' (neither its labels, a subset nor a superset of them)"
+            )
+        }));
     }
     Ok(m)
 }
 
-/// The skill of `cortiq decide --labels a,b,c`: the skill the labels match as
-/// exact or subset (spec §4.1).
+/// The skill of `cortiq decide --labels a,b,c`: the data skill the labels
+/// match as exact or subset (spec §4.1). An auto-skill is one exact contract
+/// (instructions and criteria), which labels alone do not name: `--skill`
+/// names it and its rubric supplies the contract.
 pub fn skill_for_labels(skills: &[SkillLabels<'_>], labels: &[&str]) -> anyhow::Result<String> {
-    let m = match_labels(skills, labels);
+    let m = match_labels(skills, labels, None);
     match (m.kind, m.skill) {
         (MatchKind::Exact | MatchKind::Subset, Some(s)) => Ok(s),
         (MatchKind::Superset, Some(s)) => anyhow::bail!(
@@ -253,6 +307,7 @@ pub fn skill_for_labels(skills: &[SkillLabels<'_>], labels: &[&str]) -> anyhow::
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     fn labels(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
@@ -263,23 +318,23 @@ mod tests {
         let a = labels(&["a", "b", "c"]);
         let d = labels(&["d", "e"]);
         let skills = [SkillLabels::data("s1", &a), SkillLabels::data("s2", &d)];
-        let m = match_labels(&skills, &["c", "a", "b"]);
+        let m = match_labels(&skills, &["c", "a", "b"], None);
         assert_eq!(m.kind, MatchKind::Exact);
         assert_eq!(m.skill.as_deref(), Some("s1"));
         assert_eq!(m.candidates, vec![0, 1, 2]);
-        let m = match_labels(&skills, &["c", "a"]);
+        let m = match_labels(&skills, &["c", "a"], None);
         assert_eq!(m.kind, MatchKind::Subset);
         assert_eq!(m.candidates, vec![0, 2]);
-        let m = match_labels(&skills, &["e", "x", "d"]);
+        let m = match_labels(&skills, &["e", "x", "d"], None);
         assert_eq!(m.kind, MatchKind::Superset);
         assert_eq!(m.skill.as_deref(), Some("s2"));
         assert_eq!(m.unknown, vec!["x"]);
         assert_eq!(
-            match_labels(&skills, &["a", "d"]).kind,
+            match_labels(&skills, &["a", "d"], None).kind,
             MatchKind::Untrained
         );
         assert_eq!(
-            match_labels(&skills, &["x", "y"]).kind,
+            match_labels(&skills, &["x", "y"], None).kind,
             MatchKind::Untrained
         );
     }
@@ -289,97 +344,132 @@ mod tests {
         let a = labels(&["a", "b", "c"]);
         let b = labels(&["a", "b", "d"]);
         let skills = [SkillLabels::data("s1", &a), SkillLabels::data("s2", &b)];
-        let m = match_labels(&skills, &["a", "b"]);
+        let m = match_labels(&skills, &["a", "b"], None);
         assert_eq!(m.kind, MatchKind::Untrained);
         assert!(m.ambiguous && !m.is_foreign());
         assert!(m.reason.unwrap().contains("ambiguous"));
-        assert!(match_labels(&skills, &["x", "y"]).is_foreign());
+        assert!(match_labels(&skills, &["x", "y"], None).is_foreign());
         // An exact match wins over a subset of another skill.
-        let m = match_labels(&skills, &["a", "b", "c"]);
+        let m = match_labels(&skills, &["a", "b", "c"], None);
         assert_eq!((m.kind, m.skill.as_deref()), (MatchKind::Exact, Some("s1")));
     }
 
+    /// A choice question under `instructions` with a description per label.
+    fn question(instructions: Value, labels: &[&str]) -> Question {
+        let mut c = serde_json::Map::new();
+        for l in labels {
+            c.insert(l.to_string(), json!(format!("about {l}")));
+        }
+        Question {
+            id: "task".into(),
+            kind: QuestionKind::Choice,
+            instructions,
+            criteria: Some(Value::Object(c)),
+        }
+    }
+
+    /// An auto-skill is matched by its contract sha alone (DESIGN A18): the
+    /// same contract is exact over the active labels, the quarantined ones
+    /// known within it; a subset, a superset, other instructions or another
+    /// description is no relation at all — a different contract, foreign.
     #[test]
-    fn an_auto_skill_relates_over_its_known_labels_and_decides_over_the_active_ones() {
+    fn an_auto_skill_is_one_exact_contract() {
         let active = labels(&["food", "travel"]);
         let known = labels(&["cruise", "food", "travel"]);
-        let auto = SkillLabels {
-            id: "auto-1",
-            active: &active,
-            known: &known,
-            auto: true,
-        };
+        let which = json!("Which topic?");
+        let q = question(which.clone(), &["food", "travel", "cruise"]);
+        let sha = q.contract_sha256().unwrap();
+        let auto = SkillLabels::auto("auto-1", &active, &known, &sha);
         // The whole contract: exact over the two active candidates.
-        let m = match_labels(&[auto], &["food", "travel", "cruise"]);
+        let m = match_question(&[auto], &q, None).unwrap();
         assert_eq!(
             (m.kind, m.skill.as_deref()),
             (MatchKind::Exact, Some("auto-1"))
         );
         assert_eq!(m.candidates, vec![0, 1]);
-        // Two known ids, one active: a subset over that candidate.
-        let m = match_labels(&[auto], &["cruise", "travel"]);
-        assert_eq!((m.kind, m.candidates.clone()), (MatchKind::Subset, vec![1]));
-        // Only quarantined ids: not decidable, foreign (a new contract).
-        let other = labels(&["cruise", "ship"]);
-        let ship = labels(&["ship"]);
-        let a2 = SkillLabels {
-            id: "auto-2",
-            active: &ship,
-            known: &other,
-            auto: true,
-        };
-        assert!(match_labels(&[auto], &["cruise", "food"]).kind == MatchKind::Subset);
-        let known3 = labels(&["cruise", "food", "travel", "zoo"]);
-        let a3 = SkillLabels {
-            id: "auto-3",
-            active: &active,
-            known: &known3,
-            auto: true,
-        };
-        assert!(match_labels(&[a3], &["cruise", "zoo"]).is_foreign());
-        // An unknown id with every active one: superset, the quarantined ids unknown too.
-        let m = match_labels(&[auto], &["food", "travel", "cruise", "x"]);
-        assert_eq!(m.kind, MatchKind::Superset);
-        assert_eq!(m.unknown, vec!["cruise", "x"]);
-        // A fully quarantined auto-skill is invisible.
-        let none = SkillLabels {
-            id: "auto-0",
-            active: &[],
-            known: &known,
-            auto: true,
-        };
-        assert!(match_labels(&[none, a2], &["food", "travel", "cruise"]).is_foreign());
+        // The criteria in another order: the same contract.
+        let q2 = question(which.clone(), &["cruise", "travel", "food"]);
+        assert_eq!(q2.contract_sha256().unwrap(), sha);
+        assert_eq!(
+            match_question(&[auto], &q2, None).unwrap().kind,
+            MatchKind::Exact
+        );
+        // A subset of the ids, a superset, other instructions, a changed
+        // description: other contracts, never subset/superset, foreign.
+        for other in [
+            question(which.clone(), &["food", "travel"]),
+            question(which.clone(), &["cruise", "travel"]),
+            question(which.clone(), &["food", "travel", "cruise", "x"]),
+            question(json!("Is it urgent?"), &["food", "travel", "cruise"]),
+            question(Value::Null, &["food", "travel", "cruise"]),
+            {
+                let mut q = q.clone();
+                q.criteria.as_mut().unwrap()["food"] = json!("meals");
+                q
+            },
+        ] {
+            assert_ne!(other.contract_sha256().unwrap(), sha);
+            let m = match_question(&[auto], &other, None).unwrap();
+            assert!(m.is_foreign(), "{m:?}");
+        }
+        // Forced with `cmf.skill`: untrained, the reason names the contract
+        // (a forced question is never learned, the caller checks `cmf.skill`).
+        let m = match_question(
+            &[auto],
+            &question(which.clone(), &["food", "travel"]),
+            Some("auto-1"),
+        )
+        .unwrap();
+        assert_eq!(m.kind, MatchKind::Untrained);
+        assert!(
+            m.reason
+                .unwrap()
+                .contains("contract of auto-skill 'auto-1'")
+        );
+        // Labels alone (`decide --labels`) never name an auto-skill.
+        assert!(skill_for_labels(&[auto], &["food", "travel", "cruise"]).is_err());
+        // A fully quarantined auto-skill is invisible: its contract is foreign
+        // (and keeps teaching it).
+        let none = SkillLabels::auto("auto-0", &[], &known, &sha);
+        assert!(match_question(&[none], &q, None).unwrap().is_foreign());
+        // Two auto-skills of the same ids under different instructions: each
+        // answers its own question only.
+        let urgent = question(json!("Is it urgent?"), &["food", "travel", "cruise"]);
+        let sha_u = urgent.contract_sha256().unwrap();
+        let auto_u = SkillLabels::auto("auto-2", &active, &known, &sha_u);
+        let m = match_question(&[auto, auto_u], &q, None).unwrap();
+        assert_eq!(m.skill.as_deref(), Some("auto-1"));
+        let m = match_question(&[auto, auto_u], &urgent, None).unwrap();
+        assert_eq!(m.skill.as_deref(), Some("auto-2"));
     }
 
     #[test]
     fn a_data_skill_wins_a_tie_against_auto_skills_only() {
         let a = labels(&["a", "b", "c"]);
         let data = SkillLabels::data("s1", &a);
-        let auto1 = SkillLabels {
-            id: "auto-1",
-            active: &a,
-            known: &a,
-            auto: true,
-        };
-        let auto2 = SkillLabels {
-            id: "auto-2",
-            active: &a,
-            known: &a,
-            auto: true,
-        };
-        let m = match_labels(&[auto1, data, auto2], &["a", "b", "c"]);
+        let q = question(json!("Which?"), &["a", "b", "c"]);
+        let sha = q.contract_sha256().unwrap();
+        let auto1 = SkillLabels::auto("auto-1", &a, &a, &sha);
+        let auto2 = SkillLabels::auto("auto-2", &a, &a, &sha);
+        let m = match_question(&[auto1, data, auto2], &q, None).unwrap();
         assert_eq!((m.kind, m.skill.as_deref()), (MatchKind::Exact, Some("s1")));
-        let m = match_labels(&[auto1, data], &["a", "b"]);
+        // A part of the ids: the data skill's subset; no auto-skill relates.
+        let m = match_question(
+            &[auto1, data],
+            &question(json!("Which?"), &["a", "b"]),
+            None,
+        )
+        .unwrap();
         assert_eq!(
             (m.kind, m.skill.as_deref()),
             (MatchKind::Subset, Some("s1"))
         );
         // Auto-skills alone: ambiguous, and not learnable.
-        let m = match_labels(&[auto1, auto2], &["a", "b", "c"]);
+        let m = match_question(&[auto1, auto2], &q, None).unwrap();
         assert!(m.kind == MatchKind::Untrained && m.ambiguous && !m.is_foreign());
         // Two data skills: ambiguous as before, whatever the auto-skills.
         let data2 = SkillLabels::data("s2", &a);
-        let m = match_labels(&[data, auto1, data2], &["a", "b", "c"]);
+        let m = match_question(&[data, auto1, data2], &q, None).unwrap();
         assert!(m.ambiguous);
         assert!(m.reason.unwrap().contains("s1, auto-1, s2"));
     }

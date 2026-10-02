@@ -175,26 +175,46 @@ pub fn is_auto_skill_id(id: &str) -> bool {
 }
 
 /// The option ids of a choice contract in their canonical form: sorted
-/// bytewise, duplicates dropped, as a JSON array. Hashing the canonical array
-/// (as `cache::skill_scope` does) keeps the key injective: ids may hold any
-/// byte, so a joined string would not be.
+/// bytewise, duplicates dropped — the labels of an auto-skill (the cache
+/// scope hashes the same array; the auto-skill key hashes the whole contract,
+/// [`contract_sha256`]).
 pub fn contract_ids(ids: &[&str]) -> Vec<String> {
     let set: BTreeSet<&str> = ids.iter().copied().collect();
     set.into_iter().map(str::to_string).collect()
 }
 
-/// sha256 of a contract: the canonical JSON array of [`contract_ids`].
-pub fn contract_sha256(ids: &[&str]) -> String {
-    let v = Value::Array(contract_ids(ids).into_iter().map(Value::String).collect());
-    canonical::sha256_hex(&v)
+/// The canonical form of a choice contract (DESIGN A18.1):
+/// `{"type":"choice","instructions":…,"criteria":{…}}` — the instructions as
+/// sent (a string, an object, an array or `null`: the System One dialect
+/// sends none), the criteria object with its keys sorted bytewise and every
+/// description kept (`null` too). Two requests that differ only in the order
+/// of their criteria are one contract; any difference in the instructions or
+/// in a description is another contract.
+pub fn contract_value(instructions: &Value, criteria: &Map<String, Value>) -> Value {
+    let sorted: BTreeSet<&String> = criteria.keys().collect();
+    let mut c = Map::new();
+    for k in sorted {
+        c.insert(k.clone(), criteria[k].clone());
+    }
+    let mut m = Map::new();
+    m.insert("type".into(), Value::String("choice".into()));
+    m.insert("instructions".into(), instructions.clone());
+    m.insert("criteria".into(), Value::Object(c));
+    Value::Object(m)
+}
+
+/// sha256 of a choice contract: the canonical JSON (keys sorted at every
+/// level) of [`contract_value`].
+pub fn contract_sha256(instructions: &Value, criteria: &Map<String, Value>) -> String {
+    canonical::sha256_hex(&contract_value(instructions, criteria))
 }
 
 /// The id of the auto-skill of a choice contract: `auto-` + the first 12 hex
-/// characters of [`contract_sha256`]. Order-independent; a valid skill id.
-pub fn auto_skill_id(ids: &[&str]) -> String {
+/// characters of [`contract_sha256`]. A valid skill id.
+pub fn auto_skill_id(instructions: &Value, criteria: &Map<String, Value>) -> String {
     format!(
         "{AUTO_SKILL_PREFIX}{}",
-        &contract_sha256(ids)[..AUTO_SKILL_ID_HEX]
+        &contract_sha256(instructions, criteria)[..AUTO_SKILL_ID_HEX]
     )
 }
 
@@ -1250,7 +1270,10 @@ impl Gate {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rubric {
-    pub instructions: String,
+    /// A string for a skill built from a question file; an auto-skill keeps
+    /// the first request's instructions verbatim (any JSON value, `null` when
+    /// the request sent none), so its contract sha is reproduced from here.
+    pub instructions: Value,
     pub criteria: Map<String, Value>,
     /// Key order of the question file when it is not the sorted order (canonical
     /// JSON sorts keys; the oracle's schema enum follows this order).
@@ -1260,7 +1283,7 @@ pub struct Rubric {
 
 impl Rubric {
     /// A rubric from criteria in their file order.
-    pub fn new(instructions: impl Into<String>, criteria: Map<String, Value>) -> Self {
+    pub fn new(instructions: impl Into<Value>, criteria: Map<String, Value>) -> Self {
         let keys: Vec<String> = criteria.keys().cloned().collect();
         let sorted = keys.windows(2).all(|w| w[0] < w[1]);
         Self {
@@ -1268,6 +1291,18 @@ impl Rubric {
             criteria,
             criteria_order: if sorted { Vec::new() } else { keys },
         }
+    }
+
+    /// The contract sha of the rubric as a choice contract
+    /// ([`contract_sha256`]): instructions and criteria verbatim, the key
+    /// order ignored.
+    pub fn contract_sha256(&self) -> String {
+        contract_sha256(&self.instructions, &self.criteria)
+    }
+
+    /// The auto-skill id of the rubric's contract ([`auto_skill_id`]).
+    pub fn auto_skill_id(&self) -> String {
+        auto_skill_id(&self.instructions, &self.criteria)
     }
 
     /// Criteria keys in the question file's order.
@@ -1402,15 +1437,18 @@ impl SkillManifest {
         is_auto_skill_id(&self.id) && self.data.train.n == 0
     }
 
-    /// The manifest of a new auto-skill before any fit: every contract id a
-    /// quarantined cold-start task (no topology, `k 0`) in the contract's
-    /// sorted order, the placeholder gate, an empty data record whose sha256 is
-    /// the contract's ([`contract_sha256`]) and the `learned` calibration source.
-    /// `representation_id` and the rows records are filled by the writer
+    /// The manifest of a new auto-skill before any fit: the contract is its
+    /// rubric (DESIGN A18: instructions + criteria, the first request's
+    /// verbatim), every criteria key a quarantined cold-start task (no
+    /// topology, `k 0`) in sorted order, the placeholder gate, an empty data
+    /// record whose sha256 is the contract's ([`Rubric::contract_sha256`])
+    /// and the `learned` calibration source. `representation_id` and the rows
+    /// records are filled by the writer
     /// ([`crate::container::OverlayBuilder::add_skill`]). The learner then
     /// replaces the tasks it fits and the gate it certifies.
-    pub fn auto_skeleton(ids: &[&str], rubric: Option<Rubric>, k_max: u64) -> Self {
-        let labels = contract_ids(ids);
+    pub fn auto_skeleton(rubric: &Rubric, k_max: u64) -> Self {
+        let ids: Vec<&str> = rubric.criteria.keys().map(String::as_str).collect();
+        let labels = contract_ids(&ids);
         let tasks = labels
             .iter()
             .enumerate()
@@ -1427,17 +1465,17 @@ impl SkillManifest {
                 basis_sha256: None,
             })
             .collect();
-        let sha = contract_sha256(ids);
+        let sha = rubric.contract_sha256();
         Self {
             schema: SKILL_SCHEMA.into(),
-            id: auto_skill_id(ids),
+            id: rubric.auto_skill_id(),
             taxonomy_version: 1,
             representation_id: String::new(),
             recipe: Recipe::standard(k_max),
             labels,
             tasks,
             gate: Gate::placeholder(),
-            rubric,
+            rubric: Some(rubric.clone()),
             data: DataRecord {
                 train: TrainRecord {
                     n: 0,
@@ -1579,10 +1617,11 @@ impl SkillManifest {
         }
         self.gate.validate()?;
         if let Some(r) = &self.rubric {
-            ensure!(
-                r.instructions.len() <= 1 << 20,
-                "rubric instructions too long"
-            );
+            let instructions_len = match &r.instructions {
+                Value::String(s) => s.len(),
+                other => canonical::to_string(other).len(),
+            };
+            ensure!(instructions_len <= 1 << 20, "rubric instructions too long");
             for k in r.criteria.keys() {
                 ensure!(
                     seen.contains(k.as_str()),
@@ -1630,6 +1669,22 @@ impl SkillManifest {
             ensure!(
                 self.rows.n_learned == 0,
                 "an auto-skill keeps every row in rows.learned (its build blob is empty)"
+            );
+            // The contract is the rubric (DESIGN A18): every label described,
+            // the id and the data sha256 reproduced from it.
+            let r = self.rubric.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("an auto-skill carries its contract as its rubric")
+            })?;
+            ensure!(
+                r.criteria.len() == self.labels.len(),
+                "an auto-skill's rubric describes every label of its contract"
+            );
+            let sha = r.contract_sha256();
+            ensure!(
+                self.id == r.auto_skill_id()
+                    && d.train.sha256 == sha
+                    && d.calibration.sha256 == sha,
+                "an auto-skill's id and data sha256 are the hash of its contract (rubric)"
             );
         } else {
             ensure!(
@@ -1781,18 +1836,72 @@ mod tests {
 
     const RID: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
-    /// The contract key hashes the canonical array of the sorted ids: the
-    /// request order does not matter and ids with any bytes stay apart (a
-    /// joined string would merge `{"a\nb","c"}` and `{"a","b\nc"}`).
+    fn criteria(pairs: &[(&str, Value)]) -> Map<String, Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    /// The contract key hashes the canonical `{type, instructions, criteria}`
+    /// (DESIGN A18.1): the criteria order does not matter; the instructions,
+    /// every description (`null` included) and the id set do.
     #[test]
-    fn auto_skill_id_is_order_free_and_injective() {
-        let a = auto_skill_id(&["travel", "food", "cruise"]);
-        let b = auto_skill_id(&["cruise", "travel", "food", "food"]);
-        assert_eq!(a, b);
+    fn auto_skill_id_is_the_contract_not_the_id_set() {
+        let d = |l: &str| Value::String(format!("about {l}"));
+        let abc = criteria(&[
+            ("travel", d("travel")),
+            ("food", d("food")),
+            ("cruise", d("cruise")),
+        ]);
+        let cba = criteria(&[
+            ("cruise", d("cruise")),
+            ("food", d("food")),
+            ("travel", d("travel")),
+        ]);
+        let which = Value::String("Which topic?".into());
+        let a = auto_skill_id(&which, &abc);
+        assert_eq!(a, auto_skill_id(&which, &cba));
         assert!(valid_skill_id(&a) && is_auto_skill_id(&a));
         assert_eq!(a.len(), AUTO_SKILL_PREFIX.len() + AUTO_SKILL_ID_HEX);
-        assert_ne!(a, auto_skill_id(&["travel", "food", "cruise", "x"]));
-        assert_ne!(auto_skill_id(&["a\nb", "c"]), auto_skill_id(&["a", "b\nc"]));
+        assert_eq!(
+            contract_sha256(&which, &abc),
+            canonical::sha256_hex(&serde_json::json!({
+                "type": "choice",
+                "instructions": "Which topic?",
+                "criteria": {"cruise": "about cruise", "food": "about food", "travel": "about travel"},
+            }))
+        );
+        // Other instructions, a changed description, a dropped or an added id,
+        // a null description: each another contract.
+        assert_ne!(
+            a,
+            auto_skill_id(&Value::String("Is it urgent?".into()), &abc)
+        );
+        let mut changed = abc.clone();
+        changed.insert("food".into(), Value::String("meals".into()));
+        assert_ne!(a, auto_skill_id(&which, &changed));
+        let mut null = abc.clone();
+        null.insert("food".into(), Value::Null);
+        assert_ne!(a, auto_skill_id(&which, &null));
+        let mut fewer = abc.clone();
+        fewer.remove("cruise");
+        assert_ne!(a, auto_skill_id(&which, &fewer));
+        let mut more = abc.clone();
+        more.insert("x".into(), Value::Null);
+        assert_ne!(a, auto_skill_id(&which, &more));
+        // Null and absent instructions (the System One dialect) are one
+        // contract; the string "null" is another.
+        assert_eq!(
+            auto_skill_id(&Value::Null, &abc),
+            Rubric::new(Value::Null, abc.clone()).auto_skill_id()
+        );
+        assert_ne!(
+            auto_skill_id(&Value::Null, &abc),
+            auto_skill_id(&Value::String("null".into()), &abc)
+        );
+        // The rubric reproduces the id whatever its key order.
+        assert_eq!(Rubric::new(which.clone(), cba).auto_skill_id(), a);
         assert_eq!(contract_ids(&["b", "a", "b"]), ["a", "b"]);
     }
 
@@ -1800,11 +1909,7 @@ mod tests {
         let mut criteria = Map::new();
         criteria.insert("food".into(), Value::Null);
         criteria.insert("cruise".into(), Value::String("a cruise".into()));
-        let mut m = SkillManifest::auto_skeleton(
-            &["food", "cruise"],
-            Some(Rubric::new("Pick.", criteria)),
-            8,
-        );
+        let mut m = SkillManifest::auto_skeleton(&Rubric::new("Pick.", criteria), 8);
         m.representation_id = RID.into();
         m.rows = RowsRecord {
             tensor: rows_tensor(&m.id),
@@ -1828,7 +1933,11 @@ mod tests {
             t.state == TaskState::Quarantined && t.origin == TaskOrigin::ColdStart && t.k == 0
         }));
         assert_eq!(m.data.calibration.source, CALIBRATION_LEARNED);
-        assert_eq!(m.data.train.sha256, contract_sha256(&["cruise", "food"]));
+        let r = m.rubric.as_ref().unwrap();
+        assert_eq!(m.data.train.sha256, r.contract_sha256());
+        assert_eq!(m.data.calibration.sha256, r.contract_sha256());
+        assert_eq!(m.id, r.auto_skill_id());
+        assert_eq!(r.order(), ["food", "cruise"], "the request's order is kept");
         m.validate(RID, 4104).unwrap();
         assert!(Gate::placeholder().validate().is_ok());
 
@@ -1868,5 +1977,30 @@ mod tests {
             "learned-rows rule",
         );
         refused(&|m| m.rows.n_learned = 1, "rows.learned");
+        // The contract is the rubric (A18): a changed description, other
+        // instructions or a missing criterion no longer hash to the id.
+        refused(&|m| m.rubric = None, "contract as its rubric");
+        refused(
+            &|m| {
+                let r = m.rubric.as_mut().unwrap();
+                r.criteria.remove("food");
+                r.criteria_order.clear();
+            },
+            "describes every label",
+        );
+        refused(
+            &|m| {
+                m.rubric
+                    .as_mut()
+                    .unwrap()
+                    .criteria
+                    .insert("food".into(), Value::String("meals".into()));
+            },
+            "hash of its contract",
+        );
+        refused(
+            &|m| m.rubric.as_mut().unwrap().instructions = Value::Null,
+            "hash of its contract",
+        );
     }
 }
