@@ -2806,6 +2806,7 @@ fn skill_summary(m: &SkillManifest) -> Value {
         .map(|e| e.lb);
     json!({
         "id": m.id,
+        "auto": m.is_auto(),
         "taxonomy_version": m.taxonomy_version,
         "labels": m.labels.len(),
         "tasks": {
@@ -2895,8 +2896,9 @@ fn info(path: &Path, as_json: bool) -> Result<()> {
         let v = skill_summary(&s.manifest);
         let m = &s.manifest;
         println!(
-            "    {}: {} labels ({} active, {} inactive, {} quarantined), K {}, rows train {} / calibration {} / learned {}",
+            "    {}{}: {} labels ({} active, {} inactive, {} quarantined), K {}, rows train {} / calibration {} / learned {}",
             m.id,
+            if m.is_auto() { " (auto)" } else { "" },
             v["labels"],
             v["tasks"]["active"],
             v["tasks"]["inactive"],

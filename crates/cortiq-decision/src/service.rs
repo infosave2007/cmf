@@ -202,6 +202,9 @@ impl LoadedModel {
         );
         let mut skills = Vec::with_capacity(model.skills().len());
         for s in model.skills() {
+            // A skill with no active task (an auto-skill whose labels are all
+            // quarantined) gets an empty scorer: listed by `/v1/skills`, no
+            // active labels for the matcher (`relate` skips it).
             skills.push(SkillRuntime {
                 scorer: SkillScorer::from_model(&model, s.id())
                     .with_context(|| format!("skill '{}'", s.id()))?,

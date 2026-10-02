@@ -35,6 +35,18 @@
 //! names and `decision.skill.{id}.rows.learned`. Loading = base + overlay, overlay
 //! tensors first. The base's rows blob and encoder are never replaced.
 //!
+//! **Overlay-born skills** (0.8.6): a generation may also carry a skill the base
+//! does not have, but only an auto-skill ([`SkillManifest::is_auto`]: a choice
+//! contract learned from oracle answers, no build rows). Such a skill lives
+//! entirely in the overlay — its manifest (in the overlay manifest), its empty
+//! `rows` blob, its `rows.learned` and every active task's tensors — under the
+//! same allowlist and sha256 checks as a replaced skill; it is appended after
+//! the base's skills ([`DecisionModel::overlay_born`]). Rolling back to a
+//! generation without it drops it. An older binary refuses such a generation
+//! with "is not in the base file" (generations are local state, never
+//! shipped). [`materialize`] writes it into the base of the new file as an
+//! ordinary skill, which reads with cortiq ≥ 0.8.6.
+//!
 //! Deviation from the §2.2 table (declared): a full (base) file may also hold
 //! `decision.skill.{id}.rows.learned` — [`materialize`] of a generation copies
 //! every skill manifest byte for byte (the build rows blob and its record
@@ -731,6 +743,7 @@ impl DecisionModel {
         let dims = (self.encoder_dim(), self.hashing_dim());
         for m in self.base_skill_manifests()? {
             let m: &SkillManifest = &m;
+            // (An overlay-born skill has no base manifest; `verify_full` checks it.)
             for (name, x) in skill_tensor_expectations(m, self.signal_dim()) {
                 let bytes = c
                     .tensor_bytes(&name)
@@ -767,30 +780,39 @@ impl DecisionModel {
 
     /// The skill manifests of the base file itself, in skill order: a skill an
     /// overlay replaced is read again from the base (its sha256 checked against
-    /// the base's `decision.manifest`).
+    /// the base's `decision.manifest`); a skill born in the overlay has none.
     fn base_skill_manifests(&self) -> Result<Vec<Cow<'_, SkillManifest>>, Refusal> {
         let rid = &self.manifest.representation_id;
         self.skills
             .iter()
-            .map(|s| {
+            .filter_map(|s| {
                 if !s.from_overlay {
-                    return Ok(Cow::Borrowed(&s.manifest));
+                    return Some(Ok(Cow::Borrowed(&s.manifest)));
                 }
                 let id = s.id();
-                let sref = self
-                    .manifest
-                    .skills
-                    .iter()
-                    .find(|r| r.id == id)
-                    .ok_or_else(|| {
-                        Refusal::Overlay(format!("skill '{id}' is not in the base file"))
-                    })?;
+                let sref = self.base_ref(id)?;
                 let name = skill_manifest_tensor(id);
-                let bytes = manifest_bytes(&self.base, &name)?;
-                check_sha(&name, bytes, &sref.manifest_sha256)?;
-                parse_skill(bytes, id, rid, self.signal_dim()).map(Cow::Owned)
+                Some(
+                    manifest_bytes(&self.base, &name)
+                        .and_then(|bytes| {
+                            check_sha(&name, bytes, &sref.manifest_sha256).map(|()| bytes)
+                        })
+                        .and_then(|bytes| parse_skill(bytes, id, rid, self.signal_dim()))
+                        .map(Cow::Owned),
+                )
             })
             .collect()
+    }
+
+    /// The base file's entry of a skill, `None` for a skill born in the overlay.
+    fn base_ref(&self, id: &str) -> Option<&SkillRef> {
+        self.manifest.skills.iter().find(|r| r.id == id)
+    }
+
+    /// Is `id` a skill the overlay introduced (an auto-skill the base does not
+    /// have)? Every tensor of such a skill lives in the overlay.
+    pub fn overlay_born(&self, id: &str) -> bool {
+        self.skill(id).is_some_and(|s| s.from_overlay) && self.base_ref(id).is_none()
     }
 
     /// The topology of a task has the shapes of its record and finite values (its
@@ -879,15 +901,36 @@ impl DecisionModel {
                 sha256: None,
             },
         );
-        let mut replaced: Vec<(usize, LoadedSkill)> = Vec::new();
+        // `None`: a skill the overlay introduces (appended after the base's).
+        let mut replaced: Vec<(Option<usize>, LoadedSkill)> = Vec::new();
         for (id, v) in &om.skills {
-            let Some(&idx) = self.by_id.get(id) else {
-                return Err(Refusal::Overlay(format!(
-                    "skill '{id}' is not in the base file"
-                )));
-            };
             let bytes = canonical::to_vec(v);
             let m = parse_skill(&bytes, id, &rid, signal_dim)?;
+            let Some(&idx) = self.by_id.get(id) else {
+                // Overlay-born: only an auto-skill, and everything it names
+                // must be in the overlay (there is no base to fall back on).
+                if !m.is_auto() {
+                    return Err(Refusal::Overlay(format!(
+                        "skill '{id}' is not in the base file"
+                    )));
+                }
+                for (name, x) in skill_tensor_expectations(&m, signal_dim) {
+                    if o.tensor(&name).is_none() {
+                        return Err(Refusal::MissingTensor(name));
+                    }
+                    allowed.insert(name, x);
+                }
+                replaced.push((
+                    None,
+                    LoadedSkill {
+                        manifest: m,
+                        sha256: sha256_hex(&bytes),
+                        bytes,
+                        from_overlay: true,
+                    },
+                ));
+                continue;
+            };
             let base = &self.skills[idx].manifest;
             let ov_err = |reason: String| Refusal::Overlay(format!("skill '{id}': {reason}"));
             if m.rows != base.rows {
@@ -914,7 +957,7 @@ impl DecisionModel {
                 }
             }
             replaced.push((
-                idx,
+                Some(idx),
                 LoadedSkill {
                     manifest: m,
                     sha256: sha256_hex(&bytes),
@@ -943,9 +986,16 @@ impl DecisionModel {
                 }
             }
             let dims = (self.encoder_dim(), self.hashing_dim());
-            for (_, s) in &replaced {
+            for (idx, s) in &replaced {
                 for t in &s.manifest.tasks {
                     self.check_task_values(&s.manifest, t, &self.base, Some(&o))?;
+                }
+                if idx.is_none() {
+                    // The (empty) build blob of an overlay-born skill.
+                    let bytes = o
+                        .tensor_bytes(&s.manifest.rows.tensor)
+                        .map_err(|_| Refusal::MissingTensor(s.manifest.rows.tensor.clone()))?;
+                    check_rows_blob(&s.manifest, bytes, dims.0, dims.1, None)?;
                 }
                 if let Some(r) = &s.manifest.rows_learned {
                     let bytes = match o.tensor(&r.tensor) {
@@ -960,7 +1010,13 @@ impl DecisionModel {
             }
         }
         for (idx, s) in replaced {
-            self.skills[idx] = s;
+            match idx {
+                Some(i) => self.skills[i] = s,
+                None => {
+                    self.by_id.insert(s.manifest.id.clone(), self.skills.len());
+                    self.skills.push(s);
+                }
+            }
         }
         self.overlay_sha = Some(sha256_hex(obytes));
         self.overlay_manifest = Some(om);
@@ -1154,10 +1210,16 @@ impl DecisionModel {
         }))
     }
 
-    /// The build rows of a skill (decoded and checked).
+    /// The build rows of a skill (decoded and checked): the base's blob, which a
+    /// generation never replaces; for an overlay-born skill the (empty) blob the
+    /// overlay carries.
     pub fn rows(&self, skill: &str) -> Result<Rows> {
         let s = self.skill_or_err(skill)?;
-        let bytes = self.base.tensor_bytes(&rows_tensor(skill))?;
+        let bytes = if self.overlay_born(skill) {
+            self.tensor_bytes(&rows_tensor(skill))?
+        } else {
+            self.base.tensor_bytes(&rows_tensor(skill))?
+        };
         Ok(check_rows_blob(
             &s.manifest,
             bytes,
@@ -1206,6 +1268,12 @@ impl DecisionModel {
                 }
                 for t in &s.manifest.tasks {
                     self.check_task_values(&s.manifest, t, &self.base, Some(o))?;
+                }
+                if self.overlay_born(s.id()) {
+                    let bytes = self
+                        .tensor_bytes(&s.manifest.rows.tensor)
+                        .map_err(|_| Refusal::MissingTensor(s.manifest.rows.tensor.clone()))?;
+                    check_rows_blob(&s.manifest, bytes, dims.0, dims.1, None)?;
                 }
                 if let Some(r) = &s.manifest.rows_learned {
                     let bytes = self
@@ -1455,6 +1523,70 @@ fn learned_rows_record(
     })
 }
 
+/// Seal a [`NewSkill`] for a writer: `representation_id`, the task tensors and
+/// their sha256, the `rows` record from the decoded blob, the `rows_learned`
+/// record, then [`SkillManifest::validate`]. Returns the manifest and the
+/// tensors to write (shared by [`FileBuilder::add_skill`] and
+/// [`OverlayBuilder::add_skill`]).
+fn seal_new_skill<'a>(
+    skill: NewSkill,
+    representation_id: &str,
+    signal_dim: usize,
+    dims: (usize, usize),
+) -> Result<(SkillManifest, Vec<OutTensor<'a>>)> {
+    let NewSkill {
+        mut manifest,
+        topologies,
+        rows: rows_blob,
+        rows_learned,
+    } = skill;
+    let id = manifest.id.clone();
+    ensure!(
+        topologies.len() == manifest.tasks.len(),
+        "skill '{id}': {} topologies for {} tasks",
+        topologies.len(),
+        manifest.tasks.len()
+    );
+    manifest.representation_id = representation_id.to_string();
+    let mut tensors = Vec::new();
+    for (t, topo) in manifest.tasks.iter_mut().zip(&topologies) {
+        tensors.extend(task_tensors(&id, t, topo.as_ref(), signal_dim)?);
+    }
+    let r = Rows::decode(&rows_blob).map_err(|e| anyhow::anyhow!("skill '{id}' rows: {e}"))?;
+    ensure!(
+        (r.dim_p, r.dim_h) == dims,
+        "skill '{id}' rows: dims ({}, {}) differ from the signal {dims:?}",
+        r.dim_p,
+        r.dim_h
+    );
+    ensure!(
+        r.rows
+            .iter()
+            .all(|x| (x.task as usize) < manifest.tasks.len()),
+        "skill '{id}' rows: task index out of range"
+    );
+    manifest.rows = RowsRecord {
+        tensor: rows_tensor(&id),
+        layout: rows::LAYOUT.into(),
+        n_train: r.count(Split::Train) as u64,
+        n_calibration: r.count(Split::Calibration) as u64,
+        n_learned: r.count(Split::Learned) as u64,
+        sha256: sha256_hex(&rows_blob),
+    };
+    drop(r);
+    tensors.push(OutTensor::u8(rows_tensor(&id), rows_blob));
+    manifest.rows_learned = match rows_learned {
+        Some(bytes) => {
+            let rec = learned_rows_record(&id, &bytes, dims, manifest.tasks.len())?;
+            tensors.push(OutTensor::u8(rows_learned_tensor(&id), bytes));
+            Some(rec)
+        }
+        None => None,
+    };
+    manifest.validate(representation_id, signal_dim)?;
+    Ok((manifest, tensors))
+}
+
 impl<'a> FileBuilder<'a> {
     /// A new encoder-only file (`cortiq decision init`). `tensors` must be exactly
     /// the encoder layout of `encoder.config` (F32 weights, the `[8, dim]` golden
@@ -1642,63 +1774,23 @@ impl<'a> FileBuilder<'a> {
     }
 
     /// Add a new skill (refused when the id exists); returns the sealed manifest.
+    /// The `auto-` prefix is reserved: a user skill never gets it; an auto-skill
+    /// (no build rows, [`SkillManifest::is_auto`]) is accepted, which is how
+    /// [`materialize`] and the offline learner carry one into a full file.
     pub fn add_skill(&mut self, skill: NewSkill) -> Result<&SkillManifest> {
-        let NewSkill {
-            mut manifest,
-            topologies,
-            rows: rows_blob,
-            rows_learned,
-        } = skill;
-        let id = manifest.id.clone();
+        let id = skill.manifest.id.clone();
         ensure!(manifest::valid_skill_id(&id), "invalid skill id '{id}'");
         ensure!(
             !self.skills.iter().any(|s| s.manifest.id == id),
             "skill '{id}' already exists in this file"
         );
         ensure!(
-            topologies.len() == manifest.tasks.len(),
-            "skill '{id}': {} topologies for {} tasks",
-            topologies.len(),
-            manifest.tasks.len()
+            !manifest::is_auto_skill_id(&id) || skill.manifest.is_auto(),
+            "skill '{id}': the '{}' prefix is reserved for auto-skills (no build rows)",
+            manifest::AUTO_SKILL_PREFIX
         );
-        manifest.representation_id = self.representation_id.clone();
-        let mut tensors = Vec::new();
-        for (t, topo) in manifest.tasks.iter_mut().zip(&topologies) {
-            tensors.extend(task_tensors(&id, t, topo.as_ref(), self.signal_dim)?);
-        }
-        let r = Rows::decode(&rows_blob).map_err(|e| anyhow::anyhow!("skill '{id}' rows: {e}"))?;
-        ensure!(
-            (r.dim_p, r.dim_h) == self.dims,
-            "skill '{id}' rows: dims ({}, {}) differ from the signal {:?}",
-            r.dim_p,
-            r.dim_h,
-            self.dims
-        );
-        ensure!(
-            r.rows
-                .iter()
-                .all(|x| (x.task as usize) < manifest.tasks.len()),
-            "skill '{id}' rows: task index out of range"
-        );
-        manifest.rows = RowsRecord {
-            tensor: rows_tensor(&id),
-            layout: rows::LAYOUT.into(),
-            n_train: r.count(Split::Train) as u64,
-            n_calibration: r.count(Split::Calibration) as u64,
-            n_learned: r.count(Split::Learned) as u64,
-            sha256: sha256_hex(&rows_blob),
-        };
-        drop(r);
-        tensors.push(OutTensor::u8(rows_tensor(&id), rows_blob));
-        manifest.rows_learned = match rows_learned {
-            Some(bytes) => {
-                let rec = learned_rows_record(&id, &bytes, self.dims, manifest.tasks.len())?;
-                tensors.push(OutTensor::u8(rows_learned_tensor(&id), bytes));
-                Some(rec)
-            }
-            None => None,
-        };
-        manifest.validate(&self.representation_id, self.signal_dim)?;
+        let (manifest, tensors) =
+            seal_new_skill(skill, &self.representation_id, self.signal_dim, self.dims)?;
         let bytes = canonical::vec_of(&manifest)?;
         let sha256 = sha256_hex(&bytes);
         self.skills.push(SkillOut {
@@ -1939,6 +2031,12 @@ impl<'a> OverlayBuilder<'a> {
                 }
             }
         }
+        // The build blob of an overlay-born skill lives in the overlay too.
+        if let Some(o) = &model.overlay
+            && let Some(e) = o.tensor(&manifest.rows.tensor)
+        {
+            tensors.push(OutTensor::borrowed(o, e));
+        }
         match learned {
             LearnedRows::Keep => {
                 manifest.rows_learned = current.manifest.rows_learned.clone();
@@ -1960,6 +2058,40 @@ impl<'a> OverlayBuilder<'a> {
             }
         }
         manifest.validate(model.representation_id(), dim)?;
+        let value = serde_json::to_value(&manifest)?;
+        self.skills.insert(id, OverlaySkillOut { value, tensors });
+        Ok(manifest)
+    }
+
+    /// Add a skill the base file does not have (mirrors
+    /// [`FileBuilder::add_skill`]): only an auto-skill ([`SkillManifest::is_auto`])
+    /// can be born in a generation, and the generation then carries all of it —
+    /// manifest, every task tensor, its (empty) `rows` blob and `rows.learned`.
+    /// A skill the model serves is changed with [`Self::set_skill`] instead.
+    /// Returns the sealed manifest.
+    pub fn add_skill(&mut self, skill: NewSkill) -> Result<SkillManifest> {
+        let model = self.model;
+        let id = skill.manifest.id.clone();
+        ensure!(manifest::valid_skill_id(&id), "invalid skill id '{id}'");
+        ensure!(
+            skill.manifest.is_auto(),
+            "skill '{id}': only an auto-skill ('{}…', no build rows) can be born in a generation",
+            manifest::AUTO_SKILL_PREFIX
+        );
+        ensure!(
+            model.skill(&id).is_none(),
+            "skill '{id}' is in the model; change it with set_skill"
+        );
+        ensure!(
+            !self.skills.contains_key(&id),
+            "skill '{id}' was already added to this generation"
+        );
+        let (manifest, tensors) = seal_new_skill(
+            skill,
+            model.representation_id(),
+            model.signal_dim(),
+            (model.encoder_dim(), model.hashing_dim()),
+        )?;
         let value = serde_json::to_value(&manifest)?;
         self.skills.insert(id, OverlaySkillOut { value, tensors });
         Ok(manifest)

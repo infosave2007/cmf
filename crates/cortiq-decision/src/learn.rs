@@ -564,7 +564,10 @@ impl SkillBook {
 }
 
 /// Differences in the task tensors of every skill between two models, except
-/// task `changed` of skill `skill` (a cold start adds exactly that task).
+/// task `changed` of skill `skill` (a cold start adds exactly that task). When
+/// `skill` is an auto-skill the exemption is the whole skill (an attempt refits
+/// every eligible label at once, DESIGN D6), and it is the only skill allowed
+/// to appear in `after` without being in `before` (born in this generation).
 pub fn isolation_violations(
     before: &DecisionModel,
     after: &DecisionModel,
@@ -577,8 +580,9 @@ pub fn isolation_violations(
             v.push(format!("skill '{}' disappeared", s.id()));
             continue;
         };
+        let whole = s.id() == skill && a.manifest.is_auto();
         for t in &s.manifest.tasks {
-            if s.id() == skill && t.i as usize == changed {
+            if s.id() == skill && (whole || t.i as usize == changed) {
                 continue;
             }
             match a.manifest.tasks.get(t.i as usize) {
@@ -595,9 +599,18 @@ pub fn isolation_violations(
             .tasks
             .len()
             .saturating_sub(s.manifest.tasks.len());
-        let allowed = usize::from(s.id() == skill && changed >= s.manifest.tasks.len());
+        let allowed = if whole {
+            usize::MAX
+        } else {
+            usize::from(s.id() == skill && changed >= s.manifest.tasks.len())
+        };
         if extra > allowed {
             v.push(format!("skill '{}' gained {extra} tasks", s.id()));
+        }
+    }
+    for a in after.skills() {
+        if before.skill(a.id()).is_none() && !(a.id() == skill && a.manifest.is_auto()) {
+            v.push(format!("skill '{}' appeared", a.id()));
         }
     }
     v
@@ -1069,6 +1082,14 @@ pub fn learn_offline(
         .expect("selected skills exist")
         .manifest
         .clone();
+    // An auto-skill has no calibration rows for the holdout and gate of this
+    // pass, and its rows must stay in `rows.learned` (DESIGN D4); it learns
+    // online only.
+    ensure!(
+        !manifest_in.is_auto(),
+        "skill {} is an auto-skill (learned online by the server); offline learning does not apply",
+        crate::config::quote_unless_key(&skill)
+    );
     let question = rubric_question(&manifest_in)?;
 
     let traffic_bytes =
@@ -1337,7 +1358,8 @@ pub fn learn_offline(
                     None
                 });
             }
-            let rows = model.base().tensor_bytes(&m.rows.tensor)?.to_vec();
+            // Overlay-first: an auto-skill's (empty) blob is not in the base.
+            let rows = model.tensor_bytes(&m.rows.tensor)?.to_vec();
             let rows_learned = match &m.rows_learned {
                 Some(r) => Some(model.tensor_bytes(&r.tensor)?.to_vec()),
                 None => None,

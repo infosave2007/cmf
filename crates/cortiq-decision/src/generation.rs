@@ -262,7 +262,11 @@ pub struct GenerationInfo {
     pub parent: u64,
     pub created_unix: u64,
     pub events: Vec<manifest::OverlayEvent>,
+    /// Every skill the overlay carries (replaced or born in a generation).
     pub skills: Vec<String>,
+    /// The auto-skills among them: skills the generation carries entirely,
+    /// which the base file does not have (0.8.6).
+    pub auto_skills: Vec<String>,
     /// `CURRENT` names it.
     pub current: bool,
 }
@@ -277,6 +281,7 @@ impl GenerationInfo {
             "parent": self.parent,
             "created_unix": self.created_unix,
             "skills": self.skills,
+            "auto_skills": self.auto_skills,
             "events": self.events,
             "current": self.current,
         })
@@ -289,6 +294,18 @@ pub fn list(state: &StateDir) -> Result<Vec<GenerationInfo>> {
     let mut out = Vec::new();
     for (g, path) in state.generations()? {
         let om = overlay_manifest_of(&path)?;
+        // Without the base at hand "auto" is read off the manifest (the loader
+        // refuses an overlay-born skill that is not an auto-skill, so the two
+        // agree for a generation that loads).
+        let auto_skills = om
+            .skills
+            .iter()
+            .filter(|(_, v)| {
+                manifest::from_value::<manifest::SkillManifest>("skill manifest", v)
+                    .is_ok_and(|m| m.is_auto())
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
         out.push(GenerationInfo {
             generation: g,
             sha256: file_sha256(&path)?,
@@ -297,6 +314,7 @@ pub fn list(state: &StateDir) -> Result<Vec<GenerationInfo>> {
             created_unix: om.created_unix,
             events: om.events.clone(),
             skills: om.skills.keys().cloned().collect(),
+            auto_skills,
             current: current == Some(g),
             path,
         });
