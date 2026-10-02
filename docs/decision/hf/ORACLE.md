@@ -179,11 +179,30 @@ goes to the oracle on every new text and, until 0.8.5, was never learned. Since
   young auto-skill come from a handful of rows (θ is close to the largest
   novelty of the even half, T may sit at a bound), a local answer also needs
   `p_top ≥ learning.auto_tau` (0.9) under `balanced` and `quality-first`
-  (`cost-saver` keeps its θ-only rule); an abstention escalates and teaches as
-  any other. The agreement gate is the real guard while the subset is small;
-  the gate improves with every refit. Rejected examples are never forgotten:
-  a contract polluted by a noisy oracle needs more consistent examples, not a
+  (`cost-saver` keeps its θ-only rule), and the T an attempt records is
+  floored at `learning.auto_temperature_min` (0.02): a clean held-out subset
+  fits T at its lower bound, where every `p_top` is 1 and the `auto_tau`
+  floor never bites. An abstention escalates and teaches as any other. The
+  agreement gate is the real guard while the subset is small; the gate
+  improves with every refit. Rejected examples are never forgotten: a
+  contract polluted by a noisy oracle needs more consistent examples, not a
   reset (or a rollback to a generation before it).
+* **Exploration.** The hard rule — a question the gate accepted never
+  reaches the oracle — has exactly one exception, for auto-skills only and
+  only while one of their labels is quarantined: the gate names such a
+  label's texts as a neighbour with full confidence (measured on a stand: all
+  21 texts of a quarantined label answered locally as another label at
+  `p_top` 1), so without it the label could never learn. One text in
+  `learning.auto_explore_every` (4; `u64le(sha256(φ_P))` modulo it is 0, a
+  property of the text, never of the order; 0 turns it off) is escalated
+  although accepted: the oracle's answer is served (`action: oracle` /
+  `cache`, the flag `explore`, the `gate` block still reports `accepted:
+  true`) and learned as usual, so the rare label collects examples at a
+  quarter of its traffic until the next attempt activates it, after which
+  the contract explores no more. A refused or failed call leaves the local
+  answer. Exploration draws only when the answer could teach: the oracle
+  consented, learning and `auto_skills` on, a key with `learning_allowed`;
+  data skills, `cortiq decide`, shadow mode and `/v1/route` never explore.
 * **Limits.** A contract is learned only with 2..`auto_max_labels` (64) option
   ids and while fewer than `auto_max_skills` (256) contracts are registered;
   otherwise the oracle answers and nothing is recorded (`auto_skipped` in

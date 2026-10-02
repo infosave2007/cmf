@@ -374,9 +374,24 @@ as a generation and served: the same contract is then `exact` (a part of it
 *quarantined*: they count as known for the matching, get probability 0, and a
 text of such a label is expected to abstain on novelty and keep teaching it. A
 young auto-skill's gate comes from a handful of rows, so a local answer also
-needs `p_top ≥ learning.auto_tau` (0.90; `balanced` and `quality-first`);
+needs `p_top ≥ learning.auto_tau` (0.90; `balanced` and `quality-first`) and
+its temperature is floored at `learning.auto_temperature_min` (0.02 — a clean
+calibration subset fits T at its lower bound, where every `p_top` is 1);
 whatever abstains escalates and teaches, and later attempts refit the whole
-skill under a regression gate. Its rubric is the first caller's instructions
+skill under a regression gate. *Exploration* is the one exception to the hard
+rule that a gate-accepted question never reaches the oracle: while a label of
+an auto-skill is quarantined, a question the gate accepted is escalated anyway
+when the text's hash says so (`u64le(sha256(φ_P))` ≡ 0 modulo
+`learning.auto_explore_every`, 4 — one text in four; 0 turns it off), because
+the gate confidently names a quarantined label's texts as a neighbour and they
+would otherwise never teach it. The oracle's answer is served (`action:
+oracle` / `cache`, `decision_path` `escalate→…`, the flag `explore`, the
+`gate` block still `accepted: true`) and learned as usual, so the rare label
+collects examples at a quarter of its traffic until it activates; a refused
+or failed call leaves the local answer. Only auto-skills explore, only while
+a label is quarantined, and only when the answer could teach (the oracle
+consented, learning on, a key with `learning_allowed`); `cortiq decide`,
+shadow mode and `/v1/route` never do. Its rubric is the first caller's instructions
 and criteria, visible through `/v1/skills/{id}` to every key (as cached
 answers are shared across accounts). Limits, who teaches and the state
 directory's compatibility: [ORACLE.md](ORACLE.md#auto-skills). When a data
@@ -431,7 +446,7 @@ curl -s "$CORTIQ/v1/skills/banking77" -H "Authorization: Bearer $KEY" \
 | `source`, `skill`, `match`, `certified` | where the answer came from; section 3.2 |
 | `gate` | `accepted`, `p_top` and `tau`, `novelty` and `theta`, `is_novel`, `margin`, `profile` |
 | `errors` | reconstruction errors of the 5 best labels (all of them with `cmf.explain`) |
-| `flags` | e.g. `oracle_disabled`, `no_key` (with `oracle_disabled`: the key variable is not set), `bad_key` (with `oracle_disabled`: it holds something that is not a key), `consent_off`, `budget`, `stopped`, `oracle_unavailable`, `pii_redacted` |
+| `flags` | e.g. `oracle_disabled`, `no_key` (with `oracle_disabled`: the key variable is not set), `bad_key` (with `oracle_disabled`: it holds something that is not a key), `consent_off`, `budget`, `stopped`, `oracle_unavailable`, `pii_redacted`, `explore` (a gate-accepted question of an auto-skill answered by the oracle for exploration, section 3.2) |
 | `confident` | the answer can be used as is (gate accepted and not novel, or a valid oracle answer) |
 | `complexity` | `{score, tier, factors: {base, ambiguity, novelty, margin, length}}`, the cortiq-router formula |
 | `routing` | `{target, reason}` when `routing_tiers` maps the tier |
@@ -829,7 +844,8 @@ unknown key is an error. The defaults:
   "learning": {"enabled": true, "refit_min_new": 25, "dedup": 0.995, "cold_start": true, "synchronous": false,
                "auto_skills": true, "auto_min_rows": 10, "auto_k": 8, "auto_tau": 0.9,
                "auto_min_agreement": 0.8, "auto_min_coverage": 0.8, "auto_max_skills": 256,
-               "auto_max_labels": 64, "auto_max_examples_per_label": 1000},
+               "auto_max_labels": 64, "auto_max_examples_per_label": 1000,
+               "auto_temperature_min": 0.02, "auto_explore_every": 4},
   "feedback": {"pending_cap": 50000},
   "complexity_weights": {"base": 0.4, "ambiguity": 0.25, "novelty": 0.15, "margin": 0.1, "length": 0.1},
   "complexity_tiers": [{"tier": "low", "max": 0.33}, {"tier": "medium", "max": 0.66}, {"tier": "high", "max": 1.0}],
@@ -854,7 +870,11 @@ contract's examples its active labels must hold (both 0..1); `auto_max_skills`
 how many contracts are learned at most and `auto_max_labels` (2..255) how
 many options one may have — a contract past either is answered by the
 oracle and not learned; `auto_max_examples_per_label` (≤ 5000) replaces the
-per-label buffer cap for auto-skills. `cortiq serve --oracle MODEL` and its companions
+per-label buffer cap for auto-skills; `auto_temperature_min` (0..1) floors
+the gate temperature an attempt records (0: the fitted T, whose lower bound
+makes every `p_top` 1); `auto_explore_every` (an integer, 0 = off) explores
+one text in that many while a label is quarantined — the one case in which a
+gate-accepted question reaches the oracle, auto-skills only. `cortiq serve --oracle MODEL` and its companions
 override the `oracle` section (and `--no-oracle-learning` sets
 `learning.enabled` false); a file that sets `oracle.provider` keeps its
 `max_price` unless `--oracle-max-price` is given.
