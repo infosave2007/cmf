@@ -136,20 +136,24 @@ impl SkillRuntime {
     /// router input, id `id`): the rubric's instructions, and for each active
     /// label its rubric criterion in the question file's order (the label
     /// itself when the rubric has none); [`DEFAULT_ROUTE_INSTRUCTIONS`]
-    /// without a rubric.
+    /// without a rubric. An auto-skill's question is its whole contract
+    /// (every criterion, the quarantined labels included): only that
+    /// question is matched to it (DESIGN A18), and a quarantined option gets
+    /// probability 0.
     pub fn rubric_question(&self, id: &str) -> Question {
         let active = self.scorer.labels();
+        let auto = self.manifest.is_auto();
         let mut criteria = Map::new();
         let instructions = match &self.manifest.rubric {
             Some(r) => {
                 for (k, v) in r.ordered_criteria() {
-                    if active.contains(&k) {
+                    if auto || active.contains(&k) {
                         criteria.insert(k, v);
                     }
                 }
                 r.instructions.clone()
             }
-            None => DEFAULT_ROUTE_INSTRUCTIONS.to_string(),
+            None => Value::String(DEFAULT_ROUTE_INSTRUCTIONS.to_string()),
         };
         for l in active {
             if !criteria.contains_key(l) {
@@ -159,7 +163,7 @@ impl SkillRuntime {
         Question {
             id: id.to_string(),
             kind: QuestionKind::Choice,
-            instructions: Value::String(instructions),
+            instructions,
             criteria: Some(Value::Object(criteria)),
         }
     }
@@ -281,19 +285,21 @@ impl LoadedModel {
     }
 
     /// The labels of every skill as the matcher sees them: the active ones
-    /// (candidates) and, for an auto-skill, its whole contract as known.
+    /// (candidates) and, for an auto-skill, its whole contract as known and
+    /// its contract sha (`data.train.sha256`, the hash of its rubric — the
+    /// loader checks it), the only thing it is matched by (DESIGN A18).
     pub fn skill_labels(&self) -> Vec<SkillLabels<'_>> {
         self.skills
             .iter()
             .map(|s| {
                 let active = s.scorer.labels();
                 if s.manifest.is_auto() {
-                    SkillLabels {
-                        id: s.id(),
+                    SkillLabels::auto(
+                        s.id(),
                         active,
-                        known: &s.manifest.labels,
-                        auto: true,
-                    }
+                        &s.manifest.labels,
+                        &s.manifest.data.train.sha256,
+                    )
                 } else {
                     SkillLabels::data(s.id(), active)
                 }

@@ -1168,13 +1168,12 @@ fn attempt_auto(ctx: &LearnContext<'_>, skill: &str, label: &str) -> Result<Atte
             "the label is not an option of the contract",
         ));
     }
-    let ids: Vec<&str> = contract.ids.iter().map(String::as_str).collect();
     let manifest = match served {
         Some(s) => {
             ensure!(s.manifest.is_auto(), "skill '{skill}' is not an auto-skill");
             s.manifest.clone()
         }
-        None => SkillManifest::auto_skeleton(&ids, Some(contract.rubric()), cfg.auto_k),
+        None => SkillManifest::auto_skeleton(&contract.rubric(), cfg.auto_k),
     };
     // The manifest's labels are the contract's ids in sorted order; a contract
     // whose ids differ from a served skill of the same id cannot happen (the id
@@ -1669,7 +1668,7 @@ pub fn question_of_rubric(r: &Rubric) -> Question {
     Question {
         id: "task".into(),
         kind: QuestionKind::Choice,
-        instructions: Value::String(r.instructions.clone()),
+        instructions: r.instructions.clone(),
         criteria: Some(Value::Object(r.ordered_criteria())),
     }
 }

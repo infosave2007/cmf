@@ -2048,8 +2048,7 @@ fn toy_auto(seed: u64) -> (NewSkill, Rows) {
             json!(format!("The customer asks about {l}.")),
         );
     }
-    let mut m =
-        SkillManifest::auto_skeleton(&ids, Some(Rubric::new("Pick the topic.", criteria)), 8);
+    let mut m = SkillManifest::auto_skeleton(&Rubric::new("Pick the topic.", criteria), 8);
     assert_eq!(m.labels, ["cruise", "food", "travel"]);
     let mut topologies = vec![None, None, None];
     for (i, slot) in topologies.iter_mut().enumerate().skip(1) {
@@ -2090,10 +2089,14 @@ fn toy_auto(seed: u64) -> (NewSkill, Rows) {
     )
 }
 
-/// An auto-skill no label of which is fitted yet: no tensors at all.
+/// An auto-skill no label of which is fitted yet: no tensors at all. Its
+/// contract is a System One question (no instructions, no descriptions).
 fn toy_auto_quiet() -> NewSkill {
+    let mut criteria = serde_json::Map::new();
+    criteria.insert("yes".into(), Value::Null);
+    criteria.insert("no".into(), Value::Null);
     NewSkill {
-        manifest: SkillManifest::auto_skeleton(&["yes", "no"], None, 8),
+        manifest: SkillManifest::auto_skeleton(&Rubric::new(Value::Null, criteria), 8),
         topologies: vec![None, None],
         rows: Rows::empty_blob(TOY_HIDDEN, DIM_H).unwrap(),
         rows_learned: None,
