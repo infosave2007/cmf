@@ -109,6 +109,17 @@ pub const HOLDOUT_RULE: &str = "per label, calibration rows in sha256 order, ind
 /// Calibration source values.
 pub const CALIBRATION_FROM_FILE: &str = "file";
 pub const CALIBRATION_CARVE_OUT: &str = "carve-out";
+/// Calibration source of an auto-skill: its calibration subset is recomputed
+/// from the learned rows at every attempt ([`crate::certify::HALVES_RULE_AUTO`]),
+/// never stored (0.8.6).
+pub const CALIBRATION_LEARNED: &str = "learned";
+
+/// Reserved id prefix of an auto-skill: a choice contract learned from oracle
+/// answers (0.8.6). A user skill never gets this prefix
+/// ([`crate::container::FileBuilder::add_skill`], the offline builder).
+pub const AUTO_SKILL_PREFIX: &str = "auto-";
+/// Hex characters of the contract sha256 in an auto-skill id.
+pub const AUTO_SKILL_ID_HEX: usize = 12;
 
 /// Eight encoder golden texts a builder may use (the file records its own list).
 pub const DEFAULT_ENCODER_GOLDEN_TEXTS: [&str; ENCODER_GOLDEN_COUNT] = [
@@ -156,6 +167,35 @@ pub fn valid_skill_id(id: &str) -> bool {
         && b[1..]
             .iter()
             .all(|&c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_' || c == b'-')
+}
+
+/// Does `id` carry the reserved auto-skill prefix?
+pub fn is_auto_skill_id(id: &str) -> bool {
+    id.starts_with(AUTO_SKILL_PREFIX)
+}
+
+/// The option ids of a choice contract in their canonical form: sorted
+/// bytewise, duplicates dropped, as a JSON array. Hashing the canonical array
+/// (as `cache::skill_scope` does) keeps the key injective: ids may hold any
+/// byte, so a joined string would not be.
+pub fn contract_ids(ids: &[&str]) -> Vec<String> {
+    let set: BTreeSet<&str> = ids.iter().copied().collect();
+    set.into_iter().map(str::to_string).collect()
+}
+
+/// sha256 of a contract: the canonical JSON array of [`contract_ids`].
+pub fn contract_sha256(ids: &[&str]) -> String {
+    let v = Value::Array(contract_ids(ids).into_iter().map(Value::String).collect());
+    canonical::sha256_hex(&v)
+}
+
+/// The id of the auto-skill of a choice contract: `auto-` + the first 12 hex
+/// characters of [`contract_sha256`]. Order-independent; a valid skill id.
+pub fn auto_skill_id(ids: &[&str]) -> String {
+    format!(
+        "{AUTO_SKILL_PREFIX}{}",
+        &contract_sha256(ids)[..AUTO_SKILL_ID_HEX]
+    )
 }
 
 /// Is `label` a label (1..=256 bytes)?
@@ -1086,6 +1126,50 @@ impl Gate {
         }
     }
 
+    /// The gate of a skill that was never certified: `T = 1`, `θ = 1`, `τ = 0`,
+    /// no evidence (the value `build`/`learn` score with before a certification,
+    /// as a manifest record). It passes [`Gate::validate`]; an auto-skill whose
+    /// tasks are all quarantined carries it.
+    pub fn placeholder() -> Self {
+        let zero_grid = || {
+            certify::THRESHOLDS
+                .iter()
+                .map(|&t| GridEntry {
+                    t,
+                    accepted: 0,
+                    correct: 0,
+                    lb: 0.0,
+                    novelty_rejected: 0,
+                })
+                .collect()
+        };
+        Self {
+            temperature: 1.0,
+            novelty_theta: 1.0,
+            tau: 0.0,
+            certified: false,
+            rule: GateRule::standard(),
+            evidence: Evidence {
+                even: EvenEvidence {
+                    n: 0,
+                    n_t: 0,
+                    nll: 0.0,
+                    log_t: 0.0,
+                    nfev: 0,
+                    status: 0,
+                },
+                odd: OddEvidence {
+                    n: 0,
+                    accepted: 0,
+                    correct: 0,
+                    grid: zero_grid(),
+                    grid_theta_off: zero_grid(),
+                },
+                calibration: CalibrationEvidence { n: 0, correct: 0 },
+            },
+        }
+    }
+
     /// The f32 values the runtime uses.
     pub fn params(&self) -> GateParams {
         GateParams {
@@ -1310,8 +1394,79 @@ impl SkillManifest {
         self.labels.iter().position(|l| l == label)
     }
 
+    /// An auto-skill: a choice contract learned from oracle answers (0.8.6).
+    /// Derived, never stored: the reserved id prefix and no build rows
+    /// (`data.train.n == 0`; every row lives in `rows.learned`). [`Self::validate`]
+    /// refuses the prefix on a skill with build rows, so the two agree.
+    pub fn is_auto(&self) -> bool {
+        is_auto_skill_id(&self.id) && self.data.train.n == 0
+    }
+
+    /// The manifest of a new auto-skill before any fit: every contract id a
+    /// quarantined cold-start task (no topology, `k 0`) in the contract's
+    /// sorted order, the placeholder gate, an empty data record whose sha256 is
+    /// the contract's ([`contract_sha256`]) and the `learned` calibration source.
+    /// `representation_id` and the rows records are filled by the writer
+    /// ([`crate::container::OverlayBuilder::add_skill`]). The learner then
+    /// replaces the tasks it fits and the gate it certifies.
+    pub fn auto_skeleton(ids: &[&str], rubric: Option<Rubric>, k_max: u64) -> Self {
+        let labels = contract_ids(ids);
+        let tasks = labels
+            .iter()
+            .enumerate()
+            .map(|(i, label)| TaskRecord {
+                i: i as u64,
+                label: label.clone(),
+                state: TaskState::Quarantined,
+                origin: TaskOrigin::ColdStart,
+                k: 0,
+                n_train: 0,
+                err_mean: 0.0,
+                err_std: 0.0,
+                mean_sha256: None,
+                basis_sha256: None,
+            })
+            .collect();
+        let sha = contract_sha256(ids);
+        Self {
+            schema: SKILL_SCHEMA.into(),
+            id: auto_skill_id(ids),
+            taxonomy_version: 1,
+            representation_id: String::new(),
+            recipe: Recipe::standard(k_max),
+            labels,
+            tasks,
+            gate: Gate::placeholder(),
+            rubric,
+            data: DataRecord {
+                train: TrainRecord {
+                    n: 0,
+                    sha256: sha.clone(),
+                    parts: Vec::new(),
+                },
+                calibration: CalibrationRecord {
+                    n: 0,
+                    sha256: sha,
+                    source: CALIBRATION_LEARNED.into(),
+                },
+                dev: None,
+                halves_rule: certify::HALVES_RULE_AUTO.into(),
+                holdout_rule: HOLDOUT_RULE.into(),
+            },
+            rows: RowsRecord::default(),
+            rows_learned: None,
+            learned: None,
+        }
+    }
+
     /// Check the manifest on its own: schema, identities, recipe, the task table,
     /// gate, rubric, data and rows records. `signal_dim` bounds `K`.
+    ///
+    /// An auto-skill ([`Self::is_auto`]) relaxes exactly the data checks a skill
+    /// without build rows cannot meet — calibration source `learned`,
+    /// `halves_rule` [`certify::HALVES_RULE_AUTO`] — and adds its own: every task
+    /// `cold_start`, labels in the contract's sorted order, no calibration rows,
+    /// no dev file, no learned rows in the (empty) build blob.
     pub fn validate(&self, representation_id: &str, signal_dim: usize) -> Result<()> {
         ensure!(
             self.schema == SKILL_SCHEMA,
@@ -1319,6 +1474,13 @@ impl SkillManifest {
             self.schema
         );
         ensure!(valid_skill_id(&self.id), "invalid skill id '{}'", self.id);
+        // The prefix is reserved: with build rows it is a user skill in disguise
+        // and the derived `is_auto()` would disagree with the id.
+        ensure!(
+            !is_auto_skill_id(&self.id) || self.data.train.n == 0,
+            "the '{AUTO_SKILL_PREFIX}' id prefix is reserved for auto-skills (no build rows)"
+        );
+        let auto = self.is_auto();
         ensure!(self.taxonomy_version >= 1, "taxonomy_version starts at 1");
         ensure!(
             self.representation_id == representation_id,
@@ -1352,6 +1514,9 @@ impl SkillManifest {
             }
             match t.origin {
                 TaskOrigin::Data => {
+                    if auto {
+                        return Err(at("an auto-skill's tasks are all cold_start"));
+                    }
                     if cold {
                         return Err(at("data tasks precede cold-start tasks"));
                     }
@@ -1360,7 +1525,18 @@ impl SkillManifest {
                     }
                     last_data = Some(l);
                 }
-                TaskOrigin::ColdStart => cold = true,
+                TaskOrigin::ColdStart => {
+                    cold = true;
+                    // The contract's sorted order (so the data-task ordering
+                    // rules hold for an auto-skill, D4); `last_data` doubles as
+                    // the previous label here since no data task precedes.
+                    if auto {
+                        if last_data.is_some_and(|p| p.as_bytes() >= l.as_bytes()) {
+                            return Err(at("an auto-skill's labels are sorted bytewise"));
+                        }
+                        last_data = Some(l);
+                    }
+                }
             }
             if t.k > self.recipe.k_max {
                 return Err(at("k exceeds the recipe K"));
@@ -1432,19 +1608,38 @@ impl SkillManifest {
             ensure!(n == d.train.n, "data.train parts do not add up to n");
         }
         check_sha("data.calibration.sha256", &d.calibration.sha256)?;
-        ensure!(
-            d.calibration.source == CALIBRATION_FROM_FILE
-                || d.calibration.source == CALIBRATION_CARVE_OUT,
-            "calibration source must be file or carve-out"
-        );
+        if auto {
+            ensure!(
+                d.calibration.source == CALIBRATION_LEARNED,
+                "an auto-skill's calibration source is {CALIBRATION_LEARNED}"
+            );
+            ensure!(
+                d.calibration.n == 0 && d.train.parts.is_empty() && d.dev.is_none(),
+                "an auto-skill has no calibration rows, input parts or dev file"
+            );
+            ensure!(
+                d.halves_rule == certify::HALVES_RULE_AUTO,
+                "an auto-skill's halves_rule is the learned-rows rule"
+            );
+            ensure!(
+                self.rows.n_learned == 0,
+                "an auto-skill keeps every row in rows.learned (its build blob is empty)"
+            );
+        } else {
+            ensure!(
+                d.calibration.source == CALIBRATION_FROM_FILE
+                    || d.calibration.source == CALIBRATION_CARVE_OUT,
+                "calibration source must be file or carve-out"
+            );
+            ensure!(
+                d.halves_rule == certify::HALVES_RULE,
+                "unsupported halves_rule"
+            );
+        }
         if let Some(dev) = &d.dev {
             check_sha("data.dev.sha256", &dev.sha256)?;
             ensure!(dev.correct <= dev.n, "dev correct exceeds n");
         }
-        ensure!(
-            d.halves_rule == certify::HALVES_RULE,
-            "unsupported halves_rule"
-        );
         ensure!(d.holdout_rule == HOLDOUT_RULE, "unsupported holdout_rule");
         ensure!(
             self.rows.tensor == rows_tensor(&self.id),
@@ -1572,4 +1767,100 @@ pub fn parse_manifest_bytes<T: for<'de> Deserialize<'de>>(
     let v = canonical::parse_canonical(bytes).map_err(|e| anyhow::anyhow!("{what}: {e}"))?;
     let t = from_value(what, &v)?;
     Ok((t, v))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RID: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+    /// The contract key hashes the canonical array of the sorted ids: the
+    /// request order does not matter and ids with any bytes stay apart (a
+    /// joined string would merge `{"a\nb","c"}` and `{"a","b\nc"}`).
+    #[test]
+    fn auto_skill_id_is_order_free_and_injective() {
+        let a = auto_skill_id(&["travel", "food", "cruise"]);
+        let b = auto_skill_id(&["cruise", "travel", "food", "food"]);
+        assert_eq!(a, b);
+        assert!(valid_skill_id(&a) && is_auto_skill_id(&a));
+        assert_eq!(a.len(), AUTO_SKILL_PREFIX.len() + AUTO_SKILL_ID_HEX);
+        assert_ne!(a, auto_skill_id(&["travel", "food", "cruise", "x"]));
+        assert_ne!(auto_skill_id(&["a\nb", "c"]), auto_skill_id(&["a", "b\nc"]));
+        assert_eq!(contract_ids(&["b", "a", "b"]), ["a", "b"]);
+    }
+
+    fn skeleton() -> SkillManifest {
+        let mut criteria = Map::new();
+        criteria.insert("food".into(), Value::Null);
+        criteria.insert("cruise".into(), Value::String("a cruise".into()));
+        let mut m = SkillManifest::auto_skeleton(
+            &["food", "cruise"],
+            Some(Rubric::new("Pick.", criteria)),
+            8,
+        );
+        m.representation_id = RID.into();
+        m.rows = RowsRecord {
+            tensor: rows_tensor(&m.id),
+            layout: rows::LAYOUT.into(),
+            n_train: 0,
+            n_calibration: 0,
+            n_learned: 0,
+            sha256: sha256_hex(b"empty"),
+        };
+        m
+    }
+
+    /// `is_auto` is derived; the skeleton validates; the relaxations are
+    /// confined to auto-skills and the auto invariants are enforced.
+    #[test]
+    fn auto_skeleton_validates_and_the_relaxations_are_scoped() {
+        let m = skeleton();
+        assert!(m.is_auto());
+        assert_eq!(m.labels, ["cruise", "food"]);
+        assert!(m.tasks.iter().all(|t| {
+            t.state == TaskState::Quarantined && t.origin == TaskOrigin::ColdStart && t.k == 0
+        }));
+        assert_eq!(m.data.calibration.source, CALIBRATION_LEARNED);
+        assert_eq!(m.data.train.sha256, contract_sha256(&["cruise", "food"]));
+        m.validate(RID, 4104).unwrap();
+        assert!(Gate::placeholder().validate().is_ok());
+
+        let refused = |f: &dyn Fn(&mut SkillManifest), what: &str| {
+            let mut m = skeleton();
+            f(&mut m);
+            let e = m.validate(RID, 4104).unwrap_err().to_string();
+            assert!(e.contains(what), "{e}");
+        };
+        // The prefix with build rows is a user skill in disguise.
+        refused(&|m| m.data.train.n = 1, "reserved");
+        // A user skill does not get the relaxations.
+        refused(
+            &|m| {
+                m.id = "user".into();
+                m.rows.tensor = rows_tensor("user");
+            },
+            "file or carve-out",
+        );
+        refused(&|m| m.tasks[0].origin = TaskOrigin::Data, "all cold_start");
+        refused(
+            &|m| {
+                m.labels.swap(0, 1);
+                m.tasks.swap(0, 1);
+                m.tasks[0].i = 0;
+                m.tasks[1].i = 1;
+            },
+            "sorted bytewise",
+        );
+        refused(&|m| m.data.calibration.n = 1, "no calibration rows");
+        refused(
+            &|m| m.data.calibration.source = CALIBRATION_CARVE_OUT.into(),
+            "calibration source is learned",
+        );
+        refused(
+            &|m| m.data.halves_rule = certify::HALVES_RULE.into(),
+            "learned-rows rule",
+        );
+        refused(&|m| m.rows.n_learned = 1, "rows.learned");
+    }
 }
