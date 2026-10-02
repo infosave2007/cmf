@@ -546,13 +546,13 @@ impl DecisionModel {
             tensor: MANIFEST_TENSOR.into(),
             reason: e.to_string(),
         })?;
-        if let Some(s) = mvalue.get("schema").and_then(Value::as_str) {
-            if s != MANIFEST_SCHEMA {
-                return Err(Refusal::Schema {
-                    found: s.into(),
-                    expected: MANIFEST_SCHEMA.into(),
-                });
-            }
+        if let Some(s) = mvalue.get("schema").and_then(Value::as_str)
+            && s != MANIFEST_SCHEMA
+        {
+            return Err(Refusal::Schema {
+                found: s.into(),
+                expected: MANIFEST_SCHEMA.into(),
+            });
         }
         let manifest: DecisionManifest = manifest::from_value("decision.manifest", &mvalue)
             .map_err(|e| Refusal::Manifest {
@@ -829,10 +829,10 @@ impl DecisionModel {
         }
         let i = t.i as usize;
         let get = |name: String| -> Result<&[u8], Refusal> {
-            if let Some(o) = overlay {
-                if let Some(e) = o.tensor(&name) {
-                    return Ok(o.entry_bytes(e));
-                }
+            if let Some(o) = overlay
+                && let Some(e) = o.tensor(&name)
+            {
+                return Ok(o.entry_bytes(e));
             }
             c.tensor_bytes(&name)
                 .map_err(|_| Refusal::MissingTensor(name.clone()))
@@ -865,13 +865,13 @@ impl DecisionModel {
             tensor: OVERLAY_MANIFEST_TENSOR.into(),
             reason: e.to_string(),
         })?;
-        if let Some(s) = ovalue.get("schema").and_then(Value::as_str) {
-            if s != OVERLAY_SCHEMA {
-                return Err(Refusal::Schema {
-                    found: s.into(),
-                    expected: OVERLAY_SCHEMA.into(),
-                });
-            }
+        if let Some(s) = ovalue.get("schema").and_then(Value::as_str)
+            && s != OVERLAY_SCHEMA
+        {
+            return Err(Refusal::Schema {
+                found: s.into(),
+                expected: OVERLAY_SCHEMA.into(),
+            });
         }
         let om: OverlayManifest = manifest::from_value("decision.overlay.manifest", &ovalue)
             .and_then(|m: OverlayManifest| m.validate().map(|()| m))
@@ -1120,10 +1120,10 @@ impl DecisionModel {
 
     /// Bytes of a tensor, overlay first.
     pub fn tensor_bytes(&self, name: &str) -> Result<&[u8]> {
-        if let Some(o) = &self.overlay {
-            if let Some(e) = o.tensor(name) {
-                return Ok(o.entry_bytes(e));
-            }
+        if let Some(o) = &self.overlay
+            && let Some(e) = o.tensor(name)
+        {
+            return Ok(o.entry_bytes(e));
         }
         Ok(self.base.tensor_bytes(name)?)
     }
@@ -1357,10 +1357,10 @@ impl<'a> OutTensor<'a> {
 }
 
 fn find_in<'a>(model: &'a DecisionModel, name: &str) -> Result<OutTensor<'a>> {
-    if let Some(o) = &model.overlay {
-        if let Some(e) = o.tensor(name) {
-            return Ok(OutTensor::borrowed(o, e));
-        }
+    if let Some(o) = &model.overlay
+        && let Some(e) = o.tensor(name)
+    {
+        return Ok(OutTensor::borrowed(o, e));
     }
     let e = model
         .base
@@ -2040,10 +2040,10 @@ impl<'a> OverlayBuilder<'a> {
         match learned {
             LearnedRows::Keep => {
                 manifest.rows_learned = current.manifest.rows_learned.clone();
-                if let (Some(r), Some(o)) = (&manifest.rows_learned, &model.overlay) {
-                    if let Some(e) = o.tensor(&r.tensor) {
-                        tensors.push(OutTensor::borrowed(o, e));
-                    }
+                if let (Some(r), Some(o)) = (&manifest.rows_learned, &model.overlay)
+                    && let Some(e) = o.tensor(&r.tensor)
+                {
+                    tensors.push(OutTensor::borrowed(o, e));
                 }
             }
             LearnedRows::Replace(bytes) => {
