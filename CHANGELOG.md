@@ -30,7 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   subset fits T at its lower bound, where every `p_top` is 1 and the
   `auto_tau` floor never bites; the evidence keeps the fitted `log_t`), and
   *exploration*: while a label of an auto-skill is quarantined, one text in
-  `learning.auto_explore_every` (4, by a hash of φ_P; 0 = off) is escalated
+  `learning.auto_explore_every` (8, by a hash of φ_P; 0 = off) is escalated
   although the gate accepted it — the one exception to the rule that a
   gate-accepted question never reaches the oracle, auto-skills only — its
   oracle answer served (`action: oracle`/`cache`, flag `explore`) and

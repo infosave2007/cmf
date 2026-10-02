@@ -382,7 +382,7 @@ skill under a regression gate. *Exploration* is the one exception to the hard
 rule that a gate-accepted question never reaches the oracle: while a label of
 an auto-skill is quarantined, a question the gate accepted is escalated anyway
 when the text's hash says so (`u64le(sha256(φ_P))` ≡ 0 modulo
-`learning.auto_explore_every`, 4 — one text in four; 0 turns it off), because
+`learning.auto_explore_every`, 8 — one text in eight; 0 turns it off), because
 the gate confidently names a quarantined label's texts as a neighbour and they
 would otherwise never teach it. The oracle's answer is served (`action:
 oracle` / `cache`, `decision_path` `escalate→…`, the flag `explore`, the
@@ -845,7 +845,7 @@ unknown key is an error. The defaults:
                "auto_skills": true, "auto_min_rows": 10, "auto_k": 8, "auto_tau": 0.9,
                "auto_min_agreement": 0.8, "auto_min_coverage": 0.8, "auto_max_skills": 256,
                "auto_max_labels": 64, "auto_max_examples_per_label": 1000,
-               "auto_temperature_min": 0.02, "auto_explore_every": 4},
+               "auto_temperature_min": 0.02, "auto_explore_every": 8},
   "feedback": {"pending_cap": 50000},
   "complexity_weights": {"base": 0.4, "ambiguity": 0.25, "novelty": 0.15, "margin": 0.1, "length": 0.1},
   "complexity_tiers": [{"tier": "low", "max": 0.33}, {"tier": "medium", "max": 0.66}, {"tier": "high", "max": 1.0}],

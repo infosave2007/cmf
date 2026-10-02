@@ -576,6 +576,8 @@ fn stand_config(mock_url: &str) -> Config {
     c.oracle.api_key_env = KEY_ENV.to_string();
     c.oracle.deadline_s = 5.0;
     c.learning.synchronous = true;
+    // One explored text in four keeps the quarantined-label test short.
+    c.learning.auto_explore_every = 4;
     c
 }
 
