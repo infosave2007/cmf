@@ -191,13 +191,21 @@ goes to the oracle on every new text and, until 0.8.5, was never learned. Since
   generation re-carries every auto-skill's rows: with many contracts run
   `cortiq decision materialize` from time to time and serve the materialised
   file (it holds the auto-skills as ordinary skills; `decide --labels` and
-  `verify` read it; such a file needs cortiq ≥ 0.8.6).
+  `verify` read it; such a file needs cortiq ≥ 0.8.6). A served auto-skill
+  keeps learning wherever its contract comes from: the contract record of
+  `learn.log`, or — a materialised file on a fresh state directory, a
+  `learn.log` lost while the generations were kept — the skill's own labels
+  and rubric, registered (and written to `learn.log`) at start and after a
+  rollback.
 * **Routing.** `/v1/route` without `taxonomy_id` still means the file's only
   data skill; an auto-skill is routed by its id. When a data skill and
   auto-skills fit a question equally, the data skill answers; two auto-skills
   fitting equally are ambiguous (and such a contract is not learned).
 * **Admin.** `GET /v1/admin/learning` lists `auto_skills` (id, labels,
-  examples per label, what is served), `auto_contracts` and `auto_skipped`;
+  `examples` per label — the rows the next attempt fits: the served learned
+  rows of the label plus the buffer examples not among them, each row once,
+  so their sum is the attempt's `rows.total` — what is served),
+  `auto_contracts` and `auto_skipped`;
   attempts carry `kind: auto_start | auto_refit` and an `auto` block with the
   eligible and quarantined labels, the rows and the agreement. `/healthz`
   adds `auto_skills`. Rollback to an earlier generation drops the skill from

@@ -31,7 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loader, `verify`, `info`, `materialize`, generation listing (`auto_skills`)
   and `OverlayBuilder::add_skill` handle it; a materialised file with an
   auto-skill reads with cortiq ≥ 0.8.6. `cortiq decision train`/`add-skill`
-  refuse the reserved prefix.
+  refuse the reserved prefix. A served auto-skill without a contract record
+  in `learn.log` (a materialised file on a fresh state directory, a lost
+  `learn.log`) is registered from its own labels and rubric at start and
+  after a rollback, so it keeps learning.
 
 ### Changed
 - Matching: the quarantined labels of an auto-skill count as known (the
