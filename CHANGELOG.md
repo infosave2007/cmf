@@ -5,17 +5,41 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.6] - 2026-10-02
 
 ### Added
+- Auto-skills: `cortiq serve` learns an untrained choice contract (option
+  ids no skill fits) from the oracle's answers into a skill of its own,
+  `auto-<sha12 of the sorted ids>`, for callers whose key has
+  `learning_allowed`. Once two labels have enough examples and the fitted
+  skill agrees with the oracle on a held-out fifth of its rows, it is written
+  as a generation and the contract is answered locally (`match: exact`,
+  `skill: auto-…`, `certified: false`, a `p_top ≥ learning.auto_tau` floor);
+  rare labels stay quarantined and keep teaching; later attempts refit the
+  whole skill under a regression gate. `learn.log` gains a contract record;
+  `GET /v1/admin/learning` lists `auto_skills`, `auto_contracts`,
+  `auto_skipped` and attempts of kind `auto_start` / `auto_refit`;
+  `GET /v1/skills` adds `auto`, `active_labels`, `quarantined_labels`,
+  `examples`; `/healthz` adds `auto_skills`. Configuration:
+  `learning.auto_skills`, `auto_min_rows`, `auto_k`, `auto_tau`,
+  `auto_min_agreement`, `auto_min_coverage`, `auto_max_skills`,
+  `auto_max_labels`, `auto_max_examples_per_label` (API.md §3.2, §6;
+  ORACLE.md "Auto-skills").
 - Decision format: a generation overlay may carry a skill the base file does
   not have — an *auto-skill* (reserved id prefix `auto-`, no build rows,
   `data.calibration.source: "learned"`, every row in `rows.learned`). The
   loader, `verify`, `info`, `materialize`, generation listing (`auto_skills`)
   and `OverlayBuilder::add_skill` handle it; a materialised file with an
   auto-skill reads with cortiq ≥ 0.8.6. `cortiq decision train`/`add-skill`
-  refuse the reserved prefix. Groundwork for learning untrained choice
-  contracts from oracle answers (the serving side follows).
+  refuse the reserved prefix.
+
+### Changed
+- Matching: the quarantined labels of an auto-skill count as known (the
+  contract is exact over its active labels, a quarantined option gets
+  probability 0); when one data skill and auto-skills fit a question equally,
+  the data skill answers. `/v1/route` without `taxonomy_id` and `cortiq
+  decide` without `--skill` count data skills only, so a single-skill file
+  keeps its implicit taxonomy after an auto-skill is learned.
 
 ### Compatibility
 - A 0.8.5 binary refuses a generation that carries an auto-skill ("is not in

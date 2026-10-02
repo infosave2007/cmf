@@ -358,6 +358,29 @@ matter to the oracle alone). With L = the option ids of a choice question:
 | `superset` | one skill's labels plus labels it does not know | the oracle only; its answer teaches that skill only for a key with `learning_allowed` |
 | `untrained` | anything else, and every `score` / `noul` question | the oracle only; without it the request is 422 |
 
+**Auto-skills (0.8.6).** A choice contract no skill fits (`untrained` because
+of its options, not an ambiguous one and not one forced with `cmf.skill`) is
+learned from the oracle's answers when the caller's key has `learning_allowed`
+and `learning.auto_skills` is on (the default): the answers accumulate as
+examples of the skill `auto-<12 hex of the sha256 of the sorted option ids>`
+— the same set of ids in any order is one contract — and once enough evidence
+is there (2 labels with ≥ `auto_min_rows` fit rows, the active labels holding
+≥ `auto_min_coverage` of the examples, a macro agreement with the oracle on a
+held-out fifth of the rows ≥ `auto_min_agreement`) the skill is fitted, written
+as a generation and served: the same contract is then `exact` (a part of it
+`subset`), `action: local`, `skill: auto-…`, always `certified: false`
+(`decision_path` `router:uncertified`). Labels the oracle rarely picks stay
+*quarantined*: they count as known for the matching, get probability 0, and a
+text of such a label is expected to abstain on novelty and keep teaching it. A
+young auto-skill's gate comes from a handful of rows, so a local answer also
+needs `p_top ≥ learning.auto_tau` (0.90; `balanced` and `quality-first`);
+whatever abstains escalates and teaches, and later attempts refit the whole
+skill under a regression gate. Its rubric is the first caller's instructions
+and criteria, visible through `/v1/skills/{id}` to every key (as cached
+answers are shared across accounts). Limits, who teaches and the state
+directory's compatibility: [ORACLE.md](ORACLE.md#auto-skills). When a data
+skill and auto-skills fit a question equally, the data skill answers.
+
 `cmf.skill` names the skill and skips the search (an unknown id is 400). An
 answer is `certified: true` only for an exact match on a string `state`, the
 `balanced` or `quality-first` profile, a skill whose gate is certified, and a
@@ -529,10 +552,10 @@ curl -s "$CORTIQ/v1/feedback" -H "Authorization: Bearer $KEY" \
 | Path | Access | Returns |
 |---|---|---|
 | `GET /v1/models` | open | the model in the shape of an OpenRouter provider listing (`id`, `pricing` as USD-per-token strings, `context_length` 512, `max_output_length` 255) plus `cmf.skills` with each gate |
-| `GET /v1/skills` | key | every skill: `id`, `taxonomy_version`, `labels`, `certified`, `tau`, `theta`, `temperature` and `has_rubric` (whether it has a rubric; the rubric itself is per skill) |
+| `GET /v1/skills` | key | every skill: `id`, `taxonomy_version`, `labels` (the active ones), `certified`, `tau`, `theta`, `temperature`, `has_rubric` (whether it has a rubric; the rubric itself is per skill) and, since 0.8.6, `auto` (an auto-skill), `active_labels` (their count), `quarantined_labels` (the labels not scored yet) and `examples` (learned rows); auto-skills are listed after the file's skills |
 | `GET /v1/skills/{id}` | key | the same plus `tasks`, the whole `gate` and `rubric` (`instructions`, `criteria`; `null` without one) |
 | `GET /v1/usage` | key | the caller's account (router format; `x-cmf-extensions: 1` adds token and cost totals) |
-| `GET /healthz` | open | status, model, generation, skills, `oracle` (on/off) and `oracle_status` (`ready`, `no_key`, `bad_key`, `disabled`, `budget_exhausted`, `budget_too_small`, `stopped: <reason>`; section 5) |
+| `GET /healthz` | open | status, model, generation, skills (every served skill), `auto_skills` (0.8.6), `oracle` (on/off) and `oracle_status` (`ready`, `no_key`, `bad_key`, `disabled`, `budget_exhausted`, `budget_too_small`, `stopped: <reason>`; section 5) |
 
 `/v1/models` only has the listing's shape; Cortiq Decision is not listed on
 OpenRouter.
@@ -762,7 +785,10 @@ unknown key is an error. The defaults:
              "max_tokens_per_question": 64, "deadline_s": 30, "budget_usd": 1.0, "max_calls": 10000,
              "max_errors": 30, "redact_pii": true, "title": "cortiq-decision", "data_collection": null},
   "cache": {"enabled": true, "threshold": 0.97, "cap": 50000},
-  "learning": {"enabled": true, "refit_min_new": 25, "dedup": 0.995, "cold_start": true, "synchronous": false},
+  "learning": {"enabled": true, "refit_min_new": 25, "dedup": 0.995, "cold_start": true, "synchronous": false,
+               "auto_skills": true, "auto_min_rows": 10, "auto_k": 8, "auto_tau": 0.9,
+               "auto_min_agreement": 0.8, "auto_min_coverage": 0.8, "auto_max_skills": 256,
+               "auto_max_labels": 64, "auto_max_examples_per_label": 1000},
   "feedback": {"pending_cap": 50000},
   "complexity_weights": {"base": 0.4, "ambiguity": 0.25, "novelty": 0.15, "margin": 0.1, "length": 0.1},
   "complexity_tiers": [{"tier": "low", "max": 0.33}, {"tier": "medium", "max": 0.66}, {"tier": "high", "max": 1.0}],
@@ -776,7 +802,18 @@ part of the file: the admin token and the OpenRouter key are read from the
 environment variables it names. `auth.plans` may override the plan table.
 `oracle.base_url` must be https, or plain http to a loopback address only (a
 local proxy). The oracle, cache and learning sections are explained in
-[ORACLE.md](ORACLE.md). `cortiq serve --oracle MODEL` and its companions
+[ORACLE.md](ORACLE.md). The `learning.auto_*` keys govern auto-skills
+(section 3.2, [ORACLE.md](ORACLE.md#auto-skills)): `auto_skills` learns
+untrained choice contracts at all; `auto_min_rows` fit rows (≥ 2) a label
+needs to be active; `auto_k` the rank of its topologies; `auto_tau` the
+confidence floor of a local answer (0..1; a serving parameter — `cortiq
+decide` uses the default); `auto_min_agreement` the macro agreement with the
+oracle required to activate and `auto_min_coverage` the share of the
+contract's examples its active labels must hold (both 0..1); `auto_max_skills`
+how many contracts are learned at most and `auto_max_labels` (2..255) how
+many options one may have — a contract past either is answered by the
+oracle and not learned; `auto_max_examples_per_label` (≤ 5000) replaces the
+per-label buffer cap for auto-skills. `cortiq serve --oracle MODEL` and its companions
 override the `oracle` section (and `--no-oracle-learning` sets
 `learning.enabled` false); a file that sets `oracle.provider` keeps its
 `max_price` unless `--oracle-max-price` is given.
