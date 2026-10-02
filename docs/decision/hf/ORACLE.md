@@ -139,12 +139,22 @@ an ambiguous one — several skills fit — and not one forced with `cmf.skill`)
 goes to the oracle on every new text and, until 0.8.5, was never learned. Since
 0.8.6 its *contract* becomes a skill of its own:
 
-* **Key.** `auto-` + the first 12 hex characters of the sha256 of the option
-  ids, sorted; the same ids in any order are one contract, instructions and
-  descriptions are not part of it (the matcher never reads them). The first
-  request's instructions and criteria become the skill's rubric, visible
-  through `/v1/skills/{id}` to every key. The contract is written to
-  `learn.log` before its first example, so a restart rebuilds it.
+* **Key.** The contract is the question itself: `auto-` + the first 12 hex
+  characters of the sha256 of the canonical JSON of `{type, instructions,
+  criteria}` — the instructions as sent (`null` when absent), the criteria
+  object with its keys sorted and every description kept. The criteria in
+  any order are one contract; other instructions, a changed description, a
+  dropped or an added option are each another contract, learned separately.
+  The id set alone is not the key: two clients using `{yes, no}` under
+  different questions get two skills, and a multiple-choice benchmark whose
+  positional ids `{A, B, C, D}` carry a new description per request is never
+  learned as one skill (every request is its own contract, bounded by
+  `auto_max_skills`). To be learned, a client keeps its question stable —
+  the same instructions text, the same ids with the same descriptions. The
+  first request's instructions and criteria are stored verbatim as the
+  skill's rubric (the id is recomputed from it), visible through
+  `/v1/skills/{id}` to every key. The contract is written to `learn.log`
+  before its first example, so a restart rebuilds it.
 * **Who teaches.** Only a caller whose key has `learning_allowed` (the explicit
   open mode `auth.require: false` has it; the implicit open mode of a loopback
   address never teaches). The rule "a question that is exactly the skill's own
@@ -153,7 +163,8 @@ goes to the oracle on every new text and, until 0.8.5, was never learned. Since
   the oracle answers as before.
 * **Examples.** Each answer is an example of the auto-skill under the
   contract's label (the dedup of 0.995 applies). The labels are closed: a
-  superset request or a feedback with a label outside the contract is refused.
+  feedback with a label outside the contract is refused (a request with one
+  more id is another contract, learned on its own).
   At most `learning.auto_max_examples_per_label` (1000) examples per label.
 * **Activation.** When a label collects 25 new examples (the usual trigger)
   the whole skill is attempted: one row in five — by a hash of the row itself,
@@ -172,9 +183,12 @@ goes to the oracle on every new text and, until 0.8.5, was never learned. Since
   the same rows (the holdout rule). A promotion writes a generation that
   carries the auto-skill entirely; every other skill is byte for byte the
   same.
-* **Serving.** The contract (and any part of it) is then decided locally,
-  `match: exact` / `subset`, `skill: auto-…`, `certified: false`. A quarantined
-  label still counts as known: it gets probability 0, and a text of it is
+* **Serving.** The contract is then decided locally, `match: exact`,
+  `skill: auto-…`, `certified: false`. An auto-skill is matched by its
+  contract alone: a part of its ids, a superset, other instructions or another
+  description is another contract (`untrained`, learned on its own), never a
+  `subset` or `superset` of the auto-skill. A quarantined label still counts
+  as known within the contract: it gets probability 0, and a text of it is
   expected to abstain on novelty and keep teaching it. Because θ and T of a
   young auto-skill come from a handful of rows (θ is close to the largest
   novelty of the even half, T may sit at a bound), a local answer also needs
@@ -217,9 +231,12 @@ goes to the oracle on every new text and, until 0.8.5, was never learned. Since
   and rubric, registered (and written to `learn.log`) at start and after a
   rollback.
 * **Routing.** `/v1/route` without `taxonomy_id` still means the file's only
-  data skill; an auto-skill is routed by its id. When a data skill and
-  auto-skills fit a question equally, the data skill answers; two auto-skills
-  fitting equally are ambiguous (and such a contract is not learned).
+  data skill; an auto-skill is routed by its id (its question is then the
+  whole contract from the rubric). `cortiq decide --labels` never names an
+  auto-skill by labels alone: `--skill auto-…` names it and its rubric
+  supplies the contract. When a data skill and auto-skills fit a question
+  equally, the data skill answers; two auto-skills of one contract cannot
+  exist (the contract is the id).
 * **Admin.** `GET /v1/admin/learning` lists `auto_skills` (id, labels,
   `examples` per label — the rows the next attempt fits: the served learned
   rows of the label plus the buffer examples not among them, each row once,

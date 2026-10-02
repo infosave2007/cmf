@@ -8,10 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.8.6] - 2026-10-02
 
 ### Added
-- Auto-skills: `cortiq serve` learns an untrained choice contract (option
-  ids no skill fits) from the oracle's answers into a skill of its own,
-  `auto-<sha12 of the sorted ids>`, for callers whose key has
-  `learning_allowed`. Once two labels have enough examples and the fitted
+- Auto-skills: `cortiq serve` learns an untrained choice question (option
+  ids no skill fits) from the oracle's answers into a skill of its own, for
+  callers whose key has `learning_allowed`. The contract is the question —
+  `instructions` and `criteria` with their descriptions, not the id set: the
+  id is `auto-<sha12 of the canonical {type, instructions, criteria}>` with
+  the criteria keys sorted, so the criteria in any order are one contract,
+  while other instructions, a changed description or another option set are
+  each another (the same `{yes, no}` under two questions are two skills;
+  positional ids whose descriptions change per request never become one).
+  An auto-skill is matched by its contract alone, never as a subset or
+  superset; a client keeps its question stable to be learned. The rubric of
+  the skill stores the first request's instructions and criteria verbatim
+  (`rubric.instructions` may be any JSON value, `null` for a System One
+  question). Once two labels have enough examples and the fitted
   skill agrees with the oracle on a held-out fifth of its rows, it is written
   as a generation and the contract is answered locally (`match: exact`,
   `skill: auto-…`, `certified: false`, a `p_top ≥ learning.auto_tau` floor);
@@ -48,12 +58,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after a rollback, so it keeps learning.
 
 ### Changed
-- Matching: the quarantined labels of an auto-skill count as known (the
-  contract is exact over its active labels, a quarantined option gets
-  probability 0); when one data skill and auto-skills fit a question equally,
-  the data skill answers. `/v1/route` without `taxonomy_id` and `cortiq
-  decide` without `--skill` count data skills only, so a single-skill file
-  keeps its implicit taxonomy after an auto-skill is learned.
+- Matching: an auto-skill relates to a question only by contract equality
+  (exact); its quarantined labels count as known within the contract (a
+  quarantined option gets probability 0); when one data skill and auto-skills
+  fit a question equally, the data skill answers. `/v1/route` without
+  `taxonomy_id` and `cortiq decide` without `--skill` count data skills only,
+  so a single-skill file keeps its implicit taxonomy after an auto-skill is
+  learned; `decide --labels` names an auto-skill only with `--skill`.
 
 ### Compatibility
 - A 0.8.5 binary refuses a generation that carries an auto-skill ("is not in

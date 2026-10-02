@@ -359,20 +359,31 @@ matter to the oracle alone). With L = the option ids of a choice question:
 | `superset` | one skill's labels plus labels it does not know | the oracle only; its answer teaches that skill only for a key with `learning_allowed` |
 | `untrained` | anything else, and every `score` / `noul` question | the oracle only; without it the request is 422 |
 
-**Auto-skills (0.8.6).** A choice contract no skill fits (`untrained` because
+**Auto-skills (0.8.6).** A choice question no skill fits (`untrained` because
 of its options, not an ambiguous one and not one forced with `cmf.skill`) is
 learned from the oracle's answers when the caller's key has `learning_allowed`
-and `learning.auto_skills` is on (the default): the answers accumulate as
-examples of the skill `auto-<12 hex of the sha256 of the sorted option ids>`
-— the same set of ids in any order is one contract — and once enough evidence
-is there (2 labels with ≥ `auto_min_rows` fit rows, the active labels holding
-≥ `auto_min_coverage` of the examples, a macro agreement with the oracle on a
-held-out fifth of the rows ≥ `auto_min_agreement`) the skill is fitted, written
-as a generation and served: the same contract is then `exact` (a part of it
-`subset`), `action: local`, `skill: auto-…`, always `certified: false`
-(`decision_path` `router:uncertified`). Labels the oracle rarely picks stay
-*quarantined*: they count as known for the matching, get probability 0, and a
-text of such a label is expected to abstain on novelty and keep teaching it. A
+and `learning.auto_skills` is on (the default). Its *contract* is the whole
+question — `instructions` and `criteria` with their descriptions, not the id
+set: the key is `auto-<12 hex of the sha256 of the canonical JSON of {type,
+instructions, criteria}>` with the criteria keys sorted (so the criteria in
+any order are one contract, while other instructions, a changed description,
+a dropped or an added option are each another contract — `{yes, no}` under
+"Is this spam?" and under "Is this urgent?" are two skills that never answer
+each other's question, and positional ids `{A, B, C, D}` whose descriptions
+change with every request are never learned as one). The answers accumulate
+as examples of that skill, and once enough evidence is there (2 labels with ≥
+`auto_min_rows` fit rows, the active labels holding ≥ `auto_min_coverage` of
+the examples, a macro agreement with the oracle on a held-out fifth of the
+rows ≥ `auto_min_agreement`) the skill is fitted, written as a generation and
+served: the same contract is then `exact`, `action: local`, `skill: auto-…`,
+always `certified: false` (`decision_path` `router:uncertified`). An
+auto-skill is matched by its contract alone — never as a `subset` or
+`superset` — so to be learned and then answered locally a client keeps the
+question stable: the same `instructions` text, the same option ids with the
+same descriptions (`null` descriptions, and absent instructions, count as
+such and stay stable). Labels the oracle rarely picks stay *quarantined*: they
+count as known within the contract, get probability 0, and a text of such a
+label is expected to abstain on novelty and keep teaching it. A
 young auto-skill's gate comes from a handful of rows, so a local answer also
 needs `p_top ≥ learning.auto_tau` (0.90; `balanced` and `quality-first`) and
 its temperature is floored at `learning.auto_temperature_min` (0.02 — a clean
@@ -391,11 +402,12 @@ collects examples at a quarter of its traffic until it activates; a refused
 or failed call leaves the local answer. Only auto-skills explore, only while
 a label is quarantined, and only when the answer could teach (the oracle
 consented, learning on, a key with `learning_allowed`); `cortiq decide`,
-shadow mode and `/v1/route` never do. Its rubric is the first caller's instructions
-and criteria, visible through `/v1/skills/{id}` to every key (as cached
-answers are shared across accounts). Limits, who teaches and the state
-directory's compatibility: [ORACLE.md](ORACLE.md#auto-skills). When a data
-skill and auto-skills fit a question equally, the data skill answers.
+shadow mode and `/v1/route` never do. Its rubric is the contract — the first
+caller's instructions and criteria verbatim — visible through
+`/v1/skills/{id}` to every key (as cached answers are shared across accounts).
+Limits, who teaches and the state directory's compatibility:
+[ORACLE.md](ORACLE.md#auto-skills). When a data skill and auto-skills fit a
+question equally, the data skill answers.
 
 `cmf.skill` names the skill and skips the search (an unknown id is 400). An
 answer is `certified: true` only for an exact match on a string `state`, the
