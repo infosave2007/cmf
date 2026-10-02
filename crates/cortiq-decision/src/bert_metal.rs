@@ -248,7 +248,7 @@ impl MetalEncoder {
         n: usize,
         gelu: bool,
     ) {
-        let direct = l.inp % 8 == 0 && l.out % 8 == 0;
+        let direct = l.inp.is_multiple_of(8) && l.out.is_multiple_of(8);
         enc.set_compute_pipeline_state(if direct {
             &self.linear_direct
         } else {

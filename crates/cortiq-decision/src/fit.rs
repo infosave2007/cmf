@@ -105,7 +105,7 @@ pub fn fit_task(rows: &[f32], dim: usize, k_max: usize) -> Result<TaskFit> {
 pub fn fit_task_f64(rows: &[f32], dim: usize, k_max: usize) -> Result<TaskFit64> {
     ensure!(dim > 0, "dimension must be positive");
     ensure!(
-        !rows.is_empty() && rows.len() % dim == 0,
+        !rows.is_empty() && rows.len().is_multiple_of(dim),
         "rows must be a non-empty n × {dim} matrix (got {} values)",
         rows.len()
     );

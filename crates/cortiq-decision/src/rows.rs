@@ -406,6 +406,12 @@ impl Rows {
         Ok(w.finish())
     }
 
+    /// The blob of no rows (the 24-byte header): the build rows tensor of an
+    /// auto-skill, whose every row lives in `rows.learned`.
+    pub fn empty_blob(dim_p: usize, dim_h: usize) -> Result<Vec<u8>> {
+        Ok(RowsWriter::new(dim_p, dim_h)?.finish())
+    }
+
     /// Decode and check a blob: magic, version, reserved fields, every row, the
     /// split order and the exact length.
     pub fn decode(bytes: &[u8]) -> Result<Self> {

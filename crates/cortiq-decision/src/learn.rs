@@ -38,6 +38,39 @@
 //! Every attempt (promoted, refused or skipped) resets the label's counter
 //! (cortiq-router `selflearn.rs:75-86`) and is logged in `learn.log`.
 //!
+//! **Auto-skills** ([`attempt_auto`], 0.8.6, DESIGN D5/D6/A2/A10): an attempt of
+//! an `auto-` id (an untrained choice contract learned from oracle answers,
+//! [`crate::cascade`]) fits the WHOLE skill at once, with no build rows:
+//! 1. R = the served `rows.learned` ∪ the pending examples of every label of
+//!    the contract; each row is in the calibration subset C iff
+//!    [`certify::auto_row_key`] says so (a property of the row: it never moves
+//!    between the fit and C), the rest fit; eligible labels have at least
+//!    `learning.auto_min_rows` fit rows (an already active one at least 2);
+//!    the attempt needs ≥ 2 eligible labels including the triggering one, and
+//!    — for the first activation — the eligible labels must hold
+//!    `learning.auto_min_coverage` of the contract's rows (so that the labels
+//!    left quarantined are genuinely rare); else `skipped`;
+//! 2. *challenger*: every eligible label refitted (`K = min(auto_k, n − 1)`,
+//!    origin `cold_start`, state `active`), the others quarantined without a
+//!    topology; `taxonomy_version + 1` when the active label set changes;
+//! 3. *gate*: C of the eligible labels only (`|C| ≥ 2`, else skipped), halves by
+//!    [`certify::halves`] over the same keys, [`certify::certify`] as a build
+//!    (τ certifies only with 100 accepted odd rows, so the gate is θ-only for
+//!    a long time; serving adds the `learning.auto_tau` floor), the served
+//!    `T` floored at `learning.auto_temperature_min` (DESIGN A15: a clean C
+//!    fits `T` at its lower bound, where `p_top ≡ 1`; the evidence keeps
+//!    the fitted `log_t`); the first
+//!    activation (`auto_start`) needs a macro agreement with the oracle's
+//!    labels on C of `learning.auto_min_agreement` and ≥ 0.5 per label, else
+//!    `rejected: auto_agreement`; later (`auto_refit`) the champion (served
+//!    topologies) and the challenger are scored on the same C and the holdout
+//!    rule applies (`chall + 1e-4 ≥ champ`, task and macro accuracy);
+//!    `gate_lost` never applies (never certified while young);
+//! 4. *promotion*: the generation carries the auto-skill fully (born with
+//!    [`OverlayBuilder::add_skill`] when the model does not serve it, changed
+//!    with [`OverlayBuilder::set_skill`] otherwise, `rows.learned` = R);
+//!    isolation exempts the whole auto-skill and nothing else.
+//!
 //! **Offline** ([`learn_offline`], spec §5.14): every text of a traffic file is
 //! decided by the input model; accepted texts are left alone (the oracle is never
 //! asked about them); for an abstention the answer is taken from the answer
@@ -52,7 +85,10 @@
 //! byte for byte, the learned skill with its new topologies, the learned rows in
 //! its rows blob (split 2, source oracle) and a `learned` record in its manifest.
 
-use crate::buffer::{AddOutcome, AttemptRecord, Example, LearnLog, LearningBuffer, LogRecord};
+use crate::buffer::{
+    AddOutcome, AttemptRecord, Contract, ContractRegistry, Example, LearnLog, LearningBuffer,
+    LogRecord,
+};
 use crate::certify::{self, Calibration, Certification};
 use crate::config::{LearningConfig, OracleConfig};
 use crate::container::{
@@ -62,11 +98,11 @@ use crate::eval::{self, SkillScorer, resolve_threads};
 use crate::fit::{self, TaskFit};
 use crate::generation;
 use crate::manifest::{
-    Gate, GateParams, LearnedRecord, Rubric, SkillManifest, TaskOrigin, TaskRecord, TaskState,
+    self, Gate, GateParams, LearnedRecord, Rubric, SkillManifest, TaskOrigin, TaskRecord, TaskState,
 };
 use crate::oracle::{self, CallOutcome, Caller, KeyLookup, OracleClient};
 use crate::protocol::{Question, QuestionKind};
-use crate::resonance::{ErrStats, Topology, decide};
+use crate::resonance::{ErrStats, TaskView, Topology, decide};
 use crate::rows::{Row, Rows, Source, Split};
 use crate::service::ModelHandle;
 use crate::signal::SignalEncoder;
@@ -94,6 +130,10 @@ pub enum ChangeKind {
     Activate,
     /// A new task for a label the skill did not have (spec §5.8).
     ColdStart,
+    /// The first activation of an auto-skill (every eligible label fitted).
+    AutoStart,
+    /// A later whole-skill refit of an auto-skill.
+    AutoRefit,
 }
 
 impl ChangeKind {
@@ -102,6 +142,8 @@ impl ChangeKind {
             ChangeKind::Refit => "promote",
             ChangeKind::Activate => "activate",
             ChangeKind::ColdStart => "cold_start",
+            ChangeKind::AutoStart => "auto_start",
+            ChangeKind::AutoRefit => "auto_refit",
         }
     }
 }
@@ -387,6 +429,14 @@ impl SkillBook {
                 manifest.taxonomy_version += 1;
             }
             ChangeKind::Refit => manifest.tasks[task] = record.clone(),
+            // A per-label challenger is never built for an auto-skill
+            // (`attempt_auto` refits the whole skill).
+            ChangeKind::AutoStart | ChangeKind::AutoRefit => {
+                bail!(
+                    "skill '{}' is an auto-skill: no per-label challenger",
+                    self.id
+                )
+            }
         }
 
         // Challenger calibration state: the champion's columns, the new one.
@@ -564,7 +614,10 @@ impl SkillBook {
 }
 
 /// Differences in the task tensors of every skill between two models, except
-/// task `changed` of skill `skill` (a cold start adds exactly that task).
+/// task `changed` of skill `skill` (a cold start adds exactly that task). When
+/// `skill` is an auto-skill the exemption is the whole skill (an attempt refits
+/// every eligible label at once, DESIGN D6), and it is the only skill allowed
+/// to appear in `after` without being in `before` (born in this generation).
 pub fn isolation_violations(
     before: &DecisionModel,
     after: &DecisionModel,
@@ -577,8 +630,9 @@ pub fn isolation_violations(
             v.push(format!("skill '{}' disappeared", s.id()));
             continue;
         };
+        let whole = s.id() == skill && a.manifest.is_auto();
         for t in &s.manifest.tasks {
-            if s.id() == skill && t.i as usize == changed {
+            if s.id() == skill && (whole || t.i as usize == changed) {
                 continue;
             }
             match a.manifest.tasks.get(t.i as usize) {
@@ -595,9 +649,18 @@ pub fn isolation_violations(
             .tasks
             .len()
             .saturating_sub(s.manifest.tasks.len());
-        let allowed = usize::from(s.id() == skill && changed >= s.manifest.tasks.len());
+        let allowed = if whole {
+            usize::MAX
+        } else {
+            usize::from(s.id() == skill && changed >= s.manifest.tasks.len())
+        };
         if extra > allowed {
             v.push(format!("skill '{}' gained {extra} tasks", s.id()));
+        }
+    }
+    for a in after.skills() {
+        if before.skill(a.id()).is_none() && !(a.id() == skill && a.manifest.is_auto()) {
+            v.push(format!("skill '{}' appeared", a.id()));
         }
     }
     v
@@ -675,6 +738,8 @@ pub struct AttemptReport {
     pub gate_before: Option<Gate>,
     pub gate_after: Option<Gate>,
     pub isolation_violations: usize,
+    /// The whole-skill numbers of an auto-skill attempt.
+    pub auto: Option<AutoReport>,
 }
 
 impl AttemptReport {
@@ -691,6 +756,7 @@ impl AttemptReport {
             gate_before: None,
             gate_after: None,
             isolation_violations: 0,
+            auto: None,
         }
     }
 
@@ -711,6 +777,7 @@ impl AttemptReport {
             "gate_before": self.gate_before.as_ref().map(gate_json),
             "gate_after": self.gate_after.as_ref().map(gate_json),
             "isolation_violations": self.isolation_violations,
+            "auto": self.auto.as_ref().map(AutoReport::to_json),
         })
     }
 }
@@ -722,6 +789,8 @@ pub struct LearnContext<'a> {
     pub buffer: &'a Mutex<LearningBuffer>,
     pub log: &'a LearnLog,
     pub books: &'a Mutex<Books>,
+    /// The contracts of the auto-skills (DESIGN D1).
+    pub contracts: &'a Mutex<ContractRegistry>,
     pub cfg: &'a LearningConfig,
     /// The decoded base rows of a skill (shared with the dedup path).
     pub base_rows: &'a (dyn Fn(&DecisionModel, &str) -> Result<Arc<Rows>> + Sync),
@@ -755,6 +824,21 @@ pub fn attempt(ctx: &LearnContext<'_>, skill: &str, label: &str) -> Result<Attem
 }
 
 fn attempt_inner(ctx: &LearnContext<'_>, skill: &str, label: &str) -> Result<AttemptReport> {
+    // The auto-skill branch forks before the served-skill lookup (DESIGN
+    // A10): the first attempt of a contract, and every attempt after a
+    // rollback that dropped the auto-skill, finds no served skill. It is
+    // governed by `auto_skills` alone (`cold_start` is the rule of a data
+    // skill's new labels).
+    if manifest::is_auto_skill_id(skill) {
+        if !ctx.cfg.auto_skills {
+            return Ok(AttemptReport::skipped(
+                skill,
+                label,
+                "auto-skills are disabled",
+            ));
+        }
+        return attempt_auto(ctx, skill, label);
+    }
     let threads = resolve_threads(ctx.threads);
     let loaded = ctx.handle.current();
     let model = loaded.model();
@@ -813,6 +897,7 @@ fn attempt_inner(ctx: &LearnContext<'_>, skill: &str, label: &str) -> Result<Att
         gate_before: Some(gate_before.clone()),
         gate_after: None,
         isolation_violations: 0,
+        auto: None,
     };
     let holdout = book.holdout(model, &ch, threads)?;
     report.holdout = Some(holdout.clone());
@@ -898,6 +983,550 @@ fn attempt_inner(ctx: &LearnContext<'_>, skill: &str, label: &str) -> Result<Att
         sha256,
     };
     Ok(report)
+}
+
+// ------------------------------------------------------------------ auto-skills
+
+/// The whole-skill numbers of an auto-skill attempt (the attempt JSON's
+/// `auto`; labels appear there as they do in every learning listing, never
+/// in a log line).
+#[derive(Clone, Debug, PartialEq)]
+pub struct AutoReport {
+    /// Labels of the contract.
+    pub labels: usize,
+    /// Labels fitted and active in the challenger (sorted).
+    pub eligible: Vec<String>,
+    /// Labels left quarantined (sorted).
+    pub quarantined: Vec<String>,
+    /// Rows of the contract: all, in the fit, in the calibration subset C
+    /// (of the eligible labels), its even and odd halves.
+    pub rows: usize,
+    pub fit_rows: usize,
+    pub cal_rows: usize,
+    pub even: usize,
+    pub odd: usize,
+    /// Share of the rows the eligible labels hold.
+    pub coverage: f64,
+    /// Agreement of the challenger's argmin with the oracle's labels on C:
+    /// macro over the labels with a C row, the smallest per-label value, and
+    /// each label's.
+    pub agreement_macro: Option<f64>,
+    pub agreement_min: Option<f64>,
+    pub agreement: BTreeMap<String, f64>,
+}
+
+impl AutoReport {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "labels": self.labels, "eligible": self.eligible, "quarantined": self.quarantined,
+            "rows": {"total": self.rows, "fit": self.fit_rows, "calibration": self.cal_rows,
+                     "even": self.even, "odd": self.odd},
+            "coverage": self.coverage,
+            "agreement": {"macro": self.agreement_macro, "min": self.agreement_min,
+                          "labels": self.agreement},
+        })
+    }
+}
+
+/// One row of an auto-skill's R with its task and calibration key.
+struct AutoRow {
+    task: usize,
+    row: Row,
+    key: String,
+    cal: bool,
+}
+
+/// R of an auto-skill as an attempt sees it: the served `rows.learned` rows
+/// of `skill` (when the model serves it), then the buffer examples of every
+/// label of `manifest` that are not among them (keyed by (task, φ_P bits):
+/// the buffer is never pruned after a promotion, so every example that
+/// entered a generation is still in it). Each row with its task and whether
+/// it is pending (from the buffer, not served). The attempt and the admin
+/// listing count R through this one function, so `rows.total` of an attempt
+/// and `auto_skills[].examples` agree.
+pub(crate) fn auto_rows(
+    model: &DecisionModel,
+    buffer: &LearningBuffer,
+    skill: &str,
+    manifest: &SkillManifest,
+) -> Result<Vec<(usize, Row, bool)>> {
+    let n_tasks = manifest.tasks.len();
+    let gen_learned: Vec<Row> = match model.skill(skill) {
+        Some(_) => model
+            .rows_learned(skill)?
+            .map(|r| r.rows)
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let served_bits: HashSet<(u32, Vec<u32>)> = gen_learned
+        .iter()
+        .map(|r| (r.task, bits(&r.phi_p)))
+        .collect();
+    let mut rows: Vec<(usize, Row, bool)> = Vec::with_capacity(gen_learned.len());
+    for r in gen_learned {
+        ensure!(
+            (r.task as usize) < n_tasks,
+            "skill '{skill}': a learned row names task {} of {n_tasks}",
+            r.task
+        );
+        rows.push((r.task as usize, r, false));
+    }
+    for (t, l) in manifest.labels.iter().enumerate() {
+        for ex in buffer.examples(skill, l) {
+            if served_bits.contains(&(t as u32, bits(&ex.phi_p))) {
+                continue;
+            }
+            rows.push((t, ex.to_row(t as u32), true));
+        }
+    }
+    Ok(rows)
+}
+
+/// Rows of R per label of an auto-skill's contract ([`auto_rows`]): the
+/// served learned rows of the label plus its pending examples, in the
+/// contract's `ids` order. A contract the model does not serve has the buffer
+/// examples of each id only.
+pub fn auto_rows_per_label(
+    model: &DecisionModel,
+    buffer: &LearningBuffer,
+    contract: &Contract,
+) -> Result<Vec<(String, usize)>> {
+    let Some(served) = model.skill(&contract.skill) else {
+        return Ok(contract
+            .ids
+            .iter()
+            .map(|l| (l.clone(), buffer.examples(&contract.skill, l).len()))
+            .collect());
+    };
+    let manifest = &served.manifest;
+    let rows = auto_rows(model, buffer, &contract.skill, manifest)?;
+    Ok(contract
+        .ids
+        .iter()
+        .map(|l| {
+            let n = manifest
+                .task_of(l)
+                .map_or(0, |t| rows.iter().filter(|(task, ..)| *task == t).count());
+            (l.clone(), n)
+        })
+        .collect())
+}
+
+/// Per task: (correct, total) over the C rows under a scorer's argmin, with
+/// `truth[j]` the row's candidate in that scorer (`None`: always wrong).
+fn auto_accuracy(
+    matrix: &[f32],
+    cands: usize,
+    stats: &[ErrStats],
+    temperature: f32,
+    cal: &[&AutoRow],
+    truth: &[Option<usize>],
+) -> Result<BTreeMap<usize, (usize, usize)>> {
+    let mut acc: BTreeMap<usize, (usize, usize)> = BTreeMap::new();
+    for (j, r) in cal.iter().enumerate() {
+        let win = if cands == 0 {
+            None
+        } else {
+            decide(&matrix[j * cands..(j + 1) * cands], stats, temperature)?.winner
+        };
+        let e = acc.entry(r.task).or_insert((0, 0));
+        e.1 += 1;
+        e.0 += usize::from(win.is_some() && win == truth[j]);
+    }
+    Ok(acc)
+}
+
+fn macro_of(a: &BTreeMap<usize, (usize, usize)>) -> Option<f64> {
+    let frac = |&(c, n): &(usize, usize)| c as f64 / n as f64;
+    (!a.is_empty()).then(|| a.values().map(frac).sum::<f64>() / a.len() as f64)
+}
+
+/// One attempt of an auto-skill (see the module notes).
+fn attempt_auto(ctx: &LearnContext<'_>, skill: &str, label: &str) -> Result<AttemptReport> {
+    let threads = resolve_threads(ctx.threads);
+    let cfg = ctx.cfg;
+    let loaded = ctx.handle.current();
+    let model = loaded.model();
+    let served = model.skill(skill);
+    // The registry is seeded from the served model (`cascade`), so a served
+    // auto-skill without a contract record is read back from its manifest
+    // here too, never left frozen.
+    let registered = ctx.contracts.lock().get(skill).cloned();
+    let Some(contract) = registered.or_else(|| {
+        served.and_then(|s| Contract::of_manifest(&s.manifest, model.manifest().created_unix))
+    }) else {
+        return Ok(AttemptReport::skipped(
+            skill,
+            label,
+            "no contract is registered for the auto-skill",
+        ));
+    };
+    if !contract.has_label(label) {
+        return Ok(AttemptReport::skipped(
+            skill,
+            label,
+            "the label is not an option of the contract",
+        ));
+    }
+    let manifest = match served {
+        Some(s) => {
+            ensure!(s.manifest.is_auto(), "skill '{skill}' is not an auto-skill");
+            s.manifest.clone()
+        }
+        None => SkillManifest::auto_skeleton(&contract.rubric(), cfg.auto_k),
+    };
+    // The manifest's labels are the contract's ids in sorted order; a contract
+    // whose ids differ from a served skill of the same id cannot happen (the id
+    // is their hash), but the examples are attributed by label, never by index.
+    let (dim_p, dim_h) = (model.encoder_dim(), model.hashing_dim());
+    let dim = model.signal_dim();
+    let k_max = cfg.auto_k.min(manifest.recipe.k_max) as usize;
+    let n_tasks = manifest.tasks.len();
+
+    // R: the served learned rows, then the pending examples of every label
+    // ([`auto_rows`], shared with the admin listing).
+    let trigger = manifest.task_of(label).expect("the label is a contract id");
+    let mut pending_trigger = 0usize;
+    let rows: Vec<AutoRow> = auto_rows(model, &ctx.buffer.lock(), skill, &manifest)?
+        .into_iter()
+        .map(|(task, row, pending)| {
+            pending_trigger += usize::from(pending && task == trigger);
+            let (key, cal) = certify::auto_row_key(&row.phi_p);
+            AutoRow {
+                task,
+                row,
+                key,
+                cal,
+            }
+        })
+        .collect();
+    if pending_trigger == 0 {
+        return Ok(AttemptReport::skipped(skill, label, "no pending example"));
+    }
+
+    // Eligibility per label.
+    let mut fit_of: Vec<Vec<usize>> = vec![Vec::new(); n_tasks];
+    let mut cal_of: Vec<Vec<usize>> = vec![Vec::new(); n_tasks];
+    for (i, r) in rows.iter().enumerate() {
+        if r.cal {
+            cal_of[r.task].push(i);
+        } else {
+            fit_of[r.task].push(i);
+        }
+    }
+    let was_active = |t: usize| manifest.tasks[t].is_active();
+    let eligible: Vec<usize> = (0..n_tasks)
+        .filter(|&t| {
+            fit_of[t].len() >= cfg.auto_min_rows
+                || (was_active(t) && fit_of[t].len() >= fit::MIN_ROWS_ACTIVE)
+        })
+        .collect();
+    let kind = if (0..n_tasks).any(was_active) {
+        ChangeKind::AutoRefit
+    } else {
+        ChangeKind::AutoStart
+    };
+    let n_fit_trigger = fit_of[trigger].len();
+    let eligible_rows: usize = eligible
+        .iter()
+        .map(|&t| fit_of[t].len() + cal_of[t].len())
+        .sum();
+    let coverage = if rows.is_empty() {
+        0.0
+    } else {
+        eligible_rows as f64 / rows.len() as f64
+    };
+    let mut report = AttemptReport {
+        skill: skill.into(),
+        label: label.into(),
+        kind: Some(kind),
+        task: Some(trigger),
+        outcome: Outcome::Skipped(String::new()),
+        pending: pending_trigger,
+        n_fit: n_fit_trigger,
+        holdout: None,
+        gate_before: served.map(|s| s.manifest.gate.clone()),
+        gate_after: None,
+        isolation_violations: 0,
+        auto: Some(AutoReport {
+            labels: n_tasks,
+            eligible: eligible
+                .iter()
+                .map(|&t| manifest.labels[t].clone())
+                .collect(),
+            quarantined: (0..n_tasks)
+                .filter(|t| !eligible.contains(t))
+                .map(|t| manifest.labels[t].clone())
+                .collect(),
+            rows: rows.len(),
+            fit_rows: eligible.iter().map(|&t| fit_of[t].len()).sum(),
+            cal_rows: 0,
+            even: 0,
+            odd: 0,
+            coverage,
+            agreement_macro: None,
+            agreement_min: None,
+            agreement: BTreeMap::new(),
+        }),
+    };
+    let skip = |mut r: AttemptReport, why: String| {
+        r.outcome = Outcome::Skipped(why);
+        Ok(r)
+    };
+    if eligible.len() < 2 || !eligible.contains(&trigger) {
+        return skip(
+            report,
+            format!(
+                "auto-skill needs 2 labels with >= {} fit rows including the triggering one (has {} eligible, the trigger {n_fit_trigger} fit rows)",
+                cfg.auto_min_rows,
+                eligible.len()
+            ),
+        );
+    }
+    if kind == ChangeKind::AutoStart && coverage < f64::from(cfg.auto_min_coverage) {
+        return skip(
+            report,
+            format!(
+                "auto-skill coverage {coverage:.3} of the eligible labels is below {}",
+                cfg.auto_min_coverage
+            ),
+        );
+    }
+
+    // Challenger: every eligible label refitted, the others quarantined.
+    let mut next = manifest.clone();
+    let mut topologies: BTreeMap<usize, Option<Topology>> = BTreeMap::new();
+    for &t in &eligible {
+        let fit_rows: Vec<&Row> = fit_of[t].iter().map(|&i| &rows[i].row).collect();
+        // The error may reach a log line: the label by its tag only (§4.3).
+        let f: TaskFit =
+            crate::build::fit_task_rows(&fit_rows, dim_h, k_max).with_context(|| {
+                format!("fit of task {t} (label#{})", label_tag(&manifest.labels[t]))
+            })?;
+        let mut rec = crate::build::task_record(t, &manifest.labels[t], &f);
+        rec.origin = TaskOrigin::ColdStart;
+        rec.state = TaskState::Active;
+        next.tasks[t] = rec;
+        topologies.insert(t, Some(f.topology));
+    }
+    let active_before: Vec<usize> = (0..n_tasks).filter(|&t| was_active(t)).collect();
+    if active_before != eligible {
+        next.taxonomy_version += 1;
+    }
+    let views: Vec<Option<TaskView<'_>>> = (0..n_tasks)
+        .map(|t| {
+            topologies
+                .get(&t)
+                .and_then(|o| o.as_ref())
+                .map(Topology::view)
+        })
+        .collect();
+    let scorer = SkillScorer::new(skill, &next.tasks, &views, placeholder_gate(), dim)?;
+
+    // C of the eligible labels, in (task, key) order; halves over the keys.
+    let mut cal: Vec<&AutoRow> = eligible
+        .iter()
+        .flat_map(|&t| cal_of[t].iter().map(|&i| &rows[i]))
+        .collect();
+    cal.sort_by(|a, b| (a.task, &a.key).cmp(&(b.task, &b.key)));
+    let keys: Vec<&str> = cal.iter().map(|r| r.key.as_str()).collect();
+    let (even, odd) = certify::halves(&keys);
+    if let Some(a) = report.auto.as_mut() {
+        a.cal_rows = cal.len();
+        a.even = even.len();
+        a.odd = odd.len();
+    }
+    if cal.len() < 2 {
+        return skip(
+            report,
+            format!(
+                "the calibration subset has {} rows of the eligible labels; needs at least 2",
+                cal.len()
+            ),
+        );
+    }
+    let cal_rows: Vec<&Row> = cal.iter().map(|r| &r.row).collect();
+    let matrix = scorer.error_matrix(&cal_rows, dim_h, threads)?;
+    let truth: Vec<Option<usize>> = cal.iter().map(|r| scorer.candidate_of(r.task)).collect();
+    let cert = book_certify(&matrix, &scorer, &truth, &even, &odd)?;
+    let mut gate = Gate::from_certification(&cert);
+    // The served T is floored (DESIGN A15): a clean C drives the fitted T to
+    // its lower bound, where p_top ≡ 1 for every text — the `auto_tau` floor
+    // never bites and a quarantined label's texts are answered with
+    // confidence 1 as a neighbour. The evidence keeps the fitted `log_t`; any
+    // positive f32 T is a valid gate (`Gate::validate`).
+    let temperature = cert.temperature.max(cfg.auto_temperature_min);
+    gate.temperature = f64::from(temperature);
+    report.gate_after = Some(gate.clone());
+
+    // Agreement of the challenger with the oracle on C (the winner is the
+    // argmin, independent of T).
+    let chall = auto_accuracy(
+        &matrix,
+        scorer.len(),
+        scorer.stats(),
+        temperature,
+        &cal,
+        &truth,
+    )?;
+    let per_label: BTreeMap<String, f64> = chall
+        .iter()
+        .map(|(&t, &(c, n))| (manifest.labels[t].clone(), c as f64 / n as f64))
+        .collect();
+    let agreement_macro = macro_of(&chall);
+    let agreement_min = per_label.values().copied().reduce(f64::min);
+    if let Some(a) = report.auto.as_mut() {
+        a.agreement = per_label;
+        a.agreement_macro = agreement_macro;
+        a.agreement_min = agreement_min;
+    }
+    match kind {
+        ChangeKind::AutoStart => {
+            let ok = agreement_macro.is_some_and(|m| m >= f64::from(cfg.auto_min_agreement))
+                && agreement_min.is_some_and(|m| m >= 0.5);
+            if !ok {
+                report.outcome = Outcome::Rejected("auto_agreement".into());
+                return Ok(report);
+            }
+        }
+        _ => {
+            // The champion's topologies (served) on the same C.
+            let champ = SkillScorer::from_model(model, skill)?;
+            let cm = champ.error_matrix(&cal_rows, dim_h, threads)?;
+            let ct: Vec<Option<usize>> = cal.iter().map(|r| champ.candidate_of(r.task)).collect();
+            let champ_acc = auto_accuracy(
+                &cm,
+                champ.len(),
+                champ.stats(),
+                champ.gate().temperature,
+                &cal,
+                &ct,
+            )?;
+            let frac = |a: &BTreeMap<usize, (usize, usize)>| {
+                a.get(&trigger).map(|&(c, n)| c as f64 / n as f64)
+            };
+            let (champ_task, chall_task) = (frac(&champ_acc), frac(&chall));
+            let (champ_macro, chall_macro) = (macro_of(&champ_acc), agreement_macro);
+            let ok = |a: Option<f64>, b: Option<f64>| match (a, b) {
+                (Some(c), Some(h)) => h + REGRESSION_EPS >= c,
+                _ => true,
+            };
+            let holdout = HoldoutReport {
+                rows: cal.len(),
+                labels: chall.len(),
+                champ_task,
+                chall_task,
+                champ_macro,
+                chall_macro,
+                passed: ok(champ_task, chall_task) && ok(champ_macro, chall_macro),
+                gated: true,
+            };
+            let passed = holdout.passed;
+            report.holdout = Some(holdout);
+            if !passed {
+                report.outcome = Outcome::Rejected("holdout_regression".into());
+                return Ok(report);
+            }
+        }
+    }
+
+    // Write, check isolation, make CURRENT, swap.
+    let g = generation::next_generation(ctx.state, model.generation())?;
+    let mut b = OverlayBuilder::new(model, g)?;
+    if let Some(t) = ctx.created_unix {
+        b.set_created_unix(t);
+    }
+    b.push_event(
+        skill,
+        label,
+        kind.as_str(),
+        report
+            .holdout
+            .as_ref()
+            .map_or_else(|| json!(null), HoldoutReport::to_json),
+        json!({
+            "before": report.gate_before.as_ref().map(gate_json),
+            "after": gate_json(&gate),
+            "auto": report.auto.as_ref().map(AutoReport::to_json),
+        }),
+    );
+    next.gate = gate;
+    let mut learned: Vec<Row> = rows.into_iter().map(|r| r.row).collect();
+    learned.sort_by_key(|r| r.task);
+    let learned = Rows {
+        dim_p,
+        dim_h,
+        rows: learned,
+    }
+    .encode()?;
+    if served.is_none() {
+        let topologies: Vec<Option<Topology>> = (0..n_tasks)
+            .map(|t| topologies.remove(&t).flatten())
+            .collect();
+        b.add_skill(NewSkill {
+            manifest: next,
+            topologies,
+            rows: Rows::empty_blob(dim_p, dim_h)?,
+            rows_learned: Some(learned),
+        })?;
+    } else {
+        b.set_skill(next, topologies, LearnedRows::Replace(learned))?;
+    }
+    let mut violations = Vec::new();
+    let published = generation::publish(ctx.state, model.base_path(), &b, g, |m| {
+        violations = isolation_violations(model, m, skill, trigger);
+        if violations.is_empty() {
+            Ok(())
+        } else {
+            bail!("isolation violated: {}", violations.join("; "))
+        }
+    });
+    let published = match published {
+        Ok(p) => p,
+        Err(e) if !violations.is_empty() => {
+            tracing::error!(error = %e, "promotion cancelled");
+            report.isolation_violations = violations.len();
+            report.outcome = Outcome::Rejected("isolation".into());
+            return Ok(report);
+        }
+        Err(e) => return Err(e),
+    };
+    let sha256 = published.report.sha256.clone();
+    let next = loaded.derive(published.model)?;
+    ctx.handle.promote(next);
+    tracing::info!(
+        skill,
+        task = trigger,
+        label_sha = %label_tag(label),
+        generation = g,
+        kind = kind.as_str(),
+        eligible = eligible.len(),
+        labels = n_tasks,
+        "promoted"
+    );
+    report.outcome = Outcome::Promoted {
+        generation: g,
+        sha256,
+    };
+    Ok(report)
+}
+
+/// [`certify::certify`] over a scorer's error matrix of calibration rows.
+fn book_certify(
+    matrix: &[f32],
+    scorer: &SkillScorer,
+    truth: &[Option<usize>],
+    even: &[usize],
+    odd: &[usize],
+) -> Result<Certification> {
+    certify::certify(&Calibration {
+        errors: matrix,
+        tasks: scorer.len(),
+        stats: scorer.stats(),
+        truth,
+        even,
+        odd,
+    })
 }
 
 /// What a log line shows of a label: the first 12 hex characters of its
@@ -1039,7 +1668,7 @@ pub fn question_of_rubric(r: &Rubric) -> Question {
     Question {
         id: "task".into(),
         kind: QuestionKind::Choice,
-        instructions: Value::String(r.instructions.clone()),
+        instructions: r.instructions.clone(),
         criteria: Some(Value::Object(r.ordered_criteria())),
     }
 }
@@ -1069,6 +1698,14 @@ pub fn learn_offline(
         .expect("selected skills exist")
         .manifest
         .clone();
+    // An auto-skill has no calibration rows for the holdout and gate of this
+    // pass, and its rows must stay in `rows.learned` (DESIGN D4); it learns
+    // online only.
+    ensure!(
+        !manifest_in.is_auto(),
+        "skill {} is an auto-skill (learned online by the server); offline learning does not apply",
+        crate::config::quote_unless_key(&skill)
+    );
     let question = rubric_question(&manifest_in)?;
 
     let traffic_bytes =
@@ -1337,7 +1974,8 @@ pub fn learn_offline(
                     None
                 });
             }
-            let rows = model.base().tensor_bytes(&m.rows.tensor)?.to_vec();
+            // Overlay-first: an auto-skill's (empty) blob is not in the base.
+            let rows = model.tensor_bytes(&m.rows.tensor)?.to_vec();
             let rows_learned = match &m.rows_learned {
                 Some(r) => Some(model.tensor_bytes(&r.tensor)?.to_vec()),
                 None => None,

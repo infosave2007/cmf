@@ -13,19 +13,34 @@
 //! **Counters**: examples added per (skill, label) since the last learning
 //! attempt of that label; an attempt resets its label, a rollback every label.
 //!
-//! **`learn.log`** ([`LearnLog`]): one record per cache put, example, attempt and
-//! rollback, `magic "CDLG" | u32 len | u8 kind | payload[len] | u32 crc32`
-//! (little-endian; the crc covers `len`, `kind` and the payload), fsynced one by
-//! one. On open, a tail that is cut or fails its crc is dropped and the file is
-//! truncated to the last whole record; replaying the records restores the cache,
-//! the buffer and the counters.
+//! **Contracts** ([`Contract`], [`ContractRegistry`], 0.8.6): an untrained
+//! choice question whose oracle answers are learned into an auto-skill
+//! (`crate::manifest::auto_skill_id`) is registered once, before its first
+//! example, as the caller first sent it — option ids in request order,
+//! instructions and criteria (the auto-skill's rubric). The registry is
+//! rebuilt from the log before the examples, so an example of an auto-skill
+//! always finds its contract (one without is dropped with a warning: it cannot
+//! happen in a consistent log).
+//!
+//! **`learn.log`** ([`LearnLog`]): one record per cache put, example, attempt,
+//! rollback and contract, `magic "CDLG" | u32 len | u8 kind | payload[len] |
+//! u32 crc32` (little-endian; the crc covers `len`, `kind` and the payload),
+//! fsynced one by one. On open, a tail that is cut or fails its crc is dropped
+//! and the file is truncated to the last whole record; replaying the records
+//! restores the cache, the buffer, the counters and the contract registry.
+//! A record of a kind this binary does not know ends the replay the same way
+//! (a 0.8.5 binary on a 0.8.6 state directory truncates the log at its first
+//! contract record — never run an older binary on it).
 
 use crate::cache::CacheEntry;
+use crate::canonical;
+use crate::manifest::{self, Rubric};
 use crate::rows::{Row, Source, Split};
 use crate::signal::Features;
 use anyhow::{Context, Result, bail, ensure};
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use serde_json::{Map, Value};
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -39,6 +54,8 @@ const KIND_CACHE_PUT: u8 = 1;
 const KIND_EXAMPLE: u8 = 2;
 const KIND_ATTEMPT: u8 = 3;
 const KIND_ROLLBACK: u8 = 4;
+/// 0.8.6: the contract of an auto-skill (a 0.8.5 binary stops replaying here).
+const KIND_CONTRACT: u8 = 5;
 
 // ------------------------------------------------------------------ codec
 
@@ -236,6 +253,161 @@ impl Example {
     }
 }
 
+// ------------------------------------------------------------------ contracts
+
+/// A choice contract learned into an auto-skill, as first seen (DESIGN D1,
+/// A18): the first request's instructions and criteria verbatim, whose
+/// contract sha ([`manifest::contract_sha256`]) keys the skill.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Contract {
+    /// The auto-skill id, [`manifest::auto_skill_id`] of the instructions
+    /// and criteria.
+    pub skill: String,
+    /// The option ids (the criteria keys) in the first request's order.
+    pub ids: Vec<String>,
+    /// The first request's `instructions` (string, object, array or null).
+    pub instructions: Value,
+    /// The first request's `criteria` object (descriptions kept, `null` too).
+    pub criteria: Value,
+    pub created_unix: u64,
+}
+
+impl Contract {
+    /// The contract of a choice question: its instructions and its criteria
+    /// object (the ids in the request's order).
+    pub fn new(instructions: &Value, criteria: &Map<String, Value>, created_unix: u64) -> Self {
+        Self {
+            skill: manifest::auto_skill_id(instructions, criteria),
+            ids: criteria.keys().cloned().collect(),
+            instructions: instructions.clone(),
+            criteria: Value::Object(criteria.clone()),
+            created_unix,
+        }
+    }
+
+    /// The contract of a served auto-skill, read back from its manifest: the
+    /// rubric's instructions and criteria verbatim, the ids in the rubric's
+    /// order (the first request's — the rubric was built from the contract);
+    /// `None` for a skill that is not an auto-skill or whose id is not the
+    /// hash of its rubric. `learn.log` is the registry's source (DESIGN D1),
+    /// but a materialised file served on a fresh state directory, or a state
+    /// directory whose `learn.log` was lost, carries an auto-skill with no
+    /// contract record; without this the skill is served and matched but
+    /// never learns again (every example refused as `full`, every attempt
+    /// skipped).
+    pub fn of_manifest(m: &manifest::SkillManifest, created_unix: u64) -> Option<Self> {
+        if !m.is_auto() {
+            return None;
+        }
+        let r = m.rubric.as_ref()?;
+        let c = Self::new(&r.instructions, &r.ordered_criteria(), created_unix);
+        (c.skill == m.id).then_some(c)
+    }
+
+    /// Whether `label` is one of the contract's option ids (the closed label
+    /// set of its auto-skill, DESIGN A5).
+    pub fn has_label(&self, label: &str) -> bool {
+        self.ids.iter().any(|i| i == label)
+    }
+
+    /// The auto-skill's rubric: the instructions and the criteria verbatim
+    /// (DESIGN D4, A18.3), the criteria in the ids' (request) order whatever
+    /// the map's order after a replay (the record stores the canonical,
+    /// key-sorted text). Its contract sha is this contract's.
+    pub fn rubric(&self) -> Rubric {
+        let criteria: Map<String, Value> = self
+            .ids
+            .iter()
+            .map(|i| {
+                (
+                    i.clone(),
+                    self.criteria.get(i).cloned().unwrap_or(Value::Null),
+                )
+            })
+            .collect();
+        Rubric::new(self.instructions.clone(), criteria)
+    }
+
+    fn encode(&self, e: &mut Enc) {
+        e.str(&self.skill).u64(self.created_unix);
+        e.u32(self.ids.len() as u32);
+        for i in &self.ids {
+            e.str(i);
+        }
+        e.str(&canonical::to_string(&self.instructions));
+        e.str(&canonical::to_string(&self.criteria));
+    }
+
+    fn decode(d: &mut Dec<'_>) -> Result<Self> {
+        let skill = d.str()?;
+        let created_unix = d.u64()?;
+        let n = d.u32()? as usize;
+        ensure!(
+            n <= crate::protocol::MAX_CHOICE_OPTIONS,
+            "too many contract ids"
+        );
+        let ids = (0..n).map(|_| d.str()).collect::<Result<Vec<_>>>()?;
+        let instructions = canonical::parse(d.str()?.as_bytes())?;
+        let criteria = canonical::parse(d.str()?.as_bytes())?;
+        let object = criteria
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("contract record: the criteria are not an object"))?;
+        ensure!(
+            ids.len() == object.len() && ids.iter().all(|i| object.contains_key(i)),
+            "contract record: the option ids are not the criteria keys"
+        );
+        ensure!(
+            skill == manifest::auto_skill_id(&instructions, object),
+            "contract record: the skill id does not match its contract"
+        );
+        Ok(Self {
+            skill,
+            ids,
+            instructions,
+            criteria,
+            created_unix,
+        })
+    }
+}
+
+/// The contracts learned so far, by auto-skill id (first seen wins).
+#[derive(Clone, Debug, Default)]
+pub struct ContractRegistry {
+    contracts: BTreeMap<String, Contract>,
+}
+
+impl ContractRegistry {
+    pub fn get(&self, skill: &str) -> Option<&Contract> {
+        self.contracts.get(skill)
+    }
+
+    pub fn contains(&self, skill: &str) -> bool {
+        self.contracts.contains_key(skill)
+    }
+
+    pub fn len(&self) -> usize {
+        self.contracts.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.contracts.is_empty()
+    }
+
+    /// Register a contract unless its id is known; whether it was new.
+    pub fn insert(&mut self, c: Contract) -> bool {
+        if self.contracts.contains_key(&c.skill) {
+            return false;
+        }
+        self.contracts.insert(c.skill.clone(), c);
+        true
+    }
+
+    /// Every contract, by id.
+    pub fn iter(&self) -> impl Iterator<Item = &Contract> {
+        self.contracts.values()
+    }
+}
+
 /// A learning attempt (resets the counter of its label).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttemptRecord {
@@ -257,6 +429,8 @@ pub enum LogRecord {
     Rollback {
         generation: u64,
     },
+    /// The contract of an auto-skill, written before its first example (0.8.6).
+    Contract(Contract),
 }
 
 impl LogRecord {
@@ -282,6 +456,10 @@ impl LogRecord {
                 e.u64(*generation);
                 KIND_ROLLBACK
             }
+            LogRecord::Contract(c) => {
+                c.encode(&mut e);
+                KIND_CONTRACT
+            }
         };
         (kind, e.0)
     }
@@ -300,6 +478,7 @@ impl LogRecord {
             KIND_ROLLBACK => LogRecord::Rollback {
                 generation: d.u64()?,
             },
+            KIND_CONTRACT => LogRecord::Contract(Contract::decode(&mut d)?),
             k => bail!("unknown learn.log record kind {k}"),
         };
         d.finish()?;
@@ -584,7 +763,7 @@ impl LearningBuffer {
             LogRecord::Example(x) => self.insert(x.clone()),
             LogRecord::Attempt(a) => self.reset(&a.skill, &a.label),
             LogRecord::Rollback { .. } => self.reset_all(),
-            LogRecord::CachePut(_) => {}
+            LogRecord::CachePut(_) | LogRecord::Contract(_) => {}
         }
     }
 }
@@ -671,5 +850,87 @@ mod tests {
         std::fs::write(&p, &bytes).unwrap();
         let (_, rep) = LearnLog::open(&p).unwrap();
         assert_eq!(rep.records.len(), 3);
+    }
+
+    fn object(v: Value) -> Map<String, Value> {
+        v.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn a_contract_registry_is_rebuilt_from_the_log_first_seen_wins() {
+        let a = Contract::new(
+            &serde_json::json!("Which?"),
+            &object(serde_json::json!({"x": "ex", "y": "why"})),
+            1,
+        );
+        // The same contract, the criteria in another order: one key (A18.1).
+        let a2 = Contract::new(
+            &serde_json::json!("Which?"),
+            &object(serde_json::json!({"y": "why", "x": "ex"})),
+            2,
+        );
+        assert_eq!(a.skill, a2.skill);
+        assert_eq!(a2.ids, ["y", "x"]);
+        // Other instructions over the same ids: another contract.
+        let b = Contract::new(
+            &serde_json::json!("Other"),
+            &object(serde_json::json!({"x": "ex", "y": "why"})),
+            2,
+        );
+        assert_ne!(a.skill, b.skill);
+        assert!(a.has_label("y") && !a.has_label("z"));
+        let r = a.rubric();
+        assert_eq!(r.instructions, "Which?");
+        assert_eq!(r.order(), ["x", "y"]);
+        assert_eq!(r.auto_skill_id(), a.skill);
+        // Non-string and null instructions and null criteria are kept
+        // verbatim; the rubric reproduces the sha (A18.3).
+        let o = Contract::new(
+            &serde_json::json!({"b": 1, "a": [true]}),
+            &object(serde_json::json!({"q": null, "p": {"d": "x"}})),
+            3,
+        );
+        let r = o.rubric();
+        assert_eq!(r.instructions, serde_json::json!({"a": [true], "b": 1}));
+        assert_eq!(r.criteria["q"], Value::Null);
+        assert_eq!(r.order(), ["q", "p"]);
+        assert_eq!(r.auto_skill_id(), o.skill);
+        let none = Contract::new(
+            &Value::Null,
+            &object(serde_json::json!({"q": null, "p": {"d": "x"}})),
+            3,
+        );
+        assert_ne!(none.skill, o.skill);
+        assert_eq!(none.rubric().auto_skill_id(), none.skill);
+        assert_eq!(none.rubric().instructions, Value::Null);
+        // Ids may hold any byte (the key hashes canonical JSON, not a join).
+        let odd = Contract::new(
+            &serde_json::json!({"k": [1, null]}),
+            &object(serde_json::json!({"b": "B", "a\nc": null})),
+            11,
+        );
+        let frame = LogRecord::Contract(odd.clone()).frame();
+        let (recs, used) = read_records(&frame);
+        assert_eq!((recs, used), (vec![LogRecord::Contract(odd)], frame.len()));
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("learn.log");
+        {
+            let (log, _) = LearnLog::open(&p).unwrap();
+            log.append(&LogRecord::Contract(a.clone())).unwrap();
+            log.append(&LogRecord::Contract(a2.clone())).unwrap();
+            log.append(&LogRecord::Contract(o.clone())).unwrap();
+        }
+        let (_, rep) = LearnLog::open(&p).unwrap();
+        let mut reg = ContractRegistry::default();
+        for rec in &rep.records {
+            if let LogRecord::Contract(c) = rec {
+                reg.insert(c.clone());
+            }
+        }
+        assert_eq!(reg.len(), 2);
+        assert_eq!(reg.get(&a.skill), Some(&a));
+        assert_eq!(reg.get(&o.skill), Some(&o));
+        let ids: Vec<&str> = reg.iter().map(|c| c.skill.as_str()).collect();
+        assert!(ids.windows(2).all(|w| w[0] < w[1]));
     }
 }

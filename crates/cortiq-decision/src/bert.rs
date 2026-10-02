@@ -764,10 +764,10 @@ impl Encoder {
         packed: &[&crate::packed::Packed],
     ) -> Result<Option<EmbeddingAndErrors>> {
         #[cfg(target_os = "macos")]
-        if let Some(metal) = &self.metal {
-            if packed.iter().all(|p| p.tasks() == 0 || p.metal.is_some()) {
-                return metal.lock().embed_and_score(ids, hash, packed).map(Some);
-            }
+        if let Some(metal) = &self.metal
+            && packed.iter().all(|p| p.tasks() == 0 || p.metal.is_some())
+        {
+            return metal.lock().embed_and_score(ids, hash, packed).map(Some);
         }
         #[cfg(feature = "vulkan")]
         if let Some(v) = &self.vulkan {
@@ -1253,7 +1253,7 @@ mod tests {
         let mut b = b"\x93NUMPY\x01\x00".to_vec();
         let header = "{'descr': '<f4', 'fortran_order': False, 'shape': (2, 3), }";
         let mut h = header.to_string();
-        while (10 + h.len() + 1) % 64 != 0 {
+        while !(10 + h.len() + 1).is_multiple_of(64) {
             h.push(' ');
         }
         h.push('\n');

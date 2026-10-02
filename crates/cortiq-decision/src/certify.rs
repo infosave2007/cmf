@@ -46,6 +46,49 @@ pub const THETA_CAP: f32 = 0.999;
 /// The halves rule, as recorded in a skill manifest.
 pub const HALVES_RULE: &str =
     "calibration rows sorted by sha256(utf8 text) hex; even -> T,theta; odd -> gate";
+/// The halves rule of an auto-skill (no build rows, 0.8.6): its calibration
+/// subset C is a property of each learned row, never stored — a row is in C
+/// iff the first 8 bytes of `sha256(phi_P as f32 little-endian)` read as a
+/// little-endian u64 give 4 modulo 5 (≈ 20 %), so a row never moves between
+/// the fit and C as more rows arrive (a positional carve-out would, and the
+/// champion would be scored on rows it fitted). Inside C the halves follow
+/// [`halves`] over the same hex keys. [`auto_row_key`] computes both.
+pub const HALVES_RULE_AUTO: &str = "learned rows: in C iff u64le(sha256(phi_P f32le)[..8]) % 5 == 4; C sorted by that sha256 hex; even -> T,theta; odd -> gate";
+/// The modulus of [`HALVES_RULE_AUTO`] (one row in five is calibration).
+pub const AUTO_CAL_EVERY: u64 = 5;
+
+/// The key of a learned row under [`HALVES_RULE_AUTO`]: the hex sha256 of its
+/// φ_P as little-endian f32 bytes, and whether the row is in the calibration
+/// subset C. Text-free (the buffer holds vectors only) and deterministic.
+pub fn auto_row_key(phi_p: &[f32]) -> (String, bool) {
+    let (hex, head) = phi_p_digest(phi_p);
+    (hex, head % AUTO_CAL_EVERY == AUTO_CAL_EVERY - 1)
+}
+
+/// Whether a text of an auto-skill that still has quarantined labels is
+/// *explored* (DESIGN A16): its locally accepted answer is escalated to the
+/// oracle anyway when `u64le(sha256(φ_P f32le)[..8]) % every == 0`, so a
+/// rare label collects examples at `1/every` of its traffic even while the
+/// gate confidently misnames it. `every == 0` turns exploration off. The same
+/// digest as [`auto_row_key`]: with the default 4 the explored rows (0 mod 4)
+/// and the calibration rows (4 mod 5) are different residue classes, and a
+/// text is explored or not regardless of order and population.
+pub fn auto_explores(phi_p: &[f32], every: u64) -> bool {
+    every != 0 && phi_p_digest(phi_p).1.is_multiple_of(every)
+}
+
+/// The hex sha256 of φ_P as little-endian f32 bytes and its first 8 bytes as
+/// a little-endian u64 (the key of [`auto_row_key`] and [`auto_explores`]).
+fn phi_p_digest(phi_p: &[f32]) -> (String, u64) {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    for v in phi_p {
+        h.update(v.to_le_bytes());
+    }
+    let digest = h.finalize();
+    let head = u64::from_le_bytes(digest[..8].try_into().expect("8 bytes"));
+    (format!("{digest:x}"), head)
+}
 
 /// `0.05 / 14`.
 pub fn alpha() -> f64 {
@@ -358,6 +401,82 @@ mod tests {
         let (even, odd) = halves(&keys);
         assert_eq!(even, vec![1, 0, 4]);
         assert_eq!(odd, vec![3, 2]);
+    }
+
+    /// The auto calibration membership is a function of the row alone (the
+    /// same φ_P gives the same key and answer in any order and population)
+    /// and lands close to one row in five over a large sample.
+    #[test]
+    fn auto_row_key_is_deterministic_and_about_a_fifth() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut vec = |n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                    (x >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+                })
+                .collect()
+        };
+        let rows: Vec<Vec<f32>> = (0..20_000).map(|_| vec(16)).collect();
+        let first: Vec<(String, bool)> = rows.iter().map(|r| auto_row_key(r)).collect();
+        let again: Vec<(String, bool)> = rows.iter().rev().map(|r| auto_row_key(r)).collect();
+        assert!(first.iter().eq(again.iter().rev()));
+        assert!(first.iter().all(|(k, _)| k.len() == 64));
+        let in_c = first.iter().filter(|(_, c)| *c).count();
+        let share = in_c as f64 / rows.len() as f64;
+        assert!((0.18..=0.22).contains(&share), "share in C {share}");
+        // Keys are the hex sha256 of the little-endian bytes.
+        let (k, _) = auto_row_key(&[1.0, -2.5]);
+        let mut bytes = Vec::new();
+        for v in [1.0f32, -2.5] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        assert_eq!(k, crate::manifest::sha256_hex(&bytes));
+    }
+
+    /// Exploration (DESIGN A16) is the residue of the same digest's head:
+    /// `every == 0` is off, `every == 1` explores everything, and with the
+    /// default 4 about a quarter of the rows are explored, never a row of
+    /// the calibration subset (the residue classes 0 mod 4 and 4 mod 5 meet
+    /// only on 1/20 of the rows — both rules hold for those, and the fit
+    /// never sees them).
+    #[test]
+    fn auto_explores_follows_the_hash_rule_and_zero_turns_it_off() {
+        let phi = [1.0f32, -2.5];
+        let mut bytes = Vec::new();
+        for v in phi {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let digest = <sha2::Sha256 as sha2::Digest>::digest(&bytes);
+        let head = u64::from_le_bytes(digest[..8].try_into().unwrap());
+        for every in 1..=7u64 {
+            assert_eq!(
+                auto_explores(&phi, every),
+                head % every == 0,
+                "every {every}"
+            );
+        }
+        assert!(auto_explores(&phi, 1));
+        assert!(!auto_explores(&phi, 0));
+        assert!(!auto_explores(&[], 0));
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let rows: Vec<Vec<f32>> = (0..20_000)
+            .map(|_| {
+                (0..16)
+                    .map(|_| {
+                        x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                        (x >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+                    })
+                    .collect()
+            })
+            .collect();
+        let explored = rows.iter().filter(|r| auto_explores(r, 4)).count();
+        let share = explored as f64 / rows.len() as f64;
+        assert!((0.23..=0.27).contains(&share), "explored share {share}");
+        assert!(rows.iter().all(|r| !auto_explores(r, 0)));
+        // The same row answers the same in any order (a property of the row).
+        let again = rows.iter().rev().filter(|r| auto_explores(r, 4)).count();
+        assert_eq!(again, explored);
     }
 
     #[test]

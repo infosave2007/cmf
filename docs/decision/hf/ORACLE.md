@@ -72,7 +72,9 @@ says first whether it is ready — [Check your setup](#check-your-setup)).
 
 Superset questions (a skill's labels plus new ones) are decided by the oracle
 only; for a caller with `learning_allowed` the answer teaches that skill, and
-a new label starts a cold start.
+a new label starts a cold start. A choice question no skill fits is learned
+into an *auto-skill* of its own ([Auto-skills](#auto-skills)), for such a
+caller only.
 
 ## Self-learning
 
@@ -127,7 +129,130 @@ a new label starts a cold start.
   every label that got new examples, however few (there is no threshold of
   25 here), checks each challenger on the holdout and re-certifies the gate
   once at the end; if a certified gate would be lost, every promotion of the
-  skill is undone (see API.md, section 7).
+  skill is undone (see API.md, section 7). An auto-skill (below) learns
+  online only.
+
+### Auto-skills
+
+A choice question whose option ids match no skill (`match: untrained`, not
+an ambiguous one — several skills fit — and not one forced with `cmf.skill`)
+goes to the oracle on every new text and, until 0.8.5, was never learned. Since
+0.8.6 its *contract* becomes a skill of its own:
+
+* **Key.** The contract is the question itself: `auto-` + the first 12 hex
+  characters of the sha256 of the canonical JSON of `{type, instructions,
+  criteria}` — the instructions as sent (`null` when absent), the criteria
+  object with its keys sorted and every description kept. The criteria in
+  any order are one contract; other instructions, a changed description, a
+  dropped or an added option are each another contract, learned separately.
+  The id set alone is not the key: two clients using `{yes, no}` under
+  different questions get two skills, and a multiple-choice benchmark whose
+  positional ids `{A, B, C, D}` carry a new description per request is never
+  learned as one skill (every request is its own contract, bounded by
+  `auto_max_skills`). To be learned, a client keeps its question stable —
+  the same instructions text, the same ids with the same descriptions. The
+  first request's instructions and criteria are stored verbatim as the
+  skill's rubric (the id is recomputed from it), visible through
+  `/v1/skills/{id}` to every key. The contract is written to `learn.log`
+  before its first example, so a restart rebuilds it.
+* **Who teaches.** Only a caller whose key has `learning_allowed` (the explicit
+  open mode `auth.require: false` has it; the implicit open mode of a loopback
+  address never teaches). The rule "a question that is exactly the skill's own
+  teaches it" does not apply to auto-skills: their rubric *is* the contract
+  every caller sends. `learning.auto_skills: false` turns the learning off;
+  the oracle answers as before.
+* **Examples.** Each answer is an example of the auto-skill under the
+  contract's label (the dedup of 0.995 applies). The labels are closed: a
+  feedback with a label outside the contract is refused (a request with one
+  more id is another contract, learned on its own).
+  At most `learning.auto_max_examples_per_label` (1000) examples per label.
+* **Activation.** When a label collects 25 new examples (the usual trigger)
+  the whole skill is attempted: one row in five — by a hash of the row itself,
+  so a row never moves between the fit and the calibration subset as more
+  arrive — is held out; a label with ≥ `auto_min_rows` (10) fit rows is
+  *eligible* and fitted (rank `auto_k`, 8), the others stay quarantined; the
+  attempt needs two eligible labels including the triggering one and, the
+  first time, the eligible labels must hold ≥ `auto_min_coverage` (0.8) of
+  the contract's rows. T and θ are certified on the held-out rows as at build
+  time (τ certifies only with 100 accepted odd rows, so the skill reports
+  `certified: false` for a long time, and its winners are `cold_start` ones —
+  never certified). The first activation (`auto_start`) requires a macro
+  agreement of the fitted skill with the oracle's labels on the held-out rows
+  ≥ `auto_min_agreement` (0.8) and ≥ 0.5 per label; a later attempt
+  (`auto_refit`, the whole skill refitted) must not regress the champion on
+  the same rows (the holdout rule). A promotion writes a generation that
+  carries the auto-skill entirely; every other skill is byte for byte the
+  same.
+* **Serving.** The contract is then decided locally, `match: exact`,
+  `skill: auto-…`, `certified: false`. An auto-skill is matched by its
+  contract alone: a part of its ids, a superset, other instructions or another
+  description is another contract (`untrained`, learned on its own), never a
+  `subset` or `superset` of the auto-skill. A quarantined label still counts
+  as known within the contract: it gets probability 0, and a text of it is
+  expected to abstain on novelty and keep teaching it. Because θ and T of a
+  young auto-skill come from a handful of rows (θ is close to the largest
+  novelty of the even half, T may sit at a bound), a local answer also needs
+  `p_top ≥ learning.auto_tau` (0.9) under `balanced` and `quality-first`
+  (`cost-saver` keeps its θ-only rule), and the T an attempt records is
+  floored at `learning.auto_temperature_min` (0.02): a clean held-out subset
+  fits T at its lower bound, where every `p_top` is 1 and the `auto_tau`
+  floor never bites. An abstention escalates and teaches as any other. The
+  agreement gate is the real guard while the subset is small; the gate
+  improves with every refit. Rejected examples are never forgotten: a
+  contract polluted by a noisy oracle needs more consistent examples, not a
+  reset (or a rollback to a generation before it).
+* **Exploration.** The hard rule — a question the gate accepted never
+  reaches the oracle — has exactly one exception, for auto-skills only and
+  only while one of their labels is quarantined: the gate names such a
+  label's texts as a neighbour with full confidence (measured on a stand: all
+  21 texts of a quarantined label answered locally as another label at
+  `p_top` 1), so without it the label could never learn. One text in
+  `learning.auto_explore_every` (8; `u64le(sha256(φ_P))` modulo it is 0, a
+  property of the text, never of the order; 0 turns it off) is escalated
+  although accepted: the oracle's answer is served (`action: oracle` /
+  `cache`, the flag `explore`, the `gate` block still reports `accepted:
+  true`) and learned as usual, so the rare label collects examples at a
+  quarter of its traffic until the next attempt activates it, after which
+  the contract explores no more. A refused or failed call leaves the local
+  answer. Exploration draws only when the answer could teach: the oracle
+  consented, learning and `auto_skills` on, a key with `learning_allowed`;
+  data skills, `cortiq decide`, shadow mode and `/v1/route` never explore.
+* **Limits.** A contract is learned only with 2..`auto_max_labels` (64) option
+  ids and while fewer than `auto_max_skills` (256) contracts are registered;
+  otherwise the oracle answers and nothing is recorded (`auto_skipped` in
+  `GET /v1/admin/learning`, one warning an hour, never the ids). Every
+  generation re-carries every auto-skill's rows: with many contracts run
+  `cortiq decision materialize` from time to time and serve the materialised
+  file (it holds the auto-skills as ordinary skills; `decide --labels` and
+  `verify` read it; such a file needs cortiq ≥ 0.8.6). A served auto-skill
+  keeps learning wherever its contract comes from: the contract record of
+  `learn.log`, or — a materialised file on a fresh state directory, a
+  `learn.log` lost while the generations were kept — the skill's own labels
+  and rubric, registered (and written to `learn.log`) at start and after a
+  rollback.
+* **Routing.** `/v1/route` without `taxonomy_id` still means the file's only
+  data skill; an auto-skill is routed by its id (its question is then the
+  whole contract from the rubric). `cortiq decide --labels` never names an
+  auto-skill by labels alone: `--skill auto-…` names it and its rubric
+  supplies the contract. When a data skill and auto-skills fit a question
+  equally, the data skill answers; two auto-skills of one contract cannot
+  exist (the contract is the id).
+* **Admin.** `GET /v1/admin/learning` lists `auto_skills` (id, labels,
+  `examples` per label — the rows the next attempt fits: the served learned
+  rows of the label plus the buffer examples not among them, each row once,
+  so their sum is the attempt's `rows.total` — what is served),
+  `auto_contracts` and `auto_skipped`;
+  attempts carry `kind: auto_start | auto_refit` and an `auto` block with the
+  eligible and quarantined labels, the rows and the agreement. `/healthz`
+  adds `auto_skills`. Rollback to an earlier generation drops the skill from
+  the served model (the contract is untrained again; its examples stay and
+  start it over at the next trigger).
+* **Compatibility.** A 0.8.5 binary opening a 0.8.6 state directory truncates
+  `learn.log` at the first contract record and refuses a generation that
+  carries an auto-skill (the same rule as the `LOCK` of 0.7.9: never run an
+  older binary on a newer state directory). The cache scope of a contract
+  changes from the contract to the skill at its activation, so its first
+  requests after that miss the cache (they are answered locally anyway).
 
 ## Budget and stop rules
 
@@ -504,21 +629,20 @@ oracle: resumed — the oracle of state directory cortiq-decision.cmf.state was 
 
 **After an interrupted run** (Ctrl-C, SIGTERM, a closed terminal) the
 `LOCK` is released; a signal the run inherited as ignored (`nohup`, a
-background job of a script) stays ignored. A run that was killed (SIGKILL,
-out of memory, a crash) leaves its `LOCK` file but not its lock (an advisory
-`flock` that the kernel ends with the process), and the next run takes it
-over with a warning naming that pid:
+background job of a script) stays ignored. A `LOCK` left by a crash is
+named with its pid (`state directory cortiq-decision.cmf.state has a LOCK
+left by pid 42341, which is no longer running (an interrupted run): pass
+--break-lock to remove it, or give this run a directory of its own with
+--state DIR`); `--break-lock` removes it only when that process is gone:
 
-```text
-… WARN cortiq_decision::statedir: took over the LOCK of state directory cortiq-decision.cmf.state left by pid 42341, which ended without releasing it (killed, out of memory or a crash) lock=cortiq-decision.cmf.state/LOCK
+```bash
+cortiq decide cortiq-decision.cmf --skill banking77 -p "thanks for your help" --oracle deepseek/deepseek-v4.1-flash --break-lock
 ```
 
-The `LOCK` of a running process is never taken, `--break-lock` included:
-the run stops with `state directory cortiq-decision.cmf.state is held by
-pid 42341 (a running cortiq serve, or another cortiq decide --oracle): …`
-and what to do. `--break-lock` matters only where the directory's
-filesystem has no advisory locks (Windows, some network mounts): there a
-`LOCK` left by a crash stays until `--break-lock` removes it.
+```text
+warning: removed the LOCK of state directory cortiq-decision.cmf.state left by pid 42341, which is not running (--break-lock)
+…
+```
 
 ### Who may use it, and who teaches
 
@@ -536,7 +660,8 @@ filesystem has no advisory locks (Windows, some network mounts): there a
   (`oracle_allowed: true`, like imported router keys); `--oracle-allowed=false`
   makes one that never escalates, and `--oracle-budget-usd` caps one key's
   oracle spending. Teaching the shared skills is a separate permission,
-  `--learning-allowed` (off by default). Keys made through `POST
+  `--learning-allowed` (off by default); it alone lets a caller's untrained
+  contracts become [auto-skills](#auto-skills). Keys made through `POST
   /v1/admin/keys` keep the router's default (`oracle_allowed` only when the
   body says so).
 

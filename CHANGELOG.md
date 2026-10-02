@@ -5,7 +5,77 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.6] - 2026-10-02
+
+### Added
+- Auto-skills: `cortiq serve` learns an untrained choice question (option
+  ids no skill fits) from the oracle's answers into a skill of its own, for
+  callers whose key has `learning_allowed`. The contract is the question —
+  `instructions` and `criteria` with their descriptions, not the id set: the
+  id is `auto-<sha12 of the canonical {type, instructions, criteria}>` with
+  the criteria keys sorted, so the criteria in any order are one contract,
+  while other instructions, a changed description or another option set are
+  each another (the same `{yes, no}` under two questions are two skills;
+  positional ids whose descriptions change per request never become one).
+  An auto-skill is matched by its contract alone, never as a subset or
+  superset; a client keeps its question stable to be learned. The rubric of
+  the skill stores the first request's instructions and criteria verbatim
+  (`rubric.instructions` may be any JSON value, `null` for a System One
+  question). Once two labels have enough examples and the fitted
+  skill agrees with the oracle on a held-out fifth of its rows, it is written
+  as a generation and the contract is answered locally (`match: exact`,
+  `skill: auto-…`, `certified: false`, a `p_top ≥ learning.auto_tau` floor);
+  rare labels stay quarantined and keep teaching; later attempts refit the
+  whole skill under a regression gate. `learn.log` gains a contract record;
+  `GET /v1/admin/learning` lists `auto_skills`, `auto_contracts`,
+  `auto_skipped` and attempts of kind `auto_start` / `auto_refit`;
+  `GET /v1/skills` adds `auto`, `active_labels`, `quarantined_labels`,
+  `examples`; `/healthz` adds `auto_skills`. Configuration:
+  `learning.auto_skills`, `auto_min_rows`, `auto_k`, `auto_tau`,
+  `auto_min_agreement`, `auto_min_coverage`, `auto_max_skills`,
+  `auto_max_labels`, `auto_max_examples_per_label` (API.md §3.2, §6;
+  ORACLE.md "Auto-skills").
+- Auto-skills, after the stand run: the gate temperature an attempt records
+  is floored at `learning.auto_temperature_min` (0.02; a clean held-out
+  subset fits T at its lower bound, where every `p_top` is 1 and the
+  `auto_tau` floor never bites; the evidence keeps the fitted `log_t`), and
+  *exploration*: while a label of an auto-skill is quarantined, one text in
+  `learning.auto_explore_every` (8, by a hash of φ_P; 0 = off) is escalated
+  although the gate accepted it — the one exception to the rule that a
+  gate-accepted question never reaches the oracle, auto-skills only — its
+  oracle answer served (`action: oracle`/`cache`, flag `explore`) and
+  learned, so the rare label collects examples until it activates (API.md
+  §3.2, §6; ORACLE.md "Exploration").
+- Decision format: a generation overlay may carry a skill the base file does
+  not have — an *auto-skill* (reserved id prefix `auto-`, no build rows,
+  `data.calibration.source: "learned"`, every row in `rows.learned`). The
+  loader, `verify`, `info`, `materialize`, generation listing (`auto_skills`)
+  and `OverlayBuilder::add_skill` handle it; a materialised file with an
+  auto-skill reads with cortiq ≥ 0.8.6. `cortiq decision train`/`add-skill`
+  refuse the reserved prefix. A served auto-skill without a contract record
+  in `learn.log` (a materialised file on a fresh state directory, a lost
+  `learn.log`) is registered from its own labels and rubric at start and
+  after a rollback, so it keeps learning.
+
+### Changed
+- Matching: an auto-skill relates to a question only by contract equality
+  (exact); its quarantined labels count as known within the contract (a
+  quarantined option gets probability 0); when one data skill and auto-skills
+  fit a question equally, the data skill answers. `/v1/route` without
+  `taxonomy_id` and `cortiq decide` without `--skill` count data skills only,
+  so a single-skill file keeps its implicit taxonomy after an auto-skill is
+  learned; `decide --labels` names an auto-skill only with `--skill`.
+
+### Compatibility
+- A 0.8.5 binary refuses a generation that carries an auto-skill ("is not in
+  the base file"); generations are local state and are never shipped. Never
+  run an older binary on a 0.8.6 state directory.
+- The skill id prefix `auto-` is now reserved: a decision file built by an
+  older release with a *user* skill whose id starts with `auto-` (for example
+  `cortiq decision train --skill auto-triage …`) no longer opens — `serve`,
+  `verify`, `info`, `decide` and `learn` refuse it with "the 'auto-' id prefix
+  is reserved for auto-skills". Rebuild that skill under another id. The id is
+  the discriminator the learner relies on, so the file is not read leniently.
 
 ## [0.8.5] - 2026-10-01
 

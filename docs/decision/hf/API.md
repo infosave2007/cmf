@@ -1,16 +1,17 @@
 # Cortiq Decision — API
 
 `cortiq serve cortiq-decision.cmf` starts one HTTP server with two native
-protocols and an opt-in request adapter:
+protocols and, when explicitly enabled, a third request adapter:
 
-* the **Cortiq decisions protocol** in a Jev / OpenRouter-shaped form
+* the **Cortiq decisions protocol** in the Jev / OpenRouter-shaped form
   (`POST /api/alpha/decisions`), with an optional `cmf` extension;
 * the **cortiq-router API**, schema `1.1` (`POST /v1/route` and the rest), so
   that existing router clients switch by changing the backend address only;
-* when `--jev-compatible` is set, the TypeSafe System One request endpoint
-  (`POST /v1/systemone`). Its response identity remains a local CMF model.
+* `POST /v1/systemone`, the opt-in TypeSafe System One / Jev-compatible
+  request format (`--jev-compatible`). It always identifies its result as a
+  local CMF model, not as Jev.
 
-All use the same local model and the same oracle cascade ([ORACLE.md](ORACLE.md)).
+Both run the same local model and the same oracle cascade ([ORACLE.md](ORACLE.md)).
 There is no web interface and no CORS layer. Request bodies are never logged:
 a log line holds the request id, status, latency and account.
 
@@ -100,7 +101,7 @@ stale `LOCK` of a dead process), `--shadow-of URL` and
 `--no-oracle-learning`: the oracle in two steps, the OpenRouter key in
 `OPENROUTER_API_KEY` and then this flag
 ([ORACLE.md](ORACLE.md#connect-openrouter)). Add `--jev-compatible` to expose
-the separate System One adapter in [section 3a](#3a-system-one-request-adapter-jev-compatible).
+the separate System One adapter described in [section 3a](#3a-system-one-request-adapter-jev-compatible).
 Language-model flags (`--task`, `--gpus`, …) are refused for a decision file.
 
 ```bash
@@ -358,6 +359,56 @@ matter to the oracle alone). With L = the option ids of a choice question:
 | `superset` | one skill's labels plus labels it does not know | the oracle only; its answer teaches that skill only for a key with `learning_allowed` |
 | `untrained` | anything else, and every `score` / `noul` question | the oracle only; without it the request is 422 |
 
+**Auto-skills (0.8.6).** A choice question no skill fits (`untrained` because
+of its options, not an ambiguous one and not one forced with `cmf.skill`) is
+learned from the oracle's answers when the caller's key has `learning_allowed`
+and `learning.auto_skills` is on (the default). Its *contract* is the whole
+question — `instructions` and `criteria` with their descriptions, not the id
+set: the key is `auto-<12 hex of the sha256 of the canonical JSON of {type,
+instructions, criteria}>` with the criteria keys sorted (so the criteria in
+any order are one contract, while other instructions, a changed description,
+a dropped or an added option are each another contract — `{yes, no}` under
+"Is this spam?" and under "Is this urgent?" are two skills that never answer
+each other's question, and positional ids `{A, B, C, D}` whose descriptions
+change with every request are never learned as one). The answers accumulate
+as examples of that skill, and once enough evidence is there (2 labels with ≥
+`auto_min_rows` fit rows, the active labels holding ≥ `auto_min_coverage` of
+the examples, a macro agreement with the oracle on a held-out fifth of the
+rows ≥ `auto_min_agreement`) the skill is fitted, written as a generation and
+served: the same contract is then `exact`, `action: local`, `skill: auto-…`,
+always `certified: false` (`decision_path` `router:uncertified`). An
+auto-skill is matched by its contract alone — never as a `subset` or
+`superset` — so to be learned and then answered locally a client keeps the
+question stable: the same `instructions` text, the same option ids with the
+same descriptions (`null` descriptions, and absent instructions, count as
+such and stay stable). Labels the oracle rarely picks stay *quarantined*: they
+count as known within the contract, get probability 0, and a text of such a
+label is expected to abstain on novelty and keep teaching it. A
+young auto-skill's gate comes from a handful of rows, so a local answer also
+needs `p_top ≥ learning.auto_tau` (0.90; `balanced` and `quality-first`) and
+its temperature is floored at `learning.auto_temperature_min` (0.02 — a clean
+calibration subset fits T at its lower bound, where every `p_top` is 1);
+whatever abstains escalates and teaches, and later attempts refit the whole
+skill under a regression gate. *Exploration* is the one exception to the hard
+rule that a gate-accepted question never reaches the oracle: while a label of
+an auto-skill is quarantined, a question the gate accepted is escalated anyway
+when the text's hash says so (`u64le(sha256(φ_P))` ≡ 0 modulo
+`learning.auto_explore_every`, 8 — one text in eight; 0 turns it off), because
+the gate confidently names a quarantined label's texts as a neighbour and they
+would otherwise never teach it. The oracle's answer is served (`action:
+oracle` / `cache`, `decision_path` `escalate→…`, the flag `explore`, the
+`gate` block still `accepted: true`) and learned as usual, so the rare label
+collects examples at a quarter of its traffic until it activates; a refused
+or failed call leaves the local answer. Only auto-skills explore, only while
+a label is quarantined, and only when the answer could teach (the oracle
+consented, learning on, a key with `learning_allowed`); `cortiq decide`,
+shadow mode and `/v1/route` never do. Its rubric is the contract — the first
+caller's instructions and criteria verbatim — visible through
+`/v1/skills/{id}` to every key (as cached answers are shared across accounts).
+Limits, who teaches and the state directory's compatibility:
+[ORACLE.md](ORACLE.md#auto-skills). When a data skill and auto-skills fit a
+question equally, the data skill answers.
+
 `cmf.skill` names the skill and skips the search (an unknown id is 400). An
 answer is `certified: true` only for an exact match on a string `state`, the
 `balanced` or `quality-first` profile, a skill whose gate is certified, and a
@@ -407,7 +458,7 @@ curl -s "$CORTIQ/v1/skills/banking77" -H "Authorization: Bearer $KEY" \
 | `source`, `skill`, `match`, `certified` | where the answer came from; section 3.2 |
 | `gate` | `accepted`, `p_top` and `tau`, `novelty` and `theta`, `is_novel`, `margin`, `profile` |
 | `errors` | reconstruction errors of the 5 best labels (all of them with `cmf.explain`) |
-| `flags` | e.g. `oracle_disabled`, `no_key` (with `oracle_disabled`: the key variable is not set), `bad_key` (with `oracle_disabled`: it holds something that is not a key), `consent_off`, `budget`, `stopped`, `oracle_unavailable`, `pii_redacted` |
+| `flags` | e.g. `oracle_disabled`, `no_key` (with `oracle_disabled`: the key variable is not set), `bad_key` (with `oracle_disabled`: it holds something that is not a key), `consent_off`, `budget`, `stopped`, `oracle_unavailable`, `pii_redacted`, `explore` (a gate-accepted question of an auto-skill answered by the oracle for exploration, section 3.2) |
 | `confident` | the answer can be used as is (gate accepted and not novel, or a valid oracle answer) |
 | `complexity` | `{score, tier, factors: {base, ambiguity, novelty, margin, length}}`, the cortiq-router formula |
 | `routing` | `{target, reason}` when `routing_tiers` maps the tier |
@@ -529,13 +580,15 @@ curl -s "$CORTIQ/v1/feedback" -H "Authorization: Bearer $KEY" \
 | Path | Access | Returns |
 |---|---|---|
 | `GET /v1/models` | open | the model in the shape of an OpenRouter provider listing (`id`, `pricing` as USD-per-token strings, `context_length` 512, `max_output_length` 255) plus `cmf.skills` with each gate |
-| `GET /v1/skills` | key | every skill: `id`, `taxonomy_version`, `labels`, `certified`, `tau`, `theta`, `temperature` and `has_rubric` (whether it has a rubric; the rubric itself is per skill) |
+| `GET /v1/skills` | key | every skill: `id`, `taxonomy_version`, `labels` (the active ones), `certified`, `tau`, `theta`, `temperature`, `has_rubric` (whether it has a rubric; the rubric itself is per skill) and, since 0.8.6, `auto` (an auto-skill), `active_labels` (their count), `quarantined_labels` (the labels not scored yet) and `examples` (learned rows); auto-skills are listed after the file's skills |
 | `GET /v1/skills/{id}` | key | the same plus `tasks`, the whole `gate` and `rubric` (`instructions`, `criteria`; `null` without one) |
 | `GET /v1/usage` | key | the caller's account (router format; `x-cmf-extensions: 1` adds token and cost totals) |
-| `GET /healthz` | open | status, model, generation, skills, `oracle` (on/off) and `oracle_status` (`ready`, `no_key`, `bad_key`, `disabled`, `budget_exhausted`, `budget_too_small`, `stopped: <reason>`; section 5) |
+| `GET /healthz` | open | status, model, generation, skills (every served skill), `auto_skills` (0.8.6), `oracle` (on/off) and `oracle_status` (`ready`, `no_key`, `bad_key`, `disabled`, `budget_exhausted`, `budget_too_small`, `stopped: <reason>`; section 5) |
 
-`/v1/models` only has the listing's shape; Cortiq Decision is not listed on
-OpenRouter.
+Without `--jev-compatible`, `/v1/models` has only the native OpenRouter-style
+listing shape; Cortiq Decision is not listed on OpenRouter. With the adapter
+enabled it instead returns the System One discovery `models` array described in
+[section 3a](#3a-system-one-request-adapter-jev-compatible).
 
 ```bash
 curl -s "$CORTIQ/v1/models" \
@@ -548,34 +601,72 @@ curl -s "$CORTIQ/v1/usage" -H "Authorization: Bearer $KEY" -H 'x-cmf-extensions:
 
 ## 3a. System One request adapter (Jev-compatible)
 
-Enable the adapter explicitly; native endpoints remain unchanged:
+Enable this endpoint explicitly; it is off by default so native clients retain
+their existing contracts:
 
 ```bash
 cortiq serve cortiq-decision.cmf --state ./decision.state \
   --jev-compatible --port 8080
 ```
 
-`POST /v1/systemone` accepts the TypeSafe System One request shape and uses the
-same local skills, gate, key policy, limits and optional oracle. `model` may be
-omitted; `jev-latest`, `jev-preview`, `jev-1.13.0`, and the
-`typesafe/jev-1.13` selector series are accepted as **transport aliases**.
-Responses always identify the served CMF implementation as
-`cmf-decision-0.8.5`, not as Jev. `state` may be a string, object, array or
-`null`; question `instructions` may be omitted or `null`.
+`POST /v1/systemone` accepts the TypeSafe System One request shape. It uses the
+same local CMF skills, gate, key policy, limits and optional oracle as the
+native server. It does **not** load Jev weights or present itself as Jev.
+
+| Field | Adapter rule |
+|---|---|
+| `model` | optional. Omitted, `jev-latest`, `jev-preview`, `jev-1.13.0`, the `typesafe/jev-1.13` selector series, and `cmf-decision-0.8.5` select the current local CMF decision model at this endpoint only. |
+| `state` | a string, object, array or `null`. |
+| `questions` | an object of `choice`, `score` or `noul` questions. `instructions` may be omitted or `null`, matching System One clients. |
+
+For example, a client that omits `model` can send a small local choice:
 
 ```bash
 curl -s "$CORTIQ/v1/systemone" \
   -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
-  -d '{"state":"I still have not received my new card",
-       "questions":{"intent":{"type":"choice",
-       "criteria":{"card_arrival":null,"card_delivery_estimate":null}}}}'
+  -d '{
+    "state": "I still have not received my new card",
+    "questions": {
+      "intent": {
+        "type": "choice",
+        "criteria": {
+          "card_arrival": null,
+          "card_delivery_estimate": null
+        }
+      }
+    }
+  }' | jq
 ```
 
-A successful reply contains `{model, answers, usage}` with the same request
-metering as the native endpoint. In adapter mode, `GET /v1/models` returns the
-System One `models` discovery array, including the canonical CMF model and its
-transport aliases. The adapter is wire-format compatibility only: it does not
-load, return or claim Jev weights, identity or affiliation.
+A successful response is intentionally small and identifies the local model:
+
+```json
+{
+  "model": "cmf-decision-0.8.5",
+  "answers": {
+    "intent": {
+      "type": "choice",
+      "choice": "card_arrival",
+      "confidence": 0.99,
+      "probabilities": {"card_arrival": 0.99, "card_delivery_estimate": 0.01}
+    }
+  },
+  "usage": {"input_tokens": 42, "output_tokens": 2}
+}
+```
+
+The token figures use the same request metering as the native endpoint; their
+values vary with the request. `GET /v1/models` changes to System One discovery
+format in adapter mode. Its `models` array contains the canonical
+`cmf-decision-0.8.5` entry and transport aliases such as `jev-latest`; each
+alias describes itself as a route to the local CMF model. Requests use the same
+Cortiq key policy as the rest of the server. System One errors use
+`{"error":{"type", "message", "code", "request_id"}}`.
+
+The adapter is deliberately isolated: `/api/alpha/decisions` and
+`/v1/decisions` keep their stricter native model rules and continue to reject
+Jev model identifiers. Compatibility means the request/response wire format,
+not a claim of Jev identity, weights, affiliation or benchmark equivalence.
 
 ## 4. cortiq-router API (schema 1.1)
 
@@ -721,7 +812,7 @@ unset the admin API answers 404 `ADMIN_DISABLED`.
 | `POST / GET /v1/admin/keys`, `DELETE /v1/admin/keys/{account}`, `DELETE /v1/admin/keys/hash/{hash12}` | create (raw key returned once), list, revoke |
 | `GET /v1/admin/usage` | usage of every account |
 | `GET /v1/admin/oracle`, `POST /v1/admin/oracle {"enabled", "budget_usd", "max_calls"}` | oracle status: `status` (`ready`; `no_key` — the key variable is unset or empty; `bad_key` — it holds something that is not a key, never sent; `disabled` — not configured or switched off by the admin; `budget_exhausted` — something was spent and the budget (what is left cannot hold the smallest possible call, or a call it refused) or `max_calls` is used up; `budget_too_small` — nothing spent, and the budget cannot hold one call, `min_call_usd`, or `max_calls` is 0; `stopped: <reason>` — a stop rule), `configured` = `oracle.enabled` of the configuration, `enabled` = not switched off by a stop rule or the admin, `key_present`, `key_ok`, `key_problem` (by position and length, never a byte of the key), `key_trimmed` (surrounding whitespace was trimmed), `key_env` (the variable's name, never its value), `model`, `max_price`, `min_call_usd` (the least budget a call needs: the smallest possible call's reservation, or, once the budget refused a longer call — a budget below the smallest call included — that call's, the larger), spent, calls, stop reason, `last_error` (the code of the last failed call; both from a closed code set, another value read back from `oracle.state` is `unknown_code`); switch it and lower limits within the configuration (kept in `oracle.state` across restarts: when one of them refuses the next call, `cmf.hint` and the startup line name it and the `POST /v1/admin/oracle` that lifts it) |
-| `GET /v1/admin/learning` | buffer, cache, quarantine, attempts, promotions, recent events |
+| `GET /v1/admin/learning` | buffer, cache, quarantine, attempts, promotions, recent events; since 0.8.6 `auto_contracts`, `auto_skipped` and `auto_skills` (per contract: `id`, `labels`, `examples` per label — the rows an attempt fits: the served learned rows plus the pending buffer examples, each row once — `created_unix`, `served`) |
 | `GET /v1/admin/generations`, `POST /v1/admin/rollback {"generation": N}` | generations; serve generation N (0 = the base file) |
 | `GET /v1/admin/shadow` | agreement statistics in shadow mode, and the routed requests not compared since the start (section 8) |
 
@@ -762,7 +853,11 @@ unknown key is an error. The defaults:
              "max_tokens_per_question": 64, "deadline_s": 30, "budget_usd": 1.0, "max_calls": 10000,
              "max_errors": 30, "redact_pii": true, "title": "cortiq-decision", "data_collection": null},
   "cache": {"enabled": true, "threshold": 0.97, "cap": 50000},
-  "learning": {"enabled": true, "refit_min_new": 25, "dedup": 0.995, "cold_start": true, "synchronous": false},
+  "learning": {"enabled": true, "refit_min_new": 25, "dedup": 0.995, "cold_start": true, "synchronous": false,
+               "auto_skills": true, "auto_min_rows": 10, "auto_k": 8, "auto_tau": 0.9,
+               "auto_min_agreement": 0.8, "auto_min_coverage": 0.8, "auto_max_skills": 256,
+               "auto_max_labels": 64, "auto_max_examples_per_label": 1000,
+               "auto_temperature_min": 0.02, "auto_explore_every": 8},
   "feedback": {"pending_cap": 50000},
   "complexity_weights": {"base": 0.4, "ambiguity": 0.25, "novelty": 0.15, "margin": 0.1, "length": 0.1},
   "complexity_tiers": [{"tier": "low", "max": 0.33}, {"tier": "medium", "max": 0.66}, {"tier": "high", "max": 1.0}],
@@ -776,7 +871,22 @@ part of the file: the admin token and the OpenRouter key are read from the
 environment variables it names. `auth.plans` may override the plan table.
 `oracle.base_url` must be https, or plain http to a loopback address only (a
 local proxy). The oracle, cache and learning sections are explained in
-[ORACLE.md](ORACLE.md). `cortiq serve --oracle MODEL` and its companions
+[ORACLE.md](ORACLE.md). The `learning.auto_*` keys govern auto-skills
+(section 3.2, [ORACLE.md](ORACLE.md#auto-skills)): `auto_skills` learns
+untrained choice contracts at all; `auto_min_rows` fit rows (≥ 2) a label
+needs to be active; `auto_k` the rank of its topologies; `auto_tau` the
+confidence floor of a local answer (0..1; a serving parameter — `cortiq
+decide` uses the default); `auto_min_agreement` the macro agreement with the
+oracle required to activate and `auto_min_coverage` the share of the
+contract's examples its active labels must hold (both 0..1); `auto_max_skills`
+how many contracts are learned at most and `auto_max_labels` (2..255) how
+many options one may have — a contract past either is answered by the
+oracle and not learned; `auto_max_examples_per_label` (≤ 5000) replaces the
+per-label buffer cap for auto-skills; `auto_temperature_min` (0..1) floors
+the gate temperature an attempt records (0: the fitted T, whose lower bound
+makes every `p_top` 1); `auto_explore_every` (an integer, 0 = off) explores
+one text in that many while a label is quarantined — the one case in which a
+gate-accepted question reaches the oracle, auto-skills only. `cortiq serve --oracle MODEL` and its companions
 override the `oracle` section (and `--no-oracle-learning` sets
 `learning.enabled` false); a file that sets `oracle.provider` keeps its
 `max_price` unless `--oracle-max-price` is given.

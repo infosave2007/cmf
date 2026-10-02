@@ -8,6 +8,7 @@ tags:
   - cmf
   - cortiq
   - jev
+  - laya
   - decision-making
   - structured-output
   - tool-selection
@@ -30,9 +31,22 @@ oracle for unfamiliar cases, then use its answers to grow your local skills.
 
 **Local decisions · Custom skills · Optional oracle**
 
-[Quick start](#quick-start) · [Jev-compatible requests](#jev-compatible-requests) · [Your own skill](#add-your-own-skill) · [Oracle](ORACLE.md#connect-openrouter) · [API](API.md) · [Benchmarks](BENCHMARKS.md) · [На русском](README_RU.md)
+**[Try the live Space →](https://huggingface.co/spaces/infosave/cmf-decision)** —
+enter a request and inspect the decision, confidence and reconstruction errors.
+No installation or API key needed.
+
+[Quick start](#quick-start) · [Jev-compatible requests](#jev-compatible-request-format) · [Your own skill](#add-your-own-skill) · [Oracle](ORACLE.md#connect-openrouter) · [API](API.md) · [Benchmarks](BENCHMARKS.md) · [На русском](README_RU.md)
 
 ## Quick start
+
+### Use the hosted service
+
+Prefer an API without local setup? [allaigate Routing API](https://api.allaigate.com/)
+is a ready-to-use routing service built on the CMF format. Get an API key on the
+site and follow the [integration guide](https://api.allaigate.com/en/docs) —
+no model download or server deployment required.
+
+### Run locally
 
 Install the latest published CLI from crates.io (requires Rust 1.88 or newer):
 
@@ -70,18 +84,21 @@ CORTIQ_DECISION_DEVICE=vulkan cortiq decide cortiq-decision.cmf \
 On multi-GPU hosts, also set `CORTIQ_DECISION_VULKAN_ADAPTER` to a unique part
 of the GPU name. The same variables work with `cortiq serve`. [GPU guide →](GPU.md)
 
-### Jev-compatible requests
+### Jev-compatible request format
 
-For a TypeSafe System One client, opt in to the separate adapter:
+Cortiq 0.8.5 adds an **opt-in** adapter for the TypeSafe System One request
+format. Start it alongside the normal Cortiq APIs:
 
 ```bash
 cortiq serve cortiq-decision.cmf --jev-compatible --port 8080
 ```
 
-Send its requests to `/v1/systemone`. The default `jev-latest` and historical
-Jev selectors are input aliases only; every response names the local
-`cmf-decision-0.8.5` model. The adapter does not load or claim to be Jev.
-[Endpoint details →](API.md#3a-system-one-request-adapter-jev-compatible)
+Point a System One client at `http://127.0.0.1:8080/v1/systemone`. Its default
+`jev-latest` (and the historical `typesafe/jev-1.13`) is accepted **only as a
+request alias**; an omitted model works too. Every response identifies the
+local CMF model as `cmf-decision-0.8.5` — this adapter does not serve or claim
+to be Jev. `GET /v1/models` supplies the matching System One discovery shape
+when the flag is enabled. [Request and response details →](API.md#3a-system-one-request-adapter-jev-compatible)
 
 ## Measured results
 
@@ -92,6 +109,17 @@ Jev selectors are input aliases only; every response names the local
 With abstention enabled, accepted answers are **97.24–98.70% correct**;
 the model answers **54.30–92.11%** of requests locally, depending on the task.
 [Accuracy and coverage together →](BENCHMARKS.md#accuracy-and-coverage)
+
+### Laya: 77 choices on the same Mac
+
+![CMF and Laya on BANKING77, Apple M4](figures/laya-en.png)
+
+**Trained CMF skill: 93.34%, 3.10 ms p50.**
+Laya's base English checkpoint, all 77 label names at once: 35.65%,
+917.59 ms p50. All 3,080 rows, both local, no oracle.
+**A 77-option stress test, not Laya's best achievable result:** shortlisting and
+multilingual were not tested, and training conditions differ.
+[Full protocol, failed long-rubric run and raw results →](LAYA.md)
 
 ### Speed: now on Metal and Vulkan
 

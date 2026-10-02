@@ -415,6 +415,19 @@ impl Question {
         }
         Value::Object(m)
     }
+
+    /// The contract sha of a choice question
+    /// ([`crate::manifest::contract_sha256`]: instructions and criteria with
+    /// their descriptions, the criteria order ignored) — the key of its
+    /// auto-skill (DESIGN A18); `None` for other question types.
+    pub fn contract_sha256(&self) -> Option<String> {
+        match (&self.kind, &self.criteria) {
+            (QuestionKind::Choice, Some(Value::Object(c))) => {
+                Some(crate::manifest::contract_sha256(&self.instructions, c))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// The policy profile (spec §4.7b).
