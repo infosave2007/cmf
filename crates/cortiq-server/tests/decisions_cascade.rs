@@ -2800,7 +2800,7 @@ async fn a_random_oracle_is_rejected_and_a_consistent_contract_is_promoted() {
     // the agreement on C stays far below 0.8.
     let mock = MockOracle::start(|req| {
         let text = req.state().as_str().unwrap_or("").to_string();
-        let flip = sha256_hex(text.as_bytes()).as_bytes()[0] % 2 == 0;
+        let flip = sha256_hex(text.as_bytes()).as_bytes()[0].is_multiple_of(2);
         answer_reply(req, move |_, opts| json!(opts[usize::from(flip)]), 1e-5)
     });
     let cfg = stand_config(&mock.url());
@@ -3376,7 +3376,7 @@ async fn auto_tau_floors_a_local_answer_of_an_auto_skill() {
     // (a clean C drives T to its lower bound and every p_top to 1, DESIGN A13).
     let mock = MockOracle::start(|req| {
         let text = req.state().as_str().unwrap_or("").to_string();
-        let noisy = sha256_hex(text.as_bytes()).as_bytes()[1] % 8 == 0;
+        let noisy = sha256_hex(text.as_bytes()).as_bytes()[1].is_multiple_of(8);
         answer_reply(
             req,
             move |_, opts| {
