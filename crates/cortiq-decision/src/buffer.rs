@@ -281,6 +281,40 @@ impl Contract {
         }
     }
 
+    /// The contract of a served auto-skill, read back from its manifest: the
+    /// ids in the rubric's order (the first request's — the rubric was built
+    /// from the contract), the rubric's instructions and criteria; `None`
+    /// for a skill that is not an auto-skill or whose id is not the hash of
+    /// its labels. `learn.log` is the registry's source (DESIGN D1), but a
+    /// materialised file served on a fresh state directory, or a state
+    /// directory whose `learn.log` was lost, carries an auto-skill with no
+    /// contract record; without this the skill is served and matched but
+    /// never learns again (every example refused as `full`, every attempt
+    /// skipped).
+    pub fn of_manifest(m: &manifest::SkillManifest, created_unix: u64) -> Option<Self> {
+        if !m.is_auto() {
+            return None;
+        }
+        let labels: Vec<&str> = m.labels.iter().map(String::as_str).collect();
+        let (ids, instructions, criteria): (Vec<&str>, Value, Value) = match &m.rubric {
+            // The rubric's criteria keys are labels (validated); when they
+            // are all the labels, their order is the first request's.
+            Some(r) if r.criteria.len() == m.labels.len() => (
+                r.order(),
+                Value::String(r.instructions.clone()),
+                Value::Object(r.criteria.clone()),
+            ),
+            Some(r) => (
+                labels,
+                Value::String(r.instructions.clone()),
+                Value::Object(r.criteria.clone()),
+            ),
+            None => (labels, Value::Null, Value::Null),
+        };
+        let c = Self::new(&ids, &instructions, &criteria, created_unix);
+        (c.skill == m.id).then_some(c)
+    }
+
     /// Whether `label` is one of the contract's option ids (the closed label
     /// set of its auto-skill, DESIGN A5).
     pub fn has_label(&self, label: &str) -> bool {

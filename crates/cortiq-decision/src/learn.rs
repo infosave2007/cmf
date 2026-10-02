@@ -83,7 +83,8 @@
 //! its rows blob (split 2, source oracle) and a `learned` record in its manifest.
 
 use crate::buffer::{
-    AddOutcome, AttemptRecord, ContractRegistry, Example, LearnLog, LearningBuffer, LogRecord,
+    AddOutcome, AttemptRecord, Contract, ContractRegistry, Example, LearnLog, LearningBuffer,
+    LogRecord,
 };
 use crate::certify::{self, Calibration, Certification};
 use crate::config::{LearningConfig, OracleConfig};
@@ -1032,6 +1033,82 @@ struct AutoRow {
     cal: bool,
 }
 
+/// R of an auto-skill as an attempt sees it: the served `rows.learned` rows
+/// of `skill` (when the model serves it), then the buffer examples of every
+/// label of `manifest` that are not among them (keyed by (task, φ_P bits):
+/// the buffer is never pruned after a promotion, so every example that
+/// entered a generation is still in it). Each row with its task and whether
+/// it is pending (from the buffer, not served). The attempt and the admin
+/// listing count R through this one function, so `rows.total` of an attempt
+/// and `auto_skills[].examples` agree.
+pub(crate) fn auto_rows(
+    model: &DecisionModel,
+    buffer: &LearningBuffer,
+    skill: &str,
+    manifest: &SkillManifest,
+) -> Result<Vec<(usize, Row, bool)>> {
+    let n_tasks = manifest.tasks.len();
+    let gen_learned: Vec<Row> = match model.skill(skill) {
+        Some(_) => model
+            .rows_learned(skill)?
+            .map(|r| r.rows)
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let served_bits: HashSet<(u32, Vec<u32>)> = gen_learned
+        .iter()
+        .map(|r| (r.task, bits(&r.phi_p)))
+        .collect();
+    let mut rows: Vec<(usize, Row, bool)> = Vec::with_capacity(gen_learned.len());
+    for r in gen_learned {
+        ensure!(
+            (r.task as usize) < n_tasks,
+            "skill '{skill}': a learned row names task {} of {n_tasks}",
+            r.task
+        );
+        rows.push((r.task as usize, r, false));
+    }
+    for (t, l) in manifest.labels.iter().enumerate() {
+        for ex in buffer.examples(skill, l) {
+            if served_bits.contains(&(t as u32, bits(&ex.phi_p))) {
+                continue;
+            }
+            rows.push((t, ex.to_row(t as u32), true));
+        }
+    }
+    Ok(rows)
+}
+
+/// Rows of R per label of an auto-skill's contract ([`auto_rows`]): the
+/// served learned rows of the label plus its pending examples, in the
+/// contract's `ids` order. A contract the model does not serve has the buffer
+/// examples of each id only.
+pub fn auto_rows_per_label(
+    model: &DecisionModel,
+    buffer: &LearningBuffer,
+    contract: &Contract,
+) -> Result<Vec<(String, usize)>> {
+    let Some(served) = model.skill(&contract.skill) else {
+        return Ok(contract
+            .ids
+            .iter()
+            .map(|l| (l.clone(), buffer.examples(&contract.skill, l).len()))
+            .collect());
+    };
+    let manifest = &served.manifest;
+    let rows = auto_rows(model, buffer, &contract.skill, manifest)?;
+    Ok(contract
+        .ids
+        .iter()
+        .map(|l| {
+            let n = manifest
+                .task_of(l)
+                .map_or(0, |t| rows.iter().filter(|(task, ..)| *task == t).count());
+            (l.clone(), n)
+        })
+        .collect())
+}
+
 /// Per task: (correct, total) over the C rows under a scorer's argmin, with
 /// `truth[j]` the row's candidate in that scorer (`None`: always wrong).
 fn auto_accuracy(
@@ -1067,7 +1144,14 @@ fn attempt_auto(ctx: &LearnContext<'_>, skill: &str, label: &str) -> Result<Atte
     let cfg = ctx.cfg;
     let loaded = ctx.handle.current();
     let model = loaded.model();
-    let Some(contract) = ctx.contracts.lock().get(skill).cloned() else {
+    let served = model.skill(skill);
+    // The registry is seeded from the served model (`cascade`), so a served
+    // auto-skill without a contract record is read back from its manifest
+    // here too, never left frozen.
+    let registered = ctx.contracts.lock().get(skill).cloned();
+    let Some(contract) = registered.or_else(|| {
+        served.and_then(|s| Contract::of_manifest(&s.manifest, model.manifest().created_unix))
+    }) else {
         return Ok(AttemptReport::skipped(
             skill,
             label,
@@ -1081,7 +1165,6 @@ fn attempt_auto(ctx: &LearnContext<'_>, skill: &str, label: &str) -> Result<Atte
             "the label is not an option of the contract",
         ));
     }
-    let served = model.skill(skill);
     let ids: Vec<&str> = contract.ids.iter().map(String::as_str).collect();
     let manifest = match served {
         Some(s) => {
@@ -1098,55 +1181,26 @@ fn attempt_auto(ctx: &LearnContext<'_>, skill: &str, label: &str) -> Result<Atte
     let k_max = cfg.auto_k.min(manifest.recipe.k_max) as usize;
     let n_tasks = manifest.tasks.len();
 
-    // R: the served learned rows, then the pending examples of every label.
-    let gen_learned: Vec<Row> = match served {
-        Some(_) => model
-            .rows_learned(skill)?
-            .map(|r| r.rows)
-            .unwrap_or_default(),
-        None => Vec::new(),
-    };
-    let served_bits: HashSet<(u32, Vec<u32>)> = gen_learned
-        .iter()
-        .map(|r| (r.task, bits(&r.phi_p)))
-        .collect();
-    let mut rows: Vec<AutoRow> = Vec::new();
-    let of = |task: usize, row: Row| {
-        let (key, cal) = certify::auto_row_key(&row.phi_p);
-        AutoRow {
-            task,
-            row,
-            key,
-            cal,
-        }
-    };
-    for r in gen_learned {
-        ensure!(
-            (r.task as usize) < n_tasks,
-            "skill '{skill}': a learned row names task {} of {n_tasks}",
-            r.task
-        );
-        rows.push(of(r.task as usize, r));
-    }
+    // R: the served learned rows, then the pending examples of every label
+    // ([`auto_rows`], shared with the admin listing).
+    let trigger = manifest.task_of(label).expect("the label is a contract id");
     let mut pending_trigger = 0usize;
-    {
-        let b = ctx.buffer.lock();
-        for (t, l) in manifest.labels.iter().enumerate() {
-            for ex in b.examples(skill, l) {
-                if served_bits.contains(&(t as u32, bits(&ex.phi_p))) {
-                    continue;
-                }
-                if l == label {
-                    pending_trigger += 1;
-                }
-                rows.push(of(t, ex.to_row(t as u32)));
+    let rows: Vec<AutoRow> = auto_rows(model, &ctx.buffer.lock(), skill, &manifest)?
+        .into_iter()
+        .map(|(task, row, pending)| {
+            pending_trigger += usize::from(pending && task == trigger);
+            let (key, cal) = certify::auto_row_key(&row.phi_p);
+            AutoRow {
+                task,
+                row,
+                key,
+                cal,
             }
-        }
-    }
+        })
+        .collect();
     if pending_trigger == 0 {
         return Ok(AttemptReport::skipped(skill, label, "no pending example"));
     }
-    let trigger = manifest.task_of(label).expect("the label is a contract id");
 
     // Eligibility per label.
     let mut fit_of: Vec<Vec<usize>> = vec![Vec::new(); n_tasks];
