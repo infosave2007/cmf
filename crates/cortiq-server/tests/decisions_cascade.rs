@@ -2644,6 +2644,11 @@ async fn an_untrained_contract_becomes_an_auto_skill_and_answers_locally() {
     assert_eq!(rec["auto"]["quarantined"], json!([]));
     assert!(rec["auto"]["agreement"]["macro"].as_f64().unwrap() >= 0.8);
     assert_eq!(rec["gate_after"]["certified"], false);
+    // The recorded T is floored at `auto_temperature_min` (DESIGN A15).
+    assert!(
+        rec["gate_after"]["temperature"].as_f64().unwrap() as f32 >= 0.02,
+        "{rec}"
+    );
     assert_eq!(l["auto_skills"][0]["served"]["generation"], 1);
     assert_eq!(
         l["auto_skills"][0]["served"]["active"],
@@ -3474,6 +3479,176 @@ async fn auto_tau_floors_a_local_answer_of_an_auto_skill() {
         "one example since the restart: {l}"
     );
     assert!(l0["examples_added"].as_u64().unwrap() >= 60);
+}
+
+/// `n` texts of `label` that also carry words of `neighbour` (the stand's
+/// quarantined label: its texts sit inside an active label's cloud and the
+/// gate names them as that neighbour with full confidence), pairwise cos
+/// φ_P < `max_cos` to `seen`. Extends `seen`.
+fn texts_near(
+    label: &str,
+    neighbour: &str,
+    n: usize,
+    seed: u64,
+    tag: &str,
+    max_cos: f32,
+    seen: &mut Vec<Vec<f32>>,
+) -> Vec<String> {
+    let (p, np) = (pool(label), pool(neighbour));
+    let mut rng = Lcg(seed);
+    let mut out: Vec<String> = Vec::new();
+    let mut tries = 0;
+    while out.len() < n {
+        tries += 1;
+        assert!(
+            tries < 100_000,
+            "could not find {n} '{label}' texts near '{neighbour}'"
+        );
+        let mut words = vec![p[rng.below(p.len())]];
+        for _ in 0..2 + rng.below(2) {
+            words.push(np[rng.below(np.len())]);
+        }
+        words.push(FILLER[rng.below(FILLER.len())]);
+        let r = rng.below(words.len());
+        words.swap(0, r);
+        let t = format!("{} {tag}{}", words.join(" "), out.len());
+        let f = phi_p(&t);
+        if seen.iter().all(|q| cos(q, &f) < max_cos) {
+            seen.push(f);
+            out.push(t);
+        }
+    }
+    out
+}
+
+/// DESIGN A15–A17: the auto_start gate carries the floored T; while a label
+/// is quarantined, texts of it the gate accepts (as a neighbour) are explored
+/// — one in four by the hash of φ_P, the oracle's answer served with the
+/// flag `explore` and `gate.accepted: true`, and learned — until the label
+/// holds enough examples and the next attempt activates it, after which the
+/// contract explores no more and the label is answered locally.
+#[tokio::test]
+async fn a_quarantined_label_is_explored_until_it_activates() {
+    let mock = keyword_mock();
+    let mut cfg = stand_config(&mock.url());
+    // A trigger every 10 new examples of a label keeps the run short.
+    cfg.learning.refit_min_new = 10;
+    let srv = Srv::new(&cfg);
+    // `cruise` first: the keyword oracle answers the first option whose pool
+    // holds a word of the text, so a cruise text in food words is `cruise`.
+    let labels = ["cruise", "food", "travel"];
+    let q = choice(&labels);
+    let id = auto_id(&labels);
+    let mut seen = Vec::new();
+    let food = texts_apart("food", 25, 41, "af", 0.97, &mut seen);
+    let travel = texts_apart("travel", 25, 43, "av", 0.97, &mut seen);
+    let cruise = texts_near("cruise", "food", 90, 47, "ac", 0.97, &mut seen);
+    let lessons = vec![
+        ("food", food),
+        ("travel", travel),
+        ("cruise", cruise[..2].to_vec()),
+    ];
+    teach_contract(&srv, &q, &lessons).await;
+    let l = srv.learning().await;
+    let rec = latest(&l);
+    assert_eq!(rec["kind"], "auto_start");
+    assert_eq!(rec["outcome"], "promoted", "{rec}");
+    assert_eq!(rec["auto"]["quarantined"], json!(["cruise"]));
+    // A15: the recorded T is floored (a clean C fits T at its lower bound,
+    // where every p_top is 1); the served gate carries it.
+    let t = rec["gate_after"]["temperature"].as_f64().unwrap() as f32;
+    assert!(t >= 0.02, "gate_after T {t}");
+    let s = srv.get(&format!("/v1/skills/{id}")).await.body;
+    assert!(s["temperature"].as_f64().unwrap() as f32 >= 0.02, "{s}");
+    assert_eq!(s["quarantined_labels"], json!(["cruise"]));
+    let skill = |sk: &Value| -> Value { sk["quarantined_labels"].clone() };
+
+    // Texts of the quarantined label until it activates: accepted ones
+    // answer locally as a neighbour unless explored (then the oracle's
+    // `cruise` with the flag), abstentions escalate as before; both teach.
+    let (mut explored, mut abstained, mut misnamed) = (0usize, 0usize, 0usize);
+    let mut activated_after = None;
+    for (i, t) in cruise[2..].iter().enumerate() {
+        let r = ask(&srv, &q, t).await;
+        assert_eq!(r.q("task")["match"], "exact", "{}", r.text);
+        assert_eq!(r.q("task")["skill"], id);
+        let g = &r.q("task")["gate"];
+        let explore = r.flags().as_array().unwrap().iter().any(|f| f == "explore");
+        match r.action() {
+            "local" => {
+                assert!(!explore, "{}", r.text);
+                assert_eq!(g["accepted"], true);
+                assert_ne!(r.body["answers"]["task"]["choice"], "cruise", "{}", r.text);
+                misnamed += 1;
+            }
+            "oracle" => {
+                assert_eq!(r.body["answers"]["task"]["choice"], "cruise", "{}", r.text);
+                assert_eq!(r.q("task")["decision_path"], "escalate→oracle");
+                assert_eq!(r.q("task")["certified"], false);
+                if explore {
+                    assert_eq!(g["accepted"], true, "{}", r.text);
+                    explored += 1;
+                } else {
+                    assert_eq!(g["accepted"], false, "{}", r.text);
+                    abstained += 1;
+                }
+            }
+            other => panic!("unexpected action {other}: {}", r.text),
+        }
+        let s = srv.get(&format!("/v1/skills/{id}")).await.body;
+        if skill(&s) == json!([]) {
+            activated_after = Some(i + 1);
+            break;
+        }
+    }
+    eprintln!(
+        "cruise: explored {explored}, abstained {abstained}, misnamed {misnamed}, activated after {activated_after:?}"
+    );
+    assert!(explored >= 1, "no accepted cruise text was explored");
+    let n = activated_after.expect("cruise activated");
+    let l = srv.learning().await;
+    let rec = latest(&l);
+    assert_eq!(rec["kind"], "auto_refit", "{rec}");
+    assert_eq!(rec["outcome"], "promoted", "{rec}");
+    assert_eq!(rec["label"], "cruise");
+    assert_eq!(rec["auto"]["eligible"], json!(["cruise", "food", "travel"]));
+    assert_eq!(rec["auto"]["quarantined"], json!([]));
+    assert!(rec["gate_after"]["temperature"].as_f64().unwrap() as f32 >= 0.02);
+    assert_eq!(l["quarantine"], json!([]));
+    let s = srv.get(&format!("/v1/skills/{id}")).await.body;
+    assert_eq!(s["labels"], json!(["cruise", "food", "travel"]));
+    assert_eq!(s["active_labels"], 3);
+    // Every escalated text (explored or abstained) became an example.
+    let ex = l["auto_skills"][0]["examples"]["cruise"].as_u64().unwrap() as usize;
+    assert_eq!(ex, 2 + explored + abstained, "{l}");
+    assert!(n >= ex - 2);
+
+    // Every label active: no exploration any more, and the once-quarantined
+    // label is answered locally.
+    let hits = mock.hits();
+    let mut local_cruise = 0;
+    for t in distinct_texts("cruise", 6, 99, "zc", 0.995)
+        .iter()
+        .chain(distinct_texts("food", 6, 97, "zf", 0.995).iter())
+    {
+        let r = ask(&srv, &q, t).await;
+        assert!(
+            !r.flags().as_array().unwrap().iter().any(|f| f == "explore"),
+            "{}",
+            r.text
+        );
+        if r.action() == "local" && r.body["answers"]["task"]["choice"] == "cruise" {
+            local_cruise += 1;
+        }
+    }
+    assert!(
+        local_cruise >= 1,
+        "no local cruise answer after the activation"
+    );
+    eprintln!(
+        "after the activation: {local_cruise} local cruise answers, {} oracle calls",
+        mock.hits() - hits
+    );
 }
 
 #[tokio::test]

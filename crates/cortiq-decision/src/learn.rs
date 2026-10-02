@@ -56,7 +56,10 @@
 //! 3. *gate*: C of the eligible labels only (`|C| ≥ 2`, else skipped), halves by
 //!    [`certify::halves`] over the same keys, [`certify::certify`] as a build
 //!    (τ certifies only with 100 accepted odd rows, so the gate is θ-only for
-//!    a long time; serving adds the `learning.auto_tau` floor); the first
+//!    a long time; serving adds the `learning.auto_tau` floor), the served
+//!    `T` floored at `learning.auto_temperature_min` (DESIGN A15: a clean C
+//!    fits `T` at its lower bound, where `p_top ≡ 1`; the evidence keeps
+//!    the fitted `log_t`); the first
 //!    activation (`auto_start`) needs a macro agreement with the oracle's
 //!    labels on C of `learning.auto_min_agreement` and ≥ 0.5 per label, else
 //!    `rejected: auto_agreement`; later (`auto_refit`) the champion (served
@@ -1347,15 +1350,23 @@ fn attempt_auto(ctx: &LearnContext<'_>, skill: &str, label: &str) -> Result<Atte
     let matrix = scorer.error_matrix(&cal_rows, dim_h, threads)?;
     let truth: Vec<Option<usize>> = cal.iter().map(|r| scorer.candidate_of(r.task)).collect();
     let cert = book_certify(&matrix, &scorer, &truth, &even, &odd)?;
-    let gate = Gate::from_certification(&cert);
+    let mut gate = Gate::from_certification(&cert);
+    // The served T is floored (DESIGN A15): a clean C drives the fitted T to
+    // its lower bound, where p_top ≡ 1 for every text — the `auto_tau` floor
+    // never bites and a quarantined label's texts are answered with
+    // confidence 1 as a neighbour. The evidence keeps the fitted `log_t`; any
+    // positive f32 T is a valid gate (`Gate::validate`).
+    let temperature = cert.temperature.max(cfg.auto_temperature_min);
+    gate.temperature = f64::from(temperature);
     report.gate_after = Some(gate.clone());
 
-    // Agreement of the challenger with the oracle on C.
+    // Agreement of the challenger with the oracle on C (the winner is the
+    // argmin, independent of T).
     let chall = auto_accuracy(
         &matrix,
         scorer.len(),
         scorer.stats(),
-        cert.temperature,
+        temperature,
         &cal,
         &truth,
     )?;
