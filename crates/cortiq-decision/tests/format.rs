@@ -1235,7 +1235,7 @@ fn refuses_missing_wrong_dtype_or_oversized_manifest() {
     let p = dir.path().join("f32manifest.cmf");
     rewrite(&base, &p, |_, t| {
         let s = spec_mut(t, manifest::MANIFEST_TENSOR);
-        while s.data.len() % 4 != 0 {
+        while !s.data.len().is_multiple_of(4) {
             s.data.push(b' ');
         }
         s.dtype = TensorDtype::F32;
@@ -2052,13 +2052,13 @@ fn toy_auto(seed: u64) -> (NewSkill, Rows) {
         SkillManifest::auto_skeleton(&ids, Some(Rubric::new("Pick the topic.", criteria)), 8);
     assert_eq!(m.labels, ["cruise", "food", "travel"]);
     let mut topologies = vec![None, None, None];
-    for i in 1..3 {
+    for (i, slot) in topologies.iter_mut().enumerate().skip(1) {
         m.tasks[i].state = TaskState::Active;
         m.tasks[i].k = 1;
         m.tasks[i].n_train = 12;
         m.tasks[i].err_mean = 0.2 + i as f64 * 0.01;
         m.tasks[i].err_std = 0.05;
-        topologies[i] = Some(Topology {
+        *slot = Some(Topology {
             mean: rng.vec(SIGNAL),
             basis: rng.vec(SIGNAL),
         });

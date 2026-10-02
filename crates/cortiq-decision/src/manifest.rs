@@ -779,30 +779,30 @@ pub fn check_hashing(stored: &Value) -> std::result::Result<Vec<String>, String>
         if a.map(canonical::to_string) == b.map(canonical::to_string) {
             continue;
         }
-        if k == "golden" {
-            if let (Some(Value::Array(ga)), Some(Value::Array(gb))) = (a, b) {
-                if ga.len() != gb.len() {
-                    return Err(format!(
-                        "{} golden texts in the file, {} in this build",
-                        ga.len(),
-                        gb.len()
-                    ));
+        if k == "golden"
+            && let (Some(Value::Array(ga)), Some(Value::Array(gb))) = (a, b)
+        {
+            if ga.len() != gb.len() {
+                return Err(format!(
+                    "{} golden texts in the file, {} in this build",
+                    ga.len(),
+                    gb.len()
+                ));
+            }
+            for (i, (x, y)) in ga.iter().zip(gb).enumerate() {
+                if x.get("text") != y.get("text") {
+                    return Err(format!("golden[{i}] text differs"));
                 }
-                for (i, (x, y)) in ga.iter().zip(gb).enumerate() {
-                    if x.get("text") != y.get("text") {
-                        return Err(format!("golden[{i}] text differs"));
-                    }
-                    if x != y {
-                        return Err(format!(
-                            "golden[{i}] dense sha256 differs (file {}, this build {})",
-                            x.get("dense_f32le_sha256")
-                                .and_then(Value::as_str)
-                                .unwrap_or("?"),
-                            y.get("dense_f32le_sha256")
-                                .and_then(Value::as_str)
-                                .unwrap_or("?")
-                        ));
-                    }
+                if x != y {
+                    return Err(format!(
+                        "golden[{i}] dense sha256 differs (file {}, this build {})",
+                        x.get("dense_f32le_sha256")
+                            .and_then(Value::as_str)
+                            .unwrap_or("?"),
+                        y.get("dense_f32le_sha256")
+                            .and_then(Value::as_str)
+                            .unwrap_or("?")
+                    ));
                 }
             }
         }
