@@ -25,6 +25,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `auto_min_agreement`, `auto_min_coverage`, `auto_max_skills`,
   `auto_max_labels`, `auto_max_examples_per_label` (API.md §3.2, §6;
   ORACLE.md "Auto-skills").
+- Auto-skills, after the stand run: the gate temperature an attempt records
+  is floored at `learning.auto_temperature_min` (0.02; a clean held-out
+  subset fits T at its lower bound, where every `p_top` is 1 and the
+  `auto_tau` floor never bites; the evidence keeps the fitted `log_t`), and
+  *exploration*: while a label of an auto-skill is quarantined, one text in
+  `learning.auto_explore_every` (4, by a hash of φ_P; 0 = off) is escalated
+  although the gate accepted it — the one exception to the rule that a
+  gate-accepted question never reaches the oracle, auto-skills only — its
+  oracle answer served (`action: oracle`/`cache`, flag `explore`) and
+  learned, so the rare label collects examples until it activates (API.md
+  §3.2, §6; ORACLE.md "Exploration").
 - Decision format: a generation overlay may carry a skill the base file does
   not have — an *auto-skill* (reserved id prefix `auto-`, no build rows,
   `data.calibration.source: "learned"`, every row in `rows.learned`). The
